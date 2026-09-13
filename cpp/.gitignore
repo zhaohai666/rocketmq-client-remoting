@@ -1,0 +1,39 @@
+# 构建产物
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+Makefile
+*.cmake.tmp
+
+# Visual Studio
+.vs/
+*.vcxproj*
+*.user
+*.sln
+x64/
+Debug/
+Release/
+
+# 编译中间产物 / 库
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.a
+*.so
+*.dylib
+*.exe
+*.dll
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
