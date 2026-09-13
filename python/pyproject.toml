@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rocketmq-client-remoting"
+version = "4.9.4"
+description = "Python implementation of Apache RocketMQ 4.x remoting client (client + remoting protocol), mirroring the Java client capabilities."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+keywords = ["rocketmq", "mq", "messaging", "remoting", "client"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[tool.setuptools.packages.find]
+include = ["rocketmq*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
