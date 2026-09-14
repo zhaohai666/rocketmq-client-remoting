@@ -134,8 +134,12 @@ class TopicRouteData:
         """返回 broker 数据列表（与 Java topicRouteData.getBrokerDatas() 对齐）。"""
         return self.broker_datas
 
-    def get_all_message_queue(self) -> List["MessageQueue"]:
-        """根据 queueDatas + brokerDatas 组装全部可写 MessageQueue（对应 Java 的 topicRouteData2TopicPublishInfo 组装逻辑）。"""
+    def get_all_message_queue(self, topic: str = "") -> List["MessageQueue"]:
+        """根据 queueDatas + brokerDatas 组装全部可写 MessageQueue（对应 Java 的 topicRouteData2TopicPublishInfo 组装逻辑）。
+
+        topic 用于回填到每个 MessageQueue（Java 用真实 topic，而不是空串），否则后续
+        send/pull 用 mq.topic 回查路由时会查不到。
+        """
         mqs: List["MessageQueue"] = []
         for qd in self.queue_datas:
             if not PermName.check_perm(qd.perm, PermName.PERM_WRITE):
@@ -148,7 +152,7 @@ class TopicRouteData:
             if broker_data is None:
                 continue
             for i in range(qd.write_queue_nums):
-                mqs.append(MessageQueue("", qd.broker_name, i))
+                mqs.append(MessageQueue(topic, qd.broker_name, i))
         return mqs
 
     def clone_topic_route_data(self) -> "TopicRouteData":

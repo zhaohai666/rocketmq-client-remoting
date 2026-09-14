@@ -143,6 +143,15 @@ class PermName:
     PERM_OWNER = 0x1 << 4
 
     @staticmethod
+    def is_valid(perm) -> bool:
+        """对应 Java PermName.isValid：``perm >= 0 && perm < PERM_PRIORITY``。
+
+        Java 的 ``isValid(String)`` 直接 ``Integer.parseInt``，非数字会抛
+        NumberFormatException；这里保持一致（抛 ValueError），调用方需自行捕获。
+        """
+        return 0 <= int(perm) < PermName.PERM_PRIORITY
+
+    @staticmethod
     def perm_to_string(perm: int) -> str:
         sb = []
         if PermName.PERM_READ == (perm & PermName.PERM_READ):

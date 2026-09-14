@@ -17,7 +17,7 @@ from ..common.mix_all import MixAll
 from ..common.subscription_data import ExpressionType, FilterAPI, SubscriptionData
 from ..common.sysflag import MessageSysFlag, PullSysFlag
 from ..logging import get_logger
-from ..remoting.exception import RemotingException
+from ..remoting.exception import RemotingException, RemotingTimeoutException
 from ..remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                            HeartbeatData, MessageModel)
 from ..remoting.rpchook import RPCHook
@@ -139,6 +139,11 @@ class DefaultMQPushConsumer:
         self.pull_threshold_for_topic = -1
         self.pull_threshold_size_for_topic = -1
         self.pull_interval = 0
+        self.pull_timeout_millis = 30000
+        # 长轮询的 suspend 时长（对应 Java brokerSuspendMaxTimeMillis 默认 20000）。
+        # 注意：这个属性必须在这里初始化——pull 循环会读它，缺了就会每轮抛
+        # AttributeError 并被 _consume_loop 的兜底 except 吞掉，表现为"消费端一条都收不到"。
+        self.pull_suspend_timeout_millis = 20000
         self.consume_message_batch_max_size = 1
         self.pull_batch_size = 32
         self.pull_batch_size_in_bytes = 256 * 1024
@@ -180,6 +185,9 @@ class DefaultMQPushConsumer:
     def set_consume_thread_nums(self, n: int) -> None:
         self.consume_thread_min = max(1, n)
         self.consume_thread_max = max(1, n)
+
+    def set_pull_suspend_timeout_millis(self, millis: int) -> None:
+        self.pull_suspend_timeout_millis = int(millis)
 
     def set_message_listener(self, listener) -> None:
         self.message_listener = listener
@@ -294,7 +302,9 @@ class DefaultMQPushConsumer:
                     break
                 self._pull_and_consume_once()
             except Exception as e:  # noqa: BLE001
-                logger.error("consume loop error: %s", e)
+                # 带类型名：否则 AttributeError 之类的编码错误只打印消息文本，
+                # 很容易被当成"拉取超时"忽略掉（曾因此掩盖 pull_suspend_timeout_millis 未初始化）。
+                logger.error("consume loop error: %s: %s", type(e).__name__, e)
             time.sleep(self.pull_interval / 1000.0 if self.pull_interval > 0 else 0.01)
 
     def _pull_and_consume_once(self) -> None:
@@ -321,21 +331,28 @@ class DefaultMQPushConsumer:
                                              self.pull_batch_size, sys_flag, 0,
                                              sub.sub_string or "*", sub.sub_version,
                                              sub.expression_type,
-                                             timeout_millis=30000,
+                                             timeout_millis=self.pull_timeout_millis,
                                              max_msg_bytes=self.pull_batch_size_in_bytes,
-                                             suspend_timeout_millis=15000)
+                                             suspend_timeout_millis=self.pull_suspend_timeout_millis)
             except MQBrokerException as e:
                 if e.response_code == MQBrokerException.UNKNOWN:
                     pass
                 # PULL_OFFSET_MOVED 等已映射到 PullStatus
+                continue
+            except RemotingTimeoutException as e:
+                # 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 将
+                # suspend 时间钳制为其自身 brokerSuspendMaxTimeMillis（默认 ~15s），
+                # 忽略客户端下发的 suspend_timeout_millis，故空闲队列会周期性超时。
+                # 这不是错误，仅 debug 级别，避免污染客户端运行日志（见 logging.py）。
+                logger.debug("pull long-poll timeout for %s (benign, will retry): %s", mq, e)
                 continue
             except Exception as e:  # noqa: BLE001
                 logger.error("pull error for %s: %s", mq, e)
                 continue
 
             if result.status == PullStatus.FOUND and result.msg_found_list:
-                self._offset_table[key] = result.next_begin_offset
-                self._dispatch_messages(mq, result.msg_found_list)
+                dispatched = self._dispatch_messages(mq, result.msg_found_list)
+                self._offset_table[key] = offset + dispatched
             elif result.status == PullStatus.NO_NEW_MSG:
                 self._offset_table[key] = result.next_begin_offset
             elif result.status == PullStatus.OFFSET_ILLEGAL:
@@ -357,28 +374,39 @@ class DefaultMQPushConsumer:
         except Exception:  # noqa: BLE001
             return 0
 
-    def _dispatch_messages(self, mq: MessageQueue, msgs: List[MessageExt]) -> None:
+    def _dispatch_messages(self, mq: MessageQueue, msgs: List[MessageExt]) -> int:
+        """把一批拉到的消息交给监听器消费，按 consume_message_batch_max_size 分批调用。
+
+        返回实际已成功消费（可推进 offset）的消息条数；RECONSUME_LATER 的批次不前进。
+        """
         listener = self.message_listener
         if listener is None:
-            return
-        batch = msgs[:self.consume_message_batch_max_size] if self.consume_message_batch_max_size > 1 else msgs[:1]
-        if not batch:
-            return
-        context = ConsumeConcurrentlyContext(mq)
-        try:
-            if isinstance(listener, MessageListenerOrderly):
-                ocontext = ConsumeOrderlyContext(mq)
-                status = listener.consume_message(batch, ocontext)
-                if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
-                    time.sleep(self.suspend_current_queue_time_millis / 1000.0)
-            else:
-                status = listener.consume_message(batch, context)
-                if status == ConsumeConcurrentlyStatus.RECONSUME_LATER:
-                    # 简化：本地重投，更新 offset 回退
-                    key = "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
-                    self._offset_table[key] = max(0, self._offset_table.get(key, 0) - len(batch))
-        except Exception as e:  # noqa: BLE001
-            logger.error("listener error: %s", e)
+            return 0
+        batch_size = max(1, self.consume_message_batch_max_size)
+        consumed = 0
+        n = len(msgs)
+        i = 0
+        while i < n:
+            batch = msgs[i:i + batch_size]
+            context = ConsumeConcurrentlyContext(mq)
+            try:
+                if isinstance(listener, MessageListenerOrderly):
+                    ocontext = ConsumeOrderlyContext(mq)
+                    status = listener.consume_message(batch, ocontext)
+                    if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                        time.sleep(self.suspend_current_queue_time_millis / 1000.0)
+                        break
+                else:
+                    status = listener.consume_message(batch, context)
+                    if status == ConsumeConcurrentlyStatus.RECONSUME_LATER:
+                        # 简化：本批不推进 offset，留给后续重投
+                        break
+                consumed += len(batch)
+                i += len(batch)
+            except Exception as e:  # noqa: BLE001
+                logger.error("listener error: %s", e)
+                break
+        return consumed
 
     # ---------------- 管理能力 ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:

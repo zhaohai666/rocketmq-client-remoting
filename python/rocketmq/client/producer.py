@@ -15,7 +15,9 @@ from typing import Callable, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
+from ..common.message_decoder import _compress
 from ..common.mix_all import MixAll
+from ..common.sysflag import MessageSysFlag
 from ..logging import get_logger
 from ..remoting.exception import RemotingException
 from ..remoting.rpchook import RPCHook
@@ -129,7 +131,10 @@ class DefaultMQProducer:
         self.create_topic_key = MixAll.DEFAULT_TOPIC
         self.default_topic_queue_nums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
         self.send_msg_timeout = 3000
+        # 压缩配置，默认值与 Java DefaultMQProducer 一致
         self.compress_msg_body_over_howmuch = 1024 * 4
+        self.compress_level = 5
+        self.compress_type = MessageSysFlag.ZLIB_TYPE
         self.retry_times_when_send_failed = 2
         self.retry_times_when_send_async_failed = 2
         self.retry_another_broker_when_not_store_ok = False
@@ -165,6 +170,15 @@ class DefaultMQProducer:
 
     def set_retry_times_when_send_failed(self, n: int) -> None:
         self.retry_times_when_send_failed = n
+
+    def set_compress_msg_body_over_howmuch(self, size: int) -> None:
+        self.compress_msg_body_over_howmuch = size
+
+    def set_compress_level(self, level: int) -> None:
+        self.compress_level = level
+
+    def set_compress_type(self, compression_type: int) -> None:
+        self.compress_type = compression_type
 
     def set_create_topic_key(self, key: str) -> None:
         self.create_topic_key = key
@@ -208,6 +222,33 @@ class DefaultMQProducer:
             raise MQClientException("producer not started, call start() first")
         return self._mq_client
 
+    # ---------------- 压缩（对应 Java DefaultMQProducerImpl.tryToCompressMessage）----------------
+    def try_to_compress_message(self, msg: Message) -> int:
+        """满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sys_flag。
+
+        与 Java 逐条对齐：
+          * 批量消息（MessageBatch）**永不压缩**；
+          * body 长度 >= compress_msg_body_over_howmuch（默认 4096）才压缩；
+          * 压缩失败按 Java 的做法**降级为不压缩**并记日志，而不是让发送失败；
+          * 压缩后不比较体积（Java 也不比较）。
+        不压缩时返回 0。
+        """
+        if isinstance(msg, MessageBatch):
+            return 0
+        body = msg.get_body()
+        if not body or len(body) < self.compress_msg_body_over_howmuch:
+            return 0
+        try:
+            compressed = _compress(body, self.compress_type, self.compress_level)
+        except Exception as e:  # noqa: BLE001  # 对齐 Java：压缩失败降级为不压缩
+            logger.warning("tryToCompressMessage failed, send uncompressed: %s", e)
+            return 0
+        if not compressed:
+            return 0
+        msg.set_body(compressed)
+        sys_flag = MessageSysFlag.COMPRESSED_FLAG
+        return MessageSysFlag.set_compression_type(sys_flag, self.compress_type)
+
     # ---------------- 正常发送 ----------------
     def send(self, msg: Message, timeout_millis: Optional[int] = None,
              mq: Optional[MessageQueue] = None) -> SendResult:
@@ -217,15 +258,19 @@ class DefaultMQProducer:
         if isinstance(msg, (list, tuple)):
             return self._send_batch(list(msg), mq, timeout)
         self._check_message(msg)
+        # 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
+        # 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
+        # 消费端只解一层就拿到压缩流。这里避免该问题。
+        sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
-            return client.send_message(self.producer_group, msg, mq, timeout)
+            return client.send_message(self.producer_group, msg, mq, timeout, sys_flag)
         last_exc = None
         for attempt in range(self.retry_times_when_send_failed + 1):
             try:
                 publish = client.get_topic_publish_info(msg.topic)
                 selected = publish.select_one_message_queue()
                 mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
-                return client.send_message(self.producer_group, msg, mq_sel, timeout)
+                return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
             except (MQClientException, MQBrokerException, RemotingException) as e:
                 last_exc = e
         raise last_exc
@@ -246,15 +291,16 @@ class DefaultMQProducer:
         """单向发送（对应 Java sendOneway）。"""
         client = self._require_client()
         self._check_message(msg)
+        sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
             client.send_message_oneway(self.producer_group, msg, mq,
-                                       self._need_addr(client, mq), self.send_msg_timeout)
+                                       self._need_addr(client, mq), self.send_msg_timeout, sys_flag)
             return
         publish = client.get_topic_publish_info(msg.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
         client.send_message_oneway(self.producer_group, msg, mq_sel,
-                                   self._need_addr(client, mq_sel), self.send_msg_timeout)
+                                   self._need_addr(client, mq_sel), self.send_msg_timeout, sys_flag)
 
     def send_by_selector(self, msg: Message, selector: MessageQueueSelector, arg,
                          timeout_millis: Optional[int] = None) -> SendResult:
@@ -264,7 +310,10 @@ class DefaultMQProducer:
         publish = client.get_topic_publish_info(msg.topic)
         selected = selector.select(publish.msg_queue_list, msg, arg)
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
-        return client.send_message(self.producer_group, msg, mq_sel, timeout)
+        # 选择器用的是原始消息（topic/业务字段），压缩只影响 body
+        self._check_message(msg)
+        sys_flag = self.try_to_compress_message(msg)
+        return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
 
     # ---------------- 批量发送 ----------------
     def _send_batch(self, msgs: List[Message], mq: Optional[MessageQueue] = None,
@@ -274,12 +323,14 @@ class DefaultMQProducer:
         if not msgs:
             raise MQClientException("message list is empty")
         batch = MessageBatch.generate_from_list(msgs)
+        # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
+        sys_flag = self.try_to_compress_message(batch)
         if mq is not None:
-            return client.send_message(self.producer_group, batch, mq, timeout)
+            return client.send_message(self.producer_group, batch, mq, timeout, sys_flag)
         publish = client.get_topic_publish_info(batch.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(batch.topic, selected.broker_name, selected.queue_id)
-        return client.send_message(self.producer_group, batch, mq_sel, timeout)
+        return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag)
 
     # ---------------- 事务消息 ----------------
     def send_message_in_transaction(self, msg: Message,
@@ -292,7 +343,10 @@ class DefaultMQProducer:
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
         # 发送 half 消息（模拟：先发送，再执行本地事务，按结果决定提交/回滚）
-        send_result = client.send_message(self.producer_group, msg, mq_sel, self.send_msg_timeout)
+        # 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl）
+        sys_flag = self.try_to_compress_message(msg)
+        send_result = client.send_message(self.producer_group, msg, mq_sel,
+                                          self.send_msg_timeout, sys_flag)
         state = listener.execute_local_transaction(msg, arg)
         tsr = TransactionSendResult(send_result, state)
         if state == LocalTransactionState.UNKNOW:

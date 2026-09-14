@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import struct
+import zlib
 
 import pytest
 
 from rocketmq.common.message import Message, MessageBatch, MessageExt
 from rocketmq.common.message_decoder import (
     BLANK_MAGIC_CODE, MESSAGE_MAGIC_CODE, MESSAGE_MAGIC_CODE_V2,
+    _decompress,
     bytes_to_ip_and_port, bytes2string, count_inner_msg_num, crc32,
     create_message_id, decode_batch_message, decode_batch_messages,
     decode_message, decode_message_id, decode_messages,
@@ -352,3 +354,64 @@ def test_compressed_message_roundtrip(compress_type):
     # Java: sysFlag &= ~COMPRESSED_FLAG，仅清标志位，压缩类型位（bit8~10）保留
     assert got.get_sys_flag() == MessageSysFlag.clear_compressed_flag(sys_flag)
     assert got.get_sys_flag() == MessageSysFlag.set_compression_type(0, compress_type)
+
+
+def test_unsupported_compression_type_raises_instead_of_passthrough():
+    """未支持的压缩类型必须抛错，绝不原样透传。
+
+    对齐 Java：``CompressionType.findByValue`` 只认 0/3(ZLIB)、1(LZ4)、2(ZSTD)，
+    其余返回 null，``CompressorFactory.getCompressor`` 随即抛异常
+    （C++ ``CompressorFactory::decompress`` 同语义）。
+
+    为什么这条重要：``decode_message`` 解压后会清掉 ``COMPRESSED_FLAG``。
+    若这里透传，调用方拿到的是**压缩字节流**且标志位已丢 → 事后无法识别，
+    属于静默数据损坏。SNAPPY(4) 在 Java 5.x 里就是这种"未支持"类型。
+
+    两层语义都要钉住：
+      * ``_decompress`` 本身**抛错**（对齐 Java CompressorFactory）；
+      * ``decode_message`` 返回 ``None``（对齐 Java decode 的 catch -> null；
+        消息被丢弃，而不是被当成压缩流原样交出去）。
+    """
+    body = b"payload-that-should-never-be-returned-as-is" * 20
+    sys_flag = MessageSysFlag.COMPRESSED_FLAG | MessageSysFlag.set_compression_type(
+        0, MessageSysFlag.SNAPPY_TYPE)
+    topic_bytes = b"TopicTest"
+    payload = zlib.compress(body, 5)  # 内容真实是 zlib，但类型位谎报 SNAPPY
+
+    store_size = (4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8
+                  + 4 + len(payload) + 1 + len(topic_bytes) + 2)
+    buf = bytearray()
+    buf += struct.pack(">i", store_size)
+    buf += struct.pack(">i", MESSAGE_MAGIC_CODE)
+    buf += struct.pack(">I", crc32(body))
+    buf += struct.pack(">i", 0)
+    buf += struct.pack(">i", 0)
+    buf += struct.pack(">q", 0)
+    buf += struct.pack(">q", 1)
+    buf += struct.pack(">i", sys_flag)
+    buf += struct.pack(">q", 1700000000000)
+    buf += ip_and_port_to_bytes("127.0.0.1", 1)
+    buf += struct.pack(">q", 1700000000123)
+    buf += ip_and_port_to_bytes("127.0.0.1", 10911)
+    buf += struct.pack(">i", 0)
+    buf += struct.pack(">q", 0)
+    buf += struct.pack(">i", len(payload)) + payload
+    buf += struct.pack(">B", len(topic_bytes)) + topic_bytes
+    buf += struct.pack(">H", 0)
+
+    # 上层：消息被丢弃（Java decode 的 catch -> null），而不是交回压缩流
+    assert decode_message(bytes(buf)) is None
+
+    # 下层：解压助手直接抛错（对齐 Java CompressorFactory.getCompressor）
+    with pytest.raises(RuntimeError, match="unsupported compression type"):
+        _decompress(payload, MessageSysFlag.SNAPPY_TYPE)
+
+    # 反向确认：同一个 body 只要类型位正确就能正常解，说明上面的 None
+    # 确实来自"类型不支持"，不是帧构造错误
+    ok_flag = MessageSysFlag.COMPRESSED_FLAG | MessageSysFlag.set_compression_type(
+        0, MessageSysFlag.ZLIB_TYPE)
+    buf_ok = bytearray(buf)
+    # SYSFLAG 偏移：TOTALSIZE(4)+MAGIC(4)+BODYCRC(4)+QUEUEID(4)+FLAG(4)+QUEUEOFFSET(8)+PHYS(8)
+    struct.pack_into(">i", buf_ok, 36, ok_flag)
+    good = decode_message(bytes(buf_ok))
+    assert good is not None and good.get_body() == body

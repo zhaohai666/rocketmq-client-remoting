@@ -16,6 +16,7 @@ from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_decoder import decode_messages, message_properties_2_string
 from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
+from ..common.topic_config import TopicFilterType
 from ..logging import get_logger
 from ..remoting.client import RemotingClient
 from ..remoting.protocol.body import (ClusterInfo, GetConsumerListByGroupResponseBody,
@@ -112,27 +113,44 @@ class MQClientInstance:
     def update_topic_route_info_from_name_server(self, topic: str, timeout_millis: int = 5000) -> bool:
         if not self.name_server_addrs:
             raise MQClientException("name server address list is empty")
-        request = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC, None)
-        request.ext_fields["topic"] = topic
-        last_exc = None
-        for ns_addr in self.name_server_addrs:
-            try:
-                response = self._invoke_sync(ns_addr, request, timeout_millis)
-                if response.code == ResponseCode.SUCCESS and response.body:
-                    route = TopicRouteData.decode(response.body)
-                    with self.topic_route_lock:
-                        self.topic_route_table[topic] = route
-                        publish = self.topic_publish_info_table.setdefault(topic, TopicPublishInfo())
-                        publish.order_topic = route.order_topic_conf is not None
-                        publish.topic_route_data = route
-                        publish.msg_queue_list = route.get_all_message_queue()
-                    return True
-                break
-            except Exception as e:  # noqa: BLE001
-                last_exc = e
-        if last_exc is not None and not (isinstance(last_exc, MQBrokerException)):
-            raise last_exc
-        return False
+
+        def _fetch(t: str):
+            request = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC, None)
+            request.ext_fields["topic"] = t
+            last_exc = None
+            for ns_addr in self.name_server_addrs:
+                try:
+                    response = self._invoke_sync(ns_addr, request, timeout_millis)
+                    if response.code == ResponseCode.SUCCESS and response.body:
+                        return TopicRouteData.decode(response.body)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_exc = e
+            if last_exc is not None and not isinstance(last_exc, MQBrokerException):
+                raise last_exc
+            return None
+
+        route = _fetch(topic)
+        if route is None and topic != MixAll.DEFAULT_TOPIC:
+            # RocketMQ 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
+            # 需要像 Java 客户端那样回退到默认 topic（TBW102）来为该 topic 构造发布信息。
+            route = _fetch(MixAll.DEFAULT_TOPIC)
+            if route is not None:
+                # 新 topic 由 broker 用 default_topic_queue_nums 创建队列，而默认 topic 自身
+                # 可能配置了更多队列，这里按 broker 实际创建数裁剪，避免选中非法 queueId。
+                cap = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
+                for qd in route.queue_datas:
+                    qd.write_queue_nums = min(qd.write_queue_nums, cap)
+                    qd.read_queue_nums = min(qd.read_queue_nums, cap)
+        if route is None:
+            return False
+        with self.topic_route_lock:
+            self.topic_route_table[topic] = route
+            publish = self.topic_publish_info_table.setdefault(topic, TopicPublishInfo())
+            publish.order_topic = route.order_topic_conf is not None
+            publish.topic_route_data = route
+            publish.msg_queue_list = route.get_all_message_queue(topic)
+        return True
 
     def get_topic_publish_info(self, topic: str) -> TopicPublishInfo:
         with self.topic_route_lock:
@@ -166,7 +184,8 @@ class MQClientInstance:
         return None
 
     # ---------------- 消息发送 ----------------
-    def send_message(self, producer_group: str, msg: Message, mq: MessageQueue, timeout_millis: int = 3000) -> SendResult:
+    def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
+                     timeout_millis: int = 3000, sys_flag: int = 0) -> SendResult:
         addr = self.find_broker_addr_in_route(self.get_topic_route_data(mq.topic), mq.broker_name) if self.get_topic_route_data(mq.topic) else None
         if addr is None:
             route = self.get_topic_route_data(mq.topic)
@@ -175,31 +194,35 @@ class MQClientInstance:
             addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
             if addr is None:
                 raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis)
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag)
         response = self._invoke_sync(addr, request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_to_addr(self, producer_group: str, msg: Message, mq: MessageQueue,
-                             addr: str, timeout_millis: int = 3000) -> SendResult:
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis)
+                             addr: str, timeout_millis: int = 3000,
+                             sys_flag: int = 0) -> SendResult:
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag)
         response = self._invoke_sync(addr, request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_oneway(self, producer_group: str, msg: Message, mq: MessageQueue,
-                            addr: str, timeout_millis: int = 3000) -> None:
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis)
+                            addr: str, timeout_millis: int = 3000,
+                            sys_flag: int = 0) -> None:
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag)
         request.mark_oneway_rpc()
         self.remoting_client.invoke_oneway(addr, request)
 
     def _build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
-                            timeout_millis: int = 3000) -> RemotingCommand:
+                            timeout_millis: int = 3000, sys_flag: int = 0) -> RemotingCommand:
+        """sys_flag 由 Producer 算好（压缩标志 + 压缩类型位），见
+        DefaultMQProducer.try_to_compress_message。"""
         header = SendMessageRequestHeaderV2()
         header.producer_group = producer_group
         header.topic = msg.topic
         header.default_topic = MixAll.DEFAULT_TOPIC
         header.default_topic_queue_nums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
         header.queue_id = mq.queue_id
-        header.sys_flag = 0
+        header.sys_flag = sys_flag
         header.born_timestamp = int(time.time() * 1000)
         header.flag = msg.flag
         header.properties = message_properties_2_string(msg.properties)
@@ -370,24 +393,86 @@ class MQClientInstance:
 
     def query_message(self, topic: str, key: str, max_num: int, begin_timestamp: int,
                       end_timestamp: int, timeout_millis: int = 15000,
-                      addr: Optional[str] = None) -> Optional[bytes]:
+                      addr: Optional[str] = None,
+                      index_type: Optional[str] = None,
+                      uniq_key: bool = False) -> Optional[bytes]:
+        """按 key 查消息（对应 Java MQClientAPIImpl.queryMessage）。
+
+        ``index_type`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U")；
+        ``uniq_key=True`` 时还会额外下发 extFields["_UNIQUE_KEY_QUERY"]="true"，
+        broker 端据此强制走到 uniqKey 索引（并覆盖 maxNum 为默认查询条数）。
+        """
         if addr is None:
-            route = self.get_topic_route_data(topic)
-            if route is None:
-                raise MQClientException("No route info of this topic: %s" % topic)
-            addr = MQClientInstance.find_broker_addr_in_route(route, route.get_broker_datas()[0].broker_name)
+            addr = self._broker_addr_for_topic(topic)
         header = QueryMessageRequestHeader()
         header.topic = topic
         header.key = key
         header.max_num = max_num
         header.begin_timestamp = begin_timestamp
         header.end_timestamp = end_timestamp
+        header.index_type = index_type
         request = RemotingCommand.create_request_command(RequestCode.QUERY_MESSAGE, header)
+        if uniq_key:
+            request.ext_fields[MixAll.UNIQUE_MSG_QUERY_FLAG] = "true"
         response = self._invoke_sync(addr, request, timeout_millis)
         if response.code == ResponseCode.QUERY_NOT_FOUND:
             return None
         self._check_response(response)
         return response.body
+
+    def _broker_addr_for_topic(self, topic: str) -> str:
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            raise MQClientException("No route info of this topic: %s" % topic)
+        brokers = route.get_broker_datas()
+        if not brokers:
+            raise MQClientException("No broker in route of topic: %s" % topic)
+        addr = brokers[0].select_broker_addr()
+        if addr is None:
+            raise MQClientException("No available broker addr for topic: %s" % topic)
+        return addr
+
+    def query_message_all_brokers(self, topic: str, key: str, max_num: int,
+                                  begin_timestamp: int, end_timestamp: int,
+                                  index_type: Optional[str] = None,
+                                  uniq_key: bool = False,
+                                  timeout_millis: int = 15000) -> List:
+        """对应 Java MQAdminImpl.queryMessage：查该 topic **所有** broker 并合并去重后的消息。
+
+        Java 还会做客户端侧二次校验（uniqKey 命中要求 msgId == key；普通 key 命中要求
+        message.keys 拆分后含 key 且 topic 相同），这里保持一致。
+        """
+        from ..common.message_const import MessageConst
+        messages: List = []
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            return messages
+        for broker_data in route.get_broker_datas():
+            addr = broker_data.select_broker_addr()
+            if not addr:
+                continue
+            try:
+                body = self.query_message(topic, key, max_num, begin_timestamp,
+                                          end_timestamp, timeout_millis, addr,
+                                          index_type, uniq_key)
+            except Exception:  # noqa: BLE001
+                continue
+            if not body:
+                continue
+            for m in decode_messages(body):
+                m.broker_name = broker_data.broker_name
+                if uniq_key:
+                    if m.msg_id == key:
+                        messages.append(m)
+                else:
+                    keys = m.get_keys()
+                    if keys:
+                        for k in keys.split(MessageConst.KEY_SEPARATOR):
+                            if k == key and m.topic == topic:
+                                messages.append(m)
+                                break
+        messages.sort(key=lambda x: (x.queue_offset or 0))
+        return messages[:max_num] if max_num > 0 else messages
 
     # ---------------- 心跳 / 注销 ----------------
     def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> None:
@@ -432,27 +517,69 @@ class MQClientInstance:
 
     def create_topic_in_broker(self, broker_addr: str, default_topic: str, topic: str,
                                read_queue_nums: int = 4, write_queue_nums: int = 4,
-                               perm: int = 6, timeout_millis: int = 5000) -> None:
+                               perm: int = 6, topic_sys_flag: int = 0,
+                               topic_filter_type: str = TopicFilterType.SINGLE_TAG,
+                               order: bool = False, attributes: Optional[str] = None,
+                               timeout_millis: int = 5000, retry_times: int = 5) -> None:
+        """对应 Java MQClientAPIImpl.createTopic。
+
+        ⚠ 必须下发 topicFilterType：broker 的 CreateTopicRequestHeader.checkFields()
+        会把它转成枚举，为空直接报 "topicFilterType = [null] value invalid"。
+        Java 的 MQAdminImpl.createTopic 对每个 broker 还会重试 5 次。
+        """
         header = CreateTopicRequestHeader()
         header.topic = topic
         header.default_topic = default_topic
         header.read_queue_nums = read_queue_nums
         header.write_queue_nums = write_queue_nums
         header.perm = perm
+        header.topic_filter_type = topic_filter_type
+        header.topic_sys_flag = topic_sys_flag
+        header.order = order
+        # Java: AttributeParser.parseToString(map) —— 空 map 输出 ""，不是 null
+        header.attributes = attributes if attributes is not None else ""
+        header.force = False
         request = RemotingCommand.create_request_command(RequestCode.UPDATE_AND_CREATE_TOPIC, header)
-        response = self._invoke_sync(broker_addr, request, timeout_millis)
-        self._check_response(response)
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max(1, retry_times)):
+            try:
+                response = self._invoke_sync(broker_addr, request, timeout_millis)
+                self._check_response(response)
+                return
+            except MQBrokerException:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if attempt == retry_times - 1:
+                    raise
+        if last_exc is not None:
+            raise last_exc
 
     def create_topic_in_route(self, topic: str, read_queue_nums: int = 4, write_queue_nums: int = 4,
-                              perm: int = 6, timeout_millis: int = 5000) -> None:
+                              perm: int = 6, topic_sys_flag: int = 0,
+                              attributes: Optional[str] = None,
+                              timeout_millis: int = 5000) -> None:
+        """对应 Java MQAdminImpl.createTopic：只对默认 topic 路由里的 **master** 下发。"""
         route = self.get_topic_route_data(MixAll.DEFAULT_TOPIC)
         if route is None:
             raise MQClientException("No route info of default topic %s" % MixAll.DEFAULT_TOPIC)
+        created_at_least_once = False
+        last_exc: Optional[Exception] = None
         for broker_data in route.get_broker_datas():
             addr = broker_data.select_broker_addr()
-            if addr:
+            if not addr:
+                continue
+            try:
                 self.create_topic_in_broker(addr, MixAll.DEFAULT_TOPIC, topic,
-                                            read_queue_nums, write_queue_nums, perm, timeout_millis)
+                                            read_queue_nums, write_queue_nums, perm,
+                                            topic_sys_flag, attributes=attributes,
+                                            timeout_millis=timeout_millis)
+                created_at_least_once = True
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+        if not created_at_least_once and last_exc is not None:
+            raise MQClientException("create new topic failed", cause=last_exc)
 
     def delete_topic_in_broker(self, broker_addr: str, topic: str, timeout_millis: int = 5000) -> None:
         request = RemotingCommand.create_request_command(RequestCode.DELETE_TOPIC_IN_BROKER, None)

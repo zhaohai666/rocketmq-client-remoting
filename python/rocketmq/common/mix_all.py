@@ -14,6 +14,12 @@ class MixAll:
     CLIENT_INNER_PRODUCER_GROUP = "CLIENT_INNER_PRODUCER"
     SELF_TEST_PRODUCER_GROUP = "SELF_TEST_P_GROUP"
     SELF_TEST_CONSUMER_GROUP = "SELF_TEST_C_GROUP"
+    SCHEDULE_CONSUMER_GROUP = "SCHEDULE_CONSUMER"
+    ONS_HTTP_PROXY_GROUP = "CID_ONS-HTTP-PROXY"
+    CID_ONSAPI_PERMISSION_GROUP = "CID_ONSAPI_PERMISSION"
+    CID_ONSAPI_OWNER_GROUP = "CID_ONSAPI_OWNER"
+    CID_ONSAPI_PULL_GROUP = "CID_ONSAPI_PULL"
+    CID_SYS_RMQ_TRANS = "CID_SYS_RMQ_TRANS"
     ONS_ADDR = "ONS_ADDR"
     CID_RMQ_SYS_PREFIX = "CID_RMQ_SYS_"
     CID_ONSAPI_PREFIX = "CID_ONSAPI_"
@@ -33,9 +39,10 @@ class MixAll:
     CLIENT_INNER_CONSUMER_GROUP = "CLIENT_INNER_CONSUMER"
     SELF_TEST_CONSUMER_GROUP2 = "SELF_TEST_C_GROUP2"
     ONS_NAMESPACE = "namespace"
-    ALL_MESSAGE_QUERY_FLAG = 0
-    UNIQUE_MSG_QUERY_FLAG = 1
-    NORMAL_MSG_QUERY_FLAG = 2
+    # ⚠ Java MixAll.UNIQUE_MSG_QUERY_FLAG 是 extFields 的**键名**（值为 "true"/"false"），
+    # 不是数字标志位。broker QueryMessageProcessor 用 request.extFields.get(该键) 判断是否按
+    # uniqKey（INDEX_UNIQUE_TYPE）查询。早期 Python 把它误写成 1。
+    UNIQUE_MSG_QUERY_FLAG = "_UNIQUE_KEY_QUERY"
     TRACE_TOPIC = "RMQ_SYS_TRACE_TOPIC"
     REAL_TRACE_TOPIC = "rmq_sys_TRACE_DATA"
     TRANS_STAT_PROGRESS_TOPIC = "RMQ_SYS_TRANS_OP_HALF_TOPIC"
@@ -45,6 +52,8 @@ class MixAll:
     RMQ_SYS_TRANS_CHECK_MAX_TIME = 15
     TRANS_CHECK_MAX_TIME = 15
     UNIT_PREFIX = "unit_"
+    LMQ_PREFIX = "%LMQ%"
+    LMQ_QUEUE_ID = 0
     DEFAULT_TOPIC_QUEUE_NUMS = 4
     DEFAULT_TOPIC_READ_QUEUE_NUMS = 4
     DEFAULT_TOPIC_WRITE_QUEUE_NUMS = 4
@@ -104,6 +113,21 @@ class MixAll:
         return topic is not None and topic.startswith(MixAll.SYSTEM_TOPIC_PREFIX)
 
     @staticmethod
+    def is_lmq(lmq_meta_data: str) -> bool:
+        """对应 Java MixAll.isLmq（LMQ topic 以 %LMQ% 开头）。"""
+        return lmq_meta_data is not None and lmq_meta_data.startswith(MixAll.LMQ_PREFIX)
+
+    @staticmethod
+    def is_sys_consumer_group(consumer_group: str) -> bool:
+        """对应 Java MixAll.isSysConsumerGroup（CID_RMQ_SYS_ 前缀）。"""
+        return consumer_group is not None and consumer_group.startswith(MixAll.CID_RMQ_SYS_PREFIX)
+
+    @staticmethod
+    def is_predefined_group(consumer_group: str) -> bool:
+        """对应 Java MixAll.isPredefinedGroup 的 PREDEFINE_GROUP_SET。"""
+        return consumer_group in _PREDEFINE_GROUP_SET
+
+    @staticmethod
     def reset_retry_and_dlq_topic(topic: str) -> str:
         if topic is None:
             return None
@@ -146,3 +170,108 @@ class MixAll:
     def pid() -> int:
         import os
         return os.getpid()
+
+    # ---------------- Properties <-> String（对应 MixAll.properties2String/string2Properties）----------------
+    @staticmethod
+    def properties2_string(properties, is_sort: bool = False) -> str:
+        """Java: MixAll.properties2String —— 每条 "key=value\\n"，null 值跳过。"""
+        if properties is None:
+            return ""
+        items = list(properties.items())
+        if is_sort:
+            items.sort(key=lambda kv: str(kv[0]))
+        buf = []
+        for k, v in items:
+            if v is not None:
+                buf.append("%s=%s\n" % (k, v))
+        return "".join(buf)
+
+    @staticmethod
+    def string2_properties(text: str) -> dict:
+        """Java: MixAll.string2Properties —— 走 java.util.Properties.load 语义。
+
+        规则（逐条对齐 ``java.util.Properties.load``）：
+          - 跳过空行与 ``#`` / ``!`` 注释行；
+          - 行尾**未转义**的 ``\\`` 表示续行，下一行的前导空白被丢弃；
+          - 键与值以**第一个** ``=``、``:`` 或**空白**分隔（空白也是合法分隔符！）；
+          - 分隔符前后的空白被跳过；值的**尾部**空白保留（Java 不去尾空白）。
+
+        注：Java 还会处理 ``\\t \\n \\uXXXX`` 等转义，broker 配置导出里不出现，
+        这里不实现（避免把反斜杠语义做错反而不一致）。
+        """
+        if text is None:
+            return {}
+        result = {}
+        # 先把续行合并成逻辑行（java.util.Properties 语义）
+        logical_lines = []
+        pending = None
+        for raw in text.splitlines():
+            line = raw
+            if pending is not None:
+                line = pending + line.lstrip()
+                pending = None
+            # 统计行尾反斜杠个数：奇数表示续行
+            trailing = len(line) - len(line.rstrip("\\"))
+            if trailing % 2 == 1:
+                pending = line[:-1]
+                continue
+            logical_lines.append(line)
+        if pending is not None:
+            logical_lines.append(pending)
+
+        for line in logical_lines:
+            stripped = line.strip()
+            if not stripped or stripped[0] in "#!":
+                continue
+            n = len(line)
+            i = 0
+            while i < n and line[i] in _PROP_WS:
+                i += 1
+            key_start = i
+            while i < n and line[i] not in "=:" and line[i] not in _PROP_WS:
+                i += 1
+            key = line[key_start:i]
+            # 跳过分隔符前的空白
+            while i < n and line[i] in _PROP_WS:
+                i += 1
+            # 可选的 '=' / ':' 及其后的空白
+            if i < n and line[i] in "=:":
+                i += 1
+                while i < n and line[i] in _PROP_WS:
+                    i += 1
+            result[key] = line[i:]
+        return result
+
+
+# java.util.Properties.load 认的空白字符（string2_properties 的分隔判断用）。
+# 必须是模块级常量：staticmethod 里裸名查找走的是模块全局，不是类作用域。
+_PROP_WS = " \t\f"
+
+
+# 对应 Java MixAll.PREDEFINE_GROUP_SET
+_PREDEFINE_GROUP_SET = frozenset([
+    MixAll.DEFAULT_CONSUMER_GROUP,
+    MixAll.DEFAULT_PRODUCER_GROUP,
+    MixAll.TOOLS_CONSUMER_GROUP,
+    MixAll.SCHEDULE_CONSUMER_GROUP,
+    MixAll.FILTERSRV_CONSUMER_GROUP,
+    MixAll.MONITOR_CONSUMER_GROUP,
+    MixAll.CLIENT_INNER_PRODUCER_GROUP,
+    MixAll.SELF_TEST_PRODUCER_GROUP,
+    MixAll.SELF_TEST_CONSUMER_GROUP,
+    MixAll.ONS_HTTP_PROXY_GROUP,
+    MixAll.CID_ONSAPI_PERMISSION_GROUP,
+    MixAll.CID_ONSAPI_OWNER_GROUP,
+    MixAll.CID_ONSAPI_PULL_GROUP,
+    MixAll.CID_SYS_RMQ_TRANS,
+])
+
+class QueryMsgType:
+    """按 key 查消息的三种模式（对应 tools 的 QueryMsgByKeySubCommand.QueryMsgType）。
+
+    与 ``MixAll.UNIQUE_MSG_QUERY_FLAG`` 不是一个东西：后者是 extFields 里的**键名**。
+    """
+
+    ALL_MESSAGE = 0
+    UNIQUE_KEY = 1
+    NORMAL = 2

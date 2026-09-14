@@ -170,29 +170,126 @@ def decode_message_id(msg_id: str) -> Tuple[str, int, int]:
 # ------------------------------------------------- 压缩 / 解压（可选依赖）
 
 
-def _compress(data: bytes, compression_type: int) -> bytes:
-    if compression_type == MessageSysFlag.ZLIB_TYPE:
-        return zlib.compress(data, 5)
-    if compression_type == MessageSysFlag.LZ4_TYPE:
-        try:
-            import lz4.frame  # type: ignore
-        except ImportError:
-            return data
-        return lz4.frame.compress(data)
-    # zstd / 其它：缺少实现时原样返回，与 Java 客户端无对应依赖时行为一致
-    return data
+def normalize_compression_type(compression_type: int) -> int:
+    """把 sysFlag 里解出的压缩类型归一化到"真实算法"。
+
+    对齐 Java ``CompressionType.findByValue`` 的向后兼容映射::
+
+        case 1: return LZ4;
+        case 2: return ZSTD;
+        case 0: // To be compatible for older versions without compression type
+        case 3: return ZLIB;
+
+    即**类型位为 0 的老版本压缩消息按 ZLIB 处理**。这是必需的：老版本客户端
+    （无类型位能力）产出的压缩消息类型位就是 0，若不映射到 ZLIB，解压会失败，
+    而外层又会照样清掉 COMPRESSED_FLAG，结果是**静默返回压缩字节流**——数据损坏
+    且事后无法识别。
+    """
+    if compression_type == 0:
+        return MessageSysFlag.ZLIB_TYPE
+    return compression_type
+
+
+def _unsupported(compression_type: int) -> RuntimeError:
+    """对应 Java ``CompressorFactory.getCompressor`` 在未知类型时抛的异常。
+
+    Java 的 ``CompressionType.findByValue`` 只认 0/3(ZLIB)、1(LZ4)、2(ZSTD)，
+    其余返回 null，``CompressorFactory`` 随即抛 ``IllegalArgumentException``。
+    **绝不能原样透传**：调用方（``decode_message``）在解压后会清掉
+    ``COMPRESSED_FLAG``，透传等于把压缩字节流当正文交出去且事后无法识别，
+    属于静默数据损坏。C++ 侧同语义（``CompressorFactory::decompress`` 抛 runtime_error）。
+    """
+    return RuntimeError("unsupported compression type: %d" % compression_type)
+
+
+def _compress(data: bytes, compression_type: int, level: int = 5) -> bytes:
+    ctype = normalize_compression_type(compression_type)
+    if ctype == MessageSysFlag.ZLIB_TYPE:
+        return zlib.compress(data, level)
+    if ctype == MessageSysFlag.LZ4_TYPE:
+        return _lz4_frame().compress(data)
+    if ctype == MessageSysFlag.ZSTD_TYPE:
+        return _zstd().compress(data)
+    raise _unsupported(compression_type)
 
 
 def _decompress(data: bytes, compression_type: int) -> bytes:
-    if compression_type == MessageSysFlag.ZLIB_TYPE:
+    ctype = normalize_compression_type(compression_type)
+    if ctype == MessageSysFlag.ZLIB_TYPE:
         return zlib.decompress(data)
-    if compression_type == MessageSysFlag.LZ4_TYPE:
+    if ctype == MessageSysFlag.LZ4_TYPE:
+        return _lz4_frame().decompress(data)
+    if ctype == MessageSysFlag.ZSTD_TYPE:
+        return _zstd().decompress(data)
+    raise _unsupported(compression_type)
+
+
+class _Lz4Codec:
+    """LZ4 Frame 编解码器（Java lz4-java 的 Frame 格式）。
+
+    Java 侧用 ``LZ4FrameOutputStream`` / ``LZ4FrameInputStream``，Python 的
+    ``lz4.frame`` 实现的是同一个 LZ4 Frame 规范，二者字节互通。
+
+    未安装 ``lz4`` 时**抛错而非静默透传**：静默透传会把压缩字节流当正文返回，
+    属不可察觉的数据损坏（对齐 Java 抛异常的行为）。
+    """
+
+    @staticmethod
+    def _mod():
         try:
             import lz4.frame  # type: ignore
-        except ImportError:
-            return data
-        return lz4.frame.decompress(data)
-    return data
+        except ImportError as e:  # pragma: no cover - 取决于环境
+            raise RuntimeError(
+                "lz4 compression requires the 'lz4' package: pip install lz4"
+            ) from e
+        return lz4.frame
+
+    @staticmethod
+    def compress(data: bytes) -> bytes:
+        return _Lz4Codec._mod().compress(data)
+
+    @staticmethod
+    def decompress(data: bytes) -> bytes:
+        return _Lz4Codec._mod().decompress(data)
+
+
+class _ZstdCodec:
+    """ZSTD 编解码器（Java zstd-jni 的 ZstdOutputStream/ZstdInputStream）。
+
+    未安装 ``zstandard`` 时抛错，理由同 LZ4。
+    """
+
+    @staticmethod
+    def _mod():
+        try:
+            import zstandard  # type: ignore
+        except ImportError as e:  # pragma: no cover - 取决于环境
+            raise RuntimeError(
+                "zstd compression requires the 'zstandard' package: pip install zstandard"
+            ) from e
+        return zstandard
+
+    @staticmethod
+    def compress(data: bytes) -> bytes:
+        return _ZstdCodec._mod().ZstdCompressor().compress(data)
+
+    @staticmethod
+    def decompress(data: bytes) -> bytes:
+        # Java ZstdInputStream 读的是带 content-size 的普通 zstd 帧，
+        # 这里用流式 API 以兼容未写入 content-size 的帧（Java 默认不写）。
+        import io
+
+        dctx = _ZstdCodec._mod().ZstdDecompressor()
+        with dctx.stream_reader(io.BytesIO(data)) as reader:
+            return reader.read()
+
+
+def _lz4_frame() -> type:
+    return _Lz4Codec
+
+
+def _zstd() -> type:
+    return _ZstdCodec
 
 
 # ------------------------------------------- 1) 17 段存储格式：MessageExt

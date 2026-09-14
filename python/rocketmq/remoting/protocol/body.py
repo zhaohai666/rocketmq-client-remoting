@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from ..protocol.serialize import RemotingSerializable
+from ..protocol.serialize import RemotingSerializable, fastjson_loads
+# MessageQueue 作为 map 键的解析/序列化（fastjson2 非字符串键）+ 共用 DTO
+from .admin_body import decode_message_queue_map, message_queue_key  # noqa: F401
 
 
 class KVTable:
@@ -176,15 +178,25 @@ class ClusterInfo:
 
     def to_dict(self) -> dict:
         return {
-            "brokerAddrTable": {k: {str(kk): v for kk, v in vv.items()} for k, vv in self.broker_addr_table.items()},
+            "brokerAddrTable": {
+                k: {
+                    "cluster": "",
+                    "brokerName": k,
+                    "brokerAddrs": {str(kk): v for kk, v in vv.items()},
+                    "enableActingMaster": False,
+                } for k, vv in self.broker_addr_table.items()
+            },
             "clusterAddrTable": self.cluster_addr_table,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "ClusterInfo":
         ci = ClusterInfo()
+        # 真实 RocketMQ 的 brokerAddrTable[name] 是一个 BrokerData 对象，
+        # 真正的 {brokerId: addr} 映射在其中的 brokerAddrs 字段下。
         ci.broker_addr_table = {
-            k: {int(kk): v for kk, v in vv.items()} for k, vv in (d.get("brokerAddrTable") or {}).items()
+            k: {int(kk): v for kk, v in (vv.get("brokerAddrs") or {}).items()}
+            for k, vv in (d.get("brokerAddrTable") or {}).items()
         }
         ci.cluster_addr_table = d.get("clusterAddrTable") or {}
         return ci
@@ -389,18 +401,24 @@ class ConsumeStatsList:
 
 
 class ResetOffsetBody:
+    """对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody。
+
+    ⚠ Java 字段是 ``Map<MessageQueue, Long> offsetTable``，**不是** topic→queueId→offset
+    的嵌套 map（早期 Python 实现写错了，真实 broker 响应解析不出来）。
+    fastjson2 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
+    """
+
     def __init__(self):
-        self.offset_table: Dict[str, Dict[int, int]] = {}
+        self.offset_table: Dict[MessageQueue, int] = {}
 
     def to_dict(self) -> dict:
-        return {"offsetTable": {k: {str(kk): v for kk, v in vv.items()} for k, vv in self.offset_table.items()}}
+        return {"offsetTable": {message_queue_key(k): v for k, v in self.offset_table.items()}}
 
     @staticmethod
     def from_dict(d: dict) -> "ResetOffsetBody":
         b = ResetOffsetBody()
-        b.offset_table = {
-            k: {int(kk): v for kk, v in vv.items()} for k, vv in (d.get("offsetTable") or {}).items()
-        }
+        for mq, v in decode_message_queue_map(d.get("offsetTable")).items():
+            b.offset_table[mq] = int(v)
         return b
 
     def encode(self) -> bytes:
@@ -408,4 +426,4 @@ class ResetOffsetBody:
 
     @staticmethod
     def decode(data: bytes) -> "ResetOffsetBody":
-        return ResetOffsetBody.from_dict(RemotingSerializable.decode_json(data))
+        return ResetOffsetBody.from_dict(fastjson_loads(data.decode("utf-8")))

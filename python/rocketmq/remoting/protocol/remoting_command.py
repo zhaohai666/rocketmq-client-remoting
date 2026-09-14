@@ -184,7 +184,12 @@ class RemotingCommand:
         else:
             obj = json.loads(header_data.decode("utf-8"))
             cmd = RemotingCommand(code=int(obj.get("code", 0)), remark=obj.get("remark"), flag=int(obj.get("flag", 0)))
-            cmd.language = int(obj.get("language", LanguageCode.PYTHON))
+            # 5.x NameServer 把 language 序列化为枚举名字符串（如 "JAVA"），4.x 用 int；
+            # 这里兼容两种形态，统一成 int 码。
+            _lang = obj.get("language", LanguageCode.PYTHON)
+            if isinstance(_lang, str):
+                _lang = LanguageCode.name_to_code(_lang)
+            cmd.language = int(_lang)
             cmd.version = int(obj.get("version", 0))
             cmd.opaque = int(obj.get("opaque", -1))
             cmd.ext_fields = obj.get("extFields") or {}

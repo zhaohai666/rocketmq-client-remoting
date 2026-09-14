@@ -62,6 +62,12 @@ class MessageConst:
     CHARACTER_MAX_LENGTH = 255
     MESSAGE_ID_PREFIX = "MSGID-"
 
+    # 索引查询类型（对应 MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE）
+    # broker 的 QueryMessageRequestHeader.indexType 取这些值；为空时 broker 按 "K" 处理。
+    INDEX_KEY_TYPE = "K"
+    INDEX_UNIQUE_TYPE = "U"
+    INDEX_TAG_TYPE = "T"
+
     @staticmethod
     def message_id_prefix() -> str:
         return MessageConst.MESSAGE_ID_PREFIX

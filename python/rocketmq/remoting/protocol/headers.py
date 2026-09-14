@@ -20,8 +20,20 @@ class CommandCustomHeader:
 
 
 def _ext(fields: dict) -> dict:
-    """过滤 None。"""
-    return {k: v for k, v in fields.items() if v is not None}
+    """过滤 None，并把 bool 规范成 Java ``Boolean.toString`` 的小写形式。
+
+    为什么必须显式转换：``RemotingCommand`` 落 ext_fields 时统一走 ``str(v)``，
+    Python 的 ``str(False)`` 是 ``"False"``，而 Java 写的是 ``"false"``。
+    broker 侧 ``Boolean.parseBoolean`` 大小写不敏感，所以功能上不出错，但线上
+    报文会与 Java 客户端不一致（对比抓包/单测断言时很别扭）。
+    这里统一成小写，与 C++ 侧 ``putOptBool`` 完全一致。
+    """
+    out = {}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        out[k] = ("true" if v else "false") if isinstance(v, bool) else v
+    return out
 
 
 def _i(v) -> Optional[int]:
@@ -433,17 +445,26 @@ class GetEarliestMsgStoretimeResponseHeader(CommandCustomHeader):
 
 
 class QueryMessageRequestHeader(CommandCustomHeader):
+    """对应 org.apache.rocketmq.remoting.protocol.header.QueryMessageRequestHeader。
+
+    ``index_type`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
+    INDEX_TAG_TYPE("T")；broker 侧为空时默认按 "K"（普通 key 索引）查。
+    """
+
     def __init__(self):
         self.topic: Optional[str] = None
         self.key: Optional[str] = None
         self.max_num: Optional[int] = None
         self.begin_timestamp: Optional[int] = None
         self.end_timestamp: Optional[int] = None
+        self.index_type: Optional[str] = None
+        self.last_key: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
         return _ext({
             "topic": self.topic, "key": self.key, "maxNum": self.max_num,
             "beginTimestamp": self.begin_timestamp, "endTimestamp": self.end_timestamp,
+            "indexType": self.index_type, "lastKey": self.last_key,
         })
 
     def from_ext_fields(self, ext: dict) -> None:
@@ -452,6 +473,8 @@ class QueryMessageRequestHeader(CommandCustomHeader):
         self.max_num = _i(ext.get("maxNum"))
         self.begin_timestamp = _l(ext.get("beginTimestamp"))
         self.end_timestamp = _l(ext.get("endTimestamp"))
+        self.index_type = ext.get("indexType")
+        self.last_key = ext.get("lastKey")
 
 
 class QueryMessageResponseHeader(CommandCustomHeader):
@@ -796,6 +819,13 @@ class GetTopicConfigRequestHeader(CommandCustomHeader):
 
 
 class CreateTopicRequestHeader(CommandCustomHeader):
+    """对应 org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader。
+
+    ⚠ broker 的 checkFields() 会把 ``topicFilterType`` 解析成枚举，**为空直接抛
+    RemotingCommandException("topicFilterType = [null] value invalid")**，
+    所以哪怕只想建普通 topic，也必须显式下发 topicFilterType。
+    """
+
     def __init__(self):
         self.topic: Optional[str] = None
         self.default_topic: Optional[str] = None
@@ -805,6 +835,9 @@ class CreateTopicRequestHeader(CommandCustomHeader):
         self.topic_filter_type: Optional[str] = None
         self.topic_sys_flag: Optional[int] = None
         self.order: Optional[bool] = None
+        # AttributeParser.parseToString 格式："k1=v1,k2" （值为空时只留 key）
+        self.attributes: Optional[str] = None
+        self.force: Optional[bool] = None
 
     def to_ext_fields(self) -> dict:
         return _ext({
@@ -812,6 +845,7 @@ class CreateTopicRequestHeader(CommandCustomHeader):
             "readQueueNums": self.read_queue_nums, "writeQueueNums": self.write_queue_nums,
             "perm": self.perm, "topicFilterType": self.topic_filter_type,
             "topicSysFlag": self.topic_sys_flag, "order": self.order,
+            "attributes": self.attributes, "force": self.force,
         })
 
     def from_ext_fields(self, ext: dict) -> None:
