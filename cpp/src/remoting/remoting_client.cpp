@@ -1,0 +1,496 @@
+// RemotingClient 的实现：基于阻塞 socket + 每连接读线程的请求/响应模型。
+//
+// 两个容易踩的坑，这里都做了处理：
+//   1. SIGPIPE：向已被对端关闭的 socket 写入会触发 SIGPIPE，默认行为是**杀掉进程**。
+//      Linux 上用 send(..., MSG_NOSIGNAL)，macOS/BSD 上用 SO_NOSIGPIPE 套接字选项。
+//   2. 读线程退出：不能靠阻塞 recv 长时间挂着，否则 shutdown 时无法及时回收。
+//      这里用 select() 带 300ms 超时轮询，既能及时退出也不会空转烧 CPU。
+#include "rocketmq/remoting/remoting_client.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "rocketmq/common/byte_buffer.h"
+#include "rocketmq/common/net_compat.h"
+#include "rocketmq/remoting/exception.h"
+
+#ifndef _WIN32
+#include <fcntl.h>  // 非阻塞 connect 用（fcntl/F_GETFL/F_SETFL）
+#endif
+
+namespace rocketmq {
+
+namespace {
+
+// 平台 socket 原语统一来自 netcompat（见 include/rocketmq/common/net_compat.h）。
+// 用 using 声明引入文件作用域，保持下面代码里 socket_t/closeSocket 等名字不变。
+using netcompat::closeSocket;
+using netcompat::ensureInitialized;
+using netcompat::kInvalidSocket;
+using netcompat::sendFlags;
+using netcompat::socket_t;
+using netcompat::tuneSocket;
+
+// 带超时的 connect：先置非阻塞，select 等可写，再恢复阻塞
+socket_t connectWithTimeout(const std::string& host, const std::string& port,
+                            int32_t timeoutMillis, std::string& err) {
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || res == nullptr) {
+        err = "cannot resolve host " + host;
+        return kInvalidSocket;
+    }
+
+    socket_t sock = kInvalidSocket;
+    for (struct addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
+        sock = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sock == kInvalidSocket) {
+            continue;
+        }
+#ifdef _WIN32
+        u_long nb = 1;
+        ::ioctlsocket(sock, FIONBIO, &nb);
+#else
+        int flags = ::fcntl(sock, F_GETFL, 0);
+        ::fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+        int rc = ::connect(sock, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
+        bool connected = (rc == 0);
+        if (!connected) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            struct timeval tv;
+            tv.tv_sec = timeoutMillis / 1000;
+            tv.tv_usec = (timeoutMillis % 1000) * 1000;
+            int sel = ::select(netcompat::selectNfds(sock), nullptr, &wfds, nullptr, &tv);
+            if (sel > 0) {
+                // 可写不代表连上了，必须用 SO_ERROR 复核
+                int soErr = 0;
+                netcompat::socklen_type len = sizeof(soErr);
+                ::getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                             reinterpret_cast<char*>(&soErr), &len);
+                connected = (soErr == 0);
+            }
+        }
+        if (connected) {
+            // 恢复阻塞模式，读循环用 select() 控制节奏
+#ifdef _WIN32
+            u_long blk = 0;
+            ::ioctlsocket(sock, FIONBIO, &blk);
+#else
+            int flags2 = ::fcntl(sock, F_GETFL, 0);
+            ::fcntl(sock, F_SETFL, flags2 & ~O_NONBLOCK);
+#endif
+            tuneSocket(sock);
+            break;
+        }
+        closeSocket(sock);
+        sock = kInvalidSocket;
+    }
+    ::freeaddrinfo(res);
+    if (sock == kInvalidSocket) {
+        err = "connect failed to " + host + ":" + port;
+    }
+    return sock;
+}
+
+// 写全部字节；返回 false 表示对端已关闭或出错
+bool sendAll(socket_t sock, const Bytes& data) {
+    size_t sent = 0;
+    const int flags = sendFlags();
+    while (sent < data.size()) {
+        int n = static_cast<int>(::send(sock, data.data() + sent,
+                                        static_cast<int>(data.size() - sent), flags));
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+std::string formatAddr(const std::string& addr) { return addr; }
+
+}  // namespace
+
+// ---------------------------------------------------------------- Impl
+struct RemotingClient::Impl {
+    struct Connection {
+        std::string addr;
+        socket_t sock = kInvalidSocket;
+        std::mutex writeMutex;
+        std::atomic<bool> readerDone{false};
+    };
+
+    struct Future {
+        std::mutex m;
+        std::condition_variable cv;
+        bool done = false;
+        bool hasResponse = false;
+        RemotingCommand response;
+        InvokeCallback callback;
+    };
+
+    std::atomic<bool> running{true};
+    int32_t connectTimeout = 3000;
+    int32_t invokeTimeout = 15000;
+
+    mutable std::mutex connMutex;
+    std::unordered_map<std::string, std::shared_ptr<Connection>> conns;
+
+    std::mutex respMutex;
+    std::unordered_map<int32_t, std::shared_ptr<Future>> respTable;
+
+    // 读线程账本：<连接, 线程>。线程结束后置 connection->readerDone，
+    // 由 pruneThreadsLocked 回收（join 后从账本移除），避免线程句柄无限堆积。
+    std::mutex threadMutex;
+    std::vector<std::pair<std::shared_ptr<Connection>, std::thread>> threads;
+
+    void pruneThreadsLocked() {
+        for (auto it = threads.begin(); it != threads.end();) {
+            if (it->first->readerDone.load()) {
+                if (it->second.joinable()) {
+                    it->second.join();
+                }
+                it = threads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void pruneThreads() {
+        std::lock_guard<std::mutex> lk(threadMutex);
+        pruneThreadsLocked();
+    }
+
+    // 取出并创建/复用连接；不持有 connMutex 的调用方负责传入已锁定的上下文
+    std::shared_ptr<Connection> getOrCreateConnection(const std::string& addr) {
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            auto it = conns.find(addr);
+            if (it != conns.end() && it->second->sock != kInvalidSocket) {
+                return it->second;
+            }
+        }
+        // 建连放到锁外，避免慢 connect 阻塞其它地址
+        std::string host;
+        std::string port;
+        RemotingClient::parseAddress(addr, host, port);
+        std::string err;
+        socket_t sock = connectWithTimeout(host, port, connectTimeout, err);
+        if (sock == kInvalidSocket) {
+            throw RemotingConnectException(err);
+        }
+
+        auto conn = std::make_shared<Connection>();
+        conn->addr = addr;
+        conn->sock = sock;
+
+        pruneThreads();
+
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            // 并发建连：若已有别人先建成，放弃自己的 socket
+            auto it = conns.find(addr);
+            if (it != conns.end() && it->second->sock != kInvalidSocket) {
+                closeSocket(sock);
+                return it->second;
+            }
+            conns[addr] = conn;
+        }
+
+        std::thread reader([this, conn]() { readLoop(conn); });
+        {
+            std::lock_guard<std::mutex> lk(threadMutex);
+            threads.emplace_back(conn, std::move(reader));
+        }
+        return conn;
+    }
+
+    void readLoop(const std::shared_ptr<Connection>& conn) {
+        Bytes buf;
+        const socket_t sock = conn->sock;
+        char chunk[65536];
+        while (running.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(sock, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 300000;  // 300ms：既能及时退出，也不空转
+            int sel = ::select(static_cast<int>(sock) + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel < 0) {
+                break;  // 描述符已关闭（shutdown 时会走这条）
+            }
+            if (sel == 0) {
+                continue;
+            }
+            int n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
+            if (n <= 0) {
+                break;  // 0 = 对端关闭
+            }
+            buf.append(chunk, static_cast<size_t>(n));
+            // 按 totalLength 前缀切帧；粘包/半包都由这里处理
+            while (true) {
+                if (buf.size() < 4) {
+                    break;
+                }
+                int32_t totalLen = ByteReader::getInt32At(buf, 0);
+                if (totalLen <= 0 || totalLen > RemotingClient::MAX_FRAME_LENGTH) {
+                    buf.clear();
+                    break;
+                }
+                if (buf.size() < static_cast<size_t>(4 + totalLen)) {
+                    break;  // 半包，继续收
+                }
+                Bytes frame = buf.substr(0, static_cast<size_t>(4 + totalLen));
+                buf.erase(0, static_cast<size_t>(4 + totalLen));
+                dispatch(frame);
+            }
+        }
+        conn->readerDone.store(true);
+        // 把自己从连接表摘掉（避免留下失效条目）
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            auto it = conns.find(conn->addr);
+            if (it != conns.end() && it->second == conn) {
+                conns.erase(it);
+            }
+        }
+    }
+
+    void dispatch(const Bytes& frame) {
+        RemotingCommand cmd;
+        if (!RemotingCommand::tryDecode(frame, cmd, nullptr)) {
+            return;  // 解不出的帧直接丢，不影响其它请求
+        }
+        std::shared_ptr<Future> future;
+        {
+            std::lock_guard<std::mutex> lk(respMutex);
+            auto it = respTable.find(cmd.opaque);
+            if (it != respTable.end()) {
+                future = it->second;
+                respTable.erase(it);
+            }
+        }
+        if (future == nullptr) {
+            return;  // 已超时的请求（响应来晚了）
+        }
+        InvokeCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(future->m);
+            future->response = cmd;
+            future->hasResponse = true;
+            future->done = true;
+            cb = future->callback;
+        }
+        future->cv.notify_all();
+        if (cb) {
+            cb(cmd);
+        }
+    }
+
+    // 取得一个**在途请求中唯一**的 opaque，并在同一把锁内登记 future。
+    //
+    // 为什么不能简单用 "opaque == 0 就重分配"：RemotingCommand 的 opaque 计数器从 0
+    // 开始，所以 createRequestCommand() 产出的**第一个**请求 opaque 就是 0，把 0 当
+    // "未设置"会把它改掉，导致调用方与服务端回填的 opaque 不一致（调用方拿不到响应）。
+    // 这里只在**真的与在途请求冲突**时才重分配，其余情况原样保留（含 0），与 Java
+    // NettyRemotingClient 从不改写调用方 opaque 的行为一致。
+    std::shared_ptr<Future> registerFutureAcquiringOpaque(RemotingCommand& request,
+                                                          InvokeCallback cb) {
+        auto future = std::make_shared<Future>();
+        future->callback = std::move(cb);
+        std::lock_guard<std::mutex> lk(respMutex);
+        if (respTable.find(request.opaque) != respTable.end()) {
+            int32_t candidate = 0;
+            do {
+                candidate = RemotingCommand::nextOpaque();
+            } while (candidate == request.opaque
+                     || respTable.find(candidate) != respTable.end());
+            request.opaque = candidate;
+        }
+        respTable[request.opaque] = future;
+        return future;
+    }
+
+    void unregisterFuture(int32_t opaque) {
+        std::lock_guard<std::mutex> lk(respMutex);
+        respTable.erase(opaque);
+    }
+
+    void sendRequest(const std::string& addr, RemotingCommand& request) {
+        auto conn = getOrCreateConnection(addr);
+        Bytes data = request.encode();
+        std::lock_guard<std::mutex> lk(conn->writeMutex);
+        if (!sendAll(conn->sock, data)) {
+            closeSocket(conn->sock);
+            conn->sock = kInvalidSocket;
+            {
+                std::lock_guard<std::mutex> clk(connMutex);
+                auto it = conns.find(addr);
+                if (it != conns.end() && it->second == conn) {
+                    conns.erase(it);
+                }
+            }
+            throw RemotingSendRequestException(formatAddr(addr));
+        }
+    }
+
+    void shutdown() {
+        bool expected = true;
+        if (!running.compare_exchange_strong(expected, false)) {
+            return;  // 已关闭
+        }
+        std::vector<std::shared_ptr<Connection>> all;
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            for (auto& kv : conns) {
+                all.push_back(kv.second);
+            }
+            conns.clear();
+        }
+        // 关闭 socket 让阻塞中的 reader 立刻返回
+        for (auto& c : all) {
+            closeSocket(c->sock);
+            c->sock = kInvalidSocket;
+        }
+        std::lock_guard<std::mutex> lk(threadMutex);
+        for (auto& t : threads) {
+            if (t.second.joinable()) {
+                t.second.join();
+            }
+        }
+        threads.clear();
+        std::lock_guard<std::mutex> rlk(respMutex);
+        respTable.clear();
+    }
+};
+
+// ---------------------------------------------------------------- 公开接口
+RemotingClient::RemotingClient(int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis)
+    : impl_(new Impl()), connectTimeoutMillis_(connectTimeoutMillis),
+      invokeTimeoutMillis_(invokeTimeoutMillis) {
+    ensureInitialized();
+    impl_->connectTimeout = connectTimeoutMillis;
+    impl_->invokeTimeout = invokeTimeoutMillis;
+}
+
+RemotingClient::~RemotingClient() {
+    if (impl_) {
+        impl_->shutdown();
+    }
+}
+
+void RemotingClient::parseAddress(const std::string& addr, std::string& host,
+                                  std::string& port) {
+    if (!addr.empty() && addr[0] == '[') {  // IPv6 字面量：[::1]:10911
+        size_t end = addr.find(']');
+        if (end != std::string::npos) {
+            host = addr.substr(1, end - 1);
+            size_t colon = addr.find(':', end);
+            port = (colon == std::string::npos) ? std::string() : addr.substr(colon + 1);
+            return;
+        }
+    }
+    // IPv4 / 主机名：最后一个 ':' 之后是端口
+    size_t colon = addr.rfind(':');
+    if (colon == std::string::npos) {
+        host = addr;
+        port.clear();
+        return;
+    }
+    host = addr.substr(0, colon);
+    port = addr.substr(colon + 1);
+}
+
+RemotingCommand RemotingClient::invokeSync(const std::string& addr, RemotingCommand& request,
+                                           int32_t timeoutMillis) {
+    int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : invokeTimeoutMillis_;
+    auto future = impl_->registerFutureAcquiringOpaque(request, nullptr);
+    const int32_t opaque = request.opaque;
+    try {
+        impl_->sendRequest(addr, request);
+    } catch (...) {
+        impl_->unregisterFuture(opaque);
+        throw;
+    }
+
+    std::unique_lock<std::mutex> lk(future->m);
+    bool ok = future->cv.wait_for(lk, std::chrono::milliseconds(timeout),
+                                 [&]() { return future->done; });
+    if (!ok) {
+        lk.unlock();
+        impl_->unregisterFuture(opaque);
+        throw RemotingTimeoutException(addr + " wait response timeout " + std::to_string(timeout)
+                                       + " ms, opaque=" + std::to_string(opaque));
+    }
+    return future->response;
+}
+
+void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& request,
+                                 InvokeCallback callback, int32_t /*timeoutMillis*/) {
+    auto future = impl_->registerFutureAcquiringOpaque(request, std::move(callback));
+    const int32_t opaque = request.opaque;
+    try {
+        impl_->sendRequest(addr, request);
+    } catch (...) {
+        impl_->unregisterFuture(opaque);
+        throw;
+    }
+}
+
+void RemotingClient::invokeOneway(const std::string& addr, RemotingCommand& request) {
+    request.markOnewayRpc();
+    impl_->sendRequest(addr, request);
+}
+
+bool RemotingClient::isChannelWritable(const std::string& addr) const {
+    std::lock_guard<std::mutex> lk(impl_->connMutex);
+    auto it = impl_->conns.find(addr);
+    return it != impl_->conns.end() && it->second->sock != kInvalidSocket;
+}
+
+void RemotingClient::closeChannel(const std::string& addr) {
+    std::shared_ptr<Impl::Connection> conn;
+    {
+        std::lock_guard<std::mutex> lk(impl_->connMutex);
+        auto it = impl_->conns.find(addr);
+        if (it == impl_->conns.end()) {
+            return;
+        }
+        conn = it->second;
+        impl_->conns.erase(it);
+    }
+    // 关闭 socket 会让读线程的 select()/recv() 立刻返回并自行退出
+    closeSocket(conn->sock);
+    conn->sock = kInvalidSocket;
+}
+
+void RemotingClient::updateNameServerAddressList(const std::vector<std::string>& /*addrs*/) {
+    // 由上层 MQClientInstance 维护 NameServer 列表；传输层不持有
+}
+
+void RemotingClient::shutdown() { impl_->shutdown(); }
+
+size_t RemotingClient::connectionCount() const {
+    std::lock_guard<std::mutex> lk(impl_->connMutex);
+    return impl_->conns.size();
+}
+
+}  // namespace rocketmq

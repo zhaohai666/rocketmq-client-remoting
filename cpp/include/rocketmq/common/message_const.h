@@ -64,6 +64,12 @@ struct MessageConst {
     static constexpr int32_t CHARACTER_MAX_LENGTH = 255;
     static constexpr const char* MESSAGE_ID_PREFIX = "MSGID-";
 
+    // 索引查询类型（对应 MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE）。
+    // broker 的 QueryMessageRequestHeader.indexType 取这些值；为空时 broker 按 "K" 处理。
+    static constexpr const char* INDEX_KEY_TYPE = "K";
+    static constexpr const char* INDEX_UNIQUE_TYPE = "U";
+    static constexpr const char* INDEX_TAG_TYPE = "T";
+
     static std::string messageIdPrefix() { return MESSAGE_ID_PREFIX; }
 };
 

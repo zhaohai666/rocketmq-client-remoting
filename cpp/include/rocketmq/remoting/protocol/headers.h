@@ -268,6 +268,11 @@ struct QueryMessageRequestHeader : public CommandCustomHeader {
     std::optional<int32_t> maxNum;
     std::optional<int64_t> beginTimestamp;
     std::optional<int64_t> endTimestamp;
+    // 索引类型："K"=普通 KEYS 索引，"U"=uniqKey（需 RocksDB 索引），"T"=tag。
+    // 见 MessageConst::INDEX_*_TYPE。空值时 broker 按 "K" 处理。
+    std::optional<std::string> indexType;
+    // 分页游标：broker 侧每页最多返回 maxNum 条，继续翻页时带上上一页最后一条的 key。
+    std::optional<std::string> lastKey;
 
     PropertyMap toExtFields() const override;
     void fromExtFields(const PropertyMap& ext) override;
@@ -347,6 +352,24 @@ struct CheckTransactionStateRequestHeader : public CommandCustomHeader {
     std::optional<std::string> msgId;
     std::optional<std::string> transactionId;
     std::optional<int64_t> offsetMsgId;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// 对应 org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader
+// 用于 UPDATE_AND_CREATE_TOPIC：在 broker 上按指定队列数/权限建 topic。
+struct CreateTopicRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> topic;
+    std::optional<std::string> defaultTopic;
+    std::optional<int32_t> readQueueNums;
+    std::optional<int32_t> writeQueueNums;
+    std::optional<int32_t> perm;
+    std::optional<std::string> topicFilterType;  // 默认 SINGLE_TAG
+    std::optional<int32_t> topicSysFlag;
+    std::optional<bool> order;   // 默认 false
+    std::optional<std::string> attributes;
+    std::optional<bool> force;   // 默认 false
 
     PropertyMap toExtFields() const override;
     void fromExtFields(const PropertyMap& ext) override;

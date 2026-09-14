@@ -62,6 +62,8 @@ public:
     void pushArray(const JsonValue& v);
 
     // ---- object ----
+    // 保序的键值对视图（供遍历；顺序与插入/解析顺序一致）
+    const Object& objectItems() const { return obj_; }
     bool contains(const std::string& key) const;
     const JsonValue* find(const std::string& key) const;
     // 找不到时返回静态 Null 引用，便于链式取值
@@ -76,6 +78,9 @@ public:
     std::string dump() const;
 
 private:
+    // 递归序列化实现（object 保序遍历需要访问私有存储）
+    void dumpImpl(std::string& out) const;
+
     Type type_ = Type::Null;
     bool bool_ = false;
     double num_ = 0.0;

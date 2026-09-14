@@ -135,7 +135,7 @@ public:
 
     int32_t readInt32() {
         require(4);
-        int32_t v = readInt32At(pos_);
+        int32_t v = getInt32At(data_, pos_);
         pos_ += 4;
         return v;
     }

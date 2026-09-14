@@ -65,6 +65,12 @@ struct Message {
     Bytes body;
     bool hasBody = true;
     std::string transactionId;
+    // 是否为批量消息体（由 MessageBatch::generateFromList 置位）。
+    // 发送时映射到 SendMessageRequestHeader.batch —— broker 端
+    // SendMessageProcessor 用 requestHeader.isBatch() 决定走 sendBatchMessage
+    // 还是 sendMessage，所以这个标志是必须的。
+    // 说明：不用 dynamic_cast 是因为 Message 非多态类型（无虚函数），RTTI 不可用。
+    bool isBatch = false;
 
     Message() = default;
     Message(const std::string& topic, const Bytes& body) : topic(topic), body(body) {}

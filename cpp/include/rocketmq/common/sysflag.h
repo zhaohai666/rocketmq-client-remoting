@@ -14,6 +14,7 @@
 #define ROCKETMQ_COMMON_SYSFLAG_H
 
 #include <cstdint>
+#include <string>
 
 namespace rocketmq {
 
@@ -132,11 +133,24 @@ struct PermName {
     static constexpr int32_t PERM_INHERIT = 0x1;
     static constexpr int32_t PERM_OWNER = 0x1 << 4;
 
-    static std::string permToString(int32_t perm);
+    // 对应 Java PermName.permToString：三位标志 "RWX"，不满足的位写 '-'。
+    // （此前只声明未定义——是个"编译能过、一链接就炸"的坑，随 TopicConfig 一起补上。）
+    static std::string permToString(int32_t perm) {
+        std::string s;
+        s += (perm & PERM_READ) == PERM_READ ? 'R' : '-';
+        s += (perm & PERM_WRITE) == PERM_WRITE ? 'W' : '-';
+        s += (perm & PERM_INHERIT) == PERM_INHERIT ? 'X' : '-';
+        return s;
+    }
 
     static bool checkPerm(int32_t perm, int32_t wantedPerm) {
         return (perm & wantedPerm) == wantedPerm;
     }
+
+    // 对应 Java PermName.isValid(value)：合法区间为 [0, PERM_PRIORITY)。
+    // 管理端 UpdateBrokerConfig 会用它对 brokerPermission 做入参校验
+    // （Python 侧 PermName.is_valid 同样如此）。
+    static bool isValid(int32_t value) { return value >= 0 && value < PERM_PRIORITY; }
 };
 
 struct SubscriptionMode {

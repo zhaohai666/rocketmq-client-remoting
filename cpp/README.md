@@ -1,0 +1,146 @@
+# rocketmq-client-remoting (C++)
+
+Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 C++17 实现，迁移自 Java 的
+`org.apache.rocketmq.client` + `org.apache.rocketmq.remoting` + `org.apache.rocketmq.tools`，
+并与本仓库的 Python 参考实现（`../python/`）逐项对齐。
+
+**无第三方运行时依赖**（只用 POSIX socket + 标准库 + zlib），网络层手写而不是引 netty 类似物，
+目的是把"字节到底长什么样"暴露出来、便于与 Java / Python 做逐字节互操作验证。
+
+已实现范围：
+
+| 层 | 内容 |
+| --- | --- |
+| 协议层 | JSON / RocketMQ 二进制两路序列化；`RemotingCommand` 帧编解码；CommandCustomHeader 家族（含 V2 短字段名）；17 段消息存储格式与 6 段批量格式 |
+| 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、SIGPIPE 处理 |
+| 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData` |
+| 客户端 | `MQClientInstance`、`DefaultMQProducer`、`DefaultMQPushConsumer`、**`DefaultMQAdminExt`** |
+| 压缩 | zlib 生产端自动压缩 + 消费端自动解压（`-DRMQ_WITH_ZLIB=OFF` 可关） |
+
+**未实测**：Windows 分支（代码在，未在真机跑过）。
+
+## 构建
+
+```bash
+cd cpp
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build          # 产出 librocketmq_remoting.a + tests/* + examples/*
+```
+
+工具链：CMake ≥ 3.15、C++17 编译器（Apple clang 14+ / GCC / MSVC）、`Threads`、`ZLIB`。
+开 `-Wall -Wextra`（未开 `-Werror`），**目标是零 warning**。
+MSVC 下自动加 `/utf-8`（源码含中文注释，否则 C4819）；Windows 走 `winsock`（`ws2_32`）。
+
+选项：
+- `-DRMQ_BUILD_TESTS=OFF` / `-DRMQ_BUILD_EXAMPLES=OFF`
+- `-DRMQ_WITH_ZLIB=OFF`：关掉 zlib。注意此时**遇到压缩消息会抛异常**，而不是静默返回压缩字节
+  —— 避免把数据损坏伪装成成功。
+
+## 测试
+
+```bash
+cd build && ctest --output-on-failure     # 7 个用例，约 476 项断言，~2s
+```
+
+| 用例 | 断言 | 覆盖 |
+| --- | --- | --- |
+| `codec` | 65 | JSON / ROCKETMQ / `RemotingCommand` 两路 / 消息 17 段与 6 段 / header V1↔V2 / hashCode / CRC32 / msgId |
+| `java_alignment` | 32（带 `ROCKETMQ_JAVA_SRC` 为 38） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对 |
+| `route_heartbeat` | 92 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
+| `transport` | 32 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、地址解析 |
+| `compression` | 33 | 压缩类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib 往返 + **Python 生成的外部夹具**、解压后清 flag、未支持类型必须失败而非交出压缩流 |
+| `admin` | 152 | fastjson2 非法 JSON 容错、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
+| `interop` | 70 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
+
+```bash
+# Java 对齐（断言数 32 -> 38）
+ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
+```
+
+`interop` 会输出 `WARN` 记录 **Python 参考客户端侧的已知缺陷**（不影响退出码）。
+出现新的 `WARN` 要读一下——它是跨语言偏差的显式台账。
+
+## 真实集群联调
+
+需要在跑 nameServer(9876) + broker(10911)、`autoCreateTopicEnable=true` 的集群。
+这些工具**不进 ctest**（依赖外部集群）。
+
+```bash
+./build/examples/rmq_selfcheck                       # 不依赖集群的协议层自检
+./build/examples/rmq_live_message_types 127.0.0.1:9876
+./build/examples/rmq_admin_live         127.0.0.1:9876
+./build/examples/rmq_compression_live   selftest 127.0.0.1:9876
+./build/examples/rmq_compression_live   send|recv 127.0.0.1:9876 <topic> <group> <size>
+```
+
+| 工具 | 结果 | 覆盖 |
+| --- | --- | --- |
+| `rmq_live_message_types` | 12/12 | 异步发送 / 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 心跳注册 |
+| `rmq_admin_live` | 47 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → 清理 |
+| `rmq_compression_live` | 全 PASS | 自动压缩自产自销 + **与真实 Java 客户端双向互通** |
+
+SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
+本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
+
+## 目录结构
+
+```
+cpp/
+├── include/rocketmq/
+│   ├── common/                 消息模型与常量
+│   │   ├── message.h               Message / MessageExt / MessageBatch / MessageQueue
+│   │   ├── message_decoder.h       17 段 + 6 段编解码（含压缩）
+│   │   ├── compression.h           CompressorFactory（zlib / lz4 / zstd 类型解析）
+│   │   ├── sysflag.h / mix_all.h / topic_config.h / subscription_data.h / util_all.h
+│   │   ├── byte_buffer.h           大端读写游标
+│   │   ├── logging.h               header-only 日志（默认 INFO）
+│   │   └── net_compat.h            socket 跨平台兼容（含 SIGPIPE 处理）
+│   ├── remoting/
+│   │   ├── remoting_client.h       同步 / 异步 / oneway + 拆包重组
+│   │   └── protocol/               json / serialize / remoting_command / codes /
+│   │                               headers / route / heartbeat / body / admin_body /
+│   │                               subscription
+│   └── client/
+│       ├── mq_client.h             MQClientInstance：路由发现 + 全部 RPC
+│       ├── producer.h / consumer.h / admin.h / result.h / exception.h
+├── src/                        与 include 同构的 22 个 .cpp
+├── examples/                   selfcheck / interop_tool / 三个真机联调工具
+└── tests/                      6 个 C++ 单测 + interop_check.py
+```
+
+## 几个必须知道的实现约定
+
+**字段名一律以 Java 为准。** broker 用 fastjson2 按 Java 属性名反序列化，
+字段名错一个就**静默丢字段**（不报错）。差异清单见技能文档
+`~/.workbuddy/skills/rocketmq-cpp-build-verify/SKILL.md`。
+
+**fastjson2 会产出非法 JSON。** map 的对象 key 会被内联
+（`{"offsetTable":{{"brokerName":"b",...}:{...}}}`）、数字 key 不加引号、允许
+NaN/Infinity 与尾逗号。所以 `json.cpp` 里是**容错解析器**而不是严格 JSON parser。
+改它的时候务必保留这套宽容逻辑，否则所有管理端响应体全崩。
+
+**`RemotingCommand.body` 的存在判定是 `hasBody || !body.empty()`**（对齐 Java `body != null`），
+只赋 `body` 不设 `hasBody` 也要能编码出 body。
+
+**opaque 不能用 0 当"未设置"哨兵。** `opaqueCounter` 从 0 起算，第一个请求的 opaque 合法值就是 0；
+传输层只在**与在途请求真的冲突**时才重分配，否则响应永远匹配不上。
+
+**`TopicPublishInfo` 不可拷贝**，必须用 `std::shared_ptr` 取用 —— 它的队列轮询游标是跨调用
+共享状态（Java 用 ThreadLocal），按值返回会让每次发送都从 0 号队列重来。
+
+**压缩失败 / 未知算法必须响亮。** `CompressorFactory::decompress` 对未支持类型抛异常，
+`decodeMessage` 捕获后返回 `false`（消息被丢弃）。**绝不能原样透传压缩字节**：
+外层会清掉 `COMPRESSED_FLAG`，透传等于把压缩流当正文交出去且事后无法识别，属于静默数据损坏。
+
+## 日志
+
+`include/rocketmq/common/logging.h` 是 header-only 日志，默认级别 **INFO**，
+输出到 stderr 与 `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log`。
+环境变量：`ROCKETMQ_CPP_LOG_LEVEL`（DEBUG/INFO/WARN/ERROR/OFF）、`ROCKETMQ_CPP_LOG_FILE`。
+
+**良性长轮询超时走 DEBUG**（默认被抑制），所以正常运行日志里 `ERROR=0` 是预期状态 ——
+出现 ERROR 就是真问题。
+
+## License
+
+Apache-2.0，与上游 RocketMQ 保持一致。
