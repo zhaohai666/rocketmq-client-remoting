@@ -1,8 +1,8 @@
 # rocketmq-client-remoting · 长期项目笔记
 
-本仓库把 RocketMQ remoting 协议层用 **Python** 与 **C++** 各实现一遍，参照 Java
+本仓库把 RocketMQ remoting 协议层用 **Python**、**C++** 与 **.NET(C#)** 各实现一遍，参照 Java
 （`/Users/haizai/project/jingsai/roocketmq/zhaohai666-rocketmq`，5.x）。Python 实现已对真实
-5.5.1 集群验证；C++ 侧以 Python + Java 双方为参照移植。
+5.5.1 集群验证；C++ 侧以 Python + Java 双方为参照移植；.NET 侧（2026-09-14 完成）以 C++ 为参照移植。
 
 ## 目录
 - `python/rocketmq/`：参考实现（common / remoting / client），已真实集群验证。
@@ -11,6 +11,18 @@
   + **压缩（zlib，走 `find_package(ZLIB)`）**，并已对真实 5.5.1 集群跑通 7 类消息收发（12/12）、
   管理端全链路（C++ 47 PASS/0 FAIL/1 SKIP）、压缩跨客户端矩阵（6 组全 PASS）。
   **仅 Windows 分支未实测。**
+- `dotnet/`：.NET 10 实现（零 NuGet 依赖，仅 BCL；TreatWarningsAsErrors 全局开启，0 warning）。
+  协议/传输/客户端全层对齐 C++；xunit 46/46；真机联调 selfcheck 3/0、message-types 12/0、
+  admin-live 47/0/1、compression selftest ALL PASS、Python↔.NET interop 双向解码一致。
+  详见 `dotnet/README.md`。事务消息同为简化单阶段。
+
+## .NET 侧特有坑（勿再踩）
+- **数值格式化必须显式 `CultureInfo.InvariantCulture`**（协议序列化不能随区域设置变）。
+- C# **属性名不能与类型同名**（`TopicList` 属性改 `Topics`，JSON 键不变）。
+- examples 分发器已剥命令名：CompressionLive send/recv 参数检查是 `args.Length >= 5`。
+- 并行子代理构建必须 `mkdir /tmp/dotnet-build.lock` 互斥（obj/ 争抢）；
+  同一文件多处改动必须逐条串行 Edit（并行会丢更新）。
+- 联调脚本起集群后要 `sleep 12` 等 broker 向 NS 注册（端口开 ≠ 已注册）。
 
 ## 压缩（两侧均已实现，2026-09-14 真机跨客户端验过）
 - **阈值**：`compressMsgBodyOverHowmuch` 默认 **4096**；`MessageBatch` **不压缩**
@@ -100,6 +112,7 @@
   - `bash /tmp/run_admin_live_cpp.sh` → C++ Admin（47 PASS/0 FAIL/1 SKIP）
   - `bash /tmp/run_compression_live.sh` → 压缩跨客户端矩阵（C++/Python 自测 + 与 Java 双向互通）
   - `bash /tmp/run_logging_live.sh` → 日志能力真机验证（线程名 + 轮转，`threads=True rotation=True`）
+  - `bash /tmp/run_dotnet_live.sh [message-types|admin|compression|all]` → .NET 全链路联调
   - `examples/rmq_live_message_types 127.0.0.1:9876` → 7 类消息能力（12/12）
 - `interop` 的 WARN 不是失败，但**出现新 WARN 要读**——它是 Python 侧偏差的显式记录
   （当前 WARN=2：`SubscriptionData` 不可哈希、`to_dict()` 出 snake_case 键）。

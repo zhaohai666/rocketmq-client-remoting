@@ -1,0 +1,453 @@
+// C# 客户端的**真实集群**消息类型联调（对应 cpp/examples/live_message_types.cpp）。
+//
+// 覆盖 7 类消息能力，全部打真实 nameServer + broker：
+//   1. 异步发送（sendAsync + SendCallback）
+//   2. 顺序消息（sendBySelector 同 key 落同队列 + 顺序消费保序）
+//   3. 带 Tag 消息 + 服务端 Tag 过滤
+//   4. 用户属性透传
+//   5. 延迟消息（setDelayTimeLevel 并校验 store_ts - born_ts >= 3000ms）
+//   6. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
+//   7. 事务消息（简化单阶段）+ 落库可消费
+//   附：消费者心跳注册（HEART_BEAT）
+//
+// 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
+// autoCreateTopicEnable=true。用法（由 Program 以 "message-types [namesrv]" 形式调用）。
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using RocketMQ.Client;
+using RocketMQ.Common;
+using RocketMQ.Remoting.Protocol;
+
+namespace RocketMQ.Examples;
+
+/// <summary>真实集群 7 类消息能力联调（与 cpp/examples/live_message_types.cpp 对齐）。</summary>
+internal static class LiveMessageTypes
+{
+    private static string _gNamesrv = "127.0.0.1:9876";
+    private static string _gPrefix = string.Empty;
+    private static readonly List<(string Name, bool Ok)> Results = new();
+    private static int _gPass;
+    private static int _gFail;
+
+    private static void Check(string name, bool ok, string detail = "")
+    {
+        Results.Add((name, ok));
+        if (ok) ++_gPass;
+        else ++_gFail;
+        Console.WriteLine("[" + (ok ? "PASS" : "FAIL") + "] " + name + (detail.Length > 0 ? "  " + detail : string.Empty));
+    }
+
+    private static string Bytes2Str(byte[] b) => Encoding.UTF8.GetString(b);
+
+    private static byte[] Str2Bytes(string s) => Encoding.UTF8.GetBytes(s);
+
+    // ---------------- 监听器 ----------------
+
+    private sealed class CollectingListenerConcurrently : IMessageListenerConcurrently
+    {
+        private readonly object _lk = new();
+        private readonly List<MessageExt> _msgs = new();
+
+        public bool Orderly() => false;
+
+        public ConsumeConcurrentlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeConcurrentlyContext ctx)
+        {
+            lock (_lk) _msgs.AddRange(msgs);
+            return ConsumeConcurrentlyStatus.ConsumeSuccess;
+        }
+
+        public List<MessageExt> Snapshot()
+        {
+            lock (_lk) return new List<MessageExt>(_msgs);
+        }
+    }
+
+    private sealed class CollectingListenerOrderly : IMessageListenerOrderly
+    {
+        private readonly object _lk = new();
+        private readonly List<MessageExt> _msgs = new();
+
+        public bool Orderly() => true;
+
+        public ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext ctx)
+        {
+            lock (_lk) _msgs.AddRange(msgs);
+            return ConsumeOrderlyStatus.Success;
+        }
+
+        public List<MessageExt> Snapshot()
+        {
+            lock (_lk) return new List<MessageExt>(_msgs);
+        }
+    }
+
+    private sealed class CollectingCallback : ISendCallback
+    {
+        private int _ok;
+        private int _err;
+        private readonly object _lk = new();
+        private readonly List<SendResult> _results = new();
+        private readonly List<string> _errors = new();
+
+        public void OnSuccess(SendResult result)
+        {
+            Interlocked.Increment(ref _ok);
+            lock (_lk) _results.Add(result);
+        }
+
+        public void OnException(string error)
+        {
+            Interlocked.Increment(ref _err);
+            lock (_lk) _errors.Add(error);
+        }
+
+        public int Ok() => _ok;
+        public int Err() => _err;
+
+        public List<SendResult> Results()
+        {
+            lock (_lk) return new List<SendResult>(_results);
+        }
+
+        public List<string> Errors()
+        {
+            lock (_lk) return new List<string>(_errors);
+        }
+    }
+
+    private sealed class CommitTxListener : ITransactionListener
+    {
+        public LocalTransactionState ExecuteLocalTransaction(Message msg, string arg) =>
+            LocalTransactionState.CommitMessage;
+
+        public LocalTransactionState CheckLocalTransaction(MessageExt msg) =>
+            LocalTransactionState.CommitMessage;
+    }
+
+    // ---------------- 消费辅助 ----------------
+
+    // 活跃等待直至收到 expect 条（或最多 durationSec 秒），再关闭消费者，返回已收到的消息。
+    private static List<MessageExt> RunConsumer(string topic, string subExpr, int durationSec,
+        bool orderly, string groupSuffix, int expect = 0, int pullTimeout = 3000, int pullSuspend = 1000)
+    {
+        var conc = new CollectingListenerConcurrently();
+        var ord = new CollectingListenerOrderly();
+        IMessageListener listener = orderly ? ord : conc;
+
+        var consumer = new DefaultMQPushConsumer(_gPrefix + "_" + groupSuffix)
+        {
+            ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset,
+            PullTimeoutMillis = pullTimeout,
+            PullSuspendTimeoutMillis = pullSuspend,
+        };
+        consumer.SetNamesrvAddr(_gNamesrv);
+        consumer.Subscribe(topic, subExpr);
+        consumer.SetMessageListener(listener);
+        consumer.Start();
+
+        var deadline = DateTime.UtcNow.AddSeconds(durationSec);
+        while (DateTime.UtcNow < deadline)
+        {
+            int got = orderly ? ord.Snapshot().Count : conc.Snapshot().Count;
+            if (expect > 0 && got >= expect) break;
+            Thread.Sleep(100);
+        }
+
+        List<MessageExt> msgs = orderly ? ord.Snapshot() : conc.Snapshot();
+        consumer.Shutdown();
+        return msgs;
+    }
+
+    // 等待 broker 在 nameServer 注册完成（避免端口刚开、注册未落地的竞态）
+    private static List<string> WaitBroker(DefaultMQProducer prod)
+    {
+        var addrs = new List<string>();
+        for (int i = 0; i < 40; ++i)
+        {
+            try
+            {
+                List<MessageQueue> mqs = prod.FetchPublishMessageQueues(MixAll.DefaultTopic);
+                foreach (MessageQueue mq in mqs)
+                {
+                    string a = prod.Client().BrokerAddrOf(mq.BrokerName);
+                    if (a.Length > 0 && !addrs.Contains(a)) addrs.Add(a);
+                }
+
+                if (addrs.Count > 0) return addrs;
+            }
+            catch (Exception)
+            {
+                // 路由还没就绪，继续等
+            }
+
+            Thread.Sleep(1000);
+        }
+
+        return addrs;
+    }
+
+    // ---------------- 入口 ----------------
+
+    public static int Run(string[] args)
+    {
+        if (args.Length >= 1) _gNamesrv = args[0];
+        long stamp = UtilAll.CurrentTimeSeconds();
+        _gPrefix = "MTDotnet_" + stamp;
+
+        Console.WriteLine("=== C# 客户端消息类型联调（真实集群）===");
+        Console.WriteLine("namesrv = " + _gNamesrv + "  prefix = " + _gPrefix);
+
+        var prod = new DefaultMQProducer(_gPrefix + "_producer")
+        {
+            NamesrvAddr = _gNamesrv,
+            SendMsgTimeout = 5000,
+        };
+        try
+        {
+            prod.Start();
+        }
+        catch (Exception e)
+        {
+            Check("生产者启动", false, e.Message);
+            return 1;
+        }
+
+        List<string> brokers = WaitBroker(prod);
+        if (brokers.Count == 0)
+        {
+            Check("集群探活", false, "nameServer 无 broker 注册");
+            prod.Shutdown();
+            return 1;
+        }
+
+        Check("集群探活", true, "brokers=" + string.Join(",", brokers));
+
+        long t0 = UtilAll.CurrentTimeMillis();
+
+        // ---------- 1. 异步发送 ----------
+        {
+            string topic = _gPrefix + "_Async";
+            var cb = new CollectingCallback();
+            Message msg = new(topic, Str2Bytes("async-hello"));
+            try
+            {
+                prod.SendAsync(msg, cb);
+            }
+            catch (Exception e)
+            {
+                Check("异步发送 sendAsync", false, "throw: " + e.Message);
+            }
+
+            for (int i = 0; i < 200 && cb.Ok() + cb.Err() == 0; ++i)
+            {
+                Thread.Sleep(25);
+            }
+
+            List<SendResult> rs = cb.Results();
+            bool ok = cb.Ok() == 1 && cb.Err() == 0 && rs.Count > 0 && rs[0].SendStatus == SendStatus.SendOk;
+            Check("异步发送 sendAsync", ok, "ok=" + cb.Ok().ToString(CultureInfo.InvariantCulture)
+                  + " err=" + cb.Err().ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 2. 顺序消息：同 key 落同队列 + 顺序消费保序 ----------
+        List<byte[]> bodiesOrder = new();
+        {
+            string topic = _gPrefix + "_Order";
+            var selector = new SelectMessageQueueByHash();
+            var qids = new List<int>();
+            for (int i = 0; i < 10; ++i)
+            {
+                byte[] body = Str2Bytes(string.Format(CultureInfo.InvariantCulture, "ord-{0:00}", i));
+                bodiesOrder.Add(body);
+                SendResult sr = prod.SendBySelector(new Message(topic, body), selector, "shard-A");
+                if (!qids.Contains(sr.MessageQueue.QueueId)) qids.Add(sr.MessageQueue.QueueId);
+            }
+
+            Check("顺序发送: 同 key 路由到同一队列", qids.Count == 1,
+                "distinct_queue_ids=" + (qids.Count == 0 ? "?" : string.Join(",", qids)));
+
+            List<MessageExt> run = RunConsumer(topic, "*", 12, /*orderly=*/true, "order", /*expect=*/10);
+            List<string> recv = run.Select(m => Bytes2Str(m.Body)).ToList();
+            List<string> expect = bodiesOrder.Select(Bytes2Str).ToList();
+            bool seqOk = recv.SequenceEqual(expect);
+            bool offsetOk = true;
+            for (int i = 1; i < run.Count; ++i)
+            {
+                if (run[i].QueueOffset <= run[i - 1].QueueOffset) offsetOk = false;
+            }
+
+            string orderDetail = "received=" + run.Count.ToString(CultureInfo.InvariantCulture) + "/10 seq_ok="
+                                 + (seqOk ? "1" : "0") + " offset_monotonic=" + (offsetOk ? "1" : "0");
+            if (run.Count > 0)
+            {
+                orderDetail += " first=" + recv[0] + " last=" + recv[run.Count - 1];
+            }
+
+            Check("顺序消费保序", run.Count == 10 && seqOk && offsetOk, orderDetail);
+        }
+
+        // ---------- 3. 带 Tag 消息 + 服务端 Tag 过滤 ----------
+        {
+            string topic = _gPrefix + "_Tag";
+            for (int i = 0; i < 3; ++i)
+            {
+                Message m = new(topic, Str2Bytes("tagA-" + i)) { Tags = "TagA" };
+                prod.Send(m);
+            }
+
+            for (int i = 0; i < 3; ++i)
+            {
+                Message m = new(topic, Str2Bytes("tagB-" + i)) { Tags = "TagB" };
+                prod.Send(m);
+            }
+
+            List<MessageExt> run = RunConsumer(topic, "TagA", 12, false, "tag");
+            bool allA = run.All(m => m.Tags == "TagA");
+            Check("Tag 过滤消费（仅收到 TagA）", run.Count == 3 && allA,
+                "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 4. 用户属性透传 ----------
+        {
+            string topic = _gPrefix + "_Prop";
+            for (int i = 0; i < 3; ++i)
+            {
+                Message m = new(topic, Str2Bytes("prop-" + i)) { Tags = "P" };
+                m.SetUserProperty("city", "Hangzhou");
+                m.SetUserProperty("env", "prod");
+                prod.Send(m);
+            }
+
+            List<MessageExt> run = RunConsumer(topic, "*", 12, false, "prop");
+            bool okCity = run.All(m => m.GetUserProperty("city") == "Hangzhou");
+            bool okEnv = run.All(m => m.GetUserProperty("env") == "prod");
+            Check("用户属性透传(city=Hangzhou, env=prod)", okCity && okEnv && run.Count == 3,
+                "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 5. 延迟消息 ----------
+        {
+            string topic = _gPrefix + "_Delay";
+            prod.Send(new Message(topic, Str2Bytes("normal-now")));
+            Message dm = new(topic, Str2Bytes("delayed-5s")) { DelayTimeLevel = 2 }; // level2 = 5s
+            prod.Send(dm);
+
+            List<MessageExt> run = RunConsumer(topic, "*", 20, false, "delay", /*expect=*/2);
+            var delayed = new List<MessageExt>();
+            var normal = new List<MessageExt>();
+            foreach (MessageExt m in run)
+            {
+                if (Bytes2Str(m.Body) == "delayed-5s") delayed.Add(m);
+                else if (Bytes2Str(m.Body) == "normal-now") normal.Add(m);
+            }
+
+            Check("延迟消息最终投递", delayed.Count > 0,
+                "delayed received=" + delayed.Count.ToString(CultureInfo.InvariantCulture)
+                + " normal=" + normal.Count.ToString(CultureInfo.InvariantCulture));
+            if (delayed.Count > 0)
+            {
+                long drift = delayed[0].StoreTimestamp - delayed[0].BornTimestamp;
+                Check("延迟生效(store_ts-born_ts>=3000ms)", drift >= 3000,
+                    "drift=" + drift.ToString(CultureInfo.InvariantCulture) + "ms");
+            }
+            else
+            {
+                Check("延迟生效(store_ts-born_ts>=3000ms)", false, "无延迟消息可校验");
+            }
+        }
+
+        // ---------- 6. 带 Key 消息 + 按 Key 查询 ----------
+        {
+            string topic = _gPrefix + "_Key";
+            string key = "MTKEY_" + stamp.ToString(CultureInfo.InvariantCulture);
+            Message m = new(topic, Str2Bytes("key-msg-payload")) { Keys = key };
+            prod.Send(m);
+            Thread.Sleep(1000);
+
+            long begin = t0 - 120000;
+            long end = UtilAll.CurrentTimeMillis() + 120000;
+            List<MessageExt> found = prod.QueryMessage(topic, key, 10, begin, end);
+            bool hit = found.Any(x => Bytes2Str(x.Body) == "key-msg-payload");
+            Check("按 Key 查询(query_message)", hit, "returned=" + found.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 7. 事务消息（简化单阶段）----------
+        {
+            string topic = _gPrefix + "_Tx";
+            var listener = new CommitTxListener();
+            TransactionSendResult tsr;
+            string stateStr;
+            try
+            {
+                tsr = prod.SendMessageInTransaction(new Message(topic, Str2Bytes("tx-commit")), listener);
+                stateStr = LocalTransactionStateNames.Name(tsr.LocalTransactionState);
+            }
+            catch (Exception e)
+            {
+                Check("事务消息发送(简化单阶段)", false, "throw: " + e.Message);
+                tsr = new TransactionSendResult { LocalTransactionState = LocalTransactionState.Unknow };
+                stateStr = e.Message;
+            }
+
+            Check("事务消息发送(简化单阶段)",
+                tsr.SendStatus == SendStatus.SendOk && tsr.LocalTransactionState == LocalTransactionState.CommitMessage,
+                "state=" + stateStr);
+
+            List<MessageExt> run = RunConsumer(topic, "*", 10, false, "tx");
+            bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-commit");
+            Check("事务消息落库可被消费", consumed, "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 附：心跳注册 ----------
+        {
+            string topic = _gPrefix + "_Hb";
+            prod.Send(new Message(topic, Str2Bytes("hb-probe")));
+            var listener = new CollectingListenerConcurrently();
+            var cons = new DefaultMQPushConsumer(_gPrefix + "_hb")
+            {
+                ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset,
+                PullTimeoutMillis = 3000,
+                PullSuspendTimeoutMillis = 1000,
+            };
+            cons.SetNamesrvAddr(_gNamesrv);
+            cons.Subscribe(topic, "*");
+            cons.SetMessageListener(listener);
+            cons.Start();
+            for (int i = 0; i < 40 && listener.Snapshot().Count < 1; ++i)
+            {
+                Thread.Sleep(250);
+            }
+
+            long hb = cons.HeartbeatCount;
+            cons.Shutdown();
+            Check("消费者心跳注册(HEART_BEAT)", hb > 0,
+                "heartbeat_ok=" + hb.ToString(CultureInfo.InvariantCulture)
+                + " consumed=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        prod.Shutdown();
+
+        // ---------- 汇总 ----------
+        Console.WriteLine();
+        Console.WriteLine("================ C# 消息类型联调汇总 ================");
+        foreach ((string Name, bool Ok) r in Results)
+        {
+            Console.WriteLine("  [" + (r.Ok ? "PASS" : "FAIL") + "] " + r.Name);
+        }
+
+        Console.WriteLine("=====================================================");
+        Console.WriteLine("  PASS=" + _gPass.ToString(CultureInfo.InvariantCulture)
+                          + " FAIL=" + _gFail.ToString(CultureInfo.InvariantCulture));
+        if (_gFail > 0)
+        {
+            Console.WriteLine("结果: " + _gFail.ToString(CultureInfo.InvariantCulture) + " 项失败");
+            return 1;
+        }
+
+        Console.WriteLine("结果: 全部通过（C# 客户端对真实集群完成全部消息类型收发）");
+        return 0;
+    }
+}

@@ -1,0 +1,21 @@
+<Project>
+
+  <!-- dotnet/ 下所有工程的共享属性。
+       与 cpp/ 的约定保持一致：目标「零 warning」，所以编译器告警一律当错误。 -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <!-- 生成确定性输出，便于核对「同一份源码产出同一份二进制」 -->
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- ⚠ 不要打开 InvariantGlobalization：客户端需要真实的时区/区域能力（日志时间戳、时间格式化）。
+       协议层的数值/日期格式化**必须显式传 CultureInfo.InvariantCulture**——
+       否则在 de-DE 等区域下 double.ToString() 会输出 "1,5" 而不是 "1.5"，
+       JSON 直接损坏。这一点在 Json/Serialize 里逐处落实。 -->
+
+</Project>

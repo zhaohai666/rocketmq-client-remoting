@@ -8,6 +8,11 @@ dist/
 .venv/
 venv/
 
+# .NET
+dotnet/**/bin/
+dotnet/**/obj/
+*.user
+
 # 测试 / 工具缓存
 .pytest_cache/
 .mypy_cache/

@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>RocketMQ.Examples</RootNamespace>
+    <AssemblyName>rmq</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- 真机联调工具集合（对应 cpp/examples 的 5 个可执行文件）。
+         用单个可执行文件 + 子命令，避免 5 个 csproj 的重复开销。
+         子命令：selfcheck / interop / message-types / admin-live / compression-live，
+         用法见 dotnet/README.md。 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/RocketMQ.Client/RocketMQ.Client.csproj" />
+  </ItemGroup>
+
+</Project>

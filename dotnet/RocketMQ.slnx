@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/examples/">
+    <Project Path="examples/RocketMQ.Examples/RocketMQ.Examples.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/RocketMQ.Client/RocketMQ.Client.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RocketMQ.Client.Tests/RocketMQ.Client.Tests.csproj" />
+  </Folder>
+</Solution>

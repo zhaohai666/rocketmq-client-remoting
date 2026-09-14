@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>RocketMQ</RootNamespace>
+    <AssemblyName>RocketMQ.Client</AssemblyName>
+    <!-- 只依赖 BCL：JSON 容错解析、zlib 压缩、TCP 传输全部自实现/走框架内置，
+         与 cpp/（仅系统 zlib）和 python/（仅标准库）的策略一致。 -->
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>RocketMQ.Client.Remoting</PackageId>
+    <Description>Apache RocketMQ 经典 remoting 协议客户端（对齐 5.x Java 实现）</Description>
+  </PropertyGroup>
+
+</Project>
