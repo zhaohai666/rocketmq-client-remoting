@@ -22,3 +22,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# 误留的重定向文件（nohup 等）
+nohup.out
