@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 142 条单元/协议测试（4 skip 为可选依赖相关）
+pytest -q                     # 147 条单元/协议测试（4 skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -34,6 +34,25 @@ python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 
 `/tmp/probe_admin/CompressProbe.java` 同算法，因此可直接验证"Java 产的压缩消息我们能否解开"
 以及反向。注意 Java `UtilAll.crc32` 会 `& 0x7FFFFFFF`，与标准 CRC-32 **差正好 2^31**，
 对结果时看各自的 `match` 字段而不是 CRC 数字。
+
+## 客户端日志
+
+`rocketmq/logging.py` 把内部日志桥接到标准 `logging`：
+
+- 文件落在 `$HOME/logs/rocketmqlogs/rocketmq_py_client.log`，按天滚动，
+  备份名 `rocketmq_py_client.log.YYYY-MM-DD`，保留 `ROCKETMQ_CLIENT_LOG_MAX_INDEX`（默认 10）份；
+- 同时输出到 stderr（可用 `ROCKETMQ_CLIENT_LOG_USE_STDOUT=false` 关掉）；
+- 若宿主程序已配置过 Python logging（root 已有 handler），则**完全不插手**，
+  等价于 Java 客户端的 `logUseSlf4j` 模式。
+
+环境变量：`ROCKETMQ_CLIENT_LOG_DIR` / `ROCKETMQ_CLIENT_LOG_FILE` / `ROCKETMQ_CLIENT_LOG_LEVEL`
+/ `ROCKETMQ_CLIENT_LOG_MAX_INDEX` / `ROCKETMQ_CLIENT_LOG_USE_STDOUT`。
+
+> 📌 默认文件名**刻意不叫** Java 的 `rocketmq_client.log`。两者轮转策略不同（Java logback 按大小
+> 64MB 滚动并 gzip，Python 按天重命名），落到同一文件会互相插行；更糟的是 Python 在午夜会把文件
+> **改名**，而 JVM 仍持有旧 fd，后续 Java 日志会写进已 unlink 的 inode 而静默消失。
+> 需要与 Java 一致时显式设 `ROCKETMQ_CLIENT_LOG_FILE=rocketmq_client.log`。
+> 对应回归守卫见 `tests/test_logging_config.py`。
 
 ## 目录结构
 

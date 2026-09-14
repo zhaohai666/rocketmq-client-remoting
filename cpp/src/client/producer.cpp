@@ -2,6 +2,7 @@
 #include "rocketmq/client/producer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +41,13 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
         start = pos + 1;
     }
     return out;
+}
+
+// 异步发送线程的递增序号，用于线程命名（对齐 Java 线程工厂 "AsyncSenderThread_" + n 的后缀）。
+// 进程级递增，与 Java 的 ThreadFactoryImpl 计数器语义一致。
+int nextAsyncSenderSeq() {
+    static std::atomic<int> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -229,6 +237,8 @@ void DefaultMQProducer::sendAsync(const Message& msg, std::shared_ptr<SendCallba
     (void)client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     std::thread th([this, msg, callback, timeout]() {
+        // 线程名对齐 Java 的 ThreadFactoryImpl("AsyncSenderThread_")
+        setThreadName("AsyncSenderThread_" + std::to_string(nextAsyncSenderSeq()));
         try {
             SendResult result = send(msg, timeout);
             if (callback) callback->onSuccess(result);

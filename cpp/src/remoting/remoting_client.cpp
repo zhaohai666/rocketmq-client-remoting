@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "rocketmq/common/byte_buffer.h"
+#include "rocketmq/common/logging.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
 
@@ -214,7 +215,13 @@ struct RemotingClient::Impl {
             conns[addr] = conn;
         }
 
-        std::thread reader([this, conn]() { readLoop(conn); });
+        // 每连接一个读线程，命名后日志里能直接看出是哪条链路（对应 Java 的
+        // NettyClientWorkerThread；Java 用线程池复用，这里是一连接一线程，故带上地址）。
+        const std::string connAddr = conn->addr;
+        std::thread reader([this, conn, connAddr]() {
+            setThreadName("RemotingClientReader-" + connAddr);
+            readLoop(conn);
+        });
         {
             std::lock_guard<std::mutex> lk(threadMutex);
             threads.emplace_back(conn, std::move(reader));
@@ -235,14 +242,22 @@ struct RemotingClient::Impl {
             tv.tv_usec = 300000;  // 300ms：既能及时退出，也不空转
             int sel = ::select(static_cast<int>(sock) + 1, &rfds, nullptr, nullptr, &tv);
             if (sel < 0) {
-                break;  // 描述符已关闭（shutdown 时会走这条）
+                // shutdown() 关闭 fd 后 select 必然失败，属正常退出路径。这里统一记 DEBUG：
+                // 默认 INFO 级别下不可见（不会出现"退出时的假异常"噪声），
+                // 需要看连接生命周期时 ROCKETMQ_CPP_LOG_LEVEL=DEBUG 即可。
+                logger_debug("remoting reader: select failed on " + conn->addr + ", reader exiting");
+                break;
             }
             if (sel == 0) {
                 continue;
             }
             int n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
             if (n <= 0) {
-                break;  // 0 = 对端关闭
+                // n == 0 对端正常关闭，n < 0 读错误。Java 侧 Netty 的 channelInactive 会打一行，
+                // 但正常 shutdown 也会走到这里，为免默认 INFO 下变成噪声同样降到 DEBUG。
+                logger_debug("remoting reader: connection " + conn->addr + " closed, recv=" +
+                             std::to_string(n));
+                break;
             }
             buf.append(chunk, static_cast<size_t>(n));
             // 按 totalLength 前缀切帧；粘包/半包都由这里处理
@@ -252,6 +267,11 @@ struct RemotingClient::Impl {
                 }
                 int32_t totalLen = ByteReader::getInt32At(buf, 0);
                 if (totalLen <= 0 || totalLen > RemotingClient::MAX_FRAME_LENGTH) {
+                    // 真正的协议异常（对应 Java NettyRemotingAbstract 的 "decode message length error"）：
+                    // 必须可见，否则会表现为"请求莫名超时"而没人知道原因。
+                    logger_warn("remoting reader: illegal frame length " + std::to_string(totalLen) +
+                                " from " + conn->addr + ", dropping " +
+                                std::to_string(buf.size()) + " buffered bytes");
                     buf.clear();
                     break;
                 }
@@ -260,7 +280,7 @@ struct RemotingClient::Impl {
                 }
                 Bytes frame = buf.substr(0, static_cast<size_t>(4 + totalLen));
                 buf.erase(0, static_cast<size_t>(4 + totalLen));
-                dispatch(frame);
+                dispatch(frame, conn->addr);
             }
         }
         conn->readerDone.store(true);
@@ -274,9 +294,12 @@ struct RemotingClient::Impl {
         }
     }
 
-    void dispatch(const Bytes& frame) {
+    void dispatch(const Bytes& frame, const std::string& from) {
         RemotingCommand cmd;
         if (!RemotingCommand::tryDecode(frame, cmd, nullptr)) {
+            // Java 侧这里同样是 warn（解码失败意味着这条响应永久丢失，调用方只会看到超时）。
+            logger_warn("remoting reader: drop undecodable frame (" + std::to_string(frame.size()) +
+                        " bytes) from " + from);
             return;  // 解不出的帧直接丢，不影响其它请求
         }
         std::shared_ptr<Future> future;

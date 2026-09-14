@@ -69,9 +69,15 @@
    opaque 合法值就是 0。传输层只在**与在途请求真的冲突**时才重分配 opaque。
 5. C++ 零 warning 是目标（`-Wall -Wextra`，未开 `-Werror`）；改完应保持干净重建零 warning。
 6. **C++ 日志默认 INFO**（`include/rocketmq/common/logging.h`，落
-   `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log`）。良性长轮询超时走 DEBUG，默认被抑制 ——
-   运行日志必须保持 `ERROR=0`。新增"预期内"的失败日志时别用 ERROR/WARN。
-7. **`TopicPublishInfo` 不可拷贝、必须用 `shared_ptr` 取用**：它的轮询游标是**跨调用共享状态**，
+   `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log`）。**按大小轮转**（FixedWindow，默认 64MB ×
+   maxIndex 10，对齐 Java logback），行格式 `%Y-%m-%d %H:%M:%S.%03d %-5s [pid] [线程名] [文件:行号] - msg`。
+   良性长轮询超时走 DEBUG，默认被抑制 —— 运行日志必须保持 `ERROR=0`。
+   新增"预期内"的失败日志时别用 ERROR/WARN（连接关闭这类正常退出路径要用 DEBUG）。
+7. **三套客户端的日志文件必须不同名**：Java `rocketmq_client.log`（按大小 gzip）、
+   C++ `rocketmq_cpp_client.log`（FixedWindow）、Python `rocketmq_py_client.log`（按天改名）。
+   轮转策略不同，落同一文件会互相插行；更糟的是按天改名的实现会在午夜把文件改走，
+   而 JVM 仍持旧 fd → 后续 Java 日志写进已 unlink 的 inode 而**静默消失**。
+8. **`TopicPublishInfo` 不可拷贝、必须用 `shared_ptr` 取用**：它的轮询游标是**跨调用共享状态**，
    按值返回会让每次发送都从 0 号队列重来（轮询失效）。
 
 ## 已知 Python 参考实现的缺陷（C++ 侧无此问题）
@@ -84,15 +90,16 @@
 - 若将来给 Python 补心跳能力，需先修上述 1~3 点。
 
 ## 验证入口
-- 技能：`~/.workbuddy/skills/rocketmq-cpp-build-verify/SKILL.md`（编译命令、**7** 个 ctest 用例与
-  断言数、三个真机联调工具、手动互操作工具、全部坑位清单）。改 C++/Python 后照它跑即可。
-- Python 单测 **142 passed / 4 skipped**；C++ ctest **7/7 全绿**，合计 **476** 项断言
+- 技能：`~/.workbuddy/skills/rocketmq-cpp-build-verify/SKILL.md`（编译命令、**8** 个 ctest 用例与
+  断言数、四个真机联调工具、手动互操作工具、全部坑位清单）。改 C++/Python 后照它跑即可。
+- Python 单测 **147 passed / 4 skipped**；C++ ctest **8/8 全绿**，合计 **512** 项断言
   （codec 65 / java_alignment 32[带 Java 源码 38] / route_heartbeat 92 / transport 32 /
-  compression 33 / admin 152 / interop 70）。
+  compression 33 / admin 152 / **logging 36** / interop 70）。
 - **真实集群联调（不进 ctest，一条命令起停集群）**：
   - `bash /tmp/run_admin_live.sh` → Python Admin（52 PASS/0 FAIL/1 SKIP）
   - `bash /tmp/run_admin_live_cpp.sh` → C++ Admin（47 PASS/0 FAIL/1 SKIP）
   - `bash /tmp/run_compression_live.sh` → 压缩跨客户端矩阵（C++/Python 自测 + 与 Java 双向互通）
+  - `bash /tmp/run_logging_live.sh` → 日志能力真机验证（线程名 + 轮转，`threads=True rotation=True`）
   - `examples/rmq_live_message_types 127.0.0.1:9876` → 7 类消息能力（12/12）
 - `interop` 的 WARN 不是失败，但**出现新 WARN 要读**——它是 Python 侧偏差的显式记录
   （当前 WARN=2：`SubscriptionData` 不可哈希、`to_dict()` 出 snake_case 键）。

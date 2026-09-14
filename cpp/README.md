@@ -39,7 +39,7 @@ MSVC 下自动加 `/utf-8`（源码含中文注释，否则 C4819）；Windows �
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 7 个用例，约 476 项断言，~2s
+cd build && ctest --output-on-failure     # 8 个用例，约 512 项断言，~4s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -50,6 +50,7 @@ cd build && ctest --output-on-failure     # 7 个用例，约 476 项断言，~2
 | `transport` | 32 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、地址解析 |
 | `compression` | 33 | 压缩类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib 往返 + **Python 生成的外部夹具**、解压后清 flag、未支持类型必须失败而非交出压缩流 |
 | `admin` | 152 | fastjson2 非法 JSON 容错、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
+| `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
 | `interop` | 70 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
 
 ```bash
@@ -93,7 +94,7 @@ cpp/
 │   │   ├── compression.h           CompressorFactory（zlib / lz4 / zstd 类型解析）
 │   │   ├── sysflag.h / mix_all.h / topic_config.h / subscription_data.h / util_all.h
 │   │   ├── byte_buffer.h           大端读写游标
-│   │   ├── logging.h               header-only 日志（默认 INFO）
+│   │   ├── logging.h               header-only 日志（默认 INFO，按大小轮转，线程名/毫秒/文件:行）
 │   │   └── net_compat.h            socket 跨平台兼容（含 SIGPIPE 处理）
 │   ├── remoting/
 │   │   ├── remoting_client.h       同步 / 异步 / oneway + 拆包重组
@@ -135,11 +136,41 @@ NaN/Infinity 与尾逗号。所以 `json.cpp` 里是**容错解析器**而不是
 ## 日志
 
 `include/rocketmq/common/logging.h` 是 header-only 日志，默认级别 **INFO**，
-输出到 stderr 与 `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log`。
-环境变量：`ROCKETMQ_CPP_LOG_LEVEL`（DEBUG/INFO/WARN/ERROR/OFF）、`ROCKETMQ_CPP_LOG_FILE`。
+同时输出到 stderr 与 `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log`。
+
+行格式对齐 Java logback 的 `%d{...SSS} %-5p [%pid] [%t] [%logger#%M:%L] - %m`：
+
+```
+2026-09-14 17:06:14.566 INFO  [57308] [main] [producer.cpp:110] - DefaultMQProducer[...] started, clientId=...
+2026-09-14 17:07:09.086 INFO  [57316] [ConsumeMessageThread_0] [consumer.cpp:161] - DefaultMQPushConsumer[...] started
+```
+
+线程名：主线程落 `main`（对齐 Java），工作线程由内部命名 ——
+`ConsumeMessageThread_N` / `AsyncSenderThread_N` / `RemotingClientReader-<ip:port>`。
+后两者只在异常路径留痕（连接关闭、非法帧长、解码失败），所以正常日志里通常只看到前两者。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ROCKETMQ_CPP_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` / `OFF` |
+| `ROCKETMQ_CPP_LOG_FILE` | `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log` | 设为空串/`OFF`/`NONE` 则只留 stderr |
+| `ROCKETMQ_CPP_LOG_FILE_MAX_SIZE` | `67108864`（64MB） | 单文件上限，对齐 Java logback 的 `<maxFileSize>64MB</maxFileSize>`；`0` = 不轮转 |
+| `ROCKETMQ_CPP_LOG_FILE_MAX_INDEX` | `10` | 备份份数，对齐 Java `rocketmq.log.file.maxIndex`；`0` = 不保留 |
+
+轮转语义是 **FixedWindow**：`<file>.N` 最旧先删，其余依次后移，最后 base → `.1`。
+
+与 Java 的三点已知差异（都已显式记录在头文件里，不是 bug）：
+
+1. 备份**不压缩**（Java 会 gzip 到 `other_days/rocketmq_client-%i.log.gz`）；
+2. **同步写**（Java 走 AsyncAppender），但每行 `fflush`，`tail -f` 实时可见；
+3. 连接关闭记 **DEBUG**（Java 走 Netty `channelInactive` 记 INFO/WARN，但正常 shutdown 也命中同一路径，
+   在默认 INFO 下会变成"退出时的假异常"噪声）。真正的协议异常（帧长非法、解码失败）仍按 **WARN** 记录。
 
 **良性长轮询超时走 DEBUG**（默认被抑制），所以正常运行日志里 `ERROR=0` 是预期状态 ——
 出现 ERROR 就是真问题。
+
+> 📌 文件名刻意与 Java 客户端的 `rocketmq_client.log` 区分（Python 侧同理叫 `rocketmq_py_client.log`）。
+> 三者轮转策略不同，写同一文件会互相插行；更糟的是按天滚动的实现会在午夜把文件**改名**，
+> 而 JVM 仍持有旧 fd，后续日志会写进已 unlink 的 inode 而静默消失。
 
 ## License
 

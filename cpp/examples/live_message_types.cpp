@@ -227,7 +227,11 @@ int main(int argc, char** argv) {
     std::cout << "namesrv = " << gNamesrv << "  prefix = " << gPrefix << std::endl;
 
     // 日志保持干净：默认 INFO，良性长轮询超时（DEBUG）被抑制
-    setLogLevel(LOG_INFO);
+    // 日志保持干净：默认 INFO，良性长轮询超时（DEBUG）被抑制。
+    // 但若外部显式设置了 ROCKETMQ_CPP_LOG_LEVEL，则尊重它——真机排查时不改代码即可提级别。
+    if (!logLevelSetFromEnv()) {
+        setLogLevel(LOG_INFO);
+    }
 
     DefaultMQProducer prod(gPrefix + "_producer");
     prod.setNamesrvAddr(gNamesrv);

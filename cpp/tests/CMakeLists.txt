@@ -27,6 +27,11 @@ add_executable(rmq_test_admin test_admin.cpp)
 target_link_libraries(rmq_test_admin PRIVATE rocketmq::remoting)
 add_test(NAME admin COMMAND rmq_test_admin)
 
+# 客户端日志：行格式（毫秒/pid/线程名/文件:行）+ 按大小轮转 + maxIndex 上限 + 级别过滤
+add_executable(rmq_test_logging test_logging.cpp)
+target_link_libraries(rmq_test_logging PRIVATE rocketmq::remoting)
+add_test(NAME logging COMMAND rmq_test_logging)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

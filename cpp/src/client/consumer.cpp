@@ -145,7 +145,11 @@ void DefaultMQPushConsumer::start() {
     const int32_t n = std::max(1, consumeThreadNums_);
     consumeThreads_.clear();
     for (int32_t i = 0; i < n; ++i) {
-        consumeThreads_.emplace_back([this]() { consumeLoop(); });
+        // 线程名对齐 Java 的 ThreadFactoryImpl("ConsumeMessageThread_")：日志里能区分是哪个消费线程。
+        consumeThreads_.emplace_back([this, i]() {
+            setThreadName("ConsumeMessageThread_" + std::to_string(i));
+            consumeLoop();
+        });
     }
     std::string topics;
     for (const std::string& t : subscribedTopics()) {
