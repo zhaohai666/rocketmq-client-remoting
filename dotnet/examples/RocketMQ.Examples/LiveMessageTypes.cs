@@ -127,6 +127,36 @@ internal static class LiveMessageTypes
             LocalTransactionState.CommitMessage;
     }
 
+    /// <summary>本地事务回滚：broker 不应把半消息投递出来。</summary>
+    private sealed class RollbackTxListener : ITransactionListener
+    {
+        public LocalTransactionState ExecuteLocalTransaction(Message msg, string arg) =>
+            LocalTransactionState.RollbackMessage;
+
+        public LocalTransactionState CheckLocalTransaction(MessageExt msg) =>
+            LocalTransactionState.RollbackMessage;
+    }
+
+    /// <summary>
+    /// 本地事务返回 Unknow，等 broker 回查时才判 Commit。
+    /// CheckCalls 用于证明 **broker 确实回调过**（否则"最终收到"可能只是普通消息路径）。
+    /// </summary>
+    private sealed class UnknownThenCommitTxListener : ITransactionListener
+    {
+        private int _checkCalls;
+
+        public int CheckCalls => Volatile.Read(ref _checkCalls);
+
+        public LocalTransactionState ExecuteLocalTransaction(Message msg, string arg) =>
+            LocalTransactionState.Unknow;
+
+        public LocalTransactionState CheckLocalTransaction(MessageExt msg)
+        {
+            Interlocked.Increment(ref _checkCalls);
+            return LocalTransactionState.CommitMessage;
+        }
+    }
+
     // ---------------- 消费辅助 ----------------
 
     // 活跃等待直至收到 expect 条（或最多 durationSec 秒），再关闭消费者，返回已收到的消息。
@@ -374,31 +404,91 @@ internal static class LiveMessageTypes
             Check("按 Key 查询(query_message)", hit, "returned=" + found.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 7. 事务消息（简化单阶段）----------
+        // ---------- 7. 事务消息（对齐 Java 的两阶段：半消息 + END_TRANSACTION + 回查）----------
+        // ---------- 7.1 COMMIT ----------
         {
             string topic = _gPrefix + "_Tx";
             var listener = new CommitTxListener();
-            TransactionSendResult tsr;
             string stateStr;
+            bool txOk = false;
             try
             {
-                tsr = prod.SendMessageInTransaction(new Message(topic, Str2Bytes("tx-commit")), listener);
+                TransactionSendResult tsr = prod.SendMessageInTransaction(
+                    new Message(topic, Str2Bytes("tx-commit")), listener);
                 stateStr = LocalTransactionStateNames.Name(tsr.LocalTransactionState);
+                txOk = tsr.SendStatus == SendStatus.SendOk
+                    && tsr.LocalTransactionState == LocalTransactionState.CommitMessage;
             }
             catch (Exception e)
             {
-                Check("事务消息发送(简化单阶段)", false, "throw: " + e.Message);
-                tsr = new TransactionSendResult { LocalTransactionState = LocalTransactionState.Unknow };
-                stateStr = e.Message;
+                stateStr = "throw: " + e.Message;
             }
 
-            Check("事务消息发送(简化单阶段)",
-                tsr.SendStatus == SendStatus.SendOk && tsr.LocalTransactionState == LocalTransactionState.CommitMessage,
-                "state=" + stateStr);
+            Check("事务-COMMIT 发送状态", txOk, "state=" + stateStr);
 
             List<MessageExt> run = RunConsumer(topic, "*", 10, false, "tx");
             bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-commit");
-            Check("事务消息落库可被消费", consumed, "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+            Check("事务-COMMIT 落库可被消费", consumed,
+                "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 7.2 ROLLBACK ----------
+        {
+            string topic = _gPrefix + "_TxRollback";
+            var listener = new RollbackTxListener();
+            string stateStr;
+            bool txOk = false;
+            try
+            {
+                TransactionSendResult tsr = prod.SendMessageInTransaction(
+                    new Message(topic, Str2Bytes("tx-rollback")), listener);
+                stateStr = LocalTransactionStateNames.Name(tsr.LocalTransactionState);
+                txOk = tsr.SendStatus == SendStatus.SendOk
+                    && tsr.LocalTransactionState == LocalTransactionState.RollbackMessage;
+            }
+            catch (Exception e)
+            {
+                stateStr = "throw: " + e.Message;
+            }
+
+            Check("事务-ROLLBACK 发送状态", txOk, "state=" + stateStr);
+
+            List<MessageExt> run = RunConsumer(topic, "*", 10, false, "txrollback");
+            bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-rollback");
+            Check("事务-ROLLBACK 不被投递", !consumed,
+                "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 7.3 UNKNOW + broker 回查 ----------
+        {
+            string topic = _gPrefix + "_TxCheck";
+            var listener = new UnknownThenCommitTxListener();
+            string stateStr;
+            bool txOk = false;
+            try
+            {
+                TransactionSendResult tsr = prod.SendMessageInTransaction(
+                    new Message(topic, Str2Bytes("tx-check")), listener);
+                stateStr = LocalTransactionStateNames.Name(tsr.LocalTransactionState);
+                txOk = tsr.SendStatus == SendStatus.SendOk
+                    && tsr.LocalTransactionState == LocalTransactionState.Unknow;
+            }
+            catch (Exception e)
+            {
+                stateStr = "throw: " + e.Message;
+            }
+
+            Check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
+
+            // 回查默认 60s 一轮；联调 broker 配了 transactionCheckInterval=3000，
+            // 这里给足窗口等 broker 回查 + 提交后再投递
+            List<MessageExt> run = RunConsumer(topic, "*", 25, false, "txcheck");
+            bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-check");
+            int checks = listener.CheckCalls;
+            Check("事务-UNKNOW 触发 broker 回查", checks > 0,
+                "checkLocalTransaction_calls=" + checks.ToString(CultureInfo.InvariantCulture));
+            Check("事务-UNKNOW 回查后最终投递", consumed,
+                "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
         }
 
         // ---------- 附：心跳注册 ----------

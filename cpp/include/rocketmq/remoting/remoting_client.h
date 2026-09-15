@@ -27,6 +27,12 @@ class RemotingClient {
 public:
     using InvokeCallback = std::function<void(const RemotingCommand&)>;
 
+    // broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
+    // 对应 Java NettyRemotingAbstract 的 processor 表；返回值 void 表示「不回响应」，
+    // 与 Java ClientRemotingProcessor.checkTransactionState 返回 null 的语义一致
+    // （broker 侧是用 invokeOneway 发的，本来也不期待响应）。
+    using RequestProcessor = std::function<void(const RemotingCommand&, const std::string&)>;
+
     // 单帧上限（与 Java RemotingSysResponseCode / NettyRemotingClient 的 16MB 限制一致）
     static constexpr int32_t MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
@@ -57,6 +63,15 @@ public:
 
     // 单向调用：置 oneway 标志后发送，不等响应（对应 Java invokeOneway）。
     void invokeOneway(const std::string& addr, RemotingCommand& request);
+
+    // ---- broker 主动请求处理 ----
+    // 注册/注销按 requestCode 索引的请求处理器。
+    //
+    // 只有**请求类型且不在本地在途响应表里**的命令才会派发到这里（典型场景：
+    // broker 发来的事务回查 CHECK_TRANSACTION_STATE=39），不会影响现有的
+    // invokeSync / invokeAsync 响应分发。handler 在读线程里被调用，需自保证线程安全。
+    void registerProcessor(int32_t requestCode, RequestProcessor handler);
+    void unregisterProcessor(int32_t requestCode);
 
     // ---- 连接管理 ----
     bool isChannelWritable(const std::string& addr) const;

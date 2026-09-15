@@ -608,6 +608,9 @@ public sealed class QueryMessageRequestHeader : ICommandCustomHeader
 
 public sealed class EndTransactionRequestHeader : ICommandCustomHeader
 {
+    /// <summary>对应 setTopic(msg.getTopic())。</summary>
+    public string? Topic { get; set; }
+
     public string? ProducerGroup { get; set; }
     public long? TranStateTableOffset { get; set; }
     public long? CommitLogOffset { get; set; }
@@ -619,9 +622,14 @@ public sealed class EndTransactionRequestHeader : ICommandCustomHeader
     public string? MsgId { get; set; }
     public string? TransactionId { get; set; }
 
+    // ⚠ 键名必须是 "bname"（RpcRequestHeader 的字段名），不能是 brokerName——
+    //   否则 Java broker 用 setBrokerName 反序列化时静默丢字段。
+    public string? Bname { get; set; }
+
     public PropertyMap ToExtFields()
     {
         var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
         HeaderCodec.PutOptStr(outMap, "producerGroup", ProducerGroup);
         HeaderCodec.PutOptLong(outMap, "tranStateTableOffset", TranStateTableOffset);
         HeaderCodec.PutOptLong(outMap, "commitLogOffset", CommitLogOffset);
@@ -629,11 +637,13 @@ public sealed class EndTransactionRequestHeader : ICommandCustomHeader
         HeaderCodec.PutOptBool(outMap, "fromTransactionCheck", FromTransactionCheck);
         HeaderCodec.PutOptStr(outMap, "msgId", MsgId);
         HeaderCodec.PutOptStr(outMap, "transactionId", TransactionId);
+        HeaderCodec.PutOptStr(outMap, "bname", Bname);
         return outMap;
     }
 
     public void FromExtFields(PropertyMap ext)
     {
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
         ProducerGroup = HeaderCodec.GetOptStr(ext, "producerGroup");
         TranStateTableOffset = HeaderCodec.GetOptLong(ext, "tranStateTableOffset");
         CommitLogOffset = HeaderCodec.GetOptLong(ext, "commitLogOffset");
@@ -641,6 +651,7 @@ public sealed class EndTransactionRequestHeader : ICommandCustomHeader
         FromTransactionCheck = HeaderCodec.GetOptBool(ext, "fromTransactionCheck");
         MsgId = HeaderCodec.GetOptStr(ext, "msgId");
         TransactionId = HeaderCodec.GetOptStr(ext, "transactionId");
+        Bname = HeaderCodec.GetOptStr(ext, "bname");
     }
 }
 
@@ -773,30 +784,42 @@ public sealed class GetRouteInfoRequestHeader : ICommandCustomHeader
 
 public sealed class CheckTransactionStateRequestHeader : ICommandCustomHeader
 {
+    /// <summary>对应 RpcRequestHeader 基类的 topic 字段（CHECK 请求里 broker 也带了 topic）。</summary>
+    public string? Topic { get; set; }
+
     public long? TranStateTableOffset { get; set; }
     public long? CommitLogOffset { get; set; }
     public string? MsgId { get; set; }
     public string? TransactionId { get; set; }
-    public long? OffsetMsgId { get; set; }
+
+    /// <summary>⚠ Java 的 offsetMsgId 是 **String**，不是 long。</summary>
+    public string? OffsetMsgId { get; set; }
+
+    // ⚠ 键名必须是 "bname"（同 EndTransactionRequestHeader）。
+    public string? Bname { get; set; }
 
     public PropertyMap ToExtFields()
     {
         var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
         HeaderCodec.PutOptLong(outMap, "tranStateTableOffset", TranStateTableOffset);
         HeaderCodec.PutOptLong(outMap, "commitLogOffset", CommitLogOffset);
         HeaderCodec.PutOptStr(outMap, "msgId", MsgId);
         HeaderCodec.PutOptStr(outMap, "transactionId", TransactionId);
-        HeaderCodec.PutOptLong(outMap, "offsetMsgId", OffsetMsgId);
+        HeaderCodec.PutOptStr(outMap, "offsetMsgId", OffsetMsgId);
+        HeaderCodec.PutOptStr(outMap, "bname", Bname);
         return outMap;
     }
 
     public void FromExtFields(PropertyMap ext)
     {
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
         TranStateTableOffset = HeaderCodec.GetOptLong(ext, "tranStateTableOffset");
         CommitLogOffset = HeaderCodec.GetOptLong(ext, "commitLogOffset");
         MsgId = HeaderCodec.GetOptStr(ext, "msgId");
         TransactionId = HeaderCodec.GetOptStr(ext, "transactionId");
-        OffsetMsgId = HeaderCodec.GetOptLong(ext, "offsetMsgId");
+        OffsetMsgId = HeaderCodec.GetOptStr(ext, "offsetMsgId");
+        Bname = HeaderCodec.GetOptStr(ext, "bname");
     }
 }
 

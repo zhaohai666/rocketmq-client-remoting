@@ -13,7 +13,11 @@ public static class MessageConst
     public const string PropertyRealTopic = "REAL_TOPIC";
     public const string PropertyRealQueueId = "REAL_QID";
     public const string PropertyTransactionPrepared = "TRAN_MSG";
-    public const string PropertyProducerGroup = "PRODUCER_GROUP";
+    /// <summary>
+    /// ⚠ Java 里这个属性的字面值是 "PGROUP"（不是 "PRODUCER_GROUP"）。
+    /// broker 事务回查时正是用这个属性反查生产者，写错会导致回查永远找不到 listener。
+    /// </summary>
+    public const string PropertyProducerGroup = "PGROUP";
     public const string PropertyMinOffset = "MIN_OFFSET";
     public const string PropertyMaxOffset = "MAX_OFFSET";
     public const string PropertyBuyerId = "BUYER_ID";

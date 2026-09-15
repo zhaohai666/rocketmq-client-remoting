@@ -708,29 +708,49 @@ class UnlockBatchMqRequestHeader(CommandCustomHeader):
 
 
 class EndTransactionRequestHeader(CommandCustomHeader):
+    """对应 org.apache.rocketmq.remoting.protocol.header.EndTransactionRequestHeader。
+
+    ⚠ 继承 RpcRequestHeader 的 brokerName 字段在 Java 里**反射名是 ``bname``**
+    （setter 为 setBrokerName，但字段声明名是 bname）。写错键 broker 会静默丢字段。
+    字段名严格与 Java 一致：topic / producerGroup / tranStateTableOffset /
+    commitLogOffset / commitOrRollback / fromTransactionCheck / msgId /
+    transactionId / bname。
+    """
+
     def __init__(self):
-        self.transaction_id: Optional[str] = None
-        self.commit_log_offset: Optional[int] = None
-        self.commit: Optional[bool] = None
+        self.topic: Optional[str] = None
         self.producer_group: Optional[str] = None
         self.tran_state_table_offset: Optional[int] = None
+        self.commit_log_offset: Optional[int] = None
+        self.commit_or_rollback: Optional[int] = None
         self.from_transaction_check: Optional[bool] = None
+        self.msg_id: Optional[str] = None
+        self.transaction_id: Optional[str] = None
+        self.bname: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
         return _ext({
-            "transactionId": self.transaction_id, "commitLogOffset": self.commit_log_offset,
-            "commit": self.commit, "producerGroup": self.producer_group,
+            "topic": self.topic,
+            "producerGroup": self.producer_group,
             "tranStateTableOffset": self.tran_state_table_offset,
+            "commitLogOffset": self.commit_log_offset,
+            "commitOrRollback": self.commit_or_rollback,
             "fromTransactionCheck": self.from_transaction_check,
+            "msgId": self.msg_id,
+            "transactionId": self.transaction_id,
+            "bname": self.bname,
         })
 
     def from_ext_fields(self, ext: dict) -> None:
-        self.transaction_id = ext.get("transactionId")
-        self.commit_log_offset = _l(ext.get("commitLogOffset"))
-        self.commit = _b(ext.get("commit"))
+        self.topic = ext.get("topic")
         self.producer_group = ext.get("producerGroup")
         self.tran_state_table_offset = _l(ext.get("tranStateTableOffset"))
+        self.commit_log_offset = _l(ext.get("commitLogOffset"))
+        self.commit_or_rollback = _i(ext.get("commitOrRollback"))
         self.from_transaction_check = _b(ext.get("fromTransactionCheck"))
+        self.msg_id = ext.get("msgId")
+        self.transaction_id = ext.get("transactionId")
+        self.bname = ext.get("bname")
 
 
 class EndTransactionResponseHeader(CommandCustomHeader):
@@ -747,21 +767,41 @@ class EndTransactionResponseHeader(CommandCustomHeader):
 
 
 class CheckTransactionStateRequestHeader(CommandCustomHeader):
+    """对应 org.apache.rocketmq.remoting.protocol.header.CheckTransactionStateRequestHeader。
+
+    ⚠ 同样继承 RpcRequestHeader：brokerName 反射名是 ``bname``。字段名严格与 Java
+    一致：topic / tranStateTableOffset / commitLogOffset / msgId / transactionId /
+    offsetMsgId / bname。
+    """
+
     def __init__(self):
-        self.transaction_id: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.tran_state_table_offset: Optional[int] = None
         self.commit_log_offset: Optional[int] = None
-        self.producer_group: Optional[str] = None
+        self.msg_id: Optional[str] = None
+        self.transaction_id: Optional[str] = None
+        self.offset_msg_id: Optional[str] = None
+        self.bname: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
         return _ext({
-            "transactionId": self.transaction_id, "commitLogOffset": self.commit_log_offset,
-            "producerGroup": self.producer_group,
+            "topic": self.topic,
+            "tranStateTableOffset": self.tran_state_table_offset,
+            "commitLogOffset": self.commit_log_offset,
+            "msgId": self.msg_id,
+            "transactionId": self.transaction_id,
+            "offsetMsgId": self.offset_msg_id,
+            "bname": self.bname,
         })
 
     def from_ext_fields(self, ext: dict) -> None:
-        self.transaction_id = ext.get("transactionId")
+        self.topic = ext.get("topic")
+        self.tran_state_table_offset = _l(ext.get("tranStateTableOffset"))
         self.commit_log_offset = _l(ext.get("commitLogOffset"))
-        self.producer_group = ext.get("producerGroup")
+        self.msg_id = ext.get("msgId")
+        self.transaction_id = ext.get("transactionId")
+        self.offset_msg_id = ext.get("offsetMsgId")
+        self.bname = ext.get("bname")
 
 
 class CheckTransactionStateResponseHeader(CommandCustomHeader):

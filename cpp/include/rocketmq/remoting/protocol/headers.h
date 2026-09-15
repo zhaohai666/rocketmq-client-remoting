@@ -279,6 +279,7 @@ struct QueryMessageRequestHeader : public CommandCustomHeader {
 };
 
 struct EndTransactionRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> topic;
     std::optional<std::string> producerGroup;
     std::optional<int64_t> tranStateTableOffset;
     std::optional<int64_t> commitLogOffset;
@@ -286,6 +287,10 @@ struct EndTransactionRequestHeader : public CommandCustomHeader {
     std::optional<bool> fromTransactionCheck;
     std::optional<std::string> msgId;
     std::optional<std::string> transactionId;
+    // ⚠ 键名必须是 bname：该字段继承自 Java RpcRequestHeader 的 `protected String bname`
+    // （setter 叫 setBrokerName，但 RemotingCommand.makeCustomHeaderToNet 用反射取的是
+    // **字段声明名**），写成 brokerName 会让 broker 静默丢字段。
+    std::optional<std::string> bname;
 
     PropertyMap toExtFields() const override;
     void fromExtFields(const PropertyMap& ext) override;
@@ -346,12 +351,16 @@ struct GetRouteInfoRequestHeader : public CommandCustomHeader {
     void fromExtFields(const PropertyMap& ext) override;
 };
 
+// broker -> client 的事务回查请求（RequestCode.CHECK_TRANSACTION_STATE = 39）。
+// ⚠ Java 的 offsetMsgId 是 **String**（不是 long），别按整型序列化。
 struct CheckTransactionStateRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> topic;
     std::optional<int64_t> tranStateTableOffset;
     std::optional<int64_t> commitLogOffset;
     std::optional<std::string> msgId;
     std::optional<std::string> transactionId;
-    std::optional<int64_t> offsetMsgId;
+    std::optional<std::string> offsetMsgId;
+    std::optional<std::string> bname;  // 同 EndTransactionRequestHeader：键名是 bname
 
     PropertyMap toExtFields() const override;
     void fromExtFields(const PropertyMap& ext) override;

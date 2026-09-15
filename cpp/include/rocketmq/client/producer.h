@@ -19,6 +19,8 @@
 #include "rocketmq/common/compression.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/mix_all.h"
+#include "rocketmq/remoting/protocol/headers.h"
+#include "rocketmq/remoting/protocol/remoting_command.h"
 
 namespace rocketmq {
 
@@ -86,8 +88,12 @@ public:
     SendResult sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis = -1);
 
     // ---------------- 事务消息 ----------------
-    // 注意：与 Python 参考实现一致，为**简化单阶段**实现 —— 发送普通消息后执行
-    // 本地事务并回填状态，未实现 broker 半消息 / 回查 / END_TRANSACTION 两阶段提交。
+    // 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction 的**两阶段**：
+    //   1) 半消息：给 msg 打 TRAN_MSG / PGROUP 属性，sysFlag 置 TRANSACTION_PREPARED_TYPE；
+    //   2) 本地事务：仅 SEND_OK 时执行；FLUSH_* / SLAVE_NOT_AVAILABLE -> ROLLBACK；
+    //   3) endTransaction：以 END_TRANSACTION(37, oneway) 告知 broker 提交 / 回滚 / 未知；
+    //   4) UNKNOW 时由 broker 回查 CHECK_TRANSACTION_STATE(39)，回调
+    //      listener.checkLocalTransaction 后再发 END_TRANSACTION(fromTransactionCheck=true)。
     TransactionSendResult sendMessageInTransaction(const Message& msg, TransactionListener& listener,
                                                    const std::string& arg = std::string());
 
@@ -107,6 +113,39 @@ protected:
     // 满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sysFlag
     // （COMPRESSED_FLAG | 压缩类型位）；不压缩时返回 0。
     int32_t prepareForSend(Message& msg) const;
+
+    // 对应 Java endTransaction / checkTransactionState 的收尾：
+    // 以 END_TRANSACTION(37, oneway) 告知 broker 事务最终状态。
+    // fromCheck=true 时表示这是**回查**的收尾，偏移等字段取自 broker 的回查 header。
+    void endTransaction(const Message& msg, const SendResult& sendResult,
+                        LocalTransactionState state, bool hasLocalException,
+                        const std::string& localExceptionText, bool fromCheck,
+                        const CheckTransactionStateRequestHeader* checkHeader,
+                        const MessageExt* checkMsg, const std::string& brokerAddr);
+    // broker 主动发起的事务回查（CHECK_TRANSACTION_STATE=39）入口，由传输层回调。
+    void checkTransactionState(const RemotingCommand& cmd, const std::string& addr);
+
+    // 向所有已知 broker 发一次心跳（含 ProducerData）。
+    //
+    // Java 里 producer 与 consumer 一样定期心跳注册到 broker；**broker 的事务回查正是
+    // 通过 ProducerManager 里登记的 channel 反向联系生产者的**。生产者不发心跳时，
+    // COMMIT/ROLLBACK 仍能成功（客户端主动 END_TRANSACTION），但 UNKNOW 状态的半消息
+    // 会因为 broker 找不到客户端而**永远不被回查**。
+    int32_t sendHeartbeatToAllBroker();
+
+    // 最近一次 sendMessageInTransaction 使用的监听器（broker 回查时回调它）。
+    // 裸引用：调用方需保证其生命周期覆盖事务回查（与 Java 的 TransactionListener 引用语义一致）。
+    TransactionListener* txListener_ = nullptr;
+    // 回查处理线程句柄，shutdown 时统一 join 回收
+    std::vector<std::thread> txThreads_;
+    std::mutex txThreadsMutex_;
+
+    // 心跳线程（对齐 Java MQClientInstance 的定时心跳；间隔默认 30s）
+    std::thread heartbeatThread_;
+    std::atomic<bool> heartbeatRunning_{false};
+    std::atomic<int64_t> lastHeartbeatMs_{0};
+    int32_t heartbeatIntervalMillis_ = 30000;
+    std::atomic<int32_t> heartbeatCount_{0};
 
     std::string producerGroup_;
     std::string instanceName_ = "DEFAULT";

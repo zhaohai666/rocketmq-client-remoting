@@ -135,6 +135,7 @@ private:
 };
 
 // ---------------------------------------------------------------- 事务监听器
+// COMMIT：本地事务直接提交
 class CommitTxListener : public TransactionListener {
 public:
     LocalTransactionState executeLocalTransaction(const Message& /*msg*/,
@@ -144,6 +145,33 @@ public:
     LocalTransactionState checkLocalTransaction(const MessageExt& /*msg*/) override {
         return LocalTransactionState::COMMIT_MESSAGE;
     }
+};
+
+// ROLLBACK：本地事务回滚，broker 不应把半消息投递出来
+class RollbackTxListener : public TransactionListener {
+public:
+    LocalTransactionState executeLocalTransaction(const Message& /*msg*/,
+                                                  const std::string& /*arg*/) override {
+        return LocalTransactionState::ROLLBACK_MESSAGE;
+    }
+    LocalTransactionState checkLocalTransaction(const MessageExt& /*msg*/) override {
+        return LocalTransactionState::ROLLBACK_MESSAGE;
+    }
+};
+
+// UNKNOW + 回查：本地事务返回 UNKNOW，等 broker 回查时才判 COMMIT。
+// checkCalls 用于证明 **broker 确实回调过**（否则"最终收到"可能只是普通消息路径）。
+class UnknownThenCommitTxListener : public TransactionListener {
+public:
+    LocalTransactionState executeLocalTransaction(const Message& /*msg*/,
+                                                  const std::string& /*arg*/) override {
+        return LocalTransactionState::UNKNOW;
+    }
+    LocalTransactionState checkLocalTransaction(const MessageExt& /*msg*/) override {
+        ++checkCalls;
+        return LocalTransactionState::COMMIT_MESSAGE;
+    }
+    std::atomic<int> checkCalls{0};
 };
 
 // ---------------------------------------------------------------- 消费辅助
@@ -418,7 +446,8 @@ int main(int argc, char** argv) {
               "returned=" + std::to_string(found.size()));
     }
 
-    // ---------- 7. 事务消息（简化单阶段）----------
+    // ---------- 7. 事务消息（对齐 Java 的两阶段：半消息 + END_TRANSACTION + 回查）----------
+    // ---------- 7.1 COMMIT ----------
     {
         const std::string topic = gPrefix + "_Tx";
         CommitTxListener listener;
@@ -433,14 +462,72 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             stateStr = std::string("throw: ") + e.what();
         }
-        check("事务消息发送(简化单阶段)", txOk, "state=" + stateStr);
+        check("事务-COMMIT 发送状态", txOk, "state=" + stateStr);
 
         ConsumerRun run = runConsumer(topic, "*", 10, false, "tx");
         bool consumed = false;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "tx-commit") consumed = true;
         }
-        check("事务消息落库可被消费", consumed,
+        check("事务-COMMIT 落库可被消费", consumed,
+              "received=" + std::to_string(run.msgs.size()));
+    }
+
+    // ---------- 7.2 ROLLBACK ----------
+    {
+        const std::string topic = gPrefix + "_TxRollback";
+        RollbackTxListener listener;
+        bool txOk = false;
+        std::string stateStr;
+        try {
+            TransactionSendResult tsr =
+                prod.sendMessageInTransaction(Message(topic, str2bytes("tx-rollback")), listener);
+            stateStr = localTransactionStateName(tsr.localTransactionState);
+            txOk = (tsr.sendStatus == SendStatus::SEND_OK &&
+                    tsr.localTransactionState == LocalTransactionState::ROLLBACK_MESSAGE);
+        } catch (const std::exception& e) {
+            stateStr = std::string("throw: ") + e.what();
+        }
+        check("事务-ROLLBACK 发送状态", txOk, "state=" + stateStr);
+
+        // 回滚后 broker 不应投递：等满窗口确认一条都没收到
+        ConsumerRun run = runConsumer(topic, "*", 10, false, "txrollback");
+        bool consumed = false;
+        for (const MessageExt& m : run.msgs) {
+            if (bytes2str(m.body) == "tx-rollback") consumed = true;
+        }
+        check("事务-ROLLBACK 不被投递", !consumed,
+              "received=" + std::to_string(run.msgs.size()));
+    }
+
+    // ---------- 7.3 UNKNOW + broker 回查 ----------
+    {
+        const std::string topic = gPrefix + "_TxCheck";
+        UnknownThenCommitTxListener listener;
+        bool txOk = false;
+        std::string stateStr;
+        try {
+            TransactionSendResult tsr =
+                prod.sendMessageInTransaction(Message(topic, str2bytes("tx-check")), listener);
+            stateStr = localTransactionStateName(tsr.localTransactionState);
+            txOk = (tsr.sendStatus == SendStatus::SEND_OK &&
+                    tsr.localTransactionState == LocalTransactionState::UNKNOW);
+        } catch (const std::exception& e) {
+            stateStr = std::string("throw: ") + e.what();
+        }
+        check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
+
+        // 回查默认 60s 一轮；联调 broker 配了 transactionCheckInterval=3000，
+        // 这里给足窗口等 broker 回查 + 提交后再投递
+        ConsumerRun run = runConsumer(topic, "*", 25, false, "txcheck");
+        bool consumed = false;
+        for (const MessageExt& m : run.msgs) {
+            if (bytes2str(m.body) == "tx-check") consumed = true;
+        }
+        int checks = listener.checkCalls.load();
+        check("事务-UNKNOW 触发 broker 回查", checks > 0,
+              "checkLocalTransaction_calls=" + std::to_string(checks));
+        check("事务-UNKNOW 回查后最终投递", consumed,
               "received=" + std::to_string(run.msgs.size()));
     }
 

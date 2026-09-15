@@ -91,6 +91,10 @@ dotnet $PROG interop --decode <hex>       # 解码外部帧（供 Python/C++ -> 
 
 ## 与 Java 的已知差异
 
-- 事务消息为**简化单阶段**（先本地执行再发送），未实现半消息/回查/两阶段（与 C++/Python 一致）。
+- 事务消息已对齐 Java 的**两阶段**：半消息（TRAN_MSG/PGROUP + sysFlag TRANSACTION_PREPARED）→
+  本地事务 → END_TRANSACTION(37, oneway) → broker 回查 CHECK_TRANSACTION_STATE(39) 时回调
+  `CheckLocalTransaction` 并回发 END_TRANSACTION(FromTransactionCheck=true)。
+  真机验证 COMMIT / ROLLBACK / UNKNOW+回查 三场景全通过（2026-09-15）。
+  生产者会周期性向 broker 发心跳（含 ProducerData）——**broker 的事务回查依赖它**。
 - `ClientLog` 备份文件不压缩（Java 会 gzip）；同步写（Java 走 AsyncAppender）。
 - 心跳指纹固定 0（走 broker V1 完整注册路径），未实现依赖 fastjson2 字段序的 V2 指纹。

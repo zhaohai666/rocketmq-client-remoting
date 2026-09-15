@@ -106,8 +106,32 @@ void DefaultMQProducer::start() {
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_));
     mqClient_->start();
+    // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
+    // 不注册的话 broker 回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 UNKNOW。
+    mqClient_->remotingClient().registerProcessor(
+        RequestCode::CHECK_TRANSACTION_STATE,
+        [this](const RemotingCommand& cmd, const std::string& addr) {
+            this->checkTransactionState(cmd, addr);
+        });
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
+
+    // 心跳线程：周期性向 broker 注册 ProducerData。没有它 broker 无法主动回查事务。
+    heartbeatRunning_.store(true);
+    heartbeatThread_ = std::thread([this]() {
+        setThreadName("ProducerHeartbeatThread");
+        // 启动后立刻发一次：让 broker 尽快登记 channel，避免首条事务消息错过回查窗口
+        while (heartbeatRunning_.load()) {
+            try {
+                sendHeartbeatToAllBroker();
+            } catch (const std::exception& e) {
+                logger_debug("producer heartbeat failed: " + std::string(e.what()));
+            }
+            for (int i = 0; i < heartbeatIntervalMillis_ / 100 && heartbeatRunning_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    });
 }
 
 void DefaultMQProducer::shutdown() {
@@ -123,6 +147,21 @@ void DefaultMQProducer::shutdown() {
     // 先回收异步线程（它们内部持有 mqClient_ 引用），再关客户端
     for (std::thread& t : threads) {
         if (t.joinable()) t.join();
+    }
+    // 先停心跳线程（它内部持有 mqClient_ 引用），再回收其它线程
+    heartbeatRunning_.store(false);
+    if (heartbeatThread_.joinable()) {
+        heartbeatThread_.join();
+    }
+    {
+        std::vector<std::thread> txThreads;
+        {
+            std::lock_guard<std::mutex> tl(txThreadsMutex_);
+            txThreads.swap(txThreads_);
+        }
+        for (std::thread& t : txThreads) {
+            if (t.joinable()) t.join();
+        }
     }
     if (mqClient_) {
         mqClient_->shutdown();
@@ -278,25 +317,253 @@ SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_
     return c.sendMessage(producerGroup_, batch, selected, timeout, sysFlag);
 }
 
+// ---------------------------------------------------------------- 心跳
+int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
+    if (mqClient_ == nullptr) {
+        return 0;
+    }
+    std::vector<std::string> addrs;
+    try {
+        addrs = mqClient_->knownBrokerAddrs();
+    } catch (const std::exception& e) {
+        logger_warn("producer heartbeat: gather brokers failed: " + std::string(e.what()));
+        return 0;
+    }
+    if (addrs.empty()) {
+        return 0;
+    }
+
+    // 只带 ProducerData：对齐 Java MQClientInstance 里 producerTable 的注册内容。
+    // broker 会把该 group 登记到 ProducerManager（事务回查即通过该 channel 反向联系）。
+    HeartbeatData hb(clientId_);
+    ProducerData pd;
+    pd.groupName = producerGroup_;
+    hb.heartbeatFingerprint = 0;  // 走 V1 注册路径，最稳妥
+    hb.addProducerData(pd);
+
+    int32_t okCount = 0;
+    for (const std::string& addr : addrs) {
+        try {
+            mqClient_->sendHeartbeat(addr, hb, 5000);
+            ++okCount;
+            heartbeatCount_.fetch_add(1);
+        } catch (const std::exception& e) {
+            logger_warn("producer heartbeat to " + addr + " failed: " + e.what());
+        }
+    }
+    return okCount;
+}
+
 // ---------------------------------------------------------------- 事务消息
+//
+// 对齐 Java DefaultMQProducerImpl 的两阶段实现：
+//   半消息(TRAN_MSG/PGROUP + sysFlag TRANSACTION_PREPARED) -> 本地事务 ->
+//   END_TRANSACTION(37, oneway)；UNKNOW 时由 broker 回查 CHECK_TRANSACTION_STATE(39)。
+static int32_t transactionFlagOf(LocalTransactionState state) {
+    switch (state) {
+        case LocalTransactionState::COMMIT_MESSAGE:
+            return MessageSysFlag::TRANSACTION_COMMIT_TYPE;    // 0x2 << 2
+        case LocalTransactionState::ROLLBACK_MESSAGE:
+            return MessageSysFlag::TRANSACTION_ROLLBACK_TYPE;  // 0x3 << 2
+        default:
+            return MessageSysFlag::TRANSACTION_NOT_TYPE;       // UNKNOW
+    }
+}
+
+void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sendResult,
+                                       LocalTransactionState state, bool hasLocalException,
+                                       const std::string& localExceptionText, bool fromCheck,
+                                       const CheckTransactionStateRequestHeader* checkHeader,
+                                       const MessageExt* checkMsg, const std::string& brokerAddr) {
+    MQClientInstance& c = client();
+
+    EndTransactionRequestHeader header;
+    header.producerGroup = producerGroup_;
+    header.commitOrRollback = transactionFlagOf(state);
+    header.fromTransactionCheck = fromCheck;
+
+    std::string addr;
+    if (fromCheck) {
+        // 回查收尾：偏移 / 事务号来自 broker 的回查请求（sendResult 此时不可用）
+        header.topic = checkHeader->topic.value_or("");
+        header.commitLogOffset = checkHeader->commitLogOffset;
+        header.tranStateTableOffset = checkHeader->tranStateTableOffset;
+        header.transactionId = checkHeader->transactionId;
+        header.bname = checkHeader->bname;
+        // Java: uniqueKey = msg 属性 UNIQ_KEY，取不到才用 msgId
+        std::string uniqueKey;
+        if (checkMsg != nullptr) {
+            uniqueKey = checkMsg->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+            if (uniqueKey.empty()) {
+                uniqueKey = checkMsg->msgId;
+            }
+        }
+        header.msgId = uniqueKey.empty() ? std::optional<std::string>() : uniqueKey;
+        addr = brokerAddr;
+    } else {
+        // Java: id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
+        const std::string& idText = sendResult.offsetMsgId.empty() ? sendResult.msgId
+                                                                   : sendResult.offsetMsgId;
+        std::string idIp;
+        int32_t idPort = 0;
+        int64_t idOffset = 0;
+        if (!decodeMessageId(idText, idIp, idPort, idOffset)) {
+            throw MQClientException("unrecognized msgId: " + idText);
+        }
+        header.topic = msg.topic;
+        header.commitLogOffset = idOffset;
+        header.tranStateTableOffset = sendResult.queueOffset;
+        header.transactionId = sendResult.transactionId;
+        header.bname = sendResult.messageQueue.brokerName;
+        header.msgId = sendResult.msgId;
+        addr = c.brokerAddrForMq(sendResult.messageQueue);
+    }
+
+    RemotingCommand request = RemotingCommand::createRequestCommand(
+        RequestCode::END_TRANSACTION, std::make_shared<EndTransactionRequestHeader>(header));
+    if (hasLocalException) {
+        request.remark = "executeLocalTransactionBranch exception: " + localExceptionText;
+    }
+    // Java 走 endTransactionOneway：单向发送，不等 broker 响应
+    c.remotingClient().invokeOneway(addr, request);
+}
+
+void DefaultMQProducer::checkTransactionState(const RemotingCommand& cmd, const std::string& addr) {
+    CheckTransactionStateRequestHeader header;
+    header.fromExtFields(cmd.extFields);
+
+    // broker 把整条 MessageExt 编码后放在 body 里（Java Broker2Client.checkProducerTransactionState）
+    MessageExt msgExt;
+    if (cmd.body.empty() || !decodeMessage(cmd.body, msgExt)) {
+        logger_warn("checkTransactionState: decode message failed");
+        return;
+    }
+
+    const std::string group =
+        msgExt.getProperty(MessageConst::PROPERTY_PRODUCER_GROUP);
+    if (group != producerGroup_) {
+        logger_debug("checkTransactionState: group " + group + " is not mine (" + producerGroup_ +
+                     ")");
+        return;
+    }
+
+    TransactionListener* listener = txListener_;
+    if (listener == nullptr) {
+        logger_warn("checkTransactionState: no transaction listener for group " + producerGroup_);
+        return;
+    }
+
+    // Java 在独立线程里执行回查回调，避免阻塞读线程
+    MessageExt captured = std::move(msgExt);
+    CheckTransactionStateRequestHeader capturedHeader = header;
+    std::thread th([this, captured, capturedHeader, addr, listener]() {
+        setThreadName("TransactionCheckThread");
+        LocalTransactionState state = LocalTransactionState::UNKNOW;
+        bool hasException = false;
+        std::string exceptionText;
+        try {
+            state = listener->checkLocalTransaction(captured);
+        } catch (const std::exception& e) {
+            logger_error(std::string("Broker call checkTransactionState, but "
+                                     "checkLocalTransactionState exception: ") +
+                         e.what());
+            hasException = true;
+            exceptionText = e.what();
+        } catch (...) {
+            logger_error("Broker call checkTransactionState, but checkLocalTransactionState "
+                         "threw unknown exception");
+            hasException = true;
+            exceptionText = "unknown exception";
+        }
+        try {
+            static const Message emptyMsg;
+            static const SendResult emptyResult;
+            endTransaction(emptyMsg, emptyResult, state, hasException, exceptionText, true,
+                           &capturedHeader, &captured, addr);
+        } catch (const std::exception& e) {
+            logger_warn("checkTransactionState: end transaction failed: " + std::string(e.what()));
+        }
+    });
+    {
+        std::lock_guard<std::mutex> tl(txThreadsMutex_);
+        txThreads_.push_back(std::move(th));
+    }
+}
+
 TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message& msg,
                                                                   TransactionListener& listener,
                                                                   const std::string& arg) {
+    // Java ensureNotDelayedForTransactional：事务消息不支持延迟投递
+    if (msg.getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL).size() > 0) {
+        throw MQClientException("Transactional messages do not support delayed delivery");
+    }
+
     MQClientInstance& c = client();
     checkMessage(msg);
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic);
+
+    // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
+    Message outbound = msg;
+    outbound.putProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED, "true");
+    outbound.putProperty(MessageConst::PROPERTY_PRODUCER_GROUP, producerGroup_);
+    txListener_ = &listener;
+
+    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
 
-    // 简化单阶段：先发消息，再执行本地事务，按结果回填状态。
-    // 未实现 broker 半消息 + 回查 + END_TRANSACTION 两阶段提交。
-    // 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl）。
-    Message outbound = msg;
-    const int32_t sysFlag = prepareForSend(outbound);
-    SendResult sendResult =
-        c.sendMessage(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
+    // 压缩与普通发送一致；再叠加事务类型位（Java sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
+    int32_t sysFlag = prepareForSend(outbound);
+    sysFlag = MessageSysFlag::resetTransactionValue(sysFlag,
+                                                    MessageSysFlag::TRANSACTION_PREPARED_TYPE);
+    SendResult sendResult;
+    try {
+        sendResult = c.sendMessage(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
+    } catch (const std::exception& e) {
+        throw MQClientException(std::string("send message Exception: ") + e.what());
+    }
+
+    LocalTransactionState state = LocalTransactionState::UNKNOW;
+    bool hasLocalException = false;
+    std::string localExceptionText;
+    if (sendResult.sendStatus == SendStatus::SEND_OK) {
+        if (!sendResult.transactionId.empty()) {
+            outbound.putProperty("__transactionId__", sendResult.transactionId);
+        }
+        std::string uniq = outbound.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+        if (!uniq.empty()) {
+            outbound.transactionId = uniq;
+        }
+        try {
+            LocalTransactionState ret = listener.executeLocalTransaction(outbound, arg);
+            state = ret;  // Java：null 视为 UNKNOW → C++ 枚举已覆盖三态
+        } catch (const std::exception& e) {
+            logger_error("executeLocalTransactionBranch exception, topic=" + outbound.topic +
+                         ": " + e.what());
+            hasLocalException = true;
+            localExceptionText = e.what();
+        } catch (...) {
+            logger_error("executeLocalTransactionBranch threw unknown exception, topic=" +
+                         outbound.topic);
+            hasLocalException = true;
+            localExceptionText = "unknown exception";
+        }
+    } else if (sendResult.sendStatus == SendStatus::FLUSH_DISK_TIMEOUT ||
+               sendResult.sendStatus == SendStatus::FLUSH_SLAVE_TIMEOUT ||
+               sendResult.sendStatus == SendStatus::SLAVE_NOT_AVAILABLE) {
+        state = LocalTransactionState::ROLLBACK_MESSAGE;
+    }
+
+    try {
+        endTransaction(outbound, sendResult, state, hasLocalException, localExceptionText, false,
+                       nullptr, nullptr, "");
+    } catch (const std::exception& e) {
+        // Java：end broker transaction 失败只 warn，不影响返回结果
+        logger_warn("local transaction execute " + std::string(localTransactionStateName(state)) +
+                    ", but end broker transaction failed: " + e.what());
+    }
+
     TransactionSendResult tsr;
     static_cast<SendResult&>(tsr) = sendResult;
-    tsr.localTransactionState = listener.executeLocalTransaction(msg, arg);
+    tsr.localTransactionState = state;
     return tsr;
 }
 

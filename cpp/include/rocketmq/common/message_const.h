@@ -15,7 +15,9 @@ struct MessageConst {
     static constexpr const char* PROPERTY_REAL_TOPIC = "REAL_TOPIC";
     static constexpr const char* PROPERTY_REAL_QUEUE_ID = "REAL_QID";
     static constexpr const char* PROPERTY_TRANSACTION_PREPARED = "TRAN_MSG";
-    static constexpr const char* PROPERTY_PRODUCER_GROUP = "PRODUCER_GROUP";
+    // ⚠ Java 里这个属性的字面值是 "PGROUP"（不是 "PRODUCER_GROUP"）。
+    // broker 事务回查时正是用这个属性反查生产者，写错会导致回查永远找不到 listener。
+    static constexpr const char* PROPERTY_PRODUCER_GROUP = "PGROUP";
     static constexpr const char* PROPERTY_MIN_OFFSET = "MIN_OFFSET";
     static constexpr const char* PROPERTY_MAX_OFFSET = "MAX_OFFSET";
     static constexpr const char* PROPERTY_BUYER_ID = "BUYER_ID";

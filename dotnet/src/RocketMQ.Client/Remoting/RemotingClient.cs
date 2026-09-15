@@ -28,6 +28,14 @@ public sealed class RemotingClient : IDisposable
     /// <summary>响应到达时在读线程中触发的回调。实现需自行保证线程安全。</summary>
     public delegate void InvokeCallback(RemotingCommand response);
 
+    /// <summary>
+    /// broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
+    /// 对应 Java NettyRemotingAbstract 的 processor 表；返回 void 表示「不回响应」，
+    /// 与 Java ClientRemotingProcessor.checkTransactionState 返回 null 的语义一致
+    /// （broker 侧是用 invokeOneway 发的，本来也不期待响应）。
+    /// </summary>
+    public delegate void RequestProcessor(RemotingCommand request, string addr);
+
     /// <summary>单帧上限（与 Java NettyRemotingClient 的 16MB 限制一致）。</summary>
     public const int MaxFrameLength = 16 * 1024 * 1024;
 
@@ -54,6 +62,11 @@ public sealed class RemotingClient : IDisposable
     private readonly Dictionary<string, Connection> _conns = new(StringComparer.Ordinal);
 
     private readonly ConcurrentDictionary<int, Future> _respTable = new();
+
+    // broker 主动请求处理器表：requestCode -> handler。仅用于事务回查
+    // (CHECK_TRANSACTION_STATE=39) 这类「服务端反过来找我」的命令。
+    private readonly Dictionary<int, RequestProcessor> _processors = new();
+    private readonly object _procLock = new();
 
     // 读线程账本：读线程自行结束后置 ReaderDone，由 PruneThreads 回收，避免句柄无限堆积。
     private readonly object _threadMutex = new();
@@ -367,7 +380,39 @@ public sealed class RemotingClient : IDisposable
 
         if (!_respTable.TryRemove(cmd.Opaque, out Future? future))
         {
-            return; // 已超时的请求（响应来晚了）
+            // 在途表里查不到：要么是迟到的响应，要么是 **broker 主动发来的请求**。
+            // 后者交给已注册的处理器（典型：事务回查 CHECK_TRANSACTION_STATE=39）。
+            if (!cmd.IsResponseType())
+            {
+                RequestProcessor? proc = null;
+                lock (_procLock)
+                {
+                    _processors.TryGetValue(cmd.Code, out proc);
+                }
+
+                if (proc is not null)
+                {
+                    // 处理器在读线程里执行：异常必须兜住，否则读线程会死掉，
+                    // 该连接上其余响应会全部丢失（比丢一条回查严重得多）。
+                    try
+                    {
+                        proc(cmd, from);
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Warn("remoting: processor for request code "
+                            + cmd.Code.ToString(CultureInfo.InvariantCulture) + " threw: " + e.Message);
+                    }
+                }
+                else
+                {
+                    // 未开启事务时 broker 不会发这类请求，属于预期情况，不用 Warn
+                    ClientLog.Debug("remoting: no processor for broker request code "
+                        + cmd.Code.ToString(CultureInfo.InvariantCulture) + " from " + from);
+                }
+            }
+
+            return; // 迟到的响应 / 已处理完的 broker 请求
         }
 
         InvokeCallback? cb;
@@ -379,6 +424,28 @@ public sealed class RemotingClient : IDisposable
 
         future.Done.Set();
         cb?.Invoke(cmd);
+    }
+
+    /// <summary>
+    /// 注册 broker 主动请求的处理器（对应 Java NettyRemotingAbstract 的 processor 表）。
+    /// 只有「请求类型且不在本地在途响应表里」的命令才会派发到这里，不会影响现有的
+    /// InvokeSync / InvokeAsync 响应分发。处理器在读线程里执行，需自保证线程安全。
+    /// </summary>
+    public void RegisterProcessor(int requestCode, RequestProcessor handler)
+    {
+        lock (_procLock)
+        {
+            _processors[requestCode] = handler;
+        }
+    }
+
+    /// <summary>注销按 requestCode 索引的请求处理器。</summary>
+    public void UnregisterProcessor(int requestCode)
+    {
+        lock (_procLock)
+        {
+            _processors.Remove(requestCode);
+        }
     }
 
     // ---------------------------------------------------------------- 发送

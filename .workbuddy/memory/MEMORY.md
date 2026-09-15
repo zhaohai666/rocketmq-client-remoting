@@ -14,7 +14,7 @@
 - `dotnet/`：.NET 10 实现（零 NuGet 依赖，仅 BCL；TreatWarningsAsErrors 全局开启，0 warning）。
   协议/传输/客户端全层对齐 C++；xunit 46/46；真机联调 selfcheck 3/0、message-types 12/0、
   admin-live 47/0/1、compression selftest ALL PASS、Python↔.NET interop 双向解码一致。
-  详见 `dotnet/README.md`。事务消息同为简化单阶段。
+  详见 `dotnet/README.md`。事务消息三侧均已对齐 Java 两阶段（见下）。
 
 ## .NET 侧特有坑（勿再踩）
 - **数值格式化必须显式 `CultureInfo.InvariantCulture`**（协议序列化不能随区域设置变）。
@@ -23,6 +23,29 @@
 - 并行子代理构建必须 `mkdir /tmp/dotnet-build.lock` 互斥（obj/ 争抢）；
   同一文件多处改动必须逐条串行 Edit（并行会丢更新）。
 - 联调脚本起集群后要 `sleep 12` 等 broker 向 NS 注册（端口开 ≠ 已注册）。
+- **.NET 的 `Message.DelayTimeLevel` getter 对缺失键返回 0**——判"是否设置了延迟"必须查
+  Properties 字典，不能只看属性值（事务消息的延迟校验曾因此恒触发）。
+
+## 事务消息（三侧已对齐 Java 两阶段，2026-09-15 真机验证）
+- 协议：半消息（msg 属性 `TRAN_MSG=true` + `PGROUP`，sysFlag 置 0x1<<2）→ 本地事务（仅 SEND_OK
+  执行；FLUSH_*/SLAVE_NOT_AVAILABLE → ROLLBACK）→ `END_TRANSACTION=37` **oneway**（commitOrRollback：
+  COMMIT 8 / ROLLBACK 12 / UNKNOW 0；偏移取自 sendResult；`bname` 键）→ broker 回查
+  `CHECK_TRANSACTION_STATE=39`（**body 是整条编码后的 MessageExt**，broker 用 oneway 发，
+  客户端**不回响应**），客户端在新线程跑 checkLocalTransaction 后再发
+  END_TRANSACTION(fromTransactionCheck=true)。
+- **三侧共同的坑**：`PROPERTY_PRODUCER_GROUP` 的字面值是 **"PGROUP"** 不是 "PRODUCER_GROUP"
+  （C++/Python/.NET 三侧原本全错，broker 回查靠它反查生产者）；`offsetMsgId` 在
+  CheckTransactionStateRequestHeader 里是 **String 不是 long**。
+- **生产者必须发心跳（含 ProducerData）**：broker 的事务回查通过 ProducerManager 里登记的
+  channel 反向联系客户端；生产者不发心跳时 COMMIT/ROLLBACK 仍成功（客户端主动发
+  END_TRANSACTION），但 UNKNOW 的半消息**永远不被回查**。三侧都已补心跳线程。
+- RemotingClient 需支持「按 requestCode 注册处理器」：dispatch 时非响应类型且不在途表 → 交给
+  处理器（处理器在读线程跑，必须 try/catch 兜住，否则读线程死掉会丢整条连接的响应）。
+- 真机验证：broker 配 `transactionCheckInterval=3000 / transactionTimeOut=3000`；三场景
+  COMMIT 应被消费 / ROLLBACK 等窗口仍不投递 / UNKNOW 需**计数器证明回查被回调**；
+  消费者必须**先于发送启动**（默认从最新位点消费，后启动会整个错过投递）。
+- 验证入口：`bash /tmp/run_transaction_live.sh [cpp|python|dotnet|all]`；
+  Python 侧 `python/verify_transaction_live.py`。
 
 ## 压缩（两侧均已实现，2026-09-14 真机跨客户端验过）
 - **阈值**：`compressMsgBodyOverHowmuch` 默认 **4096**；`MessageBatch` **不压缩**

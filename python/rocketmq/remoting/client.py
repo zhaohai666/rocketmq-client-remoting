@@ -15,6 +15,9 @@ from typing import Callable, Dict, Optional
 from .exception import (RemotingConnectException, RemotingSendRequestException,
                         RemotingTimeoutException)
 from .protocol.remoting_command import RemotingCommand
+from ..logging import get_logger
+
+logger = get_logger()
 
 MAX_FRAME_LENGTH = 16 * 1024 * 1024
 
@@ -57,6 +60,8 @@ class RemotingClient:
         self.rpc_hooks = []
         # 每连接读线程
         self._reader_threads: Dict[str, threading.Thread] = {}
+        # broker 主动请求处理器：request_code -> handler(cmd, addr) -> None
+        self._processors: Dict[int, Callable] = {}
 
     # ---------- 连接管理 ----------
     def _get_or_create_conn(self, addr: str) -> socket.socket:
@@ -159,7 +164,7 @@ class RemotingClient:
                         break
                     frame = bytes(buf[:4 + total_len])
                     del buf[:4 + total_len]
-                    self._dispatch(frame)
+                    self._dispatch(frame, addr)
         finally:
             with self._lock:
                 if self._conns.get(addr) is sock:
@@ -169,21 +174,62 @@ class RemotingClient:
             except OSError:
                 pass
 
-    def _dispatch(self, frame: bytes) -> None:
+    def _dispatch(self, frame: bytes, addr: str) -> None:
         try:
             cmd = RemotingCommand.decode(frame)
         except Exception:
             return
+        if cmd.is_response_type():
+            future = None
+            with self._response_lock:
+                future = self._response_table.pop(cmd.opaque, None)
+            if future is not None:
+                future.put_response(cmd)
+                if future.invoke_callback is not None:
+                    try:
+                        future.invoke_callback(cmd)
+                    except Exception:
+                        pass
+            return
+        # 非响应命令：broker 主动发起的请求（如 CHECK_TRANSACTION_STATE=39）。
+        # 这类请求的 opaque 由 broker 生成，不会出现在本地在途表里，按主动请求处理。
         future = None
         with self._response_lock:
             future = self._response_table.pop(cmd.opaque, None)
         if future is not None:
+            # 异常兜底：本应是对端响应却没带响应标志
             future.put_response(cmd)
             if future.invoke_callback is not None:
                 try:
                     future.invoke_callback(cmd)
                 except Exception:
                     pass
+            return
+        handler = self._processors.get(cmd.code)
+        if handler is not None:
+            try:
+                handler(cmd, addr)
+            except Exception:
+                logger.warning("processor for request code %s raised", cmd.code, exc_info=True)
+        else:
+            logger.debug("no processor registered for request code %s (opaque=%s) from %s",
+                         cmd.code, cmd.opaque, addr)
+
+    def register_processor(self, request_code: int,
+                           handler: Callable[["RemotingCommand", str], None]) -> None:
+        """注册 broker 主动请求处理器（对应 Java NettyRemotingServer 的 processor 表）。
+
+        handler 签名 ``handler(cmd, addr) -> None``，其中 ``cmd`` 是解码后的
+        RemotingCommand（含 ext_fields / body），``addr`` 是对端（broker）地址。
+        当前仅用于事务回查 CHECK_TRANSACTION_STATE(39)；oneway 请求不需要回响应。
+
+        注意：仅当命令是「请求类型」且不在本地在途响应表里时才派发到这里，
+        不会破坏现有 invokeSync/invokeAsync 的响应分发。
+        """
+        self._processors[request_code] = handler
+
+    def unregister_processor(self, request_code: int) -> None:
+        self._processors.pop(request_code, None)
 
     # ---------- 请求发送 ----------
     def _send(self, addr: str, cmd: RemotingCommand) -> None:

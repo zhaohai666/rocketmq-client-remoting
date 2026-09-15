@@ -156,6 +156,11 @@ struct RemotingClient::Impl {
     std::mutex respMutex;
     std::unordered_map<int32_t, std::shared_ptr<Future>> respTable;
 
+    // broker 主动请求处理器表：requestCode -> handler。仅用于事务回查
+    // (CHECK_TRANSACTION_STATE=39) 这类「服务端反过来找我」的命令。
+    std::mutex procMutex;
+    std::unordered_map<int32_t, RequestProcessor> processors;
+
     // 读线程账本：<连接, 线程>。线程结束后置 connection->readerDone，
     // 由 pruneThreadsLocked 回收（join 后从账本移除），避免线程句柄无限堆积。
     std::mutex threadMutex;
@@ -312,7 +317,36 @@ struct RemotingClient::Impl {
             }
         }
         if (future == nullptr) {
-            return;  // 已超时的请求（响应来晚了）
+            // 在途表里查不到：要么是迟到的响应，要么是 **broker 主动发来的请求**。
+            // 后者由已注册的处理器接管（典型：事务回查 CHECK_TRANSACTION_STATE=39）。
+            if (!cmd.isResponseType()) {
+                RequestProcessor proc;
+                {
+                    std::lock_guard<std::mutex> plk(procMutex);
+                    auto pit = processors.find(cmd.code);
+                    if (pit != processors.end()) {
+                        proc = pit->second;
+                    }
+                }
+                if (proc) {
+                    // 处理器在读线程里执行：异常必须兜住，否则读线程会死掉，
+                    // 导致该连接上其余响应全部丢失（比丢一条回查严重得多）。
+                    try {
+                        proc(cmd, from);
+                    } catch (const std::exception& e) {
+                        logger_warn("remoting: processor for request code " +
+                                    std::to_string(cmd.code) + " threw: " + e.what());
+                    } catch (...) {
+                        logger_warn("remoting: processor for request code " +
+                                    std::to_string(cmd.code) + " threw unknown exception");
+                    }
+                } else {
+                    // 没有注册处理器属于预期情况（未开启事务时 broker 不会发），别用 warn
+                    logger_debug("remoting: no processor for broker request code " +
+                                 std::to_string(cmd.code) + " from " + from);
+                }
+            }
+            return;  // 迟到的响应 / 已处理完的 broker 请求
         }
         InvokeCallback cb;
         {
@@ -481,6 +515,16 @@ void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& reque
 void RemotingClient::invokeOneway(const std::string& addr, RemotingCommand& request) {
     request.markOnewayRpc();
     impl_->sendRequest(addr, request);
+}
+
+void RemotingClient::registerProcessor(int32_t requestCode, RequestProcessor handler) {
+    std::lock_guard<std::mutex> lk(impl_->procMutex);
+    impl_->processors[requestCode] = std::move(handler);
+}
+
+void RemotingClient::unregisterProcessor(int32_t requestCode) {
+    std::lock_guard<std::mutex> lk(impl_->procMutex);
+    impl_->processors.erase(requestCode);
 }
 
 bool RemotingClient::isChannelWritable(const std::string& addr) const {

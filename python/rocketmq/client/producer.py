@@ -15,11 +15,17 @@ from typing import Callable, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
-from ..common.message_decoder import _compress
+from ..common.message_const import MessageConst
+from ..common.message_decoder import _compress, decode_message, decode_message_id
 from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
 from ..logging import get_logger
 from ..remoting.exception import RemotingException
+from ..remoting.protocol.codes import RequestCode
+from ..remoting.protocol.headers import (CheckTransactionStateRequestHeader,
+                                         EndTransactionRequestHeader)
+from ..remoting.protocol.heartbeat import HeartbeatData, ProducerData
+from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .exception import MQBrokerException, MQClientException
 from .mq_client import MQClientInstance
@@ -148,6 +154,10 @@ class DefaultMQProducer:
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
         self._lock = threading.Lock()
+        # 当前事务监听器（send_message_in_transaction 时记录，供 broker 回查调用）
+        self._transaction_listener: Optional[TransactionListener] = None
+        self._heartbeat_running = False
+        self.heartbeat_interval_millis = 30000
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -207,15 +217,65 @@ class DefaultMQProducer:
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
+            # 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
+            # 按 message_ext 的 PGROUP 属性匹配本生产者，不匹配则丢弃。
+            self._mq_client.remoting_client.register_processor(
+                RequestCode.CHECK_TRANSACTION_STATE, self._handle_check_transaction_state)
             self._started = True
+            # 心跳线程：周期性向 broker 注册 ProducerData。
+            # broker 的事务回查正是通过这一步登记的 channel 反向联系生产者的；
+            # 生产者不发心跳时 COMMIT/ROLLBACK 仍能成功（客户端主动 END_TRANSACTION），
+            # 但 UNKNOW 的半消息会**永远不被回查**。
+            self._heartbeat_running = True
+            threading.Thread(target=self._heartbeat_loop, name="ProducerHeartbeatThread",
+                             daemon=True).start()
 
     def shutdown(self) -> None:
         with self._lock:
             if not self._started:
                 return
+            self._heartbeat_running = False
             if self._mq_client is not None:
                 self._mq_client.shutdown()
             self._started = False
+
+    def _heartbeat_loop(self) -> None:
+        """周期性向所有已知 broker 发心跳（含 ProducerData），对齐 Java 的生产者注册。"""
+        interval_sec = max(1, self.heartbeat_interval_millis // 1000)
+        while self._heartbeat_running:
+            try:
+                self._send_heartbeat_to_all_broker()
+            except Exception:  # noqa: BLE001
+                logger.debug("producer heartbeat failed", exc_info=True)
+            for _ in range(interval_sec):
+                if not self._heartbeat_running:
+                    return
+                time.sleep(1)
+
+    def _send_heartbeat_to_all_broker(self) -> int:
+        if self._mq_client is None:
+            return 0
+        try:
+            addrs = self._mq_client.get_route_of_all_brokers()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("producer heartbeat: gather brokers failed: %s", e)
+            return 0
+        if not addrs:
+            return 0
+        hb = HeartbeatData(self.client_id or "")
+        pd = ProducerData(self.producer_group)
+        # ⚠ Python 的 HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
+        # （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径，
+        # 与 C++ 侧显式置 0 的效果一致，这里保持现状不引入新差异。
+        hb.producer_data_set.add(pd)
+        ok_count = 0
+        for addr in addrs:
+            try:
+                self._mq_client.send_heartbeat(addr, hb, 5000)
+                ok_count += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("producer heartbeat to %s failed: %s", addr, e)
+        return ok_count
 
     def _require_client(self) -> MQClientInstance:
         if not self._started or self._mq_client is None:
@@ -333,26 +393,203 @@ class DefaultMQProducer:
         return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag)
 
     # ---------------- 事务消息 ----------------
+    # 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction（L1433-1509）的**两阶段**：
+    #   1) 半消息：给 msg 打 TRAN_MSG / PGROUP 属性，发送时 sysFlag 置 TRANSACTION_PREPARED_TYPE；
+    #   2) 本地事务：仅 SEND_OK 时执行，结果/异常汇总为 LocalTransactionState；
+    #   3) endTransaction：以 END_TRANSACTION(37, oneway) 告知 broker 提交/回滚/未知；
+    #   4) 若 UNKNOW（或本地事务没执行成功），broker 会回查 CHECK_TRANSACTION_STATE(39)，
+    #      由 _handle_check_transaction_state 调 listener.check_local_transaction 后再 END_TRANSACTION。
+
+    @staticmethod
+    def _transaction_flag(state: LocalTransactionState) -> int:
+        """LocalTransactionState -> Java MessageSysFlag 的 commitOrRollback 值。"""
+        if state == LocalTransactionState.COMMIT_MESSAGE:
+            return MessageSysFlag.TRANSACTION_COMMIT_TYPE      # 0x2 << 2 = 8
+        if state == LocalTransactionState.ROLLBACK_MESSAGE:
+            return MessageSysFlag.TRANSACTION_ROLLBACK_TYPE    # 0x3 << 2 = 12
+        return MessageSysFlag.TRANSACTION_NOT_TYPE             # 0（UNKNOW）
+
     def send_message_in_transaction(self, msg: Message,
                                     listener: TransactionListener,
                                     arg=None) -> TransactionSendResult:
-        """发送事务消息（对应 Java sendMessageInTransaction）。"""
+        """发送事务消息（对应 Java sendMessageInTransaction）。
+
+        与 Java 一致的两阶段语义；返回 TransactionSendResult，其中
+        local_transaction_state 是本地事务的最终状态。
+        """
+        if listener is None:
+            raise MQClientException("tranExecutor is null", None)
+
+        # Java ensureNotDelayedForTransactional：事务消息不支持任何形式的延迟投递
+        # Java ensureNotDelayedForTransactional：事务消息不支持延迟投递。
+        # Python 目前只有 DELAY / DELAY_TIME 两个延迟类属性（没有 5.x 的 TIMER_*），
+        # 因此按 getattr 取，新增常量时自动生效。
+        for key in (MessageConst.PROPERTY_DELAY_TIME_LEVEL,
+                    MessageConst.PROPERTY_DELAY_TIME,
+                    getattr(MessageConst, "PROPERTY_TIMER_DELAY_MS", "__none__"),
+                    getattr(MessageConst, "PROPERTY_TIMER_DELAY_SEC", "__none__"),
+                    getattr(MessageConst, "PROPERTY_TIMER_DELIVER_MS", "__none__")):
+            if msg.get_property(key) is not None:
+                raise MQClientException(
+                    "Transactional messages do not support delayed delivery", None)
+
         client = self._require_client()
         self._check_message(msg)
+
+        # 半消息标记（broker 侧据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC）
+        msg.put_property(MessageConst.PROPERTY_TRANSACTION_PREPARED, "true")
+        msg.put_property(MessageConst.PROPERTY_PRODUCER_GROUP, self.producer_group)
+        # 回查时按此 listener 回调（broker 通过 PGROUP 属性定位到本生产者）
+        self._transaction_listener = listener
+
         publish = client.get_topic_publish_info(msg.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
-        # 发送 half 消息（模拟：先发送，再执行本地事务，按结果决定提交/回滚）
-        # 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl）
+
+        # 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl），
+        # 再叠加事务类型位（对应 Java L951-953 检测 TRAN_MSG 后置 TRANSACTION_PREPARED）
         sys_flag = self.try_to_compress_message(msg)
-        send_result = client.send_message(self.producer_group, msg, mq_sel,
-                                          self.send_msg_timeout, sys_flag)
-        state = listener.execute_local_transaction(msg, arg)
-        tsr = TransactionSendResult(send_result, state)
-        if state == LocalTransactionState.UNKNOW:
-            # 由 broker 回查，本地简化直接跳过
-            pass
-        return tsr
+        sys_flag = MessageSysFlag.reset_transaction_value(
+            sys_flag, MessageSysFlag.TRANSACTION_PREPARED_TYPE)
+
+        try:
+            send_result = client.send_message(self.producer_group, msg, mq_sel,
+                                              self.send_msg_timeout, sys_flag)
+        except Exception as e:  # noqa: BLE001
+            raise MQClientException("send message Exception", e)
+
+        state = LocalTransactionState.UNKNOW
+        local_exception = None
+        if send_result.send_status == SendStatus.SEND_OK:
+            if send_result.transaction_id is not None:
+                msg.put_property("__transactionId__", send_result.transaction_id)
+            uniq = msg.get_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+            if uniq:
+                msg.set_transaction_id(uniq)
+            try:
+                ret = listener.execute_local_transaction(msg, arg)
+                # Java：返回 null 视为 UNKNOW
+                state = ret if ret is not None else LocalTransactionState.UNKNOW
+            except Exception as e:  # noqa: BLE001
+                logger.error("executeLocalTransactionBranch exception, topic=%s", msg.topic,
+                             exc_info=True)
+                local_exception = e
+        elif send_result.send_status in (SendStatus.FLUSH_DISK_TIMEOUT,
+                                         SendStatus.FLUSH_SLAVE_TIMEOUT,
+                                         SendStatus.SLAVE_NOT_AVAILABLE):
+            state = LocalTransactionState.ROLLBACK_MESSAGE
+
+        try:
+            self._end_transaction(send_result, msg, state, local_exception, False)
+        except Exception as e:  # noqa: BLE001
+            # Java：end broker transaction 失败只 warn，不影响返回结果
+            logger.warning("local transaction execute %s, but end broker transaction failed: %s",
+                           state, e)
+
+        return TransactionSendResult(send_result, state)
+
+    def _end_transaction(self, send_result: SendResult, msg: Message,
+                         state: LocalTransactionState, local_exception,
+                         from_transaction_check: bool,
+                         check_header: Optional[CheckTransactionStateRequestHeader] = None,
+                         msg_ext: Optional[MessageExt] = None,
+                         broker_addr: Optional[str] = None) -> None:
+        """向 broker 发送 END_TRANSACTION(37, oneway)，对齐 Java endTransaction + checkTransactionState。
+
+        - 普通收尾（from_transaction_check=False）：偏移/事务号取自 send_result；
+        - 回查收尾（from_transaction_check=True）：偏移/事务号取自 broker 的回查 header
+          （send_result/mq 此时不可用），msgId 取 message_ext 的 UNIQ_KEY。
+        """
+        client = self._require_client()
+        header = EndTransactionRequestHeader()
+
+        if from_transaction_check:
+            # 回收时 broker 会把 COMPRESSED/事务相关信息放在回查请求里
+            header.commit_log_offset = check_header.commit_log_offset
+            header.tran_state_table_offset = check_header.tran_state_table_offset
+            header.transaction_id = check_header.transaction_id
+            header.bname = check_header.bname
+            header.topic = check_header.topic
+            uniq = msg_ext.get_property(
+                MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) if msg_ext else None
+            header.msg_id = uniq or (msg_ext.msg_id if msg_ext else None)
+        else:
+            # Java：id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
+            _ip, _port, offset = decode_message_id(
+                send_result.offset_msg_id or send_result.msg_id)
+            broker_name = send_result.message_queue.broker_name
+            header.commit_log_offset = offset
+            header.tran_state_table_offset = send_result.queue_offset
+            header.transaction_id = send_result.transaction_id
+            header.bname = broker_name
+            header.topic = msg.topic
+            header.msg_id = send_result.msg_id
+            broker_addr = client.broker_addr_of(broker_name)
+
+        header.producer_group = self.producer_group
+        header.commit_or_rollback = self._transaction_flag(state)
+        header.from_transaction_check = from_transaction_check
+
+        remark = None
+        if local_exception is not None:
+            remark = "executeLocalTransactionBranch exception: %s" % local_exception
+
+        cmd = RemotingCommand.create_request_command(RequestCode.END_TRANSACTION, header)
+        cmd.remark = remark
+        if not broker_addr:
+            raise MQClientException("no broker address for end transaction", None)
+        client.remoting_client.invoke_oneway(broker_addr, cmd)
+
+    def _handle_check_transaction_state(self, cmd, addr: str) -> None:
+        """处理 broker 主动发来的事务回查（CHECK_TRANSACTION_STATE=39）。
+
+        对齐 Java ClientRemotingProcessor.checkTransactionState + DefaultMQProducerImpl
+        .checkTransactionState：broker 是 **oneway** 发来的（body 为整条编码后的
+        MessageExt），因此**不回响应**，而是在新线程里调 listener.check_local_transaction，
+        再以 END_TRANSACTION(fromTransactionCheck=true) 把最终状态告知 broker。
+        """
+        header = CheckTransactionStateRequestHeader()
+        try:
+            header.from_ext_fields(cmd.ext_fields or {})
+        except Exception:  # noqa: BLE001
+            logger.warning("checkTransactionState: decode header failed from %s", addr)
+            return
+
+        msg_ext = decode_message(cmd.body) if cmd.body else None
+        if msg_ext is None:
+            logger.warning("checkTransactionState: decode message failed")
+            return
+
+        group = msg_ext.get_property(MessageConst.PROPERTY_PRODUCER_GROUP)
+        if group is not None and group != self.producer_group:
+            logger.debug("checkTransactionState: group %s not mine (%s)", group,
+                         self.producer_group)
+            return
+
+        listener = self._transaction_listener
+        if listener is None:
+            logger.warning("checkTransactionState: no transaction listener for group %s",
+                           self.producer_group)
+            return
+
+        def _run() -> None:
+            try:
+                ret = listener.check_local_transaction(msg_ext)
+                state = ret if ret is not None else LocalTransactionState.UNKNOW
+                exception = None
+            except Exception as e:  # noqa: BLE001
+                logger.error("Broker call checkTransactionState, but checkLocalTransaction "
+                             "exception", exc_info=True)
+                state = LocalTransactionState.UNKNOW
+                exception = e
+            try:
+                self._end_transaction(None, None, state, exception, True,
+                                      check_header=header, msg_ext=msg_ext, broker_addr=addr)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("checkTransactionState: end transaction failed: %s", e)
+
+        t = threading.Thread(target=_run, name="TransactionCheckThread", daemon=True)
+        t.start()
 
     # ---------------- 管理能力 ----------------
     def fetch_publish_message_queues(self, topic: str) -> List[MessageQueue]:

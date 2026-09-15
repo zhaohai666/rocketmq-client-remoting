@@ -344,6 +344,7 @@ void QueryMessageRequestHeader::fromExtFields(const PropertyMap& ext) {
 
 PropertyMap EndTransactionRequestHeader::toExtFields() const {
     PropertyMap out;
+    putOptStr(out, "topic", topic);
     putOptStr(out, "producerGroup", producerGroup);
     putOptInt(out, "tranStateTableOffset", tranStateTableOffset);
     putOptInt(out, "commitLogOffset", commitLogOffset);
@@ -351,10 +352,12 @@ PropertyMap EndTransactionRequestHeader::toExtFields() const {
     putOptBool(out, "fromTransactionCheck", fromTransactionCheck);
     putOptStr(out, "msgId", msgId);
     putOptStr(out, "transactionId", transactionId);
+    putOptStr(out, "bname", bname);
     return out;
 }
 
 void EndTransactionRequestHeader::fromExtFields(const PropertyMap& ext) {
+    topic = getOptStr(ext, "topic");
     producerGroup = getOptStr(ext, "producerGroup");
     tranStateTableOffset = getOptLong(ext, "tranStateTableOffset");
     commitLogOffset = getOptLong(ext, "commitLogOffset");
@@ -362,6 +365,7 @@ void EndTransactionRequestHeader::fromExtFields(const PropertyMap& ext) {
     fromTransactionCheck = getOptBool(ext, "fromTransactionCheck");
     msgId = getOptStr(ext, "msgId");
     transactionId = getOptStr(ext, "transactionId");
+    bname = getOptStr(ext, "bname");
 }
 
 PropertyMap ConsumerSendMsgBackRequestHeader::toExtFields() const {
@@ -442,20 +446,24 @@ void GetRouteInfoRequestHeader::fromExtFields(const PropertyMap& ext) {
 
 PropertyMap CheckTransactionStateRequestHeader::toExtFields() const {
     PropertyMap out;
+    putOptStr(out, "topic", topic);
     putOptInt(out, "tranStateTableOffset", tranStateTableOffset);
     putOptInt(out, "commitLogOffset", commitLogOffset);
     putOptStr(out, "msgId", msgId);
     putOptStr(out, "transactionId", transactionId);
-    putOptInt(out, "offsetMsgId", offsetMsgId);
+    putOptStr(out, "offsetMsgId", offsetMsgId);  // Java 侧是 String，不是 long
+    putOptStr(out, "bname", bname);
     return out;
 }
 
 void CheckTransactionStateRequestHeader::fromExtFields(const PropertyMap& ext) {
+    topic = getOptStr(ext, "topic");
     tranStateTableOffset = getOptLong(ext, "tranStateTableOffset");
     commitLogOffset = getOptLong(ext, "commitLogOffset");
     msgId = getOptStr(ext, "msgId");
     transactionId = getOptStr(ext, "transactionId");
-    offsetMsgId = getOptLong(ext, "offsetMsgId");
+    offsetMsgId = getOptStr(ext, "offsetMsgId");
+    bname = getOptStr(ext, "bname");
 }
 
 PropertyMap CreateTopicRequestHeader::toExtFields() const {

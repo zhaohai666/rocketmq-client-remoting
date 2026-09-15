@@ -2,8 +2,8 @@
 // TransactionMQProducer 与 Python client/producer.py）。
 //
 // 能力覆盖：同步发送（轮询选队列 / 定点发送）、按选择器发送（顺序消息）、
-// 异步发送、单向发送、批量发送、事务消息（简化单阶段）、按 Key 查询、
-// offset 查询、建 topic。
+// 异步发送、单向发送、批量发送、事务消息（对齐 Java 的两阶段：半消息 + 回查）、
+// 按 Key 查询、offset 查询、建 topic。
 //
 // 与 C++ producer.cpp 逐函数对齐：重试次数、队列选择、压缩判断阈值 4096、
 // 超时与异常映射都是协议行为，下面的中文注释一并保留。
@@ -11,6 +11,7 @@ using System.Globalization;
 using System.Threading;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
+using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
@@ -191,8 +192,22 @@ public class DefaultMQProducer
 
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs);
             _mqClient.Start();
+
+            // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
+            // 不注册的话回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 Unknown。
+            _mqClient.RemotingClient.RegisterProcessor(RequestCode.CheckTransactionState,
+                CheckTransactionState);
+
             _started = true;
             ClientLog.Info("DefaultMQProducer[" + _producerGroup + "] started, clientId=" + _clientId);
+
+            // 心跳线程：周期性向 broker 注册 ProducerData。broker 的事务回查正是通过
+            // 这一步登记的 channel 反向联系生产者的；生产者不发心跳时 Commit/Rollback
+            // 仍能成功（客户端主动 END_TRANSACTION），但 Unknown 的半消息**永远不被回查**。
+            _heartbeatRunning = true;
+            _heartbeatThread = new Thread(HeartbeatLoop)
+            { IsBackground = true, Name = "ProducerHeartbeatThread" };
+            _heartbeatThread.Start();
         }
     }
 
@@ -209,6 +224,19 @@ public class DefaultMQProducer
             _started = false;
             threads = new List<Thread>(_asyncThreads);
             _asyncThreads.Clear();
+
+            // 先停心跳线程（它内部持有 mqClient 引用）
+            _heartbeatRunning = false;
+            if (_heartbeatThread is { IsAlive: true })
+            {
+                _heartbeatThread.Join(2000);
+            }
+
+            lock (_txThreadsLock)
+            {
+                threads.AddRange(_txThreads);
+                _txThreads.Clear();
+            }
         }
 
         // 先回收异步线程（它们内部持有 mqClient_ 引用），再关客户端
@@ -453,24 +481,100 @@ public class DefaultMQProducer
     }
 
     // ---------------- 事务消息 ----------------
-    // 注意：与 Python 参考实现一致，为**简化单阶段**实现 —— 发送普通消息后执行
-    // 本地事务并回填状态，未实现 broker 半消息 / 回查 / END_TRANSACTION 两阶段提交。
+    // 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction 的**两阶段**：
+    //   1) 半消息：给 msg 打 TRAN_MSG / PGROUP 属性，sysFlag 置 TRANSACTION_PREPARED_TYPE；
+    //   2) 本地事务：仅 SendOk 时执行；Flush* / SlaveNotAvailable -> Rollback；
+    //   3) EndTransaction：以 END_TRANSACTION(37, oneway) 告知 broker 提交 / 回滚 / 未知；
+    //   4) Unknow 时由 broker 回查 CHECK_TRANSACTION_STATE(39)，回调
+    //      listener.CheckLocalTransaction 后再发 END_TRANSACTION(FromTransactionCheck=true)。
     public TransactionSendResult SendMessageInTransaction(Message msg, ITransactionListener listener,
         string arg = "")
     {
+        if (listener is null)
+        {
+            throw new MQClientException("tranExecutor is null");
+        }
+
+        // Java ensureNotDelayedForTransactional：事务消息不支持延迟投递。
+        // ⚠ .NET 的 DelayTimeLevel 属性有默认值 0（getter 对缺失键返回 0），
+        // 必须判 properties 里是否真的设置了该键，不能只看属性值。
+        if (msg.Properties.TryGetValue(MessageConst.PropertyDelayTimeLevel, out string? dl)
+            && !string.IsNullOrEmpty(dl))
+        {
+            throw new MQClientException("Transactional messages do not support delayed delivery");
+        }
+
         MQClientInstance c = GetClient();
         CheckMessage(msg);
         TopicPublishInfo publish = c.GetTopicPublishInfo(msg.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
 
-        // 简化单阶段：先发消息，再执行本地事务，按结果回填状态。
-        // 未实现 broker 半消息 + 回查 + END_TRANSACTION 两阶段提交。
-        // 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl）。
+        // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
         Message outbound = CloneMessage(msg);
-        int sysFlag = PrepareForSend(outbound);
-        SendResult sendResult = c.SendMessage(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
+        outbound.PutProperty(MessageConst.PropertyTransactionPrepared, "true");
+        outbound.PutProperty(MessageConst.PropertyProducerGroup, _producerGroup);
+        _txListener = listener;
 
-        var tsr = new TransactionSendResult
+        // 压缩与普通发送一致；再叠加事务类型位（Java sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
+        int sysFlag = PrepareForSend(outbound);
+        sysFlag = MessageSysFlag.ResetTransactionValue(sysFlag, MessageSysFlag.TransactionPreparedType);
+
+        SendResult sendResult;
+        try
+        {
+            sendResult = c.SendMessage(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
+        }
+        catch (Exception e)
+        {
+            throw new MQClientException("send message Exception: " + e.Message);
+        }
+
+        LocalTransactionState state = LocalTransactionState.Unknow;
+        string? localExceptionText = null;
+        if (sendResult.SendStatus == SendStatus.SendOk)
+        {
+            if (!string.IsNullOrEmpty(sendResult.TransactionId))
+            {
+                outbound.PutProperty("__transactionId__", sendResult.TransactionId!);
+            }
+
+            string? uniq = outbound.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
+            if (!string.IsNullOrEmpty(uniq))
+            {
+                outbound.TransactionId = uniq;
+            }
+
+            try
+            {
+                state = listener.ExecuteLocalTransaction(outbound, arg);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Error("executeLocalTransactionBranch exception, topic=" + outbound.Topic
+                    + ": " + e.Message);
+                localExceptionText = e.Message;
+                state = LocalTransactionState.Unknow;
+            }
+        }
+        else if (sendResult.SendStatus == SendStatus.FlushDiskTimeout
+                 || sendResult.SendStatus == SendStatus.FlushSlaveTimeout
+                 || sendResult.SendStatus == SendStatus.SlaveNotAvailable)
+        {
+            state = LocalTransactionState.RollbackMessage;
+        }
+
+        try
+        {
+            EndTransaction(outbound, sendResult, state, localExceptionText, false, null, null, "");
+        }
+        catch (Exception e)
+        {
+            // Java：end broker transaction 失败只 warn，不影响返回结果
+            ClientLog.Warn("local transaction execute " + state
+                + ", but end broker transaction failed: " + e.Message);
+        }
+
+        return new TransactionSendResult
         {
             SendStatus = sendResult.SendStatus,
             MsgId = sendResult.MsgId,
@@ -479,9 +583,237 @@ public class DefaultMQProducer
             QueueOffset = sendResult.QueueOffset,
             TransactionId = sendResult.TransactionId,
             RegionId = sendResult.RegionId,
+            LocalTransactionState = state,
         };
-        tsr.LocalTransactionState = listener.ExecuteLocalTransaction(msg, arg);
-        return tsr;
+    }
+
+    private static int TransactionFlagOf(LocalTransactionState state) => state switch
+    {
+        LocalTransactionState.CommitMessage => MessageSysFlag.TransactionCommitType,
+        LocalTransactionState.RollbackMessage => MessageSysFlag.TransactionRollbackType,
+        _ => MessageSysFlag.TransactionNotType,
+    };
+
+    // ---------------- 心跳（broker 事务回查依赖它） ----------------
+
+    private void HeartbeatLoop()
+    {
+        ClientLog.SetThreadName("ProducerHeartbeatThread");
+        int intervalMs = _heartbeatIntervalMillis;
+        while (_heartbeatRunning)
+        {
+            try
+            {
+                SendHeartbeatToAllBroker();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("producer heartbeat failed: " + e.Message);
+            }
+
+            for (int i = 0; i < intervalMs / 100 && _heartbeatRunning; ++i)
+            {
+                Thread.Sleep(100);
+            }
+        }
+    }
+
+    private int SendHeartbeatToAllBroker()
+    {
+        MQClientInstance? c = _mqClient;
+        if (c is null)
+        {
+            return 0;
+        }
+
+        List<string> addrs;
+        try
+        {
+            addrs = c.KnownBrokerAddrs();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("producer heartbeat: gather brokers failed: " + e.Message);
+            return 0;
+        }
+
+        if (addrs.Count == 0)
+        {
+            return 0;
+        }
+
+        // 只带 ProducerData：对齐 Java MQClientInstance 里 producerTable 的注册内容。
+        // broker 会把该 group 登记到 ProducerManager（事务回查即通过该 channel 反向联系）。
+        var hb = new HeartbeatData(_clientId ?? string.Empty)
+        {
+            HeartbeatFingerprint = 0,  // 走 V1 注册路径，最稳妥
+        };
+        hb.AddProducerData(new ProducerData(_producerGroup));
+
+        int okCount = 0;
+        foreach (string addr in addrs)
+        {
+            try
+            {
+                c.SendHeartbeat(addr, hb, 5000);
+                ++okCount;
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("producer heartbeat to " + addr + " failed: " + e.Message);
+            }
+        }
+
+        return okCount;
+    }
+
+    // 心跳线程（对齐 Java MQClientInstance 的定时心跳；间隔默认 30s）
+    private Thread? _heartbeatThread;
+    private volatile bool _heartbeatRunning;
+    private readonly int _heartbeatIntervalMillis = 30000;
+
+    // 最近一次 SendMessageInTransaction 使用的监听器（broker 回查时回调它）。
+    // 引用语义：调用方需保证其生命周期覆盖事务回查（与 Java 的 TransactionListener 一致）。
+    private ITransactionListener? _txListener;
+    private readonly List<Thread> _txThreads = new();
+    private readonly object _txThreadsLock = new();
+
+    /// <summary>
+    /// 以 END_TRANSACTION(37, oneway) 告知 broker 事务最终状态（对齐 Java endTransaction /
+    /// checkTransactionState）。fromCheck=true 表示这是**回查**的收尾，偏移等字段取自
+    /// broker 的回查 header（此时 sendResult 不可用）。
+    /// </summary>
+    private void EndTransaction(Message msg, SendResult sendResult, LocalTransactionState state,
+        string? localExceptionText, bool fromCheck,
+        CheckTransactionStateRequestHeader? checkHeader, MessageExt? checkMsg, string brokerAddr)
+    {
+        MQClientInstance c = GetClient();
+
+        var header = new EndTransactionRequestHeader
+        {
+            ProducerGroup = _producerGroup,
+            CommitOrRollback = TransactionFlagOf(state),
+            FromTransactionCheck = fromCheck,
+        };
+
+        string addr;
+        if (fromCheck)
+        {
+            header.Topic = checkHeader!.Topic;
+            header.CommitLogOffset = checkHeader.CommitLogOffset;
+            header.TranStateTableOffset = checkHeader.TranStateTableOffset;
+            header.TransactionId = checkHeader.TransactionId;
+            header.Bname = checkHeader.Bname;
+            // Java: uniqueKey = msg 属性 UNIQ_KEY，取不到才用 msgId
+            string? uniqueKey = checkMsg?.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
+            header.MsgId = string.IsNullOrEmpty(uniqueKey) ? checkMsg?.MsgId : uniqueKey;
+            addr = brokerAddr;
+        }
+        else
+        {
+            // Java: id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
+            string idText = string.IsNullOrEmpty(sendResult.OffsetMsgId)
+                ? sendResult.MsgId ?? string.Empty
+                : sendResult.OffsetMsgId!;
+            MessageDecoder.DecodeMessageId(idText, out _, out _, out long offset);
+            header.Topic = msg.Topic;
+            header.CommitLogOffset = offset;
+            header.TranStateTableOffset = sendResult.QueueOffset;
+            header.TransactionId = sendResult.TransactionId;
+            header.Bname = sendResult.MessageQueue?.BrokerName;
+            header.MsgId = sendResult.MsgId;
+            addr = c.BrokerAddrForMq(sendResult.MessageQueue!);
+        }
+
+        RemotingCommand request =
+            RemotingCommand.CreateRequestCommand(RequestCode.EndTransaction, header);
+        if (localExceptionText is not null)
+        {
+            request.Remark = "executeLocalTransactionBranch exception: " + localExceptionText;
+        }
+
+        c.RemotingClient.InvokeOneway(addr, request);
+    }
+
+    /// <summary>
+    /// broker 主动发起的事务回查（CHECK_TRANSACTION_STATE=39）入口，由传输层回调。
+    /// </summary>
+    private void CheckTransactionState(RemotingCommand cmd, string addr)
+    {
+        var header = new CheckTransactionStateRequestHeader();
+        try
+        {
+            header.FromExtFields(cmd.ExtFields ?? new PropertyMap());
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("checkTransactionState: decode header failed from " + addr + ": " + e.Message);
+            return;
+        }
+
+        // broker 把整条 MessageExt 编码后放在 body 里（Java Broker2Client.checkProducerTransactionState）
+        MessageExt? msgExt = null;
+        if (cmd.Body is { Length: > 0 }
+            && MessageDecoder.DecodeMessage(cmd.Body, out MessageExt decoded, true, true, true, false))
+        {
+            msgExt = decoded;
+        }
+
+        if (msgExt is null)
+        {
+            ClientLog.Warn("checkTransactionState: decode message failed");
+            return;
+        }
+
+        string? group = msgExt.GetProperty(MessageConst.PropertyProducerGroup);
+        if (group is not null && group != _producerGroup)
+        {
+            ClientLog.Debug("checkTransactionState: group " + group + " is not mine (" + _producerGroup + ")");
+            return;
+        }
+
+        ITransactionListener? listener = _txListener;
+        if (listener is null)
+        {
+            ClientLog.Warn("checkTransactionState: no transaction listener for group " + _producerGroup);
+            return;
+        }
+
+        // Java 在独立线程里执行回查回调，避免阻塞读线程
+        MessageExt captured = msgExt;
+        CheckTransactionStateRequestHeader capturedHeader = header;
+        var th = new Thread(() =>
+        {
+            ClientLog.SetThreadName("TransactionCheckThread");
+            LocalTransactionState state = LocalTransactionState.Unknow;
+            string? exceptionText = null;
+            try
+            {
+                state = listener.CheckLocalTransaction(captured);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Error("Broker call checkTransactionState, but checkLocalTransaction exception: "
+                    + e.Message);
+                exceptionText = e.Message;
+            }
+
+            try
+            {
+                EndTransaction(new Message(), new SendResult(), state, exceptionText, true,
+                    capturedHeader, captured, addr);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("checkTransactionState: end transaction failed: " + e.Message);
+            }
+        })
+        { IsBackground = true, Name = "TransactionCheckThread" };
+        th.Start();
+        lock (_txThreadsLock)
+        {
+            _txThreads.Add(th);
+        }
     }
 
     // ---------------- 查询 / 管理 ----------------
