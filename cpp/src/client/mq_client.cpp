@@ -19,6 +19,7 @@
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/headers.h"
+#include "rocketmq/remoting/protocol/json.h"
 
 namespace rocketmq {
 
@@ -461,6 +462,101 @@ void MQClientInstance::updateConsumerOffset(const std::string& consumerGroup,
         RemotingCommand::createRequestCommand(RequestCode::UPDATE_CONSUMER_OFFSET, header);
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
     checkResponseCode(response);
+}
+
+// ---------------------------------------------------------------- 队列锁（顺序消费）
+namespace {
+
+// LockBatchRequestBody：{"consumerGroup":..,"clientId":..,"mqSet":[{"topic":..,
+// "brokerName":..,"queueId":..}]}（对齐 Java LockBatchRequestBody）
+JsonValue buildMqSetJson(const std::vector<MessageQueue>& mqs) {
+    JsonValue arr = JsonValue::makeArray();
+    for (const MessageQueue& mq : mqs) {
+        JsonValue o = JsonValue::makeObject();
+        o.set("topic", JsonValue::makeString(mq.topic));
+        o.set("brokerName", JsonValue::makeString(mq.brokerName));
+        o.set("queueId", JsonValue::makeInt(mq.queueId));
+        arr.pushArray(o);
+    }
+    return arr;
+}
+
+}  // namespace
+
+std::vector<MessageQueue> MQClientInstance::lockBatchMq(const std::string& consumerGroup,
+                                                       const std::string& clientId,
+                                                       const std::vector<MessageQueue>& mqs,
+                                                       int32_t timeoutMillis) {
+    std::vector<MessageQueue> lockOk;
+    // 按 broker 分组（Java 按 brokerName 逐个发请求）
+    std::map<std::string, std::vector<MessageQueue>> byBroker;
+    for (const MessageQueue& mq : mqs) {
+        byBroker[mq.brokerName].push_back(mq);
+    }
+    for (const auto& kv : byBroker) {
+        std::string addr = brokerAddrOf(kv.first);
+        if (addr.empty()) {
+            continue;
+        }
+        JsonValue body = JsonValue::makeObject();
+        body.set("consumerGroup", JsonValue::makeString(consumerGroup));
+        body.set("clientId", JsonValue::makeString(clientId));
+        body.set("mqSet", buildMqSetJson(kv.second));
+        std::string bodyText = body.dump();
+        Bytes payload(bodyText.begin(), bodyText.end());
+        RemotingCommand response =
+            invokeSyncRaw(addr, RequestCode::LOCK_BATCH_MQ, PropertyMap{}, payload,
+                          /*hasBody=*/true, timeoutMillis);
+        checkResponseCode(response);
+        // LockBatchResponseBody：{"lockOKMQSet":[{topic,brokerName,queueId}]}
+        std::string text(response.body.begin(), response.body.end());
+        JsonValue root;
+        std::string err;
+        if (!jsonParse(text, root, &err)) {
+            logger_warn("lockBatchMq: parse response failed: " + err);
+            continue;
+        }
+        const JsonValue* okSet = root.find("lockOKMQSet");
+        if (okSet == nullptr || !okSet->isArray()) {
+            continue;
+        }
+        for (size_t i = 0; i < okSet->size(); ++i) {
+            const JsonValue& o = okSet->at(i);
+            const JsonValue* t = o.find("topic");
+            const JsonValue* b = o.find("brokerName");
+            const JsonValue* q = o.find("queueId");
+            if (t == nullptr || b == nullptr || q == nullptr) continue;
+            lockOk.emplace_back(t->stringValue(), b->stringValue(),
+                                static_cast<int32_t>(q->intValue()));
+        }
+    }
+    return lockOk;
+}
+
+void MQClientInstance::unlockBatchMq(const std::string& consumerGroup,
+                                     const std::string& clientId,
+                                     const std::vector<MessageQueue>& mqs,
+                                     int32_t timeoutMillis) {
+    std::map<std::string, std::vector<MessageQueue>> byBroker;
+    for (const MessageQueue& mq : mqs) {
+        byBroker[mq.brokerName].push_back(mq);
+    }
+    for (const auto& kv : byBroker) {
+        std::string addr = brokerAddrOf(kv.first);
+        if (addr.empty()) {
+            continue;
+        }
+        JsonValue body = JsonValue::makeObject();
+        body.set("consumerGroup", JsonValue::makeString(consumerGroup));
+        body.set("clientId", JsonValue::makeString(clientId));
+        body.set("mqSet", buildMqSetJson(kv.second));
+        std::string bodyText = body.dump();
+        Bytes payload(bodyText.begin(), bodyText.end());
+        RemotingCommand response =
+            invokeSyncRaw(addr, RequestCode::UNLOCK_BATCH_MQ, PropertyMap{}, payload,
+                          /*hasBody=*/true, timeoutMillis);
+        checkResponseCode(response);
+    }
 }
 
 int64_t MQClientInstance::getMaxOffset(const MessageQueue& mq, int32_t timeoutMillis,

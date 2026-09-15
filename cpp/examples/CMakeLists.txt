@@ -10,6 +10,9 @@ target_link_libraries(rmq_interop PRIVATE rocketmq::remoting)
 add_executable(rmq_live_message_types live_message_types.cpp)
 target_link_libraries(rmq_live_message_types PRIVATE rocketmq::remoting)
 
+add_executable(rmq_live_redelivery live_redelivery.cpp)
+target_link_libraries(rmq_live_redelivery PRIVATE rocketmq::remoting)
+
 # 真实集群管理端联调（需先起 nameServer+broker；不打进 ctest）
 add_executable(rmq_admin_live admin_live.cpp)
 target_link_libraries(rmq_admin_live PRIVATE rocketmq::remoting)

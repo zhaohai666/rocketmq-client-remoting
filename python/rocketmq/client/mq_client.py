@@ -474,6 +474,70 @@ class MQClientInstance:
         messages.sort(key=lambda x: (x.queue_offset or 0))
         return messages[:max_num] if max_num > 0 else messages
 
+    # ---------------- 队列锁（顺序消费） ----------------
+
+    def lock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
+                      timeout_millis: int = 1000) -> List[MessageQueue]:
+        """批量锁队列（对应 Java MQClientAPIImpl.lockBatchMQ，RequestCode.LOCK_BATCH_MQ）。
+
+        按 broker 分组发送；返回 broker 确认锁定成功的队列集（lockOKMQSet）。
+        body：LockBatchRequestBody{consumerGroup, clientId, mqSet(JSON 数组)}；
+        响应：LockBatchResponseBody.lockOKMQSet。
+        """
+        from ..remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+        from ..remoting.protocol.codes import RequestCode
+        from ..remoting.protocol.headers import LockBatchMqRequestHeader
+        lock_ok: List[MessageQueue] = []
+        by_broker: Dict[str, List[MessageQueue]] = {}
+        for mq in mqs:
+            by_broker.setdefault(mq.broker_name, []).append(mq)
+        for broker_name, broker_mqs in by_broker.items():
+            addr = self.broker_addr_of(broker_name)
+            if addr is None:
+                continue
+            body = LockBatchRequestBody()
+            body.consumer_group = consumer_group
+            body.client_id = client_id
+            body.mq_set = [{"topic": m.topic, "brokerName": m.broker_name, "queueId": m.queue_id}
+                           for m in broker_mqs]
+            request = RemotingCommand.create_request_command(RequestCode.LOCK_BATCH_MQ, LockBatchMqRequestHeader())
+            request.body = body.encode()
+            try:
+                response = self._invoke_sync(addr, request, timeout_millis)
+                self._check_response(response)
+                rb = LockBatchResponseBody.decode(response.body)
+                for d in rb.lock_ok_mq_set:
+                    lock_ok.append(MessageQueue(d.get("topic"), d.get("brokerName"), int(d.get("queueId") or 0)))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("lock_batch_mq failed for broker %s: %s", broker_name, e)
+        return lock_ok
+
+    def unlock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
+                        timeout_millis: int = 1000) -> None:
+        """批量解锁队列（对应 Java MQClientAPIImpl.unlockBatchMQ，RequestCode.UNLOCK_BATCH_MQ）。"""
+        from ..remoting.protocol.body import UnlockBatchRequestBody
+        from ..remoting.protocol.codes import RequestCode
+        from ..remoting.protocol.headers import UnlockBatchMqRequestHeader
+        by_broker: Dict[str, List[MessageQueue]] = {}
+        for mq in mqs:
+            by_broker.setdefault(mq.broker_name, []).append(mq)
+        for broker_name, broker_mqs in by_broker.items():
+            addr = self.broker_addr_of(broker_name)
+            if addr is None:
+                continue
+            body = UnlockBatchRequestBody()
+            body.consumer_group = consumer_group
+            body.client_id = client_id
+            body.mq_set = [{"topic": m.topic, "brokerName": m.broker_name, "queueId": m.queue_id}
+                           for m in broker_mqs]
+            request = RemotingCommand.create_request_command(RequestCode.UNLOCK_BATCH_MQ, UnlockBatchMqRequestHeader())
+            request.body = body.encode()
+            try:
+                response = self._invoke_sync(addr, request, timeout_millis)
+                self._check_response(response)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("unlock_batch_mq failed for broker %s: %s", broker_name, e)
+
     # ---------------- 心跳 / 注销 ----------------
     def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData, timeout_millis: int = 5000) -> None:
         request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)

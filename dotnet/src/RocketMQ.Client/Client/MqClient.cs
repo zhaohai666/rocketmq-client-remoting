@@ -7,6 +7,7 @@
 //
 // 与 Python 参考实现（python/client/mq_client.py）逐项对齐。
 using System.Globalization;
+using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
@@ -594,6 +595,119 @@ public sealed class MQClientInstance : IDisposable
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UpdateConsumerOffset, header);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
         CheckResponseCode(response);
+    }
+
+    // ---------------- 队列锁（顺序消费，Java MQClientAPIImpl.lockBatchMQ / unlockBatchMQ）----------------
+
+    private static JsonValue BuildMqSetJson(IEnumerable<MessageQueue> mqs)
+    {
+        var arr = JsonValue.MakeArray();
+        foreach (MessageQueue mq in mqs)
+        {
+            var o = JsonValue.MakeObject();
+            o.Set("topic", JsonValue.MakeString(mq.Topic));
+            o.Set("brokerName", JsonValue.MakeString(mq.BrokerName));
+            o.Set("queueId", JsonValue.MakeInt(mq.QueueId));
+            arr.PushArray(o);
+        }
+
+        return arr;
+    }
+
+    /// <summary>批量锁队列；返回 broker 确认锁定成功的队列集（lockOKMQSet）。</summary>
+    public List<MessageQueue> LockBatchMq(string consumerGroup, string clientId,
+        IReadOnlyList<MessageQueue> mqs, int timeoutMillis = 5000)
+    {
+        var lockOk = new List<MessageQueue>();
+        // 按 broker 分组（Java 按 brokerName 逐个发请求）
+        var byBroker = new Dictionary<string, List<MessageQueue>>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in mqs)
+        {
+            if (!byBroker.TryGetValue(mq.BrokerName, out List<MessageQueue>? list))
+            {
+                list = new List<MessageQueue>();
+                byBroker[mq.BrokerName] = list;
+            }
+
+            list.Add(mq);
+        }
+
+        foreach (KeyValuePair<string, List<MessageQueue>> kv in byBroker)
+        {
+            string addr = BrokerAddrOf(kv.Key);
+            if (addr.Length == 0)
+            {
+                continue;
+            }
+
+            var body = JsonValue.MakeObject();
+            body.Set("consumerGroup", JsonValue.MakeString(consumerGroup));
+            body.Set("clientId", JsonValue.MakeString(clientId));
+            body.Set("mqSet", BuildMqSetJson(kv.Value));
+            byte[] payload = Encoding.UTF8.GetBytes(body.Dump());
+            RemotingCommand response = InvokeSyncRaw(addr, RequestCode.LockBatchMq,
+                null, payload, true, timeoutMillis);
+            CheckResponseCode(response);
+            // LockBatchResponseBody：{"lockOKMQSet":[{topic,brokerName,queueId}]}
+            string text = Encoding.UTF8.GetString(response.Body ?? Array.Empty<byte>());
+            if (!Json.TryParse(text, out JsonValue root, out string? error) || root is null)
+            {
+                ClientLog.Warn("lockBatchMq: parse response failed: " + (error ?? "unknown"));
+                continue;
+            }
+
+            JsonValue okSet = root.Get("lockOKMQSet");
+            if (!okSet.IsArray)
+            {
+                continue;
+            }
+
+            for (int i = 0; i < okSet.Size(); ++i)
+            {
+                JsonValue o = okSet.At(i);
+                lockOk.Add(new MessageQueue(
+                    o.Get("topic").StringValue(),
+                    o.Get("brokerName").StringValue(),
+                    (int)o.Get("queueId").IntValue()));
+            }
+        }
+
+        return lockOk;
+    }
+
+    /// <summary>批量解锁队列（顺序消费清退时调用）。</summary>
+    public void UnlockBatchMq(string consumerGroup, string clientId,
+        IReadOnlyList<MessageQueue> mqs, int timeoutMillis = 5000)
+    {
+        var byBroker = new Dictionary<string, List<MessageQueue>>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in mqs)
+        {
+            if (!byBroker.TryGetValue(mq.BrokerName, out List<MessageQueue>? list))
+            {
+                list = new List<MessageQueue>();
+                byBroker[mq.BrokerName] = list;
+            }
+
+            list.Add(mq);
+        }
+
+        foreach (KeyValuePair<string, List<MessageQueue>> kv in byBroker)
+        {
+            string addr = BrokerAddrOf(kv.Key);
+            if (addr.Length == 0)
+            {
+                continue;
+            }
+
+            var body = JsonValue.MakeObject();
+            body.Set("consumerGroup", JsonValue.MakeString(consumerGroup));
+            body.Set("clientId", JsonValue.MakeString(clientId));
+            body.Set("mqSet", BuildMqSetJson(kv.Value));
+            byte[] payload = Encoding.UTF8.GetBytes(body.Dump());
+            RemotingCommand response = InvokeSyncRaw(addr, RequestCode.UnlockBatchMq,
+                null, payload, true, timeoutMillis);
+            CheckResponseCode(response);
+        }
     }
 
     public long GetMaxOffset(MessageQueue mq, int timeoutMillis = 5000, string? addrIn = null)

@@ -1,17 +1,18 @@
-// 推模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer
-// 与 Python client/consumer.py 的 DefaultMQPushConsumer）。
+// 推模式消费者（对齐 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。
 //
-// 实现方式与 Python 参考实现一致：**单线程拉取循环 + 本地消费**
-//   1. Start() 启动一个消费线程；
-//   2. 每轮对「已分配队列」逐个调用 PULL_MESSAGE（带订阅信息的长轮询）；
-//   3. 按 PullStatus 推进 offset：FOUND -> offset + 成功消费条数；
-//      NO_NEW_MSG / OFFSET_ILLEGAL -> nextBeginOffset；
-//   4. 把消息交给 MessageListener（并发/顺序两种）。
+// 架构（对齐 Java PushConsumer 的三层模型）：
+//   1. 拉取层：每个队列一个拉取线程（对应 Java PullMessageService 的并发长轮询——
+//      broker 为每个队列挂起长轮询请求、消息到达立即返回），拉到的消息进
+//      _pending 缓冲（对应 ProcessQueue），拉取游标推进到 nextBeginOffset；
+//   2. 分发层：单分发线程从缓冲按 ConsumeMessageBatchMaxSize 取批次交给
+//      IMessageListener；RECONSUME_LATER/异常批次逐条回投 %RETRY%topic
+//      （延迟梯度 3+reconsumeTimes，超 maxReconsumeTimes 由 broker 转 %DLQ%）；
+//   3. 位点层：_consumeOffsetTable 记录"已消费位点"，每 5s 用 UPDATE_CONSUMER_OFFSET
+//      提交 broker（Java persistAllConsumerOffset），启动先 QUERY_CONSUMER_OFFSET。
 //
 // 关键工程点（真机验证得出，勿删注释）：
-//   - 单线程顺序长轮询下，排在满载队列前面的**空闲队列**会用 suspend 长轮询
-//     阻塞整轮，把满载队列饿死（顺序消息尤其明显，因为同 key 全落一个队列）。
-//     因此 pull_suspend_timeout_millis 与 pull_timeout_millis 必须可配且设短。
+//   - 拉取必须按队列并行：单线程顺序长轮询下，空闲队列的 suspend 会阻塞
+//     其余队列投递（曾导致"第一批消息能收到、后续全迟到"）。
 //   - broker 会把客户端下发的 suspend 时间钳制到自身 brokerSuspendMaxTimeMillis，
 //     故空闲队列仍会周期性客户端超时 —— 这是**良性**的，按 debug 处理不记 ERROR。
 using System;
@@ -70,11 +71,25 @@ public sealed class DefaultMQPushConsumer
     private readonly Dictionary<string, SubscriptionData> _subscriptionData = new(StringComparer.Ordinal);
     private IMessageListener? _messageListener;
     private readonly Dictionary<string, long> _offsetTable = new(StringComparer.Ordinal);
+    // ---- 对齐 Java 的消费进度 / 缓冲 / 锁状态 ----
+    // _offsetTable 是"拉取游标"（nextBeginOffset）；_consumeOffsetTable 是"已消费位点"
+    // （周期持久化到 broker 的对象）；_pending 是已拉未消费缓冲（Java ProcessQueue）。
+    private readonly Dictionary<string, long> _consumeOffsetTable = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, MessageQueue> _mqMap = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Queue<MessageExt>> _pending = new(StringComparer.Ordinal);
+    // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
+    private readonly HashSet<string> _lockOk = new(StringComparer.Ordinal);
+    private int _pullThresholdForQueue = 1000;
+    private long _flowControlTriggered;
+    private Thread? _dispatchThread;
+    private Thread? _persistThread;
+    private Thread? _lockThread;
+    private Thread? _rebalanceThread;
+    private readonly Dictionary<string, Thread> _pullThreads = new(StringComparer.Ordinal);
 
     private MQClientInstance? _mqClient;
     private volatile bool _started;
     private volatile bool _stop;
-    private readonly List<Thread> _consumeThreads = new();
     private readonly ManualResetEventSlim _stopEvent = new(false);
     private long _consumedCount;
     private long _heartbeatCount;
@@ -183,6 +198,16 @@ public sealed class DefaultMQPushConsumer
         set => _heartbeatEnabled = value;
     }
 
+    // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（Java pullThresholdForQueue，默认 1000）
+    public int PullThresholdForQueue
+    {
+        get => _pullThresholdForQueue;
+        set => _pullThresholdForQueue = value;
+    }
+
+    // 流控触发次数（用于验证流控能力）
+    public long FlowControlTriggered => Interlocked.Read(ref _flowControlTriggered);
+
     public int HeartbeatIntervalMillis
     {
         get => _heartbeatIntervalMillis;
@@ -288,6 +313,18 @@ public sealed class DefaultMQPushConsumer
                 _clientId = ClientIds.Build(_instanceName);
             }
 
+            // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：
+            // broker 回投的消息写到 %RETRY%group，客户端不订阅就收不到
+            if (_messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+            {
+                string retryTopic = MixAll.GetRetryTopic(ConsumerGroup);
+                if (!_subscriptionData.ContainsKey(retryTopic))
+                {
+                    _subscriptionData[retryTopic] =
+                        FilterAPI.BuildSubscriptionData(retryTopic, "*");
+                }
+            }
+
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
                 /*connectTimeoutMillis=*/3000,
                 /*invokeTimeoutMillis=*/_pullTimeoutMillis);
@@ -296,21 +333,16 @@ public sealed class DefaultMQPushConsumer
             _started = true;
         }
 
-        int n = Math.Max(1, _consumeThreadNums);
-        _consumeThreads.Clear();
-        for (int i = 0; i < n; ++i)
-        {
-            int idx = i;
-            // 线程名对齐 Java 的 ThreadFactoryImpl("ConsumeMessageThread_")：日志里能区分是哪个消费线程。
-            var t = new Thread(() =>
-            {
-                ClientLog.SetThreadName("ConsumeMessageThread_" + idx.ToString(CultureInfo.InvariantCulture));
-                ConsumeLoop();
-            });
-            t.IsBackground = true;
-            t.Start();
-            _consumeThreads.Add(t);
-        }
+        // 拉取：每队列一个线程（并发长轮询，避免空队列 suspend 阻塞其他队列投递）
+        RebalancePullThreads();
+        _dispatchThread = MakeThread("ConsumeMessageThread", DispatchLoop);
+        _dispatchThread.Start();
+        _persistThread = MakeThread("MQClientFactoryScheduledThread", OffsetPersistLoop);
+        _persistThread.Start();
+        _lockThread = MakeThread("ConsumeMessageOrderlyServiceThread", LockLoop);
+        _lockThread.Start();
+        _rebalanceThread = MakeThread("RebalanceThread", RebalanceLoop);
+        _rebalanceThread.Start();
 
         string topics = string.Empty;
         foreach (string t in SubscribedTopics())
@@ -335,13 +367,61 @@ public sealed class DefaultMQPushConsumer
 
         _stop = true;
         _stopEvent.Set();
-        foreach (Thread t in _consumeThreads)
+        // 退出前把已消费位点持久化一次（对齐 Java shutdown → persistAllConsumerOffset）
+        try
+        {
+            PersistOffsetsOnce();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("persist offsets on shutdown failed: " + e.Message);
+        }
+
+        // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）
+        if (IsOrderly() && _messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        {
+            try
+            {
+                List<MessageQueue> mqs = AssignedQueues();
+                if (mqs.Count > 0 && _mqClient is not null)
+                {
+                    _mqClient.UnlockBatchMq(ConsumerGroup, _clientId, mqs);
+                }
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unlock on shutdown failed: " + e.Message);
+            }
+        }
+
+        foreach (Thread t in _pullThreads.Values)
         {
             if (t.IsAlive) t.Join();
         }
 
-        _consumeThreads.Clear();
+        _pullThreads.Clear();
+        JoinIfAlive(_dispatchThread);
+        JoinIfAlive(_persistThread);
+        JoinIfAlive(_lockThread);
+        JoinIfAlive(_rebalanceThread);
         _mqClient?.Shutdown();
+    }
+
+    private static void JoinIfAlive(Thread? t)
+    {
+        if (t is not null && t.IsAlive)
+        {
+            t.Join();
+        }
+    }
+
+    private static Thread MakeThread(string name, ThreadStart action)
+    {
+        var t = new Thread(action)
+        {
+            IsBackground = true,
+        };
+        return t;
     }
 
     public MQClientInstance Client()
@@ -355,24 +435,601 @@ public sealed class DefaultMQPushConsumer
     }
 
     // ---------------- 消费循环 ----------------
-    private void ConsumeLoop()
+    private bool IsOrderly() => _messageListener is not null && _messageListener.Orderly();
+
+    private void RebalancePullThreads()
     {
+        List<MessageQueue> queues = AssignedQueues();
+        var current = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in queues)
+        {
+            current[OffsetKey(mq)] = mq;
+        }
+
+        List<KeyValuePair<string, MessageQueue>> toStart = new();
+        lock (_lock)
+        {
+            foreach (KeyValuePair<string, MessageQueue> kv in current)
+            {
+                if (!_pullThreads.ContainsKey(kv.Key))
+                {
+                    toStart.Add(kv);
+                }
+            }
+        }
+
+        foreach (KeyValuePair<string, MessageQueue> kv in toStart)
+        {
+            MessageQueue mq = kv.Value;
+            Thread t = MakeThread("PullMessageService", () => QueuePullLoop(mq));
+            lock (_lock)
+            {
+                // 竞态保护：rebalance 可能把同 key 再起一次
+                if (_pullThreads.ContainsKey(kv.Key))
+                {
+                    continue;
+                }
+
+                _pullThreads[kv.Key] = t;
+            }
+
+            t.Start();
+        }
+    }
+
+    private void RebalanceLoop()
+    {
+        // 简化 rebalance：周期刷新分配集，为新增队列（如 %RETRY%topic 建立路由后）补拉取线程
+        while (!_stop)
+        {
+            _stopEvent.Wait(TimeSpan.FromMilliseconds(2000));
+            if (_stop || !_started) return;
+            try
+            {
+                MaybeSendHeartbeat();
+                RebalancePullThreads();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("rebalance pull threads error: " + e.Message);
+            }
+        }
+    }
+
+    private void QueuePullLoop(MessageQueue mq)
+    {
+        MQClientInstance c = Client();
+        bool orderly = IsOrderly();
+        string key = OffsetKey(mq);
+        while (!_stop && _started)
+        {
+            SubscriptionData sub;
+            lock (_lock)
+            {
+                if (!_subscriptionData.TryGetValue(mq.Topic, out SubscriptionData? s) || s is null)
+                {
+                    return;
+                }
+
+                sub = s!;
+            }
+
+            // 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
+            if (orderly)
+            {
+                bool locked;
+                lock (_lock)
+                {
+                    locked = _lockOk.Contains(key);
+                }
+
+                if (!locked)
+                {
+                    _stopEvent.Wait(TimeSpan.FromMilliseconds(200));
+                    continue;
+                }
+            }
+
+            // 流控（对齐 Java ProcessQueue 的 pullThresholdForQueue 检查）：
+            // 已拉未消费的条数超过阈值就暂停本队列拉取
+            {
+                int pendingN;
+                lock (_lock)
+                {
+                    pendingN = _pending.TryGetValue(key, out Queue<MessageExt>? q) ? q.Count : 0;
+                }
+
+                if (pendingN >= Math.Max(1, _pullThresholdForQueue))
+                {
+                    Interlocked.Increment(ref _flowControlTriggered);
+                    ClientLog.Debug("flow control: queue " + mq + " pause pull");
+                    _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
+                    continue;
+                }
+            }
+
+            long offset;
+            lock (_lock)
+            {
+                offset = _offsetTable.TryGetValue(key, out long v) ? v : -1;
+            }
+
+            if (offset < 0)
+            {
+                try
+                {
+                    offset = ResolveInitialOffset(mq, sub);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("resolve initial offset failed for " + mq + ": " + e.Message);
+                    _stopEvent.Wait(TimeSpan.FromMilliseconds(1000));
+                    continue;
+                }
+
+                lock (_lock)
+                {
+                    _offsetTable[key] = offset;
+                }
+            }
+
+            PullResult result;
+            try
+            {
+                int sysFlag = PullSysFlag.BuildSysFlag(
+                    /*commitOffset=*/false, /*suspend=*/true, /*subscription=*/true, /*classFilter=*/false);
+                string expr = UtilAll.IsBlank(sub.SubString) ? "*" : sub.SubString;
+                result = c.PullMessage(ConsumerGroup, mq, offset, _pullBatchSize, sysFlag,
+                    /*commitOffset=*/0, expr, sub.SubVersion, sub.ExpressionType,
+                    _pullTimeoutMillis, _pullBatchSizeInBytes, _pullSuspendTimeoutMillis);
+            }
+            catch (MQBrokerException e)
+            {
+                // TOPIC_NOT_EXIST / PULL_NOT_FOUND 等多为预期路径（topic 未创建等），debug + 退避
+                ClientLog.Debug("pull broker error for " + mq + ": " + e.Message);
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(500));
+                continue;
+            }
+            catch (RemotingTimeoutException e)
+            {
+                // 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 会把
+                // suspend 时间钳制到自身 brokerSuspendMaxTimeMillis，忽略客户端下发值，
+                // 故空闲队列会周期性超时。非错误，仅 debug，避免污染运行日志。
+                ClientLog.Debug("pull long-poll timeout for " + mq
+                    + " (benign, will retry): " + e.Message);
+                continue;
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("pull error for " + mq + ": " + e.Message);
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(500));
+                continue;
+            }
+
+            lock (_lock)
+            {
+                if (!_pending.ContainsKey(key))
+                {
+                    _pending[key] = new Queue<MessageExt>();
+                    _mqMap[key] = mq;
+                }
+            }
+
+            if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
+            {
+                lock (_lock)
+                {
+                    Queue<MessageExt> dq = _pending[key];
+                    foreach (MessageExt m in result.MsgFoundList)
+                    {
+                        dq.Enqueue(m);
+                    }
+                }
+            }
+
+            // 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consumeOffsetTable 跟踪并持久化
+            if (result.NextBeginOffset >= 0)
+            {
+                lock (_lock)
+                {
+                    _offsetTable[key] = result.NextBeginOffset;
+                }
+            }
+        }
+    }
+
+    private void DispatchLoop()
+    {
+        while (!_stop)
+        {
+            bool progressed = false;
+            List<string> keys;
+            lock (_lock)
+            {
+                keys = new List<string>(_pending.Keys);
+            }
+
+            foreach (string key in keys)
+            {
+                if (_stop || !_started) return;
+                MessageQueue mq;
+                lock (_lock)
+                {
+                    if (!_mqMap.TryGetValue(key, out MessageQueue? m)) continue;
+                    mq = m!;
+                }
+
+                List<MessageExt> batch = new();
+                lock (_lock)
+                {
+                    if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
+                    {
+                        int n = Math.Min(q.Count, Math.Max(1, _consumeMessageBatchMaxSize));
+                        for (int i = 0; i < n; ++i)
+                        {
+                            batch.Add(q.Dequeue());
+                        }
+                    }
+                }
+
+                if (batch.Count == 0) continue;
+                try
+                {
+                    bool done = ConsumeBatch(key, mq, batch);
+                    progressed = progressed || done;
+                }
+                catch (Exception e)
+                {
+                    // 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死分发线程）
+                    ClientLog.Warn("dispatch batch error (will retry): " + e.Message);
+                    lock (_lock)
+                    {
+                        if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+                        {
+                            for (int i = batch.Count - 1; i >= 0; --i)
+                            {
+                                PushFront(q, batch[i]);
+                            }
+                        }
+                    }
+
+                    _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
+                }
+            }
+
+            if (!progressed)
+            {
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(50));
+            }
+        }
+    }
+
+    private static void PushFront(Queue<MessageExt> q, MessageExt m)
+    {
+        // Queue<T> 无 PushFront：借助临时队列重组（批次很小，开销可忽略）
+        var tmp = new Queue<MessageExt>(q.Count + 1);
+        tmp.Enqueue(m);
+        while (q.Count > 0)
+        {
+            tmp.Enqueue(q.Dequeue());
+        }
+
+        while (tmp.Count > 0)
+        {
+            q.Enqueue(tmp.Dequeue());
+        }
+    }
+
+    /// <summary>消费一个批次并处理回投/挂起。返回消费位点是否前进。</summary>
+    private bool ConsumeBatch(string key, MessageQueue mq, List<MessageExt> batch)
+    {
+        bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
+        // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
+        if (IsOrderly())
+        {
+            var orderly = (IMessageListenerOrderly)_messageListener!;
+            var ctx = new ConsumeOrderlyContext(mq);
+            ConsumeOrderlyStatus status;
+            try
+            {
+                status = orderly.ConsumeMessage(batch, ctx);
+            }
+            catch (Exception e)
+            {
+                // Java 顺序消费：异常 → 不提交 offset，原地重试
+                ClientLog.Debug("orderly listener error (retry in place): " + e.Message);
+                status = ConsumeOrderlyStatus.SuspendCurrentQueueAMoment;
+            }
+
+            if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
+            {
+                lock (_lock)
+                {
+                    if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+                    {
+                        for (int i = batch.Count - 1; i >= 0; --i)
+                        {
+                            PushFront(q, batch[i]);
+                        }
+                    }
+                }
+
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(_suspendCurrentQueueTimeMillis));
+                return false;
+            }
+
+            AdvanceConsumeOffset(key, batch);
+            Interlocked.Add(ref _consumedCount, batch.Count);
+            return true;
+        }
+
+        // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
+        var conc = (IMessageListenerConcurrently)_messageListener!;
+        var cctx = new ConsumeConcurrentlyContext(mq);
+        ConsumeConcurrentlyStatus cstatus;
+        try
+        {
+            cstatus = conc.ConsumeMessage(batch, cctx);
+        }
+        catch (Exception e)
+        {
+            // Java：消费抛异常按 RECONSUME_LATER 处理
+            ClientLog.Debug("listener error, treat as RECONSUME_LATER: " + e.Message);
+            cstatus = ConsumeConcurrentlyStatus.ReconsumeLater;
+        }
+
+        if (cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess)
+        {
+            AdvanceConsumeOffset(key, batch);
+            Interlocked.Add(ref _consumedCount, batch.Count);
+            return true;
+        }
+
+        // RECONSUME_LATER：广播模式不回投（仅告警，位点前进）；集群模式回投 %RETRY%topic
+        if (broadcast)
+        {
+            ClientLog.Warn("BROADCASTING: message consume failed, no redelivery: "
+                + batch.Count.ToString(CultureInfo.InvariantCulture) + " msgs in " + mq);
+            AdvanceConsumeOffset(key, batch);
+            Interlocked.Add(ref _consumedCount, batch.Count);
+            return true;
+        }
+
+        if (SendBackBatch(batch, cctx))
+        {
+            AdvanceConsumeOffset(key, batch);
+            Interlocked.Add(ref _consumedCount, batch.Count);
+            return true;
+        }
+
+        // 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
+        lock (_lock)
+        {
+            if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+            {
+                for (int i = batch.Count - 1; i >= 0; --i)
+                {
+                    PushFront(q, batch[i]);
+                }
+            }
+        }
+
+        _stopEvent.Wait(TimeSpan.FromMilliseconds(200));
+        return false;
+    }
+
+    /// <summary>失败批次逐条回投 broker（对齐 Java processConsumeResult → sendMessageBack）。</summary>
+    private bool SendBackBatch(List<MessageExt> batch, ConsumeConcurrentlyContext ctx)
+    {
+        bool ok = true;
+        foreach (MessageExt msg in batch)
+        {
+            try
+            {
+                // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
+                //（reconsumeTimes 在 MessageExt 线上格式第 13 字段，broker 重投时 +1）
+                int delayLevel = ctx.DelayLevelWhenNextConsume;
+                if (delayLevel == 0)
+                {
+                    delayLevel = 3 + msg.ReconsumeTimes;
+                }
+
+                SendMessageBack(msg, delayLevel);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("send message back failed for msg " + msg.MsgId + ": " + e.Message);
+                ok = false;
+            }
+        }
+
+        return ok;
+    }
+
+    private void AdvanceConsumeOffset(string key, List<MessageExt> batch)
+    {
+        long nextOffset = 0;
+        foreach (MessageExt m in batch)
+        {
+            if (m.QueueOffset + 1 > nextOffset)
+            {
+                nextOffset = m.QueueOffset + 1;
+            }
+        }
+
+        lock (_lock)
+        {
+            _consumeOffsetTable.TryGetValue(key, out long cur);
+            if (cur < nextOffset)
+            {
+                _consumeOffsetTable[key] = nextOffset;
+            }
+        }
+    }
+
+    // ---------------- 位点持久化 ----------------
+    private void OffsetPersistLoop()
+    {
+        // Java MQClientInstance.startScheduledTask：persistAllConsumerOffset 每 5s
+        while (!_stop)
+        {
+            _stopEvent.Wait(TimeSpan.FromMilliseconds(5000));
+            if (_stop || !_started) return;
+            try
+            {
+                PersistOffsetsOnce();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("persist offsets error: " + e.Message);
+            }
+        }
+    }
+
+    private void PersistOffsetsOnce()
+    {
+        if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        {
+            SaveLocalOffsets();
+            return;
+        }
+
+        if (_mqClient is null)
+        {
+            return;
+        }
+
+        List<KeyValuePair<string, long>> items;
+        lock (_lock)
+        {
+            items = new List<KeyValuePair<string, long>>(_consumeOffsetTable);
+        }
+
+        foreach (KeyValuePair<string, long> kv in items)
+        {
+            if (!_mqMap.TryGetValue(kv.Key, out MessageQueue? mq) || mq is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                _mqClient.UpdateConsumerOffset(ConsumerGroup, mq, kv.Value);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("update consumer offset failed for " + mq + ": " + e.Message);
+            }
+        }
+    }
+
+    private string LocalOffsetPath()
+    {
+        // Java LocalFileOffsetStore：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
+        string home = Environment.GetEnvironmentVariable("HOME") is { Length: > 0 } h ? h : ".";
+        return home + "/.rocketmq_offsets/" + (_clientId.Length == 0 ? "DEFAULT" : _clientId)
+            + "/" + ConsumerGroup + "/offsets.json";
+    }
+
+    private void SaveLocalOffsets()
+    {
+        Dictionary<string, long> items;
+        lock (_lock)
+        {
+            items = new Dictionary<string, long>(_consumeOffsetTable, StringComparer.Ordinal);
+        }
+
+        string path = LocalOffsetPath();
+        string dir = path[..path.LastIndexOf('/')];
+        Directory.CreateDirectory(dir);
+        var root = JsonValue.MakeObject();
+        foreach (KeyValuePair<string, long> kv in items)
+        {
+            root.Set(kv.Key, JsonValue.MakeInt(kv.Value));
+        }
+
+        File.WriteAllText(path, root.Dump());
+    }
+
+    private Dictionary<string, long> LoadLocalOffsets()
+    {
+        var outMap = new Dictionary<string, long>(StringComparer.Ordinal);
+        try
+        {
+            if (!File.Exists(LocalOffsetPath()))
+            {
+                return outMap;
+            }
+
+            string text = File.ReadAllText(LocalOffsetPath());
+            if (!Json.TryParse(text, out JsonValue root, out _) || root is null)
+            {
+                return outMap;
+            }
+
+            foreach (KeyValuePair<string, JsonValue> kv in root.ObjectItems())
+            {
+                outMap[kv.Key] = kv.Value.IntValue();
+            }
+        }
+        catch (Exception)
+        {
+            // 本地位点文件缺失/损坏按首次启动处理
+        }
+
+        return outMap;
+    }
+
+    // ---------------- 顺序消费队列锁 ----------------
+    private void LockLoop()
+    {
+        if (!IsOrderly() || _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        {
+            return;
+        }
+
+        // Java ConsumeMessageOrderlyService.lockMQ：每 20s 批量锁分到的队列；
+        // 启动时立刻尝试一次，避免首个 20s 空转
         while (!_stop)
         {
             try
             {
-                if (!_started) break;
-                PullAndConsumeOnce();
+                List<MessageQueue> mqs = AssignedQueues();
+                if (mqs.Count > 0 && _mqClient is not null)
+                {
+                    List<MessageQueue> ok = _mqClient.LockBatchMq(ConsumerGroup, _clientId, mqs);
+                    var okKeys = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (MessageQueue mq in ok)
+                    {
+                        okKeys.Add(OffsetKey(mq));
+                    }
+
+                    lock (_lock)
+                    {
+                        _lockOk.Clear();
+                        foreach (string k in okKeys)
+                        {
+                            _lockOk.Add(k);
+                        }
+                    }
+
+                    ClientLog.Debug("lock_batch_mq: " + okKeys.Count.ToString(CultureInfo.InvariantCulture)
+                        + "/" + mqs.Count.ToString(CultureInfo.InvariantCulture) + " queues locked");
+                }
             }
             catch (Exception e)
             {
-                ClientLog.Warn("consume loop error: " + e.Message);
+                ClientLog.Debug("lock mq error: " + e.Message);
             }
 
-            int interval = _pullIntervalMillis > 0 ? _pullIntervalMillis : 10;
-            _stopEvent.Wait(TimeSpan.FromMilliseconds(interval));
+            // 等待 20s（期间响应 stop）
+            for (int i = 0; i < 200 && !_stop; ++i)
+            {
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
+            }
         }
     }
+
 
     private static string OffsetKey(MessageQueue mq) => mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
@@ -396,7 +1053,8 @@ public sealed class DefaultMQPushConsumer
             }
             catch (Exception e)
             {
-                ClientLog.Warn("assigned_queues: skip topic " + topic + ": " + e.Message);
+                // %RETRY%topic 在首次回投前无路由，属预期路径，debug 即可
+                ClientLog.Debug("assigned_queues: skip topic " + topic + ": " + e.Message);
             }
         }
 
@@ -410,6 +1068,37 @@ public sealed class DefaultMQPushConsumer
         {
             // SQL 过滤无 offset 语义，默认最新
             return c.GetMaxOffset(mq);
+        }
+
+        if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        {
+            // 广播模式：offset 只存本地（对齐 Java LocalFileOffsetStore）
+            Dictionary<string, long> stored = LoadLocalOffsets();
+            if (stored.TryGetValue(OffsetKey(mq), out long v))
+            {
+                return v;
+            }
+
+            if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
+            {
+                return c.GetMinOffset(mq);
+            }
+
+            return c.GetMaxOffset(mq);
+        }
+
+        // 集群模式：先查 broker 上已提交的位点（对齐 Java RemoteBrokerOffsetStore.readOffset）
+        try
+        {
+            if (c.QueryConsumerOffset(ConsumerGroup, mq, out long stored, 5000, null,
+                    /*setZeroIfNotFound=*/false))
+            {
+                return stored;
+            }
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("query consumer offset for " + mq + " not found: " + e.Message);
         }
 
         try
@@ -432,152 +1121,6 @@ public sealed class DefaultMQPushConsumer
         {
             return 0;
         }
-    }
-
-    private void PullAndConsumeOnce()
-    {
-        MQClientInstance c = Client();
-        List<MessageQueue> queues = AssignedQueues();
-        // 路由已加载（或尝试过），此时发心跳才能拿到 broker 地址
-        MaybeSendHeartbeat();
-
-        foreach (MessageQueue mq in queues)
-        {
-            if (_stop || !_started) return;
-
-            SubscriptionData sub;
-            {
-                lock (_lock)
-                {
-                    if (!_subscriptionData.TryGetValue(mq.Topic, out SubscriptionData? s) || s is null)
-                    {
-                        continue;
-                    }
-
-                    sub = s!;
-                }
-            }
-
-            string key = OffsetKey(mq);
-            long offset;
-            {
-                lock (_lock)
-                {
-                    offset = _offsetTable.TryGetValue(key, out long v) ? v : -1;
-                }
-            }
-
-            if (offset < 0)
-            {
-                offset = ResolveInitialOffset(mq, sub);
-                lock (_lock)
-                {
-                    _offsetTable[key] = offset;
-                }
-            }
-
-            PullResult result;
-            try
-            {
-                int sysFlag = PullSysFlag.BuildSysFlag(
-                    /*commitOffset=*/false, /*suspend=*/true, /*subscription=*/true, /*classFilter=*/false);
-                string expr = UtilAll.IsBlank(sub.SubString) ? "*" : sub.SubString;
-                result = c.PullMessage(ConsumerGroup, mq, offset, _pullBatchSize, sysFlag,
-                    /*commitOffset=*/0, expr, sub.SubVersion, sub.ExpressionType,
-                    _pullTimeoutMillis, _pullBatchSizeInBytes, _pullSuspendTimeoutMillis);
-            }
-            catch (MQBrokerException e)
-            {
-                // PULL_OFFSET_MOVED 等已映射到 PullStatus；其余 broker 错误跳过本轮
-                ClientLog.Debug("pull broker error for " + mq + ": " + e.Message);
-                continue;
-            }
-            catch (RemotingTimeoutException e)
-            {
-                // 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 会把
-                // suspend 时间钳制到自身 brokerSuspendMaxTimeMillis，忽略客户端下发值，
-                // 故空闲队列会周期性超时。非错误，仅 debug，避免污染运行日志。
-                ClientLog.Debug("pull long-poll timeout for " + mq
-                    + " (benign, will retry): " + e.Message);
-                continue;
-            }
-            catch (Exception e)
-            {
-                ClientLog.Warn("pull error for " + mq + ": " + e.Message);
-                continue;
-            }
-
-            if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
-            {
-                int dispatched = DispatchMessages(mq, result.MsgFoundList);
-                lock (_lock)
-                {
-                    _offsetTable[key] = offset + dispatched;
-                }
-            }
-            else if (result.Status == PullStatus.NoNewMsg || result.Status == PullStatus.OffsetIllegal)
-            {
-                lock (_lock)
-                {
-                    _offsetTable[key] = result.NextBeginOffset;
-                }
-            }
-        }
-    }
-
-    // 返回可推进 offset 的消息条数
-    private int DispatchMessages(MessageQueue mq, List<MessageExt> msgs)
-    {
-        IMessageListener? listener = _messageListener;
-        if (listener is null)
-        {
-            return 0;
-        }
-
-        int batchSize = Math.Max(1, _consumeMessageBatchMaxSize);
-        int consumed = 0;
-        int i = 0;
-        while (i < msgs.Count)
-        {
-            int end = Math.Min(i + batchSize, msgs.Count);
-            List<MessageExt> batch = msgs.GetRange(i, end - i);
-            try
-            {
-                if (listener.Orderly())
-                {
-                    var orderly = (IMessageListenerOrderly)listener;
-                    var ctx = new ConsumeOrderlyContext(mq);
-                    ConsumeOrderlyStatus status = orderly.ConsumeMessage(batch, ctx);
-                    if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
-                    {
-                        _stopEvent.Wait(TimeSpan.FromMilliseconds(_suspendCurrentQueueTimeMillis));
-                        break;
-                    }
-                }
-                else
-                {
-                    var conc = (IMessageListenerConcurrently)listener;
-                    var ctx = new ConsumeConcurrentlyContext(mq);
-                    ConsumeConcurrentlyStatus status = conc.ConsumeMessage(batch, ctx);
-                    if (status == ConsumeConcurrentlyStatus.ReconsumeLater)
-                    {
-                        // 简化：本批不推进 offset，留给后续重投
-                        break;
-                    }
-                }
-
-                consumed += batch.Count;
-                Interlocked.Add(ref _consumedCount, batch.Count);
-                i = end;
-            }
-            catch (Exception e)
-            {
-                ClientLog.Warn("listener error: " + e.Message);
-                break;
-            }
-        }
-
-        return consumed;
     }
 
     // ---------------- 心跳 ----------------
@@ -695,7 +1238,8 @@ public sealed class DefaultMQPushConsumer
             OriginMsgId = msg.MsgId,
             OriginTopic = msg.Topic,
             UnitMode = false,
-            MaxReconsumeTimes = _maxReconsumeTimes,
+            // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
+            MaxReconsumeTimes = _maxReconsumeTimes == -1 ? 16 : _maxReconsumeTimes,
         };
         c.InvokeSync(addr, RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
         return true;

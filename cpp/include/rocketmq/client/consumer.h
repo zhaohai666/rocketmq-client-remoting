@@ -1,17 +1,18 @@
-// 推模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer
-// 与 Python client/consumer.py 的 DefaultMQPushConsumer）。
+// 推模式消费者（对齐 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。
 //
-// 实现方式与 Python 参考实现一致：**单线程拉取循环 + 本地消费**
-//   1. start() 启动一个消费线程；
-//   2. 每轮对「已分配队列」逐个调用 PULL_MESSAGE（带订阅信息的长轮询）；
-//   3. 按 PullStatus 推进 offset：FOUND -> offset + 成功消费条数；
-//      NO_NEW_MSG / OFFSET_ILLEGAL -> nextBeginOffset；
-//   4. 把消息交给 MessageListener（并发/顺序两种）。
+// 架构（对齐 Java PushConsumer 的三层模型）：
+//   1. 拉取层：每个队列一个拉取线程（对应 Java PullMessageService 的并发长轮询——
+//      broker 为每个队列挂起长轮询请求、消息到达立即返回），拉到的消息进
+//      pending_ 缓冲（对应 ProcessQueue），拉取游标推进到 nextBeginOffset；
+//   2. 分发层：单分发线程从缓冲按 consumeMessageBatchMaxSize 取批次交给
+//      MessageListener；RECONSUME_LATER/异常批次逐条回投 %RETRY%topic
+//      （延迟梯度 3+reconsumeTimes，超 maxReconsumeTimes 由 broker 转 %DLQ%）；
+//   3. 位点层：_consume_offsets 记录"已消费位点"，每 5s 用 UPDATE_CONSUMER_OFFSET
+//      提交 broker（Java persistAllConsumerOffset），启动先 QUERY_CONSUMER_OFFSET。
 //
 // 关键工程点（真机验证得出，勿删注释）：
-//   - 单线程顺序长轮询下，排在满载队列前面的**空闲队列**会用 suspend 长轮询
-//     阻塞整轮，把满载队列饿死（顺序消息尤其明显，因为同 key 全落一个队列）。
-//     因此 pull_suspend_timeout_millis 与 pull_timeout_millis 必须可配且设短。
+//   - 拉取必须按队列并行：单线程顺序长轮询下，空闲队列的 suspend 会阻塞
+//     其余队列投递（曾导致"第一批消息能收到、后续全迟到"）。
 //   - broker 会把客户端下发的 suspend 时间钳制到自身 brokerSuspendMaxTimeMillis，
 //     故空闲队列仍会周期性客户端超时 —— 这是**良性**的，按 debug 处理不记 ERROR。
 #ifndef ROCKETMQ_CLIENT_CONSUMER_H
@@ -21,9 +22,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -75,6 +78,8 @@ public:
     void setSuspendCurrentQueueTimeMillis(int32_t t) { suspendCurrentQueueTimeMillis_ = t; }
     void setMaxReconsumeTimes(int32_t n) { maxReconsumeTimes_ = n; }
     void setPullIntervalMillis(int32_t t) { pullIntervalMillis_ = t; }
+    // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（Java pullThresholdForQueue，默认 1000）
+    void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
     // 是否在消费循环里周期性发 HEART_BEAT（默认开启；失败仅告警不影响消费）
     void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
     void setHeartbeatIntervalMillis(int32_t t) { heartbeatIntervalMillis_ = t; }
@@ -89,6 +94,8 @@ public:
     int64_t consumedCount() const { return consumedCount_.load(); }
     // broker 心跳成功次数（用于验证心跳能力）
     int64_t heartbeatCount() const { return heartbeatCount_.load(); }
+    // 流控触发次数（用于验证流控能力）
+    int64_t flowControlTriggered() const { return flowControlTriggered_.load(); }
 
     // ---------------- 订阅 ----------------
     void subscribe(const std::string& topic, const std::string& subExpression = "*");
@@ -111,13 +118,35 @@ public:
     int32_t sendHeartbeatToAllBroker();
 
 private:
-    void consumeLoop();
-    void pullAndConsumeOnce();
+    // 拉取：每个队列一个线程（对齐 Java PullMessageService 的并发长轮询语义：
+    // broker 为每个队列挂起长轮询、消息到达立即返回；若单线程顺序轮询，
+    // 一个空队列的 suspend 会阻塞其余队列的投递）。
+    void rebalancePullThreads();
+    void rebalanceLoop();
+    void queuePullLoop(const MessageQueue& mq);
+    // 分发：单线程从各队列缓冲取批次交给监听器
+    void dispatchLoop();
+    // 消费一个批次，处理回投/挂起；返回消费位点是否前进
+    bool consumeBatch(const std::string& key, const MessageQueue& mq,
+                      const std::vector<MessageExt>& batch);
+    // 失败批次逐条回投（Java processConsumeResult → sendMessageBack）
+    bool sendBackBatch(const std::vector<MessageExt>& batch,
+                       const ConsumeConcurrentlyContext& ctx);
+    void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch);
+    // 位点持久化：每 5s 把"已消费位点"提交 broker（Java persistAllConsumerOffset）
+    void offsetPersistLoop();
+    void persistOffsetsOnce();
+    // 广播模式本地位点文件（Java LocalFileOffsetStore）
+    std::string localOffsetPath() const;
+    void saveLocalOffsets();
+    std::map<std::string, int64_t> loadLocalOffsets() const;
+    // 顺序消费 broker 队列锁（Java ConsumeMessageOrderlyService.lockMQ，每 20s）
+    void lockLoop();
+    bool isOrderly() const;
+    void maybeSendHeartbeat();
+
     std::vector<MessageQueue> assignedQueues();
     int64_t resolveInitialOffset(const MessageQueue& mq, const SubscriptionData& sub);
-    // 返回可推进 offset 的消息条数
-    int32_t dispatchMessages(const MessageQueue& mq, const std::vector<MessageExt>& msgs);
-    void maybeSendHeartbeat();
     static std::string offsetKey(const MessageQueue& mq);
 
     std::string consumerGroup_;
@@ -135,6 +164,7 @@ private:
     int32_t suspendCurrentQueueTimeMillis_ = 1000;
     int32_t maxReconsumeTimes_ = -1;
     int32_t pullIntervalMillis_ = 0;
+    int32_t pullThresholdForQueue_ = 1000;
     bool heartbeatEnabled_ = true;
     int32_t heartbeatIntervalMillis_ = 30000;
 
@@ -142,17 +172,30 @@ private:
     mutable std::mutex lock_;
     std::map<std::string, SubscriptionData> subscriptionData_;
     std::shared_ptr<MessageListener> messageListener_;
+    // 拉取游标（nextBeginOffset）
     std::map<std::string, int64_t> offsetTable_;
+    // 已消费位点（周期持久化的对象；Java ProcessQueue.removeMessage 后的 commitOffset）
+    std::map<std::string, int64_t> consumeOffsetTable_;
+    std::map<std::string, MessageQueue> mqMap_;
+    // 已拉未消费缓冲（Java ProcessQueue 的简化版）
+    std::map<std::string, std::deque<MessageExt>> pending_;
+    // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
+    std::set<std::string> lockOk_;
 
     std::unique_ptr<MQClientInstance> mqClient_;
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_{false};
-    std::vector<std::thread> consumeThreads_;
+    std::map<std::string, std::thread> pullThreads_;
+    std::thread dispatchThread_;
+    std::thread persistThread_;
+    std::thread lockThread_;
+    std::thread rebalanceThread_;
     std::condition_variable cv_;
     std::mutex waitMutex_;
     std::atomic<int64_t> consumedCount_{0};
     std::atomic<int64_t> heartbeatCount_{0};
     std::atomic<int64_t> lastHeartbeatMs_{0};
+    std::atomic<int64_t> flowControlTriggered_{0};
 };
 
 }  // namespace rocketmq

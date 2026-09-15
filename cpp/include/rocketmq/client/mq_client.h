@@ -123,6 +123,14 @@ public:
     void updateConsumerOffset(const std::string& consumerGroup, const MessageQueue& mq,
                               int64_t commitOffset, int32_t timeoutMillis = 5000,
                               const std::string& addr = std::string());
+    // 批量锁/解锁队列（顺序消费，Java MQClientAPIImpl.lockBatchMQ / unlockBatchMQ）。
+    // 按 broker 分组发送；lockBatchMq 返回 broker 确认锁定成功的队列集（lockOKMQSet）。
+    std::vector<MessageQueue> lockBatchMq(const std::string& consumerGroup,
+                                          const std::string& clientId,
+                                          const std::vector<MessageQueue>& mqs,
+                                          int32_t timeoutMillis = 5000);
+    void unlockBatchMq(const std::string& consumerGroup, const std::string& clientId,
+                       const std::vector<MessageQueue>& mqs, int32_t timeoutMillis = 5000);
     int64_t getMaxOffset(const MessageQueue& mq, int32_t timeoutMillis = 5000,
                          const std::string& addr = std::string());
     int64_t getMinOffset(const MessageQueue& mq, int32_t timeoutMillis = 5000,

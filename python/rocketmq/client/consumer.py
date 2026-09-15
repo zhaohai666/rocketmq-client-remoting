@@ -7,10 +7,13 @@ MessageQueueListener、消费进度管理、消息重投（sendMessageBack）等
 """
 from __future__ import annotations
 
+import json
+import os
 import queue
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional, Set
 
 from ..common.message import MessageExt, MessageQueue
 from ..common.mix_all import MixAll
@@ -165,6 +168,21 @@ class DefaultMQPushConsumer:
         self._msg_queue_inflight: Dict[str, int] = {}
         self._offset_table: Dict[str, int] = {}
         self._stop = threading.Event()
+        # ---- 对齐 Java 的消费进度 / 缓冲 / 锁状态 ----
+        # _offset_table 是"拉取游标"（nextBeginOffset）；_consume_offsets 是
+        # "已消费位点"（Java ProcessQueue.removeMessage 后的 commitOffset），
+        # 周期持久化到 broker 的是后者。_pending 是已拉未消费缓冲（Java ProcessQueue）。
+        self._pending: Dict[str, Deque[MessageExt]] = {}
+        self._mq_map: Dict[str, MessageQueue] = {}
+        self._consume_offsets: Dict[str, int] = {}
+        # 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集（Java ConsumeMessageOrderlyService）
+        self._lock_ok: Set[str] = set()
+        self._flow_control_triggered = 0
+        self._dispatch_thread: Optional[threading.Thread] = None
+        self._persist_thread: Optional[threading.Thread] = None
+        self._lock_thread: Optional[threading.Thread] = None
+        self._rebalance_thread: Optional[threading.Thread] = None
+        self._queue_threads: Dict[str, threading.Thread] = {}
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -241,14 +259,52 @@ class DefaultMQPushConsumer:
             self._mq_client.start()
             self._started = True
             self._stop.clear()
+            # 集群模式自动订阅重试 topic（对齐 Java copySubscription →
+            # retryTopic = MixAll.getRetryTopic(consumerGroup)），broker 重投的消息写到这里
+            if self.message_model != MessageModel.BROADCASTING:
+                retry_topic = MixAll.get_retry_topic(self.consumer_group)
+                if retry_topic not in self.subscription_data:
+                    sub = SubscriptionData(topic=retry_topic, sub_string="*")
+                    sub.tags_set.add("*")
+                    self.subscription_data[retry_topic] = sub
         self._start_pull_loop()
+        self._start_dispatch_loop()
+        self._start_offset_persist_loop()
+        self._start_lock_loop()
+        t = threading.Thread(target=self._rebalance_loop, daemon=True,
+                             name="rmq-rebalance-%s" % self.consumer_group)
+        t.start()
+        self._rebalance_thread = t
 
     def shutdown(self) -> None:
         with self._lock:
             if not self._started:
                 return
-            self._started = False
             self._stop.set()
+        # 退出前把已消费位点持久化一次（对齐 Java MQClientInstance.shutdown →
+        # persistAllConsumerOffset）。注意必须在 _started=False 之前调（_require_client）。
+        try:
+            self._persist_offsets_once()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("persist offsets on shutdown failed: %s", e)
+        # 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）
+        if self._is_orderly() and self.message_model != MessageModel.BROADCASTING:
+            try:
+                mqs = self._assigned_queues()
+                if mqs:
+                    self._require_client().unlock_batch_mq(self.consumer_group, self.client_id or "", mqs)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("unlock on shutdown failed: %s", e)
+        with self._lock:
+            self._started = False
+        for t in (self._persist_thread, self._lock_thread, self._dispatch_thread,
+                  self._rebalance_thread):
+            if t is not None and t.is_alive():
+                t.join(timeout=2)
+        for t in list(self._queue_threads.values()):
+            if t.is_alive():
+                t.join(timeout=2)
+        self._queue_threads.clear()
         if self._mq_client is not None:
             try:
                 self._mq_client.shutdown()
@@ -271,12 +327,29 @@ class DefaultMQPushConsumer:
     # ---------------- 消费循环 ----------------
     def _start_pull_loop(self) -> None:
         self._pulling = True
-        n = max(1, self.consume_thread_min)
-        for i in range(n):
-            t = threading.Thread(target=self._consume_loop, daemon=True,
-                                 name="rmq-consume-%s-%d" % (self.consumer_group, i))
-            t.start()
-            self._consume_threads.append(t)
+        # 对齐 Java PullMessageService 的并发长轮询语义：broker 会为每个队列挂起
+        # 长轮询请求，消息到达立即返回——因此每个队列必须各有一个拉取线程，
+        # 否则一个空队列的长轮询（~15s suspend）会阻塞其余队列的投递。
+        self._rebalance_pull_threads()
+
+    def _rebalance_pull_threads(self) -> None:
+        """按当前分配的队列同步拉取线程集（简化 rebalance 的线程侧实现）。"""
+        current = {self._mq_key(mq): mq for mq in self._assigned_queues()}
+        with self._lock:
+            for key, mq in current.items():
+                if key in self._queue_threads:
+                    continue
+                t = threading.Thread(target=self._queue_pull_loop, args=(mq,), daemon=True,
+                                     name="rmq-pull-%s-%s" % (self.consumer_group, key))
+                self._queue_threads[key] = t
+                t.start()
+            for key in list(self._queue_threads.keys()):
+                if key not in current:
+                    self._queue_threads.pop(key, None)  # 循环内检测到退出
+
+    @staticmethod
+    def _mq_key(mq: MessageQueue) -> str:
+        return "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
 
     def _assigned_queues(self) -> List[MessageQueue]:
         """简化 rebalance：本进程所有订阅 topic 的全部队列。"""
@@ -292,35 +365,50 @@ class DefaultMQPushConsumer:
                     if mq2 not in result:
                         result.append(mq2)
             except MQClientException as e:  # noqa: BLE001
-                logger.warning("assigned_queues: skip topic %s: %s", topic, e)
+                logger.debug("assigned_queues: skip topic %s: %s", topic, e)
         return result
 
-    def _consume_loop(self) -> None:
-        while not self._stop.is_set():
+    def _rebalance_loop(self) -> None:
+        """周期刷新分配集，为新增队列补拉取线程（对应 Java doRebalance 的简化版）。"""
+        while not self._stop.wait(5.0):
             try:
-                if not self._started:
-                    break
-                self._pull_and_consume_once()
+                self._rebalance_pull_threads()
             except Exception as e:  # noqa: BLE001
-                # 带类型名：否则 AttributeError 之类的编码错误只打印消息文本，
-                # 很容易被当成"拉取超时"忽略掉（曾因此掩盖 pull_suspend_timeout_millis 未初始化）。
-                logger.error("consume loop error: %s: %s", type(e).__name__, e)
-            time.sleep(self.pull_interval / 1000.0 if self.pull_interval > 0 else 0.01)
+                logger.debug("rebalance pull threads error: %s", e)
 
-    def _pull_and_consume_once(self) -> None:
+    def _queue_pull_loop(self, mq: MessageQueue) -> None:
+        """单队列拉取循环：长轮询拉取 → 推入待消费缓冲（Java PullMessageService+ProcessQueue）。"""
         client = self._require_client()
-        for mq in self._assigned_queues():
-            if self._stop.is_set() or not self._started:
-                return
-            sub = None
+        orderly = self._is_orderly()
+        key = self._mq_key(mq)
+        while not self._stop.is_set() and self._started:
             with self._lock:
+                still_assigned = key in self._queue_threads and self._queue_threads[key] is threading.current_thread()
                 sub = self.subscription_data.get(mq.topic)
-            if sub is None:
+            if not still_assigned or sub is None:
+                return
+            # 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
+            if orderly and key not in self._lock_ok:
+                time.sleep(0.2)
                 continue
-            key = "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
+            # 流控（对齐 Java ProcessQueue.putMessage 的 pullThresholdForQueue 检查）：
+            # 已拉未消费的条数超过阈值就暂停本队列拉取
+            with self._lock:
+                pending_n = len(self._pending.get(key, ()))
+            if pending_n >= max(1, self.pull_threshold_for_queue):
+                self._flow_control_triggered += 1
+                logger.debug("flow control: queue %s pending=%d >= threshold=%d, pause pull",
+                             mq, pending_n, self.pull_threshold_for_queue)
+                time.sleep(0.1)
+                continue
             offset = self._offset_table.get(key)
             if offset is None:
-                offset = self._resolve_initial_offset(client, mq, sub)
+                try:
+                    offset = self._resolve_initial_offset(client, mq, sub)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("resolve initial offset failed for %s: %s", mq, e)
+                    time.sleep(1.0)
+                    continue
                 self._offset_table[key] = offset
             try:
                 sys_flag = PullSysFlag.build_sys_flag(commit_offset=False,
@@ -334,11 +422,6 @@ class DefaultMQPushConsumer:
                                              timeout_millis=self.pull_timeout_millis,
                                              max_msg_bytes=self.pull_batch_size_in_bytes,
                                              suspend_timeout_millis=self.pull_suspend_timeout_millis)
-            except MQBrokerException as e:
-                if e.response_code == MQBrokerException.UNKNOWN:
-                    pass
-                # PULL_OFFSET_MOVED 等已映射到 PullStatus
-                continue
             except RemotingTimeoutException as e:
                 # 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 将
                 # suspend 时间钳制为其自身 brokerSuspendMaxTimeMillis（默认 ~15s），
@@ -347,15 +430,21 @@ class DefaultMQPushConsumer:
                 logger.debug("pull long-poll timeout for %s (benign, will retry): %s", mq, e)
                 continue
             except Exception as e:  # noqa: BLE001
-                logger.error("pull error for %s: %s", mq, e)
+                # broker 侧非 SUCCESS 码（TOPIC_NOT_EXIST / PULL_NOT_FOUND 等）或其他错误：
+                # 多为 topic 尚未创建等预期路径，debug + 短暂退避，避免热循环
+                logger.debug("pull error for %s: %s: %s", mq, type(e).__name__, e)
+                time.sleep(0.5)
                 continue
 
+            with self._lock:
+                if key not in self._pending:
+                    self._pending[key] = deque()
+                    self._mq_map[key] = mq
             if result.status == PullStatus.FOUND and result.msg_found_list:
-                dispatched = self._dispatch_messages(mq, result.msg_found_list)
-                self._offset_table[key] = offset + dispatched
-            elif result.status == PullStatus.NO_NEW_MSG:
-                self._offset_table[key] = result.next_begin_offset
-            elif result.status == PullStatus.OFFSET_ILLEGAL:
+                with self._lock:
+                    self._pending[key].extend(result.msg_found_list)
+            # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
+            if result.next_begin_offset is not None:
                 self._offset_table[key] = result.next_begin_offset
 
     def _resolve_initial_offset(self, client: MQClientInstance, mq: MessageQueue,
@@ -363,50 +452,229 @@ class DefaultMQPushConsumer:
         if sub.expression_type == ExpressionType.SQL92:
             # SQL 过滤无 offset 语义，默认最新
             return client.get_max_offset(mq)
-        try:
-            from ..remoting.protocol.codes import ResponseCode
+        if self.message_model == MessageModel.BROADCASTING:
+            # 广播模式：offset 只存本地（对齐 Java LocalFileOffsetStore）
+            stored = self._load_local_offsets()
+            key = "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
+            if key in stored:
+                return stored[key]
             if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
                 return client.get_min_offset(mq)
-            if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
-                return client.search_offset_by_timestamp(mq, int(time.time() * 1000 - 30 * 60 * 1000))
-            # 默认 CONSUME_FROM_LAST_OFFSET
             return client.get_max_offset(mq)
-        except Exception:  # noqa: BLE001
-            return 0
+        # 集群模式：先查 broker 上已提交的位点（对齐 Java RemoteBrokerOffsetStore.readOffset）
+        try:
+            stored = client.query_consumer_offset(self.consumer_group, mq, set_zero_if_not_found=False)
+            if stored is not None and stored >= 0:
+                return stored
+        except Exception as e:  # noqa: BLE001
+            logger.debug("query consumer offset for %s not found: %s", mq, e)
+        if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
+            return client.get_min_offset(mq)
+        if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
+            return client.search_offset_by_timestamp(mq, int(time.time() * 1000 - 30 * 60 * 1000))
+        # 默认 CONSUME_FROM_LAST_OFFSET
+        return client.get_max_offset(mq)
 
-    def _dispatch_messages(self, mq: MessageQueue, msgs: List[MessageExt]) -> int:
-        """把一批拉到的消息交给监听器消费，按 consume_message_batch_max_size 分批调用。
+    # ---------------- 分发消费 ----------------
+    def _start_dispatch_loop(self) -> None:
+        t = threading.Thread(target=self._dispatch_loop, daemon=True,
+                             name="rmq-dispatch-%s" % self.consumer_group)
+        t.start()
+        self._dispatch_thread = t
 
-        返回实际已成功消费（可推进 offset）的消息条数；RECONSUME_LATER 的批次不前进。
-        """
+    def _dispatch_loop(self) -> None:
+        while not self._stop.is_set():
+            progressed = False
+            with self._lock:
+                keys = list(self._pending.keys())
+            for key in keys:
+                if self._stop.is_set() or not self._started:
+                    return
+                mq = self._mq_map.get(key)
+                if mq is None:
+                    continue
+                with self._lock:
+                    dq = self._pending.get(key)
+                    batch = [dq.popleft() for _ in range(min(len(dq) if dq else 0,
+                                                             max(1, self.consume_message_batch_max_size)))]
+                if not batch:
+                    continue
+                try:
+                    done = self._consume_batch(key, mq, batch)
+                    progressed = progressed or done
+                except Exception as e:  # noqa: BLE001
+                    # 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死分发线程）
+                    logger.error("dispatch batch error (will retry): %s: %s", type(e).__name__, e)
+                    with self._lock:
+                        dq2 = self._pending.get(key)
+                        if dq2 is not None:
+                            for m in reversed(batch):
+                                dq2.appendleft(m)
+                    time.sleep(0.1)
+            if not progressed:
+                time.sleep(0.05)
+
+    def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt]) -> bool:
+        """消费一个批次并处理回投/挂起。返回消费位点是否前进。"""
         listener = self.message_listener
-        if listener is None:
-            return 0
-        batch_size = max(1, self.consume_message_batch_max_size)
-        consumed = 0
-        n = len(msgs)
-        i = 0
-        while i < n:
-            batch = msgs[i:i + batch_size]
-            context = ConsumeConcurrentlyContext(mq)
+        broadcast = self.message_model == MessageModel.BROADCASTING
+        # ---- 顺序消费（Java ConsumeMessageOrderlyService）----
+        if self._is_orderly():
+            ocontext = ConsumeOrderlyContext(mq)
             try:
-                if isinstance(listener, MessageListenerOrderly):
-                    ocontext = ConsumeOrderlyContext(mq)
-                    status = listener.consume_message(batch, ocontext)
-                    if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
-                        time.sleep(self.suspend_current_queue_time_millis / 1000.0)
-                        break
-                else:
-                    status = listener.consume_message(batch, context)
-                    if status == ConsumeConcurrentlyStatus.RECONSUME_LATER:
-                        # 简化：本批不推进 offset，留给后续重投
-                        break
-                consumed += len(batch)
-                i += len(batch)
+                status = listener.consume_message(batch, ocontext)
             except Exception as e:  # noqa: BLE001
-                logger.error("listener error: %s", e)
-                break
-        return consumed
+                # Java 顺序消费：异常 → 不提交 offset，原地重试
+                logger.debug("orderly listener error (retry in place): %s", e)
+                status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT
+            if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                with self._lock:
+                    dq = self._pending.get(key)
+                    if dq is not None:
+                        for m in reversed(batch):
+                            dq.appendleft(m)
+                time.sleep(self.suspend_current_queue_time_millis / 1000.0)
+                return False
+            self._advance_consume_offset(key, batch)
+            return True
+        # ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
+        context = ConsumeConcurrentlyContext(mq)
+        try:
+            status = listener.consume_message(batch, context)
+        except Exception as e:  # noqa: BLE001
+            # Java：消费抛异常按 RECONSUME_LATER 处理
+            logger.debug("listener error, treat as RECONSUME_LATER: %s", e)
+            status = ConsumeConcurrentlyStatus.RECONSUME_LATER
+        if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
+            self._advance_consume_offset(key, batch)
+            return True
+        # RECONSUME_LATER：广播模式不回投（仅告警，位点不前进，重启后重新消费）；
+        # 集群模式回投 %RETRY%topic（延迟梯度 3+reconsumeTimes；超过 maxReconsumeTimes
+        # 由 broker 自动转 %DLQ%）
+        if broadcast:
+            logger.warning("BROADCASTING: message consume failed, no redelivery: %d msgs in %s",
+                           len(batch), mq)
+            self._advance_consume_offset(key, batch)
+            return True
+        if self._send_back_batch(batch, context):
+            self._advance_consume_offset(key, batch)
+            return True
+        # 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
+        with self._lock:
+            dq = self._pending.get(key)
+            if dq is not None:
+                for m in reversed(batch):
+                    dq.appendleft(m)
+        time.sleep(0.2)
+        return False
+
+    def _send_back_batch(self, batch: List[MessageExt],
+                         context: ConsumeConcurrentlyContext) -> bool:
+        """失败批次逐条回投 broker（对齐 Java processConsumeResult → sendMessageBack）。"""
+        ok = True
+        for msg in batch:
+            try:
+                # 重投次数在 MessageExt 线上格式第 13 字段（Java msg.getReconsumeTimes()），
+                # broker 重投时会 +1；不是 properties 键（Java 的 PROPERTY_RECONSUME_TIME
+                # 实际值是 "RECONSUME_TIME"，仅由 MessageAccessor.setReconsumeTime 写入）
+                delay_level = context.delay_level_when_next_consume
+                if not delay_level:
+                    # Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
+                    delay_level = 3 + msg.get_reconsume_times()
+                self.send_message_back(msg, delay_level)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("send message back failed for msg %s: %s", msg.msg_id, e)
+                ok = False
+        return ok
+
+    def _advance_consume_offset(self, key: str, batch: List[MessageExt]) -> None:
+        next_off = max((m.queue_offset or 0) for m in batch) + 1
+        with self._lock:
+            cur = self._consume_offsets.get(key)
+            self._consume_offsets[key] = max(cur or 0, next_off)
+
+    # ---------------- 位点持久化 ----------------
+    def _start_offset_persist_loop(self) -> None:
+        t = threading.Thread(target=self._offset_persist_loop, daemon=True,
+                             name="rmq-offset-persist-%s" % self.consumer_group)
+        t.start()
+        self._persist_thread = t
+
+    def _offset_persist_loop(self) -> None:
+        # Java MQClientInstance.startScheduledTask：persistAllConsumerOffset 每 5s
+        while not self._stop.wait(5.0):
+            try:
+                self._persist_offsets_once()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("persist offsets error: %s", e)
+
+    def _persist_offsets_once(self) -> None:
+        if self.message_model == MessageModel.BROADCASTING:
+            self._save_local_offsets()
+            return
+        client = self._require_client()
+        with self._lock:
+            items = list(self._consume_offsets.items())
+        for key, off in items:
+            mq = self._mq_map.get(key)
+            if mq is None:
+                continue
+            try:
+                client.update_consumer_offset(self.consumer_group, mq, off)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("update consumer offset failed for %s: %s", mq, e)
+
+    def _local_offset_path(self) -> str:
+        # Java LocalFileOffsetStore：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
+        base = os.path.join(os.path.expanduser("~"), ".rocketmq_offsets",
+                            self.client_id or "DEFAULT", self.consumer_group)
+        return os.path.join(base, "offsets.json")
+
+    def _save_local_offsets(self) -> None:
+        with self._lock:
+            items = dict(self._consume_offsets)
+        path = self._local_offset_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+        os.replace(tmp, path)
+
+    def _load_local_offsets(self) -> Dict[str, int]:
+        try:
+            with open(self._local_offset_path(), "r", encoding="utf-8") as f:
+                return {k: int(v) for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            return {}
+
+    # ---------------- 顺序消费队列锁 ----------------
+    def _start_lock_loop(self) -> None:
+        if not self._is_orderly() or self.message_model == MessageModel.BROADCASTING:
+            return
+        t = threading.Thread(target=self._lock_loop, daemon=True,
+                             name="rmq-lock-%s" % self.consumer_group)
+        t.start()
+        self._lock_thread = t
+
+    def _lock_loop(self) -> None:
+        client = self._require_client()
+        # Java ConsumeMessageOrderlyService.lockMQ：每 20s 批量锁分到的队列；
+        # 启动时立刻尝试一次，避免首个 20s 空转
+        while not self._stop.is_set():
+            try:
+                mqs = self._assigned_queues()
+                if mqs:
+                    ok = client.lock_batch_mq(self.consumer_group, self.client_id or "", mqs)
+                    ok_keys = {"%s%s%d" % (m.topic, m.broker_name, m.queue_id) for m in ok}
+                    with self._lock:
+                        self._lock_ok = ok_keys
+                    logger.debug("lock_batch_mq: %d/%d queues locked", len(ok_keys), len(mqs))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("lock mq error: %s", e)
+            self._stop.wait(20.0)
+
+    def _is_orderly(self) -> bool:
+        return isinstance(self.message_listener, MessageListenerOrderly)
 
     # ---------------- 管理能力 ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
@@ -426,6 +694,8 @@ class DefaultMQPushConsumer:
         addr = client.broker_addr_of(broker_name)
         if addr is None:
             raise MQClientException("broker %s not found" % broker_name)
+        # Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
+        max_reconsume = 16 if self.max_reconsume_times == -1 else self.max_reconsume_times
         header = ConsumerSendMsgBackRequestHeader()
         header.offset = msg.commit_log_offset
         header.group = self.consumer_group
@@ -433,7 +703,7 @@ class DefaultMQPushConsumer:
         header.origin_msg_id = msg.msg_id
         header.origin_topic = msg.topic
         header.unit_mode = False
-        header.max_reconsume_times = self.max_reconsume_times
+        header.max_reconsume_times = max_reconsume
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
         response = client._invoke_sync(addr, request, 5000)
         client._check_response(response)

@@ -50,7 +50,9 @@ class ConsumeOrderlyStatus(Enum):
 class ConsumeConcurrentlyContext:
     def __init__(self, message_queue=None):
         self.message_queue = message_queue
-        self.delay_level_next_consume = 0
+        # 对应 Java ConsumeConcurrentlyContext.delayLevelWhenNextConsume（缺省 0）。
+        # 为 0 时由 caller 改写为 3 + reconsumeTimes（见 consumer.py _send_back_batch）。
+        self.delay_level_when_next_consume = 0
         self.ack_index = -1
 
 
@@ -58,6 +60,8 @@ class ConsumeOrderlyContext:
     def __init__(self, message_queue=None):
         self.message_queue = message_queue
         self.auto_commit = True
+        # 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis
+        self.suspend_current_queue_time_millis = 1000
 
 
 class MessageListenerConcurrently:
