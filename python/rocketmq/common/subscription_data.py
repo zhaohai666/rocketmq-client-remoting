@@ -85,6 +85,31 @@ class SubscriptionData:
             return False
         return True
 
+    def __hash__(self) -> int:
+        # 必须与 __eq__ 配套：Python 定义 __eq__ 后默认 __hash__ 变 None，
+        # SubscriptionData 一旦不可哈希，ConsumerData.subscription_data_set.add()
+        # 会直接抛 TypeError —— 心跳就发不出去（broker 端也就看不到消费者，
+        # rebalance 查不到消费者列表 → 队列分不下来）。
+        return hash((self.class_filter_mode, self.topic, self.sub_string,
+                     self.expression_type,
+                     frozenset(self.tags_set or ()),
+                     frozenset(self.code_set or ())))
+
+    def to_dict(self) -> dict:
+        """Java 字段名（camelCase），tagsSet/codeSet 转 list 才能 JSON 序列化。
+
+        注意 filterClassSource 在 Java 里是 @JSONField(serialize=false) —— **不序列化**。
+        """
+        return {
+            "classFilterMode": self.class_filter_mode,
+            "topic": self.topic,
+            "subString": self.sub_string,
+            "tagsSet": sorted(self.tags_set or ()),
+            "codeSet": sorted(self.code_set or ()),
+            "subVersion": self.sub_version,
+            "expressionType": self.expression_type,
+        }
+
     def __repr__(self):
         return "SubscriptionData [topic=%s, subString=%s, tagsSet=%s]" % (
             self.topic, self.sub_string, self.tags_set)

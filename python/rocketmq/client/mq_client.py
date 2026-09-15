@@ -22,7 +22,9 @@ from ..remoting.client import RemotingClient
 from ..remoting.protocol.body import (ClusterInfo, GetConsumerListByGroupResponseBody,
                                       TopicList)
 from ..remoting.protocol.codes import RequestCode, ResponseCode, SerializeType
-from ..remoting.protocol.headers import (CreateTopicRequestHeader, GetMaxOffsetRequestHeader,
+from ..remoting.protocol.headers import (CreateTopicRequestHeader,
+                                         GetConsumerListByGroupRequestHeader,
+                                         GetMaxOffsetRequestHeader,
                                          GetMaxOffsetResponseHeader, GetMinOffsetRequestHeader,
                                          GetMinOffsetResponseHeader, PullMessageRequestHeader,
                                          PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
@@ -85,15 +87,50 @@ class MQClientInstance:
         self.topic_route_lock = threading.RLock()
         self._started = False
         self._last_route_fetch = 0.0
+        # 本客户端「在用」的 topic（消费者订阅 + 生产者发过的），对应 Java 的
+        # MQConsumerInner.subscriptions() / MQProducerInner.getPublishTopicList()，
+        # 由周期任务 updateTopicRouteInfoFromNameServer() 逐个刷新路由。
+        self._topics_in_use: set = set()
+        self._route_refresh_thread: Optional[threading.Thread] = None
+        self._route_refresh_stop = threading.Event()
         MQClientInstance.INSTANCE_MAP[client_id] = self
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
         self._started = True
+        if self._route_refresh_thread is None:
+            self._route_refresh_stop.clear()
+            t = threading.Thread(target=self._route_refresh_loop, daemon=True,
+                                 name="rmq-route-refresh-%s" % self.client_id)
+            t.start()
+            self._route_refresh_thread = t
 
     def shutdown(self) -> None:
         self._started = False
+        self._route_refresh_stop.set()
         self.remoting_client.shutdown()
+
+    def register_topic_in_use(self, topic: str) -> None:
+        """登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。"""
+        if topic:
+            self._topics_in_use.add(topic)
+
+    def _route_refresh_loop(self) -> None:
+        """周期刷新在用 topic 的路由（对应 Java MQClientInstance.startScheduledTask 中
+        ``scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)``，
+        默认 30s）。没有这个任务，路由变化（如新 topic 被 broker 创建、队列扩容）只能等
+        消费者自己的 rebalance 轮次或生产者的下次发送才被发现。
+        """
+        if self._route_refresh_stop.wait(0.01):  # Java 首个任务延迟 10ms
+            return
+        while not self._route_refresh_stop.wait(30.0):
+            if not self._started:
+                return
+            for topic in list(self._topics_in_use):
+                try:
+                    self.update_topic_route_info_from_name_server(topic)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("route refresh failed for %s: %s", topic, e)
 
     def update_name_server_address_list(self, addrs: List[str]) -> None:
         if addrs:
@@ -110,7 +147,16 @@ class MQClientInstance:
         raise MQBrokerException(response.code, response.remark or "")
 
     # ---------------- 路由管理 ----------------
-    def update_topic_route_info_from_name_server(self, topic: str, timeout_millis: int = 5000) -> bool:
+    def update_topic_route_info_from_name_server(self, topic: str, timeout_millis: int = 5000,
+                                                 is_default: bool = False) -> bool:
+        """拉取并落库 topic 路由。
+
+        ``is_default`` 对应 Java ``MQClientInstance.updateTopicRouteInfoFromNameServer(topic,
+        isDefault, defaultMQProducer)``：**只有生产者**在真实路由拉不到时才回退到默认 topic
+        （TBW102）来为新 topic 合成发布信息（见 Java DefaultMQProducerImpl:905）。
+        消费者路径**绝不允许**兜底——否则 ``%RETRY%group`` 这类尚未由 broker 创建的主题会
+        被合成出一组假队列，两个实例在不同时刻拉取会得到不同的队列数，rebalance 视图不一致。
+        """
         if not self.name_server_addrs:
             raise MQClientException("name server address list is empty")
 
@@ -131,9 +177,10 @@ class MQClientInstance:
             return None
 
         route = _fetch(topic)
-        if route is None and topic != MixAll.DEFAULT_TOPIC:
+        if route is None and is_default and topic != MixAll.DEFAULT_TOPIC:
             # RocketMQ 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
-            # 需要像 Java 客户端那样回退到默认 topic（TBW102）来为该 topic 构造发布信息。
+            # **生产者**需要像 Java 客户端那样回退到默认 topic（TBW102）来为该 topic
+            # 构造发布信息。消费者不做这个兜底（见方法 docstring）。
             route = _fetch(MixAll.DEFAULT_TOPIC)
             if route is not None:
                 # 新 topic 由 broker 用 default_topic_queue_nums 创建队列，而默认 topic 自身
@@ -152,12 +199,12 @@ class MQClientInstance:
             publish.msg_queue_list = route.get_all_message_queue(topic)
         return True
 
-    def get_topic_publish_info(self, topic: str) -> TopicPublishInfo:
+    def get_topic_publish_info(self, topic: str, is_default: bool = False) -> TopicPublishInfo:
         with self.topic_route_lock:
             info = self.topic_publish_info_table.get(topic)
             if info is not None and info.ok():
                 return info
-        self.update_topic_route_info_from_name_server(topic)
+        self.update_topic_route_info_from_name_server(topic, is_default=is_default)
         with self.topic_route_lock:
             info = self.topic_publish_info_table.get(topic)
             if info is None or not info.ok():
@@ -702,6 +749,55 @@ class MQClientInstance:
                 if a and a not in addrs:
                     addrs.append(a)
         return addrs
+
+    def get_consumer_id_list_by_group(self, topic: str, consumer_group: str,
+                                      timeout_millis: int = 5000) -> Optional[List[str]]:
+        """查询消费组内所有 clientId（对应 Java MQClientInstance.findConsumerIdList）。
+
+        Java 取该 topic 路由里的 master broker 发 GET_CONSUMER_LIST_BY_GROUP(38)：
+        所有客户端都会向集群内每台 broker 心跳注册，故任取一台即持有**完整**消费者列表。
+        查不到（无路由 / 非 SUCCESS / 异常）返回 None；调用方按 Java 语义「保留当前分配」，
+        不要回退成"自己独占全部队列"（那会让多实例互相重复消费）。
+        """
+        try:
+            addr = self._broker_addr_for_topic(topic)
+        except MQClientException as e:
+            logger.debug("get_consumer_id_list_by_group: no broker for topic %s: %s", topic, e)
+            return None
+        header = GetConsumerListByGroupRequestHeader()
+        header.consumer_group = consumer_group
+        request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP,
+                                                         header)
+        try:
+            response = self._invoke_sync(addr, request, timeout_millis)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("get_consumer_id_list_by_group failed, %s %s: %s",
+                         addr, consumer_group, e)
+            return None
+        if response.code != ResponseCode.SUCCESS or response.body is None:
+            return None
+        try:
+            body = GetConsumerListByGroupResponseBody.decode(response.body)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("get_consumer_id_list_by_group decode failed: %s", e)
+            return None
+        return list(body.consumer_id_list)
+
+    def unregister_client_all_brokers(self, client_id: str, producer_group: str,
+                                      consumer_group: str, timeout_millis: int = 5000) -> None:
+        """向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）。
+
+        Java 在生产者/消费者 shutdown 时会逐台 broker 发 UNREGISTER_CLIENT(35)。
+        不发的话 broker 端 Producer/ConsumerManager 只能等心跳超时（默认 ~120s）清理，
+        期间事务回查、消费者变更通知仍可能发往已退出的实例。
+        单台失败只记 debug —— shutdown 路径不应因网络抖动抛异常。
+        """
+        for addr in self.get_route_of_all_brokers():
+            try:
+                self.unregister_client(addr, client_id, producer_group, consumer_group,
+                                       timeout_millis)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("unregister_client failed, addr=%s: %s", addr, e)
 
 
 __all__ = ["MQClientInstance", "TopicPublishInfo"]

@@ -25,6 +25,7 @@ from ..remoting.protocol.codes import RequestCode
 from ..remoting.protocol.headers import (CheckTransactionStateRequestHeader,
                                          EndTransactionRequestHeader)
 from ..remoting.protocol.heartbeat import HeartbeatData, ProducerData
+from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .exception import MQBrokerException, MQClientException
@@ -148,9 +149,6 @@ class DefaultMQProducer:
         self.rpc_hook = rpc_hook
         self.topics = list(topics) if topics else []
         self.name_server_addrs: List[str] = []
-        self._namespace_mode = False
-        if namespace:
-            self._namespace_mode = True
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
         self._lock = threading.Lock()
@@ -213,6 +211,10 @@ class DefaultMQProducer:
                 raise MQClientException("name server address is not set")
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
+            # 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start:375
+            # setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
+            if self.namespace:
+                self.producer_group = NamespaceUtil.wrap_namespace(self.namespace, self.producer_group)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
@@ -309,6 +311,30 @@ class DefaultMQProducer:
         sys_flag = MessageSysFlag.COMPRESSED_FLAG
         return MessageSysFlag.set_compression_type(sys_flag, self.compress_type)
 
+    def _with_namespace(self, topic: str) -> str:
+        """给 topic 拼上命名空间前缀（对应 Java ClientConfig.withNamespace）。
+
+        Java 在每个 ``DefaultMQProducer.send*`` 公开入口都做 ``msg.setTopic(withNamespace(...))``，
+        broker 侧看到的资源名是 ``<namespace>%<topic>``；生产者组在 ``start()`` 里同样被包装。
+        """
+        if not self.namespace:
+            return topic
+        return NamespaceUtil.wrap_namespace(self.namespace, topic)
+
+    def _topic_publish_info(self, topic: str) -> "TopicPublishInfo":
+        """对应 Java DefaultMQProducerImpl.tryToFindTopicPublishInfo。
+
+        先拉**真实**路由；只有确实拉不到（新 topic 尚未在 NameServer 注册）时才按 Java 的做法
+        回退到默认 topic（TBW102）为该 topic 合成发布信息，否则新 topic 的**首条**消息没队列可选。
+        消费者路径不做这个兜底（理由见 MQClientInstance.update_topic_route_info_from_name_server）。
+        """
+        client = self._require_client()
+        client.register_topic_in_use(topic)
+        try:
+            return client.get_topic_publish_info(topic)
+        except MQClientException:
+            return client.get_topic_publish_info(topic, is_default=True)
+
     # ---------------- 正常发送 ----------------
     def send(self, msg: Message, timeout_millis: Optional[int] = None,
              mq: Optional[MessageQueue] = None) -> SendResult:
@@ -317,6 +343,7 @@ class DefaultMQProducer:
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         if isinstance(msg, (list, tuple)):
             return self._send_batch(list(msg), mq, timeout)
+        msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
         # 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
         # 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
@@ -327,7 +354,7 @@ class DefaultMQProducer:
         last_exc = None
         for attempt in range(self.retry_times_when_send_failed + 1):
             try:
-                publish = client.get_topic_publish_info(msg.topic)
+                publish = self._topic_publish_info(msg.topic)
                 selected = publish.select_one_message_queue()
                 mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
                 return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
@@ -350,13 +377,14 @@ class DefaultMQProducer:
     def send_oneway(self, msg: Message, mq: Optional[MessageQueue] = None) -> None:
         """单向发送（对应 Java sendOneway）。"""
         client = self._require_client()
+        msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
         sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
             client.send_message_oneway(self.producer_group, msg, mq,
                                        self._need_addr(client, mq), self.send_msg_timeout, sys_flag)
             return
-        publish = client.get_topic_publish_info(msg.topic)
+        publish = self._topic_publish_info(msg.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
         client.send_message_oneway(self.producer_group, msg, mq_sel,
@@ -367,7 +395,8 @@ class DefaultMQProducer:
         """使用 MessageQueueSelector 选择队列发送（对应 Java send(msg, selector, arg)）。"""
         client = self._require_client()
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
-        publish = client.get_topic_publish_info(msg.topic)
+        msg.topic = self._with_namespace(msg.topic)
+        publish = self._topic_publish_info(msg.topic)
         selected = selector.select(publish.msg_queue_list, msg, arg)
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
         # 选择器用的是原始消息（topic/业务字段），压缩只影响 body
@@ -382,12 +411,14 @@ class DefaultMQProducer:
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         if not msgs:
             raise MQClientException("message list is empty")
+        for m in msgs:
+            m.topic = self._with_namespace(m.topic)
         batch = MessageBatch.generate_from_list(msgs)
         # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
         sys_flag = self.try_to_compress_message(batch)
         if mq is not None:
             return client.send_message(self.producer_group, batch, mq, timeout, sys_flag)
-        publish = client.get_topic_publish_info(batch.topic)
+        publish = self._topic_publish_info(batch.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(batch.topic, selected.broker_name, selected.queue_id)
         return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag)
@@ -419,6 +450,7 @@ class DefaultMQProducer:
         """
         if listener is None:
             raise MQClientException("tranExecutor is null", None)
+        msg.topic = self._with_namespace(msg.topic)
 
         # Java ensureNotDelayedForTransactional：事务消息不支持任何形式的延迟投递
         # Java ensureNotDelayedForTransactional：事务消息不支持延迟投递。
@@ -442,7 +474,7 @@ class DefaultMQProducer:
         # 回查时按此 listener 回调（broker 通过 PGROUP 属性定位到本生产者）
         self._transaction_listener = listener
 
-        publish = client.get_topic_publish_info(msg.topic)
+        publish = self._topic_publish_info(msg.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
 

@@ -13,16 +13,19 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, List, Optional, Set
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from ..common.message import MessageExt, MessageQueue
+from ..common.message_const import MessageConst
 from ..common.mix_all import MixAll
 from ..common.subscription_data import ExpressionType, FilterAPI, SubscriptionData
 from ..common.sysflag import MessageSysFlag, PullSysFlag
 from ..logging import get_logger
 from ..remoting.exception import RemotingException, RemotingTimeoutException
+from ..remoting.protocol.codes import RequestCode
 from ..remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
-                                           HeartbeatData, MessageModel)
+                                           ConsumerData, HeartbeatData, MessageModel)
+from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.rpchook import RPCHook
 from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus,
                               ConsumeOrderlyContext, ConsumeOrderlyStatus,
@@ -32,6 +35,15 @@ from .exception import MQBrokerException, MQClientException
 from .mq_client import MQClientInstance
 
 logger = get_logger()
+
+
+def _mq_sort_key(mq: MessageQueue):
+    """队列排序键，语义对齐 Java MessageQueue.compareTo：topic → brokerName → queueId。
+
+    Java rebalance 会先把 mqAll/cidAll 排序再分配；顺序不一致会让不同实例算出
+    不同的分配结果（同一队列被两个实例同时消费）。
+    """
+    return (mq.topic, mq.broker_name, mq.queue_id)
 
 
 class MessageSelector:
@@ -183,6 +195,21 @@ class DefaultMQPushConsumer:
         self._lock_thread: Optional[threading.Thread] = None
         self._rebalance_thread: Optional[threading.Thread] = None
         self._queue_threads: Dict[str, threading.Thread] = {}
+        # ---- 真实 rebalance（对齐 Java RebalanceImpl）----
+        # _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
+        # 由 _do_rebalance() 按 LOCK/分配策略计算；_rebalance_now 用于
+        # NOTIFY_CONSUMER_IDS_CHANGED(40) 触发的即时 rebalance（Java rebalanceImmediately）。
+        self._assigned: List[MessageQueue] = []
+        self._rebalance_now = threading.Event()
+        # start() 时刻：rebalance 循环在启动阶段用更短的间隔重试（见 _rebalance_loop）
+        self._start_time = time.time()
+        # ---- 消费者心跳（对齐 Java heartbeatBrokerInterval 默认 30s）----
+        # 必需：broker 的 ConsumerManager 只有收到心跳才记录消费组里的 clientId，
+        # rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
+        self.heartbeat_enabled = True
+        self.heartbeat_interval_millis = 30000
+        self._heartbeat_count = 0
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -199,6 +226,19 @@ class DefaultMQPushConsumer:
 
     def set_consume_from_where(self, where: str) -> None:
         self.consume_from_where = where
+
+    def set_consume_timestamp(self, timestamp: str) -> None:
+        """设置 CONSUME_FROM_TIMESTAMP 的起点时间（对应 Java setConsumeTimestamp）。
+
+        格式 ``yyyyMMddHHmmss``（Java UtilAll.YYYY_MM_DD_HH_MM_SS），默认 30 分钟前。
+        """
+        self.consume_timestamp = timestamp
+
+    def _consume_timestamp_millis(self) -> int:
+        try:
+            return int(time.mktime(time.strptime(self.consume_timestamp, "%Y%m%d%H%M%S")) * 1000)
+        except (ValueError, TypeError):
+            return int(time.time() * 1000 - 30 * 60 * 1000)
 
     def set_consume_thread_nums(self, n: int) -> None:
         self.consume_thread_min = max(1, n)
@@ -219,6 +259,7 @@ class DefaultMQPushConsumer:
     # ---------------- 订阅 ----------------
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
         self._assert_not_started()
+        topic = self._with_namespace(topic)
         sub = FilterAPI.build_subscription_data(topic, sub_expression)
         if sub is None:
             sub = SubscriptionData(topic=topic, sub_string="*")
@@ -228,6 +269,7 @@ class DefaultMQPushConsumer:
 
     def subscribe_with_selector(self, topic: str, selector: MessageSelector) -> None:
         self._assert_not_started()
+        topic = self._with_namespace(topic)
         sub = SubscriptionData(topic=topic, sub_string=selector.expression)
         sub.expression_type = selector.type
         if selector.type == ExpressionType.TAG:
@@ -238,7 +280,13 @@ class DefaultMQPushConsumer:
 
     def unsubscribe(self, topic: str) -> None:
         with self._lock:
-            self.subscription_data.pop(topic, None)
+            self.subscription_data.pop(self._with_namespace(topic), None)
+
+    def _with_namespace(self, topic: str) -> str:
+        """topic 拼命名空间前缀（对应 Java DefaultMQPushConsumer.subscribe(withNamespace(topic))）。"""
+        if not self.namespace:
+            return topic
+        return NamespaceUtil.wrap_namespace(self.namespace, topic)
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
@@ -251,6 +299,11 @@ class DefaultMQPushConsumer:
                 raise MQClientException("subscription is not set, call subscribe() first")
             if self.message_listener is None:
                 raise MQClientException("message listener is not set")
+            # 消费组也拼命名空间（对齐 Java DefaultMQPushConsumer.start:763
+            # setConsumerGroup(withNamespace(consumerGroup))）。必须在算重试主题之前：
+            # 重试主题 = %RETRY% + 带前缀的组名（Java MixAll.getRetryTopic(wrappedGroup)）。
+            if self.namespace:
+                self.consumer_group = NamespaceUtil.wrap_namespace(self.namespace, self.consumer_group)
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
@@ -258,6 +311,7 @@ class DefaultMQPushConsumer:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
             self._started = True
+            self._start_time = time.time()
             self._stop.clear()
             # 集群模式自动订阅重试 topic（对齐 Java copySubscription →
             # retryTopic = MixAll.getRetryTopic(consumerGroup)），broker 重投的消息写到这里
@@ -267,6 +321,24 @@ class DefaultMQPushConsumer:
                     sub = SubscriptionData(topic=retry_topic, sub_string="*")
                     sub.tags_set.add("*")
                     self.subscription_data[retry_topic] = sub
+            # 注册 broker 主动通知：消费者上下线时立刻重算分配
+            # （对齐 Java ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
+            self._mq_client.remoting_client.register_processor(
+                RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._on_consumer_ids_changed)
+        # 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
+        # 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
+        # 心跳必须在 rebalance 之前：rebalance 要向 broker 查消费者列表。
+        self._refresh_routes()
+        try:
+            self._send_heartbeat_to_all_broker()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("initial heartbeat failed: %s", e)
+        # 首轮分配必须同步完成：否则拉取线程会在空分配集上白转，直到第一轮 rebalance 才生效
+        try:
+            self._do_rebalance()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("initial rebalance failed: %s", e)
+        self._start_heartbeat_loop()
         self._start_pull_loop()
         self._start_dispatch_loop()
         self._start_offset_persist_loop()
@@ -295,10 +367,18 @@ class DefaultMQPushConsumer:
                     self._require_client().unlock_batch_mq(self.consumer_group, self.client_id or "", mqs)
             except Exception as e:  # noqa: BLE001
                 logger.debug("unlock on shutdown failed: %s", e)
+        # 优雅注销（对齐 Java MQClientInstance.unregisterClient）：立刻从各 broker 的
+        # ConsumerManager 摘除，不必等心跳超时（默认 ~120s）——否则这段时间内
+        # 消费者变更通知/事务回查仍可能发往本已退出的实例。
+        try:
+            self._require_client().unregister_client_all_brokers(
+                self.client_id or "", "", self.consumer_group)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("unregister on shutdown failed: %s", e)
         with self._lock:
             self._started = False
         for t in (self._persist_thread, self._lock_thread, self._dispatch_thread,
-                  self._rebalance_thread):
+                  self._rebalance_thread, self._heartbeat_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=2)
         for t in list(self._queue_threads.values()):
@@ -324,6 +404,86 @@ class DefaultMQPushConsumer:
             raise MQClientException("consumer not started, call start() first")
         return self._mq_client
 
+    # ---------------- 心跳（消费者注册） ----------------
+    def _refresh_routes(self) -> None:
+        """订阅 topic 的路由拉一遍，顺带把 broker 地址表填上（心跳要靠它）。
+
+        同时把订阅 topic 登记为「在用」，交给 MQClientInstance 的后台任务周期刷新路由
+        （对应 Java 的 MQConsumerInner.subscriptions() → updateTopicRouteInfoFromNameServer()）。
+        这样新 topic 被 broker 创建、队列扩容等变化无需等下一次 rebalance 才发现。
+        """
+        client = self._require_client()
+        with self._lock:
+            topics = list(self.subscription_data.keys())
+        for topic in topics:
+            client.register_topic_in_use(topic)
+            try:
+                client.get_topic_publish_info(topic)
+            except MQClientException as e:  # noqa: BLE001
+                logger.debug("refresh route for %s failed: %s", topic, e)
+
+    def _build_heartbeat(self) -> HeartbeatData:
+        hb = HeartbeatData(self.client_id or "")
+        cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_PASSIVELY,
+                          self.message_model, self.consume_from_where)
+        with self._lock:
+            subs = list(self.subscription_data.values())
+        for sub in subs:
+            cd.subscription_data_set.add(sub)
+        hb.consumer_data_set.add(cd)
+        return hb
+
+    def _send_heartbeat_to_all_broker(self) -> int:
+        """向所有已知 broker 发心跳（对齐 Java MQClientInstance.sendHeartbeatToAllBrokerWithLock）。
+
+        消费者**必须**注册到 broker：broker 的 ConsumerManager 只有收到心跳才知道
+        消费组里有哪些 clientId，rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
+        本实现此前从未发消费者心跳（订阅靠 pull 请求里的 subscription 属性带过去），
+        因为当时队列分配是"全给自己"所以没暴露；一旦做真实 rebalance，
+        消费者列表为空就分不到任何队列。返回成功台数，供真机验证断言。
+        """
+        client = self._require_client()
+        hb = self._build_heartbeat()
+        ok = 0
+        for addr in client.get_route_of_all_brokers():
+            try:
+                client.send_heartbeat(addr, hb, 5000)
+                ok += 1
+            except Exception as e:  # noqa: BLE001
+                logger.debug("heartbeat to %s failed: %s", addr, e)
+        if ok > 0:
+            self._heartbeat_count += 1
+        return ok
+
+    def heartbeat_count(self) -> int:
+        """心跳成功轮数（真机验证用）。"""
+        return self._heartbeat_count
+
+    def assigned_queue_count(self) -> int:
+        """当前分给本实例的队列数（真机验证多实例分配用）。"""
+        return len(self._assigned_queues())
+
+    def assigned_queue_keys(self) -> List[str]:
+        """当前分配队列的 key 列表（真机验证"同组两实例不重不漏"用）。"""
+        return sorted(self._mq_key(mq) for mq in self._assigned_queues())
+
+    def _start_heartbeat_loop(self) -> None:
+        t = threading.Thread(target=self._heartbeat_loop, daemon=True,
+                             name="rmq-heartbeat-%s" % self.consumer_group)
+        t.start()
+        self._heartbeat_thread = t
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._stop.wait(self.heartbeat_interval_millis / 1000.0):
+                break
+            if not self.heartbeat_enabled or not self._started:
+                continue
+            try:
+                self._send_heartbeat_to_all_broker()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("heartbeat loop error: %s", e)
+
     # ---------------- 消费循环 ----------------
     def _start_pull_loop(self) -> None:
         self._pulling = True
@@ -333,8 +493,15 @@ class DefaultMQPushConsumer:
         self._rebalance_pull_threads()
 
     def _rebalance_pull_threads(self) -> None:
-        """按当前分配的队列同步拉取线程集（简化 rebalance 的线程侧实现）。"""
+        """按当前分配的队列同步拉取线程集，并清理被撤销队列的状态。
+
+        对齐 Java ``RebalanceImpl.updateProcessQueueTableInRebalance``：队列被撤走时必须
+        ①persist 该队列**已消费**位点 ②丢弃 ProcessQueue（在途消息不再消费，交新属主重投）
+        ③顺序消费集群模式还要 UNLOCK_BATCH_MQ。少任何一步，被撤销队列里的在途消息都会被
+        **旧实例继续消费**，与新属主重复（真机 S6 多出重复消息的根因）。
+        """
         current = {self._mq_key(mq): mq for mq in self._assigned_queues()}
+        revoked: List[Tuple[MessageQueue, Optional[int]]] = []
         with self._lock:
             for key, mq in current.items():
                 if key in self._queue_threads:
@@ -346,35 +513,154 @@ class DefaultMQPushConsumer:
             for key in list(self._queue_threads.keys()):
                 if key not in current:
                     self._queue_threads.pop(key, None)  # 循环内检测到退出
+                    mq = self._mq_map.pop(key, None)
+                    self._pending.pop(key, None)
+                    self._lock_ok.discard(key)
+                    off = self._consume_offsets.pop(key, None)
+                    self._offset_table.pop(key, None)
+                    if mq is not None:
+                        revoked.append((mq, off))
+        # 网络/落盘在锁外做
+        if revoked:
+            self._on_queues_revoked(revoked)
+
+    def _on_queues_revoked(self, revoked: List[Tuple[MessageQueue, Optional[int]]]) -> None:
+        """被撤销队列的收尾（对应 Java RebalanceImpl.removeUnnecessaryMessageQueue）。"""
+        broadcast = self.message_model == MessageModel.BROADCASTING
+        if broadcast:
+            # 广播模式位点只存本地
+            self._save_local_offsets()
+            return
+        client = self._mq_client
+        if client is None:
+            return
+        for mq, off in revoked:
+            if off is not None:
+                try:
+                    client.update_consumer_offset(self.consumer_group, mq, off)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("persist offset on revoke failed for %s: %s", mq, e)
+            if self._is_orderly():
+                # 顺序消费：释放 broker 队列锁，新属主才能立刻接上
+                try:
+                    client.unlock_batch_mq(self.consumer_group, self.client_id or "", [mq])
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("unlock on revoke failed for %s: %s", mq, e)
+        logger.info("queues revoked, group=%s count=%d", self.consumer_group, len(revoked))
+
+    def _owns_queue(self, key: str) -> bool:
+        """本线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。"""
+        with self._lock:
+            return self._queue_threads.get(key) is threading.current_thread()
 
     @staticmethod
     def _mq_key(mq: MessageQueue) -> str:
         return "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
 
-    def _assigned_queues(self) -> List[MessageQueue]:
-        """简化 rebalance：本进程所有订阅 topic 的全部队列。"""
+    def _all_queues_of_topic(self, topic: str) -> List[MessageQueue]:
+        """topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。"""
         client = self._require_client()
-        result: List[MessageQueue] = []
+        try:
+            publish = client.get_topic_publish_info(topic)
+        except MQClientException as e:  # noqa: BLE001
+            logger.debug("rebalance: no route for topic %s: %s", topic, e)
+            return []
+        return [MessageQueue(topic, mq.broker_name, mq.queue_id) for mq in publish.msg_queue_list]
+
+    def _assigned_queues(self) -> List[MessageQueue]:
+        """当前分给本实例的队列集（_do_rebalance 计算，对应 Java ProcessQueueTable 的键集）。"""
+        with self._lock:
+            return list(self._assigned)
+
+    def _do_rebalance(self) -> None:
+        """按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步拉取线程集。
+
+        BROADCASTING：全部队列都归自己（不做 broker 协调）。
+        CLUSTERING：查 broker 上的消费者列表 → 排序 → 分配策略 → 取本实例那一份。
+        查不到消费者列表时**保留现有分配**（Java 仅告警；绝不回退成"独占全部队列"，
+        否则同组多实例会互相重复消费）。
+        """
+        client = self._require_client()
+        was = {self._mq_key(mq) for mq in self._assigned_queues()}
+        assigned: List[MessageQueue] = []
         with self._lock:
             topics = list(self.subscription_data.keys())
-        for topic in topics:
+        if self.message_model == MessageModel.BROADCASTING:
+            for topic in topics:
+                assigned.extend(self._all_queues_of_topic(topic))
+        else:
+            for topic in topics:
+                mq_all = sorted(self._all_queues_of_topic(topic), key=_mq_sort_key)
+                if not mq_all:
+                    continue
+                cid_all = client.get_consumer_id_list_by_group(topic, self.consumer_group)
+                if not cid_all:
+                    logger.debug("rebalance: no consumer id list for %s/%s, keep current",
+                                 self.consumer_group, topic)
+                    assigned.extend([mq for mq in self._assigned_queues() if mq.topic == topic])
+                    continue
+                try:
+                    got = self.allocate_strategy.allocate(
+                        self.consumer_group, self.client_id or "", mq_all, sorted(cid_all))
+                except Exception as e:  # noqa: BLE001
+                    logger.error("allocate message queue exception, strategy=%s: %s",
+                                 self.allocate_strategy.__class__.__name__, e)
+                    return
+                assigned.extend(got)
+        with self._lock:
+            self._assigned = assigned
+        now = {self._mq_key(mq) for mq in assigned}
+        if now != was:
+            logger.info("rebalance result changed, group=%s clientId=%s assigned=%d",
+                        self.consumer_group, self.client_id, len(assigned))
+        # 新分配的队列**立刻**解析初始位点（对齐 Java RebalanceImpl.updateProcessQueueTableInRebalance：
+        # 新队列 removeDirtyOffset → computePullFromWhereWithException → offsetStore.updateOffset）。
+        # 不能留到第一次拉取时才惰性解析：CONSUME_FROM_LAST_OFFSET 的语义是"分配时刻的最新位点"，
+        # 惰性解析会把「分配之后、首次拉取之前」新产生的消息一并跳过（真机上表现为消费者一直收不到）。
+        for mq in assigned:
+            key = self._mq_key(mq)
+            if key in was:
+                continue
+            with self._lock:
+                if key in self._offset_table:
+                    continue
+                sub = self.subscription_data.get(mq.topic)
+            if sub is None:
+                continue
             try:
-                publish = client.get_topic_publish_info(topic)
-                for mq in publish.msg_queue_list:
-                    mq2 = MessageQueue(topic, mq.broker_name, mq.queue_id)
-                    if mq2 not in result:
-                        result.append(mq2)
-            except MQClientException as e:  # noqa: BLE001
-                logger.debug("assigned_queues: skip topic %s: %s", topic, e)
-        return result
+                off = self._resolve_initial_offset(client, mq, sub)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("resolve initial offset for %s failed: %s", mq, e)
+                continue
+            with self._lock:
+                self._offset_table.setdefault(key, off)
+        self._rebalance_pull_threads()
+
+    def _on_consumer_ids_changed(self, cmd, addr) -> None:  # noqa: ARG002
+        """broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。"""
+        logger.debug("notify consumer ids changed from %s, rebalance immediately", addr)
+        self._rebalance_now.set()
 
     def _rebalance_loop(self) -> None:
-        """周期刷新分配集，为新增队列补拉取线程（对应 Java doRebalance 的简化版）。"""
-        while not self._stop.wait(5.0):
+        """周期重算分配（对齐 Java RebalanceService 默认 20s），或被通知时立即重算。
+
+        启动阶段且**当前没有任何分配**时缩短为 2s 重试：消费者可能先于 topic 被创建启动
+        （``autoCreateTopicEnable`` 下 broker 由生产者的首次发送建 topic），此时真实路由还
+        拉不到——消费端不做默认 topic 兜底（见 MQClientInstance.update_topic_route_info_
+        from_name_server），死等 20s 会长时间不消费。该快速重试只在启动后 60s 内生效，
+        避免长期订阅了不存在 topic 的客户端持续高频打 NameServer。
+        """
+        while not self._stop.is_set():
+            starting_up = (time.time() - self._start_time) < 60.0
+            interval = 2.0 if (starting_up and not self._assigned) else 20.0
+            self._rebalance_now.wait(interval)
+            self._rebalance_now.clear()
+            if self._stop.is_set() or not self._started:
+                break
             try:
-                self._rebalance_pull_threads()
+                self._do_rebalance()
             except Exception as e:  # noqa: BLE001
-                logger.debug("rebalance pull threads error: %s", e)
+                logger.debug("rebalance error: %s", e)
 
     def _queue_pull_loop(self, mq: MessageQueue) -> None:
         """单队列拉取循环：长轮询拉取 → 推入待消费缓冲（Java PullMessageService+ProcessQueue）。"""
@@ -382,23 +668,19 @@ class DefaultMQPushConsumer:
         orderly = self._is_orderly()
         key = self._mq_key(mq)
         while not self._stop.is_set() and self._started:
+            if not self._owns_queue(key):
+                return
             with self._lock:
-                still_assigned = key in self._queue_threads and self._queue_threads[key] is threading.current_thread()
                 sub = self.subscription_data.get(mq.topic)
-            if not still_assigned or sub is None:
+            if sub is None:
                 return
             # 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
             if orderly and key not in self._lock_ok:
                 time.sleep(0.2)
                 continue
-            # 流控（对齐 Java ProcessQueue.putMessage 的 pullThresholdForQueue 检查）：
-            # 已拉未消费的条数超过阈值就暂停本队列拉取
-            with self._lock:
-                pending_n = len(self._pending.get(key, ()))
-            if pending_n >= max(1, self.pull_threshold_for_queue):
-                self._flow_control_triggered += 1
-                logger.debug("flow control: queue %s pending=%d >= threshold=%d, pause pull",
-                             mq, pending_n, self.pull_threshold_for_queue)
+            # 流控（对齐 Java ProcessQueue.putMessage / checkReconsumeTimes）：
+            # 条数 / 字节数 / topic 级累计 / 并发跨度任一超限就暂停本队列拉取
+            if self._flow_control_hit(mq, key):
                 time.sleep(0.1)
                 continue
             offset = self._offset_table.get(key)
@@ -436,16 +718,66 @@ class DefaultMQPushConsumer:
                 time.sleep(0.5)
                 continue
 
+            # 入队与"是否仍持有该队列"的判断必须原子：长轮询期间被 rebalance 撤走的队列，
+            # 这批消息按 Java 语义（ProcessQueue.isDropped()）**直接丢弃**——不消费、不推进位点，
+            # 由新属主从我们最后持久化的位点重投，否则两实例会重复消费同一条消息。
             with self._lock:
+                if self._queue_threads.get(key) is not threading.current_thread():
+                    logger.debug("queue %s revoked during pull, discard %d fetched messages",
+                                 mq, len(result.msg_found_list or ()))
+                    return
                 if key not in self._pending:
                     self._pending[key] = deque()
                     self._mq_map[key] = mq
-            if result.status == PullStatus.FOUND and result.msg_found_list:
-                with self._lock:
+                if result.status == PullStatus.FOUND and result.msg_found_list:
                     self._pending[key].extend(result.msg_found_list)
-            # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
-            if result.next_begin_offset is not None:
-                self._offset_table[key] = result.next_begin_offset
+                # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
+                if result.next_begin_offset is not None:
+                    self._offset_table[key] = result.next_begin_offset
+
+    def _flow_control_hit(self, mq: MessageQueue, key: str) -> bool:
+        """是否触发流控（对齐 Java ProcessQueue.putMessage 的五个阈值检查）。
+
+        - ``pull_threshold_for_queue``：本队列已拉未消费**条数**（默认 1000）
+        - ``pull_threshold_size_for_queue``：本队列已拉未消费**字节数 MB**（默认 100）
+        - ``pull_threshold_for_topic`` / ``pull_threshold_size_for_topic``：同 topic 全部队列累计（-1 关闭）
+        - ``consume_concurrently_max_span``：已拉未消费消息 queueOffset 的**跨度**（默认 2000，
+          防止"某条消息一直消费失败、后面的堆着"导致位点跨度失控）
+        """
+        with self._lock:
+            dq = list(self._pending.get(key, ()))
+        size_mb = 0.0
+        span = 0
+        for m in dq:
+            size_mb += getattr(m, "store_size", 0)
+        size_mb /= (1024.0 * 1024.0)
+        if dq:
+            offsets = [m.queue_offset for m in dq]
+            span = max(offsets) - min(offsets)
+        reason = ""
+        if len(dq) >= max(1, self.pull_threshold_for_queue):
+            reason = "count=%d" % len(dq)
+        elif self.pull_threshold_size_for_queue > 0 and size_mb >= self.pull_threshold_size_for_queue:
+            reason = "size=%.1fMB" % size_mb
+        elif self.consume_concurrently_max_span > 0 and span > self.consume_concurrently_max_span:
+            reason = "span=%d" % span
+        elif self.pull_threshold_for_topic > 0 or self.pull_threshold_size_for_topic > 0:
+            with self._lock:
+                topic_pending = [m for k, q in self._pending.items()
+                                 if k in self._mq_map and self._mq_map[k].topic == mq.topic
+                                 for m in q]
+            if (self.pull_threshold_for_topic > 0
+                    and len(topic_pending) >= self.pull_threshold_for_topic):
+                reason = "topicCount=%d" % len(topic_pending)
+            elif self.pull_threshold_size_for_topic > 0:
+                topic_mb = sum(getattr(m, "store_size", 0) for m in topic_pending) / (1024.0 * 1024.0)
+                if topic_mb >= self.pull_threshold_size_for_topic:
+                    reason = "topicSize=%.1fMB" % topic_mb
+        if not reason:
+            return False
+        self._flow_control_triggered += 1
+        logger.debug("flow control: queue %s %s, pause pull", mq, reason)
+        return True
 
     def _resolve_initial_offset(self, client: MQClientInstance, mq: MessageQueue,
                                 sub: SubscriptionData) -> int:
@@ -471,7 +803,11 @@ class DefaultMQPushConsumer:
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
             return client.get_min_offset(mq)
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
-            return client.search_offset_by_timestamp(mq, int(time.time() * 1000 - 30 * 60 * 1000))
+            return client.search_offset_by_timestamp(mq, self._consume_timestamp_millis())
+        if NamespaceUtil.is_retry_topic(mq.topic):
+            # Java RebalancePushImpl:181-182：首次消费且无已提交位点时，%RETRY% 主题从 0 开始
+            # （重试消息要全量重试），而不是从最大位点跳过
+            return 0
         # 默认 CONSUME_FROM_LAST_OFFSET
         return client.get_max_offset(mq)
 
@@ -490,13 +826,15 @@ class DefaultMQPushConsumer:
             for key in keys:
                 if self._stop.is_set() or not self._started:
                     return
-                mq = self._mq_map.get(key)
-                if mq is None:
-                    continue
+                # 取值与"是否仍持有该队列"必须同一把锁内完成：key 是本轮开始时的快照，
+                # 队列可能已被 rebalance 撤走（那时缓冲已被清理，不能再消费）
                 with self._lock:
+                    mq = self._mq_map.get(key)
                     dq = self._pending.get(key)
-                    batch = [dq.popleft() for _ in range(min(len(dq) if dq else 0,
-                                                             max(1, self.consume_message_batch_max_size)))]
+                    if mq is None or dq is None or not dq:
+                        continue
+                    n = min(len(dq), max(1, self.consume_message_batch_max_size))
+                    batch = [dq.popleft() for _ in range(n)]
                 if not batch:
                     continue
                 try:
@@ -514,10 +852,26 @@ class DefaultMQPushConsumer:
             if not progressed:
                 time.sleep(0.05)
 
+    def _reset_retry_topic_and_namespace(self, msgs: List[MessageExt]) -> None:
+        """对应 Java DefaultMQPushConsumerImpl.resetRetryAndNamespace（分发前调用）。
+
+        重投消息实际存在 ``%RETRY%consumerGroup`` 下，broker 会把原始 topic 写进
+        ``RETRY_TOPIC`` 属性。Java 在交给 listener **之前**用它把 topic 还原，
+        listener 才能看到业务原始 topic；不做的话用户按 topic 分支的代码会走错。
+        """
+        group_topic = MixAll.get_retry_topic(self.consumer_group)
+        for msg in msgs:
+            retry_topic = msg.get_property(MessageConst.PROPERTY_RETRY_TOPIC)
+            if retry_topic and msg.topic == group_topic:
+                msg.topic = retry_topic
+            if self.namespace:
+                msg.topic = NamespaceUtil.without_namespace(msg.topic, self.namespace)
+
     def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt]) -> bool:
         """消费一个批次并处理回投/挂起。返回消费位点是否前进。"""
         listener = self.message_listener
         broadcast = self.message_model == MessageModel.BROADCASTING
+        self._reset_retry_topic_and_namespace(batch)
         # ---- 顺序消费（Java ConsumeMessageOrderlyService）----
         if self._is_orderly():
             ocontext = ConsumeOrderlyContext(mq)

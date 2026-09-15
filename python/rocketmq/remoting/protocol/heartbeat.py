@@ -53,20 +53,20 @@ class ConsumerData:
         self.message_model = message_model
         self.consume_from_where = consume_from_where
         self.subscription_data_set: Set[SubscriptionData] = set()
-        self.consume_timestamp = int(time.time() * 1000)
         self.unit_mode = False
-        self.max_reconsume_times = 0
 
     def to_dict(self) -> dict:
+        """对齐 Java 5.x ConsumerData 字段（**没有** 4.x 的 consumeTimestamp /
+        maxReconsumeTimes）；subscriptionDataSet 用 SubscriptionData.to_dict()，
+        不能直接 __dict__（那是 snake_case 键 + set 类型，JSON 也序列化不了）。
+        """
         return {
             "groupName": self.group_name,
             "consumeType": self.consume_type,
             "messageModel": self.message_model,
             "consumeFromWhere": self.consume_from_where,
-            "subscriptionDataSet": [s.__dict__ for s in self.subscription_data_set],
-            "consumeTimestamp": self.consume_timestamp,
+            "subscriptionDataSet": [s.to_dict() for s in self.subscription_data_set],
             "unitMode": self.unit_mode,
-            "maxReconsumeTimes": self.max_reconsume_times,
         }
 
     @staticmethod
@@ -74,13 +74,12 @@ class ConsumerData:
         cd = ConsumerData(d.get("groupName", ""), d.get("consumeType", ConsumeType.CONSUME_PASSIVELY),
                           d.get("messageModel", MessageModel.CLUSTERING),
                           d.get("consumeFromWhere", ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET))
-        cd.consume_timestamp = int(d.get("consumeTimestamp", 0))
         cd.unit_mode = d.get("unitMode", False) or False
-        cd.max_reconsume_times = int(d.get("maxReconsumeTimes", 0))
         for sd in d.get("subscriptionDataSet") or []:
             sub = SubscriptionData(sd.get("topic"), sd.get("subString"))
             sub.sub_version = int(sd.get("subVersion", 0))
             sub.expression_type = sd.get("expressionType", "TAG")
+            sub.class_filter_mode = bool(sd.get("classFilterMode", False))
             sub.tags_set = set(sd.get("tagsSet") or [])
             sub.code_set = set(int(v) for v in (sd.get("codeSet") or []))
             cd.subscription_data_set.add(sub)
@@ -98,10 +97,15 @@ class HeartbeatData:
         self.consumer_data_set: Set[ConsumerData] = set()
 
     def to_dict(self) -> dict:
+        # heartbeatFingerprint 故意留 0：broker 见到 0 走 V1 注册路径（用完整
+        # subscriptionDataSet 注册），最稳妥；非 0 才会进 heartBeatV2 优化。
+        # withoutSub 同理（Java 字段 isWithoutSub，fastjson2 名是 withoutSub）。
         return {
             "clientID": self.client_id,
             "producerDataSet": [p.to_dict() for p in self.producer_data_set],
             "consumerDataSet": [c.to_dict() for c in self.consumer_data_set],
+            "heartbeatFingerprint": 0,
+            "withoutSub": False,
         }
 
     @staticmethod

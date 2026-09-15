@@ -27,6 +27,7 @@ from rocketmq.client.consumer import (ConsumeConcurrentlyStatus,
                                       MessageListenerConcurrently,
                                       MessageListenerOrderly,
                                       SimpleMessageListener)
+from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.common.message import Message
 
@@ -80,6 +81,22 @@ def start_consumer(group: str, topic: str, collector: Collector,
     return c
 
 
+def prepare_topic(topic: str, queues: int = 4) -> None:
+    """按真实用法先把 topic 建出来，再启动消费者。
+
+    消费者**不做默认 topic 兜底**（对齐 Java：只有生产者才会用 TBW102 为新 topic 合成
+    发布信息）。topic 不存在时消费者拿不到路由 → 不分配队列 → 不消费，而且消费者要等
+    下一次 30s 心跳才会被 broker 登记（Java 同样），分配还要再往后。真实环境里 topic
+    由管理员或首次发送预先创建，这里显式建出来，避免测出"实现没问题但等超时"的假失败。
+    """
+    c = MQClientInstance("setup-%d" % int(time.time() * 1000), [NAMESRV])
+    c.start()
+    try:
+        c.create_topic_in_route(topic, queues, queues)
+    finally:
+        c.shutdown()
+
+
 def main() -> int:
     producer = DefaultMQProducer(PREFIX + "_pg")
     producer.set_namesrv_addr(NAMESRV)
@@ -88,6 +105,7 @@ def main() -> int:
 
     # ---------- S1 回投 ----------
     topic1 = PREFIX + "_Retry"
+    prepare_topic(topic1)
     group1 = PREFIX + "_g1"
     c1 = DefaultMQPushConsumer(group1)
     seen1 = []
@@ -111,7 +129,9 @@ def main() -> int:
     producer.send(Message(topic1, b"retry-me"))
     producer.send(Message(topic1, b"normal-1"))
     print("S1: 已发送，等待回投（延迟梯度 level3≈10s）...")
-    time.sleep(22)
+    # 回投消息落在 %RETRY%group 主题，该主题由 broker 在首次回投时才创建；
+    # 消费者要等下一轮 rebalance（对齐 Java 的 20s）才会分配它的队列，故窗口给足。
+    time.sleep(30)
     c1.shutdown()
     retry_arrivals = [r for r in seen1 if r[0] == b"retry-me"]
     normal_arrivals = [r for r in seen1 if r[0] == b"normal-1"]
@@ -128,9 +148,16 @@ def main() -> int:
         check("S1-回投有延迟梯度(>=8s)", False, "不足两次投递")
     check("S1-正常消息只投一次", len(normal_arrivals) == 1,
           "arrivals=%d" % len(normal_arrivals))
+    # 重投消息实际存在 %RETRY%group 下；对齐 Java resetRetryAndNamespace 后，
+    # listener 看到的 topic 应被还原成业务原始 topic（否则用户按 topic 分支会走错）
+    retried = [r for r in retry_arrivals if r[2] >= 1]
+    check("S1-重投消息 topic 还原为原始 topic",
+          bool(retried) and all(r[1] == topic1 for r in retried),
+          "topics=%s" % sorted({r[1] for r in retried}))
 
     # ---------- S2 位点持久化 ----------
     topic2 = PREFIX + "_Offset"
+    prepare_topic(topic2)
     group2 = PREFIX + "_g2"
     c2 = DefaultMQPushConsumer(group2)
     col2 = Collector(c2)
@@ -160,6 +187,7 @@ def main() -> int:
 
     # ---------- S3 顺序消费 + broker 锁 ----------
     topic3 = PREFIX + "_Orderly"
+    prepare_topic(topic3)
     group3 = PREFIX + "_g3"
     c3 = DefaultMQPushConsumer(group3)
     got3 = []
@@ -186,6 +214,7 @@ def main() -> int:
 
     # ---------- S4 广播模式 ----------
     topic4 = PREFIX + "_Bc"
+    prepare_topic(topic4)
     group4 = PREFIX + "_g4"
 
     def make_broadcast_consumer(inst_name: str) -> Collector:
@@ -209,6 +238,7 @@ def main() -> int:
 
     # ---------- S5 流控 ----------
     topic5 = PREFIX + "_Flow"
+    prepare_topic(topic5)
     group5 = PREFIX + "_g5"
     c5 = DefaultMQPushConsumer(group5)
     got5 = []
@@ -234,6 +264,166 @@ def main() -> int:
     c5.shutdown()
     check("S5-慢消费下消息全部到达", len(got5) == 10, "got=%d" % len(got5))
     check("S5-流控触发计数>0", fc > 0, "triggered=%d" % fc)
+
+    # ---------- S6 集群多实例 rebalance（队列分配） ----------
+    # 两个同组实例订阅同一 topic：broker 端消费者列表应有 2 个 clientId，
+    # 队列按 AllocateMessageQueueAveragely 拆分；每条消息**只被消费一次**。
+    topic6 = PREFIX + "_Rebalance"
+    group6 = PREFIX + "_g6"
+    # 先把 topic 建出来（8 队列）并等路由传播，否则消费者启动时无路由，
+    # 分配要等到下一轮 20s rebalance 才稳定（测试会读到中间态）
+    created = False
+    try:
+        setup = MQClientInstance("setup-%d" % int(time.time() * 1000), [NAMESRV])
+        setup.start()
+        setup.create_topic_in_route(topic6, 8, 8)
+        setup.shutdown()
+        created = True
+    except Exception as e:  # noqa: BLE001
+        print("S6: 预建 topic 失败（改用自动创建）: %s" % e)
+    ca = DefaultMQPushConsumer(group6)
+    ca.set_instance_name("inst-a")
+    ca.set_namesrv_addr(NAMESRV)
+    rec_a = []
+    rec_b = []
+    lk6 = threading.Lock()
+
+    def make_listener(bucket):
+        class L(MessageListenerConcurrently):
+            def consume_message(self, msgs, context):
+                with lk6:
+                    bucket.extend(bytes(m.body) for m in msgs)
+                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
+
+        return L()
+
+    ca.set_message_listener(make_listener(rec_a))
+    ca.subscribe(topic6, "*")
+    ca.start()
+
+    cb = DefaultMQPushConsumer(group6)
+    cb.set_instance_name("inst-b")
+    cb.set_namesrv_addr(NAMESRV)
+    cb.set_message_listener(make_listener(rec_b))
+    cb.subscribe(topic6, "*")
+    cb.start()
+    # 等分配稳定：交集为空 + 两边都非空 + 主 topic 队列被完整覆盖
+    # （最多等 45s，覆盖 20s 的 rebalance 周期；分配集合里还含 %RETRY% 队列，故按主 topic 校验）
+    deadline = time.time() + 45
+    asg_a = asg_b = 0
+    keys_a, keys_b = [], []
+    expected_keys = set()
+    while time.time() < deadline:
+        keys_a = set(ca.assigned_queue_keys())
+        keys_b = set(cb.assigned_queue_keys())
+        asg_a, asg_b = len(keys_a), len(keys_b)
+        expected_keys = {ca._mq_key(mq) for mq in ca._all_queues_of_topic(topic6)}
+        covered = expected_keys and (keys_a | keys_b) >= expected_keys
+        if asg_a > 0 and asg_b > 0 and not (keys_a & keys_b) and covered:
+            break
+        time.sleep(2)
+    hb_a = ca.heartbeat_count()
+    cid_list = ca._require_client().get_consumer_id_list_by_group(topic6, group6) or []
+    n6 = 40
+    for i in range(n6):
+        producer.send(Message(topic6, b"rb-%d" % i))
+    time.sleep(15)
+    total6 = len(rec_a) + len(rec_b)
+    all6 = rec_a + rec_b
+    dup6 = len(all6) - len(set(all6))
+    covered_n = len((keys_a | keys_b) & expected_keys)
+    ca.shutdown()
+    cb.shutdown()
+    check("S6-消费者已心跳注册", hb_a > 0 and len(cid_list) == 2,
+          "heartbeats=%d brokerCids=%d" % (hb_a, len(cid_list)))
+    check("S6-队列不重不漏(a=%d,b=%d,交集=%d,覆盖=%d/%d)"
+          % (asg_a, asg_b, len(keys_a & keys_b), covered_n, len(expected_keys)),
+          asg_a > 0 and asg_b > 0 and not (keys_a & keys_b)
+          and expected_keys and (keys_a | keys_b) >= expected_keys)
+    check("S6-消息无重复消费", dup6 == 0 and total6 == n6,
+          "got=%d/%d dup=%d" % (total6, n6, dup6))
+
+    # ---------- S7 优雅注销 ----------
+    # shutdown 时应发 UNREGISTER_CLIENT，broker 端立刻摘除，不必等心跳超时（~120s）。
+    # 查询用独立的探针客户端（消费者 shutdown 后其内部客户端也已关闭）。
+    probe = MQClientInstance("probe-%d" % int(time.time() * 1000), [NAMESRV])
+    probe.start()
+    group7 = PREFIX + "_g7"
+    qc = DefaultMQPushConsumer(group7)
+    qc.set_instance_name("inst-c")
+    qc.set_namesrv_addr(NAMESRV)
+    qc.set_message_listener(make_listener([]))
+    qc.subscribe(topic6, "*")
+    qc.start()
+    time.sleep(3)
+    cid7 = qc.client_id
+    list_before = probe.get_consumer_id_list_by_group(topic6, group7) or []
+    qc.shutdown()
+    time.sleep(2)
+    list_after = probe.get_consumer_id_list_by_group(topic6, group7) or []
+    probe.shutdown()
+    check("S7-shutdown 已注销 clientId",
+          cid7 in list_before and cid7 not in list_after,
+          "before=%d after=%d" % (len(list_before), len(list_after)))
+
+    # ---------- S8 命名空间隔离 ----------
+    # 带 namespace 的客户端把资源名拼成 "<ns>%<topic>" 再发给 broker（Java NamespaceUtil），
+    # listener 拿到的 topic 应还原成业务原始 topic；不带 namespace 的客户端读不到该消息。
+    ns = PREFIX + "_NS"
+    raw_topic = PREFIX + "_NsTopic"
+    ns_topic = ns + "%" + raw_topic          # broker 侧真实主题名
+    prepare_topic(ns_topic)
+    group8 = PREFIX + "_g8"
+
+    p8 = DefaultMQProducer(PREFIX + "_pg8", namespace=ns)
+    p8.set_namesrv_addr(NAMESRV)
+
+    n8 = []
+    n8_plain = []
+    seen8_topics = []
+    lk8 = threading.Lock()
+
+    class NsListener(MessageListenerConcurrently):
+        def __init__(self, bucket):
+            self.bucket = bucket
+
+        def consume_message(self, msgs, context):
+            with lk8:
+                self.bucket.extend(bytes(m.body) for m in msgs)
+                seen8_topics.extend(m.topic for m in msgs)
+            return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
+
+    c8 = DefaultMQPushConsumer(group8, namespace=ns)
+    c8.set_namesrv_addr(NAMESRV)
+    c8.set_message_listener(NsListener(n8))
+    c8.subscribe(raw_topic, "*")
+    c8.start()
+    # 反证：不带 namespace 的消费者订阅同名 raw_topic，读的是另一个主题，不该收到
+    c8p = DefaultMQPushConsumer(PREFIX + "_g8p")
+    c8p.set_namesrv_addr(NAMESRV)
+    c8p.set_message_listener(NsListener(n8_plain))
+    c8p.subscribe(raw_topic, "*")
+    c8p.start()
+
+    # 消费者必须先于发送启动：CONSUME_FROM_LAST_OFFSET 从「消费者启动时刻」的最新位点开始
+    # （Java 同样），先发后起会把消息跳过。等分配就绪（位点已在分配时解析）再发。
+    time.sleep(5)
+    p8.start()
+    p8.send(Message(raw_topic, b"ns-1"))
+
+    deadline = time.time() + 25
+    while time.time() < deadline and not any(b == b"ns-1" for b in n8):
+        time.sleep(1)
+    time.sleep(3)
+    c8.shutdown()
+    c8p.shutdown()
+    p8.shutdown()
+    check("S8-命名空间消费者收到消息", any(b == b"ns-1" for b in n8),
+          "got=%s" % [b.decode() for b in n8])
+    check("S8-无命名空间消费者收不到(隔离)", not any(b == b"ns-1" for b in n8_plain),
+          "got=%s" % [b.decode() for b in n8_plain])
+    check("S8-topic 还原为业务原始名", bool(seen8_topics) and all(t == raw_topic for t in seen8_topics),
+          "topics=%s" % sorted(set(seen8_topics)))
 
     producer.shutdown()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
