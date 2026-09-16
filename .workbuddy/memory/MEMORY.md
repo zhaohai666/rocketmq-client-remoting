@@ -41,3 +41,26 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
   `decode_message` 捕获后**返回 None / false**（丢弃消息）——而不是把压缩流当正文交出去。
 - **Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，砍掉最高位**，与标准 CRC-32 差正好 2^31。
   跨语言对 CRC 只看各自的 `match` 字段，别比数字。
+
+## 与 Java 客户端仍存在的差距（P1 收官后，2026-09-16 盘点）
+已对齐 Java：两阶段事务、真实 rebalance + 队列撤销收尾 + 分配时解析初始位点、回投 / 位点持久化 /
+顺序锁 / 广播 / 流控、`resetRetryAndNamespace`、优雅注销、`UNREGISTER_CLIENT`、路由 30s 刷新、压缩。
+仍缺（grep 验证：`namespace_util`/`AclRPCHook` 仅 Python 有，其余三侧 grep 命中只在 admin 代码）：
+
+| 能力 | 严重度 | Py | C++ | .NET | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 命名空间包裹 (withNamespace) | P1 正确性 | ✅ | ❌ | ❌ | C++/.NET 生产/消费不做 NS 包裹 → NS 集群 topic 解析错 |
+| ACL 鉴权 | P1 连通性 | ✅ | ❌ | ❌ | 仅 Python 有 AclRPCHook+SessionCredentials；C++/.NET 连不开 ACL 集群会鉴权失败 |
+| 主动拉取 PullConsumer | P2 | ✅ | ❌ | ❌ | 仅 Python 有完整实现 |
+| 故障规避 sendLatencyFaultEnable | P2 | ❌ | ❌ | ❌ | 三侧均无 broker 故障避让 |
+| POP 模式 (5.x 轻量消费) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
+| Request-Reply (5.x) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
+| 消息轨迹 Trace/Hook | P3 | ❌ | ❌ | ❌ | 三侧均无 |
+| TLS | P3 | ❌ | ❌ | ❌ | 仅明文 TCP |
+| 动态 name server (address server) | P3 | ❌ | ❌ | ❌ | 仅静态 namesrv 列表 |
+| 客户端统计 / metrics | P3 | ❌ | ❌ | ❌ | 无 |
+| 其它 broker 主动请求 | P3 | 部分 | 部分 | 部分 | 仅接 CHECK_TRANSACTION_STATE(39)；GET_CONSUMER_RUNNING_INFO(307) 等未接（admin 有 VIEW_MESSAGE 部分） |
+| 细粒度流控 / 线程弹性 | P3 | ❌ | ❌ | ❌ | 仅 pullThresholdForQueue；消费线程 min=max 固定 |
+
+注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。建议下一步优先补 **C++/.NET 的 namespace + ACL**
+（直接照搬 Python 的 `namespace_util.py` 与 `rpchook.py`），这是生产集群真会踩的两个硬伤。
