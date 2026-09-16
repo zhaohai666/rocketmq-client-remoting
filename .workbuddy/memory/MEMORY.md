@@ -6,17 +6,19 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 跨语言的关键约定与验证入口，避免重复。
 
 ## 目录
-- `python/rocketmq/` 参考实现 · `cpp/` C++（22 个 .cpp，含 Admin / 压缩）· `dotnet/` .NET 10（零 NuGet）。
+- `python/rocketmq/` 参考实现 · `cpp/` C++（24 个 .cpp，含 Admin / 压缩 / PullConsumer）·
+  `dotnet/` .NET 10（零 NuGet）。
 - 三侧已对齐 Java：**两阶段事务**（半消息 → END_TRANSACTION → broker 回查）、消费侧回投 / 位点持久化 /
   顺序锁 / 广播 / 流控、**真实 rebalance + 队列撤销收尾 + 重投 topic 还原 + 优雅注销 + 命名空间 +
-  ACL 鉴权**、压缩（zlib 跨客户端互通）。
+  ACL 鉴权 + 主动拉取 PullConsumer**、压缩（zlib 跨客户端互通）。
 
 ## 验证入口（改完必跑）
 - 技能 `rocketmq-cpp-build-verify/SKILL.md`：编译命令、9 个 ctest 用例与断言数、真机联调工具、全部坑位。
-- Python `pytest` 147 passed / 4 skipped；C++ ctest **9/9**（约 550 项断言）；.NET xunit **55/55**。
+- Python `pytest` 158 passed / 4 skipped；C++ ctest **9/9**（约 552 项断言）；.NET xunit **55/55**。
 - 真机（**起集群 + 等端口 + 跑测试 + kill 必须在同一条 Bash 命令里**，前台返回会回收后台 JVM）：
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
-  `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、**`run_acl_live.sh`**（开认证的集群）。
+  `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、**`run_acl_live.sh`**（开认证的集群）、
+  **`run_pull_live.sh`**（主动拉取消费者 S1–S7）。
 
 ## 跨语言硬性约定
 1. **字段名以 Java 为准**：broker 用 fastjson2 按 **Java 属性名**反序列化，错一个就**静默丢字段**。
@@ -45,6 +47,16 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
    `AccessKey`/`SecurityToken` 必须在算签名**之前**写进 extFields（它们参与签名）。钩子必须在
    **encode 之前**调用。Python 曾有钩子但**从未被调用**、算法也是自造的（=三侧都连不开 ACL 集群）。
    对拍向量固化在 `python/verify_acl_java_parity.py`（Java 官方实现输出）。
+10. **PullConsumer 的 sysFlag：`pull()` 是短轮询，不是长轮询**。Java
+   `DefaultMQPullConsumerImpl.pullSyncImpl(:248)` 是 `buildSysFlag(false /*commitOffset*/,
+   block /*suspend*/, true, false)` → `pull()` 的 block=false 所以 **suspend=false**，只有
+   `pullBlockIfNotFound` 才 suspend=true；**两者都不带 commitOffset 位**（位点由调用方自己
+   `update_consume_offset` 提交）。三侧（含 Python 参考实现）原先 pull() 也写了 suspend=true，
+   真机必现 5s `RemotingTimeoutException`（broker 挂起到 brokerSuspendMaxTimeMillis=20s）。
+   回归守卫：`python/tests/test_pull_consumer.py` 用 inspect 断言两个函数的 suspend 取值。
+11. **拉模式回投要复用"访问过该 topic"的那个 consumer**：`send_message_back` 靠
+   `broker_addr_of(msg.broker_name)` 反查路由表，新起的 consumer 路由表为空 →
+   "broker xxx not found"（Java 同理，走 `findBrokerAddressInPublish` 读 brokerAddrTable）。
 
 ## 两条"静默数据损坏"级的坑（最贵，别顺手优化）
 - **压缩两层语义缺一不可**：未支持的压缩类型（如 SNAPPY）`decompress` **抛异常**，且
@@ -52,26 +64,26 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 - **Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，砍掉最高位**，与标准 CRC-32 差正好 2^31。
   跨语言对 CRC 只看各自的 `match` 字段，别比数字。
 
-## 与 Java 客户端仍存在的差距（命名空间 + ACL 收官后，2026-09-16 盘点）
+## 与 Java 客户端仍存在的差距（命名空间 + ACL + PullConsumer 收官后，2026-09-16 盘点）
 已对齐 Java：两阶段事务、真实 rebalance + 队列撤销收尾 + 分配时解析初始位点、回投 / 位点持久化 /
 顺序锁 / 广播 / 流控、`resetRetryAndNamespace`、优雅注销、`UNREGISTER_CLIENT`、路由 30s 刷新、
-压缩、**命名空间包裹（三侧）**、**ACL 鉴权（三侧）**。
-仍缺（下表；两个 P1 硬伤已关闭，其余经 grep 确认仍缺）：
+压缩、**命名空间包裹（三侧）**、**ACL 鉴权（三侧）**、**主动拉取 PullConsumer（三侧）**。
+仍缺（下表；三个 P1/P2 已关闭，其余经 grep 确认仍缺）：
 
 | 能力 | 严重度 | Py | C++ | .NET | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| 主动拉取 PullConsumer | P2 | ✅ | ❌ | ❌ | 仅 Python 有完整实现 |
-| 故障规避 sendLatencyFaultEnable | P2 | ❌ | ❌ | ❌ | 三侧均无 broker 故障避让 |
+| 故障规避 sendLatencyFaultEnable | P2 | ⚠ 已接线未真机 | ❌ | ❌ | Python 有 MQFaultStrategy 并接入选队列（默认关）；C++/.NET 无 |
 | POP 模式 (5.x 轻量消费) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
 | Request-Reply (5.x) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
 | 消息轨迹 Trace/Hook | P3 | ❌ | ❌ | ❌ | 三侧均无 |
 | TLS | P3 | ❌ | ❌ | ❌ | 仅明文 TCP |
 | 动态 name server (address server) | P3 | ❌ | ❌ | ❌ | 仅静态 namesrv 列表 |
-| 客户端统计 / metrics | P3 | ❌ | ❌ | ❌ | 无 |
+| 客户端统计 / metrics | P3 | 部分 | ❌ | ❌ | Python 有 ClientMetrics 并接入 send |
 | 其它 broker 主动请求 | P3 | 部分 | 部分 | 部分 | 仅接 CHECK_TRANSACTION_STATE(39)；GET_CONSUMER_RUNNING_INFO(307) 等未接（admin 有 VIEW_MESSAGE 部分） |
 | 细粒度流控 / 线程弹性 | P3 | ❌ | ❌ | ❌ | 仅 pullThresholdForQueue；消费线程 min=max 固定 |
 
-注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。两个 P1 生产硬伤（命名空间 / ACL）已于
-2026-09-16 三侧补齐并真机验证（命名空间走 S8 隔离场景；ACL 走 `run_acl_live.sh` 的 S1–S7，三语言
-均 7/0）。下一步按 P2 推进：**C++/.NET 的 PullConsumer**、故障规避的真机验证（需注入 broker 故障），
-再往后是 POP / Request-Reply / Trace / TLS / 动态 name server。
+注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。三个硬伤（命名空间 / ACL / PullConsumer）已于
+2026-09-16 三侧补齐并真机验证（命名空间走 S8 隔离场景 19–21/0；ACL 走 `run_acl_live.sh` S1–S7 三语言 7/0；
+PullConsumer 走 `run_pull_live.sh` S1–S7 三语言 16/0）。下一步按 P2 推进：**POP 模式 / Request-Reply**
+（5.x 管道，工作量大）或先补 C++/.NET 的故障规避（照搬 Python `latency.py`），再往后是 Trace / TLS /
+动态 name server / 307 运行信息。
