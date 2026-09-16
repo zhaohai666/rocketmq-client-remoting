@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "rocketmq/client/mq_client.h"
+#include "rocketmq/client/request_reply.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/compression.h"
 #include "rocketmq/common/message.h"
@@ -102,6 +103,21 @@ public:
                    int32_t timeoutMillis = -1);
     void sendOneway(const Message& msg);
 
+    // ---------------- Request-Reply（5.x）----------------
+    // 同步 request：给请求消息写 CORRELATION_ID（随机 UUID）/ REPLY_TO_CLIENT（本客户端
+    // clientId）/ TTL（= timeout），发送后阻塞等应答，应答由 broker 经
+    // PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回（注册在 MQClientInstance 构造里）。
+    // 对应 Java DefaultMQProducerImpl#request(msg, timeout)。
+    // 超时抛 RequestTimeoutException（消息已发出但没等到应答）；
+    // 发送本身失败抛 MQClientException。REPLY_TO_CLIENT 要靠心跳登记 channel，
+    // 所以 start() 之后本实现会再补一次心跳（对齐 Java prepareSendRequest）。
+    void setRequestTimeout(int32_t millis) { requestTimeoutMillis_ = millis; }
+    int32_t requestTimeout() const { return requestTimeoutMillis_; }
+    // 不指定队列：轮询选择
+    Message request(const Message& msg, int32_t timeoutMillis = -1);
+    // 定点发送请求到指定队列
+    Message request(const Message& msg, const MessageQueue& mq, int32_t timeoutMillis = -1);
+
     // ---------------- 批量 ----------------
     SendResult sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis = -1);
 
@@ -129,6 +145,12 @@ protected:
     void checkMessage(const Message& msg) const;
     // 发送前给 topic 套上 namespace 前缀（对应 Java withNamespace）；namespace 为空原样返回。
     Message withNamespace(const Message& msg) const;
+    // request() 的公共收尾（两个公开重载都会走到这里；outbound 已过 withNamespace/checkMessage）
+    Message requestWithQueue(Message& outbound, const MessageQueue& mq, int32_t timeout);
+    // 对应 Java waitResponse：超时/发送失败分别抛 RequestTimeoutException / MQClientException
+    Message waitRequestResponse(const Message& outbound, int32_t timeout,
+                                const std::shared_ptr<RequestResponseFuture>& future,
+                                int64_t costMillis);
     // 对应 Java DefaultMQProducerImpl.tryToCompressMessage + sendKernelImpl 的 sysFlag 组装：
     // 满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sysFlag
     // （COMPRESSED_FLAG | 压缩类型位）；不压缩时返回 0。
@@ -173,6 +195,8 @@ protected:
     std::string createTopicKey_ = MixAll::DEFAULT_TOPIC;
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     int32_t sendMsgTimeout_ = 3000;
+    // Request-Reply 默认超时（对应 Java DefaultMQProducer 的 request 兜底 3000ms）
+    int32_t requestTimeoutMillis_ = DEFAULT_REQUEST_TIMEOUT_MILLIS;
     int32_t retryTimesWhenSendFailed_ = 2;
     int32_t maxMessageSize_ = 1024 * 1024 * 4;
     // 压缩配置，默认值与 Java DefaultMQProducer 一致

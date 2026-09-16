@@ -138,6 +138,29 @@ struct SendMessageResponseHeader : public CommandCustomHeader {
     void fromExtFields(const PropertyMap& ext) override;
 };
 
+// Request-Reply（5.x）：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回请求方，
+// 该 header 就是随 326 下发的（对应 Java ReplyMessageRequestHeader）。
+// ⚠ 与 Java 字段名逐字一致（broker 侧用 fastjson2 按属性名反序列化/序列化）。
+struct ReplyMessageRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> producerGroup;
+    std::optional<std::string> topic;
+    std::optional<std::string> defaultTopic;
+    std::optional<int32_t> defaultTopicQueueNums;
+    std::optional<int32_t> queueId;
+    std::optional<int32_t> sysFlag;
+    std::optional<int64_t> bornTimestamp;
+    std::optional<int32_t> flag;
+    std::optional<std::string> properties;
+    std::optional<int32_t> reconsumeTimes;
+    std::optional<bool> unitMode;
+    std::optional<std::string> bornHost;
+    std::optional<std::string> storeHost;
+    std::optional<int64_t> storeTimestamp;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
 // ------------------------------------------------ 拉取消息
 
 struct PullMessageRequestHeader : public CommandCustomHeader {

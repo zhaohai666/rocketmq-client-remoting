@@ -157,6 +157,66 @@ class SendMessageRequestHeaderV2(CommandCustomHeader):
         self.broker_name = ext.get("n")
 
 
+class ReplyMessageRequestHeader(CommandCustomHeader):
+    """broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
+
+    对应 Java ``org.apache.rocketmq.remoting.protocol.header.ReplyMessageRequestHeader``
+    （字段与 ``SendMessageRequestHeader`` 高度重合，但多了 bornHost/storeHost/storeTimestamp，
+    broker 的 ``ReplyMessageProcessor#pushReplyMessage`` 就是用它拼出来的）。
+    请求方收到后据此 + body 还原出真正的应答 MessageExt。
+    """
+
+    def __init__(self):
+        self.producer_group: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.default_topic: Optional[str] = None
+        self.default_topic_queue_nums: Optional[int] = None
+        self.queue_id: Optional[int] = None
+        self.sys_flag: Optional[int] = None
+        self.born_timestamp: Optional[int] = None
+        self.flag: Optional[int] = None
+        self.properties: Optional[str] = None
+        self.reconsume_times: Optional[int] = None
+        self.unit_mode: Optional[bool] = None
+        self.born_host: Optional[str] = None
+        self.store_host: Optional[str] = None
+        self.store_timestamp: Optional[int] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "producerGroup": self.producer_group,
+            "topic": self.topic,
+            "defaultTopic": self.default_topic,
+            "defaultTopicQueueNums": self.default_topic_queue_nums,
+            "queueId": self.queue_id,
+            "sysFlag": self.sys_flag,
+            "bornTimestamp": self.born_timestamp,
+            "flag": self.flag,
+            "properties": self.properties,
+            "reconsumeTimes": self.reconsume_times,
+            "unitMode": self.unit_mode,
+            "bornHost": self.born_host,
+            "storeHost": self.store_host,
+            "storeTimestamp": self.store_timestamp,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.producer_group = ext.get("producerGroup")
+        self.topic = ext.get("topic")
+        self.default_topic = ext.get("defaultTopic")
+        self.default_topic_queue_nums = _i(ext.get("defaultTopicQueueNums"))
+        self.queue_id = _i(ext.get("queueId"))
+        self.sys_flag = _i(ext.get("sysFlag"))
+        self.born_timestamp = _l(ext.get("bornTimestamp"))
+        self.flag = _i(ext.get("flag"))
+        self.properties = ext.get("properties")
+        self.reconsume_times = _i(ext.get("reconsumeTimes"))
+        self.unit_mode = _b(ext.get("unitMode"))
+        self.born_host = ext.get("bornHost")
+        self.store_host = ext.get("storeHost")
+        self.store_timestamp = _l(ext.get("storeTimestamp"))
+
+
 class SendMessageResponseHeader(CommandCustomHeader):
     def __init__(self):
         self.msg_id: Optional[str] = None

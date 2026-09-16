@@ -37,4 +37,18 @@ class MQQueueException(MQClientException):
     pass
 
 
-__all__ = ["MQClientException", "MQBrokerException", "MQTimeOutException", "MQQueueException"]
+class RequestTimeoutException(MQClientException):
+    """对应 Java ``RequestTimeoutException extends MQClientException``。
+
+    Request-Reply 专用语义：请求消息**已经发成功**，但在超时窗口内没等到应答。
+    与「发送本身失败」（会抛 MQClientException / RemotingException）区分开 ——
+    前者可能只是应答方没回，消息其实已经投递；后者连 broker 都没收到。
+    """
+
+    def __init__(self, message: str = "", response_code: Optional[int] = None,
+                 cause: Optional[Exception] = None):
+        super().__init__(message, response_code, cause)
+
+
+__all__ = ["MQClientException", "MQBrokerException", "MQTimeOutException", "MQQueueException",
+           "RequestTimeoutException"]

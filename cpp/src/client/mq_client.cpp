@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/request_reply.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/mix_all.h"
@@ -87,7 +88,18 @@ MQClientInstance::MQClientInstance(const std::string& clientId,
                                   const std::vector<std::string>& nameServerAddrs,
                                   int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis)
     : clientId_(clientId), nameServerAddrs_(nameServerAddrs),
-      remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)) {}
+      remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)) {
+    // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
+    // 对应 Java MQClientAPIImpl 构造函数里的
+    // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)
+    // —— 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），
+    // 所以注册在构造函数里。处理器绝不能在回调里同步发请求（回调在读线程上执行）。
+    remotingClient_->registerProcessor(
+        RequestCode::PUSH_REPLY_MESSAGE_TO_CLIENT,
+        [](const RemotingCommand& cmd, const std::string& addr) {
+            return processReplyMessage(cmd, addr);
+        });
+}
 
 MQClientInstance::~MQClientInstance() { shutdown(); }
 
@@ -361,8 +373,13 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     header->maxReconsumeTimes = 0;
     header->batch = msg.isBatch;
 
-    RemotingCommand request =
-        RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2, header);
+    // Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
+    // 而不是普通的 SEND_MESSAGE_V2(314)。broker 只在 324/325 上注册了
+    // ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT 把应答推回请求方）。
+    RemotingCommand request = RemotingCommand::createRequestCommand(
+        isReplyMessage(msg) ? RequestCode::SEND_REPLY_MESSAGE_V2
+                            : RequestCode::SEND_MESSAGE_V2,
+        header);
     request.body = msg.body;
     request.hasBody = true;
 
@@ -412,8 +429,10 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     header->maxReconsumeTimes = 0;
     header->batch = msg.isBatch;
 
-    RemotingCommand request =
-        RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2, header);
+    RemotingCommand request = RemotingCommand::createRequestCommand(
+        isReplyMessage(msg) ? RequestCode::SEND_REPLY_MESSAGE_V2
+                            : RequestCode::SEND_MESSAGE_V2,
+        header);
     request.body = msg.body;
     request.hasBody = true;
     request.markOnewayRpc();

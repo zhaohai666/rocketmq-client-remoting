@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,10 +30,15 @@ public:
     using InvokeCallback = std::function<void(const RemotingCommand&)>;
 
     // broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
-    // 对应 Java NettyRemotingAbstract 的 processor 表；返回值 void 表示「不回响应」，
-    // 与 Java ClientRemotingProcessor.checkTransactionState 返回 null 的语义一致
-    // （broker 侧是用 invokeOneway 发的，本来也不期待响应）。
-    using RequestProcessor = std::function<void(const RemotingCommand&, const std::string&)>;
+    // 对应 Java NettyRemotingAbstract 的 processor 表。返回值语义与 Java
+    // NettyRequestProcessor#processRequest 一致：
+    //   * 返回 std::nullopt —— 不回响应（Java 返回 null）。典型：事务回查
+    //     CHECK_TRANSACTION_STATE(39)，broker 侧用 invokeOneway 发的，本就不期待响应。
+    //   * 返回 RemotingCommand —— 把它作为响应写回（opaque 由框架填成请求的 opaque）。
+    //     典型：PUSH_REPLY_MESSAGE_TO_CLIENT(326)，broker 用 invokeSync **等**这个响应，
+    //     不回它 broker 侧会等到超时并在日志里记一条 push reply fail。
+    using RequestProcessor = std::function<std::optional<RemotingCommand>(
+        const RemotingCommand&, const std::string&)>;
 
     // 单帧上限（与 Java RemotingSysResponseCode / NettyRemotingClient 的 16MB 限制一致）
     static constexpr int32_t MAX_FRAME_LENGTH = 16 * 1024 * 1024;

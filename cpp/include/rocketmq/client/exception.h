@@ -36,6 +36,12 @@ struct MQBrokerException : public std::runtime_error {
     const std::string& getResponseMessage() const { return responseMessage; }
 };
 
+// 对应 Java org.apache.rocketmq.client.exception.RequestTimeoutException
+// （extends MQClientException）：request() 里「请求消息已发出但等应答超时」时抛。
+struct RequestTimeoutException : public MQClientException {
+    explicit RequestTimeoutException(const std::string& msg) : MQClientException(msg) {}
+};
+
 // 对应 Java MQClientException 的 "no route info" 等语义化子类（此处仅作语义标记）
 struct MQClientNoRouteException : public MQClientException {
     explicit MQClientNoRouteException(const std::string& topic)

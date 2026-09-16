@@ -28,13 +28,38 @@ from ..remoting.protocol.heartbeat import HeartbeatData, ProducerData
 from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
-from .exception import MQBrokerException, MQClientException
+from .exception import MQBrokerException, MQClientException, RequestTimeoutException
 from .latency import MQFaultStrategy
 from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
+from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
+                            RequestResponseFuture, create_correlation_id)
 from .send_result import SendResult, SendStatus
 
 logger = get_logger()
+
+
+class _NullSendCallback:
+    """request() 专用的空发送回调（对齐 Java 里给 sendDefaultImpl 传的那个匿名 SendCallback）。
+
+    它只负责把「发送成功/失败」写回 RequestResponseFuture，应答本身由 broker 的
+    326 推送投递，与这个回调无关。
+    """
+
+    def __init__(self, future: Optional[RequestResponseFuture] = None):
+        self.future = future
+
+    def on_success(self, send_result: SendResult) -> None:
+        if self.future is not None:
+            self.future.send_request_ok = True
+
+    def on_exception(self, e: BaseException) -> None:
+        if self.future is not None:
+            # 与 Java 的 onException 完全一致：三件事都要做。少了 put_response_message(None)
+            # 的话，等待方会一直阻塞到超时才抛错（明明是发送失败，却要等满 timeout）。
+            self.future.send_request_ok = False
+            self.future.put_response_message(None)
+            self.future.cause = e
 
 
 class MessageQueueSelector:
@@ -163,6 +188,9 @@ class DefaultMQProducer:
         self._mq_fault_strategy = MQFaultStrategy(False)
         # 基础客户端指标（send/consume RT 与计数）
         self.metrics = ClientMetrics()
+        # Request-Reply 的默认超时。Java 的 request(msg, timeout) 必须显式给 timeout，
+        # 这里额外提供一个可设置的默认值，方便脚本调用（语义与显式传参完全一致）。
+        self.request_timeout = DEFAULT_REQUEST_TIMEOUT_MILLIS
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -213,6 +241,10 @@ class DefaultMQProducer:
         """对应 Java DefaultMQProducer.setSendLatencyFaultEnable。默认关闭。"""
         self.send_latency_fault_enable = enable
         self._mq_fault_strategy.set_send_latency_fault_enable(enable)
+
+    def set_request_timeout(self, timeout_millis: int) -> None:
+        """设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。"""
+        self.request_timeout = timeout_millis
 
     def get_metrics(self) -> ClientMetrics:
         """返回本生产者的基础指标计数器（send/consume RT 与计数）。"""
@@ -394,6 +426,72 @@ class DefaultMQProducer:
             except (MQClientException, MQBrokerException, RemotingException) as e:
                 last_exc = e
         raise last_exc
+
+    def request(self, msg: Message, timeout_millis: Optional[int] = None,
+                mq: Optional[MessageQueue] = None) -> Message:
+        """Request-Reply（5.x）：发一条请求消息并**同步等应答**，返回应答消息。
+
+        对应 Java ``DefaultMQProducerImpl#request(msg, mq, timeout)``（:1738-1767）。
+        请求方做三件事：
+          1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（**本客户端 clientId**）、
+             TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
+          2. 把等待槽按 correlationId 登记到进程内的 REQUEST_FUTURE_HOLDER。
+          3. 发送后阻塞等待；应答由 broker 经 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回，
+             由 ``MQClientInstance._process_reply_message`` 投递进等待槽。
+
+        超时抛 ``RequestTimeoutException``（消息已发出但没等到应答）；
+        发送本身失败则抛 ``MQClientException``（带着底层 cause），与 Java 一致。
+
+        ``REPLY_TO_CLIENT`` 是 clientId —— broker 要靠它反查 channel，
+        所以本生产者必须先发过心跳（``start()`` 已起心跳线程；这里也会补一次，
+        对齐 Java ``prepareSendRequest`` 的 ``sendHeartbeatToAllBrokerWithLock``）。
+        """
+        timeout = timeout_millis if timeout_millis is not None else self.request_timeout
+        msg.topic = self._with_namespace(msg.topic)
+        self._check_message(msg)
+
+        correlation_id = create_correlation_id()
+        client = self._require_client()
+        msg.put_property(MessageConst.PROPERTY_CORRELATION_ID, correlation_id)
+        msg.put_property(MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT, client.client_id)
+        msg.put_property(MessageConst.PROPERTY_MESSAGE_TTL, str(timeout))
+
+        begin = time.time() * 1000.0
+        # 对齐 Java prepareSendRequest：确保路由已知，然后补一次心跳 ——
+        # 没在 broker 上登记为 producer，broker 就找不到 channel 把应答推回来。
+        try:
+            self._topic_publish_info(msg.topic)
+            self._send_heartbeat_to_all_broker()
+        except Exception:  # noqa: BLE001 — 拿不到路由就让下面的发送路径自己报错
+            logger.debug("request: prepare route/heartbeat failed", exc_info=True)
+
+        future = RequestResponseFuture(correlation_id, timeout)
+        REQUEST_FUTURE_HOLDER.put_request(correlation_id, future)
+        cost = int(time.time() * 1000.0 - begin)
+        try:
+            # 说明：Java 用 ASYNC 发送并等 latch；本实现的 send_async 是
+            # 「同步发送 + 立即回调」的包装，所以这里等价于同步发。
+            # 协议上无差别 —— 应答是 broker 通过**另一条** 326 通道推回来的，
+            # 与本次发送的 CommunicationMode 无关。
+            # 发送失败时回调会把 future 标成 !send_request_ok 并主动唤醒等待方。
+            self.send_async(msg, _NullSendCallback(future),
+                            timeout - cost if timeout > cost else timeout, mq)
+            return self._wait_request_response(msg, timeout, future, cost)
+        finally:
+            REQUEST_FUTURE_HOLDER.remove_request(correlation_id)
+
+    def _wait_request_response(self, msg: Message, timeout: int,
+                               future: RequestResponseFuture, cost: int) -> Message:
+        """对应 Java ``waitResponse``：超时/发送失败分别抛不同异常。"""
+        response = future.wait_response_message(timeout - cost)
+        if response is None:
+            if future.send_request_ok:
+                raise RequestTimeoutException(
+                    "send request message to <%s> OK, but wait reply message timeout, %d ms."
+                    % (msg.topic, timeout))
+            raise MQClientException(
+                "send request message to <%s> fail" % msg.topic, None, future.cause)
+        return response
 
     def send_async(self, msg: Message, callback: SendCallback,
                    timeout_millis: Optional[int] = None,

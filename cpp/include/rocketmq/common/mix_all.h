@@ -28,6 +28,12 @@ struct MixAll {
     static constexpr const char* RETRY_GROUP_TOPIC_PREFIX = "%RETRY%";
     static constexpr const char* DLQ_GROUP_TOPIC_PREFIX = "%DLQ%";
     static constexpr const char* REPLY_TOPIC_PREFIX = "%REPLY%";
+    // Request-Reply（5.x）：应答 topic 名 = <clusterName>_REPLY_TOPIC。
+    // ⚠ 注意与上面的 REPLY_TOPIC_PREFIX("%REPLY%") 不是一回事：后者是旧版
+    // 「消费者把消息回投到自己的 %REPLY%<topic>」的约定，5.x 的 request-reply 用的是下面这个。
+    static constexpr const char* REPLY_TOPIC_POSTFIX = "REPLY_TOPIC";
+    // 应答消息的 MSG_TYPE 属性值（Java MixAll.REPLY_MESSAGE_FLAG）
+    static constexpr const char* REPLY_MESSAGE_FLAG = "reply";
     static constexpr const char* SYSTEM_TOPIC_PREFIX = "rmq_sys_";
     static constexpr const char* TOOLS_CONSUMER_GROUP = "TOOLS_CONSUMER";
     static constexpr const char* FILTERSRV_CONSUMER_GROUP = "FILTERSRV_CONSUMER";
@@ -81,8 +87,11 @@ struct MixAll {
         return topic.rfind(DLQ_GROUP_TOPIC_PREFIX, 0) == 0;
     }
 
-    static std::string getReplyTopic(const std::string& topic) {
-        return std::string(REPLY_TOPIC_PREFIX) + topic;
+    // 对应 Java MixAll.getReplyTopic(clusterName) = clusterName + "_REPLY_TOPIC"。
+    // 该 topic 由 broker 在启动时注册为**系统 topic**（TopicConfigManager.init），
+    // 客户端不可 createTopic 建它（会被 INVALID_PARAMETER「conflict with system topic」拒）。
+    static std::string getReplyTopic(const std::string& clusterName) {
+        return clusterName + "_" + REPLY_TOPIC_POSTFIX;
     }
 
     static bool isSysTopic(const std::string& topic) {

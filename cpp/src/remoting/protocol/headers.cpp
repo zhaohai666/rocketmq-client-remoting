@@ -138,6 +138,44 @@ void SendMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
     msgRegion = getOptLong(ext, "msgRegion");
 }
 
+// ---------------------------------------------------------------- Request-Reply 应答推送
+
+PropertyMap ReplyMessageRequestHeader::toExtFields() const {
+    PropertyMap out;
+    putOptStr(out, "producerGroup", producerGroup);
+    putOptStr(out, "topic", topic);
+    putOptStr(out, "defaultTopic", defaultTopic);
+    putOptInt32(out, "defaultTopicQueueNums", defaultTopicQueueNums);
+    putOptInt32(out, "queueId", queueId);
+    putOptInt32(out, "sysFlag", sysFlag);
+    putOptInt(out, "bornTimestamp", bornTimestamp);
+    putOptInt32(out, "flag", flag);
+    putOptStr(out, "properties", properties);
+    putOptInt32(out, "reconsumeTimes", reconsumeTimes);
+    putOptBool(out, "unitMode", unitMode);
+    putOptStr(out, "bornHost", bornHost);
+    putOptStr(out, "storeHost", storeHost);
+    putOptInt(out, "storeTimestamp", storeTimestamp);
+    return out;
+}
+
+void ReplyMessageRequestHeader::fromExtFields(const PropertyMap& ext) {
+    producerGroup = getOptStr(ext, "producerGroup");
+    topic = getOptStr(ext, "topic");
+    defaultTopic = getOptStr(ext, "defaultTopic");
+    defaultTopicQueueNums = getOptInt(ext, "defaultTopicQueueNums");
+    queueId = getOptInt(ext, "queueId");
+    sysFlag = getOptInt(ext, "sysFlag");
+    bornTimestamp = getOptLong(ext, "bornTimestamp");
+    flag = getOptInt(ext, "flag");
+    properties = getOptStr(ext, "properties");
+    reconsumeTimes = getOptInt(ext, "reconsumeTimes");
+    unitMode = getOptBool(ext, "unitMode");
+    bornHost = getOptStr(ext, "bornHost");
+    storeHost = getOptStr(ext, "storeHost");
+    storeTimestamp = getOptLong(ext, "storeTimestamp");
+}
+
 // ---------------------------------------------------------------- 拉取消息
 
 PropertyMap PullMessageRequestHeader::toExtFields() const {

@@ -37,6 +37,11 @@ add_executable(rmq_test_acl test_acl.cpp)
 target_link_libraries(rmq_test_acl PRIVATE rocketmq::remoting)
 add_test(NAME acl COMMAND rmq_test_acl)
 
+# Request-Reply（5.x）：等待槽语义 + createReplyMessage 形状 + 326 回推入口（含迟到/坏包）
+add_executable(rmq_test_request_reply test_request_reply.cpp)
+target_link_libraries(rmq_test_request_reply PRIVATE rocketmq::remoting)
+add_test(NAME request_reply COMMAND rmq_test_request_reply)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

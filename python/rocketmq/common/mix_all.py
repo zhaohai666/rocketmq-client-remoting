@@ -32,6 +32,10 @@ class MixAll:
     RETRY_GROUP_TOPIC_PREFIX = "%RETRY%"
     DLQ_GROUP_TOPIC_PREFIX = "%DLQ%"
     REPLY_TOPIC_PREFIX = "%REPLY%"
+    # Request-Reply：应答 topic 名 = <cluster>_REPLY_TOPIC（Java MixAll.REPLY_TOPIC_POSTFIX）
+    REPLY_TOPIC_POSTFIX = "REPLY_TOPIC"
+    # Request-Reply：应答消息的 MSG_TYPE 属性值（Java MixAll.REPLY_MESSAGE_FLAG）
+    REPLY_MESSAGE_FLAG = "reply"
     SYSTEM_TOPIC_PREFIX = "rmq_sys_"
     TOOLS_CONSUMER_GROUP = "TOOLS_CONSUMER"
     FILTERSRV_CONSUMER_GROUP = "FILTERSRV_CONSUMER"
@@ -97,8 +101,14 @@ class MixAll:
         return topic is not None and topic.startswith(MixAll.DLQ_GROUP_TOPIC_PREFIX)
 
     @staticmethod
-    def get_reply_topic(topic: str) -> str:
-        return "%s%s" % (MixAll.REPLY_TOPIC_PREFIX, topic)
+    def get_reply_topic(cluster_name: str) -> str:
+        """对应 Java MixAll.getReplyTopic(clusterName) = clusterName + "_REPLY_TOPIC"。
+
+        Request-Reply 的应答消息就发到这个 topic 上（broker 会把 cluster 名写进
+        消息的 CLUSTER 属性，应答方据此拼出该 topic）。注意这**不是**控制台里那个
+        `%REPLY%<topic>` 前缀（那是另一套东西），本方法只用于 request-reply。
+        """
+        return "%s_%s" % (cluster_name, MixAll.REPLY_TOPIC_POSTFIX)
 
     @staticmethod
     def get_broker_circuit_breaker_consume_group() -> str:

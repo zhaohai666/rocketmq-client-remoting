@@ -24,6 +24,7 @@
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
+#include "rocketmq/remoting/protocol/codes.h"
 
 #ifndef _WIN32
 #include <fcntl.h>  // 非阻塞 connect 用（fcntl/F_GETFL/F_SETFL）
@@ -341,14 +342,26 @@ struct RemotingClient::Impl {
                 if (proc) {
                     // 处理器在读线程里执行：异常必须兜住，否则读线程会死掉，
                     // 导致该连接上其余响应全部丢失（比丢一条回查严重得多）。
+                    std::optional<RemotingCommand> resp;
                     try {
-                        proc(cmd, from);
+                        resp = proc(cmd, from);
                     } catch (const std::exception& e) {
                         logger_warn("remoting: processor for request code " +
                                     std::to_string(cmd.code) + " threw: " + e.what());
+                        resp = RemotingCommand::createResponseCommand(
+                            ResponseCode::SYSTEM_ERROR, "process request fail");
                     } catch (...) {
                         logger_warn("remoting: processor for request code " +
                                     std::to_string(cmd.code) + " threw unknown exception");
+                        resp = RemotingCommand::createResponseCommand(
+                            ResponseCode::SYSTEM_ERROR, "process request fail");
+                    }
+                    // 有返回值就回写（opaque 必须原样带回，broker 侧 invokeSync 靠它对上号）；
+                    // oneway 请求不回响应，与 Java NettyRemotingAbstract 的
+                    // `if (!cmd.isOnewayRpc()) { ... writeResponse ... }` 一致。
+                    if (resp.has_value() && !cmd.isOnewayRpc()) {
+                        resp->opaque = cmd.opaque;
+                        sendResponseByAddr(from, *resp);
                     }
                 } else {
                     // 没有注册处理器属于预期情况（未开启事务时 broker 不会发），别用 warn
@@ -401,8 +414,33 @@ struct RemotingClient::Impl {
         respTable.erase(opaque);
     }
 
-    void sendRequest(const std::string& addr, RemotingCommand& request) {
-        // RPC 钩子必须在 encode() **之前**执行：ACL 钩子把 AccessKey/Signature
+    // 把响应写回**已存在**的连接（不新建）。
+    //
+    // 用途：broker 主动请求（典型 PUSH_REPLY_MESSAGE_TO_CLIENT=326）的响应必须原路返回，
+    // 而 dispatch() 只有对端地址字符串，故这里按地址查连接表。连接已被关掉时只记一条
+    // warn —— 应答本身已经投递给业务了，丢一个响应不该影响读线程。
+    void sendResponseByAddr(const std::string& addr, RemotingCommand& response) {
+        std::shared_ptr<Connection> conn;
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            auto it = conns.find(addr);
+            if (it != conns.end()) {
+                conn = it->second;
+            }
+        }
+        if (conn == nullptr) {
+            logger_warn("remoting: cannot answer broker request from " + addr +
+                        ", connection is gone");
+            return;
+        }
+        Bytes data = response.encode();
+        std::lock_guard<std::mutex> wlk(conn->writeMutex);
+        if (!sendAll(conn->sock, data)) {
+            logger_warn("remoting: failed to write response to " + addr);
+        }
+    }
+
+    void sendRequest(const std::string& addr, RemotingCommand& request) {        // RPC 钩子必须在 encode() **之前**执行：ACL 钩子把 AccessKey/Signature
         // 写进 extFields，而签名覆盖的正是「即将上线的这份 extFields + body」。
         // 先取快照再调用，避免持锁跑钩子。
         if (auto hook = currentHook()) {

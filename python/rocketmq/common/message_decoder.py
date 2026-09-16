@@ -224,6 +224,17 @@ def _decompress(data: bytes, compression_type: int) -> bytes:
     raise _unsupported(compression_type)
 
 
+def decompress_body(data: bytes, compression_type: int) -> bytes:
+    """按压缩类型解压（``_decompress`` 的公开入口）。
+
+    除 ``decode_message`` 之外还有第二个调用方：Request-Reply 的应答是从
+    ``PUSH_REPLY_MESSAGE_TO_CLIENT(326)`` 直接推过来的裸包，不走消息解码路径，
+    需要自己按 ``sysFlag`` 判断并解压（对齐 Java
+    ``ClientRemotingProcessor#receiveReplyMessage`` 里的 Compressor 分支）。
+    """
+    return _decompress(data, compression_type)
+
+
 class _Lz4Codec:
     """LZ4 Frame 编解码器（Java lz4-java 的 Frame 格式）。
 

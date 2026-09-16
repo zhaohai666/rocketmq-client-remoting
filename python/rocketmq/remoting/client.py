@@ -14,6 +14,7 @@ from typing import Callable, Dict, Optional
 
 from .exception import (RemotingConnectException, RemotingSendRequestException,
                         RemotingTimeoutException)
+from .protocol.codes import ResponseCode
 from .protocol.remoting_command import RemotingCommand
 from ..logging import get_logger
 
@@ -212,21 +213,32 @@ class RemotingClient:
             return
         handler = self._processors.get(cmd.code)
         if handler is not None:
+            # 处理器**可以**返回一个响应命令（对应 Java NettyRequestProcessor#processRequest
+            # 的返回值）。需要返回的典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：
+            # broker 用 invokeSync 推应答，客户端不回响应它那边就会等到超时。
+            # 事务回查 39 是 oneway（Java 里 broker 用 invokeOneway），处理器返回 None 即可。
+            response = None
             try:
-                handler(cmd, addr)
+                response = handler(cmd, addr)
             except Exception:
                 logger.warning("processor for request code %s raised", cmd.code, exc_info=True)
+                response = RemotingCommand.create_response_command(
+                    ResponseCode.SYSTEM_ERROR, "process request fail", None)
+            if response is not None and not cmd.is_oneway_rpc():
+                response.opaque = cmd.opaque
+                self._write_response(addr, response)
         else:
             logger.debug("no processor registered for request code %s (opaque=%s) from %s",
                          cmd.code, cmd.opaque, addr)
 
     def register_processor(self, request_code: int,
-                           handler: Callable[["RemotingCommand", str], None]) -> None:
+                           handler: Callable[["RemotingCommand", str], Optional[RemotingCommand]]) -> None:
         """注册 broker 主动请求处理器（对应 Java NettyRemotingServer 的 processor 表）。
 
-        handler 签名 ``handler(cmd, addr) -> None``，其中 ``cmd`` 是解码后的
-        RemotingCommand（含 ext_fields / body），``addr`` 是对端（broker）地址。
-        当前仅用于事务回查 CHECK_TRANSACTION_STATE(39)；oneway 请求不需要回响应。
+        handler 签名 ``handler(cmd, addr) -> Optional[RemotingCommand]``：``cmd`` 是解码后的
+        RemotingCommand（含 ext_fields / body），``addr`` 是对端（broker）地址；
+        **返回非 None 就会把该命令作为响应写回**（opaque 由框架填成请求的 opaque），
+        返回 None 表示不需要响应（oneway 请求，如事务回查 CHECK_TRANSACTION_STATE(39)）。
 
         注意：仅当命令是「请求类型」且不在本地在途响应表里时才派发到这里，
         不会破坏现有 invokeSync/invokeAsync 的响应分发。
@@ -264,6 +276,24 @@ class RemotingClient:
     # ---------- 请求发送 ----------
     def _send(self, addr: str, cmd: RemotingCommand) -> None:
         self._apply_before_request_hooks(addr, cmd)
+        self._write(addr, cmd)
+
+    def _write_response(self, addr: str, cmd: RemotingCommand) -> None:
+        """把响应写回 broker。
+
+        **不能**走 ``_send``：``_send`` 会执行 RPC 钩子（ACL 会给请求加签），
+        而响应报文不需要也不能带签名（对齐 Java：``doBeforeRpcHooks`` 只在
+        invokeSync/invokeAsync/invokeOneway 三条主动发起路径上调用）。
+        写失败只记日志：这条响应对应 broker 侧的 ``Broker2Client.callClient`` 超时，
+        不该让读线程因为这个异常退出（读线程一死，同连接上所有在途请求全丢）。
+        """
+        try:
+            self._write(addr, cmd)
+        except Exception:
+            logger.warning("remoting: failed to write response (code=%s) to %s",
+                           cmd.code, addr, exc_info=True)
+
+    def _write(self, addr: str, cmd: RemotingCommand) -> None:
         sock = self._get_or_create_conn(addr)
         data = cmd.encode()
         with self._sock_locks.get(addr, threading.Lock()):

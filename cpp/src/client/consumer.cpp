@@ -173,8 +173,10 @@ void DefaultMQPushConsumer::start() {
     // → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）。
     mqClient_->remotingClient().registerProcessor(
         RequestCode::NOTIFY_CONSUMER_IDS_CHANGED,
-        [this](const RemotingCommand& cmd, const std::string&) {
+        [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             this->onConsumerIdsChanged(cmd);
+            // 通知类请求（broker 用 oneway 发），不需要回响应。
+            return std::nullopt;
         });
 
     // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：

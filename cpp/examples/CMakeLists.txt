@@ -29,3 +29,7 @@ target_link_libraries(rmq_live_acl PRIVATE rocketmq::remoting)
 add_executable(rmq_live_pull live_pull.cpp)
 target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
 
+# Request-Reply（5.x）真机联调（请求 → 应答 → 326 推回；不打进 ctest）
+add_executable(rmq_live_request_reply live_rr.cpp)
+target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)
+

@@ -13,7 +13,10 @@ import time
 from typing import Dict, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
-from ..common.message_decoder import decode_messages, message_properties_2_string
+from ..common.message_const import MessageConst
+from ..common.message_decoder import (decode_messages, decompress_body,
+                                      message_properties_2_string,
+                                      string_2_message_properties)
 from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
 from ..common.topic_config import TopicFilterType
@@ -29,7 +32,8 @@ from ..remoting.protocol.headers import (CreateTopicRequestHeader,
                                          GetMinOffsetResponseHeader, PullMessageRequestHeader,
                                          PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
                                          QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader,
-                                         QueryMessageResponseHeader, SearchOffsetRequestHeader,
+                                         QueryMessageResponseHeader, ReplyMessageRequestHeader,
+                                         SearchOffsetRequestHeader,
                                          SearchOffsetResponseHeader, SendMessageRequestHeader,
                                          SendMessageRequestHeaderV2, SendMessageResponseHeader,
                                          UpdateConsumerOffsetRequestHeader)
@@ -37,6 +41,7 @@ from ..remoting.protocol.heartbeat import HeartbeatData
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.protocol.route import TopicRouteData
 from .exception import MQBrokerException, MQClientException
+from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
 from .send_result import SendResult, SendStatus
 
 logger = get_logger()
@@ -109,6 +114,12 @@ class MQClientInstance:
         self._topics_in_use: set = set()
         self._route_refresh_thread: Optional[threading.Thread] = None
         self._route_refresh_stop = threading.Event()
+        # Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
+        # 对应 Java MQClientAPIImpl 构造函数里的
+        # ``registerProcessor(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)``
+        # —— 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），所以在这里注册。
+        self.remoting_client.register_processor(
+            RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, self._process_reply_message)
         MQClientInstance.INSTANCE_MAP[client_id] = self
 
     # ---------------- 生命周期 ----------------
@@ -293,7 +304,13 @@ class MQClientInstance:
         header.unit_mode = False
         header.max_reconsume_times = 0
         header.batch = isinstance(msg, MessageBatch)
-        request = RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2, header)
+        # Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
+        # 而不是普通的 SEND_MESSAGE_V2(314)。broker 只在 324/325 上注册了
+        # ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT 把应答推回请求方）。
+        # 对齐 Java MQClientAPIImpl.sendMessage:550-558（sendSmartMsg 默认 true → V2）。
+        code = (RequestCode.SEND_REPLY_MESSAGE_V2 if is_reply_message(msg)
+                else RequestCode.SEND_MESSAGE_V2)
+        request = RemotingCommand.create_request_command(code, header)
         request.body = self._encode_body(msg)
         return request
 
@@ -324,6 +341,48 @@ class MQClientInstance:
                 transaction_id=header.transaction_id,
             )
         raise MQBrokerException(response.code, response.remark or "")
+
+    # ---------------- Request-Reply：接收 broker 推回的应答 ----------------
+    def _process_reply_message(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """处理 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：把应答交给等待中的 request()。
+
+        对应 Java ``ClientRemotingProcessor#receiveReplyMessage``（:222-271）。
+        与 Java 一样**必须回一个响应**：broker 侧 ``Broker2Client.callClient`` 是
+        ``invokeSync``（10s 超时），不回响应它那边就会超时并记 ``push reply message to
+        <id> fail``，应答虽然已经投递成功，broker 日志里却是失败。
+        """
+        header = ReplyMessageRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        try:
+            body = cmd.body or b""
+            # sysFlag 里带压缩标志时要先解压：326 推的是**裸包**，不走消息解码路径
+            # （对齐 Java 同处的 Compressor 分支）。
+            if MessageSysFlag.is_compressed(header.sys_flag or 0):
+                body = decompress_body(body, MessageSysFlag.get_compression_type(header.sys_flag or 0))
+            msg = MessageExt(topic=header.topic or "", body=body)
+            msg.queue_id = header.queue_id or 0
+            msg.store_timestamp = header.store_timestamp or 0
+            msg.flag = header.flag or 0
+            msg.born_timestamp = header.born_timestamp or 0
+            msg.reconsume_times = header.reconsume_times or 0
+            if header.born_host:
+                msg.born_host = header.born_host
+            if header.store_host:
+                msg.store_host = header.store_host
+            msg.properties = string_2_message_properties(header.properties)
+            msg.properties[MessageConst.PROPERTY_REPLY_MESSAGE_ARRIVE_TIME] = str(
+                int(time.time() * 1000))
+            correlation_id = msg.properties.get(MessageConst.PROPERTY_CORRELATION_ID)
+            if REQUEST_FUTURE_HOLDER.put_response(correlation_id, msg) is None:
+                # 查不到是正常情况（请求已超时 / 应答重复），Java 此处也是 warn
+                logger.warning("receive reply message, but not matched any request, "
+                               "CorrelationId: %s, reply from host: %s",
+                               correlation_id, header.born_host)
+            return RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("unknown err when receiveReplyMsg", exc_info=True)
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "process reply message fail: %s" % e, None)
 
     # ---------------- 消息拉取 ----------------
     def pull_message(self, consumer_group: str, mq: MessageQueue, queue_offset: int,

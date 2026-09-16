@@ -12,6 +12,7 @@
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
@@ -117,8 +118,11 @@ void DefaultMQProducer::start() {
     // 不注册的话 broker 回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 UNKNOW。
     mqClient_->remotingClient().registerProcessor(
         RequestCode::CHECK_TRANSACTION_STATE,
-        [this](const RemotingCommand& cmd, const std::string& addr) {
+        [this](const RemotingCommand& cmd, const std::string& addr)
+            -> std::optional<RemotingCommand> {
             this->checkTransactionState(cmd, addr);
+            // 不回响应：broker 用 invokeOneway 发回查，与 Java checkTransactionState 返回 null 一致。
+            return std::nullopt;
         });
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
@@ -316,6 +320,107 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     MessageQueue selected = publish->selectOneMessageQueue();
     const int32_t sysFlag = prepareForSend(outbound);
     c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
+}
+
+// ---------------------------------------------------------------- Request-Reply
+
+namespace {
+
+// RAII：无论正常返回还是异常，都把等待槽摘掉（对应 Java request() 的 finally remove）。
+// putResponse 已经先原子 remove 了，这里再摘一次是幂等的。
+struct RequestFutureRemover {
+    const std::string& correlationId;
+    ~RequestFutureRemover() { RequestFutureHolder::getInstance().removeRequest(correlationId); }
+};
+
+}  // namespace
+
+Message DefaultMQProducer::request(const Message& msg, int32_t timeoutMillis) {
+    MQClientInstance& c = client();
+    int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : requestTimeoutMillis_;
+    checkMessage(msg);
+    Message outbound = withNamespace(msg);
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    MessageQueue selected = publish->selectOneMessageQueue();
+    return requestWithQueue(outbound, selected, timeout);
+}
+
+Message DefaultMQProducer::request(const Message& msg, const MessageQueue& mq,
+                                   int32_t timeoutMillis) {
+    int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : requestTimeoutMillis_;
+    checkMessage(msg);
+    Message outbound = withNamespace(msg);
+    return requestWithQueue(outbound, mq, timeout);
+}
+
+Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueue& mq,
+                                            int32_t timeout) {
+    MQClientInstance& c = client();
+
+    // 请求方三件事（对齐 Java prepareSendRequest / DefaultMQProducerImpl#request）：
+    // CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（本客户端 clientId）、TTL（= timeout）。
+    // REPLY_TO_CLIENT 是 broker 反查 channel 的键 —— 撞名会把应答推到别人的连接上。
+    const std::string correlationId = createCorrelationId();
+    outbound.putProperty(MessageConst::PROPERTY_CORRELATION_ID, correlationId);
+    outbound.putProperty(MessageConst::PROPERTY_MESSAGE_REPLY_TO_CLIENT, clientId_);
+    outbound.putProperty(MessageConst::PROPERTY_MESSAGE_TTL, std::to_string(timeout));
+
+    const int64_t begin = UtilAll::currentTimeMillis();
+    // 先确认路由已知，再补一次心跳：没在 broker 上登记为 producer，broker 就找不到
+    // channel 把应答推回来（REPLY_TO_CLIENT 反查 ProducerManager 的 clientChannelTable）。
+    try {
+        (void)c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+        sendHeartbeatToAllBroker();
+    } catch (const std::exception& e) {
+        // 拿不到路由就让下面的发送路径自己报错
+        logger_debug(std::string("request: prepare route/heartbeat failed: ") + e.what());
+    }
+
+    auto future = std::make_shared<RequestResponseFuture>(correlationId, timeout);
+    RequestFutureHolder::getInstance().putRequest(correlationId, future);
+    RequestFutureRemover remover{correlationId};
+    (void)remover;
+
+    const int64_t cost = UtilAll::currentTimeMillis() - begin;
+    try {
+        const int32_t sysFlag = prepareForSend(outbound);
+        c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag);
+    } catch (...) {
+        // 发送失败三件事：标 !sendRequestOk + 空唤醒（别让等待方白等满 timeout）+ 记 cause。
+        // 与 Java 的匿名 SendCallback#onException 完全一致。
+        future->setSendRequestOk(false);
+        future->setCause(std::current_exception());
+        future->putResponseMessage();
+    }
+    return waitRequestResponse(outbound, timeout, future, cost);
+}
+
+Message DefaultMQProducer::waitRequestResponse(const Message& outbound, int32_t timeout,
+                                               const std::shared_ptr<RequestResponseFuture>& future,
+                                               int64_t costMillis) {
+    const int64_t remain = static_cast<int64_t>(timeout) - costMillis;
+    future->waitResponseMessage(remain > 0 ? static_cast<int32_t>(remain) : 0);
+    if (!future->hasResponse()) {
+        throw RequestTimeoutException("send request message to <" + outbound.topic
+                                      + "> OK, but wait reply message timeout, "
+                                      + std::to_string(timeout) + " ms.");
+    }
+    if (!future->isSendRequestOk() || future->cause() != nullptr) {
+        std::string detail = "send request message to <" + outbound.topic + "> fail";
+        if (future->cause() != nullptr) {
+            try {
+                std::rethrow_exception(future->cause());
+            } catch (const std::exception& e) {
+                detail += ": ";
+                detail += e.what();
+            } catch (...) {
+            }
+        }
+        throw MQClientException(detail);
+    }
+    // 应答在 MessageExt 里带全属性（CORRELATION_ID / REPLY_MESSAGE_ARRIVE_TIME 等）
+    return future->responseMessage();
 }
 
 // ---------------------------------------------------------------- 批量

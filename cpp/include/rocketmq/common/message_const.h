@@ -42,6 +42,16 @@ struct MessageConst {
     static constexpr const char* PROPERTY_INSTANCE_ID = "INSTANCE_ID";
     static constexpr const char* PROPERTY_CLUSTER = "CLUSTER";
     static constexpr const char* PROPERTY_MESSAGE_TYPE = "MSG_TYPE";
+    // Request-Reply（5.x）：请求消息带 CORRELATION_ID / REPLY_TO_CLIENT / TTL，
+    // 应答消息的 MSG_TYPE == "reply"（据此把请求码换成 SEND_REPLY_MESSAGE_V2），
+    // broker 按 REPLY_TO_CLIENT 反查请求方 channel 后推 PUSH_REPLY_MESSAGE_TO_CLIENT。
+    static constexpr const char* PROPERTY_CORRELATION_ID = "CORRELATION_ID";
+    static constexpr const char* PROPERTY_MESSAGE_REPLY_TO_CLIENT = "REPLY_TO_CLIENT";
+    static constexpr const char* PROPERTY_MESSAGE_TTL = "TTL";
+    // 客户端收到应答时打的时间戳（Java ClientRemotingProcessor#receiveReplyMessage 写入）
+    static constexpr const char* PROPERTY_REPLY_MESSAGE_ARRIVE_TIME = "REPLY_MESSAGE_ARRIVE_TIME";
+    // broker 成功把应答推回请求方时写入（Java ReplyMessageProcessor#pushReplyMessage）
+    static constexpr const char* PROPERTY_PUSH_REPLY_TIME = "PUSH_REPLY_TIME";
     static constexpr const char* PROPERTY_INNER_MULTI_DISPATCH = "INNER_MULTI_DISPATCH";
     static constexpr const char* PROPERTY_INNER_MULTI_QUEUE_OFFSET = "INNER_MULTI_QUEUE_OFFSET";
     static constexpr const char* PROPERTY_POP_CK = "POP_CK";
