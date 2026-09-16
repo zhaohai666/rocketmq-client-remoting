@@ -230,7 +230,8 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     std::string lastError;
     for (int32_t attempt = 0; attempt <= retryTimesWhenSendFailed_; ++attempt) {
         try {
-            std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(outbound.topic);
+            std::shared_ptr<TopicPublishInfo> publish =
+                c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
             MessageQueue selected = publish->selectOneMessageQueue();
             return c.sendMessage(producerGroup_, outbound, selected, timeout, sysFlag);
         } catch (const MQClientException& e) {
@@ -261,7 +262,7 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic);
+    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic, /*isDefault=*/true);
     MessageQueue selected = selector.select(publish->msgQueueList, msg, arg);
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
     Message outbound = msg;
@@ -294,7 +295,7 @@ void DefaultMQProducer::sendAsync(const Message& msg, std::shared_ptr<SendCallba
 void DefaultMQProducer::sendOneway(const Message& msg) {
     MQClientInstance& c = client();
     checkMessage(msg);
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic);
+    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
     Message outbound = msg;
     const int32_t sysFlag = prepareForSend(outbound);
@@ -310,7 +311,8 @@ SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_
     }
     MessageBatch batch = MessageBatch::generateFromList(msgs);
     checkMessage(batch);
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(batch.topic);
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(batch.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
     // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
     const int32_t sysFlag = prepareForSend(batch);
@@ -507,7 +509,8 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     outbound.putProperty(MessageConst::PROPERTY_PRODUCER_GROUP, producerGroup_);
     txListener_ = &listener;
 
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(outbound.topic);
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
 
     // 压缩与普通发送一致；再叠加事务类型位（Java sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
@@ -583,7 +586,8 @@ std::vector<MessageExt> DefaultMQProducer::queryMessage(const std::string& topic
 
 std::vector<MessageQueue> DefaultMQProducer::fetchPublishMessageQueues(const std::string& topic) {
     MQClientInstance& c = client();
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(topic);
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(topic, /*isDefault=*/true);
     return publish->msgQueueList;
 }
 

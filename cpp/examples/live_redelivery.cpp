@@ -8,11 +8,20 @@
 //   S3 顺序消费：orderly listener 消费正常，且 broker 队列锁（LOCK_BATCH_MQ）生效。
 //   S4 广播模式：同组两个消费者各自收全所有消息。
 //   S5 流控：阈值 2 + 慢消费 → 流控触发计数 >0，最终消息全部消费。
+//   S6 集群多实例 rebalance：同组两实例均分队列（不重不漏），40 条消息无重复消费。
+//   S7 优雅注销：shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除 clientId。
+//
+// ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 prepareTopic）。消费者不做默认 topic
+//   兜底（对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），所以 topic 不存在
+//   时消费者拿不到路由 → 不分配队列 → 不消费；等它自己发现路由时，CONSUME_FROM_LAST_OFFSET
+//   已把位点解析到"发现时刻的最新"，期间生产的消息会被正常跳过（Java 同样）。那是语义
+//   正确但测不出东西的假失败，不是客户端 bug。
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +57,20 @@ int64_t nowMs() {
 }
 
 std::string str2bytes(const std::string& s) { return s; }
+
+// 按真实用法先把 topic 建出来，再启动消费者（与 Python verify_redelivery_live.py 的
+// prepare_topic 同义）。真实环境里 topic 由管理员或首次发送预先创建；消费者不做默认
+// topic 兜底，topic 不存在时拿不到路由、不分配队列。这里显式建出来，避免测出
+// "实现没问题但等超时/漏消息"的假失败。
+void prepareTopic(DefaultMQProducer& producer, const std::string& topic, int32_t queues = 4) {
+    try {
+        producer.createTopic("init", topic, queues);
+    } catch (const std::exception& e) {
+        std::printf("  预建 topic %s 失败（改用自动创建）: %s\n", topic.c_str(), e.what());
+    }
+    // 等 NameServer 路由传播，否则消费者首轮 rebalance 仍查不到
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+}
 
 // 便捷监听器：把收到的 body 记进列表，全部 CONSUME_SUCCESS
 class CollectListener : public MessageListenerConcurrently {
@@ -85,6 +108,7 @@ int main(int argc, char* argv[]) {
     // ---------------- S1 回投 ----------------
     {
         const std::string topic = gPrefix + "_Retry";
+        prepareTopic(producer, topic);
         auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g1");
         std::mutex mtx;
         struct Arrival {
@@ -161,6 +185,7 @@ int main(int argc, char* argv[]) {
     {
         const std::string topic = gPrefix + "_Offset";
         const std::string group = gPrefix + "_g2";
+        prepareTopic(producer, topic);
         std::vector<std::string> round1;
         {
             auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
@@ -209,6 +234,7 @@ int main(int argc, char* argv[]) {
     // ---------------- S3 顺序消费 + broker 锁 ----------------
     {
         const std::string topic = gPrefix + "_Orderly";
+        prepareTopic(producer, topic);
         auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g3");
         std::atomic<int32_t> got{0};
         class L : public MessageListenerOrderly {
@@ -242,6 +268,7 @@ int main(int argc, char* argv[]) {
     {
         const std::string topic = gPrefix + "_Bc";
         const std::string group = gPrefix + "_g4";
+        prepareTopic(producer, topic);
         std::vector<std::string> gotA;
         std::vector<std::string> gotB;
         auto ca = std::make_shared<DefaultMQPushConsumer>(group);
@@ -274,6 +301,7 @@ int main(int argc, char* argv[]) {
     // ---------------- S5 流控 ----------------
     {
         const std::string topic = gPrefix + "_Flow";
+        prepareTopic(producer, topic);
         auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g5");
         std::atomic<int32_t> got{0};
         class L : public MessageListenerConcurrently {
@@ -303,6 +331,132 @@ int main(int argc, char* argv[]) {
         consumer->shutdown();
         check("S5-慢消费下消息全部到达", got.load() == 10, "got=" + std::to_string(got.load()));
         check("S5-流控触发计数>0", fc > 0, "triggered=" + std::to_string(fc));
+    }
+
+    // ---------------- S6 集群多实例 rebalance（队列分配） ----------------
+    {
+        const std::string topic6 = gPrefix + "_Rebalance";
+        const std::string group6 = gPrefix + "_g6";
+        // 先把 topic 建出来（8 队列）并等路由传播，否则消费者启动时无路由，
+        // 分配要等到下一轮 20s rebalance 才稳定（会读到中间态）
+        try {
+            producer.createTopic("init", topic6, 8);
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        } catch (const std::exception& e) {
+            std::printf("S6: 预建 topic 失败（改用自动创建）: %s\n", e.what());
+        }
+        std::vector<std::string> recA;
+        std::vector<std::string> recB;
+        auto ca = std::make_shared<DefaultMQPushConsumer>(group6);
+        ca->setInstanceName("inst-a");
+        ca->setMessageListener(std::make_shared<CollectListener>(recA));
+        ca->setNamesrvAddr(nsAddr);
+        ca->subscribe(topic6);
+        ca->start();
+        auto cb = std::make_shared<DefaultMQPushConsumer>(group6);
+        cb->setInstanceName("inst-b");
+        cb->setMessageListener(std::make_shared<CollectListener>(recB));
+        cb->setNamesrvAddr(nsAddr);
+        cb->subscribe(topic6);
+        cb->start();
+        // 等分配稳定：交集为空 + 两边都非空 + 主 topic 队列被完整覆盖（最多等 45s）
+        std::vector<std::string> keysA, keysB;
+        int asgA = 0, asgB = 0;
+        std::set<std::string> expectedKeys;
+        {
+            for (const MessageQueue& mq : ca->fetchSubscribeMessageQueues(topic6)) {
+                expectedKeys.insert(mq.topic + mq.brokerName + std::to_string(mq.queueId));
+            }
+        }
+        int64_t deadline = nowMs() + 45000;
+        while (nowMs() < deadline) {
+            keysA = ca->assignedQueueKeys();
+            keysB = cb->assignedQueueKeys();
+            asgA = static_cast<int>(keysA.size());
+            asgB = static_cast<int>(keysB.size());
+            std::set<std::string> ua(keysA.begin(), keysA.end());
+            std::set<std::string> ub(keysB.begin(), keysB.end());
+            std::set<std::string> inter;
+            std::set_intersection(ua.begin(), ua.end(), ub.begin(), ub.end(),
+                                  std::inserter(inter, inter.begin()));
+            std::set<std::string> uni = ua;
+            uni.insert(ub.begin(), ub.end());
+            std::set<std::string> covered;
+            std::set_intersection(uni.begin(), uni.end(), expectedKeys.begin(), expectedKeys.end(),
+                                  std::inserter(covered, covered.begin()));
+            if (asgA > 0 && asgB > 0 && inter.empty() && covered == expectedKeys) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        const int64_t hbA = ca->heartbeatCount();
+        std::vector<std::string> cidList = ca->consumerIdListOfGroup(topic6);
+        const int n6 = 40;
+        for (int i = 0; i < n6; ++i) {
+            producer.send(Message(topic6, str2bytes("rb-" + std::to_string(i))));
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        int total6 = static_cast<int>(recA.size() + recB.size());
+        std::vector<std::string> all6 = recA;
+        all6.insert(all6.end(), recB.begin(), recB.end());
+        std::set<std::string> uniq(all6.begin(), all6.end());
+        int dup6 = static_cast<int>(all6.size()) - static_cast<int>(uniq.size());
+        ca->shutdown();
+        cb->shutdown();
+        check("S6-消费者已心跳注册",
+              hbA > 0 && cidList.size() == 2,
+              "heartbeats=" + std::to_string(hbA)
+                  + " brokerCids=" + std::to_string(cidList.size()));
+        std::set<std::string> sa(keysA.begin(), keysA.end());
+        std::set<std::string> sb(keysB.begin(), keysB.end());
+        std::set<std::string> inter2;
+        std::set_intersection(sa.begin(), sa.end(), sb.begin(), sb.end(),
+                              std::inserter(inter2, inter2.begin()));
+        std::set<std::string> uni2 = sa;
+        uni2.insert(sb.begin(), sb.end());
+        std::set<std::string> covered2;
+        std::set_intersection(uni2.begin(), uni2.end(), expectedKeys.begin(), expectedKeys.end(),
+                              std::inserter(covered2, covered2.begin()));
+        check("S6-队列不重不漏(a=" + std::to_string(asgA) + ",b=" + std::to_string(asgB)
+                  + ",交集=" + std::to_string(inter2.size()) + ",覆盖=" + std::to_string(covered2.size())
+                  + "/" + std::to_string(expectedKeys.size()) + ")",
+              asgA > 0 && asgB > 0 && inter2.empty() && !expectedKeys.empty()
+                  && covered2 == expectedKeys);
+        check("S6-消息无重复消费", dup6 == 0 && total6 == n6,
+              "got=" + std::to_string(total6) + "/" + std::to_string(n6)
+                  + " dup=" + std::to_string(dup6));
+    }
+
+    // ---------------- S7 优雅注销 ----------------
+    {
+        // 复用在 S6 建的 8 队列 topic；shutdown 时应发 UNREGISTER_CLIENT，broker 端立刻摘除，
+        // 不必等心跳超时（~120s）。查询用独立的探针客户端（消费者 shutdown 后其内部客户端已关闭）。
+        const std::string topic7 = gPrefix + "_Rebalance";
+        const std::string group7 = gPrefix + "_g7";
+        MQClientInstance probe("probe-" + std::to_string(nowMs()),
+                               std::vector<std::string>{nsAddr});
+        probe.start();
+        auto qc = std::make_shared<DefaultMQPushConsumer>(group7);
+        qc->setInstanceName("inst-c");
+        std::vector<std::string> sink;
+        qc->setMessageListener(std::make_shared<CollectListener>(sink));
+        qc->setNamesrvAddr(nsAddr);
+        qc->subscribe(topic7);
+        qc->start();
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        const std::string cid7 = qc->clientId();
+        std::vector<std::string> listBefore = probe.getConsumerIdListByGroup(topic7, group7);
+        qc->shutdown();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::vector<std::string> listAfter = probe.getConsumerIdListByGroup(topic7, group7);
+        probe.shutdown();
+        bool beforeHas =
+            std::find(listBefore.begin(), listBefore.end(), cid7) != listBefore.end();
+        bool afterHas = std::find(listAfter.begin(), listAfter.end(), cid7) != listAfter.end();
+        check("S7-shutdown 已注销 clientId",
+              beforeHas && !afterHas,
+              "before=" + std::to_string(listBefore.size())
+                  + " after=" + std::to_string(listAfter.size()));
     }
 
     producer.shutdown();

@@ -152,12 +152,44 @@ void DefaultMQPushConsumer::start() {
                                              /*connectTimeoutMillis=*/3000,
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_));
         mqClient_->start();
+        startMillis_ = UtilAll::currentTimeMillis();
         stop_.store(false);
         started_.store(true);
     }
 
+    // 注册 broker 主动通知：消费者上下线时立刻重算分配（对齐 Java ClientRemotingProcessor
+    // → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）。
+    mqClient_->remotingClient().registerProcessor(
+        RequestCode::NOTIFY_CONSUMER_IDS_CHANGED,
+        [this](const RemotingCommand& cmd, const std::string&) {
+            this->onConsumerIdsChanged(cmd);
+        });
+
+    // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
+    // 拉路由（登记 topic 在用 + 填 broker 地址表）→ 发心跳（broker 先认识本消费者）
+    // → 立即 rebalance → 起消费线程。心跳必须在 rebalance 之前：rebalance 要向 broker
+    // 查消费者列表（GET_CONSUMER_LIST_BY_GROUP），broker 只有收到心跳才登记本 clientId。
+    for (const std::string& t : subscribedTopics()) {
+        mqClient_->registerTopicInUse(t);
+        try {
+            mqClient_->getTopicPublishInfo(t);
+        } catch (const std::exception& e) {
+            logger_debug("refresh route for " + t + " failed: " + e.what());
+        }
+    }
+    try {
+        sendHeartbeatToAllBroker();
+    } catch (const std::exception& e) {
+        logger_debug("initial heartbeat failed: " + std::string(e.what()));
+    }
+    // 首轮分配必须同步完成：否则拉取线程会在空分配集上白转，直到第一轮 rebalance 才生效。
+    try {
+        doRebalance();
+    } catch (const std::exception& e) {
+        logger_debug("initial rebalance failed: " + std::string(e.what()));
+    }
+
     // 拉取：每队列一个线程（并发长轮询，避免空队列 suspend 阻塞其他队列投递）
-    rebalancePullThreads();
     dispatchThread_ = std::thread([this]() {
         setThreadName("ConsumeMessageThread");
         dispatchLoop();
@@ -212,11 +244,23 @@ void DefaultMQPushConsumer::shutdown() {
         if (kv.second.joinable()) kv.second.join();
     }
     pullThreads_.clear();
+    for (std::thread& t : retiredThreads_) {
+        if (t.joinable()) t.join();
+    }
+    retiredThreads_.clear();
     if (dispatchThread_.joinable()) dispatchThread_.join();
     if (persistThread_.joinable()) persistThread_.join();
     if (lockThread_.joinable()) lockThread_.join();
     if (rebalanceThread_.joinable()) rebalanceThread_.join();
+    // 优雅注销（对齐 Java MQClientInstance.unregisterClient）：关闭连接**之前**对
+    // brokerAddrTable 里所有 broker 发 UNREGISTER_CLIENT(35)，broker 端立刻摘除本 clientId，
+    // 不必等心跳超时（默认 ~120s）——否则这段时间内消费者变更通知仍可能发往已退出的实例。
     if (mqClient_) {
+        try {
+            mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
+        } catch (const std::exception& e) {
+            logger_debug("unregister on shutdown failed: " + std::string(e.what()));
+        }
         mqClient_->shutdown();
     }
 }
@@ -234,17 +278,45 @@ bool DefaultMQPushConsumer::isOrderly() const {
 }
 
 void DefaultMQPushConsumer::rebalancePullThreads() {
+    // 对齐 Java RebalanceImpl.updateProcessQueueTableInRebalance：
+    // 按当前分配集同步拉取线程，并为被撤销的队列做收尾（持久化已消费位点、
+    // 丢弃在途缓冲、顺序消费集群模式解锁）。少任何一步，被撤销队列里的在途消息
+    // 会被旧实例继续消费，与新属主重复（同组多实例重复消费的根因）。
     std::vector<MessageQueue> queues = assignedQueues();
     std::map<std::string, MessageQueue> current;
     for (const MessageQueue& mq : queues) {
         current[offsetKey(mq)] = mq;
     }
     std::vector<std::pair<std::string, MessageQueue>> toStart;
+    std::vector<std::pair<MessageQueue, int64_t>> revoked;
     {
         std::lock_guard<std::mutex> lk(lock_);
+        // 1. 新分配的队列：起拉取线程
         for (const auto& kv : current) {
             if (pullThreads_.find(kv.first) == pullThreads_.end()) {
                 toStart.emplace_back(kv.first, kv.second);
+            }
+        }
+        // 2. 被撤销的队列：清状态 + 收集 (mq, 已消费位点)，把旧线程移到 retiredThreads_
+        //    等待其自然退出（线程循环里 ownsQueue 返回 false 即退出）
+        for (auto it = pullThreads_.begin(); it != pullThreads_.end();) {
+            if (current.find(it->first) == current.end()) {
+                MessageQueue mq;
+                auto mit = mqMap_.find(it->first);
+                if (mit != mqMap_.end()) mq = mit->second;
+                int64_t off = -1;
+                auto oit = consumeOffsetTable_.find(it->first);
+                if (oit != consumeOffsetTable_.end()) off = oit->second;
+                revoked.emplace_back(mq, off);
+                retiredThreads_.push_back(std::move(it->second));
+                mqMap_.erase(it->first);
+                pending_.erase(it->first);
+                lockOk_.erase(it->first);
+                offsetTable_.erase(it->first);
+                consumeOffsetTable_.erase(it->first);
+                it = pullThreads_.erase(it);
+            } else {
+                ++it;
             }
         }
     }
@@ -262,18 +334,39 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
         }
         pullThreads_[kv.first] = std::move(t);
     }
+    // 网络/落盘在锁外做
+    if (!revoked.empty()) {
+        onQueuesRevoked(revoked);
+    }
 }
 
 void DefaultMQPushConsumer::rebalanceLoop() {
-    // 简化 rebalance：周期刷新分配集，为新增队列（如 %RETRY%topic 建立路由后）补拉取线程
+    // 周期重算分配（对齐 Java RebalanceService 默认 20s），或被 NOTIFY_CONSUMER_IDS_CHANGED
+    // 通知时立即重算（rebalanceNow_ 置位）。启动后 60s 内且当前无任何分配时缩短为 2s 重试：
+    // 消费者可能先于 topic 被创建启动，此时真实路由还拉不到——消费端不做默认 topic 兜底，
+    // 死等 20s 会长时间不消费；快速重试只在启动后 60s 内生效，避免长期订阅不存在 topic 时
+    // 高频打 NameServer。
     while (!stop_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        bool fast = false;
+        {
+            std::lock_guard<std::mutex> lk(lock_);
+            if (assignedQueues_.empty()
+                && (UtilAll::currentTimeMillis() - startMillis_) < 60000) {
+                fast = true;
+            }
+        }
+        {
+            std::unique_lock<std::mutex> lk(rebalanceMutex_);
+            rebalanceCv_.wait_for(lk, std::chrono::milliseconds(fast ? 2000 : 20000),
+                                  [this]() { return rebalanceNow_.load() || stop_.load(); });
+            rebalanceNow_.store(false);
+        }
         if (stop_.load() || !started_.load()) return;
         try {
             maybeSendHeartbeat();
-            rebalancePullThreads();
+            doRebalance();
         } catch (const std::exception& e) {
-            logger_debug(std::string("rebalance pull threads error: ") + e.what());
+            logger_debug(std::string("rebalance error: ") + e.what());
         }
     }
 }
@@ -283,6 +376,11 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
     const bool orderly = isOrderly();
     const std::string key = offsetKey(mq);
     while (!stop_.load() && started_.load()) {
+        // 长轮询期间被 rebalance 撤走（队列或换了拉取线程）即失效：直接退出本线程，
+        // 由新属主从我们最后持久化的位点接手，避免两实例重复消费同一条消息。
+        if (!ownsQueue(key)) {
+            return;
+        }
         SubscriptionData sub;
         {
             std::lock_guard<std::mutex> lk(lock_);
@@ -378,6 +476,14 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
                 mqMap_[key] = mq;
             }
         }
+        // 入队与「是否仍持有该队列」必须一致：长轮询期间被 rebalance 撤走的队列，这批消息按
+        // Java 语义（ProcessQueue.isDropped()）直接丢弃——不消费、不推进位点，由新属主从我们
+        // 最后持久化的位点重投，否则两实例会重复消费同一条消息。
+        if (!ownsQueue(key)) {
+            logger_debug("queue " + mq.toString()
+                         + " revoked during pull, discard fetched messages");
+            return;
+        }
         if (result.status == PullStatus::FOUND && !result.msgFoundList.empty()) {
             std::lock_guard<std::mutex> lk(lock_);
             std::deque<MessageExt>& dq = pending_[key];
@@ -449,6 +555,11 @@ void DefaultMQPushConsumer::dispatchLoop() {
 
 bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQueue& mq,
                                          const std::vector<MessageExt>& batch) {
+    // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）：
+    // broker 回投的消息实际写在 %RETRY%group，原始 topic 在 RETRY_TOPIC 属性里，不还原
+    // 用户按 topic 分支的代码会走错。
+    std::vector<MessageExt> restored = batch;
+    resetRetryTopicAndNamespace(restored);
     const bool broadcast = (messageModel_ == MessageModel::BROADCASTING);
     // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
     if (isOrderly()) {
@@ -456,7 +567,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         ConsumeOrderlyContext ctx(mq);
         ConsumeOrderlyStatus status;
         try {
-            status = orderly->consumeMessage(batch, ctx);
+            status = orderly->consumeMessage(restored, ctx);
         } catch (const std::exception& e) {
             // Java 顺序消费：异常 → 不提交 offset，原地重试
             logger_debug(std::string("orderly listener error (retry in place): ") + e.what());
@@ -466,7 +577,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             std::lock_guard<std::mutex> lk(lock_);
             auto it = pending_.find(key);
             if (it != pending_.end()) {
-                for (auto rit = batch.rbegin(); rit != batch.rend(); ++rit) {
+                for (auto rit = restored.rbegin(); rit != restored.rend(); ++rit) {
                     it->second.push_front(*rit);
                 }
             }
@@ -474,8 +585,8 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
                 std::chrono::milliseconds(suspendCurrentQueueTimeMillis_));
             return false;
         }
-        advanceConsumeOffset(key, batch);
-        consumedCount_.fetch_add(static_cast<int64_t>(batch.size()));
+        advanceConsumeOffset(key, restored);
+        consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
     // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
@@ -483,29 +594,29 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
     ConsumeConcurrentlyContext ctx(mq);
     ConsumeConcurrentlyStatus status;
     try {
-        status = conc->consumeMessage(batch, ctx);
+        status = conc->consumeMessage(restored, ctx);
     } catch (const std::exception& e) {
         // Java：消费抛异常按 RECONSUME_LATER 处理
         logger_debug(std::string("listener error, treat as RECONSUME_LATER: ") + e.what());
         status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
     }
     if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
-        advanceConsumeOffset(key, batch);
-        consumedCount_.fetch_add(static_cast<int64_t>(batch.size()));
+        advanceConsumeOffset(key, restored);
+        consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
     // RECONSUME_LATER：广播模式不回投（仅告警，位点前进，重启后不重投）；
     // 集群模式回投 %RETRY%topic（延迟梯度 3+reconsumeTimes，超限由 broker 转 %DLQ%）
     if (broadcast) {
         logger_warn("BROADCASTING: message consume failed, no redelivery: "
-                    + std::to_string(batch.size()) + " msgs in " + mq.toString());
-        advanceConsumeOffset(key, batch);
-        consumedCount_.fetch_add(static_cast<int64_t>(batch.size()));
+                    + std::to_string(restored.size()) + " msgs in " + mq.toString());
+        advanceConsumeOffset(key, restored);
+        consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
-    if (sendBackBatch(batch, ctx)) {
-        advanceConsumeOffset(key, batch);
-        consumedCount_.fetch_add(static_cast<int64_t>(batch.size()));
+    if (sendBackBatch(restored, ctx)) {
+        advanceConsumeOffset(key, restored);
+        consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
     // 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
@@ -513,7 +624,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         std::lock_guard<std::mutex> lk(lock_);
         auto it = pending_.find(key);
         if (it != pending_.end()) {
-            for (auto rit = batch.rbegin(); rit != batch.rend(); ++rit) {
+            for (auto rit = restored.rbegin(); rit != restored.rend(); ++rit) {
                 it->second.push_front(*rit);
             }
         }
@@ -674,23 +785,213 @@ std::string DefaultMQPushConsumer::offsetKey(const MessageQueue& mq) {
 }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::assignedQueues() {
-    MQClientInstance& c = client();
-    std::vector<MessageQueue> result;
-    for (const std::string& topic : subscribedTopics()) {
-        try {
-            std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(topic);
-            for (const MessageQueue& q : publish->msgQueueList) {
-                MessageQueue mq(topic, q.brokerName, q.queueId);
-                if (std::find(result.begin(), result.end(), mq) == result.end()) {
-                    result.push_back(mq);
+    // 返回真实 rebalance 计算出的分配集（doRebalance 写入 assignedQueues_）。
+    // 不再返回「订阅 topic 的全部队列」——那正是同组多实例重复消费的根源。
+    std::lock_guard<std::mutex> lk(lock_);
+    return assignedQueues_;
+}
+
+// ---------------------------------------------------------------- 真实 rebalance
+void DefaultMQPushConsumer::doRebalance() {
+    // 对齐 Java RebalanceImpl.rebalanceByTopic：BROADCASTING 全给自己；CLUSTERING 查 broker
+    // 消费者列表 → 排序 → AllocateMessageQueueAveragely → 取本实例那一份。查不到消费者列表时
+    // 保留现有分配（Java 仅告警），绝不回退成"独占全部队列"（否则同组多实例互相重复消费）。
+    if (mqClient_ == nullptr) return;
+    MQClientInstance& c = *mqClient_;
+    std::vector<std::string> topics;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const auto& kv : subscriptionData_) {
+            topics.push_back(kv.first);
+        }
+    }
+    std::set<std::string> was;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const MessageQueue& mq : assignedQueues_) {
+            was.insert(offsetKey(mq));
+        }
+    }
+    std::vector<MessageQueue> assigned;
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        for (const std::string& topic : topics) {
+            for (const MessageQueue& mq : allQueuesOfTopic(topic)) {
+                assigned.push_back(mq);
+            }
+        }
+    } else {
+        for (const std::string& topic : topics) {
+            std::vector<MessageQueue> mqAll = allQueuesOfTopic(topic);
+            // mqAll 与 cidAll 都排序（对齐 Java：排序后才分配，否则不同实例算出不同结果）
+            std::sort(mqAll.begin(), mqAll.end(),
+                      [](const MessageQueue& a, const MessageQueue& b) {
+                          return a.compareTo(b) < 0;
+                      });
+            if (mqAll.empty()) {
+                continue;
+            }
+            std::vector<std::string> cidAll = c.getConsumerIdListByGroup(topic, consumerGroup_);
+            if (cidAll.empty()) {
+                logger_debug("rebalance: no consumer id list for " + consumerGroup_ + "/" + topic
+                             + ", keep current assignment");
+                std::lock_guard<std::mutex> lk(lock_);
+                for (const MessageQueue& mq : assignedQueues_) {
+                    if (mq.topic == topic) assigned.push_back(mq);
                 }
+                continue;
+            }
+            std::sort(cidAll.begin(), cidAll.end());
+            std::vector<MessageQueue> got =
+                allocateMessageQueueAveragely(consumerGroup_, clientId_, mqAll, cidAll);
+            assigned.insert(assigned.end(), got.begin(), got.end());
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        assignedQueues_ = assigned;
+    }
+    std::set<std::string> now;
+    for (const MessageQueue& mq : assigned) {
+        now.insert(offsetKey(mq));
+    }
+    if (now != was) {
+        logger_info("rebalance result changed, group=" + consumerGroup_
+                    + " clientId=" + clientId_ + " assigned=" + std::to_string(assigned.size()));
+    }
+    // 新分配的队列**立刻**解析初始位点写入 offsetTable_（对齐 Java
+    // updateProcessQueueTableInRebalance → computePullFromWhereWithException →
+    // offsetStore.updateOffset）。不能留到第一次拉取时才惰性解析：CONSUME_FROM_LAST_OFFSET 语义
+    // 是"分配时刻的最新位点"，惰性解析会跳过「分配之后、首次拉取之前」新产生的消息。
+    for (const MessageQueue& mq : assigned) {
+        std::string key = offsetKey(mq);
+        if (was.count(key)) {
+            continue;
+        }
+        SubscriptionData sub;
+        {
+            std::lock_guard<std::mutex> lk(lock_);
+            if (offsetTable_.count(key)) continue;
+            auto it = subscriptionData_.find(mq.topic);
+            if (it == subscriptionData_.end()) continue;
+            sub = it->second;
+        }
+        try {
+            int64_t off = resolveInitialOffset(mq, sub);
+            std::lock_guard<std::mutex> lk(lock_);
+            if (!offsetTable_.count(key)) {
+                offsetTable_[key] = off;
             }
         } catch (const std::exception& e) {
-            // %RETRY%topic 在首次回投前无路由，属预期路径，debug 即可
-            logger_debug("assigned_queues: skip topic " + topic + ": " + e.what());
+            logger_debug("resolve initial offset for " + mq.toString() + " failed: " + e.what());
+        }
+    }
+    rebalancePullThreads();
+}
+
+std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::string& topic) {
+    // 对齐 Java RebalanceImpl.topicSubscribeInfoTable：topic 路由里的全部队列。
+    std::vector<MessageQueue> out;
+    if (mqClient_ == nullptr) return out;
+    try {
+        std::shared_ptr<TopicPublishInfo> publish = mqClient_->getTopicPublishInfo(topic);
+        out.reserve(publish->msgQueueList.size());
+        for (const MessageQueue& q : publish->msgQueueList) {
+            out.emplace_back(q.topic, q.brokerName, q.queueId);
+        }
+    } catch (const std::exception& e) {
+        logger_debug("rebalance: no route for topic " + topic + ": " + e.what());
+    }
+    return out;
+}
+
+std::vector<MessageQueue> DefaultMQPushConsumer::allocateMessageQueueAveragely(
+    const std::string& consumerGroup, const std::string& currentCid,
+    const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) {
+    (void)consumerGroup;
+    std::vector<MessageQueue> result;
+    int mqCount = static_cast<int>(mqAll.size());
+    int cidCount = static_cast<int>(cidAll.size());
+    if (mqCount == 0 || cidCount == 0) return result;
+    auto it = std::find(cidAll.begin(), cidAll.end(), currentCid);
+    if (it == cidAll.end()) return result;  // 本实例不在消费组列表里 → 不分配
+    int index = static_cast<int>(it - cidAll.begin());
+    // 对齐 Java AllocateMessageQueueAveragely
+    int mod = mqCount % cidCount;
+    int averageSize = (mqCount <= cidCount)
+                          ? 1
+                          : (mod > 0 && index < mod ? mqCount / cidCount + 1 : mqCount / cidCount);
+    int startIndex = (mod > 0 && index < mod) ? index * averageSize : index * averageSize + mod;
+    int range = std::min(averageSize, mqCount - startIndex);
+    for (int i = 0; i < range; ++i) {
+        if (startIndex + i < mqCount) {
+            result.push_back(mqAll[startIndex + i]);
         }
     }
     return result;
+}
+
+bool DefaultMQPushConsumer::ownsQueue(const std::string& key) const {
+    // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = pullThreads_.find(key);
+    if (it == pullThreads_.end()) return false;
+    return it->second.get_id() == std::this_thread::get_id();
+}
+
+void DefaultMQPushConsumer::onQueuesRevoked(
+    const std::vector<std::pair<MessageQueue, int64_t>>& revoked) {
+    // 对齐 Java RebalanceImpl.removeUnnecessaryMessageQueue
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        // 广播模式位点只存本地
+        saveLocalOffsets();
+        return;
+    }
+    if (mqClient_ == nullptr) return;
+    std::vector<MessageQueue> toUnlock;
+    for (const auto& kv : revoked) {
+        const MessageQueue& mq = kv.first;
+        int64_t off = kv.second;
+        // 仅该队列的已消费位点：一条 UPDATE_CONSUMER_OFFSET(15)，info 级别只记一次摘要
+        if (off >= 0) {
+            try {
+                mqClient_->updateConsumerOffset(consumerGroup_, mq, off);
+            } catch (const std::exception& e) {
+                logger_debug("persist offset on revoke failed for " + mq.toString() + ": "
+                             + e.what());
+            }
+        }
+        if (isOrderly()) {
+            toUnlock.push_back(mq);
+        }
+    }
+    if (!toUnlock.empty()) {
+        try {
+            mqClient_->unlockBatchMq(consumerGroup_, clientId_, toUnlock);
+        } catch (const std::exception& e) {
+            logger_debug("unlock on revoke failed: " + std::string(e.what()));
+        }
+    }
+    logger_info("queues revoked, group=" + consumerGroup_
+                + " count=" + std::to_string(revoked.size()));
+}
+
+void DefaultMQPushConsumer::onConsumerIdsChanged(const RemotingCommand& cmd) {
+    (void)cmd;
+    // broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。
+    rebalanceNow_.store(true);
+    rebalanceCv_.notify_all();
+}
+
+void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs) {
+    // 对应 Java DefaultMQPushConsumerImpl.resetRetryAndNamespace（分发前调用）。
+    // 本客户端不使用 namespace，故只做 topic 还原。
+    const std::string groupTopic = MixAll::getRetryTopic(consumerGroup_);
+    for (MessageExt& msg : msgs) {
+        std::string retryTopic = msg.getProperty(MessageConst::PROPERTY_RETRY_TOPIC);
+        if (!retryTopic.empty() && msg.topic == groupTopic) {
+            msg.setTopic(retryTopic);
+        }
+    }
 }
 
 int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
@@ -729,6 +1030,11 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
             int64_t ts = UtilAll::currentTimeMillis() - 30 * 60 * 1000LL;
             return c.searchOffsetByTimestamp(mq, ts);
+        }
+        // Java RebalancePushImpl：首次消费且无已提交位点时，%RETRY% 主题从 0 开始
+        // （重试消息要全量重试），而不是从最大位点跳过。
+        if (MixAll::isRetryTopic(mq.topic)) {
+            return 0;
         }
         return c.getMaxOffset(mq);  // 默认 CONSUME_FROM_LAST_OFFSET
     } catch (const std::exception&) {
@@ -833,6 +1139,29 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
         throw MQBrokerException(response.code, response.remark);
     }
     return true;
+}
+
+std::vector<std::string> DefaultMQPushConsumer::assignedQueueKeys() const {
+    // 当前分给本实例的队列 key 列表（真机验证"同组两实例不重不漏"用）。
+    // key 格式与 offsetKey 一致：topic + brokerName + queueId。
+    std::lock_guard<std::mutex> lk(lock_);
+    std::vector<std::string> out;
+    out.reserve(assignedQueues_.size());
+    for (const MessageQueue& mq : assignedQueues_) {
+        out.push_back(offsetKey(mq));
+    }
+    return out;
+}
+
+std::vector<std::string> DefaultMQPushConsumer::consumerIdListOfGroup(
+    const std::string& topic) const {
+    // 查消费组在某 topic 上的全部 clientId（对应 Java findConsumerIdList），用于验证多实例注册。
+    if (mqClient_ == nullptr) return {};
+    try {
+        return mqClient_->getConsumerIdListByGroup(topic, consumerGroup_);
+    } catch (...) {
+        return {};
+    }
 }
 
 }  // namespace rocketmq

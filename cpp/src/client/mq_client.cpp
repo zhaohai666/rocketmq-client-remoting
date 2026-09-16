@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -98,10 +99,59 @@ void MQClientInstance::start() {
         ns += nameServerAddrs_[i];
     }
     logger_info("MQClientInstance[" + clientId_ + "] started, namesrv=" + ns);
+    // 周期刷新在用 topic 路由（对应 Java MQClientInstance.startScheduledTask 用
+    // pollNameServerInterval，默认 30s）。没有它，新 topic 被 broker 创建、队列扩容等
+    // 变化只能等消费者自己的 rebalance 轮次或生产者的下次发送才被发现。
+    if (!routeRefreshThread_.joinable()) {
+        routeRefreshStop_ = false;
+        routeRefreshThread_ = std::thread([this]() {
+            setThreadName("MQClientFactoryScheduledThread");
+            routeRefreshLoop();
+        });
+    }
+}
+
+void MQClientInstance::registerTopicInUse(const std::string& topic) {
+    if (!topic.empty()) {
+        std::lock_guard<std::recursive_mutex> lk(routeLock_);
+        topicsInUse_.insert(topic);
+    }
+}
+
+void MQClientInstance::routeRefreshLoop() {
+    // 首次延迟 ~10ms 后再开始周期刷新（对应 Java 的 10ms initialDelay）
+    if (routeRefreshStop_) return;
+    for (int i = 0; i < 10 && !routeRefreshStop_; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    while (!routeRefreshStop_) {
+        // 周期 30s（对应 Java pollNameServerInterval 默认 30000ms）
+        for (int i = 0; i < 300 && !routeRefreshStop_; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (routeRefreshStop_) return;
+        if (!started_) return;
+        std::set<std::string> topics;
+        {
+            std::lock_guard<std::recursive_mutex> lk(routeLock_);
+            topics = topicsInUse_;
+        }
+        for (const std::string& topic : topics) {
+            try {
+                updateTopicRouteInfoFromNameServer(topic);
+            } catch (const std::exception& e) {
+                logger_debug("route refresh failed for " + topic + ": " + e.what());
+            }
+        }
+    }
 }
 
 void MQClientInstance::shutdown() {
     started_ = false;
+    routeRefreshStop_ = true;
+    if (routeRefreshThread_.joinable()) {
+        routeRefreshThread_.join();
+    }
     if (remotingClient_) {
         remotingClient_->shutdown();
     }
@@ -131,7 +181,8 @@ void MQClientInstance::checkResponseCode(const RemotingCommand& response) {
 
 // ---------------------------------------------------------------- 路由管理
 bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& topic,
-                                                         int32_t timeoutMillis) {
+                                                         int32_t timeoutMillis,
+                                                         bool isDefault) {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address list is empty");
     }
@@ -160,9 +211,10 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
 
     TopicRouteData route;
     bool ok = fetch(topic, route);
-    if (!ok && topic != MixAll::DEFAULT_TOPIC) {
+    if (!ok && isDefault && topic != MixAll::DEFAULT_TOPIC) {
         // 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
-        // 需像 Java 客户端那样回退到默认 topic（TBW102）来构造发布信息。
+        // **生产者**需要像 Java 客户端那样回退到默认 topic（TBW102）来为该 topic
+        // 构造发布信息。isDefault=false 时（消费者路径）不做这个兜底。
         // 新 topic 由 broker 用 defaultTopicQueueNums 创建队列，而默认 topic 自身
         // 可能配置了更多队列，这里按 broker 实际创建数裁剪，避免选中非法 queueId。
         TopicRouteData defaultRoute;
@@ -199,7 +251,8 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
     return true;
 }
 
-std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const std::string& topic) {
+std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const std::string& topic,
+                                                                      bool isDefault) {
     {
         std::lock_guard<std::recursive_mutex> lk(routeLock_);
         auto it = topicPublishInfoTable_.find(topic);
@@ -207,7 +260,7 @@ std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const st
             return it->second;
         }
     }
-    updateTopicRouteInfoFromNameServer(topic);
+    updateTopicRouteInfoFromNameServer(topic, 5000, isDefault);
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = topicPublishInfoTable_.find(topic);
     if (it == topicPublishInfoTable_.end() || it->second == nullptr || !it->second->ok()) {
@@ -906,6 +959,51 @@ GetConsumerListByGroupResponseBody MQClientInstance::getConsumerListByGroup(
         GetConsumerListByGroupResponseBody::decode(response.body, out);
     }
     return out;
+}
+
+std::vector<std::string> MQClientInstance::getConsumerIdListByGroup(
+    const std::string& topic, const std::string& consumerGroup, int32_t timeoutMillis) {
+    // 取该 topic 路由里的 master broker 发 GET_CONSUMER_LIST_BY_GROUP(38)：
+    // 所有客户端都会向集群内每台 broker 心跳注册，故任取一台即持有完整消费者列表。
+    // 查不到（无路由 / 非 SUCCESS / 异常）返回空 vector；调用方按 Java 语义「保留当前分配」，
+    // 不要回退成"自己独占全部队列"（那会让多实例互相重复消费）。
+    std::string addr;
+    {
+        auto route = getTopicRouteData(topic);
+        if (route == nullptr || route->brokerDatas.empty()) {
+            return {};
+        }
+        addr = route->brokerDatas[0].selectBrokerAddr();
+    }
+    if (addr.empty()) {
+        return {};
+    }
+    try {
+        GetConsumerListByGroupResponseBody body =
+            getConsumerListByGroup(consumerGroup, addr, timeoutMillis);
+        return body.consumerIdList;
+    } catch (const std::exception& e) {
+        logger_debug("getConsumerIdListByGroup failed, topic=" + topic + " group=" + consumerGroup
+                     + ": " + e.what());
+        return {};
+    }
+}
+
+void MQClientInstance::unregisterClientAllBrokers(const std::string& clientId,
+                                                 const std::string& producerGroup,
+                                                 const std::string& consumerGroup,
+                                                 int32_t timeoutMillis) {
+    // 向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）：
+    // 生产者/消费者 shutdown 时逐台 broker 发 UNREGISTER_CLIENT(35)。不发的话 broker 端
+    // Consumer/ProducerManager 只能等心跳超时（默认 ~120s）清理，期间事务回查、消费者
+    // 变更通知仍可能发往已退出的实例。单台失败只记 debug——shutdown 路径不应因网络抖动抛异常。
+    for (const std::string& addr : getRouteOfAllBrokers()) {
+        try {
+            unregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
+        } catch (const std::exception& e) {
+            logger_debug("unregisterClient failed, addr=" + addr + ": " + e.what());
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 工具

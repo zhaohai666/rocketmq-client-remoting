@@ -14,7 +14,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rocketmq/client/result.h"
@@ -84,11 +86,22 @@ public:
     // ---------------- 路由管理 ----------------
     // 从 NameServer 拉取 topic 路由。未知 topic 会回退到 MixAll::DEFAULT_TOPIC
     // （5.x nameserver 不为未知 topic 合成路由，返回 TOPIC_NOT_EXIST）。
+    // isDefault=true 时未知 topic 才会回退到默认 topic（TBW102）来合成发布信息——
+    // 这**只有生产者**在真实路由拉不到时才允许（对应 Java DefaultMQProducerImpl
+    // 的 tryToFindTopicPublishInfo）。消费者路径必须传 false（默认），否则 %RETRY%group
+    // 这类尚未由 broker 创建的主题会被合成出一组假队列，两个实例视图不一致。
     bool updateTopicRouteInfoFromNameServer(const std::string& topic,
-                                            int32_t timeoutMillis = 5000);
+                                            int32_t timeoutMillis = 5000,
+                                            bool isDefault = false);
     // 取发布信息（**缓存实例共享**，轮询游标在实例内推进）；
-    // 缓存未命中会触发一次路由刷新，仍拿不到则抛 MQClientException
-    std::shared_ptr<TopicPublishInfo> getTopicPublishInfo(const std::string& topic);
+    // 缓存未命中会触发一次路由刷新，仍拿不到则抛 MQClientException。
+    // isDefault 透传给 updateTopicRouteInfoFromNameServer（仅生产者发送路径显式传 true）。
+    std::shared_ptr<TopicPublishInfo> getTopicPublishInfo(const std::string& topic,
+                                                         bool isDefault = false);
+    // 登记「在用」topic，交给后台周期任务刷新路由（对应 Java 的订阅/发布 topic 列表）。
+    // 没有它，路由变化（新 topic 被 broker 创建、队列扩容）只能等下一次 rebalance
+    // 或生产者下次发送才被发现。
+    void registerTopicInUse(const std::string& topic);
     std::shared_ptr<TopicRouteData> getTopicRouteData(const std::string& topic);
 
     static std::string findBrokerAddrInRoute(const TopicRouteData& route,
@@ -145,6 +158,12 @@ public:
     void unregisterClient(const std::string& addr, const std::string& clientId,
                           const std::string& producerGroup, const std::string& consumerGroup,
                           int32_t timeoutMillis = 5000);
+    // 向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）：
+    // 关闭连接前调用，broker 端立刻摘除，不必等心跳超时（~120s）。
+    void unregisterClientAllBrokers(const std::string& clientId,
+                                    const std::string& producerGroup,
+                                    const std::string& consumerGroup,
+                                    int32_t timeoutMillis = 5000);
 
     // ---------------- 通用同步调用（管理端复用）----------------
     // 下发任意 requestCode + extFields + body。languageOverride >= 0 时覆盖请求的
@@ -188,6 +207,12 @@ public:
     GetConsumerListByGroupResponseBody getConsumerListByGroup(
         const std::string& consumerGroup, const std::string& addr,
         int32_t timeoutMillis = 5000);
+    // 按 topic 路由找到的 master broker 查消费组 clientId 列表（对应 Java
+    // MQClientInstance.findConsumerIdList）。查不到/无路由/非 SUCCESS 返回空 vector，
+    // 调用方按 Java 语义「保留当前分配」，不要回退成独占全部队列。
+    std::vector<std::string> getConsumerIdListByGroup(const std::string& topic,
+                                                     const std::string& consumerGroup,
+                                                     int32_t timeoutMillis = 5000);
 
     // ---------------- 按 Key / uniqKey 查消息 ----------------
     // indexType 见 MessageConst::INDEX_*_TYPE；uniqKey 为 true 时额外下发
@@ -217,6 +242,8 @@ private:
     std::string brokerAddr(const MessageQueue& mq);
     RemotingCommand invokeSyncOnAddr(const std::string& addr, RemotingCommand& request,
                                      int32_t timeoutMillis);
+    // 后台路由刷新循环（对应 Java startScheduledTask 的 updateTopicRouteInfoFromNameServer 周期任务）
+    void routeRefreshLoop();
 
     std::string clientId_;
     std::vector<std::string> nameServerAddrs_;
@@ -225,7 +252,11 @@ private:
     mutable std::recursive_mutex routeLock_;
     std::map<std::string, TopicRouteData> topicRouteTable_;
     std::map<std::string, std::shared_ptr<TopicPublishInfo>> topicPublishInfoTable_;
+    // 在用 topic（消费者订阅 + 生产者发送过的），由周期任务刷新路由
+    std::set<std::string> topicsInUse_;
     bool started_ = false;
+    bool routeRefreshStop_ = false;
+    std::thread routeRefreshThread_;
 };
 
 }  // namespace rocketmq

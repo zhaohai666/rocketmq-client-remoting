@@ -227,51 +227,53 @@ def test_heartbeat():
     got_alias = json.loads(run_tool("--decode-heartbeat", alias.hex()))
     check("hb accepts isWithoutSub alias", got_alias.get("withoutSub") is True, got_alias)
 
-    # ---- 已知差异（Python 参考客户端侧，非 C++ 问题），显式测出来避免"看着绿其实字段丢了" ----
+    # ---- Python 参考客户端曾有两处会导致 broker **静默丢字段**的偏差，现已修复；
+    #      这里改成回归守卫（不再是 WARN），防止将来退回 snake_case / 不可哈希。
+    #      背景：broker 用 fastjson2 按 **Java 属性名** 反序列化，字段名错一个就静默丢字段。----
     from rocketmq.common.subscription_data import SubscriptionData as PySub
     from rocketmq.common.subscription_data import FilterAPI as PyFilterAPI
     from rocketmq.remoting.protocol.heartbeat import ConsumerData as PyConsumerData
 
-    # 差异 1：SubscriptionData 定义了 __eq__ 却没配 __hash__ -> 不可哈希
+    # 守卫 1：SubscriptionData 必须可哈希
+    # （它定义了 __eq__；若不同时定义 __hash__ 就不可哈希，
+    #   ConsumerData.subscription_data_set.add(...) 会直接抛 TypeError）
     try:
         set().add(PySub("T", "*"))
         check("python SubscriptionData is hashable", True)
     except TypeError as exc:
-        warn("Python 参考客户端的 SubscriptionData 定义了 __eq__ 但未定义 __hash__，"
-             "因此不可哈希：ConsumerData.subscription_data_set.add(...) 会抛 "
-             "TypeError(%s)。同时 send_heartbeat() 在客户端里从未被调用，"
-             "所以这条心跳/订阅代码路径是**未经测试的死代码**——"
-             "Python 侧若要支持心跳注册，需补 __hash__（C++ 侧无此问题）。" % exc)
+        check("python SubscriptionData is hashable", False,
+              "SubscriptionData 定义了 __eq__ 却没配 __hash__，"
+              "subscription_data_set.add(...) 会抛 TypeError(%s)" % exc)
 
-    # 差异 2：to_dict 用 __dict__ -> snake_case 键，broker(fastjson2) 认不出来
+    # 守卫 2：to_dict() 必须输出 Java 驼峰字段名（不能是 __dict__ 的 snake_case）
     py_cd = PyConsumerData("cg_x")
-    # 用 list 顶替 set 以绕过上面的不可哈希问题，仅用于观察序列化字段名
-    py_cd.subscription_data_set = [PyFilterAPI.build_subscription_data("TopicX", "TagA")]
+    py_cd.subscription_data_set = {PyFilterAPI.build_subscription_data("TopicX", "TagA")}
     py_dict = py_cd.to_dict()
     sent_keys = set((py_dict.get("subscriptionDataSet") or [{}])[0].keys())
     snake = sorted(k for k in sent_keys if "_" in k)
-    if snake:
-        warn("Python 参考客户端 SubscriptionData.to_dict() 输出 snake_case 键 %s；"
-             "broker 用 fastjson2 按 Java 属性名反序列化，会丢掉这些字段"
-             "（C++ 侧已使用正确的 Java 字段名，可被 broker 正常解析）。" % snake)
-        # 包成 HeartbeatData 的形状再喂给 C++（to_dict 产出的是 ConsumerData 一层）
-        hb_dict = {
-            "clientID": "cid",
-            "consumerDataSet": [py_dict],
-            "heartbeatFingerprint": 0,
-            "producerDataSet": [],
-            "withoutSub": False,
-        }
-        got_py = json.loads(run_tool("--decode-heartbeat",
-                                     json.dumps(hb_dict, default=_json_default)
-                                     .encode("utf-8").hex()))
-        pcd = (got_py.get("consumerDataSet") or [{}])[0]
-        psd = (pcd.get("subscriptionDataSet") or [{}])[0]
-        check("hb python-client body: topic survives", psd.get("topic") == "TopicX", psd)
-        check("hb python-client body: snake_case fields are NOT visible to C++",
-              not psd.get("subString") and not psd.get("tagsSet"), psd)
-    else:
-        check("python heartbeat uses Java field names", False, sent_keys)
+    check("python SubscriptionData.to_dict() has NO snake_case keys", not snake,
+          "snake_case 键 %s 会被 broker(fastjson2) 静默丢弃" % snake)
+    check("python SubscriptionData.to_dict() uses Java keys",
+          {"topic", "subString", "tagsSet", "classFilterMode", "expressionType"}
+          <= sent_keys, sorted(sent_keys))
+
+    # Python 产出的心跳 body 必须能被 C++ 按 Java 字段名**完整**解出
+    # （包成 HeartbeatData 的形状；to_dict 产出的是 ConsumerData 那一层）
+    hb_dict = {
+        "clientID": "cid",
+        "consumerDataSet": [py_dict],
+        "heartbeatFingerprint": 0,
+        "producerDataSet": [],
+        "withoutSub": False,
+    }
+    got_py = json.loads(run_tool("--decode-heartbeat",
+                                 json.dumps(hb_dict, default=_json_default)
+                                 .encode("utf-8").hex()))
+    pcd = (got_py.get("consumerDataSet") or [{}])[0]
+    psd = (pcd.get("subscriptionDataSet") or [{}])[0]
+    check("hb python-client body: topic survives", psd.get("topic") == "TopicX", psd)
+    check("hb python-client body: Java-named fields ARE visible to C++",
+          psd.get("subString") == "TagA" and psd.get("tagsSet") == ["TagA"], psd)
 
 
 def main():

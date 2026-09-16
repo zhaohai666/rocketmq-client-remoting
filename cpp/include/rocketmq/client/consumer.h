@@ -96,6 +96,11 @@ public:
     int64_t heartbeatCount() const { return heartbeatCount_.load(); }
     // 流控触发次数（用于验证流控能力）
     int64_t flowControlTriggered() const { return flowControlTriggered_.load(); }
+    // 当前分给本实例的队列 key 列表（真机验证"同组两实例不重不漏"用）。
+    // key 格式与 offsetKey 一致：topic + brokerName + queueId。
+    std::vector<std::string> assignedQueueKeys() const;
+    // 查消费组在某 topic 上的全部 clientId（对应 Java findConsumerIdList），用于验证多实例注册。
+    std::vector<std::string> consumerIdListOfGroup(const std::string& topic) const;
 
     // ---------------- 订阅 ----------------
     void subscribe(const std::string& topic, const std::string& subExpression = "*");
@@ -149,6 +154,26 @@ private:
     int64_t resolveInitialOffset(const MessageQueue& mq, const SubscriptionData& sub);
     static std::string offsetKey(const MessageQueue& mq);
 
+    // ---- 真实 rebalance（对齐 Java RebalanceImpl.rebalanceByTopic）----
+    // 计算本实例应持有的队列集并写入 assignedQueues_，再同步拉取线程；
+    // 新分配的队列**立刻**解析初始位点写入 offsetTable_。
+    void doRebalance();
+    // 当前分配里「topic 的全部队列」（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
+    std::vector<MessageQueue> allQueuesOfTopic(const std::string& topic);
+    // AllocateMessageQueueAveragely（对齐 Java 同名字段逐条实现）。
+    static std::vector<MessageQueue> allocateMessageQueueAveragely(
+        const std::string& consumerGroup, const std::string& currentCid,
+        const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll);
+    // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
+    bool ownsQueue(const std::string& key) const;
+    // 队列被撤走时的收尾（对应 Java removeUnnecessaryMessageQueue）：持久化已消费位点、
+    // 丢弃在途缓冲、顺序消费集群模式解锁。revoked 为 (队列, 已消费位点) 列表。
+    void onQueuesRevoked(const std::vector<std::pair<MessageQueue, int64_t>>& revoked);
+    // broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。
+    void onConsumerIdsChanged(const RemotingCommand& cmd);
+    // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）。
+    void resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs);
+
     std::string consumerGroup_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
@@ -186,12 +211,22 @@ private:
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_{false};
     std::map<std::string, std::thread> pullThreads_;
+    // 被撤销队列对应的旧拉取线程（已脱离 pullThreads_，等待其自然退出后回收）
+    std::vector<std::thread> retiredThreads_;
     std::thread dispatchThread_;
     std::thread persistThread_;
     std::thread lockThread_;
     std::thread rebalanceThread_;
+    // 真实 rebalance 计算出的本实例队列集（对应 Java ProcessQueueTable 的键集）。
+    // 取代旧实现里「订阅 topic 的全部队列」，避免同组多实例重复消费。
+    std::vector<MessageQueue> assignedQueues_;
     std::condition_variable cv_;
     std::mutex waitMutex_;
+    // 即时重算信号（broker 发 NOTIFY_CONSUMER_IDS_CHANGED 时置位）
+    std::atomic<bool> rebalanceNow_{false};
+    std::mutex rebalanceMutex_;
+    std::condition_variable rebalanceCv_;
+    int64_t startMillis_ = 0;
     std::atomic<int64_t> consumedCount_{0};
     std::atomic<int64_t> heartbeatCount_{0};
     std::atomic<int64_t> lastHeartbeatMs_{0};
