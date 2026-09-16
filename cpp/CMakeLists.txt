@@ -58,6 +58,7 @@ set(RMQ_SOURCES
     src/client/mq_client.cpp
     src/client/producer.cpp
     src/client/consumer.cpp
+    src/client/pull_consumer.cpp
     src/client/admin.cpp
 )
 

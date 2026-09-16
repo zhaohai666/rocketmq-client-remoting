@@ -1143,23 +1143,34 @@ class DefaultMQPullConsumer:
         client = self._require_client()
         timeout = timeout_millis if timeout_millis is not None else self.consumer_pull_timeout_millis
         sub = FilterAPI.build_subscription_data(mq.topic, sub_expression)
-        sys_flag = PullSysFlag.build_sys_flag(commit_offset=(self.message_model != MessageModel.BROADCASTING),
-                                              suspend=True, subscription=True, class_filter=False)
+        # 对齐 Java DefaultMQPullConsumerImpl.pullSyncImpl（:248）：
+        #   sysFlag = PullSysFlag.buildSysFlag(false, block, true, false)
+        # 即 commit_offset=False、suspend=block。**pull() 的 block=false** ——
+        # 位点由调用方自己 update_consume_offset 提交，且这是**短轮询**不挂起。
+        # ⚠ 曾在这里写成 suspend=True：broker 在队尾会挂起到 brokerSuspendMaxTimeMillis
+        # （默认 20s），而客户端 5s 就超时 → RemotingTimeoutException（真机必现）。
+        sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
+                                              subscription=True, class_filter=False)
         return client.pull_message(self.consumer_group, mq, offset, max_nums,
-                                   sys_flag, 0, sub.sub_string or "*", sub.sub_version,
+                                   sys_flag, 0, sub.sub_string or "*",
+                                   # Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
+                                   0,
                                    ExpressionType.TAG, timeout_millis=timeout,
                                    max_msg_bytes=-1, suspend_timeout_millis=15000)
 
     def pull_block_if_not_found(self, mq: MessageQueue, sub_expression: str, offset: int,
                                 max_nums: int) -> PullResult:
-        """长轮询拉取（对应 Java pullBlockIfNotFound）。"""
+        """长轮询拉取（对应 Java pullBlockIfNotFound，block=true → 挂起等消息）。"""
         client = self._require_client()
         sub = FilterAPI.build_subscription_data(mq.topic, sub_expression)
-        sys_flag = PullSysFlag.build_sys_flag(commit_offset=(self.message_model != MessageModel.BROADCASTING),
-                                              suspend=True, subscription=True, class_filter=False)
+        # block=true：suspend=True 让 broker 挂起到有消息；超时用
+        # consumer_timeout_millis_when_suspend（Java :250 的 `block ? ... : timeout`）。
+        sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=True,
+                                              subscription=True, class_filter=False)
         return client.pull_message(self.consumer_group, mq, offset, max_nums,
-                                   sys_flag, 0, sub.sub_string or "*", sub.sub_version,
-                                   ExpressionType.TAG, timeout_millis=self.consumer_timeout_millis_when_suspend,
+                                   sys_flag, 0, sub.sub_string or "*", 0,
+                                   ExpressionType.TAG,
+                                   timeout_millis=self.consumer_timeout_millis_when_suspend,
                                    max_msg_bytes=-1,
                                    suspend_timeout_millis=self.broker_suspend_max_time_millis)
 
@@ -1197,6 +1208,15 @@ class DefaultMQPullConsumer:
         return resp_header.timestamp or 0
 
     def send_message_back(self, msg: MessageExt, delay_level: int) -> None:
+        """消息回投（对应 Java DefaultMQPullConsumer.sendMessageBack）。
+
+        注意两点（真机踩过）：
+        1. 地址靠 `broker_addr_of(msg.broker_name)` 反查**路由表**，所以调用方必须先用本
+           consumer 访问过该 topic（Java 同理，走 findBrokerAddressInPublish 读 brokerAddrTable）。
+        2. 与 Java 的**有意差异**：Java 在失败时会吞掉异常、改用内部默认生产者把消息直接发到
+           `%RETRY%group`（见 DefaultMQPullConsumerImpl:666 的 catch 分支）。本实现不做这个
+           兜底 —— 回投失败就抛，让调用方看见，而不是换一条路径静默重发。
+        """
         client = self._require_client()
         from ..remoting.protocol.codes import RequestCode
         from ..remoting.protocol.headers import ConsumerSendMsgBackRequestHeader

@@ -25,3 +25,7 @@ target_link_libraries(rmq_compression_live PRIVATE rocketmq::remoting)
 add_executable(rmq_live_acl live_acl.cpp)
 target_link_libraries(rmq_live_acl PRIVATE rocketmq::remoting)
 
+# 主动拉取消费者（DefaultMQPullConsumer）真机联调
+add_executable(rmq_live_pull live_pull.cpp)
+target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
+
