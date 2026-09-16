@@ -57,6 +57,15 @@ public:
         kvNamespaceToDeleteList_.push_back(ns);
     }
 
+    // ---------------- ACL 鉴权（对应 Java DefaultMQAdminExt(rpcHook)）----------------
+    // 必须在 start() 之前调用。
+    void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
+    void setCredentials(const std::string& accessKey, const std::string& secretKey,
+                        const std::string& securityToken = std::string()) {
+        rpcHook_ = std::make_shared<AclClientRPCHook>(
+            SessionCredentials(accessKey, secretKey, securityToken));
+    }
+
     void start();
     void shutdown();
     bool isStarted() const { return started_; }
@@ -224,6 +233,8 @@ private:
     int32_t timeoutMillis_ = DEFAULT_TIMEOUT;
 
     std::unique_ptr<MQClientInstance> mqClient_;
+    // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
+    std::shared_ptr<RPCHook> rpcHook_;
     bool started_ = false;
 };
 

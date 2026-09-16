@@ -50,6 +50,18 @@ public:
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     const std::string& namespaceOf() const { return namespace_; }
 
+    // ---------------- ACL 鉴权（对应 Java DefaultMQProducer(rpcHook)）----------------
+    // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance（同一 clientId
+    // 复用实例时以先注册者为准，与 Java 的绑定时机一致）。
+    void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
+    // 便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。
+    void setCredentials(const std::string& accessKey, const std::string& secretKey,
+                        const std::string& securityToken = std::string()) {
+        rpcHook_ = std::make_shared<AclClientRPCHook>(
+            SessionCredentials(accessKey, secretKey, securityToken));
+    }
+    const std::shared_ptr<RPCHook>& rpcHook() const { return rpcHook_; }
+
     // ---------------- 压缩配置（对应 Java DefaultMQProducer 同名属性）----------------
     // body 长度 >= 该阈值时自动压缩（默认 4096，与 Java 一致）；批量消息永不压缩。
     void setCompressMsgBodyOverHowmuch(int32_t bytes) { compressMsgBodyOverHowmuch_ = bytes; }
@@ -170,6 +182,8 @@ protected:
     std::string namespace_;
 
     std::unique_ptr<MQClientInstance> mqClient_;
+    // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
+    std::shared_ptr<RPCHook> rpcHook_;
     bool started_ = false;
     std::mutex lock_;
     // 异步发送线程句柄，shutdown 时统一 join 回收

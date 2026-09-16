@@ -19,6 +19,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using RocketMQ.Common;
+using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
@@ -85,6 +86,17 @@ public sealed class DefaultMQAdminExt
 
     public List<string> GetNameServerAddressList() => new List<string>(_nameServerAddrs);
 
+    // ---------------- ACL 鉴权（对应 Java DefaultMQAdminExt(rpcHook)）----------------
+    // 必须在 Start() 之前调用。
+    public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
+
+    /// <summary>便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。</summary>
+    public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
+        => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
+
+    // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
+    private IRpcHook? _rpcHook;
+
     public void SetTimeoutMillis(int millis) => _timeoutMillis = millis;
 
     public int GetTimeoutMillis() => _timeoutMillis;
@@ -107,6 +119,13 @@ public sealed class DefaultMQAdminExt
 
         _mqClient = new MQClientInstance(_clientId, _nameServerAddrs);
         _mqClient.Start();
+        // ACL 鉴权钩子：管理端的所有请求（建/删 topic、查状态等）同样需要签名。
+        if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
+        {
+            ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
+                + _clientId + ")");
+        }
+
         _started = true;
     }
 

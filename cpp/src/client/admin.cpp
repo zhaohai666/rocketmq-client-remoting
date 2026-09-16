@@ -86,6 +86,11 @@ void DefaultMQAdminExt::start() {
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_));
     mqClient_->start();
+    // ACL 鉴权钩子：管理端的所有请求（建/删 topic、查状态等）同样需要签名。
+    if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
+        logger_warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
+                    + clientId_ + ")");
+    }
     started_ = true;
 }
 

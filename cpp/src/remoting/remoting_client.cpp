@@ -161,6 +161,16 @@ struct RemotingClient::Impl {
     std::mutex procMutex;
     std::unordered_map<int32_t, RequestProcessor> processors;
 
+    // RPC 钩子（ACL 等）。注册发生在 start 阶段；发送路径只在锁内取一次
+    // shared_ptr 拷贝，**绝不持锁调用钩子**（钩子内部可能做签名计算甚至 I/O）。
+    std::mutex hookMutex;
+    std::shared_ptr<RPCHook> rpcHook;
+
+    std::shared_ptr<RPCHook> currentHook() {
+        std::lock_guard<std::mutex> lk(hookMutex);
+        return rpcHook;
+    }
+
     // 读线程账本：<连接, 线程>。线程结束后置 connection->readerDone，
     // 由 pruneThreadsLocked 回收（join 后从账本移除），避免线程句柄无限堆积。
     std::mutex threadMutex;
@@ -392,6 +402,12 @@ struct RemotingClient::Impl {
     }
 
     void sendRequest(const std::string& addr, RemotingCommand& request) {
+        // RPC 钩子必须在 encode() **之前**执行：ACL 钩子把 AccessKey/Signature
+        // 写进 extFields，而签名覆盖的正是「即将上线的这份 extFields + body」。
+        // 先取快照再调用，避免持锁跑钩子。
+        if (auto hook = currentHook()) {
+            hook->doBeforeRequest(addr, request);
+        }
         auto conn = getOrCreateConnection(addr);
         Bytes data = request.encode();
         std::lock_guard<std::mutex> lk(conn->writeMutex);
@@ -525,6 +541,20 @@ void RemotingClient::registerProcessor(int32_t requestCode, RequestProcessor han
 void RemotingClient::unregisterProcessor(int32_t requestCode) {
     std::lock_guard<std::mutex> lk(impl_->procMutex);
     impl_->processors.erase(requestCode);
+}
+
+bool RemotingClient::registerRPCHook(std::shared_ptr<RPCHook> hook) {
+    std::lock_guard<std::mutex> lk(impl_->hookMutex);
+    if (impl_->rpcHook) {
+        return false;  // first-wins：已有钩子，保留旧的（与 Java 绑定时机一致）
+    }
+    impl_->rpcHook = std::move(hook);
+    return true;
+}
+
+void RemotingClient::unregisterRPCHook() {
+    std::lock_guard<std::mutex> lk(impl_->hookMutex);
+    impl_->rpcHook.reset();
 }
 
 bool RemotingClient::isChannelWritable(const std::string& addr) const {

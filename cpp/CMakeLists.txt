@@ -53,6 +53,7 @@ set(RMQ_SOURCES
     src/remoting/protocol/admin_body.cpp
     src/remoting/protocol/body.cpp
     src/remoting/remoting_client.cpp
+    src/remoting/rpchook.cpp
     src/client/result.cpp
     src/client/mq_client.cpp
     src/client/producer.cpp

@@ -106,6 +106,13 @@ void DefaultMQProducer::start() {
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_));
     mqClient_->start();
+    // ACL 鉴权钩子：必须在任何请求发出之前绑定（路由拉取、心跳都会带签名）。
+    if (rpcHook_) {
+        if (!mqClient_->registerRPCHook(rpcHook_)) {
+            logger_warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
+                        + clientId_ + ")");
+        }
+    }
     // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
     // 不注册的话 broker 回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 UNKNOW。
     mqClient_->remotingClient().registerProcessor(

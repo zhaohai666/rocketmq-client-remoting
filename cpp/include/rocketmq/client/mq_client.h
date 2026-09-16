@@ -83,6 +83,13 @@ public:
     void updateNameServerAddressList(const std::vector<std::string>& addrs);
     RemotingClient& remotingClient() { return *remotingClient_; }
 
+    // 安装 RPC 钩子（ACL 鉴权）。对应 Java 在 MQClientInstance 构造时绑定 rpcHook。
+    // **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
+    // 此时返回 false。故钩子必须在 start() 之前设置。
+    bool registerRPCHook(std::shared_ptr<RPCHook> hook) {
+        return remotingClient_->registerRPCHook(std::move(hook));
+    }
+
     // ---------------- 路由管理 ----------------
     // 从 NameServer 拉取 topic 路由。未知 topic 会回退到 MixAll::DEFAULT_TOPIC
     // （5.x nameserver 不为未知 topic 合成路由，返回 TOPIC_NOT_EXIST）。

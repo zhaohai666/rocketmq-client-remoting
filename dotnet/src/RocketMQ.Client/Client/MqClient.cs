@@ -117,6 +117,13 @@ public sealed class MQClientInstance : IDisposable
         _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis);
     }
 
+    /// <summary>
+    /// 安装 RPC 钩子（ACL 鉴权）。对应 Java 在构造 MQClientInstance 时绑定 rpcHook。
+    /// **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
+    /// 此时返回 false。故钩子必须在 Start() 之前设置。
+    /// </summary>
+    public bool RegisterRpcHook(IRpcHook hook) => _remotingClient.RegisterRpcHook(hook);
+
     // ---------------- 生命周期 ----------------
 
     public void Start()

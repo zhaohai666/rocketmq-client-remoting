@@ -23,10 +23,13 @@ MAX_FRAME_LENGTH = 16 * 1024 * 1024
 
 
 class _ResponseFuture:
-    def __init__(self, opaque: int, timeout_millis: int, invoke_callback=None):
+    def __init__(self, opaque: int, timeout_millis: int, invoke_callback=None,
+                 request: Optional[RemotingCommand] = None):
         self.opaque = opaque
         self.timeout_millis = timeout_millis
         self.invoke_callback = invoke_callback
+        # 保留请求命令，供 do_after_response 钩子使用（对应 Java 的 request 形参）
+        self.request = request
         self.response: Optional[RemotingCommand] = None
         self.send_request_ok = False
         self._done = threading.Event()
@@ -185,6 +188,7 @@ class RemotingClient:
                 future = self._response_table.pop(cmd.opaque, None)
             if future is not None:
                 future.put_response(cmd)
+                self._apply_after_response_hooks(addr, future.request, cmd)
                 if future.invoke_callback is not None:
                     try:
                         future.invoke_callback(cmd)
@@ -199,6 +203,7 @@ class RemotingClient:
         if future is not None:
             # 异常兜底：本应是对端响应却没带响应标志
             future.put_response(cmd)
+            self._apply_after_response_hooks(addr, future.request, cmd)
             if future.invoke_callback is not None:
                 try:
                     future.invoke_callback(cmd)
@@ -231,8 +236,34 @@ class RemotingClient:
     def unregister_processor(self, request_code: int) -> None:
         self._processors.pop(request_code, None)
 
+    # ---------- RPC 钩子 ----------
+    def _apply_before_request_hooks(self, addr: str, cmd: RemotingCommand) -> None:
+        """发送前依次执行 RPC 钩子（对应 Java NettyRemotingAbstract#doBeforeRpcHooks）。
+
+        **必须在 cmd.encode() 之前调用**：ACL 钩子要把 AccessKey/Signature 写进
+        ext_fields，而 Signature 覆盖的是 makeCustomHeaderToNet() 之后的完整
+        ext_fields + body —— 即真正会上线的那份内容。encode() 之后再注入就晚了。
+        """
+        for hook in tuple(self.rpc_hooks):
+            hook.do_before_request(addr, cmd)
+
+    def _apply_after_response_hooks(self, addr: str, request: Optional[RemotingCommand],
+                                    response: Optional[RemotingCommand]) -> None:
+        """收到响应后依次执行 RPC 钩子（对应 Java NettyRemotingAbstract#doAfterRpcHooks）。
+
+        无钩子时零开销；request 缺失（理论上不会）则跳过，不影响响应分发。
+        """
+        if not self.rpc_hooks or request is None:
+            return
+        for hook in tuple(self.rpc_hooks):
+            try:
+                hook.do_after_response(addr, request, response)
+            except Exception:
+                pass
+
     # ---------- 请求发送 ----------
     def _send(self, addr: str, cmd: RemotingCommand) -> None:
+        self._apply_before_request_hooks(addr, cmd)
         sock = self._get_or_create_conn(addr)
         data = cmd.encode()
         with self._sock_locks.get(addr, threading.Lock()):
@@ -247,7 +278,7 @@ class RemotingClient:
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
-        future = _ResponseFuture(request.opaque, timeout)
+        future = _ResponseFuture(request.opaque, timeout, request=request)
         with self._response_lock:
             self._response_table[request.opaque] = future
         try:
@@ -267,7 +298,8 @@ class RemotingClient:
     def invoke_async(self, addr: str, request: RemotingCommand, callback: Callable[[RemotingCommand], None],
                      timeout_millis: Optional[int] = None) -> None:
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
-        future = _ResponseFuture(request.opaque, timeout, invoke_callback=callback)
+        future = _ResponseFuture(request.opaque, timeout, invoke_callback=callback,
+                                 request=request)
         with self._response_lock:
             self._response_table[request.opaque] = future
         try:

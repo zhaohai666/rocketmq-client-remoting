@@ -33,6 +33,7 @@ internal static class Program
                 "admin-live" => AdminLive.Run(rest),
                 "compression-live" => CompressionLive.Run(rest),
                 "redelivery" => LiveRedelivery.Run(rest),
+                "acl" => LiveAcl.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -62,6 +63,7 @@ internal static class Program
               admin-live   [namesrv]        真实集群管理端全链路联调
               compression-live <mode> ...   压缩跨客户端矩阵
               redelivery    [namesrv]       真实集群消费侧能力联调（回投/位点/顺序/广播/流控）
+              acl     [namesrv] [ak] [sk]   真实集群 ACL 鉴权联调（需 broker 开 authenticationEnabled）
             """);
     }
 }

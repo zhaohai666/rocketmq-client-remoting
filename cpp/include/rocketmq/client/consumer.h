@@ -89,6 +89,16 @@ public:
     // 套上 "ns%" 前缀再与 broker 交互（对齐 Java start() 里对 consumerGroup 的包装）。
     void setNamespace(const std::string& ns) { namespace_ = ns; }
 
+    // ---------------- ACL 鉴权（对应 Java DefaultMQPushConsumer(rpcHook)）----------------
+    // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance。
+    void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
+    void setCredentials(const std::string& accessKey, const std::string& secretKey,
+                        const std::string& securityToken = std::string()) {
+        rpcHook_ = std::make_shared<AclClientRPCHook>(
+            SessionCredentials(accessKey, secretKey, securityToken));
+    }
+    const std::shared_ptr<RPCHook>& rpcHook() const { return rpcHook_; }
+
     const std::string& consumerGroup() const { return consumerGroup_; }
     const std::string& clientId() const { return clientId_; }
     const std::string& messageModel() const { return messageModel_; }
@@ -181,6 +191,8 @@ private:
 
     std::string consumerGroup_;
     std::string namespace_;
+    // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
+    std::shared_ptr<RPCHook> rpcHook_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
     std::string messageModel_ = MessageModel::CLUSTERING;

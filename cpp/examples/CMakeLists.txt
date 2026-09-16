@@ -21,3 +21,7 @@ target_link_libraries(rmq_admin_live PRIVATE rocketmq::remoting)
 add_executable(rmq_compression_live compression_live.cpp)
 target_link_libraries(rmq_compression_live PRIVATE rocketmq::remoting)
 
+# ACL 鉴权真机联调（需 broker 开 authenticationEnabled；不打进 ctest）
+add_executable(rmq_live_acl live_acl.cpp)
+target_link_libraries(rmq_live_acl PRIVATE rocketmq::remoting)
+

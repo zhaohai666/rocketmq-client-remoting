@@ -36,6 +36,8 @@ public class DefaultMQProducer
     // 命名空间（多租户隔离）：非空前，发送时把 topic 拼成 "ns%topic" 发给 broker。
     // 默认空 = 不加命名空间（与裸集群兼容，不破坏现有行为）。
     private string _namespace = string.Empty;
+    // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
+    private IRpcHook? _rpcHook;
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
@@ -140,6 +142,15 @@ public class DefaultMQProducer
         set => _namespace = value ?? string.Empty;
     }
 
+    // ---------------- ACL 鉴权（对应 Java DefaultMQProducer(group, rpcHook)）----------------
+    // 必须在 Start() 之前调用：钩子在 Start() 里绑定到 MQClientInstance（同一 clientId
+    // 复用实例时以先注册者为准，与 Java 的绑定时机一致）。
+    public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
+
+    /// <summary>便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。</summary>
+    public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
+        => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
+
     public string ProducerGroup
     {
         get => _producerGroup;
@@ -203,6 +214,13 @@ public class DefaultMQProducer
 
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs);
             _mqClient.Start();
+
+            // ACL 鉴权钩子：必须在任何请求发出之前绑定（路由拉取、心跳都会带签名）。
+            if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
+            {
+                ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
+                    + _clientId + ")");
+            }
 
             // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
             // 不注册的话回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 Unknown。

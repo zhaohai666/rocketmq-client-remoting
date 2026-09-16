@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "rocketmq/remoting/protocol/remoting_command.h"
+#include "rocketmq/remoting/rpchook.h"
 
 namespace rocketmq {
 
@@ -72,6 +73,24 @@ public:
     // invokeSync / invokeAsync 响应分发。handler 在读线程里被调用，需自保证线程安全。
     void registerProcessor(int32_t requestCode, RequestProcessor handler);
     void unregisterProcessor(int32_t requestCode);
+
+    // ---- RPC 钩子（ACL 鉴权等）----
+    // 对应 Java NettyRemotingClient#registerRPCHook。钩子在每次请求**编码之前**
+    // 于发送路径上被调用（invokeSync / invokeAsync / invokeOneway 三条路径共用同一
+    // 注入点），从而能把 AccessKey/Signature 写进 extFields。
+    //
+    // 注册发生在 start 阶段、读路径只读，故不需要在调用钩子时持锁。
+    // **首次注册生效（first-wins）**：已有钩子时返回 false 且不覆盖，与 Java 的
+    // 行为一致（Java 在构造 MQClientInstance 时绑定钩子，同一 clientId 复用实例）。
+    // 因此钩子/凭据必须在 start() 之前设置。
+    //
+    // 注意（与 Java 的有意差异）：Java 还在响应完成回调里调用 doAfterResponse，
+    // 本实现**没有**该调用——响应在读线程里分发，此处不持有请求对象，
+    // 为了不把每个请求的 body 都拷一份挂在在途表上，故省略。
+    // AclClientRPCHook#doAfterResponse 本身是空实现，因此无功能影响。
+    // 返回 true 表示安装成功，false 表示已有钩子被保留。
+    bool registerRPCHook(std::shared_ptr<RPCHook> hook);
+    void unregisterRPCHook();
 
     // ---- 连接管理 ----
     bool isChannelWritable(const std::string& addr) const;

@@ -72,6 +72,55 @@ public sealed class RemotingClient : IDisposable
     private readonly object _threadMutex = new();
     private readonly List<(Connection conn, Thread thread)> _threads = new();
 
+    // RPC 钩子（ACL 等）。注册发生在 start 阶段；发送路径只在锁内取一次引用，
+    // **绝不持锁调用钩子**（钩子内部要做签名计算）。
+    private readonly object _hookLock = new();
+    private IRpcHook? _rpcHook;
+
+    /// <summary>
+    /// 安装 RPC 钩子（对应 Java NettyRemotingClient#registerRPCHook）。钩子在每次请求
+    /// **编码之前**于发送路径上被调用，从而能把 AccessKey/Signature 写进 ExtFields。
+    /// </summary>
+    /// <remarks>
+    /// <b>first-wins</b>：已有钩子时返回 false 且不覆盖，与 Java 在构造 MQClientInstance 时
+    /// 绑定钩子的行为一致（同一 clientId 复用实例）。因此钩子必须在 Start() 之前设置。
+    /// <para>
+    /// 注意（与 Java 的有意差异）：Java 还在响应完成回调里调用 DoAfterResponse，本实现
+    /// 没有该调用——响应在读线程里分发，此处不持有请求对象，为了不把每个请求的 Body
+    /// 都拷一份挂在在途表上，故省略。AclClientRPCHook.DoAfterResponse 本身是空实现，
+    /// 因此无功能影响。
+    /// </para>
+    /// </remarks>
+    public bool RegisterRpcHook(IRpcHook hook)
+    {
+        lock (_hookLock)
+        {
+            if (_rpcHook is not null)
+            {
+                return false;
+            }
+
+            _rpcHook = hook;
+            return true;
+        }
+    }
+
+    public void UnregisterRpcHook()
+    {
+        lock (_hookLock)
+        {
+            _rpcHook = null;
+        }
+    }
+
+    private IRpcHook? CurrentRpcHook()
+    {
+        lock (_hookLock)
+        {
+            return _rpcHook;
+        }
+    }
+
     public RemotingClient(int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000)
     {
         _connectTimeoutMillis = connectTimeoutMillis;
@@ -452,6 +501,9 @@ public sealed class RemotingClient : IDisposable
 
     private void SendRequest(string addr, RemotingCommand request)
     {
+        // RPC 钩子必须在 Encode() **之前**执行：ACL 钩子把 AccessKey/Signature 写进
+        // ExtFields，而签名覆盖的正是「即将上线的这份 ExtFields + Body」。
+        CurrentRpcHook()?.DoBeforeRequest(addr, request);
         Connection conn = GetOrCreateConnection(addr);
         byte[] data = request.Encode();
         lock (conn.WriteLock)

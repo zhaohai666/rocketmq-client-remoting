@@ -159,6 +159,11 @@ void DefaultMQPushConsumer::start() {
                                              /*connectTimeoutMillis=*/3000,
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_));
         mqClient_->start();
+        // ACL 鉴权钩子：必须在首包（路由拉取 / 心跳 / rebalance）发出之前绑定。
+        if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
+            logger_warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
+                        + clientId_ + ")");
+        }
         startMillis_ = UtilAll::currentTimeMillis();
         stop_.store(false);
         started_.store(true);
