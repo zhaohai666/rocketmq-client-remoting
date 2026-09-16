@@ -246,12 +246,29 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     const int32_t sysFlag = prepareForSend(outbound);
 
     std::string lastError;
+    std::string lastBrokerName;
     for (int32_t attempt = 0; attempt <= retryTimesWhenSendFailed_; ++attempt) {
         try {
             std::shared_ptr<TopicPublishInfo> publish =
                 c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
-            MessageQueue selected = publish->selectOneMessageQueue();
-            return c.sendMessage(producerGroup_, outbound, selected, timeout, sysFlag);
+            // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
+            // 关闭时退化为普通轮询（策略内部判断）。
+            MessageQueue selected = mqFaultStrategy_.selectOneMessageQueue(*publish, lastBrokerName);
+            lastBrokerName = selected.brokerName;
+            const int64_t sendBegin = UtilAll::currentTimeMillis();
+            SendResult result;
+            try {
+                result = c.sendMessage(producerGroup_, outbound, selected, timeout, sysFlag);
+            } catch (...) {
+                // 发送异常：按隔离档位记录（latency 固定 10000ms），broker 进入隔离期
+                mqFaultStrategy_.updateFaultItem(selected.brokerName, 0.0, true, false);
+                throw;
+            }
+            // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+            mqFaultStrategy_.updateFaultItem(
+                selected.brokerName,
+                static_cast<double>(UtilAll::currentTimeMillis() - sendBegin), false, true);
+            return result;
         } catch (const MQClientException& e) {
             lastError = e.what();
         } catch (const MQBrokerException& e) {

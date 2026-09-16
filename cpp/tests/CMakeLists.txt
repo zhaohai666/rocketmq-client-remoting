@@ -42,6 +42,11 @@ add_executable(rmq_test_request_reply test_request_reply.cpp)
 target_link_libraries(rmq_test_request_reply PRIVATE rocketmq::remoting)
 add_test(NAME request_reply COMMAND rmq_test_request_reply)
 
+# 发送延迟故障容错：阈值表逐档映射 + 隔离/到期恢复 + 选择退化链（available→reachable→轮询）
+add_executable(rmq_test_latency test_latency.cpp)
+target_link_libraries(rmq_test_latency PRIVATE rocketmq::remoting)
+add_test(NAME latency COMMAND rmq_test_latency)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

@@ -85,6 +85,37 @@ public sealed class TopicPublishInfo
         long last = Interlocked.Increment(ref _index) - 1;
         return MsgQueueList[(int)(last % MsgQueueList.Count)];
     }
+
+    /// <summary>
+    /// 带过滤器的轮询（对应 Python select_one_message_queue(*filters)）：游标照常推进，
+    /// 一轮内全部不匹配返回 null，由调用方退化选择。filter 与 brokerFilter 都通过才选中。
+    /// </summary>
+    public MessageQueue? SelectOneMessageQueue(Func<MessageQueue, bool> filter,
+                                               Func<MessageQueue, bool> brokerFilter)
+    {
+        if (MsgQueueList.Count == 0)
+        {
+            throw new MQClientException("no message queue for publish info");
+        }
+
+        for (int i = 0; i < MsgQueueList.Count; ++i)
+        {
+            long idx = Interlocked.Increment(ref _index) - 1;
+            MessageQueue mq = MsgQueueList[(int)(idx % MsgQueueList.Count)];
+            if (filter(mq) && brokerFilter(mq))
+            {
+                return mq;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>重置轮询游标（对应 Python reset_index，故障规避 resetIndex 用）。</summary>
+    public void ResetIndex()
+    {
+        Interlocked.Exchange(ref _index, 0);
+    }
 }
 
 /// <summary>客户端核心编排实例。</summary>

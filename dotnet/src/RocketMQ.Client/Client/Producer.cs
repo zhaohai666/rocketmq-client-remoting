@@ -42,6 +42,8 @@ public class DefaultMQProducer
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
     private int _retryTimesWhenSendFailed = 2;
+    // 发送延迟故障规避（默认关闭，对应 Java MQFaultStrategy 的默认开关）
+    private readonly MQFaultStrategy _mqFaultStrategy = new(false);
     private int _maxMessageSize = 1024 * 1024 * 4;
     // 压缩配置，默认值与 Java DefaultMQProducer 一致
     private int _compressMsgBodyOverHowmuch = 1024 * 4;
@@ -117,6 +119,17 @@ public class DefaultMQProducer
         get => _retryTimesWhenSendFailed;
         set => _retryTimesWhenSendFailed = value;
     }
+
+    // ---------------- 故障规避（对应 Java sendLatencyFaultEnable，默认关闭）----------------
+    // 开启后发送选队列会按 broker 延迟/隔离状态过滤（MQFaultStrategy）；发送结果回写
+    // 容错表：成功记实测延迟（超阈值隔离该 broker 一段时间），异常记隔离 10000ms 档。
+    public bool SendLatencyFaultEnable
+    {
+        get => _mqFaultStrategy.IsSendLatencyFaultEnable();
+        set => _mqFaultStrategy.SetSendLatencyFaultEnable(value);
+    }
+
+    public MQFaultStrategy MqFaultStrategy => _mqFaultStrategy;
 
     public int MaxMessageSize
     {
@@ -411,13 +424,32 @@ public class DefaultMQProducer
         int sysFlag = PrepareForSend(outbound);
 
         string lastError = string.Empty;
+        string lastBrokerName = "";
         for (int attempt = 0; attempt <= _retryTimesWhenSendFailed; ++attempt)
         {
             try
             {
                 TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
-                MessageQueue selected = publish.SelectOneMessageQueue();
-                return c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
+                // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
+                // 关闭时退化为普通轮询（策略内部判断）。
+                MessageQueue selected = _mqFaultStrategy.SelectOneMessageQueue(publish, lastBrokerName);
+                lastBrokerName = selected.BrokerName;
+                long sendBegin = UtilAll.CurrentTimeMillis();
+                SendResult result;
+                try
+                {
+                    result = c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
+                }
+                catch (Exception)
+                {
+                    // 发送异常：按隔离档位记录（latency 固定 10000ms），broker 进入隔离期
+                    _mqFaultStrategy.UpdateFaultItem(selected.BrokerName, 0.0, true, false);
+                    throw;
+                }
+                // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
+                                                 UtilAll.CurrentTimeMillis() - sendBegin, false, true);
+                return result;
             }
             catch (MQClientException e)
             {

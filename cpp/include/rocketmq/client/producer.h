@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/latency.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/request_reply.h"
 #include "rocketmq/client/result.h"
@@ -51,6 +52,13 @@ public:
     // 包装成 "namespace%topic" 再发给 broker（系统资源 / retry / DLQ 前缀除外）。
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     const std::string& namespaceOf() const { return namespace_; }
+
+    // ---------------- 故障规避（对应 Java sendLatencyFaultEnable，默认关闭）----------------
+    // 开启后发送选队列会按 broker 延迟/隔离状态过滤（MQFaultStrategy）；发送结果回写
+    // 容错表：成功记实测延迟（超阈值隔离该 broker 一段时间），异常记隔离 10000ms 档。
+    void setSendLatencyFaultEnable(bool enable) { mqFaultStrategy_.setSendLatencyFaultEnable(enable); }
+    bool isSendLatencyFaultEnable() const { return mqFaultStrategy_.isSendLatencyFaultEnable(); }
+    MQFaultStrategy& mqFaultStrategy() { return mqFaultStrategy_; }
 
     // ---------------- ACL 鉴权（对应 Java DefaultMQProducer(rpcHook)）----------------
     // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance（同一 clientId
@@ -205,6 +213,8 @@ protected:
     int32_t compressType_ = CompressionType::ZLIB;
     std::vector<std::string> nameServerAddrs_;
     std::string namespace_;
+    // 发送延迟故障规避（默认关闭，对应 Java MQFaultStrategy 的默认开关）
+    MQFaultStrategy mqFaultStrategy_{false};
 
     std::unique_ptr<MQClientInstance> mqClient_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层

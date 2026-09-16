@@ -83,6 +83,25 @@ MessageQueue TopicPublishInfo::selectOneMessageQueue(const std::string& lastBrok
     return msgQueueList[static_cast<size_t>(idx % msgQueueList.size())];
 }
 
+std::optional<MessageQueue> TopicPublishInfo::selectOneMessageQueue(
+    const std::function<bool(const MessageQueue&)>& filter,
+    const std::function<bool(const MessageQueue&)>& brokerFilter) {
+    if (msgQueueList.empty()) {
+        throw MQClientException("no message queue for publish info");
+    }
+    // 对应 Python select_one_message_queue(*filters)：游标照常推进，
+    // 一轮内全部不匹配返回 nullopt（由调用方退化选择，不在这里兜底）。
+    const size_t n = msgQueueList.size();
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t idx = index_.fetch_add(1);
+        MessageQueue mq = msgQueueList[static_cast<size_t>(idx % n)];
+        if (filter(mq) && brokerFilter(mq)) {
+            return mq;
+        }
+    }
+    return std::nullopt;
+}
+
 // ---------------------------------------------------------------- 生命周期
 MQClientInstance::MQClientInstance(const std::string& clientId,
                                   const std::vector<std::string>& nameServerAddrs,

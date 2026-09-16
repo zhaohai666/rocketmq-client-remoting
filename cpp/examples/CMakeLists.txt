@@ -33,3 +33,7 @@ target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
 add_executable(rmq_live_request_reply live_rr.cpp)
 target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)
 
+# 发送延迟故障容错真机联调（默认关/开、隔离退化链、到期恢复；不打进 ctest）
+add_executable(rmq_live_latency live_latency.cpp)
+target_link_libraries(rmq_live_latency PRIVATE rocketmq::remoting)
+

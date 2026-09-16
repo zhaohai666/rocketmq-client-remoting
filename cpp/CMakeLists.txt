@@ -38,6 +38,7 @@ set(RMQ_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(RMQ_SOURCES
     src/common/util_all.cpp
     src/common/message.cpp
+    src/client/latency.cpp
     src/common/message_decoder.cpp
     src/common/subscription_data.cpp
     src/common/compression.cpp

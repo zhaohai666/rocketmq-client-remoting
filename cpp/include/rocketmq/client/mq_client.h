@@ -11,9 +11,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -58,6 +60,15 @@ public:
     MessageQueue selectOneMessageQueue();
     // 避开上一次失败的 broker（对应 Java selectOneMessageQueue(lastBrokerName)）
     MessageQueue selectOneMessageQueue(const std::string& lastBrokerName);
+
+    // 带过滤器的轮询（对应 Python select_one_message_queue(*filters)）：游标照常推进，
+    // 一轮内全部不匹配返回 nullopt，由调用方退化选择。
+    // 全部过滤器都通过才选中。
+    std::optional<MessageQueue> selectOneMessageQueue(
+        const std::function<bool(const MessageQueue&)>& filter,
+        const std::function<bool(const MessageQueue&)>& brokerFilter);
+    // 重置轮询游标（对应 Python reset_index，故障规避 resetIndex 用）
+    void resetIndex() { index_.store(0); }
 
 private:
     std::atomic<uint64_t> index_{0};

@@ -74,7 +74,6 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 | --- | --- | --- | --- | --- | --- |
 | 故障规避 sendLatencyFaultEnable | P2 | ⚠ 已接线未真机 | ❌ | ❌ | Python 有 MQFaultStrategy 并接入选队列（默认关）；C++/.NET 无 |
 | POP 模式 (5.x 轻量消费) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
-| Request-Reply (5.x) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
 | 消息轨迹 Trace/Hook | P3 | ❌ | ❌ | ❌ | 三侧均无 |
 | TLS | P3 | ❌ | ❌ | ❌ | 仅明文 TCP |
 | 动态 name server (address server) | P3 | ❌ | ❌ | ❌ | 仅静态 namesrv 列表 |
@@ -82,8 +81,10 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 | 其它 broker 主动请求 | P3 | 部分 | 部分 | 部分 | 仅接 CHECK_TRANSACTION_STATE(39)；GET_CONSUMER_RUNNING_INFO(307) 等未接（admin 有 VIEW_MESSAGE 部分） |
 | 细粒度流控 / 线程弹性 | P3 | ❌ | ❌ | ❌ | 仅 pullThresholdForQueue；消费线程 min=max 固定 |
 
-注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。三个硬伤（命名空间 / ACL / PullConsumer）已于
-2026-09-16 三侧补齐并真机验证（命名空间走 S8 隔离场景 19–21/0；ACL 走 `run_acl_live.sh` S1–S7 三语言 7/0；
-PullConsumer 走 `run_pull_live.sh` S1–S7 三语言 16/0）。下一步按 P2 推进：**POP 模式 / Request-Reply**
-（5.x 管道，工作量大）或先补 C++/.NET 的故障规避（照搬 Python `latency.py`），再往后是 Trace / TLS /
-动态 name server / 307 运行信息。
+注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。命名空间 / ACL / PullConsumer 已于
+2026-09-16 三侧补齐并真机验证；**Request-Reply (5.x) 亦于同日三侧补齐并真机验证**
+（Py 16/16、C++ 15/15、.NET 16/16，`/tmp/run_rr_live.sh`；Py+C++ 提交 56350c2、.NET 提交
+8932727，均已 push）。**remoting 传输层新增约定：broker 主动请求（326 等）的处理器回调
+可返回响应，必须原路写回已有连接、opaque 原样带回、oneway 不回；326 查不到等待槽也回
+SUCCESS。** 下一步按 P2 推进：**POP 模式**（5.x 管道，工作量大）或先补 C++/.NET 的故障规避
+（照搬 Python `latency.py`），再往后是 Trace / TLS / 动态 name server / 307 运行信息。
