@@ -47,7 +47,17 @@ public sealed class MessageSelector
 public sealed class DefaultMQPushConsumer
 {
     // ---------------- 配置 ----------------
-    public string ConsumerGroup { get; }
+    public string ConsumerGroup { get; private set; }
+
+    private string _namespace = string.Empty;
+
+    // 命名空间（对应 Java DefaultMQPushConsumer.setNamespace）：非空时把 topic / group
+    // 套上 "ns%" 前缀再与 broker 交互（对齐 Java start() 里对 consumerGroup 的包装）。
+    public string Namespace
+    {
+        get => _namespace;
+        set => _namespace = value ?? string.Empty;
+    }
 
     private string _instanceName = "DEFAULT";
     private string _clientId = string.Empty;
@@ -242,10 +252,11 @@ public sealed class DefaultMQPushConsumer
             throw new MQClientException("consumer already started, cannot change configuration");
         }
 
-        SubscriptionData sub = FilterAPI.BuildSubscriptionData(topic, subExpression);
+        string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
+        SubscriptionData sub = FilterAPI.BuildSubscriptionData(realTopic, subExpression);
         lock (_lock)
         {
-            _subscriptionData[topic] = sub;
+            _subscriptionData[realTopic] = sub;
         }
     }
 
@@ -256,19 +267,20 @@ public sealed class DefaultMQPushConsumer
             throw new MQClientException("consumer already started, cannot change configuration");
         }
 
-        var sub = new SubscriptionData(topic, selector.Expression)
+        string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
+        var sub = new SubscriptionData(realTopic, selector.Expression)
         {
             ExpressionType = selector.Type,
         };
         if (selector.Type == ExpressionType.TAG)
         {
-            SubscriptionData built = FilterAPI.BuildSubscriptionData(topic, selector.Expression);
+            SubscriptionData built = FilterAPI.BuildSubscriptionData(realTopic, selector.Expression);
             sub.TagsSet = built.TagsSet;
         }
 
         lock (_lock)
         {
-            _subscriptionData[topic] = sub;
+            _subscriptionData[realTopic] = sub;
         }
     }
 
@@ -321,6 +333,13 @@ public sealed class DefaultMQPushConsumer
             if (_clientId.Length == 0)
             {
                 _clientId = ClientIds.Build(_instanceName);
+            }
+
+            // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
+            // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
+            if (_namespace.Length != 0)
+            {
+                ConsumerGroup = NamespaceUtil.WrapNamespace(_namespace, ConsumerGroup);
             }
 
             // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：
@@ -793,7 +812,10 @@ public sealed class DefaultMQPushConsumer
                             string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
                             if (!string.IsNullOrEmpty(orig))
                             {
-                                m.Topic = orig!;
+                                // Java 还会把命名空间从还原后的 topic 上剥掉再交给 listener
+                                m.Topic = _namespace.Length == 0
+                                    ? orig!
+                                    : NamespaceUtil.WithoutNamespace(orig!, _namespace);
                             }
                         }
 

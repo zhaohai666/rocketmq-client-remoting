@@ -84,6 +84,7 @@ public static class LiveRedelivery
         ScenarioFlowControl(producer);
         ScenarioRebalance(producer);
         ScenarioUnregister();
+        ScenarioNamespace();
 
         producer.Shutdown();
         Console.WriteLine();
@@ -484,5 +485,61 @@ public static class LiveRedelivery
             before.Contains(cid) && !after.Contains(cid),
             "before=" + before.Count.ToString(CultureInfo.InvariantCulture)
                 + " after=" + after.Count.ToString(CultureInfo.InvariantCulture));
+    }
+
+    // ---------------- S8 命名空间（多租户隔离）----------------
+    private static void ScenarioNamespace()
+    {
+        string ns = "NSDotnet" + (NowMs() % 100000).ToString(CultureInfo.InvariantCulture);
+        string topic = _gPrefix + "_Ns";
+
+        var nsProducer = new DefaultMQProducer(_gPrefix + "_ns_pg");
+        nsProducer.NamesrvAddr = _namesrv;
+        nsProducer.Namespace = ns;
+        nsProducer.Start();
+        // CreateTopic 也走 namespace 包装：真实建出来的是 "<ns>%<topic>"
+        PrepareTopic(nsProducer, topic);
+
+        var nsListener = new CollectingListenerConcurrently();
+        var nsConsumer = new DefaultMQPushConsumer(_gPrefix + "_g8");
+        nsConsumer.Namespace = ns;
+        nsConsumer.SetNamesrvAddr(_namesrv);
+        nsConsumer.SetMessageListener(nsListener);
+        nsConsumer.Subscribe(topic, "*");
+        nsConsumer.Start();
+        Thread.Sleep(3000);
+        for (int i = 0; i < 3; ++i)
+        {
+            nsProducer.Send(new Message(topic, Str2Bytes("ns-" + i.ToString(CultureInfo.InvariantCulture))));
+        }
+
+        Thread.Sleep(8000);
+        nsConsumer.Shutdown();
+        List<string> nsGot = nsListener.Snapshot();
+        Check("S8-带 namespace 生产/消费收全", nsGot.Count == 3,
+            "got=" + nsGot.Count.ToString(CultureInfo.InvariantCulture));
+
+        // 不带 namespace 的消费者订阅同一个裸 topic → 收不到（证明真实 topic 是 ns%topic）
+        var plainListener = new CollectingListenerConcurrently();
+        try
+        {
+            var plainConsumer = new DefaultMQPushConsumer(_gPrefix + "_g8plain");
+            plainConsumer.SetNamesrvAddr(_namesrv);
+            plainConsumer.SetMessageListener(plainListener);
+            plainConsumer.Subscribe(topic, "*");
+            plainConsumer.Start();
+            Thread.Sleep(8000);
+            plainConsumer.Shutdown();
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  (无 ns 消费者异常，符合隔离预期: " + e.Message + ")");
+        }
+
+        List<string> plainGot = plainListener.Snapshot();
+        Check("S8-无 namespace 消费者收不到(隔离)", plainGot.Count == 0,
+            "got=" + plainGot.Count.ToString(CultureInfo.InvariantCulture));
+
+        nsProducer.Shutdown();
     }
 }

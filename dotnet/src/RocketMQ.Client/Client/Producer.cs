@@ -33,6 +33,9 @@ public class DefaultMQProducer
     private string _producerGroup;
     private string _instanceName = "DEFAULT";
     private string _clientId = string.Empty;
+    // 命名空间（多租户隔离）：非空前，发送时把 topic 拼成 "ns%topic" 发给 broker。
+    // 默认空 = 不加命名空间（与裸集群兼容，不破坏现有行为）。
+    private string _namespace = string.Empty;
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
@@ -127,6 +130,14 @@ public class DefaultMQProducer
     {
         get => _createTopicKey;
         set => _createTopicKey = value;
+    }
+
+    // 命名空间（对应 Java DefaultMQProducer.setNamespace）：非空时发送前把 topic
+    // 包装成 "ns%topic" 再发给 broker（%RETRY%/%DLQ% 前缀除外，系统资源不包装）。
+    public string Namespace
+    {
+        get => _namespace;
+        set => _namespace = value ?? string.Empty;
     }
 
     public string ProducerGroup
@@ -347,6 +358,19 @@ public class DefaultMQProducer
         return copy;
     }
 
+    // 发送前给 topic 套上 namespace 前缀（对应 Java DefaultMQProducer.withNamespace）。
+    // namespace 为空时仅克隆（不改变 topic）。
+    private Message WithNamespace(Message msg)
+    {
+        Message outMsg = CloneMessage(msg);
+        if (_namespace.Length != 0)
+        {
+            outMsg.Topic = NamespaceUtil.WrapNamespace(_namespace, msg.Topic);
+        }
+
+        return outMsg;
+    }
+
     // ---------------- 同步发送 ----------------
 
     // 不指定队列：轮询选择，失败按 retryTimesWhenSendFailed 重试
@@ -355,7 +379,7 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
-        Message outbound = CloneMessage(msg);
+        Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
 
         string lastError = string.Empty;
@@ -392,7 +416,7 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
-        Message outbound = CloneMessage(msg);
+        Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
         return c.SendMessage(_producerGroup, outbound, mq, timeout, sysFlag);
     }
@@ -404,10 +428,10 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(msg.Topic);
+        Message outbound = WithNamespace(msg);
+        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
         MessageQueue selected = selector.Select(publish.MsgQueueList, msg, arg);
         // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
-        Message outbound = CloneMessage(msg);
         int sysFlag = PrepareForSend(outbound);
         return c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
     }
@@ -452,9 +476,9 @@ public class DefaultMQProducer
     {
         MQClientInstance c = GetClient();
         CheckMessage(msg);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(msg.Topic);
+        Message outbound = WithNamespace(msg);
+        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
-        Message outbound = CloneMessage(msg);
         int sysFlag = PrepareForSend(outbound);
         c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
     }
@@ -472,10 +496,16 @@ public class DefaultMQProducer
 
         MessageBatch batch = MessageBatch.GenerateFromList(msgs);
         CheckMessage(batch);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(batch.Topic);
+        Message outbound = CloneMessage(batch);
+        // 对应 Java MessageBatch.generateFromList + withNamespace：批量 topic 也要套命名空间
+        if (_namespace.Length != 0)
+        {
+            outbound.Topic = NamespaceUtil.WrapNamespace(_namespace, batch.Topic);
+        }
+
+        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
         // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
-        Message outbound = CloneMessage(batch);
         int sysFlag = PrepareForSend(outbound);
         return c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
     }
@@ -506,11 +536,11 @@ public class DefaultMQProducer
 
         MQClientInstance c = GetClient();
         CheckMessage(msg);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(msg.Topic);
+        Message outbound = WithNamespace(msg);
+        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
 
         // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
-        Message outbound = CloneMessage(msg);
         outbound.PutProperty(MessageConst.PropertyTransactionPrepared, "true");
         outbound.PutProperty(MessageConst.PropertyProducerGroup, _producerGroup);
         _txListener = listener;
@@ -834,7 +864,8 @@ public class DefaultMQProducer
     public List<MessageQueue> FetchPublishMessageQueues(string topic)
     {
         MQClientInstance c = GetClient();
-        TopicPublishInfo publish = c.GetTopicPublishInfo(topic);
+        TopicPublishInfo publish = c.GetTopicPublishInfo(
+            _namespace.Length == 0 ? topic : NamespaceUtil.WrapNamespace(_namespace, topic));
         return publish.MsgQueueList;
     }
 
@@ -844,7 +875,10 @@ public class DefaultMQProducer
         const int perm = 6; // PERM_READ | PERM_WRITE
         // C++ 的 createTopic 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
         _ = key;
-        c.CreateTopicInRoute(newTopic, queueNum, queueNum, perm);
+        string realTopic = _namespace.Length == 0
+            ? newTopic
+            : NamespaceUtil.WrapNamespace(_namespace, newTopic);
+        c.CreateTopicInRoute(realTopic, queueNum, queueNum, perm);
     }
 
     public long SearchOffset(MessageQueue mq, long timestamp) =>

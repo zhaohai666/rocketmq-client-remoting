@@ -186,6 +186,13 @@ void DefaultMQProducer::checkMessage(const Message& msg) const {
     }
 }
 
+Message DefaultMQProducer::withNamespace(const Message& msg) const {
+    if (namespace_.empty()) return msg;
+    Message out = msg;
+    out.topic = NamespaceUtil::wrapNamespace(namespace_, msg.topic);
+    return out;
+}
+
 // 对应 Java DefaultMQProducerImpl.tryToCompressMessage + sendKernelImpl 的 sysFlag 组装。
 //
 // 语义逐条对齐 Java：
@@ -224,7 +231,7 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
-    Message outbound = msg;
+    Message outbound = withNamespace(msg);
     const int32_t sysFlag = prepareForSend(outbound);
 
     std::string lastError;
@@ -251,7 +258,7 @@ SendResult DefaultMQProducer::send(const Message& msg, const MessageQueue& mq,
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
-    Message outbound = msg;
+    Message outbound = withNamespace(msg);
     const int32_t sysFlag = prepareForSend(outbound);
     return c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag);
 }
@@ -262,10 +269,11 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic, /*isDefault=*/true);
-    MessageQueue selected = selector.select(publish->msgQueueList, msg, arg);
+    Message outbound = withNamespace(msg);
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    MessageQueue selected = selector.select(publish->msgQueueList, outbound, arg);
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
-    Message outbound = msg;
     const int32_t sysFlag = prepareForSend(outbound);
     return c.sendMessage(producerGroup_, outbound, selected, timeout, sysFlag);
 }
@@ -295,9 +303,10 @@ void DefaultMQProducer::sendAsync(const Message& msg, std::shared_ptr<SendCallba
 void DefaultMQProducer::sendOneway(const Message& msg) {
     MQClientInstance& c = client();
     checkMessage(msg);
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(msg.topic, /*isDefault=*/true);
+    Message outbound = withNamespace(msg);
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
-    Message outbound = msg;
     const int32_t sysFlag = prepareForSend(outbound);
     c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
 }
@@ -311,6 +320,9 @@ SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_
     }
     MessageBatch batch = MessageBatch::generateFromList(msgs);
     checkMessage(batch);
+    if (!namespace_.empty()) {
+        batch.topic = NamespaceUtil::wrapNamespace(namespace_, batch.topic);
+    }
     std::shared_ptr<TopicPublishInfo> publish =
         c.getTopicPublishInfo(batch.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
@@ -504,7 +516,7 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     checkMessage(msg);
 
     // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
-    Message outbound = msg;
+    Message outbound = withNamespace(msg);
     outbound.putProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED, "true");
     outbound.putProperty(MessageConst::PROPERTY_PRODUCER_GROUP, producerGroup_);
     txListener_ = &listener;
@@ -577,7 +589,8 @@ std::vector<MessageExt> DefaultMQProducer::queryMessage(const std::string& topic
                                                         int64_t endTimestamp) {
     MQClientInstance& c = client();
     Bytes body;
-    bool found = c.queryMessage(topic, key, maxNum, beginTimestamp, endTimestamp, body, 15000);
+    const std::string realTopic = namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
+    bool found = c.queryMessage(realTopic, key, maxNum, beginTimestamp, endTimestamp, body, 15000);
     if (!found || body.empty()) {
         return {};
     }
@@ -586,8 +599,9 @@ std::vector<MessageExt> DefaultMQProducer::queryMessage(const std::string& topic
 
 std::vector<MessageQueue> DefaultMQProducer::fetchPublishMessageQueues(const std::string& topic) {
     MQClientInstance& c = client();
+    const std::string realTopic = namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
     std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(topic, /*isDefault=*/true);
+        c.getTopicPublishInfo(realTopic, /*isDefault=*/true);
     return publish->msgQueueList;
 }
 
@@ -596,7 +610,8 @@ void DefaultMQProducer::createTopic(const std::string& key, const std::string& n
     MQClientInstance& c = client();
     constexpr int32_t perm = 6;  // PERM_READ | PERM_WRITE
     (void)key;
-    c.createTopicInRoute(newTopic, queueNum, queueNum, perm);
+    const std::string realTopic = namespace_.empty() ? newTopic : NamespaceUtil::wrapNamespace(namespace_, newTopic);
+    c.createTopicInRoute(realTopic, queueNum, queueNum, perm);
 }
 
 int64_t DefaultMQProducer::searchOffset(const MessageQueue& mq, int64_t timestamp) {

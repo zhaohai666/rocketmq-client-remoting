@@ -86,23 +86,25 @@ void DefaultMQPushConsumer::subscribe(const std::string& topic, const std::strin
     if (started_.load()) {
         throw MQClientException("consumer already started, cannot change configuration");
     }
-    SubscriptionData sub = FilterAPI::buildSubscriptionData(topic, subExpression);
+    const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
+    SubscriptionData sub = FilterAPI::buildSubscriptionData(realTopic, subExpression);
     std::lock_guard<std::mutex> lk(lock_);
-    subscriptionData_[topic] = sub;
+    subscriptionData_[realTopic] = sub;
 }
 
 void DefaultMQPushConsumer::subscribe(const std::string& topic, const MessageSelector& selector) {
     if (started_.load()) {
         throw MQClientException("consumer already started, cannot change configuration");
     }
-    SubscriptionData sub(topic, selector.expression);
+    const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
+    SubscriptionData sub(realTopic, selector.expression);
     sub.expressionType = selector.type;
     if (selector.type == ExpressionType::TAG) {
-        SubscriptionData built = FilterAPI::buildSubscriptionData(topic, selector.expression);
+        SubscriptionData built = FilterAPI::buildSubscriptionData(realTopic, selector.expression);
         sub.tagsSet = built.tagsSet;
     }
     std::lock_guard<std::mutex> lk(lock_);
-    subscriptionData_[topic] = sub;
+    subscriptionData_[realTopic] = sub;
 }
 
 void DefaultMQPushConsumer::unsubscribe(const std::string& topic) {
@@ -138,6 +140,11 @@ void DefaultMQPushConsumer::start() {
         }
         if (clientId_.empty()) {
             clientId_ = buildClientId(instanceName_);
+        }
+        // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
+        // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
+        if (!namespace_.empty()) {
+            consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
         }
         // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：
         // broker 回投的消息写到 %RETRY%group，客户端不订阅就收不到
@@ -984,12 +991,14 @@ void DefaultMQPushConsumer::onConsumerIdsChanged(const RemotingCommand& cmd) {
 
 void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs) {
     // 对应 Java DefaultMQPushConsumerImpl.resetRetryAndNamespace（分发前调用）。
-    // 本客户端不使用 namespace，故只做 topic 还原。
+    // 重投消息 topic 还原成业务原始 topic，并剥掉命名空间前缀。
     const std::string groupTopic = MixAll::getRetryTopic(consumerGroup_);
     for (MessageExt& msg : msgs) {
         std::string retryTopic = msg.getProperty(MessageConst::PROPERTY_RETRY_TOPIC);
         if (!retryTopic.empty() && msg.topic == groupTopic) {
-            msg.setTopic(retryTopic);
+            msg.setTopic(namespace_.empty()
+                             ? retryTopic
+                             : NamespaceUtil::withoutNamespace(retryTopic, namespace_));
         }
     }
 }

@@ -35,6 +35,7 @@
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/mix_all.h"
+#include "rocketmq/common/namespace_util.h"
 #include "rocketmq/common/subscription_data.h"
 #include "rocketmq/remoting/protocol/heartbeat.h"
 
@@ -83,6 +84,10 @@ public:
     // 是否在消费循环里周期性发 HEART_BEAT（默认开启；失败仅告警不影响消费）
     void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
     void setHeartbeatIntervalMillis(int32_t t) { heartbeatIntervalMillis_ = t; }
+
+    // 命名空间（对应 Java DefaultMQPushConsumer.setNamespace）：非空时把 topic / group
+    // 套上 "ns%" 前缀再与 broker 交互（对齐 Java start() 里对 consumerGroup 的包装）。
+    void setNamespace(const std::string& ns) { namespace_ = ns; }
 
     const std::string& consumerGroup() const { return consumerGroup_; }
     const std::string& clientId() const { return clientId_; }
@@ -175,6 +180,7 @@ private:
     void resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs);
 
     std::string consumerGroup_;
+    std::string namespace_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
     std::string messageModel_ = MessageModel::CLUSTERING;

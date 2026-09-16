@@ -19,6 +19,7 @@
 #include "rocketmq/common/compression.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/mix_all.h"
+#include "rocketmq/common/namespace_util.h"
 #include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 
@@ -44,6 +45,10 @@ public:
     void setDefaultTopicQueueNums(int32_t n) { defaultTopicQueueNums_ = n; }
     void setCreateTopicKey(const std::string& key) { createTopicKey_ = key; }
     void setProducerGroup(const std::string& g);
+    // 命名空间（对应 Java DefaultMQProducer namespace）。非空时发送前把 topic
+    // 包装成 "namespace%topic" 再发给 broker（系统资源 / retry / DLQ 前缀除外）。
+    void setNamespace(const std::string& ns) { namespace_ = ns; }
+    const std::string& namespaceOf() const { return namespace_; }
 
     // ---------------- 压缩配置（对应 Java DefaultMQProducer 同名属性）----------------
     // body 长度 >= 该阈值时自动压缩（默认 4096，与 Java 一致）；批量消息永不压缩。
@@ -109,6 +114,8 @@ public:
 
 protected:
     void checkMessage(const Message& msg) const;
+    // 发送前给 topic 套上 namespace 前缀（对应 Java withNamespace）；namespace 为空原样返回。
+    Message withNamespace(const Message& msg) const;
     // 对应 Java DefaultMQProducerImpl.tryToCompressMessage + sendKernelImpl 的 sysFlag 组装：
     // 满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sysFlag
     // （COMPRESSED_FLAG | 压缩类型位）；不压缩时返回 0。
@@ -160,6 +167,7 @@ protected:
     int32_t compressLevel_ = 5;
     int32_t compressType_ = CompressionType::ZLIB;
     std::vector<std::string> nameServerAddrs_;
+    std::string namespace_;
 
     std::unique_ptr<MQClientInstance> mqClient_;
     bool started_ = false;

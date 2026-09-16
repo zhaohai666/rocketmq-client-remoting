@@ -10,6 +10,8 @@
 //   S5 流控：阈值 2 + 慢消费 → 流控触发计数 >0，最终消息全部消费。
 //   S6 集群多实例 rebalance：同组两实例均分队列（不重不漏），40 条消息无重复消费。
 //   S7 优雅注销：shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除 clientId。
+//   S8 命名空间：带 namespace 的生产者/消费者在 "<ns>%<topic>" 上收发成功；不带 namespace
+//      的消费者订阅同名裸 topic 收不到（多租户隔离）。
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 prepareTopic）。消费者不做默认 topic
 //   兜底（对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），所以 topic 不存在
@@ -457,6 +459,54 @@ int main(int argc, char* argv[]) {
               beforeHas && !afterHas,
               "before=" + std::to_string(listBefore.size())
                   + " after=" + std::to_string(listAfter.size()));
+    }
+
+    // ---------------- S8 命名空间（多租户隔离）----------------
+    {
+        const std::string ns = "NSCpp" + std::to_string(nowMs() % 100000);
+        const std::string topic = gPrefix + "_Ns";
+        DefaultMQProducer nsProducer(gPrefix + "_ns_pg");
+        nsProducer.setNamesrvAddr(nsAddr);
+        nsProducer.setNamespace(ns);
+        nsProducer.start();
+        // createTopic 也走 namespace 包装：真实建出来的是 "<ns>%<topic>"
+        prepareTopic(nsProducer, topic);
+
+        std::vector<std::string> nsGot;
+        {
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g8");
+            consumer->setNamespace(ns);
+            consumer->setMessageListener(std::make_shared<CollectListener>(nsGot));
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->subscribe(topic);
+            consumer->start();
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            for (int i = 0; i < 3; ++i) {
+                nsProducer.send(Message(topic, str2bytes("ns-" + std::to_string(i))));
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            consumer->shutdown();
+        }
+        check("S8-带 namespace 生产/消费收全", nsGot.size() == 3,
+              "got=" + std::to_string(nsGot.size()));
+
+        // 不带 namespace 的消费者订阅同一个裸 topic → 收不到（证明真实 topic 是 ns%topic）
+        std::vector<std::string> plainGot;
+        try {
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g8plain");
+            consumer->setMessageListener(std::make_shared<CollectListener>(plainGot));
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->subscribe(topic);
+            consumer->start();
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            consumer->shutdown();
+        } catch (const std::exception& e) {
+            std::printf("  (无 ns 消费者异常，符合隔离预期: %s)\n", e.what());
+        }
+        check("S8-无 namespace 消费者收不到(隔离)", plainGot.empty(),
+              "got=" + std::to_string(plainGot.size()));
+
+        nsProducer.shutdown();
     }
 
     producer.shutdown();
