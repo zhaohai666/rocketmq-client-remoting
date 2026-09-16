@@ -941,7 +941,7 @@ public class TransactionMQProducer : DefaultMQProducer
 
     public ITransactionListener? TransactionListener { get; set; }
 
-    // 简化单阶段：使用预设 listener 执行本地事务。
+    // 两阶段事务：使用预设 listener 执行本地事务（半消息 → 本地事务 → END_TRANSACTION → broker 回查）。
     public TransactionSendResult SendMessageInTransaction(Message msg, string arg = "")
     {
         if (TransactionListener is null)

@@ -7,7 +7,7 @@
 //   4. 用户属性透传
 //   5. 延迟消息（setDelayTimeLevel 并校验 store_ts - born_ts >= 3000ms）
 //   6. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
-//   7. 事务消息（简化单阶段）+ 落库可消费
+//   7. 事务消息（两阶段的提交路径；完整链路见 RunTransaction）+ 落库可消费
 //   附：消费者心跳注册（HEART_BEAT）
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且

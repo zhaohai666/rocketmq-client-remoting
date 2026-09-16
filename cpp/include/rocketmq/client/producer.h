@@ -2,7 +2,8 @@
 // TransactionMQProducer 与 Python client/producer.py）。
 //
 // 能力覆盖：同步发送（轮询选队列 / 定点发送）、按选择器发送（顺序消息）、
-// 异步发送、单向发送、批量发送、事务消息（简化单阶段）、按 Key 查询、
+// 异步发送、单向发送、批量发送、事务消息（两阶段：半消息 → 本地事务 → END_TRANSACTION → broker 回查）、
+// 按 Key 查询、
 // offset 查询、建 topic。
 #ifndef ROCKETMQ_CLIENT_PRODUCER_H
 #define ROCKETMQ_CLIENT_PRODUCER_H

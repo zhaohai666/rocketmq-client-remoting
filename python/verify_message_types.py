@@ -8,7 +8,8 @@
   4. 带 Tag 消息 + 服务端 Tag 过滤消费
   5. 带 Key 消息 + 按 Key 服务端查询（query_message）
   6. 用户属性（user property）生产/消费透传
-  7. 事务消息（send_message_in_transaction，注意：Python 端为简化单阶段实现）
+  7. 事务消息（send_message_in_transaction，两阶段：半消息 → 本地事务 → END_TRANSACTION；
+     本文件只做提交路径的冒烟，回查/回滚的完整链路见 verify_transaction_live.py）
 
 本脚本自身不启动集群；调用方需先启动 nameServer(9876)+broker(10911) 且
 autoCreateTopicEnable=true。运行：在 venv 中 `python verify_message_types.py`
@@ -201,7 +202,7 @@ def main():
     hit = any((m.body == body_key) for m in (found or []))
     check("按 Key 查询(query_message)", hit, "returned=%d" % (len(found or [])))
 
-    # ---------- 7. 事务消息（简化单阶段实现）----------
+    # ---------- 7. 事务消息（两阶段的提交路径冒烟；完整链路见 verify_transaction_live.py）----------
     topic_tx = "%s_Tx" % PREFIX
 
     class _TxListener(TransactionListener):
@@ -214,7 +215,7 @@ def main():
     tsr = prod.send_message_in_transaction(Message(topic_tx, b"tx-commit"), _TxListener())
     tx_ok = (tsr is not None and tsr.send_status.name == "SEND_OK"
              and tsr.get_local_transaction_state() == LocalTransactionState.COMMIT_MESSAGE)
-    check("事务消息发送(简化单阶段)", tx_ok,
+    check("事务消息发送(提交路径)", tx_ok,
           "state=%s" % (tsr.get_local_transaction_state() if tsr else "None"))
     # 确认事务消息确实落库可被消费
     recv_tx = run_consumer(topic_tx, "*", 10, group_suffix="tx")
