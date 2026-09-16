@@ -732,15 +732,24 @@ public sealed class GetConsumerListByGroupRequestHeader : ICommandCustomHeader
 {
     public string? ConsumerGroup { get; set; }
 
+    // ⚠ 该头继承 RpcRequestHeader，Java 字段名是 "bname"（不是 "brokerName"）。
+    // findConsumerIdList 发往 topic 路由里的第一个 broker，bname 填该 brokerName。
+    // broker 处理 GET_CONSUMER_LIST_BY_GROUP 时实际只用 consumerGroup，bname 是协议对齐项。
+    public string? Bname { get; set; }
+
     public PropertyMap ToExtFields()
     {
         var outMap = new PropertyMap();
         HeaderCodec.PutOptStr(outMap, "consumerGroup", ConsumerGroup);
+        HeaderCodec.PutOptStr(outMap, "bname", Bname);
         return outMap;
     }
 
-    public void FromExtFields(PropertyMap ext) =>
+    public void FromExtFields(PropertyMap ext)
+    {
         ConsumerGroup = HeaderCodec.GetOptStr(ext, "consumerGroup");
+        Bname = HeaderCodec.GetOptStr(ext, "bname");
+    }
 }
 
 public sealed class GetConsumerListByGroupResponseHeader : ICommandCustomHeader

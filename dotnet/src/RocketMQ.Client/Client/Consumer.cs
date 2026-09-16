@@ -87,6 +87,16 @@ public sealed class DefaultMQPushConsumer
     private Thread? _rebalanceThread;
     private readonly Dictionary<string, Thread> _pullThreads = new(StringComparer.Ordinal);
 
+    // ---- 真实 rebalance（对齐 Java RebalanceImpl）----
+    // _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
+    // 由 DoRebalance() 按分配策略计算；_rebalanceNow 用于
+    // NOTIFY_CONSUMER_IDS_CHANGED(40) 触发的即时 rebalance（Java rebalanceImmediately）。
+    private List<MessageQueue> _assigned = new();
+    private readonly ManualResetEventSlim _rebalanceNow = new(false);
+    // 撤销标记（对齐 Java ProcessQueue.isDropped）：rebalance 把某队列从本实例分配中去掉后，
+    // 置 _dropped，pull 线程长轮询返回后看到该标记即丢弃批次并退出（不再为该队列服务）。
+    private readonly HashSet<string> _dropped = new(StringComparer.Ordinal);
+
     private MQClientInstance? _mqClient;
     private volatile bool _started;
     private volatile bool _stop;
@@ -331,10 +341,50 @@ public sealed class DefaultMQPushConsumer
             _mqClient.Start();
             _stop = false;
             _started = true;
+
+            // 登记订阅 topic 为"在用"，交给 MQClientInstance 周期刷新路由（对应 task ⑥）
+            foreach (string t in SubscribedTopics())
+            {
+                _mqClient.RegisterTopicInUse(t);
+            }
+
+            // 注册 broker 主动通知：消费者实例上下线 → 立即重算分配（对应 Java
+            // ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
+            _mqClient.RemotingClient.RegisterProcessor(RequestCode.NotifyConsumerIdsChanged,
+                OnConsumerIdsChanged);
         }
 
-        // 拉取：每队列一个线程（并发长轮询，避免空队列 suspend 阻塞其他队列投递）
-        RebalancePullThreads();
+        // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
+        // 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
+        // 心跳必须在 rebalance 之前：rebalance 要向 broker 查消费者列表。
+        try
+        {
+            RefreshRoutes();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("initial refresh routes failed: " + e.Message);
+        }
+
+        try
+        {
+            SendHeartbeatToAllBroker();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("initial heartbeat failed: " + e.Message);
+        }
+
+        // 首轮分配必须同步完成：否则拉取线程会在空分配集上白转，直到首轮 rebalance 才生效
+        try
+        {
+            DoRebalance();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("initial rebalance failed: " + e.Message);
+        }
+
         _dispatchThread = MakeThread("ConsumeMessageThread", DispatchLoop);
         _dispatchThread.Start();
         _persistThread = MakeThread("MQClientFactoryScheduledThread", OffsetPersistLoop);
@@ -404,6 +454,21 @@ public sealed class DefaultMQPushConsumer
         JoinIfAlive(_persistThread);
         JoinIfAlive(_lockThread);
         JoinIfAlive(_rebalanceThread);
+
+        // 优雅注销（对应 task ④）：关闭连接前从所有 broker 摘除本 clientId，不必等心跳超时
+        // （默认 ~120s）——否则这段时间内消费者变更通知仍可能发往已退出的实例。
+        if (_mqClient is not null)
+        {
+            try
+            {
+                _mqClient.UnregisterClientAllBrokers(_clientId, "", ConsumerGroup);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unregister client on shutdown failed: " + e.Message);
+            }
+        }
+
         _mqClient?.Shutdown();
     }
 
@@ -415,13 +480,50 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>后台线程工厂（dispatch / pull / persist / lock / rebalance 全走这里）。</summary>
+    /// <remarks>⚠ 这里的兜底 try/catch 是**刻意**的，别当成"掩盖 bug"删掉：
+    /// Java 的 ServiceThread / 线程池会把后台任务抛出的 Throwable 吞成日志（只损失那一个线程），
+    /// 而 **.NET 的默认行为是未处理异常直接终止整个进程**。实测后果：拉取线程在 Shutdown 竞态里
+    /// 调 Client() 抛 MQClientException → 整个联调进程 `Abort trap: 6`（RC=134），
+    /// 其后的所有场景（S6/S7）一行都跑不到。有了这层兜底，进程级崩溃降级为
+    /// "该后台线程退出 + 一条 WARN"，与 Java 的可观测行为一致。
+    /// 注意：正常路径**不应**出现这条 WARN —— 出现即代表有真 bug 要查。</remarks>
     private static Thread MakeThread(string name, ThreadStart action)
     {
-        var t = new Thread(action)
+        var t = new Thread(() =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("background thread (" + name + ") exited unexpectedly: " + e);
+            }
+        })
         {
             IsBackground = true,
+            Name = name,
         };
         return t;
+    }
+
+    /// <summary>启动初期把订阅 topic 的真实路由拉到本地缓存（对应 Java
+    /// MQClientInstance.updateTopicRouteInfoFromNameServer 的首轮拉取）。消费侧不做默认 topic
+    /// 兜底——%RETRY%group 等尚未由 broker 创建的主题拉不到就保持空，rebalance 视图才一致。</summary>
+    private void RefreshRoutes()
+    {
+        foreach (string t in SubscribedTopics())
+        {
+            try
+            {
+                Client().UpdateTopicRouteInfoFromNameServer(t);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("refresh route for " + t + " failed: " + e.Message);
+            }
+        }
     }
 
     public MQClientInstance Client()
@@ -460,6 +562,9 @@ public sealed class DefaultMQPushConsumer
 
         foreach (KeyValuePair<string, MessageQueue> kv in toStart)
         {
+            // Shutdown 期间（_started 已置 false / _stop 已置 true）不要再起新拉取线程：
+            // 线程刚 start 就会撞上"未启动"状态而立刻退出，纯属浪费且放大竞态窗口。
+            if (_stop || !_started) return;
             MessageQueue mq = kv.Value;
             Thread t = MakeThread("PullMessageService", () => QueuePullLoop(mq));
             lock (_lock)
@@ -477,32 +582,78 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>broker 通知本消费组实例上下线（NOTIFY_CONSUMER_IDS_CHANGED=40）。对应 Java
+    /// ClientRemotingProcessor → rebalanceImmediately：置标记唤醒自己的 rebalance 线程，
+    /// 避免等下个 20s 周期。</summary>
+    /// <remarks>⚠ 本回调在 **remoting 读线程**上执行（RemotingClient 的分发路径）。这里**绝不能**
+    /// 同步调用 DoRebalance()：它内部会做阻塞式 invokeSync（GET_CONSUMER_LIST_BY_GROUP、心跳），
+    /// 而响应只能由**同一个读线程**投递 —— 读线程阻塞在自己发起的同步调用上必然自死锁，直到
+    /// invokeTimeout（实测 5s 超时、日志出现 "no consumer id list ..., keep current"，
+    /// 并连带把其它请求的响应一起卡住）。只置标志、交给 RebalanceThread 去算即可，
+    /// 与 C++ 侧只置 rebalanceNow_ 标志、Java 侧 rebalanceImmediately() 的语义一致。</remarks>
+    private void OnConsumerIdsChanged(RemotingCommand request, string addr)
+    {
+        ClientLog.Debug("received NOTIFY_CONSUMER_IDS_CHANGED, rebalance now (on reader thread, defer to RebalanceThread)");
+        _rebalanceNow.Set();
+    }
+
     private void RebalanceLoop()
     {
-        // 简化 rebalance：周期刷新分配集，为新增队列（如 %RETRY%topic 建立路由后）补拉取线程
+        // 周期重算分配（对齐 Java RebalanceService 默认 20s），或被通知时立即重算。
+        // 启动阶段且当前没有任何分配时缩短为 2s 重试：消费者可能先于 topic 被创建启动
+        // （autoCreateTopicEnable 下 broker 由生产者的首次发送建 topic），此时真实路由还
+        // 拉不到——消费端不做默认 topic 兜底（见 MQClientInstance.UpdateTopicRouteInfoFromNameServer），
+        // 死等 20s 会长时间不消费。该快速重试只在启动后 60s 内生效。
+        long startTime = UtilAll.CurrentTimeMillis();
         while (!_stop)
         {
-            _stopEvent.Wait(TimeSpan.FromMilliseconds(2000));
+            bool startingUp = (UtilAll.CurrentTimeMillis() - startTime) < 60000;
+            int interval = (startingUp && AssignedQueues().Count == 0) ? 2000 : 20000;
+            _rebalanceNow.Wait(interval);
+            _rebalanceNow.Reset();
             if (_stop || !_started) return;
             try
             {
                 MaybeSendHeartbeat();
-                RebalancePullThreads();
+                DoRebalance();
             }
             catch (Exception e)
             {
-                ClientLog.Debug("rebalance pull threads error: " + e.Message);
+                ClientLog.Debug("rebalance error: " + e.Message);
             }
         }
     }
 
     private void QueuePullLoop(MessageQueue mq)
     {
-        MQClientInstance c = Client();
+        // ⚠ 这里**不能**用 Client()：Shutdown() 会先置 _started=false，之后才 join 拉取线程；
+        //    RebalancePullThreads 可能正好在那个窗口里把本线程 start 起来，于是本线程的
+        //    第一条语句就撞上"未启动"状态，Client() 抛 MQClientException。该异常抛在**后台
+        //    线程**上，.NET 会因此终止整个进程（实测 Abort trap: 6 / RC=134），
+        //    而 Java/C++/Python 只是让这一个线程退出。判活后正常返回，把优雅退出变成正常路径。
+        MQClientInstance? clientRef = _mqClient;
+        if (clientRef is null || !_started) return;
+        MQClientInstance c = clientRef;
         bool orderly = IsOrderly();
         string key = OffsetKey(mq);
         while (!_stop && _started)
         {
+            // 队列已被 rebalance 撤销（isDropped）：退出线程并摘除自身（对齐 Java
+            // ProcessQueue.isDropped → pull 线程停止服务该队列）。
+            bool dropped;
+            lock (_lock)
+            {
+                dropped = _dropped.Contains(key);
+            }
+            if (dropped)
+            {
+                lock (_lock)
+                {
+                    _pullThreads.Remove(key);
+                }
+                return;
+            }
+
             SubscriptionData sub;
             lock (_lock)
             {
@@ -606,6 +757,17 @@ public sealed class DefaultMQPushConsumer
                 continue;
             }
 
+            // 长轮询返回后再次确认：若期间被撤销，丢弃本批消息并退出（对齐 Java
+            // ProcessQueue.isDropped 守卫——拉到的消息不再进入缓冲）。
+            lock (_lock)
+            {
+                if (_dropped.Contains(key))
+                {
+                    _pullThreads.Remove(key);
+                    return;
+                }
+            }
+
             lock (_lock)
             {
                 if (!_pending.ContainsKey(key))
@@ -617,11 +779,24 @@ public sealed class DefaultMQPushConsumer
 
             if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
             {
+                // 重投消息 topic 还原（对齐 Java PullAPIWrapper.processPullResult）：broker 把重试
+                // 消息写到 %RETRY%group，但消息自带 RETRY_TOPIC 属性指向原始 topic，分发前还原，
+                // 否则上层 listener 看到的 topic 是 %RETRY% 而非业务 topic。
+                string retryTopic = MixAll.GetRetryTopic(ConsumerGroup);
                 lock (_lock)
                 {
                     Queue<MessageExt> dq = _pending[key];
                     foreach (MessageExt m in result.MsgFoundList)
                     {
+                        if (m.Topic == retryTopic)
+                        {
+                            string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
+                            if (!string.IsNullOrEmpty(orig))
+                            {
+                                m.Topic = orig!;
+                            }
+                        }
+
                         dq.Enqueue(m);
                     }
                 }
@@ -657,6 +832,13 @@ public sealed class DefaultMQPushConsumer
                 {
                     if (!_mqMap.TryGetValue(key, out MessageQueue? m)) continue;
                     mq = m!;
+                    // 被撤销的队列：丢弃缓冲、跳过（不消费、不推进位点），对齐 Java 丢弃
+                    // 已从 ProcessQueueTable 移除的队列消息。
+                    if (_dropped.Contains(key))
+                    {
+                        _pending.Remove(key);
+                        continue;
+                    }
                 }
 
                 List<MessageExt> batch = new();
@@ -1035,30 +1217,257 @@ public sealed class DefaultMQPushConsumer
 
     private List<MessageQueue> AssignedQueues()
     {
-        MQClientInstance c = Client();
-        var result = new List<MessageQueue>();
-        foreach (string topic in SubscribedTopics())
+        lock (_lock)
         {
-            try
+            return new List<MessageQueue>(_assigned);
+        }
+    }
+
+    /// <summary>topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。消费侧
+    /// 用 isDefault=false，绝不兜底默认 topic。</summary>
+    private List<MessageQueue> AllQueuesOfTopic(string topic)
+    {
+        var outList = new List<MessageQueue>();
+        try
+        {
+            TopicPublishInfo? publish = Client().GetTopicPublishInfo(topic);
+            if (publish is null || !publish.Ok())
             {
-                TopicPublishInfo? publish = c.GetTopicPublishInfo(topic);
-                foreach (MessageQueue q in publish.MsgQueueList)
-                {
-                    var mq = new MessageQueue(topic, q.BrokerName, q.QueueId);
-                    if (!result.Contains(mq))
-                    {
-                        result.Add(mq);
-                    }
-                }
+                return outList;
             }
-            catch (Exception e)
+
+            foreach (MessageQueue q in publish.MsgQueueList)
             {
-                // %RETRY%topic 在首次回投前无路由，属预期路径，debug 即可
-                ClientLog.Debug("assigned_queues: skip topic " + topic + ": " + e.Message);
+                outList.Add(new MessageQueue(topic, q.BrokerName, q.QueueId));
+            }
+        }
+        catch (Exception e)
+        {
+            // %RETRY%topic 在首次回投前无路由，属预期路径，debug 即可
+            ClientLog.Debug("rebalance: no route for topic " + topic + ": " + e.Message);
+        }
+
+        outList.Sort(); // MessageQueue IComparable：topic → brokerName → queueId
+        return outList;
+    }
+
+    /// <summary>平均分配（对应 Java AllocateMessageQueueAveragely）。</summary>
+    private static List<MessageQueue> AllocateMessageQueueAveragely(string consumerGroup, string currentCid,
+        List<MessageQueue> mqAll, List<string> cidAll)
+    {
+        if (mqAll.Count == 0)
+        {
+            return new List<MessageQueue>();
+        }
+
+        if (cidAll.Count == 0 || !cidAll.Contains(currentCid))
+        {
+            return new List<MessageQueue>();
+        }
+
+        int index = cidAll.IndexOf(currentCid);
+        int mod = mqAll.Count % cidAll.Count;
+        int avg = mqAll.Count <= cidAll.Count
+            ? 1
+            : (mod > 0 && index < mod ? mqAll.Count / cidAll.Count + 1 : mqAll.Count / cidAll.Count);
+        int startIndex = (mod > 0 && index < mod) ? index * avg : index * avg + mod;
+        int range = Math.Min(avg, mqAll.Count - startIndex);
+        if (range <= 0)
+        {
+            return new List<MessageQueue>();
+        }
+
+        return mqAll.GetRange(startIndex, range);
+    }
+
+    /// <summary>按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步拉取线程集。</summary>
+    private void DoRebalance()
+    {
+        MQClientInstance c = Client();
+        var prev = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in AssignedQueues())
+        {
+            prev[OffsetKey(mq)] = mq;
+        }
+
+        var assigned = new List<MessageQueue>();
+        List<string> topics;
+        lock (_lock)
+        {
+            topics = new List<string>(_subscriptionData.Keys);
+        }
+
+        if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        {
+            foreach (string topic in topics)
+            {
+                assigned.AddRange(AllQueuesOfTopic(topic));
+            }
+        }
+        else
+        {
+            foreach (string topic in topics)
+            {
+                List<MessageQueue> mqAll = AllQueuesOfTopic(topic);
+                if (mqAll.Count == 0)
+                {
+                    continue;
+                }
+
+                List<string>? cidAll = c.GetConsumerIdListByGroup(topic, ConsumerGroup);
+                if (cidAll is null || cidAll.Count == 0)
+                {
+                    // 查不到消费者列表：保留本 topic 现有分配（Java 仅告警；绝不回退成
+                    // "独占全部队列"，否则同组多实例会互相重复消费）
+                    ClientLog.Debug("rebalance: no consumer id list for " + ConsumerGroup + "/" + topic + ", keep current");
+                    assigned.AddRange(AssignedQueues().FindAll(m => m.Topic == topic));
+                    continue;
+                }
+
+                cidAll.Sort(StringComparer.Ordinal);
+                assigned.AddRange(AllocateMessageQueueAveragely(ConsumerGroup, _clientId, mqAll, cidAll));
             }
         }
 
-        return result;
+        lock (_lock)
+        {
+            _assigned = assigned;
+        }
+
+        // 撤销清理（对齐 Java updateProcessQueueTableInRebalance → removeUnnecessaryMessageQueue
+        // + removeProcessQueue）：本轮不再分配给本实例的队列，先把已消费位点持久化、丢弃
+        // 在途/缓冲消息、解除顺序锁（orderly+clustering），并在 _dropped 打标记让 pull 线程
+        // 长轮询返回后丢弃批次并退出。绝不能直接丢弃位点——否则重分配后从 0 重投。
+        var assignedKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in assigned)
+        {
+            assignedKeys.Add(OffsetKey(mq));
+        }
+
+        // 重新分配给本实例的队列清除撤销标记（可能上轮被撤销、本轮又分回），否则 pull 线程
+        // 会误判 isDropped 直接退出。_pullThreads 的键存在性会阻止同一队列起两个线程。
+        lock (_lock)
+        {
+            foreach (string k in assignedKeys)
+            {
+                _dropped.Remove(k);
+            }
+        }
+
+        var revoked = new List<MessageQueue>();
+        foreach (KeyValuePair<string, MessageQueue> kv in prev)
+        {
+            if (!assignedKeys.Contains(kv.Key))
+            {
+                revoked.Add(kv.Value);
+            }
+        }
+
+        if (revoked.Count > 0)
+        {
+            bool orderly = IsOrderly();
+            bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
+            var unlockList = new List<MessageQueue>();
+            foreach (MessageQueue mq in revoked)
+            {
+                string key = OffsetKey(mq);
+                long consumeOffset;
+                lock (_lock)
+                {
+                    _dropped.Add(key);
+                    _pending.Remove(key);
+                    _mqMap.Remove(key);
+                    _offsetTable.Remove(key);
+                    _consumeOffsetTable.TryGetValue(key, out consumeOffset);
+                    _consumeOffsetTable.Remove(key);
+                }
+
+                // 1) 先持久化已消费位点（UPDATE_CONSUMER_OFFSET=15），再清缓冲/解锁
+                if (!broadcast && _mqClient is not null)
+                {
+                    try
+                    {
+                        _mqClient.UpdateConsumerOffset(ConsumerGroup, mq, consumeOffset);
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Debug("update consumer offset on revoke failed for " + mq + ": " + e.Message);
+                    }
+
+                    // 2) 顺序消费（orderly + clustering）撤销队列需主动解锁（UNLOCK_BATCH_MQ=42），
+                    //    否则 broker 侧锁长期不释放，新 owner 抢不到锁会在原地空转。
+                    if (orderly)
+                    {
+                        unlockList.Add(mq);
+                    }
+                }
+            }
+
+            if (unlockList.Count > 0 && _mqClient is not null)
+            {
+                try
+                {
+                    _mqClient.UnlockBatchMq(ConsumerGroup, _clientId, unlockList);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("unlock on revoke failed: " + e.Message);
+                }
+            }
+
+            ClientLog.Info("rebalance: revoked " + revoked.Count.ToString(CultureInfo.InvariantCulture)
+                + " queue(s), current assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // 新分配的队列**立刻**解析初始位点写入 offset 表（对齐 Java
+        // updateProcessQueueTableInRebalance：新队列 → computePullFromWhereWithException →
+        // offsetStore.updateOffset）。不能留到首次拉取时惰性解析——CONSUME_FROM_LAST_OFFSET
+        // 语义是"分配时刻的最新位点"，惰性解析会跳过分配后新产生的消息（真机表现为收不到）。
+        foreach (MessageQueue mq in assigned)
+        {
+            string key = OffsetKey(mq);
+            if (prev.ContainsKey(key))
+            {
+                continue;
+            }
+
+            SubscriptionData? sub;
+            lock (_lock)
+            {
+                if (_offsetTable.ContainsKey(key))
+                {
+                    continue;
+                }
+
+                _subscriptionData.TryGetValue(mq.Topic, out sub);
+            }
+
+            if (sub is null)
+            {
+                continue;
+            }
+
+            long off;
+            try
+            {
+                off = ResolveInitialOffset(mq, sub);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("resolve initial offset for " + mq + " failed: " + e.Message);
+                continue;
+            }
+
+            lock (_lock)
+            {
+                if (!_offsetTable.ContainsKey(key))
+                {
+                    _offsetTable[key] = off;
+                }
+            }
+        }
+
+        RebalancePullThreads();
     }
 
     private long ResolveInitialOffset(MessageQueue mq, SubscriptionData sub)
@@ -1217,6 +1626,38 @@ public sealed class DefaultMQPushConsumer
         }
 
         return outList;
+    }
+
+    /// <summary>当前分给本实例的队列 key 列表（真机验证"同组两实例不重不漏"用）。
+    /// key 格式与 OffsetKey 一致：topic + brokerName + queueId。</summary>
+    public List<string> AssignedQueueKeys()
+    {
+        var outList = new List<string>();
+        foreach (MessageQueue mq in AssignedQueues())
+        {
+            outList.Add(OffsetKey(mq));
+        }
+
+        return outList;
+    }
+
+    /// <summary>查消费组在某 topic 上的全部 clientId（对应 Java findConsumerIdList），
+    /// 用于验证多实例注册。查不到/未启动返回空，不抛。</summary>
+    public List<string> ConsumerIdListOfGroup(string topic)
+    {
+        if (_mqClient is null)
+        {
+            return new List<string>();
+        }
+
+        try
+        {
+            return _mqClient.GetConsumerIdListByGroup(topic, ConsumerGroup) ?? new List<string>();
+        }
+        catch (Exception)
+        {
+            return new List<string>();
+        }
     }
 
     // 消息重投（对应 Java sendMessageBack）：失败抛 MQBrokerException，成功返回 true

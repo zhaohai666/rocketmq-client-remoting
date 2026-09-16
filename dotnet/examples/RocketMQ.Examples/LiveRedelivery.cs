@@ -1,5 +1,15 @@
-// 消费侧补齐真机验证（对齐 Java：回投 / 位点持久化 / 顺序锁 / 广播 / 流控）。
+// 消费侧补齐真机验证（对齐 Java：回投 / 位点持久化 / 顺序锁 / 广播 / 流控 / rebalance / 注销）。
 // 用法：rmq redelivery [namesrv]
+//
+// S1 回投 / S2 位点持久化 / S3 顺序消费+broker 锁 / S4 广播 / S5 流控
+// S6 集群多实例 rebalance（均分队列、不重不漏、无重复消费）
+// S7 优雅注销（shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除）
+//
+// ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
+//   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
+//   路由 → 不分配队列 → 不消费；等它自己发现路由时，CONSUME_FROM_LAST_OFFSET 已把位点解析到
+//   "发现时刻的最新"，期间生产的消息会被正常跳过（Java 同样）。那是语义正确但测不出东西的
+//   假失败，不是客户端 bug。
 using System.Text;
 
 using RocketMQ.Client;
@@ -72,6 +82,8 @@ public static class LiveRedelivery
         ScenarioOrderlyLock(producer);
         ScenarioBroadcast(producer);
         ScenarioFlowControl(producer);
+        ScenarioRebalance(producer);
+        ScenarioUnregister();
 
         producer.Shutdown();
         Console.WriteLine();
@@ -85,6 +97,28 @@ public static class LiveRedelivery
         var c = new DefaultMQPushConsumer(group);
         c.SetNamesrvAddr(_namesrv);
         return c;
+    }
+
+    /// <summary>队列 key（与消费者内部 OffsetKey 一致）：topic + brokerName + queueId。</summary>
+    private static string Key(MessageQueue mq) =>
+        mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>按真实用法先把 topic 建出来，再启动消费者（与 Python/C++ 联调同义）。
+    /// 真实环境里 topic 由管理员或首次发送预先创建；消费者不做默认 topic 兜底，
+    /// topic 不存在时拿不到路由、不分配队列。</summary>
+    private static void PrepareTopic(DefaultMQProducer producer, string topic, int queues = 4)
+    {
+        try
+        {
+            producer.CreateTopic("init", topic, queues);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  预建 topic " + topic + " 失败（改用自动创建）: " + e.Message);
+        }
+
+        // 等 NameServer 路由传播，否则消费者首轮 rebalance 仍查不到
+        Thread.Sleep(3000);
     }
 
     // ---------------- S1 回投 ----------------
@@ -125,6 +159,7 @@ public static class LiveRedelivery
     private static void ScenarioRetry(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Retry";
+        PrepareTopic(producer, topic);
         var consumer = NewConsumer(_gPrefix + "_g1");
         var listener = new RetryListener();
         consumer.SetMessageListener(listener);
@@ -167,6 +202,7 @@ public static class LiveRedelivery
     {
         string topic = _gPrefix + "_Offset";
         string group = _gPrefix + "_g2";
+        PrepareTopic(producer, topic);
 
         List<string> round1;
         var c1 = NewConsumer(group);
@@ -224,6 +260,7 @@ public static class LiveRedelivery
     private static void ScenarioOrderlyLock(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Orderly";
+        PrepareTopic(producer, topic);
         var consumer = NewConsumer(_gPrefix + "_g3");
         var listener = new CountingOrderlyListener();
         consumer.SetMessageListener(listener);
@@ -247,6 +284,7 @@ public static class LiveRedelivery
     {
         string topic = _gPrefix + "_Bc";
         string group = _gPrefix + "_g4";
+        PrepareTopic(producer, topic);
 
         var ca = NewConsumer(group);
         ca.InstanceName = "bc-a";
@@ -300,6 +338,7 @@ public static class LiveRedelivery
     private static void ScenarioFlowControl(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Flow";
+        PrepareTopic(producer, topic);
         var consumer = NewConsumer(_gPrefix + "_g5");
         var listener = new SlowListener();
         consumer.SetMessageListener(listener);
@@ -319,5 +358,131 @@ public static class LiveRedelivery
             "got=" + listener.Got.ToString(CultureInfo.InvariantCulture));
         Check("S5-流控触发计数>0", fc > 0,
             "triggered=" + fc.ToString(CultureInfo.InvariantCulture));
+    }
+
+    // ---------------- S6 集群多实例 rebalance（队列分配） ----------------
+    private static void ScenarioRebalance(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_Rebalance";
+        string group = _gPrefix + "_g6";
+        PrepareTopic(producer, topic, 8);
+
+        var la = new CollectingListenerConcurrently();
+        var ca = NewConsumer(group);
+        ca.InstanceName = "inst-a";
+        ca.SetMessageListener(la);
+        ca.Subscribe(topic, "*");
+        ca.Start();
+
+        var lb = new CollectingListenerConcurrently();
+        var cb = NewConsumer(group);
+        cb.InstanceName = "inst-b";
+        cb.SetMessageListener(lb);
+        cb.Subscribe(topic, "*");
+        cb.Start();
+
+        // 主 topic 的全部队列（期望被两实例完整覆盖）
+        var expectedKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in ca.FetchSubscribeMessageQueues(topic))
+        {
+            expectedKeys.Add(Key(mq));
+        }
+
+        // 等分配稳定：交集为空 + 两边都非空 + 主 topic 队列被完整覆盖（最多等 45s）
+        List<string> keysA = new();
+        List<string> keysB = new();
+        long deadline = NowMs() + 45000;
+        while (NowMs() < deadline)
+        {
+            keysA = ca.AssignedQueueKeys();
+            keysB = cb.AssignedQueueKeys();
+            var inter = new HashSet<string>(keysA, StringComparer.Ordinal);
+            inter.IntersectWith(keysB);
+            var covered = new HashSet<string>(keysA, StringComparer.Ordinal);
+            covered.UnionWith(keysB);
+            covered.IntersectWith(expectedKeys);
+            if (keysA.Count > 0 && keysB.Count > 0 && inter.Count == 0
+                && expectedKeys.Count > 0 && covered.Count == expectedKeys.Count)
+            {
+                break;
+            }
+
+            Thread.Sleep(2000);
+        }
+
+        long hbA = ca.HeartbeatCount;
+        List<string> cidList = ca.ConsumerIdListOfGroup(topic);
+
+        const int total = 40;
+        for (int i = 0; i < total; ++i)
+        {
+            producer.Send(new Message(topic, Str2Bytes("rb-" + i.ToString(CultureInfo.InvariantCulture))));
+        }
+
+        Thread.Sleep(15000);
+
+        List<string> gotA = la.Snapshot();
+        List<string> gotB = lb.Snapshot();
+        var all = new List<string>(gotA);
+        all.AddRange(gotB);
+        var uniq = new HashSet<string>(all, StringComparer.Ordinal);
+        int dup = all.Count - uniq.Count;
+        ca.Shutdown();
+        cb.Shutdown();
+
+        Check("S6-消费者已心跳注册", hbA > 0 && cidList.Count == 2,
+            "heartbeats=" + hbA.ToString(CultureInfo.InvariantCulture)
+                + " brokerCids=" + cidList.Count.ToString(CultureInfo.InvariantCulture));
+
+        var sa = new HashSet<string>(keysA, StringComparer.Ordinal);
+        var sb = new HashSet<string>(keysB, StringComparer.Ordinal);
+        int cross = sa.Intersect(sb).Count();
+        var cover = new HashSet<string>(sa, StringComparer.Ordinal);
+        cover.UnionWith(sb);
+        cover.IntersectWith(expectedKeys);
+        Check("S6-队列不重不漏(a=" + keysA.Count.ToString(CultureInfo.InvariantCulture)
+              + ",b=" + keysB.Count.ToString(CultureInfo.InvariantCulture)
+              + ",交集=" + cross.ToString(CultureInfo.InvariantCulture)
+              + ",覆盖=" + cover.Count.ToString(CultureInfo.InvariantCulture)
+              + "/" + expectedKeys.Count.ToString(CultureInfo.InvariantCulture) + ")",
+            keysA.Count > 0 && keysB.Count > 0 && cross == 0 && expectedKeys.Count > 0
+                && cover.Count == expectedKeys.Count);
+        Check("S6-消息无重复消费", dup == 0 && all.Count == total,
+            "got=" + all.Count.ToString(CultureInfo.InvariantCulture)
+                + "/" + total.ToString(CultureInfo.InvariantCulture)
+                + " dup=" + dup.ToString(CultureInfo.InvariantCulture));
+    }
+
+    // ---------------- S7 优雅注销 ----------------
+    private static void ScenarioUnregister()
+    {
+        // 复用 S6 建的 8 队列 topic；shutdown 时应发 UNREGISTER_CLIENT，broker 端立刻摘除，
+        // 不必等心跳超时（~120s）。查询用独立的探针客户端（消费者 shutdown 后其内部客户端已关闭）。
+        string topic = _gPrefix + "_Rebalance";
+        string group = _gPrefix + "_g7";
+        var probe = new MQClientInstance(
+            "probe-" + NowMs().ToString(CultureInfo.InvariantCulture),
+            new List<string> { _namesrv });
+        probe.Start();
+
+        var listener = new CollectingListenerConcurrently();
+        var c = NewConsumer(group);
+        c.InstanceName = "inst-c";
+        c.SetMessageListener(listener);
+        c.Subscribe(topic, "*");
+        c.Start();
+        Thread.Sleep(3000);
+
+        string cid = c.ClientId;
+        List<string> before = probe.GetConsumerIdListByGroup(topic, group) ?? new List<string>();
+        c.Shutdown();
+        Thread.Sleep(2000);
+        List<string> after = probe.GetConsumerIdListByGroup(topic, group) ?? new List<string>();
+        probe.Shutdown();
+
+        Check("S7-shutdown 已注销 clientId",
+            before.Contains(cid) && !after.Contains(cid),
+            "before=" + before.Count.ToString(CultureInfo.InvariantCulture)
+                + " after=" + after.Count.ToString(CultureInfo.InvariantCulture));
     }
 }

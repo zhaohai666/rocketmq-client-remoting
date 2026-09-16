@@ -99,6 +99,13 @@ public sealed class MQClientInstance : IDisposable
     private readonly Dictionary<string, TopicPublishInfo> _topicPublishInfoTable = new(StringComparer.Ordinal);
     private volatile bool _started;
 
+    /// <summary>本客户端「在用」的 topic（消费者订阅 + 生产者发过的），对应 Java 的
+    /// MQConsumerInner.subscriptions() / MQProducerInner.getPublishTopicList()，由周期任务
+    /// updateTopicRouteInfoFromNameServer() 逐个刷新路由。</summary>
+    private readonly HashSet<string> _topicsInUse = new(StringComparer.Ordinal);
+    private Thread? _routeRefreshThread;
+    private readonly ManualResetEventSlim _routeRefreshStop = new(false);
+
     /// <summary>是否已 Start（诊断用）。</summary>
     public bool Started => _started;
 
@@ -117,12 +124,82 @@ public sealed class MQClientInstance : IDisposable
         _started = true;
         string ns = string.Join(";", _nameServerAddrs);
         ClientLog.Info("MQClientInstance[" + _clientId + "] started, namesrv=" + ns);
+        if (_routeRefreshThread is null)
+        {
+            _routeRefreshStop.Reset();
+            _routeRefreshThread = new Thread(RouteRefreshLoop)
+            {
+                IsBackground = true,
+                Name = "rmq-route-refresh-" + _clientId,
+            };
+            _routeRefreshThread.Start();
+        }
     }
 
     public void Shutdown()
     {
         _started = false;
+        _routeRefreshStop.Set();
+        if (_routeRefreshThread is { IsAlive: true })
+        {
+            _routeRefreshThread.Join(2000);
+        }
+
         _remotingClient.Shutdown();
+    }
+
+    /// <summary>登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。</summary>
+    public void RegisterTopicInUse(string topic)
+    {
+        if (topic.Length > 0)
+        {
+            lock (_routeLock)
+            {
+                _topicsInUse.Add(topic);
+            }
+        }
+    }
+
+    private void RouteRefreshLoop()
+    {
+        // 对齐 Java MQClientInstance.startScheduledTask 的
+        // scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)（默认 30s）。
+        if (_routeRefreshStop.Wait(30))
+        {
+            return; // 启动后立刻收到 stop，直接退出
+        }
+
+        while (!_routeRefreshStop.IsSet)
+        {
+            // 等待 30s（期间响应 stop），再刷新在用 topic 的路由
+            for (int i = 0; i < 300 && !_routeRefreshStop.IsSet; ++i)
+            {
+                _routeRefreshStop.Wait(TimeSpan.FromMilliseconds(100));
+            }
+
+            if (_routeRefreshStop.IsSet)
+            {
+                break;
+            }
+
+            List<string> topics;
+            lock (_routeLock)
+            {
+                topics = new List<string>(_topicsInUse);
+            }
+
+            foreach (string topic in topics)
+            {
+                try
+                {
+                    UpdateTopicRouteInfoFromNameServer(topic);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("route refresh failed for " + topic + ": " + e.Message);
+                }
+            }
+        }
     }
 
     public void Dispose() => Shutdown();
@@ -159,7 +236,14 @@ public sealed class MQClientInstance : IDisposable
     /// 从 NameServer 拉取 topic 路由。未知 topic 会回退到 MixAll.DefaultTopic
     /// （5.x nameserver 不为未知 topic 合成路由，返回 TOPIC_NOT_EXIST）。
     /// </summary>
-    public bool UpdateTopicRouteInfoFromNameServer(string topic, int timeoutMillis = 5000)
+    /// <summary>
+    /// 从 NameServer 拉取 topic 路由。未知 topic 的**默认 topic 兜底（TBW102 合成）只允许生产者
+    /// 在真实路由拉不到时走**（<paramref name="isDefault"/>=true，对齐 Java
+    /// DefaultMQProducerImpl.tryToFindTopicPublishInfo:898-905 先真实路由、失败才 isDefault=true）。
+    /// 消费者**绝不能**兜底：否则 %RETRY%group 这类尚未由 broker 创建的主题会被合成出一组假队列，
+    /// 两个实例在不同时间拉取会得到不同队列数，rebalance 视图不一致（真机重复消费根因之一）。
+    /// </summary>
+    public bool UpdateTopicRouteInfoFromNameServer(string topic, bool isDefault = false, int timeoutMillis = 5000)
     {
         if (_nameServerAddrs.Count == 0)
         {
@@ -194,7 +278,7 @@ public sealed class MQClientInstance : IDisposable
         }
 
         bool ok = Fetch(topic, out TopicRouteData route);
-        if (!ok && topic != MixAll.DefaultTopic)
+        if (!ok && isDefault && topic != MixAll.DefaultTopic)
         {
             // 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
             // 需像 Java 客户端那样回退到默认 topic（TBW102）来构造发布信息。
@@ -249,8 +333,9 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>
     /// 取发布信息（**缓存实例共享**，轮询游标在实例内推进）；
     /// 缓存未命中会触发一次路由刷新，仍拿不到则抛 MQClientException。
+    /// <paramref name="isDefault"/> 透传给路由刷新：仅生产者发真实路由拉不到时传 true。
     /// </summary>
-    public TopicPublishInfo GetTopicPublishInfo(string topic)
+    public TopicPublishInfo GetTopicPublishInfo(string topic, bool isDefault = false)
     {
         lock (_routeLock)
         {
@@ -260,7 +345,7 @@ public sealed class MQClientInstance : IDisposable
             }
         }
 
-        UpdateTopicRouteInfoFromNameServer(topic);
+        UpdateTopicRouteInfoFromNameServer(topic, isDefault);
         lock (_routeLock)
         {
             if (_topicPublishInfoTable.TryGetValue(topic, out TopicPublishInfo? p) && p is not null && p.Ok())
@@ -1013,6 +1098,95 @@ public sealed class MQClientInstance : IDisposable
         CheckResponseCode(response);
         GetConsumerListByGroupResponseBody.Decode(response.Body, out GetConsumerListByGroupResponseBody @out);
         return @out;
+    }
+
+    /// <summary>取 topic 路由里第一个 broker 地址（对应 Java MQClientInstance.findBrokerAddrByTopic）。
+    /// 所有 broker 都持有完整消费者列表，任取一台即可查 GET_CONSUMER_LIST_BY_GROUP。</summary>
+    public string BrokerAddrForTopic(string topic)
+    {
+        TopicRouteData? route = GetTopicRouteData(topic);
+        if (route is null)
+        {
+            return string.Empty;
+        }
+
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length > 0)
+            {
+                return addr;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// 查询消费组内所有 clientId（对应 Java MQClientInstance.findConsumerIdList）。
+    /// 取该 topic 路由里的 broker 发 GET_CONSUMER_LIST_BY_GROUP(38)。查不到（无路由 / 非
+    /// SUCCESS / 异常）返回 null；调用方按 Java 语义「保留当前分配」，不要回退成
+    /// "自己独占全部队列"（那会让多实例互相重复消费）。
+    /// </summary>
+    public List<string>? GetConsumerIdListByGroup(string topic, string consumerGroup, int timeoutMillis = 5000)
+    {
+        string addr = BrokerAddrForTopic(topic);
+        if (addr.Length == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            string brokerName = string.Empty;
+            TopicRouteData? route = GetTopicRouteData(topic);
+            if (route is not null && route.BrokerDatas.Count > 0)
+            {
+                brokerName = route.BrokerDatas[0].BrokerName;
+            }
+
+            var header = new GetConsumerListByGroupRequestHeader
+            {
+                ConsumerGroup = consumerGroup,
+                Bname = brokerName.Length > 0 ? brokerName : null,
+            };
+            RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetConsumerListByGroup, header);
+            RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+            if (response.Code != ResponseCode.Success || response.Body.Length == 0)
+            {
+                return null;
+            }
+
+            GetConsumerListByGroupResponseBody.Decode(response.Body, out GetConsumerListByGroupResponseBody body);
+            return body.ConsumerIdList;
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("get consumer id list failed, " + addr + " " + consumerGroup + ": " + e.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）。
+    /// 对齐 Java 生产者/消费者 shutdown：逐台 broker 发 UNREGISTER_CLIENT(35)。
+    /// 不发的话 broker 端 ConsumerManager 只能等心跳超时（默认 ~120s）清理。
+    /// 单台失败只记 debug —— shutdown 路径不应因网络抖动抛异常。
+    /// </summary>
+    public void UnregisterClientAllBrokers(string clientId, string producerGroup, string consumerGroup,
+        int timeoutMillis = 5000)
+    {
+        foreach (string addr in GetRouteOfAllBrokers())
+        {
+            try
+            {
+                UnregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unregister_client failed, addr=" + addr + ": " + e.Message);
+            }
+        }
     }
 
     // ---------------- 按 Key / uniqKey 查消息 ----------------
