@@ -8,15 +8,15 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 ## 目录
 - `python/rocketmq/` 参考实现 · `cpp/` C++（22 个 .cpp，含 Admin / 压缩）· `dotnet/` .NET 10（零 NuGet）。
 - 三侧已对齐 Java：**两阶段事务**（半消息 → END_TRANSACTION → broker 回查）、消费侧回投 / 位点持久化 /
-  顺序锁 / 广播 / 流控、**真实 rebalance + 队列撤销收尾 + 重投 topic 还原 + 优雅注销 + 命名空间**、
-  压缩（zlib 跨客户端互通）。
+  顺序锁 / 广播 / 流控、**真实 rebalance + 队列撤销收尾 + 重投 topic 还原 + 优雅注销 + 命名空间 +
+  ACL 鉴权**、压缩（zlib 跨客户端互通）。
 
 ## 验证入口（改完必跑）
-- 技能 `rocketmq-cpp-build-verify/SKILL.md`：编译命令、8 个 ctest 用例与断言数、真机联调工具、全部坑位。
-- Python `pytest` 147 passed / 4 skipped；C++ ctest **8/8**（约 515 项断言）；.NET xunit 46/46。
+- 技能 `rocketmq-cpp-build-verify/SKILL.md`：编译命令、9 个 ctest 用例与断言数、真机联调工具、全部坑位。
+- Python `pytest` 147 passed / 4 skipped；C++ ctest **9/9**（约 550 项断言）；.NET xunit **55/55**。
 - 真机（**起集群 + 等端口 + 跑测试 + kill 必须在同一条 Bash 命令里**，前台返回会回收后台 JVM）：
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
-  `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`。
+  `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、**`run_acl_live.sh`**（开认证的集群）。
 
 ## 跨语言硬性约定
 1. **字段名以 Java 为准**：broker 用 fastjson2 按 **Java 属性名**反序列化，错一个就**静默丢字段**。
@@ -35,6 +35,16 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
    读线程阻塞在自己发起的 `invokeSync` 上 = 自死锁（实测 5s 超时，且连带卡住该连接**所有**响应）。
 7. 零 warning 是目标（C++ `-Wall -Wextra`；.NET `TreatWarningsAsErrors`）。日志：三侧文件名必须
    **不同名**（轮转策略不同，同文件会互相插行），运行日志保持 `ERROR=0`，良性超时走 DEBUG。
+8. **测消费必须"先起消费者、再发消息"**。Java 默认 `CONSUME_FROM_LAST_OFFSET`：新消费组首次消费且
+   无已提交位点时，初始位点 = 该队列**当时的** maxOffset（`RebalancePushImpl.java:174-190`），
+   所以"先发后起消费者"本来就一条都收不到。更坑的是 broker 的 consumequeue **异步分发/刷盘**，
+   刚发完立刻查 maxOffset 可能读到 0 —— 于是同一时序三语言结果不一致（实测 Python 收 0 条、
+   C++/.NET 收 3 条），极易被误判成"某语言有 bug"。与约定 5（先建 topic 再起消费者）是一对。
+9. **ACL 签名**（三侧已实现，改 remoting 层时勿破坏）：content = extFields 按 key 字典序、
+   **只拼 value**、跳过 key == `"Signature"`，再拼 body；`Base64(HMAC-SHA1(secretKey, content))`；
+   `AccessKey`/`SecurityToken` 必须在算签名**之前**写进 extFields（它们参与签名）。钩子必须在
+   **encode 之前**调用。Python 曾有钩子但**从未被调用**、算法也是自造的（=三侧都连不开 ACL 集群）。
+   对拍向量固化在 `python/verify_acl_java_parity.py`（Java 官方实现输出）。
 
 ## 两条"静默数据损坏"级的坑（最贵，别顺手优化）
 - **压缩两层语义缺一不可**：未支持的压缩类型（如 SNAPPY）`decompress` **抛异常**，且
@@ -42,15 +52,14 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 - **Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，砍掉最高位**，与标准 CRC-32 差正好 2^31。
   跨语言对 CRC 只看各自的 `match` 字段，别比数字。
 
-## 与 Java 客户端仍存在的差距（P1 收官后，2026-09-16 盘点）
+## 与 Java 客户端仍存在的差距（命名空间 + ACL 收官后，2026-09-16 盘点）
 已对齐 Java：两阶段事务、真实 rebalance + 队列撤销收尾 + 分配时解析初始位点、回投 / 位点持久化 /
-顺序锁 / 广播 / 流控、`resetRetryAndNamespace`、优雅注销、`UNREGISTER_CLIENT`、路由 30s 刷新、压缩。
-仍缺（grep 验证：`namespace_util`/`AclRPCHook` 仅 Python 有，其余三侧 grep 命中只在 admin 代码）：
+顺序锁 / 广播 / 流控、`resetRetryAndNamespace`、优雅注销、`UNREGISTER_CLIENT`、路由 30s 刷新、
+压缩、**命名空间包裹（三侧）**、**ACL 鉴权（三侧）**。
+仍缺（下表；两个 P1 硬伤已关闭，其余经 grep 确认仍缺）：
 
 | 能力 | 严重度 | Py | C++ | .NET | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| 命名空间包裹 (withNamespace) | P1 正确性 | ✅ | ❌ | ❌ | C++/.NET 生产/消费不做 NS 包裹 → NS 集群 topic 解析错 |
-| ACL 鉴权 | P1 连通性 | ✅ | ❌ | ❌ | 仅 Python 有 AclRPCHook+SessionCredentials；C++/.NET 连不开 ACL 集群会鉴权失败 |
 | 主动拉取 PullConsumer | P2 | ✅ | ❌ | ❌ | 仅 Python 有完整实现 |
 | 故障规避 sendLatencyFaultEnable | P2 | ❌ | ❌ | ❌ | 三侧均无 broker 故障避让 |
 | POP 模式 (5.x 轻量消费) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
@@ -62,5 +71,7 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 | 其它 broker 主动请求 | P3 | 部分 | 部分 | 部分 | 仅接 CHECK_TRANSACTION_STATE(39)；GET_CONSUMER_RUNNING_INFO(307) 等未接（admin 有 VIEW_MESSAGE 部分） |
 | 细粒度流控 / 线程弹性 | P3 | ❌ | ❌ | ❌ | 仅 pullThresholdForQueue；消费线程 min=max 固定 |
 
-注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。建议下一步优先补 **C++/.NET 的 namespace + ACL**
-（直接照搬 Python 的 `namespace_util.py` 与 `rpchook.py`），这是生产集群真会踩的两个硬伤。
+注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。两个 P1 生产硬伤（命名空间 / ACL）已于
+2026-09-16 三侧补齐并真机验证（命名空间走 S8 隔离场景；ACL 走 `run_acl_live.sh` 的 S1–S7，三语言
+均 7/0）。下一步按 P2 推进：**C++/.NET 的 PullConsumer**、故障规避的真机验证（需注入 broker 故障），
+再往后是 POP / Request-Reply / Trace / TLS / 动态 name server。
