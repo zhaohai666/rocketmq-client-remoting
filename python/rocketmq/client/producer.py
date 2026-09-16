@@ -29,6 +29,8 @@ from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .exception import MQBrokerException, MQClientException
+from .latency import MQFaultStrategy
+from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
 from .send_result import SendResult, SendStatus
 
@@ -156,6 +158,11 @@ class DefaultMQProducer:
         self._transaction_listener: Optional[TransactionListener] = None
         self._heartbeat_running = False
         self.heartbeat_interval_millis = 30000
+        # 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
+        self.send_latency_fault_enable = False
+        self._mq_fault_strategy = MQFaultStrategy(False)
+        # 基础客户端指标（send/consume RT 与计数）
+        self.metrics = ClientMetrics()
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -201,6 +208,15 @@ class DefaultMQProducer:
         if self._started:
             raise MQClientException("producerGroup cannot be changed after startup")
         self.producer_group = group
+
+    def set_send_latency_fault_enable(self, enable: bool) -> None:
+        """对应 Java DefaultMQProducer.setSendLatencyFaultEnable。默认关闭。"""
+        self.send_latency_fault_enable = enable
+        self._mq_fault_strategy.set_send_latency_fault_enable(enable)
+
+    def get_metrics(self) -> ClientMetrics:
+        """返回本生产者的基础指标计数器（send/consume RT 与计数）。"""
+        return self.metrics
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
@@ -352,12 +368,29 @@ class DefaultMQProducer:
         if mq is not None:
             return client.send_message(self.producer_group, msg, mq, timeout, sys_flag)
         last_exc = None
+        last_broker_name = None
         for attempt in range(self.retry_times_when_send_failed + 1):
             try:
                 publish = self._topic_publish_info(msg.topic)
-                selected = publish.select_one_message_queue()
+                # 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
+                # 关闭时退化为普通轮询（策略内部判断）。
+                selected = self._mq_fault_strategy.select_one_message_queue(
+                    publish, last_broker_name)
+                last_broker_name = selected.broker_name
                 mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
-                return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+                send_start = self.metrics.record_send_start()
+                try:
+                    result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+                except Exception:  # noqa: BLE001 — 记录指标/隔离后按原异常重试
+                    self.metrics.record_send_failure(send_start)
+                    self._mq_fault_strategy.update_fault_item(
+                        selected.broker_name, 0.0, True, False)
+                    raise
+                self.metrics.record_send_success(send_start)
+                # 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                self._mq_fault_strategy.update_fault_item(
+                    selected.broker_name, time.time() * 1000.0 - send_start, False, True)
+                return result
             except (MQClientException, MQBrokerException, RemotingException) as e:
                 last_exc = e
         raise last_exc
@@ -385,7 +418,7 @@ class DefaultMQProducer:
                                        self._need_addr(client, mq), self.send_msg_timeout, sys_flag)
             return
         publish = self._topic_publish_info(msg.topic)
-        selected = publish.select_one_message_queue()
+        selected = self._mq_fault_strategy.select_one_message_queue(publish, None)
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
         client.send_message_oneway(self.producer_group, msg, mq_sel,
                                    self._need_addr(client, mq_sel), self.send_msg_timeout, sys_flag)

@@ -55,13 +55,29 @@ class TopicPublishInfo:
     def ok(self) -> bool:
         return len(self.msg_queue_list) > 0
 
-    def select_one_message_queue(self, last_broker_name: Optional[str] = None) -> MessageQueue:
+    def reset_index(self) -> None:
+        self._index = 0
+
+    def select_one_message_queue(self, *filters) -> Optional[MessageQueue]:
+        """轮询选队列（对应 Java TopicPublishInfo.selectOneMessageQueue）。
+
+        ``*filters`` 为可调用 ``f(mq) -> bool``，全部通过才选中。无过滤器时固定返回一个
+        轮询队列（永不返回 None）；带过滤器且一轮内无匹配时返回 None，由调用方退化选择。
+        """
         with self._lock:
             if not self.msg_queue_list:
                 raise MQClientException("no message queue for publish info")
-            idx = self._index % len(self.msg_queue_list)
-            self._index += 1
-            return self.msg_queue_list[idx]
+            n = len(self.msg_queue_list)
+            if not filters:
+                mq = self.msg_queue_list[self._index % n]
+                self._index += 1
+                return mq
+            for _ in range(n):
+                mq = self.msg_queue_list[self._index % n]
+                self._index += 1
+                if all(f(mq) for f in filters):
+                    return mq
+            return None
 
     def to_dict(self) -> dict:
         return {
