@@ -11,6 +11,9 @@ public class MQClientException : Exception
     public int ResponseCode { get; }
 
     public MQClientException(string msg, int code = 1) : base(msg) => ResponseCode = code;
+
+    public MQClientException(string msg, Exception? inner, int code = 1) : base(msg, inner) =>
+        ResponseCode = code;
 }
 
 /// <summary>对应 Java MQBrokerException：带 broker 返回的 responseCode。</summary>

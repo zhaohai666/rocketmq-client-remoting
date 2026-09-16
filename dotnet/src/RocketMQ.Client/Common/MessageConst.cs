@@ -42,6 +42,13 @@ public static class MessageConst
     public const string PropertyInstanceId = "INSTANCE_ID";
     public const string PropertyCluster = "CLUSTER";
     public const string PropertyMessageType = "MSG_TYPE";
+
+    // Request-Reply（5.x）专用属性键（对应 Java MessageConst / Python MessageConst）。
+    // 这些键名是协议的一部分，broker 的 ReplyMessageProcessor 按字面匹配。
+    public const string PropertyCorrelationId = "CORRELATION_ID";
+    public const string PropertyReplyToClient = "REPLY_TO_CLIENT";
+    public const string PropertyMessageTTL = "TTL";
+    public const string PropertyReplyMessageArriveTime = "REPLY_MESSAGE_ARRIVE_TIME";
     public const string PropertyInnerMultiDispatch = "INNER_MULTI_DISPATCH";
     public const string PropertyInnerMultiQueueOffset = "INNER_MULTI_QUEUE_OFFSET";
     public const string PropertyPopCk = "POP_CK";

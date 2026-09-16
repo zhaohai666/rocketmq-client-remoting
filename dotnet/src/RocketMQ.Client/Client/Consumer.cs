@@ -628,10 +628,11 @@ public sealed class DefaultMQPushConsumer
     /// invokeTimeout（实测 5s 超时、日志出现 "no consumer id list ..., keep current"，
     /// 并连带把其它请求的响应一起卡住）。只置标志、交给 RebalanceThread 去算即可，
     /// 与 C++ 侧只置 rebalanceNow_ 标志、Java 侧 rebalanceImmediately() 的语义一致。</remarks>
-    private void OnConsumerIdsChanged(RemotingCommand request, string addr)
+    private RemotingCommand? OnConsumerIdsChanged(RemotingCommand request, string addr)
     {
         ClientLog.Debug("received NOTIFY_CONSUMER_IDS_CHANGED, rebalance now (on reader thread, defer to RebalanceThread)");
         _rebalanceNow.Set();
+        return null; // 回查类通知是 invokeOneway，不期待响应
     }
 
     private void RebalanceLoop()

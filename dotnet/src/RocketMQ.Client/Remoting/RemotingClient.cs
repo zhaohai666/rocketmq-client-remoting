@@ -30,11 +30,13 @@ public sealed class RemotingClient : IDisposable
 
     /// <summary>
     /// broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
-    /// 对应 Java NettyRemotingAbstract 的 processor 表；返回 void 表示「不回响应」，
-    /// 与 Java ClientRemotingProcessor.checkTransactionState 返回 null 的语义一致
-    /// （broker 侧是用 invokeOneway 发的，本来也不期待响应）。
+    /// 对应 Java NettyRemotingAbstract 的 processor 表。返回非 null 的 RemotingCommand
+    /// 表示「要回一个响应」——典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)，broker 侧是
+    /// invokeSync，不回响应它那边会超时；返回 null 表示「不回响应」，与 Java
+    /// ClientRemotingProcessor.checkTransactionState 返回 null 的语义一致（broker 用
+    /// invokeOneway 发的回查本来也不期待响应）。
     /// </summary>
-    public delegate void RequestProcessor(RemotingCommand request, string addr);
+    public delegate RemotingCommand? RequestProcessor(RemotingCommand request, string addr);
 
     /// <summary>单帧上限（与 Java NettyRemotingClient 的 16MB 限制一致）。</summary>
     public const int MaxFrameLength = 16 * 1024 * 1024;
@@ -445,7 +447,24 @@ public sealed class RemotingClient : IDisposable
                     // 该连接上其余响应会全部丢失（比丢一条回查严重得多）。
                     try
                     {
-                        proc(cmd, from);
+                        RemotingCommand? resp = proc(cmd, from);
+                        // 处理器产出了响应（典型 326 必须回 SUCCESS/SYSTEM_ERROR，broker 侧是
+                        // invokeSync，不回响应它那边会超时）；按请求 opaque 原样回填并标记响应位。
+                        if (resp is not null)
+                        {
+                            resp.Opaque = cmd.Opaque;
+                            resp.MarkResponseType();
+                            try
+                            {
+                                SendResponse(from, resp);
+                            }
+                            catch (Exception se)
+                            {
+                                ClientLog.Warn("remoting: send processor response for code "
+                                    + cmd.Code.ToString(CultureInfo.InvariantCulture) + " failed: "
+                                    + se.Message);
+                            }
+                        }
                     }
                     catch (Exception e)
                     {
@@ -540,6 +559,37 @@ public sealed class RemotingClient : IDisposable
             }
 
             sent += n;
+        }
+    }
+
+    /// <summary>
+    /// 把**响应**写回对端（对应 Java processRequestCommand 里给处理器产出响应走
+    /// ctx.writeAndFlush）。不走 RPC 钩子（响应不需要重签名），且调用方已设好 Opaque
+    /// 与响应位。仅复用了连接写锁与分帧发送。
+    /// </summary>
+    private void SendResponse(string addr, RemotingCommand response)
+    {
+        Connection conn = GetOrCreateConnection(addr);
+        byte[] data = response.Encode();
+        lock (conn.WriteLock)
+        {
+            try
+            {
+                SendAll(conn.Sock, data);
+            }
+            catch (Exception)
+            {
+                CloseQuietly(conn);
+                lock (_connMutex)
+                {
+                    if (_conns.TryGetValue(addr, out Connection? found) && ReferenceEquals(found, conn))
+                    {
+                        _conns.Remove(addr);
+                    }
+                }
+
+                throw new RemotingSendRequestException(addr);
+            }
         }
     }
 

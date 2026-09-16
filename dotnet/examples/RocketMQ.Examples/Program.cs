@@ -35,6 +35,8 @@ internal static class Program
                 "redelivery" => LiveRedelivery.Run(rest),
                 "acl" => LiveAcl.Run(rest),
                 "pull" => LivePull.Run(rest),
+                "rr" => LiveRR.Run(rest),
+                "reqreply" => LiveRR.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -66,6 +68,7 @@ internal static class Program
               redelivery    [namesrv]       真实集群消费侧能力联调（回投/位点/顺序/广播/流控）
               acl     [namesrv] [ak] [sk]   真实集群 ACL 鉴权联调（需 broker 开 authenticationEnabled）
               pull         [namesrv]       真实集群主动拉取消费者联调（手动拉取/手动位点/回投）
+              rr           [namesrv]        真实集群 Request-Reply（5.x）联调（请求/应答/并发/超时）
             """);
     }
 }

@@ -21,6 +21,15 @@ public static class MixAll
     public const string RetryGroupTopicPrefix = "%RETRY%";
     public const string DlqGroupTopicPrefix = "%DLQ%";
     public const string ReplyTopicPrefix = "%REPLY%";
+
+    // Request-Reply（5.x）：应答 topic = <cluster>_REPLY_TOPIC（Java MixAll.REPLY_TOPIC_POSTFIX）。
+    // 注意：它**不是**上面那个老的控制台前缀 "%REPLY%"，两者语义完全不同——
+    // GetReplyTopic 返回的是集群级系统 topic（broker 预注册，客户端切勿自建）。
+    public const string REPLY_TOPIC_POSTFIX = "REPLY_TOPIC";
+
+    // 应答消息的 MSG_TYPE 属性值（Java MixAll.REPLY_MESSAGE_FLAG）。大小写敏感。
+    public const string REPLY_MESSAGE_FLAG = "reply";
+
     public const string SystemTopicPrefix = "rmq_sys_";
     public const string ToolsConsumerGroup = "TOOLS_CONSUMER";
     public const string FiltersrvConsumerGroup = "FILTERSRV_CONSUMER";
@@ -84,7 +93,12 @@ public static class MixAll
 
     public static bool IsDlqTopic(string topic) => topic.StartsWith(DlqGroupTopicPrefix, StringComparison.Ordinal);
 
-    public static string GetReplyTopic(string topic) => ReplyTopicPrefix + topic;
+    /// <summary>
+    /// 应答 topic = &lt;cluster&gt;_REPLY_TOPIC（Java MixAll.getReplyTopic）。
+    /// 对应 Python 的 <c>cluster_name + "_" + REPLY_TOPIC_POSTFIX</c>。
+    /// broker 预注册该系统 topic，客户端只发不建。
+    /// </summary>
+    public static string GetReplyTopic(string clusterName) => clusterName + "_" + REPLY_TOPIC_POSTFIX;
 
     public static bool IsSysTopic(string topic) => topic.StartsWith(SystemTopicPrefix, StringComparison.Ordinal);
 

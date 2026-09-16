@@ -115,6 +115,12 @@ public sealed class MQClientInstance : IDisposable
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
         _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis);
+
+        // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
+        // 对应 Java MQClientAPIImpl 构造里
+        // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)——
+        // 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），所以在这里注册。
+        _remotingClient.RegisterProcessor(RequestCode.PushReplyMessageToClient, ProcessReplyMessage);
     }
 
     /// <summary>
@@ -464,14 +470,15 @@ public sealed class MQClientInstance : IDisposable
     // ---------------- 消息发送 ----------------
 
     /// <summary>
+    /// 组装发送请求（对应 Java MQClientAPIImpl.sendMessage 的头部拼装 + V2 选择）。
+    /// Request-Reply 的应答消息（MSG_TYPE == "reply"）会用 SEND_REPLY_MESSAGE_V2(325)
+    /// 而不是普通 SEND_MESSAGE_V2(314)——broker 只在 324/325 上注册了 ReplyMessageProcessor。
     /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
     /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
     /// </summary>
-    public SendResult SendMessage(string producerGroup, Message msg, MessageQueue mq,
-        int timeoutMillis = 3000, int sysFlag = 0)
+    public RemotingCommand BuildSendRequest(string producerGroup, Message msg, MessageQueue mq,
+        int sysFlag = 0)
     {
-        string addr = BrokerAddr(mq);
-
         var header = new SendMessageRequestHeaderV2
         {
             ProducerGroup = producerGroup,
@@ -489,10 +496,26 @@ public sealed class MQClientInstance : IDisposable
             Batch = msg.IsBatch,
         };
 
-        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.SendMessageV2, header);
+        // 对应 Java MQClientAPIImpl.sendMessage:550-558（sendSmartMsg 默认 true → V2）。
+        int code = RequestReply.IsReplyMessage(msg)
+            ? RequestCode.SendReplyMessageV2
+            : RequestCode.SendMessageV2;
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(code, header);
         request.Body = msg.Body;
         request.HasBody = true;
+        return request;
+    }
 
+    /// <summary>
+    /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
+    /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
+    /// </summary>
+    public SendResult SendMessage(string producerGroup, Message msg, MessageQueue mq,
+        int timeoutMillis = 3000, int sysFlag = 0)
+    {
+        string addr = BrokerAddr(mq);
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
 
         SendStatus status;
@@ -531,29 +554,96 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 3000, int sysFlag = 0)
     {
         string addr = BrokerAddr(mq);
-
-        var header = new SendMessageRequestHeaderV2
-        {
-            ProducerGroup = producerGroup,
-            Topic = msg.Topic,
-            DefaultTopic = MixAll.DefaultTopic,
-            DefaultTopicQueueNums = MixAll.DefaultTopicQueueNums,
-            QueueId = mq.QueueId,
-            SysFlag = sysFlag,
-            BornTimestamp = UtilAll.CurrentTimeMillis(),
-            Flag = msg.Flag,
-            Properties = MessageDecoder.MessagePropertiesToString(msg.Properties),
-            ReconsumeTimes = 0,
-            UnitMode = false,
-            MaxReconsumeTimes = 0,
-            Batch = msg.IsBatch,
-        };
-
-        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.SendMessageV2, header);
-        request.Body = msg.Body;
-        request.HasBody = true;
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
         request.MarkOnewayRpc();
         _remotingClient.InvokeOneway(addr, request);
+    }
+
+    // ---------------- Request-Reply：接收 broker 推回的应答（326）----------------
+
+    /// <summary>
+    /// 处理 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：把应答交给等待中的 Request()。
+    ///
+    /// 对应 Java ClientRemotingProcessor#receiveReplyMessage(:222-271)。
+    /// 与 Java 一样**必须回一个响应**：broker 侧 Broker2Client.callClient 是 invokeSync
+    /// （10s 超时），不回响应它那边就会超时并记 "push reply message to &lt;id&gt; fail"，
+    /// 应答虽然已经投递成功，broker 日志里却是失败。
+    ///
+    /// 该回调运行在**读线程**上：绝不能在这里做 invokeSync（会死锁读线程）；异常必须兜住
+    /// （解析失败回 SYSTEM_ERROR，绝不让读线程崩），对应 Java 的同处 try/catch。
+    /// </summary>
+    public RemotingCommand? ProcessReplyMessage(RemotingCommand cmd, string addr)
+    {
+        var header = new ReplyMessageRequestHeader();
+        try
+        {
+            header.FromExtFields(cmd.ExtFields ?? new PropertyMap());
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("processReplyMessage: decode header failed from " + addr + ": " + e.Message);
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError, "process reply message fail: " + e.Message);
+        }
+
+        try
+        {
+            byte[] body = cmd.Body ?? Array.Empty<byte>();
+            // sysFlag 里带压缩标志时要先解压：326 推的是**裸包**，不走消息解码路径
+            // （对齐 Java 同处的 Compressor 分支）。
+            int sysFlag = header.SysFlag ?? 0;
+            if (MessageSysFlag.IsCompressed(sysFlag))
+            {
+                body = CompressorFactory.Decompress(body, MessageSysFlag.GetCompressionType(sysFlag));
+            }
+
+            var msg = new MessageExt
+            {
+                Topic = header.Topic ?? string.Empty,
+                Body = body,
+                QueueId = header.QueueId ?? 0,
+                StoreTimestamp = header.StoreTimestamp ?? 0,
+                Flag = header.Flag ?? 0,
+                BornTimestamp = header.BornTimestamp ?? 0,
+                ReconsumeTimes = header.ReconsumeTimes ?? 0,
+            };
+            if (!string.IsNullOrEmpty(header.BornHost))
+            {
+                msg.BornHost = header.BornHost;
+            }
+
+            if (!string.IsNullOrEmpty(header.StoreHost))
+            {
+                msg.StoreHost = header.StoreHost;
+            }
+
+            PropertyMap props = MessageDecoder.StringToMessageProperties(header.Properties ?? string.Empty);
+            foreach (var kv in props)
+            {
+                msg.Properties[kv.Key] = kv.Value;
+            }
+
+            // 应答到达时间（Java 同处写入 REPLY_MESSAGE_ARRIVE_TIME）。
+            msg.PutProperty(MessageConst.PropertyReplyMessageArriveTime,
+                UtilAll.CurrentTimeMillis().ToString(CultureInfo.InvariantCulture));
+
+            string correlationId = msg.GetProperty(MessageConst.PropertyCorrelationId);
+            if (RequestFutureHolder.Instance.PutResponse(correlationId, msg) is null)
+            {
+                // 查不到是正常情况（请求已超时 / 应答重复），Java 此处也是 warn
+                ClientLog.Warn("receive reply message, but not matched any request, CorrelationId: "
+                    + correlationId + ", reply from host: " + (header.BornHost ?? addr));
+            }
+
+            return RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
+        }
+        catch (Exception e)
+        {
+            // 解析失败绝不能让读线程崩：回 SYSTEM_ERROR（broker 侧记 warn 但不丢连接）。
+            ClientLog.Warn("unknown err when receiveReplyMsg: " + e.Message);
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError, "process reply message fail: " + e.Message);
+        }
     }
 
     // ---------------- 消息拉取 ----------------

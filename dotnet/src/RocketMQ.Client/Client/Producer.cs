@@ -47,6 +47,8 @@ public class DefaultMQProducer
     private int _compressMsgBodyOverHowmuch = 1024 * 4;
     private int _compressLevel = 5;
     private int _compressType = CompressionType.ZLIB;
+    // Request-Reply 默认等待应答超时（ms），与 Java/Python 默认 3000 对齐。
+    private int _requestTimeout = 3000;
     private List<string> _nameServerAddrs = new();
     // 异步发送线程句柄，shutdown 时统一 join 回收
     private readonly List<Thread> _asyncThreads = new();
@@ -185,6 +187,14 @@ public class DefaultMQProducer
     {
         get => _compressType;
         set => _compressType = value;
+    }
+
+    // Request-Reply：等待应答的超时（默认 3000ms，与 Java/Python 对齐）。
+    // 任何 <= 0 的值都回退到默认 3000，避免把发送路径的超时设成 0。
+    public int RequestTimeout
+    {
+        get => _requestTimeout;
+        set => _requestTimeout = value > 0 ? value : 3000;
     }
 
     public string ClientId => _clientId;
@@ -528,6 +538,104 @@ public class DefaultMQProducer
         return c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
     }
 
+    // ---------------- Request-Reply（5.x）----------------
+
+    /// <summary>
+    /// Request-Reply（5.x）：发一条请求消息并**同步等应答**，返回应答消息。
+    ///
+    /// 对应 Java DefaultMQProducerImpl#request(msg, mq, timeout)（:1738-1767）。
+    /// 请求方做三件事：
+    ///   1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（本客户端 clientId）、
+    ///      TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
+    ///   2. 把等待槽按 correlationId 登记到进程级的 RequestFutureHolder。
+    ///   3. 发送后阻塞等待；应答由 broker 经 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回，
+    ///      由 MQClientInstance.ProcessReplyMessage 投递进等待槽。
+    ///
+    /// 超时抛 RequestTimeoutException（消息已发出但没等到应答）；发送本身失败则抛
+    /// MQClientException（带着底层 cause），与 Java 一致。
+    ///
+    /// REPLY_TO_CLIENT 是 clientId —— broker 要靠它反查 channel，所以本生产者必须先发过
+    /// 心跳（start() 已起心跳线程；这里也会补一次，对齐 Java prepareSendRequest 的
+    /// sendHeartbeatToAllBrokerWithLock）。
+    /// </summary>
+    public Message Request(Message msg, int timeoutMillis = -1)
+    {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
+        MQClientInstance c = GetClient();
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        int sysFlag = PrepareForSend(outbound);
+
+        string correlationId = RequestReply.CreateCorrelationId();
+        outbound.PutProperty(MessageConst.PropertyCorrelationId, correlationId);
+        outbound.PutProperty(MessageConst.PropertyReplyToClient, c.ClientId);
+        outbound.PutProperty(MessageConst.PropertyMessageTTL,
+            timeout.ToString(CultureInfo.InvariantCulture));
+
+        // 对齐 Java prepareSendRequest：确保路由已知，然后补一次心跳 ——
+        // 没在 broker 上登记为 producer，broker 就找不到 channel 把应答推回来。
+        long begin = UtilAll.CurrentTimeMillis();
+        try
+        {
+            c.GetTopicPublishInfo(outbound.Topic);
+            SendHeartbeatToAllBroker();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("request: prepare route/heartbeat failed: " + e.Message);
+        }
+
+        var future = new RequestResponseFuture(correlationId, timeout);
+        RequestFutureHolder.Instance.PutRequest(correlationId, future);
+
+        try
+        {
+            long elapsed = UtilAll.CurrentTimeMillis() - begin;
+            int remaining = (int)(timeout > elapsed ? timeout - elapsed : 0);
+
+            // 发送失败时把等待槽标成 !sendRequestOk 并立即唤醒（让 _waitRequestResponse 走失败分支）；
+            // 协议上无差别 —— 应答由 broker 经**另一条** 326 通道推回，与本次发送的 mode 无关。
+            try
+            {
+                Send(outbound, remaining);
+            }
+            catch (Exception e)
+            {
+                future.SendRequestOk = false;
+                future.Cause = e;
+                future.PutResponseMessage(null);
+            }
+
+            return WaitRequestResponse(outbound, timeout, future);
+        }
+        finally
+        {
+            RequestFutureHolder.Instance.RemoveRequest(correlationId);
+        }
+    }
+
+    /// <summary>对应 Java waitResponse：超时/发送失败分别抛不同异常。</summary>
+    private static Message WaitRequestResponse(Message msg, int timeout, RequestResponseFuture future)
+    {
+        long elapsed = UtilAll.CurrentTimeMillis() - future.BeginTimestamp;
+        int waitMillis = (int)(timeout > elapsed ? timeout - elapsed : 0);
+        Message? response = future.WaitResponseMessage(waitMillis);
+        if (response is null)
+        {
+            if (future.SendRequestOk)
+            {
+                throw new RequestTimeoutException(
+                    "send request message to <" + msg.Topic + "> OK, but wait reply message timeout, "
+                    + timeout.ToString(CultureInfo.InvariantCulture) + " ms.");
+            }
+
+            throw new MQClientException(
+                "send request message to <" + msg.Topic + "> fail", future.Cause);
+        }
+
+        return response;
+    }
+
     // ---------------- 事务消息 ----------------
     // 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction 的**两阶段**：
     //   1) 半消息：给 msg 打 TRAN_MSG / PGROUP 属性，sysFlag 置 TRANSACTION_PREPARED_TYPE；
@@ -785,8 +893,9 @@ public class DefaultMQProducer
 
     /// <summary>
     /// broker 主动发起的事务回查（CHECK_TRANSACTION_STATE=39）入口，由传输层回调。
+    /// 回查是 broker 用 invokeOneway 发的，不期待响应，故返回 null。
     /// </summary>
-    private void CheckTransactionState(RemotingCommand cmd, string addr)
+    private RemotingCommand? CheckTransactionState(RemotingCommand cmd, string addr)
     {
         var header = new CheckTransactionStateRequestHeader();
         try
@@ -796,7 +905,7 @@ public class DefaultMQProducer
         catch (Exception e)
         {
             ClientLog.Warn("checkTransactionState: decode header failed from " + addr + ": " + e.Message);
-            return;
+            return null;
         }
 
         // broker 把整条 MessageExt 编码后放在 body 里（Java Broker2Client.checkProducerTransactionState）
@@ -810,21 +919,21 @@ public class DefaultMQProducer
         if (msgExt is null)
         {
             ClientLog.Warn("checkTransactionState: decode message failed");
-            return;
+            return null;
         }
 
         string? group = msgExt.GetProperty(MessageConst.PropertyProducerGroup);
         if (group is not null && group != _producerGroup)
         {
             ClientLog.Debug("checkTransactionState: group " + group + " is not mine (" + _producerGroup + ")");
-            return;
+            return null;
         }
 
         ITransactionListener? listener = _txListener;
         if (listener is null)
         {
             ClientLog.Warn("checkTransactionState: no transaction listener for group " + _producerGroup);
-            return;
+            return null;
         }
 
         // Java 在独立线程里执行回查回调，避免阻塞读线程
@@ -856,12 +965,14 @@ public class DefaultMQProducer
                 ClientLog.Warn("checkTransactionState: end transaction failed: " + e.Message);
             }
         })
-        { IsBackground = true, Name = "TransactionCheckThread" };
+            { IsBackground = true, Name = "TransactionCheckThread" };
         th.Start();
         lock (_txThreadsLock)
         {
             _txThreads.Add(th);
         }
+
+        return null;
     }
 
     // ---------------- 查询 / 管理 ----------------

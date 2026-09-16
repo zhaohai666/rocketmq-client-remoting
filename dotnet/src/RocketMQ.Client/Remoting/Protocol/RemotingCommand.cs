@@ -100,13 +100,13 @@ public sealed class RemotingCommand
         return cmd;
     }
 
-    public static RemotingCommand CreateResponseCommand(int code, string remark)
+    public static RemotingCommand CreateResponseCommand(int code, string? remark)
     {
         var cmd = new RemotingCommand
         {
             Code = code,
-            Remark = remark,
-            HasRemark = remark.Length > 0,
+            Remark = remark ?? string.Empty,
+            HasRemark = remark is { Length: > 0 },
             SerializeTypeCurrentRpc = GetSerializeTypeConfig(),
             Version = VersionConfig,
         };

@@ -879,3 +879,67 @@ public sealed class CreateTopicRequestHeader : ICommandCustomHeader
         Force = HeaderCodec.GetOptBool(ext, "force");
     }
 }
+
+/// <summary>
+/// 对应 org.apache.rocketmq.remoting.protocol.header.ReplyMessageRequestHeader：
+/// broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
+///
+/// 字段与 SendMessageRequestHeaderV2 高度重合，但多了 bornHost / storeHost /
+/// storeTimestamp（broker 的 ReplyMessageProcessor#pushReplyMessage 据此拼出头）。
+/// 请求方收到后结合 body 还原出真正的应答 MessageExt。
+/// </summary>
+public sealed class ReplyMessageRequestHeader : ICommandCustomHeader
+{
+    public string? ProducerGroup { get; set; }
+    public string? Topic { get; set; }
+    public string? DefaultTopic { get; set; }
+    public int? DefaultTopicQueueNums { get; set; }
+    public int? QueueId { get; set; }
+    public int? SysFlag { get; set; }
+    public long? BornTimestamp { get; set; }
+    public int? Flag { get; set; }
+    public string? Properties { get; set; }
+    public int? ReconsumeTimes { get; set; }
+    public bool? UnitMode { get; set; }
+    public string? BornHost { get; set; }
+    public string? StoreHost { get; set; }
+    public long? StoreTimestamp { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "producerGroup", ProducerGroup);
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
+        HeaderCodec.PutOptStr(outMap, "defaultTopic", DefaultTopic);
+        HeaderCodec.PutOptInt(outMap, "defaultTopicQueueNums", DefaultTopicQueueNums);
+        HeaderCodec.PutOptInt(outMap, "queueId", QueueId);
+        HeaderCodec.PutOptInt(outMap, "sysFlag", SysFlag);
+        HeaderCodec.PutOptLong(outMap, "bornTimestamp", BornTimestamp);
+        HeaderCodec.PutOptInt(outMap, "flag", Flag);
+        HeaderCodec.PutOptStr(outMap, "properties", Properties);
+        HeaderCodec.PutOptInt(outMap, "reconsumeTimes", ReconsumeTimes);
+        HeaderCodec.PutOptBool(outMap, "unitMode", UnitMode);
+        HeaderCodec.PutOptStr(outMap, "bornHost", BornHost);
+        HeaderCodec.PutOptStr(outMap, "storeHost", StoreHost);
+        HeaderCodec.PutOptLong(outMap, "storeTimestamp", StoreTimestamp);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        ProducerGroup = HeaderCodec.GetOptStr(ext, "producerGroup");
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
+        DefaultTopic = HeaderCodec.GetOptStr(ext, "defaultTopic");
+        DefaultTopicQueueNums = HeaderCodec.GetOptInt(ext, "defaultTopicQueueNums");
+        QueueId = HeaderCodec.GetOptInt(ext, "queueId");
+        SysFlag = HeaderCodec.GetOptInt(ext, "sysFlag");
+        BornTimestamp = HeaderCodec.GetOptLong(ext, "bornTimestamp");
+        Flag = HeaderCodec.GetOptInt(ext, "flag");
+        Properties = HeaderCodec.GetOptStr(ext, "properties");
+        ReconsumeTimes = HeaderCodec.GetOptInt(ext, "reconsumeTimes");
+        UnitMode = HeaderCodec.GetOptBool(ext, "unitMode");
+        BornHost = HeaderCodec.GetOptStr(ext, "bornHost");
+        StoreHost = HeaderCodec.GetOptStr(ext, "storeHost");
+        StoreTimestamp = HeaderCodec.GetOptLong(ext, "storeTimestamp");
+    }
+}
