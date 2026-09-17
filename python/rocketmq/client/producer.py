@@ -17,6 +17,7 @@ from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
 from ..common.message_const import MessageConst
 from ..common.message_decoder import _compress, decode_message, decode_message_id
+from ..common.message_type import MessageType
 from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
 from ..logging import get_logger
@@ -29,12 +30,16 @@ from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .exception import MQBrokerException, MQClientException, RequestTimeoutException
+from .hook import EndTransactionContext, EndTransactionHook, SendMessageContext, SendMessageHook
 from .latency import MQFaultStrategy
 from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
 from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
                             RequestResponseFuture, create_correlation_id)
 from .send_result import SendResult, SendStatus
+from .trace import AccessChannel
+from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
+from .trace_hook import EndTransactionTraceHook, SendMessageTraceHook
 
 logger = get_logger()
 
@@ -186,6 +191,13 @@ class DefaultMQProducer:
         # 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
         self.send_latency_fault_enable = False
         self._mq_fault_strategy = MQFaultStrategy(False)
+        # ---- 消息轨迹（对应 Java ClientConfig.enableTrace / traceTopic / traceMsgBatchNum）----
+        self.enable_trace = False
+        self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
+        self.trace_msg_batch_num = 10
+        self.send_message_hook_list: List["SendMessageHook"] = []
+        self.end_transaction_hook_list: List["EndTransactionHook"] = []
+        self.trace_dispatcher = None
         # 基础客户端指标（send/consume RT 与计数）
         self.metrics = ClientMetrics()
         # Request-Reply 的默认超时。Java 的 request(msg, timeout) 必须显式给 timeout，
@@ -250,6 +262,109 @@ class DefaultMQProducer:
         """返回本生产者的基础指标计数器（send/consume RT 与计数）。"""
         return self.metrics
 
+    # ---------------- 消息轨迹配置（对应 Java ClientConfig / DefaultMQProducer）----------------
+    def set_enable_trace(self, enable: bool) -> None:
+        """开关消息轨迹（Java ``ClientConfig.setEnableTrace``，默认 false）。
+
+        开启后 ``start()`` 会注册 SendMessageTraceHook，把每条消息的发送轨迹
+        异步发到轨迹 topic。**内部轨迹生产者自身必须保持关闭**，否则无限递归。
+        """
+        self.enable_trace = enable
+
+    def is_enable_trace(self) -> bool:
+        return self.enable_trace
+
+    def set_trace_topic(self, trace_topic: Optional[str]) -> None:
+        """自定义轨迹 topic（Java ``ClientConfig.setTraceTopic``）；空则用系统默认。"""
+        self.trace_topic = trace_topic
+
+    def set_trace_msg_batch_num(self, n: int) -> None:
+        self.trace_msg_batch_num = n
+
+    def register_send_message_hook(self, hook: "SendMessageHook") -> None:
+        """注册发送钩子（对应 Java DefaultMQProducerImpl.registerSendMessageHook）。"""
+        if hook is not None:
+            self.send_message_hook_list.append(hook)
+
+    def has_send_message_hook(self) -> bool:
+        return len(self.send_message_hook_list) > 0
+
+    def register_end_transaction_hook(self, hook: "EndTransactionHook") -> None:
+        """注册事务收尾钩子（对应 Java registerEndTransactionHook）。"""
+        if hook is not None:
+            self.end_transaction_hook_list.append(hook)
+
+    def execute_end_transaction_hook(self, context: "EndTransactionContext") -> None:
+        for hook in self.end_transaction_hook_list:
+            try:
+                hook.end_transaction(context)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("failed to executeEndTransactionHook: %s", e)
+
+    # ---------------- 发送钩子调用（对应 Java executeSendMessageHookBefore/After）----------------
+    def execute_send_message_hook_before(self, context: SendMessageContext) -> None:
+        """钩子异常一律吞掉并记 warn（Java DefaultMQProducerImpl:1159）。"""
+        for hook in self.send_message_hook_list:
+            try:
+                hook.send_message_before(context)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("failed to executeSendMessageHookBefore: %s", e)
+
+    def execute_send_message_hook_after(self, context: SendMessageContext) -> None:
+        for hook in self.send_message_hook_list:
+            try:
+                hook.send_message_after(context)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("failed to executeSendMessageHookAfter: %s", e)
+
+    def _build_send_context(self, msg: Message, mq: MessageQueue,
+                            broker_addr: str) -> SendMessageContext:
+        """构造 SendMessageContext（对齐 Java DefaultMQProducerImpl:969-989）。
+
+        msgType 的判定顺序也照抄：TRAN_MSG=true → Trans_Msg_Half；
+        带任何延迟类属性 → Delay_Msg；否则 Normal_Msg。
+        """
+        context = SendMessageContext()
+        context.producer = self
+        context.producer_group = self.producer_group
+        context.message = msg
+        context.mq = mq
+        context.broker_addr = broker_addr
+        context.namespace = self.namespace
+        if msg.get_property(MessageConst.PROPERTY_TRANSACTION_PREPARED) == "true":
+            context.msg_type = MessageType.TRANS_MSG_HALF
+        for key in ("__STARTDELIVERTIME", MessageConst.PROPERTY_DELAY_TIME_LEVEL,
+                    "TIMER_DELIVER_MS", "TIMER_DELAY_SEC", "TIMER_DELAY_MS"):
+            if msg.get_property(key) is not None:
+                context.msg_type = MessageType.DELAY_MSG
+                break
+        return context
+
+    def _send_with_hooks(self, client: MQClientInstance, msg: Message, mq_sel: MessageQueue,
+                         timeout: int, sys_flag: int) -> SendResult:
+        """带上 before/after 钩子的同步发送（对应 Java sendKernelImpl + sendDefaultImpl 的钩子点）。
+
+        钩子只在**真正发起请求的那一次**执行（Java 也是这样：重试时每轮都重建 context）。
+        """
+        if not self.send_message_hook_list:
+            return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+        broker_addr = ""
+        try:
+            broker_addr = client.broker_addr_of(mq_sel.broker_name) or ""
+        except Exception:  # noqa: BLE001
+            pass
+        context = self._build_send_context(msg, mq_sel, broker_addr)
+        self.execute_send_message_hook_before(context)
+        try:
+            result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+        except Exception as e:  # noqa: BLE001
+            context.exception = e
+            self.execute_send_message_hook_after(context)
+            raise
+        context.send_result = result
+        self.execute_send_message_hook_after(context)
+        return result
+
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
         with self._lock:
@@ -279,6 +394,33 @@ class DefaultMQProducer:
             self._heartbeat_running = True
             threading.Thread(target=self._heartbeat_loop, name="ProducerHeartbeatThread",
                              daemon=True).start()
+        # 轨迹分发器在锁外启动（Java 同样在 defaultMQProducerImpl.start() 之后做）：
+        # 它要新建内部生产者并拉路由，属网络操作，不该占着生产者自己的锁。
+        self._start_trace_dispatcher()
+
+    def _start_trace_dispatcher(self) -> None:
+        """对应 Java DefaultMQProducer.start():380-405。
+
+        enableTrace=true 时建 AsyncTraceDispatcher（Type=PRODUCE）并注册
+        SendMessageTraceHook；随后无论新建还是复用，都要 start 它。
+        任何异常都只记日志 —— 轨迹挂了不能影响正常发送。
+        """
+        if self.enable_trace:
+            try:
+                dispatcher = AsyncTraceDispatcher(
+                    self.producer_group, TraceDispatcherType.PRODUCE,
+                    self.trace_msg_batch_num, self.trace_topic, self.rpc_hook)
+                dispatcher.set_host_producer(self)
+                self.trace_dispatcher = dispatcher
+                self.register_send_message_hook(SendMessageTraceHook(dispatcher))
+                self.register_end_transaction_hook(EndTransactionTraceHook(dispatcher))
+            except Exception as e:  # noqa: BLE001
+                logger.error("system mqtrace hook init failed ,maybe can't send msg trace data: %s", e)
+        if self.trace_dispatcher is not None:
+            try:
+                self.trace_dispatcher.start(self.get_namesrv_addr(), AccessChannel.LOCAL)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("trace dispatcher start failed: %s", e)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -288,6 +430,13 @@ class DefaultMQProducer:
             if self._mq_client is not None:
                 self._mq_client.shutdown()
             self._started = False
+        # 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器
+        # （分发器用的是**自己的**内部生产者，与本客户端实例无关，所以关掉了照样能发完）
+        if self.trace_dispatcher is not None:
+            try:
+                self.trace_dispatcher.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("trace dispatcher shutdown failed: %s", e)
 
     def _heartbeat_loop(self) -> None:
         """周期性向所有已知 broker 发心跳（含 ProducerData），对齐 Java 的生产者注册。"""
@@ -398,6 +547,9 @@ class DefaultMQProducer:
         # 消费端只解一层就拿到压缩流。这里避免该问题。
         sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
+            # 定点发送同样要过钩子（Java：目标是 mq 也走 sendKernelImpl）
+            if self.send_message_hook_list:
+                return self._send_with_hooks(client, msg, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, msg, mq, timeout, sys_flag)
         last_exc = None
         last_broker_name = None
@@ -412,7 +564,7 @@ class DefaultMQProducer:
                 mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
                 send_start = self.metrics.record_send_start()
                 try:
-                    result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+                    result = self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag)
                 except Exception:  # noqa: BLE001 — 记录指标/隔离后按原异常重试
                     self.metrics.record_send_failure(send_start)
                     self._mq_fault_strategy.update_fault_item(
@@ -533,6 +685,8 @@ class DefaultMQProducer:
         # 选择器用的是原始消息（topic/业务字段），压缩只影响 body
         self._check_message(msg)
         sys_flag = self.try_to_compress_message(msg)
+        if self.send_message_hook_list:
+            return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag)
         return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
 
     # ---------------- 批量发送 ----------------
@@ -548,10 +702,14 @@ class DefaultMQProducer:
         # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
         sys_flag = self.try_to_compress_message(batch)
         if mq is not None:
+            if self.send_message_hook_list:
+                return self._send_with_hooks(client, batch, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, batch, mq, timeout, sys_flag)
         publish = self._topic_publish_info(batch.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(batch.topic, selected.broker_name, selected.queue_id)
+        if self.send_message_hook_list:
+            return self._send_with_hooks(client, batch, mq_sel, timeout, sys_flag)
         return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag)
 
     # ---------------- 事务消息 ----------------
@@ -616,8 +774,10 @@ class DefaultMQProducer:
             sys_flag, MessageSysFlag.TRANSACTION_PREPARED_TYPE)
 
         try:
-            send_result = client.send_message(self.producer_group, msg, mq_sel,
-                                              self.send_msg_timeout, sys_flag)
+            # 事务发送同样走 sendKernelImpl（→ 同样触发发送钩子），
+            # 所以开启轨迹后事务消息会先落一条 Pub（Trans_Msg_Half）轨迹
+            send_result = self._send_with_hooks(client, msg, mq_sel,
+                                               self.send_msg_timeout, sys_flag)
         except Exception as e:  # noqa: BLE001
             raise MQClientException("send message Exception", e)
 
@@ -702,6 +862,19 @@ class DefaultMQProducer:
         if not broker_addr:
             raise MQClientException("no broker address for end transaction", None)
         client.remoting_client.invoke_oneway(broker_addr, cmd)
+        # 对应 Java endTransaction 末尾的 executeEndTransactionHook：无论主动提交还是
+        # broker 回查后提交，都会落一条 EndTransaction 轨迹
+        if self.end_transaction_hook_list:
+            ctx = EndTransactionContext()
+            ctx.producer_group = self.producer_group
+            ctx.message = msg_ext if msg_ext is not None else msg
+            ctx.broker_addr = broker_addr or ""
+            ctx.msg_id = header.msg_id
+            ctx.transaction_id = header.transaction_id
+            ctx.transaction_state = state
+            ctx.from_transaction_check = from_transaction_check
+            ctx.namespace = self.namespace
+            self.execute_end_transaction_hook(ctx)
 
     def _handle_check_transaction_state(self, cmd, addr: str) -> None:
         """处理 broker 主动发来的事务回查（CHECK_TRANSACTION_STATE=39）。

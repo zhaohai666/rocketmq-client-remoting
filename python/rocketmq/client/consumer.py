@@ -35,11 +35,16 @@ from ..remoting.protocol.extra_info import split
 from ..remoting.rpchook import RPCHook
 from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus,
                               ConsumeOrderlyContext, ConsumeOrderlyStatus,
+                              ConsumeReturnType,
                               MessageListener, MessageListenerConcurrently,
                               MessageListenerOrderly, PopResult, PopStatus,
                               PullResult, PullStatus)
 from .exception import MQBrokerException, MQClientException
+from .hook import ConsumeMessageContext, ConsumeMessageHook
 from .mq_client import MQClientInstance
+from .trace import AccessChannel
+from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
+from .trace_hook import ConsumeMessageTraceHook
 
 logger = get_logger()
 
@@ -298,6 +303,13 @@ class DefaultMQPushConsumer:
         # 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
         self._pop_queues: Dict[str, PopProcessQueue] = {}
         self._pop_executor: Optional["ThreadPoolExecutor"] = None
+        # ---- 消息轨迹（对应 Java ClientConfig.enableTrace / traceTopic）----
+        # 开启后 start() 注册 ConsumeMessageTraceHook，落 SubBefore/SubAfter 两段轨迹
+        self.enable_trace = False
+        self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
+        self.trace_msg_batch_num = 10
+        self.consume_message_hook_list: List[ConsumeMessageHook] = []
+        self.trace_dispatcher = None
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -340,6 +352,90 @@ class DefaultMQPushConsumer:
 
     def set_allocate_message_queue_strategy(self, strategy: AllocateMessageQueueStrategy) -> None:
         self.allocate_strategy = strategy
+
+    # ---------------- 消息轨迹（对应 Java DefaultMQPushConsumer 的 enableMsgTrace）----------------
+    def set_enable_msg_trace(self, enable: bool) -> None:
+        """开关消费侧消息轨迹（Java 构造函数参数 ``enableMsgTrace`` → enableTrace）。"""
+        self.enable_trace = enable
+
+    def set_enable_trace(self, enable: bool) -> None:
+        self.enable_trace = enable
+
+    def is_enable_trace(self) -> bool:
+        return self.enable_trace
+
+    def set_customized_trace_topic(self, trace_topic: Optional[str]) -> None:
+        """自定义轨迹 topic（Java ``customizedTraceTopic``）；空则用系统默认。"""
+        self.trace_topic = trace_topic
+
+    def set_trace_topic(self, trace_topic: Optional[str]) -> None:
+        self.trace_topic = trace_topic
+
+    def set_trace_msg_batch_num(self, n: int) -> None:
+        self.trace_msg_batch_num = n
+
+    def register_consume_message_hook(self, hook: ConsumeMessageHook) -> None:
+        """注册消费钩子（对应 Java registerConsumeMessageHook）。"""
+        if hook is not None:
+            self.consume_message_hook_list.append(hook)
+
+    def has_consume_message_hook(self) -> bool:
+        return len(self.consume_message_hook_list) > 0
+
+    def execute_consume_hook_before(self, context: ConsumeMessageContext) -> None:
+        for hook in self.consume_message_hook_list:
+            try:
+                hook.consume_message_before(context)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("consumeMessageHook executeHookBefore exception: %s", e)
+
+    def execute_consume_hook_after(self, context: ConsumeMessageContext) -> None:
+        for hook in self.consume_message_hook_list:
+            try:
+                hook.consume_message_after(context)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("consumeMessageHook executeHookAfter exception: %s", e)
+
+    def _build_consume_hook_context(self, msgs: List[MessageExt],
+                                    mq: MessageQueue) -> ConsumeMessageContext:
+        """构造消费钩子上下文。初始化值与 Java 一致：success=False、props 为空字典。"""
+        context = ConsumeMessageContext(self.consumer_group, msgs, mq)
+        context.success = False
+        context.props = {}
+        context.access_channel = AccessChannel.LOCAL
+        return context
+
+    def _consume_return_type(self, status, has_exception: bool, consume_rt_ms: float,
+                             failed: bool, succeeded: bool) -> ConsumeReturnType:
+        """对应 Java 的 returnType 判定（决定轨迹的 contextCode）。
+
+        Java 判定顺序：status == null → EXCEPTION/RETURNNULL；RT >= consumeTimeout
+        （分钟）→ TIME_OUT；RECONSUME_LATER → FAILED；CONSUME_SUCCESS → SUCCESS。
+        顺序消费把「挂起」等价于 FAILED、成功等价于 SUCCESS，由调用方用
+        failed/succeeded 两个标志传入。
+        """
+        if status is None:
+            return ConsumeReturnType.EXCEPTION if has_exception else ConsumeReturnType.RETURNNULL
+        if consume_rt_ms >= self.consume_timeout * 60 * 1000:
+            return ConsumeReturnType.TIME_OUT
+        if failed:
+            return ConsumeReturnType.FAILED
+        if succeeded:
+            return ConsumeReturnType.SUCCESS
+        return ConsumeReturnType.SUCCESS
+
+    def _finish_consume_hook(self, hook_ctx: Optional[ConsumeMessageContext], status,
+                             has_exception: bool, begin_ms: float, failed: bool,
+                             succeeded: bool) -> None:
+        """把 returnType/status/success 写回上下文并触发 after 钩子（对齐 Java）。"""
+        if hook_ctx is None:
+            return
+        rt = time.time() * 1000 - begin_ms
+        ret = self._consume_return_type(status, has_exception, rt, failed, succeeded)
+        hook_ctx.props["ConsumeContextType"] = ret.name
+        hook_ctx.status = str(status)
+        hook_ctx.success = succeeded
+        self.execute_consume_hook_after(hook_ctx)
 
     def get_consumer_group(self) -> str:
         return self.consumer_group
@@ -442,6 +538,27 @@ class DefaultMQPushConsumer:
                              name="rmq-rebalance-%s" % self.consumer_group)
         t.start()
         self._rebalance_thread = t
+        # 消息轨迹分发器（对应 Java DefaultMQPushConsumer.start():765-785）：
+        # 放在消费循环全部起来之后，避免轨迹生产者的初始化拖慢首次 rebalance。
+        self._start_trace_dispatcher()
+
+    def _start_trace_dispatcher(self) -> None:
+        """enable_trace=true 时建 AsyncTraceDispatcher（Type=CONSUME）并注册消费钩子。"""
+        if self.enable_trace:
+            try:
+                dispatcher = AsyncTraceDispatcher(
+                    self.consumer_group, TraceDispatcherType.CONSUME,
+                    self.trace_msg_batch_num, self.trace_topic, self.rpc_hook)
+                dispatcher.set_host_consumer(self)
+                self.trace_dispatcher = dispatcher
+                self.register_consume_message_hook(ConsumeMessageTraceHook(dispatcher))
+            except Exception as e:  # noqa: BLE001
+                logger.error("system mqtrace hook init failed ,maybe can't send msg trace data: %s", e)
+        if self.trace_dispatcher is not None:
+            try:
+                self.trace_dispatcher.start(";".join(self.name_server_addrs), AccessChannel.LOCAL)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("trace dispatcher start failed: %s", e)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -497,6 +614,12 @@ class DefaultMQPushConsumer:
             if t.is_alive():
                 t.join(timeout=2)
         self._consume_threads.clear()
+        # 轨迹分发器最后关（flush 剩余轨迹）—— 对应 Java DefaultMQPushConsumer.shutdown:794
+        if self.trace_dispatcher is not None:
+            try:
+                self.trace_dispatcher.shutdown()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("trace dispatcher shutdown failed: %s", e)
 
     def _assert_not_started(self) -> None:
         if self._started:
@@ -971,12 +1094,25 @@ class DefaultMQPushConsumer:
         # 回投路径的语义），若不在 POP 这里改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，
         # 消息在 invisibleTime 到期后被 broker 复活重投 —— 短观测窗口下会伪装成通过。
         context.ack_index = len(msgs) - 1
+        hook_ctx = None
+        if self.consume_message_hook_list:
+            hook_ctx = self._build_consume_hook_context(msgs, mq)
+            self.execute_consume_hook_before(hook_ctx)
+        begin_ms = time.time() * 1000
+        has_exception = False
         try:
             status = self.message_listener.consume_message(msgs, context)
         except Exception as e:  # noqa: BLE001
             # Java：消费抛异常按 RECONSUME_LATER 处理
             logger.debug("pop listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
+            has_exception = True
+        # 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，
+        # 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
+        self._finish_consume_hook(
+            hook_ctx, status, has_exception, begin_ms,
+            failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
+            succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
         if status is None:
             logger.debug("pop listener returned None, treat as RECONSUME_LATER for %s", mq)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
@@ -1358,12 +1494,24 @@ class DefaultMQPushConsumer:
         # ---- 顺序消费（Java ConsumeMessageOrderlyService）----
         if self._is_orderly():
             ocontext = ConsumeOrderlyContext(mq)
+            ohook_ctx = None
+            if self.consume_message_hook_list:
+                ohook_ctx = self._build_consume_hook_context(batch, mq)
+                self.execute_consume_hook_before(ohook_ctx)
+            obegin_ms = time.time() * 1000
+            ohas_exception = False
             try:
                 status = listener.consume_message(batch, ocontext)
             except Exception as e:  # noqa: BLE001
                 # Java 顺序消费：异常 → 不提交 offset，原地重试
                 logger.debug("orderly listener error (retry in place): %s", e)
                 status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT
+                ohas_exception = True
+            # 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
+            self._finish_consume_hook(
+                ohook_ctx, status, ohas_exception, obegin_ms,
+                failed=status != ConsumeOrderlyStatus.SUCCESS,
+                succeeded=status == ConsumeOrderlyStatus.SUCCESS)
             if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
                 with self._lock:
                     dq = self._pending.get(key)
@@ -1376,12 +1524,25 @@ class DefaultMQPushConsumer:
             return True
         # ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
         context = ConsumeConcurrentlyContext(mq)
+        hook_ctx = None
+        if self.consume_message_hook_list:
+            # 顺序与 Java 一致：before 钩子在 listener **之前**（用于生成 SubBefore 轨迹），
+            # after 在拿到 status 之后（生成 SubAfter，带 contextCode）
+            hook_ctx = self._build_consume_hook_context(batch, mq)
+            self.execute_consume_hook_before(hook_ctx)
+        begin_ms = time.time() * 1000
+        has_exception = False
         try:
             status = listener.consume_message(batch, context)
         except Exception as e:  # noqa: BLE001
             # Java：消费抛异常按 RECONSUME_LATER 处理
             logger.debug("listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
+            has_exception = True
+        self._finish_consume_hook(
+            hook_ctx, status, has_exception, begin_ms,
+            failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
+            succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
         if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
             self._advance_consume_offset(key, batch)
             return True

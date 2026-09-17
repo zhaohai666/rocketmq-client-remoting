@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
+from ..common.message_client_id_setter import get_uniq_id, set_uniq_id
 from ..common.message_const import MessageConst
 from ..common.message_decoder import (decode_message, decode_messages, decompress_body,
                                       message_properties_2_string,
@@ -412,6 +413,13 @@ class MQClientInstance:
                             timeout_millis: int = 3000, sys_flag: int = 0) -> RemotingCommand:
         """sys_flag 由 Producer 算好（压缩标志 + 压缩类型位），见
         DefaultMQProducer.try_to_compress_message。"""
+        # 对齐 Java DefaultMQProducerImpl.sendKernelImpl:932-935：非批量消息在
+        # **发请求之前**补一个客户端唯一 ID（UNIQ_KEY）；批量消息的 ID 在
+        # MessageBatch.generateFromList 时已逐条写好，不覆盖。
+        # 这个字段决定 SendResult.msgId 的取值，也是消息轨迹里 msgId 的来源 ——
+        # 控制台正是按它把发送轨迹与消费轨迹串起来。
+        if not isinstance(msg, MessageBatch):
+            set_uniq_id(msg)
         header = SendMessageRequestHeaderV2()
         header.producer_group = producer_group
         header.topic = msg.topic
@@ -455,13 +463,24 @@ class MQClientInstance:
         if response.code in status_map:
             header = SendMessageResponseHeader()
             header.from_ext_fields(response.ext_fields)
-            return SendResult(
+            # 对应 Java MQClientAPIImpl.processSendResponse(:794-806)：
+            #   msgId         = 客户端唯一 ID（UNIQ_KEY，批量消息为逐条拼接）
+            #   offsetMsgId   = 响应头里的 msgId（broker 生成的 offset 消息 ID）
+            #   regionId      = 响应头 MSG_REGION，缺省回落 DefaultRegion
+            #   traceOn       = 响应头 TRACE_ON != "false"（broker 默认 true）
+            result = SendResult(
                 send_status=status_map[response.code],
-                msg_id=header.msg_id,
+                msg_id=get_uniq_id(msg) or header.msg_id,
                 message_queue=MessageQueue(mq.topic, mq.broker_name, header.queue_id if header.queue_id is not None else mq.queue_id),
                 queue_offset=header.queue_offset or 0,
                 transaction_id=header.transaction_id,
+                offset_msg_id=header.msg_id,
             )
+            ext = response.ext_fields or {}
+            region_id = ext.get(MessageConst.PROPERTY_MSG_REGION)
+            result.region_id = region_id if region_id else MixAll.DEFAULT_TRACE_REGION_ID
+            result.trace_on = str(ext.get(MessageConst.PROPERTY_TRACE_SWITCH)) != "false"
+            return result
         raise MQBrokerException(response.code, response.remark or "")
 
     # ---------------- Request-Reply：接收 broker 推回的应答 ----------------

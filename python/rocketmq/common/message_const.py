@@ -21,6 +21,10 @@ class MessageConst:
     PROPERTY_CHECK_IMMUNITY_TIME_IN_SECONDS = "CHECK_IMMUNITY_TIME_IN_SECONDS"
     PROPERTY_RECONSUME_TIME = "RECONSUME_TIME"
     PROPERTY_MSG_REGION = "MSG_REGION"
+    # 消息轨迹开关：broker 在 SEND 响应头里带回（SendMessageProcessor 写
+    # String.valueOf(brokerConfig.isTraceOn())，默认 true），客户端据此决定是否落轨迹；
+    # 消费侧则从消息属性里读同一个 key（ConsumeMessageTraceHookImpl）。
+    PROPERTY_TRACE_SWITCH = "TRACE_ON"
     PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX = "UNIQ_KEY"
     PROPERTY_MAX_RECONSUME_TIMES = "MAX_RECONSUME_TIMES"
     PROPERTY_CONSUME_START_TIMESTAMP = "CONSUME_START_TIME"

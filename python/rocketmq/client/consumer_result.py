@@ -22,6 +22,20 @@ class PullStatus(Enum):
             return PullStatus.FOUND
 
 
+class ConsumeReturnType(Enum):
+    """消费返回类型（对应 Java client.consumer.listener.ConsumeReturnType）。
+
+    ⚠ 顺序即 ordinal —— 轨迹 SubAfter 的 ``contextCode`` 用的正是 ordinal
+    （Java ConsumeMessageTraceHookImpl:113），改动顺序会让控制台显示错乱。
+    """
+
+    SUCCESS = 0
+    TIME_OUT = 1
+    EXCEPTION = 2
+    RETURNNULL = 3
+    FAILED = 4
+
+
 class PullResult:
     def __init__(self, status: PullStatus, next_begin_offset: int = 0,
                  min_offset: int = 0, max_offset: int = 0,

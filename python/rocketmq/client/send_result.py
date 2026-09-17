@@ -34,6 +34,21 @@ class SendResult:
         self.transaction_id = transaction_id
         self.offset_msg_id = offset_msg_id
         self.region_id = region_id
+        # 轨迹开关：来自 SEND 响应头的 TRACE_ON（broker 默认 true）。
+        # Java 的判据是「extFields.get("TRACE_ON") != "false"」，所以默认 True。
+        self.trace_on: bool = True
+
+    def is_trace_on(self) -> bool:
+        return self.trace_on
+
+    def set_trace_on(self, trace_on: bool) -> None:
+        self.trace_on = trace_on
+
+    def get_region_id(self) -> Optional[str]:
+        return self.region_id
+
+    def set_region_id(self, region_id: Optional[str]) -> None:
+        self.region_id = region_id
 
     def get_send_status(self) -> SendStatus:
         return self.send_status
