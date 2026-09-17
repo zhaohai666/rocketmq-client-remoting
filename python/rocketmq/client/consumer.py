@@ -39,6 +39,7 @@ from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlySta
                               MessageListener, MessageListenerConcurrently,
                               MessageListenerOrderly, PopResult, PopStatus,
                               PullResult, PullStatus)
+from .consumer_stats import ConsumerStatsManager
 from .exception import MQBrokerException, MQClientException
 from .hook import (ConsumeMessageContext, ConsumeMessageHook,
                    FilterMessageContext, FilterMessageHook)
@@ -378,6 +379,8 @@ class DefaultMQPushConsumer:
         # 开启后 start() 注册 ConsumeMessageTraceHook，落 SubBefore/SubAfter 两段轨迹
         self.enable_trace = False
         self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
+        # 消费统计（Java ConsumerStatsManager），start() 时绑定到实例的 manager
+        self._stats_manager: Optional[ConsumerStatsManager] = None
         self.trace_msg_batch_num = 10
         self.consume_message_hook_list: List[ConsumeMessageHook] = []
         # 投递前过滤钩子（Java DefaultMQPushConsumerImpl.filterMessageHookList）
@@ -613,6 +616,18 @@ class DefaultMQPushConsumer:
             return ConsumeReturnType.SUCCESS
         return ConsumeReturnType.SUCCESS
 
+    def _record_consume_stats(self, topic: str, msg_count: int, begin_ms: float,
+                              failed: bool) -> None:
+        """消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。"""
+        if self._stats_manager is None:
+            return
+        rt = int(time.time() * 1000 - begin_ms)
+        if failed:
+            self._stats_manager.inc_consume_failed_tps(self.consumer_group, topic, msg_count)
+        else:
+            self._stats_manager.inc_consume_ok_tps(self.consumer_group, topic, msg_count)
+        self._stats_manager.inc_consume_rt(self.consumer_group, topic, rt)
+
     def _finish_consume_hook(self, hook_ctx: Optional[ConsumeMessageContext], status,
                              has_exception: bool, begin_ms: float, failed: bool,
                              succeeded: bool) -> None:
@@ -691,6 +706,8 @@ class DefaultMQPushConsumer:
             # 让 consumerRunningInfo 等处能看到（Java 由共享的 ClientConfig 天然同步）。
             if not self.name_server_addrs and self._mq_client.name_server_addrs:
                 self.name_server_addrs = list(self._mq_client.name_server_addrs)
+            # 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）
+            self._stats_manager = self._mq_client.consumer_stats_manager
             self._mq_client.register_consumer(self.consumer_group, self)
             self._started = True
             self._start_time = time.time()
@@ -1136,6 +1153,7 @@ class DefaultMQPushConsumer:
                                                       suspend=True,
                                                       subscription=True,
                                                       class_filter=False)
+                pull_began = time.time()
                 result = client.pull_message(self.consumer_group, mq, offset,
                                              self.pull_batch_size, sys_flag, 0,
                                              sub.sub_string or "*", sub.sub_version,
@@ -1143,6 +1161,13 @@ class DefaultMQPushConsumer:
                                              timeout_millis=self.pull_timeout_millis,
                                              max_msg_bytes=self.pull_batch_size_in_bytes,
                                              suspend_timeout_millis=self.pull_suspend_timeout_millis)
+                # 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
+                if self._stats_manager is not None:
+                    self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
+                                                    int((time.time() - pull_began) * 1000))
+                    if result.status == PullStatus.FOUND and result.msg_found_list:
+                        self._stats_manager.inc_pull_tps(self.consumer_group, mq.topic,
+                                                         len(result.msg_found_list))
             except RemotingTimeoutException as e:
                 # 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 将
                 # suspend 时间钳制为其自身 brokerSuspendMaxTimeMillis（默认 ~15s），
@@ -1365,6 +1390,8 @@ class DefaultMQPushConsumer:
             has_exception = True
         # 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，
         # 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
+        self._record_consume_stats(mq.topic, len(msgs), begin_ms,
+                                   failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER)
         self._finish_consume_hook(
             hook_ctx, status, has_exception, begin_ms,
             failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
@@ -1711,8 +1738,13 @@ class DefaultMQPushConsumer:
                     info.mq_pop_table[mq] = pqi.to_dict()
         info.subscription_set = [s.to_dict() if hasattr(s, "to_dict") else dict(s.__dict__)
                                  for s in subs]
+        # statusTable（Java consumerRunningInfo：consumeStatus(group, topic)，minute 快照）
         for s in subs:
-            info.status_table[s.topic] = ConsumeStatus().to_dict()
+            if self._stats_manager is not None:
+                info.status_table[s.topic] = self._stats_manager.consume_status(
+                    self.consumer_group, s.topic).to_dict()
+            else:
+                info.status_table[s.topic] = ConsumeStatus().to_dict()
         return info
 
     def consume_message_directly(self, msg: MessageExt,
@@ -1764,6 +1796,8 @@ class DefaultMQPushConsumer:
                 status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT
                 ohas_exception = True
             # 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
+            self._record_consume_stats(mq.topic, len(batch), obegin_ms,
+                                       failed=status != ConsumeOrderlyStatus.SUCCESS)
             self._finish_consume_hook(
                 ohook_ctx, status, ohas_exception, obegin_ms,
                 failed=status != ConsumeOrderlyStatus.SUCCESS,
@@ -1795,6 +1829,8 @@ class DefaultMQPushConsumer:
             logger.debug("listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
             has_exception = True
+        self._record_consume_stats(mq.topic, len(batch), begin_ms,
+                                   failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER)
         self._finish_consume_hook(
             hook_ctx, status, has_exception, begin_ms,
             failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,

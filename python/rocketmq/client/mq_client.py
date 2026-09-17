@@ -50,6 +50,7 @@ from ..remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHead
 from ..remoting.protocol.heartbeat import HeartbeatData
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.protocol.route import TopicRouteData
+from .consumer_stats import ConsumerStatsManager
 from .exception import MQBrokerException, MQClientException
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
 from .send_result import SendResult, SendStatus
@@ -148,6 +149,8 @@ class MQClientInstance:
         # 动态 name server（对应 Java MQClientAPIImpl.topAddressing）。
         # 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 ws_addr 为空串 → fetch 是 no-op，行为不变。
         self.top_addressing = DefaultTopAddressing()
+        # 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）
+        self.consumer_stats_manager = ConsumerStatsManager()
         self._namesrv_refresh_stop = threading.Event()
         self._namesrv_refresh_thread: Optional[threading.Thread] = None
         # 线程弹性巡检线程（对应 Java MQClientInstance.startScheduledTask 里
@@ -287,6 +290,9 @@ class MQClientInstance:
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
         self._started = True
+        # 消费统计采样线程（Java ConsumerStatsManager.start 是空的——采样挂在
+        # 各 StatsItem 的调度器上；这里收敛为一个统一线程，采样精度不变 10s）
+        self.consumer_stats_manager.start()
         # 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
         # 地址时先 fetch 一次；取不到就直接报错（比 Java 更严格——Java 会让运行期各处
         # 各自失败，这里在 start 时给一个明确错误，行为可预期）。
@@ -323,6 +329,7 @@ class MQClientInstance:
         self._route_refresh_stop.set()
         self._adjust_pool_stop.set()
         self._namesrv_refresh_stop.set()
+        self.consumer_stats_manager.shutdown()
         self.remoting_client.shutdown()
 
     def _namesrv_refresh_loop(self) -> None:
