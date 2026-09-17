@@ -63,6 +63,10 @@ set(RMQ_SOURCES
     src/client/pull_consumer.cpp
     src/client/request_reply.cpp
     src/client/admin.cpp
+    src/client/hook.cpp
+    src/client/trace.cpp
+    src/client/trace_dispatcher.cpp
+    src/client/trace_hook.cpp
 )
 
 # 传输层用到 std::thread / std::mutex，需要显式链接线程库（Linux 上尤其必要）

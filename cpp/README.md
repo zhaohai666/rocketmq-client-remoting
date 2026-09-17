@@ -39,7 +39,7 @@ MSVC 下自动加 `/utf-8`（源码含中文注释，否则 C4819）；Windows �
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 8 个用例，约 512 项断言，~4s
+cd build && ctest --output-on-failure     # 14 个用例，约 849 项断言，~3s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -51,6 +51,12 @@ cd build && ctest --output-on-failure     # 8 个用例，约 512 项断言，~4
 | `compression` | 33 | 压缩类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib 往返 + **Python 生成的外部夹具**、解压后清 flag、未支持类型必须失败而非交出压缩流 |
 | `admin` | 152 | fastjson2 非法 JSON 容错、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
+| `acl` | 37 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
+| `request_reply` | 37 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时 |
+| `latency` | 31 | 故障规避：延迟窗口滑窗统计、可用性判定、broker 隔离与恢复、`sendLatencyFaultEnable` 开关 |
+| `pop` | 93 | POP 协议管道：CK 反构（8 段 + `startOffsetInfo`/`msgOffsetInfo` 下标选择）、`bornTime`、ACK offset 语义 |
+| `pop_consumer` | 47 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制 |
+| `trace` | 92 | 消息轨迹：与 Java 官方实现的**逐字节对拍**（Pub / SubBefore / SubAfter / EndTransaction / Recall）+ 编解码双向 + 无 keys 空段容错 + 坏记录隔离 + 分发器分组/切块 |
 | `interop` | 70 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
 
 ```bash
@@ -72,6 +78,13 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_admin_live         127.0.0.1:9876
 ./build/examples/rmq_compression_live   selftest 127.0.0.1:9876
 ./build/examples/rmq_compression_live   send|recv 127.0.0.1:9876 <topic> <group> <size>
+./build/examples/rmq_live_acl           127.0.0.1:9876   # 需开 ACL 的集群
+./build/examples/rmq_live_pull          127.0.0.1:9876
+./build/examples/rmq_live_request_reply 127.0.0.1:9876
+./build/examples/rmq_live_latency       127.0.0.1:9876
+./build/examples/rmq_live_pop           127.0.0.1:9876
+./build/examples/rmq_live_pop_consumer  127.0.0.1:9876
+./build/examples/rmq_live_trace         127.0.0.1:9876   # 需 broker traceTopicEnable=true
 ```
 
 | 工具 | 结果 | 覆盖 |
@@ -79,6 +92,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_live_message_types` | 12/12 | 异步发送 / 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 心跳注册 |
 | `rmq_admin_live` | 47 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → 清理 |
 | `rmq_compression_live` | 全 PASS | 自动压缩自产自销 + **与真实 Java 客户端双向互通** |
+| `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -104,9 +118,11 @@ cpp/
 │   └── client/
 │       ├── mq_client.h             MQClientInstance：路由发现 + 全部 RPC
 │       ├── producer.h / consumer.h / admin.h / result.h / exception.h
-├── src/                        与 include 同构的 22 个 .cpp
-├── examples/                   selfcheck / interop_tool / 三个真机联调工具
-└── tests/                      6 个 C++ 单测 + interop_check.py
+│       ├── hook.h / trace.h / trace_hook.h / trace_dispatcher.h
+│       │                            消息轨迹：钩子接口 + 文本编解码 + 异步分发
+├── src/                        与 include 同构的 31 个 .cpp
+├── examples/                   selfcheck / interop_tool + 11 个真机联调工具
+└── tests/                      14 个 ctest 用例（含 Java 对拍）+ interop_check.py
 ```
 
 ## 几个必须知道的实现约定
@@ -132,6 +148,13 @@ NaN/Infinity 与尾逗号。所以 `json.cpp` 里是**容错解析器**而不是
 **压缩失败 / 未知算法必须响亮。** `CompressorFactory::decompress` 对未支持类型抛异常，
 `decodeMessage` 捕获后返回 `false`（消息被丢弃）。**绝不能原样透传压缩字节**：
 外层会清掉 `COMPRESSED_FLAG`，透传等于把压缩流当正文交出去且事后无法识别，属于静默数据损坏。
+
+**消息轨迹的解码器比 Java 更健壮。** Java `TraceDataEncoder` 对无 keys 消息的 `SubBefore`
+会 `line[7]` 越界抛 `ArrayIndexOutOfBoundsException`（**5.5.1 上游真实缺陷**，已复现），
+本项目缺段按空串取；并且**单条记录**解码失败只跳过自己 —— Java 是一条坏记录直接毁掉
+整条轨迹消息的解码（表现为控制台整批轨迹消失）。轨迹文本按 `\x01` 分段、`\x02` 结尾，
+切分必须用 **Java `String.split` 语义（丢弃末尾空串）**，原生 split 会多出一段。
+故障排查提示：轨迹 topic 默认 `RMQ_SYS_TRACE_TOPIC`，broker 需 `traceTopicEnable=true` 才预建。
 
 ## 日志
 

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/trace_hook.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
@@ -222,6 +223,10 @@ void DefaultMQPushConsumer::start() {
         rebalanceLoop();
     });
 
+    // 消息轨迹：enableMsgTrace=true 时建 AsyncTraceDispatcher 并注册 ConsumeMessageTraceHook。
+    // 放在消费线程起来之后：分发器的内部生产者要先把轨迹 topic 的路由拉起来。
+    startTraceDispatcher();
+
     std::string topics;
     for (const std::string& t : subscribedTopics()) {
         if (!topics.empty()) topics += ",";
@@ -275,6 +280,16 @@ void DefaultMQPushConsumer::shutdown() {
     if (persistThread_.joinable()) persistThread_.join();
     if (lockThread_.joinable()) lockThread_.join();
     if (rebalanceThread_.joinable()) rebalanceThread_.join();
+    // 消费线程都停了之后再关轨迹分发器：先把队列里剩余的轨迹强刷出去（SubBefore/SubAfter
+    // 落盘就靠这一步），再关内部生产者。必须在 mqClient_->shutdown() 之前。
+    if (traceDispatcher_) {
+        try {
+            traceDispatcher_->shutdown();
+        } catch (const std::exception& e) {
+            logger_warn(std::string("trace dispatcher shutdown failed: ") + e.what());
+        }
+        traceDispatcher_.reset();
+    }
     // 优雅注销（对齐 Java MQClientInstance.unregisterClient）：关闭连接**之前**对
     // brokerAddrTable 里所有 broker 发 UNREGISTER_CLIENT(35)，broker 端立刻摘除本 clientId，
     // 不必等心跳超时（默认 ~120s）——否则这段时间内消费者变更通知仍可能发往已退出的实例。
@@ -664,13 +679,30 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
     // 改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，消息在 invisibleTime 到期后被
     // broker 复活重投 —— 短观测窗口下会伪装成通过。
     ctx.ackIndex = static_cast<int32_t>(msgs.size()) - 1;
+    // 消费钩子：before 在 listener 之前，after 紧跟在 listener 之后
+    // （Java ConsumeMessagePopConcurrentlyService:360-422 就是这个顺序：
+    //  after 钩子在「队列被撤走 / pop 超时」判定**之前**跑）
+    const bool useHook = hasConsumeMessageHook();
+    ConsumeMessageContext hookCtx;
+    if (useHook) {
+        hookCtx = buildConsumeHookContext(msgs, mq);
+        executeConsumeHookBefore(hookCtx);
+    }
     ConsumeConcurrentlyStatus status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
+    bool hookHasException = false;
+    int64_t hookBeginMs = UtilAll::currentTimeMillis();
     try {
         auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
         status = conc->consumeMessage(msgs, ctx);
     } catch (const std::exception& e) {
         // Java：消费抛异常按 RECONSUME_LATER 处理
         logger_debug(std::string("pop listener error, treat as RECONSUME_LATER: ") + e.what());
+        hookHasException = true;
+    }
+    if (useHook) {
+        const bool ok = (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
+        finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
+                          ok ? "CONSUME_SUCCESS" : "RECONSUME_LATER");
     }
     if (pq->isDropped() || isPopTimeout(popTime, invisible)) {
         // 消费期间队列被撤走或已超时：结果不再处理
@@ -858,6 +890,89 @@ void DefaultMQPushConsumer::dispatchLoop() {
     }
 }
 
+// ---------------------------------------------------------------- 消费钩子 / 轨迹
+//
+// 对应 Java 的 ConsumeMessageHook 调用点（ConsumeMessageConcurrentlyService:348-412、
+// ConsumeMessageOrderlyService:440-512、ConsumeMessagePopConcurrentlyService:360-422）：
+//   1) 调 listener **之前** 建 context 并跑 before 钩子（生成 SubBefore 轨迹）；
+//   2) listener 返回后算出 ConsumeReturnType 名字写进 props（决定 SubAfter 的 contextCode），
+//      再跑 after 钩子（生成 SubAfter 轨迹）。
+// 钩子异常一律吞掉并记 warn —— 轨迹挂了绝不能影响消费。
+ConsumeMessageContext DefaultMQPushConsumer::buildConsumeHookContext(
+    const std::vector<MessageExt>& msgs, const MessageQueue& mq) const {
+    ConsumeMessageContext context(consumerGroup_, msgs, mq);
+    context.success = false;            // Java 初始值
+    context.props.clear();              // props 用来放 ConsumeReturnType 名字
+    context.accessChannel = accessChannel_;
+    return context;
+}
+
+void DefaultMQPushConsumer::executeConsumeHookBefore(ConsumeMessageContext& context) {
+    for (auto& hook : consumeMessageHookList_) {
+        try {
+            hook->consumeMessageBefore(context);
+        } catch (const std::exception& e) {
+            logger_warn(std::string("consumeMessageHook executeHookBefore exception: ") + e.what());
+        } catch (...) {
+            logger_warn("consumeMessageHook executeHookBefore exception: unknown");
+        }
+    }
+}
+
+void DefaultMQPushConsumer::executeConsumeHookAfter(ConsumeMessageContext& context) {
+    for (auto& hook : consumeMessageHookList_) {
+        try {
+            hook->consumeMessageAfter(context);
+        } catch (const std::exception& e) {
+            logger_warn(std::string("consumeMessageHook executeHookAfter exception: ") + e.what());
+        } catch (...) {
+            logger_warn("consumeMessageHook executeHookAfter exception: unknown");
+        }
+    }
+}
+
+const char* DefaultMQPushConsumer::consumeReturnTypeOf(bool hasException, int64_t consumeRtMs,
+                                                       bool failed, bool succeeded) {
+    // 判定顺序照抄 Java ConsumeMessageConcurrentlyService:378-393
+    if (hasException) return "EXCEPTION";
+    if (consumeRtMs >= 15LL * 60 * 1000) return "TIME_OUT";
+    if (failed) return "FAILED";
+    if (succeeded) return "SUCCESS";
+    return "SUCCESS";
+}
+
+void DefaultMQPushConsumer::finishConsumeHook(ConsumeMessageContext* hookCtx, bool hasException,
+                                              int64_t beginMs, bool failed, bool succeeded,
+                                              const std::string& statusText) {
+    if (hookCtx == nullptr) return;
+    int64_t rt = UtilAll::currentTimeMillis() - beginMs;
+    hookCtx->props = consumeReturnTypeOf(hasException, rt, failed, succeeded);
+    hookCtx->status = statusText;
+    hookCtx->success = succeeded;
+    executeConsumeHookAfter(*hookCtx);
+}
+
+void DefaultMQPushConsumer::startTraceDispatcher() {
+    if (!enableMsgTrace_) return;
+    try {
+        auto dispatcher = std::make_shared<AsyncTraceDispatcher>(
+            consumerGroup_, TraceDispatcherType::CONSUME, traceMsgBatchNum_, traceTopic_, rpcHook_);
+        dispatcher->setHostConsumer(this);
+        dispatcher->setHostClientId(clientId_);
+        std::string namesrv;
+        for (const std::string& a : nameServerAddrs_) {
+            if (!namesrv.empty()) namesrv += ";";
+            namesrv += a;
+        }
+        dispatcher->start(namesrv, accessChannel_);
+        traceDispatcher_ = dispatcher;
+        registerConsumeMessageHook(std::make_shared<ConsumeMessageTraceHook>(dispatcher.get()));
+        logger_info("consumer trace enabled, traceTopic=" + dispatcher->getTraceTopicName());
+    } catch (const std::exception& e) {
+        logger_warn(std::string("start trace dispatcher failed: ") + e.what());
+    }
+}
+
 bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQueue& mq,
                                          const std::vector<MessageExt>& batch) {
     // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）：
@@ -868,15 +983,29 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
     const bool broadcast = (messageModel_ == MessageModel::BROADCASTING);
     // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
     if (isOrderly()) {
+        const bool useHook = hasConsumeMessageHook();
+        ConsumeMessageContext hookCtx;
+        if (useHook) {
+            hookCtx = buildConsumeHookContext(restored, mq);
+            executeConsumeHookBefore(hookCtx);
+        }
         auto* orderly = static_cast<MessageListenerOrderly*>(messageListener_.get());
         ConsumeOrderlyContext ctx(mq);
         ConsumeOrderlyStatus status;
+        bool hookHasException = false;
+        int64_t hookBeginMs = UtilAll::currentTimeMillis();
         try {
             status = orderly->consumeMessage(restored, ctx);
         } catch (const std::exception& e) {
             // Java 顺序消费：异常 → 不提交 offset，原地重试
             logger_debug(std::string("orderly listener error (retry in place): ") + e.what());
             status = ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
+            hookHasException = true;
+        }
+        if (useHook) {
+            const bool ok = (status == ConsumeOrderlyStatus::SUCCESS);
+            finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
+                              ok ? "SUCCESS" : "SUSPEND_CURRENT_QUEUE_A_MOMENT");
         }
         if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
             std::lock_guard<std::mutex> lk(lock_);
@@ -895,15 +1024,31 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         return true;
     }
     // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
+    const bool useHook = hasConsumeMessageHook();
+    ConsumeMessageContext hookCtx;
+    if (useHook) {
+        // 顺序与 Java 一致：before 在 listener **之前**（生成 SubBefore），
+        // after 在拿到 status 之后（生成 SubAfter，带 contextCode）
+        hookCtx = buildConsumeHookContext(restored, mq);
+        executeConsumeHookBefore(hookCtx);
+    }
     auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
     ConsumeConcurrentlyContext ctx(mq);
     ConsumeConcurrentlyStatus status;
+    bool hookHasException = false;
+    int64_t hookBeginMs = UtilAll::currentTimeMillis();
     try {
         status = conc->consumeMessage(restored, ctx);
     } catch (const std::exception& e) {
         // Java：消费抛异常按 RECONSUME_LATER 处理
         logger_debug(std::string("listener error, treat as RECONSUME_LATER: ") + e.what());
         status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
+        hookHasException = true;
+    }
+    if (useHook) {
+        const bool ok = (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
+        finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
+                          ok ? "CONSUME_SUCCESS" : "RECONSUME_LATER");
     }
     if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
         advanceConsumeOffset(key, restored);

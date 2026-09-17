@@ -15,10 +15,12 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/hook.h"
 #include "rocketmq/client/latency.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/request_reply.h"
 #include "rocketmq/client/result.h"
+#include "rocketmq/client/trace_dispatcher.h"
 #include "rocketmq/common/compression.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/mix_all.h"
@@ -82,6 +84,30 @@ public:
     // 压缩算法：CompressionType::ZLIB / LZ4 / ZSTD（Java 默认 ZLIB）
     void setCompressType(int32_t type) { compressType_ = type; }
     int32_t getCompressType() const { return compressType_; }
+
+    // ---------------- 消息轨迹（对应 Java DefaultMQProducer.setEnableTrace 等）----------------
+    // enableTrace=true 时 start() 会建 AsyncTraceDispatcher（Type=PRODUCE）并自动注册
+    // SendMessageTraceHook + EndTransactionTraceHook；轨迹生产者自身不追踪自身（防递归）。
+    void setEnableTrace(bool enable) { enableTrace_ = enable; }
+    bool isEnableTrace() const { return enableTrace_; }
+    // 自定义轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）
+    void setTraceTopic(const std::string& topic) { traceTopic_ = topic; }
+    const std::string& getTraceTopic() const { return traceTopic_; }
+    // 一次批量发送的最大轨迹条数（对应 Java traceMsgBatchNum，最大 20）
+    void setTraceMsgBatchNum(int32_t n) { traceMsgBatchNum_ = n; }
+    int32_t getTraceMsgBatchNum() const { return traceMsgBatchNum_; }
+
+    // ---------------- 钩子（对应 Java registerSendMessageHook / registerEndTransactionHook）----
+    void registerSendMessageHook(std::shared_ptr<SendMessageHook> hook) {
+        if (hook) sendMessageHookList_.push_back(std::move(hook));
+    }
+    void registerEndTransactionHook(std::shared_ptr<EndTransactionHook> hook) {
+        if (hook) endTransactionHookList_.push_back(std::move(hook));
+    }
+    bool hasSendMessageHook() const { return !sendMessageHookList_.empty(); }
+    size_t sendMessageHookCount() const { return sendMessageHookList_.size(); }
+    // 轨迹分发器（未开轨迹时为空），供联调脚本读取丢弃计数等状态
+    std::shared_ptr<AsyncTraceDispatcher> traceDispatcher() const { return traceDispatcher_; }
 
     const std::string& producerGroup() const { return producerGroup_; }
     const std::string& clientId() const { return clientId_; }
@@ -164,6 +190,24 @@ protected:
     // （COMPRESSED_FLAG | 压缩类型位）；不压缩时返回 0。
     int32_t prepareForSend(Message& msg) const;
 
+    // ---------------- 轨迹 / 钩子内部实现 ----------------
+    // 带 before/after 钩子的同步发送（对应 Java sendKernelImpl 的钩子点）：
+    // 无钩子时直接透传，零开销。msgType 判定与 Java 一致：
+    // TRAN_MSG=true -> Trans_Msg_Half；带 DELAY 属性 -> Delay_Msg；否则 Normal_Msg。
+    SendResult sendWithHooks(MQClientInstance& client, const Message& msg,
+                             const MessageQueue& mq, int32_t timeout, int32_t sysFlag);
+    void executeSendMessageHookBefore(SendMessageContext& context);
+    void executeSendMessageHookAfter(SendMessageContext& context);
+    // 事务收尾轨迹（对应 Java endTransaction 里的 EndTransactionTraceHook）
+    void executeEndTransactionHook(const Message& msg, const std::string& brokerAddr,
+                                   const std::string& msgId, const std::string& transactionId,
+                                   const std::string& transactionState, bool fromTransactionCheck);
+    // start() 里按 enableTrace 建分发器并注册钩子；任何异常只记日志，不影响正常发送。
+    void startTraceDispatcher();
+    // 发轨迹前的公共上下文（brokerAddr 用消息将要落到的 broker 地址）
+    SendMessageContext buildSendMessageContext(const Message& msg, const MessageQueue& mq,
+                                               const std::string& brokerAddr) const;
+
     // 对应 Java endTransaction / checkTransactionState 的收尾：
     // 以 END_TRANSACTION(37, oneway) 告知 broker 事务最终状态。
     // fromCheck=true 时表示这是**回查**的收尾，偏移等字段取自 broker 的回查 header。
@@ -219,6 +263,13 @@ protected:
     std::unique_ptr<MQClientInstance> mqClient_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
     std::shared_ptr<RPCHook> rpcHook_;
+    // ---------------- 消息轨迹 / 钩子 ----------------
+    bool enableTrace_ = false;
+    std::string traceTopic_;                     // 空 => 用 MixAll::TRACE_TOPIC
+    int32_t traceMsgBatchNum_ = 10;
+    std::vector<std::shared_ptr<SendMessageHook>> sendMessageHookList_;
+    std::vector<std::shared_ptr<EndTransactionHook>> endTransactionHookList_;
+    std::shared_ptr<AsyncTraceDispatcher> traceDispatcher_;
     bool started_ = false;
     std::mutex lock_;
     // 异步发送线程句柄，shutdown 时统一 join 回收

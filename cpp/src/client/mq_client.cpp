@@ -13,6 +13,7 @@
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/request_reply.h"
+#include "rocketmq/client/trace.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
@@ -420,12 +421,23 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     respHeader.fromExtFields(response.extFields);
     SendResult result;
     result.sendStatus = status;
-    result.msgId = respHeader.msgId.value_or("");
+    // msgId 对齐 Java processSendResponse：客户端 UNIQ_KEY（批量 = 逗号拼接）；
+    // offsetMsgId 是 broker 的 offset 消息 ID（响应头的 msgId）。
+    result.msgId = msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
     result.offsetMsgId = respHeader.msgId.value_or("");
     result.messageQueue = MessageQueue(mq.topic, mq.brokerName,
                                        respHeader.queueId.value_or(mq.queueId));
     result.queueOffset = respHeader.queueOffset.value_or(0);
     result.transactionId = respHeader.transactionId.value_or("");
+    // MSG_REGION / TRACE_ON 来自响应头 extFields（对齐 Java processSendResponse）。
+    // 缺省 region=DefaultRegion，traceOn=true（Java: !"false".equals(TRACE_ON)）。
+    auto regionIt = response.extFields.find(MessageConst::PROPERTY_MSG_REGION);
+    std::string region = (regionIt != response.extFields.end()) ? regionIt->second : std::string();
+    result.regionId = region.empty() ? std::string(TraceConstants::DEFAULT_TRACE_REGION_ID) : region;
+    auto traceIt = response.extFields.find(TraceConstants::PROPERTY_TRACE_SWITCH);
+    std::string traceOn =
+        (traceIt != response.extFields.end()) ? traceIt->second : std::string();
+    result.traceOn = (traceOn != "false");
     return result;
 }
 

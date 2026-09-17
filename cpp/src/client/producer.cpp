@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/trace_hook.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
@@ -49,6 +50,17 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
 int nextAsyncSenderSeq() {
     static std::atomic<int> seq{0};
     return seq.fetch_add(1, std::memory_order_relaxed);
+}
+
+// 发送前确保消息带有 UNIQ_KEY（32 位十六进制唯一 ID），与 Java MessageClientIDSetter.setUniqID
+// 对齐：缺失才生成，已存在则保留（幂等）。轨迹钩子用它在 SendResult.msgId 里回填 UNIQ_KEY，
+// 从而让发送侧轨迹的 msgId == UNIQ_KEY（非 offsetMsgId）。
+void ensureUniqId(Message& msg) {
+    std::string uniq = msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+    if (uniq.empty()) {
+        uniq = InnerIdGenerator::createUniqId();
+        msg.putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, uniq);
+    }
 }
 
 }  // namespace
@@ -127,6 +139,10 @@ void DefaultMQProducer::start() {
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
 
+    // 消息轨迹：enableTrace=true 时建 AsyncTraceDispatcher 并注册 Send/EndTransaction 钩子。
+    // 必须在心跳线程之前完成 —— 分发器内部生产者要先把轨迹 topic 的路由拉起来。
+    startTraceDispatcher();
+
     // 心跳线程：周期性向 broker 注册 ProducerData。没有它 broker 无法主动回查事务。
     heartbeatRunning_.store(true);
     heartbeatThread_ = std::thread([this]() {
@@ -154,6 +170,16 @@ void DefaultMQProducer::shutdown() {
         }
         started_ = false;
         threads.swap(asyncThreads_);
+    }
+    // 先关轨迹分发器：它会把队列里剩余的轨迹强刷出去，再关内部生产者。
+    // 必须在 mqClient_->shutdown() 之前 —— 刷写要发消息，得有自己的传输层。
+    if (traceDispatcher_) {
+        try {
+            traceDispatcher_->shutdown();
+        } catch (const std::exception& e) {
+            logger_warn(std::string("trace dispatcher shutdown failed: ") + e.what());
+        }
+        traceDispatcher_.reset();
     }
     // 先回收异步线程（它们内部持有 mqClient_ 引用），再关客户端
     for (std::thread& t : threads) {
@@ -237,12 +263,144 @@ int32_t DefaultMQProducer::prepareForSend(Message& msg) const {
     return sysFlag;
 }
 
+// ---------------------------------------------------------------- 消息轨迹 / 钩子
+//
+// 对应 Java DefaultMQProducerImpl 的 sendMessageHookList / executeSendMessageHook*，
+// 以及 DefaultMQProducer.start() 里的 traceDispatcher 装配（Java 5.x :380-405）。
+// 钩子异常一律吞掉并记 warn —— 轨迹挂了绝不能影响正常收发。
+SendMessageContext DefaultMQProducer::buildSendMessageContext(
+    const Message& msg, const MessageQueue& mq, const std::string& brokerAddr) const {
+    SendMessageContext context;
+    context.producerGroup = producerGroup_;
+    context.message = &msg;
+    context.mq = mq;
+    context.brokerAddr = brokerAddr;
+    context.ns = namespace_;
+    context.msgType = static_cast<int32_t>(TraceMessageType::NORMAL);
+    // 判定顺序照抄 Java DefaultMQProducerImpl:975-990：
+    //   TRAN_MSG == "true"      -> Trans_Msg_Half(1)
+    //   带 DELAY 属性            -> Delay_Msg(3)（覆盖前者，与 Java 的两段 if 顺序一致）
+    if (msg.getProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED) == "true") {
+        context.msgType = static_cast<int32_t>(TraceMessageType::TRANS);
+    }
+    // Java 判的是 "属性存在"（null 判定）；C++ 的 getProperty 对缺失返回空串，
+    // 故用非空判定 —— 值为空的 DELAY 属性本身也没有语义。
+    if (!msg.getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL).empty()) {
+        context.msgType = static_cast<int32_t>(TraceMessageType::DELAY);
+    }
+    return context;
+}
+
+void DefaultMQProducer::executeSendMessageHookBefore(SendMessageContext& context) {
+    for (auto& hook : sendMessageHookList_) {
+        try {
+            hook->sendMessageBefore(context);
+        } catch (const std::exception& e) {
+            logger_warn(std::string("failed to executeSendMessageHookBefore: ") + e.what());
+        } catch (...) {
+            logger_warn("failed to executeSendMessageHookBefore: unknown error");
+        }
+    }
+}
+
+void DefaultMQProducer::executeSendMessageHookAfter(SendMessageContext& context) {
+    for (auto& hook : sendMessageHookList_) {
+        try {
+            hook->sendMessageAfter(context);
+        } catch (const std::exception& e) {
+            logger_warn(std::string("failed to executeSendMessageHookAfter: ") + e.what());
+        } catch (...) {
+            logger_warn("failed to executeSendMessageHookAfter: unknown error");
+        }
+    }
+}
+
+SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Message& msg,
+                                            const MessageQueue& mq, int32_t timeout,
+                                            int32_t sysFlag) {
+    // 没有任何钩子时零开销透传
+    if (sendMessageHookList_.empty()) {
+        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
+    }
+    std::string brokerAddr;
+    try {
+        brokerAddr = client.brokerAddrOf(mq.brokerName);
+    } catch (...) {
+        brokerAddr.clear();
+    }
+    SendMessageContext context = buildSendMessageContext(msg, mq, brokerAddr);
+    executeSendMessageHookBefore(context);
+
+    SendResult result;
+    try {
+        result = client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
+    } catch (const std::exception& e) {
+        context.exception = e.what();
+        executeSendMessageHookAfter(context);
+        throw;
+    } catch (...) {
+        context.exception = "unknown error";
+        executeSendMessageHookAfter(context);
+        throw;
+    }
+    context.sendResult = &result;
+    executeSendMessageHookAfter(context);
+    return result;
+}
+
+void DefaultMQProducer::executeEndTransactionHook(const Message& msg,
+                                                  const std::string& brokerAddr,
+                                                  const std::string& msgId,
+                                                  const std::string& transactionId,
+                                                  const std::string& transactionState,
+                                                  bool fromTransactionCheck) {
+    if (endTransactionHookList_.empty()) return;
+    EndTransactionContext context;
+    context.producerGroup = producerGroup_;
+    context.message = &msg;
+    context.brokerAddr = brokerAddr;
+    context.msgId = msgId;
+    context.transactionId = transactionId;
+    context.transactionState = transactionState;
+    context.fromTransactionCheck = fromTransactionCheck;
+    context.ns = namespace_;
+    for (auto& hook : endTransactionHookList_) {
+        try {
+            hook->endTransaction(context);
+        } catch (const std::exception& e) {
+            logger_warn(std::string("failed to executeEndTransactionHook: ") + e.what());
+        } catch (...) {
+            logger_warn("failed to executeEndTransactionHook: unknown error");
+        }
+    }
+}
+
+void DefaultMQProducer::startTraceDispatcher() {
+    if (!enableTrace_) return;
+    try {
+        auto dispatcher = std::make_shared<AsyncTraceDispatcher>(
+            producerGroup_, TraceDispatcherType::PRODUCE, traceMsgBatchNum_, traceTopic_, rpcHook_);
+        dispatcher->setHostProducer(this);
+        dispatcher->setHostClientId(clientId_);
+        dispatcher->start(getNamesrvAddr());
+        traceDispatcher_ = dispatcher;
+        // 顺序与 Java DefaultMQProducer.start() 一致：先 SendMessageTraceHook，再 EndTransactionTraceHook
+        registerSendMessageHook(std::make_shared<SendMessageTraceHook>(dispatcher.get()));
+        registerEndTransactionHook(std::make_shared<EndTransactionTraceHook>(dispatcher.get()));
+        logger_info("producer trace enabled, traceTopic=" + dispatcher->getTraceTopicName());
+    } catch (const std::exception& e) {
+        // 轨迹挂了不能影响正常发送（对齐 Java 的 try/catch 语义）
+        logger_warn(std::string("start trace dispatcher failed: ") + e.what());
+    }
+}
+
 // ---------------------------------------------------------------- 同步发送
 SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
     Message outbound = withNamespace(msg);
+    ensureUniqId(outbound);
     const int32_t sysFlag = prepareForSend(outbound);
 
     std::string lastError;
@@ -258,7 +416,7 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
             const int64_t sendBegin = UtilAll::currentTimeMillis();
             SendResult result;
             try {
-                result = c.sendMessage(producerGroup_, outbound, selected, timeout, sysFlag);
+                result = sendWithHooks(c, outbound, selected, timeout, sysFlag);
             } catch (...) {
                 // 发送异常：按隔离档位记录（latency 固定 10000ms），broker 进入隔离期
                 mqFaultStrategy_.updateFaultItem(selected.brokerName, 0.0, true, false);
@@ -287,8 +445,9 @@ SendResult DefaultMQProducer::send(const Message& msg, const MessageQueue& mq,
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
     Message outbound = withNamespace(msg);
+    ensureUniqId(outbound);
     const int32_t sysFlag = prepareForSend(outbound);
-    return c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag);
+    return sendWithHooks(c, outbound, mq, timeout, sysFlag);
 }
 
 SendResult DefaultMQProducer::sendBySelector(const Message& msg,
@@ -298,12 +457,13 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
     Message outbound = withNamespace(msg);
+    ensureUniqId(outbound);
     std::shared_ptr<TopicPublishInfo> publish =
         c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
     MessageQueue selected = selector.select(publish->msgQueueList, outbound, arg);
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
     const int32_t sysFlag = prepareForSend(outbound);
-    return c.sendMessage(producerGroup_, outbound, selected, timeout, sysFlag);
+    return sendWithHooks(c, outbound, selected, timeout, sysFlag);
 }
 
 // ---------------------------------------------------------------- 异步 / 单向
@@ -457,7 +617,7 @@ SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_
     MessageQueue selected = publish->selectOneMessageQueue();
     // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
     const int32_t sysFlag = prepareForSend(batch);
-    return c.sendMessage(producerGroup_, batch, selected, timeout, sysFlag);
+    return sendWithHooks(c, batch, selected, timeout, sysFlag);
 }
 
 // ---------------------------------------------------------------- 心跳
@@ -569,6 +729,13 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
     }
     // Java 走 endTransactionOneway：单向发送，不等 broker 响应
     c.remotingClient().invokeOneway(addr, request);
+
+    // 事务收尾轨迹（对应 Java DefaultMQProducerImpl:1561 / :442 的 doExecuteEndTransactionHook）：
+    // 客户端主动提交与 broker 回查两条路径都会产生 EndTransaction 轨迹。
+    // msgId 取 header 里的（本地路径 = SendResult.msgId 即 UNIQ_KEY；回查路径 = 消息 UNIQ_KEY）；
+    // transactionId 取消息自身的（Java 用的是 msg.getTransactionId()，不是 header 的）。
+    executeEndTransactionHook(msg, addr, header.msgId.value_or(std::string()),
+                              msg.transactionId, localTransactionStateName(state), fromCheck);
 }
 
 void DefaultMQProducer::checkTransactionState(const RemotingCommand& cmd, const std::string& addr) {
@@ -655,12 +822,13 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     MessageQueue selected = publish->selectOneMessageQueue();
 
     // 压缩与普通发送一致；再叠加事务类型位（Java sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
+    ensureUniqId(outbound);   // 对齐 Java sendKernelImpl：非批量消息发送前注入 UNIQ_KEY
     int32_t sysFlag = prepareForSend(outbound);
     sysFlag = MessageSysFlag::resetTransactionValue(sysFlag,
                                                     MessageSysFlag::TRANSACTION_PREPARED_TYPE);
     SendResult sendResult;
     try {
-        sendResult = c.sendMessage(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
+        sendResult = sendWithHooks(c, outbound, selected, sendMsgTimeout_, sysFlag);
     } catch (const std::exception& e) {
         throw MQClientException(std::string("send message Exception: ") + e.what());
     }

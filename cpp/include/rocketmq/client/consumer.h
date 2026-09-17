@@ -31,8 +31,10 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/hook.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
+#include "rocketmq/client/trace_dispatcher.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/namespace_util.h"
@@ -185,6 +187,28 @@ public:
     }
     const std::shared_ptr<RPCHook>& rpcHook() const { return rpcHook_; }
 
+    // ---------------- 消息轨迹（对应 Java DefaultMQPushConsumer.setEnableMsgTrace 等）----
+    // enableMsgTrace=true 时 start() 会建 AsyncTraceDispatcher（Type=CONSUME）并自动注册
+    // ConsumeMessageTraceHook；三条消费路径（并发 / 顺序 / POP）都会产出 SubBefore/SubAfter。
+    void setEnableMsgTrace(bool enable) { enableMsgTrace_ = enable; }
+    bool isEnableMsgTrace() const { return enableMsgTrace_; }
+    // setEnableMsgTrace 的别名（对齐 Java 5.x 里的 setEnableTrace 写法）
+    void setEnableTrace(bool enable) { enableMsgTrace_ = enable; }
+    void setTraceTopic(const std::string& t) { traceTopic_ = t; }
+    void setTraceMsgBatchNum(int32_t n) { traceMsgBatchNum_ = n; }
+    // SubAfter 是否补 timestamp + groupName 两段由此决定（CLOUD 不补，Java 默认 LOCAL）
+    void setAccessChannel(AccessChannel ch) { accessChannel_ = ch; }
+    AccessChannel accessChannel() const { return accessChannel_; }
+    // 单批消费超时（分钟），用于 ConsumeReturnType.TIME_OUT 判定（Java 默认 15）
+    void setConsumeTimeout(int32_t minutes) { consumeTimeoutMinutes_ = minutes; }
+
+    void registerConsumeMessageHook(std::shared_ptr<ConsumeMessageHook> hook) {
+        if (hook) consumeMessageHookList_.push_back(std::move(hook));
+    }
+    bool hasConsumeMessageHook() const { return !consumeMessageHookList_.empty(); }
+    size_t consumeMessageHookCount() const { return consumeMessageHookList_.size(); }
+    std::shared_ptr<AsyncTraceDispatcher> traceDispatcher() const { return traceDispatcher_; }
+
     const std::string& consumerGroup() const { return consumerGroup_; }
     const std::string& clientId() const { return clientId_; }
     const std::string& messageModel() const { return messageModel_; }
@@ -293,6 +317,22 @@ private:
     void ackPopMsg(const MessageExt& msg);
     void changePopInvisibleTime(const MessageExt& msg, int32_t delayLevel);
 
+    // ---- 消费钩子 / 轨迹 ----
+    // 构造消费钩子上下文（Java 的初始值：success=false、props 空）
+    ConsumeMessageContext buildConsumeHookContext(const std::vector<MessageExt>& msgs,
+                                                  const MessageQueue& mq) const;
+    void executeConsumeHookBefore(ConsumeMessageContext& context);
+    void executeConsumeHookAfter(ConsumeMessageContext& context);
+    // 消费结果 -> ConsumeReturnType 名字（写进 props，决定轨迹 SubAfter 的 contextCode）。
+    // 判定顺序与 Java ConsumeMessageConcurrentlyService:378-393 一致。
+    static const char* consumeReturnTypeOf(bool hasException, int64_t consumeRtMs,
+                                           bool failed, bool succeeded);
+    // 收尾：写 props/status/success 后触发 after 钩子（对应 Java executeHookAfter 那一段）
+    void finishConsumeHook(ConsumeMessageContext* hookCtx, bool hasException, int64_t beginMs,
+                           bool failed, bool succeeded, const std::string& statusText);
+    // start() 里按 enableMsgTrace 建分发器并注册 ConsumeMessageTraceHook
+    void startTraceDispatcher();
+
     std::string consumerGroup_;
     std::string namespace_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
@@ -365,6 +405,15 @@ private:
     std::atomic<int64_t> heartbeatCount_{0};
     std::atomic<int64_t> lastHeartbeatMs_{0};
     std::atomic<int64_t> flowControlTriggered_{0};
+
+    // ---------------- 消息轨迹 / 消费钩子 ----------------
+    bool enableMsgTrace_ = false;
+    std::string traceTopic_;                      // 空 => 用 MixAll::TRACE_TOPIC
+    int32_t traceMsgBatchNum_ = 10;
+    int32_t consumeTimeoutMinutes_ = 15;
+    AccessChannel accessChannel_ = AccessChannel::LOCAL;
+    std::vector<std::shared_ptr<ConsumeMessageHook>> consumeMessageHookList_;
+    std::shared_ptr<AsyncTraceDispatcher> traceDispatcher_;
 };
 
 }  // namespace rocketmq

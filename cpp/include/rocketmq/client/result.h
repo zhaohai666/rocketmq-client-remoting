@@ -47,6 +47,9 @@ struct SendResult {
     int64_t queueOffset = 0;
     std::string transactionId;
     std::string regionId;
+    // broker 是否开启轨迹（由 SEND 响应头 TRACE_ON 解析，默认 true）。
+    // 轨迹钩子据此决定是否落轨迹（traceOn=false 或 regionId 为空则不落）。
+    bool traceOn = true;
 
     SendStatus getSendStatus() const { return sendStatus; }
     const std::string& getMsgId() const { return msgId; }

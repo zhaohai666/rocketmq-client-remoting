@@ -45,3 +45,7 @@ target_link_libraries(rmq_live_pop PRIVATE rocketmq::remoting)
 add_executable(rmq_live_pop_consumer live_pop_consumer.cpp)
 target_link_libraries(rmq_live_pop_consumer PRIVATE rocketmq::remoting)
 
+# 消息轨迹真机联调（需 broker traceTopicEnable=true；不打进 ctest）
+add_executable(rmq_live_trace live_trace.cpp)
+target_link_libraries(rmq_live_trace PRIVATE rocketmq::remoting)
+
