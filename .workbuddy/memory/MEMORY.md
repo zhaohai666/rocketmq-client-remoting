@@ -57,6 +57,23 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 11. **拉模式回投要复用"访问过该 topic"的那个 consumer**：`send_message_back` 靠
    `broker_addr_of(msg.broker_name)` 反查路由表，新起的 consumer 路由表为空 →
    "broker xxx not found"（Java 同理，走 `findBrokerAddressInPublish` 读 brokerAddrTable）。
+12. **POP 模式（5.x）的三条硬性事实**（真机实测 + Java 源码核对，2026-09-17）：
+   - 单 broker 5.5.1 **原生支持 POP，无需 proxy、无需任何开关**；`BrokerController` 无条件注册
+     POP_MESSAGE(200050) / ACK_MESSAGE(200051) / CHANGE_MESSAGE_INVISIBLETIME(**200053**，
+     200052 是 PEEK)。唯一硬依赖 `timerWheelEnable`（默认 true）。三侧直连 broker:10911。
+   - **`POP_CK` 必须由客户端反构**：普通 topic 直连 POP 时 broker **不在消息上写** `POP_CK`
+     （只在 retry-topic 重编码路径写）。客户端要用响应头 `startOffsetInfo`/`msgOffsetInfo`
+     按 `topic@queueId` 取 startOffset、按 queueOffset 求 index 取 msgQueueOffset，拼**8 段**
+     （**空格**分隔）CK 串，再补 `1ST_POP_TIME`。**没有它就无法 ACK**。已带 POP_CK 的
+     （retry 消息）**不能覆盖**。
+   - **`bornTime` 必须填当前毫秒时间戳**：broker `now - bornTime - pollTime > 500` 即回
+     `POLLING_TIMEOUT(210)`。**ACK 的 `offset` 是 consumeQueue offset（CK 第 8 段）**，
+     不是 commitlog offset。不 ack 的消息在 invisibleTime 后被复活重投到
+     `%RETRY%<group>_<topic>`（V1）。`queueId=-1` = 弹所有队列。
+   - 移植坑：Java `String.split(" ")` **丢弃末尾空串**，Python/（C# 的 `Split(' ')`）会保留 ——
+     段数校验依赖这个差异。`order`/`suspend` 在 Java 是非空 Boolean，**总是**出现在报文里。
+   - 三侧回归守卫：Python `tests/test_pop.py`（50 例，含 extFields 逐键断言）+ 真机
+     `python/verify_pop_live.py` S1–S8；harness `/tmp/run_pop_live.sh`。
 
 ## 两条"静默数据损坏"级的坑（最贵，别顺手优化）
 - **压缩两层语义缺一不可**：未支持的压缩类型（如 SNAPPY）`decompress` **抛异常**，且
@@ -72,8 +89,7 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 
 | 能力 | 严重度 | Py | C++ | .NET | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| 故障规避 sendLatencyFaultEnable | P2 | ⚠ 已接线未真机 | ❌ | ❌ | Python 有 MQFaultStrategy 并接入选队列（默认关）；C++/.NET 无 |
-| POP 模式 (5.x 轻量消费) | P2 | ❌ | ❌ | ❌ | 仅常量，无管道 |
+| POP 模式 (5.x 轻量消费) | P2 | ✅ 真机 14/14 | ❌ | ❌ | Python 管道完成（提交 d8c970d，未 push）；C++/.NET 待移植 |
 | 消息轨迹 Trace/Hook | P3 | ❌ | ❌ | ❌ | 三侧均无 |
 | TLS | P3 | ❌ | ❌ | ❌ | 仅明文 TCP |
 | 动态 name server (address server) | P3 | ❌ | ❌ | ❌ | 仅静态 namesrv 列表 |
@@ -81,10 +97,10 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 | 其它 broker 主动请求 | P3 | 部分 | 部分 | 部分 | 仅接 CHECK_TRANSACTION_STATE(39)；GET_CONSUMER_RUNNING_INFO(307) 等未接（admin 有 VIEW_MESSAGE 部分） |
 | 细粒度流控 / 线程弹性 | P3 | ❌ | ❌ | ❌ | 仅 pullThresholdForQueue；消费线程 min=max 固定 |
 
-注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。命名空间 / ACL / PullConsumer 已于
-2026-09-16 三侧补齐并真机验证；**Request-Reply (5.x) 亦于同日三侧补齐并真机验证**
-（Py 16/16、C++ 15/15、.NET 16/16，`/tmp/run_rr_live.sh`；Py+C++ 提交 56350c2、.NET 提交
-8932727，均已 push）。**remoting 传输层新增约定：broker 主动请求（326 等）的处理器回调
-可返回响应，必须原路写回已有连接、opaque 原样带回、oneway 不回；326 查不到等待槽也回
-SUCCESS。** 下一步按 P2 推进：**POP 模式**（5.x 管道，工作量大）或先补 C++/.NET 的故障规避
-（照搬 Python `latency.py`），再往后是 Trace / TLS / 动态 name server / 307 运行信息。
+注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。命名空间 / ACL / PullConsumer /
+**Request-Reply (5.x)** / **故障规避 sendLatencyFaultEnable** 均已于 2026-09-16 三侧补齐并
+真机验证（RR：Py 16/16、C++ 15/15、.NET 16/16，`/tmp/run_rr_live.sh`，提交 56350c2/8932727；
+故障规避：三侧 14/14，`/tmp/run_latency_live.sh`，提交 41dd8d3；均已 push，唯一残留是 Java
+startDetector 探测线程，有意省略）。**TopicPublishInfo 三侧现都有"带过滤器选队列"版本**
+（一轮无匹配返回 None/null/nullopt）+ resetIndex，供策略三级退化用。下一步：**POP 模式（P2）**，
+再往后是 Trace / TLS / 动态 name server / 307 运行信息 / 消费线程弹性（P3）。
