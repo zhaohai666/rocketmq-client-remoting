@@ -7,17 +7,20 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 
 ## 目录 / 状态
 - `python/rocketmq/` 参考实现 · `cpp/` C++ · `dotnet/` .NET 10（零 NuGet）。
-- 三侧已对齐 Java：两阶段事务、消费侧回投 / 位点持久化 / 顺序锁 / 广播 / 流控、
+- 三侧已对齐 Java：两阶段事务、消费侧回投 / 位点持久化 / 顺序锁 / 广播 / **消费线程弹性**、
   真实 rebalance + 队列撤销收尾 + 重投 topic 还原 + 优雅注销 + 命名空间 + ACL 鉴权 +
   主动拉取 PullConsumer + Request-Reply + 故障规避 + 压缩(zlib 跨语言) +
   **POP 协议管道 + POP 消费循环** + **消息轨迹 Trace/Hook** +
-  **CheckForbiddenHook / FilterMessageHook + 客户端二次 tag 过滤**。
-- 残留缺口全部 P3：TLS、动态 name server(TopAddressing)、307 运行信息、客户端 metrics、
-  消费线程弹性、OpenTracing 版轨迹钩子。心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。
+  **CheckForbiddenHook / FilterMessageHook + 客户端二次 tag 过滤** +
+  **动态 name server(TopAddressing)** + **消费统计 ConsumerStatsManager** +
+  **GET_CONSUMER_RUNNING_INFO(307)**。
+- 残留缺口全部 P3：TLS、OpenTracing 版轨迹钩子、其它 broker 主动请求（307/309 已接）。
+  心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。
 
 ## 验证入口（改完必跑）
-- Python `pytest`（当前 345 passed / 4 skipped，2 error 是沙箱 tmpdir 权限噪音）；C++ ctest
-  **15/15**（约 920 项断言）、零 warning；.NET xunit（当前 189/189）、零 warning。
+- Python `pytest`（当前 **415 passed / 4 skipped**；tmpdir 报 EEXIST 是沙箱噪音，加
+  `--basetemp=/tmp/rmq_pytest_tmp`）；C++ ctest **18/18**、零 warning；.NET xunit **233/233**、
+  零 warning（测试并行已禁用：Logging/TopAddressing 测试动进程级全局状态）。
 - 真机（**起集群 + 等端口 + 跑测试 + kill 必须在同一条 Bash 命令里**，前台返回会回收后台 JVM）：
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
   `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、`run_acl_live.sh`（认证集群）、
@@ -83,3 +86,10 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
   **返回 None / false**（丢弃消息），而不是把压缩流当正文交出去。
 - **Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，砍掉最高位**，与标准 CRC-32 差 2^31。
   跨语言对 CRC 只看各自的 `match` 字段，别比数字。
+16. **消费统计 StatsItem 真实模型**：累计 value/times 只增不减 + 两级采样链（10s/10min）；
+    快照 = **差分窗口**（sum=末-首、tps=sum*1000/spanMs、avgpt=sum/timesDiff），
+    不是"每分钟一个桶"。consumeStatus 全取 minute，唯独 consumeFailedMsgs 取 **hour** sum。
+    三语言统一用 **manager 级一个采样线程**（不逐 item 排任务）。307 应答的 statusTable 来自它。
+17. **307 应答 wire 形状**：properties(6 个 PROP_* 键)+subscriptionSet+mqTable+mqPopTable+
+    statusTable+userConsumerInfo（缺省 `{}`）；mq*Table 键是 fastjson2 **内联对象键**
+    （字母序）。**tps 单测必须注入时间戳**（真实时钟两次 sample 间隔≈0 → tps 恒 0）。
