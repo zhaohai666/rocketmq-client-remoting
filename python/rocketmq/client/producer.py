@@ -30,7 +30,8 @@ from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .exception import MQBrokerException, MQClientException, RequestTimeoutException
-from .hook import EndTransactionContext, EndTransactionHook, SendMessageContext, SendMessageHook
+from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
+                   EndTransactionContext, EndTransactionHook, SendMessageContext, SendMessageHook)
 from .latency import MQFaultStrategy
 from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
@@ -197,6 +198,8 @@ class DefaultMQProducer:
         self.trace_msg_batch_num = 10
         self.send_message_hook_list: List["SendMessageHook"] = []
         self.end_transaction_hook_list: List["EndTransactionHook"] = []
+        # 发送前拦截钩子（Java DefaultMQProducerImpl.checkForbiddenHookList）
+        self.check_forbidden_hook_list: List["CheckForbiddenHook"] = []
         self.trace_dispatcher = None
         # 基础客户端指标（send/consume RT 与计数）
         self.metrics = ClientMetrics()
@@ -289,6 +292,29 @@ class DefaultMQProducer:
     def has_send_message_hook(self) -> bool:
         return len(self.send_message_hook_list) > 0
 
+    # ---------------- 发送前拦截钩子（对应 Java CheckForbiddenHook 三个方法）----------------
+    def register_check_forbidden_hook(self, hook: "CheckForbiddenHook") -> None:
+        """注册发送前拦截钩子（Java DefaultMQProducerImpl.registerCheckForbiddenHook:186）。"""
+        if hook is not None:
+            self.check_forbidden_hook_list.append(hook)
+
+    def has_check_forbidden_hook(self) -> bool:
+        return len(self.check_forbidden_hook_list) > 0
+
+    def _has_send_interceptors(self) -> bool:
+        """是否需要走「带拦截/钩子」的发送内核（两者任一存在就得走）。"""
+        return bool(self.send_message_hook_list) or bool(self.check_forbidden_hook_list)
+
+    def execute_check_forbidden_hook(self, context: "CheckForbiddenContext") -> None:
+        """⚠ 与 send/consume 钩子不同：这里**不吞异常**（Java 签名 ``throws MQClientException``）。
+
+        钩子抛出的异常会沿 sendDefaultImpl 的重试链向上传播，这正是"禁止发送"的实现方式。
+        """
+        if not self.has_check_forbidden_hook():
+            return
+        for hook in self.check_forbidden_hook_list:
+            hook.check_forbidden(context)
+
     def register_end_transaction_hook(self, hook: "EndTransactionHook") -> None:
         """注册事务收尾钩子（对应 Java registerEndTransactionHook）。"""
         if hook is not None:
@@ -318,7 +344,8 @@ class DefaultMQProducer:
                 logger.warning("failed to executeSendMessageHookAfter: %s", e)
 
     def _build_send_context(self, msg: Message, mq: MessageQueue,
-                            broker_addr: str) -> SendMessageContext:
+                            broker_addr: str,
+                            communication_mode: str = CommunicationMode.SYNC) -> SendMessageContext:
         """构造 SendMessageContext（对齐 Java DefaultMQProducerImpl:969-989）。
 
         msgType 的判定顺序也照抄：TRAN_MSG=true → Trans_Msg_Half；
@@ -331,6 +358,7 @@ class DefaultMQProducer:
         context.mq = mq
         context.broker_addr = broker_addr
         context.namespace = self.namespace
+        context.communication_mode = communication_mode
         if msg.get_property(MessageConst.PROPERTY_TRANSACTION_PREPARED) == "true":
             context.msg_type = MessageType.TRANS_MSG_HALF
         for key in ("__STARTDELIVERTIME", MessageConst.PROPERTY_DELAY_TIME_LEVEL,
@@ -340,20 +368,44 @@ class DefaultMQProducer:
                 break
         return context
 
-    def _send_with_hooks(self, client: MQClientInstance, msg: Message, mq_sel: MessageQueue,
-                         timeout: int, sys_flag: int) -> SendResult:
-        """带上 before/after 钩子的同步发送（对应 Java sendKernelImpl + sendDefaultImpl 的钩子点）。
+    def _execute_check_forbidden(self, msg: Message, mq: MessageQueue, broker_addr: str,
+                                 arg=None,
+                                 communication_mode: str = CommunicationMode.SYNC) -> None:
+        """构造 CheckForbiddenContext 并执行（异常**不吞**，见 execute_check_forbidden_hook）。"""
+        context = CheckForbiddenContext()
+        context.name_srv_addr = self.get_namesrv_addr()
+        context.group = self.producer_group
+        context.communication_mode = communication_mode
+        context.broker_addr = broker_addr
+        context.message = msg
+        context.mq = mq
+        # 本项目无 unit mode（Java 的 isUnitMode() 恒为 false）
+        context.unit_mode = False
+        context.arg = arg
+        self.execute_check_forbidden_hook(context)
 
-        钩子只在**真正发起请求的那一次**执行（Java 也是这样：重试时每轮都重建 context）。
+    def _send_with_hooks(self, client: MQClientInstance, msg: Message, mq_sel: MessageQueue,
+                         timeout: int, sys_flag: int, arg=None,
+                         communication_mode: str = CommunicationMode.SYNC) -> SendResult:
+        """真正发起请求的那一步（对应 Java sendKernelImpl 内的钩子点）。
+
+        执行顺序严格照抄 Java `sendKernelImpl:956-990`：
+          1. **CheckForbiddenHook**（每次尝试都跑；异常**不吞**，直接抛给重试链）
+          2. SendMessageHook.before
+          3. 发请求
+          4. SendMessageHook.after（成功带 sendResult / 失败带 exception）
+        重试时每轮都会重建 context，所以钩子会被调用多次 —— 与 Java 一致。
         """
-        if not self.send_message_hook_list:
-            return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
         broker_addr = ""
         try:
             broker_addr = client.broker_addr_of(mq_sel.broker_name) or ""
         except Exception:  # noqa: BLE001
             pass
-        context = self._build_send_context(msg, mq_sel, broker_addr)
+        if self.has_check_forbidden_hook():
+            self._execute_check_forbidden(msg, mq_sel, broker_addr, arg, communication_mode)
+        if not self.send_message_hook_list:
+            return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+        context = self._build_send_context(msg, mq_sel, broker_addr, communication_mode)
         self.execute_send_message_hook_before(context)
         try:
             result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
@@ -548,7 +600,7 @@ class DefaultMQProducer:
         sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
             # 定点发送同样要过钩子（Java：目标是 mq 也走 sendKernelImpl）
-            if self.send_message_hook_list:
+            if self._has_send_interceptors():
                 return self._send_with_hooks(client, msg, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, msg, mq, timeout, sys_flag)
         last_exc = None
@@ -664,12 +716,19 @@ class DefaultMQProducer:
         self._check_message(msg)
         sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
+            if self.has_check_forbidden_hook():
+                # Java sendOneway 同样走 sendKernelImpl → 拦截钩子照跑（communicationMode=ONEWAY）
+                self._execute_check_forbidden(msg, mq, self._need_addr(client, mq),
+                                              None, CommunicationMode.ONEWAY)
             client.send_message_oneway(self.producer_group, msg, mq,
                                        self._need_addr(client, mq), self.send_msg_timeout, sys_flag)
             return
         publish = self._topic_publish_info(msg.topic)
         selected = self._mq_fault_strategy.select_one_message_queue(publish, None)
         mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
+        if self.has_check_forbidden_hook():
+            self._execute_check_forbidden(msg, mq_sel, self._need_addr(client, mq_sel),
+                                          None, CommunicationMode.ONEWAY)
         client.send_message_oneway(self.producer_group, msg, mq_sel,
                                    self._need_addr(client, mq_sel), self.send_msg_timeout, sys_flag)
 
@@ -685,8 +744,9 @@ class DefaultMQProducer:
         # 选择器用的是原始消息（topic/业务字段），压缩只影响 body
         self._check_message(msg)
         sys_flag = self.try_to_compress_message(msg)
-        if self.send_message_hook_list:
-            return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag)
+        if self._has_send_interceptors():
+            # arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
+            return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag, arg=arg)
         return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
 
     # ---------------- 批量发送 ----------------
@@ -702,13 +762,13 @@ class DefaultMQProducer:
         # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
         sys_flag = self.try_to_compress_message(batch)
         if mq is not None:
-            if self.send_message_hook_list:
+            if self._has_send_interceptors():
                 return self._send_with_hooks(client, batch, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, batch, mq, timeout, sys_flag)
         publish = self._topic_publish_info(batch.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(batch.topic, selected.broker_name, selected.queue_id)
-        if self.send_message_hook_list:
+        if self._has_send_interceptors():
             return self._send_with_hooks(client, batch, mq_sel, timeout, sys_flag)
         return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag)
 

@@ -18,8 +18,10 @@ from .trace import (AccessChannel, TraceBean, TraceConstants, TraceContext,
                     TraceDataEncoder, TraceTransferBean, TraceType)
 from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
 from .trace_hook import ConsumeMessageTraceHook, EndTransactionTraceHook, SendMessageTraceHook
-from .hook import (ConsumeMessageContext, ConsumeMessageHook, EndTransactionContext,
-                   EndTransactionHook, SendMessageContext, SendMessageHook)
+from .hook import (CheckForbiddenContext, CheckForbiddenHook, ConsumeMessageContext,
+                   ConsumeMessageHook, EndTransactionContext, EndTransactionHook,
+                   FilterMessageContext, FilterMessageHook, SendMessageContext,
+                   SendMessageHook)
 
 __all__ = [
     "DefaultMQProducer", "TransactionMQProducer", "LocalTransactionState",
@@ -39,5 +41,7 @@ __all__ = [
     "TraceTransferBean", "TraceType", "AsyncTraceDispatcher", "TraceDispatcherType",
     "SendMessageTraceHook", "ConsumeMessageTraceHook", "EndTransactionTraceHook",
     "SendMessageContext", "SendMessageHook", "ConsumeMessageContext", "ConsumeMessageHook",
+    "CheckForbiddenContext", "CheckForbiddenHook",
+    "FilterMessageContext", "FilterMessageHook",
     "EndTransactionContext", "EndTransactionHook",
 ]

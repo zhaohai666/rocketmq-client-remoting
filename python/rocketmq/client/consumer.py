@@ -40,7 +40,8 @@ from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlySta
                               MessageListenerOrderly, PopResult, PopStatus,
                               PullResult, PullStatus)
 from .exception import MQBrokerException, MQClientException
-from .hook import ConsumeMessageContext, ConsumeMessageHook
+from .hook import (ConsumeMessageContext, ConsumeMessageHook,
+                   FilterMessageContext, FilterMessageHook)
 from .mq_client import MQClientInstance
 from .trace import AccessChannel
 from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
@@ -69,6 +70,57 @@ def _mq_sort_key(mq: MessageQueue):
     不同的分配结果（同一队列被两个实例同时消费）。
     """
     return (mq.topic, mq.broker_name, mq.queue_id)
+
+
+def _safe_hook_name(hook) -> str:
+    try:
+        return str(hook.hook_name())
+    except Exception:  # noqa: BLE001
+        return type(hook).__name__
+
+
+def client_side_tag_filter(sub: Optional[SubscriptionData],
+                           msgs: List[MessageExt]) -> List[MessageExt]:
+    """客户端二次 tag 过滤（对应 Java PullAPIWrapper.processPullResult:113-122）。
+
+    broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放；Java 因此让客户端
+    再按字符串核一遍。守卫 `!tagsSet.isEmpty() && !isClassFilterMode` 意味着：
+    订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 `FilterAPI.build_subscription_data`
+    对 SUB_ALL 必须保持 tags_set 为空（那里有详细注释）。
+    """
+    if not msgs or sub is None or not sub.tags_set or sub.class_filter_mode:
+        return msgs
+    return [m for m in msgs if m.get_tags() is not None and m.get_tags() in sub.tags_set]
+
+
+def execute_filter_hooks(hook_list: List["FilterMessageHook"], context: FilterMessageContext) -> None:
+    """依次执行过滤钩子，**异常一律吞掉**（Java PullAPIWrapper.executeHook:171-178 记 error）。
+
+    与 send/consume 钩子不同：过滤钩子失败不能影响消费，只是该次过滤不生效。
+    """
+    for hook in hook_list:
+        try:
+            hook.filter_message(context)
+        except Exception as e:  # noqa: BLE001
+            logger.error("execute hook error. hookName=%s: %s", _safe_hook_name(hook), e)
+
+
+def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMessageHook"],
+                                 mq: MessageQueue, sub: Optional[SubscriptionData],
+                                 msgs: List[MessageExt]) -> List[MessageExt]:
+    """投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
+
+    钩子拿到的是**可变的** ``msg_list``；被摘掉的消息由调用方决定处置方式：
+    拉取路径 = 静默跳过（位点照常推进，不 ack，Java 亦然）；
+    POP 路径 = 必须立刻 ack，否则 invisibleTime 到期后会复活重投。
+    """
+    out = client_side_tag_filter(sub, list(msgs))
+    if out and hook_list:
+        context = FilterMessageContext(consumer_group, out, mq)
+        context.unit_mode = False        # 本项目无 unit mode（Java isUnitMode() 恒 false）
+        execute_filter_hooks(hook_list, context)
+        out = list(context.msg_list)
+    return out
 
 
 class MessageSelector:
@@ -309,6 +361,8 @@ class DefaultMQPushConsumer:
         self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
         self.trace_msg_batch_num = 10
         self.consume_message_hook_list: List[ConsumeMessageHook] = []
+        # 投递前过滤钩子（Java DefaultMQPushConsumerImpl.filterMessageHookList）
+        self.filter_message_hook_list: List[FilterMessageHook] = []
         self.trace_dispatcher = None
 
     # ---------------- 配置 ----------------
@@ -382,6 +436,25 @@ class DefaultMQPushConsumer:
     def has_consume_message_hook(self) -> bool:
         return len(self.consume_message_hook_list) > 0
 
+    # ---------------- 投递前过滤钩子（对应 Java FilterMessageHook）----------------
+    def register_filter_message_hook(self, hook: FilterMessageHook) -> None:
+        """注册投递前过滤钩子（Java DefaultMQPushConsumerImpl.registerFilterMessageHook:152）。"""
+        if hook is not None:
+            self.filter_message_hook_list.append(hook)
+
+    def has_filter_message_hook(self) -> bool:
+        return len(self.filter_message_hook_list) > 0
+
+    def execute_filter_message_hook(self, context: FilterMessageContext) -> None:
+        """钩子异常一律吞掉并记 error（Java PullAPIWrapper.executeHook:171-178）。"""
+        execute_filter_hooks(self.filter_message_hook_list, context)
+
+    def _filter_messages_for_delivery(self, mq: MessageQueue, sub: Optional[SubscriptionData],
+                                      msgs: List[MessageExt]) -> List[MessageExt]:
+        """投递前过滤（见模块级 filter_messages_for_delivery 的说明）。"""
+        return filter_messages_for_delivery(self.consumer_group, self.filter_message_hook_list,
+                                            mq, sub, msgs)
+
     def execute_consume_hook_before(self, context: ConsumeMessageContext) -> None:
         for hook in self.consume_message_hook_list:
             try:
@@ -445,20 +518,23 @@ class DefaultMQPushConsumer:
         self._assert_not_started()
         topic = self._with_namespace(topic)
         sub = FilterAPI.build_subscription_data(topic, sub_expression)
-        if sub is None:
-            sub = SubscriptionData(topic=topic, sub_string="*")
-            sub.tags_set.add("*")
         with self._lock:
             self.subscription_data[topic] = sub
 
     def subscribe_with_selector(self, topic: str, selector: MessageSelector) -> None:
         self._assert_not_started()
         topic = self._with_namespace(topic)
-        sub = SubscriptionData(topic=topic, sub_string=selector.expression)
-        sub.expression_type = selector.type
+        # 对齐 Java FilterAPI.build(topic, subString, type)：
+        #   TAG（或 type 为空）→ 走 buildSubscriptionData（填 tagsSet + codeSet）
+        #   其它（SQL92 / CLASS_FILTER）→ 只设 topic/subString/expressionType，两个集合留空
         if selector.type == ExpressionType.TAG:
-            FilterAPI.build_subscription_data(topic, selector.expression)
-            sub.tags_set = FilterAPI.build_subscription_data(topic, selector.expression).tags_set
+            sub = FilterAPI.build_subscription_data(topic, selector.expression)
+            sub.expression_type = selector.type
+        else:
+            if not selector.expression:
+                raise ValueError("Expression can't be null! %s" % selector.type)
+            sub = SubscriptionData(topic=topic, sub_string=selector.expression)
+            sub.expression_type = selector.type
         with self._lock:
             self.subscription_data[topic] = sub
 
@@ -503,8 +579,9 @@ class DefaultMQPushConsumer:
             if self.message_model != MessageModel.BROADCASTING:
                 retry_topic = MixAll.get_retry_topic(self.consumer_group)
                 if retry_topic not in self.subscription_data:
-                    sub = SubscriptionData(topic=retry_topic, sub_string="*")
-                    sub.tags_set.add("*")
+                    # 对齐 Java copySubscription → FilterAPI.buildSubscriptionData(group, retryTopic, SUB_ALL)：
+                    # SUB_ALL 下 tagsSet / codeSet 都为**空**（不是 {"*"}），见 subscription_data.FilterAPI
+                    sub = FilterAPI.build_subscription_data(retry_topic, "*")
                     self.subscription_data[retry_topic] = sub
             # 注册 broker 主动通知：消费者上下线时立刻重算分配
             # （对齐 Java ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
@@ -954,6 +1031,14 @@ class DefaultMQPushConsumer:
                 time.sleep(0.5)
                 continue
 
+            # 投递前的客户端侧过滤（对齐 Java PullAPIWrapper.processPullResult:113-128）：
+            # 先二次 tag 过滤，再跑 FilterMessageHook。**必须在拿 _lock 之前做** ——
+            # 钩子是用户代码，可能阻塞，不能压在入队的临界区里。
+            # 拉取路径被摘掉的消息不 ack（Java 亦然）：位点照常推进 = 静默跳过。
+            if result.status == PullStatus.FOUND and result.msg_found_list:
+                result.msg_found_list = self._filter_messages_for_delivery(
+                    mq, sub, result.msg_found_list)
+
             # 入队与"是否仍持有该队列"的判断必须原子：长轮询期间被 rebalance 撤走的队列，
             # 这批消息按 Java 语义（ProcessQueue.isDropped()）**直接丢弃**——不消费、不推进位点，
             # 由新属主从我们最后持久化的位点重投，否则两实例会重复消费同一条消息。
@@ -1038,7 +1123,20 @@ class DefaultMQPushConsumer:
             pq.last_pop_timestamp = time.time()
             if result.status == PopStatus.FOUND and result.msg_found_list:
                 pq.inc_found_msg(len(result.msg_found_list))
-                self._submit_pop_consume_request(result.msg_found_list, pq, mq)
+                # 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
+                # 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
+                kept = self._filter_messages_for_delivery(mq, sub, result.msg_found_list)
+                if len(kept) != len(result.msg_found_list):
+                    kept_ids = {id(m) for m in kept}
+                    for msg in result.msg_found_list:
+                        if id(msg) not in kept_ids:
+                            self._ack_pop_msg(msg)
+                            pq.ack()
+                    logger.info("pop filter dropped %d of %d messages (acked)",
+                                len(result.msg_found_list) - len(kept),
+                                len(result.msg_found_list))
+                if kept:
+                    self._submit_pop_consume_request(kept, pq, mq)
             else:
                 # 空结果：若 broker 没按 poll_time 挂起（立即返回）就会变成热循环，
                 # 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
@@ -1728,8 +1826,36 @@ class DefaultMQPullConsumer:
         self.register_topics: Set[str] = set()
         self.message_queue_lists: List[MessageQueue] = []
         self.message_queue_listener: Optional[MessageQueueListener] = None
+        # 投递前过滤钩子（Java DefaultMQPullConsumerImpl.filterMessageHookList:80，
+        # start() 时注册进 PullAPIWrapper:726）
+        self.filter_message_hook_list: List[FilterMessageHook] = []
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
+
+    # ---------------- 投递前过滤钩子 ----------------
+    def register_filter_message_hook(self, hook: FilterMessageHook) -> None:
+        """注册投递前过滤钩子（Java DefaultMQPullConsumerImpl.registerFilterMessageHook:844）。"""
+        if hook is not None:
+            self.filter_message_hook_list.append(hook)
+
+    def has_filter_message_hook(self) -> bool:
+        return len(self.filter_message_hook_list) > 0
+
+    def execute_filter_message_hook(self, context: FilterMessageContext) -> None:
+        execute_filter_hooks(self.filter_message_hook_list, context)
+
+    def _filter_messages_for_delivery(self, mq: MessageQueue, msgs: List[MessageExt]) -> List[MessageExt]:
+        """拉模式也要过过滤钩子（Java pullSyncImpl → pullAPIWrapper.processPullResult）。
+
+        拉模式的 tag 过滤交给调用方（Java 的 pull 接口不传 subscriptionData 时
+        processPullResult 里 tagsSet 为空 → 不筛），这里只跑钩子。
+        """
+        if not msgs or not self.filter_message_hook_list:
+            return msgs
+        context = FilterMessageContext(self.consumer_group, list(msgs), mq)
+        context.unit_mode = False
+        self.execute_filter_message_hook(context)
+        return list(context.msg_list)
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -1795,12 +1921,15 @@ class DefaultMQPullConsumer:
         # （默认 20s），而客户端 5s 就超时 → RemotingTimeoutException（真机必现）。
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                               subscription=True, class_filter=False)
-        return client.pull_message(self.consumer_group, mq, offset, max_nums,
-                                   sys_flag, 0, sub.sub_string or "*",
-                                   # Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
-                                   0,
-                                   ExpressionType.TAG, timeout_millis=timeout,
-                                   max_msg_bytes=-1, suspend_timeout_millis=15000)
+        result = client.pull_message(self.consumer_group, mq, offset, max_nums,
+                                     sys_flag, 0, sub.sub_string or "*",
+                                     # Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
+                                     0,
+                                     ExpressionType.TAG, timeout_millis=timeout,
+                                     max_msg_bytes=-1, suspend_timeout_millis=15000)
+        if result.status == PullStatus.FOUND and result.msg_found_list:
+            result.msg_found_list = self._filter_messages_for_delivery(mq, result.msg_found_list)
+        return result
 
     def pull_block_if_not_found(self, mq: MessageQueue, sub_expression: str, offset: int,
                                 max_nums: int) -> PullResult:
@@ -1811,12 +1940,15 @@ class DefaultMQPullConsumer:
         # consumer_timeout_millis_when_suspend（Java :250 的 `block ? ... : timeout`）。
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=True,
                                               subscription=True, class_filter=False)
-        return client.pull_message(self.consumer_group, mq, offset, max_nums,
-                                   sys_flag, 0, sub.sub_string or "*", 0,
-                                   ExpressionType.TAG,
-                                   timeout_millis=self.consumer_timeout_millis_when_suspend,
-                                   max_msg_bytes=-1,
-                                   suspend_timeout_millis=self.broker_suspend_max_time_millis)
+        result = client.pull_message(self.consumer_group, mq, offset, max_nums,
+                                     sys_flag, 0, sub.sub_string or "*", 0,
+                                     ExpressionType.TAG,
+                                     timeout_millis=self.consumer_timeout_millis_when_suspend,
+                                     max_msg_bytes=-1,
+                                     suspend_timeout_millis=self.broker_suspend_max_time_millis)
+        if result.status == PullStatus.FOUND and result.msg_found_list:
+            result.msg_found_list = self._filter_messages_for_delivery(mq, result.msg_found_list)
+        return result
 
     # ---------------- Offset 管理 ----------------
     def fetch_consume_offset(self, mq: MessageQueue) -> Optional[int]:

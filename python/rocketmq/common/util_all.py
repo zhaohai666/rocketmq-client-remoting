@@ -11,6 +11,21 @@ import zlib
 from typing import Optional
 
 
+def java_string_hash(s: str) -> int:
+    """Java `String.hashCode()`：h = 31*h + ch，按 32 位有符号回绕。
+
+    必须显式实现：Python 的 `hash(str)` 带进程级随机盐（PYTHONHASHSEED），
+    且算法与 Java 完全不同。用途之一：`SubscriptionData.codeSet`
+    （Java `FilterAPI.buildSubscriptionData` 写入 `tag.hashCode()`，
+    broker 侧 `ExpressionMessageFilter.isMatchedByConsumeQueue` 按它过滤）。
+    对拍向量：TagA=2598919、TagB=2598920、P=80、PA=2545、"*"=42。
+    """
+    h = 0
+    for ch in s:
+        h = (31 * h + ord(ch)) & 0xFFFFFFFF
+    return h - 0x100000000 if h >= 0x80000000 else h
+
+
 class UtilAll:
     # Java 相同的日期格式化
     YYYY_MM_DD_HH_MM_SS = "%Y-%m-%d %H:%M:%S"

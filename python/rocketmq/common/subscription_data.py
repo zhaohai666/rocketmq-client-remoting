@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import List, Optional, Set
 
+from .util_all import java_string_hash
+
 
 class ExpressionType:
     TAG = "TAG"
@@ -116,15 +118,45 @@ class SubscriptionData:
 
 
 class FilterAPI:
+    SUB_ALL = "*"
+
     @staticmethod
-    def build_subscription_data(topic: str, sub_string: str) -> SubscriptionData:
+    def build_subscription_data(topic: str, sub_string: Optional[str]) -> SubscriptionData:
+        """对齐 Java `FilterAPI.buildSubscriptionData`（探针实测向量见下）。
+
+        Java 行为（`/tmp/subprobe/SubProbe.java` + `BlankProbe.java` + `EdgeProbe.java` 实测）：
+          "*" / None / ""  → subString 归一为 "*"，**tagsSet 与 codeSet 都保持空**
+          "TagA"           → tagsSet={TagA}, codeSet={2598919}
+          "TagA||TagB"     → tagsSet={TagA,TagB}, codeSet={2598919,2598920}
+          " TagA || TagB " → **subString 原样保留空格**，标签各自 trim
+          "   "（纯空白）   → tagsSet 空、**subString 原样保留**（StringUtils.isEmpty 只认 null/""）
+          "|||"            → tagsSet={|}, codeSet={124}（Java-split 只丢**末尾**空串）
+          "||" / "||||"    → 抛 "subString split error"（Java-split 结果数组长度为 0）
+
+        ⚠ 曾经的实现给 "*" 塞了 tagsSet={"*"}，并且从不填 codeSet —— 两处都是偏差：
+        ① Java 里 tagsSet 非空是"客户端二次 tag 过滤"的开关（`PullAPIWrapper
+        .processPullResult` 的 `!tagsSet.isEmpty()`），塞了 "*" 会让订阅全量时把
+        所有正常 tag 的消息客户端自己过滤掉；② codeSet 是 broker 侧按 tag 哈希过滤的依据
+        （`ExpressionMessageFilter.isMatchedByConsumeQueue` 走 `codeSet.contains`）。
+        """
         sub = SubscriptionData(topic=topic, sub_string=sub_string)
-        if sub_string is None or sub_string == "*" or not sub_string.strip():
-            sub.tags_set.add("*")
-        else:
-            for tag in [t.strip() for t in sub_string.split("||")]:
-                if tag != "":
-                    sub.tags_set.add(tag)
+        # Java: StringUtils.isEmpty(subString) || subString.equals("*") -> setSubString("*") 后直接 return
+        # 注意是 isEmpty（只认 None/""）而非 isBlank —— 纯空白会走进下面的 split 分支。
+        if sub_string is None or sub_string == "" or sub_string == FilterAPI.SUB_ALL:
+            sub.sub_string = FilterAPI.SUB_ALL
+            return sub
+        # Java String.split("\\|\\|")：丢弃**末尾**空串
+        parts = sub_string.split("||")
+        while parts and parts[-1] == "":
+            parts.pop()
+        if not parts:
+            # Java 这里是 throw new Exception("subString split error")
+            raise ValueError("subString split error")
+        for part in parts:
+            tag = part.strip()
+            if tag != "":
+                sub.tags_set.add(tag)
+                sub.code_set.add(java_string_hash(tag))
         return sub
 
     @staticmethod
