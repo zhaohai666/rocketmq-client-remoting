@@ -322,6 +322,25 @@ void DefaultMQPushConsumer::start() {
             return std::nullopt;
         });
 
+    // 对应 Java ClientRemotingProcessor GET_CONSUMER_RUNNING_INFO(307)：
+    // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
+    mqClient_->remotingClient().registerProcessor(
+        RequestCode::GET_CONSUMER_RUNNING_INFO,
+        [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
+            auto it = cmd.extFields.find("consumerGroup");
+            const std::string group = it == cmd.extFields.end() ? std::string() : it->second;
+            if (group != consumerGroup_) {
+                // 与 Java 一致：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
+                return RemotingCommand::createResponseCommand(
+                    ResponseCode::SYSTEM_ERROR,
+                    "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
+            }
+            RemotingCommand resp = RemotingCommand::createResponseCommand(
+                ResponseCode::SUCCESS, std::string());
+            resp.body = consumerRunningInfo().encode();
+            return resp;
+        });
+
     // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
     // 拉路由（登记 topic 在用 + 填 broker 地址表）→ 发心跳（broker 先认识本消费者）
     // → 立即 rebalance → 起消费线程。心跳必须在 rebalance 之前：rebalance 要向 broker
@@ -647,10 +666,18 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
                 PullSysFlag::buildSysFlag(/*commitOffset=*/false, /*suspend=*/true,
                                           /*subscription=*/true, /*classFilter=*/false);
             const std::string expr = sub.subString.empty() ? std::string("*") : sub.subString;
+            const int64_t pullBegan = UtilAll::currentTimeMillis();
             result = c.pullMessage(consumerGroup_, mq, offset, pullBatchSize_, sysFlag,
                                    /*commitOffset=*/0, expr, sub.subVersion, sub.expressionType,
                                    pullTimeoutMillis_, pullBatchSizeInBytes_,
                                    pullSuspendTimeoutMillis_);
+            // 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
+            mqClient_->consumerStats().incPullRT(consumerGroup_, mq.topic,
+                                                 UtilAll::currentTimeMillis() - pullBegan);
+            if (result.isFound() && !result.msgFoundList.empty()) {
+                mqClient_->consumerStats().incPullTPS(consumerGroup_, mq.topic,
+                                                      static_cast<int64_t>(result.msgFoundList.size()));
+            }
         } catch (const MQBrokerException& e) {
             // TOPIC_NOT_EXIST / PULL_NOT_FOUND 等多为预期路径（topic 未创建等），debug + 退避
             logger_debug("pull broker error for " + mq.toString() + ": " + e.what());
@@ -877,6 +904,8 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
         logger_debug(std::string("pop listener error, treat as RECONSUME_LATER: ") + e.what());
         hookHasException = true;
     }
+    recordConsumeStats(mq.topic, static_cast<int64_t>(msgs.size()), hookBeginMs,
+                       status != ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
     if (useHook) {
         const bool ok = (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
         finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
@@ -1200,6 +1229,98 @@ void DefaultMQPushConsumer::finishConsumeHook(ConsumeMessageContext* hookCtx, bo
     executeConsumeHookAfter(*hookCtx);
 }
 
+void DefaultMQPushConsumer::recordConsumeStats(const std::string& topic, int64_t msgCount,
+                                               int64_t beginMs, bool failed) {
+    if (!mqClient_) return;
+    auto& stats = mqClient_->consumerStats();
+    const int64_t rt = UtilAll::currentTimeMillis() - beginMs;
+    if (failed) {
+        stats.incConsumeFailedTPS(consumerGroup_, topic, msgCount);
+    } else {
+        stats.incConsumeOKTPS(consumerGroup_, topic, msgCount);
+    }
+    stats.incConsumeRT(consumerGroup_, topic, rt);
+}
+
+ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
+    // 对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。
+    ConsumerRunningInfo info;
+    std::string namesrv;
+    for (const std::string& a : nameServerAddrs_) {
+        if (!namesrv.empty()) namesrv += ";";
+        namesrv += a;
+    }
+    info.properties[ConsumerRunningInfo::PROP_NAMESERVER_ADDR] = namesrv + ";";
+    info.properties[ConsumerRunningInfo::PROP_CONSUME_TYPE] = "CONSUME_PASSIVELY";
+    info.properties[ConsumerRunningInfo::PROP_CONSUME_ORDERLY] = isOrderly() ? "true" : "false";
+    info.properties[ConsumerRunningInfo::PROP_THREADPOOL_CORE_SIZE] =
+        std::to_string(getCorePoolSize());
+    info.properties[ConsumerRunningInfo::PROP_CONSUMER_START_TIMESTAMP] =
+        std::to_string(startMillis_);
+    info.properties[ConsumerRunningInfo::PROP_CLIENT_VERSION] = "V5_5_1";
+
+    JsonValue subs = JsonValue::makeArray();
+    JsonValue statusTable = JsonValue::makeObject();
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const auto& kv : subscriptionData_) {
+            subs.pushArray(kv.second.toJson());
+        }
+        auto makePqi = [&](int64_t commitOffset, int64_t cachedMsgCount, bool droped) {
+            // ProcessQueueInfo 全字段（Java body.ProcessQueueInfo；"droped" 拼写照抄）
+            JsonValue pqi = JsonValue::makeObject();
+            pqi.set("commitOffset", JsonValue::makeInt(commitOffset));
+            pqi.set("cachedMsgMinOffset", JsonValue::makeInt(0));
+            pqi.set("cachedMsgMaxOffset", JsonValue::makeInt(0));
+            pqi.set("cachedMsgCount", JsonValue::makeInt(cachedMsgCount));
+            pqi.set("cachedMsgSizeInMiB", JsonValue::makeInt(0));
+            pqi.set("transactionMsgMinOffset", JsonValue::makeInt(0));
+            pqi.set("transactionMsgMaxOffset", JsonValue::makeInt(0));
+            pqi.set("transactionMsgCount", JsonValue::makeInt(0));
+            pqi.set("locked", JsonValue::makeBool(false));
+            pqi.set("tryUnlockTimes", JsonValue::makeInt(0));
+            pqi.set("lastLockTimestamp", JsonValue::makeInt(0));
+            pqi.set("droped", JsonValue::makeBool(droped));
+            pqi.set("lastPullTimestamp", JsonValue::makeInt(0));
+            pqi.set("lastConsumeTimestamp", JsonValue::makeInt(0));
+            return pqi;
+        };
+        for (const auto& kv : mqMap_) {
+            const MessageQueue& mq = kv.second;
+            // fastjson2 内联对象键（键按字母序），与 Python message_queue_key 同款
+            const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
+                + std::to_string(mq.queueId) + ",\"topic\":\"" + mq.topic + "\"}";
+            int64_t commit = 0;
+            auto ot = consumeOffsetTable_.find(kv.first);
+            if (ot != consumeOffsetTable_.end()) commit = ot->second;
+            int64_t cached = 0;
+            auto pt = pending_.find(kv.first);
+            if (pt != pending_.end()) cached = static_cast<int64_t>(pt->second.size());
+            info.mqTable.set(mqKey, makePqi(commit, cached, false));
+        }
+        if (popMode_) {
+            for (const auto& kv : popQueues_) {
+                auto mt = mqMap_.find(kv.first);
+                if (mt == mqMap_.end()) continue;
+                const MessageQueue& mq = mt->second;
+                const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
+                    + std::to_string(mq.queueId) + ",\"topic\":\"" + mq.topic + "\"}";
+                info.mqPopTable.set(mqKey,
+                                    makePqi(0, kv.second->waitAckCount(), kv.second->isDropped()));
+            }
+        }
+    }
+    // statusTable（Java consumerRunningInfo：consumeStatus(group, topic)，minute 快照）
+    for (const auto& kv : subscriptionData_) {
+        ConsumeStatus cs;
+        if (mqClient_) cs = mqClient_->consumerStats().consumeStatus(consumerGroup_, kv.first);
+        statusTable.set(kv.first, cs.toJson());
+    }
+    info.subscriptionSet = subs;
+    info.statusTable = statusTable;
+    return info;
+}
+
 void DefaultMQPushConsumer::startTraceDispatcher() {
     if (!enableMsgTrace_) return;
     try {
@@ -1250,6 +1371,9 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             status = ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
             hookHasException = true;
         }
+        // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
+        recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs,
+                           status != ConsumeOrderlyStatus::SUCCESS);
         if (useHook) {
             const bool ok = (status == ConsumeOrderlyStatus::SUCCESS);
             finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
@@ -1293,6 +1417,8 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
         hookHasException = true;
     }
+    recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs,
+                       status == ConsumeConcurrentlyStatus::RECONSUME_LATER);
     if (useHook) {
         const bool ok = (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
         finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,

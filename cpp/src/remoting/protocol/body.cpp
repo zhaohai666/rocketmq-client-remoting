@@ -312,11 +312,39 @@ bool ProducerConnection::decode(const Bytes& data, ProducerConnection& out) {
 }
 
 // ---------------------------------------------------------------- ConsumerRunningInfo
+JsonValue ConsumeStatus::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("pullRT", JsonValue::makeDouble(pullRT));
+    v.set("pullTPS", JsonValue::makeDouble(pullTPS));
+    v.set("consumeRT", JsonValue::makeDouble(consumeRT));
+    v.set("consumeOKTPS", JsonValue::makeDouble(consumeOKTPS));
+    v.set("consumeFailedTPS", JsonValue::makeDouble(consumeFailedTPS));
+    v.set("consumeFailedMsgs", JsonValue::makeInt(consumeFailedMsgs));
+    return v;
+}
+
+ConsumeStatus ConsumeStatus::fromJson(const JsonValue& v) {
+    ConsumeStatus cs;
+    cs.pullRT = v.get("pullRT").doubleValue();
+    cs.pullTPS = v.get("pullTPS").doubleValue();
+    cs.consumeRT = v.get("consumeRT").doubleValue();
+    cs.consumeOKTPS = v.get("consumeOKTPS").doubleValue();
+    cs.consumeFailedTPS = v.get("consumeFailedTPS").doubleValue();
+    cs.consumeFailedMsgs = v.get("consumeFailedMsgs").intValue();
+    return cs;
+}
+
 JsonValue ConsumerRunningInfo::toJson() const {
     JsonValue v = JsonValue::makeObject();
     v.set("properties", makeStringMap(properties));
     v.set("subscriptionSet", subscriptionSet.isNull() ? JsonValue::makeArray() : subscriptionSet);
     v.set("mqTable", mqTable.isNull() ? JsonValue::makeObject() : mqTable);
+    // Python/Java 侧 307 应答总是带 mqPopTable/statusTable/userConsumerInfo；
+    // 缺省时输出空对象，保持三语言报文形状一致（fastjson2 会忽略空 map 吗？不会，
+    // Java 的字段非 null 就序列化，空 TreeMap 输出 {}）。
+    v.set("mqPopTable", mqPopTable.isNull() ? JsonValue::makeObject() : mqPopTable);
+    v.set("statusTable", statusTable.isNull() ? JsonValue::makeObject() : statusTable);
+    v.set("userConsumerInfo", userConsumerInfo.isNull() ? JsonValue::makeObject() : userConsumerInfo);
     if (hasJstack) v.set("jstack", JsonValue::makeString(jstack));
     return v;
 }
@@ -326,6 +354,9 @@ ConsumerRunningInfo ConsumerRunningInfo::fromJson(const JsonValue& v) {
     ri.properties = readStringMap(v.get("properties"));
     ri.subscriptionSet = rawSub(v, "subscriptionSet");
     ri.mqTable = rawSub(v, "mqTable");
+    ri.mqPopTable = rawSub(v, "mqPopTable");
+    ri.statusTable = rawSub(v, "statusTable");
+    ri.userConsumerInfo = rawSub(v, "userConsumerInfo");
     std::string s;
     if (v.tryGetString("jstack", s)) {
         ri.jstack = s;

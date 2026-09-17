@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/consumer_stats.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/byte_buffer.h"
 #include "rocketmq/common/message.h"
@@ -101,6 +102,9 @@ public:
     DefaultTopAddressing& topAddressing() { return topAddressing_; }
     // 取一次地址；变化才应用到 nameServerAddrs_（Java 地址变化才 update）。
     void fetchNameServerAddr();
+
+    // ---- 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）----
+    ConsumerStatsManager& consumerStats() { return consumerStats_; }
 
     // 安装 RPC 钩子（ACL 鉴权）。对应 Java 在 MQClientInstance 构造时绑定 rpcHook。
     // **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
@@ -335,6 +339,7 @@ private:
     std::thread namesrvRefreshThread_;
     void namesrvRefreshLoop();
     DefaultTopAddressing topAddressing_;
+    ConsumerStatsManager consumerStats_;
 };
 
 }  // namespace rocketmq

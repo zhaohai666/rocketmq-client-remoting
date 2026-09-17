@@ -79,6 +79,10 @@ add_executable(rmq_test_top_addressing test_top_addressing.cpp)
 target_link_libraries(rmq_test_top_addressing PRIVATE rocketmq::remoting)
 add_test(NAME top_addressing COMMAND rmq_test_top_addressing)
 
+add_executable(rmq_test_consumer_stats test_consumer_stats.cpp)
+target_link_libraries(rmq_test_consumer_stats PRIVATE rocketmq::remoting)
+add_test(NAME consumer_stats COMMAND rmq_test_consumer_stats)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

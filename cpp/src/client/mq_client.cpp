@@ -128,6 +128,8 @@ MQClientInstance::~MQClientInstance() { shutdown(); }
 
 void MQClientInstance::start() {
     started_ = true;
+    // 消费统计采样线程（Java 挂在每个 StatsItem 的调度器上，这里收敛为实例级一个）
+    consumerStats_.start();
     // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
     // 静态地址时先 fetch 一次；取不到直接报错（比 Java 更严格——Java 会让运行期各处
     // 各自失败，这里在 start 时给一个明确错误）。
@@ -209,6 +211,7 @@ void MQClientInstance::shutdown() {
     if (routeRefreshThread_.joinable()) {
         routeRefreshThread_.join();
     }
+    consumerStats_.shutdown();
     if (remotingClient_) {
         remotingClient_->shutdown();
     }

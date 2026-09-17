@@ -59,6 +59,7 @@ set(RMQ_SOURCES
     src/remoting/rpchook.cpp
     src/client/result.cpp
     src/client/mq_client.cpp
+    src/client/consumer_stats.cpp
     src/client/producer.cpp
     src/client/consumer.cpp
     src/client/consume_executor.cpp

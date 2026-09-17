@@ -40,6 +40,7 @@
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/namespace_util.h"
 #include "rocketmq/common/subscription_data.h"
+#include "rocketmq/remoting/protocol/body.h"
 #include "rocketmq/remoting/protocol/heartbeat.h"
 
 namespace rocketmq {
@@ -155,6 +156,8 @@ public:
     // 观测：当前 POP 消费执行器的存活线程数 / 排队任务数（未建执行器时为 0）。
     int32_t consumeExecutorWorkers() const;
     int32_t consumeExecutorQueued() const;
+    // 对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。
+    ConsumerRunningInfo consumerRunningInfo();
     void setMessageListener(std::shared_ptr<MessageListener> listener);
     void setPullBatchSize(int32_t n) { pullBatchSize_ = n; }
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }
@@ -384,6 +387,8 @@ private:
     // 收尾：写 props/status/success 后触发 after 钩子（对应 Java executeHookAfter 那一段）
     void finishConsumeHook(ConsumeMessageContext* hookCtx, bool hasException, int64_t beginMs,
                            bool failed, bool succeeded, const std::string& statusText);
+    // 消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）
+    void recordConsumeStats(const std::string& topic, int64_t msgCount, int64_t beginMs, bool failed);
     // start() 里按 enableMsgTrace 建分发器并注册 ConsumeMessageTraceHook
     void startTraceDispatcher();
 

@@ -113,11 +113,36 @@ struct ProducerConnection {
     static bool decode(const Bytes& data, ProducerConnection& out);
 };
 
+// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
+// （ConsumerRunningInfo.statusTable 的值，字段全部来自 ConsumerStatsManager 的快照）
+struct ConsumeStatus {
+    double pullRT = 0.0;
+    double pullTPS = 0.0;
+    double consumeRT = 0.0;
+    double consumeOKTPS = 0.0;
+    double consumeFailedTPS = 0.0;
+    int64_t consumeFailedMsgs = 0;
+
+    JsonValue toJson() const;
+    static ConsumeStatus fromJson(const JsonValue& v);
+};
+
 // 对应 org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo
 struct ConsumerRunningInfo {
+    // Java ConsumerRunningInfo 里 properties 的固定键（常量名照抄 Java）
+    static constexpr const char* PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR";
+    static constexpr const char* PROP_THREADPOOL_CORE_SIZE = "PROP_THREADPOOL_CORE_SIZE";
+    static constexpr const char* PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY";  // Java 常量名无下划线
+    static constexpr const char* PROP_CONSUME_TYPE = "PROP_CONSUME_TYPE";
+    static constexpr const char* PROP_CLIENT_VERSION = "PROP_CLIENT_VERSION";
+    static constexpr const char* PROP_CONSUMER_START_TIMESTAMP = "PROP_CONSUMER_START_TIMESTAMP";
+
     PropertyMap properties;
     JsonValue subscriptionSet;  // 透传（List<SubscriptionData>）
     JsonValue mqTable;          // 透传（Map<MessageQueue, ProcessQueueInfo>）
+    JsonValue mqPopTable;       // 透传（Map<MessageQueue, ProcessQueueInfo>，POP 模式）
+    JsonValue statusTable;      // 透传（Map<String, ConsumeStatus>）
+    JsonValue userConsumerInfo; // 透传（Map<String, String>）
     std::string jstack;
     bool hasJstack = false;
 
