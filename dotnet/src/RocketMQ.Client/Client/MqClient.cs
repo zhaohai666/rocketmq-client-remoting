@@ -137,6 +137,26 @@ public sealed class MQClientInstance : IDisposable
     private Thread? _routeRefreshThread;
     private readonly ManualResetEventSlim _routeRefreshStop = new(false);
 
+    // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
+    // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 → fetch 是 no-op，行为不变。
+    public DefaultTopAddressing TopAddressing { get; } = new();
+    private Thread? _namesrvRefreshThread;
+    private readonly ManualResetEventSlim _namesrvRefreshStop = new(false);
+
+    /// <summary>取一次地址；变化才应用到 _nameServerAddrs（Java 地址变化才 update）。</summary>
+    public void FetchNameServerAddr()
+    {
+        string? changed = TopAddressing.FetchAndApply();
+        if (string.IsNullOrEmpty(changed)) return;
+        var addrs = new List<string>();
+        foreach (string part in changed.Split(';'))
+        {
+            string t = part.Trim();
+            if (t.Length > 0) addrs.Add(t);
+        }
+        UpdateNameServerAddressList(addrs);
+    }
+
     /// <summary>是否已 Start（诊断用）。</summary>
     public bool Started => _started;
 
@@ -166,6 +186,29 @@ public sealed class MQClientInstance : IDisposable
     public void Start()
     {
         _started = true;
+        // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
+        // 静态地址时先 fetch 一次；取不到直接报错（比 Java 更严格——Java 会让运行期
+        // 各处各自失败，这里在 Start 时给一个明确错误）。
+        if (_nameServerAddrs.Count == 0 && !string.IsNullOrEmpty(TopAddressing.WsAddr))
+        {
+            FetchNameServerAddr();
+            if (_nameServerAddrs.Count == 0)
+            {
+                throw new MQClientException("name server address is not set and address server ("
+                    + TopAddressing.WsAddr + ") returned none");
+            }
+            // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
+            if (_namesrvRefreshThread is null)
+            {
+                _namesrvRefreshStop.Reset();
+                _namesrvRefreshThread = new Thread(NamesrvRefreshLoop)
+                {
+                    IsBackground = true,
+                    Name = "rmq-namesrv-refresh-" + _clientId,
+                };
+                _namesrvRefreshThread.Start();
+            }
+        }
         string ns = string.Join(";", _nameServerAddrs);
         ClientLog.Info("MQClientInstance[" + _clientId + "] started, namesrv=" + ns);
         if (_routeRefreshThread is null)
@@ -184,12 +227,42 @@ public sealed class MQClientInstance : IDisposable
     {
         _started = false;
         _routeRefreshStop.Set();
+        _namesrvRefreshStop.Set();
+        if (_namesrvRefreshThread is { IsAlive: true })
+        {
+            _namesrvRefreshThread.Join(2000);
+        }
         if (_routeRefreshThread is { IsAlive: true })
         {
             _routeRefreshThread.Join(2000);
         }
 
         _remotingClient.Shutdown();
+    }
+
+    /// <summary>动态 name server 周期刷新：Java 首次延迟 10s、周期 2 分钟。</summary>
+    private void NamesrvRefreshLoop()
+    {
+        if (_namesrvRefreshStop.Wait(TimeSpan.FromSeconds(10)))
+        {
+            return;
+        }
+        while (!_namesrvRefreshStop.IsSet)
+        {
+            if (!_started) return;
+            try
+            {
+                FetchNameServerAddr();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("fetchNameServerAddr exception: " + e.Message);
+            }
+            if (_namesrvRefreshStop.Wait(TimeSpan.FromMinutes(2)))
+            {
+                return;
+            }
+        }
     }
 
     /// <summary>登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。</summary>

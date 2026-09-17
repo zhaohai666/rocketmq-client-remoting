@@ -307,7 +307,8 @@ public class DefaultMQProducer
                 return;
             }
 
-            if (_nameServerAddrs.Count == 0)
+            // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+            if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
                 throw new MQClientException("name server address is not set");
             }
@@ -319,6 +320,11 @@ public class DefaultMQProducer
 
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs);
             _mqClient.Start();
+            // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+            if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
+            {
+                _nameServerAddrs = new List<string>(_mqClient.NameServerAddrs);
+            }
 
             // ACL 鉴权钩子：必须在任何请求发出之前绑定（路由拉取、心跳都会带签名）。
             if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))

@@ -331,7 +331,21 @@ public sealed class DefaultMQPushConsumer
     private string _messageModel = RocketMQ.Remoting.Protocol.MessageModel.Clustering;
     private string _consumeFromWhere = RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromLastOffset;
 
-    private int _consumeThreadNums = 1;
+    // ---- 消费线程池（对齐 Java DefaultMQPushConsumer 的 consumeThreadMin/Max）----
+    // Java 默认 min=20 / max=64。本实现的**拉取**路径是"每队列一个拉取线程 + 单分发线程"，
+    // 只有 **POP** 路径用真正的线程池（对应 Java ConsumeMessagePopConcurrentlyService），
+    // 因此 CorePoolSize 直接决定 POP 的消费并发度（Java 无界队列下 max 实际用不到）。
+    private int _consumeThreadMin = 20;
+    private int _consumeThreadMax = 64;
+    // Java adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；上游 inc/dec 是空实现）
+    private long _adjustThreadPoolNumsThreshold = 100000;
+    // 声明式 core pool size（Java setCorePoolSize 的等价物），默认 = consumeThreadMin
+    private int _corePoolSize = 20;
+    // key -> ProcessQueue.msgAccCnt（最近一次拉取算出的积压条数）
+    private readonly Dictionary<string, long> _msgAccCntTable = new(StringComparer.Ordinal);
+    // POP 消费执行器（Start 且 PopMode 时创建；Shutdown 时释放）
+    private ConsumeExecutor? _popConsumeExecutor;
+
     private int _pullBatchSize = 32;
     private int _pullBatchSizeInBytes = 256 * 1024;
     private int _consumeMessageBatchMaxSize = 1;
@@ -423,9 +437,142 @@ public sealed class DefaultMQPushConsumer
         set => _consumeFromWhere = value;
     }
 
+    /// <summary>便捷方法：Min 与 Max 一起设（Java 4.x setConsumeThreadNums 的语义）。
+    /// Java 5.x 已拆成 SetConsumeThreadMin/Max，本方法保留是为了兼容既有调用点。</summary>
     public void SetConsumeThreadNums(int n)
     {
-        _consumeThreadNums = Math.Max(1, n);
+        int v = Math.Max(1, n);
+        _consumeThreadMin = v;
+        _consumeThreadMax = v;
+        _corePoolSize = v;
+        _popConsumeExecutor?.SetCorePoolSize(v);
+    }
+
+    // ---- 消费线程弹性（对应 Java AbstractConsumeMessageService）----
+
+    public int ConsumeThreadMin => _consumeThreadMin;
+    public int ConsumeThreadMax => _consumeThreadMax;
+    public long AdjustThreadPoolNumsThreshold => _adjustThreadPoolNumsThreshold;
+
+    public void SetConsumeThreadMin(int n)
+    {
+        _consumeThreadMin = Math.Max(1, n);
+        _corePoolSize = _consumeThreadMin;
+        _popConsumeExecutor?.SetCorePoolSize(_corePoolSize);
+    }
+
+    public void SetConsumeThreadMax(int n)
+    {
+        _consumeThreadMax = Math.Max(1, n);
+    }
+
+    public void SetAdjustThreadPoolNumsThreshold(long v) => _adjustThreadPoolNumsThreshold = v;
+
+    /// <summary>运行时调整消费并发度（对应 Java updateCorePoolSize → setCorePoolSize）。
+    /// <para>Java 的守卫逐条照抄（AbstractConsumeMessageService:63-71）：
+    /// ownsConsumeExecutor &amp;&amp; corePoolSize &gt; 0
+    /// &amp;&amp; corePoolSize &lt;= Short.MAX_VALUE(32767)
+    /// &amp;&amp; corePoolSize &lt; consumeThreadMax。任一条不满足就**静默忽略**
+    /// （Java 也是静默 return，不抛异常）。返回值只用于单测断言"是否真的生效"。</para></summary>
+    public bool UpdateCorePoolSize(int corePoolSize)
+    {
+        if (corePoolSize <= 0 || corePoolSize > 32767 || corePoolSize >= _consumeThreadMax)
+        {
+            return false;
+        }
+        _corePoolSize = corePoolSize;
+        _popConsumeExecutor?.SetCorePoolSize(_corePoolSize);
+        return true;
+    }
+
+    /// <summary>Java getCorePoolSize（本实现恒为自建执行器，故不会返回 -1）。</summary>
+    public int GetCorePoolSize() => _popConsumeExecutor?.GetCorePoolSize() ?? _corePoolSize;
+
+    /// <summary>Java DefaultMQPushConsumerImpl.computeAccumulationTotal：所有队列 msgAccCnt 之和。</summary>
+    public long ComputeAccumulationTotal()
+    {
+        lock (_lock)
+        {
+            long total = 0;
+            foreach (long v in _msgAccCntTable.Values) total += v;
+            return total;
+        }
+    }
+
+    /// <summary>单队列（不传 key 则求和）的 ProcessQueue.msgAccCnt。</summary>
+    public long MsgAccCnt(string? key = null)
+    {
+        lock (_lock)
+        {
+            if (string.IsNullOrEmpty(key))
+            {
+                long total = 0;
+                foreach (long v in _msgAccCntTable.Values) total += v;
+                return total;
+            }
+            return _msgAccCntTable.TryGetValue(key!, out long acc) ? acc : 0;
+        }
+    }
+
+    /// <summary>按 Java ProcessQueue.putMessage 的规则更新 msgAccCnt
+    /// （= 最后一条消息的 MAX_OFFSET 属性 - 它的 queueOffset，&gt; 0 才更新）。</summary>
+    public void UpdateMsgAccCnt(string key, IReadOnlyList<MessageExt> msgs)
+    {
+        lock (_lock)
+        {
+            UpdateMsgAccCntLocked(key, msgs);
+        }
+    }
+
+    private void UpdateMsgAccCntLocked(string key, IReadOnlyList<MessageExt> msgs)
+    {
+        // Java ProcessQueue.java:148-158：
+        //   long accTotal = Long.parseLong(msg.getProperty(MAX_OFFSET)) - msg.getQueueOffset();
+        //   if (accTotal > 0) this.msgAccCnt = accTotal;
+        // 取**本批最后一条**；属性缺失/非数字/非正一律不更新（Java 里 parse 失败会抛，
+        // 但 broker 恒会带上该属性，这里做容错以免脏数据打断拉取线程）。
+        if (msgs.Count == 0) return;
+        MessageExt last = msgs[msgs.Count - 1];
+        string? maxOffset = last.GetProperty(MessageConst.PropertyMaxOffset);
+        if (string.IsNullOrEmpty(maxOffset)) return;
+        if (!long.TryParse(maxOffset, NumberStyles.Integer, CultureInfo.InvariantCulture, out long parsed))
+        {
+            return;
+        }
+        long accTotal = parsed - last.QueueOffset;
+        if (accTotal > 0) _msgAccCntTable[key] = accTotal;
+    }
+
+    /// <summary>Java DefaultMQPushConsumerImpl.adjustThreadPool（每分钟调度一次）。
+    /// <para>⚠ **在 Java 5.5.1 这是 no-op，我们照抄 no-op**：它调用的
+    /// consumeMessageService.incCorePoolSize()/decCorePoolSize() 在
+    /// AbstractConsumeMessageService:70-75 是**空方法体**。这里保留阈值比较仅为让
+    /// msgAccCnt / 阈值配置可观测；**不要"修好"它** —— 真正生效的是显式的
+    /// UpdateCorePoolSize()。</para></summary>
+    public void AdjustThreadPool()
+    {
+        long accTotal = ComputeAccumulationTotal();
+        long incThreshold = (long)(_adjustThreadPoolNumsThreshold * 1.0);
+        long decThreshold = (long)(_adjustThreadPoolNumsThreshold * 0.8);
+        if (accTotal >= incThreshold)
+        {
+            ClientLog.Debug($"adjustThreadPool: acc={accTotal} >= incThreshold={incThreshold} (inc is a no-op upstream)");
+        }
+        if (accTotal < decThreshold)
+        {
+            ClientLog.Debug($"adjustThreadPool: acc={accTotal} < decThreshold={decThreshold} (dec is a no-op upstream)");
+        }
+    }
+
+    /// <summary>观测：当前 POP 消费执行器的存活线程数 / 排队任务数（未建执行器时为 0）。</summary>
+    public int ConsumeExecutorWorkers() => _popConsumeExecutor?.WorkerCount() ?? 0;
+    public int ConsumeExecutorQueued() => _popConsumeExecutor?.QueuedCount() ?? 0;
+    // 仅供单测：直接注入一个执行器，避免为了测线程弹性去起集群
+    // （测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码）
+    public ConsumeExecutor? PopConsumeExecutorForTest
+    {
+        get => _popConsumeExecutor;
+        set => _popConsumeExecutor = value;
     }
 
     public void SetMessageListener(IMessageListener listener)
@@ -584,7 +731,8 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
-            if (_nameServerAddrs.Count == 0)
+            // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+            if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
                 throw new MQClientException("name server address is not set");
             }
@@ -627,11 +775,26 @@ public sealed class DefaultMQPushConsumer
                 /*connectTimeoutMillis=*/3000,
                 /*invokeTimeoutMillis=*/_pullTimeoutMillis);
             _mqClient.Start();
+            // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
+            // （Java 由共享的 ClientConfig 天然同步）
+            if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
+            {
+                _nameServerAddrs = new List<string>(_mqClient.NameServerAddrs);
+            }
             // ACL 鉴权钩子：必须在首包（路由拉取 / 心跳 / rebalance）发出之前绑定。
             if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
             {
                 ClientLog.Warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
                     + _clientId + ")");
+            }
+
+            // POP 消费执行器必须在 rebalance（会立刻起每队列 POP 循环）之前建好，
+            // 否则循环弹出消息后无处投递（对齐 Java 在 service 构造时就建 consumeExecutor）。
+            if (PopMode)
+            {
+                _popConsumeExecutor = new ConsumeExecutor(
+                    Math.Max(1, _corePoolSize), Math.Max(1, _consumeThreadMax),
+                    /*keepAliveSeconds=*/60.0, "rmq-popconsume-" + ConsumerGroup);
             }
 
             _stop = false;
@@ -725,6 +888,11 @@ public sealed class DefaultMQPushConsumer
 
             _popQueues.Clear();
         }
+
+        // POP 消费执行器收工（对齐 Java shutdownGracefully：不再收新任务，把手上的批次跑完）。
+        // Dispose 里 Shutdown(wait=true)：工作线程捕获了 this，必须 join 完才能放。
+        _popConsumeExecutor?.Shutdown(true);
+        _popConsumeExecutor = null;
 
         // 退出前把已消费位点持久化一次（对齐 Java shutdown → persistAllConsumerOffset）
         try
@@ -1264,6 +1432,9 @@ public sealed class DefaultMQPushConsumer
 
                         dq.Enqueue(m);
                     }
+
+                    // ProcessQueue.msgAccCnt：用**过滤后入队**的那批算（Java 是先过滤再 putMessage）
+                    UpdateMsgAccCntLocked(key, result.MsgFoundList);
                 }
             }
 
@@ -1394,17 +1565,29 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>按 ConsumeMessageBatchMaxSize 切批后投给消费线程（对应 Java
     /// ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest）。
-    /// <para>POP 的语义是"弹出即投递、循环立刻继续"，不能像 pull 那样等分发线程慢慢取，
-    /// 所以每批起一个独立线程。</para></summary>
+    /// <para>投给**有界线程池**（core=ConsumeThreadMin / max=ConsumeThreadMax）。
+    /// 此前这里每批起一个裸线程（无上限），慢监听器一上来就线程爆炸，而
+    /// SetConsumeThreadNums() 设的值完全没作用。Java 用线程池 + 无界队列，
+    /// 因此真实并发度 == CorePoolSize，UpdateCorePoolSize() 在运行时能改它。</para></summary>
     private void SubmitPopConsumeRequest(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
     {
         int size = Math.Max(1, _consumeMessageBatchMaxSize);
+        ConsumeExecutor? exec = _popConsumeExecutor;
         for (int i = 0; i < msgs.Count; i += size)
         {
             List<MessageExt> batch = msgs.GetRange(i, Math.Min(size, msgs.Count - i));
             if (batch.Count == 0) continue;
-            Thread t = MakeThread("PopConsume", () => ConsumePopBatch(batch, pq, mq));
-            t.Start();
+            if (exec != null)
+            {
+                // 捕获局部变量，避免闭包共享同一个 batch 变量
+                List<MessageExt> captured = batch;
+                exec.Submit(() => ConsumePopBatch(captured, pq, mq));
+            }
+            else
+            {
+                // 未 Start（单测）时没有执行器：同步执行，保持与改动前一致的可测行为。
+                ConsumePopBatch(batch, pq, mq);
+            }
         }
     }
 
