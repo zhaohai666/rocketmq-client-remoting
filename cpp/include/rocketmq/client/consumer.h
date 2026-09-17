@@ -54,6 +54,65 @@ struct MessageSelector {
     }
 };
 
+// Java DefaultMQPushConsumerImpl.popDelayLevel（单位**秒**）。
+// 与 send 的延迟档位（首档 1s）不是同一张表，别混。
+inline const std::vector<int32_t>& popDelayLevelTable() {
+    static const std::vector<int32_t> kTable = {10, 30, 60, 120, 180, 240, 300, 360,
+                                                420, 480, 540, 600, 1200, 1800, 3600, 7200};
+    return kTable;
+}
+
+// Java DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME：超出范围一律回落到 60000
+constexpr int64_t kMinPopInvisibleTime = 5000;
+constexpr int64_t kMaxPopInvisibleTime = 300000;
+
+// Java ConsumeInitMode
+enum class ConsumeInitMode : int32_t { MIN = 0, MAX = 1 };
+
+// POP 模式的队列状态（对应 org.apache.rocketmq.client.impl.consumer.PopProcessQueue）。
+//
+// 与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
+// 消费线程，确认靠 ack。这里只跟踪两件事：
+//   - waitAckCounter：已弹出但还没 ack / 还没延长不可见时间的条数，用于流控；
+//   - dropped：队列是否已被 rebalance 撤走（撤走后本批消息不再消费、也不 ack，
+//     交给 invisibleTime 到期后 broker 自动复活重投）。
+class PopProcessQueue {
+public:
+    void incFoundMsg(int32_t n) {
+        std::lock_guard<std::mutex> lk(lock_);
+        waitAckCounter_ += n;
+    }
+    // Java 传的是负数（decFoundMsg(-msgs.size())），这里按"减多少"理解。
+    void decFoundMsg(int32_t n) {
+        std::lock_guard<std::mutex> lk(lock_);
+        waitAckCounter_ += n;
+    }
+    int32_t ack() {
+        std::lock_guard<std::mutex> lk(lock_);
+        return --waitAckCounter_;
+    }
+    int32_t waitAckCount() const {
+        std::lock_guard<std::mutex> lk(lock_);
+        return waitAckCounter_;
+    }
+    bool isDropped() const { return dropped_.load(); }
+    void setDropped(bool v) { dropped_.store(v); }
+
+private:
+    mutable std::mutex lock_;
+    int32_t waitAckCounter_ = 0;
+    std::atomic<bool> dropped_{false};
+};
+
+// 从 POP_CK 解出的 ack / 延长不可见时间目标。
+struct PopCkTarget {
+    std::string topic;        // getRealTopic 按 retryFlag 还原后的真实 topic
+    std::string brokerName;   // CK 第 6 段
+    int32_t queueId = 0;      // CK 第 7 段
+    int64_t offset = 0;       // CK 第 8 段 = consumeQueue offset
+    std::string extraInfo;    // 原样回传的 CK 串
+};
+
 class DefaultMQPushConsumer {
 public:
     explicit DefaultMQPushConsumer(
@@ -82,6 +141,33 @@ public:
     // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（Java pullThresholdForQueue，默认 1000）
     void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
     // 是否在消费循环里周期性发 HEART_BEAT（默认开启；失败仅告警不影响消费）
+    // ---- POP 模式（5.x 轻量消费）----
+    // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
+    void setPopMode(bool b) { popMode_ = b; }
+    bool popMode() const { return popMode_; }
+    // 弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）
+    void setPopInvisibleTime(int64_t t) { popInvisibleTime_ = t; }
+    int64_t popInvisibleTime() const { return popInvisibleTime_; }
+    // 单次 POP 的最大条数（Java popBatchNums 默认 32；broker 侧 >32 会回 INVALID_PARAMETER）
+    void setPopBatchNums(int32_t n) { popBatchNums_ = n; }
+    int32_t popBatchNums() const { return popBatchNums_; }
+    // 本队列"已弹未 ack"计数器上限，超过就暂停 POP（Java popThresholdForQueue 默认 96）
+    void setPopThresholdForQueue(int32_t n) { popThresholdForQueue_ = n; }
+    int32_t popThresholdForQueue() const { return popThresholdForQueue_; }
+    // POP 长轮询挂起时长。0 = 短轮询（broker 立即返回或 NO_NEW_MSG）。
+    // ⚠ 非 0 时请求超时必须 > 它，否则客户端先超时。
+    void setPopPollTimeMillis(int32_t t) { popPollTimeMillis_ = t; }
+    int32_t popPollTimeMillis() const { return popPollTimeMillis_; }
+    void setPopTimeoutMillis(int32_t t) { popTimeoutMillis_ = t; }
+    int32_t popTimeoutMillis() const { return popTimeoutMillis_; }
+
+    // 以下两个是**纯逻辑**（不发请求），做成 public 是为了离线可测——popCkTarget 是 POP
+    // 最容易错的一段（retry topic 还原），必须能单测而不是只能靠真机。
+    // 从 POP_CK 还原 ack 目标；CK 缺失或段数不足返回 nullopt（放弃 ack，交给 broker 复活）。
+    std::optional<PopCkTarget> popCkTarget(const MessageExt& msg);
+    // Java ConsumeRequest.isPopTimeout：解析不出 popTime/invisibleTime 时按超时处理
+    static bool isPopTimeout(int64_t popTime, int64_t invisible);
+
     void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
     void setHeartbeatIntervalMillis(int32_t t) { heartbeatIntervalMillis_ = t; }
 
@@ -189,6 +275,24 @@ private:
     // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）。
     void resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs);
 
+    // ---- POP 消费循环（5.x 轻量消费，对应 Java popMessage 回调 + ConsumeMessagePopConcurrentlyService）----
+    // 单队列 POP 循环。**不查、不提交消费位点**：进度由 broker 侧 checkpoint 跟踪，确认只靠 ack。
+    void queuePopLoop(const MessageQueue& mq);
+    // 按 consumeMessageBatchMaxSize 切批投递
+    void submitPopConsumeRequest(std::vector<MessageExt> msgs,
+                                 std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
+    // 消费一个批次并按结果 ack / 延长不可见时间
+    void consumePopBatch(std::vector<MessageExt> msgs,
+                         std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
+    void processPopConsumeResult(ConsumeConcurrentlyStatus status,
+                                 const ConsumeConcurrentlyContext& ctx,
+                                 std::vector<MessageExt>& msgs,
+                                 const std::shared_ptr<PopProcessQueue>& pq);
+    // 重试次数用尽后的兜底（Java checkNeedAckOrDelay）
+    void checkNeedAckOrDelay(const MessageExt& msg);
+    void ackPopMsg(const MessageExt& msg);
+    void changePopInvisibleTime(const MessageExt& msg, int32_t delayLevel);
+
     std::string consumerGroup_;
     std::string namespace_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
@@ -208,6 +312,18 @@ private:
     int32_t maxReconsumeTimes_ = -1;
     int32_t pullIntervalMillis_ = 0;
     int32_t pullThresholdForQueue_ = 1000;
+
+    // ---- POP 模式（5.x 轻量消费）----
+    bool popMode_ = false;
+    int64_t popInvisibleTime_ = 60000;
+    int32_t popBatchNums_ = 32;
+    int32_t popThresholdForQueue_ = 96;
+    int32_t popPollTimeMillis_ = 15000;
+    int32_t popTimeoutMillis_ = 25000;
+    std::vector<int32_t> popDelayLevel_ = popDelayLevelTable();
+    // 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
+    std::map<std::string, std::shared_ptr<PopProcessQueue>> popQueues_;
+
     bool heartbeatEnabled_ = true;
     int32_t heartbeatIntervalMillis_ = 30000;
 

@@ -18,6 +18,7 @@
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "rocketmq/remoting/protocol/extra_info.h"
 #include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/json.h"
 
@@ -237,6 +238,14 @@ void DefaultMQPushConsumer::shutdown() {
     }
     stop_.store(true);
     cv_.notify_all();
+    // POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）
+    if (popMode_) {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (auto& kv : popQueues_) {
+            kv.second->setDropped(true);
+        }
+        popQueues_.clear();
+    }
     // 退出前把已消费位点持久化一次（对齐 Java shutdown → persistAllConsumerOffset）
     try {
         persistOffsetsOnce();
@@ -308,6 +317,9 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
         // 1. 新分配的队列：起拉取线程
         for (const auto& kv : current) {
             if (pullThreads_.find(kv.first) == pullThreads_.end()) {
+                if (popMode_ && popQueues_.find(kv.first) == popQueues_.end()) {
+                    popQueues_[kv.first] = std::make_shared<PopProcessQueue>();
+                }
                 toStart.emplace_back(kv.first, kv.second);
             }
         }
@@ -328,6 +340,12 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
                 lockOk_.erase(it->first);
                 offsetTable_.erase(it->first);
                 consumeOffsetTable_.erase(it->first);
+                // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+                auto pqit = popQueues_.find(it->first);
+                if (pqit != popQueues_.end()) {
+                    pqit->second->setDropped(true);
+                    popQueues_.erase(pqit);
+                }
                 it = pullThreads_.erase(it);
             } else {
                 ++it;
@@ -336,9 +354,15 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
     }
     for (const auto& kv : toStart) {
         // 捕获 kv.second（拷贝），线程内再通过成员访问共享状态
-        std::thread t([this, mq = kv.second]() {
-            setThreadName("PullMessageService");
-            queuePullLoop(mq);
+        std::thread t([this, mq = kv.second, key = kv.first]() {
+            if (popMode_) {
+                setThreadName("PopMessageService");
+                queuePopLoop(mq);
+            } else {
+                setThreadName("PullMessageService");
+                queuePullLoop(mq);
+            }
+            (void)key;
         });
         std::lock_guard<std::mutex> lk(lock_);
         // 竞态保护：rebalance 可能把同 key 再起一次
@@ -510,6 +534,273 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
             std::lock_guard<std::mutex> lk(lock_);
             offsetTable_[key] = result.nextBeginOffset;
         }
+    }
+}
+
+// ---------------------------------------------------------------- POP 消费循环
+void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq) {
+    // 与 pull 循环的关键差别：
+    //   - **不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；
+    //   - 弹出即投递给消费线程，本轮循环立刻继续（不等消费结果）；
+    //   - POLLING_NOT_FOUND（队列暂时没消息）是**正常态**，直接下一轮，不算错误。
+    const std::string key = offsetKey(mq);
+    int64_t invisible = popInvisibleTime_;
+    if (invisible < kMinPopInvisibleTime || invisible > kMaxPopInvisibleTime) {
+        // Java 的钳制：超出 [5s, 300s] 一律回落到 60s
+        invisible = 60000;
+    }
+    // Java PopRequest 默认 ConsumeInitMode.MAX；这里按 consumeFromWhere 映射，
+    // 让"从头消费"的语义在 POP 模式下也成立。
+    const int32_t initMode =
+        consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET
+            ? static_cast<int32_t>(ConsumeInitMode::MIN)
+            : static_cast<int32_t>(ConsumeInitMode::MAX);
+
+    while (!stop_.load() && started_.load()) {
+        if (!ownsQueue(key)) return;
+        std::shared_ptr<PopProcessQueue> pq;
+        {
+            std::lock_guard<std::mutex> lk(lock_);
+            auto it = popQueues_.find(key);
+            if (it == popQueues_.end()) return;
+            pq = it->second;
+        }
+        if (pq->isDropped()) return;
+        SubscriptionData sub;
+        {
+            std::lock_guard<std::mutex> lk(lock_);
+            auto it = subscriptionData_.find(mq.topic);
+            if (it == subscriptionData_.end()) return;
+            sub = it->second;
+        }
+        // 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）
+        if (pq->waitAckCount() > popThresholdForQueue_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        const int64_t began = UtilAll::currentTimeMillis();
+        PopResult result;
+        try {
+            result = client().popMessage(consumerGroup_, mq.topic, mq.queueId, popBatchNums_,
+                                         invisible, popPollTimeMillis_, initMode,
+                                         sub.subString.empty() ? "*" : sub.subString,
+                                         sub.expressionType, false, popTimeoutMillis_, mq.brokerName);
+        } catch (const RemotingTimeoutException& e) {
+            // 长轮询挂起期间没有消息 → 客户端先超时，属正常行为，直接下一轮
+            logger_debug("pop long-poll timeout for " + key + " (benign): " + e.what());
+            continue;
+        } catch (const std::exception& e) {
+            logger_debug(std::string("pop error for ") + key + ": " + e.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        // 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
+        // （Java 对应 PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
+        // broker 自动复活重投给新属主。
+        if (!ownsQueue(key) || pq->isDropped()) {
+            logger_debug("queue " + key + " revoked during pop, discard "
+                         + std::to_string(result.msgFoundList.size()) + " messages un-acked");
+            return;
+        }
+        if (result.status == PopStatus::FOUND && !result.msgFoundList.empty()) {
+            pq->incFoundMsg(static_cast<int32_t>(result.msgFoundList.size()));
+            submitPopConsumeRequest(result.msgFoundList, pq, mq);
+        } else if (UtilAll::currentTimeMillis() - began < 200) {
+            // 空结果：若 broker 没按 pollTime 挂起（立即返回）就会变成热循环，
+            // 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        // NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL 都直接进下一轮
+    }
+}
+
+void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs,
+                                                    std::shared_ptr<PopProcessQueue> pq,
+                                                    const MessageQueue& mq) {
+    // 对应 Java ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest。
+    // 每个批次起一个独立线程：POP 的语义是"弹出即投递、循环立刻继续"，
+    // 不能像 pull 那样等分发线程慢慢取。
+    const size_t size = static_cast<size_t>(std::max(1, consumeMessageBatchMaxSize_));
+    for (size_t i = 0; i < msgs.size(); i += size) {
+        std::vector<MessageExt> batch(msgs.begin() + static_cast<long>(i),
+                                      msgs.begin() + static_cast<long>(std::min(i + size, msgs.size())));
+        if (batch.empty()) continue;
+        std::thread t([this, batch = std::move(batch), pq, mq]() mutable {
+            setThreadName("PopConsume");
+            consumePopBatch(std::move(batch), pq, mq);
+        });
+        t.detach();
+    }
+}
+
+void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
+                                            std::shared_ptr<PopProcessQueue> pq,
+                                            const MessageQueue& mq) {
+    // 对应 Java ConsumeMessagePopConcurrentlyService$ConsumeRequest.run。
+    if (pq->isDropped() || msgs.empty()) return;
+
+    int64_t popTime = 0;
+    int64_t invisible = 0;
+    try {
+        auto it = msgs[0].properties.find(MessageConst::PROPERTY_POP_CK);
+        if (it != msgs[0].properties.end()) {
+            std::vector<std::string> seg = extra_info::split(it->second);
+            popTime = extra_info::getPopTime(seg);
+            invisible = extra_info::getInvisibleTime(seg);
+        }
+    } catch (const std::exception& e) {
+        logger_debug(std::string("parse pop ck failed: ") + e.what());
+    }
+    if (isPopTimeout(popTime, invisible)) {
+        // 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+        pq->decFoundMsg(-static_cast<int32_t>(msgs.size()));
+        return;
+    }
+
+    resetRetryTopicAndNamespace(msgs);
+    ConsumeConcurrentlyContext ctx(mq);
+    // ⚠ 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE：
+    // 默认就是"全部 ack"。本项目的默认值是 -1（push 回投路径的语义），若不在 POP 这里
+    // 改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，消息在 invisibleTime 到期后被
+    // broker 复活重投 —— 短观测窗口下会伪装成通过。
+    ctx.ackIndex = static_cast<int32_t>(msgs.size()) - 1;
+    ConsumeConcurrentlyStatus status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
+    try {
+        auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
+        status = conc->consumeMessage(msgs, ctx);
+    } catch (const std::exception& e) {
+        // Java：消费抛异常按 RECONSUME_LATER 处理
+        logger_debug(std::string("pop listener error, treat as RECONSUME_LATER: ") + e.what());
+    }
+    if (pq->isDropped() || isPopTimeout(popTime, invisible)) {
+        // 消费期间队列被撤走或已超时：结果不再处理
+        pq->decFoundMsg(-static_cast<int32_t>(msgs.size()));
+        return;
+    }
+    processPopConsumeResult(status, ctx, msgs, pq);
+}
+
+bool DefaultMQPushConsumer::isPopTimeout(int64_t popTime, int64_t invisible) {
+    // Java ConsumeRequest.isPopTimeout：不能解析出 popTime/invisibleTime 时按超时处理
+    if (popTime <= 0 || invisible <= 0) return true;
+    return UtilAll::currentTimeMillis() - popTime >= invisible;
+}
+
+void DefaultMQPushConsumer::processPopConsumeResult(
+    ConsumeConcurrentlyStatus status, const ConsumeConcurrentlyContext& ctx,
+    std::vector<MessageExt>& msgs, const std::shared_ptr<PopProcessQueue>& pq) {
+    // 对应 Java ConsumeMessagePopConcurrentlyService.processConsumeResult。
+    int32_t ackIndex = ctx.ackIndex;
+    if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
+        if (ackIndex >= static_cast<int32_t>(msgs.size())) {
+            ackIndex = static_cast<int32_t>(msgs.size()) - 1;
+        }
+    } else {
+        ackIndex = -1;  // RECONSUME_LATER：一条都不 ack
+    }
+    for (int32_t i = 0; i <= ackIndex; i++) {
+        ackPopMsg(msgs[static_cast<size_t>(i)]);
+        pq->ack();
+    }
+    for (int32_t i = ackIndex + 1; i < static_cast<int32_t>(msgs.size()); i++) {
+        pq->ack();
+        const MessageExt& msg = msgs[static_cast<size_t>(i)];
+        // 超过最大重试次数：Java 走 checkNeedAckOrDelay（太老就直接 ack 丢弃，
+        // 否则按消息已存活时间选一个延迟档位）
+        if (maxReconsumeTimes_ >= 0 && msg.reconsumeTimes >= maxReconsumeTimes_) {
+            checkNeedAckOrDelay(msg);
+            continue;
+        }
+        changePopInvisibleTime(msg, ctx.delayLevelWhenNextConsume);
+    }
+}
+
+void DefaultMQPushConsumer::checkNeedAckOrDelay(const MessageExt& msg) {
+    // Java checkNeedAckOrDelay：重试次数用尽后的兜底。
+    // 消息存活时间已经超过最大延迟档位的 2 倍 → 直接 ack 丢弃（不再无限重试）；
+    // 否则按存活时间选一个档位继续延长不可见时间。
+    const std::vector<int32_t>& table = popDelayLevel_;
+    const int64_t msgDelayTime = UtilAll::currentTimeMillis() - msg.bornTimestamp;
+    if (msgDelayTime > static_cast<int64_t>(table.back()) * 1000 * 2) {
+        logger_warn("pop consume too many times, ack and drop: " + msg.msgId);
+        ackPopMsg(msg);
+        return;
+    }
+    int32_t level = static_cast<int32_t>(table.size()) - 1;
+    for (; level >= 0; level--) {
+        if (msgDelayTime >= static_cast<int64_t>(table[static_cast<size_t>(level)]) * 1000) {
+            level++;
+            break;
+        }
+    }
+    // ⚠ 有意偏离 Java：存活时间小于首档时 Java 会算出 level=-1 并索引
+    // delayLevelTable[-1] 抛 ArrayIndexOutOfBounds。这里钳到首档。
+    changePopInvisibleTime(msg, level);
+}
+
+std::optional<PopCkTarget> DefaultMQPushConsumer::popCkTarget(const MessageExt& msg) {
+    // ⚠ 两处都不能想当然：
+    //   1. topic 要用 ExtraInfoUtil.getRealTopic 按 CK 的 retryFlag 还原 —— 复活消息
+    //      （retryFlag=1）的真实 topic 是 %RETRY%<group>_<topic>，**不是**消息上的 topic；
+    //   2. 地址要按 CK 里的 brokerName 反查，不能按 topic 查路由 —— retry topic 通常没有
+    //      独立路由表项，按 topic 查会失败（Java 同理走 findBrokerAddressInSubscribe）。
+    auto pit = msg.properties.find(MessageConst::PROPERTY_POP_CK);
+    if (pit == msg.properties.end() || pit->second.empty()) {
+        logger_debug("pop message without POP_CK, cannot ack: " + msg.msgId);
+        return std::nullopt;
+    }
+    PopCkTarget out;
+    out.extraInfo = pit->second;
+    try {
+        std::vector<std::string> seg = extra_info::split(out.extraInfo);
+        out.brokerName = extra_info::getBrokerName(seg);
+        out.queueId = extra_info::getQueueId(seg);
+        out.offset = extra_info::getQueueOffset(seg);
+        std::string retry = extra_info::getRetry(seg);
+        out.topic = extra_info::getRealTopic(msg.topic, consumerGroup_, retry);
+    } catch (const std::exception& e) {
+        logger_debug("bad POP_CK " + out.extraInfo + ": " + e.what());
+        return std::nullopt;
+    }
+    return out;
+}
+
+void DefaultMQPushConsumer::ackPopMsg(const MessageExt& msg) {
+    // 对应 Java DefaultMQPushConsumerImpl.ackAsync
+    auto target = popCkTarget(msg);
+    if (!target) return;
+    try {
+        client().ackMessage(consumerGroup_, target->topic, target->queueId, target->extraInfo,
+                            target->offset, 3000, target->brokerName);
+    } catch (const std::exception& e) {
+        // ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
+        logger_debug(std::string("ack failed for ") + msg.msgId + ": " + e.what());
+    }
+}
+
+void DefaultMQPushConsumer::changePopInvisibleTime(const MessageExt& msg, int32_t delayLevel) {
+    // 对应 Java changePopInvisibleTime。
+    // delayLevel == 0 时 Java 用消息已重试次数当档位；档位表是**秒**，接口要毫秒。
+    auto target = popCkTarget(msg);
+    if (!target) return;
+    if (delayLevel == 0) {
+        delayLevel = msg.reconsumeTimes;
+    }
+    const std::vector<int32_t>& table = popDelayLevel_;
+    int32_t delaySecond = 0;
+    if (delayLevel >= static_cast<int32_t>(table.size())) {
+        delaySecond = table.back();
+    } else {
+        delaySecond = table[static_cast<size_t>(std::max(0, delayLevel))];
+    }
+    try {
+        client().changeInvisibleTime(consumerGroup_, target->topic, target->queueId,
+                                     target->extraInfo, target->offset,
+                                     static_cast<int64_t>(delaySecond) * 1000, 3000,
+                                     target->brokerName);
+    } catch (const std::exception& e) {
+        logger_debug(std::string("change invisible time failed for ") + msg.msgId + ": "
+                     + e.what());
     }
 }
 

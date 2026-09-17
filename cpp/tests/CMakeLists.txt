@@ -52,6 +52,11 @@ add_executable(rmq_test_pop test_pop.cpp)
 target_link_libraries(rmq_test_pop PRIVATE rocketmq::remoting)
 add_test(NAME pop COMMAND rmq_test_pop)
 
+# POP **消费侧**（pop_mode 消费循环）本地单测
+add_executable(rmq_test_pop_consumer test_pop_consumer.cpp)
+target_link_libraries(rmq_test_pop_consumer PRIVATE rocketmq::remoting)
+add_test(NAME pop_consumer COMMAND rmq_test_pop_consumer)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")
