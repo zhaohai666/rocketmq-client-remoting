@@ -84,8 +84,13 @@ public:
 
 // org.apache.rocketmq.common.filter.FilterAPI
 struct FilterAPI {
-    // subString 为空 / "*" / 全空白 => tagsSet = {"*"}；否则按 "||" 切分并 trim，
-    // 空片段丢弃（与 Java FilterAPI.buildSubscriptionData 一致）。
+    // 对齐 Java FilterAPI.buildSubscriptionData（探针实测向量）：
+    //   null / "" / "*"   → subString 归一为 "*"，**tagsSet 与 codeSet 都保持空**
+    //   "TagA"            → tagsSet={TagA}, codeSet={2598919}
+    //   "TagA||TagB"      → tagsSet={TagA,TagB}, codeSet={2598919,2598920}
+    //   " TagA || TagB "  → subString 原样保留空格，标签各自 trim
+    //   "   "（纯空白）    → tagsSet 空、subString 原样保留（isEmpty 只认 null/""）
+    //   "||" / "||||"     → 抛 std::invalid_argument("subString split error")
     static SubscriptionData buildSubscriptionData(const std::string& topic,
                                                   const std::string& subString);
 };

@@ -49,3 +49,7 @@ target_link_libraries(rmq_live_pop_consumer PRIVATE rocketmq::remoting)
 add_executable(rmq_live_trace live_trace.cpp)
 target_link_libraries(rmq_live_trace PRIVATE rocketmq::remoting)
 
+# 钩子真机联调：CheckForbiddenHook 拦截 + FilterMessageHook 拉取/POP 两条路径（不打进 ctest）
+add_executable(rmq_live_hook live_hook.cpp)
+target_link_libraries(rmq_live_hook PRIVATE rocketmq::remoting)
+

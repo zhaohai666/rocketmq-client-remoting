@@ -315,11 +315,37 @@ void DefaultMQProducer::executeSendMessageHookAfter(SendMessageContext& context)
     }
 }
 
+void DefaultMQProducer::executeCheckForbiddenHook(CheckForbiddenContext& context) {
+    // ⚠ 与 send/consume 钩子**相反**：这里不吞异常（Java 签名就是 throws MQClientException）。
+    // 异常会沿 sendDefaultImpl 的重试链向上传播 —— 这正是"禁止发送"的实现方式。
+    for (auto& hook : checkForbiddenHookList_) {
+        hook->checkForbidden(context);
+    }
+}
+
+void DefaultMQProducer::runCheckForbidden(const Message& msg, const MessageQueue& mq,
+                                          const std::string& brokerAddr, const std::string* arg,
+                                          CommunicationMode mode) {
+    if (checkForbiddenHookList_.empty()) return;
+    CheckForbiddenContext context;
+    context.nameSrvAddr = nameServerAddrs_.empty() ? "" : nameServerAddrs_.front();
+    context.group = producerGroup_;
+    context.message = &msg;
+    context.mq = mq;
+    context.brokerAddr = brokerAddr;
+    context.communicationMode = mode;
+    context.arg = arg;
+    // 本项目无 unit mode（Java isUnitMode() 恒为 false）
+    context.unitMode = false;
+    executeCheckForbiddenHook(context);
+}
+
 SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Message& msg,
                                             const MessageQueue& mq, int32_t timeout,
-                                            int32_t sysFlag) {
-    // 没有任何钩子时零开销透传
-    if (sendMessageHookList_.empty()) {
+                                            int32_t sysFlag, const std::string* arg,
+                                            CommunicationMode mode) {
+    // 没有任何拦截/钩子时零开销透传
+    if (!hasSendInterceptors()) {
         return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
     }
     std::string brokerAddr;
@@ -327,6 +353,13 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
         brokerAddr = client.brokerAddrOf(mq.brokerName);
     } catch (...) {
         brokerAddr.clear();
+    }
+    // 顺序严格照抄 Java sendKernelImpl:956-990：
+    //   1. CheckForbiddenHook（每次尝试都跑；异常不吞）  2. SendMessageHook.before
+    //   3. 发请求  4. SendMessageHook.after
+    runCheckForbidden(msg, mq, brokerAddr, arg, mode);
+    if (sendMessageHookList_.empty()) {
+        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
     }
     SendMessageContext context = buildSendMessageContext(msg, mq, brokerAddr);
     executeSendMessageHookBefore(context);
@@ -463,7 +496,8 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     MessageQueue selected = selector.select(publish->msgQueueList, outbound, arg);
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
     const int32_t sysFlag = prepareForSend(outbound);
-    return sendWithHooks(c, outbound, selected, timeout, sysFlag);
+    // arg 透传给 CheckForbiddenHook（Java CheckForbiddenContext.arg 就是它）
+    return sendWithHooks(c, outbound, selected, timeout, sysFlag, &arg, CommunicationMode::SYNC);
 }
 
 // ---------------------------------------------------------------- 异步 / 单向
@@ -496,6 +530,14 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
         c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
     const int32_t sysFlag = prepareForSend(outbound);
+    // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效
+    std::string brokerAddr;
+    try {
+        brokerAddr = c.brokerAddrOf(selected.brokerName);
+    } catch (...) {
+        brokerAddr.clear();
+    }
+    runCheckForbidden(outbound, selected, brokerAddr, nullptr, CommunicationMode::ONEWAY);
     c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
 }
 

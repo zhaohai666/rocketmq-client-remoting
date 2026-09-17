@@ -538,9 +538,18 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
             return;
         }
         if (result.status == PullStatus::FOUND && !result.msgFoundList.empty()) {
+            // 投递前的客户端侧过滤（对齐 Java PullAPIWrapper.processPullResult:113-128）：
+            // 先二次 tag 过滤，再跑 FilterMessageHook。**必须在拿 lock_ 之前做** ——
+            // 钩子是用户代码，可能阻塞，不能压在入队的临界区里。
+            // 拉取路径被摘掉的消息**不 ack**（Java 亦然）：位点照常推进 = 静默跳过。
+            std::vector<MessageExt> deliverable = filterMessagesForDelivery(mq, &sub, result.msgFoundList);
+            if (deliverable.size() != result.msgFoundList.size()) {
+                filteredMessageCount_ +=
+                    static_cast<int64_t>(result.msgFoundList.size() - deliverable.size());
+            }
             std::lock_guard<std::mutex> lk(lock_);
             std::deque<MessageExt>& dq = pending_[key];
-            for (const MessageExt& m : result.msgFoundList) {
+            for (const MessageExt& m : deliverable) {
                 dq.push_back(m);
             }
         }
@@ -619,7 +628,20 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq) {
         }
         if (result.status == PopStatus::FOUND && !result.msgFoundList.empty()) {
             pq->incFoundMsg(static_cast<int32_t>(result.msgFoundList.size()));
-            submitPopConsumeRequest(result.msgFoundList, pq, mq);
+            // 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
+            // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
+            std::vector<MessageExt> kept = filterMessagesForDelivery(mq, &sub, result.msgFoundList);
+            if (kept.size() != result.msgFoundList.size()) {
+                std::vector<MessageExt> dropped = droppedMessages(result.msgFoundList, kept);
+                filteredMessageCount_ += static_cast<int64_t>(dropped.size());
+                for (const MessageExt& msg : dropped) {
+                    ackPopMsg(msg);
+                    pq->ack();
+                }
+                logger_info("pop filter dropped " + std::to_string(dropped.size()) + " of "
+                            + std::to_string(result.msgFoundList.size()) + " messages (acked)");
+            }
+            if (!kept.empty()) submitPopConsumeRequest(kept, pq, mq);
         } else if (UtilAll::currentTimeMillis() - began < 200) {
             // 空结果：若 broker 没按 pollTime 挂起（立即返回）就会变成热循环，
             // 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
@@ -929,6 +951,76 @@ void DefaultMQPushConsumer::executeConsumeHookAfter(ConsumeMessageContext& conte
             logger_warn("consumeMessageHook executeHookAfter exception: unknown");
         }
     }
+}
+
+void DefaultMQPushConsumer::executeFilterMessageHook(FilterMessageContext& context) {
+    // 钩子异常一律吞掉并记 error（Java PullAPIWrapper.executeHook:171-178 / processPopResult:646-653）。
+    // 与 CheckForbiddenHook 相反：过滤钩子挂了不能影响消费。
+    for (auto& hook : filterMessageHookList_) {
+        try {
+            hook->filterMessage(context);
+        } catch (const std::exception& e) {
+            logger_error("execute hook error. hookName=" + hook->hookName() + ": " + e.what());
+        } catch (...) {
+            logger_error("execute hook error. hookName=" + hook->hookName() + ": unknown");
+        }
+    }
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::filterMessagesForDelivery(
+    const MessageQueue& mq, const SubscriptionData* sub, const std::vector<MessageExt>& msgs) {
+    // 投递前过滤：① 客户端二次 tag 过滤 ② FilterMessageHook（拉取 / POP 两条路径共用）。
+    //
+    // ① 对齐 Java PullAPIWrapper.processPullResult:113-122 与 processPopResult:625-635：
+    //    broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放，客户端要再按
+    //    字符串核一遍。守卫 `!tagsSet.isEmpty()` 意味着订阅 "*"（SUB_ALL）时不过滤 ——
+    //    所以 FilterAPI.buildSubscriptionData 对 SUB_ALL 必须留空。
+    //
+    // ② 钩子拿到的是**可变的** msgList，被摘掉的消息由调用方决定怎么处置：
+    //    拉取路径 = 静默跳过（位点照常推进，不 ack）；POP 路径 = 立刻 ack。
+    std::vector<MessageExt> out = msgs;
+    if (out.empty()) return out;
+    if (sub != nullptr && !sub->tagsSet.empty() && !sub->classFilterMode) {
+        std::vector<MessageExt> kept;
+        kept.reserve(out.size());
+        for (const MessageExt& m : out) {
+            std::string tags = m.getTags();
+            if (!tags.empty() && sub->tagsSet.count(tags) > 0) kept.push_back(m);
+        }
+        out.swap(kept);
+    }
+    if (!filterMessageHookList_.empty() && !out.empty()) {
+        FilterMessageContext context;
+        context.consumerGroup = consumerGroup_;
+        context.msgList = out;
+        context.mq = mq;
+        context.unitMode = false;  // 本项目无 unit mode
+        executeFilterMessageHook(context);
+        out = context.msgList;
+    }
+    return out;
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::droppedMessages(
+    const std::vector<MessageExt>& original, const std::vector<MessageExt>& kept) {
+    // Java 用的是 List.contains(Object)（Object.equals = 引用同一性），拿到的 msgListFilterAgain
+    // 与原 msgFoundList 共享元素引用，所以差集是精确的。C++ 里 vector 拷贝后没有同一性可用，
+    // 改用 **msgId** 求差 —— 同一批 POP 结果的 msgId 必不相同（msgId 由 storeHost+commitLogOffset
+    // 生成），语义等价且不会被"值相等"误判。
+    if (kept.size() >= original.size()) return {};
+    std::vector<std::string> keptIds;
+    keptIds.reserve(kept.size());
+    for (const MessageExt& m : kept) keptIds.push_back(m.msgId);
+    std::vector<MessageExt> dropped;
+    dropped.reserve(original.size() - kept.size());
+    for (const MessageExt& m : original) {
+        bool found = false;
+        for (const std::string& id : keptIds) {
+            if (id == m.msgId) { found = true; break; }
+        }
+        if (!found) dropped.push_back(m);
+    }
+    return dropped;
 }
 
 const char* DefaultMQPushConsumer::consumeReturnTypeOf(bool hasException, int64_t consumeRtMs,

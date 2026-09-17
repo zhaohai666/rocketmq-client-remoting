@@ -146,28 +146,53 @@ std::string SubscriptionData::toString() const {
 SubscriptionData FilterAPI::buildSubscriptionData(const std::string& topic,
                                                   const std::string& subString) {
     SubscriptionData sub(topic, subString);
-    // Java: null / "*" / 全空白 -> tagsSet = {"*"}
-    if (UtilAll::isBlank(subString) || subString == "*") {
-        sub.tagsSet.insert("*");
-    } else {
-        // 按 "||" 切分，trim 后丢弃空片段
-        size_t pos = 0;
-        while (pos <= subString.size()) {
-            size_t next = subString.find("||", pos);
-            std::string tag = (next == std::string::npos)
-                                  ? subString.substr(pos)
-                                  : subString.substr(pos, next - pos);
-            // trim
-            size_t b = tag.find_first_not_of(" \t\r\n");
-            size_t e = tag.find_last_not_of(" \t\r\n");
-            tag = (b == std::string::npos) ? std::string() : tag.substr(b, e - b + 1);
-            if (!tag.empty()) {
-                sub.tagsSet.insert(tag);
-            }
-            if (next == std::string::npos) {
-                break;
-            }
-            pos = next + 2;
+    // Java `FilterAPI.buildSubscriptionData` 逐句对齐（探针 /tmp/subprobe/SubProbe.java 与
+    // BlankProbe.java 实测过四种输入）：
+    //
+    //   StringUtils.isEmpty(subString) || subString.equals("*")  → setSubString("*") 后**直接 return**
+    //       ⇒ tagsSet 与 codeSet 都保持空
+    //   否则按 "||" 做 Java String.split（**丢弃末尾空串**），然后 trim、丢空片段，
+    //       每个 tag 同时进 tagsSet 与 codeSet（codeSet 存 tag.hashCode()）。
+    //       Java-split 结果数组长度为 0 时（即 subString 形如 "||"、"||||"）抛 Exception。
+    //
+    // ⚠ 两处曾有的偏差（都会污染心跳、并让客户端二次 tag 过滤失效）：
+    //   ① 给 "*" 塞 tagsSet={"*"} —— Java 里 tagsSet 非空才是"客户端二次 tag 过滤"的开关
+    //      （PullAPIWrapper.processPullResult 的 `!tagsSet.isEmpty()`），塞了 "*" 会让订阅
+    //      全量时把所有正常 tag 的消息客户端自己过滤掉；
+    //   ② 从不填 codeSet —— 它是 broker 侧按 tag 哈希过滤的依据
+    //      （ExpressionMessageFilter.isMatchedByConsumeQueue 走 codeSet.contains）。
+    // 另注：判空必须用"空串"而不是"全空白"—— Java StringUtils.isEmpty 只认 null/""，
+    // 纯空白（如 "   "）会走进 split 分支，结果 tagsSet 空但 subString 原样保留。
+    if (subString.empty() || subString == "*") {
+        sub.subString = "*";
+        return sub;
+    }
+    // Java String.split("\\|\\|")：先全切，再丢弃**末尾**空串
+    std::vector<std::string> rawTags;
+    size_t pos = 0;
+    while (true) {
+        size_t next = subString.find("||", pos);
+        if (next == std::string::npos) {
+            rawTags.push_back(subString.substr(pos));
+            break;
+        }
+        rawTags.push_back(subString.substr(pos, next - pos));
+        pos = next + 2;
+    }
+    while (!rawTags.empty() && rawTags.back().empty()) {
+        rawTags.pop_back();
+    }
+    if (rawTags.empty()) {
+        // Java: throw new Exception("subString split error")
+        throw std::invalid_argument("subString split error");
+    }
+    for (std::string& tag : rawTags) {
+        size_t b = tag.find_first_not_of(" \t\r\n");
+        size_t e = tag.find_last_not_of(" \t\r\n");
+        tag = (b == std::string::npos) ? std::string() : tag.substr(b, e - b + 1);
+        if (!tag.empty()) {
+            sub.tagsSet.insert(tag);
+            sub.codeSet.insert(static_cast<int64_t>(javaStringHash(tag)));
         }
     }
     return sub;

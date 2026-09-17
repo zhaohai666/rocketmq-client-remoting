@@ -6,5 +6,7 @@ namespace rocketmq {
 SendMessageHook::~SendMessageHook() = default;
 ConsumeMessageHook::~ConsumeMessageHook() = default;
 EndTransactionHook::~EndTransactionHook() = default;
+CheckForbiddenHook::~CheckForbiddenHook() = default;
+FilterMessageHook::~FilterMessageHook() = default;
 
 }  // namespace rocketmq

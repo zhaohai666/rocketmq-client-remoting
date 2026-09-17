@@ -106,6 +106,22 @@ public:
     }
     bool hasSendMessageHook() const { return !sendMessageHookList_.empty(); }
     size_t sendMessageHookCount() const { return sendMessageHookList_.size(); }
+
+    // 发送前拦截钩子（对应 Java registerCheckForbiddenHook / hasCheckForbiddenHook）。
+    // ⚠ 它的异常**不被吞掉**，会沿发送重试链向上传播 —— 见 executeCheckForbiddenHook。
+    void registerCheckForbiddenHook(std::shared_ptr<CheckForbiddenHook> hook) {
+        if (hook) checkForbiddenHookList_.push_back(std::move(hook));
+    }
+    bool hasCheckForbiddenHook() const { return !checkForbiddenHookList_.empty(); }
+    size_t checkForbiddenHookCount() const { return checkForbiddenHookList_.size(); }
+    // 不需要走「带拦截/钩子」发送内核时返回 false（零开销快路径）
+    bool hasSendInterceptors() const {
+        return !sendMessageHookList_.empty() || !checkForbiddenHookList_.empty();
+    }
+    // 供单测/联调直接驱动钩子执行（不经过网络）。
+    // ⚠ 与 send/consume 钩子**相反**：这里**不吞异常** —— 钩子抛出的异常会原样传播出去，
+    // 这正是"禁止发送"的实现方式（Java executeCheckForbiddenHook 的语义）。
+    void executeCheckForbiddenHook(CheckForbiddenContext& context);
     // 轨迹分发器（未开轨迹时为空），供联调脚本读取丢弃计数等状态
     std::shared_ptr<AsyncTraceDispatcher> traceDispatcher() const { return traceDispatcher_; }
 
@@ -195,9 +211,15 @@ protected:
     // 无钩子时直接透传，零开销。msgType 判定与 Java 一致：
     // TRAN_MSG=true -> Trans_Msg_Half；带 DELAY 属性 -> Delay_Msg；否则 Normal_Msg。
     SendResult sendWithHooks(MQClientInstance& client, const Message& msg,
-                             const MessageQueue& mq, int32_t timeout, int32_t sysFlag);
+                             const MessageQueue& mq, int32_t timeout, int32_t sysFlag,
+                             const std::string* arg = nullptr,
+                             CommunicationMode mode = CommunicationMode::SYNC);
     void executeSendMessageHookBefore(SendMessageContext& context);
     void executeSendMessageHookAfter(SendMessageContext& context);
+    // 构造 CheckForbiddenContext 并执行（每次发送尝试都会调一次，含重试）
+    void runCheckForbidden(const Message& msg, const MessageQueue& mq,
+                           const std::string& brokerAddr, const std::string* arg,
+                           CommunicationMode mode);
     // 事务收尾轨迹（对应 Java endTransaction 里的 EndTransactionTraceHook）
     void executeEndTransactionHook(const Message& msg, const std::string& brokerAddr,
                                    const std::string& msgId, const std::string& transactionId,
@@ -269,6 +291,7 @@ protected:
     int32_t traceMsgBatchNum_ = 10;
     std::vector<std::shared_ptr<SendMessageHook>> sendMessageHookList_;
     std::vector<std::shared_ptr<EndTransactionHook>> endTransactionHookList_;
+    std::vector<std::shared_ptr<CheckForbiddenHook>> checkForbiddenHookList_;
     std::shared_ptr<AsyncTraceDispatcher> traceDispatcher_;
     bool started_ = false;
     std::mutex lock_;

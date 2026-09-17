@@ -62,6 +62,12 @@ add_executable(rmq_test_trace test_trace.cpp)
 target_link_libraries(rmq_test_trace PRIVATE rocketmq::remoting)
 add_test(NAME trace COMMAND rmq_test_trace)
 
+# 钩子：CheckForbiddenHook（不吞异常）与 FilterMessageHook（异常吞掉 + 拉取/POP 差异）
+# 以及订阅语义 tagsSet/codeSet 的 Java 对拍向量
+add_executable(rmq_test_hook test_hook.cpp)
+target_link_libraries(rmq_test_hook PRIVATE rocketmq::remoting)
+add_test(NAME hook COMMAND rmq_test_hook)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

@@ -207,6 +207,34 @@ public:
     }
     bool hasConsumeMessageHook() const { return !consumeMessageHookList_.empty(); }
     size_t consumeMessageHookCount() const { return consumeMessageHookList_.size(); }
+
+    // 投递前过滤钩子（对应 Java registerFilterMessageHook / hasFilterMessageHook）。
+    // 钩子摘掉的消息：拉取路径静默跳过（位点照常推进），POP 路径立刻 ack。
+    void registerFilterMessageHook(std::shared_ptr<FilterMessageHook> hook) {
+        if (hook) filterMessageHookList_.push_back(std::move(hook));
+    }
+    bool hasFilterMessageHook() const { return !filterMessageHookList_.empty(); }
+    size_t filterMessageHookCount() const { return filterMessageHookList_.size(); }
+    // 已丢弃的条数（拉取 + POP 合计），供联调脚本与单测观测
+    int64_t filteredMessageCount() const { return filteredMessageCount_.load(); }
+
+    // ---- 投递前过滤（对应 Java PullAPIWrapper.processPullResult 的 113-122 与 executeHook）----
+    // 以下三个供单测/联调直接驱动（不经过网络）。
+    // 依次执行过滤钩子，**异常一律吞掉**（Java PullAPIWrapper.executeHook:171-178 记 error）；
+    // 与 CheckForbiddenHook 相反：过滤钩子挂了不能影响消费。
+    void executeFilterMessageHook(FilterMessageContext& context);
+    // 拉取 / POP 两条路径共用的投递前过滤：
+    //   ① 客户端二次 tag 过滤（broker 侧按 codeSet 哈希过滤有碰撞误放）
+    //   ② FilterMessageHook（可改写 msgList）
+    // 传入的 sub 为 nullptr 时只跑 ②。
+    std::vector<MessageExt> filterMessagesForDelivery(const MessageQueue& mq,
+                                                      const SubscriptionData* sub,
+                                                      const std::vector<MessageExt>& msgs);
+    // 求 original \ kept 的差集（POP 路径要给被摘掉的消息补 ack）。
+    // Java 用 List.contains 的引用同一性；C++ 拷 vector 后无同一性，改按 msgId 求差（语义等价）。
+    static std::vector<MessageExt> droppedMessages(const std::vector<MessageExt>& original,
+                                                   const std::vector<MessageExt>& kept);
+
     std::shared_ptr<AsyncTraceDispatcher> traceDispatcher() const { return traceDispatcher_; }
 
     const std::string& consumerGroup() const { return consumerGroup_; }
@@ -413,6 +441,8 @@ private:
     int32_t consumeTimeoutMinutes_ = 15;
     AccessChannel accessChannel_ = AccessChannel::LOCAL;
     std::vector<std::shared_ptr<ConsumeMessageHook>> consumeMessageHookList_;
+    std::vector<std::shared_ptr<FilterMessageHook>> filterMessageHookList_;
+    std::atomic<int64_t> filteredMessageCount_{0};
     std::shared_ptr<AsyncTraceDispatcher> traceDispatcher_;
 };
 

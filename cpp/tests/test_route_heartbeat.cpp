@@ -37,18 +37,37 @@ static bool contains(const std::string& hay, const std::string& needle) {
 
 // ---------------------------------------------------------------- SubscriptionData
 static void testSubscriptionData() {
-    // FilterAPI: "*" / 空 / 全空白 -> {"*"}
+    // FilterAPI: "*" / "" -> SUB_ALL 且 **两个集合都空**（Java 直接 return）
+    // Java 里 tagsSet 非空是"客户端二次 tag 过滤"的开关，塞 "*" 会让订阅全量时把正常消息过滤掉。
     SubscriptionData all1 = FilterAPI::buildSubscriptionData("T", "*");
-    CHECK(all1.tagsSet.size() == 1 && all1.tagsSet.count("*") == 1, "filter '*' -> tagsSet={*}");
+    CHECK(all1.subString == "*" && all1.tagsSet.empty() && all1.codeSet.empty(),
+          "filter '*' -> SUB_ALL with empty sets");
     SubscriptionData all2 = FilterAPI::buildSubscriptionData("T", "");
-    CHECK(all2.tagsSet.size() == 1 && all2.tagsSet.count("*") == 1, "filter empty -> tagsSet={*}");
+    CHECK(all2.subString == "*" && all2.tagsSet.empty() && all2.codeSet.empty(),
+          "filter empty -> SUB_ALL with empty sets");
+    // 纯空白：Java StringUtils.isEmpty 只认 null/"" -> 走 split 分支，标签被 trim 成空 -> 集合仍空，
+    // 但 subString **原样保留**（探测确认：Java 输出 sub=[   ] tags=[] codes=[]）。
     SubscriptionData all3 = FilterAPI::buildSubscriptionData("T", "   ");
-    CHECK(all3.tagsSet.size() == 1 && all3.tagsSet.count("*") == 1, "filter blank -> tagsSet={*}");
+    CHECK(all3.subString == "   " && all3.tagsSet.empty() && all3.codeSet.empty(),
+          "filter blank -> split branch, subString kept as-is, empty sets");
 
-    // "||" 切分 + trim + 丢空片段
+    // "||" 切分 + trim + 丢空片段，且必须同时填 codeSet（Java tag.hashCode()）
     SubscriptionData multi = FilterAPI::buildSubscriptionData("T", " TagA || TagB || ");
     CHECK(multi.tagsSet.size() == 2, "filter split count");
     CHECK(multi.tagsSet.count("TagA") == 1 && multi.tagsSet.count("TagB") == 1, "filter split trim");
+    CHECK(multi.tagsSet.count("*") == 0, "filter split must not contain '*'");
+    CHECK(multi.codeSet.size() == 2 && multi.codeSet.count(2598919) == 1
+              && multi.codeSet.count(2598920) == 1,
+          "filter split fills codeSet with java hashCode");
+
+    // "||" 全分隔符：Java-split 结果数组长度为 0 -> Java 抛 "subString split error"
+    bool threw = false;
+    try {
+        FilterAPI::buildSubscriptionData("T", "||");
+    } catch (const std::exception& e) {
+        threw = std::string(e.what()) == "subString split error";
+    }
+    CHECK(threw, "filter '||' -> throws subString split error (java-split drops all trailing empties)");
 
     // toJson 必须包含 Java 字段名，且**不得**出现 filterClassSource
     SubscriptionData sd("TopicProbe", "TagA||TagB");

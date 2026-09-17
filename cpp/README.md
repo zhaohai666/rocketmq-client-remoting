@@ -39,7 +39,7 @@ MSVC 下自动加 `/utf-8`（源码含中文注释，否则 C4819）；Windows �
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 14 个用例，约 849 项断言，~3s
+cd build && ctest --output-on-failure     # 15 个用例，约 920 项断言，~6s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -85,6 +85,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_pop           127.0.0.1:9876
 ./build/examples/rmq_live_pop_consumer  127.0.0.1:9876
 ./build/examples/rmq_live_trace         127.0.0.1:9876   # 需 broker traceTopicEnable=true
+./build/examples/rmq_live_hook          127.0.0.1:9876
 ```
 
 | 工具 | 结果 | 覆盖 |
@@ -93,6 +94,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_admin_live` | 47 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → 清理 |
 | `rmq_compression_live` | 全 PASS | 自动压缩自产自销 + **与真实 Java 客户端双向互通** |
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
+| `rmq_live_hook` | 13 PASS / 0 FAIL | `CheckForbiddenHook`（放行 / 每次发送尝试都回调 / 单向也拦截 / 被拦截的消息确实没落 broker）+ `FilterMessageHook`（拉取路径 3 收 2 丢且不重投、POP 路径 2 收 1 丢且**摘掉即 ack**）+ 客户端二次 tag 过滤（订阅 `TagA` 只收 `TagA`）+ 钩子异常被吞掉不影响后续钩子 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -119,10 +121,11 @@ cpp/
 │       ├── mq_client.h             MQClientInstance：路由发现 + 全部 RPC
 │       ├── producer.h / consumer.h / admin.h / result.h / exception.h
 │       ├── hook.h / trace.h / trace_hook.h / trace_dispatcher.h
-│       │                            消息轨迹：钩子接口 + 文本编解码 + 异步分发
+│       │                            钩子接口（Send/Consume/EndTransaction/CheckForbidden/
+│       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 31 个 .cpp
-├── examples/                   selfcheck / interop_tool + 11 个真机联调工具
-└── tests/                      14 个 ctest 用例（含 Java 对拍）+ interop_check.py
+├── examples/                   selfcheck / interop_tool + 12 个真机联调工具
+└── tests/                      15 个 ctest 用例（含 Java 对拍）+ interop_check.py
 ```
 
 ## 几个必须知道的实现约定

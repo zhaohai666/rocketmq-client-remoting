@@ -90,6 +90,64 @@ public:
     virtual void endTransaction(EndTransactionContext& context) = 0;
 };
 
+// ---------------------------------------------------------------- 发送模式
+// 对应 org.apache.rocketmq.client.impl.CommunicationMode（Java 是枚举，三个常量）。
+enum class CommunicationMode { SYNC, ASYNC, ONEWAY };
+
+// ---------------------------------------------------------------- CheckForbidden
+// 对应 org.apache.rocketmq.client.hook.CheckForbiddenContext。
+//
+// 与 SendMessageContext 的关键差别：**没有 sendResult**（此刻还没发），带上 `arg`
+// （send(msg, selector, arg) 里的业务参数）。
+struct CheckForbiddenContext {
+    std::string nameSrvAddr;
+    std::string group;
+    const Message* message = nullptr;
+    MessageQueue mq;
+    std::string brokerAddr;
+    CommunicationMode communicationMode = CommunicationMode::SYNC;
+    const SendResult* sendResult = nullptr;
+    std::string exception;
+    // Java 是 Object arg；C++ 的 sendBySelector 用 std::string 承载，这里照此对齐，
+    // 其余发送入口传 nullptr。
+    const std::string* arg = nullptr;
+    // 本项目无 unit mode（Java 的 isUnitMode() 恒为 false）
+    bool unitMode = false;
+};
+
+// 对应 org.apache.rocketmq.client.hook.CheckForbiddenHook。
+//
+// ⚠ 与 Send/Consume 钩子**相反**：checkForbidden 抛出的异常**不会被吞掉**
+// （Java 签名就是 `throws MQClientException`），而是沿发送重试链向上传播 ——
+// 这正是"拦截"能力的实现方式。
+class CheckForbiddenHook {
+public:
+    virtual ~CheckForbiddenHook();
+    virtual std::string hookName() const = 0;
+    virtual void checkForbidden(CheckForbiddenContext& context) = 0;
+};
+
+// ---------------------------------------------------------------- FilterMessage
+// 对应 org.apache.rocketmq.client.hook.FilterMessageContext。
+//
+// `msgList` 是**可变的**：钩子把它替换/裁剪掉的消息会被客户端直接丢弃
+// （拉取路径 = 静默跳过、位点照常推进；POP 路径 = 立刻 ack）。
+struct FilterMessageContext {
+    std::string consumerGroup;
+    std::vector<MessageExt> msgList;
+    MessageQueue mq;
+    const std::string* arg = nullptr;
+    bool unitMode = false;
+};
+
+// 对应 org.apache.rocketmq.client.hook.FilterMessageHook。
+class FilterMessageHook {
+public:
+    virtual ~FilterMessageHook();
+    virtual std::string hookName() const = 0;
+    virtual void filterMessage(FilterMessageContext& context) = 0;
+};
+
 }  // namespace rocketmq
 
 #endif  // ROCKETMQ_CLIENT_HOOK_H
