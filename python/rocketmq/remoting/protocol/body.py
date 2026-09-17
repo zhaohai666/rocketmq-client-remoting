@@ -210,26 +210,54 @@ class ClusterInfo:
 
 
 class ConsumerRunningInfo:
+    """对应 org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo。
+
+    两端都用得到：**admin 侧**解析 broker 汇总的运行信息；**客户端侧**在应答
+    GET_CONSUMER_RUNNING_INFO(307) 时编码自己的运行信息。
+
+    ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``，fastjson2 会把它内联成
+    JSON 对象（``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这不是
+    合法 JSON，但 Java 的 fastjson2 能读回来，所以必须用 ``message_queue_key`` /
+    ``decode_message_queue_map`` 处理，不能当普通字符串键。
+    """
+
+    PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR"
+    PROP_THREADPOOL_CORE_SIZE = "PROP_THREADPOOL_CORE_SIZE"
+    PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"   # 注意 Java 常量名没有下划线
+    PROP_CONSUME_TYPE = "PROP_CONSUME_TYPE"
+    PROP_CLIENT_VERSION = "PROP_CLIENT_VERSION"
+    PROP_CONSUMER_START_TIMESTAMP = "PROP_CONSUMER_START_TIMESTAMP"
+
     def __init__(self):
         self.properties: Dict[str, str] = {}
         self.subscription_set: List[dict] = []
-        self.mq_table: Dict[str, dict] = {}
+        self.mq_table: Dict[MessageQueue, dict] = {}
+        self.mq_pop_table: Dict[MessageQueue, dict] = {}
+        self.status_table: Dict[str, dict] = {}
+        self.user_consumer_info: Dict[str, str] = {}
         self.jstack: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "properties": self.properties,
             "subscriptionSet": self.subscription_set,
-            "mqTable": self.mq_table,
+            "mqTable": {message_queue_key(k): v for k, v in self.mq_table.items()},
+            "mqPopTable": {message_queue_key(k): v for k, v in self.mq_pop_table.items()},
+            "statusTable": self.status_table,
+            "userConsumerInfo": self.user_consumer_info,
             "jstack": self.jstack,
         }
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> "ConsumerRunningInfo":
         ri = ConsumerRunningInfo()
         ri.properties = d.get("properties") or {}
         ri.subscription_set = list(d.get("subscriptionSet") or [])
-        ri.mq_table = d.get("mqTable") or {}
+        ri.mq_table = decode_message_queue_map(d.get("mqTable"))
+        ri.mq_pop_table = decode_message_queue_map(d.get("mqPopTable"))
+        ri.status_table = d.get("statusTable") or {}
+        ri.user_consumer_info = d.get("userConsumerInfo") or {}
         ri.jstack = d.get("jstack")
         return ri
 
@@ -427,3 +455,156 @@ class ResetOffsetBody:
     @staticmethod
     def decode(data: bytes) -> "ResetOffsetBody":
         return ResetOffsetBody.from_dict(fastjson_loads(data.decode("utf-8")))
+
+
+# ---------------------------------------------------------------- 42 GET_CONSUMER_STATUS_FROM_CLIENT
+class GetConsumerStatusBody:
+    """对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody。
+
+    两个 map 的键都是 ``MessageQueue``（fastjson2 内联对象键）。
+    """
+
+    def __init__(self):
+        self.message_queue_table: Dict[MessageQueue, int] = {}
+        # 已废弃的字段：Java 仍保留（consumerTable: clientId → 位点表）
+        self.consumer_table: Dict[str, Dict[MessageQueue, int]] = {}
+
+    def to_dict(self) -> dict:
+        return {
+            "messageQueueTable": {message_queue_key(k): v
+                                  for k, v in self.message_queue_table.items()},
+            "consumerTable": {cid: {message_queue_key(k): v for k, v in tbl.items()}
+                              for cid, tbl in self.consumer_table.items()},
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "GetConsumerStatusBody":
+        b = GetConsumerStatusBody()
+        b.message_queue_table = {mq: int(v) for mq, v in
+                                 decode_message_queue_map(d.get("messageQueueTable")).items()}
+        for cid, tbl in (d.get("consumerTable") or {}).items():
+            b.consumer_table[cid] = {mq: int(v) for mq, v in
+                                     decode_message_queue_map(tbl).items()}
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "GetConsumerStatusBody":
+        return GetConsumerStatusBody.from_dict(fastjson_loads(data.decode("utf-8")))
+
+
+# ---------------------------------------------------------------- 307 / 309
+class ProcessQueueInfo:
+    """对应 org.apache.rocketmq.remoting.protocol.body.ProcessQueueInfo。"""
+
+    def __init__(self):
+        self.commit_offset: int = 0
+        self.cached_msg_min_offset: int = 0
+        self.cached_msg_max_offset: int = 0
+        self.cached_msg_count: int = 0
+        self.cached_msg_size_in_mib: int = 0
+        self.transaction_msg_min_offset: int = 0
+        self.transaction_msg_max_offset: int = 0
+        self.transaction_msg_count: int = 0
+        self.locked: bool = False
+        self.try_unlock_times: int = 0
+        self.last_lock_timestamp: int = 0
+        self.droped: bool = False          # Java 字段名就是 droped（拼写如此）
+        self.last_pull_timestamp: int = 0
+        self.last_consume_timestamp: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "commitOffset": self.commit_offset,
+            "cachedMsgMinOffset": self.cached_msg_min_offset,
+            "cachedMsgMaxOffset": self.cached_msg_max_offset,
+            "cachedMsgCount": self.cached_msg_count,
+            "cachedMsgSizeInMiB": self.cached_msg_size_in_mib,
+            "transactionMsgMinOffset": self.transaction_msg_min_offset,
+            "transactionMsgMaxOffset": self.transaction_msg_max_offset,
+            "transactionMsgCount": self.transaction_msg_count,
+            "locked": self.locked,
+            "tryUnlockTimes": self.try_unlock_times,
+            "lastLockTimestamp": self.last_lock_timestamp,
+            "droped": self.droped,
+            "lastPullTimestamp": self.last_pull_timestamp,
+            "lastConsumeTimestamp": self.last_consume_timestamp,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "ProcessQueueInfo":
+        p = ProcessQueueInfo()
+        p.commit_offset = int(d.get("commitOffset", 0))
+        p.cached_msg_min_offset = int(d.get("cachedMsgMinOffset", 0))
+        p.cached_msg_max_offset = int(d.get("cachedMsgMaxOffset", 0))
+        p.cached_msg_count = int(d.get("cachedMsgCount", 0))
+        p.cached_msg_size_in_mib = int(d.get("cachedMsgSizeInMiB", 0))
+        p.transaction_msg_min_offset = int(d.get("transactionMsgMinOffset", 0))
+        p.transaction_msg_max_offset = int(d.get("transactionMsgMaxOffset", 0))
+        p.transaction_msg_count = int(d.get("transactionMsgCount", 0))
+        p.locked = bool(d.get("locked", False))
+        p.try_unlock_times = int(d.get("tryUnlockTimes", 0))
+        p.last_lock_timestamp = int(d.get("lastLockTimestamp", 0))
+        p.droped = bool(d.get("droped", False))
+        p.last_pull_timestamp = int(d.get("lastPullTimestamp", 0))
+        p.last_consume_timestamp = int(d.get("lastConsumeTimestamp", 0))
+        return p
+
+    def __repr__(self):
+        return ("ProcessQueueInfo[commitOffset=%d, cached=%d, droped=%s]"
+                % (self.commit_offset, self.cached_msg_count, self.droped))
+
+
+class CMResult:
+    """对应 org.apache.rocketmq.remoting.protocol.body.CMResult。"""
+
+    CR_SUCCESS = "CR_SUCCESS"
+    CR_LATER = "CR_LATER"
+    CR_ROLLBACK = "CR_ROLLBACK"
+    CR_COMMIT = "CR_COMMIT"
+    CR_THROW_EXCEPTION = "CR_THROW_EXCEPTION"
+    CR_RETURN_NULL = "CR_RETURN_NULL"
+
+
+class ConsumeMessageDirectlyResult:
+    """对应 org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult。
+
+    这是 309 的应答 body，字段全是标量 —— 是四个 body 里唯一不需要处理
+    MessageQueue 内联键的一个。
+    """
+
+    def __init__(self):
+        self.order: bool = False
+        self.auto_commit: bool = True
+        self.consume_result: Optional[str] = None
+        self.remark: Optional[str] = None
+        self.spent_time_mills: int = 0
+
+    def to_dict(self) -> dict:
+        d = {
+            "order": self.order,
+            "autoCommit": self.auto_commit,
+            "consumeResult": self.consume_result,
+            "remark": self.remark,
+            "spentTimeMills": self.spent_time_mills,
+        }
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "ConsumeMessageDirectlyResult":
+        r = ConsumeMessageDirectlyResult()
+        r.order = bool(d.get("order", False))
+        r.auto_commit = bool(d.get("autoCommit", True))
+        r.consume_result = d.get("consumeResult")
+        r.remark = d.get("remark")
+        r.spent_time_mills = int(d.get("spentTimeMills", 0))
+        return r
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "ConsumeMessageDirectlyResult":
+        return ConsumeMessageDirectlyResult.from_dict(fastjson_loads(data.decode("utf-8")))

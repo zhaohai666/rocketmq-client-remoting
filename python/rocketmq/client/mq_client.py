@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_const import MessageConst
-from ..common.message_decoder import (decode_messages, decompress_body,
+from ..common.message_decoder import (decode_message, decode_messages, decompress_body,
                                       message_properties_2_string,
                                       string_2_message_properties)
 from ..common.mix_all import MixAll
@@ -22,17 +22,26 @@ from ..common.sysflag import MessageSysFlag
 from ..common.topic_config import TopicFilterType
 from ..logging import get_logger
 from ..remoting.client import RemotingClient
-from ..remoting.protocol.body import (ClusterInfo, GetConsumerListByGroupResponseBody,
+from ..remoting.protocol.body import (ClusterInfo, ConsumerRunningInfo,
+                                      ConsumeMessageDirectlyResult, GetConsumerStatusBody,
+                                      GetConsumerListByGroupResponseBody, ResetOffsetBody,
                                       TopicList)
+
+if TYPE_CHECKING:
+    from .consumer import DefaultMQPushConsumer
 from ..remoting.protocol.codes import RequestCode, ResponseCode, SerializeType
-from ..remoting.protocol.headers import (CreateTopicRequestHeader,
+from ..remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader,
+                                         CreateTopicRequestHeader,
                                          GetConsumerListByGroupRequestHeader,
+                                         GetConsumerRunningInfoRequestHeader,
+                                         GetConsumerStatusRequestHeader,
                                          GetMaxOffsetRequestHeader,
                                          GetMaxOffsetResponseHeader, GetMinOffsetRequestHeader,
                                          GetMinOffsetResponseHeader, PullMessageRequestHeader,
                                          PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
                                          QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader,
                                          QueryMessageResponseHeader, ReplyMessageRequestHeader,
+                                         ResetOffsetRequestHeader,
                                          SearchOffsetRequestHeader,
                                          SearchOffsetResponseHeader, SendMessageRequestHeader,
                                          SendMessageRequestHeaderV2, SendMessageResponseHeader,
@@ -120,7 +129,120 @@ class MQClientInstance:
         # —— 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），所以在这里注册。
         self.remoting_client.register_processor(
             RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, self._process_reply_message)
+        # broker 主动请求 220/221/307/309（对应 Java ClientRemotingProcessor）：
+        # 与 326 一样是**客户端实例级**注册，但处理时要按 consumerGroup 找到对应的消费者
+        # 实例（同一进程多消费组时不能只认最后一个）。注意这些回调跑在 remoting 的**读线程**
+        # 上（见 client.py _dispatch），因此任何会触发 invokeSync 的动作（如 220 的 rebalance）
+        # 必须丢到后台线程，否则会卡死该连接上所有响应（静默自死锁）。
+        self.remoting_client.register_processor(
+            RequestCode.RESET_CONSUMER_CLIENT_OFFSET, self._process_reset_offset)
+        self.remoting_client.register_processor(
+            RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT, self._process_get_consumer_status)
+        self.remoting_client.register_processor(
+            RequestCode.GET_CONSUMER_RUNNING_INFO, self._process_get_consumer_running_info)
+        self.remoting_client.register_processor(
+            RequestCode.CONSUME_MESSAGE_DIRECTLY, self._process_consume_message_directly)
+        self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
         MQClientInstance.INSTANCE_MAP[client_id] = self
+
+    # ---------------- 消费者注册（broker 主动请求按 group 分派） ----------------
+    def register_consumer(self, group: str, consumer: "DefaultMQPushConsumer") -> None:
+        """登记一个消费者实例，供 broker 主动请求按 consumerGroup 分派到正确的实例。
+
+        对应 Java ``MQClientInstance.consumerTable`` + ``findConsumer``。
+        """
+        self._consumer_table[group] = consumer
+
+    def unregister_consumer(self, group: str) -> None:
+        self._consumer_table.pop(group, None)
+
+    def find_consumer(self, group: str) -> Optional["DefaultMQPushConsumer"]:
+        return self._consumer_table.get(group)
+
+    # ---------------- broker 主动请求处理（ClientRemotingProcessor） ----------------
+    def _process_reset_offset(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发的，无需应答。
+
+        但重置逻辑里会触发 rebalance（lock/unlock/batch 等 invokeSync），不能在读线程上同步
+        跑——丢到后台线程，立即返回 None（oneway）。
+        """
+        header = ResetOffsetRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            logger.warning("RESET_CONSUMER_CLIENT_OFFSET: no consumer for group=%s", group)
+            return None
+        try:
+            body = ResetOffsetBody.decode(cmd.body) if cmd.body else ResetOffsetBody()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("RESET_CONSUMER_CLIENT_OFFSET: bad body: %s", e)
+            return None
+        topic = header.topic
+        offset_table: Dict[MessageQueue, int] = body.offset_table
+
+        def _run() -> None:
+            try:
+                consumer.reset_offset(topic, offset_table)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("reset offset failed (group=%s topic=%s): %s",
+                               group, topic, e)
+
+        t = threading.Thread(target=_run, daemon=True,
+                             name="rmq-reset-offset-%s" % (group or "?"))
+        t.start()
+        return None
+
+    def _process_get_consumer_status(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """GET_CONSUMER_STATUS_FROM_CLIENT(221)：返回已消费位点表（Map<MessageQueue,Long>）。"""
+        header = GetConsumerStatusRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "no consumer for group=%s" % group, None)
+        status = consumer.get_consumer_status(header.topic)
+        body = GetConsumerStatusBody()
+        body.message_queue_table = dict(status)
+        resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        resp.body = body.encode()
+        return resp
+
+    def _process_get_consumer_running_info(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """GET_CONSUMER_RUNNING_INFO(307)：返回本消费者运行信息。"""
+        header = GetConsumerRunningInfoRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.consumer_group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "no consumer for group=%s" % group, None)
+        info = consumer.consumer_running_info()
+        resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        resp.body = info.encode()
+        return resp
+
+    def _process_consume_message_directly(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """CONSUME_MESSAGE_DIRECTLY(309)：broker 把一条消息推下来，要求本地真实消费一次。"""
+        header = ConsumeMessageDirectlyResultRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.consumer_group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "no consumer for group=%s" % group, None)
+        if not cmd.body:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "empty message body", None)
+        msg = decode_message(cmd.body, check_crc=False)
+        if msg is None:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "decode message failed", None)
+        result = consumer.consume_message_directly(msg, header.broker_name)
+        resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        resp.body = result.encode()
+        return resp
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:

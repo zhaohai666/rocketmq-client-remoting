@@ -27,6 +27,9 @@ from ..remoting.protocol.codes import RequestCode
 from ..remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                            ConsumerData, HeartbeatData, MessageModel)
 from ..remoting.protocol.namespace_util import NamespaceUtil
+from ..remoting.protocol.body import (CMResult, ConsumeMessageDirectlyResult,
+                                       ConsumeStatus, ConsumerRunningInfo,
+                                       ProcessQueueInfo)
 from ..remoting.protocol import extra_info as extra_info_util
 from ..remoting.protocol.extra_info import split
 from ..remoting.rpchook import RPCHook
@@ -395,6 +398,7 @@ class DefaultMQPushConsumer:
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
+            self._mq_client.register_consumer(self.consumer_group, self)
             self._started = True
             self._start_time = time.time()
             self._stop.clear()
@@ -1229,6 +1233,122 @@ class DefaultMQPushConsumer:
                 msg.topic = retry_topic
             if self.namespace:
                 msg.topic = NamespaceUtil.without_namespace(msg.topic, self.namespace)
+
+    # ---------------- broker 主动请求：220 / 221 / 307 / 309 ----------------
+    # 这四个请求由 broker（或 mqadmin 经 broker）反向打给客户端，对应 Java
+    # ClientRemotingProcessor。处理入口注册在 MQClientInstance 上（见
+    # mq_client.py），因为它要按 consumerGroup 找到**对应的**消费者实例，而不是
+    # 每个消费者各注册一次（那样同一进程里多消费组时只有最后一个生效）。
+
+    def reset_offset(self, topic: str, offset_table: Dict[MessageQueue, int]) -> None:
+        """对应 Java MQClientInstance.resetOffset（220 的处理逻辑）。
+
+        顺序：suspend → 命中的队列 drop+clear → 等一会儿让在途消费跑完 →
+        写新位点 → 撤销该队列（触发 rebalance 重新分配并从新位点开始）。
+        """
+        if topic is None or not offset_table:
+            return
+        with self._lock:
+            hit: List[Tuple[MessageQueue, str]] = []
+            for key, mq in list(self._mq_map.items()):
+                if mq.topic != topic:
+                    continue
+                off = offset_table.get(mq)
+                if off is None:
+                    continue
+                self._pending.pop(key, None)   # 等价 ProcessQueue.clear()
+                self._offset_table.pop(key, None)
+                self._consume_offsets[key] = int(off)
+                hit.append((mq, key))
+        if not hit:
+            return
+        # Java 用 RESET_OFFSET_MAX_WAIT（5 秒）等并发消费跑完；这里缩短以免阻塞
+        # 读线程太久（220 是 oneway，broker 不等响应，但仍应尽快返回）。
+        time.sleep(0.2)
+        self._on_queues_revoked([(mq, None) for mq, _ in hit])
+        try:
+            self._do_rebalance()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("rebalance after reset offset failed: %s", e)
+        logger.info("reset offset applied, group=%s topic=%s queues=%d",
+                    self.consumer_group, topic, len(hit))
+
+    def get_consumer_status(self, topic: str) -> Dict[MessageQueue, int]:
+        """对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）。
+
+        Java 返回 ``offsetStore.cloneOffsetTable(topic)``，即**已消费位点**表
+        （不是拉取游标）。
+        """
+        out: Dict[MessageQueue, int] = {}
+        with self._lock:
+            for key, mq in list(self._mq_map.items()):
+                if topic is not None and mq.topic != topic:
+                    continue
+                off = self._consume_offsets.get(key)
+                if off is not None:
+                    out[mq] = int(off)
+        return out
+
+    def consumer_running_info(self) -> ConsumerRunningInfo:
+        """对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答）。"""
+        info = ConsumerRunningInfo()
+        info.properties = {
+            ConsumerRunningInfo.PROP_NAMESERVER_ADDR: ";".join(self.name_server_addrs) + ";",
+            ConsumerRunningInfo.PROP_CONSUME_TYPE: "CONSUME_PASSIVELY",
+            ConsumerRunningInfo.PROP_CONSUME_ORDERLY: str(bool(self._is_orderly())).lower(),
+            ConsumerRunningInfo.PROP_THREADPOOL_CORE_SIZE: str(max(1, self.consume_thread_max)),
+            ConsumerRunningInfo.PROP_CONSUMER_START_TIMESTAMP: str(int(self._start_time * 1000)),
+            ConsumerRunningInfo.PROP_CLIENT_VERSION: "V5_5_1",
+        }
+        with self._lock:
+            subs = list(self.subscription_data.values())
+            for key, mq in self._mq_map.items():
+                pqi = ProcessQueueInfo()
+                pqi.commit_offset = int(self._consume_offsets.get(key, 0))
+                pqi.cached_msg_count = len(self._pending.get(key) or ())
+                pqi.droped = False
+                info.mq_table[mq] = pqi.to_dict()
+            if self.pop_mode:
+                for key, pq in (self._pop_queues or {}).items():
+                    mq = self._mq_map.get(key)
+                    if mq is None:
+                        continue
+                    pqi = ProcessQueueInfo()
+                    pqi.cached_msg_count = pq.wait_ack_count()
+                    pqi.droped = pq.is_dropped()
+                    info.mq_pop_table[mq] = pqi.to_dict()
+        info.subscription_set = [s.to_dict() if hasattr(s, "to_dict") else dict(s.__dict__)
+                                 for s in subs]
+        for s in subs:
+            info.status_table[s.topic] = ConsumeStatus().to_dict()
+        return info
+
+    def consume_message_directly(self, msg: MessageExt,
+                                 broker_name: Optional[str]) -> ConsumeMessageDirectlyResult:
+        """对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）。"""
+        result = ConsumeMessageDirectlyResult()
+        result.order = False
+        result.auto_commit = True
+        msgs = [msg]
+        mq = MessageQueue(topic=msg.topic, broker_name=broker_name or "",
+                          queue_id=msg.queue_id)
+        self._reset_retry_topic_and_namespace(msgs)
+        context = ConsumeConcurrentlyContext(mq)
+        begin = int(time.time() * 1000)
+        try:
+            status = self.message_listener.consume_message(msgs, context) \
+                if self.message_listener is not None else None
+            if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
+                result.consume_result = CMResult.CR_SUCCESS
+            elif status == ConsumeConcurrentlyStatus.RECONSUME_LATER:
+                result.consume_result = CMResult.CR_LATER
+            elif status is None:
+                result.consume_result = CMResult.CR_RETURN_NULL
+        except Exception as e:  # noqa: BLE001
+            result.consume_result = CMResult.CR_THROW_EXCEPTION
+            result.remark = "%s: %s" % (type(e).__name__, e)
+        result.spent_time_mills = int(time.time() * 1000) - begin
+        return result
 
     def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt]) -> bool:
         """消费一个批次并处理回投/挂起。返回消费位点是否前进。"""

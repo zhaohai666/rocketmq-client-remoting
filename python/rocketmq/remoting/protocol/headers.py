@@ -677,6 +677,24 @@ class GetConsumerConnectionListRequestHeader(CommandCustomHeader):
         self.consumer_group = ext.get("consumerGroup")
 
 
+class GetConsumerStatusRequestHeader(CommandCustomHeader):
+    """GET_CONSUMER_STATUS_FROM_CLIENT(221) 的请求头。"""
+
+    def __init__(self):
+        self.topic: Optional[str] = None
+        self.group: Optional[str] = None
+        self.client_addr: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({"topic": self.topic, "group": self.group,
+                     "clientAddr": self.client_addr})
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.topic = ext.get("topic")
+        self.group = ext.get("group")
+        self.client_addr = ext.get("clientAddr")
+
+
 class GetConsumerRunningInfoRequestHeader(CommandCustomHeader):
     def __init__(self):
         self.consumer_group: Optional[str] = None
@@ -1027,9 +1045,6 @@ class InterviewGetConsumerStatusRequestHeader(CommandCustomHeader):
     def from_ext_fields(self, ext: dict) -> None:
         self.consumer_group = ext.get("consumerGroup")
         self.topic = ext.get("topic")
-
-
-GetConsumerStatusRequestHeader = InterviewGetConsumerStatusRequestHeader
 
 
 class GetTopicsByClusterRequestHeader(CommandCustomHeader):
