@@ -26,6 +26,7 @@
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/topic_config.h"
 #include "rocketmq/remoting/protocol/body.h"
+#include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/heartbeat.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/protocol/route.h"
@@ -169,6 +170,53 @@ public:
     int64_t searchOffsetByTimestamp(const MessageQueue& mq, int64_t timestamp,
                                     int32_t timeoutMillis = 5000,
                                     const std::string& addr = std::string());
+
+    // ---------------- POP 模式（5.x 轻量消费） ----------------
+    //
+    // 与 pull 的语义差别：**不提交位点**，消费完成后用 ackMessage 确认；不 ack 的消息
+    // 在 invisibleTime 之后被 broker 复活并重投到 %RETRY%<group>_<topic>（V1），
+    // 下次 POP 会再弹回来（至少一次语义）。queueId = -1 表示弹该 topic 的所有队列。
+    //
+    // 返回的每条消息都已被盖上 POP_CK（客户端反构的 8 段 CK 串）与 1ST_POP_TIME。
+    PopResult popMessage(const std::string& consumerGroup, const std::string& topic,
+                         int32_t queueId, int32_t maxMsgNums, int64_t invisibleTime,
+                         int64_t pollTime, int32_t initMode,
+                         const std::string& expression = std::string(),
+                         const std::string& expressionType = std::string(),
+                         bool order = false, int32_t timeoutMillis = 10000,
+                         const std::string& brokerName = std::string(),
+                         const std::string& addr = std::string());
+
+    // 确认一条 POP 消息。extraInfo 用消息上的 POP_CK 属性；offset 必须是
+    // **consumeQueue offset**（即 CK 串第 8 段），不是 commitlog offset —— 传错
+    // broker 会回 NO_MESSAGE(208)。返回 broker 响应码，SUCCESS(0) 即成功。
+    int32_t ackMessage(const std::string& consumerGroup, const std::string& topic,
+                       int32_t queueId, const std::string& extraInfo, int64_t offset,
+                       int32_t timeoutMillis = 3000,
+                       const std::string& brokerName = std::string(),
+                       const std::string& addr = std::string());
+
+    // 延长 POP 消息的不可见时间。响应返回**新的** popTime/invisibleTime/reviveQid，
+    // 客户端据此重建 8 段 extraInfo（结果里的 extraInfo 字段）供后续 ACK 使用。
+    ChangeInvisibleTimeResult changeInvisibleTime(const std::string& consumerGroup,
+                                                  const std::string& topic, int32_t queueId,
+                                                  const std::string& extraInfo, int64_t offset,
+                                                  int64_t invisibleTime,
+                                                  int32_t timeoutMillis = 3000,
+                                                  const std::string& brokerName = std::string(),
+                                                  const std::string& addr = std::string());
+
+    // 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME（对应 Java
+    // MQClientAPIImpl.processPopResponse 的前半段）。
+    //
+    // 单独暴露成静态函数是为了**可单测**：这是整个 POP 实现里最容易踩坑、
+    // 又最难靠真机定位的一段逻辑（普通 topic 直连 POP 时 broker 不写 POP_CK，
+    // 必须由客户端用 startOffsetInfo/msgOffsetInfo 反构，否则 ACK 无从下手）。
+    //
+    // 注意：调用方必须在**改写消息 topic 之前**调用，因为 retryFlag 是从消息的
+    // 原始 topic 推出来的（broker 可能改写 topic）。
+    static void stampPopCk(std::vector<MessageExt>& msgs, const std::string& brokerName,
+                           const PopMessageResponseHeader& respHeader);
 
     // ---------------- 心跳 / 注销 ----------------
     void sendHeartbeat(const std::string& addr, const HeartbeatData& heartbeatData,

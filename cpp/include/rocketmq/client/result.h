@@ -132,6 +132,56 @@ struct PullResult {
     bool isNoNewMsg() const { return status == PullStatus::NO_NEW_MSG; }
 };
 
+// ---------------------------------------------------------------- POP 模式
+
+// 对应 Java org.apache.rocketmq.client.consumer.PopStatus
+enum class PopStatus {
+    FOUND = 0,
+    NO_NEW_MSG = 1,
+    POLLING_FULL = 2,
+    POLLING_NOT_FOUND = 3,
+};
+
+inline const char* popStatusName(PopStatus s) {
+    switch (s) {
+        case PopStatus::FOUND: return "FOUND";
+        case PopStatus::NO_NEW_MSG: return "NO_NEW_MSG";
+        case PopStatus::POLLING_FULL: return "POLLING_FULL";
+        case PopStatus::POLLING_NOT_FOUND: return "POLLING_NOT_FOUND";
+    }
+    return "UNKNOWN";
+}
+
+// POP 响应（对应 Java PopResult）。
+// startOffsetInfo / msgOffsetInfo / orderCountInfo 保留 broker 原样字符串，
+// 解析交给 remoting::protocol::extra_info；msgFoundList 里每条消息都已盖好
+// POP_CK（客户端反构）与 1ST_POP_TIME 属性。
+struct PopResult {
+    PopStatus status = PopStatus::NO_NEW_MSG;
+    std::vector<MessageExt> msgFoundList;
+    int64_t restNum = 0;
+    int64_t popTime = 0;
+    int64_t invisibleTime = 0;
+    int32_t reviveQid = 0;
+    std::string startOffsetInfo;
+    std::string msgOffsetInfo;
+    std::string orderCountInfo;
+
+    bool isFound() const { return status == PopStatus::FOUND; }
+};
+
+// changeInvisibleTime 的结果。extraInfo 是用响应里**新的** popTime/invisibleTime/
+// reviveQid 重建的 8 段 CK 串，后续 ACK 要用它（不是请求时传进去的那个旧串）。
+struct ChangeInvisibleTimeResult {
+    int32_t responseCode = 0;
+    int64_t popTime = 0;
+    int64_t invisibleTime = 0;
+    int32_t reviveQid = 0;
+    std::string extraInfo;
+
+    bool success() const { return responseCode == 0; }
+};
+
 // ---------------------------------------------------------------- 消费状态
 enum class ConsumeConcurrentlyStatus {
     CONSUME_SUCCESS = 0,

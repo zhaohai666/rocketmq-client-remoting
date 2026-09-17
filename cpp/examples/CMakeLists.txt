@@ -37,3 +37,7 @@ target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)
 add_executable(rmq_live_latency live_latency.cpp)
 target_link_libraries(rmq_live_latency PRIVATE rocketmq::remoting)
 
+# POP 模式（5.x 轻量消费）真机联调：POP/ACK/延长不可见时间/复活重投（不打进 ctest）
+add_executable(rmq_live_pop live_pop.cpp)
+target_link_libraries(rmq_live_pop PRIVATE rocketmq::remoting)
+

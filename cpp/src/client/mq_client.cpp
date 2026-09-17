@@ -14,12 +14,14 @@
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/request_reply.h"
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "rocketmq/remoting/protocol/extra_info.h"
 #include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/json.h"
 
@@ -509,6 +511,283 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
             m.brokerName = mq.brokerName;
             m.queueId = mq.queueId;
         }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------- POP 模式
+
+namespace {
+
+// 从 topic 路由解析出 (brokerName, addr)。调用方可能已给定其中之一。
+void resolveBrokerFromRoute(const TopicRouteData& route, const std::string& topic,
+                            std::string& brokerName, std::string& addr) {
+    if (brokerName.empty()) {
+        if (route.brokerDatas.empty()) {
+            throw MQClientException("No broker in route of topic: " + topic);
+        }
+        brokerName = route.brokerDatas.front().brokerName;
+    }
+    if (addr.empty()) {
+        addr = MQClientInstance::findBrokerAddrInRoute(route, brokerName);
+        if (addr.empty() && !route.brokerDatas.empty()) {
+            addr = route.brokerDatas.front().selectBrokerAddr();
+        }
+        if (addr.empty()) {
+            throw MQClientException("No available broker addr for topic: " + topic);
+        }
+    }
+}
+
+}  // namespace
+
+// 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME。
+//
+// **这是 POP 最容易踩的坑**：普通 topic 直连 POP 时 broker **不写** POP_CK 属性
+// （只在 retry topic 重编码路径才写），必须由客户端用响应头的 startOffsetInfo /
+// msgOffsetInfo 反构 —— 没有它就无法发 ACK。逐条对齐 Java
+// MQClientAPIImpl.processPopResponse。
+//
+// 注意调用时机：必须在**改写消息 topic 之前**调用，因为 retryFlag 是从消息的
+// 原始 topic 推出来的（broker 可能改写 topic）。
+void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::string& brokerName,
+                                  const PopMessageResponseHeader& respHeader) {
+    using namespace extra_info;
+
+    const int64_t popTime = respHeader.popTime.value_or(0);
+    const int64_t invisibleTime = respHeader.invisibleTime.value_or(0);
+    const int32_t reviveQid = respHeader.reviveQid.value_or(0);
+    const std::string startOffsetInfo = respHeader.startOffsetInfo.value_or("");
+    const std::string msgOffsetInfo = respHeader.msgOffsetInfo.value_or("");
+
+    // Java 的查表 key：消息已带 POP_CK（= retry 消息）时 retryFlag 取自 POP_CK 第 5 段，
+    // 否则由消息 topic 推断。
+    auto queueMapKey = [](const MessageExt& m) -> std::string {
+        auto it = m.properties.find(MessageConst::PROPERTY_POP_CK);
+        if (it != m.properties.end() && !it->second.empty()) {
+            return getRetry(split(it->second)) + "@" + std::to_string(m.queueId);
+        }
+        return getStartOffsetInfoMapKey(m.topic, m.queueId);
+    };
+
+    if (startOffsetInfo.empty()) {
+        // Java 的 startOffsetInfo == null 分支：用消息自身 queueOffset 当 ckQueueOffset
+        // 拼 7 段，再手工补一段凑成 8 段。
+        std::map<std::string, std::string> perQueue;
+        for (MessageExt& m : msgs) {
+            std::string key = m.topic + std::to_string(m.queueId);
+            auto it = perQueue.find(key);
+            if (it == perQueue.end()) {
+                std::string built = buildExtraInfo(m.queueOffset, popTime, invisibleTime, reviveQid,
+                                                   m.topic, brokerName, m.queueId);
+                it = perQueue.emplace(key, built).first;
+            }
+            m.properties[MessageConst::PROPERTY_POP_CK] =
+                it->second + kKeySeparator + std::to_string(m.queueOffset);
+        }
+    } else {
+        auto startMap = parseStartOffsetInfo(startOffsetInfo);
+        auto msgMap = parseMsgOffsetInfo(msgOffsetInfo);
+
+        // Java 先按队列收集 queueOffset 并排序，再用 indexOf 求下标去取
+        // msgOffsetInfo 里对应的 msgQueueOffset。
+        std::map<std::string, std::vector<int64_t>> sortedOffsets;
+        for (const MessageExt& m : msgs) {
+            sortedOffsets[queueMapKey(m)].push_back(m.queueOffset);
+        }
+        for (auto& kv : sortedOffsets) {
+            std::sort(kv.second.begin(), kv.second.end());
+        }
+
+        for (MessageExt& m : msgs) {
+            // retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+            if (m.properties.find(MessageConst::PROPERTY_POP_CK) != m.properties.end()) {
+                continue;
+            }
+            const std::string key = queueMapKey(m);
+            if (startMap == std::nullopt || msgMap == std::nullopt) {
+                continue;
+            }
+            auto startIt = startMap->find(key);
+            auto offIt = msgMap->find(key);
+            if (startIt == startMap->end() || offIt == msgMap->end()) {
+                continue;
+            }
+            auto sortedIt = sortedOffsets.find(key);
+            if (sortedIt == sortedOffsets.end()) {
+                continue;
+            }
+            const std::vector<int64_t>& ordered = sortedIt->second;
+            auto pos = std::find(ordered.begin(), ordered.end(), m.queueOffset);
+            if (pos == ordered.end()) {
+                continue;
+            }
+            std::size_t index = static_cast<std::size_t>(pos - ordered.begin());
+            if (index >= offIt->second.size()) {
+                continue;
+            }
+            m.properties[MessageConst::PROPERTY_POP_CK] =
+                buildExtraInfo(startIt->second, popTime, invisibleTime, reviveQid, m.topic,
+                               brokerName, m.queueId, offIt->second[index]);
+        }
+    }
+
+    // Java 用 computeIfAbsent：只在缺失时补。
+    for (MessageExt& m : msgs) {
+        if (m.properties.find(MessageConst::PROPERTY_FIRST_POP_TIME) == m.properties.end()) {
+            m.properties[MessageConst::PROPERTY_FIRST_POP_TIME] = std::to_string(popTime);
+        }
+    }
+}
+
+PopResult MQClientInstance::popMessage(const std::string& consumerGroup, const std::string& topic,
+                                       int32_t queueId, int32_t maxMsgNums, int64_t invisibleTime,
+                                       int64_t pollTime, int32_t initMode,
+                                       const std::string& expression,
+                                       const std::string& expressionType, bool order,
+                                       int32_t timeoutMillis, const std::string& brokerNameIn,
+                                       const std::string& addrIn) {
+    std::string brokerName = brokerNameIn;
+    std::string addr = addrIn;
+    if (brokerName.empty() || addr.empty()) {
+        auto route = getTopicRouteData(topic);
+        if (route == nullptr) {
+            throw MQClientNoRouteException(topic);
+        }
+        resolveBrokerFromRoute(*route, topic, brokerName, addr);
+    }
+
+    auto header = std::make_shared<PopMessageRequestHeader>();
+    header->consumerGroup = consumerGroup;
+    header->topic = topic;
+    header->queueId = queueId;
+    header->maxMsgNums = maxMsgNums;
+    header->invisibleTime = invisibleTime;
+    header->pollTime = pollTime;
+    // bornTime 填 0 会让 broker 判定"超时太久"直接回 POLLING_TIMEOUT(210)
+    header->bornTime = UtilAll::currentTimeMillis();
+    header->initMode = initMode;
+    if (!expression.empty()) {
+        header->exp = expression;
+    }
+    if (!expressionType.empty()) {
+        header->expType = expressionType;
+    }
+    header->order = order;
+
+    RemotingCommand request =
+        RemotingCommand::createRequestCommand(RequestCode::POP_MESSAGE, header);
+    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+
+    PopResult result;
+    if (response.code == ResponseCode::SUCCESS) {
+        result.status = PopStatus::FOUND;
+    } else if (response.code == ResponseCode::POLLING_FULL) {
+        result.status = PopStatus::POLLING_FULL;
+    } else if (response.code == ResponseCode::POLLING_TIMEOUT) {
+        result.status = PopStatus::POLLING_NOT_FOUND;
+    } else if (response.code == ResponseCode::PULL_NOT_FOUND) {
+        result.status = PopStatus::POLLING_NOT_FOUND;
+    } else {
+        throw MQBrokerException(response.code, response.remark);
+    }
+
+    PopMessageResponseHeader respHeader;
+    respHeader.fromExtFields(response.extFields);
+    result.restNum = respHeader.restNum.value_or(0);
+    result.popTime = respHeader.popTime.value_or(0);
+    result.invisibleTime = respHeader.invisibleTime.value_or(0);
+    result.reviveQid = respHeader.reviveQid.value_or(0);
+    result.startOffsetInfo = respHeader.startOffsetInfo.value_or("");
+    result.msgOffsetInfo = respHeader.msgOffsetInfo.value_or("");
+    result.orderCountInfo = respHeader.orderCountInfo.value_or("");
+
+    if (result.status == PopStatus::FOUND && !response.body.empty()) {
+        result.msgFoundList = decodeMessages(response.body);
+        stampPopCk(result.msgFoundList, brokerName, respHeader);
+    }
+    // Java processPopResponse 收尾：统一盖 brokerName，并把 topic 还原成请求的 topic
+    for (MessageExt& m : result.msgFoundList) {
+        m.brokerName = brokerName;
+        m.topic = topic;
+    }
+    return result;
+}
+
+int32_t MQClientInstance::ackMessage(const std::string& consumerGroup, const std::string& topic,
+                                     int32_t queueId, const std::string& extraInfo, int64_t offset,
+                                     int32_t timeoutMillis, const std::string& brokerNameIn,
+                                     const std::string& addrIn) {
+    std::string brokerName = brokerNameIn;
+    if (brokerName.empty() && !extraInfo.empty()) {
+        // 与 Java 一致：从 CK 串第 6 段取 brokerName（ACK 是靠它找地址的）
+        brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
+    }
+    std::string addr = addrIn;
+    if (addr.empty()) {
+        auto route = getTopicRouteData(topic);
+        if (route == nullptr) {
+            throw MQClientNoRouteException(topic);
+        }
+        resolveBrokerFromRoute(*route, topic, brokerName, addr);
+    }
+
+    auto header = std::make_shared<AckMessageRequestHeader>();
+    header->consumerGroup = consumerGroup;
+    header->topic = topic;
+    header->queueId = queueId;
+    header->extraInfo = extraInfo;
+    header->offset = offset;
+
+    RemotingCommand request =
+        RemotingCommand::createRequestCommand(RequestCode::ACK_MESSAGE, header);
+    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    return response.code;
+}
+
+ChangeInvisibleTimeResult MQClientInstance::changeInvisibleTime(
+    const std::string& consumerGroup, const std::string& topic, int32_t queueId,
+    const std::string& extraInfo, int64_t offset, int64_t invisibleTime, int32_t timeoutMillis,
+    const std::string& brokerNameIn, const std::string& addrIn) {
+    std::string brokerName = brokerNameIn;
+    if (brokerName.empty() && !extraInfo.empty()) {
+        brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
+    }
+    std::string addr = addrIn;
+    if (addr.empty()) {
+        auto route = getTopicRouteData(topic);
+        if (route == nullptr) {
+            throw MQClientNoRouteException(topic);
+        }
+        resolveBrokerFromRoute(*route, topic, brokerName, addr);
+    }
+
+    auto header = std::make_shared<ChangeInvisibleTimeRequestHeader>();
+    header->consumerGroup = consumerGroup;
+    header->topic = topic;
+    header->queueId = queueId;
+    header->extraInfo = extraInfo;
+    header->offset = offset;
+    header->invisibleTime = invisibleTime;
+
+    RemotingCommand request =
+        RemotingCommand::createRequestCommand(RequestCode::CHANGE_MESSAGE_INVISIBLETIME, header);
+    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+
+    ChangeInvisibleTimeResponseHeader respHeader;
+    respHeader.fromExtFields(response.extFields);
+
+    ChangeInvisibleTimeResult result;
+    result.responseCode = response.code;
+    result.popTime = respHeader.popTime.value_or(0);
+    result.invisibleTime = respHeader.invisibleTime.value_or(0);
+    result.reviveQid = respHeader.reviveQid.value_or(0);
+    if (response.code == ResponseCode::SUCCESS) {
+        // 与 Java MQClientAPIImpl.changeInvisibleTimeAsync 一致：用**响应里的**新值
+        // 重建 8 段 extraInfo，供后续 ACK 使用。
+        result.extraInfo = extra_info::buildExtraInfo(offset, result.popTime, result.invisibleTime,
+                                                      result.reviveQid, topic, brokerName, queueId,
+                                                      offset);
     }
     return result;
 }

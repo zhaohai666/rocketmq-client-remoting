@@ -56,6 +56,9 @@ struct MessageConst {
     static constexpr const char* PROPERTY_INNER_MULTI_QUEUE_OFFSET = "INNER_MULTI_QUEUE_OFFSET";
     static constexpr const char* PROPERTY_POP_CK = "POP_CK";
     static constexpr const char* PROPERTY_POP_CK_OFFSET = "POP_CK_OFFSET";
+    // Java 侧写的是 "1ST_POP_TIME"（MessageConst.PROPERTY_FIRST_POP_TIME）；
+    // 客户端在 POP 响应后处理时"仅在缺失时"补上，值为响应头的 popTime。
+    static constexpr const char* PROPERTY_FIRST_POP_TIME = "1ST_POP_TIME";
     static constexpr const char* PROPERTY_POP_TIME = "POP_TIME";
     static constexpr const char* PROPERTY_INVISIBLE_TIME = "INVISIBLE_TIME";
     static constexpr const char* PROPERTY_DELAY_TIME = "DELAY_TIME";

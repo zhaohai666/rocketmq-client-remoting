@@ -407,6 +407,89 @@ struct CreateTopicRequestHeader : public CommandCustomHeader {
     void fromExtFields(const PropertyMap& ext) override;
 };
 
+// ------------------------------------------------ POP 模式（5.x 轻量消费）
+//
+// ext key 必须逐字等于 Java 侧字段名：broker 用 fastjson2 按 Java 属性名反序列化，
+// 错一个字母就**静默丢字段**（不报错、行为静默退化）。
+//
+// 注意 order / suspend：Java 用的是非空 Boolean/boolean，encodeHeader 只跳过 null，
+// 所以它们**总是**出现在报文里 —— 这里用非 optional 的 bool，保证同样总是写出。
+
+// Java PopMessageRequestHeader（RequestCode::POP_MESSAGE = 200050）
+struct PopMessageRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> consumerGroup;
+    std::optional<std::string> topic;
+    std::optional<int32_t> queueId;
+    std::optional<int32_t> maxMsgNums;
+    std::optional<int64_t> invisibleTime;
+    std::optional<int64_t> pollTime;
+    // bornTime 必须是**当前毫秒时间戳**：broker 校验
+    // now - bornTime - pollTime > 500 就直接回 POLLING_TIMEOUT(210)。
+    std::optional<int64_t> bornTime;
+    // 0 = MIN（从最小位点开始），非 0 = MAX（只拿新消息）
+    std::optional<int32_t> initMode;
+    std::optional<std::string> expType;
+    std::optional<std::string> exp;
+    bool order = false;
+    std::optional<std::string> attemptId;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// Java PopMessageResponseHeader
+struct PopMessageResponseHeader : public CommandCustomHeader {
+    std::optional<int64_t> popTime;
+    std::optional<int64_t> invisibleTime;
+    std::optional<int32_t> reviveQid;
+    std::optional<int64_t> restNum;
+    std::optional<std::string> startOffsetInfo;
+    std::optional<std::string> msgOffsetInfo;
+    std::optional<std::string> orderCountInfo;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// Java AckMessageRequestHeader（RequestCode::ACK_MESSAGE = 200051）
+// offset 是 **consumeQueue offset**（CK 串第 8 段），不是 commitlog offset。
+struct AckMessageRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> consumerGroup;
+    std::optional<std::string> topic;
+    std::optional<int32_t> queueId;
+    std::optional<std::string> extraInfo;
+    std::optional<int64_t> offset;
+    std::optional<std::string> liteTopic;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// Java ChangeInvisibleTimeRequestHeader（CHANGE_MESSAGE_INVISIBLETIME = 200053）
+struct ChangeInvisibleTimeRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> consumerGroup;
+    std::optional<std::string> topic;
+    std::optional<int32_t> queueId;
+    std::optional<std::string> extraInfo;
+    std::optional<int64_t> offset;
+    std::optional<int64_t> invisibleTime;
+    std::optional<std::string> liteTopic;
+    bool suspend = false;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// Java ChangeInvisibleTimeResponseHeader：返回的是**新的** popTime/invisibleTime/reviveQid
+struct ChangeInvisibleTimeResponseHeader : public CommandCustomHeader {
+    std::optional<int64_t> popTime;
+    std::optional<int64_t> invisibleTime;
+    std::optional<int32_t> reviveQid;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
 }  // namespace rocketmq
 
 #endif  // ROCKETMQ_REMOTING_PROTOCOL_HEADERS_H

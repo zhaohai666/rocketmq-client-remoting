@@ -48,6 +48,7 @@ set(RMQ_SOURCES
     src/remoting/protocol/serialize.cpp
     src/remoting/protocol/remoting_command.cpp
     src/remoting/protocol/headers.cpp
+    src/remoting/protocol/extra_info.cpp
     src/remoting/protocol/route.cpp
     src/remoting/protocol/heartbeat.cpp
     src/remoting/protocol/subscription.cpp

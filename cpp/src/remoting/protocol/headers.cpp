@@ -532,4 +532,120 @@ void CreateTopicRequestHeader::fromExtFields(const PropertyMap& ext) {
     force = getOptBool(ext, "force");
 }
 
+// ---------------------------------------------------------------- POP 模式
+
+PropertyMap PopMessageRequestHeader::toExtFields() const {
+    PropertyMap out;
+    putOptStr(out, "consumerGroup", consumerGroup);
+    putOptStr(out, "topic", topic);
+    putOptInt32(out, "queueId", queueId);
+    putOptInt32(out, "maxMsgNums", maxMsgNums);
+    putOptInt(out, "invisibleTime", invisibleTime);
+    putOptInt(out, "pollTime", pollTime);
+    putOptInt(out, "bornTime", bornTime);
+    putOptInt32(out, "initMode", initMode);
+    putOptStr(out, "expType", expType);
+    putOptStr(out, "exp", exp);
+    // 非 optional：Java 侧是 Boolean order = Boolean.FALSE，总是写出
+    putOptBool(out, "order", std::optional<bool>(order));
+    putOptStr(out, "attemptId", attemptId);
+    return out;
+}
+
+void PopMessageRequestHeader::fromExtFields(const PropertyMap& ext) {
+    consumerGroup = getOptStr(ext, "consumerGroup");
+    topic = getOptStr(ext, "topic");
+    queueId = getOptInt(ext, "queueId");
+    maxMsgNums = getOptInt(ext, "maxMsgNums");
+    invisibleTime = getOptLong(ext, "invisibleTime");
+    pollTime = getOptLong(ext, "pollTime");
+    bornTime = getOptLong(ext, "bornTime");
+    initMode = getOptInt(ext, "initMode");
+    expType = getOptStr(ext, "expType");
+    exp = getOptStr(ext, "exp");
+    order = getOptBool(ext, "order").value_or(false);
+    attemptId = getOptStr(ext, "attemptId");
+}
+
+PropertyMap PopMessageResponseHeader::toExtFields() const {
+    PropertyMap out;
+    putOptInt(out, "popTime", popTime);
+    putOptInt(out, "invisibleTime", invisibleTime);
+    putOptInt32(out, "reviveQid", reviveQid);
+    putOptInt(out, "restNum", restNum);
+    putOptStr(out, "startOffsetInfo", startOffsetInfo);
+    putOptStr(out, "msgOffsetInfo", msgOffsetInfo);
+    putOptStr(out, "orderCountInfo", orderCountInfo);
+    return out;
+}
+
+void PopMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
+    popTime = getOptLong(ext, "popTime");
+    invisibleTime = getOptLong(ext, "invisibleTime");
+    reviveQid = getOptInt(ext, "reviveQid");
+    restNum = getOptLong(ext, "restNum");
+    startOffsetInfo = getOptStr(ext, "startOffsetInfo");
+    msgOffsetInfo = getOptStr(ext, "msgOffsetInfo");
+    orderCountInfo = getOptStr(ext, "orderCountInfo");
+}
+
+PropertyMap AckMessageRequestHeader::toExtFields() const {
+    PropertyMap out;
+    putOptStr(out, "consumerGroup", consumerGroup);
+    putOptStr(out, "topic", topic);
+    putOptInt32(out, "queueId", queueId);
+    putOptStr(out, "extraInfo", extraInfo);
+    putOptInt(out, "offset", offset);
+    putOptStr(out, "liteTopic", liteTopic);
+    return out;
+}
+
+void AckMessageRequestHeader::fromExtFields(const PropertyMap& ext) {
+    consumerGroup = getOptStr(ext, "consumerGroup");
+    topic = getOptStr(ext, "topic");
+    queueId = getOptInt(ext, "queueId");
+    extraInfo = getOptStr(ext, "extraInfo");
+    offset = getOptLong(ext, "offset");
+    liteTopic = getOptStr(ext, "liteTopic");
+}
+
+PropertyMap ChangeInvisibleTimeRequestHeader::toExtFields() const {
+    PropertyMap out;
+    putOptStr(out, "consumerGroup", consumerGroup);
+    putOptStr(out, "topic", topic);
+    putOptInt32(out, "queueId", queueId);
+    putOptStr(out, "extraInfo", extraInfo);
+    putOptInt(out, "offset", offset);
+    putOptInt(out, "invisibleTime", invisibleTime);
+    putOptStr(out, "liteTopic", liteTopic);
+    // 非 optional：Java 侧是 private boolean suspend = false，总是写出
+    putOptBool(out, "suspend", std::optional<bool>(suspend));
+    return out;
+}
+
+void ChangeInvisibleTimeRequestHeader::fromExtFields(const PropertyMap& ext) {
+    consumerGroup = getOptStr(ext, "consumerGroup");
+    topic = getOptStr(ext, "topic");
+    queueId = getOptInt(ext, "queueId");
+    extraInfo = getOptStr(ext, "extraInfo");
+    offset = getOptLong(ext, "offset");
+    invisibleTime = getOptLong(ext, "invisibleTime");
+    liteTopic = getOptStr(ext, "liteTopic");
+    suspend = getOptBool(ext, "suspend").value_or(false);
+}
+
+PropertyMap ChangeInvisibleTimeResponseHeader::toExtFields() const {
+    PropertyMap out;
+    putOptInt(out, "popTime", popTime);
+    putOptInt(out, "invisibleTime", invisibleTime);
+    putOptInt32(out, "reviveQid", reviveQid);
+    return out;
+}
+
+void ChangeInvisibleTimeResponseHeader::fromExtFields(const PropertyMap& ext) {
+    popTime = getOptLong(ext, "popTime");
+    invisibleTime = getOptLong(ext, "invisibleTime");
+    reviveQid = getOptInt(ext, "reviveQid");
+}
+
 }  // namespace rocketmq
