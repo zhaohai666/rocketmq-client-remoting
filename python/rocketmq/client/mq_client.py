@@ -439,6 +439,269 @@ class MQClientInstance:
         return PullResult(status, resp_header.next_begin_offset or 0,
                           resp_header.min_offset or 0, resp_header.max_offset or 0, found)
 
+    # ---------------- POP 模式（5.x 轻量消费） ----------------
+
+    def pop_message(self, consumer_group: str, topic: str, queue_id: int = -1,
+                    max_msg_nums: int = 32, invisible_time: int = 60000,
+                    poll_time: int = 0, init_mode: int = 0,
+                    exp: Optional[str] = None, exp_type: Optional[str] = None,
+                    order: bool = False, broker_name: Optional[str] = None,
+                    timeout_millis: int = 10000, addr: Optional[str] = None) -> "PopResult":
+        """POP 弹取消息（``RequestCode.POP_MESSAGE = 200050``）。
+
+        与 pull 的语义差别：
+        - **不需要提交位点**，消费完成后用 ``ack_message`` 确认；
+        - 不 ack 的消息在 ``invisible_time`` 之后被 broker 复活并重投到
+          ``%RETRY%<group>_<topic>``（V1），下次 POP 会再弹回来 —— 至少一次语义；
+        - ``queue_id = -1`` 表示弹该 topic 的所有队列。
+
+        ``born_time`` 必须是当前毫秒时间戳：broker 用
+        ``now - bornTime - pollTime > 500`` 判定"超时太久"并直接回
+        ``POLLING_TIMEOUT(210)``，填 0 会必然失败。
+        """
+        from .consumer_result import PopResult, PopStatus
+        from ..remoting.protocol import extra_info as ei
+        from ..remoting.protocol.headers import (PopMessageRequestHeader,
+                                                 PopMessageResponseHeader)
+
+        if addr is None or broker_name is None:
+            route = self.get_topic_route_data(topic)
+            if route is None:
+                raise MQClientException("No route info of this topic: %s" % topic)
+            brokers = route.get_broker_datas()
+            if not brokers:
+                raise MQClientException("No broker in route of topic: %s" % topic)
+            bd = brokers[0]
+            broker_name = broker_name or bd.broker_name
+            if addr is None:
+                addr = bd.select_broker_addr()
+                if addr is None:
+                    raise MQClientException("No available broker addr for topic: %s" % topic)
+
+        header = PopMessageRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = topic
+        header.queue_id = queue_id
+        header.max_msg_nums = max_msg_nums
+        header.invisible_time = invisible_time
+        header.poll_time = poll_time
+        header.born_time = int(time.time() * 1000)
+        header.init_mode = init_mode
+        header.exp_type = exp_type
+        header.exp = exp
+        header.order = order
+        request = RemotingCommand.create_request_command(RequestCode.POP_MESSAGE, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+
+        # 响应码映射照 Java MQClientAPIImpl.processPopResponse。
+        if response.code == ResponseCode.SUCCESS:
+            status = PopStatus.FOUND
+        elif response.code == ResponseCode.POLLING_FULL:
+            status = PopStatus.POLLING_FULL
+        elif response.code == ResponseCode.POLLING_TIMEOUT:
+            status = PopStatus.POLLING_NOT_FOUND
+        elif response.code == ResponseCode.PULL_NOT_FOUND:
+            status = PopStatus.POLLING_NOT_FOUND
+        else:
+            raise MQBrokerException(response.code, response.remark or "")
+
+        resp_header = PopMessageResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+
+        found: List[MessageExt] = []
+        if status == PopStatus.FOUND and response.body:
+            found = decode_messages(response.body)
+            # 必须在改写 topic 之前反构 POP_CK —— retryFlag 是从消息**原始** topic
+            # 推出来的（broker 可能改写 topic，见 Java buildQueueOffsetSortedMap 注释）。
+            self._stamp_pop_ck(found, broker_name, resp_header)
+
+        # Java processPopResponse 收尾：统一盖 brokerName，并把 topic 还原成请求的
+        # topic（不带命名空间），这样消费方不用关心 retry topic。
+        for m in found:
+            m.broker_name = broker_name
+            m.topic = topic
+
+        return PopResult(status, found,
+                         resp_header.rest_num or 0,
+                         resp_header.pop_time or 0,
+                         resp_header.invisible_time or 0,
+                         resp_header.revive_qid or 0,
+                         resp_header.start_offset_info,
+                         resp_header.msg_offset_info,
+                         resp_header.order_count_info)
+
+    @staticmethod
+    def _pop_queue_map_key(extra, m: MessageExt) -> str:
+        """``startOffsetInfo`` / ``msgOffsetInfo`` / sortMap 的查表 key。
+
+        Java ``getStartOffsetInfoMapKey(topic, popCk, key)`` 的规则：消息**已带**
+        ``POP_CK``（说明是从 retry topic 弹回来的）时 retryFlag 取自 POP_CK 第 5 段，
+        否则由消息 topic 推断 —— 因为 broker 可能改写 topic。
+        """
+        ck = m.properties.get(MessageConst.PROPERTY_POP_CK)
+        if ck:
+            return extra.get_retry(extra.split(ck)) + "@" + str(m.queue_id)
+        return extra.get_start_offset_info_map_key(m.topic, m.queue_id)
+
+    def _stamp_pop_ck(self, found: List[MessageExt], broker_name: str, resp_header) -> None:
+        """给 POP 出来的消息反构 ``POP_CK`` 与 ``1ST_POP_TIME``。
+
+        **这是 POP 最容易踩的坑**：普通 topic 直连 POP 时 broker **不写** ``POP_CK``
+        属性（只在 retry topic 重编码路径才写），必须由客户端用响应头的
+        ``startOffsetInfo`` / ``msgOffsetInfo`` 反构 —— 没有它就无法发 ACK。
+        逐条对齐 Java ``MQClientAPIImpl.processPopResponse``。
+        """
+        from ..remoting.protocol import extra_info as extra
+
+        pop_time = resp_header.pop_time or 0
+        invisible_time = resp_header.invisible_time or 0
+        revive_qid = resp_header.revive_qid or 0
+
+        if not resp_header.start_offset_info:
+            # Java 的 startOffsetInfo == null 分支：用消息自身 queueOffset 当
+            # ckQueueOffset 拼 7 段，再手工补一段凑成 8 段。
+            per_queue: Dict[str, str] = {}
+            for m in found:
+                key = str(m.topic) + str(m.queue_id)
+                if key not in per_queue:
+                    per_queue[key] = extra.build_extra_info(
+                        m.queue_offset, pop_time, invisible_time, revive_qid,
+                        m.topic, broker_name, m.queue_id)
+                m.properties[MessageConst.PROPERTY_POP_CK] = (
+                    per_queue[key] + extra.KEY_SEPARATOR + str(m.queue_offset))
+        else:
+            start_map = extra.parse_start_offset_info(resp_header.start_offset_info) or {}
+            msg_map = extra.parse_msg_offset_info(resp_header.msg_offset_info) or {}
+
+            # Java 先按队列收集 queueOffset 并排序，再用 indexOf 求下标去取
+            # msgOffsetInfo 里对应的 msgQueueOffset。
+            sorted_offsets: Dict[str, List[int]] = {}
+            for m in found:
+                queue_key = self._pop_queue_map_key(extra, m)
+                sorted_offsets.setdefault(queue_key, []).append(m.queue_offset)
+            for offsets in sorted_offsets.values():
+                offsets.sort()
+
+            for m in found:
+                # retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+                if m.properties.get(MessageConst.PROPERTY_POP_CK) is not None:
+                    continue
+                queue_key = self._pop_queue_map_key(extra, m)
+                start_offset = start_map.get(queue_key)
+                offsets = msg_map.get(queue_key)
+                if start_offset is None or not offsets:
+                    continue
+                try:
+                    index = sorted_offsets[queue_key].index(m.queue_offset)
+                except ValueError:
+                    continue
+                if index >= len(offsets):
+                    continue
+                m.properties[MessageConst.PROPERTY_POP_CK] = extra.build_extra_info(
+                    start_offset, pop_time, invisible_time, revive_qid,
+                    m.topic, broker_name, m.queue_id, offsets[index])
+
+        # Java 用 computeIfAbsent：只在缺失时补。
+        for m in found:
+            m.properties.setdefault(MessageConst.PROPERTY_FIRST_POP_TIME, str(pop_time))
+
+    def _addr_for(self, topic: str, broker_name: Optional[str] = None) -> str:
+        """按 topic（可选再按 brokerName）解析 broker 地址。"""
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            raise MQClientException("No route info of this topic: %s" % topic)
+        if broker_name:
+            addr = MQClientInstance.find_broker_addr_in_route(route, broker_name)
+            if addr is None:
+                raise MQClientException(
+                    "Broker %s not found in route of topic %s" % (broker_name, topic))
+            return addr
+        brokers = route.get_broker_datas()
+        if not brokers:
+            raise MQClientException("No broker in route of topic: %s" % topic)
+        addr = brokers[0].select_broker_addr()
+        if addr is None:
+            raise MQClientException("No available broker addr for topic: %s" % topic)
+        return addr
+
+    def ack_message(self, consumer_group: str, topic: str, queue_id: int,
+                    extra_info: str, offset: int, broker_name: Optional[str] = None,
+                    timeout_millis: int = 3000, addr: Optional[str] = None) -> int:
+        """确认一条 POP 消息（``RequestCode.ACK_MESSAGE = 200051``）。
+
+        ``extra_info`` 用消息上的 ``POP_CK`` 属性；``offset`` 必须是
+        **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），不是 commitlog
+        offset —— 传错 broker 会回 ``NO_MESSAGE``。
+
+        返回 broker 响应码，``ResponseCode.SUCCESS`` 即确认成功。
+        """
+        from ..remoting.protocol import extra_info as extra
+        from ..remoting.protocol.headers import AckMessageRequestHeader
+
+        if broker_name is None:
+            broker_name = extra.get_broker_name(extra.split(extra_info))
+        if addr is None:
+            addr = self._addr_for(topic, broker_name)
+
+        header = AckMessageRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = topic
+        header.queue_id = queue_id
+        header.extra_info = extra_info
+        header.offset = offset
+        request = RemotingCommand.create_request_command(RequestCode.ACK_MESSAGE, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        return response.code
+
+    def change_invisible_time(self, consumer_group: str, topic: str, queue_id: int,
+                              extra_info: str, offset: int, invisible_time: int,
+                              broker_name: Optional[str] = None,
+                              timeout_millis: int = 3000,
+                              addr: Optional[str] = None) -> "ChangeInvisibleTimeResult":
+        """延长 POP 消息的不可见时间（``CHANGE_MESSAGE_INVISIBLETIME = 200053``）。
+
+        用于"还在处理、别让 broker 复活重投"的场景。响应返回的是**新的**
+        popTime / invisibleTime / reviveQid，客户端据此重建 8 段 extraInfo
+        （返回在结果的 ``extra_info`` 字段里）供后续 ACK 使用 —— 不是原来那个旧串。
+        """
+        from .consumer_result import ChangeInvisibleTimeResult
+        from ..remoting.protocol import extra_info as extra
+        from ..remoting.protocol.headers import (ChangeInvisibleTimeRequestHeader,
+                                                 ChangeInvisibleTimeResponseHeader)
+
+        if broker_name is None:
+            broker_name = extra.get_broker_name(extra.split(extra_info))
+        if addr is None:
+            addr = self._addr_for(topic, broker_name)
+
+        header = ChangeInvisibleTimeRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = topic
+        header.queue_id = queue_id
+        header.extra_info = extra_info
+        header.offset = offset
+        header.invisible_time = invisible_time
+        request = RemotingCommand.create_request_command(
+            RequestCode.CHANGE_MESSAGE_INVISIBLETIME, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+
+        resp_header = ChangeInvisibleTimeResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+
+        new_extra = None
+        if response.code == ResponseCode.SUCCESS:
+            # 与 Java MQClientAPIImpl.changeInvisibleTimeAsync 一致：
+            # 7 段 build（ckQueueOffset 用本次的 offset）再补一段凑 8 段。
+            new_extra = extra.build_extra_info(
+                offset, resp_header.pop_time, resp_header.invisible_time,
+                resp_header.revive_qid, topic, broker_name, queue_id,
+                offset)
+        return ChangeInvisibleTimeResult(response.code,
+                                         resp_header.pop_time or 0,
+                                         resp_header.invisible_time or 0,
+                                         resp_header.revive_qid or 0,
+                                         new_extra)
+
     # ---------------- Offset 查询/更新 ----------------
     def query_consumer_offset(self, consumer_group: str, mq: MessageQueue,
                               timeout_millis: int = 5000, addr: Optional[str] = None,

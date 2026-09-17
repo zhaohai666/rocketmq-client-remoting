@@ -1404,3 +1404,165 @@ class QueryDataVersionResponseHeader(CommandCustomHeader):
     def from_ext_fields(self, ext: dict) -> None:
         v = ext.get("changed")
         self.changed = bool(v) if v is not None else None
+
+
+# ---------------- POP 模式（5.x 轻量消费） ----------------
+#
+# ext key 必须逐字等于 Java 侧的字段名：broker 用 fastjson2 按 Java 属性名反序列化，
+# 错一个字母就**静默丢字段**（不报错、行为静默退化），所以下面每个 key 都对着
+# Java `remoting/.../protocol/header/Pop*Header.java` 抄。
+#
+# 另外注意 `order` / `suspend` 这两个字段 Java 用的是**非空** Boolean/boolean
+# （`Boolean order = Boolean.FALSE`、`private boolean suspend = false`），
+# `encodeHeader` 只会跳过 null，所以它们**总是**出现在报文里 —— 这里也不做 None 过滤。
+
+
+class PopMessageRequestHeader(CommandCustomHeader):
+    """Java ``PopMessageRequestHeader``（RequestCode.POP_MESSAGE = 200050）。"""
+
+    def __init__(self):
+        self.consumer_group: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.queue_id: Optional[int] = None
+        self.max_msg_nums: Optional[int] = None
+        self.invisible_time: Optional[int] = None
+        self.poll_time: Optional[int] = None
+        # bornTime 必须是**当前毫秒时间戳**：broker 校验
+        # `now - bornTime - pollTime > 500` 就直接回 POLLING_TIMEOUT(210)。
+        self.born_time: Optional[int] = None
+        # 0 = MIN（从最小位点开始，能消费历史），1 = MAX（只拿新消息）
+        self.init_mode: Optional[int] = None
+        self.exp_type: Optional[str] = None
+        self.exp: Optional[str] = None
+        self.order: bool = False
+        self.attempt_id: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "consumerGroup": self.consumer_group,
+            "topic": self.topic,
+            "queueId": self.queue_id,
+            "maxMsgNums": self.max_msg_nums,
+            "invisibleTime": self.invisible_time,
+            "pollTime": self.poll_time,
+            "bornTime": self.born_time,
+            "initMode": self.init_mode,
+            "expType": self.exp_type,
+            "exp": self.exp,
+            "order": self.order,
+            "attemptId": self.attempt_id,
+        })
+
+
+class PopMessageResponseHeader(CommandCustomHeader):
+    """Java ``PopMessageResponseHeader``。
+
+    ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` 是编码过的
+    字符串（空格做字段分隔、分号做队列分隔），用 ``extra_info`` 模块解析。
+    """
+
+    def __init__(self):
+        self.pop_time: Optional[int] = None
+        self.invisible_time: Optional[int] = None
+        self.revive_qid: Optional[int] = None
+        self.rest_num: Optional[int] = None
+        self.start_offset_info: Optional[str] = None
+        self.msg_offset_info: Optional[str] = None
+        self.order_count_info: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "popTime": self.pop_time,
+            "invisibleTime": self.invisible_time,
+            "reviveQid": self.revive_qid,
+            "restNum": self.rest_num,
+            "startOffsetInfo": self.start_offset_info,
+            "msgOffsetInfo": self.msg_offset_info,
+            "orderCountInfo": self.order_count_info,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.pop_time = _l(ext.get("popTime"))
+        self.invisible_time = _l(ext.get("invisibleTime"))
+        self.revive_qid = _i(ext.get("reviveQid"))
+        self.rest_num = _l(ext.get("restNum"))
+        self.start_offset_info = ext.get("startOffsetInfo")
+        self.msg_offset_info = ext.get("msgOffsetInfo")
+        self.order_count_info = ext.get("orderCountInfo")
+
+
+class AckMessageRequestHeader(CommandCustomHeader):
+    """Java ``AckMessageRequestHeader``（RequestCode.ACK_MESSAGE = 200051）。
+
+    ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
+    不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
+    """
+
+    def __init__(self):
+        self.consumer_group: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.queue_id: Optional[int] = None
+        self.extra_info: Optional[str] = None
+        self.offset: Optional[int] = None
+        self.lite_topic: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "consumerGroup": self.consumer_group,
+            "topic": self.topic,
+            "queueId": self.queue_id,
+            "extraInfo": self.extra_info,
+            "offset": self.offset,
+            "liteTopic": self.lite_topic,
+        })
+
+
+class ChangeInvisibleTimeRequestHeader(CommandCustomHeader):
+    """Java ``ChangeInvisibleTimeRequestHeader``（CHANGE_MESSAGE_INVISIBLETIME = 200053）。"""
+
+    def __init__(self):
+        self.consumer_group: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.queue_id: Optional[int] = None
+        self.extra_info: Optional[str] = None
+        self.offset: Optional[int] = None
+        self.invisible_time: Optional[int] = None
+        self.lite_topic: Optional[str] = None
+        self.suspend: bool = False
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "consumerGroup": self.consumer_group,
+            "topic": self.topic,
+            "queueId": self.queue_id,
+            "extraInfo": self.extra_info,
+            "offset": self.offset,
+            "invisibleTime": self.invisible_time,
+            "liteTopic": self.lite_topic,
+            "suspend": self.suspend,
+        })
+
+
+class ChangeInvisibleTimeResponseHeader(CommandCustomHeader):
+    """Java ``ChangeInvisibleTimeResponseHeader``。
+
+    返回的是**新的** ``invisible_time`` / ``pop_time`` / ``revive_qid``；
+    客户端要用它们重建 extraInfo 供后续 ACK 使用。
+    """
+
+    def __init__(self):
+        self.pop_time: Optional[int] = None
+        self.invisible_time: Optional[int] = None
+        self.revive_qid: Optional[int] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "popTime": self.pop_time,
+            "invisibleTime": self.invisible_time,
+            "reviveQid": self.revive_qid,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.pop_time = _l(ext.get("popTime"))
+        self.invisible_time = _l(ext.get("invisibleTime"))
+        self.revive_qid = _i(ext.get("reviveQid"))
