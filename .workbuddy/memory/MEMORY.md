@@ -72,8 +72,15 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
      `%RETRY%<group>_<topic>`（V1）。`queueId=-1` = 弹所有队列。
    - 移植坑：Java `String.split(" ")` **丢弃末尾空串**，Python/（C# 的 `Split(' ')`）会保留 ——
      段数校验依赖这个差异。`order`/`suspend` 在 Java 是非空 Boolean，**总是**出现在报文里。
+   - 移植坑（**只有 .NET 踩到**）：反构 CK 求 index 要去**本批该队列的 queueOffset 排序表**
+     （Java `sortMap`）里找下标，再拿这个下标去 `msgOffsetInfo` 取值；**不能**直接在
+     `msgOffsetInfo` 列表里 `IndexOf(消息自身 queueOffset)` —— 两者不等时会一条都盖不上 CK
+     （Java `MQClientAPIImpl:1202`）。回归守卫：`PopTests.StampPopCkIndexSelectsRightOffsetWithinQueue`
+     故意让 msgOffsetInfo 值（100/101/102）≠ 消息 queueOffset（10/11/12）。
    - 三侧回归守卫：Python `tests/test_pop.py`（50 例，含 extFields 逐键断言）+ 真机
-     `python/verify_pop_live.py` S1–S8；harness `/tmp/run_pop_live.sh`。
+     `python/verify_pop_live.py` S1–S8；C++ `tests/test_pop.cpp`（ctest 12/12）+
+     `examples/live_pop.cpp`；.NET `tests/.../PopTests.cs`（xunit 125/125）+
+     `examples/.../LivePop.cs`（子命令 `rmq pop`）。harness `/tmp/run_pop_live.sh all` → 42/42。
 
 ## 两条"静默数据损坏"级的坑（最贵，别顺手优化）
 - **压缩两层语义缺一不可**：未支持的压缩类型（如 SNAPPY）`decompress` **抛异常**，且
@@ -81,15 +88,16 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 - **Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，砍掉最高位**，与标准 CRC-32 差正好 2^31。
   跨语言对 CRC 只看各自的 `match` 字段，别比数字。
 
-## 与 Java 客户端仍存在的差距（命名空间 + ACL + PullConsumer 收官后，2026-09-16 盘点）
+## 与 Java 客户端仍存在的差距（POP 模式收官后，2026-09-17 盘点）
 已对齐 Java：两阶段事务、真实 rebalance + 队列撤销收尾 + 分配时解析初始位点、回投 / 位点持久化 /
 顺序锁 / 广播 / 流控、`resetRetryAndNamespace`、优雅注销、`UNREGISTER_CLIENT`、路由 30s 刷新、
-压缩、**命名空间包裹（三侧）**、**ACL 鉴权（三侧）**、**主动拉取 PullConsumer（三侧）**。
-仍缺（下表；三个 P1/P2 已关闭，其余经 grep 确认仍缺）：
+压缩、**命名空间包裹（三侧）**、**ACL 鉴权（三侧）**、**主动拉取 PullConsumer（三侧）**、
+**Request-Reply（三侧）**、**故障规避 sendLatencyFaultEnable（三侧）**、**POP 模式协议管道（三侧）**。
+仍缺（下表全部为 P3）：
 
 | 能力 | 严重度 | Py | C++ | .NET | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| POP 模式 (5.x 轻量消费) | P2 | ✅ 真机 14/14 | ❌ | ❌ | Python 管道完成（提交 d8c970d，未 push）；C++/.NET 待移植 |
+| POP 消费侧循环（push consumer 走 POP） | P2(余) | ❌ | ❌ | ❌ | 只有协议管道；见下方说明 |
 | 消息轨迹 Trace/Hook | P3 | ❌ | ❌ | ❌ | 三侧均无 |
 | TLS | P3 | ❌ | ❌ | ❌ | 仅明文 TCP |
 | 动态 name server (address server) | P3 | ❌ | ❌ | ❌ | 仅静态 namesrv 列表 |
@@ -98,9 +106,10 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 | 细粒度流控 / 线程弹性 | P3 | ❌ | ❌ | ❌ | 仅 pullThresholdForQueue；消费线程 min=max 固定 |
 
 注：心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。命名空间 / ACL / PullConsumer /
-**Request-Reply (5.x)** / **故障规避 sendLatencyFaultEnable** 均已于 2026-09-16 三侧补齐并
-真机验证（RR：Py 16/16、C++ 15/15、.NET 16/16，`/tmp/run_rr_live.sh`，提交 56350c2/8932727；
-故障规避：三侧 14/14，`/tmp/run_latency_live.sh`，提交 41dd8d3；均已 push，唯一残留是 Java
-startDetector 探测线程，有意省略）。**TopicPublishInfo 三侧现都有"带过滤器选队列"版本**
-（一轮无匹配返回 None/null/nullopt）+ resetIndex，供策略三级退化用。下一步：**POP 模式（P2）**，
-再往后是 Trace / TLS / 动态 name server / 307 运行信息 / 消费线程弹性（P3）。
+Request-Reply / 故障规避 / **POP 协议管道** 均已三侧补齐并真机验证
+（POP：`bash /tmp/run_pop_live.sh all` → 三语言各 14/14，单测 Py 50 例 / C++ ctest 12/12 /
+.NET xunit 125/125，三侧零 warning）。**唯一残留的 P2 是"消费侧 POP 轻量消费循环"** ——
+Java 的 push-consumer POP 走 **broker 侧分配** `QUERY_ASSIGNMENT(400)` +
+`MessageQueueAssignment(mode=POP)`，不做客户端 rebalance；本项目若要补，改用客户端 rebalance
+等价路径并**在文档写明这个有意差异**。再往后按 P3 推进：Trace / TLS / 动态 name server /
+307 运行信息 / 消费线程弹性。
