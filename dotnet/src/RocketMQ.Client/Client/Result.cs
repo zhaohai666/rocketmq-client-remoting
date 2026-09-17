@@ -138,6 +138,69 @@ public sealed class PullResult
     public bool IsNoNewMsg => Status == PullStatus.NoNewMsg;
 }
 
+// ---------------------------------------------------------------- POP 结果
+
+/// <summary>
+/// org.apache.rocketmq.client.consumer.PopStatus。
+/// POP 与 pull 的差别：POP 不提交位点，靠 ack 确认；没有新消息时返回 POLLING_NOT_FOUND
+/// 而不是 NO_NEW_MSG。
+/// </summary>
+public enum PopStatus
+{
+    Found = 0,
+    NoNewMsg = 1,
+    PollingFull = 2,
+    PollingNotFound = 3,
+}
+
+public static class PopStatusNames
+{
+    public static string Name(PopStatus s) => s switch
+    {
+        PopStatus.Found => "FOUND",
+        PopStatus.NoNewMsg => "NO_NEW_MSG",
+        PopStatus.PollingFull => "POLLING_FULL",
+        PopStatus.PollingNotFound => "POLLING_NOT_FOUND",
+        _ => "UNKNOWN",
+    };
+}
+
+/// <summary>org.apache.rocketmq.client.consumer.PopResult。</summary>
+public sealed class PopResult
+{
+    public PopStatus Status { get; set; } = PopStatus.PollingNotFound;
+    public List<MessageExt> MsgFoundList { get; set; } = new();
+    public long RestNum { get; set; }
+    public long PopTime { get; set; }
+    public long InvisibleTime { get; set; }
+    public int ReviveQid { get; set; }
+
+    /// <summary>每队列的起始 offset，形如 "0 3 0;0 2 0"；客户端据此反构 POP_CK。</summary>
+    public string StartOffsetInfo { get; set; } = string.Empty;
+
+    /// <summary>每队列本批弹出的 offset 列表，形如 "0 3 0,1,2"。</summary>
+    public string MsgOffsetInfo { get; set; } = string.Empty;
+
+    public string OrderCountInfo { get; set; } = string.Empty;
+
+    public bool IsFound => Status == PopStatus.Found;
+}
+
+/// <summary>
+/// CHANGE_MESSAGE_INVISIBLETIME 的结果。ExtraInfo 是用响应里**新的**
+/// popTime/invisibleTime/reviveQid 重建的 8 段串，后续 ACK 必须用它。
+/// </summary>
+public sealed class ChangeInvisibleTimeResult
+{
+    public int Code { get; set; }
+    public long PopTime { get; set; }
+    public long InvisibleTime { get; set; }
+    public int ReviveQid { get; set; }
+    public string ExtraInfo { get; set; } = string.Empty;
+
+    public bool Success => Code == ResponseCode.Success;
+}
+
 // ---------------------------------------------------------------- 消费状态
 
 /// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus。</summary>

@@ -943,3 +943,216 @@ public sealed class ReplyMessageRequestHeader : ICommandCustomHeader
         StoreTimestamp = HeaderCodec.GetOptLong(ext, "storeTimestamp");
     }
 }
+
+// ------------------------------------------------ POP（5.x 轻量消费）
+//
+// ⚠ ext 键名必须逐字等于 Java 字段名：broker 用 fastjson2 按 Java 属性名反序列化，
+//   错一个字母就**静默丢字段**（不报错，只是那个条件不生效）。
+//   例如 maxMsgNums 写成 maxMsgNum 会被 broker 当 0 处理。
+
+/// <summary>org.apache.rocketmq.remoting.protocol.header.PopMessageRequestHeader。</summary>
+public sealed class PopMessageRequestHeader : ICommandCustomHeader
+{
+    public string? ConsumerGroup { get; set; }
+    public string? Topic { get; set; }
+    public int? QueueId { get; set; }
+    public int? MaxMsgNums { get; set; }
+    public long? InvisibleTime { get; set; }
+
+    /// <summary>长轮询挂起时长；本客户端只做短轮询，恒为 0。</summary>
+    public long? PollTime { get; set; }
+
+    /// <summary>
+    /// ⚠ 必须填**当前毫秒时间戳**。broker 校验 now - bornTime - pollTime > 500 直接回
+    /// POLLING_TIMEOUT(210)（PopMessageRequestHeader.isTimeoutTooMuch）。
+    /// </summary>
+    public long? BornTime { get; set; }
+
+    /// <summary>ConsumeInitMode：0=MIN（从最小位点消费历史），1=MAX（只取新消息）。</summary>
+    public int? InitMode { get; set; }
+
+    public string? ExpType { get; set; }
+    public string? Exp { get; set; }
+
+    /// <summary>Java 是 primitive boolean，**总是在 extFields 里**（与 Python/C++ 侧一致）。</summary>
+    public bool Order { get; set; }
+
+    public string? AttemptId { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "consumerGroup", ConsumerGroup);
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
+        HeaderCodec.PutOptInt(outMap, "queueId", QueueId);
+        HeaderCodec.PutOptInt(outMap, "maxMsgNums", MaxMsgNums);
+        HeaderCodec.PutOptLong(outMap, "invisibleTime", InvisibleTime);
+        HeaderCodec.PutOptLong(outMap, "pollTime", PollTime);
+        HeaderCodec.PutOptLong(outMap, "bornTime", BornTime);
+        HeaderCodec.PutOptInt(outMap, "initMode", InitMode);
+        HeaderCodec.PutOptStr(outMap, "expType", ExpType);
+        HeaderCodec.PutOptStr(outMap, "exp", Exp);
+        HeaderCodec.PutOptBool(outMap, "order", Order);
+        HeaderCodec.PutOptStr(outMap, "attemptId", AttemptId);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        ConsumerGroup = HeaderCodec.GetOptStr(ext, "consumerGroup");
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
+        QueueId = HeaderCodec.GetOptInt(ext, "queueId");
+        MaxMsgNums = HeaderCodec.GetOptInt(ext, "maxMsgNums");
+        InvisibleTime = HeaderCodec.GetOptLong(ext, "invisibleTime");
+        PollTime = HeaderCodec.GetOptLong(ext, "pollTime");
+        BornTime = HeaderCodec.GetOptLong(ext, "bornTime");
+        InitMode = HeaderCodec.GetOptInt(ext, "initMode");
+        ExpType = HeaderCodec.GetOptStr(ext, "expType");
+        Exp = HeaderCodec.GetOptStr(ext, "exp");
+        Order = HeaderCodec.GetOptBool(ext, "order") ?? false;
+        AttemptId = HeaderCodec.GetOptStr(ext, "attemptId");
+    }
+}
+
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.header.PopMessageResponseHeader。
+/// startOffsetInfo / msgOffsetInfo 是客户端反构 POP_CK 的唯一来源。
+/// </summary>
+public sealed class PopMessageResponseHeader : ICommandCustomHeader
+{
+    public long? PopTime { get; set; }
+    public long? InvisibleTime { get; set; }
+    public int? ReviveQid { get; set; }
+    public long? RestNum { get; set; }
+    public string? StartOffsetInfo { get; set; }
+    public string? MsgOffsetInfo { get; set; }
+    public string? OrderCountInfo { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptLong(outMap, "popTime", PopTime);
+        HeaderCodec.PutOptLong(outMap, "invisibleTime", InvisibleTime);
+        HeaderCodec.PutOptInt(outMap, "reviveQid", ReviveQid);
+        HeaderCodec.PutOptLong(outMap, "restNum", RestNum);
+        HeaderCodec.PutOptStr(outMap, "startOffsetInfo", StartOffsetInfo);
+        HeaderCodec.PutOptStr(outMap, "msgOffsetInfo", MsgOffsetInfo);
+        HeaderCodec.PutOptStr(outMap, "orderCountInfo", OrderCountInfo);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        PopTime = HeaderCodec.GetOptLong(ext, "popTime");
+        InvisibleTime = HeaderCodec.GetOptLong(ext, "invisibleTime");
+        ReviveQid = HeaderCodec.GetOptInt(ext, "reviveQid");
+        RestNum = HeaderCodec.GetOptLong(ext, "restNum");
+        StartOffsetInfo = HeaderCodec.GetOptStr(ext, "startOffsetInfo");
+        MsgOffsetInfo = HeaderCodec.GetOptStr(ext, "msgOffsetInfo");
+        OrderCountInfo = HeaderCodec.GetOptStr(ext, "orderCountInfo");
+    }
+}
+
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.header.AckMessageRequestHeader。
+/// ⚠ Offset 是 **consumeQueue offset**（CK 串第 8 段 / msgQueueOffset），不是 commitlog offset。
+/// </summary>
+public sealed class AckMessageRequestHeader : ICommandCustomHeader
+{
+    public string? ConsumerGroup { get; set; }
+    public string? Topic { get; set; }
+    public int? QueueId { get; set; }
+    public string? ExtraInfo { get; set; }
+    public long? Offset { get; set; }
+    public string? LiteTopic { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "consumerGroup", ConsumerGroup);
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
+        HeaderCodec.PutOptInt(outMap, "queueId", QueueId);
+        HeaderCodec.PutOptStr(outMap, "extraInfo", ExtraInfo);
+        HeaderCodec.PutOptLong(outMap, "offset", Offset);
+        HeaderCodec.PutOptStr(outMap, "liteTopic", LiteTopic);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        ConsumerGroup = HeaderCodec.GetOptStr(ext, "consumerGroup");
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
+        QueueId = HeaderCodec.GetOptInt(ext, "queueId");
+        ExtraInfo = HeaderCodec.GetOptStr(ext, "extraInfo");
+        Offset = HeaderCodec.GetOptLong(ext, "offset");
+        LiteTopic = HeaderCodec.GetOptStr(ext, "liteTopic");
+    }
+}
+
+/// <summary>org.apache.rocketmq.remoting.protocol.header.ChangeInvisibleTimeRequestHeader。</summary>
+public sealed class ChangeInvisibleTimeRequestHeader : ICommandCustomHeader
+{
+    public string? ConsumerGroup { get; set; }
+    public string? Topic { get; set; }
+    public int? QueueId { get; set; }
+    public string? ExtraInfo { get; set; }
+    public long? Offset { get; set; }
+    public long? InvisibleTime { get; set; }
+    public string? LiteTopic { get; set; }
+
+    /// <summary>Java 是 primitive boolean（默认 false），**总是在 extFields 里**。</summary>
+    public bool Suspend { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "consumerGroup", ConsumerGroup);
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
+        HeaderCodec.PutOptInt(outMap, "queueId", QueueId);
+        HeaderCodec.PutOptStr(outMap, "extraInfo", ExtraInfo);
+        HeaderCodec.PutOptLong(outMap, "offset", Offset);
+        HeaderCodec.PutOptLong(outMap, "invisibleTime", InvisibleTime);
+        HeaderCodec.PutOptStr(outMap, "liteTopic", LiteTopic);
+        HeaderCodec.PutOptBool(outMap, "suspend", Suspend);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        ConsumerGroup = HeaderCodec.GetOptStr(ext, "consumerGroup");
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
+        QueueId = HeaderCodec.GetOptInt(ext, "queueId");
+        ExtraInfo = HeaderCodec.GetOptStr(ext, "extraInfo");
+        Offset = HeaderCodec.GetOptLong(ext, "offset");
+        InvisibleTime = HeaderCodec.GetOptLong(ext, "invisibleTime");
+        LiteTopic = HeaderCodec.GetOptStr(ext, "liteTopic");
+        Suspend = HeaderCodec.GetOptBool(ext, "suspend") ?? false;
+    }
+}
+
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.header.ChangeInvisibleTimeResponseHeader。
+/// ⚠ 返回的是**新的** invisibleTime/popTime（不是 startTime/nextVisibleTime）。
+/// </summary>
+public sealed class ChangeInvisibleTimeResponseHeader : ICommandCustomHeader
+{
+    public long? PopTime { get; set; }
+    public long? InvisibleTime { get; set; }
+    public int? ReviveQid { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptLong(outMap, "popTime", PopTime);
+        HeaderCodec.PutOptLong(outMap, "invisibleTime", InvisibleTime);
+        HeaderCodec.PutOptInt(outMap, "reviveQid", ReviveQid);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        PopTime = HeaderCodec.GetOptLong(ext, "popTime");
+        InvisibleTime = HeaderCodec.GetOptLong(ext, "invisibleTime");
+        ReviveQid = HeaderCodec.GetOptInt(ext, "reviveQid");
+    }
+}

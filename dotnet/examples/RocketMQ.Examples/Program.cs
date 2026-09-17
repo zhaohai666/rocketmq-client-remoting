@@ -38,6 +38,7 @@ internal static class Program
                 "rr" => LiveRR.Run(rest),
                 "reqreply" => LiveRR.Run(rest),
                 "latency" => LiveLatency.Run(rest),
+                "pop" => LivePop.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -71,6 +72,7 @@ internal static class Program
               pull         [namesrv]       真实集群主动拉取消费者联调（手动拉取/手动位点/回投）
               rr           [namesrv]        真实集群 Request-Reply（5.x）联调（请求/应答/并发/超时）
               latency      [namesrv]        真实集群发送延迟故障容错联调（默认关/开/隔离退化链/到期恢复）
+              pop          [namesrv]        真实集群 POP 模式（5.x）联调（POP/ACK/延长不可见/复活重投）
             """);
     }
 }

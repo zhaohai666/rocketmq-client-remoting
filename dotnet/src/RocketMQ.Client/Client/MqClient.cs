@@ -756,6 +756,361 @@ public sealed class MQClientInstance : IDisposable
         return result;
     }
 
+    // ---------------- POP（5.x 轻量消费） ----------------
+
+    /// <summary>
+    /// 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME（逐条对齐 Java
+    /// MQClientAPIImpl.processPopResponse:1150-1230）。
+    ///
+    /// ⚠ 这是 POP 最容易踩的坑：**普通 topic 直连 POP 时 broker 不在消息上写 POP_CK**
+    /// （只有 retry topic 的重编码路径才写），而 ACK 必须要这个串，所以只能由客户端用
+    /// 响应头的 startOffsetInfo / msgOffsetInfo 反构出来。
+    ///
+    /// 公开为 static 是为了单测能直接覆盖这段纯逻辑（不联网）。
+    /// </summary>
+    public static void StampPopCk(List<MessageExt> msgs, string brokerName,
+        PopMessageResponseHeader respHeader)
+    {
+        long popTime = respHeader.PopTime ?? 0;
+        long invisibleTime = respHeader.InvisibleTime ?? 0;
+        int reviveQid = respHeader.ReviveQid ?? 0;
+        string startOffsetInfo = respHeader.StartOffsetInfo ?? string.Empty;
+        string msgOffsetInfo = respHeader.MsgOffsetInfo ?? string.Empty;
+
+        if (startOffsetInfo.Length == 0)
+        {
+            // Java 的 startOffsetInfo == null 分支：用消息自身 queueOffset 当 ckQueueOffset
+            // 建 7 段，再手工补一段凑成 8 段。按 topic+queueId 缓存，同队列共用同一基准。
+            var perQueue = new Dictionary<string, string>();
+            foreach (MessageExt m in msgs)
+            {
+                string key = m.Topic + m.QueueId.ToString(CultureInfo.InvariantCulture);
+                if (!perQueue.TryGetValue(key, out string? built))
+                {
+                    built = ExtraInfoUtil.BuildExtraInfo(m.QueueOffset, popTime, invisibleTime,
+                        reviveQid, m.Topic, brokerName, m.QueueId);
+                    perQueue[key] = built;
+                }
+
+                m.Properties[MessageConst.PropertyPopCk] = built + ExtraInfoUtil.KeySeparator
+                    + m.QueueOffset.ToString(CultureInfo.InvariantCulture);
+            }
+        }
+        else
+        {
+            Dictionary<string, long>? startMap = ExtraInfoUtil.ParseStartOffsetInfo(startOffsetInfo);
+            Dictionary<string, List<long>>? msgMap = ExtraInfoUtil.ParseMsgOffsetInfo(msgOffsetInfo);
+
+            // Java 先按队列收集 queueOffset 并**排序**，再用 indexOf 求下标，
+            // 用这个下标去 msgOffsetInfo 里取该条消息真正对应的 msgQueueOffset。
+            var sortedOffsets = new Dictionary<string, List<long>>();
+            foreach (MessageExt m in msgs)
+            {
+                string sortKey = ExtraInfoUtil.GetStartOffsetInfoMapKey(
+                    m.Topic, m.Properties.TryGetValue(MessageConst.PropertyPopCk, out string? ck) ? ck : null,
+                    m.QueueId);
+                if (!sortedOffsets.TryGetValue(sortKey, out List<long>? list))
+                {
+                    list = new List<long>();
+                    sortedOffsets[sortKey] = list;
+                }
+
+                list.Add(m.QueueOffset);
+            }
+
+            foreach (List<long> list in sortedOffsets.Values)
+            {
+                list.Sort();
+            }
+
+            foreach (MessageExt m in msgs)
+            {
+                // retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+                if (m.Properties.ContainsKey(MessageConst.PropertyPopCk))
+                {
+                    continue;
+                }
+
+                if (startMap is null || msgMap is null)
+                {
+                    continue;
+                }
+
+                // 注意：查 startOffsetInfo/msgOffsetInfo 用的是**只看 topic** 的 key
+                // （Java :1200 的两参重载），与上面 sortMap 用的 POP_CK 感知 key 不同；
+                // 能走到这里说明 POP_CK 为空，两者恰好等价。
+                string key = ExtraInfoUtil.GetStartOffsetInfoMapKey(m.Topic, m.QueueId);
+                if (!startMap.TryGetValue(key, out long startOffset)
+                    || !msgMap.TryGetValue(key, out List<long>? offsets)
+                    || !sortedOffsets.TryGetValue(key, out List<long>? ordered))
+                {
+                    continue;
+                }
+
+                // ⚠ 下标是在**本批该队列的 queueOffset 排序表**里找，不是直接在
+                // msgOffsetInfo 列表里找 —— 后者是 broker 侧写入的 offset，可能与本条消息
+                // 自身的 queueOffset 不等（Java 正是用 sortMap.indexOf 再取值）。
+                int index = ordered.IndexOf(m.QueueOffset);
+                if (index < 0 || index >= offsets.Count)
+                {
+                    continue;
+                }
+
+                m.Properties[MessageConst.PropertyPopCk] = ExtraInfoUtil.BuildExtraInfo(
+                    startOffset, popTime, invisibleTime, reviveQid, m.Topic, brokerName,
+                    m.QueueId, offsets[index]);
+            }
+        }
+
+        // Java 用 computeIfAbsent：只在缺失时补。
+        foreach (MessageExt m in msgs)
+        {
+            if (!m.Properties.ContainsKey(MessageConst.PropertyFirstPopTime))
+            {
+                m.Properties[MessageConst.PropertyFirstPopTime] =
+                    popTime.ToString(CultureInfo.InvariantCulture);
+            }
+        }
+    }
+
+    /// <summary>
+    /// POP_MESSAGE（200050）：从 broker 直接弹出消息，**不提交位点** —— 消费成功后必须
+    /// 显式 ACK，否则 invisibleTime 到期后 broker 会把消息复活重投到
+    /// %RETRY%&lt;group&gt;_&lt;topic&gt;（至少一次语义）。
+    ///
+    /// queueId = -1 表示弹该 topic 的所有队列。
+    /// initMode：0=MIN（从最小位点开始，消费历史），1=MAX（只取新消息）。
+    /// </summary>
+    public PopResult PopMessage(string consumerGroup, string topic, int queueId,
+        int maxMsgNums, long invisibleTime, long pollTime, int initMode,
+        string expression = "*", string expressionType = "TAG", bool order = false,
+        int timeoutMillis = 10000, string? brokerNameIn = null, string? addrIn = null)
+    {
+        string brokerName = brokerNameIn ?? string.Empty;
+        string addr = addrIn ?? string.Empty;
+        if (brokerName.Length == 0 || addr.Length == 0)
+        {
+            TopicRouteData? route = GetTopicRouteData(topic);
+            if (route is null)
+            {
+                throw new MQClientNoRouteException(topic);
+            }
+
+            ResolveBrokerFromRoute(route, topic, ref brokerName, ref addr);
+        }
+
+        var header = new PopMessageRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = topic,
+            QueueId = queueId,
+            MaxMsgNums = maxMsgNums,
+            InvisibleTime = invisibleTime,
+            PollTime = pollTime,
+
+            // ⚠ 必须填当前毫秒时间戳：broker 校验 now - bornTime - pollTime > 500 会直接回
+            // POLLING_TIMEOUT(210)（PopMessageRequestHeader.isTimeoutTooMuch），
+            // 填 0 等于必定超时。
+            BornTime = UtilAll.CurrentTimeMillis(),
+            InitMode = initMode,
+            Exp = expression,
+            ExpType = expressionType,
+            Order = order,
+        };
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.PopMessage, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+
+        PopStatus status;
+        switch (response.Code)
+        {
+            case ResponseCode.Success:
+                status = PopStatus.Found;
+                break;
+            case ResponseCode.PollingFull:
+                status = PopStatus.PollingFull;
+                break;
+            case ResponseCode.PollingTimeout:
+                status = PopStatus.PollingNotFound;
+                break;
+            case ResponseCode.PullNotFound:
+                status = PopStatus.PollingNotFound;
+                break;
+            default:
+                throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        var respHeader = new PopMessageResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+
+        var result = new PopResult
+        {
+            Status = status,
+            RestNum = respHeader.RestNum ?? 0,
+            PopTime = respHeader.PopTime ?? 0,
+            InvisibleTime = respHeader.InvisibleTime ?? 0,
+            ReviveQid = respHeader.ReviveQid ?? 0,
+            StartOffsetInfo = respHeader.StartOffsetInfo ?? string.Empty,
+            MsgOffsetInfo = respHeader.MsgOffsetInfo ?? string.Empty,
+            OrderCountInfo = respHeader.OrderCountInfo ?? string.Empty,
+        };
+
+        if (result.Status == PopStatus.Found && response.Body.Length > 0)
+        {
+            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body);
+            StampPopCk(result.MsgFoundList, brokerName, respHeader);
+        }
+
+        // Java processPopResponse 收尾：统一盖 brokerName，并把 topic 还原成请求的 topic
+        // （broker 可能把 retry topic 改写回原 topic）。
+        foreach (MessageExt m in result.MsgFoundList)
+        {
+            m.BrokerName = brokerName;
+            m.Topic = topic;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// ACK_MESSAGE（200051）：确认一条 POP 消息已消费完。
+    ///
+    /// ⚠ offset 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
+    /// 不是 commitlog offset。返回 broker 的响应码，SUCCESS 即成功。
+    /// </summary>
+    public int AckMessage(string consumerGroup, string topic, int queueId,
+        string extraInfo, long offset, int timeoutMillis = 3000,
+        string? brokerNameIn = null, string? addrIn = null)
+    {
+        string brokerName = brokerNameIn ?? string.Empty;
+        if (brokerName.Length == 0 && extraInfo.Length > 0)
+        {
+            // 与 Java 一致：从 CK 串第 6 段取 brokerName（ACK 靠它定位 broker）
+            brokerName = ExtraInfoUtil.GetBrokerName(ExtraInfoUtil.Split(extraInfo));
+        }
+
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            TopicRouteData? route = GetTopicRouteData(topic);
+            if (route is null)
+            {
+                throw new MQClientNoRouteException(topic);
+            }
+
+            ResolveBrokerFromRoute(route, topic, ref brokerName, ref addr);
+        }
+
+        var header = new AckMessageRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = topic,
+            QueueId = queueId,
+            ExtraInfo = extraInfo,
+            Offset = offset,
+        };
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.AckMessage, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        return response.Code;
+    }
+
+    /// <summary>
+    /// CHANGE_MESSAGE_INVISIBLETIME（200053，注意不是 200052 —— 那是 PEEK）：
+    /// 延长一条 POP 消息的不可见时间。
+    ///
+    /// 响应给的是**新的** popTime/invisibleTime/reviveQid；成功时用它们 + 请求里的 offset
+    /// 重建一个 8 段 extraInfo（结果里的 ExtraInfo），**后续 ACK 必须用新串**。
+    /// </summary>
+    public ChangeInvisibleTimeResult ChangeInvisibleTime(string consumerGroup, string topic,
+        int queueId, string extraInfo, long offset, long invisibleTime,
+        int timeoutMillis = 3000, string? brokerNameIn = null, string? addrIn = null)
+    {
+        string brokerName = brokerNameIn ?? string.Empty;
+        if (brokerName.Length == 0 && extraInfo.Length > 0)
+        {
+            brokerName = ExtraInfoUtil.GetBrokerName(ExtraInfoUtil.Split(extraInfo));
+        }
+
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            TopicRouteData? route = GetTopicRouteData(topic);
+            if (route is null)
+            {
+                throw new MQClientNoRouteException(topic);
+            }
+
+            ResolveBrokerFromRoute(route, topic, ref brokerName, ref addr);
+        }
+
+        var header = new ChangeInvisibleTimeRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = topic,
+            QueueId = queueId,
+            ExtraInfo = extraInfo,
+            Offset = offset,
+            InvisibleTime = invisibleTime,
+        };
+
+        RemotingCommand request =
+            RemotingCommand.CreateRequestCommand(RequestCode.ChangeMessageInvisibletime, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+
+        var respHeader = new ChangeInvisibleTimeResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+
+        var result = new ChangeInvisibleTimeResult
+        {
+            Code = response.Code,
+            PopTime = respHeader.PopTime ?? 0,
+            InvisibleTime = respHeader.InvisibleTime ?? 0,
+            ReviveQid = respHeader.ReviveQid ?? 0,
+        };
+
+        if (response.Code == ResponseCode.Success)
+        {
+            // 与 Java MQClientAPIImpl.changeInvisibleTimeAsync 一致：用**响应里的**新值重建。
+            result.ExtraInfo = ExtraInfoUtil.BuildExtraInfo(offset, result.PopTime,
+                result.InvisibleTime, result.ReviveQid, topic, brokerName, queueId, offset);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 由路由补齐 brokerName / addr（缺哪个补哪个）。Java 侧对应
+    /// MQClientAPIImpl.getBrokerName/getBrokerAddr 的组合语义。
+    /// </summary>
+    private static void ResolveBrokerFromRoute(TopicRouteData route, string topic,
+        ref string brokerName, ref string addr)
+    {
+        if (brokerName.Length == 0)
+        {
+            if (route.BrokerDatas.Count == 0)
+            {
+                throw new MQClientException("No broker in route of topic: " + topic);
+            }
+
+            brokerName = route.BrokerDatas[0].BrokerName;
+        }
+
+        if (addr.Length == 0)
+        {
+            addr = FindBrokerAddrInRoute(route, brokerName);
+            if (addr.Length == 0 && route.BrokerDatas.Count > 0)
+            {
+                addr = route.BrokerDatas[0].SelectBrokerAddr();
+            }
+
+            if (addr.Length == 0)
+            {
+                throw new MQClientException("No available broker addr for topic: " + topic);
+            }
+        }
+    }
+
     // ---------------- 消费位点 ----------------
 
     /// <summary>返回 false 表示 broker 回 QUERY_NOT_FOUND（消费组尚无位点）。</summary>

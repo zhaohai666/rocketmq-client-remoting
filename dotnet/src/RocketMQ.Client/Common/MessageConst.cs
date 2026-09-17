@@ -54,6 +54,12 @@ public static class MessageConst
     public const string PropertyPopCk = "POP_CK";
     public const string PropertyPopCkOffset = "POP_CK_OFFSET";
     public const string PropertyPopTime = "POP_TIME";
+
+    /// <summary>
+    /// 首次被 POP 到的时间戳。broker 只在 retry topic 重编码路径写；普通 topic 由客户端在
+    /// 缺失时用响应头的 popTime 补上（Java MQClientAPIImpl.processPopResponse）。
+    /// </summary>
+    public const string PropertyFirstPopTime = "1ST_POP_TIME";
     public const string PropertyInvisibleTime = "INVISIBLE_TIME";
     public const string PropertyDelayTime = "DELAY_TIME";
     public const string PropertyStartTime = "START_TIME";
