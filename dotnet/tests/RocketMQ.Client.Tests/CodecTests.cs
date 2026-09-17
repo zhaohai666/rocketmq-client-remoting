@@ -251,7 +251,13 @@ public class CodecTests
         MessageBatch batch = MessageBatch.GenerateFromList(new List<Message> { a, b });
         Assert.Equal(2, batch.Size);
         Assert.Equal("T_B", batch.Topic);
-        Assert.Equal(body, batch.Body);
+        // ⚠ GenerateFromList 会给每条子消息补 UNIQ_KEY（对齐 Java DefaultMQProducerImpl:933
+        // "for MessageBatch, ID has been set in the generating process"），所以 batch.Body
+        // **不等于**补 ID 之前算出来的 body（会多一个 UNIQ_KEY 属性）。用同一批消息
+        // 重编一次来比对，同时顺带验证 SetUniqId 的幂等性。
+        Assert.Equal(MessageDecoder.EncodeMessages(new List<Message> { a, b }), batch.Body);
+        Assert.Equal(32, MessageClientIDSetter.GetUniqId(a).Length);
+        Assert.Equal(32, MessageClientIDSetter.GetUniqId(b).Length);
     }
 
     // ---------------------------------------------------------------- 工具与哈希

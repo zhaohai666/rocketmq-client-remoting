@@ -137,6 +137,44 @@ public sealed class DefaultMQPushConsumer
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
         => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
 
+    // ---------------- 消息轨迹配置（对应 Java DefaultMQPushConsumer 的 enableMsgTrace / customizedTraceTopic）----------------
+    // 开启后 Start() 会建 AsyncTraceDispatcher（Type=Consume）并注册 ConsumeMessageTraceHook。
+    public bool EnableTrace
+    {
+        get => _enableTrace;
+        set => _enableTrace = value;
+    }
+
+    /// <summary>消费侧的命名入口（对应 Java setEnableMsgTrace），与 <see cref="EnableTrace"/> 等价。</summary>
+    public void SetEnableMsgTrace(bool enable) => _enableTrace = enable;
+
+    /// <summary>自定义轨迹 topic（Java customizedTraceTopic）；空则回落系统默认 RMQ_SYS_TRACE_TOPIC。</summary>
+    public string TraceTopic
+    {
+        get => _traceTopic;
+        set => _traceTopic = string.IsNullOrEmpty(value) ? MixAll.TraceTopic : value;
+    }
+
+    public int TraceMsgBatchNum
+    {
+        get => _traceMsgBatchNum;
+        set => _traceMsgBatchNum = value;
+    }
+
+    /// <summary>消费超时（分钟，Java consumeTimeout 默认 15）——决定轨迹 SubAfter 的 contextCode 是否为 TIME_OUT。</summary>
+    public int ConsumeTimeout { get; set; } = 15;
+
+    /// <summary>注册消费钩子（对应 Java registerConsumeMessageHook）。</summary>
+    public void RegisterConsumeMessageHook(IConsumeMessageHook hook)
+    {
+        if (hook is not null)
+        {
+            _consumeMessageHooks.Add(hook);
+        }
+    }
+
+    public bool HasConsumeMessageHook() => _consumeMessageHooks.Count > 0;
+
     // ---------------- POP 模式（5.x 轻量消费）----------------
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
     public bool PopMode { get; set; }
@@ -171,6 +209,13 @@ public sealed class DefaultMQPushConsumer
 
     // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
     private IRpcHook? _rpcHook;
+
+    // ---------------- 消息轨迹（消费侧）----------------
+    private bool _enableTrace;
+    private string _traceTopic = MixAll.TraceTopic;
+    private int _traceMsgBatchNum = 10;
+    private readonly List<IConsumeMessageHook> _consumeMessageHooks = new();
+    private AsyncTraceDispatcher? _traceDispatcher;
 
     private string _instanceName = "DEFAULT";
     private string _clientId = string.Empty;
@@ -545,6 +590,9 @@ public sealed class DefaultMQPushConsumer
         ClientLog.Info("DefaultMQPushConsumer[" + ConsumerGroup + "] started, clientId=" + _clientId
             + ", topics=" + topics + ", pullTimeout=" + _pullTimeoutMillis.ToString(CultureInfo.InvariantCulture)
             + "ms, pullSuspend=" + _pullSuspendTimeoutMillis.ToString(CultureInfo.InvariantCulture) + "ms");
+
+        // 轨迹分发器最后启动：它会拉起自己的内部生产者（各自加锁），放在其它线程之后更安全。
+        StartTraceDispatcher();
     }
 
     public void Shutdown()
@@ -622,6 +670,141 @@ public sealed class DefaultMQPushConsumer
         }
 
         _mqClient?.Shutdown();
+
+        // 顺序对齐 Java DefaultMQPushConsumer.shutdown()：先关本消费者，再 flush 并关轨迹分发器
+        //（分发器用的是**自己的**内部生产者，与本实例无关，所以关掉了照样能发完）
+        if (_traceDispatcher is not null)
+        {
+            try
+            {
+                _traceDispatcher.Shutdown();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("trace dispatcher shutdown failed: " + e.Message);
+            }
+        }
+    }
+
+    // ---------------- 消费钩子（对应 Java executeHookBefore / executeHookAfter）----------------
+    // 钩子异常一律吞掉并记 warn：轨迹出错绝不能影响正常消费。
+
+    private void ExecuteConsumeHookBefore(ConsumeMessageContext context)
+    {
+        foreach (IConsumeMessageHook hook in _consumeMessageHooks)
+        {
+            try
+            {
+                hook.ConsumeMessageBefore(context);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("consumeMessageHook executeHookBefore exception: " + e.Message);
+            }
+        }
+    }
+
+    private void ExecuteConsumeHookAfter(ConsumeMessageContext context)
+    {
+        foreach (IConsumeMessageHook hook in _consumeMessageHooks)
+        {
+            try
+            {
+                hook.ConsumeMessageAfter(context);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("consumeMessageHook executeHookAfter exception: " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>构造消费钩子上下文。初始值与 Java 一致：success=false、Props 空、accessChannel=LOCAL。</summary>
+    private ConsumeMessageContext BuildConsumeHookContext(List<MessageExt> msgs, MessageQueue mq)
+        => new(ConsumerGroup, msgs, mq)
+        {
+            Success = false,
+            Props = new PropertyMap(),
+            AccessChannel = AccessChannel.Local,
+        };
+
+    /// <summary>对应 Java 的 returnType 判定（决定轨迹 SubAfter 的 contextCode）。
+    /// 顺序：status == null → EXCEPTION/RETURNNULL；RT ≥ consumeTimeout（分钟）→ TIME_OUT；
+    /// 失败 → FAILED；成功 → SUCCESS。顺序消费把「挂起」当 FAILED、成功当 SUCCESS，
+    /// 由调用方用 failed/succeeded 两个标志传入。</summary>
+    private string ConsumeReturnTypeName(bool hasStatus, bool hasException, double consumeRtMs,
+        bool failed, bool succeeded)
+    {
+        if (!hasStatus)
+        {
+            return hasException ? "EXCEPTION" : "RETURNNULL";
+        }
+
+        if (consumeRtMs >= ConsumeTimeout * 60 * 1000.0)
+        {
+            return "TIME_OUT";
+        }
+
+        if (failed)
+        {
+            return "FAILED";
+        }
+
+        return succeeded ? "SUCCESS" : "SUCCESS";
+    }
+
+    /// <summary>把 returnType / status / success 写回上下文并触发 after 钩子（对齐 Java）。
+    /// ⚠ returnType 判定必须在「status 归一化为 RECONSUME_LATER」**之前**做，
+    /// 否则 listener 返回 null 会被误记成 FAILED 而不是 RETURNNULL。</summary>
+    private void FinishConsumeHook(ConsumeMessageContext? hookCtx, bool hasStatus, bool hasException,
+        long beginMs, string statusText, bool failed, bool succeeded)
+    {
+        if (hookCtx is null)
+        {
+            return;
+        }
+
+        double rt = UtilAll.CurrentTimeMillis() - beginMs;
+        hookCtx.Props!["ConsumeContextType"] = ConsumeReturnTypeName(hasStatus, hasException, rt,
+            failed, succeeded);
+        hookCtx.Status = statusText;
+        hookCtx.Success = succeeded;
+        ExecuteConsumeHookAfter(hookCtx);
+    }
+
+    /// <summary>对应 Java DefaultMQPushConsumer.start()：enableTrace=true 时建分发器
+    /// （Type=Consume）并注册 ConsumeMessageTraceHook，随后 start 它。
+    /// 任何异常都只记日志 —— 轨迹挂了不能影响正常消费。</summary>
+    private void StartTraceDispatcher()
+    {
+        if (_enableTrace)
+        {
+            try
+            {
+                var dispatcher = new AsyncTraceDispatcher(ConsumerGroup,
+                    TraceDispatcherType.Consume, _traceMsgBatchNum, _traceTopic, _rpcHook);
+                dispatcher.SetHostConsumer(this);
+                _traceDispatcher = dispatcher;
+                RegisterConsumeMessageHook(new ConsumeMessageTraceHook(dispatcher));
+            }
+            catch (Exception e)
+            {
+                ClientLog.Error("system mqtrace hook init failed, maybe can't send msg trace data: "
+                    + e.Message);
+            }
+        }
+
+        if (_traceDispatcher is not null)
+        {
+            try
+            {
+                _traceDispatcher.Start(_nameServerAddrs, AccessChannel.Local);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("trace dispatcher start failed: " + e.Message);
+            }
+        }
     }
 
     private static void JoinIfAlive(Thread? t)
@@ -1123,6 +1306,15 @@ public sealed class DefaultMQPushConsumer
         // 改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，消息在 invisibleTime 到期后被
         // broker 复活重投 —— 短观测窗口下会伪装成通过。
         ctx.AckIndex = msgs.Count - 1;
+        ConsumeMessageContext? popHookCtx = null;
+        if (_consumeMessageHooks.Count > 0)
+        {
+            popHookCtx = BuildConsumeHookContext(msgs, mq);
+            ExecuteConsumeHookBefore(popHookCtx);
+        }
+
+        long popBegin = UtilAll.CurrentTimeMillis();
+        bool popHasException = false;
         ConsumeConcurrentlyStatus status = ConsumeConcurrentlyStatus.ReconsumeLater;
         try
         {
@@ -1132,7 +1324,14 @@ public sealed class DefaultMQPushConsumer
         {
             // Java：消费抛异常按 RECONSUME_LATER 处理
             ClientLog.Debug("pop listener error, treat as RECONSUME_LATER: " + e.Message);
+            popHasException = true;
         }
+
+        // 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，
+        // 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
+        FinishConsumeHook(popHookCtx, true, popHasException, popBegin, status.ToString(),
+            failed: status == ConsumeConcurrentlyStatus.ReconsumeLater,
+            succeeded: status == ConsumeConcurrentlyStatus.ConsumeSuccess);
 
         if (pq.IsDropped() || IsPopTimeout(popTime, invisible))
         {
@@ -1417,6 +1616,15 @@ public sealed class DefaultMQPushConsumer
         {
             var orderly = (IMessageListenerOrderly)_messageListener!;
             var ctx = new ConsumeOrderlyContext(mq);
+            ConsumeMessageContext? ohookCtx = null;
+            if (_consumeMessageHooks.Count > 0)
+            {
+                ohookCtx = BuildConsumeHookContext(batch, mq);
+                ExecuteConsumeHookBefore(ohookCtx);
+            }
+
+            long obegin = UtilAll.CurrentTimeMillis();
+            bool ohasException = false;
             ConsumeOrderlyStatus status;
             try
             {
@@ -1427,7 +1635,13 @@ public sealed class DefaultMQPushConsumer
                 // Java 顺序消费：异常 → 不提交 offset，原地重试
                 ClientLog.Debug("orderly listener error (retry in place): " + e.Message);
                 status = ConsumeOrderlyStatus.SuspendCurrentQueueAMoment;
+                ohasException = true;
             }
+
+            // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
+            FinishConsumeHook(ohookCtx, true, ohasException, obegin, status.ToString(),
+                failed: status != ConsumeOrderlyStatus.Success,
+                succeeded: status == ConsumeOrderlyStatus.Success);
 
             if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
             {
@@ -1454,6 +1668,17 @@ public sealed class DefaultMQPushConsumer
         // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
         var conc = (IMessageListenerConcurrently)_messageListener!;
         var cctx = new ConsumeConcurrentlyContext(mq);
+        // 顺序与 Java 一致：before 钩子在 listener **之前**（生成 SubBefore 轨迹），
+        // after 在拿到 status 之后（生成 SubAfter，带 contextCode）
+        ConsumeMessageContext? hookCtx = null;
+        if (_consumeMessageHooks.Count > 0)
+        {
+            hookCtx = BuildConsumeHookContext(batch, mq);
+            ExecuteConsumeHookBefore(hookCtx);
+        }
+
+        long beginMs = UtilAll.CurrentTimeMillis();
+        bool hasException = false;
         ConsumeConcurrentlyStatus cstatus;
         try
         {
@@ -1464,7 +1689,12 @@ public sealed class DefaultMQPushConsumer
             // Java：消费抛异常按 RECONSUME_LATER 处理
             ClientLog.Debug("listener error, treat as RECONSUME_LATER: " + e.Message);
             cstatus = ConsumeConcurrentlyStatus.ReconsumeLater;
+            hasException = true;
         }
+
+        FinishConsumeHook(hookCtx, true, hasException, beginMs, cstatus.ToString(),
+            failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater,
+            succeeded: cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess);
 
         if (cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess)
         {

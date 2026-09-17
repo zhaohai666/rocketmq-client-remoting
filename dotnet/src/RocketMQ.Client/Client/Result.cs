@@ -45,13 +45,15 @@ public class SendResult
     public long QueueOffset { get; set; }
     public string TransactionId { get; set; } = string.Empty;
     public string RegionId { get; set; } = string.Empty;
+    // broker 在 SEND 响应头 TRACE_ON 里告知是否落轨迹（"false" 才关，缺省 true）。
+    public bool TraceOn { get; set; } = true;
 
     public override string ToString() =>
         "SendResult [sendStatus=" + SendStatusNames.Name(SendStatus)
         + ", msgId=" + MsgId + ", offsetMsgId=" + OffsetMsgId
         + ", messageQueue=" + MessageQueue
         + ", queueOffset=" + QueueOffset.ToString(CultureInfo.InvariantCulture)
-        + ", transactionId=" + TransactionId + "]";
+        + ", transactionId=" + TransactionId + ", regionId=" + RegionId + "]";
 }
 
 // ---------------------------------------------------------------- 事务

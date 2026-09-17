@@ -26,6 +26,8 @@ public static class MessageConst
     public const string PropertyCheckImmunityTimeInSeconds = "CHECK_IMMUNITY_TIME_IN_SECONDS";
     public const string PropertyReconsumeTime = "RECONSUME_TIME";
     public const string PropertyMsgRegion = "MSG_REGION";
+    /// <summary>broker 在 SEND 响应里用 TRACE_ON 决定是否落轨迹（"false" 表示关闭，其余为真）。</summary>
+    public const string PropertyTraceSwitch = "TRACE_ON";
     public const string PropertyUniqClientMessageIdKeyidx = "UNIQ_KEY";
     public const string PropertyMaxReconsumeTimes = "MAX_RECONSUME_TIMES";
     public const string PropertyConsumeStartTimestamp = "CONSUME_START_TIME";

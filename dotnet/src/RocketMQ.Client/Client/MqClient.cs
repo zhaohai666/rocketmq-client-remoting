@@ -546,6 +546,14 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 3000, int sysFlag = 0)
     {
         string addr = BrokerAddr(mq);
+        // 对应 Java DefaultMQProducerImpl.sendKernelImpl：非批量消息在**发请求之前**
+        // 补一个客户端唯一 ID（UNIQ_KEY）。它决定 SendResult.MsgId，也是消息轨迹
+        // 里 msgId 的来源（控制台按它把发送轨迹与消费轨迹串起来）。
+        if (!msg.IsBatch)
+        {
+            MessageClientIDSetter.SetUniqId(msg);
+        }
+
         RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
 
@@ -570,21 +578,71 @@ public sealed class MQClientInstance : IDisposable
 
         var respHeader = new SendMessageResponseHeader();
         respHeader.FromExtFields(response.ExtFields);
+        // 对应 Java MQClientAPIImpl.processSendResponse：
+        //   msgId         = 客户端唯一 ID（UNIQ_KEY；批量消息为逐条逗号拼接）
+        //   offsetMsgId   = 响应头里的 msgId（broker 生成的 offset 消息 ID）
+        //   regionId      = 响应头 MSG_REGION，缺省回落 DefaultRegion
+        //   traceOn       = 响应头 TRACE_ON != "false"（broker 默认 true）
+        string msgId = msg.IsBatch
+            ? JoinBatchUniqId(msg) ?? (respHeader.MsgId ?? string.Empty)
+            : (MessageClientIDSetter.GetUniqId(msg) ?? respHeader.MsgId ?? string.Empty);
+        string regionId = MixAll.DefaultTraceRegionId;
+        if (response.ExtFields.TryGetValue(MessageConst.PropertyMsgRegion, out string? rid)
+            && !string.IsNullOrEmpty(rid))
+        {
+            regionId = rid;
+        }
+
+        bool traceOn = true;
+        if (response.ExtFields.TryGetValue(MessageConst.PropertyTraceSwitch, out string? ts)
+            && ts == "false")
+        {
+            traceOn = false;
+        }
+
         return new SendResult
         {
             SendStatus = status,
-            MsgId = respHeader.MsgId ?? string.Empty,
+            MsgId = msgId,
             OffsetMsgId = respHeader.MsgId ?? string.Empty,
             MessageQueue = new MessageQueue(mq.Topic, mq.BrokerName, respHeader.QueueId ?? mq.QueueId),
             QueueOffset = respHeader.QueueOffset ?? 0,
             TransactionId = respHeader.TransactionId ?? string.Empty,
+            RegionId = regionId,
+            TraceOn = traceOn,
         };
+    }
+
+    private static string? JoinBatchUniqId(Message msg)
+    {
+        if (msg is not MessageBatch batch || batch.Messages.Count == 0)
+        {
+            return null;
+        }
+
+        var parts = new List<string>(batch.Messages.Count);
+        foreach (Message m in batch.Messages)
+        {
+            string? id = MessageClientIDSetter.GetUniqId(m);
+            if (!string.IsNullOrEmpty(id))
+            {
+                parts.Add(id);
+            }
+        }
+
+        return parts.Count == 0 ? null : string.Join(",", parts);
     }
 
     public void SendMessageOneway(string producerGroup, Message msg, MessageQueue mq,
         int timeoutMillis = 3000, int sysFlag = 0)
     {
         string addr = BrokerAddr(mq);
+        // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
+        if (!msg.IsBatch)
+        {
+            MessageClientIDSetter.SetUniqId(msg);
+        }
+
         RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
         request.MarkOnewayRpc();
         _remotingClient.InvokeOneway(addr, request);

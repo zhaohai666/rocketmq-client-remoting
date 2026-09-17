@@ -46,8 +46,12 @@ dotnet/
 │   │   ├── Consumer.cs             # DefaultMQPushConsumer：拉取循环、并发/顺序监听、sendMessageBack
 │   │   ├── Admin.cs                # DefaultMQAdminExt 全套（47 项真机检查全通过）
 │   │   ├── Result.cs               # SendResult/PullResult/监听器接口/队列选择器
+│   │   ├── Hook.cs                 # SendMessage/ConsumeMessage/EndTransaction 钩子接口与上下文
+│   │   ├── Trace.cs                # 消息轨迹模型 + 文本编解码（与 Java 官方实现逐字节对拍）
+│   │   ├── TraceHook.cs            # 三类轨迹钩子（发送 / 消费 / 结束事务）
+│   │   ├── TraceDispatcher.cs      # AsyncTraceDispatcher：异步队列 + 分组 + 128K 切块 + 定时 flush
 │   │   └── ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit（Codec/RouteHeartbeat/Logging/AdminBody/Transport）
+├── tests/RocketMQ.Client.Tests/    # xunit（Codec/RouteHeartbeat/Logging/AdminBody/Transport/Trace…）
 └── examples/RocketMQ.Examples/     # 真机联调工具（见下）
 ```
 
@@ -77,7 +81,10 @@ dotnet $PROG compression-live send 127.0.0.1:9876 <topic> <group> <size>
 dotnet $PROG compression-live recv 127.0.0.1:9876 <topic> <group> <size>
 dotnet $PROG interop --emit               # 打印规范帧 hex（JSON/ROCKETMQ 双序列化）
 dotnet $PROG interop --decode <hex>       # 解码外部帧（供 Python/C++ -> .NET 字节级互通验证）
+dotnet $PROG trace 127.0.0.1:9876         # 消息轨迹全链路（17 PASS / 0 FAIL，需 broker traceTopicEnable=true）
 ```
+
+其它子命令：`redelivery` / `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
 
 ## 实测结果（真实 5.5.1 集群）
 
@@ -88,6 +95,10 @@ dotnet $PROG interop --decode <hex>       # 解码外部帧（供 Python/C++ -> 
 | admin-live | 47 PASS / 0 FAIL / 1 SKIP |
 | compression-live selftest | ALL PASS（storeSize 8192→384，21:1；CRC 一致；flag 清除） |
 | interop | Python ↔ .NET 双向解码逐字段一致（JSON 与 ROCKETMQ 双序列化） |
+| trace | 17 PASS / 0 FAIL（消息轨迹全链路：SendResult 字段 → Pub → SubBefore/SubAfter 配对 → 防递归 → 无 keys 容错） |
+
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **178 passed / 0 failed**，零 warning
+（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。
 
 ## 与 Java 的已知差异
 
@@ -98,3 +109,9 @@ dotnet $PROG interop --decode <hex>       # 解码外部帧（供 Python/C++ -> 
   生产者会周期性向 broker 发心跳（含 ProducerData）——**broker 的事务回查依赖它**。
 - `ClientLog` 备份文件不压缩（Java 会 gzip）；同步写（Java 走 AsyncAppender）。
 - 心跳指纹固定 0（走 broker V1 完整注册路径），未实现依赖 fastjson2 字段序的 V2 指纹。
+- 消息轨迹的解码器比 Java **更健壮**：Java `TraceDataEncoder` 对无 keys 消息的
+  `SubBefore` 会 `line[7]` 越界抛 `ArrayIndexOutOfBoundsException`（上游真实缺陷，5.5.1 复现），
+  我们缺段按空串取；同时把**单条记录**的解码包在 try/catch 里 —— Java 是一条坏记录
+  毁掉整条轨迹消息的解码，我们只跳过坏记录。
+- `GetTopicPublishInfo(topic, isDefault: true)` 的第二跳（TBW102 兜底）只在发送路径启用，
+  与 Java `tryToFindTopicPublishInfo` 一致。

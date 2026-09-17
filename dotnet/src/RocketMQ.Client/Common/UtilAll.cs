@@ -294,6 +294,12 @@ public static class UtilAll
 
     public static string NextMillisString() =>
         CurrentTimeMillis().ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// 生成 32 位十六进制唯一 ID（对应 Java MessageClientIDSetter.createUniqID / setUniqID）。
+    /// 发送前写到消息属性 <c>UNIQ_KEY</c>，作为 SendResult.MsgId 与轨迹 msgId 的源头。
+    /// </summary>
+    public static string CreateUniqId() => InnerIdGenerator.CreateUniqId();
 }
 
 /// <summary>IP 解析辅助：提供比 IPAddress.TryParse 更严格的族校验。</summary>

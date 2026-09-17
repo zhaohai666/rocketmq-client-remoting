@@ -52,6 +52,8 @@ public static class MixAll
     public const int LmqQueueId = 0;
     public const string TraceTopic = "RMQ_SYS_TRACE_TOPIC";
     public const string RealTraceTopic = "rmq_sys_TRACE_DATA";
+    /// <summary>轨迹 region 缺省值（对应 Java MixAll.DEFAULT_TRACE_REGION_ID）。</summary>
+    public const string DefaultTraceRegionId = "DefaultRegion";
     public const string RmqSysTransHalfTopic = "RMQ_SYS_TRANS_HALF_TOPIC";
     public const string RmqSysTransOpHalfTopic = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
     public const int TransCheckMaxTime = 15;

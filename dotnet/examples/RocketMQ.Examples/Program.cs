@@ -40,6 +40,7 @@ internal static class Program
                 "latency" => LiveLatency.Run(rest),
                 "pop" => LivePop.Run(rest),
                 "popc" => LivePopConsumer.Run(rest),
+                "trace" => LiveTrace.Run(rest),
                 _ => Unknown(command),
             };
         }

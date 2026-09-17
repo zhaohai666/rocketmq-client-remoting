@@ -52,6 +52,15 @@ public class DefaultMQProducer
     // Request-Reply 默认等待应答超时（ms），与 Java/Python 默认 3000 对齐。
     private int _requestTimeout = 3000;
     private List<string> _nameServerAddrs = new();
+    // ---------------- 消息轨迹（对应 Java ClientConfig / DefaultMQProducer）----------------
+    // 开启后 Start() 会建 AsyncTraceDispatcher 并注册 Send/EndTransaction 钩子；
+    // 内部轨迹生产者自身保持关闭（EnableTrace=false），否则无限递归。
+    private bool _enableTrace;
+    private string _traceTopic = MixAll.TraceTopic;
+    private int _traceMsgBatchNum = 10;
+    private readonly List<ISendMessageHook> _sendMessageHooks = new();
+    private readonly List<IEndTransactionHook> _endTransactionHooks = new();
+    private AsyncTraceDispatcher? _traceDispatcher;
     // 异步发送线程句柄，shutdown 时统一 join 回收
     private readonly List<Thread> _asyncThreads = new();
 
@@ -166,6 +175,48 @@ public class DefaultMQProducer
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
         => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
 
+    // ---------------- 消息轨迹配置（对应 Java ClientConfig 的 trace 相关属性）----------------
+    // 开启后 Start() 会建 AsyncTraceDispatcher 并注册 Send/EndTransaction 轨迹钩子；
+    // 内部分发器用的轨迹生产者自身保持 EnableTrace=false（见 AsyncTraceDispatcher），否则无限递归。
+    public bool EnableTrace
+    {
+        get => _enableTrace;
+        set => _enableTrace = value;
+    }
+
+    /// <summary>自定义轨迹 topic（Java ClientConfig.setTraceTopic）；空则回落系统默认 RMQ_SYS_TRACE_TOPIC。</summary>
+    public string TraceTopic
+    {
+        get => _traceTopic;
+        set => _traceTopic = string.IsNullOrEmpty(value) ? MixAll.TraceTopic : value;
+    }
+
+    public int TraceMsgBatchNum
+    {
+        get => _traceMsgBatchNum;
+        set => _traceMsgBatchNum = value;
+    }
+
+    /// <summary>注册发送钩子（对应 Java DefaultMQProducerImpl.registerSendMessageHook）。</summary>
+    public void RegisterSendMessageHook(ISendMessageHook hook)
+    {
+        if (hook is not null)
+        {
+            _sendMessageHooks.Add(hook);
+        }
+    }
+
+    public bool HasSendMessageHook() => _sendMessageHooks.Count > 0;
+
+    /// <summary>注册事务收尾钩子（对应 Java registerEndTransactionHook）。</summary>
+    public void RegisterEndTransactionHook(IEndTransactionHook hook)
+    {
+        if (hook is not null)
+        {
+            _endTransactionHooks.Add(hook);
+        }
+    }
+
     public string ProducerGroup
     {
         get => _producerGroup;
@@ -261,6 +312,9 @@ public class DefaultMQProducer
             { IsBackground = true, Name = "ProducerHeartbeatThread" };
             _heartbeatThread.Start();
         }
+
+        // 轨迹分发器在锁外启动：它会拉起内部生产者（各自加锁），锁内启动容易形成锁嵌套。
+        StartTraceDispatcher();
     }
 
     public void Shutdown()
@@ -308,6 +362,20 @@ public class DefaultMQProducer
         {
             _mqClient.Shutdown();
         }
+
+        // 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器
+        //（分发器用的是**自己的**内部生产者，与本客户端实例无关，所以关掉了照样能发完）
+        if (_traceDispatcher is not null)
+        {
+            try
+            {
+                _traceDispatcher.Shutdown();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("trace dispatcher shutdown failed: " + e.Message);
+            }
+        }
     }
 
     /// <summary>返回底层客户端实例（对应 C++ MQClientInstance&amp; client()）。</summary>
@@ -321,6 +389,182 @@ public class DefaultMQProducer
         }
 
         return _mqClient;
+    }
+
+    // ---------------- 钩子执行（对应 Java executeSendMessageHookBefore/After、executeEndTransactionHook）----------------
+    // 钩子抛出的异常一律吞掉并记 warn（Java DefaultMQProducerImpl:1159）：轨迹出错绝不能影响正常收发。
+
+    private void ExecuteSendMessageHookBefore(SendMessageContext context)
+    {
+        foreach (ISendMessageHook hook in _sendMessageHooks)
+        {
+            try
+            {
+                hook.SendMessageBefore(context);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("failed to executeSendMessageHookBefore: " + e.Message);
+            }
+        }
+    }
+
+    private void ExecuteSendMessageHookAfter(SendMessageContext context)
+    {
+        foreach (ISendMessageHook hook in _sendMessageHooks)
+        {
+            try
+            {
+                hook.SendMessageAfter(context);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("failed to executeSendMessageHookAfter: " + e.Message);
+            }
+        }
+    }
+
+    private void ExecuteEndTransactionHook(EndTransactionContext context)
+    {
+        foreach (IEndTransactionHook hook in _endTransactionHooks)
+        {
+            try
+            {
+                hook.EndTransaction(context);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("failed to executeEndTransactionHook: " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>构造 SendMessageContext（对齐 Java DefaultMQProducerImpl:969-989）。
+    /// msgType 判定顺序照抄：TRAN_MSG=true → Trans；带任何延迟类属性 → Delay；否则 Normal。
+    /// ⚠ .NET 的 <c>GetProperty</c> 对缺失键返回**空串**而非 null（Java/Python 返回 null），
+    /// 所以延迟属性必须用 <c>Properties.ContainsKey</c> 判断，不能靠值判空。</summary>
+    private SendMessageContext BuildSendContext(Message msg, MessageQueue mq, string brokerAddr)
+    {
+        var context = new SendMessageContext
+        {
+            Producer = this,
+            ProducerGroup = _producerGroup,
+            Message = msg,
+            Mq = mq,
+            BrokerAddr = brokerAddr,
+            Namespace = _namespace,
+        };
+        if (msg.GetProperty(MessageConst.PropertyTransactionPrepared) == "true")
+        {
+            context.MsgType = TraceMessageType.Trans;
+        }
+
+        foreach (string key in new[]
+                 {
+                     "__STARTDELIVERTIME", MessageConst.PropertyDelayTimeLevel,
+                     "TIMER_DELIVER_MS", "TIMER_DELAY_SEC", "TIMER_DELAY_MS",
+                 })
+        {
+            if (msg.Properties.ContainsKey(key))
+            {
+                context.MsgType = TraceMessageType.Delay;
+                break;
+            }
+        }
+
+        return context;
+    }
+
+    /// <summary>对应 Java DefaultMQProducerImpl.tryToFindTopicPublishInfo：
+    /// 先拉**真实**路由；只有确实拉不到（新 topic 尚未在 NameServer 注册）时，才按 Java 的做法
+    /// 用默认 topic（TBW102）为该 topic 合成发布信息 —— 否则新 topic 的**首条**消息没有队列可选，
+    /// 直接抛 "Can not find Message Queue"。消费侧**不做**这个兜底（与 Java 一致）。</summary>
+    private TopicPublishInfo TryToFindTopicPublishInfo(MQClientInstance c, string topic)
+    {
+        try
+        {
+            return c.GetTopicPublishInfo(topic);
+        }
+        catch (MQClientException)
+        {
+            return c.GetTopicPublishInfo(topic, true);
+        }
+    }
+
+    /// <summary>带 before/after 钩子的同步发送（对应 Java sendKernelImpl + sendDefaultImpl 的钩子点）。
+    /// 钩子只在**真正发起请求的那一次**执行（Java 重试时每轮都重建 context）。
+    /// 无钩子时直通，不引入任何额外开销。</summary>
+    private SendResult SendWithHooks(MQClientInstance c, Message msg, MessageQueue mq,
+        int timeout, int sysFlag)
+    {
+        if (_sendMessageHooks.Count == 0)
+        {
+            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
+        }
+
+        string brokerAddr = string.Empty;
+        try
+        {
+            brokerAddr = c.BrokerAddrForMq(mq) ?? string.Empty;
+        }
+        catch (Exception)
+        {
+            // 路由表里查不到 broker 时不影响发送本身，钩子照常跑（brokerAddr 为空）
+        }
+
+        SendMessageContext context = BuildSendContext(msg, mq, brokerAddr);
+        ExecuteSendMessageHookBefore(context);
+        SendResult result;
+        try
+        {
+            result = c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
+        }
+        catch (Exception e)
+        {
+            context.Exception = e;
+            ExecuteSendMessageHookAfter(context);
+            throw;
+        }
+
+        context.SendResult = result;
+        ExecuteSendMessageHookAfter(context);
+        return result;
+    }
+
+    /// <summary>对应 Java DefaultMQProducer.start():380-405：enableTrace=true 时建分发器
+    /// （Type=Produce）并注册 SendMessageTraceHook / EndTransactionTraceHook，随后 start 它。
+    /// 任何异常都只记日志 —— 轨迹挂了不能影响正常发送。</summary>
+    private void StartTraceDispatcher()
+    {
+        if (_enableTrace)
+        {
+            try
+            {
+                var dispatcher = new AsyncTraceDispatcher(_producerGroup,
+                    TraceDispatcherType.Produce, _traceMsgBatchNum, _traceTopic, _rpcHook);
+                dispatcher.SetHostProducer(this);
+                _traceDispatcher = dispatcher;
+                RegisterSendMessageHook(new SendMessageTraceHook(dispatcher));
+                RegisterEndTransactionHook(new EndTransactionTraceHook(dispatcher));
+            }
+            catch (Exception e)
+            {
+                ClientLog.Error("system mqtrace hook init failed, maybe can't send msg trace data: "
+                    + e.Message);
+            }
+        }
+
+        if (_traceDispatcher is not null)
+        {
+            try
+            {
+                _traceDispatcher.Start(_nameServerAddrs, AccessChannel.Local);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("trace dispatcher start failed: " + e.Message);
+            }
+        }
     }
 
     // ---------------- 校验 ----------------
@@ -429,7 +673,7 @@ public class DefaultMQProducer
         {
             try
             {
-                TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
+                TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
                 // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
                 // 关闭时退化为普通轮询（策略内部判断）。
                 MessageQueue selected = _mqFaultStrategy.SelectOneMessageQueue(publish, lastBrokerName);
@@ -438,7 +682,7 @@ public class DefaultMQProducer
                 SendResult result;
                 try
                 {
-                    result = c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
+                    result = SendWithHooks(c, outbound, selected, timeout, sysFlag);
                 }
                 catch (Exception)
                 {
@@ -478,7 +722,7 @@ public class DefaultMQProducer
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
-        return c.SendMessage(_producerGroup, outbound, mq, timeout, sysFlag);
+        return SendWithHooks(c, outbound, mq, timeout, sysFlag);
     }
 
     // 按选择器发送（顺序消息：同一 arg 落到同一队列）
@@ -489,11 +733,11 @@ public class DefaultMQProducer
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = selector.Select(publish.MsgQueueList, msg, arg);
         // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
         int sysFlag = PrepareForSend(outbound);
-        return c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
+        return SendWithHooks(c, outbound, selected, timeout, sysFlag);
     }
 
     // ---------------- 异步 / 单向 ----------------
@@ -537,7 +781,7 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
         int sysFlag = PrepareForSend(outbound);
         c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
@@ -563,11 +807,11 @@ public class DefaultMQProducer
             outbound.Topic = NamespaceUtil.WrapNamespace(_namespace, batch.Topic);
         }
 
-        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
         // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
         int sysFlag = PrepareForSend(outbound);
-        return c.SendMessage(_producerGroup, outbound, selected, timeout, sysFlag);
+        return SendWithHooks(c, outbound, selected, timeout, sysFlag);
     }
 
     // ---------------- Request-Reply（5.x）----------------
@@ -695,7 +939,7 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(outbound.Topic);
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
 
         // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
@@ -710,7 +954,7 @@ public class DefaultMQProducer
         SendResult sendResult;
         try
         {
-            sendResult = c.SendMessage(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
+            sendResult = SendWithHooks(c, outbound, selected, _sendMsgTimeout, sysFlag);
         }
         catch (Exception e)
         {
@@ -921,6 +1165,24 @@ public class DefaultMQProducer
         }
 
         c.RemotingClient.InvokeOneway(addr, request);
+
+        // 事务收尾轨迹（对应 Java DefaultMQProducerImpl.executeEndTransactionHook）。
+        // 必须在真正发出 END_TRANSACTION 之后调用，轨迹里的 transactionState 才是最终状态。
+        // 回查路径（fromCheck=true）的 msg 是 broker 带回来的 MessageExt，优先用它。
+        if (_endTransactionHooks.Count > 0)
+        {
+            ExecuteEndTransactionHook(new EndTransactionContext
+            {
+                ProducerGroup = _producerGroup,
+                Message = checkMsg is not null ? checkMsg : msg,
+                BrokerAddr = addr,
+                MsgId = header.MsgId,
+                TransactionId = header.TransactionId,
+                TransactionState = state,
+                FromTransactionCheck = fromCheck,
+                Namespace = _namespace,
+            });
+        }
     }
 
     /// <summary>
@@ -1025,7 +1287,7 @@ public class DefaultMQProducer
     public List<MessageQueue> FetchPublishMessageQueues(string topic)
     {
         MQClientInstance c = GetClient();
-        TopicPublishInfo publish = c.GetTopicPublishInfo(
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c,
             _namespace.Length == 0 ? topic : NamespaceUtil.WrapNamespace(_namespace, topic));
         return publish.MsgQueueList;
     }
