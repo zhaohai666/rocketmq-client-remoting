@@ -10,19 +10,20 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 - 三侧已对齐 Java：两阶段事务、消费侧回投 / 位点持久化 / 顺序锁 / 广播 / 流控、
   真实 rebalance + 队列撤销收尾 + 重投 topic 还原 + 优雅注销 + 命名空间 + ACL 鉴权 +
   主动拉取 PullConsumer + Request-Reply + 故障规避 + 压缩(zlib 跨语言) +
-  **POP 协议管道 + POP 消费循环** + **消息轨迹 Trace/Hook**。
+  **POP 协议管道 + POP 消费循环** + **消息轨迹 Trace/Hook** +
+  **CheckForbiddenHook / FilterMessageHook + 客户端二次 tag 过滤**。
 - 残留缺口全部 P3：TLS、动态 name server(TopAddressing)、307 运行信息、客户端 metrics、
   消费线程弹性、OpenTracing 版轨迹钩子。心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。
 
 ## 验证入口（改完必跑）
-- Python `pytest`（当前 319 passed / 4 skipped，2 error 是沙箱 tmpdir 权限噪音）；C++ ctest
-  **14/14**（约 849 项断言）、零 warning；.NET xunit（当前 178/178）、零 warning。
+- Python `pytest`（当前 345 passed / 4 skipped，2 error 是沙箱 tmpdir 权限噪音）；C++ ctest
+  **15/15**（约 920 项断言）、零 warning；.NET xunit（当前 189/189）、零 warning。
 - 真机（**起集群 + 等端口 + 跑测试 + kill 必须在同一条 Bash 命令里**，前台返回会回收后台 JVM）：
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
   `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、`run_acl_live.sh`（认证集群）、
   `run_pull_live.sh`、`run_rr_live.sh`、`run_latency_live.sh`、`run_pop_live.sh`、
   `run_pop_consumer_live.sh`、**`run_trace_live.sh`**（需 broker `traceTopicEnable=true`，
-  否则 RMQ_SYS_TRACE_TOPIC 不预建）。
+  否则 RMQ_SYS_TRACE_TOPIC 不预建）、**`run_hook_live.sh`**（普通配置即可）。
 
 ## 跨语言硬性约定
 1. **字段名以 Java 为准**：broker 用 fastjson2 按 **Java 属性名**反序列化，错一个就**静默丢字段**。
@@ -65,6 +66,17 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
     轨迹消息）。轨迹文本每条以 `\x02` 结尾 → 记录数 == `count("\x02")`，是"丢记录"探测器。
     ③ 真机脚本：topic/组名带时间戳、预热消息按 body 过滤、broker 需 `traceTopicEnable=true`。
     细节与 S1–S17 场景见技能；对拍向量 `python/tests/test_trace.py`（探针 `/tmp/TraceParity.java`）。
+15. **两个钩子**（`run_hook_live.sh`，三侧 13/13；broker 无需特殊配置）：
+    - `CheckForbiddenHook` 的异常**不吞**（与 Send/Consume 钩子**相反**），沿发送重试链向上传播 ——
+      **每次发送尝试都调一次**（`retryTimesWhenSendFailed=2` → 调 3 次），单向发送同样被拦截，
+      上下文**没有** `sendResult`，调用点在 `sendKernelImpl` 内、压缩与 sysFlag 之后。
+    - `FilterMessageHook` 的异常**必须吞掉**且**后续钩子照常执行**；`msgList` **可变**，被摘掉的
+      消息由调用方处置：**拉取路径 = 静默跳过**（不 ack，位点照常推进），**POP 路径 = 必须立刻 ack**
+      （否则 `invisibleTime` 后复活重投，表现为"过滤没生效"）。
+    - `FilterAPI.buildSubscriptionData`：`null`/`""`/`"*"` → `subString` 归一为 `"*"` 且
+      **tagsSet 与 codeSet 都保持空**；显式 tag → tagsSet + `codeSet={Java String.hashCode}`；
+      `"   "` 不早返回走 split；`"||"` 抛 `subString split error`。探针 `/tmp/subprobe/*Probe.java`。
+    - 单测：`python/tests/test_hook.py` / `cpp/tests/test_hook.cpp`（65 断言）/`dotnet/.../HookTests.cs`。
 
 ## 两条"静默数据损坏"级的坑（最贵，别顺手优化）
 - **压缩两层语义缺一不可**：未支持的压缩类型 `decompress` **抛异常**，且 `decode_message` 捕获后
