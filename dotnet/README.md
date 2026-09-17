@@ -46,7 +46,7 @@ dotnet/
 │   │   ├── Consumer.cs             # DefaultMQPushConsumer：拉取循环、并发/顺序监听、sendMessageBack
 │   │   ├── Admin.cs                # DefaultMQAdminExt 全套（47 项真机检查全通过）
 │   │   ├── Result.cs               # SendResult/PullResult/监听器接口/队列选择器
-│   │   ├── Hook.cs                 # SendMessage/ConsumeMessage/EndTransaction 钩子接口与上下文
+│   │   ├── Hook.cs                 # Send/Consume/EndTransaction + CheckForbidden/FilterMessage 钩子与上下文
 │   │   ├── Trace.cs                # 消息轨迹模型 + 文本编解码（与 Java 官方实现逐字节对拍）
 │   │   ├── TraceHook.cs            # 三类轨迹钩子（发送 / 消费 / 结束事务）
 │   │   ├── TraceDispatcher.cs      # AsyncTraceDispatcher：异步队列 + 分组 + 128K 切块 + 定时 flush
@@ -82,6 +82,7 @@ dotnet $PROG compression-live recv 127.0.0.1:9876 <topic> <group> <size>
 dotnet $PROG interop --emit               # 打印规范帧 hex（JSON/ROCKETMQ 双序列化）
 dotnet $PROG interop --decode <hex>       # 解码外部帧（供 Python/C++ -> .NET 字节级互通验证）
 dotnet $PROG trace 127.0.0.1:9876         # 消息轨迹全链路（17 PASS / 0 FAIL，需 broker traceTopicEnable=true）
+dotnet $PROG hook 127.0.0.1:9876          # CheckForbidden/FilterMessage 钩子（13 PASS / 0 FAIL）
 ```
 
 其它子命令：`redelivery` / `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
@@ -96,8 +97,9 @@ dotnet $PROG trace 127.0.0.1:9876         # 消息轨迹全链路（17 PASS / 0 
 | compression-live selftest | ALL PASS（storeSize 8192→384，21:1；CRC 一致；flag 清除） |
 | interop | Python ↔ .NET 双向解码逐字段一致（JSON 与 ROCKETMQ 双序列化） |
 | trace | 17 PASS / 0 FAIL（消息轨迹全链路：SendResult 字段 → Pub → SubBefore/SubAfter 配对 → 防递归 → 无 keys 容错） |
+| hook | 13 PASS / 0 FAIL（CheckForbiddenHook 放行/拦截/单向/不落 broker + FilterMessageHook 拉取与 POP 两条路径 + 二次 tag 过滤 + 钩子异常吞掉） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **178 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **189 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。
 
 ## 与 Java 的已知差异

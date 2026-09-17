@@ -60,6 +60,7 @@ public class DefaultMQProducer
     private int _traceMsgBatchNum = 10;
     private readonly List<ISendMessageHook> _sendMessageHooks = new();
     private readonly List<IEndTransactionHook> _endTransactionHooks = new();
+    private readonly List<ICheckForbiddenHook> _checkForbiddenHooks = new();
     private AsyncTraceDispatcher? _traceDispatcher;
     // 异步发送线程句柄，shutdown 时统一 join 回收
     private readonly List<Thread> _asyncThreads = new();
@@ -207,6 +208,36 @@ public class DefaultMQProducer
     }
 
     public bool HasSendMessageHook() => _sendMessageHooks.Count > 0;
+
+    /// <summary>注册发送前拦截钩子（对应 Java DefaultMQProducerImpl.registerCheckForbiddenHook:186）。</summary>
+    public void RegisterCheckForbiddenHook(ICheckForbiddenHook hook)
+    {
+        if (hook is not null)
+        {
+            _checkForbiddenHooks.Add(hook);
+        }
+    }
+
+    public bool HasCheckForbiddenHook() => _checkForbiddenHooks.Count > 0;
+
+    public int CheckForbiddenHookCount() => _checkForbiddenHooks.Count;
+
+    /// <summary>是否需要走「带拦截/钩子」的发送内核（两者任一存在就得走）。</summary>
+    public bool HasSendInterceptors() => _sendMessageHooks.Count > 0 || _checkForbiddenHooks.Count > 0;
+
+    /// <summary>供单测/联调直接驱动钩子执行（不经过网络）。
+    ///
+    /// ⚠ 与 Send/Consume/EndTransaction 钩子<b>相反</b>：这里<b>不吞异常</b> ——
+    /// 钩子抛出的异常会原样传播出去（Java CheckForbiddenHook 的签名就是
+    /// <c>throws MQClientException</c>），这正是"禁止发送"的实现方式。
+    /// </summary>
+    public void ExecuteCheckForbiddenHook(CheckForbiddenContext context)
+    {
+        foreach (ICheckForbiddenHook hook in _checkForbiddenHooks)
+        {
+            hook.CheckForbidden(context);
+        }
+    }
 
     /// <summary>注册事务收尾钩子（对应 Java registerEndTransactionHook）。</summary>
     public void RegisterEndTransactionHook(IEndTransactionHook hook)
@@ -493,11 +524,18 @@ public class DefaultMQProducer
 
     /// <summary>带 before/after 钩子的同步发送（对应 Java sendKernelImpl + sendDefaultImpl 的钩子点）。
     /// 钩子只在**真正发起请求的那一次**执行（Java 重试时每轮都重建 context）。
-    /// 无钩子时直通，不引入任何额外开销。</summary>
+    /// 无钩子时直通，不引入任何额外开销。
+    ///
+    /// 执行顺序严格照抄 Java sendKernelImpl:956-990：
+    ///   1. <b>CheckForbiddenHook</b>（每次尝试都跑；异常<b>不吞</b>，直接抛给重试链）
+    ///   2. SendMessageHook.before
+    ///   3. 发请求
+    ///   4. SendMessageHook.after（成功带 SendResult / 失败带 Exception）</summary>
     private SendResult SendWithHooks(MQClientInstance c, Message msg, MessageQueue mq,
-        int timeout, int sysFlag)
+        int timeout, int sysFlag, object? arg = null,
+        CommunicationMode mode = CommunicationMode.Sync)
     {
-        if (_sendMessageHooks.Count == 0)
+        if (!HasSendInterceptors())
         {
             return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
         }
@@ -510,6 +548,12 @@ public class DefaultMQProducer
         catch (Exception)
         {
             // 路由表里查不到 broker 时不影响发送本身，钩子照常跑（brokerAddr 为空）
+        }
+
+        RunCheckForbidden(msg, mq, brokerAddr, arg, mode);
+        if (_sendMessageHooks.Count == 0)
+        {
+            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
         }
 
         SendMessageContext context = BuildSendContext(msg, mq, brokerAddr);
@@ -529,6 +573,30 @@ public class DefaultMQProducer
         context.SendResult = result;
         ExecuteSendMessageHookAfter(context);
         return result;
+    }
+
+    /// <summary>构造 CheckForbiddenContext 并执行（每次发送尝试都会调一次，含重试）。
+    /// 异常不在这里捕获 —— 必须沿发送重试链向上传播。</summary>
+    private void RunCheckForbidden(Message msg, MessageQueue mq, string brokerAddr,
+        object? arg, CommunicationMode mode)
+    {
+        if (_checkForbiddenHooks.Count == 0)
+        {
+            return;
+        }
+
+        var context = new CheckForbiddenContext
+        {
+            NameSrvAddr = _nameServerAddrs.Count > 0 ? _nameServerAddrs[0] : string.Empty,
+            Group = _producerGroup,
+            Message = msg,
+            Mq = mq,
+            BrokerAddr = brokerAddr,
+            CommunicationMode = mode,
+            Arg = arg,
+            UnitMode = false, // 本项目无 unit mode
+        };
+        ExecuteCheckForbiddenHook(context);
     }
 
     /// <summary>对应 Java DefaultMQProducer.start():380-405：enableTrace=true 时建分发器
@@ -737,7 +805,8 @@ public class DefaultMQProducer
         MessageQueue selected = selector.Select(publish.MsgQueueList, msg, arg);
         // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
         int sysFlag = PrepareForSend(outbound);
-        return SendWithHooks(c, outbound, selected, timeout, sysFlag);
+        // arg 透传给 CheckForbiddenHook（Java CheckForbiddenContext.arg 就是它）
+        return SendWithHooks(c, outbound, selected, timeout, sysFlag, arg, CommunicationMode.Sync);
     }
 
     // ---------------- 异步 / 单向 ----------------
@@ -784,6 +853,18 @@ public class DefaultMQProducer
         TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
         int sysFlag = PrepareForSend(outbound);
+        // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效
+        string brokerAddr = string.Empty;
+        try
+        {
+            brokerAddr = c.BrokerAddrForMq(selected) ?? string.Empty;
+        }
+        catch (Exception)
+        {
+            // 查不到 broker 地址不影响拦截判定，brokerAddr 留空
+        }
+
+        RunCheckForbidden(outbound, selected, brokerAddr, null, CommunicationMode.Oneway);
         c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
     }
 

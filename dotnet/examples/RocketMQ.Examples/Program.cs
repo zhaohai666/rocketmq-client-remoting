@@ -41,6 +41,7 @@ internal static class Program
                 "pop" => LivePop.Run(rest),
                 "popc" => LivePopConsumer.Run(rest),
                 "trace" => LiveTrace.Run(rest),
+                "hook" => LiveHook.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -76,6 +77,8 @@ internal static class Program
               latency      [namesrv]        真实集群发送延迟故障容错联调（默认关/开/隔离退化链/到期恢复）
               pop          [namesrv]        真实集群 POP 模式（5.x）联调（POP/ACK/延长不可见/复活重投）
               popc         [namesrv]        真实集群 POP **消费侧**联调（消费循环/ack/延迟重投）
+              trace        [namesrv]        真实集群消息轨迹联调（需 broker traceTopicEnable=true）
+              hook         [namesrv]        真实集群 CheckForbidden/FilterMessage 钩子联调
             """);
     }
 }

@@ -175,6 +175,113 @@ public sealed class DefaultMQPushConsumer
 
     public bool HasConsumeMessageHook() => _consumeMessageHooks.Count > 0;
 
+    /// <summary>注册投递前过滤钩子（对应 Java registerFilterMessageHook / hasFilterMessageHook）。
+    /// 钩子摘掉的消息：拉取路径静默跳过（位点照常推进），POP 路径立刻 ack。</summary>
+    public void RegisterFilterMessageHook(IFilterMessageHook hook)
+    {
+        if (hook is not null)
+        {
+            _filterMessageHooks.Add(hook);
+        }
+    }
+
+    public bool HasFilterMessageHook() => _filterMessageHooks.Count > 0;
+
+    public int FilterMessageHookCount() => _filterMessageHooks.Count;
+
+    /// <summary>已丢弃的条数（拉取 + POP 合计），供联调脚本与单测观测。</summary>
+    public long FilteredMessageCount() => Interlocked.Read(ref _filteredMessageCount);
+
+    /// <summary>依次执行过滤钩子，<b>异常一律吞掉</b>并记 error
+    /// （Java PullAPIWrapper.executeHook:171-178）。
+    /// 与 CheckForbiddenHook 相反：过滤钩子挂了不能影响消费。</summary>
+    public void ExecuteFilterMessageHook(FilterMessageContext context)
+    {
+        foreach (IFilterMessageHook hook in _filterMessageHooks)
+        {
+            try
+            {
+                hook.FilterMessage(context);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Error("execute hook error. hookName=" + hook.HookName() + ": " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>拉取 / POP 两条路径共用的投递前过滤：
+    /// ① 客户端二次 tag 过滤（broker 侧按 codeSet 哈希过滤有碰撞误放）
+    /// ② IFilterMessageHook（可改写 MsgList）。
+    /// <para>① 对齐 Java PullAPIWrapper.processPullResult:113-122 与 processPopResult:625-635：
+    /// broker 侧是按 tag 的<b>哈希（codeSet）</b>过滤的，存在哈希碰撞误放，客户端要再按
+    /// 字符串核一遍。守卫 <c>!tagsSet.isEmpty()</c> 意味着订阅 "*"（SUB_ALL）时不过滤 ——
+    /// 所以 FilterAPI.BuildSubscriptionData 对 SUB_ALL 必须留空。</para>
+    /// <para>sub 为 null 时只跑 ②。</para></summary>
+    public List<MessageExt> FilterMessagesForDelivery(MessageQueue mq, SubscriptionData? sub,
+        List<MessageExt> msgs)
+    {
+        List<MessageExt> result = msgs;
+        if (result.Count == 0)
+        {
+            return result;
+        }
+
+        if (sub is not null && sub.TagsSet.Count > 0 && !sub.ClassFilterMode)
+        {
+            var kept = new List<MessageExt>(result.Count);
+            foreach (MessageExt m in result)
+            {
+                string? tags = m.Tags;
+                if (!string.IsNullOrEmpty(tags) && sub.TagsSet.Contains(tags!))
+                {
+                    kept.Add(m);
+                }
+            }
+
+            result = kept;
+        }
+
+        if (_filterMessageHooks.Count > 0 && result.Count > 0)
+        {
+            var context = new FilterMessageContext(ConsumerGroup, result, mq)
+            {
+                UnitMode = false, // 本项目无 unit mode
+            };
+            ExecuteFilterMessageHook(context);
+            result = context.MsgList;
+        }
+
+        return result;
+    }
+
+    /// <summary>求 original \ kept 的差集（POP 路径要给被摘掉的消息补 ack）。
+    /// Java 用 List.contains 的引用同一性；C# 里 List 拷贝后无同一性，改按 MsgId 求差（语义等价）。</summary>
+    public static List<MessageExt> DroppedMessages(List<MessageExt> original, List<MessageExt> kept)
+    {
+        var dropped = new List<MessageExt>();
+        if (kept.Count >= original.Count)
+        {
+            return dropped;
+        }
+
+        var keptIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (MessageExt m in kept)
+        {
+            keptIds.Add(m.MsgId);
+        }
+
+        foreach (MessageExt m in original)
+        {
+            if (!keptIds.Contains(m.MsgId))
+            {
+                dropped.Add(m);
+            }
+        }
+
+        return dropped;
+    }
+
     // ---------------- POP 模式（5.x 轻量消费）----------------
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
     public bool PopMode { get; set; }
@@ -215,6 +322,8 @@ public sealed class DefaultMQPushConsumer
     private string _traceTopic = MixAll.TraceTopic;
     private int _traceMsgBatchNum = 10;
     private readonly List<IConsumeMessageHook> _consumeMessageHooks = new();
+    private readonly List<IFilterMessageHook> _filterMessageHooks = new();
+    private long _filteredMessageCount;
     private AsyncTraceDispatcher? _traceDispatcher;
 
     private string _instanceName = "DEFAULT";
@@ -1121,6 +1230,17 @@ public sealed class DefaultMQPushConsumer
 
             if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
             {
+                // 投递前的客户端侧过滤（对齐 Java PullAPIWrapper.processPullResult:113-128）：
+                // 先二次 tag 过滤，再跑 FilterMessageHook。**必须在拿 _lock 之前做** ——
+                // 钩子是用户代码，可能阻塞，不能压在入队的临界区里。
+                // 拉取路径被摘掉的消息**不 ack**（Java 亦然）：位点照常推进 = 静默跳过。
+                int before = result.MsgFoundList.Count;
+                result.MsgFoundList = FilterMessagesForDelivery(mq, sub, result.MsgFoundList);
+                if (result.MsgFoundList.Count < before)
+                {
+                    Interlocked.Add(ref _filteredMessageCount, before - result.MsgFoundList.Count);
+                }
+
                 // 重投消息 topic 还原（对齐 Java PullAPIWrapper.processPullResult）：broker 把重试
                 // 消息写到 %RETRY%group，但消息自带 RETRY_TOPIC 属性指向原始 topic，分发前还原，
                 // 否则上层 listener 看到的 topic 是 %RETRY% 而非业务 topic。
@@ -1240,7 +1360,27 @@ public sealed class DefaultMQPushConsumer
             if (result.Status == PopStatus.Found && result.MsgFoundList.Count > 0)
             {
                 pq.IncFoundMsg(result.MsgFoundList.Count);
-                SubmitPopConsumeRequest(result.MsgFoundList, pq, mq);
+                // 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
+                // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
+                List<MessageExt> kept = FilterMessagesForDelivery(mq, sub, result.MsgFoundList);
+                if (kept.Count != result.MsgFoundList.Count)
+                {
+                    List<MessageExt> dropped = DroppedMessages(result.MsgFoundList, kept);
+                    Interlocked.Add(ref _filteredMessageCount, dropped.Count);
+                    foreach (MessageExt msg in dropped)
+                    {
+                        AckPopMsg(msg);
+                        pq.Ack();
+                    }
+
+                    ClientLog.Info("pop filter dropped " + dropped.Count + " of "
+                        + result.MsgFoundList.Count + " messages (acked)");
+                }
+
+                if (kept.Count > 0)
+                {
+                    SubmitPopConsumeRequest(kept, pq, mq);
+                }
             }
             else if (UtilAll.CurrentTimeMillis() - began < 200)
             {

@@ -91,3 +91,77 @@ public interface IEndTransactionHook
 
     void EndTransaction(EndTransactionContext context);
 }
+
+/// <summary>对应 org.apache.rocketmq.client.impl.CommunicationMode（Java 是枚举，三个常量）。</summary>
+public enum CommunicationMode
+{
+    Sync = 0,
+    Async = 1,
+    Oneway = 2,
+}
+
+/// <summary>对应 org.apache.rocketmq.client.hook.CheckForbiddenContext。
+///
+/// 与 SendMessageContext 的关键差别：<b>没有 SendResult</b>（此刻还没发），带上 Arg
+/// （send(msg, selector, arg) 里的业务参数）。
+/// </summary>
+public sealed class CheckForbiddenContext
+{
+    public string NameSrvAddr { get; set; } = string.Empty;
+    public string Group { get; set; } = string.Empty;
+    public Message? Message { get; set; }
+    public MessageQueue? Mq { get; set; }
+    public string BrokerAddr { get; set; } = string.Empty;
+    public CommunicationMode CommunicationMode { get; set; } = CommunicationMode.Sync;
+    public SendResult? SendResult { get; set; }
+    public Exception? Exception { get; set; }
+    public object? Arg { get; set; }
+
+    /// <summary>本项目无 unit mode（Java 的 isUnitMode() 恒为 false）。</summary>
+    public bool UnitMode { get; set; }
+}
+
+/// <summary>对应 org.apache.rocketmq.client.hook.CheckForbiddenHook。
+///
+/// ⚠ 与 Send/Consume 钩子<b>相反</b>：CheckForbidden 抛出的异常<b>不会被吞掉</b>
+/// （Java 签名就是 <c>throws MQClientException</c>），而是沿发送重试链向上传播 ——
+/// 这正是"拦截"能力的实现方式。
+/// </summary>
+public interface ICheckForbiddenHook
+{
+    string HookName();
+
+    void CheckForbidden(CheckForbiddenContext context);
+}
+
+/// <summary>对应 org.apache.rocketmq.client.hook.FilterMessageContext。
+///
+/// MsgList 是<b>可变的</b>：钩子把它替换/裁剪掉的消息会被客户端直接丢弃
+/// （拉取路径 = 静默跳过、位点照常推进；POP 路径 = 立刻 ack）。
+/// </summary>
+public sealed class FilterMessageContext
+{
+    public FilterMessageContext(string consumerGroup = "", List<MessageExt>? msgList = null,
+        MessageQueue? mq = null)
+    {
+        ConsumerGroup = consumerGroup;
+        MsgList = msgList ?? new List<MessageExt>();
+        Mq = mq;
+    }
+
+    public string ConsumerGroup { get; set; }
+    public List<MessageExt> MsgList { get; set; }
+    public MessageQueue? Mq { get; set; }
+    public object? Arg { get; set; }
+
+    /// <summary>本项目无 unit mode。</summary>
+    public bool UnitMode { get; set; }
+}
+
+/// <summary>对应 org.apache.rocketmq.client.hook.FilterMessageHook。</summary>
+public interface IFilterMessageHook
+{
+    string HookName();
+
+    void FilterMessage(FilterMessageContext context);
+}

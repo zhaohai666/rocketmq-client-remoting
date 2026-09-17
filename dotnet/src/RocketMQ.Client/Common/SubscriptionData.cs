@@ -241,39 +241,68 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
 // org.apache.rocketmq.common.filter.FilterAPI
 public static class FilterAPI
 {
-    // subString 为空 / "*" / 全空白 => tagsSet = {"*"}；否则按 "||" 切分并 trim，
-    // 空片段丢弃（与 Java FilterAPI.buildSubscriptionData 一致）。
+    public const string SubAll = "*";
+
+    // 对齐 Java FilterAPI.buildSubscriptionData（Java 探针实测向量）：
+    //   null / "" / "*"   → subString 归一为 "*"，**tagsSet 与 codeSet 都保持空**
+    //   "TagA"            → tagsSet={TagA}, codeSet={2598919}
+    //   "TagA||TagB"      → tagsSet={TagA,TagB}, codeSet={2598919,2598920}
+    //   " TagA || TagB "  → subString 原样保留空格，标签各自 trim
+    //   "   "（纯空白）    → tagsSet 空、subString 原样保留（IsEmpty 只认 null/""）
+    //   "|||"             → tagsSet={|}, codeSet={124}（Java-split 只丢**末尾**空串）
+    //   "||" / "||||"     → 抛 "subString split error"（Java-split 结果数组长度为 0）
+    //
+    // ⚠ 两处曾有的偏差（都会污染心跳、并让客户端二次 tag 过滤失效）：
+    //   ① 给 "*" 塞 tagsSet={"*"} —— Java 里 tagsSet 非空才是"客户端二次 tag 过滤"的开关
+    //      （PullAPIWrapper.processPullResult 的 `!tagsSet.isEmpty()`），塞了 "*" 会让订阅
+    //      全量时把所有正常 tag 的消息客户端自己过滤掉；
+    //   ② 从不填 codeSet —— 它是 broker 侧按 tag 哈希过滤的依据
+    //      （ExpressionMessageFilter.isMatchedByConsumeQueue 走 codeSet.contains）。
+    // 另注：判空必须用"空串"而不是"全空白"—— Java StringUtils.isEmpty 只认 null/""，
+    // 纯空白（如 "   "）会走进 split 分支，结果 tagsSet 空但 subString 原样保留。
     public static SubscriptionData BuildSubscriptionData(string topic, string subString)
     {
         SubscriptionData sub = new SubscriptionData(topic, subString);
-        // Java: null / "*" / 全空白 -> tagsSet = {"*"}
-        if (UtilAll.IsBlank(subString) || subString == "*")
+        if (string.IsNullOrEmpty(subString) || subString == SubAll)
         {
-            sub.TagsSet.Add("*");
+            sub.SubString = SubAll;
+            return sub;
         }
-        else
+
+        // Java String.split("\\|\\|")：先全切，再丢弃**末尾**空串
+        List<string> rawTags = new List<string>();
+        int pos = 0;
+        while (true)
         {
-            // 按 "||" 切分，trim 后丢弃空片段
-            int pos = 0;
-            while (pos <= subString.Length)
+            int next = subString.IndexOf("||", pos, StringComparison.Ordinal);
+            if (next < 0)
             {
-                int next = subString.IndexOf("||", pos, StringComparison.Ordinal);
-                string tag = next < 0
-                    ? subString.Substring(pos)
-                    : subString.Substring(pos, next - pos);
-                // trim（仅 " \t\r\n"，与 C++ 一致）
-                tag = TrimTag(tag);
-                if (tag.Length > 0)
-                {
-                    sub.TagsSet.Add(tag);
-                }
+                rawTags.Add(subString.Substring(pos));
+                break;
+            }
 
-                if (next < 0)
-                {
-                    break;
-                }
+            rawTags.Add(subString.Substring(pos, next - pos));
+            pos = next + 2;
+        }
 
-                pos = next + 2;
+        while (rawTags.Count > 0 && rawTags[rawTags.Count - 1].Length == 0)
+        {
+            rawTags.RemoveAt(rawTags.Count - 1);
+        }
+
+        if (rawTags.Count == 0)
+        {
+            // Java: throw new Exception("subString split error")
+            throw new ArgumentException("subString split error");
+        }
+
+        foreach (string raw in rawTags)
+        {
+            string tag = TrimTag(raw);
+            if (tag.Length > 0)
+            {
+                sub.TagsSet.Add(tag);
+                sub.CodeSet.Add(JavaHash.JavaStringHash(tag));
             }
         }
 
