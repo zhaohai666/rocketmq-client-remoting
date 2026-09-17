@@ -6,19 +6,22 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 跨语言的关键约定与验证入口，避免重复。
 
 ## 目录
-- `python/rocketmq/` 参考实现 · `cpp/` C++（24 个 .cpp，含 Admin / 压缩 / PullConsumer）·
-  `dotnet/` .NET 10（零 NuGet）。
+- `python/rocketmq/` 参考实现 · `cpp/` C++（27 个 .cpp，含 Admin / 压缩 / PullConsumer /
+  Request-Reply / 故障规避 / POP）· `dotnet/` .NET 10（零 NuGet）。
 - 三侧已对齐 Java：**两阶段事务**（半消息 → END_TRANSACTION → broker 回查）、消费侧回投 / 位点持久化 /
   顺序锁 / 广播 / 流控、**真实 rebalance + 队列撤销收尾 + 重投 topic 还原 + 优雅注销 + 命名空间 +
-  ACL 鉴权 + 主动拉取 PullConsumer**、压缩（zlib 跨客户端互通）。
+  ACL 鉴权 + 主动拉取 PullConsumer + Request-Reply + 故障规避 + POP 协议管道**、
+  压缩（zlib 跨客户端互通）。
 
 ## 验证入口（改完必跑）
-- 技能 `rocketmq-cpp-build-verify/SKILL.md`：编译命令、9 个 ctest 用例与断言数、真机联调工具、全部坑位。
-- Python `pytest` 158 passed / 4 skipped；C++ ctest **9/9**（约 552 项断言）；.NET xunit **55/55**。
+- 技能 `rocketmq-cpp-build-verify/SKILL.md`：编译命令、**12** 个 ctest 用例与断言数、真机联调工具、全部坑位。
+- Python `pytest` **222 passed / 4 skipped**；C++ ctest **12/12**（约 **713** 项断言，带 Java 源码比对 719）；
+  .NET xunit **125/125**。
 - 真机（**起集群 + 等端口 + 跑测试 + kill 必须在同一条 Bash 命令里**，前台返回会回收后台 JVM）：
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
   `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、**`run_acl_live.sh`**（开认证的集群）、
-  **`run_pull_live.sh`**（主动拉取消费者 S1–S7）。
+  **`run_pull_live.sh`**（主动拉取 S1–S7）、**`run_rr_live.sh`**（Request-Reply）、
+  **`run_latency_live.sh`**（故障规避）、**`run_pop_live.sh`**（POP 模式 S1–S8；三语言各 14/14）。
 
 ## 跨语言硬性约定
 1. **字段名以 Java 为准**：broker 用 fastjson2 按 **Java 属性名**反序列化，错一个就**静默丢字段**。
