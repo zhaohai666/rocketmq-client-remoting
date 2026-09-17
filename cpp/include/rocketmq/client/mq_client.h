@@ -24,6 +24,7 @@
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/byte_buffer.h"
 #include "rocketmq/common/message.h"
+#include "rocketmq/common/top_addressing.h"
 #include "rocketmq/common/topic_config.h"
 #include "rocketmq/remoting/protocol/body.h"
 #include "rocketmq/remoting/protocol/headers.h"
@@ -94,6 +95,12 @@ public:
     std::vector<std::string> nameServerAddrs() const;
     void updateNameServerAddressList(const std::vector<std::string>& addrs);
     RemotingClient& remotingClient() { return *remotingClient_; }
+
+    // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
+    // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 wsAddr 为空 → fetch 是 no-op，行为不变。
+    DefaultTopAddressing& topAddressing() { return topAddressing_; }
+    // 取一次地址；变化才应用到 nameServerAddrs_（Java 地址变化才 update）。
+    void fetchNameServerAddr();
 
     // 安装 RPC 钩子（ACL 鉴权）。对应 Java 在 MQClientInstance 构造时绑定 rpcHook。
     // **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
@@ -323,6 +330,11 @@ private:
     bool started_ = false;
     bool routeRefreshStop_ = false;
     std::thread routeRefreshThread_;
+    // 动态 name server 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
+    std::atomic<bool> namesrvRefreshStop_{false};
+    std::thread namesrvRefreshThread_;
+    void namesrvRefreshLoop();
+    DefaultTopAddressing topAddressing_;
 };
 
 }  // namespace rocketmq

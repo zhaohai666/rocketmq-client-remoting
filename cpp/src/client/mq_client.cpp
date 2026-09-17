@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -127,6 +128,24 @@ MQClientInstance::~MQClientInstance() { shutdown(); }
 
 void MQClientInstance::start() {
     started_ = true;
+    // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
+    // 静态地址时先 fetch 一次；取不到直接报错（比 Java 更严格——Java 会让运行期各处
+    // 各自失败，这里在 start 时给一个明确错误）。
+    if (nameServerAddrs_.empty() && !topAddressing_.wsAddr().empty()) {
+        fetchNameServerAddr();
+        if (nameServerAddrs_.empty()) {
+            throw MQClientException("name server address is not set and address server ("
+                                    + topAddressing_.wsAddr() + ") returned none");
+        }
+        // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
+        if (!namesrvRefreshThread_.joinable()) {
+            namesrvRefreshStop_ = false;
+            namesrvRefreshThread_ = std::thread([this]() {
+                setThreadName("MQClientFactoryScheduledThread-NS");
+                namesrvRefreshLoop();
+            });
+        }
+    }
     std::string ns;
     for (size_t i = 0; i < nameServerAddrs_.size(); ++i) {
         if (i) ns += ";";
@@ -183,11 +202,47 @@ void MQClientInstance::routeRefreshLoop() {
 void MQClientInstance::shutdown() {
     started_ = false;
     routeRefreshStop_ = true;
+    namesrvRefreshStop_ = true;
+    if (namesrvRefreshThread_.joinable()) {
+        namesrvRefreshThread_.join();
+    }
     if (routeRefreshThread_.joinable()) {
         routeRefreshThread_.join();
     }
     if (remotingClient_) {
         remotingClient_->shutdown();
+    }
+}
+
+void MQClientInstance::fetchNameServerAddr() {
+    // Java MQClientAPIImpl.fetchNameServerAddr：地址**变化才应用**（按 ';' 切分）
+    std::string changed = topAddressing_.fetchAndApply();
+    if (changed.empty()) return;
+    std::vector<std::string> addrs;
+    std::string item;
+    std::istringstream iss(changed);
+    while (std::getline(iss, item, ';')) {
+        const std::string t = clearNewLine(item);
+        if (!t.empty()) addrs.push_back(t);
+    }
+    updateNameServerAddressList(addrs);
+}
+
+void MQClientInstance::namesrvRefreshLoop() {
+    // Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)：首次延迟 10s、周期 2min
+    for (int i = 0; i < 100 && !namesrvRefreshStop_; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    while (!namesrvRefreshStop_) {
+        if (!started_) return;
+        try {
+            fetchNameServerAddr();
+        } catch (const std::exception& e) {
+            logger_debug(std::string("fetchNameServerAddr exception: ") + e.what());
+        }
+        for (int i = 0; i < 1200 && !namesrvRefreshStop_; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 }
 

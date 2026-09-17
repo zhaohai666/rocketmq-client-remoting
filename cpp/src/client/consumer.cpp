@@ -76,7 +76,135 @@ void DefaultMQPushConsumer::setNameServerAddresses(const std::vector<std::string
 }
 
 void DefaultMQPushConsumer::setConsumeThreadNums(int32_t n) {
-    consumeThreadNums_ = std::max(1, n);
+    // 便捷方法：min 与 max 一起设（Java 4.x setConsumeThreadNums 的语义）。
+    // Java 5.x 已拆成 setConsumeThreadMin/Max，本方法保留是为了兼容既有调用点。
+    const int32_t v = std::max(1, n);
+    consumeThreadMin_ = v;
+    consumeThreadMax_ = v;
+    corePoolSize_ = v;
+    if (popConsumeExecutor_) {
+        popConsumeExecutor_->setCorePoolSize(v);
+    }
+}
+
+void DefaultMQPushConsumer::setConsumeThreadMin(int32_t n) {
+    consumeThreadMin_ = std::max(1, n);
+    corePoolSize_ = consumeThreadMin_;
+    if (popConsumeExecutor_) {
+        popConsumeExecutor_->setCorePoolSize(corePoolSize_);
+    }
+}
+
+void DefaultMQPushConsumer::setConsumeThreadMax(int32_t n) {
+    consumeThreadMax_ = std::max(1, n);
+    if (popConsumeExecutor_) {
+        popConsumeExecutor_->setCorePoolSize(corePoolSize_);
+    }
+}
+
+// ---------------------------------------------------------------- 消费线程弹性
+
+bool DefaultMQPushConsumer::updateCorePoolSize(int32_t corePoolSize) {
+    // Java AbstractConsumeMessageService:63-71 的守卫逐条照抄：
+    //   ownsConsumeExecutor && corePoolSize > 0
+    //       && corePoolSize <= Short.MAX_VALUE   (32767)
+    //       && corePoolSize < consumeThreadMax
+    // 任一条不满足就静默忽略（Java 也是静默 return，不抛异常）。
+    // 本实现不支持外部注入执行器，ownsConsumeExecutor 恒为 true。
+    if (corePoolSize <= 0 || corePoolSize > 32767 || corePoolSize >= consumeThreadMax_) {
+        return false;
+    }
+    corePoolSize_ = corePoolSize;
+    if (popConsumeExecutor_) {
+        popConsumeExecutor_->setCorePoolSize(corePoolSize_);
+    }
+    return true;
+}
+
+int32_t DefaultMQPushConsumer::getCorePoolSize() const {
+    if (popConsumeExecutor_) {
+        return popConsumeExecutor_->getCorePoolSize();
+    }
+    return corePoolSize_;
+}
+
+int64_t DefaultMQPushConsumer::computeAccumulationTotal() const {
+    std::lock_guard<std::mutex> lk(lock_);
+    int64_t total = 0;
+    for (const auto& kv : msgAccCntTable_) {
+        total += kv.second;
+    }
+    return total;
+}
+
+int64_t DefaultMQPushConsumer::msgAccCnt(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    if (key.empty()) {
+        int64_t total = 0;
+        for (const auto& kv : msgAccCntTable_) {
+            total += kv.second;
+        }
+        return total;
+    }
+    auto it = msgAccCntTable_.find(key);
+    return it == msgAccCntTable_.end() ? 0 : it->second;
+}
+
+void DefaultMQPushConsumer::updateMsgAccCnt(const std::string& key,
+                                           const std::vector<MessageExt>& msgs) {
+    std::lock_guard<std::mutex> lk(lock_);
+    updateMsgAccCntLocked(key, msgs);
+}
+
+void DefaultMQPushConsumer::updateMsgAccCntLocked(const std::string& key,
+                                                 const std::vector<MessageExt>& msgs) {
+    // Java ProcessQueue.java:148-158：
+    //   long accTotal = Long.parseLong(msg.getProperty(MAX_OFFSET)) - msg.getQueueOffset();
+    //   if (accTotal > 0) this.msgAccCnt = accTotal;
+    // 取**本批最后一条**；属性缺失/非数字/非正一律不更新（Java 里 parse 失败会抛，
+    // 但 broker 恒会带上该属性，这里做容错以免脏数据打断拉取线程）。
+    if (msgs.empty()) return;
+    const MessageExt& last = msgs.back();
+    const std::string maxOffset = last.getProperty(MessageConst::PROPERTY_MAX_OFFSET);
+    if (maxOffset.empty()) return;
+    int64_t parsed = 0;
+    try {
+        size_t pos = 0;
+        parsed = std::stoll(maxOffset, &pos);
+        if (pos != maxOffset.size()) return;
+    } catch (const std::exception&) {
+        return;
+    }
+    const int64_t accTotal = parsed - static_cast<int64_t>(last.queueOffset);
+    if (accTotal > 0) {
+        msgAccCntTable_[key] = accTotal;
+    }
+}
+
+void DefaultMQPushConsumer::adjustThreadPool() {
+    // ⚠ 在 Java 5.5.1 这是 no-op：真正被调的 consumeMessageService.incCorePoolSize() /
+    // decCorePoolSize() 在 AbstractConsumeMessageService:70-75 是**空方法体**。
+    // 这里保留阈值比较与日志，仅为让 msgAccCnt / 阈值配置可观测；**不要"修好"它**。
+    const int64_t accTotal = computeAccumulationTotal();
+    const int64_t threshold = adjustThreadPoolNumsThreshold_;
+    const int64_t incThreshold = static_cast<int64_t>(static_cast<double>(threshold) * 1.0);
+    const int64_t decThreshold = static_cast<int64_t>(static_cast<double>(threshold) * 0.8);
+    if (accTotal >= incThreshold) {
+        logger_debug("adjustThreadPool: acc=" + std::to_string(accTotal) + " >= incThreshold="
+                     + std::to_string(incThreshold) + " (inc is a no-op upstream)");
+    }
+    if (accTotal < decThreshold) {
+        logger_debug("adjustThreadPool: acc=" + std::to_string(accTotal) + " < decThreshold="
+                     + std::to_string(decThreshold) + " (dec is a no-op upstream)");
+    }
+}
+
+int32_t DefaultMQPushConsumer::consumeExecutorWorkers() const {
+    return popConsumeExecutor_ ? popConsumeExecutor_->workerCount() : 0;
+}
+
+int32_t DefaultMQPushConsumer::consumeExecutorQueued() const {
+    return popConsumeExecutor_ ? popConsumeExecutor_->queuedCount() : 0;
 }
 
 void DefaultMQPushConsumer::setMessageListener(std::shared_ptr<MessageListener> listener) {
@@ -131,7 +259,8 @@ void DefaultMQPushConsumer::start() {
         if (started_.load()) {
             return;
         }
-        if (nameServerAddrs_.empty()) {
+        // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+        if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
             throw MQClientException("name server address is not set");
         }
         if (subscriptionData_.empty()) {
@@ -161,10 +290,22 @@ void DefaultMQPushConsumer::start() {
                                              /*connectTimeoutMillis=*/3000,
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_));
         mqClient_->start();
+        // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
+        // （Java 由共享的 ClientConfig 天然同步）
+        if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
+            nameServerAddrs_ = mqClient_->nameServerAddrs();
+        }
         // ACL 鉴权钩子：必须在首包（路由拉取 / 心跳 / rebalance）发出之前绑定。
         if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
             logger_warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
                         + clientId_ + ")");
+        }
+        // POP 消费执行器必须在 rebalance（会立刻起每队列 POP 循环）之前建好，
+        // 否则循环弹出消息后无处投递（对齐 Java 在 service 构造时就建 consumeExecutor）。
+        if (popMode_) {
+            popConsumeExecutor_ = std::make_shared<ConsumeExecutor>(
+                std::max(1, corePoolSize_), std::max(1, consumeThreadMax_),
+                /*keepAliveSeconds=*/60.0, "rmq-popconsume-" + consumerGroup_);
         }
         startMillis_ = UtilAll::currentTimeMillis();
         stop_.store(false);
@@ -250,6 +391,12 @@ void DefaultMQPushConsumer::shutdown() {
             kv.second->setDropped(true);
         }
         popQueues_.clear();
+    }
+    // POP 消费执行器收工（对齐 Java shutdownGracefully：不再收新任务，把手上的批次跑完）。
+    // ⚠ 必须显式 join：工作线程捕获了 this，留着跑就是 use-after-free。
+    if (popConsumeExecutor_) {
+        popConsumeExecutor_->shutdown(true);
+        popConsumeExecutor_.reset();
     }
     // 退出前把已消费位点持久化一次（对齐 Java shutdown → persistAllConsumerOffset）
     try {
@@ -552,6 +699,8 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
             for (const MessageExt& m : deliverable) {
                 dq.push_back(m);
             }
+            // ProcessQueue.msgAccCnt：用**过滤后入队**的那批算（Java 是先过滤再 putMessage）
+            updateMsgAccCntLocked(key, deliverable);
         }
         // 拉取游标推进到 nextBeginOffset；"已消费位点"由 consumeOffsetTable_ 跟踪并持久化
         if (result.nextBeginOffset >= 0) {
@@ -655,18 +804,25 @@ void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs
                                                     std::shared_ptr<PopProcessQueue> pq,
                                                     const MessageQueue& mq) {
     // 对应 Java ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest。
-    // 每个批次起一个独立线程：POP 的语义是"弹出即投递、循环立刻继续"，
-    // 不能像 pull 那样等分发线程慢慢取。
+    // 投给**有界线程池**（core=consumeThreadMin / max=consumeThreadMax）：
+    // 此前这里每批起一个 detached 线程（无上限），慢监听器一上来就线程爆炸，
+    // 而 setConsumeThreadNums() 设的值完全没作用。Java 用线程池 + 无界队列，
+    // 因此真实并发度 == corePoolSize，updateCorePoolSize() 在运行时能改它。
     const size_t size = static_cast<size_t>(std::max(1, consumeMessageBatchMaxSize_));
+    std::shared_ptr<ConsumeExecutor> exec = popConsumeExecutor_;
     for (size_t i = 0; i < msgs.size(); i += size) {
-        std::vector<MessageExt> batch(msgs.begin() + static_cast<long>(i),
-                                      msgs.begin() + static_cast<long>(std::min(i + size, msgs.size())));
-        if (batch.empty()) continue;
-        std::thread t([this, batch = std::move(batch), pq, mq]() mutable {
-            setThreadName("PopConsume");
-            consumePopBatch(std::move(batch), pq, mq);
-        });
-        t.detach();
+        auto batch = std::make_shared<std::vector<MessageExt>>(
+            msgs.begin() + static_cast<long>(i),
+            msgs.begin() + static_cast<long>(std::min(i + size, msgs.size())));
+        if (batch->empty()) continue;
+        if (exec) {
+            exec->submit([this, batch, pq, mq]() {
+                consumePopBatch(std::move(*batch), pq, mq);
+            });
+        } else {
+            // 未 start（单测）时没有执行器：同步执行，保持与改动前一致的可测行为。
+            consumePopBatch(std::move(*batch), pq, mq);
+        }
     }
 }
 

@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/hook.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
@@ -131,6 +132,29 @@ public:
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
     void setConsumeThreadNums(int32_t n);
+    // ---- 消费线程弹性（对应 Java DefaultMQPushConsumer / AbstractConsumeMessageService）----
+    void setConsumeThreadMin(int32_t n);
+    void setConsumeThreadMax(int32_t n);
+    int32_t getConsumeThreadMin() const { return consumeThreadMin_; }
+    int32_t getConsumeThreadMax() const { return consumeThreadMax_; }
+    void setAdjustThreadPoolNumsThreshold(int64_t v) { adjustThreadPoolNumsThreshold_ = v; }
+    int64_t getAdjustThreadPoolNumsThreshold() const { return adjustThreadPoolNumsThreshold_; }
+    // Java AbstractConsumeMessageService.updateCorePoolSize：守卫不满足则**静默忽略**。
+    // 返回值只用于单测断言"是否真的生效"（Java 无返回值）。
+    bool updateCorePoolSize(int32_t corePoolSize);
+    int32_t getCorePoolSize() const;
+    // Java DefaultMQPushConsumerImpl.computeAccumulationTotal / adjustThreadPool。
+    // ⚠ adjustThreadPool 在 Java 5.5.1 是 no-op（inc/dec 空实现），本实现照抄。
+    int64_t computeAccumulationTotal() const;
+    void adjustThreadPool();
+    // 单队列（key 省略则求和）的 ProcessQueue.msgAccCnt。
+    int64_t msgAccCnt(const std::string& key = std::string()) const;
+    // 按 Java ProcessQueue.putMessage 的规则更新某队列的 msgAccCnt
+    // （= 最后一条消息的 MAX_OFFSET 属性 - 它的 queueOffset，> 0 才更新）。
+    void updateMsgAccCnt(const std::string& key, const std::vector<MessageExt>& msgs);
+    // 观测：当前 POP 消费执行器的存活线程数 / 排队任务数（未建执行器时为 0）。
+    int32_t consumeExecutorWorkers() const;
+    int32_t consumeExecutorQueued() const;
     void setMessageListener(std::shared_ptr<MessageListener> listener);
     void setPullBatchSize(int32_t n) { pullBatchSize_ = n; }
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }
@@ -342,6 +366,8 @@ private:
                                  const std::shared_ptr<PopProcessQueue>& pq);
     // 重试次数用尽后的兜底（Java checkNeedAckOrDelay）
     void checkNeedAckOrDelay(const MessageExt& msg);
+    // 调用方必须已持有 lock_（pull 循环在入队临界区内直接调它）
+    void updateMsgAccCntLocked(const std::string& key, const std::vector<MessageExt>& msgs);
     void ackPopMsg(const MessageExt& msg);
     void changePopInvisibleTime(const MessageExt& msg, int32_t delayLevel);
 
@@ -370,7 +396,21 @@ private:
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
 
-    int32_t consumeThreadNums_ = 1;
+    // ---- 消费线程池（对齐 Java DefaultMQPushConsumer 的 consumeThreadMin/Max）----
+    // Java 默认 min=20 / max=64。本实现的**拉取**路径是"每队列一个拉取线程 + 单分发线程"，
+    // 只有 **POP** 路径用真正的线程池（对应 Java ConsumeMessagePopConcurrentlyService），
+    // 因此 corePoolSize 直接决定 POP 的消费并发度（Java 无界队列下 max 实际用不到）。
+    int32_t consumeThreadMin_ = 20;
+    int32_t consumeThreadMax_ = 64;
+    // Java adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；上游 inc/dec 是空实现）
+    int64_t adjustThreadPoolNumsThreshold_ = 100000;
+    // 声明式 core pool size（Java setCorePoolSize 的等价物），默认 = consumeThreadMin
+    int32_t corePoolSize_ = 20;
+    // key -> ProcessQueue.msgAccCnt（最近一次拉取算出的积压条数）
+    mutable std::map<std::string, int64_t> msgAccCntTable_;
+    // POP 消费执行器（start 且 popMode_ 时创建；stop 时 shutdown）
+    std::shared_ptr<ConsumeExecutor> popConsumeExecutor_;
+
     int32_t pullBatchSize_ = 32;
     int32_t pullBatchSizeInBytes_ = 256 * 1024;
     int32_t consumeMessageBatchMaxSize_ = 1;

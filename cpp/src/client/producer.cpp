@@ -111,7 +111,8 @@ void DefaultMQProducer::start() {
     if (started_) {
         return;
     }
-    if (nameServerAddrs_.empty()) {
+    // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+    if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
         throw MQClientException("name server address is not set");
     }
     if (clientId_.empty()) {
@@ -119,6 +120,10 @@ void DefaultMQProducer::start() {
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_));
     mqClient_->start();
+    // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+    if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
+        nameServerAddrs_ = mqClient_->nameServerAddrs();
+    }
     // ACL 鉴权钩子：必须在任何请求发出之前绑定（路由拉取、心跳都会带签名）。
     if (rpcHook_) {
         if (!mqClient_->registerRPCHook(rpcHook_)) {

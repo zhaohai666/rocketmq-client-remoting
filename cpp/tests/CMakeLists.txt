@@ -68,6 +68,17 @@ add_executable(rmq_test_hook test_hook.cpp)
 target_link_libraries(rmq_test_hook PRIVATE rocketmq::remoting)
 add_test(NAME hook COMMAND rmq_test_hook)
 
+# 消费线程弹性：ConsumeExecutor（core/max 两档）+ updateCorePoolSize 五条守卫 +
+# adjustThreadPool 的上游 no-op 语义 + msgAccCnt
+add_executable(rmq_test_consume_thread_pool test_consume_thread_pool.cpp)
+target_link_libraries(rmq_test_consume_thread_pool PRIVATE rocketmq::remoting)
+add_test(NAME consume_thread_pool COMMAND rmq_test_consume_thread_pool)
+
+# 动态 name server：DefaultTopAddressing 的 URL 规则 / clearNewLine / mock 地址服务器
+add_executable(rmq_test_top_addressing test_top_addressing.cpp)
+target_link_libraries(rmq_test_top_addressing PRIVATE rocketmq::remoting)
+add_test(NAME top_addressing COMMAND rmq_test_top_addressing)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

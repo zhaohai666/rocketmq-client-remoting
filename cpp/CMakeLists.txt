@@ -43,6 +43,7 @@ set(RMQ_SOURCES
     src/common/subscription_data.cpp
     src/common/compression.cpp
     src/common/mix_all.cpp
+    src/common/top_addressing.cpp
     src/common/topic_config.cpp
     src/remoting/protocol/json.cpp
     src/remoting/protocol/serialize.cpp
@@ -60,6 +61,7 @@ set(RMQ_SOURCES
     src/client/mq_client.cpp
     src/client/producer.cpp
     src/client/consumer.cpp
+    src/client/consume_executor.cpp
     src/client/pull_consumer.cpp
     src/client/request_reply.cpp
     src/client/admin.cpp
