@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from ..common.message import MessageExt, MessageQueue
@@ -26,15 +27,31 @@ from ..remoting.protocol.codes import RequestCode
 from ..remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                            ConsumerData, HeartbeatData, MessageModel)
 from ..remoting.protocol.namespace_util import NamespaceUtil
+from ..remoting.protocol import extra_info as extra_info_util
+from ..remoting.protocol.extra_info import split
 from ..remoting.rpchook import RPCHook
 from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus,
                               ConsumeOrderlyContext, ConsumeOrderlyStatus,
                               MessageListener, MessageListenerConcurrently,
-                              MessageListenerOrderly, PullResult, PullStatus)
+                              MessageListenerOrderly, PopResult, PopStatus,
+                              PullResult, PullStatus)
 from .exception import MQBrokerException, MQClientException
 from .mq_client import MQClientInstance
 
 logger = get_logger()
+
+# POP 消费失败的延迟梯度（秒），逐项对应 Java
+# DefaultMQPushConsumerImpl.popDelayLevel。
+POP_DELAY_LEVEL = (10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600,
+                   1200, 1800, 3600, 7200)
+
+# Java DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME：超出范围一律回落到 60000
+MIN_POP_INVISIBLE_TIME = 5000
+MAX_POP_INVISIBLE_TIME = 300000
+
+# Java ConsumeInitMode
+CONSUME_INIT_MODE_MIN = 0
+CONSUME_INIT_MODE_MAX = 1
 
 
 def _mq_sort_key(mq: MessageQueue):
@@ -131,8 +148,58 @@ class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
         return list(self.message_queue_list)
 
 
+class PopProcessQueue:
+    """POP 模式的队列状态（对应 org.apache.rocketmq.client.impl.consumer.PopProcessQueue）。
+
+    与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
+    消费线程，确认靠 ack。这里只跟踪两件事：
+
+    - ``wait_ack_counter``：已弹出但还没 ack / 还没延长不可见时间的条数，用于流控；
+    - ``dropped``：队列是否已被 rebalance 撤走（撤走后本批消息不再消费、也不 ack，
+      交给 invisibleTime 到期后 broker 自动复活重投）。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wait_ack_counter = 0
+        self._dropped = False
+        self.last_pop_timestamp = time.time()
+
+    def inc_found_msg(self, count: int) -> None:
+        with self._lock:
+            self._wait_ack_counter += count
+
+    def dec_found_msg(self, count: int) -> None:
+        """Java 传的是负数（decFoundMsg(-msgs.size())），这里按"减多少"理解。"""
+        with self._lock:
+            self._wait_ack_counter += count
+
+    def ack(self) -> int:
+        with self._lock:
+            self._wait_ack_counter -= 1
+            return self._wait_ack_counter
+
+    def wait_ack_count(self) -> int:
+        with self._lock:
+            return self._wait_ack_counter
+
+    def is_dropped(self) -> bool:
+        return self._dropped
+
+    def set_dropped(self, dropped: bool) -> None:
+        self._dropped = dropped
+
+
 class DefaultMQPushConsumer:
     """推模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。"""
+
+    # ---------------- POP 模式（5.x 轻量消费）配置 ----------------
+    #
+    # Java 的 push-consumer POP 走 **broker 侧分配**：QUERY_ASSIGNMENT(400) 拿
+    # MessageQueueAssignment(mode=POP)，客户端不做 rebalance。本项目**刻意不实现这条路径**，
+    # 而是复用已有的**客户端 rebalance**（见 _rebalance_pull_threads）：队列由本地按分配策略
+    # 算出，然后每队列独立 POP。语义等价（都是"每队列一个 POP 循环 + ack 确认"），
+    # 差别只在于"谁决定分哪些队列"——这是有意差异，改动前请先读本段注释。
 
     def __init__(self, consumer_group: str = MixAll.DEFAULT_CONSUMER_GROUP,
                  rpc_hook: Optional[RPCHook] = None, namespace: str = "",
@@ -210,6 +277,24 @@ class DefaultMQPushConsumer:
         self.heartbeat_interval_millis = 30000
         self._heartbeat_count = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
+        # ---- POP 模式（5.x 轻量消费）----
+        # 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
+        self.pop_mode = False
+        # 弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）
+        self.pop_invisible_time = 60000
+        # 单次 POP 的最大条数（Java popBatchNums 默认 32；broker 侧 >32 会拒）
+        self.pop_batch_nums = 32
+        # 本队列"已弹未 ack"计数器上限，超过就暂停 POP（Java popThresholdForQueue 默认 96）
+        self.pop_threshold_for_queue = 96
+        # 消费失败时延长不可见时间的梯度（秒）
+        self.pop_delay_level = list(POP_DELAY_LEVEL)
+        # POP 长轮询挂起时长。0 = 短轮询（broker 立即返回或 NO_NEW_MSG）。
+        # ⚠ 非 0 时请求超时必须 > 它，否则客户端先超时。
+        self.pop_poll_time_millis = 15000
+        self.pop_timeout_millis = 25000
+        # 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
+        self._pop_queues: Dict[str, PopProcessQueue] = {}
+        self._pop_executor: Optional["ThreadPoolExecutor"] = None
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -325,6 +410,12 @@ class DefaultMQPushConsumer:
             # （对齐 Java ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
             self._mq_client.remoting_client.register_processor(
                 RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._on_consumer_ids_changed)
+        # POP 模式的消费线程池必须在 rebalance 之前建好：rebalance 会立刻起每队列的 POP
+        # 循环，而循环拿到消息后要投递到这里（Java 的 consumeExecutor）。
+        if self.pop_mode:
+            self._pop_executor = ThreadPoolExecutor(
+                max_workers=max(1, self.consume_thread_max),
+                thread_name_prefix="rmq-popconsume-%s" % self.consumer_group)
         # 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
         # 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
         # 心跳必须在 rebalance 之前：rebalance 要向 broker 查消费者列表。
@@ -353,6 +444,14 @@ class DefaultMQPushConsumer:
             if not self._started:
                 return
             self._stop.set()
+            # POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）
+            if self.pop_mode:
+                for pq in self._pop_queues.values():
+                    pq.set_dropped(True)
+                self._pop_queues.clear()
+                if self._pop_executor is not None:
+                    self._pop_executor.shutdown(wait=False)
+                    self._pop_executor = None
         # 退出前把已消费位点持久化一次（对齐 Java MQClientInstance.shutdown →
         # persistAllConsumerOffset）。注意必须在 _started=False 之前调（_require_client）。
         try:
@@ -502,12 +601,18 @@ class DefaultMQPushConsumer:
         """
         current = {self._mq_key(mq): mq for mq in self._assigned_queues()}
         revoked: List[Tuple[MessageQueue, Optional[int]]] = []
+        pop = self.pop_mode
         with self._lock:
             for key, mq in current.items():
                 if key in self._queue_threads:
                     continue
-                t = threading.Thread(target=self._queue_pull_loop, args=(mq,), daemon=True,
-                                     name="rmq-pull-%s-%s" % (self.consumer_group, key))
+                if pop and key not in self._pop_queues:
+                    self._pop_queues[key] = PopProcessQueue()
+                # POP 模式：每队列起一个 POP 循环（不拉位点、不建拉取缓冲区）
+                target = self._queue_pop_loop if pop else self._queue_pull_loop
+                t = threading.Thread(target=target, args=(mq,), daemon=True,
+                                     name="rmq-%s-%s-%s" % ("pop" if pop else "pull",
+                                                            self.consumer_group, key))
                 self._queue_threads[key] = t
                 t.start()
             for key in list(self._queue_threads.keys()):
@@ -518,6 +623,10 @@ class DefaultMQPushConsumer:
                     self._lock_ok.discard(key)
                     off = self._consume_offsets.pop(key, None)
                     self._offset_table.pop(key, None)
+                    # POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+                    pq = self._pop_queues.pop(key, None)
+                    if pq is not None:
+                        pq.set_dropped(True)
                     if mq is not None:
                         revoked.append((mq, off))
         # 网络/落盘在锁外做
@@ -734,6 +843,260 @@ class DefaultMQPushConsumer:
                 # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
                 if result.next_begin_offset is not None:
                     self._offset_table[key] = result.next_begin_offset
+
+    # ---------------------------------------------------------------- POP 消费循环
+
+    def _queue_pop_loop(self, mq: MessageQueue) -> None:
+        """单队列 POP 循环（对应 Java DefaultMQPushConsumerImpl.popMessage 的回调部分）。
+
+        与 pull 循环的关键差别：
+          - **不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；
+          - 弹出即投递给消费线程，本轮循环立刻继续（不等消费结果）；
+          - ``POLLING_NOT_FOUND``（队列暂时没消息）是**正常态**，直接下一轮，不算错误。
+        """
+        client = self._require_client()
+        key = self._mq_key(mq)
+        invisible = self.pop_invisible_time
+        if invisible < MIN_POP_INVISIBLE_TIME or invisible > MAX_POP_INVISIBLE_TIME:
+            # Java 的钳制：超出 [5s, 300s] 一律回落到 60s
+            invisible = 60000
+        # Java PopRequest 默认 ConsumeInitMode.MAX；这里按 consume_from_where 映射，
+        # 让"从头消费"的语义在 POP 模式下也成立。
+        init_mode = (CONSUME_INIT_MODE_MIN
+                     if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET
+                     else CONSUME_INIT_MODE_MAX)
+        while not self._stop.is_set() and self._started:
+            if not self._owns_queue(key):
+                return
+            pq = self._pop_queues.get(key)
+            if pq is None or pq.is_dropped():
+                return
+            with self._lock:
+                sub = self.subscription_data.get(mq.topic)
+            if sub is None:
+                return
+            # 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）
+            if pq.wait_ack_count() > self.pop_threshold_for_queue:
+                time.sleep(0.05)
+                continue
+            began = time.time()
+            try:
+                result = client.pop_message(
+                    self.consumer_group, mq.topic, mq.queue_id,
+                    max_msg_nums=self.pop_batch_nums,
+                    invisible_time=invisible,
+                    poll_time=self.pop_poll_time_millis,
+                    init_mode=init_mode,
+                    exp=sub.sub_string or "*",
+                    exp_type=sub.expression_type,
+                    timeout_millis=self.pop_timeout_millis,
+                    broker_name=mq.broker_name,
+                )
+            except RemotingTimeoutException:
+                # 长轮询挂起期间没有消息 → 客户端先超时，属正常行为，直接下一轮
+                logger.debug("pop long-poll timeout for %s (benign, will retry)", mq)
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.debug("pop error for %s: %s: %s", mq, type(e).__name__, e)
+                time.sleep(0.5)
+                continue
+
+            # 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
+            # （Java 对应 PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
+            # broker 自动复活重投给新属主。
+            if not self._owns_queue(key) or pq.is_dropped():
+                logger.debug("queue %s revoked during pop, discard %d messages un-acked",
+                             mq, len(result.msg_found_list or ()))
+                return
+            pq.last_pop_timestamp = time.time()
+            if result.status == PopStatus.FOUND and result.msg_found_list:
+                pq.inc_found_msg(len(result.msg_found_list))
+                self._submit_pop_consume_request(result.msg_found_list, pq, mq)
+            else:
+                # 空结果：若 broker 没按 poll_time 挂起（立即返回）就会变成热循环，
+                # 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
+                if (time.time() - began) * 1000.0 < 200:
+                    time.sleep(0.2)
+            # NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL 都直接进下一轮
+
+    def _submit_pop_consume_request(self, msgs: List[MessageExt], pq: PopProcessQueue,
+                                    mq: MessageQueue) -> None:
+        """按 consume_message_batch_max_size 切批后投给消费线程池。
+
+        对应 Java ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest。
+        """
+        size = max(1, self.consume_message_batch_max_size)
+        batches = [msgs[i:i + size] for i in range(0, len(msgs), size)] or [msgs]
+        for batch in batches:
+            if not batch:
+                continue
+            if self._pop_executor is not None:
+                self._pop_executor.submit(self._consume_pop_batch, batch, pq, mq)
+            else:
+                # 未起线程池（单测或未 start）：同步执行
+                self._consume_pop_batch(batch, pq, mq)
+
+    def _consume_pop_batch(self, msgs: List[MessageExt], pq: PopProcessQueue,
+                           mq: MessageQueue) -> None:
+        """消费一个 POP 批次并按结果 ack / 延长不可见时间。
+
+        对应 Java ConsumeMessagePopConcurrentlyService$ConsumeRequest.run。
+        """
+        if pq.is_dropped() or not msgs:
+            return
+        pop_time = 0
+        invisible = 0
+        try:
+            seg = split(msgs[0].get_property(MessageConst.PROPERTY_POP_CK))
+            pop_time = extra_info_util.get_pop_time(seg)
+            invisible = extra_info_util.get_invisible_time(seg)
+        except Exception:  # noqa: BLE001
+            logger.debug("parse pop ck failed for %s, treat as not timed out", mq)
+
+        if self._is_pop_timeout(msgs, pop_time, invisible):
+            # 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+            logger.debug("pop timeout, abort consume for %s: popTime=%s invisible=%s",
+                         mq, pop_time, invisible)
+            pq.dec_found_msg(-len(msgs))
+            return
+
+        self._reset_retry_topic_and_namespace(msgs)
+        context = ConsumeConcurrentlyContext(mq)
+        # ⚠ 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE：
+        # 默认就是"全部 ack"。本项目 ConsumeConcurrentlyContext 的默认值是 -1（push
+        # 回投路径的语义），若不在 POP 这里改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，
+        # 消息在 invisibleTime 到期后被 broker 复活重投 —— 短观测窗口下会伪装成通过。
+        context.ack_index = len(msgs) - 1
+        try:
+            status = self.message_listener.consume_message(msgs, context)
+        except Exception as e:  # noqa: BLE001
+            # Java：消费抛异常按 RECONSUME_LATER 处理
+            logger.debug("pop listener error, treat as RECONSUME_LATER: %s", e)
+            status = ConsumeConcurrentlyStatus.RECONSUME_LATER
+        if status is None:
+            logger.debug("pop listener returned None, treat as RECONSUME_LATER for %s", mq)
+            status = ConsumeConcurrentlyStatus.RECONSUME_LATER
+
+        if pq.is_dropped() or self._is_pop_timeout(msgs, pop_time, invisible):
+            # 消费期间队列被撤走或已超时：结果不再处理
+            pq.dec_found_msg(-len(msgs))
+            return
+        self._process_pop_consume_result(status, context, msgs, pq, mq)
+
+    @staticmethod
+    def _is_pop_timeout(msgs: List[MessageExt], pop_time: int, invisible: int) -> bool:
+        """Java ConsumeRequest.isPopTimeout：不能解析出 popTime/invisibleTime 时按超时处理。"""
+        if not msgs or pop_time <= 0 or invisible <= 0:
+            return True
+        return int(time.time() * 1000) - pop_time >= invisible
+
+    def _process_pop_consume_result(self, status, context: ConsumeConcurrentlyContext,
+                                    msgs: List[MessageExt], pq: PopProcessQueue,
+                                    mq: MessageQueue) -> None:
+        """对应 Java ConsumeMessagePopConcurrentlyService.processConsumeResult。"""
+        ack_index = context.ack_index
+        if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
+            if ack_index >= len(msgs):
+                ack_index = len(msgs) - 1
+        else:
+            # RECONSUME_LATER：一条都不 ack
+            ack_index = -1
+
+        for i in range(0, ack_index + 1):
+            self._ack_pop_msg(msgs[i])
+            pq.ack()
+
+        for i in range(ack_index + 1, len(msgs)):
+            pq.ack()
+            msg = msgs[i]
+            # 超过最大重试次数：Java 走 checkNeedAckOrDelay（太老就直接 ack 丢弃，
+            # 否则按消息已存活时间选一个延迟档位）
+            if self.max_reconsume_times >= 0 and msg.reconsume_times >= self.max_reconsume_times:
+                self._check_need_ack_or_delay(msg)
+                continue
+            self._change_pop_invisible_time(msg, context.delay_level_when_next_consume)
+
+    def _check_need_ack_or_delay(self, msg: MessageExt) -> None:
+        """Java checkNeedAckOrDelay：重试次数用尽后的兜底。
+
+        消息存活时间已经超过最大延迟档位的 2 倍 → 直接 ack 丢弃（不再无限重试）；
+        否则按存活时间选一个档位继续延长不可见时间。
+        """
+        table = self.pop_delay_level
+        msg_delay_time = int(time.time() * 1000) - msg.born_timestamp
+        if msg_delay_time > table[-1] * 1000 * 2:
+            logger.warning("pop consume too many times, ack and drop: key=%s", msg.get_keys())
+            self._ack_pop_msg(msg)
+            return
+        level = len(table) - 1
+        while level >= 0:
+            if msg_delay_time >= table[level] * 1000:
+                level += 1
+                break
+            level -= 1
+        self._change_pop_invisible_time(msg, level)
+
+    def _pop_ck_target(self, msg: MessageExt) -> Optional[Tuple[str, str, int, int, str]]:
+        """从 POP_CK 解出 ack/延长不可见时间需要的 (topic, brokerName, queueId, offset, ck)。
+
+        ⚠ 两处都不能想当然：
+          1. topic 要用 ``ExtraInfoUtil.getRealTopic`` 按 CK 的 retryFlag 还原 —— 复活消息
+             （retryFlag=1）的真实 topic 是 ``%RETRY%<group>_<topic>``，**不是**消息上的 topic；
+          2. 地址要按 CK 里的 brokerName 反查，不能按 topic 查路由 —— retry topic 通常没有
+             独立路由表项，按 topic 查会失败（Java 同理走 findBrokerAddressInSubscribe）。
+        """
+        ck = msg.get_property(MessageConst.PROPERTY_POP_CK)
+        if not ck:
+            logger.debug("pop message without POP_CK, cannot ack: %s", msg.msg_id)
+            return None
+        try:
+            seg = split(ck)
+            broker_name = extra_info_util.get_broker_name(seg)
+            queue_id = extra_info_util.get_queue_id(seg)
+            offset = extra_info_util.get_queue_offset(seg)
+            retry = extra_info_util.get_retry(seg)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("bad POP_CK %r: %s", ck, e)
+            return None
+        topic = extra_info_util.get_real_topic(msg.topic, self.consumer_group, retry)
+        return topic, broker_name, queue_id, offset, ck
+
+    def _ack_pop_msg(self, msg: MessageExt) -> None:
+        """单条 ack（对应 Java DefaultMQPushConsumerImpl.ackAsync）。"""
+        target = self._pop_ck_target(msg)
+        if target is None:
+            return
+        topic, broker_name, queue_id, offset, ck = target
+        try:
+            client = self._require_client()
+            client.ack_message(self.consumer_group, topic, queue_id, ck, offset,
+                               broker_name=broker_name,
+                               addr=client.broker_addr_of(broker_name))
+        except Exception as e:  # noqa: BLE001
+            # ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
+            logger.debug("ack failed for %s: %s", msg.msg_id, e)
+
+    def _change_pop_invisible_time(self, msg: MessageExt, delay_level: int) -> None:
+        """延长不可见时间（对应 Java changePopInvisibleTime）。
+
+        ``delay_level == 0`` 时 Java 用消息已重试次数当档位；档位表是**秒**，接口要毫秒。
+        """
+        target = self._pop_ck_target(msg)
+        if target is None:
+            return
+        topic, broker_name, queue_id, offset, ck = target
+        if delay_level == 0:
+            delay_level = msg.reconsume_times
+        table = self.pop_delay_level
+        delay_second = table[-1] if delay_level >= len(table) else table[max(0, delay_level)]
+        try:
+            client = self._require_client()
+            client.change_invisible_time(self.consumer_group, topic, queue_id, ck, offset,
+                                         delay_second * 1000,
+                                         broker_name=broker_name,
+                                         addr=client.broker_addr_of(broker_name))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("change invisible time failed for %s: %s", msg.msg_id, e)
 
     def _flow_control_hit(self, mq: MessageQueue, key: str) -> bool:
         """是否触发流控（对齐 Java ProcessQueue.putMessage 的五个阈值检查）。
