@@ -449,9 +449,56 @@ public sealed class ProducerConnection
     }
 }
 
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
+/// （ConsumerRunningInfo.statusTable 的值，字段全部来自 ConsumerStatsManager 的快照）。
+/// </summary>
+public sealed class ConsumeStatus
+{
+    public double PullRT { get; set; }
+    public double PullTPS { get; set; }
+    public double ConsumeRT { get; set; }
+    public double ConsumeOKTPS { get; set; }
+    public double ConsumeFailedTPS { get; set; }
+    public long ConsumeFailedMsgs { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("pullRT", JsonValue.MakeDouble(PullRT));
+        v.Set("pullTPS", JsonValue.MakeDouble(PullTPS));
+        v.Set("consumeRT", JsonValue.MakeDouble(ConsumeRT));
+        v.Set("consumeOKTPS", JsonValue.MakeDouble(ConsumeOKTPS));
+        v.Set("consumeFailedTPS", JsonValue.MakeDouble(ConsumeFailedTPS));
+        v.Set("consumeFailedMsgs", JsonValue.MakeInt(ConsumeFailedMsgs));
+        return v;
+    }
+
+    public static ConsumeStatus FromJson(JsonValue v)
+    {
+        return new ConsumeStatus
+        {
+            PullRT = v.Get("pullRT").DoubleValue(),
+            PullTPS = v.Get("pullTPS").DoubleValue(),
+            ConsumeRT = v.Get("consumeRT").DoubleValue(),
+            ConsumeOKTPS = v.Get("consumeOKTPS").DoubleValue(),
+            ConsumeFailedTPS = v.Get("consumeFailedTPS").DoubleValue(),
+            ConsumeFailedMsgs = v.Get("consumeFailedMsgs").IntValue()
+        };
+    }
+}
+
 /// <summary>org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo。</summary>
 public sealed class ConsumerRunningInfo
 {
+    // Java ConsumerRunningInfo 里 properties 的固定键（常量名照抄 Java）
+    public const string PropNameserverAddr = "PROP_NAMESERVER_ADDR";
+    public const string PropThreadpoolCoreSize = "PROP_THREADPOOL_CORE_SIZE";
+    public const string PropConsumeOrderly = "PROP_CONSUMEORDERLY";   // Java 常量名无下划线
+    public const string PropConsumeType = "PROP_CONSUME_TYPE";
+    public const string PropClientVersion = "PROP_CLIENT_VERSION";
+    public const string PropConsumerStartTimestamp = "PROP_CONSUMER_START_TIMESTAMP";
+
     public PropertyMap Properties { get; set; } = new();
 
     // 透传（List<SubscriptionData>）
@@ -459,6 +506,15 @@ public sealed class ConsumerRunningInfo
 
     // 透传（Map<MessageQueue, ProcessQueueInfo>）
     public JsonValue MqTable { get; set; } = JsonValue.Null;
+
+    // 透传（Map<MessageQueue, ProcessQueueInfo>，POP 模式）
+    public JsonValue MqPopTable { get; set; } = JsonValue.Null;
+
+    // 透传（Map<String, ConsumeStatus>）
+    public JsonValue StatusTable { get; set; } = JsonValue.Null;
+
+    // 透传（Map<String, String>）
+    public JsonValue UserConsumerInfo { get; set; } = JsonValue.Null;
 
     public string Jstack { get; set; } = string.Empty;
     public bool HasJstack { get; set; }
@@ -469,6 +525,11 @@ public sealed class ConsumerRunningInfo
         v.Set("properties", AdminJsonStrings.MakeStringMap(Properties));
         v.Set("subscriptionSet", SubscriptionSet.IsNull ? JsonValue.MakeArray() : SubscriptionSet);
         v.Set("mqTable", MqTable.IsNull ? JsonValue.MakeObject() : MqTable);
+        // Python/Java 侧 307 应答总是带 mqPopTable/statusTable/userConsumerInfo；
+        // 缺省时输出空对象，保持三语言报文形状一致。
+        v.Set("mqPopTable", MqPopTable.IsNull ? JsonValue.MakeObject() : MqPopTable);
+        v.Set("statusTable", StatusTable.IsNull ? JsonValue.MakeObject() : StatusTable);
+        v.Set("userConsumerInfo", UserConsumerInfo.IsNull ? JsonValue.MakeObject() : UserConsumerInfo);
         if (HasJstack)
         {
             v.Set("jstack", JsonValue.MakeString(Jstack));
@@ -484,6 +545,9 @@ public sealed class ConsumerRunningInfo
             Properties = AdminJsonStrings.ReadStringMap(v.Get("properties")),
             SubscriptionSet = v.Get("subscriptionSet"),
             MqTable = v.Get("mqTable"),
+            MqPopTable = v.Get("mqPopTable"),
+            StatusTable = v.Get("statusTable"),
+            UserConsumerInfo = v.Get("userConsumerInfo"),
         };
         if (v.TryGetString("jstack", out string s))
         {

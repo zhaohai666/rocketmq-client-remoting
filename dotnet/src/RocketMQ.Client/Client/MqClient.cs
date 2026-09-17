@@ -143,6 +143,9 @@ public sealed class MQClientInstance : IDisposable
     private Thread? _namesrvRefreshThread;
     private readonly ManualResetEventSlim _namesrvRefreshStop = new(false);
 
+    // ---- 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）----
+    public ConsumerStatsManager ConsumerStats { get; } = new();
+
     /// <summary>取一次地址；变化才应用到 _nameServerAddrs（Java 地址变化才 update）。</summary>
     public void FetchNameServerAddr()
     {
@@ -186,6 +189,8 @@ public sealed class MQClientInstance : IDisposable
     public void Start()
     {
         _started = true;
+        // 消费统计采样线程（Java 挂在每个 StatsItem 的调度器上，这里收敛为实例级一个）
+        ConsumerStats.Start();
         // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
         // 静态地址时先 fetch 一次；取不到直接报错（比 Java 更严格——Java 会让运行期
         // 各处各自失败，这里在 Start 时给一个明确错误）。
@@ -237,6 +242,7 @@ public sealed class MQClientInstance : IDisposable
             _routeRefreshThread.Join(2000);
         }
 
+        ConsumerStats.Shutdown();
         _remotingClient.Shutdown();
     }
 

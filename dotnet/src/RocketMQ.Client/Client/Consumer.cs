@@ -368,6 +368,8 @@ public sealed class DefaultMQPushConsumer
     private readonly Dictionary<string, long> _consumeOffsetTable = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MessageQueue> _mqMap = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Queue<MessageExt>> _pending = new(StringComparer.Ordinal);
+    // Start() 时刻（307 应答 PROP_CONSUMER_START_TIMESTAMP，对应 Java consumerStartTimestamp）
+    private long _startTimestamp;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
     private readonly HashSet<string> _lockOk = new(StringComparer.Ordinal);
     private int _pullThresholdForQueue = 1000;
@@ -799,6 +801,7 @@ public sealed class DefaultMQPushConsumer
 
             _stop = false;
             _started = true;
+            _startTimestamp = UtilAll.CurrentTimeMillis();
 
             // 登记订阅 topic 为"在用"，交给 MQClientInstance 周期刷新路由（对应 task ⑥）
             foreach (string t in SubscribedTopics())
@@ -810,6 +813,11 @@ public sealed class DefaultMQPushConsumer
             // ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
             _mqClient.RemotingClient.RegisterProcessor(RequestCode.NotifyConsumerIdsChanged,
                 OnConsumerIdsChanged);
+
+            // 对应 Java ClientRemotingProcessor GET_CONSUMER_RUNNING_INFO(307)：
+            // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
+            _mqClient.RemotingClient.RegisterProcessor(RequestCode.GetConsumerRunningInfo,
+                OnGetConsumerRunningInfo);
         }
 
         // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
@@ -1216,6 +1224,137 @@ public sealed class DefaultMQPushConsumer
         return null; // 回查类通知是 invokeOneway，不期待响应
     }
 
+    private RemotingCommand? OnGetConsumerRunningInfo(RemotingCommand cmd, string addr)
+    {
+        // 对应 Java ClientRemotingProcessor.processRequest GET_CONSUMER_RUNNING_INFO 分支。
+        // 运行在读线程上：只做本地快照（构造 ConsumerRunningInfo），绝不做网络调用。
+        string? group = null;
+        if (cmd.ExtFields is not null && cmd.ExtFields.TryGetValue("consumerGroup", out string? g))
+        {
+            group = g;
+        }
+
+        if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
+        {
+            // 与 Java 一致：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError,
+                "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
+        }
+
+        RemotingCommand resp = RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
+        resp.Body = BuildConsumerRunningInfo().Encode();
+        return resp;
+    }
+
+    /// <summary>对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。</summary>
+    public ConsumerRunningInfo BuildConsumerRunningInfo()
+    {
+        var info = new ConsumerRunningInfo
+        {
+            Properties =
+            {
+                [ConsumerRunningInfo.PropNameserverAddr] = string.Join(";", _nameServerAddrs) + ";",
+                [ConsumerRunningInfo.PropConsumeType] = "CONSUME_PASSIVELY",
+                [ConsumerRunningInfo.PropConsumeOrderly] = IsOrderly() ? "true" : "false",
+                [ConsumerRunningInfo.PropThreadpoolCoreSize] =
+                    GetCorePoolSize().ToString(CultureInfo.InvariantCulture),
+                [ConsumerRunningInfo.PropConsumerStartTimestamp] =
+                    _startTimestamp.ToString(CultureInfo.InvariantCulture),
+                [ConsumerRunningInfo.PropClientVersion] = "V5_5_1",
+            }
+        };
+
+        JsonValue subs = JsonValue.MakeArray();
+        var statusTable = JsonValue.MakeObject();
+        lock (_lock)
+        {
+            foreach (SubscriptionData sub in _subscriptionData.Values)
+            {
+                subs.PushArray(sub.ToJson());
+            }
+
+            foreach (var kv in _mqMap)
+            {
+                string mqKey = MessageQueueKeys.MessageQueueKey(kv.Value);
+                long commitOffset = _consumeOffsetTable.TryGetValue(kv.Key, out long co) ? co : 0;
+                int cachedMsgCount = _pending.TryGetValue(kv.Key, out Queue<MessageExt>? q)
+                    ? q.Count
+                    : 0;
+                info.MqTable.Set(mqKey, MakeProcessQueueInfo(commitOffset, cachedMsgCount, droped: false));
+            }
+
+            if (PopMode)
+            {
+                foreach (var kv in _popQueues)
+                {
+                    if (!_mqMap.TryGetValue(kv.Key, out MessageQueue? mq))
+                    {
+                        continue;
+                    }
+
+                    info.MqPopTable.Set(MessageQueueKeys.MessageQueueKey(mq),
+                        MakeProcessQueueInfo(0, kv.Value.WaitAckCount(), kv.Value.IsDropped()));
+                }
+            }
+        }
+
+        // statusTable（Java consumerRunningInfo：consumeStatus(group, topic)，minute 快照）
+        foreach (string topic in _subscriptionData.Keys)
+        {
+            ConsumeStatus cs = _mqClient?.ConsumerStats.ConsumeStatus(ConsumerGroup, topic)
+                ?? new ConsumeStatus();
+            statusTable.Set(topic, cs.ToJson());
+        }
+
+        info.SubscriptionSet = subs;
+        info.StatusTable = statusTable;
+        return info;
+    }
+
+    private static JsonValue MakeProcessQueueInfo(long commitOffset, long cachedMsgCount, bool droped)
+    {
+        // ProcessQueueInfo 全字段（Java body.ProcessQueueInfo；"droped" 拼写照抄）
+        var pqi = JsonValue.MakeObject();
+        pqi.Set("commitOffset", JsonValue.MakeInt(commitOffset));
+        pqi.Set("cachedMsgMinOffset", JsonValue.MakeInt(0));
+        pqi.Set("cachedMsgMaxOffset", JsonValue.MakeInt(0));
+        pqi.Set("cachedMsgCount", JsonValue.MakeInt(cachedMsgCount));
+        pqi.Set("cachedMsgSizeInMiB", JsonValue.MakeInt(0));
+        pqi.Set("transactionMsgMinOffset", JsonValue.MakeInt(0));
+        pqi.Set("transactionMsgMaxOffset", JsonValue.MakeInt(0));
+        pqi.Set("transactionMsgCount", JsonValue.MakeInt(0));
+        pqi.Set("locked", JsonValue.MakeBool(false));
+        pqi.Set("tryUnlockTimes", JsonValue.MakeInt(0));
+        pqi.Set("lastLockTimestamp", JsonValue.MakeInt(0));
+        pqi.Set("droped", JsonValue.MakeBool(droped));
+        pqi.Set("lastPullTimestamp", JsonValue.MakeInt(0));
+        pqi.Set("lastConsumeTimestamp", JsonValue.MakeInt(0));
+        return pqi;
+    }
+
+    /// <summary>消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。</summary>
+    private void RecordConsumeStats(string topic, int msgCount, long beginMs, bool failed)
+    {
+        if (_mqClient is null)
+        {
+            return;
+        }
+
+        ConsumerStatsManager stats = _mqClient.ConsumerStats;
+        long rt = UtilAll.CurrentTimeMillis() - beginMs;
+        if (failed)
+        {
+            stats.IncConsumeFailedTPS(ConsumerGroup, topic, msgCount);
+        }
+        else
+        {
+            stats.IncConsumeOKTPS(ConsumerGroup, topic, msgCount);
+        }
+
+        stats.IncConsumeRT(ConsumerGroup, topic, rt);
+    }
+
     private void RebalanceLoop()
     {
         // 周期重算分配（对齐 Java RebalanceService 默认 20s），或被通知时立即重算。
@@ -1349,9 +1488,18 @@ public sealed class DefaultMQPushConsumer
                 int sysFlag = PullSysFlag.BuildSysFlag(
                     /*commitOffset=*/false, /*suspend=*/true, /*subscription=*/true, /*classFilter=*/false);
                 string expr = UtilAll.IsBlank(sub.SubString) ? "*" : sub.SubString;
+                long pullBegan = UtilAll.CurrentTimeMillis();
                 result = c.PullMessage(ConsumerGroup, mq, offset, _pullBatchSize, sysFlag,
                     /*commitOffset=*/0, expr, sub.SubVersion, sub.ExpressionType,
                     _pullTimeoutMillis, _pullBatchSizeInBytes, _pullSuspendTimeoutMillis);
+                // 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
+                _mqClient!.ConsumerStats.IncPullRT(ConsumerGroup, mq.Topic,
+                    UtilAll.CurrentTimeMillis() - pullBegan);
+                if (result.IsFound && result.MsgFoundList.Count > 0)
+                {
+                    _mqClient.ConsumerStats.IncPullTPS(ConsumerGroup, mq.Topic,
+                        result.MsgFoundList.Count);
+                }
             }
             catch (MQBrokerException e)
             {
@@ -1652,6 +1800,8 @@ public sealed class DefaultMQPushConsumer
 
         // 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，
         // 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
+        RecordConsumeStats(mq.Topic, msgs.Count, popBegin,
+            failed: status == ConsumeConcurrentlyStatus.ReconsumeLater);
         FinishConsumeHook(popHookCtx, true, popHasException, popBegin, status.ToString(),
             failed: status == ConsumeConcurrentlyStatus.ReconsumeLater,
             succeeded: status == ConsumeConcurrentlyStatus.ConsumeSuccess);
@@ -1962,6 +2112,8 @@ public sealed class DefaultMQPushConsumer
             }
 
             // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
+            RecordConsumeStats(mq.Topic, batch.Count, obegin,
+                failed: status != ConsumeOrderlyStatus.Success);
             FinishConsumeHook(ohookCtx, true, ohasException, obegin, status.ToString(),
                 failed: status != ConsumeOrderlyStatus.Success,
                 succeeded: status == ConsumeOrderlyStatus.Success);
@@ -2015,6 +2167,8 @@ public sealed class DefaultMQPushConsumer
             hasException = true;
         }
 
+        RecordConsumeStats(mq.Topic, batch.Count, beginMs,
+            failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater);
         FinishConsumeHook(hookCtx, true, hasException, beginMs, cstatus.ToString(),
             failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater,
             succeeded: cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess);
