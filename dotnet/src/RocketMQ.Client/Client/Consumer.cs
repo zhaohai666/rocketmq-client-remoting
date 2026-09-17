@@ -44,6 +44,76 @@ public sealed class MessageSelector
 /// <summary>
 /// 推模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。
 /// </summary>
+/// <summary>
+/// Java DefaultMQPushConsumerImpl.popDelayLevel（单位**秒**）。
+/// 与 send 的延迟档位（首档 1s）不是同一张表，别混。
+/// </summary>
+public static class PopDelayLevelDefaults
+{
+    public static readonly int[] Table = { 10, 30, 60, 120, 180, 240, 300, 360,
+                                           420, 480, 540, 600, 1200, 1800, 3600, 7200 };
+}
+
+/// <summary>
+/// POP 模式的队列状态（对应 org.apache.rocketmq.client.impl.consumer.PopProcessQueue）。
+/// <para>
+/// 与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
+/// 消费线程，确认靠 ack。这里只跟踪两件事：已弹未 ack 的条数（流控用）和队列是否已被
+/// rebalance 撤走（撤走后本批消息不再消费、也不 ack，交给 invisibleTime 到期后
+/// broker 自动复活重投）。
+/// </para>
+/// </summary>
+public sealed class PopProcessQueue
+{
+    private readonly object _lock = new();
+    private int _waitAckCounter;
+    private volatile bool _dropped;
+
+    public void IncFoundMsg(int n)
+    {
+        lock (_lock) { _waitAckCounter += n; }
+    }
+
+    /// <summary>Java 传的是负数（decFoundMsg(-msgs.size())），这里按"减多少"理解。</summary>
+    public void DecFoundMsg(int n)
+    {
+        lock (_lock) { _waitAckCounter += n; }
+    }
+
+    public int Ack()
+    {
+        lock (_lock) { return --_waitAckCounter; }
+    }
+
+    public int WaitAckCount()
+    {
+        lock (_lock) { return _waitAckCounter; }
+    }
+
+    public bool IsDropped() => _dropped;
+
+    public void SetDropped(bool v) => _dropped = v;
+}
+
+/// <summary>从 POP_CK 解出的 ack / 延长不可见时间目标。</summary>
+public sealed class PopCkTarget
+{
+    /// <summary>getRealTopic 按 retryFlag 还原后的真实 topic。</summary>
+    public string Topic { get; set; } = string.Empty;
+
+    /// <summary>CK 第 6 段。</summary>
+    public string BrokerName { get; set; } = string.Empty;
+
+    /// <summary>CK 第 7 段。</summary>
+    public int QueueId { get; set; }
+
+    /// <summary>CK 第 8 段 = consumeQueue offset（不是 commitlog offset）。</summary>
+    public long Offset { get; set; }
+
+    /// <summary>原样回传的 CK 串。</summary>
+    public string ExtraInfo { get; set; } = string.Empty;
+}
+
 public sealed class DefaultMQPushConsumer
 {
     // ---------------- 配置 ----------------
@@ -66,6 +136,38 @@ public sealed class DefaultMQPushConsumer
     /// <summary>便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。</summary>
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
         => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
+
+    // ---------------- POP 模式（5.x 轻量消费）----------------
+    // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
+    public bool PopMode { get; set; }
+
+    /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
+    public long PopInvisibleTime { get; set; } = 60000;
+
+    /// <summary>单次 POP 的最大条数（Java popBatchNums 默认 32；broker 侧 >32 会回 INVALID_PARAMETER）。</summary>
+    public int PopBatchNums { get; set; } = 32;
+
+    /// <summary>本队列"已弹未 ack"计数器上限，超过就暂停 POP（Java popThresholdForQueue 默认 96）。</summary>
+    public int PopThresholdForQueue { get; set; } = 96;
+
+    /// <summary>
+    /// POP 长轮询挂起时长。0 = 短轮询（broker 立即返回或 NO_NEW_MSG）。
+    /// ⚠ 非 0 时请求超时必须 &gt; 它，否则客户端先超时。
+    /// </summary>
+    public int PopPollTimeMillis { get; set; } = 15000;
+
+    public int PopTimeoutMillis { get; set; } = 25000;
+
+    /// <summary>消费失败时延长不可见时间的梯度（秒）。</summary>
+    public List<int> PopDelayLevel { get; set; } = new(PopDelayLevelDefaults.Table);
+
+    // Java DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME：超出范围一律回落到 60000
+    // Java ConsumeInitMode
+    public const int ConsumeInitModeMin = 0;
+    public const int ConsumeInitModeMax = 1;
+
+    public const long MinPopInvisibleTime = 5000;
+    public const long MaxPopInvisibleTime = 300000;
 
     // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
     private IRpcHook? _rpcHook;
@@ -107,6 +209,8 @@ public sealed class DefaultMQPushConsumer
     private Thread? _lockThread;
     private Thread? _rebalanceThread;
     private readonly Dictionary<string, Thread> _pullThreads = new(StringComparer.Ordinal);
+    // 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
+    private readonly Dictionary<string, PopProcessQueue> _popQueues = new(StringComparer.Ordinal);
 
     // ---- 真实 rebalance（对齐 Java RebalanceImpl）----
     // _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
@@ -454,6 +558,17 @@ public sealed class DefaultMQPushConsumer
 
         _stop = true;
         _stopEvent.Set();
+        // POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）
+        if (PopMode)
+        {
+            foreach (PopProcessQueue pq in _popQueues.Values)
+            {
+                pq.SetDropped(true);
+            }
+
+            _popQueues.Clear();
+        }
+
         // 退出前把已消费位点持久化一次（对齐 Java shutdown → persistAllConsumerOffset）
         try
         {
@@ -603,7 +718,13 @@ public sealed class DefaultMQPushConsumer
             // 线程刚 start 就会撞上"未启动"状态而立刻退出，纯属浪费且放大竞态窗口。
             if (_stop || !_started) return;
             MessageQueue mq = kv.Value;
-            Thread t = MakeThread("PullMessageService", () => QueuePullLoop(mq));
+            if (PopMode && !_popQueues.ContainsKey(kv.Key))
+            {
+                _popQueues[kv.Key] = new PopProcessQueue();
+            }
+
+            Thread t = MakeThread(PopMode ? "PopMessageService" : "PullMessageService",
+                                  () => { if (PopMode) QueuePopLoop(mq); else QueuePullLoop(mq); });
             lock (_lock)
             {
                 // 竞态保护：rebalance 可能把同 key 再起一次
@@ -851,6 +972,350 @@ public sealed class DefaultMQPushConsumer
                     _offsetTable[key] = result.NextBeginOffset;
                 }
             }
+        }
+    }
+
+    // ---------------- POP 消费循环（5.x 轻量消费）----------------
+
+    /// <summary>
+    /// 单队列 POP 循环（对应 Java DefaultMQPushConsumerImpl.popMessage 的回调部分）。
+    /// <para>与 pull 循环的关键差别：
+    /// <list type="bullet">
+    /// <item>**不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；</item>
+    /// <item>弹出即投递给消费线程，本轮循环立刻继续（不等消费结果）；</item>
+    /// <item>PollingNotFound（队列暂时没消息）是**正常态**，直接下一轮，不算错误。</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    private void QueuePopLoop(MessageQueue mq)
+    {
+        string key = OffsetKey(mq);
+        long invisible = PopInvisibleTime;
+        if (invisible < MinPopInvisibleTime || invisible > MaxPopInvisibleTime)
+        {
+            // Java 的钳制：超出 [5s, 300s] 一律回落到 60s
+            invisible = 60000;
+        }
+
+        // Java PopRequest 默认 ConsumeInitMode.MAX；这里按 consumeFromWhere 映射，
+        // 让"从头消费"的语义在 POP 模式下也成立。
+        int initMode = _consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset
+            ? ConsumeInitModeMin
+            : ConsumeInitModeMax;
+
+        while (!_stop && _started)
+        {
+            if (_dropped.Contains(key)) return;
+            PopProcessQueue? pq;
+            SubscriptionData? sub;
+            lock (_lock)
+            {
+                _popQueues.TryGetValue(key, out pq);
+                _subscriptionData.TryGetValue(mq.Topic, out sub);
+            }
+
+            if (pq is null || pq.IsDropped() || sub is null) return;
+            // 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）
+            if (pq.WaitAckCount() > PopThresholdForQueue)
+            {
+                Thread.Sleep(50);
+                continue;
+            }
+
+            long began = UtilAll.CurrentTimeMillis();
+            PopResult result;
+            try
+            {
+                result = Client().PopMessage(ConsumerGroup, mq.Topic, mq.QueueId, PopBatchNums,
+                                             invisible, PopPollTimeMillis, initMode,
+                                             string.IsNullOrEmpty(sub.SubString) ? "*" : sub.SubString,
+                                             sub.ExpressionType, false, PopTimeoutMillis, mq.BrokerName);
+            }
+            catch (RemotingTimeoutException e)
+            {
+                // 长轮询挂起期间没有消息 → 客户端先超时，属正常行为，直接下一轮
+                ClientLog.Debug("pop long-poll timeout for " + key + " (benign): " + e.Message);
+                continue;
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("pop error for " + key + ": " + e.Message);
+                Thread.Sleep(500);
+                continue;
+            }
+
+            // 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
+            // （Java 对应 PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
+            // broker 自动复活重投给新属主。
+            if (_dropped.Contains(key) || pq.IsDropped())
+            {
+                ClientLog.Debug("queue " + key + " revoked during pop, discard "
+                                + result.MsgFoundList.Count + " messages un-acked");
+                return;
+            }
+
+            if (result.Status == PopStatus.Found && result.MsgFoundList.Count > 0)
+            {
+                pq.IncFoundMsg(result.MsgFoundList.Count);
+                SubmitPopConsumeRequest(result.MsgFoundList, pq, mq);
+            }
+            else if (UtilAll.CurrentTimeMillis() - began < 200)
+            {
+                // 空结果：若 broker 没按 pollTime 挂起（立即返回）就会变成热循环，
+                // 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
+                Thread.Sleep(200);
+            }
+            // NoNewMsg / PollingNotFound / PollingFull 都直接进下一轮
+        }
+    }
+
+    /// <summary>按 ConsumeMessageBatchMaxSize 切批后投给消费线程（对应 Java
+    /// ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest）。
+    /// <para>POP 的语义是"弹出即投递、循环立刻继续"，不能像 pull 那样等分发线程慢慢取，
+    /// 所以每批起一个独立线程。</para></summary>
+    private void SubmitPopConsumeRequest(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
+    {
+        int size = Math.Max(1, _consumeMessageBatchMaxSize);
+        for (int i = 0; i < msgs.Count; i += size)
+        {
+            List<MessageExt> batch = msgs.GetRange(i, Math.Min(size, msgs.Count - i));
+            if (batch.Count == 0) continue;
+            Thread t = MakeThread("PopConsume", () => ConsumePopBatch(batch, pq, mq));
+            t.Start();
+        }
+    }
+
+    /// <summary>消费一个 POP 批次并按结果 ack / 延长不可见时间（对应 Java
+    /// ConsumeMessagePopConcurrentlyService$ConsumeRequest.run）。</summary>
+    private void ConsumePopBatch(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
+    {
+        if (pq.IsDropped() || msgs.Count == 0) return;
+
+        long popTime = 0;
+        long invisible = 0;
+        try
+        {
+            string? ck = msgs[0].GetProperty(MessageConst.PropertyPopCk);
+            if (!string.IsNullOrEmpty(ck))
+            {
+                string[] seg = ExtraInfoUtil.Split(ck);
+                popTime = ExtraInfoUtil.GetPopTime(seg);
+                invisible = ExtraInfoUtil.GetInvisibleTime(seg);
+            }
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("parse pop ck failed: " + e.Message);
+        }
+
+        if (IsPopTimeout(popTime, invisible))
+        {
+            // 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+            pq.DecFoundMsg(-msgs.Count);
+            return;
+        }
+
+        ResetRetryTopicAndNamespace(msgs);
+        var ctx = new ConsumeConcurrentlyContext(mq);
+
+        // ⚠ 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE：
+        // 默认就是"全部 ack"。本项目的默认值是 -1（push 回投路径的语义），若不在 POP 这里
+        // 改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，消息在 invisibleTime 到期后被
+        // broker 复活重投 —— 短观测窗口下会伪装成通过。
+        ctx.AckIndex = msgs.Count - 1;
+        ConsumeConcurrentlyStatus status = ConsumeConcurrentlyStatus.ReconsumeLater;
+        try
+        {
+            status = ((IMessageListenerConcurrently)_messageListener!).ConsumeMessage(msgs, ctx);
+        }
+        catch (Exception e)
+        {
+            // Java：消费抛异常按 RECONSUME_LATER 处理
+            ClientLog.Debug("pop listener error, treat as RECONSUME_LATER: " + e.Message);
+        }
+
+        if (pq.IsDropped() || IsPopTimeout(popTime, invisible))
+        {
+            // 消费期间队列被撤走或已超时：结果不再处理
+            pq.DecFoundMsg(-msgs.Count);
+            return;
+        }
+
+        ProcessPopConsumeResult(status, ctx, msgs, pq);
+    }
+
+    /// <summary>消费前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）。
+    /// 与 pull 路径内联的那段同义，这里抽出来供 POP 复用。</summary>
+    private void ResetRetryTopicAndNamespace(List<MessageExt> msgs)
+    {
+        string retryTopic = MixAll.GetRetryTopic(ConsumerGroup);
+        foreach (MessageExt m in msgs)
+        {
+            if (m.Topic != retryTopic) continue;
+            string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
+            if (string.IsNullOrEmpty(orig)) continue;
+            // Java 还会把命名空间从还原后的 topic 上剥掉再交给 listener
+            m.Topic = _namespace.Length == 0 ? orig! : NamespaceUtil.WithoutNamespace(orig!, _namespace);
+        }
+    }
+
+    /// <summary>Java ConsumeRequest.isPopTimeout：解析不出 popTime/invisibleTime 时按超时处理。</summary>
+    public static bool IsPopTimeout(long popTime, long invisible)
+    {
+        if (popTime <= 0 || invisible <= 0) return true;
+        return UtilAll.CurrentTimeMillis() - popTime >= invisible;
+    }
+
+    /// <summary>对应 Java ConsumeMessagePopConcurrentlyService.processConsumeResult。</summary>
+    private void ProcessPopConsumeResult(ConsumeConcurrentlyStatus status,
+                                         ConsumeConcurrentlyContext ctx,
+                                         List<MessageExt> msgs, PopProcessQueue pq)
+    {
+        int ackIndex = ctx.AckIndex;
+        if (status == ConsumeConcurrentlyStatus.ConsumeSuccess)
+        {
+            if (ackIndex >= msgs.Count)
+            {
+                ackIndex = msgs.Count - 1;
+            }
+        }
+        else
+        {
+            ackIndex = -1; // RECONSUME_LATER：一条都不 ack
+        }
+
+        for (int i = 0; i <= ackIndex; i++)
+        {
+            AckPopMsg(msgs[i]);
+            pq.Ack();
+        }
+
+        for (int i = ackIndex + 1; i < msgs.Count; i++)
+        {
+            pq.Ack();
+            MessageExt msg = msgs[i];
+            // 超过最大重试次数：Java 走 CheckNeedAckOrDelay（太老就直接 ack 丢弃，
+            // 否则按消息已存活时间选一个延迟档位）
+            if (_maxReconsumeTimes >= 0 && msg.ReconsumeTimes >= _maxReconsumeTimes)
+            {
+                CheckNeedAckOrDelay(msg);
+                continue;
+            }
+
+            ChangePopInvisibleTime(msg, ctx.DelayLevelWhenNextConsume);
+        }
+    }
+
+    /// <summary>Java checkNeedAckOrDelay：重试次数用尽后的兜底。
+    /// 消息存活时间已超过最大延迟档位的 2 倍 → 直接 ack 丢弃（不再无限重试）；
+    /// 否则按存活时间选一个档位继续延长不可见时间。</summary>
+    private void CheckNeedAckOrDelay(MessageExt msg)
+    {
+        List<int> table = PopDelayLevel;
+        long msgDelayTime = UtilAll.CurrentTimeMillis() - msg.BornTimestamp;
+        if (msgDelayTime > (long)table[table.Count - 1] * 1000 * 2)
+        {
+            ClientLog.Warn("pop consume too many times, ack and drop: " + msg.MsgId);
+            AckPopMsg(msg);
+            return;
+        }
+
+        int level = table.Count - 1;
+        for (; level >= 0; level--)
+        {
+            if (msgDelayTime >= (long)table[level] * 1000)
+            {
+                level++;
+                break;
+            }
+        }
+
+        // ⚠ 有意偏离 Java：存活时间小于首档时 Java 会算出 level=-1 并索引
+        // delayLevelTable[-1] 抛 IndexOutOfRangeException。这里在 ChangePopInvisibleTime
+        // 里钳到首档。
+        ChangePopInvisibleTime(msg, level);
+    }
+
+    /// <summary>
+    /// 从 POP_CK 解出 ack/延长不可见时间需要的目标（对应 Java 客户端自行反构 extraInfo）。
+    /// <para>⚠ 两处都不能想当然：
+    /// <list type="number">
+    /// <item>topic 要用 ExtraInfoUtil.GetRealTopic 按 CK 的 retryFlag 还原 —— 复活消息
+    /// （retryFlag=1）的真实 topic 是 %RETRY%&lt;group&gt;_&lt;topic&gt;，**不是**消息上的 topic；</item>
+    /// <item>地址要按 CK 里的 brokerName 反查，不能按 topic 查路由 —— retry topic 通常没有
+    /// 独立路由表项，按 topic 查会失败（Java 同理走 findBrokerAddressInSubscribe）。</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    public PopCkTarget? PopCkTarget(MessageExt msg)
+    {
+        string? ck = msg.GetProperty(MessageConst.PropertyPopCk);
+        if (string.IsNullOrEmpty(ck))
+        {
+            ClientLog.Debug("pop message without POP_CK, cannot ack: " + msg.MsgId);
+            return null;
+        }
+
+        var target = new PopCkTarget { ExtraInfo = ck! };
+        try
+        {
+            string[] seg = ExtraInfoUtil.Split(target.ExtraInfo);
+            target.BrokerName = ExtraInfoUtil.GetBrokerName(seg);
+            target.QueueId = ExtraInfoUtil.GetQueueId(seg);
+            target.Offset = ExtraInfoUtil.GetQueueOffset(seg);
+            string retry = ExtraInfoUtil.GetRetry(seg);
+            target.Topic = ExtraInfoUtil.GetRealTopic(msg.Topic, ConsumerGroup, retry);
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("bad POP_CK " + target.ExtraInfo + ": " + e.Message);
+            return null;
+        }
+
+        return target;
+    }
+
+    /// <summary>单条 ack（对应 Java DefaultMQPushConsumerImpl.ackAsync）。</summary>
+    private void AckPopMsg(MessageExt msg)
+    {
+        PopCkTarget? target = PopCkTarget(msg);
+        if (target is null) return;
+        try
+        {
+            Client().AckMessage(ConsumerGroup, target.Topic, target.QueueId, target.ExtraInfo,
+                                target.Offset, 3000, target.BrokerName);
+        }
+        catch (Exception e)
+        {
+            // ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
+            ClientLog.Debug("ack failed for " + msg.MsgId + ": " + e.Message);
+        }
+    }
+
+    /// <summary>延长不可见时间（对应 Java changePopInvisibleTime）。
+    /// delayLevel == 0 时 Java 用消息已重试次数当档位；档位表是**秒**，接口要毫秒。</summary>
+    private void ChangePopInvisibleTime(MessageExt msg, int delayLevel)
+    {
+        PopCkTarget? target = PopCkTarget(msg);
+        if (target is null) return;
+        if (delayLevel == 0)
+        {
+            delayLevel = msg.ReconsumeTimes;
+        }
+
+        List<int> table = PopDelayLevel;
+        int delaySecond = delayLevel >= table.Count
+            ? table[table.Count - 1]
+            : table[Math.Max(0, delayLevel)];
+        try
+        {
+            Client().ChangeInvisibleTime(ConsumerGroup, target.Topic, target.QueueId,
+                                         target.ExtraInfo, target.Offset,
+                                         (long)delaySecond * 1000, 3000, target.BrokerName);
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("change invisible time failed for " + msg.MsgId + ": " + e.Message);
         }
     }
 
@@ -1421,6 +1886,12 @@ public sealed class DefaultMQPushConsumer
                     _offsetTable.Remove(key);
                     _consumeOffsetTable.TryGetValue(key, out consumeOffset);
                     _consumeOffsetTable.Remove(key);
+                    // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活重投）
+                    if (_popQueues.TryGetValue(key, out PopProcessQueue? pq))
+                    {
+                        pq.SetDropped(true);
+                        _popQueues.Remove(key);
+                    }
                 }
 
                 // 1) 先持久化已消费位点（UPDATE_CONSUMER_OFFSET=15），再清缓冲/解锁
