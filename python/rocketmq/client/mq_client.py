@@ -53,6 +53,7 @@ from ..remoting.protocol.route import TopicRouteData
 from .exception import MQBrokerException, MQClientException
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
 from .send_result import SendResult, SendStatus
+from .top_addressing import DefaultTopAddressing
 
 logger = get_logger()
 
@@ -144,7 +145,45 @@ class MQClientInstance:
         self.remoting_client.register_processor(
             RequestCode.CONSUME_MESSAGE_DIRECTLY, self._process_consume_message_directly)
         self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
+        # 动态 name server（对应 Java MQClientAPIImpl.topAddressing）。
+        # 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 ws_addr 为空串 → fetch 是 no-op，行为不变。
+        self.top_addressing = DefaultTopAddressing()
+        self._namesrv_refresh_stop = threading.Event()
+        self._namesrv_refresh_thread: Optional[threading.Thread] = None
+        # 线程弹性巡检线程（对应 Java MQClientInstance.startScheduledTask 里
+        # scheduleAtFixedRate(adjustThreadPool, 1, 1, MINUTES)）
+        self._adjust_pool_stop = threading.Event()
+        self._adjust_pool_thread: Optional[threading.Thread] = None
         MQClientInstance.INSTANCE_MAP[client_id] = self
+
+    def fetch_name_server_addr(self) -> Optional[str]:
+        """对应 Java ``MQClientAPIImpl.fetchNameServerAddr``：地址**变化才应用**。
+
+        应用 = 按 ``;`` 切分后更新本实例的 name_server_addrs（Java 的
+        ``updateNameServerAddressList``）。返回新地址串；没变化 / 不可用返回 None。
+        """
+        if self.top_addressing is None or not self.top_addressing.ws_addr:
+            return None
+        changed = self.top_addressing.fetch_and_apply()
+        if changed:
+            addrs = [a.strip() for a in changed.split(";") if a.strip()]
+            self.update_name_server_address_list(addrs)
+        return changed
+
+    def adjust_thread_pool(self) -> None:
+        """对应 Java ``MQClientInstance.adjustThreadPool``：遍历 consumerTable。
+
+        ⚠ 被调用的 push consumer 的 ``adjust_thread_pool()`` 在 Java 5.5.1 是 no-op
+        （inc/dec 空实现），本实现照抄。异常按 Java 语义逐实例吞掉（``catch (Exception
+        ignored)``），保证一个消费者的异常不影响其它消费者。
+        """
+        for group, consumer in list(self._consumer_table.items()):
+            if consumer is None:
+                continue
+            try:
+                consumer.adjust_thread_pool()
+            except Exception as e:  # noqa: BLE001 —— Java 也是 catch (Exception ignored)
+                logger.debug("adjustThreadPool failed for group %s: %s", group, e)
 
     # ---------------- 消费者注册（broker 主动请求按 group 分派） ----------------
     def register_consumer(self, group: str, consumer: "DefaultMQPushConsumer") -> None:
@@ -248,17 +287,82 @@ class MQClientInstance:
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
         self._started = True
+        # 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
+        # 地址时先 fetch 一次；取不到就直接报错（比 Java 更严格——Java 会让运行期各处
+        # 各自失败，这里在 start 时给一个明确错误，行为可预期）。
+        dynamic_ns = (not self.name_server_addrs
+                      and self.top_addressing is not None
+                      and bool(self.top_addressing.ws_addr))
+        if dynamic_ns:
+            self.fetch_name_server_addr()
+            if not self.name_server_addrs:
+                raise MQClientException(
+                    "name server address is not set and address server (%s) returned none"
+                    % self.top_addressing.ws_addr)
+            # 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
+            self._namesrv_refresh_stop.clear()
+            t = threading.Thread(target=self._namesrv_refresh_loop, daemon=True,
+                                 name="rmq-namesrv-refresh-%s" % self.client_id)
+            t.start()
+            self._namesrv_refresh_thread = t
         if self._route_refresh_thread is None:
             self._route_refresh_stop.clear()
             t = threading.Thread(target=self._route_refresh_loop, daemon=True,
                                  name="rmq-route-refresh-%s" % self.client_id)
             t.start()
             self._route_refresh_thread = t
+        if self._adjust_pool_thread is None:
+            self._adjust_pool_stop.clear()
+            t = threading.Thread(target=self._adjust_thread_pool_loop, daemon=True,
+                                 name="rmq-adjust-pool-%s" % self.client_id)
+            t.start()
+            self._adjust_pool_thread = t
 
     def shutdown(self) -> None:
         self._started = False
         self._route_refresh_stop.set()
+        self._adjust_pool_stop.set()
+        self._namesrv_refresh_stop.set()
         self.remoting_client.shutdown()
+
+    def _namesrv_refresh_loop(self) -> None:
+        """动态 name server 周期刷新。
+
+        Java ``MQClientInstance.startScheduledTask``::
+
+            if (null == this.clientConfig.getNamesrvAddr()) {
+                scheduledExecutorService.scheduleAtFixedRate(() -> fetchNameServerAddr(),
+                    1000 * 10, 1000 * 60 * 2, MILLISECONDS);
+            }
+
+        ——首次延迟 10s、周期 2 分钟，且只在"未配置静态地址"时调度。
+        """
+        if self._namesrv_refresh_stop.wait(10.0):    # Java initialDelay = 10s
+            return
+        while not self._namesrv_refresh_stop.wait(120.0):
+            if not self._started:
+                return
+            try:
+                self.fetch_name_server_addr()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("fetchNameServerAddr exception: %s", e)
+
+    def _adjust_thread_pool_loop(self) -> None:
+        """周期触发线程弹性巡检。
+
+        Java ``MQClientInstance.startScheduledTask``::
+
+            scheduleAtFixedRate(() -> adjustThreadPool(), 1, 1, TimeUnit.MINUTES);
+
+        ——首次延迟 1 分钟、周期 1 分钟。虽然 inc/dec 是空实现（见
+        ``DefaultMQPushConsumer.adjust_thread_pool``），调度本身照抄以保持行为一致。
+        """
+        if self._adjust_pool_stop.wait(60.0):    # Java initialDelay = 1 分钟
+            return
+        while not self._adjust_pool_stop.wait(60.0):
+            if not self._started:
+                return
+            self.adjust_thread_pool()
 
     def register_topic_in_use(self, topic: str) -> None:
         """登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。"""

@@ -13,7 +13,6 @@ import queue
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from ..common.message import MessageExt, MessageQueue
@@ -33,6 +32,7 @@ from ..remoting.protocol.body import (CMResult, ConsumeMessageDirectlyResult,
 from ..remoting.protocol import extra_info as extra_info_util
 from ..remoting.protocol.extra_info import split
 from ..remoting.rpchook import RPCHook
+from .consume_executor import ConsumeExecutor
 from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus,
                               ConsumeOrderlyContext, ConsumeOrderlyStatus,
                               ConsumeReturnType,
@@ -43,6 +43,7 @@ from .exception import MQBrokerException, MQClientException
 from .hook import (ConsumeMessageContext, ConsumeMessageHook,
                    FilterMessageContext, FilterMessageHook)
 from .mq_client import MQClientInstance
+from .top_addressing import DefaultTopAddressing
 from .trace import AccessChannel
 from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
 from .trace_hook import ConsumeMessageTraceHook
@@ -273,8 +274,26 @@ class DefaultMQPushConsumer:
         self.message_model = message_model
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         self.consume_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
-        self.consume_thread_min = 1
-        self.consume_thread_max = 1
+        # ---- 消费线程池（对齐 Java DefaultMQPushConsumer / ThreadPoolExecutor）----
+        # Java 默认 consumeThreadMin=20、consumeThreadMax=64。
+        # 本实现的**拉取**路径是"每队列一个拉取线程"（不是共享线程池），只有 **POP**
+        # 路径才真正建线程池（Java 的 ConsumeMessagePopConcurrentlyService 也是线程池）。
+        # 两个值同时是"声明值"：consume_thread_max 既是 POP 线程池的 max，也是
+        # update_core_pool_size 的上界（Java 守卫 n < getConsumeThreadMax()）。
+        self.consume_thread_min = 20
+        self.consume_thread_max = 64
+        # 自动弹性阈值（Java DefaultMQPushConsumer.adjustThreadPoolNumsThreshold，默认 100000）。
+        # ⚠ 自动 inc/dec 在 Java 5.5.1 是**空实现**（AbstractConsumeMessageService:70-75），
+        # 见 adjust_thread_pool()：保留计算与配置是为了可观测，不要"顺手修好"。
+        self.adjust_thread_pool_nums_threshold = 100000
+        # 声明式 core pool size（Java setCorePoolSize 的等价物），默认 = consume_thread_min
+        self._core_pool_size = self.consume_thread_min
+        # 是否自建执行器（Java AbstractConsumeMessageService.ownsConsumeExecutor）。
+        # 本实现不支持外部注入执行器，故恒为 True —— update_core_pool_size 的这道守卫恒满足。
+        self._owns_consume_executor = True
+        # ProcessQueue.msgAccCnt（按队列 key）：最近一次拉取算出的"积压条数"
+        # = 消息上的 MAX_OFFSET 属性 - 该消息的 queueOffset（>0 才更新）
+        self._msg_acc_cnt_table: Dict[str, int] = {}
         self.consume_concurrently_max_span = 2000
         self.pull_threshold_for_queue = 1000
         self.pull_threshold_size_for_queue = 100
@@ -354,7 +373,7 @@ class DefaultMQPushConsumer:
         self.pop_timeout_millis = 25000
         # 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
         self._pop_queues: Dict[str, PopProcessQueue] = {}
-        self._pop_executor: Optional["ThreadPoolExecutor"] = None
+        self._pop_executor: Optional[ConsumeExecutor] = None
         # ---- 消息轨迹（对应 Java ClientConfig.enableTrace / traceTopic）----
         # 开启后 start() 注册 ConsumeMessageTraceHook，落 SubBefore/SubAfter 两段轨迹
         self.enable_trace = False
@@ -395,8 +414,105 @@ class DefaultMQPushConsumer:
             return int(time.time() * 1000 - 30 * 60 * 1000)
 
     def set_consume_thread_nums(self, n: int) -> None:
-        self.consume_thread_min = max(1, n)
-        self.consume_thread_max = max(1, n)
+        """便捷方法：min 与 max 一起设（Java 4.x ``setConsumeThreadNums`` 的语义）。
+
+        Java 5.x 的 ``DefaultMQPushConsumer`` 已拆成 ``setConsumeThreadMin/Max``，
+        本方法保留是为了兼容既有调用点。
+        """
+        n = max(1, int(n))
+        self.consume_thread_min = n
+        self.consume_thread_max = n
+        self._core_pool_size = n
+        self._apply_core_pool_size()
+
+    def set_consume_thread_min(self, n: int) -> None:
+        self.consume_thread_min = max(1, int(n))
+        self._core_pool_size = self.consume_thread_min
+        self._apply_core_pool_size()
+
+    def set_consume_thread_max(self, n: int) -> None:
+        self.consume_thread_max = max(1, int(n))
+
+    def get_consume_thread_min(self) -> int:
+        return self.consume_thread_min
+
+    def get_consume_thread_max(self) -> int:
+        return self.consume_thread_max
+
+    def set_adjust_thread_pool_nums_threshold(self, value: int) -> None:
+        """Java ``DefaultMQPushConsumer.setAdjustThreadPoolNumsThreshold``。"""
+        self.adjust_thread_pool_nums_threshold = int(value)
+
+    def get_adjust_thread_pool_nums_threshold(self) -> int:
+        return self.adjust_thread_pool_nums_threshold
+
+    # ---------------- 线程弹性（对应 Java AbstractConsumeMessageService）----------------
+
+    def update_core_pool_size(self, core_pool_size: int) -> bool:
+        """运行时调整消费并发度（对应 Java `updateCorePoolSize` → `setCorePoolSize`）。
+
+        Java 的守卫逐条照抄（``AbstractConsumeMessageService:63-71``）::
+
+            ownsConsumeExecutor && corePoolSize > 0
+                && corePoolSize <= Short.MAX_VALUE          # 32767
+                && corePoolSize < consumeThreadMax
+
+        任一条不满足就**静默忽略**（Java 也是静默 return，不抛异常）。返回值只用于
+        单测断言"是否真的生效"，Java 侧无返回值。
+        """
+        if not self._owns_consume_executor:
+            return False
+        if not (0 < int(core_pool_size) <= 32767):    # Short.MAX_VALUE
+            return False
+        if int(core_pool_size) >= self.consume_thread_max:
+            return False
+        self._core_pool_size = int(core_pool_size)
+        self._apply_core_pool_size()
+        return True
+
+    def get_core_pool_size(self) -> int:
+        """Java ``getCorePoolSize``：非自建执行器时返回 -1。"""
+        if not self._owns_consume_executor:
+            return -1
+        if self._pop_executor is not None:
+            return self._pop_executor.get_core_pool_size()
+        return self._core_pool_size
+
+    def _apply_core_pool_size(self) -> None:
+        """把声明的 core size 落到真实执行器上（没有执行器时只记声明值）。"""
+        if self._pop_executor is not None and self._owns_consume_executor:
+            self._pop_executor.set_core_pool_size(self._core_pool_size)
+
+    def compute_accumulation_total(self) -> int:
+        """Java ``DefaultMQPushConsumerImpl.computeAccumulationTotal``。
+
+        = 所有 ProcessQueue 的 ``msgAccCnt`` 之和。本实现按"每队列"记录最近一次
+        拉取算出的积压条数（见 ``_update_msg_acc_cnt``）。
+        """
+        with self._lock:
+            return sum(self._msg_acc_cnt_table.values())
+
+    def adjust_thread_pool(self) -> None:
+        """Java ``DefaultMQPushConsumerImpl.adjustThreadPool``（每分钟调度一次）。
+
+        ⚠ **在 Java 5.5.1 这是 no-op，我们照抄 no-op**：它调用的
+        ``consumeMessageService.incCorePoolSize()/decCorePoolSize()`` 在
+        ``AbstractConsumeMessageService:70-75`` 是**空方法体**。这里保留阈值比较
+        与日志，仅为让 ``msgAccCnt`` / 阈值配置可观测、可断言；**不要"修好"它** ——
+        真正生效的是显式的 ``update_core_pool_size()``。
+        """
+        acc_total = self.compute_accumulation_total()
+        threshold = self.adjust_thread_pool_nums_threshold
+        inc_threshold = threshold * 1.0
+        dec_threshold = threshold * 0.8
+        if acc_total >= inc_threshold:
+            # Java: consumeMessageService.incCorePoolSize() —— 空实现
+            logger.debug("adjustThreadPool: acc=%d >= incThreshold=%d (inc is a no-op upstream)",
+                         acc_total, int(inc_threshold))
+        if acc_total < dec_threshold:
+            # Java: consumeMessageService.decCorePoolSize() —— 空实现
+            logger.debug("adjustThreadPool: acc=%d < decThreshold=%d (dec is a no-op upstream)",
+                         acc_total, int(dec_threshold))
 
     def set_pull_suspend_timeout_millis(self, millis: int) -> None:
         self.pull_suspend_timeout_millis = int(millis)
@@ -553,7 +669,8 @@ class DefaultMQPushConsumer:
         with self._lock:
             if self._started:
                 return
-            if not self.name_server_addrs:
+            if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
+                # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
                 raise MQClientException("name server address is not set")
             if not self.subscription_data:
                 raise MQClientException("subscription is not set, call subscribe() first")
@@ -570,6 +687,10 @@ class DefaultMQPushConsumer:
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
+            # 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者，
+            # 让 consumerRunningInfo 等处能看到（Java 由共享的 ClientConfig 天然同步）。
+            if not self.name_server_addrs and self._mq_client.name_server_addrs:
+                self.name_server_addrs = list(self._mq_client.name_server_addrs)
             self._mq_client.register_consumer(self.consumer_group, self)
             self._started = True
             self._start_time = time.time()
@@ -590,8 +711,13 @@ class DefaultMQPushConsumer:
         # POP 模式的消费线程池必须在 rebalance 之前建好：rebalance 会立刻起每队列的 POP
         # 循环，而循环拿到消息后要投递到这里（Java 的 consumeExecutor）。
         if self.pop_mode:
-            self._pop_executor = ThreadPoolExecutor(
-                max_workers=max(1, self.consume_thread_max),
+            # Java ConsumeMessagePopConcurrentlyService 用的就是这个线程池：
+            # core=consumeThreadMin、max=consumeThreadMax、队列无界（因此**真实并发度
+            # == core**，与 Java 一致）。为了拿到 core/max 两档语义，这里用自实现的
+            # ConsumeExecutor（标准库 ThreadPoolExecutor 只有 max 一个上限）。
+            self._pop_executor = ConsumeExecutor(
+                core_pool_size=max(1, self._core_pool_size),
+                maximum_pool_size=max(1, self.consume_thread_max),
                 thread_name_prefix="rmq-popconsume-%s" % self.consumer_group)
         # 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
         # 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
@@ -1052,9 +1178,41 @@ class DefaultMQPushConsumer:
                     self._mq_map[key] = mq
                 if result.status == PullStatus.FOUND and result.msg_found_list:
                     self._pending[key].extend(result.msg_found_list)
+                    self._update_msg_acc_cnt(key, result.msg_found_list)
                 # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
                 if result.next_begin_offset is not None:
                     self._offset_table[key] = result.next_begin_offset
+
+    def _update_msg_acc_cnt(self, key: str, msgs: List[MessageExt]) -> None:
+        """对应 Java ``ProcessQueue.putMessage`` 里的 ``msgAccCnt`` 计算。
+
+        ``ProcessQueue.java:148-158``::
+
+            long accTotal = Long.parseLong(msg.getProperty(MAX_OFFSET)) - msg.getQueueOffset();
+            if (accTotal > 0) this.msgAccCnt = accTotal;
+
+        取的是**本批最后一条**消息；用来喂 ``adjust_thread_pool`` 的阈值比较。
+        """
+        if not msgs:
+            return
+        last = msgs[-1]
+        prop = last.get_property(MessageConst.PROPERTY_MAX_OFFSET)
+        if prop is None:
+            return
+        try:
+            acc_total = int(prop) - int(last.queue_offset)
+        except (TypeError, ValueError):
+            return
+        if acc_total > 0:
+            with self._lock:
+                self._msg_acc_cnt_table[key] = acc_total
+
+    def msg_acc_cnt(self, key: Optional[str] = None) -> int:
+        """读 ``msgAccCnt``：给 key 读单队列，不给则求和（等价 computeAccumulationTotal）。"""
+        with self._lock:
+            if key is None:
+                return sum(self._msg_acc_cnt_table.values())
+            return int(self._msg_acc_cnt_table.get(key, 0))
 
     # ---------------------------------------------------------------- POP 消费循环
 
@@ -1530,7 +1688,7 @@ class DefaultMQPushConsumer:
             ConsumerRunningInfo.PROP_NAMESERVER_ADDR: ";".join(self.name_server_addrs) + ";",
             ConsumerRunningInfo.PROP_CONSUME_TYPE: "CONSUME_PASSIVELY",
             ConsumerRunningInfo.PROP_CONSUME_ORDERLY: str(bool(self._is_orderly())).lower(),
-            ConsumerRunningInfo.PROP_THREADPOOL_CORE_SIZE: str(max(1, self.consume_thread_max)),
+            ConsumerRunningInfo.PROP_THREADPOOL_CORE_SIZE: str(self.get_core_pool_size()),
             ConsumerRunningInfo.PROP_CONSUMER_START_TIMESTAMP: str(int(self._start_time * 1000)),
             ConsumerRunningInfo.PROP_CLIENT_VERSION: "V5_5_1",
         }

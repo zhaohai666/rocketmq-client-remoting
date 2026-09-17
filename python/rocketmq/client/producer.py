@@ -35,6 +35,7 @@ from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
 from .latency import MQFaultStrategy
 from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
+from .top_addressing import DefaultTopAddressing
 from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
                             RequestResponseFuture, create_correlation_id)
 from .send_result import SendResult, SendStatus
@@ -422,7 +423,8 @@ class DefaultMQProducer:
         with self._lock:
             if self._started:
                 return
-            if not self.name_server_addrs:
+            if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
+                # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
                 raise MQClientException("name server address is not set")
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
@@ -434,6 +436,9 @@ class DefaultMQProducer:
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
+            # 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+            if not self.name_server_addrs and self._mq_client.name_server_addrs:
+                self.name_server_addrs = list(self._mq_client.name_server_addrs)
             # 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
             # 按 message_ext 的 PGROUP 属性匹配本生产者，不匹配则丢弃。
             self._mq_client.remoting_client.register_processor(
