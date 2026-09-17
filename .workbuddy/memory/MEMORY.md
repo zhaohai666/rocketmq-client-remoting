@@ -21,7 +21,8 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
   `run_logging_live.sh`、`run_transaction_live.sh`、`run_dotnet_live.sh`、**`run_acl_live.sh`**（开认证的集群）、
   **`run_pull_live.sh`**（主动拉取 S1–S7）、**`run_rr_live.sh`**（Request-Reply）、
-  **`run_latency_live.sh`**（故障规避）、**`run_pop_live.sh`**（POP 模式 S1–S8；三语言各 14/14）。
+  **`run_latency_live.sh`**（故障规避）、**`run_pop_live.sh`**（POP 协议管道 S1–S8；各 14/14）、
+  **`run_pop_consumer_live.sh`**（POP 消费循环 S1–S4；各 7/7）。
 
 ## 跨语言硬性约定
 1. **字段名以 Java 为准**：broker 用 fastjson2 按 **Java 属性名**反序列化，错一个就**静默丢字段**。
@@ -81,9 +82,24 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
      （Java `MQClientAPIImpl:1202`）。回归守卫：`PopTests.StampPopCkIndexSelectsRightOffsetWithinQueue`
      故意让 msgOffsetInfo 值（100/101/102）≠ 消息 queueOffset（10/11/12）。
    - 三侧回归守卫：Python `tests/test_pop.py`（50 例，含 extFields 逐键断言）+ 真机
-     `python/verify_pop_live.py` S1–S8；C++ `tests/test_pop.cpp`（ctest 12/12）+
-     `examples/live_pop.cpp`；.NET `tests/.../PopTests.cs`（xunit 125/125）+
-     `examples/.../LivePop.cs`（子命令 `rmq pop`）。harness `/tmp/run_pop_live.sh all` → 42/42。
+     `python/verify_pop_live.py` S1–S8；C++ `tests/test_pop.cpp` + `examples/live_pop.cpp`；
+     .NET `tests/.../PopTests.cs` + `examples/.../LivePop.cs`（子命令 `rmq pop`）。
+     harness `/tmp/run_pop_live.sh all` → 42/42。
+13. **POP **消费侧**的两个坑**（2026-09-17，三侧同源，写消费循环前必读）：
+   - **`ackIndex` 默认值**：Java `ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE`
+     （= 全 ack），本项目默认 **-1**（push 回投语义）。照搬 -1 会让 `CONSUME_SUCCESS`
+     **一条都不 ack**，整批在 invisibleTime 后复活重投。POP 路径必须显式置 `size-1`。
+   - **"验证不重复投递"的观察窗口必须 > `popInvisibleTime`**。用默认 60s + 观察 8s 的话，
+     即使 ack 完全没发出去，消息也还没到复活时间，断言照样"全过"（假绿）。真机脚本已把
+     invisible 压到 10s、观察拉到 16s。
+   - 有意偏离 Java：`checkNeedAckOrDelay` 对"存活 < 首档"的消息算出 `delayLevel=-1`，
+     Java 随后索引 `delayLevelTable[-1]` 抛 AIOOBE；三侧钳到首档。
+   - 调试提示：`SimpleMessageListener` 回调是 **`fn(msgs)` 单参**，写成 `(msgs, context)`
+     会抛 TypeError，而 POP 循环把 listener 异常按 RECONSUME_LATER **吞掉**（对齐 Java），
+     表现为"一条都收不到"且只有 DEBUG 日志 → 开 `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG`。
+   - 三侧回归守卫：`test_pop_consumer.py`（37 例）/ `test_pop_consumer.cpp`（ctest 13/13）/
+     `PopConsumerTests.cs`（13 例）；真机 `bash /tmp/run_pop_consumer_live.sh all` → 21/21
+     （子命令 `rmq popc`）。
 
 ## 两条"静默数据损坏"级的坑（最贵，别顺手优化）
 - **压缩两层语义缺一不可**：未支持的压缩类型（如 SNAPPY）`decompress` **抛异常**，且
@@ -95,7 +111,7 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 已对齐 Java：两阶段事务、真实 rebalance + 队列撤销收尾 + 分配时解析初始位点、回投 / 位点持久化 /
 顺序锁 / 广播 / 流控、`resetRetryAndNamespace`、优雅注销、`UNREGISTER_CLIENT`、路由 30s 刷新、
 压缩、**命名空间包裹（三侧）**、**ACL 鉴权（三侧）**、**主动拉取 PullConsumer（三侧）**、
-**Request-Reply（三侧）**、**故障规避 sendLatencyFaultEnable（三侧）**、**POP 模式协议管道（三侧）**。
+**Request-Reply（三侧）**、**故障规避 sendLatencyFaultEnable（三侧）**、**POP 模式（协议管道 + 消费循环，三侧）**。
 仍缺（下表全部为 P3）：
 
 | 能力 | 严重度 | Py | C++ | .NET | 说明 |
