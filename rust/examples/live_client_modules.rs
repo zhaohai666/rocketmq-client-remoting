@@ -809,15 +809,17 @@ async fn t3_consumer_stats(
         mgr.inc_consume_ok_tps(group, topic, len);
     }
 
-    let handle = client.runtime_handle();
-    mgr.start_with_handle(handle);
+    let handle = client
+        .runtime_handle()
+        .ok_or("no tokio runtime handle bound to the remoting client")?;
+    mgr.start_with_handle(&handle);
     ck.check(
         "T3 sampler is running after start_with_handle",
         mgr.is_running(),
         "start_with_handle did not spawn the sampler",
     );
     // 重复 start 必须是 no-op（Python 见到已有线程直接 return）。
-    mgr.start_with_handle(handle);
+    mgr.start_with_handle(&handle);
     ck.check("T3 start is idempotent", mgr.is_running(), "second start killed the sampler");
 
     // 用固定时间戳采样，StatsSnapshot 的算术才能精确对拍。
@@ -909,7 +911,7 @@ async fn t3_consumer_stats(
         "sampler still running after shutdown",
     );
     // shutdown 之后可以重新 start（Python 的线程句柄被置 None）。
-    mgr.start_with_handle(handle);
+    mgr.start_with_handle(&handle);
     ck.check("T3 restart after shutdown works", mgr.is_running(), "restart failed");
     mgr.shutdown();
     Ok(())

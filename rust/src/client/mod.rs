@@ -6,6 +6,7 @@ pub mod consumer_stats;
 pub mod hook;
 pub mod latency;
 pub mod metrics;
+pub mod mq_client;
 pub mod request_reply;
 pub mod result;
 pub mod top_addressing;

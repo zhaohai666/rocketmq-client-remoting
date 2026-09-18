@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,7 +67,7 @@ impl ResponseSink {
         response.opaque = self.opaque;
         let inner = self.inner.clone();
         let addr = self.addr.clone();
-        self.inner.handle.spawn(async move {
+        self.inner.spawn("response write", async move {
             if let Err(e) = write_frame(&inner, &addr, &mut response).await {
                 rmq_warn!("remoting: failed to write response (code={}) to {}: {}", response.code, addr, e);
             }
@@ -167,7 +167,10 @@ struct Inner {
     hooks: RwLock<Vec<Arc<dyn RPCHook>>>,
     processors: RwLock<HashMap<i32, Arc<dyn RequestProcessor>>>,
     running: AtomicBool,
-    handle: tokio::runtime::Handle,
+    /// 首次需要 spawn 时才绑定的 tokio 句柄（`None` 表示还没绑定）。
+    /// 构造 `RemotingClient` 可能在运行时之外（Python 的构造与运行时无关），
+    /// 所以这里不能急切 `Handle::current()`；所有 spawn 点都在运行时内部。
+    handle: OnceLock<tokio::runtime::Handle>,
 }
 
 /// 长连接 remoting 客户端，可跨任务克隆。
@@ -196,7 +199,7 @@ impl RemotingClient {
                 hooks: RwLock::new(Vec::new()),
                 processors: RwLock::new(HashMap::new()),
                 running: AtomicBool::new(true),
-                handle: tokio::runtime::Handle::current(),
+                handle: OnceLock::new(),
             }),
         }
     }
@@ -205,8 +208,10 @@ impl RemotingClient {
         &self.inner.config
     }
 
-    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
-        &self.inner.handle
+    /// 当前 tokio 句柄；不在运行时上下文里时返回 `None`（Python 的构造与运行时无关，
+    /// 这里同样不假设构造点有运行时）。
+    pub fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        self.inner.runtime_handle()
     }
 
     // ---------------- 钩子 / 处理器 ----------------
@@ -284,7 +289,7 @@ impl RemotingClient {
     ) {
         let inner = self.inner.clone();
         let addr = addr.to_string();
-        self.inner.handle.spawn(async move {
+        self.inner.spawn("invoke_async", async move {
             let result = invoke_sync_inner(&inner, &addr, &mut request, timeout_millis).await;
             callback(result);
         });
@@ -321,6 +326,12 @@ impl RemotingClient {
         state.pending.len()
     }
 
+    /// 对应 Java `NettyRemotingClient#start`（`MQClientInstance#start` 会调它）：
+    /// 把 `shutdown` 关掉的传输重新打开。连接本来就是按需建的，所以只需翻回 running 位。
+    pub fn start(&self) {
+        self.inner.running.store(true, Ordering::Release);
+    }
+
     pub fn shutdown(&self) {
         if !self.inner.running.swap(false, Ordering::SeqCst) {
             return;
@@ -340,6 +351,29 @@ impl RemotingClient {
 impl Inner {
     fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        if let Some(handle) = self.handle.get() {
+            return Some(handle.clone());
+        }
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        // 并发下可能两个任务同时 try_current，set 失败无害，句柄等价。
+        let _ = self.handle.set(handle.clone());
+        Some(handle)
+    }
+
+    /// 在当前运行时上派后台任务；没有可用运行时时只记日志，不 panic。
+    fn spawn<F>(&self, what: &str, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        match self.runtime_handle() {
+            Some(handle) => {
+                handle.spawn(task);
+            }
+            None => rmq_warn!("remoting: no tokio runtime in context, {what} dropped"),
+        }
     }
 
     fn register_pending(
