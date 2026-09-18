@@ -384,7 +384,9 @@ impl<'a> PublishMessage<'a> {
         }
     }
 
-    fn as_message_mut(&mut self) -> &mut Message {
+    /// 外层 `Message` 的可变视图：发送内核里的 traceparent 注入
+    /// （Python `_send_with_hooks` 的 `inject_trace_context(msg)`）要就地改属性。
+    pub fn as_message_mut(&mut self) -> &mut Message {
         match self {
             PublishMessage::Single(m) => m,
             PublishMessage::Batch(b) => &mut b.message,
