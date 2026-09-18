@@ -146,8 +146,10 @@ int main() {
 
     // ------------------------------------------------ 等待槽
     {
-        RequestResponseFuture f("c1", 50);
-        expect(!f.waitResponseMessage(50), "wait times out returns false");
+        // isTimeout 用严格的 elapsed > timeoutMillis（与 Java 一致）：future 超时与等待预算
+        // 必须拉开差距，否则并行跑满负载时会正好压在边界上偶发失败。
+        RequestResponseFuture f("c1", 20);
+        expect(!f.waitResponseMessage(200), "wait times out returns false");
         expect(f.isTimeout(), "future isTimeout after wait");
     }
     {

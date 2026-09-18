@@ -1254,10 +1254,15 @@ public sealed class MQClientInstance : IDisposable
     // ---------------- 消费位点 ----------------
 
     /// <summary>返回 false 表示 broker 回 QUERY_NOT_FOUND（消费组尚无位点）。</summary>
+    /// <remarks>
+    /// setZeroIfNotFound 默认 false：Java 的 fetchConsumeOffsetFromBroker 从不设置该字段，
+    /// 新消费组因此拿到 QUERY_NOT_FOUND 而非 0，调用方才会按 ConsumeFromWhere 计算起点。
+    /// 默认 true 会把首次启动的消费者钉在队首重放历史消息，并让 LastOffset / Timestamp 形同虚设。
+    /// </remarks>
     public bool QueryConsumerOffset(string consumerGroup, MessageQueue mq,
         out long outOffset, int timeoutMillis = 5000,
         string? addrIn = null,
-        bool setZeroIfNotFound = true)
+        bool setZeroIfNotFound = false)
     {
         outOffset = 0;
         string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);

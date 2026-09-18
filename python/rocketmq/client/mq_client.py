@@ -957,9 +957,12 @@ class MQClientInstance:
                                          new_extra)
 
     # ---------------- Offset 查询/更新 ----------------
+    # set_zero_if_not_found 默认 False：Java 的 fetchConsumeOffsetFromBroker 从不设置该字段，
+    # 新消费组因此回 QUERY_NOT_FOUND（None）而非 0，调用方才会按 consume_from_where 算起点。
+    # 默认 True 会把首次启动的消费者钉在队首重放历史消息，并让 LAST_OFFSET / TIMESTAMP 形同虚设。
     def query_consumer_offset(self, consumer_group: str, mq: MessageQueue,
                               timeout_millis: int = 5000, addr: Optional[str] = None,
-                              set_zero_if_not_found: bool = True) -> Optional[int]:
+                              set_zero_if_not_found: bool = False) -> Optional[int]:
         if addr is None:
             addr = self._broker_addr(mq)
         header = QueryConsumerOffsetRequestHeader()

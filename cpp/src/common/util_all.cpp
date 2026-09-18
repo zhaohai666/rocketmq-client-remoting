@@ -98,6 +98,11 @@ std::string UtilAll::timeToHumanString(int64_t ts, const std::string& pattern) {
     return out;
 }
 
+std::string UtilAll::timeMillisToHumanString3(int64_t ts) {
+    // %Y%m%d%H%M%S 与 Java 的 String.format("%04d%02d%02d%02d%02d%02d") 逐位等价（同为本地时区）
+    return timeToHumanString(ts, "%Y%m%d%H%M%S");
+}
+
 bool UtilAll::isBlank(const std::string& s) {
     for (char c : s) {
         if (!std::isspace(static_cast<unsigned char>(c))) return false;

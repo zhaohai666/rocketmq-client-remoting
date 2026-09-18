@@ -1,7 +1,6 @@
 #include "rocketmq/client/lite_pull_consumer.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <ctime>
 #include <optional>
 #include <utility>
@@ -9,6 +8,7 @@
 #include "rocketmq/client/exception.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/sysflag.h"
+#include "rocketmq/common/util_all.h"
 
 namespace rocketmq {
 
@@ -38,21 +38,6 @@ int64_t nowMillis() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-// Java UtilAll.timeMillisToHumanString3：本地时区的 14 位 "yyyyMMddHHmmss"。
-std::string timeMillisToHumanString3(int64_t t) {
-    std::time_t sec = static_cast<std::time_t>(t / 1000);
-    std::tm tmv {};
-#if defined(_WIN32)
-    if (localtime_s(&tmv, &sec) != 0) return std::string();
-#else
-    if (localtime_r(&sec, &tmv) == nullptr) return std::string();
-#endif
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%04d%02d%02d%02d%02d%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
-                  tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-    return std::string(buf);
 }
 
 // 对应 Java UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)：该字段**只**是 14 位本地墙钟日期。
@@ -98,7 +83,7 @@ DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGrou
     consumerGroup_ = consumerGroup;
     // 对应 Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
     // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
-    consumeTimestamp_ = timeMillisToHumanString3(nowMillis() - 30 * 60 * 1000);
+    consumeTimestamp_ = UtilAll::timeMillisToHumanString3(nowMillis() - 30 * 60 * 1000);
 }
 
 DefaultLitePullConsumer::~DefaultLitePullConsumer() {
@@ -350,6 +335,9 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
     }
     auto sit = seekOffset_.find(mq);
     if (sit != seekOffset_.end()) return sit->second;
+    // 与 Java RebalanceLitePullImpl.computePullFromWhereWithException 同序：先读已提交位点，
+    // 只有真正 QUERY_NOT_FOUND 时才按 consumeFromWhere 计算。broker 在 setZeroIfNotFound
+    // 未设置且队首仍在 commitlog 内时会直接回 0，此时 consumeFromWhere 不参与。
     try {
         int64_t off = 0;
         if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) {

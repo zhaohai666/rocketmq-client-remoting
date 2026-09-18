@@ -24,6 +24,10 @@ struct UtilAll {
     static int64_t computeElapseTimeMillis(int64_t lastTime);
     static std::string timeToHumanString(int64_t ts, const std::string& pattern = YYYY_MM_DD_HH_MM_SS);
 
+    // Java UtilAll.timeMillisToHumanString3：本地时区的 14 位 "yyyyMMddHHmmss"，
+    // consumeTimestamp 的默认值与展示都靠它。
+    static std::string timeMillisToHumanString3(int64_t ts);
+
     static bool isBlank(const std::string& s);
     static bool isNotBlank(const std::string& s);
 

@@ -163,10 +163,13 @@ public:
 
     // ---------------- 消费位点 ----------------
     // 返回 false 表示 broker 回 QUERY_NOT_FOUND（消费组尚无位点）
+    // setZeroIfNotFound 默认 false：Java 的 fetchConsumeOffsetFromBroker 从不设置该字段，
+    // 新消费组因此拿到 QUERY_NOT_FOUND 而非 0，调用方才会按 consumeFromWhere 计算起点。
+    // 默认 true 会把首次启动的消费者钉在队首重放历史消息，并让 LAST_OFFSET / TIMESTAMP 形同虚设。
     bool queryConsumerOffset(const std::string& consumerGroup, const MessageQueue& mq,
                              int64_t& outOffset, int32_t timeoutMillis = 5000,
                              const std::string& addr = std::string(),
-                             bool setZeroIfNotFound = true);
+                             bool setZeroIfNotFound = false);
     void updateConsumerOffset(const std::string& consumerGroup, const MessageQueue& mq,
                               int64_t commitOffset, int32_t timeoutMillis = 5000,
                               const std::string& addr = std::string());

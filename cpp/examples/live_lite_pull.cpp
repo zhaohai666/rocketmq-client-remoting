@@ -9,6 +9,10 @@
 //   S3 auto-commit：消费后 committed 位点 > 0，且 commit() 后可回读
 //   S4 assign 模式：显式 assign 全部队列 + seek 到队首 → poll 重新收全 12 条
 //   S5 订阅 TagA：subscribe(T, "TagA") 只收 TagA 的 6 条（订阅级 tag 过滤）
+//   S6 CONSUME_FROM_TIMESTAMP：consumeTimestamp 按 Java 的 14 位本地墙钟解释
+//      S6a 新组 + 起点=30 分钟前 → 收全 12 条
+//      S6b 墙钟→队列位置映射：30 分钟前 → 各队列队首（Σ=0）；10 分钟后 → 越过全部消息（Σ=12）
+//      （旧实现把 "20260919072530" 当 epoch 秒 → 公元 2611 年 → 两个方向同时翻转）
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -87,6 +91,8 @@ int main(int argc, char** argv) {
     const std::string group1 = "LitePG1Cpp_" + stamp;
     const std::string group2 = "LitePG2Cpp_" + stamp;
     const std::string group3 = "LitePG3Cpp_" + stamp;
+    const std::string group4 = "LitePG4Cpp_" + stamp;
+    const std::string group5 = "LitePG5Cpp_" + stamp;
     const int32_t nMsg = 12;
     const int32_t queueNum = 4;
 
@@ -231,6 +237,51 @@ int main(int argc, char** argv) {
         }
         check("S5 仅收 TagA 且恰好 6 条", onlyA, "got=" + std::to_string(got3Set.size()));
         c3.shutdown();
+    }
+
+    // ---------------- S6 CONSUME_FROM_TIMESTAMP：14 位本地墙钟 ----------------
+    std::printf("\nS6 CONSUME_FROM_TIMESTAMP：墙钟起点收全 + 时间戳→位点映射\n");
+    {
+        const int64_t wall = UtilAll::currentTimeMillis();
+
+        DefaultLitePullConsumer c4(group4);
+        c4.setNamesrvAddr(namesrv);
+        c4.setPollTimeoutMillis(1000);
+        c4.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_TIMESTAMP);
+        c4.setConsumeTimestamp(UtilAll::timeMillisToHumanString3(wall - 30 * 60 * 1000));
+        c4.subscribe(topic, "*");
+        c4.start();
+        waitAssignment(c4);
+        std::vector<MessageExt> got4 = drain(c4, static_cast<size_t>(nMsg));
+        std::set<std::string> got4Set;
+        for (const MessageExt& m : got4) got4Set.insert(bodyOf(m));
+        check("S6a 起点=" + c4.consumeTimestamp() + " 早于全部消息 → 收全 " +
+                  std::to_string(nMsg) + " 条",
+              got4Set == sent, "got=" + std::to_string(got4Set.size()));
+        c4.shutdown();
+
+        DefaultLitePullConsumer c5(group5);
+        c5.setNamesrvAddr(namesrv);
+        c5.setPollTimeoutMillis(1000);
+        c5.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_TIMESTAMP);
+        c5.setConsumeTimestamp(UtilAll::timeMillisToHumanString3(wall + 10 * 60 * 1000));
+        c5.subscribe(topic, "*");
+        c5.start();
+        std::vector<MessageQueue> q5 = waitAssignment(c5);
+        // 「未来时间戳的消费者收不到消息」在 Java 里不成立：新消费组只要队首仍在 commitlog 内，
+        // broker 就直接回已提交位点 0（见 ConsumerManageProcessor + RebalanceLitePullImpl 的
+        // readOffset 优先），consumeFromWhere 根本不参与。所以这里断言的是墙钟真正影响的量：
+        // 时间戳 → 队列位置的映射。旧的 epoch 误解析会把两个方向同时翻转。
+        int64_t sumPast = 0, sumFuture = 0;
+        for (const MessageQueue& mq : q5) {
+            sumPast += c5.offsetForTimestamp(mq, wall - 30 * 60 * 1000);
+            sumFuture += c5.offsetForTimestamp(mq, wall + 10 * 60 * 1000);
+        }
+        check("S6b 30 分钟前 → 各队列队首", sumPast == 0,
+              "sumOffset=" + std::to_string(sumPast));
+        check("S6b 10 分钟后 → 越过全部 " + std::to_string(nMsg) + " 条",
+              sumFuture == nMsg, "sumOffset=" + std::to_string(sumFuture));
+        c5.shutdown();
     }
 
     c1.shutdown();

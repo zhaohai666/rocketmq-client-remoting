@@ -15,6 +15,10 @@
   S3 auto-commit：消费后 committed 位点 > 0，且 commit() 后可回读
   S4 assign 模式：显式 assign 全部队列 + seek 到队首 → poll 重新收全 12 条（验证 assign/seek/poll）
   S5 订阅 TagA：subscribe(T, "TagA") 只收 TagA 的 6 条（验证订阅级 tag 过滤）
+  S6 CONSUME_FROM_TIMESTAMP：consumeTimestamp 按 Java 的 14 位本地墙钟解释
+     S6a 新组 + 起点=30 分钟前 → 收全 12 条
+     S6b 墙钟→队列位置映射：30 分钟前 → 各队列队首（Σ=0）；10 分钟后 → 越过全部消息（Σ=12）
+     旧实现把墙钟串当 epoch 解析会把两个方向同时翻转。
 """
 from __future__ import annotations
 
@@ -34,6 +38,8 @@ TOPIC = "LiteLive_%d" % STAMP
 GROUP1 = "LitePG1_%d" % STAMP
 GROUP2 = "LitePG2_%d" % STAMP
 GROUP3 = "LitePG3_%d" % STAMP
+GROUP4 = "LitePG4_%d" % STAMP
+GROUP5 = "LitePG5_%d" % STAMP
 N_MSG = 12
 QUEUE_NUM = 4
 TAG_A = {("lite-%02d" % i).encode() for i in range(0, N_MSG, 2)}   # 偶数下标 → TagA，共 6 条
@@ -185,6 +191,45 @@ def main() -> int:
     check("S5 仅收 TagA 且恰好 6 条", only_a,
           "got=%d set_ok=%s" % (len(got3), got3_bytes <= TAG_A))
     c3.shutdown()
+
+    # ===== S6 CONSUME_FROM_TIMESTAMP：14 位本地墙钟 =====
+    print("\nS6 CONSUME_FROM_TIMESTAMP：墙钟起点收全 + 时间戳→位点映射")
+    wall = int(time.time() * 1000)
+
+    def wall_clock(delta_ms: int) -> str:
+        return time.strftime("%Y%m%d%H%M%S", time.localtime((wall + delta_ms) / 1000))
+
+    c4 = DefaultLitePullConsumer(GROUP4)
+    c4.set_namesrv_addr(NAMESRV)
+    c4.set_poll_timeout_millis(1000)
+    c4.consume_from_where = ConsumeFromWhere.CONSUME_FROM_TIMESTAMP
+    c4.consume_timestamp = wall_clock(-30 * 60 * 1000)
+    c4.subscribe(TOPIC, "*")
+    c4.start()
+    wait_assignment(c4)
+    got4 = drain(c4, N_MSG)
+    got4_bytes = {bytes(m.body) for m in got4}
+    check("S6a 起点=%s 早于全部消息 → 收全 %d 条" % (c4.consume_timestamp, N_MSG),
+          got4_bytes == sent, "got=%d" % len(got4_bytes))
+    c4.shutdown()
+
+    c5 = DefaultLitePullConsumer(GROUP5)
+    c5.set_namesrv_addr(NAMESRV)
+    c5.set_poll_timeout_millis(1000)
+    c5.consume_from_where = ConsumeFromWhere.CONSUME_FROM_TIMESTAMP
+    c5.consume_timestamp = wall_clock(10 * 60 * 1000)
+    c5.subscribe(TOPIC, "*")
+    c5.start()
+    q5 = wait_assignment(c5)
+    # 不断言「未来时间戳收不到消息」：Java 的 RebalanceLitePullImpl 先读已提交位点，
+    # 新组只要队首仍在 commitlog 内，broker 就直接回 0，consume_from_where 不参与。
+    # 墙钟真正影响的是「时间戳 → 队列位置」的映射，所以断言这个量。
+    sum_past = sum(c5.offset_for_timestamp(mq, wall - 30 * 60 * 1000) for mq in q5)
+    sum_future = sum(c5.offset_for_timestamp(mq, wall + 10 * 60 * 1000) for mq in q5)
+    check("S6b 30 分钟前 → 各队列队首", sum_past == 0, "sumOffset=%d" % sum_past)
+    check("S6b 10 分钟后 → 越过全部 %d 条" % N_MSG, sum_future == N_MSG,
+          "sumOffset=%d" % sum_future)
+    c5.shutdown()
 
     c1.shutdown()
     print("\nLitePullConsumer: PASS=%d FAIL=%d" % (PASS, FAIL))
