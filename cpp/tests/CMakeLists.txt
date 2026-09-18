@@ -95,3 +95,8 @@ if(EXISTS "${RMQ_PY_VENV}")
              COMMAND ${RMQ_PY_VENV} ${CMAKE_CURRENT_SOURCE_DIR}/interop_check.py
                      $<TARGET_FILE:rmq_interop>)
 endif()
+
+# 轻量拉取消费者（DefaultLitePullConsumer）：start 前纯状态行为 + 221/309 body wire 形状
+add_executable(rmq_test_lite_pull test_lite_pull.cpp)
+target_link_libraries(rmq_test_lite_pull PRIVATE rocketmq::remoting)
+add_test(NAME lite_pull COMMAND rmq_test_lite_pull)

@@ -33,6 +33,10 @@ target_link_libraries(rmq_live_tls PRIVATE rocketmq::remoting)
 add_executable(rmq_live_pull live_pull.cpp)
 target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
 
+# 轻量拉取消费者（DefaultLitePullConsumer）真机联调：subscribe/assign 双模式 + poll
+add_executable(rmq_live_lite_pull live_lite_pull.cpp)
+target_link_libraries(rmq_live_lite_pull PRIVATE rocketmq::remoting)
+
 # Request-Reply（5.x）真机联调（请求 → 应答 → 326 推回；不打进 ctest）
 add_executable(rmq_live_request_reply live_rr.cpp)
 target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)

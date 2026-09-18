@@ -35,6 +35,7 @@ internal static class Program
                 "redelivery" => LiveRedelivery.Run(rest),
                 "acl" => LiveAcl.Run(rest),
                 "pull" => LivePull.Run(rest),
+                "lite-pull" => LiveLitePull.Run(rest),
                 "rr" => LiveRR.Run(rest),
                 "reqreply" => LiveRR.Run(rest),
                 "latency" => LiveLatency.Run(rest),
