@@ -19,6 +19,10 @@ dotnet/**/obj/
 .coverage
 htmlcov/
 
+# Rust
+rust/target/
+**/*.rs.bk
+
 # IDE
 .idea/
 .vscode/

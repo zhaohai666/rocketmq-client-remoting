@@ -1,0 +1,29 @@
+[package]
+name = "rocketmq-client-remoting"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Apache RocketMQ 经典 remoting 协议客户端（Rust / tokio），对齐 Java 5.x 与本仓库 Python 参考实现"
+
+[lib]
+name = "rocketmq_client_remoting"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
+lz4_flex = { version = "0.14", features = ["frame"] }
+zstd = "0.13"
+chrono = "0.4"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+native-tls = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+[profile.release]
+debug = true
