@@ -139,6 +139,25 @@ class TestLifecycle:
         assert c.pull_batch_size == 32
         assert c.poll_timeout_millis == 5000
         assert c.consume_from_where == "CONSUME_FROM_LAST_OFFSET"
+        # Java DefaultLitePullConsumer.java:168：默认 now-30min 的 14 位 yyyyMMddHHmmss
+        assert len(c.consume_timestamp) == 14
+        assert c.consume_timestamp.isdigit()
+
+    def test_consume_timestamp_must_be_wall_clock(self):
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.assign([MessageQueue("T", "broker-a", 0)])
+        # 纯数字的 epoch 毫秒必须被拒（旧实现按 epoch 解释，静默算出错位起点）
+        c.set_consume_timestamp("1700000000000")
+        with pytest.raises(MQClientException, match="consumeTimestamp is invalid"):
+            c.start()
+        # 合法值不能被这条启动守卫误杀
+        c.set_consume_timestamp("20230101000000")
+        c.start()
+        try:
+            assert c._started is True
+        finally:
+            c.shutdown()
 
 
 class TestAssignMode:

@@ -33,6 +33,18 @@ public class LoggingTests : IDisposable
         @"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) (DEBUG|INFO |WARN |ERROR) \[\d+\] \[([^\]]+)\] \[[^\]]+:\d+\] - (.*)$",
         RegexOptions.Compiled);
 
+    // ClientLog 全程持有写句柄，而 Windows 双向校验共享模式：File.ReadAllLines 以
+    // FileShare.Read 打开会判为与写句柄冲突。必须像 `tail -f` 那样以 ReadWrite 共享读取。
+    private static string[] ReadAllLinesShared(string path)
+    {
+        using FileStream fs = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using StreamReader sr = new(fs);
+        var lines = new List<string>();
+        string? line;
+        while ((line = sr.ReadLine()) is not null) lines.Add(line);
+        return lines.ToArray();
+    }
+
     [Fact]
     public void LineFormat_MatchesJavaStyle()
     {
@@ -42,7 +54,7 @@ public class LoggingTests : IDisposable
         ClientLog.Info("hello-测试");
         ClientLog.FlushLogFile();
 
-        string[] lines = File.ReadAllLines(path);
+        string[] lines = ReadAllLinesShared(path);
         Assert.Single(lines);
         Match m = LineRegex.Match(lines[0]);
         Assert.True(m.Success, "line format mismatch: " + lines[0]);
@@ -85,7 +97,7 @@ public class LoggingTests : IDisposable
         ClientLog.Warn("visible");
         ClientLog.FlushLogFile();
 
-        string[] lines = File.ReadAllLines(path);
+        string[] lines = ReadAllLinesShared(path);
         Assert.Single(lines);
         Assert.Contains("- visible", lines[0]);
     }
@@ -120,7 +132,7 @@ public class LoggingTests : IDisposable
         Assert.True(baseSize <= 2000, "base file should be capped at maxSize");
 
         // 备份文件内容也应是完整行
-        string[] backupLines = File.ReadAllLines(backup1);
+        string[] backupLines = ReadAllLinesShared(backup1);
         Assert.All(backupLines, l => Assert.Matches(LineRegex, l));
     }
 }

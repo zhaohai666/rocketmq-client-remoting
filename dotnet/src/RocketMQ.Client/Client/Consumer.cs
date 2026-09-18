@@ -2647,7 +2647,8 @@ public sealed class DefaultMQPushConsumer
     private string LocalOffsetPath()
     {
         // Java LocalFileOffsetStore：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
-        string home = Environment.GetEnvironmentVariable("HOME") is { Length: > 0 } h ? h : ".";
+        string home = UtilAll.UserHome();
+        if (home.Length == 0) home = ".";
         return home + "/.rocketmq_offsets/" + (_clientId.Length == 0 ? "DEFAULT" : _clientId)
             + "/" + ConsumerGroup + "/offsets.json";
     }

@@ -104,8 +104,10 @@ public class RequestReplyTests
     [Fact]
     public void FutureWaitTimesOutReturnsNull()
     {
-        var f = new RequestResponseFuture("c1", 50);
-        Assert.Null(f.WaitResponseMessage(50));
+        // 等待预算必须明显大于 future 的超时预算：IsTimeout 用的是严格大于（同 Java），
+        // 而系统等待可能比截止时刻早一丁点返回，两者相等时忙机上这条断言会抖。
+        var f = new RequestResponseFuture("c1", 20);
+        Assert.Null(f.WaitResponseMessage(200));
         Assert.True(f.IsTimeout());
     }
 

@@ -6,6 +6,7 @@ RemotingClient(tls_enable=True) 能完成握手并按 RocketMQ 帧收发；
 以及 TLS 客户端打到明文端口必须报 RemotingConnectException。
 """
 import os
+import shutil
 import socket
 import ssl
 import struct
@@ -77,10 +78,15 @@ def test_inject_does_not_overwrite_and_extract_roundtrip():
 @pytest.fixture(scope="module")
 def tls_cert():
     """用 openssl CLI 生成一张自签证书（server 侧用）。"""
+    exe = shutil.which("openssl")
+    if exe is None:
+        exe = next((p for p in ("/usr/local/bin/openssl", "/usr/bin/openssl")
+                    if os.path.exists(p)), None)
+    if exe is None:
+        pytest.skip("openssl CLI not found; TLS transport test needs it to mint a cert")
     d = tempfile.mkdtemp(prefix="rmq_tls_")
     cert = os.path.join(d, "cert.pem")
     key = os.path.join(d, "key.pem")
-    exe = "/usr/local/bin/openssl" if os.path.exists("/usr/local/bin/openssl") else "/usr/bin/openssl"
     subprocess.run(
         [exe, "req", "-x509", "-newkey", "rsa:2048", "-keyout", key, "-out", cert,
          "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1"],
@@ -102,6 +108,12 @@ class TlsFrameServer:
         self._thread.start()
 
     def _loop(self):
+        """accept 循环。
+
+        每条连接单独起线程服务：若在 accept 线程里内联执行，服务端一次只服务一条连接，
+        全套件跑时别的用例残留的连接（端口复用）会把 accept 线程卡死，而 Windows 下
+        connect() 打进 backlog 是成功的——于是真正的客户端只会等满 15s 超时。
+        """
         try:
             while True:
                 conn, _ = self._listen.accept()
@@ -110,9 +122,9 @@ class TlsFrameServer:
                 except (OSError, ssl.SSLError):
                     conn.close()
                     continue
-                self._serve(tls)
+                threading.Thread(target=self._serve, args=(tls,), daemon=True).start()
         except OSError:
-            pass
+            pass  # stop() 关掉监听套接字
 
     def _serve(self, tls):
         try:

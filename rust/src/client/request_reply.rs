@@ -453,9 +453,10 @@ mod tests {
 
     #[tokio::test]
     async fn wait_times_out_and_is_timeout() {
-        let f = RequestResponseFuture::new("c1", 50);
-        assert!(f.wait_response_message(50).await.is_none());
-        // begin_timestamp 刚写下，50ms 的预算在等待后必然已超
+        // 等待预算必须明显大于 future 的超时预算：is_timeout 用的是严格大于（同 Java），
+        // 而定时器可能比截止时刻早一丁点触发，两者相等时忙机上这条断言会抖。
+        let f = RequestResponseFuture::new("c1", 20);
+        assert!(f.wait_response_message(200).await.is_none());
         assert!(f.is_timeout());
     }
 

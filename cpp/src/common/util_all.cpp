@@ -10,6 +10,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -224,6 +225,14 @@ std::string UtilAll::localIp() {
         return std::string(host);
     }
     return "127.0.0.1";
+}
+
+std::string UtilAll::userHome() {
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && *home != '\0') return std::string(home);
+    const char* profile = std::getenv("USERPROFILE");  // Windows 下 Java user.home 的来源
+    if (profile != nullptr && *profile != '\0') return std::string(profile);
+    return std::string();
 }
 
 std::string UtilAll::nextMillisString() {

@@ -90,8 +90,10 @@ def test_correlation_id_is_random():
 
 
 def test_future_wait_times_out_returns_none():
-    f = RequestResponseFuture("c1", 50)
-    assert f.wait_response_message(50) is None
+    # 等待预算必须明显大于 future 的超时预算：is_timeout 用的是严格大于（同 Java），
+    # 而系统等待可能比截止时刻早一丁点返回，两者相等时忙机上这条断言会抖。
+    f = RequestResponseFuture("c1", 20)
+    assert f.wait_response_message(200) is None
     assert f.is_timeout() is True
 
 

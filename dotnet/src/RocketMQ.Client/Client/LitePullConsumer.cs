@@ -43,7 +43,10 @@ public sealed class DefaultLitePullConsumer
     private string _clientId = string.Empty;
     private string _messageModel = MessageModel.Clustering;
     private string _consumeFromWhere = ConsumeFromWhere.ConsumeFromLastOffset;
-    private string _consumeTimestamp = string.Empty;
+    // Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
+    // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
+    private string _consumeTimestamp =
+        UtilAll.TimeMillisToHumanString3(UtilAll.CurrentTimeMillis() - 30 * 60 * 1000);
     private readonly List<string> _nameServerAddrs = new();
     private IRpcHook? _rpcHook;
 
@@ -128,6 +131,9 @@ public sealed class DefaultLitePullConsumer
     public void SetConsumeFromWhere(string where) => _consumeFromWhere = where;
 
     public void SetConsumeTimestamp(string ts) => _consumeTimestamp = ts;
+
+    /// <summary>对应 Java DefaultLitePullConsumer.getConsumeTimestamp：默认「now - 30 分钟」的 yyyyMMddHHmmss。</summary>
+    public string ConsumeTimestamp => _consumeTimestamp;
 
     public void SetPullBatchSize(int n) => _pullBatchSize = Math.Max(1, n);
 
@@ -227,6 +233,10 @@ public sealed class DefaultLitePullConsumer
             {
                 throw new MQClientException("subscription is not set, call Subscribe() or Assign() first");
             }
+
+            // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验，
+            // 而不是等到算起点时抛出、被下层 catch 吞掉后静默退化成从 max offset 消费。
+            ParseConsumeTimestamp(_consumeTimestamp);
 
             if (_clientId.Length == 0)
             {
@@ -501,7 +511,7 @@ public sealed class DefaultLitePullConsumer
 
         if (_consumeFromWhere == ConsumeFromWhere.ConsumeFromTimestamp)
         {
-            return RequireClient().SearchOffsetByTimestamp(mq, ParseTimestamp(_consumeTimestamp));
+            return RequireClient().SearchOffsetByTimestamp(mq, ParseConsumeTimestamp(_consumeTimestamp));
         }
 
         return RequireClient().GetMaxOffset(mq);
@@ -824,15 +834,19 @@ public sealed class DefaultLitePullConsumer
         return outAddrs;
     }
 
-    // 对应 Python _parse_timestamp：形如 "20230101000000" 或毫秒/秒时间戳。
-    private static long ParseTimestamp(string ts)
+    // 对应 Java UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)：该字段**只**是 14 位本地墙钟日期。
+    // 旧实现完全不解析日期，把任何纯数字串当 epoch 秒/毫秒，"20230101000000" 会被解释成
+    // 公元 2611 年，起点彻底错位。
+    private static long ParseConsumeTimestamp(string ts)
     {
-        if (string.IsNullOrEmpty(ts)) return UtilAll.CurrentTimeMillis();
-        if (long.TryParse(ts, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v))
+        if (ts is { Length: 14 }
+            && DateTimeOffset.TryParseExact(ts, "yyyyMMddHHmmss", CultureInfo.InvariantCulture,
+                   DateTimeStyles.None, out DateTimeOffset dt))
         {
-            return v < 1000000000000L ? v * 1000 : v;
+            return dt.ToUnixTimeMilliseconds();
         }
 
-        return UtilAll.CurrentTimeMillis();
+        throw new MQClientException(
+            "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received " + ts);
     }
 }

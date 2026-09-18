@@ -93,6 +93,8 @@ public:
 
     const std::string& consumerGroup() const { return consumerGroup_; }
     const std::string& clientId() const { return clientId_; }
+    // 对应 Java DefaultLitePullConsumer.getConsumeTimestamp：默认「now - 30 分钟」的 yyyyMMddHHmmss。
+    const std::string& consumeTimestamp() const { return consumeTimestamp_; }
     const std::string& namespaceOf() const { return namespace_; }
     bool isStarted() const { return started_; }
     bool isRunning() const { return running_; }

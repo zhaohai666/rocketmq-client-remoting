@@ -296,6 +296,25 @@ public static class UtilAll
         CurrentTimeMillis().ToString(CultureInfo.InvariantCulture);
 
     /// <summary>
+    /// Java <c>System.getProperty("user.home")</c>：POSIX 取 HOME，Windows 取 USERPROFILE。
+    /// 只读 HOME 会让日志文件与本地位点快照在 Windows 上静默落空。
+    /// </summary>
+    public static string UserHome()
+    {
+        string home = Environment.GetEnvironmentVariable("HOME") ?? string.Empty;
+        if (home.Length == 0)
+        {
+            home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        }
+        return home;
+    }
+
+    /// <summary>Java UtilAll.timeMillisToHumanString3：本地时区的 14 位 "yyyyMMddHHmmss"。</summary>
+    public static string TimeMillisToHumanString3(long ts) =>
+        DateTimeOffset.FromUnixTimeMilliseconds(ts).LocalDateTime
+            .ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
+
+    /// <summary>
     /// 生成 32 位十六进制唯一 ID（对应 Java MessageClientIDSetter.createUniqID / setUniqID）。
     /// 发送前写到消息属性 <c>UNIQ_KEY</c>，作为 SendResult.MsgId 与轨迹 msgId 的源头。
     /// </summary>

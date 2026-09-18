@@ -91,13 +91,22 @@ std::uintmax_t envUmax(const char* name) {
     return static_cast<std::uintmax_t>(std::strtoull(v, nullptr, 10));
 }
 
+// ::setenv 是 POSIX 专有，MSVC 下不存在（只有 _putenv_s），Windows 原生构建会直接编译失败。
+void setEnvVar(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, 1);
+#endif
+}
+
 }  // namespace
 
 int main() {
     // ---- 必须在第一次日志调用之前设置：logging.h 的静态缓存取首次读到的环境变量 ----
-    ::setenv("ROCKETMQ_CPP_LOG_FILE_MAX_SIZE", "1200", 1);
-    ::setenv("ROCKETMQ_CPP_LOG_FILE_MAX_INDEX", "3", 1);
-    ::setenv("ROCKETMQ_CPP_LOG_LEVEL", "INFO", 1);
+    setEnvVar("ROCKETMQ_CPP_LOG_FILE_MAX_SIZE", "1200");
+    setEnvVar("ROCKETMQ_CPP_LOG_FILE_MAX_INDEX", "3");
+    setEnvVar("ROCKETMQ_CPP_LOG_LEVEL", "INFO");
 
     // 环境变量确实被解析到了（而不是静默回落默认值 64MB/10）
     CHECK(logFileMaxSize() == kTestMaxSize, "env max size honored");

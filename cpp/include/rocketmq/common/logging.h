@@ -158,7 +158,8 @@ inline std::string defaultLogFilePath() {
         return s;
     }
     const char* home = std::getenv("HOME");
-    if (home == nullptr) return std::string();
+    if (home == nullptr || *home == '\0') home = std::getenv("USERPROFILE");  // Windows: Java user.home
+    if (home == nullptr || *home == '\0') return std::string();
     // 文件名刻意与 Java 的 rocketmq_client.log 区分：同机同时跑 Java 客户端时
     // 两边轮转策略不同，写同一文件会互相插行、互相截断。
     return std::string(home) + "/logs/rocketmqlogs/rocketmq_cpp_client.log";
@@ -184,7 +185,9 @@ inline bool openLogSinkLocked(LogFileSink& sink) {
     if (!p.parent_path().empty()) {
         std::filesystem::create_directories(p.parent_path(), ec);
     }
-    sink.fp = std::fopen(sink.path.c_str(), "a");
+    // "ab" 而不是 "a"：Windows 的文本模式会把 '\n' 改写成 "\r\n"，既让落盘行格式与
+    // 其它平台不一致，又让轮转用的字节数（fprintf 返回值，翻译前）与真实文件大小脱钩。
+    sink.fp = std::fopen(sink.path.c_str(), "ab");
     if (sink.fp == nullptr) {
         // 静默降级为仅 stderr（不阻断客户端），但只提示一次
         sink.openFailed = true;

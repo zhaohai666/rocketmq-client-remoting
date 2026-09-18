@@ -72,6 +72,14 @@ pub fn get_pid() -> u32 {
     std::process::id()
 }
 
+/// Java `System.getProperty("user.home")`：Windows 下该目录在 `USERPROFILE` 里，
+/// 只读 `HOME` 会让日志与本地位点文件在 Windows 上静默落空。
+pub fn user_home() -> Option<String> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+}
+
 pub fn is_ipv4(addr: &str) -> bool {
     addr.parse::<std::net::Ipv4Addr>().is_ok()
 }

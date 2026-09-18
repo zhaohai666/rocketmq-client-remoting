@@ -60,10 +60,7 @@ impl Config {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .filter(|h| !h.is_empty())
-                    .map(|h| format!("{h}/logs/rocketmqlogs"))
+                crate::common::util_all::user_home().map(|h| format!("{h}/logs/rocketmqlogs"))
             })
             .unwrap_or_else(|| "logs/rocketmqlogs".to_string());
         let file_name = std::env::var("ROCKETMQ_CLIENT_LOG_FILE")

@@ -87,6 +87,53 @@ static void testLitePullPreStartBehavior() {
     ++g_pass;
 }
 
+// ---------------------------------------------------------------- consumeTimestamp（Java 格式）
+static void testLitePullConsumeTimestamp() {
+    DefaultLitePullConsumer c;
+    // Java DefaultLitePullConsumer.java:168：默认是 now-30min 的 14 位 yyyyMMddHHmmss，不是空串
+    CHECK_EQ(c.consumeTimestamp().size(), static_cast<size_t>(14), "默认 consumeTimestamp 14 位");
+    bool allDigit = !c.consumeTimestamp().empty();
+    for (char ch : c.consumeTimestamp()) {
+        if (ch < '0' || ch > '9') allDigit = false;
+    }
+    CHECK(allDigit, "默认 consumeTimestamp 全是数字");
+
+    c.setNamesrvAddr("127.0.0.1:1");
+    c.subscribe("MyTopic", "*");
+    // 纯数字的 epoch 毫秒必须被拒（旧实现按 epoch 解释，静默算出错位起点）
+    c.setConsumeTimestamp("1700000000000");
+    std::string what;
+    bool threw = false;
+    try {
+        c.start();
+    } catch (const MQClientException& e) {
+        threw = true;
+        what = e.what();
+    } catch (...) {
+        threw = true;
+        what = "<not MQClientException>";
+    }
+    CHECK(threw, "非法 consumeTimestamp 时 start() 抛异常");
+    CHECK(what.find("consumeTimestamp is invalid") != std::string::npos,
+          "异常文案对齐 Java checkConfig");
+
+    // 合法值不能被这条守卫误杀（namesrv 不可达是另一回事）
+    DefaultLitePullConsumer ok;
+    ok.setNamesrvAddr("127.0.0.1:1");
+    ok.subscribe("MyTopic", "*");
+    ok.setConsumeTimestamp("20230101000000");
+    std::string okWhat;
+    try {
+        ok.start();
+    } catch (const MQClientException& e) {
+        okWhat = e.what();
+    } catch (...) {
+    }
+    CHECK(okWhat.find("consumeTimestamp is invalid") == std::string::npos,
+          "合法 consumeTimestamp 不被误杀");
+    ok.shutdown();
+}
+
 // ---------------------------------------------------------------- 221 GetConsumerStatusBody
 static void testGetConsumerStatusBodyWireShape() {
     GetConsumerStatusBody b;
@@ -146,6 +193,7 @@ static void testConsumeMessageDirectlyResult() {
 
 int main() {
     testLitePullPreStartBehavior();
+    testLitePullConsumeTimestamp();
     testGetConsumerStatusBodyWireShape();
     testConsumeMessageDirectlyResult();
     std::cout << "lite_pull: " << g_pass << " passed, " << g_fail << " failed\n";

@@ -483,17 +483,22 @@ fn default_consume_timestamp() -> String {
     past.format("%Y%m%d%H%M%S").to_string()
 }
 
-/// Python `_consume_timestamp_millis`：解析失败回落到「现在 - 30 分钟」。
+/// Java `UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)`：该字段**只**是 14 位本地墙钟日期。
 ///
 /// 与 Python 同用**本地时区**（`time.mktime` / `chrono::Local`），否则
-/// `CONSUME_FROM_TIMESTAMP` 的起点会差一个时区。
-fn consume_timestamp_millis(text: &str) -> i64 {
+/// `CONSUME_FROM_TIMESTAMP` 的起点会差一个时区。解析不了必须硬失败（Java 在 start 时抛
+/// `consumeTimestamp is invalid`）——静默回落到「现在 - 30 分钟」会让起点错位无人察觉。
+fn consume_timestamp_millis(text: &str) -> Result<i64> {
     use chrono::TimeZone;
     chrono::NaiveDateTime::parse_from_str(text, "%Y%m%d%H%M%S")
         .ok()
         .and_then(|naive| chrono::Local.from_local_datetime(&naive).single())
         .map(|dt| dt.timestamp_millis())
-        .unwrap_or_else(|| current_time_millis() - 30 * 60 * 1000)
+        .ok_or_else(|| {
+            Error::client(format!(
+                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received {text}"
+            ))
+        })
 }
 
 // ================================================================ 内部可变状态
@@ -1579,7 +1584,7 @@ async fn resolve_initial_offset(
         return client.get_min_offset(mq, 5000, None).await;
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
-        let ts = consume_timestamp_millis(&cfg.consume_timestamp);
+        let ts = consume_timestamp_millis(&cfg.consume_timestamp)?;
         return client.search_offset_by_timestamp(mq, ts, 5000, None).await;
     }
     if NamespaceUtil::is_retry_topic(&mq.topic) {
@@ -2079,10 +2084,10 @@ async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
 /// `$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json`）。
 fn local_offset_path(inner: &Inner) -> Option<std::path::PathBuf> {
     let cfg = read_cfg(inner);
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return None;
-    }
+    let home = match crate::common::util_all::user_home() {
+        Some(h) => h,
+        None => return None,
+    };
     let base = std::path::Path::new(&home)
         .join(".rocketmq_offsets")
         .join(cfg.client_id.as_deref().unwrap_or("DEFAULT"))
@@ -3544,10 +3549,26 @@ mod tests {
         assert_eq!(cfg.trace_msg_batch_num, 10);
         // CONSUME_FROM_TIMESTAMP 的起点：默认「30 分钟前」，格式 yyyyMMddHHmmss
         assert_eq!(cfg.consume_timestamp.len(), 14);
-        let past = consume_timestamp_millis(&cfg.consume_timestamp);
+        let past = consume_timestamp_millis(&cfg.consume_timestamp).unwrap();
         assert!((past..current_time_millis()).contains(&(current_time_millis() - 1000)));
-        // 解析不了的字符串回落到「现在 - 30 分钟」，不报错
-        assert!(current_time_millis() - consume_timestamp_millis("not-a-time") >= 29 * 60 * 1000);
+        // 回归守卫：14 位纯数字是**本地墙钟日期**，不能被当成 epoch（否则是公元 2611 年）
+        let expected = {
+            use chrono::TimeZone;
+            chrono::Local
+                .with_ymd_and_hms(2023, 1, 1, 0, 0, 0)
+                .single()
+                .expect("local 2023-01-01 00:00:00 should resolve")
+        };
+        assert_eq!(
+            consume_timestamp_millis("20230101000000").unwrap(),
+            expected.timestamp_millis()
+        );
+        // 解析不了的字符串必须硬失败（Java checkConfig :1058），不能静默回落
+        let err = consume_timestamp_millis("not-a-time").unwrap_err();
+        assert!(
+            format!("{err}").contains("consumeTimestamp is invalid"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

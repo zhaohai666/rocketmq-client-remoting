@@ -1718,8 +1718,8 @@ void DefaultMQPushConsumer::persistOffsetsOnce() {
 
 std::string DefaultMQPushConsumer::localOffsetPath() const {
     // Java LocalFileOffsetStore：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
-    const char* home = std::getenv("HOME");
-    std::string base = (home != nullptr && *home != '\0') ? std::string(home) : std::string(".");
+    std::string base = UtilAll::userHome();
+    if (base.empty()) base = ".";
     return base + "/.rocketmq_offsets/" + (clientId_.empty() ? "DEFAULT" : clientId_)
            + "/" + consumerGroup_ + "/offsets.json";
 }

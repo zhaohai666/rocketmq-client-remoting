@@ -408,15 +408,21 @@ class DefaultMQPushConsumer:
     def set_consume_timestamp(self, timestamp: str) -> None:
         """设置 CONSUME_FROM_TIMESTAMP 的起点时间（对应 Java setConsumeTimestamp）。
 
-        格式 ``yyyyMMddHHmmss``（Java UtilAll.YYYY_MM_DD_HH_MM_SS），默认 30 分钟前。
+        格式 ``yyyyMMddHHmmss``（Java UtilAll.YYYYMMDDHHMMSS），默认 30 分钟前。
         """
         self.consume_timestamp = timestamp
 
     def _consume_timestamp_millis(self) -> int:
+        # 对应 Java UtilAll.parseDate(ts, YYYYMMDDHHMMSS)：解析不了必须硬失败——静默回落到
+        # 「现在 - 30 分钟」会让起点错位无人察觉（Java 在 checkConfig :1058 就抛）。
         try:
+            if len(str(self.consume_timestamp)) != 14:
+                raise ValueError(self.consume_timestamp)
             return int(time.mktime(time.strptime(self.consume_timestamp, "%Y%m%d%H%M%S")) * 1000)
-        except (ValueError, TypeError):
-            return int(time.time() * 1000 - 30 * 60 * 1000)
+        except (ValueError, TypeError, OverflowError):
+            raise MQClientException(
+                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received %s"
+                % self.consume_timestamp)
 
     def set_consume_thread_nums(self, n: int) -> None:
         """便捷方法：min 与 max 一起设（Java 4.x ``setConsumeThreadNums`` 的语义）。
@@ -693,6 +699,9 @@ class DefaultMQPushConsumer:
                 raise MQClientException("subscription is not set, call subscribe() first")
             if self.message_listener is None:
                 raise MQClientException("message listener is not set")
+            # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验起点时间，
+            # 而不是等到 rebalance 里抛错、被 compute_pull_from_where 的兜底吞掉。
+            self._consume_timestamp_millis()
             # 消费组也拼命名空间（对齐 Java DefaultMQPushConsumer.start:763
             # setConsumerGroup(withNamespace(consumerGroup))）。必须在算重试主题之前：
             # 重试主题 = %RETRY% + 带前缀的组名（Java MixAll.getRetryTopic(wrappedGroup)）。
@@ -2263,7 +2272,10 @@ class DefaultLitePullConsumer:
 
         # 拉取 / poll 配置
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
-        self.consume_timestamp = ""
+        # Java DefaultLitePullConsumer.consumeTimestamp 字段初值：now - 30 分钟。
+        # 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
+        self.consume_timestamp = time.strftime(
+            "%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
         self.pull_batch_size = 32
         self.poll_timeout_millis = 5000
         self.auto_commit = True
@@ -2402,6 +2414,9 @@ class DefaultLitePullConsumer:
             raise MQClientException("name server address is not set")
         if not self.subscription and not self._assign_mode:
             raise MQClientException("subscription is not set, call subscribe() or assign() first")
+        # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验。
+        # 下面解析初始位点的循环会吞异常，晚抛等于静默退化成从 max offset 消费。
+        self._parse_consume_timestamp(self.consume_timestamp)
         if self.client_id is None:
             self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
         self._mq_client = self._create_client()
@@ -2596,25 +2611,21 @@ class DefaultLitePullConsumer:
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
             return self._mq_client.get_min_offset(mq)
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
-            ts = self._parse_timestamp(self.consume_timestamp)
+            ts = self._parse_consume_timestamp(self.consume_timestamp)
             return self._mq_client.search_offset_by_timestamp(mq, ts)
         return self._mq_client.get_max_offset(mq)
 
-    @staticmethod
-    def _parse_timestamp(ts: str) -> int:
-        # 形如 "20230101000000" 或毫秒/秒时间戳
-        if ts is None or not str(ts).strip():
-            return int(time.time() * 1000)
-        s = str(ts).strip()
-        if s.isdigit():
-            v = int(s)
-            return v * 1000 if v < 1_000_000_000_000 else v
+    def _parse_consume_timestamp(self, ts: str) -> int:
+        # 对应 Java UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)：该字段**只**是 14 位本地
+        # 墙钟日期。旧实现先走 isdigit() 分支把纯数字当 epoch 秒/毫秒，"20230101000000"
+        # 因此被解释成公元 2611 年，而下面的 strptime 分支永远不可达。
         try:
-            import datetime
-            dt = datetime.datetime.strptime(s, "%Y%m%d%H%M%S")
-            return int(dt.timestamp() * 1000)
-        except Exception:
-            return int(time.time() * 1000)
+            if len(str(ts)) != 14:
+                raise ValueError(ts)
+            return int(time.mktime(time.strptime(str(ts), "%Y%m%d%H%M%S")) * 1000)
+        except (ValueError, TypeError, OverflowError):
+            raise MQClientException(
+                "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received %s" % ts)
 
     # ---------------- rebalance（subscribe 模式）----------------
     def _rebalance(self) -> None:

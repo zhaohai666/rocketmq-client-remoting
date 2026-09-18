@@ -160,11 +160,7 @@ public static class ClientLog
             return env;
         }
 
-        string? home = Environment.GetEnvironmentVariable("HOME");
-        if (string.IsNullOrEmpty(home))
-        {
-            home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        }
+        string home = UtilAll.UserHome();
         if (string.IsNullOrEmpty(home)) return "";
         return Path.Combine(home, "logs", "rocketmqlogs", "rocketmq_cpp_client.log");
     }
@@ -320,7 +316,11 @@ public static class ClientLog
             string? dir = Path.GetDirectoryName(Sink.Path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-            Sink.Writer = new StreamWriter(Sink.Path, append: true, Utf8NoBom);
+            // FileShare.ReadWrite：Windows 是强制锁，默认的 FileShare.Read 会让 tail 式并发读
+            // 直接抛 IOException（POSIX 下无强制锁所以只在 Windows 暴露）。
+            Sink.Writer = new StreamWriter(
+                new FileStream(Sink.Path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),
+                Utf8NoBom);
             long existing = 0;
             try
             {

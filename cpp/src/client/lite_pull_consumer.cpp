@@ -1,6 +1,7 @@
 #include "rocketmq/client/lite_pull_consumer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <ctime>
 #include <optional>
 #include <utility>
@@ -39,27 +40,53 @@ int64_t nowMillis() {
         .count();
 }
 
-// 对应 Python _parse_timestamp：形如 "20230101000000" 或毫秒/秒时间戳。
-int64_t parseTimestamp(const std::string& ts) {
-    if (ts.empty()) return nowMillis();
-    bool allDigit = true;
-    for (char c : ts) {
-        if (c < '0' || c > '9') { allDigit = false; break; }
-    }
-    if (allDigit) {
-        int64_t v = 0;
-        try {
-            v = std::stoll(ts);
-        } catch (...) {
-            return nowMillis();
+// Java UtilAll.timeMillisToHumanString3：本地时区的 14 位 "yyyyMMddHHmmss"。
+std::string timeMillisToHumanString3(int64_t t) {
+    std::time_t sec = static_cast<std::time_t>(t / 1000);
+    std::tm tmv {};
+#if defined(_WIN32)
+    if (localtime_s(&tmv, &sec) != 0) return std::string();
+#else
+    if (localtime_r(&sec, &tmv) == nullptr) return std::string();
+#endif
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%04d%02d%02d%02d%02d%02d", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                  tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return std::string(buf);
+}
+
+// 对应 Java UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)：该字段**只**是 14 位本地墙钟日期。
+// 旧实现把任何纯数字串当 epoch 处理，"20230101000000" 会被解释成公元 2611 年，起点彻底错位；
+// 而它真正想做日期解析的分支用了 strptime/timegm——POSIX 专有，MSVC 下既不可达也编不过。
+int64_t parseConsumeTimestamp(const std::string& ts) {
+    auto invalid = [&ts] {
+        return MQClientException(
+            "consumeTimestamp is invalid, the valid format is yyyyMMddHHmmss,but received " + ts);
+    };
+    if (ts.size() != 14) throw invalid();
+
+    int field[6] = {0, 0, 0, 0, 0, 0};
+    size_t pos = 0;
+    for (int i = 0; i < 6; ++i) {
+        int width = i == 0 ? 4 : 2;
+        for (int k = 0; k < width; ++k) {
+            char c = ts[pos++];
+            if (c < '0' || c > '9') throw invalid();
+            field[i] = field[i] * 10 + (c - '0');
         }
-        return v < 1000000000000LL ? v * 1000 : v;
     }
-    struct tm tm {};
-    if (strptime(ts.c_str(), "%Y%m%d%H%M%S", &tm) != nullptr) {
-        return static_cast<int64_t>(timegm(&tm)) * 1000;
-    }
-    return nowMillis();
+
+    std::tm tmv {};
+    tmv.tm_year = field[0] - 1900;
+    tmv.tm_mon = field[1] - 1;
+    tmv.tm_mday = field[2];
+    tmv.tm_hour = field[3];
+    tmv.tm_min = field[4];
+    tmv.tm_sec = field[5];
+    tmv.tm_isdst = -1;
+    std::time_t sec = std::mktime(&tmv);
+    if (sec == static_cast<std::time_t>(-1)) throw invalid();
+    return static_cast<int64_t>(sec) * 1000;
 }
 
 }  // namespace
@@ -69,6 +96,9 @@ DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGrou
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
+    // 对应 Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
+    // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
+    consumeTimestamp_ = timeMillisToHumanString3(nowMillis() - 30 * 60 * 1000);
 }
 
 DefaultLitePullConsumer::~DefaultLitePullConsumer() {
@@ -133,6 +163,9 @@ void DefaultLitePullConsumer::start() {
     if (subscription_.empty() && !assignMode_) {
         throw MQClientException("subscription is not set, call subscribe() or assign() first");
     }
+    // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验，
+    // 而不是等到算起点时抛出、被下面的 catch(...) 吞掉后静默退化成从 max offset 消费。
+    parseConsumeTimestamp(consumeTimestamp_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }
@@ -328,7 +361,7 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
         return mqClient_->getMinOffset(mq);
     }
     if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
-        return mqClient_->searchOffsetByTimestamp(mq, parseTimestamp(consumeTimestamp_));
+        return mqClient_->searchOffsetByTimestamp(mq, parseConsumeTimestamp(consumeTimestamp_));
     }
     return mqClient_->getMaxOffset(mq);
 }

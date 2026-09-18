@@ -31,6 +31,40 @@ public class LitePullTests
     }
 
     [Fact]
+    public void ConsumeTimestamp_DefaultsToJavaWallClockFormat()
+    {
+        var c = new DefaultLitePullConsumer();
+        // Java DefaultLitePullConsumer.java:168：默认 now-30min 的 14 位 yyyyMMddHHmmss
+        Assert.Equal(14, c.ConsumeTimestamp.Length);
+        Assert.All(c.ConsumeTimestamp, ch => Assert.True(char.IsDigit(ch)));
+    }
+
+    [Fact]
+    public void Start_RejectsEpochLookingConsumeTimestamp()
+    {
+        var c = new DefaultLitePullConsumer();
+        c.SetNamesrvAddr("127.0.0.1:1");
+        c.Subscribe("MyTopic", "*");
+        // 纯数字的 epoch 毫秒必须被拒（旧实现按 epoch 解释，静默算出错位起点）
+        c.SetConsumeTimestamp("1700000000000");
+        var ex = Assert.Throws<MQClientException>(c.Start);
+        Assert.Contains("consumeTimestamp is invalid", ex.Message);
+    }
+
+    [Fact]
+    public void Start_KeepsValidConsumeTimestamp()
+    {
+        var c = new DefaultLitePullConsumer();
+        c.SetNamesrvAddr("127.0.0.1:1");
+        c.Subscribe("MyTopic", "*");
+        c.SetConsumeTimestamp("20230101000000");
+        // 合法值不能被这条启动守卫误杀（namesrv 不可达是另一回事）
+        var ex = Record.Exception(c.Start);
+        Assert.DoesNotContain("consumeTimestamp is invalid", ex?.Message ?? string.Empty);
+        c.Shutdown();
+    }
+
+    [Fact]
     public void Subscribe_Assign_Seek_Poll_BeforeStart_DoesNotCrash()
     {
         var c = new DefaultLitePullConsumer();

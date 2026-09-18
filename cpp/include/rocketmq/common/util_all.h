@@ -50,6 +50,10 @@ struct UtilAll {
 
     static std::string localIp();
 
+    // Java System.getProperty("user.home")：POSIX 取 HOME，Windows 取 USERPROFILE。
+    // 只读 HOME 的话，Windows 上日志与本地位点文件会静默落不到用户目录。
+    static std::string userHome();
+
     // 跨平台的 warmup/pretty 名字
     static std::string nextMillisString();
 };
