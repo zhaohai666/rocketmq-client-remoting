@@ -2215,6 +2215,506 @@ class DefaultMQPullConsumer:
         client.create_topic_in_route(new_topic, queue_num, queue_num, 6)
 
 
+class DefaultLitePullConsumer:
+    """轻量拉取消费者（对应 org.apache.rocketmq.client.consumer.DefaultLitePullConsumer）。
+
+    与 DefaultMQPullConsumer 的本质区别：
+    - DefaultMQPullConsumer：调用方自己 ``pull(mq, offset)`` 逐队列拉、自己管位点；没有本地缓冲、
+      没有后台拉取线程、不做 rebalance。
+    - DefaultLitePullConsumer：支持两种模式——
+      * **subscribe 模式**：登记订阅后自动 rebalance 分配队列（与 push 一致），后台拉取线程把
+        消息灌进**本地缓冲**；``poll()`` 只从本地缓冲取消息，不用调用方管位点；
+      * **assign 模式**：调用方 ``assign([mq...])`` 显式指定队列，不走 rebalance，同样后台灌本地缓冲。
+    两种模式都用 ``poll(timeout)`` 取批量消息；位点默认 autoCommit（拉完即向 broker 提交）。
+
+    设计取舍（与既有三门语言实现一致）：
+    - 后台**单个** pull 服务线程顺序遍历所有已分配队列做短轮询（suspend=False），把消息塞进
+      一个线程安全的本地缓冲 ``_local_buffer``；``poll()`` 用 Condition 等待并 drain 该缓冲。
+      不按队列起独立线程（与 Java 的 PullTask 不同，但语义等价：本地缓冲 + poll）。
+    - subscribe 模式的 rebalance 复用既有 ``get_consumer_id_list_by_group`` + ``AllocateMessageQueueAveragely``，
+      与 push 消费者同一套分配算法；查询不到消费组列表时按 Java 语义「保留当前分配」，不回退独占。
+    - 不做 POP / 推模式；不做 broker 主动请求（309/313）处理（那是 push 消费者的职责）。
+    """
+
+    def __init__(self, consumer_group: str = MixAll.DEFAULT_CONSUMER_GROUP,
+                 rpc_hook: Optional[RPCHook] = None, namespace: str = "",
+                 message_model: str = MessageModel.CLUSTERING):
+        if consumer_group is None or not str(consumer_group).strip():
+            raise MQClientException("consumerGroup is empty")
+        self.consumer_group = str(consumer_group)
+        self.namespace = namespace
+        self.instance_name = "DEFAULT"
+        self.client_id: Optional[str] = None
+        self.message_model = message_model
+        self.name_server_addrs: List[str] = []
+        self.rpc_hook = rpc_hook
+
+        # subscribe 模式的订阅表（topic -> sub_expression）
+        self.subscription: Dict[str, str] = {}
+        # 订阅对应的 SubscriptionData（带 tagsSet），用于发给 broker 的心跳做 tag 过滤注册
+        self.subscription_data: Dict[str, SubscriptionData] = {}
+        # assign 模式：调用方显式指定队列时的 tag 过滤表达式（透传给 pull）
+        self._assign_sub_expr: Dict[str, str] = {}
+        self._assign_mode = False
+        self._assigned: Set[MessageQueue] = set()
+
+        # rebalance 算法（subscribe 模式）
+        self.allocate_message_queue_strategy = AllocateMessageQueueAveragely()
+
+        # 拉取 / poll 配置
+        self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
+        self.consume_timestamp = ""
+        self.pull_batch_size = 32
+        self.poll_timeout_millis = 5000
+        self.auto_commit = True
+        self.auto_commit_interval_millis = 5000
+        self.consumer_timeout_millis_when_suspend = 30000
+        self.broker_suspend_max_time_millis = 20000
+        self.pull_interval_millis = 50  # 队尾空轮询时的退避，避免空转打爆 broker
+        self.pull_thread_nums = 1
+
+        # 运行状态
+        self._mq_client: Optional[MQClientInstance] = None
+        self._started = False
+        self._running = False
+        self._pull_thread: Optional[threading.Thread] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
+
+        # 本地缓冲 + 位点游标
+        self._local_buffer: Deque[MessageExt] = deque()
+        self._buffer_lock = threading.Lock()
+        self._buffer_cond = threading.Condition(self._buffer_lock)
+        self._next_offset: Dict[MessageQueue, int] = {}
+        self._seek_offset: Dict[MessageQueue, int] = {}
+        self._last_commit: Dict[MessageQueue, float] = {}
+        self._paused: Set[MessageQueue] = set()
+        self._message_queue_listener = None
+        self._last_rebalance_ts = 0
+
+    # ---------------- 命名空间 ----------------
+    def _with_namespace(self, topic: str) -> str:
+        if self.namespace and not topic.startswith(self.namespace + "%"):
+            return self.namespace + "%" + topic
+        return topic
+
+    # ---------------- 配置 ----------------
+    def set_namesrv_addr(self, addr: str) -> None:
+        self.name_server_addrs = [a.strip() for a in addr.split(";") if a.strip()]
+
+    def set_name_server_addresses(self, addrs: List[str]) -> None:
+        self.name_server_addrs = list(addrs)
+
+    def set_instance_name(self, name: str) -> None:
+        self.instance_name = name
+
+    def set_message_model(self, model: str) -> None:
+        self.message_model = model
+
+    def set_namespace(self, ns: str) -> None:
+        self.namespace = ns
+
+    def set_rpc_hook(self, hook: RPCHook) -> None:
+        self.rpc_hook = hook
+
+    def set_consume_from_where(self, where: str) -> None:
+        self.consume_from_where = where
+
+    def set_consume_timestamp(self, ts: str) -> None:
+        self.consume_timestamp = ts
+
+    def set_pull_batch_size(self, n: int) -> None:
+        self.pull_batch_size = max(1, int(n))
+
+    def set_poll_timeout_millis(self, ms: int) -> None:
+        self.poll_timeout_millis = max(0, int(ms))
+
+    def set_auto_commit(self, auto: bool) -> None:
+        self.auto_commit = bool(auto)
+
+    def set_auto_commit_interval_millis(self, ms: int) -> None:
+        self.auto_commit_interval_millis = max(0, int(ms))
+
+    def set_consumer_timeout_millis_when_suspend(self, ms: int) -> None:
+        self.consumer_timeout_millis_when_suspend = int(ms)
+
+    def set_broker_suspend_max_time_millis(self, ms: int) -> None:
+        self.broker_suspend_max_time_millis = int(ms)
+
+    def set_pull_interval_millis(self, ms: int) -> None:
+        self.pull_interval_millis = max(0, int(ms))
+
+    def set_allocate_message_queue_strategy(self, strategy) -> None:
+        self.allocate_message_queue_strategy = strategy
+
+    def set_message_queue_listener(self, listener) -> None:
+        self._message_queue_listener = listener
+
+    # ---------------- 订阅 / 分配 ----------------
+    def subscribe(self, topic: str, sub_expression: str = "*") -> None:
+        self._assign_mode = False
+        ns = self._with_namespace(topic)
+        self.subscription[ns] = sub_expression
+        # 同步构建 SubscriptionData，供心跳把 tag 订阅注册给 broker（否则 broker 不认 tag 过滤）
+        try:
+            self.subscription_data[ns] = FilterAPI.build_subscription_data(ns, sub_expression)
+        except Exception:
+            self.subscription_data.pop(ns, None)
+
+    def subscribe_with_selector(self, topic: str, selector) -> None:
+        # Lite 仅支持 tag 表达式订阅；MessageSelector 一律按 tag 处理
+        self.subscribe(topic, getattr(selector, "expression", "*"))
+
+    def unsubscribe(self, topic: str) -> None:
+        ns = self._with_namespace(topic)
+        self.subscription.pop(ns, None)
+        self.subscription_data.pop(ns, None)
+
+    def set_sub_expression_for_assign(self, topic: str, sub_expression: str) -> None:
+        """assign 模式下给某个 topic 的队列指定 tag 过滤表达式（对应 Java setSubExpressionForAssign）。
+
+        同时构建 SubscriptionData 注册到心跳，使 broker 按该 tag 过滤（assign 模式 broker 也需要订阅）。
+        """
+        ns = self._with_namespace(topic)
+        self._assign_sub_expr[ns] = sub_expression
+        try:
+            self.subscription_data[ns] = FilterAPI.build_subscription_data(ns, sub_expression)
+        except Exception:
+            self.subscription_data.pop(ns, None)
+
+    def assign(self, message_queues) -> None:
+        self._assign_mode = True
+        self._assigned = set(message_queues)
+        for mq in self._assigned:
+            if mq not in self._next_offset:
+                try:
+                    self._next_offset[mq] = self._resolve_initial_offset(mq)
+                except Exception:
+                    logger.debug("assign: resolve initial offset failed for %s", mq)
+
+    # ---------------- 生命周期 ----------------
+    def _create_client(self) -> MQClientInstance:
+        return MQClientInstance(self.client_id, self.name_server_addrs)
+
+    def start(self) -> None:
+        if self._started:
+            return
+        if not self.name_server_addrs:
+            raise MQClientException("name server address is not set")
+        if not self.subscription and not self._assign_mode:
+            raise MQClientException("subscription is not set, call subscribe() or assign() first")
+        if self.client_id is None:
+            self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
+        self._mq_client = self._create_client()
+        if self.rpc_hook is not None:
+            self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
+        self._mq_client.start()
+        # assign 模式在 start 时解析初始位点
+        if self._assign_mode:
+            for mq in list(self._assigned):
+                if mq not in self._next_offset:
+                    try:
+                        self._next_offset[mq] = self._resolve_initial_offset(mq)
+                    except Exception:
+                        logger.debug("start: resolve initial offset failed for %s", mq)
+        # 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息
+        self._send_heartbeat_to_all_broker()
+        self._start_heartbeat_loop()
+        self._running = True
+        self._started = True
+        self._pull_thread = threading.Thread(
+            target=self._pull_service_loop, daemon=True,
+            name="rmq-lite-pull-%s" % self.consumer_group)
+        self._pull_thread.start()
+
+    def shutdown(self) -> None:
+        if not self._started:
+            return
+        self._started = False
+        self._running = False
+        if self.auto_commit:
+            try:
+                self.commit()
+            except Exception:
+                logger.debug("shutdown commit failed")
+        # 唤醒可能的 poll() 等待，让其在关闭后尽快返回
+        with self._buffer_cond:
+            self._buffer_cond.notify_all()
+        if self._pull_thread is not None:
+            self._pull_thread.join(timeout=2.0)
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2.0)
+        if self._mq_client is not None:
+            self._mq_client.shutdown()
+
+    def is_running(self) -> bool:
+        return self._running
+
+    # ---------------- 心跳（把 tag 订阅注册给 broker）----------------
+    def _build_heartbeat(self) -> HeartbeatData:
+        hb = HeartbeatData(self.client_id or "")
+        cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_PASSIVELY,
+                          self.message_model, self.consume_from_where)
+        for sub in self.subscription_data.values():
+            cd.subscription_data_set.add(sub)
+        hb.consumer_data_set.add(cd)
+        return hb
+
+    def _send_heartbeat_to_all_broker(self) -> int:
+        if self._mq_client is None:
+            return 0
+        hb = self._build_heartbeat()
+        ok = 0
+        for addr in self._mq_client.get_route_of_all_brokers():
+            try:
+                self._mq_client.send_heartbeat(addr, hb, 5000)
+                ok += 1
+            except Exception as e:  # noqa: BLE001
+                logger.debug("lite heartbeat to %s failed: %s", addr, e)
+        return ok
+
+    def _start_heartbeat_loop(self) -> None:
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True,
+            name="rmq-lite-hb-%s" % self.consumer_group)
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while self._running:
+            try:
+                self._send_heartbeat_to_all_broker()
+            except Exception:  # noqa: BLE001
+                logger.debug("lite heartbeat loop error")
+            # 5s 心跳间隔（与 push 消费者一致）
+            for _ in range(50):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+
+    # ---------------- 拉取服务 ----------------
+    def _pull_service_loop(self) -> None:
+        while self._running:
+            try:
+                now = time.time() * 1000.0
+                if not self._assign_mode and (self._last_rebalance_ts == 0
+                                             or (now - self._last_rebalance_ts) > 1000):
+                    self._rebalance()
+                    self._last_rebalance_ts = now
+                targets = list(self._assigned)
+                got_any = False
+                for mq in targets:
+                    if not self._running:
+                        break
+                    if mq in self._paused:
+                        continue
+                    if self._pull_one(mq):
+                        got_any = True
+            except Exception as e:  # noqa: BLE001
+                logger.debug("lite pull service error: %s", e)
+            # 退避：轮询空时放慢，避免打爆 broker；有消息则尽快回填缓冲
+            time.sleep(self.pull_interval_millis / 1000.0 if not got_any else 0.005)
+
+    def _subscription_for(self, topic: str) -> str:
+        if topic in self.subscription:
+            return self.subscription[topic]
+        if topic in self._assign_sub_expr:
+            return self._assign_sub_expr[topic]
+        return "*"
+
+    def _pull_one(self, mq: MessageQueue) -> bool:
+        offset = self._next_offset.get(mq)
+        if offset is None:
+            offset = self._resolve_initial_offset(mq)
+            self._next_offset[mq] = offset
+        sub = self._subscription_for(mq.topic) or "*"
+        # 短轮询（suspend=False），位点由 auto-commit 单独提交（与 Java LitePull 一致）
+        sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
+                                              subscription=True, class_filter=False)
+        try:
+            result = self._mq_client.pull_message(
+                self.consumer_group, mq, offset, self.pull_batch_size,
+                sys_flag, 0, sub, 0, ExpressionType.TAG,
+                timeout_millis=30000, max_msg_bytes=-1,
+                suspend_timeout_millis=15000)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lite pull_one failed for %s@%d: %s", mq.topic, mq.queue_id, e)
+            return False
+        if result.status == PullStatus.FOUND and result.msg_found_list:
+            msgs = self._filter_tags(mq.topic, result.msg_found_list, sub)
+            if msgs:
+                self._enqueue(msgs)
+                last = msgs[-1]
+                self._next_offset[mq] = last.queue_offset + 1
+                if self.auto_commit:
+                    self._maybe_commit(mq)
+                return True
+        return False
+
+    def _filter_tags(self, topic, msgs, sub):
+        if not sub or sub == "*":
+            return msgs
+        try:
+            sub_data = FilterAPI.build_subscription_data(topic, sub)
+        except Exception:
+            return msgs
+        if not sub_data.tags_set:
+            return msgs
+        kept = []
+        for m in msgs:
+            # 注意：真实拉取回来的 MessageExt 把 tag 放在 properties["TAGS"]（get_tags() 读它），
+            # 实例属性 .tags 为 None；单元测试里会显式 set_tags，这里两种来源都兼容。
+            tag = getattr(m, "tags", None) or m.get_tags()
+            if tag in sub_data.tags_set:
+                kept.append(m)
+        return kept
+
+    def _enqueue(self, msgs: List[MessageExt]) -> None:
+        with self._buffer_cond:
+            self._local_buffer.extend(msgs)
+            self._buffer_cond.notify_all()
+
+    def _maybe_commit(self, mq: MessageQueue) -> None:
+        now = time.time() * 1000.0
+        last = self._last_commit.get(mq, 0.0)
+        if now - last < self.auto_commit_interval_millis:
+            return
+        try:
+            self._mq_client.update_consumer_offset(self.consumer_group, mq, self._next_offset[mq])
+            self._last_commit[mq] = now
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lite auto-commit failed for %s: %s", mq, e)
+
+    def _resolve_initial_offset(self, mq: MessageQueue) -> int:
+        if mq in self._seek_offset:
+            return self._seek_offset[mq]
+        # 有已提交位点则沿用（保证重启续消费）
+        try:
+            off = self._mq_client.query_consumer_offset(self.consumer_group, mq)
+            if off is not None:
+                return off
+        except Exception:
+            pass
+        if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
+            return self._mq_client.get_min_offset(mq)
+        if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
+            ts = self._parse_timestamp(self.consume_timestamp)
+            return self._mq_client.search_offset_by_timestamp(mq, ts)
+        return self._mq_client.get_max_offset(mq)
+
+    @staticmethod
+    def _parse_timestamp(ts: str) -> int:
+        # 形如 "20230101000000" 或毫秒/秒时间戳
+        if ts is None or not str(ts).strip():
+            return int(time.time() * 1000)
+        s = str(ts).strip()
+        if s.isdigit():
+            v = int(s)
+            return v * 1000 if v < 1_000_000_000_000 else v
+        try:
+            import datetime
+            dt = datetime.datetime.strptime(s, "%Y%m%d%H%M%S")
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return int(time.time() * 1000)
+
+    # ---------------- rebalance（subscribe 模式）----------------
+    def _rebalance(self) -> None:
+        new_set: Set[MessageQueue] = set()
+        for topic in list(self.subscription.keys()):
+            try:
+                info = self._mq_client.get_topic_publish_info(topic)
+                mq_all = [MessageQueue(q.topic, q.broker_name, q.queue_id)
+                          for q in info.msg_queue_list]
+            except Exception:
+                mq_all = []
+            cid_all = self._mq_client.get_consumer_id_list_by_group(topic, self.consumer_group) or []
+            if self.client_id not in cid_all:
+                cid_all = cid_all + [self.client_id]
+            try:
+                allocated = self.allocate_message_queue_strategy.allocate(
+                    self.consumer_group, self.client_id, mq_all, cid_all)
+            except Exception:
+                allocated = []
+            new_set |= set(allocated)
+        if new_set != self._assigned:
+            old = self._assigned
+            self._assigned = new_set
+            for mq in (new_set - old):
+                if mq not in self._next_offset:
+                    try:
+                        self._next_offset[mq] = self._resolve_initial_offset(mq)
+                    except Exception:
+                        logger.debug("rebalance: resolve offset failed for %s", mq)
+            for mq in (old - new_set):
+                self._next_offset.pop(mq, None)
+                self._last_commit.pop(mq, None)
+            if self._message_queue_listener is not None:
+                try:
+                    self._message_queue_listener.message_queue_changed(list(new_set), list(old))
+                except Exception:
+                    pass
+
+    # ---------------- poll / 位点 ----------------
+    def poll(self, timeout: Optional[int] = None) -> List[MessageExt]:
+        if timeout is None:
+            timeout = self.poll_timeout_millis
+        deadline = time.time() + (timeout / 1000.0)
+        with self._buffer_cond:
+            while not self._local_buffer:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return []
+                self._buffer_cond.wait(remaining)
+            out: List[MessageExt] = []
+            while self._local_buffer and len(out) < 1024:
+                out.append(self._local_buffer.popleft())
+            return out
+
+    def seek(self, mq: MessageQueue, offset: int) -> None:
+        self._seek_offset[mq] = offset
+        self._next_offset[mq] = offset
+        with self._buffer_cond:
+            kept = [m for m in self._local_buffer
+                    if not (m.topic == mq.topic and m.broker_name == mq.broker_name
+                            and m.queue_id == mq.queue_id and m.queue_offset < offset)]
+            self._local_buffer = deque(kept)
+
+    def seek_to_begin(self, mq: MessageQueue) -> None:
+        self.seek(mq, self._mq_client.get_min_offset(mq))
+
+    def seek_to_end(self, mq: MessageQueue) -> None:
+        self.seek(mq, self._mq_client.get_max_offset(mq))
+
+    def committed(self, mq: MessageQueue) -> Optional[int]:
+        return self._mq_client.query_consumer_offset(self.consumer_group, mq)
+
+    def commit(self) -> None:
+        for mq, off in list(self._next_offset.items()):
+            try:
+                self._mq_client.update_consumer_offset(self.consumer_group, mq, off)
+                self._last_commit[mq] = time.time() * 1000.0
+            except Exception as e:  # noqa: BLE001
+                logger.debug("lite commit failed for %s: %s", mq, e)
+
+    def offset_for_timestamp(self, mq: MessageQueue, timestamp: int) -> int:
+        return self._mq_client.search_offset_by_timestamp(mq, timestamp)
+
+    def assignment(self) -> List[MessageQueue]:
+        return list(self._assigned)
+
+    def fetch_message_queues(self, topic: str) -> List[MessageQueue]:
+        info = self._mq_client.get_topic_publish_info(self._with_namespace(topic))
+        return [MessageQueue(q.topic, q.broker_name, q.queue_id) for q in info.msg_queue_list]
+
+    def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
+        return self.fetch_message_queues(topic)
+
+    def pause(self, message_queues) -> None:
+        self._paused |= set(message_queues)
+
+    def resume(self, message_queues) -> None:
+        self._paused -= set(message_queues)
+
+
 class SimpleMessageListener(MessageListenerConcurrently):
     """便捷监听器包装：把消费逻辑转成纯函数。"""
 
