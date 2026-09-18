@@ -60,6 +60,7 @@ set(RMQ_SOURCES
     src/client/result.cpp
     src/client/mq_client.cpp
     src/client/consumer_stats.cpp
+    src/client/trace_context.cpp
     src/client/producer.cpp
     src/client/consumer.cpp
     src/client/consume_executor.cpp
@@ -84,6 +85,19 @@ if(RMQ_WITH_ZLIB)
     find_package(ZLIB REQUIRED)
 endif()
 
+# 传输层 TLS（对应 Java NettyRemotingClient 的 SslHandler）。找到 OpenSSL 就默认编入
+# （test mode 信任 broker 自签证书，配合 PERMISSIVE broker 即配即通）；找不到时静默降级，
+# setTlsEnable(true) 会在运行时抛出带说明的错误，其余路径零影响。
+option(RMQ_ENABLE_TLS "Enable TLS transport (requires OpenSSL)" ON)
+if(RMQ_ENABLE_TLS)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+        message(STATUS "RocketMQ client TLS: enabled (OpenSSL ${OPENSSL_VERSION})")
+    else()
+        message(STATUS "RocketMQ client TLS: OpenSSL not found, building WITHOUT TLS")
+    endif()
+endif()
+
 add_library(rocketmq_remoting STATIC ${RMQ_SOURCES})
 target_include_directories(rocketmq_remoting PUBLIC
     $<BUILD_INTERFACE:${RMQ_INCLUDE_DIR}>
@@ -95,6 +109,14 @@ if(RMQ_WITH_ZLIB)
     target_link_libraries(rocketmq_remoting PUBLIC ZLIB::ZLIB)
     # 让 message_decoder / compression.cpp 感知 zlib 是否可用
     target_compile_definitions(rocketmq_remoting PUBLIC ROCKETMQ_HAS_ZLIB=1)
+endif()
+
+if(RMQ_ENABLE_TLS AND OpenSSL_FOUND)
+    target_link_libraries(rocketmq_remoting PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_include_directories(rocketmq_remoting PRIVATE ${OPENSSL_INCLUDE_DIR})
+    # 仅 tls_session.cpp 感知（PUBLIC 与否：tests 需要自己的 mock TLS server，也用 OpenSSL）
+    target_compile_definitions(rocketmq_remoting PUBLIC RMQ_HAS_TLS=1)
+    target_sources(rocketmq_remoting PRIVATE src/remoting/tls_session.cpp)
 endif()
 
 # util_all 里 localIp() 用到 socket；Windows 需要链接 winsock

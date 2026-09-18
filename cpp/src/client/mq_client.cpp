@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -107,11 +109,22 @@ std::optional<MessageQueue> TopicPublishInfo::selectOneMessageQueue(
 }
 
 // ---------------------------------------------------------------- 生命周期
+bool MQClientInstance::tlsEnabledFromEnv() {
+    const char* v = std::getenv("ROCKETMQ_TLS_ENABLE");
+    if (v == nullptr) return false;
+    std::string s(v);
+    // 简单归一：1/true/yes（大小写不敏感）
+    for (auto& c : s) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    return s == "1" || s == "true" || s == "yes";
+}
+
 MQClientInstance::MQClientInstance(const std::string& clientId,
                                   const std::vector<std::string>& nameServerAddrs,
-                                  int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis)
+                                  int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis,
+                                  bool tlsEnable)
     : clientId_(clientId), nameServerAddrs_(nameServerAddrs),
-      remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)) {
+      remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)),
+      tlsEnable_(tlsEnable) {
     // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
     // 对应 Java MQClientAPIImpl 构造函数里的
     // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)
@@ -128,6 +141,10 @@ MQClientInstance::~MQClientInstance() { shutdown(); }
 
 void MQClientInstance::start() {
     started_ = true;
+    // TLS：必须在首条连接建立前打开（之后建的所有连接都走握手）
+    if (tlsEnable_) {
+        remotingClient_->setTlsEnable(true);
+    }
     // 消费统计采样线程（Java 挂在每个 StatsItem 的调度器上，这里收敛为实例级一个）
     consumerStats_.start();
     // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置

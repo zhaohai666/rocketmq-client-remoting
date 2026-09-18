@@ -25,6 +25,7 @@
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "tls_session.h"
 
 #ifndef _WIN32
 #include <fcntl.h>  // 非阻塞 connect 用（fcntl/F_GETFL/F_SETFL）
@@ -136,6 +137,8 @@ struct RemotingClient::Impl {
         socket_t sock = kInvalidSocket;
         std::mutex writeMutex;
         std::atomic<bool> readerDone{false};
+        // TLS 会话（tlsEnable 时非空；read/write 走 SSL_*）
+        std::unique_ptr<TlsSession> tls;
     };
 
     struct Future {
@@ -150,6 +153,10 @@ struct RemotingClient::Impl {
     std::atomic<bool> running{true};
     int32_t connectTimeout = 3000;
     int32_t invokeTimeout = 15000;
+    // TLS（对应 Java NettyRemotingClient 的 isUseTLS + 构造期 buildSslContext）。
+    // tlsCtx 持有 SSL_CTX*；setTlsEnable(true) 时创建。
+    bool tlsEnable = false;
+    std::shared_ptr<void> tlsCtx;
 
     mutable std::mutex connMutex;
     std::unordered_map<std::string, std::shared_ptr<Connection>> conns;
@@ -218,6 +225,18 @@ struct RemotingClient::Impl {
         conn->addr = addr;
         conn->sock = sock;
 
+        // TLS：在任何 RocketMQ 帧之前完成握手（对应 Java pipeline.addFirst(SslHandler)）。
+        // 失败按建连失败处理，异常信息带握手原因。
+        if (tlsEnable) {
+            std::string tlsErr;
+            auto session = std::make_unique<TlsSession>(tlsCtx);
+            if (!session->handshake(sock, host, connectTimeout, tlsErr)) {
+                closeSocket(sock);
+                throw RemotingConnectException(tlsErr);
+            }
+            conn->tls = std::move(session);
+        }
+
         pruneThreads();
 
         {
@@ -250,24 +269,36 @@ struct RemotingClient::Impl {
         const socket_t sock = conn->sock;
         char chunk[65536];
         while (running.load()) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(sock, &rfds);
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 300000;  // 300ms：既能及时退出，也不空转
-            int sel = ::select(static_cast<int>(sock) + 1, &rfds, nullptr, nullptr, &tv);
-            if (sel < 0) {
-                // shutdown() 关闭 fd 后 select 必然失败，属正常退出路径。这里统一记 DEBUG：
-                // 默认 INFO 级别下不可见（不会出现"退出时的假异常"噪声），
-                // 需要看连接生命周期时 ROCKETMQ_CPP_LOG_LEVEL=DEBUG 即可。
-                logger_debug("remoting reader: select failed on " + conn->addr + ", reader exiting");
-                break;
+            // TLS：SSL 内部可能还有未交付的解密字节（select 对 fd 会漏报），此时跳过 select
+            if (!(conn->tls && conn->tls->pending() > 0)) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(sock, &rfds);
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 300000;  // 300ms：既能及时退出，也不空转
+                int sel = ::select(static_cast<int>(sock) + 1, &rfds, nullptr, nullptr, &tv);
+                if (sel < 0) {
+                    // shutdown() 关闭 fd 后 select 必然失败，属正常退出路径。这里统一记 DEBUG：
+                    // 默认 INFO 级别下不可见（不会出现"退出时的假异常"噪声），
+                    // 需要看连接生命周期时 ROCKETMQ_CPP_LOG_LEVEL=DEBUG 即可。
+                    logger_debug("remoting reader: select failed on " + conn->addr + ", reader exiting");
+                    break;
+                }
+                if (sel == 0) {
+                    continue;
+                }
             }
-            if (sel == 0) {
-                continue;
+            int n;
+            if (conn->tls) {
+                n = conn->tls->read(sock, chunk, sizeof(chunk));
+                if (n == -2) {
+                    // SO_RCVTIMEO 到点（或 want-write）：回到 select 循环
+                    continue;
+                }
+            } else {
+                n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
             }
-            int n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
             if (n <= 0) {
                 // n == 0 对端正常关闭，n < 0 读错误。Java 侧 Netty 的 channelInactive 会打一行，
                 // 但正常 shutdown 也会走到这里，为免默认 INFO 下变成噪声同样降到 DEBUG。
@@ -435,7 +466,11 @@ struct RemotingClient::Impl {
         }
         Bytes data = response.encode();
         std::lock_guard<std::mutex> wlk(conn->writeMutex);
-        if (!sendAll(conn->sock, data)) {
+        const bool ok = conn->tls ? conn->tls->writeAll(conn->sock,
+                                                        reinterpret_cast<const char*>(data.data()),
+                                                        data.size())
+                                  : sendAll(conn->sock, data);
+        if (!ok) {
             logger_warn("remoting: failed to write response to " + addr);
         }
     }
@@ -449,7 +484,11 @@ struct RemotingClient::Impl {
         auto conn = getOrCreateConnection(addr);
         Bytes data = request.encode();
         std::lock_guard<std::mutex> lk(conn->writeMutex);
-        if (!sendAll(conn->sock, data)) {
+        const bool sentOk = conn->tls ? conn->tls->writeAll(conn->sock,
+                                                            reinterpret_cast<const char*>(data.data()),
+                                                            data.size())
+                                      : sendAll(conn->sock, data);
+        if (!sentOk) {
             closeSocket(conn->sock);
             conn->sock = kInvalidSocket;
             {
@@ -594,6 +633,26 @@ void RemotingClient::unregisterRPCHook() {
     std::lock_guard<std::mutex> lk(impl_->hookMutex);
     impl_->rpcHook.reset();
 }
+
+void RemotingClient::setTlsEnable(bool enable) {
+    if (!enable) {
+        impl_->tlsEnable = false;
+        impl_->tlsCtx.reset();
+        return;
+    }
+    // 只创建一次 SSL_CTX（对应 Java 构造期 buildSslContext(true)）
+    if (!impl_->tlsCtx) {
+        std::string err;
+        auto ctx = createClientSslContext(err);
+        if (!ctx) {
+            throw RemotingException("enable TLS failed: " + err);
+        }
+        impl_->tlsCtx = ctx;
+    }
+    impl_->tlsEnable = true;
+}
+
+bool RemotingClient::tlsEnable() const { return impl_->tlsEnable; }
 
 bool RemotingClient::isChannelWritable(const std::string& addr) const {
     std::lock_guard<std::mutex> lk(impl_->connMutex);

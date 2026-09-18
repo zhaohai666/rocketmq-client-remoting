@@ -83,6 +83,11 @@ add_executable(rmq_test_consumer_stats test_consumer_stats.cpp)
 target_link_libraries(rmq_test_consumer_stats PRIVATE rocketmq::remoting)
 add_test(NAME consumer_stats COMMAND rmq_test_consumer_stats)
 
+# W3C traceparent：生成/校验/子 span/注入不覆盖/属性提取
+add_executable(rmq_test_trace_context test_trace_context.cpp)
+target_link_libraries(rmq_test_trace_context PRIVATE rocketmq::remoting)
+add_test(NAME trace_context COMMAND rmq_test_trace_context)
+
 # 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

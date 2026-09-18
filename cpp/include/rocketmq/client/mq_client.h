@@ -79,10 +79,14 @@ private:
 
 class MQClientInstance {
 public:
+    // Java 的 tls.enable 是 JVM 全局系统属性；这里等价为 env ROCKETMQ_TLS_ENABLE。
+    static bool tlsEnabledFromEnv();
+
     MQClientInstance(const std::string& clientId,
                      const std::vector<std::string>& nameServerAddrs,
                      int32_t connectTimeoutMillis = 3000,
-                     int32_t invokeTimeoutMillis = 15000);
+                     int32_t invokeTimeoutMillis = 15000,
+                     bool tlsEnable = tlsEnabledFromEnv());
     ~MQClientInstance();
 
     MQClientInstance(const MQClientInstance&) = delete;
@@ -331,6 +335,7 @@ private:
     std::map<std::string, std::shared_ptr<TopicPublishInfo>> topicPublishInfoTable_;
     // 在用 topic（消费者订阅 + 生产者发送过的），由周期任务刷新路由
     std::set<std::string> topicsInUse_;
+    bool tlsEnable_ = false;
     bool started_ = false;
     bool routeRefreshStop_ = false;
     std::thread routeRefreshThread_;

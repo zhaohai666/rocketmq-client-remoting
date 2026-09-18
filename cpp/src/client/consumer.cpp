@@ -288,7 +288,8 @@ void DefaultMQPushConsumer::start() {
         }
         mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                              /*connectTimeoutMillis=*/3000,
-                                             /*invokeTimeoutMillis=*/pullTimeoutMillis_));
+                                             /*invokeTimeoutMillis=*/pullTimeoutMillis_,
+                                             tlsEnable_));
         mqClient_->start();
         // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
         // （Java 由共享的 ClientConfig 天然同步）

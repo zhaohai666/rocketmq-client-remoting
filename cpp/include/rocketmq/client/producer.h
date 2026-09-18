@@ -44,6 +44,10 @@ public:
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     std::string getNamesrvAddr() const;
     void setInstanceName(const std::string& name) { instanceName_ = name; }
+    // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
+    void setTlsEnable(bool b) { tlsEnable_ = b; }
+    // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+    void setEnableTraceContext(bool b) { enableTraceContext_ = b; }
     void setSendMsgTimeout(int32_t millis) { sendMsgTimeout_ = millis; }
     void setRetryTimesWhenSendFailed(int32_t n) { retryTimesWhenSendFailed_ = n; }
     void setMaxMessageSize(int32_t bytes) { maxMessageSize_ = bytes; }
@@ -268,6 +272,8 @@ protected:
     std::string clientId_;
     std::string createTopicKey_ = MixAll::DEFAULT_TOPIC;
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
+    bool tlsEnable_ = false;
+    bool enableTraceContext_ = false;
     int32_t sendMsgTimeout_ = 3000;
     // Request-Reply 默认超时（对应 Java DefaultMQProducer 的 request 兜底 3000ms）
     int32_t requestTimeoutMillis_ = DEFAULT_REQUEST_TIMEOUT_MILLIS;

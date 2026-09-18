@@ -98,6 +98,14 @@ public:
     bool registerRPCHook(std::shared_ptr<RPCHook> hook);
     void unregisterRPCHook();
 
+    // ---- TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）----
+    // 必须在**首条连接建立前**调用（建连时才握手）。true 时为每条新连接做 TLS 握手；
+    // test mode 信任 broker 自签证书（Java tls.test.mode.enable 默认 true 的等价语义）。
+    // 未编入 OpenSSL（RMQ_ENABLE_TLS=OFF 或找不到 OpenSSL）时传 true 会抛
+    // MQClientException，明文路径零影响。
+    void setTlsEnable(bool enable);
+    bool tlsEnable() const;
+
     // ---- 连接管理 ----
     bool isChannelWritable(const std::string& addr) const;
     void closeChannel(const std::string& addr);

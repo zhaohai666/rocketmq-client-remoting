@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/trace_context.h"
 #include "rocketmq/client/trace_hook.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
@@ -118,7 +119,10 @@ void DefaultMQProducer::start() {
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }
-    mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_));
+    mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
+                                         /*connectTimeoutMillis=*/3000,
+                                         /*invokeTimeoutMillis=*/15000,
+                                         tlsEnable_));
     mqClient_->start();
     // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
     if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
@@ -349,6 +353,11 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
                                             const MessageQueue& mq, int32_t timeout,
                                             int32_t sysFlag, const std::string* arg,
                                             CommunicationMode mode) {
+    // W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖。
+    // ⚠ 必须放在 hasSendInterceptors() 早退之前，否则无钩子时注入被跳过。
+    if (enableTraceContext_) {
+        injectTraceContext(const_cast<Message*>(&msg));
+    }
     // 没有任何拦截/钩子时零开销透传
     if (!hasSendInterceptors()) {
         return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
@@ -543,6 +552,10 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
         brokerAddr.clear();
     }
     runCheckForbidden(outbound, selected, brokerAddr, nullptr, CommunicationMode::ONEWAY);
+    // W3C traceparent 透传（opt-in）：单向发送同样注入
+    if (enableTraceContext_) {
+        injectTraceContext(&outbound);
+    }
     c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
 }
 

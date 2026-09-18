@@ -174,6 +174,8 @@ public:
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
     void setPopMode(bool b) { popMode_ = b; }
     bool popMode() const { return popMode_; }
+    // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
+    void setTlsEnable(bool b) { tlsEnable_ = b; }
     // 弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）
     void setPopInvisibleTime(int64_t t) { popInvisibleTime_ = t; }
     int64_t popInvisibleTime() const { return popInvisibleTime_; }
@@ -428,6 +430,7 @@ private:
 
     // ---- POP 模式（5.x 轻量消费）----
     bool popMode_ = false;
+    bool tlsEnable_ = false;
     int64_t popInvisibleTime_ = 60000;
     int32_t popBatchNums_ = 32;
     int32_t popThresholdForQueue_ = 96;
