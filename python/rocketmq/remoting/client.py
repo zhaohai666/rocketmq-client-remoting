@@ -6,7 +6,9 @@ opaque 映射回调分发、超时控制、连接状态探活。
 """
 from __future__ import annotations
 
+import os
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -51,9 +53,15 @@ class _ResponseFuture:
 
 
 class RemotingClient:
-    def __init__(self, connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000):
+    def __init__(self, connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
+                 tls_enable: Optional[bool] = None):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
+        # TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
+        # 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
+        if tls_enable is None:
+            tls_enable = os.environ.get("ROCKETMQ_TLS_ENABLE", "").strip().lower() in ("1", "true", "yes")
+        self.tls_enable = bool(tls_enable)
         self._lock = threading.RLock()
         self._conns: Dict[str, socket.socket] = {}
         self._sock_locks: Dict[str, threading.Lock] = {}
@@ -91,6 +99,21 @@ class RemotingClient:
         except OSError:
             sock.close()
             raise RemotingConnectException(addr)
+        if self.tls_enable:
+            # 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ
+            # 帧之前完成握手。test mode（Java tls.test.mode.enable 默认 true）= 信任
+            # broker 的自签证书、不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            except (OSError, ssl.SSLError) as e:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise RemotingConnectException("%s (tls handshake: %s)" % (addr, e))
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return sock

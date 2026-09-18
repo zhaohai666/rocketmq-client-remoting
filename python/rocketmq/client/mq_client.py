@@ -111,10 +111,12 @@ class MQClientInstance:
     INSTANCE_LOCK = threading.Lock()
 
     def __init__(self, client_id: str, name_server_addrs: List[str],
-                 connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000):
+                 connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
+                 tls_enable: Optional[bool] = None):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
-        self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis)
+        self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
+                                              tls_enable=tls_enable)
         self.topic_route_table: Dict[str, TopicRouteData] = {}
         self.topic_publish_info_table: Dict[str, TopicPublishInfo] = {}
         self.topic_route_lock = threading.RLock()

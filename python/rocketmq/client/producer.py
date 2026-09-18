@@ -31,6 +31,7 @@ from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .exception import MQBrokerException, MQClientException, RequestTimeoutException
 from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
+
                    EndTransactionContext, EndTransactionHook, SendMessageContext, SendMessageHook)
 from .latency import MQFaultStrategy
 from .metrics import ClientMetrics
@@ -39,6 +40,7 @@ from .top_addressing import DefaultTopAddressing
 from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
                             RequestResponseFuture, create_correlation_id)
 from .send_result import SendResult, SendStatus
+from .trace_context import inject_trace_context, trace_context_enabled_from_env
 from .trace import AccessChannel
 from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
 from .trace_hook import EndTransactionTraceHook, SendMessageTraceHook
@@ -162,10 +164,17 @@ class DefaultMQProducer:
 
     def __init__(self, producer_group: str = MixAll.DEFAULT_PRODUCER_GROUP,
                  rpc_hook: Optional[RPCHook] = None, namespace: str = "",
-                 topics: Optional[List[str]] = None):
+                 topics: Optional[List[str]] = None, tls_enable: Optional[bool] = None,
+                 enable_trace_context: Optional[bool] = None):
         if producer_group is None or not str(producer_group).strip():
             raise MQClientException("producerGroup is empty")
         self.producer_group = str(producer_group)
+        # TLS（Java 全局系统属性 tls.enable 的等价物；None = 交给 env ROCKETMQ_TLS_ENABLE）
+        self.tls_enable: Optional[bool] = tls_enable
+        # W3C traceparent 透传（opt-in；None = 交给 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+        if enable_trace_context is None:
+            enable_trace_context = trace_context_enabled_from_env()
+        self.enable_trace_context: bool = bool(enable_trace_context)
         self.namespace = namespace
         self.instance_name = "DEFAULT"
         self.client_id = None
@@ -404,6 +413,9 @@ class DefaultMQProducer:
             pass
         if self.has_check_forbidden_hook():
             self._execute_check_forbidden(msg, mq_sel, broker_addr, arg, communication_mode)
+        # W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖
+        if self.enable_trace_context:
+            inject_trace_context(msg)
         if not self.send_message_hook_list:
             return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
         context = self._build_send_context(msg, mq_sel, broker_addr, communication_mode)
@@ -432,7 +444,8 @@ class DefaultMQProducer:
             # setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
             if self.namespace:
                 self.producer_group = NamespaceUtil.wrap_namespace(self.namespace, self.producer_group)
-            self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
+            self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
+                                               tls_enable=self.tls_enable)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()

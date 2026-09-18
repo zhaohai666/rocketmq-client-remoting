@@ -269,6 +269,8 @@ class DefaultMQPushConsumer:
         if consumer_group is None or not str(consumer_group).strip():
             raise MQClientException("consumerGroup is empty")
         self.consumer_group = str(consumer_group)
+        # TLS（Java 全局系统属性 tls.enable 的等价物；None = 交给 env ROCKETMQ_TLS_ENABLE）
+        self.tls_enable: Optional[bool] = kwargs.pop("tls_enable", None)
         self.namespace = namespace
         self.instance_name = "DEFAULT"
         self.client_id: Optional[str] = None
@@ -698,7 +700,8 @@ class DefaultMQPushConsumer:
                 self.consumer_group = NamespaceUtil.wrap_namespace(self.namespace, self.consumer_group)
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
-            self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
+            self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
+                                               tls_enable=self.tls_enable)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
