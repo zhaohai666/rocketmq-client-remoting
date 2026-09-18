@@ -93,3 +93,12 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
 17. **307 应答 wire 形状**：properties(6 个 PROP_* 键)+subscriptionSet+mqTable+mqPopTable+
     statusTable+userConsumerInfo（缺省 `{}`）；mq*Table 键是 fastjson2 **内联对象键**
     （字母序）。**tps 单测必须注入时间戳**（真实时钟两次 sample 间隔≈0 → tps 恒 0）。
+18. **TLS 真机配置**：broker 起集群加 JVM `-Dtls.test.mode.enable=true -Dtls.server.mode=PERMISSIVE`
+    （自签证书 + 同端口明文兼容）。客户端 opt-in：Py `tls_enable=` / C++ `setTlsEnable` /
+    .NET `TlsEnable`（env `ROCKETMQ_TLS_ENABLE` 等价 Java `tls.enable`）。C++ 读循环
+    **先 SSL_pending() 再 select**。TLS live 脚本 `/tmp/run_tls_live.sh`（起集群后必须等
+    ~12s 路由注册，否则 TBW102 无路由假失败）。
+19. **traceparent 注入必须在 sendWithHooks 的"零开销早退"之前**（无钩子直接 sendMessage
+    的路径），否则 opt-in 注入被静默跳过（C++/.NET 双踩）。键小写 `traceparent`，不覆盖已有值。
+20. **消费 0 条假象**：把裸函数传给 Python set_message_listener → `'function' object has no
+    attribute 'consume_message'` 被吞成 RECONSUME_LATER（仅 DEBUG 可见），消息其实拉到了。
