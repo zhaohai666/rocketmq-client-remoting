@@ -286,6 +286,9 @@ public sealed class DefaultMQPushConsumer
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
     public bool PopMode { get; set; }
 
+    /// <summary>TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）。</summary>
+    public bool TlsEnable { get; set; }
+
     /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
     public long PopInvisibleTime { get; set; } = 60000;
 
@@ -775,7 +778,8 @@ public sealed class DefaultMQPushConsumer
 
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
                 /*connectTimeoutMillis=*/3000,
-                /*invokeTimeoutMillis=*/_pullTimeoutMillis);
+                /*invokeTimeoutMillis=*/_pullTimeoutMillis,
+                tlsEnable: TlsEnable);
             _mqClient.Start();
             // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
             // （Java 由共享的 ClientConfig 天然同步）

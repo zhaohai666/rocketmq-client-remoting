@@ -41,6 +41,10 @@ public class DefaultMQProducer
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
+    // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
+    private bool _tlsEnable;
+    // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+    private bool _enableTraceContext;
     private int _retryTimesWhenSendFailed = 2;
     // 发送延迟故障规避（默认关闭，对应 Java MQFaultStrategy 的默认开关）
     private readonly MQFaultStrategy _mqFaultStrategy = new(false);
@@ -73,6 +77,8 @@ public class DefaultMQProducer
         }
 
         _producerGroup = producerGroup;
+        // opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE
+        _enableTraceContext = TraceParentContext.EnabledFromEnv();
     }
 
     /// <summary>析构：与 C++ ~DefaultMQProducer 一致，释放时兜底 shutdown。</summary>
@@ -122,6 +128,20 @@ public class DefaultMQProducer
     {
         get => _sendMsgTimeout;
         set => _sendMsgTimeout = value;
+    }
+
+    /// <summary>TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）。</summary>
+    public bool TlsEnable
+    {
+        get => _tlsEnable;
+        set => _tlsEnable = value;
+    }
+
+    /// <summary>W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）。</summary>
+    public bool EnableTraceContext
+    {
+        get => _enableTraceContext;
+        set => _enableTraceContext = value;
     }
 
     public int RetryTimesWhenSendFailed
@@ -318,7 +338,8 @@ public class DefaultMQProducer
                 _clientId = ClientIds.Build(_instanceName);
             }
 
-            _mqClient = new MQClientInstance(_clientId, _nameServerAddrs);
+            _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
+                tlsEnable: _tlsEnable);
             _mqClient.Start();
             // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
@@ -541,6 +562,13 @@ public class DefaultMQProducer
         int timeout, int sysFlag, object? arg = null,
         CommunicationMode mode = CommunicationMode.Sync)
     {
+        // W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖。
+        // ⚠ 必须放在 HasSendInterceptors 早退之前，否则无钩子时注入被跳过。
+        if (_enableTraceContext)
+        {
+            TraceParentContext.Inject(msg);
+        }
+
         if (!HasSendInterceptors())
         {
             return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
@@ -557,6 +585,7 @@ public class DefaultMQProducer
         }
 
         RunCheckForbidden(msg, mq, brokerAddr, arg, mode);
+
         if (_sendMessageHooks.Count == 0)
         {
             return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
@@ -871,6 +900,12 @@ public class DefaultMQProducer
         }
 
         RunCheckForbidden(outbound, selected, brokerAddr, null, CommunicationMode.Oneway);
+        // W3C traceparent 透传（opt-in）：单向发送同样注入
+        if (_enableTraceContext)
+        {
+            TraceParentContext.Inject(outbound);
+        }
+
         c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
     }
 

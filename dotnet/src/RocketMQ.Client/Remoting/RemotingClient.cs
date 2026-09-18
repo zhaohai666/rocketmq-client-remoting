@@ -16,6 +16,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -47,6 +48,8 @@ public sealed class RemotingClient : IDisposable
         public Socket Sock = null!;
         public readonly object WriteLock = new();
         public volatile bool ReaderDone;
+        // TLS 会话（TLS 启用时非空；读写走 SslStream）
+        public SslStream? Tls;
     }
 
     private sealed class Future
@@ -59,6 +62,7 @@ public sealed class RemotingClient : IDisposable
     private volatile bool _running = true;
     private readonly int _connectTimeoutMillis;
     private readonly int _invokeTimeoutMillis;
+    private readonly bool _tlsEnable;
 
     private readonly object _connMutex = new();
     private readonly Dictionary<string, Connection> _conns = new(StringComparer.Ordinal);
@@ -123,10 +127,20 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    public RemotingClient(int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000)
+    public RemotingClient(int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000,
+        bool? tlsEnable = null)
     {
         _connectTimeoutMillis = connectTimeoutMillis;
         _invokeTimeoutMillis = invokeTimeoutMillis;
+        // TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
+        // 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
+        _tlsEnable = tlsEnable ?? EnvTlsEnabled();
+    }
+
+    internal static bool EnvTlsEnabled()
+    {
+        string? v = Environment.GetEnvironmentVariable("ROCKETMQ_TLS_ENABLE");
+        return v is not null && (v.Trim().ToLowerInvariant() is "1" or "true" or "yes");
     }
 
     public int ConnectTimeoutMillis => _connectTimeoutMillis;
@@ -278,6 +292,25 @@ public sealed class RemotingClient : IDisposable
 
         var conn = new Connection { Addr = addr, Sock = sock };
 
+        // TLS：在任何 RocketMQ 帧之前完成握手（对应 Java pipeline.addFirst(SslHandler)）。
+        // test mode 信任 broker 自签证书（Java tls.test.mode.enable 默认 true 的等价语义）。
+        if (_tlsEnable)
+        {
+            try
+            {
+                var ns = new NetworkStream(sock, ownsSocket: false);
+                var ssl = new SslStream(ns, false,
+                    (sender, cert, chain, errors) => true);   // test mode：信任一切
+                ssl.AuthenticateAsClient(host);
+                conn.Tls = ssl;
+            }
+            catch (Exception e)
+            {
+                try { sock.Dispose(); } catch { /* ignore */ }
+                throw new RemotingConnectException(addr + " (tls handshake: " + e.Message + ")");
+            }
+        }
+
         PruneThreads();
 
         lock (_connMutex)
@@ -331,7 +364,9 @@ public sealed class RemotingClient : IDisposable
             int n;
             try
             {
-                n = sock.Receive(chunk, chunk.Length, SocketFlags.None);
+                n = conn.Tls is not null
+                    ? conn.Tls.Read(chunk, 0, chunk.Length)
+                    : sock.Receive(chunk, chunk.Length, SocketFlags.None);
             }
             catch (Exception)
             {
@@ -529,7 +564,7 @@ public sealed class RemotingClient : IDisposable
         {
             try
             {
-                SendAll(conn.Sock, data);
+                SendAll(conn, data);
             }
             catch (Exception)
             {
@@ -547,8 +582,16 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    private static void SendAll(Socket sock, byte[] data)
+    private static void SendAll(Connection conn, byte[] data)
     {
+        if (conn.Tls is not null)
+        {
+            // SslStream.Write 语义 = 写完全部字节
+            conn.Tls.Write(data, 0, data.Length);
+            return;
+        }
+
+        Socket sock = conn.Sock;
         int sent = 0;
         while (sent < data.Length)
         {
@@ -575,7 +618,7 @@ public sealed class RemotingClient : IDisposable
         {
             try
             {
-                SendAll(conn.Sock, data);
+                SendAll(conn, data);
             }
             catch (Exception)
             {
@@ -696,6 +739,15 @@ public sealed class RemotingClient : IDisposable
 
     private static void CloseQuietly(Connection conn)
     {
+        try
+        {
+            conn.Tls?.Dispose();
+        }
+        catch
+        {
+            // dispose 失败忽略
+        }
+
         try
         {
             conn.Sock.Dispose();

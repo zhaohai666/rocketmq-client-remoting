@@ -41,6 +41,7 @@ internal static class Program
                 "pop" => LivePop.Run(rest),
                 "popc" => LivePopConsumer.Run(rest),
                 "trace" => LiveTrace.Run(rest),
+                "tls" => LiveTls.Run(rest),
                 "hook" => LiveHook.Run(rest),
                 _ => Unknown(command),
             };

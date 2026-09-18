@@ -163,12 +163,15 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>是否已 Start（诊断用）。</summary>
     public bool Started => _started;
 
+    /// <summary>Java 的 tls.enable 是 JVM 全局系统属性；这里等价为 env ROCKETMQ_TLS_ENABLE。</summary>
+    internal static bool TlsEnabledFromEnv() => RemotingClient.EnvTlsEnabled();
+
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
-        int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000)
+        int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
-        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis);
+        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable);
 
         // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
         // 对应 Java MQClientAPIImpl 构造里
