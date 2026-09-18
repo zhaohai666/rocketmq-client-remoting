@@ -182,6 +182,35 @@ struct ResetOffsetBody {
     static bool decode(const Bytes& data, ResetOffsetBody& out);
 };
 
+// 对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
+// （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。messageQueueTable 的键是
+// MessageQueue（fastjson2 内联对象键）；consumerTable 是 Java 保留的废弃字段
+// （clientId -> 位点表），本客户端不填，序列化时按 Java 形状带空对象。
+struct GetConsumerStatusBody {
+    std::map<MessageQueue, int64_t> messageQueueTable;
+
+    JsonValue toJson() const;
+    Bytes encode() const;
+};
+
+// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult
+// （CONSUME_MESSAGE_DIRECTLY(309) 的应答体）。字段全是标量——唯一不需要处理
+// MessageQueue 内联键的 body。consumeResult 取 CMResult 常量：
+// CR_SUCCESS / CR_LATER / CR_ROLLBACK / CR_COMMIT / CR_THROW_EXCEPTION / CR_RETURN_NULL。
+struct ConsumeMessageDirectlyResult {
+    bool order = false;
+    bool autoCommit = true;
+    std::string consumeResult;
+    std::string remark;
+    int64_t spentTimeMills = 0;
+
+    JsonValue toJson() const;
+    static ConsumeMessageDirectlyResult fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, ConsumeMessageDirectlyResult& out);
+};
+
 }  // namespace rocketmq
 
 #endif  // ROCKETMQ_REMOTING_PROTOCOL_BODY_H

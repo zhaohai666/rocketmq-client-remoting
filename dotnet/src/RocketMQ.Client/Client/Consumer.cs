@@ -822,6 +822,19 @@ public sealed class DefaultMQPushConsumer
             // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
             _mqClient.RemotingClient.RegisterProcessor(RequestCode.GetConsumerRunningInfo,
                 OnGetConsumerRunningInfo);
+
+            // RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发，无需应答。
+            // 重置会触发 rebalance（invokeSync），不能在读线程上同步跑——丢后台线程。
+            _mqClient.RemotingClient.RegisterProcessor(RequestCode.ResetConsumerClientOffset,
+                OnResetConsumerOffset);
+
+            // GET_CONSUMER_STATUS_FROM_CLIENT(221)：admin 查询已消费位点表。
+            _mqClient.RemotingClient.RegisterProcessor(RequestCode.GetConsumerStatusFromClient,
+                OnGetConsumerStatus);
+
+            // CONSUME_MESSAGE_DIRECTLY(309)：broker 推一条消息下来，本地真实消费一次。
+            _mqClient.RemotingClient.RegisterProcessor(RequestCode.ConsumeMessageDirectly,
+                OnConsumeMessageDirectly);
         }
 
         // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
@@ -1251,6 +1264,133 @@ public sealed class DefaultMQPushConsumer
         return resp;
     }
 
+    private RemotingCommand? OnResetConsumerOffset(RemotingCommand cmd, string addr)
+    {
+        // 对应 Java ClientRemotingProcessor RESET_CONSUMER_CLIENT_OFFSET 分支：
+        // oneway 请求（broker 不等响应），重置逻辑丢到后台线程（不能阻塞读线程）。
+        string? group = null;
+        string? topic = null;
+        if (cmd.ExtFields is not null)
+        {
+            if (cmd.ExtFields.TryGetValue("group", out string? g))
+            {
+                group = g;
+            }
+
+            if (cmd.ExtFields.TryGetValue("topic", out string? t))
+            {
+                topic = t;
+            }
+        }
+
+        if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
+        {
+            return null;   // oneway，不回响应
+        }
+
+        var table = new Dictionary<MessageQueue, long>();
+        if (cmd.Body is { Length: > 0 } && ResetOffsetBody.Decode(cmd.Body, out ResetOffsetBody body))
+        {
+            foreach (var kv in body.OffsetTable)
+            {
+                table[kv.Key] = kv.Value;
+            }
+        }
+
+        DefaultMQPushConsumer consumer = this;
+        string topicArg = topic ?? string.Empty;
+        MakeThread("ResetOffsetThread", () =>
+        {
+            try
+            {
+                consumer.ResetOffset(topicArg, table);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("reset offset failed (group=" + ConsumerGroup + "): " + e.Message);
+            }
+        }).Start();
+        return null;
+    }
+
+    private RemotingCommand? OnGetConsumerStatus(RemotingCommand cmd, string addr)
+    {
+        // 运行在读线程上：只做本地快照（已消费位点表），绝不做网络调用。
+        string? group = null;
+        string? topic = null;
+        if (cmd.ExtFields is not null)
+        {
+            if (cmd.ExtFields.TryGetValue("group", out string? g))
+            {
+                group = g;
+            }
+
+            if (cmd.ExtFields.TryGetValue("topic", out string? t))
+            {
+                topic = t;
+            }
+        }
+
+        if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
+        {
+            // 与 Java 一致：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError,
+                "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
+        }
+
+        var body = new GetConsumerStatusBody();
+        foreach (var kv in GetConsumerStatus(topic ?? string.Empty))
+        {
+            body.MessageQueueTable[kv.Key] = kv.Value;
+        }
+
+        RemotingCommand resp = RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
+        resp.Body = body.Encode();
+        return resp;
+    }
+
+    private RemotingCommand? OnConsumeMessageDirectly(RemotingCommand cmd, string addr)
+    {
+        // 与 Python 一致：监听器在读线程上同步跑（admin 一次性探针；监听器里如果再发
+        // 同步请求会自死锁，但那是用户代码职责，Java 读线程同样有此约束）。
+        string? group = null;
+        string? brokerName = null;
+        if (cmd.ExtFields is not null)
+        {
+            if (cmd.ExtFields.TryGetValue("consumerGroup", out string? g))
+            {
+                group = g;
+            }
+
+            if (cmd.ExtFields.TryGetValue("brokerName", out string? b))
+            {
+                brokerName = b;
+            }
+        }
+
+        if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
+        {
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError,
+                "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
+        }
+
+        if (cmd.Body is null || cmd.Body.Length == 0)
+        {
+            return RemotingCommand.CreateResponseCommand(ResponseCode.SystemError, "empty message body");
+        }
+
+        if (!MessageDecoder.DecodeMessage(cmd.Body, out MessageExt msg, true, true, true, false))
+        {
+            return RemotingCommand.CreateResponseCommand(ResponseCode.SystemError, "decode message failed");
+        }
+
+        RemotingCommand ok = RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
+        ok.Body = ConsumeMessageDirectly(msg, brokerName ?? string.Empty).Encode();
+        return ok;
+    }
+
     /// <summary>对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。</summary>
     public ConsumerRunningInfo BuildConsumerRunningInfo()
     {
@@ -1314,6 +1454,188 @@ public sealed class DefaultMQPushConsumer
         info.SubscriptionSet = subs;
         info.StatusTable = statusTable;
         return info;
+    }
+
+    /// <summary>
+    /// 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）：
+    /// 命中本 topic 分配队列的 → 清在途缓冲与拉取游标 → 写新已消费位点 →
+    /// 撤销该队列（持久化新位点 + 顺序解锁）→ 立即 rebalance 从新位点重拉。
+    /// </summary>
+    public void ResetOffset(string topic, IReadOnlyDictionary<MessageQueue, long> offsetTable)
+    {
+        if (string.IsNullOrEmpty(topic) || offsetTable.Count == 0)
+        {
+            return;
+        }
+
+        var hit = new List<MessageQueue>();
+        lock (_lock)
+        {
+            foreach (var kv in _mqMap)
+            {
+                MessageQueue mq = kv.Value;
+                if (mq.Topic != topic)
+                {
+                    continue;
+                }
+
+                if (!offsetTable.TryGetValue(mq, out long off))
+                {
+                    continue;
+                }
+
+                _pending.Remove(kv.Key);        // 等价 ProcessQueue.clear()
+                _offsetTable.Remove(kv.Key);    // 拉取游标一并清掉
+                _consumeOffsetTable[kv.Key] = off;
+                hit.Add(mq);
+            }
+        }
+
+        if (hit.Count == 0)
+        {
+            return;
+        }
+
+        // Java 用 RESET_OFFSET_MAX_WAIT（5 秒）等并发消费跑完；这里缩短以免阻塞太久
+        // （220 是 oneway，broker 不等响应，但仍应尽快返回）。
+        Thread.Sleep(200);
+        bool orderly = IsOrderly();
+        bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
+        var unlockList = new List<MessageQueue>();
+        foreach (MessageQueue mq in hit)
+        {
+            string key = OffsetKey(mq);
+            lock (_lock)
+            {
+                _dropped.Add(key);   // 拉取线程见到 dropped 自行退出并从 _pullThreads 摘除
+                _pending.Remove(key);
+                _mqMap.Remove(key);
+                _offsetTable.Remove(key);
+            }
+
+            // 新位点已在 _consumeOffsetTable：撤销收尾时持久化（对齐 Java resetOffset）
+            if (!broadcast && _mqClient is not null)
+            {
+                try
+                {
+                    _mqClient.UpdateConsumerOffset(ConsumerGroup, mq, offsetTable[mq]);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("persist offset on reset failed for " + mq + ": " + e.Message);
+                }
+
+                if (orderly)
+                {
+                    unlockList.Add(mq);
+                }
+            }
+        }
+
+        if (unlockList.Count > 0 && _mqClient is not null)
+        {
+            try
+            {
+                _mqClient.UnlockBatchMq(ConsumerGroup, _clientId, unlockList);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unlock on reset failed: " + e.Message);
+            }
+        }
+
+        try
+        {
+            DoRebalance();   // 重新分配（队列仍在分配集里，从新位点重拉）
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("rebalance after reset offset failed: " + e.Message);
+        }
+
+        ClientLog.Info("reset offset applied, group=" + ConsumerGroup + " topic=" + topic
+            + " queues=" + hit.Count.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）：
+    /// 返回**已消费位点**表（不是拉取游标），topic 为空则返回全部。
+    /// </summary>
+    public SortedDictionary<MessageQueue, long> GetConsumerStatus(string topic)
+    {
+        var outTable = new SortedDictionary<MessageQueue, long>();
+        lock (_lock)
+        {
+            foreach (var kv in _mqMap)
+            {
+                if (!string.IsNullOrEmpty(topic) && kv.Value.Topic != topic)
+                {
+                    continue;
+                }
+
+                if (_consumeOffsetTable.TryGetValue(kv.Key, out long off))
+                {
+                    outTable[kv.Value] = off;
+                }
+            }
+        }
+
+        return outTable;
+    }
+
+    /// <summary>
+    /// 对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）：
+    /// 本地真实消费一条消息（还原重投 topic 后交给监听器），把结果回给 admin。
+    /// </summary>
+    public ConsumeMessageDirectlyResult ConsumeMessageDirectly(MessageExt msg, string brokerName)
+    {
+        var result = new ConsumeMessageDirectlyResult { AutoCommit = true };
+        var msgs = new List<MessageExt> { msg };
+        var mq = new MessageQueue(msg.Topic, brokerName ?? string.Empty, msg.QueueId);
+        result.Order = IsOrderly();
+        ResetRetryTopicAndNamespace(msgs);
+        long begin = UtilAll.CurrentTimeMillis();
+        if (_messageListener is null)
+        {
+            result.ConsumeResult = "CR_RETURN_NULL";
+        }
+        else if (_messageListener is IMessageListenerOrderly orderlyListener)
+        {
+            try
+            {
+                var ctx = new ConsumeOrderlyContext(mq);
+                ConsumeOrderlyStatus status = orderlyListener.ConsumeMessage(msgs, ctx);
+                result.ConsumeResult = status == ConsumeOrderlyStatus.Success
+                    ? "CR_SUCCESS" : "CR_LATER";
+            }
+            catch (Exception e)
+            {
+                result.ConsumeResult = "CR_THROW_EXCEPTION";
+                result.Remark = e.GetType().Name + ": " + e.Message;
+            }
+        }
+        else if (_messageListener is IMessageListenerConcurrently concurrentListener)
+        {
+            try
+            {
+                var ctx = new ConsumeConcurrentlyContext(mq);
+                ConsumeConcurrentlyStatus status = concurrentListener.ConsumeMessage(msgs, ctx);
+                result.ConsumeResult = status == ConsumeConcurrentlyStatus.ConsumeSuccess
+                    ? "CR_SUCCESS" : "CR_LATER";
+            }
+            catch (Exception e)
+            {
+                result.ConsumeResult = "CR_THROW_EXCEPTION";
+                result.Remark = e.GetType().Name + ": " + e.Message;
+            }
+        }
+        else
+        {
+            result.ConsumeResult = "CR_RETURN_NULL";
+        }
+
+        result.SpentTimeMills = UtilAll.CurrentTimeMillis() - begin;
+        return result;
     }
 
     private static JsonValue MakeProcessQueueInfo(long commitOffset, long cachedMsgCount, bool droped)
@@ -2469,7 +2791,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>平均分配（对应 Java AllocateMessageQueueAveragely）。</summary>
-    private static List<MessageQueue> AllocateMessageQueueAveragely(string consumerGroup, string currentCid,
+    internal static List<MessageQueue> AllocateMessageQueueAveragely(string consumerGroup, string currentCid,
         List<MessageQueue> mqAll, List<string> cidAll)
     {
         if (mqAll.Count == 0)

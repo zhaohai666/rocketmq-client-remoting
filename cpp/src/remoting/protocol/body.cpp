@@ -432,4 +432,51 @@ bool ResetOffsetBody::decode(const Bytes& data, ResetOffsetBody& out) {
     return true;
 }
 
+JsonValue GetConsumerStatusBody::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    JsonValue table = JsonValue::makeObject();
+    for (const auto& kv : messageQueueTable) {
+        table.set(messageQueueKey(kv.first), JsonValue::makeInt(kv.second));
+    }
+    v.set("messageQueueTable", table);
+    // Java 保留的废弃字段 consumerTable（clientId -> 位点表）：始终带空对象，
+    // 与 Python/Java 序列化形状一致。
+    v.set("consumerTable", JsonValue::makeObject());
+    return v;
+}
+
+Bytes GetConsumerStatusBody::encode() const { return RemotingSerializable::encode(toJson()); }
+
+JsonValue ConsumeMessageDirectlyResult::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("order", JsonValue::makeBool(order));
+    v.set("autoCommit", JsonValue::makeBool(autoCommit));
+    v.set("consumeResult", consumeResult.empty() ? JsonValue::makeNull()
+                                                 : JsonValue::makeString(consumeResult));
+    v.set("remark", remark.empty() ? JsonValue::makeNull() : JsonValue::makeString(remark));
+    v.set("spentTimeMills", JsonValue::makeInt(spentTimeMills));
+    return v;
+}
+
+ConsumeMessageDirectlyResult ConsumeMessageDirectlyResult::fromJson(const JsonValue& v) {
+    ConsumeMessageDirectlyResult r;
+    r.order = rawSub(v, "order").boolValue();
+    r.autoCommit = rawSub(v, "autoCommit").boolValue();
+    JsonValue cr = rawSub(v, "consumeResult");
+    if (cr.isString()) r.consumeResult = cr.stringValue();
+    JsonValue rk = rawSub(v, "remark");
+    if (rk.isString()) r.remark = rk.stringValue();
+    r.spentTimeMills = rawSub(v, "spentTimeMills").intValue();
+    return r;
+}
+
+Bytes ConsumeMessageDirectlyResult::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool ConsumeMessageDirectlyResult::decode(const Bytes& data, ConsumeMessageDirectlyResult& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v)) return false;
+    out = fromJson(v);
+    return true;
+}
+
 }  // namespace rocketmq

@@ -158,6 +158,17 @@ public:
     int32_t consumeExecutorQueued() const;
     // 对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。
     ConsumerRunningInfo consumerRunningInfo();
+    // 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）：
+    // 命中本 topic 分配队列的 → 清在途缓冲与拉取游标 → 写新已消费位点 →
+    // 撤销该队列（持久化新位点 + 顺序解锁）→ 立即 rebalance 从新位点重拉。
+    void resetOffset(const std::string& topic, const std::map<MessageQueue, int64_t>& offsetTable);
+    // 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）：
+    // 返回**已消费位点**表（不是拉取游标），topic 为空则返回全部。
+    std::map<MessageQueue, int64_t> getConsumerStatus(const std::string& topic);
+    // 对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）：
+    // 本地真实消费一条消息（还原重投 topic 后交给监听器），把结果回给 admin。
+    ConsumeMessageDirectlyResult consumeMessageDirectly(const MessageExt& msg,
+                                                        const std::string& brokerName);
     void setMessageListener(std::shared_ptr<MessageListener> listener);
     void setPullBatchSize(int32_t n) { pullBatchSize_ = n; }
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }

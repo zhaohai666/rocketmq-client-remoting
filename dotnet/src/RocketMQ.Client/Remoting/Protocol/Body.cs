@@ -680,6 +680,98 @@ public sealed class ResetOffsetBody
     }
 }
 
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
+/// （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。MessageQueueTable 的键是
+/// MessageQueue（fastjson2 内联对象键）；ConsumerTable 是 Java 保留的废弃字段
+/// （clientId 到位点表），本客户端不填，序列化时按 Java 形状带空对象。
+/// </summary>
+public sealed class GetConsumerStatusBody
+{
+    public SortedDictionary<MessageQueue, long> MessageQueueTable { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        var table = JsonValue.MakeObject();
+        foreach (var kv in MessageQueueTable)
+        {
+            table.Set(MessageQueueKeys.MessageQueueKey(kv.Key), JsonValue.MakeInt(kv.Value));
+        }
+
+        v.Set("messageQueueTable", table);
+        v.Set("consumerTable", JsonValue.MakeObject());
+        return v;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+}
+
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult
+/// （CONSUME_MESSAGE_DIRECTLY(309) 的应答体）。字段全是标量——唯一不需要处理
+/// MessageQueue 内联键的 body。ConsumeResult 取 CMResult 常量：
+/// CR_SUCCESS / CR_LATER / CR_ROLLBACK / CR_COMMIT / CR_THROW_EXCEPTION / CR_RETURN_NULL。
+/// </summary>
+public sealed class ConsumeMessageDirectlyResult
+{
+    public bool Order { get; set; }
+
+    public bool AutoCommit { get; set; } = true;
+
+    public string? ConsumeResult { get; set; }
+
+    public string? Remark { get; set; }
+
+    public long SpentTimeMills { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("order", JsonValue.MakeBool(Order));
+        v.Set("autoCommit", JsonValue.MakeBool(AutoCommit));
+        v.Set("consumeResult", ConsumeResult is null ? JsonValue.MakeNull() : JsonValue.MakeString(ConsumeResult));
+        v.Set("remark", Remark is null ? JsonValue.MakeNull() : JsonValue.MakeString(Remark));
+        v.Set("spentTimeMills", JsonValue.MakeInt(SpentTimeMills));
+        return v;
+    }
+
+    public static ConsumeMessageDirectlyResult FromJson(JsonValue v)
+    {
+        var r = new ConsumeMessageDirectlyResult
+        {
+            Order = v.Get("order").BoolValue(),
+            AutoCommit = v.Get("autoCommit").BoolValue(),
+        };
+        if (v.Get("consumeResult").IsString)
+        {
+            r.ConsumeResult = v.Get("consumeResult").StringValue();
+        }
+
+        if (v.Get("remark").IsString)
+        {
+            r.Remark = v.Get("remark").StringValue();
+        }
+
+        r.SpentTimeMills = v.Get("spentTimeMills").IntValue();
+        return r;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out ConsumeMessageDirectlyResult @out)
+    {
+        @out = new ConsumeMessageDirectlyResult();
+        if (!RemotingSerializable.Decode(data, out JsonValue v))
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
 /// <summary>body 层字符串 map 编解码辅助。</summary>
 internal static class AdminJsonStrings
 {

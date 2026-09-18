@@ -15,6 +15,7 @@
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/trace_hook.h"
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/exception.h"
@@ -339,6 +340,95 @@ void DefaultMQPushConsumer::start() {
             RemotingCommand resp = RemotingCommand::createResponseCommand(
                 ResponseCode::SUCCESS, std::string());
             resp.body = consumerRunningInfo().encode();
+            return resp;
+        });
+
+    // RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发，无需应答。
+    // 重置逻辑里会触发 rebalance（lock/unlock/batch 等 invokeSync），不能在读线程上
+    // 同步跑（自死锁，见本文件顶部工程点）——丢到后台线程，立即返回 nullopt。
+    mqClient_->remotingClient().registerProcessor(
+        RequestCode::RESET_CONSUMER_CLIENT_OFFSET,
+        [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
+            auto git = cmd.extFields.find("group");
+            const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
+            if (group != consumerGroup_) return std::nullopt;  // oneway，不回响应
+            std::string topic;
+            auto tit = cmd.extFields.find("topic");
+            if (tit != cmd.extFields.end()) topic = tit->second;
+            std::map<MessageQueue, int64_t> table;
+            if (!cmd.body.empty()) {
+                ResetOffsetBody body;
+                if (ResetOffsetBody::decode(cmd.body, body)) table = std::move(body.offsetTable);
+            }
+            auto tablePtr = std::make_shared<std::map<MessageQueue, int64_t>>(std::move(table));
+            std::thread([this, topic, tablePtr]() {
+                try {
+                    this->resetOffset(topic, *tablePtr);
+                } catch (const std::exception& e) {
+                    logger_warn("reset offset failed (group=" + consumerGroup_
+                                + " topic=" + topic + "): " + e.what());
+                } catch (...) {
+                    logger_warn("reset offset failed (group=" + consumerGroup_
+                                + " topic=" + topic + ")");
+                }
+            }).detach();
+            return std::nullopt;
+        });
+
+    // GET_CONSUMER_STATUS_FROM_CLIENT(221)：admin 查询本消费者已消费位点表，
+    // 回 GetConsumerStatusBody JSON body（messageQueueTable 内联对象键）。
+    mqClient_->remotingClient().registerProcessor(
+        RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT,
+        [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
+            auto git = cmd.extFields.find("group");
+            const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
+            if (group != consumerGroup_) {
+                // 与 Java 一致：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
+                return RemotingCommand::createResponseCommand(
+                    ResponseCode::SYSTEM_ERROR,
+                    "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
+            }
+            std::string topic;
+            auto tit = cmd.extFields.find("topic");
+            if (tit != cmd.extFields.end()) topic = tit->second;
+            GetConsumerStatusBody body;
+            body.messageQueueTable = getConsumerStatus(topic);
+            RemotingCommand resp = RemotingCommand::createResponseCommand(
+                ResponseCode::SUCCESS, std::string());
+            resp.body = body.encode();
+            return resp;
+        });
+
+    // CONSUME_MESSAGE_DIRECTLY(309)：broker 把一条消息推下来，要求本地真实消费一次。
+    // 与 Python 一致：监听器在读线程上同步跑（admin 一次性探针；监听器里如果再发
+    // 同步请求会自死锁，但那是用户代码职责，Java 读线程同样有此约束）。
+    mqClient_->remotingClient().registerProcessor(
+        RequestCode::CONSUME_MESSAGE_DIRECTLY,
+        [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
+            auto git = cmd.extFields.find("consumerGroup");
+            const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
+            if (group != consumerGroup_) {
+                return RemotingCommand::createResponseCommand(
+                    ResponseCode::SYSTEM_ERROR,
+                    "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
+            }
+            if (cmd.body.empty()) {
+                return RemotingCommand::createResponseCommand(
+                    ResponseCode::SYSTEM_ERROR, "empty message body");
+            }
+            MessageExt msg;
+            if (!decodeMessage(cmd.body, msg, /*readBody=*/true, /*decompressBody=*/true,
+                               /*isClient=*/true, /*checkCrc=*/false)) {
+                return RemotingCommand::createResponseCommand(
+                    ResponseCode::SYSTEM_ERROR, "decode message failed");
+            }
+            std::string brokerName;
+            auto bit = cmd.extFields.find("brokerName");
+            if (bit != cmd.extFields.end()) brokerName = bit->second;
+            ConsumeMessageDirectlyResult result = consumeMessageDirectly(msg, brokerName);
+            RemotingCommand resp = RemotingCommand::createResponseCommand(
+                ResponseCode::SUCCESS, std::string());
+            resp.body = result.encode();
             return resp;
         });
 
@@ -1320,6 +1410,100 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
     info.subscriptionSet = subs;
     info.statusTable = statusTable;
     return info;
+}
+
+void DefaultMQPushConsumer::resetOffset(const std::string& topic,
+                                        const std::map<MessageQueue, int64_t>& offsetTable) {
+    // 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）：
+    // suspend → 命中的队列 drop+clear → 等一会儿让在途消费跑完 → 写新位点 →
+    // 撤销该队列（触发 rebalance 重新分配并从新位点开始）。
+    if (topic.empty() || offsetTable.empty()) return;
+    std::vector<std::pair<MessageQueue, int64_t>> hit;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const auto& kv : mqMap_) {
+            const MessageQueue& mq = kv.second;
+            if (mq.topic != topic) continue;
+            auto it = offsetTable.find(mq);
+            if (it == offsetTable.end()) continue;
+            pending_.erase(kv.first);        // 等价 ProcessQueue.clear()
+            offsetTable_.erase(kv.first);    // 拉取游标一并清掉
+            consumeOffsetTable_[kv.first] = it->second;
+            hit.emplace_back(mq, it->second);
+        }
+    }
+    if (hit.empty()) return;
+    // Java 用 RESET_OFFSET_MAX_WAIT（5 秒）等并发消费跑完；这里缩短以免阻塞太久
+    // （220 是 oneway，broker 不等响应，但仍应尽快返回）。
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // 撤销队列：onQueuesRevoked 会把 hit 里带的（新）已消费位点持久化到 broker，
+    // 并对顺序消费解锁——与 Java resetOffset 写位点后走 revoke 收尾一致。
+    onQueuesRevoked(hit);
+    try {
+        doRebalance();
+    } catch (const std::exception& e) {
+        logger_debug(std::string("rebalance after reset offset failed: ") + e.what());
+    }
+    logger_info("reset offset applied, group=" + consumerGroup_ + " topic=" + topic
+                + " queues=" + std::to_string(hit.size()));
+}
+
+std::map<MessageQueue, int64_t> DefaultMQPushConsumer::getConsumerStatus(const std::string& topic) {
+    // 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）：
+    // 返回**已消费位点**表（不是拉取游标）。
+    std::map<MessageQueue, int64_t> out;
+    std::lock_guard<std::mutex> lk(lock_);
+    for (const auto& kv : mqMap_) {
+        if (!topic.empty() && kv.second.topic != topic) continue;
+        auto it = consumeOffsetTable_.find(kv.first);
+        if (it != consumeOffsetTable_.end()) out[kv.second] = it->second;
+    }
+    return out;
+}
+
+ConsumeMessageDirectlyResult DefaultMQPushConsumer::consumeMessageDirectly(
+    const MessageExt& msg, const std::string& brokerName) {
+    // 对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）。
+    ConsumeMessageDirectlyResult result;
+    result.autoCommit = true;
+    std::vector<MessageExt> msgs{msg};
+    MessageQueue mq(msg.topic, brokerName, msg.queueId);
+    result.order = isOrderly();
+    resetRetryTopicAndNamespace(msgs);
+    const int64_t begin = UtilAll::currentTimeMillis();
+    if (messageListener_ == nullptr) {
+        result.consumeResult = "CR_RETURN_NULL";
+    } else if (isOrderly()) {
+        auto* orderly = static_cast<MessageListenerOrderly*>(messageListener_.get());
+        ConsumeOrderlyContext ctx(mq);
+        try {
+            const ConsumeOrderlyStatus status = orderly->consumeMessage(msgs, ctx);
+            result.consumeResult = (status == ConsumeOrderlyStatus::SUCCESS)
+                ? "CR_SUCCESS" : "CR_LATER";
+        } catch (const std::exception& e) {
+            result.consumeResult = "CR_THROW_EXCEPTION";
+            result.remark = std::string("std::exception: ") + e.what();
+        } catch (...) {
+            result.consumeResult = "CR_THROW_EXCEPTION";
+            result.remark = "unknown exception";
+        }
+    } else {
+        auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
+        ConsumeConcurrentlyContext ctx(mq);
+        try {
+            const ConsumeConcurrentlyStatus status = conc->consumeMessage(msgs, ctx);
+            result.consumeResult = (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS)
+                ? "CR_SUCCESS" : "CR_LATER";
+        } catch (const std::exception& e) {
+            result.consumeResult = "CR_THROW_EXCEPTION";
+            result.remark = std::string("std::exception: ") + e.what();
+        } catch (...) {
+            result.consumeResult = "CR_THROW_EXCEPTION";
+            result.remark = "unknown exception";
+        }
+    }
+    result.spentTimeMills = UtilAll::currentTimeMillis() - begin;
+    return result;
 }
 
 void DefaultMQPushConsumer::startTraceDispatcher() {
