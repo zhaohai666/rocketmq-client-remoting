@@ -415,6 +415,18 @@ impl ConsumeReturnType {
     pub fn code(self) -> i32 {
         self as i32
     }
+
+    /// Java `ConsumeReturnType#name()`：轨迹 `ConsumeContextType` 属性存的是这个名字，
+    /// 消费端按名反查 ordinal（见 `trace_hook` 里的 `ConsumeReturnType.valueOf`）。
+    pub fn name(self) -> &'static str {
+        match self {
+            ConsumeReturnType::Success => "SUCCESS",
+            ConsumeReturnType::TimeOut => "TIME_OUT",
+            ConsumeReturnType::Exception => "EXCEPTION",
+            ConsumeReturnType::ReturnNull => "RETURNNULL",
+            ConsumeReturnType::Failed => "FAILED",
+        }
+    }
 }
 
 /// 对应 Java `ConsumeConcurrentlyStatus`。

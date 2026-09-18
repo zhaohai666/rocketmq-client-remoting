@@ -303,7 +303,7 @@ where
 ///
 /// 之所以是 `Arc` 而不是 `&dyn`：钩子列表按注册顺序长期持有 sink，生命周期不能挂
 /// 在生产者的借用上。
-struct SinkAdapter(Arc<dyn TraceDispatcherChannel>);
+pub(crate) struct SinkAdapter(pub Arc<dyn TraceDispatcherChannel>);
 
 impl TraceReportSink for SinkAdapter {
     fn trace_topic_name(&self) -> String {

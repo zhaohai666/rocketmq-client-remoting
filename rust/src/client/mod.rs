@@ -2,12 +2,14 @@
 
 pub mod allocate_strategy;
 pub mod consume_executor;
+pub mod consumer;
 pub mod consumer_stats;
 pub mod hook;
 pub mod latency;
 pub mod metrics;
 pub mod mq_client;
 pub mod producer;
+pub mod pull_consumer;
 pub mod request_reply;
 pub mod result;
 pub mod top_addressing;

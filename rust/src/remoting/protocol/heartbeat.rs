@@ -6,11 +6,13 @@
 //!
 //! ## 为什么本层自带 `SubscriptionData`
 //!
-//! Python 从 `rocketmq.common.subscription_data` 引入它，但本层不允许依赖
-//! `crate::common`（该层与本协议层并行开发）。这里只声明心跳报文用到的字段，
-//! 字段名 / 顺序 / 缺省值与 Python 的 `to_dict()` 逐一对齐；
-//! `filterClassSource` 在 Java 上是 `@JSONField(serialize = false)`，
-//! **故意不出现**在本结构里。
+//! Python 把它放在 `rocketmq.common.subscription_data`，`heartbeat.py` 再从那里
+//! import。Rust 里心跳报文与它是同一套编解码，因此类型声明在本层，字段名 / 顺序 /
+//! 缺省值与 Python 的 `to_dict()` 逐一对齐；`filterClassSource` 在 Java 上是
+//! `@JSONField(serialize = false)`，**故意不出现**在本结构里。
+//! [`FilterAPI`] 计算 `codeSet` 要用 `common::util_all::java_string_hash` ——
+//! 协议层用到 `common` 的工具函数在本 crate 是常态（`route.rs`、`extra_info.rs`、
+//! `serialize.rs` 同样如此）。
 //!
 //! ## 报文细节
 //!
@@ -200,6 +202,73 @@ impl SubscriptionData {
             expression_type: jstring_or(value, "expressionType", ExpressionType::TAG),
         })
     }
+}
+
+// ---------------------------------------------------------------- FilterAPI
+
+/// 订阅表达式 → [`SubscriptionData`]（对应 Java `FilterAPI.buildSubscriptionData`，
+/// Python `common/subscription_data.FilterAPI`）。
+pub struct FilterAPI;
+
+impl FilterAPI {
+    /// Java `FilterAPI.SUB_ALL`。
+    pub const SUB_ALL: &'static str = "*";
+
+    /// 按订阅表达式构造订阅数据。
+    ///
+    /// Java 行为（Python 侧用探针实测过，这里是同一批向量）：
+    /// * `None` / `""` / `"*"` ⇒ `subString` 归一成 `"*"`，**`tagsSet` 与 `codeSet` 都留空**。
+    ///   留空不是省事：`tagsSet` 非空是客户端二次 tag 过滤的开关
+    ///   （`PullAPIWrapper.processPullResult` 的 `!tagsSet.isEmpty()`），塞了 `"*"`
+    ///   会把订阅全量时所有带 tag 的消息自己过滤掉；`codeSet` 则是 broker 侧
+    ///   按 tag 哈希过滤的依据。
+    /// * `" TagA || TagB "` ⇒ `subString` **原样保留空格**，标签各自 trim。
+    /// * `"   "`（纯空白）⇒ 走切分分支，标签 trim 后为空 ⇒ 两个集合都空，
+    ///   但 `subString` 仍是那三个空格（Java `StringUtils.isEmpty` 只认 null/`""`）。
+    /// * `"|||"` ⇒ `tagsSet={"|"}`、`codeSet={124}`（切分只丢**末尾**空串）。
+    /// * `"||"` / `"||||"` ⇒ 报错 `subString split error`（Java 的切分结果长度为 0）。
+    pub fn build_subscription_data(
+        topic: &str,
+        sub_string: Option<&str>,
+    ) -> Result<SubscriptionData> {
+        let mut sub = SubscriptionData::new(topic, sub_string.unwrap_or(""));
+        let raw = match sub_string {
+            None => return Ok(normalise_sub_all(sub)),
+            Some(s) => s,
+        };
+        if raw.is_empty() || raw == Self::SUB_ALL {
+            return Ok(normalise_sub_all(sub));
+        }
+        // Java String.split("\\|\\|")：丢掉**末尾**空串，中间的留着。
+        let mut parts: Vec<&str> = raw.split("||").collect();
+        while parts.last() == Some(&"") {
+            parts.pop();
+        }
+        if parts.is_empty() {
+            // Java: throw new Exception("subString split error")
+            return Err(Error::client("subString split error"));
+        }
+        let mut tags: Vec<String> = Vec::new();
+        let mut codes: Vec<i32> = Vec::new();
+        for part in parts {
+            let tag = part.trim();
+            if !tag.is_empty() {
+                tags.push(tag.to_string());
+                codes.push(crate::common::util_all::java_string_hash(tag));
+            }
+        }
+        // set_tags 负责去重 + 升序（等价 Python 的 sorted(set)）。
+        sub.set_tags(tags, codes);
+        Ok(sub)
+    }
+}
+
+/// Java 的 SUB_ALL 归一：`subString = "*"`，两个集合保持为空。
+fn normalise_sub_all(mut sub: SubscriptionData) -> SubscriptionData {
+    sub.sub_string = FilterAPI::SUB_ALL.to_string();
+    sub.tags_set.clear();
+    sub.code_set.clear();
+    sub
 }
 
 // ---------------------------------------------------------------- ProducerData
@@ -592,6 +661,63 @@ mod tests {
             assert!(
                 matches!(HeartbeatData::decode(raw), Err(Error::Decode(_))),
                 "input {raw:?} must be rejected"
+            );
+        }
+    }
+
+    /// 黄金向量取自**跑起来的 Python 参考实现**
+    /// （`python/rocketmq/common/subscription_data.FilterAPI`），不是手推的。
+    #[test]
+    fn filter_api_matches_the_python_reference_vector_by_vector() {
+        /// (用例名, 订阅表达式, 期望 subString, 期望 tagsSet, 期望 codeSet)
+        type Case = (&'static str, Option<&'static str>, &'static str, &'static [&'static str], &'static [i32]);
+        let cases: &[Case] = &[
+            ("none", None, "*", &[], &[]),
+            ("empty", Some(""), "*", &[], &[]),
+            ("sub-all", Some("*"), "*", &[], &[]),
+            ("blank-kept", Some("   "), "   ", &[], &[]),
+            ("one-tag", Some("TagA"), "TagA", &["TagA"], &[2598919]),
+            (
+                "two-tags",
+                Some("TagA||TagB"),
+                "TagA||TagB",
+                &["TagA", "TagB"],
+                &[2598919, 2598920],
+            ),
+            (
+                "spaces-around-tags",
+                Some(" TagA || TagB "),
+                " TagA || TagB ",
+                &["TagA", "TagB"],
+                &[2598919, 2598920],
+            ),
+            ("only-separators", Some("|||"), "|||", &["|"], &[124]),
+            ("trailing-empty-dropped", Some("a||||"), "a||||", &["a"], &[97]),
+            ("leading-empty-dropped", Some("||TagA"), "||TagA", &["TagA"], &[2598919]),
+            ("duplicates-collapse", Some("TagA||TagA"), "TagA||TagA", &["TagA"], &[2598919]),
+        ];
+        for (what, expression, sub_string, tags, codes) in cases {
+            let sub = FilterAPI::build_subscription_data("T", *expression)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(sub.topic, "T", "{what}");
+            assert_eq!(&sub.sub_string, sub_string, "{what} subString");
+            assert_eq!(&sub.tags_set, tags, "{what} tagsSet");
+            assert_eq!(&sub.code_set, codes, "{what} codeSet");
+            // Python 的 build_subscription_data 从不改 expressionType / classFilterMode。
+            assert_eq!(sub.expression_type, ExpressionType::TAG, "{what}");
+            assert!(!sub.class_filter_mode, "{what}");
+        }
+    }
+
+    #[test]
+    fn filter_api_rejects_an_all_empty_split_like_java() {
+        for raw in ["||", "||||"] {
+            assert!(
+                matches!(
+                    FilterAPI::build_subscription_data("T", Some(raw)),
+                    Err(Error::Client { message, .. }) if message == "subString split error"
+                ),
+                "input {raw:?} must raise subString split error"
             );
         }
     }
