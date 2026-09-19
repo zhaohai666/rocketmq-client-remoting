@@ -517,9 +517,10 @@ int main(int argc, char** argv) {
         }
         check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
 
-        // 回查默认 60s 一轮；联调 broker 配了 transactionCheckInterval=3000，
-        // 这里给足窗口等 broker 回查 + 提交后再投递
-        ConsumerRun run = runConsumer(topic, "*", 25, false, "txcheck");
+        // 回查节奏取决于 broker：本机集群 transactionCheckInterval 为 30s 一轮，
+        // 半消息在发送后 15~17s 才被提交，故窗口必须覆盖一整个回查周期；
+        // expect=1 让消费者一收到就返回，不必等满。
+        ConsumerRun run = runConsumer(topic, "*", 40, false, "txcheck", /*expect=*/1);
         bool consumed = false;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "tx-check") consumed = true;
