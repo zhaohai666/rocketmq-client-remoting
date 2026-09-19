@@ -140,7 +140,8 @@ void ConsumerStatsManager::shutdown() {
         if (!started_) return;
         stop_ = true;
     }
-    // 用 condvar 唤醒；这里简化：等待线程退出（最长一轮 10s）。测试里一般不 start()。
+    // 采样线程停在 wait_for(10s) 上，必须显式唤醒，否则 shutdown 要等满一个采样周期
+    sampleCond_.notify_all();
     if (sampleThread_ && sampleThread_->joinable()) {
         sampleThread_->join();
     }

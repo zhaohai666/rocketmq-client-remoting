@@ -313,7 +313,8 @@ int main(int argc, char** argv) {
     }
 
     // ---------- 6. 生产 + 统计 + 查询 ----------
-    std::vector<std::pair<Bytes, std::string>> sent;  // body, msgId
+    std::vector<std::pair<Bytes, std::string>> sent;  // body, uniqKey msgId
+    std::vector<std::string> offsetIds;               // broker 侧 offsetMsgId（viewMessage 要用它）
     MessageQueue firstMq;
     {
         DefaultMQProducer prod("AdminLiveCppProducer_" + stamp);
@@ -326,6 +327,7 @@ int main(int argc, char** argv) {
                 SendResult sr = prod.send(Message(topic, str2bytes(payload)));
                 if (sr.sendStatus == SendStatus::SEND_OK) {
                     sent.emplace_back(str2bytes(payload), sr.msgId);
+                    offsetIds.push_back(sr.offsetMsgId);
                     if (firstMq.topic.empty()) firstMq = sr.messageQueue;
                 }
             } catch (const std::exception& e) {
@@ -395,9 +397,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // viewMessage：从 msgId 解 broker 地址 + commitLog 偏移
+    // viewMessage：从 offsetMsgId 解 broker 地址 + commitLog 偏移（uniqKey 解不出来）
     try {
-        MessageExt vm = admin.viewMessage(topic, sent[0].second);
+        const std::string viewId = offsetIds.empty() ? sent[0].second : offsetIds[0];
+        MessageExt vm = admin.viewMessage(topic, viewId);
         check("viewMessage(byMsgId)", true,
               "topic=" + vm.topic + " offset=" + std::to_string(vm.queueOffset)
               + " body=" + bytes2str(vm.body).substr(0, 32));

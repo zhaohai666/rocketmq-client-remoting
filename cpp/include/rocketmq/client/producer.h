@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,6 +51,23 @@ public:
     void setEnableTraceContext(bool b) { enableTraceContext_ = b; }
     void setSendMsgTimeout(int32_t millis) { sendMsgTimeout_ = millis; }
     void setRetryTimesWhenSendFailed(int32_t n) { retryTimesWhenSendFailed_ = n; }
+    // 对应 Java DefaultMQProducer.retryAnotherBrokerWhenNotStoreOK（默认 false）：
+    // 同步发送拿到 FLUSH_DISK_TIMEOUT / FLUSH_SLAVE_TIMEOUT / SLAVE_NOT_AVAILABLE 时，
+    // 是否换个 broker 重试；false 时直接把该结果返回给调用方。
+    void setRetryAnotherBrokerWhenNotStoreOK(bool b) { retryAnotherBrokerWhenNotStoreOK_ = b; }
+    bool isRetryAnotherBrokerWhenNotStoreOK() const { return retryAnotherBrokerWhenNotStoreOK_; }
+    // 对应 Java sendMsgMaxTimeoutPerRequest（默认 -1 表示不限制）：还有重试机会时，
+    // 单次请求最多用掉这么多毫秒，把剩余超时留给后面的 broker。
+    void setSendMsgMaxTimeoutPerRequest(int32_t millis) { sendMsgMaxTimeoutPerRequest_ = millis; }
+    int32_t getSendMsgMaxTimeoutPerRequest() const { return sendMsgMaxTimeoutPerRequest_; }
+    // 对应 Java DefaultMQProducer.addRetryResponseCode / getRetryResponseCodes：
+    // broker 返回这些响应码（MQBrokerException）时才重试，其余立即抛出。
+    // 默认集合与 Java 一致，见 retryResponseCodes_ 初始化。
+    void addRetryResponseCode(int32_t responseCode) { retryResponseCodes_.insert(responseCode); }
+    const std::set<int32_t>& getRetryResponseCodes() const { return retryResponseCodes_; }
+    bool isRetryResponseCode(int32_t responseCode) const {
+        return retryResponseCodes_.count(responseCode) > 0;
+    }
     void setMaxMessageSize(int32_t bytes) { maxMessageSize_ = bytes; }
     void setDefaultTopicQueueNums(int32_t n) { defaultTopicQueueNums_ = n; }
     void setCreateTopicKey(const std::string& key) { createTopicKey_ = key; }
@@ -278,6 +296,14 @@ protected:
     // Request-Reply 默认超时（对应 Java DefaultMQProducer 的 request 兜底 3000ms）
     int32_t requestTimeoutMillis_ = DEFAULT_REQUEST_TIMEOUT_MILLIS;
     int32_t retryTimesWhenSendFailed_ = 2;
+    bool retryAnotherBrokerWhenNotStoreOK_ = false;
+    int32_t sendMsgMaxTimeoutPerRequest_ = -1;
+    // 可重试的 broker 响应码，默认集合与 Java DefaultMQProducer#retryResponseCodes 一致
+    std::set<int32_t> retryResponseCodes_ = {
+        ResponseCode::SYSTEM_ERROR,        ResponseCode::SYSTEM_BUSY,
+        ResponseCode::SERVICE_NOT_AVAILABLE, ResponseCode::NO_PERMISSION,
+        ResponseCode::TOPIC_NOT_EXIST,     ResponseCode::NO_BUYER_ID,
+        ResponseCode::NOT_IN_CURRENT_UNIT, ResponseCode::GO_AWAY};
     int32_t maxMessageSize_ = 1024 * 1024 * 4;
     // 压缩配置，默认值与 Java DefaultMQProducer 一致
     int32_t compressMsgBodyOverHowmuch_ = 1024 * 4;

@@ -99,14 +99,22 @@ void testManagerConsumeStatus() {
 }
 
 void testStartShutdown() {
-    // 生命周期：start 后采样线程在跑，shutdown 干净退出（不挂死）
+    // 生命周期：start 后采样线程在跑，shutdown 干净退出（不挂死）。
+    // 回归守卫：shutdown 曾经不唤醒停在 10s wait_for 的采样线程，
+    // 于是每个生产者/消费者关闭都要卡满一个采样周期。
     ConsumerStatsManager m;
     m.start();
     m.incPullRT("G", "T", 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto begin = std::chrono::steady_clock::now();
     m.shutdown();
+    const long long ms = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin)
+            .count());
+    if (ms >= 1000) std::printf("  shutdown blocked %lldms (sampling thread not woken)\n", ms);
+    expectTrue(ms < 1000, "shutdown wakes the sampling thread immediately");
     m.shutdown();  // 幂等
-    expectTrue(true, "start/shutdown lifecycle");
 }
 
 void testConsumeStatusJson() {

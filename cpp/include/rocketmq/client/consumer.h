@@ -309,7 +309,8 @@ public:
 
     // ---------------- 管理 ----------------
     std::vector<MessageQueue> fetchSubscribeMessageQueues(const std::string& topic);
-    // 消息重投（对应 Java sendMessageBack）：返回 false 表示被 broker 拒收
+    // 消息重投（对应 Java sendMessageBack）：内部不抛异常。返回 false 表示
+    // CONSUMER_SEND_MSG_BACK 与"普通消息重投"兜底都失败了。
     bool sendMessageBack(const MessageExt& msg, int32_t delayLevel,
                          const std::string& brokerName = std::string());
     // 向所有已知 broker 发一次心跳（对应 Java sendHeartbeatToAllBrokerWithLock）
@@ -331,6 +332,9 @@ private:
     bool sendBackBatch(const std::vector<MessageExt>& batch,
                        const ConsumeConcurrentlyContext& ctx);
     void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch);
+    // 回投兜底（Java getMaxReconsumeTimes / sendMessageBackAsNormalMessage）
+    int32_t maxReconsumeTimesOrDefault() const;
+    void sendMessageBackAsNormalMessage(const MessageExt& msg);
     // 位点持久化：每 5s 把"已消费位点"提交 broker（Java persistAllConsumerOffset）
     void offsetPersistLoop();
     void persistOffsetsOnce();

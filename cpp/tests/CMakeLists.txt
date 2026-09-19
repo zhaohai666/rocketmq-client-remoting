@@ -47,6 +47,11 @@ add_executable(rmq_test_latency test_latency.cpp)
 target_link_libraries(rmq_test_latency PRIVATE rocketmq::remoting)
 add_test(NAME latency COMMAND rmq_test_latency)
 
+# 发送重试链路：mock name server + broker，锁死 sendDefaultImpl 的重试分类语义
+add_executable(rmq_test_send_retry test_send_retry.cpp)
+target_link_libraries(rmq_test_send_retry PRIVATE rocketmq::remoting)
+add_test(NAME send_retry COMMAND rmq_test_send_retry)
+
 # POP 模式：CK 串编解码 + 请求头字段名守卫 + POP_CK 反构
 add_executable(rmq_test_pop test_pop.cpp)
 target_link_libraries(rmq_test_pop PRIVATE rocketmq::remoting)

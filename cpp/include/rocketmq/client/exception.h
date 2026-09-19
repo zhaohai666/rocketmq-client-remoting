@@ -8,6 +8,16 @@
 
 namespace rocketmq {
 
+// 客户端自身错误码（对应 org.apache.rocketmq.client.common.ClientErrorCode）。
+// broker 响应码占 1~2xxx，客户端错误从 10001 起，避免与 ResponseCode 混淆。
+struct ClientErrorCode {
+    static constexpr int32_t CONNECT_BROKER_EXCEPTION = 10001;
+    static constexpr int32_t ACCESS_BROKER_TIMEOUT = 10002;
+    static constexpr int32_t BROKER_NOT_EXIST_EXCEPTION = 10003;
+    static constexpr int32_t NO_NAME_SERVER_EXCEPTION = 10004;
+    static constexpr int32_t NOT_FOUND_TOPIC_EXCEPTION = 10005;
+};
+
 struct MQClientException : public std::runtime_error {
     // 对应 Python MQClientException(message, response_code)；默认 1（UNKNOWN）。
     // 管理端靠它把 broker 响应码透传出来——例如 resetOffsetNew 需要区分

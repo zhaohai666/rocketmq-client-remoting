@@ -1681,7 +1681,10 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
 void DefaultMQPushConsumer::offsetPersistLoop() {
     // Java MQClientInstance.startScheduledTask：persistAllConsumerOffset 每 5s
     while (!stop_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+        // 周期 5s，但按 100ms 切片以便 shutdown 立刻收手（整段 sleep 会把 join 拖满 5s）
+        for (int i = 0; i < 50 && !stop_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         if (stop_.load() || !started_.load()) return;
         try {
             persistOffsetsOnce();
@@ -2126,30 +2129,90 @@ std::vector<MessageQueue> DefaultMQPushConsumer::fetchSubscribeMessageQueues(
     return out;
 }
 
+int32_t DefaultMQPushConsumer::maxReconsumeTimesOrDefault() const {
+    // Java getMaxReconsumeTimes()：-1 表示用 broker 默认的 16
+    return maxReconsumeTimes_ == -1 ? 16 : maxReconsumeTimes_;
+}
+
+// 对应 Java DefaultMQPushConsumerImpl#sendMessageBackAsNormalMessage：
+// 回投请求失败时，把这条消息当成普通消息重新发到 %RETRY%group，
+// 由 broker 按 DELAY 档位重投。属性置法与 Java 逐条一致。
+void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg) {
+    MQClientInstance& c = client();
+    Message newMsg(MixAll::getRetryTopic(consumerGroup_), msg.body);
+    newMsg.properties = msg.properties;
+    newMsg.flag = msg.flag;
+    std::string originMsgId = msg.getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID);
+    if (originMsgId.empty()) originMsgId = msg.msgId;
+    if (!originMsgId.empty()) {
+        newMsg.putProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID, originMsgId);
+    }
+    newMsg.putProperty(MessageConst::PROPERTY_RETRY_TOPIC, msg.topic);
+    newMsg.putProperty(MessageConst::PROPERTY_RECONSUME_TIME,
+                       std::to_string(msg.reconsumeTimes + 1));
+    newMsg.putProperty(MessageConst::PROPERTY_MAX_RECONSUME_TIMES,
+                       std::to_string(maxReconsumeTimesOrDefault()));
+    // 半消息重投时不能带上 TRAN_MSG，否则 broker 会把它再当回查消息处理
+    newMsg.properties.erase(MessageConst::PROPERTY_TRANSACTION_PREPARED);
+    newMsg.putProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL,
+                       std::to_string(3 + msg.reconsumeTimes));
+    if (newMsg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).empty()) {
+        newMsg.putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+                           InnerIdGenerator::createUniqId());
+    }
+
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
+    MessageQueue selected = publish->selectOneMessageQueue();
+    c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0);
+}
+
 bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel,
                                            const std::string& brokerNameIn) {
     MQClientInstance& c = client();
     std::string brokerName = brokerNameIn.empty() ? msg.brokerName : brokerNameIn;
-    std::string addr = c.brokerAddrOf(brokerName);
-    if (addr.empty()) {
-        throw MQClientException("broker " + brokerName + " not found");
+    // Java：整个回投过程包在 try/catch(Throwable) 里，失败退化到"普通消息重投"，
+    // 绝不把异常抛给消费线程（否则这条消息既没 ack 也没回投，只能等超时重复消费）。
+    try {
+        std::string addr = c.brokerAddrOf(brokerName);
+        if (addr.empty()) {
+            throw MQClientException("Broker[" + brokerName + "] master node does not exist");
+        }
+        auto header = std::make_shared<ConsumerSendMsgBackRequestHeader>();
+        header->offset = msg.commitLogOffset;
+        header->group = consumerGroup_;
+        header->delayLevel = delayLevel;
+        header->originMsgId = msg.msgId;
+        header->originTopic = msg.topic;
+        header->unitMode = false;
+        header->maxReconsumeTimes = maxReconsumeTimesOrDefault();
+        RemotingCommand request =
+            RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
+        RemotingCommand response = c.remotingClient().invokeSync(addr, request, 5000);
+        if (response.code != ResponseCode::SUCCESS) {
+            throw MQBrokerException(response.code, response.remark);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        logger_error("Failed to send message back, consumerGroup=" + consumerGroup_
+                     + ", brokerName=" + brokerName + ", msg=" + msg.msgId
+                     + ", fallback to normal send: " + e.what());
+    } catch (...) {
+        logger_error("Failed to send message back, consumerGroup=" + consumerGroup_
+                     + ", brokerName=" + brokerName + ", msg=" + msg.msgId
+                     + ", fallback to normal send: unknown error");
     }
-    auto header = std::make_shared<ConsumerSendMsgBackRequestHeader>();
-    header->offset = msg.commitLogOffset;
-    header->group = consumerGroup_;
-    header->delayLevel = delayLevel;
-    header->originMsgId = msg.msgId;
-    header->originTopic = msg.topic;
-    header->unitMode = false;
-    // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
-    header->maxReconsumeTimes = maxReconsumeTimes_ == -1 ? 16 : maxReconsumeTimes_;
-    RemotingCommand request =
-        RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
-    RemotingCommand response = c.remotingClient().invokeSync(addr, request, 5000);
-    if (response.code != ResponseCode::SUCCESS) {
-        throw MQBrokerException(response.code, response.remark);
+    try {
+        sendMessageBackAsNormalMessage(msg);
+        return true;
+    } catch (const std::exception& e) {
+        logger_error("Failed to send message back as normal message, consumerGroup="
+                     + consumerGroup_ + ", msg=" + msg.msgId + ": " + e.what());
+    } catch (...) {
+        logger_error("Failed to send message back as normal message, consumerGroup="
+                     + consumerGroup_ + ", msg=" + msg.msgId + ": unknown error");
     }
-    return true;
+    return false;
 }
 
 std::vector<std::string> DefaultMQPushConsumer::assignedQueueKeys() const {

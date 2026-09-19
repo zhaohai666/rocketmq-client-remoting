@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,6 +30,24 @@ std::string trim(const std::string& s) {
     if (b == std::string::npos) return std::string();
     size_t e = s.find_last_not_of(" \t\r\n");
     return s.substr(b, e - b + 1);
+}
+
+// 对应 Java 失败信息里的 Arrays.toString(brokersSent)
+std::string joinStrings(const std::vector<std::string>& parts) {
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) out += ", ";
+        out += parts[i];
+    }
+    return out;
+}
+
+// 用单调钟算耗时：一次本地 broker 往返可能不到 1ms，整数毫秒差会在容错表里记成
+// latency=0，那这条 broker 就永远不会被延迟阈值判到。
+double elapsedMillis(const std::chrono::steady_clock::time_point& from) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - from)
+        .count();
 }
 
 std::vector<std::string> splitSemicolon(const std::string& addr) {
@@ -442,48 +461,131 @@ void DefaultMQProducer::startTraceDispatcher() {
 }
 
 // ---------------------------------------------------------------- 同步发送
+// 逐条对齐 Java DefaultMQProducerImpl#sendDefaultImpl：
+//   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
+//   * 每次尝试先算 costTime，总超时已用完则整体放弃（→ RemotingTooMuchRequestException）；
+//     还剩重试机会时，单次请求超时被 sendMsgMaxTimeoutPerRequest 压住，把余量留给后面的 broker；
+//   * 异常按类型分档写容错表，且只有 retryResponseCodes 里的 broker 响应码才继续重试；
+//   * 全部失败时把原因映射成 ClientErrorCode 塞进 MQClientException。
 SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     MQClientInstance& c = client();
-    int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
+    const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
     Message outbound = withNamespace(msg);
     ensureUniqId(outbound);
     const int32_t sysFlag = prepareForSend(outbound);
 
-    std::string lastError;
+    // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉
+    try {
+        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    } catch (const MQClientException& e) {
+        throw MQClientException(e.what(), ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
+    }
+
+    const int32_t timesTotal = retryTimesWhenSendFailed_ + 1;
+    const int64_t beginFirst = UtilAll::currentTimeMillis();
+    std::vector<std::string> brokersSent;
     std::string lastBrokerName;
-    for (int32_t attempt = 0; attempt <= retryTimesWhenSendFailed_; ++attempt) {
+    SendResult result;
+    bool gotResult = false;
+    bool callTimeout = false;
+    // 最后一次失败的原因，用于循环结束后的错误码映射
+    enum class Cause { NONE, BROKER, CONNECT, TIMEOUT, CLIENT, OTHER };
+    Cause cause = Cause::NONE;
+    int32_t brokerCode = 0;
+    std::string lastError;
+
+    for (int32_t times = 0; times < timesTotal; ++times) {
+        MessageQueue selected;
+        int64_t beginPrev = UtilAll::currentTimeMillis();
+        std::chrono::steady_clock::time_point attemptBegan = std::chrono::steady_clock::now();
         try {
             std::shared_ptr<TopicPublishInfo> publish =
                 c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
             // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
-            // 关闭时退化为普通轮询（策略内部判断）。
-            MessageQueue selected = mqFaultStrategy_.selectOneMessageQueue(*publish, lastBrokerName);
+            // 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
+            // 从而能避开 lastBrokerName 选到别的 broker。
+            selected = mqFaultStrategy_.selectOneMessageQueue(*publish, lastBrokerName,
+                                                              /*resetIndex=*/times > 0);
             lastBrokerName = selected.brokerName;
-            const int64_t sendBegin = UtilAll::currentTimeMillis();
-            SendResult result;
-            try {
-                result = sendWithHooks(c, outbound, selected, timeout, sysFlag);
-            } catch (...) {
-                // 发送异常：按隔离档位记录（latency 固定 10000ms），broker 进入隔离期
-                mqFaultStrategy_.updateFaultItem(selected.brokerName, 0.0, true, false);
-                throw;
+            brokersSent.push_back(selected.brokerName);
+
+            beginPrev = UtilAll::currentTimeMillis();
+            const int64_t costTime = beginPrev - beginFirst;
+            if (timeout < costTime) {
+                callTimeout = true;
+                break;
             }
+            int32_t curTimeout = static_cast<int32_t>(timeout - costTime);
+            const bool canRetryAgain = times + 1 < timesTotal;
+            if (sendMsgMaxTimeoutPerRequest_ > -1 && canRetryAgain
+                && curTimeout > sendMsgMaxTimeoutPerRequest_) {
+                curTimeout = sendMsgMaxTimeoutPerRequest_;
+            }
+            attemptBegan = std::chrono::steady_clock::now();
+            result = sendWithHooks(c, outbound, selected, curTimeout, sysFlag);
+            gotResult = true;
             // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
-            mqFaultStrategy_.updateFaultItem(
-                selected.brokerName,
-                static_cast<double>(UtilAll::currentTimeMillis() - sendBegin), false, true);
+            mqFaultStrategy_.updateFaultItem(selected.brokerName, elapsedMillis(attemptBegan),
+                                             false, true);
+            // Java：非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
+            // 否则把这个"存了但没存好"的结果原样返回
+            if (result.sendStatus != SendStatus::SEND_OK && retryAnotherBrokerWhenNotStoreOK_) {
+                continue;
+            }
             return result;
-        } catch (const MQClientException& e) {
-            lastError = e.what();
         } catch (const MQBrokerException& e) {
+            // broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+            if (!selected.brokerName.empty()) {
+                mqFaultStrategy_.updateFaultItem(selected.brokerName,
+                                                 elapsedMillis(attemptBegan), true, false);
+            }
             lastError = e.what();
+            cause = Cause::BROKER;
+            brokerCode = e.getResponseCode();
+            if (isRetryResponseCode(brokerCode)) continue;
+            if (gotResult) return result;
+            throw;
         } catch (const RemotingException& e) {
+            // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测线程，
+            // 所以 Java 的 reachable=!isStartDetectorEnable() 恒为 true。
+            if (!selected.brokerName.empty()) {
+                mqFaultStrategy_.updateFaultItem(selected.brokerName,
+                                                 elapsedMillis(attemptBegan), true, true);
+            }
             lastError = e.what();
+            if (dynamic_cast<const RemotingConnectException*>(&e) != nullptr) {
+                cause = Cause::CONNECT;
+            } else if (dynamic_cast<const RemotingTimeoutException*>(&e) != nullptr) {
+                cause = Cause::TIMEOUT;
+            } else {
+                cause = Cause::OTHER;
+            }
+        } catch (const MQClientException& e) {
+            // 客户端自己的问题（选不到队列、路由没了…）：与 broker 健康度无关，不隔离
+            lastError = e.what();
+            cause = Cause::CLIENT;
         }
     }
-    throw MQClientException("send failed after " + std::to_string(retryTimesWhenSendFailed_ + 1)
-                            + " attempts, last error: " + lastError);
+
+    if (gotResult) return result;
+    const int32_t costTotal = static_cast<int32_t>(UtilAll::currentTimeMillis() - beginFirst);
+    if (callTimeout) {
+        throw RemotingTooMuchRequestException("sendDefaultImpl call timeout");
+    }
+    std::string info = "Send [" + std::to_string(brokersSent.size())
+                       + "] times, still failed, cost [" + std::to_string(costTotal)
+                       + "]ms, Topic: " + outbound.topic + ", BrokersSent: ["
+                       + joinStrings(brokersSent) + "], last error: " + lastError;
+    int32_t responseCode = 1;
+    switch (cause) {
+        case Cause::BROKER: responseCode = brokerCode; break;
+        case Cause::CONNECT: responseCode = ClientErrorCode::CONNECT_BROKER_EXCEPTION; break;
+        case Cause::TIMEOUT: responseCode = ClientErrorCode::ACCESS_BROKER_TIMEOUT; break;
+        case Cause::CLIENT: responseCode = ClientErrorCode::BROKER_NOT_EXIST_EXCEPTION; break;
+        default: break;
+    }
+    throw MQClientException(info, responseCode);
 }
 
 SendResult DefaultMQProducer::send(const Message& msg, const MessageQueue& mq,
