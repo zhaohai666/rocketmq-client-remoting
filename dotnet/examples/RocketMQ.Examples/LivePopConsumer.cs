@@ -127,6 +127,17 @@ public static class LivePopConsumer
         {
             lock (_lk) return _keys.Count;
         }
+
+        public List<string> Snapshot()
+        {
+            lock (_lk) return new List<string>(_keys);
+        }
+
+        // 至少被投递过两次的不同消息数（"每条都重投了"才是 S3 要证明的语义）
+        public int RedeliveredKinds()
+        {
+            lock (_lk) return _keys.GroupBy(k => k).Count(g => g.Count() >= 2);
+        }
     }
 
     public static int Run(string[] args)
@@ -232,11 +243,13 @@ public static class LivePopConsumer
         Check("S3a 首轮投递 3 条", first && firstRound >= 3,
             "count=" + firstRound.ToString(CultureInfo.InvariantCulture));
 
-        bool again = WaitUntil(() => laterListener.Count() >= firstRound + 3, 40000);
-        int total = laterListener.Count();
-        Check("S3b 消费失败后被重新投递（延长不可见时间生效）", again,
+        // ⚠ 断言的是"每条都重投过"，不是"又多收了 3 次投递"：按条数算时，
+        // 某一条被重投 3 次而另一条从没回来也会通过。
+        bool again = WaitUntil(() => laterListener.RedeliveredKinds() >= 3, 40000);
+        Check("S3b 每条消费失败的消息都被重新投递（延长不可见时间生效）", again,
             "first=" + firstRound.ToString(CultureInfo.InvariantCulture)
-                + " total=" + total.ToString(CultureInfo.InvariantCulture));
+                + " redelivered=" + laterListener.RedeliveredKinds().ToString(CultureInfo.InvariantCulture)
+                + " deliveries=" + string.Join(",", laterListener.Snapshot()));
         c2.Shutdown();
         p2.Shutdown();
 

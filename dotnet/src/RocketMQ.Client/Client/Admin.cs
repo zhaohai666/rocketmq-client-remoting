@@ -1197,35 +1197,58 @@ public sealed class DefaultMQAdminExt
             topic, key, maxNum, 0, now + 3600L * 1000, MessageConst.IndexKeyType, false);
     }
 
-    /// <summary>对应 Java MQAdminImpl.viewMessage：从 msgId 自身解出 broker 地址 + commitLog 偏移。</summary>
+    /// <summary>
+    /// 对应 Java DefaultMQAdminExtImpl.viewMessage：先按 offset msgId 直查 commitLog，
+    /// 解不出或查不到就退回 uniqKey（5.x 客户端返回的 msgId 本身就是 uniqKey，
+    /// 硬解只会得到越界的垃圾端口）。
+    /// </summary>
     public MessageExt ViewMessage(string topic, string msgId)
     {
-        if (!MessageDecoder.DecodeMessageId(msgId, out string ip, out int port, out long offset))
+        Exception? byIdError;
+        try
         {
-            throw new MQClientException("query message by id finished, but no message.",
-                ResponseCode.NoMessage);
+            if (!MessageDecoder.DecodeMessageId(msgId, out string ip, out int port, out long offset)
+                || port <= 0 || port > ushort.MaxValue)
+            {
+                throw new MQClientException("not a valid offset msgId: " + msgId,
+                    ResponseCode.NoMessage);
+            }
+
+            PropertyMap ext = new()
+            {
+                ["topic"] = topic,
+                ["offset"] = I64Str(offset),
+            };
+            RemotingCommand response = RequireClient().InvokeSync(
+                ip + ":" + port.ToString(CultureInfo.InvariantCulture),
+                RequestCode.ViewMessageById, ext, null, false, _timeoutMillis);
+            if (response.Body.Length == 0)
+            {
+                throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
+            }
+
+            List<MessageExt> msgs = MessageDecoder.DecodeMessages(response.Body, true);
+            if (msgs.Count == 0)
+            {
+                throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
+            }
+
+            return msgs[0];
+        }
+        catch (Exception e)
+        {
+            // Java 同样只 warn，然后走 uniqKey 兜底
+            byIdError = e;
         }
 
-        string addr = ip + ":" + port.ToString(CultureInfo.InvariantCulture);
-        PropertyMap ext = new()
+        if (QueryMessageByUniqKey(topic, msgId, out MessageExt found))
         {
-            ["topic"] = topic,
-            ["offset"] = I64Str(offset),
-        };
-        RemotingCommand response = RequireClient().InvokeSync(
-            addr, RequestCode.ViewMessageById, ext, null, false, _timeoutMillis);
-        if (response.Body.Length == 0)
-        {
-            throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
+            return found;
         }
 
-        List<MessageExt> msgs = MessageDecoder.DecodeMessages(response.Body, true);
-        if (msgs.Count == 0)
-        {
-            throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
-        }
-
-        return msgs[0];
+        throw new MQClientException(
+            "viewMessage failed: neither offset msgId nor uniq key matched message " + msgId
+            + " of " + topic, byIdError, ResponseCode.NoMessage);
     }
 
     public QueryConsumeQueueResponseBody QueryConsumeQueue(string brokerAddr, string topic,

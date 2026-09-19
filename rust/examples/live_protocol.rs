@@ -498,7 +498,9 @@ async fn s4_pull(
     sent: &Sent,
     ck: &mut Checker,
 ) -> Live {
-    let sys_flag = PullSysFlag::build_sys_flag_basic(false, false, true, false);
+    // suspend 位必须置上：commitLog→consumeQueue 的分发是异步的，不留长轮询窗口
+    // 时刚发出去的消息会以 PULL_NOT_FOUND(19) 返回。
+    let sys_flag = PullSysFlag::build_sys_flag_basic(false, true, true, false);
     let req = RemotingCommand::create_request_command(
         request_code::PULL_MESSAGE,
         Some(Box::new(PullMessageRequestHeader {

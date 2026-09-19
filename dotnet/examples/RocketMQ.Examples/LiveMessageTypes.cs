@@ -255,6 +255,30 @@ internal static class LiveMessageTypes
 
         Check("集群探活", true, "brokers=" + string.Join(",", brokers));
 
+        // 预建本用例全部 topic：新 topic 只能等 broker 每 30s 一轮的
+        // registerNameServerPeriod 才进路由，期间消费者的订阅是空转的。
+        {
+            var admin = new DefaultMQAdminExt();
+            admin.SetNamesrvAddr(_gNamesrv);
+            admin.SetTimeoutMillis(10000);
+            admin.Start();
+            try
+            {
+                foreach (string suffix in new[]
+                         { "Async", "Order", "Tag", "Prop", "Delay", "Key", "Tx",
+                           "TxRollback", "TxCheck", "Hb" })
+                {
+                    admin.CreateTopic(MixAll.DefaultTopic, _gPrefix + "_" + suffix, 4);
+                }
+                Thread.Sleep(1000);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("  预建 topic 失败（改用自动创建）: " + e.Message);
+            }
+            admin.Shutdown();
+        }
+
         long t0 = UtilAll.CurrentTimeMillis();
 
         // ---------- 1. 异步发送 ----------

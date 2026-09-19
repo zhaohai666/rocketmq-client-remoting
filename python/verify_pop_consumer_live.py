@@ -185,12 +185,20 @@ def main():
         first_round = len(later_keys)
     check("S3a 首轮投递 3 条", ok_first and first_round >= 3, "count=%d" % first_round)
 
-    # 失败后客户端延长不可见时间（3s），到期应重新可见并被再次投递
-    ok_again = wait_until(lambda: len(later_keys) >= first_round + 3, timeout=40.0)
+    # 失败后客户端延长不可见时间（3s），到期应重新可见并被再次投递。
+    # ⚠ 断言的是"每条都重投过"，不是"又多收了 3 次投递"：按条数算时，
+    #   某一条被重投 3 次而另一条从没回来也会通过。
+    def redelivered_kinds():
+        counts = {}
+        for k in later_keys:
+            counts[k] = counts.get(k, 0) + 1
+        return sum(1 for n in counts.values() if n >= 2)
+
+    ok_again = wait_until(redelivered_kinds, timeout=40.0)
     with lock:
-        total = len(later_keys)
-    check("S3b 消费失败后被重新投递（延长不可见时间生效）", ok_again,
-          "first=%d total=%d" % (first_round, total))
+        joined = ",".join(str(k) for k in later_keys)
+    check("S3b 每条消费失败的消息都被重新投递（延长不可见时间生效）", ok_again,
+          "first=%d redelivered=%d deliveries=%s" % (first_round, redelivered_kinds(), joined))
 
     c2.shutdown()
     p2.shutdown()

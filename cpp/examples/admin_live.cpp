@@ -25,10 +25,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <typeinfo>
 #include <vector>
 
 #include "rocketmq/client/admin.h"
 #include "rocketmq/client/consumer.h"
+#include "rocketmq/client/exception.h"
 #include "rocketmq/client/producer.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/logging.h"
@@ -397,17 +399,30 @@ int main(int argc, char** argv) {
         }
     }
 
-    // viewMessage：从 offsetMsgId 解 broker 地址 + commitLog 偏移（uniqKey 解不出来）
+    // viewMessage(byOffsetMsgId)：只有 broker 赋值的 offsetMsgId 解得出 commitLog 偏移
     try {
         const std::string viewId = offsetIds.empty() ? sent[0].second : offsetIds[0];
         MessageExt vm = admin.viewMessage(topic, viewId);
-        check("viewMessage(byMsgId)", true,
+        check("viewMessage(byOffsetMsgId)", true,
               "topic=" + vm.topic + " offset=" + std::to_string(vm.queueOffset)
               + " body=" + bytes2str(vm.body).substr(0, 32));
         check("viewMessage body 与发送一致", vm.body == sent[0].first,
               "期望 " + bytes2str(sent[0].first) + " 实际 " + bytes2str(vm.body));
     } catch (const std::exception& e) {
-        check("viewMessage(byMsgId)", false, e.what());
+        check("viewMessage(byOffsetMsgId)", false, e.what());
+    }
+
+    // viewMessage(uniqKey)：5.x 的 msgId 解不出偏移，必须走 uniqKey 兜底并给出干净异常，
+    // 而不是拿垃圾端口去 connect
+    try {
+        admin.viewMessage(topic, sent[0].second);
+        check("viewMessage(uniqKey) 走兜底并给出干净异常", false, "没有抛异常");
+    } catch (const MQClientException& e) {
+        check("viewMessage(uniqKey) 走兜底并给出干净异常", true,
+              "code=" + std::to_string(e.getResponseCode()));
+    } catch (const std::exception& e) {
+        check("viewMessage(uniqKey) 走兜底并给出干净异常", false,
+              std::string(typeid(e).name()) + ": " + e.what());
     }
 
     // ---------- 7. Offset 只读查询 ----------

@@ -1013,28 +1013,44 @@ std::vector<MessageExt> DefaultMQAdminExt::queryMessageByKey(const std::string& 
 }
 
 MessageExt DefaultMQAdminExt::viewMessage(const std::string& topic, const std::string& msgId) {
-    // 对应 Java MQAdminImpl.viewMessage：从 msgId 自身解出 broker 地址 + commitLog 偏移
-    std::string ip;
-    int32_t port = 0;
-    int64_t offset = 0;
-    if (!decodeMessageId(msgId, ip, port, offset)) {
-        throw MQClientException("query message by id finished, but no message.",
-                                ResponseCode::NO_MESSAGE);
+    // 对应 Java DefaultMQAdminExtImpl.viewMessage：先按 offset msgId 直查 commitLog，
+    // 解不出或查不到就退回 uniqKey（5.x 客户端返回的 msgId 本身就是 uniqKey，
+    // 硬解只会得到越界的垃圾端口）。
+    std::string byIdError;
+    try {
+        std::string ip;
+        int32_t port = 0;
+        int64_t offset = 0;
+        if (!decodeMessageId(msgId, ip, port, offset) || port <= 0 || port > 65535) {
+            throw MQClientException("not a valid offset msgId: " + msgId,
+                                    ResponseCode::NO_MESSAGE);
+        }
+        std::string addr = ip + ":" + std::to_string(port);
+        PropertyMap ext;
+        ext["topic"] = topic;
+        ext["offset"] = i64str(offset);
+        RemotingCommand response = requireClient().invokeSync(
+            addr, RequestCode::VIEW_MESSAGE_BY_ID, ext, Bytes(), false, timeoutMillis_);
+        if (response.body.empty()) {
+            throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
+        }
+        std::vector<MessageExt> msgs = decodeMessages(response.body, true);
+        if (msgs.empty()) {
+            throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
+        }
+        return msgs[0];
+    } catch (const std::exception& e) {
+        // Java 同样只 warn，然后走 uniqKey 兜底
+        byIdError = e.what();
     }
-    std::string addr = ip + ":" + std::to_string(port);
-    PropertyMap ext;
-    ext["topic"] = topic;
-    ext["offset"] = i64str(offset);
-    RemotingCommand response = requireClient().invokeSync(
-        addr, RequestCode::VIEW_MESSAGE_BY_ID, ext, Bytes(), false, timeoutMillis_);
-    if (response.body.empty()) {
-        throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
+
+    MessageExt found;
+    if (queryMessageByUniqKey(topic, msgId, found)) {
+        return found;
     }
-    std::vector<MessageExt> msgs = decodeMessages(response.body, true);
-    if (msgs.empty()) {
-        throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
-    }
-    return msgs[0];
+    throw MQClientException(
+        "viewMessage failed: neither offset msgId nor uniq key matched message " + msgId
+        + " of " + topic + ", last error: " + byIdError, ResponseCode::NO_MESSAGE);
 }
 
 QueryConsumeQueueResponseBody DefaultMQAdminExt::queryConsumeQueue(

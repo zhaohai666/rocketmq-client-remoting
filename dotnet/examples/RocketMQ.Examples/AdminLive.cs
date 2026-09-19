@@ -342,7 +342,7 @@ internal static class AdminLive
         }
 
         // ---------- 6. 生产 + 统计 + 查询 ----------
-        var sent = new List<(byte[] Body, string MsgId)>();
+        var sent = new List<(byte[] Body, string MsgId, string OffsetMsgId)>();
         MessageQueue firstMq = new();
         {
             var prod = new DefaultMQProducer("AdminLiveDotnetProducer_" + stamp)
@@ -359,7 +359,7 @@ internal static class AdminLive
                     SendResult sr = prod.Send(new Message(topic, Str2Bytes(payload)));
                     if (sr.SendStatus == SendStatus.SendOk)
                     {
-                        sent.Add((Str2Bytes(payload), sr.MsgId));
+                        sent.Add((Str2Bytes(payload), sr.MsgId, sr.OffsetMsgId));
                         if (firstMq.Topic.Length == 0) firstMq = sr.MessageQueue;
                     }
                 }
@@ -447,13 +447,13 @@ internal static class AdminLive
             }
         }
 
-        // viewMessage：从 msgId 解 broker 地址 + commitLog 偏移
+        // viewMessage(byOffsetMsgId)：只有 broker 赋值的 offset msgId 能解出 commitLog 偏移
         try
         {
-            MessageExt vm = admin.ViewMessage(topic, sent[0].MsgId);
+            MessageExt vm = admin.ViewMessage(topic, sent[0].OffsetMsgId);
             string bodyStr = Bytes2Str(vm.Body);
             string head = bodyStr.Length > 32 ? bodyStr.Substring(0, 32) : bodyStr;
-            Check("viewMessage(byMsgId)", true,
+            Check("viewMessage(byOffsetMsgId)", true,
                 "topic=" + vm.Topic + " offset=" + vm.QueueOffset.ToString(CultureInfo.InvariantCulture)
                 + " body=" + head);
             bool bodyEq = vm.Body.Length == sent[0].Body.Length && vm.Body.AsSpan().SequenceEqual(sent[0].Body.AsSpan());
@@ -462,7 +462,25 @@ internal static class AdminLive
         }
         catch (Exception e)
         {
-            Check("viewMessage(byMsgId)", false, e.Message);
+            Check("viewMessage(byOffsetMsgId)", false, e.Message);
+        }
+
+        // viewMessage(uniqKey)：5.x 的 msgId 解不出偏移，必须走 uniqKey 兜底并给出干净异常，
+        // 而不是拿垃圾端口去 connect（曾表现为 "connect failed to 192.168.0.105:371196628"）
+        try
+        {
+            admin.ViewMessage(topic, sent[0].MsgId);
+            Check("viewMessage(uniqKey) 走兜底并给出干净异常", false, "没有抛异常");
+        }
+        catch (MQClientException e)
+        {
+            Check("viewMessage(uniqKey) 走兜底并给出干净异常", true, "code="
+                + e.ResponseCode.ToString(CultureInfo.InvariantCulture));
+        }
+        catch (Exception e)
+        {
+            Check("viewMessage(uniqKey) 走兜底并给出干净异常", false,
+                e.GetType().Name + ": " + e.Message);
         }
 
         // ---------- 7. Offset 只读查询 ----------

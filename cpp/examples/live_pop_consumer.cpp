@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -233,19 +234,36 @@ int main(int argc, char* argv[]) {
         }
         check("S3a 首轮投递 3 条", first && firstRound >= 3, "count=" + std::to_string(firstRound));
 
+        // ⚠ 断言的是"每条都重投过"，不是"又多收了 3 次投递"：按条数算时，
+        // 某一条被重投 3 次而另一条从没回来也会通过。
+        auto redeliveredKinds = [&]() {
+            std::map<std::string, int32_t> seen;
+            for (const std::string& k : keys) ++seen[k];
+            size_t n = 0;
+            for (const auto& e : seen) {
+                if (e.second >= 2) ++n;
+            }
+            return n;
+        };
+
         bool again = waitUntil(
             [&]() {
                 std::lock_guard<std::mutex> lk(mtx);
-                return keys.size() >= firstRound + 3;
+                return redeliveredKinds() >= 3;
             },
             40000);
-        size_t total = 0;
+        std::string joined;
+        size_t kinds = 0;
         {
             std::lock_guard<std::mutex> lk(mtx);
-            total = keys.size();
+            kinds = redeliveredKinds();
+            for (const std::string& k : keys) {
+                joined += (joined.empty() ? "" : ",") + k;
+            }
         }
-        check("S3b 消费失败后被重新投递（延长不可见时间生效）", again,
-              "first=" + std::to_string(firstRound) + " total=" + std::to_string(total));
+        check("S3b 每条消费失败的消息都被重新投递（延长不可见时间生效）", again,
+              "first=" + std::to_string(firstRound) + " redelivered=" + std::to_string(kinds)
+                  + " deliveries=" + joined);
         c2->shutdown();
         p2.shutdown();
     }
