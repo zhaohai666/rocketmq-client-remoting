@@ -108,23 +108,27 @@ class TlsFrameServer:
         self._thread.start()
 
     def _loop(self):
-        """accept 循环。
+        """accept 循环：握手与收发都在连接线程里做。
 
-        每条连接单独起线程服务：若在 accept 线程里内联执行，服务端一次只服务一条连接，
-        全套件跑时别的用例残留的连接（端口复用）会把 accept 线程卡死，而 Windows 下
-        connect() 打进 backlog 是成功的——于是真正的客户端只会等满 15s 超时。
+        握手不能留在 accept 线程里内联执行：一条对端已经消失的半开连接会把 accept
+        线程卡在 ``wrap_socket`` 上，而 Windows 下 connect() 打进 backlog 是成功的——
+        真正的客户端只会等满超时（本用例原先 15s 就是这么挂的）。
         """
         try:
             while True:
                 conn, _ = self._listen.accept()
-                try:
-                    tls = self._ctx.wrap_socket(conn, server_side=True)
-                except (OSError, ssl.SSLError):
-                    conn.close()
-                    continue
-                threading.Thread(target=self._serve, args=(tls,), daemon=True).start()
+                threading.Thread(target=self._handshake_and_serve, args=(conn,),
+                                 daemon=True).start()
         except OSError:
             pass  # stop() 关掉监听套接字
+
+    def _handshake_and_serve(self, conn):
+        try:
+            tls = self._ctx.wrap_socket(conn, server_side=True)
+        except (OSError, ssl.SSLError):
+            conn.close()
+            return
+        self._serve(tls)
 
     def _serve(self, tls):
         try:
@@ -145,10 +149,29 @@ class TlsFrameServer:
         except (OSError, ssl.SSLError):
             pass
         finally:
-            try:
-                tls.close()
-            except OSError:
-                pass
+            self._close_tls(tls)
+
+    @staticmethod
+    def _close_tls(tls):
+        """先 close_notify 再关：与 Netty 的 SslHandler 关闭行为一致。
+
+        直接 closesocket 时若内核接收缓冲里还留着没读走的 TLS 1.3 NewSessionTicket，
+        Windows 会发 RST 而不是 FIN；这条 RST 能打到下一条复用同一 4 元组的新连接上，
+        把它的第一个请求静默吞掉。
+        """
+        try:
+            tls.settimeout(2.0)
+            tls.unwrap()
+        except (OSError, ssl.SSLError, ValueError):
+            pass
+        try:
+            tls.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            tls.close()
+        except OSError:
+            pass
 
     @staticmethod
     def _recv_exact(tls, n):
@@ -170,18 +193,63 @@ class TlsFrameServer:
             pass
 
 
+def _route_request():
+    return rc_mod.RemotingCommand.create_request_command(
+        RequestCode.GET_ROUTEINFO_BY_TOPIC,
+        (lambda h: (setattr(h, "topic", "t"), h)[1])(headers_mod.GetRouteInfoRequestHeader()))
+
+
 def test_invoke_sync_over_tls(tls_cert):
     server = TlsFrameServer(*tls_cert)
     try:
         client = RemotingClient(tls_enable=True)
-        req = rc_mod.RemotingCommand.create_request_command(
-            RequestCode.GET_ROUTEINFO_BY_TOPIC, (lambda h: (setattr(h, "topic", "t"), h)[1])(headers_mod.GetRouteInfoRequestHeader()))
-        resp = client.invoke_sync("127.0.0.1:%d" % server.port, req, 15000)
+        req = _route_request()
+        resp = client.invoke_sync("127.0.0.1:%d" % server.port, req, 5000)
         assert resp.code == ResponseCode.SUCCESS
         assert resp.opaque == req.opaque
         client.shutdown()
     finally:
         server.stop()
+
+
+def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
+    """反复建/断 TLS 连接：每条新连接的第一个请求都必须送达。
+
+    盯的是关闭路径。上一轮连接若是硬关（没发 close_notify），内核接收缓冲里还留着
+    对端 TLS 1.3 的 NewSessionTicket 没读走，Windows 就会发 RST 而不是 FIN；这条 RST
+    打到复用同一 4 元组的下一条新连接上，新连接的第一个请求被静默吞掉，调用方只能
+    等满超时。改前本机 loopback 实测每轮新建连接约 25~30% 挂一次，改后必须 0 次。
+    """
+    server = TlsFrameServer(*tls_cert)
+    addr = "127.0.0.1:%d" % server.port
+    try:
+        for _ in range(12):
+            client = RemotingClient(tls_enable=True)
+            try:
+                resp = client.invoke_sync(addr, _route_request(), 3000)
+                assert resp.code == ResponseCode.SUCCESS
+            finally:
+                client.shutdown()
+    finally:
+        server.stop()
+
+
+def test_tls_shutdown_leaves_no_reader_threads(tls_cert):
+    """shutdown() 必须等读线程退干净：套接字由读线程自己关，别人抢着关不安全。"""
+    server = TlsFrameServer(*tls_cert)
+    addr = "127.0.0.1:%d" % server.port
+    before = {t.name for t in threading.enumerate()}
+    try:
+        for _ in range(3):
+            client = RemotingClient(tls_enable=True)
+            resp = client.invoke_sync(addr, _route_request(), 3000)
+            assert resp.code == ResponseCode.SUCCESS
+            client.shutdown()
+    finally:
+        server.stop()
+    leaked = [t.name for t in threading.enumerate()
+              if t.name not in before and t.name.startswith("rmq-read-")]
+    assert not leaked, "reader threads survived shutdown: %s" % leaked
 
 
 def test_tls_client_to_plaintext_server_fails():
