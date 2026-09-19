@@ -475,9 +475,11 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     ensureUniqId(outbound);
     const int32_t sysFlag = prepareForSend(outbound);
 
-    // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉
+    // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉。
+    // 与 Java 一致：整条重试链只用这一份发布信息，中途路由刷新不会换掉候选队列。
+    std::shared_ptr<TopicPublishInfo> publish;
     try {
-        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+        publish = c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
     } catch (const MQClientException& e) {
         throw MQClientException(e.what(), ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
     }
@@ -500,8 +502,6 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
         int64_t beginPrev = UtilAll::currentTimeMillis();
         std::chrono::steady_clock::time_point attemptBegan = std::chrono::steady_clock::now();
         try {
-            std::shared_ptr<TopicPublishInfo> publish =
-                c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
             // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
             // 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
             // 从而能避开 lastBrokerName 选到别的 broker。
@@ -562,7 +562,11 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
                 cause = Cause::OTHER;
             }
         } catch (const MQClientException& e) {
-            // 客户端自己的问题（选不到队列、路由没了…）：与 broker 健康度无关，不隔离
+            // 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离
+            if (!selected.brokerName.empty()) {
+                mqFaultStrategy_.updateFaultItem(selected.brokerName,
+                                                 elapsedMillis(attemptBegan), false, true);
+            }
             lastError = e.what();
             cause = Cause::CLIENT;
         }

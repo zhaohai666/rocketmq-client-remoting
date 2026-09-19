@@ -61,15 +61,8 @@ private:
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "usage: rmq_tls_live <namesrv> <topic> <group>\n";
-        return 2;
-    }
-    const std::string namesrv = argv[1];
-    const std::string topic = argv[2];
-    const std::string group = argv[3];
-
+static int runLive(const std::string& namesrv, const std::string& topic,
+                   const std::string& group) {
     // 1) 预建 topic（约定 5：先建 topic 再起消费者；消费者不做默认 topic 兜底）
     {
         DefaultMQProducer prep("GID_TLS_PREP");
@@ -124,4 +117,24 @@ int main(int argc, char** argv) {
               << "\n  props=" << listener->lastProps()
               << (ok ? "  [PASS]" : "  [FAIL]") << "\n";
     return ok ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 4) {
+        std::cerr << "usage: rmq_tls_live <namesrv> <topic> <group>\n";
+        return 2;
+    }
+#ifndef RMQ_HAS_TLS
+    // 没找到 OpenSSL 时 TLS 实现整体不编译，setTlsEnable(true) 会抛异常；
+    // 显式 SKIP，别让它以未捕获异常的形式崩掉（看上去像用例失败）。
+    std::cout << "SKIP: built without TLS support (OpenSSL not found by CMake)\n";
+    return 0;
+#else
+    try {
+        return runLive(argv[1], argv[2], argv[3]);
+    } catch (const std::exception& e) {
+        std::cout << "  [FAIL] uncaught: " << e.what() << "\n";
+        return 1;
+    }
+#endif
 }
