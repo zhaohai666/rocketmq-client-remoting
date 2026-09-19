@@ -27,7 +27,11 @@ namespace rocketmq {
 
 class RemotingClient {
 public:
-    using InvokeCallback = std::function<void(const RemotingCommand&)>;
+    // 异步回调（对应 Java InvokeCallback#operationComplete(ResponseFuture)）。
+    // error 非空表示**失败**（超时、连接断开等），此时 response 无效必须忽略；
+    // error 为空表示收到响应。Java 用 (response, throwable) 两个参数表达同一件事。
+    using InvokeCallback = std::function<void(const RemotingCommand& response,
+                                              const std::string& error)>;
 
     // broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
     // 对应 Java NettyRemotingAbstract 的 processor 表。返回值语义与 Java
@@ -64,7 +68,9 @@ public:
                                int32_t timeoutMillis = -1);
 
     // 异步调用：发送后立即返回，响应到达时在读线程里触发 callback。
-    // 注意 callback 在**读线程**中执行，实现需自行保证线程安全。
+    // 注意 callback 在**读线程**（或超时清理线程）中执行，实现需自行保证线程安全。
+    // timeoutMillis 会登记到在途表项，超时后由清理线程以 error 回调一次（对应 Java
+    // NettyRemotingAbstract 的 scanResponseTable），不会因对端不回包而永久悬挂。
     void invokeAsync(const std::string& addr, RemotingCommand& request,
                      InvokeCallback callback, int32_t timeoutMillis = -1);
 

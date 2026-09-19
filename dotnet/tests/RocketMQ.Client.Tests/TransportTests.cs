@@ -228,4 +228,93 @@ public class TransportTests
             await Task.WhenAny(loopTask, Task.Delay(100));
         }
     }
+
+    [Fact]
+    public async Task InvokeAsync_EchoRoundTrip_FiresOnceWithResponse()
+    {
+        (Socket server, IPEndPoint ep, Func<Task> loop) = await StartEchoBrokerAsync();
+        var loopTask = Task.Run(loop);
+        try
+        {
+            using var client = new RemotingClient();
+            RemotingCommand req = MakeRequest();
+            int fired = 0;
+            RemotingCommand? seen = null;
+            Exception? err = null;
+            client.InvokeAsync(ep.ToString(), req, (response, error) =>
+            {
+                Interlocked.Increment(ref fired);
+                seen = response;
+                err = error;
+            });
+
+            for (int i = 0; i < 100 && Volatile.Read(ref fired) == 0; i++)
+            {
+                await Task.Delay(20);
+            }
+
+            Assert.Equal(1, fired);
+            Assert.Null(err);
+            Assert.NotNull(seen);
+            Assert.Equal(ResponseCode.Success, seen!.Code);
+            // 响应必须回填同一个 opaque，否则说明在途表关联错了
+            Assert.Equal(req.Opaque, seen.Opaque);
+        }
+        finally
+        {
+            server.Dispose();
+            await Task.WhenAny(loopTask, Task.Delay(100));
+        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_SilentServer_TimeoutFiresOnceWithError()
+    {
+        // 只 accept、永不回包：timeoutMillis 必须生效，回调仍要**恰好一次**带上超时异常。
+        // 修复前该参数被直接丢弃，在途条目和回调都会永久悬挂。
+        var server = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        server.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        server.Listen(2);
+        var ep = (IPEndPoint)server.LocalEndPoint!;
+        Task acceptTask = Task.Run(async () =>
+        {
+            try
+            {
+                Socket conn = await server.AcceptAsync();
+                await Task.Delay(5000); // 收下就不回
+                conn.Dispose();
+            }
+            catch
+            {
+                // 服务端已释放
+            }
+        });
+        try
+        {
+            using var client = new RemotingClient();
+            int fired = 0;
+            Exception? err = null;
+            client.InvokeAsync(ep.ToString(), MakeRequest(), (response, error) =>
+            {
+                Interlocked.Increment(ref fired);
+                err = error;
+            }, 300);
+
+            // 清理线程与 Java scanResponseTable 同式：deadline + 1s 宽限才判超时
+            for (int i = 0; i < 300 && Volatile.Read(ref fired) == 0; i++)
+            {
+                await Task.Delay(20);
+            }
+
+            Assert.Equal(1, fired);
+            Assert.IsAssignableFrom<RemotingTimeoutException>(err);
+            await Task.Delay(300);
+            Assert.Equal(1, fired); // 不会被重复投递
+        }
+        finally
+        {
+            server.Dispose();
+            await Task.WhenAny(acceptTask, Task.Delay(100));
+        }
+    }
 }

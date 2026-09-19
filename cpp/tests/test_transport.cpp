@@ -17,21 +17,11 @@
 #include <vector>
 
 #include "rocketmq/common/byte_buffer.h"
+#include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/remoting_client.h"
-
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
 
 using namespace rocketmq;
 
@@ -48,27 +38,14 @@ static int g_fail = 0;
         }                                                                      \
     } while (0)
 
-#if defined(_WIN32)
-
-int main() {
-    std::cout << "transport checks: skipped on Windows\n";
-    return 0;
-}
-
-#else
-
 namespace {
 
-using sock_t = int;
-
-void closeSock(sock_t s) {
-    if (s >= 0) {
-        ::close(s);
-    }
-}
+using netcompat::socket_t;
+using netcompat::socklen_type;
+using netcompat::kInvalidSocket;
 
 // 阻塞读取 n 字节；返回 false 表示对端关闭
-bool readN(sock_t s, char* buf, size_t n) {
+bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
     while (got < n) {
         int r = static_cast<int>(::recv(s, buf + got, static_cast<int>(n - got), 0));
@@ -81,7 +58,7 @@ bool readN(sock_t s, char* buf, size_t n) {
 }
 
 // 读取一个完整帧（含 4 字节 totalLength 前缀）
-bool readFrame(sock_t s, Bytes& out) {
+bool readFrame(socket_t s, Bytes& out) {
     char lenBuf[4];
     if (!readN(s, lenBuf, 4)) {
         return false;
@@ -99,11 +76,12 @@ bool readFrame(sock_t s, Bytes& out) {
     return true;
 }
 
-bool writeAll(sock_t s, const Bytes& data) {
+bool writeAll(socket_t s, const Bytes& data) {
     size_t sent = 0;
     while (sent < data.size()) {
         int n = static_cast<int>(::send(s, data.data() + sent,
-                                       static_cast<int>(data.size() - sent), 0));
+                                       static_cast<int>(data.size() - sent),
+                                       netcompat::sendFlags()));
         if (n <= 0) {
             return false;
         }
@@ -122,27 +100,31 @@ enum class ServerMode {
 class TestServer {
 public:
     explicit TestServer(ServerMode mode, int maxRequests = 8) : mode_(mode), maxRequests_(maxRequests) {
+        netcompat::ensureInitialized();
         listenSock_ = ::socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
-        ::setsockopt(listenSock_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        ::setsockopt(listenSock_, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&one), static_cast<int>(sizeof(one)));
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0;  // 让内核分配端口
         ::bind(listenSock_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
         ::listen(listenSock_, 4);
-        socklen_t len = sizeof(addr);
+        socklen_type len = sizeof(addr);
         ::getsockname(listenSock_, reinterpret_cast<struct sockaddr*>(&addr), &len);
         port_ = ntohs(addr.sin_port);
         thread_ = std::thread([this]() { serve(); });
     }
 
     ~TestServer() {
+        // 先置位、再 join、最后关监听 socket：Windows 上 closesocket 不会唤醒阻塞在
+        // accept 里的线程，join 前先关句柄反而会让 serve() 使用已失效的 socket。
         stop_.store(true);
-        closeSock(listenSock_);
         if (thread_.joinable()) {
             thread_.join();
         }
+        netcompat::closeSocket(listenSock_);
     }
 
     std::string address() const { return "127.0.0.1:" + std::to_string(port_); }
@@ -150,18 +132,33 @@ public:
 
 private:
     void serve() {
-        // 循环 accept：closeChannel 后客户端会重连，服务端必须愿意接第二次
+        // 循环 accept：closeChannel 后客户端会重连，服务端必须愿意接第二次。
+        // 用 select 轮询而不是裸 accept：这样 stop_ 置位后线程能在 100ms 内退出
+        // （Windows 的 closesocket 不会唤醒阻塞中的 accept）。
         while (!stop_.load() && served_.load() < maxRequests_) {
-            sock_t conn = ::accept(listenSock_, nullptr, nullptr);
-            if (conn < 0) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listenSock_, &rfds);
+            timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100 * 1000;
+            const int ready = ::select(netcompat::selectNfds(listenSock_), &rfds, nullptr, nullptr, &tv);
+            if (ready == 0) {
+                continue;  // 超时，回去看 stop_
+            }
+            if (ready < 0) {
                 break;  // 监听 socket 已被关闭
             }
+            socket_t conn = ::accept(listenSock_, nullptr, nullptr);
+            if (conn == kInvalidSocket) {
+                break;
+            }
             handleConn(conn);
-            closeSock(conn);
+            netcompat::closeSocket(conn);
         }
     }
 
-    void handleConn(sock_t conn) {
+    void handleConn(socket_t conn) {
         while (!stop_.load() && served_.load() < maxRequests_) {
             Bytes frame;
             if (!readFrame(conn, frame)) {
@@ -200,7 +197,7 @@ private:
 
     ServerMode mode_;
     int maxRequests_;
-    sock_t listenSock_ = -1;
+    socket_t listenSock_ = kInvalidSocket;
     uint16_t port_ = 0;
     std::atomic<bool> stop_{false};
     std::atomic<int> served_{0};
@@ -284,13 +281,15 @@ int main() {
         std::atomic<bool> called{false};
         std::atomic<int32_t> gotCode{0};
         std::atomic<int32_t> gotOpaque{0};
+        std::atomic<int32_t> errLen{0};
 
         RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         const int32_t opaque = req.opaque;
         client.invokeAsync(server.address(), req,
-                           [&](const RemotingCommand& r) {
+                           [&](const RemotingCommand& r, const std::string& err) {
                                gotCode.store(r.code);
                                gotOpaque.store(r.opaque);
+                               errLen.store(static_cast<int32_t>(err.size()));
                                called.store(true);
                            });
         for (int i = 0; i < 200 && !called.load(); ++i) {
@@ -299,6 +298,32 @@ int main() {
         CHECK(called.load(), "invokeAsync callback fired");
         CHECK(gotCode.load() == ResponseCode::SUCCESS, "invokeAsync response code");
         CHECK(gotOpaque.load() == opaque, "invokeAsync opaque matched");
+        CHECK(errLen.load() == 0, "invokeAsync success carries no error");
+        client.shutdown();
+    }
+
+    // ------------------------------------------------------ 3b. 异步超时回调
+    // 对端收下请求但永不回复：timeoutMillis 必须生效，回调仍要触发**一次**（带 error）。
+    // 修复前该参数被直接丢弃，在途表项和回调都会永久悬挂。
+    {
+        TestServer server(ServerMode::Silent, 1);
+        RemotingClient client;
+        std::atomic<int32_t> fired{0};
+        std::atomic<int32_t> errLen{0};
+
+        RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
+        client.invokeAsync(
+            server.address(), req,
+            [&](const RemotingCommand&, const std::string& err) {
+                ++fired;
+                errLen.store(static_cast<int32_t>(err.size()));
+            },
+            300);
+        for (int i = 0; i < 300 && fired.load() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(fired.load() == 1, "invokeAsync timeout fires the callback once");
+        CHECK(errLen.load() > 0, "invokeAsync timeout carries an error");
         client.shutdown();
     }
 
@@ -372,5 +397,3 @@ int main() {
     std::cout << "transport checks: " << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;
 }
-
-#endif  // !_WIN32

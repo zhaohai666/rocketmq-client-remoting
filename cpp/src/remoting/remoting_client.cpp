@@ -148,6 +148,18 @@ struct RemotingClient::Impl {
         bool hasResponse = false;
         RemotingCommand response;
         InvokeCallback callback;
+        // 异步请求的超时账目（对应 Java ResponseFuture 的 timeoutMillis + beginTimestamp）。
+        // addr/deadlineMs 只在登记时写入；callbackFired 由 notifyExpired 与 dispatch 竞争设置。
+        std::string addr;
+        int64_t deadlineMs = 0;
+        int64_t timeoutMs = 0;
+        bool callbackFired = false;
+
+        static int64_t monoNowMs() {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        }
     };
 
     std::atomic<bool> running{true};
@@ -408,11 +420,16 @@ struct RemotingClient::Impl {
             future->response = cmd;
             future->hasResponse = true;
             future->done = true;
-            cb = future->callback;
+            // 与超时清理线程抢同一个回调：谁先置位谁投递，另一个只能放弃（Java 用
+            // ResponseFuture 上的 executeOnceCallback 表达同一约束）。
+            if (!future->callbackFired) {
+                future->callbackFired = true;
+                cb = future->callback;
+            }
         }
         future->cv.notify_all();
         if (cb) {
-            cb(cmd);
+            cb(cmd, std::string());
         }
     }
 
@@ -424,9 +441,15 @@ struct RemotingClient::Impl {
     // 这里只在**真的与在途请求冲突**时才重分配，其余情况原样保留（含 0），与 Java
     // NettyRemotingClient 从不改写调用方 opaque 的行为一致。
     std::shared_ptr<Future> registerFutureAcquiringOpaque(RemotingCommand& request,
-                                                          InvokeCallback cb) {
+                                                          InvokeCallback cb,
+                                                          const std::string& addr = std::string(),
+                                                          int64_t timeoutMillis = 0) {
         auto future = std::make_shared<Future>();
         future->callback = std::move(cb);
+        future->addr = addr;
+        future->timeoutMs = timeoutMillis;
+        // timeoutMillis == 0 表示不交给清理线程（同步路径自己等、自己摘）。
+        future->deadlineMs = timeoutMillis > 0 ? Future::monoNowMs() + timeoutMillis : 0;
         std::lock_guard<std::mutex> lk(respMutex);
         if (respTable.find(request.opaque) != respTable.end()) {
             int32_t candidate = 0;
@@ -443,6 +466,84 @@ struct RemotingClient::Impl {
     void unregisterFuture(int32_t opaque) {
         std::lock_guard<std::mutex> lk(respMutex);
         respTable.erase(opaque);
+    }
+
+    // ---- 异步请求的超时清理（对应 Java NettyRemotingAbstract.scanResponseTable）----
+    // 没有它，invokeAsync 的 timeoutMillis 就无处生效：对端不回包时回调永远不触发，
+    // 在途表项也永久留在 respTable 里（长连接复用久了就是内存泄漏 + 悬挂的发送请求）。
+    std::mutex sweepMutex;
+    std::condition_variable sweepCv;
+    std::thread sweeper;
+    bool sweeperStarted = false;
+
+    void ensureSweeper() {
+        {
+            std::lock_guard<std::mutex> lk(sweepMutex);
+            if (sweeperStarted) return;
+            sweeperStarted = true;
+        }
+        sweeper = std::thread([this]() {
+            while (true) {
+                std::unique_lock<std::mutex> lk(sweepMutex);
+                sweepCv.wait_for(lk, std::chrono::milliseconds(100),
+                                 [this]() { return !running.load() || !sweeperStarted; });
+                lk.unlock();
+                if (!running.load()) return;
+                sweepExpired();
+            }
+        });
+    }
+
+    void stopSweeper() {
+        {
+            std::lock_guard<std::mutex> lk(sweepMutex);
+            sweeperStarted = false;
+        }
+        sweepCv.notify_all();
+        if (sweeper.joinable()) {
+            sweeper.join();
+        }
+    }
+
+    void sweepExpired() {
+        // 与 Java scanResponseTable 同式：beginTimestamp + timeoutMillis + 1000 <= now。
+        // 这 1s 宽限是给"响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递，
+        // 避免清理线程把刚好赶上末班的响应抢成一次超时失败。
+        constexpr int64_t kSweepGraceMs = 1000;
+        const int64_t now = Future::monoNowMs();
+        std::vector<std::pair<std::shared_ptr<Future>, int32_t>> expired;
+        {
+            std::lock_guard<std::mutex> lk(respMutex);
+            for (auto it = respTable.begin(); it != respTable.end();) {
+                const std::shared_ptr<Future>& f = it->second;
+                if (f->deadlineMs != 0 && now >= f->deadlineMs + kSweepGraceMs) {
+                    expired.emplace_back(f, it->first);
+                    it = respTable.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        // 回调必须在 respMutex **之外**执行：回调里常常还要回到传输层或业务层，
+        // 持锁回调既会和 shutdown 抢同一把锁，也可能自锁。
+        for (auto& kv : expired) {
+            const std::shared_ptr<Future>& f = kv.first;
+            bool mine = false;
+            {
+                std::lock_guard<std::mutex> flk(f->m);
+                f->done = true;
+                if (!f->callbackFired) {
+                    f->callbackFired = true;
+                    mine = true;
+                }
+            }
+            f->cv.notify_all();
+            if (mine && f->callback) {
+                f->callback(RemotingCommand(), f->addr + " async invoke timeout "
+                                               + std::to_string(f->timeoutMs) + " ms, opaque="
+                                               + std::to_string(kv.second));
+            }
+        }
     }
 
     // 把响应写回**已存在**的连接（不新建）。
@@ -507,6 +608,8 @@ struct RemotingClient::Impl {
         if (!running.compare_exchange_strong(expected, false)) {
             return;  // 已关闭
         }
+        // 先停清理线程：它会在回调里回到业务层，不能让它看到半关闭的客户端。
+        stopSweeper();
         std::vector<std::shared_ptr<Connection>> all;
         {
             std::lock_guard<std::mutex> lk(connMutex);
@@ -594,8 +697,10 @@ RemotingCommand RemotingClient::invokeSync(const std::string& addr, RemotingComm
 }
 
 void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& request,
-                                 InvokeCallback callback, int32_t /*timeoutMillis*/) {
-    auto future = impl_->registerFutureAcquiringOpaque(request, std::move(callback));
+                                 InvokeCallback callback, int32_t timeoutMillis) {
+    const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : invokeTimeoutMillis_;
+    impl_->ensureSweeper();
+    impl_->registerFutureAcquiringOpaque(request, std::move(callback), addr, timeout);
     const int32_t opaque = request.opaque;
     try {
         impl_->sendRequest(addr, request);

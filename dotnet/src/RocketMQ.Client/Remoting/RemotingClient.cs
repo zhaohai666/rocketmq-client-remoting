@@ -26,8 +26,12 @@ namespace RocketMQ.Remoting;
 /// <summary>带超时控制的 TCP 传输客户端。</summary>
 public sealed class RemotingClient : IDisposable
 {
-    /// <summary>响应到达时在读线程中触发的回调。实现需自行保证线程安全。</summary>
-    public delegate void InvokeCallback(RemotingCommand response);
+    /// <summary>
+    /// 异步调用回调（对应 Java InvokeCallback 的 operationSucceed / operationFail 二分）：
+    /// 成功时 response 非空、error 为空；超时或发送失败时 response 为空、error 非空。
+    /// 在读线程或超时清理线程中触发，实现需自行保证线程安全。
+    /// </summary>
+    public delegate void InvokeCallback(RemotingCommand? response, Exception? error);
 
     /// <summary>
     /// broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
@@ -57,6 +61,17 @@ public sealed class RemotingClient : IDisposable
         public readonly ManualResetEventSlim Done = new(false);
         public RemotingCommand Response = new();
         public InvokeCallback? Callback;
+
+        // 异步请求的超时账目（对应 Java ResponseFuture 的 timeoutMillis + beginTimestamp）。
+        // Addr/DeadlineMs/TimeoutMs 只在登记时写入；CallbackFired 由读线程与清理线程争抢。
+        // DeadlineMs == 0 表示不由清理线程负责（同步路径自己等、自己摘除）。
+        public string Addr = string.Empty;
+        public long DeadlineMs;
+        public long TimeoutMs;
+        public bool CallbackFired;
+
+        // 单调时钟：不受系统时间调整影响（Java 用 currentTimeMillis，这里刻意取更稳的口径）
+        public static long MonoNowMs() => Environment.TickCount64;
     }
 
     private volatile bool _running = true;
@@ -68,6 +83,12 @@ public sealed class RemotingClient : IDisposable
     private readonly Dictionary<string, Connection> _conns = new(StringComparer.Ordinal);
 
     private readonly ConcurrentDictionary<int, Future> _respTable = new();
+
+    // 在途请求超时清理（对应 Java NettyRemotingAbstract.scanResponseTable 及其定时线程）。
+    // 异步请求只有被这张表按时摘掉并回调一次，调用方才知道失败；缺了它回调会永久悬挂、
+    // 条目永久泄漏。首次 InvokeAsync 时才创建，纯同步用法不留线程。
+    private readonly object _sweepLock = new();
+    private Timer? _sweeper;
 
     // broker 主动请求处理器表：requestCode -> handler。仅用于事务回查
     // (CHECK_TRANSACTION_STATE=39) 这类「服务端反过来找我」的命令。
@@ -518,15 +539,21 @@ public sealed class RemotingClient : IDisposable
             return; // 迟到的响应 / 已处理完的 broker 请求
         }
 
-        InvokeCallback? cb;
+        InvokeCallback? cb = null;
         lock (future.Done)
         {
             future.Response = cmd;
-            cb = future.Callback;
+            // 与超时清理线程抢同一个回调：谁先置位谁投递，另一个只能放弃
+            // （Java 用 ResponseFuture.executeCallbackOnlyOnce 表达同一约束）。
+            if (!future.CallbackFired)
+            {
+                future.CallbackFired = true;
+                cb = future.Callback;
+            }
         }
 
         future.Done.Set();
-        cb?.Invoke(cmd);
+        cb?.Invoke(cmd, null);
     }
 
     /// <summary>
@@ -645,9 +672,17 @@ public sealed class RemotingClient : IDisposable
     // "未设置"会把它改掉，导致调用方与服务端回填的 opaque 不一致（调用方拿不到响应）。
     // 这里只在**真的与在途请求冲突**时才重分配，其余情况原样保留（含 0），与 Java
     // NettyRemotingClient 从不改写调用方 opaque 的行为一致。
-    private Future RegisterFutureAcquiringOpaque(RemotingCommand request, InvokeCallback? cb)
+    private Future RegisterFutureAcquiringOpaque(RemotingCommand request, InvokeCallback? cb,
+        string addr = "", long timeoutMillis = 0)
     {
-        var future = new Future { Callback = cb };
+        var future = new Future
+        {
+            Callback = cb,
+            Addr = addr,
+            TimeoutMs = timeoutMillis,
+            // timeoutMillis == 0 表示不交给清理线程（同步路径自己等、自己摘）
+            DeadlineMs = timeoutMillis > 0 ? Future.MonoNowMs() + timeoutMillis : 0,
+        };
         lock (_respTable)
         {
             if (_respTable.ContainsKey(request.Opaque))
@@ -668,6 +703,107 @@ public sealed class RemotingClient : IDisposable
     }
 
     private void UnregisterFuture(int opaque) => _respTable.TryRemove(opaque, out _);
+
+    /// <summary>启动超时清理线程（幂等；只有异步调用才需要）。</summary>
+    private void EnsureSweeper()
+    {
+        lock (_sweepLock)
+        {
+            if (_sweeper is not null)
+            {
+                return;
+            }
+
+            _sweeper = new Timer(_ => SweepExpired(), null, 100, 100);
+        }
+    }
+
+    private void StopSweeper()
+    {
+        Timer? timer;
+        lock (_sweepLock)
+        {
+            timer = _sweeper;
+            _sweeper = null;
+        }
+
+        if (timer is null)
+        {
+            return;
+        }
+
+        // Dispose(waitHandle) 等到正在执行的那一轮结束，等价于 cpp 版 join 清理线程。
+        using var done = new ManualResetEvent(false);
+        timer.Dispose(done);
+        try
+        {
+            done.WaitOne(TimeSpan.FromSeconds(5));
+        }
+        catch (ObjectDisposedException)
+        {
+            // 已完成，忽略
+        }
+    }
+
+    /// <summary>
+    /// 摘除已超时的在途请求并回调一次（对应 Java scanResponseTable）。
+    /// </summary>
+    private void SweepExpired()
+    {
+        // 与 Java 同式：beginTimestamp + timeoutMillis + 1000 <= now。这 1s 宽限是给
+        // "响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递。
+        const long GraceMs = 1000;
+        long now = Future.MonoNowMs();
+        List<(Future Future, int Opaque)>? expired = null;
+        foreach (KeyValuePair<int, Future> kv in _respTable)
+        {
+            Future f = kv.Value;
+            if (f.DeadlineMs == 0 || now < f.DeadlineMs + GraceMs)
+            {
+                continue;
+            }
+
+            // TryRemove 决定归属：与读线程同时摘同一 opaque 时只有一方拿到非空值
+            if (!_respTable.TryRemove(kv.Key, out Future? removed) || removed is null)
+            {
+                continue;
+            }
+
+            if (expired is null)
+            {
+                expired = new List<(Future, int)>();
+            }
+
+            expired.Add((removed, kv.Key));
+        }
+
+        if (expired is null)
+        {
+            return;
+        }
+
+        foreach ((Future f, int opaque) in expired)
+        {
+            InvokeCallback? cb = null;
+            lock (f.Done)
+            {
+                f.Done.Set();
+                if (f.CallbackFired)
+                {
+                    continue;  // 读线程已经抢先投递（响应正好赶在宽限期内到）
+                }
+
+                f.CallbackFired = true;
+                cb = f.Callback;
+            }
+
+            // 回调必须**脱离在途表**执行：回调里常常还要回到传输层或业务层，
+            // 持表回调会和 shutdown 抢同一把锁，也可能自锁。
+            cb?.Invoke(null, new RemotingTimeoutException(f.Addr + " async invoke timeout "
+                + f.TimeoutMs.ToString(CultureInfo.InvariantCulture) + " ms, opaque="
+                + opaque.ToString(CultureInfo.InvariantCulture)));
+        }
+    }
 
     // ---------------------------------------------------------------- 公开调用
 
@@ -703,12 +839,15 @@ public sealed class RemotingClient : IDisposable
     }
 
     /// <summary>
-    /// 异步调用：发送后立即返回，响应到达时在读线程里触发 callback。
-    /// 注意 callback 在**读线程**中执行，实现需自行保证线程安全。
+    /// 异步调用：发送后立即返回。回调**恰好触发一次**——响应到达时在读线程里带 response，
+    /// 超时或无响应时由清理线程带 error（对应 Java scanResponseTable → operationFail）。
+    /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
     /// </summary>
     public void InvokeAsync(string addr, RemotingCommand request, InvokeCallback callback, int timeoutMillis = -1)
     {
-        Future future = RegisterFutureAcquiringOpaque(request, callback);
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _invokeTimeoutMillis;
+        EnsureSweeper();
+        RegisterFutureAcquiringOpaque(request, callback, addr, timeout);
         int opaque = request.Opaque;
         try
         {
@@ -805,6 +944,9 @@ public sealed class RemotingClient : IDisposable
         }
 
         _running = false;
+        // 先停清理线程：它会在别的线程上触发回调，必须早于关连接退出，
+        // 否则 shutdown 之后还可能冒出一个超时回调。
+        StopSweeper();
         List<Connection> all;
         lock (_connMutex)
         {
