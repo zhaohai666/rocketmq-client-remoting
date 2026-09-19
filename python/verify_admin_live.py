@@ -28,6 +28,7 @@ from rocketmq.client.admin import DefaultMQAdminExt
 from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq.client.exception import MQClientException
 from rocketmq.common.message import Message, MessageQueue
 from rocketmq.common.mix_all import MixAll
 from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
@@ -206,12 +207,14 @@ def main():
     prod.start()
 
     sent = []
+    offset_ids = []
     for i in range(N_MSG):
         body = ("admin-live-%d" % i).encode("utf-8")
         try:
             sr = prod.send(Message(TOPIC, body))
             if sr.send_status.name == "SEND_OK":
                 sent.append((body, sr.msg_id, sr.message_queue))
+                offset_ids.append(sr.offset_msg_id)
         except Exception as e:  # noqa: BLE001
             print("send %d error: %s" % (i, e))
     check("同步发送 %d 条" % N_MSG, len(sent) == N_MSG, "ok=%d/%d" % (len(sent), N_MSG))
@@ -258,13 +261,26 @@ def main():
     skip("queryMessage 命中结果（需 broker 开 RocksDB/KEYS 索引）",
          "本机为默认文件索引且消息未设 KEYS，uniqKey 查询返回空属预期")
 
-    # viewMessage by msgId（从 msgId 解 broker 地址 + commitLog offset）
-    vm = safe("viewMessage(byMsgId)", lambda: admin.view_message(TOPIC, msg_id0),
+    # viewMessage by offsetMsgId（只有它编码了 broker 地址 + commitLog offset）
+    vm = safe("viewMessage(byOffsetMsgId)",
+              lambda: admin.view_message(TOPIC, offset_ids[0]),
               lambda m: "topic=%s offset=%s body=%s" % (m.topic, m.queue_offset,
                                                         m.body[:32]))
     if vm is not None:
         check("viewMessage body 与发送一致", vm.body == body0,
               "期望 %r 实际 %r" % (body0, vm.body))
+
+    # 客户端 uniqKey 也是 32 位十六进制，硬解会拼出一个假地址；必须走 Java 的
+    # queryMessageByUniqKey 兜底，最终以 MQClientException 收场，而不是裸 OverflowError。
+    try:
+        admin.view_message(TOPIC, msg_id0)
+        check("viewMessage(uniqKey) 走兜底并给出干净异常", False, "没有抛异常")
+    except MQClientException as e:
+        check("viewMessage(uniqKey) 走兜底并给出干净异常", True,
+              "code=%s" % e.response_code)
+    except Exception as e:  # noqa: BLE001
+        check("viewMessage(uniqKey) 走兜底并给出干净异常", False,
+              "%s: %s" % (type(e).__name__, e))
 
     # ---------- 7. Offset 管理（只读查询）----------
     mq = mq0 if isinstance(mq0, MessageQueue) else MessageQueue(TOPIC, route.get_broker_datas()[0].broker_name, 0)

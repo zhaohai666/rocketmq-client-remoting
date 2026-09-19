@@ -836,19 +836,35 @@ class DefaultMQAdminExt:
             index_type=MessageConst.INDEX_KEY_TYPE, uniq_key=False)
 
     def view_message(self, topic: str, msg_id: str) -> MessageExt:
-        """对应 Java MQAdminImpl.viewMessage：从 msgId 自身解出 broker 地址 + commitLog 偏移。"""
+        """对应 Java DefaultMQAdminExtImpl.viewMessage（:578-587）。
+
+        Java 先按 offsetMsgId 解出 broker 地址 + commitLog 偏移走 VIEW_MESSAGE_BY_ID，
+        **任何**失败都退回按 UNIQ_KEY 查索引。必须留这条兜底：5.x 客户端的 msgId 是
+        客户端生成的 uniqKey，同样是 32 位十六进制，硬解会拼出一个不存在的 ip:port
+        （Java 取 4 字节端口所以永远落在 uint16 内，Python 不校验就会把 OverflowError
+        抛到调用方手里，异常契约直接破掉）。
+        """
+        by_id_error: Optional[Exception] = None
         try:
             ip, port, offset = decode_message_id(msg_id)
-        except Exception as e:  # noqa: BLE001
-            raise MQClientException(
-                "query message by id finished, but no message.",
-                ResponseCode.NO_MESSAGE) from e
-        addr = "%s:%d" % (ip, port)
-        response = self._invoke_broker(addr, RequestCode.VIEW_MESSAGE_BY_ID,
-                                       {"topic": topic, "offset": offset})
-        if not response.body:
-            raise MQBrokerException(ResponseCode.NO_MESSAGE, "message not found: %s" % msg_id)
-        return decode_message(response.body)
+            if not 0 < port <= 65535:
+                raise MQClientException("not a valid offset msgId: %s" % msg_id)
+            response = self._invoke_broker("%s:%d" % (ip, port),
+                                           RequestCode.VIEW_MESSAGE_BY_ID,
+                                           {"topic": topic, "offset": offset})
+            if response.body:
+                return decode_message(response.body)
+            by_id_error = MQBrokerException(ResponseCode.NO_MESSAGE,
+                                            "message not found: %s" % msg_id)
+        except Exception as e:  # noqa: BLE001 — Java 同样只 warn 后走兜底
+            by_id_error = e
+
+        found = self.query_message_by_uniq_key(topic, msg_id)
+        if found is not None:
+            return found
+        raise MQClientException(
+            "viewMessage failed: neither offset msgId nor uniq key matched message %s of %s"
+            % (msg_id, topic), ResponseCode.NO_MESSAGE, by_id_error)
 
     def query_consume_queue(self, broker_addr: str, topic: str, queue_id: int,
                             index: int, count: int = 32,
