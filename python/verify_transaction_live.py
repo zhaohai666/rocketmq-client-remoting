@@ -14,11 +14,14 @@ import time
 
 sys.path.insert(0, ".")
 
+from rocketmq.client.admin import DefaultMQAdminExt
 from rocketmq.client.consumer import (DefaultMQPushConsumer,
                                       SimpleMessageListener)
 from rocketmq.client.producer import (DefaultMQProducer, LocalTransactionState,
                                       TransactionListener)
 from rocketmq.common.message import Message
+from rocketmq.common.mix_all import MixAll
+from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "TxPy_%d" % int(time.time() * 1000)
@@ -44,6 +47,9 @@ class ConsumeCollector:
         self.msgs = []
         self._consumer = DefaultMQPushConsumer(group)
         self._consumer.set_namesrv_addr(NAMESRV)
+        # 全新消费组 + 默认 LAST_OFFSET：broker 会把位点直接种到队尾，消费者拿到队列
+        # 之前发的那几条就永远读不到了。这里必须显式从 0 开始（与 verify_message_types 一致）。
+        self._consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
         self._consumer.subscribe(topic, "*")
 
         def listener(msgs, context):
@@ -107,9 +113,28 @@ def main() -> int:
     producer.set_namesrv_addr(NAMESRV)
     producer.start()
 
+    topic_plain = PREFIX + "_Plain"
+    topic = PREFIX + "_Tx"
+    topic_rb = PREFIX + "_TxRollback"
+    topic_ck = PREFIX + "_TxCheck"
+
+    # topic 必须先建好，再启动消费者。靠 broker 自动建 topic 的话，新 topic 要到下一次
+    # broker 注册（registerNameServerPeriod=30s）才进 NameServer 路由；而消费者心跳又只发往
+    # 路由里已有的 broker（get_route_of_all_brokers 读的是缓存路由）。两者叠加，"消费者先于
+    # topic 启动"要白等 30s 以上才分得到队列，远超本脚本 8~25s 的观测窗。
+    # admin 建 topic 会让 broker 立刻重新注册，NameServer 当场就有路由。
+    admin = DefaultMQAdminExt()
+    admin.set_namesrv_addr(NAMESRV)
+    admin.start()
+    try:
+        for t in (topic_plain, topic, topic_rb, topic_ck):
+            admin.create_topic(MixAll.DEFAULT_TOPIC, t, 4)
+        time.sleep(1)
+    finally:
+        admin.shutdown()
+
     # ---------- 0. 对照组：普通（非事务）消息 ----------
     # 先证明消费者链路本身是通的，否则"事务消息没被消费"可能只是脚本/消费者用法问题
-    topic_plain = PREFIX + "_Plain"
     plain = ConsumeCollector(topic_plain, PREFIX + "_cg_plain")
     plain.start()
     producer.send(Message(topic_plain, b"plain-msg"))
@@ -119,7 +144,6 @@ def main() -> int:
           "received=%d" % len(plain.msgs))
 
     # ---------- 1. COMMIT ----------
-    topic = PREFIX + "_Tx"
     listener = CommitListener()
     run = ConsumeCollector(topic, PREFIX + "_cg")
     run.start()
@@ -139,7 +163,6 @@ def main() -> int:
           "received=%d" % len(run.msgs))
 
     # ---------- 2. ROLLBACK ----------
-    topic_rb = PREFIX + "_TxRollback"
     rb_listener = RollbackListener()
     run2 = ConsumeCollector(topic_rb, PREFIX + "_cg_rb")
     run2.start()
@@ -158,7 +181,6 @@ def main() -> int:
           "received=%d" % len(run2.msgs))
 
     # ---------- 3. UNKNOW + broker 回查 ----------
-    topic_ck = PREFIX + "_TxCheck"
     ck_listener = UnknownThenCommitListener()
     run3 = ConsumeCollector(topic_ck, PREFIX + "_cg_ck")
     run3.start()

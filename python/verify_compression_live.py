@@ -27,6 +27,10 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows 控制台默认 GBK，docstring 里的 ⚠ 会让 print 直接抛 UnicodeEncodeError
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
 from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
 from rocketmq.client.producer import DefaultMQProducer
