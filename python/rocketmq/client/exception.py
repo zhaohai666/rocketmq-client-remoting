@@ -5,6 +5,21 @@ from __future__ import annotations
 from typing import Optional
 
 
+class ClientErrorCode:
+    """对应 org.apache.rocketmq.client.exception.ClientErrorCode。
+
+    sendDefaultImpl 重试耗尽后用它给最终的 MQClientException 定性：
+    连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
+    地址服务器没给地址→10004，路由查不到→10005。
+    """
+
+    CONNECT_BROKER_EXCEPTION = 10001
+    ACCESS_BROKER_TIMEOUT = 10002
+    BROKER_NOT_EXIST_EXCEPTION = 10003
+    NO_NAME_SERVER_EXCEPTION = 10004
+    NOT_FOUND_TOPIC_EXCEPTION = 10005
+
+
 class MQClientException(Exception):
     """对应 MQClientException。response_code 非 0 时为 broker 侧错误码。"""
 
@@ -50,5 +65,5 @@ class RequestTimeoutException(MQClientException):
         super().__init__(message, response_code, cause)
 
 
-__all__ = ["MQClientException", "MQBrokerException", "MQTimeOutException", "MQQueueException",
-           "RequestTimeoutException"]
+__all__ = ["ClientErrorCode", "MQClientException", "MQBrokerException", "MQTimeOutException",
+           "MQQueueException", "RequestTimeoutException"]

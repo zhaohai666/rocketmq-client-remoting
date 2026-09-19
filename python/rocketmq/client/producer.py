@@ -21,15 +21,17 @@ from ..common.message_type import MessageType
 from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
 from ..logging import get_logger
-from ..remoting.exception import RemotingException
-from ..remoting.protocol.codes import RequestCode
+from ..remoting.exception import (RemotingConnectException, RemotingException,
+                                  RemotingTimeoutException, RemotingTooMuchRequestException)
+from ..remoting.protocol.codes import RequestCode, ResponseCode
 from ..remoting.protocol.headers import (CheckTransactionStateRequestHeader,
                                          EndTransactionRequestHeader)
 from ..remoting.protocol.heartbeat import HeartbeatData, ProducerData
 from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
-from .exception import MQBrokerException, MQClientException, RequestTimeoutException
+from .exception import (ClientErrorCode, MQBrokerException, MQClientException,
+                        RequestTimeoutException)
 from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
 
                    EndTransactionContext, EndTransactionHook, SendMessageContext, SendMessageHook)
@@ -188,6 +190,17 @@ class DefaultMQProducer:
         self.retry_times_when_send_failed = 2
         self.retry_times_when_send_async_failed = 2
         self.retry_another_broker_when_not_store_ok = False
+        # Java DefaultMQProducer 默认 -1 = 不限制单次请求超时；开了之后每次重试的单请求
+        # 超时被压到该值，慢 broker 才会被换掉而不是把总预算吃光。
+        self.send_msg_max_timeout_per_request = -1
+        # Java retryResponseCodes：broker 明确回了这些码才值得换一台重试，
+        # 其余码（如 MESSAGE_ILLEGAL）重试也是白试，必须原样抛出。
+        self.retry_response_codes = {
+            ResponseCode.SYSTEM_ERROR, ResponseCode.SYSTEM_BUSY,
+            ResponseCode.SERVICE_NOT_AVAILABLE, ResponseCode.NO_PERMISSION,
+            ResponseCode.TOPIC_NOT_EXIST, ResponseCode.NO_BUYER_ID,
+            ResponseCode.NOT_IN_CURRENT_UNIT, ResponseCode.GO_AWAY,
+        }
         self.max_message_size = 1024 * 1024 * 4
         self.rpc_hook = rpc_hook
         self.topics = list(topics) if topics else []
@@ -238,6 +251,24 @@ class DefaultMQProducer:
 
     def set_retry_times_when_send_failed(self, n: int) -> None:
         self.retry_times_when_send_failed = n
+
+    def set_send_msg_max_timeout_per_request(self, timeout: int) -> None:
+        self.send_msg_max_timeout_per_request = timeout
+
+    def get_send_msg_max_timeout_per_request(self) -> int:
+        return self.send_msg_max_timeout_per_request
+
+    def set_retry_another_broker_when_not_store_ok(self, retry: bool) -> None:
+        self.retry_another_broker_when_not_store_ok = retry
+
+    def is_retry_another_broker_when_not_store_ok(self) -> bool:
+        return self.retry_another_broker_when_not_store_ok
+
+    def add_retry_response_code(self, response_code: int) -> None:
+        self.retry_response_codes.add(response_code)
+
+    def is_retry_response_code(self, response_code: Optional[int]) -> bool:
+        return response_code in self.retry_response_codes
 
     def set_compress_msg_body_over_howmuch(self, size: int) -> None:
         self.compress_msg_body_over_howmuch = size
@@ -602,6 +633,15 @@ class DefaultMQProducer:
         except MQClientException:
             return client.get_topic_publish_info(topic, is_default=True)
 
+    def _update_fault_item(self, selected, began: float, isolation: bool,
+                           reachable: bool) -> None:
+        """容错表记一次尝试的延迟。延迟必须用单调钟量：本地亚毫秒往返用毫秒墙钟差
+        会记成 0，那样延迟阈值永远不会生效。"""
+        if selected is None:
+            return
+        self._mq_fault_strategy.update_fault_item(
+            selected.broker_name, (time.monotonic() - began) * 1000.0, isolation, reachable)
+
     # ---------------- 正常发送 ----------------
     def send(self, msg: Message, timeout_millis: Optional[int] = None,
              mq: Optional[MessageQueue] = None) -> SendResult:
@@ -621,33 +661,97 @@ class DefaultMQProducer:
             if self._has_send_interceptors():
                 return self._send_with_hooks(client, msg, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, msg, mq, timeout, sys_flag)
-        last_exc = None
-        last_broker_name = None
-        for attempt in range(self.retry_times_when_send_failed + 1):
+        # 对应 Java sendDefaultImpl：重试分类逐异常类型走，不用"啥都重试"糊过去。
+        try:
+            publish = self._topic_publish_info(msg.topic)
+        except MQClientException as e:
+            # Java：路由拿不到时立刻抛 NOT_FOUND_TOPIC_EXCEPTION，不把重试次数空转掉
+            raise MQClientException(str(e), ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
+        times_total = self.retry_times_when_send_failed + 1
+        begin_first = time.monotonic()
+        brokers_sent: List[str] = []
+        last_broker_name: Optional[str] = None
+        result: Optional[SendResult] = None
+        last_exc: Optional[Exception] = None
+        call_timeout = False
+        for attempt in range(times_total):
+            selected = None
+            began = time.monotonic()
             try:
-                publish = self._topic_publish_info(msg.topic)
                 # 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
-                # 关闭时退化为普通轮询（策略内部判断）。
+                # 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
+                # 从而能避开 last_broker_name 选到别的 broker。
                 selected = self._mq_fault_strategy.select_one_message_queue(
-                    publish, last_broker_name)
+                    publish, last_broker_name, attempt > 0)
+                if selected is None:
+                    break
                 last_broker_name = selected.broker_name
+                brokers_sent.append(selected.broker_name)
                 mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
+                began = time.monotonic()
+                cost_time = int((began - begin_first) * 1000)
+                if timeout < cost_time:
+                    call_timeout = True
+                    break
+                cur_timeout = timeout - cost_time
+                can_retry_again = attempt + 1 < times_total
+                if (self.send_msg_max_timeout_per_request > -1 and can_retry_again
+                        and cur_timeout > self.send_msg_max_timeout_per_request):
+                    cur_timeout = self.send_msg_max_timeout_per_request
                 send_start = self.metrics.record_send_start()
                 try:
-                    result = self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag)
-                except Exception:  # noqa: BLE001 — 记录指标/隔离后按原异常重试
+                    result = self._send_with_hooks(client, msg, mq_sel, cur_timeout, sys_flag)
+                except Exception:  # noqa: BLE001 — 指标记账后按原异常分类处理
                     self.metrics.record_send_failure(send_start)
-                    self._mq_fault_strategy.update_fault_item(
-                        selected.broker_name, 0.0, True, False)
                     raise
                 self.metrics.record_send_success(send_start)
                 # 记录发送延迟；超出阈值会把该 broker 隔离一段时间
-                self._mq_fault_strategy.update_fault_item(
-                    selected.broker_name, time.time() * 1000.0 - send_start, False, True)
+                self._update_fault_item(selected, began, False, True)
+                # Java：非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
+                # 否则把这个"存了但没存好"的结果原样返回
+                if (result is not None and result.send_status != SendStatus.SEND_OK
+                        and self.retry_another_broker_when_not_store_ok):
+                    continue
                 return result
-            except (MQClientException, MQBrokerException, RemotingException) as e:
+            except MQBrokerException as e:
+                # broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+                self._update_fault_item(selected, began, True, False)
                 last_exc = e
-        raise last_exc
+                if self.is_retry_response_code(e.response_code):
+                    continue
+                if result is not None:
+                    return result
+                raise
+            except RemotingException as e:
+                # 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测任务，
+                # 所以 Java 的 reachable = !isStartDetectorEnable() 恒为 True。
+                self._update_fault_item(selected, began, True, True)
+                last_exc = e
+            except MQClientException as e:
+                # 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离
+                self._update_fault_item(selected, began, False, True)
+                last_exc = e
+
+        if result is not None:
+            return result
+        if call_timeout:
+            raise RemotingTooMuchRequestException("sendDefaultImpl call timeout")
+        info = ("Send [%d] times, still failed, cost [%d]ms, Topic: %s, BrokersSent: [%s]"
+                ", last error: %s" % (len(brokers_sent),
+                                      int((time.monotonic() - begin_first) * 1000),
+                                      msg.topic, ", ".join(brokers_sent),
+                                      last_exc if last_exc is not None else ""))
+        if isinstance(last_exc, MQBrokerException):
+            code = last_exc.response_code
+        elif isinstance(last_exc, RemotingConnectException):
+            code = ClientErrorCode.CONNECT_BROKER_EXCEPTION
+        elif isinstance(last_exc, RemotingTimeoutException):
+            code = ClientErrorCode.ACCESS_BROKER_TIMEOUT
+        elif isinstance(last_exc, MQClientException):
+            code = ClientErrorCode.BROKER_NOT_EXIST_EXCEPTION
+        else:
+            code = None
+        raise MQClientException(info, code, last_exc)
 
     def request(self, msg: Message, timeout_millis: Optional[int] = None,
                 mq: Optional[MessageQueue] = None) -> Message:

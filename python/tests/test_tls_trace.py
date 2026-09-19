@@ -226,7 +226,9 @@ def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
         for _ in range(12):
             client = RemotingClient(tls_enable=True)
             try:
-                resp = client.invoke_sync(addr, _route_request(), 3000)
+                # 10s 而不是 3s：这里断言的是「请求必须送达」，不是延迟。整套用例并发跑时
+                # Windows 上的 TLS 握手会偶发超过 3s，会被误判成首包被吞。
+                resp = client.invoke_sync(addr, _route_request(), 10000)
                 assert resp.code == ResponseCode.SUCCESS
             finally:
                 client.shutdown()
