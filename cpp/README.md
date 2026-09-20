@@ -4,7 +4,8 @@ Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 C++17 实现，迁移�
 `org.apache.rocketmq.client` + `org.apache.rocketmq.remoting` + `org.apache.rocketmq.tools`，
 并与本仓库的 Python 参考实现（`../python/`）逐项对齐。
 
-**无第三方运行时依赖**（只用 POSIX socket + 标准库 + zlib），网络层手写而不是引 netty 类似物，
+**无第三方运行时依赖**（只用 POSIX socket + 标准库 + 系统压缩库：zlib 必需，liblz4 /
+libzstd 可选，找不到就只关那一个后端），网络层手写而不是引 netty 类似物，
 目的是把"字节到底长什么样"暴露出来、便于与 Java / Python 做逐字节互操作验证。
 
 已实现范围：
@@ -15,7 +16,7 @@ Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 C++17 实现，迁移�
 | 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、SIGPIPE 处理 |
 | 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData` |
 | 客户端 | `MQClientInstance`、`DefaultMQProducer`、`DefaultMQPushConsumer`、**`DefaultMQAdminExt`** |
-| 压缩 | zlib 生产端自动压缩 + 消费端自动解压（`-DRMQ_WITH_ZLIB=OFF` 可关） |
+| 压缩 | zlib / LZ4 Frame / ZSTD 三后端：生产端自动压缩 + 消费端自动解压（与 Java lz4-java、zstd-jni 的线上帧格式互通；`-DRMQ_WITH_ZLIB=OFF` 等可逐个关） |
 
 **未实测**：Windows 分支（代码在，未在真机跑过）。
 
@@ -27,37 +28,56 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build          # 产出 librocketmq_remoting.a + tests/* + examples/*
 ```
 
-工具链：CMake ≥ 3.15、C++17 编译器（Apple clang 14+ / GCC / MSVC）、`Threads`、`ZLIB`。
+工具链：CMake ≥ 3.15、C++17 编译器（Apple clang 14+ / GCC / MSVC）、`Threads`、`ZLIB`；
+liblz4 / libzstd 用系统包（`find_path` + `find_library`，也接受 `lz4::lz4` / `zstd::zstd`
+这类 CMake config target），**不下载、不 vendor 任何第三方源码**。
 开 `-Wall -Wextra`（未开 `-Werror`），**目标是零 warning**。
 MSVC 下自动加 `/utf-8`（源码含中文注释，否则 C4819）；Windows 走 `winsock`（`ws2_32`）。
 
 选项：
 - `-DRMQ_BUILD_TESTS=OFF` / `-DRMQ_BUILD_EXAMPLES=OFF`
-- `-DRMQ_WITH_ZLIB=OFF`：关掉 zlib。注意此时**遇到压缩消息会抛异常**，而不是静默返回压缩字节
-  —— 避免把数据损坏伪装成成功。
+- `-DRMQ_WITH_ZLIB=OFF` / `-DRMQ_WITH_LZ4=OFF` / `-DRMQ_WITH_ZSTD=OFF`：逐个关掉压缩后端。
+  注意关掉之后**遇到该压缩消息会抛异常**，而不是静默返回压缩字节
+  —— 避免把数据损坏伪装成成功。CMake 找不到库时自动只关那一个后端，configure 照样成功。
+
+configure 日志里会写明每个可选后端的状态（zlib 走 `find_package(ZLIB REQUIRED)`，
+缺了直接 configure 失败）：
+
+```
+RocketMQ client zstd: enabled (/usr/local/lib/libzstd.dylib)
+RocketMQ client lz4:  enabled (/usr/local/lib/liblz4.dylib)
+RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
+```
 
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 15 个用例，约 920 项断言，~6s
+cd build && ctest --output-on-failure     # 21 个用例，约 1240 项断言，~9s
 ```
 
 | 用例 | 断言 | 覆盖 |
 | --- | --- | --- |
 | `codec` | 65 | JSON / ROCKETMQ / `RemotingCommand` 两路 / 消息 17 段与 6 段 / header V1↔V2 / hashCode / CRC32 / msgId |
 | `java_alignment` | 32（带 `ROCKETMQ_JAVA_SRC` 为 38） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对 |
-| `route_heartbeat` | 92 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
-| `transport` | 32 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、地址解析 |
-| `compression` | 33 | 压缩类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib 往返 + **Python 生成的外部夹具**、解压后清 flag、未支持类型必须失败而非交出压缩流 |
+| `route_heartbeat` | 95 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
+| `transport` | 35 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、地址解析 |
+| `compression` | 152 | 三后端：类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib / **LZ4 Frame** / **ZSTD** 往返、**外部硬编码真值夹具**（Python zlib.compress、Java lz4-java、zstd-jni、`zstd -3` CLI 各产的帧）、帧头 magic 与 LZ4 block-independence 位、17 段报文 × 三种类型、解压后清 flag、后端缺失或未知类型必须抛错而非交出压缩流 |
 | `admin` | 152 | fastjson2 非法 JSON 容错、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
 | `acl` | 37 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
 | `request_reply` | 37 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时 |
 | `latency` | 31 | 故障规避：延迟窗口滑窗统计、可用性判定、broker 隔离与恢复、`sendLatencyFaultEnable` 开关 |
+| `send_retry` | 35 | `sendDefaultImpl` 重试分类语义（进程内 mock 集群 + 真 socket）：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离 |
 | `pop` | 93 | POP 协议管道：CK 反构（8 段 + `startOffsetInfo`/`msgOffsetInfo` 下标选择）、`bornTime`、ACK offset 语义 |
 | `pop_consumer` | 47 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制 |
 | `trace` | 92 | 消息轨迹：与 Java 官方实现的**逐字节对拍**（Pub / SubBefore / SubAfter / EndTransaction / Recall）+ 编解码双向 + 无 keys 空段容错 + 坏记录隔离 + 分发器分组/切块 |
+| `hook` | 65 | `CheckForbiddenHook`（异常不吞、沿重试链传播）+ `FilterMessageHook`（可变 msgList、摘掉即静默跳过）+ 钩子异常隔离 |
+| `consume_thread_pool` | 61 | 消费端有界 core/max 执行器：真实并发度 == corePoolSize、`setConsumeThreadNums` 生效、`updateCorePoolSize` 运行时调并发 |
+| `top_addressing` | 23 | 动态 name server：WS 地址 / unitName / para 拼装、`clearNewLine`、非 200 与连接失败回退为空 |
+| `consumer_stats` | 24 | `ConsumerStatsManager` 采样（sum/tps 窗口端点差分，不依赖真实时钟）+ `ConsumeStatus` / `ConsumerRunningInfo`(307) 编码 |
+| `trace_context` | 24 | W3C `traceparent` 生成/校验/子 span/注入不覆盖/属性提取 |
 | `interop` | 70 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
+| `lite_pull` | 31 | `DefaultLitePullConsumer` 无网络状态机（subscribe/assign/seek/poll/committed）+ 221/309 应答体 wire 形状 |
 
 ```bash
 # Java 对齐（断言数 32 -> 38）
@@ -77,7 +97,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_message_types 127.0.0.1:9876
 ./build/examples/rmq_admin_live         127.0.0.1:9876
 ./build/examples/rmq_compression_live   selftest 127.0.0.1:9876
-./build/examples/rmq_compression_live   send|recv 127.0.0.1:9876 <topic> <group> <size>
+./build/examples/rmq_compression_live   send|recv 127.0.0.1:9876 <topic> <group> <size> [codec]
 ./build/examples/rmq_live_acl           127.0.0.1:9876   # 需开 ACL 的集群
 ./build/examples/rmq_live_pull          127.0.0.1:9876
 ./build/examples/rmq_live_request_reply 127.0.0.1:9876
@@ -92,7 +112,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | --- | --- | --- |
 | `rmq_live_message_types` | 12/12 | 异步发送 / 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 心跳注册 |
 | `rmq_admin_live` | 47 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → 清理 |
-| `rmq_compression_live` | 全 PASS | 自动压缩自产自销 + **与真实 Java 客户端双向互通** |
+| `rmq_compression_live` | 10 PASS | 三后端（zlib / LZ4 Frame / ZSTD）自动压缩自产自销 + **与真实 Java/Python/.NET/Rust 客户端双向互通**（互通矩阵见 `../scripts/compression_matrix.sh`）；构建时未编入的后端打 SKIP |
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
 | `rmq_live_hook` | 13 PASS / 0 FAIL | `CheckForbiddenHook`（放行 / 每次发送尝试都回调 / 单向也拦截 / 被拦截的消息确实没落 broker）+ `FilterMessageHook`（拉取路径 3 收 2 丢且不重投、POP 路径 2 收 1 丢且**摘掉即 ack**）+ 客户端二次 tag 过滤（订阅 `TagA` 只收 `TagA`）+ 钩子异常被吞掉不影响后续钩子 |
 

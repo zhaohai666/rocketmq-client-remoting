@@ -15,7 +15,7 @@
 //
 // 用法（由 Program 以 "compression-live <mode> ..." 形式调用）：
 //   rmq compression-live selftest <namesrv>
-//   rmq compression-live send     <namesrv> <topic> <group> <size>
+//   rmq compression-live send     <namesrv> <topic> <group> <size> [codec]
 //   rmq compression-live recv     <namesrv> <topic> <group> <size>
 using System;
 using System.Collections.Generic;
@@ -41,10 +41,18 @@ internal static class CompressionLive
         }
 
         string mode = args[0];
-        // 分发器已剥掉 "compression-live"，此处 args = [mode, namesrv, topic, group, size]
+        // 分发器已剥掉 "compression-live"，此处 args = [mode, namesrv, topic, group, size, [codec]]
         if (mode == "send" && args.Length >= 5)
         {
-            return Send(args[1], args[2], args[3], int.Parse(args[4], CultureInfo.InvariantCulture));
+            if (!TryParseCodec(args.Length >= 6 ? args[5] : null, out int codec))
+            {
+                Console.Error.WriteLine("unknown codec: " + args[5]);
+                Usage();
+                return 2;
+            }
+
+            return Send(args[1], args[2], args[3], int.Parse(args[4], CultureInfo.InvariantCulture),
+                codec);
         }
 
         if (mode == "recv" && args.Length >= 5)
@@ -65,9 +73,39 @@ internal static class CompressionLive
     {
         Console.Error.WriteLine(
             "usage: rmq compression-live selftest <namesrv>\n" +
-            "       rmq compression-live send <namesrv> <topic> <group> <size>\n" +
-            "       rmq compression-live recv <namesrv> <topic> <group> <size>");
+            "       rmq compression-live send <namesrv> <topic> <group> <size> [codec]\n" +
+            "       rmq compression-live recv <namesrv> <topic> <group> <size>\n" +
+            "  codec = zlib（默认）| lz4 | zstd，只影响发送端；接收端按 sysFlag 类型位自动解压");
     }
+
+    /// <summary>矩阵用的算法名解析：拼错 codec 直接退出，别让它看起来像"互通失败"。</summary>
+    private static bool TryParseCodec(string? name, out int codec)
+    {
+        switch (name)
+        {
+            case null:
+            case "":
+            case "zlib":
+                codec = CompressionType.ZLIB;
+                return true;
+            case "lz4":
+                codec = CompressionType.LZ4;
+                return true;
+            case "zstd":
+                codec = CompressionType.ZSTD;
+                return true;
+            default:
+                codec = CompressionType.ZLIB;
+                return false;
+        }
+    }
+
+    private static string CodecName(int codec) => codec switch
+    {
+        CompressionType.LZ4 => "lz4",
+        CompressionType.ZSTD => "zstd",
+        _ => "zlib",
+    };
 
     // ---------------- 确定性载荷 ----------------
 
@@ -158,20 +196,23 @@ internal static class CompressionLive
 
     // ---------------- send ----------------
 
-    private static int Send(string namesrv, string topic, string group, int size)
+    private static int Send(string namesrv, string topic, string group, int size, int codec)
     {
         byte[] payload = BuildPayload(size);
         var prod = new DefaultMQProducer(group)
         {
             NamesrvAddr = namesrv,
             SendMsgTimeout = 10000,
+            // 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
+            CompressType = codec,
         };
         prod.Start();
         try
         {
             SendResult sr = prod.Send(new Message(topic, payload));
             uint crc = UtilAll.Crc32(payload);
-            Console.WriteLine("SEND_OK len=" + payload.Length.ToString(CultureInfo.InvariantCulture)
+            Console.WriteLine("SEND_OK codec=" + CodecName(codec)
+                              + " len=" + payload.Length.ToString(CultureInfo.InvariantCulture)
                               + " crc32=" + crc.ToString(CultureInfo.InvariantCulture)
                               + " msgId=" + sr.MsgId);
             return sr.SendStatus == SendStatus.SendOk ? 0 : 1;
@@ -324,6 +365,57 @@ internal static class CompressionLive
                 && !MessageSysFlag.IsCompressed(restored.SysFlag),
                 "rawLen=" + raw.Body.Length.ToString(CultureInfo.InvariantCulture)
                 + " restoredLen=" + restored.Body.Length.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // 7) 另外两个后端（LZ4 Frame / ZSTD）各过一遍真机闭环：生产端压缩 → broker 存压缩体
+        //    → 消费端解压还原。单测里有用 Java 那套库（lz4-java / zstd-jni）生成的硬编码夹具
+        //    证明**线上格式**互通，这里证明的是「自己的发送路径真的用上了这个后端」。
+        //    后端走系统库（P/Invoke 到 liblz4 / libzstd），装不上时打 SKIP，不算失败。
+        foreach (var (name, type, available) in new (string, int, bool)[]
+                 {
+                     ("lz4", CompressionType.LZ4, CompressorFactory.HasLz4Support()),
+                     ("zstd", CompressionType.ZSTD, CompressorFactory.HasZstdSupport()),
+                 })
+        {
+            string tag = "后端 " + name + " 真机往返";
+            if (!available)
+            {
+                Console.WriteLine("[SKIP] " + tag + "  本机没有可用的 lib" + name);
+                continue;
+            }
+
+            string suffix = name + "_" + stamp;
+            string btopic = "CompressLiveDotnet_" + suffix;
+            string bgroup = "CompressLiveDotnetGroup_" + suffix;
+            var bprod = new DefaultMQProducer("CompressLiveDotnetProducer_" + suffix)
+            {
+                NamesrvAddr = namesrv,
+                SendMsgTimeout = 10000,
+                CompressType = type,
+            };
+            bprod.Start();
+            SendResult bsr = bprod.Send(new Message(btopic, payload));
+            bprod.Shutdown();
+            if (bsr.SendStatus != SendStatus.SendOk)
+            {
+                Check(tag, false, "send status=" + bsr.SendStatus);
+                continue;
+            }
+
+            if (!RecvOne(namesrv, btopic, bgroup, 30, out MessageExt bm))
+            {
+                Check(tag, false, "30s 未消费到");
+                continue;
+            }
+
+            Check(tag,
+                bm.Body.Length == payload.Length
+                && UtilAll.Crc32(bm.Body) == payloadCrc
+                && bm.StoreSize > 0 && bm.StoreSize < size / 2
+                && !MessageSysFlag.IsCompressed(bm.SysFlag),
+                "len=" + bm.Body.Length.ToString(CultureInfo.InvariantCulture)
+                + " storeSize=" + bm.StoreSize.ToString(CultureInfo.InvariantCulture)
+                + " sysFlag=" + bm.SysFlag.ToString(CultureInfo.InvariantCulture));
         }
 
         Console.WriteLine();

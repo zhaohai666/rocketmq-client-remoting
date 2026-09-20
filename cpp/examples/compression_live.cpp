@@ -15,7 +15,7 @@
 //
 // 用法：
 //   rmq_compression_live selftest <namesrv>
-//   rmq_compression_live send     <namesrv> <topic> <group> <size>
+//   rmq_compression_live send     <namesrv> <topic> <group> <size> [codec]
 //   rmq_compression_live recv     <namesrv> <topic> <group> <size>
 #include <chrono>
 #include <cstdint>
@@ -51,6 +51,22 @@ std::string buildPayload(int size) {
 }
 
 Bytes str2bytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
+
+// 矩阵用的算法名解析：拼错 codec 直接退出，别让它看起来像"互通失败"。
+int32_t parseCodec(const std::string& name, bool *ok) {
+    *ok = true;
+    if (name.empty() || name == "zlib") return CompressionType::ZLIB;
+    if (name == "lz4") return CompressionType::LZ4;
+    if (name == "zstd") return CompressionType::ZSTD;
+    *ok = false;
+    return CompressionType::ZLIB;
+}
+
+std::string codecName(int32_t codec) {
+    if (codec == CompressionType::LZ4) return "lz4";
+    if (codec == CompressionType::ZSTD) return "zstd";
+    return "zlib";
+}
 
 // 消费 1 条消息（FIRST_OFFSET），超时返回 false
 class FirstMsgListener : public MessageListenerConcurrently {
@@ -110,8 +126,9 @@ bool recvOne(const std::string& namesrv, const std::string& topic, const std::st
 
 int usage() {
     std::cerr << "usage: rmq_compression_live selftest <namesrv>\n"
-                 "       rmq_compression_live send <namesrv> <topic> <group> <size>\n"
-                 "       rmq_compression_live recv <namesrv> <topic> <group> <size>\n";
+                 "       rmq_compression_live send <namesrv> <topic> <group> <size> [codec]\n"
+                 "       rmq_compression_live recv <namesrv> <topic> <group> <size>\n"
+                 "  codec = zlib (默认) | lz4 | zstd，只影响发送端；接收端按 sysFlag 类型位自动解压\n";
     return 2;
 }
 
@@ -131,11 +148,18 @@ int main(int argc, char** argv) {
             const std::string topic = argv[3];
             const std::string group = argv[4];
             const int size = std::stoi(argv[5]);
+            bool codecOk = false;
+            const int32_t codec = parseCodec(argc >= 7 ? argv[6] : "", &codecOk);
+            if (!codecOk) {
+                std::cout << "SEND_FAIL unknown codec=" << argv[6] << std::endl;
+                return usage();
+            }
             const std::string payload = buildPayload(size);
             const Bytes body = str2bytes(payload);
             DefaultMQProducer prod(group);
             prod.setNamesrvAddr(namesrv);
             prod.setSendMsgTimeout(10000);
+            prod.setCompressType(codec);
             prod.start();
             SendResult sr = prod.send(Message(topic, body));
             prod.shutdown();
@@ -143,7 +167,8 @@ int main(int argc, char** argv) {
                 std::cout << "SEND_FAIL status=" << sendStatusName(sr.sendStatus) << std::endl;
                 return 1;
             }
-            std::cout << "SEND_OK len=" << body.size()
+            std::cout << "SEND_OK codec=" << codecName(codec)
+                      << " len=" << body.size()
                       << " crc32=" << crc32(body)
                       << " msgId=" << sr.msgId << std::endl;
             return 0;
@@ -285,7 +310,53 @@ int main(int argc, char** argv) {
               + std::to_string(restored.body.size()));
     }
 
+    // 7) 另外两个后端（LZ4 Frame / ZSTD）各过一遍真机闭环：生产端压缩 → broker 存压缩体
+    //    → 消费端解压还原。单测里有用 Java 那套库（lz4-java / zstd-jni）生成的硬编码夹具
+    //    证明**线上格式**互通，这里证明的是「自己的发送路径真的用上了这个后端」。
+    //    构建时没编入对应系统库的后端打 SKIP，不算失败。
+    struct Backend {
+        const char* name;
+        int32_t type;
+        bool available;
+    };
+    const Backend backends[] = {
+        {"lz4", CompressionType::LZ4, hasLz4Support()},
+        {"zstd", CompressionType::ZSTD, hasZstdSupport()},
+    };
+    for (const Backend& b : backends) {
+        const std::string tag = std::string("后端 ") + b.name + " 真机往返";
+        if (!b.available) {
+            std::cout << "[SKIP] " << tag << "  构建时未编入 lib" << b.name << std::endl;
+            continue;
+        }
+        const std::string suffix = std::string(b.name) + "_" + stamp;
+        const std::string t = "CompressLiveCpp_" + suffix;
+        const std::string g = "CompressLiveCppGroup_" + suffix;
+        DefaultMQProducer prod("CompressLiveCppProducer_" + suffix);
+        prod.setNamesrvAddr(namesrv);
+        prod.setSendMsgTimeout(10000);
+        prod.setCompressType(b.type);
+        prod.start();
+        SendResult sr = prod.send(Message(t, body));
+        prod.shutdown();
+        if (sr.sendStatus != SendStatus::SEND_OK) {
+            check(tag, false, "send status=" + std::string(sendStatusName(sr.sendStatus)));
+            continue;
+        }
+        MessageExt cme;
+        if (!recvOne(namesrv, t, g, 30, cme)) {
+            check(tag, false, "30s 未消费到");
+            continue;
+        }
+        check(tag,
+              cme.body.size() == body.size() && crc32(cme.body) == payloadCrc
+                  && cme.storeSize > 0 && cme.storeSize < size / 2
+                  && !MessageSysFlag::isCompressed(cme.sysFlag),
+              "len=" + std::to_string(cme.body.size())
+                  + " storeSize=" + std::to_string(cme.storeSize)
+                  + " sysFlag=" + std::to_string(cme.sysFlag));
+    }
+
     std::cout << "\n==== compression live summary ====" << std::endl;
     std::cout << (fail == 0 ? "ALL PASS" : "FAILED") << " (fail=" << fail << ")" << std::endl;
-    return fail == 0 ? 0 : 1;
-}
+    return fail == 0 ? 0 : 1;}

@@ -9,6 +9,13 @@
 //   3. **失败一律抛异常，绝不静默原样返回**。静默透传会把压缩字节流当作正文交给
 //      上层——不报错、不抛异常，属不可察觉的数据损坏（Java 抛 IOException /
 //      RuntimeException，这里的语义与其一致）。
+//   4. LZ4 / ZSTD 由系统原生库提供（见 Common/NativeCompression.cs）：
+//      ZSTD 走 libzstd 的 `ZSTD_compress`/`ZSTD_decompress`，产出/接受**标准 zstd 帧**
+//      （magic 0x28 B5 2F FD），对应 Java zstd-jni 的 `ZstdOutputStream`；
+//      LZ4 走 liblz4 的 **LZ4F** 帧接口，对应 Java lz4-java 的 `LZ4FrameOutputStream`。
+//      ⚠ 不能用 `LZ4_compress_default`——那是 raw block，没有帧头，Java 端读不了。
+//      原生库确实加载不到时同样**抛错**（带 "unsupported compression type" 字样），
+//      由调用方（Producer 发送路径）按 Java `tryToCompressMessage` 的方式降级为不压缩。
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Compression;
@@ -65,33 +72,79 @@ public static class CompressorFactory
     // 当前构建是否编入了 zlib 支持（.NET 内置 ZLibStream，恒为 true）。
     public static bool HasZlibSupport() => true;
 
+    /// <summary>
+    /// 当前进程能否用 LZ4（取决于能否加载到带 LZ4F 导出的 liblz4）。
+    /// 探测结果会缓存，调用很便宜。
+    /// </summary>
+    public static bool HasLz4Support()
+    {
+        NativeCompressionLibrary.EnsureProbed();
+        return NativeLz4Codec.IsAvailable;
+    }
+
+    /// <summary>当前进程能否用 ZSTD（取决于能否加载到 libzstd）。探测结果缓存。</summary>
+    public static bool HasZstdSupport()
+    {
+        NativeCompressionLibrary.EnsureProbed();
+        return NativeZstdCodec.IsAvailable;
+    }
+
     // level 仅在 ZLIB 下有意义（Java 默认 5，也是 Python 侧使用的值）。
+    // 例外：Java 的 ZstdCompressor 会把 level 透传给 ZstdOutputStream，这里跟随 Java；
+    // LZ4 两边都忽略 level（lz4-java 用 LZ4FrameOutputStream 默认参数）。
     public static byte[] Compress(byte[] src, int compressionType, int level = 5)
     {
         int type = CompressionType.FindByValue(compressionType);
-        if (type == CompressionType.ZLIB)
+        switch (type)
         {
-            return ZlibDeflate(src, level);
-        }
+            case CompressionType.ZLIB:
+                return ZlibDeflate(src, level);
 
-        // LZ4 / ZSTD 当前未编入（Java 侧由 lz4-java / zstd-jni 提供）。
-        // 同样选择抛错而非静默透传，让问题立刻暴露。
-        throw new InvalidOperationException(
-            "unsupported compression type for compress: " + type.ToString(CultureInfo.InvariantCulture));
+            case CompressionType.LZ4:
+                // Java Lz4Compressor.compress -> new LZ4FrameOutputStream(...)
+                return NativeLz4Codec.IsAvailable
+                    ? NativeLz4Codec.Compress(src)
+                    : throw NativeCompressionLibrary.Unavailable("LZ4");
+
+            case CompressionType.ZSTD:
+                // Java ZstdCompressor.compress -> new ZstdOutputStream(out, level)
+                return NativeZstdCodec.IsAvailable
+                    ? NativeZstdCodec.Compress(src, level)
+                    : throw NativeCompressionLibrary.Unavailable("ZSTD");
+
+            default:
+                throw Unsupported("compress", type);
+        }
     }
 
     public static byte[] Decompress(byte[] src, int compressionType)
     {
         int type = CompressionType.FindByValue(compressionType);
-        if (type == CompressionType.ZLIB)
+        switch (type)
         {
-            return ZlibInflate(src);
-        }
+            case CompressionType.ZLIB:
+                return ZlibInflate(src);
 
-        // 关键：不能原样返回。返回压缩字节会被上层当作正文，属静默数据损坏。
-        throw new InvalidOperationException(
-            "unsupported compression type for decompress: " + type.ToString(CultureInfo.InvariantCulture));
+            case CompressionType.LZ4:
+                // Java Lz4Compressor.decompress -> new LZ4FrameInputStream(...)
+                return NativeLz4Codec.IsAvailable
+                    ? NativeLz4Codec.Decompress(src)
+                    : throw NativeCompressionLibrary.Unavailable("LZ4");
+
+            case CompressionType.ZSTD:
+                // Java ZstdCompressor.decompress -> new ZstdInputStream(...)
+                return NativeZstdCodec.IsAvailable
+                    ? NativeZstdCodec.Decompress(src)
+                    : throw NativeCompressionLibrary.Unavailable("ZSTD");
+
+            default:
+                throw Unsupported("decompress", type);
+        }
     }
+
+    // 关键：不能原样返回。返回压缩字节会被上层当作正文，属静默数据损坏。
+    private static InvalidOperationException Unsupported(string what, int type) =>
+        new("unsupported compression type for " + what + ": " + type.ToString(CultureInfo.InvariantCulture));
 
     private static byte[] ZlibDeflate(byte[] src, int level)
     {

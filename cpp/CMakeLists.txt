@@ -86,6 +86,74 @@ if(RMQ_WITH_ZLIB)
     find_package(ZLIB REQUIRED)
 endif()
 
+# 消息体压缩的另外两个后端：Java 用 lz4-java 的 LZ4Frame*Stream 与 zstd-jni，
+# Python 用 lz4.frame / zstandard，Rust 用 lz4_flex::frame / zstd crate；这里直接链接
+# 系统的 liblz4（LZ4 Frame 互操作格式，见 lz4frame.h）与 libzstd。
+# 与 zlib 同一约定：**找不到就只关这一个后端，configure 照样成功**，运行期遇到该算法
+# 的压缩消息一律抛异常，绝不静默把压缩字节当正文交出去（那等于伪装成成功的数据损坏）。
+option(RMQ_WITH_ZSTD "Enable zstd message body (de)compression" ON)
+option(RMQ_WITH_LZ4  "Enable lz4  message body (de)compression" ON)
+
+# 两个后端都用"裸路径查找优先、cmake config 兜底"：brew 只装 dylib + 头文件（没有
+# *-config.cmake），而 vcpkg / 源码安装会导出带 include 路径的 imported target。
+# 搜索前缀覆盖 Intel Mac 的 /usr/local、Apple Silicon 的 /opt/homebrew 与 Linux 默认路径。
+set(RMQCompression_HINTS /usr/local /opt/homebrew)
+
+set(RMQ_ZSTD_FOUND FALSE)
+if(RMQ_WITH_ZSTD)
+    find_path(RMQ_ZSTD_INCLUDE_DIR NAMES zstd.h
+              HINTS ${RMQCompression_HINTS} PATH_SUFFIXES include)
+    find_library(RMQ_ZSTD_LIBRARY NAMES zstd libzstd
+                 HINTS ${RMQCompression_HINTS} PATH_SUFFIXES lib)
+    if(RMQ_ZSTD_INCLUDE_DIR AND RMQ_ZSTD_LIBRARY)
+        set(RMQ_ZSTD_FOUND TRUE)
+        set(RMQ_ZSTD_LIBS ${RMQ_ZSTD_LIBRARY})
+        message(STATUS "RocketMQ client zstd: enabled (${RMQ_ZSTD_LIBRARY})")
+    else()
+        find_package(zstd CONFIG QUIET)
+        foreach(RMQ_ZSTD_CANDIDATE zstd::zstd zstd::libzstd_shared zstd::libzstd_static)
+            if(NOT RMQ_ZSTD_FOUND AND TARGET ${RMQ_ZSTD_CANDIDATE})
+                set(RMQ_ZSTD_FOUND TRUE)
+                set(RMQ_ZSTD_LIBS ${RMQ_ZSTD_CANDIDATE})
+                message(STATUS "RocketMQ client zstd: enabled via cmake config (${RMQ_ZSTD_CANDIDATE})")
+            endif()
+        endforeach()
+    endif()
+    if(NOT RMQ_ZSTD_FOUND)
+        set(RMQ_ZSTD_INCLUDE_DIR "")
+        set(RMQ_ZSTD_LIBRARY "")
+        message(STATUS "RocketMQ client zstd: libzstd not found, building WITHOUT zstd")
+    endif()
+endif()
+
+set(RMQ_LZ4_FOUND FALSE)
+if(RMQ_WITH_LZ4)
+    # lz4frame.h 是 Frame 格式的公开头；lz4.h 一并要求（compression.cpp 两处都用）
+    find_path(RMQ_LZ4_INCLUDE_DIR NAMES lz4frame.h
+              HINTS ${RMQCompression_HINTS} PATH_SUFFIXES include)
+    find_library(RMQ_LZ4_LIBRARY NAMES lz4 liblz4
+                 HINTS ${RMQCompression_HINTS} PATH_SUFFIXES lib)
+    if(RMQ_LZ4_INCLUDE_DIR AND RMQ_LZ4_LIBRARY)
+        set(RMQ_LZ4_FOUND TRUE)
+        set(RMQ_LZ4_LIBS ${RMQ_LZ4_LIBRARY})
+        message(STATUS "RocketMQ client lz4: enabled (${RMQ_LZ4_LIBRARY})")
+    else()
+        find_package(lz4 CONFIG QUIET)
+        foreach(RMQ_LZ4_CANDIDATE lz4::lz4 LZ4::lz4)
+            if(NOT RMQ_LZ4_FOUND AND TARGET ${RMQ_LZ4_CANDIDATE})
+                set(RMQ_LZ4_FOUND TRUE)
+                set(RMQ_LZ4_LIBS ${RMQ_LZ4_CANDIDATE})
+                message(STATUS "RocketMQ client lz4: enabled via cmake config (${RMQ_LZ4_CANDIDATE})")
+            endif()
+        endforeach()
+    endif()
+    if(NOT RMQ_LZ4_FOUND)
+        set(RMQ_LZ4_INCLUDE_DIR "")
+        set(RMQ_LZ4_LIBRARY "")
+        message(STATUS "RocketMQ client lz4: liblz4 not found, building WITHOUT lz4")
+    endif()
+endif()
+
 # 传输层 TLS（对应 Java NettyRemotingClient 的 SslHandler）。找到 OpenSSL 就默认编入
 # （test mode 信任 broker 自签证书，配合 PERMISSIVE broker 即配即通）；找不到时静默降级，
 # setTlsEnable(true) 会在运行时抛出带说明的错误，其余路径零影响。
@@ -110,6 +178,24 @@ if(RMQ_WITH_ZLIB)
     target_link_libraries(rocketmq_remoting PUBLIC ZLIB::ZLIB)
     # 让 message_decoder / compression.cpp 感知 zlib 是否可用
     target_compile_definitions(rocketmq_remoting PUBLIC ROCKETMQ_HAS_ZLIB=1)
+endif()
+
+# zstd / lz4 同样是 PUBLIC：示例与单测里直接调 CompressorFactory 的代码要看到同一套宏，
+# 否则"编译期关掉的后端"在测试里会被误判成 bug（见 tests/test_compression.cpp 的分支）。
+if(RMQ_ZSTD_FOUND)
+    target_link_libraries(rocketmq_remoting PUBLIC ${RMQ_ZSTD_LIBS})
+    if(RMQ_ZSTD_INCLUDE_DIR)
+        target_include_directories(rocketmq_remoting PUBLIC ${RMQ_ZSTD_INCLUDE_DIR})
+    endif()
+    target_compile_definitions(rocketmq_remoting PUBLIC ROCKETMQ_HAS_ZSTD=1)
+endif()
+
+if(RMQ_LZ4_FOUND)
+    target_link_libraries(rocketmq_remoting PUBLIC ${RMQ_LZ4_LIBS})
+    if(RMQ_LZ4_INCLUDE_DIR)
+        target_include_directories(rocketmq_remoting PUBLIC ${RMQ_LZ4_INCLUDE_DIR})
+    endif()
+    target_compile_definitions(rocketmq_remoting PUBLIC ROCKETMQ_HAS_LZ4=1)
 endif()
 
 if(RMQ_ENABLE_TLS AND OpenSSL_FOUND)

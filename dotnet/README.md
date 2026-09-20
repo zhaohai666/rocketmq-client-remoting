@@ -8,10 +8,13 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，46 项断言测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，282 项测试
 ```
 
-要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`。
+要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
+LZ4 / ZSTD 走 P/Invoke 调**系统库**（`/usr/local/lib/liblz4.dylib`、`libzstd.dylib`，
+Linux 上是 `liblz4.so.1` / `libzstd.so.1`）—— 不引第三方包，装不到时该后端抛异常而不是
+静默透传压缩字节。
 
 ## 目录结构
 
@@ -25,7 +28,8 @@ dotnet/
 │   │   ├── MixAll.cs  MessageConst.cs  SysFlag.cs（MessageSysFlag/PullSysFlag/PermName）
 │   │   ├── Message.cs              #   Message/MessageExt/MessageBatch（引用语义，发送前由 Producer 克隆）
 │   │   ├── MessageDecoder.cs       #   17 段存储格式 + 6 段批量格式编解码
-│   │   ├── Compression.cs          #   zlib；类型位 0/3 = ZLIB；未支持类型必须抛异常（不透传）
+│   │   ├── Compression.cs          #   zlib / LZ4 / ZSTD 三后端；类型位 0/3 = ZLIB；未支持类型必须抛异常（不透传）
+│   │   ├── NativeCompression.cs    #   P/Invoke 到系统 liblz4（LZ4 Frame）/ libzstd，缺库时该后端抛异常
 │   │   ├── SubscriptionData.cs     #   FilterAPI.BuildSubscriptionData / Equals 语义对齐 Java
 │   │   ├── TopicConfig.cs
 │   │   └── ClientLog.cs            #   对齐 Java logback：按大小轮转 + 线程名 + 毫秒 + 文件:行号
@@ -77,7 +81,7 @@ dotnet $PROG selfcheck                    # 本地自检（无需集群）
 dotnet $PROG message-types 127.0.0.1:9876  # 7 类消息能力（12 项检查）
 dotnet $PROG admin-live 127.0.0.1:9876     # Admin 全链路（47 PASS / 0 FAIL / 1 SKIP）
 dotnet $PROG compression-live selftest 127.0.0.1:9876   # 压缩真实性（真机发送→消费→解压→CRC）
-dotnet $PROG compression-live send 127.0.0.1:9876 <topic> <group> <size>
+dotnet $PROG compression-live send 127.0.0.1:9876 <topic> <group> <size> [codec]
 dotnet $PROG compression-live recv 127.0.0.1:9876 <topic> <group> <size>
 dotnet $PROG interop --emit               # 打印规范帧 hex（JSON/ROCKETMQ 双序列化）
 dotnet $PROG interop --decode <hex>       # 解码外部帧（供 Python/C++ -> .NET 字节级互通验证）
@@ -94,13 +98,17 @@ dotnet $PROG hook 127.0.0.1:9876          # CheckForbidden/FilterMessage 钩子�
 | selfcheck | PASS=3 FAIL=0 |
 | message-types | 12 PASS / 0 FAIL |
 | admin-live | 47 PASS / 0 FAIL / 1 SKIP |
-| compression-live selftest | ALL PASS（storeSize 8192→384，21:1；CRC 一致；flag 清除） |
+| compression-live selftest | 10 PASS / 0 FAIL（zlib 真机往返 storeSize 8192→~360、CRC 一致、flag 清除、阈值与编解码闭环 + **后端 lz4 / zstd 真机往返**） |
+| compression-live send/recv | 作为 `../scripts/compression_matrix.sh` 的一端参与四语言矩阵（zlib 13/13、lz4 13/13、zstd 7/7，全 PASS） |
 | interop | Python ↔ .NET 双向解码逐字段一致（JSON 与 ROCKETMQ 双序列化） |
+| latency | 18 PASS / 0 FAIL（S1-S5 故障规避链 + S6 发送重试内核：默认可重试 8 码、上限/换 broker 开关不误伤正常发送、无路由快速失败定性 10005） |
 | trace | 17 PASS / 0 FAIL（消息轨迹全链路：SendResult 字段 → Pub → SubBefore/SubAfter 配对 → 防递归 → 无 keys 容错） |
 | hook | 13 PASS / 0 FAIL（CheckForbiddenHook 放行/拦截/单向/不落 broker + FilterMessageHook 拉取与 POP 两条路径 + 二次 tag 过滤 + 钩子异常吞掉） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **189 passed / 0 failed**，零 warning
-（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **282 passed / 0 failed**，零 warning
+（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（11 项）用
+**进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
+这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。
 
 ## 与 Java 的已知差异
 

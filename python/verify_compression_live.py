@@ -17,8 +17,12 @@
 
 用法：
     python verify_compression_live.py selftest
-    python verify_compression_live.py send   <topic> <group> <size>
+    python verify_compression_live.py send   <topic> <group> <size> [codec]
     python verify_compression_live.py recv   <topic> <group> <size>
+
+``codec`` = zlib（默认）| lz4 | zstd，只影响发送端；接收端按 sysFlag 的类型位自动解压。
+⚠ 本 venv 只装了 ``lz4``，没装 ``zstandard``：zstd 的收发会明确报错而不是静默透传
+（见 ``message_decoder._zstd``），所以跨语言 zstd 矩阵里 python 这一端要跳过。
 """
 import os
 import sys
@@ -85,15 +89,27 @@ def recv_one(topic, group, timeout_sec=30):
     return got[0] if got else None
 
 
-def do_send(topic, group, size):
+CODEC_NAMES = {"zlib": MessageSysFlag.ZLIB_TYPE,
+               "lz4": MessageSysFlag.LZ4_TYPE,
+               "zstd": MessageSysFlag.ZSTD_TYPE}
+
+
+def do_send(topic, group, size, codec="zlib"):
+    ctype = CODEC_NAMES.get(codec)
+    if ctype is None:
+        print("SEND_FAIL unknown codec=%s" % codec, file=sys.stderr)
+        return 2
     payload = build_payload(size)
     prod = DefaultMQProducer(group)
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(10000)
+    # 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
+    prod.set_compress_type(ctype)
     prod.start()
     sr = prod.send(Message(topic, payload))
     prod.shutdown()
-    print("SEND_OK len=%d crc32=%d msgId=%s" % (len(payload), crc32(payload), sr.msg_id))
+    print("SEND_OK codec=%s len=%d crc32=%d msgId=%s"
+          % (codec, len(payload), crc32(payload), sr.msg_id))
     return 0
 
 
@@ -186,6 +202,39 @@ def selftest():
           "rawLen=%s restoredLen=%s"
           % (len(raw.get_body()) if raw else "?", len(restored.get_body()) if restored else "?"))
 
+    # 7) 另外两个后端各过一遍真机闭环：生产端压缩 → broker 存压缩体 → 消费端解压还原。
+    #    与 zlib 那条的区别在于「自己的发送路径真的用上了这个后端」；缺包时打 SKIP，
+    #    不算失败（message_decoder 在缺 lz4/zstandard 时是**明确抛错**的，不会静默透传）。
+    import importlib.util
+    for backend_name, ctype, mod in (
+            ("lz4", MessageSysFlag.LZ4_TYPE, "lz4.frame"),
+            ("zstd", MessageSysFlag.ZSTD_TYPE, "zstandard"),
+    ):
+        tag = "后端 %s 真机往返" % backend_name
+        if importlib.util.find_spec(mod) is None:
+            print("[SKIP] %s  本 venv 没装 %s" % (tag, mod.split(".")[0]))
+            continue
+        bt = "CompressLivePy_%s_%d" % (backend_name, stamp)
+        bg = "CompressLivePyGroup_%s_%d" % (backend_name, stamp)
+        bp = DefaultMQProducer("CompressLivePyProducer_%s_%d" % (backend_name, stamp))
+        bp.set_namesrv_addr(NAMESRV)
+        bp.set_send_msg_timeout(10000)
+        bp.set_compress_type(ctype)
+        bp.start()
+        bp.send(Message(bt, payload))
+        bp.shutdown()
+        bm = recv_one(bt, bg)
+        if bm is None:
+            check(tag, False, "30s 未消费到")
+            continue
+        bbody = bm.get_body()
+        bstore = getattr(bm, "store_size", 0) or 0
+        check(tag,
+              len(bbody) == size and crc32(bbody) == payload_crc
+              and 0 < bstore < size // 2
+              and not MessageSysFlag.is_compressed(getattr(bm, "sys_flag", 0)),
+              "len=%d storeSize=%d sysFlag=%d" % (len(bbody), bstore, getattr(bm, "sys_flag", 0)))
+
     failed = [r for r in results if not r[1]]
     print("\n==== compression live summary ====")
     print("%s (pass=%d fail=%d)" % ("ALL PASS" if not failed else "FAILED",
@@ -196,7 +245,8 @@ def selftest():
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "selftest"
     if mode == "send":
-        return do_send(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+        return do_send(sys.argv[2], sys.argv[3], int(sys.argv[4]),
+                       sys.argv[5] if len(sys.argv) > 5 else "zlib")
     if mode == "recv":
         return do_recv(sys.argv[2], sys.argv[3], int(sys.argv[4]))
     if mode != "selftest":

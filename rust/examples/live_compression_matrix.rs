@@ -8,9 +8,12 @@
 //!
 //! 用法：
 //! ```text
-//! cargo run --example live_compression_matrix -- send <topic> <group> <size>
-//! cargo run --example live_compression_matrix -- recv <topic> <group> <size> [namesrv]
+//! cargo run --example live_compression_matrix -- send <topic> <group> <size> [namesrv] [codec]
+//! cargo run --example live_compression_matrix -- recv <topic> <group> <size> [namesrv] [codec]
 //! ```
+//!
+//! `codec`（`zlib` / `lz4` / `zstd`，默认 `zlib`）只决定发送端用哪个压缩算法；
+//! 接收端按消息 sysFlag 的类型位自动解压，传不传都一样。
 //!
 //! `recv` 走 lite 拉取消费者（订阅 + 后台灌缓冲 + poll），顺带证明解压发生在
 //! 解码路径里（`MessageDecoder` 会清掉 `COMPRESSED_FLAG`）。
@@ -24,6 +27,7 @@ use rocketmq_client_remoting::client::pull_consumer::{
     DefaultLitePullConsumer, LitePullConsumerConfig,
 };
 use rocketmq_client_remoting::common::message::Message;
+use rocketmq_client_remoting::common::sysflag::MessageSysFlag;
 use rocketmq_client_remoting::common::util_all::crc32;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
@@ -41,10 +45,29 @@ fn build_payload(size: usize) -> Vec<u8> {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: live_compression_matrix send <topic> <group> <size> [namesrv]\n\
-        \x20      live_compression_matrix recv <topic> <group> <size> [namesrv]"
+        "usage: live_compression_matrix send <topic> <group> <size> [namesrv] [codec]\n\
+        \x20      live_compression_matrix recv <topic> <group> <size> [namesrv] [codec]"
     );
     ExitCode::FAILURE
+}
+
+/// `zlib` / `lz4` / `zstd` → [`MessageSysFlag`] 的算法号；未知名字直接失败，
+/// 免得矩阵里把「拼错 codec」当成「互通失败」。
+fn parse_codec(raw: &str) -> Result<i32, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "zlib" => Ok(MessageSysFlag::ZLIB_TYPE),
+        "lz4" => Ok(MessageSysFlag::LZ4_TYPE),
+        "zstd" => Ok(MessageSysFlag::ZSTD_TYPE),
+        other => Err(format!("unknown codec: {other}")),
+    }
+}
+
+fn codec_name(codec: i32) -> &'static str {
+    match codec {
+        MessageSysFlag::LZ4_TYPE => "lz4",
+        MessageSysFlag::ZSTD_TYPE => "zstd",
+        _ => "zlib",
+    }
 }
 
 #[tokio::main]
@@ -71,10 +94,18 @@ async fn main() -> ExitCode {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1:9876".to_string());
+    let codec = match argv.get(5).map(|s| parse_codec(s)) {
+        None => MessageSysFlag::ZLIB_TYPE,
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let payload = build_payload(size);
     let crc = crc32(&payload);
     match mode {
-        "send" => send(&namesrv, topic, group, &payload, crc).await,
+        "send" => send(&namesrv, topic, group, &payload, crc, codec).await,
         "recv" => recv(&namesrv, topic, group, &payload, crc).await,
         other => {
             eprintln!("unknown mode: {other}");
@@ -84,7 +115,14 @@ async fn main() -> ExitCode {
 }
 
 /// `group` 只在 recv 侧有用；send 侧用它派生一个稳定的 producer group。
-async fn send(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32) -> ExitCode {
+async fn send(
+    namesrv: &str,
+    topic: &str,
+    group: &str,
+    payload: &[u8],
+    crc: u32,
+    codec: i32,
+) -> ExitCode {
     let mut msg = Message::new(topic, Some(payload));
     msg.set_keys(&format!("{topic}-probe"));
     let producer = match DefaultMQProducer::new(&format!("{group}_prod")) {
@@ -95,6 +133,8 @@ async fn send(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32)
         }
     };
     producer.set_namesrv_addr(namesrv);
+    producer.set_compress_type(codec);
+    // 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
     if let Err(e) = producer.start().await {
         eprintln!("SEND_FAIL start failed: {e}");
         return ExitCode::FAILURE;
@@ -104,7 +144,8 @@ async fn send(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32)
     match result {
         Ok(r) => {
             println!(
-                "SEND_OK len={} crc32={} msgId={}",
+                "SEND_OK codec={} len={} crc32={} msgId={}",
+                codec_name(codec),
                 payload.len(),
                 crc,
                 r.msg_id.clone().unwrap_or_default()
