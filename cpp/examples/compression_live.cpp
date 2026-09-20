@@ -122,43 +122,55 @@ int main(int argc, char** argv) {
     const std::string mode = argv[1];
     const std::string namesrv = argv[2];
 
-    if (mode == "send") {
-        if (argc < 6) return usage();
-        const std::string topic = argv[3];
-        const std::string group = argv[4];
-        const int size = std::stoi(argv[5]);
-        const std::string payload = buildPayload(size);
-        const Bytes body = str2bytes(payload);
-        DefaultMQProducer prod(group);
-        prod.setNamesrvAddr(namesrv);
-        prod.setSendMsgTimeout(10000);
-        prod.start();
-        SendResult sr = prod.send(Message(topic, body));
-        prod.shutdown();
-        std::cout << "SEND_OK len=" << body.size()
-                  << " crc32=" << crc32(body)
-                  << " msgId=" << sr.msgId << std::endl;
-        return sr.sendStatus == SendStatus::SEND_OK ? 0 : 1;
-    }
-
-    if (mode == "recv") {
-        if (argc < 6) return usage();
-        const std::string topic = argv[3];
-        const std::string group = argv[4];
-        const int size = std::stoi(argv[5]);
-        const std::string payload = buildPayload(size);
-        MessageExt m;
-        if (!recvOne(namesrv, topic, group, 30, m)) {
-            std::cout << "RECV_TIMEOUT" << std::endl;
-            return 3;
+    // send/recv 是给跨语言矩阵当端点用的：异常必须落成可 grep 的一行
+    // （`SEND_FAIL` / `RECV_FAIL`），否则 TLS/ACL 被拒这类失败会以 SIGABRT 收场，
+    // 矩阵里只看到一个 134 退出码，读不出原因。
+    try {
+        if (mode == "send") {
+            if (argc < 6) return usage();
+            const std::string topic = argv[3];
+            const std::string group = argv[4];
+            const int size = std::stoi(argv[5]);
+            const std::string payload = buildPayload(size);
+            const Bytes body = str2bytes(payload);
+            DefaultMQProducer prod(group);
+            prod.setNamesrvAddr(namesrv);
+            prod.setSendMsgTimeout(10000);
+            prod.start();
+            SendResult sr = prod.send(Message(topic, body));
+            prod.shutdown();
+            if (sr.sendStatus != SendStatus::SEND_OK) {
+                std::cout << "SEND_FAIL status=" << sendStatusName(sr.sendStatus) << std::endl;
+                return 1;
+            }
+            std::cout << "SEND_OK len=" << body.size()
+                      << " crc32=" << crc32(body)
+                      << " msgId=" << sr.msgId << std::endl;
+            return 0;
         }
-        const bool lenOk = static_cast<int>(m.body.size()) == size;
-        const bool crcOk = !m.body.empty() && crc32(m.body) == crc32(str2bytes(payload));
-        std::cout << "RECV_OK len=" << m.body.size()
-                  << " crc32=" << (m.body.empty() ? 0u : crc32(m.body))
-                  << " storeSize=" << m.storeSize
-                  << " match=" << ((lenOk && crcOk) ? 1 : 0) << std::endl;
-        return (lenOk && crcOk) ? 0 : 1;
+
+        if (mode == "recv") {
+            if (argc < 6) return usage();
+            const std::string topic = argv[3];
+            const std::string group = argv[4];
+            const int size = std::stoi(argv[5]);
+            const std::string payload = buildPayload(size);
+            MessageExt m;
+            if (!recvOne(namesrv, topic, group, 30, m)) {
+                std::cout << "RECV_TIMEOUT" << std::endl;
+                return 3;
+            }
+            const bool lenOk = static_cast<int>(m.body.size()) == size;
+            const bool crcOk = !m.body.empty() && crc32(m.body) == crc32(str2bytes(payload));
+            std::cout << "RECV_OK len=" << m.body.size()
+                      << " crc32=" << (m.body.empty() ? 0u : crc32(m.body))
+                      << " storeSize=" << m.storeSize
+                      << " match=" << ((lenOk && crcOk) ? 1 : 0) << std::endl;
+            return (lenOk && crcOk) ? 0 : 1;
+        }
+    } catch (const std::exception& e) {
+        std::cout << (mode == "recv" ? "RECV_FAIL " : "SEND_FAIL ") << e.what() << std::endl;
+        return 1;
     }
 
     if (mode != "selftest") return usage();

@@ -21,6 +21,7 @@
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/request_reply.h"
 #include "rocketmq/client/result.h"
+#include "rocketmq/client/trace_context.h"
 #include "rocketmq/client/trace_dispatcher.h"
 #include "rocketmq/common/compression.h"
 #include "rocketmq/common/message.h"
@@ -290,8 +291,10 @@ protected:
     std::string clientId_;
     std::string createTopicKey_ = MixAll::DEFAULT_TOPIC;
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
-    bool tlsEnable_ = false;
-    bool enableTraceContext_ = false;
+    bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
+    // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释和
+    // Python/dotnet 一致；写死 false 会让这条 env 开关形同虚设。
+    bool enableTraceContext_ = traceContextEnabledFromEnv();
     int32_t sendMsgTimeout_ = 3000;
     // Request-Reply 默认超时（对应 Java DefaultMQProducer 的 request 兜底 3000ms）
     int32_t requestTimeoutMillis_ = DEFAULT_REQUEST_TIMEOUT_MILLIS;

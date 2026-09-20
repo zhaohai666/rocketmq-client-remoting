@@ -445,7 +445,7 @@ private:
 
     // ---- POP 模式（5.x 轻量消费）----
     bool popMode_ = false;
-    bool tlsEnable_ = false;
+    bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
     int64_t popInvisibleTime_ = 60000;
     int32_t popBatchNums_ = 32;
     int32_t popThresholdForQueue_ = 96;
