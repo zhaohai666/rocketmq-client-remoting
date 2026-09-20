@@ -21,6 +21,14 @@ constexpr const char* SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type";
 constexpr const char* SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE";
 constexpr const char* REMOTING_VERSION_KEY = "rocketmq.remoting.version";
 
+// Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
+// broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
+// `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
+// 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
+// （223→221）低于 `V3_0_7_SNAPSHOT`（ordinal 28）时回 "the client does not support this
+// feature. version=V3_0_7_SNAPSHOT"，`resetOffset` 的在线分支同样按 28 跳过。
+constexpr int32_t CURRENT_VERSION = 515;
+
 std::atomic<int32_t>& opaqueCounter() {
     static std::atomic<int32_t> counter{0};
     return counter;
@@ -44,11 +52,11 @@ uint8_t& serializeTypeConfig() {
 
 int32_t loadVersionConfig() {
     const char* v = std::getenv(REMOTING_VERSION_KEY);
-    if (v == nullptr) return 0;
+    if (v == nullptr) return CURRENT_VERSION;
     try {
         return std::stoi(v);
     } catch (...) {
-        return 0;
+        return CURRENT_VERSION;
     }
 }
 

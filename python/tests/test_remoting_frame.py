@@ -14,7 +14,7 @@ import pytest
 
 from rocketmq.remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
 from rocketmq.remoting.protocol.headers import PullMessageRequestHeader, SendMessageRequestHeaderV2
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq.remoting.protocol.remoting_command import CURRENT_VERSION, RemotingCommand
 
 
 def make_request(code=RequestCode.SEND_MESSAGE_V2, opaque=9, **kwargs):
@@ -210,5 +210,8 @@ class TestCustomHeader:
 
 
 def test_remoting_command_version_default():
+    # 出站请求带真实协议版本（对齐 Java MQVersion.CURRENT_VERSION）：
+    # 0 会让 broker 拒发 307/221 等回调型管理请求（见 remoting_command.CURRENT_VERSION）
     cmd = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC)
-    assert cmd.version == 0
+    assert cmd.version == CURRENT_VERSION
+    assert RemotingCommand.decode(cmd.encode()).version == CURRENT_VERSION

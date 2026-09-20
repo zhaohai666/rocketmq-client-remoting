@@ -21,6 +21,14 @@ SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type"
 SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE"
 REMOTING_VERSION_KEY = "rocketmq.remoting.version"
 
+# Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
+# broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
+# `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
+# 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
+# （223→221）低于 `V3_0_7_SNAPSHOT`（ordinal 28）时回 "the client does not support this
+# feature. version=..."，`resetOffset` 的在线分支同样按 28 跳过。发 0 等于自降为不可回调。
+CURRENT_VERSION = 515
+
 RPC_TYPE = 0
 RPC_ONEWAY = 1
 
@@ -251,7 +259,7 @@ def _set_cmd_version(cmd: RemotingCommand) -> None:
             return
         except ValueError:
             pass
-    cmd.version = 0
+    cmd.version = CURRENT_VERSION
 
 
 def _convert_value(field_type, value: str):

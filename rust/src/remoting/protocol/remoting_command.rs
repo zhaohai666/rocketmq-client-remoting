@@ -24,6 +24,15 @@ pub const RPC_ONEWAY: i32 = 1;
 
 pub const REMOTING_VERSION_KEY: &str = "rocketmq.remoting.version";
 
+/// Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
+///
+/// 这个值不只是好看：broker 用它决定能不能把管理请求转发回客户端——
+/// `AdminBrokerProcessor#callConsumer` 要求 ≥ `V3_1_8_SNAPSHOT`（ordinal 62），
+/// `Broker2Client#getConsumeStatus` 要求 ≥ `V3_0_7_SNAPSHOT`（ordinal 28）。
+/// 之前默认 0（= `V3_0_0_SNAPSHOT`），于是 `examineConsumerRunningInfo` /
+/// `getConsumeStatus` 一律回 `code=1 too low to finish`。
+pub const CURRENT_VERSION: i32 = 515;
+
 static REQUEST_ID: AtomicI32 = AtomicI32::new(0);
 
 pub fn next_opaque() -> i32 {
@@ -123,7 +132,7 @@ impl RemotingCommand {
         self.version = raw
             .as_deref()
             .and_then(|v| v.trim().parse::<i32>().ok())
-            .unwrap_or(0);
+            .unwrap_or(CURRENT_VERSION);
     }
 
     // ---------------- 标志位 ----------------
@@ -399,5 +408,25 @@ impl std::fmt::Display for RemotingCommand {
                 .join(","),
             self.serialize_type_current_rpc
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 出站请求必须带上 Java 口径的协议版本，否则 broker 的管理转发（307/221）会
+    /// 直接以 "too low to finish" 拒掉；`new()` 是解码用的裸对象，仍保持 0。
+    #[test]
+    fn outgoing_commands_carry_the_protocol_version() {
+        assert_eq!(RemotingCommand::new().version, 0);
+        assert_eq!(
+            RemotingCommand::create_request_command(0, None).version,
+            CURRENT_VERSION
+        );
+        assert_eq!(
+            RemotingCommand::create_response(0, None).version,
+            CURRENT_VERSION
+        );
     }
 }

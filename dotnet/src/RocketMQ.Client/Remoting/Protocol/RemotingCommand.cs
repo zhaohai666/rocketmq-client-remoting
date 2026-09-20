@@ -17,6 +17,16 @@ public sealed class RemotingCommand
     public const int RpcType = 0;     // 0 -> REQUEST, 1 -> RESPONSE
     public const int RpcOneway = 1;
 
+    /// <summary>
+    /// Java <c>MQVersion.CURRENT_VERSION</c>（= <c>Version.V5_5_1</c>.ordinal()，本机 5.5.1 集群）。
+    /// broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
+    /// <c>AdminBrokerProcessor#callConsumer</c>（307）低于 V3_1_8_SNAPSHOT（ordinal 62）时直接回
+    /// "The Consumer &lt;x&gt; Version &lt;0&gt; too low to finish"；<c>Broker2Client#getConsumeStatus</c>
+    /// （223 推 221）低于 V3_0_7_SNAPSHOT（ordinal 28）时回 "the client does not support this
+    /// feature. version=..."，resetOffset 的在线分支同样按 28 跳过。发 0 等于自降为不可回调。
+    /// </summary>
+    public const int CurrentVersion = 515;
+
     private static readonly object SerializeTypeLock = new();
     private static int _opaqueCounter;
     private static byte _serializeTypeConfig = LoadSerializeTypeConfig();
@@ -429,10 +439,12 @@ public sealed class RemotingCommand
         string? v = Environment.GetEnvironmentVariable("rocketmq.remoting.version");
         if (v is null)
         {
-            return 0;
+            return CurrentVersion;
         }
 
-        return int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? n : 0;
+        return int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n)
+            ? n
+            : CurrentVersion;
     }
 
     /// <summary>language 名称 -> 码（兼容 5.x 把 language 序列化为枚举名字符串）。未知回落 JAVA。</summary>
