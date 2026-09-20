@@ -64,6 +64,28 @@ public class AdminBodyTests
     }
 
     [Fact]
+    public void ConsumeStatsList_DecodeUsesJavaFieldName()
+    {
+        // ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机
+        // 341 响应会解析成空集合，看着像「这个 broker 没有积压」
+        const string json =
+            "{\"consumeStatsList\":[{\"G_BROKER\":[{\"offsetTable\":{}}]}],"
+            + "\"brokerAddr\":\"127.0.0.1:10911\",\"totalDiff\":7,\"totalInflightDiff\":2}";
+
+        Assert.True(ConsumeStatsList.Decode(Encoding.UTF8.GetBytes(json), out ConsumeStatsList sl));
+        Assert.Equal(1, sl.StatsList.Size());
+        Assert.True(sl.HasBrokerAddr);
+        Assert.Equal("127.0.0.1:10911", sl.BrokerAddr);
+        Assert.Equal(7, sl.TotalDiff);
+        Assert.Equal(2, sl.TotalInflightDiff);
+
+        // 旧键名的 JSON 必须解析不出行，否则会掩盖回归
+        Assert.True(ConsumeStatsList.Decode(
+            Encoding.UTF8.GetBytes("{\"statsList\":[{\"G\":[{}]}]}"), out ConsumeStatsList stale));
+        Assert.Equal(0, stale.StatsList.Size());
+    }
+
+    [Fact]
     public void MessageQueueKey_PlainStringKey_ReturnsFalse()
     {
         // 普通字符串键（"0"、"G1"）不是内联对象，解析必须返回 false

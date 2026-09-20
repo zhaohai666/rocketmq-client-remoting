@@ -403,21 +403,35 @@ class ConsumeStatus:
 
 
 class ConsumeStatsList:
+    """对应 Java `body.ConsumeStatsList`（`GET_BROKER_CONSUME_STATS` 响应）。
+
+    ⚠ JSON 键是 Java 字段名 `consumeStatsList`，不是 `statsList`：写错键名时
+    真机响应会解析成空列表，看着像「这个 broker 没有积压」。
+    `brokerAddr` 是 Java 的 String 字段，走 NON_NULL 序列化所以 None 时整键消失；
+    `totalDiff` / `totalInflightDiff` 是 `long` 原语字段，恒在。
+    """
+
     def __init__(self):
         self.stats_list: List[dict] = []
         self.broker_addr: Optional[str] = None
+        self.total_diff: int = 0
+        self.total_inflight_diff: int = 0
 
     def to_dict(self) -> dict:
-        d = {"statsList": self.stats_list}
+        d = {"consumeStatsList": self.stats_list}
         if self.broker_addr is not None:
             d["brokerAddr"] = self.broker_addr
+        d["totalDiff"] = self.total_diff
+        d["totalInflightDiff"] = self.total_inflight_diff
         return d
 
     @staticmethod
     def from_dict(d: dict) -> "ConsumeStatsList":
         sl = ConsumeStatsList()
-        sl.stats_list = list(d.get("statsList") or [])
+        sl.stats_list = list(d.get("consumeStatsList") or [])
         sl.broker_addr = d.get("brokerAddr")
+        sl.total_diff = int(d.get("totalDiff") or 0)
+        sl.total_inflight_diff = int(d.get("totalInflightDiff") or 0)
         return sl
 
     def encode(self) -> bytes:

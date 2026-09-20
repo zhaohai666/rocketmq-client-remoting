@@ -373,6 +373,24 @@ void testPublicBodies() {
               std::string("{\"consumerIdList\":[\"c1\",\"c2\"]}"), g),
           "GetConsumerListByGroup decode");
     CHECK_EQ(g.consumerIdList.size(), static_cast<size_t>(2), "consumerIdList 2 项");
+
+    // ConsumeStatsList：JSON 键必须是 Java 字段名 consumeStatsList（早期实现写成
+    // statsList，真机 341 响应会被解析成空集合，看着像 broker 没有积压）
+    ConsumeStatsList sl;
+    CHECK(ConsumeStatsList::decode(
+              std::string("{\"consumeStatsList\":[{\"G_BROKER\":\"x\"}],"
+                          "\"brokerAddr\":\"127.0.0.1:10911\",\"totalDiff\":7,"
+                          "\"totalInflightDiff\":2}"),
+              sl),
+          "ConsumeStatsList decode");
+    CHECK_EQ(sl.statsList.size(), static_cast<size_t>(1), "consumeStatsList 1 行");
+    CHECK(sl.hasBrokerAddr && sl.brokerAddr == "127.0.0.1:10911", "ConsumeStatsList brokerAddr");
+    CHECK_EQ(sl.totalDiff, static_cast<long long>(7), "ConsumeStatsList totalDiff");
+    CHECK_EQ(sl.totalInflightDiff, static_cast<long long>(2), "ConsumeStatsList totalInflightDiff");
+    ConsumeStatsList wrongKey;
+    CHECK(ConsumeStatsList::decode(std::string("{\"statsList\":[{\"G\":\"x\"}]}"), wrongKey),
+          "旧键名 JSON 仍可解析（不报错）");
+    CHECK_EQ(wrongKey.statsList.size(), static_cast<size_t>(0), "旧键名 statsList 被忽略");
 }
 
 // ---------------------------------------------------------------- 7. MixAll properties

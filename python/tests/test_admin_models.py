@@ -8,6 +8,8 @@ fastjson2 会把键内联成 JSON 对象，产出**非法 JSON**，标准 json.l
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rocketmq.common.message import MessageQueue
@@ -132,6 +134,30 @@ def test_reset_offset_body_is_mq_keyed():
     assert body.offset_table[MessageQueue("T", "b", 1)] == 20
     again = ResetOffsetBody.decode(body.encode())
     assert again.offset_table[MessageQueue("T", "b", 1)] == 20
+
+
+def test_consume_stats_list_uses_java_field_name():
+    """Java `ConsumeStatsList` 的 JSON 键是 `consumeStatsList`，不是 `statsList`。
+
+    写错键名时真实 broker 的 341 响应会解析成空集合，看着像「这个 broker 没有积压」。
+    `totalDiff` / `totalInflightDiff` 是 Java 的 long 原语字段，恒出现在 JSON 里；
+    `brokerAddr` 是 String，走 NON_NULL 所以 None 时整键消失。
+    """
+    from rocketmq.remoting.protocol.body import ConsumeStatsList
+
+    raw = (b'{"consumeStatsList":[{"G_BROKER":[{"offsetTable":{}}]}],'
+           b'"brokerAddr":"127.0.0.1:10911","totalDiff":7,"totalInflightDiff":2}')
+    sl = ConsumeStatsList.decode(raw)
+    assert len(sl.stats_list) == 1
+    assert sl.broker_addr == "127.0.0.1:10911"
+    assert sl.total_diff == 7
+    assert sl.total_inflight_diff == 2
+
+    # 旧键名的响应必须解析不出行，否则掩盖回归
+    assert ConsumeStatsList.decode(b'{"statsList":[{"G":[{}]}]}').stats_list == []
+
+    assert json.loads(ConsumeStatsList().encode()) == {
+        "consumeStatsList": [], "totalDiff": 0, "totalInflightDiff": 0}
 
 
 # ---------------------------------------------------------------- TopicConfig / 订阅组

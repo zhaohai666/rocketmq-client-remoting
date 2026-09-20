@@ -154,11 +154,17 @@ struct ConsumerRunningInfo {
 };
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeStatsList
-// （GET_BROKER_CONSUME_STATS 的响应：statsList 为 <topic, List<ConsumeStats>> 的列表）
+// （GET_BROKER_CONSUME_STATS 的响应：consumeStatsList 为
+//   <groupName, List<ConsumeStats>> 的列表）
+//
+// ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错时真机响应会
+// 解析成空列表，看着像「这个 broker 没有积压」。
 struct ConsumeStatsList {
     JsonValue statsList;  // 透传
     std::string brokerAddr;
     bool hasBrokerAddr = false;
+    long long totalDiff = 0;
+    long long totalInflightDiff = 0;
 
     JsonValue toJson() const;
     static ConsumeStatsList fromJson(const JsonValue& v);

@@ -61,7 +61,7 @@ fn string_list(value: &Value, key: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// 原样透传的对象数组（`subscriptionSet` / `statsList` / `consumeTimeSpanSet`）。
+/// 原样透传的对象数组（`subscriptionSet` / `consumeStatsList` / `consumeTimeSpanSet`）。
 ///
 /// 不做形状校验，与 Python 的 `list(d.get(k) or [])` 一致 —— 连 `null` 元素也照留。
 fn raw_object_list(value: &Value, key: &str) -> Result<Vec<Value>> {
@@ -785,12 +785,19 @@ impl ConsumeStatus {
 
 /// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumeStatsList`。
 ///
-/// `statsList` 元素是 `admin_body::ConsumeStats` 的 JSON；`brokerAddr` 为 None 时
-/// 整键不出现（`body.py:410-414`）。
+/// ⚠ JSON 键是 Java 字段名 `consumeStatsList`，**不是** `statsList`：早期移植
+/// 猜错了键名，于是真机响应永远解析出空列表，看着像「这个 broker 没有积压」。
+///
+/// `stats_list` 元素是 `List<Map<groupName, List<ConsumeStats>>>` 的 JSON；
+/// `broker_addr` 为 None 时整键不出现（Java `RemotingSerializable` 用
+/// NON_NULL 序列化 String），`totalDiff` / `totalInflightDiff` 是 Java 的
+/// `long` 原语字段，恒出现在 JSON 里。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumeStatsList {
     pub stats_list: Vec<Value>,
     pub broker_addr: Option<String>,
+    pub total_diff: i64,
+    pub total_inflight_diff: i64,
 }
 
 impl ConsumeStatsList {
@@ -801,20 +808,27 @@ impl ConsumeStatsList {
     pub fn to_json_value(&self) -> Value {
         let mut map = Map::new();
         map.insert(
-            "statsList".to_string(),
+            "consumeStatsList".to_string(),
             Value::Array(self.stats_list.clone()),
         );
         if let Some(addr) = &self.broker_addr {
             map.insert("brokerAddr".to_string(), Value::String(addr.clone()));
         }
+        map.insert("totalDiff".to_string(), Value::from(self.total_diff));
+        map.insert(
+            "totalInflightDiff".to_string(),
+            Value::from(self.total_inflight_diff),
+        );
         Value::Object(map)
     }
 
     pub fn from_json_value(value: &Value) -> Result<ConsumeStatsList> {
         expect_object(value, "ConsumeStatsList")?;
         Ok(ConsumeStatsList {
-            stats_list: raw_object_list(value, "statsList")?,
+            stats_list: raw_object_list(value, "consumeStatsList")?,
             broker_addr: jstring(value, "brokerAddr"),
+            total_diff: jlong(value, "totalDiff", 0),
+            total_inflight_diff: jlong(value, "totalInflightDiff", 0),
         })
     }
 
@@ -1255,16 +1269,22 @@ mod tests {
         let stats = ConsumeStatsList {
             stats_list: vec![py(r#"{"offsetTable":{},"consumeTps":1.5}"#)],
             broker_addr: Some("127.0.0.1:10911".into()),
+            total_diff: 7,
+            total_inflight_diff: 2,
         };
         assert_eq!(
             json_of(&stats.to_json_value()),
-            r#"{"statsList":[{"offsetTable":{},"consumeTps":1.5}],"brokerAddr":"127.0.0.1:10911"}"#
+            concat!(
+                r#"{"consumeStatsList":[{"offsetTable":{},"consumeTps":1.5}],"#,
+                r#""brokerAddr":"127.0.0.1:10911","totalDiff":7,"totalInflightDiff":2}"#
+            )
         );
         assert_eq!(ConsumeStatsList::decode(&stats.encode()).unwrap(), stats);
-        // 参考实现 `ConsumeStatsList()`：brokerAddr 键消失
+        // brokerAddr 为 None 时整键消失（Java String 字段走 NON_NULL），
+        // 两个 long 字段则恒在
         assert_eq!(
             json_of(&ConsumeStatsList::new().to_json_value()),
-            r#"{"statsList":[]}"#
+            r#"{"consumeStatsList":[],"totalDiff":0,"totalInflightDiff":0}"#
         );
     }
 
@@ -1725,7 +1745,7 @@ mod tests {
             Err(Error::Decode(_))
         ));
         assert!(matches!(
-            ConsumeStatsList::decode(br#"{"statsList":{}}"#),
+            ConsumeStatsList::decode(br#"{"consumeStatsList":{}}"#),
             Err(Error::Decode(_))
         ));
         assert!(matches!(

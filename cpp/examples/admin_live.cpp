@@ -503,6 +503,43 @@ int main(int argc, char** argv) {
               + "s；broker 把 delayLevel=0 改写为 3，约 10s 后可见）");
     }
 
+    // ---------- 8.5 fetchConsumeStatsInBroker（341）：按订阅组出行，本组带 offsetTable ----------
+    // Java `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 对
+    // `subscriptionGroupTable.keySet()` 的每个组建一行 {group: [ConsumeStats]}，内层 topic
+    // 才来自位点表 `whichTopicByConsumer`（所以要等消费者刷过位点）。
+    // ⚠ 响应 JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机响应
+    // 会解析成空集合，看着像「这个 broker 没有积压」—— 这条断言就是回归护栏。
+    {
+        size_t rows = 0;
+        bool groupWithOffsets = false;
+        int waited = 0;
+        for (int i = 0; i < 20 && !groupWithOffsets; ++i) {
+            try {
+                ConsumeStatsList sl = admin.fetchConsumeStatsInBroker(brokerAddr, false);
+                rows = sl.statsList.size();
+                for (size_t r = 0; r < rows && !groupWithOffsets; ++r) {
+                    const JsonValue& stats = sl.statsList.at(r).get(group);
+                    for (size_t s = 0; s < stats.size(); ++s) {
+                        if (!stats.at(s).get("offsetTable").objectItems().empty()) {
+                            groupWithOffsets = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (const std::exception&) {
+                rows = 0;
+            }
+            if (!groupWithOffsets) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                ++waited;
+            }
+        }
+        check("fetchConsumeStatsInBroker 按订阅组出行", rows > 0,
+              "groups=" + std::to_string(rows));
+        check("fetchConsumeStatsInBroker 本组统计带 offsetTable", groupWithOffsets,
+              "轮询 " + std::to_string(waited) + "s");
+    }
+
     // ---------- 9. 真实 broker 端位点重置（放最后，避免干扰上面的消费）----------
     {
         int64_t ts = nowMs() + 60000;  // 未来时间 -> 位点应被推到 max

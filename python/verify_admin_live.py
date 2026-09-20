@@ -363,6 +363,39 @@ def main():
               "maxOffsetSum=%s（轮询 %ds；broker 把 delayLevel=0 改写为 3，约 10s 后可见）"
               % (retry_max, waited))
 
+    # ---------- 8.5 fetchConsumeStatsInBroker（341）：按订阅组出行，本组带 offsetTable ----------
+    # Java `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 对
+    # `subscriptionGroupTable.keySet()` 的每个组建一行 `{group: [ConsumeStats]}`，
+    # 内层 topic 才来自位点表 `whichTopicByConsumer`（所以要等消费者刷过位点）。
+    # ⚠ 响应 JSON 键是 Java 字段名 consumeStatsList；早期实现写成 statsList，
+    # 于是真机响应永远解析出空集合，看着像「broker 没有积压」——这条断言就是回归护栏。
+    def _group_has_offset_table(rows):
+        # 每行是 Java 的 Map<订阅组名, List<ConsumeStats>>，ConsumeStats.offsetTable
+        # 按 writeQueueNums 逐队列填 brokerOffset/consumerOffset
+        for row in rows:
+            stats = row.get(GROUP) if isinstance(row, dict) else None
+            if stats is None:
+                continue
+            return any(isinstance(s, dict) and s.get("offsetTable") for s in stats)
+        return False
+
+    rows, hit_group, waited_stats = [], False, 0
+    deadline_stats = time.time() + 20
+    while time.time() < deadline_stats:
+        try:
+            rows = admin.fetch_consume_stats_in_broker(broker_addr, False).stats_list
+        except Exception:  # noqa: BLE001
+            rows = []
+        hit_group = _group_has_offset_table(rows)
+        if hit_group:
+            break
+        time.sleep(1)
+        waited_stats += 1
+    check("fetchConsumeStatsInBroker 按订阅组出行", len(rows) > 0,
+          "groups=%d（轮询 %ds）" % (len(rows), waited_stats))
+    check("fetchConsumeStatsInBroker 本组统计带 offsetTable", hit_group,
+          "本组行里有 ConsumeStats（轮询 %ds）" % waited_stats)
+
     # ---------- 9. 真实 broker 端位点重置（放最后，避免干扰上面的消费）----------
     ts = int(time.time() * 1000) + 60000  # 未来时间 → 位点应被推到 max
     reset = safe("resetOffsetByTimestamp(INVOKE_BROKER_TO_RESET_OFFSET)",

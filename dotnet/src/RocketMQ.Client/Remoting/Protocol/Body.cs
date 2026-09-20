@@ -575,7 +575,10 @@ public sealed class ConsumerRunningInfo
 
 /// <summary>
 /// org.apache.rocketmq.remoting.protocol.body.ConsumeStatsList
-/// （GET_BROKER_CONSUME_STATS 的响应：statsList 为 topic 到 ConsumeStats 列表的集合）。
+/// （GET_BROKER_CONSUME_STATS 的响应：consumeStatsList 为 groupName 到
+///   ConsumeStats 列表的集合）。
+/// ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错时真机响应会
+/// 解析成空集合，看着像「这个 broker 没有积压」。
 /// </summary>
 public sealed class ConsumeStatsList
 {
@@ -585,15 +588,21 @@ public sealed class ConsumeStatsList
     public string BrokerAddr { get; set; } = string.Empty;
     public bool HasBrokerAddr { get; set; }
 
+    // Java 的 long 原语字段，恒出现在 JSON 里
+    public long TotalDiff { get; set; }
+    public long TotalInflightDiff { get; set; }
+
     public JsonValue ToJson()
     {
         var v = JsonValue.MakeObject();
-        v.Set("statsList", StatsList.IsNull ? JsonValue.MakeArray() : StatsList);
+        v.Set("consumeStatsList", StatsList.IsNull ? JsonValue.MakeArray() : StatsList);
         if (HasBrokerAddr)
         {
             v.Set("brokerAddr", JsonValue.MakeString(BrokerAddr));
         }
 
+        v.Set("totalDiff", JsonValue.MakeInt(TotalDiff));
+        v.Set("totalInflightDiff", JsonValue.MakeInt(TotalInflightDiff));
         return v;
     }
 
@@ -601,7 +610,7 @@ public sealed class ConsumeStatsList
     {
         var sl = new ConsumeStatsList
         {
-            StatsList = v.Get("statsList"),
+            StatsList = v.Get("consumeStatsList"),
         };
         if (v.TryGetString("brokerAddr", out string s))
         {
@@ -609,6 +618,10 @@ public sealed class ConsumeStatsList
             sl.HasBrokerAddr = true;
         }
 
+        v.TryGetInt("totalDiff", out long totalDiff);
+        sl.TotalDiff = totalDiff;
+        v.TryGetInt("totalInflightDiff", out long totalInflight);
+        sl.TotalInflightDiff = totalInflight;
         return sl;
     }
 

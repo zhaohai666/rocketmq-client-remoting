@@ -577,6 +577,53 @@ internal static class AdminLive
                 + "s；broker 把 delayLevel=0 改写为 3，约 10s 后可见）");
         }
 
+        // ---------- 8.5 FetchConsumeStatsInBroker（341）：按订阅组出行，本组带 offsetTable ----------
+        // Java `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 对
+        // `subscriptionGroupTable.keySet()` 的每个组建一行 {group: [ConsumeStats]}，内层 topic
+        // 才来自位点表 `whichTopicByConsumer`（所以要等消费者刷过位点）。
+        // ⚠ 响应 JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机响应
+        // 会解析成空集合，看着像「这个 broker 没有积压」—— 这条断言就是回归护栏。
+        {
+            int rows = 0;
+            bool groupWithOffsets = false;
+            int waited = 0;
+            for (int i = 0; i < 20 && !groupWithOffsets; ++i)
+            {
+                try
+                {
+                    ConsumeStatsList sl = admin.FetchConsumeStatsInBroker(brokerAddr, false);
+                    rows = sl.StatsList.Size();
+                    for (int r = 0; r < rows && !groupWithOffsets; ++r)
+                    {
+                        JsonValue stats = sl.StatsList.At(r).Get(group);
+                        for (int s = 0; s < stats.Size(); ++s)
+                        {
+                            if (stats.At(s).Get("offsetTable").ObjectItems().Count > 0)
+                            {
+                                groupWithOffsets = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    rows = 0;
+                }
+
+                if (!groupWithOffsets)
+                {
+                    Thread.Sleep(1000);
+                    ++waited;
+                }
+            }
+
+            Check("fetchConsumeStatsInBroker 按订阅组出行", rows > 0,
+                "groups=" + rows.ToString(CultureInfo.InvariantCulture));
+            Check("fetchConsumeStatsInBroker 本组统计带 offsetTable", groupWithOffsets,
+                "轮询 " + waited.ToString(CultureInfo.InvariantCulture) + "s");
+        }
+
         // ---------- 9. 真实 broker 端位点重置（放最后，避免干扰上面的消费）----------
         {
             long ts = UtilAll.CurrentTimeMillis() + 60000; // 未来时间 -> 位点应被推到 max

@@ -377,19 +377,23 @@ bool ConsumerRunningInfo::decode(const Bytes& data, ConsumerRunningInfo& out) {
 // ---------------------------------------------------------------- ConsumeStatsList
 JsonValue ConsumeStatsList::toJson() const {
     JsonValue v = JsonValue::makeObject();
-    v.set("statsList", statsList.isNull() ? JsonValue::makeArray() : statsList);
+    v.set("consumeStatsList", statsList.isNull() ? JsonValue::makeArray() : statsList);
     if (hasBrokerAddr) v.set("brokerAddr", JsonValue::makeString(brokerAddr));
+    v.set("totalDiff", JsonValue::makeInt(totalDiff));
+    v.set("totalInflightDiff", JsonValue::makeInt(totalInflightDiff));
     return v;
 }
 
 ConsumeStatsList ConsumeStatsList::fromJson(const JsonValue& v) {
     ConsumeStatsList sl;
-    sl.statsList = rawSub(v, "statsList");
+    sl.statsList = rawSub(v, "consumeStatsList");
     std::string s;
     if (v.tryGetString("brokerAddr", s)) {
         sl.brokerAddr = s;
         sl.hasBrokerAddr = true;
     }
+    v.tryGetInt("totalDiff", sl.totalDiff);
+    v.tryGetInt("totalInflightDiff", sl.totalInflightDiff);
     return sl;
 }
 
