@@ -961,14 +961,15 @@ mod tests {
         );
         assert_eq!(emitted.trace_beans[0].store_time, render_store(&emitted));
 
-        // 时钟回拨：把 before 的 time_stamp 推到未来 3ms，costTime 变负数，
-        // storeTime 必须按 Python 的 `//` 向下取整（-3 → ts-2，而 Java 会算成 ts-1）
+        // 时钟回拨：把 before 的 time_stamp 推到未来 50ms（不是刚好 3ms——钩子取
+        // now 与这里取 now 之间至少会跳 1 个毫秒，cost 就成了 -2/-1），costTime 变
+        // 负数后 storeTime 必须按 Python 的 `//` 向下取整（-3 → ts-2，Java 会算成 ts-1）
         let mut skewed = emitted.clone();
-        skewed.time_stamp = util_all::current_time_millis() + 3;
+        skewed.time_stamp = util_all::current_time_millis() + 50;
         context.mq_trace_context = Some(Arc::new(skewed));
         hook.send_message_after(&mut context).unwrap();
         let back = sink.reported().remove(1);
-        assert!(back.cost_time <= -3, "cost = {}", back.cost_time);
+        assert!(back.cost_time <= -45, "cost = {}", back.cost_time);
         assert_eq!(
             back.trace_beans[0].store_time,
             back.time_stamp + half_floor(back.cost_time)
