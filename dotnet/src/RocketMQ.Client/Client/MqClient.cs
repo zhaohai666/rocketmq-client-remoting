@@ -146,6 +146,11 @@ public sealed class MQClientInstance : IDisposable
     // ---- 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）----
     public ConsumerStatsManager ConsumerStats { get; } = new();
 
+    // ---- broker 主动通知 40（实例级处理器 + 每个消费者的「叫醒」回调）----
+    private readonly object _wakeupLock = new();
+    private readonly Dictionary<string, Action> _rebalanceWakeups = new(StringComparer.Ordinal);
+    private long _consumerIdsChangedCount;
+
     /// <summary>取一次地址；变化才应用到 _nameServerAddrs（Java 地址变化才 update）。</summary>
     public void FetchNameServerAddr()
     {
@@ -178,6 +183,81 @@ public sealed class MQClientInstance : IDisposable
         // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)——
         // 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），所以在这里注册。
         _remotingClient.RegisterProcessor(RequestCode.PushReplyMessageToClient, ProcessReplyMessage);
+
+        // NOTIFY_CONSUMER_IDS_CHANGED(40)：消费组成员变化时 broker 沿长连接反向推过来。
+        // 同样注册在**实例**上（Java 的 MQClientAPIImpl 构造函数里注册的
+        // clientRemotingProcessor），处理器只做 RebalanceImmediately()；broker 用的是
+        // invokeOneway ⇒ 返回 null 不回包。
+        _remotingClient.RegisterProcessor(RequestCode.NotifyConsumerIdsChanged,
+            ProcessNotifyConsumerIdsChanged);
+    }
+
+    // ---------------- broker 主动通知 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
+    // Java 把 40 注册在 MQClientAPIImpl（实例级），而处理器表是「一个 code 一个处理器」，
+    // 每个消费者各自注册会互相覆盖（后启动的把前一个顶掉）⇒ 组里只剩最后一个实例会被
+    // 叫醒。消费者改为向实例登记「叫醒」回调，由实例收到后逐个扇出。
+
+    /// <summary>收到过多少次 broker 的 40 通知。反向请求只有 broker 发得出来，用例
+    /// 注入不了，计数是真机断言的唯一落点。</summary>
+    public long ConsumerIdsChangedCount => Interlocked.Read(ref _consumerIdsChangedCount);
+
+    public void RegisterRebalanceWakeup(string group, Action wakeup)
+    {
+        lock (_wakeupLock)
+        {
+            _rebalanceWakeups[group] = wakeup;
+        }
+    }
+
+    public void UnregisterRebalanceWakeup(string group)
+    {
+        lock (_wakeupLock)
+        {
+            _rebalanceWakeups.Remove(group);
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#rebalanceImmediately</c>（一行 <c>rebalanceService.wakeup()</c>）。
+    /// 这里没有实例级重平衡线程，改成逐个叫醒已注册消费者自己那份循环
+    /// （等价于 Java doRebalance() 逐个 tryRebalance()）。
+    /// </summary>
+    public void RebalanceImmediately()
+    {
+        Action[] snapshot;
+        lock (_wakeupLock)
+        {
+            snapshot = _rebalanceWakeups.Values.ToArray();
+        }
+        foreach (Action wake in snapshot)
+        {
+            try
+            {
+                wake();
+            }
+            catch (Exception e)
+            {
+                // Java 整段包在 catch (Exception ignored)：一个消费者叫醒失败不影响其它
+                ClientLog.Warn("rebalanceImmediately failed: " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>ClientRemotingProcessor#notifyConsumerIdsChanged</c>：日志文案照抄，
+    /// 然后 rebalanceImmediately()。consumerGroup 只用于日志 —— Java 不读它来决定叫醒谁。
+    /// 运行在 remoting 读线程上：只置位 + 计数，不发任何 RPC。
+    /// 公开只为让离线用例能驱动这条反向路径（真连接上 broker 推不进来），勿用于业务代码。
+    /// </summary>
+    public RemotingCommand? ProcessNotifyConsumerIdsChanged(RemotingCommand cmd, string addr)
+    {
+        var header = new NotifyConsumerIdsChangedRequestHeader();
+        header.FromExtFields(cmd.ExtFields ?? new PropertyMap());
+        Interlocked.Increment(ref _consumerIdsChangedCount);
+        ClientLog.Info("receive broker's notification[" + addr + "], the consumer group: "
+                       + (header.ConsumerGroup ?? string.Empty) + " changed, rebalance immediately");
+        RebalanceImmediately();
+        return null; // broker 用 oneway 发的，Java 返回 null ⇒ 不回包
     }
 
     /// <summary>
@@ -246,6 +326,13 @@ public sealed class MQClientInstance : IDisposable
         }
 
         ConsumerStats.Shutdown();
+        // 40 的回调是消费者登记的闭包（捕获了消费者状态）：关连接之前先摘掉处理器和
+        // 回调表，避免收尾期间 broker 的 40 还打进一个正在退出的消费者。
+        _remotingClient.UnregisterProcessor(RequestCode.NotifyConsumerIdsChanged);
+        lock (_wakeupLock)
+        {
+            _rebalanceWakeups.Clear();
+        }
         _remotingClient.Shutdown();
     }
 

@@ -371,7 +371,8 @@ private:
     // 丢弃在途缓冲、顺序消费集群模式解锁。revoked 为 (队列, 已消费位点) 列表。
     void onQueuesRevoked(const std::vector<std::pair<MessageQueue, int64_t>>& revoked);
     // broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。
-    void onConsumerIdsChanged(const RemotingCommand& cmd);
+    // 由 MQClientInstance 的 40 处理器逐个点名调用（实例级注册，见 start()）。
+    void wakeRebalanceLoop();
     // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）。
     void resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs);
 

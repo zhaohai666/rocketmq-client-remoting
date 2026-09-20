@@ -135,8 +135,15 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
     }
 }
 
-/// 分配结果里剔除 `%RETRY%<group>` 那条队列：`start()` 一定把它和业务 topic 一起
-/// 订阅（Java `copySubscription`），比较「分摊是否不重不漏」时只该看业务队列。
+/// 本实例收到过多少次 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED(40)`；实例已被回收
+/// 时返回 0（40 是 broker 推给长连接的，本端只能靠计数证明它落地了）。
+fn ids_changed_count(client_id: &str) -> usize {
+    MQClientInstance::find_instance(client_id)
+        .map(|i| i.consumer_ids_changed_count())
+        .unwrap_or_default()
+}
+
+/// 分配结果里剔除 `%RETRY%<group>` 那条队列：`start()` 一定把它和业务 topic 一起/// 订阅（Java `copySubscription`），比较「分摊是否不重不漏」时只该看业务队列。
 fn main_queues(keys: &[String]) -> Vec<String> {
     keys.iter()
         .filter(|k| !k.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX))
@@ -1375,6 +1382,22 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         &format!("A={ma:?} B={mb:?}"),
     );
 
+    // 反向推送只有 broker 发得出来，测试无法注入，所以这里是全链路唯一的观测点：
+    // B 注册进组后，broker 沿 A 的长连接推 `NOTIFY_CONSUMER_IDS_CHANGED(40)`，
+    // 实例级处理器把它记成一个计数并叫醒 A 的重平衡。
+    // 断言的不是数值（通知可能来 0~N 次），而是「本端确实收到并处理过」——
+    // 处理器没注册时这里会一直超时，而 remoting 层会打 WARN。
+    let id_a = a.client_id();
+    let notified = poll_until(|| ids_changed_count(&id_a) > 0, WAIT_SECONDS).await;
+    ck.check(
+        "C8 the broker's NOTIFY_CONSUMER_IDS_CHANGED(40) reached the earlier member",
+        notified,
+        &format!(
+            "clientId={id_a} count={} (0 means the instance-level processor never ran)",
+            ids_changed_count(&id_a)
+        ),
+    );
+
     let _ = fx.produce(&topic, "TagA", 16, None).await;
     let got_all = poll_until(|| inbox_a.count() + inbox_b.count() >= 16, WAIT_SECONDS).await;
     let mut bodies = inbox_a.bodies();
@@ -1391,6 +1414,8 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
     );
 
     // 撤掉 A：broker 的成员列表变化后经 40 通知（或 20s 定时）让 B 接管
+    let id_b = b.client_id();
+    let b_before = ids_changed_count(&id_b);
     a.shutdown();
     let took_over = poll_until(
         || main_queues(&b.assigned_queue_keys()).len() == QUEUE_NUMS as usize,
@@ -1401,6 +1426,18 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         "C8 after one instance shuts down the survivor takes over every queue",
         took_over,
         &format!("B assigned={:?}", main_queues(&b.assigned_queue_keys())),
+    );
+    // 接管不该只能等 20s 定时重平衡：A 的连接断开时 broker 会给 B 长连接推 40。
+    let survivor_notified =
+        poll_until(|| ids_changed_count(&id_b) > b_before, WAIT_SECONDS).await;
+    ck.check(
+        "C8 the survivor is pushed NOTIFY_CONSUMER_IDS_CHANGED(40) when a member leaves",
+        survivor_notified,
+        &format!(
+            "clientId={id_b} count {} -> {} (timed rebalance alone would leave it unchanged)",
+            b_before,
+            ids_changed_count(&id_b)
+        ),
     );
     let before_b = inbox_b.count();
     let _ = fx.produce(&topic, "TagA", 4, None).await;

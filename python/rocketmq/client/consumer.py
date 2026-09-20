@@ -1130,10 +1130,10 @@ class DefaultMQPushConsumer:
                     # SUB_ALL 下 tagsSet / codeSet 都为**空**（不是 {"*"}），见 subscription_data.FilterAPI
                     sub = FilterAPI.build_subscription_data(retry_topic, "*")
                     self.subscription_data[retry_topic] = sub
-            # 注册 broker 主动通知：消费者上下线时立刻重算分配
-            # （对齐 Java ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
-            self._mq_client.remoting_client.register_processor(
-                RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._on_consumer_ids_changed)
+            # broker 主动通知 40（消费者上下线 → 立即重算）**不**在这里注册处理器：
+            # Java 把它注册在 MQClientAPIImpl（实例级），一个 code 只有一个处理器，
+            # 每个消费者各自注册会互相覆盖。改由 MQClientInstance 收到后扇给
+            # consumerTable 里的每个消费者（见 ``rebalance_immediately``）。
         # POP 模式的消费线程池必须在 rebalance 之前建好：rebalance 会立刻起每队列的 POP
         # 循环，而循环拿到消息后要投递到这里（Java 的 consumeExecutor）。
         if self.pop_mode:
@@ -1501,9 +1501,11 @@ class DefaultMQPushConsumer:
                 self._offset_table.setdefault(key, off)
         self._rebalance_pull_threads()
 
-    def _on_consumer_ids_changed(self, cmd, addr) -> None:  # noqa: ARG002
-        """broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。"""
-        logger.debug("notify consumer ids changed from %s, rebalance immediately", addr)
+    def rebalance_immediately(self) -> None:
+        """实例收到 broker 的 40 通知后叫醒本消费者的重平衡循环。
+
+        对应 Java ``MQClientInstance#rebalanceImmediately`` → ``RebalanceService#wakeup``。
+        """
         self._rebalance_now.set()
 
     def _rebalance_loop(self) -> None:

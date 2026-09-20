@@ -122,3 +122,9 @@ add_test(NAME consistent_hash COMMAND rmq_test_consistent_hash)
 add_executable(rmq_test_validators test_validators.cpp)
 target_link_libraries(rmq_test_validators PRIVATE rocketmq::remoting)
 add_test(NAME validators COMMAND rmq_test_validators)
+
+# broker 反向推送 40 NOTIFY_CONSUMER_IDS_CHANGED：实例级处理器 + 整组唤醒 + 计数
+#（真机用例注入不了反向请求，只能离线把分派锁死）
+add_executable(rmq_test_broker_requests test_broker_requests.cpp)
+target_link_libraries(rmq_test_broker_requests PRIVATE rocketmq::remoting)
+add_test(NAME broker_requests COMMAND rmq_test_broker_requests)

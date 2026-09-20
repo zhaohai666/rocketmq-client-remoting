@@ -35,7 +35,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::watch;
@@ -81,6 +81,7 @@ use crate::remoting::protocol::headers::{
     GetEarliestMsgStoretimeRequestHeader, GetEarliestMsgStoretimeResponseHeader,
     GetMaxOffsetRequestHeader, GetMaxOffsetResponseHeader,
     GetMinOffsetRequestHeader, GetMinOffsetResponseHeader, LockBatchMqRequestHeader,
+    NotifyConsumerIdsChangedRequestHeader,
     PopMessageRequestHeader, PopMessageResponseHeader, PullMessageRequestHeader,
     PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
     QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader, ReplyMessageRequestHeader,
@@ -91,7 +92,7 @@ use crate::remoting::protocol::headers::{
 use crate::remoting::protocol::heartbeat::{ConsumerData, HeartbeatData, SubscriptionData};
 use crate::remoting::protocol::remoting_command::RemotingCommand;
 use crate::remoting::protocol::route::TopicRouteData;
-use crate::{bail, rmq_debug, rmq_warn};
+use crate::{bail, rmq_debug, rmq_info, rmq_warn};
 
 // ================================================================ seams
 
@@ -145,6 +146,13 @@ pub trait RegisteredConsumer: Send + Sync {
     /// 线程弹性巡检（Java `MQClientInstance#adjustThreadPool` 调用的
     /// `consumer.adjustThreadPool()`；Python/Java 均 no-op）。
     fn adjust_thread_pool(&self) {}
+
+    /// broker 推 `NOTIFY_CONSUMER_IDS_CHANGED(40)` 时，实例对每个已注册消费者的扇出
+    /// （Java `MQClientInstance#rebalanceImmediately` → `RebalanceService#wakeup` →
+    /// `doRebalance` 逐个调 `tryRebalance`）。
+    ///
+    /// 默认 no-op：拉模式的消费组没有后台重平衡循环，Java 那边唤醒它也是空转。
+    fn rebalance_immediately(&self) {}
 
     /// 220 处理：broker 下发位点重置。必须**后台**执行（内部会做 rebalance /
     /// lock / batch 等 `invoke_sync`，不能卡在 remoting 读线程上）。
@@ -537,6 +545,11 @@ struct Inner {
     /// 后台任务的停止信号（true = 停）。
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// 收到过多少次 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED(40)`。
+    /// Java 只打一行 INFO（`ClientRemotingProcessor#notifyConsumerIdsChanged`），
+    /// 这里额外计数是为了让"通知到底有没有被处理"在真机用例里可断言 ——
+    /// 反向推送只有 broker 能发，测试没法从外部注入。
+    consumer_ids_changed_count: AtomicUsize,
 }
 
 /// Python `MQClientInstance`（类级 `INSTANCE_MAP` 在 Rust 里是
@@ -595,10 +608,15 @@ impl MQClientInstance {
             config,
             stop: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
+            consumer_ids_changed_count: AtomicUsize::new(0),
         });
         let this = MQClientInstance { inner: inner.clone() };
-        // Python __init__：注册 326/220/221/307/309 五个实例级处理器
+        // Python __init__：注册 326/220/221/307/309/40 六个实例级处理器
         // （Java MQClientAPIImpl 构造函数里的 clientRemotingProcessor）。
+        // 40 也在这里：Java 是 `registerProcessor(NOTIFY_CONSUMER_IDS_CHANGED,
+        // clientRemotingProcessor, null)`，属于**实例**而不是某个消费者 ——
+        // 同 clientId 上的 lite / 拉模式 / 生产者连接都会收到 broker 的这条反向推送，
+        // 交给消费者自己注册就会留下"没人处理"的告警。
         let processor = Arc::new(ClientRemotingProcessor {
             instance: Arc::downgrade(&inner),
         });
@@ -608,6 +626,7 @@ impl MQClientInstance {
             request_code::GET_CONSUMER_STATUS_FROM_CLIENT,
             request_code::GET_CONSUMER_RUNNING_INFO,
             request_code::CONSUME_MESSAGE_DIRECTLY,
+            request_code::NOTIFY_CONSUMER_IDS_CHANGED,
         ] {
             this.inner.remoting_client.register_processor(code, processor.clone());
         }
@@ -708,6 +727,22 @@ impl MQClientInstance {
             .collect()
     }
 
+    /// Java `MQClientInstance#rebalanceImmediately`（一行 `rebalanceService.wakeup()`，
+    /// 由共享的重平衡线程逐个 `tryRebalance`）。Rust 没有实例级重平衡线程，
+    /// 改成对每个已注册消费者点一次名，让它叫醒自己那份循环。
+    pub fn rebalance_immediately(&self) {
+        for consumer in self.consumers_snapshot() {
+            consumer.rebalance_immediately();
+        }
+    }
+
+    /// 收到过多少次 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED(40)`。
+    /// 见 [`Inner::consumer_ids_changed_count`]：反向推送只有 broker 发得出来，
+    /// 真机用例需要一个可断言的落点。
+    pub fn consumer_ids_changed_count(&self) -> usize {
+        self.inner.consumer_ids_changed_count.load(Ordering::SeqCst)
+    }
+
     // ---------------- broker 主动请求处理（ClientRemotingProcessor） ----------------
 
     pub(crate) fn process_reset_offset(&self, cmd: &RemotingCommand) {
@@ -752,6 +787,25 @@ impl MQClientInstance {
                 rmq_warn!("reset offset failed (group={group:?} topic={topic}): {e}");
             }
         });
+    }
+
+    /// 对应 Java `ClientRemotingProcessor#notifyConsumerIdsChanged`：记一行 INFO
+    /// 文案照抄（`receive broker's notification[<addr>], the consumer group: <g>
+    /// changed, rebalance immediately`），然后 `rebalanceImmediately()`。
+    /// Java 整段包在 `try/catch` 里且**返回 null**（不回包）—— 通知处理失败不能让
+    /// broker 侧连接报错，这里同理：不抛、也不回响应。
+    pub(crate) fn process_notify_consumer_ids_changed(&self, cmd: &RemotingCommand, addr: &str) {
+        let mut header = NotifyConsumerIdsChangedRequestHeader::default();
+        header.from_ext_fields(cmd.ext_fields());
+        let group = header.consumer_group.clone().unwrap_or_default();
+        self.inner
+            .consumer_ids_changed_count
+            .fetch_add(1, Ordering::SeqCst);
+        rmq_info!(
+            "receive broker's notification[{addr}], the consumer group: {group} changed, \
+             rebalance immediately"
+        );
+        self.rebalance_immediately();
     }
 
     pub(crate) fn process_get_consumer_status(&self, cmd: &RemotingCommand) -> RemotingCommand {
@@ -2871,7 +2925,7 @@ fn build_reply_message_ext(header: &ReplyMessageRequestHeader, body: Option<&[u8
     Ok(msg)
 }
 
-/// 五个实例级 broker 主动请求码共用一个处理器（Python 注册的是同一个实例上的
+/// 六个实例级 broker 主动请求码共用一个处理器（Python 注册的是同一个实例上的
 /// 不同方法，Rust 的 `RequestProcessor` 一个对象可注册到多个 code，语义一致）。
 ///
 /// 对应 Java `ClientRemotingProcessor`。
@@ -2882,7 +2936,7 @@ struct ClientRemotingProcessor {
 }
 
 impl RequestProcessor for ClientRemotingProcessor {
-    fn process(&self, request: RemotingCommand, _addr: String, sink: ResponseSink) {
+    fn process(&self, request: RemotingCommand, addr: String, sink: ResponseSink) {
         let Some(inner) = self.instance.upgrade() else {
             sink.respond(RemotingCommand::create_response(
                 response_code::SYSTEM_ERROR,
@@ -2897,6 +2951,11 @@ impl RequestProcessor for ClientRemotingProcessor {
                 // oneway：Python 返回 None；Rust 由 ResponseSink 按 wants_reply 丢弃，
                 // 这里干脆不回。
                 instance.process_reset_offset(&request);
+                return;
+            }
+            request_code::NOTIFY_CONSUMER_IDS_CHANGED => {
+                // 同 220：broker 发的是通知，Java 返回 null ⇒ 不回包。
+                instance.process_notify_consumer_ids_changed(&request, &addr);
                 return;
             }
             request_code::GET_CONSUMER_STATUS_FROM_CLIENT => {
@@ -2987,6 +3046,8 @@ mod tests {
         resets: Arc<Mutex<Vec<(String, usize)>>>,
         status_topics: Arc<Mutex<Vec<Option<String>>>>,
         persisted: Arc<AtomicUsize>,
+        /// 40 通知叫醒了几次重平衡。
+        rebalance_wakeups: Arc<AtomicUsize>,
     }
 
     impl StubConsumer {
@@ -2997,6 +3058,7 @@ mod tests {
                 resets: Arc::new(Mutex::new(Vec::new())),
                 status_topics: Arc::new(Mutex::new(Vec::new())),
                 persisted: Arc::new(AtomicUsize::new(0)),
+                rebalance_wakeups: Arc::new(AtomicUsize::new(0)),
             })
         }
     }
@@ -3032,6 +3094,10 @@ mod tests {
 
         fn subscriptions(&self) -> Vec<SubscriptionData> {
             Vec::new()
+        }
+
+        fn rebalance_immediately(&self) {
+            self.rebalance_wakeups.fetch_add(1, Ordering::SeqCst);
         }
 
         fn reset_offset(
@@ -3272,6 +3338,51 @@ mod tests {
         let resp = instance.process_consume_message_directly(&garbage);
         assert_eq!(resp.code, response_code::SYSTEM_ERROR);
         assert_eq!(resp.remark.as_deref(), Some("decode message failed"));
+        instance.shutdown();
+    }
+
+    // ---------------- 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
+
+    /// Java 把 40 注册在 `MQClientAPIImpl` 构造器里（实例级），处理器只做
+    /// `rebalanceImmediately()` 且**不回包**；Rust 同口径：扇出到 consumerTable
+    /// 里每个消费者，没有注册者也不报错。
+    #[tokio::test]
+    async fn consumer_ids_changed_notification_wakes_every_consumer() {
+        let instance = new_instance();
+        let first = StubConsumer::new();
+        let second = StubConsumer::new();
+        instance.register_consumer(GROUP, first.clone());
+        instance.register_consumer("GID_Other", second.clone());
+
+        let mut header = NotifyConsumerIdsChangedRequestHeader::default();
+        header.consumer_group = Some(GROUP.to_string());
+        instance.process_notify_consumer_ids_changed(
+            &request(request_code::NOTIFY_CONSUMER_IDS_CHANGED, header),
+            "127.0.0.1:10911",
+        );
+
+        assert_eq!(instance.consumer_ids_changed_count(), 1);
+        // 扇出是整组唤醒，不是只叫醒 header 里那一个组（Java 同样不读 group）。
+        assert_eq!(first.rebalance_wakeups.load(Ordering::SeqCst), 1);
+        assert_eq!(second.rebalance_wakeups.load(Ordering::SeqCst), 1);
+
+        // 缺 consumerGroup 也照样计数：Java 只用它拼日志。
+        instance.process_notify_consumer_ids_changed(
+            &request(
+                request_code::NOTIFY_CONSUMER_IDS_CHANGED,
+                NotifyConsumerIdsChangedRequestHeader::default(),
+            ),
+            "127.0.0.1:10911",
+        );
+        assert_eq!(instance.consumer_ids_changed_count(), 2);
+        assert_eq!(first.rebalance_wakeups.load(Ordering::SeqCst), 2);
+
+        // 注销后不再被叫醒，但通知本身仍然被处理。
+        instance.unregister_consumer(GROUP);
+        instance.unregister_consumer("GID_Other");
+        instance.rebalance_immediately();
+        assert_eq!(first.rebalance_wakeups.load(Ordering::SeqCst), 2);
+        assert_eq!(second.rebalance_wakeups.load(Ordering::SeqCst), 2);
         instance.shutdown();
     }
 

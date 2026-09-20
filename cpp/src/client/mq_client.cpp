@@ -135,6 +135,16 @@ MQClientInstance::MQClientInstance(const std::string& clientId,
         [](const RemotingCommand& cmd, const std::string& addr) {
             return processReplyMessage(cmd, addr);
         });
+    // NOTIFY_CONSUMER_IDS_CHANGED(40)：消费组成员变化时 broker 沿长连接反向推过来。
+    // 同样注册在**实例**上（Java 的 `MQClientAPIImpl` 构造函数），处理器只做
+    // rebalanceImmediately()，且 broker 用 oneway 发的 ⇒ 不回包（返回 nullopt）。
+    // ⚠ 回调在读线程上执行，只做置位/计数，不发任何 RPC。
+    remotingClient_->registerProcessor(
+        RequestCode::NOTIFY_CONSUMER_IDS_CHANGED,
+        [this](const RemotingCommand& cmd, const std::string& addr) {
+            this->processNotifyConsumerIdsChanged(cmd, addr);
+            return std::optional<RemotingCommand>();
+        });
 }
 
 MQClientInstance::~MQClientInstance() { shutdown(); }
@@ -230,8 +240,58 @@ void MQClientInstance::shutdown() {
     }
     consumerStats_.shutdown();
     if (remotingClient_) {
+        // 40 的回调捕获了 this：实例析构前必须摘掉，否则读线程可能回调悬垂对象
+        remotingClient_->unregisterProcessor(RequestCode::NOTIFY_CONSUMER_IDS_CHANGED);
         remotingClient_->shutdown();
     }
+    {
+        std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
+        rebalanceWakeups_.clear();
+    }
+}
+
+// ---------------------------------------------------------------- 40 NOTIFY_CONSUMER_IDS_CHANGED
+
+void MQClientInstance::registerRebalanceWakeup(const std::string& group,
+                                               std::function<void()> wakeup) {
+    std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
+    rebalanceWakeups_[group] = std::move(wakeup);
+}
+
+void MQClientInstance::unregisterRebalanceWakeup(const std::string& group) {
+    std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
+    rebalanceWakeups_.erase(group);
+}
+
+void MQClientInstance::rebalanceImmediately() {
+    // Java 是一行 rebalanceService.wakeup()：唤醒那个共享的重平衡线程，由它
+    // doRebalance() 逐个 tryRebalance()。这里没有实例级重平衡线程（每个消费者跑自己
+    // 那份循环），所以改成逐个点名。异常照 Java 吞掉：一个消费者叫醒失败不影响其它。
+    std::map<std::string, std::function<void()>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
+        snapshot = rebalanceWakeups_;
+    }
+    for (const auto& entry : snapshot) {
+        if (!entry.second) continue;
+        try {
+            entry.second();
+        } catch (...) {
+            // Java: catch (Exception ignored)
+        }
+    }
+}
+
+void MQClientInstance::processNotifyConsumerIdsChanged(const RemotingCommand& cmd,
+                                                      const std::string& addr) {
+    // 对应 Java ClientRemotingProcessor#notifyConsumerIdsChanged：日志文案照抄。
+    // consumerGroup 只用于日志 —— Java 不读它来决定叫醒谁，整组一起唤醒。
+    auto it = cmd.extFields.find("consumerGroup");
+    const std::string group = it == cmd.extFields.end() ? std::string() : it->second;
+    consumerIdsChangedCount_.fetch_add(1);
+    logger_info("receive broker's notification[" + addr + "], the consumer group: " + group +
+                " changed, rebalance immediately");
+    rebalanceImmediately();
 }
 
 void MQClientInstance::fetchNameServerAddr() {

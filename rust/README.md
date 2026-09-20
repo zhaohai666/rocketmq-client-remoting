@@ -49,12 +49,12 @@ Windows / MSVC 分支。
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 639 条，~0.3s
+cargo test --lib               # 640 条，~0.3s
 ```
 
 ## 单元测试
 
-639 条按模块分布（`cargo test --lib -- --list` 可复算）：
+640 条按模块分布（`cargo test --lib -- --list` 可复算）：
 
 | 模块 | 条数 | 覆盖 |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ cargo test --lib               # 639 条，~0.3s
 | `client::allocate_strategy` | 30 | 六个策略与 Java 单测逐条对拍：`AVG` / `AVG_BY_CIRCLE` 的 Java 用例（10/4、7/3、边界队列续接）、四道 `check` 守卫返回**空结果**而非 Java 的 `IllegalArgumentException`、`CONFIG` 不查守卫且返回副本、六个 `get_name()` 与 Java 常量一致、N 消费者不重不漏、`CONSISTENT_HASH` 的哈希环表逐格、`MACHINE_ROOM` 的 `[0,1,4]/[2,3]` 分片与 `String#split("@")` 裁尾空段真值表、`MACHINE_ROOM_NEARBY` 同机房优先 + 无消费者机房由全员共享 + resolver 空机房**抛错**（保住上一轮分配） |
 | `client::consumer` / `pull_consumer` / `consume_executor` / `consumer_stats` | 97 | 订阅与 `MessageSelector`、`PopProcessQueue`、过滤与投递接缝、pull/lite 状态机（subscribe/assign/seek/poll/committed）、`consume_executor` 的 core/max 两档弹性语义（空闲 worker 按 keepAlive 退休）、`StatsItem` 窗口端点差分（不依赖真实时钟） |
 | 轨迹四件套 `trace` / `trace_hook` / `trace_dispatcher` / `trace_context` | 101 | 与 Java 官方实现的逐字节对拍（Pub / SubBefore / SubAfter / EndTransaction / Recall）、SOH/STX 文本编解码双向、无 keys 空段容错、坏记录只跳过自己、分发器攒批/切块/防递归、W3C `traceparent` 生成与校验 |
-| `client` 其余 | 111 | `mq_client`（实例表复用、心跳装配、路由缓存）、`admin`（properties 文本、分页合并、地址挑选）、`latency`、`hook`、`request_reply`、`metrics`、`top_addressing`、`result`、`validators` |
+| `client` 其余 | 112 | `mq_client`（实例表复用、心跳装配、路由缓存）、`admin`（properties 文本、分页合并、地址挑选）、`latency`、`hook`、`request_reply`、`metrics`、`top_addressing`、`result`、`validators` |
 | `error` | 2 | 错误码口径（10001..10005）与 `Display` |
 
 ## 真实集群联调
@@ -94,7 +94,7 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 ```
 
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
-下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 11 个工具合计 659 项断言；
+下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 11 个工具合计 661 项断言；
 `live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本调度，都不计进去）：
 
 | 工具 | 结果 | 覆盖 |
@@ -102,7 +102,7 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_protocol` | 43 PASS | S0~S8：路由/集群信息 → `SEND_MESSAGE_V2`(310) 短键 header → `PULL_MESSAGE`(11) + 17 段解码 → 四个 offset RPC → 心跳/消费组列表/注销 → **RocketMQ 二进制 header 在真 broker 上的往返** → 清理 |
 | `live_mq_client` | 74 PASS | M1~M7：实例身份与复用、路由与 `TopicPublishInfo` 游标（未知 topic 只在生产者路径回退 `TBW102`）、收发逐字段、位点五 RPC、心跳真被 broker 采纳（用 `GET_CONSUMER_LIST_BY_GROUP` 反查证明）、**POP 弹回→ACK→改不可见时间→再弹拿不到**、队列批量锁真互斥 |
 | `live_producer` | 46 PASS | P1~P8：生命周期与心跳注册、六条发送路径、压缩消息 broker 端透明解压且清 flag、三类钩子、轨迹接缝、Request-Reply 三属性与超时、**事务两阶段 + broker 回查**、管理便捷方法、发送重试内核定性 |
-| `live_consumer` | 86 PASS | C1~C10：`start()` 三道校验与首轮同步心跳、长轮询 24 条不重不丢且位点刷到 broker、tag 过滤（broker 存 20 只投 10）、`RECONSUME_LATER` 走 `%RETRY%` 重投、POP + ack、广播位点、顺序消费 broker 锁、多实例分摊与撤位、`ConsumerRunningInfo` |
+| `live_consumer` | 88 PASS | C1~C10：`start()` 三道校验与首轮同步心跳、长轮询 24 条不重不丢且位点刷到 broker、tag 过滤（broker 存 20 只投 10）、`RECONSUME_LATER` 走 `%RETRY%` 重投、POP + ack、广播位点、顺序消费 broker 锁、多实例分摊与撤位、broker 推来的 `NOTIFY_CONSUMER_IDS_CHANGED`(40) 确实叫醒了两端、`ConsumerRunningInfo` |
 | `live_pull_consumer` | 43 PASS | P1~P11：生命周期、`fetch_subscribe_message_queues`、定向 12 条、手动 pull 不重不漏 + `broker_name` 回填、位点由调用方掌控（回退再拉 FOUND、换 tag `NO_MATCHED_MSG`）、未提交组读位点得 `None` 而非 0、**长轮询真的挂起** |
 | `live_lite_pull_consumer` | 48 PASS | L1~L10：`start()` 校验（含 14 位墙钟硬失败）、subscribe 后台重平衡收全 12 条、`auto_commit` 两态、assign + `seek_to_begin` 重放、`seek()` 丢掉缓冲里早于目标位点的消息、pause/resume、手工心跳 |
 | `live_alloc_strategy` | 26 PASS | A1~A6：**策略真的驱动重平衡**。A1/A2 默认 `AVG` 与 null 策略被 `start()` 按 Java 文案拒绝、A3 `AVG_BY_CIRCLE` / `CONFIG` 两实例交叉与分半、A4 `CONSISTENT_HASH` 用真实 clientId 建环、A5 `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 单机房下原样透传内层策略且 resolver 被逐个真实 brokerName 与两个真实 clientId 问过、A6 `MACHINE_ROOM` 白名单不匹配 `broker-a` 时**安静饿死**（同组 AVG 对照组仍只拿自己半边）。收敛判据统一是「线上 `assignment()` == 用真实 mqAll/cidAll 离线跑同一策略的预测」——"两边都非空且并集覆盖全队列"是**假收敛**：环算法下一实例本就合法地拿到全部，且对端心跳落地前每台都会先拿全部 |
@@ -206,9 +206,6 @@ rust/
 ## 与 Java 的已知差异 / 待办
 
 - **`recallMessage`(370) 没有生产者侧 API**，只有轨迹侧的 Recall 记录解码。
-- **入站 `NOTIFY_CONSUMER_IDS_CHANGED`(40) 只有 push consumer 注册了处理器**：
-  pull / lite 路径会打 `no processor for request code 40` 的 WARN（属预期噪音，
-  不影响收发）。Java 是在 `MQClientInstance` 上按 group 统一注册的。
 - **默认 clientId 不含本机 IP 段**：`build_mq_client_id(ip, instanceName, unitName)` 已按
   Java 写好，但 facade 默认走 `build_default_client_id` ⇒ `instanceName@<14 位时间戳>`。
 - **`unitName` / `unitMode` 没有客户端配置项**（协议字段在，能编解码）。

@@ -38,7 +38,9 @@ from ..remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHead
                                          GetConsumerStatusRequestHeader,
                                          GetMaxOffsetRequestHeader,
                                          GetMaxOffsetResponseHeader, GetMinOffsetRequestHeader,
-                                         GetMinOffsetResponseHeader, PullMessageRequestHeader,
+                                         GetMinOffsetResponseHeader,
+                                         NotifyConsumerIdsChangedRequestHeader,
+                                         PullMessageRequestHeader,
                                          PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
                                          QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader,
                                          QueryMessageResponseHeader, ReplyMessageRequestHeader,
@@ -147,6 +149,16 @@ class MQClientInstance:
             RequestCode.GET_CONSUMER_RUNNING_INFO, self._process_get_consumer_running_info)
         self.remoting_client.register_processor(
             RequestCode.CONSUME_MESSAGE_DIRECTLY, self._process_consume_message_directly)
+        # NOTIFY_CONSUMER_IDS_CHANGED(40)：消费组成员变化时 broker 沿长连接反向推过来。
+        # 对应 Java ``MQClientAPIImpl`` 构造函数 —— 它注册的是**实例级**的
+        # ``clientRemotingProcessor``，不是每个消费者各注册一份：处理器按 code 建表，
+        # 同组多消费者时后注册的会覆盖前一个（Java 里一个 clientId 只有一个连接，
+        # 覆盖就等于「只有最后一个消费者会被叫醒」）。
+        self.remoting_client.register_processor(
+            RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._process_notify_consumer_ids_changed)
+        # 40 只能由 broker 发出，用例无法注入反向请求，所以计数是唯一能断言
+        # 「本端确实收到并处理过」的落点（见 python/tests/test_broker_requests.py）。
+        self._consumer_ids_changed_count = 0
         self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
         # 动态 name server（对应 Java MQClientAPIImpl.topAddressing）。
         # 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 ws_addr 为空串 → fetch 是 no-op，行为不变。
@@ -203,6 +215,46 @@ class MQClientInstance:
 
     def find_consumer(self, group: str) -> Optional["DefaultMQPushConsumer"]:
         return self._consumer_table.get(group)
+
+    # ---------------- 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
+    @property
+    def consumer_ids_changed_count(self) -> int:
+        """本实例收到过多少次 broker 的 ``NOTIFY_CONSUMER_IDS_CHANGED(40)``。"""
+        return self._consumer_ids_changed_count
+
+    def rebalance_immediately(self) -> None:
+        """对应 Java ``MQClientInstance#rebalanceImmediately``（一行 ``rebalanceService.wakeup()``）。
+
+        Java 只有一个共享的重平衡线程，唤醒它即可；这里没有实例级重平衡线程，
+        改成对 consumerTable 里每个消费者点一次名，让它叫醒自己那份循环
+        （等价于 Java ``doRebalance()`` 逐个 ``impl.tryRebalance()``）。
+        拉模式消费者没有后台循环，``rebalance_immediately`` 在它们那边是 no-op。
+        """
+        for consumer in list(self._consumer_table.values()):
+            if consumer is None:
+                continue
+            wake = getattr(consumer, "rebalance_immediately", None)
+            if wake is None:
+                continue
+            try:
+                wake()
+            except Exception as e:  # noqa: BLE001 —— Java 整段包在 try/catch 里
+                logger.warning("rebalance_immediately failed: %s", e)
+
+    def _process_notify_consumer_ids_changed(self, cmd: RemotingCommand,
+                                             addr: str) -> Optional[RemotingCommand]:
+        """对应 Java ``ClientRemotingProcessor#notifyConsumerIdsChanged``。
+
+        broker 用 ``invokeOneway`` 发的，Java 返回 null ⇒ 不回包。group 只用于日志：
+        Java 不读它来决定叫醒谁，整组一起唤醒（本实现照抄）。
+        """
+        header = NotifyConsumerIdsChangedRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        self._consumer_ids_changed_count += 1
+        logger.info("receive broker's notification[%s], the consumer group: %s changed, "
+                    "rebalance immediately", addr, header.consumer_group)
+        self.rebalance_immediately()
+        return None
 
     # ---------------- broker 主动请求处理（ClientRemotingProcessor） ----------------
     def _process_reset_offset(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:

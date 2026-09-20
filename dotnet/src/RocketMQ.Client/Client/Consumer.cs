@@ -854,10 +854,10 @@ public sealed class DefaultMQPushConsumer
                 _mqClient.RegisterTopicInUse(t);
             }
 
-            // 注册 broker 主动通知：消费者实例上下线 → 立即重算分配（对应 Java
-            // ClientRemotingProcessor → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）
-            _mqClient.RemotingClient.RegisterProcessor(RequestCode.NotifyConsumerIdsChanged,
-                OnConsumerIdsChanged);
+            // broker 主动通知 40（成员变化 → 立即重算）**不**在这里注册处理器：
+            // Java 把它注册在 MQClientAPIImpl（实例级），而一个 code 只能有一个处理器，
+            // 各自注册会互相覆盖。改成向实例登记「叫醒」回调，由实例收到后扇出。
+            _mqClient.RegisterRebalanceWakeup(ConsumerGroup, WakeRebalanceLoop);
 
             // 对应 Java ClientRemotingProcessor GET_CONSUMER_RUNNING_INFO(307)：
             // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
@@ -1002,6 +1002,8 @@ public sealed class DefaultMQPushConsumer
         // （默认 ~120s）——否则这段时间内消费者变更通知仍可能发往已退出的实例。
         if (_mqClient is not null)
         {
+            // 消费线程都已 join，先把 40 的「叫醒」回调摘掉（回调捕获了本消费者状态）
+            _mqClient.UnregisterRebalanceWakeup(ConsumerGroup);
             try
             {
                 _mqClient.UnregisterClientAllBrokers(_clientId, "", ConsumerGroup);
@@ -1275,11 +1277,14 @@ public sealed class DefaultMQPushConsumer
     /// invokeTimeout（实测 5s 超时、日志出现 "no consumer id list ..., keep current"，
     /// 并连带把其它请求的响应一起卡住）。只置标志、交给 RebalanceThread 去算即可，
     /// 与 C++ 侧只置 rebalanceNow_ 标志、Java 侧 rebalanceImmediately() 的语义一致。</remarks>
-    private RemotingCommand? OnConsumerIdsChanged(RemotingCommand request, string addr)
+    /// <summary>
+    /// 实例收到 broker 的 40 通知后叫醒本消费者的重平衡线程
+    /// （对应 Java MQClientInstance#rebalanceImmediately → RebalanceService#wakeup）。
+    /// 跑在 remoting 读线程上：只置位，不发 RPC、不做重活。
+    /// </summary>
+    private void WakeRebalanceLoop()
     {
-        ClientLog.Debug("received NOTIFY_CONSUMER_IDS_CHANGED, rebalance now (on reader thread, defer to RebalanceThread)");
         _rebalanceNow.Set();
-        return null; // 回查类通知是 invokeOneway，不期待响应
     }
 
     private RemotingCommand? OnGetConsumerRunningInfo(RemotingCommand cmd, string addr)

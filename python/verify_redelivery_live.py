@@ -323,6 +323,10 @@ def main() -> int:
             break
         time.sleep(2)
     hb_a = ca.heartbeat_count()
+    # broker 在组成员变化时沿长连接反向推 40；这是全链路唯一的观测点（反向请求
+    # 无法由用例注入），只断言「本端确实收到并处理过」，不比次数。
+    notified_a = ca._mq_client.consumer_ids_changed_count
+    notified_b = cb._mq_client.consumer_ids_changed_count
     cid_list = ca._require_client().get_consumer_id_list_by_group(topic6, group6) or []
     n6 = 40
     for i in range(n6):
@@ -342,6 +346,11 @@ def main() -> int:
           and expected_keys and (keys_a | keys_b) >= expected_keys)
     check("S6-消息无重复消费", dup6 == 0 and total6 == n6,
           "got=%d/%d dup=%d" % (total6, n6, dup6))
+    # 反向推送只有 broker 发得出来，用例无法注入，所以计数是唯一能证明
+    # 「实例级 40 处理器跑过」的落点（处理器没注册时这里恒为 0）。
+    check("S6-成员变化时收到 broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40)",
+          notified_a > 0 and notified_b > 0,
+          "a=%d b=%d" % (notified_a, notified_b))
 
     # ---------- S7 优雅注销 ----------
     # shutdown 时应发 UNREGISTER_CLIENT，broker 端立刻摘除，不必等心跳超时（~120s）。

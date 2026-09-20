@@ -112,7 +112,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | lite-pull | 33 PASS / 0 FAIL（`DefaultLitePullConsumer` 真机全链路：S1 rebalance 拿 4 队列 → S2 subscribe+poll 收全 12 条 → S3 commit 位点 >0 → S4 assign+seek 重收 → S5 订阅级 tag 只收 6 条 → S6a `ConsumeFromTimestamp` 收全、S6b `OffsetForTimestamp` 双向（30 分钟前→Σ=0，10 分钟后→Σ=12）→ S7a 默认策略 `AVG` + 策略为 null 时 `Start()` 报 Java 同款文案、S7b 换 `AVG_BY_CIRCLE` 同组两实例无交集/并集覆盖 4 队列/步长 2 交叉、S7c 两半 `CONFIG` 各自只收配置队列且合起来恰好 12 条互不重叠、S7d `CONSISTENT_HASH` 用**真实 clientId** 建环且线上分配收敛到「真实 mqAll/cidAll 离线跑同一策略」的预测（合起来收全 12 条）、S7e `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 单机房下原样透传内层策略 + resolver 被逐个队列和两个真实 clientId 问过、S7f `MACHINE_ROOM` 白名单不匹配真实 `broker-a` → 安静饿死（分不到队列、poll 不到消息，同组 AVG 对照组仍只拿自己半边）） |
 | validators-live | 39 PASS / 0 FAIL（名字校验四语言对拍：S1 发送路径 13 项本地快拒（<50ms、不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `Start()` 三道组名门 + 120 等长边界、S4 正腿 push/lite 各收 3 条、S5 对照腿（合法但不存在的 topic 真往返 45ms vs 本地 0.66ms）、S6 pull/lite 组名门 + 查队列与位点、S7 `CreateTopic` 挡空白/非法/系统 topic） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **417 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **420 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（11 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。

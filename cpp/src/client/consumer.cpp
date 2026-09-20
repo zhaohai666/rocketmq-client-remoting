@@ -343,15 +343,11 @@ void DefaultMQPushConsumer::start() {
         started_.store(true);
     }
 
-    // 注册 broker 主动通知：消费者上下线时立刻重算分配（对齐 Java ClientRemotingProcessor
-    // → NOTIFY_CONSUMER_IDS_CHANGED → rebalanceImmediately）。
-    mqClient_->remotingClient().registerProcessor(
-        RequestCode::NOTIFY_CONSUMER_IDS_CHANGED,
-        [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
-            this->onConsumerIdsChanged(cmd);
-            // 通知类请求（broker 用 oneway 发），不需要回响应。
-            return std::nullopt;
-        });
+    // broker 主动通知 40（成员变化 → 立即重算）**不**在这里注册处理器：
+    // Java 把它注册在 MQClientAPIImpl（实例级），而 remoting 表里一个 code 只有一个
+    // 处理器，各自注册会互相覆盖。改成向实例登记「叫醒」回调，由实例收到后扇出。
+    // 回调跑在 remoting 读线程上，只做置位 + notify，不发 RPC。
+    mqClient_->registerRebalanceWakeup(consumerGroup_, [this] { this->wakeRebalanceLoop(); });
 
     // 对应 Java ClientRemotingProcessor GET_CONSUMER_RUNNING_INFO(307)：
     // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
@@ -580,6 +576,9 @@ void DefaultMQPushConsumer::shutdown() {
     // brokerAddrTable 里所有 broker 发 UNREGISTER_CLIENT(35)，broker 端立刻摘除本 clientId，
     // 不必等心跳超时（默认 ~120s）——否则这段时间内消费者变更通知仍可能发往已退出的实例。
     if (mqClient_) {
+        // 叫醒回调捕获了 this：消费线程都已 join，先把回调摘掉，剩下
+        // （注销客户端、关连接）这段时间里 broker 再推 40 也不会回调到半个线程上。
+        mqClient_->unregisterRebalanceWakeup(consumerGroup_);
         try {
             mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
         } catch (const std::exception& e) {
@@ -1999,8 +1998,7 @@ void DefaultMQPushConsumer::onQueuesRevoked(
                 + " count=" + std::to_string(revoked.size()));
 }
 
-void DefaultMQPushConsumer::onConsumerIdsChanged(const RemotingCommand& cmd) {
-    (void)cmd;
+void DefaultMQPushConsumer::wakeRebalanceLoop() {
     // broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。
     rebalanceNow_.store(true);
     rebalanceCv_.notify_all();

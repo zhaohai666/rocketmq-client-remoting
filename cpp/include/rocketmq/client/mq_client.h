@@ -110,6 +110,23 @@ public:
     // ---- 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）----
     ConsumerStatsManager& consumerStats() { return consumerStats_; }
 
+    // ---- broker 主动通知 NOTIFY_CONSUMER_IDS_CHANGED(40)（实例级，对齐 Java）----
+    // Java 把 40 注册在 MQClientAPIImpl（实例级），处理器只做 rebalanceImmediately()。
+    // remoting 的处理器表是「一个 code 一个处理器」，所以消费者各自注册会互相覆盖
+    // —— 消费者改为向实例登记自己的「叫醒」回调，由实例收到后逐个扇出。
+    void registerRebalanceWakeup(const std::string& group, std::function<void()> wakeup);
+    void unregisterRebalanceWakeup(const std::string& group);
+    // 对应 Java MQClientInstance#rebalanceImmediately（一行 rebalanceService.wakeup()）。
+    // 这里没有实例级重平衡线程，改成逐个叫醒已注册消费者自己那份循环。
+    void rebalanceImmediately();
+    // 收到过多少次 broker 的 40 通知。反向请求只有 broker 发得出来，用例无法注入，
+    // 计数是真机断言的唯一落点。
+    size_t consumerIdsChangedCount() const { return consumerIdsChangedCount_.load(); }
+    // 40 的处理器本体：记 Java 的 INFO 文案 + 计数 + rebalanceImmediately()。
+    // Java 整段包在 try/catch 且返回 null（不回包），所以这里也不抛、不回。
+    // 公开只为让离线用例能驱动这条反向路径（真连接上 broker 推不进来）。
+    void processNotifyConsumerIdsChanged(const RemotingCommand& cmd, const std::string& addr);
+
     // 安装 RPC 钩子（ACL 鉴权）。对应 Java 在 MQClientInstance 构造时绑定 rpcHook。
     // **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
     // 此时返回 false。故钩子必须在 start() 之前设置。
@@ -348,6 +365,10 @@ private:
     void namesrvRefreshLoop();
     DefaultTopAddressing topAddressing_;
     ConsumerStatsManager consumerStats_;
+    // group → 消费者的「叫醒」回调（消费者 shutdown 时摘掉，避免悬垂 this）
+    std::mutex rebalanceWakeupLock_;
+    std::map<std::string, std::function<void()>> rebalanceWakeups_;
+    std::atomic<size_t> consumerIdsChangedCount_{0};
 };
 
 }  // namespace rocketmq

@@ -53,7 +53,7 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 24 个用例，2476 项断言，~10s
+cd build && ctest --output-on-failure     # 25 个用例，2487 项断言，~10s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -156,7 +156,7 @@ cpp/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 41 个 .cpp
 ├── examples/                   selfcheck / interop_tool + 15 个真机联调工具
-└── tests/                      24 个 ctest 用例（含 Java 对拍）+ interop_check.py
+└── tests/                      25 个 ctest 用例（含 Java 对拍）+ interop_check.py
 ```
 
 ## 几个必须知道的实现约定

@@ -8,7 +8,8 @@
 //   S3 顺序消费：orderly listener 消费正常，且 broker 队列锁（LOCK_BATCH_MQ）生效。
 //   S4 广播模式：同组两个消费者各自收全所有消息。
 //   S5 流控：阈值 2 + 慢消费 → 流控触发计数 >0，最终消息全部消费。
-//   S6 集群多实例 rebalance：同组两实例均分队列（不重不漏），40 条消息无重复消费。
+//   S6 集群多实例 rebalance：同组两实例均分队列（不重不漏），40 条消息无重复消费，
+//      并且两侧都收到过 broker 反向推的 NOTIFY_CONSUMER_IDS_CHANGED(40)。
 //   S7 优雅注销：shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除 clientId。
 //   S8 命名空间：带 namespace 的生产者/消费者在 "<ns>%<topic>" 上收发成功；不带 namespace
 //      的消费者订阅同名裸 topic 收不到（多租户隔离）。
@@ -403,6 +404,10 @@ int main(int argc, char* argv[]) {
         all6.insert(all6.end(), recB.begin(), recB.end());
         std::set<std::string> uniq(all6.begin(), all6.end());
         int dup6 = static_cast<int>(all6.size()) - static_cast<int>(uniq.size());
+        // broker 在组成员变化时沿长连接反向推 40；反向请求用例注入不了，所以计数是
+        // 唯一能证明「实例级 40 处理器真的跑过」的落点（必须在 shutdown 之前取样）。
+        const size_t notifiedA = ca->client().consumerIdsChangedCount();
+        const size_t notifiedB = cb->client().consumerIdsChangedCount();
         ca->shutdown();
         cb->shutdown();
         check("S6-消费者已心跳注册",
@@ -427,6 +432,10 @@ int main(int argc, char* argv[]) {
         check("S6-消息无重复消费", dup6 == 0 && total6 == n6,
               "got=" + std::to_string(total6) + "/" + std::to_string(n6)
                   + " dup=" + std::to_string(dup6));
+        check("S6-成员变化时收到 broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40)",
+              notifiedA > 0 && notifiedB > 0,
+              "a=" + std::to_string(notifiedA) + " b=" + std::to_string(notifiedB)
+                  + "（0 表示实例级处理器没收到过反向通知）");
     }
 
     // ---------------- S7 优雅注销 ----------------

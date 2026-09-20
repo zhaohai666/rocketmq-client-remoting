@@ -2,7 +2,7 @@
 // 用法：rmq redelivery [namesrv]
 //
 // S1 回投 / S2 位点持久化 / S3 顺序消费+broker 锁 / S4 广播 / S5 流控
-// S6 集群多实例 rebalance（均分队列、不重不漏、无重复消费）
+// S6 集群多实例 rebalance（均分队列、不重不漏、无重复消费，且两侧都收到 broker 反推的 40）
 // S7 优雅注销（shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除）
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
@@ -428,6 +428,10 @@ public static class LiveRedelivery
         all.AddRange(gotB);
         var uniq = new HashSet<string>(all, StringComparer.Ordinal);
         int dup = all.Count - uniq.Count;
+        // broker 在组成员变化时沿长连接反向推 40；反向请求用例注入不了，所以计数是
+        // 唯一能证明「实例级 40 处理器真的跑过」的落点（必须在 Shutdown 之前取样）。
+        long notifiedA = ca.Client().ConsumerIdsChangedCount;
+        long notifiedB = cb.Client().ConsumerIdsChangedCount;
         ca.Shutdown();
         cb.Shutdown();
 
@@ -452,6 +456,11 @@ public static class LiveRedelivery
             "got=" + all.Count.ToString(CultureInfo.InvariantCulture)
                 + "/" + total.ToString(CultureInfo.InvariantCulture)
                 + " dup=" + dup.ToString(CultureInfo.InvariantCulture));
+        Check("S6-成员变化时收到 broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40)",
+            notifiedA > 0 && notifiedB > 0,
+            "a=" + notifiedA.ToString(CultureInfo.InvariantCulture)
+                + " b=" + notifiedB.ToString(CultureInfo.InvariantCulture)
+                + "（0 表示实例级处理器没收到过反向通知）");
     }
 
     // ---------------- S7 优雅注销 ----------------

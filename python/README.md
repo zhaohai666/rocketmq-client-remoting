@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 659 条单元/协议测试（4 skip 为可选依赖相关）
+pytest -q                     # 661 条单元/协议测试（4 skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 

@@ -44,7 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{watch, Notify};
@@ -80,7 +80,6 @@ use crate::common::mix_all::MixAll;
 use crate::common::sysflag::{ConsumeInitMode, PullSysFlag};
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
-use crate::remoting::client::{RequestProcessor, ResponseSink};
 use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
     CMResult, ConsumeMessageDirectlyResult, ConsumerRunningInfo, ProcessQueueInfo,
@@ -1046,13 +1045,10 @@ impl DefaultMQPushConsumer {
             }
         }
 
-        // broker 主动通知：消费者上下线时立刻重算分配（Java rebalanceImmediately）
-        client.remoting_client().register_processor(
-            request_code::NOTIFY_CONSUMER_IDS_CHANGED,
-            Arc::new(NotifyConsumerIdsChangedProcessor {
-                consumer: Arc::downgrade(&self.inner),
-            }),
-        );
+        // broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40) 由 **实例** 统一处理并扇出回来
+        // （`RegisteredConsumer::rebalance_immediately`，见 mq_client.rs），本消费者
+        // 不自己注册处理器 —— 下面 register_consumer 之前必须先置好信号位，
+        // 否则首轮 `do_rebalance` 会被自己的唤醒重复触发一次。
         self.inner
             .start_time_millis
             .store(current_time_millis(), Ordering::SeqCst);
@@ -2993,22 +2989,6 @@ fn send_message_back(
 // 因为它的动作就是「叫醒本消费者的 rebalance 循环」。
 
 /// Python `_on_consumer_ids_changed`：broker 通知消费组实例变化 → 立即重算。
-struct NotifyConsumerIdsChangedProcessor {
-    consumer: Weak<Inner>,
-}
-
-impl RequestProcessor for NotifyConsumerIdsChangedProcessor {
-    fn process(&self, _request: RemotingCommand, addr: String, sink: ResponseSink) {
-        rmq_debug!("notify consumer ids changed from {addr}, rebalance immediately");
-        // 40 是 oneway（Python 的 handler 返回 None），不该回包
-        if let Some(inner) = self.consumer.upgrade() {
-            inner.rebalance_now.store(true, Ordering::SeqCst);
-            inner.rebalance_signal.notify_waiters();
-        }
-        let _ = sink;
-    }
-}
-
 impl RegisteredConsumer for DefaultMQPushConsumer {
     fn client_id(&self) -> String {
         self.client_id()
@@ -3045,6 +3025,13 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
 
     fn subscriptions(&self) -> Vec<SubscriptionData> {
         self.subscriptions()
+    }
+
+    /// 实例收到 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED(40)` 后扇出到这里
+    /// （Java `MQClientInstance#rebalanceImmediately` → `RebalanceService#wakeup`）。
+    fn rebalance_immediately(&self) {
+        self.inner.rebalance_now.store(true, Ordering::SeqCst);
+        self.inner.rebalance_signal.notify_waiters();
     }
 
     /// Python `adjust_thread_pool`：⚠ **Java 5.5.1 里这是 no-op**

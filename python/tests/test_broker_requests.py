@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""broker 主动请求（220/221/307/309）离线单测，不需要集群。
+"""broker 主动请求（40/220/221/307/309）离线单测，不需要集群。
 
 为什么单独一个文件：这组请求是 broker（或 mqadmin）反向打给客户端的，对应 Java
 ``ClientRemotingProcessor``。它们不在正常消费路径上，但错得同样安静 —— 比如
@@ -13,6 +13,7 @@ ConsumerRunningInfo 的 mqTable 键是 ``MessageQueue``（fastjson2 内联成对
   - 消费者四个处理方法（get_consumer_status / consumer_running_info /
     consume_message_directly 的四种状态映射 / reset_offset 落位）
   - MQClientInstance 按 consumerGroup 分派 + 读线程安全的 oneway 处理（220 丢后台线程）
+  - 40 NOTIFY_CONSUMER_IDS_CHANGED 的**实例级**注册与整组唤醒
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ GET_CONSUMER_RUNNING_INFO = RequestCode.GET_CONSUMER_RUNNING_INFO
 GET_CONSUMER_STATUS_FROM_CLIENT = RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT
 RESET_CONSUMER_CLIENT_OFFSET = RequestCode.RESET_CONSUMER_CLIENT_OFFSET
 CONSUME_MESSAGE_DIRECTLY = RequestCode.CONSUME_MESSAGE_DIRECTLY
+NOTIFY_CONSUMER_IDS_CHANGED = RequestCode.NOTIFY_CONSUMER_IDS_CHANGED
 from rocketmq.remoting.protocol.remoting_command import RemotingCommand
 from rocketmq.remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader,
                                                 GetConsumerRunningInfoRequestHeader,
@@ -262,6 +264,43 @@ class TestMqClientDispatch:
         # 后台线程应已（或即将）调用到 reset_offset
         recorded["event"].wait(timeout=2.0)
         assert recorded["called"] is True
+
+    def test_40_is_instance_level_and_wakes_every_consumer(self):
+        """40 注册在 **实例**上（Java MQClientAPIImpl 构造函数），扇给全组消费者。
+
+        曾经的 bug：每个 push 消费者各自 `register_processor(40, self._on_...)`，
+        而处理器按 code 建表 ⇒ 后启动的消费者把前一个的处理器覆盖掉，
+        组里只剩最后一个实例能被叫醒。
+        """
+        c1 = consumer_with_state()
+        c2 = consumer_with_state()
+        mqc = MQClientInstance("client@40", ["127.0.0.1:9876"])
+        mqc.register_consumer(GROUP, c1)
+        mqc.register_consumer("GID_Other", c2)
+        # 处理器必须是实例自己那份，而不是某个消费者的方法
+        assert mqc.remoting_client._processors[NOTIFY_CONSUMER_IDS_CHANGED] \
+            == mqc._process_notify_consumer_ids_changed
+
+        cmd = fake_cmd(NOTIFY_CONSUMER_IDS_CHANGED, {"consumerGroup": GROUP})
+        resp = mqc._process_notify_consumer_ids_changed(cmd, "127.0.0.1:10911")
+        assert resp is None, "40 是 broker 的 oneway 通知，Java 返回 null ⇒ 不回包"
+        assert mqc.consumer_ids_changed_count == 1
+        assert c1._rebalance_now.is_set() and c2._rebalance_now.is_set(), \
+            "整组一起唤醒（Java rebalanceImmediately 不读 consumerGroup）"
+
+    def test_40_with_no_group_or_consumer_is_silent(self):
+        mqc = MQClientInstance("client@40-empty", ["127.0.0.1:9876"])
+        cmd = fake_cmd(NOTIFY_CONSUMER_IDS_CHANGED, {})
+        assert mqc._process_notify_consumer_ids_changed(cmd, "127.0.0.1:10911") is None
+        assert mqc.consumer_ids_changed_count == 1
+
+        class NoRebalance:
+            """没注册过的对象不该被叫醒，也不能让通知处理抛出去。"""
+
+        mqc.register_consumer(GROUP, None)
+        mqc._consumer_table["GID_None"] = NoRebalance()
+        mqc.rebalance_immediately()
+        assert mqc.consumer_ids_changed_count == 1
 
     def test_dispatch_unknown_group_returns_error(self):
         mqc = MQClientInstance("client@id", ["127.0.0.1:9876"])
