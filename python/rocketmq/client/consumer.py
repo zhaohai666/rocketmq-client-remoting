@@ -2230,7 +2230,12 @@ class DefaultMQPullConsumer:
         header.origin_msg_id = msg.msg_id
         header.origin_topic = msg.topic
         header.unit_mode = False
-        header.max_reconsume_times = -1
+        # ⚠ 这里**不能**照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack
+        # （它直接传 getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker
+        # 会无条件采用该字段（AbstractSendMessageProcessor:172-179），-1 会让
+        # reconsumeTimes(0) >= -1 成立、消息直接进 %DLQ%。留 None 交给订阅组的
+        # retryMaxTimes 判定。
+        header.max_reconsume_times = None
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
         response = client._invoke_sync(addr, request, 5000)
         client._check_response(response)

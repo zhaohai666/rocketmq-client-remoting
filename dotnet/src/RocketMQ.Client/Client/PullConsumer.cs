@@ -305,8 +305,11 @@ public sealed class DefaultMQPullConsumer
             OriginMsgId = msg.MsgId,
             OriginTopic = msg.Topic,
             UnitMode = false,
-            // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
-            MaxReconsumeTimes = 16,
+            // ⚠ 不照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack（它直接传
+            // getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker 无条件采信
+            // 该字段（AbstractSendMessageProcessor:172-179），-1 会让 reconsumeTimes(0) >= -1
+            // 成立、消息直接进 %DLQ%。留空交给订阅组的 retryMaxTimes 判定。
+            MaxReconsumeTimes = null,
         };
         c.InvokeSync(addr, RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
     }

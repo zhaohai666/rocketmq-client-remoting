@@ -635,8 +635,10 @@ impl DefaultMQPullConsumer {
     /// 2. 与 Java 的有意差异：Java 失败时吞异常、改由内部生产者把消息直接发进
     ///    `%RETRY%group`；这里直接返回错误，不换路径静默重发（模块头偏离 4）。
     ///
-    /// `max_reconsume_times` 按 `consumer.py:2207` 原样下发 `-1`（Java 拉模式同样
-    /// 直接传 `getMaxReconsumeTimes()`，由 broker 决定上限后转 `%DLQ%`）。
+    /// `max_reconsume_times` 不下发（`None`）：让 broker 按订阅组的 `retryMaxTimes`
+    /// 判定重试上限，超限才转 `%DLQ%`。Python 在这里传 `-1`，但它自己的注释说的是
+    /// 「交给 broker 决定」——真按 Java 拉模式把 -1 带上，broker 会无条件采纳并让消息
+    /// 直接进 `%DLQ%`（详见 [`MQClientInstance::consumer_send_msg_back`]）。
     pub async fn send_message_back(&self, msg: &MessageExt, delay_level: i32) -> Result<()> {
         let client = self.require_client()?;
         let group = self.consumer_group();
@@ -645,7 +647,7 @@ impl DefaultMQPullConsumer {
             .broker_addr_of(&broker)
             .ok_or_else(|| Error::client(format!("broker {broker} not found")))?;
         client
-            .consumer_send_msg_back(&group, msg, delay_level, -1, 5_000, &addr)
+            .consumer_send_msg_back(&group, msg, delay_level, None, 5_000, &addr)
             .await
     }
 

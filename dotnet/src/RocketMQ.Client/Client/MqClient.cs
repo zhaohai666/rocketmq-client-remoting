@@ -605,7 +605,10 @@ public sealed class MQClientInstance : IDisposable
             Properties = MessageDecoder.MessagePropertiesToString(msg.Properties),
             ReconsumeTimes = 0,
             UnitMode = false,
-            MaxReconsumeTimes = 0,
+            // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
+            // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
+            // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
+            MaxReconsumeTimes = null,
             Batch = msg.IsBatch,
         };
 

@@ -1357,7 +1357,11 @@ impl MQClientInstance {
             properties: Some(message_properties_2_string(&outer.properties)),
             reconsume_times: Some(0),
             unit_mode: Some(false),
-            max_reconsume_times: Some(0),
+            // Java `sendKernelImpl:1007-1018` 只在「发往 %RETRY% 且消息带
+            // MAX_RECONSUME_TIMES 属性」时才设这个字段，平时留 null。这里必须留
+            // `None`：broker 在 `version >= V3_4_9` 后无条件采纳请求里的值
+            // （`SendMessageProcessor:196-199`），固定发 0 会让重试消息直接进 `%DLQ%`。
+            max_reconsume_times: None,
             batch: Some(msg.is_batch()),
             broker_name: None,
         };
@@ -2151,16 +2155,22 @@ impl MQClientInstance {
     ///
     /// 与 push 消费者内部那次回投的差别（`consumer.rs` 的 `send_message_back`）：
     /// 那条是**发射后不管**（`tokio::spawn` + 只记日志），且把
-    /// `maxReconsumeTimes == -1` 映射成 16；这里必须把失败返回给调用方，
-    /// 且按 `consumer.py:2207` 原样下发 `-1`（Java `DefaultMQPullConsumerImpl
-    /// .sendMessageBack` 直接传 `getMaxReconsumeTimes()`，映射交给 broker）。
+    /// `maxReconsumeTimes == -1` 映射成 16；这里必须把失败返回给调用方。
+    ///
+    /// `max_reconsume_times = None` 表示「不下发这个字段」，broker 会用订阅组自己的
+    /// `retryMaxTimes` 判定是否转 `%DLQ%`。⚠ 有意偏离 Java：Java 的
+    /// `DefaultMQPullConsumerImpl#sendMessageBack`（已 `@Deprecated`）把
+    /// `getMaxReconsumeTimes()`（默认 -1）原样带上，而 broker 在
+    /// `version >= V3_4_9` 时无条件采纳它（`AbstractSendMessageProcessor:172-179`），
+    /// 于是 `reconsumeTimes(0) >= -1` 恒成立 ⇒ 拉模式回投的消息**不进 `%RETRY%` 而是
+    /// 直接进 `%DLQ%`。Python 传 -1 时注释写的是「交给 broker 决定」，这里按那个语义走。
     #[allow(clippy::too_many_arguments)]
     pub async fn consumer_send_msg_back(
         &self,
         consumer_group: &str,
         msg: &MessageExt,
         delay_level: i32,
-        max_reconsume_times: i32,
+        max_reconsume_times: Option<i32>,
         timeout_millis: i64,
         addr: &str,
     ) -> Result<()> {
@@ -2171,7 +2181,7 @@ impl MQClientInstance {
             origin_msg_id: msg.msg_id.clone(),
             origin_topic: Some(msg.topic.clone()),
             unit_mode: Some(false),
-            max_reconsume_times: Some(max_reconsume_times),
+            max_reconsume_times,
         };
         let mut request = RemotingCommand::create_request_command(
             request_code::CONSUMER_SEND_MSG_BACK,

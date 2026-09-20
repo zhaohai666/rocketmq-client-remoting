@@ -272,8 +272,11 @@ void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
     header->originMsgId = msg.msgId;
     header->originTopic = msg.topic;
     header->unitMode = false;
-    // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
-    header->maxReconsumeTimes = 16;
+    // ⚠ 不照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack（它直接传
+    // getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker 无条件采信该
+    // 字段（`AbstractSendMessageProcessor:172-179`），-1 会让 reconsumeTimes(0) >= -1
+    // 成立、消息直接进 %DLQ%。留空交给订阅组的 retryMaxTimes 判定。
+    header->maxReconsumeTimes = std::nullopt;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
     const RemotingCommand response = mqClient_->remotingClient().invokeSync(addr, request, 5000);

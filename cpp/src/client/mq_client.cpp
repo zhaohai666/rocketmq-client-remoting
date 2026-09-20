@@ -467,7 +467,10 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     header->properties = messagePropertiesToString(msg.properties);
     header->reconsumeTimes = 0;
     header->unitMode = false;
-    header->maxReconsumeTimes = 0;
+    // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
+    // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
+    // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
+    header->maxReconsumeTimes = std::nullopt;
     header->batch = msg.isBatch;
 
     // Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
@@ -534,7 +537,10 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     header->properties = messagePropertiesToString(msg.properties);
     header->reconsumeTimes = 0;
     header->unitMode = false;
-    header->maxReconsumeTimes = 0;
+    // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
+    // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
+    // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
+    header->maxReconsumeTimes = std::nullopt;
     header->batch = msg.isBatch;
 
     RemotingCommand request = RemotingCommand::createRequestCommand(

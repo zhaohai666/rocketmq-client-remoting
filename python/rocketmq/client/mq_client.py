@@ -545,7 +545,11 @@ class MQClientInstance:
         header.properties = message_properties_2_string(msg.properties)
         header.reconsume_times = 0
         header.unit_mode = False
-        header.max_reconsume_times = 0
+        # ⚠ maxReconsumeTimes 只在「发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES 属性」时
+        # 才下发（Java sendKernelImpl:1003-1018）。客户端版本升到 V3_4_9 之后 broker
+        # 会无条件采信这个字段（AbstractSendMessageProcessor:172-179），固定发 0 会让
+        # 重试消息第一次回投就判定 reconsumeTimes(0) >= 0 直接进 %DLQ%。
+        header.max_reconsume_times = None
         header.batch = isinstance(msg, MessageBatch)
         # Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
         # 而不是普通的 SEND_MESSAGE_V2(314)。broker 只在 324/325 上注册了
