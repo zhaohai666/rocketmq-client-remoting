@@ -504,9 +504,16 @@ internal static class LiveMessageTypes
 
             Check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
 
-            // 回查默认 60s 一轮；联调 broker 配了 transactionCheckInterval=3000，
-            // 这里给足窗口等 broker 回查 + 提交后再投递
-            List<MessageExt> run = RunConsumer(topic, "*", 25, false, "txcheck");
+            // broker 巡检半消息的周期是 Java BrokerConfig#transactionCheckInterval，
+            // **默认 30s**（联调 broker.conf 没覆写），所以半消息最快也要等一轮巡检才回查。
+            // 固定 sleep(25) 会稳定地早于回查 → "最终投递"必然失败。这里先等"回查发生"
+            // 这个事件（最多 90s，兼容 3s/30s 两种配置），再观察 10s 让 COMMIT 后的消息真正投递。
+            long checkDeadline = UtilAll.CurrentTimeMillis() + 90_000;
+            while (listener.CheckCalls == 0 && UtilAll.CurrentTimeMillis() < checkDeadline)
+            {
+                Thread.Sleep(1000);
+            }
+            List<MessageExt> run = RunConsumer(topic, "*", 10, false, "txcheck");
             bool consumed = run.Any(m => Bytes2Str(m.Body) == "tx-check");
             int checks = listener.CheckCalls;
             Check("事务-UNKNOW 触发 broker 回查", checks > 0,
