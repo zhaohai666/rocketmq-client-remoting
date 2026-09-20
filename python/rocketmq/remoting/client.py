@@ -2,7 +2,12 @@
 """socket 长连接客户端（对应 org.apache.rocketmq.remoting.netty.NettyRemotingClient 的核心能力）。
 
 提供：连接管理（惰性建连 + 复用）、invokeSync/invokeAsync/invokeOneway、
-opaque 映射回调分发、超时控制、连接状态探活。
+opaque 映射回调分发、超时控制、连接状态探活、GO_AWAY 换连接重发。
+
+与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
+（channelNotActiveInterval=60s）在 Java 客户端里**从未被调度**——client + remoting 全树
+grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
+惰性清理已覆盖真实场景。
 """
 from __future__ import annotations
 
@@ -37,6 +42,25 @@ _SHUTDOWN_JOIN_SECONDS = 5.0
 # 改系统时间不应让在途请求提前超时或永不超时）
 def _mono_millis() -> float:
     return time.monotonic() * 1000.0
+
+
+def _retry_request(request: RemotingCommand) -> RemotingCommand:
+    """GO_AWAY 重发用的请求副本（对应 Java 的 createRequestCommand + setBody + setExtFields）。
+
+    必须是**新** opaque：旧的那条已经在途表里摘掉了，复用会让响应错配到别的请求。
+    ext_fields 按值复制——ACL 签名（AccessKey/Signature）就存在这里，重发要带原签名，
+    所以副本不能从 custom_header 重新推导（推导会丢掉签名那两项）。
+    """
+    retry = RemotingCommand(code=request.code, custom_header=request.custom_header)
+    retry.language = request.language
+    retry.version = request.version
+    retry.flag = request.flag
+    retry.remark = request.remark
+    retry.ext_fields = dict(request.ext_fields)
+    retry.body = request.body
+    retry.serialize_type_current_rpc = request.serialize_type_current_rpc
+    retry.cached_header = request.cached_header
+    return retry
 
 
 def _close_socket(sock: socket.socket) -> None:
@@ -131,9 +155,13 @@ class _ResponseFuture:
 
 class RemotingClient:
     def __init__(self, connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
-                 tls_enable: Optional[bool] = None):
+                 tls_enable: Optional[bool] = None,
+                 enable_reconnect_for_go_away: bool = True):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
+        # 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）：
+        # 收到 ResponseCode.GO_AWAY(1500) 时换一条连接重发一次。
+        self.enable_reconnect_for_go_away = enable_reconnect_for_go_away
         # TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
         # 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
         if tls_enable is None:
@@ -453,7 +481,36 @@ class RemotingClient:
                 raise RemotingSendRequestException(addr)
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
+        """同步 RPC，含 GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）。"""
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
+        started = _mono_millis()
+        response = self._invoke_once(addr, request, timeout)
+        if response.code != ResponseCode.GO_AWAY:
+            return response
+        response = self._handle_go_away(addr, request, timeout, started, response)
+        return response
+
+    def _handle_go_away(self, addr: str, request: RemotingCommand, timeout: int,
+                        started: float, response: RemotingCommand) -> RemotingCommand:
+        """GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
+
+        单独抽出来是因为同步与异步两条路都要同一套判定，重发次数也必须一样（一次）。
+        """
+        if not self.enable_reconnect_for_go_away:
+            raise RemotingSendRequestException(addr, "Receive GO_AWAY from channel %s" % addr)
+        logger.info("remoting: receive GO_AWAY from %s, reconnect and retry once", addr)
+        self.close_channel(addr)
+        # 重发只花剩余预算：Java 用同一个 Stopwatch 的 elapsed 扣减 timeoutMillis。
+        spent = int(_mono_millis() - started)
+        retry_timeout = max(1, timeout - spent)
+        retry = _retry_request(request)
+        response = self._invoke_once(addr, retry, retry_timeout)
+        if response.code == ResponseCode.GO_AWAY:
+            raise RemotingSendRequestException(
+                addr, "Receive GO_AWAY twice in request from channel %s" % addr)
+        return response
+
+    def _invoke_once(self, addr: str, request: RemotingCommand, timeout: int) -> RemotingCommand:
         future = _ResponseFuture(request.opaque, timeout, request=request)
         with self._response_lock:
             self._response_table[request.opaque] = future
@@ -481,9 +538,28 @@ class RemotingClient:
           （由超时清理线程投递，等价于 Java scanResponseTable 里的 operationFail）
 
         timeout_millis 为 None 时使用 invoke_timeout_millis。
+
+        GO_AWAY 与同步路径同口径：换连接重发一次，第二次仍是 GO_AWAY 则回调报错
+        （Java 的这段逻辑在 ``invokeImpl`` 里，同步与异步共用）。
         """
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
-        future = _ResponseFuture(request.opaque, timeout, invoke_callback=callback,
+        self._invoke_async_once(addr, request, callback, timeout, _mono_millis())
+
+    def _invoke_async_once(self, addr: str, request: RemotingCommand,
+                           callback: Callable[[Optional[RemotingCommand], Optional[BaseException]], None],
+                           timeout: int, started: float) -> None:
+        def on_response(response, error):
+            if response is None or error is not None or response.code != ResponseCode.GO_AWAY:
+                callback(response, error)
+                return
+            # 重发要等一次完整的往返，而这里跑在该连接的读线程上：就地阻塞会把
+            # 同连接其它在途请求的投递一起拖住。GO_AWAY 是稀有事件，交给短命线程做。
+            threading.Thread(
+                target=self._retry_after_go_away,
+                args=(addr, request, callback, timeout, started, response),
+                name="rmq-go-away-retry", daemon=True).start()
+
+        future = _ResponseFuture(request.opaque, timeout, invoke_callback=on_response,
                                  request=request, addr=addr)
         self._ensure_sweeper()
         with self._response_lock:
@@ -495,6 +571,15 @@ class RemotingClient:
             with self._response_lock:
                 self._response_table.pop(request.opaque, None)
             raise
+
+    def _retry_after_go_away(self, addr: str, request: RemotingCommand,
+                             callback: Callable[[Optional[RemotingCommand], Optional[BaseException]], None],
+                             timeout: int, started: float,
+                             response: RemotingCommand) -> None:
+        try:
+            callback(self._handle_go_away(addr, request, timeout, started, response), None)
+        except BaseException as retry_error:  # noqa: BLE001 - 回调契约：错误也只能走 error 参数
+            callback(None, retry_error)
 
     # ---------- 在途请求超时清理（对应 Java scanResponseTable） ----------
     def _ensure_sweeper(self) -> None:

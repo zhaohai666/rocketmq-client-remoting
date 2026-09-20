@@ -5,13 +5,21 @@
 //!
 //! 每条连接一个读任务 + 一个写任务（TLS 因为 `native-tls` 是同步 API，跑在专用
 //! 阻塞线程上），在途请求按 opaque 全局登记，与 Java 的 `responseTable` 一致。
+//!
+//! 与 Java 的两处口径差异（都刻意如此，不是漏实现）：
+//! - Java `NettyRemotingAbstract#scanResponseTable` 的定时清理在这里由每个请求自己的
+//!   `tokio::time::timeout` 替代：请求超时即从在途表摘除，不需要常驻扫描线程。
+//! - Java `NettyRemotingClient#scanChannelTablesOfNameServer`（`channelNotActiveInterval`
+//!   = 60s）**在 Java 客户端里从未被调度**——grep 遍 client + remoting 全树只有一个调用点
+//!   都没有，属于死代码。所以这里不做空闲连接回收： broker 侧的 `connectionLivenessCheckMillis`
+//!   断开连接时，读任务会立刻见到 EOF，惰性清理已经覆盖真实场景。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -20,7 +28,8 @@ use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 use crate::{rmq_debug, rmq_warn};
-use crate::remoting::protocol::remoting_command::RemotingCommand;
+use crate::remoting::protocol::codes::response_code;
+use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
 
 pub const MAX_FRAME_LENGTH: i32 = 16 * 1024 * 1024;
@@ -83,6 +92,10 @@ pub struct RemotingClientConfig {
     pub tls_enable: bool,
     /// 对应 Java `tls.test.mode.enable`（默认 true）：信任自签证书、不校验主机名。
     pub tls_test_mode: bool,
+    /// 对应 Java `NettyClientConfig.enableReconnectForGoAway`（默认 **true**）。
+    /// 收到 `ResponseCode.GO_AWAY(1500)` 时换一条连接重发一次；关掉则直接抛
+    /// `SendRequest`（Java 同口径）。
+    pub enable_reconnect_for_go_away: bool,
 }
 
 impl Default for RemotingClientConfig {
@@ -92,6 +105,7 @@ impl Default for RemotingClientConfig {
             invoke_timeout_millis: 3000,
             tls_enable: env_bool("ROCKETMQ_TLS_ENABLE", false),
             tls_test_mode: env_bool("ROCKETMQ_TLS_TEST_MODE", true),
+            enable_reconnect_for_go_away: true,
         }
     }
 }
@@ -250,37 +264,19 @@ impl RemotingClient {
     }
 
     // ---------------- RPC ----------------
+    /// 同步 RPC，语义见 [`invoke_impl`]（对应 Java `NettyRemotingClient#invokeImpl`）。
     pub async fn invoke_sync(
         &self,
         addr: &str,
         request: &mut RemotingCommand,
         timeout_millis: Option<i64>,
     ) -> Result<RemotingCommand> {
-        let timeout = timeout_millis.unwrap_or(self.inner.config.invoke_timeout_millis as i64);
-        let opaque = request.opaque;
-        let (tx, rx) = oneshot::channel();
-        self.inner.register_pending(opaque, tx, Some(request.clone()), addr);
-        if let Err(e) = send_request(&self.inner, addr, request).await {
-            self.inner.cancel(opaque);
-            return Err(e);
-        }
-        match tokio::time::timeout(Duration::from_millis(timeout.max(1) as u64), rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                self.inner.cancel(opaque);
-                Err(Error::SendRequest {
-                    addr: addr.to_string(),
-                    message: "connection closed".into(),
-                })
-            }
-            Err(_) => {
-                self.inner.cancel(opaque);
-                Err(Error::Timeout { addr: addr.to_string(), timeout_millis: timeout })
-            }
-        }
+        invoke_impl(&self.inner, addr, request, timeout_millis).await
     }
 
     /// 对应 Java `invokeAsync`：不阻塞调用方，结果交给回调。
+    ///
+    /// 走的是与同步调用同一条 `invokeImpl`，所以异步路径同样有 GO_AWAY 重连语义。
     pub fn invoke_async(
         &self,
         addr: &str,
@@ -291,7 +287,7 @@ impl RemotingClient {
         let inner = self.inner.clone();
         let addr = addr.to_string();
         self.inner.spawn("invoke_async", async move {
-            let result = invoke_sync_inner(&inner, &addr, &mut request, timeout_millis).await;
+            let result = invoke_impl(&inner, &addr, &mut request, timeout_millis).await;
             callback(result);
         });
     }
@@ -394,13 +390,54 @@ impl Inner {
     }
 }
 
-async fn invoke_sync_inner(
+/// 对应 Java `NettyRemotingClient#invokeImpl:828-873`：一次 RPC，外加
+/// `GO_AWAY(1500)` 的换连接重发。
+///
+/// GO_AWAY 是 broker / proxy 优雅下线时主动回给在途请求的信令，语义是「这条连接
+/// 别再用了」，所以必须**换新连接**重发才算成功；Java 只重发一次，第二次仍是
+/// GO_AWAY 就抛 `RemotingSendRequestException`，避免在下线中的集群上无限打转。
+async fn invoke_impl(
     inner: &Arc<Inner>,
     addr: &str,
     request: &mut RemotingCommand,
     timeout_millis: Option<i64>,
 ) -> Result<RemotingCommand> {
     let timeout = timeout_millis.unwrap_or(inner.config.invoke_timeout_millis as i64);
+    let started = Instant::now();
+    let response = invoke_with_timeout(inner, addr, request, timeout).await?;
+    if response.code != response_code::GO_AWAY {
+        return Ok(response);
+    }
+    if !inner.config.enable_reconnect_for_go_away {
+        return Err(Error::SendRequest {
+            addr: addr.to_string(),
+            message: format!("Receive GO_AWAY from channel {addr}"),
+        });
+    }
+    rmq_warn!("remoting: receive GO_AWAY from {addr}, reconnect and retry once");
+    close_channel(inner, addr);
+    // 重发只花剩余预算：Java 用同一个 Stopwatch 的 elapsed 扣减 timeoutMillis。
+    let spent = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let retry_timeout = (timeout - spent).max(1);
+    let mut retry = request.clone();
+    // 重发必须是**新** opaque：旧请求已经拿到应答，复用会让下一次响应错配。
+    retry.opaque = next_opaque();
+    let response = invoke_with_timeout(inner, addr, &mut retry, retry_timeout).await?;
+    if response.code == response_code::GO_AWAY {
+        return Err(Error::SendRequest {
+            addr: addr.to_string(),
+            message: format!("Receive GO_AWAY twice in request from channel {addr}"),
+        });
+    }
+    Ok(response)
+}
+
+async fn invoke_with_timeout(
+    inner: &Arc<Inner>,
+    addr: &str,
+    request: &mut RemotingCommand,
+    timeout: i64,
+) -> Result<RemotingCommand> {
     let opaque = request.opaque;
     let (tx, rx) = oneshot::channel();
     inner.register_pending(opaque, tx, Some(request.clone()), addr);
@@ -902,6 +939,8 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
@@ -1054,6 +1093,77 @@ mod tests {
         assert!(matches!(err, Error::Timeout { .. }), "got {err}");
         assert!(err.to_string().contains("200ms"));
         assert_eq!(client.in_flight_count(), 0, "超时后必须清掉在途表");
+        client.shutdown();
+    }
+
+    /// GO_AWAY 专用 server：前 `go_away_conns` 条连接一律回 GO_AWAY，其余回 SUCCESS。
+    /// 返回连接序号计数器，供断言"重发确实换了新连接"。
+    async fn go_away_server(go_away_conns: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let idx = counter.fetch_add(1, Ordering::SeqCst);
+                let go_away = idx < go_away_conns;
+                tokio::spawn(async move {
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let cmd = RemotingCommand::decode(&frame).unwrap();
+                        let code = if go_away {
+                            response_code::GO_AWAY
+                        } else {
+                            response_code::SUCCESS
+                        };
+                        let mut response = response_for(&cmd, code);
+                        write_command(&mut stream, &mut response).await;
+                    }
+                });
+            }
+        });
+        (addr, conns)
+    }
+
+    #[tokio::test]
+    async fn go_away_reconnects_and_retries_once() {
+        let (addr, conns) = go_away_server(1).await;
+        let client = RemotingClient::new();
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "goaway");
+        let response = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap();
+        assert_eq!(response.code, response_code::SUCCESS, "重发必须拿到真应答");
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "GO_AWAY 后必须换新连接");
+        assert_eq!(client.in_flight_count(), 0);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn second_go_away_fails_instead_of_looping() {
+        let (addr, conns) = go_away_server(usize::MAX).await;
+        let client = RemotingClient::new();
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "goaway");
+        let err = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
+        assert!(
+            err.to_string().contains("GO_AWAY twice"),
+            "文案要对齐 Java RemotingSendRequestException: {err}"
+        );
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "只重发一次，不能无限重连");
+        assert_eq!(client.in_flight_count(), 0);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn go_away_without_reconnect_flag_surfaces_error() {
+        let (addr, conns) = go_away_server(usize::MAX).await;
+        let client = RemotingClient::with_config(RemotingClientConfig {
+            enable_reconnect_for_go_away: false,
+            ..RemotingClientConfig::default()
+        });
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "goaway");
+        let err = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
+        assert!(err.to_string().contains("Receive GO_AWAY from channel"));
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "关掉开关就不该重连");
         client.shutdown();
     }
 

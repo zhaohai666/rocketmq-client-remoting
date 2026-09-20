@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -93,13 +94,15 @@ bool writeAll(socket_t s, const Bytes& data) {
 enum class ServerMode {
     Normal,    // 正常响应
     HalfSplit, // 响应拆两段发（测半包重组）
-    Silent     // 收到但永不回复（测超时）
+    Silent,    // 收到但永不回复（测超时）
+    GoAway     // 前 goAwayConns_ 条连接一律回 GO_AWAY(1500)，之后的连接正常响应
 };
 
 // 本机回环测试服务端：accept 一个连接，按 mode 处理若干请求
 class TestServer {
 public:
-    explicit TestServer(ServerMode mode, int maxRequests = 8) : mode_(mode), maxRequests_(maxRequests) {
+    explicit TestServer(ServerMode mode, int maxRequests = 8, int goAwayConns = 0)
+        : mode_(mode), maxRequests_(maxRequests), goAwayConns_(goAwayConns) {
         netcompat::ensureInitialized();
         listenSock_ = ::socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
@@ -129,6 +132,12 @@ public:
 
     std::string address() const { return "127.0.0.1:" + std::to_string(port_); }
     int served() const { return served_.load(); }
+    int connections() const { return conns_.load(); }
+    // 服务端见过的 opaque：GO_AWAY 重发必须是**新** opaque，用这个断言
+    std::vector<int32_t> opaques() const {
+        std::lock_guard<std::mutex> lk(opaqueMutex);
+        return opaqueLog_;
+    }
 
 private:
     void serve() {
@@ -153,12 +162,12 @@ private:
             if (conn == kInvalidSocket) {
                 break;
             }
-            handleConn(conn);
+            handleConn(conn, conns_.fetch_add(1));
             netcompat::closeSocket(conn);
         }
     }
 
-    void handleConn(socket_t conn) {
+    void handleConn(socket_t conn, int connIndex) {
         while (!stop_.load() && served_.load() < maxRequests_) {
             Bytes frame;
             if (!readFrame(conn, frame)) {
@@ -169,13 +178,19 @@ private:
                 break;
             }
             served_.fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lk(opaqueMutex);
+                opaqueLog_.push_back(req.opaque);
+            }
             if (mode_ == ServerMode::Silent) {
                 // 不回复：让客户端超时
                 std::this_thread::sleep_for(std::chrono::milliseconds(1200));
                 continue;
             }
             RemotingCommand resp;
-            resp.code = ResponseCode::SUCCESS;
+            resp.code = mode_ == ServerMode::GoAway && connIndex < goAwayConns_
+                            ? ResponseCode::GO_AWAY
+                            : ResponseCode::SUCCESS;
             resp.opaque = req.opaque;  // 必须回填同一个 opaque
             resp.markResponseType();
             resp.remark = "ok";
@@ -197,6 +212,10 @@ private:
 
     ServerMode mode_;
     int maxRequests_;
+    int goAwayConns_ = 0;
+    std::atomic<int> conns_{0};
+    mutable std::mutex opaqueMutex;
+    std::vector<int32_t> opaqueLog_;
     socket_t listenSock_ = kInvalidSocket;
     uint16_t port_ = 0;
     std::atomic<bool> stop_{false};
@@ -382,7 +401,120 @@ int main() {
         CHECK(!client.isChannelWritable(addr), "not writable after shutdown");
     }
 
-    // ---------------------------------------------------------- 8. 地址解析
+    // ------------------------- 8. GO_AWAY(1500)：换连接重发一次（Java invokeImpl 同语义）
+    {
+        // 8.1 第一条连接回 GO_AWAY，第二条正常 -> 调用方只看到成功
+        TestServer server(ServerMode::GoAway, 4, 1);
+        RemotingClient client;
+        const std::string addr = server.address();
+        RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
+        const int32_t firstOpaque = req.opaque;
+        RemotingCommand resp = client.invokeSync(addr, req, 5000);
+        CHECK(resp.code == ResponseCode::SUCCESS, "GO_AWAY: retry gets the real response");
+        CHECK(server.connections() == 2, "GO_AWAY: retry must use a brand new connection");
+        CHECK(server.served() == 2, "GO_AWAY: the request is sent exactly twice");
+        CHECK(server.opaques().size() == 2 && server.opaques()[0] == firstOpaque
+                  && server.opaques()[1] != firstOpaque,
+              "GO_AWAY: the retry carries a fresh opaque, else responses mis-pair");
+        client.shutdown();
+    }
+    {
+        // 8.2 两次都 GO_AWAY -> 抛错而不是无限重连
+        TestServer server(ServerMode::GoAway, 4, 1000);
+        RemotingClient client;
+        RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
+        bool threw = false;
+        std::string what;
+        try {
+            client.invokeSync(server.address(), req, 5000);
+        } catch (const RemotingSendRequestException& e) {
+            threw = true;
+            what = e.what();
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        CHECK(threw, "GO_AWAY twice -> RemotingSendRequestException");
+        CHECK(what.find("GO_AWAY twice") != std::string::npos,
+              "GO_AWAY twice: message matches Java (" + what + ")");
+        CHECK(server.connections() == 2, "GO_AWAY twice: retries exactly once");
+        client.shutdown();
+    }
+    {
+        // 8.3 开关关掉：直接失败，一条连接都不重连
+        TestServer server(ServerMode::GoAway, 4, 1000);
+        RemotingClient client;
+        client.setEnableReconnectForGoAway(false);
+        CHECK(!client.enableReconnectForGoAway(), "setEnableReconnectForGoAway is readable");
+        RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
+        bool threw = false;
+        std::string what;
+        try {
+            client.invokeSync(server.address(), req, 5000);
+        } catch (const RemotingSendRequestException& e) {
+            threw = true;
+            what = e.what();
+        }
+        CHECK(threw, "GO_AWAY with the flag off -> RemotingSendRequestException");
+        CHECK(what.find("Receive GO_AWAY from channel") != std::string::npos,
+              "GO_AWAY flag off: message matches Java (" + what + ")");
+        CHECK(server.connections() == 1, "GO_AWAY flag off: no reconnect at all");
+        client.shutdown();
+    }
+    {
+        // 8.4 异步路径共用同一套语义（Java 里同步/异步都走 invokeImpl）。
+        //     重发不能在 reading 线程上等，所以由清理线程代跑 —— 这里等回调落地。
+        TestServer server(ServerMode::GoAway, 4, 1);
+        RemotingClient client;
+        const std::string addr = server.address();
+        RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
+        std::mutex m;
+        std::atomic<bool> done{false};
+        int code = -1;
+        std::string error;
+        client.invokeAsync(addr, req,
+                           [&](const RemotingCommand& resp, const std::string& err) {
+                               std::lock_guard<std::mutex> lk(m);
+                               code = resp.code;
+                               error = err;
+                               done.store(true);
+                           },
+                           5000);
+        for (int i = 0; i < 500 && !done.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(done.load(), "async GO_AWAY: callback fires exactly once");
+        CHECK(error.empty(), "async GO_AWAY: successful retry carries no error (" + error + ")");
+        CHECK(code == ResponseCode::SUCCESS, "async GO_AWAY: retry gets the real response");
+        CHECK(server.connections() == 2, "async GO_AWAY: retried on a new connection");
+        client.shutdown();
+    }
+    {
+        // 8.5 异步两次 GO_AWAY -> 折成回调错误，不能悄悄吞掉
+        TestServer server(ServerMode::GoAway, 4, 1000);
+        RemotingClient client;
+        RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
+        std::mutex m;
+        std::atomic<bool> done{false};
+        std::string error;
+        client.invokeAsync(server.address(), req,
+                           [&](const RemotingCommand& resp, const std::string& err) {
+                               (void)resp;
+                               std::lock_guard<std::mutex> lk(m);
+                               error = err;
+                               done.store(true);
+                           },
+                           5000);
+        for (int i = 0; i < 500 && !done.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(done.load(), "async GO_AWAY twice: callback fires");
+        CHECK(error.find("GO_AWAY twice") != std::string::npos,
+              "async GO_AWAY twice: error carries the Java message (" + error + ")");
+        CHECK(server.connections() == 2, "async GO_AWAY twice: retries exactly once");
+        client.shutdown();
+    }
+
+    // ---------------------------------------------------------- 9. 地址解析
     {
         std::string h;
         std::string p;

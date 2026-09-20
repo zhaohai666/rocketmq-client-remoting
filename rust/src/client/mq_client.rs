@@ -573,7 +573,7 @@ impl MQClientInstance {
             tls_enable: config
                 .tls_enable
                 .unwrap_or_else(default_tls_enable_from_env),
-            tls_test_mode: RemotingClientConfig::default().tls_test_mode,
+            ..RemotingClientConfig::default()
         };
         let inner = Arc::new(Inner {
             client_id: client_id.to_string(),

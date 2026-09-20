@@ -165,6 +165,8 @@ struct RemotingClient::Impl {
     std::atomic<bool> running{true};
     int32_t connectTimeout = 3000;
     int32_t invokeTimeout = 15000;
+    // 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）。
+    bool enableReconnectForGoAway = true;
     // TLS（对应 Java NettyRemotingClient 的 isUseTLS + 构造期 buildSslContext）。
     // tlsCtx 持有 SSL_CTX*；setTlsEnable(true) 时创建。
     bool tlsEnable = false;
@@ -468,6 +470,73 @@ struct RemotingClient::Impl {
         respTable.erase(opaque);
     }
 
+    // ---- GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）----
+    // 单次请求-应答：不含 GO_AWAY 判定，重发与首发都走这里。
+    RemotingCommand invokeOnce(const std::string& addr, RemotingCommand& request,
+                               int32_t timeoutMillis) {
+        auto future = registerFutureAcquiringOpaque(request, nullptr);
+        const int32_t opaque = request.opaque;
+        try {
+            sendRequest(addr, request);
+        } catch (...) {
+            unregisterFuture(opaque);
+            throw;
+        }
+        std::unique_lock<std::mutex> lk(future->m);
+        const bool ok = future->cv.wait_for(lk, std::chrono::milliseconds(timeoutMillis),
+                                            [&]() { return future->done; });
+        if (!ok) {
+            lk.unlock();
+            unregisterFuture(opaque);
+            throw RemotingTimeoutException(addr + " wait response timeout "
+                                           + std::to_string(timeoutMillis) + " ms, opaque="
+                                           + std::to_string(opaque));
+        }
+        return future->response;
+    }
+
+    void closeConnection(const std::string& addr) {
+        std::shared_ptr<Connection> conn;
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            auto it = conns.find(addr);
+            if (it == conns.end()) {
+                return;
+            }
+            conn = it->second;
+            conns.erase(it);
+        }
+        // 关闭 socket 会让读线程的 select()/recv() 立刻返回并自行退出
+        closeSocket(conn->sock);
+        conn->sock = kInvalidSocket;
+    }
+
+    /// GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
+    /// `deadlineMs` 是本次调用（含首发）的绝对截止时间，重发只花剩余预算 ——
+    /// Java 用同一个 Stopwatch 扣减 timeoutMillis。
+    RemotingCommand retryAfterGoAway(const std::string& addr, const RemotingCommand& request,
+                                     int64_t deadlineMs) {
+        if (!enableReconnectForGoAway) {
+            throw RemotingSendRequestException("Receive GO_AWAY from channel " + addr);
+        }
+        logger_info("remoting: receive GO_AWAY from " + addr + ", reconnect and retry once");
+        closeConnection(addr);
+        const int64_t remaining = deadlineMs - Future::monoNowMs();
+        if (remaining <= 0) {
+            throw RemotingTimeoutException(addr + " GO_AWAY retry budget exhausted, opaque="
+                                           + std::to_string(request.opaque));
+        }
+        // 重发必须是**新** opaque：旧请求已经拿到应答，复用会让下一次响应错配。
+        RemotingCommand retry = request;
+        retry.opaque = RemotingCommand::nextOpaque();
+        const RemotingCommand response = invokeOnce(addr, retry, static_cast<int32_t>(remaining));
+        if (response.code == ResponseCode::GO_AWAY) {
+            throw RemotingSendRequestException("Receive GO_AWAY twice in request from channel "
+                                               + addr);
+        }
+        return response;
+    }
+
     // ---- 异步请求的超时清理（对应 Java NettyRemotingAbstract.scanResponseTable）----
     // 没有它，invokeAsync 的 timeoutMillis 就无处生效：对端不回包时回调永远不触发，
     // 在途表项也永久留在 respTable 里（长连接复用久了就是内存泄漏 + 悬挂的发送请求）。
@@ -475,6 +544,55 @@ struct RemotingClient::Impl {
     std::condition_variable sweepCv;
     std::thread sweeper;
     bool sweeperStarted = false;
+
+    // 异步调用收到 GO_AWAY 后的重发任务。必须在**非读线程**上执行：重发要建新连接并
+    // 等新连接的读线程投递响应，而在读线程里等就是把这条连接上其它在途请求的投递堵住。
+    // 复用清理线程（而不是 detach 一个线程），生命周期才跟着 RemotingClient 走。
+    struct GoAwayRetry {
+        std::string addr;
+        RemotingCommand request;
+        InvokeCallback callback;
+        int64_t deadlineMs;
+    };
+    std::mutex retryMutex;
+    std::vector<GoAwayRetry> retryQueue;
+
+    void scheduleGoAwayRetry(GoAwayRetry job) {
+        {
+            std::lock_guard<std::mutex> lk(retryMutex);
+            retryQueue.push_back(std::move(job));
+        }
+        sweepCv.notify_all();  // 立刻来干，别等下一个 100ms tick
+    }
+
+    void drainGoAwayRetries() {
+        std::vector<GoAwayRetry> jobs;
+        {
+            std::lock_guard<std::mutex> lk(retryMutex);
+            jobs.swap(retryQueue);
+        }
+        for (auto& job : jobs) {
+            try {
+                const RemotingCommand response =
+                    retryAfterGoAway(job.addr, job.request, job.deadlineMs);
+                job.callback(response, std::string());
+            } catch (const std::exception& e) {
+                job.callback(RemotingCommand(), e.what());
+            }
+        }
+    }
+
+    // 退出前把还没重发的任务交还给业务：回调一次都不触发比触发成错误更难排查。
+    void failPendingRetries(const std::string& reason) {
+        std::vector<GoAwayRetry> jobs;
+        {
+            std::lock_guard<std::mutex> lk(retryMutex);
+            jobs.swap(retryQueue);
+        }
+        for (auto& job : jobs) {
+            job.callback(RemotingCommand(), reason);
+        }
+    }
 
     void ensureSweeper() {
         {
@@ -485,11 +603,19 @@ struct RemotingClient::Impl {
         sweeper = std::thread([this]() {
             while (true) {
                 std::unique_lock<std::mutex> lk(sweepMutex);
-                sweepCv.wait_for(lk, std::chrono::milliseconds(100),
-                                 [this]() { return !running.load() || !sweeperStarted; });
+                sweepCv.wait_for(lk, std::chrono::milliseconds(100), [this]() {
+                    if (!running.load() || !sweeperStarted) {
+                        return true;
+                    }
+                    // 嵌套加锁顺序固定为 sweepMutex -> retryMutex：scheduleGoAwayRetry
+                    // 只在**放掉** retryMutex 之后才 notify，不会反向持锁，故无死锁环。
+                    std::lock_guard<std::mutex> rlk(retryMutex);
+                    return !retryQueue.empty();
+                });
                 lk.unlock();
                 if (!running.load()) return;
                 sweepExpired();
+                drainGoAwayRetries();
             }
         });
     }
@@ -610,6 +736,8 @@ struct RemotingClient::Impl {
         }
         // 先停清理线程：它会在回调里回到业务层，不能让它看到半关闭的客户端。
         stopSweeper();
+        // 排队里还没重发完的 GO_AWAY 任务交给业务一个错误回调，不能悄悄吞掉。
+        failPendingRetries("remoting client shutdown, GO_AWAY retry abandoned");
         std::vector<std::shared_ptr<Connection>> all;
         {
             std::lock_guard<std::mutex> lk(connMutex);
@@ -674,33 +802,41 @@ void RemotingClient::parseAddress(const std::string& addr, std::string& host,
 
 RemotingCommand RemotingClient::invokeSync(const std::string& addr, RemotingCommand& request,
                                            int32_t timeoutMillis) {
-    int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : invokeTimeoutMillis_;
-    auto future = impl_->registerFutureAcquiringOpaque(request, nullptr);
-    const int32_t opaque = request.opaque;
-    try {
-        impl_->sendRequest(addr, request);
-    } catch (...) {
-        impl_->unregisterFuture(opaque);
-        throw;
+    const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : invokeTimeoutMillis_;
+    const int64_t deadline = Impl::Future::monoNowMs() + timeout;
+    const RemotingCommand response = impl_->invokeOnce(addr, request, timeout);
+    if (response.code != ResponseCode::GO_AWAY) {
+        return response;
     }
-
-    std::unique_lock<std::mutex> lk(future->m);
-    bool ok = future->cv.wait_for(lk, std::chrono::milliseconds(timeout),
-                                 [&]() { return future->done; });
-    if (!ok) {
-        lk.unlock();
-        impl_->unregisterFuture(opaque);
-        throw RemotingTimeoutException(addr + " wait response timeout " + std::to_string(timeout)
-                                       + " ms, opaque=" + std::to_string(opaque));
-    }
-    return future->response;
+    return impl_->retryAfterGoAway(addr, request, deadline);
 }
 
 void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& request,
                                  InvokeCallback callback, int32_t timeoutMillis) {
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : invokeTimeoutMillis_;
     impl_->ensureSweeper();
-    impl_->registerFutureAcquiringOpaque(request, std::move(callback), addr, timeout);
+    const int64_t deadline = Impl::Future::monoNowMs() + timeout;
+    InvokeCallback user = std::move(callback);
+    // 与同步路径同一套 GO_AWAY 语义（Java 里两者共用 invokeImpl）。请求在这里拷一份，
+    // 只有真收到 GO_AWAY 才用得上 —— 传输层不为每次调用都留请求副本（见头文件说明），
+    // 而重发必须能拿到原始报文。
+    RemotingCommand original = request;
+    impl_->registerFutureAcquiringOpaque(
+        request,
+        [this, user, addr, deadline, original](const RemotingCommand& response,
+                                               const std::string& error) {
+            if (!error.empty() || response.code != ResponseCode::GO_AWAY) {
+                user(response, error);
+                return;
+            }
+            Impl::GoAwayRetry job;
+            job.addr = addr;
+            job.request = original;
+            job.callback = user;
+            job.deadlineMs = deadline;
+            impl_->scheduleGoAwayRetry(std::move(job));
+        },
+        addr, timeout);
     const int32_t opaque = request.opaque;
     try {
         impl_->sendRequest(addr, request);
@@ -765,21 +901,13 @@ bool RemotingClient::isChannelWritable(const std::string& addr) const {
     return it != impl_->conns.end() && it->second->sock != kInvalidSocket;
 }
 
-void RemotingClient::closeChannel(const std::string& addr) {
-    std::shared_ptr<Impl::Connection> conn;
-    {
-        std::lock_guard<std::mutex> lk(impl_->connMutex);
-        auto it = impl_->conns.find(addr);
-        if (it == impl_->conns.end()) {
-            return;
-        }
-        conn = it->second;
-        impl_->conns.erase(it);
-    }
-    // 关闭 socket 会让读线程的 select()/recv() 立刻返回并自行退出
-    closeSocket(conn->sock);
-    conn->sock = kInvalidSocket;
+void RemotingClient::closeChannel(const std::string& addr) { impl_->closeConnection(addr); }
+
+void RemotingClient::setEnableReconnectForGoAway(bool enable) {
+    impl_->enableReconnectForGoAway = enable;
 }
+
+bool RemotingClient::enableReconnectForGoAway() const { return impl_->enableReconnectForGoAway; }
 
 void RemotingClient::updateNameServerAddressList(const std::vector<std::string>& /*addrs*/) {
     // 由上层 MQClientInstance 维护 NameServer 列表；传输层不持有

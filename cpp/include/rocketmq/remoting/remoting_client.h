@@ -10,6 +10,11 @@
 //
 // 线格式：totalLength(4) | headerLength(4) | header | body
 //   totalLength = 4 + headerLength + bodyLength（即首 4 字节之后的所有字节数）
+//
+// 与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
+// （channelNotActiveInterval=60s）在 Java 客户端里**从未被调度** —— client + remoting 全树
+// grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
+// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现。
 #ifndef ROCKETMQ_REMOTING_REMOTING_CLIENT_H
 #define ROCKETMQ_REMOTING_REMOTING_CLIENT_H
 
@@ -111,6 +116,13 @@ public:
     // MQClientException，明文路径零影响。
     void setTlsEnable(bool enable);
     bool tlsEnable() const;
+
+    // ---- GO_AWAY（对应 Java NettyClientConfig.enableReconnectForGoAway，默认 true）----
+    // broker / proxy 优雅下线时给在途请求回 ResponseCode.GO_AWAY(1500)，语义是
+    // 「这条连接别再用了」。开启时换一条连接重发一次（只一次），第二次仍是 GO_AWAY
+    // 就按发送失败抛出；关掉则直接失败、不重连。必须在首条连接建立前设置。
+    void setEnableReconnectForGoAway(bool enable);
+    bool enableReconnectForGoAway() const;
 
     // ---- 连接管理 ----
     bool isChannelWritable(const std::string& addr) const;

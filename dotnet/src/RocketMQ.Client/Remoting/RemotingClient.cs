@@ -12,6 +12,11 @@
 //
 // 线格式：totalLength(4) | headerLength(4) | header | body
 //   totalLength = 4 + headerLength + bodyLength（即首 4 字节之后的所有字节数）
+//
+// 与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
+// （channelNotActiveInterval=60s）在 Java 客户端里**从未被调度** —— client + remoting 全树
+// grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
+// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现。
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
@@ -163,6 +168,14 @@ public sealed class RemotingClient : IDisposable
         string? v = Environment.GetEnvironmentVariable("ROCKETMQ_TLS_ENABLE");
         return v is not null && (v.Trim().ToLowerInvariant() is "1" or "true" or "yes");
     }
+
+    /// <summary>
+    /// 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 <c>true</c>）：
+    /// broker / proxy 优雅下线时给在途请求回 <c>GO_AWAY(1500)</c>，语义是「这条连接别再用了」。
+    /// 开启时换一条连接重发一次（只一次），第二次仍是 GO_AWAY 就报发送失败；关掉直接失败。
+    /// 必须在首条连接建立前设置。
+    /// </summary>
+    public bool EnableReconnectForGoAway { get; set; } = true;
 
     public int ConnectTimeoutMillis => _connectTimeoutMillis;
 
@@ -808,13 +821,27 @@ public sealed class RemotingClient : IDisposable
     // ---------------------------------------------------------------- 公开调用
 
     /// <summary>
-    /// 同步调用：等到响应或超时。超时抛 RemotingTimeoutException；
+    /// 同步调用：等到响应或超时，含 GO_AWAY 换连接重发（对应 Java
+    /// <c>NettyRemotingClient#invokeImpl:828-873</c>）。超时抛 RemotingTimeoutException；
     /// 建连失败抛 RemotingConnectException；发送失败抛 RemotingSendRequestException。
     /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
     /// </summary>
     public RemotingCommand InvokeSync(string addr, RemotingCommand request, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _invokeTimeoutMillis;
+        long deadline = Future.MonoNowMs() + timeout;
+        RemotingCommand response = InvokeOnce(addr, request, timeout);
+        if (response.Code != ResponseCode.GoAway)
+        {
+            return response;
+        }
+
+        return RetryAfterGoAway(addr, request, deadline);
+    }
+
+    /// <summary>单次请求-应答：登记 opaque、写出、等响应或超时。不含 GO_AWAY 判定。</summary>
+    private RemotingCommand InvokeOnce(string addr, RemotingCommand request, int timeout)
+    {
         Future future = RegisterFutureAcquiringOpaque(request, null);
         int opaque = request.Opaque;
         try
@@ -839,15 +866,98 @@ public sealed class RemotingClient : IDisposable
     }
 
     /// <summary>
+    /// GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
+    /// <paramref name="deadlineMs"/> 是整次调用（含首发）的绝对截止时间，重发只花剩余预算
+    /// ——Java 用同一个 Stopwatch 扣减 timeoutMillis。
+    /// </summary>
+    private RemotingCommand RetryAfterGoAway(string addr, RemotingCommand request, long deadlineMs)
+    {
+        if (!EnableReconnectForGoAway)
+        {
+            throw new RemotingSendRequestException("Receive GO_AWAY from channel " + addr);
+        }
+
+        ClientLog.Info("remoting: receive GO_AWAY from " + addr + ", reconnect and retry once");
+        CloseChannel(addr);
+        long remaining = deadlineMs - Future.MonoNowMs();
+        if (remaining <= 0)
+        {
+            throw new RemotingTimeoutException(addr + " GO_AWAY retry budget exhausted, opaque="
+                + request.Opaque.ToString(CultureInfo.InvariantCulture));
+        }
+
+        RemotingCommand retry = CopyForRetry(request);
+        RemotingCommand response = InvokeOnce(addr, retry,
+            (int)Math.Min(remaining, int.MaxValue));
+        if (response.Code == ResponseCode.GoAway)
+        {
+            throw new RemotingSendRequestException(
+                "Receive GO_AWAY twice in request from channel " + addr);
+        }
+
+        return response;
+    }
+
+    /// <summary>
+    /// GO_AWAY 重发用的请求副本（对应 Java 的 createRequestCommand + setBody + setExtFields）。
+    /// 必须是**新** opaque：旧请求已经拿到应答，复用会让下一次响应错配。
+    /// ExtFields 按值复制——ACL 签名（AccessKey/Signature）就在里面，重发要带原签名。
+    /// </summary>
+    private static RemotingCommand CopyForRetry(RemotingCommand request)
+    {
+        return new RemotingCommand
+        {
+            Code = request.Code,
+            Language = request.Language,
+            Version = request.Version,
+            Opaque = RemotingCommand.NextOpaque(),
+            Flag = request.Flag,
+            Remark = request.Remark,
+            HasRemark = request.HasRemark,
+            ExtFields = new PropertyMap(request.ExtFields),
+            CustomHeader = request.CustomHeader,
+            Body = request.Body,
+            HasBody = request.HasBody,
+            SerializeTypeCurrentRpc = request.SerializeTypeCurrentRpc,
+        };
+    }
+
+    /// <summary>
     /// 异步调用：发送后立即返回。回调**恰好触发一次**——响应到达时在读线程里带 response，
     /// 超时或无响应时由清理线程带 error（对应 Java scanResponseTable → operationFail）。
     /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
+    ///
+    /// GO_AWAY 与同步路径同一套语义（Java 里两条路共用 invokeImpl）：重发要建新连接并等
+    /// 它的读线程投递响应，绝不能压在回调所在的读线程上，所以交给线程池。
     /// </summary>
     public void InvokeAsync(string addr, RemotingCommand request, InvokeCallback callback, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _invokeTimeoutMillis;
         EnsureSweeper();
-        RegisterFutureAcquiringOpaque(request, callback, addr, timeout);
+        long deadline = Future.MonoNowMs() + timeout;
+        RemotingCommand original = CopyForRetry(request);
+        original.Opaque = request.Opaque;
+        RegisterFutureAcquiringOpaque(request, (response, error) =>
+        {
+            if (response is null || error is not null || response.Code != ResponseCode.GoAway)
+            {
+                callback(response, error);
+                return;
+            }
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    callback(RetryAfterGoAway(addr, original, deadline), null);
+                }
+                catch (Exception retryError)
+                {
+                    // 回调契约：失败也只能通过 error 表达，不能把异常抛回读线程
+                    callback(null, retryError);
+                }
+            });
+        }, addr, timeout);
         int opaque = request.Opaque;
         try
         {

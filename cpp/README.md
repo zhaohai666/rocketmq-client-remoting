@@ -13,7 +13,7 @@ libzstd 可选，找不到就只关那一个后端），网络层手写而不是
 | 层 | 内容 |
 | --- | --- |
 | 协议层 | JSON / RocketMQ 二进制两路序列化；`RemotingCommand` 帧编解码；CommandCustomHeader 家族（含 V2 短字段名）；17 段消息存储格式与 6 段批量格式 |
-| 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、SIGPIPE 处理 |
+| 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、**GO_AWAY(1500) 换连接重发一次**、SIGPIPE 处理 |
 | 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData` |
 | 客户端 | `MQClientInstance`、`DefaultMQProducer`、`DefaultMQPushConsumer`、`DefaultMQPullConsumer`、`DefaultLitePullConsumer`、**`DefaultMQAdminExt`** |
 | 校验门 | `Validators` / `TopicValidator`：`checkTopic` / `checkGroup` / `isSystemTopic` / `isNotAllowedSendTopic` / `checkMessage`，四类 facade 的 `start()` 在建客户端实例**之前**跑完组名校验（纯本地判定，失败不碰网络） |
@@ -53,7 +53,7 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 22 个用例，约 1240 项断言，~15s
+cd build && ctest --output-on-failure     # 22 个用例，1267 项断言，~15s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -61,9 +61,9 @@ cd build && ctest --output-on-failure     # 22 个用例，约 1240 项断言，
 | `codec` | 65 | JSON / ROCKETMQ / `RemotingCommand` 两路 / 消息 17 段与 6 段 / header V1↔V2 / hashCode / CRC32 / msgId |
 | `java_alignment` | 32（带 `ROCKETMQ_JAVA_SRC` 为 38） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对 |
 | `route_heartbeat` | 95 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
-| `transport` | 35 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、地址解析 |
+| `transport` | 53 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、**GO_AWAY 重发（同步+异步、只重发一次、开关关掉不重连）**、地址解析 |
 | `compression` | 152 | 三后端：类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib / **LZ4 Frame** / **ZSTD** 往返、**外部硬编码真值夹具**（Python zlib.compress、Java lz4-java、zstd-jni、`zstd -3` CLI 各产的帧）、帧头 magic 与 LZ4 block-independence 位、17 段报文 × 三种类型、解压后清 flag、后端缺失或未知类型必须抛错而非交出压缩流 |
-| `admin` | 152 | fastjson2 非法 JSON 容错、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
+| `admin` | 159 | fastjson2 非法 JSON 容错、`ConsumeStatsList` 的 **Java 字段名 `consumeStatsList`**（键名错一个字符就静默解析成空列表）、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
 | `acl` | 37 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
 | `request_reply` | 37 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时 |
