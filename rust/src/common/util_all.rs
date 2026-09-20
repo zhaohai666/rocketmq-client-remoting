@@ -2,11 +2,25 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const YYYY_MM_DD_HH_MM_SS: &str = "%Y-%m-%d %H:%M:%S";
 
 const HEX_ARRAY: &[u8; 16] = b"0123456789ABCDEF";
+
+/// [`monotonic_millis`] 的原点，首次调用时锚定（对应 `time.monotonic()` 的进程起点）。
+static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// 对应 Python `time.monotonic() * 1000` / dotnet `UtilAll.MonotonicMillis`：
+/// **单调递增**的毫秒数，不受系统时间被回拨/NTP 校正影响。
+///
+/// 为什么不能像 [`current_time_millis`] 那样用挂钟：发送重试预算和 broker 延迟
+/// 故障规避都要算「两次事件之间隔了多久」，挂钟一旦回退就会算出负延迟，
+/// 于是把超时的请求记成「极快」，反而给坏的 broker 加分。
+pub fn monotonic_millis() -> f64 {
+    let origin = MONOTONIC_ORIGIN.get_or_init(Instant::now);
+    origin.elapsed().as_secs_f64() * 1000.0
+}
 
 /// Java `String.hashCode()`：`h = 31*h + ch`，32 位有符号回绕。
 /// 对拍向量：`TagA`=2598919、`TagB`=2598920、`P`=80、`PA`=2545、`*`=42。

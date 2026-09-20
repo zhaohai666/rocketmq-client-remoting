@@ -48,6 +48,19 @@ public class DefaultMQProducer
     // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
     private bool _enableTraceContext;
     private int _retryTimesWhenSendFailed = 2;
+    // 对应 Java sendMsgMaxTimeoutPerRequest（默认 -1 = 不限制）：还有重试机会时，
+    // 单次请求超时被压到该值，把总预算的余量留给后面的 broker。
+    private int _sendMsgMaxTimeoutPerRequest = -1;
+    // 可重试的 broker 响应码，默认集合与 Java DefaultMQProducer#retryResponseCodes 一致
+    private readonly HashSet<int> _retryResponseCodes = new()
+    {
+        ResponseCode.SystemError, ResponseCode.SystemBusy,
+        ResponseCode.ServiceNotAvailable, ResponseCode.NoPermission,
+        ResponseCode.TopicNotExist, ResponseCode.NoBuyerId,
+        ResponseCode.NotInCurrentUnit, ResponseCode.GoAway,
+    };
+    // 对应 Java retryAnotherBrokerWhenNotStoreOK：状态不是 SEND_OK 时是否也换一台 broker
+    private bool _retryAnotherBrokerWhenNotStoreOk;
     // 发送延迟故障规避（默认关闭，对应 Java MQFaultStrategy 的默认开关）
     private readonly MQFaultStrategy _mqFaultStrategy = new(false);
     private int _maxMessageSize = 1024 * 1024 * 4;
@@ -150,6 +163,52 @@ public class DefaultMQProducer
     {
         get => _retryTimesWhenSendFailed;
         set => _retryTimesWhenSendFailed = value;
+    }
+
+    /// <summary>
+    /// 对应 Java setSendMsgMaxTimeoutPerRequest。-1（默认）表示单次请求不设上限；
+    /// 设成有限值后，**还有重试机会**的那几次单次超时被压到该值 —— 否则一台慢
+    /// broker 就能把整个 SendMsgTimeout 预算吃光，剩下的 broker 一次都试不到。
+    /// </summary>
+    public int SendMsgMaxTimeoutPerRequest
+    {
+        get => _sendMsgMaxTimeoutPerRequest;
+        set => _sendMsgMaxTimeoutPerRequest = value;
+    }
+
+    /// <summary>对应 Java retryAnotherBrokerWhenNotStoreOK（默认 false）。</summary>
+    public bool RetryAnotherBrokerWhenNotStoreOk
+    {
+        get => _retryAnotherBrokerWhenNotStoreOk;
+        set => _retryAnotherBrokerWhenNotStoreOk = value;
+    }
+
+    /// <summary>对应 Java getRetryResponseCodes（返回副本，改集合要走 AddRetryResponseCode）。</summary>
+    public HashSet<int> RetryResponseCodes => new(_retryResponseCodes);
+
+    /// <summary>对应 Java addRetryResponseCode：broker 回了这些码才值得换一台重发。</summary>
+    public void AddRetryResponseCode(int responseCode)
+    {
+        lock (_retryResponseCodes)
+        {
+            _retryResponseCodes.Add(responseCode);
+        }
+    }
+
+    /// <summary>
+    /// 对应 Python is_retry_response_code：null（压根没等到响应码）等于不可重试。
+    /// </summary>
+    public bool IsRetryResponseCode(int? responseCode)
+    {
+        if (!responseCode.HasValue)
+        {
+            return false;
+        }
+
+        lock (_retryResponseCodes)
+        {
+            return _retryResponseCodes.Contains(responseCode.Value);
+        }
     }
 
     // ---------------- 故障规避（对应 Java sendLatencyFaultEnable，默认关闭）----------------
@@ -763,62 +822,186 @@ public class DefaultMQProducer
 
     // ---------------- 同步发送 ----------------
 
-    // 不指定队列：轮询选择，失败按 retryTimesWhenSendFailed 重试
+    /// <summary>重试耗尽后给最后一次失败定性，决定最终 MQClientException 的错误码。
+    /// 等价于 Java 的 lastExceptionType 判定（C++/Rust 同款分档）。</summary>
+    private enum SendFailureCause
+    {
+        None,
+        Broker,
+        Connect,
+        Timeout,
+        Client,
+        Other,
+    }
+
+    // 不指定队列：按 broker 延迟/隔离状态选队列，失败按 retryTimesWhenSendFailed 重试。
+    // 逐条对齐 Java DefaultMQProducerImpl#sendDefaultImpl：
+    //   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
+    //   * 路由在循环**之外**只取一次，整条重试链共用；完全取不到时在循环外就按
+    //     NOT_FOUND_TOPIC 抛掉，不把重试次数空转掉；
+    //   * 每次尝试先算 costTime，总超时已用完则整体放弃（→ RemotingTooMuchRequestException）；
+    //     还剩重试机会时，单次请求超时被 SendMsgMaxTimeoutPerRequest 压住，把余量留给后面的 broker；
+    //   * 异常按类型分档写容错表，且只有 RetryResponseCodes 里的 broker 响应码才继续重试；
+    //   * 全部失败时把原因映射成 ClientErrorCode 塞进 MQClientException。
     public SendResult Send(Message msg, int timeoutMillis = -1)
     {
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
+        // 在重试循环之外压缩一次：PrepareForSend 就地改写 body，循环内重复调用会把
+        // 已压缩的字节再压一遍（zlib(zlib(x))），消费端只解一层就拿到压缩流。
         int sysFlag = PrepareForSend(outbound);
 
-        string lastError = string.Empty;
-        string lastBrokerName = "";
-        for (int attempt = 0; attempt <= _retryTimesWhenSendFailed; ++attempt)
+        TopicPublishInfo publish;
+        try
         {
+            publish = TryToFindTopicPublishInfo(c, outbound.Topic);
+        }
+        catch (MQClientException e)
+        {
+            throw new MQClientException(e.Message, ClientErrorCode.NotFoundTopicException);
+        }
+
+        int timesTotal = _retryTimesWhenSendFailed + 1;
+        // 耗时用单调高精度钟（对应 Python time.monotonic / C++ steady_clock / Rust monotonic_millis）：
+        // 墙钟毫秒粒度会把本地环回的亚毫秒往返量成 0，容错阈值就永远不生效。
+        double beginFirst = UtilAll.MonotonicMillis();
+        var brokersSent = new List<string>();
+        string lastBrokerName = string.Empty;
+        // 非 SEND_OK 且开了换 broker 时，把这个"存了但没存好"的结果留着：后面全失败就原样返回。
+        SendResult? result = null;
+        string lastError = string.Empty;
+        var cause = SendFailureCause.None;
+        int brokerCode = MQBrokerException.Unknown;
+        bool callTimeout = false;
+
+        for (int attempt = 0; attempt < timesTotal; ++attempt)
+        {
+            // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
+            // 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
+            // 从而能避开 lastBrokerName 选到别的 broker。
+            MessageQueue selected;
             try
             {
-                TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
-                // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
-                // 关闭时退化为普通轮询（策略内部判断）。
-                MessageQueue selected = _mqFaultStrategy.SelectOneMessageQueue(publish, lastBrokerName);
-                lastBrokerName = selected.BrokerName;
-                // 耗时用单调高精度钟（对应 Python time.monotonic / C++ steady_clock）：
-                // 墙钟毫秒粒度会把本地环回的亚毫秒往返量成 0，阈值就永远不生效。
-                double sendBegin = UtilAll.MonotonicMillis();
-                SendResult result;
-                try
-                {
-                    result = SendWithHooks(c, outbound, selected, timeout, sysFlag);
-                }
-                catch (Exception)
-                {
-                    // 发送异常：按隔离档位记录（latency 固定 10000ms），broker 进入隔离期
-                    _mqFaultStrategy.UpdateFaultItem(selected.BrokerName, 0.0, true, false);
-                    throw;
-                }
-                // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
-                _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
-                                                 UtilAll.MonotonicMillis() - sendBegin, false, true);
-                return result;
+                selected = _mqFaultStrategy.SelectOneMessageQueue(publish, lastBrokerName,
+                    attempt > 0);
             }
             catch (MQClientException e)
             {
+                // 选不到队列属客户端异常：此刻还没有目标 broker，容错表无从记起（Java 同）
                 lastError = e.Message;
+                cause = SendFailureCause.Client;
+                continue;
+            }
+
+            lastBrokerName = selected.BrokerName;
+            brokersSent.Add(selected.BrokerName);
+            double began = UtilAll.MonotonicMillis();
+
+            // 整体预算：timeout 是**这次调用**的总预算，已被前面的尝试吃掉的部分要扣掉，
+            // 否则 3 次重试各 3s 会变成最长 9s 才返回。
+            long costTime = (long)(began - beginFirst);
+            if (timeout < costTime)
+            {
+                callTimeout = true;
+                break;
+            }
+
+            // costTime <= timeout（int），差值必在 int 范围内，窄化转换无损
+            int curTimeout = (int)(timeout - costTime);
+            bool canRetryAgain = attempt + 1 < timesTotal;
+            if (_sendMsgMaxTimeoutPerRequest > -1 && canRetryAgain
+                && curTimeout > _sendMsgMaxTimeoutPerRequest)
+            {
+                curTimeout = _sendMsgMaxTimeoutPerRequest;
+            }
+
+            try
+            {
+                SendResult sent = SendWithHooks(c, outbound, selected, curTimeout, sysFlag);
+                result = sent;
+                // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
+                    UtilAll.MonotonicMillis() - began, false, true);
+                // Java：非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
+                // 否则把这个"存了但没存好"的结果原样返回
+                if (sent.SendStatus != SendStatus.SendOk && _retryAnotherBrokerWhenNotStoreOk)
+                {
+                    continue;
+                }
+
+                return sent;
             }
             catch (MQBrokerException e)
             {
+                // broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+                _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
+                    UtilAll.MonotonicMillis() - began, true, false);
                 lastError = e.Message;
+                cause = SendFailureCause.Broker;
+                brokerCode = e.ResponseCode;
+                if (IsRetryResponseCode(e.ResponseCode))
+                {
+                    continue;
+                }
+
+                if (result is not null)
+                {
+                    return result;
+                }
+
+                throw;
             }
             catch (RemotingException e)
             {
+                // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测线程，
+                // 所以 Java 的 reachable=!isStartDetectorEnable() 恒为 true。
+                _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
+                    UtilAll.MonotonicMillis() - began, true, true);
                 lastError = e.Message;
+                cause = e switch
+                {
+                    RemotingConnectException => SendFailureCause.Connect,
+                    RemotingTimeoutException => SendFailureCause.Timeout,
+                    _ => SendFailureCause.Other,
+                };
+            }
+            catch (MQClientException e)
+            {
+                // 客户端自己的问题（钩子拦截、路由没了…）：Java 同样只记延迟、不隔离
+                _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
+                    UtilAll.MonotonicMillis() - began, false, true);
+                lastError = e.Message;
+                cause = SendFailureCause.Client;
             }
         }
 
-        throw new MQClientException("send failed after "
-                                    + (_retryTimesWhenSendFailed + 1).ToString(CultureInfo.InvariantCulture)
-                                    + " attempts, last error: " + lastError);
+        if (result is not null)
+        {
+            return result;
+        }
+
+        if (callTimeout)
+        {
+            throw new RemotingTooMuchRequestException("sendDefaultImpl call timeout");
+        }
+
+        long costTotal = (long)(UtilAll.MonotonicMillis() - beginFirst);
+        string info = "Send [" + brokersSent.Count.ToString(CultureInfo.InvariantCulture)
+                      + "] times, still failed, cost ["
+                      + costTotal.ToString(CultureInfo.InvariantCulture)
+                      + "]ms, Topic: " + outbound.Topic + ", BrokersSent: ["
+                      + string.Join(", ", brokersSent) + "], last error: " + lastError;
+        int responseCode = cause switch
+        {
+            SendFailureCause.Broker => brokerCode,
+            SendFailureCause.Connect => ClientErrorCode.ConnectBrokerException,
+            SendFailureCause.Timeout => ClientErrorCode.AccessBrokerTimeout,
+            SendFailureCause.Client => ClientErrorCode.BrokerNotExistException,
+            _ => MQBrokerException.Unknown,
+        };
+        throw new MQClientException(info, responseCode);
     }
 
     // 定点发送到指定队列

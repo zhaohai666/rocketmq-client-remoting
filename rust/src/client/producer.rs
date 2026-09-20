@@ -26,6 +26,7 @@
 //!    Python 的顺序注册 `SendMessageTraceHook` / `EndTransactionTraceHook` 并启动它。
 //! 5. `time.time()*1000` → [`current_time_millis`]；`threading.Lock` → `Mutex`。
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
@@ -66,10 +67,10 @@ use crate::common::message_decoder::{decode_message, decode_message_id, decode_m
 use crate::common::message_type::MessageType;
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::{MessageSysFlag, PermName};
-use crate::common::util_all::{current_time_millis, java_string_hash};
-use crate::error::{Error, Result};
+use crate::common::util_all::{current_time_millis, java_string_hash, monotonic_millis};
+use crate::error::{client_error_code, Error, Result};
 use crate::remoting::client::{RequestProcessor, ResponseSink};
-use crate::remoting::protocol::codes::request_code;
+use crate::remoting::protocol::codes::{request_code, response_code};
 use crate::remoting::protocol::ext_fields::CustomHeader;
 use crate::remoting::protocol::headers::{
     CheckTransactionStateRequestHeader, EndTransactionRequestHeader,
@@ -82,6 +83,10 @@ use crate::remoting::rpchook::RPCHook;
 use crate::client::trace_context::{inject_trace_context, trace_context_enabled_from_env};
 use crate::{bail, rmq_debug, rmq_warn};
 
+/// 发送重试内核的离线对拍（进程内假集群），见该模块文档。
+#[cfg(test)]
+mod send_retry_tests;
+
 /// Python `DefaultMQProducer.instance_name` 的默认值。
 pub const DEFAULT_INSTANCE_NAME: &str = "DEFAULT";
 /// Java `DefaultMQProducer#maxMessageSize` 默认 4 MiB。
@@ -90,6 +95,22 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: i32 = 1024 * 1024 * 4;
 pub const DEFAULT_COMPRESS_MSG_BODY_OVER_HOWMUCH: i32 = 1024 * 4;
 /// Java `MessageSysFlag.COMPRESSION_LEVEL` 默认 zlib level 5。
 pub const DEFAULT_COMPRESS_LEVEL: i32 = 5;
+
+/// Java `DefaultMQProducer#retryResponseCodes` 的默认集合（Python 构造函数同款）。
+///
+/// 判据是「换一台 broker 有可能不一样」：这些码都代表 broker 侧的临时状态
+/// （忙、不可用、路由还没同步、被隔离……）。而 `MESSAGE_ILLEGAL` 之类的
+/// 确定性错误重试也是白试，必须原样抛给调用方。
+pub const DEFAULT_RETRY_RESPONSE_CODES: [i32; 8] = [
+    response_code::SYSTEM_ERROR,
+    response_code::SYSTEM_BUSY,
+    response_code::SERVICE_NOT_AVAILABLE,
+    response_code::NO_PERMISSION,
+    response_code::TOPIC_NOT_EXIST,
+    response_code::NO_BUYER_ID,
+    response_code::NOT_IN_CURRENT_UNIT,
+    response_code::GO_AWAY,
+];
 
 // ================================================================ 队列选择器
 
@@ -362,6 +383,12 @@ pub struct ProducerConfig {
     /// Python `retry_another_broker_when_not_store_ok`（Java
     /// `retryAnotherBrokerWhenNotStoreOK`，默认 false）。
     pub retry_another_broker_when_not_store_ok: bool,
+    /// Python `send_msg_max_timeout_per_request`（Java 同名，默认 -1 = 单次请求不设上限，
+    /// 只受整体 `send_msg_timeout` 预算约束）。
+    pub send_msg_max_timeout_per_request: i64,
+    /// Python `retry_response_codes`：broker 回了这些**业务错误码**时换一台 broker 重发，
+    /// 而不是直接把失败抛给调用方。
+    pub retry_response_codes: BTreeSet<i32>,
     /// Python `max_message_size`。
     pub max_message_size: i32,
     /// Python `topics`。
@@ -400,6 +427,11 @@ impl Default for ProducerConfig {
             retry_times_when_send_failed: 2,
             retry_times_when_send_async_failed: 2,
             retry_another_broker_when_not_store_ok: false,
+            send_msg_max_timeout_per_request: -1,
+            retry_response_codes: DEFAULT_RETRY_RESPONSE_CODES
+                .iter()
+                .copied()
+                .collect::<BTreeSet<i32>>(),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             topics: Vec::new(),
             name_server_addrs: Vec::new(),
@@ -693,6 +725,53 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.retry_times_when_send_failed = n);
     }
 
+    /// Python `set_retry_another_broker_when_not_store_ok`（Java
+    /// `setRetryAnotherBrokerWhenNotStoreOK`）：发送**没抛异常但状态不是 SEND_OK**
+    /// （例如 FLUSH_DISK_TIMEOUT）时，是否也换一台 broker 重发。默认 false，
+    /// 即把这个结果原样交给调用方。
+    pub fn set_retry_another_broker_when_not_store_ok(&self, retry: bool) {
+        self.write_cfg(|c| c.retry_another_broker_when_not_store_ok = retry);
+    }
+
+    /// Python `is_retry_another_broker_when_not_store_ok`。
+    pub fn is_retry_another_broker_when_not_store_ok(&self) -> bool {
+        self.read_cfg(|c| c.retry_another_broker_when_not_store_ok)
+    }
+
+    /// Python `set_send_msg_max_timeout_per_request`（Java 同名）。
+    ///
+    /// `-1`（默认）表示单次请求不设上限；设成有限值后，**还有重试机会**的那几次
+    /// 单次超时被压到该值，把余量留给后面的 broker —— 否则一台慢 broker
+    /// 就能把整个 `send_msg_timeout` 预算吃光，剩下的 broker 一次都试不到。
+    pub fn set_send_msg_max_timeout_per_request(&self, timeout_millis: i64) {
+        self.write_cfg(|c| c.send_msg_max_timeout_per_request = timeout_millis);
+    }
+
+    /// Python `get_send_msg_max_timeout_per_request`。
+    pub fn get_send_msg_max_timeout_per_request(&self) -> i64 {
+        self.read_cfg(|c| c.send_msg_max_timeout_per_request)
+    }
+
+    /// Python `add_retry_response_code`：往可重试码集合里加一个 broker 响应码。
+    pub fn add_retry_response_code(&self, response_code: i32) {
+        self.write_cfg(|c| {
+            c.retry_response_codes.insert(response_code);
+        });
+    }
+
+    /// Python `retry_response_codes` 属性（Java `getRetryResponseCodes`）。
+    pub fn get_retry_response_codes(&self) -> BTreeSet<i32> {
+        self.read_cfg(|c| c.retry_response_codes.clone())
+    }
+
+    /// Python `is_retry_response_code`：`None`（压根没等到响应码）等于不可重试。
+    pub fn is_retry_response_code(&self, response_code: Option<i32>) -> bool {
+        match response_code {
+            Some(code) => self.read_cfg(|c| c.retry_response_codes.contains(&code)),
+            None => false,
+        }
+    }
+
     /// Python `set_compress_msg_body_over_howmuch`。
     pub fn set_compress_msg_body_over_howmuch(&self, size: i32) {
         self.write_cfg(|c| c.compress_msg_body_over_howmuch = size);
@@ -866,6 +945,15 @@ impl DefaultMQProducer {
             .cfg
             .write()
             .unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// [`Self::write_cfg`] 的只读版：锁毒化时同样带着旧值继续，绝不在读配置上 panic。
+    fn read_cfg<T>(&self, f: impl FnOnce(&ProducerConfig) -> T) -> T {
+        f(&self
+            .inner
+            .cfg
+            .read()
+            .unwrap_or_else(|e| e.into_inner()))
     }
 
     // ---------------- 生命周期 ----------------
@@ -1147,9 +1235,12 @@ async fn send_heartbeat_to_all_broker(inner: &Inner, client: &MQClientInstance) 
     ok
 }
 
-/// Python `send` 的重试判据：`except (MQClientException, MQBrokerException,
-/// RemotingException)` 才重试，其它异常（例如批量消息的 `ValueError`、参数校验）
+/// 「这次失败值不值得再问一次」的粗判据：`except (MQClientException, MQBrokerException,
+/// RemotingException)` 都算，其它异常（例如批量消息的 `ValueError`、参数校验）
 /// 直接向上抛。
+///
+/// 现在只剩 [`DefaultMQProducer::topic_publish_info`] 用它决定「要不要强制刷一次路由」；
+/// 发送主循环改用了更细的 [`classify_send_error`]（三档异常在故障表上的记法不同）。
 ///
 /// [`Error::RequestTimeout`] 也在重试之列 —— Python 里它是 `MQClientException`
 /// 的子类，会被同一个 `except` 接住（发送链路本身产不出它，列出来只为口径完整）。
@@ -1166,6 +1257,51 @@ fn retryable(err: &Error) -> bool {
             | Error::TooMuchRequest(_)
             | Error::RequestTimeout { .. }
     )
+}
+
+/// Java `sendDefaultImpl` 三个 `except` 分支的归类结果。
+///
+/// Python 用 `isinstance` 分派；Rust 没有异常继承树，靠 [`Error`] 的变体一一对应
+/// （见 [`classify_send_error`]）。三档在**故障表**和**是否继续重试**上都不一样，
+/// 所以不能像早期版本那样合成一个 `retryable` 判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendErrorKind {
+    /// `MQBrokerException`：broker 明确回了业务错误码（Rust [`Error::Broker`]）。
+    Broker,
+    /// `RemotingException` 及其子类：连不上/发不出去/等响应超时。
+    Remoting,
+    /// `MQClientException` 及其子类：客户端自身的问题。
+    Client,
+}
+
+/// 把一次发送失败的 [`Error`] 归到 Python 的哪个 `except` 分支；
+/// `None` = 三个分支都接不住（校验错、解码错、本地 IO 错），直接向上抛。
+///
+/// [`Error::RequestTimeout`] 属 `MQClientException` 家族（Python
+/// `RequestTimeoutException extends MQClientException`），这点和
+/// [`Error::Timeout`]（remoting 层的 `RemotingTimeoutException`）分属两档，
+/// 是有意为之：前者说明 broker 收到了请求，后者连通道都没走通。
+fn classify_send_error(err: &Error) -> Option<SendErrorKind> {
+    match err {
+        Error::Broker { .. } => Some(SendErrorKind::Broker),
+        Error::Connect { .. }
+        | Error::SendRequest { .. }
+        | Error::Timeout { .. }
+        | Error::TooMuchRequest(_)
+        | Error::RemotingCommand(_)
+        | Error::Server { .. } => Some(SendErrorKind::Remoting),
+        Error::Client { .. } | Error::RequestTimeout { .. } => Some(SendErrorKind::Client),
+        Error::Decode(_) | Error::Encode(_) | Error::Io(_) | Error::Json(_) => None,
+    }
+}
+
+/// 从 `began`（[`monotonic_millis`] 取的起点）到现在的毫秒数，向下取整。
+///
+/// 对应 Python 的 `int((time.monotonic() - began) * 1000)`：`as i64` 对正浮点数
+/// 同样是向零取整，语义一致。用挂钟（`current_time_millis`）算不行——系统时间
+/// 一回退就会得到负延迟，反而把慢 broker 记成"很快"。
+fn latency_since(began: f64) -> i64 {
+    (monotonic_millis() - began) as i64
 }
 
 /// Python `_build_send_context` 里那串「延迟类属性」判定键。
@@ -1485,78 +1621,178 @@ impl DefaultMQProducer {
                 .await;
         }
 
-        let mut last_exc: Option<Error> = None;
+        // 对应 Java `sendDefaultImpl`：重试分类逐异常类型走，不用"啥都重试"糊过去。
+        // 路由在循环**之外**只取一次；拿不到就立刻按 NOT_FOUND_TOPIC 定性，
+        // 不把重试次数空转掉（Python `producer.py:665-670`）。
+        let publish = match self.topic_publish_info(&client, &topic).await {
+            Ok(publish) => publish,
+            Err(e @ Error::Client { .. }) => {
+                return Err(Error::client_with_code(
+                    client_error_code::NOT_FOUND_TOPIC_EXCEPTION,
+                    e.to_string(),
+                ))
+            }
+            Err(e) => return Err(e),
+        };
+        let times_total = retry_times.saturating_add(1);
+        let begin_first = monotonic_millis();
+        let mut brokers_sent: Vec<String> = Vec::new();
         let mut last_broker_name: Option<String> = None;
-        for _ in 0..=retry_times.max(0) {
-            match self
-                .send_attempt(&client, &topic, msg, timeout, sys_flag, &mut last_broker_name)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) if retryable(&e) => last_exc = Some(e),
-                Err(e) => return Err(e),
+        // Python 把「最后一次成功的 SendResult」留在变量里：非 SEND_OK 且开了换 broker
+        // 时会带着它继续重试，后面全失败就原样返回这个"存了但没存好"的结果。
+        let mut result: Option<SendResult> = None;
+        let mut last_exc: Option<Error> = None;
+        let mut call_timeout = false;
+        let mut attempt: i32 = 0;
+        while attempt < times_total {
+            // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
+            // 关闭时退化为普通轮询（策略内部判断）。重试时 reset_index 让轮询从头开始，
+            // 从而能避开 last_broker_name 选到别的 broker。
+            let selected = match self.inner.fault_strategy.select_one_message_queue(
+                &*publish,
+                last_broker_name.as_deref(),
+                attempt > 0,
+            ) {
+                Ok(selected) => selected,
+                // 选不到队列属 MQClientException：Python 此时 selected 仍是 None，
+                // `_update_fault_item` 直接 return（不记故障表），只留 last_exc 进下一轮。
+                Err(e) => {
+                    last_exc = Some(e);
+                    attempt += 1;
+                    continue;
+                }
+            };
+            let broker_name = selected.broker_name.clone();
+            last_broker_name = Some(broker_name.clone());
+            brokers_sent.push(broker_name.clone());
+            let began = monotonic_millis();
+            let mq_sel = MessageQueue::new(&topic, &broker_name, selected.queue_id);
+            // 整体预算：`timeout` 是**这次调用**的总预算，已经被前面的尝试吃掉的部分要扣掉，
+            // 否则 3 次重试各 3s 会变成最长 9s 才返回。
+            let cost_time = (began - begin_first) as i64;
+            if timeout < cost_time {
+                call_timeout = true;
+                break;
             }
+            let mut cur_timeout = timeout - cost_time;
+            let can_retry_again = attempt + 1 < times_total;
+            let max_per_request = self.read_cfg(|c| c.send_msg_max_timeout_per_request);
+            if max_per_request > -1 && can_retry_again && cur_timeout > max_per_request {
+                cur_timeout = max_per_request;
+            }
+            let send_start = self.inner.metrics.record_send_start();
+            let mut publish_msg = PublishMessage::Single(msg);
+            let outcome = self
+                .send_with_hooks(
+                    &client,
+                    &mut publish_msg,
+                    &mq_sel,
+                    cur_timeout,
+                    sys_flag,
+                    None,
+                    CommunicationMode::Sync,
+                )
+                .await;
+            match outcome {
+                Ok(ok_result) => {
+                    self.inner.metrics.record_send_success(send_start);
+                    // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+                    self.inner.fault_strategy.update_fault_item(
+                        &broker_name,
+                        latency_since(began),
+                        false,
+                        true,
+                    );
+                    // Java：非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
+                    // 否则把这个"存了但没存好"的结果原样返回
+                    if ok_result.status != SendStatus::SendOk
+                        && self.read_cfg(|c| c.retry_another_broker_when_not_store_ok)
+                    {
+                        result = Some(ok_result);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(ok_result);
+                }
+                Err(e) => {
+                    self.inner.metrics.record_send_failure(send_start);
+                    match classify_send_error(&e) {
+                        // 三个 except 都接不住的异常（校验/解码…）：Python 直接向上抛
+                        None => return Err(e),
+                        Some(SendErrorKind::Broker) => {
+                            // broker 明确回了错误码：隔离该 broker（可达性不动），
+                            // 只有 retryResponseCodes 里的码才值得换一台
+                            self.inner.fault_strategy.update_fault_item(
+                                &broker_name,
+                                latency_since(began),
+                                true,
+                                false,
+                            );
+                            let retry = self.is_retry_response_code(e.response_code());
+                            if retry {
+                                last_exc = Some(e);
+                                attempt += 1;
+                                continue;
+                            }
+                            if let Some(result) = result {
+                                return Ok(result);
+                            }
+                            return Err(e);
+                        }
+                        Some(SendErrorKind::Remoting) => {
+                            // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测
+                            // 任务，所以 Java 的 reachable = !isStartDetectorEnable() 恒真。
+                            self.inner.fault_strategy.update_fault_item(
+                                &broker_name,
+                                latency_since(began),
+                                true,
+                                true,
+                            );
+                            last_exc = Some(e);
+                        }
+                        Some(SendErrorKind::Client) => {
+                            // 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离
+                            self.inner.fault_strategy.update_fault_item(
+                                &broker_name,
+                                latency_since(began),
+                                false,
+                                true,
+                            );
+                            last_exc = Some(e);
+                        }
+                    }
+                }
+            }
+            attempt += 1;
         }
-        match last_exc {
-            Some(e) => Err(e),
-            // retry_times 被配成负数：Python 在这里会 `raise None`（TypeError），
-            // 这里给一条可读的客户端错误。
-            None => Err(Error::client("no send attempt was made")),
-        }
-    }
 
-    /// Python `send` 重试循环的**单次尝试**（选队 + 指标 + 故障规避 + 发送）。
-    async fn send_attempt(
-        &self,
-        client: &MQClientInstance,
-        topic: &str,
-        msg: &mut Message,
-        timeout: i64,
-        sys_flag: i32,
-        last_broker_name: &mut Option<String>,
-    ) -> Result<SendResult> {
-        let publish = self.topic_publish_info(client, topic).await?;
-        // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
-        // 关闭时退化为普通轮询（策略内部判断）。
-        let selected = self.inner.fault_strategy.select_one_message_queue(
-            &*publish,
-            last_broker_name.as_deref(),
-            false,
-        )?;
-        *last_broker_name = Some(selected.broker_name.clone());
-        let mq_sel = MessageQueue::new(topic, &selected.broker_name, selected.queue_id);
-        let broker_name = selected.broker_name.clone();
-        let send_start = self.inner.metrics.record_send_start();
-        let mut publish_msg = PublishMessage::Single(msg);
-        let result = self
-            .send_with_hooks(
-                client,
-                &mut publish_msg,
-                &mq_sel,
-                timeout,
-                sys_flag,
-                None,
-                CommunicationMode::Sync,
-            )
-            .await;
-        match result {
-            Ok(result) => {
-                self.inner.metrics.record_send_success(send_start);
-                // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
-                let latency = current_time_millis() as f64 - send_start;
-                self.inner
-                    .fault_strategy
-                    .update_fault_item(&broker_name, latency as i64, false, true);
-                Ok(result)
-            }
-            Err(e) => {
-                self.inner.metrics.record_send_failure(send_start);
-                self.inner
-                    .fault_strategy
-                    .update_fault_item(&broker_name, 0, true, false);
-                Err(e)
-            }
+        if let Some(result) = result {
+            return Ok(result);
         }
+        if call_timeout {
+            return Err(Error::TooMuchRequest("sendDefaultImpl call timeout".to_string()));
+        }
+        // 文案与 Python `producer.py:734-741` 逐字一致（Java 同款拼接）。
+        // 差别：Python 的 MQClientException 带 cause，本 crate 的 Error 没有 cause 字段，
+        // 所以原始异常只能拼进消息文本。
+        let info = format!(
+            "Send [{}] times, still failed, cost [{}]ms, Topic: {topic}, BrokersSent: [{}], \
+             last error: {}",
+            brokers_sent.len(),
+            latency_since(begin_first),
+            brokers_sent.join(", "),
+            last_exc.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+        );
+        let code = match &last_exc {
+            Some(Error::Broker { response_code, .. }) => Some(*response_code),
+            Some(Error::Connect { .. }) => Some(client_error_code::CONNECT_BROKER_EXCEPTION),
+            Some(Error::Timeout { .. }) => Some(client_error_code::ACCESS_BROKER_TIMEOUT),
+            Some(Error::Client { .. }) | Some(Error::RequestTimeout { .. }) => {
+                Some(client_error_code::BROKER_NOT_EXIST_EXCEPTION)
+            }
+            _ => None,
+        };
+        Err(Error::Client { response_code: code, message: info })
     }
 
     /// Python `send` 的批量分支（`_send_batch`）。

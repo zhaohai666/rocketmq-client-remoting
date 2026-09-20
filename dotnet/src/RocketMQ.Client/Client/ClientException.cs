@@ -2,6 +2,22 @@
 namespace RocketMQ.Client;
 
 /// <summary>
+/// 对应 org.apache.rocketmq.client.exception.ClientErrorCode（Python 同名类）。
+///
+/// sendDefaultImpl 重试耗尽后用它给最终的 MQClientException 定性：
+/// 连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
+/// 地址服务器没给地址→10004，路由查不到→10005。
+/// </summary>
+public static class ClientErrorCode
+{
+    public const int ConnectBrokerException = 10001;
+    public const int AccessBrokerTimeout = 10002;
+    public const int BrokerNotExistException = 10003;
+    public const int NoNameServerException = 10004;
+    public const int NotFoundTopicException = 10005;
+}
+
+/// <summary>
 /// 对应 Python MQClientException(message, responseCode)；默认 1（UNKNOWN）。
 /// 管理端靠它把 broker 响应码透传出来——例如 resetOffsetNew 需要区分
 /// CONSUMER_NOT_ONLINE 才能退化到 resetOffsetByTimestampOld。

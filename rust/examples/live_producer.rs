@@ -22,6 +22,8 @@
 //!   UNKNOW 被 broker 经心跳登记的连接**回查**，回查后提交的最终状态生效。
 //! - P7 **管理便捷方法**：`create_topic` 经 TBW102 真建出 topic、四个 offset RPC、
 //!   按 key 查消息、`view_message` 按 Python 的行为明确报错。
+//! - P8 **发送重试内核**：可重试码集合与 Java 对齐、单次超时上限与「非 SEND_OK 换
+//!   broker」开关不影响真集群上的正常发送、没有路由时按错误码定性而非空转重试。
 //!
 //! 用法（先按项目记忆里的 runbook 起本地集群）：
 //! ```text
@@ -43,8 +45,9 @@ use rocketmq_client_remoting::client::hook::{
 use rocketmq_client_remoting::client::mq_client::{MQClientInstance, TraceDispatcher};
 use rocketmq_client_remoting::client::producer::{
     ClosureSendCallback, DefaultMQProducer, SelectMessageQueueByHash, SendCallback,
-    TransactionListener, TransactionMQProducer,
+    TransactionListener, TransactionMQProducer, DEFAULT_RETRY_RESPONSE_CODES,
 };
+use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::client::request_reply::request_future_holder;
 use rocketmq_client_remoting::client::result::{
     LocalTransactionState, SendResult, SendStatus, TransactionSendResult,
@@ -1252,6 +1255,91 @@ async fn p7_admin(
     Ok(())
 }
 
+// ---------------------------------------------------------------- P8 重试内核
+
+/// 发送重试内核（`sendDefaultImpl`）里**能上真集群**的那几面：可重试码集合、
+/// 单次超时上限、非 SEND_OK 换 broker 开关，以及彻底拿不到路由时的定性。
+///
+/// 「broker 回可重试码就换一台」「慢 broker 吃光预算报 call timeout」「端口拒绝报
+/// 10001」这三条要的是 broker 主动回错误码 / 慢到吃掉预算 / 端口拒连 —— 真集群一台
+/// 健康的单 broker 都给不了，留在 `src/client/producer/send_retry_tests.rs` 的
+/// 进程内假集群里对拍（与 python/cpp 的同题用例一一对应）。
+async fn p8_send_retry_kernel(
+    p: &DefaultMQProducer,
+    topic: &str,
+    run: &str,
+    ck: &mut Checker,
+) -> Live {
+    let defaults: Vec<i32> = DEFAULT_RETRY_RESPONSE_CODES.to_vec();
+    ck.check(
+        "P8 the default retryable broker codes are exactly the Java eight",
+        defaults == [1, 2, 14, 16, 17, 204, 205, 1500]
+            && p.get_retry_response_codes().len() == 8
+            && p.is_retry_response_code(Some(response_code::SERVICE_NOT_AVAILABLE))
+            // 没等到响应码（压根没连上）等于不可重试；不在集合里的码也不可重试
+            && !p.is_retry_response_code(None)
+            && !p.is_retry_response_code(Some(response_code::MESSAGE_ILLEGAL)),
+        &format!("{defaults:?}"),
+    );
+
+    p.add_retry_response_code(response_code::MESSAGE_ILLEGAL);
+    p.set_send_msg_max_timeout_per_request(2000);
+    p.set_retry_another_broker_when_not_store_ok(true);
+    let mut capped = 0usize;
+    for i in 0..10 {
+        let mut m = msg(topic, format!("retry-kernel-{i}").as_bytes(), "", "");
+        if matches!(p.send(&mut m, Some(5000), None).await, Ok(r) if r.status == SendStatus::SendOk)
+        {
+            capped += 1;
+        }
+    }
+    ck.check(
+        "P8 a per-request cap plus the not-store-ok switch leaves healthy sends SEND_OK",
+        capped == 10
+            && p.get_send_msg_max_timeout_per_request() == 2000
+            && p.is_retry_another_broker_when_not_store_ok()
+            && p.is_retry_response_code(Some(response_code::MESSAGE_ILLEGAL)),
+        &format!("send_ok={capped}/10"),
+    );
+    p.set_retry_another_broker_when_not_store_ok(false);
+    p.set_send_msg_max_timeout_per_request(-1);
+
+    // 路由彻底拉不到：这次连 namesrv 都拒了。Python 参考实现刻意**不**把传输层失败
+    // 粉饰成「没有路由」（`mq_client.py` 的 `_fetch` 只在 broker 回了错误码时才往下传），
+    // 所以这里断言的是：原样报连接失败，且一次 broker 都没联系、重试次数没被空转掉。
+    let dead_addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "127.0.0.1:1".to_string());
+    let orphan = DefaultMQProducer::new(&format!("PID_rust_orphan_{run}"))
+        .map_err(|e| format!("orphan producer: {e}"))?;
+    orphan.set_namesrv_addr(&dead_addr);
+    orphan.set_instance_name(&format!("{run}-orphan"));
+    if let Err(e) = orphan.start().await {
+        orphan.shutdown();
+        return Err(format!("orphan start against {dead_addr}: {e}"));
+    }
+    let mut m = msg(&format!("RustLiveNoRoute_{run}"), b"no-route", "", "");
+    let began = Instant::now();
+    let outcome = orphan.send(&mut m, Some(2000), None).await;
+    let elapsed = began.elapsed();
+    let detail = match &outcome {
+        Ok(r) => format!("unexpectedly sent: {:?}", r.status),
+        Err(e) => format!("{e}"),
+    };
+    let burned_retries = matches!(&outcome, Err(e) if e.to_string().contains("Send ["));
+    ck.check(
+        "P8 a dead name server surfaces the transport failure once, without burning retries",
+        matches!(outcome.err(), Some(Error::Connect { .. }))
+            && !burned_retries
+            && elapsed < Duration::from_millis(500),
+        &format!("elapsed={}ms {detail}", elapsed.as_millis()),
+    );
+    orphan.shutdown();
+    Ok(())
+}
+
 // ------------------------------------------------------------------- main
 
 async fn run(namesrv: &str) -> Checker {
@@ -1350,6 +1438,10 @@ async fn run(namesrv: &str) -> Checker {
         (
             "P7 admin",
             p7_admin(&p, &instance, namesrv, &topic, &broker_name, &broker_addr, &run, &mut ck).await,
+        ),
+        (
+            "P8 send retry kernel",
+            p8_send_retry_kernel(&p, &topic, &run, &mut ck).await,
         ),
     ];
     for (name, outcome) in scenarios {

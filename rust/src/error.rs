@@ -4,6 +4,20 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// 对应 `org.apache.rocketmq.client.exception.ClientErrorCode`
+/// （Python `rocketmq/client/exception.py:ClientErrorCode`）。
+///
+/// `sendDefaultImpl` 重试耗尽后用它给最终的 `MQClientException` 定性：
+/// 连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
+/// 地址服务器没给地址→10004，路由查不到→10005。
+pub mod client_error_code {
+    pub const CONNECT_BROKER_EXCEPTION: i32 = 10001;
+    pub const ACCESS_BROKER_TIMEOUT: i32 = 10002;
+    pub const BROKER_NOT_EXIST_EXCEPTION: i32 = 10003;
+    pub const NO_NAME_SERVER_EXCEPTION: i32 = 10004;
+    pub const NOT_FOUND_TOPIC_EXCEPTION: i32 = 10005;
+}
+
 #[derive(Debug)]
 pub enum Error {
     /// RemotingCommandException / RemotingNoCodecException
