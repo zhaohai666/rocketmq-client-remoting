@@ -1606,6 +1606,71 @@ public class DefaultMQProducer
         return publish.MsgQueueList;
     }
 
+    /// <summary>撤回一条定时/延迟消息，返回被撤回消息的 uniqKey。
+    ///
+    /// 校验顺序与 Java <c>DefaultMQProducerImpl#recallMessage</c>(:1570-1601) 逐条对齐：
+    /// 状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 预热路由 → 定位 broker → 发请求。
+    /// 前三步必须在打网络<b>之前</b>跑完，否则一个手滑的句柄就要耗掉一次 RPC 超时。
+    /// 句柄来自定时消息的 <see cref="SendResult.RecallHandle"/>，普通消息没有。</summary>
+    /// <remarks>
+    /// 与 Java 的差异：Java 的 <c>findBrokerAddrByTopic</c> 返回该 topic 的<b>全部</b> broker
+    /// 地址再随机取一个，这里直接取路由里的第一个可用地址——单 broker 场景等价，多 broker
+    /// 场景两者都只会命中句柄里那个 broker 之外的地址，最终由 broker 用
+    /// <c>ILLEGAL_OPERATION</c>（brokerName 不匹配）拒绝，语义不变。
+    /// </remarks>
+    public string RecallMessage(string topic, string recallHandle)
+    {
+        MQClientInstance c = GetClient();
+        string realTopic = _namespace.Length == 0
+            ? topic
+            : NamespaceUtil.WrapNamespace(_namespace, topic);
+        Validators.CheckTopic(realTopic);
+        if (NamespaceUtil.IsRetryTopic(realTopic) || NamespaceUtil.IsDlqTopic(realTopic))
+        {
+            throw new MQClientException("topic is not supported");
+        }
+
+        HandleV1 handle = RecallMessageHandle.DecodeHandle(recallHandle);
+
+        // Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
+        // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
+        TryToFindTopicPublishInfo(c, realTopic);
+
+        // Java findBrokerAddressInPublish(brokerName) → 退化到 findBrokerAddrByTopic(topic)
+        string addr = c.BrokerAddrOf(handle.BrokerName);
+        if (addr.Length == 0)
+        {
+            TopicRouteData? route = c.GetTopicRouteData(realTopic);
+            if (route is not null)
+            {
+                foreach (BrokerData bd in route.BrokerDatas)
+                {
+                    addr = bd.SelectBrokerAddr();
+                    if (addr.Length > 0)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (addr.Length == 0)
+        {
+            ClientLog.Warn("can't find broker service address. " + handle.BrokerName);
+            throw new MQClientException("The broker service address not found");
+        }
+
+        var header = new RecallMessageRequestHeader
+        {
+            ProducerGroup = _producerGroup,
+            Topic = realTopic,
+            RecallHandle = recallHandle,
+            // 继承字段在 Java 里反射名就是 bname，写成 brokerName 会被 broker 静默丢掉。
+            Bname = handle.BrokerName,
+        };
+        return c.RecallMessage(addr, header, _sendMsgTimeout);
+    }
+
     public void CreateTopic(string key, string newTopic, int queueNum = 4)
     {
         MQClientInstance c = GetClient();

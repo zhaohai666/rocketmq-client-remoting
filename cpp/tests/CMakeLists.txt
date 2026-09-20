@@ -128,3 +128,8 @@ add_test(NAME validators COMMAND rmq_test_validators)
 add_executable(rmq_test_broker_requests test_broker_requests.cpp)
 target_link_libraries(rmq_test_broker_requests PRIVATE rocketmq::remoting)
 add_test(NAME broker_requests COMMAND rmq_test_broker_requests)
+
+# 定时消息撤回（370）：句柄编解码对拍 Java 向量 + bname 键名 + 本地校验顺序（不打网络）
+add_executable(rmq_test_recall_message test_recall_message.cpp)
+target_link_libraries(rmq_test_recall_message PRIVATE rocketmq::remoting)
+add_test(NAME recall_message COMMAND rmq_test_recall_message)

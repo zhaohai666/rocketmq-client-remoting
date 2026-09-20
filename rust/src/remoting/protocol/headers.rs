@@ -136,7 +136,6 @@ impl fmt::Debug for dyn CustomHeader + '_ {
 }
 
 
-//   SendMessageResponseHeader: java-only fields ["recallHandle"]
 //   GetMaxOffsetRequestHeader: java-only fields ["committed"]
 //   SearchOffsetRequestHeader: java-only fields ["liteTopic", "boundaryType"]
 //   QueryMessageResponseHeader: java-only fields ["indexLastUpdatePhyoffset"]
@@ -230,6 +229,37 @@ header_struct! {
         queue_offset: l => "queueOffset",
         transaction_id: s => "transactionId",
         batch_uniq_id: s => "batchUniqId",
+        // 只给定时/延迟消息（Java `SendMessageProcessor#attachRecallHandle`），
+        // 普通消息解出来是 `None`。见 `crate::common::recall_message_handle`。
+        recall_handle: s => "recallHandle",
+
+    }
+}
+
+header_struct! {
+/// 定时/延迟消息撤回请求（`RECALL_MESSAGE` 370）。
+///
+/// 对应 Java ``org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader``。
+/// ⚠ `broker_name` 走的是继承来的 `RpcRequestHeader.bname`，反射名是 ``bname`` 而不是
+/// ``brokerName``，写错 broker 侧静默丢字段。
+///
+/// extFields: `org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader`
+    RecallMessageRequestHeader {
+        producer_group: s => "producerGroup",
+        topic: s => "topic",
+        recall_handle: s => "recallHandle",
+        bname: s => "bname",
+
+    }
+}
+
+header_struct! {
+/// `recallMessage` 的响应：撤回动作本身是一条写进定时队列的删除消息，
+/// Java 回填它的 uniqId（等于被撤回消息的 UNIQ_KEY），调用方拿它确认撤回生效。
+///
+/// extFields: `org.apache.rocketmq.remoting.protocol.header.RecallMessageResponseHeader`
+    RecallMessageResponseHeader {
+        msg_id: s => "msgId",
 
     }
 }
@@ -1031,7 +1061,9 @@ const JAVA_HEADER_FIELDS: &[(&str, &[&str])] = &[
     ("SendMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "maxReconsumeTimes", "batch", ]),
     ("SendMessageRequestHeaderV2", &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", ]),
     ("ReplyMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "bornHost", "storeHost", "storeTimestamp", ]),
-    ("SendMessageResponseHeader", &["msgId", "queueId", "queueOffset", "transactionId", "batchUniqId", ]),
+    ("SendMessageResponseHeader", &["msgId", "queueId", "queueOffset", "transactionId", "batchUniqId", "recallHandle", ]),
+    ("RecallMessageRequestHeader", &["producerGroup", "topic", "recallHandle", "bname", ]),
+    ("RecallMessageResponseHeader", &["msgId", ]),
     ("PullMessageRequestHeader", &["consumerGroup", "topic", "liteTopic", "queueId", "queueOffset", "maxMsgNums", "sysFlag", "commitOffset", "suspendTimeoutMillis", "subscription", "subVersion", "expressionType", "maxMsgBytes", "requestSource", "proxyFrowardClientId", ]),
     ("PullMessageResponseHeader", &["nextBeginOffset", "minOffset", "maxOffset", "suggestWhichBrokerId", "topicSysFlag", "groupSysFlag", "forbiddenType", "offsetDelta", ]),
     ("QueryConsumerOffsetRequestHeader", &["consumerGroup", "topic", "queueId", "setZeroIfNotFound", ]),
@@ -1404,6 +1436,52 @@ mod tests {
         let mut back = CreateTopicRequestHeader::default();
         back.from_ext_fields(&ext);
         assert_eq!(back, full);
+    }
+
+    /// `RECALL_MESSAGE`(370) 的三条字段名守卫。
+    ///
+    /// ⚠ `bname` 是从 `RpcRequestHeader` 继承下来的，反射名不是 `brokerName`；
+    /// 写成后者 broker 收不到值，而 Java 客户端会照写 `bname`。
+    #[test]
+    fn recall_message_headers_use_java_keys() {
+        let h = RecallMessageRequestHeader {
+            producer_group: Some(GROUP.into()),
+            topic: Some(TOPIC.into()),
+            recall_handle: Some("djEgVG9waWNBIGJyb2tlci1h".into()),
+            bname: Some("broker-a".into()),
+        };
+        let mut ext = ExtFields::new();
+        h.to_ext_fields(&mut ext);
+        assert_eq!(
+            keys(&ext),
+            vec!["producerGroup", "topic", "recallHandle", "bname"]
+        );
+        let mut back = RecallMessageRequestHeader::default();
+        back.from_ext_fields(&ext);
+        assert_eq!(back, h);
+
+        let mut ext = ExtFields::new();
+        ext.insert("msgId", "0123456789ABCDEF0123456789abcdef");
+        let mut resp = RecallMessageResponseHeader::default();
+        resp.from_ext_fields(&ext);
+        assert_eq!(
+            resp.msg_id.as_deref(),
+            Some("0123456789ABCDEF0123456789abcdef")
+        );
+
+        // 定时消息的 recallHandle 由 broker 下发，普通消息不带这个键。
+        let mut ext = ExtFields::new();
+        ext.insert("msgId", "offset-msg-id");
+        ext.insert("queueId", "3");
+        ext.insert("queueOffset", "77");
+        ext.insert("recallHandle", "djEgVG9waWNBIGJyb2tlci1h");
+        let mut send_resp = SendMessageResponseHeader::default();
+        send_resp.from_ext_fields(&ext);
+        assert_eq!(
+            send_resp.recall_handle.as_deref(),
+            Some("djEgVG9waWNBIGJyb2tlci1h")
+        );
+        assert_eq!(send_resp.batch_uniq_id, None);
     }
 
     /// `QueryMessageRequestHeader`（`cpp/tests/test_admin.cpp` 的往返守卫）。

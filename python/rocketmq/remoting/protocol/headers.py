@@ -224,6 +224,9 @@ class SendMessageResponseHeader(CommandCustomHeader):
         self.queue_offset: Optional[int] = None
         self.transaction_id: Optional[str] = None
         self.batch_uniq_id: Optional[str] = None
+        # 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
+        # TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 None。
+        self.recall_handle: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
         return _ext({
@@ -232,6 +235,7 @@ class SendMessageResponseHeader(CommandCustomHeader):
             "queueOffset": self.queue_offset,
             "transactionId": self.transaction_id,
             "batchUniqId": self.batch_uniq_id,
+            "recallHandle": self.recall_handle,
         })
 
     def from_ext_fields(self, ext: dict) -> None:
@@ -240,6 +244,50 @@ class SendMessageResponseHeader(CommandCustomHeader):
         self.queue_offset = _l(ext.get("queueOffset"))
         self.transaction_id = ext.get("transactionId")
         self.batch_uniq_id = ext.get("batchUniqId")
+        self.recall_handle = ext.get("recallHandle")
+
+
+class RecallMessageRequestHeader(CommandCustomHeader):
+    """对应 org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader。
+
+    ⚠ Java 侧继承 ``TopicRequestHeader`` → ``RpcRequestHeader``，父类字段 ``bname`` 的
+    **反射名就是 bname**（不是 brokerName）：写成 ``brokerName`` 会被 broker 静默丢掉。
+    broker 的 RecallMessageProcessor 其实只用 topic/producerGroup/recallHandle，
+    校验句柄里的 brokerName 也是从 handle 解出来的，但报文仍要与 Java 一致。
+    """
+
+    def __init__(self):
+        self.producer_group: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.recall_handle: Optional[str] = None
+        self.bname: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "producerGroup": self.producer_group,
+            "topic": self.topic,
+            "recallHandle": self.recall_handle,
+            "bname": self.bname,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.producer_group = ext.get("producerGroup")
+        self.topic = ext.get("topic")
+        self.recall_handle = ext.get("recallHandle")
+        self.bname = ext.get("bname")
+
+
+class RecallMessageResponseHeader(CommandCustomHeader):
+    """对应 RecallMessageResponseHeader：Java 只有一个字段 ``msgId``。"""
+
+    def __init__(self):
+        self.msg_id: Optional[str] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({"msgId": self.msg_id})
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.msg_id = ext.get("msgId")
 
 
 # ---------------- 拉取消息 ----------------

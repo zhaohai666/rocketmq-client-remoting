@@ -168,6 +168,12 @@ public:
                            const MessageQueue& mq, int32_t timeoutMillis = 3000,
                            int32_t sysFlag = 0);
 
+    // ---------------- 定时消息撤回 ----------------
+    // RECALL_MESSAGE(370)，对应 Java MQClientAPIImpl#recallMessage(:3749-3767)：
+    // SUCCESS 才取响应头 msgId（被撤回消息的 uniqKey），其余码一律抛 MQBrokerException。
+    std::string recallMessage(const std::string& addr, const RecallMessageRequestHeader& header,
+                              int32_t timeoutMillis = 3000);
+
     // ---------------- 消息拉取 ----------------
     PullResult pullMessage(const std::string& consumerGroup, const MessageQueue& mq,
                            int64_t queueOffset, int32_t maxMsgNums, int32_t sysFlag,

@@ -65,3 +65,7 @@ target_link_libraries(rmq_live_hook PRIVATE rocketmq::remoting)
 # 名字校验（Validators/TopicValidator）真机联调：本地快拒 + 合法名字照常收发 + 往返对照（不打进 ctest）
 add_executable(rmq_validators_live validators_live.cpp)
 target_link_libraries(rmq_validators_live PRIVATE rocketmq::remoting)
+
+# 定时消息撤回（370）真机联调：句柄往返 + 撤回后到点不投递 + broker 开关还原（不打进 ctest）
+add_executable(rmq_recall_live recall_live.cpp)
+target_link_libraries(rmq_recall_live PRIVATE rocketmq::remoting)

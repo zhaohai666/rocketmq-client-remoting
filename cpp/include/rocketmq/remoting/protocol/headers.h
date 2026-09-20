@@ -133,6 +133,30 @@ struct SendMessageResponseHeader : public CommandCustomHeader {
     std::optional<int64_t> queueOffset;
     std::optional<std::string> transactionId;
     std::optional<int64_t> msgRegion;
+    // 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
+    // TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 nullopt。
+    std::optional<std::string> recallHandle;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// 对应 org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader。
+// ⚠ Java 侧继承 TopicRequestHeader → RpcRequestHeader，父类字段 bname 的**反射名就是
+// bname**（不是 brokerName）：写成 brokerName 会被 broker 静默丢掉。
+struct RecallMessageRequestHeader : public CommandCustomHeader {
+    std::optional<std::string> producerGroup;
+    std::optional<std::string> topic;
+    std::optional<std::string> recallHandle;
+    std::optional<std::string> bname;
+
+    PropertyMap toExtFields() const override;
+    void fromExtFields(const PropertyMap& ext) override;
+};
+
+// 对应 RecallMessageResponseHeader：Java 只有一个字段 msgId（被撤回消息的 uniqKey）。
+struct RecallMessageResponseHeader : public CommandCustomHeader {
+    std::optional<std::string> msgId;
 
     PropertyMap toExtFields() const override;
     void fromExtFields(const PropertyMap& ext) override;

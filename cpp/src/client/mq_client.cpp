@@ -567,6 +567,8 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
                                        respHeader.queueId.value_or(mq.queueId));
     result.queueOffset = respHeader.queueOffset.value_or(0);
     result.transactionId = respHeader.transactionId.value_or("");
+    // 定时/延迟消息才有；普通消息恒为 nullopt（对齐 Java processSendResponse:798）。
+    result.recallHandle = respHeader.recallHandle;
     // MSG_REGION / TRACE_ON 来自响应头 extFields（对齐 Java processSendResponse）。
     // 缺省 region=DefaultRegion，traceOn=true（Java: !"false".equals(TRACE_ON)）。
     auto regionIt = response.extFields.find(MessageConst::PROPERTY_MSG_REGION);
@@ -577,6 +579,25 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
         (traceIt != response.extFields.end()) ? traceIt->second : std::string();
     result.traceOn = (traceOn != "false");
     return result;
+}
+
+std::string MQClientInstance::recallMessage(const std::string& addr,
+                                            const RecallMessageRequestHeader& header,
+                                            int32_t timeoutMillis) {
+    // 对应 Java MQClientAPIImpl#recallMessage(:3749-3767)：只有 SUCCESS 才读响应头的
+    // msgId（= 被撤回那条消息的 UNIQ_KEY，broker 的 RecallMessageProcessor 直接回填
+    // handle.messageId），其余码原样抛 MQBrokerException 让调用方看到 ILLEGAL_OPERATION
+    // 之类的真实原因。
+    RemotingCommand request = RemotingCommand::createRequestCommand(
+        RequestCode::RECALL_MESSAGE, std::make_shared<RecallMessageRequestHeader>(header));
+    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    checkResponseCode(response);
+    RecallMessageResponseHeader respHeader;
+    respHeader.fromExtFields(response.extFields);
+    if (!respHeader.msgId.has_value() || respHeader.msgId->empty()) {
+        throw MQBrokerException(response.code, "recall message response has no msgId");
+    }
+    return *respHeader.msgId;
 }
 
 void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const Message& msg,

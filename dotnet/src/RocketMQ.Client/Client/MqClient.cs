@@ -782,6 +782,8 @@ public sealed class MQClientInstance : IDisposable
             TransactionId = respHeader.TransactionId ?? string.Empty,
             RegionId = regionId,
             TraceOn = traceOn,
+            // 定时/延迟消息才有；普通消息恒为 null（对齐 Java processSendResponse:798）。
+            RecallHandle = respHeader.RecallHandle,
         };
     }
 
@@ -818,6 +820,31 @@ public sealed class MQClientInstance : IDisposable
         RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
         request.MarkOnewayRpc();
         _remotingClient.InvokeOneway(addr, request);
+    }
+
+    // ---------------- 定时消息撤回 ----------------
+
+    /// <summary>
+    /// RECALL_MESSAGE(370)，对应 Java MQClientAPIImpl#recallMessage(:3749-3767)。
+    ///
+    /// 与 Java 一样：只有 SUCCESS 才取响应头的 msgId（= 被撤回那条消息的 UNIQ_KEY，
+    /// broker 的 RecallMessageProcessor 直接把 handle.messageId 回填回来），
+    /// 其余码原样抛 MQBrokerException，让调用方看到 ILLEGAL_OPERATION 之类的真实原因。
+    /// SUCCESS 但没有 msgId 也判失败——拿到空串当成功会让上层以为撤回了别的东西。
+    /// </summary>
+    public string RecallMessage(string addr, RecallMessageRequestHeader header,
+        int timeoutMillis = 3000)
+    {
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.RecallMessage, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+        var respHeader = new RecallMessageResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        if (string.IsNullOrEmpty(respHeader.MsgId))
+        {
+            throw new MQBrokerException(response.Code, "recall message response has no msgId");
+        }
+        return respHeader.MsgId!;
     }
 
     // ---------------- Request-Reply：接收 broker 推回的应答（326）----------------

@@ -47,6 +47,9 @@ public class SendResult
     public string RegionId { get; set; } = string.Empty;
     // broker 在 SEND 响应头 TRACE_ON 里告知是否落轨迹（"false" 才关，缺省 true）。
     public bool TraceOn { get; set; } = true;
+    // 对应 Java SendResult.recallHandle：只有定时/延迟消息才有（broker 在 SEND 响应头里
+    // 挂回 recallHandle），普通消息恒为 null。原样传给 RecallMessage() 即可撤回。
+    public string? RecallHandle { get; set; }
 
     public override string ToString() =>
         "SendResult [sendStatus=" + SendStatusNames.Name(SendStatus)

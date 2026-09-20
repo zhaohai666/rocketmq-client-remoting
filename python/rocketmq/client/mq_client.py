@@ -43,7 +43,9 @@ from ..remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHead
                                          PullMessageRequestHeader,
                                          PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
                                          QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader,
-                                         QueryMessageResponseHeader, ReplyMessageRequestHeader,
+                                         QueryMessageResponseHeader,
+                                         RecallMessageRequestHeader, RecallMessageResponseHeader,
+                                         ReplyMessageRequestHeader,
                                          ResetOffsetRequestHeader,
                                          SearchOffsetRequestHeader,
                                          SearchOffsetResponseHeader, SendMessageRequestHeader,
@@ -649,7 +651,27 @@ class MQClientInstance:
             region_id = ext.get(MessageConst.PROPERTY_MSG_REGION)
             result.region_id = region_id if region_id else MixAll.DEFAULT_TRACE_REGION_ID
             result.trace_on = str(ext.get(MessageConst.PROPERTY_TRACE_SWITCH)) != "false"
+            result.recall_handle = header.recall_handle
             return result
+        raise MQBrokerException(response.code, response.remark or "")
+
+    # ---------------- 定时消息撤回 ----------------
+    def recall_message(self, addr: str, header: RecallMessageRequestHeader,
+                       timeout_millis: int) -> str:
+        """RECALL_MESSAGE(370)，对应 Java ``MQClientAPIImpl#recallMessage``(:3749-3767)。
+
+        与 Java 一样：SUCCESS 才取响应头的 ``msgId``（被撤回那条消息的 UNIQ_KEY），
+        其余码一律抛 ``MQBrokerException``。
+        """
+        request = RemotingCommand.create_request_command(RequestCode.RECALL_MESSAGE, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        if response.code == ResponseCode.SUCCESS:
+            resp_header = RecallMessageResponseHeader()
+            resp_header.from_ext_fields(response.ext_fields)
+            if not resp_header.msg_id:
+                raise MQBrokerException(response.code,
+                                        "recall message response has no msgId, addr %s" % addr)
+            return resp_header.msg_id
         raise MQBrokerException(response.code, response.remark or "")
 
     # ---------------- Request-Reply：接收 broker 推回的应答 ----------------

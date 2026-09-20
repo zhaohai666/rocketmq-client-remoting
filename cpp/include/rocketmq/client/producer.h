@@ -209,6 +209,12 @@ public:
                                          int32_t maxNum, int64_t beginTimestamp,
                                          int64_t endTimestamp);
     std::vector<MessageQueue> fetchPublishMessageQueues(const std::string& topic);
+
+    // ---------------- 定时消息撤回（对应 Java recallMessage）----------------
+    // 撤回一条定时/延迟消息，返回被撤回消息的 uniqKey。句柄来自定时消息的
+    // SendResult.recallHandle（对应 Java DefaultMQProducer#recallMessage(:1140) 会先给
+    // topic 套 namespace，所以这里传**业务原始 topic**）。
+    std::string recallMessage(const std::string& topic, const std::string& recallHandle);
     void createTopic(const std::string& key, const std::string& newTopic, int32_t queueNum = 4);
     int64_t searchOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t maxOffset(const MessageQueue& mq);

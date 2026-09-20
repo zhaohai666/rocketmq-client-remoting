@@ -11,6 +11,7 @@
 #define ROCKETMQ_CLIENT_RESULT_H
 
 #include <cstdint>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -50,6 +51,9 @@ struct SendResult {
     // broker 是否开启轨迹（由 SEND 响应头 TRACE_ON 解析，默认 true）。
     // 轨迹钩子据此决定是否落轨迹（traceOn=false 或 regionId 为空则不落）。
     bool traceOn = true;
+    // 对应 Java SendResult.recallHandle：只有定时/延迟消息才有（broker 在 SEND 响应头
+    // 里挂回 recallHandle），普通消息恒为 nullopt。原样传给 recallMessage() 即可撤回。
+    std::optional<std::string> recallHandle;
 
     SendStatus getSendStatus() const { return sendStatus; }
     const std::string& getMsgId() const { return msgId; }
@@ -57,6 +61,7 @@ struct SendResult {
     int64_t getQueueOffset() const { return queueOffset; }
     const std::string& getTransactionId() const { return transactionId; }
     void setTransactionId(const std::string& id) { transactionId = id; }
+    const std::optional<std::string>& getRecallHandle() const { return recallHandle; }
 
     std::string toString() const {
         return std::string("SendResult [sendStatus=") + sendStatusName(sendStatus)

@@ -257,6 +257,9 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
     public long? QueueOffset { get; set; }
     public string? TransactionId { get; set; }
     public long? MsgRegion { get; set; }
+    // 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
+    // TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 null。
+    public string? RecallHandle { get; set; }
 
     public PropertyMap ToExtFields()
     {
@@ -266,6 +269,7 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
         HeaderCodec.PutOptLong(outMap, "queueOffset", QueueOffset);
         HeaderCodec.PutOptStr(outMap, "transactionId", TransactionId);
         HeaderCodec.PutOptLong(outMap, "msgRegion", MsgRegion);
+        HeaderCodec.PutOptStr(outMap, "recallHandle", RecallHandle);
         return outMap;
     }
 
@@ -276,6 +280,54 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
         QueueOffset = HeaderCodec.GetOptLong(ext, "queueOffset");
         TransactionId = HeaderCodec.GetOptStr(ext, "transactionId");
         MsgRegion = HeaderCodec.GetOptLong(ext, "msgRegion");
+        RecallHandle = HeaderCodec.GetOptStr(ext, "recallHandle");
+    }
+}
+
+// 对应 org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader。
+// ⚠ Java 侧继承 TopicRequestHeader → RpcRequestHeader，父类字段 bname 的**反射名就是
+// bname**（不是 brokerName）：写成 brokerName 会被 broker 静默丢掉。
+public sealed class RecallMessageRequestHeader : ICommandCustomHeader
+{
+    public string? ProducerGroup { get; set; }
+    public string? Topic { get; set; }
+    public string? RecallHandle { get; set; }
+    public string? Bname { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "producerGroup", ProducerGroup);
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
+        HeaderCodec.PutOptStr(outMap, "recallHandle", RecallHandle);
+        HeaderCodec.PutOptStr(outMap, "bname", Bname);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        ProducerGroup = HeaderCodec.GetOptStr(ext, "producerGroup");
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
+        RecallHandle = HeaderCodec.GetOptStr(ext, "recallHandle");
+        Bname = HeaderCodec.GetOptStr(ext, "bname");
+    }
+}
+
+// 对应 RecallMessageResponseHeader：Java 只有一个字段 msgId（被撤回消息的 uniqKey）。
+public sealed class RecallMessageResponseHeader : ICommandCustomHeader
+{
+    public string? MsgId { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "msgId", MsgId);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        MsgId = HeaderCodec.GetOptStr(ext, "msgId");
     }
 }
 

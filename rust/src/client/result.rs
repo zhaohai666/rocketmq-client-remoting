@@ -64,6 +64,9 @@ pub struct SendResult {
     pub transaction_id: Option<String>,
     pub offset_msg_id: Option<String>,
     pub region_id: Option<String>,
+    /// 定时/延迟消息的撤回句柄（Java `SendResult.recallHandle`，来自 SEND 响应头的
+    /// `recallHandle`）。普通消息恒为 `None`。
+    pub recall_handle: Option<String>,
     /// 轨迹开关：来自 SEND 响应头的 `TRACE_ON`。Java 的判据是
     /// `!"false".equals(extFields.get("TRACE_ON"))`，所以默认为 true。
     pub trace_on: bool,
@@ -79,6 +82,7 @@ impl Default for SendResult {
             transaction_id: None,
             offset_msg_id: None,
             region_id: None,
+            recall_handle: None,
             trace_on: true,
         }
     }

@@ -67,6 +67,7 @@ use crate::common::message_const::{
 use crate::common::message_decoder::{decode_message, decode_message_id, decode_messages};
 use crate::common::message_type::MessageType;
 use crate::common::mix_all::MixAll;
+use crate::common::recall_message_handle;
 use crate::common::sysflag::{MessageSysFlag, PermName};
 use crate::common::util_all::{current_time_millis, java_string_hash, monotonic_millis};
 use crate::error::{client_error_code, Error, Result};
@@ -76,6 +77,7 @@ use crate::remoting::protocol::ext_fields::CustomHeader;
 use crate::remoting::protocol::headers::{
     CheckTransactionStateRequestHeader, EndTransactionRequestHeader,
     GetEarliestMsgStoretimeRequestHeader, GetEarliestMsgStoretimeResponseHeader,
+    RecallMessageRequestHeader,
 };
 use crate::remoting::protocol::heartbeat::{HeartbeatData, ProducerData};
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
@@ -2473,6 +2475,65 @@ impl DefaultMQProducer {
                 }
             }
         }
+    }
+}
+
+// ================================================================ 定时消息撤回
+
+/// 对应 Java `DefaultMQProducerImpl#recallMessage`（`DefaultMQProducer` 上也有一份同名
+/// 转发）。
+impl DefaultMQProducer {
+    /// 撤回一条**定时/延迟**消息（`RECALL_MESSAGE` 370），成功返回被撤回消息的 uniqKey。
+    ///
+    /// `recall_handle` 来自定时消息 [`SendResult::recall_handle`]（Java 在
+    /// `MQClientAPIImpl#processSendResponse:798` 从 SEND 响应头透传）。
+    ///
+    /// 校验顺序照 Java `DefaultMQProducerImpl:1570-1601`：状态 → topic 名 → 拒
+    /// `%RETRY%`/`%DLQ%` → 解 handle → 刷路由 → 定 broker。
+    ///
+    /// ⚠ broker 侧默认 `recallMessageEnable=false`（Java `BrokerConfig:546`），关掉时
+    /// 直接回 `NO_PERMISSION`，不是客户端问题。
+    pub async fn recall_message(&self, topic: &str, recall_handle: &str) -> Result<String> {
+        let client = self.require_client()?;
+        let topic = self.with_namespace(topic);
+        validators::check_topic(&topic)?;
+        if MixAll::is_retry_topic(Some(topic.as_str())) || MixAll::is_dlq_topic(Some(topic.as_str())) {
+            return Err(Error::client("topic is not supported"));
+        }
+        let handle = recall_message_handle::decode_handle(recall_handle)?;
+        // Java `tryToFindTopicPublishInfo(topic)`：返回值不使用，但**异常照抛**
+        // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
+        self.topic_publish_info(&client, &topic).await?;
+        // 优先按 handle 里的 brokerName 定位；拿不到再退到该 topic 路由里的任一 broker
+        // （Java `findBrokerAddressInPublish` / `findBrokerAddrByTopic`）。
+        let addr = client
+            .broker_addr_of(&handle.broker_name)
+            .or_else(|| {
+                client
+                    .route_of(&topic)
+                    .and_then(|route| {
+                        route
+                            .get_broker_datas()
+                            .iter()
+                            .find_map(|bd| bd.select_broker_addr())
+                    })
+            })
+            .ok_or_else(|| {
+                // Java 先 log.warn 再抛，文案照抄。
+                rmq_warn!(
+                    "can't find broker service address. {}",
+                    handle.broker_name
+                );
+                Error::client("The broker service address not found")
+            })?;
+        let header = RecallMessageRequestHeader {
+            producer_group: Some(self.inner.producer_group()),
+            topic: Some(topic.clone()),
+            recall_handle: Some(recall_handle.to_string()),
+            bname: Some(handle.broker_name.clone()),
+        };
+        let timeout = self.read_cfg(|c| c.send_msg_timeout);
+        client.recall_message(&addr, header, timeout).await
     }
 }
 

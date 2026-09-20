@@ -45,6 +45,7 @@ internal static class Program
                 "tls" => LiveTls.Run(rest),
                 "hook" => LiveHook.Run(rest),
                 "validators-live" => LiveValidators.Run(rest),
+                "recall" => LiveRecall.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -83,6 +84,7 @@ internal static class Program
               trace        [namesrv]        真实集群消息轨迹联调（需 broker traceTopicEnable=true）
               hook         [namesrv]        真实集群 CheckForbidden/FilterMessage 钩子联调
               validators-live [namesrv]     真实集群名字校验联调（本地快拒 + 合法名字收发 + 往返对照）
+              recall     [namesrv]        真实集群定时消息撤回联调（需 broker 开 recallMessageEnable，脚本负责还原）
             """);
     }
 }

@@ -18,6 +18,7 @@ from ..common.message_accessor import MessageAccessor
 from ..common.message_const import MessageConst
 from ..common.message_decoder import _compress, decode_message, decode_message_id
 from ..common.message_type import MessageType
+from ..common import recall_message_handle
 from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
 from ..logging import get_logger
@@ -25,7 +26,8 @@ from ..remoting.exception import (RemotingConnectException, RemotingException,
                                   RemotingTimeoutException, RemotingTooMuchRequestException)
 from ..remoting.protocol.codes import RequestCode, ResponseCode
 from ..remoting.protocol.headers import (CheckTransactionStateRequestHeader,
-                                         EndTransactionRequestHeader)
+                                         EndTransactionRequestHeader,
+                                         RecallMessageRequestHeader)
 from ..remoting.protocol.heartbeat import HeartbeatData, ProducerData
 from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
@@ -880,6 +882,45 @@ class DefaultMQProducer:
             # arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
             return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag, arg=arg)
         return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+
+    # ---------------- 定时消息撤回（对应 Java recallMessage）----------------
+    def recall_message(self, topic: str, recall_handle: str) -> str:
+        """撤回一条定时/延迟消息，返回被撤回消息的 uniqKey。
+
+        校验顺序与 Java ``DefaultMQProducerImpl#recallMessage``(:1570-1601) 逐条对齐：
+        状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 预热路由 → 定位 broker → 发请求。
+        句柄来自定时消息的 ``SendResult.recall_handle``，普通消息没有。
+
+        与 Java 的差异：Java 的 ``findBrokerAddrByTopic`` 返回该 topic 的**全部** broker
+        地址再随机取一个，这里直接取路由里的第一个可用地址——单 broker 场景等价，
+        多 broker 场景两者都只会命中句柄里那个 broker 之外的地址，最终由 broker 用
+        ``ILLEGAL_OPERATION``（brokerName 不匹配）拒绝，语义不变。
+        """
+        client = self._require_client()
+        topic = self._with_namespace(topic)
+        validators.check_topic(topic)
+        if MixAll.is_retry_topic(topic) or MixAll.is_dlq_topic(topic):
+            raise MQClientException("topic is not supported")
+        handle = recall_message_handle.decode_handle(recall_handle)
+        # Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
+        # （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
+        self._topic_publish_info(topic)
+        addr = client.broker_addr_of(handle.broker_name)
+        if addr is None:
+            route = client.get_topic_route_data(topic)
+            for broker_data in route.get_broker_datas() if route else []:
+                addr = broker_data.select_broker_addr()
+                if addr:
+                    break
+        if addr is None:
+            logger.warning("can't find broker service address. %s", handle.broker_name)
+            raise MQClientException("The broker service address not found")
+        header = RecallMessageRequestHeader()
+        header.producer_group = self.producer_group
+        header.topic = topic
+        header.recall_handle = recall_handle
+        header.bname = handle.broker_name
+        return client.recall_message(addr, header, self.send_msg_timeout)
 
     # ---------------- 批量发送 ----------------
     def _send_batch(self, msgs: List[Message], mq: Optional[MessageQueue] = None,

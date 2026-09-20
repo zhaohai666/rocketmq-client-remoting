@@ -18,6 +18,9 @@
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
+#include "rocketmq/common/mix_all.h"
+#include "rocketmq/common/namespace_util.h"
+#include "rocketmq/common/recall_message_handle.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/exception.h"
@@ -1100,6 +1103,50 @@ void DefaultMQProducer::createTopic(const std::string& key, const std::string& n
     constexpr int32_t perm = 6;  // PERM_READ | PERM_WRITE
     const std::string realTopic = namespace_.empty() ? newTopic : NamespaceUtil::wrapNamespace(namespace_, newTopic);
     c.createTopicInRoute(realTopic, queueNum, queueNum, perm);
+}
+
+std::string DefaultMQProducer::recallMessage(const std::string& topic,
+                                             const std::string& recallHandle) {
+    // 校验顺序逐条对齐 Java DefaultMQProducerImpl#recallMessage(:1570-1601)：
+    // 状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 预热路由 → 定位 broker → 发请求。
+    // 前三步必须在打网络**之前**跑完，否则一个手滑的句柄就要耗掉一次 RPC 超时。
+    MQClientInstance& c = client();
+    const std::string realTopic =
+        namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
+    Validators::checkTopic(realTopic);
+    if (MixAll::isRetryTopic(realTopic) || MixAll::isDlqTopic(realTopic)) {
+        throw MQClientException("topic is not supported");
+    }
+    const HandleV1 handle = decodeRecallHandle(recallHandle);
+
+    // Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
+    // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
+    c.registerTopicInUse(realTopic);
+    (void)c.getTopicPublishInfo(realTopic, /*isDefault=*/true);
+
+    // Java findBrokerAddressInPublish(brokerName) → 退化到 findBrokerAddrByTopic(topic)。
+    std::string addr = c.brokerAddrOf(handle.brokerName);
+    if (addr.empty()) {
+        std::shared_ptr<TopicRouteData> route = c.getTopicRouteData(realTopic);
+        if (route) {
+            for (const auto& bd : route->getBrokerDatas()) {
+                addr = bd.selectBrokerAddr();
+                if (!addr.empty()) break;
+            }
+        }
+    }
+    if (addr.empty()) {
+        logger_warn(std::string("can't find broker service address. ") + handle.brokerName);
+        throw MQClientException("The broker service address not found");
+    }
+
+    RecallMessageRequestHeader header;
+    header.producerGroup = producerGroup_;
+    header.topic = realTopic;
+    header.recallHandle = recallHandle;
+    // 继承字段在 Java 里反射名就是 bname，写成 brokerName 会被 broker 静默丢掉。
+    header.bname = handle.brokerName;
+    return c.recallMessage(addr, header, sendMsgTimeout_);
 }
 
 int64_t DefaultMQProducer::searchOffset(const MessageQueue& mq, int64_t timestamp) {

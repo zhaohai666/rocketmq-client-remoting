@@ -127,6 +127,7 @@ PropertyMap SendMessageResponseHeader::toExtFields() const {
     putOptInt(out, "queueOffset", queueOffset);
     putOptStr(out, "transactionId", transactionId);
     putOptInt(out, "msgRegion", msgRegion);
+    putOptStr(out, "recallHandle", recallHandle);
     return out;
 }
 
@@ -136,6 +137,33 @@ void SendMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
     queueOffset = getOptLong(ext, "queueOffset");
     transactionId = getOptStr(ext, "transactionId");
     msgRegion = getOptLong(ext, "msgRegion");
+    recallHandle = getOptStr(ext, "recallHandle");
+}
+
+PropertyMap RecallMessageRequestHeader::toExtFields() const {
+    PropertyMap out;
+    putOptStr(out, "producerGroup", producerGroup);
+    putOptStr(out, "topic", topic);
+    putOptStr(out, "recallHandle", recallHandle);
+    putOptStr(out, "bname", bname);
+    return out;
+}
+
+void RecallMessageRequestHeader::fromExtFields(const PropertyMap& ext) {
+    producerGroup = getOptStr(ext, "producerGroup");
+    topic = getOptStr(ext, "topic");
+    recallHandle = getOptStr(ext, "recallHandle");
+    bname = getOptStr(ext, "bname");
+}
+
+PropertyMap RecallMessageResponseHeader::toExtFields() const {
+    PropertyMap out;
+    putOptStr(out, "msgId", msgId);
+    return out;
+}
+
+void RecallMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
+    msgId = getOptStr(ext, "msgId");
 }
 
 // ---------------------------------------------------------------- Request-Reply 应答推送

@@ -349,6 +349,8 @@ async fn send_full(
         transaction_id: resp_header.transaction_id.clone(),
         // Python `offset_msg_id = header.msg_id`：响应头的 msgId 是 broker 侧的 offsetMsgId
         offset_msg_id: Some(broker_msg_id.clone()),
+        // 定时消息才有；普通消息恒为 None
+        recall_handle: resp_header.recall_handle.clone(),
         region_id: Some(if region.is_empty() {
             MixAll::DEFAULT_TRACE_REGION_ID.to_string()
         } else {

@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 661 条单元/协议测试（4 skip 为可选依赖相关）
+pytest -q                     # 687 条单元/协议测试（683 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -31,6 +31,7 @@ python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 
 python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需 broker traceTopicEnable=true）
 python verify_hook_live.py        # CheckForbidden/FilterMessage 钩子（13 PASS/0 FAIL）
 python verify_validators_live.py  # 名字校验（24 PASS/0 FAIL）：非法 topic/group 本地快拒、合法名字照常收发、往返对照腿
+python verify_recall_live.py      # 定时消息撤回 recallMessage(370)（15 PASS/0 FAIL，脚本会打开并在退出时还原 broker 的 recallMessageEnable）
 python verify_lite_pull_live.py   # lite pull 全链路（32 PASS/0 FAIL）：rebalance/收 12 条/commit/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）
 ```
 
@@ -72,6 +73,7 @@ rocketmq/
 │   ├── message_const.py       MessageConst 属性键（含 INDEX_KEY/UNIQUE/TAG_TYPE）
 │   ├── sysflag.py             MessageSysFlag / PullSysFlag / PermName
 │   ├── mix_all.py / util_all.py
+│   ├── recall_message_handle.py 定时消息撤回句柄 v1（base64url + 5 段，Java 同格式）
 │   └── subscription_data.py / topic_config.py / message_accessor.py
 ├── remoting/              传输层（不依赖 netty，纯 socket + 线程）
 │   ├── client.py              RemotingClient：同步 / 异步 / oneway

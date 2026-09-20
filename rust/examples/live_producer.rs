@@ -22,6 +22,9 @@
 //!   UNKNOW 被 broker 经心跳登记的连接**回查**，回查后提交的最终状态生效。
 //! - P7 **管理便捷方法**：`create_topic` 经 TBW102 真建出 topic、四个 offset RPC、
 //!   按 key 查消息、`view_message` 按 Python 的行为明确报错。
+//! - P9 **定时消息撤回**：SEND 响应带回 `recallHandle`（普通消息没有）、handle 本地解码
+//!   对得上 brokerName/uniqKey、`recall_message` 真把定时消息摘掉（到点不投递，同延迟的
+//!   对照组照投），`%RETRY%` topic 与坏 handle 在任何 IO 之前按 Java 文案失败。
 //! - P8 **发送重试内核**：可重试码集合与 Java 对齐、单次超时上限与「非 SEND_OK 换
 //!   broker」开关不影响真集群上的正常发送、没有路由时按错误码定性而非空转重试。
 //!
@@ -62,11 +65,13 @@ use rocketmq_client_remoting::common::message_const::{
 };
 use rocketmq_client_remoting::common::message_decoder::decode_message_id;
 use rocketmq_client_remoting::common::mix_all::MixAll;
+use rocketmq_client_remoting::common::recall_message_handle;
 use rocketmq_client_remoting::common::sysflag::{MessageSysFlag, PullSysFlag};
 use rocketmq_client_remoting::common::topic_config::{self, TopicFilterType};
 use rocketmq_client_remoting::common::util_all::current_time_millis;
 use rocketmq_client_remoting::remoting::client::RemotingClient;
 use rocketmq_client_remoting::remoting::protocol::codes::{request_code, response_code};
+use rocketmq_client_remoting::remoting::protocol::ext_fields::StringMap;
 use rocketmq_client_remoting::remoting::protocol::headers::{
     CreateTopicRequestHeader, GetRouteInfoRequestHeader,
 };
@@ -1340,6 +1345,186 @@ async fn p8_send_retry_kernel(
     Ok(())
 }
 
+// ------------------------------------------------------------------- P9
+
+/// 读 broker 的一个配置项（`GET_BROKER_CONFIG` 的响应体是 properties 文本）。
+async fn read_broker_flag(instance: &MQClientInstance, addr: &str, key: &str) -> Option<String> {
+    let mut request = RemotingCommand::create_request_command(request_code::GET_BROKER_CONFIG, None);
+    let response = instance
+        .remoting_client()
+        .invoke_sync(addr, &mut request, Some(5000))
+        .await
+        .ok()?;
+    if response.code != response_code::SUCCESS {
+        return None;
+    }
+    let text = String::from_utf8_lossy(response.body().unwrap_or_default()).into_owned();
+    MixAll::string_to_properties(&text).get(key).map(str::to_string)
+}
+
+/// 只改一个配置项（Java `updateBrokerConfig` 按 Properties 逐键反射赋值，
+/// 所以单键请求不会碰到其它设置）。
+async fn write_broker_flag(
+    instance: &MQClientInstance,
+    addr: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let mut props = StringMap::new();
+    props.insert(key, value);
+    let mut request = RemotingCommand::create_request_command(request_code::UPDATE_BROKER_CONFIG, None);
+    request.set_body(Some(MixAll::properties_to_string(&props, false).into_bytes()));
+    let response = instance
+        .remoting_client()
+        .invoke_sync(addr, &mut request, Some(5000))
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.code == response_code::SUCCESS {
+        return Ok(());
+    }
+    Err(format!(
+        "code={} remark={:?}",
+        response.code, response.remark
+    ))
+}
+
+/// 定时消息的 `recallMessage`(370)：handle 由 SEND 响应下发，撤回后消息**不会**投递。
+///
+/// ⚠ broker 默认 `recallMessageEnable=false`（Java `BrokerConfig:546`），本机集群也是关的，
+/// 所以这里临时打开、跑完还原；还原失败记 FAILED，不静默改共享集群的配置。
+async fn p9_recall(
+    p: &DefaultMQProducer,
+    instance: &MQClientInstance,
+    topic: &str,
+    broker_name: &str,
+    broker_addr: &str,
+    ck: &mut Checker,
+) -> Live {
+    const ENABLE_KEY: &str = "recallMessageEnable";
+    let prior = read_broker_flag(instance, broker_addr, ENABLE_KEY).await;
+    if prior.as_deref() != Some("true") {
+        write_broker_flag(instance, broker_addr, ENABLE_KEY, "true")
+            .await
+            .map_err(|e| format!("cannot enable {ENABLE_KEY} on the broker: {e}"))?;
+    }
+    // 定时消息的投递时刻：留够「先撤回、再确认没投递」的窗口。
+    let delay_secs = 12;
+
+    let mut to_recall = msg(topic, b"timer-recalled", "TagTimer", "keyTimerRecalled");
+    to_recall.put_property("TIMER_DELAY_SEC", &delay_secs.to_string());
+    let recalled = p
+        .send(&mut to_recall, Some(5000), None)
+        .await
+        .map_err(|e| format!("timer send failed: {e}"))?;
+    let mut control = msg(topic, b"timer-kept", "TagTimer", "keyTimerKept");
+    control.put_property("TIMER_DELAY_SEC", &delay_secs.to_string());
+    let kept = p
+        .send(&mut control, Some(5000), None)
+        .await
+        .map_err(|e| format!("control timer send failed: {e}"))?;
+    let mut plain = msg(topic, b"timer-none", "TagTimer", "keyTimerNone");
+    let plain = p
+        .send(&mut plain, Some(5000), None)
+        .await
+        .map_err(|e| format!("plain send failed: {e}"))?;
+
+    ck.check(
+        "P9 a timer send carries the broker's recallHandle",
+        recalled.recall_handle.as_deref().is_some_and(|h| !h.is_empty())
+            && kept.recall_handle.as_deref().is_some_and(|h| !h.is_empty()),
+        &format!("{:?}", recalled.recall_handle),
+    );
+    ck.check(
+        "P9 a normal send carries no recallHandle",
+        plain.recall_handle.is_none(),
+        &format!("{:?}", plain.recall_handle),
+    );
+
+    // handle 里就带着 brokerName，解出来必须是我们发出去的那台 broker。
+    let handle = recalled.recall_handle.clone().unwrap_or_default();
+    let decoded = recall_message_handle::decode_handle(&handle);
+    ck.check(
+        "P9 the handle the broker sent back decodes with our codec",
+        decoded.as_ref().is_ok_and(|h| {
+            h.topic == topic && h.broker_name == broker_name && h.message_id == recalled.msg_id.clone().unwrap_or_default()
+        }),
+        &format!("{decoded:?} topic={topic} broker={broker_name} msgId={:?}", recalled.msg_id),
+    );
+
+    let outcome = p.recall_message(topic, &handle).await;
+    let want = recalled.msg_id.clone().unwrap_or_default();
+    ck.check(
+        "P9 recall_message answers with the recalled message's uniqKey",
+        outcome.as_ref().ok().map(String::as_str) == Some(want.as_str()),
+        &format!("{outcome:?} want={want}"),
+    );
+
+    // 本地校验：两类错误都不该产生任何 IO（Java 的顺序：状态 → topic 名 → %RETRY%/%DLQ%
+    // → handle 解码 → 才谈路由）。
+    let retry_err = p
+        .recall_message(
+            &format!("{}{PULL_GROUP}", MixAll::RETRY_GROUP_TOPIC_PREFIX),
+            &handle,
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    ck.check(
+        "P9 recalling on a %RETRY% topic is refused with Java's message",
+        retry_err.contains("topic is not supported"),
+        &retry_err,
+    );
+    let started = Instant::now();
+    let bad_err = p
+        .recall_message(topic, "not-a-handle")
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    ck.check(
+        "P9 a corrupt handle fails locally, before any IO",
+        bad_err.contains("recall handle is invalid") && started.elapsed() < Duration::from_millis(200),
+        &format!("{}ms {bad_err}", started.elapsed().as_millis()),
+    );
+
+    // 到点之后：被撤回的那条不该出现，对照组必须出现。
+    let delivered = wait_async(
+        || async {
+            read_all_bodies(instance, topic, broker_name, broker_addr, QUEUE_NUMS)
+                .await
+                .iter()
+                .any(|b| b == "timer-kept")
+        },
+        Duration::from_secs(delay_secs as u64 + 20),
+    )
+    .await;
+    let bodies = read_all_bodies(instance, topic, broker_name, broker_addr, QUEUE_NUMS).await;
+    ck.check(
+        "P9 the control timer message is still delivered on time",
+        delivered && bodies.iter().any(|b| b == "timer-kept"),
+        &format!("bodies={}", bodies.len()),
+    );
+    ck.check(
+        "P9 the recalled timer message is never delivered",
+        !bodies.iter().any(|b| b == "timer-recalled"),
+        &format!("bodies={}", bodies.len()),
+    );
+
+    let restore = match prior.as_deref() {
+        Some(value) => write_broker_flag(instance, broker_addr, ENABLE_KEY, value).await,
+        // broker 没这个键（更老的版本）：留 true 会改变 broker 行为，报出来让人知道。
+        None => Err("broker reported no recallMessageEnable to restore".to_string()),
+    };
+    let restore_detail = restore.clone().err().unwrap_or_default();
+    ck.check(
+        "P9 recallMessageEnable is restored on the broker",
+        restore.is_ok(),
+        &restore_detail,
+    );
+    Ok(())
+}
+
 // ------------------------------------------------------------------- main
 
 async fn run(namesrv: &str) -> Checker {
@@ -1443,6 +1628,10 @@ async fn run(namesrv: &str) -> Checker {
             "P8 send retry kernel",
             p8_send_retry_kernel(&p, &topic, &run, &mut ck).await,
         ),
+        (
+            "P9 recall",
+            p9_recall(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
+        ),
     ];
     for (name, outcome) in scenarios {
         if let Err(e) = outcome {
@@ -1452,12 +1641,12 @@ async fn run(namesrv: &str) -> Checker {
 
     // 收尾：删主 topic（broker 配置 + namesrv 路由）
     match instance.delete_topic_in_broker(&broker_addr, &topic, 5000).await {
-        Ok(()) => ck.check("P9 delete_topic_in_broker", true, ""),
-        Err(e) => ck.check("P9 delete_topic_in_broker", false, &e.to_string()),
+        Ok(()) => ck.check("P10 delete_topic_in_broker", true, ""),
+        Err(e) => ck.check("P10 delete_topic_in_broker", false, &e.to_string()),
     }
     match instance.delete_topic_in_namesrv(&topic, 5000).await {
-        Ok(()) => ck.check("P9 delete_topic_in_namesrv", true, ""),
-        Err(e) => ck.check("P9 delete_topic_in_namesrv", false, &e.to_string()),
+        Ok(()) => ck.check("P10 delete_topic_in_namesrv", true, ""),
+        Err(e) => ck.check("P10 delete_topic_in_namesrv", false, &e.to_string()),
     }
     p.shutdown();
     ck

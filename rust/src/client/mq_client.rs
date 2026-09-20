@@ -84,7 +84,8 @@ use crate::remoting::protocol::headers::{
     NotifyConsumerIdsChangedRequestHeader,
     PopMessageRequestHeader, PopMessageResponseHeader, PullMessageRequestHeader,
     PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
-    QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader, ReplyMessageRequestHeader,
+    QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader, RecallMessageRequestHeader,
+    RecallMessageResponseHeader, ReplyMessageRequestHeader,
     ResetOffsetRequestHeader, SearchOffsetRequestHeader, SearchOffsetResponseHeader,
     SendMessageRequestHeaderV2, SendMessageResponseHeader, UnregisterClientRequestHeader,
     UpdateConsumerOffsetRequestHeader, UnlockBatchMqRequestHeader,
@@ -1475,6 +1476,7 @@ impl MQClientInstance {
             queue_offset: header.queue_offset.unwrap_or(0),
             transaction_id: header.transaction_id.clone(),
             offset_msg_id: header.msg_id.clone(),
+            recall_handle: header.recall_handle.clone(),
             region_id: Some(
                 response
                     .get_ext_field(PROPERTY_MSG_REGION)
@@ -1488,6 +1490,30 @@ impl MQClientInstance {
                 None => true,
             },
         })
+    }
+
+    // ---------------- 定时消息撤回（370） ----------------
+
+    /// Java `MQClientAPIImpl#recallMessage`：`RECALL_MESSAGE`(370) 同步往返，
+    /// 只有 SUCCESS 才取响应头的 `msgId`，其余码抛 broker 异常。
+    pub async fn recall_message(
+        &self,
+        addr: &str,
+        header: RecallMessageRequestHeader,
+        timeout_millis: i64,
+    ) -> Result<String> {
+        let mut request = RemotingCommand::create_request_command(
+            request_code::RECALL_MESSAGE,
+            Some(Box::new(header)),
+        );
+        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        Self::check_response(&response)?;
+        let mut resp_header = RecallMessageResponseHeader::default();
+        resp_header.from_ext_fields(response.ext_fields());
+        resp_header
+            .msg_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Error::client(format!("recall message response has no msgId, addr {addr}")))
     }
 
     // ---------------- 拉取 ----------------

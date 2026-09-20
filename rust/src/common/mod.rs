@@ -8,6 +8,7 @@ pub mod message_const;
 pub mod message_decoder;
 pub mod message_type;
 pub mod mix_all;
+pub mod recall_message_handle;
 pub mod sysflag;
 pub mod topic_config;
 pub mod topic_validator;

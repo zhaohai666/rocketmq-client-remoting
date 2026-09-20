@@ -48,6 +48,7 @@ set(RMQ_SOURCES
     src/common/mix_all.cpp
     src/common/top_addressing.cpp
     src/common/topic_config.cpp
+    src/common/recall_message_handle.cpp
     src/remoting/protocol/json.cpp
     src/remoting/protocol/serialize.cpp
     src/remoting/protocol/remoting_command.cpp
