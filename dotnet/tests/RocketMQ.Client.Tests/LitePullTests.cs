@@ -42,7 +42,9 @@ public class LitePullTests
     [Fact]
     public void Start_RejectsEpochLookingConsumeTimestamp()
     {
-        var c = new DefaultLitePullConsumer();
+        // 组名要合法且不能是保留的 DEFAULT_CONSUMER：checkConfig 排在起点校验之前，
+        // 用默认组只会测到组名那条错误。
+        var c = new DefaultLitePullConsumer("LitePullTsGroup");
         c.SetNamesrvAddr("127.0.0.1:1");
         c.Subscribe("MyTopic", "*");
         // 纯数字的 epoch 毫秒必须被拒（旧实现按 epoch 解释，静默算出错位起点）
@@ -54,7 +56,7 @@ public class LitePullTests
     [Fact]
     public void Start_KeepsValidConsumeTimestamp()
     {
-        var c = new DefaultLitePullConsumer();
+        var c = new DefaultLitePullConsumer("LitePullTsGroup");
         c.SetNamesrvAddr("127.0.0.1:1");
         c.Subscribe("MyTopic", "*");
         c.SetConsumeTimestamp("20230101000000");

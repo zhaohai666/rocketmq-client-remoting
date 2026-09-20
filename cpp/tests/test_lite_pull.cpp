@@ -89,7 +89,9 @@ static void testLitePullPreStartBehavior() {
 
 // ---------------------------------------------------------------- consumeTimestamp（Java 格式）
 static void testLitePullConsumeTimestamp() {
-    DefaultLitePullConsumer c;
+    // 组名要合法且不能是保留的 DEFAULT_CONSUMER：checkConfig 排在起点校验之前，
+    // 用默认组只会测到组名那条错误（见 Validators::checkGroup 的接线）。
+    DefaultLitePullConsumer c("LitePullTsGroup");
     // Java DefaultLitePullConsumer.java:168：默认是 now-30min 的 14 位 yyyyMMddHHmmss，不是空串
     CHECK_EQ(c.consumeTimestamp().size(), static_cast<size_t>(14), "默认 consumeTimestamp 14 位");
     bool allDigit = !c.consumeTimestamp().empty();

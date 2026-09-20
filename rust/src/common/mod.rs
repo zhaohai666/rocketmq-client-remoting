@@ -9,4 +9,5 @@ pub mod message_type;
 pub mod mix_all;
 pub mod sysflag;
 pub mod topic_config;
+pub mod topic_validator;
 pub mod util_all;

@@ -82,6 +82,7 @@ use crate::remoting::rpchook::RPCHook;
 use crate::{bail, rmq_debug, rmq_warn};
 
 use crate::client::consumer::ExpressionType;
+use crate::client::validators;
 
 /// Python 两个消费者共用的默认值：`brokerSuspendMaxTimeMillis` = 20000。
 pub const DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS: i64 = 20_000;
@@ -394,6 +395,19 @@ impl DefaultMQPullConsumer {
             return Ok(());
         }
         let cfg = self.config();
+        // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:772)：组名合法性（blank / 120
+        // 长度 / 字符表）+ 挡掉 DEFAULT_CONSUMER（共用默认组会混掉订阅关系与位点）。
+        // 纯本地校验，排在地址检查之前，失败不碰网络。
+        if let Err(e) = validators::check_group(&cfg.consumer_group) {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(e);
+        }
+        if cfg.consumer_group == MixAll::DEFAULT_CONSUMER_GROUP {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(Error::client(
+                "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.",
+            ));
+        }
         if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
@@ -1129,7 +1143,7 @@ impl DefaultLitePullConsumer {
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start()`：幂等；必须有 name server；必须已有订阅或 assign；
+    /// Python `start()`：幂等；先查组名，再有 name server，必须已有订阅或 assign；
     /// **先同步发一次心跳再起后台循环**。
     ///
     /// ⚠ 真机实测：自建实例此刻路由表还是空的，所以这一轮心跳实际发 0 份
@@ -1146,6 +1160,18 @@ impl DefaultLitePullConsumer {
             return Ok(());
         }
         let cfg = self.config();
+        // 对应 Java DefaultLitePullConsumerImpl.checkConfig(:413)：组名合法性 + 挡掉
+        // DEFAULT_CONSUMER，都排在地址/订阅校验之前（纯本地判定，失败不碰网络）。
+        if let Err(e) = validators::check_group(&cfg.consumer_group) {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(e);
+        }
+        if cfg.consumer_group == MixAll::DEFAULT_CONSUMER_GROUP {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(Error::client(
+                "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.",
+            ));
+        }
         if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
@@ -1919,6 +1945,35 @@ mod tests {
         }
         assert!(DefaultMQPullConsumer::new("PG").is_ok());
         assert!(DefaultLitePullConsumer::new("PG").is_ok());
+    }
+
+    /// Java 的 `checkConfig` 是 start() 第一步，所以组名校验排在地址/订阅/时间戳之前：
+    /// 地址配好、订阅齐了，也照样因为组名本地失败（`127.0.0.1:1` 兜底，跑偏了也不会
+    /// 打到真集群）。
+    #[tokio::test]
+    async fn both_pull_consumers_reject_bad_group_before_the_other_gates() {
+        let long_group = std::iter::repeat_n('g', 121).collect::<String>();
+        for (group, needle) in [
+            (
+                MixAll::DEFAULT_CONSUMER_GROUP,
+                "consumerGroup can not equal DEFAULT_CONSUMER",
+            ),
+            ("bad group", "contains illegal characters"),
+            (long_group.as_str(), "is longer than group max length"),
+        ] {
+            let pull = DefaultMQPullConsumer::new(group).expect("构造不该提前拒绝");
+            pull.set_namesrv_addr("127.0.0.1:1");
+            let err = pull.start().await.expect_err("pull: 非法组名必须本地失败");
+            assert!(err.to_string().contains(needle), "pull {group}: {err}");
+            assert!(!pull.is_started(), "pull {group}: 失败的 start 必须回滚 started");
+
+            let lite = DefaultLitePullConsumer::new(group).expect("构造不该提前拒绝");
+            lite.set_namesrv_addr("127.0.0.1:1");
+            lite.subscribe("T", "TagA");
+            let err = lite.start().await.expect_err("lite: 非法组名必须本地失败");
+            assert!(err.to_string().contains(needle), "lite {group}: {err}");
+            assert!(!lite.is_started(), "lite {group}: 失败的 start 必须回滚 started");
+        }
     }
 
     #[tokio::test]

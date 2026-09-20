@@ -14,6 +14,7 @@
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/trace_hook.h"
+#include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/sysflag.h"
@@ -260,6 +261,21 @@ void DefaultMQPushConsumer::start() {
         if (started_.load()) {
             return;
         }
+        // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
+        // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
+        if (!namespace_.empty()) {
+            consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
+        }
+        // 对应 Java DefaultMQPushConsumerImpl.checkConfig(:1026) / Python：先 Validators.checkGroup
+        // （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让
+        // broker 侧的订阅关系判定把两组混在一起，回投与重平衡都错乱。
+        // ⚠ checkConfig 是 Java start() 的第一步，这里也领先于地址/订阅检查：
+        // 配置非法时既不碰网络，也不该被后面的"未订阅"错误盖掉真正原因。
+        Validators::checkGroup(consumerGroup_);
+        if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
+            throw MQClientException(
+                "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
+        }
         // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
         if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
             throw MQClientException("name server address is not set");
@@ -272,11 +288,6 @@ void DefaultMQPushConsumer::start() {
         }
         if (clientId_.empty()) {
             clientId_ = buildClientId(instanceName_);
-        }
-        // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
-        // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
-        if (!namespace_.empty()) {
-            consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
         }
         // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：
         // broker 回投的消息写到 %RETRY%group，客户端不订阅就收不到

@@ -46,6 +46,7 @@ from .trace_context import inject_trace_context, trace_context_enabled_from_env
 from .trace import AccessChannel
 from .trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
 from .trace_hook import EndTransactionTraceHook, SendMessageTraceHook
+from . import validators
 
 logger = get_logger()
 
@@ -466,15 +467,24 @@ class DefaultMQProducer:
         with self._lock:
             if self._started:
                 return
+            # 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start:375
+            # setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
+            if self.namespace:
+                self.producer_group = NamespaceUtil.wrap_namespace(self.namespace, self.producer_group)
+            # 对应 Java DefaultMQProducerImpl.checkConfig（:295）：组名校验排在拼完命名空间之后
+            # （Java 也是 start() 先 withNamespace 再 impl.start()），并且要挡住
+            # DEFAULT_PRODUCER —— 多进程共用默认组会互相踢下线。checkConfig 是 Java start() 的
+            # 第一步，所以这里也领先于 name server 地址检查。
+            validators.check_group(self.producer_group)
+            if self.producer_group == MixAll.DEFAULT_PRODUCER_GROUP:
+                raise MQClientException(
+                    "producerGroup can not equal %s, please specify another one."
+                    % MixAll.DEFAULT_PRODUCER_GROUP)
             if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
                 # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
                 raise MQClientException("name server address is not set")
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
-            # 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start:375
-            # setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
-            if self.namespace:
-                self.producer_group = NamespaceUtil.wrap_namespace(self.namespace, self.producer_group)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable)
             if self.rpc_hook is not None:
@@ -878,6 +888,11 @@ class DefaultMQProducer:
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         if not msgs:
             raise MQClientException("message list is empty")
+        # 对应 Java DefaultMQProducer.batch()：**每条子消息**都过一遍 Validators.checkMessage
+        # （在拼命名空间之前），再 MessageBatch.generateFromList 查同质性。
+        # 少这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
+        for m in msgs:
+            validators.check_message(m, self.max_message_size)
         for m in msgs:
             m.topic = self._with_namespace(m.topic)
         batch = MessageBatch.generate_from_list(msgs)
@@ -1118,6 +1133,9 @@ class DefaultMQProducer:
     def create_topic(self, key: str, new_topic: str, queue_num: int = 4,
                      topic_sys_flag: int = 0) -> None:
         client = self._require_client()
+        # 对应 Java DefaultMQProducerImpl.createTopic：checkTopic + isSystemTopic
+        validators.check_topic(new_topic)
+        validators.is_system_topic(new_topic)
         perm = 6  # PermName.PERM_READ | PERM_WRITE
         client.create_topic_in_route(new_topic, queue_num, queue_num, perm)
 
@@ -1161,13 +1179,12 @@ class DefaultMQProducer:
 
     # ---------------- 辅助 ----------------
     def _check_message(self, msg: Message) -> None:
-        if msg is None:
-            raise MQClientException("message is null")
-        if not msg.topic:
-            raise MQClientException("message topic is empty")
-        if len(msg.body) > self.max_message_size:
-            raise MQClientException(
-                "message body size %d exceeds maxMessageSize %d" % (len(msg.body), self.max_message_size))
+        """对应 ``Validators.checkMessage(msg, this)``——纯本地、打网络之前就跑完。
+
+        校验项与顺序都跟着 Java 走：topic（blank/长度/字符表）→ 禁发 topic →
+        body（null/零长/超过 maxMessageSize）→ ``INNER_MULTI_DISPATCH`` 不能带路径分隔符。
+        """
+        validators.check_message(msg, self.max_message_size)
 
     @staticmethod
     def _need_addr(client: MQClientInstance, mq: MessageQueue) -> str:

@@ -14,6 +14,7 @@
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/trace_context.h"
 #include "rocketmq/client/trace_hook.h"
+#include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
@@ -131,6 +132,22 @@ void DefaultMQProducer::start() {
     if (started_) {
         return;
     }
+    // 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start():375 / Python：
+    // setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记。
+    // wrapNamespace 自带"已带前缀则原样返回"的幂等守卫，重复 start 不会套两层。
+    if (!namespace_.empty()) {
+        producerGroup_ = NamespaceUtil::wrapNamespace(namespace_, producerGroup_);
+    }
+    // 对应 Java DefaultMQProducerImpl.checkConfig(:295)：它排在 withNamespace 之后
+    // （Java 也是 start() 先 withNamespace 再 impl.start()），并且要挡住
+    // DEFAULT_PRODUCER —— 多进程共用默认组会互相踢下线。
+    // ⚠ checkConfig 是 Java start() 的第一步，所以这里领先于 name server 地址检查：
+    // 配置非法时不该先报"没配地址"，也不该建出客户端实例。
+    Validators::checkGroup(producerGroup_);
+    if (producerGroup_ == MixAll::DEFAULT_PRODUCER_GROUP) {
+        throw MQClientException(
+            "producerGroup can not equal DEFAULT_PRODUCER, please specify another one.");
+    }
     // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
     if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
         throw MQClientException("name server address is not set");
@@ -241,14 +258,11 @@ MQClientInstance& DefaultMQProducer::client() {
 }
 
 // ---------------------------------------------------------------- 校验
+// 对应 Java DefaultMQProducerImpl 发送前的 Validators.checkMessage(msg, this)：
+// 全部判定收敛到 Validators（topic blank/长度/字符表 → 禁发 topic → body 三档 →
+// INNER_MULTI_DISPATCH 分隔符），文案与顺序以 python/rocketmq/client/validators.py 为准。
 void DefaultMQProducer::checkMessage(const Message& msg) const {
-    if (msg.topic.empty()) {
-        throw MQClientException("message topic is empty");
-    }
-    if (static_cast<int32_t>(msg.body.size()) > maxMessageSize_) {
-        throw MQClientException("message body size " + std::to_string(msg.body.size())
-                                + " exceeds maxMessageSize " + std::to_string(maxMessageSize_));
-    }
+    Validators::checkMessage(msg, maxMessageSize_);
 }
 
 Message DefaultMQProducer::withNamespace(const Message& msg) const {
@@ -773,6 +787,13 @@ SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_
     if (msgs.empty()) {
         throw MQClientException("message list is empty");
     }
+    // 对应 Java DefaultMQProducer.batch() / Python _send_batch：**每条子消息**都过一遍
+    // Validators.checkMessage（在拼命名空间之前、用原始 topic），再 MessageBatch
+    // .generateFromList 查同质性。少这一步等于批量路径绕过了所有本地校验——
+    // 超长/空 body/非法 topic 都能发出去。
+    for (const Message& m : msgs) {
+        Validators::checkMessage(m, maxMessageSize_);
+    }
     MessageBatch batch = MessageBatch::generateFromList(msgs);
     checkMessage(batch);
     if (!namespace_.empty()) {
@@ -1071,8 +1092,12 @@ std::vector<MessageQueue> DefaultMQProducer::fetchPublishMessageQueues(const std
 void DefaultMQProducer::createTopic(const std::string& key, const std::string& newTopic,
                                     int32_t queueNum) {
     MQClientInstance& c = client();
-    constexpr int32_t perm = 6;  // PERM_READ | PERM_WRITE
+    // 对应 Java DefaultMQProducerImpl.createTopic：先 checkTopic（blank/长度/字符表），
+    // 再 isSystemTopic —— 建与 broker 内部资源重名的 topic 会静默篡改系统流水。
     (void)key;
+    Validators::checkTopic(newTopic);
+    Validators::isSystemTopic(newTopic);
+    constexpr int32_t perm = 6;  // PERM_READ | PERM_WRITE
     const std::string realTopic = namespace_.empty() ? newTopic : NamespaceUtil::wrapNamespace(namespace_, newTopic);
     c.createTopicInRoute(realTopic, queueNum, queueNum, perm);
 }

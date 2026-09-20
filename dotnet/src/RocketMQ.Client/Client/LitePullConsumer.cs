@@ -218,6 +218,20 @@ public sealed class DefaultLitePullConsumer
         lock (_lock)
         {
             if (_started) return;
+            if (_namespace.Length > 0)
+            {
+                _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
+            }
+
+            // 对应 Java DefaultLitePullConsumerImpl.checkConfig（:415）：组名合法性 + 挡掉
+            // DEFAULT_CONSUMER。纯本地校验，排在地址/订阅检查之前。
+            Validators.CheckGroup(_consumerGroup);
+            if (_consumerGroup == MixAll.DefaultConsumerGroup)
+            {
+                throw new MQClientException("consumerGroup can not equal " + MixAll.DefaultConsumerGroup
+                                            + ", please specify another one.");
+            }
+
             if (_nameServerAddrs.Count == 0)
             {
                 throw new MQClientException("name server address is not set");
@@ -241,11 +255,6 @@ public sealed class DefaultLitePullConsumer
             if (_clientId.Length == 0)
             {
                 _clientId = ClientIds.Build(_instanceName);
-            }
-
-            if (_namespace.Length > 0)
-            {
-                _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
             }
 
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),

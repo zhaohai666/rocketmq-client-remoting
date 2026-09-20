@@ -56,6 +56,7 @@ use crate::client::trace::TraceContext;
 use crate::client::trace_hook::{
     EndTransactionTraceHook, SendMessageTraceHook, TraceReportSink,
 };
+use crate::client::validators;
 use crate::common::compression;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_const::{
@@ -982,6 +983,28 @@ impl DefaultMQProducer {
         }
 
         let cfg = self.config();
+        // 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start:375
+        // setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
+        let group = if cfg.namespace.is_empty() {
+            cfg.producer_group.clone()
+        } else {
+            NamespaceUtil::wrap_namespace(&cfg.namespace, &cfg.producer_group)
+        };
+        // 对应 Java DefaultMQProducerImpl.checkConfig(:295)：组名校验排在拼完命名空间之后
+        // （Java 也是 start() 先 withNamespace 再 impl.start()），并且要挡住
+        // DEFAULT_PRODUCER —— 多进程共用默认组会互相踢下线。checkConfig 是 Java start()
+        // 的第一步，所以这里领先于 name server 地址检查：配置非法时既不碰网络，
+        // 也不该被"没配地址"盖掉真正原因。
+        if let Err(e) = validators::check_group(&group) {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(e);
+        }
+        if group == MixAll::DEFAULT_PRODUCER_GROUP {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(Error::client(
+                "producerGroup can not equal DEFAULT_PRODUCER, please specify another one.",
+            ));
+        }
         if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
             self.inner.started.store(false, Ordering::Release);
             // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
@@ -991,13 +1014,6 @@ impl DefaultMQProducer {
             .client_id
             .clone()
             .unwrap_or_else(|| MixAll::build_default_client_id(&cfg.instance_name));
-        // 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start:375
-        // setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
-        let group = if cfg.namespace.is_empty() {
-            cfg.producer_group.clone()
-        } else {
-            NamespaceUtil::wrap_namespace(&cfg.namespace, &cfg.producer_group)
-        };
         // Python 在 `__init__` 里就把 None 解析成布尔；这里等价地在 start 时定型。
         let trace_context_on = cfg
             .enable_trace_context
@@ -1321,10 +1337,11 @@ const DELAY_PROPERTY_KEYS: [&str; 5] = [
 impl DefaultMQProducer {
     // ---------------- 校验 / 压缩 / 路由 ----------------
 
-    /// Python `_check_message`。
+    /// Python `_check_message` → `client/validators.check_message`。
     ///
-    /// ⚠ Python 对 `body is None` 会 `len(None)` 抛 `TypeError`；这里把「无正文」
-    /// 当作 0 字节放过（Java 的 `Message#getBody()` 返回 null 时同样不进长度比较）。
+    /// 判定全部收敛到 [`validators`]：topic（blank / 127 / 字符表）→ 禁发 topic →
+    /// body（null / 零长 / 超 max_message_size）→ INNER_MULTI_DISPATCH 分隔符，
+    /// 顺序与文案跟 Python 一字不差。
     fn check_message(&self, msg: &Message) -> Result<()> {
         let max = self
             .inner
@@ -1332,14 +1349,7 @@ impl DefaultMQProducer {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .max_message_size;
-        if msg.topic.is_empty() {
-            bail!("message topic is empty");
-        }
-        let len = msg.get_body().len();
-        if len > max as usize {
-            bail!("message body size {len} exceeds maxMessageSize {max}");
-        }
-        Ok(())
+        validators::check_message(msg, max)
     }
 
     /// Python `try_to_compress_message`：满足阈值时**就地压缩**，返回应下发的 sys_flag。
@@ -1818,6 +1828,18 @@ impl DefaultMQProducer {
         };
         if msgs.is_empty() {
             bail!("message list is empty");
+        }
+        let max = self
+            .inner
+            .cfg
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_message_size;
+        // 对应 Java DefaultMQProducer.batch()：每条子消息都用**原始 topic**过一遍
+        // Validators.checkMessage，然后才拼命名空间 + generateFromList 查同质性。
+        // 少这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
+        for msg in &msgs {
+            validators::check_message(msg, max)?;
         }
         let mut msgs = msgs;
         for msg in &mut msgs {
@@ -2483,6 +2505,10 @@ impl DefaultMQProducer {
         topic_sys_flag: i32,
     ) -> Result<()> {
         let client = self.require_client()?;
+        // 对应 Java DefaultMQProducerImpl.createTopic(:477)：先 checkTopic（blank/长度/字符表），
+        // 再 isSystemTopic —— 建与 broker 内部资源重名的 topic 会静默篡改系统流水。
+        validators::check_topic(new_topic)?;
+        validators::is_system_topic(new_topic)?;
         let perm = PermName::PERM_READ | PermName::PERM_WRITE;
         client
             .create_topic_in_route(new_topic, queue_num, queue_num, perm, topic_sys_flag, None, 5000)
@@ -2861,8 +2887,9 @@ mod tests {
         p.set_max_message_size(4);
         assert!(p.check_message(&Message::new("T1", Some(b"12345"))).is_err());
         assert!(p.check_message(&Message::new("T1", Some(b"1234"))).is_ok());
-        // 空正文按 0 字节放过（Python 在这里会 TypeError，Java 也不进长度比较）
-        assert!(p.check_message(&Message::new("T1", None)).is_ok());
+        // 空正文按 zero-length 拒（Java 的 body length is zero 那一支；
+        // Message::new(topic, None) 与 Some(b"") 在这里同口径）
+        assert!(p.check_message(&Message::new("T1", None)).is_err());
     }
 
     #[test]
@@ -3136,6 +3163,37 @@ mod tests {
             assert!(p.start().await.is_err());
             assert!(!p.is_started(), "启动失败后不能留在 started 状态");
         }
+    }
+
+    /// 组名校验排在地址检查之前：地址齐全也照样本地失败，报的是组名的错，
+    /// 而且失败后不留在 started（Java 的 `serviceState` 同样退回 FAILED）。
+    #[tokio::test]
+    async fn start_rejects_bad_producer_group_without_touching_network() {
+        let long_group = std::iter::repeat_n('g', 121).collect::<String>();
+        for (group, needle) in [
+            ("DEFAULT_PRODUCER", "producerGroup can not equal DEFAULT_PRODUCER"),
+            ("bad group", "contains illegal characters"),
+            (long_group.as_str(), "is longer than group max length"),
+        ] {
+            // 构造期只查空白，非法字符要留到 start()（与 Python 同口径）
+            let p = DefaultMQProducer::new(group).expect("构造不该提前拒绝");
+            p.set_namesrv_addr("127.0.0.1:9876");
+            let err = p.start().await.expect_err("非法组名必须本地失败");
+            assert!(err.to_string().contains(needle), "{group}: {err}");
+            assert!(!p.is_started(), "{group}: 启动失败后不能留在 started");
+        }
+    }
+
+    /// 拼了命名空间的组名按**包装后**的形状校验（Java 的 start 先 withNamespace 再
+    /// checkConfig），所以「短组名 + 长命名空间」也会被 120 上限挡住。
+    #[tokio::test]
+    async fn producer_group_is_validated_after_the_namespace_wrap() {
+        let p = DefaultMQProducer::new(&"g".repeat(110)).unwrap();
+        p.set_namespace("ns".repeat(30).as_str());
+        // 包装后是 ns…ns%g，长度 90+1+110 > 120
+        let err = p.start().await.expect_err("包装后超长必须报错");
+        assert!(err.to_string().contains("is longer than group max length"), "{err}");
+        assert!(!p.is_started());
     }
 
     #[tokio::test]

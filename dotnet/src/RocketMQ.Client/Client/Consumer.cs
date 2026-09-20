@@ -746,6 +746,24 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
+            // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
+            // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
+            if (_namespace.Length != 0)
+            {
+                ConsumerGroup = NamespaceUtil.WrapNamespace(_namespace, ConsumerGroup);
+            }
+
+            // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1026）：先 Validators.checkGroup
+            // （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让
+            // broker 侧的订阅关系判定把两组混在一起，回投与重平衡都错乱。
+            // Java 把 checkConfig 排在最前，所以这里也领先于地址/订阅检查。
+            Validators.CheckGroup(ConsumerGroup);
+            if (ConsumerGroup == MixAll.DefaultConsumerGroup)
+            {
+                throw new MQClientException("consumerGroup can not equal " + MixAll.DefaultConsumerGroup
+                                            + ", please specify another one.");
+            }
+
             // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
             if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
@@ -765,13 +783,6 @@ public sealed class DefaultMQPushConsumer
             if (_clientId.Length == 0)
             {
                 _clientId = ClientIds.Build(_instanceName);
-            }
-
-            // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
-            // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
-            if (_namespace.Length != 0)
-            {
-                ConsumerGroup = NamespaceUtil.WrapNamespace(_namespace, ConsumerGroup);
             }
 
             // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：

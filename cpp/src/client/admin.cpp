@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/message_decoder.h"
@@ -139,6 +140,10 @@ std::vector<std::string> DefaultMQAdminExt::brokerAddrsOfCluster(MQClientInstanc
 // ---------------------------------------------------------------- Topic 管理
 void DefaultMQAdminExt::createTopic(const std::string& /*key*/, const std::string& newTopic,
                                     int32_t queueNum, int32_t /*topicSysFlag*/) {
+    // 对应 Java DefaultMQAdminExt.createTopic → Validators.checkTopic + isSystemTopic：
+    // 与 producer 门面同款本地快失败，非法/系统重名的建 topic 请求不该打到 broker。
+    Validators::checkTopic(newTopic);
+    Validators::isSystemTopic(newTopic);
     requireClient().createTopicInRoute(newTopic, queueNum, queueNum, MixAll::READ_PERM_BY_DEFAULT);
 }
 

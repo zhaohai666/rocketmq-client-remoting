@@ -32,6 +32,7 @@ from ..remoting.protocol.body import (CMResult, ConsumeMessageDirectlyResult,
 from ..remoting.protocol import extra_info as extra_info_util
 from ..remoting.protocol.extra_info import split
 from ..remoting.rpchook import RPCHook
+from . import validators
 from .consume_executor import ConsumeExecutor
 from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus,
                               ConsumeOrderlyContext, ConsumeOrderlyStatus,
@@ -692,6 +693,20 @@ class DefaultMQPushConsumer:
         with self._lock:
             if self._started:
                 return
+            # 消费组也拼命名空间（对齐 Java DefaultMQPushConsumer.start:763
+            # setConsumerGroup(withNamespace(consumerGroup))）。必须在算重试主题之前：
+            # 重试主题 = %RETRY% + 带前缀的组名（Java MixAll.getRetryTopic(wrappedGroup)）。
+            if self.namespace:
+                self.consumer_group = NamespaceUtil.wrap_namespace(self.namespace, self.consumer_group)
+            # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1026）：先 Validators.checkGroup
+            # （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让
+            # broker 侧的订阅关系判定把两组混在一起，回投与重平衡都错乱。
+            # Java 把 checkConfig 排在 copySubscription 之前，所以这里也领先于订阅/地址检查。
+            validators.check_group(self.consumer_group)
+            if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
+                raise MQClientException(
+                    "consumerGroup can not equal %s, please specify another one."
+                    % MixAll.DEFAULT_CONSUMER_GROUP)
             if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
                 # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
                 raise MQClientException("name server address is not set")
@@ -702,11 +717,6 @@ class DefaultMQPushConsumer:
             # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验起点时间，
             # 而不是等到 rebalance 里抛错、被 compute_pull_from_where 的兜底吞掉。
             self._consume_timestamp_millis()
-            # 消费组也拼命名空间（对齐 Java DefaultMQPushConsumer.start:763
-            # setConsumerGroup(withNamespace(consumerGroup))）。必须在算重试主题之前：
-            # 重试主题 = %RETRY% + 带前缀的组名（Java MixAll.getRetryTopic(wrappedGroup)）。
-            if self.namespace:
-                self.consumer_group = NamespaceUtil.wrap_namespace(self.namespace, self.consumer_group)
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
@@ -2086,6 +2096,13 @@ class DefaultMQPullConsumer:
     def start(self) -> None:
         if self._started:
             return
+        # 对应 Java DefaultMQPullConsumerImpl.checkConfig（:772）——纯本地校验，
+        # 排在建立客户端实例之前，非法组名不需要等到连不上才报。
+        validators.check_group(self.consumer_group)
+        if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
+            raise MQClientException(
+                "consumerGroup can not equal %s, please specify another one."
+                % MixAll.DEFAULT_CONSUMER_GROUP)
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
         if self.client_id is None:
@@ -2410,6 +2427,12 @@ class DefaultLitePullConsumer:
     def start(self) -> None:
         if self._started:
             return
+        # 对应 Java DefaultLitePullConsumerImpl.checkConfig（:415）：纯本地校验，最先做
+        validators.check_group(self.consumer_group)
+        if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
+            raise MQClientException(
+                "consumerGroup can not equal %s, please specify another one."
+                % MixAll.DEFAULT_CONSUMER_GROUP)
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
         if not self.subscription and not self._assign_mode:

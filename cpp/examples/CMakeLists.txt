@@ -61,3 +61,7 @@ target_link_libraries(rmq_live_trace PRIVATE rocketmq::remoting)
 add_executable(rmq_live_hook live_hook.cpp)
 target_link_libraries(rmq_live_hook PRIVATE rocketmq::remoting)
 
+
+# 名字校验（Validators/TopicValidator）真机联调：本地快拒 + 合法名字照常收发 + 往返对照（不打进 ctest）
+add_executable(rmq_validators_live validators_live.cpp)
+target_link_libraries(rmq_validators_live PRIVATE rocketmq::remoting)

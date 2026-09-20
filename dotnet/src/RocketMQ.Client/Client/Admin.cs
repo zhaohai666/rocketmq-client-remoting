@@ -200,8 +200,13 @@ public sealed class DefaultMQAdminExt
 
     // 对应 DefaultMQAdminExt.createTopic：key / topicSysFlag 在 C++ 实作中被忽略，
     // 直接走 createTopicInRoute（默认 TopicConfig defaultTopic=TBW102，perm=READ|WRITE）。
-    public void CreateTopic(string key, string newTopic, int queueNum = 4, int topicSysFlag = 0) =>
+    public void CreateTopic(string key, string newTopic, int queueNum = 4, int topicSysFlag = 0)
+    {
+        // 对应 Java DefaultMQProducerImpl.createTopic 的本地校验：非法/系统 topic 名不该打到 broker
+        Validators.CheckTopic(newTopic);
+        Validators.IsSystemTopic(newTopic);
         RequireClient().CreateTopicInRoute(newTopic, queueNum, queueNum, MixAll.ReadPermByDefault);
+    }
 
     public void CreateAndUpdateTopicConfig(string addr, TopicConfig config) =>
         RequireClient().CreateTopicInBroker(

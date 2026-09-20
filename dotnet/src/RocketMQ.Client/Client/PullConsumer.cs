@@ -126,6 +126,22 @@ public sealed class DefaultMQPullConsumer
                 return;
             }
 
+            // 对齐 Java DefaultMQPullConsumer.start()：把消费组套上命名空间（ns%group），
+            // 之后所有面向 broker 的组名（心跳 / 位点 / 回投）都用包装后的值。
+            if (_namespace.Length > 0)
+            {
+                _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
+            }
+
+            // 对应 Java DefaultMQPullConsumerImpl.checkConfig（:772）：组名合法性 + 挡掉
+            // DEFAULT_CONSUMER（订阅关系/位点会串组）。纯本地校验，排在连地址之前。
+            Validators.CheckGroup(_consumerGroup);
+            if (_consumerGroup == MixAll.DefaultConsumerGroup)
+            {
+                throw new MQClientException("consumerGroup can not equal " + MixAll.DefaultConsumerGroup
+                                            + ", please specify another one.");
+            }
+
             if (_nameServerAddrs.Count == 0)
             {
                 throw new MQClientException("name server address is not set");
@@ -134,13 +150,6 @@ public sealed class DefaultMQPullConsumer
             if (_clientId.Length == 0)
             {
                 _clientId = ClientIds.Build(_instanceName);
-            }
-
-            // 对齐 Java DefaultMQPullConsumer.start()：把消费组套上命名空间（ns%group），
-            // 之后所有面向 broker 的组名（心跳 / 位点 / 回投）都用包装后的值。
-            if (_namespace.Length > 0)
-            {
-                _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
             }
 
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),

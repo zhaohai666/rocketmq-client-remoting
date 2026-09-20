@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
@@ -51,7 +52,10 @@ int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallbac
 }  // namespace
 
 DefaultMQPullConsumer::DefaultMQPullConsumer(const std::string& consumerGroup) {
-    if (consumerGroup.empty()) {
+    // 与 push/lite-pull 生产者同款首道守卫：只挡空白组名。完整校验
+    // （长度/字符表/DEFAULT_CONSUMER 保留名）在 start() 里走 Validators::checkGroup，
+    // 与 Python 一致。⚠ 旧实现用 empty()，纯空白组名会漏过——改为 UtilAll::isBlank。
+    if (UtilAll::isBlank(consumerGroup)) {
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
@@ -83,16 +87,24 @@ void DefaultMQPullConsumer::registerMessageQueueListener(
 // ---------------------------------------------------------------- 生命周期
 void DefaultMQPullConsumer::start() {
     if (started_) return;
+    // 对齐 Java DefaultMQPullConsumer.start()：把消费组套上命名空间（ns%group），
+    // 之后所有面向 broker 的组名（心跳 / 位点 / 回投）都用包装后的值。
+    if (!namespace_.empty()) {
+        consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
+    }
+    // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:772) / Python：组名合法性 +
+    // 挡掉 DEFAULT_CONSUMER（共用默认组会混掉订阅关系与位点）。纯本地校验，
+    // 排在地址检查与建客户端实例之前，失败必须**不碰网络**。
+    Validators::checkGroup(consumerGroup_);
+    if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
+        throw MQClientException(
+            "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
+    }
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
-    }
-    // 对齐 Java DefaultMQPullConsumer.start()：把消费组套上命名空间（ns%group），
-    // 之后所有面向 broker 的组名（心跳 / 位点 / 回投）都用包装后的值。
-    if (!namespace_.empty()) {
-        consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,

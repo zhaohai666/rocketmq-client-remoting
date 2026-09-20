@@ -71,6 +71,7 @@ use crate::client::result::{
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::AccessChannel;
 use crate::client::trace_hook::{ConsumeMessageTraceHook, TraceReportSink};
+use crate::client::validators;
 use crate::common::message::{MessageExt, MessageQueue};
 use crate::common::message_const::{
     PROPERTY_MAX_OFFSET, PROPERTY_POP_CK, PROPERTY_RETRY_TOPIC,
@@ -942,6 +943,27 @@ impl DefaultMQPushConsumer {
             return Ok(());
         }
         let cfg = self.config();
+        // 消费组拼命名空间必须在算重试主题之前（Java DefaultMQPushConsumer.start:763）。
+        let group = if cfg.namespace.is_empty() {
+            cfg.consumer_group.clone()
+        } else {
+            NamespaceUtil::wrap_namespace(&cfg.namespace, &cfg.consumer_group)
+        };
+        // 对应 Java DefaultMQPushConsumerImpl.checkConfig(:1026)：先 Validators.check_group
+        // （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让 broker 侧
+        // 的订阅关系判定把两组混在一起，回投与重平衡都错乱。
+        // ⚠ checkConfig 是 Java start() 的第一步，所以这里领先于地址/订阅/监听器检查：
+        // 组名非法时既不碰网络，也不该被后面的错误盖掉真正原因。
+        if let Err(e) = validators::check_group(&group) {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(e);
+        }
+        if group == MixAll::DEFAULT_CONSUMER_GROUP {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(Error::client(
+                "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.",
+            ));
+        }
         if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
@@ -958,12 +980,6 @@ impl DefaultMQPushConsumer {
             bail!("message listener is not set");
         }
 
-        // 消费组拼命名空间必须在算重试主题之前（Java DefaultMQPushConsumer.start:763）。
-        let group = if cfg.namespace.is_empty() {
-            cfg.consumer_group.clone()
-        } else {
-            NamespaceUtil::wrap_namespace(&cfg.namespace, &cfg.consumer_group)
-        };
         let client_id = cfg.client_id.clone().unwrap_or_else(|| {
             // Python: "%s@%s" % (instance_name, strftime("%Y%m%d%H%M%S"))
             format!(
@@ -3656,6 +3672,29 @@ mod tests {
         consumer.subscribe("T", "TagA").unwrap();
         assert!(consumer.start().await.is_err(), "未设置 listener");
         assert!(!consumer.is_started());
+    }
+
+    /// 组名校验是这三道校验里的第一道：地址、订阅、listener 全都不缺，照样因为组名失败，
+    /// 报的也只是组名的错。用 `127.0.0.1:1` 兜底，顺序被改坏时会连不上而不是打到真集群。
+    #[tokio::test]
+    async fn start_rejects_bad_consumer_group_before_the_other_gates() {
+        let long_group = std::iter::repeat_n('g', 121).collect::<String>();
+        for (group, needle) in [
+            (
+                MixAll::DEFAULT_CONSUMER_GROUP,
+                "consumerGroup can not equal DEFAULT_CONSUMER",
+            ),
+            ("bad group", "contains illegal characters"),
+            (long_group.as_str(), "is longer than group max length"),
+        ] {
+            let consumer = DefaultMQPushConsumer::new(group).expect("构造不该提前拒绝");
+            consumer.set_namesrv_addr("127.0.0.1:1");
+            consumer.subscribe("T", "TagA").unwrap();
+            consumer.set_message_listener_concurrently(Arc::new(NoopListener));
+            let err = consumer.start().await.expect_err("非法组名必须本地失败");
+            assert!(err.to_string().contains(needle), "{group}: {err}");
+            assert!(!consumer.is_started(), "{group}: 失败的 start 必须回滚 started");
+        }
     }
 
     /// 订阅表：表达式经 `FilterAPI` 解析，重复订阅覆盖，`unsubscribe` 删除。

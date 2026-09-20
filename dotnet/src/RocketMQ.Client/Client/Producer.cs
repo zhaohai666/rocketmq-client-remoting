@@ -388,6 +388,15 @@ public class DefaultMQProducer
                 return;
             }
 
+            // 对应 Java DefaultMQProducerImpl.checkConfig()：组名合法性 + 保留默认组名。
+            // 排在 checkConfig 该在的位置——任何网络动作之前，非法配置在 Start() 当场失败。
+            Validators.CheckGroup(_producerGroup);
+            if (_producerGroup == MixAll.DefaultProducerGroup)
+            {
+                throw new MQClientException("producerGroup can not equal " + MixAll.DefaultProducerGroup
+                                            + ", please specify another one.");
+            }
+
             // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
             if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
@@ -733,20 +742,9 @@ public class DefaultMQProducer
 
     // ---------------- 校验 ----------------
 
-    private void CheckMessage(Message msg)
-    {
-        if (string.IsNullOrEmpty(msg.Topic))
-        {
-            throw new MQClientException("message topic is empty");
-        }
-
-        if (msg.Body.Length > _maxMessageSize)
-        {
-            throw new MQClientException("message body size " + msg.Body.Length.ToString(CultureInfo.InvariantCulture)
-                                        + " exceeds maxMessageSize "
-                                        + _maxMessageSize.ToString(CultureInfo.InvariantCulture));
-        }
-    }
+    // 对应 Java Validators.checkMessage：topic 合法性、禁发 topic、body 长度阈值、LMQ 路径。
+    // 本地先拦下来是因为 TOPIC_NOT_EXIST 属于可重试码，非法名字会把重试预算空转一遍。
+    private void CheckMessage(Message msg) => Validators.CheckMessage(msg, _maxMessageSize);
 
     // 对应 Java DefaultMQProducerImpl.tryToCompressMessage + sendKernelImpl 的 sysFlag 组装：
     // 满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sysFlag
@@ -1105,6 +1103,13 @@ public class DefaultMQProducer
         if (msgs is null || msgs.Count == 0)
         {
             throw new MQClientException("message list is empty");
+        }
+
+        // 对应 Java DefaultMQProducer.batch()：**每条子消息**都过一遍 Validators.checkMessage，
+        // 少这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
+        foreach (Message m in msgs)
+        {
+            Validators.CheckMessage(m, _maxMessageSize);
         }
 
         MessageBatch batch = MessageBatch.GenerateFromList(msgs);
@@ -1605,6 +1610,9 @@ public class DefaultMQProducer
     {
         MQClientInstance c = GetClient();
         const int perm = 6; // PERM_READ | PERM_WRITE
+        // 对应 Java DefaultMQProducerImpl.createTopic：先本地校验原始 topic 名，再查系统 topic
+        Validators.CheckTopic(newTopic);
+        Validators.IsSystemTopic(newTopic);
         // C++ 的 createTopic 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
         _ = key;
         string realTopic = _namespace.Length == 0

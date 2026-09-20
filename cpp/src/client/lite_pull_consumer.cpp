@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
@@ -77,7 +78,9 @@ int64_t parseConsumeTimestamp(const std::string& ts) {
 }  // namespace
 
 DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGroup) {
-    if (consumerGroup.empty()) {
+    // 与 push consumer 同款首道守卫：只挡空白组名（⚠ 旧实现用 empty()，纯空白漏过，
+    // 改为 UtilAll::isBlank）；完整校验在 start() 里走 Validators::checkGroup。
+    if (UtilAll::isBlank(consumerGroup)) {
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
@@ -142,6 +145,16 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
 // ---------------------------------------------------------------- 生命周期
 void DefaultLitePullConsumer::start() {
     if (started_) return;
+    if (!namespace_.empty()) {
+        consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
+    }
+    // 对应 Java DefaultLitePullConsumerImpl.checkConfig(:415) / Python：组名合法性 +
+    // 挡掉 DEFAULT_CONSUMER。纯本地校验，排在地址/订阅检查之前，失败不碰网络。
+    Validators::checkGroup(consumerGroup_);
+    if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
+        throw MQClientException(
+            "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
+    }
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
@@ -153,9 +166,6 @@ void DefaultLitePullConsumer::start() {
     parseConsumeTimestamp(consumeTimestamp_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
-    }
-    if (!namespace_.empty()) {
-        consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,

@@ -17,3 +17,4 @@ pub mod trace;
 pub mod trace_context;
 pub mod trace_dispatcher;
 pub mod trace_hook;
+pub mod validators;

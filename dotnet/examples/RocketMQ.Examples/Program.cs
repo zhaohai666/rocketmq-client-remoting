@@ -44,6 +44,7 @@ internal static class Program
                 "trace" => LiveTrace.Run(rest),
                 "tls" => LiveTls.Run(rest),
                 "hook" => LiveHook.Run(rest),
+                "validators-live" => LiveValidators.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -81,6 +82,7 @@ internal static class Program
               popc         [namesrv]        真实集群 POP **消费侧**联调（消费循环/ack/延迟重投）
               trace        [namesrv]        真实集群消息轨迹联调（需 broker traceTopicEnable=true）
               hook         [namesrv]        真实集群 CheckForbidden/FilterMessage 钩子联调
+              validators-live [namesrv]     真实集群名字校验联调（本地快拒 + 合法名字收发 + 往返对照）
             """);
     }
 }

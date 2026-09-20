@@ -105,3 +105,9 @@ endif()
 add_executable(rmq_test_lite_pull test_lite_pull.cpp)
 target_link_libraries(rmq_test_lite_pull PRIVATE rocketmq::remoting)
 add_test(NAME lite_pull COMMAND rmq_test_lite_pull)
+
+# Validators fast-fail：topic/group 字符表与长度 + checkMessage 文案/顺序/响应码 +
+# start() 组名守卫（非法/保留组不碰网络即失败）
+add_executable(rmq_test_validators test_validators.cpp)
+target_link_libraries(rmq_test_validators PRIVATE rocketmq::remoting)
+add_test(NAME validators COMMAND rmq_test_validators)

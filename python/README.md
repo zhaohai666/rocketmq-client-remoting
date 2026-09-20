@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 345 条单元/协议测试（4 skip 为可选依赖相关）
+pytest -q                     # 559 条单元/协议测试（4 skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -30,6 +30,7 @@ python verify_compression_live.py selftest   # 自动压缩自产自销 + broker
 python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 探针跨客户端互通
 python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需 broker traceTopicEnable=true）
 python verify_hook_live.py        # CheckForbidden/FilterMessage 钩子（13 PASS/0 FAIL）
+python verify_validators_live.py  # 名字校验（24 PASS/0 FAIL）：非法 topic/group 本地快拒、合法名字照常收发、往返对照腿
 ```
 
 其它真机脚本：`verify_acl_live.py`（需开 ACL 的集群）/ `verify_pull_live.py` /
