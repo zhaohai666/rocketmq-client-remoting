@@ -477,7 +477,7 @@ pub const DEFAULT_INSTANCE_NAME: &str = "DEFAULT";
 pub const SHORT_MAX_VALUE: i32 = 32767;
 
 /// Python `time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30*60))`。
-fn default_consume_timestamp() -> String {
+pub(crate) fn default_consume_timestamp() -> String {
     let now = chrono::Local::now();
     let past = now - chrono::Duration::minutes(30);
     past.format("%Y%m%d%H%M%S").to_string()
@@ -488,7 +488,7 @@ fn default_consume_timestamp() -> String {
 /// 与 Python 同用**本地时区**（`time.mktime` / `chrono::Local`），否则
 /// `CONSUME_FROM_TIMESTAMP` 的起点会差一个时区。解析不了必须硬失败（Java 在 start 时抛
 /// `consumeTimestamp is invalid`）——静默回落到「现在 - 30 分钟」会让起点错位无人察觉。
-fn consume_timestamp_millis(text: &str) -> Result<i64> {
+pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
     use chrono::TimeZone;
     chrono::NaiveDateTime::parse_from_str(text, "%Y%m%d%H%M%S")
         .ok()
@@ -2084,10 +2084,7 @@ async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
 /// `$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json`）。
 fn local_offset_path(inner: &Inner) -> Option<std::path::PathBuf> {
     let cfg = read_cfg(inner);
-    let home = match crate::common::util_all::user_home() {
-        Some(h) => h,
-        None => return None,
-    };
+    let home = crate::common::util_all::user_home()?;
     let base = std::path::Path::new(&home)
         .join(".rocketmq_offsets")
         .join(cfg.client_id.as_deref().unwrap_or("DEFAULT"))

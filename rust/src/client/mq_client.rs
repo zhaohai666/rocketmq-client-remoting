@@ -75,9 +75,11 @@ use crate::remoting::protocol::ext_fields::CustomHeader;
 use crate::remoting::protocol::extra_info;
 use crate::remoting::protocol::headers::{
     AckMessageRequestHeader, ChangeInvisibleTimeRequestHeader, ChangeInvisibleTimeResponseHeader,
-    ConsumeMessageDirectlyResultRequestHeader, CreateTopicRequestHeader,
-    GetConsumerListByGroupRequestHeader, GetConsumerRunningInfoRequestHeader,
-    GetConsumerStatusRequestHeader, GetMaxOffsetRequestHeader, GetMaxOffsetResponseHeader,
+    ConsumeMessageDirectlyResultRequestHeader, ConsumerSendMsgBackRequestHeader,
+    CreateTopicRequestHeader, GetConsumerListByGroupRequestHeader,
+    GetConsumerRunningInfoRequestHeader, GetConsumerStatusRequestHeader,
+    GetEarliestMsgStoretimeRequestHeader, GetEarliestMsgStoretimeResponseHeader,
+    GetMaxOffsetRequestHeader, GetMaxOffsetResponseHeader,
     GetMinOffsetRequestHeader, GetMinOffsetResponseHeader, LockBatchMqRequestHeader,
     PopMessageRequestHeader, PopMessageResponseHeader, PullMessageRequestHeader,
     PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
@@ -2114,6 +2116,70 @@ impl MQClientInstance {
         let mut resp_header = SearchOffsetResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
         Ok(resp_header.offset.unwrap_or(0))
+    }
+
+    /// Python 把这条 RPC 内联在 `DefaultMQPullConsumer.earliest_msg_store_time`
+    /// （`consumer.py:2166`）里，Rust 与其它 offset RPC 一并收在实例层
+    /// （Java `MQClientAPIImpl#getEarliestMsgStoretime`）。
+    /// 响应头缺 `timestamp` ⇒ `0`（Python `resp_header.timestamp or 0`）。
+    pub async fn get_earliest_msg_store_time(
+        &self,
+        mq: &MessageQueue,
+        timeout_millis: i64,
+        addr: Option<&str>,
+    ) -> Result<i64> {
+        let addr = match addr {
+            Some(a) => a.to_string(),
+            None => self.broker_addr(mq).await?,
+        };
+        let header = GetEarliestMsgStoretimeRequestHeader {
+            topic: Some(mq.topic.clone()),
+            queue_id: Some(mq.queue_id),
+        };
+        let mut request = RemotingCommand::create_request_command(
+            request_code::GET_EARLIEST_MSG_STORETIME,
+            Some(Box::new(header)),
+        );
+        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        Self::check_response(&response)?;
+        let mut resp_header = GetEarliestMsgStoretimeResponseHeader::default();
+        resp_header.from_ext_fields(response.ext_fields());
+        Ok(resp_header.timestamp.unwrap_or(0))
+    }
+
+    /// 消息回投（Java `MQClientAPIImpl#sendMessageBack`，同步等待响应）。
+    ///
+    /// 与 push 消费者内部那次回投的差别（`consumer.rs` 的 `send_message_back`）：
+    /// 那条是**发射后不管**（`tokio::spawn` + 只记日志），且把
+    /// `maxReconsumeTimes == -1` 映射成 16；这里必须把失败返回给调用方，
+    /// 且按 `consumer.py:2207` 原样下发 `-1`（Java `DefaultMQPullConsumerImpl
+    /// .sendMessageBack` 直接传 `getMaxReconsumeTimes()`，映射交给 broker）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consumer_send_msg_back(
+        &self,
+        consumer_group: &str,
+        msg: &MessageExt,
+        delay_level: i32,
+        max_reconsume_times: i32,
+        timeout_millis: i64,
+        addr: &str,
+    ) -> Result<()> {
+        let header = ConsumerSendMsgBackRequestHeader {
+            offset: Some(msg.commit_log_offset),
+            group: Some(consumer_group.to_string()),
+            delay_level: Some(delay_level),
+            origin_msg_id: msg.msg_id.clone(),
+            origin_topic: Some(msg.topic.clone()),
+            unit_mode: Some(false),
+            max_reconsume_times: Some(max_reconsume_times),
+        };
+        let mut request = RemotingCommand::create_request_command(
+            request_code::CONSUMER_SEND_MSG_BACK,
+            Some(Box::new(header)),
+        );
+        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        Self::check_response(&response)?;
+        Ok(())
     }
 
     // ---------------- 消息查询 ----------------
