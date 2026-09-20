@@ -262,9 +262,13 @@ class DefaultMQAdminExt:
         return self._require_client().get_all_topic_list_from_name_server()
 
     def fetch_topics_by_cluster(self, cluster_name: str) -> Set[str]:
-        """对应 Java fetchTopicsByCLuster（GET_TOPICS_BY_CLUSTER 打到 NameServer）。"""
+        """对应 Java fetchTopicsByCLuster（GET_TOPICS_BY_CLUSTER 打到 NameServer）。
+
+        字段名必须是 Java GetTopicsByClusterRequestHeader 的 ``cluster``：早先写成
+        ``clusterName`` 时 NameServer 查不到集群（NPE 被吞），只回 SUCCESS + 空列表。
+        """
         response = self._invoke_namesrv_one(RequestCode.GET_TOPICS_BY_CLUSTER,
-                                            {"clusterName": cluster_name})
+                                            {"cluster": cluster_name})
         topics: Set[str] = set()
         if response.code == ResponseCode.SUCCESS and response.body:
             obj = RemotingSerializable.decode_json(response.body)
