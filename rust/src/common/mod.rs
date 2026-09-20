@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod compression;
+pub mod consistent_hash;
 pub mod logging;
 pub mod message;
 pub mod message_client_id_setter;

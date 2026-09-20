@@ -55,6 +55,19 @@ impl MessageQueue {
         self.queue_id.to_string()
     }
 
+    /// 对应 Java `MessageQueue#toString`。
+    ///
+    /// ⚠ 刻意**不**与本模块的 [`fmt::Display`] 合并：Java 的 `toString` 是
+    /// `MessageQueue [topic=.., brokerName=.., queueId=..]`，而一致性哈希策略要哈希的
+    /// 正是这个字符串（差一个空格就与 Java 客户端不是同一个环），`Display` 那种
+    /// 面向日志的紧凑写法不能顶替它。
+    pub fn to_java_string(&self) -> String {
+        format!(
+            "MessageQueue [topic={}, brokerName={}, queueId={}]",
+            self.topic, self.broker_name, self.queue_id
+        )
+    }
+
     /// Java `MessageQueue#hashCode`：`((31 + brokerHash) * 31 + queueId) * 31 + topicHash`，
     /// 32 位有符号回绕。消费者 rebalance / 去重按它分桶，必须逐位一致。
     pub fn hashcode(&self) -> i32 {

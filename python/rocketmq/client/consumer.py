@@ -7,6 +7,8 @@ MessageQueueListener、消费进度管理、消息重投（sendMessageBack）等
 """
 from __future__ import annotations
 
+import bisect
+import hashlib
 import json
 import os
 import queue
@@ -151,11 +153,36 @@ class MessageQueueListener:
 
 
 class AllocateMessageQueueStrategy:
-    """队列分配策略接口。"""
+    """队列分配策略接口（对应 Java AllocateMessageQueueStrategy）。
+
+    与 Java 的有意差异：Java 的
+    ``AbstractAllocateMessageQueueStrategy#check`` 在非法入参时抛
+    ``IllegalArgumentException``，这里一律返回空列表——rebalance 是后台周期任务，
+    一条脏入参不该把消费者打挂。
+    """
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
         raise NotImplementedError
+
+    def get_name(self) -> str:
+        """对应 Java ``AllocateMessageQueueStrategy#getName``：算法名（AVG 等）。"""
+        raise NotImplementedError
+
+
+def _strategy_name(strategy: AllocateMessageQueueStrategy) -> str:
+    """取策略名用于日志。
+
+    Java 侧策略是接口实现、必有 ``getName()``；Python 允许业务方鸭子类型地传一个只有
+    ``allocate`` 的自定义对象，所以缺 ``get_name`` 时退化成类名而不是抛 AttributeError。
+    """
+    getter = getattr(strategy, "get_name", None)
+    if callable(getter):
+        try:
+            return str(getter())
+        except Exception:  # noqa: BLE001 - 日志取值不该影响 rebalance
+            pass
+    return strategy.__class__.__name__
 
 
 class AllocateMessageQueueAveragely(AllocateMessageQueueStrategy):
@@ -163,9 +190,15 @@ class AllocateMessageQueueAveragely(AllocateMessageQueueStrategy):
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
-        if not mq_all:
+        # 守卫顺序与 Java AbstractAllocateMessageQueueStrategy#check 一致：currentCID →
+        # mqAll → cidAll。唯一偏差：Java 这三种情况都抛 IllegalArgumentException，
+        # 这里只返回空列表（rebalance 是后台周期任务，脏入参不该把消费者打挂）；
+        # currentCID 不在 cidAll 时保留 Java 那条 [BUG] info 日志。
+        if not current_cid or not mq_all or not cid_all:
             return []
-        if not cid_all or current_cid not in cid_all:
+        if current_cid not in cid_all:
+            logger.info("[BUG] ConsumerGroup: %s The consumerId: %s not in cidAll: %s",
+                        consumer_group, current_cid, cid_all)
             return []
         index = cid_all.index(current_cid)
         mod = len(mq_all) % len(cid_all)
@@ -183,15 +216,21 @@ class AllocateMessageQueueAveragely(AllocateMessageQueueStrategy):
             end_index = start_index + average_size
         return mq_all[start_index:end_index]
 
+    def get_name(self) -> str:
+        return "AVG"
+
 
 class AllocateMessageQueueAveragelyByCircle(AllocateMessageQueueStrategy):
     """环形平均分配（对应 Java AllocateMessageQueueAveragelyByCircle）。"""
 
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
-        if not mq_all:
+        # 守卫与 Averagely 同款（Java AbstractAllocateMessageQueueStrategy#check），同样只返回空列表。
+        if not current_cid or not mq_all or not cid_all:
             return []
-        if not cid_all or current_cid not in cid_all:
+        if current_cid not in cid_all:
+            logger.info("[BUG] ConsumerGroup: %s The consumerId: %s not in cidAll: %s",
+                        consumer_group, current_cid, cid_all)
             return []
         index = cid_all.index(current_cid)
         result = []
@@ -199,9 +238,17 @@ class AllocateMessageQueueAveragelyByCircle(AllocateMessageQueueStrategy):
             result.append(mq_all[i])
         return result
 
+    def get_name(self) -> str:
+        return "AVG_BY_CIRCLE"
+
 
 class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
-    """按显式配置分配（对应 Java AllocateMessageQueueByConfig）。"""
+    """按显式配置分配（对应 Java AllocateMessageQueueByConfig）。
+
+    与 Java 的有意差异：Java 直接 ``return this.messageQueueList``，未配置时是 ``null``；
+    这里 __init__ 规整成空列表、allocate 返回列表副本。两边的 ``allocate`` 都**不**做
+    check，所以空 group / 空 cid_all 也照样返回配置值。
+    """
 
     def __init__(self, message_queue_list: Optional[List[MessageQueue]] = None):
         self.message_queue_list = list(message_queue_list) if message_queue_list else []
@@ -209,6 +256,343 @@ class AllocateMessageQueueByConfig(AllocateMessageQueueStrategy):
     def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
                  cid_all: List[str]) -> List[MessageQueue]:
         return list(self.message_queue_list)
+
+    def get_name(self) -> str:
+        return "CONFIG"
+
+
+# ------------------------------------------------------ 一致性哈希环（Java common 包）
+#
+# 对应 org.apache.rocketmq.common.consistenthash.{HashFunction, Node, VirtualNode,
+# ConsistentHashRouter}。只有 AllocateMessageQueueConsistentHash 用它，但整套照搬而不做
+# "等价改写"：环上的落点由 MD5 取字节的方式、虚拟节点命名、tailMap 含端点这三处细节
+# 共同决定，任何一处不同都会让全体队列换主，与 Java 客户端混跑时表现为重复/漏消费。
+
+
+class HashFunction:
+    """对应 Java `HashFunction#hash(String)`。自定义哈希用它注入策略。"""
+
+    def hash(self, key: str) -> int:
+        raise NotImplementedError
+
+
+class MD5Hash(HashFunction):
+    """对应 Java `ConsistentHashRouter.MD5Hash`：MD5 摘要的**前 4 字节**按大端拼成整数。
+
+    ⚠ 只取前 4 字节（不是完整 128 bit），换成其它取法就与 Java 不是同一个环。
+    """
+
+    def hash(self, key: str) -> int:
+        digest = hashlib.md5(key.encode("utf-8")).digest()
+        value = 0
+        for i in range(4):
+            value = (value << 8) | digest[i]
+        return value
+
+
+class Node:
+    """对应 Java `Node#getKey`：环上可寻址的东西，物理或虚拟都行。"""
+
+    def get_key(self) -> str:
+        raise NotImplementedError
+
+
+class ClientNode(Node):
+    """对应 Java `AllocateMessageQueueConsistentHash.ClientNode`：key 就是 clientId。"""
+
+    def __init__(self, client_id: str):
+        self.client_id = client_id
+
+    def get_key(self) -> str:
+        return self.client_id
+
+
+class VirtualNode(Node):
+    """对应 Java `VirtualNode`：key = 物理节点 key + "-" + 副本序号。"""
+
+    def __init__(self, physical_node: Node, replica_index: int):
+        self.physical_node = physical_node
+        self.replica_index = replica_index
+
+    def get_key(self) -> str:
+        return "%s-%d" % (self.physical_node.get_key(), self.replica_index)
+
+    def is_virtual_node_of(self, p_node: Node) -> bool:
+        return self.physical_node.get_key() == p_node.get_key()
+
+    def get_physical_node(self) -> Node:
+        return self.physical_node
+
+
+class ConsistentHashRouter:
+    """对应 Java `ConsistentHashRouter`：把节点哈希成环，路由到顺时针最近的物理节点。
+
+    Java 用 `TreeMap<Long, VirtualNode>`；这里用「升序 key 列表 + dict」等价替代。
+    `route_node` 要的是 `tailMap(hashVal).firstKey()`，而 TreeMap 的 tailMap **含端点**，
+    所以等价的查找是 `bisect_left`（相等的 hash 归自己），环空或越过末尾时回绕到首节点。
+    """
+
+    def __init__(self, p_nodes: Optional[List[Node]] = None, v_node_count: int = 0,
+                 hash_function: Optional[HashFunction] = None):
+        if hash_function is None:
+            hash_function = MD5Hash()
+        self.hash_function = hash_function
+        self._ring: Dict[int, VirtualNode] = {}
+        self._keys: List[int] = []
+        if p_nodes is not None:
+            for p_node in p_nodes:
+                self.add_node(p_node, v_node_count)
+
+    def add_node(self, p_node: Node, v_node_count: int) -> None:
+        # 对应 Java `#addNode`：已有副本要接着编号，否则同一个物理节点的 v 个虚拟节点
+        # 会全落在同一个 hash 上（Java 分两次 addNode 时靠 i + existingReplicas 区分）。
+        if v_node_count < 0:
+            raise ValueError("illegal virtual node counts :%d" % v_node_count)
+        existing_replicas = self.get_existing_replicas(p_node)
+        for i in range(v_node_count):
+            v_node = VirtualNode(p_node, i + existing_replicas)
+            key = self.hash_function.hash(v_node.get_key())
+            if key not in self._ring:
+                bisect.insort(self._keys, key)
+            # Java 是 TreeMap.put：同 hash 时后来者覆盖，位置不变
+            self._ring[key] = v_node
+
+    def remove_node(self, p_node: Node) -> None:
+        for key in [k for k in self._keys
+                    if self._ring[k].is_virtual_node_of(p_node)]:
+            self._keys.remove(key)
+            del self._ring[key]
+
+    def route_node(self, object_key: str) -> Optional[Node]:
+        if not self._ring:
+            return None
+        index = bisect.bisect_left(self._keys, self.hash_function.hash(object_key))
+        if index == len(self._keys):
+            index = 0  # 越过环的末尾 → 回绕到第一个（Java 的 ring.firstKey()）
+        return self._ring[self._keys[index]].get_physical_node()
+
+    def get_existing_replicas(self, p_node: Node) -> int:
+        return sum(1 for v_node in self._ring.values() if v_node.is_virtual_node_of(p_node))
+
+
+def _java_message_queue_string(mq: MessageQueue) -> str:
+    """对应 Java `MessageQueue#toString`（一致性哈希要哈希**它**，不是 repr）。
+
+    ⚠ 必须逐字符等于 Java 的 `"MessageQueue [topic=.., brokerName=.., queueId=..]"`：
+    Python 自己的 `__repr__` 是另一种写法，拿它去哈希会得到完全不同的环。
+    """
+    return "MessageQueue [topic=%s, brokerName=%s, queueId=%d]" % (
+        mq.topic, mq.broker_name, mq.queue_id)
+
+
+def _java_split(text: str, sep: str) -> List[str]:
+    """对应 Java `String#split(String)`（limit=0）：**丢掉末尾的空段**。
+
+    Python 的 `str.split` 保留尾空段，两边对 broker 名的切分结果因此不同，而
+    `AllocateMessageQueueByMachineRoom` 恰好按 `length == 2` 判合法，差异会直接改变
+    一条队列参不参与分配：
+
+    | 输入 | Java | Python 原生 |
+    |---|---|---|
+    | `"room1@"` | `["room1"]`（1 段，剔除） | `["room1", ""]`（2 段，误收） |
+    | `"room1@b@"` | `["room1", "b"]`（2 段，收） | `["room1", "b", ""]`（3 段，误剔） |
+    | `"@"` | `[]` | `["", ""]` |
+    | `""` / `"broker-a"` | 无分隔符命中时**整串原样返回**，哪怕是空串 | 同 |
+
+    最后一行是 Java `Pattern#split` 里 "If no match was found, return this" 那个早返回，
+    所以不能无条件裁尾（否则 `""` 会变成 `[]`）。以上取值用 JDK 17 实测核对过。
+    """
+    parts = text.split(sep)
+    if len(parts) == 1:
+        return parts  # 没命中分隔符：Java 原样返回整串
+    while parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
+class AllocateMessageQueueConsistentHash(AllocateMessageQueueStrategy):
+    """一致性哈希分配（对应 Java `AllocateMessageQueueConsistentHash`，`getName()` 为
+    `CONSISTENT_HASH`）。
+
+    与 AVG / AVG_BY_CIRCLE 的差别不是"分得均不均"，而是**稳定性**：队列数或消费者数变化时，
+    只有落在新增/移除节点之间弧段上的队列会换主（Java 单测
+    `AllocateMessageQueueConsitentHashTest` 正是断言这一点），AVG 则会把所有人的分界整体挪掉。
+
+    守卫口径同其它策略：Java 的 `check` 抛 IllegalArgumentException，这里返回空列表。
+    唯一保留抛的是构造函数里的 `virtualNodeCnt < 0`（Java 也在构造时抛，且不属于 rebalance
+    后台路径）。
+    """
+
+    def __init__(self, virtual_node_cnt: int = 10,
+                 custom_hash_function: Optional[HashFunction] = None):
+        # 对应 Java 三个构造函数的链：默认 10 个虚拟节点、默认 MD5Hash
+        if virtual_node_cnt < 0:
+            raise ValueError("illegal virtualNodeCnt :%d" % virtual_node_cnt)
+        self.virtual_node_cnt = virtual_node_cnt
+        self.custom_hash_function = custom_hash_function
+
+    def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
+                 cid_all: List[str]) -> List[MessageQueue]:
+        if not current_cid or not mq_all or not cid_all:
+            return []
+        if current_cid not in cid_all:
+            logger.info("[BUG] ConsumerGroup: %s The consumerId: %s not in cidAll: %s",
+                        consumer_group, current_cid, cid_all)
+            return []
+        cid_nodes = [ClientNode(cid) for cid in cid_all]
+        if self.custom_hash_function is not None:
+            router = ConsistentHashRouter(cid_nodes, self.virtual_node_cnt,
+                                          self.custom_hash_function)
+        else:
+            router = ConsistentHashRouter(cid_nodes, self.virtual_node_cnt)
+        result = []
+        for mq in mq_all:
+            node = router.route_node(_java_message_queue_string(mq))
+            if node is not None and node.get_key() == current_cid:
+                result.append(mq)
+        return result
+
+    def get_name(self) -> str:
+        return "CONSISTENT_HASH"
+
+
+class AllocateMessageQueueByMachineRoom(AllocateMessageQueueStrategy):
+    """按机房分配（对应 Java `AllocateMessageQueueByMachineRoom`，`getName()` 为
+    `MACHINE_ROOM`，注释里的场景是"支付宝逻辑机房"）。
+
+    约定 broker 名写成 `<机房>@<brokerName>`，只有前缀落在 `consumeridcs` 里的队列参与
+    分配，然后在这些队列内部再做一次"平均分配"（分片算法与 AVG 逐行相同，但 rem 的归属
+    判据是 `rem > currentIndex`，即余数队列发给前 rem 个消费者）。
+
+    ⚠ broker 名的切分走 [`_java_split`]，不是 Python 原生 `split`：Java 会丢掉末尾空段，
+    `"room1@"` 在 Java 是 1 段（不参与分配）、`"room1@b@"` 是 2 段（参与）。
+
+    ⚠ Java 的 `consumeridcs` 字段没有默认值，没 set 就 `contains` → NPE；这里默认空集合，
+    表现为"一条都不分"，与本端口一贯的"守卫返回空结果"口径一致。
+    """
+
+    def __init__(self, consumeridcs: Optional[Set[str]] = None):
+        self.consumeridcs: Set[str] = set(consumeridcs) if consumeridcs else set()
+
+    def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
+                 cid_all: List[str]) -> List[MessageQueue]:
+        if not current_cid or not mq_all or not cid_all:
+            return []
+        if current_cid not in cid_all:
+            logger.info("[BUG] ConsumerGroup: %s The consumerId: %s not in cidAll: %s",
+                        consumer_group, current_cid, cid_all)
+            return []
+        current_index = cid_all.index(current_cid)
+        if current_index < 0:
+            return []
+        premq_all = []
+        for mq in mq_all:
+            temp = _java_split(mq.broker_name, "@")
+            if len(temp) == 2 and temp[0] in self.consumeridcs:
+                premq_all.append(mq)
+        mod = len(premq_all) // len(cid_all)  # Java 是 int 除法
+        rem = len(premq_all) % len(cid_all)
+        start_index = mod * current_index
+        end_index = start_index + mod
+        result = list(premq_all[start_index:end_index])
+        if rem > current_index:
+            result.append(premq_all[current_index + mod * len(cid_all)])
+        return result
+
+    def get_name(self) -> str:
+        return "MACHINE_ROOM"
+
+    def get_consumeridcs(self) -> Set[str]:
+        return self.consumeridcs
+
+    def set_consumeridcs(self, consumeridcs: Set[str]) -> None:
+        self.consumeridcs = consumeridcs
+
+
+class MachineRoomResolver:
+    """对应 Java `AllocateMachineRoomNearby.MachineRoomResolver`：告诉策略"谁在哪个机房"。
+
+    Java 注释明确写了两个方法**都不能返回 null**（否则该机房视为空，队列会被撤走）。
+    """
+
+    def broker_deploy_in(self, message_queue: MessageQueue) -> str:
+        raise NotImplementedError
+
+    def consumer_deploy_in(self, client_id: str) -> str:
+        raise NotImplementedError
+
+
+class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
+    """机房就近分配（对应 Java `AllocateMachineRoomNearby`）。
+
+    代理模式：先按机房把队列和消费者各自分组，
+    1. 本消费者所在机房的队列只分给**同机房**的消费者（用内层策略）；
+    2. 那些**机房里没有任何活消费者**的队列，交给所有消费者按内层策略瓜分——
+       否则它们就没人消费了。
+
+    `getName()` 是 `"MACHINE_ROOM_NEARBY" + "-" + 内层策略名`（Java 同），因为日志里
+    必须能看出实际用的是哪个分配算法。
+
+    两个构造参数缺失时 Java 抛 NullPointerException；resolver 给出空机房时 Java 抛
+    IllegalArgumentException —— 这里都**照抛**：静默返回空列表等于把整个 topic 的队列
+    撤走，而 rebalance 抓住异常时反而会保住现有分配，与 Java 行为一致。
+    """
+
+    def __init__(self, allocate_message_queue_strategy: AllocateMessageQueueStrategy,
+                 machine_room_resolver: MachineRoomResolver):
+        if allocate_message_queue_strategy is None:
+            raise ValueError("allocateMessageQueueStrategy is null")
+        if machine_room_resolver is None:
+            raise ValueError("machineRoomResolver is null")
+        self.allocate_message_queue_strategy = allocate_message_queue_strategy
+        self.machine_room_resolver = machine_room_resolver
+
+    def allocate(self, consumer_group: str, current_cid: str, mq_all: List[MessageQueue],
+                 cid_all: List[str]) -> List[MessageQueue]:
+        if not current_cid or not mq_all or not cid_all:
+            return []
+        if current_cid not in cid_all:
+            logger.info("[BUG] ConsumerGroup: %s The consumerId: %s not in cidAll: %s",
+                        consumer_group, current_cid, cid_all)
+            return []
+
+        # 按机房分组。Java 用 TreeMap ⇒ 机房名**字典序**遍历，这里同样排序，
+        # 否则同名机房的处理顺序会随插入顺序变（结果集是并集，顺序也会进日志/断言）。
+        mr_2_mq: Dict[str, List[MessageQueue]] = {}
+        for mq in mq_all:
+            room = self.machine_room_resolver.broker_deploy_in(mq)
+            if room:
+                mr_2_mq.setdefault(room, []).append(mq)
+            else:
+                raise ValueError("Machine room is null for mq %s"
+                                 % _java_message_queue_string(mq))
+        mr_2_c: Dict[str, List[str]] = {}
+        for cid in cid_all:
+            room = self.machine_room_resolver.consumer_deploy_in(cid)
+            if room:
+                mr_2_c.setdefault(room, []).append(cid)
+            else:
+                raise ValueError("Machine room is null for consumer id %s" % cid)
+
+        allocate_results: List[MessageQueue] = []
+        # 1. 本消费者所在机房的队列：只在同机房消费者之间分
+        current_machine_room = self.machine_room_resolver.consumer_deploy_in(current_cid)
+        mq_in_this_machine_room = mr_2_mq.pop(current_machine_room, None)
+        consumer_in_this_machine_room = mr_2_c.get(current_machine_room)
+        if mq_in_this_machine_room:
+            allocate_results += self.allocate_message_queue_strategy.allocate(
+                consumer_group, current_cid, mq_in_this_machine_room,
+                consumer_in_this_machine_room)
+        # 2. 没有活消费者的机房：队列不能没人消费，交给全部消费者
+        for room in sorted(mr_2_mq):
+            if room not in mr_2_c:
+                allocate_results += self.allocate_message_queue_strategy.allocate(
+                    consumer_group, current_cid, mr_2_mq[room], cid_all)
+        return allocate_results
+
+    def get_name(self) -> str:
+        return "MACHINE_ROOM_NEARBY-%s" % _strategy_name(
+            self.allocate_message_queue_strategy)
 
 
 class PopProcessQueue:
@@ -717,6 +1101,9 @@ class DefaultMQPushConsumer:
             # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验起点时间，
             # 而不是等到 rebalance 里抛错、被 compute_pull_from_where 的兜底吞掉。
             self._consume_timestamp_millis()
+            # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1067）：策略为 None 直接拒绝启动。
+            if self.allocate_strategy is None:
+                raise MQClientException("allocateMessageQueueStrategy is null")
             if self.client_id is None:
                 self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
@@ -1082,7 +1469,7 @@ class DefaultMQPushConsumer:
                         self.consumer_group, self.client_id or "", mq_all, sorted(cid_all))
                 except Exception as e:  # noqa: BLE001
                     logger.error("allocate message queue exception, strategy=%s: %s",
-                                 self.allocate_strategy.__class__.__name__, e)
+                                 _strategy_name(self.allocate_strategy), e)
                     return
                 assigned.extend(got)
         with self._lock:
@@ -2042,6 +2429,12 @@ class DefaultMQPullConsumer:
         self.register_topics: Set[str] = set()
         self.message_queue_lists: List[MessageQueue] = []
         self.message_queue_listener: Optional[MessageQueueListener] = None
+        # 队列分配策略，对应 Java DefaultMQPullConsumer.allocateMessageQueueStrategy
+        # （字段初值 new AllocateMessageQueueAveragely():89，getter/setter:196-202）。
+        # 本端口拉模式由调用方自己管队列，所以它只作为配置存在并被 start() 校验，
+        # 不像 Java 那样注入 RebalancePullImpl（本端口没有拉模式后台重平衡）。
+        self.allocate_message_queue_strategy: Optional[AllocateMessageQueueStrategy] = \
+            AllocateMessageQueueAveragely()
         # 投递前过滤钩子（Java DefaultMQPullConsumerImpl.filterMessageHookList:80，
         # start() 时注册进 PullAPIWrapper:726）
         self.filter_message_hook_list: List[FilterMessageHook] = []
@@ -2089,6 +2482,12 @@ class DefaultMQPullConsumer:
     def set_message_queue_listener(self, listener: MessageQueueListener) -> None:
         self.message_queue_listener = listener
 
+    def set_allocate_message_queue_strategy(
+            self, strategy: Optional[AllocateMessageQueueStrategy]) -> None:
+        """对应 Java DefaultMQPullConsumer.setAllocateMessageQueueStrategy(:200)：
+        setter 不校验，置 None 由 start() 拒绝。"""
+        self.allocate_message_queue_strategy = strategy
+
     def get_register_topics(self) -> Set[str]:
         return self.register_topics
 
@@ -2105,6 +2504,9 @@ class DefaultMQPullConsumer:
                 % MixAll.DEFAULT_CONSUMER_GROUP)
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
+        # 对应 Java DefaultMQPullConsumerImpl.checkConfig（:803）：策略为 None 直接拒绝启动。
+        if self.allocate_message_queue_strategy is None:
+            raise MQClientException("allocateMessageQueueStrategy is null")
         if self.client_id is None:
             self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
         self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
@@ -2445,6 +2847,10 @@ class DefaultLitePullConsumer:
         # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验。
         # 下面解析初始位点的循环会吞异常，晚抛等于静默退化成从 max offset 消费。
         self._parse_consume_timestamp(self.consume_timestamp)
+        # 对应 Java DefaultLitePullConsumerImpl.checkConfig（:435）：策略为 None 直接拒绝启动，
+        # 而不是等 rebalance 里 None.allocate 抛 AttributeError 被静默吞掉。
+        if self.allocate_message_queue_strategy is None:
+            raise MQClientException("allocateMessageQueueStrategy is null")
         if self.client_id is None:
             self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
         self._mq_client = self._create_client()
@@ -2459,15 +2865,31 @@ class DefaultLitePullConsumer:
                         self._next_offset[mq] = self._resolve_initial_offset(mq)
                     except Exception:
                         logger.debug("start: resolve initial offset failed for %s", mq)
-        # 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息
+        # 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息。
+        # 心跳要靠「已知 broker 列表」发送，而该列表只来自 topic 路由表：start 时先把订阅/指派的
+        # topic 拉一遍路由并登记为「在用」（对应 Java sendHeartbeatToAllBrokerWithLock 之前必然先
+        # updateTopicRouteInfoFromNameServer）。少了这步，首轮心跳因为没有 broker 而静默不发 ⇒
+        # broker 侧看不到本实例 ⇒ 多实例 rebalance 各自独占全部队列（互相重复消费）。
+        self._refresh_route_for_heartbeat()
+        self._running = True
         self._send_heartbeat_to_all_broker()
         self._start_heartbeat_loop()
-        self._running = True
         self._started = True
         self._pull_thread = threading.Thread(
             target=self._pull_service_loop, daemon=True,
             name="rmq-lite-pull-%s" % self.consumer_group)
         self._pull_thread.start()
+
+    def _refresh_route_for_heartbeat(self) -> None:
+        """为心跳准备 broker 地址：拉取并登记本实例关注的 topic 路由。"""
+        topics = list(self.subscription.keys())
+        topics += [mq.topic for mq in self._assigned if mq.topic not in topics]
+        for topic in topics:
+            self._mq_client.register_topic_in_use(topic)
+            try:
+                self._mq_client.get_topic_publish_info(topic)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("lite start: refresh route for %s failed: %s", topic, e)
 
     def shutdown(self) -> None:
         if not self._started:
@@ -2657,22 +3079,30 @@ class DefaultLitePullConsumer:
 
     # ---------------- rebalance（subscribe 模式）----------------
     def _rebalance(self) -> None:
+        # 对应 Java DefaultLitePullConsumerImpl.rebalance → RebalanceImpl.doRebalance：
+        # 走的是与 push **完全相同**的 rebalanceByTopic 路径，所以 mqAll / cidAll 都要先排序。
+        # 顺序不一致会让同组不同实例算出互相冲突的分配（同一队列被两个实例同时消费）。
         new_set: Set[MessageQueue] = set()
         for topic in list(self.subscription.keys()):
             try:
                 info = self._mq_client.get_topic_publish_info(topic)
-                mq_all = [MessageQueue(q.topic, q.broker_name, q.queue_id)
-                          for q in info.msg_queue_list]
+                mq_all = sorted([MessageQueue(q.topic, q.broker_name, q.queue_id)
+                                 for q in info.msg_queue_list], key=_mq_sort_key)
             except Exception:
                 mq_all = []
-            cid_all = self._mq_client.get_consumer_id_list_by_group(topic, self.consumer_group) or []
+            cid_all = sorted(self._mq_client.get_consumer_id_list_by_group(topic, self.consumer_group) or [])
             if self.client_id not in cid_all:
-                cid_all = cid_all + [self.client_id]
+                cid_all = sorted(cid_all + [self.client_id])
             try:
                 allocated = self.allocate_message_queue_strategy.allocate(
                     self.consumer_group, self.client_id, mq_all, cid_all)
-            except Exception:
-                allocated = []
+            except Exception as e:  # noqa: BLE001
+                # 对应 Java RebalanceImpl.rebalanceByTopic 的 catch (Throwable)：只记日志、
+                # 本轮跳过该 topic（保留它当前的分配），绝不能因为一次策略异常就把队列撤走。
+                logger.error("allocate message queue exception, strategy=%s: %s",
+                             _strategy_name(self.allocate_message_queue_strategy), e)
+                new_set |= {mq for mq in self._assigned if mq.topic == topic}
+                continue
             new_set |= set(allocated)
         if new_set != self._assigned:
             old = self._assigned
@@ -2769,7 +3199,10 @@ __all__ = [
     "DefaultMQPushConsumer", "DefaultMQPullConsumer", "MessageSelector",
     "MessageQueueListener", "AllocateMessageQueueStrategy",
     "AllocateMessageQueueAveragely", "AllocateMessageQueueAveragelyByCircle",
-    "AllocateMessageQueueByConfig", "SimpleMessageListener",
+    "AllocateMessageQueueByConfig", "AllocateMessageQueueConsistentHash",
+    "AllocateMessageQueueByMachineRoom", "AllocateMachineRoomNearby",
+    "MachineRoomResolver", "ConsistentHashRouter", "MD5Hash", "HashFunction",
+    "SimpleMessageListener",
     "PullResult", "PullStatus", "MessageListener", "MessageListenerConcurrently",
     "MessageListenerOrderly", "ConsumeConcurrentlyStatus", "ConsumeOrderlyStatus",
 ]

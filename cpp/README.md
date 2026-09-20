@@ -53,7 +53,7 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 22 个用例，1267 项断言，~15s
+cd build && ctest --output-on-failure     # 24 个用例，2476 项断言，~10s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -79,6 +79,8 @@ cd build && ctest --output-on-failure     # 22 个用例，1267 项断言，~15s
 | `trace_context` | 24 | W3C `traceparent` 生成/校验/子 span/注入不覆盖/属性提取 |
 | `interop` | 70 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
 | `lite_pull` | 31 | `DefaultLitePullConsumer` 无网络状态机（subscribe/assign/seek/poll/committed）+ 221/309 应答体 wire 形状 |
+| `allocate_strategy` | 1167 | 六个策略与 Java 单测逐条对拍：`AVG` / `AVG_BY_CIRCLE` 的 Java 用例（10/4、7/3、边界队列续接）、四道 `check` 守卫的返回口径（本端口返回空结果而非 Java 的 `IllegalArgumentException`）、`CONFIG` 不查守卫且返回副本、`getName()` 与 Java 常量一致（六个名字齐全）、N 消费者恰好不重不漏覆盖每个队列、与 Python/Rust 参考实现的公式对拍、多 broker 真实队列、三类消费者（push / pull / lite）默认 AVG 且可替换，策略为 null 时 `start()` 用 Java `checkConfig` 的文案拒绝；**`CONSISTENT_HASH`** 用 Java 实测的哈希环表逐格对拍（6×2/6×3/10×4/20×10 与 vc=10 的 4×2/8×3、覆盖矩阵、注入自定义 `HashFunction` 后的 TreeMap 撞坑退化）、**`MACHINE_ROOM`** 的 `[0,1,4]/[2,3]` 分片与 `String#split("@")` 的 8 行裁尾空段真值表、**`MACHINE_ROOM_NEARBY-<内层>`** 的同机房优先 + 无消费者机房由全员共享（Java 单测的精确顺序）与 resolver 空机房**抛错**（保住上一轮分配） |
+| `consistent_hash` | 42 | 一致性哈希环 + 自带 MD5：RFC 1321 附录 A 全向量（含 55/56/57/64/65/200 字节的填充边界）与 Java `hash()` 取前 4 字节大端的真值、环的路由稳定性与越过末尾回绕、空环返回 null、负虚拟节点数只在 `addNode` 抛、`i + existingReplicas` 的副本下标不重叠、`removeNode` 不误伤别的节点、注入自定义 hash 生效、`ringHashes()` 严格升序 |
 | `validators` | 75 | 名字校验：字符表（码点 >=128 一律非法）与正则口径、12 个系统 topic / 8 个禁发 topic 名单（`TBW102` 可发、`%RETRY%` 可发）、`checkTopic`/`checkGroup` 的 blank→长度(127/120)→字符表顺序与文案逐字、`checkMessage` 只有 body 档位带 `MESSAGE_ILLEGAL(13)`、LMQ 分隔符、四类 facade 的 `start()` 组名门在建实例之前 |
 
 ```bash
@@ -102,6 +104,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_compression_live   send|recv 127.0.0.1:9876 <topic> <group> <size> [codec]
 ./build/examples/rmq_live_acl           127.0.0.1:9876   # 需开 ACL 的集群
 ./build/examples/rmq_live_pull          127.0.0.1:9876
+./build/examples/rmq_live_lite_pull     127.0.0.1:9876
 ./build/examples/rmq_live_request_reply 127.0.0.1:9876
 ./build/examples/rmq_live_latency       127.0.0.1:9876
 ./build/examples/rmq_live_pop           127.0.0.1:9876
@@ -119,6 +122,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
 | `rmq_validators_live` | 39 PASS / 0 FAIL | 名字校验真机对拍（与 Python/Rust/.NET 同场景）：S1 发送路径 13 项本地快拒（空白/超长/非法字符 topic、禁发的 broker 内部流水、body 三档 + `INNER_MULTI_DISPATCH` 分隔符，全部 <50ms 且不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `start()` 三道组名门 + 120 等长边界放行、S4 正腿（合法名字建 topic → push/lite 两路各收 3 条）、S5 对照腿（合法但不存在的 topic 不被误伤，真往返 46ms vs 本地 0.17ms）、S6 pull/lite 组名门 + 合法 pull 组查队列与位点、S7 `createTopic` 挡空白/非法/系统 topic |
 | `rmq_live_hook` | 13 PASS / 0 FAIL | `CheckForbiddenHook`（放行 / 每次发送尝试都回调 / 单向也拦截 / 被拦截的消息确实没落 broker）+ `FilterMessageHook`（拉取路径 3 收 2 丢且不重投、POP 路径 2 收 1 丢且**摘掉即 ack**）+ 客户端二次 tag 过滤（订阅 `TagA` 只收 `TagA`）+ 钩子异常被吞掉不影响后续钩子 |
+| `rmq_live_lite_pull` | 33 PASS / 0 FAIL | `DefaultLitePullConsumer` 真机全链路：S1 后台 rebalance 拿到 4 个队列 → S2 subscribe+poll 收全 12 条且内容一致 → S3 `commit` 后各队列位点 >0 → S4 assign+seek 从头重收 → S5 订阅级 tag 只收 6 条 → S6a `CONSUME_FROM_TIMESTAMP`（墙钟起点早于全部消息 → 收全）、S6b `offset_for_timestamp` 双向（30 分钟前 → 队首 Σ=0，10 分钟后 → Σ=12）→ S7a 默认策略名 `AVG` 且策略为 null 时 `start()` 报 Java 同款文案、S7b 换 `AVG_BY_CIRCLE` 后**同组两实例**分配无交集、并集覆盖 4 队列、下标步长 2（交叉而非连续段）、S7c 两半 `CONFIG` 各自只收到配置队列里的消息且合起来恰好 12 条互不重叠、S7d `CONSISTENT_HASH` 用**真实 clientId** 建环且线上分配收敛到「真实 mqAll/cidAll 离线跑同一策略」的预测（合起来收全 12 条）、S7e `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 在单机房下**原样透传**内层策略 + resolver 被逐个队列/两个真实 clientId 问过、S7f `MACHINE_ROOM` 白名单不匹配真实 `broker-a` → 安静饿死（分不到队列、poll 不到消息、同组 AVG 对照组仍只拿自己那半边）|
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -134,6 +138,7 @@ cpp/
 │   │   ├── compression.h           CompressorFactory（zlib / lz4 / zstd 类型解析）
 │   │   ├── sysflag.h / mix_all.h / topic_config.h / subscription_data.h / util_all.h
 │   │   ├── byte_buffer.h           大端读写游标
+│   │   ├── consistent_hash.h       一致性哈希环（`ConsistentHashRouter` + 自带 MD5）
 │   │   ├── logging.h               header-only 日志（默认 INFO，按大小轮转，线程名/毫秒/文件:行）
 │   │   └── net_compat.h            socket 跨平台兼容（含 SIGPIPE 处理）
 │   ├── remoting/
@@ -144,12 +149,14 @@ cpp/
 │   └── client/
 │       ├── mq_client.h             MQClientInstance：路由发现 + 全部 RPC
 │       ├── producer.h / consumer.h / admin.h / result.h / exception.h
+│       ├── allocate_strategy.h     六种队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG /
+│       │                            CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY）
 │       ├── hook.h / trace.h / trace_hook.h / trace_dispatcher.h
 │       │                            钩子接口（Send/Consume/EndTransaction/CheckForbidden/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
-├── src/                        与 include 同构的 31 个 .cpp
+├── src/                        与 include 同构的 41 个 .cpp
 ├── examples/                   selfcheck / interop_tool + 15 个真机联调工具
-└── tests/                      22 个 ctest 用例（含 Java 对拍）+ interop_check.py
+└── tests/                      24 个 ctest 用例（含 Java 对拍）+ interop_check.py
 ```
 
 ## 几个必须知道的实现约定

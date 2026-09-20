@@ -106,6 +106,17 @@ add_executable(rmq_test_lite_pull test_lite_pull.cpp)
 target_link_libraries(rmq_test_lite_pull PRIVATE rocketmq::remoting)
 add_test(NAME lite_pull COMMAND rmq_test_lite_pull)
 
+# 队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
+# MACHINE_ROOM_NEARBY）：Java 单测对拍 + 守卫 + 消费者可替换
+add_executable(rmq_test_allocate_strategy test_allocate_strategy.cpp)
+target_link_libraries(rmq_test_allocate_strategy PRIVATE rocketmq::remoting)
+add_test(NAME allocate_strategy COMMAND rmq_test_allocate_strategy)
+
+# 一致性哈希环（CONSISTENT_HASH 的底座）：MD5 官方向量 + Java 落点/回绕/replica 口径
+add_executable(rmq_test_consistent_hash test_consistent_hash.cpp)
+target_link_libraries(rmq_test_consistent_hash PRIVATE rocketmq::remoting)
+add_test(NAME consistent_hash COMMAND rmq_test_consistent_hash)
+
 # Validators fast-fail：topic/group 字符表与长度 + checkMessage 文案/顺序/响应码 +
 # start() 组名守卫（非法/保留组不碰网络即失败）
 add_executable(rmq_test_validators test_validators.cpp)

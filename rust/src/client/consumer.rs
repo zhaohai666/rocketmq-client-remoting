@@ -227,7 +227,7 @@ impl MessageSelector {
 /// 队列变更监听器（对应 Java `MessageQueueListener`）。
 ///
 /// Python 只在 `DefaultMQPullConsumer` / `DefaultLitePullConsumer` 上持有该监听器
-/// 字段，且只有 LitePull 真的会回调（`consumer.py:2650`）；push 消费者没有这个接缝，
+/// 字段，且只有 LitePull 真的会回调（`consumer.py:2705`）；push 消费者没有这个接缝，
 /// 与 Python 一致。接缝实现见 [`crate::client::pull_consumer`]。
 pub trait MessageQueueListener: Send + Sync {
     /// Java `messageQueueChanged`。`mq_all` 是该 topic 的全部队列，
@@ -255,7 +255,7 @@ pub trait MessageQueueListener: Send + Sync {
 pub struct PopProcessQueue {
     wait_ack_counter: AtomicI32,
     dropped: AtomicBool,
-    /// Python `last_pop_timestamp = time.time()`：**只写不读**（`consumer.py:228,1309`）。
+    /// Python `last_pop_timestamp = time.time()`：**只写不读**（`consumer.py:276,1309`）。
     /// Java 用它做过期清理，本项目没有那条清理路径，这里保留字段仅为了
     /// 「最近一次弹出的时刻」在诊断时可见，单位换成毫秒。
     pub last_pop_timestamp: AtomicI64,
@@ -312,7 +312,7 @@ impl PopProcessQueue {
 /// 监听器（对应 Java `MessageListener` 的两个实现）。
 ///
 /// Python 用 `isinstance(listener, MessageListenerOrderly)` 判定顺序/并发
-/// （`consumer.py:1969` 的 `_is_orderly`）；Rust 没有运行时类型探测，这里用枚举标签
+/// （`consumer.py:2020` 的 `_is_orderly`）；Rust 没有运行时类型探测，这里用枚举标签
 /// 表达同一件事 —— 只是**声明方式**不同，判定口径与 Python 完全一致。
 #[derive(Clone)]
 pub enum MessageListener {
@@ -343,7 +343,7 @@ impl std::fmt::Debug for MessageListener {
 ///
 /// Python 的属性可以随时直接赋值，这里聚成一个 `pub` 字段的结构体，由
 /// [`DefaultMQPushConsumer::config`] / [`DefaultMQPushConsumer::update_config`] 读写，
-/// 语义等价（生产者侧同一手法）。默认值逐项照抄 `consumer.py:266-390`。
+/// 语义等价（生产者侧同一手法）。默认值逐项照抄 `consumer.py:314-438`。
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
     /// Python `consumer_group`。
@@ -794,6 +794,15 @@ impl DefaultMQPushConsumer {
             .strategy
             .write()
             .unwrap_or_else(|e| e.into_inner()) = strategy;
+    }
+
+    /// 当前队列分配策略（对应 Java `DefaultMQPushConsumer.getAllocateMessageQueueStrategy`）。
+    pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
+        self.inner
+            .strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn set_rpc_hook(&self, hook: Option<Arc<dyn RPCHook>>) {
@@ -1303,7 +1312,7 @@ impl DefaultMQPushConsumer {
     ///
     /// Java 里同一个事实是 `ProcessQueue.isLocked()`；四个移植版的
     /// `consumerRunningInfo` 都不回填 `ProcessQueueInfo.locked`（Python
-    /// `consumer.py:1727-1732` 只写 commitOffset/cachedMsgCount/droped），
+    /// `consumer.py:1778-1783` 只写 commitOffset/cachedMsgCount/droped），
     /// 所以这是唯一能观测锁定状态的入口。
     pub fn locked_queue_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = lock(&self.inner.state).lock_ok.iter().cloned().collect();
@@ -1395,7 +1404,11 @@ impl DefaultMQPushConsumer {
                     Err(e) => {
                         // Python 在这里直接 `return`：本轮分配结果整个作废，
                         // 连已算好的 topic 都不写入（下一轮 20s 后再试）。照抄。
-                        rmq_error!("allocate message queue exception: {e}");
+                        rmq_error!(
+                            "allocate message queue exception. strategy name: {}, ex: {}",
+                            strategy.get_name(),
+                            e
+                        );
                         return Ok(());
                     }
                 }
@@ -3170,7 +3183,7 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             ));
         }
         if cfg.pop_mode {
-            // Python `consumer.py:1734-1741` 用 `self._mq_map.get(key)` 反查队列，但
+            // Python `consumer.py:1785-1792` 用 `self._mq_map.get(key)` 反查队列，但
             // pop 路径从不写 `_mq_map`（只有拉取入队时写），所以参考版的 mqPopTable
             // 恒空。这里按 Java `DefaultMQPushConsumerImpl.consumerRunningInfo:1473`
             // 的口径——popProcessQueueTable 本来就以 MessageQueue 为键——从当前分配
@@ -3594,6 +3607,50 @@ mod tests {
             );
         }
         assert!(DefaultMQPushConsumer::new("G").is_ok());
+    }
+
+    /// Java `DefaultMQPushConsumer:89`（字段默认 `new AllocateMessageQueueAveragely()`）
+    /// 与 `:196-202`（getter/setter）。
+    /// ⚠ Python/C++/.NET 那条「置 null 后 checkConfig 拒绝启动」在这里由
+    /// `Arc<dyn ...>` 表达成「类型上不可表示」，所以没有对应的拒绝分支。
+    #[test]
+    fn push_consumer_exposes_the_allocate_strategy() {
+        use crate::client::allocate_strategy::{
+            AllocateMessageQueueAveragelyByCircle, AllocateMessageQueueByConfig,
+        };
+
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        assert_eq!(
+            consumer.allocate_message_queue_strategy().get_name(),
+            "AVG",
+            "默认策略必须是 AVG"
+        );
+
+        consumer.set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueAveragelyByCircle));
+        assert_eq!(
+            consumer.allocate_message_queue_strategy().get_name(),
+            "AVG_BY_CIRCLE",
+            "策略可替换，getter 读回同一个"
+        );
+
+        let by_config = Arc::new(AllocateMessageQueueByConfig::new(vec![MessageQueue::new(
+            "T", "broker-a", 1,
+        )]));
+        consumer.set_allocate_message_queue_strategy(by_config.clone());
+        // 存的是共享引用：换进消费者之后再改列表依然对所有 rebalance 生效（Java/Python 同）
+        by_config.set_message_queue_list(vec![
+            MessageQueue::new("T", "broker-a", 0),
+            MessageQueue::new("T", "broker-a", 1),
+        ]);
+        let strategy = consumer.allocate_message_queue_strategy();
+        assert_eq!(strategy.get_name(), "CONFIG");
+        assert_eq!(
+            strategy
+                .allocate("G", "cid", &[], &["cid".to_string()])
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     /// Python `getMQQueueCacheKey`：三段**直接拼接**，无分隔符。

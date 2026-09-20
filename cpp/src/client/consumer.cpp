@@ -58,6 +58,8 @@ DefaultMQPushConsumer::DefaultMQPushConsumer(const std::string& consumerGroup) {
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
+    // Java DefaultMQPushConsumer 的默认策略（构造参数可覆盖，这里等价于 setter）。
+    allocateStrategy_ = std::make_shared<AllocateMessageQueueAveragely>();
 }
 
 DefaultMQPushConsumer::~DefaultMQPushConsumer() {
@@ -75,6 +77,17 @@ void DefaultMQPushConsumer::setNamesrvAddr(const std::string& addr) {
 
 void DefaultMQPushConsumer::setNameServerAddresses(const std::vector<std::string>& addrs) {
     nameServerAddrs_ = addrs;
+}
+
+void DefaultMQPushConsumer::setAllocateMessageQueueStrategy(
+    std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
+    // 与 Java 一致：setter 不校验，null 由 start() 的 checkConfig 拒绝
+    //（Java DefaultMQPushConsumerImpl.checkConfig:1067）。
+    allocateStrategy_ = std::move(strategy);
+}
+
+std::shared_ptr<AllocateMessageQueueStrategy> DefaultMQPushConsumer::allocateMessageQueueStrategy() const {
+    return allocateStrategy_;
 }
 
 void DefaultMQPushConsumer::setConsumeThreadNums(int32_t n) {
@@ -279,6 +292,11 @@ void DefaultMQPushConsumer::start() {
         // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
         if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
             throw MQClientException("name server address is not set");
+        }
+        // 对应 Java DefaultMQPushConsumerImpl.checkConfig(:1067)：策略为 null 直接拒绝启动，
+        // 而不是等 rebalance 解引用空指针（UB）。
+        if (allocateStrategy_ == nullptr) {
+            throw MQClientException("allocateMessageQueueStrategy is null");
         }
         if (subscriptionData_.empty()) {
             throw MQClientException("subscription is not set, call subscribe() first");
@@ -1864,8 +1882,17 @@ void DefaultMQPushConsumer::doRebalance() {
                 continue;
             }
             std::sort(cidAll.begin(), cidAll.end());
-            std::vector<MessageQueue> got =
-                allocateMessageQueueAveragely(consumerGroup_, clientId_, mqAll, cidAll);
+            // 自定义策略抛异常时：**保持现有分配**并结束本轮 rebalance
+            // （Python client/consumer.py 的 try/except → return；Java 是 catch Throwable →
+            //  log error → return false）。绝不能把该 topic 的队列撤走。
+            std::vector<MessageQueue> got;
+            try {
+                got = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
+            } catch (const std::exception& e) {
+                logger_error("allocate message queue exception. strategy name: "
+                             + allocateStrategy_->getName() + ", ex: " + e.what());
+                return;
+            }
             assigned.insert(assigned.end(), got.begin(), got.end());
         }
     }
@@ -1925,32 +1952,6 @@ std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::str
         logger_debug("rebalance: no route for topic " + topic + ": " + e.what());
     }
     return out;
-}
-
-std::vector<MessageQueue> DefaultMQPushConsumer::allocateMessageQueueAveragely(
-    const std::string& consumerGroup, const std::string& currentCid,
-    const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) {
-    (void)consumerGroup;
-    std::vector<MessageQueue> result;
-    int mqCount = static_cast<int>(mqAll.size());
-    int cidCount = static_cast<int>(cidAll.size());
-    if (mqCount == 0 || cidCount == 0) return result;
-    auto it = std::find(cidAll.begin(), cidAll.end(), currentCid);
-    if (it == cidAll.end()) return result;  // 本实例不在消费组列表里 → 不分配
-    int index = static_cast<int>(it - cidAll.begin());
-    // 对齐 Java AllocateMessageQueueAveragely
-    int mod = mqCount % cidCount;
-    int averageSize = (mqCount <= cidCount)
-                          ? 1
-                          : (mod > 0 && index < mod ? mqCount / cidCount + 1 : mqCount / cidCount);
-    int startIndex = (mod > 0 && index < mod) ? index * averageSize : index * averageSize + mod;
-    int range = std::min(averageSize, mqCount - startIndex);
-    for (int i = 0; i < range; ++i) {
-        if (startIndex + i < mqCount) {
-            result.push_back(mqAll[startIndex + i]);
-        }
-    }
-    return result;
 }
 
 bool DefaultMQPushConsumer::ownsQueue(const std::string& key) const {

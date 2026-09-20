@@ -30,7 +30,7 @@
 //!    `DefaultMQPullConsumerImpl#pullSyncImpl` 会把 `FilterAPI.buildSubscriptionData`
 //!    造出的 `subscriptionData` 交给 `PullAPIWrapper#processPullResult`，后者在
 //!    `!tagsSet.isEmpty()` 时按字符串再筛一遍（:112-121）。Python/cpp/dotnet 三版
-//!    都只跑过滤钩子（`consumer.py:2044-2055` 的注释把这件事说成 Java 行为，其实
+//!    都只跑过滤钩子（`consumer.py:2095-2106` 的注释把这件事说成 Java 行为，其实
 //!    不成立）。差别只在 broker 侧 tag **哈希**碰撞时才会显现（碰撞消息 Java 丢、
 //!    本版留），这里保持与四门语言一致的口径，不改行为、只在此处记账。
 //! 2. **不做 Java 的 `subscriptionAutomatically` / 消费者注册**。Java 的拉取消费者
@@ -44,7 +44,7 @@
 //!    改用内部生产者把消息直接发进 `%RETRY%group`；本实现按 Python 同口径直接返回错误
 //!    （见 [`DefaultMQPullConsumer::send_message_back`]）。
 //! 5. **`MessageQueueListener` 按 Java 签名回调**：Python 的重平衡用两个实参调
-//!    三参方法（`consumer.py:2650`），异常被外层 `except Exception: pass` 吞掉 ⇒
+//!    三参方法（`consumer.py:2705`），异常被外层 `except Exception: pass` 吞掉 ⇒
 //!    监听器在 Python 里**从未真正触发过**；cpp 传的是「全部订阅队列 + 新分配」两参。
 //!    这里回调 `(topic, mqAll, mqDivided)`（Java `RebalanceImpl#messageQueueChanged`），
 //!    与本项目已有的 trait 形状一致。
@@ -140,7 +140,7 @@ fn with_namespace(namespace: &str, topic: &str) -> String {
 ///
 /// ⚠ 短轮询这条**绝不能**置 suspend 位：broker 会在队尾挂到
 /// `brokerSuspendMaxTimeMillis`（20s），而客户端 10s 就超时 ——
-/// 真机必现 `RemotingTimeoutException`（Python `consumer.py:2117` 的踩坑记录）。
+/// 真机必现 `RemotingTimeoutException`（Python `consumer.py:2168` 的踩坑记录）。
 fn pull_sys_flag(block: bool) -> i32 {
     PullSysFlag::build_sys_flag_basic(false, block, true, false)
 }
@@ -148,7 +148,7 @@ fn pull_sys_flag(block: bool) -> i32 {
 // ================================================================ DefaultMQPullConsumer
 
 /// [`DefaultMQPullConsumer`] 的配置（Python `DefaultMQPullConsumer.__init__`
-/// 里那批平铺属性，`consumer.py:2008-2030`）。
+/// 里那批平铺属性，`consumer.py:2059-2081`）。
 #[derive(Debug, Clone)]
 pub struct PullConsumerConfig {
     /// Python `consumer_group`。
@@ -192,7 +192,6 @@ impl Default for PullConsumerConfig {
     }
 }
 
-#[derive(Default)]
 struct PullInner {
     cfg: RwLock<PullConsumerConfig>,
     client: Mutex<Option<MQClientInstance>>,
@@ -200,7 +199,26 @@ struct PullInner {
     filter_hooks: FilterMessageHookList,
     register_topics: Mutex<BTreeSet<String>>,
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
+    /// 对应 Java `DefaultMQPullConsumer.allocateMessageQueueStrategy` 的字段初值
+    /// （`new AllocateMessageQueueAveragely()`:89）。本端口拉模式不做 rebalance
+    /// （见模块头偏离 2），所以它只是配置形状，与 Python/C++/dotnet 同口径。
+    strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
+}
+
+impl Default for PullInner {
+    fn default() -> PullInner {
+        PullInner {
+            cfg: RwLock::new(PullConsumerConfig::default()),
+            client: Mutex::new(None),
+            started: AtomicBool::new(false),
+            filter_hooks: FilterMessageHookList::new(),
+            register_topics: Mutex::new(BTreeSet::new()),
+            listener: Mutex::new(None),
+            strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
+            rpc_hook: RwLock::new(None),
+        }
+    }
 }
 
 /// 拉模式消费者（对应 Java `DefaultMQPullConsumer` + `DefaultMQPullConsumerImpl`，
@@ -340,6 +358,31 @@ impl DefaultMQPullConsumer {
         *lock(&self.inner.listener) = Some(listener);
     }
 
+    /// 队列分配策略，对应 Java `DefaultMQPullConsumer` 的 getter/setter(:196-202)。
+    ///
+    /// ⚠ Java 的 checkConfig(:803) 会拒绝 null 策略；Rust 用 `Arc<dyn ...>` 表达
+    /// 「一定有策略」，那个分支类型上不可表示，故无对应校验。本端口拉模式不做
+    /// rebalance（见模块头偏离 2），策略只作为配置形状保留。
+    pub fn set_allocate_message_queue_strategy(
+        &self,
+        strategy: Arc<dyn AllocateMessageQueueStrategy>,
+    ) {
+        *self
+            .inner
+            .strategy
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = strategy;
+    }
+
+    /// 当前队列分配策略（对应 Java `getAllocateMessageQueueStrategy`）。
+    pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
+        self.inner
+            .strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Python `get_register_topics`（Java 用它拼心跳订阅集；本移植版只登记，
     /// 不发心跳，见模块头偏离 2）。
     pub fn register_topics(&self) -> Vec<String> {
@@ -382,7 +425,7 @@ impl DefaultMQPullConsumer {
     /// Python `start()`：幂等、必须有 name server，`client_id` 缺省时现造。
     ///
     /// ⚠ `client_id` 的时间戳是**秒级** `instanceName@yyyyMMddHHmmss`
-    /// （`consumer.py:2083`），与推送消费者同格式；同一秒内起两个实例会撞 clientId，
+    /// （`consumer.py:2134`），与推送消费者同格式；同一秒内起两个实例会撞 clientId，
     /// 那时 [`MQClientInstance::create_mq_client_instance`] 会复用同一实例 —— 与
     /// Python/Java 同语义（Java 靠 `changeInstanceNameToPID` 规避，本项目四版都没做）。
     pub async fn start(&self) -> Result<()> {
@@ -483,7 +526,7 @@ impl DefaultMQPullConsumer {
 
     /// Python `fetch_subscribe_message_queues`：按发布路由列队列。
     ///
-    /// ⚠ 与 lite 版不同，这里**不拼命名空间**（`consumer.py:2103-2106` 直接把入参
+    /// ⚠ 与 lite 版不同，这里**不拼命名空间**（`consumer.py:2154-2157` 直接把入参
     /// topic 传给路由查询），与 Python 保持逐字一致。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = self.require_client()?;
@@ -696,7 +739,7 @@ fn split_addrs(addr: &str) -> Vec<String> {
 
 // ================================================================ DefaultLitePullConsumer
 
-/// [`DefaultLitePullConsumer`] 的配置（Python `consumer.py:2239-2292`）。
+/// [`DefaultLitePullConsumer`] 的配置（Python `consumer.py:2290-2343`）。
 #[derive(Debug, Clone)]
 pub struct LitePullConsumerConfig {
     /// Python `consumer_group`。
@@ -1009,6 +1052,9 @@ impl DefaultLitePullConsumer {
     }
 
     /// Python `set_allocate_message_queue_strategy`。
+    ///
+    /// ⚠ Rust 用 `Arc<dyn ...>` 表达「一定有策略」，Java/Python 那个「置 null/None
+    /// 再由 checkConfig 拒绝」的分支在这里类型不可表示，故无对应校验。
     pub fn set_allocate_message_queue_strategy(
         &self,
         strategy: Arc<dyn AllocateMessageQueueStrategy>,
@@ -1018,6 +1064,16 @@ impl DefaultLitePullConsumer {
             .strategy
             .write()
             .unwrap_or_else(|e| e.into_inner()) = strategy;
+    }
+
+    /// 当前队列分配策略（对应 Java `getAllocateMessageQueueStrategy`，
+    /// `DefaultLitePullConsumer:196` 同款）。
+    pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
+        self.inner
+            .strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Python `set_message_queue_listener`（Java 签名回调，见模块头偏离 5）。
@@ -1050,7 +1106,7 @@ impl DefaultLitePullConsumer {
     /// Python `subscribe(topic, sub_expression="*")`：切回 subscribe 模式。
     ///
     /// 表达式非法（`FilterAPI` 抛错）时只丢订阅表里的那条
-    /// （Python `consumer.py:2358-2361`），`subscription` 仍记下 —— 与 Python 一致。
+    /// （Python `consumer.py:2409-2412`），`subscription` 仍记下 —— 与 Python 一致。
     pub fn subscribe(&self, topic: &str, sub_expression: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
         {
@@ -1072,7 +1128,7 @@ impl DefaultLitePullConsumer {
     }
 
     /// Python `subscribe_with_selector`：lite 只认 tag 表达式，`MessageSelector`
-    /// 一律按 tag 处理（`consumer.py:2363-2365`）。
+    /// 一律按 tag 处理（`consumer.py:2414-2416`）。
     pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) {
         self.subscribe(topic, &selector.expression);
     }
@@ -1146,12 +1202,12 @@ impl DefaultLitePullConsumer {
     // ---------------- 生命周期 ----------------
 
     /// Python `start()`：幂等；先查组名，再有 name server，必须已有订阅或 assign；
-    /// **先同步发一次心跳再起后台循环**。
+    /// **先把订阅 topic 的路由缓存进来，再同步发一次心跳**，最后起后台循环。
     ///
-    /// ⚠ 真机实测：自建实例此刻路由表还是空的，所以这一轮心跳实际发 0 份
-    /// （Python 逐字如此，这里保持一致）。副作用是**订阅要到 5s 心跳循环的第一轮**
-    /// 才注册上 broker —— 想立刻验证心跳到达数，先 [`rebalance`](Self::rebalance)
-    /// 或 [`fetch_message_queues`](Self::fetch_message_queues) 把路由缓存进来。
+    /// 心跳只发给路由表里已知的 broker，所以刷路由必须在那次同步心跳之前
+    /// （见 [`refresh_route_for_heartbeat`](Self::refresh_route_for_heartbeat)）：
+    /// 否则 start() 那一轮发 0 份，订阅要等到 5s 心跳循环第一轮才注册上 broker，
+    /// 同组多实例时对端要晚一个心跳周期才能看见彼此。
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -1232,7 +1288,7 @@ impl DefaultLitePullConsumer {
         // 只取 client 引用备用。
         *lock(&self.inner.client) = Some(client);
 
-        // assign 模式：start 时补齐初始位点（Python `consumer.py:2412-2418`）
+        // assign 模式：start 时补齐初始位点（Python `consumer.py:2463-2469`）
         let pending: Vec<MessageQueue> = {
             let state = lock(&self.inner.state);
             state
@@ -1247,6 +1303,7 @@ impl DefaultLitePullConsumer {
         }
 
         // 先把 tag 订阅注册给 broker，再起后台拉取
+        self.refresh_route_for_heartbeat().await;
         self.send_heartbeat_to_all_broker().await;
         self.inner.running.store(true, Ordering::Release);
         let _ = self.inner.stop.send(false);
@@ -1331,6 +1388,32 @@ impl DefaultLitePullConsumer {
     }
 
     // ---------------- 心跳 ----------------
+
+    /// Python `_refresh_route_for_heartbeat`：心跳只发给「路由表里已知的 broker」，
+    /// 而自建实例刚 start 时路由表还是空的，那一轮会发 0 份 —— 订阅要等到 5s 心跳
+    /// 循环的第一轮才注册上 broker。所以这里先把本实例关注的 topic（订阅的 + assign
+    /// 到的）路由拉一遍并登记为在用，让 start() 里那次同步心跳真正到达 broker。
+    ///
+    /// 对应 Java：`MQClientInstance#sendHeartbeatToAllBrokerWithLock` 依赖
+    /// `topicRouteTable`，而 `DefaultLitePullConsumerImpl#start` 在注册心跳前先
+    /// `updateTopicRouteInfoFromNameServer`。
+    async fn refresh_route_for_heartbeat(&self) {
+        let Ok(client) = Self::require_client(&self.inner) else {
+            return;
+        };
+        let mut topics: Vec<String> = lock(&self.inner.state).subscription.keys().cloned().collect();
+        for mq in lock(&self.inner.state).assigned.values() {
+            if !topics.contains(&mq.topic) {
+                topics.push(mq.topic.clone());
+            }
+        }
+        for topic in topics {
+            client.register_topic_in_use(&topic);
+            if let Err(e) = client.get_topic_publish_info(&topic, false).await {
+                rmq_debug!("lite start: refresh route for {topic} failed: {e}");
+            }
+        }
+    }
 
     /// Python `_send_heartbeat_to_all_broker`：向路由里的每个 broker 发一份，返回成功数。
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
@@ -1590,6 +1673,10 @@ impl DefaultLitePullConsumer {
             .clone();
 
         let mut new_assigned: BTreeMap<String, MessageQueue> = BTreeMap::new();
+        // 本轮的分配起点：本 topic 当前的分配。策略抛错时以它兜底——
+        // Java `RebalanceImpl#rebalanceByTopic` 在 `catch (Throwable)` 里直接 `return false`，
+        // 位置在 `updateProcessQueueTableInRebalance` **之前**，所以一次分配异常不会把队列撤走。
+        let baseline: Vec<MessageQueue> = lock(&self.inner.state).assigned.values().cloned().collect();
         // topic -> (全部队列, 分到的队列)，用于 MessageQueueListener 回调
         let mut per_topic: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = Vec::new();
         for topic in topics {
@@ -1614,8 +1701,8 @@ impl DefaultLitePullConsumer {
             {
                 Ok(got) => got,
                 Err(e) => {
-                    rmq_debug!("lite rebalance: allocate failed for {topic}: {e}");
-                    Vec::new()
+                    rmq_warn!("lite rebalance: allocate failed for {topic}: {e}");
+                    baseline.iter().filter(|mq| mq.topic == topic).cloned().collect()
                 }
             };
             for mq in &allocated {
@@ -1641,7 +1728,7 @@ impl DefaultLitePullConsumer {
                     state.next_offset.remove(key);
                     state.last_commit.remove(key);
                     // ⚠ 与 Python 一致：撤销队列**只**清 next_offset / last_commit，
-                    // seek_offset 与 paused 保留（consumer.py:2659-2661）。队列回到本实例时
+                    // seek_offset 与 paused 保留（consumer.py:2714-2719）。队列回到本实例时
                     // 用户先前 seek 的位置仍然生效。
                 }
             }
@@ -2134,7 +2221,7 @@ mod tests {
     #[test]
     fn bad_tag_expression_drops_only_subscription_data() {
         // `"||"` 会让 FilterAPI 抛 `subString split error`：Python 保留
-        // `subscription` 条目、丢掉 `subscription_data`（consumer.py:2358-2361）
+        // `subscription` 条目、丢掉 `subscription_data`（consumer.py:2409-2412）
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.subscribe("T", "||");
         assert_eq!(c.subscription().len(), 1);
@@ -2343,5 +2430,64 @@ mod tests {
         let high = queue("T", "broker-a", 1);
         assert!(mq_key(&low) < mq_key(&high));
         assert!(_key_order_proof(&low) < _key_order_proof(&high));
+    }
+
+    /// 两个拉消费者的策略面（Java `DefaultMQPullConsumer:89` 字段默认 + `:196-202`
+    /// getter/setter；`DefaultLitePullConsumer` 同款）。
+    ///
+    /// ⚠ Python/C++/.NET 都有「置 null/None 后 `start()` 抛
+    /// `allocateMessageQueueStrategy is null`」（Java checkConfig:803）；Rust 用
+    /// `Arc<dyn ...>` 把它压成「类型上不可表示」，所以这里只测默认值与替换。
+    #[test]
+    fn both_pull_consumers_expose_the_allocate_strategy() {
+        use crate::client::allocate_strategy::{
+            AllocateMessageQueueAveragelyByCircle, AllocateMessageQueueByConfig,
+        };
+
+        let mq_all: Vec<MessageQueue> = (0..4).map(|i| queue("T", "broker-a", i)).collect();
+        let cid_all: Vec<String> = vec!["cid-a".to_string(), "cid-b".to_string()];
+        let allocate_ids = |strategy: &dyn AllocateMessageQueueStrategy, group: &str| -> Vec<i32> {
+            strategy
+                .allocate(group, "cid-a", &mq_all, &cid_all)
+                .unwrap()
+                .iter()
+                .map(MessageQueue::get_queue_id)
+                .collect()
+        };
+
+        let pull = DefaultMQPullConsumer::new("PG").unwrap();
+        assert_eq!(
+            pull.allocate_message_queue_strategy().get_name(),
+            "AVG",
+            "pull 默认策略 = AVG"
+        );
+        pull.set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueAveragelyByCircle));
+        let pull_strategy = pull.allocate_message_queue_strategy();
+        assert_eq!(pull_strategy.get_name(), "AVG_BY_CIRCLE", "pull 可替换");
+        assert_eq!(
+            allocate_ids(&*pull_strategy, "PG"),
+            vec![0, 2],
+            "pull 换上的策略就是 getter 读回的那个"
+        );
+
+        let lite = DefaultLitePullConsumer::new("LG").unwrap();
+        assert_eq!(
+            lite.allocate_message_queue_strategy().get_name(),
+            "AVG",
+            "lite 默认策略 = AVG"
+        );
+        let by_config = Arc::new(AllocateMessageQueueByConfig::new(vec![
+            queue("T", "broker-a", 0),
+            queue("T", "broker-a", 1),
+        ]));
+        lite.set_allocate_message_queue_strategy(by_config.clone());
+        assert_eq!(lite.allocate_message_queue_strategy().get_name(), "CONFIG");
+        // getter 交出的是共享引用而不是快照：之后改列表照样作用于 rebalance
+        by_config.set_message_queue_list(vec![queue("T", "broker-a", 3)]);
+        assert_eq!(
+            allocate_ids(&*lite.allocate_message_queue_strategy(), "LG"),
+            vec![3],
+            "CONFIG 策略无视 mqAll/cidAll 返回配置队列"
+        );
     }
 }

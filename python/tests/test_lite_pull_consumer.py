@@ -42,6 +42,9 @@ class MockClient:
         self.remoting_client = SimpleNamespace(register_rpc_hook=lambda *a, **k: None)
         self._store = store
         self.committed: Dict[Tuple[str, int], int] = {}
+        # start() 必须先把 topic 登记为「在用」并拉一次路由，再发首轮心跳（心跳目标
+        # 只来自路由表）。顺序用事件流水记录，便于断言而不是只断言发生过。
+        self.events: List[str] = []
 
     def start(self) -> None:
         pass
@@ -50,9 +53,15 @@ class MockClient:
         pass
 
     def get_route_of_all_brokers(self):
+        self.events.append("brokers")
         return []  # 无真实 broker，心跳发往空集合（no-op）
 
+    def register_topic_in_use(self, topic):
+        self.events.append("register:%s" % topic)
+
     def get_topic_publish_info(self, topic):
+        self.events.append("route:%s" % topic)
+
         class _Info:
             msg_queue_list = [MessageQueue(topic, b, q) for (b, q) in self._store.keys()]
         return _Info()
@@ -158,6 +167,31 @@ class TestLifecycle:
             assert c._started is True
         finally:
             c.shutdown()
+
+    def test_start_pulls_route_before_the_first_heartbeat(self):
+        # 心跳只发给「路由表里已知的 broker」，所以刷路由必须排在那次同步心跳之前；
+        # 反了的话首轮心跳没有目标，broker 侧看不到本实例，多实例 rebalance 会
+        # 各自独占全部队列（真实集群上表现为重复消费）。
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.subscribe("T", "*")
+        c.start()
+        try:
+            events = c._mock.events
+            assert "register:T" in events and "route:T" in events, events
+            assert events.index("route:T") < events.index("brokers"), events
+        finally:
+            c.shutdown()
+
+        assigned = _Lite("LitePG_UT", _store=STORE)
+        assigned.set_namesrv_addr("127.0.0.1:9876")
+        assigned.assign([MessageQueue("T", "broker-a", 0)])
+        assigned.start()
+        try:
+            # assign 模式下 subscription 是空的，路由得从已指派队列反推出来
+            assert "register:T" in assigned._mock.events, assigned._mock.events
+        finally:
+            assigned.shutdown()
 
 
 class TestAssignMode:

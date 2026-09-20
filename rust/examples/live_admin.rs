@@ -62,6 +62,7 @@ use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueu
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::topic_config::{TopicConfig, TopicFilterType, DEFAULT_PERM};
 use rocketmq_client_remoting::error::Error;
+use rocketmq_client_remoting::remoting::protocol::admin_body::TopicStatsTable;
 use rocketmq_client_remoting::remoting::protocol::codes::response_code;
 use rocketmq_client_remoting::remoting::protocol::ext_fields::StringMap;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
@@ -849,15 +850,25 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
         return sent;
     }
     // broker 统计是周期刷新的，带预算轮询到 maxOffset 到位。
+    // 只保留**见过最大值**的那份快照：轮询期间 broker 侧的统计可能先回一个偏小的
+    // 半刷新结果，若最后一轮拿到什么就用什么，下面的"按 broker 查是合并结果子集"
+    // 会拿"更晚时刻"的单 broker 值去比"更早时刻"的合并值，随机假失败。
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
-    let mut stats = None;
+    let mut stats: Option<TopicStatsTable> = None;
     loop {
         match admin.examine_topic_stats(&topic).await {
-            Ok(table) if table.total_max_offset() >= N_MSG as i64 => {
-                stats = Some(table);
-                break;
+            Ok(table) => {
+                let total = table.total_max_offset();
+                let better = stats
+                    .as_ref()
+                    .is_none_or(|old| total > old.total_max_offset());
+                if better {
+                    stats = Some(table);
+                }
+                if total >= N_MSG as i64 {
+                    break;
+                }
             }
-            Ok(table) => stats = Some(table),
             Err(e) => {
                 if Instant::now() > deadline {
                     ck.abort("A7 examineTopicStats", &e.to_string());

@@ -87,6 +87,8 @@ DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGrou
     // 对应 Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
     // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
     consumeTimestamp_ = UtilAll::timeMillisToHumanString3(nowMillis() - 30 * 60 * 1000);
+    // 对应 Java DefaultLitePullConsumer 的字段初值 new AllocateMessageQueueAveragely()。
+    allocateStrategy_ = std::make_shared<AllocateMessageQueueAveragely>();
 }
 
 DefaultLitePullConsumer::~DefaultLitePullConsumer() {
@@ -103,6 +105,17 @@ void DefaultLitePullConsumer::setNamesrvAddr(const std::string& addr) {
 
 void DefaultLitePullConsumer::setNameServerAddresses(const std::vector<std::string>& addrs) {
     nameServerAddrs_ = addrs;
+}
+
+void DefaultLitePullConsumer::setAllocateMessageQueueStrategy(
+    std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
+    // 与 Java 一致：setter 不校验，null 由 start() 的 checkConfig 拒绝。
+    allocateStrategy_ = std::move(strategy);
+}
+
+std::shared_ptr<AllocateMessageQueueStrategy>
+DefaultLitePullConsumer::allocateMessageQueueStrategy() const {
+    return allocateStrategy_;
 }
 
 // ---------------------------------------------------------------- 订阅 / 分配
@@ -158,6 +171,11 @@ void DefaultLitePullConsumer::start() {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
+    // 对应 Java DefaultLitePullConsumerImpl.checkConfig(:435)：策略为 null 直接拒绝启动，
+    // 而不是等 rebalance 解引用空指针（UB）。
+    if (allocateStrategy_ == nullptr) {
+        throw MQClientException("allocateMessageQueueStrategy is null");
+    }
     if (subscription_.empty() && !assignMode_) {
         throw MQClientException("subscription is not set, call subscribe() or assign() first");
     }
@@ -171,12 +189,24 @@ void DefaultLitePullConsumer::start() {
                                         /*connectTimeoutMillis=*/3000,
                                         /*invokeTimeoutMillis=*/10000));
     mqClient_->start();
-    // 登记在用 topic，让路由周期刷新（订阅 topic 与已 assign 队列所在 topic）。
+    // 登记在用 topic，并**同步**把路由拉进来：心跳只发给「实例路由表里已知的 broker」，
+    // 自建实例此刻路由表还是空的，那一轮会发 0 份 → 订阅要等 5s 心跳循环第一轮才注册上
+    // broker，同组多实例时首轮 rebalance 会各自独占全部队列。
+    // （对应 Python `_refresh_route_for_heartbeat` / Java 注册心跳前的 updateTopicRouteInfo）
+    std::set<std::string> routeTopics;
     for (const auto& kv : subscription_) {
-        mqClient_->registerTopicInUse(kv.first);
+        routeTopics.insert(kv.first);
     }
     for (const MessageQueue& mq : assigned_) {
-        mqClient_->registerTopicInUse(mq.topic);
+        routeTopics.insert(mq.topic);
+    }
+    for (const std::string& t : routeTopics) {
+        mqClient_->registerTopicInUse(t);
+        try {
+            mqClient_->getTopicPublishInfo(t);
+        } catch (const std::exception& e) {
+            logger_debug("lite start: refresh route for " + t + " failed: " + e.what());
+        }
     }
     if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
         logger_warn("lite pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
@@ -195,8 +225,10 @@ void DefaultLitePullConsumer::start() {
     }
     // 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息。
     sendHeartbeatToAllBroker();
-    heartbeatThread_ = std::thread(&DefaultLitePullConsumer::heartbeatLoop, this);
+    // running_ 必须在心跳线程起来**之前**置位：heartbeatLoop 的循环条件是它，
+    // 线程先跑起来会看到 false 直接退出，本实例就再也不会周期心跳（broker 120s 后踢掉）。
     running_ = true;
+    heartbeatThread_ = std::thread(&DefaultLitePullConsumer::heartbeatLoop, this);
     started_ = true;
     pullThread_ = std::thread(&DefaultLitePullConsumer::pullServiceLoop, this);
 }
@@ -365,26 +397,6 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
 }
 
 // ---------------------------------------------------------------- rebalance
-std::vector<MessageQueue> DefaultLitePullConsumer::allocateMessageQueueAveragely(
-    const std::string& /*consumerGroup*/, const std::string& currentCid,
-    const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) {
-    if (mqAll.empty()) return {};
-    if (cidAll.empty() || std::find(cidAll.begin(), cidAll.end(), currentCid) == cidAll.end()) {
-        return {};
-    }
-    int index = static_cast<int>(std::find(cidAll.begin(), cidAll.end(), currentCid) - cidAll.begin());
-    int mod = static_cast<int>(mqAll.size() % cidAll.size());
-    int avg = mqAll.size() <= cidAll.size()
-                  ? 1
-                  : (mod > 0 && index < mod ? static_cast<int>(mqAll.size()) / static_cast<int>(cidAll.size()) + 1
-                                            : static_cast<int>(mqAll.size()) / static_cast<int>(cidAll.size()));
-    int startIndex =
-        (mod > 0 && index < mod) ? index * avg : index * avg + mod;
-    int range = std::min(avg, static_cast<int>(mqAll.size()) - startIndex);
-    if (range <= 0) return {};
-    return std::vector<MessageQueue>(mqAll.begin() + startIndex, mqAll.begin() + startIndex + range);
-}
-
 void DefaultLitePullConsumer::rebalance() {
     std::set<MessageQueue> newSet;
     for (const auto& kv : subscription_) {
@@ -395,13 +407,28 @@ void DefaultLitePullConsumer::rebalance() {
         } catch (...) {
             mqAll.clear();
         }
+        // Java RebalanceImpl.rebalanceByTopic 在分配前 Collections.sort(mqAll) + sort(cidAll)：
+        // 顺序不一致会让同组不同实例算出冲突的分配（同一队列被两个实例同时消费）。
+        std::sort(mqAll.begin(), mqAll.end());
         std::vector<std::string> cidAll =
             mqClient_->getConsumerIdListByGroup(kv.first, consumerGroup_);
         if (std::find(cidAll.begin(), cidAll.end(), clientId_) == cidAll.end()) {
             cidAll.push_back(clientId_);
         }
-        std::vector<MessageQueue> allocated =
-            allocateMessageQueueAveragely(consumerGroup_, clientId_, mqAll, cidAll);
+        std::sort(cidAll.begin(), cidAll.end());
+        std::vector<MessageQueue> allocated;
+        // Java RebalanceImpl#rebalanceByTopic 的 catch (Throwable) 直接 return，位置在
+        // updateProcessQueueTableInRebalance **之前** → 一次分配异常不该把队列撤走。
+        // 所以这里回退成「沿用本 topic 当前的分配」（Python / Rust 同口径）。
+        try {
+            allocated = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
+        } catch (const std::exception& e) {
+            logger_error("allocate message queue exception. strategy name: "
+                         + allocateStrategy_->getName() + ", ex: " + e.what());
+            for (const MessageQueue& mq : assigned_) {
+                if (mq.topic == kv.first) allocated.push_back(mq);
+            }
+        }
         newSet.insert(allocated.begin(), allocated.end());
     }
     if (newSet != assigned_) {

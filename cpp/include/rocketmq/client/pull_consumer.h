@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "rocketmq/client/allocate_strategy.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
@@ -59,6 +60,17 @@ public:
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
+    }
+    // 队列分配策略，对应 Java DefaultMQPullConsumer.allocateMessageQueueStrategy
+    // （字段初值 new AllocateMessageQueueAveragely():89，getter/setter:196-202）。
+    // setter 不校验，置 nullptr 由 start() 按 Java checkConfig(:803) 拒绝。
+    // 本端口拉模式不做 rebalance（见文件头），所以它只是配置面 + 启动校验。
+    void setAllocateMessageQueueStrategy(std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
+        allocateStrategy_ = std::move(strategy);
+    }
+    // 对应 Java DefaultMQPullConsumer.getAllocateMessageQueueStrategy(:196)。
+    const std::shared_ptr<AllocateMessageQueueStrategy>& allocateMessageQueueStrategy() const {
+        return allocateStrategy_;
     }
     // 对应 Java registerMessageQueueListener(topic, listener)：登记 topic + 该 topic 的监听器。
     void registerMessageQueueListener(const std::string& topic,
@@ -134,6 +146,9 @@ private:
     std::set<std::string> registerTopics_;
     std::map<std::string, std::shared_ptr<MessageQueueListener>> messageQueueListeners_;
     std::shared_ptr<MessageQueueListener> messageQueueListener_;
+    // 对应 Java DefaultMQPullConsumer.allocateMessageQueueStrategy 的默认值
+    std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_ =
+        std::make_shared<AllocateMessageQueueAveragely>();
 
     std::unique_ptr<MQClientInstance> mqClient_;
     bool started_ = false;

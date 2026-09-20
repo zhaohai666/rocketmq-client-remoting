@@ -59,7 +59,7 @@
 //! [`MessageListenerConcurrently`](super::result::MessageListenerConcurrently) 与
 //! [`MessageListenerOrderly`](super::result::MessageListenerOrderly)，都是 `Send + Sync`
 //! 的对象安全 trait，本模块刻意不重复定义（复用规则）。`consumer.rs` 要写的就是
-//! Python `consumer.py:1345` `self._pop_executor.submit(self._consume_pop_batch, batch, pq, mq)`
+//! Python `consumer.py:1396` `self._pop_executor.submit(self._consume_pop_batch, batch, pq, mq)`
 //! 的等价物：
 //!
 //! ```text
@@ -219,7 +219,7 @@ impl ConsumeExecutor {
     }
 
     /// 对应 Python `ConsumeExecutor(core, max, keep_alive_seconds=..., thread_name_prefix=...)`
-    /// （POP 路径实际用的形态，见 Python `consumer.py:738`）。
+    /// （POP 路径实际用的形态，见 Python `consumer.py:789`）。
     ///
     /// 入参照抄 Python 的夹取：`core = max(0, core)`、`max = max(core, max)`，
     /// 所以负数不会报错、只会退化成 0。`keep_alive == 0` 表示超编 worker 一空闲就退出

@@ -45,6 +45,12 @@ public sealed class DefaultMQPullConsumer
     private readonly Dictionary<string, IMessageQueueListener> _messageQueueListeners =
         new(StringComparer.Ordinal);
     private IMessageQueueListener? _messageQueueListener;
+    // 队列分配策略，对应 Java DefaultMQPullConsumer.allocateMessageQueueStrategy
+    // （字段初值 new AllocateMessageQueueAveragely():89，getter/setter:196-202）。
+    // 与 Java 同款：setter 不校验，置 null 由 Start() 的 checkConfig(:803) 拒绝。
+    // 本端口拉模式不做 rebalance，所以它只是配置面 + 启动校验。
+    private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy =
+        new AllocateMessageQueueAveragely();
 
     private readonly int _brokerSuspendMaxTimeMillis = 20000;
     private readonly int _consumerPullTimeoutMillis = 10000;
@@ -81,6 +87,13 @@ public sealed class DefaultMQPullConsumer
 
     public void SetMessageQueueListener(IMessageQueueListener listener) =>
         _messageQueueListener = listener;
+
+    public void SetAllocateMessageQueueStrategy(IAllocateMessageQueueStrategy? strategy) =>
+        _allocateMessageQueueStrategy = strategy;
+
+    /// <summary>对应 Java DefaultMQPullConsumer.getAllocateMessageQueueStrategy(:196)。</summary>
+    public IAllocateMessageQueueStrategy? AllocateMessageQueueStrategy =>
+        _allocateMessageQueueStrategy;
 
     /// <summary>对应 Java registerMessageQueueListener(topic, listener)：登记 topic + 该 topic 的监听器。</summary>
     public void RegisterMessageQueueListener(string topic, IMessageQueueListener listener)
@@ -145,6 +158,12 @@ public sealed class DefaultMQPullConsumer
             if (_nameServerAddrs.Count == 0)
             {
                 throw new MQClientException("name server address is not set");
+            }
+
+            // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:803)：策略为 null 直接拒绝启动。
+            if (_allocateMessageQueueStrategy is null)
+            {
+                throw new MQClientException("allocateMessageQueueStrategy is null");
             }
 
             if (_clientId.Length == 0)

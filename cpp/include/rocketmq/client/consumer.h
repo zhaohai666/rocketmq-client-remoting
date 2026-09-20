@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/allocate_strategy.h"
 #include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/hook.h"
 #include "rocketmq/client/mq_client.h"
@@ -132,6 +133,13 @@ public:
     void setInstanceName(const std::string& name) { instanceName_ = name; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
+    // 队列分配策略（对应 Java DefaultMQPushConsumer.setAllocateMessageQueueStrategy）。
+    // 与 Java 同款：setter 允许传 nullptr，由 start() 的 checkConfig 拒绝
+    //（Java DefaultMQPushConsumerImpl.checkConfig:1067 "allocateMessageQueueStrategy is null"）。
+    // 默认 AllocateMessageQueueAveragely。
+    void setAllocateMessageQueueStrategy(std::shared_ptr<AllocateMessageQueueStrategy> strategy);
+    // 对应 Java DefaultMQPushConsumer.getAllocateMessageQueueStrategy（RebalanceImpl 同名字段）。
+    std::shared_ptr<AllocateMessageQueueStrategy> allocateMessageQueueStrategy() const;
     void setConsumeThreadNums(int32_t n);
     // ---- 消费线程弹性（对应 Java DefaultMQPushConsumer / AbstractConsumeMessageService）----
     void setConsumeThreadMin(int32_t n);
@@ -357,10 +365,6 @@ private:
     void doRebalance();
     // 当前分配里「topic 的全部队列」（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
     std::vector<MessageQueue> allQueuesOfTopic(const std::string& topic);
-    // AllocateMessageQueueAveragely（对齐 Java 同名字段逐条实现）。
-    static std::vector<MessageQueue> allocateMessageQueueAveragely(
-        const std::string& consumerGroup, const std::string& currentCid,
-        const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll);
     // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
     bool ownsQueue(const std::string& key) const;
     // 队列被撤走时的收尾（对应 Java removeUnnecessaryMessageQueue）：持久化已消费位点、
@@ -410,6 +414,9 @@ private:
     void startTraceDispatcher();
 
     std::string consumerGroup_;
+    // 队列分配策略，对应 Java RebalanceImpl.allocateMessageQueueStrategy
+    // （DefaultMQPushConsumer 构造时传入）。默认 AllocateMessageQueueAveragely。
+    std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_;
     std::string namespace_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
     std::shared_ptr<RPCHook> rpcHook_;

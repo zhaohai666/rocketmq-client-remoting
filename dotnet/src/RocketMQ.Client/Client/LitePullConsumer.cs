@@ -13,8 +13,9 @@
 // 设计取舍（与 C++ / Python 参考实现一致）：
 // - 后台**单个**拉取线程顺序遍历所有已分配队列做短轮询（suspend=false），把消息塞进
 //   一个线程安全的本地缓冲 _localBuffer；Poll() 用 Monitor 等待并 drain 该缓冲。
-// - subscribe 模式的 rebalance 复用既有 GetConsumerIdListByGroup + AllocateMessageQueueAveragely，
-//   与 push 消费者同一套分配算法；查询不到消费组列表时按 Java 语义「保留当前分配」，不回退独占。
+// - subscribe 模式的 rebalance 复用既有 GetConsumerIdListByGroup + 队列分配策略
+//   （AllocateStrategy.cs，默认 AllocateMessageQueueAveragely），与 push 消费者同一套分配算法；
+//   查询不到消费组列表时按 Java 语义「保留当前分配」，不回退独占。
 // - 不做 POP / 推模式；不做 broker 主动请求（309/313）处理（那是 push 消费者的职责）。
 using System;
 using System.Collections.Generic;
@@ -42,6 +43,9 @@ public sealed class DefaultLitePullConsumer
     private string _instanceName = "DEFAULT";
     private string _clientId = string.Empty;
     private string _messageModel = MessageModel.Clustering;
+    // 队列分配策略，对应 Java DefaultLitePullConsumer.allocateMessageQueueStrategy
+    // （字段初值 new AllocateMessageQueueAveragely()）。
+    private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     private string _consumeFromWhere = ConsumeFromWhere.ConsumeFromLastOffset;
     // Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
     // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
@@ -106,6 +110,16 @@ public sealed class DefaultLitePullConsumer
     public void SetInstanceName(string name) => _instanceName = name;
 
     public void SetMessageModel(string model) => _messageModel = model;
+
+    /// <summary>
+    /// 队列分配策略（对应 Java DefaultLitePullConsumer.setAllocateMessageQueueStrategy）。
+    /// 与 Java 同款：setter 不校验，置 null 由 Start() 的 checkConfig 拒绝
+    /// （Java DefaultLitePullConsumerImpl.checkConfig:435 "allocateMessageQueueStrategy is null"）。
+    /// </summary>
+    public void SetAllocateMessageQueueStrategy(IAllocateMessageQueueStrategy? strategy) =>
+        _allocateMessageQueueStrategy = strategy;
+
+    public IAllocateMessageQueueStrategy? AllocateMessageQueueStrategy => _allocateMessageQueueStrategy;
 
     public void SetNamespace(string ns) => _namespace = ns ?? string.Empty;
 
@@ -243,6 +257,12 @@ public sealed class DefaultLitePullConsumer
                 hasSub = _subscription.Count > 0;
             }
 
+            // 对应 Java DefaultLitePullConsumerImpl.checkConfig（:435）：策略为 null 直接拒绝启动。
+            if (_allocateMessageQueueStrategy is null)
+            {
+                throw new MQClientException("allocateMessageQueueStrategy is null");
+            }
+
             if (!hasSub && !_assignMode)
             {
                 throw new MQClientException("subscription is not set, call Subscribe() or Assign() first");
@@ -286,12 +306,13 @@ public sealed class DefaultLitePullConsumer
                 }
             }
 
-            foreach (string t in _subscription.Keys)
-            {
-                _mqClient.RegisterTopicInUse(t);
-            }
-
             // 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息。
+            // 心跳只发给「实例路由表里已知的 broker」，而自建实例此刻路由表还是空的，
+            // 所以先同步把订阅/分配的 topic 路由拉进来（Python `_refresh_route_for_heartbeat`、
+            // Java 在注册心跳前先 updateTopicRouteInfoFromNameServer）。
+            // 少了这一步，订阅要等到 5s 心跳循环第一轮才注册上 broker，
+            // 同组多实例时首轮 rebalance 会各自独占全部队列。
+            RefreshRouteForHeartbeat();
             SendHeartbeatToAllBroker();
             _running = true;
             _started = true;
@@ -552,7 +573,35 @@ public sealed class DefaultLitePullConsumer
             List<string>? cidAll = RequireClient().GetConsumerIdListByGroup(topic, _consumerGroup);
             if (cidAll is null) cidAll = new List<string>();
             if (!cidAll.Contains(_clientId)) cidAll.Add(_clientId);
-            List<MessageQueue> allocated = DefaultMQPushConsumer.AllocateMessageQueueAveragely(_consumerGroup, _clientId, mqAll, cidAll);
+            // Java RebalanceImpl.rebalanceByTopic 在分配前 Collections.sort(mqAll) + sort(cidAll)：
+            // 顺序不一致会让同组不同实例算出冲突的分配（同一队列被两个实例同时消费）。
+            mqAll.Sort();
+            cidAll.Sort(StringComparer.Ordinal);
+            // Java RebalanceImpl#rebalanceByTopic 的 catch (Throwable) 直接 return，位置在
+            // updateProcessQueueTableInRebalance **之前** → 一次分配异常不该把队列撤走。
+            // 所以这里回退成「沿用本 topic 当前的分配」（Python / C++ / Rust 同口径）。
+            List<MessageQueue> allocated;
+            try
+            {
+                allocated = _allocateMessageQueueStrategy!.Allocate(_consumerGroup, _clientId, mqAll, cidAll);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Error("allocate message queue exception. strategy name: "
+                    + _allocateMessageQueueStrategy!.GetName() + ", ex: " + e.Message);
+                allocated = new List<MessageQueue>();
+                lock (_lock)
+                {
+                    foreach (MessageQueue mq in _assigned)
+                    {
+                        if (mq.Topic == topic)
+                        {
+                            allocated.Add(mq);
+                        }
+                    }
+                }
+            }
+
             foreach (MessageQueue mq in allocated) newSet.Add(mq);
         }
 
@@ -767,6 +816,41 @@ public sealed class DefaultLitePullConsumer
 
         hb.AddConsumerData(cd);
         return hb;
+    }
+
+    /// <summary>
+    /// 为心跳准备 broker 地址：把本实例关注的 topic（订阅的 + assign 到的）路由拉一遍
+    /// 并登记为在用（对应 Python `_refresh_route_for_heartbeat`）。
+    /// 心跳只发给路由表里已知的 broker，所以这一步必须在首轮心跳之前。
+    /// </summary>
+    private void RefreshRouteForHeartbeat()
+    {
+        if (_mqClient is null)
+        {
+            return;
+        }
+
+        List<string> topics = new(_subscription.Keys);
+        foreach (MessageQueue mq in _assigned)
+        {
+            if (!topics.Contains(mq.Topic, StringComparer.Ordinal))
+            {
+                topics.Add(mq.Topic);
+            }
+        }
+
+        foreach (string topic in topics)
+        {
+            _mqClient.RegisterTopicInUse(topic);
+            try
+            {
+                _mqClient.GetTopicPublishInfo(topic);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("lite start: refresh route for " + topic + " failed: " + e.Message);
+            }
+        }
     }
 
     private int SendHeartbeatToAllBroker()

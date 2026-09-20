@@ -14,8 +14,9 @@
 // - 后台**单个** pull 服务线程顺序遍历所有已分配队列做短轮询（suspend=false），把消息塞进
 //   一个线程安全的本地缓冲 _local_buffer；poll() 用条件变量等待并 drain 该缓冲。
 //   不按队列起独立线程（与 Java 的 PullTask 不同，但语义等价：本地缓冲 + poll）。
-// - subscribe 模式的 rebalance 复用既有 getConsumerIdListByGroup + AllocateMessageQueueAveragely，
-//   与 push 消费者同一套分配算法；查询不到消费组列表时按 Java 语义「保留当前分配」，不回退独占。
+// - subscribe 模式的 rebalance 复用既有 getConsumerIdListByGroup + 队列分配策略
+//   （allocate_strategy.h，默认 AllocateMessageQueueAveragely），与 push 消费者同一套分配算法；
+//   查询不到消费组列表时按 Java 语义「保留当前分配」，不回退独占。
 // - 不做 POP / 推模式；不做 broker 主动请求（309/313）处理（那是 push 消费者的职责）。
 #ifndef ROCKETMQ_CLIENT_LITE_PULL_CONSUMER_H
 #define ROCKETMQ_CLIENT_LITE_PULL_CONSUMER_H
@@ -33,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/allocate_strategy.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
@@ -90,6 +92,11 @@ public:
     void setMessageQueueListener(std::shared_ptr<LiteMessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
     }
+    // 队列分配策略（对应 Java DefaultLitePullConsumer.setAllocateMessageQueueStrategy）。
+    // 与 Java 同款：setter 允许传 nullptr，由 start() 的 checkConfig 拒绝
+    //（Java DefaultLitePullConsumerImpl.checkConfig:435）。默认 AllocateMessageQueueAveragely。
+    void setAllocateMessageQueueStrategy(std::shared_ptr<AllocateMessageQueueStrategy> strategy);
+    std::shared_ptr<AllocateMessageQueueStrategy> allocateMessageQueueStrategy() const;
 
     const std::string& consumerGroup() const { return consumerGroup_; }
     const std::string& clientId() const { return clientId_; }
@@ -137,11 +144,6 @@ public:
     void resume(const std::vector<MessageQueue>& messageQueues);
 
 private:
-    // 单实例 rebalance（subscribe 模式）：复用 AllocateMessageQueueAveragely。
-    static std::vector<MessageQueue> allocateMessageQueueAveragely(
-        const std::string& consumerGroup, const std::string& currentCid,
-        const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll);
-
     std::string withNamespace(const std::string& topic) const {
         return namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
     }
@@ -166,6 +168,9 @@ private:
     void pullServiceLoop();
 
     std::string consumerGroup_;
+    // 队列分配策略，对应 Java DefaultLitePullConsumer.allocateMessageQueueStrategy
+    // （字段初值 new AllocateMessageQueueAveragely()）。
+    std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_;
     std::string namespace_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;

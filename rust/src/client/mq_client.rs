@@ -2123,7 +2123,7 @@ impl MQClientInstance {
     }
 
     /// Python 把这条 RPC 内联在 `DefaultMQPullConsumer.earliest_msg_store_time`
-    /// （`consumer.py:2166`）里，Rust 与其它 offset RPC 一并收在实例层
+    /// （`consumer.py:2217`）里，Rust 与其它 offset RPC 一并收在实例层
     /// （Java `MQClientAPIImpl#getEarliestMsgStoretime`）。
     /// 响应头缺 `timestamp` ⇒ `0`（Python `resp_header.timestamp or 0`）。
     pub async fn get_earliest_msg_store_time(

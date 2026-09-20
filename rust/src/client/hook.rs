@@ -160,7 +160,7 @@ pub struct ConsumeMessageContext {
     pub consumer_group: String,
     pub msg_list: Vec<MessageExt>,
     pub mq: Option<MessageQueue>,
-    /// Python `__init__` 的缺省是 `True`；Java 与投递路径（`consumer.py:597`
+    /// Python `__init__` 的缺省是 `True`；Java 与投递路径（`consumer.py:645`
     /// `_build_consume_hook_context`）会显式改成 `False`，两者别搞混。
     pub success: bool,
     /// 消费状态的名字串（Python `str(status)`，如 `"CONSUME_SUCCESS"`）。

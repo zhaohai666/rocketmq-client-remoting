@@ -44,6 +44,7 @@ set(RMQ_SOURCES
     src/common/message_decoder.cpp
     src/common/subscription_data.cpp
     src/common/compression.cpp
+    src/common/consistent_hash.cpp
     src/common/mix_all.cpp
     src/common/top_addressing.cpp
     src/common/topic_config.cpp
@@ -60,6 +61,7 @@ set(RMQ_SOURCES
     src/remoting/remoting_client.cpp
     src/remoting/rpchook.cpp
     src/client/result.cpp
+    src/client/allocate_strategy.cpp
     src/client/mq_client.cpp
     src/client/consumer_stats.cpp
     src/client/trace_context.cpp

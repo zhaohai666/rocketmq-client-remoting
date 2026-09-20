@@ -22,8 +22,9 @@
 //!   全部消息）。把墙钟串当 epoch 毫秒解析会把这两个方向同时翻转。
 //! - L7 `pause` / `resume`：暂停后 `poll()` 拿不到新消息，恢复后 12 条照常收全。
 //! - L8 `send_heartbeat_to_all_broker()` >= 1：lite 的心跳报文只带自己那份
-//!   `ConsumerData`；⚠ 自建实例在 `start()` 时路由表还是空的（那一轮发 0 份，
-//!   Python 逐字相同），所以先把路由缓存进来再验到达数。
+//!   `ConsumerData`；`start()` 会先同步刷一次订阅 topic 的路由（Java
+//!   `updateTopicRouteInfoFromNameServer` 的等价物）再发首轮心跳，所以这里直接
+//!   验到达数 >= 1，而不是等后台循环把路由表填上。
 //! - L9 状态与运维接口：`assignment` / `buffered_message_count` /
 //!   `offset_for_timestamp` 单调 / `fetch_subscribe_message_queues`。
 //! - L10 清理：删掉本次建的 topic。
@@ -833,9 +834,9 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         Some(c) => c,
         None => return,
     };
-    // 心跳的目标是「实例路由表里已知的 broker」。lite 自建实例在 start() 时路由表
-    // 还是空的（所以那次心跳发 0 份，与 Python 同序），得等重平衡把订阅 topic 的
-    // 路由缓存进来。先拉一次路由（后台循环做的同一件事），再验心跳真的到得了 broker
+    // 心跳的目标是「实例路由表里已知的 broker」。lite 的 `start()` 已经同步刷过一次
+    // 订阅 topic 的路由（Python/C++/.NET 同口径），所以首轮心跳就能落到 broker 上；
+    // 这里仍然先等重平衡拿到分配，再验心跳真的到得了 broker
     // —— 没注册上订阅，broker 侧的 tag 过滤与 GET_CONSUMER_LIST_BY_GROUP 都会失真。
     let _ = wait_assignment(&c, QUEUE_NUMS as usize, 20).await;
     let _ = c.fetch_message_queues(topic).await;

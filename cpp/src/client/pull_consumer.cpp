@@ -103,6 +103,11 @@ void DefaultMQPullConsumer::start() {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
+    // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:803) / 本端口 push 与 lite：
+    // 策略为空直接拒绝启动。
+    if (!allocateStrategy_) {
+        throw MQClientException("allocateMessageQueueStrategy is null");
+    }
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }

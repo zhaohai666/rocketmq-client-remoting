@@ -342,6 +342,9 @@ public sealed class DefaultMQPushConsumer
     private string _instanceName = "DEFAULT";
     private string _clientId = string.Empty;
     private string _messageModel = RocketMQ.Remoting.Protocol.MessageModel.Clustering;
+    // 队列分配策略，对应 Java DefaultMQPushConsumer.allocateMessageQueueStrategy
+    // （构造参数默认 new AllocateMessageQueueAveragely()）。
+    private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     private string _consumeFromWhere = RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromLastOffset;
 
     // ---- 消费线程池（对齐 Java DefaultMQPushConsumer 的 consumeThreadMin/Max）----
@@ -444,6 +447,17 @@ public sealed class DefaultMQPushConsumer
     {
         get => _messageModel;
         set => _messageModel = value;
+    }
+
+    /// <summary>
+    /// 队列分配策略（对应 Java DefaultMQPushConsumer.get/setAllocateMessageQueueStrategy）。
+    /// 与 Java 同款：setter 不校验，置 null 由 Start() 的 checkConfig 拒绝
+    /// （Java DefaultMQPushConsumerImpl.checkConfig:1067 "allocateMessageQueueStrategy is null"）。
+    /// </summary>
+    public IAllocateMessageQueueStrategy? AllocateMessageQueueStrategy
+    {
+        get => _allocateMessageQueueStrategy;
+        set => _allocateMessageQueueStrategy = value;
     }
 
     public string ConsumeFromWhere
@@ -768,6 +782,12 @@ public sealed class DefaultMQPushConsumer
             if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
                 throw new MQClientException("name server address is not set");
+            }
+
+            // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1067）：策略为 null 直接拒绝启动。
+            if (_allocateMessageQueueStrategy is null)
+            {
+                throw new MQClientException("allocateMessageQueueStrategy is null");
             }
 
             if (_subscriptionData.Count == 0)
@@ -2812,35 +2832,6 @@ public sealed class DefaultMQPushConsumer
         return outList;
     }
 
-    /// <summary>平均分配（对应 Java AllocateMessageQueueAveragely）。</summary>
-    internal static List<MessageQueue> AllocateMessageQueueAveragely(string consumerGroup, string currentCid,
-        List<MessageQueue> mqAll, List<string> cidAll)
-    {
-        if (mqAll.Count == 0)
-        {
-            return new List<MessageQueue>();
-        }
-
-        if (cidAll.Count == 0 || !cidAll.Contains(currentCid))
-        {
-            return new List<MessageQueue>();
-        }
-
-        int index = cidAll.IndexOf(currentCid);
-        int mod = mqAll.Count % cidAll.Count;
-        int avg = mqAll.Count <= cidAll.Count
-            ? 1
-            : (mod > 0 && index < mod ? mqAll.Count / cidAll.Count + 1 : mqAll.Count / cidAll.Count);
-        int startIndex = (mod > 0 && index < mod) ? index * avg : index * avg + mod;
-        int range = Math.Min(avg, mqAll.Count - startIndex);
-        if (range <= 0)
-        {
-            return new List<MessageQueue>();
-        }
-
-        return mqAll.GetRange(startIndex, range);
-    }
-
     /// <summary>按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步拉取线程集。</summary>
     private void DoRebalance()
     {
@@ -2886,7 +2877,24 @@ public sealed class DefaultMQPushConsumer
                 }
 
                 cidAll.Sort(StringComparer.Ordinal);
-                assigned.AddRange(AllocateMessageQueueAveragely(ConsumerGroup, _clientId, mqAll, cidAll));
+                // 自定义策略抛异常时：**保持现有分配**并结束本轮 rebalance（Java catch Throwable
+                // → log error → return false；Python 同款 try/except → return）。
+                // 绝不能把该 topic 的队列撤走。
+                IAllocateMessageQueueStrategy strategy = _allocateMessageQueueStrategy
+                    ?? throw new MQClientException("allocateMessageQueueStrategy is null");
+                List<MessageQueue> got;
+                try
+                {
+                    got = strategy.Allocate(ConsumerGroup, _clientId, mqAll, cidAll);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Error("allocate message queue exception. strategy name: "
+                        + strategy.GetName() + ", ex: " + e.Message);
+                    return;
+                }
+
+                assigned.AddRange(got);
             }
         }
 

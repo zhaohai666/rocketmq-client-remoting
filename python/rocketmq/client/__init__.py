@@ -5,7 +5,10 @@ from .producer import (DefaultMQProducer, TransactionMQProducer, LocalTransactio
 from .consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer, MessageSelector,
                        MessageQueueListener, AllocateMessageQueueStrategy,
                        AllocateMessageQueueAveragely, AllocateMessageQueueAveragelyByCircle,
-                       AllocateMessageQueueByConfig)
+                       AllocateMessageQueueByConfig,
+                       AllocateMessageQueueConsistentHash,
+                       AllocateMessageQueueByMachineRoom,
+                       AllocateMachineRoomNearby, MachineRoomResolver)
 from .admin import DefaultMQAdminExt
 from .exception import (MQClientException, MQBrokerException, MQTimeOutException, MQQueueException)
 from .send_result import SendStatus
@@ -30,6 +33,8 @@ __all__ = [
     "MessageQueueListener", "AllocateMessageQueueStrategy",
     "AllocateMessageQueueAveragely", "AllocateMessageQueueAveragelyByCircle",
     "AllocateMessageQueueByConfig",
+    "AllocateMessageQueueConsistentHash", "AllocateMessageQueueByMachineRoom",
+    "AllocateMachineRoomNearby", "MachineRoomResolver",
     "DefaultMQAdminExt",
     "MQClientException", "MQBrokerException", "MQTimeOutException", "MQQueueException",
     "SendStatus",
