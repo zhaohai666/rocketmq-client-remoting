@@ -182,6 +182,11 @@ void DefaultLitePullConsumer::start() {
     // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验，
     // 而不是等到算起点时抛出、被下面的 catch(...) 吞掉后静默退化成从 max offset 消费。
     parseConsumeTimestamp(consumeTimestamp_);
+    // Java `DefaultLitePullConsumerImpl#start`:287-289：CLUSTERING 才改写 instanceName，
+    // clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+    if (messageModel_ == MessageModel::CLUSTERING) {
+        instanceName_ = changeInstanceNameToPID(instanceName_);
+    }
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }

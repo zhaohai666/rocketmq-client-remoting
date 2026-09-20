@@ -304,6 +304,13 @@ void DefaultMQPushConsumer::start() {
         if (messageListener_ == nullptr) {
             throw MQClientException("message listener is not set");
         }
+        // Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
+        // `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，Java 的 MQClientManager
+        // 因此让同进程的广播消费者复用同一份实例），再由 `ClientConfig#buildMQClientId`
+        // 拼 `<本机 IP>@<instanceName>`。
+        if (messageModel_ == MessageModel::CLUSTERING) {
+            instanceName_ = changeInstanceNameToPID(instanceName_);
+        }
         if (clientId_.empty()) {
             clientId_ = buildClientId(instanceName_);
         }

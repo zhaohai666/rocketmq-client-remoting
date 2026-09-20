@@ -108,6 +108,11 @@ void DefaultMQPullConsumer::start() {
     if (!allocateStrategy_) {
         throw MQClientException("allocateMessageQueueStrategy is null");
     }
+    // Java `DefaultMQPullConsumerImpl#start`:712-714：CLUSTERING 才改写 instanceName，
+    // clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+    if (messageModel_ == MessageModel::CLUSTERING) {
+        instanceName_ = changeInstanceNameToPID(instanceName_);
+    }
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }

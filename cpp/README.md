@@ -53,7 +53,7 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 26 个用例，2585 项断言，~16s
+cd build && ctest --output-on-failure     # 27 个用例，2602 项断言，~16s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -83,6 +83,7 @@ cd build && ctest --output-on-failure     # 26 个用例，2585 项断言，~16s
 | `consistent_hash` | 42 | 一致性哈希环 + 自带 MD5：RFC 1321 附录 A 全向量（含 55/56/57/64/65/200 字节的填充边界）与 Java `hash()` 取前 4 字节大端的真值、环的路由稳定性与越过末尾回绕、空环返回 null、负虚拟节点数只在 `addNode` 抛、`i + existingReplicas` 的副本下标不重叠、`removeNode` 不误伤别的节点、注入自定义 hash 生效、`ringHashes()` 严格升序 |
 | `validators` | 75 | 名字校验：字符表（码点 >=128 一律非法）与正则口径、12 个系统 topic / 8 个禁发 topic 名单（`TBW102` 可发、`%RETRY%` 可发）、`checkTopic`/`checkGroup` 的 blank→长度(127/120)→字符表顺序与文案逐字、`checkMessage` 只有 body 档位带 `MESSAGE_ILLEGAL(13)`、LMQ 分隔符、四类 facade 的 `start()` 组名门在建实例之前 |
 | `broker_requests` | 11 | broker 反向请求 `NOTIFY_CONSUMER_IDS_CHANGED`(40)：注册在**实例级**的 clientRemotingProcessor（各消费者重复注册会互相覆盖）、计数 + 整组唤醒、`unregisterRebalanceWakeup` 后不再被叫醒但通知仍被处理、缺 `consumerGroup` 不抛、shutdown 清掉唤醒表 |
+| `client_id` | 17 | clientId 口径与 Java `ClientConfig` 对拍：`buildMqClientId` 的 `ip@instanceName[@unitName]`（空白 unitName 不拼）、`changeInstanceNameToPID` 只改默认名且幂等、四类 facade `start()` 盖出的 `<ip>@<pid>#<nanoTime>`、同进程两个生产者不撞号、广播消费者保持 `DEFAULT`、显式 instanceName 原样透传 |
 | `recall_message` | 28 | 定时消息撤回 `recallMessage`(370)：句柄编解码与 **Java `buildHandle` 真值向量**对拍（含无填充句柄、6 段新版本、v2/段数不足/非法 utf-8 全部按 Java 文案 `"recall handle is invalid"` 拒）、`RecallMessageRequestHeader` 逐键守卫（继承字段反射名是 **`bname`** 而不是 `brokerName`）、`SendMessageResponseHeader.recallHandle` 往返、producer 本地校验顺序（未 start / `%RETRY%` / `%DLQ%` / 非法句柄都在打网络**之前**秒回，路由拿不到时预热带异常照抛） |
 
 ```bash
@@ -162,7 +163,7 @@ cpp/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 42 个 .cpp
 ├── examples/                   selfcheck / interop_tool + 16 个真机联调工具
-└── tests/                      26 个 ctest 用例（含 Java 对拍）+ interop_check.py
+└── tests/                      27 个 ctest 用例（含 Java 对拍）+ interop_check.py
 ```
 
 ## 几个必须知道的实现约定
@@ -188,6 +189,15 @@ NaN/Infinity 与尾逗号。所以 `json.cpp` 里是**容错解析器**而不是
 **压缩失败 / 未知算法必须响亮。** `CompressorFactory::decompress` 对未支持类型抛异常，
 `decodeMessage` 捕获后返回 `false`（消息被丢弃）。**绝不能原样透传压缩字节**：
 外层会清掉 `COMPRESSED_FLAG`，透传等于把压缩流当正文交出去且事后无法识别，属于静默数据损坏。
+
+**clientId 口径按 Java。** `buildClientId(instanceName)` = `<本机 IP>@<instanceName>`
+（`buildMqClientId`，对应 `ClientConfig#buildMQClientId`）；instanceName 还是默认值 `DEFAULT`
+时由各 facade 的 `start()` 调 `changeInstanceNameToPID` **就地**换成 `<pid>#<nanoTime>` ——
+生产者与 admin 无条件，三个消费者只在 `CLUSTERING` 下（广播消费者保持 `DEFAULT`，与 Java
+一致 —— Java 的 `MQClientManager` 会让同进程的广播消费者复用同一份实例，本端口是每门面各建
+一份私有实例）。与 Java 两点不同：本机 IP 用
+UDP sockname 探测（Java 枚举网卡），且没有 `unitName` / `enableStreamRequestType` 配置项，
+拼不出 `@<unitName>` / `@STREAM` 后缀。回归：`tests/test_client_id.cpp`（ctest `client_id`）。
 
 **消息轨迹的解码器比 Java 更健壮。** Java `TraceDataEncoder` 对无 keys 消息的 `SubBefore`
 会 `line[7]` 越界抛 `ArrayIndexOutOfBoundsException`（**5.5.1 上游真实缺陷**，已复现），

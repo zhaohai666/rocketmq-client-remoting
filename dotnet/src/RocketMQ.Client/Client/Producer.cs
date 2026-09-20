@@ -31,7 +31,7 @@ public class DefaultMQProducer
     private bool _started;
 
     private string _producerGroup;
-    private string _instanceName = "DEFAULT";
+    private string _instanceName = MixAll.DefaultInstanceName;
     private string _clientId = string.Empty;
     // 命名空间（多租户隔离）：非空前，发送时把 topic 拼成 "ns%topic" 发给 broker。
     // 默认空 = 不加命名空间（与裸集群兼容，不破坏现有行为）。
@@ -403,6 +403,10 @@ public class DefaultMQProducer
                 throw new MQClientException("name server address is not set");
             }
 
+            // 对应 Java DefaultMQProducerImpl.start()（:251）：非 inner 生产者无条件把默认的
+            // instanceName 换成 <pid>#<nanoTime>，再按 ClientConfig#buildMQClientId 拼 clientId。
+            // 就地写回字段，所以同一生产者 restart 后 clientId 不变（Java 同样改了不回滚）。
+            _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
             if (string.IsNullOrEmpty(_clientId))
             {
                 _clientId = ClientIds.Build(_instanceName);

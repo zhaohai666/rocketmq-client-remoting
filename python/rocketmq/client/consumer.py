@@ -1104,8 +1104,14 @@ class DefaultMQPushConsumer:
             # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1067）：策略为 None 直接拒绝启动。
             if self.allocate_strategy is None:
                 raise MQClientException("allocateMessageQueueStrategy is null")
+            # 对应 Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
+            # `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，Java 的
+            # MQClientManager 因此让同进程的广播消费者复用同一份实例），再由
+            # `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>`。
+            if self.message_model == MessageModel.CLUSTERING:
+                self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
             if self.client_id is None:
-                self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
+                self.client_id = MixAll.client_id_for(self.instance_name)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable)
             if self.rpc_hook is not None:
@@ -2509,8 +2515,12 @@ class DefaultMQPullConsumer:
         # 对应 Java DefaultMQPullConsumerImpl.checkConfig（:803）：策略为 None 直接拒绝启动。
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
+        # Java `DefaultMQPullConsumerImpl#start`:712-714：CLUSTERING 才改写 instanceName，
+        # clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        if self.message_model == MessageModel.CLUSTERING:
+            self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
-            self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
+            self.client_id = MixAll.client_id_for(self.instance_name)
         self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
@@ -2853,8 +2863,12 @@ class DefaultLitePullConsumer:
         # 而不是等 rebalance 里 None.allocate 抛 AttributeError 被静默吞掉。
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
+        # Java `DefaultLitePullConsumerImpl#start`:287-289：CLUSTERING 才改写 instanceName，
+        # clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        if self.message_model == MessageModel.CLUSTERING:
+            self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
-            self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
+            self.client_id = MixAll.client_id_for(self.instance_name)
         self._mq_client = self._create_client()
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)

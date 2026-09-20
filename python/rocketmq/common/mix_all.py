@@ -183,6 +183,62 @@ class MixAll:
         import os
         return os.getpid()
 
+    # ---------------- clientId（对应 Java ClientConfig）----------------
+    # Java `ClientConfig#instanceName` 的默认值（`System.getProperty("rocketmq.client.name", "DEFAULT")`）
+    DEFAULT_INSTANCE_NAME = "DEFAULT"
+
+    @staticmethod
+    def cached_ip_str() -> str:
+        """进程内只探测一次的本机 IP。
+
+        对应 Java `ClientConfig#clientIP` —— 它在 ClientConfig 构造时就定下来了，
+        同一个客户端的 clientId 因此稳定；每次都重新探测既慢又可能在网卡变化后
+        让重启的客户端换一个 clientId。
+        """
+        global _CACHED_IP_STR
+        if _CACHED_IP_STR is None:
+            _CACHED_IP_STR = MixAll.get_ip_str()
+        return _CACHED_IP_STR
+
+    @staticmethod
+    def build_mq_client_id(client_ip: str, instance_name: str,
+                           unit_name: Optional[str] = None) -> str:
+        """对应 Java `ClientConfig#buildMQClientId`：`ip@instanceName[@unitName]`。
+
+        Java 还会在 `enableStreamRequestType` 时再拼一段 `@STREAM`；本客户端没有
+        这个开关（也没有 unitName 配置项），所以那两条后缀永远拼不出来。
+        """
+        cid = "%s@%s" % (client_ip, instance_name)
+        if unit_name is not None and unit_name.strip():
+            # Java 只在 isBlank 判断上用了 trim，拼接时用的是原值
+            cid = "%s@%s" % (cid, unit_name)
+        return cid
+
+    @staticmethod
+    def change_instance_name_to_pid(instance_name: str) -> str:
+        """对应 Java `ClientConfig#changeInstanceNameToPID`：默认名 `DEFAULT` 换成
+        `<pid>#<nanoTime>`，其余原样返回。
+
+        这一步是 clientId 唯一性的来源：不换的话同进程里两个客户端会算出同一个
+        clientId（旧实现用秒级时间戳，同一秒内必撞），在 `MQClientInstance.INSTANCE_MAP`
+        里互相覆盖。Java 只在生产者（非 `CLIENT_INNER_PRODUCER`）和 CLUSTERING 消费者
+        的 `start()` 里调用它，条件由各 facade 把。
+        """
+        if instance_name == MixAll.DEFAULT_INSTANCE_NAME:
+            import time
+            # Java 用 System.nanoTime()：单调、原点任意，只用来保证同进程内不重复
+            return "%d#%d" % (MixAll.pid(), time.monotonic_ns())
+        return instance_name
+
+    @staticmethod
+    def client_id_for(instance_name: str) -> str:
+        """未显式配置 clientId 时的默认口径：`<本机 IP>@<instanceName>`。
+
+        调用方要按 Java 的条件先跑过 `change_instance_name_to_pid`
+        （生产者无条件，消费者仅 CLUSTERING）。
+        """
+        return MixAll.build_mq_client_id(MixAll.cached_ip_str(), instance_name)
+
     # ---------------- Properties <-> String（对应 MixAll.properties2String/string2Properties）----------------
     @staticmethod
     def properties2_string(properties, is_sort: bool = False) -> str:
@@ -258,6 +314,9 @@ class MixAll:
 # java.util.Properties.load 认的空白字符（string2_properties 的分隔判断用）。
 # 必须是模块级常量：staticmethod 里裸名查找走的是模块全局，不是类作用域。
 _PROP_WS = " \t\f"
+
+# `MixAll.cached_ip_str` 的缓存，同样是模块级（类作用域里不能赋值）。
+_CACHED_IP_STR = None
 
 
 # 对应 Java MixAll.PREDEFINE_GROUP_SET

@@ -671,8 +671,10 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     }
     ck.check("C1 start() succeeded", c.is_started(), "started flag false");
     ck.check(
-        "C1 start() stamped a clientId (instanceName@timestamp)",
-        !c.client_id().is_empty() && c.client_id().contains("live-"),
+        "C1 start() stamped a clientId (<clientIP>@<instanceName>, Java buildMQClientId)",
+        c.client_id()
+            .split_once('@')
+            .is_some_and(|(ip, instance)| !ip.is_empty() && instance.contains("live-")),
         &format!("clientId={:?}", c.client_id()),
     );
     ck.check(

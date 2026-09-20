@@ -16,6 +16,8 @@ struct MixAll {
     static constexpr const char* DEFAULT_TOPIC = "TBW102";
     static constexpr const char* BENCHMARK_TOPIC = "BenchmarkTest";
     static constexpr const char* DEFAULT_PRODUCER_GROUP = "DEFAULT_PRODUCER";
+    // Java `ClientConfig#instanceName` 的默认值（`System.getProperty("rocketmq.client.name", "DEFAULT")`）
+    static constexpr const char* DEFAULT_INSTANCE_NAME = "DEFAULT";
     static constexpr const char* DEFAULT_CONSUMER_GROUP = "DEFAULT_CONSUMER";
     static constexpr const char* CLIENT_INNER_PRODUCER_GROUP = "CLIENT_INNER_PRODUCER";
     static constexpr const char* SELF_TEST_PRODUCER_GROUP = "SELF_TEST_P_GROUP";
@@ -123,6 +125,10 @@ struct MixAll {
 
     // 本机出口 IP（UDP connect 探测，无外网回落 gethostname -> 127.0.0.1）
     static std::string getIpStr();
+    // 进程内只探测一次的本机 IP。对应 Java `ClientConfig#clientIP`：它在 ClientConfig
+    // 构造时就定下来，同一个客户端的 clientId 因此稳定（每次重新探测既慢，又可能在
+    // 换网卡后让重启的客户端换一个 clientId）。
+    static const std::string& cachedIpStr();
     static int32_t pid();
 
     // ---------------- Properties <-> String ----------------

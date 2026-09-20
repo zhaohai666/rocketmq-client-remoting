@@ -82,6 +82,11 @@ void DefaultMQAdminExt::start() {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
+    // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，clientId
+    // 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。本端口的 admin
+    // 默认 instanceName 是 "ADMIN"（不是 Java 的 "DEFAULT"），所以改写只在调用方显式
+    // 设成 "DEFAULT" 时才起作用。
+    instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }

@@ -22,6 +22,14 @@ pub fn monotonic_millis() -> f64 {
     origin.elapsed().as_secs_f64() * 1000.0
 }
 
+/// 对应 Java `System.nanoTime()`：单调时钟的纳秒读数，原点任意，只能用来比大小。
+///
+/// 目前只有一个用处：Java 用它拼 `instanceName`（`<pid>#<nanoTime>`），保证同进程里
+/// 两个客户端算出不同的 clientId，从而不会意外共用一个 `MQClientInstance`。
+pub fn nano_time() -> u128 {
+    MONOTONIC_ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()
+}
+
 /// Java `String.hashCode()`：`h = 31*h + ch`，32 位有符号回绕。
 /// 对拍向量：`TagA`=2598919、`TagB`=2598920、`P`=80、`PA`=2545、`*`=42。
 pub fn java_string_hash(s: &str) -> i32 {

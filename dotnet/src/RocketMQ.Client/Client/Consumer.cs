@@ -339,7 +339,7 @@ public sealed class DefaultMQPushConsumer
     private long _filteredMessageCount;
     private AsyncTraceDispatcher? _traceDispatcher;
 
-    private string _instanceName = "DEFAULT";
+    private string _instanceName = MixAll.DefaultInstanceName;
     private string _clientId = string.Empty;
     private string _messageModel = RocketMQ.Remoting.Protocol.MessageModel.Clustering;
     // 队列分配策略，对应 Java DefaultMQPushConsumer.allocateMessageQueueStrategy
@@ -800,6 +800,13 @@ public sealed class DefaultMQPushConsumer
                 throw new MQClientException("message listener is not set");
             }
 
+            // 对应 Java DefaultMQPushConsumerImpl.start()（:935）：**只有 CLUSTERING** 才把默认
+            // instanceName 换成 <pid>#<nanoTime>；BROADCASTING 保留 "DEFAULT"，于是同机同组的
+            // 广播消费者共用一个 clientId —— 那是 Java 故意留的共享语义，不能"修"掉。
+            if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Clustering)
+            {
+                _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
+            }
             if (_clientId.Length == 0)
             {
                 _clientId = ClientIds.Build(_instanceName);

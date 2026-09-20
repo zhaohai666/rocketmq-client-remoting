@@ -72,6 +72,12 @@ public sealed class DefaultMQAdminExt
     /// <summary>对应 C++ setInstanceName（运行期改 instanceName 不会重建 client）。</summary>
     public void SetInstanceName(string name) => _instanceName = name;
 
+    /// <summary>instanceName 会被 Start() 就地改写，所以这里读的是启动后的实际值。</summary>
+    public string GetInstanceName() => _instanceName;
+
+    /// <summary>Start() 之后才有值（对应其他 facade 的 ClientId）。</summary>
+    public string ClientId => _clientId;
+
     public string GetNamesrvAddr()
     {
         var sb = new StringBuilder();
@@ -112,6 +118,11 @@ public sealed class DefaultMQAdminExt
             throw new MQClientException("name server address is not set");
         }
 
+        // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
+        // clientId 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        // 本端口的 admin 默认 instanceName 是 "ADMIN"（不是 Java 的 "DEFAULT"，因为 admin
+        // 用私有实例、不和其他客户端共用），所以这一步只在调用方显式设成 "DEFAULT" 时才起作用。
+        _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
         if (string.IsNullOrEmpty(_clientId))
         {
             _clientId = ClientIds.Build(_instanceName);

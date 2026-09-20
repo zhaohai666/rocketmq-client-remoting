@@ -6,6 +6,7 @@
 // 按 Key 查询消息、创建 Topic。
 //
 // 与 Python 参考实现（python/client/mq_client.py）逐项对齐。
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using RocketMQ.Common;
@@ -15,22 +16,57 @@ using RocketMQ.Remoting.Protocol;
 namespace RocketMQ.Client;
 
 /// <summary>
-/// 生成唯一 clientId：instanceName@yyyymmddhhmmss@pid@seq。
-/// Java 用 ip@instanceName@unitName(pid 派生)，Python 用 instanceName@时间戳；
-/// 这里额外带 pid 与进程内序号，保证同一秒内多次启动的客户端（如测试里连续起
-/// 多个 consumer）不会撞 clientId —— broker 的消费组 channel 表以 clientId 为键。
+/// clientId 的口径（对应 Java <c>ClientConfig#buildMQClientId</c> 与
+/// <c>ClientConfig#changeInstanceNameToPID</c>）：<c>&lt;本机 IP&gt;@&lt;instanceName&gt;</c>，
+/// instanceName 还是默认值 "DEFAULT" 时在 start() 里就地改成 <c>&lt;pid&gt;#&lt;nanoTime&gt;</c>。
+///
+/// 旧的 <c>instanceName@时间戳@pid@seq</c> 已废弃。唯一性本身是必须的 —— broker 的消费组
+/// channel 表以 clientId 为键，同一进程内撞号等于两个客户端在 broker 侧互相顶掉；旧口径靠
+/// pid+序号确实不撞，但少了本机 IP，运维工具按 <c>&lt;ip&gt;@&lt;clientId&gt;</c> 查不到，
+/// 而且 Java 故意让同机广播消费者共用一个 clientId（BROADCASTING 不改写 instanceName），
+/// 旧口径把这份共享也拆散了。
 /// </summary>
 public static class ClientIds
 {
-    private static int _seq;
+    /// <summary>
+    /// 对应 Java <c>System.nanoTime()</c>：单调、原点任意，只用来保证同进程内不重复。
+    /// .NET 的 <c>Stopwatch</c> 没有静态起点，这里以类型初始化时刻为原点。
+    /// </summary>
+    private static readonly Stopwatch NanoClock = Stopwatch.StartNew();
 
-    public static string Build(string instanceName)
+    private static long NanoTime() => NanoClock.Elapsed.Ticks * 100L;
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#changeInstanceNameToPID</c>：默认名 "DEFAULT" 换成
+    /// <c>&lt;pid&gt;#&lt;nanoTime&gt;</c>，其余原样返回。
+    ///
+    /// Java 只在生产者（非 CLIENT_INNER_PRODUCER）和 CLUSTERING 消费者的 start() 里调用它，
+    /// 条件由各 facade 把，这里只做纯字符串变换。
+    /// </summary>
+    public static string ChangeInstanceNameToPID(string instanceName)
     {
-        string ts = UtilAll.TimeToHumanString(UtilAll.CurrentTimeMillis(), "%Y%m%d%H%M%S");
-        int seq = Interlocked.Increment(ref _seq) - 1;
-        return instanceName + "@" + ts + "@" + UtilAll.Pid().ToString(CultureInfo.InvariantCulture) + "@"
-            + seq.ToString(CultureInfo.InvariantCulture);
+        if (instanceName != MixAll.DefaultInstanceName) return instanceName;
+        return UtilAll.Pid().ToString(CultureInfo.InvariantCulture) + "#"
+            + NanoTime().ToString(CultureInfo.InvariantCulture);
     }
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#buildMQClientId</c>：<c>ip@instanceName[@unitName]</c>。
+    /// Java 还会在 enableStreamRequestType 时再拼一段 <c>@STREAM</c>；本端口没有这两个开关。
+    /// </summary>
+    public static string BuildMqClientId(string clientIp, string instanceName, string? unitName = null)
+    {
+        var sb = new StringBuilder();
+        sb.Append(clientIp).Append('@').Append(instanceName);
+        if (!string.IsNullOrWhiteSpace(unitName)) sb.Append('@').Append(unitName);
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 未显式配置 clientId 时的默认口径：<c>&lt;本机 IP&gt;@&lt;instanceName&gt;</c>。
+    /// 调用方要按 Java 的条件先跑过 <see cref="ChangeInstanceNameToPID"/>。
+    /// </summary>
+    public static string Build(string instanceName) => BuildMqClientId(MixAll.CachedIpStr(), instanceName);
 }
 
 /// <summary>

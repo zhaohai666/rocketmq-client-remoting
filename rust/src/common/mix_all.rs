@@ -296,11 +296,51 @@ impl MixAll {
         sb
     }
 
-    /// Python 客户端层的 client_id 口径：`instanceName@yyyyMMddHHmmss`。
-    pub fn build_default_client_id(instance_name: &str) -> String {
-        let now = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
-        format!("{instance_name}@{now}")
+    /// 对应 Java 各消费者 facade 的 `if (messageModel == CLUSTERING)
+    /// changeInstanceNameToPID()`：广播模式故意不改写，让同进程的广播消费者共用实例。
+    pub fn instance_name_for_model(instance_name: &str, clustering: bool) -> String {
+        if clustering {
+            Self::change_instance_name_to_pid(instance_name)
+        } else {
+            instance_name.to_string()
+        }
     }
+
+    /// 对应 Java `ClientConfig#changeInstanceNameToPID`：instanceName 还是默认的
+    /// `DEFAULT` 时换成 `<pid>#<nanoTime>`，其余原样返回。
+    ///
+    /// 这一步决定了 clientId 的唯一性：不换的话同进程里两个客户端会算出同一个
+    /// clientId，被 `MQClientManager` 合并成一份 `MQClientInstance`（Java 只在
+    /// 生产者（非 `CLIENT_INNER_PRODUCER`）和 CLUSTERING 消费者 start 时调用它，
+    /// 所以条件由各个 facade 把，这里只做纯字符串变换）。
+    pub fn change_instance_name_to_pid(instance_name: &str) -> String {
+        if instance_name == Self::DEFAULT_INSTANCE_NAME {
+            format!("{}#{}", Self::cached_pid(), util_all::nano_time())
+        } else {
+            instance_name.to_string()
+        }
+    }
+
+    /// Java `ClientConfig#buildMQClientId` 的默认口径：`<本机 IP>@<instanceName>`。
+    ///
+    /// 调用前要先按 Java 的条件跑过 [`change_instance_name_to_pid`]
+    /// （[`Self::client_id_for`] 一次做完这两步）。
+    pub fn build_default_client_id(instance_name: &str) -> String {
+        Self::build_mq_client_id(Self::cached_ip_str(), instance_name, None)
+    }
+
+    /// 未显式配置 clientId 时的默认值：`<本机 IP>@<pid>#<nanoTime>`。
+    ///
+    /// 对应 Java 里 `changeInstanceNameToPID()` + `buildMQClientId()` 的连用；
+    /// instanceName 被显式设成非 `DEFAULT` 时结果就稳定了（同进程、同 instanceName
+    /// 的两个客户端会共用一份实例，这正是 Java 的语义）。
+    pub fn client_id_for(instance_name: &str) -> String {
+        Self::build_default_client_id(&Self::change_instance_name_to_pid(instance_name))
+    }
+
+    /// 对应 Java `ClientConfig#instanceName` 的默认值
+    /// （`System.getProperty("rocketmq.client.name", "DEFAULT")`）。
+    pub const DEFAULT_INSTANCE_NAME: &'static str = "DEFAULT";
 
     /// 对应 Java `MixAll.brokerVIPChannel`：VIP 通道 = 端口 - 2。
     ///
@@ -581,8 +621,27 @@ mod tests {
             "10.0.0.1@inst@unit-a"
         );
         let id = MixAll::build_default_client_id("inst");
-        assert!(id.starts_with("inst@"));
-        assert_eq!(id.len(), "inst@".len() + 14);
+        // Java `buildMQClientId`：IP 在前，instanceName 原样透传。
+        assert!(id.ends_with("@inst"), "{id}");
+
+        // changeInstanceNameToPID 只改默认名，显式设置的名字原样保留。
+        assert_eq!(MixAll::change_instance_name_to_pid("inst"), "inst");
+        let pid_prefix = format!("{}#", MixAll::cached_pid());
+        let rewritten = MixAll::change_instance_name_to_pid("DEFAULT");
+        assert!(rewritten.starts_with(&pid_prefix), "{rewritten}");
+        // 幂等：Java 就地覆盖 instanceName，第二次 start 不能再换名字，
+        // 否则重启一次就换一个 clientId、丢回原 clientId 的注册表。
+        assert_eq!(MixAll::change_instance_name_to_pid(&rewritten), rewritten);
+
+        // 默认 clientId = 本机 IP + '@' + 改写后的 instanceName；同进程两次调用
+        // 必须给出不同结果，否则两个客户端会共用一份 MQClientInstance。
+        let first = MixAll::client_id_for("DEFAULT");
+        assert!(first.contains(&format!("@{pid_prefix}")), "{first}");
+        assert_ne!(first, MixAll::client_id_for("DEFAULT"), "{first}");
+        assert_eq!(
+            MixAll::client_id_for("inst"),
+            MixAll::build_default_client_id("inst")
+        );
     }
 
     #[test]

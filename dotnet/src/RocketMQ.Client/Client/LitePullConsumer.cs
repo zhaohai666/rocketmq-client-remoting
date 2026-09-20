@@ -40,7 +40,7 @@ public sealed class DefaultLitePullConsumer
     private readonly object _lock = new();
     private string _consumerGroup;
     private string _namespace = string.Empty;
-    private string _instanceName = "DEFAULT";
+    private string _instanceName = MixAll.DefaultInstanceName;
     private string _clientId = string.Empty;
     private string _messageModel = MessageModel.Clustering;
     // 队列分配策略，对应 Java DefaultLitePullConsumer.allocateMessageQueueStrategy
@@ -272,6 +272,12 @@ public sealed class DefaultLitePullConsumer
             // 而不是等到算起点时抛出、被下层 catch 吞掉后静默退化成从 max offset 消费。
             ParseConsumeTimestamp(_consumeTimestamp);
 
+            // 对应 Java DefaultLitePullConsumerImpl.start()（:289）：只有 CLUSTERING 才改写
+            // 默认 instanceName，clientId 统一走 buildMQClientId 的 <ip>@<instanceName>。
+            if (_messageModel == MessageModel.Clustering)
+            {
+                _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
+            }
             if (_clientId.Length == 0)
             {
                 _clientId = ClientIds.Build(_instanceName);

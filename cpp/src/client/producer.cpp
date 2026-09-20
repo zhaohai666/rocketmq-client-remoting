@@ -155,6 +155,11 @@ void DefaultMQProducer::start() {
     if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
         throw MQClientException("name server address is not set");
     }
+    // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
+    // （Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，本端口没有内部生产者，所以无条件
+    // 执行），再由 `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>`。
+    // instanceName 就地写回，和 Java 一样：第二次 start() 复用同一个 clientId。
+    instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_);
     }

@@ -450,14 +450,20 @@ impl DefaultMQAdminExt {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
-        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
-            format!(
-                "{}@{}",
-                cfg.instance_name,
-                chrono::Local::now().format("%Y%m%d%H%M%S")
-            )
+        // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
+        // clientId 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        // 本移植的 admin instanceName 默认是 "ADMIN"（不是 Java 的 "DEFAULT"，见模块头
+        // 差异 2：admin 用私有实例，不和其他客户端共用），所以改写只在调用方显式
+        // 设成 "DEFAULT" 时才起作用。
+        let instance_name = MixAll::change_instance_name_to_pid(&cfg.instance_name);
+        let client_id = cfg
+            .client_id
+            .clone()
+            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+        self.update_config(|c| {
+            c.client_id = Some(client_id.clone());
+            c.instance_name = instance_name;
         });
-        self.update_config(|c| c.client_id = Some(client_id.clone()));
 
         // Python `admin.py:92`：直接构造私有实例（见模块头差异 2）。
         let client = MQClientInstance::new(&client_id, cfg.name_server_addrs.clone());

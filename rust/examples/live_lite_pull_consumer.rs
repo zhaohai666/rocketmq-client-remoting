@@ -382,8 +382,10 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     ck.check("L1 start 后 is_started", c2.is_started(), "");
     ck.check("L1 重复 start 幂等", c2.start().await.is_ok(), "");
     ck.check(
-        "L1 client_id = instanceName@时间戳",
-        c2.client_id().starts_with("live-lite-life") && c2.client_id().contains('@'),
+        "L1 client_id = 本机IP@instanceName（Java buildMQClientId）",
+        c2.client_id()
+            .split_once('@')
+            .is_some_and(|(ip, instance)| !ip.is_empty() && instance.starts_with("live-lite-life")),
         &c2.client_id(),
     );
     c2.shutdown();

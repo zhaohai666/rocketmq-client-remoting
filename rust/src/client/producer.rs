@@ -1012,16 +1012,22 @@ impl DefaultMQProducer {
             // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
             return Err(Error::client("name server address is not set"));
         }
+        // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
+        // （非 CLIENT_INNER_PRODUCER 才做，本移植没有内部生产者所以无条件执行），再
+        // `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>`。
+        // instanceName 就地写回配置，和 Java 一样：第二次 start() 复用同一个 clientId。
+        let instance_name = MixAll::change_instance_name_to_pid(&cfg.instance_name);
         let client_id = cfg
             .client_id
             .clone()
-            .unwrap_or_else(|| MixAll::build_default_client_id(&cfg.instance_name));
+            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
         // Python 在 `__init__` 里就把 None 解析成布尔；这里等价地在 start 时定型。
         let trace_context_on = cfg
             .enable_trace_context
             .unwrap_or_else(trace_context_enabled_from_env);
         self.write_cfg(|c| {
             c.client_id = Some(client_id.clone());
+            c.instance_name = instance_name;
             c.producer_group = group.clone();
             c.enable_trace_context = Some(trace_context_on);
         });
@@ -3221,6 +3227,62 @@ mod tests {
         p.shutdown();
         p.shutdown();
         assert!(!p.is_started());
+    }
+
+    /// 默认 clientId 的口径（Java `DefaultMQProducerImpl#start` 的
+    /// `changeInstanceNameToPID` + `ClientConfig#buildMQClientId`）：
+    /// `<本机 IP>@<pid>#<nanoTime>`。换掉旧的 `DEFAULT@<秒级时间戳>` 是因为后者会让
+    /// 同一秒内创建的两个生产者算出同一个 clientId，被实例工厂表合并成一份实例。
+    #[tokio::test]
+    async fn start_stamps_a_java_style_client_id() {
+        let p = producer("GID_clientid_shape");
+        p.set_namesrv_addr("127.0.0.1:1");
+        p.start().await.expect("静态地址下 start 不该失败");
+        let id = p.client_id().expect("start 之后必须已经有 clientId");
+        let (ip, instance) = id
+            .split_once('@')
+            .unwrap_or_else(|| panic!("clientId 少了 IP@instanceName 的分隔符: {id}"));
+        assert_eq!(ip, MixAll::cached_ip_str(), "{id}");
+        assert!(
+            instance.starts_with(&format!("{}#", MixAll::cached_pid())),
+            "{id}"
+        );
+        let cfg = p.config();
+        assert_eq!(cfg.instance_name, instance, "instanceName 要就地写回配置");
+        p.shutdown();
+
+        // 同一秒内的第二个生产者必须拿到不同的 clientId（旧口径在这里会撞车）
+        let q = producer("GID_clientid_shape_2");
+        q.set_namesrv_addr("127.0.0.1:1");
+        q.start().await.expect("静态地址下 start 不该失败");
+        assert_ne!(q.client_id(), Some(id));
+        q.shutdown();
+    }
+
+    /// 显式设置 instanceName 时 Java 的语义保留：同名的两个生产者共用一份实例。
+    #[tokio::test]
+    async fn an_explicit_instance_name_shares_one_instance() {
+        let name = format!("clientid-shared-{}", MixAll::cached_pid());
+        let a = producer("GID_clientid_shared_a");
+        a.set_instance_name(&name);
+        a.set_namesrv_addr("127.0.0.1:1");
+        a.start().await.expect("start 不该失败");
+        let b = producer("GID_clientid_shared_b");
+        b.set_instance_name(&name);
+        b.set_namesrv_addr("127.0.0.1:1");
+        b.start().await.expect("start 不该失败");
+        assert_eq!(a.client_id(), b.client_id());
+        let shared = MQClientInstance::find_instance(&a.client_id().expect("clientId"))
+            .expect("同 clientId 的两个生产者必须落在同一份实例上");
+        assert!(
+            shared.has_producer(&a.config().producer_group) && shared.has_producer(&b.config().producer_group),
+            "生产者没有登记到共用实例的 producerTable"
+        );
+        // 守卫：先退的那个不能把还在用的实例拆掉
+        a.shutdown();
+        assert!(shared.is_started(), "先退场的使用者把共用实例关掉了");
+        b.shutdown();
+        assert!(!shared.is_started(), "最后一个使用者退场后实例没被拆掉");
     }
 
     #[tokio::test]

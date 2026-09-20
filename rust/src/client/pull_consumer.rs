@@ -455,14 +455,21 @@ impl DefaultMQPullConsumer {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
-        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
-            format!(
-                "{}@{}",
-                cfg.instance_name,
-                chrono::Local::now().format("%Y%m%d%H%M%S")
-            )
+        // Java `DefaultMQPullConsumerImpl#start`:712 / `DefaultLitePullConsumerImpl#start`:288：
+        // CLUSTERING 才改写 instanceName，clientId 口径是 `ClientConfig#buildMQClientId`
+        // 的 `<本机 IP>@<instanceName>`。
+        let instance_name = MixAll::instance_name_for_model(
+            &cfg.instance_name,
+            cfg.message_model == MessageModel::CLUSTERING,
+        );
+        let client_id = cfg
+            .client_id
+            .clone()
+            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+        self.update_config(|c| {
+            c.client_id = Some(client_id.clone());
+            c.instance_name = instance_name;
         });
-        self.update_config(|c| c.client_id = Some(client_id.clone()));
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
@@ -1254,14 +1261,21 @@ impl DefaultLitePullConsumer {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
-            format!(
-                "{}@{}",
-                cfg.instance_name,
-                chrono::Local::now().format("%Y%m%d%H%M%S")
-            )
+        // Java `DefaultMQPullConsumerImpl#start`:712 / `DefaultLitePullConsumerImpl#start`:288：
+        // CLUSTERING 才改写 instanceName，clientId 口径是 `ClientConfig#buildMQClientId`
+        // 的 `<本机 IP>@<instanceName>`。
+        let instance_name = MixAll::instance_name_for_model(
+            &cfg.instance_name,
+            cfg.message_model == MessageModel::CLUSTERING,
+        );
+        let client_id = cfg
+            .client_id
+            .clone()
+            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+        self.update_config(|c| {
+            c.client_id = Some(client_id.clone());
+            c.instance_name = instance_name;
         });
-        self.update_config(|c| c.client_id = Some(client_id.clone()));
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,

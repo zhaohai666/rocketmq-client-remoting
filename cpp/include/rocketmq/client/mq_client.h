@@ -36,10 +36,22 @@
 
 namespace rocketmq {
 
-// 生成唯一 clientId：instanceName@yyyymmddhhmmss@pid@seq。
-// Java 用 ip@instanceName@unitName(pid 派生)，Python 用 instanceName@时间戳；
-// 这里额外带 pid 与进程内序号，保证同一秒内多次启动的客户端（如测试里连续起
-// 多个 consumer）不会撞 clientId —— broker 的消费组 channel 表以 clientId 为键。
+// 对应 Java `ClientConfig#changeInstanceNameToPID`：instanceName 还是默认的 "DEFAULT"
+// 时换成 `<pid>#<nanoTime>`，其余原样返回。
+//
+// 这一步是 clientId 唯一性的来源：不换的话同进程里两个客户端会算出同一个 clientId，
+// 而 broker 的消费组 channel 表以 clientId 为键。Java 只在生产者（非
+// CLIENT_INNER_PRODUCER）和 CLUSTERING 消费者的 start() 里调用它，条件由各 facade 把。
+std::string changeInstanceNameToPID(const std::string& instanceName);
+
+// 对应 Java `ClientConfig#buildMQClientId`：`ip@instanceName[@unitName]`。
+// Java 还会在 enableStreamRequestType 时再拼一段 `@STREAM`；本端口没有这两个开关。
+std::string buildMqClientId(const std::string& clientIp, const std::string& instanceName,
+                            const std::string& unitName = std::string());
+
+// 未显式配置 clientId 时的默认口径：`<本机 IP>@<instanceName>`（对应 Java 的
+// `changeInstanceNameToPID()` + `buildMQClientId()` 连用，改写那步由调用方按条件做）。
+// 旧的 `instanceName@时间戳@pid@seq` 已废弃：把唯一性做在 instanceName 里才是 Java 的做法。
 std::string buildClientId(const std::string& instanceName);
 
 // 对应 org.apache.rocketmq.client.impl.producer.TopicPublishInfo

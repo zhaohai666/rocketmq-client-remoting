@@ -988,17 +988,22 @@ impl DefaultMQPushConsumer {
             bail!("message listener is not set");
         }
 
-        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
-            // Python: "%s@%s" % (instance_name, strftime("%Y%m%d%H%M%S"))
-            format!(
-                "{}@{}",
-                cfg.instance_name,
-                chrono::Local::now().format("%Y%m%d%H%M%S")
-            )
-        });
+        // Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
+        // `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，同进程多个广播消费者
+        // 因此共用一份实例），再由 `ClientConfig#buildMQClientId` 拼
+        // `<本机 IP>@<instanceName>`。
+        let instance_name = MixAll::instance_name_for_model(
+            &cfg.instance_name,
+            cfg.message_model == MessageModel::CLUSTERING,
+        );
+        let client_id = cfg
+            .client_id
+            .clone()
+            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
         self.update_config(|c| {
             c.consumer_group = group.clone();
             c.client_id = Some(client_id.clone());
+            c.instance_name = instance_name;
         });
 
         let instance_cfg = MQClientInstanceConfig {
@@ -3727,6 +3732,87 @@ mod tests {
         consumer.subscribe("T", "TagA").unwrap();
         assert!(consumer.start().await.is_err(), "未设置 listener");
         assert!(!consumer.is_started());
+    }
+
+    /// clientId 口径对齐 Java（`DefaultMQPushConsumerImpl#start` 的
+    /// `changeInstanceNameToPID` + `ClientConfig#buildMQClientId`）：
+    /// `<本机 IP>@<instanceName>`，且 instanceName **只在 CLUSTERING 时**被改写成
+    /// `<pid>#<nanoTime>`。
+    ///
+    /// 后半段是有实际后果的那一条：广播模式保持 `DEFAULT`，于是同进程的两个广播消费者
+    /// 算出同一个 clientId、共用一份 `MQClientInstance`（Java 就是这么跑的）。
+    #[tokio::test]
+    async fn client_id_follows_java_buildmqclientid_rules() {
+        let clustering = DefaultMQPushConsumer::new("CID-clientid-parity-clustering").unwrap();
+        clustering.set_namesrv_addr("127.0.0.1:1");
+        clustering.subscribe("T", "TagA").unwrap();
+        clustering.set_message_listener_concurrently(Arc::new(NoopListener));
+        clustering.start().await.expect("CLUSTERING 消费者应该能启动");
+
+        let id = clustering.client_id();
+        let (ip, instance) = id
+            .split_once('@')
+            .unwrap_or_else(|| panic!("clientId 少了 IP@instanceName 的分隔符: {id}"));
+        assert_eq!(ip, MixAll::cached_ip_str(), "{id}");
+        assert!(
+            instance.starts_with(&format!("{}#", MixAll::cached_pid())),
+            "{id}"
+        );
+        assert_eq!(
+            clustering.config().instance_name,
+            instance,
+            "instanceName 要就地写回配置，否则重启会换一个 clientId"
+        );
+        clustering.shutdown();
+        clustering.start().await.expect("重启");
+        assert_eq!(clustering.client_id(), id, "重启换了 clientId");
+        let clustering_id = clustering.client_id();
+        clustering.shutdown();
+
+        let broadcast = |group: &str| {
+            let cfg = ConsumerConfig {
+                consumer_group: group.to_string(),
+                name_server_addrs: vec!["127.0.0.1:1".to_string()],
+                message_model: MessageModel::BROADCASTING.to_string(),
+                ..Default::default()
+            };
+            let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
+            c.subscribe("T", "TagA").unwrap();
+            c.set_message_listener_concurrently(Arc::new(NoopListener));
+            c
+        };
+        let first = broadcast("CID-clientid-parity-broadcast-a");
+        first.start().await.expect("广播消费者应该能启动");
+        assert_eq!(
+            first.client_id(),
+            format!("{}@DEFAULT", MixAll::cached_ip_str()),
+            "广播模式不许改写 instanceName"
+        );
+        assert_eq!(first.config().instance_name, "DEFAULT");
+        assert_ne!(first.client_id(), clustering_id);
+
+        let second = broadcast("CID-clientid-parity-broadcast-b");
+        second.start().await.expect("第二个广播消费者应该能启动");
+        assert_eq!(second.client_id(), first.client_id());
+        let shared = MQClientInstance::find_instance(&first.client_id()).expect("实例必须已登记");
+        assert!(
+            shared.find_consumer(&first.config().consumer_group).is_some()
+                && shared.find_consumer(&second.config().consumer_group).is_some(),
+            "两个广播消费者没落在同一份实例上"
+        );
+        second.shutdown();
+        first.shutdown();
+        // 推送消费者的 `client.shutdown()` 排在清退任务最后（刷位点 → 解锁 → 注销 →
+        // 关实例，见 `shutdown`），所以要轮询等它跑完，不能同步断言。
+        let mut torn_down = false;
+        for _ in 0..100 {
+            if MQClientInstance::find_instance(&first.client_id()).is_none() {
+                torn_down = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(torn_down, "最后一个租户退场后实例没被拆掉");
     }
 
     /// 组名校验是这三道校验里的第一道：地址、订阅、listener 全都不缺，照样因为组名失败，

@@ -415,10 +415,11 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
         }
     };
     lite.set_namesrv_addr(namesrv);
-    // ⚠ 各自独立的 instanceName：MQClientInstance 按 clientId 复用（对齐 Java 的工厂表），
-    // 默认 instanceName 同为 "DEFAULT" 时 lite / pull / producer 会**共用同一个实例**，
-    // 那么先 shutdown 的那个会把还在用的实例一起关掉（V7 就是死在这上面）。Java 靠
-    // MQClientManager 的引用计数规避，本项目四语言都没做——先各自命名绕开。
+    // ⚠ 各自独立的 instanceName：MQClientInstance 按 clientId 复用（对齐 Java 的工厂表）。
+    // 现在 clientId 走 Java 口径（`<本机 IP>@<pid>#<nanoTime>`，见 `ClientConfig#buildMQClientId`），
+    // 默认名字各自不同，本不需要再命名；这里保留显式名字只是让失败日志更好认。
+    // 另外即便真的共用实例，先 shutdown 的那个也不会再拆掉还在用的那份
+    //（`MQClientInstance::shutdown` 按注册的租户数把关，对齐 Java）。
     lite.set_instance_name(&format!("lite-{stamp}"));
     lite.subscribe(&topic, "*");
     if let Err(e) = lite.start().await {

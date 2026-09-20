@@ -9,6 +9,8 @@ public static class MixAll
     public const string DefaultTopic = "TBW102";
     public const string BenchmarkTopic = "BenchmarkTest";
     public const string DefaultProducerGroup = "DEFAULT_PRODUCER";
+    /// <summary>Java <c>ClientConfig#instanceName</c> 的默认值（<c>System.getProperty("rocketmq.client.name", "DEFAULT")</c>）。</summary>
+    public const string DefaultInstanceName = "DEFAULT";
     public const string DefaultConsumerGroup = "DEFAULT_CONSUMER";
     public const string ClientInnerProducerGroup = "CLIENT_INNER_PRODUCER";
     public const string SelfTestProducerGroup = "SELF_TEST_P_GROUP";
@@ -143,6 +145,15 @@ public static class MixAll
 
     /// <summary>本机出口 IP（UDP connect 探测，无外网回落 hostname -> 127.0.0.1）。</summary>
     public static string GetIpStr() => UtilAll.LocalIp();
+
+    /// <summary>
+    /// 进程内只探测一次的本机 IP。对应 Java <c>ClientConfig#clientIP</c>：它在 ClientConfig
+    /// 构造时就定下来，同一个客户端的 clientId 因此稳定（每次重新探测既慢，又可能在换网卡
+    /// 后让重启的客户端换一个 clientId）。
+    /// </summary>
+    public static string CachedIpStr() => _cachedIpStr ??= UtilAll.LocalIp();
+
+    private static string? _cachedIpStr;
 
     public static int Pid() => UtilAll.Pid();
 

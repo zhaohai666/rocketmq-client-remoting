@@ -76,6 +76,12 @@ bool MixAll::isPredefinedGroup(const std::string& consumerGroup) {
 
 std::string MixAll::getIpStr() { return UtilAll::localIp(); }
 
+const std::string& MixAll::cachedIpStr() {
+    // 函数内静态：C++11 起局部静态初始化是线程安全的，客户端可能在多个线程里同时 start
+    static const std::string ip = UtilAll::localIp();
+    return ip;
+}
+
 int32_t MixAll::pid() { return UtilAll::pid(); }
 
 std::string MixAll::properties2String(const PropertyMap& properties) {

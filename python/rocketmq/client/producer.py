@@ -485,8 +485,14 @@ class DefaultMQProducer:
             if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
                 # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
                 raise MQClientException("name server address is not set")
+            # 对应 Java `DefaultMQProducerImpl#start`:250-252 的两步：先
+            # `changeInstanceNameToPID`（Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，
+            # 本客户端没有内部生产者，所以无条件执行），再由 `ClientConfig#buildMQClientId`
+            # 拼 `<本机 IP>@<instanceName>`。instanceName 就地写回，和 Java 一样：
+            # 第二次 start() 复用同一个 clientId，而不是每重启一次换一个名字。
+            self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
             if self.client_id is None:
-                self.client_id = "%s@%s" % (self.instance_name, time.strftime("%Y%m%d%H%M%S"))
+                self.client_id = MixAll.client_id_for(self.instance_name)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable)
             if self.rpc_hook is not None:

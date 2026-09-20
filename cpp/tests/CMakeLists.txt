@@ -3,6 +3,11 @@ add_executable(rmq_test_codec test_codec.cpp)
 target_link_libraries(rmq_test_codec PRIVATE rocketmq::remoting)
 add_test(NAME codec COMMAND rmq_test_codec)
 
+# clientId 口径：Java `ClientConfig#buildMQClientId` 的 IP@instanceName + changeInstanceNameToPID
+add_executable(rmq_test_client_id test_client_id.cpp)
+target_link_libraries(rmq_test_client_id PRIVATE rocketmq::remoting)
+add_test(NAME client_id COMMAND rmq_test_client_id)
+
 add_executable(rmq_test_java_alignment test_java_alignment.cpp)
 target_link_libraries(rmq_test_java_alignment PRIVATE rocketmq::remoting)
 add_test(NAME java_alignment COMMAND rmq_test_java_alignment)

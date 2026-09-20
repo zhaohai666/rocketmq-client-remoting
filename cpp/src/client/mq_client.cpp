@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -56,11 +57,43 @@ bool mapPullStatus(int32_t code, PullStatus& out) {
 }  // namespace
 
 // ---------------------------------------------------------------- clientId
+namespace {
+
+// 对应 Java `System.nanoTime()`：单调、原点任意，只用来保证同进程内不重复。
+uint64_t nanoTime() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+bool isBlank(const std::string& s) {
+    for (char c : s) {
+        if (!std::isspace(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::string changeInstanceNameToPID(const std::string& instanceName) {
+    if (instanceName == MixAll::DEFAULT_INSTANCE_NAME) {
+        return std::to_string(UtilAll::pid()) + "#" + std::to_string(nanoTime());
+    }
+    return instanceName;
+}
+
+std::string buildMqClientId(const std::string& clientIp, const std::string& instanceName,
+                            const std::string& unitName) {
+    std::string id = clientIp + "@" + instanceName;
+    if (!isBlank(unitName)) {
+        id += "@" + unitName;
+    }
+    return id;
+}
+
 std::string buildClientId(const std::string& instanceName) {
-    static std::atomic<uint32_t> seq{0};
-    std::string ts = UtilAll::timeToHumanString(UtilAll::currentTimeMillis(), "%Y%m%d%H%M%S");
-    return instanceName + "@" + ts + "@" + std::to_string(UtilAll::pid()) + "@"
-         + std::to_string(seq.fetch_add(1));
+    return buildMqClientId(MixAll::cachedIpStr(), instanceName);
 }
 
 // ---------------------------------------------------------------- TopicPublishInfo

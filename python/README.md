@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 687 条单元/协议测试（683 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 701 条单元/协议测试（697 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -94,6 +94,20 @@ rocketmq/
 ├── __main__.py            命令行入口（selfcheck）
 └── selfcheck.py           无集群环境下的协议自检
 ```
+
+## clientId 口径
+
+`MixAll.client_id_for(instance_name)` 对应 Java `ClientConfig#buildMQClientId`：默认
+clientId 是 `<本机 IP>@<instanceName>`，而 `instance_name` 还是默认值 `DEFAULT` 时会在
+`start()` 里被**就地**改写成 `<pid>#<monotonic_ns>`（对应 `changeInstanceNameToPID`）——
+生产者与 admin 无条件执行，三个消费者只在 `CLUSTERING` 下执行 —— 广播消费者保持
+`DEFAULT`，于是同进程的广播消费者算出同一个 clientId（Java 的 `MQClientManager` 会让它们
+复用同一份实例；本实现每个门面各建一份，只在 `INSTANCE_MAP` 里占同一个键）。就地写回
+意味着 restart 不换身份。
+
+两点与 Java 不同：本机 IP 用 UDP「连」公网地址后读 sockname（Java 枚举网卡），
+且没有 `unitName` / `enableStreamRequestType` 配置项，所以拼不出
+`<ip>@<instance>@<unitName>` / `@STREAM` 后缀。回归测试：`tests/test_client_id.py`。
 
 ## 管理端（`client/admin.py`）
 
