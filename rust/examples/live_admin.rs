@@ -894,17 +894,25 @@ async fn a7_produce_and_stats(ck: &mut Checker, env: &Env) -> Vec<SentMsg> {
                 &format!("queues={}", table.offset_table.len()),
             );
             let addr = env.broker();
+            // 「按 broker 查 ⊆ 合并查」要的必须是**同一时刻之后**的合并视图：队列的
+            // maxOffset 单调不减，所以先取单 broker、紧接着再取合并，包含关系才成立。
+            // 反过来（拿更早的合并快照去比更晚的单 broker 值）会随机假失败。
             match admin.examine_topic_stats_by_broker(&addr, &topic).await {
-                Ok(part) => ck.check(
-                    "A7 examineTopicStatsByBroker 是合并结果的子集",
-                    part.offset_table.len() <= table.offset_table.len()
-                        && part.total_max_offset() <= table.total_max_offset(),
-                    &format!(
-                        "broker={} merged={}",
-                        part.offset_table.len(),
-                        table.offset_table.len()
+                Ok(part) => match admin.examine_topic_stats(&topic).await {
+                    Ok(merged) => ck.check(
+                        "A7 examineTopicStatsByBroker 是合并结果的子集",
+                        part.offset_table.len() <= merged.offset_table.len()
+                            && part.total_max_offset() <= merged.total_max_offset(),
+                        &format!(
+                            "brokerQueues={} brokerMax={} mergedQueues={} mergedMax={}",
+                            part.offset_table.len(),
+                            part.total_max_offset(),
+                            merged.offset_table.len(),
+                            merged.total_max_offset()
+                        ),
                     ),
-                ),
+                    Err(e) => ck.abort("A7 examineTopicStats 复检", &e.to_string()),
+                },
                 Err(e) => ck.abort("A7 examineTopicStatsByBroker", &e.to_string()),
             }
         }
@@ -1651,20 +1659,33 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     // `GET_SUBSCRIPTIONGROUP_CONFIG` 在 broker 端走 `findSubscriptionGroupConfig`，
     // autoCreateSubscriptionGroup=true 时查不到就顺手建一个默认组（retryMaxTimes=16），
     // 用它验证删除会得到「删了还在」的假象。
-    match admin.examine_subscription_group_config(&addr, &group).await {
-        Ok(None) => ck.check("A13 deleteSubscriptionGroup 后查不到该组", true, ""),
-        Ok(Some(found)) => {
-            ck.check("A13 deleteSubscriptionGroup 后查不到该组", false, &found.group_name)
+    // 删除要过 broker 的 subscriptionGroupTable（分页应答按 groupSeq 现算），
+    // 固定 1.5s 等待偶尔抢不过它 ⇒ 轮询到预算用尽。
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for (label, name) in [
+        ("A13 deleteSubscriptionGroup 后查不到该组", group.clone()),
+        ("A13 目标组也一并删除", env.dest_group.clone()),
+    ] {
+        let mut gone = false;
+        let mut detail = String::new();
+        loop {
+            match admin.examine_subscription_group_config(&addr, &name).await {
+                Ok(None) => {
+                    gone = true;
+                    break;
+                }
+                Ok(Some(found)) => detail = format!("still there: {}", found.group_name),
+                Err(e) => {
+                    detail = format!("read back failed: {e}");
+                    break;
+                }
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+            sleep_millis(500).await;
         }
-        Err(e) => ck.abort("A13 删除后回读订阅组", &e.to_string()),
-    }
-    match admin
-        .examine_subscription_group_config(&addr, &env.dest_group)
-        .await
-    {
-        Ok(None) => ck.check("A13 目标组也一并删除", true, ""),
-        Ok(Some(found)) => ck.check("A13 目标组也一并删除", false, &found.group_name),
-        Err(e) => ck.abort("A13 删除后回读目标组", &e.to_string()),
+        ck.check(label, gone, &detail);
     }
 }
 

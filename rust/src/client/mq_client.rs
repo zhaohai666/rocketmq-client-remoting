@@ -31,6 +31,16 @@
 //!    `tokio::spawn` + `JoinHandle`，shutdown 用 watch 信号 + abort，确定可测。
 //! 6. `time.time()*1000` 一律换成 [`current_time_millis`]；`threading.Lock`
 //!    换成 `Mutex`（统一 `lock().unwrap_or_else(|e| e.into_inner())`）。
+//! 7. **共用实例的关闭守卫**：Python 的 `shutdown()` 无条件拆实例，同 clientId 上
+//!    后关的门会把还在用的心跳、路由刷新和连接一起带走。这里补上 Java
+//!    `MQClientInstance#shutdown` 的守卫（见 [`MQClientInstance::shutdown`]），
+//!    并配套 [`MQClientInstance::register_producer`] 与
+//!    [`MQClientInstance::register_consumer_group`]。Java 的条件是
+//!    `producerTable.size() > 1`，多出来的那一份是实例自己常驻的
+//!    `CLIENT_INNER_PRODUCER`（`MQClientInstance#start` 里 `defaultMQProducer`
+//!    的 impl）；本移植的实例不养内部生产者（生产者心跳由 facade 自己发、轨迹
+//!    生产者由调用方注入），所以判据是「表非空」。Java 守卫还看 `adminExtTable`，
+//!    这里 admin facade 用的是私有实例（见 `admin.rs` 模块头差异 2），无对应项。
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -537,6 +547,15 @@ struct Inner {
     started: AtomicBool,
     /// Python `MQClientInstance._consumer_table`（Java `consumerTable`）。
     consumer_table: Mutex<HashMap<String, Arc<dyn RegisteredConsumer>>>,
+    /// Java `MQClientInstance#producerTable`（key = producerGroup）。本移植的
+    /// `ProducerData` 心跳由生产者自己发，这张表只服务一个目的：
+    /// [`MQClientInstance::shutdown`] 的共用实例守卫。
+    producer_table: Mutex<HashSet<String>>,
+    /// 拉模式 / lite 消费者登记的组名（Java 把它们和推送消费者一起放进
+    /// `consumerTable`；这里的 `consumer_table` 存的是能接 broker 反向请求的
+    /// [`RegisteredConsumer`]，拉模式消费者没有 220/221/307/309 那套能力，硬塞
+    /// 会把请求派发到空实现，所以只登记组名给守卫用）。
+    consumer_group_table: Mutex<HashSet<String>>,
     /// `fetch_and_apply` 要 `&mut`，放进 `tokio::sync::Mutex`。
     top_addressing: Arc<tokio::sync::Mutex<DefaultTopAddressing>>,
     consumer_stats_manager: Arc<ConsumerStatsManager>,
@@ -597,6 +616,8 @@ impl MQClientInstance {
             topics_in_use: Mutex::new(HashSet::new()),
             started: AtomicBool::new(false),
             consumer_table: Mutex::new(HashMap::new()),
+            producer_table: Mutex::new(HashSet::new()),
+            consumer_group_table: Mutex::new(HashSet::new()),
             top_addressing: Arc::new(tokio::sync::Mutex::new(
                 config.top_addressing.clone().unwrap_or_default(),
             )),
@@ -726,6 +747,75 @@ impl MQClientInstance {
             .values()
             .cloned()
             .collect()
+    }
+
+    // ---------------- 生产者 / 拉模式消费者登记（只服务于关闭守卫） ----------------
+
+    /// Java `MQClientInstance#registerProducer`（`DefaultMQProducerImpl#start`:258）。
+    /// Java 注册的是 impl（实例级心跳要按它拼 `ProducerData`）；本移植的生产者自己发
+    /// 心跳，这里只登记组名，让 [`MQClientInstance::shutdown`] 看得见还有生产者在用
+    /// 这份实例。
+    pub fn register_producer(&self, group: &str) {
+        self.inner
+            .producer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(group.to_string());
+    }
+
+    /// Java `MQClientInstance#unregisterProducer`（`DefaultMQProducerImpl#shutdown`:313，
+    /// 排在 `mQClientFactory.shutdown()` **之前**——先摘掉自己，守卫才不会被自己挡住）。
+    pub fn unregister_producer(&self, group: &str) {
+        self.inner
+            .producer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(group);
+    }
+
+    pub fn has_producer(&self, group: &str) -> bool {
+        self.inner
+            .producer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(group)
+    }
+
+    /// Java `MQClientInstance#registerConsumer` 的拉模式版本
+    /// （`DefaultMQPullConsumerImpl#start`:746、`DefaultLitePullConsumerImpl#start`:339）：
+    /// 登记组名而不是 impl，理由见 [`Inner::consumer_group_table`]。
+    pub fn register_consumer_group(&self, group: &str) {
+        self.inner
+            .consumer_group_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(group.to_string());
+    }
+
+    /// Java `unregisterConsumer` 的拉模式版本，同样必须在 `shutdown()` 之前调用。
+    pub fn unregister_consumer_group(&self, group: &str) {
+        self.inner
+            .consumer_group_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(group);
+    }
+
+    pub fn has_consumer_group(&self, group: &str) -> bool {
+        self.inner
+            .consumer_group_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(group)
+    }
+
+    /// 还在用这份实例的门面数量（Java `shutdown` 前三行守卫读的就是这三张表）。
+    fn tenant_count(&self) -> usize {
+        let consumers = self.inner.consumer_table.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let groups =
+            self.inner.consumer_group_table.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let producers = self.inner.producer_table.lock().unwrap_or_else(|e| e.into_inner()).len();
+        consumers + groups + producers
     }
 
     /// Java `MQClientInstance#rebalanceImmediately`（一行 `rebalanceService.wakeup()`，
@@ -946,7 +1036,7 @@ impl MQClientInstance {
         let _ = self.inner.stop.send(false);
         self.inner.remoting_client.start();
         if let Err(e) = self.inner.consumer_stats_manager.start() {
-            self.inner.started.store(false, Ordering::Release);
+            self.shutdown_factory();
             return Err(e);
         }
         // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
@@ -957,12 +1047,18 @@ impl MQClientInstance {
             addrs.is_empty() && !ta.ws_addr().is_empty()
         };
         if dynamic_ns {
-            self.fetch_name_server_addr().await?;
+            // Java `start` 的 catch 分支：起不来的实例要就地拆掉并摘掉登记，
+            // 不能带着半启动的循环留在 INSTANCE_MAP 里被同 clientId 的后来者复用。
+            if let Err(e) = self.fetch_name_server_addr().await {
+                self.shutdown_factory();
+                return Err(e);
+            }
             if self.name_server_addrs().is_empty() {
                 let ws_addr = self.inner.top_addressing.lock().await.ws_addr().to_string();
-                bail!(
+                self.shutdown_factory();
+                return Err(Error::client(format!(
                     "name server address is not set and address server ({ws_addr}) returned none"
-                );
+                )));
             }
             // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
             self.spawn_periodic(
@@ -1009,10 +1105,31 @@ impl MQClientInstance {
         Ok(())
     }
 
-    /// Python `shutdown()`：先置 `started=false` 再 set 三个 stop 事件，
-    /// 然后停统计、关 remoting。Rust 版额外 abort 后台任务并清句柄，
-    /// 保证无 broker 场景下确定收敛（模块头差异 5）。
+    /// Python `shutdown()` + Java `MQClientInstance#shutdown`(1101-1137) 的守卫。
+    ///
+    /// 同 clientId 的实例可能被多个 producer/consumer 共用（`create_mq_client_instance`
+    /// 的复用工厂），先退的那个**不能**把别人的心跳、路由刷新和连接一起拆掉：
+    /// Java 用「三张表还有人 ⇒ 直接 return」表达同一件事（它的
+    /// `producerTable.size() > 1` 多容的是实例常驻的 `CLIENT_INNER_PRODUCER`，
+    /// 本移植没有常驻内部生产者，故判据为「非空」，见模块头差异 7）。
+    /// 守卫为真时只做一件事：留一条 DEBUG，说明这份实例还归谁。
     pub fn shutdown(&self) {
+        let tenants = self.tenant_count();
+        if tenants > 0 {
+            rmq_debug!(
+                "client factory [{}] still has {tenants} client(s) registered, skip shutdown",
+                self.inner.client_id
+            );
+            return;
+        }
+        self.shutdown_factory();
+    }
+
+    /// Java `MQClientInstance#shutdown` 里 `case RUNNING` 的那一段（守卫通过之后）。
+    /// 也用于 `start()` 失败：Java 在 catch 分支里
+    /// `cleanupAfterStartFailure(e)` + `removeClientFactory`（:361-366），
+    /// 起不来的实例不能继续挂在登记表上被后来者复用。
+    fn shutdown_factory(&self) {
         self.inner.started.store(false, Ordering::Release);
         let _ = self.inner.stop.send(true);
         let handles: Vec<JoinHandle<()>> = {
@@ -1024,6 +1141,21 @@ impl MQClientInstance {
         }
         self.inner.consumer_stats_manager.shutdown();
         self.inner.remoting_client.shutdown();
+        self.remove_from_instance_map();
+    }
+
+    /// Java `MQClientManager#removeClientFactory`：把本实例从 `INSTANCE_MAP` 摘掉，
+    /// 之后同 clientId 会拿到干净的新实例。只摘**指向自己**的那一条 —— 同 key 可能
+    /// 已被更晚构造的实例覆盖（`with_config` 是无条件 `insert`）。
+    fn remove_from_instance_map(&self) {
+        let mut map = MQClientInstance::instance_map().lock().unwrap_or_else(|e| e.into_inner());
+        let alive = map
+            .get(self.inner.client_id.as_str())
+            .and_then(|weak| weak.upgrade())
+            .is_some_and(|strong| Arc::ptr_eq(&strong, &self.inner));
+        if alive {
+            map.remove(self.inner.client_id.as_str());
+        }
     }
 
     fn push_task(&self, handle: JoinHandle<()>) {
@@ -3498,6 +3630,9 @@ mod tests {
 
         assert!(wait_until(|| consumer.persisted.load(Ordering::SeqCst) > 0).await);
 
+        // 守卫读的就是 consumer_table：先摘掉自己，shutdown 才真能拆（见
+        // `shutdown_keeps_the_instance_alive_while_tenants_remain`）。
+        instance.unregister_consumer(GROUP);
         instance.shutdown();
         assert!(!instance.is_started());
         assert_eq!(task_count(&instance), 0, "shutdown left task handles behind");
@@ -3505,13 +3640,141 @@ mod tests {
 
         // 重启必须真能跑：Python 靠把线程句柄置 None 重来，这里靠 stop 信号复位。
         instance.start().await.unwrap();
+        instance.register_consumer(GROUP, consumer.clone());
         assert_eq!(task_count(&instance), started);
         assert!(instance.is_started());
         assert!(
             wait_until(|| consumer.persisted.load(Ordering::SeqCst) > after_stop + 1).await,
             "loops stayed dead after restart"
         );
+        instance.unregister_consumer(GROUP);
         instance.shutdown();
+    }
+
+    /// Java `MQClientInstance#shutdown`(1101-1111)：`consumerTable` / `adminExtTable`
+    /// 非空、或 `producerTable` 还有别人时**直接 return**，只有关掉最后一个门面的
+    /// 那次调用才真正拆循环、关连接并摘掉 `INSTANCE_MAP` 登记。
+    #[tokio::test]
+    async fn shutdown_keeps_the_instance_alive_while_tenants_remain() {
+        let id = format!("{GROUP}@guard-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance =
+            MQClientInstance::with_config(&id, vec![NAMESRV.to_string()], fast_persist_config());
+        let consumer = StubConsumer::new();
+        instance.register_consumer(GROUP, consumer.clone());
+        instance.register_consumer_group("GID_Lite");
+        instance.register_producer("PG_First");
+        instance.register_producer("PG_Second");
+        assert!(instance.has_producer("PG_First"));
+        assert!(instance.has_producer("PG_Second"));
+
+        instance.start().await.unwrap();
+        let tasks = task_count(&instance);
+        assert_eq!(tasks, 4);
+
+        // 一个生产者退出：消费者和另一个生产者还在用，实例必须照常跑。
+        instance.unregister_producer("PG_First");
+        assert!(!instance.has_producer("PG_First"));
+        instance.shutdown();
+        assert!(instance.is_started(), "shutdown tore down a shared instance");
+        assert_eq!(task_count(&instance), tasks);
+        assert!(
+            MQClientInstance::find_instance(&id).is_some(),
+            "a guarded shutdown must not unregister the factory"
+        );
+
+        // 逐个退完之前的每一次都还是 no-op。
+        instance.unregister_producer("PG_Second");
+        instance.shutdown();
+        assert!(instance.is_started());
+        instance.unregister_consumer_group("GID_Lite");
+        instance.shutdown();
+        assert!(instance.is_started());
+
+        // 最后一个租户退出：这次真拆，登记表也要摘掉（Java `removeClientFactory`），
+        // 否则同 clientId 的后来者会复用到一个已关掉的死实例。
+        instance.unregister_consumer(GROUP);
+        instance.shutdown();
+        assert!(!instance.is_started());
+        assert_eq!(task_count(&instance), 0, "shutdown left task handles behind");
+        assert!(
+            MQClientInstance::find_instance(&id).is_none(),
+            "the factory stayed in INSTANCE_MAP after real shutdown"
+        );
+        // `JoinHandle::abort` 要到下一个让出点才生效，先留一拍；之后 persist 间隔 5ms，
+        // 再等 80ms 计数必须纹丝不动，说明循环真的停了。
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let settled = consumer.persisted.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            consumer.persisted.load(Ordering::SeqCst),
+            settled,
+            "the background loop survived the last tenant's shutdown"
+        );
+    }
+
+    /// Java `MQClientInstance#start` 的 catch 分支（:361-366 `cleanupAfterStartFailure`
+    /// + `removeClientFactory`）：起不来的实例要就地拆干净并摘掉登记，不能让同 clientId
+    /// 的后来者复用一个「started=false 但 remoting 已 start、循环起了一半」的半成品。
+    #[tokio::test]
+    async fn start_failure_cleans_up_and_unregisters_the_instance() {
+        let id = format!("{GROUP}@startfail-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            Vec::new(),
+            MQClientInstanceConfig {
+                // 没配静态地址 ⇒ 走动态取址；地址服务器不可达 ⇒ start 必失败
+                top_addressing: Some(DefaultTopAddressing::from_domain("127.0.0.1:1")),
+                ..Default::default()
+            },
+        );
+        instance
+            .start()
+            .await
+            .expect_err("an unreachable address server must fail start()");
+        assert!(!instance.is_started());
+        assert_eq!(task_count(&instance), 0, "failed start left background loops behind");
+        assert!(
+            MQClientInstance::find_instance(&id).is_none(),
+            "a factory that never reached RUNNING stayed in INSTANCE_MAP"
+        );
+        // 摘掉登记后同 clientId 必须能重建可用实例（Java 靠 MQClientManager 换新的）。
+        let rebuilt = MQClientInstance::create_mq_client_instance(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig::default(),
+        );
+        assert_eq!(rebuilt.name_server_addrs(), vec![NAMESRV.to_string()]);
+        rebuilt.shutdown();
+    }
+
+    /// 守卫通过后拆的是自己那份：同 clientId 已被更晚的实例覆盖时，
+    /// 不能把别人的登记一起摘掉（`with_config` 是无条件 insert）。
+    #[tokio::test]
+    async fn shutdown_does_not_unregister_a_newer_instance_with_the_same_client_id() {
+        let id = format!("{GROUP}@overwrite-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let older = MQClientInstance::with_config(
+            &id,
+            vec!["127.0.0.1:1".to_string()],
+            MQClientInstanceConfig::default(),
+        );
+        let newer = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig::default(),
+        );
+        assert_eq!(
+            MQClientInstance::find_instance(&id)
+                .expect("newest instance must own the registration")
+                .name_server_addrs(),
+            newer.name_server_addrs(),
+            "the newer instance must win the same clientId slot"
+        );
+
+        older.shutdown();
+        let still_there = MQClientInstance::find_instance(&id).expect("newer entry must survive");
+        assert_eq!(still_there.name_server_addrs(), newer.name_server_addrs());
+        newer.shutdown();
+        assert!(MQClientInstance::find_instance(&id).is_none());
     }
 
     #[tokio::test]

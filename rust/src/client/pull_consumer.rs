@@ -493,6 +493,10 @@ impl DefaultMQPullConsumer {
                 self.update_config(|c| c.name_server_addrs = addrs);
             }
         }
+        // Java `DefaultMQPullConsumerImpl#start`:746 `registerConsumer`：拉模式消费者
+        // 接不了 broker 的反向请求（220/221/307/309），所以只登记组名给实例的关闭
+        // 守卫用，不进 `consumer_table`。
+        client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
         Ok(())
     }
@@ -508,6 +512,9 @@ impl DefaultMQPullConsumer {
             return;
         }
         if let Some(client) = lock(&self.inner.client).take() {
+            // 先摘自己再关实例（Java `unregisterConsumer`:691 → `shutdown()`:693）。
+            let group = self.consumer_group();
+            client.unregister_consumer_group(&group);
             client.shutdown();
         }
     }
@@ -1284,8 +1291,11 @@ impl DefaultLitePullConsumer {
                 self.update_config(|c| c.name_server_addrs = addrs);
             }
         }
-        // 本消费者不进实例注册表：lite 的心跳报文由自己拼（Python 同），
-        // 只取 client 引用备用。
+        // 本消费者不进 `consumer_table`（接不了 broker 的反向请求），但要在实例上
+        // 登记组名：Java `DefaultLitePullConsumerImpl#start`:339 也是 registerConsumer
+        // 之后才由实例的关闭守卫判断「还有谁在用这份实例」。心跳报文仍由自己拼
+        // （Python 同），这里只取 client 引用备用。
+        client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
 
         // assign 模式：start 时补齐初始位点（Python `consumer.py:2463-2469`）
@@ -1355,16 +1365,23 @@ impl DefaultLitePullConsumer {
                                 rmq_debug!("lite shutdown commit failed for {mq:?}: {e}");
                             }
                         }
+                        // 末次提交还要用这条连接，所以摘登记与关实例都排在它之后
+                        // （Java `unregisterConsumer`:265 → `shutdown()`:269）。
+                        client.unregister_consumer_group(&group);
                         client.shutdown();
                     });
                 } else {
                     // 无运行时：提交不了，至少把连接关掉（与 Python 的
                     // 「commit 失败只 debug 日志」同级别降级）。
                     rmq_warn!("lite shutdown: no tokio runtime, skip final offset commit");
+                    client.unregister_consumer_group(&group);
                     client.shutdown();
                 }
             }
-            (Some(client), false) => client.shutdown(),
+            (Some(client), false) => {
+                client.unregister_consumer_group(&group);
+                client.shutdown();
+            }
             (None, _) => {}
         }
     }

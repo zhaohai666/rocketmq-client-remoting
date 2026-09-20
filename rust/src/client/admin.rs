@@ -21,8 +21,8 @@
 //! 2. **实例是私有的**：Python `admin.py:92` 直接 `MQClientInstance(client_id, addrs)`
 //!    构造（不走 `create_mq_client_instance` 的复用工厂），这里照抄 —— 因此 admin 的
 //!    `shutdown()` 只会拆掉自己那份实例，不会连带同 clientId 的 producer/consumer。
-//!    （Java 走 `MQClientManager` 共享 + 引用计数注销；本项目 producer/consumer 侧的
-//!    复用+无条件 shutdown 隐患单独记在待办 #38，admin 不受影响。）
+//!    （Java 走 `MQClientManager` 共享 + `adminExtTable` 守卫；本移植的 producer 与
+//!    consumer 侧现在也有守卫了，见 `mq_client.rs` 模块头差异 7，admin 不依赖它。）
 //! 3. **没有默认参数**：Python 的 `timeout_millis=None` / `topic=None` / `count=32`
 //!    在这里分成 `Option<...>` 与显式实参，常量（[`DEFAULT_TIMEOUT_MILLIS`]、
 //!    [`DEFAULT_QUERY_MESSAGE_MAX_NUM`]）给出同一默认值。

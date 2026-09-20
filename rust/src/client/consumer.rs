@@ -1184,14 +1184,25 @@ impl DefaultMQPushConsumer {
                     // 才生效），它落回 broker 会把本 clientId 重新塞进 ConsumerManager，同组
                     // 其它实例就得等 broker 的通道扫描（默认 120s）才接管。Java 靠「先停心跳
                     // 线程 → 注销 → 关连接」消掉这个窗口；这里连接可能和同 clientId 的其它
-                    // 客户端共用，不能随手关，那就等一拍再补偿性注销一次。
+                    // 客户端共用（关不关由实例的守卫判断，见 `MQClientInstance::shutdown`），
+                    // 那就等一拍再补偿性注销一次。
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if client.find_consumer(&group).is_none() {
                         client
                             .unregister_client_all_brokers(&client_id, "", &group, 5000)
                             .await;
                     }
+                    // 清退 RPC 跑完了才关实例（Java `DefaultMQPushConsumerImpl#shutdown`
+                    // 的 `unregisterConsumer` → `mQClientFactory.shutdown()` 顺序）。
+                    // 守卫保证同 clientId 还有别人时这一句是 no-op。
+                    client.shutdown();
                 });
+            } else {
+                // 无运行时：末次持久化与注销都发不出去（Python 那里线程照起），
+                // 但至少把该还的还掉。
+                rmq_warn!("push shutdown: no tokio runtime, skip final offset persist and \
+                           consumer unregister");
+                client.shutdown();
             }
         }
         lock(&self.inner.client).take();

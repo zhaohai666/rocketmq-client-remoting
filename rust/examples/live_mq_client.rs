@@ -7,7 +7,8 @@
 //! 这两件事不足以判合格。本示例锁死的是只有真集群能证明的性质：
 //!
 //! - M1 **实例身份与生命周期**：clientId 登记进进程级实例表、同 id 复用同一实例、
-//!   `start` / `shutdown` 翻转 `started` 且对所有 handle 可见、空 namesrv 列表不改写
+//!   `start` / `shutdown` 翻转 `started` 且对所有 handle 可见、`shutdown` 之后登记表
+//!   里不再留死的实例、空 namesrv 列表不改写
 //!   地址、没配地址服务器时 `fetch_name_server_addr` 回 `None`（Python 同）。
 //! - M2 **路由与发布信息缓存**：真实路由落库后 `TopicPublishInfo` 的队列视图、
 //!   轮询游标（含 `reset_index` 与过滤器语义：过滤全拒回 `None` 而不是报错）、
@@ -26,6 +27,11 @@
 //!   能直接用于后续 ACK；全部确认后同组再弹拿不到这些消息。
 //! - M7 **管理与清理**：集群信息 / namesrv topic 列表 / 队列批量锁（含「锁真互斥」
 //!   的反证）/ 注销，最后删掉本次建的 topic。
+//! - M8 **共用实例的关闭守卫**（Java `MQClientInstance#shutdown` 读的那三张表 +
+//!   `removeClientFactory`）：同 clientId 的两个生产者与一个 lite 消费者共用一份实例，
+//!   先退的门面不能把还在用的心跳、路由刷新和连接拆掉（用「兄弟退出后另一个仍能真发消息」
+//!   证明），最后一个退掉时实例要真拆并**从进程级登记表摘掉**，同 clientId 才能拿到新实例。
+//!   排在 M7 之前跑，因为要用 M7 删掉的 topic 发消息。
 //!
 //! ⚠ 未覆盖：broker 主动请求（220/221/307/309/326）无法从外部注入 —— 它们走 broker
 //! 已建立的那条连接。协议与分派由 `mq_client.rs` 的离线单测覆盖（对齐
@@ -49,6 +55,10 @@ use rocketmq_client_remoting::client::consumer_stats::ConsumerStatsManager;
 use rocketmq_client_remoting::client::latency::QueueFilter;
 use rocketmq_client_remoting::client::mq_client::{
     ConsumerFuture, MQClientInstance, MQClientInstanceConfig, PublishMessage, RegisteredConsumer,
+};
+use rocketmq_client_remoting::client::producer::DefaultMQProducer;
+use rocketmq_client_remoting::client::pull_consumer::{
+    DefaultLitePullConsumer, LitePullConsumerConfig,
 };
 use rocketmq_client_remoting::client::result::{PopStatus, PullStatus, SendStatus};
 use rocketmq_client_remoting::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
@@ -498,10 +508,23 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     instance.shutdown();
     instance.shutdown();
     ck.check(
-        "M1 shutdown() is shared through every handle and is idempotent",
-        !instance.is_started() && MQClientInstance::find_instance(&client_id).is_some(),
-        "flag stuck or instance vanished",
+        "M1 shutdown() is shared through every handle and unregisters the factory",
+        !instance.is_started() && MQClientInstance::find_instance(&client_id).is_none(),
+        "flag stuck or the factory stayed in INSTANCE_MAP",
     );
+    // Java `removeClientFactory`：摘掉登记后同 clientId 拿到的是干净的新实例，
+    // 复用的工厂不会把一个已关掉的死实例发给后来者。
+    let rebuilt = MQClientInstance::create_mq_client_instance(
+        &client_id,
+        vec![namesrv.to_string()],
+        MQClientInstanceConfig::default(),
+    );
+    ck.check(
+        "M1 a fresh factory takes over the clientId after shutdown",
+        rebuilt.start().await.is_ok() && rebuilt.is_started(),
+        "the replacement factory could not start",
+    );
+    rebuilt.shutdown();
 
     // 动态取址：没配地址服务器时 Python `fetch_name_server_addr` 直接返回 None。
     let fresh = MQClientInstance::new(&format!("{client_id}-fresh"), vec![namesrv.to_string()]);
@@ -1432,6 +1455,140 @@ async fn m6_pop(
     Ok(())
 }
 
+// ---------------------------------------------------------------------- M8
+
+/// 共用实例的关闭守卫（Java `MQClientInstance#shutdown`:1101-1137 读的三张表 +
+/// `MQClientManager#removeClientFactory`）在**真门面**上的效果：同 clientId 的
+/// producer / lite 消费者共用一份实例时，先退的那个不能把还在用的心跳、路由刷新
+/// 和连接一起拆掉；最后一个退掉之后，实例要从进程级登记表里消失。
+///
+/// 排在 M7 之前跑：M7 会删掉本示例的 topic，这里要用它真发消息。
+async fn m8_shared_factory(
+    namesrv: &str,
+    topic: &str,
+    group_a: &str,
+    group_b: &str,
+    lite_group: &str,
+    ck: &mut Checker,
+) -> Live {
+    let client_id = format!("rust-live-mqclient-{}@m8", stamp());
+
+    let a = DefaultMQProducer::new(group_a).map_err(|e| format!("A build failed: {e}"))?;
+    a.set_namesrv_addr(namesrv);
+    a.set_client_id(Some(&client_id));
+    a.start().await.map_err(|e| format!("A start failed: {e}"))?;
+
+    let shared = match MQClientInstance::find_instance(&client_id) {
+        Some(instance) => instance,
+        None => return Err("A's factory is missing from INSTANCE_MAP".to_string()),
+    };
+    ck.check(
+        "M8 producer start registers its group on the factory (Java registerProducer)",
+        shared.has_producer(group_a) && !shared.has_producer(group_b),
+        &format!("clientId={}", shared.client_id()),
+    );
+
+    // 同 clientId 的第二个生产者：复用实例，不能再起第二份心跳/路由循环。
+    let b = DefaultMQProducer::new(group_b).map_err(|e| format!("B build failed: {e}"))?;
+    b.set_namesrv_addr(namesrv);
+    b.set_client_id(Some(&client_id));
+    b.start().await.map_err(|e| format!("B start failed: {e}"))?;
+    ck.check(
+        "M8 the second producer with the same clientId shares that one factory",
+        shared.has_producer(group_b) && b.client().is_some(),
+        &format!("producerTable missing {group_b}"),
+    );
+    let mut warm = Message::new(topic, Some(b"m8-warm"));
+    let warm_ok = b.send(&mut warm, Some(10_000), None).await.is_ok();
+    ck.check(
+        "M8 both producers send on the shared factory",
+        warm_ok,
+        "B's send failed",
+    );
+
+    // A 先退：B 还在用 ⇒ 守卫让 `shutdown()` 变成 no-op，B 的发送照常走同一条连接。
+    a.shutdown();
+    ck.check(
+        "M8 the first producer leaving keeps the shared factory running",
+        shared.is_started() && !shared.has_producer(group_a) && shared.has_producer(group_b),
+        &format!(
+            "started={} a={} b={}",
+            shared.is_started(),
+            shared.has_producer(group_a),
+            shared.has_producer(group_b)
+        ),
+    );
+    let mut after_a = Message::new(topic, Some(b"m8-after-a-shutdown"));
+    let sent = match b.send(&mut after_a, Some(10_000), None).await {
+        Ok(r) => Ok(r),
+        Err(e) => Err(format!("{e}")),
+    };
+    ck.check(
+        "M8 the remaining producer really sends after its sibling shut down",
+        sent.is_ok(),
+        sent.err().as_deref().unwrap_or(""),
+    );
+
+    // 拉模式消费者同样进守卫（Java 把它和推送消费者一起放 consumerTable；这里按
+    // 组名登记）。它复用同一份实例，不是新建。
+    let lite = DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
+        consumer_group: lite_group.to_string(),
+        name_server_addrs: vec![namesrv.to_string()],
+        client_id: Some(client_id.clone()),
+        ..Default::default()
+    })
+    .map_err(|e| format!("lite build failed: {e}"))?;
+    lite.subscribe(topic, "*");
+    lite.start().await.map_err(|e| format!("lite start failed: {e}"))?;
+    ck.check(
+        "M8 a pull-mode consumer is a tenant of the factory too",
+        shared.is_started() && shared.has_consumer_group(lite_group),
+        &format!("started={} groupRegistered={}", shared.is_started(), shared.has_consumer_group(lite_group)),
+    );
+
+    // B 再退：lite 还在用，实例仍不许拆。
+    b.shutdown();
+    ck.check(
+        "M8 the factory survives while the lite consumer still uses it",
+        shared.is_started() && shared.has_consumer_group(lite_group),
+        "shutdown tore down an instance that still had a consumer",
+    );
+
+    // 最后一个租户退出（lite 的末次提交与关实例是串在同一个后台任务里的）：
+    // 这次要真拆，并且把 INSTANCE_MAP 的登记摘掉。
+    lite.shutdown();
+    let gone = wait_async(
+        || async {
+            !shared.is_started() && MQClientInstance::find_instance(&client_id).is_none()
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    ck.check(
+        "M8 the last tenant shuts the factory down and unregisters it",
+        gone,
+        &format!(
+            "started={} stillRegistered={}",
+            shared.is_started(),
+            MQClientInstance::find_instance(&client_id).is_some()
+        ),
+    );
+    // 摘掉登记之后同 clientId 必须拿到可用的新实例，而不是一个已关掉的死实例。
+    let rebuilt = MQClientInstance::create_mq_client_instance(
+        &client_id,
+        vec![namesrv.to_string()],
+        MQClientInstanceConfig::default(),
+    );
+    let restart_ok = rebuilt.start().await.is_ok() && rebuilt.is_started();
+    ck.check(
+        "M8 a shutdown factory is replaced by a fresh one for the same clientId",
+        restart_ok,
+        "the rebuilt factory could not start",
+    );
+    rebuilt.shutdown();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------- M7
 
 /// 集群信息 / topic 列表 / 队列锁（含互斥反证）/ 注销，然后删掉本次建的 topic。
@@ -1680,6 +1837,18 @@ async fn run(namesrv: &str) -> Checker {
                 &broker_name,
                 &producer_group,
                 &consumer_group,
+                &mut ck,
+            )
+            .await,
+        ),
+        (
+            "M8 shared client factory lifecycle",
+            m8_shared_factory(
+                namesrv,
+                &topic,
+                &format!("{producer_group}_m8a"),
+                &format!("{producer_group}_m8b"),
+                &format!("{consumer_group}_m8"),
                 &mut ck,
             )
             .await,

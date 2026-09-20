@@ -49,12 +49,12 @@ Windows / MSVC 分支。
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 640 条，~0.3s
+cargo test --lib               # 650 条，~0.3s
 ```
 
 ## 单元测试
 
-647 条按模块分布（`cargo test --lib -- --list` 可复算）：
+650 条按模块分布（`cargo test --lib -- --list` 可复算）：
 
 | 模块 | 条数 | 覆盖 |
 | --- | --- | --- |
@@ -70,7 +70,7 @@ cargo test --lib               # 640 条，~0.3s
 | `client::allocate_strategy` | 30 | 六个策略与 Java 单测逐条对拍：`AVG` / `AVG_BY_CIRCLE` 的 Java 用例（10/4、7/3、边界队列续接）、四道 `check` 守卫返回**空结果**而非 Java 的 `IllegalArgumentException`、`CONFIG` 不查守卫且返回副本、六个 `get_name()` 与 Java 常量一致、N 消费者不重不漏、`CONSISTENT_HASH` 的哈希环表逐格、`MACHINE_ROOM` 的 `[0,1,4]/[2,3]` 分片与 `String#split("@")` 裁尾空段真值表、`MACHINE_ROOM_NEARBY` 同机房优先 + 无消费者机房由全员共享 + resolver 空机房**抛错**（保住上一轮分配） |
 | `client::consumer` / `pull_consumer` / `consume_executor` / `consumer_stats` | 97 | 订阅与 `MessageSelector`、`PopProcessQueue`、过滤与投递接缝、pull/lite 状态机（subscribe/assign/seek/poll/committed）、`consume_executor` 的 core/max 两档弹性语义（空闲 worker 按 keepAlive 退休）、`StatsItem` 窗口端点差分（不依赖真实时钟） |
 | 轨迹四件套 `trace` / `trace_hook` / `trace_dispatcher` / `trace_context` | 101 | 与 Java 官方实现的逐字节对拍（Pub / SubBefore / SubAfter / EndTransaction / Recall）、SOH/STX 文本编解码双向、无 keys 空段容错、坏记录只跳过自己、分发器攒批/切块/防递归、W3C `traceparent` 生成与校验 |
-| `client` 其余 | 112 | `mq_client`（实例表复用、心跳装配、路由缓存）、`admin`（properties 文本、分页合并、地址挑选）、`latency`、`hook`、`request_reply`、`metrics`、`top_addressing`、`result`、`validators` |
+| `client` 其余 | 115 | `mq_client`（实例表复用、心跳装配、路由缓存、**共用实例的关闭守卫**：还有 producer / 拉模式消费者登记时 `shutdown()` 是 no-op，最后一个租户退掉才真拆并摘掉 `INSTANCE_MAP` 登记；启动失败同样就地清理）、`admin`（properties 文本、分页合并、地址挑选）、`latency`、`hook`、`request_reply`、`metrics`、`top_addressing`、`result`、`validators` |
 | `error` | 2 | 错误码口径（10001..10005）与 `Display` |
 
 ## 真实集群联调
@@ -95,13 +95,13 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 ```
 
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
-下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 11 个工具合计 670 项断言；
+下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 11 个工具合计 680 项断言；
 `live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本调度，都不计进去）：
 
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
 | `live_protocol` | 43 PASS | S0~S8：路由/集群信息 → `SEND_MESSAGE_V2`(310) 短键 header → `PULL_MESSAGE`(11) + 17 段解码 → 四个 offset RPC → 心跳/消费组列表/注销 → **RocketMQ 二进制 header 在真 broker 上的往返** → 清理 |
-| `live_mq_client` | 74 PASS | M1~M7：实例身份与复用、路由与 `TopicPublishInfo` 游标（未知 topic 只在生产者路径回退 `TBW102`）、收发逐字段、位点五 RPC、心跳真被 broker 采纳（用 `GET_CONSUMER_LIST_BY_GROUP` 反查证明）、**POP 弹回→ACK→改不可见时间→再弹拿不到**、队列批量锁真互斥 |
+| `live_mq_client` | 84 PASS | M1~M8：实例身份与复用、路由与 `TopicPublishInfo` 游标（未知 topic 只在生产者路径回退 `TBW102`）、收发逐字段、位点五 RPC、心跳真被 broker 采纳（用 `GET_CONSUMER_LIST_BY_GROUP` 反查证明）、**POP 弹回→ACK→改不可见时间→再弹拿不到**、队列批量锁真互斥、**共用实例的关闭守卫**（同 clientId 的两个生产者 + 一个 lite 消费者：先退的门面之后兄弟仍能真发消息，最后一个退掉才拆循环并摘掉 `INSTANCE_MAP`，同 clientId 重建才拿到可用新实例） |
 | `live_producer` | 55 PASS | P1~P10：生命周期与心跳注册、六条发送路径、压缩消息 broker 端透明解压且清 flag、三类钩子、轨迹接缝、Request-Reply 三属性与超时、**事务两阶段 + broker 回查**、管理便捷方法、发送重试内核定性、**定时消息撤回 `recallMessage`(370)**（broker 给的句柄能解开、撤回返回 uniqKey、对照定时消息按时到 / 被撤回那条永不到、`recallMessageEnable` 还原）、topic 清理 |
 | `live_consumer` | 88 PASS | C1~C10：`start()` 三道校验与首轮同步心跳、长轮询 24 条不重不丢且位点刷到 broker、tag 过滤（broker 存 20 只投 10）、`RECONSUME_LATER` 走 `%RETRY%` 重投、POP + ack、广播位点、顺序消费 broker 锁、多实例分摊与撤位、broker 推来的 `NOTIFY_CONSUMER_IDS_CHANGED`(40) 确实叫醒了两端、`ConsumerRunningInfo` |
 | `live_pull_consumer` | 43 PASS | P1~P11：生命周期、`fetch_subscribe_message_queues`、定向 12 条、手动 pull 不重不漏 + `broker_name` 回填、位点由调用方掌控（回退再拉 FOUND、换 tag `NO_MATCHED_MSG`）、未提交组读位点得 `None` 而非 0、**长轮询真的挂起** |
@@ -210,9 +210,6 @@ rust/
 - **默认 clientId 不含本机 IP 段**：`build_mq_client_id(ip, instanceName, unitName)` 已按
   Java 写好，但 facade 默认走 `build_default_client_id` ⇒ `instanceName@<14 位时间戳>`。
 - **`unitName` / `unitMode` 没有客户端配置项**（协议字段在，能编解码）。
-- **`shutdown()` 不做引用计数**：Java `MQClientInstance` 按 clientId 计数注销，这里
-  producer / push / lite 共用实例时任一 `shutdown()` 会拆掉整份实例（待办 #38）。
-  管理端不受影响 —— admin 刻意用私有实例（见 `admin.rs` 模块头差异 2）。
 - **broker 主动请求（220/221/307/309/326）无法从外部注入**：它们走 broker 已建立的那条
   连接。协议与分派由离线单测覆盖，`live_mq_client` 只验实例侧的 seam。
 - **SQL92 过滤 / `%DLQ%` 死信 / 批量发送真机 / Rust TLS / 动态地址服务器真机**这几条

@@ -1053,6 +1053,10 @@ impl DefaultMQProducer {
             .client
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
+        // Java `DefaultMQProducerImpl#start`:258 `mQClientFactory.registerProducer`：
+        // 登记组名，实例的关闭守卫才知道还有生产者在用它（同 clientId 的别人先退，
+        // 也不该把本生产者的心跳与路由刷新拆掉）。
+        client.register_producer(&group);
 
         // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
         if cfg.name_server_addrs.is_empty() {
@@ -1148,6 +1152,10 @@ impl DefaultMQProducer {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(client) = client {
+            // Java `DefaultMQProducerImpl#shutdown`:313-317：先 `unregisterProducer`
+            // 再 `mQClientFactory.shutdown()`。守卫读的就是这张表，不先摘掉自己，
+            // 最后一个使用者反而永远拆不掉实例。
+            client.unregister_producer(&self.inner.producer_group());
             client.shutdown();
         }
         // 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器
