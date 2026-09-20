@@ -2,6 +2,7 @@
 //
 // 关键点：Bytes2String 必须输出**大写**十六进制（Java HEX_ARRAY = "0123456789ABCDEF"），
 // msgId 依赖该大小写；String2Bytes 是十六进制解码，不是 UTF-8 编码。
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -24,6 +25,17 @@ public static class UtilAll
         offset.ToString("D20", CultureInfo.InvariantCulture);
 
     public static long ComputeElapseTimeMillis(long lastTime) => CurrentTimeMillis() - lastTime;
+
+    /// <summary>
+    /// 单调高精度时钟起点（对应 Python `time.monotonic()` / C++ `steady_clock::now()`）。
+    ///
+    /// 只用于量**耗时**：墙钟（`CurrentTimeMillis`）粒度是毫秒且会被 NTP 往回拨，
+    /// 本地环回亚毫秒往返会量成 0，发送延迟故障容错的阈值就永远不会生效。
+    /// </summary>
+    public static double MonotonicMillis() =>
+        Stopwatch.GetElapsedTime(_stopwatchStart).TotalMilliseconds;
+
+    private static readonly long _stopwatchStart = Stopwatch.GetTimestamp();
 
     /// <summary>
     /// 按strftime风格的模式格式化时间戳（本地时区，与 C++ localtime_r / Java SimpleDateFormat 默认一致）。

@@ -287,7 +287,17 @@ public sealed class DefaultMQPushConsumer
     public bool PopMode { get; set; }
 
     /// <summary>TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）。</summary>
-    public bool TlsEnable { get; set; }
+    /// <remarks>
+    /// 初值必须在这里取 env：实例化 <c>MQClientInstance</c> 时传的是 <c>bool</c>（不是
+    /// <c>bool?</c>），默认的 <c>false</c> 会盖掉 RemotingClient 内部的 env 兜底。
+    /// </remarks>
+    public bool TlsEnable
+    {
+        get => _tlsEnable;
+        set => _tlsEnable = value;
+    }
+
+    private bool _tlsEnable = MQClientInstance.TlsEnabledFromEnv();
 
     /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
     public long PopInvisibleTime { get; set; } = 60000;

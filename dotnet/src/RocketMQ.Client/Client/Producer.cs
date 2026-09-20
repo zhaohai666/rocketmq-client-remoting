@@ -42,7 +42,9 @@ public class DefaultMQProducer
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
     // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
-    private bool _tlsEnable;
+    // 注意必须在字段初始化时就取 env：往 MQClientInstance 传的是 bool（非 bool?），
+    // 传 false 会盖掉 RemotingClient 里的 env 兜底。
+    private bool _tlsEnable = MQClientInstance.TlsEnabledFromEnv();
     // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
     private bool _enableTraceContext;
     private int _retryTimesWhenSendFailed = 2;
@@ -781,7 +783,9 @@ public class DefaultMQProducer
                 // 关闭时退化为普通轮询（策略内部判断）。
                 MessageQueue selected = _mqFaultStrategy.SelectOneMessageQueue(publish, lastBrokerName);
                 lastBrokerName = selected.BrokerName;
-                long sendBegin = UtilAll.CurrentTimeMillis();
+                // 耗时用单调高精度钟（对应 Python time.monotonic / C++ steady_clock）：
+                // 墙钟毫秒粒度会把本地环回的亚毫秒往返量成 0，阈值就永远不生效。
+                double sendBegin = UtilAll.MonotonicMillis();
                 SendResult result;
                 try
                 {
@@ -795,7 +799,7 @@ public class DefaultMQProducer
                 }
                 // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
                 _mqFaultStrategy.UpdateFaultItem(selected.BrokerName,
-                                                 UtilAll.CurrentTimeMillis() - sendBegin, false, true);
+                                                 UtilAll.MonotonicMillis() - sendBegin, false, true);
                 return result;
             }
             catch (MQClientException e)
