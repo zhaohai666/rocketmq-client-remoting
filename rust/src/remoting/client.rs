@@ -25,8 +25,9 @@ use crate::remoting::rpchook::RPCHook;
 
 pub const MAX_FRAME_LENGTH: i32 = 16 * 1024 * 1024;
 
-/// TLS 读线程单次持锁上限：读阻塞时写线程最多等这么久。
-const TLS_READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// TLS 读写单次尝试拿不到数据时的退避：socket 为非阻塞，靠这个小睡避免空转，
+/// 同时保证 [`TlsStream`] 那把双向锁的持有时长只有一次 syscall 量级。
+const TLS_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// 异步调用回调（对应 Java `InvokeCallback`）。
 pub type InvokeCallback = Box<dyn FnOnce(Result<RemotingCommand>) + Send + 'static>;
@@ -674,8 +675,12 @@ async fn connect_plain(inner: &Arc<Inner>, socket_addr: SocketAddr, addr: &str) 
     Ok(conn)
 }
 
-/// TLS 走阻塞线程：`native-tls` 没有 async 接口，读写共用一把锁，
-/// 读侧带 [`TLS_READ_TIMEOUT`] 超时以保证写不被读阻塞饿死。
+/// TLS 走独立线程：`native-tls` 没有 async 接口，一条 [`TlsStream`] 双向共用一把锁。
+///
+/// ⚠  socket 握手后置为**非阻塞**，读写都按 [`TLS_POLL_INTERVAL`] 小睡重试。
+/// 用「阻塞读 + 读超时」的老做法会在半包时抱着锁等满一个超时周期，写线程被饿死：
+/// 实测（真机 TLS broker）表现为 namesrv 请求 5s 全超时、超时后响应成批回来
+/// （`remoting: response for unknown opaque N`）。非阻塞 + 短睡把持锁时间压到一次 syscall。
 async fn connect_tls(
     inner: &Arc<Inner>,
     addr: &str,
@@ -710,8 +715,8 @@ async fn connect_tls(
         let mut tls = connector.connect(&domain, std_stream).map_err(|e| Error::Connect {
             addr: format!("{handshake_addr} (tls handshake: {e})"),
         })?;
-        // 读超时设在握手之后：握手期间必须允许完整阻塞。
-        let _ = tls.get_mut().set_read_timeout(Some(TLS_READ_TIMEOUT));
+        // 非阻塞设在握手之后：握手期间必须允许完整阻塞。
+        let _ = tls.get_mut().set_nonblocking(true);
         Ok::<_, Error>(tls)
     })
     .await
@@ -748,14 +753,15 @@ fn spawn_tls_writer(
 ) {
     let addr = addr.to_string();
     std::thread::spawn(move || {
-        while let Ok(data) = rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+        loop {
+            let data = match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+                Ok(data) => data,
+                Err(_) => break,
+            };
             if !alive.load(Ordering::Acquire) || !inner.is_running() {
                 break;
             }
-            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let result = guard.write_all(&data).and_then(|_| guard.flush());
-            drop(guard);
-            if result.is_err() {
+            if tls_write_all(&shared, &data).is_err() {
                 break;
             }
         }
@@ -764,6 +770,35 @@ fn spawn_tls_writer(
 }
 
 type SharedTls = Arc<Mutex<native_tls::TlsStream<std::net::TcpStream>>>;
+
+/// 取放一次锁写一段，`WouldBlock` 时先睡 [`TLS_POLL_INTERVAL`] 再续写。
+///
+/// 锁必须一次一取：读线程也在等这把锁，长时间持有会把对端的请求堵死。
+fn tls_write_all(shared: &SharedTls, data: &[u8]) -> std::io::Result<()> {
+    let mut off = 0usize;
+    while off < data.len() {
+        let written = {
+            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.write(&data[off..]) {
+                Ok(0) => Err(std::io::ErrorKind::WriteZero.into()),
+                result => result,
+            }
+        };
+        match written {
+            Ok(n) => off += n,
+            Err(e) if is_timeout(&e) => std::thread::sleep(TLS_POLL_INTERVAL),
+            Err(e) => return Err(e),
+        }
+    }
+    loop {
+        let flushed = { shared.lock().unwrap_or_else(|e| e.into_inner()).flush() };
+        match flushed {
+            Ok(()) => return Ok(()),
+            Err(e) if is_timeout(&e) => std::thread::sleep(TLS_POLL_INTERVAL),
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 fn tls_read_loop(inner: Arc<Inner>, addr: String, shared: SharedTls, alive: Arc<AtomicBool>) {
     let mut len_buf = [0u8; 4];
@@ -775,7 +810,10 @@ fn tls_read_loop(inner: Arc<Inner>, addr: String, shared: SharedTls, alive: Arc<
         if !header_done {
             match tls_read_exact(&shared, &mut len_buf) {
                 Ok(true) => header_done = true,
-                Ok(false) => continue,
+                Ok(false) => {
+                    std::thread::sleep(TLS_POLL_INTERVAL);
+                    continue;
+                }
                 Err(_) => break,
             }
         }
@@ -788,7 +826,10 @@ fn tls_read_loop(inner: Arc<Inner>, addr: String, shared: SharedTls, alive: Arc<
         frame[..4].copy_from_slice(&len_buf);
         match tls_read_exact(&shared, &mut frame[4..]) {
             Ok(true) => {}
-            Ok(false) => continue,
+            Ok(false) => {
+                std::thread::sleep(TLS_POLL_INTERVAL);
+                continue;
+            }
             Err(_) => break,
         }
         header_done = false;
@@ -798,19 +839,26 @@ fn tls_read_loop(inner: Arc<Inner>, addr: String, shared: SharedTls, alive: Arc<
     on_connection_lost(&inner, &addr);
 }
 
-/// `Ok(true)` 读满，`Ok(false)` 读超时（调用方重试），`Err` 连接不可用。
+/// `Ok(true)` 读满，`Ok(false)` 暂无数据（调用方重试），`Err` 连接不可用。
+///
+/// ⚠ 每次 `read` **单独取放锁**，不能整帧持锁：`TlsStream` 双向共用一把锁，读线程抱着
+/// 锁等半包会让写线程发不出下一个请求（真机表现为请求成批 5s 超时、响应成批回来）。
+/// 半包的进度记在 `filled` 里，让出锁不丢数据。
 fn tls_read_exact(shared: &SharedTls, buf: &mut [u8]) -> std::result::Result<bool, std::io::Error> {
-    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut filled = 0usize;
     while filled < buf.len() {
-        match guard.read(&mut buf[filled..]) {
+        let read = {
+            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            guard.read(&mut buf[filled..])
+        };
+        match read {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => filled += n,
             Err(e) if is_timeout(&e) => {
                 if filled == 0 {
                     return Ok(false);
                 }
-                continue;
+                std::thread::sleep(TLS_POLL_INTERVAL);
             }
             Err(e) => return Err(e),
         }
