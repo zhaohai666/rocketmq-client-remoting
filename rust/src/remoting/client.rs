@@ -1318,4 +1318,307 @@ mod tests {
     fn frame_length_guard() {
         assert_eq!(MAX_FRAME_LENGTH, 16 * 1024 * 1024);
     }
+
+    // ------------------------------------------------------------- TLS 回归网
+    //
+    // 为什么要有这组离线用例：TLS 分支（`connect_tls` 及其读写循环）是整套传输里唯一
+    // 「一个改动就静默死锁」的地方，而它的所有已知 bug 都只需要一台机器就能复现：
+    //   * `TlsStream` 双向共用一把锁，读线程抱着锁等半包 → 写线程饿死，表现为请求
+    //     成批超时、响应成批回来（真机 TLS broker 实测过，见 connect_tls 的注释）；
+    //   * socket 握手后置非阻塞，`tls_read_exact` / `tls_write_all` 必须自己续读续写，
+    //     少写一次进度就把帧读废了。
+    // 这两条靠真机 TLS broker 验代价高（要起带证书的 broker），且 CI 上根本没那台机器；
+    // 本地用 openssl 现造一张自签证书 + 进程内 TLS 服务端就能锁死，口径与
+    // python/tests/test_tls_trace.py 一致。
+
+    const TLS_P12_PASSWORD: &str = "rmq-rust-test";
+
+    /// 用 openssl CLI 现造一张自签证书，导出成 PKCS#12（`Identity::from_pkcs12` 三个
+    /// 后端都支持，绕开 PKCS#1/PKCS#8  PEM 头的平台差异）。
+    /// 找不到 openssl 就返回 `None`，用例自己跳过——守的是 TLS 读写循环，缺工具不该
+    /// 把整个 gate 变红。
+    fn tls_identity_pkcs12() -> Option<Vec<u8>> {
+        let openssl = match std::env::var("OPENSSL_BIN") {
+            Ok(v) => v,
+            Err(_) => {
+                // 没设环境变量就按 PATH 探一次：探不到直接跳过（Windows CI 上常没有）
+                std::process::Command::new("openssl")
+                    .arg("-version")
+                    .output()
+                    .ok()?
+                    .status
+                    .success()
+                    .then(|| "openssl".to_string())?
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("rmq_rust_tls_{}_{}", std::process::id(), {
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let p12 = dir.join("identity.p12");
+        let ok = std::process::Command::new(&openssl)
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-keyout",
+                key.to_str()?, "-out", cert.to_str()?, "-days", "1", "-nodes",
+                "-subj", "/CN=127.0.0.1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        // 显式指定旧式 PBE：OpenSSL 3 默认导出 PKCS#12 v2.0（AES-256 + SHA-256 KDF），
+        // macOS 的 SecPKCS12Import 解不开，会报 "MAC verification failed"。
+        // SHA1-3DES + SHA1 MAC 在 OpenSSL 1.x/3.x 和三个 TLS 后端上都能导入。
+        let exported = ok
+            && std::process::Command::new(&openssl)
+                .args([
+                    "pkcs12", "-export", "-inkey", key.to_str()?, "-in", cert.to_str()?,
+                    "-out", p12.to_str()?, "-passout", &format!("pass:{TLS_P12_PASSWORD}"),
+                    "-keypbe", "PBE-SHA1-3DES", "-certpbe", "PBE-SHA1-3DES", "-macalg", "sha1",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        let der = std::fs::read(&p12).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        if exported { der } else { None }
+    }
+
+    /// 进程内 TLS 帧服务端：收一帧 → 回一帧（同 opaque）。
+    /// `write_chunk` 为 `Some(n)` 时响应按 n 字节分片写出，用来逼出客户端
+    /// `tls_read_exact` 的半包分支；请求体非空时响应 remark 回填 `len:<字节数>`，
+    /// 用来证明 `tls_write_all` 把大 body 完整写出去了。
+    struct TlsFrameServer {
+        addr: String,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Drop for TlsFrameServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl TlsFrameServer {
+        fn start(identity_pkcs12: &[u8], write_chunk: Option<usize>) -> std::result::Result<Self, String> {
+            use std::net::TcpListener;
+            let identity = native_tls::Identity::from_pkcs12(identity_pkcs12, TLS_P12_PASSWORD)
+                .map_err(|e| format!("identity: {e}"))?;
+            let acceptor =
+                native_tls::TlsAcceptor::new(identity).map_err(|e| format!("acceptor: {e}"))?;
+            let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+            let addr = listener.local_addr().map_err(|e| e.to_string())?.to_string();
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let accept_stop = stop.clone();
+            std::thread::spawn(move || {
+                while !accept_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let conn_stop = accept_stop.clone();
+                            let acceptor = acceptor.clone();
+                            std::thread::spawn(move || {
+                                // macOS/BSD 下 accept 出来的套接字继承监听口的非阻塞标志，
+                                // 而 OpenSSL/SecureTransport 的握手都要求阻塞语义，
+                                // 留着非阻塞会立刻 WouldBlock ⇒ 表现为「对端关闭握手」。
+                                let _ = stream.set_nonblocking(false);
+                                // 握手放在连接线程里：卡在 accept 线程上会让整个服务端
+                                // 对后续连接装死（半开连接会把握手堵在内核队列里）。
+                                let Ok(mut tls) = acceptor.accept(stream) else {
+                                    return;
+                                };
+                                serve_tls_frames(&mut tls, write_chunk, conn_stop);
+                            });
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            Ok(TlsFrameServer { addr, stop })
+        }
+    }
+
+    fn serve_tls_frames(
+        tls: &mut native_tls::TlsStream<std::net::TcpStream>,
+        write_chunk: Option<usize>,
+        stop: Arc<AtomicBool>,
+    ) {
+        let mut head = [0u8; 4];
+        while !stop.load(Ordering::Acquire) {
+            if !read_block(tls, &mut head) {
+                return;
+            }
+            // totalLength 覆盖的是「4 字节 headerLength 位 + header + body」，
+            // 所以还要再读 total 字节，和 read_frame / tls_read_loop 同一口径。
+            let total = i32::from_be_bytes(head);
+            if total <= 0 || total > MAX_FRAME_LENGTH {
+                return;
+            }
+            let mut frame = head.to_vec();
+            frame.resize(4 + total as usize, 0);
+            if !read_block(tls, &mut frame[4..]) {
+                return;
+            }
+            let Ok(cmd) = RemotingCommand::decode(&frame) else { return };
+            if cmd.is_oneway_rpc() {
+                continue;
+            }
+            let body_len = cmd.body.as_ref().map_or(0, Vec::len);
+            let remark = match cmd.remark.clone() {
+                Some(remark) if body_len > 0 => format!("{remark}:len:{body_len}"),
+                Some(remark) => format!("pong:{remark}"),
+                None => String::new(),
+            };
+            let mut response = response_for(&cmd, response_code::SUCCESS);
+            if !remark.is_empty() {
+                response.remark = Some(remark);
+            }
+            let bytes = response.encode();
+            match write_chunk {
+                Some(n) => {
+                    for chunk in bytes.chunks(n) {
+                        if tls.write_all(chunk).is_err() || tls.flush().is_err() {
+                            return;
+                        }
+                        // 让半包真的停留在线上：分片之间不合并，客户端必须自己续读
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                None => {
+                    if tls.write_all(&bytes).is_err() || tls.flush().is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_block(tls: &mut native_tls::TlsStream<std::net::TcpStream>, buf: &mut [u8]) -> bool {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match tls.read(&mut buf[filled..]) {
+                Ok(0) => return false,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// TLS 客户端：`tls_enable` 打开、`tls_test_mode` 显式置真（自签证书不校验主机名），
+    /// 其余走默认值。
+    fn tls_client() -> RemotingClient {
+        RemotingClient::with_config(RemotingClientConfig {
+            tls_enable: true,
+            tls_test_mode: true,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn tls_round_trips_and_reassembles_half_packets() {
+        let Some(pkcs12) = tls_identity_pkcs12() else {
+            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            return;
+        };
+        // 3 字节一片：4 字节帧头都要跨两次 read，正是 tls_read_exact 的续读路径
+        let server = TlsFrameServer::start(&pkcs12, Some(3)).expect("TLS 服务端起不来");
+        let client = tls_client();
+        let mut cmd = request(request_code::GET_ROUTEINFO_BY_TOPIC, "tls");
+        let response = client
+            .invoke_sync(&server.addr, &mut cmd, Some(10_000))
+            .await
+            .expect("TLS 往返失败");
+        assert_eq!(response.code, response_code::SUCCESS);
+        assert_eq!(response.opaque, cmd.opaque, "TLS 响应必须带回请求的 opaque");
+        assert_eq!(response.remark.as_deref(), Some("pong:tls"));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn tls_write_all_sends_a_large_body_intact() {
+        let Some(pkcs12) = tls_identity_pkcs12() else {
+            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            return;
+        };
+        let server = TlsFrameServer::start(&pkcs12, None).expect("TLS 服务端起不来");
+        let client = tls_client();
+        // 1MB body：非阻塞 socket 上单次 write 必然写不完，tls_write_all 要自己续写
+        let body = vec![0xA5u8; 1024 * 1024];
+        let mut cmd = request(request_code::SEND_MESSAGE, "big");
+        cmd.body = Some(body);
+        let response = client
+            .invoke_sync(&server.addr, &mut cmd, Some(15_000))
+            .await
+            .expect("大 body 的 TLS 往返失败");
+        assert_eq!(
+            response.remark.as_deref(),
+            Some("big:len:1048576"),
+            "服务端收到的 body 长度必须与发出的一致"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn tls_concurrent_requests_share_one_connection_without_starving() {
+        let Some(pkcs12) = tls_identity_pkcs12() else {
+            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            return;
+        };
+        let server = TlsFrameServer::start(&pkcs12, Some(7)).expect("TLS 服务端起不来");
+        let client = tls_client();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let client = client.clone();
+            let addr = server.addr.clone();
+            handles.push(tokio::spawn(async move {
+                let mut cmd = request(request_code::SEND_MESSAGE, &format!("t{i}"));
+                cmd.body = Some(vec![0u8; 4096]);
+                let response = client
+                    .invoke_sync(&addr, &mut cmd, Some(10_000))
+                    .await
+                    .expect("并发 TLS 请求超时/失败：读写抢锁把对方饿死了");
+                assert_eq!(response.opaque, cmd.opaque);
+                response.remark.unwrap_or_default()
+            }));
+        }
+        let mut remarks = Vec::new();
+        for handle in handles {
+            remarks.push(handle.await.expect("并发任务 panic"));
+        }
+        remarks.sort();
+        let expected: Vec<String> =
+            (0..8).map(|i| format!("t{i}:len:4096")).collect();
+        assert_eq!(remarks, expected);
+        assert_eq!(client.connection_addrs().len(), 1, "8 个请求应复用同一条 TLS 连接");
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_against_plaintext_port_maps_to_connect_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            // 明文 echo：收下 ClientHello 后原样关掉，握手必然失败
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.shutdown().await;
+            }
+        });
+        let client = tls_client();
+        let mut cmd = request(request_code::GET_ROUTEINFO_BY_TOPIC, "plain");
+        let err = client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap_err();
+        assert!(matches!(err, Error::Connect { .. }), "明文端口上的 TLS 握手应报 Connect，got {err}");
+        client.shutdown();
+    }
 }

@@ -93,7 +93,15 @@ dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS /
 dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
 ```
 
-其它子命令：`redelivery` / `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
+其它子命令：`redelivery`（27 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace 九段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
+
+`redelivery` 的 S9 是**死信终态**，也是「用尽」这条判据唯一能验的地方——客户端只把
+`maxReconsumeTimes` 通过 `sendMessageBack` 的 header 递上去，真正决定第几次转死信的是 broker
+（`AbstractSendMessageProcessor:183` 判 `reconsumeTimes >= maxReconsumeTimes || delayLevel < 0`，
+`:193` 改写 topic，`:228` 存储时 `reconsumeTimes + 1`）。`maxReconsumeTimes=2` 实测只投 3 次、
+延迟梯度 `0s/10s/40s`（Java 的 `delayLevel = 3 + reconsumeTimes` 档位算术），死信落在
+`%DLQ%<group>`、`reconsumeTimes=3`、`RETRY_TOPIC` 保留业务 topic，且观察窗内没有第 4 次投递。
+窗口给 150s 而不是 100s：整机并发时 broker 定时服务会拖档，100s 是假失败。
 
 单测里的 `ValidatorsTests`（45 项）锁死名字校验的文案、判定顺序与码值口径：topic/group 的
 blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 -1，本工程沿用默认 1），

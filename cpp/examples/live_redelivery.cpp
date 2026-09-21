@@ -13,6 +13,9 @@
 //   S7 优雅注销：shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除 clientId。
 //   S8 命名空间：带 namespace 的生产者/消费者在 "<ns>%<topic>" 上收发成功；不带 namespace
 //      的消费者订阅同名裸 topic 收不到（多租户隔离）。
+//   S9 死信终态：maxReconsumeTimes=2 ⇒ 恰好投递 3 次（reconsumeTimes 0/1/2），第 3 次回投后
+//      broker 改投 %DLQ%<group>（自动建 topic 并注册路由），死信里 reconsumeTimes=3、
+//      RETRY_TOPIC 保留业务 topic，且原组不再有第 4 次投递。
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 prepareTopic）。消费者不做默认 topic
 //   兜底（对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），所以 topic 不存在
@@ -23,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -31,8 +35,13 @@
 
 #include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
+#include "rocketmq/client/lite_pull_consumer.h"
+#include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/producer.h"
 #include "rocketmq/common/message.h"
+#include "rocketmq/common/mix_all.h"
+#include "rocketmq/remoting/protocol/heartbeat.h"
+#include "rocketmq/remoting/protocol/route.h"
 
 using namespace rocketmq;
 
@@ -75,22 +84,55 @@ void prepareTopic(DefaultMQProducer& producer, const std::string& topic, int32_t
     std::this_thread::sleep_for(std::chrono::seconds(3));
 }
 
-// 便捷监听器：把收到的 body 记进列表，全部 CONSUME_SUCCESS
+// 轮询等待条件成立：真机投递受 broker 长轮询、流控和同机负载影响，固定 sleep 会在机器
+// 忙时把「实现没问题」测成漏消息（实测同一份代码 got=7/10、35/40 抖动）。
+bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs) {
+    const int64_t deadline = nowMs() + timeoutMs;
+    while (nowMs() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return pred();
+}
+
+// 收集盒：锁和缓冲区绑在一起，主线程读之前必须拿同一把锁。
+struct BodySink {
+    std::mutex mtx;
+    std::vector<std::string> bodies;
+
+    std::vector<std::string> snapshot() {
+        std::lock_guard<std::mutex> lk(mtx);
+        return bodies;
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lk(mtx);
+        return bodies.size();
+    }
+
+    bool empty() {
+        std::lock_guard<std::mutex> lk(mtx);
+        return bodies.empty();
+    }
+};
+
+// 便捷监听器：把收到的 body 记进列表，全部 CONSUME_SUCCESS。
+// 锁必须跟着缓冲区走：早先每个 listener 各持一把 mtx_，主线程读 vector 时谁都没锁，
+// 是数据竞争（实测 S6 计数飘到 71/40、35/40 这种不可能的值）。
 class CollectListener : public MessageListenerConcurrently {
 public:
-    explicit CollectListener(std::vector<std::string>& sink) : sink_(sink) {}
+    explicit CollectListener(BodySink& sink) : sink_(sink) {}
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
                                              ConsumeConcurrentlyContext&) override {
-        std::lock_guard<std::mutex> lk(mtx_);
+        std::lock_guard<std::mutex> lk(sink_.mtx);
         for (const MessageExt& m : msgs) {
-            sink_.push_back(bodyOf(m));
+            sink_.bodies.push_back(bodyOf(m));
         }
         return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
     }
 
 private:
-    std::vector<std::string>& sink_;
-    std::mutex mtx_;
+    BodySink& sink_;
 };
 
 }  // namespace
@@ -189,7 +231,7 @@ int main(int argc, char* argv[]) {
         const std::string topic = gPrefix + "_Offset";
         const std::string group = gPrefix + "_g2";
         prepareTopic(producer, topic);
-        std::vector<std::string> round1;
+        BodySink round1;
         {
             auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
             consumer->setMessageListener(std::make_shared<CollectListener>(round1));
@@ -200,19 +242,20 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) {
                 producer.send(Message(topic, str2bytes("persist-" + std::to_string(i))));
             }
-            std::this_thread::sleep_for(std::chrono::seconds(8));
+            waitUntil([&] { return round1.size() >= 3; }, 40000);
             consumer->shutdown();  // shutdown 持久化位点
         }
+        const std::vector<std::string> seen1 = round1.snapshot();
         int32_t gotFirst = 0;
         for (int i = 0; i < 3; ++i) {
-            if (std::find(round1.begin(), round1.end(),
-                          "persist-" + std::to_string(i)) != round1.end()) {
+            if (std::find(seen1.begin(), seen1.end(),
+                          "persist-" + std::to_string(i)) != seen1.end()) {
                 ++gotFirst;
             }
         }
         check("S2-首轮消费 3 条", gotFirst == 3, "got=" + std::to_string(gotFirst));
 
-        std::vector<std::string> round2;
+        BodySink round2;
         {
             auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
             consumer->setMessageListener(std::make_shared<CollectListener>(round2));
@@ -221,12 +264,13 @@ int main(int argc, char* argv[]) {
             consumer->start();
             std::this_thread::sleep_for(std::chrono::seconds(3));
             producer.send(Message(topic, str2bytes("persist-new")));
-            std::this_thread::sleep_for(std::chrono::seconds(8));
+            waitUntil([&] { return round2.size() >= 1; }, 40000);
             consumer->shutdown();
         }
-        bool newSeen = std::find(round2.begin(), round2.end(), "persist-new") != round2.end();
+        const std::vector<std::string> seen2 = round2.snapshot();
+        bool newSeen = std::find(seen2.begin(), seen2.end(), "persist-new") != seen2.end();
         int32_t oldResent = 0;
-        for (const std::string& b : round2) {
+        for (const std::string& b : seen2) {
             if (b.rfind("persist-", 0) == 0 && b != "persist-new") ++oldResent;
         }
         check("S2-重启后新消息继续投递", newSeen, newSeen ? "" : "未收到");
@@ -260,9 +304,9 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < 4; ++i) {
             producer.send(Message(topic, str2bytes("orderly-" + std::to_string(i))));
         }
-        std::this_thread::sleep_for(std::chrono::seconds(8));
+        const bool orderlyAll = waitUntil([&] { return got.load() >= 4; }, 30000);
         consumer->shutdown();
-        check("S3-顺序消费收全", got.load() == 4, "got=" + std::to_string(got.load()));
+        check("S3-顺序消费收全", orderlyAll && got.load() == 4, "got=" + std::to_string(got.load()));
         // lockOK 数通过消费成功 + 无异常间接验证（内部锁集合非空在日志 debug 可见）
         check("S3-顺序消费链路存活", got.load() > 0);
     }
@@ -272,8 +316,8 @@ int main(int argc, char* argv[]) {
         const std::string topic = gPrefix + "_Bc";
         const std::string group = gPrefix + "_g4";
         prepareTopic(producer, topic);
-        std::vector<std::string> gotA;
-        std::vector<std::string> gotB;
+        BodySink gotA;
+        BodySink gotB;
         auto ca = std::make_shared<DefaultMQPushConsumer>(group);
         ca->setInstanceName("bc-a");
         ca->setMessageListener(std::make_shared<CollectListener>(gotA));
@@ -292,12 +336,14 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < 3; ++i) {
             producer.send(Message(topic, str2bytes("bc-" + std::to_string(i))));
         }
-        std::this_thread::sleep_for(std::chrono::seconds(8));
+        // 广播模式下两个实例各自收全 3 条
+        const bool aAll = waitUntil([&] { return gotA.size() >= 3; }, 30000);
+        const bool bAll = waitUntil([&] { return gotB.size() >= 3; }, 30000);
         ca->shutdown();
         cb->shutdown();
-        check("S4-广播消费者 A 收全", static_cast<int32_t>(gotA.size()) == 3,
+        check("S4-广播消费者 A 收全", aAll && gotA.size() == 3,
               "got=" + std::to_string(gotA.size()));
-        check("S4-广播消费者 B 收全", static_cast<int32_t>(gotB.size()) == 3,
+        check("S4-广播消费者 B 收全", bAll && gotB.size() == 3,
               "got=" + std::to_string(gotB.size()));
     }
 
@@ -329,10 +375,13 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < 10; ++i) {
             producer.send(Message(topic, str2bytes("flow-" + std::to_string(i))));
         }
-        std::this_thread::sleep_for(std::chrono::seconds(12));
+        // 阈值 2 + 每条睡 300ms：全部落袋才说明「流控只是暂停拉取，不丢消息」。
+        // 固定 sleep 在机器忙时会测出 got=7/10 的假失败（同一份代码复跑即绿）。
+        const bool allArrived = waitUntil([&] { return got.load() >= 10; }, 45000);
         const int64_t fc = consumer->flowControlTriggered();
         consumer->shutdown();
-        check("S5-慢消费下消息全部到达", got.load() == 10, "got=" + std::to_string(got.load()));
+        check("S5-慢消费下消息全部到达", allArrived && got.load() == 10,
+              "got=" + std::to_string(got.load()));
         check("S5-流控触发计数>0", fc > 0, "triggered=" + std::to_string(fc));
     }
 
@@ -348,8 +397,8 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             std::printf("S6: 预建 topic 失败（改用自动创建）: %s\n", e.what());
         }
-        std::vector<std::string> recA;
-        std::vector<std::string> recB;
+        BodySink recA;
+        BodySink recB;
         auto ca = std::make_shared<DefaultMQPushConsumer>(group6);
         ca->setInstanceName("inst-a");
         ca->setMessageListener(std::make_shared<CollectListener>(recA));
@@ -399,9 +448,14 @@ int main(int argc, char* argv[]) {
             producer.send(Message(topic6, str2bytes("rb-" + std::to_string(i))));
         }
         std::this_thread::sleep_for(std::chrono::seconds(15));
-        int total6 = static_cast<int>(recA.size() + recB.size());
-        std::vector<std::string> all6 = recA;
-        all6.insert(all6.end(), recB.begin(), recB.end());
+        // 先给一轮固定投递时间，再等 40 条收齐（机器忙时固定 15s 会测成 35/40 的假失败）；
+        // 收齐后再多等一会儿给重复投递露面的机会：这时多出来的条数才是真重复，不是「还没到」。
+        const bool allArrived = waitUntil([&] { return recA.size() + recB.size() >= 40; }, 60000);
+        std::this_thread::sleep_for(std::chrono::seconds(8));
+        const int total6 = static_cast<int>(recA.size() + recB.size());
+        std::vector<std::string> all6 = recA.snapshot();
+        const std::vector<std::string> b6 = recB.snapshot();
+        all6.insert(all6.end(), b6.begin(), b6.end());
         std::set<std::string> uniq(all6.begin(), all6.end());
         int dup6 = static_cast<int>(all6.size()) - static_cast<int>(uniq.size());
         // broker 在组成员变化时沿长连接反向推 40；反向请求用例注入不了，所以计数是
@@ -429,7 +483,7 @@ int main(int argc, char* argv[]) {
                   + "/" + std::to_string(expectedKeys.size()) + ")",
               asgA > 0 && asgB > 0 && inter2.empty() && !expectedKeys.empty()
                   && covered2 == expectedKeys);
-        check("S6-消息无重复消费", dup6 == 0 && total6 == n6,
+        check("S6-消息无重复消费", allArrived && dup6 == 0 && total6 == n6,
               "got=" + std::to_string(total6) + "/" + std::to_string(n6)
                   + " dup=" + std::to_string(dup6));
         check("S6-成员变化时收到 broker 的 NOTIFY_CONSUMER_IDS_CHANGED(40)",
@@ -449,7 +503,7 @@ int main(int argc, char* argv[]) {
         probe.start();
         auto qc = std::make_shared<DefaultMQPushConsumer>(group7);
         qc->setInstanceName("inst-c");
-        std::vector<std::string> sink;
+        BodySink sink;
         qc->setMessageListener(std::make_shared<CollectListener>(sink));
         qc->setNamesrvAddr(nsAddr);
         qc->subscribe(topic7);
@@ -481,7 +535,7 @@ int main(int argc, char* argv[]) {
         // createTopic 也走 namespace 包装：真实建出来的是 "<ns>%<topic>"
         prepareTopic(nsProducer, topic);
 
-        std::vector<std::string> nsGot;
+        BodySink nsGot;
         {
             auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g8");
             consumer->setNamespace(ns);
@@ -493,14 +547,14 @@ int main(int argc, char* argv[]) {
             for (int i = 0; i < 3; ++i) {
                 nsProducer.send(Message(topic, str2bytes("ns-" + std::to_string(i))));
             }
-            std::this_thread::sleep_for(std::chrono::seconds(8));
+            waitUntil([&] { return nsGot.size() >= 3; }, 30000);
             consumer->shutdown();
         }
         check("S8-带 namespace 生产/消费收全", nsGot.size() == 3,
               "got=" + std::to_string(nsGot.size()));
 
         // 不带 namespace 的消费者订阅同一个裸 topic → 收不到（证明真实 topic 是 ns%topic）
-        std::vector<std::string> plainGot;
+        BodySink plainGot;
         try {
             auto consumer = std::make_shared<DefaultMQPushConsumer>(gPrefix + "_g8plain");
             consumer->setMessageListener(std::make_shared<CollectListener>(plainGot));
@@ -516,6 +570,158 @@ int main(int argc, char* argv[]) {
               "got=" + std::to_string(plainGot.size()));
 
         nsProducer.shutdown();
+    }
+
+    // ---------------- S9 死信终态（%DLQ%） ----------------
+    // 为什么只能真机验：「重试到第几次算用尽」两端各写一半。客户端只把
+    // maxReconsumeTimes 塞进 CONSUMER_SEND_MSG_BACK 请求头（Java
+    // DefaultMQPushConsumerImpl#sendMessageBack:773，-1 时按 16 传，见
+    // #getMaxReconsumeTimes:890）；判定与改投 %DLQ%<group> 全在 broker
+    // （AbstractSendMessageProcessor#consumerSendMsgBack:183 用
+    // `msgExt.getReconsumeTimes() >= maxReconsumeTimes`，注意是 >= 而不是 >；
+    // 转死信时 topic 换成 MixAll::getDlqTopic(group)、顺手建 topic 并注册路由，
+    // :226 又给 reconsumeTimes +1）。两种写反都表现为「看起来正常」：客户端漏传
+    // header ⇒ broker 用订阅组默认的 16 次，测试等到天荒地老；把 >= 写成 > ⇒
+    // 多投一次才进死信。离线单测锁不住任何一边。
+    // 这里用 maxReconsumeTimes=2 把终态压到几十秒，逐条钉住投递次数与死信内容。
+    {
+        const std::string topic = gPrefix + "_Dlq";
+        const std::string group = gPrefix + "_g9";
+        const int32_t kMaxReconsume = 2;
+        prepareTopic(producer, topic, 1);
+        std::mutex mtx;
+        struct Arrival {
+            int32_t reconsumeTimes;
+            std::string topic;
+            int64_t atMs;  // 相对发送时刻的投递延迟，用来区分「次数不对」和「来得慢」
+        };
+        std::vector<Arrival> seen;
+        int64_t sentAtMs = 0;
+        class L : public MessageListenerConcurrently {
+        public:
+            L(std::mutex& mtx, std::vector<Arrival>& seen, const int64_t& sentAtMs)
+                : mtx_(mtx), seen_(seen), sentAtMs_(sentAtMs) {}
+            ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                     ConsumeConcurrentlyContext&) override {
+                bool mine = false;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    for (const MessageExt& m : msgs) {
+                        seen_.push_back({m.getReconsumeTimes(), m.topic, nowMs() - sentAtMs_});
+                        if (bodyOf(m) == "dlq-me") mine = true;
+                    }
+                }
+                return mine ? ConsumeConcurrentlyStatus::RECONSUME_LATER
+                            : ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+            }
+
+        private:
+            std::mutex& mtx_;
+            std::vector<Arrival>& seen_;
+            const int64_t& sentAtMs_;
+        };
+        auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+        consumer->setMaxReconsumeTimes(kMaxReconsume);
+        consumer->setMessageListener(std::make_shared<L>(mtx, seen, sentAtMs));
+        consumer->setNamesrvAddr(nsAddr);
+        consumer->subscribe(topic);
+        consumer->start();
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        sentAtMs = nowMs();
+        producer.send(Message(topic, str2bytes("dlq-me")));
+        // 回投档位 = 3 + reconsumeTimes ⇒ level3(10s) + level4(30s)：理论 40s 收口。
+        // 预算给到 150s：四套真机用例同机并跑时第 3 次投递实测拖到 100s 之后（环境慢，
+        // 不是实现错），慢到什么程度由 times=[…]@Ns 直接暴露出来。
+        std::vector<Arrival> firstThree;
+        {
+            int64_t deadline = nowMs() + 150000;
+            while (nowMs() < deadline) {
+                size_t n;
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    n = seen.size();
+                }
+                if (n >= 3) break;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+            std::lock_guard<std::mutex> lk(mtx);
+            firstThree = seen;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(15));  // 反证：不该有第 4 次
+        std::vector<Arrival> finalSeen;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            finalSeen = seen;
+        }
+        consumer->shutdown();
+        std::string times;
+        for (const Arrival& a : firstThree) {
+            times += (times.empty() ? "" : ",") + std::to_string(a.reconsumeTimes) + "@"
+                + std::to_string(a.atMs / 1000) + "s";
+        }
+        bool ladder = firstThree.size() >= 3 && firstThree[0].reconsumeTimes == 0
+            && firstThree[1].reconsumeTimes == 1 && firstThree[2].reconsumeTimes == 2;
+        check("S9-maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2）", ladder,
+              "times=[" + times + "]");
+        check("S9-用尽后不再投递（观察窗口内只有 3 次）", finalSeen.size() == 3,
+              "arrivals=" + std::to_string(finalSeen.size()));
+        bool topicKept = true;
+        for (const Arrival& a : firstThree) {
+            if (a.topic != topic) topicKept = false;
+        }
+        check("S9-重投期间 listener 看到业务 topic（不是 %RETRY%）", topicKept);
+
+        const std::string dlqTopic = MixAll::getDlqTopic(group);
+        std::shared_ptr<TopicRouteData> dlqRoute;
+        MQClientInstance probe("dlqprobe-" + std::to_string(nowMs()),
+                               std::vector<std::string>{nsAddr});
+        probe.start();
+        for (int i = 0; i < 15; ++i) {
+            dlqRoute = probe.getTopicRouteData(dlqTopic);
+            if (dlqRoute && !dlqRoute->queueDatas.empty()) break;
+            dlqRoute.reset();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", dlqRoute != nullptr,
+              "dlq=" + dlqTopic);
+        probe.shutdown();
+
+        std::vector<MessageExt> dlqMsgs;
+        if (dlqRoute) {
+            std::vector<MessageQueue> queues;
+            for (const QueueData& q : dlqRoute->queueDatas) {
+                for (int32_t i = 0; i < q.readQueueNums; ++i) {
+                    queues.emplace_back(dlqTopic, q.brokerName, i);
+                }
+            }
+            DefaultLitePullConsumer reader(gPrefix + "_g9dlq");
+            reader.setNamesrvAddr(nsAddr);
+            // 新消费组 + LAST 会从队尾开始，把已经在死信里的那条跳过 ⇒ 假失败
+            reader.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+            reader.assign(queues);
+            reader.start();
+            for (const MessageQueue& mq : queues) reader.seekToBegin(mq);
+            int64_t deadline = nowMs() + 25000;
+            while (nowMs() < deadline && dlqMsgs.empty()) {
+                std::vector<MessageExt> batch = reader.poll(1000);
+                dlqMsgs.insert(dlqMsgs.end(), batch.begin(), batch.end());
+            }
+            reader.shutdown();
+        }
+        const bool one = dlqMsgs.size() == 1 && bodyOf(dlqMsgs[0]) == "dlq-me";
+        check("S9-消息落在 %DLQ%<group>", one,
+              "n=" + std::to_string(dlqMsgs.size()));
+        if (one) {
+            const MessageExt& d = dlqMsgs.front();
+            check("S9-死信 reconsumeTimes = maxReconsumeTimes + 1（broker 存储时 +1）",
+                d.getReconsumeTimes() == kMaxReconsume + 1,
+                "reconsumeTimes=" + std::to_string(d.getReconsumeTimes()));
+            auto retryIt = d.properties.find("RETRY_TOPIC");
+            check("S9-死信保留 RETRY_TOPIC=业务 topic，topic 已是 %DLQ%<group>",
+                retryIt != d.properties.end() && retryIt->second == topic && d.topic == dlqTopic,
+                "retryTopic="
+                    + (retryIt == d.properties.end() ? std::string("<missing>") : retryIt->second));
+        }
     }
 
     producer.shutdown();

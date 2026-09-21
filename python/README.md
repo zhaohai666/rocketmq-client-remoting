@@ -39,7 +39,16 @@ python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 
 
 其它真机脚本：`verify_acl_live.py`（需开 ACL 的集群）/ `verify_pull_live.py` /
 `verify_rr_live.py` / `verify_latency_live.py` / `verify_pop_live.py` /
-`verify_pop_consumer_live.py` / `verify_redelivery_live.py`。
+`verify_pop_consumer_live.py` / `verify_redelivery_live.py`（30 PASS / 0 FAIL）。
+
+`verify_redelivery_live.py` 的 S9 是**死信终态**：`maxReconsumeTimes=2` 的组对同一条消息只投
+3 次（listener 一直回 `RECONSUME_LATER`），实测档位 `0s / 10s / 40s` —— Java broker 用
+`delayLevel = 3 + reconsumeTimes` 决定重投延迟（`AbstractSendMessageProcessor:209`，本机
+`messageDelayLevel` 的 3/4 档是 10s/30s）；第 3 次回投时 `reconsumeTimes >= maxReconsumeTimes`
+成立，broker 把 topic 改写成 `%DLQ%<group>` 并现场建出这条 topic（`:193`），存进去的
+`reconsumeTimes` 还要再 +1（`:228`），`RETRY_TOPIC` 保留原业务 topic。判据的客户端半边是
+`DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890` 的 `-1 → 16`，所以 `-1` 与 `16` 等价。
+观察窗口给 150s：整机并发时 broker 的定时服务会拖档，卡 100s 会假失败。
 
 `verify_compression_live.py` 的载荷是确定性的，与 Java 探针
 `/tmp/probe_admin/CompressProbe.java` 同算法，因此可直接验证"Java 产的压缩消息我们能否解开"

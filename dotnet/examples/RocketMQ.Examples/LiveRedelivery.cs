@@ -4,6 +4,9 @@
 // S1 回投 / S2 位点持久化 / S3 顺序消费+broker 锁 / S4 广播 / S5 流控
 // S6 集群多实例 rebalance（均分队列、不重不漏、无重复消费，且两侧都收到 broker 反推的 40）
 // S7 优雅注销（shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除）
+// S9 死信终态：maxReconsumeTimes=2 ⇒ 恰好投递 3 次（reconsumeTimes 0/1/2），第 3 次回投后
+//    broker 改投 %DLQ%<group>（自动建 topic 并注册路由），死信里 reconsumeTimes=3、
+//    RETRY_TOPIC 保留业务 topic，且原组不再有第 4 次投递
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
 //   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
@@ -85,6 +88,7 @@ public static class LiveRedelivery
         ScenarioRebalance(producer);
         ScenarioUnregister();
         ScenarioNamespace();
+        ScenarioDlq(producer);
 
         producer.Shutdown();
         Console.WriteLine();
@@ -550,5 +554,146 @@ public static class LiveRedelivery
             "got=" + plainGot.Count.ToString(CultureInfo.InvariantCulture));
 
         nsProducer.Shutdown();
+    }
+
+    // ---------------- S9 死信终态（%DLQ%） ----------------
+    private sealed class AlwaysFailListener : IMessageListenerConcurrently
+    {
+        public readonly object Lock = new();
+        private readonly List<(string Body, string Topic, int ReconsumeTimes)> _seen = new();
+
+        public bool Orderly() => false;
+
+        public List<(string Body, string Topic, int ReconsumeTimes)> Snapshot()
+        {
+            lock (Lock) return new List<(string Body, string Topic, int ReconsumeTimes)>(_seen);
+        }
+
+        public ConsumeConcurrentlyStatus ConsumeMessage(List<MessageExt> msgs,
+            ConsumeConcurrentlyContext ctx)
+        {
+            bool mine = false;
+            lock (Lock)
+            {
+                foreach (MessageExt m in msgs)
+                {
+                    string body = Body(m);
+                    _seen.Add((body, m.Topic, m.ReconsumeTimes));
+                    if (body == "dlq-me") mine = true;
+                }
+            }
+
+            return mine ? ConsumeConcurrentlyStatus.ReconsumeLater
+                : ConsumeConcurrentlyStatus.ConsumeSuccess;
+        }
+    }
+
+    /// <summary>
+    /// 死信终态。为什么只能真机验：「重试到第几次算用尽」两端各写一半——客户端只把
+    /// maxReconsumeTimes 塞进 CONSUMER_SEND_MSG_BACK 请求头（Java
+    /// DefaultMQPushConsumerImpl#sendMessageBack:773，-1 时按 16 传，见 #getMaxReconsumeTimes:890），
+    /// 判定与改投 %DLQ%&lt;group&gt; 全在 broker（AbstractSendMessageProcessor#consumerSendMsgBack:183
+    /// 用 `msgExt.getReconsumeTimes() &gt;= maxReconsumeTimes`，注意是 &gt;= 不是 &gt;；转死信时
+    /// topic 换成 MixAll.GetDlqTopic(group)、顺手建 topic 并注册路由，:226 又给 reconsumeTimes +1）。
+    /// 两种写反都表现为「看起来正常」：漏传 header ⇒ broker 用订阅组默认 16 次，测试等到天荒地老；
+    /// &gt;= 写成 &gt; ⇒ 多投一次才进死信。离线单测锁不住任何一边。
+    /// </summary>
+    private static void ScenarioDlq(DefaultMQProducer producer)
+    {
+        const int maxReconsume = 2;
+        string topic = _gPrefix + "_Dlq";
+        string group = _gPrefix + "_g9";
+        PrepareTopic(producer, topic, 1);
+
+        var consumer = NewConsumer(group);
+        consumer.MaxReconsumeTimes = maxReconsume;
+        var listener = new AlwaysFailListener();
+        consumer.SetMessageListener(listener);
+        consumer.Subscribe(topic, "*");
+        consumer.Start();
+        Thread.Sleep(3000);
+        producer.Send(new Message(topic, Str2Bytes("dlq-me")));
+
+        // 回投档位 = 3 + reconsumeTimes ⇒ level3(10s) + level4(30s)，再留投递余量。
+        // 150s 而不是 100s：整机并发跑其它套件时 broker 的定时服务会拖档，第三次投递
+        // 实测能晚到 60s+，卡 100s 是假失败。
+        long deadline = NowMs() + 150000;
+        while (NowMs() < deadline && listener.Snapshot().Count < 3) Thread.Sleep(2000);
+        List<(string Body, string Topic, int ReconsumeTimes)> firstThree =
+            listener.Snapshot().Where(a => a.Body == "dlq-me").ToList();
+        Thread.Sleep(15000);  // 反证：不该有第 4 次投递
+        List<(string Body, string Topic, int ReconsumeTimes)> finalSeen =
+            listener.Snapshot().Where(a => a.Body == "dlq-me").ToList();
+        consumer.Shutdown();
+
+        string times = string.Join(",", firstThree.Select(a => a.ReconsumeTimes
+            .ToString(CultureInfo.InvariantCulture)));
+        Check("S9-maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2）",
+            firstThree.Count >= 3 && firstThree[0].ReconsumeTimes == 0
+                && firstThree[1].ReconsumeTimes == 1 && firstThree[2].ReconsumeTimes == 2,
+            "times=[" + times + "]");
+        Check("S9-用尽后不再投递（观察窗口内只有 3 次）", finalSeen.Count == 3,
+            "arrivals=" + finalSeen.Count.ToString(CultureInfo.InvariantCulture));
+        Check("S9-重投期间 listener 看到业务 topic（不是 %RETRY%）",
+            firstThree.All(a => a.Topic == topic));
+
+        // %DLQ%<group> 由 broker 在转死信那一刻才建出来并注册到 namesrv
+        string dlqTopic = MixAll.GetDlqTopic(group);
+        TopicRouteData? route = null;
+        using (var probe = new MQClientInstance("dlqprobe-" + NowMs().ToString(CultureInfo.InvariantCulture),
+                   new List<string> { _namesrv }))
+        {
+            probe.Start();
+            for (int i = 0; i < 15; ++i)
+            {
+                route = probe.GetTopicRouteData(dlqTopic);
+                if (route != null && route.QueueDatas.Count > 0) break;
+                route = null;
+                Thread.Sleep(2000);
+            }
+        }
+
+        Check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", route != null,
+            "dlq=" + dlqTopic);
+
+        var dlqMsgs = new List<MessageExt>();
+        if (route != null)
+        {
+            var queues = new List<MessageQueue>();
+            foreach (QueueData q in route.QueueDatas)
+            {
+                for (int i = 0; i < q.ReadQueueNums; ++i)
+                {
+                    queues.Add(new MessageQueue(dlqTopic, q.BrokerName, i));
+                }
+            }
+
+            var reader = new DefaultLitePullConsumer(_gPrefix + "_g9dlq");
+            reader.SetNamesrvAddr(_namesrv);
+            // 新消费组 + LAST 会从队尾开始，把已经在死信里的那条跳过 ⇒ 假失败
+            reader.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
+            reader.Assign(queues);
+            reader.Start();
+            foreach (MessageQueue mq in queues) reader.SeekToBegin(mq);
+            deadline = NowMs() + 25000;
+            while (NowMs() < deadline && dlqMsgs.Count == 0) dlqMsgs.AddRange(reader.Poll(1000));
+            reader.Shutdown();
+        }
+
+        bool one = dlqMsgs.Count == 1 && Body(dlqMsgs[0]) == "dlq-me";
+        Check("S9-消息落在 %DLQ%<group>", one,
+            "n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
+        if (one)
+        {
+            MessageExt d = dlqMsgs[0];
+            Check("S9-死信 reconsumeTimes = maxReconsumeTimes + 1（broker 存储时 +1）",
+                d.ReconsumeTimes == maxReconsume + 1,
+                "reconsumeTimes=" + d.ReconsumeTimes.ToString(CultureInfo.InvariantCulture));
+            bool retryKept = d.Properties.TryGetValue("RETRY_TOPIC", out string? origin)
+                && origin == topic && d.Topic == dlqTopic;
+            Check("S9-死信保留 RETRY_TOPIC=业务 topic，topic 已是 %DLQ%<group>", retryKept,
+                "retryTopic=" + (d.Properties.TryGetValue("RETRY_TOPIC", out string? o)
+                    ? o : "<missing>"));
+        }
     }
 }

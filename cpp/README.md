@@ -112,6 +112,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_latency       127.0.0.1:9876
 ./build/examples/rmq_live_pop           127.0.0.1:9876
 ./build/examples/rmq_live_pop_consumer  127.0.0.1:9876
+./build/examples/rmq_live_redelivery    127.0.0.1:9876   # 重投/死信/重启/广播/顺序/流控/namespace 九段
 ./build/examples/rmq_live_trace         127.0.0.1:9876   # 需 broker traceTopicEnable=true
 ./build/examples/rmq_live_hook          127.0.0.1:9876
 ./build/examples/rmq_validators_live    127.0.0.1:9876
@@ -134,6 +135,8 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_live_unit_config` | 20 PASS / 0 FAIL | `unitName`/`unitMode`/`stream` 真机（与 Python/Rust/.NET 同场景）：U1 `unitName` 拼进 clientId 且照常发送 → U2 `@unitA@STREAM` 的消费者收到消息，**broker 的 `examineConsumerConnectionInfo` 回读到同一串 clientId** → U3 `unitMode=true` 自动建出的 topic 带 `UNIT` 位、对照组不带 → U4 心跳的 `ConsumerData.unitMode` 让 `%RETRY%` 带 `UNIT_SUB` 位 → U5 lite 消费者与显式开 stream 的生产者都带 `@STREAM`，3 发 3 收。钩子顺序（`ReqT` 必须在 ACL 签名之内）与"钩子真的写到 socket 上"由离线用例 `testRequestHooksReachWire`（`tests/test_send_retry.cpp`，抓真报文 + broker 侧复算 HMAC）和 `tests/test_acl.cpp` 锁死 |
 
 | `rmq_sql92_live` | 20 PASS / 0 FAIL | SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 真机（与 Python/Rust/.NET 同场景）：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线用例 `tests/test_check_client_config.cpp`（ctest `check_client_config`，9 项 / 32 断言，进程内 mock broker 抓真报文） |
+
+| `rmq_live_redelivery` | 27 PASS / 0 FAIL | 消费侧九段真机（与 Python/Rust/.NET 同场景）：S1 `RECONSUME_LATER` 走 `sendMessageBack`(code 3) 重投，实测延迟梯度 ≥8s、重投来自 `%RETRY%` 且 `reconsumeTimes` 递增、正常消息只投一次 → S2 重启后接着消费且不重复 → S3 顺序消费 → S4 广播两组各收全 → S5 慢消费下 10 条全到 + 流控触发计数 >0 → S6 同组两实例队列不重不漏 + 40 条无重复 + 收到 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED`(40) → S7 `shutdown()` 真的注销了 clientId（`queryConsumerIdList` 前后对照）→ S8 `namespace` 正腿/反腿（带 ns 收全、裸 topic 消费者收不到，证明真实 topic 是 `NS%topic`）→ **S9 死信终态**：`maxReconsumeTimes=2` 只投 3 次（实测 `0s/10s/40s`，即 Java `delayLevel = 3 + reconsumeTimes`，`AbstractSendMessageProcessor:209`），第 3 次回投被 broker 改写进 `%DLQ%<group>`（`:193`，路由此刻才建出来），lite pull 从队首读回的那条 `reconsumeTimes=3`（存储时 +1，`:228`）、`RETRY_TOPIC` 仍是业务 topic、之后不再投递。S9 的窗口给 150s：整机并发时定时服务会拖档，100s 会假失败。所有断言的观察都用有界轮询（`waitUntil`）而不是固定 `sleep`，listener 的缓冲区由**跟着缓冲区走的互斥量**（`BodySink`）保护——原来「每个 listener 一把锁 + 主线程不持锁读」是数据竞争，会在高负载下漏读/误报重复。
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。

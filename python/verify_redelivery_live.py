@@ -12,6 +12,8 @@
   S3 顺序消费：orderly listener 消费正常，且 broker 锁（LOCK_BATCH_MQ）生效。
   S4 广播模式：同组两个消费者各自收全所有消息，互不影响。
   S5 流控：阈值 2 + 慢消费 → 触发流控计数 >0，最终消息全部消费。
+  S9 死信终态：maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2）后由 broker 转投
+     %DLQ%<group>（DLQ 里 reconsumeTimes=3、RETRY_TOPIC 保留原始 topic），且不再投第 4 次。
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ sys.path.insert(0, ".")
 
 from rocketmq.client.consumer import (ConsumeConcurrentlyStatus,
                                       ConsumeOrderlyStatus,
+                                      DefaultLitePullConsumer,
                                       DefaultMQPushConsumer,
                                       MessageListenerConcurrently,
                                       MessageListenerOrderly,
@@ -30,6 +33,8 @@ from rocketmq.client.consumer import (ConsumeConcurrentlyStatus,
 from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.common.message import Message
+from rocketmq.common.mix_all import MixAll
+from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "GapPy_%d" % int(time.time() * 1000)
@@ -433,6 +438,105 @@ def main() -> int:
           "got=%s" % [b.decode() for b in n8_plain])
     check("S8-topic 还原为业务原始名", bool(seen8_topics) and all(t == raw_topic for t in seen8_topics),
           "topics=%s" % sorted(set(seen8_topics)))
+
+    # ---------- S9 死信终态（%DLQ%） ----------
+    # 为什么必须真机验：重试到上限后**由 broker**把消息改投 %DLQ%<group>
+    # （Java AbstractSendMessageProcessor#consumerSendMsgBack:183 判
+    # `msgExt.getReconsumeTimes() >= maxReconsumeTimes`，是 `>=` 不是 `>`；
+    # maxReconsumeTimes 取客户端请求头，客户端在 -1 时按 16 传，见 DefaultMQPushConsumerImpl
+    # #getMaxReconsumeTimes:890）。所以「消费了几次」和「第几次进 DLQ」两端各有一半，
+    # 任何一端写错都会表现为「消息永远在重试」或「早早就进 DLQ」，
+    # 而这两个错都不会让单测变红。这里逐条钉住：
+    #   maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2），第 3 次回投时进 DLQ，
+    #   DLQ 里的 reconsumeTimes=3（broker 存储时 +1），原组不再有第 4 次投递。
+    topic9 = PREFIX + "_Dlq"
+    prepare_topic(topic9)
+    group9 = PREFIX + "_g9"
+    attempts = []
+    lk9 = threading.Lock()
+    # 记录每次投递相对发送时刻的延迟：负载高时回投会比理论值（10s/30s 档位）慢很多，
+    # 有了延迟才能区分「次数算错」和「只是来得慢」——本机同机并跑四套真机用例时实测
+    # 第 3 次投递会拖到 100s 之后，那是环境慢，不是实现错。
+    clock = {"sent": 0.0}
+
+    class AlwaysFailListener(MessageListenerConcurrently):
+        def consume_message(self, msgs, context):
+            with lk9:
+                for m in msgs:
+                    attempts.append((m.get_reconsume_times(), bytes(m.body), m.topic,
+                                     time.time() - clock["sent"]))
+            return ConsumeConcurrentlyStatus.RECONSUME_LATER
+
+    c9 = DefaultMQPushConsumer(group9)
+    c9.set_namesrv_addr(NAMESRV)
+    c9.set_message_listener(AlwaysFailListener())
+    c9.max_reconsume_times = 2   # 显式小值：默认 16 次要等几小时
+    c9.subscribe(topic9, "*")
+    c9.start()
+    time.sleep(5)
+    # 消费者先起来再发（同 S8：CONSUME_FROM_LAST_OFFSET 会跳过启动前的消息）
+    clock["sent"] = time.time()
+    sent9 = producer.send(Message(topic9, b"dlq-me"))
+    # 回投延迟档位 level3=10s、level4=30s ⇒ 三次投递约 40s；150s 是留出同机竞争的余量
+    deadline = time.time() + 150
+    while time.time() < deadline and len(attempts) < 3:
+        time.sleep(2)
+    first_three = list(attempts)
+    time.sleep(15)   # 反证窗口：不该再有第 4 次投递
+    final = list(attempts)
+    c9.shutdown()
+    times_seen = ["%d@%.0fs" % (a[0], a[3]) for a in first_three]
+    check("S9-maxReconsumeTimes=2 时投递 3 次（0/1/2 各一次）",
+          [a[0] for a in first_three][:3] == [0, 1, 2], "times=%s" % times_seen)
+    check("S9-用尽后不再投递（观察窗口内只有 3 次）", len(final) == 3,
+          "arrivals=%d times=%s" % (len(final), [a[0] for a in final]))
+    check("S9-重投期间 topic 还原为业务 topic",
+          all(a[2] == topic9 for a in first_three), "topics=%s" % sorted({a[2] for a in first_three}))
+
+    # %DLQ%<group> 由 broker 在投递进 DLQ 时才创建并注册路由，先等路由出现
+    dlq_topic = MixAll.get_dlq_topic(group9)
+    probe9 = MQClientInstance("dlq-probe-%d" % int(time.time() * 1000), [NAMESRV])
+    probe9.start()
+    deadline = time.time() + 30
+    dlq_route = None
+    while time.time() < deadline:
+        dlq_route = probe9.get_topic_route_data(dlq_topic)
+        if dlq_route is not None and dlq_route.broker_datas:
+            break
+        time.sleep(2)
+    check("S9- broker 自动创建并注册 %DLQ%<group> 路由", dlq_route is not None and bool(dlq_route.broker_datas),
+          "dlq=%s" % dlq_topic)
+    probe9.shutdown()
+
+    # 用 lite pull 从队首读 DLQ，确认「就是那条消息」而不是只看到位点前移
+    dlq_msgs = []
+    if dlq_route is not None and dlq_route.broker_datas:
+        lc9 = DefaultLitePullConsumer(PREFIX + "_g9dlq")
+        lc9.set_namesrv_addr(NAMESRV)
+        # 新消费组 + CONSUME_FROM_LAST_OFFSET 会从队尾开始，把已经在 DLQ 里的那条跳过 ⇒ 假失败
+        lc9.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
+        lc9.subscribe(dlq_topic, "*")
+        lc9.start()
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            for m in lc9.poll(3000) or []:
+                dlq_msgs.append(m)
+            if dlq_msgs:
+                break
+            time.sleep(1)
+        lc9.shutdown()
+    got9 = [(bytes(m.body), m.get_reconsume_times(), m.topic,
+             (m.properties or {}).get("RETRY_TOPIC")) for m in dlq_msgs]
+    check("S9-消息落在 %DLQ%<group>", [g[0] for g in got9] == [b"dlq-me"],
+          "got=%s" % [(g[0].decode(), g[1]) for g in got9])
+    # broker 存储时 reconsumeTimes+1（AbstractSendMessageProcessor:226）⇒ 3
+    check("S9-DLQ 消息 reconsumeTimes=3（第 3 次回投转死信）",
+          len(got9) == 1 and got9[0][1] == 3, "got=%s" % got9)
+    check("S9-DLQ 消息保留 RETRY_TOPIC=原始业务 topic",
+          len(got9) == 1 and got9[0][3] == topic9, "got=%s" % got9)
+    check("S9-DLQ 消息 topic 就是 %DLQ%<group>",
+          len(got9) == 1 and got9[0][2] == dlq_topic, "got=%s" % got9)
+    print("S9: 原始 msgId=%s，DLQ 观测=%s" % (sent9.msg_id, got9))
 
     producer.shutdown()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
