@@ -13,7 +13,11 @@
 //   9. maxOffset / minOffset / searchOffset / earliestMsgStoreTime / examineConsumerOffset
 //  10. sendMessageBack：消费 1 条后重投 → 轮询 %RETRY%<group> 出现该消息
 //  11. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，language=CPP）
-//  12. 清理：deleteSubscriptionGroup / deleteTopic
+//  12. resetOffsetByQueueId（25 + 带 queueId/offset 的 222）：拉回 min ⇒ 首笔 pull 被
+//      OFFSET_RESET 短路成 PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒
+//      ⇒ 位点停在第 1 笔写入的非法值（两笔 RPC 非原子，与 Java 同构）
+//  13. queryTopicsByConsumerToBroker / queryTopicsByConsumer(group)（343，按 %RETRY% 路由扇出）
+//  14. 清理：deleteSubscriptionGroup / deleteTopic
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
 // autoCreateTopicEnable=true。用法：
@@ -32,6 +36,7 @@
 #include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/producer.h"
+#include "rocketmq/client/pull_consumer.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message.h"
@@ -556,6 +561,101 @@ int main(int argc, char** argv) {
                   "consumerOffset=" + std::to_string(off) + " maxOffset=" + std::to_string(maxNow));
         } catch (const std::exception& e) {
             check("resetOffsetByTimestamp", false, e.what());
+        }
+    }
+
+    // ---------- 9.5 resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）+
+    //             queryTopicsByConsumer(343) ----------
+    {
+        const int32_t queueId = mq.getQueueId();
+        int64_t minReset = -1;
+        try {
+            minReset = admin.minOffset(mq);
+        } catch (const std::exception& e) {
+            check("minOffset(reset 前置)", false, e.what());
+        }
+        if (minReset >= 0) {
+            try {
+                std::map<MessageQueue, int64_t> table =
+                    admin.resetOffsetByQueueId(brokerAddr, group, topic, queueId, minReset);
+                // Java 该方法是 void：broker 只在 language=CPP 时回可解析的 offsetTable，
+                // 空表合法；非空时必须是我们操作的那个队列。
+                bool consistent = table.empty() ||
+                    table.begin()->first.getQueueId() == queueId;
+                check("resetOffsetByQueueId(回到 minOffset)", consistent,
+                      "returnedTable=" + std::to_string(table.size()) +
+                          "（Java 为 void，可为空）");
+                int64_t off = -1;
+                bool found = admin.examineConsumerOffset(group, mq, off);
+                check("resetOffsetByQueueId 后位点==目标 offset", found && off == minReset,
+                      "consumerOffset=" + std::to_string(off) +
+                          " target=" + std::to_string(minReset));
+            } catch (const std::exception& e) {
+                check("resetOffsetByQueueId(回到 minOffset)", false, e.what());
+            }
+
+            // 一次性 resetOffsetTable 真的被下一次 pull 取走：Java
+            // `PullMessageProcessor:539-548` 在 useServerSideResetOffset 下**不读消息**，
+            // 直接回 OFFSET_RESET ⇒ PULL_OFFSET_MOVED(:672)，客户端映射成
+            // PullStatus::OFFSET_ILLEGAL + nextBeginOffset=重置位点（MQClientAPIImpl:1098）。
+            // 所以第一笔 pull 必须是 OFFSET_ILLEGAL，第二笔才真正拿到历史消息。
+            try {
+                DefaultMQPullConsumer pull(group);
+                pull.setNamesrvAddr(gNamesrv);
+                pull.start();
+                PullResult first = pull.pull(mq, "*", minReset, 16, 5000);
+                check("重置后首笔 pull 被 broker 短路成 PULL_OFFSET_MOVED",
+                      first.status == PullStatus::OFFSET_ILLEGAL &&
+                          first.nextBeginOffset == minReset,
+                      "status=" + std::string(pullStatusName(first.status)) +
+                          " nextBeginOffset=" + std::to_string(first.nextBeginOffset));
+                PullResult second = pull.pull(mq, "*", first.nextBeginOffset, 16, 5000);
+                check("重置位点之后可重新拉到历史消息", !second.msgFoundList.empty(),
+                      "status=" + std::string(pullStatusName(second.status)) +
+                          " found=" + std::to_string(second.msgFoundList.size()));
+                pull.shutdown();
+            } catch (const std::exception& e) {
+                check("重置后回拉", false, e.what());
+            }
+
+            // 越界负例：resetOffsetInner 的 [min, max+1] 校验必须拒掉。同时量化 Java 语义——
+            // 两笔 RPC **不是原子的**：commitOffset 无区间校验，第 1 笔已把非法位点落库，
+            // 所以失败后位点停在非法目标上（这里不断言"回滚"）。
+            int64_t badTarget = -1;
+            try {
+                badTarget = admin.maxOffset(mq) + 100;
+                bool rejected = false;
+                std::string remark;
+                try {
+                    admin.resetOffsetByQueueId(brokerAddr, group, topic, queueId, badTarget);
+                } catch (const std::exception& e) {
+                    rejected = true;
+                    remark = e.what();
+                }
+                check("resetOffsetByQueueId 越界目标被 broker 拒绝", rejected,
+                      "badTarget=" + std::to_string(badTarget) + " " + remark.substr(0, 120));
+                int64_t off = -1;
+                bool found = admin.examineConsumerOffset(group, mq, off);
+                check("越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+                      found && off == badTarget,
+                      "consumerOffset=" + std::to_string(off));
+            } catch (const std::exception& e) {
+                check("resetOffsetByQueueId 越界目标被 broker 拒绝", false, e.what());
+            }
+        }
+
+        // 343 读的是 broker 的 offsetTable（whichTopicByConsumer），组提交过位点才有内容。
+        try {
+            TopicList byBroker = admin.queryTopicsByConsumerToBroker(brokerAddr, group);
+            check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
+                  byBroker.contains(topic), "topics=" + std::to_string(byBroker.topicList.size()));
+            // Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group：按
+            // %RETRY%<group> 路由逐 broker 扇出再合并（Set 语义去重）。
+            TopicList byGroup = admin.queryTopicsByConsumer(group);
+            check("queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
+                  byGroup.contains(topic), "topics=" + std::to_string(byGroup.topicList.size()));
+        } catch (const std::exception& e) {
+            check("queryTopicsByConsumer", false, e.what());
         }
     }
 

@@ -180,7 +180,16 @@ public:
                                                int32_t timeoutMillis = -1);
     std::set<std::string> queryTopicConsumeByWho(const std::string& brokerAddr,
                                                  const std::string& topic);
-    TopicList queryTopicsByConsumer(const std::string& brokerAddr, const std::string& group);
+    // 对应 Java MQClientAPIImpl#queryTopicsByConsumer:2525（343）的单 broker 原始调用。
+    // broker 端走 AdminBrokerProcessor#queryTopicsByConsumer:2421 →
+    // ConsumerOffsetManager#whichTopicByConsumer：**从位点表**（topic@group 键）反查该组
+    // 消费过哪些 topic，所以组从没提交过位点时回空表，这是预期而不是 bug。
+    TopicList queryTopicsByConsumerToBroker(const std::string& brokerAddr,
+                                            const std::string& group);
+    // 对应 Java DefaultMQAdminExt#queryTopicsByConsumer（DefaultMQAdminExtImpl:1078）：
+    // 先按 %RETRY%<group> 查路由，再对路由里每个 broker 下发 343 并合并
+    // （Java 的 TopicList.topicList 是 Set<String>，所以这里同样去重）。
+    TopicList queryTopicsByConsumer(const std::string& group);
     JsonValue querySubscription(const std::string& brokerAddr, const std::string& group,
                                 const std::string& topic);
     JsonValue getConsumeStatus(const std::string& brokerAddr, const std::string& topic,
@@ -212,6 +221,19 @@ public:
     std::map<MessageQueue, int64_t> resetOffsetByTimestampOld(
         const std::string& consumerGroup, const std::string& topic, int64_t timestamp,
         bool force = true);
+    // 对应 Java DefaultMQAdminExt#resetOffsetByQueueId（DefaultMQAdminExtImpl:1827）：**两笔**
+    // RPC，缺一不可。先 updateConsumerOffset(25) 直接写 offsetTable，再发一笔带 queueId +
+    // offset 的 INVOKE_BROKER_TO_RESET_OFFSET(222)：broker 在 resetOffsetInner 里先按
+    // [min, max+1] 校验目标位点，再 assignResetOffset（同时写一次性的 resetOffsetTable
+    // 和 offsetTable，并清掉该队列的 POP 在途计数）。Java 返回 void（只打日志），这里把
+    // broker 报回的队列表返回，便于调用方核对。
+    // 注意实测（5.5.1 真机）这两笔 RPC **不是原子的**：ConsumerOffsetManager#commitOffset
+    // 只做覆盖写（offset 变小也只打 [NOTIFYME] warn，不做区间校验），所以第 2 笔被
+    // resetOffsetInner 以 "Target offset N not in consume queue range" 拒绝时，第 1 笔已经
+    // 把非法位点落库。Java 同样如此，这里不做保护性回滚。
+    std::map<MessageQueue, int64_t> resetOffsetByQueueId(
+        const std::string& brokerAddr, const std::string& consumerGroup,
+        const std::string& topic, int32_t queueId, int64_t resetOffset);
 
     // ---------------- 消息查询 ----------------
     std::vector<MessageExt> queryMessage(const std::string& topic, const std::string& key,
@@ -230,6 +252,13 @@ public:
 private:
     // ---------------- 底层调用助手 ----------------
     MQClientInstance& requireClient();
+    // 一笔 INVOKE_BROKER_TO_RESET_OFFSET(222)。Java 在这里有两个重载：不带 queueId 的按
+    // timestamp 重置整个 topic，带 queueId + offset 的只重置单个队列。这里用哨兵值表示
+    // 「不带该字段」：queueId < 0 即 Java 的默认 -1，offset < 0 即 Java 的「offset=-1 表示
+    // offset 为 null」。
+    std::map<MessageQueue, int64_t> invokeBrokerToResetOffset(
+        const std::string& brokerAddr, const std::string& topic, const std::string& group,
+        int64_t timestamp, bool isForce, bool isCpp, int32_t queueId, int64_t offset);
     static std::string firstBrokerAddr(MQClientInstance& client);
     std::string findFirstBrokerAddr(MQClientInstance& client);
     std::string brokerAddrForMq(MQClientInstance& client, const MessageQueue& mq);

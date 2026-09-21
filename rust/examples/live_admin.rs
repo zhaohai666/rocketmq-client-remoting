@@ -24,7 +24,8 @@
 //! - A7 生产 + 统计：`examine_topic_stats`（多 broker 合并）/ `examine_topic_stats_by_broker`
 //!   / `examine_consume_stats` / `fetch_consume_stats_in_broker` / `query_consume_queue`。
 //! - A8 在线消费者：`examine_consumer_connection_info` / `get_consumer_list_by_group` /
-//!   `query_topic_consume_by_who` / `query_topics_by_consumer` / `query_subscription` /
+//!   `query_topic_consume_by_who` / `query_topics_by_consumer(group)` +
+//!   `query_topics_by_consumer_to_broker`（343）/ `query_subscription` /
 //!   `examine_producer_connection_info`，以及 `examine_consumer_running_info`（307 走
 //!   broker→客户端回调，证明 `ClientRemotingProcessor` 真能被管理端驱动）。
 //! - A9 消息查询：`query_message`/`query_message_by_key`/`query_message_by_uniq_key` 可达
@@ -35,7 +36,10 @@
 //! - A11 `send_message_back` 重投 → 管理端轮询 `%RETRY%<group>` 的统计（broker 把
 //!   delayLevel=0 改写成 3，约 10s 后可见）。
 //! - A12 位点重置：`reset_offset_by_timestamp`(222, broker 端) 推到未来 → 位点 == max、
-//!   `reset_offset_new`、`reset_offset_by_timestamp_old`。
+//!   `reset_offset_new`、`reset_offset_by_timestamp_old`、`reset_offset_by_queue_id`
+//!   （25 + 带 queueId/offset 的 222：拉回 min ⇒ 首笔 pull 被 OFFSET_RESET 短路成
+//!   PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒 ⇒ 位点停在第 1 笔写入的
+//!   非法值，证明两笔 RPC 非原子、与 Java 同构）。
 //! - A13 写权限 + 清理：`wipe_write_perm_of_broker` → `add_write_perm_of_broker` 还原 →
 //!   `delete_topic_in_broker` / `delete_topic_in_name_server` / `delete_topic` →
 //!   topic 从 `fetch_all_topic_list` 消失。
@@ -1193,16 +1197,32 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
     // 343 QUERY_TOPICS_BY_CONSUMER 读的是 broker 的 offsetTable
     // （`ConsumerOffsetManager#whichTopicByConsumer`），所以只有在消费者刷过位点之后
     // 才有内容；订阅关系本身不参与。%RETRY% 同理，只有给重试 topic 提交过位点才会出现。
-    match admin.query_topics_by_consumer(&env.broker(), &group).await {
+    match admin
+        .query_topics_by_consumer_to_broker(&env.broker(), &group)
+        .await
+    {
         Ok(list) => {
             let topics = list.get_topic_list();
             ck.check(
-                "A8 queryTopicsByConsumer 从位点表读出本组消费过的 topic",
+                "A8 queryTopicsByConsumerToBroker 从位点表读出本组消费过的 topic",
                 topics.contains(&topic),
                 &format!("{topics:?}"),
             );
         }
-        Err(e) => ck.abort("A8 queryTopicsByConsumer", &e.to_string()),
+        Err(e) => ck.abort("A8 queryTopicsByConsumerToBroker", &e.to_string()),
+    }
+    // Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group：按 %RETRY%<group>
+    // 的路由逐 broker 扇出再合并，所以这条断言同时验证了路由解析和合并口径。
+    match admin.query_topics_by_consumer(&group).await {
+        Ok(list) => {
+            let topics = list.get_topic_list();
+            ck.check(
+                "A8 queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
+                topics.contains(&topic),
+                &format!("{topics:?}"),
+            );
+        }
+        Err(e) => ck.abort("A8 queryTopicsByConsumer(group)", &e.to_string()),
     }
     match admin
         .fetch_consume_stats_in_broker(&env.broker(), false, None)
@@ -1582,6 +1602,110 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
             &format!("queues={}", offsets.len()),
         ),
         Err(e) => ck.abort("A12 resetOffsetByTimestampOld", &e.to_string()),
+    }
+
+    // ---------- resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）----------
+    // 与上面的按 timestamp 重置不同：这条把「队列 + 显式 offset」交给 broker，
+    // 拉回 minOffset 后必须能按该位点重新取到 A7 发的历史消息。
+    let min_reset = admin.min_offset(&mq).await.unwrap_or(-1);
+    match admin
+        .reset_offset_by_queue_id(&env.broker(), &group, &topic, mq.queue_id, min_reset)
+        .await
+    {
+        Ok(table) => ck.check(
+            "A12 resetOffsetByQueueId 打到 broker 成功",
+            // Java 该方法是 void：broker 只有 language=CPP 才回可解析的 offsetTable，
+            // 所以空表合法；非空时必须是我们操作的那个队列。
+            table.is_empty()
+                || table.iter().any(|(k, _)| k.queue_id == mq.queue_id),
+            &format!("returnedTable={}（Java 为 void，可为空）", table.len()),
+        ),
+        Err(e) => {
+            ck.abort("A12 resetOffsetByQueueId", &e.to_string());
+            return;
+        }
+    }
+    match admin.examine_consumer_offset(&group, &mq).await {
+        Ok(offset) => ck.check(
+            "A12 resetOffsetByQueueId 后位点==目标 offset",
+            offset == Some(min_reset),
+            &format!("consumerOffset={offset:?} target={min_reset}"),
+        ),
+        Err(e) => ck.abort("A12 回读 resetOffsetByQueueId 位点", &e.to_string()),
+    }
+    // 一次性 resetOffsetTable 真的被下一次 pull 取走：Java `PullMessageProcessor:539-548`
+    // 在 useServerSideResetOffset 下**不读消息**，直接回 OFFSET_RESET ⇒
+    // ResponseCode.PULL_OFFSET_MOVED(:672)，客户端 `MQClientAPIImpl:1098` 把它映射成
+    // PullStatus.OFFSET_ILLEGAL + nextBeginOffset=重置位点。所以第一笔 pull 必须是
+    // OffsetIllegal 且 nextBeginOffset==目标位点；第二笔才真正拿到历史消息。
+    {
+        let consumer = match DefaultMQPullConsumer::with_config(PullConsumerConfig {
+            consumer_group: group.clone(),
+            name_server_addrs: vec![env.namesrv.clone()],
+            instance_name: format!("live-admin-reset-{}", env.stamp),
+            ..Default::default()
+        }) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                ck.abort("A12 重置后回拉：消费者构造", &e.to_string());
+                None
+            }
+        };
+        if let Some(consumer) = consumer {
+            if let Err(e) = consumer.start().await {
+                ck.abort("A12 重置后回拉：start", &e.to_string());
+            } else {
+                match consumer.pull(&mq, "*", min_reset, 1, Some(5_000)).await {
+                    Ok(first) => {
+                        ck.check(
+                            "A12 重置后首笔 pull 被 broker 短路成 PULL_OFFSET_MOVED",
+                            first.status == PullStatus::OffsetIllegal
+                                && first.next_begin_offset == min_reset,
+                            &format!(
+                                "status={} nextBeginOffset={} target={min_reset}",
+                                first.status, first.next_begin_offset
+                            ),
+                        );
+                        let resume = first.next_begin_offset;
+                        match consumer.pull(&mq, "*", resume, 16, Some(5_000)).await {
+                            Ok(second) => ck.check(
+                                "A12 重置位点之后可重新拉到历史消息",
+                                !second.msg_found_list.is_empty(),
+                                &format!(
+                                    "status={} found={} from={resume}",
+                                    second.status,
+                                    second.msg_found_list.len()
+                                ),
+                            ),
+                            Err(e) => ck.abort("A12 重置后第二笔回拉", &e.to_string()),
+                        }
+                    }
+                    Err(e) => ck.abort("A12 重置后回拉", &e.to_string()),
+                }
+                consumer.shutdown();
+            }
+        }
+    }
+    // 越界负例：resetOffsetInner 的 [min, max+1] 校验必须拒掉；同时量化 Java 语义——
+    // 两笔 RPC **不是原子的**（commitOffset 无区间校验，第 1 笔已把非法位点落库），
+    // 所以失败后位点停在非法目标上，这里不断言"回滚"。
+    let bad_target = max_now + 100;
+    let rejected = admin
+        .reset_offset_by_queue_id(&env.broker(), &group, &topic, mq.queue_id, bad_target)
+        .await
+        .is_err();
+    ck.check(
+        "A12 resetOffsetByQueueId 越界目标被 broker 拒绝",
+        rejected,
+        &format!("badTarget={bad_target}"),
+    );
+    match admin.examine_consumer_offset(&group, &mq).await {
+        Ok(offset) => ck.check(
+            "A12 越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+            offset == Some(bad_target),
+            &format!("consumerOffset={offset:?} badTarget={bad_target}"),
+        ),
+        Err(e) => ck.abort("A12 回读越界 reset 位点", &e.to_string()),
     }
 }
 

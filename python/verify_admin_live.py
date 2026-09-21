@@ -12,8 +12,10 @@
  8. 生产 N 条 → examineTopicStats / examineConsumeStats / queryConsumeQueue /
     queryMessage(key) / viewMessage(msgId)
  9. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，观察位点变化）
-10. sendMessageBack：消费 1 条后重投 → 校验 %RETRY%<group> 里出现原消息
-11. 清理：deleteSubscriptionGroup / deleteTopic
+    + resetOffsetByQueueId（单队列显式位点：正例回读位点、重启消费者重投、越界负例）
+10. queryTopicsByConsumer（343）：单 broker 原始调用 + Java 的组级重载（按 %RETRY% 路由扇出合并）
+11. sendMessageBack：消费 1 条后重投 → 校验 %RETRY%<group> 里出现原消息
+12. 清理：deleteSubscriptionGroup / deleteTopic
 
 用法：先起 nameServer(9876)+broker(10911)，再在 venv 里 `python verify_admin_live.py`
 """
@@ -410,6 +412,83 @@ def main():
         max_now = admin.max_offset(mq)
         check("reset 后消费者位点被推到 maxOffset", off_after >= max_now - 1,
               "consumerOffset=%s maxOffset=%s" % (off_after, max_now))
+
+    # ---------- 9.5 resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）----------
+    # 与 9 的差别：这一条把「队列 + 显式 offset」交给 broker，不按 timestamp 反算。
+    # 只回读 examine_consumer_offset 断言：Java 该方法是 void，且 broker 仅在
+    # language=CPP 时回可解析的 offsetTable，所以返回表为空属预期，不是 bug。
+    min_reset = admin.min_offset(mq)
+    rqi = safe("resetOffsetByQueueId(回到 minOffset)",
+               lambda: admin.reset_offset_by_queue_id(
+                   broker_addr, GROUP, TOPIC, mq.queue_id, min_reset),
+               lambda d: "returnedTable=%d（Java 为 void，可为空）" % len(d))
+    if rqi is not None:
+        off_rqi = admin.examine_consumer_offset(GROUP, mq)
+        check("resetOffsetByQueueId 后位点==目标 offset", off_rqi == min_reset,
+              "consumerOffset=%s target=%s" % (off_rqi, min_reset))
+
+    # 真机重投：位点被拉回 minOffset 后，重启消费者应能**重新**收到历史消息。
+    # 这一步证明的不只是 offsetTable 改写了，而是 broker 端 resetOffsetTable 的一次性
+    # 重置确实被下一次 pull 取走（ConsumerOffsetManager#queryThenEraseResetOffset）。
+    # Java `PullMessageProcessor:539-548` 命中一次性重置时**不读消息**，直接回
+    # OFFSET_RESET ⇒ PULL_OFFSET_MOVED(:672)，客户端映射成 OFFSET_ILLEGAL + 新位点，
+    # 消费者按 nextBeginOffset 再拉一次才真正拿到消息（rust A12 逐笔验证了这个两段式）。
+    again = []
+    lock2 = threading.Lock()
+
+    def on_msg_again(msgs):
+        with lock2:
+            again.extend(msgs)
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
+
+    cons2 = DefaultMQPushConsumer(consumer_group=GROUP)
+    cons2.set_namesrv_addr(NAMESRV)
+    cons2.subscribe(TOPIC, "*")
+    cons2.set_message_listener(SimpleMessageListener(on_msg_again))
+    cons2.start()
+    deadline_again = time.time() + 20
+    while time.time() < deadline_again and len(again) < 1:
+        time.sleep(0.5)
+    cons2.shutdown()
+    check("resetOffsetByQueueId 后重新消费到历史消息", len(again) >= 1,
+          "reConsumed=%d（队列 %d 位点已回到 minOffset=%s）" % (len(again), mq.queue_id, min_reset))
+
+    # 越界负例：目标 offset 超出 [minOffset, maxOffset+1] 时 broker 的 222 必须拒绝
+    # （resetOffsetInner 回 SYSTEM_ERROR "Target offset N not in consume queue range [...]"）。
+    # ⚠ 同时量化一个 Java 语义：这两笔 RPC **不是原子的**——
+    # `ConsumerOffsetManager#commitOffset` 只做覆盖写入（连 offset 变小都只打一条
+    # [NOTIFYME] warn，不做区间校验），所以第 1 笔 updateConsumerOffset 已经把非法位点
+    # 落库，第 2 笔才被拒绝。这里断言「222 拒绝 + 位点仍停在第 1 笔写入的非法值」，
+    # 与 Java `DefaultMQAdminExtImpl:1829-1846` 完全同构；不额外加保护性回滚。
+    max_for_range = admin.max_offset(mq)
+    bad_target = max_for_range + 100
+    try:
+        admin.reset_offset_by_queue_id(broker_addr, GROUP, TOPIC, mq.queue_id, bad_target)
+        check("resetOffsetByQueueId 越界目标被 broker 拒绝", False, "没有抛异常")
+    except Exception as e:  # noqa: BLE001
+        check("resetOffsetByQueueId 越界目标被 broker 拒绝", True,
+              "%s: %s" % (type(e).__name__, str(e)[:160]))
+    off_after_bad = admin.examine_consumer_offset(GROUP, mq)
+    check("越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+          off_after_bad == bad_target,
+          "consumerOffset=%s badTarget=%s" % (off_after_bad, bad_target))
+
+    # ---------- 9.6 queryTopicsByConsumer（343）：单 broker 原始调用 vs Java 的组级重载 ----------
+    # broker 端读的是 offsetTable（ConsumerOffsetManager#whichTopicByConsumer），所以必须
+    # 等消费者刷过位点；Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group——
+    # 先按 %RETRY%<group> 查路由，再逐 broker 扇出并合并成 Set。
+    by_broker = safe("queryTopicsByConsumerToBroker",
+                     lambda: admin.query_topics_by_consumer_to_broker(broker_addr, GROUP),
+                     lambda t: "topics=%d" % len(t.get_topic_list()))
+    if by_broker is not None:
+        check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
+              TOPIC in set(by_broker.get_topic_list()), str(by_broker.get_topic_list()))
+    by_group = safe("queryTopicsByConsumer(group)（按 %RETRY% 路由扇出）",
+                    lambda: admin.query_topics_by_consumer(GROUP),
+                    lambda t: "topics=%d" % len(t.get_topic_list()))
+    if by_group is not None:
+        check("queryTopicsByConsumer(group) 合并后含本组消费过的 topic",
+              TOPIC in set(by_group.get_topic_list()), str(by_group.get_topic_list()))
 
     prod.shutdown()
 

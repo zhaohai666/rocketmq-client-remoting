@@ -1623,8 +1623,13 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `query_topics_by_consumer`（343）。
-    pub async fn query_topics_by_consumer(
+    /// 对应 Java `MQClientAPIImpl#queryTopicsByConsumer:2525`（343）的单 broker 原始调用。
+    ///
+    /// broker 端走 `AdminBrokerProcessor#queryTopicsByConsumer:2421` →
+    /// `ConsumerOffsetManager#whichTopicByConsumer`：**从位点表**（`topic@group` 键）反查该组
+    /// 消费过哪些 topic。所以组从没提交过位点时回空表，这是预期而不是 bug。
+    /// Python `query_topics_by_consumer_to_broker`。
+    pub async fn query_topics_by_consumer_to_broker(
         &self,
         broker_addr: &str,
         group: &str,
@@ -1643,6 +1648,35 @@ impl DefaultMQAdminExt {
             Some(body) => TopicList::decode(body),
             None => Ok(TopicList::new()),
         }
+    }
+
+    /// 对应 Java `DefaultMQAdminExt#queryTopicsByConsumer`（`DefaultMQAdminExtImpl:1078`）。
+    ///
+    /// Java 先按 `%RETRY%<group>` 查路由，再对路由里每个 broker 下发 343 并合并
+    /// （Java 的 `TopicList.topicList` 是 `Set<String>`，所以这里同样去重）。
+    /// Python `query_topics_by_consumer`。
+    pub async fn query_topics_by_consumer(&self, group: &str) -> Result<TopicList> {
+        let route = self
+            .examine_topic_route(&MixAll::get_retry_topic(group))
+            .await?;
+        let mut result = TopicList::new();
+        let mut seen: Vec<String> = Vec::new();
+        for bd in route.get_broker_datas() {
+            let Some(addr) = bd.select_broker_addr().filter(|a| !a.is_empty()) else {
+                continue;
+            };
+            let topics = self
+                .query_topics_by_consumer_to_broker(&addr, group)
+                .await?;
+            for topic in topics.get_topic_list() {
+                if seen.iter().any(|t| *t == *topic) {
+                    continue;
+                }
+                seen.push(topic.clone());
+                result.topic_list.push(topic.clone());
+            }
+        }
+        Ok(result)
     }
 
     /// Python `query_subscription`（345）。
@@ -1814,7 +1848,6 @@ impl DefaultMQAdminExt {
         cluster_name: Option<&str>,
         is_cpp: bool,
     ) -> Result<Vec<(MessageQueueKey, i64)>> {
-        let client = self.require_client()?;
         // Python：LMQ / wheel_timer 这类没有独立路由的 topic，按集群名去查路由，
         // 但下发给 broker 的 `topic` 仍是原值。
         let route_topic = if !topic.is_empty()
@@ -1834,36 +1867,13 @@ impl DefaultMQAdminExt {
             let Some(addr) = bd.select_broker_addr().filter(|a| !a.is_empty()) else {
                 continue;
             };
-            let ext = ext_pairs(&[
-                ("topic", topic.to_string()),
-                ("group", group.to_string()),
-                ("timestamp", timestamp.to_string()),
-                ("force", bool_flag(is_force).to_string()),
-                // Java：offset=-1 表示 offset 为空
-                ("offset", "-1".to_string()),
-            ]);
-            let mut request =
-                build_request(request_code::INVOKE_BROKER_TO_RESET_OFFSET, &ext, None);
-            if is_cpp {
-                request.language = language_code::CPP;
-            }
-            let response = client
-                .invoke_sync(&addr, &mut request, self.timeout_millis())
-                .await?;
-            if response.code != response_code::SUCCESS {
-                return Err(Error::client_with_code(
-                    response.code,
-                    response
-                        .remark
-                        .unwrap_or_else(|| "reset offset failed".to_string()),
-                ));
-            }
-            if let Some(body) = response.body.as_deref().filter(|b| !b.is_empty()) {
-                for (key, offset) in ResetOffsetBody::decode(body)?.offset_table {
-                    match all_offsets.iter_mut().find(|(k, _)| *k == key) {
-                        Some(entry) => entry.1 = offset,
-                        None => all_offsets.push((key, offset)),
-                    }
+            for (key, offset) in self
+                .invoke_broker_reset_offset(&addr, topic, group, timestamp, is_force, is_cpp, None, None)
+                .await?
+            {
+                match all_offsets.iter_mut().find(|(k, _)| *k == key) {
+                    Some(entry) => entry.1 = offset,
+                    None => all_offsets.push((key, offset)),
                 }
             }
         }
@@ -1871,6 +1881,109 @@ impl DefaultMQAdminExt {
             bail!("reset offset failed, no broker returned offset table");
         }
         Ok(all_offsets)
+    }
+
+    /// 一笔 `INVOKE_BROKER_TO_RESET_OFFSET`(222)，回 broker 实际重置的队列表。
+    ///
+    /// Java 在这里有**两个**重载：`(topic, group, timestamp, isForce)` 按时间戳重置整个
+    /// topic，另一个带 `queueId` + `offset` 的只重置单个队列
+    /// （`MQClientAPIImpl#invokeBrokerToResetOffset`）。`offset` 为 `None` 时按 Java 口径
+    /// 写 `-1`（broker 侧当成 null，转去按 timestamp 算位点）。
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::fn_params_excessive_bools)]
+    async fn invoke_broker_reset_offset(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+        group: &str,
+        timestamp: i64,
+        is_force: bool,
+        is_cpp: bool,
+        queue_id: Option<i32>,
+        offset: Option<i64>,
+    ) -> Result<Vec<(MessageQueueKey, i64)>> {
+        let client = self.require_client()?;
+        let mut pairs = vec![
+            ("topic", topic.to_string()),
+            ("group", group.to_string()),
+            ("timestamp", timestamp.to_string()),
+            ("force", bool_flag(is_force).to_string()),
+            // Java：offset=-1 表示 offset 为空
+            ("offset", offset.unwrap_or(-1).to_string()),
+        ];
+        if let Some(queue_id) = queue_id {
+            pairs.push(("queueId", queue_id.to_string()));
+        }
+        let mut request = build_request(
+            request_code::INVOKE_BROKER_TO_RESET_OFFSET,
+            &ext_pairs(&pairs),
+            None,
+        );
+        if is_cpp {
+            request.language = language_code::CPP;
+        }
+        let response = client
+            .invoke_sync(broker_addr, &mut request, self.timeout_millis())
+            .await?;
+        if response.code != response_code::SUCCESS {
+            return Err(Error::client_with_code(
+                response.code,
+                response
+                    .remark
+                    .unwrap_or_else(|| "reset offset failed".to_string()),
+            ));
+        }
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => Ok(ResetOffsetBody::decode(body)?.offset_table),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Python `reset_offset_by_queue_id`（对应 Java
+    /// `DefaultMQAdminExt#resetOffsetByQueueId:797` → `DefaultMQAdminExtImpl:1827`）。
+    ///
+    /// Java 打**两笔** RPC，缺一不可：
+    /// 1. `updateConsumerOffset`(25) 直接把 offsetTable 改成目标位点；
+    /// 2. 带 `queueId` + `offset` 的 222 走 `AdminBrokerProcessor#resetOffsetInner`，
+    ///    先按 `[min, max+1]` 校验目标位点（越界回 SYSTEM_ERROR
+    ///    `Target offset N not in consume queue range [min-max]`），再
+    ///    `ConsumerOffsetManager#assignResetOffset`——它同时写 `resetOffsetTable`（一次性，
+    ///    下次 pull 用 `queryThenEraseResetOffset` 取走）和 `offsetTable`，并清掉该队列的
+    ///    POP 在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
+    ///
+    /// Java 返回 void（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
+    ///
+    /// ⚠ 实测（5.5.1 真机）这两笔 RPC **不是原子的**：`ConsumerOffsetManager#commitOffset`
+    /// 只做覆盖写（连 offset 变小都只打 `[NOTIFYME]` warn，不做区间校验），所以第 2 笔被
+    /// `resetOffsetInner` 以 `Target offset N not in consume queue range [min-max]` 拒绝时，
+    /// 第 1 笔已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
+    pub async fn reset_offset_by_queue_id(
+        &self,
+        broker_addr: &str,
+        consumer_group: &str,
+        topic: &str,
+        queue_id: i32,
+        reset_offset: i64,
+    ) -> Result<Vec<(MessageQueueKey, i64)>> {
+        self.update_consumer_offset_to_broker(
+            broker_addr,
+            consumer_group,
+            &MessageQueue::new(topic, "", queue_id),
+            reset_offset,
+        )
+        .await?;
+        // Java 的单队列重载不传 force（默认 false）、timestamp 传 0（位点已给定，不参与算）
+        self.invoke_broker_reset_offset(
+            broker_addr,
+            topic,
+            consumer_group,
+            0,
+            false,
+            false,
+            Some(queue_id),
+            Some(reset_offset),
+        )
+        .await
     }
 
     /// Python `reset_offset_new`：先试新版（broker 端重置），消费者不在线再退化到旧版。

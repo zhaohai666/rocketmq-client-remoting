@@ -25,7 +25,7 @@ ROCKETMQ_JAVA_SRC=<...>/remoting/src/main/java/org/apache/rocketmq/remoting/prot
 
 ```bash
 python verify_message_types.py    # 7 类消息能力（异步/顺序/Tag/属性/延迟/Key/事务）
-python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（52 PASS/0 FAIL/1 SKIP）
+python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（63 PASS/0 FAIL/1 SKIP）
 python verify_compression_live.py selftest   # 自动压缩自产自销 + broker 侧压缩体校验
 python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 探针跨客户端互通
 python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需 broker traceTopicEnable=true）
@@ -150,6 +150,25 @@ Admin 响应体全崩。
 
 `GET_MESSAGE` 类查询中，**uniqKey（msgId）查询需要 broker 开 RocksDB 索引**；
 默认文件索引 + 消息未设 KEYS 时查不到是 **broker 配置差异，不是客户端 bug**。
+
+位点重置有**两条不同的 Java 路径**，别再混：`reset_offset_by_timestamp`（222 不带
+`queueId`、`offset=-1` 表示 Java 的 null）按时间戳整 topic 重置；`reset_offset_by_queue_id`
+是**两笔** RPC——先 `update_consumer_offset`(25) 写 offsetTable，再一笔带 `queueId`+`offset`
+的 222 让 broker 走 `resetOffsetInner` → `assignResetOffset`（同时写**一次性**的
+`resetOffsetTable`）。真机（5.5.1）量到两件事：
+
+1. 重置后**首笔 pull 拿不到消息**——broker 直接回 `OFFSET_RESET` ⇒ `PULL_OFFSET_MOVED`，
+   客户端映射成 `OFFSET_ILLEGAL` + `next_begin_offset=重置位点`（`PullMessageProcessor:539-548/672`
+   + `MQClientAPIImpl:1098`），第二笔才真正取到历史消息。
+2. 这两笔**不是原子的**：`ConsumerOffsetManager#commitOffset` 无区间校验（连位点变小都只打
+   `[NOTIFYME]` warn），所以越界目标下第 1 笔已把非法位点落库、第 2 笔才被
+   `Target offset N not in consume queue range [min-max]` 拒掉。Java 同样如此，
+   这里不做保护性回滚，`verify_admin_live.py` 第 9.5 节把该行为钉成断言。
+
+`query_topics_by_consumer` 对齐 Java 的**组级**重载（只收 `group`：按 `%RETRY%<group>` 查路由、
+逐 broker 扇出 343、按 Set 去重合并），原先那笔单 broker 的原始调用改名为
+`query_topics_by_consumer_to_broker`。343 读的是 offsetTable（`whichTopicByConsumer`），
+所以**组没提交过位点时回空表是预期**。
 
 ## 两条消息编码路径
 

@@ -79,7 +79,7 @@ dotnet/
 PROG=examples/RocketMQ.Examples/bin/Debug/net10.0/rmq.dll
 dotnet $PROG selfcheck                    # 本地自检（无需集群）
 dotnet $PROG message-types 127.0.0.1:9876  # 8 类消息能力（19 项检查）
-dotnet $PROG admin-live 127.0.0.1:9876     # Admin 全链路（47 PASS / 0 FAIL / 1 SKIP）
+dotnet $PROG admin-live 127.0.0.1:9876     # Admin 全链路（57 PASS / 0 FAIL / 1 SKIP）
 dotnet $PROG compression-live selftest 127.0.0.1:9876   # 压缩真实性（真机发送→消费→解压→CRC）
 dotnet $PROG compression-live send 127.0.0.1:9876 <topic> <group> <size> [codec]
 dotnet $PROG compression-live recv 127.0.0.1:9876 <topic> <group> <size>
@@ -113,7 +113,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 |---|---|
 | selfcheck | PASS=3 FAIL=0 |
 | message-types | 19 PASS / 0 FAIL（含批量：`SendBatch` 走 `SEND_BATCH_MESSAGE(320)`，真 broker 投成 3 条独立消息、offset 连续 0,1,2） |
-| admin-live | 47 PASS / 0 FAIL / 1 SKIP |
+| admin-live | 57 PASS / 0 FAIL / 1 SKIP（含 `ResetOffsetByQueueId`：25 + 带 queueId/offset 的 222，重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构；`QueryTopicsByConsumer(group)` 按 `%RETRY%` 路由扇出合并 + `QueryTopicsByConsumerToBroker`） |
 | compression-live selftest | 10 PASS / 0 FAIL（zlib 真机往返 storeSize 8192→~360、CRC 一致、flag 清除、阈值与编解码闭环 + **后端 lz4 / zstd 真机往返**） |
 | compression-live send/recv | 作为 `../scripts/compression_matrix.sh` 的一端参与四语言矩阵（zlib 13/13、lz4 13/13、zstd 7/7，全 PASS） |
 | interop | Python ↔ .NET 双向解码逐字段一致（JSON 与 ROCKETMQ 双序列化） |

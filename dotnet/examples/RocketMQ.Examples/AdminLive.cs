@@ -13,7 +13,11 @@
 //   9. maxOffset / minOffset / searchOffset / earliestMsgStoreTime / examineConsumerOffset
 //  10. sendMessageBack：消费 1 条后重投 → 轮询 %RETRY%<group> 出现该消息
 //  11. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，language=CPP）
-//  12. 清理：deleteSubscriptionGroup / deleteTopic
+//  12. resetOffsetByQueueId（25 + 带 queueId/offset 的 222）：拉回 min ⇒ 首笔 pull 被
+//      OFFSET_RESET 短路成 PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒
+//      ⇒ 位点停在第 1 笔写入的非法值（两笔 RPC 非原子，与 Java 同构）
+//  13. queryTopicsByConsumerToBroker / queryTopicsByConsumer(group)（343，按 %RETRY% 路由扇出）
+//  14. 清理：deleteSubscriptionGroup / deleteTopic
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
 // autoCreateTopicEnable=true。用法（由 Program 以 "admin-live [namesrv]" 形式调用）。
@@ -642,6 +646,119 @@ internal static class AdminLive
             catch (Exception e)
             {
                 Check("resetOffsetByTimestamp", false, e.Message);
+            }
+        }
+
+        // ---------- 9.5 resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）+
+        //             queryTopicsByConsumer(343) ----------
+        {
+            int queueId = mq.QueueId;
+            long minReset;
+            try
+            {
+                minReset = admin.MinOffset(mq);
+            }
+            catch (Exception e)
+            {
+                Check("minOffset(reset 前置)", false, e.Message);
+                minReset = -1;
+            }
+            if (minReset >= 0)
+            {
+                try
+                {
+                    SortedDictionary<MessageQueue, long> table =
+                        admin.ResetOffsetByQueueId(brokerAddr, group, topic, queueId, minReset);
+                    // Java 该方法是 void：broker 只在 language=CPP 时回可解析的 offsetTable，
+                    // 空表合法；非空时必须是我们操作的那个队列。
+                    Check("resetOffsetByQueueId(回到 minOffset)",
+                        table.Count == 0 || table.Keys.First().QueueId == queueId,
+                        "returnedTable=" + table.Count.ToString(CultureInfo.InvariantCulture)
+                        + "（Java 为 void，可为空）");
+                    bool found = admin.ExamineConsumerOffset(group, mq, out long off);
+                    Check("resetOffsetByQueueId 后位点==目标 offset", found && off == minReset,
+                        "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture)
+                        + " target=" + minReset.ToString(CultureInfo.InvariantCulture));
+                }
+                catch (Exception e)
+                {
+                    Check("resetOffsetByQueueId(回到 minOffset)", false, e.Message);
+                }
+
+                // 一次性 resetOffsetTable 真的被下一次 pull 取走：Java
+                // PullMessageProcessor:539-548 在 useServerSideResetOffset 下**不读消息**，
+                // 直接回 OFFSET_RESET ⇒ PULL_OFFSET_MOVED(:672)，客户端映射成
+                // PullStatus.OffsetIllegal + nextBeginOffset=重置位点（MQClientAPIImpl:1098）。
+                // 所以第一笔 pull 必须是 OffsetIllegal，第二笔才真正拿到历史消息。
+                try
+                {
+                    var pull = new DefaultMQPullConsumer(group);
+                    pull.SetNamesrvAddr(_gNamesrv);
+                    pull.Start();
+                    PullResult first = pull.Pull(mq, "*", minReset, 16, 5000);
+                    Check("重置后首笔 pull 被 broker 短路成 PULL_OFFSET_MOVED",
+                        first.Status == PullStatus.OffsetIllegal && first.NextBeginOffset == minReset,
+                        "status=" + first.Status + " nextBeginOffset="
+                        + first.NextBeginOffset.ToString(CultureInfo.InvariantCulture));
+                    PullResult second = pull.Pull(mq, "*", first.NextBeginOffset, 16, 5000);
+                    Check("重置位点之后可重新拉到历史消息", second.MsgFoundList.Count > 0,
+                        "status=" + second.Status + " found="
+                        + second.MsgFoundList.Count.ToString(CultureInfo.InvariantCulture));
+                    pull.Shutdown();
+                }
+                catch (Exception e)
+                {
+                    Check("重置后回拉", false, e.Message);
+                }
+
+                // 越界负例：resetOffsetInner 的 [min, max+1] 校验必须拒掉。同时量化 Java 语义——
+                // 两笔 RPC **不是原子的**：commitOffset 无区间校验，第 1 笔已把非法位点落库，
+                // 所以失败后位点停在非法目标上（这里不断言"回滚"）。
+                try
+                {
+                    long badTarget = admin.MaxOffset(mq) + 100;
+                    bool rejected = false;
+                    string remark = "";
+                    try
+                    {
+                        admin.ResetOffsetByQueueId(brokerAddr, group, topic, queueId, badTarget);
+                    }
+                    catch (Exception e)
+                    {
+                        rejected = true;
+                        remark = e.Message;
+                    }
+                    Check("resetOffsetByQueueId 越界目标被 broker 拒绝", rejected,
+                        "badTarget=" + badTarget.ToString(CultureInfo.InvariantCulture)
+                        + " " + remark.Substring(0, Math.Min(120, remark.Length)));
+                    bool found = admin.ExamineConsumerOffset(group, mq, out long off);
+                    Check("越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+                        found && off == badTarget,
+                        "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture));
+                }
+                catch (Exception e)
+                {
+                    Check("resetOffsetByQueueId 越界目标被 broker 拒绝", false, e.Message);
+                }
+            }
+
+            // 343 读的是 broker 的 offsetTable（whichTopicByConsumer），组提交过位点才有内容。
+            try
+            {
+                TopicList byBroker = admin.QueryTopicsByConsumerToBroker(brokerAddr, group);
+                Check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
+                    byBroker.Topics.Contains(topic),
+                    "topics=" + byBroker.Topics.Count.ToString(CultureInfo.InvariantCulture));
+                // Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group：按
+                // %RETRY%<group> 路由逐 broker 扇出再合并（Set 语义去重）。
+                TopicList byGroup = admin.QueryTopicsByConsumer(group);
+                Check("queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
+                    byGroup.Topics.Contains(topic),
+                    "topics=" + byGroup.Topics.Count.ToString(CultureInfo.InvariantCulture));
+            }
+            catch (Exception e)
+            {
+                Check("queryTopicsByConsumer", false, e.Message);
             }
         }
 

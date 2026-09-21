@@ -980,7 +980,13 @@ public sealed class DefaultMQAdminExt
         return groups;
     }
 
-    public TopicList QueryTopicsByConsumer(string brokerAddr, string group)
+    /// <summary>
+    /// 对应 Java MQClientAPIImpl#queryTopicsByConsumer:2525（343）的单 broker 原始调用。
+    /// broker 端走 AdminBrokerProcessor#queryTopicsByConsumer:2421 →
+    /// ConsumerOffsetManager#whichTopicByConsumer：**从位点表**（topic@group 键）反查该组
+    /// 消费过哪些 topic，所以组从没提交过位点时回空表，这是预期而不是 bug。
+    /// </summary>
+    public TopicList QueryTopicsByConsumerToBroker(string brokerAddr, string group)
     {
         PropertyMap ext = new() { ["group"] = group };
         RemotingCommand response = RequireClient().InvokeSync(
@@ -988,6 +994,29 @@ public sealed class DefaultMQAdminExt
         var tl = new TopicList();
         if (response.Body.Length > 0) TopicList.Decode(response.Body, out tl);
         return tl;
+    }
+
+    /// <summary>
+    /// 对应 Java DefaultMQAdminExt#queryTopicsByConsumer（DefaultMQAdminExtImpl:1078）：
+    /// 先按 %RETRY%&lt;group&gt; 查路由，再对路由里每个 broker 下发 343 并合并
+    /// （Java 的 TopicList.topicList 是 Set&lt;string&gt;，所以这里同样去重）。
+    /// </summary>
+    public TopicList QueryTopicsByConsumer(string group)
+    {
+        TopicRouteData route = ExamineTopicRoute(MixAll.GetRetryTopic(group));
+        TopicList merged = new();
+        HashSet<string> seen = new();
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length == 0) continue;
+            TopicList part = QueryTopicsByConsumerToBroker(addr, group);
+            foreach (string topic in part.Topics)
+            {
+                if (seen.Add(topic)) merged.Topics.Add(topic);
+            }
+        }
+        return merged;
     }
 
     public JsonValue QuerySubscription(string brokerAddr, string group, string topic)
@@ -1076,7 +1105,6 @@ public sealed class DefaultMQAdminExt
     public SortedDictionary<MessageQueue, long> ResetOffsetByTimestamp(string topic, string group,
         long timestamp, bool isForce = true, string clusterName = "", bool isCpp = true)
     {
-        MQClientInstance client = RequireClient();
         string routeTopic = topic;
         string wheelTimer = MixAll.SystemTopicPrefix + "wheel_timer";
         if (!string.IsNullOrEmpty(topic) &&
@@ -1092,32 +1120,11 @@ public sealed class DefaultMQAdminExt
         {
             string addr = bd.SelectBrokerAddr();
             if (addr.Length == 0) continue;
-            PropertyMap ext = new()
+            // queueId/offset 都传 -1：Java 的"按 timestamp 重置整个 topic"那个重载
+            foreach (var kv in InvokeBrokerToResetOffset(addr, topic, group, timestamp, isForce,
+                         isCpp, -1, -1))
             {
-                ["topic"] = topic,
-                ["group"] = group,
-                ["timestamp"] = I64Str(timestamp),
-                ["force"] = isForce ? "true" : "false",
-                // Java：offset=-1 表示 offset 为空
-                ["offset"] = "-1",
-            };
-            RemotingCommand response = client.InvokeSyncRaw(
-                addr, RequestCode.InvokeBrokerToResetOffset, ext, null, false, _timeoutMillis,
-                isCpp ? LanguageCode.Cpp : -1);
-            if (response.Code == ResponseCode.Success)
-            {
-                if (response.Body.Length > 0)
-                {
-                    if (ResetOffsetBody.Decode(response.Body, out ResetOffsetBody body))
-                    {
-                        foreach (var kv in body.OffsetTable) allOffsets[kv.Key] = kv.Value;
-                    }
-                }
-            }
-            else
-            {
-                throw new MQClientException(
-                    response.Remark.Length == 0 ? "reset offset failed" : response.Remark, response.Code);
+                allOffsets[kv.Key] = kv.Value;
             }
         }
 
@@ -1127,6 +1134,76 @@ public sealed class DefaultMQAdminExt
         }
 
         return allOffsets;
+    }
+
+    /// <summary>
+    /// 一笔 INVOKE_BROKER_TO_RESET_OFFSET(222)，回 broker 实际重置的队列表。
+    ///
+    /// Java 在这里有**两个**重载：不带 queueId 的按 timestamp 重置整个 topic，带
+    /// queueId + offset 的只重置单个队列（MQClientAPIImpl#invokeBrokerToResetOffset）。
+    /// 这里用哨兵值表达"字段为空"：queueId &lt; 0 即 Java 的默认 -1，offset &lt; 0 即
+    /// Java 的"offset=-1 表示 offset 为 null"。
+    /// </summary>
+    private SortedDictionary<MessageQueue, long> InvokeBrokerToResetOffset(string brokerAddr,
+        string topic, string group, long timestamp, bool isForce, bool isCpp, int queueId,
+        long offset)
+    {
+        MQClientInstance client = RequireClient();
+        PropertyMap ext = new()
+        {
+            ["topic"] = topic,
+            ["group"] = group,
+            ["timestamp"] = I64Str(timestamp),
+            ["force"] = isForce ? "true" : "false",
+            // Java：offset=-1 表示 offset 为空
+            ["offset"] = I64Str(offset),
+        };
+        if (queueId >= 0) ext["queueId"] = I64Str(queueId);
+        RemotingCommand response = client.InvokeSyncRaw(
+            brokerAddr, RequestCode.InvokeBrokerToResetOffset, ext, null, false, _timeoutMillis,
+            isCpp ? LanguageCode.Cpp : -1);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(
+                response.Remark.Length == 0 ? "reset offset failed" : response.Remark, response.Code);
+        }
+
+        var offsets = new SortedDictionary<MessageQueue, long>();
+        if (response.Body.Length > 0 &&
+            ResetOffsetBody.Decode(response.Body, out ResetOffsetBody body))
+        {
+            foreach (var kv in body.OffsetTable) offsets[kv.Key] = kv.Value;
+        }
+
+        return offsets;
+    }
+
+    /// <summary>
+    /// 对应 Java DefaultMQAdminExt#resetOffsetByQueueId（DefaultMQAdminExtImpl:1827）：
+    /// **两笔** RPC，缺一不可。
+    /// 1. UpdateConsumerOffset(25) 直接把 offsetTable 改成目标位点；
+    /// 2. 带 queueId + offset 的 222 走 AdminBrokerProcessor#resetOffsetInner，先按
+    ///    [min, max+1] 校验目标位点（越界回 SYSTEM_ERROR
+    ///    "Target offset N not in consume queue range [min-max]"），再
+    ///    ConsumerOffsetManager#assignResetOffset——它同时写 resetOffsetTable（一次性，
+    ///    下次 pull 用 queryThenEraseResetOffset 取走）和 offsetTable，并清掉该队列的 POP
+    ///    在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
+    ///
+    /// Java 返回 void（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
+    ///
+    /// 注意实测（5.5.1 真机）这两笔 RPC **不是原子的**：ConsumerOffsetManager#commitOffset
+    /// 只做覆盖写（offset 变小也只打 [NOTIFYME] warn，不做区间校验），所以第 2 笔被
+    /// resetOffsetInner 以 "Target offset N not in consume queue range" 拒绝时，第 1 笔
+    /// 已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
+    /// </summary>
+    public SortedDictionary<MessageQueue, long> ResetOffsetByQueueId(string brokerAddr,
+        string consumerGroup, string topic, int queueId, long resetOffset)
+    {
+        UpdateConsumerOffsetToBroker(brokerAddr, consumerGroup,
+            new MessageQueue(topic, string.Empty, queueId), resetOffset);
+        // Java 的单队列重载不传 force（默认 false）、timestamp 传 0（位点已给定，不参与算）
+        return InvokeBrokerToResetOffset(brokerAddr, topic, consumerGroup, 0, false, false,
+            queueId, resetOffset);
     }
 
     /// <summary>

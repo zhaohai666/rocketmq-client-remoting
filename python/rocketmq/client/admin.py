@@ -690,12 +690,37 @@ class DefaultMQAdminExt:
         obj = RemotingSerializable.decode_json(response.body)
         return set(obj.get("groupList", []))
 
-    def query_topics_by_consumer(self, broker_addr: str, group: str) -> TopicList:
+    def query_topics_by_consumer_to_broker(self, broker_addr: str, group: str) -> TopicList:
+        """对应 Java `MQClientAPIImpl#queryTopicsByConsumer:2525`（343）的单 broker 原始调用。
+
+        broker 端走 `AdminBrokerProcessor#queryTopicsByConsumer:2421` →
+        `ConsumerOffsetManager#whichTopicByConsumer`：**从位点表**（`topic@group` 键）反查该组
+        消费过哪些 topic。所以组从没提交过位点时回空表，这是预期而不是 bug。
+        """
         response = self._invoke_broker(broker_addr, RequestCode.QUERY_TOPICS_BY_CONSUMER,
                                        {"group": group})
         if not response.body:
             return TopicList()
         return TopicList.decode(response.body)
+
+    def query_topics_by_consumer(self, group: str) -> TopicList:
+        """对应 Java `DefaultMQAdminExt#queryTopicsByConsumer`（`DefaultMQAdminExtImpl:1078`）。
+
+        Java 先按 `%RETRY%<group>` 查路由，再对路由里每个 broker 下发 343 并合并。
+        合并口径对齐 Java 的 `TopicList.topicList`（那是个 `Set<String>`），这里去重后回列表。
+        """
+        route = self.examine_topic_route(MixAll.get_retry_topic(group))
+        result = TopicList()
+        seen: Set[str] = set()
+        for bd in route.get_broker_datas():
+            addr = bd.select_broker_addr()
+            if not addr:
+                continue
+            for topic in self.query_topics_by_consumer_to_broker(addr, group).get_topic_list():
+                if topic not in seen:
+                    seen.add(topic)
+                    result.topic_list.append(topic)
+        return result
 
     def query_subscription(self, broker_addr: str, group: str, topic: str) -> Optional[dict]:
         response = self._invoke_broker(broker_addr, RequestCode.QUERY_SUBSCRIPTION_BY_CONSUMER,
@@ -762,7 +787,6 @@ class DefaultMQAdminExt:
         注意：这里**不再**走「逐队列 searchOffset + updateConsumerOffset」的旧本地实现——
         那不会同步在线消费者，也不会做 broker 端一致性校验。
         """
-        client = self._require_client()
         route_topic = topic
         if topic and (MixAll.is_lmq(topic) or
                       topic == MixAll.SYSTEM_TOPIC_PREFIX + "wheel_timer") and cluster_name:
@@ -773,30 +797,73 @@ class DefaultMQAdminExt:
             addr = bd.select_broker_addr()
             if not addr:
                 continue
-            request = RemotingCommand.create_request_command(
-                RequestCode.INVOKE_BROKER_TO_RESET_OFFSET, None)
-            ext = {
-                "topic": topic,
-                "group": group,
-                "timestamp": timestamp,
-                "force": "true" if is_force else "false",
-                # Java：offset=-1 表示 offset 为空
-                "offset": -1,
-            }
-            for k, v in ext.items():
-                request.ext_fields[k] = str(v)
-            if is_cpp:
-                request.language = LanguageCode.CPP
-            response = client._invoke_sync(addr, request, self.timeout_millis)
-            if response.code == ResponseCode.SUCCESS:
-                if response.body:
-                    all_offsets.update(ResetOffsetBody.decode(response.body).offset_table)
-            else:
-                raise MQClientException(response.remark or "reset offset failed",
-                                        response.code)
+            all_offsets.update(
+                self._invoke_broker_reset_offset(addr, topic, group, timestamp,
+                                                 is_force, is_cpp))
         if not all_offsets:
             raise MQClientException("reset offset failed, no broker returned offset table")
         return all_offsets
+
+    def _invoke_broker_reset_offset(self, broker_addr: str, topic: str, group: str,
+                                    timestamp: int, is_force: bool, is_cpp: bool,
+                                    queue_id: Optional[int] = None,
+                                    offset: Optional[int] = None) -> Dict[MessageQueue, int]:
+        """一笔 `INVOKE_BROKER_TO_RESET_OFFSET`(222)，回 broker 实际重置的队列表。
+
+        Java 在这里有**两个**重载：`invokeBrokerToResetOffset(..., isForce, ...)` 按时间戳
+        重置整个 topic，另一个带 `queueId` + `offset` 的只重置单个队列。`offset` 为 None
+        时按 Java 口径写 `-1`（broker 判成 null，转去按 timestamp 算位点）。
+        """
+        client = self._require_client()
+        request = RemotingCommand.create_request_command(
+            RequestCode.INVOKE_BROKER_TO_RESET_OFFSET, None)
+        ext = {
+            "topic": topic,
+            "group": group,
+            "timestamp": timestamp,
+            "force": "true" if is_force else "false",
+            # Java：offset=-1 表示 offset 为空
+            "offset": -1 if offset is None else offset,
+        }
+        if queue_id is not None:
+            ext["queueId"] = queue_id
+        for k, v in ext.items():
+            request.ext_fields[k] = str(v)
+        if is_cpp:
+            request.language = LanguageCode.CPP
+        response = client._invoke_sync(broker_addr, request, self.timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(response.remark or "reset offset failed", response.code)
+        if not response.body:
+            return {}
+        return ResetOffsetBody.decode(response.body).offset_table
+
+    def reset_offset_by_queue_id(self, broker_addr: str, consumer_group: str, topic: str,
+                                 queue_id: int, reset_offset: int) -> Dict[MessageQueue, int]:
+        """对应 Java `DefaultMQAdminExt#resetOffsetByQueueId`（`DefaultMQAdminExtImpl:1827`）。
+
+        Java 打**两笔** RPC，缺一不可：
+        1. `updateConsumerOffset`(25) 直接把 offsetTable 改成目标位点；
+        2. 带 `queueId` + `offset` 的 222 走 `AdminBrokerProcessor#resetOffsetInner`，
+           先按 `[min, max+1]` 校验目标位点（越界回 SYSTEM_ERROR
+           `Target offset N not in consume queue range [min-max]`），再
+           `ConsumerOffsetManager#assignResetOffset`——它同时写 `resetOffsetTable`（一次性，
+           下次 pull 用 `queryThenEraseResetOffset` 取走）和 `offsetTable`，并清掉该队列的
+           POP 在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
+
+        Java 返回值是 void（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
+
+        ⚠ 实测（5.5.1 真机）这两笔 RPC **不是原子的**：`ConsumerOffsetManager#commitOffset`
+        只做覆盖写（连 offset 变小都只打 `[NOTIFYME]` warn，不做区间校验），所以第 2 笔
+        被 `resetOffsetInner` 以 `Target offset N not in consume queue range [min-max]` 拒绝时，
+        第 1 笔已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
+        """
+        self.update_consumer_offset_to_broker(
+            broker_addr, consumer_group, MessageQueue(topic, "", queue_id), reset_offset)
+        # Java 的单个队列重载不传 force（默认 false）、timestamp 传 0（offset 已给定，不参与算）
+        return self._invoke_broker_reset_offset(
+            broker_addr, topic, consumer_group, 0, False, False,
+            queue_id=queue_id, offset=reset_offset)
 
     def reset_offset_new(self, consumer_group: str, topic: str, timestamp: int) -> None:
         """对应 Java resetOffsetNew：先试新版（broker 端重置），失败再退化到旧版。"""

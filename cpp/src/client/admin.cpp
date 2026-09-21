@@ -804,8 +804,8 @@ std::set<std::string> DefaultMQAdminExt::queryTopicConsumeByWho(const std::strin
     return groups;
 }
 
-TopicList DefaultMQAdminExt::queryTopicsByConsumer(const std::string& brokerAddr,
-                                                  const std::string& group) {
+TopicList DefaultMQAdminExt::queryTopicsByConsumerToBroker(const std::string& brokerAddr,
+                                                          const std::string& group) {
     PropertyMap ext;
     ext["group"] = group;
     RemotingCommand response = requireClient().invokeSync(
@@ -813,6 +813,23 @@ TopicList DefaultMQAdminExt::queryTopicsByConsumer(const std::string& brokerAddr
     TopicList tl;
     if (!response.body.empty()) TopicList::decode(response.body, tl);
     return tl;
+}
+
+TopicList DefaultMQAdminExt::queryTopicsByConsumer(const std::string& group) {
+    // 对应 Java DefaultMQAdminExtImpl:1078：按 %RETRY%<group> 查路由，逐 broker 下发 343 合并
+    TopicRouteData route = examineTopicRoute(MixAll::getRetryTopic(group));
+    TopicList merged;
+    for (const BrokerData& bd : route.brokerDatas) {
+        std::string addr = bd.selectBrokerAddr();
+        if (addr.empty()) continue;
+        TopicList part = queryTopicsByConsumerToBroker(addr, group);
+        for (const std::string& topic : part.topicList) {
+            // Java 侧 TopicList.topicList 是 Set<String>，这里等价地去重
+            if (merged.contains(topic)) continue;
+            merged.topicList.push_back(topic);
+        }
+    }
+    return merged;
 }
 
 JsonValue DefaultMQAdminExt::querySubscription(const std::string& brokerAddr,
@@ -900,6 +917,35 @@ void DefaultMQAdminExt::updateConsumerOffsetToBroker(const std::string& brokerAd
     requireClient().updateConsumerOffset(consumerGroup, mq, offset, 5000, brokerAddr);
 }
 
+std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffset(
+    const std::string& brokerAddr, const std::string& topic, const std::string& group,
+    int64_t timestamp, bool isForce, bool isCpp, int32_t queueId, int64_t offset) {
+    MQClientInstance& client = requireClient();
+    PropertyMap ext;
+    ext["topic"] = topic;
+    ext["group"] = group;
+    ext["timestamp"] = i64str(timestamp);
+    ext["force"] = isForce ? "true" : "false";
+    // Java：offset=-1 表示 offset 为空
+    ext["offset"] = i64str(offset);
+    if (queueId >= 0) ext["queueId"] = i64str(queueId);
+    RemotingCommand response = client.invokeSyncRaw(
+        brokerAddr, RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, ext, Bytes(), false, timeoutMillis_,
+        isCpp ? LanguageCode::CPP : -1);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(response.remark.empty() ? "reset offset failed" : response.remark,
+                                response.code);
+    }
+    std::map<MessageQueue, int64_t> offsets;
+    if (!response.body.empty()) {
+        ResetOffsetBody body;
+        if (ResetOffsetBody::decode(response.body, body)) {
+            for (const auto& kv : body.offsetTable) offsets[kv.first] = kv.second;
+        }
+    }
+    return offsets;
+}
+
 std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
     const std::string& topic, const std::string& group, int64_t timestamp, bool isForce,
     const std::string& clusterName, bool isCpp) {
@@ -908,7 +954,6 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
     //
     // 注意：这里**不再**走"逐队列 searchOffset + updateConsumerOffset"的旧本地实现——
     // 那不会同步在线消费者，也不会做 broker 端一致性校验。
-    MQClientInstance& client = requireClient();
     std::string routeTopic = topic;
     std::string wheelTimer = std::string(MixAll::SYSTEM_TOPIC_PREFIX) + "wheel_timer";
     if (!topic.empty() && (MixAll::isLmq(topic) || topic == wheelTimer) && !clusterName.empty()) {
@@ -920,32 +965,38 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
     for (const BrokerData& bd : route.brokerDatas) {
         std::string addr = bd.selectBrokerAddr();
         if (addr.empty()) continue;
-        PropertyMap ext;
-        ext["topic"] = topic;
-        ext["group"] = group;
-        ext["timestamp"] = i64str(timestamp);
-        ext["force"] = isForce ? "true" : "false";
-        // Java：offset=-1 表示 offset 为空
-        ext["offset"] = "-1";
-        RemotingCommand response = client.invokeSyncRaw(
-            addr, RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, ext, Bytes(), false, timeoutMillis_,
-            isCpp ? LanguageCode::CPP : -1);
-        if (response.code == ResponseCode::SUCCESS) {
-            if (!response.body.empty()) {
-                ResetOffsetBody body;
-                if (ResetOffsetBody::decode(response.body, body)) {
-                    for (const auto& kv : body.offsetTable) allOffsets[kv.first] = kv.second;
-                }
-            }
-        } else {
-            throw MQClientException(response.remark.empty() ? "reset offset failed" : response.remark,
-                                    response.code);
+        // queueId=-1 / offset=-1：Java 的"按 timestamp 重置整个 topic"那个重载
+        for (const auto& kv : invokeBrokerToResetOffset(
+                 addr, topic, group, timestamp, isForce, isCpp, -1, -1)) {
+            allOffsets[kv.first] = kv.second;
         }
     }
     if (allOffsets.empty()) {
         throw MQClientException("reset offset failed, no broker returned offset table");
     }
     return allOffsets;
+}
+
+std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByQueueId(
+    const std::string& brokerAddr, const std::string& consumerGroup, const std::string& topic,
+    int32_t queueId, int64_t resetOffset) {
+    // 对应 Java DefaultMQAdminExt#resetOffsetByQueueId（DefaultMQAdminExtImpl:1827）：
+    // 两笔 RPC 缺一不可。
+    // 1) updateConsumerOffset(25) 直接把 offsetTable 改成目标位点；
+    // 2) 带 queueId + offset 的 222 走 AdminBrokerProcessor#resetOffsetInner，先按
+    //    [min, max+1] 校验（越界回 SYSTEM_ERROR "Target offset N not in consume queue
+    //    range [min-max]"），再 ConsumerOffsetManager#assignResetOffset —— 它同时写
+    //    resetOffsetTable（一次性，下次 pull 用 queryThenEraseResetOffset 取走）和
+    //    offsetTable，并清掉该队列的 POP 在途计数。只做第 1 步的话在线消费者仍按自己
+    //    内存里的位点继续拉。
+    // 实测（5.5.1 真机）两笔 RPC **不是原子的**：ConsumerOffsetManager#commitOffset 只做
+    //    覆盖写（offset 变小也只打 [NOTIFYME] warn，不做区间校验），所以第 2 笔被拒时，
+    //    第 1 笔已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
+    updateConsumerOffsetToBroker(brokerAddr, consumerGroup,
+                                 MessageQueue(topic, "", queueId), resetOffset);
+    // Java 的单队列重载不传 force（默认 false），timestamp 传 0（位点已给定、不参与计算）
+    return invokeBrokerToResetOffset(brokerAddr, topic, consumerGroup, 0, false, false,
+                                     queueId, resetOffset);
 }
 
 void DefaultMQAdminExt::resetOffsetNew(const std::string& consumerGroup,
