@@ -15,7 +15,7 @@
 //       （broker 按 REPLY_TO_CLIENT 找到请求方连接）   broker 走 SEND_REPLY_MESSAGE_V2(325)
 //
 // 两个关键点（错了真机就不通）：
-// 1. 应答消息必须带 MSG_TYPE == "reply"，发送时据此把请求码从 SEND_MESSAGE_V2(314)
+// 1. 应答消息必须带 MSG_TYPE == "reply"，发送时据此把请求码从 SEND_MESSAGE_V2(310)
 //    换成 SEND_REPLY_MESSAGE_V2(325)；broker 的 ReplyMessageProcessor 只在 324/325 注册。
 // 2. REPLY_TO_CLIENT 是请求方的 clientId，broker 靠它在 producerManager 里反查 channel
 //    才能把应答推回——所以请求方必须先发过心跳（已注册为 producer）。

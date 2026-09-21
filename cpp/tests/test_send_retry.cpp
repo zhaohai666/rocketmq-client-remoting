@@ -355,6 +355,7 @@ private:
             }
         } else if (req.code == RequestCode::SEND_MESSAGE_V2
                    || req.code == RequestCode::SEND_MESSAGE
+                   || req.code == RequestCode::SEND_BATCH_MESSAGE
                    || req.code == RequestCode::SEND_REPLY_MESSAGE_V2) {
             const int idx = sendCount_.fetch_add(1);
             {
@@ -789,6 +790,60 @@ void testUnitModeReachesWire(MockEndpoint& mock) {
     }
 }
 
+// 8b. 发送请求码的三级判据（Java `MQClientAPIImpl#sendMessage:550-563`）：先判
+// isReply ⇒ 325，再判「这条消息是不是批量」⇒ SEND_BATCH_MESSAGE(320)，否则 310。
+//
+// 请求码与 V2 头的单字母键 `m`（batch）是两件事：broker 按 `m` 选 sendBatchMessage
+// 还是单条写入（`SendMessageProcessor:117` 读 requestHeader.isBatch()），码只影响
+// 服务端按码归类（proxy `AbstractRemotingActivity:69` 与 auth
+// `DefaultAuthorizationContextBuilder:230-240` 都把 310/320 列在同一个 case 里）。
+// 所以两个都要取证：只对齐码不对齐 `m`，批量 body 会被按单条解析。
+void testSendRequestCodeFollowsJava(MockEndpoint& mock) {
+    const std::string topic = "SendRetryCodeBranch";
+    mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
+
+    {
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_code_single");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("code-single");
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expectInt(rec.code, RequestCode::SEND_MESSAGE_V2, "single send goes out as 310");
+        expect(rec.ext.count("m") > 0 && rec.ext.at("m") == "false", "single -> batch key m=false");
+        p.shutdown();
+    }
+    {
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_code_batch");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("code-batch");
+        p.start();
+        p.sendBatch({plainMessage(topic), plainMessage(topic)}, 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expectInt(rec.code, RequestCode::SEND_BATCH_MESSAGE, "batch send goes out as 320");
+        expect(rec.ext.count("m") > 0 && rec.ext.at("m") == "true", "batch -> batch key m=true");
+        p.shutdown();
+    }
+    {
+        // reply 判在 batch 之前：带 MSG_TYPE=reply 的批量仍然走 325。
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_code_reply");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("code-reply");
+        p.start();
+        MessageBatch batch = MessageBatch::generateFromList({plainMessage(topic)});
+        batch.properties[MessageConst::PROPERTY_MESSAGE_TYPE] = MixAll::REPLY_MESSAGE_FLAG;
+        p.send(batch, 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expectInt(rec.code, RequestCode::SEND_REPLY_MESSAGE_V2, "reply wins over batch: 325");
+        expect(rec.ext.count("m") > 0 && rec.ext.at("m") == "true",
+               "reply batch still carries batch key m=true");
+        p.shutdown();
+    }
+}
+
 // 9. 请求钩子的**上线**取证。钩子是在报文编码前的最后一刻才改写 extFields 的，本地断言
 // 看不到结果；而 lite 消费者曾经绕过 composeRequestHooks 直接注册用户钩子，让 `ReqT`
 // 静默漏发（test_acl 锁的是钩子自身的组合与顺序，锁不住 facade 有没有用它）。
@@ -920,6 +975,7 @@ int main() {
     runCase("errorCodeMapping", mock, testErrorCodeMapping);
     runCase("faultItemFlags", mock, testFaultItemFlags);
     runCase("unitModeReachesWire", mock, testUnitModeReachesWire);
+    runCase("sendRequestCodeFollowsJava", mock, testSendRequestCodeFollowsJava);
     runCase("requestHooksReachWire", mock, testRequestHooksReachWire);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);

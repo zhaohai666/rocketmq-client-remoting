@@ -5,7 +5,8 @@
 1. 纯数据/等待槽逻辑（``RequestResponseFuture`` / ``RequestFutureHolder`` /
    ``create_reply_message``）—— 不需要网络；
 2. 线上编码：应答消息必须选 ``SEND_REPLY_MESSAGE_V2(325)`` 而不是
-   ``SEND_MESSAGE_V2(314)``，否则 broker 不会走 ReplyMessageProcessor；
+   ``SEND_MESSAGE_V2(310)``，否则 broker 不会走 ReplyMessageProcessor；批量消息选
+   ``SEND_BATCH_MESSAGE(320)``，与 Java ``msg instanceof MessageBatch`` 同判据。
 3. broker 回推入口 ``MQClientInstance._process_reply_message(326)`` —— 必须把应答
    投进等待槽，并且**回一个响应**（broker 侧是 invokeSync，不回响应它那边会超时）。
 """
@@ -21,7 +22,7 @@ from rocketmq.client.request_reply import (REQUEST_FUTURE_HOLDER, RequestFutureH
                                             RequestResponseFuture, create_correlation_id,
                                             create_reply_message, is_reply_message)
 from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageQueue
+from rocketmq.common.message import Message, MessageBatch, MessageQueue
 from rocketmq.common.message_const import MessageConst
 from rocketmq.common.message_decoder import message_properties_2_string
 from rocketmq.common.mix_all import MixAll
@@ -153,6 +154,39 @@ def test_normal_send_still_uses_send_message_v2():
     req = inst._build_send_request("PG_RR", msg, MessageQueue(BASE_TOPIC, "broker-a", 0))
     assert req.code == RequestCode.SEND_MESSAGE_V2
     assert req.code != RequestCode.SEND_REPLY_MESSAGE_V2
+    req.make_custom_header_to_net()
+    assert req.ext_fields["m"] == "false"
+
+
+def test_batch_send_uses_send_batch_message_code():
+    """对齐 Java MQClientAPIImpl.sendMessage:562 —— 判据是 msg instanceof MessageBatch，
+    批量走 SEND_BATCH_MESSAGE(320)。
+
+    同时断言 V2 头的单字母键 ``m``（Java 里 batch 映射到 m，
+    SendMessageRequestHeaderV2:127）必须是 true：broker 真正决定「按批量写入还是单条
+    写入」的是这个字段（SendMessageProcessor:117 读 requestHeader.isBatch()），
+    请求码只影响服务端按码做的统计/鉴权归类。两者不一致时 broker 会按单条解析批量
+    body，所以必须成对断言。
+    """
+    inst = _make_instance()
+    batch = MessageBatch.generate_from_list(
+        [Message(BASE_TOPIC, ("b-%d" % i).encode("utf-8")) for i in range(3)])
+    req = inst._build_send_request("PG_RR", batch, MessageQueue(BASE_TOPIC, "broker-a", 0))
+    assert req.code == RequestCode.SEND_BATCH_MESSAGE
+    req.make_custom_header_to_net()
+    assert req.ext_fields["m"] == "true"
+
+
+def test_reply_wins_over_batch_in_the_send_code():
+    """Java MQClientAPIImpl:552-563 先判 isReply 再判 instanceof MessageBatch，
+    所以「带 reply 属性的批量」仍然走 325 —— 判据顺序不能写反。"""
+    inst = _make_instance()
+    batch = MessageBatch.generate_from_list([Message(BASE_TOPIC, b"r-0")])
+    batch.put_property(MessageConst.PROPERTY_MESSAGE_TYPE, MixAll.REPLY_MESSAGE_FLAG)
+    req = inst._build_send_request("PG_RR", batch, MessageQueue(BASE_TOPIC, "broker-a", 0))
+    assert req.code == RequestCode.SEND_REPLY_MESSAGE_V2
+    req.make_custom_header_to_net()
+    assert req.ext_fields["m"] == "true"
 
 
 # ---------------------------------------------------------------- broker 回推入口 326

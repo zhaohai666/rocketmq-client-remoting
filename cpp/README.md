@@ -53,7 +53,7 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 27 个用例，2602 项断言，~16s
+cd build && ctest --output-on-failure     # 27 个用例，2606 项断言，~17s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -68,7 +68,7 @@ cd build && ctest --output-on-failure     # 27 个用例，2602 项断言，~16s
 | `acl` | 37 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
 | `request_reply` | 37 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时 |
 | `latency` | 31 | 故障规避：延迟窗口滑窗统计、可用性判定、broker 隔离与恢复、`sendLatencyFaultEnable` 开关 |
-| `send_retry` | 35 | `sendDefaultImpl` 重试分类语义（进程内 mock 集群 + 真 socket）：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离 |
+| `send_retry` | 57 | `sendDefaultImpl` 重试分类语义（进程内 mock 集群 + 真 socket）：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离；同一套抓包还取证明线上报文（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据） |
 | `pop` | 93 | POP 协议管道：CK 反构（8 段 + `startOffsetInfo`/`msgOffsetInfo` 下标选择）、`bornTime`、ACK offset 语义 |
 | `pop_consumer` | 47 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制 |
 | `trace` | 92 | 消息轨迹：与 Java 官方实现的**逐字节对拍**（Pub / SubBefore / SubAfter / EndTransaction / Recall）+ 编解码双向 + 无 keys 空段容错 + 坏记录隔离 + 分发器分组/切块 |
@@ -121,7 +121,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
-| `rmq_live_message_types` | 12/12 | 异步发送 / 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 心跳注册 |
+| `rmq_live_message_types` | 19/19 | 异步发送 / 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 批量发送（320，投成 3 条独立消息且 offset 连续）/ 心跳注册 |
 | `rmq_admin_live` | 47 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → 清理 |
 | `rmq_compression_live` | 10 PASS | 三后端（zlib / LZ4 Frame / ZSTD）自动压缩自产自销 + **与真实 Java/Python/.NET/Rust 客户端双向互通**（互通矩阵见 `../scripts/compression_matrix.sh`）；构建时未编入的后端打 SKIP |
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
@@ -216,6 +216,17 @@ Java 的 rpcHook 是随 `MQClientAPIImpl` 构造进去的，实例第一笔报�
 （真 socket 上取证的 `k` / `ReqT`，并用 broker 侧算法重放验签）+
 `examples/live_unit_config.cpp`（真 broker 的 topic `sysFlag` UNIT=0x1 / UNIT_SUB=0x2、
 broker 记录的 clientId）。
+
+**批量发送的请求码是 320，不是 310。** `sendRequestCode()`（`src/client/mq_client.cpp`）
+按 Java `MQClientAPIImpl:550-563` 的三级判据走：先 `isReplyMessage` ⇒ 325，再 `msg.isBatch`
+⇒ `SEND_BATCH_MESSAGE(320)`，否则 `SEND_MESSAGE_V2(310)`。注意请求码与 V2 头的单字母键 `m`
+（batch）是两件事：broker 按 `m` 选 `sendBatchMessage` 还是单条写入
+（`SendMessageProcessor:117` 读 `requestHeader.isBatch()`），码只影响服务端按码归类
+（proxy `AbstractRemotingActivity:69` 与 auth `DefaultAuthorizationContextBuilder:230-240`
+把 310/320 列在同一个 case 里）—— 所以对齐 320 不是修 bug，是请求码这一层也与 Java 一致，
+两个字段必须成对取证。回归：`tests/test_send_retry.cpp`（`sendRequestCodeFollowsJava`，
+真 socket 上取 `code` + `m`）+ `examples/live_message_types.cpp` 第 8 项（真 broker 把批量
+投成 3 条独立消息、`queueOffset` 连续 0,1,2）。
 
 **消息轨迹的解码器比 Java 更健壮。** Java `TraceDataEncoder` 对无 keys 消息的 `SubBefore`
 会 `line[7]` 越界抛 `ArrayIndexOutOfBoundsException`（**5.5.1 上游真实缺陷**，已复现），

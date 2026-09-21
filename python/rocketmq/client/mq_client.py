@@ -622,11 +622,17 @@ class MQClientInstance:
         header.max_reconsume_times = None
         header.batch = isinstance(msg, MessageBatch)
         # Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
-        # 而不是普通的 SEND_MESSAGE_V2(314)。broker 只在 324/325 上注册了
+        # 而不是普通的 SEND_MESSAGE_V2(310)。broker 只在 324/325 上注册了
         # ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT 把应答推回请求方）。
-        # 对齐 Java MQClientAPIImpl.sendMessage:550-558（sendSmartMsg 默认 true → V2）。
-        code = (RequestCode.SEND_REPLY_MESSAGE_V2 if is_reply_message(msg)
-                else RequestCode.SEND_MESSAGE_V2)
+        # 批量消息走 SEND_BATCH_MESSAGE(320)：Java 的判据是 msg instanceof MessageBatch
+        # （MQClientAPIImpl:562），先判 reply 再判 batch。
+        # 对齐 Java MQClientAPIImpl.sendMessage:550-563（sendSmartMsg 默认 true → V2）。
+        if is_reply_message(msg):
+            code = RequestCode.SEND_REPLY_MESSAGE_V2
+        elif header.batch:
+            code = RequestCode.SEND_BATCH_MESSAGE
+        else:
+            code = RequestCode.SEND_MESSAGE_V2
         request = RemotingCommand.create_request_command(code, header)
         request.body = self._encode_body(msg)
         return request

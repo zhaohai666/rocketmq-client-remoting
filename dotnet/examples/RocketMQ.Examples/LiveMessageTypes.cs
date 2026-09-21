@@ -1,6 +1,6 @@
 // C# 客户端的**真实集群**消息类型联调（对应 cpp/examples/live_message_types.cpp）。
 //
-// 覆盖 7 类消息能力，全部打真实 nameServer + broker：
+// 覆盖 8 类消息能力，全部打真实 nameServer + broker：
 //   1. 异步发送（sendAsync + SendCallback）
 //   2. 顺序消息（sendBySelector 同 key 落同队列 + 顺序消费保序）
 //   3. 带 Tag 消息 + 服务端 Tag 过滤
@@ -8,6 +8,7 @@
 //   5. 延迟消息（setDelayTimeLevel 并校验 store_ts - born_ts >= 3000ms）
 //   6. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
 //   7. 事务消息（两阶段的提交路径；完整链路见 RunTransaction）+ 落库可消费
+//   8. 批量消息（SendBatch → SEND_BATCH_MESSAGE(320)，broker 按 N 条独立消息投递、offset 连续）
 //   附：消费者心跳注册（HEART_BEAT）
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
@@ -520,6 +521,61 @@ internal static class LiveMessageTypes
                 "checkLocalTransaction_calls=" + checks.ToString(CultureInfo.InvariantCulture));
             Check("事务-UNKNOW 回查后最终投递", consumed,
                 "received=" + run.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // ---------- 8. 批量消息（SEND_BATCH_MESSAGE 320）----------
+        // 请求码从 310 换成 320 之后，要在真 broker 上重新证明它确实按「批量写入」处理：
+        // 判据是消费侧收到 N 条**各自完整**的消息且 queueOffset 连续。若 broker 把批量
+        // body 当单条存（header.batch 没生效），这里只会收到 1 条拼接字节的消息。
+        {
+            string topic = _gPrefix + "_Batch";
+            bool batchOk;
+            string detail;
+            try
+            {
+                var group = new List<Message>();
+                for (int i = 0; i < 3; ++i)
+                {
+                    group.Add(new Message(topic, Str2Bytes("batch-" + i.ToString(CultureInfo.InvariantCulture))));
+                }
+
+                SendResult sr = prod.SendBatch(group, 5000);
+                batchOk = sr.SendStatus == SendStatus.SendOk;
+                detail = "status=" + sr.SendStatus;
+            }
+            catch (Exception e)
+            {
+                batchOk = false;
+                detail = "throw: " + e.Message;
+            }
+
+            Check("批量发送 SendBatch(3 条)", batchOk, detail);
+
+            List<MessageExt> msgs = RunConsumer(topic, "*", 15, false, "batch", expect: 3);
+            var bodies = new HashSet<string>();
+            var offsets = new List<long>();
+            foreach (MessageExt m in msgs)
+            {
+                bodies.Add(Bytes2Str(m.Body));
+                offsets.Add(m.QueueOffset);
+            }
+
+            offsets.Sort();
+            bool contiguous = offsets.Count == 3;
+            for (int i = 1; i < offsets.Count; ++i)
+            {
+                if (offsets[i] != offsets[i - 1] + 1) contiguous = false;
+            }
+
+            bool exact = true;
+            for (int i = 0; i < 3; ++i)
+            {
+                if (!bodies.Contains("batch-" + i.ToString(CultureInfo.InvariantCulture))) exact = false;
+            }
+
+            Check("批量消息被 broker 按 3 条独立消息投递", exact && contiguous,
+                "received=" + msgs.Count.ToString(CultureInfo.InvariantCulture)
+                + " offsets=" + string.Join(",", offsets));
         }
 
         // ---------- 附：心跳注册 ----------

@@ -199,8 +199,8 @@ public class SendRetryTests
         }
 
         /// <summary>
-        /// 第一笔**发送**请求的取证（V1/V2/批量/应答都算）：本端口按 Java sendSmartMsg 默认发
-        /// SendMessageV2(310)，写死 SendMessage(10) 会永远抓不到。
+        /// 第一笔**发送**请求的取证：本端口按 Java 的三级判据发 SendMessageV2(310) /
+        /// SendBatchMessage(320) / SendReplyMessageV2(325)，写死某一个码会永远抓不到。
         /// </summary>
         public WireRecord? FirstSendRequest()
         {
@@ -759,6 +759,48 @@ public class SendRetryTests
             Assert.False(cluster.AnyRequestHas(RequestCode.HeartBeat, MixAll.ReqT));
             consumer.Shutdown();
         }
+    }
+
+    /// <summary>
+    /// 发送请求码的三级判据（Java MQClientAPIImpl#sendMessage:550-563）：先判 isReply
+    /// ⇒ 325，再判「这条消息是不是批量」⇒ SendBatchMessage(320)，否则 310。
+    ///
+    /// ⚠ 请求码与 V2 头的单字母键 <c>m</c>（batch）是两件事：broker 按 <c>m</c> 选
+    /// sendBatchMessage 还是单条写入（SendMessageProcessor:117 读 requestHeader.isBatch()），
+    /// 码只影响服务端按码归类（proxy AbstractRemotingActivity:69 与 auth
+    /// DefaultAuthorizationContextBuilder:230-240 都把 310/320 列在同一个 case 里）。
+    /// 所以两个都取证：只对码不对 <c>m</c>，批量 body 会被按单条解析。
+    /// </summary>
+    [Fact]
+    public void SendRequestCodeFollowsJava()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQProducer producer = Started(cluster, "GID_SendCodeBranch");
+
+        cluster.ClearRequests();
+        Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
+        WireRecord single = cluster.FirstSendRequest()!;
+        Assert.Equal(RequestCode.SendMessageV2, single.Code);
+        Assert.Equal("false", single.Ext["m"]);
+
+        cluster.ClearRequests();
+        Assert.Equal(SendStatus.SendOk,
+            producer.SendBatch(new List<Message> { Msg(), Msg() }).SendStatus);
+        WireRecord batch = cluster.FirstSendRequest()!;
+        Assert.Equal(RequestCode.SendBatchMessage, batch.Code);
+        Assert.Equal("true", batch.Ext["m"]);
+
+        // reply 判在 batch 之前：带 MSG_TYPE=reply 的批量仍然走 325。
+        cluster.ClearRequests();
+        Message replyBatch = Msg();
+        replyBatch.IsBatch = true;
+        replyBatch.Properties[MessageConst.PropertyMessageType] = MixAll.REPLY_MESSAGE_FLAG;
+        Assert.Equal(SendStatus.SendOk, producer.Send(replyBatch).SendStatus);
+        WireRecord reply = cluster.FirstSendRequest()!;
+        Assert.Equal(RequestCode.SendReplyMessageV2, reply.Code);
+        Assert.Equal("true", reply.Ext["m"]);
+
+        producer.Shutdown();
     }
 
     /// <summary>

@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 701 条单元/协议测试（697 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 725 条单元/协议测试（721 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -207,6 +207,25 @@ bit0 = 响应类型（RPC_TYPE）      bit1 = oneway（RPC_ONEWAY）
   早期实现两层都错：`_decompress` 直接 `return data` 透传，于是 `decode_message` 会返回一条
   body 是压缩字节、而 `COMPRESSED_FLAG` 已被清掉的消息 —— 事后完全无法识别。已修并有回归测试。
 - `zlib` 是 Python 标准库，解压路径无需额外依赖；`lz4`/`zstd` 未安装时**抛错**而非静默降级。
+
+## 发送请求码：310 / 320 / 325
+
+`_build_send_request` 的判据与 Java `MQClientAPIImpl.sendMessage:550-563` 一致，三条分支
+都要在线上报文取证（`tests/test_request_reply.py`）：
+
+| 消息 | 请求码 | V2 头 `m`(batch) |
+| --- | --- | --- |
+| 普通 | `SEND_MESSAGE_V2(310)` | `false` |
+| `MessageBatch` | `SEND_BATCH_MESSAGE(320)` | `true` |
+| `MSG_TYPE == "reply"` | `SEND_REPLY_MESSAGE_V2(325)` | 视是否批量 |
+
+两点容易搞混：**判据顺序**先 reply 再批量（Java 就是先 `isReply`），带 reply 属性的批量
+仍走 325；**请求码与 `m` 是两件事** —— broker 靠 `m` 决定走 `sendBatchMessage` 还是单条
+写入（`SendMessageProcessor:117` 读 `requestHeader.isBatch()`），请求码只影响服务端按码
+归类（proxy `AbstractRemotingActivity:69`、auth
+`DefaultAuthorizationContextBuilder:230-240` 把 310/320 列在同一个 case 里）。所以两个
+必须成对断言，只改码不改 `m` 会让批量 body 被按单条解析。真机侧由
+`verify_live_clean.py` 的「批量发送 3 条」+ 消费计数对账覆盖。
 
 ## License
 

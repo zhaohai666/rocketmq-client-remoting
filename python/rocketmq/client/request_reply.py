@@ -22,7 +22,7 @@
 
 两个关键点（错了真机就不通）：
 1. 应答消息必须带 ``MSG_TYPE == "reply"``，客户端发送时据此把请求码从
-   ``SEND_MESSAGE_V2(314)`` 换成 ``SEND_REPLY_MESSAGE_V2(325)``；
+   ``SEND_MESSAGE_V2(310)`` 换成 ``SEND_REPLY_MESSAGE_V2(325)``；
    broker 的 ``ReplyMessageProcessor`` 只在 324/325 上注册。
 2. ``REPLY_TO_CLIENT`` 是**请求方的 clientId**，broker 用它在 producerManager 里
    反查 channel 才能把应答推回来 —— 所以请求方必须发过心跳（已注册为 producer）。

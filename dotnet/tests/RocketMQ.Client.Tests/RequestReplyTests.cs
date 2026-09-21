@@ -4,7 +4,7 @@
 // 1. 纯数据/等待槽逻辑（RequestResponseFuture / RequestFutureHolder /
 //    create_reply_message）—— 不需要网络；
 // 2. 线上编码：应答消息必须选 SEND_REPLY_MESSAGE_V2(325) 而不是
-//    SEND_MESSAGE_V2(314)，否则 broker 不会走 ReplyMessageProcessor；
+//    SEND_MESSAGE_V2(310)，否则 broker 不会走 ReplyMessageProcessor；
 // 3. broker 回推入口 MQClientInstance.ProcessReplyMessage(326) —— 必须把应答
 //    投进等待槽，并且**回一个响应**（broker 侧是 invokeSync，不回响应它那边会超时）。
 using System;

@@ -726,7 +726,8 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>
     /// 组装发送请求（对应 Java MQClientAPIImpl.sendMessage 的头部拼装 + V2 选择）。
     /// Request-Reply 的应答消息（MSG_TYPE == "reply"）会用 SEND_REPLY_MESSAGE_V2(325)
-    /// 而不是普通 SEND_MESSAGE_V2(314)——broker 只在 324/325 上注册了 ReplyMessageProcessor。
+    /// 而不是普通 SEND_MESSAGE_V2(310)——broker 只在 324/325 上注册了 ReplyMessageProcessor。
+    /// 批量消息（msg.IsBatch）用 SEND_BATCH_MESSAGE(320)，与 Java 的 msg instanceof MessageBatch 同判据。
     /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
     /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
     /// </summary>
@@ -756,10 +757,23 @@ public sealed class MQClientInstance : IDisposable
             Batch = msg.IsBatch,
         };
 
-        // 对应 Java MQClientAPIImpl.sendMessage:550-558（sendSmartMsg 默认 true → V2）。
-        int code = RequestReply.IsReplyMessage(msg)
-            ? RequestCode.SendReplyMessageV2
-            : RequestCode.SendMessageV2;
+        // 对应 Java MQClientAPIImpl.sendMessage:550-563（sendSmartMsg 默认 true → V2）：
+        // 先判应答消息，再判批量 —— Java 的批量判据是 msg instanceof MessageBatch。
+        // 服务端对 310/320 的处理其实是同一条路：broker 两种码都解码成 V2 头
+        // （SendMessageRequestHeader.parseRequestHeader:185-202）、由 header.batch 决定
+        // 走 sendBatchMessage（SendMessageProcessor:117）；proxy 的 SendMessageActivity:49-52
+        // 与 auth 的 DefaultAuthorizationContextBuilder:230-240 都把两者列在同一个 case 里。
+        // 所以这里改成 320 不是修 bug，是为了在请求码这一层也和 Java 一致 ——
+        // 服务端按码做限流/统计/鉴权策略时不会把我们的批量当成单条发送。
+        int code;
+        if (RequestReply.IsReplyMessage(msg))
+        {
+            code = RequestCode.SendReplyMessageV2;
+        }
+        else
+        {
+            code = msg.IsBatch ? RequestCode.SendBatchMessage : RequestCode.SendMessageV2;
+        }
 
         RemotingCommand request = RemotingCommand.CreateRequestCommand(code, header);
         request.Body = msg.Body;

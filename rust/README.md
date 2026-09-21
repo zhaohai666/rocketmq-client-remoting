@@ -49,24 +49,24 @@ Windows / MSVC 分支。
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 653 条，~0.3s
+cargo test --lib               # 660 条，~1s
 ```
 
 ## 单元测试
 
-653 条按模块分布（`cargo test --lib -- --list` 可复算）：
+660 条按模块分布（`cargo test --lib -- --list` 可复算）：
 
 | 模块 | 条数 | 覆盖 |
 | --- | --- | --- |
 | `remoting::protocol` | 105 | header 字段名表逐个与 Java 对拍（错一个字母就静默丢字段）、`codes` 常量守卫、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody` 等 body、POP `extraInfo` 8 段反构、JSON 对 fastjson2 非标准输出的容忍（裸数字键、对象 key、NaN/Infinity、尾逗号）、RocketMQ 二进制往返、`RecallMessageRequestHeader` 的 **`bname`** 键名守卫 |
 | `remoting::client` | 16 | 真 socket 回环：同步/异步/oneway、半包重组、并发请求各自匹配 opaque、静默超时、建连失败与坏端口、`close_channel` 强制重连、**GO_AWAY 重连后只重发一次**（第三次不陷入死循环、关掉开关则直接抛）、broker 推送抵达 processor、RPC 钩子在编码前执行、地址切分与帧长守卫 |
-| `remoting::rpchook` | 4 | ACL 签名：extFields 按 key 字典序、只拼 value、跳过 `Signature`、再拼 body，与 Java 官方向量对拍 |
+| `remoting::rpchook` | 6 | ACL 签名：extFields 按 key 字典序、只拼 value、跳过 `Signature`、再拼 body，与 Java 官方向量对拍 |
 | `common::message_decoder` | 38 | 17 段 / 6 段两条编码路径（切勿混用）、压缩段的 crc32（Java `& 0x7FFFFFFF`）、批量消息、坏数据必须拒收 |
 | `common::consistent_hash` | 8 | 环：MD5 摘要**只取前 4 字节大端**、虚拟节点 key 从 `existingReplicas` 起算、`tailMap` **含端点**、越过环末尾回绕、空环返回 `None`、负虚拟节点数只在构造处报错 |
 | `common::compression` | 7 | 三后端往返 + 类型解析（含 Java 的 `0→ZLIB` 兼容映射）；未支持类型必须抛错而不是透传压缩字节 |
 | `common::recall_message_handle` | 6 | 定时消息撤回句柄 v1：与 Java `buildHandle` 的**真值向量**对拍（带 `=` 填充）、无填充句柄也能解（跨客户端撤回）、6 段新版本忽略尾段、空串/坏 base64/非法 utf-8/`v2`/段数不足一律 Java 文案 `recall handle is invalid` |
 | `common` 其余 | 74 | `message` / `message_const` / `message_type` / `message_client_id_setter`、`mix_all`（含 `%NS%` 前缀与 `build_mq_client_id` / `change_instance_name_to_pid` 的 clientId 口径）、`sysflag`、`util_all`（14 位墙钟、`nano_time`、`is_blank`）、`topic_config`、`topic_validator`、`buffer`、`logging` |
-| `client::producer` | 49 | 配置与生命周期（含 Java `buildMQClientId` 的 clientId 口径：`<ip>@<pid>#<nanoTime>`、重启不换、同名 instanceName 共用一份实例）、选队列、压缩时机、事务两阶段；其中 `send_retry_tests` 用**进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败 10005、连接失败隔离 |
+| `client::producer` | 54 | 配置与生命周期（含 Java `buildMQClientId` 的 clientId 口径：`<ip>@<pid>#<nanoTime>`、重启不换、同名 instanceName 共用一份实例）、选队列、压缩时机、事务两阶段；其中 `send_retry_tests` 用**进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败 10005、连接失败隔离；同一套抓取也取证明线上的字段口径（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据） |
 | `client::allocate_strategy` | 30 | 六个策略与 Java 单测逐条对拍：`AVG` / `AVG_BY_CIRCLE` 的 Java 用例（10/4、7/3、边界队列续接）、四道 `check` 守卫返回**空结果**而非 Java 的 `IllegalArgumentException`、`CONFIG` 不查守卫且返回副本、六个 `get_name()` 与 Java 常量一致、N 消费者不重不漏、`CONSISTENT_HASH` 的哈希环表逐格、`MACHINE_ROOM` 的 `[0,1,4]/[2,3]` 分片与 `String#split("@")` 裁尾空段真值表、`MACHINE_ROOM_NEARBY` 同机房优先 + 无消费者机房由全员共享 + resolver 空机房**抛错**（保住上一轮分配） |
 | `client::consumer` / `pull_consumer` / `consume_executor` / `consumer_stats` | 98 | 订阅与 `MessageSelector`、clientId 的 CLUSTERING/BROADCASTING 分岔（广播保持 `DEFAULT` 并复用同一份实例）、`PopProcessQueue`、过滤与投递接缝、pull/lite 状态机（subscribe/assign/seek/poll/committed）、`consume_executor` 的 core/max 两档弹性语义（空闲 worker 按 keepAlive 退休）、`StatsItem` 窗口端点差分（不依赖真实时钟） |
 | 轨迹四件套 `trace` / `trace_hook` / `trace_dispatcher` / `trace_context` | 101 | 与 Java 官方实现的逐字节对拍（Pub / SubBefore / SubAfter / EndTransaction / Recall）、SOH/STX 文本编解码双向、无 keys 空段容错、坏记录只跳过自己、分发器攒批/切块/防递归、W3C `traceparent` 生成与校验 |
@@ -226,7 +226,15 @@ rust/
   **之前**（`MQClientAPIImpl:329-332`），否则 `ReqT` 落在签名之外，开鉴权的 broker 验签必失败。
 - **broker 主动请求（220/221/307/309/326）无法从外部注入**：它们走 broker 已建立的那条
   连接。协议与分派由离线单测覆盖，`live_mq_client` 只验实例侧的 seam。
-- **SQL92 过滤 / `%DLQ%` 死信 / 批量发送真机 / Rust TLS / 动态地址服务器真机**这几条
+- **批量发送走 `SEND_BATCH_MESSAGE(320)`，与 Java 同判据**（`MQClientAPIImpl:562` 先判
+  `isReply` 再判 `msg instanceof MessageBatch`）。服务端对 310/320 其实同路：broker 解码都走
+  V2 头、由 `header.batch` 选 `sendBatchMessage`（`SendMessageProcessor:117`），proxy
+  `AbstractRemotingActivity:69` 与 auth `DefaultAuthorizationContextBuilder:230-240` 把两个码
+  列在同一个 case 里。所以这一项不是修 bug，是让请求码这一层也与 Java 一致。
+  离线取证 `send_retry_tests::send_request_code_follows_java_three_way_branch`
+  （310+`m=false` / 320+`m=true` / reply 批量仍是 325），真机取证 `live_mq_client` M3
+  （批量发出后 broker 按 3 条独立消息投回、逻辑位点连续）。
+- **SQL92 过滤 / `%DLQ%` 死信 / Rust TLS / 动态地址服务器真机**这几条
   链路还没跑过带它们的环境（待办 #37）；ACL 需要开鉴权的 broker 才能跑。
 
 ## License

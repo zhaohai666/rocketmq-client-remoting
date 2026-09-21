@@ -40,6 +40,8 @@ struct BrokerScript {
     requests: usize,
     /// 每笔 SEND 请求**上线时**的 extFields 快照（钩子已经跑完，等价于真报文）。
     sends: Vec<Vec<(String, String)>>,
+    /// 与 `sends` 一一对应的请求码（310 单条 / 320 批量 / 325 应答）。
+    send_codes: Vec<i32>,
 }
 
 impl BrokerScript {
@@ -49,6 +51,7 @@ impl BrokerScript {
             tail: (response_code::SUCCESS, 0),
             requests: 0,
             sends: Vec::new(),
+            send_codes: Vec::new(),
         }
     }
 }
@@ -107,6 +110,7 @@ impl MockCluster {
         broker.tail = tail;
         broker.requests = 0;
         broker.sends.clear();
+        broker.send_codes.clear();
     }
 
     /// 第 `index` 个 broker 收到的 SEND 请求数。
@@ -117,6 +121,11 @@ impl MockCluster {
     /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 extFields 快照。
     fn send_ext(&self, index: usize, n: usize) -> Vec<(String, String)> {
         lock(&self.state).brokers[index].sends[n].clone()
+    }
+
+    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的请求码。
+    fn send_code(&self, index: usize, n: usize) -> i32 {
+        lock(&self.state).brokers[index].send_codes[n]
     }
 }
 
@@ -256,6 +265,7 @@ fn spawn_broker(
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect(),
                         );
+                        broker.send_codes.push(request.code);
                         (step.0, step.1, broker.requests)
                     };
                     if delay > 0 {
@@ -629,6 +639,65 @@ async fn unit_name_only_changes_the_client_id() {
     producer.send(&mut msg, None, None).await.expect("发送应当成功");
     // unitName 不进发送头：Java 只有 unitMode 上线，unitName 只影响 clientId/地址服务器
     assert!(cluster.send_ext(0, 0).iter().all(|(k, _)| k != "unitName"));
+    producer.shutdown();
+}
+
+/// Java `MQClientAPIImpl#sendMessage:550-563` 的三级判据，逐条抓线取证：
+/// 先 `isReply` → 325，再 `msg instanceof MessageBatch` → 320，否则 310。
+///
+/// ⚠ 请求码与 V2 头的 `m`（batch）是**两件不同的事**：broker 真正按 `m` 选
+/// `sendBatchMessage` 还是单条写入（`SendMessageProcessor:117` 读
+/// `requestHeader.isBatch()`），码只影响服务端按码归类（proxy/auth 把 310/320 列在
+/// 同一个 case，见 `AbstractRemotingActivity:69`、
+/// `DefaultAuthorizationContextBuilder:230-240`）。所以两个都得断言 ——
+/// 只对齐码不对齐 `m`，批量 body 会被按单条解析。
+#[tokio::test]
+async fn send_request_code_follows_java_three_way_branch() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("send_code_branch", &cluster).await;
+
+    let mut single = Message::new("T1", Some(b"single"));
+    producer.send(&mut single, None, None).await.expect("发送应当成功");
+    assert_eq!(cluster.send_code(0, 0), request_code::SEND_MESSAGE_V2);
+    assert_eq!(ext_value(&cluster.send_ext(0, 0), "m"), Some("false"));
+
+    let batch = producer
+        .send_batch(
+            vec![
+                Message::new("T1", Some(b"b-0")),
+                Message::new("T1", Some(b"b-1")),
+            ],
+            None,
+            None,
+        )
+        .await;
+    batch.expect("批量发送应当成功");
+    assert_eq!(cluster.send_code(0, 1), request_code::SEND_BATCH_MESSAGE);
+    assert_eq!(ext_value(&cluster.send_ext(0, 1), "m"), Some("true"));
+
+    // reply 优先于 batch：Java 先判 isReply，所以「带 reply 属性的批量」仍走 325。
+    let mut reply_batch = MessageBatch::generate_from_list(vec![
+        Message::new("T1", Some(b"r-0")),
+        Message::new("T1", Some(b"r-1")),
+    ])
+    .expect("同 topic、非延迟、非重试，应当合法");
+    reply_batch
+        .message
+        .put_property(
+            crate::common::message_const::PROPERTY_MESSAGE_TYPE,
+            MixAll::REPLY_MESSAGE_FLAG,
+        );
+    let mut publish = PublishMessage::Batch(&mut reply_batch);
+    let mq = MessageQueue::new("T1", "broker-0", 0);
+    let client = producer.require_client().expect("client 已启动");
+    client
+        .send_message("GID_send_retry", &mut publish, &mq, 3_000, 0, false)
+        .await
+        .expect("应答批量发送应当成功");
+    assert_eq!(cluster.send_code(0, 2), request_code::SEND_REPLY_MESSAGE_V2);
+    assert_eq!(ext_value(&cluster.send_ext(0, 2), "m"), Some("true"));
+
     producer.shutdown();
 }
 

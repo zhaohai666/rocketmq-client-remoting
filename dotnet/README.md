@@ -78,7 +78,7 @@ dotnet/
 ```bash
 PROG=examples/RocketMQ.Examples/bin/Debug/net10.0/rmq.dll
 dotnet $PROG selfcheck                    # 本地自检（无需集群）
-dotnet $PROG message-types 127.0.0.1:9876  # 7 类消息能力（12 项检查）
+dotnet $PROG message-types 127.0.0.1:9876  # 8 类消息能力（19 项检查）
 dotnet $PROG admin-live 127.0.0.1:9876     # Admin 全链路（47 PASS / 0 FAIL / 1 SKIP）
 dotnet $PROG compression-live selftest 127.0.0.1:9876   # 压缩真实性（真机发送→消费→解压→CRC）
 dotnet $PROG compression-live send 127.0.0.1:9876 <topic> <group> <size> [codec]
@@ -103,7 +103,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | 工具 | 结果 |
 |---|---|
 | selfcheck | PASS=3 FAIL=0 |
-| message-types | 12 PASS / 0 FAIL |
+| message-types | 19 PASS / 0 FAIL（含批量：`SendBatch` 走 `SEND_BATCH_MESSAGE(320)`，真 broker 投成 3 条独立消息、offset 连续 0,1,2） |
 | admin-live | 47 PASS / 0 FAIL / 1 SKIP |
 | compression-live selftest | 10 PASS / 0 FAIL（zlib 真机往返 storeSize 8192→~360、CRC 一致、flag 清除、阈值与编解码闭环 + **后端 lz4 / zstd 真机往返**） |
 | compression-live send/recv | 作为 `../scripts/compression_matrix.sh` 的一端参与四语言矩阵（zlib 13/13、lz4 13/13、zstd 7/7，全 PASS） |
@@ -116,16 +116,18 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | recall | 16 PASS / 0 FAIL（定时消息撤回 `recallMessage`(370)，与 Python/C++/Rust 同场景：R0 读到并临时打开 broker 的 `recallMessageEnable` → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle` → R2 broker 给的句柄能被解码、`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4/R5 `%RETRY%`/`%DLQ%`/非法句柄都在打网络之前秒回 → R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：对照定时消息按时投递、被撤回那条整个窗口都不出现 → R7 无条件还原开关） |
 | unit-config | 20 PASS / 0 FAIL（unitName/unitMode/stream 四语言同场景：U1 `unitName` 拼进 clientId 且照常发送 → U2 stream 消费者 `@unitA@STREAM` 收尾，**broker 的 `examineConsumerConnectionInfo` 记录的 clientId 也带同一后缀**（唯一能证明「上线的就是拼好的那个」的观测点）→ U3 `unitMode=true` 自动建出的 topic `topicSysFlag` 带 UNIT 位、对照组不带 → U4 心跳 `ConsumerData.unitMode` 让 `%RETRY%` 带 UNIT_SUB 位 → U5 lite 消费者默认带 `@STREAM`、显式开 stream 的生产者同样，3 发 3 收） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **460 passed / 0 failed**，零 warning
-（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（12 项）用
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **461 passed / 0 failed**，零 warning
+（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（13 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。
 同一种"抓 socket"的能力也被用来验请求钩子（`RequestHooksReachTheWire`）：只注册 ACL 时线上
 有 `AccessKey`/`Signature` 而没有 `ReqT`；ACL + stream 时 `ReqT="0"` 在场，且把抓下来的报文按
 broker 的口径复算 HMAC-SHA1 **能对上签名**（等价于「`ReqT` 落在被签的那段内容里」，顺序写反
 就复算不上）；lite 消费者的路由与心跳默认全部带标，`EnableStreamRequestType=false` 后一笔都不
-带、但请求照发（排除"根本没打出去"的假绿）。⚠ 抓的是 `SendMessageV2`(310) 而不是 V1(10) ——
-本端口与 Java 一样默认 `sendSmartMsg=true`。
+带、但请求照发（排除"根本没打出去"的假绿）。同一套抓取也被用来验发送请求码
+（`SendRequestCodeFollowsJava`）：普通发 310、批量发 320、`MSG_TYPE=reply` 发 325，并成对
+断言 V2 头的 `m`(batch) —— 抓的是 V2 系列而不是 V1(10)，本端口与 Java 一样默认
+`sendSmartMsg=true`。
 `ConsistentHashTests` + `AllocateStrategyTests` 则把六个队列分配策略与 Java 单测逐条对拍
 （哈希环表、`String.Split('@')` 与 Java `split("@")` 的裁尾空段差异、NEARBY 的同机房优先与
 resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consistent_hash` 用例一致。
@@ -183,3 +185,12 @@ resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consist
   传进去了，晚一步首包就是裸的）。回归：`AclTests`（顺序 + 反证）、`SendRetryTests`
   （钩子真的写到 socket 上）、`rmq unit-config` 的 U1–U5（broker 侧 `topicSysFlag` 与
   `examineConsumerConnectionInfo` 的 clientId）。
+- **批量发送的请求码是 320，不是 310。** `MqClient.BuildSendRequest` 按 Java
+  `MQClientAPIImpl:550-563` 的三级判据走：先 `IsReplyMessage` ⇒ 325，再 `msg.IsBatch`
+  ⇒ `SendBatchMessage(320)`，否则 `SendMessageV2(310)`。请求码与 V2 头的 `m`（batch）是
+  两件事：broker 按 `m` 选 `sendBatchMessage` 还是单条写入（`SendMessageProcessor:117` 读
+  `requestHeader.isBatch()`），码只影响服务端按码归类（proxy `AbstractRemotingActivity:69`
+  与 auth `DefaultAuthorizationContextBuilder:230-240` 把 310/320 列在同一个 case 里），
+  所以对齐 320 不是修 bug、而是请求码这一层也与 Java 一致 —— 两个字段必须成对取证。
+  回归：`SendRetryTests.SendRequestCodeFollowsJava`（真 socket 上取 `Code` + `m`）、
+  `rmq message-types` 第 8 项（真 broker 把批量投成 3 条独立消息、offset 连续）。

@@ -54,6 +54,20 @@ bool mapPullStatus(int32_t code, PullStatus& out) {
     }
 }
 
+// 发送请求码（对应 Java `MQClientAPIImpl#sendMessage:550-563`）：先判应答消息，
+// 再判批量。应答必须走 325（broker 只在 324/325 上注册 ReplyMessageProcessor）；
+// 批量走 SEND_BATCH_MESSAGE(320)，判据与 Java 一样是「这条消息是不是批量」
+// （Java 用 `msg instanceof MessageBatch`，这里用 `msg.isBatch`）。
+// 服务端对 310/320 走同一条路（broker 按 header.batch 选写入方式，proxy 和 auth
+// 把两个码列在同一个 case 里），所以这不是修 bug，只是把请求码这一层也对齐 Java，
+// 免得服务端按码统计/限流时把批量当成单条。
+int32_t sendRequestCode(const Message& msg) {
+    if (isReplyMessage(msg)) {
+        return RequestCode::SEND_REPLY_MESSAGE_V2;
+    }
+    return msg.isBatch ? RequestCode::SEND_BATCH_MESSAGE : RequestCode::SEND_MESSAGE_V2;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- clientId
@@ -580,13 +594,10 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     header->maxReconsumeTimes = std::nullopt;
     header->batch = msg.isBatch;
 
-    // Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
-    // 而不是普通的 SEND_MESSAGE_V2(314)。broker 只在 324/325 上注册了
-    // ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT 把应答推回请求方）。
+    // 请求码选择（reply / batch / 普通）见 sendRequestCode：应答走 325、批量走 320，
+    // 否则才是普通的 SEND_MESSAGE_V2(310)。
     RemotingCommand request = RemotingCommand::createRequestCommand(
-        isReplyMessage(msg) ? RequestCode::SEND_REPLY_MESSAGE_V2
-                            : RequestCode::SEND_MESSAGE_V2,
-        header);
+        sendRequestCode(msg), header);
     request.body = msg.body;
     request.hasBody = true;
 
@@ -671,10 +682,9 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     header->maxReconsumeTimes = std::nullopt;
     header->batch = msg.isBatch;
 
+    // 请求码选择（reply / batch / 普通）见 sendRequestCode。
     RemotingCommand request = RemotingCommand::createRequestCommand(
-        isReplyMessage(msg) ? RequestCode::SEND_REPLY_MESSAGE_V2
-                            : RequestCode::SEND_MESSAGE_V2,
-        header);
+        sendRequestCode(msg), header);
     request.body = msg.body;
     request.hasBody = true;
     request.markOnewayRpc();

@@ -1596,9 +1596,13 @@ impl MQClientInstance {
         };
         // Request-Reply：`msgType == "reply"` 的应答消息走 SEND_REPLY_MESSAGE_V2(325)：
         // broker 只在 324/325 上注册了 ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT
-        // 把应答推回请求方）。对齐 Java `MQClientAPIImpl#sendMessage:550-558`。
+        // 把应答推回请求方）。批量消息走 `SEND_BATCH_MESSAGE(320)`：Java 的判据是
+        // `msg instanceof MessageBatch`（`MQClientAPIImpl#sendMessage:562`），先判 reply
+        // 再判 batch。对齐 Java `MQClientAPIImpl#sendMessage:550-563`。
         let code = if is_reply_message(outer) {
             request_code::SEND_REPLY_MESSAGE_V2
+        } else if msg.is_batch() {
+            request_code::SEND_BATCH_MESSAGE
         } else {
             request_code::SEND_MESSAGE_V2
         };

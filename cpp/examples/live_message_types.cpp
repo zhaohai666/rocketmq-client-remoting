@@ -8,6 +8,7 @@
 //   5. 延迟消息（setDelayTimeLevel 并校验 store_ts - born_ts >= 3000ms）
 //   6. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
 //   7. 事务消息（两阶段的提交路径；完整链路见 rmq_live_transaction）+ 落库可消费
+//   8. 批量消息（sendBatch → SEND_BATCH_MESSAGE(320)，broker 按 N 条独立消息投递、offset 连续）
 //   附：消费者心跳注册（HEART_BEAT，Python 参考实现缺此能力）
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -530,6 +532,53 @@ int main(int argc, char** argv) {
               "checkLocalTransaction_calls=" + std::to_string(checks));
         check("事务-UNKNOW 回查后最终投递", consumed,
               "received=" + std::to_string(run.msgs.size()));
+    }
+
+    // ---------- 8. 批量消息（SEND_BATCH_MESSAGE 320）----------
+    // 请求码从 310 换成 320 之后，必须在真 broker 上重新证明一次：broker 确实是按
+    // 「批量写入」处理这笔请求的。判据是消费侧看到 **N 条独立消息、offset 连续**：
+    // 如果 broker 把批量 body 当成单条消息存（即 header.batch 没生效），这里只会收到
+    // 1 条 body 为拼接字节的消息，而不是 N 条各自完整的 body。
+    {
+        const std::string topic = gPrefix + "_Batch";
+        std::vector<Message> group;
+        for (int i = 0; i < 3; ++i) {
+            group.emplace_back(topic, str2bytes("batch-" + std::to_string(i)));
+        }
+        bool batchOk = false;
+        std::string batchDetail = "throw";
+        try {
+            SendResult sr = prod.sendBatch(group, 5000);
+            batchOk = sr.sendStatus == SendStatus::SEND_OK;
+            batchDetail = "status=" + std::to_string(static_cast<int>(sr.sendStatus));
+        } catch (const std::exception& e) {
+            batchDetail = std::string("throw: ") + e.what();
+        }
+        check("批量发送 sendBatch(3 条)", batchOk, batchDetail);
+
+        ConsumerRun run = runConsumer(topic, "*", 15, false, "batch", /*expect=*/3);
+        std::set<std::string> bodies;
+        std::vector<int64_t> offsets;
+        for (const MessageExt& m : run.msgs) {
+            bodies.insert(bytes2str(m.body));
+            offsets.push_back(m.queueOffset);
+        }
+        std::sort(offsets.begin(), offsets.end());
+        bool contiguous = offsets.size() == 3;
+        for (size_t i = 1; i < offsets.size(); ++i) {
+            if (offsets[i] != offsets[i - 1] + 1) contiguous = false;
+        }
+        bool exact = true;
+        for (int i = 0; i < 3; ++i) {
+            if (bodies.count("batch-" + std::to_string(i)) == 0) exact = false;
+        }
+        check("批量消息被 broker 按 3 条独立消息投递", exact && contiguous,
+              "received=" + std::to_string(run.msgs.size()) + " offsets="
+                  + [&] {
+                        std::string s;
+                        for (int64_t o : offsets) { if (!s.empty()) s += ","; s += std::to_string(o); }
+                        return s;
+                    }());
     }
 
     // ---------- 附：心跳注册 ----------
