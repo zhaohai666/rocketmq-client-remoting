@@ -32,6 +32,7 @@ python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需
 python verify_hook_live.py        # CheckForbidden/FilterMessage 钩子（13 PASS/0 FAIL）
 python verify_validators_live.py  # 名字校验（24 PASS/0 FAIL）：非法 topic/group 本地快拒、合法名字照常收发、往返对照腿
 python verify_recall_live.py      # 定时消息撤回 recallMessage(370)（15 PASS/0 FAIL，脚本会打开并在退出时还原 broker 的 recallMessageEnable）
+python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）：clientId 后缀、broker 侧 topic 的 UNIT/UNIT_SUB 位、每笔请求的 ReqT
 python verify_lite_pull_live.py   # lite pull 全链路（32 PASS/0 FAIL）：rebalance/收 12 条/commit/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）
 ```
 
@@ -97,17 +98,25 @@ rocketmq/
 
 ## clientId 口径
 
-`MixAll.client_id_for(instance_name)` 对应 Java `ClientConfig#buildMQClientId`：默认
-clientId 是 `<本机 IP>@<instanceName>`，而 `instance_name` 还是默认值 `DEFAULT` 时会在
-`start()` 里被**就地**改写成 `<pid>#<monotonic_ns>`（对应 `changeInstanceNameToPID`）——
+`MixAll.client_id_for(instance_name, unit_name, enable_stream_request_type)` 对应 Java
+`ClientConfig#buildMQClientId`：默认 clientId 是
+`<本机 IP>@<instanceName>[@<unitName>][@STREAM]`，而 `instance_name` 还是默认值 `DEFAULT`
+时会在 `start()` 里被**就地**改写成 `<pid>#<monotonic_ns>`（对应 `changeInstanceNameToPID`）——
 生产者与 admin 无条件执行，三个消费者只在 `CLUSTERING` 下执行 —— 广播消费者保持
 `DEFAULT`，于是同进程的广播消费者算出同一个 clientId（Java 的 `MQClientManager` 会让它们
 复用同一份实例；本实现每个门面各建一份，只在 `INSTANCE_MAP` 里占同一个键）。就地写回
 意味着 restart 不换身份。
 
-两点与 Java 不同：本机 IP 用 UDP「连」公网地址后读 sockname（Java 枚举网卡），
-且没有 `unitName` / `enableStreamRequestType` 配置项，所以拼不出
-`<ip>@<instance>@<unitName>` / `@STREAM` 后缀。回归测试：`tests/test_client_id.py`。
+`unit_name` / `unit_mode` / `enable_stream_request_type` 三项配置五个门面都有（setter 与
+Java 同名），默认值也对齐：producer/push/admin 关 stream，pull/lite 在构造时就开
+（`DefaultMQPullConsumer:113/126`、`DefaultLitePullConsumer:213/228`）。⚠ 两处口径别混：
+ExtFields 里的 `ReqT` 是 `RequestType.STREAM.getCode()` 的字符串形式 `"0"`，clientId 尾巴上
+才是枚举 name `@STREAM`。传输层只有一槽钩子（Java 是 `List<RPCHook>`），顺序靠
+`compose_request_hooks()` 还原——stream 必须排在 ACL **之前**（`MQClientAPIImpl:329-332`），
+否则 `ReqT` 落在签名之外；钩子还要在 `MQClientInstance.start()` 之前注册（Java 随
+`MQClientAPIImpl` 构造传入）。与 Java 的另一处不同是本机 IP 用 UDP「连」公网地址后读
+sockname（Java 枚举网卡）。回归测试：`tests/test_client_id.py`、`tests/test_unit_config.py`、
+`verify_unit_config_live.py`。
 
 ## 管理端（`client/admin.py`）
 

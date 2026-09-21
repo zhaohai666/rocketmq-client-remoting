@@ -140,7 +140,7 @@ class _FakeClient:
     def broker_addr_of(self, broker_name):
         return "127.0.0.1:10911"
 
-    def send_message(self, group, msg, mq, timeout, sys_flag):
+    def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False):
         self.sends += 1
         self.sent.append((mq, msg))
         return SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq)

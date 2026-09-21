@@ -22,6 +22,8 @@ from rocketmq.remoting.protocol.heartbeat import MessageModel
 
 # <IP>@<pid>#<纳秒>
 JAVA_STYLE = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())
+# 拉取/轻量消费者多一段 @STREAM（Java 的构造函数恒开 enableStreamRequestType）
+JAVA_STREAM_STYLE = re.compile(r"^[^@\s]+@%d#\d+@STREAM$" % MixAll.pid())
 
 
 def _split(client_id: str):
@@ -145,11 +147,14 @@ class TestConsumerClientId:
             broadcast.shutdown()
 
     def test_pull_and_lite_follow_the_same_rule(self):
+        """拉取/轻量消费者的 clientId 多一段 `@STREAM`：Java 在它们的构造函数里
+        就把 enableStreamRequestType 置真（DefaultMQPullConsumer:113、
+        DefaultLitePullConsumer:213），推送消费者和生产者则不会。"""
         pull = DefaultMQPullConsumer("CID_clientid_pull")
         pull.set_namesrv_addr("127.0.0.1:1")
         pull.start()
         try:
-            assert JAVA_STYLE.match(pull.client_id), pull.client_id
+            assert JAVA_STREAM_STYLE.match(pull.client_id), pull.client_id
         finally:
             pull.shutdown()
 
@@ -158,7 +163,7 @@ class TestConsumerClientId:
         lite.subscribe("T", "*")
         lite.start()
         try:
-            assert JAVA_STYLE.match(lite.client_id), lite.client_id
+            assert JAVA_STREAM_STYLE.match(lite.client_id), lite.client_id
         finally:
             lite.shutdown()
 
@@ -168,9 +173,114 @@ class TestConsumerClientId:
         lite_broadcast.subscribe("T", "*")
         lite_broadcast.start()
         try:
-            assert lite_broadcast.client_id == "%s@DEFAULT" % MixAll.cached_ip_str()
+            assert lite_broadcast.client_id == "%s@DEFAULT@STREAM" % MixAll.cached_ip_str()
         finally:
             lite_broadcast.shutdown()
+
+    def test_stream_suffix_can_be_turned_off_and_on(self):
+        """开关是 ClientConfig 上的字段，两边都能显式设：关掉退化成 Java 的推送口径，
+        打开则让同一 instanceName 的推送消费者落在另一个 clientId 上。"""
+        off = DefaultMQPullConsumer("CID_clientid_stream_off")
+        off.set_instance_name("stream-switch")
+        off.set_enable_stream_request_type(False)
+        off.set_namesrv_addr("127.0.0.1:1")
+        off.start()
+        try:
+            assert off.client_id == "%s@stream-switch" % MixAll.cached_ip_str()
+        finally:
+            off.shutdown()
+
+        on = DefaultMQPushConsumer("CID_clientid_stream_on")
+        on.set_instance_name("stream-switch")
+        on.set_enable_stream_request_type(True)
+        on.set_namesrv_addr("127.0.0.1:1")
+        on.subscribe("T", "TagA")
+        on.set_message_listener(lambda msgs: None)
+        with pytest.raises(RemotingConnectException):
+            on.start()
+        try:
+            assert on.client_id == "%s@stream-switch@STREAM" % MixAll.cached_ip_str()
+        finally:
+            on.shutdown()
+
+
+class TestUnitNameClientId:
+    """unitName 是 clientId 的第三段：Java `ClientConfig#buildMQClientId` 只在
+    `UtilAll.isBlank` 为假时拼它，拼的还是原值而不是 trim 后的值。"""
+
+    def test_pure_string_part(self):
+        assert MixAll.build_mq_client_id("10.0.0.1", "inst", "unit-a") == "10.0.0.1@inst@unit-a"
+        # 空白 = 没有（Java 的 isBlank 认 \t/\n/空格）
+        assert MixAll.build_mq_client_id("10.0.0.1", "inst", "   ") == "10.0.0.1@inst"
+        assert MixAll.build_mq_client_id("10.0.0.1", "inst", None) == "10.0.0.1@inst"
+        # 两段后缀顺序固定：先 unitName 再 STREAM
+        assert (MixAll.build_mq_client_id("10.0.0.1", "inst", "unit-a", True)
+                == "10.0.0.1@inst@unit-a@STREAM")
+
+    def test_producer_carries_the_unit_name(self):
+        p = DefaultMQProducer("PID_clientid_unit")
+        p.set_instance_name("unit-producer")
+        p.set_unit_name("unitA")
+        p.set_namesrv_addr("127.0.0.1:1")
+        p.start()
+        try:
+            assert p.client_id == "%s@unit-producer@unitA" % MixAll.cached_ip_str()
+            # unitName 不参与 changeInstanceNameToPID：instanceName 该原样留着
+            assert p.instance_name == "unit-producer"
+            assert p.get_unit_name() == "unitA"
+        finally:
+            p.shutdown()
+
+    def test_blank_unit_name_is_ignored(self):
+        p = DefaultMQProducer("PID_clientid_blank_unit")
+        p.set_instance_name("blank-unit")
+        p.set_unit_name("  ")
+        p.set_namesrv_addr("127.0.0.1:1")
+        p.start()
+        try:
+            assert p.client_id == "%s@blank-unit" % MixAll.cached_ip_str()
+        finally:
+            p.shutdown()
+
+    def test_two_units_get_two_client_ids(self):
+        """同进程同 instanceName、不同 unitName 的两个客户端不能共用一个 clientId ——
+        否则 INSTANCE_MAP 里后者会覆盖前者，心跳与 rebalance 都会串台。"""
+        a = DefaultMQProducer("PID_clientid_unit_a")
+        b = DefaultMQProducer("PID_clientid_unit_b")
+        for c in (a, b):
+            c.set_instance_name("same-instance")
+            c.set_namesrv_addr("127.0.0.1:1")
+        a.set_unit_name("unitA")
+        b.set_unit_name("unitB")
+        a.start()
+        b.start()
+        try:
+            assert a.client_id != b.client_id, (a.client_id, b.client_id)
+        finally:
+            a.shutdown()
+            b.shutdown()
+
+    def test_consumer_and_admin_also_take_a_unit_name(self):
+        lite = DefaultLitePullConsumer("CID_clientid_unit_lite")
+        lite.set_instance_name("unit-lite")
+        lite.set_unit_name("unitA")
+        lite.set_namesrv_addr("127.0.0.1:1")
+        lite.subscribe("T", "*")
+        lite.start()
+        try:
+            assert lite.client_id == "%s@unit-lite@unitA@STREAM" % MixAll.cached_ip_str()
+        finally:
+            lite.shutdown()
+
+        admin = DefaultMQAdminExt()
+        admin.set_unit_name("unitA")
+        admin.set_namesrv_addr("127.0.0.1:1")
+        admin.start()
+        try:
+            assert admin.client_id == "%s@ADMIN@unitA" % MixAll.cached_ip_str()
+        finally:
+            admin.shutdown()
+
 
 
 class TestAdminClientId:

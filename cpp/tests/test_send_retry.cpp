@@ -13,6 +13,9 @@
 //   5. 总超时用尽 → RemotingTooMuchRequestException；
 //   6. 失败原因映射 ClientErrorCode：连不上→10001，broker 码→原码，无路由→10005；
 //   7. 容错表分档：broker 错误码=隔离+不可达，传输异常=隔离但可达，成功=只记延迟。
+//   8. unitMode 上线：SEND_MESSAGE_V2 的单字母键 `k`。
+//   9. 请求钩子上线：stream 的 `ReqT=0`、ACL 的 AccessKey/Signature，以及
+//      「ReqT 必须在签名内容之内」这条顺序约束（broker 侧算法重放验签）。
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -27,6 +30,7 @@
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/hook.h"
+#include "rocketmq/client/lite_pull_consumer.h"
 #include "rocketmq/client/producer.h"
 #include "rocketmq/common/byte_buffer.h"
 #include "rocketmq/common/mix_all.h"
@@ -36,6 +40,7 @@
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/protocol/route.h"
+#include "rocketmq/remoting/rpchook.h"
 
 using namespace rocketmq;
 
@@ -160,7 +165,18 @@ void releaseConn(const ConnRef& c) {
 
 // ---------------------------------------------------------------- mock 端点
 
-// 一次 SEND 请求的脚本化响应
+// 一笔上线报文的取证：请求码（V1/V2、路由、心跳…）、extFields 和原始 body
+struct WireRecord {
+    int32_t code = 0;
+    PropertyMap ext;
+    Bytes body;
+    bool hasBody = false;
+};
+
+// 上线报文取证的条数上限：lite 消费者的拉取循环会持续打，留几百条足够判断"有没有打标"
+constexpr size_t kRequestLogCap = 500;
+
+// 一条 SEND 请求的脚本化响应
 struct SendReply {
     int32_t code = ResponseCode::SUCCESS;
     int delayMillis = 0;
@@ -218,9 +234,51 @@ public:
     void scriptSend(std::vector<SendReply> replies) {
         std::lock_guard<std::mutex> lk(state_);
         sends_ = std::move(replies);
+        sendLog_.clear();
         sendCount_.store(0);
     }
     int sendCount() const { return sendCount_.load(); }
+
+    // 第 `i` 次 SEND 的取证；越界时返回空记录（调用方按"没有这一笔"处理）。
+    WireRecord sendRecord(size_t i) {
+        std::lock_guard<std::mutex> lk(state_);
+        if (i >= sendLog_.size()) return WireRecord{};
+        return sendLog_[i];
+    }
+
+    // 清空"所有上线报文"的取证，钩子用例只关心自己那一段流量。
+    void clearRequests() {
+        std::lock_guard<std::mutex> lk(state_);
+        requestLog_.clear();
+    }
+
+    // 已记录的上线报文快照（SEND 之外的 GET_ROUTEINFO / HEARTBEAT / PULL 都在里面）。
+    std::vector<WireRecord> requests() {
+        std::lock_guard<std::mutex> lk(state_);
+        return requestLog_;
+    }
+
+    // 请求码为 `code` 的报文里，有多少条带 key==value 的扩展字段。
+    int countRequestsWith(int32_t code, const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lk(state_);
+        int n = 0;
+        for (const WireRecord& r : requestLog_) {
+            if (r.code != code) continue;
+            auto it = r.ext.find(key);
+            if (it != r.ext.end() && it->second == value) ++n;
+        }
+        return n;
+    }
+
+    // 请求码为 `code` 的报文总条数。
+    int countRequests(int32_t code) {
+        std::lock_guard<std::mutex> lk(state_);
+        int n = 0;
+        for (const WireRecord& r : requestLog_) {
+            if (r.code == code) ++n;
+        }
+        return n;
+    }
 
 private:
     void acceptLoop() {
@@ -263,6 +321,14 @@ private:
     }
 
     void respond(const ConnRef& conn, RemotingCommand req) {
+        // 每一笔上线报文都留一份证：钩子注入的扩展字段（ReqT / AccessKey / Signature）
+        // 只在客户端编码前才写进 extFields，本地断言看不到，只有这里能取证。
+        {
+            std::lock_guard<std::mutex> lk(state_);
+            if (requestLog_.size() < kRequestLogCap) {
+                requestLog_.push_back({req.code, req.extFields, req.body, req.hasBody});
+            }
+        }
         RemotingCommand resp;
         resp.opaque = req.opaque;
         resp.markResponseType();
@@ -291,6 +357,13 @@ private:
                    || req.code == RequestCode::SEND_MESSAGE
                    || req.code == RequestCode::SEND_REPLY_MESSAGE_V2) {
             const int idx = sendCount_.fetch_add(1);
+            {
+                // 记录上线的请求码与 extFields：重试分类之外的字段口径（unitMode/batch）
+                // 只能在这里取证。
+                std::lock_guard<std::mutex> lk(state_);
+                sendLog_.push_back({req.code, req.extFields, req.body, req.hasBody});
+            }
+
             SendReply reply;
             {
                 std::lock_guard<std::mutex> lk(state_);
@@ -325,6 +398,8 @@ private:
     std::mutex state_;
     std::map<std::string, Bytes> routes_;
     std::vector<SendReply> sends_;
+    std::vector<WireRecord> sendLog_;
+    std::vector<WireRecord> requestLog_;
     std::mutex workersM_;
     std::vector<std::thread> workers_;
     std::thread acceptor_;
@@ -676,6 +751,137 @@ void testFaultItemFlags(MockEndpoint& mock) {
     }
 }
 
+// 8. unitMode 上线：走的是 SendMessageRequestHeaderV2 的单字母键 `k`
+//（Java SendMessageRequestHeaderV2.java:62 `@CFNullable private Boolean k; // unitMode`，
+// 由 DefaultMQProducerImpl:1004 `requestHeader.setUnitMode(this.isUnitMode())` 填）。
+// 键名写错 broker 就读不到，单元化路由整条链路静默失效，故离线取证。
+void testUnitModeReachesWire(MockEndpoint& mock) {
+    const std::string topic = "SendRetryUnitMode";
+    mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
+
+    {
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_unit_mode_on");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("unit-mode-on");
+        p.setUnitMode(true);
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expectInt(rec.code, RequestCode::SEND_MESSAGE_V2, "send goes out as SEND_MESSAGE_V2");
+        expect(rec.ext.count("k") == 1, "unitMode is on the wire as V2 key k");
+        expect(rec.ext.count("k") > 0 && rec.ext.at("k") == "true", "unitMode=true -> k=true");
+        expect(rec.ext.count("a") > 0 && rec.ext.at("a") == "PG_unit_mode_on",
+               "producerGroup is V2 key a in the same header");
+        p.shutdown();
+    }
+    {
+        // 默认关闭时字段仍然存在（Java 的 Boolean 非 null ⇒ fastjson 会写出 false）
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_unit_mode_off");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("unit-mode-off");
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expect(rec.ext.count("k") > 0 && rec.ext.at("k") == "false", "unitMode=false -> k=false");
+        p.shutdown();
+    }
+}
+
+// 9. 请求钩子的**上线**取证。钩子是在报文编码前的最后一刻才改写 extFields 的，本地断言
+// 看不到结果；而 lite 消费者曾经绕过 composeRequestHooks 直接注册用户钩子，让 `ReqT`
+// 静默漏发（test_acl 锁的是钩子自身的组合与顺序，锁不住 facade 有没有用它）。
+// 所以这里从 socket 这头数扩展字段。
+void testRequestHooksReachWire(MockEndpoint& mock) {
+    const std::string topic = "SendRetryReqT";
+    mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
+    const std::string ak = "AK-wire-probe";
+    const std::string sk = "SK-wire-probe";
+
+    {
+        // 生产者默认关 stream（Java DefaultMQProducer 从不置 enableStreamRequestType）：
+        // 只该看到 ACL 字段
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        mock.clearRequests();
+        DefaultMQProducer p("PG_reqt_off");
+        p.setNamesrvAddr(mock.address());
+        p.setCredentials(ak, sk);
+        p.setInstanceName("reqt-off");
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        p.shutdown();
+        const WireRecord rec = mock.sendRecord(0);
+        expect(rec.ext.count(SessionCredentials::ACCESS_KEY) == 1, "acl: AccessKey on the wire");
+        expect(rec.ext.count(SessionCredentials::SIGNATURE) == 1, "acl: Signature on the wire");
+        expect(rec.ext.count(std::string(MixAll::REQ_T)) == 0, "stream off -> no ReqT");
+    }
+    {
+        // 打开 stream：ReqT 与 ACL 字段并存，而且**在签进去的内容里**。判据用 broker 的
+        // 算法：拿上线的 extFields + body 重放一遍 HMAC-SHA1，等式成立才说明顺序是
+        // Stream → ACL（Java MQClientAPIImpl:329-332 "Inject stream rpc hook first to
+        // make reserve field signature"）；反了的话开鉴权的 broker 会直接验签失败。
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        mock.clearRequests();
+        DefaultMQProducer p("PG_reqt_on");
+        p.setNamesrvAddr(mock.address());
+        p.setCredentials(ak, sk);
+        p.setEnableStreamRequestType(true);
+        p.setInstanceName("reqt-on");
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        p.shutdown();
+        const WireRecord rec = mock.sendRecord(0);
+        // 值是 RequestType.STREAM 的 code（"0"），不是枚举名
+        const auto reqt = rec.ext.find(std::string(MixAll::REQ_T));
+        expect(reqt != rec.ext.end() && reqt->second == "0", "stream on -> ReqT=0 on the wire");
+        const auto sig = rec.ext.find(std::string(SessionCredentials::SIGNATURE));
+        expect(sig != rec.ext.end(), "stream on keeps the ACL signature");
+        RemotingCommand replay;
+        replay.code = rec.code;
+        replay.extFields = rec.ext;
+        replay.body = rec.body;
+        replay.hasBody = rec.hasBody;
+        const bool matches =
+            sig != rec.ext.end() && AclClientRPCHook::calcSignature(sk, replay) == sig->second;
+        expect(matches, "ReqT sits inside the signed content (broker-side replay matches)");
+    }
+    {
+        // lite 消费者默认开 stream（Java DefaultLitePullConsumer:213/228 构造里置真）：
+        // 路由 / 心跳这些**非 SEND** 报文也必须打标 —— 那次漏发的回归守卫。
+        mock.clearRequests();
+        DefaultLitePullConsumer c("PG_lite_reqt");
+        c.setNamesrvAddr(mock.address());
+        c.setInstanceName("lite-reqt");
+        c.subscribe(topic, "*");
+        c.start();
+        c.shutdown();
+        const int routeTotal = mock.countRequests(RequestCode::GET_ROUTEINFO_BY_TOPIC);
+        const int routeTagged =
+            mock.countRequestsWith(RequestCode::GET_ROUTEINFO_BY_TOPIC, MixAll::REQ_T, "0");
+        expect(routeTotal > 0, "lite consumer asked the namesrv for its route",
+               "routeRequests=" + std::to_string(routeTotal));
+        expectInt(routeTotal, routeTagged, "every lite-consumer route request carries ReqT");
+        expect(mock.countRequestsWith(RequestCode::HEART_BEAT, MixAll::REQ_T, "0") > 0,
+               "lite consumer heartbeat carries ReqT");
+    }
+    {
+        // 显式关掉 stream 的同一条路径必须一条都不带（默认值不是"硬编码开着"）
+        mock.clearRequests();
+        DefaultLitePullConsumer c("PG_lite_no_reqt");
+        c.setNamesrvAddr(mock.address());
+        c.setInstanceName("lite-no-reqt");
+        c.setEnableStreamRequestType(false);
+        c.subscribe(topic, "*");
+        c.start();
+        c.shutdown();
+        expectInt(mock.countRequestsWith(RequestCode::GET_ROUTEINFO_BY_TOPIC, MixAll::REQ_T, "0"), 0,
+                  "setEnableStreamRequestType(false) really turns ReqT off");
+        expect(mock.countRequests(RequestCode::GET_ROUTEINFO_BY_TOPIC) > 0,
+               "the consumer did talk to the namesrv, so that 0 means something");
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -713,6 +919,8 @@ int main() {
     runCase("callTimeout", mock, testCallTimeout);
     runCase("errorCodeMapping", mock, testErrorCodeMapping);
     runCase("faultItemFlags", mock, testFaultItemFlags);
+    runCase("unitModeReachesWire", mock, testUnitModeReachesWire);
+    runCase("requestHooksReachWire", mock, testRequestHooksReachWire);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

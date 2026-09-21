@@ -181,8 +181,16 @@ class DefaultMQProducer:
             enable_trace_context = trace_context_enabled_from_env()
         self.enable_trace_context: bool = bool(enable_trace_context)
         self.namespace = namespace
-        self.instance_name = "DEFAULT"
+        self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id = None
+        # ---- unit / stream 配置（对应 Java ClientConfig 的同名字段）----
+        # unitName 会拼进 clientId 与动态取址 URL；unitMode 会透传给 broker
+        # （发消息头、心跳 ConsumerData、拦截钩子上下文）；enableStreamRequestType
+        # 既给 clientId 加 @STREAM 后缀（Java 注释：防止 MQClientInstance 被意外复用），
+        # 也给每个请求加 ReqT=0 扩展字段。Java 的 producer 默认三个都是「关/空」。
+        self.unit_name: Optional[str] = None
+        self.unit_mode = False
+        self.enable_stream_request_type = False
         self.create_topic_key = MixAll.DEFAULT_TOPIC
         self.default_topic_queue_nums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
         self.send_msg_timeout = 3000
@@ -245,6 +253,24 @@ class DefaultMQProducer:
 
     def set_instance_name(self, name: str) -> None:
         self.instance_name = name
+
+    def set_unit_name(self, unit_name: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。"""
+        self.unit_name = unit_name
+
+    def get_unit_name(self) -> Optional[str]:
+        return self.unit_name
+
+    def set_unit_mode(self, unit_mode: bool) -> None:
+        """对应 Java `ClientConfig#setUnitMode`：随请求头/心跳上报给 broker。"""
+        self.unit_mode = bool(unit_mode)
+
+    def is_unit_mode(self) -> bool:
+        return self.unit_mode
+
+    def set_enable_stream_request_type(self, enable: bool) -> None:
+        """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
+        self.enable_stream_request_type = bool(enable)
 
     def set_max_message_size(self, size: int) -> None:
         self.max_message_size = size
@@ -423,8 +449,7 @@ class DefaultMQProducer:
         context.broker_addr = broker_addr
         context.message = msg
         context.mq = mq
-        # 本项目无 unit mode（Java 的 isUnitMode() 恒为 false）
-        context.unit_mode = False
+        context.unit_mode = self.unit_mode
         context.arg = arg
         self.execute_check_forbidden_hook(context)
 
@@ -451,11 +476,13 @@ class DefaultMQProducer:
         if self.enable_trace_context:
             inject_trace_context(msg)
         if not self.send_message_hook_list:
-            return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+            return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
+                                       unit_mode=self.unit_mode)
         context = self._build_send_context(msg, mq_sel, broker_addr, communication_mode)
         self.execute_send_message_hook_before(context)
         try:
-            result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+            result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
+                                           unit_mode=self.unit_mode)
         except Exception as e:  # noqa: BLE001
             context.exception = e
             self.execute_send_message_hook_after(context)
@@ -488,13 +515,16 @@ class DefaultMQProducer:
             # 对应 Java `DefaultMQProducerImpl#start`:250-252 的两步：先
             # `changeInstanceNameToPID`（Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，
             # 本客户端没有内部生产者，所以无条件执行），再由 `ClientConfig#buildMQClientId`
-            # 拼 `<本机 IP>@<instanceName>`。instanceName 就地写回，和 Java 一样：
-            # 第二次 start() 复用同一个 clientId，而不是每重启一次换一个名字。
+            # 拼 `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。instanceName 就地写回，
+            # 和 Java 一样：第二次 start() 复用同一个 clientId，而不是每重启一次换一个名字。
             self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
             if self.client_id is None:
-                self.client_id = MixAll.client_id_for(self.instance_name)
+                self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
+                                                      self.enable_stream_request_type)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
-                                               tls_enable=self.tls_enable)
+                                               tls_enable=self.tls_enable,
+                                               enable_stream_request_type=self.enable_stream_request_type,
+                                               unit_name=self.unit_name)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
@@ -678,7 +708,8 @@ class DefaultMQProducer:
             # 定点发送同样要过钩子（Java：目标是 mq 也走 sendKernelImpl）
             if self._has_send_interceptors():
                 return self._send_with_hooks(client, msg, mq, timeout, sys_flag)
-            return client.send_message(self.producer_group, msg, mq, timeout, sys_flag)
+            return client.send_message(self.producer_group, msg, mq, timeout, sys_flag,
+                                   unit_mode=self.unit_mode)
         # 对应 Java sendDefaultImpl：重试分类逐异常类型走，不用"啥都重试"糊过去。
         try:
             publish = self._topic_publish_info(msg.topic)
@@ -861,7 +892,8 @@ class DefaultMQProducer:
                 self._execute_check_forbidden(msg, mq, self._need_addr(client, mq),
                                               None, CommunicationMode.ONEWAY)
             client.send_message_oneway(self.producer_group, msg, mq,
-                                       self._need_addr(client, mq), self.send_msg_timeout, sys_flag)
+                                       self._need_addr(client, mq), self.send_msg_timeout,
+                                       sys_flag, unit_mode=self.unit_mode)
             return
         publish = self._topic_publish_info(msg.topic)
         selected = self._mq_fault_strategy.select_one_message_queue(publish, None)
@@ -870,7 +902,8 @@ class DefaultMQProducer:
             self._execute_check_forbidden(msg, mq_sel, self._need_addr(client, mq_sel),
                                           None, CommunicationMode.ONEWAY)
         client.send_message_oneway(self.producer_group, msg, mq_sel,
-                                   self._need_addr(client, mq_sel), self.send_msg_timeout, sys_flag)
+                                   self._need_addr(client, mq_sel), self.send_msg_timeout,
+                                   sys_flag, unit_mode=self.unit_mode)
 
     def send_by_selector(self, msg: Message, selector: MessageQueueSelector, arg,
                          timeout_millis: Optional[int] = None) -> SendResult:
@@ -887,7 +920,8 @@ class DefaultMQProducer:
         if self._has_send_interceptors():
             # arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
             return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag, arg=arg)
-        return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag)
+        return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
+                                       unit_mode=self.unit_mode)
 
     # ---------------- 定时消息撤回（对应 Java recallMessage）----------------
     def recall_message(self, topic: str, recall_handle: str) -> str:
@@ -948,13 +982,15 @@ class DefaultMQProducer:
         if mq is not None:
             if self._has_send_interceptors():
                 return self._send_with_hooks(client, batch, mq, timeout, sys_flag)
-            return client.send_message(self.producer_group, batch, mq, timeout, sys_flag)
+            return client.send_message(self.producer_group, batch, mq, timeout, sys_flag,
+                                   unit_mode=self.unit_mode)
         publish = self._topic_publish_info(batch.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(batch.topic, selected.broker_name, selected.queue_id)
         if self._has_send_interceptors():
             return self._send_with_hooks(client, batch, mq_sel, timeout, sys_flag)
-        return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag)
+        return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag,
+                                   unit_mode=self.unit_mode)
 
     # ---------------- 事务消息 ----------------
     # 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction（L1433-1509）的**两阶段**：

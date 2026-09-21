@@ -84,16 +84,26 @@ std::string changeInstanceNameToPID(const std::string& instanceName) {
 }
 
 std::string buildMqClientId(const std::string& clientIp, const std::string& instanceName,
-                            const std::string& unitName) {
+                            const std::string& unitName, bool enableStreamRequestType) {
+    // Java `ClientConfig#buildMQClientId`：
+    //   sb.append(clientIP).append("@").append(instanceName);
+    //   if (!UtilAll.isBlank(unitName)) sb.append("@").append(unitName);
+    //   if (enableStreamRequestType) sb.append("@").append(RequestType.STREAM);
+    // 末段 Java 拼的是**枚举名**（`RequestType.STREAM` 的 toString = "STREAM"），
+    // 不是 code；code 只出现在 extFields 的 ReqT 里。
     std::string id = clientIp + "@" + instanceName;
     if (!isBlank(unitName)) {
         id += "@" + unitName;
     }
+    if (enableStreamRequestType) {
+        id += "@" + std::string(MixAll::STREAM_REQUEST_TYPE);
+    }
     return id;
 }
 
-std::string buildClientId(const std::string& instanceName) {
-    return buildMqClientId(MixAll::cachedIpStr(), instanceName);
+std::string buildClientId(const std::string& instanceName, const std::string& unitName,
+                          bool enableStreamRequestType) {
+    return buildMqClientId(MixAll::cachedIpStr(), instanceName, unitName, enableStreamRequestType);
 }
 
 // ---------------------------------------------------------------- TopicPublishInfo
@@ -154,10 +164,14 @@ bool MQClientInstance::tlsEnabledFromEnv() {
 MQClientInstance::MQClientInstance(const std::string& clientId,
                                   const std::vector<std::string>& nameServerAddrs,
                                   int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis,
-                                  bool tlsEnable)
+                                  bool tlsEnable, const std::string& unitName)
     : clientId_(clientId), nameServerAddrs_(nameServerAddrs),
       remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)),
       tlsEnable_(tlsEnable) {
+    // 动态取址（对应 Java MQClientAPIImpl 构造里的 DefaultTopAddressing(unitName)）：
+    // 配了 ROCKETMQ_NAMESRV_DOMAIN 才生效，wsAddr + unitName 一起决定 URL。
+    // 未配置时 configureFromEnv 是 no-op，行为与不接这个入参完全一致。
+    topAddressing_.configureFromEnv(unitName);
     // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
     // 对应 Java MQClientAPIImpl 构造函数里的
     // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)
@@ -545,7 +559,7 @@ std::vector<std::string> MQClientInstance::knownBrokerAddrs() { return getRouteO
 // ---------------------------------------------------------------- 消息发送
 SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const Message& msg,
                                         const MessageQueue& mq, int32_t timeoutMillis,
-                                        int32_t sysFlag) {
+                                        int32_t sysFlag, bool unitMode) {
     const std::string addr = brokerAddr(mq);
 
     auto header = std::make_shared<SendMessageRequestHeaderV2>();
@@ -559,7 +573,7 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     header->flag = msg.flag;
     header->properties = messagePropertiesToString(msg.properties);
     header->reconsumeTimes = 0;
-    header->unitMode = false;
+    header->unitMode = unitMode;
     // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
     // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
     // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
@@ -635,7 +649,7 @@ std::string MQClientInstance::recallMessage(const std::string& addr,
 
 void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const Message& msg,
                                         const MessageQueue& mq, int32_t timeoutMillis,
-                                        int32_t sysFlag) {
+                                        int32_t sysFlag, bool unitMode) {
     const std::string addr = brokerAddr(mq);
     (void)timeoutMillis;
 
@@ -650,7 +664,7 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     header->flag = msg.flag;
     header->properties = messagePropertiesToString(msg.properties);
     header->reconsumeTimes = 0;
-    header->unitMode = false;
+    header->unitMode = unitMode;
     // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
     // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
     // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。

@@ -69,3 +69,7 @@ target_link_libraries(rmq_validators_live PRIVATE rocketmq::remoting)
 # 定时消息撤回（370）真机联调：句柄往返 + 撤回后到点不投递 + broker 开关还原（不打进 ctest）
 add_executable(rmq_recall_live recall_live.cpp)
 target_link_libraries(rmq_recall_live PRIVATE rocketmq::remoting)
+
+# unitName / unitMode / enableStreamRequestType 真机联调：clientId 后缀 + broker 侧单元位（不打进 ctest）
+add_executable(rmq_live_unit_config live_unit_config.cpp)
+target_link_libraries(rmq_live_unit_config PRIVATE rocketmq::remoting)

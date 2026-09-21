@@ -188,11 +188,27 @@ void DefaultLitePullConsumer::start() {
         instanceName_ = changeInstanceNameToPID(instanceName_);
     }
     if (clientId_.empty()) {
-        clientId_ = buildClientId(instanceName_);
+        clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
     }
+    // 轻量消费者默认开着 stream（Java `DefaultLitePullConsumer:213/228` 构造函数里置真），
+    // unitName 只影响动态取址 URL。
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,
-                                        /*invokeTimeoutMillis=*/10000));
+                                        /*invokeTimeoutMillis=*/10000,
+                                        MQClientInstance::tlsEnabledFromEnv(), unitName_));
+    // 请求钩子（ACL 签名 / stream 的 `ReqT`）：lite 消费者在 Java 里**默认**开 stream
+    //（DefaultLitePullConsumer:213/228），所以这里必须走 composeRequestHooks 把
+    // StreamTypeRPCHook 排在用户钩子之前 —— 直接注册 rpcHook_ 会让 ReqT 漏发，
+    // 而且开 ACL 时签的内容与上线的字段不一致。
+    // 绑定位置也关键：Java 的 rpcHook 在 MQClientAPIImpl 构造时就传进去了，实例发出的
+    // 第一笔报文（下面的 start() 动态取址、路由刷新）就带着它；放到 start() 之后，
+    // 首包就是裸的。
+    const std::shared_ptr<RPCHook> requestHook =
+        composeRequestHooks(enableStreamRequestType_, rpcHook_);
+    if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
+        logger_warn("lite pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
+                    + clientId_ + ")");
+    }
     mqClient_->start();
     // 登记在用 topic，并**同步**把路由拉进来：心跳只发给「实例路由表里已知的 broker」，
     // 自建实例此刻路由表还是空的，那一轮会发 0 份 → 订阅要等 5s 心跳循环第一轮才注册上
@@ -212,10 +228,6 @@ void DefaultLitePullConsumer::start() {
         } catch (const std::exception& e) {
             logger_debug("lite start: refresh route for " + t + " failed: " + e.what());
         }
-    }
-    if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
-        logger_warn("lite pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
-                    + clientId_ + ")");
     }
     if (assignMode_) {
         for (const MessageQueue& mq : assigned_) {
@@ -584,6 +596,9 @@ HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     HeartbeatData hb(clientId_);
     ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_PASSIVELY, messageModel_,
                     consumeFromWhere_);
+    // Java `MQClientInstance:1039`：心跳里的 ConsumerData.unitMode 决定 broker 建
+    // %RETRY% topic 时打不打 UNIT_SUB 位
+    cd.unitMode = unitMode_;
     for (const auto& kv : subscriptionData_) {
         cd.subscriptionDataSet.push_back(kv.second);
     }

@@ -72,6 +72,18 @@ bool DefaultTopAddressing::isConfigured() {
     return env != nullptr && env[0] != '\0';
 }
 
+void DefaultTopAddressing::configureFromEnv(const std::string& unitName) {
+    // 对应 Java `MQClientAPIImpl` 构造里的 `new DefaultTopAddressing(unitName)`：
+    // 它读 ROCKETMQ_NAMESRV_DOMAIN 并用 MixAll.getWSAddr(domain) 拼出 wsAddr。
+    // 未配置（空）时保持原样 = 动态取址关闭，行为与旧版一致。
+    const char* env = std::getenv("ROCKETMQ_NAMESRV_DOMAIN");
+    if (env == nullptr || env[0] == '\0') {
+        return;
+    }
+    wsAddr_ = getWsAddr(env);
+    unitName_ = unitName;
+}
+
 std::string DefaultTopAddressing::buildUrl() const {
     // Java fetchNSAddr 的 URL 拼装（unitName / para 规则逐条照抄）
     std::string url = wsAddr_;

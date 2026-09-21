@@ -116,6 +116,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_hook          127.0.0.1:9876
 ./build/examples/rmq_validators_live    127.0.0.1:9876
 ./build/examples/rmq_recall_live        127.0.0.1:9876   # 需 broker 开 recallMessageEnable（工具自己打开并还原）
+./build/examples/rmq_live_unit_config   127.0.0.1:9876   # unitName/unitMode/stream
 ```
 
 | 工具 | 结果 | 覆盖 |
@@ -129,6 +130,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_live_lite_pull` | 33 PASS / 0 FAIL | `DefaultLitePullConsumer` 真机全链路：S1 后台 rebalance 拿到 4 个队列 → S2 subscribe+poll 收全 12 条且内容一致 → S3 `commit` 后各队列位点 >0 → S4 assign+seek 从头重收 → S5 订阅级 tag 只收 6 条 → S6a `CONSUME_FROM_TIMESTAMP`（墙钟起点早于全部消息 → 收全）、S6b `offset_for_timestamp` 双向（30 分钟前 → 队首 Σ=0，10 分钟后 → Σ=12）→ S7a 默认策略名 `AVG` 且策略为 null 时 `start()` 报 Java 同款文案、S7b 换 `AVG_BY_CIRCLE` 后**同组两实例**分配无交集、并集覆盖 4 队列、下标步长 2（交叉而非连续段）、S7c 两半 `CONFIG` 各自只收到配置队列里的消息且合起来恰好 12 条互不重叠、S7d `CONSISTENT_HASH` 用**真实 clientId** 建环且线上分配收敛到「真实 mqAll/cidAll 离线跑同一策略」的预测（合起来收全 12 条）、S7e `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 在单机房下**原样透传**内层策略 + resolver 被逐个队列/两个真实 clientId 问过、S7f `MACHINE_ROOM` 白名单不匹配真实 `broker-a` → 安静饿死（分不到队列、poll 不到消息、同组 AVG 对照组仍只拿自己那半边）|
 
 | `rmq_recall_live` | 14 PASS / 0 FAIL | 定时消息撤回 `recallMessage`(370) 真机（与 Python/Rust/.NET 同场景）：R0 读得到 broker 的 `recallMessageEnable` 并临时打开 → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle`，普通消息没有 → R2 broker 给的句柄能被本端口解码器解开，`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4 `%RETRY%` topic 本地用 Java 文案拒掉、R5 非法句柄 <200ms 秒回（没打网络）→ R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：同样延迟的对照消息按时投递、被撤回的那条整个窗口都不出现 → R7 无条件把 `recallMessageEnable` 还原成跑之前的值 |
+| `rmq_live_unit_config` | 20 PASS / 0 FAIL | `unitName`/`unitMode`/`stream` 真机（与 Python/Rust/.NET 同场景）：U1 `unitName` 拼进 clientId 且照常发送 → U2 `@unitA@STREAM` 的消费者收到消息，**broker 的 `examineConsumerConnectionInfo` 回读到同一串 clientId** → U3 `unitMode=true` 自动建出的 topic 带 `UNIT` 位、对照组不带 → U4 心跳的 `ConsumerData.unitMode` 让 `%RETRY%` 带 `UNIT_SUB` 位 → U5 lite 消费者与显式开 stream 的生产者都带 `@STREAM`，3 发 3 收。钩子顺序（`ReqT` 必须在 ACL 签名之内）与"钩子真的写到 socket 上"由离线用例 `testRequestHooksReachWire`（`tests/test_send_retry.cpp`，抓真报文 + broker 侧复算 HMAC）和 `tests/test_acl.cpp` 锁死 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -190,14 +192,30 @@ NaN/Infinity 与尾逗号。所以 `json.cpp` 里是**容错解析器**而不是
 `decodeMessage` 捕获后返回 `false`（消息被丢弃）。**绝不能原样透传压缩字节**：
 外层会清掉 `COMPRESSED_FLAG`，透传等于把压缩流当正文交出去且事后无法识别，属于静默数据损坏。
 
-**clientId 口径按 Java。** `buildClientId(instanceName)` = `<本机 IP>@<instanceName>`
-（`buildMqClientId`，对应 `ClientConfig#buildMQClientId`）；instanceName 还是默认值 `DEFAULT`
-时由各 facade 的 `start()` 调 `changeInstanceNameToPID` **就地**换成 `<pid>#<nanoTime>` ——
-生产者与 admin 无条件，三个消费者只在 `CLUSTERING` 下（广播消费者保持 `DEFAULT`，与 Java
-一致 —— Java 的 `MQClientManager` 会让同进程的广播消费者复用同一份实例，本端口是每门面各建
-一份私有实例）。与 Java 两点不同：本机 IP 用
-UDP sockname 探测（Java 枚举网卡），且没有 `unitName` / `enableStreamRequestType` 配置项，
-拼不出 `@<unitName>` / `@STREAM` 后缀。回归：`tests/test_client_id.cpp`（ctest `client_id`）。
+**clientId 口径按 Java。** `buildClientId(instanceName, unitName, enableStream)` =
+`<本机 IP>@<instanceName>[@<unitName>][@STREAM]`（`buildMqClientId`，对应
+`ClientConfig#buildMQClientId`；空白 unitName 不拼段，`@STREAM` 取枚举名而非 code）；
+instanceName 还是默认值 `DEFAULT` 时由各 facade 的 `start()` 调 `changeInstanceNameToPID`
+**就地**换成 `<pid>#<nanoTime>` —— 生产者与 admin 无条件，三个消费者只在 `CLUSTERING` 下
+（广播消费者保持 `DEFAULT`，与 Java 一致 —— Java 的 `MQClientManager` 会让同进程的广播消费者
+复用同一份实例，本端口是每门面各建一份私有实例）。与 Java 一点不同：本机 IP 用 UDP sockname
+探测（Java 枚举网卡）。回归：`tests/test_client_id.cpp`（ctest `client_id`）。
+
+**unitMode / stream 是上线字段，不是本地摆设。** 三类开关各有落点：
+`unitName` 进 clientId 与动态取址 URL（`-<unitName>?nofix=1`）；
+`unitMode` 进 `SEND_MESSAGE_V2` 的单字母键 `k`、心跳 `ConsumerData.unitMode`、
+回投请求头与过滤/禁行钩子上下文；`enableStreamRequestType` 让每笔请求带 `ReqT=0`
+（值是 `RequestType.STREAM` 的 **code**，与 clientId 的枚举名后缀不同）。
+生产者默认关 stream（Java 只有 pull / lite 消费者在构造里置 `true`）。
+**顺序是语义**：Java `MQClientAPIImpl:329-332` 先装 Stream 钩子再装用户（ACL）钩子，
+`ReqT` 必须落在签名内容**之内**，否则开鉴权的 broker 验签必失败。本端口的传输层只有
+一槽 RPCHook（Java 是列表，first-wins），所以 facade 一律经 `composeRequestHooks()`
+合成后再 `registerRPCHook()`，且绑在 `MQClientInstance::start()` **之前** ——
+Java 的 rpcHook 是随 `MQClientAPIImpl` 构造进去的，实例第一笔报文就该带着它。
+回归：`tests/test_acl.cpp`（钩子组合与签名内容）+ `tests/test_send_retry.cpp`
+（真 socket 上取证的 `k` / `ReqT`，并用 broker 侧算法重放验签）+
+`examples/live_unit_config.cpp`（真 broker 的 topic `sysFlag` UNIT=0x1 / UNIT_SUB=0x2、
+broker 记录的 clientId）。
 
 **消息轨迹的解码器比 Java 更健壮。** Java `TraceDataEncoder` 对无 keys 消息的 `SubBefore`
 会 `line[7]` 越界抛 `ArrayIndexOutOfBoundsException`（**5.5.1 上游真实缺陷**，已复现），

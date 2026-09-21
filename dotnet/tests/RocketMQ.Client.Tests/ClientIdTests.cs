@@ -22,7 +22,22 @@ public class ClientIdTests
     private static readonly Regex JavaStyle =
         new Regex(@"^[^@\s]+@" + Environment.ProcessId + @"#\d+$");
 
+    /// <summary>
+    /// Java <c>ClientConfig#buildMQClientId</c> 的 stream 后缀用的是 <c>sb.append
+    /// (RequestType.STREAM)</c>，即枚举 **name**；ExtFields 里的 <c>ReqT</c> 才是 code "0"。
+    /// </summary>
+    private const string StreamSuffix = "@STREAM";
+
     private static string Ip => MixAll.CachedIpStr();
+
+    /// <summary>剥掉尾部的 <c>@STREAM</c>：pull / lite 消费者默认开 stream，
+    /// 结构断言只关心 `<ip>@<instance>` 那部分。</summary>
+    private static string WithoutStream(string clientId)
+    {
+        return clientId.EndsWith(StreamSuffix, StringComparison.Ordinal)
+            ? clientId[..^StreamSuffix.Length]
+            : clientId;
+    }
 
     private static (string Ip, string Instance) Split(string clientId)
     {
@@ -167,26 +182,100 @@ public class ClientIdTests
         Assert.Equal(Ip + "@DEFAULT", broadcast.ClientId);
     }
 
+    /// pull / lite 消费者在 Java 里**默认**开 stream（DefaultMQPullConsumer:113/126、
+    /// DefaultLitePullConsumer:213/228），所以 clientId 尾巴上多一段 `@STREAM`。
     [Fact]
     public void PullAndLiteFollowTheSameRule()
     {
         var pull = new DefaultMQPullConsumer("CID_clientid_pull");
         pull.SetNamesrvAddr("127.0.0.1:1");
         Stamped(pull, pull.Start, pull.Shutdown);
-        Assert.Matches(JavaStyle, pull.ClientId);
+        Assert.Matches(JavaStyle, WithoutStream(pull.ClientId));
+        Assert.EndsWith(StreamSuffix, pull.ClientId);
 
         var lite = new DefaultLitePullConsumer("CID_clientid_lite");
         lite.SetNamesrvAddr("127.0.0.1:1");
         lite.Subscribe("T", "*");
         Stamped(lite, lite.Start, lite.Shutdown);
-        Assert.Matches(JavaStyle, lite.ClientId);
+        Assert.Matches(JavaStyle, WithoutStream(lite.ClientId));
+        Assert.EndsWith(StreamSuffix, lite.ClientId);
 
         var liteBroadcast = new DefaultLitePullConsumer("CID_clientid_lite_broadcast");
         liteBroadcast.SetNamesrvAddr("127.0.0.1:1");
         liteBroadcast.SetMessageModel(MessageModel.Broadcasting);
         liteBroadcast.Subscribe("T", "*");
         Stamped(liteBroadcast, liteBroadcast.Start, liteBroadcast.Shutdown);
-        Assert.Equal(Ip + "@DEFAULT", liteBroadcast.ClientId);
+        // Java 只对 CLUSTERING 改写 instanceName；stream 后缀与消息模型无关，照样带上。
+        Assert.Equal(Ip + "@DEFAULT" + StreamSuffix, liteBroadcast.ClientId);
+    }
+
+    /// 显式关掉 stream 后 `@STREAM` 后缀必须消失（Java 的 sb.append 在 if 分支里）。
+    [Fact]
+    public void StreamSuffixIsOptOutable()
+    {
+        var lite = new DefaultLitePullConsumer("CID_clientid_lite_nostream")
+        {
+            EnableStreamRequestType = false,
+        };
+        lite.SetNamesrvAddr("127.0.0.1:1");
+        lite.Subscribe("T", "*");
+        Stamped(lite, lite.Start, lite.Shutdown);
+        Assert.DoesNotContain(StreamSuffix, lite.ClientId);
+        Assert.Matches(JavaStyle, lite.ClientId);
+    }
+
+    // ---------------------------------------------------------------- unitName / stream 后缀
+
+    [Fact]
+    public void StreamSuffixComesAfterUnitName()
+    {
+        // Java ClientConfig#buildMQClientId：先 unitName，再 RequestType.STREAM 的 **name**。
+        Assert.Equal("10.0.0.1@inst@unit-a@STREAM",
+            ClientIds.BuildMqClientId("10.0.0.1", "inst", "unit-a", true));
+        Assert.Equal("10.0.0.1@inst@STREAM",
+            ClientIds.BuildMqClientId("10.0.0.1", "inst", null, true));
+        Assert.Equal("10.0.0.1@inst",
+            ClientIds.BuildMqClientId("10.0.0.1", "inst", "  ", false));
+    }
+
+    /// 各 facade 的默认值：生产者/推送消费者/管理端不开 stream，pull/lite 开。
+    [Fact]
+    public void FacadeStreamDefaultsMatchJava()
+    {
+        Assert.False(new DefaultMQProducer("PID_stream_default").EnableStreamRequestType);
+        Assert.False(new DefaultMQPushConsumer("CID_stream_default").EnableStreamRequestType);
+        Assert.False(new DefaultMQAdminExt().EnableStreamRequestType);
+        Assert.True(new DefaultMQPullConsumer("CID_stream_default").EnableStreamRequestType);
+        Assert.True(new DefaultLitePullConsumer("CID_stream_default").EnableStreamRequestType);
+    }
+
+    /// unitName 会同时进 clientId 和 TopAddressing（Java 的 ns 后缀），这里只断言 clientId。
+    [Fact]
+    public void UnitNameReachesProducerClientId()
+    {
+        var p = new DefaultMQProducer("PID_unitname_clientid")
+        {
+            UnitName = "unit-east",
+            InstanceName = "unitname-fixed",
+            NamesrvAddr = "127.0.0.1:1",
+        };
+        Stamped(p, p.Start, p.Shutdown);
+        Assert.Equal(Ip + "@unitname-fixed@unit-east", p.ClientId);
+    }
+
+    /// unitMode 是消费者/生产者上的独立开关，默认 false（Java ClientConfig#isUnitMode）。
+    [Fact]
+    public void UnitModeDefaultsToFalseAndIsSettable()
+    {
+        var producer = new DefaultMQProducer("PID_unitmode");
+        Assert.False(producer.UnitMode);
+        producer.UnitMode = true;
+        Assert.True(producer.UnitMode);
+
+        var push = new DefaultMQPushConsumer("CID_unitmode");
+        Assert.False(push.UnitMode);
+        var lite = new DefaultLitePullConsumer("CID_unitmode");
+        Assert.False(lite.UnitMode);
     }
 
     // ---------------------------------------------------------------- 管理端

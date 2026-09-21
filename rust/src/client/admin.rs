@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::client::mq_client::MQClientInstance;
+use crate::client::mq_client::{MQClientInstance, MQClientInstanceConfig};
 use crate::common::message::{MessageExt, MessageQueue};
 use crate::common::message_const::{INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE};
 use crate::common::message_decoder::{decode_message, decode_message_id};
@@ -96,6 +96,15 @@ pub struct AdminConfig {
     pub namespace: String,
     pub instance_name: String,
     pub client_id: Option<String>,
+    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
+    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
+    pub unit_name: Option<String>,
+    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
+    /// clientId 末尾多一段 `@STREAM`。
+    ///
+    /// ⚠ admin 没有 `unitMode` 的落点：管理端不发普通消息、也不做消息过滤，
+    /// Java 的 `DefaultMQAdminExtImpl` 全程没读过 `isUnitMode()`，所以这里不设该字段。
+    pub enable_stream_request_type: bool,
     pub name_server_addrs: Vec<String>,
     pub timeout_millis: i64,
     /// Java `kvNamespaceToDeleteList`：`delete_topic` 时顺带清掉的 KV namespace。
@@ -107,6 +116,8 @@ impl Default for AdminConfig {
         AdminConfig {
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
+            unit_name: None,
+            enable_stream_request_type: false,
             client_id: None,
             name_server_addrs: Vec::new(),
             timeout_millis: DEFAULT_TIMEOUT_MILLIS,
@@ -395,6 +406,17 @@ impl DefaultMQAdminExt {
         self.update_config(|c| c.instance_name = name);
     }
 
+    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
+    pub fn set_unit_name(&self, unit_name: Option<&str>) {
+        let unit_name = unit_name.map(str::to_string);
+        self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `ClientConfig#setEnableStreamRequestType`。
+    pub fn set_enable_stream_request_type(&self, enable: bool) {
+        self.update_config(|c| c.enable_stream_request_type = enable);
+    }
+
     /// Python `set_timeout_millis`。
     pub fn set_timeout_millis(&self, timeout_millis: i64) {
         self.update_config(|c| c.timeout_millis = timeout_millis);
@@ -451,7 +473,8 @@ impl DefaultMQAdminExt {
             bail!("name server address is not set");
         }
         // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
-        // clientId 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        // clientId 再走 `ClientConfig#buildMQClientId` 的
+        // `<本机 IP>@<instanceName>[@unitName][@STREAM]`。
         // 本移植的 admin instanceName 默认是 "ADMIN"（不是 Java 的 "DEFAULT"，见模块头
         // 差异 2：admin 用私有实例，不和其他客户端共用），所以改写只在调用方显式
         // 设成 "DEFAULT" 时才起作用。
@@ -459,14 +482,28 @@ impl DefaultMQAdminExt {
         let client_id = cfg
             .client_id
             .clone()
-            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+            .unwrap_or_else(|| {
+                MixAll::build_default_client_id(
+                    &instance_name,
+                    cfg.unit_name.as_deref(),
+                    cfg.enable_stream_request_type,
+                )
+            });
         self.update_config(|c| {
             c.client_id = Some(client_id.clone());
             c.instance_name = instance_name;
         });
 
         // Python `admin.py:92`：直接构造私有实例（见模块头差异 2）。
-        let client = MQClientInstance::new(&client_id, cfg.name_server_addrs.clone());
+        let client = MQClientInstance::with_config(
+            &client_id,
+            cfg.name_server_addrs.clone(),
+            MQClientInstanceConfig {
+                unit_name: cfg.unit_name.clone(),
+                enable_stream_request_type: cfg.enable_stream_request_type,
+                ..Default::default()
+            },
+        );
         if let Some(hook) = self
             .inner
             .rpc_hook

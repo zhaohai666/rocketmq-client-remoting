@@ -362,6 +362,15 @@ pub struct ProducerConfig {
     pub namespace: String,
     /// Python `instance_name`。
     pub instance_name: String,
+    /// Java `ClientConfig#unitName`（默认 null）：非空时拼进 clientId，
+    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
+    pub unit_name: Option<String>,
+    /// Java `ClientConfig#unitMode`（默认 false）：随发送、回投、鉴权、消息过滤
+    /// 等请求一起上线，broker 据此给自动创建的 topic 打 UNIT / UNIT_SUB 位。
+    pub unit_mode: bool,
+    /// Java `ClientConfig#enableStreamRequestType`（生产者默认 false）：
+    /// true 时每个请求都带 `ReqT=0`，clientId 末尾多一段 `@STREAM`。
+    pub enable_stream_request_type: bool,
     /// Python `client_id`：`None` 时 `start()` 生成 `<instanceName>@<yyyyMMddHHmmss>`。
     pub client_id: Option<String>,
     /// Python `create_topic_key`。
@@ -420,6 +429,10 @@ impl Default for ProducerConfig {
             enable_trace_context: None,
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
+            unit_name: None,
+            unit_mode: false,
+            // Java `DefaultMQProducer` 不碰这个开关（只有拉模式/轻量消费者构造函数里置 true）
+            enable_stream_request_type: false,
             client_id: None,
             create_topic_key: MixAll::DEFAULT_TOPIC.to_string(),
             default_topic_queue_nums: MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
@@ -502,6 +515,12 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .namespace
             .clone()
+    }
+
+    /// Java `DefaultMQProducerImpl` 各处用到的 `tc.isUnitMode()`：发送头、
+    /// CheckForbiddenContext 都取这一个值。
+    fn unit_mode(&self) -> bool {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).unit_mode
     }
 
     fn client(&self) -> Option<MQClientInstance> {
@@ -682,6 +701,21 @@ impl DefaultMQProducer {
     /// Python `set_instance_name`。
     pub fn set_instance_name(&self, name: &str) {
         self.write_cfg(|c| c.instance_name = name.to_string());
+    }
+
+    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼接时按 `isBlank` 判）。
+    pub fn set_unit_name(&self, unit_name: Option<&str>) {
+        self.write_cfg(|c| c.unit_name = unit_name.map(str::to_string));
+    }
+
+    /// Java `ClientConfig#setUnitMode`。
+    pub fn set_unit_mode(&self, unit_mode: bool) {
+        self.write_cfg(|c| c.unit_mode = unit_mode);
+    }
+
+    /// Java `ClientConfig#setEnableStreamRequestType`。
+    pub fn set_enable_stream_request_type(&self, enable: bool) {
+        self.write_cfg(|c| c.enable_stream_request_type = enable);
     }
 
     /// Python `set_namespace`（`__init__` 的 `namespace` 参数）。
@@ -1014,13 +1048,16 @@ impl DefaultMQProducer {
         }
         // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
         // （非 CLIENT_INNER_PRODUCER 才做，本移植没有内部生产者所以无条件执行），再
-        // `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>`。
+        // `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>[@unitName][@STREAM]`。
         // instanceName 就地写回配置，和 Java 一样：第二次 start() 复用同一个 clientId。
         let instance_name = MixAll::change_instance_name_to_pid(&cfg.instance_name);
-        let client_id = cfg
-            .client_id
-            .clone()
-            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
+            MixAll::build_default_client_id(
+                &instance_name,
+                cfg.unit_name.as_deref(),
+                cfg.enable_stream_request_type,
+            )
+        });
         // Python 在 `__init__` 里就把 None 解析成布尔；这里等价地在 start 时定型。
         let trace_context_on = cfg
             .enable_trace_context
@@ -1034,6 +1071,8 @@ impl DefaultMQProducer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            unit_name: cfg.unit_name.clone(),
+            enable_stream_request_type: cfg.enable_stream_request_type,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -1511,6 +1550,8 @@ impl DefaultMQProducer {
             broker_addr: broker_addr.to_string(),
             communication_mode: Some(mode),
             arg,
+            // Java `DefaultMQProducerImpl:964` `context.setUnitMode(tc.isUnitMode())`
+            unit_mode: self.inner.unit_mode(),
             ..Default::default()
         };
         crate::client::hook::execute_check_forbidden_hook(
@@ -1551,6 +1592,7 @@ impl DefaultMQProducer {
             .unwrap_or_else(|e| e.into_inner())
             .enable_trace_context
             .unwrap_or(false);
+        let unit_mode = self.inner.unit_mode();
         // Python `try: ... except Exception: pass` —— 拿不到地址就按空串继续
         let broker_addr = client
             .broker_addr_of(&mq_sel.broker_name)
@@ -1563,12 +1605,14 @@ impl DefaultMQProducer {
             inject_trace_context(msg.as_message_mut());
         }
         if !self.has_send_message_hook() {
-            return client.send_message(&group, msg, mq_sel, timeout, sys_flag).await;
+            return client
+                .send_message(&group, msg, mq_sel, timeout, sys_flag, unit_mode)
+                .await;
         }
         let mut context =
             self.build_send_context(msg.as_message(), &group, &namespace, mq_sel, &broker_addr, mode);
         crate::client::hook::execute_send_message_hook_before(&self.inner.send_hooks, &mut context);
-        match client.send_message(&group, msg, mq_sel, timeout, sys_flag).await {
+        match client.send_message(&group, msg, mq_sel, timeout, sys_flag, unit_mode).await {
             Ok(result) => {
                 context.send_result = Some(result.clone());
                 crate::client::hook::execute_send_message_hook_after(
@@ -1643,7 +1687,14 @@ impl DefaultMQProducer {
                     .await;
             }
             return client
-                .send_message(&self.inner.producer_group(), &mut publish, mq, timeout, sys_flag)
+                .send_message(
+                    &self.inner.producer_group(),
+                    &mut publish,
+                    mq,
+                    timeout,
+                    sys_flag,
+                    self.inner.unit_mode(),
+                )
                 .await;
         }
 
@@ -1898,6 +1949,7 @@ impl DefaultMQProducer {
                 &mq_sel,
                 timeout,
                 sys_flag,
+                self.inner.unit_mode(),
             )
             .await
     }
@@ -1937,6 +1989,7 @@ impl DefaultMQProducer {
                 &mq_sel,
                 &addr,
                 sys_flag,
+                self.inner.unit_mode(),
             )
             .await
     }
@@ -1988,6 +2041,7 @@ impl DefaultMQProducer {
                 &mq_sel,
                 timeout,
                 sys_flag,
+                self.inner.unit_mode(),
             )
             .await
     }

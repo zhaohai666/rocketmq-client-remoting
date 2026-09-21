@@ -17,8 +17,10 @@
 #ifndef ROCKETMQ_REMOTING_RPCHOOK_H
 #define ROCKETMQ_REMOTING_RPCHOOK_H
 
+#include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "rocketmq/common/byte_buffer.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
@@ -88,8 +90,45 @@ private:
     SessionCredentials credentials_;
 };
 
-// ------------------------------------------------------------------ 原语
-// SHA1 / HMAC-SHA1 / 标准 Base64（带 '=' 填充）。导出出来是为了让单测能直接
+// 对应 org.apache.rocketmq.remoting.rpchook.StreamTypeRPCHook：
+// 给每个请求打 `ReqT = String.valueOf(RequestType.STREAM.getCode())`，即字面量 "0"。
+// 开关是 `ClientConfig#enableStreamRequestType`（Java 只有 pull/lite 消费者构造时置真）。
+class StreamTypeRPCHook : public RPCHook {
+public:
+    void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) override;
+};
+
+// 按注册顺序依次执行的组合钩子。
+//
+// Java 的传输层持有的是 RPCHook **列表**（`NettyRemotingAbstract#rpcHooks`，按注册顺序
+// 执行），本端口的 RemotingClient 只有一个钩子槽（first-wins），所以顺序靠组合还原。
+// 顺序在这里是语义而不是风格：Java `MQClientAPIImpl:329-332` 的注册顺序是
+// Namespace → Stream → 用户钩子（ACL），注释写明 "Inject stream rpc hook first to make
+// reserve field signature" —— `ReqT` 必须在签名**之前**写入，否则签的内容与真正上线的
+// extFields 不一致，broker 侧验签必然失败。
+class ChainedRPCHook : public RPCHook {
+public:
+    explicit ChainedRPCHook(std::vector<std::shared_ptr<RPCHook>> hooks)
+        : hooks_(std::move(hooks)) {}
+
+    void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) override;
+    void doAfterResponse(const std::string& remoteAddr, const RemotingCommand& request,
+                         const RemotingCommand* response) override;
+
+private:
+    std::vector<std::shared_ptr<RPCHook>> hooks_;
+};
+
+// 按 Java `MQClientAPIImpl:329-332` 的顺序装好请求钩子：StreamTypeRPCHook 在前、
+// 用户钩子（ACL 签名）在后；只开了 stream 或只有用户钩子时直接返回那一个，
+// 两者都没有时返回空（不注册钩子 = 零开销）。
+//
+// 各 facade 在 start() 里统一走这里，顺序就不会写反 —— 反了会让 ACL 签名的内容
+// 里缺 `ReqT`，开鉴权的 broker 直接验签失败。
+std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
+                                             const std::shared_ptr<RPCHook>& userHook);
+
+// ------------------------------------------------------------------ 原语// SHA1 / HMAC-SHA1 / 标准 Base64（带 '=' 填充）。导出出来是为了让单测能直接
 // 用 Java（AclProbe）与 Python 产出的固定向量逐字节对拍。
 Bytes sha1(const Bytes& data);
 Bytes hmacSha1(const std::string& key, const Bytes& data);

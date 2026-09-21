@@ -58,6 +58,7 @@ use crate::client::result::{
     ChangeInvisibleTimeResult, PopResult, PopStatus, PullResult, PullStatus, SendResult, SendStatus,
 };
 use crate::client::top_addressing::DefaultTopAddressing;
+use crate::remoting::rpchook::StreamTypeRPCHook;
 use crate::common::compression::decompress_body;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_client_id_setter::{get_uniq_id, set_uniq_id};
@@ -458,6 +459,16 @@ pub struct MQClientInstanceConfig {
     /// 动态 name server（Python 内部 `DefaultTopAddressing()`；注入用，
     /// `None` = `DefaultTopAddressing::default()`，读环境变量）。
     pub top_addressing: Option<DefaultTopAddressing>,
+    /// Java `ClientConfig#unitName`：既进 clientId 后缀，也决定地址服务器 URL
+    /// 的 `-<unitName>` 段（`MQClientAPIImpl:322`
+    /// `new DefaultTopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName())`）。
+    pub unit_name: Option<String>,
+    /// Java `ClientConfig#enableStreamRequestType`：true 时**在本实例的传输层**注册
+    /// `StreamTypeRPCHook`（每个请求带 `ReqT=0`）。
+    ///
+    /// 注册点在 `with_config` 里、门面自己的 `rpc_hook` 之前，正好还原 Java
+    /// `MQClientAPIImpl` 的钩子顺序（… → Stream → 用户钩子 → …），ACL 签名才会覆盖 ReqT。
+    pub enable_stream_request_type: bool,
 }
 
 impl Default for MQClientInstanceConfig {
@@ -479,6 +490,8 @@ impl Default for MQClientInstanceConfig {
             latency_fault_tolerance: None,
             trace_dispatcher: None,
             top_addressing: None,
+            unit_name: None,
+            enable_stream_request_type: false,
         }
     }
 }
@@ -523,6 +536,8 @@ impl std::fmt::Debug for MQClientInstanceConfig {
             )
             .field("trace_dispatcher", &injected(self.trace_dispatcher.is_some()))
             .field("top_addressing", &injected(self.top_addressing.is_some()))
+            .field("unit_name", &self.unit_name)
+            .field("enable_stream_request_type", &self.enable_stream_request_type)
             .finish()
     }
 }
@@ -619,7 +634,13 @@ impl MQClientInstance {
             producer_table: Mutex::new(HashSet::new()),
             consumer_group_table: Mutex::new(HashSet::new()),
             top_addressing: Arc::new(tokio::sync::Mutex::new(
-                config.top_addressing.clone().unwrap_or_default(),
+                config
+                    .top_addressing
+                    .clone()
+                    .unwrap_or_default()
+                    // Java `MQClientAPIImpl:322` 把 unitName 传进地址服务器，
+                    // 取到的 URL 形如 `...-unitA?nofix=1`（`DefaultTopAddressing#buildUrl`）。
+                    .with_unit_name(config.unit_name.clone().unwrap_or_default()),
             )),
             consumer_stats_manager: config
                 .consumer_stats_manager
@@ -633,6 +654,15 @@ impl MQClientInstance {
             consumer_ids_changed_count: AtomicUsize::new(0),
         });
         let this = MQClientInstance { inner: inner.clone() };
+        // Java `MQClientAPIImpl:329-333` 的钩子顺序是
+        // `NamespaceRpcHook → StreamTypeRPCHook → 用户 rpcHook → DynamicalExtFieldRPCHook`，
+        // 注释还特别写明 stream 要在 ACL 之前（"make reserve field signature"）。
+        // 各门面的用户钩子是**创建实例之后**才注册的，所以在这里注册天然靠前。
+        if inner.config.enable_stream_request_type {
+            this.inner
+                .remoting_client
+                .register_rpc_hook(Arc::new(StreamTypeRPCHook::new()));
+        }
         // Python __init__：注册 326/220/221/307/309/40 六个实例级处理器
         // （Java MQClientAPIImpl 构造函数里的 clientRemotingProcessor）。
         // 40 也在这里：Java 是 `registerProcessor(NOTIFY_CONSUMER_IDS_CHANGED,
@@ -1461,6 +1491,11 @@ impl MQClientInstance {
     // ---------------- 消息发送 ----------------
 
     /// Python `send_message`：按路由解析 broker 地址后同步发送。
+    ///
+    /// `unit_mode` 对应 Java `DefaultMQProducerImpl#sendKernelImpl:1004` 的
+    /// `requestHeader.setUnitMode(tc.isUnitMode())`：broker 侧据此给自动创建的
+    /// topic 打上 `TopicSysFlag.UNIT`（`AbstractSendMessageProcessor:491`）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message(
         &self,
         producer_group: &str,
@@ -1468,6 +1503,7 @@ impl MQClientInstance {
         mq: &MessageQueue,
         timeout_millis: i64,
         sys_flag: i32,
+        unit_mode: bool,
     ) -> Result<SendResult> {
         // Python 先 `... if self.get_topic_route_data(mq.topic) else None` 再取一次，
         // 两次调用读的是同一份缓存（第二次必然命中），语义等价于「取一次路由」。
@@ -1481,11 +1517,12 @@ impl MQClientInstance {
                 mq.broker_name, mq.topic
             ))
         })?;
-        self.send_message_to_addr(producer_group, msg, mq, &addr, timeout_millis, sys_flag)
+        self.send_message_to_addr(producer_group, msg, mq, &addr, timeout_millis, sys_flag, unit_mode)
             .await
     }
 
     /// Python `send_message_to_addr`。
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_to_addr(
         &self,
         producer_group: &str,
@@ -1494,8 +1531,9 @@ impl MQClientInstance {
         addr: &str,
         timeout_millis: i64,
         sys_flag: i32,
+        unit_mode: bool,
     ) -> Result<SendResult> {
-        let mut request = Self::build_send_request(producer_group, msg, mq, sys_flag);
+        let mut request = Self::build_send_request(producer_group, msg, mq, sys_flag, unit_mode);
         let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
         Self::parse_send_response(&response, msg.as_message(), mq)
     }
@@ -1511,8 +1549,9 @@ impl MQClientInstance {
         mq: &MessageQueue,
         addr: &str,
         sys_flag: i32,
+        unit_mode: bool,
     ) -> Result<()> {
-        let mut request = Self::build_send_request(producer_group, msg, mq, sys_flag);
+        let mut request = Self::build_send_request(producer_group, msg, mq, sys_flag, unit_mode);
         request.mark_oneway_rpc();
         self.inner.remoting_client.invoke_oneway(addr, &mut request).await
     }
@@ -1527,6 +1566,7 @@ impl MQClientInstance {
         msg: &mut PublishMessage<'_>,
         mq: &MessageQueue,
         sys_flag: i32,
+        unit_mode: bool,
     ) -> RemotingCommand {
         if !msg.is_batch() {
             set_uniq_id(msg.as_message_mut());
@@ -1543,7 +1583,9 @@ impl MQClientInstance {
             flag: Some(outer.flag),
             properties: Some(message_properties_2_string(&outer.properties)),
             reconsume_times: Some(0),
-            unit_mode: Some(false),
+            // Java `sendKernelImpl:1004` `requestHeader.setUnitMode(tc.isUnitMode())`。
+            // V2 头把它映射成单字母键 `k`（`SendMessageRequestHeaderV2`）。
+            unit_mode: Some(unit_mode),
             // Java `sendKernelImpl:1007-1018` 只在「发往 %RETRY% 且消息带
             // MAX_RECONSUME_TIMES 属性」时才设这个字段，平时留 null。这里必须留
             // `None`：broker 在 `version >= V3_4_9` 后无条件采纳请求里的值
@@ -2385,6 +2427,7 @@ impl MQClientInstance {
         max_reconsume_times: Option<i32>,
         timeout_millis: i64,
         addr: &str,
+        unit_mode: bool,
     ) -> Result<()> {
         let header = ConsumerSendMsgBackRequestHeader {
             offset: Some(msg.commit_log_offset),
@@ -2392,7 +2435,9 @@ impl MQClientInstance {
             delay_level: Some(delay_level),
             origin_msg_id: msg.msg_id.clone(),
             origin_topic: Some(msg.topic.clone()),
-            unit_mode: Some(false),
+            // Java `DefaultMQPullConsumerImpl#sendMessageBack` /
+            // `DefaultMQPushConsumerImpl#sendMessageBackImpl` 都是 `tc.isUnitMode()`。
+            unit_mode: Some(unit_mode),
             max_reconsume_times,
         };
         let mut request = RemotingCommand::create_request_command(

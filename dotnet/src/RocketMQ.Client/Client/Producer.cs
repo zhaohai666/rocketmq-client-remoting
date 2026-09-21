@@ -38,6 +38,10 @@ public class DefaultMQProducer
     private string _namespace = string.Empty;
     // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
     private IRpcHook? _rpcHook;
+    // ClientConfig 的三个单元化/stream 开关（默认值与 Java DefaultMQProducer 一致）
+    private string _unitName = string.Empty;
+    private bool _unitMode;
+    private bool _enableStreamRequestType;
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
@@ -248,6 +252,39 @@ public class DefaultMQProducer
         set => _namespace = value ?? string.Empty;
     }
 
+    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
+    // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置：unitName 与
+    // @STREAM 决定 clientId 的形状，stream 决定请求钩子链（ReqT 要进 ACL 签名内容）。
+    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
+    public string UnitName
+    {
+        get => _unitName;
+        set => _unitName = value ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#isUnitMode()</c>。生产者这一路只落在一处：
+    /// <c>DefaultMQProducerImpl:1004</c> 的 <c>requestHeader.setUnitMode(...)</c>
+    /// → SEND_MESSAGE_V2 的单字母键 <c>k</c>；broker 据此给自动建出来的 topic 打
+    /// UNIT(0x1) / UNIT_SUB(0x2) 系统标记（AbstractSendMessageProcessor:487-497）。
+    /// Java 的 DefaultMQProducer 从不主动置真，所以默认 false。
+    /// </summary>
+    public bool UnitMode
+    {
+        get => _unitMode;
+        set => _unitMode = value;
+    }
+
+    /// <summary>
+    /// true 时每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。
+    /// Java 只有 pull / lite 消费者在构造里置真，生产者默认 false。
+    /// </summary>
+    public bool EnableStreamRequestType
+    {
+        get => _enableStreamRequestType;
+        set => _enableStreamRequestType = value;
+    }
+
     // ---------------- ACL 鉴权（对应 Java DefaultMQProducer(group, rpcHook)）----------------
     // 必须在 Start() 之前调用：钩子在 Start() 里绑定到 MQClientInstance（同一 clientId
     // 复用实例时以先注册者为准，与 Java 的绑定时机一致）。
@@ -409,23 +446,26 @@ public class DefaultMQProducer
             _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
             if (string.IsNullOrEmpty(_clientId))
             {
-                _clientId = ClientIds.Build(_instanceName);
+                _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
             }
 
+            // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定必须在 Start() 之前 ——
+            // Java 的 rpcHook 是随 MQClientAPIImpl 构造进去的，实例第一笔报文就带着它；
+            // 放在 Start() 之后，start 期间的动态取址/首包路由就是裸的。
+            // composeRequestHooks 还原 Java 的 stream → 用户钩子顺序（单槽传输层）。
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
-                tlsEnable: _tlsEnable);
+                tlsEnable: _tlsEnable, unitName: _unitName);
+            if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
+            {
+                ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
+                    + _clientId + ")");
+            }
             _mqClient.Start();
             // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
             {
                 _nameServerAddrs = new List<string>(_mqClient.NameServerAddrs);
-            }
-
-            // ACL 鉴权钩子：必须在任何请求发出之前绑定（路由拉取、心跳都会带签名）。
-            if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
-            {
-                ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
-                    + _clientId + ")");
             }
 
             // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
@@ -645,7 +685,7 @@ public class DefaultMQProducer
 
         if (!HasSendInterceptors())
         {
-            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
+            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode);
         }
 
         string brokerAddr = string.Empty;
@@ -662,7 +702,7 @@ public class DefaultMQProducer
 
         if (_sendMessageHooks.Count == 0)
         {
-            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
+            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode);
         }
 
         SendMessageContext context = BuildSendContext(msg, mq, brokerAddr);
@@ -670,7 +710,7 @@ public class DefaultMQProducer
         SendResult result;
         try
         {
-            result = c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag);
+            result = c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode);
         }
         catch (Exception e)
         {
@@ -703,7 +743,9 @@ public class DefaultMQProducer
             BrokerAddr = brokerAddr,
             CommunicationMode = mode,
             Arg = arg,
-            UnitMode = false, // 本项目无 unit mode
+            // Java DefaultMQProducerImpl:964 `checkForbiddenContext.setUnitMode(this.isUnitMode())`
+            // —— 钩子据此判断这是不是单元化流量。
+            UnitMode = _unitMode,
         };
         ExecuteCheckForbiddenHook(context);
     }
@@ -1095,7 +1137,7 @@ public class DefaultMQProducer
             TraceParentContext.Inject(outbound);
         }
 
-        c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag);
+        c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag, _unitMode);
     }
 
     // ---------------- 批量 ----------------

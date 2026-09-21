@@ -78,6 +78,18 @@ public:
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     const std::string& namespaceOf() const { return namespace_; }
 
+    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
+    // 对应 Java `ClientConfig` 的三个同名开关（差异见 `cpp/README.md`）。
+    // 必须在 start() 之前设置：unitName/@STREAM 决定 clientId，stream 决定钩子链，
+    // 两者都要在首个请求发出前定下来。
+    void setUnitName(const std::string& unitName) { unitName_ = unitName; }
+    const std::string& unitName() const { return unitName_; }
+    // Java `DefaultMQProducer` 不置 unitMode（只有消费者/事务链路读它），默认 false。
+    void setUnitMode(bool unitMode) { unitMode_ = unitMode; }
+    bool isUnitMode() const { return unitMode_; }
+    void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
+    bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
+
     // ---------------- 故障规避（对应 Java sendLatencyFaultEnable，默认关闭）----------------
     // 开启后发送选队列会按 broker 延迟/隔离状态过滤（MQFaultStrategy）；发送结果回写
     // 容错表：成功记实测延迟（超阈值隔离该 broker 一段时间），异常记隔离 10000ms 档。
@@ -295,6 +307,11 @@ protected:
     std::string producerGroup_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
+    std::string unitName_;
+    bool unitMode_ = false;
+    // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
+    // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
+    bool enableStreamRequestType_ = false;
     std::string createTopicKey_ = MixAll::DEFAULT_TOPIC;
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();

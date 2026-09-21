@@ -62,6 +62,12 @@ struct MixAll {
     static constexpr const char* RMQ_SYS_TRANS_OP_HALF_TOPIC = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
     static constexpr int32_t TRANS_CHECK_MAX_TIME = 15;
     static constexpr const char* UNIT_PREFIX = "unit_";
+    // 对应 Java `MixAll.REQ_T`：请求类型标记的 extFields 键，由 StreamTypeRPCHook 写入。
+    // broker 侧只有 proxy/stream 链路读它，普通 broker 忽略。
+    static constexpr const char* REQ_T = "ReqT";
+    // Java 拼 clientId 用的是 `RequestType.STREAM.name()`，即字面量 "STREAM"
+    // （⚠ 与 extFields 里那个**枚举 code** 不同，见 StreamTypeRPCHook）。
+    static constexpr const char* STREAM_REQUEST_TYPE = "STREAM";
 
     static constexpr int32_t DEFAULT_TOPIC_QUEUE_NUMS = 4;
     static constexpr int32_t DEFAULT_TOPIC_READ_QUEUE_NUMS = 4;

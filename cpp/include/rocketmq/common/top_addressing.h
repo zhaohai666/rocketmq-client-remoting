@@ -41,6 +41,14 @@ class DefaultTopAddressing {
     void setWsAddr(std::string wsAddr) { wsAddr_ = std::move(wsAddr); }
     const std::string& wsAddr() const { return wsAddr_; }
 
+    void setUnitName(std::string unitName) { unitName_ = std::move(unitName); }
+    const std::string& unitName() const { return unitName_; }
+
+    // 用环境变量 ROCKETMQ_NAMESRV_DOMAIN 装配 wsAddr，并把 unitName 带进 URL 拼装。
+    // 对应 Java `MQClientAPIImpl` 构造里的 `new DefaultTopAddressing(unitName)`：
+    // 那个构造函数自己读这个环境变量。未配置时保持原样 = 动态取址关闭。
+    void configureFromEnv(const std::string& unitName = std::string());
+
     // 对应 fetchNSAddr 里的 URL 拼装（unitName / para 规则逐条照抄）
     std::string buildUrl() const;
 

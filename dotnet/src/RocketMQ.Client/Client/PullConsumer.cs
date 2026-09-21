@@ -41,6 +41,11 @@ public sealed class DefaultMQPullConsumer
     private string _messageModel = MessageModel.Clustering;
     private readonly List<string> _nameServerAddrs = new();
     private IRpcHook? _rpcHook;
+    // ClientConfig 的三个单元化/stream 开关。⚠ Java 的 DefaultMQPullConsumer 在两个
+    // 构造函数里就把 enableStreamRequestType 置真（:113/126），所以这里默认 **true**。
+    private string _unitName = string.Empty;
+    private bool _unitMode;
+    private bool _enableStreamRequestType = true;
     private readonly SortedSet<string> _registerTopics = new(StringComparer.Ordinal);
     private readonly Dictionary<string, IMessageQueueListener> _messageQueueListeners =
         new(StringComparer.Ordinal);
@@ -114,6 +119,35 @@ public sealed class DefaultMQPullConsumer
         set => _namespace = value ?? string.Empty;
     }
 
+    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
+    // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置。
+    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
+    public string UnitName
+    {
+        get => _unitName;
+        set => _unitName = value ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#isUnitMode()</c>：进回投请求头与（有过滤钩子时的）
+    /// 消息过滤上下文，broker 据此给 %RETRY% topic 打 UNIT_SUB(0x2)。
+    /// </summary>
+    public bool UnitMode
+    {
+        get => _unitMode;
+        set => _unitMode = value;
+    }
+
+    /// <summary>
+    /// 每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。
+    /// Java 的 DefaultMQPullConsumer 在构造里就置真（:113/126），本端口默认值与之对齐。
+    /// </summary>
+    public bool EnableStreamRequestType
+    {
+        get => _enableStreamRequestType;
+        set => _enableStreamRequestType = value;
+    }
+
     // ---------------- ACL 鉴权 ----------------
     /// <summary>必须在 Start() 之前调用：钩子在 Start() 里绑定到 MqClient。</summary>
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
@@ -174,23 +208,27 @@ public sealed class DefaultMQPullConsumer
             }
             if (_clientId.Length == 0)
             {
-                _clientId = ClientIds.Build(_instanceName);
+                _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
             }
 
+            // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定在 Start() **之前** ——
+            // Java 的 rpcHook 随 MQClientAPIImpl 构造传入，实例第一笔报文（路由拉取、
+            // 位点查询）就该带着它。拉模式默认开 stream，所以这里必须走 Compose，
+            // 直接注册 _rpcHook 会让 ReqT 漏发、且 ACL 签的内容与上线字段不一致。
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
-                /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/_consumerPullTimeoutMillis);
+                /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/_consumerPullTimeoutMillis,
+                unitName: _unitName);
+            if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
+            {
+                ClientLog.Warn("pull consumer rpc hook ignored: MqClient already has one (clientId="
+                    + _clientId + ")");
+            }
             _mqClient.Start();
             // 拉模式也要登记 topic，路由才会被周期刷新（对齐 Java registerTopicInUse）。
             foreach (string t in _registerTopics)
             {
                 _mqClient.RegisterTopicInUse(NamespaceUtil.WrapNamespace(_namespace, t));
-            }
-
-            // ACL 鉴权钩子：必须在首包（路由拉取 / 位点查询）发出之前绑定。
-            if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
-            {
-                ClientLog.Warn("pull consumer rpc hook ignored: MqClient already has one (clientId="
-                    + _clientId + ")");
             }
 
             _started = true;
@@ -329,7 +367,11 @@ public sealed class DefaultMQPullConsumer
             DelayLevel = delayLevel,
             OriginMsgId = msg.MsgId,
             OriginTopic = msg.Topic,
-            UnitMode = false,
+            // ⚠ 有意超出 Java：MQClientAPIImpl#consumerSendMessageBack(:1684-1693) 从不写
+            // unitMode（恒 false），但 broker 侧读它（AbstractSendMessageProcessor:135-138
+            // → buildSysFlag(false, true)）。按消费者配置如实上报，单元化重试 topic
+            // 才会带 UNIT_SUB 标记。
+            UnitMode = _unitMode,
             // ⚠ 不照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack（它直接传
             // getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker 无条件采信
             // 该字段（AbstractSendMessageProcessor:172-179），-1 会让 reconsumeTimes(0) >= -1

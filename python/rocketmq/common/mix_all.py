@@ -58,6 +58,12 @@ class MixAll:
     RMQ_SYS_TRANS_CHECK_MAX_TIME = 15
     TRANS_CHECK_MAX_TIME = 15
     UNIT_PREFIX = "unit_"
+    # Java `MixAll.REQ_T`（common/MixAll.java:115）：extFields 的键名，值是
+    # `RequestType` 的枚举 code。由 StreamTypeRPCHook 在发请求前写入。
+    REQ_T = "ReqT"
+    # Java `ClientConfig#buildMQClientId` 拼的是 `sb.append(RequestType.STREAM)`，
+    # 即枚举**名**（不是 code），所以 clientId 后缀为 "@STREAM"。
+    STREAM_REQUEST_TYPE = "STREAM"
     LMQ_PREFIX = "%LMQ%"
     LMQ_QUEUE_ID = 0
     DEFAULT_TOPIC_QUEUE_NUMS = 4
@@ -202,16 +208,22 @@ class MixAll:
 
     @staticmethod
     def build_mq_client_id(client_ip: str, instance_name: str,
-                           unit_name: Optional[str] = None) -> str:
-        """对应 Java `ClientConfig#buildMQClientId`：`ip@instanceName[@unitName]`。
+                           unit_name: Optional[str] = None,
+                           enable_stream_request_type: bool = False) -> str:
+        """对应 Java `ClientConfig#buildMQClientId`：`ip@instanceName[@unitName][@STREAM]`。
 
-        Java 还会在 `enableStreamRequestType` 时再拼一段 `@STREAM`；本客户端没有
-        这个开关（也没有 unitName 配置项），所以那两条后缀永远拼不出来。
+        两段后缀都是可选的，且顺序固定：先 unitName 再 STREAM。
+        - unitName：Java 用 `UtilAll.isBlank(unitName)` 判断，**只在判空时用 trim**，
+          拼接用的是原值（所以尾随空格的 unitName 会原样进 clientId）。
+        - STREAM：`enableStreamRequestType` 为真时拼 `sb.append(RequestType.STREAM)`，
+          即枚举名。它的存在意义见 `client_id_for` 的注释。
         """
         cid = "%s@%s" % (client_ip, instance_name)
         if unit_name is not None and unit_name.strip():
             # Java 只在 isBlank 判断上用了 trim，拼接时用的是原值
             cid = "%s@%s" % (cid, unit_name)
+        if enable_stream_request_type:
+            cid = "%s@%s" % (cid, MixAll.STREAM_REQUEST_TYPE)
         return cid
 
     @staticmethod
@@ -231,13 +243,19 @@ class MixAll:
         return instance_name
 
     @staticmethod
-    def client_id_for(instance_name: str) -> str:
-        """未显式配置 clientId 时的默认口径：`<本机 IP>@<instanceName>`。
+    def client_id_for(instance_name: str, unit_name: Optional[str] = None,
+                      enable_stream_request_type: bool = False) -> str:
+        """未显式配置 clientId 时的默认口径：`<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
 
         调用方要按 Java 的条件先跑过 `change_instance_name_to_pid`
         （生产者无条件，消费者仅 CLUSTERING）。
+
+        `enable_stream_request_type` 这段后缀不只是好看：Java 的注释写明它是为了
+        「prevent unexpected reuses of MQClientInstance」—— 拉取/轻量消费者恒为 true，
+        所以同一个 instanceName 的它们与推送消费者天然落在不同的 clientId 上。
         """
-        return MixAll.build_mq_client_id(MixAll.cached_ip_str(), instance_name)
+        return MixAll.build_mq_client_id(MixAll.cached_ip_str(), instance_name,
+                                        unit_name, enable_stream_request_type)
 
     # ---------------- Properties <-> String（对应 MixAll.properties2String/string2Properties）----------------
     @staticmethod

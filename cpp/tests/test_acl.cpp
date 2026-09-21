@@ -7,11 +7,18 @@
 //
 // SHA1 / HMAC / Base64 的原语向量则取自公开标准（RFC 3174 / RFC 2202 / RFC 4648），
 // 用来保证即使签名向量通过，也不是"两个错误互相抵消"。
+//
+// 后半部分还覆盖 StreamTypeRPCHook 与钩子**顺序**：Java 把 stream 钩子注册在 ACL 之前
+// （MQClientAPIImpl:329-332），`ReqT` 因此必须落在签名内容里；顺序写反在不开鉴权的
+// broker 上完全看不出来，只有对拍能守住。
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "rocketmq/common/mix_all.h"
 #include "rocketmq/remoting/rpchook.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 
@@ -56,6 +63,31 @@ RemotingCommand makeRequest(const std::vector<std::pair<std::string, std::string
     }
     return cmd;
 }
+
+// 记录调用顺序、以及"被调用时看到的 extFields 快照"，用于证明 stream 钩子先跑。
+class LogHook : public RPCHook {
+public:
+    LogHook(std::vector<std::string>& log, std::string name)
+        : log_(log), name_(std::move(name)) {}
+
+    void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) override {
+        (void)remoteAddr;
+        log_.push_back(name_);
+        sawReqT = !request.getExtField(MixAll::REQ_T).empty();
+    }
+
+    void doAfterResponse(const std::string& remoteAddr, const RemotingCommand& request,
+                         const RemotingCommand* response) override {
+        (void)remoteAddr;
+        (void)request;
+        (void)response;
+        log_.push_back(name_ + "#after");
+    }
+
+    std::vector<std::string>& log_;
+    std::string name_;
+    bool sawReqT = false;
+};
 
 }  // namespace
 
@@ -220,6 +252,114 @@ static void testNoHookNoMutation() {
     CHECK(cmd.getExtField("Signature").empty(), "no hook => empty signature");
 }
 
+// ---------------------------------------------------------------- StreamTypeRPCHook
+// 对应 Java remoting/.../rpchook/StreamTypeRPCHook.java:28：
+// `request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))`，
+// 而 RequestType.STREAM 的 code 是 0 ⇒ 线上值是字面量 "0"（不是 "STREAM"）。
+static void testStreamHookWritesReqT() {
+    RemotingCommand cmd = makeRequest({{"topic", "MyTopic"}}, Bytes());
+    StreamTypeRPCHook hook;
+    hook.doBeforeRequest("127.0.0.1:10911", cmd);
+    CHECK(cmd.getExtField(MixAll::REQ_T) == "0", "stream hook writes ReqT=0");
+    CHECK(cmd.extFields.size() == 2, "stream hook only adds ReqT");
+    // doAfterResponse 是空实现（Java 该钩子只覆写 doBeforeRequest）
+    std::vector<std::string> log;
+    auto probe = std::make_shared<LogHook>(log, "probe");
+    ChainedRPCHook chain{std::vector<std::shared_ptr<RPCHook>>{probe}};
+    chain.doAfterResponse("127.0.0.1:10911", cmd, nullptr);
+    CHECK(log.size() == 1 && log[0] == "probe#after", "chained doAfterResponse forwards");
+}
+
+// ---------------------------------------------------------------- composeRequestHooks 形态
+static void testComposeRequestHooksShape() {
+    auto user = std::make_shared<AclClientRPCHook>(SessionCredentials("AK", "SK"));
+
+    // 都没开：不注册任何钩子（零开销），facade 会跳过 registerRPCHook
+    CHECK(composeRequestHooks(false, nullptr) == nullptr, "no stream + no user => no hook");
+
+    // 只有用户钩子：原对象直接返回，不套 ChainedRPCHook 壳
+    const std::shared_ptr<RPCHook> onlyUser = composeRequestHooks(false, user);
+    CHECK(onlyUser.get() == user.get(), "user only => the very same hook instance");
+    CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyUser) == nullptr,
+          "user only => not wrapped in a chain");
+
+    // stream 开关会改变包装形态
+    CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(composeRequestHooks(true, user)) != nullptr,
+          "stream + user => chained");
+    const std::shared_ptr<RPCHook> onlyStream = composeRequestHooks(true, nullptr);
+    CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyStream) != nullptr,
+          "stream only => still chained");
+    {
+        RemotingCommand cmd = makeRequest({{"topic", "T"}}, Bytes());
+        onlyStream->doBeforeRequest("127.0.0.1:10911", cmd);
+        CHECK(cmd.getExtField(MixAll::REQ_T) == "0", "stream-only chain still tags ReqT");
+        CHECK(cmd.getExtField(SessionCredentials::SIGNATURE).empty(),
+              "stream-only chain adds no signature");
+    }
+}
+
+// ---------------------------------------------------------------- 顺序：ReqT 必须进签名
+// Java MQClientAPIImpl:329-332 的注释是 "Inject stream rpc hook first to make reserve
+// field signature"：StreamTypeRPCHook 注册在用户 ACL 钩子**之前**，所以 broker 验签时
+// 看到的 extFields（含 ReqT）与客户端签名时看到的一致。
+static void testStreamRunsBeforeUserHook() {
+    std::vector<std::string> log;
+    auto probe = std::make_shared<LogHook>(log, "user");
+    ChainedRPCHook chain{
+        std::vector<std::shared_ptr<RPCHook>>{std::make_shared<StreamTypeRPCHook>(), probe}};
+
+    RemotingCommand cmd = makeRequest({{"topic", "MyTopic"}}, Bytes());
+    chain.doBeforeRequest("127.0.0.1:10911", cmd);
+    CHECK(probe->sawReqT, "user hook already sees ReqT when it runs");
+    CHECK(cmd.getExtField(MixAll::REQ_T) == "0", "ReqT survives to the wire");
+
+    // 顺序反过来（先签名后打标签）就是 bug：签的内容里没有 ReqT。
+    std::vector<std::string> wrongOrder;
+    auto signer = std::make_shared<LogHook>(wrongOrder, "acl");
+    auto tagger = std::make_shared<LogHook>(wrongOrder, "stream");
+    ChainedRPCHook reversed{
+        std::vector<std::shared_ptr<RPCHook>>{signer, tagger}};
+    RemotingCommand reversedCmd = makeRequest({{"topic", "MyTopic"}}, Bytes());
+    reversed.doBeforeRequest("127.0.0.1:10911", reversedCmd);
+    CHECK(!signer->sawReqT, "reversed order: signer runs before ReqT exists");
+    const std::vector<std::string> expectedReversed{"acl", "stream"};
+    CHECK(wrongOrder == expectedReversed, "chain runs hooks in order");
+    const std::vector<std::string> expectedForward{"user"};
+    CHECK(log == expectedForward, "chain does not reorder user hooks");
+}
+
+static void testReqTIsCoveredByAclSignature() {
+    const SessionCredentials credentials("RocketMQ", "FRo3RvIPW7ih");
+
+    // 1) 正确顺序：chain(Stream, ACL)
+    RemotingCommand chained = makeRequest({{"topic", "MyTopic"}}, Bytes("hello", 5));
+    composeRequestHooks(true, std::make_shared<AclClientRPCHook>(credentials))
+        ->doBeforeRequest("127.0.0.1:10911", chained);
+
+    // 2) 参照：手工写入 ReqT 后再单独跑 ACL —— 内容与 broker 侧重组出来的一致
+    RemotingCommand reference = makeRequest({{"topic", "MyTopic"}, {MixAll::REQ_T, "0"}},
+                                            Bytes("hello", 5));
+    AclClientRPCHook(credentials).doBeforeRequest("127.0.0.1:10911", reference);
+    CHECK(chained.getExtField(SessionCredentials::SIGNATURE)
+              == reference.getExtField(SessionCredentials::SIGNATURE),
+          "ReqT is inside the signed content (chain == manual order)");
+    CHECK(!chained.getExtField(SessionCredentials::SIGNATURE).empty(),
+          "chain actually produced a signature");
+
+    // 3) 错误顺序（先 ACL 后打标签）：签名里没有 ReqT ⇒ 与 1) 必然不同，
+    //    开了鉴权的 broker 会验签失败。这一条是顺序的回归守卫。
+    RemotingCommand wrong = makeRequest({{"topic", "MyTopic"}}, Bytes("hello", 5));
+    AclClientRPCHook(credentials).doBeforeRequest("127.0.0.1:10911", wrong);
+    const std::string wrongSig = wrong.getExtField(SessionCredentials::SIGNATURE);
+    wrong.addExtField(MixAll::REQ_T, "0");
+    CHECK(wrongSig != chained.getExtField(SessionCredentials::SIGNATURE),
+          "signing before ReqT produces a different (rejected) signature");
+    // broker 会拿**收到**的全部字段（含 ReqT）重算，故 2) 的内容才是对的
+    CHECK(AclClientRPCHook::buildRequestContent(reference).size()
+              == AclClientRPCHook::buildRequestContent(chained).size(),
+          "signed content matches what the broker recomputes");
+}
+
 int main() {
     testSha1Vectors();
     testHmacVectors();
@@ -227,6 +367,10 @@ int main() {
     testJavaSignatureVectors();
     testSignatureExcluded();
     testNoHookNoMutation();
+    testStreamHookWritesReqT();
+    testComposeRequestHooksShape();
+    testStreamRunsBeforeUserHook();
+    testReqTIsCoveredByAclSignature();
 
     std::cout << "acl: PASS=" << g_pass << " FAIL=" << g_fail << "\n";
     return g_fail == 0 ? 0 : 1;

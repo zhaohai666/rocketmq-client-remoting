@@ -51,22 +51,29 @@ public static class ClientIds
     }
 
     /// <summary>
-    /// 对应 Java <c>ClientConfig#buildMQClientId</c>：<c>ip@instanceName[@unitName]</c>。
-    /// Java 还会在 enableStreamRequestType 时再拼一段 <c>@STREAM</c>；本端口没有这两个开关。
+    /// 对应 Java <c>ClientConfig#buildMQClientId</c>：
+    /// <c>ip@instanceName[@unitName][@STREAM]</c>。
+    /// 两处后缀口径不同，别抄反了：unitName 是**原值**、且 <c>UtilAll.isBlank</c> 时整段不拼；
+    /// stream 后缀是 <c>sb.append(RequestType.STREAM)</c>，走枚举 **name**（"STREAM"），
+    /// 而打到 ExtFields 的 <c>ReqT</c> 是 code（"0"，见 StreamTypeRPCHook）。
     /// </summary>
-    public static string BuildMqClientId(string clientIp, string instanceName, string? unitName = null)
+    public static string BuildMqClientId(string clientIp, string instanceName,
+        string? unitName = null, bool enableStreamRequestType = false)
     {
         var sb = new StringBuilder();
         sb.Append(clientIp).Append('@').Append(instanceName);
         if (!string.IsNullOrWhiteSpace(unitName)) sb.Append('@').Append(unitName);
+        if (enableStreamRequestType) sb.Append('@').Append("STREAM");
         return sb.ToString();
     }
 
     /// <summary>
-    /// 未显式配置 clientId 时的默认口径：<c>&lt;本机 IP&gt;@&lt;instanceName&gt;</c>。
+    /// 未显式配置 clientId 时的默认口径：<c>&lt;本机 IP&gt;@&lt;instanceName&gt;[@unitName][@STREAM]</c>。
     /// 调用方要按 Java 的条件先跑过 <see cref="ChangeInstanceNameToPID"/>。
     /// </summary>
-    public static string Build(string instanceName) => BuildMqClientId(MixAll.CachedIpStr(), instanceName);
+    public static string Build(string instanceName, string? unitName = null,
+        bool enableStreamRequestType = false)
+        => BuildMqClientId(MixAll.CachedIpStr(), instanceName, unitName, enableStreamRequestType);
 }
 
 /// <summary>
@@ -175,7 +182,9 @@ public sealed class MQClientInstance : IDisposable
 
     // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
     // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 → fetch 是 no-op，行为不变。
-    public DefaultTopAddressing TopAddressing { get; } = new();
+    // 非空白 unitName 会让 URL 多出 `-<unitName>?nofix=1`（Java `MQClientAPIImpl` 构造里
+    // `new DefaultTopAddressing(unitName)`），单元化环境取到的是本单元的 namesrv 列表。
+    public DefaultTopAddressing TopAddressing { get; }
     private Thread? _namesrvRefreshThread;
     private readonly ManualResetEventSlim _namesrvRefreshStop = new(false);
 
@@ -207,12 +216,21 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>Java 的 tls.enable 是 JVM 全局系统属性；这里等价为 env ROCKETMQ_TLS_ENABLE。</summary>
     internal static bool TlsEnabledFromEnv() => RemotingClient.EnvTlsEnabled();
 
+    /// <summary>
+    /// <paramref name="unitName"/> 只为动态取址服务（对应 Java <c>MQClientAPIImpl</c> 构造里的
+    /// <c>new DefaultTopAddressing(unitName)</c>）；静态地址路径下它只影响 clientId。
+    /// </summary>
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
-        int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null)
+        int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
+        string? unitName = null)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
         _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable);
+        // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 = 动态取址关闭（与 Java 默认
+        // jmenv.tbsite.net 不同：那是个依赖 /etc/hosts 的域名，照抄会让未配置的用户
+        // 每次 start 白等 3s 超时）。
+        TopAddressing = new DefaultTopAddressing(unitName: unitName);
 
         // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
         // 对应 Java MQClientAPIImpl 构造里
@@ -713,7 +731,7 @@ public sealed class MQClientInstance : IDisposable
     /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
     /// </summary>
     public RemotingCommand BuildSendRequest(string producerGroup, Message msg, MessageQueue mq,
-        int sysFlag = 0)
+        int sysFlag = 0, bool unitMode = false)
     {
         var header = new SendMessageRequestHeaderV2
         {
@@ -727,7 +745,10 @@ public sealed class MQClientInstance : IDisposable
             Flag = msg.Flag,
             Properties = MessageDecoder.MessagePropertiesToString(msg.Properties),
             ReconsumeTimes = 0,
-            UnitMode = false,
+            // 对应 Java DefaultMQProducerImpl:1004 `requestHeader.setUnitMode(this.isUnitMode())`
+            // → V2 的单字母键 `k`（SendMessageRequestHeaderV2.java:62）。broker 据此给
+            // 自动创建的 topic 打 UNIT(0x1)/UNIT_SUB(0x2) 标记，单元化路由靠它。
+            UnitMode = unitMode,
             // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
             // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
             // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
@@ -749,9 +770,10 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>
     /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
     /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
+    /// unitMode 同样由调用方给（Java 从 producer 的 ClientConfig 取，见 sendKernelImpl:1004）。
     /// </summary>
     public SendResult SendMessage(string producerGroup, Message msg, MessageQueue mq,
-        int timeoutMillis = 3000, int sysFlag = 0)
+        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false)
     {
         string addr = BrokerAddr(mq);
         // 对应 Java DefaultMQProducerImpl.sendKernelImpl：非批量消息在**发请求之前**
@@ -762,7 +784,7 @@ public sealed class MQClientInstance : IDisposable
             MessageClientIDSetter.SetUniqId(msg);
         }
 
-        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
 
         SendStatus status;
@@ -844,7 +866,7 @@ public sealed class MQClientInstance : IDisposable
     }
 
     public void SendMessageOneway(string producerGroup, Message msg, MessageQueue mq,
-        int timeoutMillis = 3000, int sysFlag = 0)
+        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false)
     {
         string addr = BrokerAddr(mq);
         // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
@@ -853,7 +875,7 @@ public sealed class MQClientInstance : IDisposable
             MessageClientIDSetter.SetUniqId(msg);
         }
 
-        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag);
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
         request.MarkOnewayRpc();
         _remotingClient.InvokeOneway(addr, request);
     }

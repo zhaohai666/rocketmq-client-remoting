@@ -114,20 +114,28 @@ void DefaultMQPullConsumer::start() {
         instanceName_ = changeInstanceNameToPID(instanceName_);
     }
     if (clientId_.empty()) {
-        clientId_ = buildClientId(instanceName_);
+        clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
     }
+    // 拉模式消费者默认开着 stream（Java `DefaultMQPullConsumer:113/126` 在构造函数里
+    // 就置了 true），unitName 只影响动态取址的 URL。
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,
-                                        consumerPullTimeoutMillis_));
+                                        consumerPullTimeoutMillis_,
+                                        MQClientInstance::tlsEnabledFromEnv(), unitName_));
+    // 请求钩子（ACL 签名 / stream 的 `ReqT`）：必须在**实例 start() 之前**绑定 ——
+    // Java 的 rpcHook 是在 MQClientAPIImpl 构造时传进去的（MQClientInstance:214 附近），
+    // 也就是实例发出的第一笔报文就带着它；放到 start() 之后，start 期间的动态取址、
+    // 首包路由就可能签不出 ReqT/AccessKey。
+    std::shared_ptr<RPCHook> requestHook =
+        composeRequestHooks(enableStreamRequestType_, rpcHook_);
+    if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
+        logger_warn("pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
+                    + clientId_ + ")");
+    }
     mqClient_->start();
     // 拉模式也要登记 topic，路由才会被周期刷新（对齐 Java registerTopicInUse）。
     for (const std::string& t : registerTopics_) {
         mqClient_->registerTopicInUse(NamespaceUtil::wrapNamespace(namespace_, t));
-    }
-    // ACL 鉴权钩子：必须在首包（路由拉取 / 位点查询）发出之前绑定。
-    if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
-        logger_warn("pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
-                    + clientId_ + ")");
     }
     started_ = true;
 }
@@ -281,7 +289,13 @@ void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
     header->delayLevel = delayLevel;
     header->originMsgId = msg.msgId;
     header->originTopic = msg.topic;
-    header->unitMode = false;
+    // ⚠ 有意超出 Java：Java 的 MQClientAPIImpl#consumerSendMessageBack(:1684-1693) 只填
+    // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName，
+    // 从不写 unitMode，所以字段恒为 false —— 单元化模式下回投自动建出的 %RETRY%group
+    // 拿不到 UNIT_SUB 标记。broker 侧是读这个字段的
+    // （AbstractSendMessageProcessor:135-138 → TopicSysFlag.buildSysFlag(false, true)），
+    // 故这里按消费者配置如实上报。
+    header->unitMode = unitMode_;
     // ⚠ 不照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack（它直接传
     // getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker 无条件采信该
     // 字段（`AbstractSendMessageProcessor:172-179`），-1 会让 reconsumeTimes(0) >= -1

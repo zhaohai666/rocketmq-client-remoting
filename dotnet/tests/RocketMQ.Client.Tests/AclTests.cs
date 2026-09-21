@@ -10,6 +10,7 @@
 //
 // 任何一处拼接顺序 / 分隔符 / 字符集 / Base64 字母表的偏差都会立刻暴露。
 using System.Text;
+using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
@@ -186,5 +187,81 @@ public class AclTests
         Assert.False(client.RegisterRpcHook(second)); // 已有钩子 → 不覆盖
         client.UnregisterRpcHook();
         Assert.True(client.RegisterRpcHook(second)); // 注销后可再注册
+    }
+
+    // ------------------------------------------------- stream + ACL 的组合顺序（ReqT 必须在签名内）
+
+    /// 传输层只有一槽，顺序靠 RequestHooks.Compose 还原；这里锁住它返回的形状。
+    [Fact]
+    public void ComposeFollowsJavaHookOrder()
+    {
+        var acl = new AclClientRPCHook(new SessionCredentials("AK", "SK"));
+
+        Assert.Null(RequestHooks.Compose(false, null));
+        Assert.Same(acl, RequestHooks.Compose(false, acl));
+        Assert.IsType<StreamTypeRPCHook>(RequestHooks.Compose(true, null));
+
+        var chain = Assert.IsType<ChainedRpcHook>(RequestHooks.Compose(true, acl));
+        Assert.IsType<StreamTypeRPCHook>(chain.Hooks[0]); // stream 在前
+        Assert.Same(acl, chain.Hooks[1]); // 用户钩子（签名）在后
+    }
+
+    /// 开 stream 时 ReqT 必须落在签名内容里：用签名后的 ExtFields 复算一次，能对上就说明
+    /// broker 按同样口径复算也能对上。
+    [Fact]
+    public void ReqTIsSignedWhenStreamTypeHookRunsFirst()
+    {
+        var acl = new AclClientRPCHook(new SessionCredentials("AK_TEST", SecretKey));
+        IRpcHook composed = RequestHooks.Compose(true, acl)!;
+
+        RemotingCommand cmd = MakeRequest(V1Ext(), V1Body());
+        composed.DoBeforeRequest("127.0.0.1:9876", cmd);
+
+        // Java StreamTypeRPCHook 写的是 code 的字符串形式 "0"（clientId 才用枚举名 STREAM）。
+        Assert.Equal("0", cmd.GetExtField(MixAll.ReqT));
+        Assert.Equal(
+            AclClientRPCHook.CalcSignature(SecretKey, cmd),
+            cmd.GetExtField(SessionCredentials.SignatureField));
+    }
+
+    /// 反证：顺序写反时同一套断言必须红，否则上一条测试没有牙齿。
+    [Fact]
+    public void ReversedHookOrderBreaksTheSignature()
+    {
+        var acl = new AclClientRPCHook(new SessionCredentials("AK_TEST", SecretKey));
+        var reversed = new ChainedRpcHook(new IRpcHook[] { acl, new StreamTypeRPCHook() });
+
+        RemotingCommand cmd = MakeRequest(V1Ext(), V1Body());
+        reversed.DoBeforeRequest("127.0.0.1:9876", cmd);
+
+        Assert.NotEqual(
+            AclClientRPCHook.CalcSignature(SecretKey, cmd),
+            cmd.GetExtField(SessionCredentials.SignatureField));
+    }
+
+    /// 组合钩子的 doAfterResponse 要逐个转发（Java 的 rpcHooks 列表就是这个语义）。
+    [Fact]
+    public void ChainedHookForwardsAfterResponse()
+    {
+        var counting = new CountingHook();
+        var chain = new ChainedRpcHook(new IRpcHook[] { new StreamTypeRPCHook(), counting });
+        RemotingCommand cmd = MakeRequest(new[] { ("topic", "MyTopic") });
+
+        chain.DoAfterResponse("addr", cmd, null);
+        Assert.Equal(1, counting.After);
+        chain.DoBeforeRequest("addr", cmd);
+        Assert.Equal(1, counting.Before);
+    }
+
+    private sealed class CountingHook : IRpcHook
+    {
+        public int Before { get; private set; }
+
+        public int After { get; private set; }
+
+        public void DoBeforeRequest(string remoteAddr, RemotingCommand request) => Before++;
+
+        public void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response)
+            => After++;
     }
 }

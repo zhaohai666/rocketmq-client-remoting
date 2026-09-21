@@ -44,15 +44,19 @@ namespace rocketmq {
 // CLIENT_INNER_PRODUCER）和 CLUSTERING 消费者的 start() 里调用它，条件由各 facade 把。
 std::string changeInstanceNameToPID(const std::string& instanceName);
 
-// 对应 Java `ClientConfig#buildMQClientId`：`ip@instanceName[@unitName]`。
-// Java 还会在 enableStreamRequestType 时再拼一段 `@STREAM`；本端口没有这两个开关。
+// 对应 Java `ClientConfig#buildMQClientId`：
+// `ip@instanceName` + （unitName 非空白时）`@unitName` + （enableStreamRequestType 时）
+// `@STREAM`。⚠ 末段用的是 `RequestType.STREAM.name()` 字面量，不是它的 code。
 std::string buildMqClientId(const std::string& clientIp, const std::string& instanceName,
-                            const std::string& unitName = std::string());
+                            const std::string& unitName = std::string(),
+                            bool enableStreamRequestType = false);
 
-// 未显式配置 clientId 时的默认口径：`<本机 IP>@<instanceName>`（对应 Java 的
-// `changeInstanceNameToPID()` + `buildMQClientId()` 连用，改写那步由调用方按条件做）。
+// 未显式配置 clientId 时的默认口径：`<本机 IP>@<instanceName>[@unitName][@STREAM]`
+// （对应 Java 的 `changeInstanceNameToPID()` + `buildMQClientId()` 连用，改写那步由调用方按条件做）。
 // 旧的 `instanceName@时间戳@pid@seq` 已废弃：把唯一性做在 instanceName 里才是 Java 的做法。
-std::string buildClientId(const std::string& instanceName);
+std::string buildClientId(const std::string& instanceName,
+                          const std::string& unitName = std::string(),
+                          bool enableStreamRequestType = false);
 
 // 对应 org.apache.rocketmq.client.impl.producer.TopicPublishInfo
 //
@@ -94,11 +98,15 @@ public:
     // Java 的 tls.enable 是 JVM 全局系统属性；这里等价为 env ROCKETMQ_TLS_ENABLE。
     static bool tlsEnabledFromEnv();
 
+    // `unitName` 对应 Java `MQClientAPIImpl` 构造里传给 `DefaultTopAddressing` 的那个值：
+    // 只影响动态取址的 URL（`-<unitName>` 段）。clientId 的 unitName/@STREAM 后缀在
+    // 各 facade 里就已经拼好了（Java 同：`ClientConfig#buildMQClientId`）。
     MQClientInstance(const std::string& clientId,
                      const std::vector<std::string>& nameServerAddrs,
                      int32_t connectTimeoutMillis = 3000,
                      int32_t invokeTimeoutMillis = 15000,
-                     bool tlsEnable = tlsEnabledFromEnv());
+                     bool tlsEnable = tlsEnabledFromEnv(),
+                     const std::string& unitName = std::string());
     ~MQClientInstance();
 
     MQClientInstance(const MQClientInstance&) = delete;
@@ -139,9 +147,12 @@ public:
     // 公开只为让离线用例能驱动这条反向路径（真连接上 broker 推不进来）。
     void processNotifyConsumerIdsChanged(const RemotingCommand& cmd, const std::string& addr);
 
-    // 安装 RPC 钩子（ACL 鉴权）。对应 Java 在 MQClientInstance 构造时绑定 rpcHook。
-    // **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
-    // 此时返回 false。故钩子必须在 start() 之前设置。
+    // 安装 RPC 钩子（ACL 鉴权 + 可选的 stream 打标）。对应 Java 在 MQClientAPIImpl
+    // 构造时绑定 rpcHook。
+    // ⚠ 与 Java 的差异：Java 的传输层持 RPCHook **列表**（后注册者追加在后面），本端口
+    // 只有一槽且 first-wins —— 第二个注册者被忽略并返回 false。因此各 facade 必须先把
+    // stream 钩子与用户钩子**合成一个**再注册（见 composeRequestHooks），否则顺序就丢了。
+    // 钩子必须在 start() 之前设置。
     bool registerRPCHook(std::shared_ptr<RPCHook> hook) {
         return remotingClient_->registerRPCHook(std::move(hook));
     }
@@ -173,12 +184,17 @@ public:
     // ---------------- 消息发送 ----------------
     // sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
     // 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer::prepareForSend）。
+    //
+    // `unitMode` 对应 Java `sendKernelImpl:1004` 写进发送头的 `tc.isUnitMode()`
+    // （V2 头里映射成单字母键 `k`）。必须**逐次传入**而不是存在实例上：Java 的
+    // MQClientInstance 按 clientId 共享，同一实例可能被 unitMode 不同的客户端复用。
+    // broker 侧后果见 `AbstractSendMessageProcessor:485-497`（自动建 topic 时打 UNIT 位）。
     SendResult sendMessage(const std::string& producerGroup, const Message& msg,
                            const MessageQueue& mq, int32_t timeoutMillis = 3000,
-                           int32_t sysFlag = 0);
+                           int32_t sysFlag = 0, bool unitMode = false);
     void sendMessageOneway(const std::string& producerGroup, const Message& msg,
                            const MessageQueue& mq, int32_t timeoutMillis = 3000,
-                           int32_t sysFlag = 0);
+                           int32_t sysFlag = 0, bool unitMode = false);
 
     // ---------------- 定时消息撤回 ----------------
     // RECALL_MESSAGE(370)，对应 Java MQClientAPIImpl#recallMessage(:3749-3767)：

@@ -88,15 +88,19 @@ void DefaultMQAdminExt::start() {
     // 设成 "DEFAULT" 时才起作用。
     instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
-        clientId_ = buildClientId(instanceName_);
+        clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
     }
-    mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_));
-    mqClient_->start();
-    // ACL 鉴权钩子：管理端的所有请求（建/删 topic、查状态等）同样需要签名。
-    if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
+    mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
+                                        3000, 15000, MQClientInstance::tlsEnabledFromEnv(),
+                                        unitName_));
+    // 请求钩子（ACL 签名 / stream 的 `ReqT`）：管理端所有请求同样要带上。
+    std::shared_ptr<RPCHook> requestHook =
+        composeRequestHooks(enableStreamRequestType_, rpcHook_);
+    if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
         logger_warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
                     + clientId_ + ")");
     }
+    mqClient_->start();
     started_ = true;
 }
 

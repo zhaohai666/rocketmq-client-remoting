@@ -156,11 +156,14 @@ pub fn filter_messages_for_delivery(
     mq: &MessageQueue,
     sub: Option<&SubscriptionData>,
     msgs: Vec<MessageExt>,
+    unit_mode: bool,
 ) -> Vec<MessageExt> {
     let mut out = client_side_tag_filter(sub, msgs);
     if !out.is_empty() && hooks.has_hooks() {
         let mut context = FilterMessageContext::new(consumer_group, Some(out), Some(mq.clone()));
-        // unit_mode 恒 false：本项目没有 unit mode（Java isUnitMode() 亦恒 false）
+        // Java `DefaultMQPushConsumerImpl:640` / `PullAPIWrapper:126`：
+        // `context.setUnitMode(...)` 取消费者的 `ClientConfig#unitMode`。
+        context.unit_mode = unit_mode;
         crate::client::hook::execute_filter_hooks(hooks, &mut context);
         out = context.msg_list;
     }
@@ -353,6 +356,17 @@ pub struct ConsumerConfig {
     pub instance_name: String,
     /// Python `client_id`；`None` 时 `start()` 里现造。
     pub client_id: Option<String>,
+    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
+    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
+    pub unit_name: Option<String>,
+    /// Java `ClientConfig#unitMode`（默认 false）：随发送/回投/鉴权/消息过滤
+    /// 一起上线，broker 据此给自动创建的 topic 打 UNIT / UNIT_SUB 位。
+    pub unit_mode: bool,
+    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
+    /// clientId 末尾多一段 `@STREAM`。
+    ///
+    /// Java `DefaultMQPushConsumer` 不碰这个开关，默认 false。
+    pub enable_stream_request_type: bool,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
@@ -431,6 +445,9 @@ impl Default for ConsumerConfig {
             consumer_group: MixAll::DEFAULT_CONSUMER_GROUP.to_string(),
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
+            unit_name: None,
+            unit_mode: false,
+            enable_stream_request_type: false,
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
@@ -770,6 +787,22 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.instance_name = name);
     }
 
+    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
+    pub fn set_unit_name(&self, unit_name: Option<&str>) {
+        let unit_name = unit_name.map(str::to_string);
+        self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `ClientConfig#setUnitMode`。
+    pub fn set_unit_mode(&self, unit_mode: bool) {
+        self.update_config(|c| c.unit_mode = unit_mode);
+    }
+
+    /// Java `ClientConfig#setEnableStreamRequestType`。
+    pub fn set_enable_stream_request_type(&self, enable: bool) {
+        self.update_config(|c| c.enable_stream_request_type = enable);
+    }
+
     pub fn set_message_listener(&self, listener: MessageListener) {
         *lock(&self.inner.listener) = Some(listener);
     }
@@ -999,7 +1032,13 @@ impl DefaultMQPushConsumer {
         let client_id = cfg
             .client_id
             .clone()
-            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+            .unwrap_or_else(|| {
+                MixAll::build_default_client_id(
+                    &instance_name,
+                    cfg.unit_name.as_deref(),
+                    cfg.enable_stream_request_type,
+                )
+            });
         self.update_config(|c| {
             c.consumer_group = group.clone();
             c.client_id = Some(client_id.clone());
@@ -1008,6 +1047,8 @@ impl DefaultMQPushConsumer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            unit_name: cfg.unit_name.clone(),
+            enable_stream_request_type: cfg.enable_stream_request_type,
             ..Default::default()
         };
         let client =
@@ -1777,6 +1818,7 @@ async fn queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 &mq,
                 Some(&sub),
                 msgs,
+                cfg.unit_mode,
             );
         }
         // 入队与「是否仍持有该队列」必须同一把锁内完成：挂起期间被撤走的队列，
@@ -2263,6 +2305,7 @@ async fn queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 &mq,
                 Some(&sub),
                 result.msg_found_list.clone(),
+                cfg.unit_mode,
             );
             let mut dropped_cnt = 0usize;
             if kept.len() != result.msg_found_list.len() {
@@ -2973,7 +3016,8 @@ fn send_message_back(
         delay_level: Some(delay_level),
         origin_msg_id: msg.msg_id.clone(),
         origin_topic: Some(msg.topic.clone()),
-        unit_mode: Some(false),
+        // Java `DefaultMQPushConsumerImpl#sendMessageBack` 的 unitMode
+        unit_mode: Some(cfg.unit_mode),
         max_reconsume_times: Some(max_reconsume),
     };
     let mut request =
@@ -3027,8 +3071,8 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
     }
 
     fn is_unit_mode(&self) -> bool {
-        // Python 没有 unit mode（Java isUnitMode() 亦恒 false）
-        false
+        // Java `MQClientInstance:1039` `consumerData.setUnitMode(impl.isUnitMode())`
+        self.config().unit_mode
     }
 
     fn subscription(&self) -> Vec<String> {
@@ -3468,6 +3512,7 @@ mod tests {
             &MessageQueue::new("T", "broker-a", 0),
             Some(&sub("T", "TagA")),
             msgs,
+            false,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get_tags(), Some("TagA"));

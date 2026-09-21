@@ -90,12 +90,13 @@ cargo run --example live_rebalance_and_trace -- 127.0.0.1:9876
 cargo run --example live_client_modules     -- 127.0.0.1:9876
 cargo run --example live_validators         -- 127.0.0.1:9876
 cargo run --example live_admin              -- 127.0.0.1:9876
+cargo run --example live_unit_config        -- 127.0.0.1:9876
 cargo run --example live_acl                -- 127.0.0.1:9876 <AK> <SK>   # 需开 ACL 的集群
 cargo run --example live_compression_matrix -- send|recv ...             # 由 ../scripts/compression_matrix.sh 调度
 ```
 
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
-下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 11 个工具合计 680 项断言；
+下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 12 个工具合计 695 项断言；
 `live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本调度，都不计进去）：
 
 | 工具 | 结果 | 覆盖 |
@@ -111,6 +112,7 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_client_modules` | 92 PASS | T1~T8：动态 namesrv 取址（本地起地址服务器桩并**用取到的地址真查一次路由**）、实测延迟喂故障规避选队列、真实 RT/TPS 过统计、五类钩子的相反异常语义、轨迹文本穿过 broker、指标记账、request-reply |
 | `live_validators` | 31 PASS | V1~V7（与 Python/C++/.NET 同场景对拍）：非法名字**亚毫秒本地失败且不碰网络**、`maxMessageSize` 等长放行、批量逐条 + 同质性、四类 facade 的 `start()` 组名门、正反两条腿的往返耗时对照 |
 | `live_admin` | 85 PASS / 1 SKIP | A1~A13：admin **私有实例**隔离（shutdown 后同 clientId 的 producer 照常收发）、集群与运行时信息、topic 建/查/配置、broker 配置（properties 文本）读改写回、NameServer KV、订阅组分页、`viewMessage`、`sendMessageBack` 重投、`resetOffsetByTimestamp`、消费统计与 ConsumeQueue、清理。SKIP：uniqKey 查询要 broker 开 RocksDB 索引，本机默认文件索引查不到属**配置差异，不是客户端 bug** |
+| `live_unit_config` | 15 PASS | U1~U5（与 Python/C++/.NET 同场景）：`unit_name` 拼进 clientId（`<ip>@<instance>@<unitName>`）且照常发送、`@STREAM` 后缀的消费者在 **broker 的 `GET_CONSUMER_LIST_BY_GROUP` 里也是同一串**（唯一能证明「上线的就是拼好的 clientId」的观测点）、`unit_mode=true` 的发送让自动建出的 topic 带 `UNIT` 位而对照组不带、心跳里的 `ConsumerData.unit_mode` 让 `%RETRY%group` 带 `UNIT_SUB` 位、stream 生产者与 lite 消费者（默认开）每个请求带 `ReqT=0` 时收发照常 |
 | `live_acl` | 需开鉴权的集群 | S1~S8：签名被 broker 接受（建 topic / 发送 / 心跳+长轮询+位点三条 RPC 全程带签名）、不带凭据与 secretKey 写错都回 `NO_PERMISSION(16)`、拉模式签名链路。前置是 broker.conf 开 `authenticationEnabled=true` + `LocalAuthenticationMetadataProvider` + `initAuthenticationUser`（本机默认集群关着，跑不了这一项） |
 | `live_compression_matrix` | 矩阵一端 | 与 Java/Python/C++/.NET 探针双向收发压缩消息，由 `../scripts/compression_matrix.sh` 调度 |
 
@@ -207,15 +209,21 @@ rust/
 
 ## 与 Java 的已知差异 / 待办
 
-- **clientId 后缀缺 `unitName` 与 `@STREAM`**：默认口径已按 Java 走
-  `buildMQClientId` ⇒ `<本机 IP>@<instanceName>`，`instanceName` 为 `DEFAULT` 时在
+- **clientId 口径按 Java 齐平**：`buildMQClientId` ⇒
+  `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`，`instanceName` 为 `DEFAULT` 时在
   `start()` 里就地改写成 `<pid>#<nanoTime>`（生产者和 CLUSTERING 消费者；广播消费者
   保持 `DEFAULT`，因此同进程的广播消费者共用一份实例，与 Java 一致）。
-  `build_mq_client_id(ip, instanceName, unitName)` 支持 unitName 后缀，但客户端配置里
-  还没有 unitName / `enableStreamRequestType` 这两项，所以拼不出带后缀的 clientId。
+  `unit_name` / `unit_mode` / `enable_stream_request_type` 三项配置 producer、push、pull、
+  lite、admin 五个门面都有，默认值与 Java 相同（producer/push/admin 关 stream，pull/lite 开）。
 - **本机 IP 探测方式不同**：Java 枚举网卡并优先非内网 IPv4，这里用 UDP「连」公网地址后
   读 sockname（不发包），取不到退化成 `127.0.0.1`。结果通常是同一块出口网卡的地址。
-- **`unitName` / `unitMode` 没有客户端配置项**（协议字段在，能编解码）。
+- **unitMode / stream 是上线字段，不是本地摆设**（`live_unit_config` U1–U5 在真集群上验）：
+  `unit_mode=true` 的发送让自动建出的 topic 带 `UNIT` 位（`AbstractSendMessageProcessor:487-497`），
+  消费者心跳的 `ConsumerData.unit_mode` 让 `%RETRY%group` 带 `UNIT_SUB` 位
+  （`MQClientInstance:1039` → `ClientManageProcessor:113-118`），`unit_name` 还参与动态取址
+  URL 的 `-<unitName>?nofix=1` 后缀。⚠ ExtFields 的 `ReqT` 是 `RequestType.STREAM.getCode()`
+  的字符串形式 `"0"`，clientId 尾巴上才是枚举 name `@STREAM`；stream 钩子必须排在 ACL 钩子
+  **之前**（`MQClientAPIImpl:329-332`），否则 `ReqT` 落在签名之外，开鉴权的 broker 验签必失败。
 - **broker 主动请求（220/221/307/309/326）无法从外部注入**：它们走 broker 已建立的那条
   连接。协议与分派由离线单测覆盖，`live_mq_client` 只验实例侧的 seam。
 - **SQL92 过滤 / `%DLQ%` 死信 / 批量发送真机 / Rust TLS / 动态地址服务器真机**这几条

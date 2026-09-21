@@ -111,7 +111,8 @@ struct CheckForbiddenContext {
     // Java 是 Object arg；C++ 的 sendBySelector 用 std::string 承载，这里照此对齐，
     // 其余发送入口传 nullptr。
     const std::string* arg = nullptr;
-    // 本项目无 unit mode（Java 的 isUnitMode() 恒为 false）
+    // 对应 Java ClientConfig#isUnitMode()：由生产者/消费者的 unitMode 透传，
+    // 钩子可据此判断这是单元化流量（Java SendMessageHook 上下文同名同义）。
     bool unitMode = false;
 };
 

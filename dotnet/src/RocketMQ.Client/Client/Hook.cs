@@ -117,7 +117,10 @@ public sealed class CheckForbiddenContext
     public Exception? Exception { get; set; }
     public object? Arg { get; set; }
 
-    /// <summary>本项目无 unit mode（Java 的 isUnitMode() 恒为 false）。</summary>
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#isUnitMode()</c>：由生产者/消费者的 unitMode 透传，
+    /// 钩子可据此判断这是单元化流量（Java CheckForbiddenHook 上下文同名同义）。
+    /// </summary>
     public bool UnitMode { get; set; }
 }
 

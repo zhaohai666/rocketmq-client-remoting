@@ -265,7 +265,8 @@ pub struct CheckForbiddenContext {
     pub exception: Option<Error>,
     /// Java `Object arg`。
     pub arg: Option<AnyHolder>,
-    /// 本项目无 unit mode（Java `isUnitMode()` 恒 false，Python 同样固定 False）。
+    /// Java `CheckForbiddenContext#setUnitMode(tc.isUnitMode())`
+    /// （`DefaultMQProducerImpl:964`），来自门面的 `ClientConfig#unitMode`。
     pub unit_mode: bool,
 }
 
@@ -318,7 +319,9 @@ pub struct FilterMessageContext {
 
 impl FilterMessageContext {
     /// 对应 Python `FilterMessageContext(consumer_group, msg_list, mq)`：
-    /// `arg` 为 None、`unit_mode` 为 False（Python `__init__` 的固定值）。
+    /// `arg` 为 None；`unit_mode` 取消费者的配置（Java 是
+    /// `DefaultMQPushConsumerImpl:640` 的 `context.setUnitMode(...)`，Python 早期
+    /// 固定 False，这里跟 Java 走）。
     pub fn new(
         consumer_group: &str,
         msg_list: Option<Vec<MessageExt>>,

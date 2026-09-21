@@ -92,6 +92,23 @@ public sealed class DefaultMQAdminExt
 
     public List<string> GetNameServerAddressList() => new List<string>(_nameServerAddrs);
 
+    // ---------------- unitName / enableStreamRequestType ----------------
+    // 对应 Java ClientConfig 的同名开关（admin 只用到 unitName：clientId 与动态取址 URL；
+    // Java 的 DefaultMQAdminExt 从不置 unitMode / stream，默认全关）。
+    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
+    public string UnitName
+    {
+        get => _unitName;
+        set => _unitName = value ?? string.Empty;
+    }
+
+    /// <summary>true 时每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。</summary>
+    public bool EnableStreamRequestType
+    {
+        get => _enableStreamRequestType;
+        set => _enableStreamRequestType = value;
+    }
+
     // ---------------- ACL 鉴权（对应 Java DefaultMQAdminExt(rpcHook)）----------------
     // 必须在 Start() 之前调用。
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
@@ -102,6 +119,8 @@ public sealed class DefaultMQAdminExt
 
     // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
     private IRpcHook? _rpcHook;
+    private string _unitName = string.Empty;
+    private bool _enableStreamRequestType;
 
     public void SetTimeoutMillis(int millis) => _timeoutMillis = millis;
 
@@ -125,17 +144,20 @@ public sealed class DefaultMQAdminExt
         _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
         if (string.IsNullOrEmpty(_clientId))
         {
-            _clientId = ClientIds.Build(_instanceName);
+            _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
         }
 
-        _mqClient = new MQClientInstance(_clientId, _nameServerAddrs);
-        _mqClient.Start();
-        // ACL 鉴权钩子：管理端的所有请求（建/删 topic、查状态等）同样需要签名。
-        if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
+        // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定在 Start() **之前**（Java 的 rpcHook
+        // 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它）。
+        // admin 在 Java 里既不置 unitMode 也不置 stream，默认全关。
+        IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
+        _mqClient = new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName);
+        if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
         {
             ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
                 + _clientId + ")");
         }
+        _mqClient.Start();
 
         _started = true;
     }

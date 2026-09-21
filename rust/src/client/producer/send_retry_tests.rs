@@ -4,6 +4,8 @@
 //! 恰好是这段内核的全部难点，所以这里在进程内起一个**假集群**（1 个 namesrv +
 //! N 个 broker，只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
 //!
+//! 末尾另有一节「unitMode / enableStreamRequestType」用同一套假集群做**线上报文**断言
+//! （`unitMode` 落在 V2 头的单字母键 `k`、`ReqT` 由 stream 钩子在 encode 之前写入），
 //! 与 `python/tests/test_send_retry.py`、`cpp/tests/test_send_retry.cpp` 同题。
 
 #![cfg(test)]
@@ -36,6 +38,8 @@ struct BrokerScript {
     steps: VecDeque<(i32, u64)>,
     tail: (i32, u64),
     requests: usize,
+    /// 每笔 SEND 请求**上线时**的 extFields 快照（钩子已经跑完，等价于真报文）。
+    sends: Vec<Vec<(String, String)>>,
 }
 
 impl BrokerScript {
@@ -44,6 +48,7 @@ impl BrokerScript {
             steps: VecDeque::new(),
             tail: (response_code::SUCCESS, 0),
             requests: 0,
+            sends: Vec::new(),
         }
     }
 }
@@ -101,11 +106,17 @@ impl MockCluster {
         broker.steps = steps.into();
         broker.tail = tail;
         broker.requests = 0;
+        broker.sends.clear();
     }
 
     /// 第 `index` 个 broker 收到的 SEND 请求数。
     fn requests(&self, index: usize) -> usize {
         lock(&self.state).brokers[index].requests
+    }
+
+    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 extFields 快照。
+    fn send_ext(&self, index: usize, n: usize) -> Vec<(String, String)> {
+        lock(&self.state).brokers[index].sends[n].clone()
     }
 }
 
@@ -237,6 +248,14 @@ fn spawn_broker(
                         let broker = &mut state.brokers[index];
                         let step = broker.steps.pop_front().unwrap_or(broker.tail);
                         broker.requests += 1;
+                        // 快照必须在应答之前：这时拿到的是钩子处理完、真正上线的那份头
+                        broker.sends.push(
+                            request
+                                .ext_fields()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        );
                         (step.0, step.1, broker.requests)
                     };
                     if delay > 0 {
@@ -554,5 +573,127 @@ async fn failed_broker_is_isolated_and_latency_is_recorded() {
     let ok = tolerance.get_fault_item("broker-1").expect("成功的 broker 要进表");
     assert!(ok.is_available(tolerance.now_millis()), "健康的 broker 不该被隔离");
     assert!(ok.is_reachable(), "成功一档传 reachable=True");
+    producer.shutdown();
+}
+
+// ---------------------------------------------------------------- unitMode / stream
+
+/// 从 extFields 快照里取值（顺序无关，只按 key 找）。
+fn ext_value<'a>(ext: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    ext.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// Java `sendKernelImpl:1004` 把 `tc.isUnitMode()` 写进发送头，
+/// V2 头再映射成单字母键 `k`（`SendMessageRequestHeaderV2`）。
+#[tokio::test]
+async fn unit_mode_is_carried_in_the_send_header() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+
+    let on = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    on.set_instance_name("unit_mode_on");
+    on.set_namesrv_addr(&cluster.namesrv_addr);
+    on.set_unit_mode(true);
+    on.start().await.expect("假集群里 start 应当成功");
+    let mut msg = Message::new("T1", Some(b"unit-on"));
+    on.send(&mut msg, None, None).await.expect("发送应当成功");
+
+    let off = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    off.set_instance_name("unit_mode_off");
+    off.set_namesrv_addr(&cluster.namesrv_addr);
+    off.start().await.expect("默认 unitMode=false");
+    let mut msg = Message::new("T1", Some(b"unit-off"));
+    off.send(&mut msg, None, None).await.expect("发送应当成功");
+
+    assert_eq!(ext_value(&cluster.send_ext(0, 0), "k"), Some("true"));
+    assert_eq!(ext_value(&cluster.send_ext(0, 1), "k"), Some("false"));
+    assert_eq!(ext_value(&cluster.send_ext(0, 1), "a"), Some("GID_send_retry"));
+    on.shutdown();
+    off.shutdown();
+}
+
+/// 单位名要同时出现在 clientId 与线上报文里，且不影响发送。
+#[tokio::test]
+async fn unit_name_only_changes_the_client_id() {
+    let cluster = MockCluster::start(1, true).await;
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    producer.set_instance_name("unit_name_case");
+    producer.set_namesrv_addr(&cluster.namesrv_addr);
+    producer.set_unit_name(Some("unitA"));
+    producer.start().await.expect("start");
+    assert_eq!(
+        producer.client_id(),
+        Some(format!("{}@unit_name_case@unitA", MixAll::cached_ip_str()))
+    );
+    let mut msg = Message::new("T1", Some(b"body"));
+    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    // unitName 不进发送头：Java 只有 unitMode 上线，unitName 只影响 clientId/地址服务器
+    assert!(cluster.send_ext(0, 0).iter().all(|(k, _)| k != "unitName"));
+    producer.shutdown();
+}
+
+/// `ReqT` 必须由 stream 钩子**在用户钩子之前**写入：Java 的注释
+/// "Inject stream rpc hook first to make reserve field signature" 说明它得进 ACL 签名，
+/// 而签名由用户钩子（AclClientRPCHook）算 —— 顺序反了签名内容就不含 ReqT。
+#[tokio::test]
+async fn stream_request_type_tags_requests_before_user_hooks_run() {
+    #[derive(Default)]
+    struct OrderProbe {
+        req_t_seen_by_user_hook: AtomicBool,
+    }
+    impl RPCHook for OrderProbe {
+        fn do_before_request(&self, _addr: &str, request: &mut RemotingCommand) {
+            self.req_t_seen_by_user_hook.store(
+                request.get_ext_field(MixAll::REQ_T).is_some(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    let cluster = MockCluster::start(1, true).await;
+    let probe = Arc::new(OrderProbe::default());
+    let producer = DefaultMQProducer::with_rpc_hook(
+        "GID_send_retry",
+        Some(probe.clone() as Arc<dyn RPCHook>),
+    )
+    .expect("组名合法");
+    producer.set_instance_name("stream_on");
+    producer.set_namesrv_addr(&cluster.namesrv_addr);
+    producer.set_enable_stream_request_type(true);
+    producer.start().await.expect("start");
+    assert!(
+        producer.client_id().unwrap_or_default().ends_with("@STREAM"),
+        "开启 stream 后 clientId 要带 @STREAM 后缀"
+    );
+
+    let mut msg = Message::new("T1", Some(b"body"));
+    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    let ext = cluster.send_ext(0, 0);
+    assert_eq!(
+        ext_value(&ext, MixAll::REQ_T),
+        Some("0"),
+        "ReqT 要出现在上线报文里（值是 RequestType.STREAM 的 code）"
+    );
+    assert!(
+        probe.req_t_seen_by_user_hook.load(Ordering::SeqCst),
+        "用户钩子跑的时候 ReqT 必须已经写入"
+    );
+    producer.shutdown();
+}
+
+/// 默认不开：普通生产者的请求里不该出现 ReqT。
+#[tokio::test]
+async fn stream_request_type_is_off_by_default_for_producers() {
+    let cluster = MockCluster::start(1, true).await;
+    let producer = started("stream_off", &cluster).await;
+    assert!(!producer.config().enable_stream_request_type);
+    let mut msg = Message::new("T1", Some(b"body"));
+    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    let ext = cluster.send_ext(0, 0);
+    assert!(ext_value(&ext, MixAll::REQ_T).is_none(), "默认不该带 ReqT: {ext:?}");
+    assert!(
+        !producer.client_id().unwrap_or_default().ends_with("@STREAM"),
+        "默认 clientId 不该带 @STREAM"
+    );
     producer.shutdown();
 }

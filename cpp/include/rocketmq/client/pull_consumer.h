@@ -57,6 +57,20 @@ public:
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
+
+    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
+    // 对应 Java `ClientConfig` 的三个同名开关。⚠ 必须在 start() 之前设置：
+    // unitName / @STREAM 决定 clientId 的形状，stream 决定请求钩子链（`ReqT` 要进 ACL 签名）。
+    void setUnitName(const std::string& unitName) { unitName_ = unitName; }
+    const std::string& unitName() const { return unitName_; }
+    // Java 在消息过滤上下文（`DefaultMQPushConsumerImpl:640`）、心跳里的
+    // `ConsumerData.unitMode`（`MQClientInstance:1039`）和回投请求头（`:927/948`）三处读它。
+    void setUnitMode(bool unitMode) { unitMode_ = unitMode; }
+    bool isUnitMode() const { return unitMode_; }
+
+    // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
+    void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
+    bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
@@ -135,6 +149,11 @@ private:
     std::string namespace_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
+    std::string unitName_;
+    bool unitMode_ = false;
+    // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
+    // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
+    bool enableStreamRequestType_ = true;
     std::string messageModel_ = MessageModel::CLUSTERING;
 
     int32_t brokerSuspendMaxTimeMillis_ = 20000;

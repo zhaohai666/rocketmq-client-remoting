@@ -53,6 +53,11 @@ public sealed class DefaultLitePullConsumer
         UtilAll.TimeMillisToHumanString3(UtilAll.CurrentTimeMillis() - 30 * 60 * 1000);
     private readonly List<string> _nameServerAddrs = new();
     private IRpcHook? _rpcHook;
+    // ClientConfig 的三个单元化/stream 开关。⚠ Java 的 DefaultLitePullConsumer 在构造
+    // 函数里就把 enableStreamRequestType 置真（:213/228），所以这里默认 **true**。
+    private string _unitName = string.Empty;
+    private bool _unitMode;
+    private bool _enableStreamRequestType = true;
 
     // subscribe 模式的订阅表（topic -> sub_expression，已套命名空间）
     private readonly Dictionary<string, string> _subscription = new(StringComparer.Ordinal);
@@ -122,6 +127,37 @@ public sealed class DefaultLitePullConsumer
     public IAllocateMessageQueueStrategy? AllocateMessageQueueStrategy => _allocateMessageQueueStrategy;
 
     public void SetNamespace(string ns) => _namespace = ns ?? string.Empty;
+
+    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
+    // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置。
+    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
+    public string UnitName
+    {
+        get => _unitName;
+        set => _unitName = value ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#isUnitMode()</c>：lite 路径经 MQClientInstance:1039 进
+    /// 心跳的 ConsumerData.unitMode，决定 broker 侧 %RETRY% topic 的 UNIT_SUB(0x2) 标记。
+    /// （Java 还把它传进 PullAPIWrapper 用于过滤上下文，DefaultLitePullConsumerImpl:356-359；
+    /// 本端 lite 消费者没有 filter message hook，所以只有心跳这一处落地。）
+    /// </summary>
+    public bool UnitMode
+    {
+        get => _unitMode;
+        set => _unitMode = value;
+    }
+
+    /// <summary>
+    /// 每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。
+    /// Java 的 DefaultLitePullConsumer 在构造里就置真，本端口默认值与之对齐。
+    /// </summary>
+    public bool EnableStreamRequestType
+    {
+        get => _enableStreamRequestType;
+        set => _enableStreamRequestType = value;
+    }
 
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
@@ -280,18 +316,23 @@ public sealed class DefaultLitePullConsumer
             }
             if (_clientId.Length == 0)
             {
-                _clientId = ClientIds.Build(_instanceName);
+                _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
             }
 
+            // 请求钩子（ACL 签名 / stream 的 ReqT）：lite 消费者默认开 stream，必须走
+            // RequestHooks.Compose 把 StreamTypeRPCHook 排在用户钩子之前 —— 直接注册
+            // _rpcHook 会让 ReqT 漏发，开 ACL 时签的内容也与上线字段不一致。
+            // 绑定位置同样在 Start() **之前**（Java 的 rpcHook 随 MQClientAPIImpl 构造传入）。
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
-                /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000);
-            _mqClient.Start();
-
-            if (_rpcHook is not null && !_mqClient.RegisterRpcHook(_rpcHook))
+                /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000,
+                unitName: _unitName);
+            if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("lite pull consumer rpc hook ignored: MqClient already has one (clientId="
                     + _clientId + ")");
             }
+            _mqClient.Start();
 
             if (_assignMode)
             {
@@ -811,7 +852,12 @@ public sealed class DefaultLitePullConsumer
     private HeartbeatData BuildHeartbeat()
     {
         var hb = new HeartbeatData(_clientId);
-        var cd = new ConsumerData(_consumerGroup, ConsumeType.ConsumePassively, _messageModel, _consumeFromWhere);
+        var cd = new ConsumerData(_consumerGroup, ConsumeType.ConsumePassively, _messageModel, _consumeFromWhere)
+        {
+            // Java MQClientInstance:1039：consumerData.setUnitMode(impl.isUnitMode())，
+            // broker 据此给 %RETRY%group 打 UNIT_SUB(0x2)（ClientManageProcessor:113-118）。
+            UnitMode = _unitMode,
+        };
         lock (_lock)
         {
             foreach (KeyValuePair<string, SubscriptionData> kv in _subscriptionData)

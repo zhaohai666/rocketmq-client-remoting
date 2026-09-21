@@ -68,6 +68,22 @@ public:
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
+
+    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
+    // 对应 Java `ClientConfig` 的三个同名开关。⚠ 必须在 start() 之前设置：
+    // unitName / @STREAM 决定 clientId 的形状，stream 决定请求钩子链（`ReqT` 要进 ACL 签名）。
+    void setUnitName(const std::string& unitName) { unitName_ = unitName; }
+    const std::string& unitName() const { return unitName_; }
+    // Java 侧 lite 消费者的 unitMode 传进 PullAPIWrapper（DefaultLitePullConsumerImpl:356-359），
+    // 只用于消息过滤上下文（PullAPIWrapper:126）；另外心跳里的 ConsumerData.unitMode
+    // 由 MQClientInstance:1039 从本消费者读取，决定 %RETRY% topic 是否带 UNIT_SUB 标记。
+    // 本端 lite 消费者没有 filter message hook，所以第一处落地只有心跳这一条。
+    void setUnitMode(bool unitMode) { unitMode_ = unitMode; }
+    bool isUnitMode() const { return unitMode_; }
+
+    // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
+    void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
+    bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
@@ -174,6 +190,11 @@ private:
     std::string namespace_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
+    std::string unitName_;
+    bool unitMode_ = false;
+    // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
+    // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
+    bool enableStreamRequestType_ = true;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
     std::string consumeTimestamp_;

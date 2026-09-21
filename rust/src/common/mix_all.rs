@@ -71,6 +71,11 @@ impl MixAll {
     pub const RMQ_SYS_TRANS_CHECK_MAX_TIME: i32 = 15;
     pub const TRANS_CHECK_MAX_TIME: i32 = 15;
     pub const UNIT_PREFIX: &'static str = "unit_";
+    /// 对应 Java `MixAll.REQ_T`：`StreamTypeRPCHook` 写进 extFields 的键名。
+    pub const REQ_T: &'static str = "ReqT";
+    /// 对应 Java `ClientConfig#buildMQClientId` 末尾拼的 `RequestType.STREAM`
+    /// **枚举名**（不是它的 code，code 只出现在 [`MixAll::REQ_T`] 的值里）。
+    pub const STREAM_REQUEST_TYPE: &'static str = "STREAM";
     pub const LMQ_PREFIX: &'static str = "%LMQ%";
     pub const LMQ_QUEUE_ID: i32 = 0;
     pub const DEFAULT_TOPIC_QUEUE_NUMS: i32 = 4;
@@ -283,15 +288,31 @@ impl MixAll {
         *PID.get_or_init(util_all::get_pid)
     }
 
-    /// 对应 Java `ClientConfig#buildMQClientId`：`ip@instanceName[@unitName]`。
-    pub fn build_mq_client_id(client_ip: &str, instance_name: &str, unit_name: Option<&str>) -> String {
+    /// 对应 Java `ClientConfig#buildMQClientId`：
+    /// `clientIP + "@" + instanceName + (@unitName 非空时) + (@STREAM 开启时)`。
+    ///
+    /// ⚠ Java 判空用的是 `UtilAll.isBlank(unitName)`，但**拼接时用的是原值**（没有
+    /// trim），所以 `"unit-a"` 会原样出现在 clientId 里；`@STREAM` 后缀来自
+    /// `enableStreamRequestType`（拉模式/轻量消费者默认 true，其余默认 false）。
+    pub fn build_mq_client_id(
+        client_ip: &str,
+        instance_name: &str,
+        unit_name: Option<&str>,
+        enable_stream_request_type: bool,
+    ) -> String {
         let mut sb = String::with_capacity(client_ip.len() + instance_name.len() + 2);
         sb.push_str(client_ip);
         sb.push('@');
         sb.push_str(instance_name);
-        if util_all::is_not_blank_str(unit_name.unwrap_or("")) {
+        if let Some(unit_name) = unit_name {
+            if util_all::is_not_blank_str(unit_name) {
+                sb.push('@');
+                sb.push_str(unit_name);
+            }
+        }
+        if enable_stream_request_type {
             sb.push('@');
-            sb.push_str(unit_name.unwrap_or(""));
+            sb.push_str(Self::STREAM_REQUEST_TYPE);
         }
         sb
     }
@@ -321,21 +342,40 @@ impl MixAll {
         }
     }
 
-    /// Java `ClientConfig#buildMQClientId` 的默认口径：`<本机 IP>@<instanceName>`。
+    /// Java `ClientConfig#buildMQClientId` 的默认口径：本机 IP 打头，
+    /// 后缀规则见 [`MixAll::build_mq_client_id`]。
     ///
     /// 调用前要先按 Java 的条件跑过 [`change_instance_name_to_pid`]
-    /// （[`Self::client_id_for`] 一次做完这两步）。
-    pub fn build_default_client_id(instance_name: &str) -> String {
-        Self::build_mq_client_id(Self::cached_ip_str(), instance_name, None)
+    /// （[`client_id_for`] 一次做完这两步）。
+    pub fn build_default_client_id(
+        instance_name: &str,
+        unit_name: Option<&str>,
+        enable_stream_request_type: bool,
+    ) -> String {
+        Self::build_mq_client_id(
+            Self::cached_ip_str(),
+            instance_name,
+            unit_name,
+            enable_stream_request_type,
+        )
     }
 
-    /// 未显式配置 clientId 时的默认值：`<本机 IP>@<pid>#<nanoTime>`。
+    /// 未显式配置 clientId 时的默认值：
+    /// `<本机 IP>@<pid>#<nanoTime>[@unitName][@STREAM]`。
     ///
     /// 对应 Java 里 `changeInstanceNameToPID()` + `buildMQClientId()` 的连用；
     /// instanceName 被显式设成非 `DEFAULT` 时结果就稳定了（同进程、同 instanceName
     /// 的两个客户端会共用一份实例，这正是 Java 的语义）。
-    pub fn client_id_for(instance_name: &str) -> String {
-        Self::build_default_client_id(&Self::change_instance_name_to_pid(instance_name))
+    pub fn client_id_for(
+        instance_name: &str,
+        unit_name: Option<&str>,
+        enable_stream_request_type: bool,
+    ) -> String {
+        Self::build_default_client_id(
+            &Self::change_instance_name_to_pid(instance_name),
+            unit_name,
+            enable_stream_request_type,
+        )
     }
 
     /// 对应 Java `ClientConfig#instanceName` 的默认值
@@ -613,14 +653,32 @@ mod tests {
 
     #[test]
     fn client_id_builders() {
-        assert_eq!(MixAll::build_mq_client_id("10.0.0.1", "inst", None), "10.0.0.1@inst");
-        assert_eq!(MixAll::build_mq_client_id("10.0.0.1", "inst", Some("")), "10.0.0.1@inst");
-        assert_eq!(MixAll::build_mq_client_id("10.0.0.1", "inst", Some("  ")), "10.0.0.1@inst");
         assert_eq!(
-            MixAll::build_mq_client_id("10.0.0.1", "inst", Some("unit-a")),
+            MixAll::build_mq_client_id("10.0.0.1", "inst", None, false),
+            "10.0.0.1@inst"
+        );
+        assert_eq!(
+            MixAll::build_mq_client_id("10.0.0.1", "inst", Some(""), false),
+            "10.0.0.1@inst"
+        );
+        assert_eq!(
+            MixAll::build_mq_client_id("10.0.0.1", "inst", Some("  "), false),
+            "10.0.0.1@inst"
+        );
+        assert_eq!(
+            MixAll::build_mq_client_id("10.0.0.1", "inst", Some("unit-a"), false),
             "10.0.0.1@inst@unit-a"
         );
-        let id = MixAll::build_default_client_id("inst");
+        // Java 的拼接顺序固定：unitName 在前、@STREAM 在后
+        assert_eq!(
+            MixAll::build_mq_client_id("10.0.0.1", "inst", Some("unit-a"), true),
+            "10.0.0.1@inst@unit-a@STREAM"
+        );
+        assert_eq!(
+            MixAll::build_mq_client_id("10.0.0.1", "inst", None, true),
+            "10.0.0.1@inst@STREAM"
+        );
+        let id = MixAll::build_default_client_id("inst", None, false);
         // Java `buildMQClientId`：IP 在前，instanceName 原样透传。
         assert!(id.ends_with("@inst"), "{id}");
 
@@ -635,13 +693,14 @@ mod tests {
 
         // 默认 clientId = 本机 IP + '@' + 改写后的 instanceName；同进程两次调用
         // 必须给出不同结果，否则两个客户端会共用一份 MQClientInstance。
-        let first = MixAll::client_id_for("DEFAULT");
+        let first = MixAll::client_id_for("DEFAULT", None, false);
         assert!(first.contains(&format!("@{pid_prefix}")), "{first}");
-        assert_ne!(first, MixAll::client_id_for("DEFAULT"), "{first}");
+        assert_ne!(first, MixAll::client_id_for("DEFAULT", None, false), "{first}");
         assert_eq!(
-            MixAll::client_id_for("inst"),
-            MixAll::build_default_client_id("inst")
+            MixAll::client_id_for("inst", None, false),
+            MixAll::build_default_client_id("inst", None, false)
         );
+        assert!(MixAll::client_id_for("DEFAULT", Some("u"), true).ends_with("@u@STREAM"));
     }
 
     #[test]

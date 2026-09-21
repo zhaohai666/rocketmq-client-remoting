@@ -9,6 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+
+#include "rocketmq/common/mix_all.h"
+#include "rocketmq/remoting/protocol/codes.h"
 
 namespace rocketmq {
 
@@ -227,6 +231,39 @@ void AclClientRPCHook::doBeforeRequest(const std::string& remoteAddr,
     }
     const std::string signature = calcSignature(credentials_.secretKey(), request);
     request.addExtField(SessionCredentials::SIGNATURE, signature);
+}
+
+void StreamTypeRPCHook::doBeforeRequest(const std::string& remoteAddr,
+                                        RemotingCommand& request) {
+    (void)remoteAddr;
+    // Java: request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))
+    // RequestType.STREAM 的 code 是 0，故写入字面量 "0"。
+    request.addExtField(MixAll::REQ_T, std::to_string(RequestType::STREAM));
+}
+
+void ChainedRPCHook::doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) {
+    // 严格按注册顺序执行 —— 顺序决定 ACL 签名覆盖的字段集（见头文件注释）。
+    for (const std::shared_ptr<RPCHook>& hook : hooks_) {
+        if (hook) hook->doBeforeRequest(remoteAddr, request);
+    }
+}
+
+void ChainedRPCHook::doAfterResponse(const std::string& remoteAddr, const RemotingCommand& request,
+                                     const RemotingCommand* response) {
+    for (const std::shared_ptr<RPCHook>& hook : hooks_) {
+        if (hook) hook->doAfterResponse(remoteAddr, request, response);
+    }
+}
+
+std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
+                                             const std::shared_ptr<RPCHook>& userHook) {
+    // Java MQClientAPIImpl:329-335 的注册顺序是 Namespace → Stream → 用户钩子 →
+    // DynamicalExtField；本端口没有前两者之外的钩子，只保留 Stream/用户这一对。
+    if (!enableStreamRequestType) return userHook;
+    std::vector<std::shared_ptr<RPCHook>> hooks;
+    hooks.push_back(std::make_shared<StreamTypeRPCHook>());
+    if (userHook) hooks.push_back(userHook);
+    return std::make_shared<ChainedRPCHook>(std::move(hooks));
 }
 
 }  // namespace rocketmq

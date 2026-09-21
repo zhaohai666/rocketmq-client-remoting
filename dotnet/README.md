@@ -89,6 +89,7 @@ dotnet $PROG trace 127.0.0.1:9876         # 消息轨迹全链路（17 PASS / 0 
 dotnet $PROG hook 127.0.0.1:9876          # CheckForbidden/FilterMessage 钩子（13 PASS / 0 FAIL）
 dotnet $PROG validators-live 127.0.0.1:9876  # 名字校验（39 PASS / 0 FAIL）
 dotnet $PROG recall 127.0.0.1:9876        # 定时消息撤回（16 PASS / 0 FAIL，脚本负责开关并还原 recallMessageEnable）
+dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS / 0 FAIL）
 ```
 
 其它子命令：`redelivery` / `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
@@ -113,11 +114,18 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | lite-pull | 33 PASS / 0 FAIL（`DefaultLitePullConsumer` 真机全链路：S1 rebalance 拿 4 队列 → S2 subscribe+poll 收全 12 条 → S3 commit 位点 >0 → S4 assign+seek 重收 → S5 订阅级 tag 只收 6 条 → S6a `ConsumeFromTimestamp` 收全、S6b `OffsetForTimestamp` 双向（30 分钟前→Σ=0，10 分钟后→Σ=12）→ S7a 默认策略 `AVG` + 策略为 null 时 `Start()` 报 Java 同款文案、S7b 换 `AVG_BY_CIRCLE` 同组两实例无交集/并集覆盖 4 队列/步长 2 交叉、S7c 两半 `CONFIG` 各自只收配置队列且合起来恰好 12 条互不重叠、S7d `CONSISTENT_HASH` 用**真实 clientId** 建环且线上分配收敛到「真实 mqAll/cidAll 离线跑同一策略」的预测（合起来收全 12 条）、S7e `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 单机房下原样透传内层策略 + resolver 被逐个队列和两个真实 clientId 问过、S7f `MACHINE_ROOM` 白名单不匹配真实 `broker-a` → 安静饿死（分不到队列、poll 不到消息，同组 AVG 对照组仍只拿自己半边）） |
 | validators-live | 39 PASS / 0 FAIL（名字校验四语言对拍：S1 发送路径 13 项本地快拒（<50ms、不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `Start()` 三道组名门 + 120 等长边界、S4 正腿 push/lite 各收 3 条、S5 对照腿（合法但不存在的 topic 真往返 45ms vs 本地 0.66ms）、S6 pull/lite 组名门 + 查队列与位点、S7 `CreateTopic` 挡空白/非法/系统 topic） |
 | recall | 16 PASS / 0 FAIL（定时消息撤回 `recallMessage`(370)，与 Python/C++/Rust 同场景：R0 读到并临时打开 broker 的 `recallMessageEnable` → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle` → R2 broker 给的句柄能被解码、`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4/R5 `%RETRY%`/`%DLQ%`/非法句柄都在打网络之前秒回 → R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：对照定时消息按时投递、被撤回那条整个窗口都不出现 → R7 无条件还原开关） |
+| unit-config | 20 PASS / 0 FAIL（unitName/unitMode/stream 四语言同场景：U1 `unitName` 拼进 clientId 且照常发送 → U2 stream 消费者 `@unitA@STREAM` 收尾，**broker 的 `examineConsumerConnectionInfo` 记录的 clientId 也带同一后缀**（唯一能证明「上线的就是拼好的那个」的观测点）→ U3 `unitMode=true` 自动建出的 topic `topicSysFlag` 带 UNIT 位、对照组不带 → U4 心跳 `ConsumerData.unitMode` 让 `%RETRY%` 带 UNIT_SUB 位 → U5 lite 消费者默认带 `@STREAM`、显式开 stream 的生产者同样，3 发 3 收） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **450 passed / 0 failed**，零 warning
-（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（11 项）用
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **460 passed / 0 failed**，零 warning
+（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（12 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。
+同一种"抓 socket"的能力也被用来验请求钩子（`RequestHooksReachTheWire`）：只注册 ACL 时线上
+有 `AccessKey`/`Signature` 而没有 `ReqT`；ACL + stream 时 `ReqT="0"` 在场，且把抓下来的报文按
+broker 的口径复算 HMAC-SHA1 **能对上签名**（等价于「`ReqT` 落在被签的那段内容里」，顺序写反
+就复算不上）；lite 消费者的路由与心跳默认全部带标，`EnableStreamRequestType=false` 后一笔都不
+带、但请求照发（排除"根本没打出去"的假绿）。⚠ 抓的是 `SendMessageV2`(310) 而不是 V1(10) ——
+本端口与 Java 一样默认 `sendSmartMsg=true`。
 `ConsistentHashTests` + `AllocateStrategyTests` 则把六个队列分配策略与 Java 单测逐条对拍
 （哈希环表、`String.Split('@')` 与 Java `split("@")` 的裁尾空段差异、NEARBY 的同机房优先与
 resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consistent_hash` 用例一致。
@@ -126,9 +134,15 @@ resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consist
 `SendMessageResponseHeader.recallHandle` 往返，以及 producer 的本地校验顺序——把名字服务器指向
 必然拒绝的端口，非法 topic / 非法句柄必须**亚毫秒**返回 Java 文案，路由拿不到时预热带异常照抛
 （`DefaultMQProducerImpl:1586`）。
-`ClientIdTests`（13 项）锁 clientId 口径：`BuildMqClientId` 的 `ip@instanceName[@unitName]`、
+`ClientIdTests`（18 项）锁 clientId 口径：`BuildMqClientId` 的
+`ip@instanceName[@unitName][@STREAM]`（含 unitName 与 stream 的先后、空白 unitName 视同没有）、
 `ChangeInstanceNameToPID` 只改默认名且幂等、四类 `Start()` 盖出的 `<ip>@<pid>#<nanoTime>`、
-同进程两个生产者不撞号、广播消费者保持 `DEFAULT`。
+同进程两个生产者不撞号、广播消费者保持 `DEFAULT`、五个门面的 stream 默认值
+（producer/push/admin 关，pull/lite 开 —— Java 在 `DefaultMQPullConsumer:113/126` 和
+`DefaultLitePullConsumer:213/228` 的构造函数里置真）。
+`AclTests` 里新增的 4 项锁住请求钩子的**组合顺序**：`RequestHooks.Compose` 的形状
+（stream 在前、用户钩子在后）、`ReqT="0"` 落在 ACL 签名**之内**（用签名后的 ExtFields 复算
+能对上）、反证（顺序写反时同一断言必须红）、`ChainedRpcHook` 逐个转发 `doAfterResponse`。
 
 ## 与 Java 的已知差异
 
@@ -145,11 +159,27 @@ resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consist
   毁掉整条轨迹消息的解码，我们只跳过坏记录。
 - `GetTopicPublishInfo(topic, isDefault: true)` 的第二跳（TBW102 兜底）只在发送路径启用，
   与 Java `tryToFindTopicPublishInfo` 一致。
-- clientId 口径按 Java：`ClientIds.Build(instanceName)` = `<本机 IP>@<instanceName>`
-  （`ClientConfig#buildMQClientId`），instanceName 还是默认值 `DEFAULT` 时由 `Start()` 调
-  `ClientIds.ChangeInstanceNameToPID` **就地**换成 `<pid>#<nanoTime>` —— 生产者与 admin
-  无条件，三个消费者只在 `CLUSTERING` 下（广播消费者保持 `DEFAULT`，与 Java 一致；本端口
-  每个门面各建私有 `MQClientInstance`，没有 Java 的 `MQClientManager` 工厂表）。旧口径
-  `instanceName@时间戳@pid@seq` 已废弃。另外 `unitName` / `enableStreamRequestType` 没有
-  配置项，所以拼不出 `@<unitName>` / `@STREAM` 后缀；本机 IP 用 UDP sockname 探测
-  （Java 枚举网卡）。回归：`tests/RocketMQ.Client.Tests/ClientIdTests.cs`。
+- clientId 口径按 Java：`ClientIds.Build(instanceName[, unitName][, enableStreamRequestType])`
+  = `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`（`ClientConfig#buildMQClientId`），
+  instanceName 还是默认值 `DEFAULT` 时由 `Start()` 调 `ClientIds.ChangeInstanceNameToPID`
+  **就地**换成 `<pid>#<nanoTime>` —— 生产者与 admin 无条件，三个消费者只在 `CLUSTERING`
+  下（广播消费者保持 `DEFAULT`，与 Java 一致；本端口每个门面各建私有 `MQClientInstance`，
+  没有 Java 的 `MQClientManager` 工厂表）。旧口径 `instanceName@时间戳@pid@seq` 已废弃。
+  本机 IP 用 UDP sockname 探测（Java 枚举网卡）。回归：
+  `tests/RocketMQ.Client.Tests/ClientIdTests.cs`。
+- **unitMode / stream 是上线字段，不是本地摆设。** 三个开关（`UnitName` / `UnitMode` /
+  `EnableStreamRequestType`）五个门面都有，默认值与 Java 一致（producer/push/admin 不开
+  stream，pull/lite 开）。落到线上的三处：`unitMode=true` 的发送让自动建出的 topic 带
+  `TopicSysFlag.UNIT`（`AbstractSendMessageProcessor:487-497`）；消费者心跳的
+  `ConsumerData.unitMode` 让 `%RETRY%group` 带 `UNIT_SUB`（`MQClientInstance:1039` →
+  `ClientManageProcessor:113-118`）；`unitName` 参与 clientId 与 `TopAddressing` 的 ns 后缀。
+  ⚠ **两处 `ReqT`/`@STREAM` 口径不同别混**：ExtFields 里的 `MixAll.ReqT` 写的是
+  `RequestType.STREAM.getCode()` 的字符串形式 `"0"`（`StreamTypeRPCHook:28`），clientId 尾巴
+  上才是枚举 name `@STREAM`。`RemotingClient` 只有**一槽**钩子（Java 是 `List<RPCHook>`），
+  所以顺序靠 `RequestHooks.Compose(enableStream, userHook)` 还原——Java
+  `MQClientAPIImpl:329-332` 把 stream 注在 ACL **之前**（"Inject stream rpc hook first to
+  make reserve field signature"），`ReqT` 必须落在签名内容里，否则开鉴权的 broker 验签必挂。
+  钩子还必须在 `MQClientInstance.Start()` **之前**注册（Java 在构造 `MQClientAPIImpl` 时就
+  传进去了，晚一步首包就是裸的）。回归：`AclTests`（顺序 + 反证）、`SendRetryTests`
+  （钩子真的写到 socket 上）、`rmq unit-config` 的 U1–U5（broker 侧 `topicSysFlag` 与
+  `examineConsumerConnectionInfo` 的 clientId）。

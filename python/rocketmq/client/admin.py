@@ -55,6 +55,12 @@ class DefaultMQAdminExt:
         self.namespace = namespace
         self.instance_name = "ADMIN"
         self.client_id: Optional[str] = None
+        # Java 的 `DefaultMQAdminExt extends ClientConfig`，因此 unitName 与
+        # enableStreamRequestType 这两个只影响 clientId / 取址 URL / 请求扩展字段的
+        # 开关对 admin 同样有效。（unitMode 在这里没有落点：admin 不发消息，
+        # 也不注册消费者，Java 里它只是个继承来的字段。）
+        self.unit_name: Optional[str] = None
+        self.enable_stream_request_type = False
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
         # 删除 topic 时一并清理的 KV namespace（Java 的 kvNamespaceToDeleteList）
@@ -73,6 +79,17 @@ class DefaultMQAdminExt:
     def set_instance_name(self, name: str) -> None:
         self.instance_name = name
 
+    def set_unit_name(self, unit_name: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。"""
+        self.unit_name = unit_name
+
+    def get_unit_name(self) -> Optional[str]:
+        return self.unit_name
+
+    def set_enable_stream_request_type(self, enable: bool) -> None:
+        """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
+        self.enable_stream_request_type = bool(enable)
+
     def get_name_server_addr(self) -> str:
         return ";".join(self.name_server_addrs)
 
@@ -88,14 +105,18 @@ class DefaultMQAdminExt:
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
         # Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
-        # clientId 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        # clientId 再走 `ClientConfig#buildMQClientId` 的
+        # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
         # 本客户端的 admin 默认 instanceName 是 "ADMIN"（不是 Java 的 "DEFAULT"，因为
         # admin 用私有实例、不和其他客户端共用），所以这一步只在调用方显式设成
         # "DEFAULT" 时才起作用。
         self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
-            self.client_id = MixAll.client_id_for(self.instance_name)
-        self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
+            self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
+                                                  self.enable_stream_request_type)
+        self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
+                                           enable_stream_request_type=self.enable_stream_request_type,
+                                           unit_name=self.unit_name)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         self._mq_client.start()

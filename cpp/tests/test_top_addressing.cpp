@@ -5,9 +5,12 @@
 //   * clearNewLine（trim 后截断到第一个 \r 或 \n）；
 //   * 200 → 地址串；非 200 / 连接失败 → 空串；
 //   * fetchAndApply：地址**变化才应用**；
-//   * MQClientInstance：配了静态地址不 fetch；空地址 fetch 一次并应用；取不到报错。
+//   * MQClientInstance：配了静态地址不 fetch；空地址 fetch 一次并应用；取不到报错；
+//     只有走动态取址时才起 10s/2min 的刷新线程（Java scheduleAtFixedRate）；
+//   * configureFromEnv(ROCKETMQ_NAMESRV_DOMAIN)：实例构造时自己装配 wsAddr + unitName。
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -57,6 +60,35 @@ void expectEq(const std::string& actual, const std::string& expected, const std:
                     expected.c_str());
     }
 }
+
+// 临时改环境变量、析构时还原（值设成空串即等价于"未设置"：实现按 env[0]=='\0' 判断）。
+// ::setenv 是 POSIX 专有，MSVC 只有 _putenv_s。
+class ScopedEnv {
+ public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        const char* old = std::getenv(name);
+        if (old != nullptr) oldValue_ = old;
+        apply(name, value);
+    }
+    ~ScopedEnv() { apply(name_, hadOld() ? oldValue_.c_str() : ""); }
+
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+    bool hadOld() const { return !oldValue_.empty(); }
+
+ private:
+    void apply(const char* name, const char* value) {
+#if defined(_WIN32)
+        _putenv_s(name, value);
+#else
+        ::setenv(name, value, 1);
+#endif
+    }
+
+    const char* name_;
+    std::string oldValue_;
+};
 
 // ------------------------------------------------------------------ mock server
 
@@ -246,6 +278,59 @@ void testDefaultConstructedIsDisabled() {
     expectEq(ta.fetchNsAddr(false), "", "disabled fetch returns empty");
 }
 
+// configureFromEnv：对应 Java MQClientAPIImpl 构造里的 `new DefaultTopAddressing(unitName)`
+// —— 那个构造函数自己读域名（Java 是系统属性，本端口统一用环境变量
+// ROCKETMQ_NAMESRV_DOMAIN，与 python/rust/dotnet 三端口一致）。
+// 这条链路此前只能靠调用方手工 setWsAddr 才通，实例自己装配是缺的。
+void testConfigureFromEnv(MockAddrServer& s) {
+    const std::string key = "ROCKETMQ_NAMESRV_DOMAIN";
+    // 1) 未配置 = 完全 no-op（不能让没设 env 的用户白等 3s 域名解析）
+    {
+        ScopedEnv off(key.c_str(), "");
+        expect(!DefaultTopAddressing::isConfigured(), "env 未设置时 isConfigured=false");
+        DefaultTopAddressing ta;
+        ta.configureFromEnv("unitA");
+        expect(ta.wsAddr().empty(), "env 未设置 → 不改 wsAddr");
+        expect(ta.unitName().empty(), "env 未设置 → 不记 unitName");
+        expectEq(ta.fetchNsAddr(false), "", "env 未设置时 fetch 仍是 no-op");
+    }
+    // 2) 配置了 domain：wsAddr 按 MixAll.getWSAddr 拼，unitName 进 URL
+    s.setResponse(200, "127.0.0.1:9876");
+    {
+        ScopedEnv on(key.c_str(), topAddrDomain(s).c_str());
+        expect(DefaultTopAddressing::isConfigured(), "env 设置后 isConfigured=true");
+        DefaultTopAddressing ta;
+        ta.configureFromEnv("unitA");
+        expectEq(ta.wsAddr(), topAddrWs(s), "configureFromEnv 拼出 wsAddr");
+        expectEq(ta.unitName(), "unitA", "unitName 落到地址服务器配置");
+        // domain 自带端口 ⇒ 不追加 :8080；unitName 段是 "-<unit>?nofix=1"
+        expectEq(ta.buildUrl(), topAddrWs(s) + "-unitA?nofix=1", "env + unitName 的 URL");
+        expectEq(ta.fetchNsAddr(false), "127.0.0.1:9876", "env 驱动的 fetch 取到地址");
+    }
+    // 3) MQClientInstance 构造时自己装配：facade 不用手工 setWsAddr
+    {
+        ScopedEnv on(key.c_str(), topAddrDomain(s).c_str());
+        MQClientInstance mqc("c@cppenv", {}, 3000, 15000, false, "unitZ");
+        expectEq(mqc.topAddressing().wsAddr(), topAddrWs(s), "实例从 env 装好 wsAddr");
+        expectEq(mqc.topAddressing().unitName(), "unitZ", "实例把 unitName 传给取址配置");
+        mqc.start();
+        const std::vector<std::string> addrs = mqc.nameServerAddrs();
+        expect(addrs.size() == 1 && addrs[0] == "127.0.0.1:9876",
+               "env 驱动的实例 start 时取到地址", "addrs=" + std::to_string(addrs.size()));
+        mqc.shutdown();
+    }
+    // 4) 没有 env 时实例保持关闭动态取址，也不碰地址服务器
+    {
+        ScopedEnv off(key.c_str(), "");
+        MQClientInstance mqc("c@cppenv2", {"127.0.0.1:9876"});
+        expect(mqc.topAddressing().wsAddr().empty(), "无 env 时实例 wsAddr 为空");
+        const int before = s.hitCount();
+        mqc.start();
+        mqc.shutdown();
+        expectEq(std::to_string(s.hitCount() - before), "0", "无 env 时不请求地址服务器");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -259,6 +344,10 @@ int main() {
         testMqClientIntegration(s);
     }
     testDefaultConstructedIsDisabled();
+    {
+        MockAddrServer s;
+        testConfigureFromEnv(s);
+    }
 
     std::printf("%s: %d checks, %d failed\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

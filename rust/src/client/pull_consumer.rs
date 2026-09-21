@@ -159,6 +159,18 @@ pub struct PullConsumerConfig {
     pub instance_name: String,
     /// Python `client_id`；`None` 时 `start()` 现造。
     pub client_id: Option<String>,
+    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
+    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
+    pub unit_name: Option<String>,
+    /// Java `ClientConfig#unitMode`（默认 false）：随回投/鉴权/消息过滤上线。
+    pub unit_mode: bool,
+    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
+    /// clientId 末尾多一段 `@STREAM`。
+    ///
+    /// ⚠ 拉模式默认 **true**：Java `DefaultMQPullConsumer` / `DefaultLitePullConsumer`
+    /// 的每个构造函数都置 `enableStreamRequestType = true`（:113/:126 与 :213/:228），
+    /// 只有推送消费者和生产者默认 false。
+    pub enable_stream_request_type: bool,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
@@ -181,6 +193,9 @@ impl Default for PullConsumerConfig {
             consumer_group: MixAll::DEFAULT_CONSUMER_GROUP.to_string(),
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
+            unit_name: None,
+            unit_mode: false,
+            enable_stream_request_type: true,
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
@@ -309,6 +324,11 @@ impl DefaultMQPullConsumer {
             .unwrap_or_default()
     }
 
+    /// Java `ClientConfig#isUnitMode()`（回投/过滤等请求都取这一个值）。
+    pub fn unit_mode(&self) -> bool {
+        read_cfg(&self.inner.cfg).unit_mode
+    }
+
     pub fn is_started(&self) -> bool {
         self.inner.started.load(Ordering::Acquire)
     }
@@ -331,6 +351,22 @@ impl DefaultMQPullConsumer {
     pub fn set_instance_name(&self, name: &str) {
         let name = name.to_string();
         self.update_config(|c| c.instance_name = name);
+    }
+
+    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
+    pub fn set_unit_name(&self, unit_name: Option<&str>) {
+        let unit_name = unit_name.map(str::to_string);
+        self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `ClientConfig#setUnitMode`。
+    pub fn set_unit_mode(&self, unit_mode: bool) {
+        self.update_config(|c| c.unit_mode = unit_mode);
+    }
+
+    /// Java `ClientConfig#setEnableStreamRequestType`。
+    pub fn set_enable_stream_request_type(&self, enable: bool) {
+        self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
     /// Python `set_namespace`。
@@ -417,6 +453,7 @@ impl DefaultMQPullConsumer {
             mq,
             None,
             msgs,
+            self.config().unit_mode,
         )
     }
 
@@ -465,7 +502,13 @@ impl DefaultMQPullConsumer {
         let client_id = cfg
             .client_id
             .clone()
-            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+            .unwrap_or_else(|| {
+                MixAll::build_default_client_id(
+                    &instance_name,
+                    cfg.unit_name.as_deref(),
+                    cfg.enable_stream_request_type,
+                )
+            });
         self.update_config(|c| {
             c.client_id = Some(client_id.clone());
             c.instance_name = instance_name;
@@ -473,6 +516,8 @@ impl DefaultMQPullConsumer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            unit_name: cfg.unit_name.clone(),
+            enable_stream_request_type: cfg.enable_stream_request_type,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -704,7 +749,7 @@ impl DefaultMQPullConsumer {
             .broker_addr_of(&broker)
             .ok_or_else(|| Error::client(format!("broker {broker} not found")))?;
         client
-            .consumer_send_msg_back(&group, msg, delay_level, None, 5_000, &addr)
+            .consumer_send_msg_back(&group, msg, delay_level, None, 5_000, &addr, self.unit_mode())
             .await
     }
 
@@ -764,6 +809,18 @@ pub struct LitePullConsumerConfig {
     pub instance_name: String,
     /// Python `client_id`；`None` 时 `start()` 现造。
     pub client_id: Option<String>,
+    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
+    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
+    pub unit_name: Option<String>,
+    /// Java `ClientConfig#unitMode`（默认 false）：随回投/鉴权/消息过滤上线。
+    pub unit_mode: bool,
+    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
+    /// clientId 末尾多一段 `@STREAM`。
+    ///
+    /// ⚠ 拉模式默认 **true**：Java `DefaultMQPullConsumer` / `DefaultLitePullConsumer`
+    /// 的每个构造函数都置 `enableStreamRequestType = true`（:113/:126 与 :213/:228），
+    /// 只有推送消费者和生产者默认 false。
+    pub enable_stream_request_type: bool,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`（同上，与推送消费者统一）。
@@ -802,6 +859,9 @@ impl Default for LitePullConsumerConfig {
             consumer_group: MixAll::DEFAULT_CONSUMER_GROUP.to_string(),
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
+            unit_name: None,
+            unit_mode: false,
+            enable_stream_request_type: true,
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
@@ -1044,6 +1104,22 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.instance_name = name);
     }
 
+    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
+    pub fn set_unit_name(&self, unit_name: Option<&str>) {
+        let unit_name = unit_name.map(str::to_string);
+        self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `ClientConfig#setUnitMode`。
+    pub fn set_unit_mode(&self, unit_mode: bool) {
+        self.update_config(|c| c.unit_mode = unit_mode);
+    }
+
+    /// Java `ClientConfig#setEnableStreamRequestType`。
+    pub fn set_enable_stream_request_type(&self, enable: bool) {
+        self.update_config(|c| c.enable_stream_request_type = enable);
+    }
+
     /// Python `set_message_model`。
     pub fn set_message_model(&self, model: &str) {
         let model = model.to_string();
@@ -1104,6 +1180,11 @@ impl DefaultLitePullConsumer {
             .client_id
             .clone()
             .unwrap_or_default()
+    }
+
+    /// Java `ClientConfig#isUnitMode()`（回投/过滤等请求都取这一个值）。
+    pub fn unit_mode(&self) -> bool {
+        read_cfg(&self.inner.cfg).unit_mode
     }
 
     pub fn is_started(&self) -> bool {
@@ -1271,7 +1352,13 @@ impl DefaultLitePullConsumer {
         let client_id = cfg
             .client_id
             .clone()
-            .unwrap_or_else(|| MixAll::build_default_client_id(&instance_name));
+            .unwrap_or_else(|| {
+                MixAll::build_default_client_id(
+                    &instance_name,
+                    cfg.unit_name.as_deref(),
+                    cfg.enable_stream_request_type,
+                )
+            });
         self.update_config(|c| {
             c.client_id = Some(client_id.clone());
             c.instance_name = instance_name;
@@ -1279,6 +1366,8 @@ impl DefaultLitePullConsumer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            unit_name: cfg.unit_name.clone(),
+            enable_stream_request_type: cfg.enable_stream_request_type,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -1947,7 +2036,8 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
         cfg.consume_from_where,
     );
     cd.subscription_data_set = lock(&inner.state).subscription_data.values().cloned().collect();
-    cd.unit_mode = false;
+    // Java `MQClientInstance:1039`：心跳里的 unitMode 来自消费者自己的 ClientConfig
+    cd.unit_mode = cfg.unit_mode;
     hb.consumer_data_set.push(cd);
     hb
 }

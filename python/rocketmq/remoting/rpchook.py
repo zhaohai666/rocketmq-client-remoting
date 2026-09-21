@@ -22,6 +22,8 @@ import hashlib
 import hmac as _hmac
 from typing import Optional
 
+from ..common.mix_all import MixAll
+from .protocol.codes import RequestType
 from .protocol.remoting_command import RemotingCommand
 
 
@@ -105,4 +107,26 @@ class AclClientRPCHook(RPCHook):
 # 兼容旧名（最初写作 AclRPCHook）
 AclRPCHook = AclClientRPCHook
 
-__all__ = ["RPCHook", "SessionCredentials", "AclClientRPCHook", "AclRPCHook"]
+
+class StreamTypeRPCHook(RPCHook):
+    """给每个请求打上请求类型标记
+    （对应 org.apache.rocketmq.remoting.rpchook.StreamTypeRPCHook）。
+
+    Java 的 `doBeforeRequest` 只有一行：
+    `request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))`，
+    即 `ReqT = "0"`（`RequestType` 目前只有 STREAM 一个枚举项，code 为 `(byte) 0`）。
+
+    ⚠ 注册顺序有意义：`MQClientAPIImpl:329-332` 的注释写着
+    "Inject stream rpc hook first to make reserve field signature"，即它必须注册在
+    用户的 rpcHook（通常是 ACL 签名钩子）**之前**，这样 ReqT 才会被算进签名内容，
+    broker 侧才不会因为多出一个未签名字段而拒签。
+    """
+
+    def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:
+        from ..common.mix_all import MixAll
+        from .protocol.codes import RequestType
+        request.add_ext_field(MixAll.REQ_T, str(RequestType.STREAM))
+
+
+__all__ = ["RPCHook", "SessionCredentials", "AclClientRPCHook", "AclRPCHook",
+           "StreamTypeRPCHook"]

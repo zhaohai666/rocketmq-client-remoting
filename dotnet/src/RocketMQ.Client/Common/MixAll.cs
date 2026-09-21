@@ -61,6 +61,13 @@ public static class MixAll
     public const int TransCheckMaxTime = 15;
     public const string UnitPrefix = "unit_";
 
+    /// <summary>
+    /// 对应 Java <c>MixAll.REQ_T</c>：请求类型标记的 ExtFields 键，由 stream 请求钩子
+    /// （<c>StreamTypeRPCHook</c>）写入，取值是 <c>RequestType.STREAM.getCode()</c>
+    /// 即 <c>"0"</c>（不是枚举名 —— clientId 的后缀才用枚举名 <c>@STREAM</c>）。
+    /// </summary>
+    public const string ReqT = "ReqT";
+
     public const int DefaultTopicQueueNums = 4;
     public const int DefaultTopicReadQueueNums = 4;
     public const int DefaultTopicWriteQueueNums = 4;

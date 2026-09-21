@@ -48,6 +48,16 @@ public:
     void setNamesrvAddr(const std::string& addr);  // 分号分隔
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
+
+    // ---------------- unitName / enableStreamRequestType ----------------
+    // 对应 Java `ClientConfig` 的这两个开关（必须在 start() 之前设置）。
+    // ⚠ 管理端**没有** unitMode 的落点：Java `DefaultMQAdminExtImpl` 全程没读过
+    // `isUnitMode()` —— 它既不发普通消息、也不做消息过滤。
+    void setUnitName(const std::string& unitName) { unitName_ = unitName; }
+    const std::string& unitName() const { return unitName_; }
+    // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
+    void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
+    bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     std::string getNamesrvAddr() const;
     std::vector<std::string> getNameServerAddressList() const { return nameServerAddrs_; }
     void setTimeoutMillis(int32_t millis) { timeoutMillis_ = millis; }
@@ -228,6 +238,8 @@ private:
 
     std::string instanceName_;
     std::string clientId_;
+    std::string unitName_;
+    bool enableStreamRequestType_ = false;
     std::vector<std::string> nameServerAddrs_;
     std::vector<std::string> kvNamespaceToDeleteList_;
     int32_t timeoutMillis_ = DEFAULT_TIMEOUT;

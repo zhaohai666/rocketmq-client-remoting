@@ -157,27 +157,31 @@ void DefaultMQProducer::start() {
     }
     // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
     // （Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，本端口没有内部生产者，所以无条件
-    // 执行），再由 `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>`。
+    // 执行），再由 `ClientConfig#buildMQClientId` 拼
+    // `<本机 IP>@<instanceName>[@unitName][@STREAM]`。
     // instanceName 就地写回，和 Java 一样：第二次 start() 复用同一个 clientId。
     instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
-        clientId_ = buildClientId(instanceName_);
+        clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                          /*connectTimeoutMillis=*/3000,
                                          /*invokeTimeoutMillis=*/15000,
-                                         tlsEnable_));
+                                         tlsEnable_, unitName_));
+    // 请求钩子：必须在**任何请求发出之前**绑定（start() 里的路由拉取与心跳也要带签名，
+    // 开了 stream 时还要带 `ReqT`）。Java 把钩子绑在 MQClientAPIImpl 构造函数里，
+    // 这里同样先绑钩子再 start()。
+    if (std::shared_ptr<RPCHook> requestHook =
+            composeRequestHooks(enableStreamRequestType_, rpcHook_)) {
+        if (!mqClient_->registerRPCHook(requestHook)) {
+            logger_warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
+                        + clientId_ + ")");
+        }
+    }
     mqClient_->start();
     // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
     if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
         nameServerAddrs_ = mqClient_->nameServerAddrs();
-    }
-    // ACL 鉴权钩子：必须在任何请求发出之前绑定（路由拉取、心跳都会带签名）。
-    if (rpcHook_) {
-        if (!mqClient_->registerRPCHook(rpcHook_)) {
-            logger_warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
-                        + clientId_ + ")");
-        }
     }
     // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
     // 不注册的话 broker 回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 UNKNOW。
@@ -385,8 +389,8 @@ void DefaultMQProducer::runCheckForbidden(const Message& msg, const MessageQueue
     context.brokerAddr = brokerAddr;
     context.communicationMode = mode;
     context.arg = arg;
-    // 本项目无 unit mode（Java isUnitMode() 恒为 false）
-    context.unitMode = false;
+    // Java `DefaultMQProducerImpl:964` 把 `tc.isUnitMode()` 放进 CheckForbiddenContext
+    context.unitMode = unitMode_;
     executeCheckForbiddenHook(context);
 }
 
@@ -401,7 +405,7 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
     }
     // 没有任何拦截/钩子时零开销透传
     if (!hasSendInterceptors()) {
-        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
+        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_);
     }
     std::string brokerAddr;
     try {
@@ -414,14 +418,14 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
     //   3. 发请求  4. SendMessageHook.after
     runCheckForbidden(msg, mq, brokerAddr, arg, mode);
     if (sendMessageHookList_.empty()) {
-        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
+        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_);
     }
     SendMessageContext context = buildSendMessageContext(msg, mq, brokerAddr);
     executeSendMessageHookBefore(context);
 
     SendResult result;
     try {
-        result = client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag);
+        result = client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_);
     } catch (const std::exception& e) {
         context.exception = e.what();
         executeSendMessageHookAfter(context);
@@ -684,7 +688,7 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     if (enableTraceContext_) {
         injectTraceContext(&outbound);
     }
-    c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag);
+    c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag, unitMode_);
 }
 
 // ---------------------------------------------------------------- Request-Reply
@@ -750,7 +754,7 @@ Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueu
     const int64_t cost = UtilAll::currentTimeMillis() - begin;
     try {
         const int32_t sysFlag = prepareForSend(outbound);
-        c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag);
+        c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag, unitMode_);
     } catch (...) {
         // 发送失败三件事：标 !sendRequestOk + 空唤醒（别让等待方白等满 timeout）+ 记 cause。
         // 与 Java 的匿名 SendCallback#onException 完全一致。

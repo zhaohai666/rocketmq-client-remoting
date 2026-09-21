@@ -112,7 +112,8 @@ def execute_filter_hooks(hook_list: List["FilterMessageHook"], context: FilterMe
 
 def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMessageHook"],
                                  mq: MessageQueue, sub: Optional[SubscriptionData],
-                                 msgs: List[MessageExt]) -> List[MessageExt]:
+                                 msgs: List[MessageExt],
+                                 unit_mode: bool = False) -> List[MessageExt]:
     """投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
 
     钩子拿到的是**可变的** ``msg_list``；被摘掉的消息由调用方决定处置方式：
@@ -122,7 +123,7 @@ def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMes
     out = client_side_tag_filter(sub, list(msgs))
     if out and hook_list:
         context = FilterMessageContext(consumer_group, out, mq)
-        context.unit_mode = False        # 本项目无 unit mode（Java isUnitMode() 恒 false）
+        context.unit_mode = unit_mode    # Java DefaultMQPushConsumerImpl:640
         execute_filter_hooks(hook_list, context)
         out = list(context.msg_list)
     return out
@@ -657,8 +658,17 @@ class DefaultMQPushConsumer:
         # TLS（Java 全局系统属性 tls.enable 的等价物；None = 交给 env ROCKETMQ_TLS_ENABLE）
         self.tls_enable: Optional[bool] = kwargs.pop("tls_enable", None)
         self.namespace = namespace
-        self.instance_name = "DEFAULT"
+        self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
+        # ---- unit / stream 配置（对应 Java ClientConfig 的同名字段）----
+        # unitName 参与 clientId 的 `@<unitName>` 后缀与动态取址 URL；unitMode 随
+        # ConsumerData 心跳、消息回投请求头和过滤钩子上报给 broker；
+        # enableStreamRequestType 既给 clientId 加 `@STREAM` 后缀（Java 的注释写明是
+        # 为了"prevent unexpected reuses of MQClientInstance"），也给每个请求加
+        # `ReqT=0` 扩展字段。Java 的推送消费者与 producer 一样默认关闭。
+        self.unit_name: Optional[str] = None
+        self.unit_mode = False
+        self.enable_stream_request_type = False
         self.message_model = message_model
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         self.consume_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
@@ -783,6 +793,24 @@ class DefaultMQPushConsumer:
 
     def set_instance_name(self, name: str) -> None:
         self.instance_name = name
+
+    def set_unit_name(self, unit_name: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。"""
+        self.unit_name = unit_name
+
+    def get_unit_name(self) -> Optional[str]:
+        return self.unit_name
+
+    def set_unit_mode(self, unit_mode: bool) -> None:
+        """对应 Java `ClientConfig#setUnitMode`：随心跳/请求头透传给 broker。"""
+        self.unit_mode = bool(unit_mode)
+
+    def is_unit_mode(self) -> bool:
+        return self.unit_mode
+
+    def set_enable_stream_request_type(self, enable: bool) -> None:
+        """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
+        self.enable_stream_request_type = bool(enable)
 
     def set_message_model(self, model: str) -> None:
         self.message_model = model
@@ -965,7 +993,7 @@ class DefaultMQPushConsumer:
                                       msgs: List[MessageExt]) -> List[MessageExt]:
         """投递前过滤（见模块级 filter_messages_for_delivery 的说明）。"""
         return filter_messages_for_delivery(self.consumer_group, self.filter_message_hook_list,
-                                            mq, sub, msgs)
+                                            mq, sub, msgs, self.unit_mode)
 
     def execute_consume_hook_before(self, context: ConsumeMessageContext) -> None:
         for hook in self.consume_message_hook_list:
@@ -1107,13 +1135,17 @@ class DefaultMQPushConsumer:
             # 对应 Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
             # `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，Java 的
             # MQClientManager 因此让同进程的广播消费者复用同一份实例），再由
-            # `ClientConfig#buildMQClientId` 拼 `<本机 IP>@<instanceName>`。
+            # `ClientConfig#buildMQClientId` 拼
+            # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
             if self.message_model == MessageModel.CLUSTERING:
                 self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
             if self.client_id is None:
-                self.client_id = MixAll.client_id_for(self.instance_name)
+                self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
+                                                      self.enable_stream_request_type)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
-                                               tls_enable=self.tls_enable)
+                                               tls_enable=self.tls_enable,
+                                               enable_stream_request_type=self.enable_stream_request_type,
+                                               unit_name=self.unit_name)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
@@ -1287,6 +1319,10 @@ class DefaultMQPushConsumer:
         hb = HeartbeatData(self.client_id or "")
         cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_PASSIVELY,
                           self.message_model, self.consume_from_where)
+        # Java `MQClientInstance`:1039 把 `impl.isUnitMode()` 写进 ConsumerData；
+        # broker 端据此给自动建出来的 %RETRY% topic 打 UNIT 系统标志
+        # （ClientManageProcessor:113 / :186）。
+        cd.unit_mode = self.unit_mode
         with self._lock:
             subs = list(self.subscription_data.values())
         for sub in subs:
@@ -2409,7 +2445,7 @@ class DefaultMQPushConsumer:
         header.delay_level = delay_level
         header.origin_msg_id = msg.msg_id
         header.origin_topic = msg.topic
-        header.unit_mode = False
+        header.unit_mode = self.unit_mode
         header.max_reconsume_times = max_reconsume
         request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
         response = client._invoke_sync(addr, request, 5000)
@@ -2426,8 +2462,17 @@ class DefaultMQPullConsumer:
             raise MQClientException("consumerGroup is empty")
         self.consumer_group = str(consumer_group)
         self.namespace = namespace
-        self.instance_name = "DEFAULT"
+        self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
+        # ---- unit / stream 配置（对应 Java ClientConfig 的同名字段）----
+        # unitName 参与 clientId 的 `@<unitName>` 后缀与动态取址 URL；unitMode 随
+        # ConsumerData 心跳、消息回投请求头和过滤钩子上报给 broker；
+        # enableStreamRequestType 既给 clientId 加 `@STREAM` 后缀（Java 的注释写明是
+        # 为了"prevent unexpected reuses of MQClientInstance"），也给每个请求加
+        # `ReqT=0` 扩展字段。Java 的 DefaultMQPullConsumer 每个构造函数都写 `enableStreamRequestType = true`（:113/:126）。
+        self.unit_name: Optional[str] = None
+        self.unit_mode = False
+        self.enable_stream_request_type = True
         self.message_model = message_model
         self.broker_suspend_max_time_millis = 20000
         self.consumer_pull_timeout_millis = 10000
@@ -2470,7 +2515,7 @@ class DefaultMQPullConsumer:
         if not msgs or not self.filter_message_hook_list:
             return msgs
         context = FilterMessageContext(self.consumer_group, list(msgs), mq)
-        context.unit_mode = False
+        context.unit_mode = self.unit_mode
         self.execute_filter_message_hook(context)
         return list(context.msg_list)
 
@@ -2483,6 +2528,24 @@ class DefaultMQPullConsumer:
 
     def set_instance_name(self, name: str) -> None:
         self.instance_name = name
+
+    def set_unit_name(self, unit_name: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。"""
+        self.unit_name = unit_name
+
+    def get_unit_name(self) -> Optional[str]:
+        return self.unit_name
+
+    def set_unit_mode(self, unit_mode: bool) -> None:
+        """对应 Java `ClientConfig#setUnitMode`：随心跳/请求头透传给 broker。"""
+        self.unit_mode = bool(unit_mode)
+
+    def is_unit_mode(self) -> bool:
+        return self.unit_mode
+
+    def set_enable_stream_request_type(self, enable: bool) -> None:
+        """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
+        self.enable_stream_request_type = bool(enable)
 
     def set_message_model(self, model: str) -> None:
         self.message_model = model
@@ -2516,12 +2579,16 @@ class DefaultMQPullConsumer:
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
         # Java `DefaultMQPullConsumerImpl#start`:712-714：CLUSTERING 才改写 instanceName，
-        # clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        # clientId 口径是 `ClientConfig#buildMQClientId` 的
+        # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
         if self.message_model == MessageModel.CLUSTERING:
             self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
-            self.client_id = MixAll.client_id_for(self.instance_name)
-        self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs)
+            self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
+                                                  self.enable_stream_request_type)
+        self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
+                                           enable_stream_request_type=self.enable_stream_request_type,
+                                           unit_name=self.unit_name)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         self._mq_client.start()
@@ -2643,7 +2710,7 @@ class DefaultMQPullConsumer:
         header.delay_level = delay_level
         header.origin_msg_id = msg.msg_id
         header.origin_topic = msg.topic
-        header.unit_mode = False
+        header.unit_mode = self.unit_mode
         # ⚠ 这里**不能**照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack
         # （它直接传 getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker
         # 会无条件采用该字段（AbstractSendMessageProcessor:172-179），-1 会让
@@ -2688,8 +2755,17 @@ class DefaultLitePullConsumer:
             raise MQClientException("consumerGroup is empty")
         self.consumer_group = str(consumer_group)
         self.namespace = namespace
-        self.instance_name = "DEFAULT"
+        self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
+        # ---- unit / stream 配置（对应 Java ClientConfig 的同名字段）----
+        # unitName 参与 clientId 的 `@<unitName>` 后缀与动态取址 URL；unitMode 随
+        # ConsumerData 心跳、消息回投请求头和过滤钩子上报给 broker；
+        # enableStreamRequestType 既给 clientId 加 `@STREAM` 后缀（Java 的注释写明是
+        # 为了"prevent unexpected reuses of MQClientInstance"），也给每个请求加
+        # `ReqT=0` 扩展字段。Java 的 DefaultLitePullConsumer 每个构造函数都写 `enableStreamRequestType = true`（:213/:228）。
+        self.unit_name: Optional[str] = None
+        self.unit_mode = False
+        self.enable_stream_request_type = True
         self.message_model = message_model
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
@@ -2754,6 +2830,24 @@ class DefaultLitePullConsumer:
 
     def set_instance_name(self, name: str) -> None:
         self.instance_name = name
+
+    def set_unit_name(self, unit_name: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。"""
+        self.unit_name = unit_name
+
+    def get_unit_name(self) -> Optional[str]:
+        return self.unit_name
+
+    def set_unit_mode(self, unit_mode: bool) -> None:
+        """对应 Java `ClientConfig#setUnitMode`：随心跳/请求头透传给 broker。"""
+        self.unit_mode = bool(unit_mode)
+
+    def is_unit_mode(self) -> bool:
+        return self.unit_mode
+
+    def set_enable_stream_request_type(self, enable: bool) -> None:
+        """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
+        self.enable_stream_request_type = bool(enable)
 
     def set_message_model(self, model: str) -> None:
         self.message_model = model
@@ -2841,7 +2935,9 @@ class DefaultLitePullConsumer:
 
     # ---------------- 生命周期 ----------------
     def _create_client(self) -> MQClientInstance:
-        return MQClientInstance(self.client_id, self.name_server_addrs)
+        return MQClientInstance(self.client_id, self.name_server_addrs,
+                                enable_stream_request_type=self.enable_stream_request_type,
+                                unit_name=self.unit_name)
 
     def start(self) -> None:
         if self._started:
@@ -2864,11 +2960,13 @@ class DefaultLitePullConsumer:
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
         # Java `DefaultLitePullConsumerImpl#start`:287-289：CLUSTERING 才改写 instanceName，
-        # clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
+        # clientId 口径是 `ClientConfig#buildMQClientId` 的
+        # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
         if self.message_model == MessageModel.CLUSTERING:
             self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
-            self.client_id = MixAll.client_id_for(self.instance_name)
+            self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
+                                                  self.enable_stream_request_type)
         self._mq_client = self._create_client()
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
@@ -2935,6 +3033,8 @@ class DefaultLitePullConsumer:
         hb = HeartbeatData(self.client_id or "")
         cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_PASSIVELY,
                           self.message_model, self.consume_from_where)
+        # 见推送消费者 _build_heartbeat 的同名注释
+        cd.unit_mode = self.unit_mode
         for sub in self.subscription_data.values():
             cd.subscription_data_set.add(sub)
         hb.consumer_data_set.add(cd)

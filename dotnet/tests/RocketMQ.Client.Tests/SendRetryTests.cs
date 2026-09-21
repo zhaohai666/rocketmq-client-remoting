@@ -16,6 +16,8 @@ using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
+// PropertyMap 是 src 侧的 global using 别名（SortedDictionary<string,string>），测试项目要显式声明。
+using PropertyMap = System.Collections.Generic.SortedDictionary<string, string>;
 
 namespace RocketMQ.Client.Tests;
 
@@ -25,6 +27,43 @@ public class SendRetryTests
     private const int MaxFrame = 20 * 1024 * 1024;
 
     // ---------------------------------------------------------------- 假集群
+
+    /// <summary>
+    /// 一笔上线报文的取证：请求码（发送/路由/心跳…）、extFields 和原始 body。
+    /// 客户端自说自话不算证据，只有从 socket 上抓下来的字段才能证明钩子真的生效了。
+    /// </summary>
+    private sealed class WireRecord
+    {
+        public int Code { get; init; }
+        public PropertyMap Ext { get; init; } = new();
+        public byte[] Body { get; init; } = Array.Empty<byte>();
+        public bool HasBody { get; init; }
+
+        public static WireRecord Of(RemotingCommand req) => new()
+        {
+            Code = req.Code,
+            Ext = new PropertyMap(req.ExtFields),
+            Body = req.Body,
+            HasBody = req.HasBody,
+        };
+
+        /// <summary>还原成裸报文，用来做 broker 侧的验签复算。</summary>
+        public RemotingCommand ToCommand()
+        {
+            var cmd = RemotingCommand.CreateRequestCommand(Code, null);
+            foreach ((string key, string value) in Ext)
+            {
+                cmd.AddExtField(key, value);
+            }
+
+            cmd.Body = Body;
+            cmd.HasBody = HasBody;
+            return cmd;
+        }
+    }
+
+    /// <summary>取证的条数上限：后台线程会持续打，留几百条足够判断"有没有打标"。</summary>
+    private const int RequestLogCap = 500;
 
     /// <summary>单个 broker 的脚本：按顺序弹出 (应答码, 应答前 sleep 毫秒)，耗尽后一直用 Tail。</summary>
     private sealed class BrokerScript
@@ -44,6 +83,7 @@ public class SendRetryTests
         private readonly List<BrokerScript> _brokers = new();
         private readonly List<string> _brokerAddrs = new();
         private readonly List<Socket> _sockets = new();
+        private readonly List<WireRecord> _requests = new();
         private bool _routeOk = true;
 
         public string NamesrvAddr { get; private init; } = string.Empty;
@@ -119,6 +159,66 @@ public class SendRetryTests
             }
         }
 
+        /// <summary>记下每一笔上线报文（namesrv 与 broker 都算），供钩子类断言回查。</summary>
+        private void Record(RemotingCommand req)
+        {
+            lock (_gate)
+            {
+                if (_requests.Count < RequestLogCap)
+                {
+                    _requests.Add(WireRecord.Of(req));
+                }
+            }
+        }
+
+        public void ClearRequests()
+        {
+            lock (_gate)
+            {
+                _requests.Clear();
+            }
+        }
+
+        /// <summary>指定请求码上收到过多少笔请求。</summary>
+        public int CountRequests(int code)
+        {
+            lock (_gate)
+            {
+                return _requests.Count(r => r.Code == code);
+            }
+        }
+
+        /// <summary>指定请求码上，extFields 里 key=value 命中了多少笔。</summary>
+        public int CountRequestsWith(int code, string key, string value)
+        {
+            lock (_gate)
+            {
+                return _requests.Count(r =>
+                    r.Code == code && r.Ext.TryGetValue(key, out string? v) && v == value);
+            }
+        }
+
+        /// <summary>
+        /// 第一笔**发送**请求的取证（V1/V2/批量/应答都算）：本端口按 Java sendSmartMsg 默认发
+        /// SendMessageV2(310)，写死 SendMessage(10) 会永远抓不到。
+        /// </summary>
+        public WireRecord? FirstSendRequest()
+        {
+            lock (_gate)
+            {
+                return _requests.FirstOrDefault(r => IsSendCode(r.Code));
+            }
+        }
+
+        /// <summary>指定请求码里是否有任何一笔带了这个 extField。</summary>
+        public bool AnyRequestHas(int code, string key)
+        {
+            lock (_gate)
+            {
+                return _requests.Any(r => r.Code == code && r.Ext.ContainsKey(key));
+            }
+        }
+
         public void Dispose()
         {
             foreach (Socket s in _sockets)
@@ -136,6 +236,7 @@ public class SendRetryTests
 
         private RemotingCommand? NamesrvRespond(RemotingCommand req)
         {
+            Record(req);
             if (req.Code == RequestCode.GetRouteinfoByTopic)
             {
                 List<string> addrs;
@@ -162,6 +263,7 @@ public class SendRetryTests
 
         private RemotingCommand? BrokerRespond(int index, RemotingCommand req)
         {
+            Record(req);
             if (!IsSendCode(req.Code))
             {
                 // 心跳等非发送请求一律应答成功，别让后台线程卡在错误上
@@ -589,5 +691,111 @@ public class SendRetryTests
         Assert.True(ok!.IsAvailable());
         Assert.True(ok.IsReachable());
         producer.Shutdown();
+    }
+
+    // ------------------------------------------------------- 请求钩子真的写到 socket 上
+
+    private const string WireSk = "SK_wire_12345678";
+
+    /// <summary>
+    /// 钩子的四段取证，全部只看**抓下来的报文**：
+    /// ① 只注册 ACL → 有 AccessKey/Signature、没有 ReqT；
+    /// ② ACL + stream → 有 ReqT="0"，且把抓到的报文按 broker 的口径复算 HMAC 能对上
+    ///    （证明 ReqT 落在签名内容里，而不是签完之后又改了几个字段）；
+    /// ③ lite 消费者（Java 默认开 stream）→ 路由与心跳都带 ReqT；
+    /// ④ 关掉开关 → 一笔都不带，但请求照发（不是"没打出去"造成的假绿）。
+    /// 顺序在 RequestHooks.Compose 里，绑定位置在各 facade 的 Start() 里，两处都得线上验证。
+    /// </summary>
+    [Fact]
+    public void RequestHooksReachTheWire()
+    {
+        // ---- ① 只有 ACL：签名字段在，ReqT 不在 ----
+        using (var cluster = MockCluster.Start(1))
+        {
+            DefaultMQProducer producer = StartedWithHook(cluster, "GID_HookAclOnly", false);
+            Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
+
+            WireRecord? rec = cluster.FirstSendRequest();
+            Assert.NotNull(rec);
+            Assert.Equal("AK_wire", rec!.Ext[SessionCredentials.AccessKeyField]);
+            Assert.True(rec.Ext.ContainsKey(SessionCredentials.SignatureField));
+            Assert.False(rec.Ext.ContainsKey(MixAll.ReqT), "没开 stream 不该打 ReqT");
+            producer.Shutdown();
+        }
+
+        // ---- ② ACL + stream：ReqT 在签**之前**写入，所以算进签名 ----
+        using (var cluster = MockCluster.Start(1))
+        {
+            DefaultMQProducer producer = StartedWithHook(cluster, "GID_HookStreamAcl", true);
+            Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
+
+            WireRecord rec = cluster.FirstSendRequest()!;
+            Assert.Equal("0", rec.Ext[MixAll.ReqT]); // Java 写 code 的字符串形式，不是枚举名
+            // broker 侧复算：拿抓到的报文（含 ReqT、排除 Signature）重算一遍签名
+            Assert.Equal(rec.Ext[SessionCredentials.SignatureField],
+                AclClientRPCHook.CalcSignature(WireSk, rec.ToCommand()));
+            producer.Shutdown();
+        }
+
+        // ---- ③ lite 消费者默认开 stream：路由 + 心跳都带标 ----
+        using (var cluster = MockCluster.Start(1))
+        {
+            DefaultLitePullConsumer consumer = StartedLite(cluster, "GID_HookLite", stream: null);
+            Assert.True(cluster.CountRequestsWith(RequestCode.GetRouteinfoByTopic,
+                MixAll.ReqT, "0") > 0, "路由请求要带 ReqT");
+            Assert.Equal(cluster.CountRequests(RequestCode.GetRouteinfoByTopic),
+                cluster.CountRequestsWith(RequestCode.GetRouteinfoByTopic, MixAll.ReqT, "0"));
+            Assert.True(cluster.CountRequestsWith(RequestCode.HeartBeat, MixAll.ReqT, "0") > 0,
+                "心跳要带 ReqT");
+            consumer.Shutdown();
+        }
+
+        // ---- ④ 显式关掉：一笔都不带，但请求确实发出去了 ----
+        using (var cluster = MockCluster.Start(1))
+        {
+            DefaultLitePullConsumer consumer = StartedLite(cluster, "GID_HookLiteOff", stream: false);
+            Assert.True(cluster.CountRequests(RequestCode.GetRouteinfoByTopic) > 0);
+            Assert.False(cluster.AnyRequestHas(RequestCode.GetRouteinfoByTopic, MixAll.ReqT));
+            Assert.False(cluster.AnyRequestHas(RequestCode.HeartBeat, MixAll.ReqT));
+            consumer.Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// 带 ACL 钩子的生产者。钩子必须排在 Start() **之前**：Java 的 rpcHook 随
+    /// <c>MQClientAPIImpl</c> 构造传入，本端口各 facade 也在 <c>Start()</c> 里把它绑到
+    /// 传输层 —— 启动后再 SetRpcHook 已经来不及，报文会裸着出去（这正是 ① ② 要抓的东西）。
+    /// </summary>
+    private static DefaultMQProducer StartedWithHook(MockCluster cluster, string group, bool stream)
+    {
+        var producer = new DefaultMQProducer(group)
+        {
+            NamesrvAddr = cluster.NamesrvAddr,
+            InstanceName = group,
+            EnableStreamRequestType = stream,
+        };
+        producer.SetRpcHook(new AclClientRPCHook(new SessionCredentials("AK_wire", WireSk)));
+        producer.Start();
+        return producer;
+    }
+
+    /// <summary>
+    /// 起一个 lite 消费者：stream 传 null 表示**不动默认值**（Java 的
+    /// DefaultLitePullConsumer 在构造函数里就置 true，③ 段要验的正是这个默认）。
+    /// </summary>
+    private static DefaultLitePullConsumer StartedLite(MockCluster cluster, string group,
+        bool? stream)
+    {
+        var consumer = new DefaultLitePullConsumer(group);
+        consumer.SetInstanceName(group);
+        if (stream.HasValue)
+        {
+            consumer.EnableStreamRequestType = stream.Value;
+        }
+
+        consumer.SetNamesrvAddr(cluster.NamesrvAddr);
+        consumer.Subscribe(Topic, "*");
+        consumer.Start();
+        return consumer;
     }
 }

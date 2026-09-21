@@ -312,7 +312,7 @@ void DefaultMQPushConsumer::start() {
             instanceName_ = changeInstanceNameToPID(instanceName_);
         }
         if (clientId_.empty()) {
-            clientId_ = buildClientId(instanceName_);
+            clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
         }
         // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：
         // broker 回投的消息写到 %RETRY%group，客户端不订阅就收不到
@@ -326,17 +326,20 @@ void DefaultMQPushConsumer::start() {
         mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                              /*connectTimeoutMillis=*/3000,
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_,
-                                             tlsEnable_));
+                                             tlsEnable_, unitName_));
+        // 请求钩子（ACL 签名 / stream 的 `ReqT`）：绑定在 **start() 之前** ——
+        // Java 的 rpcHook 在 MQClientAPIImpl 构造时传入，实例第一笔报文就带着它。
+        std::shared_ptr<RPCHook> requestHook =
+            composeRequestHooks(enableStreamRequestType_, rpcHook_);
+        if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
+            logger_warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
+                        + clientId_ + ")");
+        }
         mqClient_->start();
         // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
         // （Java 由共享的 ClientConfig 天然同步）
         if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
             nameServerAddrs_ = mqClient_->nameServerAddrs();
-        }
-        // ACL 鉴权钩子：必须在首包（路由拉取 / 心跳 / rebalance）发出之前绑定。
-        if (rpcHook_ && !mqClient_->registerRPCHook(rpcHook_)) {
-            logger_warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
-                        + clientId_ + ")");
         }
         // POP 消费执行器必须在 rebalance（会立刻起每队列 POP 循环）之前建好，
         // 否则循环弹出消息后无处投递（对齐 Java 在 service 构造时就建 consumeExecutor）。
@@ -1305,7 +1308,9 @@ std::vector<MessageExt> DefaultMQPushConsumer::filterMessagesForDelivery(
         context.consumerGroup = consumerGroup_;
         context.msgList = out;
         context.mq = mq;
-        context.unitMode = false;  // 本项目无 unit mode
+        // Java `DefaultMQPushConsumerImpl:640`：filterMessageContext.setUnitMode(
+        // this.defaultMQPushConsumer.isUnitMode()) —— 钩子据此判断是否单元化流量
+        context.unitMode = unitMode_;
         executeFilterMessageHook(context);
         out = context.msgList;
     }
@@ -2095,7 +2100,9 @@ int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
     cd.consumeType = ConsumeType::CONSUME_PASSIVELY;
     cd.messageModel = messageModel_;
     cd.consumeFromWhere = consumeFromWhere_;
-    cd.unitMode = false;
+    // Java `MQClientInstance:1039` 心跳里带 consumerData.setUnitMode(tc.isUnitMode())：
+    // broker 据此决定 %RETRY% topic 建出来带不带 UNIT_SUB 位
+    cd.unitMode = unitMode_;
     {
         std::lock_guard<std::mutex> lk(lock_);
         for (const auto& kv : subscriptionData_) {
@@ -2181,7 +2188,11 @@ void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg
     std::shared_ptr<TopicPublishInfo> publish =
         c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
-    c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0);
+    // 走的是 MQClientInstance 的**内部生产者**，Java 在构造它时调过
+    // `resetClientConfig(clientConfig)`（MQClientInstance.java:218-219），
+    // 所以 unitMode 与本消费者一致 —— 这里必须带上，否则重投消息会丢单元标记。
+    c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0,
+                  unitMode_);
 }
 
 bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel,
@@ -2201,7 +2212,12 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
         header->delayLevel = delayLevel;
         header->originMsgId = msg.msgId;
         header->originTopic = msg.topic;
-        header->unitMode = false;
+        // ⚠ 有意超出 Java：MQClientAPIImpl#consumerSendMessageBack(:1684-1693) 只填
+        // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName，
+        // 从不写 unitMode，字段恒为 false。broker 侧确实读它
+        // （AbstractSendMessageProcessor:135-138 → buildSysFlag(false, true)），所以这里
+        // 按消费者配置如实上报，单元化重试 topic 才会带上 UNIT_SUB 标记。
+        header->unitMode = unitMode_;
         header->maxReconsumeTimes = maxReconsumeTimesOrDefault();
         RemotingCommand request =
             RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);

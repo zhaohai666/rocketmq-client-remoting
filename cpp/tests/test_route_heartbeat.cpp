@@ -245,6 +245,20 @@ static void testHeartbeatData() {
     CHECK(!contains(cdJson, "maxReconsumeTimes"),
           "consumer json must NOT contain maxReconsumeTimes (absent in this Java version)");
 
+    // unitMode=true 必须真的上线：broker 只看这一个字段决定 %RETRY%group 建出来
+    // 带不带 UNIT_SUB 位（ClientManageProcessor.java:113-118）。
+    ConsumerData unitCd = cd;
+    unitCd.setUnitMode(true);
+    CHECK(contains(unitCd.toJson().dump(), "\"unitMode\":true"),
+          "consumer json carries unitMode=true");
+    CHECK(!(unitCd == cd), "ConsumerData equality distinguishes unitMode");
+    HeartbeatData unitHb("10.0.0.1@12345");
+    unitHb.addConsumerData(unitCd);
+    HeartbeatData unitBack;
+    CHECK(HeartbeatData::decode(unitHb.encode(), unitBack), "unit heartbeat decode ok");
+    CHECK(unitBack.consumerDataSet.size() == 1 && unitBack.consumerDataSet[0].isUnitMode(),
+          "unit heartbeat round-trips unitMode");
+
     // HeartbeatData 顶层字段守卫
     HeartbeatData full("10.0.0.1@12345");
     full.addProducerData(ProducerData("pg_probe"));

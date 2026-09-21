@@ -54,6 +54,7 @@ from ..remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHead
 from ..remoting.protocol.heartbeat import HeartbeatData
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.protocol.route import TopicRouteData
+from ..remoting.rpchook import StreamTypeRPCHook
 from .consumer_stats import ConsumerStatsManager
 from .exception import MQBrokerException, MQClientException
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
@@ -116,11 +117,19 @@ class MQClientInstance:
 
     def __init__(self, client_id: str, name_server_addrs: List[str],
                  connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
-                 tls_enable: Optional[bool] = None):
+                 tls_enable: Optional[bool] = None,
+                 enable_stream_request_type: bool = False,
+                 unit_name: Optional[str] = None):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
                                               tls_enable=tls_enable)
+        # 对应 Java `MQClientAPIImpl:329-332`：stream 钩子必须注册在用户 rpcHook 之前，
+        # 这样 `ReqT` 才会被算进 ACL 签名内容（注释原文 "Inject stream rpc hook first
+        # to make reserve field signature"）。各 facade 都是在构造完本实例之后才
+        # `register_rpc_hook(self.rpc_hook)`，所以在这里注册天然满足顺序。
+        if enable_stream_request_type:
+            self.remoting_client.register_rpc_hook(StreamTypeRPCHook())
         self.topic_route_table: Dict[str, TopicRouteData] = {}
         self.topic_publish_info_table: Dict[str, TopicPublishInfo] = {}
         self.topic_route_lock = threading.RLock()
@@ -164,7 +173,9 @@ class MQClientInstance:
         self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
         # 动态 name server（对应 Java MQClientAPIImpl.topAddressing）。
         # 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 ws_addr 为空串 → fetch 是 no-op，行为不变。
-        self.top_addressing = DefaultTopAddressing()
+        # unitName 要透传（Java `new DefaultTopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName())`）：
+        # 有 unit 时取址 URL 变成 `<wsAddr>-<unitName>?nofix=1`，取到的是该单元的 name server 列表。
+        self.top_addressing = DefaultTopAddressing(unit_name=unit_name or "")
         # 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）
         self.consumer_stats_manager = ConsumerStatsManager()
         self._namesrv_refresh_stop = threading.Event()
@@ -549,7 +560,8 @@ class MQClientInstance:
 
     # ---------------- 消息发送 ----------------
     def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
-                     timeout_millis: int = 3000, sys_flag: int = 0) -> SendResult:
+                     timeout_millis: int = 3000, sys_flag: int = 0,
+                     unit_mode: bool = False) -> SendResult:
         addr = self.find_broker_addr_in_route(self.get_topic_route_data(mq.topic), mq.broker_name) if self.get_topic_route_data(mq.topic) else None
         if addr is None:
             route = self.get_topic_route_data(mq.topic)
@@ -558,26 +570,30 @@ class MQClientInstance:
             addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
             if addr is None:
                 raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag)
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                           unit_mode)
         response = self._invoke_sync(addr, request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_to_addr(self, producer_group: str, msg: Message, mq: MessageQueue,
                              addr: str, timeout_millis: int = 3000,
-                             sys_flag: int = 0) -> SendResult:
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag)
+                             sys_flag: int = 0, unit_mode: bool = False) -> SendResult:
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                           unit_mode)
         response = self._invoke_sync(addr, request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_oneway(self, producer_group: str, msg: Message, mq: MessageQueue,
                             addr: str, timeout_millis: int = 3000,
-                            sys_flag: int = 0) -> None:
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag)
+                            sys_flag: int = 0, unit_mode: bool = False) -> None:
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                           unit_mode)
         request.mark_oneway_rpc()
         self.remoting_client.invoke_oneway(addr, request)
 
     def _build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
-                            timeout_millis: int = 3000, sys_flag: int = 0) -> RemotingCommand:
+                            timeout_millis: int = 3000, sys_flag: int = 0,
+                            unit_mode: bool = False) -> RemotingCommand:
         """sys_flag 由 Producer 算好（压缩标志 + 压缩类型位），见
         DefaultMQProducer.try_to_compress_message。"""
         # 对齐 Java DefaultMQProducerImpl.sendKernelImpl:932-935：非批量消息在
@@ -598,7 +614,7 @@ class MQClientInstance:
         header.flag = msg.flag
         header.properties = message_properties_2_string(msg.properties)
         header.reconsume_times = 0
-        header.unit_mode = False
+        header.unit_mode = unit_mode
         # ⚠ maxReconsumeTimes 只在「发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES 属性」时
         # 才下发（Java sendKernelImpl:1003-1018）。客户端版本升到 V3_4_9 之后 broker
         # 会无条件采信这个字段（AbstractSendMessageProcessor:172-179），固定发 0 会让

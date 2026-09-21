@@ -213,7 +213,7 @@ void testCheckForbiddenHook() {
     expectInt(hook->calls, 1, "forbidden: hook invoked once per execute");
     expect(hook->lastTopic == "TopicHook", "forbidden: context carries mq.topic");
     expect(hook->lastMode == CommunicationMode::ASYNC, "forbidden: context carries mode");
-    expect(hook->lastUnitMode == false, "forbidden: unitMode is false (no unit mode support)");
+    expect(hook->lastUnitMode == false, "forbidden: context.unitMode is passed through as set");
     expect(hook->lastSendResultIsNull, "forbidden: sendResult is null before send");
     expect(!hook->lastArgIsNull, "forbidden: selector arg is passed through");
     expect(hook->lastBody == "hello", "forbidden: context carries the message");

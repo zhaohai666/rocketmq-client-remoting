@@ -7,6 +7,7 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
+use crate::remoting::protocol::codes::request_type;
 use crate::remoting::protocol::remoting_command::RemotingCommand;
 
 /// 对应 `org.apache.rocketmq.remoting.RPCHook`。
@@ -112,9 +113,39 @@ impl RPCHook for AclClientRPCHook {
     }
 }
 
+/// 对应 `org.apache.rocketmq.client.impl.MQClientAPIImpl` 里注册的
+/// `StreamTypeRPCHook`（匿名类）：给**每个**请求打上 `ReqT=<RequestType 的 code>`。
+///
+/// 由 `ClientConfig#enableStreamRequestType` 开关，拉模式/轻量消费者默认开
+/// （Java `DefaultMQPullConsumer`/`DefaultLitePullConsumer` 构造函数里
+/// `this.enableStreamRequestType = true`），生产者/推送消费者/admin 默认关。
+/// 值取 [`request_type::STREAM`] 的 **code**（`0`），而 clientId 后缀是它的
+/// **枚举名**（`STREAM`）—— 两处不是同一个字符串，别混。
+///
+/// ⚠ 注册顺序：Java 注释写着 "Inject stream rpc hook first to make reserve field
+/// signature"，即必须在 ACL 钩子**之前**注入，`ReqT` 才会进签名内容。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamTypeRPCHook;
+
+impl StreamTypeRPCHook {
+    pub fn new() -> StreamTypeRPCHook {
+        StreamTypeRPCHook
+    }
+}
+
+impl RPCHook for StreamTypeRPCHook {
+    fn do_before_request(&self, _remote_addr: &str, request: &mut RemotingCommand) {
+        request.add_ext_field(
+            crate::common::mix_all::MixAll::REQ_T,
+            &request_type::STREAM.to_string(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::mix_all::MixAll;
 
     fn command() -> RemotingCommand {
         let mut cmd = RemotingCommand::create_request_command(
@@ -174,6 +205,29 @@ mod tests {
         assert_ne!(
             cmd.get_ext_field("Signature"),
             cmd2.get_ext_field("Signature")
+        );
+    }
+
+    #[test]
+    fn stream_type_hook_tags_every_request_with_req_t() {
+        let mut cmd = command();
+        StreamTypeRPCHook::new().do_before_request("127.0.0.1:10911", &mut cmd);
+        // Java 写的是 `String.valueOf(RequestType.STREAM.getCode())`，即枚举的 code 不是名字
+        assert_eq!(cmd.get_ext_field(MixAll::REQ_T), Some("0"));
+    }
+
+    #[test]
+    fn stream_type_field_is_covered_by_the_acl_signature() {
+        // Java 注释「Inject stream rpc hook first to make reserve field signature」：
+        // 只有 ReqT 先写入，ACL 签名内容才包含它；反过来说明两个钩子不能合并成一个。
+        let mut before = command();
+        StreamTypeRPCHook::new().do_before_request("a", &mut before);
+        let mut plain = command();
+        AclClientRPCHook::new(SessionCredentials::new("AK", "SK"))
+            .do_before_request("a", &mut plain);
+        assert_ne!(
+            before.get_ext_field(SessionCredentials::SIGNATURE),
+            plain.get_ext_field(SessionCredentials::SIGNATURE)
         );
     }
 }
