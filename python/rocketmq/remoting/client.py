@@ -70,8 +70,9 @@ def _close_socket(sock: socket.socket) -> None:
 
     1. 内核接收缓冲里还留着对端 TLS 1.3 的 NewSessionTicket 没被 SSL 层读走，
        ``closesocket()`` 于是发 RST 而不是 FIN。这条 RST 会打到下一条复用同一
-       4 元组的新连接上——loopback 上"每轮新建 TLS 连接"实测约 25% 把第一个请求
-       静默吞掉，调用方只能等满 invoke 超时（明文与非 TLS 路径 0%）。
+       4 元组的新连接上——loopback 上"每轮新建 TLS 连接"实测约 25~30% 把第一个请求
+       静默吞掉，调用方只能等满 invoke 超时（明文与非 TLS 路径 0%）。补上 close_notify
+       后这个成因归零，但当时还残留约 3~5%，那一份是读线程起得太早，见 _write。
     2. broker 侧只看到异常断连，正常下线与真掉线分不出来。
 
     只对**已经不再被别的线程 recv/send** 的套接字调用：两个线程同时进 OpenSSL
@@ -199,11 +200,34 @@ class RemotingClient:
             self._sock_locks[addr] = threading.Lock()
             stop = threading.Event()
             self._conn_stops[addr] = stop
-            t = threading.Thread(target=self._read_loop, args=(addr, sock, stop), daemon=True,
-                                 name="rmq-read-%s" % addr)
-            t.start()
-            self._reader_threads[addr] = t
+            # 明文连接立刻起读线程；TLS 连接等第一个请求写出去再起，
+            # 原因见 _write 里的说明。
+            if not isinstance(sock, ssl.SSLSocket):
+                self._spawn_reader(addr, sock, stop)
             return sock
+
+    def _spawn_reader(self, addr: str, sock: socket.socket,
+                      stop: threading.Event) -> None:
+        """起读线程。调用方必须持有 ``self._lock``。"""
+        t = threading.Thread(target=self._read_loop, args=(addr, sock, stop), daemon=True,
+                             name="rmq-read-%s" % addr)
+        t.start()
+        self._reader_threads[addr] = t
+
+    def _start_reader(self, addr: str) -> None:
+        """补起被延后的读线程；已经起了就是空操作。
+
+        关连接和 shutdown 也走这里：套接字一律由该连接的读线程关（见 _close_socket），
+        所以「还没起读线程」的连接在被关闭前必须先把它起起来，否则没人关这条 fd。
+        """
+        with self._lock:
+            if addr in self._reader_threads:
+                return
+            sock = self._conns.get(addr)
+            stop = self._conn_stops.get(addr)
+            if sock is None or stop is None:
+                return
+            self._spawn_reader(addr, sock, stop)
 
     def _create_conn(self, addr: str) -> socket.socket:
         host, port = self._parse_addr(addr)
@@ -263,7 +287,9 @@ class RemotingClient:
         真正关套接字的是该连接的读线程：这里只置停止标志并等它退出。
         在调用方线程上直接关 SSLSocket 不安全——读线程可能正阻塞在同一条 socket 的
         recv 里，两个线程同时进 OpenSSL 会踩坏它的内部状态（实测段错误）。
+        读线程还没起的 TLS 连接（见 _write）先把它补起来，否则这条 fd 没人关。
         """
+        self._start_reader(addr)
         with self._lock:
             self._conns.pop(addr, None)
             stop = self._conn_stops.pop(addr, None)
@@ -468,17 +494,30 @@ class RemotingClient:
                            cmd.code, addr, exc_info=True)
 
     def _write(self, addr: str, cmd: RemotingCommand) -> None:
+        """把命令写到连接上，并保证这条连接的读线程已经起起来。
+
+        TLS 连接的读线程推迟到这里、第一个记录写出去之后才起：实测（macOS loopback，
+        对端是 CPython ``ssl``，每轮新建 TLS 连接）握手刚完成就读线程已经进过 OpenSSL 的
+        情况下，紧跟着的第一个请求记录有约 3~5% 根本没到对端 —— 对端的 TLS 读一直等到
+        超时，调用方只能等满 invoke 超时（明文连接 0%）。改成「先写第一个记录、再起读
+        线程」后同一场景 270 条新建 TLS 连接 0 次复现。对真集群（5.5.1 nameServer 与
+        broker 的 TLS 嗅探端口）各 60 轮两种时序都是 0 丢 —— Java 的 TLS 栈不把这个竞争
+        暴露出来，所以这条只能在本地 TLS 对端上守（``tests/test_tls_trace.py``），
+        真机侧由 ``verify_tls_live.py`` 守整链路。明文连接没有这个问题，仍然立刻起读线程。
+        """
         sock = self._get_or_create_conn(addr)
         data = cmd.encode()
-        with self._sock_locks.get(addr, threading.Lock()):
-            try:
-                sock.sendall(data)
-                return
-            except OSError:
-                self.close_channel(addr)
-                raise RemotingSendRequestException(addr)
-            except AttributeError:
-                raise RemotingSendRequestException(addr)
+        try:
+            with self._sock_locks.get(addr, threading.Lock()):
+                try:
+                    sock.sendall(data)
+                except OSError:
+                    self.close_channel(addr)
+                    raise RemotingSendRequestException(addr)
+                except AttributeError:
+                    raise RemotingSendRequestException(addr)
+        finally:
+            self._start_reader(addr)
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
         """同步 RPC，含 GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）。"""
@@ -648,6 +687,9 @@ class RemotingClient:
         self._closed = True
         # 先停清理线程：它在别的线程上触发回调，必须早于关连接退出
         self._stop_sweeper()
+        # 读线程还没起的 TLS 连接（见 _write）补一个读线程来关它的套接字
+        for addr in list(self._conn_stops):
+            self._start_reader(addr)
         with self._lock:
             stops = list(self._conn_stops.values())
             threads = [t for t in self._reader_threads.values()

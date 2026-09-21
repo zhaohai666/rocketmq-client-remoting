@@ -215,15 +215,23 @@ def test_invoke_sync_over_tls(tls_cert):
 def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
     """反复建/断 TLS 连接：每条新连接的第一个请求都必须送达。
 
-    盯的是关闭路径。上一轮连接若是硬关（没发 close_notify），内核接收缓冲里还留着
-    对端 TLS 1.3 的 NewSessionTicket 没读走，Windows 就会发 RST 而不是 FIN；这条 RST
-    打到复用同一 4 元组的下一条新连接上，新连接的第一个请求被静默吞掉，调用方只能
-    等满超时。改前本机 loopback 实测每轮新建连接约 25~30% 挂一次，改后必须 0 次。
+    盯的是两处本机实测过的坑：
+
+    1. 关闭路径。上一轮连接若是硬关（没发 close_notify），内核接收缓冲里还留着对端
+       TLS 1.3 的 NewSessionTicket 没读走，就会发 RST 而不是 FIN；这条 RST 打到复用同
+       一 4 元组的下一条新连接上，新连接的第一个请求被静默吞掉。
+    2. 读线程起得太早。握手刚完成就让读线程进 OpenSSL，紧跟着写出去的 TLS 1.3 首个
+       记录有约 3~5% 根本到不了对端（对端 TLS 读一直等到超时），调用方只能等满 invoke
+       超时；明文连接没有这个现象。所以 TLS 连接把读线程推迟到第一个记录写出去之后再
+       起（见 RemotingClient._write）。
+
+    改前本机 loopback 每轮新建连接约 25~30% 挂一次，两处都修完必须 0 次。30 轮而不止
+    12 轮：5% 的单轮概率下 12 轮只有约一半的把握能抓到回归。
     """
     server = TlsFrameServer(*tls_cert)
     addr = "127.0.0.1:%d" % server.port
     try:
-        for _ in range(12):
+        for _ in range(30):
             client = RemotingClient(tls_enable=True)
             try:
                 # 10s 而不是 3s：这里断言的是「请求必须送达」，不是延迟。整套用例并发跑时
@@ -232,6 +240,29 @@ def test_tls_reconnect_cycles_every_request_round_trips(tls_cert):
                 assert resp.code == ResponseCode.SUCCESS
             finally:
                 client.shutdown()
+    finally:
+        server.stop()
+
+
+def test_tls_reader_starts_only_after_the_first_record(tls_cert):
+    """TLS 连接的读线程必须在第一个记录写出去之后才起；明文连接照旧立刻起。"""
+    server = TlsFrameServer(*tls_cert)
+    addr = "127.0.0.1:%d" % server.port
+    try:
+        client = RemotingClient(tls_enable=True)
+        try:
+            sock = client._get_or_create_conn(addr)
+            assert isinstance(sock, ssl.SSLSocket)
+            assert client._reader_threads.get(addr) is None, \
+                "TLS 读线程在建连接时就起了，首包会被它和写路径抢 OpenSSL"
+            assert client.invoke_sync(addr, _route_request(), 5000).code == ResponseCode.SUCCESS
+            reader = client._reader_threads.get(addr)
+            assert reader is not None and reader.is_alive()
+            # 第二条请求复用同一条连接：读线程已经在跑，不受影响
+            assert client.invoke_sync(addr, _route_request(), 5000).code == ResponseCode.SUCCESS
+        finally:
+            client.shutdown()
+        assert not [t for t in threading.enumerate() if t.name.startswith("rmq-read-")]
     finally:
         server.stop()
 

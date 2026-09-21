@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 766 条单元/协议测试（762 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 767 条单元/协议测试（763 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -36,6 +36,7 @@ python verify_recall_live.py      # 定时消息撤回 recallMessage(370)（15 P
 python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）：clientId 后缀、broker 侧 topic 的 UNIT/UNIT_SUB 位、每笔请求的 ReqT
 python verify_lite_pull_live.py   # lite pull 全链路（32 PASS/0 FAIL）：rebalance/收 12 条/commit/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）
 python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS/0 FAIL）：SQL92 订阅启动时正好一笔 46、纯 TAG 订阅一笔不发；broker 真按属性过滤（red 只收 3 条、blue 不漏、'*' 对照组收 6 条、永不匹配收 0 条）；语法错的表达式让 start() 秒回 SUBSCRIPTION_PARSE_FAILED(23) 并就地回滚。需 broker 开 enablePropertyFilter=true
+python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
 ```
 
 其它真机脚本：`verify_acl_live.py`（需开 ACL 的集群）/ `verify_pull_live.py` /
@@ -213,6 +214,30 @@ bit0 = 响应类型（RPC_TYPE）      bit1 = oneway（RPC_ONEWAY）
 ```
 
 `create_response_command` 会置位 bit0；`mark_oneway_rpc` 置位 bit1。
+
+## TLS 连接（`tls_enable=True`）
+
+5.5.1 的 nameServer/broker 在 `tls.test.mode.enable`（默认 true）下按首字节嗅探协议，
+同一个端口明文与 TLS 都收，所以整条链路可以直接对真集群验：`verify_tls_live.py`（8 PASS /
+0 FAIL：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发 8 条、确认没有连接
+悄悄退回明文、shutdown 后不留读线程）。
+
+两条在 macOS loopback 上实测出来的约束，都写在 `rocketmq/remoting/client.py` 的对应
+docstring 里，改动前先读它们：
+
+- **读线程要等第一个记录写出去再起。** 握手刚完成就让读线程进 OpenSSL（`pending()` /
+  `recv()`）时，紧接着的第一个请求记录有约 3~5% 根本到不了对端：`sendall()` 返回成功，
+  对端的 TLS 读一直等到超时，调用方只能等满 invoke 超时。这条只在对端是 CPython `ssl`
+  时稳定复现（对真集群的 nameServer/broker 各 60 轮两种时序都是 0 丢），所以回归守卫放在
+  `tests/test_tls_trace.py` 的本地 TLS mock server 上。明文连接 0%，只有 TLS 连接走
+  `_write` 里的延迟起线程。
+- **关闭必须走 `close_notify`。** 直接 `closesocket()` 时，内核接收缓冲里还留着对端
+  TLS 1.3 的 NewSessionTicket 没被 SSL 层读走，于是发 RST 而不是 FIN；这条 RST 会打到
+  复用同一 4 元组的下一条新连接上，实测约 25~30% 静默吞掉它的首包。
+
+因此 TLS 连接的套接字一律由该连接的读线程关闭（`close_channel` / `shutdown` 会先把还没
+起读线程的连接补上，避免 fd 泄漏）。两个线程同时进一个 OpenSSL 对象会踩坏其内部状态
+（实测段错误），不要用"加锁"替代上面两条。
 
 ## 消息压缩
 
