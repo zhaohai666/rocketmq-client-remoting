@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1550,6 +1551,73 @@ void MQClientInstance::unregisterClientAllBrokers(const std::string& clientId,
             unregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
         } catch (const std::exception& e) {
             logger_debug("unregisterClient failed, addr=" + addr + ": " + e.what());
+        }
+    }
+}
+
+// ---------------------------------------------------------------- CHECK_CLIENT_CONFIG(46)
+std::string MQClientInstance::findBrokerAddrByTopic(const std::string& topic) {
+    // Java MQClientInstance#findBrokerAddrByTopic:1390 —— 只读缓存（不像 getTopicRouteData
+    // 那样补拉路由），随机挑一个 BrokerData 再取它的 master 优先地址。
+    std::shared_ptr<TopicRouteData> route;
+    {
+        std::lock_guard<std::recursive_mutex> lk(routeLock_);
+        auto it = topicRouteTable_.find(topic);
+        if (it == topicRouteTable_.end()) return std::string();
+        route = std::make_shared<TopicRouteData>(it->second);
+    }
+    const std::vector<BrokerData>& brokers = route->getBrokerDatas();
+    if (brokers.empty()) return std::string();
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::uniform_int_distribution<size_t> dist(0, brokers.size() - 1);
+    return brokers[dist(rng)].selectBrokerAddr();
+}
+
+void MQClientInstance::checkClientConfig(const std::string& brokerAddr,
+                                         const std::string& consumerGroup,
+                                         const std::string& clientId,
+                                         const SubscriptionData& subscriptionData,
+                                         int32_t timeoutMillis) {
+    // Java MQClientAPIImpl#checkClientInBroker:3256：请求头 null、body 是
+    // CheckClientRequestBody 的 JSON；非 SUCCESS 用响应码抛 MQClientException
+    // （而不是 checkResponseCode 的 MQBrokerException），调用方才能区分 SUBSCRIPTION_PARSE_FAILED。
+    RemotingCommand request =
+        RemotingCommand::createRequestCommand(RequestCode::CHECK_CLIENT_CONFIG, nullptr);
+    CheckClientRequestBody body;
+    body.clientId = clientId;
+    body.group = consumerGroup;
+    body.subscriptionData = subscriptionData;
+    request.body = body.encode();
+    request.hasBody = true;
+    RemotingCommand response = invokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(response.remark, response.code);
+    }
+}
+
+void MQClientInstance::checkSubscriptionsInBroker(const std::string& group,
+                                                  const std::vector<SubscriptionData>& subs) {
+    for (const SubscriptionData& sub : subs) {
+        // Java ExpressionType.isTagType：null / "" / "TAG" 都算 TAG，一律跳过。
+        if (sub.expressionType.empty() || sub.expressionType == ExpressionType::TAG) continue;
+        const std::string addr = findBrokerAddrByTopic(sub.topic);
+        if (addr.empty()) continue;  // 查不到路由 → 跳过，不报错
+        try {
+            checkClientConfig(addr, group, clientId_, sub, kMqClientApiTimeoutMillis);
+        } catch (const MQClientException&) {
+            throw;  // 已带 broker 响应码，原样上抛
+        } catch (const std::exception& e) {
+            // 连不上/超时也当启动失败：Java 抛的是同一段文案的 MQClientException（cause 里
+            // 挂原异常，本端口的 MQClientException 没有 cause 字段，所以只记进日志），
+            // 由调用方（consumer.start）收拾。老 broker 不认 46 码时就落在这里。
+            logger_warn("checkClientConfig failed, addr=" + addr + ": " + e.what());
+            throw MQClientException(
+                std::string("Check client in broker error, maybe because you use ")
+                + sub.expressionType
+                + " to filter message, but server has not been upgraded to support!This error "
+                  "would not affect the launch of consumer, but may has impact on message "
+                  "receiving if you have use the new features which are not supported by server, "
+                  "please check the log!");
         }
     }
 }

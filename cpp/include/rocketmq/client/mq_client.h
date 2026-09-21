@@ -300,6 +300,35 @@ public:
                                     const std::string& consumerGroup,
                                     int32_t timeoutMillis = 5000);
 
+    // ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+    // Java `ClientConfig#mqClientApiTimeout` 的默认值（`ClientConfig.java:81` = 3 * 1000）：
+    // 管理类短 RPC 走的就是它，与发送/拉取的超时预算无关。
+    static constexpr int32_t kMqClientApiTimeoutMillis = 3000;
+
+    // 对应 Java MQClientInstance#findBrokerAddrByTopic:1390：**只读缓存**路由，随机挑其中
+    // 一个 broker（优先 master 地址）；没有缓存返回空串，由调用方决定跳过（不抛）。
+    // 与 getTopicRouteData 的分工照抄 Java：后者缓存空了会补拉一次路由。
+    std::string findBrokerAddrByTopic(const std::string& topic);
+
+    // 一笔 CHECK_CLIENT_CONFIG(46)（Java MQClientAPIImpl#checkClientInBroker:3256）：
+    // 请求头是 null、body 是 CheckClientRequestBody 的 JSON；broker 非 SUCCESS 时用
+    // **响应码**抛 MQClientException（SUBSCRIPTION_PARSE_FAILED=23、
+    // 未开 enablePropertyFilter 的 SYSTEM_ERROR=1 都走这里）。
+    // Java 的 brokerVIPChannel(vipChannelEnabled=false) 是恒等变换，本端口不实现。
+    void checkClientConfig(const std::string& brokerAddr, const std::string& consumerGroup,
+                           const std::string& clientId, const SubscriptionData& subscriptionData,
+                           int32_t timeoutMillis = kMqClientApiTimeoutMillis);
+
+    // 对应 Java MQClientInstance#checkClientInBroker:534 的内层循环：只把**非 TAG**
+    // （SQL92 / CLASS_FILTER）的表达式发给 broker 校验，查不到路由的订阅跳过。
+    // 为什么必须发：SQL92 表达式写错时 broker 的 ExpressionMessageFilter 拿不到编译好的
+    // 过滤数据会**直接放行全部消息**（返回 true），静默变成「订阅全部消息」、启动也不报错；
+    // 这一调用把「写错的表达式」变成启动期一次显式失败。
+    // 单独暴露是因为本端口的 MQClientInstance 没有 Java 的 consumerTable（消费者各自持有
+    // 实例），由消费者在 start() 里带着自己那份订阅调它 —— 语义与 Java 逐分支一致。
+    void checkSubscriptionsInBroker(const std::string& group,
+                                    const std::vector<SubscriptionData>& subs);
+
     // ---------------- 通用同步调用（管理端复用）----------------
     // 下发任意 requestCode + extFields + body。languageOverride >= 0 时覆盖请求的
     // language 字段：个别 RPC 会按它改变行为（INVOKE_BROKER_TO_RESET_OFFSET 对

@@ -207,7 +207,7 @@ impl Eq for BrokerData {}
 ///
 /// 不引入 `rand` 依赖：纳秒时钟 + 进程级计数器做 xorshift64，只需保证「不是每次取同一
 /// 个」，负载均衡不要求密码学质量。
-fn pseudo_random_index(bound: usize) -> usize {
+pub(crate) fn pseudo_random_index(bound: usize) -> usize {
     if bound <= 1 {
         return 0;
     }

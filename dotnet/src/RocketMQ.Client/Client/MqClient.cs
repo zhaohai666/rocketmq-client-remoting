@@ -1687,6 +1687,118 @@ public sealed class MQClientInstance : IDisposable
         CheckResponseCode(response);
     }
 
+    // ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+
+    /// <summary>
+    /// Java <c>ClientConfig#mqClientApiTimeout</c> 的默认值（<c>ClientConfig.java:81</c> =
+    /// 3 * 1000）：管理类短 RPC 走的就是它，与发送/拉取的超时预算无关。
+    /// </summary>
+    public const int MqClientApiTimeoutMillis = 3000;
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#findBrokerAddrByTopic:1390</c>：<b>只读缓存</b>路由，
+    /// 随机挑其中一个 broker（优先 master 地址）；没有缓存返回 null，由调用方决定跳过（不抛）。
+    /// 与 <see cref="GetTopicRouteData"/> 的分工照抄 Java：后者缓存空了会补拉一次路由。
+    /// </summary>
+    public string? FindBrokerAddrByTopic(string topic)
+    {
+        TopicRouteData? route;
+        lock (_routeLock)
+        {
+            _topicRouteTable.TryGetValue(topic, out route);
+        }
+
+        if (route == null)
+        {
+            return null;
+        }
+
+        List<BrokerData> brokers = route.BrokerDatas;
+        if (brokers.Count == 0)
+        {
+            return null;
+        }
+
+        return brokers[ThreadLocalRandom.Next(brokers.Count)].SelectBrokerAddr();
+    }
+
+    /// <summary>
+    /// 一笔 CHECK_CLIENT_CONFIG(46)（Java <c>MQClientAPIImpl#checkClientInBroker:3256</c>）。
+    ///
+    /// 请求头是 null、body 是 <see cref="CheckClientRequestBody"/> 的 JSON；broker 非 SUCCESS
+    /// 时用<b>响应码</b>抛 MQClientException（SUBSCRIPTION_PARSE_FAILED=23、未开
+    /// enablePropertyFilter 的 SYSTEM_ERROR=1 都走这里），调用方才分得出是哪种拒绝。
+    /// Java 的 brokerVIPChannel(vipChannelEnabled=false) 是恒等变换，本端口不实现。
+    /// </summary>
+    public void CheckClientConfig(string brokerAddr, string consumerGroup, string clientId,
+        SubscriptionData subscriptionData, int timeoutMillis = MqClientApiTimeoutMillis)
+    {
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.CheckClientConfig, null);
+        var body = new CheckClientRequestBody
+        {
+            ClientId = clientId,
+            Group = consumerGroup,
+            SubscriptionData = subscriptionData,
+        };
+        request.Body = body.Encode();
+        request.HasBody = true;
+        RemotingCommand response = InvokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(response.Remark, response.Code);
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#checkClientInBroker:534</c> 的内层循环：只把<b>非 TAG</b>
+    /// （SQL92 / CLASS_FILTER）的订阅表达式发给 broker 校验，查不到路由的订阅跳过。
+    ///
+    /// 为什么必须发：SQL92 表达式写错时 broker 的 ExpressionMessageFilter 在 ConsumeQueue
+    /// 阶段拿不到编译好的过滤数据会<b>直接放行全部消息</b>（返回 true），静默变成「订阅全部
+    /// 消息」、启动也不报错；这一调用把「写错的表达式」变成启动期一次显式失败。
+    ///
+    /// 本端口的 MQClientInstance 没有 Java 的 consumerTable（消费者各自持有实例），所以由消费者
+    /// 在 Start() 里带着自己那份订阅调用 —— 分支语义与 Java 逐条一致。
+    /// </summary>
+    public void CheckSubscriptionsInBroker(string group, IEnumerable<SubscriptionData> subs)
+    {
+        foreach (SubscriptionData? sub in subs)
+        {
+            // Java ExpressionType.isTagType：null / "" / "TAG" 都算 TAG，一律跳过。
+            if (sub == null || string.IsNullOrEmpty(sub.ExpressionType)
+                || sub.ExpressionType == RocketMQ.Common.ExpressionType.TAG)
+            {
+                continue;
+            }
+
+            string? addr = FindBrokerAddrByTopic(sub.Topic);
+            if (string.IsNullOrEmpty(addr))
+            {
+                continue;
+            }
+
+            try
+            {
+                CheckClientConfig(addr, group, ClientId, sub);
+            }
+            catch (MQClientException)
+            {
+                throw;  // 已带 broker 响应码，原样上抛
+            }
+            catch (Exception e)
+            {
+                // 连不上/超时也当启动失败：Java 抛的是同一段文案的 MQClientException（cause
+                // 挂原异常），由调用方（consumer.Start）收拾。老 broker 不认 46 码时就落在这里。
+                throw new MQClientException(
+                    "Check client in broker error, maybe because you use " + sub.ExpressionType
+                    + " to filter message, but server has not been upgraded to support!This error"
+                    + " would not affect the launch of consumer, but may has impact on message "
+                    + "receiving if you have use the new features which are not supported by "
+                    + "server, please check the log!", e);
+            }
+        }
+    }
+
     // ---------------- 通用同步调用（管理端复用）----------------
 
     /// <summary>

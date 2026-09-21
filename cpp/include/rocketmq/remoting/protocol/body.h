@@ -1,5 +1,6 @@
 // 公共 body（对应 org.apache.rocketmq.remoting.protocol.body.* 常用部分）：
-//   KVTable / TopicList / ClusterInfo / Connection / ConsumerConnection /
+//   KVTable / TopicList / GetConsumerListByGroupResponseBody / CheckClientRequestBody /
+//   ClusterInfo / Connection / ConsumerConnection /
 //   ProducerConnection / ConsumerRunningInfo / ConsumeStatsList / ResetOffsetBody
 //
 // 复合且管理端不需要解释内容的字段（subscriptionTable / mqTable / statsList 等）
@@ -14,6 +15,7 @@
 
 #include "rocketmq/common/byte_buffer.h"
 #include "rocketmq/common/message.h"
+#include "rocketmq/common/subscription_data.h"
 #include "rocketmq/common/types.h"
 #include "rocketmq/remoting/protocol/admin_body.h"
 #include "rocketmq/remoting/protocol/json.h"
@@ -56,6 +58,26 @@ struct GetConsumerListByGroupResponseBody {
 
     Bytes encode() const;
     static bool decode(const Bytes& data, GetConsumerListByGroupResponseBody& out);
+};
+
+// 对应 org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody
+//
+// 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 拿 clientId/group 记日志，真正被校验的只有
+// subscriptionData 的 expressionType 与 subString（Java
+// ClientManageProcessor#checkClientConfig）。namespace 字段 Java 5.5.1 里存在但发送端
+// 不填，这里同样保留字段而不写值（未置位时不参与 JSON，对齐 fastjson 不序列化 null）。
+struct CheckClientRequestBody {
+    std::string clientId;
+    std::string group;
+    SubscriptionData subscriptionData;
+    std::string clientNamespace;  // Java 字段名 namespace（C++ 里 namespace 是关键字）
+    bool hasNamespace = false;
+
+    JsonValue toJson() const;
+    static CheckClientRequestBody fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, CheckClientRequestBody& out);
 };
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.ClusterInfo

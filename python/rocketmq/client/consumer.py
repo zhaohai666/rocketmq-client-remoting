@@ -1065,6 +1065,13 @@ class DefaultMQPushConsumer:
     def get_consumer_group(self) -> str:
         return self.consumer_group
 
+    def subscriptions(self) -> List[SubscriptionData]:
+        """对应 Java ``MQConsumerInner#subscriptions()``：本消费者当前的订阅集合。
+
+        给 ``MQClientInstance#checkClientInBroker`` 用（它按实例遍历，不看具体消费者类型）。
+        """
+        return list(self.subscription_data.values())
+
     # ---------------- 订阅 ----------------
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
         self._assert_not_started()
@@ -1187,6 +1194,15 @@ class DefaultMQPushConsumer:
         # 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
         # 心跳必须在 rebalance 之前：rebalance 要向 broker 查消费者列表。
         self._refresh_routes()
+        # 对应 Java DefaultMQPushConsumerImpl.start:1013-1020：路由到手之后、心跳之前，把
+        # 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
+        # 拿不到编译数据会**静默放行全部消息**，只有这一步能让它变成启动期错误；
+        # Java 在这一步失败时 shutdown() 并把异常抛给调用方。
+        try:
+            self._mq_client.check_client_in_broker()
+        except Exception:
+            self.shutdown()
+            raise
         try:
             self._send_heartbeat_to_all_broker()
         except Exception as e:  # noqa: BLE001

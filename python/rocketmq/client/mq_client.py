@@ -8,9 +8,10 @@ offset 查询/更新、心跳、管理类 API（创建/删除 Topic、集群信�
 """
 from __future__ import annotations
 
+import random
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_client_id_setter import get_uniq_id, set_uniq_id
@@ -19,12 +20,14 @@ from ..common.message_decoder import (decode_message, decode_messages, decompres
                                       message_properties_2_string,
                                       string_2_message_properties)
 from ..common.mix_all import MixAll
+from ..common.subscription_data import ExpressionType, SubscriptionData
 from ..common.sysflag import MessageSysFlag
 from ..common.topic_config import TopicFilterType
 from ..logging import get_logger
 from ..remoting.client import RemotingClient
-from ..remoting.protocol.body import (ClusterInfo, ConsumerRunningInfo,
-                                      ConsumeMessageDirectlyResult, GetConsumerStatusBody,
+from ..remoting.protocol.body import (CheckClientRequestBody, ClusterInfo,
+                                      ConsumerRunningInfo, ConsumeMessageDirectlyResult,
+                                      GetConsumerStatusBody,
                                       GetConsumerListByGroupResponseBody, ResetOffsetBody,
                                       TopicList)
 
@@ -228,6 +231,55 @@ class MQClientInstance:
 
     def find_consumer(self, group: str) -> Optional["DefaultMQPushConsumer"]:
         return self._consumer_table.get(group)
+
+    # ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+    def check_client_in_broker(self) -> None:
+        """对应 Java ``MQClientInstance#checkClientInBroker:534``。
+
+        遍历本实例登记的每个消费者的订阅，只把**非 TAG**（SQL92 / CLASS_FILTER）的表达式
+        发给 broker 校验。为什么必须发：SQL92 表达式写错时 broker 的
+        ``ExpressionMessageFilter`` 在 ConsumeQueue 阶段拿不到编译好的过滤数据就**直接放行**
+        （返回 true），也就是静默变成「订阅全部消息」，消费者启动照样成功、一条错误都不报。
+        这一调用把「写错的表达式」变成启动期的一次显式失败。
+
+        与 Java 一致的两个细节：
+        * 某个消费者「无订阅」时是 ``return`` 而不是 ``continue``（Java 源码如此，
+          后面的消费者这一轮就不再查了）；
+        * 查不到路由（``findBrokerAddrByTopic`` 返回 None）时**跳过**该订阅而不是报错。
+        """
+        for group, consumer in list(self._consumer_table.items()):
+            subs = consumer.subscriptions() if consumer is not None else None
+            if not subs:
+                # 对齐 Java 的 `return`：不是 continue。
+                return
+            self.check_subscriptions_in_broker(group, subs)
+
+    def check_subscriptions_in_broker(self, group: str,
+                                      subs: Iterable[SubscriptionData]) -> None:
+        """``check_client_in_broker`` 的内层循环，单独暴露给未登记进 consumerTable 的消费者
+        （拉模式 / lite 消费者的订阅存在自己那份，Java 通过 ``MQConsumerInner#subscriptions``
+        走同一张表，本端口的 consumerTable 只收推模式消费者）。
+        """
+        for sub in subs:
+            # Java ``ExpressionType.isTagType``：null / "" / "TAG" 都算 TAG，一律跳过。
+            if sub is None or not sub.expression_type or sub.expression_type == ExpressionType.TAG:
+                continue
+            addr = self.find_broker_addr_by_topic(sub.topic or "")
+            if addr is None:
+                continue
+            try:
+                self.check_client_config(addr, group, self.client_id, sub)
+            except MQClientException:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 连不上/超时也当启动失败：Java 抛的是同一段文案的 MQClientException，
+                # 由调用方（consumer.start）收拾。老 broker 不认 46 码时就落在这里。
+                raise MQClientException(
+                    "Check client in broker error, maybe because you use %s to filter "
+                    "message, but server has not been upgraded to support!This error would "
+                    "not affect the launch of consumer, but may has impact on message "
+                    "receiving if you have use the new features which are not supported by "
+                    "server, please check the log!" % sub.expression_type, cause=e)
 
     # ---------------- 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
     @property
@@ -557,6 +609,23 @@ class MQClientInstance:
             if broker_data.broker_name == broker_name:
                 return broker_data.select_broker_addr()
         return None
+
+    def find_broker_addr_by_topic(self, topic: str) -> Optional[str]:
+        """对应 Java ``MQClientInstance#findBrokerAddrByTopic:1390``：从路由里随机挑一个
+        broker（优先 master 地址）；查不到返回 ``None``（不抛）。
+
+        与 ``_broker_addr_for_topic``（拿不到就抛，给管理类 API 用）的分工照抄 Java：
+        这里返回 null 由调用方决定跳过。与 Java 的一点不同：Java 只读缓存（它依赖调用前的
+        ``updateTopicSubscribeInfoWhenSubscriptionChanged`` 预热），这里用
+        ``get_topic_route_data``，缓存空了会顺手补拉一次。
+        """
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            return None
+        brokers = route.get_broker_datas()
+        if not brokers:
+            return None
+        return random.choice(brokers).select_broker_addr()
 
     # ---------------- 消息发送 ----------------
     def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
@@ -1297,6 +1366,29 @@ class MQClientInstance:
         request = RemotingCommand.create_request_command(RequestCode.UNREGISTER_CLIENT, header)
         response = self._invoke_sync(addr, request, timeout_millis)
         self._check_response(response)
+
+    def check_client_config(self, broker_addr: str, consumer_group: str, client_id: str,
+                            subscription_data: SubscriptionData,
+                            timeout_millis: int = 3000) -> None:
+        """CHECK_CLIENT_CONFIG(46)：让 broker 校验一份订阅表达式（对应 Java
+        ``MQClientAPIImpl#checkClientInBroker:3256``）。
+
+        请求头是 null、body 是 ``CheckClientRequestBody`` 的 JSON；broker 非 SUCCESS 时
+        Java 用 **响应码** 抛 MQClientException（``SUBSCRIPTION_PARSE_FAILED=23``、
+        ``SYSTEM_ERROR=1``「broker 没开 enablePropertyFilter」都走这里）。
+        Java 的 ``brokerVIPChannel(vipChannelEnabled=false)`` 是恒等变换，这里不实现。
+        """
+        request = RemotingCommand.create_request_command(RequestCode.CHECK_CLIENT_CONFIG, None)
+        body = CheckClientRequestBody()
+        body.client_id = client_id
+        body.group = consumer_group
+        body.subscription_data = subscription_data
+        request.body = body.encode()
+        response = self._invoke_sync(broker_addr, request, timeout_millis)
+        if response is None:
+            raise MQClientException("checkClientConfig got no response from %s" % broker_addr)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(response.remark or "", response.code)
 
     # ---------------- 管理类 API ----------------
     def get_broker_cluster_info(self, timeout_millis: int = 10000) -> ClusterInfo:

@@ -1122,6 +1122,14 @@ impl DefaultMQPushConsumer {
 
         // 拉一次路由 → 同步首轮心跳 → 同步首轮重平衡 → 起循环（顺序照 Python）
         self.refresh_routes().await;
+        // 对应 Java DefaultMQPushConsumerImpl.start:1013-1020：路由到手之后、心跳之前，把
+        // 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
+        // 拿不到编译数据会**静默放行全部消息**，只有这一步能让它变成启动期错误；
+        // Java 在这一步失败时 shutdown() 并把异常抛给调用方。
+        if let Err(e) = client.check_client_in_broker().await {
+            self.shutdown();
+            return Err(e);
+        }
         let ok = client.send_heartbeat_to_all_broker(5000).await;
         if ok > 0 {
             self.inner

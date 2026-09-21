@@ -138,6 +138,40 @@ bool GetConsumerListByGroupResponseBody::decode(const Bytes& data,
     return true;
 }
 
+// ---------------------------------------------------------------- CheckClientRequestBody
+JsonValue CheckClientRequestBody::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("clientId", JsonValue::makeString(clientId));
+    v.set("group", JsonValue::makeString(group));
+    v.set("subscriptionData", subscriptionData.toJson());
+    // Java 的 namespace 为 null 时 fastjson 不写这个键，这里用 hasNamespace 表达同一语义
+    if (hasNamespace) v.set("namespace", JsonValue::makeString(clientNamespace));
+    return v;
+}
+
+CheckClientRequestBody CheckClientRequestBody::fromJson(const JsonValue& v) {
+    CheckClientRequestBody b;
+    std::string s;
+    if (v.tryGetString("clientId", s)) b.clientId = s;
+    if (v.tryGetString("group", s)) b.group = s;
+    if (v.tryGetString("namespace", s)) {
+        b.clientNamespace = s;
+        b.hasNamespace = true;
+    }
+    const JsonValue* sd = v.find("subscriptionData");
+    if (sd != nullptr && sd->isObject()) b.subscriptionData = SubscriptionData::fromJson(*sd);
+    return b;
+}
+
+Bytes CheckClientRequestBody::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool CheckClientRequestBody::decode(const Bytes& data, CheckClientRequestBody& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v)) return false;
+    out = fromJson(v);
+    return true;
+}
+
 // ---------------------------------------------------------------- ClusterInfo
 std::vector<std::string> ClusterInfo::getBrokerAddrs() const {
     // brokerAddrTable 是 std::map（已按 brokerName 排序），内层 brokerAddrs 也按 brokerId 排序

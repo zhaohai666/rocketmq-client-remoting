@@ -941,6 +941,19 @@ public sealed class DefaultMQPushConsumer
             ClientLog.Debug("initial refresh routes failed: " + e.Message);
         }
 
+        // 对齐 Java DefaultMQPushConsumerImpl.start:1013-1020：路由到手之后、心跳之前，把
+        // 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
+        // 会**静默放行全部消息**，只有这一笔请求能把它变成启动错误；失败就地回滚后再上抛。
+        try
+        {
+            _mqClient.CheckSubscriptionsInBroker(ConsumerGroup, _subscriptionData.Values);
+        }
+        catch (Exception)
+        {
+            Shutdown();
+            throw;
+        }
+
         try
         {
             SendHeartbeatToAllBroker();

@@ -479,6 +479,18 @@ void DefaultMQPushConsumer::start() {
             logger_debug("refresh route for " + t + " failed: " + e.what());
         }
     }
+    // 对齐 Java DefaultMQPushConsumerImpl.start:1013-1020：路由到手之后、心跳之前，把
+    // 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
+    // 会**静默放行全部消息**，只有这一笔请求能把它变成启动错误；失败就地回滚后再上抛。
+    try {
+        std::vector<SubscriptionData> subs;
+        subs.reserve(subscriptionData_.size());
+        for (const auto& kv : subscriptionData_) subs.push_back(kv.second);
+        mqClient_->checkSubscriptionsInBroker(consumerGroup_, subs);
+    } catch (const std::exception&) {
+        shutdown();
+        throw;
+    }
     try {
         sendHeartbeatToAllBroker();
     } catch (const std::exception& e) {

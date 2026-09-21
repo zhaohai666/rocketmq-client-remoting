@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from ...common.subscription_data import SubscriptionData
 from ..protocol.serialize import RemotingSerializable, fastjson_loads
 # MessageQueue 作为 map 键的解析/序列化（fastjson2 非字符串键）+ 共用 DTO
 from .admin_body import decode_message_queue_map, message_queue_key  # noqa: F401
@@ -157,6 +158,54 @@ class GetConsumerListByGroupResponseBody:
     @staticmethod
     def decode(data: bytes) -> "GetConsumerListByGroupResponseBody":
         return GetConsumerListByGroupResponseBody.from_dict(RemotingSerializable.decode_json(data))
+
+
+class CheckClientRequestBody:
+    """对应 org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody。
+
+    只被 ``CHECK_CLIENT_CONFIG(46)`` 用到：broker 拿 clientId/group 记日志，真正被校验的
+    只有 ``subscriptionData`` 的 expressionType 与 subString（Java
+    ``ClientManageProcessor.checkClientConfig``）。namespace 字段 Java 5.5.1 里存在但
+    发送端不填，这里同样保留字段而不写值（fastjson 不序列化 None）。
+    """
+
+    def __init__(self):
+        self.client_id: Optional[str] = None
+        self.group: Optional[str] = None
+        self.subscription_data: Optional[SubscriptionData] = None
+        self.namespace: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        d = {"clientId": self.client_id, "group": self.group}
+        if self.subscription_data is not None:
+            d["subscriptionData"] = self.subscription_data.to_dict()
+        if self.namespace is not None:
+            d["namespace"] = self.namespace
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "CheckClientRequestBody":
+        b = CheckClientRequestBody()
+        b.client_id = d.get("clientId")
+        b.group = d.get("group")
+        b.namespace = d.get("namespace")
+        sd = d.get("subscriptionData")
+        if sd:
+            sub = SubscriptionData(sd.get("topic"), sd.get("subString"))
+            sub.class_filter_mode = bool(sd.get("classFilterMode", False))
+            sub.tags_set = set(sd.get("tagsSet") or [])
+            sub.code_set = set(sd.get("codeSet") or [])
+            sub.sub_version = int(sd.get("subVersion", 0))
+            sub.expression_type = sd.get("expressionType", "TAG")
+            b.subscription_data = sub
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "CheckClientRequestBody":
+        return CheckClientRequestBody.from_dict(RemotingSerializable.decode_json(data))
 
 
 class ClusterInfo:

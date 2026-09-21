@@ -1,5 +1,6 @@
 // 公共 body（对应 org.apache.rocketmq.remoting.protocol.body.* 常用部分）：
-//   KVTable / TopicList / ClusterInfo / Connection / ConsumerConnection /
+//   KVTable / TopicList / GetConsumerListByGroupResponseBody / CheckClientRequestBody /
+//   ClusterInfo / Connection / ConsumerConnection /
 //   ProducerConnection / ConsumerRunningInfo / ConsumeStatsList / ResetOffsetBody
 //
 // 复合且管理端不需要解释内容的字段（subscriptionTable / mqTable / statsList 等）
@@ -146,6 +147,77 @@ public sealed class GetConsumerListByGroupResponseBody
     public static bool Decode(byte[] data, out GetConsumerListByGroupResponseBody @out)
     {
         @out = new GetConsumerListByGroupResponseBody();
+        if (!RemotingSerializable.Decode(data, out JsonValue v))
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody。
+///
+/// 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 拿 clientId/group 记日志，真正被校验的只有
+/// subscriptionData 的 expressionType 与 subString（Java
+/// ClientManageProcessor#checkClientConfig）。namespace 字段 Java 5.5.1 里存在但发送端
+/// 不填，这里同样保留字段而不写值（未设置时不参与序列化，对齐 fastjson 不序列化 null）。
+/// </summary>
+public sealed class CheckClientRequestBody
+{
+    public string ClientId { get; set; } = string.Empty;
+    public string Group { get; set; } = string.Empty;
+    public SubscriptionData? SubscriptionData { get; set; }
+    // Java 的字段名就叫 namespace；C# 里是关键字，属性名用 Namespace、JSON 键仍是 "namespace"
+    public string? Namespace { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("clientId", JsonValue.MakeString(ClientId));
+        v.Set("group", JsonValue.MakeString(Group));
+        if (SubscriptionData != null)
+        {
+            v.Set("subscriptionData", SubscriptionData.ToJson());
+        }
+
+        if (Namespace != null)
+        {
+            v.Set("namespace", JsonValue.MakeString(Namespace));
+        }
+
+        return v;
+    }
+
+    public static CheckClientRequestBody FromJson(JsonValue v)
+    {
+        var b = new CheckClientRequestBody
+        {
+            ClientId = v.Get("clientId").StringValue(string.Empty),
+            Group = v.Get("group").StringValue(string.Empty),
+        };
+        JsonValue? ns = v.Find("namespace");
+        if (ns is { IsString: true })
+        {
+            b.Namespace = ns.StringValue();
+        }
+
+        JsonValue? sd = v.Find("subscriptionData");
+        if (sd is { IsObject: true })
+        {
+            b.SubscriptionData = RocketMQ.Common.SubscriptionData.FromJson(sd);
+        }
+
+        return b;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out CheckClientRequestBody @out)
+    {
+        @out = new CheckClientRequestBody();
         if (!RemotingSerializable.Decode(data, out JsonValue v))
         {
             return false;

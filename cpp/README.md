@@ -53,7 +53,7 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 27 个用例，2606 项断言，~17s
+cd build && ctest --output-on-failure     # 28 个用例，2638 项断言，~17s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -117,6 +117,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_validators_live    127.0.0.1:9876
 ./build/examples/rmq_recall_live        127.0.0.1:9876   # 需 broker 开 recallMessageEnable（工具自己打开并还原）
 ./build/examples/rmq_live_unit_config   127.0.0.1:9876   # unitName/unitMode/stream
+./build/examples/rmq_sql92_live         127.0.0.1:9876   # 需 broker 开 enablePropertyFilter=true
 ```
 
 | 工具 | 结果 | 覆盖 |
@@ -131,6 +132,8 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 
 | `rmq_recall_live` | 14 PASS / 0 FAIL | 定时消息撤回 `recallMessage`(370) 真机（与 Python/Rust/.NET 同场景）：R0 读得到 broker 的 `recallMessageEnable` 并临时打开 → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle`，普通消息没有 → R2 broker 给的句柄能被本端口解码器解开，`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4 `%RETRY%` topic 本地用 Java 文案拒掉、R5 非法句柄 <200ms 秒回（没打网络）→ R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：同样延迟的对照消息按时投递、被撤回的那条整个窗口都不出现 → R7 无条件把 `recallMessageEnable` 还原成跑之前的值 |
 | `rmq_live_unit_config` | 20 PASS / 0 FAIL | `unitName`/`unitMode`/`stream` 真机（与 Python/Rust/.NET 同场景）：U1 `unitName` 拼进 clientId 且照常发送 → U2 `@unitA@STREAM` 的消费者收到消息，**broker 的 `examineConsumerConnectionInfo` 回读到同一串 clientId** → U3 `unitMode=true` 自动建出的 topic 带 `UNIT` 位、对照组不带 → U4 心跳的 `ConsumerData.unitMode` 让 `%RETRY%` 带 `UNIT_SUB` 位 → U5 lite 消费者与显式开 stream 的生产者都带 `@STREAM`，3 发 3 收。钩子顺序（`ReqT` 必须在 ACL 签名之内）与"钩子真的写到 socket 上"由离线用例 `testRequestHooksReachWire`（`tests/test_send_retry.cpp`，抓真报文 + broker 侧复算 HMAC）和 `tests/test_acl.cpp` 锁死 |
+
+| `rmq_sql92_live` | 20 PASS / 0 FAIL | SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 真机（与 Python/Rust/.NET 同场景）：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线用例 `tests/test_check_client_config.cpp`（ctest `check_client_config`，9 项 / 32 断言，进程内 mock broker 抓真报文） |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -164,8 +167,8 @@ cpp/
 │       │                            钩子接口（Send/Consume/EndTransaction/CheckForbidden/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 42 个 .cpp
-├── examples/                   selfcheck / interop_tool + 16 个真机联调工具
-└── tests/                      27 个 ctest 用例（含 Java 对拍）+ interop_check.py
+├── examples/                   selfcheck / interop_tool + 18 个真机联调工具
+└── tests/                      28 个 ctest 用例（含 Java 对拍）+ interop_check.py
 ```
 
 ## 几个必须知道的实现约定

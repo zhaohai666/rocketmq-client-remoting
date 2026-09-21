@@ -49,7 +49,7 @@ Windows / MSVC 分支。
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 660 条，~1s
+cargo test --lib               # 669 条，~1s
 ```
 
 ## 单元测试
@@ -91,12 +91,13 @@ cargo run --example live_client_modules     -- 127.0.0.1:9876
 cargo run --example live_validators         -- 127.0.0.1:9876
 cargo run --example live_admin              -- 127.0.0.1:9876
 cargo run --example live_unit_config        -- 127.0.0.1:9876
+cargo run --example live_sql92              -- 127.0.0.1:9876   # 需 broker enablePropertyFilter=true
 cargo run --example live_acl                -- 127.0.0.1:9876 <AK> <SK>   # 需开 ACL 的集群
 cargo run --example live_compression_matrix -- send|recv ...             # 由 ../scripts/compression_matrix.sh 调度
 ```
 
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
-下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 12 个工具合计 695 项断言；
+下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（上表前 13 个工具合计 710 项断言；
 `live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本调度，都不计进去）：
 
 | 工具 | 结果 | 覆盖 |
@@ -113,6 +114,7 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_validators` | 31 PASS | V1~V7（与 Python/C++/.NET 同场景对拍）：非法名字**亚毫秒本地失败且不碰网络**、`maxMessageSize` 等长放行、批量逐条 + 同质性、四类 facade 的 `start()` 组名门、正反两条腿的往返耗时对照 |
 | `live_admin` | 85 PASS / 1 SKIP | A1~A13：admin **私有实例**隔离（shutdown 后同 clientId 的 producer 照常收发）、集群与运行时信息、topic 建/查/配置、broker 配置（properties 文本）读改写回、NameServer KV、订阅组分页、`viewMessage`、`sendMessageBack` 重投、`resetOffsetByTimestamp`、消费统计与 ConsumeQueue、清理。SKIP：uniqKey 查询要 broker 开 RocksDB 索引，本机默认文件索引查不到属**配置差异，不是客户端 bug** |
 | `live_unit_config` | 15 PASS | U1~U5（与 Python/C++/.NET 同场景）：`unit_name` 拼进 clientId（`<ip>@<instance>@<unitName>`）且照常发送、`@STREAM` 后缀的消费者在 **broker 的 `GET_CONSUMER_LIST_BY_GROUP` 里也是同一串**（唯一能证明「上线的就是拼好的 clientId」的观测点）、`unit_mode=true` 的发送让自动建出的 topic 带 `UNIT` 位而对照组不带、心跳里的 `ConsumerData.unit_mode` 让 `%RETRY%group` 带 `UNIT_SUB` 位、stream 生产者与 lite 消费者（默认开）每个请求带 `ReqT=0` 时收发照常 |
+| `live_sql92` | 15 PASS | S1~S4（与 Python/C++/.NET 同场景）：SQL92 订阅启动时正好一笔 `CHECK_CLIENT_CONFIG`(46)、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发 → 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，不是放行全部），`'*'` 对照组收全 6 条，永不匹配的 `color='green'` 收 0 条 → 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线单测 9 项（`client::mq_client`：真 socket mock broker，含 Java 那个「订阅集合里有空 subscriptions 就整轮 `return` 而非 `continue`」的短路怪癖） |
 | `live_acl` | 需开鉴权的集群 | S1~S8：签名被 broker 接受（建 topic / 发送 / 心跳+长轮询+位点三条 RPC 全程带签名）、不带凭据与 secretKey 写错都回 `NO_PERMISSION(16)`、拉模式签名链路。前置是 broker.conf 开 `authenticationEnabled=true` + `LocalAuthenticationMetadataProvider` + `initAuthenticationUser`（本机默认集群关着，跑不了这一项） |
 | `live_compression_matrix` | 矩阵一端 | 与 Java/Python/C++/.NET 探针双向收发压缩消息，由 `../scripts/compression_matrix.sh` 调度 |
 
@@ -234,8 +236,10 @@ rust/
   离线取证 `send_retry_tests::send_request_code_follows_java_three_way_branch`
   （310+`m=false` / 320+`m=true` / reply 批量仍是 325），真机取证 `live_mq_client` M3
   （批量发出后 broker 按 3 条独立消息投回、逻辑位点连续）。
-- **SQL92 过滤 / `%DLQ%` 死信 / Rust TLS / 动态地址服务器真机**这几条
+- **`%DLQ%` 死信 / Rust TLS / 动态地址服务器真机**这几条
   链路还没跑过带它们的环境（待办 #37）；ACL 需要开鉴权的 broker 才能跑。
+  SQL92 过滤不在此列：`CHECK_CLIENT_CONFIG`(46) 已接进 push consumer 的 `start()`，
+  离线 9 项 + 真机 `live_sql92` 15 项都在本机 5.5.1 集群（`enablePropertyFilter=true`）跑过。
 
 ## License
 

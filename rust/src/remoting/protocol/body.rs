@@ -36,6 +36,7 @@ use super::admin_body::{
     jstring, MessageQueueKey,
 };
 use super::ext_fields::StringMap;
+use super::heartbeat::SubscriptionData;
 use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
 
@@ -376,6 +377,59 @@ impl GetConsumerListByGroupResponseBody {
 
     pub fn decode(data: &[u8]) -> Result<GetConsumerListByGroupResponseBody> {
         GetConsumerListByGroupResponseBody::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+// ---------------------------------------------------------------- CHECK_CLIENT_CONFIG
+
+/// 对应 `org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody`（46）。
+///
+/// 只被 `CHECK_CLIENT_CONFIG(46)` 用到：broker 拿 clientId/group 记日志，真正被校验的只有
+/// `subscriptionData` 的 expressionType 与 subString（Java
+/// `ClientManageProcessor#checkClientConfig`）。`namespace` 字段 Java 5.5.1 里有但发送端
+/// 不填，这里同样保留字段而不写值。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckClientRequestBody {
+    pub client_id: Option<String>,
+    pub group: Option<String>,
+    pub subscription_data: Option<SubscriptionData>,
+    pub namespace: Option<String>,
+}
+
+impl CheckClientRequestBody {
+    pub fn to_json_value(&self) -> Value {
+        let mut entries: Vec<(&'static str, Value)> = vec![
+            ("clientId", optional_string(&self.client_id)),
+            ("group", optional_string(&self.group)),
+        ];
+        if let Some(sd) = &self.subscription_data {
+            entries.push(("subscriptionData", sd.to_json_value()));
+        }
+        if let Some(ns) = &self.namespace {
+            entries.push(("namespace", Value::String(ns.clone())));
+        }
+        json_object(entries)
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<CheckClientRequestBody> {
+        expect_object(value, "CheckClientRequestBody")?;
+        Ok(CheckClientRequestBody {
+            client_id: jstring(value, "clientId"),
+            group: jstring(value, "group"),
+            subscription_data: match value.get("subscriptionData") {
+                Some(v) if v.is_object() => Some(SubscriptionData::from_json_value(v)?),
+                _ => None,
+            },
+            namespace: jstring(value, "namespace"),
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RemotingSerializable::encode(&self.to_json_value())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<CheckClientRequestBody> {
+        CheckClientRequestBody::from_json_value(&RemotingSerializable::decode(data)?)
     }
 }
 

@@ -73,3 +73,7 @@ target_link_libraries(rmq_recall_live PRIVATE rocketmq::remoting)
 # unitName / unitMode / enableStreamRequestType 真机联调：clientId 后缀 + broker 侧单元位（不打进 ctest）
 add_executable(rmq_live_unit_config live_unit_config.cpp)
 target_link_libraries(rmq_live_unit_config PRIVATE rocketmq::remoting)
+
+# SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调（需 broker enablePropertyFilter=true；不打进 ctest）
+add_executable(rmq_sql92_live sql92_live.cpp)
+target_link_libraries(rmq_sql92_live PRIVATE rocketmq::remoting)

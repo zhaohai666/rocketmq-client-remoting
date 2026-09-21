@@ -138,3 +138,9 @@ add_test(NAME broker_requests COMMAND rmq_test_broker_requests)
 add_executable(rmq_test_recall_message test_recall_message.cpp)
 target_link_libraries(rmq_test_recall_message PRIVATE rocketmq::remoting)
 add_test(NAME recall_message COMMAND rmq_test_recall_message)
+
+# CHECK_CLIENT_CONFIG(46)：mock broker 锁死协议形状与分支语义
+#（SQL92 写错时 broker 静默放行全部消息，只有这笔请求能把它变成启动错误；真机见 rmq_sql92_live）
+add_executable(rmq_test_check_client_config test_check_client_config.cpp)
+target_link_libraries(rmq_test_check_client_config PRIVATE rocketmq::remoting)
+add_test(NAME check_client_config COMMAND rmq_test_check_client_config)

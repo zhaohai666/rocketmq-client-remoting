@@ -90,6 +90,7 @@ dotnet $PROG hook 127.0.0.1:9876          # CheckForbidden/FilterMessage 钩子�
 dotnet $PROG validators-live 127.0.0.1:9876  # 名字校验（39 PASS / 0 FAIL）
 dotnet $PROG recall 127.0.0.1:9876        # 定时消息撤回（16 PASS / 0 FAIL，脚本负责开关并还原 recallMessageEnable）
 dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS / 0 FAIL）
+dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
 ```
 
 其它子命令：`redelivery` / `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
@@ -116,7 +117,9 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | recall | 16 PASS / 0 FAIL（定时消息撤回 `recallMessage`(370)，与 Python/C++/Rust 同场景：R0 读到并临时打开 broker 的 `recallMessageEnable` → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle` → R2 broker 给的句柄能被解码、`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4/R5 `%RETRY%`/`%DLQ%`/非法句柄都在打网络之前秒回 → R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：对照定时消息按时投递、被撤回那条整个窗口都不出现 → R7 无条件还原开关） |
 | unit-config | 20 PASS / 0 FAIL（unitName/unitMode/stream 四语言同场景：U1 `unitName` 拼进 clientId 且照常发送 → U2 stream 消费者 `@unitA@STREAM` 收尾，**broker 的 `examineConsumerConnectionInfo` 记录的 clientId 也带同一后缀**（唯一能证明「上线的就是拼好的那个」的观测点）→ U3 `unitMode=true` 自动建出的 topic `topicSysFlag` 带 UNIT 位、对照组不带 → U4 心跳 `ConsumerData.unitMode` 让 `%RETRY%` 带 UNIT_SUB 位 → U5 lite 消费者默认带 `@STREAM`、显式开 stream 的生产者同样，3 发 3 收） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **461 passed / 0 failed**，零 warning
+| sql92 | 20 PASS / 0 FAIL（SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 四语言同场景：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `Start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `Start()`）。协议形状与四条分支语义另有离线单测 10 项（`CheckClientConfigTests`，进程内 mock broker） |
+
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **471 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（13 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。

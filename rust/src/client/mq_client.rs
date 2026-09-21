@@ -77,7 +77,7 @@ use crate::error::{Error, Result};
 use crate::remoting::client::{RemotingClient, RemotingClientConfig, RequestProcessor, ResponseSink};
 use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
-    ClusterInfo, ConsumeMessageDirectlyResult, ConsumerRunningInfo,
+    CheckClientRequestBody, ClusterInfo, ConsumeMessageDirectlyResult, ConsumerRunningInfo,
     GetConsumerListByGroupResponseBody, GetConsumerStatusBody, LockBatchRequestBody,
     LockBatchResponseBody, ResetOffsetBody, TopicList, UnlockBatchRequestBody,
 };
@@ -101,12 +101,18 @@ use crate::remoting::protocol::headers::{
     SendMessageRequestHeaderV2, SendMessageResponseHeader, UnregisterClientRequestHeader,
     UpdateConsumerOffsetRequestHeader, UnlockBatchMqRequestHeader,
 };
-use crate::remoting::protocol::heartbeat::{ConsumerData, HeartbeatData, SubscriptionData};
+use crate::remoting::protocol::heartbeat::{
+    ConsumerData, ExpressionType, HeartbeatData, SubscriptionData,
+};
 use crate::remoting::protocol::remoting_command::RemotingCommand;
-use crate::remoting::protocol::route::TopicRouteData;
+use crate::remoting::protocol::route::{pseudo_random_index, TopicRouteData};
 use crate::{bail, rmq_debug, rmq_info, rmq_warn};
 
 // ================================================================ seams
+
+/// Java `ClientConfig.mqClientApiTimeout` 的默认值（`ClientConfig.java:81` = `3 * 1000`）：
+/// 管理类短 RPC（如 `CHECK_CLIENT_CONFIG`）走的就是它，与发送/拉取的超时预算无关。
+const MQ_CLIENT_API_TIMEOUT_MILLIS: i64 = 3000;
 
 /// 消费者对实例暴露的能力面（对应 Java `MQConsumerInner` 中
 /// `MQClientInstance` 心跳 / 位点持久化 / broker 主动请求分派真正读到的部分）。
@@ -2747,6 +2753,114 @@ impl MQClientInstance {
         entries
     }
 
+    // ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+
+    /// 只读缓存路由、随机挑其中一个 broker（优先 master 地址）；没有缓存返回 `None`。
+    ///
+    /// Java `MQClientInstance#findBrokerAddrByTopic:1390`。与 `broker_addr_for_topic`
+    /// （拿不到就抛，给管理类 API 用）的分工照抄 Java：这里返回 `None` 由调用方决定跳过。
+    pub fn find_broker_addr_by_topic(&self, topic: &str) -> Option<String> {
+        let route = self.route_of(topic)?;
+        let brokers = route.get_broker_datas();
+        brokers.get(pseudo_random_index(brokers.len()))?.select_broker_addr()
+    }
+
+    /// Python `check_client_config`：一笔 `CHECK_CLIENT_CONFIG(46)`（Java
+    /// `MQClientAPIImpl#checkClientInBroker:3256`）。
+    ///
+    /// 请求头是 null、body 是 `CheckClientRequestBody` 的 JSON；broker 非 SUCCESS 时
+    /// Java 用**响应码**抛 MQClientException（`SUBSCRIPTION_PARSE_FAILED=23`、
+    /// 未开 `enablePropertyFilter` 的 `SYSTEM_ERROR=1` 都走这里）。
+    /// Java 的 `brokerVIPChannel(vipChannelEnabled=false)` 是恒等变换，本端口不实现。
+    pub async fn check_client_config(
+        &self,
+        broker_addr: &str,
+        consumer_group: &str,
+        client_id: &str,
+        subscription_data: &SubscriptionData,
+        timeout_millis: i64,
+    ) -> Result<()> {
+        let mut request =
+            RemotingCommand::create_request_command(request_code::CHECK_CLIENT_CONFIG, None);
+        let body = CheckClientRequestBody {
+            client_id: Some(client_id.to_string()),
+            group: Some(consumer_group.to_string()),
+            subscription_data: Some(subscription_data.clone()),
+            namespace: None,
+        };
+        request.set_body(Some(body.encode()));
+        let response = self
+            .invoke_sync(broker_addr, &mut request, timeout_millis)
+            .await?;
+        if response.code != response_code::SUCCESS {
+            return Err(Error::client_with_code(
+                response.code,
+                response.remark.clone().unwrap_or_default(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Python `check_client_in_broker`（Java `MQClientInstance#checkClientInBroker:534`）。
+    ///
+    /// 遍历本实例登记的每个消费者的订阅，只把**非 TAG**（SQL92 / CLASS_FILTER）的表达式
+    /// 发给 broker 校验。为什么必须发：SQL92 表达式写错时 broker 的
+    /// `ExpressionMessageFilter` 在拿不到编译好的过滤数据时**直接放行全部消息**
+    /// （返回 true），也就是静默变成「订阅全部消息」，消费者启动照样成功、一条错误都不报。
+    /// 这一调用把「写错的表达式」变成启动期的一次显式失败。
+    ///
+    /// 与 Java 一致的两个细节：
+    /// * 某个消费者「无订阅」时直接 `return` 而不是继续下一个（Java 源码如此）；
+    /// * 查不到路由（`find_broker_addr_by_topic` 返回 None）时**跳过**该订阅而不是报错。
+    pub async fn check_client_in_broker(&self) -> Result<()> {
+        for (group, consumer) in self.consumers_entries() {
+            let subs = consumer.subscriptions();
+            if subs.is_empty() {
+                // 对齐 Java 的 `return`：不是 continue。
+                return Ok(());
+            }
+            self.check_subscriptions_in_broker(&group, &subs).await?;
+        }
+        Ok(())
+    }
+
+    /// `check_client_in_broker` 的内层循环，单独暴露给未登记进 consumerTable 的调用方。
+    pub async fn check_subscriptions_in_broker(
+        &self,
+        group: &str,
+        subs: &[SubscriptionData],
+    ) -> Result<()> {
+        let timeout_millis = MQ_CLIENT_API_TIMEOUT_MILLIS;
+        for sub in subs {
+            // Java `ExpressionType.isTagType`：null / "" / "TAG" 都算 TAG，一律跳过。
+            if sub.expression_type.is_empty() || sub.expression_type == ExpressionType::TAG {
+                continue;
+            }
+            let Some(addr) = self.find_broker_addr_by_topic(&sub.topic) else {
+                continue;
+            };
+            let result = self
+                .check_client_config(&addr, group, &self.inner.client_id, sub, timeout_millis)
+                .await;
+            if let Err(e) = result {
+                // MQClientException 分支（含 broker 回的错误码）原样上抛；
+                // 连不上 / 超时这类传输错误换成 Java 的固定文案 —— 老 broker 不认 46 号
+                // 请求时就落在这里，Java 也是让 consumer.start() 失败。
+                if matches!(e, Error::Client { .. }) {
+                    return Err(e);
+                }
+                return Err(Error::client(format!(
+                    "Check client in broker error, maybe because you use {} to filter message, \
+                     but server has not been upgraded to support!This error would not affect the \
+                     launch of consumer, but may has impact on message receiving if you have use \
+                     the new features which are not supported by server, please check the log!",
+                    sub.expression_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Python `unregister_client`（UNREGISTER_CLIENT = 35）。
     pub async fn unregister_client(
         &self,
@@ -3197,6 +3311,9 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
 
     use super::*;
+    use crate::common::sysflag::PermName;
+    use crate::remoting::protocol::route::{BrokerData, QueueData};
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use crate::common::message_decoder::encode_message_ext;
@@ -3255,18 +3372,30 @@ mod tests {
         persisted: Arc<AtomicUsize>,
         /// 40 通知叫醒了几次重平衡。
         rebalance_wakeups: Arc<AtomicUsize>,
+        /// 46 号检查读的就是这张表（Java `MQConsumerInner#subscriptions()`）。
+        subs: Vec<SubscriptionData>,
     }
 
     impl StubConsumer {
         fn new() -> Arc<StubConsumer> {
-            Arc::new(StubConsumer {
+            Arc::new(StubConsumer { ..StubConsumer::bare() })
+        }
+
+        /// 只带订阅表的替身：46 号检查只需要 `subscriptions()`。
+        fn with_subs(group: &str, subs: Vec<SubscriptionData>) -> Arc<StubConsumer> {
+            Arc::new(StubConsumer { group: group.to_string(), subs, ..StubConsumer::bare() })
+        }
+
+        fn bare() -> StubConsumer {
+            StubConsumer {
                 group: GROUP.to_string(),
                 reset_delay: Duration::from_millis(40),
                 resets: Arc::new(Mutex::new(Vec::new())),
                 status_topics: Arc::new(Mutex::new(Vec::new())),
                 persisted: Arc::new(AtomicUsize::new(0)),
                 rebalance_wakeups: Arc::new(AtomicUsize::new(0)),
-            })
+                subs: Vec::new(),
+            }
         }
     }
 
@@ -3300,7 +3429,7 @@ mod tests {
         }
 
         fn subscriptions(&self) -> Vec<SubscriptionData> {
-            Vec::new()
+            self.subs.clone()
         }
 
         fn rebalance_immediately(&self) {
@@ -3858,5 +3987,373 @@ mod tests {
         );
         assert_eq!(fresh.name_server_addrs(), vec![NAMESRV.to_string()]);
         assert_eq!(fresh.client_id(), id);
+    }
+
+    // ---------------- 46 CHECK_CLIENT_CONFIG ----------------
+    //
+    // 对齐 `python/tests/test_check_client_config.py`。SQL92 表达式写错时 broker **不会**报错
+    // （`ExpressionMessageFilter#isMatched` 在 ConsumeQueue 阶段拿不到编译好的过滤数据就直接
+    // `return true`，静默放行全部消息），Java 因此在 `DefaultMQPushConsumerImpl.start` 里主动
+    // 发一笔 46 号请求把它变成启动期错误。这里用进程内假 broker 锁死线上报文形状与分支语义，
+    // 真机行为见 `examples/live_sql92.rs`。
+
+    /// 假 broker 收到的一笔请求（线上原样，未经任何解码便捷封装）。
+    #[derive(Debug, Clone)]
+    struct Recorded {
+        code: i32,
+        ext_fields: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    /// 进程内假 broker：只说 remoting 协议，逐笔按脚本应答。
+    struct MockBroker {
+        addr: String,
+        state: Arc<Mutex<Vec<Recorded>>>,
+        /// 脚本：下一笔请求的应答码（用完一律回 SUCCESS）。
+        codes: Arc<Mutex<VecDeque<i32>>>,
+        remarks: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    impl MockBroker {
+        async fn start() -> Arc<MockBroker> {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                Ok(l) => l,
+                Err(e) => panic!("bind mock broker: {e}"),
+            };
+            let addr = match listener.local_addr() {
+                Ok(a) => a.to_string(),
+                Err(e) => panic!("mock broker addr: {e}"),
+            };
+            let broker = Arc::new(MockBroker {
+                addr,
+                state: Arc::new(Mutex::new(Vec::new())),
+                codes: Arc::new(Mutex::new(VecDeque::new())),
+                remarks: Arc::new(Mutex::new(VecDeque::new())),
+            });
+            let inner = Arc::clone(&broker);
+            tokio::spawn(async move {
+                loop {
+                    let accepted = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(_) => return,
+                    };
+                    let broker = Arc::clone(&inner);
+                    tokio::spawn(async move {
+                        let mut stream = accepted.0;
+                        while let Some(request) = read_request(&mut stream).await {
+                            let code = guard(&broker.codes).pop_front();
+                            let remark = guard(&broker.remarks).pop_front();
+                            guard(&broker.state).push(Recorded {
+                                code: request.code,
+                                ext_fields: request
+                                    .ext_fields()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                                body: request.body().unwrap_or_default().to_vec(),
+                            });
+                            let _ = write_response(
+                                &mut stream,
+                                &request,
+                                code.unwrap_or(response_code::SUCCESS),
+                                remark,
+                            )
+                            .await;
+                        }
+                    });
+                }
+            });
+            broker
+        }
+
+        fn script(&self, codes: Vec<i32>, remarks: Vec<String>) {
+            *guard(&self.codes) = codes.into();
+            *guard(&self.remarks) = remarks.into();
+        }
+
+        /// 只保留 46 号请求：路由刷新等副作用不该混进断言。
+        fn checks(&self) -> Vec<Recorded> {
+            guard(&self.state)
+                .iter()
+                .filter(|r| r.code == request_code::CHECK_CLIENT_CONFIG)
+                .cloned()
+                .collect()
+        }
+
+        /// 第 `n` 笔 46 号请求的 body 解析成 JSON。
+        fn body_of(&self, n: usize) -> serde_json::Value {
+            let checks = self.checks();
+            match checks.get(n) {
+                Some(r) => serde_json::from_slice(&r.body).unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            }
+        }
+    }
+
+    /// 读一整帧并解码（`decode` 从 totalLength 开始，所以帧要连长度前缀一起给）。
+    async fn read_request(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<RemotingCommand> {
+        use tokio::io::AsyncReadExt as _;
+        let mut len_buf = [0_u8; 4];
+        stream.read_exact(&mut len_buf).await.ok()?;
+        let total = i32::from_be_bytes(len_buf);
+        if total <= 4 || total > 20 * 1024 * 1024 {
+            return None;
+        }
+        let usize_len = usize::try_from(total).ok()?;
+        let mut frame = vec![0_u8; usize_len + 4];
+        frame[..4].copy_from_slice(&len_buf);
+        stream.read_exact(&mut frame[4..]).await.ok()?;
+        RemotingCommand::decode(&frame).ok()
+    }
+
+    async fn write_response(
+        stream: &mut tokio::net::TcpStream,
+        request: &RemotingCommand,
+        code: i32,
+        remark: Option<String>,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut response = RemotingCommand::create_response(code, remark);
+        // 客户端按 opaque 配对响应，串了就当噪声丢掉，所以必须回原值。
+        response.opaque = request.opaque;
+        response.serialize_type_current_rpc = request.serialize_type_current_rpc;
+        let bytes = response.encode();
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    }
+
+    fn sql92_sub(topic: &str, expression: &str) -> SubscriptionData {
+        SubscriptionData {
+            topic: topic.to_string(),
+            sub_string: expression.to_string(),
+            expression_type: ExpressionType::SQL92.to_string(),
+            ..SubscriptionData::default()
+        }
+    }
+
+    fn tag_sub(topic: &str, expression: &str, expression_type: &str) -> SubscriptionData {
+        SubscriptionData {
+            topic: topic.to_string(),
+            sub_string: expression.to_string(),
+            expression_type: expression_type.to_string(),
+            ..SubscriptionData::default()
+        }
+    }
+
+    /// 把路由塞进实例缓存，broker 地址指向 `addr`（`route_of` 只读缓存，不会补拉）。
+    fn seed_route(instance: &MQClientInstance, topic: &str, broker_name: &str, addr: &str) {
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                broker_name,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                broker_name,
+                vec![(i64::from(MixAll::MASTER_ID), addr.to_string())],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(topic.to_string(), route);
+    }
+
+    /// 订阅 + 缓存路由都就位，返回可以直接跑 `check_client_in_broker` 的实例。
+    fn instance_with_sub(broker: &MockBroker, subs: Vec<SubscriptionData>) -> MQClientInstance {
+        let instance = new_instance();
+        for sub in &subs {
+            seed_route(&instance, &sub.topic, BROKER, &broker.addr);
+        }
+        instance.register_consumer(GROUP, StubConsumer::with_subs(GROUP, subs));
+        instance
+    }
+
+    #[tokio::test]
+    async fn tag_only_subscriptions_send_no_check_request() {
+        // Java `ExpressionType.isTagType`：null / "" / "TAG" 都算 TAG，一律跳过。
+        let broker = MockBroker::start().await;
+        let instance = instance_with_sub(
+            &broker,
+            vec![
+                tag_sub(TOPIC, "tagA || tagB", ExpressionType::TAG),
+                tag_sub("NullTypeTopic", "*", ""),
+            ],
+        );
+        instance.check_client_in_broker().await.expect("TAG-only must not fail");
+        assert!(broker.checks().is_empty(), "TAG subscriptions must not reach the broker");
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sql92_request_shape_matches_java() {
+        let broker = MockBroker::start().await;
+        let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a > 10")]);
+        instance.check_client_in_broker().await.expect("SUCCESS reply");
+        let checks = broker.checks();
+        assert_eq!(checks.len(), 1, "one SQL92 sub ⇒ exactly one 46");
+        // 请求头是 null ⇒ 线上没有 extFields。
+        assert!(checks[0].ext_fields.is_empty(), "header must be null: {:?}", checks[0].ext_fields);
+
+        let body = broker.body_of(0);
+        assert_eq!(body["clientId"], instance.client_id());
+        assert_eq!(body["group"], GROUP);
+        let sd = &body["subscriptionData"];
+        assert_eq!(sd["topic"], TOPIC);
+        assert_eq!(sd["subString"], "a > 10");
+        assert_eq!(sd["expressionType"], ExpressionType::SQL92);
+        // Java SubscriptionData 的序列化字段名（`filterClassSource` 是 @JSONField(serialize=false)）
+        let mut keys: Vec<&str> = sd.as_object().expect("subscriptionData is an object").keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "classFilterMode",
+                "codeSet",
+                "expressionType",
+                "subString",
+                "subVersion",
+                "tagsSet",
+                "topic"
+            ]
+        );
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn broker_reject_code_becomes_client_error_with_that_code() {
+        // SUBSCRIPTION_PARSE_FAILED(23) 要原样带上响应码 —— 这是启动失败的判据。
+        let broker = MockBroker::start().await;
+        broker.script(vec![response_code::SUBSCRIPTION_PARSE_FAILED], vec!["bad sql92".to_string()]);
+        let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a >")]);
+        let err = instance.check_client_in_broker().await.expect_err("23 must fail the check");
+        assert_eq!(err.response_code(), Some(response_code::SUBSCRIPTION_PARSE_FAILED));
+        // broker 的 remark 不能丢：Java 抛的就是 `MQClientException(响应码, remark)`。
+        assert!(err.to_string().contains("bad sql92"), "remark lost: {err}");
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn broker_without_property_filter_reports_system_error() {
+        // 未开 `enablePropertyFilter` 的 broker 回 SYSTEM_ERROR(1)（Java 同码）。
+        let broker = MockBroker::start().await;
+        broker.script(vec![response_code::SYSTEM_ERROR], vec![]);
+        let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a > 10")]);
+        let err = instance.check_client_in_broker().await.expect_err("SYSTEM_ERROR must fail");
+        assert_eq!(err.response_code(), Some(response_code::SYSTEM_ERROR));
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn missing_route_skips_the_subscription() {
+        // Java `findBrokerAddrByTopic` 只读缓存：查不到就是 null ⇒ continue，不报错。
+        let instance = new_instance();
+        instance.register_consumer(
+            GROUP,
+            StubConsumer::with_subs(GROUP, vec![sql92_sub(TOPIC, "a > 10")]),
+        );
+        instance.check_client_in_broker().await.expect("no route must be skipped, not fatal");
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn transport_error_is_wrapped_with_java_message() {
+        // 路由指向一个没人监听的端口 ⇒ 连接失败（Java 的 RemotingConnectException），
+        // 换成 Java 的固定文案再抛 —— 老 broker 不认 46 号请求时也落在这里。
+        let idle = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an idle port");
+        let dead_addr = match idle.local_addr() {
+            Ok(a) => a.to_string(),
+            Err(e) => panic!("idle addr: {e}"),
+        };
+        drop(idle);
+        let instance = new_instance();
+        seed_route(&instance, TOPIC, BROKER, &dead_addr);
+        instance.register_consumer(
+            GROUP,
+            StubConsumer::with_subs(GROUP, vec![sql92_sub(TOPIC, "a > 10")]),
+        );
+        let err = instance.check_client_in_broker().await.expect_err("dead broker must fail");
+        let text = err.to_string();
+        assert!(text.contains(ExpressionType::SQL92), "expression type lost: {text}");
+        assert!(
+            text.contains("server has not been upgraded to support"),
+            "java wrap message missing: {text}"
+        );
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn consumer_without_subscriptions_ends_the_whole_check() {
+        // Java 的 `return`（不是 `continue`）：空订阅的消费者会把后面的检查一起终止。
+        // `consumers_entries` 按组名排序，所以 "A_empty" 一定先被遍历到。
+        let broker = MockBroker::start().await;
+        let empty = StubConsumer::with_subs("A_empty_group", Vec::new());
+        let sql = StubConsumer::with_subs("B_sql_group", vec![sql92_sub(TOPIC, "a > 10")]);
+        let instance = new_instance();
+        seed_route(&instance, TOPIC, BROKER, &broker.addr);
+        instance.register_consumer("A_empty_group", empty);
+        instance.register_consumer("B_sql_group", sql);
+        instance.check_client_in_broker().await.expect("the quirk is silent, not fatal");
+        assert!(broker.checks().is_empty(), "the check must stop at the first empty consumer");
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn inner_helper_covers_unregistered_callers() {
+        // consumerTable 只收推模式消费者；lite 拉 / 拉模式消费者用内层循环拿同样语义。
+        let broker = MockBroker::start().await;
+        let instance = new_instance();
+        seed_route(&instance, TOPIC, BROKER, &broker.addr);
+        instance
+            .check_subscriptions_in_broker("GID_Unregistered", &[sql92_sub(TOPIC, "a > 10")])
+            .await
+            .expect("SUCCESS reply");
+        let checks = broker.checks();
+        assert_eq!(checks.len(), 1);
+        let body = broker.body_of(0);
+        assert_eq!(body["group"], "GID_Unregistered");
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn master_broker_is_preferred_and_only_one_addr_is_used() {
+        // `selectBrokerAddr`：MASTER_ID(0) 在表里就用 master，不会挑到 slave。
+        let broker = MockBroker::start().await;
+        let instance = new_instance();
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID) + 1, "127.0.0.1:1".to_string()),
+                    (i64::from(MixAll::MASTER_ID), broker.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
+        assert_eq!(
+            instance.find_broker_addr_by_topic(TOPIC).as_deref(),
+            Some(broker.addr.as_str()),
+            "master must win over the acting slave"
+        );
+        assert_eq!(instance.find_broker_addr_by_topic("NoSuchTopic"), None);
+        instance.shutdown();
     }
 }
