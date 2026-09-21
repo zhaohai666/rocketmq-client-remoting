@@ -14,24 +14,37 @@ int32_t clampInt32(int32_t v, int32_t lo) { return v < lo ? lo : v; }
 }  // namespace
 
 ConsumeExecutor::ConsumeExecutor(int32_t core_pool_size, int32_t maximum_pool_size,
-                                 double keep_alive_seconds, std::string thread_name_prefix)
+                                 double keep_alive_seconds, std::string thread_name_prefix,
+                                 int32_t max_queue_size, std::string thread_name_sep,
+                                 int32_t thread_index_from)
     : core_(clampInt32(core_pool_size, 0)),
       max_(clampInt32(std::max(core_, maximum_pool_size), 0)),
       keepAliveSeconds_(keep_alive_seconds),
-      prefix_(std::move(thread_name_prefix)) {}
+      prefix_(std::move(thread_name_prefix)),
+      maxQueueSize_(clampInt32(max_queue_size, 0)),
+      nameSep_(std::move(thread_name_sep)) {
+    seq_ = clampInt32(thread_index_from, 0);
+}
 
 ConsumeExecutor::~ConsumeExecutor() { shutdown(true); }
 
 void ConsumeExecutor::submit(std::function<void()> task) {
     std::lock_guard<std::mutex> lk(m_);
     if (shutdown_) {
-        throw std::runtime_error("ConsumeExecutor has been shut down");
+        throw RejectedExecutionError("ConsumeExecutor has been shut down");
+    }
+    // Java：入队失败（队列满）才考虑开一个非 core 线程，再不行就 reject
+    const bool queueFull = maxQueueSize_ > 0 && static_cast<int32_t>(queue_.size()) >= maxQueueSize_;
+    const bool canGrow = workers_ < max_;
+    if (queueFull && !canGrow) {
+        throw RejectedExecutionError("ConsumeExecutor queue is full ("
+                                     + std::to_string(maxQueueSize_) + ")");
     }
     queue_.push_back(std::move(task));
     // Java 无界队列语义：只有 poolSize < corePoolSize 才新建线程；否则入队等待。
-    if (workers_ < core_ || workers_ == 0) {
-        // 第二个条件是 Java execute() 里 "入队成功后 workerCount == 0 再补一个线程"
-        // 的兜底分支 —— core=0 的配置下没有它任务永远没人跑。
+    // workers == 0 是 core=0 配置下的兜底分支（Java execute 的同一处），
+    // 队满且还能涨时也要补线程，否则任务永远排在一个已经不再干活的队列里。
+    if (workers_ < core_ || (queueFull && canGrow) || workers_ == 0) {
         spawnLocked();
     }
     cv_.notify_one();
@@ -104,7 +117,7 @@ void ConsumeExecutor::shutdown(bool wait) {
 void ConsumeExecutor::spawnLocked() {
     // 调用方必须已持有 m_
     ++workers_;
-    const std::string name = prefix_ + "-" + std::to_string(seq_++);
+    const std::string name = prefix_ + nameSep_ + std::to_string(seq_++);
     threads_.emplace_back([this, name]() {
         setThreadName(name);
         run();

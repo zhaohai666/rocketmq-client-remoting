@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 734 条单元/协议测试（730 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 766 条单元/协议测试（762 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -24,7 +24,8 @@ ROCKETMQ_JAVA_SRC=<...>/remoting/src/main/java/org/apache/rocketmq/remoting/prot
 ### 真实集群联调（无 mock，需先起 nameServer(9876) + broker(10911)）
 
 ```bash
-python verify_message_types.py    # 7 类消息能力（异步/顺序/Tag/属性/延迟/Key/事务）
+python verify_message_types.py    # 7 类消息能力，18 PASS/0 FAIL（异步 9 项：不阻塞返回、线程口径、并发、定点、失败只走回调）
+python verify_request_reply_live.py # request-reply 全链路（16 PASS/0 FAIL）：325 落地、REPLY_TO_CLIENT=真实 clientId、超时/并发/普通消费不受影响
 python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（63 PASS/0 FAIL/1 SKIP）
 python verify_compression_live.py selftest   # 自动压缩自产自销 + broker 侧压缩体校验
 python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 探针跨客户端互通
@@ -255,6 +256,54 @@ bit0 = 响应类型（RPC_TYPE）      bit1 = oneway（RPC_ONEWAY）
 `DefaultAuthorizationContextBuilder:230-240` 把 310/320 列在同一个 case 里）。所以两个
 必须成对断言，只改码不改 `m` 会让批量 body 被按单条解析。真机侧由
 `verify_live_clean.py` 的「批量发送 3 条」+ 消费计数对账覆盖。
+
+## 异步发送 `send_async`
+
+Java 的异步发送不是一条直路，它串了三个部件，本实现逐个对齐（回归守卫
+`tests/test_producer_async.py`，真机守卫 `verify_message_types.py` 前 9 项）：
+
+| 部件 | Java 出处 | 本实现 |
+| --- | --- | --- |
+| 发送线程池 | `DefaultMQProducerImpl:133-140`：`core=max=availableProcessors`、队列 50000、线程名 `AsyncSenderExecutor_` | `ConsumeExecutor(core,max=cpu_count, max_queue_size=async_sender_queue_capacity)`，线程名 `AsyncSenderExecutor_1` 起 |
+| 回调线程池 | `NettyRemotingAbstract.executeInvokeCallback:488-517` 把 `onSuccess/onException` 交给 `callbackExecutor`；`NettyClientConfig:28` 默认 **`availableProcessors()`**（`<=0` 才退成 4） | `_callback_executor`，线程名 `NettyClientPublicExecutor_1` 起；`client_callback_executor_threads` 可覆盖 |
+| 失败换 broker | `MQClientAPIImpl#onExceptionImpl:704-743` | `_on_send_exception` |
+
+用户回调**永远不跑在读线程/超时扫描线程上**，这是那两个池存在的唯一理由。调用方
+`send_async` 只入队就返回（实测 `callerBlockedMs=0`）。
+
+三个入口级判据：
+
+- 队列满 → `MQClientException("executor rejected")`（Java `RejectedExecutionException` 分支）；
+- 排队已经把预算吃光 → `RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")`，
+  连请求都不会建（Java `:553-575` 的 `timeout > costTime` 闸门）；
+- ASYNC 的 `timesTotal` 固定为 1（Java `:756`），重试次数读
+  `retry_times_when_send_async_failed`（Java `:1057`）——早期实现里那个配置是个死字段。
+
+重试的四个细节最容易漏：跨重试**复用同一个请求对象**（`SendMessageRequestHeaderV2` 不带
+brokerName，所以换 broker 不必重建），但每次尝试**换一个 `opaque`**（复用会让两次尝试的应答
+串台）；`select_one_message_queue(publish, last_broker, False)` 避开刚失败的那台；超时用的是
+**共享的剩余预算**而不是重新给一份；`timeout <= 0` 立即停。
+
+失败分类（`_classify_async_failure`）不是均匀的：**broker 明确回了错误码时原样交给回调、
+不换 broker 重试**（`needRetry=false`），这和同步发送的 `retry_response_codes` 语义**不同**；
+`RemotingSendRequestException`/`RemotingTimeoutException`/其它 `RemotingException` 各按 Java
+`operationFail` 的措辞包一层 `MQClientException`（`send request failed` /
+`wait response timeout, cost=N` / `unknown reason`）并重试，只有
+`RemotingTooMuchRequestException` 不重试；而外层 catch（同步抛出）走的是 Java 的
+raw-exception + `needRetry=true` 分支，**不包装**。`request()` 内部就是这条 ASYNC 路径
++ 等 latch，所以它同样受上述全部语义约束。
+
+地址解析也照 `sendKernelImpl:919-924` 走两步：先查发布地址表，查不到**按 topic 刷一次路由**
+再查。这一步是定点发送（调用方直接给 `mq`）唯一的路由来源 —— 它不会在 `sendDefaultImpl`
+里取发布信息，少了这一步第一次定点发送必然带着空地址去连；刷完还没有就回调
+`MQClientException("The broker[x] not exist")`（Java `:1100`）。ASYNC 分支另有自己的一道总闸
+（`:1043-1046`）：钩子、压缩、建请求的耗时都算进预算，被吃光时不再发起请求，回调拿
+`RemotingTooMuchRequestException("sendKernelImpl call timeout")` 且不重试。
+
+刻意保留的四处偏差：未 `start()` 时 `send_async` 同步抛（Java 从回调给）；批量消息在 sender
+池里复用同步批量内核；没实现 Java 默认关闭的信号量背压；`shutdown()` 不等在途异步任务
+（Java `:314` 也只调 `shutdown()` 不 `awaitTermination`）——所以"发完立刻 shutdown"会丢任务，
+与 Java 一致。
 
 ## License
 

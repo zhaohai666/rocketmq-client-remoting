@@ -431,7 +431,7 @@ struct RemotingClient::Impl {
         }
         future->cv.notify_all();
         if (cb) {
-            cb(cmd, std::string());
+            cb(cmd, InvokeError());
         }
     }
 
@@ -572,12 +572,26 @@ struct RemotingClient::Impl {
             jobs.swap(retryQueue);
         }
         for (auto& job : jobs) {
+            // 异常类型必须带到回调里：Java 的 operationFail(Throwable) 就是按类型决定
+            // 文案和是否重试（MQClientAPIImpl:680-693），压成字符串等于丢掉判据。
             try {
                 const RemotingCommand response =
                     retryAfterGoAway(job.addr, job.request, job.deadlineMs);
-                job.callback(response, std::string());
+                job.callback(response, InvokeError());
+            } catch (const RemotingTimeoutException& e) {
+                job.callback(RemotingCommand(),
+                             InvokeError(InvokeError::Kind::TIMEOUT, e.what()));
+            } catch (const RemotingSendRequestException& e) {
+                job.callback(RemotingCommand(),
+                             InvokeError(InvokeError::Kind::SEND_REQUEST, e.what()));
+            } catch (const RemotingConnectException& e) {
+                job.callback(RemotingCommand(),
+                             InvokeError(InvokeError::Kind::CONNECT, e.what()));
+            } catch (const RemotingTooMuchRequestException& e) {
+                job.callback(RemotingCommand(),
+                             InvokeError(InvokeError::Kind::TOO_MUCH_REQUEST, e.what()));
             } catch (const std::exception& e) {
-                job.callback(RemotingCommand(), e.what());
+                job.callback(RemotingCommand(), InvokeError(InvokeError::Kind::OTHER, e.what()));
             }
         }
     }
@@ -590,7 +604,7 @@ struct RemotingClient::Impl {
             jobs.swap(retryQueue);
         }
         for (auto& job : jobs) {
-            job.callback(RemotingCommand(), reason);
+            job.callback(RemotingCommand(), InvokeError(InvokeError::Kind::OTHER, reason));
         }
     }
 
@@ -665,9 +679,12 @@ struct RemotingClient::Impl {
             }
             f->cv.notify_all();
             if (mine && f->callback) {
-                f->callback(RemotingCommand(), f->addr + " async invoke timeout "
-                                               + std::to_string(f->timeoutMs) + " ms, opaque="
-                                               + std::to_string(kv.second));
+                // 类型必须是 TIMEOUT：异步发送的重试判据就靠它区分"等等看"和"换一台"
+                f->callback(RemotingCommand(),
+                            InvokeError(InvokeError::Kind::TIMEOUT,
+                                        f->addr + " async invoke timeout "
+                                            + std::to_string(f->timeoutMs) + " ms, opaque="
+                                            + std::to_string(kv.second)));
             }
         }
     }
@@ -824,7 +841,7 @@ void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& reque
     impl_->registerFutureAcquiringOpaque(
         request,
         [this, user, addr, deadline, original](const RemotingCommand& response,
-                                               const std::string& error) {
+                                               const InvokeError& error) {
             if (!error.empty() || response.code != ResponseCode::GO_AWAY) {
                 user(response, error);
                 return;

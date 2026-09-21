@@ -301,14 +301,16 @@ int main() {
         std::atomic<int32_t> gotCode{0};
         std::atomic<int32_t> gotOpaque{0};
         std::atomic<int32_t> errLen{0};
+        std::atomic<int32_t> kind{-1};
 
         RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         const int32_t opaque = req.opaque;
         client.invokeAsync(server.address(), req,
-                           [&](const RemotingCommand& r, const std::string& err) {
+                           [&](const RemotingCommand& r, const InvokeError& err) {
                                gotCode.store(r.code);
                                gotOpaque.store(r.opaque);
-                               errLen.store(static_cast<int32_t>(err.size()));
+                               kind.store(static_cast<int32_t>(err.kind));
+                               errLen.store(static_cast<int32_t>(err.message.size()));
                                called.store(true);
                            });
         for (int i = 0; i < 200 && !called.load(); ++i) {
@@ -318,6 +320,8 @@ int main() {
         CHECK(gotCode.load() == ResponseCode::SUCCESS, "invokeAsync response code");
         CHECK(gotOpaque.load() == opaque, "invokeAsync opaque matched");
         CHECK(errLen.load() == 0, "invokeAsync success carries no error");
+        CHECK(kind.load() == static_cast<int32_t>(InvokeError::Kind::NONE),
+              "invokeAsync success carries kind NONE");
         client.shutdown();
     }
 
@@ -329,13 +333,15 @@ int main() {
         RemotingClient client;
         std::atomic<int32_t> fired{0};
         std::atomic<int32_t> errLen{0};
+        std::atomic<int32_t> timeoutKind{-1};
 
         RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         client.invokeAsync(
             server.address(), req,
-            [&](const RemotingCommand&, const std::string& err) {
+            [&](const RemotingCommand&, const InvokeError& err) {
                 ++fired;
-                errLen.store(static_cast<int32_t>(err.size()));
+                errLen.store(static_cast<int32_t>(err.message.size()));
+                timeoutKind.store(static_cast<int32_t>(err.kind));
             },
             300);
         for (int i = 0; i < 300 && fired.load() == 0; ++i) {
@@ -343,6 +349,10 @@ int main() {
         }
         CHECK(fired.load() == 1, "invokeAsync timeout fires the callback once");
         CHECK(errLen.load() > 0, "invokeAsync timeout carries an error");
+        // 超时必须是 TIMEOUT：异步发送的重试判定按异常**类型**分流（Java 的
+        // RemotingTimeoutException 会重试，unknown reason 不会），文案不可作为依据。
+        CHECK(timeoutKind.load() == static_cast<int32_t>(InvokeError::Kind::TIMEOUT),
+              "invokeAsync timeout carries kind TIMEOUT");
         client.shutdown();
     }
 
@@ -472,10 +482,10 @@ int main() {
         int code = -1;
         std::string error;
         client.invokeAsync(addr, req,
-                           [&](const RemotingCommand& resp, const std::string& err) {
+                           [&](const RemotingCommand& resp, const InvokeError& err) {
                                std::lock_guard<std::mutex> lk(m);
                                code = resp.code;
-                               error = err;
+                               error = err.message;
                                done.store(true);
                            },
                            5000);
@@ -497,10 +507,10 @@ int main() {
         std::atomic<bool> done{false};
         std::string error;
         client.invokeAsync(server.address(), req,
-                           [&](const RemotingCommand& resp, const std::string& err) {
+                           [&](const RemotingCommand& resp, const InvokeError& err) {
                                (void)resp;
                                std::lock_guard<std::mutex> lk(m);
-                               error = err;
+                               error = err.message;
                                done.store(true);
                            },
                            5000);

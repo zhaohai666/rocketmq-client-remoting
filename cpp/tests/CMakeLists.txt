@@ -57,6 +57,12 @@ add_executable(rmq_test_send_retry test_send_retry.cpp)
 target_link_libraries(rmq_test_send_retry PRIVATE rocketmq::remoting)
 add_test(NAME send_retry COMMAND rmq_test_send_retry)
 
+# 异步发送链路：AsyncSenderExecutor / NettyClientPublicExecutor 两个池 + 按异常类型分类的
+# 重试链（Java sendMessageAsync/onExceptionImpl），以及有界队列的 executor rejected
+add_executable(rmq_test_producer_async test_producer_async.cpp)
+target_link_libraries(rmq_test_producer_async PRIVATE rocketmq::remoting)
+add_test(NAME producer_async COMMAND rmq_test_producer_async)
+
 # POP 模式：CK 串编解码 + 请求头字段名守卫 + POP_CK 反构
 add_executable(rmq_test_pop test_pop.cpp)
 target_link_libraries(rmq_test_pop PRIVATE rocketmq::remoting)

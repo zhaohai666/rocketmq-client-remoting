@@ -2,7 +2,10 @@
 """rocketmq-client-remoting 不同消息类型联调测试。
 
 覆盖 verify_live_clean.py 之外的消息类型/特性，全部针对真实集群验证：
-  1. 异步发送（send_async + SendCallback）
+  1. 异步发送（send_async + SendCallback）：真异步链 —— 不阻塞调用方、
+     准备工作在 AsyncSenderExecutor_ 线程、钩子 after 与回调在
+     NettyClientPublicExecutor_ 线程、并发 20 条全部落到 broker、定点发送、
+     校验失败只走回调
   2. 延迟消息（set_delay_time_level，验证延迟投递 + 时序）
   3. 顺序消息（send_by_selector 同 key 落同队列 + 顺序消费保序）
   4. 带 Tag 消息 + 服务端 Tag 过滤消费
@@ -27,7 +30,7 @@ from rocketmq.client.producer import (DefaultMQProducer, SelectMessageQueueByHas
 from rocketmq.client.consumer import (DefaultMQPushConsumer, MessageListenerConcurrently,
                                        MessageListenerOrderly)
 from rocketmq.client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus)
-from rocketmq.common.message import Message, MessageExt
+from rocketmq.common.message import Message, MessageExt, MessageQueue
 from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = "127.0.0.1:9876"
@@ -120,15 +123,100 @@ def main():
         return 1
     check("集群探活", True, "brokers=%s" % brokers)
 
-    # ---------- 1. 异步发送 ----------
+    # ---------- 1. 异步发送（真异步链：不阻塞调用方 + 两个线程池 + 真投递 + 失败走回调） ----------
     topic_async = "%s_Async" % PREFIX
+
+    # SendMessageHook 顺带当"线程探针"：before 在 AsyncSenderExecutor 上跑，
+    # after 与用户回调在 NettyClientPublicExecutor 上跑（Java 同款分工）。
+    hook_threads = []
+
+    class _ThreadSpy:
+        def hook_name(self):
+            return "thread-spy"
+
+        def send_message_before(self, context):
+            hook_threads.append(("before", threading.current_thread().name))
+
+        def send_message_after(self, context):
+            hook_threads.append(("after", threading.current_thread().name))
+
+    spy = _ThreadSpy()
+    prod.register_send_message_hook(spy)
     ok_res, errs = [], []
-    cb = SendCallbackImpl(lambda sr: ok_res.append(sr), lambda e: errs.append(e))
-    prod.send_async(Message(topic_async, b"async-hello"), cb)
-    time.sleep(2)
+    cb_threads = []
+    begin = time.monotonic()
+    prod.send_async(
+        Message(topic_async, b"async-hello"),
+        SendCallbackImpl(lambda sr: (ok_res.append(sr),
+                                     cb_threads.append(threading.current_thread().name)),
+                         lambda e: (errs.append(e),
+                                    cb_threads.append(threading.current_thread().name))))
+    caller_ms = int((time.monotonic() - begin) * 1000)
+    for _ in range(100):
+        if ok_res or errs:
+            break
+        time.sleep(0.05)
+    # 调用方拿到的是"已提交"，不是"已发完"：这一条挂了才算真异步
+    check("send_async 不阻塞调用方", caller_ms < 300, "callerBlockedMs=%d" % caller_ms)
     check("异步发送 send_async",
           len(ok_res) == 1 and ok_res[0].send_status.name == "SEND_OK" and not errs,
           "ok=%d err=%d" % (len(ok_res), len(errs)))
+    before_threads = [t for k, t in hook_threads if k == "before"]
+    after_threads = [t for k, t in hook_threads if k == "after"]
+    check("发送准备在 AsyncSenderExecutor_ 线程上跑",
+          bool(before_threads) and all(t.startswith("AsyncSenderExecutor_")
+                                       for t in before_threads),
+          "before=%s" % (before_threads or "?"))
+    check("钩子 after 与用户回调在 NettyClientPublicExecutor_ 线程上跑",
+          bool(after_threads) and all(t.startswith("NettyClientPublicExecutor_")
+                                      for t in after_threads)
+          and cb_threads == ["NettyClientPublicExecutor_1"],
+          "after=%s callback=%s" % (after_threads or "?", cb_threads or "?"))
+    prod.send_message_hook_list.remove(spy)
+
+    # 批量并发异步：20 条全部 SEND_OK，且 broker 侧真收得到
+    ok_many, err_many = [], []
+    for i in range(20):
+        prod.send_async(Message(topic_async, ("async-%02d" % i).encode()),
+                        SendCallbackImpl(lambda sr: ok_many.append(sr),
+                                         lambda e: err_many.append(e)))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(ok_many) + len(err_many) < 20:
+        time.sleep(0.05)
+    check("并发 send_async 全部回调成功",
+          len(ok_many) == 20 and not err_many,
+          "ok=%d err=%d%s" % (len(ok_many), len(err_many),
+                              (" last=%s" % err_many[-1]) if err_many else ""))
+    recv_async = run_consumer(topic_async, "*", 15, group_suffix="async", expect=21)
+    check("异步发送的消息真落到 broker",
+          len(recv_async) == 21,
+          "received=%d/21" % len(recv_async))
+
+    # 定点异步发送（Java send(msg, mq, cb, timeout)：topicPublishInfo 为 null）
+    fixed_mq = MessageQueue(topic_async, "broker-a", 0)
+    ok_fixed, err_fixed = [], []
+    prod.send_async(Message(topic_async, b"async-fixed"),
+                    SendCallbackImpl(lambda sr: ok_fixed.append(sr),
+                                     lambda e: err_fixed.append(e)),
+                    mq=fixed_mq)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (ok_fixed or err_fixed):
+        time.sleep(0.05)
+    check("定点 send_async(带 mq)", bool(ok_fixed) and not err_fixed,
+          "ok=%d err=%d%s" % (len(ok_fixed), len(err_fixed),
+                              (" last=%s" % err_fixed[-1]) if err_fixed else ""))
+
+    # 校验类失败不发请求、只走回调（Java：runnable 的 catch → newCallBack.onException）
+    ok_bad, err_bad = [], []
+    prod.send_async(Message(topic_async, b""),
+                    SendCallbackImpl(lambda sr: ok_bad.append(sr),
+                                     lambda e: err_bad.append(e)))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (ok_bad or err_bad):
+        time.sleep(0.05)
+    check("空 body 的异步发送失败只走回调",
+          not ok_bad and len(err_bad) == 1,
+          "err=%s" % (err_bad[0] if err_bad else "?"))
 
     # ---------- 2. 顺序消息：同 key 落同队列 + 顺序消费保序 ----------
     topic_order = "%s_Order" % PREFIX

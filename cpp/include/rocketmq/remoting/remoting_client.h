@@ -30,13 +30,47 @@
 
 namespace rocketmq {
 
+// 异步回调的错误载体（对应 Java ``InvokeCallback`` 收到的那个 Throwable，
+// 也是 Python 版 ``invoke_async`` 回调里的 error 参数）。
+//
+// 为什么不能只有一个字符串：Java 的异步发送重试判据**看的是异常类型**
+// （``MQClientAPIImpl:680-693`` 三个 instanceof 分支的文案各不相同，且只有
+// RemotingTooMuchRequestException 不重试）。按错误消息的措辞去猜类型，等于把
+// 重试行为挂在一句日志文案上，改个措辞就会改变语义。
+struct InvokeError {
+    enum class Kind {
+        NONE = 0,          // 没有错误（响应已送达，response 有效）
+        TIMEOUT,           // 对应 RemotingTimeoutException
+        SEND_REQUEST,      // 对应 RemotingSendRequestException
+        CONNECT,           // 对应 RemotingConnectException
+        TOO_MUCH_REQUEST,  // 对应 RemotingTooMuchRequestException（唯一不重试的传输错误）
+        // 不是传输错误：**响应已经到达**，只是处理失败了 —— 两种来源
+        //   * broker 回了非 SUCCESS 响应码（Java processSendResponse 抛 MQBrokerException）
+        //   * 响应体解析不出来（RemotingCommandException 一类）
+        // 传输层不会产出它，只有客户端层解析应答时才设。合并成一个类型是因为 Java 在
+        // 这两种分支上走的是同一条路（``MQClientAPIImpl:669-673`` operationSucceed 的
+        // catch(Exception) → onExceptionImpl(needRetry=false)）：**不换 broker 也不重试**，
+        // 与同步发送按 retryResponseCodes 换 broker 的语义刻意不同，必须能被区分出来。
+        RESPONSE_FAILED,
+        OTHER,             // 其它（Java 的 "unknown reason" 分支）
+    };
+
+    Kind kind = Kind::NONE;
+    std::string message;
+
+    InvokeError() = default;
+    InvokeError(Kind k, std::string msg) : kind(k), message(std::move(msg)) {}
+
+    bool empty() const { return kind == Kind::NONE && message.empty(); }
+};
+
 class RemotingClient {
 public:
     // 异步回调（对应 Java InvokeCallback#operationComplete(ResponseFuture)）。
     // error 非空表示**失败**（超时、连接断开等），此时 response 无效必须忽略；
     // error 为空表示收到响应。Java 用 (response, throwable) 两个参数表达同一件事。
     using InvokeCallback = std::function<void(const RemotingCommand& response,
-                                              const std::string& error)>;
+                                              const InvokeError& error)>;
 
     // broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
     // 对应 Java NettyRemotingAbstract 的 processor 表。返回值语义与 Java
@@ -74,8 +108,10 @@ public:
 
     // 异步调用：发送后立即返回，响应到达时在读线程里触发 callback。
     // 注意 callback 在**读线程**（或超时清理线程）中执行，实现需自行保证线程安全。
-    // timeoutMillis 会登记到在途表项，超时后由清理线程以 error 回调一次（对应 Java
-    // NettyRemotingAbstract 的 scanResponseTable），不会因对端不回包而永久悬挂。
+    // timeoutMillis 会登记到在途表项，超时后由清理线程以 error(kind=TIMEOUT) 回调一次
+    // （对应 Java NettyRemotingAbstract 的 scanResponseTable），不会因对端不回包而永久悬挂。
+    // ⚠ 建连/写失败在**本函数上就地抛出**类型化异常（Java 的 invokeAsync 也这样），
+    //    调用方要 try/catch；异步回来的错误只可能是超时或 GO_AWAY 重发失败。
     void invokeAsync(const std::string& addr, RemotingCommand& request,
                      InvokeCallback callback, int32_t timeoutMillis = -1);
 

@@ -196,6 +196,23 @@ public:
                            const MessageQueue& mq, int32_t timeoutMillis = 3000,
                            int32_t sysFlag = 0, bool unitMode = false);
 
+    // 只**构建** SEND_MESSAGE 请求对象、不发送（对应 Java sendKernelImpl 建头 +
+    // MQClientAPIImpl#sendMessage 建 command）。异步发送要跨重试复用同一个请求
+    // （Java ``onExceptionImpl`` 只换 opaque、不换队列），所以建与发必须能分开。
+    RemotingCommand buildSendRequest(const std::string& producerGroup, const Message& msg,
+                                     const MessageQueue& mq, int32_t sysFlag, bool unitMode);
+    // 把应答解析成 SendResult；broker 回了非成功码时抛 MQBrokerException。
+    static SendResult parseSendResponse(const RemotingCommand& response, const Message& msg,
+                                        const MessageQueue& mq);
+    // 异步发出一笔**已建好**的请求（对应 Java MQClientAPIImpl#sendMessageAsync）。
+    // onComplete(SendResult, InvokeError) 恰好被调一次：error 为空即成功。
+    // ⚠ 与同步发送不同，broker 明确回了错误码时**不换 broker 重试**（needRetry=false），
+    //    重试策略由调用方按 Java 的分类实现（见 DefaultMQProducer::sendAsync）。
+    //    建连/写失败在本函数上就地抛出（Java 也是同步抛给调用方）。
+    void sendMessageAsync(const std::string& addr, RemotingCommand& request, const Message& msg,
+                          const MessageQueue& mq, int32_t timeoutMillis,
+                          std::function<void(const SendResult&, const InvokeError&)> onComplete);
+
     // ---------------- 定时消息撤回 ----------------
     // RECALL_MESSAGE(370)，对应 Java MQClientAPIImpl#recallMessage(:3749-3767)：
     // SUCCESS 才取响应头 msgId（被撤回消息的 uniqKey），其余码一律抛 MQBrokerException。

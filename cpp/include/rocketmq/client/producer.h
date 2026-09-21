@@ -8,6 +8,7 @@
 #ifndef ROCKETMQ_CLIENT_PRODUCER_H
 #define ROCKETMQ_CLIENT_PRODUCER_H
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "rocketmq/client/hook.h"
+#include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/latency.h"
 #include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/request_reply.h"
@@ -70,6 +72,20 @@ public:
         return retryResponseCodes_.count(responseCode) > 0;
     }
     void setMaxMessageSize(int32_t bytes) { maxMessageSize_ = bytes; }
+    // ---------------- 异步发送（对应 Java DefaultMQProducerImpl 的 AsyncSenderExecutor）----
+    // 异步链的失败重试次数。Java DefaultMQProducer:140 默认 2，与同步的
+    // retryTimesWhenSendFailed 是**两个独立**配置（同步循环用它、异步 onExceptionImpl 用它）。
+    void setRetryTimesWhenSendAsyncFailed(int32_t n) { retryTimesWhenSendAsyncFailed_ = n; }
+    int32_t getRetryTimesWhenSendAsyncFailed() const { return retryTimesWhenSendAsyncFailed_; }
+    // AsyncSenderExecutor 的队列长度（Java 是 LinkedBlockingQueue(50000)）。队满时
+    // sendAsync 向调用方抛 MQClientException("executor rejected")。
+    void setAsyncSenderQueueCapacity(int32_t n) { asyncSenderQueueCapacity_ = n; }
+    int32_t getAsyncSenderQueueCapacity() const { return asyncSenderQueueCapacity_; }
+    // 跑用户回调的线程数（Java NettyClientConfig.clientCallbackExecutorThreads）。
+    // <=0 时取 CPU 核数 —— 那才是 Java 的**默认**口径（NettyClientConfig:28 =
+    // availableProcessors，4 只是显式配 <=0 时 NettyRemotingClient 的兜底）。
+    void setClientCallbackExecutorThreads(int32_t n) { clientCallbackExecutorThreads_ = n; }
+    int32_t getClientCallbackExecutorThreads() const { return clientCallbackExecutorThreads_; }
     void setDefaultTopicQueueNums(int32_t n) { defaultTopicQueueNums_ = n; }
     void setCreateTopicKey(const std::string& key) { createTopicKey_ = key; }
     void setProducerGroup(const std::string& g);
@@ -183,8 +199,20 @@ public:
                               const std::string& arg, int32_t timeoutMillis = -1);
 
     // ---------------- 异步 / 单向 ----------------
-    // 后台线程执行发送并回调；callback 以 shared_ptr 持有，调用方可安全释放
+    // 真正的异步发送（对应 Java DefaultMQProducerImpl#send(msg, SendCallback, timeout)）：
+    // **调用方立即返回**，准备工作在 AsyncSenderExecutor_N 上跑，请求走
+    // MQClientInstance::sendMessageAsync（传输层 invokeAsync），失败按
+    // retryTimesWhenSendAsyncFailed 换 broker 重试（Java onExceptionImpl：复用同一个请求、
+    // 每次尝试换新 opaque、超时用共享的剩余预算），用户回调和 SendMessageHook.after 在
+    // NettyClientPublicExecutor_N 上跑。callback 以 shared_ptr 持有，调用方可安全释放。
+    //
+    // 与 Java 的三处有意差别（详见 cpp/README.md）：未 start() 时同步抛而不是走回调；
+    // 批量消息复用同步批量内核（只是不阻塞调用方）；没实现 Java 默认关闭的信号量背压。
     void sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback,
+                   int32_t timeoutMillis = -1);
+    // 定点异步发送：mq 非空时失败只在**同一台 broker** 上换 opaque 重试
+    // （Java send(msg, mq, callback, timeout) 传下去的 topicPublishInfo 是 null）。
+    void sendAsync(const Message& msg, const MessageQueue& mq, std::shared_ptr<SendCallback> callback,
                    int32_t timeoutMillis = -1);
     void sendOneway(const Message& msg);
 
@@ -271,6 +299,50 @@ protected:
     SendMessageContext buildSendMessageContext(const Message& msg, const MessageQueue& mq,
                                                const std::string& brokerAddr) const;
 
+    // ---------------- 异步发送链（Java AsyncSenderExecutor + sendMessageAsync）----------------
+    // 一笔异步发送从头到尾的可变状态。用 shared_ptr 传递：它同时被
+    // 「在途请求的回调」和「重试链」持有，最后一份释放时才会析构。
+    // ⚠ msg 的地址会被 SendMessageContext 以裸指针引用，所以状态必须在堆上且不再移动。
+    struct AsyncSendState {
+        Message msg;                                   // 已套 namespace、已压缩
+        std::shared_ptr<TopicPublishInfo> publish;     // nullptr = 定点发送，不换 broker
+        RemotingCommand request;                       // 跨重试复用的那一份请求
+        MessageQueue mq;                               // 当前尝试要打的队列
+        std::string brokerName;                        // 当前尝试的 broker（重选时避开）
+        std::shared_ptr<SendCallback> callback;
+        std::shared_ptr<SendMessageContext> context;   // nullptr = 无发送钩子，不建上下文
+        int32_t sysFlag = 0;                           // 压缩位，整条链只算一次
+        int32_t timeout = 0;                           // **剩余**预算（每轮扣掉已花掉的）
+        int32_t times = 0;                             // 已失败次数（Java onExceptionImpl 的 times）
+        bool pinned = false;                           // 定点发送：重试不换 broker
+        std::chrono::steady_clock::time_point attemptBegan;  // 本次尝试起点（单调钟）
+    };
+
+    // start() 里建 AsyncSenderExecutor + NettyClientPublicExecutor 两个池。
+    void createAsyncExecutors();
+    // 入口：算好超时、把准备工作投进 AsyncSenderExecutor_N（调用方在此返回）。
+    // pinned 非空时是定点异步发送：重试不换 broker（Java 传下去的 publish 是 null）。
+    void enqueueAsync(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned,
+                      int32_t timeoutMillis);
+    // 出队后的准备工作（Java sendDefaultImpl(ASYNC) → sendKernelImpl）
+    void sendAsyncInner(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned);
+    // 建请求 + before 钩子，然后发出第一笔尝试
+    void sendKernelAsync(const std::shared_ptr<AsyncSendState>& state);
+    // 一笔在途尝试（对应 Java MQClientAPIImpl#sendMessageAsync）。
+    // 就地抛出的异常（连不上、写失败）按 Java 的外层 catch 处理：**原样**传递、needRetry=true。
+    void sendAttempt(const std::shared_ptr<AsyncSendState>& state, const std::string& addr);
+    // 一笔尝试的结局（在 NettyClientPublicExecutor_N 上跑）：记容错表，然后要么收尾要么重试
+    void onAttemptComplete(const std::shared_ptr<AsyncSendState>& state, const SendResult& result,
+                           const InvokeError& error);
+    // 失败分类 + 换 broker 重试（对应 Java onExceptionImpl）
+    void onSendException(const std::shared_ptr<AsyncSendState>& state, const InvokeError& error,
+                         bool needRetry);
+    // 链的终点：先 after 钩子，再回调用户（用户回调抛的异常吞掉，不能带走回调线程）
+    void completeAsync(const std::shared_ptr<AsyncSendState>& state, const SendResult* result,
+                       const InvokeError* error);
+    // 把回调处理挪到 NettyClientPublicExecutor_N；池已关或投不进时就地跑（Java runInThisThread）
+    void executeOnCallbackThread(std::function<void()> fn);
+
     // 对应 Java endTransaction / checkTransactionState 的收尾：
     // 以 END_TRANSACTION(37, oneway) 告知 broker 事务最终状态。
     // fromCheck=true 时表示这是**回查**的收尾，偏移等字段取自 broker 的回查 header。
@@ -292,8 +364,7 @@ protected:
 
     // 最近一次 sendMessageInTransaction 使用的监听器（broker 回查时回调它）。
     // 裸引用：调用方需保证其生命周期覆盖事务回查（与 Java 的 TransactionListener 引用语义一致）。
-    TransactionListener* txListener_ = nullptr;
-    // 回查处理线程句柄，shutdown 时统一 join 回收
+    TransactionListener* txListener_ = nullptr;    // 回查处理线程句柄，shutdown 时统一 join 回收
     std::vector<std::thread> txThreads_;
     std::mutex txThreadsMutex_;
 
@@ -353,8 +424,15 @@ protected:
     std::shared_ptr<AsyncTraceDispatcher> traceDispatcher_;
     bool started_ = false;
     std::mutex lock_;
-    // 异步发送线程句柄，shutdown 时统一 join 回收
-    std::vector<std::thread> asyncThreads_;
+    // 异步发送的两个池（Java DefaultMQProducerImpl.defaultAsyncSenderExecutor 与
+    // NettyRemotingAbstract.publicExecutor）。start() 建、shutdown() 关，未启动时为空。
+    int32_t retryTimesWhenSendAsyncFailed_ = 2;
+    int32_t asyncSenderQueueCapacity_ = 50000;
+    int32_t clientCallbackExecutorThreads_ = 0;
+    // 用 shared_ptr 而不是 unique_ptr：submit 前会在锁内拷一份引用，这样即使
+    // shutdown() 同时把成员换走并排空队列，正在提交的那一次也不会摸到悬垂对象。
+    std::shared_ptr<ConsumeExecutor> asyncSenderExecutor_;
+    std::shared_ptr<ConsumeExecutor> callbackExecutor_;
 };
 
 // 事务生产者（对应 Java TransactionMQProducer）：可预设 TransactionListener

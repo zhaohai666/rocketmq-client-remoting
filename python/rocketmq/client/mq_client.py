@@ -11,7 +11,7 @@ from __future__ import annotations
 import random
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_client_id_setter import get_uniq_id, set_uniq_id
@@ -659,6 +659,44 @@ class MQClientInstance:
                                            unit_mode)
         request.mark_oneway_rpc()
         self.remoting_client.invoke_oneway(addr, request)
+
+    def build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
+                           timeout_millis: int = 3000, sys_flag: int = 0,
+                           unit_mode: bool = False) -> RemotingCommand:
+        """只**构建** SEND_MESSAGE 请求对象、不发送。
+
+        异步发送链需要跨重试复用同一个请求（Java ``onExceptionImpl:728-730`` 只做
+        ``request.setOpaque(createNewRequestId())`` 再递归），所以请求构建要拆出来给调用方持有。
+        """
+        return self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                        unit_mode)
+
+    def send_message_async(self, addr: str, request: RemotingCommand, msg: Message,
+                           mq: MessageQueue, timeout_millis: int,
+                           on_complete: Callable[[Optional[SendResult], Optional[BaseException]],
+                                                 None]) -> None:
+        """异步发出一个已构建好的发送请求（对应 Java ``MQClientAPIImpl#sendMessageAsync``）。
+
+        ``on_complete(result, error)`` 恰好回调一次（由 remoting 层保证）。响应解析也放在这一层
+        做，和 Java 一样：``processSendResponse`` 是在 ``operationSucceed`` 里调的，它抛出的
+        ``MQBrokerException`` 会流进 ``onExceptionImpl`` —— 也就是说 broker 明确回了错误码时
+        **不会**换 broker 重试（needRetry=false），只有连不上/超时/发不出去才重试。这一点和同步
+        发送的 ``retryResponseCodes`` 语义**不同**，别照搬。
+
+        抛异常（``addr`` 解析不到、remoting 层就地拒绝）不走回调，直接向上抛，
+        对应 Java ``sendMessageAsync`` 外层 try-catch 的 ``needRetry=true`` 分支。
+        """
+        def _callback(response: Optional[RemotingCommand],
+                      error: Optional[BaseException]) -> None:
+            if error is not None:
+                on_complete(None, error)
+                return
+            try:
+                on_complete(self._parse_send_response(response, msg, mq), None)
+            except Exception as parse_error:  # noqa: BLE001 — 解析失败也要交给调用方
+                on_complete(None, parse_error)
+
+        self.remoting_client.invoke_async(addr, request, _callback, timeout_millis)
 
     def _build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
                             timeout_millis: int = 3000, sys_flag: int = 0,

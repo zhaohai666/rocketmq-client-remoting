@@ -68,6 +68,16 @@ class RemotingCommand:
 
     # ---------------- 工厂方法 ----------------
     @staticmethod
+    def create_new_request_id() -> int:
+        """对应 Java ``RemotingCommand.createNewRequestId()``。
+
+        异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque
+        （Java ``onExceptionImpl:728``）：旧请求还挂在 responseTable 里等超时，
+        复用 opaque 会让两次尝试的应答串台。
+        """
+        return next(_request_id)
+
+    @staticmethod
     def create_request_command(code: int, custom_header=None) -> "RemotingCommand":
         cmd = RemotingCommand(code=code, custom_header=custom_header)
         _set_cmd_version(cmd)

@@ -101,7 +101,8 @@ def broker_error(exc: BaseException):
 def new_producer(group: str, instance: str) -> DefaultMQProducer:
     """instance_name 必须各不相同。
 
-    本实现的 clientId = ``<instanceName>@<秒级时间戳>``，同秒内建的两个客户端会撞名；
+    clientId 对齐 Java ``ClientConfig#buildMQClientId`` = ``<本机IP>@<instanceName>``
+    （没有秒级时间戳兜底），所以同一台机器上只有 instanceName 不同才能保证 clientId 不同；
     而 REPLY_TO_CLIENT 用的就是 clientId，撞名会让 broker 把应答推到错误的那条连接上。
     """
     p = DefaultMQProducer(group)
@@ -240,7 +241,8 @@ def main() -> int:
             check("S2 请求消息带 CORRELATION_ID（uuid 字符串）",
                   bool(corr) and len(corr) == 36, "corr=%s" % corr)
             check("S2 请求消息带 REPLY_TO_CLIENT=请求方 clientId",
-                  bool(reply_to) and reply_to.startswith("RRReq@"), "reply_to=%s" % reply_to)
+                  reply_to == requester._require_client().client_id,
+                  "reply_to=%s want=%s" % (reply_to, requester._require_client().client_id))
             check("S2 请求消息带 TTL=timeout", ttl == str(REQUEST_TIMEOUT), "ttl=%s" % ttl)
 
         # ---------------- S4 应答确实走了 325 且落到了 REPLY_TOPIC ----------------

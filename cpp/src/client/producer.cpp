@@ -69,13 +69,6 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
     return out;
 }
 
-// 异步发送线程的递增序号，用于线程命名（对齐 Java 线程工厂 "AsyncSenderThread_" + n 的后缀）。
-// 进程级递增，与 Java 的 ThreadFactoryImpl 计数器语义一致。
-int nextAsyncSenderSeq() {
-    static std::atomic<int> seq{0};
-    return seq.fetch_add(1, std::memory_order_relaxed);
-}
-
 // 发送前确保消息带有 UNIQ_KEY（32 位十六进制唯一 ID），与 Java MessageClientIDSetter.setUniqID
 // 对齐：缺失才生成，已存在则保留（幂等）。轨迹钩子用它在 SendResult.msgId 里回填 UNIQ_KEY，
 // 从而让发送侧轨迹的 msgId == UNIQ_KEY（非 offsetMsgId）。
@@ -193,6 +186,9 @@ void DefaultMQProducer::start() {
             // 不回响应：broker 用 invokeOneway 发回查，与 Java checkTransactionState 返回 null 一致。
             return std::nullopt;
         });
+    // 异步发送的两个线程池：必须在 started_ 置位前建好，否则 sendAsync 会看到
+    // "已启动但池子为空"。
+    createAsyncExecutors();
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
 
@@ -219,14 +215,32 @@ void DefaultMQProducer::start() {
 }
 
 void DefaultMQProducer::shutdown() {
-    std::vector<std::thread> threads;
+    std::shared_ptr<ConsumeExecutor> asyncSender;
+    std::shared_ptr<ConsumeExecutor> callbackPool;
     {
         std::lock_guard<std::mutex> lk(lock_);
         if (!started_) {
             return;
         }
+        // 先把两个池摘掉：之后的 sendAsync 会看到 "producer already shutdown"。
+        // ⚠ started_ 要等队列排空之后再翻 —— 排队里的异步发送还要用 client()，
+        //   提前置 false 会让它们以"producer not started"失败，等于静默丢消息。
+        asyncSender.swap(asyncSenderExecutor_);
+        callbackPool.swap(callbackExecutor_);
+    }
+    // 先回收异步发送的两个池（它们的任务内部持有 mqClient_ 引用），再关客户端。
+    // ⚠ 与 Java 的差别：Java 的 defaultAsyncSenderExecutor.shutdown() **不等**在途任务
+    // （GC 兜住了回调里引用的对象），C++ 里回调打在一个已析构的生产者上是 UB，
+    // 所以必须先跑完再放行。副作用是"发完立刻 shutdown"在这里不会丢在途回调。
+    if (asyncSender) {
+        asyncSender->shutdown(true);
+    }
+    if (callbackPool) {
+        callbackPool->shutdown(true);
+    }
+    {
+        std::lock_guard<std::mutex> lk(lock_);
         started_ = false;
-        threads.swap(asyncThreads_);
     }
     // 先关轨迹分发器：它会把队列里剩余的轨迹强刷出去，再关内部生产者。
     // 必须在 mqClient_->shutdown() 之前 —— 刷写要发消息，得有自己的传输层。
@@ -237,10 +251,6 @@ void DefaultMQProducer::shutdown() {
             logger_warn(std::string("trace dispatcher shutdown failed: ") + e.what());
         }
         traceDispatcher_.reset();
-    }
-    // 先回收异步线程（它们内部持有 mqClient_ 引用），再关客户端
-    for (std::thread& t : threads) {
-        if (t.joinable()) t.join();
     }
     // 先停心跳线程（它内部持有 mqClient_ 引用），再回收其它线程
     heartbeatRunning_.store(false);
@@ -257,6 +267,8 @@ void DefaultMQProducer::shutdown() {
             if (t.joinable()) t.join();
         }
     }
+    // 这一步 join 掉连接的读线程与超时清理线程：返回后不可能再有异步回调打进本对象，
+    // 生产者的析构才是安全的（executeOnCallbackThread 在池子没了之后就地跑）。
     if (mqClient_) {
         mqClient_->shutdown();
     }
@@ -647,25 +659,360 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
 }
 
 // ---------------------------------------------------------------- 异步 / 单向
+// 异步链逐段对应 Java：
+//   DefaultMQProducerImpl:133-140  AsyncSenderExecutor（core==max==CPU 核数、队列 50000）
+//   DefaultMQProducerImpl:553-575  出队才算耗时，预算被排队吃光就直接失败
+//   DefaultMQProducerImpl:756      ASYNC 的 timesTotal 恒为 1（换 broker 全在 onExceptionImpl）
+//   MQClientAPIImpl:616-702        sendMessageAsync：成功/失败分类 + 容错表
+//   MQClientAPIImpl:704-743        onExceptionImpl：复用请求、换新 opaque、共享剩余预算
+//   NettyRemotingAbstract:488-517  回调挪到 NettyClientPublicExecutor，不占连接读线程
+namespace {
+
+// 一次尝试的耗时（整数毫秒，Java 全程用毫秒）
+int32_t elapsedMs(const std::chrono::steady_clock::time_point& from) {
+    return static_cast<int32_t>(elapsedMillis(from));
+}
+
+// 对应 Java ``MQClientAPIImpl:680-693`` 的 operationFail 分类：**按异常类型**决定文案和
+// 要不要重试。注意"响应已到达但处理失败"（RESPONSE_FAILED）时 Java 走的是
+// operationSucceed 里的 catch（:669-673，needRetry=false），和同步发送按
+// retryResponseCodes 换 broker 的语义**不同**，别顺手"统一"掉。
+// 文本逐字对齐 Java/Python，跨端对比时看的就是这几个短语。
+void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* wrapped,
+                          bool* needRetry) {
+    switch (error.kind) {
+        case InvokeError::Kind::SEND_REQUEST:
+            *wrapped = InvokeError(InvokeError::Kind::OTHER, "send request failed");
+            *needRetry = true;
+            return;
+        case InvokeError::Kind::TIMEOUT:
+            *wrapped = InvokeError(InvokeError::Kind::OTHER,
+                                   "wait response timeout, cost=" + std::to_string(cost));
+            *needRetry = true;
+            return;
+        case InvokeError::Kind::RESPONSE_FAILED:
+            *wrapped = error;  // 原样交给回调，不包装
+            *needRetry = false;
+            return;
+        case InvokeError::Kind::TOO_MUCH_REQUEST:
+            *wrapped = InvokeError(InvokeError::Kind::OTHER, "unknown reason");
+            *needRetry = false;  // Java: !(t instanceof RemotingTooMuchRequestException)
+            return;
+        default:
+            *wrapped = InvokeError(InvokeError::Kind::OTHER, "unknown reason");
+            *needRetry = true;
+            return;
+    }
+}
+
+}  // namespace
+
+void DefaultMQProducer::createAsyncExecutors() {
+    // Java 的两个池都以 availableProcessors 为大小；本机的 CPU 数在 ConsumeExecutor
+    // 里从 1 开始编号，线程名 "AsyncSenderExecutor_1"、"NettyClientPublicExecutor_1"。
+    int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
+    if (cores <= 0) {
+        cores = 1;  // 取不到 CPU 数时按 1 核算，不能建出一个跑不动任务的池
+    }
+    asyncSenderExecutor_ = std::make_shared<ConsumeExecutor>(
+        cores, cores, 60.0, "AsyncSenderExecutor", asyncSenderQueueCapacity_, "_", 1);
+    int32_t callbackThreads = clientCallbackExecutorThreads_;
+    if (callbackThreads <= 0) {
+        callbackThreads = cores;  // Java NettyClientConfig:28 的默认就是 availableProcessors
+    }
+    callbackExecutor_ = std::make_shared<ConsumeExecutor>(
+        callbackThreads, callbackThreads, 60.0, "NettyClientPublicExecutor", 0, "_", 1);
+}
+
 void DefaultMQProducer::sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback,
                                   int32_t timeoutMillis) {
+    auto state = std::make_shared<AsyncSendState>();
+    state->msg = msg;
+    state->callback = std::move(callback);
+    enqueueAsync(state, nullptr, timeoutMillis);
+}
+
+void DefaultMQProducer::sendAsync(const Message& msg, const MessageQueue& mq,
+                                  std::shared_ptr<SendCallback> callback, int32_t timeoutMillis) {
+    auto state = std::make_shared<AsyncSendState>();
+    state->msg = msg;
+    state->callback = std::move(callback);
+    enqueueAsync(state, &mq, timeoutMillis);
+}
+
+void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& state,
+                                     const MessageQueue* pinned, int32_t timeoutMillis) {
     // 先确认已启动（与 Python 一致：未启动立即抛，而不是在后台线程里静默失败）
     (void)client();
-    int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
-    std::thread th([this, msg, callback, timeout]() {
-        // 线程名对齐 Java 的 ThreadFactoryImpl("AsyncSenderThread_")
-        setThreadName("AsyncSenderThread_" + std::to_string(nextAsyncSenderSeq()));
+    std::shared_ptr<ConsumeExecutor> pool;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        pool = asyncSenderExecutor_;
+    }
+    if (pool == nullptr) {
+        throw MQClientException("producer already shutdown");
+    }
+    const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
+    state->timeout = timeout;
+    if (pinned != nullptr) {
+        state->mq = *pinned;
+        state->pinned = true;
+    }
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    try {
+        pool->submit([this, state, began, timeout]() {
+            // 出队之后才算真实耗时：Java 的 runnable 用 `timeout > costTime` 把关，
+            // 排队已经把预算吃光时连请求都不建。
+            const int32_t cost = elapsedMs(began);
+            if (timeout <= cost) {
+                const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
+                                          "DEFAULT ASYNC send call timeout");
+                completeAsync(state, nullptr, &tooMuch);
+                return;
+            }
+            state->timeout = timeout - cost;
+            try {
+                sendAsyncInner(state, state->pinned ? &state->mq : nullptr);
+            } catch (const std::exception& e) {
+                // Java：runnable 的 catch → newCallBack.onException(e)
+                const InvokeError err(InvokeError::Kind::OTHER, e.what());
+                completeAsync(state, nullptr, &err);
+            } catch (...) {
+                const InvokeError err(InvokeError::Kind::OTHER, "unknown error");
+                completeAsync(state, nullptr, &err);
+            }
+        });
+    } catch (const RejectedExecutionError& e) {
+        // Java DefaultMQProducerImpl:635-682：executor.submit 抛
+        // RejectedExecutionException → MQClientException("executor rejected ")
+        throw MQClientException("executor rejected");
+    }
+}
+
+void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& state,
+                                       const MessageQueue* pinned) {
+    MQClientInstance& c = client();
+    checkMessage(state->msg);
+    state->msg = withNamespace(state->msg);
+    ensureUniqId(state->msg);
+    // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
+    state->sysFlag = prepareForSend(state->msg);
+    if (pinned != nullptr) {
+        // Java send(msg, mq, cb, timeout) → sendKernelImpl 直接定点发，传下去的
+        // topicPublishInfo 是 null，所以失败只会在**同一台 broker** 上换 opaque 重试。
+        sendKernelAsync(state);
+        return;
+    }
+    // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉
+    try {
+        state->publish = c.getTopicPublishInfo(state->msg.topic, /*isDefault=*/true);
+    } catch (const MQClientException& e) {
+        throw MQClientException(e.what(), ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
+    }
+    // ASYNC 的 timesTotal 固定为 1：外层只跑一次，换 broker 全在 onSendException 里
+    MessageQueue selected =
+        mqFaultStrategy_.selectOneMessageQueue(*state->publish, std::string(), false);
+    if (selected.brokerName.empty()) {
+        throw MQClientException("Send [0] times, still failed, Topic: " + state->msg.topic
+                                + ", BrokersSent: []");
+    }
+    state->mq = MessageQueue(state->msg.topic, selected.brokerName, selected.queueId);
+    sendKernelAsync(state);
+}
+
+void DefaultMQProducer::sendKernelAsync(const std::shared_ptr<AsyncSendState>& state) {
+    MQClientInstance& c = client();
+    // Java sendKernelImpl:917 —— beginStartTime 每次进 sendKernelImpl 都重取；
+    // 重试链走的是 sendMessageAsync，不经过这里，所以这道闸一次发送只算一次。
+    const std::chrono::steady_clock::time_point beginKernel = std::chrono::steady_clock::now();
+    state->brokerName = state->mq.brokerName;
+
+    // 地址解析两步，与 Java sendKernelImpl:919-924 一致：先查已缓存的发布地址，
+    // 查不到再按 topic 刷一次路由然后重查。定点发送（pinned）不会在
+    // sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，
+    // 第一次定点发送必然拿到空地址。
+    std::string brokerAddr;
+    try {
+        brokerAddr = c.brokerAddrOf(state->mq.brokerName);
+    } catch (const std::exception& e) {
+        // 查缓存不该抛，真抛了也只是降级成"没查到"，交给下一步刷路由
+        logger_debug("async send: cached address lookup failed: " + std::string(e.what()));
+    }
+    if (brokerAddr.empty()) {
         try {
-            SendResult result = send(msg, timeout);
-            if (callback) callback->onSuccess(result);
+            brokerAddr = c.brokerAddrForMq(state->mq);
         } catch (const std::exception& e) {
-            if (callback) callback->onException(e.what());
-        } catch (...) {
-            if (callback) callback->onException("unknown error");
+            logger_debug("async send: address unresolved after route refresh: "
+                         + std::string(e.what()));
         }
-    });
-    std::lock_guard<std::mutex> lk(lock_);
-    asyncThreads_.push_back(std::move(th));
+    }
+    if (brokerAddr.empty()) {
+        // Java sendKernelImpl:1100
+        throw MQClientException("The broker[" + state->brokerName + "] not exist");
+    }
+    if (hasCheckForbiddenHook()) {
+        runCheckForbidden(state->msg, state->mq, brokerAddr, nullptr, CommunicationMode::ASYNC);
+    }
+    if (enableTraceContext_) {
+        injectTraceContext(&state->msg);
+    }
+    // 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），
+    // 所以 header 里的 queueId 也跟着第一次那次 —— 这是 Java 的真实行为，别"修"它。
+    state->request =
+        c.buildSendRequest(producerGroup_, state->msg, state->mq, state->sysFlag, unitMode_);
+    if (hasSendMessageHook()) {
+        state->context = std::make_shared<SendMessageContext>(
+            buildSendMessageContext(state->msg, state->mq, brokerAddr));
+        executeSendMessageHookBefore(*state->context);
+    }
+    // Java sendKernelImpl:1043-1046：ASYNC 分支自己的总闸 —— 钩子、压缩、路由
+    // 都算耗时，预算被它们吃光就不再发起请求（RemotingTooMuchRequestException 是
+    // RemotingException 的子类，所以会先走 :1088 的 hook.after 再抛给回调）。
+    const int32_t costAsync = elapsedMs(beginKernel);
+    if (state->timeout < costAsync) {
+        const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
+                                  "sendKernelImpl call timeout");
+        completeAsync(state, nullptr, &tooMuch);
+        return;
+    }
+    state->timeout -= costAsync;
+    sendAttempt(state, brokerAddr);
+}
+
+void DefaultMQProducer::sendAttempt(const std::shared_ptr<AsyncSendState>& state,
+                                    const std::string& addr) {
+    state->attemptBegan = std::chrono::steady_clock::now();
+    try {
+        mqClient_->sendMessageAsync(addr, state->request, state->msg, state->mq, state->timeout,
+                                    [this, state](const SendResult& result,
+                                                  const InvokeError& error) {
+                                        // 回调处理挪到 NettyClientPublicExecutor：
+                                        // 这里是连接读线程/超时清理线程，不能跑业务代码
+                                        SendResult copy = result;
+                                        InvokeError err = error;
+                                        executeOnCallbackThread([this, state, copy, err]() {
+                                            onAttemptComplete(state, copy, err);
+                                        });
+                                    });
+    } catch (const std::exception& e) {
+        // Java sendMessageAsync 的外层 catch：就地失败（连不上/通道没了），
+        // 异常**原样**传递（不包装）、needRetry=true
+        const int32_t cost = elapsedMs(state->attemptBegan);
+        mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, false);
+        state->timeout -= cost;
+        const InvokeError raw(InvokeError::Kind::OTHER, e.what());
+        onSendException(state, raw, true);
+    } catch (...) {
+        const int32_t cost = elapsedMs(state->attemptBegan);
+        mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, false);
+        state->timeout -= cost;
+        const InvokeError raw(InvokeError::Kind::OTHER, "unknown error");
+        onSendException(state, raw, true);
+    }
+}
+
+void DefaultMQProducer::onAttemptComplete(const std::shared_ptr<AsyncSendState>& state,
+                                          const SendResult& result, const InvokeError& error) {
+    const int32_t cost = elapsedMs(state->attemptBegan);
+    if (error.empty()) {
+        mqFaultStrategy_.updateFaultItem(state->brokerName, cost, false, true);
+        completeAsync(state, &result, nullptr);
+        return;
+    }
+    mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, true);
+    InvokeError wrapped;
+    bool needRetry = false;
+    classifyAsyncFailure(error, cost, &wrapped, &needRetry);
+    // Java operationFail:678-693 —— 换 broker 之前记一次原文，否则包装之后查不到真因
+    logger_warn("async send to broker " + state->brokerName + " failed: " + error.message
+                + " (reported as " + wrapped.message + ")");
+    // 超时预算是**所有尝试共享**的剩余时间，不是每次尝试各给一份
+    state->timeout -= cost;
+    onSendException(state, wrapped, needRetry);
+}
+
+void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& state,
+                                        const InvokeError& error, bool needRetry) {
+    state->times += 1;
+    if (needRetry && state->times <= retryTimesWhenSendAsyncFailed_ && state->timeout > 0) {
+        std::string retryBroker = state->brokerName;
+        if (state->publish != nullptr) {
+            // 第三个参数是 false：按 lastBrokerName 避开刚失败的那台
+            MessageQueue selected = mqFaultStrategy_.selectOneMessageQueue(
+                *state->publish, state->brokerName, false);
+            if (!selected.brokerName.empty()) {
+                state->mq = MessageQueue(state->msg.topic, selected.brokerName, selected.queueId);
+                retryBroker = selected.brokerName;
+            }
+        }
+        std::string addr;
+        try {
+            addr = client().brokerAddrOf(retryBroker);
+        } catch (const std::exception& e) {
+            logger_debug("async send retry: broker address unresolved: "
+                         + std::string(e.what()));
+        }
+        if (addr.empty()) {
+            // 路由里连这台 broker 的地址都没了，再试也没有意义
+            completeAsync(state, nullptr, &error);
+            return;
+        }
+        logger_warn("async send msg by retry " + std::to_string(state->times) + " times. topic="
+                    + state->msg.topic + ", brokerAddr=" + addr + ", brokerName=" + retryBroker
+                    + ": " + error.message);
+        state->brokerName = retryBroker;
+        // 换新 opaque：旧请求还挂在在途表里等超时，复用会把两次尝试的应答串台
+        state->request.opaque = RemotingCommand::nextOpaque();
+        sendAttempt(state, addr);
+        return;
+    }
+    completeAsync(state, nullptr, &error);
+}
+
+void DefaultMQProducer::executeOnCallbackThread(std::function<void()> fn) {
+    // Java NettyRemotingAbstract.executeInvokeCallback：能交给 publicExecutor 就交出去，
+    // 池子不可用（未启动/已关/队满）时**就地跑**，与 Java 的 runInThisThread 一致。
+    std::shared_ptr<ConsumeExecutor> pool;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        pool = callbackExecutor_;
+    }
+    if (pool == nullptr) {
+        fn();
+        return;
+    }
+    try {
+        pool->submit(std::move(fn));
+    } catch (const RejectedExecutionError&) {
+        fn();
+    }
+}
+
+void DefaultMQProducer::completeAsync(const std::shared_ptr<AsyncSendState>& state,
+                                      const SendResult* result, const InvokeError* error) {
+    // 异步链的终点：先跑 SendMessageHook.after，再回调用户
+    if (state->context != nullptr) {
+        if (result != nullptr) {
+            state->context->sendResult = result;
+        } else if (error != nullptr) {
+            state->context->exception = error->message;
+        }
+        executeSendMessageHookAfter(*state->context);
+    }
+    if (state->callback == nullptr) {
+        return;
+    }
+    try {
+        if (error != nullptr) {
+            state->callback->onException(error->message);
+        } else {
+            state->callback->onSuccess(*result);
+        }
+    } catch (...) {
+        // 用户回调抛的异常必须吞掉（Java 两处都是 catch Throwable），
+        // 否则它会带走回调线程池的 worker。
+        logger_warn("sendAsync callback threw an exception");
+    }
 }
 
 void DefaultMQProducer::sendOneway(const Message& msg) {

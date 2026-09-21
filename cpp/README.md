@@ -16,6 +16,7 @@ libzstd 可选，找不到就只关那一个后端），网络层手写而不是
 | 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、**GO_AWAY(1500) 换连接重发一次**、SIGPIPE 处理 |
 | 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData` |
 | 客户端 | `MQClientInstance`、`DefaultMQProducer`、`DefaultMQPushConsumer`、`DefaultMQPullConsumer`、`DefaultLitePullConsumer`、**`DefaultMQAdminExt`** |
+| 异步发送 | `sendAsync`（含定点 `sendAsync(msg, mq, cb)`）跑在真实的 `AsyncSenderExecutor_1..N`（core==max==CPU 核数、有界队列 50000）上，调用方不阻塞；`retryTimesWhenSendAsyncFailed` 的换 broker 重试链只在 remoting 层失败时继续（已收到响应的错误码原样回调、不重试），重试**复用同一请求**只换 opaque，超时预算是整条链共享的剩余时间；用户回调与 `SendMessageHook.after` 在 `NettyClientPublicExecutor_N` 上跑，回调抛异常吞掉不带走 worker |
 | 校验门 | `Validators` / `TopicValidator`：`checkTopic` / `checkGroup` / `isSystemTopic` / `isNotAllowedSendTopic` / `checkMessage`，四类 facade 的 `start()` 在建客户端实例**之前**跑完组名校验（纯本地判定，失败不碰网络） |
 | 压缩 | zlib / LZ4 Frame / ZSTD 三后端：生产端自动压缩 + 消费端自动解压（与 Java lz4-java、zstd-jni 的线上帧格式互通；`-DRMQ_WITH_ZLIB=OFF` 等可逐个关） |
 
@@ -53,37 +54,39 @@ RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 28 个用例，2638 项断言，~17s
+cd build && ctest --output-on-failure     # 29 个用例，2813 项断言，~24s
 ```
 
 | 用例 | 断言 | 覆盖 |
 | --- | --- | --- |
 | `codec` | 65 | JSON / ROCKETMQ / `RemotingCommand` 两路 / 消息 17 段与 6 段 / header V1↔V2 / hashCode / CRC32 / msgId |
 | `java_alignment` | 32（带 `ROCKETMQ_JAVA_SRC` 为 38） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对 |
-| `route_heartbeat` | 95 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
-| `transport` | 53 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、**GO_AWAY 重发（同步+异步、只重发一次、开关关掉不重连）**、地址解析 |
+| `route_heartbeat` | 99 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
+| `transport` | 55 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、**GO_AWAY 重发（同步+异步、只重发一次、开关关掉不重连）**、地址解析 |
 | `compression` | 152 | 三后端：类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib / **LZ4 Frame** / **ZSTD** 往返、**外部硬编码真值夹具**（Python zlib.compress、Java lz4-java、zstd-jni、`zstd -3` CLI 各产的帧）、帧头 magic 与 LZ4 block-independence 位、17 段报文 × 三种类型、解压后清 flag、后端缺失或未知类型必须抛错而非交出压缩流 |
 | `admin` | 159 | fastjson2 非法 JSON 容错、`ConsumeStatsList` 的 **Java 字段名 `consumeStatsList`**（键名错一个字符就静默解析成空列表）、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
-| `acl` | 37 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
+| `acl` | 56 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
 | `request_reply` | 37 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时 |
 | `latency` | 31 | 故障规避：延迟窗口滑窗统计、可用性判定、broker 隔离与恢复、`sendLatencyFaultEnable` 开关 |
 | `send_retry` | 57 | `sendDefaultImpl` 重试分类语义（进程内 mock 集群 + 真 socket）：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离；同一套抓包还取证明线上报文（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据） |
+| `producer_async` | 100 | 真异步发送链（进程内 mock broker + 真 socket）：`sendAsync` 立刻返回、准备工作和请求都在 `AsyncSenderExecutor_N` 上、回调与 `SendMessageHook.after` 在 `NettyClientPublicExecutor_N` 上；出队后才算耗时（预算被排队吃光一次请求都不发）；只有 remoting 层失败才重试且重试**复用同一请求**只换 opaque；超时预算是整条链共享的剩余时间；已收到响应但 broker 报错码**不重试不包装**；定点发送只在同一台 broker 上重试、且必须自己刷出路由；队满把 `executor rejected` 抛给调用方；回调抛异常被吞掉 |
 | `pop` | 93 | POP 协议管道：CK 反构（8 段 + `startOffsetInfo`/`msgOffsetInfo` 下标选择）、`bornTime`、ACK offset 语义 |
 | `pop_consumer` | 47 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制 |
 | `trace` | 92 | 消息轨迹：与 Java 官方实现的**逐字节对拍**（Pub / SubBefore / SubAfter / EndTransaction / Recall）+ 编解码双向 + 无 keys 空段容错 + 坏记录隔离 + 分发器分组/切块 |
 | `hook` | 65 | `CheckForbiddenHook`（异常不吞、沿重试链传播）+ `FilterMessageHook`（可变 msgList、摘掉即静默跳过）+ 钩子异常隔离 |
 | `consume_thread_pool` | 61 | 消费端有界 core/max 执行器：真实并发度 == corePoolSize、`setConsumeThreadNums` 生效、`updateCorePoolSize` 运行时调并发 |
-| `top_addressing` | 23 | 动态 name server：WS 地址 / unitName / para 拼装、`clearNewLine`、非 200 与连接失败回退为空 |
+| `top_addressing` | 37 | 动态 name server：WS 地址 / unitName / para 拼装、`clearNewLine`、非 200 与连接失败回退为空 |
 | `consumer_stats` | 24 | `ConsumerStatsManager` 采样（sum/tps 窗口端点差分，不依赖真实时钟）+ `ConsumeStatus` / `ConsumerRunningInfo`(307) 编码 |
 | `trace_context` | 24 | W3C `traceparent` 生成/校验/子 span/注入不覆盖/属性提取 |
-| `interop` | 70 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
+| `interop` | 73 | C++ ↔ Python 双向编解码 + 路由/心跳结构体双向语义等价 |
 | `lite_pull` | 31 | `DefaultLitePullConsumer` 无网络状态机（subscribe/assign/seek/poll/committed）+ 221/309 应答体 wire 形状 |
 | `allocate_strategy` | 1167 | 六个策略与 Java 单测逐条对拍：`AVG` / `AVG_BY_CIRCLE` 的 Java 用例（10/4、7/3、边界队列续接）、四道 `check` 守卫的返回口径（本端口返回空结果而非 Java 的 `IllegalArgumentException`）、`CONFIG` 不查守卫且返回副本、`getName()` 与 Java 常量一致（六个名字齐全）、N 消费者恰好不重不漏覆盖每个队列、与 Python/Rust 参考实现的公式对拍、多 broker 真实队列、三类消费者（push / pull / lite）默认 AVG 且可替换，策略为 null 时 `start()` 用 Java `checkConfig` 的文案拒绝；**`CONSISTENT_HASH`** 用 Java 实测的哈希环表逐格对拍（6×2/6×3/10×4/20×10 与 vc=10 的 4×2/8×3、覆盖矩阵、注入自定义 `HashFunction` 后的 TreeMap 撞坑退化）、**`MACHINE_ROOM`** 的 `[0,1,4]/[2,3]` 分片与 `String#split("@")` 的 8 行裁尾空段真值表、**`MACHINE_ROOM_NEARBY-<内层>`** 的同机房优先 + 无消费者机房由全员共享（Java 单测的精确顺序）与 resolver 空机房**抛错**（保住上一轮分配） |
 | `consistent_hash` | 42 | 一致性哈希环 + 自带 MD5：RFC 1321 附录 A 全向量（含 55/56/57/64/65/200 字节的填充边界）与 Java `hash()` 取前 4 字节大端的真值、环的路由稳定性与越过末尾回绕、空环返回 null、负虚拟节点数只在 `addNode` 抛、`i + existingReplicas` 的副本下标不重叠、`removeNode` 不误伤别的节点、注入自定义 hash 生效、`ringHashes()` 严格升序 |
 | `validators` | 75 | 名字校验：字符表（码点 >=128 一律非法）与正则口径、12 个系统 topic / 8 个禁发 topic 名单（`TBW102` 可发、`%RETRY%` 可发）、`checkTopic`/`checkGroup` 的 blank→长度(127/120)→字符表顺序与文案逐字、`checkMessage` 只有 body 档位带 `MESSAGE_ILLEGAL(13)`、LMQ 分隔符、四类 facade 的 `start()` 组名门在建实例之前 |
 | `broker_requests` | 11 | broker 反向请求 `NOTIFY_CONSUMER_IDS_CHANGED`(40)：注册在**实例级**的 clientRemotingProcessor（各消费者重复注册会互相覆盖）、计数 + 整组唤醒、`unregisterRebalanceWakeup` 后不再被叫醒但通知仍被处理、缺 `consumerGroup` 不抛、shutdown 清掉唤醒表 |
-| `client_id` | 17 | clientId 口径与 Java `ClientConfig` 对拍：`buildMqClientId` 的 `ip@instanceName[@unitName]`（空白 unitName 不拼）、`changeInstanceNameToPID` 只改默认名且幂等、四类 facade `start()` 盖出的 `<ip>@<pid>#<nanoTime>`、同进程两个生产者不撞号、广播消费者保持 `DEFAULT`、显式 instanceName 原样透传 |
+| `check_client_config` | 32 | broker 侧客户端配置校验 `CHECK_CLIENT_CONFIG`(46)：请求头为 **null**（线上没有 extFields）、body 是 `CheckClientRequestBody` 的 JSON、非 SUCCESS 抛 `MQClientException(响应码, remark)`；只发非 TAG 订阅（`null`/`""`/`TAG` 都算 TAG）、地址走**只读缓存**的 `findBrokerAddrByTopic` 且取不到就跳过、网络类异常换成固定文案、超时用 `mqClientApiTimeout`(3000ms) |
+| `client_id` | 32 | clientId 口径与 Java `ClientConfig` 对拍：`buildMqClientId` 的 `ip@instanceName[@unitName]`（空白 unitName 不拼）、`changeInstanceNameToPID` 只改默认名且幂等、四类 facade `start()` 盖出的 `<ip>@<pid>#<nanoTime>`、同进程两个生产者不撞号、广播消费者保持 `DEFAULT`、显式 instanceName 原样透传 |
 | `recall_message` | 28 | 定时消息撤回 `recallMessage`(370)：句柄编解码与 **Java `buildHandle` 真值向量**对拍（含无填充句柄、6 段新版本、v2/段数不足/非法 utf-8 全部按 Java 文案 `"recall handle is invalid"` 拒）、`RecallMessageRequestHeader` 逐键守卫（继承字段反射名是 **`bname`** 而不是 `brokerName`）、`SendMessageResponseHeader.recallHandle` 往返、producer 本地校验顺序（未 start / `%RETRY%` / `%DLQ%` / 非法句柄都在打网络**之前**秒回，路由拿不到时预热带异常照抛） |
 
 ```bash
@@ -123,7 +126,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
-| `rmq_live_message_types` | 19/19 | 异步发送 / 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 批量发送（320，投成 3 条独立消息且 offset 连续）/ 心跳注册 |
+| `rmq_live_message_types` | 20/20 | 异步发送（`sendAsync` 不阻塞调用方 + 定点 `sendAsync(msg, mq)` 在全新实例上自己刷出路由）/ 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 批量发送（320，投成 3 条独立消息且 offset 连续）/ 心跳注册 |
 | `rmq_admin_live` | 57 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → `resetOffsetByQueueId`（25 + 带 queueId/offset 的 222：重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构）→ `queryTopicsByConsumer(group)`（按 `%RETRY%` 路由扇出合并）与 `queryTopicsByConsumerToBroker` → 清理 |
 | `rmq_compression_live` | 10 PASS | 三后端（zlib / LZ4 Frame / ZSTD）自动压缩自产自销 + **与真实 Java/Python/.NET/Rust 客户端双向互通**（互通矩阵见 `../scripts/compression_matrix.sh`）；构建时未编入的后端打 SKIP |
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |

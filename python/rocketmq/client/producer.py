@@ -7,11 +7,12 @@ LocalTransactionState / TransactionListener 等。
 """
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
 from enum import Enum
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
@@ -23,7 +24,8 @@ from ..common.mix_all import MixAll
 from ..common.sysflag import MessageSysFlag
 from ..logging import get_logger
 from ..remoting.exception import (RemotingConnectException, RemotingException,
-                                  RemotingTimeoutException, RemotingTooMuchRequestException)
+                                  RemotingSendRequestException, RemotingTimeoutException,
+                                  RemotingTooMuchRequestException)
 from ..remoting.protocol.codes import RequestCode, ResponseCode
 from ..remoting.protocol.headers import (CheckTransactionStateRequestHeader,
                                          EndTransactionRequestHeader,
@@ -32,6 +34,7 @@ from ..remoting.protocol.heartbeat import HeartbeatData, ProducerData
 from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
+from .consume_executor import ConsumeExecutor, RejectedExecutionError
 from .exception import (ClientErrorCode, MQBrokerException, MQClientException,
                         RequestTimeoutException)
 from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
@@ -74,6 +77,25 @@ class _NullSendCallback:
             self.future.send_request_ok = False
             self.future.put_response_message(None)
             self.future.cause = e
+
+
+def _classify_async_failure(error: BaseException,
+                            cost: int) -> Tuple[BaseException, bool]:
+    """对应 Java ``sendMessageAsync`` 里 ``operationFail`` 的三分支：包装 + 判定能否重试。
+
+    ⚠ 只有 remoting 层抛回来的异常走这里。**已经收到响应**、但 ``processSendResponse``
+    判定为失败的错误（``MQBrokerException``）不走这里 —— Java 那条路径传的是
+    ``needRetry=false`` 且**原样**抛出。也就是说异步发送**不看** ``retryResponseCodes``：
+    broker 明确回了错就不会换 broker 重试。别和同步发送的语义混为一谈。
+    """
+    if isinstance(error, RemotingSendRequestException):
+        return MQClientException("send request failed", None, error), True
+    if isinstance(error, RemotingTimeoutException):
+        return MQClientException("wait response timeout, cost=%d" % cost, None, error), True
+    if isinstance(error, RemotingException):
+        retry = not isinstance(error, RemotingTooMuchRequestException)
+        return MQClientException("unknown reason", None, error), retry
+    return error, False
 
 
 class MessageQueueSelector:
@@ -240,6 +262,15 @@ class DefaultMQProducer:
         # Request-Reply 的默认超时。Java 的 request(msg, timeout) 必须显式给 timeout，
         # 这里额外提供一个可设置的默认值，方便脚本调用（语义与显式传参完全一致）。
         self.request_timeout = DEFAULT_REQUEST_TIMEOUT_MILLIS
+        # ---- 异步发送（对应 Java DefaultMQProducerImpl 的 asyncSenderThreadPoolQueue +
+        # defaultAsyncSenderExecutor，以及 NettyRemotingClient 的 publicExecutor）----
+        # Java：LinkedBlockingQueue(50000)，池大小 = CPU 核数（core==max，keepAlive 60s）
+        self.async_sender_queue_capacity = 50000
+        # Java NettyClientConfig.clientCallbackExecutorThreads 默认 availableProcessors，
+        # <=0 时兜到 4；这里 0 表示"按 CPU 核数"
+        self.client_callback_executor_threads = 0
+        self._async_sender_executor: Optional[ConsumeExecutor] = None
+        self._callback_executor: Optional[ConsumeExecutor] = None
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -535,6 +566,8 @@ class DefaultMQProducer:
             # 按 message_ext 的 PGROUP 属性匹配本生产者，不匹配则丢弃。
             self._mq_client.remoting_client.register_processor(
                 RequestCode.CHECK_TRANSACTION_STATE, self._handle_check_transaction_state)
+            # 异步发送的两个线程池（Java 在构造器里 new，线程本身按需创建）
+            self._create_async_executors()
             self._started = True
             # 心跳线程：周期性向 broker 注册 ProducerData。
             # broker 的事务回查正是通过这一步登记的 channel 反向联系生产者的；
@@ -576,6 +609,16 @@ class DefaultMQProducer:
             if not self._started:
                 return
             self._heartbeat_running = False
+            # 对齐 Java DefaultMQProducerImpl.shutdown:313-317：先关异步发送池，再关客户端实例。
+            # ⚠ Java 这里用的是不等待的 shutdown()，所以「send_async 完立刻 shutdown」会丢掉
+            # 还没跑完的任务（回调里拿到 RemotingConnectException）。本实现照抄：不等。
+            # 调用方要确保发完，自己等回调。
+            if self._async_sender_executor is not None:
+                self._async_sender_executor.shutdown()
+                self._async_sender_executor = None
+            if self._callback_executor is not None:
+                self._callback_executor.shutdown()
+                self._callback_executor = None
             if self._mq_client is not None:
                 self._mq_client.shutdown()
             self._started = False
@@ -844,11 +887,12 @@ class DefaultMQProducer:
         REQUEST_FUTURE_HOLDER.put_request(correlation_id, future)
         cost = int(time.time() * 1000.0 - begin)
         try:
-            # 说明：Java 用 ASYNC 发送并等 latch；本实现的 send_async 是
-            # 「同步发送 + 立即回调」的包装，所以这里等价于同步发。
+            # Java 这里也是 ASYNC + 等 latch：send_async 把发送丢进 AsyncSenderExecutor
+            # 立即返回，本线程只等 326 推回来的应答。
             # 协议上无差别 —— 应答是 broker 通过**另一条** 326 通道推回来的，
             # 与本次发送的 CommunicationMode 无关。
-            # 发送失败时回调会把 future 标成 !send_request_ok 并主动唤醒等待方。
+            # 发送失败时回调（在 NettyClientPublicExecutor 上）会把 future 标成
+            # !send_request_ok 并主动唤醒等待方，所以发送失败不会等满 timeout。
             self.send_async(msg, _NullSendCallback(future),
                             timeout - cost if timeout > cost else timeout, mq)
             return self._wait_request_response(msg, timeout, future, cost)
@@ -868,17 +912,267 @@ class DefaultMQProducer:
                 "send request message to <%s> fail" % msg.topic, None, future.cause)
         return response
 
+    def _create_async_executors(self) -> None:
+        """建异步发送链的两个池（对应 Java DefaultMQProducerImpl:133-140 与
+        NettyRemotingClient:152-157）：
+
+        * ``AsyncSenderExecutor_N`` —— 把 send_async 的准备工作（拉路由、选队列、建请求、
+          换 broker 重试）从调用方线程挪走；队列**有界**，满了抛 "executor rejected"。
+        * ``NettyClientPublicExecutor_N`` —— 用户回调与 ``SendMessageHook.after`` 在这里跑，
+          绝不让业务代码占着连接的读线程或超时清理线程。
+
+        两个池都是 core==max、keepAlive 60s（Java 同款），所以线程按需创建、创建后不退出。
+        """
+        cores = os.cpu_count() or 1
+        self._async_sender_executor = ConsumeExecutor(
+            cores, cores, thread_name_prefix="AsyncSenderExecutor",
+            max_queue_size=self.async_sender_queue_capacity,
+            thread_name_sep="_", thread_index_from=1)
+        callback_threads = self.client_callback_executor_threads
+        if callback_threads <= 0:
+            # Java：默认 availableProcessors；显式配成 <=0 时 NettyRemotingClient 兜到 4
+            callback_threads = cores
+        self._callback_executor = ConsumeExecutor(
+            callback_threads, callback_threads,
+            thread_name_prefix="NettyClientPublicExecutor",
+            thread_name_sep="_", thread_index_from=1)
+
     def send_async(self, msg: Message, callback: SendCallback,
                    timeout_millis: Optional[int] = None,
                    mq: Optional[MessageQueue] = None) -> None:
-        """异步发送（对应 Java send(msg, callBack, timeout)）。"""
-        client = self._require_client()
+        """异步发送（对应 Java ``DefaultMQProducerImpl.send(msg, SendCallback, timeout)``）。
+
+        **调用方立即返回**，整条链在后台跑，四段与 Java 逐段对齐：
+
+        1. 任务投到 ``AsyncSenderExecutor_N``（池大小 = CPU 核数、队列有界
+           ``async_sender_queue_capacity``，默认 50000，同 Java 的
+           ``LinkedBlockingQueue(50000)``）。队列满了 Java 抛 ``MQClientException
+           ("executor rejected")``，这里同样**抛给调用方**而不是走回调。
+        2. 出队之后才算真实耗时：预算被排队吃掉就直接回调
+           ``RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")``，不再发请求。
+        3. ``sendKernelImpl`` 的 ASYNC 分支：拦截钩子 → 建请求 → ``invokeAsync``。
+        4. 失败进 ``_on_send_exception``（Java ``onExceptionImpl``）：换一台 broker 的队列、给
+           **同一个请求**换新 opaque 再试，上限 ``retry_times_when_send_async_failed``；
+           超时预算是所有尝试**共享**的剩余时间，不是每次尝试各给一份。
+
+        用户回调和 ``SendMessageHook.after`` 跑在 ``NettyClientPublicExecutor_N`` 上（Java 的
+        ``NettyRemotingAbstract.executeInvokeCallback`` 就是把回调 submit 到 publicExecutor，
+        为的是不让业务代码占着连接读线程）。
+
+        与 Java 的三处有意差别：未 start 时**同步抛**（Java 走回调，那样问题更难查）；
+        批量消息复用同步批量内核（只是不阻塞调用方，见 ``_send_async_inner``）；
+        没实现 ``enableBackpressureForAsyncMode`` 那套信号量（Java 默认也是关的）。
+        """
+        self._require_client()
+        executor = self._async_sender_executor
+        if executor is None:
+            raise MQClientException("producer already shutdown")
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
+        begin = time.monotonic()
+
+        def _run() -> None:
+            cost = int((time.monotonic() - begin) * 1000)
+            if timeout <= cost:
+                self._complete(callback, None,
+                               RemotingTooMuchRequestException(
+                                   "DEFAULT ASYNC send call timeout"),
+                               None)
+                return
+            try:
+                self._send_async_inner(msg, mq, callback, timeout - cost)
+            except Exception as e:  # noqa: BLE001 — Java：runnable 的 catch → newCallBack.onException(e)
+                self._complete(callback, None, e, None)
+
         try:
-            result = self.send(msg, timeout, mq)
-            callback.on_success(result)
+            executor.submit(_run)
+        except RejectedExecutionError as e:
+            raise MQClientException("executor rejected", None, e)
+
+    def _send_async_inner(self, msg: Message, mq: Optional[MessageQueue],
+                          callback: SendCallback, timeout: int) -> None:
+        """出队后的准备工作（Java ``sendDefaultImpl(ASYNC)`` → ``sendKernelImpl``）。"""
+        client = self._require_client()
+        if isinstance(msg, (list, tuple)):
+            # 批量异步：Java 走 SEND_BATCH_MESSAGE + invokeAsync，本实现的批量发送只有同步内核，
+            # 所以这里是「在 AsyncSenderExecutor 线程里同步发一批」。对调用方语义没差别 ——
+            # 不阻塞发送方、回调照样在 callbackExecutor 上跑。
+            result = self._send_batch(list(msg), mq, timeout)
+            self._execute_on_callback_thread(
+                lambda: self._complete(callback, result, None, None))
+            return
+        msg.topic = self._with_namespace(msg.topic)
+        self._check_message(msg)
+        # 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
+        sys_flag = self.try_to_compress_message(msg)
+        if mq is not None:
+            # Java send(msg, mq, cb, timeout) → sendKernelImpl 直接定点发，传下去的
+            # topicPublishInfo 是 null，所以失败只会在**同一台 broker** 上换 opaque 重试。
+            self._send_kernel_async(client, msg, mq, callback, timeout, sys_flag, None)
+            return
+        try:
+            publish = self._topic_publish_info(msg.topic)
+        except MQClientException as e:
+            raise MQClientException(str(e), ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
+        # Java sendDefaultImpl:756 —— ASYNC 的 timesTotal 固定为 1：外层循环只跑一次，
+        # 换 broker 的重试全部发生在 onExceptionImpl 里。
+        selected = self._mq_fault_strategy.select_one_message_queue(publish, None, False)
+        if selected is None:
+            raise MQClientException(
+                "Send [0] times, still failed, Topic: %s, BrokersSent: []" % msg.topic)
+        self._send_kernel_async(client, msg,
+                                MessageQueue(msg.topic, selected.broker_name, selected.queue_id),
+                                callback, timeout, sys_flag, publish)
+
+    def _send_kernel_async(self, client: MQClientInstance, msg: Message, mq: MessageQueue,
+                           callback: SendCallback, timeout: int, sys_flag: int,
+                           publish) -> None:
+        """Java ``sendKernelImpl`` 的 ASYNC 分支：钩子 + 建请求 + 交给 sendMessageAsync。"""
+        began = time.monotonic()
+        # 地址解析两步，与 Java ``sendKernelImpl:919-924`` 一致：先查已缓存的发布地址，
+        # 查不到再按 topic 刷一次路由重查。定点发送（调用方给了 mq）不会在
+        # sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，
+        # 第一次定点发送必然拿到空地址。
+        broker_addr = None
+        try:
+            broker_addr = client.broker_addr_of(mq.broker_name)
+        except Exception:  # noqa: BLE001 — 查缓存不该抛，抛了也只是降级成"没查到"
+            pass
+        if not broker_addr:
+            try:
+                route = client.get_topic_route_data(mq.topic)
+                if route is not None:
+                    broker_addr = MQClientInstance.find_broker_addr_in_route(route,
+                                                                            mq.broker_name)
+            except Exception:  # noqa: BLE001 — 刷路由失败交给下面统一报"broker 不存在"
+                pass
+        if not broker_addr:
+            # Java ``sendKernelImpl:1100``
+            raise MQClientException("The broker[%s] not exist" % mq.broker_name)
+        if self.has_check_forbidden_hook():
+            self._execute_check_forbidden(msg, mq, broker_addr, None, CommunicationMode.ASYNC)
+        if self.enable_trace_context:
+            inject_trace_context(msg)
+        # 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），
+        # 所以 header 里的 queueId 也跟着上一次 —— 这是 Java 的真实行为，别"修"它。
+        request = client.build_send_request(self.producer_group, msg, mq, timeout, sys_flag,
+                                            unit_mode=self.unit_mode)
+        context = None
+        if self.send_message_hook_list:
+            context = self._build_send_context(msg, mq, broker_addr, CommunicationMode.ASYNC)
+            self.execute_send_message_hook_before(context)
+        # Java ``sendKernelImpl:1043-1046``：ASYNC 分支自己的总闸 —— 钩子、压缩、路由
+        # 都算耗时，预算被它们吃光就不再发起请求。RemotingTooMuchRequestException 是
+        # RemotingException 的子类，所以 Java 在 :1088 先跑 hook.after 再抛给回调，
+        # 这里用 _complete 复刻同一顺序（且**不重试**）。
+        cost_async = int((time.monotonic() - began) * 1000)
+        if timeout < cost_async:
+            self._complete(callback, None,
+                           RemotingTooMuchRequestException("sendKernelImpl call timeout"),
+                           context)
+            return
+        self._send_message_async(client, broker_addr, mq.broker_name, mq, msg, request,
+                                 timeout - cost_async, callback, publish, context, [0])
+
+    def _send_message_async(self, client: MQClientInstance, addr: str, broker_name: str,
+                            mq: MessageQueue, msg: Message, request: RemotingCommand,
+                            timeout: int, callback: SendCallback, publish, context,
+                            times: List[int]) -> None:
+        """一笔在途尝试（对应 Java ``MQClientAPIImpl#sendMessageAsync``）。"""
+        began = time.monotonic()
+
+        def _handle(result: Optional[SendResult], error: Optional[BaseException]) -> None:
+            cost = int((time.monotonic() - began) * 1000)
+            if error is None:
+                self._update_fault_item(mq, began, False, True)
+                self._complete(callback, result, None, context)
+                return
+            self._update_fault_item(mq, began, True, True)
+            wrapped, need_retry = _classify_async_failure(error, cost)
+            self._on_send_exception(client, broker_name, mq, msg, request, timeout - cost,
+                                   callback, publish, context, times, wrapped, need_retry)
+
+        def _on_complete(result: Optional[SendResult],
+                         error: Optional[BaseException]) -> None:
+            self._execute_on_callback_thread(lambda: _handle(result, error))
+
+        try:
+            client.send_message_async(addr, request, msg, mq, timeout, _on_complete)
         except Exception as e:  # noqa: BLE001
-            callback.on_exception(e)
+            # Java sendMessageAsync 的外层 catch：就地失败（连不上/通道没了），
+            # 异常**原样**传递（不包装）、needRetry=true。
+            cost = int((time.monotonic() - began) * 1000)
+            self._update_fault_item(mq, began, True, False)
+            self._on_send_exception(client, broker_name, mq, msg, request, timeout - cost,
+                                   callback, publish, context, times, e, True)
+
+    def _on_send_exception(self, client: MQClientInstance, broker_name: str, mq: MessageQueue,
+                           msg: Message, request: RemotingCommand, timeout: int,
+                           callback: SendCallback, publish, context, times: List[int],
+                           error: BaseException, need_retry: bool) -> None:
+        """对应 Java ``MQClientAPIImpl#onExceptionImpl``：还能试就换队列重试，否则终止。"""
+        times[0] += 1
+        attempt = times[0]
+        if need_retry and attempt <= self.retry_times_when_send_async_failed and timeout > 0:
+            retry_broker = broker_name
+            retry_mq = mq
+            if publish is not None:
+                # Java: producer.selectOneMessageQueue(topicPublishInfo, brokerName, false)
+                # —— 第三个参数是 false，所以按 lastBrokerName 避开刚失败的那台
+                selected = self._mq_fault_strategy.select_one_message_queue(publish, broker_name,
+                                                                           False)
+                if selected is not None:
+                    retry_mq = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
+                    retry_broker = selected.broker_name
+            addr = client.broker_addr_of(retry_broker)
+            if not addr:
+                # Java onExceptionImpl:725 只查发布地址表、不刷路由；查不到就带着
+                # null 撞进 invokeAsync。这里就地终止，别让 None 传进传输层。
+                self._complete(callback, None,
+                               MQClientException("The broker[%s] not exist" % retry_broker),
+                               context)
+                return
+            logger.warning("async send msg by retry %d times. topic=%s, brokerAddr=%s, "
+                           "brokerName=%s: %s", attempt, msg.topic, addr, retry_broker, error)
+            # 换新 opaque：旧请求还挂在 responseTable 里等超时，复用会把两次尝试的应答串台
+            request.opaque = RemotingCommand.create_new_request_id()
+            self._send_message_async(client, addr, retry_broker, retry_mq, msg, request, timeout,
+                                     callback, publish, context, times)
+            return
+        self._complete(callback, None, error, context)
+
+    def _execute_on_callback_thread(self, fn: Callable[[], None]) -> None:
+        """在 ``NettyClientPublicExecutor_N`` 上跑回调处理（Java executeInvokeCallback 的
+        publicExecutor 分支）；池子已关或投不进去时**就地跑**，与 Java 的 runInThisThread 一致。
+        """
+        pool = self._callback_executor
+        if pool is None:
+            fn()
+            return
+        try:
+            pool.submit(fn)
+        except RejectedExecutionError:
+            fn()
+
+    def _complete(self, callback: SendCallback, result: Optional[SendResult],
+                  error: Optional[BaseException], context) -> None:
+        """异步链的终点：先跑 SendMessageHook.after，再回调用户。
+
+        用户回调抛的异常必须吞掉（Java 两处都是 ``catch (Throwable)``），否则它会带走
+        回调线程池的 worker。
+        """
+        if context is not None:
+            if error is None:
+                context.send_result = result
+            else:
+                context.exception = error
+            self.execute_send_message_hook_after(context)
+        try:
+            if error is None:
+                callback.on_success(result)
+            else:
+                callback.on_exception(error)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("send callback raised: %s", e)
 
     def send_oneway(self, msg: Message, mq: Optional[MessageQueue] = None) -> None:
         """单向发送（对应 Java sendOneway）。"""

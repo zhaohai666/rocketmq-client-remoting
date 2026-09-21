@@ -308,6 +308,61 @@ int main(int argc, char** argv) {
               "ok=" + std::to_string(cb->ok()) + " err=" + std::to_string(cb->err()));
     }
 
+    // ---------- 1b. 定点异步发送：sendAsync(msg, mq, cb) ----------
+    //
+    // 用一个**全新的生产者实例**打定点异步发送：它的 topicRouteTable 是空的，
+    // 而 Java sendKernelImpl:919-924 只在发布地址表查不到时按 topic 刷一次路由再解析
+    // （定点发送不会在 sendDefaultImpl 里取发布信息）。少了那一步，第一次定点异步
+    // 发送会带着空地址去连 broker。
+    {
+        const std::string topic = gPrefix + "_AsyncPinned";
+        SendResult probe;
+        bool probed = true;
+        try {
+            probe = prod.send(Message(topic, str2bytes("probe")), 5000);
+        } catch (const std::exception& e) {
+            probed = false;
+            check("定点异步发送 sendAsync(msg, mq)", false,
+                  std::string("建 topic 失败: ") + e.what());
+        }
+        if (probed) {
+            DefaultMQProducer fresh(gPrefix + "_producer_fresh");
+            fresh.setNamesrvAddr(gNamesrv);
+            fresh.setSendMsgTimeout(5000);
+            fresh.start();
+            auto cb = std::make_shared<CollectingCallback>();
+            try {
+                fresh.sendAsync(Message(topic, str2bytes("pinned-async")), probe.messageQueue, cb,
+                                5000);
+            } catch (const std::exception& e) {
+                check("定点异步发送 sendAsync(msg, mq)", false,
+                      std::string("throw: ") + e.what());
+            }
+            for (int i = 0; i < 200 && cb->ok() + cb->err() == 0; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            std::vector<SendResult> rs = cb->results();
+            const bool sameQueue = !rs.empty() && rs[0].messageQueue == probe.messageQueue;
+            const bool ok = (cb->ok() == 1) && (cb->err() == 0) && !rs.empty()
+                            && rs[0].sendStatus == SendStatus::SEND_OK && sameQueue
+                            && !rs[0].msgId.empty();
+            check("定点异步发送 sendAsync(msg, mq)", ok,
+                  "ok=" + std::to_string(cb->ok()) + " err=" + std::to_string(cb->err())
+                      + (rs.empty()
+                             ? std::string()
+                             : (" queue=" + rs[0].messageQueue.brokerName + ":"
+                                + std::to_string(rs[0].messageQueue.queueId) + " want="
+                                  + probe.messageQueue.brokerName + ":"
+                                  + std::to_string(probe.messageQueue.queueId)
+                                  + " msgId=" + (rs[0].msgId.empty() ? "<empty>" : "set"))));
+            if (cb->err() > 0) {
+                std::vector<std::string> errs = cb->errors();
+                std::cout << "       回调异常: " << errs[0] << std::endl;
+            }
+            fresh.shutdown();
+        }
+    }
+
     // ---------- 2. 顺序消息：同 key 落同队列 + 顺序消费保序 ----------
     std::vector<Bytes> bodiesOrder;
     {

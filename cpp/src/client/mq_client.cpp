@@ -572,11 +572,11 @@ std::vector<std::string> MQClientInstance::getRouteOfAllBrokers() {
 std::vector<std::string> MQClientInstance::knownBrokerAddrs() { return getRouteOfAllBrokers(); }
 
 // ---------------------------------------------------------------- 消息发送
-SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const Message& msg,
-                                        const MessageQueue& mq, int32_t timeoutMillis,
-                                        int32_t sysFlag, bool unitMode) {
-    const std::string addr = brokerAddr(mq);
-
+// 建请求 / 解析应答 / 发送三件事分开，是为了让异步发送能跨重试复用同一个请求对象
+// （Java MQClientAPIImpl#onExceptionImpl 只换 opaque，不换队列也不重建头）。
+RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGroup,
+                                                   const Message& msg, const MessageQueue& mq,
+                                                   int32_t sysFlag, bool unitMode) {
     auto header = std::make_shared<SendMessageRequestHeaderV2>();
     header->producerGroup = producerGroup;
     header->topic = msg.topic;
@@ -597,13 +597,14 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
 
     // 请求码选择（reply / batch / 普通）见 sendRequestCode：应答走 325、批量走 320，
     // 否则才是普通的 SEND_MESSAGE_V2(310)。
-    RemotingCommand request = RemotingCommand::createRequestCommand(
-        sendRequestCode(msg), header);
+    RemotingCommand request = RemotingCommand::createRequestCommand(sendRequestCode(msg), header);
     request.body = msg.body;
     request.hasBody = true;
+    return request;
+}
 
-    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
-
+SendResult MQClientInstance::parseSendResponse(const RemotingCommand& response, const Message& msg,
+                                               const MessageQueue& mq) {
     SendStatus status;
     switch (response.code) {
         case ResponseCode::SUCCESS: status = SendStatus::SEND_OK; break;
@@ -640,6 +641,48 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
     return result;
 }
 
+SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const Message& msg,
+                                        const MessageQueue& mq, int32_t timeoutMillis,
+                                        int32_t sysFlag, bool unitMode) {
+    const std::string addr = brokerAddr(mq);
+    RemotingCommand request = buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
+    RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
+    return parseSendResponse(response, msg, mq);
+}
+
+void MQClientInstance::sendMessageAsync(const std::string& addr, RemotingCommand& request,
+                                       const Message& msg, const MessageQueue& mq,
+                                       int32_t timeoutMillis,
+                                       std::function<void(const SendResult&, const InvokeError&)>
+                                           onComplete) {
+    // 解析异常必须转成 error 交给回调，不能抛到读线程/清理线程上去（那里没有 catch）。
+    // kind=RESPONSE_FAILED 表示"响应已经到达、只是处理失败"（broker 回了失败码，或响应体
+    // 解不出来）。Java 的 operationSucceed 用一个 catch(Exception) 同时兜住这两种
+    // （``MQClientAPIImpl:669-673``），走 onExceptionImpl(needRetry=false) —— 既不重试也
+    // 不换 broker，所以这里**所有**解析异常都归同一个类型，别按异常子类去区分。
+    remotingClient_->invokeAsync(
+        addr, request,
+        [onComplete, msg, mq](const RemotingCommand& response, const InvokeError& error) {
+            if (!error.empty()) {
+                onComplete(SendResult(), error);
+                return;
+            }
+            try {
+                onComplete(parseSendResponse(response, msg, mq), InvokeError());
+            } catch (const MQBrokerException& e) {
+                onComplete(SendResult(),
+                           InvokeError(InvokeError::Kind::RESPONSE_FAILED, e.what()));
+            } catch (const std::exception& e) {
+                onComplete(SendResult(),
+                           InvokeError(InvokeError::Kind::RESPONSE_FAILED, e.what()));
+            } catch (...) {
+                onComplete(SendResult(), InvokeError(InvokeError::Kind::RESPONSE_FAILED,
+                                                     "unknown error"));
+            }
+        },
+        timeoutMillis);
+}
+
 std::string MQClientInstance::recallMessage(const std::string& addr,
                                             const RecallMessageRequestHeader& header,
                                             int32_t timeoutMillis) {
@@ -665,29 +708,8 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     const std::string addr = brokerAddr(mq);
     (void)timeoutMillis;
 
-    auto header = std::make_shared<SendMessageRequestHeaderV2>();
-    header->producerGroup = producerGroup;
-    header->topic = msg.topic;
-    header->defaultTopic = MixAll::DEFAULT_TOPIC;
-    header->defaultTopicQueueNums = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
-    header->queueId = mq.queueId;
-    header->sysFlag = sysFlag;
-    header->bornTimestamp = UtilAll::currentTimeMillis();
-    header->flag = msg.flag;
-    header->properties = messagePropertiesToString(msg.properties);
-    header->reconsumeTimes = 0;
-    header->unitMode = unitMode;
-    // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
-    // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
-    // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
-    header->maxReconsumeTimes = std::nullopt;
-    header->batch = msg.isBatch;
-
-    // 请求码选择（reply / batch / 普通）见 sendRequestCode。
-    RemotingCommand request = RemotingCommand::createRequestCommand(
-        sendRequestCode(msg), header);
-    request.body = msg.body;
-    request.hasBody = true;
+    // 请求码选择（reply / batch / 普通）见 sendRequestCode；建头细节与同步/异步共用一份
+    RemotingCommand request = buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
     request.markOnewayRpc();
     remotingClient_->invokeOneway(addr, request);
 }

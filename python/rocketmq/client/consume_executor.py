@@ -20,6 +20,11 @@
    ``setCorePoolSize`` 里的 ``addWorker(null, false)`` 循环）。
 4. 任务抛异常**不杀线程**（Java ``ThreadPoolExecutor`` 会补一个新 worker；
    这里直接在循环内捕获并记日志，效果等价且没有补线程的竞态）。
+
+队列也可以是有界的（``max_queue_size``），对应 Java ``LinkedBlockingQueue(50000)``：
+生产者的异步发送线程池就是这一档 —— 队列满了 ``submit`` 抛
+:class:`RejectedExecutionError`（等价 ``RejectedExecutionException``），由调用方决定
+是报错还是就地跑（Java ``executeAsyncMessageSend`` 两种都有）。
 """
 
 from __future__ import annotations
@@ -33,45 +38,65 @@ from ..logging import get_logger
 logger = get_logger(__name__)
 
 
+class RejectedExecutionError(RuntimeError):
+    """队列已满、任务被拒（对应 Java ``RejectedExecutionException``）。"""
+
+
 class ConsumeExecutor:
     """core/max 两档线程池（对应 Java ``ThreadPoolExecutor`` + ``LinkedBlockingQueue``）。
 
     默认参数即 Java ``AbstractConsumeMessageService`` 的构造参数：
     ``core=consumeThreadMin``、``max=consumeThreadMax``、``keepAlive=60s``。
+
+    线程名 = ``<thread_name_prefix><分隔符><序号>``。Java 的 ``ThreadFactoryImpl`` 序号从
+    **1** 开始、并且各执行器的分隔符不同（消费池是 ``ConsumeMessageThread_``，异步发送池是
+    ``AsyncSenderExecutor_``），所以分隔符和起始序号都做成参数，便于逐一对齐名字。
     """
 
     def __init__(self, core_pool_size: int, maximum_pool_size: int,
                  keep_alive_seconds: float = 60.0,
-                 thread_name_prefix: str = "rmq-consume") -> None:
+                 thread_name_prefix: str = "rmq-consume",
+                 max_queue_size: int = 0,
+                 thread_name_sep: str = "-",
+                 thread_index_from: int = 0) -> None:
         core = max(0, int(core_pool_size))
         self._core = core
         self._max = max(core, int(maximum_pool_size))
         self._keep_alive = float(keep_alive_seconds)
         self._prefix = str(thread_name_prefix)
+        self._name_sep = str(thread_name_sep)
         self._queue: Deque[Tuple[Callable[..., Any], tuple, dict]] = collections.deque()
+        # 0 = 无界（Java 的 LinkedBlockingQueue() 无参构造）
+        self._max_queue_size = max(0, int(max_queue_size))
         self._lock = threading.Lock()
         self._work_available = threading.Condition(self._lock)
         self._workers = 0          # 当前存活 worker 数（Java poolSize）
         self._idle = 0             # 其中处于等待状态的数量
         self._threads: List[threading.Thread] = []
-        self._seq = 0
+        self._seq = int(thread_index_from)
         self._shutdown = False
         self._handler_exceptions = 0
 
     # ---------------- 对外 API ----------------
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
-        """投递任务（Java ``execute``）。线程池已关闭时抛 ``RuntimeError``。"""
+        """投递任务（Java ``execute``）。线程池已关闭时抛 ``RejectedExecutionError``，
+        有界队列已满且线程数已到 max 时同样抛它（对应 Java ``offer`` 失败 -> ``reject``）。
+        """
         with self._lock:
             if self._shutdown:
-                raise RuntimeError("ConsumeExecutor has been shut down")
+                raise RejectedExecutionError("ConsumeExecutor has been shut down")
+            # Java：入队失败（队列满）才考虑开一个非 core 线程，再不行就 reject
+            queue_full = bool(self._max_queue_size) and len(self._queue) >= self._max_queue_size
+            can_grow = self._workers < self._max
+            if queue_full and not can_grow:
+                raise RejectedExecutionError(
+                    "ConsumeExecutor queue is full (%d)" % self._max_queue_size)
             self._queue.append((fn, args, kwargs))
-            # Java 无界队列语义：只有 poolSize < corePoolSize 才新建线程
-            if self._workers < self._core:
-                self._spawn_locked()
-            elif self._workers == 0:
-                # Java ThreadPoolExecutor.execute 的兜底分支：入队成功后若
-                # workerCount == 0（core=0 的配置）仍要补一个线程，否则任务永远没人跑。
+            # Java 无界队列语义：只有 poolSize < corePoolSize 才新建线程；
+            # workers == 0 是 core=0 配置下的兜底（Java execute 的同一分支），
+            # 否则任务永远没人跑。
+            if self._workers < self._core or (queue_full and can_grow) or self._workers == 0:
                 self._spawn_locked()
             self._work_available.notify()
 
@@ -155,7 +180,7 @@ class ConsumeExecutor:
     def _spawn_locked(self) -> None:
         """调用方必须已持有 ``self._lock``。"""
         self._workers += 1
-        name = "%s-%d" % (self._prefix, self._seq)
+        name = "%s%s%d" % (self._prefix, self._name_sep, self._seq)
         self._seq += 1
         t = threading.Thread(target=self._run, name=name, daemon=True)
         self._threads.append(t)
