@@ -65,7 +65,14 @@ class FairSemaphore:
 
     def try_acquire(self, permits: int, timeout_millis: int) -> bool:
         """对应 Java ``tryAcquire(permits, timeout, MILLIS)``：拿不到就返回 ``False``，
-        不抛异常（Java 也只有被 interrupt 才抛）。"""
+        不抛异常（Java 也只有被 interrupt 才抛）。
+
+        ⚠ 拿到许可和**放弃排队**这两个出口都必须再叫醒一次：公平模式下只有队首能拿，
+        队首一换人，后面的申请就可能从「轮不到我」变成「该我了」，而它的 ``permits`` 数量
+        未必被前一个人的动作影响（队首要 5 个、空闲 6 个时，队首拿走 5 个后剩下 1 个，
+        正好够排在第二的那 1 个 —— 但 ``release`` 早就跑完了，没人为它叫醒）。
+        少叫醒这一次，那个人就会一直睡到自己的超时：真机上是 5 秒死等，不是丢一条消息。
+        """
         deadline = time.monotonic() + max(timeout_millis, 0) / 1000.0
         request = _Pending(permits)
         with self._cond:
@@ -74,6 +81,7 @@ class FairSemaphore:
                 if self._queue[0] is request and self._free >= permits:
                     self._queue.popleft()
                     self._free -= permits
+                    self._cond.notify_all()  # 队首换人，下一个人可能就够了
                     return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -82,6 +90,7 @@ class FairSemaphore:
                         self._queue.remove(request)
                     except ValueError:  # pragma: no cover —— 只有被 grant 后才会不在队里
                         pass
+                    self._cond.notify_all()  # 同上：挡路的人走了
                     return False
                 self._cond.wait(remaining)
 

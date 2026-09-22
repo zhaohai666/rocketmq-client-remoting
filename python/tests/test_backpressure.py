@@ -128,6 +128,76 @@ def test_shrink_wakes_someone_blocked_on_the_old_capacity():
     assert got == [True]
 
 
+def test_a_granted_head_still_feeds_the_waiter_behind_it():
+    """队首拿走许可之后，剩下的空闲如果够后面的人，他必须最终拿到。
+
+    这里锁的是「一次 release 只放一个」这件事不会发生：空闲 6、队首要 5、第二个人要 1，
+    两个人都该拿到，且都不该等到超时。（``try_acquire`` 拿到许可后还会再 ``notify_all``
+    一次，为的是另一种更刁的排布 —— 第二个人是在那次通知**之后**才排上队的，就没人再喊过他，
+    只能靠队首离场时补这一嗓子。那个窗口在本用例里没法稳定复现，所以这里的断言只覆盖
+    「都被叫醒」这一半，另一半的回归守卫是下面那个超时退出的用例。）
+    """
+    sem = FairSemaphore(6)
+    assert sem.try_acquire(5, 0) is True           # 在途 5，空闲 1
+    outcome: list = []
+    lock = threading.Lock()
+    began = time.monotonic()
+
+    def _waiter(tag: str, permits: int, budget: int) -> None:
+        got = sem.try_acquire(permits, budget)
+        with lock:
+            outcome.append((tag, got, int((time.monotonic() - began) * 1000)))
+
+    head = threading.Thread(target=_waiter, args=("head", 5, 3000))
+    head.start()
+    _wait_until(lambda: len(sem._queue) == 1)
+    # 空闲 1 个，够第二个人 —— 但公平模式下它必须等队首先走
+    second = threading.Thread(target=_waiter, args=("second", 1, 3000))
+    second.start()
+    _wait_until(lambda: len(sem._queue) == 2)
+    sem.release(5)                                 # 空闲 1 → 6：队首这就够了
+    _wait_threads([head, second])
+    got = {tag: (ok, ms) for tag, ok, ms in outcome}
+    assert got["head"][0] is True
+    assert got["second"][0] is True, "队首拿走许可后，第二个人被丢下了（丢唤醒）"
+    # 拿到许可不该花掉整个预算：睡到超时说明根本没被叫醒
+    assert got["second"][1] < 2000, "second waited %dms" % got["second"][1]
+    assert sem.available_permits() == 0            # 6 - 5 - 1
+
+
+def test_a_timed_out_head_wakes_the_waiter_behind_it():
+    """队首**超时退出**也是一次队首换人：它要的许可数超过总容量时，后面的人本来能过。
+
+    这条是丢唤醒的回归守卫（少了离场时的那次 ``notify_all``，second 会一路睡满 3000ms）：
+    真机上对应的表现是异步发送白等满预算，再回调一个 ``semaphoreAsyncNum timeout``，
+    而许可其实早就空出来了。
+    """
+    sem = FairSemaphore(3)
+    assert sem.try_acquire(3, 0) is True           # 掏空
+    outcome: list = []
+    lock = threading.Lock()
+    began = time.monotonic()
+
+    def _waiter(tag: str, permits: int, budget: int) -> None:
+        got = sem.try_acquire(permits, budget)
+        with lock:
+            outcome.append((tag, got, int((time.monotonic() - began) * 1000)))
+
+    # 队首要 4 个 > 总量 3：它永远拿不到，只能等满自己的 200ms 预算
+    head = threading.Thread(target=_waiter, args=("head", 4, 200))
+    head.start()
+    _wait_until(lambda: len(sem._queue) == 1)
+    second = threading.Thread(target=_waiter, args=("second", 1, 3000))
+    second.start()
+    _wait_until(lambda: len(sem._queue) == 2)
+    sem.release(3)                                 # 空闲够 second，但队首是那个贪心的
+    _wait_threads([head, second], timeout=5.0)
+    got = {tag: (ok, ms) for tag, ok, ms in outcome}
+    assert got["head"][0] is False, "要得比总量还多，本该拿不到"
+    assert got["second"][0] is True, "队首退出后没被叫醒（丢唤醒）"
+    assert got["second"][1] < 2000, "second waited %dms" % got["second"][1]
+
+
 def test_release_beyond_total_is_allowed():
     """Java ``release()`` 不校验是否超过总量（信号量可以被"无中生有"地放大）。"""
     sem = FairSemaphore(1)
