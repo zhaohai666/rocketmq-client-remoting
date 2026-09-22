@@ -55,6 +55,12 @@ public sealed class RemotingClient : IDisposable
     {
         public required string Addr;
         public Socket Sock = null!;
+        // 写侧互斥。⚠ 它的存在不只是"别把两个请求的字节 interleleave"，还钉住了
+        // SslStream 的并发口径：运行时的 SslStream 用 _nestedRead / _nestedWrite 两个
+        // **互相独立**的标记位放行 I/O（见 System.Net.Security/SslStream.IO.cs），
+        // 也就是只支持"一路读 + 一路写"，同侧重入直接抛 invalidnestedcall。
+        // 本类每条连接只有一个读线程，加上这把写锁，正好落在被支持的形状里 ——
+        // 去掉它或再起第二个读线程，就会把 TLS 连接推到未定义行为上。
         public readonly object WriteLock = new();
         public volatile bool ReaderDone;
         // TLS 会话（TLS 启用时非空；读写走 SslStream）

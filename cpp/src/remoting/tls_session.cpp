@@ -105,6 +105,8 @@ bool TlsSession::handshake(netcompat::socket_t sock, const std::string& host, in
 
 int TlsSession::read(netcompat::socket_t sock, char* buf, int len) {
     (void)sock;
+    // 整个调用在会话锁内：里面只有 SSL_read 与 EINTR 重试，没有任何睡眠。
+    std::lock_guard<std::mutex> lk(ioMutex_);
     for (;;) {
         int n = SSL_read(ssl_, buf, len);
         if (n > 0) return n;
@@ -132,13 +134,20 @@ bool TlsSession::writeAll(netcompat::socket_t sock, const char* data, size_t len
     (void)sock;  // SSL_write 绑定在握手时的 fd 上；形参仅为签名一致
     size_t sent = 0;
     while (sent < len) {
-        int n = SSL_write(ssl_, data + sent, static_cast<int>(len - sent));
+        int n;
+        int err;
+        {
+            // 锁只圈住这一次 SSL_write（连同读它错误码的 SSL_get_error）：下面那 10ms
+            // 重试睡眠必须在锁外，否则读线程（以及同一会话上的其它写者）会被对端满窗口堵住。
+            std::lock_guard<std::mutex> lk(ioMutex_);
+            n = SSL_write(ssl_, data + sent, static_cast<int>(len - sent));
+            err = SSL_get_error(ssl_, n);
+        }
         if (n > 0) {
             sent += static_cast<size_t>(n);
             continue;
         }
-        int e = SSL_get_error(ssl_, n);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
             if (errno == EINTR) continue;
             // SO_SNDTIMEO 到点：短暂等待后重试（对端 TCP 窗口满）
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -149,9 +158,13 @@ bool TlsSession::writeAll(netcompat::socket_t sock, const char* data, size_t len
     return true;
 }
 
-int TlsSession::pending() { return SSL_pending(ssl_); }
+int TlsSession::pending() {
+    std::lock_guard<std::mutex> lk(ioMutex_);
+    return SSL_pending(ssl_);
+}
 
 void TlsSession::shutdown() {
+    std::lock_guard<std::mutex> lk(ioMutex_);
     if (ssl_ != nullptr) {
         // best-effort：对端可能已关，失败不处理
         SSL_shutdown(ssl_);

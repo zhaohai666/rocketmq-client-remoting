@@ -91,6 +91,7 @@ dotnet $PROG validators-live 127.0.0.1:9876  # 名字校验（39 PASS / 0 FAIL�
 dotnet $PROG recall 127.0.0.1:9876        # 定时消息撤回（16 PASS / 0 FAIL，脚本负责开关并还原 recallMessageEnable）
 dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS / 0 FAIL）
 dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
+dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
 其它子命令：`redelivery`（27 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace 九段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
@@ -127,6 +128,8 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 
 | sql92 | 20 PASS / 0 FAIL（SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 四语言同场景：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `Start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `Start()`）。协议形状与四条分支语义另有离线单测 10 项（`CheckClientConfigTests`，进程内 mock broker） |
 
+| tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
+
 单测：`dotnet test tests/RocketMQ.Client.Tests` → **471 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（13 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
@@ -156,6 +159,26 @@ resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consist
 `AclTests` 里新增的 4 项锁住请求钩子的**组合顺序**：`RequestHooks.Compose` 的形状
 （stream 在前、用户钩子在后）、`ReqT="0"` 落在 ACL 签名**之内**（用签名后的 ExtFields 复算
 能对上）、反证（顺序写反时同一断言必须红）、`ChainedRpcHook` 逐个转发 `doAfterResponse`。
+
+## TLS
+
+`TlsEnable = true`（或 `ROCKETMQ_TLS_ENABLE=1`）后每条出连接换成 `SslStream`，握手在
+`AuthenticateAsClient` 里完成、随后整个流都走 TLS。test-mode（对齐 Java
+`tls.test.mode.enable`，默认开）信任 broker 自签证书、不校验主机名，所以本机 5.5.1 集群
+**不用改 `useTLS`**：nameServer 9876 与 broker 10911 按首字节嗅探，明文与 TLS 同一端口都收。
+
+线程契约是本端口的关键约束：`SslStream` 只支持**一个并发读 + 一个并发写**（运行时源码
+`SslStream.IO.cs` 里 `_nestedRead` 与 `_nestedWrite` 是两把独立的 `Interlocked` 闸门，同类
+重入才抛 `net_io_invalidnestedcall`，读写互不干涉）。这里每条连接恰好一个读线程 + 一把
+`Connection.WriteLock` 串行化写侧，正落在这个契约内 —— 注释写在
+`src/RocketMQ.Client/Remoting/RemotingClient.cs` 的 `WriteLock` 上，别把它当成可以随手删的锁，
+也别给同一条连接再加第二个读者。
+
+`dotnet $PROG tls <namesrv> <topic> <group>` 除了真发真收，还先跑两段传输层压测
+（2026-09-22 本机实测）：S0a 每轮新建一条 TLS 连接只打一个请求、30 轮 **0 丢**（最慢一轮
+110ms，含握手）；S0b 单条 TLS 连接上 16 线程并发 320 笔 **0 失败**、响应 opaque 逐笔对上、
+总耗时 38ms。之后 TLS 生产者 + TLS push 消费者 3 发 3 收，生产侧注入的 `traceparent`
+在消费侧提取到且合法。
 
 ## 与 Java 的已知差异
 

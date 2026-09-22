@@ -51,6 +51,20 @@ RocketMQ client lz4:  enabled (/usr/local/lib/liblz4.dylib)
 RocketMQ client TLS:  enabled (OpenSSL 3.6.3)
 ```
 
+## TLS
+
+`RMQ_ENABLE_TLS`（找到 OpenSSL 时默认 ON）时每条 TLS 连接一个 `TlsSession`。
+**会话内部有一把 io 锁**（`src/remoting/tls_session.h`）：本传输层是"一连接一个读线程
+（`SSL_pending`/`SSL_read`）+ 调用方线程写（`SSL_write`）"的形状，两个线程必然在同一条
+SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SSL` 对象。连接层原来那把
+`writeMutex` 只锁写侧，挡不住读/写重叠，所以锁下沉到会话里，`read` / `writeAll` /
+`pending` / `shutdown` 每次 `SSL_*` 调用取放一次（`writeAll` 的重试睡眠在锁外）。
+
+本机 loopback + 真 nameServer 实测（`examples/live_tls.cpp` 的 S0）：一条 TLS 连接上
+16 线程并发 320 笔，加锁那几趟 20~26ms、同一台机器不加锁那趟 17~19ms，两种都是 0 失败、
+响应 opaque 逐笔对上；另加 30 轮"每轮新建 TLS 连接打首包"，0 丢。也就是说这把锁是
+**用法正确性**的修复：几毫秒摊到 320 笔（每笔 10~20µs 量级），在本机量不出有意义的代价。
+
 ## 测试
 
 ```bash

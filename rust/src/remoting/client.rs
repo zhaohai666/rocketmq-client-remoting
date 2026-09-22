@@ -771,14 +771,29 @@ async fn connect_tls(
         tasks: Mutex::new(vec![TaskHandle::Blocking]),
     });
 
+    // 读线程是普通 std 线程，本身没有 tokio 上下文；而 broker 主动推来的请求（事务回查、
+    // 心跳应答）都在那条线程上同步处理，处理器要靠运行时派后台任务。本函数是 async，
+    // 一定跑在运行时里，就在这里把句柄取出来（同时缓存进 Inner 供其它线程用）。
+    let runtime = inner.runtime_handle();
     spawn_tls_writer(inner.clone(), addr, shared.clone(), rx.clone(), alive.clone());
-    spawn_tls_reader(inner.clone(), addr, shared, alive);
+    spawn_tls_reader(inner.clone(), addr, shared, alive, runtime);
     Ok(conn)
 }
 
-fn spawn_tls_reader(inner: Arc<Inner>, addr: &str, shared: SharedTls, alive: Arc<AtomicBool>) {
+fn spawn_tls_reader(
+    inner: Arc<Inner>,
+    addr: &str,
+    shared: SharedTls,
+    alive: Arc<AtomicBool>,
+    runtime: Option<tokio::runtime::Handle>,
+) {
     let addr = addr.to_string();
-    std::thread::spawn(move || tls_read_loop(inner, addr, shared, alive));
+    std::thread::spawn(move || {
+        // enter() 让读线程上的 `Handle::try_current()` 与明文 tokio 读任务表现一致，
+        // 否则纯 TLS 会话里 broker 的回查请求会到得了处理器、却派不出去。
+        let _guard = runtime.as_ref().map(|handle| handle.enter());
+        tls_read_loop(inner, addr, shared, alive);
+    });
 }
 
 fn spawn_tls_writer(
@@ -1603,6 +1618,129 @@ mod tests {
         assert_eq!(remarks, expected);
         assert_eq!(client.connection_addrs().len(), 1, "8 个请求应复用同一条 TLS 连接");
         client.shutdown();
+    }
+
+    /// 单向 TLS 服务端：应答第一条请求（把连接建起来），随后**主动推**一条要回包的
+    /// 请求，读到客户端的响应后翻 `responded`。服务端线程最多活到读超时（10s）。
+    fn start_tls_push_server(
+        identity_pkcs12: &[u8],
+        responded: Arc<AtomicBool>,
+    ) -> std::result::Result<String, String> {
+        use std::net::TcpListener;
+        const TLS_PUSH_OPAQUE: i32 = 4_242_424;
+        let identity = native_tls::Identity::from_pkcs12(identity_pkcs12, TLS_P12_PASSWORD)
+            .map_err(|e| format!("identity: {e}"))?;
+        let acceptor = native_tls::TlsAcceptor::new(identity).map_err(|e| format!("acceptor: {e}"))?;
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?.to_string();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else { return };
+            // macOS/BSD 下 accept 出来的套接字继承监听口的非阻塞标志，握手要求阻塞语义
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let Ok(mut tls) = acceptor.accept(stream) else { return };
+            // 1) 热身请求原样回一帧，客户端这才算连上
+            let Some(warm) = read_tls_frame(&mut tls) else { return };
+            if warm.is_oneway_rpc() {
+                return;
+            }
+            let mut ack = response_for(&warm, response_code::SUCCESS);
+            let ack_bytes = ack.encode();
+            if tls.write_all(&ack_bytes).is_err() || tls.flush().is_err() {
+                return;
+            }
+            // 2) broker 视角推一条事务回查（非 oneway，必须回包）
+            let mut push = RemotingCommand::create_request_command(
+                request_code::CHECK_TRANSACTION_STATE,
+                None,
+            );
+            push.opaque = TLS_PUSH_OPAQUE;
+            if tls.write_all(&push.encode()).is_err() || tls.flush().is_err() {
+                return;
+            }
+            // 3) 等客户端把响应写回来
+            while let Some(cmd) = read_tls_frame(&mut tls) {
+                if cmd.opaque == TLS_PUSH_OPAQUE && cmd.is_response_type() {
+                    responded.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        Ok(addr)
+    }
+
+    /// 读一整帧并解出命令；对端关掉或超长都返回 `None`。
+    fn read_tls_frame(tls: &mut native_tls::TlsStream<std::net::TcpStream>) -> Option<RemotingCommand> {
+        let mut head = [0u8; 4];
+        if !read_block(tls, &mut head) {
+            return None;
+        }
+        let total = i32::from_be_bytes(head);
+        if total <= 0 || total > MAX_FRAME_LENGTH {
+            return None;
+        }
+        let mut frame = head.to_vec();
+        frame.resize(4 + total as usize, 0);
+        if !read_block(tls, &mut frame[4..]) {
+            return None;
+        }
+        RemotingCommand::decode(&frame).ok()
+    }
+
+    /// TLS 读线程上必须有 tokio 运行时上下文。
+    ///
+    /// 明文路径天然满足（读循环就是 tokio 任务），TLS 却是一条普通 std 线程：broker
+    /// 主动推来的请求（事务回查、心跳应答）在这条线程上同步处理，处理器要靠运行时派
+    /// 后台任务，派不出去就只剩一句 warn，请求到了、活没干。真机 TLS 上实测过：
+    /// broker 每 30s 回查一次，三次全被静默丢掉。
+    #[tokio::test]
+    async fn tls_inbound_request_is_processed_with_a_runtime_context() {
+        let Some(pkcs12) = tls_identity_pkcs12() else {
+            eprintln!("skip: openssl 不可用，无法现造 TLS 证书");
+            return;
+        };
+        let responded = Arc::new(AtomicBool::new(false));
+        let saw_runtime = Arc::new(AtomicBool::new(false));
+        let addr = start_tls_push_server(&pkcs12, responded.clone()).expect("TLS 服务端起不来");
+        struct Probe {
+            saw_runtime: Arc<AtomicBool>,
+        }
+        impl RequestProcessor for Probe {
+            fn process(&self, request: RemotingCommand, _addr: String, sink: ResponseSink) {
+                self.saw_runtime.store(
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    Ordering::SeqCst,
+                );
+                let mut response = RemotingCommand::create_response(response_code::SUCCESS, None);
+                response.set_body(request.body().map(|b| b.to_vec()));
+                sink.respond(response);
+            }
+        }
+        let client = tls_client();
+        client.register_processor(
+            request_code::CHECK_TRANSACTION_STATE,
+            Arc::new(Probe { saw_runtime: saw_runtime.clone() }),
+        );
+
+        // 先做一次正常往返：连接建起来，服务端才会推请求
+        let mut warm = request(request_code::HEART_BEAT, "warm");
+        client
+            .invoke_sync(&addr, &mut warm, Some(10_000))
+            .await
+            .expect("TLS 热身请求失败");
+        for _ in 0..200 {
+            if responded.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let got_response = responded.load(Ordering::Acquire);
+        client.shutdown();
+        assert!(
+            saw_runtime.load(Ordering::Acquire),
+            "TLS 读线程必须带运行时上下文，否则处理器派不出后台任务"
+        );
+        assert!(got_response, "broker 推来的请求要回包，响应必须写回对端");
     }
 
     #[tokio::test]

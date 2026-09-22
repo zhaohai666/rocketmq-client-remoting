@@ -12,6 +12,7 @@
 #define ROCKETMQ_REMOTING_TLS_SESSION_H
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "rocketmq/common/net_compat.h"
@@ -30,6 +31,18 @@ std::shared_ptr<void> createClientSslContext(std::string& err);
 
 // 一条连接的 TLS 会话。生命周期：connect 后 handshake()，之后 read/writeAll
 // 替代裸 recv/send，close 时析构（内部 best-effort SSL_shutdown）。
+//
+// ⚠ OpenSSL 不支持两个线程同时用**同一个 SSL 对象**（维护者在 openssl/openssl#20622
+// 的原话："You cannot share (most) OpenSSL objects between threads"；openssl-threads(7)
+// 也只承诺"most objects are not safe for simultaneous use"）。而本传输层的形状是
+// "一连接一个读线程 + 调用方线程写"：读线程的 SSL_pending/SSL_read 与调用方的
+// SSL_write 必然在同一条会话上交叠，光靠连接层那把 writeMutex（只锁写侧）挡不住。
+// 所以锁放在**会话内部**，四个入口每次 SSL_* 调用取放一次：
+//   * 粒度是"一次 SSL_* 调用"而不是"一次业务读写"——writeAll 的多次 SSL_write 逐次取放，
+//     重试前的 10ms 睡眠在锁外，绝不抱着锁睡觉；
+//   * 读线程只在 select 报可读（或 SSL_pending>0）时才进 read，正常情况下锁内只有一次
+//     syscall 的量级；只有"记录只到了一半"这种对端停摆的极端情况会抱锁到 SO_RCVTIMEO
+//     （1s）到点，那是这条链路本就要付的代价。
 class TlsSession {
 public:
     explicit TlsSession(std::shared_ptr<void> ctx);
@@ -56,6 +69,8 @@ public:
 private:
     std::shared_ptr<void> ctx_;
     SSL* ssl_ = nullptr;
+    // 会话级 io 锁：见类注释。只包 SSL_* 调用，不包任何睡眠/等待。
+    std::mutex ioMutex_;
 };
 
 #else  // !RMQ_HAS_TLS

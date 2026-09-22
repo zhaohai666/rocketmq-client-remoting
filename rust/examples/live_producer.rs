@@ -1182,8 +1182,12 @@ async fn p7_admin(
     let mq = MessageQueue::new(topic, broker_name, 0);
     let max_offset = p.max_offset(&mq).await.map_err(|e| format!("max_offset: {e}"))?;
     let min_offset = p.min_offset(&mq).await.map_err(|e| format!("min_offset: {e}"))?;
-    let past = p.search_offset(&mq, current_time_millis() - 60_000).await
-        .map_err(|e| format!("search_offset(past): {e}"))?;
+    // 基准不能用「现在减一分钟」：跑到这里时本次运行可能已经过了好几分钟（真机 TLS 上
+    // 等事务回查就吃掉 90s），那样 searchOffset 会跳过早先的消息，判据与时长耦合。
+    // topic 名带本次运行的秒级时间戳、只属于本次运行，所以开跑时刻就是第一条消息之前。
+    let run_started_ms = run.parse::<i64>().unwrap_or_default() * 1000;
+    let past = p.search_offset(&mq, run_started_ms).await
+        .map_err(|e| format!("search_offset(run start): {e}"))?;
     let future = p.search_offset(&mq, current_time_millis() + 600_000).await
         .map_err(|e| format!("search_offset(future): {e}"))?;
     let earliest = p.earliest_msg_store_time(&mq).await

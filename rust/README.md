@@ -27,9 +27,10 @@ Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Rust 实现，迁移�
 | 校验门 | `Validators` / `TopicValidator`：`check_topic` / `check_group` / `is_system_topic` / `is_not_allowed_send_topic` / `check_message`，四类 facade 的 `start()` 在建客户端实例**之前**跑完组名校验（纯本地判定，失败不碰网络） |
 | 压缩 | zlib / LZ4 Frame / ZSTD 三后端：生产端自动压缩 + 消费端自动解压，线上帧格式与 Java lz4-java / zstd-jni 互通 |
 
-**未实测**：对端是**真 broker 的 TLS 端口**的链路（代码在，`ROCKETMQ_TLS_ENABLE=1` 生效，
-本机集群没开 TLS 端口；TLS 读写循环本身有进程内 TLS 服务端的离线回归，见「与 Java 的差异」）、
-Windows / MSVC 分支。
+**未实测**：Windows / MSVC 分支。TLS 分支已按真机跑过：本机 5.5.1 集群在 test-mode 下**同一组端口**
+（nameServer 9876、broker 10911）嗅探 TLS，`ROCKETMQ_TLS_ENABLE=1` 直接生效，六个 `live_*`
+例子合计 **417 项断言全绿**（producer 55 / push consumer 95 / pull 43 / lite-pull 48 /
+mq_client 84 / admin 92+1 skip），实测过程见「与 Java 的差异」的 TLS 条。
 
 ## 依赖
 
@@ -50,17 +51,17 @@ Windows / MSVC 分支。
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 673 条，~1s
+cargo test --lib               # 674 条，~1s
 ```
 
 ## 单元测试
 
-673 条按模块分布（`cargo test --lib -- --list` 可复算）：
+674 条按模块分布（`cargo test --lib -- --list` 可复算）：
 
 | 模块 | 条数 | 覆盖 |
 | --- | --- | --- |
 | `remoting::protocol` | 105 | header 字段名表逐个与 Java 对拍（错一个字母就静默丢字段）、`codes` 常量守卫、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody` 等 body、POP `extraInfo` 8 段反构、JSON 对 fastjson2 非标准输出的容忍（裸数字键、对象 key、NaN/Infinity、尾逗号）、RocketMQ 二进制往返、`RecallMessageRequestHeader` 的 **`bname`** 键名守卫 |
-| `remoting::client` | 20 | 真 socket 回环：同步/异步/oneway、半包重组、并发请求各自匹配 opaque、静默超时、建连失败与坏端口、`close_channel` 强制重连、**GO_AWAY 重连后只重发一次**（第三次不陷入死循环、关掉开关则直接抛）、broker 推送抵达 processor、RPC 钩子在编码前执行、地址切分与帧长守卫；另有 **4 条 TLS 离线回归**（openssl 现造自签证书 + 进程内 `TlsAcceptor`）：3 字节分片的半包续读、1MiB body 完整写出、8 路并发共用一条连接不被读写抢锁饿死、TLS 客户端打明文端口必须映射成连接错误 |
+| `remoting::client` | 21 | 真 socket 回环：同步/异步/oneway、半包重组、并发请求各自匹配 opaque、静默超时、建连失败与坏端口、`close_channel` 强制重连、**GO_AWAY 重连后只重发一次**（第三次不陷入死循环、关掉开关则直接抛）、broker 推送抵达 processor、RPC 钩子在编码前执行、地址切分与帧长守卫；另有 **5 条 TLS 离线回归**（openssl 现造自签证书 + 进程内 `TlsAcceptor`）：3 字节分片的半包续读、1MiB body 完整写出、8 路并发共用一条连接不被读写抢锁饿死、**broker 推来的请求在读线程上拿得到运行时上下文并回得出包**、TLS 客户端打明文端口必须映射成连接错误 |
 | `remoting::rpchook` | 6 | ACL 签名：extFields 按 key 字典序、只拼 value、跳过 `Signature`、再拼 body，与 Java 官方向量对拍 |
 | `common::message_decoder` | 38 | 17 段 / 6 段两条编码路径（切勿混用）、压缩段的 crc32（Java `& 0x7FFFFFFF`）、批量消息、坏数据必须拒收 |
 | `common::consistent_hash` | 8 | 环：MD5 摘要**只取前 4 字节大端**、虚拟节点 key 从 `existingReplicas` 起算、`tailMap` **含端点**、越过环末尾回绕、空环返回 `None`、负虚拟节点数只在构造处报错 |
@@ -118,6 +119,10 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_sql92` | 15 PASS | S1~S4（与 Python/C++/.NET 同场景）：SQL92 订阅启动时正好一笔 `CHECK_CLIENT_CONFIG`(46)、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发 → 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，不是放行全部），`'*'` 对照组收全 6 条，永不匹配的 `color='green'` 收 0 条 → 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线单测 9 项（`client::mq_client`：真 socket mock broker，含 Java 那个「订阅集合里有空 subscriptions 就整轮 `return` 而非 `continue`」的短路怪癖） |
 | `live_acl` | 需开鉴权的集群 | S1~S8：签名被 broker 接受（建 topic / 发送 / 心跳+长轮询+位点三条 RPC 全程带签名）、不带凭据与 secretKey 写错都回 `NO_PERMISSION(16)`、拉模式签名链路。前置是 broker.conf 开 `authenticationEnabled=true` + `LocalAuthenticationMetadataProvider` + `initAuthenticationUser`（本机默认集群关着，跑不了这一项） |
 | `live_compression_matrix` | 矩阵一端 | 与 Java/Python/C++/.NET 探针双向收发压缩消息，由 `../scripts/compression_matrix.sh` 调度 |
+
+上表是明文；**同一批 `live_*` 在 `ROCKETMQ_TLS_ENABLE=1` 下也整套跑过**（2026-09-22 本机 5.5.1
+集群：producer 55、push consumer 95、pull 43、lite-pull 48、mq_client 84、admin 92+1 skip，
+合计 **417 项断言 0 失败**），修掉的那个只有 TLS 才有的静默故障见「与 Java 的差异」。
 
 ## 目录结构
 
@@ -243,10 +248,23 @@ rust/
   `%DLQ%<group>`（`:193`），且存的是 `reconsumeTimes + 1 = 3`（`:228`）、`RETRY_TOPIC` 保留业务
   topic。客户端侧「用尽」的判据来自 `DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890`
   的 `-1 → 16`，回投请求本身不带次数上限。观察窗口给到 150s：整机并发时定时服务会拖档。
-- **Rust TLS 只有离线回归，没有真机 TLS broker**：`remoting::client::tests::tls_*` 4 项用
-  openssl 现造自签证书 + 进程内 `TlsAcceptor`，锁住半包续读、1MiB 大 body 完整写出、
-  8 路并发共用一条连接不互相饿死、打到明文端口必须映射成连接错误；对端换成开 TLS 的
-  broker 还没跑过（本机集群没开 TLS 端口）。ACL 同理，需要开鉴权的 broker 才能跑。
+- **TLS 已按真机跑通，并且修掉过一个只有 TLS 才有的静默故障**：`ROCKETMQ_TLS_ENABLE=1` 打本机
+  5.5.1 集群（test-mode 下 nameServer 9876 与 broker 10911 按首字节嗅探 TLS，不需要改
+  `useTLS`），producer / push consumer / pull / lite-pull / mq_client / admin 六个例子
+  417 项断言全绿。修之前的实测是 producer **51 passed / 4 failed**，同时明文 55/0：broker 每
+  30s（`transactionCheckInterval`）推来的 `CHECK_TRANSACTION_STATE(39)` 三次全被丢掉，日志里只有
+  `checkTransactionState: no tokio runtime to run the transaction check`。根因在传输层：
+  `connect_tls` 的读写线程是普通 std 线程，而运行时句柄是**惰性**从当前 tokio 上下文取的
+  （`Inner::runtime_handle()` → `Handle::try_current()`）—— 明文路径的读循环本来就是 tokio 任务，
+  顺手把句柄缓存了下来，纯 TLS 进程却一次都没进过运行时，于是 `ResponseSink::respond` 与回查
+  处理器派不出任何后台任务。现在 `connect_tls`（async，必在运行时里）先把句柄取出来，读线程再
+  `Handle::enter()` 包住整个读循环。离线守卫：`tls_inbound_request_is_processed_with_a_runtime_context`
+  （进程内 TLS 服务端主动推一帧事务回查，断言处理器拿得到运行时**且**响应真写回对端；去掉修复会
+  原样打出那句 warn 并失败）。同一条断言在真机侧由 `live_producer` P6 守着。
+  另外 TLS 的 `live_producer` 里 P7 offset 那项当时也一起红了 —— 那是回查把整轮拖过 90s、
+  「now-60s」基准越过了 topic 首条消息，属于该断言自己耦合运行时长，已改成以本进程开跑时刻为基准。
+  其余 TLS 读写循环的回归（半包续读、1MiB body、8 路并发共线不饿死、明文端口映射成连接错误）见上表。
+  ACL 仍需开鉴权的 broker 才能跑（本机集群 `aclEnable=false`）。
   SQL92 过滤不在此列：`CHECK_CLIENT_CONFIG`(46) 已接进 push consumer 的 `start()`，
   离线 9 项 + 真机 `live_sql92` 15 项都在本机 5.5.1 集群（`enablePropertyFilter=true`）跑过。
 
