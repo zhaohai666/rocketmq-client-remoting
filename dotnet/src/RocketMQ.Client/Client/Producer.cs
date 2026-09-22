@@ -87,6 +87,37 @@ public class DefaultMQProducer
     private AsyncTraceDispatcher? _traceDispatcher;
     // 异步发送线程句柄，shutdown 时统一 join 回收
     private readonly List<Thread> _asyncThreads = new();
+    // ---------------- 异步发送背压（对应 Java DefaultMQProducerImpl:122-153）----------------
+    // 开关默认关闭，与 Java 同。两个信号量在**构造**时建好（不是 Start()）：开关允许运行时
+    // 才打开，那时闸必须已经在了。
+    private bool _enableBackpressureForAsyncMode;
+    private int _backPressureForAsyncSendNum = 1024;
+    private int _backPressureForAsyncSendSize = 100 * 1024 * 1024;
+    private readonly FairSemaphore _semaphoreAsyncSendNum;
+    private readonly FairSemaphore _semaphoreAsyncSendSize;
+
+    // 建背压信号量时的初始许可（Java DefaultMQProducerImpl:141-153）：配置**不高于**地板值时
+    // 用地板值，并记一条 info —— Java 的分支是 `cfg > 10 ? new Semaphore(max(cfg, 10)) : new
+    // Semaphore(10)`，所以恰好等于地板值时也会打这条日志。
+    private static long BackPressurePermits(int configured, long floor, string name)
+    {
+        if (configured > floor)
+        {
+            return configured;
+        }
+
+        ClientLog.Info(name + " can not be smaller than "
+                       + floor.ToString(CultureInfo.InvariantCulture) + ".");
+        return floor;
+    }
+
+    // 扣多少「字节」许可（Java executeAsyncMessageSend:642 的
+    // `msg.getBody() == null ? 1 : msg.getBody().length`）：不给空 body 算 1 就等于不限流。
+    private static long BackPressureMsgLen(Message msg)
+    {
+        byte[] body = msg.Body;
+        return body.Length == 0 ? 1 : body.Length;
+    }
 
     public DefaultMQProducer(string producerGroup = MixAll.DefaultProducerGroup)
     {
@@ -96,6 +127,13 @@ public class DefaultMQProducer
         }
 
         _producerGroup = producerGroup;
+        // Java 在建 impl 时就把两个公平信号量建好（DefaultMQProducerImpl:141-153）
+        _semaphoreAsyncSendNum = new FairSemaphore(
+            BackPressurePermits(_backPressureForAsyncSendNum, FairSemaphore.MinAsyncSendNum,
+                "semaphoreAsyncSendNum"));
+        _semaphoreAsyncSendSize = new FairSemaphore(
+            BackPressurePermits(_backPressureForAsyncSendSize, FairSemaphore.MinAsyncSendSize,
+                "semaphoreAsyncSendSize"));
         // opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE
         _enableTraceContext = TraceParentContext.EnabledFromEnv();
     }
@@ -401,6 +439,50 @@ public class DefaultMQProducer
         get => _compressType;
         set => _compressType = value;
     }
+
+    // ---------------- 异步发送背压（对应 Java DefaultMQProducer:1368-1408）----------------
+    // 开关默认关闭（与 Java 同），而且**不是**启动期配置：跑到一半也能打开/关掉，
+    // 因为只有闸本身读它（见 SendAsync）。
+    public bool EnableBackpressureForAsyncMode
+    {
+        get => _enableBackpressureForAsyncMode;
+        set => _enableBackpressureForAsyncMode = value;
+    }
+
+    /// <summary>
+    /// 运行时改「在途条数」上限（Java setBackPressureForAsyncSendNum:1383-1391）。语义不是
+    /// 「设成 num」而是「总量变成 num、已经在途的那几份原样保留」，所以调小之后
+    /// <see cref="SemaphoreAsyncSendNumAvailablePermits" /> 可能为负。低于地板值 10 时夹到 10。
+    /// </summary>
+    public int BackPressureForAsyncSendNum
+    {
+        get => _backPressureForAsyncSendNum;
+        set
+        {
+            _backPressureForAsyncSendNum = Math.Max(value, (int)FairSemaphore.MinAsyncSendNum);
+            _semaphoreAsyncSendNum.SetTotalPermits(_backPressureForAsyncSendNum);
+        }
+    }
+
+    /// <summary>在途字节数上限，地板值 1M，语义同 <see cref="BackPressureForAsyncSendNum" />。</summary>
+    public int BackPressureForAsyncSendSize
+    {
+        get => _backPressureForAsyncSendSize;
+        set
+        {
+            _backPressureForAsyncSendSize = Math.Max(value, (int)FairSemaphore.MinAsyncSendSize);
+            _semaphoreAsyncSendSize.SetTotalPermits(_backPressureForAsyncSendSize);
+        }
+    }
+
+    public int GetBackPressureForAsyncSendNum() => _backPressureForAsyncSendNum;
+
+    public int GetBackPressureForAsyncSendSize() => _backPressureForAsyncSendSize;
+
+    /// <summary>观测用（Java DefaultMQProducerImpl:200-206）：当前空闲许可，负数表示在途超额。</summary>
+    public long SemaphoreAsyncSendNumAvailablePermits => _semaphoreAsyncSendNum.AvailablePermits();
+
+    public long SemaphoreAsyncSendSizeAvailablePermits => _semaphoreAsyncSendSize.AvailablePermits();
 
     // Request-Reply：等待应答的超时（默认 3000ms，与 Java/Python 对齐）。
     // 任何 <= 0 的值都回退到默认 3000，避免把发送路径的超时设成 0。
@@ -1078,6 +1160,17 @@ public class DefaultMQProducer
     // ---------------- 异步 / 单向 ----------------
 
     // 后台线程执行发送并回调；调用方可安全释放 callback。
+    //
+    // 开了 EnableBackpressureForAsyncMode 之后，起线程**之前**还要过一道闸
+    // （executeAsyncMessageSend，Java DefaultMQProducerImpl:635-682）：按条数和字节数各拿一份
+    // 许可，拿不到就回调 RemotingTooMuchRequestException 的文案。这道闸**在调用方线程上等**，
+    // 所以背压打满时「异步」会退化成「等满 timeout 再报错」。许可在把结果交给用户**之前**归还
+    // （Java BackpressureSendCallBack.semaphoreProcessor:599-610 是先 size 后 num），否则用户
+    // 回调里再发一笔异步消息会多占一格。
+    //
+    // 与 Java 的一处结构差别：本端口没有 AsyncSenderExecutor 线程池（每次发送起一条线程，
+    // 见 #50 待办），所以 Java「队满时开了背压就地跑完这一笔」那条分支在这里没有对应物 ——
+    // 没有队列可满。
     public void SendAsync(Message msg, ISendCallback callback, int timeoutMillis = -1)
     {
         // 先确认已启动（与 Python 一致：未启动立即抛，而不是在后台线程里静默失败）
@@ -1085,6 +1178,50 @@ public class DefaultMQProducer
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         Message captured = CloneMessage(msg);
         ISendCallback? cb = callback;
+        // 许可按**压缩前**的 body 长度扣（Java 在调用方线程上算，那时还没压缩）
+        long msgLen = BackPressureMsgLen(msg);
+        bool numAcquired = false;
+        bool sizeAcquired = false;
+        // 链的终点归还，且只归还本次真正拿到的那份
+        void ReleasePermits()
+        {
+            if (sizeAcquired)
+            {
+                _semaphoreAsyncSendSize.Release(msgLen);
+            }
+
+            if (numAcquired)
+            {
+                _semaphoreAsyncSendNum.Release(1);
+            }
+
+            sizeAcquired = false;
+            numAcquired = false;
+        }
+
+        if (_enableBackpressureForAsyncMode)
+        {
+            double began = UtilAll.MonotonicMillis();
+            // 两个许可**顺序**申请、都用「从 began 算起的剩余预算」去等（Java :648 / :661
+            // 都是 `timeout - costTime`），所以第一个闸就能把预算花光
+            int numBudget = timeout - (int)(UtilAll.MonotonicMillis() - began);
+            numAcquired = numBudget > 0 && _semaphoreAsyncSendNum.TryAcquire(1, numBudget);
+            if (!numAcquired)
+            {
+                cb?.OnException("send message tryAcquire semaphoreAsyncNum timeout");
+                return;
+            }
+
+            int sizeBudget = timeout - (int)(UtilAll.MonotonicMillis() - began);
+            sizeAcquired = sizeBudget > 0
+                          && _semaphoreAsyncSendSize.TryAcquire(msgLen, sizeBudget);
+            if (!sizeAcquired)
+            {
+                ReleasePermits();  // 已经拿到的条数许可不能留在闸上
+                cb?.OnException("send message tryAcquire semaphoreAsyncSize timeout");
+                return;
+            }
+        }
 
         var th = new Thread(() =>
         {
@@ -1095,10 +1232,13 @@ public class DefaultMQProducer
             try
             {
                 SendResult result = Send(captured, timeout);
+                // 先还许可再交给用户（Java 的包装回调就是这个顺序）
+                ReleasePermits();
                 cb?.OnSuccess(result);
             }
             catch (Exception e)
             {
+                ReleasePermits();
                 cb?.OnException(e.Message);
             }
         });

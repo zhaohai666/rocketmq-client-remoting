@@ -627,19 +627,51 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>总预算用完：抛 RemotingTooMuchRequestException，而不是「重试耗尽」。</summary>
+    /// <summary>
+    /// 总预算用完：抛 RemotingTooMuchRequestException 而不是「重试耗尽」，且第二笔不许上线。
+    ///
+    /// ⚠ 预算是让**发送钩子睡 120ms** 吃掉的，不靠 broker 的应答延迟：后者的耗时恰好等于
+    /// 本次调用的预算（100ms 的等待在 100.0~100.9ms 之间返回完全正常），而判定是
+    /// <c>timeout &lt; costTime</c> 的整数毫秒比较（Java 用 currentTimeMillis，同样如此），
+    /// 卡在边界上就会偶发地多跑一笔 0ms 预算的尝试、最后抛成「重试耗尽」——实测整跑测试集时
+    /// 会随机红一次。python 同题用例（test_send_retry.py
+    /// ::test_call_timeout_stops_retrying_and_raises_too_much_request）用的是同一招：
+    /// 往发送路径注入 first_send_sleep_ms=60 &gt; timeout=30。
+    /// </summary>
     [Fact]
     public void ExhaustedBudget_ReportsCallTimeout()
     {
         using var cluster = MockCluster.Start(1);
-        cluster.Script(0, new List<(int, int)> { (ResponseCode.Success, 300) },
-            (ResponseCode.Success, 300));
-        DefaultMQProducer producer = Started(cluster, "GID_RetryBudget");
-        producer.SendMsgTimeout = 100;
-        producer.RetryTimesWhenSendFailed = 2;
+        cluster.Script(0, new List<(int, int)>(), (ResponseCode.SystemError, 0));
+        var producer = new DefaultMQProducer("GID_RetryBudget")
+        {
+            NamesrvAddr = cluster.NamesrvAddr,
+            InstanceName = "GID_RetryBudget",
+            SendMsgTimeout = 100,
+            RetryTimesWhenSendFailed = 2,
+        };
+        producer.RegisterSendMessageHook(new SleepBeforeHook(120));
+        producer.Start();
 
         Assert.Throws<RemotingTooMuchRequestException>(() => producer.Send(Msg()));
+        Assert.Equal(1, cluster.Requests(0));
         producer.Shutdown();
+    }
+
+    /// <summary>在 SendMessageBefore 里睡 fixed 毫秒：把耗时确定地加进发送路径本身。</summary>
+    private sealed class SleepBeforeHook : ISendMessageHook
+    {
+        private readonly int _millis;
+
+        public SleepBeforeHook(int millis) => _millis = millis;
+
+        public string HookName() => "sleep-before";
+
+        public void SendMessageBefore(SendMessageContext context) => Thread.Sleep(_millis);
+
+        public void SendMessageAfter(SendMessageContext context)
+        {
+        }
     }
 
     /// <summary>「存了但没存好」：默认原样返回，开了开关才换 broker。</summary>
