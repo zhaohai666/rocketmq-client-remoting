@@ -21,14 +21,14 @@ namespace RocketMQ.Client;
 /// </summary>
 public class DefaultMQProducer
 {
-    // 异步发送线程的递增序号，用于线程命名（对齐 Java 线程工厂 "AsyncSenderThread_" + n 的后缀）。
-    // 进程级递增，与 Java 的 ThreadFactoryImpl 计数器语义一致（C++ 用匿名命名空间里的
-    // nextAsyncSenderSeq()，这里用进程级静态字段 + Interlocked 实现）。
-    private static int _nextAsyncSenderSeq;
-
     private readonly object _lock = new();
     private MQClientInstance? _mqClient;
     private bool _started;
+
+    /// <summary>已经调过 <see cref="Shutdown"/>：用来在「排空在途发送」这段时间里拒绝新请求，
+    /// 同时让 <see cref="GetClient"/> 报出与 Java <c>SHUTDOWN_ALREADY</c> 同义的文案。
+    /// 对应 Java 的 <c>ServiceState.SHUTDOWN_ALREADY</c>。</summary>
+    private volatile bool _shutdownRequested;
 
     private string _producerGroup;
     private string _instanceName = MixAll.DefaultInstanceName;
@@ -85,8 +85,21 @@ public class DefaultMQProducer
     private readonly List<IEndTransactionHook> _endTransactionHooks = new();
     private readonly List<ICheckForbiddenHook> _checkForbiddenHooks = new();
     private AsyncTraceDispatcher? _traceDispatcher;
-    // 异步发送线程句柄，shutdown 时统一 join 回收
-    private readonly List<Thread> _asyncThreads = new();
+    // ---------------- 异步发送池（对应 Java DefaultMQProducerImpl:133-140 + NettyRemotingClient:152-157）----------------
+    // AsyncSenderExecutor：把「拉路由、选队列、建请求、换 broker 重试」这些准备工作从调用方
+    // 线程挪走。core==max==CPU 核数、队列**有界**（Java 的 LinkedBlockingQueue(50000)）。
+    // NettyClientPublicExecutor：用户回调与 SendMessageHook.after 在这里跑，绝不让业务代码
+    // 占着连接的读线程或超时清理线程（Java 的 executeInvokeCallback 就是 submit 给 publicExecutor）。
+    // 两个池都 keepAlive 60s 且 core==max，所以线程按需创建、创建后不退出。
+    private ConsumeExecutor? _asyncSenderExecutor;
+    /// <summary>内建池才由 <see cref="Shutdown"/> 负责排空（Java 只关 defaultAsyncSenderExecutor）。</summary>
+    private bool _asyncSenderExecutorOwned = true;
+    private ConsumeExecutor? _callbackExecutor;
+    // Java DefaultMQProducer:140 / :133 —— 异步重试次数与发送队列容量
+    private int _retryTimesWhenSendAsyncFailed = 2;
+    private int _asyncSenderQueueCapacity = 50000;
+    // Java NettyRemotingClient:152 —— 回调池线程数，0 = 用 CPU 核数
+    private int _clientCallbackExecutorThreads;
     // ---------------- 异步发送背压（对应 Java DefaultMQProducerImpl:122-153）----------------
     // 开关默认关闭，与 Java 同。两个信号量在**构造**时建好（不是 Start()）：开关允许运行时
     // 才打开，那时闸必须已经在了。
@@ -205,6 +218,44 @@ public class DefaultMQProducer
     {
         get => _retryTimesWhenSendFailed;
         set => _retryTimesWhenSendFailed = value;
+    }
+
+    /// <summary>对应 Java <c>DefaultMQProducer.retryTimesWhenSendAsyncFailed</c>（:140，默认 2）：
+    /// **异步**发送的重试次数，与同步那份分开配置。只在异步链里生效：换一台 broker、给同一个
+    /// 请求换新 opaque 再试，上限就是这个数（首次尝试不计）。异步发送**不看**
+    /// <see cref="RetryTimesWhenSendFailed"/>，也**不看** <c>RetryResponseCodes</c>
+    /// —— broker 明确回了错误码就不再换 broker（Java <c>onExceptionImpl</c> 的
+    /// <c>needRetry</c> 只在「没收到响应」时为真）。</summary>
+    public int RetryTimesWhenSendAsyncFailed
+    {
+        get => _retryTimesWhenSendAsyncFailed;
+        set => _retryTimesWhenSendAsyncFailed = value;
+    }
+
+    /// <summary>对应 Java <c>DefaultMQProducerImpl:133</c> 写死的 <c>LinkedBlockingQueue(50000)</c>：
+    /// 异步发送队列容量。只在 <see cref="Start"/> 读一次（Java 也只在构造时定）。队列满了
+    /// <c>SendAsync</c> 向调用方抛 <c>MQClientException("executor rejected")</c>，开了背压则
+    /// 就地跑完那一笔（Java <c>:675-681</c>）。</summary>
+    public int AsyncSenderQueueCapacity
+    {
+        get => _asyncSenderQueueCapacity;
+        set => _asyncSenderQueueCapacity = value;
+    }
+
+    /// <summary>对应 Java <c>DefaultMQProducer.setAsyncSenderExecutor:1157-1161</c> +
+    /// <c>DefaultMQProducerImpl.getAsyncSenderExecutor:1608-1613</c>：自带异步发送池时
+    /// 内建池不再创建，<see cref="Shutdown"/> 也**不等它、不关它**（Java 只
+    /// <c>defaultAsyncSenderExecutor.shutdown()</c>）—— 池的生命周期归调用方。
+    /// 必须在 <see cref="Start"/> 之前设（池在 Start 里定）。</summary>
+    public ConsumeExecutor? AsyncSenderExecutor { get; set; }
+
+    /// <summary>对应 Java <c>NettyRemotingClient:152-157</c> 的 publicExecutor 线程数：
+    /// 用户回调与 after 钩子跑在几根线程上。0（默认）= CPU 核数；必须在
+    /// <see cref="Start"/> 之前设，池是启动时建的。</summary>
+    public int ClientCallbackExecutorThreads
+    {
+        get => _clientCallbackExecutorThreads;
+        set => _clientCallbackExecutorThreads = value;
     }
 
     /// <summary>
@@ -556,6 +607,14 @@ public class DefaultMQProducer
                 CheckTransactionState);
 
             _started = true;
+            // 允许 Shutdown 之后再 Start（Shutdown 的那半程里 _started 还是 true，靠这个标记
+            // 挡住重复 Shutdown；重新 Start 就要把它清掉）
+            _shutdownRequested = false;
+            // 允许 Shutdown 之后再 Start（Java 也支持重新 start）：这道闸必须跟着复位
+            _shutdownRequested = false;
+            // 异步发送池（Java 在 DefaultMQProducerImpl 构造时建，这里等价放在 Start 的锁内）：
+            // 必须早于 _started=true 之后任何一次 SendAsync —— SendAsync 只在锁里取句柄。
+            CreateAsyncExecutors();
             ClientLog.Info("DefaultMQProducer[" + _producerGroup + "] started, clientId=" + _clientId);
 
             // 心跳线程：周期性向 broker 注册 ProducerData。broker 的事务回查正是通过
@@ -571,19 +630,53 @@ public class DefaultMQProducer
         StartTraceDispatcher();
     }
 
+    /// <summary>建异步发送链的两个池（对应 Java <c>DefaultMQProducerImpl:133-140</c> 与
+    /// <c>NettyRemotingClient:152-157</c>），线程名对齐 Java 的 <c>ThreadFactoryImpl</c>
+    /// （<c>AsyncSenderExecutor_1…</c> / <c>NettyClientPublicExecutor_1…</c>，序号从 1 起）。</summary>
+    private void CreateAsyncExecutors()
+    {
+        int cores = Math.Max(1, Environment.ProcessorCount);
+        // 对应 Java DefaultMQProducerImpl.getAsyncSenderExecutor:1608-1613：
+        // 调用方给了自定义池就用它的，内建池只在没给的时候建。
+        _asyncSenderExecutorOwned = AsyncSenderExecutor is null;
+        _asyncSenderExecutor = AsyncSenderExecutor ?? new ConsumeExecutor(
+            cores, cores, 60.0, "AsyncSenderExecutor",
+            maxQueueSize: _asyncSenderQueueCapacity, threadNameSep: "_", threadIndexFrom: 1);
+        int callbackThreads = _clientCallbackExecutorThreads;
+        if (callbackThreads <= 0)
+        {
+            // Java：默认 availableProcessors；显式配成 <=0 时 NettyRemotingClient 兜到 4
+            callbackThreads = cores;
+        }
+
+        _callbackExecutor = new ConsumeExecutor(
+            callbackThreads, callbackThreads, 60.0, "NettyClientPublicExecutor",
+            threadNameSep: "_", threadIndexFrom: 1);
+    }
+
     public void Shutdown()
     {
         List<Thread> threads;
+        ConsumeExecutor? sender;
+        ConsumeExecutor? callback;
+        bool senderOwned;
         lock (_lock)
         {
-            if (!_started)
+            if (!_started || _shutdownRequested)
             {
                 return;
             }
 
-            _started = false;
-            threads = new List<Thread>(_asyncThreads);
-            _asyncThreads.Clear();
+            // ⚠ 这里**先不**把 _started 翻掉：排空发送池时还要跑准备段，而准备段要用客户端
+            //（GetClient / 建连 / 发请求）。提前翻掉会让排在队列里的任务统统变成
+            // "producer not started"，排空就成了走个形式。拒绝新请求由 _shutdownRequested
+            // 和置空的两个池负责，语义等价于 Java 的 SHUTDOWN_ALREADY。
+            _shutdownRequested = true;
+            sender = _asyncSenderExecutor;
+            callback = _callbackExecutor;
+            senderOwned = _asyncSenderExecutorOwned;
+            _asyncSenderExecutor = null;
+            _callbackExecutor = null;
 
             // 先停心跳线程（它内部持有 mqClient 引用）
             _heartbeatRunning = false;
@@ -594,12 +687,37 @@ public class DefaultMQProducer
 
             lock (_txThreadsLock)
             {
-                threads.AddRange(_txThreads);
+                threads = new List<Thread>(_txThreads);
                 _txThreads.Clear();
             }
         }
 
-        // 先回收异步线程（它们内部持有 mqClient_ 引用），再关客户端
+        // 先回收异步发送池（它们内部持有 mqClient 引用），再关客户端：
+        // 排空（wait=true）而不是只 shutdown()。Java/Python 用的是不等待的
+        // <c>defaultAsyncSenderExecutor.shutdown()</c>，于是「send_async 完立刻 shutdown」会
+        // 把队列里还没跑到的准备段连同任务一起丢掉；这里等到队列跑完，保证交进来的
+        // 每一笔都**跑完准备段并把报文交给传输层**。
+        // ⚠ 排空的只是准备段（含换 broker 重试的发起）：网络等待在传输层的线程上，不等。
+        // ⚠ 保证止于「交给传输层」：紧接着就要关客户端，broker 还没读走的**尾部**几帧会随
+        // 连接一起丢掉（离线跑整套用例时实测 32/36 上线、单跑稳定 36/36），响应没回来的那几笔
+        // 也拿不到终态回调 —— 后一条与 Java 同构（关客户端会停掉超时清理并清空在途表，没人再
+        // 负责投递）。调用方要确保每一笔都拿到回调，就得自己等回调再 Shutdown。
+        // 调用方自带的池（Java setAsyncSenderExecutor）不动它 —— 池归它自己管。
+        if (senderOwned)
+        {
+            sender?.Shutdown(true);
+        }
+        // 回调池同理：等已排队的回调跑完。响应在此之后才回来的那一笔，
+        // CompleteOnCallbackThread 见池已关就地转交用户回调（与 Python 的兜底同一条）。
+        callback?.Shutdown(true);
+
+        // 准备段都跑完了才宣布「不再活着」：此后任何路径都拿不到客户端。
+        lock (_lock)
+        {
+            _started = false;
+        }
+
+        // 事务回查线程仍按老口径 join（它们也持有 mqClient 引用）
         foreach (Thread t in threads)
         {
             try
@@ -639,7 +757,11 @@ public class DefaultMQProducer
     {
         if (!_started || _mqClient is null)
         {
-            throw new MQClientException("producer not started, call start() first");
+            // 分得清「没启动」和「已经关掉」：Java 用 ServiceState 区分 CREATE_JUST 与
+            // SHUTDOWN_ALREADY，这里靠 _shutdownRequested 做到同一条判据。
+            throw new MQClientException(_shutdownRequested
+                ? "producer already shutdown"
+                : "producer not started, call start() first");
         }
 
         return _mqClient;
@@ -1159,95 +1281,584 @@ public class DefaultMQProducer
 
     // ---------------- 异步 / 单向 ----------------
 
-    // 后台线程执行发送并回调；调用方可安全释放 callback。
-    //
-    // 开了 EnableBackpressureForAsyncMode 之后，起线程**之前**还要过一道闸
-    // （executeAsyncMessageSend，Java DefaultMQProducerImpl:635-682）：按条数和字节数各拿一份
-    // 许可，拿不到就回调 RemotingTooMuchRequestException 的文案。这道闸**在调用方线程上等**，
-    // 所以背压打满时「异步」会退化成「等满 timeout 再报错」。许可在把结果交给用户**之前**归还
-    // （Java BackpressureSendCallBack.semaphoreProcessor:599-610 是先 size 后 num），否则用户
-    // 回调里再发一笔异步消息会多占一格。
-    //
-    // 与 Java 的一处结构差别：本端口没有 AsyncSenderExecutor 线程池（每次发送起一条线程，
-    // 见 #50 待办），所以 Java「队满时开了背压就地跑完这一笔」那条分支在这里没有对应物 ——
-    // 没有队列可满。
-    public void SendAsync(Message msg, ISendCallback callback, int timeoutMillis = -1)
+    /// <summary>异步发送（对应 Java <c>DefaultMQProducerImpl.send(msg, SendCallback, timeout)</c>
+    /// 的整条链，移植自 Python <c>send_async</c>）：<b>调用方立即返回</b>，四段与 Java 逐段对齐：
+    ///
+    /// 1. 先过背压闸（<see cref="EnableBackpressureForAsyncMode"/>，Java
+    ///    <c>executeAsyncMessageSend:635-682</c>）。这道闸<b>在调用方线程上等</b>，与
+    ///    Java/Python/C++ 同，所以背压打满时「异步」会退化成「等满 timeout 再报错」。
+    /// 2. 任务投进 <c>AsyncSenderExecutor_N</c>（core==max==CPU 核数、队列有界
+    ///    <see cref="AsyncSenderQueueCapacity"/>，默认 50000，同 Java 写死的
+    ///    <c>LinkedBlockingQueue(50000)</c>）。队满 ≡ Java <c>submit</c> 抛
+    ///    <c>RejectedExecutionException</c> → <c>MQClientException("executor rejected")</c>，
+    ///    <b>抛给调用方</b>而不走回调；只有开了背压才改走 Java <c>:675-681</c> 的「就地跑完
+    ///    这一笔」—— 那边扣许可发生在入队<b>之前</b>，不跑完就要白等超时才归还。
+    /// 3. 出队之后才算真实耗时：预算被排队吃掉直接回调
+    ///    <c>RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")</c>，不再发请求。
+    /// 4. <c>sendKernelImpl</c> 的 ASYNC 分支（<see cref="SendKernelAsync"/>）：地址解析 →
+    ///    拦截钩子 → 建请求（<b>只建一次</b>）→ before 钩子 → <c>invokeAsync</c>。失败进
+    ///    <see cref="AsyncSendChain.OnException"/>（Java <c>onExceptionImpl</c>）：换一台 broker
+    ///    的队列、给<b>同一个请求</b>换新 opaque 再试，上限
+    ///    <see cref="RetryTimesWhenSendAsyncFailed"/>；超时预算是所有尝试<b>共享</b>的剩余时间。
+    ///    broker 明确回了错误码<b>不进</b>重试链（异步不看 <c>RetryResponseCodes</c>）。
+    ///
+    /// 链的终点固定是 <see cref="CompleteAsync"/>：after 钩子 → 归还许可 → 用户回调，用户回调
+    /// <b>恰好一次</b>，且跑在 <c>NettyClientPublicExecutor_N</c> 上（Java 的
+    /// <c>executeInvokeCallback</c> 就是把回调 submit 给 publicExecutor，为的是不让业务代码占着
+    /// 连接的读线程或超时清理线程）。
+    ///
+    /// 与 Java 的两处有意差别：未 <see cref="Start"/> / 池已关时<b>同步抛</b>（Java 走回调，
+    /// 那样问题更难查），与 Python 一致；批量消息没有异步内核可用，于是在池线程里同步发一批、
+    /// 回调照样转交（Python/Rust 同构，对调用方语义没差别）。
+    /// </summary>
+    public void SendAsync(Message msg, ISendCallback callback, int timeoutMillis = -1,
+        MessageQueue? mq = null)
     {
         // 先确认已启动（与 Python 一致：未启动立即抛，而不是在后台线程里静默失败）
         _ = GetClient();
-        int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
-        Message captured = CloneMessage(msg);
-        ISendCallback? cb = callback;
-        // 许可按**压缩前**的 body 长度扣（Java 在调用方线程上算，那时还没压缩）
-        long msgLen = BackPressureMsgLen(msg);
-        bool numAcquired = false;
-        bool sizeAcquired = false;
-        // 链的终点归还，且只归还本次真正拿到的那份
-        void ReleasePermits()
+        ConsumeExecutor? executor;
+        lock (_lock)
         {
-            if (sizeAcquired)
-            {
-                _semaphoreAsyncSendSize.Release(msgLen);
-            }
-
-            if (numAcquired)
-            {
-                _semaphoreAsyncSendNum.Release(1);
-            }
-
-            sizeAcquired = false;
-            numAcquired = false;
+            executor = _asyncSenderExecutor;
         }
+
+        if (executor is null)
+        {
+            throw new MQClientException("producer already shutdown");
+        }
+
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
+        // 链上带的是**克隆**：压缩会就地改 body，不能改调用方那份；许可按**压缩前**的长度扣
+        //（Java 在调用方线程上算，那时还没压缩）
+        Message captured = CloneMessage(msg);
+        long msgLen = BackPressureMsgLen(msg);
+        double began = UtilAll.MonotonicMillis();
+        var permits = new AsyncSendPermits(_semaphoreAsyncSendNum, _semaphoreAsyncSendSize, msgLen);
 
         if (_enableBackpressureForAsyncMode)
         {
-            double began = UtilAll.MonotonicMillis();
             // 两个许可**顺序**申请、都用「从 began 算起的剩余预算」去等（Java :648 / :661
             // 都是 `timeout - costTime`），所以第一个闸就能把预算花光
             int numBudget = timeout - (int)(UtilAll.MonotonicMillis() - began);
-            numAcquired = numBudget > 0 && _semaphoreAsyncSendNum.TryAcquire(1, numBudget);
-            if (!numAcquired)
+            permits.NumAcquired = numBudget > 0 && _semaphoreAsyncSendNum.TryAcquire(1, numBudget);
+            if (!permits.NumAcquired)
             {
-                cb?.OnException("send message tryAcquire semaphoreAsyncNum timeout");
+                CompleteAsync(callback, null,
+                    new RemotingTooMuchRequestException(
+                        "send message tryAcquire semaphoreAsyncNum timeout"), null, permits,
+                    onCallbackPool: false);
                 return;
             }
 
             int sizeBudget = timeout - (int)(UtilAll.MonotonicMillis() - began);
-            sizeAcquired = sizeBudget > 0
-                          && _semaphoreAsyncSendSize.TryAcquire(msgLen, sizeBudget);
-            if (!sizeAcquired)
+            permits.SizeAcquired = sizeBudget > 0
+                                   && _semaphoreAsyncSendSize.TryAcquire(msgLen, sizeBudget);
+            if (!permits.SizeAcquired)
             {
-                ReleasePermits();  // 已经拿到的条数许可不能留在闸上
-                cb?.OnException("send message tryAcquire semaphoreAsyncSize timeout");
+                // 已经拿到的条数许可不能留在闸上（Java 靠两个标记做到这一点）
+                CompleteAsync(callback, null,
+                    new RemotingTooMuchRequestException(
+                        "send message tryAcquire semaphoreAsyncSize timeout"), null, permits,
+                    onCallbackPool: false);
                 return;
             }
         }
 
-        var th = new Thread(() =>
+        void Run()
         {
-            // 线程名对齐 Java 的 ThreadFactoryImpl("AsyncSenderThread_")
-            ClientLog.SetThreadName("AsyncSenderThread_"
-                                    + (Interlocked.Increment(ref _nextAsyncSenderSeq) - 1)
-                                        .ToString(CultureInfo.InvariantCulture));
+            // 出队之后才算真实耗时（Java 的 beginTimestampFirst 也是出队后取的）
+            long cost = (long)(UtilAll.MonotonicMillis() - began);
+            if (timeout <= cost)
+            {
+                CompleteAsync(callback, null,
+                    new RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout"),
+                    null, permits, onCallbackPool: false);
+                return;
+            }
+
             try
             {
-                SendResult result = Send(captured, timeout);
-                // 先还许可再交给用户（Java 的包装回调就是这个顺序）
-                ReleasePermits();
-                cb?.OnSuccess(result);
+                SendAsyncInner(captured, mq, callback, permits, timeout - (int)cost);
             }
             catch (Exception e)
             {
-                ReleasePermits();
-                cb?.OnException(e.Message);
+                // Java：runnable 的 catch → newCallBack.onException(e)
+                CompleteAsync(callback, null, e, null, permits, onCallbackPool: false);
             }
-        });
-        // 设为后台线程，避免宿主进程退出时因未显式 shutdown 而卡住
-        th.IsBackground = true;
-        th.Start();
+        }
+
+        try
+        {
+            executor.Submit(Run);
+        }
+        catch (RejectedExecutionException)
+        {
+            if (_enableBackpressureForAsyncMode)
+            {
+                // Java :675-681：许可已经扣掉了，就地跑完这一笔（**阻塞调用方**），好让回调
+                // 把许可还回来；否则队列一满就直接抛，白扣的容量还得等超时才还得回来。
+                Run();
+            }
+            else
+            {
+                throw new MQClientException("executor rejected");
+            }
+        }
+    }
+
+    /// <summary>对应 Java <c>sendDefaultImpl(ASYNC)</c> 的准备工作（Python
+    /// <c>_send_async_inner</c>）：校验、压缩、选队列。压缩在重试链<b>之外</b>做一次，
+    /// 否则每轮把已压缩的 body 再压一遍。<c>timesTotal</c> 固定为 1（Java
+    /// <c>sendDefaultImpl:756</c>）：换 broker 的重试全在 <c>onExceptionImpl</c> 里。</summary>
+    private void SendAsyncInner(Message msg, MessageQueue? mq, ISendCallback callback,
+        AsyncSendPermits permits, int timeout)
+    {
+        MQClientInstance c = GetClient();
+        if (msg.IsBatch)
+        {
+            // 批量没有异步内核（Java 有，本端口的批量只有同步内核）：在池线程里同步发一批，
+            // 结果照样从 CompleteAsync 走回调池转交。与 Python/Rust 同一处理。
+            SendResult sent = Send(msg, timeout);
+            CompleteAsync(callback, sent, null, null, permits);
+            return;
+        }
+
+        if (_namespace.Length != 0)
+        {
+            msg.Topic = NamespaceUtil.WrapNamespace(_namespace, msg.Topic);
+        }
+
+        CheckMessage(msg);
+        int sysFlag = PrepareForSend(msg);
+        if (mq is not null)
+        {
+            // Java send(msg, mq, cb, timeout) → sendKernelImpl 定点发，传下去的
+            // topicPublishInfo 是 null，所以失败只会在**同一台 broker** 上换 opaque 重试。
+            SendKernelAsync(c, msg, mq, null, callback, permits, timeout, sysFlag);
+            return;
+        }
+
+        TopicPublishInfo publish;
+        try
+        {
+            publish = TryToFindTopicPublishInfo(c, msg.Topic);
+        }
+        catch (MQClientException e)
+        {
+            throw new MQClientException(e.Message, ClientErrorCode.NotFoundTopicException);
+        }
+
+        MessageQueue selected;
+        try
+        {
+            selected = _mqFaultStrategy.SelectOneMessageQueue(publish, null, false);
+        }
+        catch (MQClientException e)
+        {
+            // Python 这里选不到队列报的是 `Send [0] times, still failed, Topic: …,
+            // BrokersSent: []`；.NET 的选队列是抛异常，原始原因拼进同一段文本。
+            throw new MQClientException("Send [0] times, still failed, Topic: " + msg.Topic
+                                        + ", BrokersSent: [], last error: " + e.Message);
+        }
+
+        SendKernelAsync(c, msg, new MessageQueue(msg.Topic, selected.BrokerName, selected.QueueId),
+            publish, callback, permits, timeout, sysFlag);
+    }
+
+    /// <summary>Java <c>sendKernelImpl</c> 的 ASYNC 分支：地址解析 → 拦截钩子 → traceparent →
+    /// 建请求（一次）→ before 钩子 → 交给 <see cref="AsyncSendChain"/>。这一段上每个失败出口都
+    /// 要归还许可，所以统一走 <see cref="CompleteAsync"/>。</summary>
+    private void SendKernelAsync(MQClientInstance c, Message msg, MessageQueue mq,
+        TopicPublishInfo? publish, ISendCallback callback, AsyncSendPermits permits, int timeout,
+        int sysFlag)
+    {
+        double began = UtilAll.MonotonicMillis();
+        // 地址解析两步，与 Java sendKernelImpl:919-924 一致：先查已缓存的发布地址，查不到再按
+        // topic 刷一次路由重查。定点发送（调用方给了 mq）不会在 sendDefaultImpl 里取发布信息，
+        // 这一步是它唯一的路由来源 —— 少了第一次定点发送必然拿到空地址。
+        string addr = c.BrokerAddrOf(mq.BrokerName);
+        if (addr.Length == 0)
+        {
+            try
+            {
+                TopicRouteData? route = c.GetTopicRouteData(mq.Topic);
+                if (route is not null)
+                {
+                    addr = MQClientInstance.FindBrokerAddrInRoute(route, mq.BrokerName);
+                }
+            }
+            catch (Exception)
+            {
+                // 刷路由失败交给下面统一报「broker 不存在」
+            }
+        }
+
+        if (addr.Length == 0)
+        {
+            // Java sendKernelImpl:1100
+            CompleteAsync(callback, null,
+                new MQClientException("The broker[" + mq.BrokerName + "] not exist"), null, permits,
+                onCallbackPool: false);
+            return;
+        }
+
+        RunCheckForbidden(msg, mq, addr, null, CommunicationMode.Async);
+        if (_enableTraceContext)
+        {
+            TraceParentContext.Inject(msg);
+        }
+
+        // 与同步内核同一口径：非批量消息在发请求之前补客户端唯一 ID，它决定
+        // SendResult.MsgId，也是重试链里 parseSendResponse 读的那一份。
+        if (!msg.IsBatch)
+        {
+            MessageClientIDSetter.SetUniqId(msg);
+        }
+
+        RemotingCommand request = c.BuildSendRequest(_producerGroup, msg, mq, sysFlag, _unitMode);
+        SendMessageContext? context = null;
+        if (HasSendInterceptors())
+        {
+            context = BuildSendContext(msg, mq, addr);
+            ExecuteSendMessageHookBefore(context);
+        }
+
+        // Java sendKernelImpl:1043-1046：ASYNC 分支自己的总闸 —— 钩子、压缩、路由都算耗时，
+        // 预算被它们吃光就不再发起请求。RemotingTooMuchRequestException 是 RemotingException 的
+        // 子类，所以 Java 在 :1088 先跑 hook.after 再抛给回调，这里用 CompleteAsync 复刻同一
+        // 顺序（且**不重试**）。
+        long cost = (long)(UtilAll.MonotonicMillis() - began);
+        if (timeout < cost)
+        {
+            CompleteAsync(callback, null,
+                new RemotingTooMuchRequestException("sendKernelImpl call timeout"), context, permits,
+                onCallbackPool: false);
+            return;
+        }
+
+        new AsyncSendChain(this, c, msg, mq, publish, callback, permits, context, request,
+            addr, timeout - (int)cost).Attempt();
+    }
+
+    /// <summary>链的终点（Python <c>_complete</c>）：先跑 after 钩子，再归还背压许可，最后把
+    /// 用户回调转交出去。<b>每个 AsyncSendChain 只走到一次</b>，所以用户回调恰好一次。
+    ///
+    /// <paramref name="onCallbackPool"/> 复刻 Python 的分岔：请求交给传输层<b>之前</b>的失败
+    /// （闸门、排队超预算、校验、broker 不存在）本来就是 <c>_complete</c> 就地调用，用户回调
+    /// 在当下这根线程上跑；只有**传输层带回来**的结果才 submit 给
+    /// <c>NettyClientPublicExecutor</c>（Java 的 <c>executeInvokeCallback</c>）。</summary>
+    private void CompleteAsync(ISendCallback callback, SendResult? result, Exception? error,
+        SendMessageContext? context, AsyncSendPermits permits, bool onCallbackPool = true)
+    {
+        if (context is not null)
+        {
+            if (error is not null)
+            {
+                context.Exception = error;
+            }
+            else
+            {
+                context.SendResult = result;
+            }
+
+            ExecuteSendMessageHookAfter(context);
+        }
+
+        // 先还许可再交给用户（Java 的 BackpressureSendCallBack.semaphoreProcessor:599-610
+        // 就是这个顺序，且先 size 后 num），否则用户回调里再发一笔异步消息会多占一格。
+        permits.Release();
+        if (onCallbackPool)
+        {
+            CompleteOnCallbackThread(callback, result, error);
+            return;
+        }
+
+        InvokeSendCallback(callback, result, error);
+    }
+
+    /// <summary>真正调用用户回调，并把回调自己抛的异常吞掉（Java 两处都是
+    /// <c>catch (Throwable)</c>），否则它会带走回调池的 worker。</summary>
+    private static void InvokeSendCallback(ISendCallback callback, SendResult? result,
+        Exception? error)
+    {
+        try
+        {
+            if (result is not null)
+            {
+                callback.OnSuccess(result);
+            }
+            else
+            {
+                callback.OnException(error?.Message ?? "unknown reason");
+            }
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("send callback raised: " + e);
+        }
+    }
+
+    /// <summary>把用户回调放到 <c>NettyClientPublicExecutor_N</c> 上跑（Java
+    /// <c>NettyRemotingAbstract.executeInvokeCallback</c>）。池已关（正在 Shutdown）或投不进去时
+    /// 就地跑 —— 与 Python 的兜底同一条，不能让回调因为关池而凭空消失。</summary>
+    private void CompleteOnCallbackThread(ISendCallback callback, SendResult? result,
+        Exception? error)
+    {
+        ConsumeExecutor? pool;
         lock (_lock)
         {
-            _asyncThreads.Add(th);
+            pool = _callbackExecutor;
+        }
+
+        if (pool is null)
+        {
+            InvokeSendCallback(callback, result, error);
+            return;
+        }
+
+        try
+        {
+            pool.Submit(() => InvokeSendCallback(callback, result, error));
+        }
+        catch (RejectedExecutionException)
+        {
+            InvokeSendCallback(callback, result, error);
+        }
+    }
+
+    /// <summary>本次异步发送真正拿到的背压许可（Java 的
+    /// <c>isSemaphoreAsyncNumAcquired</c> / <c>isSemaphoreAsyncSizeAcquired</c> 两个标记）。
+    /// 归还幂等，所以链上任何一条出口都能安全调用。</summary>
+    private sealed class AsyncSendPermits
+    {
+        private readonly FairSemaphore _num;
+        private readonly FairSemaphore _size;
+        private readonly long _msgLen;
+        private int _numAcquired;
+        private int _sizeAcquired;
+
+        public AsyncSendPermits(FairSemaphore num, FairSemaphore size, long msgLen)
+        {
+            _num = num;
+            _size = size;
+            _msgLen = msgLen;
+        }
+
+        public bool NumAcquired
+        {
+            get => Volatile.Read(ref _numAcquired) != 0;
+            set => Volatile.Write(ref _numAcquired, value ? 1 : 0);
+        }
+
+        public bool SizeAcquired
+        {
+            get => Volatile.Read(ref _sizeAcquired) != 0;
+            set => Volatile.Write(ref _sizeAcquired, value ? 1 : 0);
+        }
+
+        /// <summary>先还字节再还条数（Java semaphoreProcessor 的顺序）。</summary>
+        public void Release()
+        {
+            if (Interlocked.Exchange(ref _sizeAcquired, 0) != 0)
+            {
+                _size.Release(_msgLen);
+            }
+
+            if (Interlocked.Exchange(ref _numAcquired, 0) != 0)
+            {
+                _num.Release(1);
+            }
+        }
+    }
+
+    /// <summary>一次异步发送的重试链（Java <c>sendMessageAsync</c> +
+    /// <c>onExceptionImpl:683-734</c>）。请求<b>跨尝试复用同一个对象</b>、每轮换新 opaque，
+    /// 超时预算是<b>所有尝试共享</b>的剩余时间，与 Java 一致。</summary>
+    private sealed class AsyncSendChain
+    {
+        private readonly DefaultMQProducer _producer;
+        private readonly MQClientInstance _client;
+        // 只给 ProcessSendResponse 读 UNIQ_KEY：body 已经编进 request 了
+        private readonly Message _msg;
+        /// <summary>null = 定点发送（调用方给了 mq）：重试不换 broker，只在原地换 opaque。</summary>
+        private readonly TopicPublishInfo? _publish;
+        private readonly ISendCallback _callback;
+        private readonly AsyncSendPermits _permits;
+        private readonly SendMessageContext? _context;
+        private readonly RemotingCommand _request;
+        private MessageQueue _mq;
+        private string _addr;
+        private int _remaining;
+        private double _attemptBegan;
+        private int _times;
+
+        public AsyncSendChain(DefaultMQProducer producer, MQClientInstance client, Message msg,
+            MessageQueue mq, TopicPublishInfo? publish, ISendCallback callback,
+            AsyncSendPermits permits, SendMessageContext? context, RemotingCommand request,
+            string addr, int remaining)
+        {
+            _producer = producer;
+            _client = client;
+            _msg = msg;
+            _mq = mq;
+            _publish = publish;
+            _callback = callback;
+            _permits = permits;
+            _context = context;
+            _request = request;
+            _addr = addr;
+            _remaining = remaining;
+        }
+
+        /// <summary>Java <c>sendMessageAsync</c>：发出<b>本轮</b>尝试，结果由传输层回调带回。</summary>
+        public void Attempt()
+        {
+            if (_times > 0)
+            {
+                // Java onExceptionImpl:728-730 `request.setOpaque(createNewRequestId())`：
+                // 旧请求还挂在 responseTable 里等超时，复用 opaque 会把两次尝试的应答串台。
+                _request.Opaque = RemotingCommand.NextOpaque();
+            }
+
+            _attemptBegan = UtilAll.MonotonicMillis();
+            try
+            {
+                _client.InvokeAsyncOnAddr(_addr, _request, _remaining, OnResponse);
+            }
+            catch (Exception e)
+            {
+                // Python `producer.py:1274-1278`（Java sendMessageAsync 的外层 catch）：传输层
+                // **就地**抛（连不上、写不出去）时异常**原样**传递、needRetry=true，且故障表记
+                // 的是 `reachable=false`（这条连接根本没建立，不是"慢"）。.NET 的 InvokeAsync
+                // 在 SendRequest 抛掉之前已把 opaque 从在途表摘掉，所以本轮不会再有第二次回调。
+                long cost = (long)(UtilAll.MonotonicMillis() - _attemptBegan);
+                _producer._mqFaultStrategy.UpdateFaultItem(_mq.BrokerName, cost, true, false);
+                OnException(e, true, cost);
+            }
+        }
+
+        /// <summary>Java <c>operationSucceed</c> / <c>operationFail</c>（Python
+        /// <c>_handle</c>）：记故障表，成功就收尾，失败交给重试判断。</summary>
+        private void OnResponse(RemotingCommand? response, Exception? error)
+        {
+            long cost = (long)(UtilAll.MonotonicMillis() - _attemptBegan);
+            SendResult? sent = null;
+            Exception? failure = error;
+            if (failure is null && response is null)
+            {
+                failure = new RemotingException("unknown reason");
+            }
+            else if (failure is null)
+            {
+                try
+                {
+                    sent = _client.ProcessSendResponse(response!, _msg, _mq);
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                }
+            }
+
+            if (failure is null)
+            {
+                _producer._mqFaultStrategy.UpdateFaultItem(_mq.BrokerName, cost, false, true);
+                Finish(sent, null);
+                return;
+            }
+
+            // updateFaultItem(…, isOver=true, …) 排在分类之前，和 Java 一样 —— 哪怕这一笔之后
+            // 不重试，这台 broker 也要被记一次失败延迟。
+            _producer._mqFaultStrategy.UpdateFaultItem(_mq.BrokerName, cost, true, true);
+            (Exception wrapped, bool needRetry) = ClassifyAsyncFailure(failure, cost);
+            OnException(wrapped, needRetry, cost);
+        }
+
+        /// <summary>Java <c>onExceptionImpl</c>：还能试就换一台 broker、复用请求重试，否则收尾。</summary>
+        private void OnException(Exception error, bool needRetry, long cost)
+        {
+            _times++;
+            int remaining = _remaining - (int)cost;
+            if (!(needRetry && _times <= _producer._retryTimesWhenSendAsyncFailed && remaining > 0))
+            {
+                Finish(null, error);
+                return;
+            }
+
+            // 换目标：Java 用 selectOneMessageQueue(tpInfo, brokerName, false) —— 第三参 false
+            // 表示按 lastBrokerName **避开**刚失败的那台；选不到就沿用当前目标（Python 同）。
+            string brokerName = _mq.BrokerName;
+            if (_publish is not null)
+            {
+                try
+                {
+                    MessageQueue next = _producer._mqFaultStrategy.SelectOneMessageQueue(
+                        _publish, brokerName, false);
+                    _mq = new MessageQueue(_mq.Topic, next.BrokerName, next.QueueId);
+                    brokerName = next.BrokerName;
+                }
+                catch (MQClientException)
+                {
+                    // 选不到就留在原目标上重试
+                }
+            }
+
+            // Java onExceptionImpl:725 只查发布地址表、**不刷路由**；查不到就带着 null 撞进
+            // invokeAsync。这里就地终止，别让空地址传进传输层。
+            string addr = _client.BrokerAddrOf(brokerName);
+            if (addr.Length == 0)
+            {
+                Finish(null, new MQClientException("The broker[" + brokerName + "] not exist"));
+                return;
+            }
+
+            ClientLog.Warn("async send msg by retry " + _times.ToString(CultureInfo.InvariantCulture)
+                           + " times. topic=" + _mq.Topic + ", brokerAddr=" + addr
+                           + ", brokerName=" + brokerName + ": " + error.Message);
+            _addr = addr;
+            _remaining = remaining;
+            Attempt();
+        }
+
+        /// <summary>链的终点：交给 <see cref="DefaultMQProducer.CompleteAsync"/>。</summary>
+        private void Finish(SendResult? result, Exception? error)
+        {
+            _producer.CompleteAsync(_callback, result, error, _context, _permits);
+        }
+
+        /// <summary>Python <c>_classify_async_failure</c>（Java <c>operationFail</c> 的三分支）：
+        /// 包装成 MQClientException 并判定能否换 broker 重试。
+        ///
+        /// ⚠ 只有<b>没收到响应</b>的失败走这里的分类。<b>已经收到响应</b>但
+        /// <c>ProcessSendResponse</c> 判失败的 <see cref="MQBrokerException"/> 落在最后的
+        /// 分支 —— Java 那条路径传的就是 <c>needRetry=false</c> 且原样抛出。也就是说异步发送
+        /// <b>不看</b> RetryResponseCodes：broker 明确回了错就不会换 broker。别与同步语义混了。</summary>
+        private static (Exception, bool) ClassifyAsyncFailure(Exception err, long cost)
+        {
+            switch (err)
+            {
+                case RemotingSendRequestException:
+                    return (new MQClientException("send request failed, last error: " + err.Message),
+                        true);
+                case RemotingTimeoutException:
+                    return (new MQClientException("wait response timeout, cost="
+                                                  + cost.ToString(CultureInfo.InvariantCulture)
+                                                  + ", last error: " + err.Message), true);
+                // 其余 RemotingException 都是「unknown reason」，但 TooMuchRequest 是「自己人太多」，
+                // 换 broker 也没用（Python 同一条判据）。
+                case RemotingTooMuchRequestException:
+                    return (new MQClientException("unknown reason, last error: " + err.Message),
+                        false);
+                // 连不上（RemotingConnectException）与编解码/命令错也属 RemotingException：
+                // 换一台有机会。
+                case RemotingConnectException:
+                case RemotingCommandException:
+                case RemotingException:
+                    return (new MQClientException("unknown reason, last error: " + err.Message),
+                        true);
+                default:
+                    return (err, false);
+            }
         }
     }
 

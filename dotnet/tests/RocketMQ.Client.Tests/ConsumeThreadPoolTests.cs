@@ -115,8 +115,76 @@ public class ConsumeExecutorTests
     {
         var ex = new ConsumeExecutor(1, 2);
         ex.Shutdown();
-        Assert.Throws<InvalidOperationException>(() => ex.Submit(() => { }));
+        // Java 的 RejectedExecutionException（Python/C++/Rust 同源）：池已关与队列满同一个类型
+        Assert.Throws<RejectedExecutionException>(() => ex.Submit(() => { }));
         ex.Shutdown(true);
+    }
+
+    [Fact]
+    public void BoundedQueueRejectsWhenFullAndWorkersSaturated()
+    {
+        // 有界队列 ≡ Java LinkedBlockingQueue(N)：core==max 的池，线程全忙 + 队列满 ⇒ reject
+        var ex = new ConsumeExecutor(1, 1, keepAliveSeconds: 30, maxQueueSize: 2);
+        var busy = new ManualResetEventSlim(false);
+        var release = new ManualResetEventSlim(false);
+        ex.Submit(() =>
+        {
+            busy.Set();
+            release.Wait();
+        });
+        Assert.True(busy.Wait(5000), "worker 没跑起来");
+        ex.Submit(() => release.Wait()); // 队列第 1 格
+        ex.Submit(() => release.Wait()); // 队列第 2 格 = 满
+        Assert.Equal(2, ex.QueuedCount());
+        var e = Assert.Throws<RejectedExecutionException>(() => ex.Submit(() => { }));
+        Assert.Contains("queue is full", e.Message);
+        release.Set();
+        ex.Shutdown(true);
+    }
+
+    [Fact]
+    public void ThreadNamesFollowJavaThreadFactoryImpl()
+    {
+        // Java ThreadFactoryImpl：序号从 **1** 开始、分隔符由调用方给（AsyncSenderExecutor_1…）
+        var ex = new ConsumeExecutor(2, 2, keepAliveSeconds: 30, "AsyncSenderExecutor",
+            threadNameSep: "_", threadIndexFrom: 1);
+        var names = new List<string>();
+        var gate = new ManualResetEventSlim(false);
+        Action collect = () =>
+        {
+            lock (names)
+            {
+                names.Add(Thread.CurrentThread.Name ?? string.Empty);
+            }
+
+            gate.Wait();
+        };
+        ex.Submit(collect);
+        ex.Submit(collect);
+        AssertSpin(() => ex.WorkerCount() == 2);
+        gate.Set();
+        ex.Shutdown(true);
+        lock (names)
+        {
+            names.Sort(StringComparer.Ordinal);
+            Assert.Equal(new[] { "AsyncSenderExecutor_1", "AsyncSenderExecutor_2" }, names);
+        }
+    }
+
+    private static void AssertSpin(Func<bool> cond)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (cond())
+            {
+                return;
+            }
+
+            Thread.Sleep(10);
+        }
+
+        Assert.False(cond(), "条件未在 5s 内成立");
     }
 
     [Fact]

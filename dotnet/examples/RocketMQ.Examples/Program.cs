@@ -45,6 +45,7 @@ internal static class Program
                 "tls" => LiveTls.Run(rest),
                 "hook" => LiveHook.Run(rest),
                 "backpressure" => LiveBackPressure.Run(rest),
+                "async-send" => LiveAsyncSend.Run(rest),
                 "validators-live" => LiveValidators.Run(rest),
                 "recall" => LiveRecall.Run(rest),
                 "unit-config" => LiveUnitConfig.Run(rest),
@@ -87,6 +88,7 @@ internal static class Program
               trace        [namesrv]        真实集群消息轨迹联调（需 broker traceTopicEnable=true）
               hook         [namesrv]        真实集群 CheckForbidden/FilterMessage 钩子联调
               backpressure [namesrv]        真实集群异步发送背压联调（条数/字节闸、拒绝对账、运行时扩容）
+              async-send   [namesrv]        真实集群异步发送内核联调（不阻塞调用方、线程口径、并发不串台、关池排空）
               validators-live [namesrv]     真实集群名字校验联调（本地快拒 + 合法名字收发 + 往返对照）
               recall     [namesrv]        真实集群定时消息撤回联调（需 broker 开 recallMessageEnable，脚本负责还原）
               unit-config [namesrv]      真实集群 unitName/unitMode/stream 联调（clientId 后缀、topic UNIT 位、%RETRY% UNIT_SUB 位）

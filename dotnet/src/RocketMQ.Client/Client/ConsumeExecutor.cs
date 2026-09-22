@@ -14,13 +14,30 @@
 //      （Java allowCoreThreadTimeOut 默认 false）。
 //   4. SetCorePoolSize(n)：core 变大时按 min(delta, 队列长度) 补线程（Java 的启发式算法）。
 //   5. 任务抛异常不杀 worker（Java 会补一个新 worker，效果等价）。
+//
+// 队列也可以是有界的（maxQueueSize），对应 Java 的 LinkedBlockingQueue(50000)：生产者的
+// 异步发送池（AsyncSenderExecutor）就是这一档 —— 队列满了 Submit 抛
+// RejectedExecutionException（等价 Java 的 RejectedExecutionException），由调用方决定是
+// 报错还是就地跑完（Java executeAsyncMessageSend:670-681 两种都有）。
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading;
 
 using RocketMQ.Common;
 
 namespace RocketMQ.Client;
+
+/// <summary>队列已满或线程池已关闭，任务被拒（对应 Java
+/// <code>java.util.concurrent.RejectedExecutionException</code>）。
+/// 派生自 <see cref="InvalidOperationException"/>：本端口原先就是用它报「池已关闭」，
+/// 老调用方的 catch 不会因为换了类型而漏接。</summary>
+public class RejectedExecutionException : InvalidOperationException
+{
+    public RejectedExecutionException(string message) : base(message)
+    {
+    }
+}
 
 public sealed class ConsumeExecutor : IDisposable
 {
@@ -34,31 +51,54 @@ public sealed class ConsumeExecutor : IDisposable
     private int _max;
     private readonly double _keepAliveSeconds;
     private readonly string _prefix;
+    // 线程名的分隔符与起始序号（Java ThreadFactoryImpl 的序号从 **1** 开始，且各执行器分隔符
+    // 不同：消费池是 `ConsumeMessageThread_`、异步发送池是 `AsyncSenderExecutor_`）。
+    private readonly string _nameSep;
+    private readonly int _maxQueueSize;
     private int _workers;
     private int _seq;
     private bool _shutdown;
     private long _handlerExceptions;
 
+    /// <param name="maxQueueSize">0 = 无界（Java `LinkedBlockingQueue()`，消费池用这一档）；
+    /// &gt; 0 即 Java 的 `LinkedBlockingQueue(N)`，投满时 <see cref="Submit"/> 抛
+    /// <see cref="RejectedExecutionException"/>（生产者的异步发送池用这一档）。</param>
     public ConsumeExecutor(int corePoolSize, int maximumPoolSize,
-                           double keepAliveSeconds = 60.0, string threadNamePrefix = "rmq-consume")
+                           double keepAliveSeconds = 60.0, string threadNamePrefix = "rmq-consume",
+                           int maxQueueSize = 0, string threadNameSep = "-",
+                           int threadIndexFrom = 0)
     {
         _core = Math.Max(0, corePoolSize);
         _max = Math.Max(_core, maximumPoolSize);
         _keepAliveSeconds = keepAliveSeconds;
         _prefix = threadNamePrefix;
+        _maxQueueSize = Math.Max(0, maxQueueSize);
+        _nameSep = threadNameSep;
+        _seq = threadIndexFrom;
     }
 
-    /// <summary>投递任务（Java execute）。已关闭时抛 InvalidOperationException。</summary>
+    /// <summary>投递任务（Java execute）。已关闭、或有界队列已满且线程数已到 max 时抛
+    /// <see cref="RejectedExecutionException"/>（Java 的 RejectedExecutionException）。</summary>
     public void Submit(Action task)
     {
         if (task == null) throw new ArgumentNullException(nameof(task));
         lock (_gate)
         {
-            if (_shutdown) throw new InvalidOperationException("ConsumeExecutor has been shut down");
+            if (_shutdown) throw new RejectedExecutionException("ConsumeExecutor has been shut down");
+            // Java：入队失败（队列满）才考虑开一个非 core 线程，再不行就 reject
+            bool queueFull = _maxQueueSize > 0 && _queue.Count >= _maxQueueSize;
+            bool canGrow = _workers < _max;
+            if (queueFull && !canGrow)
+            {
+                throw new RejectedExecutionException("ConsumeExecutor queue is full ("
+                                                    + _maxQueueSize.ToString(CultureInfo.InvariantCulture)
+                                                    + ")");
+            }
+
             _queue.Enqueue(task);
             // Java 无界队列语义：只有 poolSize < corePoolSize 才新建线程；
             // 第二个条件是 execute() 里"入队后 workerCount == 0 再补一个线程"的兜底分支。
-            if (_workers < _core || _workers == 0)
+            if (_workers < _core || (queueFull && canGrow) || _workers == 0)
             {
                 SpawnLocked();
             }
@@ -122,7 +162,7 @@ public sealed class ConsumeExecutor : IDisposable
     private void SpawnLocked()
     {
         _workers++;
-        string name = _prefix + "-" + _seq++;
+        string name = _prefix + _nameSep + _seq++.ToString(CultureInfo.InvariantCulture);
         var t = new Thread(Run)
         {
             IsBackground = true,

@@ -488,6 +488,16 @@ public sealed class MQClientInstance : IDisposable
     private RemotingCommand InvokeSyncOnAddr(string addr, RemotingCommand request, int timeoutMillis) =>
         _remotingClient.InvokeSync(addr, request, timeoutMillis);
 
+    /// <summary>对应 Java <c>MQClientAPIImpl.sendMessage</c> 的 ASYNC 分支里那句
+    /// <c>invokeAsync(addr, request, callback, timeoutMillis)</c>：把**调用方持有的**请求交出去，
+    /// 结果由回调带回（回调在传输层的读线程 / 超时清理线程上跑，Java 同）。
+    ///
+    /// 与同步路径分开是有意的：异步重试链要跨尝试**复用同一个 request**（Java
+    /// <c>onExceptionImpl:728-730</c> 只换 opaque），所以请求不能在每次调用里现建。</summary>
+    public void InvokeAsyncOnAddr(string addr, RemotingCommand request, int timeoutMillis,
+        RemotingClient.InvokeCallback callback) =>
+        _remotingClient.InvokeAsync(addr, request, callback, timeoutMillis);
+
     /// <summary>把响应码非 SUCCESS 转成 MQBrokerException。</summary>
     public static void CheckResponseCode(RemotingCommand response)
     {
@@ -800,7 +810,16 @@ public sealed class MQClientInstance : IDisposable
 
         RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        return ProcessSendResponse(response, msg, mq);
+    }
 
+    /// <summary>
+    /// 把发送应答解析成 <see cref="SendResult"/>；应答码非成功时抛
+    /// <see cref="MQBrokerException"/>。对应 Java MQClientAPIImpl.processSendResponse。
+    /// 同步与异步发送共用这一份解码逻辑（Python 同名 process_send_response）。
+    /// </summary>
+    public SendResult ProcessSendResponse(RemotingCommand response, Message msg, MessageQueue mq)
+    {
         SendStatus status;
         switch (response.Code)
         {
