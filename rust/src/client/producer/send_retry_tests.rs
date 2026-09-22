@@ -766,3 +766,460 @@ async fn stream_request_type_is_off_by_default_for_producers() {
     );
     producer.shutdown();
 }
+
+// ---------------------------------------------------------------- 异步发送背压
+//
+// 对端是 Java `DefaultMQProducerImpl:635-682`（两道闸、共享一份预算）与 `:577-633`
+// （`BackpressureSendCallBack` 的归还），与 `python/tests/test_producer_async.py`、
+// `cpp/tests/test_producer_async.cpp` 及 .NET 的同题用例一一对应。
+//
+// 字节闸的地板值是 1M（Java `:148-153`），所以只能拿「1M 少掉多少」来断言在途字节，
+// 不能把上限配成几百字节 —— 那会被夹回 1M。
+//
+// ⚠ 这里没有「发送队列满了就地跑完」那条用例（Java `:675-681`、Python/C++/.NET 都有）：
+// 本实现把整条异步链 `tokio::spawn` 出去，**没有有界队列**，因此不存在拒绝入队的分支，
+// 那道闸也就没有落点。等 #50 接上真正的异步发送内核（有界 executor）时再补。
+
+use std::sync::atomic::AtomicUsize;
+
+/// 记录回调的发送回调（Python 测试里的 `_Callback`）。
+#[derive(Default)]
+struct Recorder {
+    done: AtomicUsize,
+    ok: AtomicUsize,
+    errors: Mutex<Vec<String>>,
+}
+
+impl Recorder {
+    fn errors(&self) -> Vec<String> {
+        lock(&self.errors).clone()
+    }
+}
+
+impl SendCallback for Recorder {
+    fn on_success(&self, _result: SendResult) {
+        self.ok.fetch_add(1, Ordering::SeqCst);
+        self.done.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_exception(&self, err: Error) {
+        lock(&self.errors).push(err.to_string());
+        self.done.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 开了背压的生产者：条数闸设成 `num`、字节闸夹到地板值 1M（同 Python 的夹具）。
+///
+/// 字节闸只能配到 1M —— 再小会被夹回来，而 1M 已经够把「一笔扣了多少字节」算清楚
+/// （body 只有几百字节）。
+async fn backpressure_producer(
+    instance: &str,
+    cluster: &MockCluster,
+    num: i64,
+) -> DefaultMQProducer {
+    let producer = started(instance, cluster).await;
+    producer.set_enable_backpressure_for_async_mode(true);
+    producer.set_back_pressure_for_async_send_num(num);
+    producer.set_back_pressure_for_async_send_size(MIN_ASYNC_SEND_SIZE);
+    producer
+}
+
+fn body_of(len: usize) -> Message {
+    let body = vec![b'x'; len];
+    Message::new("T1", Some(&body))
+}
+
+/// 轮询等待条件成立（最多约 3s），避免用固定 sleep 猜时长。
+async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+    for _ in 0..300 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cond()
+}
+
+/// Java `DefaultMQProducer:169/175/181` —— 默认关，1024 条 / 100M 字节。
+#[test]
+fn backpressure_defaults_match_java() {
+    let producer = DefaultMQProducer::new("GID_bp_default").expect("组名合法");
+    assert!(!producer.is_enable_backpressure_for_async_mode());
+    assert_eq!(producer.get_back_pressure_for_async_send_num(), 1024);
+    assert_eq!(
+        producer.get_back_pressure_for_async_send_size(),
+        100 * 1024 * 1024
+    );
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 1024);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        100 * 1024 * 1024
+    );
+}
+
+/// 配置越界时**构造**就夹到地板值（Java 建 impl 时的 `:141-153` 分支）。
+#[test]
+fn constructor_floors_undersized_capacities() {
+    let cfg = ProducerConfig {
+        producer_group: "GID_bp_floor".to_string(),
+        back_pressure_for_async_send_num: 1,
+        back_pressure_for_async_send_size: 1024,
+        ..Default::default()
+    };
+    let producer = DefaultMQProducer::with_config(cfg).expect("配置合法");
+    assert_eq!(
+        producer.get_back_pressure_for_async_send_num(),
+        1,
+        "配置值本身不改（Java 的字段同样原样留着）"
+    );
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        MIN_ASYNC_SEND_NUM,
+        "但信号量按地板值建"
+    );
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE
+    );
+}
+
+/// Java `DefaultMQProducer:1385/1402` —— setter 也夹地板值，且配置跟着走。
+#[test]
+fn setter_floors_both_gates() {
+    let producer = DefaultMQProducer::new("GID_bp_setter").expect("组名合法");
+    producer.set_back_pressure_for_async_send_num(1);
+    producer.set_back_pressure_for_async_send_size(1024);
+    assert_eq!(
+        producer.get_back_pressure_for_async_send_num(),
+        MIN_ASYNC_SEND_NUM
+    );
+    assert_eq!(
+        producer.get_back_pressure_for_async_send_size(),
+        MIN_ASYNC_SEND_SIZE
+    );
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        MIN_ASYNC_SEND_NUM
+    );
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE
+    );
+}
+
+/// 关着的时候一笔发送既不扣也不还许可。
+#[tokio::test]
+async fn disabled_gate_stays_out_of_the_way() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 300));
+    let producer = started("bp_off", &cluster).await;
+    assert!(!producer.is_enable_backpressure_for_async_mode());
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(400), cb.clone(), Some(3_000), None)
+        .expect("运行时内可派发");
+    // 在途时容量一分未动
+    assert!(wait_until(|| cluster.requests(0) >= 1).await);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 1024);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        100 * 1024 * 1024
+    );
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 1024);
+    producer.shutdown();
+}
+
+/// Java `:654-658` —— 条数拿不到就回调，一次请求都不发（预算被闸自己花光）。
+#[tokio::test]
+async fn num_gate_rejects_with_java_message_and_sends_nothing() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = backpressure_producer("bp_num_gate", &cluster, MIN_ASYNC_SEND_NUM).await;
+    assert!(producer
+        .inner
+        .semaphore_async_send_num
+        .try_acquire(MIN_ASYNC_SEND_NUM, 0)
+        .await);
+
+    let began = Instant::now();
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(1), cb.clone(), Some(300), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    let errors = cb.errors();
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0].contains("send message tryAcquire semaphoreAsyncNum timeout"),
+        "文案要与 Java 逐字一致: {}",
+        errors[0]
+    );
+    assert!(
+        began.elapsed() >= Duration::from_millis(250),
+        "没等到超时就把失败交出去了：{:?}",
+        began.elapsed()
+    );
+    assert_eq!(cluster.requests(0), 0, "被闸拒绝时一次请求都不该发出去");
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE,
+        "条数闸没过时不该去扣字节"
+    );
+    producer
+        .inner
+        .semaphore_async_send_num
+        .release(MIN_ASYNC_SEND_NUM);
+    producer.shutdown();
+}
+
+/// Java `:667-671` —— 字节闸没过时，**已经拿到**的条数许可必须归还。
+#[tokio::test]
+async fn size_gate_rejects_and_gives_the_num_permit_back() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = backpressure_producer("bp_size_gate", &cluster, MIN_ASYNC_SEND_NUM).await;
+    assert!(producer
+        .inner
+        .semaphore_async_send_size
+        .try_acquire(MIN_ASYNC_SEND_SIZE, 0)
+        .await);
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(200), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    let errors = cb.errors();
+    assert!(
+        errors[0].contains("send message tryAcquire semaphoreAsyncSize timeout"),
+        "文案要与 Java 逐字一致: {}",
+        errors[0]
+    );
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        MIN_ASYNC_SEND_NUM,
+        "条数许可漏还了"
+    );
+    assert_eq!(cluster.requests(0), 0);
+    producer
+        .inner
+        .semaphore_async_send_size
+        .release(MIN_ASYNC_SEND_SIZE);
+    producer.shutdown();
+}
+
+/// 一条在途发送 = 1 个条数许可 + body.length 个字节许可；回调之后两者都回来。
+#[tokio::test]
+async fn permits_are_borrowed_per_in_flight_send_and_given_back() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 500));
+    let producer = backpressure_producer("bp_borrow", &cluster, MIN_ASYNC_SEND_NUM).await;
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(400), cb.clone(), Some(3_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cluster.requests(0) >= 1).await);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 9);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE - 400
+    );
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE
+    );
+    producer.shutdown();
+}
+
+/// 归还挂在失败回调上（Java `semaphoreProcessor` 在两个回调里都跑），失败不能漏。
+#[tokio::test]
+async fn failure_also_gives_the_permits_back() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SYSTEM_ERROR, 0));
+    let producer = backpressure_producer("bp_failure", &cluster, MIN_ASYNC_SEND_NUM).await;
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(300), cb.clone(), Some(3_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert!(!cb.errors().is_empty());
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE
+    );
+    producer.shutdown();
+}
+
+/// 重试链只占**一份**许可（一次发送一笔），不是一笔尝试一份；还多次会把容量虚增。
+#[tokio::test]
+async fn retry_chain_holds_one_pair_not_one_per_attempt() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SYSTEM_BUSY, 200));
+    let producer = backpressure_producer("bp_retry_pair", &cluster, MIN_ASYNC_SEND_NUM).await;
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(300), cb.clone(), Some(9_000), None)
+        .expect("运行时内可派发");
+    // 第二轮尝试已经在路上，扣掉的仍然只是一笔的量
+    assert!(wait_until(|| cluster.requests(0) >= 2).await);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 9);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE - 300
+    );
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(
+        cluster.requests(0),
+        3,
+        "retry_times_when_send_failed=2 ⇒ 一共 3 笔尝试"
+    );
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE
+    );
+    producer.shutdown();
+}
+
+/// Java `:636-664` —— 闸是**等**到超时为止，不是看一眼不够就报错，这才是限流。
+#[tokio::test]
+async fn gate_waits_for_a_permit_instead_of_failing_early() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = backpressure_producer("bp_wait", &cluster, MIN_ASYNC_SEND_NUM).await;
+    assert!(producer
+        .inner
+        .semaphore_async_send_num
+        .try_acquire(MIN_ASYNC_SEND_NUM, 0)
+        .await);
+
+    let cb = Arc::new(Recorder::default());
+    let began = Instant::now();
+    producer
+        .send_async(body_of(1), cb.clone(), Some(5_000), None)
+        .expect("运行时内可派发");
+    // 让它在闸上排上队，然后确认它**还活着**（没提前失败、也没发出去）
+    assert!(wait_until(|| producer
+        .inner
+        .semaphore_async_send_num
+        .waiting_count()
+        >= 1)
+    .await);
+    assert_eq!(cb.done.load(Ordering::SeqCst), 0);
+    assert_eq!(cluster.requests(0), 0);
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "还没到超时就不该提前失败");
+    producer
+        .inner
+        .semaphore_async_send_num
+        .release(MIN_ASYNC_SEND_NUM);
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert!(
+        began.elapsed() >= Duration::from_millis(100),
+        "没有等许可，看一眼不够就失败了：{:?}",
+        began.elapsed()
+    );
+    assert!(cb.errors().is_empty(), "等到许可之后这一笔应当发出去");
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    assert_eq!(cluster.requests(0), 1);
+    producer.shutdown();
+}
+
+/// Java `DefaultMQProducerTest:593-595` 的那条断言：空闲许可 + 在途份数 == 新配置。
+#[tokio::test]
+async fn runtime_resize_keeps_the_in_flight_share() {
+    let cluster = MockCluster::start(1, true).await;
+    let producer = backpressure_producer("bp_resize", &cluster, MIN_ASYNC_SEND_NUM).await;
+    assert!(producer
+        .inner
+        .semaphore_async_send_num
+        .try_acquire(5, 0)
+        .await);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 5);
+    producer.set_back_pressure_for_async_send_num(15);
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits() + 5,
+        15
+    );
+    assert_eq!(producer.get_back_pressure_for_async_send_num(), 15);
+    producer
+        .inner
+        .semaphore_async_send_num
+        .release(5);
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), 15);
+    producer.shutdown();
+}
+
+/// 本端口改容量不丢等待者（Java 换对象会把等待者留在旧信号量上等自己的超时）。
+#[tokio::test]
+async fn growing_capacity_wakes_a_blocked_sender() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = backpressure_producer("bp_grow", &cluster, MIN_ASYNC_SEND_NUM).await;
+    assert!(producer
+        .inner
+        .semaphore_async_send_num
+        .try_acquire(MIN_ASYNC_SEND_NUM, 0)
+        .await);
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(1), cb.clone(), Some(5_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| producer
+        .inner
+        .semaphore_async_send_num
+        .waiting_count()
+        >= 1)
+    .await);
+    producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 1); // 凭空多出 1 条容量
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert!(cb.errors().is_empty(), "扩容后这一笔应当发出去: {:?}", cb.errors());
+    assert_eq!(cluster.requests(0), 1);
+    producer.shutdown();
+}
+
+/// Java `:642` —— `getBody() == null ? 1 : getBody().length`，空 body 也要扣 1。
+#[test]
+fn empty_body_still_costs_one_size_permit() {
+    assert_eq!(back_pressure_msg_len(&body_of(5)), 5);
+    assert_eq!(back_pressure_msg_len(&body_of(0)), 1);
+    let no_body = Message::new("T1", None);
+    assert_eq!(back_pressure_msg_len(&no_body), 1);
+}
+
+/// Python `_run` / Java `:555` —— 排队吃掉整个预算就直接报错，不发请求。
+///
+/// 本实现的「排队」= `tokio::spawn` 到任务真正被调度之间的间隔，所以这里直接把
+/// `began` 摆在过去，模拟那段等待（真集群造不出稳定时长）。
+#[tokio::test]
+async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("bp_stale_budget", &cluster).await;
+
+    let mut msg = body_of(1);
+    let stale = monotonic_millis() - 5_000.0;
+    let err = producer
+        .execute_async_send(&mut msg, 1, 3_000, stale, None)
+        .await
+        .expect_err("预算已被排队花光");
+    assert!(
+        err.to_string()
+            .contains("DEFAULT ASYNC send call timeout"),
+        "{err}"
+    );
+    assert_eq!(cluster.requests(0), 0, "预算没了就不该再发请求");
+    producer.shutdown();
+}

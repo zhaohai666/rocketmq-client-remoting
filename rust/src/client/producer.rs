@@ -34,6 +34,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::client::backpressure::{
+    back_pressure_permits, FairSemaphore, MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE,
+};
 use crate::client::hook::{
     AnyHolder, CheckForbiddenContext, CheckForbiddenHook, CheckForbiddenHookList,
     CommunicationMode, EndTransactionContext, EndTransactionHook, EndTransactionHookList,
@@ -403,6 +406,15 @@ pub struct ProducerConfig {
     pub retry_response_codes: BTreeSet<i32>,
     /// Python `max_message_size`。
     pub max_message_size: i32,
+    /// Python `enable_backpressure_for_async_mode`（Java `DefaultMQProducer:169`）：
+    /// 默认 **关**。开了之后异步发送在真正发请求之前要先过两个维度的公平信号量闸。
+    pub enable_backpressure_for_async_mode: bool,
+    /// Python `back_pressure_for_async_send_num`（Java `DefaultMQProducer:175`）：
+    /// 在途**条数**上限，默认 1024，地板 [`MIN_ASYNC_SEND_NUM`]。
+    pub back_pressure_for_async_send_num: i64,
+    /// Python `back_pressure_for_async_send_size`（Java `DefaultMQProducer:181`）：
+    /// 在途**字节数**上限，默认 100M，地板 [`MIN_ASYNC_SEND_SIZE`]。
+    pub back_pressure_for_async_send_size: i64,
     /// Python `topics`。
     pub topics: Vec<String>,
     /// Python `name_server_addrs`。
@@ -449,6 +461,10 @@ impl Default for ProducerConfig {
                 .copied()
                 .collect::<BTreeSet<i32>>(),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            // Java `DefaultMQProducer:169/175/181`：开关默认关，容量默认 1024 条 / 100M
+            enable_backpressure_for_async_mode: false,
+            back_pressure_for_async_send_num: 1024,
+            back_pressure_for_async_send_size: 100 * 1024 * 1024,
             topics: Vec::new(),
             name_server_addrs: Vec::new(),
             heartbeat_interval_millis: 30_000,
@@ -498,6 +514,13 @@ struct Inner {
     trace: Mutex<Option<Arc<dyn TraceDispatcherChannel>>>,
     /// Python `rpc_hook`。
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
+    /// Python `_semaphore_async_send_num`（Java `DefaultMQProducerImpl:141-146`）：
+    /// 异步发送在途**条数**的公平信号量。建对象时就按配置定容（越界兜地板值），
+    /// 运行时改容量走 [`set_back_pressure_for_async_send_num`](DefaultMQProducer::set_back_pressure_for_async_send_num)。
+    semaphore_async_send_num: FairSemaphore,
+    /// Python `_semaphore_async_send_size`（Java `DefaultMQProducerImpl:148-153`）：
+    /// 异步发送在途**字节数**的公平信号量。
+    semaphore_async_send_size: FairSemaphore,
 }
 
 impl Inner {
@@ -619,6 +642,20 @@ impl DefaultMQProducer {
             bail!("producerGroup is empty");
         }
         let fault_strategy = MQFaultStrategy::new(cfg.send_latency_fault_enable);
+        // Java 在**建 impl 时**按配置算出两个公平信号量的容量（并对越界配置兜地板值），
+        // 而不是每次发送时读配置 —— 所以容量只在构造时定型，之后只能走
+        // [`set_back_pressure_for_async_send_num`](Self::set_back_pressure_for_async_send_num)
+        // 那对方法平移。`cfg` 马上要被 move 进 `Inner`，在这里先取出来。
+        let semaphore_async_send_num = FairSemaphore::new(back_pressure_permits(
+            cfg.back_pressure_for_async_send_num,
+            MIN_ASYNC_SEND_NUM,
+            "semaphoreAsyncSendNum",
+        ));
+        let semaphore_async_send_size = FairSemaphore::new(back_pressure_permits(
+            cfg.back_pressure_for_async_send_size,
+            MIN_ASYNC_SEND_SIZE,
+            "semaphoreAsyncSendSize",
+        ));
         let inner = Arc::new(Inner {
             cfg: RwLock::new(cfg),
             client: Mutex::new(None),
@@ -634,6 +671,8 @@ impl DefaultMQProducer {
             transaction_listener: RwLock::new(None),
             trace: Mutex::new(None),
             rpc_hook: RwLock::new(None),
+            semaphore_async_send_num,
+            semaphore_async_send_size,
         });
         Ok(DefaultMQProducer { inner })
     }
@@ -868,6 +907,63 @@ impl DefaultMQProducer {
     /// Python `_mq_fault_strategy`（暴露故障表便于排错/测试）。
     pub fn fault_strategy(&self) -> &MQFaultStrategy {
         &self.inner.fault_strategy
+    }
+
+    // ---------------- 异步发送背压 ----------------
+
+    /// Python `set_enable_backpressure_for_async_mode`（Java `DefaultMQProducer:169`
+    /// 的 setter）。开关**每次发送时**读，所以运行中切换立即生效；容量则是构造时定型的，
+    /// 要改得走下面两方法。
+    pub fn set_enable_backpressure_for_async_mode(&self, enable: bool) {
+        self.write_cfg(|c| c.enable_backpressure_for_async_mode = enable);
+    }
+
+    /// Python `is_enable_backpressure_for_async_mode`。
+    pub fn is_enable_backpressure_for_async_mode(&self) -> bool {
+        self.read_cfg(|c| c.enable_backpressure_for_async_mode)
+    }
+
+    /// 运行时改「在途条数」上限（Java `DefaultMQProducer:1383-1391` →
+    /// `setSemaphoreAsyncSendNum`）。
+    ///
+    /// 语义不是「设成 num」而是「总量变成 num、已经在途的那几份原样保留」：改完之后
+    /// 空闲许可 = num - 在途份数，可能算出负数（Java 的 `new Semaphore(负数)` 一样接受）。
+    ///
+    /// ⚠ 改容量要走这个方法，别只改 `config().back_pressure_for_async_send_num`
+    /// （`ProducerConfig` 是快照，改了不动信号量）。Java 的字段是 private，没这个坑。
+    pub fn set_back_pressure_for_async_send_num(&self, num: i64) {
+        let num = num.max(MIN_ASYNC_SEND_NUM);
+        self.write_cfg(|c| c.back_pressure_for_async_send_num = num);
+        self.inner.semaphore_async_send_num.set_total_permits(num);
+    }
+
+    /// Python `get_back_pressure_for_async_send_num`（当前配置的总量，不是空闲量）。
+    pub fn get_back_pressure_for_async_send_num(&self) -> i64 {
+        self.read_cfg(|c| c.back_pressure_for_async_send_num)
+    }
+
+    /// 运行时改「在途字节数」上限，语义与
+    /// [`set_back_pressure_for_async_send_num`](Self::set_back_pressure_for_async_send_num) 相同。
+    pub fn set_back_pressure_for_async_send_size(&self, size: i64) {
+        let size = size.max(MIN_ASYNC_SEND_SIZE);
+        self.write_cfg(|c| c.back_pressure_for_async_send_size = size);
+        self.inner.semaphore_async_send_size.set_total_permits(size);
+    }
+
+    /// Python `get_back_pressure_for_async_send_size`。
+    pub fn get_back_pressure_for_async_send_size(&self) -> i64 {
+        self.read_cfg(|c| c.back_pressure_for_async_send_size)
+    }
+
+    /// Python `get_semaphore_async_send_num_available_permits`
+    /// （Java `DefaultMQProducerImpl:200-202`）：观测用，也是改容量的输入。
+    pub fn semaphore_async_send_num_available_permits(&self) -> i64 {
+        self.inner.semaphore_async_send_num.available_permits()
+    }
+
+    /// Python `get_semaphore_async_send_size_available_permits`。
+    pub fn semaphore_async_send_size_available_permits(&self) -> i64 {
+        self.inner.semaphore_async_send_size.available_permits()
     }
 
     // ---------------- 消息轨迹配置 ----------------
@@ -1373,6 +1469,50 @@ fn classify_send_error(err: &Error) -> Option<SendErrorKind> {
 /// 一回退就会得到负延迟，反而把慢 broker 记成"很快"。
 fn latency_since(began: f64) -> i64 {
     (monotonic_millis() - began) as i64
+}
+
+/// 扣多少个「字节」许可（Java `executeAsyncMessageSend:642` 的
+/// `msg.getBody() == null ? 1 : msg.getBody().length`，取**压缩之前**的长度：
+/// 压缩是发送内核里才做的事，闸在先）。
+///
+/// 空 body 按 1 算（与 Python `_back_pressure_msg_len` 一致）。Java 里 `null` 与空数组
+/// 是分开的（空数组会扣 0 个许可，等于不限流），但本 crate 的
+/// [`Message::set_body`] 把 `None` 落成空 `Vec`、[`Message::get_body`] 又把两者读成同
+/// 一个空切片，分不出这个差别 —— 给它 0 就等于给一条空消息开了不限流的口子，所以按 1。
+fn back_pressure_msg_len(msg: &Message) -> i64 {
+    let len = msg.get_body().len();
+    if len == 0 {
+        return 1;
+    }
+    i64::try_from(len).unwrap_or(i64::MAX)
+}
+
+/// 一次异步发送拿到的背压许可（对应 Java `BackpressureSendCallBack:577-633` 的
+/// `isSemaphoreAsyncNumAcquired` / `isSemaphoreAsyncSizeAcquired` 两个标记）。
+///
+/// 只归还**本次真正拿到**的那几份：字节闸超时而条数闸已到手时，必须把条数还回去，
+/// 否则过一次背压就把容量永久吃掉一格。
+///
+/// 归还写在 `Drop` 而不是调用方手里：这条链上有闸门拒绝、预算复检、发送失败三种出口
+/// （将来接真异步内核还会多一个 `?`），少写一处归还就是永久漏容量，而漏掉的容量在
+/// 单测里看不出来、只会在长跑里表现为「发几笔之后所有异步发送集体超时」。
+struct SendPermits<'a> {
+    inner: &'a Inner,
+    num_acquired: bool,
+    size_acquired: bool,
+    msg_len: i64,
+}
+
+impl Drop for SendPermits<'_> {
+    /// Java `semaphoreProcessor:599-610`：**先还字节、再还条数**。
+    fn drop(&mut self) {
+        if self.size_acquired {
+            self.inner.semaphore_async_send_size.release(self.msg_len);
+        }
+        if self.num_acquired {
+            self.inner.semaphore_async_send_num.release(1);
+        }
+    }
 }
 
 /// Python `_build_send_context` 里那串「延迟类属性」判定键。
@@ -2052,6 +2192,23 @@ impl DefaultMQProducer {
     /// 一个任务，用 `start()` 时绑定的运行时句柄派发。没有句柄就一定没启动过
     /// （`start()` 本身是 async），所以这里直接报错，而不是临时建一个运行时 ——
     /// 那会让传输层缓存到一个随调用结束就销毁的 Handle。
+    ///
+    /// 开了 `enable_backpressure_for_async_mode` 之后，发送前要先过两个维度的公平
+    /// 信号量闸（Java `executeAsyncMessageSend:635-682`），拿不到就直接回调
+    /// [`Error::TooMuchRequest`]，一次请求都不会发出去。
+    ///
+    /// ⚠ **与 Java/Python 的一处结构性差别：这道闸在 spawned 任务里等，不在调用方
+    /// 线程上等。** Java/Python/C++/.NET 都在调用方线程上阻塞式 `tryAcquire`，所以
+    /// 「异步」在背压打满时会退化成「等满 timeout 再报错」。Rust 不能照做：生产者常常
+    /// 跑在唯一的 tokio 工作线程上（`#[tokio::test]` 的单线程运行时、
+    /// `RuntimeFlavor::CurrentThread`），把那个线程 park 住就意味着**正要归还许可**的
+    /// 完成回调永远排不上队 —— 不是慢，是死锁。代价：调用方不再被闸门堵住，所以
+    /// Java 那句「队满时有背压就地跑完」（`:675-681`）在这里没有对应分支（本实现没有
+    /// 有界发送队列，见 #50）。预算仍从调用时刻算起（`began` 在 spawn 之前取），超时
+    /// 语义（多久之内过不了闸就报错）与 Java 一致。
+    ///
+    /// 差异 5（承 #50）：本实现还没有真正的异步发送内核，闸后的 `send` 走的是同步内核，
+    /// 只是不阻塞调用方而已 —— 对调用方的可观察语义（回调必到、许可必还）不变。
     pub fn send_async(
         &self,
         msg: Message,
@@ -2062,17 +2219,105 @@ impl DefaultMQProducer {
         let handle = self.runtime_handle().ok_or_else(|| {
             Error::client("send_async needs a tokio runtime; call start() first")
         })?;
+        let timeout = timeout_millis.unwrap_or_else(|| self.read_cfg(|c| c.send_msg_timeout));
+        // Java `DefaultMQProducerImpl:548-556`：进链的是一位包了背压归还的用户回调；
+        // 字节数在这里（**压缩之前**）就定下来，后面重试/压缩都不改口。
+        let msg_len = back_pressure_msg_len(&msg);
+        let began = monotonic_millis();
         let this = self.clone();
         self.push_task(handle.spawn(async move {
             let mut msg = msg;
-            let result = this.send(&mut msg, timeout_millis, mq.as_ref()).await;
-            // Python 的 send_async 就是一个 try/except：失败也走回调，不抛
+            let result = this
+                .execute_async_send(&mut msg, msg_len, timeout, began, mq.as_ref())
+                .await;
+            // Python 的 send_async 就是一个 try/except：失败也走回调，不抛。
+            // 许可已在 `execute_async_send` 返回时归还（先还许可，再交给用户）。
             match result {
                 Ok(result) => callback.on_success(result),
                 Err(e) => callback.on_exception(e),
             }
         }));
         Ok(())
+    }
+
+    /// 对应 Java `executeAsyncMessageSend` + `sendDefaultImpl(ASYNC)` 里被投进
+    /// `AsyncSenderExecutor` 的那个 runnable（Python 的 `_execute_async_message_send`
+    /// 与 `_run`，两步顺序、预算共享）。
+    ///
+    /// 返回值的 `Err` 一定是「没发出任何请求」的闸门拒绝或发送失败；两条路都靠
+    /// [`SendPermits`] 的 `Drop` 归还许可，因此这条链上任何提前 `return`（含未来接入
+    /// 真异步内核时的 `?`）都不会漏容量。
+    async fn execute_async_send(
+        &self,
+        msg: &mut Message,
+        msg_len: i64,
+        timeout: i64,
+        began: f64,
+        mq: Option<&MessageQueue>,
+    ) -> Result<SendResult> {
+        let permits = self
+            .acquire_send_permits(msg_len, timeout, began)
+            .await?;
+        // Python `_run`：出队之后才算真实耗时 —— 预算被排队吃掉就直接报错，不发请求。
+        let cost = latency_since(began);
+        if timeout <= cost {
+            return Err(Error::TooMuchRequest("DEFAULT ASYNC send call timeout".to_string()));
+        }
+        // 与 Java 一致：闸门等掉的时间**不**从发送预算里扣（Java 的 `beginTimestampFirst`
+        // 是出队之后才取的），这里只扣排队那一段。
+        let result = self.send(msg, Some(timeout - cost), mq).await;
+        drop(permits); // 显式标出归还点：必须在转交用户回调之前
+        result
+    }
+
+    /// 两个许可**顺序**申请、都用「从 `began` 算起的剩余预算」去等，所以第一个闸就能把
+    /// 预算花光；哪个没拿到就报哪个，文案与 Java 逐字一致。
+    ///
+    /// 已经拿到手的不会因为后面那个闸失败而漏还：失败路径直接 `return Err`，
+    /// 局部 `permits` 的 `Drop` 负责归还它真正拿到的那几份（对应 Java 的
+    /// `isSemaphoreAsyncNumAcquired` / `isSemaphoreAsyncSizeAcquired` 两个标记）。
+    async fn acquire_send_permits(
+        &self,
+        msg_len: i64,
+        timeout: i64,
+        began: f64,
+    ) -> Result<SendPermits<'_>> {
+        let mut permits = SendPermits {
+            inner: &self.inner,
+            num_acquired: false,
+            size_acquired: false,
+            msg_len,
+        };
+        if !self.is_enable_backpressure_for_async_mode() {
+            // Java `executeAsyncMessageSend:636` 的开关：不开闸就直接投队列，
+            // 一次 `tryAcquire` 都不做（容量仍然可读，便于观测）。
+            return Ok(permits);
+        }
+        let budget = timeout - latency_since(began);
+        permits.num_acquired = budget > 0
+            && self
+                .inner
+                .semaphore_async_send_num
+                .try_acquire(1, budget)
+                .await;
+        if !permits.num_acquired {
+            return Err(Error::TooMuchRequest(
+                "send message tryAcquire semaphoreAsyncNum timeout".to_string(),
+            ));
+        }
+        let budget = timeout - latency_since(began);
+        permits.size_acquired = budget > 0
+            && self
+                .inner
+                .semaphore_async_send_size
+                .try_acquire(msg_len, budget)
+                .await;
+        if !permits.size_acquired {
+            return Err(Error::TooMuchRequest(
+                "send message tryAcquire semaphoreAsyncSize timeout".to_string(),
+            ));
+        }
+        Ok(permits)
     }
 }
 

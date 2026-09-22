@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod allocate_strategy;
+pub mod backpressure;
 pub mod consume_executor;
 pub mod consumer;
 pub mod consumer_stats;
