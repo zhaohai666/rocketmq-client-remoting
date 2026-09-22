@@ -11,6 +11,7 @@ import os
 import random
 import threading
 import time
+from collections import deque
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ from ..remoting.protocol.namespace_util import NamespaceUtil
 from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.rpchook import RPCHook
 from .consume_executor import ConsumeExecutor, RejectedExecutionError
+from .backpressure import (MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE, FairSemaphore)
 from .exception import (ClientErrorCode, MQBrokerException, MQClientException,
                         RequestTimeoutException)
 from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
@@ -77,6 +79,77 @@ class _NullSendCallback:
             self.future.send_request_ok = False
             self.future.put_response_message(None)
             self.future.cause = e
+
+
+def _back_pressure_permits(configured: int, floor: int, name: str) -> int:
+    """对应 Java ``DefaultMQProducerImpl:141-153``：配置不高于地板值时用地板值并记一条日志。
+
+    Java 的分支写成 ``if (cfg > 10) new Semaphore(max(cfg, 10)) else new Semaphore(10)``，
+    也就是**恰好等于**地板值时也会走 else 分支（照样打那条日志），这里保持一致。
+    """
+    if configured > floor:
+        return configured
+    logger.info("%s can not be smaller than %d.", name, floor)
+    return floor
+
+
+def _back_pressure_msg_len(msg) -> int:
+    """扣多少个「字节」许可（Java ``executeAsyncMessageSend:642`` 的
+    ``msg.getBody() == null ? 1 : msg.getBody().length``）。
+
+    批量异步是 Java 没有的入口（Java 只有同步 ``send(Collection)``），这里按每条累加、
+    空 body 也算 1，整批为空时算 1 —— 不给它一个值就等于不限流。
+    """
+    if isinstance(msg, (list, tuple, MessageBatch)):
+        messages = list(msg)
+        return sum(_back_pressure_msg_len(one) for one in messages) or 1
+    body = getattr(msg, "body", None)
+    return len(body) if body else 1
+
+
+class _BackPressureSendCallback:
+    """对应 Java ``DefaultMQProducerImpl.BackpressureSendCallBack:577-633``。
+
+    它是异步链内部**唯一**被调用的回调：链的终点 ``_complete`` 先跑 ``SendMessageHook.after``，
+    再进这里的 ``on_success``/``on_exception`` —— 与 Java 的顺序一致（after 钩子在
+    ``sendKernelImpl`` 的包装回调里、信号量在外层，所以 after 先于归还许可）。归还之后才把
+    结果交给用户回调。
+
+    只归还**本次真正拿到**的许可（``num_acquired``/``size_acquired``）：字节信号量超时而
+    条数信号量已到手时，必须把那条还回去，否则关一次背压就把容量永久吃掉一格。
+    """
+
+    def __init__(self, delegate: "SendCallback", num_semaphore: FairSemaphore,
+                 size_semaphore: FairSemaphore, msg_len: int) -> None:
+        self._delegate = delegate
+        self._num_semaphore = num_semaphore
+        self._size_semaphore = size_semaphore
+        self.msg_len = msg_len
+        self._released = False
+        self.num_acquired = False
+        self.size_acquired = False
+
+    def on_success(self, send_result: SendResult) -> None:
+        self._release_permits()
+        self._delegate.on_success(send_result)
+
+    def on_exception(self, e: BaseException) -> None:
+        self._release_permits()
+        self._delegate.on_exception(e)
+
+    def _release_permits(self) -> None:
+        """Java ``semaphoreProcessor:599-610``（先还字节、再还条数）。
+
+        与 Java 的一处加固：这里用 ``_released`` 保证只还一次。Java 直接还，链上任何一条
+        走到终点之后的重复回调都会把容量虚增出去；本端口的重试链更长，还一次更稳妥。
+        """
+        if self._released:
+            return
+        self._released = True
+        if self.size_acquired:
+            self._size_semaphore.release(self.msg_len)
+        if self.num_acquired:
+            self._num_semaphore.release(1)
 
 
 def _classify_async_failure(error: BaseException,
@@ -271,6 +344,19 @@ class DefaultMQProducer:
         self.client_callback_executor_threads = 0
         self._async_sender_executor: Optional[ConsumeExecutor] = None
         self._callback_executor: Optional[ConsumeExecutor] = None
+        # ---- 异步发送背压（对应 Java DefaultMQProducerImpl:122-153 的两个公平信号量）----
+        # 默认关闭，且开关本身**不是**启动期配置：Java 允许跑到一半再打开/关掉，
+        # 三个字段都是普通属性，改容量走下面的 setter。
+        self.enable_backpressure_for_async_mode = False
+        self.back_pressure_for_async_send_num = 1024
+        self.back_pressure_for_async_send_size = 100 * 1024 * 1024
+        # Java 在建 impl 时按配置建两个公平信号量，并对越界的配置兜地板值
+        self._semaphore_async_send_num = FairSemaphore(
+            _back_pressure_permits(self.back_pressure_for_async_send_num,
+                                   MIN_ASYNC_SEND_NUM, "semaphoreAsyncSendNum"))
+        self._semaphore_async_send_size = FairSemaphore(
+            _back_pressure_permits(self.back_pressure_for_async_send_size,
+                                   MIN_ASYNC_SEND_SIZE, "semaphoreAsyncSendSize"))
 
     # ---------------- 配置 ----------------
     def set_namesrv_addr(self, addr: str) -> None:
@@ -323,6 +409,48 @@ class DefaultMQProducer:
 
     def is_retry_another_broker_when_not_store_ok(self) -> bool:
         return self.retry_another_broker_when_not_store_ok
+
+    # ---------------- 异步发送背压（Java DefaultMQProducer:1368-1408）----------------
+    def set_enable_backpressure_for_async_mode(self, enable: bool) -> None:
+        self.enable_backpressure_for_async_mode = bool(enable)
+
+    def is_enable_backpressure_for_async_mode(self) -> bool:
+        return self.enable_backpressure_for_async_mode
+
+    def set_back_pressure_for_async_send_num(self, num: int) -> None:
+        """运行时改「在途条数」上限（Java ``setBackPressureForAsyncSendNum:1383-1391``）。
+
+        语义不是「设成 num」而是「总量变成 num、已经在途的那几份原样保留」：改完之后
+        ``空闲许可 = num - 在途份数``（Java 写成先算 ``acquired = 旧配置 - 空闲``、再
+        ``new Semaphore(num - acquired)``，同一个结果，它的测试断言的正是这个和，见
+        ``DefaultMQProducerTest:593-595``）。所以调小之后空闲许可可能是负数（在途超额），
+        归还许可时才慢慢回正 —— Java 的 ``new Semaphore(负数)`` 同样接受。
+
+        ⚠ 改容量要走这个方法，别直接赋 ``back_pressure_for_async_send_num``：
+        直接改字段只动配置值，信号量不会跟着变（Java 的字段是 private，没这个坑）。
+        """
+        num = max(num, MIN_ASYNC_SEND_NUM)
+        self.back_pressure_for_async_send_num = num
+        self._semaphore_async_send_num.set_total_permits(num)
+
+    def get_back_pressure_for_async_send_num(self) -> int:
+        return self.back_pressure_for_async_send_num
+
+    def set_back_pressure_for_async_send_size(self, size: int) -> None:
+        """运行时改「在途字节数」上限，语义与 ``set_back_pressure_for_async_send_num`` 相同。"""
+        size = max(size, MIN_ASYNC_SEND_SIZE)
+        self.back_pressure_for_async_send_size = size
+        self._semaphore_async_send_size.set_total_permits(size)
+
+    def get_back_pressure_for_async_send_size(self) -> int:
+        return self.back_pressure_for_async_send_size
+
+    def get_semaphore_async_send_num_available_permits(self) -> int:
+        """对应 Java ``DefaultMQProducerImpl:200-202``（观测用，也是改容量的输入）。"""
+        return self._semaphore_async_send_num.available_permits()
+
+    def get_semaphore_async_send_size_available_permits(self) -> int:
+        return self._semaphore_async_send_size.available_permits()
 
     def add_retry_response_code(self, response_code: int) -> None:
         self.retry_response_codes.add(response_code)
@@ -947,7 +1075,8 @@ class DefaultMQProducer:
         1. 任务投到 ``AsyncSenderExecutor_N``（池大小 = CPU 核数、队列有界
            ``async_sender_queue_capacity``，默认 50000，同 Java 的
            ``LinkedBlockingQueue(50000)``）。队列满了 Java 抛 ``MQClientException
-           ("executor rejected")``，这里同样**抛给调用方**而不是走回调。
+           ("executor rejected")``，这里同样**抛给调用方**而不是走回调 —— 只有开了
+           背压时才改为就地跑（见 ``_execute_async_message_send``）。
         2. 出队之后才算真实耗时：预算被排队吃掉就直接回调
            ``RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")``，不再发请求。
         3. ``sendKernelImpl`` 的 ASYNC 分支：拦截钩子 → 建请求 → ``invokeAsync``。
@@ -959,9 +1088,13 @@ class DefaultMQProducer:
         ``NettyRemotingAbstract.executeInvokeCallback`` 就是把回调 submit 到 publicExecutor，
         为的是不让业务代码占着连接读线程）。
 
-        与 Java 的三处有意差别：未 start 时**同步抛**（Java 走回调，那样问题更难查）；
-        批量消息复用同步批量内核（只是不阻塞调用方，见 ``_send_async_inner``）；
-        没实现 ``enableBackpressureForAsyncMode`` 那套信号量（Java 默认也是关的）。
+        开了 ``enable_backpressure_for_async_mode`` 之后，投队列**之前**还要过一道闸
+        （``_execute_async_message_send``，Java ``executeAsyncMessageSend``）：按条数和字节数
+        两个维度各拿一份许可，拿不到就直接回调 ``RemotingTooMuchRequestException``。注意这道闸
+        **在调用方线程上等**，所以「异步」在背压打满时会退化成「等满 timeout 再报错」。
+
+        与 Java 的两处有意差别：未 start 时**同步抛**（Java 走回调，那样问题更难查）；
+        批量消息复用同步批量内核（只是不阻塞调用方，见 ``_send_async_inner``）。
         """
         self._require_client()
         executor = self._async_sender_executor
@@ -969,24 +1102,63 @@ class DefaultMQProducer:
             raise MQClientException("producer already shutdown")
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         begin = time.monotonic()
+        # Java ``:555`` —— 进链的是包了一层的新回调：链的终点先归还许可，再转交用户
+        gated = _BackPressureSendCallback(
+            callback, self._semaphore_async_send_num, self._semaphore_async_send_size,
+            _back_pressure_msg_len(msg))
 
         def _run() -> None:
             cost = int((time.monotonic() - begin) * 1000)
             if timeout <= cost:
-                self._complete(callback, None,
+                self._complete(gated, None,
                                RemotingTooMuchRequestException(
                                    "DEFAULT ASYNC send call timeout"),
                                None)
                 return
             try:
-                self._send_async_inner(msg, mq, callback, timeout - cost)
+                self._send_async_inner(msg, mq, gated, timeout - cost)
             except Exception as e:  # noqa: BLE001 — Java：runnable 的 catch → newCallBack.onException(e)
-                self._complete(callback, None, e, None)
+                self._complete(gated, None, e, None)
+
+        self._execute_async_message_send(_run, gated, timeout, begin, executor)
+
+    def _execute_async_message_send(self, runnable: Callable[[], None],
+                                    gated: _BackPressureSendCallback, timeout: int,
+                                    begin: float, executor: ConsumeExecutor) -> None:
+        """对应 Java ``DefaultMQProducerImpl.executeAsyncMessageSend:635-682``。
+
+        两个许可**顺序**申请、都用「从 ``begin`` 算起的剩余预算」去等，所以第一个闸就能把
+        预算花光；哪个没拿到就回调哪个，消息文案也与 Java 逐字一致。已经拿到手的由
+        ``gated`` 在回调里原样归还（Java 靠 ``isSemaphoreAsyncNumAcquired`` /
+        ``isSemaphoreAsyncSizeAcquired`` 两个标记做到这一点）。
+        """
+        if self.enable_backpressure_for_async_mode:
+            cost = int((time.monotonic() - begin) * 1000)
+            gated.num_acquired = timeout - cost > 0 and self._semaphore_async_send_num.try_acquire(
+                1, timeout - cost)
+            if not gated.num_acquired:
+                self._complete(gated, None, RemotingTooMuchRequestException(
+                    "send message tryAcquire semaphoreAsyncNum timeout"), None)
+                return
+
+            cost = int((time.monotonic() - begin) * 1000)
+            gated.size_acquired = (timeout - cost > 0
+                                   and self._semaphore_async_send_size.try_acquire(
+                                       gated.msg_len, timeout - cost))
+            if not gated.size_acquired:
+                self._complete(gated, None, RemotingTooMuchRequestException(
+                    "send message tryAcquire semaphoreAsyncSize timeout"), None)
+                return
 
         try:
-            executor.submit(_run)
+            executor.submit(runnable)
         except RejectedExecutionError as e:
-            raise MQClientException("executor rejected", None, e)
+            if self.enable_backpressure_for_async_mode:
+                # Java ``:675-681``：许可已经扣掉了，就地跑完这一笔（**阻塞调用方**），
+                # 好让回调把许可还回来；否则队列一满就直接抛，白扣的容量还得等超时。
+                runnable()
+            else:
+                raise MQClientException("executor rejected", None, e) from e
 
     def _send_async_inner(self, msg: Message, mq: Optional[MessageQueue],
                           callback: SendCallback, timeout: int) -> None:

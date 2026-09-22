@@ -35,9 +35,10 @@ from typing import List, Optional
 import pytest
 
 from rocketmq.client import producer as producer_module
+from rocketmq.client.backpressure import MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE
 from rocketmq.client.consume_executor import ConsumeExecutor
 from rocketmq.client.exception import (ClientErrorCode, MQBrokerException,
-                                       MQClientException)
+                                       MQClientException, RequestTimeoutException)
 from rocketmq.client.hook import CommunicationMode, SendMessageContext
 from rocketmq.client.mq_client import TopicPublishInfo
 from rocketmq.client.producer import DefaultMQProducer
@@ -672,3 +673,300 @@ def test_callback_survives_after_callback_pool_is_gone():
     _wait_done(cb)
     assert cb.results
     assert cb.threads and not cb.threads[0].startswith("NettyClientPublicExecutor_")
+
+
+# ---------------------------------------------------------------- 异步发送背压
+# 对端是 Java DefaultMQProducerImpl:635-682（executeAsyncMessageSend 的两道闸）与
+# :577-633（BackpressureSendCallBack 的归还）。默认关闭，所以上面那批用例一行都不用改。
+# 字节闸的地板值是 1M（Java :148-153），所以这里只能拿"1M 少掉多少"来断言，
+# 不能把上限配成几百字节 —— 那会被夹回 1M。
+def _backpressure_producer(num: int = 10, size: int = MIN_ASYNC_SEND_SIZE,
+                           **kwargs) -> DefaultMQProducer:
+    """开背压的生产者。字节闸夹到地板值 1M：够用，又能把「扣了多少字节」算清楚。"""
+    p = _producer(**kwargs)
+    p.set_enable_backpressure_for_async_mode(True)
+    p.set_back_pressure_for_async_send_num(num)
+    p.set_back_pressure_for_async_send_size(size)
+    return p
+
+
+def test_backpressure_defaults_match_java_and_stay_out_of_the_way():
+    """Java DefaultMQProducer:169/175/181 —— 默认关，1024 条 / 100M 字节。"""
+    p = DefaultMQProducer("GID_async_test")
+    assert p.is_enable_backpressure_for_async_mode() is False
+    assert p.get_back_pressure_for_async_send_num() == 1024
+    assert p.get_back_pressure_for_async_send_size() == 100 * 1024 * 1024
+    assert p.get_semaphore_async_send_num_available_permits() == 1024
+    assert p.get_semaphore_async_send_size_available_permits() == 100 * 1024 * 1024
+    # 关着的时候一笔发送既不扣也不还许可
+    p._create_async_executors()
+    p._mq_client = _FakeAsyncClient([_mq("broker-a", 0)], None, False, None, None, ())
+    p._started = True
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x" * 5000), cb, 3000)
+    _wait_done(cb)
+    assert p.get_semaphore_async_send_num_available_permits() == 1024
+    assert p.get_semaphore_async_send_size_available_permits() == 100 * 1024 * 1024
+
+
+def test_backpressure_num_floor_is_ten_and_size_floor_is_one_meg():
+    """Java DefaultMQProducerImpl:141-153 与 :1385/1402 —— 两个地板值都夹得住。"""
+    p = DefaultMQProducer("GID_async_test")
+    p.set_back_pressure_for_async_send_num(1)
+    p.set_back_pressure_for_async_send_size(1024)
+    assert p.get_back_pressure_for_async_send_num() == MIN_ASYNC_SEND_NUM
+    assert p.get_back_pressure_for_async_send_size() == MIN_ASYNC_SEND_SIZE
+    assert p.get_semaphore_async_send_num_available_permits() == MIN_ASYNC_SEND_NUM
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
+
+
+def test_num_gate_fails_with_java_message_and_sends_nothing():
+    """Java :654-658 —— 条数拿不到就回调，一次请求都不发（预算也被闸自己花光）。"""
+    gate = threading.Event()
+    p = _backpressure_producer(num=10, block=gate)
+    assert p._semaphore_async_send_num.try_acquire(10, 0) is True   # 占满在途
+    began = time.monotonic()
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x"), cb, 300)
+    _wait_done(cb)
+    assert isinstance(cb.errors[0], RemotingTooMuchRequestException)
+    assert str(cb.errors[0]).endswith("send message tryAcquire semaphoreAsyncNum timeout")
+    assert _client(p).attempts_count == 0
+    assert int((time.monotonic() - began) * 1000) >= 250, "没等到超时就把失败交出去了"
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
+    p._semaphore_async_send_num.release(10)
+    gate.set()
+
+
+def test_size_gate_fails_with_its_own_message_and_gives_the_num_permit_back():
+    """Java :667-671 —— 字节闸没过时，**已经拿到**的条数许可必须归还。"""
+    p = _backpressure_producer(num=10)
+    assert p._semaphore_async_send_size.try_acquire(MIN_ASYNC_SEND_SIZE, 0) is True
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x" * 10), cb, 200)
+    _wait_done(cb)
+    assert isinstance(cb.errors[0], RemotingTooMuchRequestException)
+    assert "send message tryAcquire semaphoreAsyncSize timeout" in str(cb.errors[0])
+    assert p.get_semaphore_async_send_num_available_permits() == 10, "条数许可漏还了"
+    assert _client(p).attempts_count == 0
+    p._semaphore_async_send_size.release(MIN_ASYNC_SEND_SIZE)
+
+
+def test_permits_are_borrowed_per_in_flight_send_and_given_back():
+    """一条在途发送 = 1 个条数许可 + body.length 个字节许可；回调后两者都回来。"""
+    gate = threading.Event()
+    p = _backpressure_producer(num=10, block=gate)
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x" * 400), cb, 3000)
+    _wait_attempts(_client(p), 1)
+    assert p.get_semaphore_async_send_num_available_permits() == 9
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE - 400
+    gate.set()
+    _wait_done(cb)
+    assert p.get_semaphore_async_send_num_available_permits() == 10
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
+
+
+def test_null_or_empty_body_still_costs_one_size_permit():
+    """Java :642 —— ``getBody() == null ? 1 : getBody().length``。
+
+    两种「没有 body」在链路上都被 ``Validators.checkMessage`` 先拒了（body 为 null /
+    长度为 0，四端口一致），所以这里断的是计价本身，而不是走一遍发送。
+    """
+    assert producer_module._back_pressure_msg_len(Message("T", b"")) == 1
+    no_body = Message("T", b"x")
+    no_body.body = None
+    assert producer_module._back_pressure_msg_len(no_body) == 1
+    # 批量按每条累加，其中空 body 那条同样算 1
+    assert producer_module._back_pressure_msg_len(
+        [Message("T", b"a" * 3), Message("T", b"")]) == 4
+
+
+def test_failure_also_gives_the_permits_back():
+    """归还挂在 on_exception 上（Java semaphoreProcessor 在两个回调里都跑），失败不能漏。"""
+    p = _backpressure_producer(
+        num=10, outcomes=[_Deliver(error=MQBrokerException(
+            ResponseCode.SYSTEM_ERROR, "store error"))])
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x" * 300), cb, 3000)
+    _wait_done(cb)
+    assert cb.errors
+    assert p.get_semaphore_async_send_num_available_permits() == 10
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
+
+
+def test_retry_chain_releases_once_not_once_per_attempt():
+    """重试链上只有一份许可（一次发送一笔），终点归还一次；还多次会把容量虚增。"""
+    p = _backpressure_producer(
+        num=10, outcomes=[_Deliver(error=RemotingTimeoutException(ADDR_A, 1)),
+                          _Deliver(error=RemotingTimeoutException(ADDR_B, 1)),
+                          _Deliver(error=RemotingTimeoutException(ADDR_A, 1))])
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x" * 300), cb, 3000)
+    _wait_done(cb)
+    assert _client(p).attempts_count == 3, "这条链本应重试两轮后终止"
+    assert p.get_semaphore_async_send_num_available_permits() == 10
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
+
+
+def test_gate_waits_for_a_permit_instead_of_failing_early():
+    """信号量是**等**到超时为止，不是看一眼不够就报错 —— 这才是背压限流的意义。"""
+    gate = threading.Event()
+    # 条数闸的地板值是 10（Java :141-146），所以"占满"要占 10 笔而不是任意小数
+    p = _backpressure_producer(num=MIN_ASYNC_SEND_NUM, block=gate)
+    held = []
+    for _ in range(MIN_ASYNC_SEND_NUM):
+        cb = _Callback()
+        held.append(cb)
+        p.send_async(Message("TopicTest", b"x"), cb, 8000)
+    _wait_attempts(_client(p), 1)
+    assert p.get_semaphore_async_send_num_available_permits() == 0
+    third = _Callback()
+    began = time.monotonic()
+
+    def _send():
+        p.send_async(Message("TopicTest", b"y"), third, 8000)
+
+    t = threading.Thread(target=_send)
+    t.start()
+    time.sleep(0.2)
+    assert t.is_alive(), "调用方不该在许可还回来之前就返回"
+    gate.set()
+    t.join(6.0)
+    assert not t.is_alive()
+    assert int((time.monotonic() - began) * 1000) >= 150
+    gate.set()
+    for cb in held:
+        _wait_done(cb)
+    _wait_done(third)
+    assert third.results, "等到许可后这一笔应当发出去"
+    assert p.get_semaphore_async_send_num_available_permits() == MIN_ASYNC_SEND_NUM
+
+
+def test_runtime_resize_keeps_the_in_flight_share():
+    """Java DefaultMQProducerTest:593-595 的那条断言：空闲许可 + 在途份数 == 新配置。"""
+    gate = threading.Event()
+    p = _backpressure_producer(num=10, block=gate)
+    callbacks = []
+    for _ in range(5):
+        cb = _Callback()
+        callbacks.append(cb)
+        p.send_async(Message("TopicTest", b"x"), cb, 8000)
+    assert p.get_semaphore_async_send_num_available_permits() == 5
+    p.set_back_pressure_for_async_send_num(15)
+    assert p.get_semaphore_async_send_num_available_permits() + 5 == 15
+    gate.set()
+    for cb in callbacks:
+        _wait_done(cb)
+    assert p.get_semaphore_async_send_num_available_permits() == 15
+
+
+def test_growing_capacity_wakes_a_blocked_sender():
+    """本实现改容量不丢等待者（Java 换对象会把等待者留在旧信号量上等自己的超时）——
+    调大容量之后，正卡在闸上的调用方应当被叫醒并把这笔发出去。"""
+    gate = threading.Event()
+    p = _backpressure_producer(num=10, block=gate)
+    for _ in range(10):
+        p.send_async(Message("TopicTest", b"x"), _Callback(), 8000)
+    assert p.get_semaphore_async_send_num_available_permits() == 0
+    blocked = _Callback()
+    t = threading.Thread(target=lambda: p.send_async(
+        Message("TopicTest", b"y"), blocked, 8000))
+    t.start()
+    time.sleep(0.2)
+    assert t.is_alive()
+    p.set_back_pressure_for_async_send_num(11)     # 凭空多出 1 条容量
+    t.join(6.0)
+    assert not t.is_alive(), "扩容后调用方还卡在闸上"
+    gate.set()
+    _wait_done(blocked)
+    assert blocked.results
+
+
+def test_queue_full_runs_inline_when_backpressure_is_on():
+    """Java :675-681：队满时**没有**背压才抛 "executor rejected"；有背压就就地跑完这一笔
+    （许可已经扣掉了，抛异常会让它悬着）。"""
+    gate = threading.Event()
+    p = _backpressure_producer(num=10, block=gate)
+    p._async_sender_executor = ConsumeExecutor(1, 1, thread_name_prefix="AsyncSenderExecutor",
+                                              max_queue_size=1, thread_name_sep="_",
+                                              thread_index_from=1)
+    running = _Callback()
+    p.send_async(Message("TopicTest", b"1"), running, 8000)
+    _wait_attempts(_client(p), 1)
+    p.send_async(Message("TopicTest", b"2"), _Callback(), 8000)     # 进队列
+    for _ in range(200):
+        if p._async_sender_executor.queued_count() == 1:
+            break
+        time.sleep(0.005)
+    assert p._async_sender_executor.queued_count() == 1
+    # 第三笔：池子拒收 → 就地跑，会占住调用方直到 gate 打开
+    inline = _Callback()
+    returned = threading.Event()
+
+    def _third():
+        p.send_async(Message("TopicTest", b"3"), inline, 8000)
+        returned.set()
+
+    t = threading.Thread(target=_third)
+    t.start()
+    time.sleep(0.2)
+    assert not returned.is_set(), "就地跑应当占住调用方"
+    gate.set()
+    t.join(6.0)
+    assert returned.is_set(), "队满不该把异常甩给调用方"
+    _wait_done(running)
+    _wait_done(inline)
+    assert _client(p).attempts_count >= 3
+    assert p.get_semaphore_async_send_num_available_permits() == 10
+
+
+def test_batch_async_charges_the_sum_of_body_lengths():
+    """批量是 Java 没有的异步入口，这里按每条累加，别让一整批只算一笔的钱。"""
+    p = _backpressure_producer(num=10)
+    seen = {}
+    real_inner = p._send_async_inner
+
+    def _spy(msgs, mq, callback, timeout):
+        seen["size"] = p.get_semaphore_async_send_size_available_permits()
+        seen["num"] = p.get_semaphore_async_send_num_available_permits()
+        return real_inner(msgs, mq, callback, timeout)
+
+    p._send_async_inner = _spy      # type: ignore[assignment]
+    calls = []
+
+    def _fake_batch(msgs, mq=None, timeout_millis=None):
+        calls.append(len(msgs))
+        return SendResult(SendStatus.SEND_OK, msg_id="b" * 32,
+                          message_queue=_mq("broker-a", 0))
+
+    p._send_batch = _fake_batch      # type: ignore[assignment]
+    cb = _Callback()
+    p.send_async([Message("TopicTest", b"a" * 100), Message("TopicTest", b"b" * 250)],
+                 cb, 5000)
+    _wait_done(cb)
+    assert calls == [2]
+    assert seen["size"] == MIN_ASYNC_SEND_SIZE - 350
+    assert seen["num"] == 9
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
+    assert p.get_semaphore_async_send_num_available_permits() == 10
+
+
+def test_request_goes_through_the_same_gate_and_leaks_nothing():
+    """request() 内部就是这条 ASYNC 链（Java 亦然），所以它同样受背压约束、同样要归还。"""
+    p = _backpressure_producer(num=10)
+    client = _client(p)
+    client.client_id = "fake-client-id"
+    delivered = {}
+
+    def _capture(addr, request, msg, mq, timeout, on_complete):
+        delivered["opaque"] = request.opaque
+        on_complete(SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq), None)
+
+    client.send_message_async = _capture      # type: ignore[assignment]
+    # 应答通道本来就不存在（fake 客户端没有 326 推送），所以按 Java 语义抛等应答超时
+    with pytest.raises(RequestTimeoutException):
+        p.request(Message("TopicTest", b"q" * 30), 300)
+    assert delivered, "request() 应当走异步链"
+    assert p.get_semaphore_async_send_num_available_permits() == 10
+    assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
