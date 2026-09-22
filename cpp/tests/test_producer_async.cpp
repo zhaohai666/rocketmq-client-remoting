@@ -958,6 +958,312 @@ void testQueueFullRejects() {
     p.shutdown();
 }
 
+// ================================================================ 异步发送背压
+//
+// 对端是 Java ``DefaultMQProducerImpl.executeAsyncMessageSend:635-682`` +
+// ``BackpressureSendCallBack:577-633``。这里锁的是**生产者这一侧**怎么用那两个信号量：
+// 闸在**调用方线程**上等、拿不到就回调（一次请求都不发）、链终点归还、队满时改为就地跑。
+// 基元本身（公平、原地改容量）在 test_backpressure.cpp。
+//
+// 占用在途不需要钩子：mock 的 ``delayMillis`` 让 broker 晚回响应，许可在回调之前不会归还。
+
+namespace {
+
+// 一台 mock name server + 一台 mock broker；``delayMillis`` 让 broker 晚回响应，
+// 于是这一笔在途（以及它借走的许可）会一直占着，直到响应回来。
+struct AsyncFixture {
+    MockServer ns;
+    MockServer broker;
+    std::string topic;
+
+    AsyncFixture(const std::string& name, int32_t delayMillis = 0, int replies = 20)
+        : topic(name) {
+        installRoute(topic, {{topic + "-broker", broker.address()}});
+        std::vector<Reply> scripted;
+        for (int i = 0; i < replies; ++i) {
+            scripted.push_back({ResponseCode::SUCCESS, delayMillis, false});
+        }
+        broker.script(scripted);
+    }
+};
+
+}  // namespace
+
+// 10. 默认配置与 Java 逐字一致；开关关着时**一格许可都不动**
+void testBackPressureDefaultsAndGateOff() {
+    AsyncFixture fx("BpDefaults");
+    DefaultMQProducer p("PG_bp_defaults");
+    p.setNamesrvAddr(fx.ns.address());
+    p.start();
+    expectInt(p.getBackPressureForAsyncSendNum(), 1024, "backPressureForAsyncSendNum default");
+    expectInt(p.getBackPressureForAsyncSendSize(), 100LL * 1024 * 1024,
+             "backPressureForAsyncSendSize default");
+    expect(!p.isEnableBackpressureForAsyncMode(), "the switch is off by default (as in Java)");
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024, "num semaphore starts full");
+    expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
+             "size semaphore starts full");
+
+    auto cb = std::make_shared<RecordingCallback>();
+    p.sendAsync(plainMessage(fx.topic), cb, 3000);
+    expect(cb->waitDone(3000), "a send with the gate off still succeeds");
+    expectInt(cb->snapshot().successCount, 1, "onSuccess on the off path");
+    // 关着的时候连 tryAcquire 都不该被调用 —— 否则一次开关就永久吃掉一格容量
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024, "off path moves no num permit");
+    expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
+             "off path moves no size permit");
+    p.shutdown();
+}
+
+// 11. 地板值（Java DefaultMQProducer:1386 / :1402 的 Math.max 与那两条日志）
+void testBackPressureFloors() {
+    AsyncFixture fx("BpFloors");
+    DefaultMQProducer p("PG_bp_floors");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setBackPressureForAsyncSendNum(1);
+    p.setBackPressureForAsyncSendSize(1);
+    expectInt(p.getBackPressureForAsyncSendNum(), 10, "the num config is floored at 10");
+    expectInt(p.getBackPressureForAsyncSendSize(), 1024 * 1024,
+             "the size config is floored at 1 MiB");
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 10, "the semaphore honours the floor");
+    expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 1024 * 1024,
+             "the size semaphore honours the floor");
+    // 高于地板值时原样生效（Java 的 `if (cfg > 10)` 分支）
+    p.setBackPressureForAsyncSendNum(11);
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 11, "11 > 10 is taken literally");
+}
+
+// 12. 条数闸打满：第 11 笔在**调用方线程**上等满预算后回调，而且一次请求都没发出去
+void testNumGateRejectsOnCallerThread() {
+    AsyncFixture fx("BpNumGate", 600 /* mock 晚 600ms 回包，占住在途 */);
+    DefaultMQProducer p("PG_bp_num_gate");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setEnableBackpressureForAsyncMode(true);
+    p.setBackPressureForAsyncSendNum(static_cast<int32_t>(kMinAsyncSendNum));
+    p.start();
+
+    std::vector<std::shared_ptr<RecordingCallback>> inFlight;
+    for (int32_t i = 0; i < kMinAsyncSendNum; ++i) {
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendAsync(plainMessage(fx.topic), cb, 8000);
+        inFlight.push_back(cb);
+    }
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendNumAvailablePermits() == 0; }, 3000),
+           "ten in-flight sends occupy the whole num gate",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendNumAvailablePermits()));
+
+    auto rejected = std::make_shared<RecordingCallback>();
+    p.sendAsync(plainMessage(fx.topic), rejected, 150);
+    auto s = rejected->snapshot();
+    expectInt(s.exceptionCount, 1, "the over-budget send calls back an error");
+    expect(s.message == "send message tryAcquire semaphoreAsyncNum timeout",
+           "the num gate text matches Java word for word", s.message);
+    // Java 的 executeAsyncMessageSend 在调用方线程上直接 sendCallback.onException(...)
+    expect(!startsWith(s.threadName, "AsyncSenderExecutor_")
+               && !startsWith(s.threadName, "NettyClientPublicExecutor_"),
+           "the rejection is reported on the caller thread, not on a pool", s.threadName);
+    // 被闸拦下的发送连路由都没查：broker 侧的计数是最硬的证据
+    expectInt(fx.broker.sendCount(), kMinAsyncSendNum,
+              "a gated request never reaches the broker");
+
+    for (const std::shared_ptr<RecordingCallback>& cb : inFlight) {
+        expect(cb->waitDone(10000), "the in-flight sends complete");
+    }
+    expect(waitFor([&] {
+               return p.getSemaphoreAsyncSendNumAvailablePermits() == kMinAsyncSendNum;
+           }, 3000),
+           "every in-flight send gives its permit back",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendNumAvailablePermits()));
+    expectInt(static_cast<long long>(rejected->snapshot().successCount), 0,
+              "a gated request never also reports success");
+    p.shutdown();
+}
+
+// 13. 字节闸：第二笔大消息被拦，但**已经拿到的条数许可必须还回去**
+void testSizeGateRejectsAndGivesTheNumPermitBack() {
+    AsyncFixture fx("BpSizeGate", 600);
+    DefaultMQProducer p("PG_bp_size_gate");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setEnableBackpressureForAsyncMode(true);
+    p.setBackPressureForAsyncSendNum(static_cast<int32_t>(kMinAsyncSendNum));
+    p.setBackPressureForAsyncSendSize(static_cast<int32_t>(kMinAsyncSendSize));
+    p.start();
+
+    Message big(fx.topic, Bytes(600 * 1024, '4'));
+    auto first = std::make_shared<RecordingCallback>();
+    p.sendAsync(big, first, 8000);
+    const int64_t borrowed = kMinAsyncSendSize - static_cast<int64_t>(600 * 1024);
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendSizeAvailablePermits() == borrowed; }, 3000),
+           "the size gate charges exactly the body length",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendSizeAvailablePermits()));
+
+    auto second = std::make_shared<RecordingCallback>();
+    p.sendAsync(big, second, 150);
+    auto s = second->snapshot();
+    expectInt(s.exceptionCount, 1, "the second big send is gated");
+    expect(s.message == "send message tryAcquire semaphoreAsyncSize timeout",
+           "the size gate text matches Java word for word", s.message);
+    // Java 用 isSemaphoreAsyncNumAcquired 标记做到「只还拿到的那份」
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), kMinAsyncSendNum - 1,
+             "the in-flight send still holds exactly one num permit");
+    expect(first->waitDone(10000), "the first big send still completes");
+    expectInt(fx.broker.sendCount(), 1, "only the first big send reached the broker");
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendSizeAvailablePermits() == kMinAsyncSendSize; },
+                   3000),
+           "the size permit is back after the send settles");
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), kMinAsyncSendNum,
+             "the num permit is back too");
+    p.shutdown();
+}
+
+// 14. 一笔在途同时扣两格：条数 -1、字节 -body 长度（body 是压缩前的原始长度）
+void testInFlightSendBorrowsBothPermits() {
+    AsyncFixture fx("BpBorrow", 600);
+    DefaultMQProducer p("PG_bp_borrow");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setEnableBackpressureForAsyncMode(true);
+    p.start();
+    const Message msg = plainMessage(fx.topic);  // body "hi" = 2 字节
+    auto cb = std::make_shared<RecordingCallback>();
+    p.sendAsync(msg, cb, 8000);
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendNumAvailablePermits() == 1023; }, 3000),
+           "an in-flight send borrows one num permit",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendNumAvailablePermits()));
+    const int64_t expected = 100LL * 1024 * 1024 - static_cast<int64_t>(msg.getBody().size());
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendSizeAvailablePermits() == expected; }, 3000),
+           "and body.length size permits",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendSizeAvailablePermits()));
+    expect(cb->waitDone(10000), "the send completes");
+    expectInt(cb->snapshot().successCount, 1, "SEND_OK on the gated path");
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024, "num permit returned");
+    expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
+             "size permit returned");
+    p.shutdown();
+}
+
+// 15. 运行时扩容把正卡在闸上的人叫醒（Java 换 Semaphore 对象做不到的事，本实现能）
+void testRuntimeResizeWakesABlockedSender() {
+    AsyncFixture fx("BpResize", 2000 /* 占满 10 格，留出观察窗口 */);
+    DefaultMQProducer p("PG_bp_resize");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setEnableBackpressureForAsyncMode(true);
+    p.setBackPressureForAsyncSendNum(static_cast<int32_t>(kMinAsyncSendNum));
+    p.start();
+
+    std::vector<std::shared_ptr<RecordingCallback>> inFlight;
+    for (int32_t i = 0; i < kMinAsyncSendNum; ++i) {
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendAsync(plainMessage(fx.topic), cb, 8000);
+        inFlight.push_back(cb);
+    }
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendNumAvailablePermits() == 0; }, 3000),
+           "the gate is saturated");
+
+    auto woke = std::make_shared<RecordingCallback>();
+    std::thread blocked([&] { p.sendAsync(plainMessage(fx.topic), woke, 8000); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(blocked.joinable(), "the 11th sender is stuck on the gate", "it already returned");
+    p.setBackPressureForAsyncSendNum(static_cast<int32_t>(kMinAsyncSendNum) + 2);
+    blocked.join();
+    expect(woke->waitDone(10000), "the resize wakes the blocked sender and it sends");
+    expectInt(woke->snapshot().successCount, 1, "the woken send reports SEND_OK");
+    for (const std::shared_ptr<RecordingCallback>& cb : inFlight) {
+        expect(cb->waitDone(15000), "the saturated sends settle");
+    }
+    expect(waitFor([&] {
+               return p.getSemaphoreAsyncSendNumAvailablePermits() == kMinAsyncSendNum + 2;
+           }, 5000),
+           "all permits are back at the **new** capacity",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendNumAvailablePermits()));
+    expectInt(fx.broker.sendCount(), kMinAsyncSendNum + 1, "every accepted send reached the broker");
+    p.shutdown();
+}
+
+// 16. 队满 + 背压开：Java 就地跑完这一笔（阻塞调用方），而不是抛 executor rejected
+void testQueueFullRunsWithBackPressureOn() {
+    AsyncFixture fx("BpQueueFull");
+    int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
+    if (cores <= 0) cores = 1;
+    auto hook = std::make_shared<ThreadNameHook>(400);  // 占住每个 worker
+    DefaultMQProducer p("PG_bp_queue_full");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setAsyncSenderQueueCapacity(1);
+    p.setEnableBackpressureForAsyncMode(true);
+    p.registerSendMessageHook(hook);
+    p.start();
+
+    const int32_t attempts = cores * 2 + 4;
+    std::vector<std::shared_ptr<RecordingCallback>> cbs;
+    int threw = 0;
+    for (int32_t i = 0; i < attempts; ++i) {
+        auto cb = std::make_shared<RecordingCallback>();
+        cbs.push_back(cb);
+        try {
+            p.sendAsync(plainMessage(fx.topic), cb, 8000);
+        } catch (const MQClientException& e) {
+            ++threw;
+            std::printf("unexpected throw %s\n", e.what());
+        }
+    }
+    // 同一份配置在开关关着时会抛 executor rejected（见 testQueueFullRejects）
+    expectInt(threw, 0, "with back-pressure on a full queue is absorbed, not thrown");
+    int completed = 0;
+    for (const std::shared_ptr<RecordingCallback>& cb : cbs) {
+        if (cb->waitDone(20000)) ++completed;
+    }
+    expectInt(completed, attempts, "every send calls back, inline ones included");
+    expectInt(fx.broker.sendCount(), attempts, "and every send actually reached the broker");
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024,
+             "the inline runs gave their permits back");
+    expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
+             "including the size permits");
+    p.shutdown();
+}
+
+// 17. 失败与重试链都只归还一次：broker 报错、建连失败换 broker 都不留泄漏
+void testFailedAndRetriedSendsReleasePermits() {
+    {
+        MockServer ns;
+        MockServer broker;
+        const std::string topic = "BpReleaseError";
+        installRoute(topic, {{topic + "-broker", broker.address()}});
+        broker.script({{ResponseCode::SYSTEM_ERROR, 0, false}});
+        DefaultMQProducer p("PG_bp_release_error");
+        p.setNamesrvAddr(ns.address());
+        p.setEnableBackpressureForAsyncMode(true);
+        p.start();
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendAsync(plainMessage(topic), cb, 3000);
+        expect(cb->waitDone(3000), "a broker error calls back");
+        expectInt(cb->snapshot().exceptionCount, 1, "and it is an error");
+        expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024,
+                 "a failed send still gives its num permit back");
+        expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
+                 "and its size permits");
+        p.shutdown();
+    }
+    {
+        // 建连失败会按 retryTimesWhenSendAsyncFailed 换 broker 重试：整条链只扣一格
+        MockServer ns;
+        MockServer live;
+        const std::string topic = "BpReleaseRetry";
+        installRoute(topic, {{topic + "-dead", deadAddress()}, {topic + "-live", live.address()}});
+        DefaultMQProducer p("PG_bp_release_retry");
+        p.setNamesrvAddr(ns.address());
+        p.setEnableBackpressureForAsyncMode(true);
+        p.setRetryTimesWhenSendAsyncFailed(2);
+        p.start();
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendAsync(plainMessage(topic), cb, 8000);
+        expect(cb->waitDone(8000), "the retry chain recovers on the live broker");
+        expectInt(cb->snapshot().successCount, 1, "recovery reports onSuccess");
+        expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024,
+                 "three attempts borrow one num permit, not three");
+        expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
+                 "and one message's worth of size permits");
+        p.shutdown();
+    }
+}
+
 // 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
 void runCase(const char* name, void (*fn)()) {
     const auto began = std::chrono::steady_clock::now();
@@ -989,6 +1295,15 @@ int main() {
     runCase("connectFailureRecoversOnAnotherBroker", testConnectFailureRecoversOnAnotherBroker);
     runCase("pinnedQueueNeverSwitchesBroker", testPinnedQueueNeverSwitchesBroker);
     runCase("queueFullRejects", testQueueFullRejects);
+    runCase("backPressureDefaultsAndGateOff", testBackPressureDefaultsAndGateOff);
+    runCase("backPressureFloors", testBackPressureFloors);
+    runCase("numGateRejectsOnCallerThread", testNumGateRejectsOnCallerThread);
+    runCase("sizeGateRejectsAndGivesTheNumPermitBack",
+            testSizeGateRejectsAndGivesTheNumPermitBack);
+    runCase("inFlightSendBorrowsBothPermits", testInFlightSendBorrowsBothPermits);
+    runCase("runtimeResizeWakesABlockedSender", testRuntimeResizeWakesABlockedSender);
+    runCase("queueFullRunsWithBackPressureOn", testQueueFullRunsWithBackPressureOn);
+    runCase("failedAndRetriedSendsReleasePermits", testFailedAndRetriedSendsReleasePermits);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

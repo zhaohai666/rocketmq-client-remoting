@@ -63,6 +63,11 @@ add_executable(rmq_test_producer_async test_producer_async.cpp)
 target_link_libraries(rmq_test_producer_async PRIVATE rocketmq::remoting)
 add_test(NAME producer_async COMMAND rmq_test_producer_async)
 
+# 异步发送背压基元：公平（只有队首能拿）+ 运行时原地改容量（在途保留、叫醒等待者）
+add_executable(rmq_test_backpressure test_backpressure.cpp)
+target_link_libraries(rmq_test_backpressure PRIVATE rocketmq::remoting)
+add_test(NAME backpressure COMMAND rmq_test_backpressure)
+
 # POP 模式：CK 串编解码 + 请求头字段名守卫 + POP_CK 反构
 add_executable(rmq_test_pop test_pop.cpp)
 target_link_libraries(rmq_test_pop PRIVATE rocketmq::remoting)

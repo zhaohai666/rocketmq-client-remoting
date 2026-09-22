@@ -69,6 +69,7 @@ set(RMQ_SOURCES
     src/client/producer.cpp
     src/client/consumer.cpp
     src/client/consume_executor.cpp
+    src/client/backpressure.cpp
     src/client/pull_consumer.cpp
     src/client/lite_pull_consumer.cpp
     src/client/request_reply.cpp

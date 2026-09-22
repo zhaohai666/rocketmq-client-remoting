@@ -77,3 +77,7 @@ target_link_libraries(rmq_live_unit_config PRIVATE rocketmq::remoting)
 # SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调（需 broker enablePropertyFilter=true；不打进 ctest）
 add_executable(rmq_sql92_live sql92_live.cpp)
 target_link_libraries(rmq_sql92_live PRIVATE rocketmq::remoting)
+
+# 异步发送背压（两个公平信号量）真机联调：限流文案 + broker 侧对账 + 运行时扩容（不打进 ctest）
+add_executable(rmq_live_backpressure live_backpressure.cpp)
+target_link_libraries(rmq_live_backpressure PRIVATE rocketmq::remoting)

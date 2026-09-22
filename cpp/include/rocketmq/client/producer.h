@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "rocketmq/client/hook.h"
+#include "rocketmq/client/backpressure.h"
 #include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/latency.h"
 #include "rocketmq/client/mq_client.h"
@@ -81,6 +82,22 @@ public:
     // sendAsync 向调用方抛 MQClientException("executor rejected")。
     void setAsyncSenderQueueCapacity(int32_t n) { asyncSenderQueueCapacity_ = n; }
     int32_t getAsyncSenderQueueCapacity() const { return asyncSenderQueueCapacity_; }
+    // ---------------- 异步发送背压（对应 Java DefaultMQProducer:1368-1408）----------------
+    // 开关默认关闭（与 Java 同），而且**不是**启动期配置：跑到一半也能打开/关掉，
+    // 因为只有闸本身读它（见 producer.cpp 的 executeAsyncMessageSend）。
+    void setEnableBackpressureForAsyncMode(bool b) { enableBackpressureForAsyncMode_ = b; }
+    bool isEnableBackpressureForAsyncMode() const { return enableBackpressureForAsyncMode_; }
+    // 运行时改「在途条数 / 在途字节数」上限。语义不是「设成 num」而是「总量变成 num、
+    // 已经在途的那几份原样保留」，所以调小之后 availablePermits 可能为负（Java
+    // setBackPressureForAsyncSendNum:1383-1391 的 new Semaphore(num - acquired) 同理）。
+    // 低于地板值时夹到地板（10 条 / 1M 字节）。
+    void setBackPressureForAsyncSendNum(int32_t num);
+    int32_t getBackPressureForAsyncSendNum() const { return backPressureForAsyncSendNum_; }
+    void setBackPressureForAsyncSendSize(int32_t size);
+    int32_t getBackPressureForAsyncSendSize() const { return backPressureForAsyncSendSize_; }
+    // 观测用（Java DefaultMQProducerImpl:200-206）：当前空闲许可，负数表示在途超额。
+    int64_t getSemaphoreAsyncSendNumAvailablePermits() const;
+    int64_t getSemaphoreAsyncSendSizeAvailablePermits() const;
     // 跑用户回调的线程数（Java NettyClientConfig.clientCallbackExecutorThreads）。
     // <=0 时取 CPU 核数 —— 那才是 Java 的**默认**口径（NettyClientConfig:28 =
     // availableProcessors，4 只是显式配 <=0 时 NettyRemotingClient 的兜底）。
@@ -206,8 +223,15 @@ public:
     // 每次尝试换新 opaque、超时用共享的剩余预算），用户回调和 SendMessageHook.after 在
     // NettyClientPublicExecutor_N 上跑。callback 以 shared_ptr 持有，调用方可安全释放。
     //
-    // 与 Java 的三处有意差别（详见 cpp/README.md）：未 start() 时同步抛而不是走回调；
-    // 批量消息复用同步批量内核（只是不阻塞调用方）；没实现 Java 默认关闭的信号量背压。
+    // 开了 setEnableBackpressureForAsyncMode(true) 之后，投队列**之前**还要过一道闸
+    // （executeAsyncMessageSend，Java DefaultMQProducerImpl:635-682）：按条数和字节数各拿
+    // 一份许可，拿不到就回调 RemotingTooMuchRequestException。这道闸**在调用方线程上等**，
+    // 所以背压打满时「异步」会退化成「等满 timeout 再报错」；队满时 Java 也允许就地跑完
+    // 这一笔（同样阻塞调用方），为的是把已经扣掉的许可还得回来。
+    //
+    // 与 Java 的两处有意差别：未 start() 时同步抛而不是走回调；批量消息复用同步批量内核
+    // （只是不阻塞调用方）。信号量本身另有两处（原地改容量、不需要 ReadWriteCASLock），
+    // 见 backpressure.h。
     void sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback,
                    int32_t timeoutMillis = -1);
     // 定点异步发送：mq 非空时失败只在**同一台 broker** 上换 opaque 重试
@@ -315,6 +339,12 @@ protected:
         int32_t timeout = 0;                           // **剩余**预算（每轮扣掉已花掉的）
         int32_t times = 0;                             // 已失败次数（Java onExceptionImpl 的 times）
         bool pinned = false;                           // 定点发送：重试不换 broker
+        // ---- 背压闸的两份许可（Java BackpressureSendCallBack:577-633 的两个 boolean）----
+        // 没走闸（开关关着）时全 false，releaseBackPressure 就什么都不做。
+        bool numAcquired = false;                      // 已拿到 1 份「条数」许可
+        bool sizeAcquired = false;                     // 已拿到 msgLen 份「字节」许可
+        bool permitsReleased = false;                  // 只归还一次（链上多条终点会重复收尾）
+        int64_t msgLen = 1;                            // 扣字节许可的份数，**压缩前**的 body 长度
         std::chrono::steady_clock::time_point attemptBegan;  // 本次尝试起点（单调钟）
     };
 
@@ -324,6 +354,17 @@ protected:
     // pinned 非空时是定点异步发送：重试不换 broker（Java 传下去的 publish 是 null）。
     void enqueueAsync(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned,
                       int32_t timeoutMillis);
+    // 投队列之前过闸（Java DefaultMQProducerImpl.executeAsyncMessageSend:635-682）：
+    // 「条数」「字节数」两个许可**顺序**申请，都用从 began 算起的剩余预算去等，所以第一个闸
+    // 就能把预算花光。拿不到就调 completeAsync 报错；队满时开了背压就地跑 runnable（许可已经
+    // 扣掉，就地跑完才还得回来），关着则抛 MQClientException("executor rejected")。
+    void executeAsyncMessageSend(const std::shared_ptr<AsyncSendState>& state,
+                                 const std::function<void()>& runnable, int32_t timeout,
+                                 const std::chrono::steady_clock::time_point& began,
+                                 const std::shared_ptr<ConsumeExecutor>& pool);
+    // 链的终点归还许可：先还字节、再还条数（Java semaphoreProcessor:599-610），
+    // 且只还**本次真正拿到**的那份、只还一次。
+    void releaseBackPressure(const std::shared_ptr<AsyncSendState>& state);
     // 出队后的准备工作（Java sendDefaultImpl(ASYNC) → sendKernelImpl）
     void sendAsyncInner(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned);
     // 建请求 + before 钩子，然后发出第一笔尝试
@@ -433,6 +474,15 @@ protected:
     // shutdown() 同时把成员换走并排空队列，正在提交的那一次也不会摸到悬垂对象。
     std::shared_ptr<ConsumeExecutor> asyncSenderExecutor_;
     std::shared_ptr<ConsumeExecutor> callbackExecutor_;
+    // ---------------- 异步发送背压（Java DefaultMQProducerImpl:122-153 的两个公平信号量）----
+    // 构造函数里按默认配置建（Java 也是在 impl 构造时建），改容量走 setter。
+    // 生命周期：链上的 completeAsync 用这两个对象归还许可，前提同样是「生产者活得比在途发送久」
+    // —— 与 asyncSenderExecutor_ 的提交回调捕获 this 是同一个约束。
+    bool enableBackpressureForAsyncMode_ = false;
+    int32_t backPressureForAsyncSendNum_ = 1024;
+    int32_t backPressureForAsyncSendSize_ = 100 * 1024 * 1024;
+    FairSemaphore semaphoreAsyncSendNum_;
+    FairSemaphore semaphoreAsyncSendSize_;
 };
 
 // 事务生产者（对应 Java TransactionMQProducer）：可预设 TransactionListener

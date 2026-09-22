@@ -80,9 +80,33 @@ void ensureUniqId(Message& msg) {
     }
 }
 
+// 建背压信号量时的初始许可（Java DefaultMQProducerImpl:141-153）：配置**不高于**地板值时
+// 用地板值，并记一条 info —— Java 的分支是 `cfg > 10 ? new Semaphore(max(cfg, 10)) : new
+// Semaphore(10)`，所以恰好等于地板值时也会打这条日志。
+int64_t backPressurePermits(int32_t configured, int64_t floor, const char* name) {
+    if (static_cast<int64_t>(configured) > floor) {
+        return configured;
+    }
+    logger_info(std::string(name) + " can not be smaller than " + std::to_string(floor) + ".");
+    return floor;
+}
+
+// 扣多少「字节」许可（Java executeAsyncMessageSend:642 的
+// `msg.getBody() == null ? 1 : msg.getBody().length`）：不给空 body 算 1 就等于不限流。
+int64_t backPressureMsgLen(const Message& msg) {
+    const Bytes& body = msg.getBody();
+    return body.empty() ? 1 : static_cast<int64_t>(body.size());
+}
+
 }  // namespace
 
-DefaultMQProducer::DefaultMQProducer(const std::string& producerGroup) {
+DefaultMQProducer::DefaultMQProducer(const std::string& producerGroup)
+    // Java 在建 impl 时就把两个公平信号量建好（DefaultMQProducerImpl:141-153），
+    // 而不是等 start()：开关允许运行时才打开，那时闸必须已经在了。
+    : semaphoreAsyncSendNum_(backPressurePermits(backPressureForAsyncSendNum_, kMinAsyncSendNum,
+                                                 "semaphoreAsyncSendNum")),
+      semaphoreAsyncSendSize_(backPressurePermits(backPressureForAsyncSendSize_,
+                                                  kMinAsyncSendSize, "semaphoreAsyncSendSize")) {
     if (UtilAll::isBlank(producerGroup)) {
         throw MQClientException("producerGroup is empty");
     }
@@ -707,6 +731,29 @@ void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* w
 
 }  // namespace
 
+// ---------------------------------------------------------------- 异步发送背压配置
+// Java DefaultMQProducer:1368-1408。改容量必须走这两个 setter：直接改字段只动配置值，
+// 信号量不会跟着变（Java 的字段是 private，没这个坑）。
+void DefaultMQProducer::setBackPressureForAsyncSendNum(int32_t num) {
+    backPressureForAsyncSendNum_ = std::max(num, static_cast<int32_t>(kMinAsyncSendNum));
+    // 语义是「总量变成 num、在途那份原样保留」⇒ 空闲 = num - 在途，调小后可以为负。
+    // Java 写成 acquired = 旧配置 - 空闲; setSemaphore(num - acquired)，同一个结果。
+    semaphoreAsyncSendNum_.setTotalPermits(backPressureForAsyncSendNum_);
+}
+
+void DefaultMQProducer::setBackPressureForAsyncSendSize(int32_t size) {
+    backPressureForAsyncSendSize_ = std::max(size, static_cast<int32_t>(kMinAsyncSendSize));
+    semaphoreAsyncSendSize_.setTotalPermits(backPressureForAsyncSendSize_);
+}
+
+int64_t DefaultMQProducer::getSemaphoreAsyncSendNumAvailablePermits() const {
+    return semaphoreAsyncSendNum_.availablePermits();
+}
+
+int64_t DefaultMQProducer::getSemaphoreAsyncSendSizeAvailablePermits() const {
+    return semaphoreAsyncSendSize_.availablePermits();
+}
+
 void DefaultMQProducer::createAsyncExecutors() {
     // Java 的两个池都以 availableProcessors 为大小；本机的 CPU 数在 ConsumeExecutor
     // 里从 1 开始编号，线程名 "AsyncSenderExecutor_1"、"NettyClientPublicExecutor_1"。
@@ -754,38 +801,94 @@ void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& stat
     }
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     state->timeout = timeout;
+    // 许可按**压缩前**的 body 长度扣（Java 在调用方线程上算，那时还没压缩）
+    state->msgLen = backPressureMsgLen(state->msg);
     if (pinned != nullptr) {
         state->mq = *pinned;
         state->pinned = true;
     }
     const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    const std::function<void()> runnable = [this, state, began, timeout]() {
+        // 出队之后才算真实耗时：Java 的 runnable 用 `timeout > costTime` 把关，
+        // 排队已经把预算吃光时连请求都不建。
+        const int32_t cost = elapsedMs(began);
+        if (timeout <= cost) {
+            const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
+                                      "DEFAULT ASYNC send call timeout");
+            completeAsync(state, nullptr, &tooMuch);
+            return;
+        }
+        state->timeout = timeout - cost;
+        try {
+            sendAsyncInner(state, state->pinned ? &state->mq : nullptr);
+        } catch (const std::exception& e) {
+            // Java：runnable 的 catch → newCallBack.onException(e)
+            const InvokeError err(InvokeError::Kind::OTHER, e.what());
+            completeAsync(state, nullptr, &err);
+        } catch (...) {
+            const InvokeError err(InvokeError::Kind::OTHER, "unknown error");
+            completeAsync(state, nullptr, &err);
+        }
+    };
+    executeAsyncMessageSend(state, runnable, timeout, began, pool);
+}
+
+void DefaultMQProducer::executeAsyncMessageSend(const std::shared_ptr<AsyncSendState>& state,
+                                                const std::function<void()>& runnable,
+                                                int32_t timeout,
+                                                const std::chrono::steady_clock::time_point& began,
+                                                const std::shared_ptr<ConsumeExecutor>& pool) {
+    if (enableBackpressureForAsyncMode_) {
+        // 两个许可**顺序**申请、都用「从 began 算起的剩余预算」去等（Java :648 / :661 都是
+        // `timeout - costTime`），所以第一个闸就能把预算花光；已经拿到手的由
+        // releaseBackPressure 在链终点原样归还。
+        const int32_t numBudget = timeout - elapsedMs(began);
+        state->numAcquired =
+            numBudget > 0 && semaphoreAsyncSendNum_.tryAcquire(1, numBudget);
+        if (!state->numAcquired) {
+            const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
+                                       "send message tryAcquire semaphoreAsyncNum timeout");
+            completeAsync(state, nullptr, &tooMuch);
+            return;
+        }
+        const int32_t sizeBudget = timeout - elapsedMs(began);
+        state->sizeAcquired =
+            sizeBudget > 0 && semaphoreAsyncSendSize_.tryAcquire(state->msgLen, sizeBudget);
+        if (!state->sizeAcquired) {
+            const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
+                                      "send message tryAcquire semaphoreAsyncSize timeout");
+            completeAsync(state, nullptr, &tooMuch);
+            return;
+        }
+    }
     try {
-        pool->submit([this, state, began, timeout]() {
-            // 出队之后才算真实耗时：Java 的 runnable 用 `timeout > costTime` 把关，
-            // 排队已经把预算吃光时连请求都不建。
-            const int32_t cost = elapsedMs(began);
-            if (timeout <= cost) {
-                const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
-                                          "DEFAULT ASYNC send call timeout");
-                completeAsync(state, nullptr, &tooMuch);
-                return;
-            }
-            state->timeout = timeout - cost;
-            try {
-                sendAsyncInner(state, state->pinned ? &state->mq : nullptr);
-            } catch (const std::exception& e) {
-                // Java：runnable 的 catch → newCallBack.onException(e)
-                const InvokeError err(InvokeError::Kind::OTHER, e.what());
-                completeAsync(state, nullptr, &err);
-            } catch (...) {
-                const InvokeError err(InvokeError::Kind::OTHER, "unknown error");
-                completeAsync(state, nullptr, &err);
-            }
-        });
-    } catch (const RejectedExecutionError& e) {
-        // Java DefaultMQProducerImpl:635-682：executor.submit 抛
-        // RejectedExecutionException → MQClientException("executor rejected ")
-        throw MQClientException("executor rejected");
+        pool->submit(runnable);
+    } catch (const RejectedExecutionError&) {
+        if (enableBackpressureForAsyncMode_) {
+            // Java :675-681：许可已经扣掉了，就地跑完这一笔（**阻塞调用方**），
+            // 好让回调把许可还回来；否则队列一满就直接抛，白扣的容量还得等超时。
+            runnable();
+        } else {
+            // Java DefaultMQProducerImpl:635-682：executor.submit 抛
+            // RejectedExecutionException → MQClientException("executor rejected ")
+            throw MQClientException("executor rejected");
+        }
+    }
+}
+
+void DefaultMQProducer::releaseBackPressure(const std::shared_ptr<AsyncSendState>& state) {
+    // Java BackpressureSendCallBack.semaphoreProcessor:599-610（先还字节、再还条数）。
+    // 与 Java 的一处加固：这里用 permitsReleased 保证只还一次 —— Java 直接还，链上任何
+    // 一次走到终点之后的重复回调都会把容量虚增出去；本端口的重试链更长，还一次更稳妥。
+    if (state->permitsReleased) {
+        return;
+    }
+    state->permitsReleased = true;
+    if (state->sizeAcquired) {
+        semaphoreAsyncSendSize_.release(state->msgLen);
+    }
+    if (state->numAcquired) {
+        semaphoreAsyncSendNum_.release(1);
     }
 }
 
@@ -999,6 +1102,9 @@ void DefaultMQProducer::completeAsync(const std::shared_ptr<AsyncSendState>& sta
         }
         executeSendMessageHookAfter(*state->context);
     }
+    // 顺序与 Java 一致：after 钩子（在 sendKernelImpl 的包装回调里）→ 归还许可 → 用户回调。
+    // 归还必须在交给用户之前，否则用户回调里再发一笔异步消息会多占一格。
+    releaseBackPressure(state);
     if (state->callback == nullptr) {
         return;
     }
