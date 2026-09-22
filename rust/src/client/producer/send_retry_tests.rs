@@ -32,6 +32,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // ---------------------------------------------------------------- 假集群
 
+/// 脚本里表示「读到请求、快照下来，然后**关掉连接不回答**」的应答码。
+///
+/// 对端关闭会让客户端拿到 [`Error::SendRequest`]（`connection closed`），也就是 Java
+/// 的 `RemotingSendRequestException` —— 异步链要按「换一台 broker 再试」处理它。
+/// 真集群造不出这种失败，脚本化的应答码又都代表「收到了响应」，所以单独开一个哨兵值。
+const CLOSE_WITHOUT_ANSWER: i32 = -1;
+
 /// 单个 broker 的脚本：按顺序弹出 `(应答码, 应答前 sleep 毫秒)`，耗尽后一直用 `tail`。
 #[derive(Debug)]
 struct BrokerScript {
@@ -42,6 +49,9 @@ struct BrokerScript {
     sends: Vec<Vec<(String, String)>>,
     /// 与 `sends` 一一对应的请求码（310 单条 / 320 批量 / 325 应答）。
     send_codes: Vec<i32>,
+    /// 与 `sends` 一一对应的 `opaque`：异步重试必须复用同一个请求、**换新的 opaque**，
+    /// 这是唯一能看出「换 opaque 了」的地方。
+    send_opaques: Vec<i32>,
 }
 
 impl BrokerScript {
@@ -52,6 +62,7 @@ impl BrokerScript {
             requests: 0,
             sends: Vec::new(),
             send_codes: Vec::new(),
+            send_opaques: Vec::new(),
         }
     }
 }
@@ -67,6 +78,8 @@ struct ClusterState {
 /// 因此第一次发送必然落在 `broker-0`（选队是轮询，游标从 0 起）。
 struct MockCluster {
     namesrv_addr: String,
+    /// 路由里 `broker-0..N` 的监听地址，顺序与路由一致。`with_addrs` 下就是传进来的那份。
+    broker_addrs: Vec<String>,
     state: Arc<Mutex<ClusterState>>,
     /// 只持有、不等待：测试运行时结束时会被 abort。
     tasks: Vec<JoinHandle<()>>,
@@ -94,12 +107,13 @@ impl MockCluster {
     async fn with_addrs(broker_addrs: Vec<String>, route_ok: bool) -> MockCluster {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
         let namesrv_addr = listener.local_addr().expect("mock namesrv addr").to_string();
+        let count = broker_addrs.len();
         let state = Arc::new(Mutex::new(ClusterState {
             route_ok,
-            brokers: (0..broker_addrs.len()).map(|_| BrokerScript::new()).collect(),
+            brokers: (0..count).map(|_| BrokerScript::new()).collect(),
         }));
-        let tasks = vec![spawn_namesrv(listener, Arc::clone(&state), broker_addrs)];
-        MockCluster { namesrv_addr, state, tasks }
+        let tasks = vec![spawn_namesrv(listener, Arc::clone(&state), broker_addrs.clone())];
+        MockCluster { namesrv_addr, broker_addrs, state, tasks }
     }
 
     /// 脚本化第 `index` 个 broker：先按 `steps` 依次应答，之后一直用 `tail`。
@@ -111,6 +125,7 @@ impl MockCluster {
         broker.requests = 0;
         broker.sends.clear();
         broker.send_codes.clear();
+        broker.send_opaques.clear();
     }
 
     /// 第 `index` 个 broker 收到的 SEND 请求数。
@@ -127,6 +142,21 @@ impl MockCluster {
     fn send_code(&self, index: usize, n: usize) -> i32 {
         lock(&self.state).brokers[index].send_codes[n]
     }
+
+    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 `opaque`。
+    fn send_opaque(&self, index: usize, n: usize) -> i32 {
+        lock(&self.state).brokers[index].send_opaques[n]
+    }
+}
+
+/// 一个**没人监听**的地址：连上去立刻被拒（`Error::Connect`）。
+///
+/// 绑定后再立刻关掉，比凭空编一个端口更可靠（那个端口随时可能被人占上）。
+async fn dead_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind then close");
+    let addr = listener.local_addr().expect("dead addr").to_string();
+    drop(listener);
+    addr
 }
 
 fn is_send_code(code: i32) -> bool {
@@ -266,8 +296,13 @@ fn spawn_broker(
                                 .collect(),
                         );
                         broker.send_codes.push(request.code);
+                        broker.send_opaques.push(request.opaque);
                         (step.0, step.1, broker.requests)
                     };
+                    if code == CLOSE_WITHOUT_ANSWER {
+                        // 丢掉连接：客户端看到的是 `Error::SendRequest`（connection closed）
+                        return;
+                    }
                     if delay > 0 {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
@@ -776,9 +811,8 @@ async fn stream_request_type_is_off_by_default_for_producers() {
 // 字节闸的地板值是 1M（Java `:148-153`），所以只能拿「1M 少掉多少」来断言在途字节，
 // 不能把上限配成几百字节 —— 那会被夹回 1M。
 //
-// ⚠ 这里没有「发送队列满了就地跑完」那条用例（Java `:675-681`、Python/C++/.NET 都有）：
-// 本实现把整条异步链 `tokio::spawn` 出去，**没有有界队列**，因此不存在拒绝入队的分支，
-// 那道闸也就没有落点。等 #50 接上真正的异步发送内核（有界 executor）时再补。
+// 「发送队列满了怎么办」（Java `:675-681`）在下一节「异步发送内核」里：那道分支要有界
+// 队列才谈得上，本端口 #50 之后才有。
 
 use std::sync::atomic::AtomicUsize;
 
@@ -808,6 +842,147 @@ impl SendCallback for Recorder {
     }
 }
 
+/// 数 before/after 钩子各跑了几次，并记下 after 有没有看到结果/异常。
+#[derive(Default)]
+struct CountingSendHook {
+    before: AtomicUsize,
+    after: AtomicUsize,
+    saw_result: AtomicUsize,
+    saw_exception: AtomicUsize,
+}
+
+impl CountingSendHook {
+    fn before(&self) -> usize {
+        self.before.load(Ordering::SeqCst)
+    }
+
+    fn after(&self) -> usize {
+        self.after.load(Ordering::SeqCst)
+    }
+
+    fn saw_result(&self) -> bool {
+        self.saw_result.load(Ordering::SeqCst) > 0
+    }
+
+    fn saw_exception(&self) -> bool {
+        self.saw_exception.load(Ordering::SeqCst) > 0
+    }
+}
+
+impl SendMessageHook for CountingSendHook {
+    fn hook_name(&self) -> &str {
+        "counting"
+    }
+
+    fn send_message_before(&self, _context: &mut SendMessageContext) -> Result<()> {
+        self.before.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn send_message_after(&self, context: &mut SendMessageContext) -> Result<()> {
+        self.after.fetch_add(1, Ordering::SeqCst);
+        if context.send_result.is_some() {
+            self.saw_result.fetch_add(1, Ordering::SeqCst);
+        }
+        if context.exception.is_some() {
+            self.saw_exception.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// 一个**耗时的**拦截钩子：用来把异步内核的准备段预算花光（真集群造不出这段时长）。
+struct SleepingForbiddenHook {
+    millis: u64,
+}
+
+impl CheckForbiddenHook for SleepingForbiddenHook {
+    fn hook_name(&self) -> &str {
+        "sleeping"
+    }
+
+    fn check_forbidden(&self, _context: &mut CheckForbiddenContext) -> Result<()> {
+        // 钩子接口是同步的（Java 也是），所以只能睡挂钟；挂钟正是预算用的时钟。
+        std::thread::sleep(Duration::from_millis(self.millis));
+        Ok(())
+    }
+}
+
+/// 一个**阻塞式**的 before 钩子：既把「在途」占住（许可要到链终点才归还），又按标签记下
+/// 每笔进钩子的相对时刻 —— 真机验证脚本里的 `SlowHook` 同构。
+///
+/// 占住的是**池消费者所在的线程**，所以这个钩子同时测到「池子被在途占满」这一维。
+struct ParkingSendHook {
+    millis: std::sync::atomic::AtomicI64,
+    clock: Mutex<Option<Instant>>,
+    entries: Mutex<Vec<(String, u128)>>,
+}
+
+impl ParkingSendHook {
+    fn new(millis: i64) -> ParkingSendHook {
+        ParkingSendHook {
+            millis: std::sync::atomic::AtomicI64::new(millis),
+            clock: Mutex::new(None),
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 重新计时并清空记录，让相邻用例互不干扰。
+    fn begin(&self) {
+        *lock(&self.clock) = Some(Instant::now());
+        lock(&self.entries).clear();
+    }
+
+    fn count_of(&self, label: &str) -> usize {
+        lock(&self.entries).iter().filter(|(l, _)| l == label).count()
+    }
+
+    fn first_entry_of(&self, label: &str) -> Option<u128> {
+        lock(&self.entries)
+            .iter()
+            .filter(|(l, _)| l == label)
+            .map(|(_, at)| *at)
+            .min()
+    }
+
+    fn dump(&self) -> String {
+        lock(&self.entries)
+            .iter()
+            .map(|(label, at)| format!("{label}@{at}ms"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+impl SendMessageHook for ParkingSendHook {
+    fn hook_name(&self) -> &str {
+        "parking"
+    }
+
+    fn send_message_before(&self, context: &mut SendMessageContext) -> Result<()> {
+        let label = context
+            .message
+            .as_ref()
+            .and_then(|msg| msg.get_keys())
+            .unwrap_or_default()
+            .to_string();
+        let began = lock(&self.clock).unwrap_or_else(Instant::now);
+        lock(&self.entries).push((label, began.elapsed().as_millis()));
+        let millis = self.millis.load(Ordering::SeqCst);
+        if millis > 0 {
+            std::thread::sleep(Duration::from_millis(millis as u64));
+        }
+        Ok(())
+    }
+}
+
+/// 带标签的消息（钩子按 keys 认领是哪一笔）。
+fn labelled(topic_len: usize, label: &str) -> Message {
+    let mut msg = body_of(topic_len);
+    msg.set_keys(label);
+    msg
+}
+
 /// 开了背压的生产者：条数闸设成 `num`、字节闸夹到地板值 1M（同 Python 的夹具）。
 ///
 /// 字节闸只能配到 1M —— 再小会被夹回来，而 1M 已经够把「一笔扣了多少字节」算清楚
@@ -822,6 +997,90 @@ async fn backpressure_producer(
     producer.set_back_pressure_for_async_send_num(num);
     producer.set_back_pressure_for_async_send_size(MIN_ASYNC_SEND_SIZE);
     producer
+}
+
+/// 同上，再挂一个阻塞式 before 钩子（占住在途用）。
+async fn backpressure_producer_with_hook(
+    instance: &str,
+    cluster: &MockCluster,
+    num: i64,
+    hook: Arc<ParkingSendHook>,
+) -> DefaultMQProducer {
+    let producer = backpressure_producer(instance, cluster, num).await;
+    producer.register_send_message_hook(hook);
+    producer
+}
+
+/// 真机验证 B3 的离线对拍（`examples/live_backpressure.rs`）：**池子消费者全被在途占住
+/// 时，运行时扩容仍然要把卡在闸上的那一笔叫醒并真的发出去**。
+///
+/// 单线程运行时测不出这件事——那里池任务只在调用方 await 时才跑，闸和池纠缠不到一起，
+/// 所以这一条要显式多样本运行时（与真机脚本同样的形状）。丢唤醒如果回归，这里会先红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
+    const HOLD_MS: i64 = 600;
+    const RESIZE_AT: u64 = 100;
+
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let hook = Arc::new(ParkingSendHook::new(HOLD_MS));
+    let producer =
+        backpressure_producer_with_hook("resize_in_pool", &cluster, MIN_ASYNC_SEND_NUM, hook.clone())
+            .await;
+    hook.begin();
+
+    let held = Arc::new(Recorder::default());
+    for _ in 0..MIN_ASYNC_SEND_NUM {
+        producer
+            .send_async(labelled(8, "held"), held.clone(), Some(15_000), None)
+            .expect("10 笔都该排进池队列");
+    }
+    // 必须等闸门真的被占满再补第 11 笔：池子里的任务和主任务并发，谁先到闸口不一定。
+    // 先过闸的那笔会拿到许可，于是「卡住的第 11 笔」会变成「卡住的第 11 笔 held」，
+    // 下面的判定就只是运气了（真机 B3 用看门线程盯同一件事）。
+    assert!(
+        wait_until(|| producer.semaphore_async_send_num_available_permits() == 0).await,
+        "10 笔没能占满条数闸（空闲 {}）",
+        producer.semaphore_async_send_num_available_permits()
+    );
+
+    let woken = Arc::new(Recorder::default());
+    producer
+        .send_async(labelled(8, "woken"), woken.clone(), Some(15_000), None)
+        .expect("第 11 笔也该排进池队列");
+
+    tokio::time::sleep(Duration::from_millis(RESIZE_AT)).await;
+    assert_eq!(
+        hook.count_of("woken"),
+        0,
+        "扩容之前第 11 笔不该过闸（钩子记录: {}）",
+        hook.dump()
+    );
+    producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 2);
+
+    assert!(
+        wait_until(|| woken.done.load(Ordering::SeqCst) == 1).await,
+        "扩容没把卡在闸上的那笔叫醒: {:?}",
+        woken.errors()
+    );
+    assert_eq!(woken.ok.load(Ordering::SeqCst), 1, "{:?}", woken.errors());
+    // 放行它的只可能是扩容：那一刻既晚于扩容、又早于 10 笔在途归还。
+    let entered = hook.first_entry_of("woken");
+    assert!(
+        entered.is_some_and(|at| at as u64 >= RESIZE_AT && (at as i64) < HOLD_MS),
+        "第 11 笔进内核于 {entered:?}ms（扩容在 {RESIZE_AT}ms、在途到 ≈{HOLD_MS}ms 才归还）",
+    );
+
+    assert!(wait_until(|| held.done.load(Ordering::SeqCst)
+        == MIN_ASYNC_SEND_NUM as usize)
+        .await);
+    assert_eq!(cluster.requests(0), MIN_ASYNC_SEND_NUM as usize + 1);
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        MIN_ASYNC_SEND_NUM + 2,
+        "全部落地后空闲许可 = 新容量"
+    );
+    producer.shutdown();
 }
 
 fn body_of(len: usize) -> Message {
@@ -1060,10 +1319,18 @@ async fn failure_also_gives_the_permits_back() {
 }
 
 /// 重试链只占**一份**许可（一次发送一笔），不是一笔尝试一份；还多次会把容量虚增。
+///
+/// 重试由「broker 关掉连接不回答」触发（异步链只对没收到响应的失败换 broker），
+/// 第二轮落在慢应答的 `broker-1` 上，好留出观察窗口。
 #[tokio::test]
 async fn retry_chain_holds_one_pair_not_one_per_attempt() {
-    let cluster = MockCluster::start(1, true).await;
-    cluster.script(0, vec![], (response_code::SYSTEM_BUSY, 200));
+    let cluster = MockCluster::start(2, true).await;
+    cluster.script(
+        0,
+        vec![(CLOSE_WITHOUT_ANSWER, 0)],
+        (response_code::SUCCESS, 0),
+    );
+    cluster.script(1, vec![], (response_code::SUCCESS, 400));
     let producer = backpressure_producer("bp_retry_pair", &cluster, MIN_ASYNC_SEND_NUM).await;
 
     let cb = Arc::new(Recorder::default());
@@ -1071,18 +1338,16 @@ async fn retry_chain_holds_one_pair_not_one_per_attempt() {
         .send_async(body_of(300), cb.clone(), Some(9_000), None)
         .expect("运行时内可派发");
     // 第二轮尝试已经在路上，扣掉的仍然只是一笔的量
-    assert!(wait_until(|| cluster.requests(0) >= 2).await);
+    assert!(wait_until(|| cluster.requests(1) >= 1).await);
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 9);
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
         MIN_ASYNC_SEND_SIZE - 300
     );
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert_eq!(
-        cluster.requests(0),
-        3,
-        "retry_times_when_send_failed=2 ⇒ 一共 3 笔尝试"
-    );
+    assert_eq!(cluster.requests(0), 1, "第一笔落在换掉的那台");
+    assert_eq!(cluster.requests(1), 1);
+    assert!(cb.errors().is_empty(), "换 broker 之后应当发成功: {:?}", cb.errors());
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
@@ -1199,27 +1464,369 @@ fn empty_body_still_costs_one_size_permit() {
     assert_eq!(back_pressure_msg_len(&no_body), 1);
 }
 
-/// Python `_run` / Java `:555` —— 排队吃掉整个预算就直接报错，不发请求。
+/// Python `_run` / Java `:555` —— 排队吃掉整个预算就直接回调，不发请求。
 ///
-/// 本实现的「排队」= `tokio::spawn` 到任务真正被调度之间的间隔，所以这里直接把
-/// `began` 摆在过去，模拟那段等待（真集群造不出稳定时长）。
+/// 「排队」在这里是任务从入队到被池内消费者跑起来之间的间隔，真集群造不出稳定时长，
+/// 所以直接把 `began` 摆在过去，等价于那段等待已经花光了预算。
 #[tokio::test]
 async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = started("bp_stale_budget", &cluster).await;
 
-    let mut msg = body_of(1);
+    let cb = Arc::new(Recorder::default());
     let stale = monotonic_millis() - 5_000.0;
-    let err = producer
-        .execute_async_send(&mut msg, 1, 3_000, stale, None)
-        .await
-        .expect_err("预算已被排队花光");
+    producer
+        .run_async_send(body_of(1), 1, cb.clone(), 3_000, stale, None)
+        .await;
+    assert_eq!(cb.done.load(Ordering::SeqCst), 1);
+    let errors = cb.errors();
+    assert_eq!(errors.len(), 1);
     assert!(
-        err.to_string()
-            .contains("DEFAULT ASYNC send call timeout"),
-        "{err}"
+        errors[0].contains("DEFAULT ASYNC send call timeout"),
+        "文案要与 Java 逐字一致: {}",
+        errors[0]
     );
     assert_eq!(cluster.requests(0), 0, "预算没了就不该再发请求");
     producer.shutdown();
 }
+
+// ================================================================ 异步发送内核
+//
+// 队列有界、地址解析、复用请求换 opaque、`retryTimesWhenSendAsyncFailed`、异步不看
+// `retryResponseCodes` —— 这些只有真异步内核才谈得上，全部在假集群上对拍。
+
+/// Java `:674-681`（Python `submit` 抛 `RejectedExecutionException`）—— 队列满了
+/// 就地报错给**调用方**，不排队、不走回调。
+///
+/// 这里能确定性地造出队满：`#[tokio::test]` 用的是**单线程**运行时，两次 `send_async`
+/// 之间没有 `await`，池内消费者没机会被调度，所以容量 1 的队列在第二笔时必然是满的。
+/// 容量是**建池时**（`start()`）读的，所以要配在 `ProducerConfig` 里。
+#[tokio::test]
+async fn queue_full_rejects_the_caller_without_sending() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = DefaultMQProducer::with_config(ProducerConfig {
+        producer_group: "GID_send_retry".to_string(),
+        instance_name: "async_queue_full".to_string(),
+        name_server_addrs: vec![cluster.namesrv_addr.clone()],
+        async_sender_queue_capacity: 1,
+        ..Default::default()
+    })
+    .expect("配置合法");
+    producer.start().await.expect("假集群里 start 应当成功");
+    assert_eq!(producer.get_async_sender_queue_capacity(), 1);
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect("第一笔总能进队列");
+    let err = producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect_err("队列满了要把这一笔退回调用方");
+    assert!(
+        err.to_string().contains("executor rejected"),
+        "文案要对齐 Python（Java 的字面量末尾多一个空格）: {err}"
+    );
+    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "被拒的一笔不该有回调");
+    assert_eq!(cluster.requests(0), 0, "被拒之前一次请求都不该发出去");
+
+    // 放行之后第一笔照常发出去、回调照样跑
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    producer.shutdown();
+}
+
+/// 队列满 + **开了背压**：Java `:675-681` 就地跑完（许可已扣），本端口扣许可发生在出队
+/// 之后，所以改成派发到队列之外 —— 两笔都要发出去，且各只扣一份许可。
+#[tokio::test]
+async fn queue_full_with_backpressure_dispatches_off_the_queue() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = DefaultMQProducer::with_config(ProducerConfig {
+        producer_group: "GID_send_retry".to_string(),
+        instance_name: "async_queue_full_bp".to_string(),
+        name_server_addrs: vec![cluster.namesrv_addr.clone()],
+        async_sender_queue_capacity: 1,
+        enable_backpressure_for_async_mode: true,
+        back_pressure_for_async_send_num: MIN_ASYNC_SEND_NUM,
+        back_pressure_for_async_send_size: MIN_ASYNC_SEND_SIZE,
+        ..Default::default()
+    })
+    .expect("配置合法");
+    producer.start().await.expect("假集群里 start 应当成功");
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect("第一笔进队列");
+    producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect("开了背压时队满也不该把这一笔退回调用方");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 2).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 2, "两笔都要发出去");
+    assert_eq!(cluster.requests(0), 2);
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        MIN_ASYNC_SEND_NUM,
+        "归还必须恰好等于扣掉的"
+    );
+    producer.shutdown();
+}
+
+/// 池已随 `shutdown()` 关掉 ⇒ 同步报错给调用方（Python 同），而不是把任务投进一个
+/// 不会再有人消费的队列。回调一次都不跑。
+#[tokio::test]
+async fn send_async_after_shutdown_is_rejected() {
+    let cluster = MockCluster::start(1, true).await;
+    let producer = started("async_after_shutdown", &cluster).await;
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect("启动后接受异步发送");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    producer.shutdown();
+    let err = producer
+        .send_async(body_of(10), cb.clone(), Some(1_000), None)
+        .expect_err("关闭后不该接受异步发送");
+    assert!(err.to_string().contains("producer not started"), "{err}");
+    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "被拒的一笔不该有回调");
+}
+
+/// Java `:1043-1046`（Python `_send_kernel_async`）—— 准备工作（这里用拦截钩子的耗时
+/// 代表）把预算花光时，**不建请求**，但仍然跑一次 after 钩子并归还许可。
+#[tokio::test]
+async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = backpressure_producer("async_kernel_timeout", &cluster, MIN_ASYNC_SEND_NUM)
+        .await;
+    producer.register_check_forbidden_hook(Arc::new(SleepingForbiddenHook {
+        millis: 200,
+    }));
+    let hooks = Arc::new(CountingSendHook::default());
+    producer.register_send_message_hook(hooks.clone());
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(300), cb.clone(), Some(50), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    let errors = cb.errors();
+    assert!(
+        errors[0].contains("sendKernelImpl call timeout"),
+        "文案要与 Java 逐字一致: {}",
+        errors[0]
+    );
+    assert_eq!(cluster.requests(0), 0, "预算没了就不该把请求交出去");
+    assert_eq!(hooks.before(), 1, "before 钩子在预算检查之前");
+    assert_eq!(hooks.after(), 1, "after 钩子要在终止前跑一次");
+    assert_eq!(producer.semaphore_async_send_num_available_permits(), MIN_ASYNC_SEND_NUM);
+    assert_eq!(
+        producer.semaphore_async_send_size_available_permits(),
+        MIN_ASYNC_SEND_SIZE
+    );
+    producer.shutdown();
+}
+
+/// Java `onExceptionImpl` —— 连不上（`RemotingConnectException`）算「没收到响应」，
+/// 要换一台 broker 重试；重试复用**同一个请求**但换新 `opaque`。
+#[tokio::test]
+async fn connect_failure_retries_on_another_broker_with_a_fresh_opaque() {
+    let live = MockCluster::start(1, true).await;
+    live.script(0, vec![], (response_code::SUCCESS, 0));
+    let dead = dead_addr().await;
+    // 路由里 broker-0 是死地址、broker-1 是真应答的 broker（选队从 0 起，重试避开 0）
+    let cluster = MockCluster::with_addrs(vec![dead, live.broker_addrs[0].clone()], true).await;
+    let producer = started("async_retry_broker", &cluster).await;
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(5_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert!(cb.errors().is_empty(), "换 broker 之后应当发成功: {:?}", cb.errors());
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    assert_eq!(live.requests(0), 1, "重试落在另一台 broker 上");
+    producer.shutdown();
+}
+
+/// 同上，但第二台 broker 也是坏的：重试上限是 `retryTimesWhenSendAsyncFailed`，
+/// 一共 3 笔尝试，最后把**包装过**的失败交给回调（Java `"unknown reason"` 分支）。
+#[tokio::test]
+async fn async_retry_honours_retry_times_when_send_async_failed() {
+    let cluster = MockCluster::start(2, true).await;
+    for index in 0..2 {
+        cluster.script(index, vec![], (CLOSE_WITHOUT_ANSWER, 0));
+    }
+    let producer = started("async_retry_limit", &cluster).await;
+    assert_eq!(producer.get_retry_times_when_send_async_failed(), 2);
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(5_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(
+        cluster.requests(0) + cluster.requests(1),
+        3,
+        "retry_times_when_send_async_failed=2 ⇒ 一共 3 笔尝试"
+    );
+    let errors = cb.errors();
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0].contains("send request failed"),
+        "Java 的 RemotingSendRequestException 分支: {}",
+        errors[0]
+    );
+    producer.shutdown();
+}
+
+/// 配成 0 就一笔都不重试（Java 的 `times <= timesTotal` 判据）。
+#[tokio::test]
+async fn retry_times_when_send_async_failed_zero_means_one_attempt() {
+    let cluster = MockCluster::start(2, true).await;
+    for index in 0..2 {
+        cluster.script(index, vec![], (CLOSE_WITHOUT_ANSWER, 0));
+    }
+    let producer = started("async_no_retry", &cluster).await;
+    producer.set_retry_times_when_send_async_failed(0);
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(5_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cluster.requests(0), 1);
+    assert_eq!(cluster.requests(1), 0, "配 0 就不该换 broker");
+    producer.shutdown();
+}
+
+/// **异步发送不看 `retryResponseCodes`**：broker 明确回了错（这里回 `SYSTEM_ERROR`）
+/// 就原样交给回调，一次尝试就结束。这与同步发送的语义**不同**，别照搬。
+#[tokio::test]
+async fn broker_rejected_response_ends_the_chain_after_one_attempt() {
+    let cluster = MockCluster::start(2, true).await;
+    cluster.script(0, vec![], (response_code::SYSTEM_ERROR, 0));
+    cluster.script(1, vec![], (response_code::SUCCESS, 0));
+    let producer = started("async_broker_code", &cluster).await;
+    assert!(
+        producer.is_retry_response_code(Some(response_code::SYSTEM_ERROR)),
+        "这个码在同步路径里是可重试的"
+    );
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(5_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cluster.requests(0), 1);
+    assert_eq!(cluster.requests(1), 0, "异步链不换 broker（Java needRetry=false）");
+    let errors = cb.errors();
+    assert!(
+        errors[0].contains("MQBrokerException"),
+        "broker 的错误码要**原样**交付，不包装成 unknown reason: {}",
+        errors[0]
+    );
+    producer.shutdown();
+}
+
+/// 一笔异步发送只跑**一次** before/after 钩子（Java 的 `sendKernelImpl` 末尾对 ASYNC
+/// 还会再跑一次 after，本端口跟 Python：只在链的终点跑一次）。
+#[tokio::test]
+async fn send_hooks_run_once_per_async_send() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("async_hooks_ok", &cluster).await;
+    let hooks = Arc::new(CountingSendHook::default());
+    producer.register_send_message_hook(hooks.clone());
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    assert_eq!(hooks.before(), 1);
+    assert_eq!(hooks.after(), 1);
+    producer.shutdown();
+}
+
+/// after 钩子要看到 `sendResult`（成功）或 `exception`（失败），与同步内核一致。
+#[tokio::test]
+async fn after_hook_sees_the_async_outcome() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(
+        0,
+        vec![(response_code::SYSTEM_ERROR, 0), (response_code::SUCCESS, 0)],
+        (response_code::SUCCESS, 0),
+    );
+    let producer = started("async_hook_ctx", &cluster).await;
+    let hooks = Arc::new(CountingSendHook::default());
+    producer.register_send_message_hook(hooks.clone());
+
+    let cb = Arc::new(Recorder::default());
+    // 第一笔失败（broker 明确回了错）、第二笔成功：两条终点都要带上各自的结果
+    for i in 1..=2 {
+        producer
+            .send_async(body_of(10), cb.clone(), Some(3_000), None)
+            .expect("运行时内可派发");
+        assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == i).await);
+    }
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+    assert_eq!(cb.errors().len(), 1);
+    assert!(hooks.saw_result(), "成功分支要带 sendResult");
+    assert!(hooks.saw_exception(), "失败分支要带 exception");
+    assert_eq!(hooks.before(), 2);
+    assert_eq!(hooks.after(), 2, "每笔发送在终点各跑一次 after");
+    producer.shutdown();
+}
+
+/// 定点发送（调用方给了 `mq`）不换 broker：Java 传下去的 topicPublishInfo 是 null，
+/// 重试只能在**同一台**上换 opaque —— 那里连接是好的，所以三次尝试都打到同一台 broker。
+#[tokio::test]
+async fn pinned_mq_retries_on_the_same_broker_with_new_opaques() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(
+        0,
+        vec![(CLOSE_WITHOUT_ANSWER, 0), (CLOSE_WITHOUT_ANSWER, 0)],
+        (response_code::SUCCESS, 0),
+    );
+    let producer = started("async_pinned", &cluster).await;
+    let mq = MessageQueue::new("T1", "broker-0", 0);
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(5_000), Some(mq))
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert!(cb.errors().is_empty(), "第三次尝试应当成功: {:?}", cb.errors());
+    assert_eq!(cluster.requests(0), 3, "三次尝试都在定点的那台");
+    assert_ne!(
+        cluster.send_opaque(0, 0),
+        cluster.send_opaque(0, 1),
+        "重试必须换新 opaque，否则两次尝试的应答会串台"
+    );
+    assert_ne!(
+        cluster.send_opaque(0, 1),
+        cluster.send_opaque(0, 2),
+        "重试必须换新 opaque，否则两次尝试的应答会串台"
+    );
+    producer.shutdown();
+}
+
+/// 未 start 的异步发送**同步抛**（Java 走回调，Python 与这里一致），回调一次都不跑。
+#[test]
+fn send_async_before_start_raises_without_calling_back() {
+    let producer = DefaultMQProducer::new("GID_async_unstarted").expect("组名合法");
+    let cb = Arc::new(Recorder::default());
+    let err = producer
+        .send_async(body_of(10), cb.clone(), Some(1_000), None)
+        .expect_err("未启动就该同步报错");
+    assert!(
+        err.to_string().contains("producer not started"),
+        "文案要对齐 Python `_require_client`: {err}"
+    );
+    assert_eq!(cb.done.load(Ordering::SeqCst), 0);
+}
+

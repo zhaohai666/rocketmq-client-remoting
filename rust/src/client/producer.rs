@@ -15,10 +15,12 @@
 //!    于是 setter 与 Python 一样是「随时可调、启动后部分拒绝」。
 //! 2. **回调/监听器是 trait 对象**（Python 是鸭子类型）：[`SendCallback`]、
 //!    [`MessageQueueSelector`]、[`TransactionListener`]。
-//! 3. **`send_async` 用 `tokio::spawn`**（Python 起线程；Java 用 Netty 异步 +
-//!    线程池回调）。派发用的运行时句柄在 [`DefaultMQProducer::start`] 时惰性绑定并
-//!    缓存（构造允许发生在运行时之外），所以 `send_async` 与心跳一样不要求调用点
-//!    处于运行时上下文。
+//! 3. **`send_async` 用 tokio 任务**（Python 起线程；Java 用 Netty 异步 + 线程池回调）：
+//!    派发用的运行时句柄在 [`DefaultMQProducer::start`] 时惰性绑定并缓存（构造允许发生
+//!    在运行时之外），于是 `send_async` 与心跳一样不要求调用点处于运行时上下文。
+//!    有界的 `AsyncSenderExecutor` 本身照 Java 形状移植（一条容量
+//!    `async_sender_queue_capacity` 的队列 + `available_parallelism()` 份并发额度，见
+//!    [`AsyncSenderExecutor`]），Java 的「线程」在这里是任务：没有名字，也不与核绑定。
 //! 4. **轨迹分发器由调用方注入**（[`DefaultMQProducer::set_trace_dispatcher`]）：
 //!    Python 在 `start()` 里 `new AsyncTraceDispatcher(...)`；本 crate 的统一约定是
 //!    依赖注入（见 `mq_client.rs` 模块头差异 2），构造 `AsyncTraceDispatcher` 需要
@@ -27,11 +29,13 @@
 //! 5. `time.time()*1000` → [`current_time_millis`]；`threading.Lock` → `Mutex`。
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::client::backpressure::{
@@ -84,7 +88,7 @@ use crate::remoting::protocol::headers::{
 };
 use crate::remoting::protocol::heartbeat::{HeartbeatData, ProducerData};
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
-use crate::remoting::protocol::remoting_command::RemotingCommand;
+use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
 use crate::client::trace_context::{inject_trace_context, trace_context_enabled_from_env};
 use crate::{bail, rmq_debug, rmq_warn};
@@ -101,6 +105,10 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: i32 = 1024 * 1024 * 4;
 pub const DEFAULT_COMPRESS_MSG_BODY_OVER_HOWMUCH: i32 = 1024 * 4;
 /// Java `MessageSysFlag.COMPRESSION_LEVEL` 默认 zlib level 5。
 pub const DEFAULT_COMPRESS_LEVEL: i32 = 5;
+/// Java `DefaultMQProducerImpl:133` 的 `new LinkedBlockingQueue<>(50000)`：
+/// 异步发送队列的默认容量（Python `async_sender_queue_capacity`、C++
+/// `asyncSenderQueueCapacity` 同值）。
+pub const DEFAULT_ASYNC_SENDER_QUEUE_CAPACITY: i32 = 50_000;
 
 /// Java `DefaultMQProducer#retryResponseCodes` 的默认集合（Python 构造函数同款）。
 ///
@@ -393,8 +401,16 @@ pub struct ProducerConfig {
     pub compress_type: i32,
     /// Python `retry_times_when_send_failed`。
     pub retry_times_when_send_failed: i32,
-    /// Python `retry_times_when_send_async_failed`（Java 有、Python 未读取，这里同样只存）。
+    /// Python `retry_times_when_send_async_failed`（Java `DefaultMQProducer:140`，默认 2）：
+    /// 异步发送在**请求已发出之后**的换 broker 重试次数上限，对应 Java
+    /// `MQClientAPIImpl#sendMessageAsync` 的 `timesTotal`。与同步发送的
+    /// `retry_times_when_send_failed` 是**两个**独立预算，且判据不同（异步不看
+    /// `retryResponseCodes`，见 [`classify_async_failure`]）。
     pub retry_times_when_send_async_failed: i32,
+    /// Python `async_sender_queue_capacity`（Java `DefaultMQProducerImpl:133` 写死的
+    /// `new LinkedBlockingQueue<>(50000)`）：`AsyncSenderExecutor` 的有界队列容量，
+    /// 只在 [`DefaultMQProducer::start`] 时读一次。
+    pub async_sender_queue_capacity: i32,
     /// Python `retry_another_broker_when_not_store_ok`（Java
     /// `retryAnotherBrokerWhenNotStoreOK`，默认 false）。
     pub retry_another_broker_when_not_store_ok: bool,
@@ -453,7 +469,10 @@ impl Default for ProducerConfig {
             compress_level: DEFAULT_COMPRESS_LEVEL,
             compress_type: MessageSysFlag::ZLIB_TYPE,
             retry_times_when_send_failed: 2,
+            // Java `DefaultMQProducer:140`
             retry_times_when_send_async_failed: 2,
+            // Java `DefaultMQProducerImpl:133` 写死的 `LinkedBlockingQueue<>(50000)`
+            async_sender_queue_capacity: DEFAULT_ASYNC_SENDER_QUEUE_CAPACITY,
             retry_another_broker_when_not_store_ok: false,
             send_msg_max_timeout_per_request: -1,
             retry_response_codes: DEFAULT_RETRY_RESPONSE_CODES
@@ -521,6 +540,10 @@ struct Inner {
     /// Python `_semaphore_async_send_size`（Java `DefaultMQProducerImpl:148-153`）：
     /// 异步发送在途**字节数**的公平信号量。
     semaphore_async_send_size: FairSemaphore,
+    /// Java `DefaultMQProducerImpl:133-140` 的 `defaultAsyncSenderExecutor`
+    /// （Python `_async_sender_executor`）：有界队列 + 固定并发额度 + 一个派发任务。
+    /// `start()` 建、`shutdown()` 关；`None` = 没启动过或已关闭。
+    async_sender: Mutex<Option<AsyncSenderExecutor>>,
 }
 
 impl Inner {
@@ -558,6 +581,104 @@ impl Inner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+/// 有界异步发送队列 + 固定并发额度（Java `DefaultMQProducerImpl:133-140` 的
+/// `LinkedBlockingQueue(50000)` + `ThreadPoolExecutor(cores, cores, …, "AsyncSenderExecutor_")`，
+/// Python `_create_async_executors:1043-1066`）。
+///
+/// 形状逐条对上：
+///   * `try_send` 失败 ≡ Java `ThreadPoolExecutor.submit` 里 `workQueue.offer` 失败后抛的
+///     `RejectedExecutionException`（→ [`send_async`](DefaultMQProducer::send_async) 的分支）；
+///   * [`close`](Self::close)（丢掉发送端）≡ `defaultAsyncSenderExecutor.shutdown()`
+///     —— **已入队的任务照样跑完**，只是不再收新的，所以 `shutdown()` 不会把在途的异步
+///     发送掐断（Java 同）；
+///   * 并发额度 = [`async_sender_worker_count`]（Java `availableProcessors()`）：拿不到
+///     额度时任务留在队列里等，正如 Java 里线程全忙时任务留在 `workQueue`。
+///
+/// 池子限流的是「准备段」（闸 → 路由 → 钩子 → 建请求 → 交给传输层）；请求一旦交给
+/// 传输层，任务就结束了，网络等待不占池 —— 这点必须对上，否则池大小会变成「在途异步
+/// 发送数」的上限，而 Java 里那个上限是背压闸（或没有上限）。
+///
+/// ⚠ **为什么是「一个派发任务 + 额度 + 每笔单独 spawn」，而不是「`cores` 个消费者共用
+/// 一把 `Mutex<Receiver>`」**（本端口第一版就是后者，真机上被证明不能用）：Java 的池线程
+/// 里跑同步钩子是**正常**的，tokio 里却是致命的 —— 消费者把任务取走后 `await` 它，钩子里
+/// 一句 `Thread.sleep` 就把这条 tokio 工作线程按住在同步调用里；而 `tokio::sync::Mutex`
+/// 是**交接**式公平锁，它把「下一个等待者」叫醒后把接力棒放进**当前这条工作线程的本地
+/// 队列**，本地队列不会被人偷走 —— 于是取任务的接力链断在这个睡着的工人上。真机实测
+/// （`examples/live_backpressure.rs` B3，钩子睡 2.5s）：队列里躺着 10 笔待派发，池子却
+/// **每 2505ms 才派发一笔**，后面的笔只能看着自己的预算被排队吃光。拆成单一派发任务
+/// （它自己永远不阻塞）+ 信号量限并发 + 每笔 `spawn`，接力的就只是「额度归还」这一件事，
+/// 而归还发生在链路终点、不占任何睡着的线程。
+///
+/// ⚠ 两处无法照搬：Java 的池线程有名字（`AsyncSenderExecutor_N`）、且与核数一一绑定；
+/// Rust 这边是 tokio 任务，既没有名字，实际并发也受宿主运行时的工作线程数制约。
+struct AsyncSenderExecutor {
+    tx: mpsc::Sender<AsyncSendJob>,
+    /// 唯一消费者（Java 池的「取任务」那一步）。它自己不跑任务，所以永远不会阻塞。
+    dispatcher: JoinHandle<()>,
+}
+
+/// 投进队列的一个异步发送任务（已经在调用方线程上把消息、预算与起点定好）。
+type AsyncSendJob = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Java `Runtime.getRuntime().availableProcessors()`。取不到时按 1 个额度兜底。
+fn async_sender_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+impl AsyncSenderExecutor {
+    fn new(handle: &tokio::runtime::Handle, capacity: i32, workers: usize) -> AsyncSenderExecutor {
+        // tokio 的有界通道不接受 0 容量（Java 的 `LinkedBlockingQueue(0)` 同样会抛
+        // IllegalArgumentException，只是这里不能 panic）：配成 0 时按 1，
+        // 语义仍是「几乎不留排队空间」。
+        let (tx, mut rx) = mpsc::channel(usize::try_from(capacity.max(1)).unwrap_or(usize::MAX));
+        let permits = Arc::new(Semaphore::new(workers.max(1)));
+        let spawn_handle = handle.clone();
+        let dispatcher = handle.spawn(async move {
+            let permits = permits;
+            loop {
+                // 发送端全部释放 = `close`：把已经排队的任务派发完再退
+                let Some(job) = rx.recv().await else { return };
+                // 额度不够就留在队列里等（等的时候让出线程，不占任何人）。
+                // `acquire_owned` 而不是 `acquire`：额度要跟着任务进 `'static` 的任务里，
+                // 借用式的那份（`SemaphorePermit<'_>`）不能 move，只能 `forget` 掉，
+                // 而 `forget` 是「永不归还」—— 那样发满 `cores` 笔就把池子锁死了。
+                // 拿不到额度只可能是有人 `close()` 了这个信号量（本端口不会）：那时
+                // 宁可照样派发、不占额度，也不要把用户交进来的发送悄悄吞掉。
+                let permit = Arc::clone(&permits).acquire_owned().await.ok();
+                spawn_handle.spawn(async move {
+                    let _permit = permit; // 任务结束（含阻塞钩子跑完）才归还
+                    job.await;
+                });
+            }
+        });
+        AsyncSenderExecutor { tx, dispatcher }
+    }
+
+    /// ≡ Java `executor.submit(runnable)`：队列满了**立即**失败，不排队等空位。
+    /// 失败时把任务原样交还，让调用方能走 Java `:675-681` 的「就地跑完」分支。
+    ///
+    /// （返回类型写全 `std::result::Result`：本模块的 `Result<T>` 别名只带一个参数，
+    /// 错误类型固定为 [`Error`]，而这里要交还的是任务本身。）
+    fn try_submit(&self, job: AsyncSendJob) -> std::result::Result<(), AsyncSendJob> {
+        match self.tx.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(job)) => Err(job),
+            Err(mpsc::error::TrySendError::Closed(job)) => Err(job),
+        }
+    }
+
+    /// ≡ `defaultAsyncSenderExecutor.shutdown()`：不再收新任务，在途与已排队的照常跑完。
+    fn close(self) {
+        let AsyncSenderExecutor { tx, dispatcher } = self;
+        drop(tx);
+        // 只丢句柄、绝不 abort：丢掉 `JoinHandle` 在 tokio 里就是 detach，任务继续跑完。
+        // 对应 Java 的 `shutdown()` 既不停已入队任务、也不等待它终止。
+        drop(dispatcher);
     }
 }
 
@@ -673,6 +794,9 @@ impl DefaultMQProducer {
             rpc_hook: RwLock::new(None),
             semaphore_async_send_num,
             semaphore_async_send_size,
+            // Java 的池子在 impl 构造时就建好；本端口没有运行时句柄可用（构造允许发生
+            // 在运行时之外），所以推迟到 `start()` 建、`shutdown()` 关。
+            async_sender: Mutex::new(None),
         });
         Ok(DefaultMQProducer { inner })
     }
@@ -799,6 +923,29 @@ impl DefaultMQProducer {
     /// Python `set_retry_times_when_send_failed`。
     pub fn set_retry_times_when_send_failed(&self, n: i32) {
         self.write_cfg(|c| c.retry_times_when_send_failed = n);
+    }
+
+    /// Java `DefaultMQProducer#setRetryTimesWhenSendAsyncFailed`（Python 是同名属性）。
+    /// 只管**异步**发送的换 broker 重试次数，与同步的
+    /// [`set_retry_times_when_send_failed`](Self::set_retry_times_when_send_failed) 互不影响。
+    pub fn set_retry_times_when_send_async_failed(&self, n: i32) {
+        self.write_cfg(|c| c.retry_times_when_send_async_failed = n);
+    }
+
+    /// Java `DefaultMQProducer#getRetryTimesWhenSendAsyncFailed`。
+    pub fn get_retry_times_when_send_async_failed(&self) -> i32 {
+        self.read_cfg(|c| c.retry_times_when_send_async_failed)
+    }
+
+    /// C++ `setAsyncSenderQueueCapacity`（Python 直接改 `async_sender_queue_capacity` 属性）：
+    /// 异步发送队列容量，**只在 `start()` 建池时生效**。
+    pub fn set_async_sender_queue_capacity(&self, capacity: i32) {
+        self.write_cfg(|c| c.async_sender_queue_capacity = capacity);
+    }
+
+    /// C++ `getAsyncSenderQueueCapacity`。
+    pub fn get_async_sender_queue_capacity(&self) -> i32 {
+        self.read_cfg(|c| c.async_sender_queue_capacity)
     }
 
     /// Python `set_retry_another_broker_when_not_store_ok`（Java
@@ -1216,6 +1363,19 @@ impl DefaultMQProducer {
             }),
         );
 
+        // 异步发送池（Java `DefaultMQProducerImpl:133-140`、Python `_create_async_executors`）：
+        // 容量在**建池时**读一次（Python 也是在 start 里把 `async_sender_queue_capacity`
+        // 传给 ConsumeExecutor），之后改配置不动已建好的池。
+        if let Some(handle) = self.runtime_handle() {
+            let capacity = cfg.async_sender_queue_capacity;
+            let executor = AsyncSenderExecutor::new(&handle, capacity, async_sender_worker_count());
+            *self
+                .inner
+                .async_sender
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(executor);
+        }
+
         // 心跳任务：周期性向 broker 注册 ProducerData。
         // broker 的事务回查正是通过这一步登记的 channel 反向联系生产者的；
         // 生产者不发心跳时 COMMIT/ROLLBACK 仍能成功（客户端主动 END_TRANSACTION），
@@ -1292,6 +1452,19 @@ impl DefaultMQProducer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        // Java `DefaultMQProducerImpl#shutdown`:312-316 的顺序：`unregisterProducer` →
+        // `defaultAsyncSenderExecutor.shutdown()` → `mQClientFactory.shutdown()`。
+        // 关池走 `close()`（等价于 `ThreadPoolExecutor.shutdown()`：**已排队的异步发送照样
+        // 跑完**，只是不再收新的），所以这里不能把它们塞进 `tasks` 里 abort 掉。
+        let executor = self
+            .inner
+            .async_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(executor) = executor {
+            executor.close();
+        }
         if let Some(client) = client {
             // Java `DefaultMQProducerImpl#shutdown`:313-317：先 `unregisterProducer`
             // 再 `mQClientFactory.shutdown()`。守卫读的就是这张表，不先摘掉自己，
@@ -1493,17 +1666,20 @@ fn back_pressure_msg_len(msg: &Message) -> i64 {
 /// 只归还**本次真正拿到**的那几份：字节闸超时而条数闸已到手时，必须把条数还回去，
 /// 否则过一次背压就把容量永久吃掉一格。
 ///
-/// 归还写在 `Drop` 而不是调用方手里：这条链上有闸门拒绝、预算复检、发送失败三种出口
-/// （将来接真异步内核还会多一个 `?`），少写一处归还就是永久漏容量，而漏掉的容量在
-/// 单测里看不出来、只会在长跑里表现为「发几笔之后所有异步发送集体超时」。
-struct SendPermits<'a> {
-    inner: &'a Inner,
+/// 归还写在 `Drop` 而不是调用方手里：这条链上有闸门拒绝、预算复检、准备段失败、网络
+/// 失败四种出口，少写一处归还就是永久漏容量，而漏掉的容量在单测里看不出来、只会在
+/// 长跑里表现为「发几笔之后所有异步发送集体超时」。
+///
+/// 持 `Arc<Inner>` 而不是 `&Inner`：许可要跟着重试链活到**网络完成**之后（Java 的
+/// `BackpressureSendCallBack` 同样活到回调终点），借用活不了那么久。
+struct SendPermits {
+    inner: Arc<Inner>,
     num_acquired: bool,
     size_acquired: bool,
     msg_len: i64,
 }
 
-impl Drop for SendPermits<'_> {
+impl Drop for SendPermits {
     /// Java `semaphoreProcessor:599-610`：**先还字节、再还条数**。
     fn drop(&mut self) {
         if self.size_acquired {
@@ -2188,27 +2364,49 @@ impl DefaultMQProducer {
 
     /// Python `send_async`（对应 Java `send(msg, callBack, timeout)`）。
     ///
-    /// 差异 3：Python 起线程、Java 用 Netty 异步 + 线程池回调；这里 `tokio::spawn`
-    /// 一个任务，用 `start()` 时绑定的运行时句柄派发。没有句柄就一定没启动过
-    /// （`start()` 本身是 async），所以这里直接报错，而不是临时建一个运行时 ——
-    /// 那会让传输层缓存到一个随调用结束就销毁的 Handle。
+    /// **调用方立即返回**，整条链在后台跑，四段与 Java 逐段对齐：
+    ///
+    /// 1. 任务投进 [`AsyncSenderExecutor`]（并发额度 = `available_parallelism()`、队列有界
+    ///    `async_sender_queue_capacity`，默认 50000，同 Java 的
+    ///    `LinkedBlockingQueue(50000)`）。队列满了 ≡ Java `submit` 抛
+    ///    `RejectedExecutionException` → [`Error::Client`] `executor rejected`，
+    ///    **抛给调用方**而不是走回调；只有开了背压时才改派到队列之外（见下）。
+    /// 2. 出队之后才算真实耗时：预算被排队吃掉就直接回调
+    ///    [`Error::TooMuchRequest`] `DEFAULT ASYNC send call timeout`，不再发请求。
+    /// 3. `sendKernelImpl` 的 ASYNC 分支：地址解析 → 拦截钩子 → 建请求 → `invokeAsync`
+    ///    （[`async_send_inner`](Self::async_send_inner) /
+    ///    [`send_kernel_async`](Self::send_kernel_async)）。
+    /// 4. 失败进 [`AsyncSendChain::on_exception`]（Java `onExceptionImpl`）：换一台 broker 的
+    ///    队列、给**同一个请求**换新 opaque 再试，上限
+    ///    [`retry_times_when_send_async_failed`](Self::get_retry_times_when_send_async_failed)；
+    ///    超时预算是所有尝试**共享**的剩余时间，不是每次尝试各给一份。
+    ///
+    /// 差异 3：Python 起线程、Java 用 Netty 异步 + 线程池回调；这里是 tokio 任务，派发用的
+    /// 运行时句柄在 [`start`](Self::start) 时绑定。没有句柄就一定没启动过（`start()` 本身是
+    /// async），所以直接报错而不是临时建一个运行时 —— 那会让传输层缓存到一个随调用结束就
+    /// 销毁的 Handle。Java 的 `AsyncSenderExecutor_N` 线程名与「回调跑在
+    /// `NettyClientPublicExecutor` 上」都没有对应物：回调就在传输层任务的上下文里跑。
     ///
     /// 开了 `enable_backpressure_for_async_mode` 之后，发送前要先过两个维度的公平
     /// 信号量闸（Java `executeAsyncMessageSend:635-682`），拿不到就直接回调
     /// [`Error::TooMuchRequest`]，一次请求都不会发出去。
     ///
-    /// ⚠ **与 Java/Python 的一处结构性差别：这道闸在 spawned 任务里等，不在调用方
-    /// 线程上等。** Java/Python/C++/.NET 都在调用方线程上阻塞式 `tryAcquire`，所以
-    /// 「异步」在背压打满时会退化成「等满 timeout 再报错」。Rust 不能照做：生产者常常
-    /// 跑在唯一的 tokio 工作线程上（`#[tokio::test]` 的单线程运行时、
-    /// `RuntimeFlavor::CurrentThread`），把那个线程 park 住就意味着**正要归还许可**的
-    /// 完成回调永远排不上队 —— 不是慢，是死锁。代价：调用方不再被闸门堵住，所以
-    /// Java 那句「队满时有背压就地跑完」（`:675-681`）在这里没有对应分支（本实现没有
-    /// 有界发送队列，见 #50）。预算仍从调用时刻算起（`began` 在 spawn 之前取），超时
-    /// 语义（多久之内过不了闸就报错）与 Java 一致。
+    /// ⚠ **与 Java/Python 的一处结构性差别：这道闸在池子里等，不在调用方线程上等。**
+    /// Java/Python/C++/.NET 都在调用方线程上阻塞式 `tryAcquire`，所以「异步」在背压打满时
+    /// 会退化成「等满 timeout 再报错」。Rust 不能照做：生产者常常跑在唯一的 tokio 工作线程
+    /// 上（`#[tokio::test]` 的单线程运行时、`RuntimeFlavor::CurrentThread`），把那个线程
+    /// park 住就意味着**正要归还许可**的完成回调永远排不上队 —— 不是慢，是死锁。
+    /// 于是 Java 的「闸 → 入队」在这里是「入队 → 出队算预算 → 闸 → 再算预算」，闸等掉的
+    /// 时间会占住一份池内并发额度（Java 占的是池线程，同样是「排队不占在途许可、但占 worker」）。
+    /// 预算仍从调用时刻算起
+    /// （`began` 在入队之前取），超时语义（多久之内过不了闸就报错）与 Java 一致。
     ///
-    /// 差异 5（承 #50）：本实现还没有真正的异步发送内核，闸后的 `send` 走的是同步内核，
-    /// 只是不阻塞调用方而已 —— 对调用方的可观察语义（回调必到、许可必还）不变。
+    /// Java `:675-681` 的「队满但有背压 ⇒ 就地跑完这一笔」在这里变成**派发到队列之外**：
+    /// 那边的许可在入队**之前**就扣掉了，不跑完就要白等超时归还；这边扣许可发生在出队
+    /// 之后，队满时一份许可都没扣，所以既不必阻塞调用方，也不会漏容量。
+    ///
+    /// 与 Java 的另一处有意差别：未 `start()` 时**同步抛**（Java 走回调，那样问题更难查），
+    /// 与 Python 一致。
     pub fn send_async(
         &self,
         msg: Message,
@@ -2216,6 +2414,8 @@ impl DefaultMQProducer {
         timeout_millis: Option<i64>,
         mq: Option<MessageQueue>,
     ) -> Result<()> {
+        // Python `send_async:1098-1102`：未启动 / 池已关都同步抛，不走回调。
+        let _ = self.require_client()?;
         let handle = self.runtime_handle().ok_or_else(|| {
             Error::client("send_async needs a tokio runtime; call start() first")
         })?;
@@ -2225,18 +2425,29 @@ impl DefaultMQProducer {
         let msg_len = back_pressure_msg_len(&msg);
         let began = monotonic_millis();
         let this = self.clone();
-        self.push_task(handle.spawn(async move {
-            let mut msg = msg;
-            let result = this
-                .execute_async_send(&mut msg, msg_len, timeout, began, mq.as_ref())
+        let job: AsyncSendJob = Box::pin(async move {
+            this.run_async_send(msg, msg_len, callback, timeout, began, mq)
                 .await;
-            // Python 的 send_async 就是一个 try/except：失败也走回调，不抛。
-            // 许可已在 `execute_async_send` 返回时归还（先还许可，再交给用户）。
-            match result {
-                Ok(result) => callback.on_success(result),
-                Err(e) => callback.on_exception(e),
+        });
+        let submitted = {
+            let slot = self
+                .inner
+                .async_sender
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match slot.as_ref() {
+                Some(executor) => executor.try_submit(job),
+                None => return Err(Error::client("producer already shutdown")),
             }
-        }));
+        };
+        if let Err(job) = submitted {
+            if !self.is_enable_backpressure_for_async_mode() {
+                return Err(Error::client("executor rejected"));
+            }
+            // Java `:675-681` 的对位分支：队列满时这一笔仍然要跑完，只是这里派发到队列
+            // 之外（不占池、也不阻塞调用方，理由见本方法文档）。
+            handle.spawn(job);
+        }
         Ok(())
     }
 
@@ -2244,30 +2455,273 @@ impl DefaultMQProducer {
     /// `AsyncSenderExecutor` 的那个 runnable（Python 的 `_execute_async_message_send`
     /// 与 `_run`，两步顺序、预算共享）。
     ///
-    /// 返回值的 `Err` 一定是「没发出任何请求」的闸门拒绝或发送失败；两条路都靠
-    /// [`SendPermits`] 的 `Drop` 归还许可，因此这条链上任何提前 `return`（含未来接入
-    /// 真异步内核时的 `?`）都不会漏容量。
-    async fn execute_async_send(
+    /// 不返回 `Result`：这条链上每一种失败都在 [`complete_async`](Self::complete_async)
+    /// 交付，用户回调**恰好一次**。
+    async fn run_async_send(
         &self,
-        msg: &mut Message,
+        mut msg: Message,
         msg_len: i64,
+        callback: Arc<dyn SendCallback>,
         timeout: i64,
         began: f64,
-        mq: Option<&MessageQueue>,
-    ) -> Result<SendResult> {
-        let permits = self
-            .acquire_send_permits(msg_len, timeout, began)
-            .await?;
-        // Python `_run`：出队之后才算真实耗时 —— 预算被排队吃掉就直接报错，不发请求。
+        mq: Option<MessageQueue>,
+    ) {
+        // 没拿到许可时 `acquire_send_permits` 内部已把**已拿到**的那几份归还（Drop）。
+        let permits = match self.acquire_send_permits(msg_len, timeout, began).await {
+            Ok(permits) => permits,
+            Err(e) => {
+                self.complete_async(&callback, Err(e), None, None);
+                return;
+            }
+        };
+        // Python `_run`：出队之后才算真实耗时 —— 预算被排队吃掉就直接回调，不发请求。
         let cost = latency_since(began);
         if timeout <= cost {
-            return Err(Error::TooMuchRequest("DEFAULT ASYNC send call timeout".to_string()));
+            return self.fail_async(
+                &callback,
+                Error::TooMuchRequest("DEFAULT ASYNC send call timeout".to_string()),
+                permits,
+            );
         }
         // 与 Java 一致：闸门等掉的时间**不**从发送预算里扣（Java 的 `beginTimestampFirst`
         // 是出队之后才取的），这里只扣排队那一段。
-        let result = self.send(msg, Some(timeout - cost), mq).await;
+        self.async_send_inner(&mut msg, mq.as_ref(), callback, permits, timeout - cost)
+            .await;
+    }
+
+    /// 一个「不发请求就终止」的出口：归还许可 + 交付错误。
+    fn fail_async(
+        &self,
+        callback: &Arc<dyn SendCallback>,
+        error: Error,
+        permits: SendPermits,
+    ) {
+        self.complete_async(callback, Err(error), None, Some(permits));
+    }
+
+    /// Python `_send_async_inner`（Java `sendDefaultImpl(ASYNC)` → `sendKernelImpl` 之前
+    /// 的准备段）：校验、压缩、选队列。
+    ///
+    /// Java `sendDefaultImpl:756` —— ASYNC 的 `timesTotal` 固定为 1：**外层循环只跑一次**，
+    /// 换 broker 的重试全部发生在 [`AsyncSendChain::on_exception`] 里。
+    ///
+    /// ⚠ 批量消息没有异步内核可用：Python 的 `_send_async_inner` 对批量走的是「在
+    /// `AsyncSenderExecutor` 线程里同步发一批」，这里同构 —— 准备工作在池里，请求交给
+    /// 传输层后池就空出来。
+    async fn async_send_inner(
+        &self,
+        msg: &mut Message,
+        mq: Option<&MessageQueue>,
+        callback: Arc<dyn SendCallback>,
+        permits: SendPermits,
+        timeout: i64,
+    ) {
+        let client = match self.require_client() {
+            Ok(client) => client,
+            Err(e) => return self.fail_async(&callback, e, permits),
+        };
+        let topic = self.with_namespace(&msg.topic);
+        msg.topic = topic.clone();
+        if let Err(e) = self.check_message(msg) {
+            return self.fail_async(&callback, e, permits);
+        }
+        // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍。
+        let sys_flag = self.try_to_compress_message(msg);
+        let (mq_sel, publish) = match mq {
+            // Java `send(msg, mq, cb, timeout)` → sendKernelImpl 定点发，传下去的
+            // topicPublishInfo 是 null，所以失败只在**同一台 broker** 上换 opaque 重试。
+            Some(mq) => (mq.clone(), None),
+            None => {
+                let publish = match self.topic_publish_info(&client, &topic).await {
+                    Ok(publish) => publish,
+                    Err(e @ Error::Client { .. }) => {
+                        return self.fail_async(
+                            &callback,
+                            Error::client_with_code(
+                                client_error_code::NOT_FOUND_TOPIC_EXCEPTION,
+                                e.to_string(),
+                            ),
+                            permits,
+                        )
+                    }
+                    Err(e) => return self.fail_async(&callback, e, permits),
+                };
+                match self
+                    .inner
+                    .fault_strategy
+                    .select_one_message_queue(&*publish, None, false)
+                {
+                    Ok(selected) => (
+                        MessageQueue::new(&topic, &selected.broker_name, selected.queue_id),
+                        Some(publish),
+                    ),
+                    Err(e) => {
+                        // Python 这里 selected 为 None 时报 `Send [0] times, still failed,
+                        // Topic: …, BrokersSent: []`；Rust 的选队列是 `Result`，原始异常
+                        // 只能拼进文本（与同步内核同一口径）。
+                        return self.fail_async(
+                            &callback,
+                            Error::client(format!(
+                                "Send [0] times, still failed, Topic: {topic}, BrokersSent: [], \
+                                 last error: {e}"
+                            )),
+                            permits,
+                        )
+                    }
+                }
+            }
+        };
+        self.send_kernel_async(&client, msg, &mq_sel, publish, sys_flag, callback, permits, timeout)
+            .await;
+    }
+
+    /// Python `_send_kernel_async`（Java `sendKernelImpl` 的 **ASYNC 分支**）：地址解析 →
+    /// 拦截钩子 → 建请求 → before 钩子 → 交给自己的一路上都有归还点。
+    #[allow(clippy::too_many_arguments)]
+    async fn send_kernel_async(
+        &self,
+        client: &MQClientInstance,
+        msg: &mut Message,
+        mq: &MessageQueue,
+        publish: Option<Arc<TopicPublishInfo>>,
+        sys_flag: i32,
+        callback: Arc<dyn SendCallback>,
+        permits: SendPermits,
+        timeout: i64,
+    ) {
+        let began = monotonic_millis();
+        // 地址解析两步，与 Java `sendKernelImpl:919-924` 一致：先查已缓存的发布地址，查不到
+        // 再按 topic 刷一次路由重查。定点发送（调用方给了 mq）不会在 sendDefaultImpl 里取
+        // 发布信息，这一步是它唯一的路由来源。
+        let addr = match client.broker_addr_of(&mq.broker_name) {
+            Some(addr) => Some(addr),
+            None => client
+                .get_topic_route_data(&mq.topic)
+                .await
+                .and_then(|route| MQClientInstance::find_broker_addr_in_route(&route, &mq.broker_name)),
+        };
+        let addr = match addr {
+            Some(addr) => addr,
+            // Java `sendKernelImpl:1100`
+            None => {
+                return self.fail_async(
+                    &callback,
+                    Error::client(format!("The broker[{}] not exist", mq.broker_name)),
+                    permits,
+                )
+            }
+        };
+        if self.has_check_forbidden_hook() {
+            // Java sendKernelImpl 的 ASYNC 分支同样先过拦截钩子（communicationMode=ASYNC）
+            if let Err(e) =
+                self.execute_check_forbidden(msg, mq, &addr, None, CommunicationMode::Async)
+            {
+                return self.fail_async(&callback, e, permits);
+            }
+        }
+        if self.read_cfg(|c| c.enable_trace_context.unwrap_or(false)) {
+            inject_trace_context(msg);
+        }
+        // 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），所以 header
+        // 里的 queueId 也跟着上一次 —— 这是 Java 的真实行为，别"修"它。
+        let mut publish_msg = PublishMessage::Single(msg);
+        let request = MQClientInstance::build_send_request(
+            &self.inner.producer_group(),
+            &mut publish_msg,
+            mq,
+            sys_flag,
+            self.inner.unit_mode(),
+        );
+        let group = self.inner.producer_group();
+        let namespace = self.inner.namespace();
+        let context = if self.has_send_message_hook() {
+            let mut context =
+                self.build_send_context(msg, &group, &namespace, mq, &addr, CommunicationMode::Async);
+            crate::client::hook::execute_send_message_hook_before(&self.inner.send_hooks, &mut context);
+            Some(context)
+        } else {
+            None
+        };
+        // Java `sendKernelImpl:1043-1046`：ASYNC 分支自己的总闸 —— 钩子、压缩、路由都算
+        // 耗时，预算被它们吃光就不再发起请求。RemotingTooMuchRequestException 是
+        // RemotingException 的子类，所以 Java 在 :1088 先跑 hook.after 再抛给回调，
+        // 这里用 complete_async 复刻同一顺序（且**不重试**）。
+        let cost = latency_since(began);
+        if timeout < cost {
+            return self.complete_async(
+                &callback,
+                Err(Error::TooMuchRequest("sendKernelImpl call timeout".to_string())),
+                context,
+                Some(permits),
+            );
+        }
+        let mut msg_only = msg.clone();
+        // body 已经编进 request，重试链只需要 UNIQ_KEY（parse_send_response 读它）
+        msg_only.set_body(None);
+        Box::new(AsyncSendChain {
+            producer: self.clone(),
+            client: client.clone(),
+            msg: Arc::new(msg_only),
+            request,
+            publish,
+            broker_name: mq.broker_name.clone(),
+            mq: mq.clone(),
+            addr,
+            timeout: timeout - cost,
+            attempt_began: 0.0,
+            times: 0,
+            context,
+            permits: Some(permits),
+            callback,
+        })
+        .attempt();
+    }
+
+    /// Python `_complete`（Java `operationSucceed` / `onExceptionImpl` 末尾的共同终点）：
+    /// 先跑 `SendMessageHook.after`，再归还背压许可，最后转交用户回调。
+    ///
+    /// 顺序照 Java：`semaphoreProcessor` 在两个回调里都排在用户回调之前（归还挂在
+    /// after 钩子之后，是因为 after 钩子要看到 `sendResult` / `exception`）。
+    ///
+    /// `permits` 走 `drop` 而不是 `SendPermits::release`：归还规则只有一处实现
+    /// （见 [`SendPermits` 的 `Drop`](SendPermits)），链上少一个能写错的地方。
+    fn complete_async(
+        &self,
+        callback: &Arc<dyn SendCallback>,
+        outcome: Result<SendResult>,
+        mut context: Option<SendMessageContext>,
+        permits: Option<SendPermits>,
+    ) {
+        let mut outcome = outcome;
+        if let Some(context) = context.as_mut() {
+            match outcome {
+                Ok(result) => {
+                    context.send_result = Some(result.clone());
+                    crate::client::hook::execute_send_message_hook_after(
+                        &self.inner.send_hooks,
+                        context,
+                    );
+                    outcome = Ok(result);
+                }
+                Err(e) => {
+                    context.exception = Some(e);
+                    crate::client::hook::execute_send_message_hook_after(
+                        &self.inner.send_hooks,
+                        context,
+                    );
+                    // 钩子只读 exception，取回来原样交付（Error 不是 Clone）。
+                    outcome = context
+                        .exception
+                        .take()
+                        .map_or_else(|| Err(Error::client("send message failed")), Err);
+                }
+            }
+        }
         drop(permits); // 显式标出归还点：必须在转交用户回调之前
-        result
+        match outcome {
+            Ok(result) => callback.on_success(result),
+            Err(e) => callback.on_exception(e),
+        }
     }
 
     /// 两个许可**顺序**申请、都用「从 `began` 算起的剩余预算」去等，所以第一个闸就能把
@@ -2281,9 +2735,9 @@ impl DefaultMQProducer {
         msg_len: i64,
         timeout: i64,
         began: f64,
-    ) -> Result<SendPermits<'_>> {
+    ) -> Result<SendPermits> {
         let mut permits = SendPermits {
-            inner: &self.inner,
+            inner: self.inner.clone(),
             num_acquired: false,
             size_acquired: false,
             msg_len,
@@ -2318,6 +2772,187 @@ impl DefaultMQProducer {
             ));
         }
         Ok(permits)
+    }
+}
+
+// ================================================================ 异步发送链
+
+/// 一笔异步发送的**在途尝试**与它的重试链（Python `_send_message_async` +
+/// `_on_send_exception` ← Java `MQClientAPIImpl#sendMessageAsync:615-703` 与
+/// `onExceptionImpl:704-740`）。
+///
+/// 一整条链装在同一个 owned 对象里：`attempt` 把请求交给传输层之后池内任务就结束了，
+/// 响应回来时闭包**带着整个链**再进来一次（对应 Java 递归调用 `sendMessageAsync`）。
+/// 于是「一次发送」的共享状态（复用请求、共享预算、已试次数、背压许可、用户回调、
+/// 轨迹 context）都是普通字段：不需要锁，也不会在两条终点之间漏掉归还。
+struct AsyncSendChain {
+    producer: DefaultMQProducer,
+    client: MQClientInstance,
+    /// 只给 `parse_send_response` 读 UNIQ_KEY；body 已经编进 `request`。
+    msg: Arc<Message>,
+    /// 跨重试复用的**同一个**请求（Java 只换 `opaque`）。
+    request: RemotingCommand,
+    /// `None` = 定点发送（调用方给了 mq）：重试不换 broker，只在原地换 opaque。
+    publish: Option<Arc<TopicPublishInfo>>,
+    broker_name: String,
+    mq: MessageQueue,
+    addr: String,
+    /// **所有尝试共享**的剩余预算（Java 往下传的是 `timeoutMillis - cost`）。
+    timeout: i64,
+    /// 本轮尝试的起点（Java 每轮重新取 `beginStartTime`），`attempt` 里刷新。
+    attempt_began: f64,
+    times: i32,
+    context: Option<SendMessageContext>,
+    permits: Option<SendPermits>,
+    callback: Arc<dyn SendCallback>,
+}
+
+impl AsyncSendChain {
+    /// Java `sendMessageAsync`：发出**本轮**尝试，结果由传输层的回调带回来。
+    fn attempt(mut self: Box<Self>) {
+        if self.times > 0 {
+            // Java `onExceptionImpl:728-730`：`request.setOpaque(createNewRequestId())`。
+            // 旧请求还挂在 responseTable 里等超时，复用 opaque 会把两次尝试的应答串台。
+            self.request.opaque = next_opaque();
+        }
+        self.attempt_began = monotonic_millis();
+        let client = self.client.clone();
+        let addr = self.addr.clone();
+        let request = self.request.clone();
+        let msg = Arc::clone(&self.msg);
+        let mq = Arc::new(self.mq.clone());
+        let timeout = self.timeout;
+        client.send_message_async(
+            &addr,
+            request,
+            msg,
+            mq,
+            timeout,
+            // 与 Java 的另一处形状差别：`invokeAsync` 在 Rust 里不会就地抛（连不上、通道
+            // 已关都变成回调里的 `Err`），所以 Java `sendMessageAsync` 外层那个
+            // `catch → onExceptionImpl(needRetry=true)` 分支在这里没有对应入口。
+            Box::new(move |outcome| self.on_response(outcome)),
+        );
+    }
+
+    /// Java `operationSucceed` / `operationFail`（Python `_handle`）：记故障表，
+    /// 成功就收尾，失败交给重试判断。
+    fn on_response(self: Box<Self>, outcome: Result<SendResult>) {
+        let cost = latency_since(self.attempt_began);
+        match outcome {
+            Ok(result) => {
+                self.producer.inner.fault_strategy.update_fault_item(
+                    &self.broker_name,
+                    cost,
+                    false,
+                    true,
+                );
+                self.finish(Ok(result));
+            }
+            Err(e) => {
+                // `updateFaultItem(…, true, …)` 排在分类之前，和 Java 一样 —— 哪怕这一笔
+                // 之后不重试，这台 broker 也要被记一次失败延迟。
+                self.producer.inner.fault_strategy.update_fault_item(
+                    &self.broker_name,
+                    cost,
+                    true,
+                    true,
+                );
+                let (wrapped, need_retry) = classify_async_failure(e, cost);
+                self.on_exception(wrapped, need_retry, cost);
+            }
+        }
+    }
+
+    /// Java `onExceptionImpl`：还能试就换一台 broker、复用请求重试，否则收尾。
+    fn on_exception(mut self: Box<Self>, error: Error, need_retry: bool, cost: i64) {
+        self.times += 1;
+        let remaining = self.timeout - cost;
+        if !(need_retry
+            && self.times <= self.producer.get_retry_times_when_send_async_failed()
+            && remaining > 0)
+        {
+            return self.finish(Err(error));
+        }
+        // 换目标：Java 用 `producer.selectOneMessageQueue(topicPublishInfo, brokerName,
+        // false)` —— 第三个参数是 false，所以按 `lastBrokerName` **避开**刚失败的那台；
+        // 选不到就沿用当前目标（Python 同）。
+        let (broker_name, mq) = match &self.publish {
+            None => (self.broker_name.clone(), self.mq.clone()),
+            Some(publish) => match self
+                .producer
+                .inner
+                .fault_strategy
+                .select_one_message_queue(&**publish, Some(&self.broker_name), false)
+            {
+                Ok(selected) => (
+                    selected.broker_name.clone(),
+                    MessageQueue::new(&self.mq.topic, &selected.broker_name, selected.queue_id),
+                ),
+                Err(_) => (self.broker_name.clone(), self.mq.clone()),
+            },
+        };
+        // Java `onExceptionImpl:725` 只查发布地址表、**不刷路由**；查不到就带着 null 撞进
+        // invokeAsync。这里就地终止，别让空地址传进传输层。
+        let addr = match self.client.broker_addr_of(&broker_name) {
+            Some(addr) => addr,
+            None => {
+                return self.finish(Err(Error::client(format!(
+                    "The broker[{broker_name}] not exist"
+                ))));
+            }
+        };
+        rmq_warn!(
+            "async send msg by retry {} times. topic={}, brokerAddr={}, brokerName={}: {}",
+            self.times,
+            self.mq.topic,
+            addr,
+            broker_name,
+            error
+        );
+        self.broker_name = broker_name;
+        self.mq = mq;
+        self.addr = addr;
+        self.timeout = remaining;
+        self.attempt();
+    }
+
+    /// 链的终点：交给 [`complete_async`](DefaultMQProducer::complete_async)
+    /// （先 after 钩子，再归还许可，最后转交用户回调）。
+    fn finish(mut self: Box<Self>, outcome: Result<SendResult>) {
+        let permits = self.permits.take();
+        let context = self.context.take();
+        self.producer
+            .complete_async(&self.callback, outcome, context, permits);
+    }
+}
+
+/// Python `_classify_async_failure`（Java `operationFail` 的三分支）：包装成
+/// `MQClientException` + 判定能否换 broker 重试。
+///
+/// ⚠ 只有**没收到响应**的失败走这里的分类。**已经收到响应**、但 `processSendResponse`
+/// 判定为失败的错误（[`Error::Broker`]）落进最后的 `_` 分支 —— Java 那条路径传的是
+/// `needRetry = false` 且**原样**抛出。也就是说异步发送**不看** `retryResponseCodes`：
+/// broker 明确回了错就不会换 broker 重试。别和同步发送的语义混为一谈。
+fn classify_async_failure(err: Error, cost: i64) -> (Error, bool) {
+    match err {
+        e @ Error::SendRequest { .. } => {
+            (Error::client(format!("send request failed, last error: {e}")), true)
+        }
+        e @ Error::Timeout { .. } => (
+            Error::client(format!("wait response timeout, cost={cost}, last error: {e}")),
+            true,
+        ),
+        // 其余 RemotingException 都是 `"unknown reason"`，但 `RemotingTooMuchRequestException`
+        // 是「自己人太多」，换 broker 也没用（Python 同：`not isinstance(e, RemotingTooMuch…)`）。
+        e @ Error::TooMuchRequest(_) => {
+            (Error::client(format!("unknown reason, last error: {e}")), false)
+        }
+        // 连不上（Java 的 `RemotingConnectException`）也属 RemotingException：换一台有机会。
+        e @ (Error::Connect { .. } | Error::RemotingCommand(_) | Error::Io(_)) => {
+            (Error::client(format!("unknown reason, last error: {e}")), true)
+        }
+        e => (e, false),
     }
 }
 
@@ -3638,45 +4273,22 @@ mod tests {
         assert!(p.send_batch(Vec::new(), None, None).await.is_err());
     }
 
-    /// 没有运行时上下文 ⇒ 明确报错，而不是偷偷新建一个 runtime
-    /// （那样会让传输层缓存到一个已关闭的 `Handle`）。
+    /// 运行时之外、而且**没启动过** ⇒ 先报「未启动」，而不是「没有运行时」。
+    ///
+    /// 两条都是同步报错（Python `_require_client` 同）：前者走回调更难查，后者意味着
+    /// 池还没建。真正「运行时之外」的分支要 start 在未绑定运行时的场景之后才可能命中，
+    /// 而 `start()` 本身是 async，所以这里只能断言顺序。
     #[test]
-    fn send_async_needs_a_bound_runtime() {
+    fn send_async_before_start_reports_not_started() {
         let p = producer("GID_async");
         let cb = Arc::new(ClosureSendCallback::new(None, None));
         let err = p
             .send_async(Message::new("T1", Some(b"x")), cb, None, None)
-            .expect_err("运行时之外不该静默派发");
-        assert!(err.to_string().contains("start()"));
-    }
-
-    #[tokio::test]
-    async fn send_async_dispatches_inside_a_runtime() {
-        let p = producer("GID_async_ok");
-        let done = Arc::new(AtomicUsize::new(0));
-        let d = done.clone();
-        let cb = Arc::new(ClosureSendCallback::new(
-            None,
-            Some(Box::new(move |_e| {
-                d.fetch_add(1, Ordering::SeqCst);
-            })),
-        ));
-        // 未 start() 也没关系：Handle::try_current() 能拿到测试运行时
-        p.send_async(Message::new("T1", Some(b"x")), cb, None, None)
-            .expect("运行时内可派发");
-        // 没路由 ⇒ 走失败回调
-        assert!(wait_until(|| done.load(Ordering::SeqCst) == 1).await);
-    }
-
-    /// 轮询等待条件成立（最多 ~2s），避免用 sleep 猜时长。
-    async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
-        for _ in 0..200 {
-            if cond() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        cond()
+            .expect_err("未启动不该静默派发");
+        assert!(
+            err.to_string().contains("producer not started"),
+            "先查客户端、再查运行时句柄: {err}"
+        );
     }
 
     #[test]

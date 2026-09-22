@@ -8,10 +8,15 @@
 //!
 //! - P1 **生命周期**：`start()` 生成 clientId 并复用进程内实例、启动前所有发送入口
 //!   一律快速失败、`shutdown()` 幂等且能重启、心跳真的把 ProducerData 注册到 broker
-//!   （用半消息回查能找上门来反证，见 P6）。
+//!   （用半消息回查能找上门来反证，见 P6）；关停时**已经排队的异步发送照样跑完**
+//!   （Java `ThreadPoolExecutor.shutdown()`：不再收新的，队列里的不吞、不重），
+//!   关停之后再投异步一律同步报错。
 //! - P2 **六条发送路径**：同步 / 定点 / 批量 / oneway / 选择器 / 异步，逐条对
 //!   `SendResult` 字段与 broker 上实际落库的结果；超阈值消息在 broker 端被透明解压
-//!   （消费者读到原正文，且 sysFlag 的 COMPRESSED 位已被清）。
+//!   （消费者读到原正文，且 sysFlag 的 COMPRESSED 位已被清）。异步那一栏锁的是
+//!   **发送内核**本身：回调里的 `(queue, offset)` 能从 broker 原样读回那一条、
+//!   30 笔并发一笔不漏也不重复回调、定点异步真的落在指定队列、池内校验失败按 Java
+//!   文案回调一次且生产者之后照常能用。
 //! - P3 **钩子**：CheckForbidden 的异常原样抛给调用方且消息不落地；
 //!   SendMessageHook 的 before/after 每轮各一次、after 看得见 sendResult。
 //! - P4 **轨迹接缝**：注入的 dispatcher 在 `start()` 里被拉起并注册两个轨迹钩子，
@@ -47,8 +52,8 @@ use rocketmq_client_remoting::client::hook::{
 };
 use rocketmq_client_remoting::client::mq_client::{MQClientInstance, TraceDispatcher};
 use rocketmq_client_remoting::client::producer::{
-    ClosureSendCallback, DefaultMQProducer, SelectMessageQueueByHash, SendCallback,
-    TransactionListener, TransactionMQProducer, DEFAULT_RETRY_RESPONSE_CODES,
+    DefaultMQProducer, SelectMessageQueueByHash, SendCallback, TransactionListener,
+    TransactionMQProducer, DEFAULT_RETRY_RESPONSE_CODES,
 };
 use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::client::request_reply::request_future_holder;
@@ -170,6 +175,96 @@ fn bodies(msgs: &[MessageExt]) -> Vec<String> {
 
 fn queue_ids(mqs: &[MessageQueue]) -> Vec<i32> {
     mqs.iter().map(|q| q.queue_id).collect()
+}
+
+/// 异步发送回调的观测点：每一笔要么成功要么失败，且**终态只来一次**。
+///
+/// 一次性的 `ClosureSendCallback` 撑不起这类场景（它的闭包取走即空），而「有没有把
+/// 某一笔悄悄吞掉」正是异步内核最容易出事的地方。
+#[derive(Default)]
+struct AsyncProbe {
+    done: AtomicUsize,
+    ok: AtomicUsize,
+    results: Mutex<Vec<SendResult>>,
+    errors: Mutex<Vec<String>>,
+}
+
+impl AsyncProbe {
+    fn done(&self) -> usize {
+        self.done.load(Ordering::SeqCst)
+    }
+
+    fn ok(&self) -> usize {
+        self.ok.load(Ordering::SeqCst)
+    }
+
+    fn results(&self) -> Vec<SendResult> {
+        lock(&self.results).clone()
+    }
+
+    fn first(&self) -> Option<SendResult> {
+        lock(&self.results).first().cloned()
+    }
+
+    fn errors(&self) -> Vec<String> {
+        lock(&self.errors).clone()
+    }
+
+    fn summary(&self) -> String {
+        let errors = self.errors();
+        format!(
+            "done={} ok={} err={} {:?}",
+            self.done(),
+            self.ok(),
+            errors.len(),
+            errors.first()
+        )
+    }
+}
+
+impl SendCallback for AsyncProbe {
+    fn on_success(&self, result: SendResult) {
+        if result.status == SendStatus::SendOk {
+            self.ok.fetch_add(1, Ordering::SeqCst);
+        }
+        lock(&self.results).push(result);
+        self.done.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_exception(&self, err: Error) {
+        lock(&self.errors).push(err.to_string());
+        self.done.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 按异步回调报的 `(queue, offset)` 从 broker 读回那一条的正文。
+///
+/// 「回调说 SEND_OK」只证明客户端这么认为；位点上真躺着这条消息才证明异步链走完了
+/// 网络、broker 也认了这份请求。落库有毫秒级延迟，所以重试到预算用完。
+async fn body_at(
+    instance: &MQClientInstance,
+    mq: &MessageQueue,
+    offset: i64,
+    broker_addr: &str,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + budget;
+    loop {
+        // 队列刚建好时拉取本身会失败，那不算「没落库」，继续轮到预算用完。
+        if let Ok(pulled) = pull_from(instance, mq, offset, broker_addr).await {
+            if let Some(found) = pulled
+                .msg_found_list
+                .iter()
+                .find(|m| m.queue_offset == offset)
+            {
+                return Some(found.body.clone().unwrap_or_default());
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn get_route(
@@ -550,7 +645,53 @@ async fn p1_lifecycle(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -
         sent.map(|r| r.status == SendStatus::SendOk).unwrap_or(false),
         &err,
     );
+    // ---- 关闭时把已经排队的异步发送跑完（Java `ThreadPoolExecutor.shutdown()`：不再收
+    // 新的，队列里那些照样执行）。实例是同时被拆掉的，所以这一批的终态**可能**是错误，
+    // 但必须「一笔不漏、一笔不重」—— 吞掉一笔的实现在生产上就是丢消息。
+    const DRAIN: usize = 10;
+    let draining = Arc::new(AsyncProbe::default());
+    for i in 0..DRAIN {
+        p.send_async(
+            msg(topic, format!("drain-{i}").as_bytes(), "TagDrain", ""),
+            draining.clone(),
+            Some(10_000),
+            None,
+        )
+        .map_err(|e| format!("send {i} before shutdown was rejected: {e}"))?;
+    }
+    let began = Instant::now();
     p.shutdown();
+    let drained = wait_async(
+        || async { draining.done() >= DRAIN },
+        Duration::from_secs(20),
+    )
+    .await;
+    let shut = draining.errors();
+    ck.check(
+        "P1 shutdown() drains the async send queue: every queued send gets exactly one terminal callback",
+        drained && draining.done() == DRAIN,
+        &format!(
+            "{} 关停+跑完用时 {:?} 首笔错误 {:?}",
+            draining.summary(),
+            began.elapsed(),
+            shut.first()
+        ),
+    );
+    let after_shutdown = p
+        .send_async(
+            msg(topic, b"after-shutdown", "TagDrain", ""),
+            draining.clone(),
+            Some(1_000),
+            None,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    ck.check(
+        "P1 send_async after shutdown() is rejected at the door (and adds no callback)",
+        after_shutdown.contains("not started") && draining.done() == DRAIN,
+        &format!("{after_shutdown} / {}", draining.summary()),
+    );
     Ok(())
 }
 
@@ -671,33 +812,176 @@ async fn p2_send_paths(
         &format!("{picked:?}"),
     );
 
-    // ---- 异步：成功回调里拿得到与同步同形的结果
-    let done = Arc::new(AtomicUsize::new(0));
-    let ok = Arc::new(AtomicUsize::new(0));
-    let (d_ok, d_ex) = (done.clone(), done.clone());
-    let o = ok.clone();
-    let cb: Arc<dyn SendCallback> = Arc::new(ClosureSendCallback::new(
-        Some(Box::new(move |r: SendResult| {
-            if r.status == SendStatus::SendOk {
-                o.fetch_add(1, Ordering::SeqCst);
-            }
-            d_ok.fetch_add(1, Ordering::SeqCst);
-        })),
-        Some(Box::new(move |_e| {
-            d_ex.fetch_add(1, Ordering::SeqCst);
-        })),
-    ));
-    p.send_async(msg(topic, b"async-1", "TagAsync", ""), cb, Some(5000), None)
-        .map_err(|e| format!("async send failed: {e}"))?;
+    // ---- 异步发送内核：回调里的 SendResult 与同步同形，而且消息真在 broker 上
+    let probe = Arc::new(AsyncProbe::default());
+    p.send_async(
+        msg(topic, b"async-1", "TagAsync", ""),
+        probe.clone(),
+        Some(5_000),
+        None,
+    )
+    .map_err(|e| format!("async send failed: {e}"))?;
     let called = wait_async(
-        || async { done.load(Ordering::SeqCst) == 1 },
+        || async { probe.done() >= 1 },
         Duration::from_secs(10),
     )
     .await;
+    let first = probe.first();
+    let shaped = first.as_ref().is_some_and(|r| {
+        r.status == SendStatus::SendOk
+            && r.msg_id
+                .as_deref()
+                .is_some_and(|id| decode_message_id(id).is_ok())
+            && r.message_queue.as_ref().is_some_and(|q| {
+                q.topic == topic && q.broker_name == *broker_name && q.queue_id >= 0
+            })
+            && r.queue_offset >= 0
+    });
     ck.check(
-        "P2 send_async drives the success callback with a real SendResult",
-        called && ok.load(Ordering::SeqCst) == 1,
-        &format!("called={called} ok={}", ok.load(Ordering::SeqCst)),
+        "P2 send_async drives the success callback with a Java-shaped SendResult",
+        called && shaped && probe.errors().is_empty(),
+        &probe.summary(),
+    );
+    let landed = match first
+        .as_ref()
+        .and_then(|r| r.message_queue.as_ref().map(|mq| (r, mq)))
+    {
+        Some((r, mq)) => {
+            body_at(instance, mq, r.queue_offset, broker_addr, Duration::from_secs(15)).await
+                == Some(b"async-1".to_vec())
+        }
+        None => false,
+    };
+    ck.check(
+        "P2 the async callback's queue+offset reads that very message back off the broker",
+        landed,
+        &probe.summary(),
+    );
+
+    // ---- 池子不吞消息：并发 30 笔，每笔恰好一个终态回调，且每一笔都在回调报的位点上
+    const BURST: usize = 30;
+    let burst = Arc::new(AsyncProbe::default());
+    for i in 0..BURST {
+        p.send_async(
+            msg(topic, format!("async-burst-{i}").as_bytes(), "TagBurst", ""),
+            burst.clone(),
+            Some(10_000),
+            None,
+        )
+        .map_err(|e| format!("burst send {i} was rejected: {e}"))?;
+    }
+    let all_back = wait_async(
+        || async { burst.done() >= BURST },
+        Duration::from_secs(30),
+    )
+    .await;
+    ck.check(
+        "P2 30 concurrent async sends each get exactly one terminal callback, all SEND_OK",
+        all_back && burst.done() == BURST && burst.ok() == BURST,
+        &burst.summary(),
+    );
+    let results = burst.results();
+    let mut slots = HashSet::new();
+    let mut read_back: HashSet<Vec<u8>> = HashSet::new();
+    for r in &results {
+        let Some(mq) = r.message_queue.as_ref() else {
+            continue;
+        };
+        slots.insert((mq.broker_name.clone(), mq.queue_id, r.queue_offset));
+        if let Some(body) = body_at(instance, mq, r.queue_offset, broker_addr, Duration::from_secs(15)).await {
+            read_back.insert(body);
+        }
+    }
+    let want: HashSet<Vec<u8>> = (0..BURST)
+        .map(|i| format!("async-burst-{i}").into_bytes())
+        .collect();
+    ck.check(
+        "P2 every burst message is readable at exactly the offset its own callback reported",
+        read_back == want && slots.len() == BURST,
+        &format!(
+            "读回 {} 条、位点 {} 个、缺 {:?}",
+            read_back.len(),
+            slots.len(),
+            want.difference(&read_back).count()
+        ),
+    );
+
+    // ---- 定点异步发送：交给它的队列就是它落下去的队列
+    let target = MessageQueue::new(topic, broker_name, 2);
+    let aimed = Arc::new(AsyncProbe::default());
+    p.send_async(
+        msg(topic, b"async-on-mq", "TagAsyncMq", ""),
+        aimed.clone(),
+        Some(5_000),
+        Some(target.clone()),
+    )
+    .map_err(|e| format!("targeted async send failed: {e}"))?;
+    let aimed_back = wait_async(
+        || async { aimed.done() >= 1 },
+        Duration::from_secs(10),
+    )
+    .await;
+    let aimed_result = aimed.first();
+    let on_target = aimed_result
+        .as_ref()
+        .is_some_and(|r| r.message_queue.as_ref() == Some(&target));
+    let aimed_landed = match aimed_result.as_ref() {
+        Some(r) => {
+            body_at(instance, &target, r.queue_offset, broker_addr, Duration::from_secs(15)).await
+                == Some(b"async-on-mq".to_vec())
+        }
+        None => false,
+    };
+    ck.check(
+        "P2 send_async honours an explicit target queue",
+        aimed_back && on_target && aimed_landed,
+        &format!("onTarget={on_target} {}", aimed.summary()),
+    );
+
+    // ---- 本地校验在池子里报错：`Validators.checkMessage` 的超长 body 走的是
+    //      `async_send_inner` 的失败分支（Java `sendKernelImpl` 同位置）：既不落地，也
+    //      只回调一次，之后这个生产者照常能用（许可/队列没被这条断链漏掉）。
+    let too_big = vec![b'q'; 5 * 1024 * 1024];
+    let rejected = Arc::new(AsyncProbe::default());
+    p.send_async(
+        msg(topic, &too_big, "TagTooBig", ""),
+        rejected.clone(),
+        Some(10_000),
+        None,
+    )
+    .map_err(|e| format!("oversized async send was rejected at the door: {e}"))?;
+    let rejected_back = wait_async(
+        || async { rejected.done() >= 1 },
+        Duration::from_secs(20),
+    )
+    .await;
+    let rejected_errors = rejected.errors();
+    let java_wording = rejected_errors
+        .first()
+        .is_some_and(|e| e.contains("the message body size over max value, MAX: "));
+    let after_reject = Arc::new(AsyncProbe::default());
+    let still_works = p
+        .send_async(
+            msg(topic, b"async-after-reject", "TagAfterReject", ""),
+            after_reject.clone(),
+            Some(5_000),
+            None,
+        )
+        .is_ok()
+        && wait_async(
+            || async { after_reject.done() >= 1 },
+            Duration::from_secs(10),
+        )
+        .await
+        && after_reject.ok() == 1;
+    ck.check(
+        "P2 an in-pool validator failure callbacks once with Java's text and leaves the producer usable",
+        rejected_back
+            && rejected.done() == 1
+            && rejected.ok() == 0
+            && java_wording
+            && still_works,
+        &format!("{} / 之后一笔 {}", rejected.summary(), after_reject.summary()),
     );
 
     // ---- 压缩：8 KiB 可压缩正文 → 消费者读到原始正文

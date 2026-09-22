@@ -225,6 +225,17 @@ impl SlowHook {
             .collect::<Vec<_>>()
             .join(",")
     }
+
+    /// 距 [`begin`] 的毫秒数；还没开始计时时返回 0。
+    ///
+    /// 给「动手脚的那个普通线程也要报时刻」用 —— 高负载机器上 `sleep(1s)` 自己就会晚，
+    /// 「脚晚了」和「叫不醒」是两种病因，混在一起就会误诊。
+    fn elapsed_of_clock(&self) -> u128 {
+        match *lock(&self.clock) {
+            Some(began) => began.elapsed().as_millis(),
+            None => 0,
+        }
+    }
 }
 
 impl SendMessageHook for SlowHook {
@@ -635,6 +646,33 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     slow.set(HOLD_MS);
     slow.begin();
     let held2 = Arc::new(Recorder::default());
+    // 第 11 笔必须**等闸门真的被占满**再交出去：池子的派发与主任务的循环并发，
+    // 谁先到闸口不一定 —— 先过闸的是它的话，卡住的就变成第 10 笔 held，
+    // 「它是被扩容放行的」这句判断就不成立了。观察与补发都交给看门线程（纪律 ④）。
+    let woken = Arc::new(Recorder::default());
+    let woken_sent_at = Arc::new(AtomicI64::new(-1));
+    let watch = GateWatch::spawn(
+        {
+            let producer = producer.clone();
+            move || producer.semaphore_async_send_num_available_permits()
+        },
+        0,
+        {
+            let producer = producer.clone();
+            let topic = topic.clone();
+            let woken = Arc::clone(&woken);
+            let (slow, woken_sent_at) = (slow.clone(), Arc::clone(&woken_sent_at));
+            move || {
+                woken_sent_at.store(slow.elapsed_of_clock() as i64, Ordering::SeqCst);
+                let _ = producer.send_async(
+                    message(&topic, "b3-woken", b"b3-woken"),
+                    woken,
+                    Some(15_000),
+                    None,
+                );
+            }
+        },
+    );
     for _ in 0..GATE_NUM {
         let _ = producer.send_async(
             message(&topic, "b3-held", b"b3-held"),
@@ -643,27 +681,36 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
             None,
         );
     }
-    let woken = Arc::new(Recorder::default());
-    let _ = producer.send_async(
-        message(&topic, "b3-woken", b"b3-woken"),
-        woken.clone(),
-        Some(15_000),
-        None,
-    );
+    // 扩容线程**真正跑起来**的时刻：这台机器负载高时 `sleep(1s)` 本身就会晚，
+    // 而「扩容晚了」与「扩容叫不醒等待者」是两种完全不同的病因，必须分得开。
+    let resize_fired_at = Arc::new(AtomicI64::new(-1));
     let _ = std::thread::spawn({
         let producer = producer.clone();
+        let resize_fired_at = Arc::clone(&resize_fired_at);
+        let fired = slow.clone();
         move || {
             std::thread::sleep(Duration::from_millis(RESIZE_AT as u64));
+            resize_fired_at
+                .store(fired.elapsed_of_clock() as i64, Ordering::SeqCst);
             producer.set_back_pressure_for_async_send_num(GATE_NUM + 2);
         }
     })
     .join();
+    let (_min_free, sent_while_gated) = watch.finish();
+    let sent_at = woken_sent_at.load(Ordering::SeqCst);
+    // 这一条是上一切的前提：第 11 笔必须是在闸门已经空了**之后**、扩容**之前**交出去的，
+    // 否则它可能只是顺着新容量走了过去，什么都没测到。
+    ck.check(
+        "B3 第 11 笔在闸门口就被扣住（扩容前才交出去）",
+        sent_while_gated && sent_at >= 0 && (sent_at as u128) < RESIZE_AT,
+        &format!("闸门曾空={sent_while_gated} 交出时刻={sent_at}ms 扩容在 {RESIZE_AT}ms"),
+    );
     ck.check(
         "B3 被叫醒的那笔真的发出去了",
         wait_until(|| woken.done() > 0, 20).await
             && woken.ok() == 1
             && woken.errors().is_empty(),
-        &woken.summary(),
+        &format!("{} 扩容实际发生在 {}ms", woken.summary(), resize_fired_at.load(Ordering::SeqCst)),
     );
     // 时刻由钩子自己记：它进内核那一刻既晚于扩容、又早于 10 笔在途归还，
     // 所以放行它的只可能是扩容这件事本身。
@@ -673,8 +720,8 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
         woken_entry.is_some_and(|at| at >= RESIZE_AT && at < HOLD_MS as u128)
             && slow.count_of("b3-held") == GATE_NUM as usize,
         &format!(
-            "它进内核于 {:?}ms（扩容在 {RESIZE_AT}ms、10 笔在途要到 ≈{}ms 之后才归还）",
-            woken_entry, HOLD_MS
+            "它进内核于 {woken_entry:?}ms（扩容在 {RESIZE_AT}ms、10 笔在途要到 ≈{}ms 之后才归还）",
+            HOLD_MS
         ),
     );
     let all_done = wait_until(|| held2.done() >= GATE_NUM as usize, 30).await;
@@ -683,7 +730,11 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     ck.check(
         "B3 broker 上一共落了 21 条",
         all_done && landed == GATE_NUM * 2 + 1,
-        &format!("landed={landed}"),
+        &format!(
+            "landed={landed} 钩子记录=[{}] {}",
+            slow.dump(),
+            held2.summary()
+        ),
     );
     ck.check(
         "B3 全部落地后空闲许可 = 新容量 12",

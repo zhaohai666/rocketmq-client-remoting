@@ -29,7 +29,7 @@ Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Rust 实现，迁移�
 
 **未实测**：Windows / MSVC 分支。TLS 分支已按真机跑过：本机 5.5.1 集群在 test-mode 下**同一组端口**
 （nameServer 9876、broker 10911）嗅探 TLS，`ROCKETMQ_TLS_ENABLE=1` 直接生效，六个 `live_*`
-例子合计 **417 项断言全绿**（producer 55 / push consumer 95 / pull 43 / lite-pull 48 /
+例子合计 **424 项断言全绿**（producer 62 / push consumer 95 / pull 43 / lite-pull 48 /
 mq_client 84 / admin 92+1 skip），实测过程见「与 Java 的差异」的 TLS 条。
 
 ## 依赖
@@ -51,12 +51,12 @@ mq_client 84 / admin 92+1 skip），实测过程见「与 Java 的差异」的 T
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 700 条，~1s
+cargo test --lib               # 712 条，~1s
 ```
 
 ## 单元测试
 
-700 条按模块分布（`cargo test --lib -- --list` 可复算）：
+712 条按模块分布（`cargo test --lib -- --list` 可复算）：
 
 | 模块 | 条数 | 覆盖 |
 | --- | --- | --- |
@@ -68,7 +68,7 @@ cargo test --lib               # 700 条，~1s
 | `common::compression` | 7 | 三后端往返 + 类型解析（含 Java 的 `0→ZLIB` 兼容映射）；未支持类型必须抛错而不是透传压缩字节 |
 | `common::recall_message_handle` | 6 | 定时消息撤回句柄 v1：与 Java `buildHandle` 的**真值向量**对拍（带 `=` 填充）、无填充句柄也能解（跨客户端撤回）、6 段新版本忽略尾段、空串/坏 base64/非法 utf-8/`v2`/段数不足一律 Java 文案 `recall handle is invalid` |
 | `common` 其余 | 74 | `message` / `message_const` / `message_type` / `message_client_id_setter`、`mix_all`（含 `%NS%` 前缀与 `build_mq_client_id` / `change_instance_name_to_pid` 的 clientId 口径）、`sysflag`、`util_all`（14 位墙钟、`nano_time`、`is_blank`）、`topic_config`、`topic_validator`、`buffer`、`logging` |
-| `client::producer` | 68 | 配置与生命周期（含 Java `buildMQClientId` 的 clientId 口径：`<ip>@<pid>#<nanoTime>`、重启不换、同名 instanceName 共用一份实例）、选队列、压缩时机、事务两阶段；其中 `send_retry_tests` 用**进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败 10005、连接失败隔离；同一套抓取也取证明线上的字段口径（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据）。另有 **10 项异步背压闸门**（`send_retry_tests::backpressure_producer` 起）：开关关掉完全不碰两个闸、条数闸超容按 Java 原文案 `send message tryAcquire semaphoreAsyncNum timeout` 拒绝且**一次请求都没发出去**、字节闸拒了要把**已拿到的条数许可**还回去、在途份数逐笔扣还、失败路径照样归还、整条重试链只占**一份**许可（不是每次尝试一份）、闸会等到预算耗尽而不是看一眼就拒、运行时改容量保留在途份额、扩容叫醒卡住的发送、过闸超时报 `DEFAULT ASYNC send call timeout` |
+| `client::producer` | 80 | 配置与生命周期（含 Java `buildMQClientId` 的 clientId 口径：`<ip>@<pid>#<nanoTime>`、重启不换、同名 instanceName 共用一份实例）、选队列、压缩时机、事务两阶段；其中 `send_retry_tests` 用**进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败 10005、连接失败隔离；同一套抓取也取证明线上的字段口径（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据）。另有 **27 项异步发送内核 + 背压闸门**（`send_retry_tests` 的「异步发送背压」一节，行号 805 到文件末尾）：闸门侧 —— 开关关掉完全不碰两个闸、条数闸超容按 Java 原文案 `send message tryAcquire semaphoreAsyncNum timeout` 拒绝且**一次请求都没发出去**、字节闸拒了要把**已拿到的条数许可**还回去、在途份数逐笔扣还、失败路径照样归还、整条重试链只占**一份**许可（不是每次尝试一份）、闸会等到预算耗尽而不是看一眼就拒、运行时改容量保留在途份额、扩容叫醒卡住的发送、空 body 也按 1 个字节许可算、排队排掉预算报 `DEFAULT ASYNC send call timeout`；有界队列侧 —— 队满时把 `executor rejected` **同步**抛回调用方且一笔都没发、开了背压则派发到队列之外照样跑完、`shutdown()` 之后再投直接被拒；异步内核侧 —— 预建请求阶段越过预算报 send kernel timeout、连接失败换 broker 重试且**同一个请求换新 opaque**、重试次数受 `retryTimesWhenSendAsyncFailed` 管（填 0 就是只试一次）、**broker 返回的业务码不进重试链**（一次就回调）、定点队列的重试仍留在同一台 broker、before/after 钩子每笔异步发送各跑一次、after 钩子看得见真实成败与异常、未 `start()` 时同步抛且**不回调**；再加一条 32 工作线程运行时下的回归：钩子同步睡住时池子仍逐笔派发（`resize_wakes_the_parked_sender_while_the_pool_is_saturated`，去掉「派发任务 + 信号量」的池设计会红） |
 | `client::backpressure` | 12 | Java `Semaphore(permits, true)` 的公平计数信号量：按 Java 的单位逐个拿/还、`permits<=0` 请求像 Java 一样被忽略、**只有队首能拿许可**、阻塞的队首把后面的人按 FIFO 排住、改总量保留在途份额、改容量叫醒等待者、队首成交后仍要喂后面那个等待者（否则真机上是 5 秒死等）、队首超时离开也要叫醒后面的人、丢弃的等待方不留幽灵票据、预算恰好用尽时只在队首清空才放行、空闲许可可以为负再拉回正、两个地板值（10 条 / 1MiB 字节）与 Java 一致 |
 | `client::allocate_strategy` | 30 | 六个策略与 Java 单测逐条对拍：`AVG` / `AVG_BY_CIRCLE` 的 Java 用例（10/4、7/3、边界队列续接）、四道 `check` 守卫返回**空结果**而非 Java 的 `IllegalArgumentException`、`CONFIG` 不查守卫且返回副本、六个 `get_name()` 与 Java 常量一致、N 消费者不重不漏、`CONSISTENT_HASH` 的哈希环表逐格、`MACHINE_ROOM` 的 `[0,1,4]/[2,3]` 分片与 `String#split("@")` 裁尾空段真值表、`MACHINE_ROOM_NEARBY` 同机房优先 + 无消费者机房由全员共享 + resolver 空机房**抛错**（保住上一轮分配） |
 | `client::consumer` / `pull_consumer` / `consume_executor` / `consumer_stats` | 98 | 订阅与 `MessageSelector`、clientId 的 CLUSTERING/BROADCASTING 分岔（广播保持 `DEFAULT` 并复用同一份实例）、`PopProcessQueue`、过滤与投递接缝、pull/lite 状态机（subscribe/assign/seek/poll/committed）、`consume_executor` 的 core/max 两档弹性语义（空闲 worker 按 keepAlive 退休）、`StatsItem` 窗口端点差分（不依赖真实时钟） |
@@ -101,15 +101,15 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 ```
 
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
-下表是 **2026-09-21 在本地 5.5.1 集群上的实测结果**（`live_backpressure` 一行为 2026-09-22 实测；
-上表 14 个工具合计 753 项断言，`live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本
+下表是 **2026-09-22 在本地 5.5.1 集群上的实测结果**（全表当轮重测；
+上表 14 个工具合计 761 项断言，`live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本
 调度，都不计进去）：
 
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
 | `live_protocol` | 43 PASS | S0~S8：路由/集群信息 → `SEND_MESSAGE_V2`(310) 短键 header → `PULL_MESSAGE`(11) + 17 段解码 → 四个 offset RPC → 心跳/消费组列表/注销 → **RocketMQ 二进制 header 在真 broker 上的往返** → 清理 |
 | `live_mq_client` | 84 PASS | M1~M8：实例身份与复用、路由与 `TopicPublishInfo` 游标（未知 topic 只在生产者路径回退 `TBW102`）、收发逐字段、位点五 RPC、心跳真被 broker 采纳（用 `GET_CONSUMER_LIST_BY_GROUP` 反查证明）、**POP 弹回→ACK→改不可见时间→再弹拿不到**、队列批量锁真互斥、**共用实例的关闭守卫**（同 clientId 的两个生产者 + 一个 lite 消费者：先退的门面之后兄弟仍能真发消息，最后一个退掉才拆循环并摘掉 `INSTANCE_MAP`，同 clientId 重建才拿到可用新实例） |
-| `live_producer` | 55 PASS | P1~P10：生命周期与心跳注册、六条发送路径、压缩消息 broker 端透明解压且清 flag、三类钩子、轨迹接缝、Request-Reply 三属性与超时、**事务两阶段 + broker 回查**、管理便捷方法、发送重试内核定性、**定时消息撤回 `recallMessage`(370)**（broker 给的句柄能解开、撤回返回 uniqKey、对照定时消息按时到 / 被撤回那条永不到、`recallMessageEnable` 还原）、topic 清理 |
+| `live_producer` | 62 PASS | P1~P10：生命周期与心跳注册、六条发送路径、压缩消息 broker 端透明解压且清 flag、三类钩子、轨迹接缝、Request-Reply 三属性与超时、**事务两阶段 + broker 回查**、管理便捷方法、发送重试内核定性、**定时消息撤回 `recallMessage`(370)**（broker 给的句柄能解开、撤回返回 uniqKey、对照定时消息按时到 / 被撤回那条永不到、`recallMessageEnable` 还原）、topic 清理。异步内核这一轮补了真机取证：P1 `shutdown()` **排空**有界发送队列（排队中的 10 笔每笔恰好拿到一次终态回调、一笔都没被吞、`shutdown()` 之后再投 `send_async` 直接拒且不新增回调）；P2 异步成功回调给出的 `SendResult` 形状与 Java 一致（状态、可解的 msgId、队列属于本 topic+broker、位点 ≥0）、**按回调自己的 queueId+offset 从 broker 把那条消息读回来**、30 笔并发异步各恰好一次终态回调且 30 个位点互不重复、每笔都在自己回调报的那个位点读得到、定点队列的 `send_async` 真落在指定队列、池子里被 `Validators.check_message` 拒掉的超大 body 恰好回调一次且文案逐字对 Java（`the message body size over max value, MAX: `）、之后生产者照常可用 |
 | `live_consumer` | 95 PASS | C1~C10：`start()` 三道校验与首轮同步心跳、长轮询 24 条不重不丢且位点刷到 broker、tag 过滤（broker 存 20 只投 10）、`RECONSUME_LATER` 走 `%RETRY%` 重投、`maxReconsumeTimes=2` 用尽后落 `%DLQ%<group>`（C4b：只投 3 次、实测 0s/10s/40s、死信 `reconsumeTimes=3` 且带 `RETRY_TOPIC`）、POP + ack、广播位点、顺序消费 broker 锁、多实例分摊与撤位、broker 推来的 `NOTIFY_CONSUMER_IDS_CHANGED`(40) 确实叫醒了两端、`ConsumerRunningInfo` |
 | `live_pull_consumer` | 43 PASS | P1~P11：生命周期、`fetch_subscribe_message_queues`、定向 12 条、手动 pull 不重不漏 + `broker_name` 回填、位点由调用方掌控（回退再拉 FOUND、换 tag `NO_MATCHED_MSG`）、未提交组读位点得 `None` 而非 0、**长轮询真的挂起** |
 | `live_lite_pull_consumer` | 48 PASS | L1~L10：`start()` 校验（含 14 位墙钟硬失败）、subscribe 后台重平衡收全 12 条、`auto_commit` 两态、assign + `seek_to_begin` 重放、`seek()` 丢掉缓冲里早于目标位点的消息、pause/resume、手工心跳 |
@@ -120,13 +120,13 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_admin` | 92 PASS / 1 SKIP | A1~A13：admin **私有实例**隔离（shutdown 后同 clientId 的 producer 照常收发）、集群与运行时信息、topic 建/查/配置、broker 配置（properties 文本）读改写回、NameServer KV、订阅组分页、`viewMessage`、`sendMessageBack` 重投、`resetOffsetByTimestamp`/`resetOffsetByQueueId`（后者真机量到：重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构）、`queryTopicsByConsumer(group)`（按 `%RETRY%` 路由扇出合并）与 `queryTopicsByConsumerToBroker`、消费统计与 ConsumeQueue、清理。SKIP：uniqKey 查询要 broker 开 RocksDB 索引，本机默认文件索引查不到属**配置差异，不是客户端 bug** |
 | `live_unit_config` | 15 PASS | U1~U5（与 Python/C++/.NET 同场景）：`unit_name` 拼进 clientId（`<ip>@<instance>@<unitName>`）且照常发送、`@STREAM` 后缀的消费者在 **broker 的 `GET_CONSUMER_LIST_BY_GROUP` 里也是同一串**（唯一能证明「上线的就是拼好的 clientId」的观测点）、`unit_mode=true` 的发送让自动建出的 topic 带 `UNIT` 位而对照组不带、心跳里的 `ConsumerData.unit_mode` 让 `%RETRY%group` 带 `UNIT_SUB` 位、stream 生产者与 lite 消费者（默认开）每个请求带 `ReqT=0` 时收发照常 |
 | `live_sql92` | 15 PASS | S1~S4（与 Python/C++/.NET 同场景）：SQL92 订阅启动时正好一笔 `CHECK_CLIENT_CONFIG`(46)、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发 → 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，不是放行全部），`'*'` 对照组收全 6 条，永不匹配的 `color='green'` 收 0 条 → 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线单测 9 项（`client::mq_client`：真 socket mock broker，含 Java 那个「订阅集合里有空 subscriptions 就整轮 `return` 而非 `continue`」的短路怪癖） |
-| `live_backpressure` | 29 PASS | B1~B5（Java `executeAsyncMessageSend` 的两个公平闸，真机版）：B1 默认容量 1024 条 / 100MiB 字节、40 笔并发异步发送全落 broker 且两个闸满额归还；B2 `minAsyncResendNum=10` 时**恰好**第 11、12 笔回调 `send message tryAcquire semaphoreAsyncNum timeout`（文案逐字对 Java）、闸等到 150ms 预算耗尽才报（不是看一眼就拒）、broker 上只落那 10 条、被拒的两笔**一笔都没进发送内核**（钩子计数 0）；B3 第 11 笔卡在闸上，由**另一个 OS 线程**在 1000ms 时刻把容量抬到 12 才放它过去（钩子时间戳证明放行时刻 ∈ [1000, 2500)ms，早于在途那 10 笔归还），一共落 21 条、空闲许可 = 新容量 12；B4 一笔 600KB 在途精确扣掉 614400 个字节许可（剩 434176），超限两笔回调 `...semaphoreAsyncSize timeout`、只落 1 条，且**字节闸没过时已拿到的条数许可照样归还**；B5 配置越界被夹到地板值 10 条 / 1MiB，开关关掉时 30 笔并发（含 3 笔 300KB）全部落地、两个闸一分未动 |
+| `live_backpressure` | 30 PASS | B1~B5（Java `executeAsyncMessageSend` 的两个公平闸 + 有界发送队列，真机版）：B1 默认容量 1024 条 / 100MiB 字节、40 笔并发异步发送全落 broker 且两个闸满额归还；B2 `minAsyncResendNum=10` 时**恰好**第 11、12 笔回调 `send message tryAcquire semaphoreAsyncNum timeout`（文案逐字对 Java）、闸等到 150ms 预算耗尽才报（不是看一眼就拒）、broker 上只落那 10 条、被拒的两笔**一笔都没进发送内核**（钩子计数 0）；B3 第 11 笔卡在闸上（**由看门 OS 线程在条数闸读到 0 的瞬间才补交**，否则池子里的任务和它会争公平闸的先后、断言就是假的），由**另一个 OS 线程**在 1000ms 时刻把容量抬到 12 才放它过去（钩子时间戳证明放行时刻 ∈ [1000, 2500)ms，早于在途那 10 笔归还），一共落 21 条、空闲许可 = 新容量 12；B4 一笔 600KB 在途精确扣掉 614400 个字节许可（剩 434176），超限两笔回调 `...semaphoreAsyncSize timeout`、只落 1 条，且**字节闸没过时已拿到的条数许可照样归还**；B5 配置越界被夹到地板值 10 条 / 1MiB，开关关掉时 30 笔并发（含 3 笔 300KB）全部落地、两个闸一分未动 |
 | `live_acl` | 需开鉴权的集群 | S1~S8：签名被 broker 接受（建 topic / 发送 / 心跳+长轮询+位点三条 RPC 全程带签名）、不带凭据与 secretKey 写错都回 `NO_PERMISSION(16)`、拉模式签名链路。前置是 broker.conf 开 `authenticationEnabled=true` + `LocalAuthenticationMetadataProvider` + `initAuthenticationUser`（本机默认集群关着，跑不了这一项） |
 | `live_compression_matrix` | 矩阵一端 | 与 Java/Python/C++/.NET 探针双向收发压缩消息，由 `../scripts/compression_matrix.sh` 调度 |
 
 上表是明文；**同一批 `live_*` 在 `ROCKETMQ_TLS_ENABLE=1` 下也整套跑过**（2026-09-22 本机 5.5.1
-集群：producer 55、push consumer 95、pull 43、lite-pull 48、mq_client 84、admin 92+1 skip，
-合计 **417 项断言 0 失败**），修掉的那个只有 TLS 才有的静默故障见「与 Java 的差异」。
+集群：producer 62、push consumer 95、pull 43、lite-pull 48、mq_client 84、admin 92+1 skip，
+合计 **424 项断言 0 失败**），修掉的那个只有 TLS 才有的静默故障见「与 Java 的差异」。
 
 ## 目录结构
 
@@ -262,16 +262,43 @@ rust/
   一次请求都不会发出。归还固定在链终点、**先还字节再还条数**（Java `BackpressureSendCallBack`
   → `semaphoreProcessor:599-610`），失败路径靠 `SendPermits` 的 `Drop` 兜住，整条重试链只占
   **一份**（不是每次尝试一份）。公平性是这套闸的全部意义：`FairSemaphore` 只放行队首，
-  非公平的话后到的持续流量能让先到的请求无限插队。离线 22 项（`client::backpressure` 12 +
-  `send_retry_tests` 10），真机 `live_backpressure` 29 项。
+  非公平的话后到的持续流量能让先到的请求无限插队。离线 39 项（`client::backpressure` 12 +
+  `send_retry_tests` 27），真机 `live_backpressure` 30 项。
+- **异步发送是真内核，不再是「同步发送包一层回调」**（`send_async` → `AsyncSenderExecutor` →
+  `run_async_send` → `async_send_inner` → `send_kernel_async` → `AsyncSendChain` →
+  `complete_async`，对齐 Java `DefaultMQProducerImpl:541-576` + `sendKernelImpl` ASYNC 分支 +
+  `onExceptionImpl`）：调用方**立即返回**，任务投进**有界**队列（`async_sender_queue_capacity`
+  默认 50000，同 Java 写死的 `LinkedBlockingQueue(50000)`；并发额度 =
+  `available_parallelism()`，同 Java `ThreadPoolExecutor(cores, cores)`），队满 ≡ Java
+  `submit` 抛 `RejectedExecutionException` → 同步把 `executor rejected` 抛回调用方、**不走回调**；
+  出队之后才算真实耗时，预算被排队吃掉直接回调 `DEFAULT ASYNC send call timeout`；请求**只建一次**，
+  重试时复用同一个请求、按 Java 的做法给它换一个新 opaque；重试上限是
+  `retry_times_when_send_async_failed`（默认 2，Java `DefaultMQProducer:140`），超时预算是**所有
+  尝试共享**的剩余时间；broker 真返回的业务码**不进**重试链（与 Java/Python 一致，异步忽略
+  `retry_response_codes`），只有传输层失败/超时才换 broker；终点固定是 `complete_async`：
+  after 钩子 → 归还许可 → 用户回调**恰好一次**。`shutdown()` 按 Java 的顺序先 unregister 再
+  **排空**发送队列（`shutdown()` 后不再接收新任务，但已入队的每笔仍会跑完并回调）。
+- **上面那条「池子」为什么不是 `tokio::sync::Mutex<Receiver>` 那种一眼省事的写法**（实测过才写的）：
+  互斥锁轮询队列看着等价，实际是**一次派发一份并发额度** —— 拿到锁的任务在被释放锁的那个工作线程
+  本地队列上醒来，只要有一个发送钩子同步阻塞（`std::thread::sleep`）， baton 就落在那个睡着的
+  线程上，`cores` 个消费者会塌成「每个钩子睡眠周期只派发一笔」。真机实测（`live_backpressure`
+  B3，钩子睡 2.5s、队列里躺着 10 笔待派发）：池子**每 2505ms 才派发一笔**，后面的笔只能看着自己
+  的预算被排队吃光 —— B3 早期正是这么红的。现在的形状是**一个永不阻塞的派发任务 +
+  `Arc<Semaphore>`（`available_parallelism()` 份）+ 每笔任务 `spawn` 一次并持有一份许可**，
+  派发方不持锁、也不等任何 worker 醒，因此阻塞钩子只占住自己那份额度。离线守卫
+  `send_retry_tests::resize_wakes_the_parked_sender_while_the_pool_is_saturated`
+  （32 工作线程运行时，去掉这个设计会红）。
 - **上面那道闸有两处与 Java 结构性不同，都是刻意的**：① **等许可发生在 `tokio::spawn` 出去的
   发送任务里，不在调用方线程上**。Java/Python/C++/.NET 都在调用方线程 park 住 `tryAcquire`，
   所以背压打满时它们的「异步」会退化成「等满 timeout 再报错」；Rust 照做会**死锁**而不是变慢
   —— 生产者常常跑在唯一的 tokio 工作线程上（`#[tokio::test]` 的单线程运行时、
   `RuntimeFlavor::CurrentThread`），park 住那个线程就等于把**正要归还许可**的完成回调永远挡在
   队列外。预算仍从调用时刻起算，所以「多久过不了闸就报错」与 Java 一致；代价是调用方不再被闸门
-  堵住，Java 那句「异步队列满时有背压就地跑完」（`:675-681`）在这里没有落点 —— 本实现还没有
-  有界发送队列，那一支跟真实异步内核一起在 #50 里补。② **改容量是在同一个信号量对象上平移
+  堵住，于是 Java 那句「异步队列满时有背压就地跑完」（`:675-681`）在这里变成**派发到队列之外**
+  —— 那边扣许可发生在入队**之前**，不跑完就要白等超时归还；这边扣许可在出队之后，队满时一份许可
+  都没扣，所以既不必阻塞调用方也不会漏容量（离线守卫
+  `queue_full_with_backpressure_dispatches_off_the_queue`，队满且没开背压时对照
+  `queue_full_rejects_the_caller_without_sending`）。② **改容量是在同一个信号量对象上平移
   总量**，不像 Java `DefaultMQProducer:1383-1391` 那样 `new Semaphore(num - acquired)` 换掉整个
   对象，因此既不需要那层 `ReadWriteCASLock`，也不会把正阻塞在旧对象上的等待者丢下（Java 那些
   等待者只能等到自己超时）。可观察结果一致：在途份额原样保留、空闲许可 = 新总量 − 在途。

@@ -1562,6 +1562,40 @@ impl MQClientInstance {
         self.inner.remoting_client.invoke_oneway(addr, &mut request).await
     }
 
+    /// Python `send_message_async`（对应 Java `MQClientAPIImpl#sendMessageAsync`）：
+    /// 异步发出一个**已构建好**的请求，响应解析也放在这一层。
+    ///
+    /// 请求由调用方持有并跨重试复用（Java `onExceptionImpl:728-730` 只换
+    /// `opaque`），所以这里收的是 owned 的 `RemotingCommand` 而不是 `&mut`。
+    ///
+    /// `on_complete` 恰好回调一次（由 remoting 层保证）。`msg` 只被
+    /// [`parse_send_response`](Self::parse_send_response) 用来取 UNIQ_KEY，
+    /// body 已经在 request 里编好了，调用方可以传一份**去掉 body** 的副本。
+    ///
+    /// 与 Java 的差别：Java 的 `invokeAsync` 在「地址解析不出来」「通道已关」时会
+    /// **就地抛**（外层 catch 走 `needRetry=true`），Rust 的
+    /// [`RemotingClient::invoke_async`] 把这类失败一并交给回调（都是
+    /// [`Error::Connect`] / [`Error::Timeout`]），所以调用方没有"就地抛"这条分支。
+    pub(crate) fn send_message_async(
+        &self,
+        addr: &str,
+        request: RemotingCommand,
+        msg: Arc<Message>,
+        mq: Arc<MessageQueue>,
+        timeout_millis: i64,
+        on_complete: Box<dyn FnOnce(Result<SendResult>) + Send + 'static>,
+    ) {
+        self.inner.remoting_client.invoke_async(
+            addr,
+            request,
+            Box::new(move |response| match response {
+                Ok(response) => on_complete(Self::parse_send_response(&response, &msg, &mq)),
+                Err(e) => on_complete(Err(e)),
+            }),
+            Some(timeout_millis),
+        );
+    }
+
     /// Python `_build_send_request`（V2 短字段头，`sendSmartMsg` 恒 true）。
     ///
     /// 对齐 Java `DefaultMQProducerImpl#sendKernelImpl:932-935`：非批量消息在
