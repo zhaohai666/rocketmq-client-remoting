@@ -2051,11 +2051,13 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
         Ok(v) => v,
         Err(e) => return ck.abort("C9 build consumer", &e),
     };
-    // 队列内缓冲 1 条就流控 —— 消费慢于拉取时才会真的命中
+    // 队列内缓冲 1 条就流控 —— 消费慢于拉取时才会真的命中。
+    // 另外两道闸门这里要"关掉"，但写法不能是 0：Java checkConfig（:1099-1209）把
+    // 它们的合法下界都定在 1，`start()` 会直接拒（见 S5/C13），所以用各自的上界。
     c.update_config(|x| {
         x.pull_threshold_for_queue = 1;
-        x.pull_threshold_size_for_queue = 0;
-        x.consume_concurrently_max_span = 0;
+        x.pull_threshold_size_for_queue = 1024;
+        x.consume_concurrently_max_span = 65535;
     });
     if let Err(e) = c.start().await {
         return ck.abort("C9 start", &format!("{e}"));

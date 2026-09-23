@@ -269,6 +269,78 @@ std::vector<std::string> DefaultMQPushConsumer::subscribedTopics() const {
     return out;
 }
 
+// ---------------------------------------------------------------- 配置数值闸门
+// 对应 Java DefaultMQPushConsumerImpl#checkConfig 的数值段（:1099-1209）。
+//
+// 为什么放在 start() 而不是各 setter 里：Java 就是这样——setter 是裸赋值，只有
+// checkConfig 统一在启动时把关（DefaultMQPushConsumerImpl:1025 起）。 setter 里
+// clamp（setConsumeMessageBatchMaxSize 的 max(1,n)）对应的是 Java 运行期的
+// Math.max 守卫，两道各有分工：setter 保证"拿到 0 也不会除零/空转"，闸门保证
+// "写 0 的人当场收到错误"。
+//
+// 文案里 Java 拼的 FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL) 一律不带上
+// （本仓库所有客户端错误的口径）。
+void DefaultMQPushConsumer::checkConfigRanges() const {
+    // consumeThreadMin
+    if (consumeThreadMin_ < 1 || consumeThreadMin_ > 1000) {
+        throw MQClientException("consumeThreadMin Out of range [1, 1000]");
+    }
+    // consumeThreadMax
+    if (consumeThreadMax_ < 1 || consumeThreadMax_ > 1000) {
+        throw MQClientException("consumeThreadMax Out of range [1, 1000]");
+    }
+    // consumeThreadMin can't be larger than consumeThreadMax
+    if (consumeThreadMin_ > consumeThreadMax_) {
+        throw MQClientException("consumeThreadMin (" + std::to_string(consumeThreadMin_)
+                                + ") is larger than consumeThreadMax ("
+                                + std::to_string(consumeThreadMax_) + ")");
+    }
+    // consumeConcurrentlyMaxSpan
+    if (consumeConcurrentlyMaxSpan_ < 1 || consumeConcurrentlyMaxSpan_ > 65535) {
+        throw MQClientException("consumeConcurrentlyMaxSpan Out of range [1, 65535]");
+    }
+    // pullThresholdForQueue
+    if (pullThresholdForQueue_ < 1 || pullThresholdForQueue_ > 65535) {
+        throw MQClientException("pullThresholdForQueue Out of range [1, 65535]");
+    }
+    // pullThresholdForTopic：-1 是 Java 的"未设置，用队列级阈值"哨兵，不在区间内也不算错
+    if (pullThresholdForTopic_ != -1
+        && (pullThresholdForTopic_ < 1 || pullThresholdForTopic_ > 6553500)) {
+        throw MQClientException("pullThresholdForTopic Out of range [1, 6553500]");
+    }
+    // pullThresholdSizeForQueue
+    if (pullThresholdSizeForQueue_ < 1 || pullThresholdSizeForQueue_ > 1024) {
+        throw MQClientException("pullThresholdSizeForQueue Out of range [1, 1024]");
+    }
+    // pullThresholdSizeForTopic：同样只有 -1 是哨兵
+    if (pullThresholdSizeForTopic_ != -1
+        && (pullThresholdSizeForTopic_ < 1 || pullThresholdSizeForTopic_ > 102400)) {
+        throw MQClientException("pullThresholdSizeForTopic Out of range [1, 102400]");
+    }
+    // pullInterval（下界是 0，与其它闸门不同）
+    if (pullIntervalMillis_ < 0 || pullIntervalMillis_ > 65535) {
+        throw MQClientException("pullInterval Out of range [0, 65535]");
+    }
+    // consumeMessageBatchMaxSize
+    if (consumeMessageBatchMaxSize_ < 1 || consumeMessageBatchMaxSize_ > 1024) {
+        throw MQClientException("consumeMessageBatchMaxSize Out of range [1, 1024]");
+    }
+    // pullBatchSize
+    if (pullBatchSize_ < 1 || pullBatchSize_ > 1024) {
+        throw MQClientException("pullBatchSize Out of range [1, 1024]");
+    }
+    // popInvisibleTime
+    if (popInvisibleTime_ < kMinPopInvisibleTime || popInvisibleTime_ > kMaxPopInvisibleTime) {
+        throw MQClientException("popInvisibleTime Out of range ["
+                                + std::to_string(kMinPopInvisibleTime) + ", "
+                                + std::to_string(kMaxPopInvisibleTime) + "]");
+    }
+    // popBatchNums（Java 写的就是 <= 0，不是 < 1）
+    if (popBatchNums_ <= 0 || popBatchNums_ > 32) {
+        throw MQClientException("popBatchNums Out of range [1, 32]");
+    }
+}
+
 // ---------------------------------------------------------------- 生命周期
 void DefaultMQPushConsumer::start() {
     {
@@ -306,6 +378,9 @@ void DefaultMQPushConsumer::start() {
         if (messageListener_ == nullptr) {
             throw MQClientException("message listener is not set");
         }
+        // 对应 Java checkConfig 的数值段（:1099-1209）：必须排在所有 null 检查之后、
+        // 建 MQClientInstance 之前 —— 起了后台线程再抛错就泄漏线程了。
+        checkConfigRanges();
         // Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
         // `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，Java 的 MQClientManager
         // 因此让同进程的广播消费者复用同一份实例），再由 `ClientConfig#buildMQClientId`

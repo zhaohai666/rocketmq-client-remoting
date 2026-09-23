@@ -1,6 +1,6 @@
 //! 拉取前流控（Java `ProcessQueue` 五个阈值）真机验证。
 //!
-//! 与 `python/verify_flow_control_live.py`（S0..S4）、`cpp/examples/live_flow_control.cpp`、
+//! 与 `python/verify_flow_control_live.py`（S0..S5）、`cpp/examples/live_flow_control.cpp`、
 //! `dotnet/examples/RocketMQ.Examples/LiveFlowControl.cs` 同题、逐条对应。
 //!
 //! 离线单测（`src/client/consumer.rs` 的 `flow_control_hits_each_threshold`）锁的是**判据
@@ -18,6 +18,9 @@
 //! - S2 位点跨度闸门：条数/字节都关掉，只剩 `consumeConcurrentlyMaxSpan=2`。
 //! - S3 topic 级条数闸门：队列级三条全关掉，只剩 `pullThresholdForTopic=4` —— 必须跨队列累计才可能命中。
 //! - S4 命中之后恢复：同一组再来一批大消息，闸门仍会命中且新消息照单全收。
+//! - S5 启动期数值闸门（Java `checkConfig` :1099-1209）：区间**边界**配置在真集群上能
+//!   启动并收全消息；越界配置本地被拒（文案逐字对 Java）且**没打到 broker** ——
+//!   broker 侧查不到那个组，说明校验排在注册之前，没留下僵尸 clientId。
 //!
 //! ⚠ 大消息必须是**不可压缩**的伪随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
 //!   的 payload 会被压到几百字节，broker 落盘的 `storeSize` 跟着变几百字节 —— "size 闸门
@@ -39,7 +42,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rocketmq_client_remoting::client::consumer::{ConsumerConfig, DefaultMQPushConsumer};
+use rocketmq_client_remoting::client::consumer::{
+    ConsumerConfig, DefaultMQPushConsumer, MAX_POP_INVISIBLE_TIME, MIN_POP_INVISIBLE_TIME,
+};
 use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::result::{
@@ -48,11 +53,21 @@ use rocketmq_client_remoting::client::result::{
 use rocketmq_client_remoting::common::message::{Message, MessageExt};
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PERM};
+use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use tokio::task::JoinSet;
 
-/// 一条"远大于任何真机缓冲"的阈值，等价于把那道闸门关掉（不写 INT_MAX 以免加法溢出）。
-const GATE_OFF: i32 = 2_000_000_000;
+/// 一条"远大于任何真机缓冲"的阈值，等价于把那道闸门关掉。
+///
+/// 不能写 `INT_MAX`（加法溢出），也不能写 `0`：`0` 曾经就是"关闭"的写法，但
+/// Java `DefaultMQPushConsumerImpl.checkConfig`（:1099-1209）把
+/// `pullThresholdForQueue` / `consumeConcurrentlyMaxSpan` 的下界定在 **1**，
+/// 我们在 `start()` 里照抄了这道闸门（见 S5），于是 0 会在启动时被拒。
+/// 65535 是 Java 给这几条字段的上界，语义上仍是"实际不可能命中"。
+const GATE_OFF: i32 = 65535;
+/// 字节闸门"关闭"的写法同上：`pullThresholdSizeForQueue` 合法域 [1, 1024]（单位 MiB），
+/// 0 已非法，用 1024 MiB 表示不拦。
+const GATE_OFF_SIZE_MIB: i32 = 1024;
 /// 字节闸门配 1 = **1 MiB**（Java pullThresholdSizeForQueue 的单位是 MiB，不是字节）。
 const GATE_ONE_MIB: i32 = 1;
 const BIG: usize = 400 * 1024;
@@ -505,7 +520,7 @@ async fn run(namesrv: &str) -> Checker {
     // ---------------- S2 位点跨度闸门 ----------------
     let span_gates = Gates {
         count: Some(GATE_OFF),
-        size: Some(0),
+        size: Some(GATE_OFF_SIZE_MIB),
         span: Some(2),
         topic_count: None,
         single_consumer: true,
@@ -543,7 +558,7 @@ async fn run(namesrv: &str) -> Checker {
     // ---------------- S3 topic 级条数闸门（跨队列累计）----------------
     let topic_gates = Gates {
         count: Some(GATE_OFF),
-        size: Some(0),
+        size: Some(GATE_OFF_SIZE_MIB),
         span: Some(GATE_OFF as i64),
         topic_count: Some(4),
         single_consumer: true,
@@ -609,6 +624,159 @@ async fn run(namesrv: &str) -> Checker {
             hit,
             &format!("triggered={fc}"),
         );
+    }
+
+    // ---------------- S5 启动期数值闸门（Java checkConfig :1099-1209）----------------
+    // 离线单测（`src/client/consumer.rs` 的 `each_range_gate_*`）锁的是区间与文案；这里
+    // 补两件只有真集群能锁死的事：
+    //   1. 落在 Java 区间**边界**上的配置真能把消费者跑起来并收全消息 —— 闸门写歪最常
+    //      见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来；
+    //   2. 越界的配置**没有打到 broker**。写成"先注册再校验"会在 broker 的 ConsumerManager
+    //      里留下一堆永不心跳的僵尸 clientId，把 rebalance 用的 cidAll 撑歪（表现为队列
+    //      分配不均），而客户端日志里只有启动失败那一条。
+    let s5_topic = fx.topic_name("Boundary");
+    let s5_group = fx.group_name("s5");
+    let bad_group = fx.group_name("s5-rejected");
+    if let Err(e) = fx.create_topic(&s5_topic, 4).await {
+        ck.abort("S5 create topic", &e);
+    } else {
+        let sink5 = Sink::new(Duration::ZERO);
+        match fx.consumer(&s5_group, &s5_topic, sink5.clone()) {
+            Err(e) => ck.abort("S5 build consumer", &e),
+            Ok(c5) => {
+                // 每条闸门取端点：`pullBatchSize=1024` 这类"贴着上限=实际不拦"的写法在
+                // 生产里很常见，误拒等于把用户挡在门外（区间写成开区间的后果）。
+                c5.update_config(|x| {
+                    x.consume_thread_min = 1;
+                    x.consume_thread_max = 2;
+                    x.consume_concurrently_max_span = i64::from(GATE_OFF);
+                    x.pull_threshold_for_queue = GATE_OFF;
+                    x.pull_threshold_for_topic = -1;
+                    x.pull_threshold_size_for_queue = GATE_OFF_SIZE_MIB;
+                    x.pull_threshold_size_for_topic = -1;
+                    x.pull_interval = 0;
+                    x.consume_message_batch_max_size = 1;
+                    x.pull_batch_size = 1024;
+                    x.pop_invisible_time = MAX_POP_INVISIBLE_TIME;
+                    x.pop_batch_nums = 32;
+                });
+                if let Err(e) = c5.start().await {
+                    ck.abort("S5 boundary config must start", &format!("{e}"));
+                } else {
+                    ck.check("S5 boundary config starts", true, "is_started=true");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let small10: Vec<Vec<u8>> =
+                        (0..10).map(|i| format!("b-{i:03}").into_bytes()).collect();
+                    if let Err(e) = fx.produce(&s5_topic, small10).await {
+                        ck.abort("S5 produce", &e);
+                    }
+                    let all = poll_until(|| sink5.count() >= 10, 40).await;
+                    ck.check(
+                        "S5 every message arrives under the boundary config",
+                        all && sink5.count() == 10 && sink5.distinct() == 10,
+                        &format!("count={} distinct={}", sink5.count(), sink5.distinct()),
+                    );
+
+                    // 越界配置：本地拒 + 不回滚 started 标志（失败的 start 必须留干净对象）
+                    type GateBreaker = fn(&mut ConsumerConfig);
+                    let illegal: Vec<(GateBreaker, &str)> = vec![
+                        (
+                            |c| c.pull_threshold_size_for_queue = 0,
+                            "MQClientException: pullThresholdSizeForQueue Out of range [1, 1024]",
+                        ),
+                        (
+                            |c| c.pull_batch_size = 1025,
+                            "MQClientException: pullBatchSize Out of range [1, 1024]",
+                        ),
+                        (
+                            |c| c.pop_invisible_time = MIN_POP_INVISIBLE_TIME - 1,
+                            "MQClientException: popInvisibleTime Out of range [5000, 300000]",
+                        ),
+                        (
+                            |c| c.pop_batch_nums = 33,
+                            "MQClientException: popBatchNums Out of range [1, 32]",
+                        ),
+                        (
+                            |c| {
+                                c.consume_thread_min = 8;
+                                c.consume_thread_max = 4;
+                            },
+                            "MQClientException: consumeThreadMin (8) is larger than consumeThreadMax (4)",
+                        ),
+                    ];
+                    for (break_it, want) in illegal {
+                        let c6 = match fx.consumer(&bad_group, &s5_topic, Sink::new(Duration::ZERO))
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                ck.abort("S5 build rejected consumer", &e);
+                                continue;
+                            }
+                        };
+                        c6.update_config(break_it);
+                        match c6.start().await {
+                            Err(e) => ck.check(
+                                "S5 out-of-range config is rejected",
+                                e.to_string() == want,
+                                &format!("want={want} actual={e}"),
+                            ),
+                            Ok(()) => {
+                                c6.shutdown();
+                                ck.abort("S5 out-of-range config is rejected", "start() succeeded");
+                            }
+                        }
+                        ck.check(
+                            "S5 a rejected start leaves nothing half-started",
+                            !c6.is_started(),
+                            "is_started() must be false after a rejected start",
+                        );
+                    }
+
+                    // broker 侧的反证
+                    match fx.admin.get_topic_route_data(&s5_topic).await {
+                        None => ck.abort("S5 route of the boundary topic", "no route from namesrv"),
+                        Some(route) => match broker_of(&route) {
+                            Err(e) => ck.abort("S5 broker address", &e),
+                            Ok(addr) => {
+                                // 从未成功注册的组：broker 的 GET_CONSUMER_LIST_BY_GROUP 回的
+                                // 不是空列表而是 "no consumer for this group"（code=1）。两种
+                                // 形态都算"查无此组"，但**绝不能**带任何 clientId。
+                                let bad = fx
+                                    .admin
+                                    .get_consumer_list_by_group(&bad_group, 5000, Some(&addr))
+                                    .await;
+                                let (absent, detail) = match bad {
+                                    Ok(body) => (
+                                        body.consumer_id_list.is_empty(),
+                                        format!("ids={:?}", body.consumer_id_list),
+                                    ),
+                                    // 只有 broker 亲口回的错才算"查无此组"。连不上/超时必须
+                                    // 判失败，否则反证退化成"什么都没查到"的空话。
+                                    Err(e @ Error::Broker { .. }) => {
+                                        (true, format!("broker 拒绝: {e}"))
+                                    }
+                                    Err(e) => (false, format!("探测请求失败: {e}")),
+                                };
+                                ck.check("S5 broker never heard of the rejected group", absent, &detail);
+                                let ok_ids = fx
+                                    .admin
+                                    .get_consumer_list_by_group(&s5_group, 5000, Some(&addr))
+                                    .await
+                                    .map(|b| b.consumer_id_list)
+                                    .unwrap_or_default();
+                                ck.check(
+                                    "S5 broker knows the boundary-value consumer",
+                                    ok_ids.len() == 1,
+                                    &format!("ids={ok_ids:?}"),
+                                );
+                            }
+                        },
+                    }
+                }
+                // 反证必须发生在 shutdown 之前：早退会撤掉 broker 侧那条注册
+                c5.shutdown();
+            }
+        }
     }
 
     fx.shutdown();

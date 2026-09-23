@@ -209,6 +209,9 @@ public:
     void setPullBatchSize(int32_t n) { pullBatchSize_ = n; }
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }
     void setConsumeMessageBatchMaxSize(int32_t n) { consumeMessageBatchMaxSize_ = std::max(1, n); }
+    // 对应 Java DefaultMQPushConsumer.getConsumeMessageBatchMaxSize（分发层按它切批）。
+    // setter 的 max(1,·) 与 Java 运行期的 Math.max(1, ...) 同侧，闸门另有分工（见 checkConfigRanges）。
+    int32_t consumeMessageBatchMaxSize() const { return consumeMessageBatchMaxSize_; }
     void setPullTimeoutMillis(int32_t t) { pullTimeoutMillis_ = t; }
     void setPullSuspendTimeoutMillis(int32_t t) { pullSuspendTimeoutMillis_ = t; }
     void setSuspendCurrentQueueTimeMillis(int32_t t) { suspendCurrentQueueTimeMillis_ = t; }
@@ -254,8 +257,14 @@ public:
     void setPopTimeoutMillis(int32_t t) { popTimeoutMillis_ = t; }
     int32_t popTimeoutMillis() const { return popTimeoutMillis_; }
 
-    // 以下两个是**纯逻辑**（不发请求），做成 public 是为了离线可测——popCkTarget 是 POP
+    // 以下三个是**纯逻辑**（不发请求），做成 public 是为了离线可测——popCkTarget 是 POP
     // 最容易错的一段（retry topic 还原），必须能单测而不是只能靠真机。
+    // 对应 Java DefaultMQPushConsumerImpl#checkConfig 的数值段（:1099-1209）：十三道
+    // 区间/大小闸门，**顺序、区间与文案逐条照抄 Java**（Java 每条拼
+    // FAQUrl.suggestTodo(...)，本仓库按约定不带后缀）。start() 在所有 null 检查之后、
+    // 建 MQClientInstance 之前调用它；做成 public 同 popCkTarget：正向用例（边界值合法）
+    // 离线没法走 start()，那会真去连 name server。
+    void checkConfigRanges() const;
     // 从 POP_CK 还原 ack 目标；CK 缺失或段数不足返回 nullopt（放弃 ack，交给 broker 复活）。
     std::optional<PopCkTarget> popCkTarget(const MessageExt& msg);
     // Java ConsumeRequest.isPopTimeout：解析不出 popTime/invisibleTime 时按超时处理

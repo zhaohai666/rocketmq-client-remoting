@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，561 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，581 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -93,7 +93,7 @@ dotnet $PROG validators-live 127.0.0.1:9876  # 名字校验（39 PASS / 0 FAIL�
 dotnet $PROG recall 127.0.0.1:9876        # 定时消息撤回（16 PASS / 0 FAIL，脚本负责开关并还原 recallMessageEnable）
 dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS / 0 FAIL）
 dotnet $PROG send-header 127.0.0.1:9876   # 发送头 c/d/n 三字段（14 PASS / 0 FAIL）
-dotnet $PROG flow-control 127.0.0.1:9876  # 拉取前流控五个阈值（14 PASS / 0 FAIL）
+dotnet $PROG flow-control 127.0.0.1:9876  # 拉取前流控五个阈值 + 启动期数值闸门（29 PASS / 0 FAIL）
 dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
@@ -188,13 +188,13 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | unit-config | 20 PASS / 0 FAIL（unitName/unitMode/stream 四语言同场景：U1 `unitName` 拼进 clientId 且照常发送 → U2 stream 消费者 `@unitA@STREAM` 收尾，**broker 的 `examineConsumerConnectionInfo` 记录的 clientId 也带同一后缀**（唯一能证明「上线的就是拼好的那个」的观测点）→ U3 `unitMode=true` 自动建出的 topic `topicSysFlag` 带 UNIT 位、对照组不带 → U4 心跳 `ConsumerData.unitMode` 让 `%RETRY%` 带 UNIT_SUB 位 → U5 lite 消费者默认带 `@STREAM`、显式开 stream 的生产者同样，3 发 3 收） |
 
 | send-header | 14 PASS / 0 FAIL（发送头 `c`/`d`/`n` 三字段真机，与 Python `verify_send_header_live.py`、C++ `rmq_live_send_header`、Rust `live_send_header` 的 H0~H5 一一对应：H0 先量出 `TBW102` 的 read/write 队列数（本机 8/8）当算术基准 → H1 什么都不配、发到全新 topic，broker 按 `min(d=4, TBW102.writeQueueNums)` 建出 **4** 条队列（`TopicConfigManager.java:289`）→ H2 `DefaultTopicQueueNums=2` 真的让 broker 只建 **2** 条（修之前写死 4，这一条必然红）→ H3 `CreateTopicKey` 指向带 `PERM_INHERIT` 的 3 队列模板 topic 时，新 topic 继承**模板**的 **3** 条而不是 TBW102 的 8 条（`isInherited` + `min` 两道门）→ H4 补上三字段后五种入口（`Send` / 定点 `Send(msg, mq)` / `SendOneway` / `SendBatch` 320 / `SendAsync`）逐条落地、7 条一条不差 → H5 落点 broker 名与路由选中那台一致。⚠ `n` 在经典 broker 的发送链路里**没有读者**（5.5.1 源码 grep 过），它上线的存在由离线抓帧单测取证，这里不假装能观测到） |
-| flow-control | 14 PASS / 0 FAIL（拉取前流控五个阈值真机闭环 S0~S4，与 Python `verify_flow_control_live.py`、C++ `rmq_live_flow_control`、Rust `live_flow_control` 逐条同构。离线 `FlowControlTests` 锁判据本身；真机锁离线锁不住的两件事：**闸门确实会命中**（单位错一位、阈值读错一个字段，离线拿预置缓冲照样绿）与**命中后一条不丢**（写成"命中就丢批/退出循环"在十几秒窗口里看不出来）。实测：S0 默认闸门 + 快消费 ⇒ `triggered=0`、12 条全到；S1 只留队列级字节闸门 ⇒ 命中 11 次、8 条 400KB 不丢不重；S2 只留跨度闸门（`MaxSpan=2`）⇒ 命中 2 次、14 条仍全部消费；S3 只留 topic 级条数闸门 ⇒ 单队列到不了阈值、必须跨队列累计（命中 112 次）且每条队列都消费到底；S4 复用 S1 的组与 topic ⇒ 位点从 broker 末尾续上、闸门不是命中一次就失效（仍命中 7 次）、6 条不重不丢。⚠ 命中**次数**随真机投递/消费节奏浮动（S3 两轮分别报 100 与 112），判据只要求 `triggered > 0`。⚠ 两条夹具坑：大消息必须**不可压缩**（否则 broker 落盘 `StoreSize` 只有几百字节，size 闸门"永不命中"其实是夹具问题）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列每条才 800KB，够不到队列级那道 1MiB）） |
+| flow-control | 29 PASS / 0 FAIL（拉取前流控五个阈值真机闭环 S0~S5，与 Python `verify_flow_control_live.py`、C++ `rmq_live_flow_control`、Rust `live_flow_control` 逐条同构。离线 `FlowControlTests` 锁判据本身；真机锁离线锁不住的两件事：**闸门确实会命中**（单位错一位、阈值读错一个字段，离线拿预置缓冲照样绿）与**命中后一条不丢**（写成"命中就丢批/退出循环"在十几秒窗口里看不出来）。实测：S0 默认闸门 + 快消费 ⇒ `triggered=0`、12 条全到；S1 只留队列级字节闸门 ⇒ 命中 11 次、8 条 400KB 不丢不重；S2 只留跨度闸门（`MaxSpan=2`）⇒ 命中 2 次、14 条仍全部消费；S3 只留 topic 级条数闸门 ⇒ 单队列到不了阈值、必须跨队列累计（命中 112 次）且每条队列都消费到底；S4 复用 S1 的组与 topic ⇒ 位点从 broker 末尾续上、闸门不是命中一次就失效（仍命中 7 次）、6 条不重不丢；S5 启动期数值闸门（Java `checkConfig` 数值段 `:1099-1209`）⇒ 贴着区间端点的配置真能启动并收全 10 条（闸门写坏最常见的方式是"比 Java 还严"，把合法配置也拒了），5 条越界配置逐字按 Java 文案在本地被拒且 `IsStarted` 仍为 false，broker 侧用**裸** `GetConsumerListByGroup` 反查：被拒的组查不到（本机 broker 回 `code=1 no consumer for this group`，空列表与该异常都算查无此组，其它异常 FAIL），边界值那个组恰好查得到 1 个 clientId——写成"先注册再校验"就会留下一堆永不心跳的僵尸 clientId 把 rebalance 用的 `cidAll` 撑歪。⚠ 有了 S5，"关掉某道闸门"的写法必须是 Java 的**上界**（`Huge=65535` / `HugeSizeMiB=1024`）而不是 `0`：`0` 现在正是启动期会拒的配置。⚠ 命中**次数**随真机投递/消费节奏浮动（S3 两轮分别报 100 与 112），判据只要求 `triggered > 0`。⚠ 两条夹具坑：大消息必须**不可压缩**（否则 broker 落盘 `StoreSize` 只有几百字节，size 闸门"永不命中"其实是夹具问题）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列每条才 800KB，够不到队列级那道 1MiB）） |
 | sql92 | 20 PASS / 0 FAIL（SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 四语言同场景：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `Start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `Start()`）。协议形状与四条分支语义另有离线单测 10 项（`CheckClientConfigTests`，进程内 mock broker） |
 
 | unreg-live | 10 PASS / 0 FAIL（生产者退出注销 `UNREGISTER_CLIENT`(35) 真机，与 Python `verify_producer_unregister_live.py`、C++ `rmq_live_producer_unregister`、Rust `live_producer` 的 P11 同一套场景）：U1 发送成功 → U2 心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId（注册确实发生过，"消失"才有意义，组靠心跳上线所以要轮询等）→ U2b 对照组注册可见（204 这条判据本身有效）→ U3 `Shutdown()` 给每台已知 broker 各发一发 35、头是 `clientID`+`producerGroup` 且 **`consumerGroup` 整个字段不上线**（Java 传 null；broker `ClientManageProcessor:228/237` 判的是 `group != null`）、addr 确实是路由里那台、且排在业务发送之后（`last_send=4 first_unreg=6`）→ U5 紧接着查 204 这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 判据强度：.NET 里每个生产者各持一份 `MQClientInstance`、各一条连接，退出时连接也关掉，单看 U5 分不出是 35 还是断连的功劳，所以这里必须由 `IRpcHook` 抓帧（钩子跑在 `Encode()` **之前**，头此时还挂在 `CustomHeader` 上）直接证明线上走了这一发；行为级的判别式证明在 Rust 的 P11（Rust 按 clientId 复用实例，先退的那个连接还活着）。⚠ 「每一发 35 都回 SUCCESS」在本移植**不可观测**——传输层有意不调 `IRpcHook#DoAfterResponse`（见 `Remoting/RemotingClient.cs`），U5 的 broker 侧效果是它的替代判据。头形状（含**纯空白组名**同空串处理，整个字段不上线）、扇出**含 slave**（`GetAllBrokerAddrs` vs 心跳用的 master 优先 `GetRouteOfAllBrokers`）、单台失败被吞且剩下的照旧注销、超时与 Java 的 `getMqClientApiTimeout()`=**3000ms** 同口径，共 9 项由 `ProducerUnregisterTests` 离线锁死（自带一个同一 brokerName 下挂 master(0)+slave(1) 的假集群——本机真集群只有一台 master，这条判据在真机上不可达） |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **570 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **581 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`
@@ -204,6 +204,17 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 那道开关——Rust 曾这么错过：离线全绿，真机上那道闸门静默失效）、判定顺序条数→字节→跨度→
 topic 条数→topic 字节、**命中一次只记一格** `FlowControlTriggered`。命中原因串按 Java 的口径
 用 `F1` + `MB` 后缀（`size=1.2MB`），单测把文案也锁死，因为运维只看得到这一行。
+`ConsumerCheckConfigTests`（11 项）锁住启动期数值闸门（Java
+`DefaultMQPushConsumerImpl#checkConfig` 数值段 `:1099-1209`）：一张与 Python/C++/Rust 同构的
+`Gates` 表把 12 条区间的**两端各测一次**（越界各拒一次、放行各一次，文案逐字对 Java 只去
+`FAQUrl` 尾巴）、`pullThresholdForTopic`/`pullThresholdSizeForTopic` 的 `-1` 关闭哨兵（其余闸门
+没有这层豁免，`-1` 照拒）、`pullInterval` 的**下界是 0**、`consumeThreadMin > consumeThreadMax`
+**严格大于**（相等合法、消息带两个数值）、`popBatchNums` 跟随 Java 字面 `<= 0`、多条同时越界时
+**按 Java 顺序**报第一条，以及 `Start()` 在建连之前就把坏配置拒掉且 `IsStarted` 仍为 false。
+⚠ 三条闸门（`consumeThreadMin/Max`、`ConsumeMessageBatchMaxSize`）的下界从公开 API **走不到**：
+setter 的 `Math.Max(1, n)` 会把 0 抬成 1，这是本移植与 Java 的一处已知差异，单测锁的是这个兜底
+本身（而不是假装下界可测）。Java `:1058` 的 `consumeTimestamp` 格式校验在这里是 no-op——本移植
+没有可配的 `ConsumeTimestamp` 属性，属"少一个可配项"而非漏校验。
 `PullExpiredTests`（12 项）锁住
 拉取循环停摆自愈的判据与收尾：阈值 120000ms 与**严格大于**边界（用注入时钟调
 `PullStalledForTest(key, now)`，-120000 不算、-120001 才算——等真 120s 分不清走的哪一支）、

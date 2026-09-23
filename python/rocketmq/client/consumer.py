@@ -1128,6 +1128,69 @@ class DefaultMQPushConsumer:
             return topic
         return NamespaceUtil.wrap_namespace(self.namespace, topic)
 
+    # ---------------- 配置数值闸门 ----------------
+    def _check_config_ranges(self) -> None:
+        """对应 Java ``DefaultMQPushConsumerImpl#checkConfig`` 的数值段（:1099-1209）。
+
+        逐条照抄 Java 的**顺序、区间和文案**（Java 每条都拼
+        ``FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL)``，本仓库按约定不带后缀）。
+        比较一律是 ``< lo || > hi`` 严格不等 —— ``popBatchNums`` 在 Java 写的是 ``<= 0``，
+        对整数等价于 ``< 1``，这里跟随 Java 的字面写法。
+
+        为什么要在 ``start()`` 拦：这些值直接决定缓冲水位与线程池规模。写成 0 或
+        ``2**31-1`` 时**没有一道闸门**的话，要么每轮拉取都被 ``threshold <= 0`` 判成
+        积压而永久停拉（消费端静默收不到消息），要么整数溢出把 drop/流控判断整个绕开。
+        到 broker 侧再报错已经晚了几拍，且错误信息只到日志里。
+
+        注意：``pullThresholdForTopic`` / ``pullThresholdSizeForTopic`` 的 ``-1`` 是
+        Java 的"未设置，用 queue 级阈值"哨兵，**不**在区间内也**不**报错。
+        """
+        # consumeThreadMin
+        if self.consume_thread_min < 1 or self.consume_thread_min > 1000:
+            raise MQClientException("consumeThreadMin Out of range [1, 1000]")
+        # consumeThreadMax
+        if self.consume_thread_max < 1 or self.consume_thread_max > 1000:
+            raise MQClientException("consumeThreadMax Out of range [1, 1000]")
+        # consumeThreadMin can't be larger than consumeThreadMax
+        if self.consume_thread_min > self.consume_thread_max:
+            raise MQClientException(
+                "consumeThreadMin (%d) is larger than consumeThreadMax (%d)"
+                % (self.consume_thread_min, self.consume_thread_max))
+        # consumeConcurrentlyMaxSpan
+        if self.consume_concurrently_max_span < 1 or self.consume_concurrently_max_span > 65535:
+            raise MQClientException("consumeConcurrentlyMaxSpan Out of range [1, 65535]")
+        # pullThresholdForQueue
+        if self.pull_threshold_for_queue < 1 or self.pull_threshold_for_queue > 65535:
+            raise MQClientException("pullThresholdForQueue Out of range [1, 65535]")
+        # pullThresholdForTopic
+        if self.pull_threshold_for_topic != -1:
+            if self.pull_threshold_for_topic < 1 or self.pull_threshold_for_topic > 6553500:
+                raise MQClientException("pullThresholdForTopic Out of range [1, 6553500]")
+        # pullThresholdSizeForQueue
+        if self.pull_threshold_size_for_queue < 1 or self.pull_threshold_size_for_queue > 1024:
+            raise MQClientException("pullThresholdSizeForQueue Out of range [1, 1024]")
+        # pullThresholdSizeForTopic
+        if self.pull_threshold_size_for_topic != -1:
+            if self.pull_threshold_size_for_topic < 1 or self.pull_threshold_size_for_topic > 102400:
+                raise MQClientException("pullThresholdSizeForTopic Out of range [1, 102400]")
+        # pullInterval
+        if self.pull_interval < 0 or self.pull_interval > 65535:
+            raise MQClientException("pullInterval Out of range [0, 65535]")
+        # consumeMessageBatchMaxSize
+        if self.consume_message_batch_max_size < 1 or self.consume_message_batch_max_size > 1024:
+            raise MQClientException("consumeMessageBatchMaxSize Out of range [1, 1024]")
+        # pullBatchSize
+        if self.pull_batch_size < 1 or self.pull_batch_size > 1024:
+            raise MQClientException("pullBatchSize Out of range [1, 1024]")
+        # popInvisibleTime
+        if (self.pop_invisible_time < MIN_POP_INVISIBLE_TIME
+                or self.pop_invisible_time > MAX_POP_INVISIBLE_TIME):
+            raise MQClientException("popInvisibleTime Out of range [%d, %d]"
+                                    % (MIN_POP_INVISIBLE_TIME, MAX_POP_INVISIBLE_TIME))
+        # popBatchNums
+        if self.pop_batch_nums <= 0 or self.pop_batch_nums > 32:
+            raise MQClientException("popBatchNums Out of range [1, 32]")
+
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
         with self._lock:
@@ -1160,6 +1223,10 @@ class DefaultMQPushConsumer:
             # 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1067）：策略为 None 直接拒绝启动。
             if self.allocate_strategy is None:
                 raise MQClientException("allocateMessageQueueStrategy is null")
+            # 对应 Java DefaultMQPushConsumerImpl.checkConfig 的数值段（:1099-1209）。
+            # 排在所有 null 检查之后、任何网络动作之前：坏配置必须在建 MQClientInstance
+            # 之前失败，否则起了后台线程再抛错就泄漏线程了。
+            self._check_config_ranges()
             # 对应 Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
             # `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，Java 的
             # MQClientManager 因此让同进程的广播消费者复用同一份实例），再由

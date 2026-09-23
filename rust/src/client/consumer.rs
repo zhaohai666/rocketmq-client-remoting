@@ -527,6 +527,90 @@ pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
         })
 }
 
+// ================================================================ 配置数值闸门
+
+/// 对应 Java `DefaultMQPushConsumerImpl#checkConfig` 的数值段（:1099-1209）：十三道
+/// 区间/大小闸门，**顺序、区间与文案逐条照抄 Java**（Java 每条拼
+/// `FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL)`，本仓库按约定不带后缀）。
+///
+/// 为什么要在 `start()` 拦而不是各字段自己夹：这些值直接决定缓冲水位与线程池规模，
+/// 错法的方向都是**静默**的 —— `pull_threshold_*=0` 在运行期被 `max(1,n)` 兜底成
+/// "1 条就停"，队列永久停拉而消费者不报任何错；`pop_batch_nums>32` broker 直接回
+/// `INVALID_PARAMETER`，POP 循环退化成错误重试；巨值绕开流控判断直到 OOM。Java 把
+/// 闸门放在启动期，就是要在**没建实例、没起任务**的时候一次性拒绝。
+///
+/// 两处 Java 自己的"不对称"必须照抄，否则会把合法配置拒了：
+/// * `pull_threshold_for_topic` / `pull_threshold_size_for_topic` 的 `-1` 是
+///   "未设置，用队列级阈值"的哨兵，`!= -1` 才进区间判断（`-2` 仍然要拒）；
+/// * `pull_interval` 的下界是 **0**（不是 1），`pop_batch_nums` Java 写的是 `<= 0`。
+fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
+    // consumeThreadMin
+    if cfg.consume_thread_min < 1 || cfg.consume_thread_min > 1000 {
+        bail!("consumeThreadMin Out of range [1, 1000]");
+    }
+    // consumeThreadMax
+    if cfg.consume_thread_max < 1 || cfg.consume_thread_max > 1000 {
+        bail!("consumeThreadMax Out of range [1, 1000]");
+    }
+    // consumeThreadMin can't be larger than consumeThreadMax
+    if cfg.consume_thread_min > cfg.consume_thread_max {
+        bail!(
+            "consumeThreadMin ({}) is larger than consumeThreadMax ({})",
+            cfg.consume_thread_min,
+            cfg.consume_thread_max
+        );
+    }
+    // consumeConcurrentlyMaxSpan
+    if cfg.consume_concurrently_max_span < 1 || cfg.consume_concurrently_max_span > 65535 {
+        bail!("consumeConcurrentlyMaxSpan Out of range [1, 65535]");
+    }
+    // pullThresholdForQueue
+    if cfg.pull_threshold_for_queue < 1 || cfg.pull_threshold_for_queue > 65535 {
+        bail!("pullThresholdForQueue Out of range [1, 65535]");
+    }
+    // pullThresholdForTopic
+    if cfg.pull_threshold_for_topic != -1
+        && (cfg.pull_threshold_for_topic < 1 || cfg.pull_threshold_for_topic > 6553500)
+    {
+        bail!("pullThresholdForTopic Out of range [1, 6553500]");
+    }
+    // pullThresholdSizeForQueue
+    if cfg.pull_threshold_size_for_queue < 1 || cfg.pull_threshold_size_for_queue > 1024 {
+        bail!("pullThresholdSizeForQueue Out of range [1, 1024]");
+    }
+    // pullThresholdSizeForTopic
+    if cfg.pull_threshold_size_for_topic != -1
+        && (cfg.pull_threshold_size_for_topic < 1 || cfg.pull_threshold_size_for_topic > 102400)
+    {
+        bail!("pullThresholdSizeForTopic Out of range [1, 102400]");
+    }
+    // pullInterval
+    if cfg.pull_interval < 0 || cfg.pull_interval > 65535 {
+        bail!("pullInterval Out of range [0, 65535]");
+    }
+    // consumeMessageBatchMaxSize
+    if cfg.consume_message_batch_max_size < 1 || cfg.consume_message_batch_max_size > 1024 {
+        bail!("consumeMessageBatchMaxSize Out of range [1, 1024]");
+    }
+    // pullBatchSize
+    if cfg.pull_batch_size < 1 || cfg.pull_batch_size > 1024 {
+        bail!("pullBatchSize Out of range [1, 1024]");
+    }
+    // popInvisibleTime
+    if cfg.pop_invisible_time < MIN_POP_INVISIBLE_TIME
+        || cfg.pop_invisible_time > MAX_POP_INVISIBLE_TIME
+    {
+        bail!(
+            "popInvisibleTime Out of range [{MIN_POP_INVISIBLE_TIME}, {MAX_POP_INVISIBLE_TIME}]"
+        );
+    }
+    // popBatchNums（Java 写的就是 `<= 0`，不是 `< 1`）
+    if cfg.pop_batch_nums <= 0 || cfg.pop_batch_nums > 32 {
+        bail!("popBatchNums Out of range [1, 32]");
+    }
+    Ok(())
+}
+
 // ================================================================ 内部可变状态
 
 /// Python 里那批以 `self._lock` 保护的字典（`_offset_table` / `_pending` /
@@ -1035,6 +1119,20 @@ impl DefaultMQPushConsumer {
         if !lock(&self.inner.listener).is_some() {
             self.inner.started.store(false, Ordering::Release);
             bail!("message listener is not set");
+        }
+        // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验起点
+        // 时间。放在这里是补一处真缺口 —— 原来只有 `compute_pull_from_where` 在拉到队列
+        // 之后才解析，格式写歪的后果是**那条队列**静默不消费，而不是启动失败。
+        if let Err(e) = consume_timestamp_millis(&cfg.consume_timestamp) {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(e);
+        }
+        // 对应 Java DefaultMQPushConsumerImpl.checkConfig 的数值段（:1099-1209）。
+        // 必须排在所有 null 检查之后、建 MQClientInstance 之前：起了后台任务再抛错
+        // 就泄漏任务了。
+        if let Err(e) = check_config_ranges(&cfg) {
+            self.inner.started.store(false, Ordering::Release);
+            return Err(e);
         }
 
         // Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
@@ -4201,6 +4299,322 @@ mod tests {
 
         consumer.subscribe("T", "TagA").unwrap();
         assert!(consumer.start().await.is_err(), "未设置 listener");
+        assert!(!consumer.is_started());
+    }
+
+    // ---------------- checkConfig 数值段（Java :1099-1209）----------------
+
+    /// 一道数值闸门：合法域 `[lo, hi]`（两端都含），越界时 Java 的固定文案。
+    struct RangeGate {
+        field: &'static str,
+        lo: i64,
+        hi: i64,
+        message: &'static str,
+        set: fn(&mut ConsumerConfig, i64),
+        /// `-1` 是 Java 给 topic 级两道闸门留的「关闭」哨兵，其它字段没有这个豁免。
+        minus_one_off: bool,
+    }
+
+    /// 顺序与 Java `checkConfig` 逐字一致 —— 顺序本身就是判据：配错两项时用户要先看到
+    /// 排在前面的那条（Python `GATES` / C++ `kGates` 同一张表）。
+    const RANGE_GATES: &[RangeGate] = &[
+        RangeGate {
+            field: "consume_thread_min",
+            lo: 1,
+            hi: 1000,
+            message: "consumeThreadMin Out of range [1, 1000]",
+            set: |c, v| c.consume_thread_min = v as i32,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "consume_thread_max",
+            lo: 1,
+            hi: 1000,
+            message: "consumeThreadMax Out of range [1, 1000]",
+            set: |c, v| c.consume_thread_max = v as i32,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "consume_concurrently_max_span",
+            lo: 1,
+            hi: 65535,
+            message: "consumeConcurrentlyMaxSpan Out of range [1, 65535]",
+            set: |c, v| c.consume_concurrently_max_span = v,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "pull_threshold_for_queue",
+            lo: 1,
+            hi: 65535,
+            message: "pullThresholdForQueue Out of range [1, 65535]",
+            set: |c, v| c.pull_threshold_for_queue = v as i32,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "pull_threshold_for_topic",
+            lo: 1,
+            hi: 6553500,
+            message: "pullThresholdForTopic Out of range [1, 6553500]",
+            set: |c, v| c.pull_threshold_for_topic = v as i32,
+            minus_one_off: true,
+        },
+        RangeGate {
+            field: "pull_threshold_size_for_queue",
+            lo: 1,
+            hi: 1024,
+            message: "pullThresholdSizeForQueue Out of range [1, 1024]",
+            set: |c, v| c.pull_threshold_size_for_queue = v as i32,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "pull_threshold_size_for_topic",
+            lo: 1,
+            hi: 102400,
+            message: "pullThresholdSizeForTopic Out of range [1, 102400]",
+            set: |c, v| c.pull_threshold_size_for_topic = v as i32,
+            minus_one_off: true,
+        },
+        RangeGate {
+            // ⚠ 唯一一条下界是 **0** 的闸门（Java 原文如此）：pullInterval=0 是
+            // "不额外等待"，是正常用法，不能当越界拒掉。
+            field: "pull_interval",
+            lo: 0,
+            hi: 65535,
+            message: "pullInterval Out of range [0, 65535]",
+            set: |c, v| c.pull_interval = v,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "consume_message_batch_max_size",
+            lo: 1,
+            hi: 1024,
+            message: "consumeMessageBatchMaxSize Out of range [1, 1024]",
+            set: |c, v| c.consume_message_batch_max_size = v as i32,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "pull_batch_size",
+            lo: 1,
+            hi: 1024,
+            message: "pullBatchSize Out of range [1, 1024]",
+            set: |c, v| c.pull_batch_size = v as i32,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "pop_invisible_time",
+            lo: MIN_POP_INVISIBLE_TIME,
+            hi: MAX_POP_INVISIBLE_TIME,
+            message: "popInvisibleTime Out of range [5000, 300000]",
+            set: |c, v| c.pop_invisible_time = v,
+            minus_one_off: false,
+        },
+        RangeGate {
+            field: "pop_batch_nums",
+            lo: 1,
+            hi: 32,
+            message: "popBatchNums Out of range [1, 32]",
+            set: |c, v| c.pop_batch_nums = v as i32,
+            minus_one_off: false,
+        },
+    ];
+
+    /// 只改一道闸门，其余保持默认；线程数先摊开成整条合法域，否则单独抬
+    /// `consume_thread_min` 会先撞上「min > max」那条相对检查，拿到的是另一句文案，
+    /// 范围分支就没测到。
+    fn gate_cfg(gate: &RangeGate, value: i64) -> ConsumerConfig {
+        let mut cfg = ConsumerConfig {
+            consume_thread_min: 1,
+            consume_thread_max: 1000,
+            ..Default::default()
+        };
+        (gate.set)(&mut cfg, value);
+        cfg
+    }
+
+    fn gate_error(cfg: &ConsumerConfig) -> String {
+        match check_config_ranges(cfg) {
+            Ok(()) => "<accepted>".to_string(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Java 的比较是 `value < lo || value > hi`，两端都是**闭**区间。
+    fn expect_rejected(gate: &RangeGate, value: i64) {
+        let want = format!("MQClientException: {}", gate.message);
+        assert_eq!(gate_error(&gate_cfg(gate, value)), want, "{}={}", gate.field, value);
+    }
+
+    fn expect_accepted(gate: &RangeGate, value: i64) {
+        assert_eq!(gate_error(&gate_cfg(gate, value)), "<accepted>", "{}={} 必须合法", gate.field, value);
+    }
+
+    #[test]
+    fn defaults_pass_check_config_ranges() {
+        check_config_ranges(&ConsumerConfig::default()).expect("默认配置必须通过 checkConfig");
+    }
+
+    #[test]
+    fn each_range_gate_accepts_both_bounds() {
+        for gate in RANGE_GATES {
+            expect_accepted(gate, gate.lo);
+            expect_accepted(gate, gate.hi);
+        }
+    }
+
+    #[test]
+    fn each_range_gate_rejects_both_ends() {
+        for gate in RANGE_GATES {
+            expect_rejected(gate, gate.lo - 1);
+            expect_rejected(gate, gate.hi + 1);
+        }
+    }
+
+    #[test]
+    fn zero_is_illegal_except_pull_interval() {
+        for gate in RANGE_GATES {
+            if gate.lo == 0 {
+                expect_accepted(gate, 0);
+            } else {
+                expect_rejected(gate, 0);
+            }
+        }
+    }
+
+    /// `-1` 只在 topic 级两道闸门上是「关闭」；把它当成通用开关会让别的闸门静默失效
+    /// （`pull_threshold_for_queue = -1` 在 Java 里是启动错误，不是"不限制"）。
+    #[test]
+    fn minus_one_sentinel_only_closes_topic_gates() {
+        for gate in RANGE_GATES {
+            if gate.minus_one_off {
+                expect_accepted(gate, -1);
+            } else {
+                expect_rejected(gate, -1);
+            }
+        }
+    }
+
+    #[test]
+    fn thread_min_must_not_exceed_thread_max() {
+        assert_eq!(
+            gate_error(&ConsumerConfig { consume_thread_min: 8, consume_thread_max: 4, ..Default::default() }),
+            "MQClientException: consumeThreadMin (8) is larger than consumeThreadMax (4)"
+        );
+
+        // Java 用的是严格大于：min == max 是合法的固定大小线程池
+        check_config_ranges(&ConsumerConfig {
+            consume_thread_min: 8,
+            consume_thread_max: 8,
+            ..Default::default()
+        })
+        .expect("min == max 必须合法");
+
+        // 相对检查排在两条范围检查**之后**：min=0 时先报范围，不报 min>max
+        assert_eq!(
+            gate_error(&ConsumerConfig { consume_thread_min: 0, consume_thread_max: 0, ..Default::default() }),
+            "MQClientException: consumeThreadMin Out of range [1, 1000]"
+        );
+    }
+
+    /// 命中顺序即 Java 的书写顺序：同时配坏两项时先报排在前面那道。
+    #[test]
+    fn gates_are_checked_in_java_order() {
+        assert_eq!(
+            gate_error(&ConsumerConfig {
+                consume_concurrently_max_span: 0,
+                pull_batch_size: 0,
+                ..Default::default()
+            }),
+            "MQClientException: consumeConcurrentlyMaxSpan Out of range [1, 65535]",
+            "跨度排在条数之前，先报跨度"
+        );
+        assert_eq!(
+            gate_error(&ConsumerConfig {
+                pull_threshold_for_queue: 0,
+                pull_batch_size: 0,
+                ..Default::default()
+            }),
+            "MQClientException: pullThresholdForQueue Out of range [1, 65535]",
+            "条数排在 pullBatchSize 之前"
+        );
+        assert_eq!(
+            gate_error(&ConsumerConfig { pull_batch_size: 0, ..Default::default() }),
+            "MQClientException: pullBatchSize Out of range [1, 1024]",
+            "前面几道修好之后才轮到 pullBatchSize"
+        );
+    }
+
+    /// 坏配置必须在**建实例之前**被拒：起了后台任务再抛错就泄漏任务，而且
+    /// `started` 会留在 true 上，`shutdown()` 之后再 start() 会静默返回。
+    #[tokio::test]
+    async fn start_rejects_out_of_range_config_before_any_network_io() {
+        let consumer = DefaultMQPushConsumer::new("CID_check_config_ranges_rust").unwrap();
+        consumer.set_namesrv_addr("127.0.0.1:1");
+        consumer.subscribe("T", "TagA").unwrap();
+        consumer.set_message_listener_concurrently(Arc::new(NoopListener));
+        consumer.update_config(|c| c.pull_batch_size = 1025);
+
+        let e = consumer
+            .start()
+            .await
+            .expect_err("pullBatchSize=1025 必须在启动时被拒");
+        assert_eq!(
+            e.to_string(),
+            "MQClientException: pullBatchSize Out of range [1, 1024]"
+        );
+        assert!(!consumer.is_started(), "被拒的 start() 必须回滚 started 标志");
+        assert!(
+            lock(&consumer.inner.client).is_none(),
+            "数值闸门必须排在建 MQClientInstance 之前，否则后台任务泄漏"
+        );
+
+        // 改对之后同一个对象还能起来（校验不留脏状态）
+        consumer.update_config(|c| c.pull_batch_size = 1024);
+        consumer.start().await.expect("修好数值后必须能启动");
+        consumer.shutdown();
+    }
+
+    /// Java 每条闸门的两个端点都要真能启动：端点写成开区间会让"贴着上限配"的
+    /// 运维配置（`pullThresholdForQueue=65535` 这类"实际不拦"的写法）被误拒。
+    #[tokio::test]
+    async fn start_accepts_every_gate_boundary() {
+        for (label, at_max) in [("min", false), ("max", true)] {
+            let consumer =
+                DefaultMQPushConsumer::new(&format!("CID_check_config_boundary_rust_{label}"))
+                    .unwrap();
+            consumer.set_namesrv_addr("127.0.0.1:1");
+            consumer.subscribe("T", "TagA").unwrap();
+            consumer.set_message_listener_concurrently(Arc::new(NoopListener));
+            consumer.update_config(|c| {
+                for gate in RANGE_GATES {
+                    let value = if at_max { gate.hi } else { gate.lo };
+                    (gate.set)(c, value);
+                }
+            });
+            if let Err(e) = consumer.start().await {
+                consumer.shutdown();
+                panic!("边界配置 {label} 被误拒：{e}");
+            }
+            consumer.shutdown();
+        }
+    }
+
+    /// 起点时间也在 checkConfig 里（Java :1058）。原来只在算拉取位点时才解析，
+    /// 格式写歪的后果是**那一条队列**静默不消费，而不是启动失败。
+    #[tokio::test]
+    async fn start_rejects_unparsable_consume_timestamp() {
+        let consumer = DefaultMQPushConsumer::new("CID_check_config_ts_rust").unwrap();
+        consumer.set_namesrv_addr("127.0.0.1:1");
+        consumer.subscribe("T", "TagA").unwrap();
+        consumer.set_message_listener_concurrently(Arc::new(NoopListener));
+        consumer.update_config(|c| {
+            c.consume_from_where = ConsumeFromWhere::CONSUME_FROM_TIMESTAMP.to_string();
+            c.consume_timestamp = "2026-01-01 00:00:00".to_string();
+        });
+        let e = consumer.start().await.expect_err("非 yyyyMMddHHmmss 必须被拒");
+        assert!(
+            e.to_string().contains("consumeTimestamp is invalid"),
+            "unexpected error: {e}"
+        );
         assert!(!consumer.is_started());
     }
 

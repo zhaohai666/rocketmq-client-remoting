@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 858 条单元/协议测试（854 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 915 条单元/协议测试（911 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -39,7 +39,7 @@ python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 
 python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
 python verify_async_send_live.py  # 异步发送内核 A1~A6（39 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核（一次回调、broker 逐条回 3 个 commitLog 偏移、读回的子消息带客户端 32 位 UNIQ_KEY）、shutdown 不等在途（36 笔全报错、一条都没落）
 python verify_backpressure_live.py # 异步发送背压 B1~B5（Java 两个公平信号量，真机版）
-python verify_flow_control_live.py # 拉取前流控五个阈值 S0~S4（13 PASS/0 FAIL）：S0 默认闸门+快消费**不命中**（12 条全到，闸门误伤正常流量表现为吞吐莫名腰斩，最难查）→ S1 只留队列级字节闸门（`pull_threshold_size_for_queue=1`，单位 **MiB**）⇒ 命中 15 次、8 条 400KB 一条不丢不重 → S2 只留跨度闸门（`consume_concurrently_max_span=2`）⇒ 命中 5 次、14 条仍全部消费 → S3 只留 topic 级条数闸门（`pull_threshold_for_topic=4`，4 队列）⇒ 单队列到不了 4 条、必须跨队列累计（命中 135 次）且每条队列都消费到底 → S4 复用 S1 的组与 topic ⇒ 位点从 broker 末尾续上、闸门**不是命中一次就失效**（仍命中 9 次）、6 条不重不丢（锁"暂停"被写成"退出拉取循环"，S1 看不出差别）。五个阈值的判定顺序、`Math.max(1,n)` 的守卫、**严格大于**的跨度边界、topic 级字节闸门**不复用**队列级那道开关、命中一次只记一格，都由 `tests/test_flow_control.py`（7 项）离线锁死；真机这一半锁的是离线锁不住的"确实会命中"和"命中后不丢"；命中的**次数**随真机投递/消费节奏浮动（S3 两轮分别报 105 与 135），判据只要求 `triggered > 0`。⚠ 两条夹具坑（都是实测踩出来的）：大消息必须**不可压缩**（`os.urandom`，全同字节会被生产者压到几百字节、broker 落盘 `store_size` 跟着变几百字节，size 闸门于是"永不命中"）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列每条才 800KB，永远够不到队列级那道 1MiB）
+python verify_flow_control_live.py # 拉取前流控五个阈值 + 启动期数值闸门 S0~S5（28 PASS/0 FAIL）：S0 默认闸门+快消费**不命中**（12 条全到，闸门误伤正常流量表现为吞吐莫名腰斩，最难查）→ S1 只留队列级字节闸门（`pull_threshold_size_for_queue=1`，单位 **MiB**）⇒ 命中 15 次、8 条 400KB 一条不丢不重 → S2 只留跨度闸门（`consume_concurrently_max_span=2`）⇒ 命中 5 次、14 条仍全部消费 → S3 只留 topic 级条数闸门（`pull_threshold_for_topic=4`，4 队列）⇒ 单队列到不了 4 条、必须跨队列累计（命中 135 次）且每条队列都消费到底 → S4 复用 S1 的组与 topic ⇒ 位点从 broker 末尾续上、闸门**不是命中一次就失效**（仍命中 9 次）、6 条不重不丢（锁"暂停"被写成"退出拉取循环"，S1 看不出差别）→ S5 启动期数值闸门（Java `checkConfig` 数值段 `:1099-1209`）⇒ 贴着 Java 区间**端点**的配置真能把消费者启动起来并收全 10 条（闸门写坏最常见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来；这一半离线只证明了"越界会拒"，证不到"边界能用"），5 条越界配置逐字按 Java 文案在本地被拒、`_started`/`_mq_client` 都还是空（没留下半启动实例），broker 侧再用**裸** `get_consumer_list_by_group` 反查：被拒的组查不到（本机 5.5.1 broker 对从未注册过的组回 `code=1 no consumer for this group` 而不是空列表，两种形态都算"查无此组"，任何别的异常判 FAIL），边界值那个组恰好查得到 1 个 clientId —— 写成"先注册再校验"的话 `ConsumerManager` 会留下一堆永不心跳的僵尸 clientId，把 rebalance 用的 `cidAll` 撑歪，真机表现为队列分配不均，而客户端日志里只有启动失败那一条。⚠ 有了 S5，夹具里"把某道闸门关掉"的写法必须是 Java 的**上界**（`OFF_COUNT=65535` / `OFF_SIZE_MB=1024`）而不是 `0`：`0` 现在正是启动期会拒的配置。五个阈值的判定顺序、`Math.max(1,n)` 的守卫、**严格大于**的跨度边界、topic 级字节闸门**不复用**队列级那道开关、命中一次只记一格，都由 `tests/test_flow_control.py`（7 项）离线锁死；真机这一半锁的是离线锁不住的"确实会命中"和"命中后不丢"；命中的**次数**随真机投递/消费节奏浮动（S3 两轮分别报 105 与 135），判据只要求 `triggered > 0`。⚠ 两条夹具坑（都是实测踩出来的）：大消息必须**不可压缩**（`os.urandom`，全同字节会被生产者压到几百字节、broker 落盘 `store_size` 跟着变几百字节，size 闸门于是"永不命中"）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列每条才 800KB，永远够不到队列级那道 1MiB）
 python verify_pull_expired_live.py # 拉取循环停摆**自愈**（Java isPullExpired / PULL_MAX_IDLE_TIME=120s，`RebalanceImpl.updateProcessQueueTableInRebalance:438-461`，11 PASS/0 FAIL）：A1 基线（3 条被消费、位点到 3、307 运行信息里 `lastPullTimestamp` 是循环自己盖的真时刻且新鲜）→ A2 把这一路的线程表条目换成一条**已退出的线程**（等价于循环被异常打穿）⇒ 下一趟 rebalance 必须换上另一条活线程，新发的 3 条照样被消费（位点到 6）→ A3 线程还活着但把盖章时刻**倒拨 121s**（> 120s）⇒ 同样被撤并重建、再发 3 条照样消费（位点到 9）→ A4 前 9 条各只投一次、`reconsumeTimes` 全 0、时钟恢复新鲜（撤走前持久化了位点，重建从 broker 位点续拉）。恢复判据用「既不是原线程、也不是注入的那条、而且活着」，否则注入还没被撤走也会被误判成通过。这条路径坏掉是**静默的**：不报错、心跳照发、别的队列照常推进，真机上只能从"某条队列位点永远不动"反推，所以停摆→恢复的闭环必须真机取证；阈值 120s 与**严格大于**的边界、盖章在流控/锁判定**之前**（`pullMessage:253`，卡住的循环也要留心跳）、POP 分支读 `lastPopTimestamp`（`PopProcessQueue:74`）、停机途中不判停摆，都由 `tests/test_pull_expired.py`（13 项）离线锁死
 python verify_ack_index_live.py   # classic 并发消费的 ackIndex 部分 ack（11 PASS/0 FAIL）：A1 对照组整批认可（3 条各投一次、位点到 3、零回投）→ A2 ackIndex=0 只认可首批第一条 ⇒ 尾巴 2 条经 %RETRY% 二次到达（reconsumeTimes>=1、topic 还原成业务 topic）、被认可那条整个窗口只投一次、3 条最终全部消费、业务队列位点仍整批提交到 3 → A3 ackIndex=2 压不住 RECONSUME_LATER（Java :222-226 强制 ackIndex=-1，3 条全重投）→ A4 广播模式下尾巴不回投。批次切分由拉取时机决定，所以三个用例都**先把 3 条放上去再起消费者**（新组显式 CONSUME_FROM_FIRST_OFFSET），否则首批可能是 1~2 条、前缀/后缀根本不确定
 python verify_orderly_reconsume_live.py # 顺序消费的重投闸门 O1~O3（12 PASS/0 FAIL，Java ConsumeMessageOrderlyService:236-362，与 verify_redelivery_live.py 的并发侧 S9 是两条不同代码路径）：O1 `max_reconsume_times=2` + `consume_message_batch_max_size=1` + `suspend_current_queue_time_millis=500` + 1 队列 topic ⇒ 毒消息恰好投 3 次、`reconsumeTimes` 走 0/1/2 的阶梯（每一格都是**客户端自己 +1**，broker 收到时已经加过）、第 3 次交回 broker 后业务队列**立刻前进**（后一条被消费，不是被毒消息永久堵住）、再等 15s 没有第 4 次、挂起期间 listener 始终看到业务 topic（本地重投不换 topic）→ O2 broker 把毒消息改写进 `%DLQ%<g>`（路由此刻才建出来），死信那条 `reconsumeTimes=3`（存储时 +1）、`RETRY_TOPIC` 仍是业务 topic。**顺序回投能落进死信而不是走延迟档位，本身就是 broker 此刻看到该组的重平衡锁没过期**（`SendMessageProcessor#handleRetryAndDLQ:202-207` 只在 `!isLockAllExpired` 时立刻判死信）——也就是「拿着 `LOCK_BATCH_MQ` 把消息交给 broker」这条链真的接上了（O1 另外直接数了该组 `LOCK_BATCH_MQ` 续锁成功的次数，>0 才算拿到判据的现场证据） → O3 反过来验 `-1` 那一支：顺序侧 `getMaxReconsumeTimes:313-320` 把 `-1` 读成**不设上限**（**不是**并发侧 `DefaultMQPushConsumerImpl:890` 的 16），实测同一条毒消息被持续重试 28 次、`reconsumeTimes` 阶梯一路爬到 19，而 `%DLQ%` 连 topic 都没建出来。三条分支（+1、用尽才回投、回投失败才继续挂起）与回投那条消息的字段由 `tests/test_orderly_reconsume.py`（13 项）离线锁死——离线未 `start()` 的消费者拿不到内部生产者，回投必定失败，所以离线只锁得住失败分支，「回投成功 ⇒ 位点前进、队列不堵」只能靠真机这一段
@@ -149,6 +149,30 @@ ExtFields 里的 `ReqT` 是 `RequestType.STREAM.getCode()` 的字符串形式 `"
 `MQClientAPIImpl` 构造传入）。与 Java 的另一处不同是本机 IP 用 UDP「连」公网地址后读
 sockname（Java 枚举网卡）。回归测试：`tests/test_client_id.py`、`tests/test_unit_config.py`、
 `verify_unit_config_live.py`。
+
+## 推送消费者启动期校验（`consumer.py:_check_config_ranges()`）
+
+对齐 Java `DefaultMQPushConsumerImpl#checkConfig` 的数值段（`:1099-1209`）：13 条区间在
+`start()` 里逐条检查，比较一律 `< lo or > hi`（两端闭区），文案逐字照抄 Java、只去掉
+`FAQUrl.suggest_todo()` 尾巴（本移植没有 FAQ 短链服务）。要点：
+
+- `pullThresholdForTopic` / `pullThresholdSizeForTopic` 的 `-1` 是"关闭"哨兵（Java 用
+  `if (x != -1)` 包住整条检查），**其余闸门没有这层豁免**，`-1` 照拒；
+- `pullInterval` 的下界是 **0**（Java 原文如此，0 = 不间隔），别照抄邻居闸门的 1；
+- `pullThresholdSizeForQueue` / `pullThresholdSizeForTopic` 的单位是 **MiB**；
+- `consumeThreadMin > consumeThreadMax` 是**严格大于**（相等合法，Java 允许单线程消费者），
+  消息里带上两个数值；
+- `popBatchNums` 跟随 Java 字面的 `<= 0`，文案仍写 `[1, 32]`；
+- 校验排在所有 null 检查之后、`MQClientInstance` 建连之前 —— 坏配置必须在注册 clientId 之前
+  失败，否则 broker 的 `ConsumerManager` 会留下一堆永不心跳的僵尸 clientId，把 rebalance 用的
+  `cidAll` 撑歪（真机表现为队列分配不均，而客户端日志里只有启动失败那一条）。
+
+Java `:1058` 的 `consumeTimestamp` 格式校验本端口**会真拒**（`consume_timestamp` 是可配的
+`%Y%m%d%H%M%S` 字符串），这是与 .NET 的一处差异（那边没有这个可配项）。回归守卫：
+`tests/test_consumer_check_config.py`（57 项，逐条锁区间两端、`-1` 哨兵、检查顺序与文案）；
+真机守卫见上面 `verify_flow_control_live.py` 的 S5。C++ / Rust / .NET 用同一张闸门表、同一段
+顺序、同一条文案（`cpp/tests/test_consumer_check_config.cpp`、`rust/src/client/consumer.rs` 的
+`RANGE_GATES`、`dotnet/tests/RocketMQ.Client.Tests/ConsumerCheckConfigTests.cs`）。
 
 ## 管理端（`client/admin.py`）
 

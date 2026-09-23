@@ -186,3 +186,11 @@ add_test(NAME flow_control COMMAND rmq_test_flow_control)
 add_executable(rmq_test_producer_unregister test_producer_unregister.cpp)
 target_link_libraries(rmq_test_producer_unregister PRIVATE rocketmq::remoting)
 add_test(NAME producer_unregister COMMAND rmq_test_producer_unregister)
+
+# 推送消费者配置数值闸门（Java checkConfig :1099-1209）：十三道区间的边界值、越界文案、
+# min/max 相对关系与"坏配置在建 MQClientInstance 之前就被拒"（地址指向没人监听的端口，
+# 报的必须是配置文案而不是连接失败）。真机侧的"边界值真能启动并消费 + broker 查无此组"
+# 在 examples/live_flow_control.cpp 的 S5。
+add_executable(rmq_test_consumer_check_config test_consumer_check_config.cpp)
+target_link_libraries(rmq_test_consumer_check_config PRIVATE rocketmq::remoting)
+add_test(NAME consumer_check_config COMMAND rmq_test_consumer_check_config)

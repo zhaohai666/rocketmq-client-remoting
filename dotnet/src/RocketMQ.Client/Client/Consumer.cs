@@ -854,6 +854,104 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>Java <c>DefaultMQPushConsumerImpl#checkConfig</c> 的数值段（:1099-1209）。
+    /// <para>逐条照抄 Java 的<b>顺序、区间和文案</b>（Java 每条都拼
+    /// <c>FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL)</c>，本仓库按约定不带后缀）。
+    /// 比较一律 <c>&lt; lo || &gt; hi</c>；<c>PopBatchNums</c> 跟随 Java 的字面写法
+    /// <c>&lt;= 0</c>。四语言（Python 参考实现 / C++ / Rust / 本移植）文案逐字一致，
+    /// 改一处要同时改四处，否则跨语言用例的断言会分叉。</para>
+    /// <para>为什么要在 <see cref="Start"/> 拦：这些值直接决定缓冲水位与线程池规模。
+    /// 配成 0 或 <c>int.MaxValue</c> 而没有这道闸门时，要么每轮拉取都被"阈值 &lt;= 0"
+    /// 判成积压而<b>永久停拉</b>（消费端静默收不到消息），要么整数溢出把流控判断整个
+    /// 绕开。等 broker 报错已经晚了几拍，且错误只落在日志里。</para>
+    /// <para><c>PullThresholdForTopic</c> / <c>PullThresholdSizeForTopic</c> 的 -1 是
+    /// Java 的"关闭这条闸门"哨兵，不在区间内也不报错；其余字段没有这个豁免（写成 -1
+    /// 在 Java 里是启动错误，不是"不限制"）。</para>
+    /// <para>public 只为离线可测：正向用例（边界值必须放行）走不到 <see cref="Start"/>
+    /// 之后，测试工程与本程序集没有 InternalsVisibleTo 关系。业务代码请直接 <c>Start()</c>。</para>
+    /// <para>已知与 Java 的差异：<c>SetConsumeThreadMin/Max</c> 与
+    /// <c>ConsumeMessageBatchMaxSize</c> 的 setter 带 <c>Math.Max(1, n)</c> 兜底
+    /// （Java 的 setter 是裸赋值），于是这三条的**下界**越界从公开 API 走不到；
+    /// 上界与相对检查（min &gt; max）仍然可达，闸门本身照抄全量。</para>
+    /// </summary>
+    public void CheckConfigRanges()
+    {
+        // consumeThreadMin
+        if (ConsumeThreadMin < 1 || ConsumeThreadMin > 1000)
+        {
+            throw new MQClientException("consumeThreadMin Out of range [1, 1000]");
+        }
+        // consumeThreadMax
+        if (ConsumeThreadMax < 1 || ConsumeThreadMax > 1000)
+        {
+            throw new MQClientException("consumeThreadMax Out of range [1, 1000]");
+        }
+        // consumeThreadMin can't be larger than consumeThreadMax
+        if (ConsumeThreadMin > ConsumeThreadMax)
+        {
+            throw new MQClientException("consumeThreadMin (" + ConsumeThreadMin
+                                        + ") is larger than consumeThreadMax ("
+                                        + ConsumeThreadMax + ")");
+        }
+        // consumeConcurrentlyMaxSpan
+        if (ConsumeConcurrentlyMaxSpan < 1 || ConsumeConcurrentlyMaxSpan > 65535)
+        {
+            throw new MQClientException("consumeConcurrentlyMaxSpan Out of range [1, 65535]");
+        }
+        // pullThresholdForQueue
+        if (PullThresholdForQueue < 1 || PullThresholdForQueue > 65535)
+        {
+            throw new MQClientException("pullThresholdForQueue Out of range [1, 65535]");
+        }
+        // pullThresholdForTopic
+        if (PullThresholdForTopic != -1)
+        {
+            if (PullThresholdForTopic < 1 || PullThresholdForTopic > 6553500)
+            {
+                throw new MQClientException("pullThresholdForTopic Out of range [1, 6553500]");
+            }
+        }
+        // pullThresholdSizeForQueue
+        if (PullThresholdSizeForQueue < 1 || PullThresholdSizeForQueue > 1024)
+        {
+            throw new MQClientException("pullThresholdSizeForQueue Out of range [1, 1024]");
+        }
+        // pullThresholdSizeForTopic
+        if (PullThresholdSizeForTopic != -1)
+        {
+            if (PullThresholdSizeForTopic < 1 || PullThresholdSizeForTopic > 102400)
+            {
+                throw new MQClientException("pullThresholdSizeForTopic Out of range [1, 102400]");
+            }
+        }
+        // pullInterval：Java 的下界就是 0（不间隔），别照抄别条闸门的 1
+        if (PullIntervalMillis < 0 || PullIntervalMillis > 65535)
+        {
+            throw new MQClientException("pullInterval Out of range [0, 65535]");
+        }
+        // consumeMessageBatchMaxSize
+        if (ConsumeMessageBatchMaxSize < 1 || ConsumeMessageBatchMaxSize > 1024)
+        {
+            throw new MQClientException("consumeMessageBatchMaxSize Out of range [1, 1024]");
+        }
+        // pullBatchSize
+        if (PullBatchSize < 1 || PullBatchSize > 1024)
+        {
+            throw new MQClientException("pullBatchSize Out of range [1, 1024]");
+        }
+        // popInvisibleTime：区间与 POP 循环里那条兜底用的是同一对常量
+        if (PopInvisibleTime < MinPopInvisibleTime || PopInvisibleTime > MaxPopInvisibleTime)
+        {
+            throw new MQClientException("popInvisibleTime Out of range [" + MinPopInvisibleTime
+                                        + ", " + MaxPopInvisibleTime + "]");
+        }
+        // popBatchNums（Java 写的就是 <= 0，不是 < 1）
+        if (PopBatchNums <= 0 || PopBatchNums > 32)
+        {
+            throw new MQClientException("popBatchNums Out of range [1, 32]");
+        }
+    }
+
     // ---------------- 生命周期 ----------------
     public void Start()
     {
@@ -902,6 +1000,15 @@ public sealed class DefaultMQPushConsumer
             {
                 throw new MQClientException("message listener is not set");
             }
+
+            // 对应 Java DefaultMQPushConsumerImpl.checkConfig 的数值段（:1099-1209）。
+            // 排在所有 null 检查之后、建 MQClientInstance 之前：坏配置必须在实例化之前
+            // 失败，否则起了后台线程/注册了 clientId 再抛错就留下半启动状态。
+            // Java :1058 那条 consumeTimestamp 格式校验在这里是 no-op —— 本移植没有
+            // 可配的 ConsumeTimestamp 属性，CONSUME_FROM_TIMESTAMP 一律取"30 分钟前"
+            // （见 ComputePullOffsetFromWhere），没有可写坏的字符串可拒。这是一处已知
+            // 与 Java 的差距（少一个可配项），不是这里漏了校验。
+            CheckConfigRanges();
 
             // 对应 Java DefaultMQPushConsumerImpl.start()（:935）：**只有 CLUSTERING** 才把默认
             // instanceName 换成 <pid>#<nanoTime>；BROADCASTING 保留 "DEFAULT"，于是同机同组的
