@@ -19,6 +19,7 @@ from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
 from ..common.message_const import MessageConst
 from ..common.message_decoder import _compress, decode_message, decode_message_id
+from ..common.message_client_id_setter import get_uniq_id, set_uniq_id
 from ..common.message_type import MessageType
 from ..common import recall_message_handle
 from ..common.mix_all import MixAll
@@ -97,8 +98,10 @@ def _back_pressure_msg_len(msg) -> int:
     """扣多少个「字节」许可（Java ``executeAsyncMessageSend:642`` 的
     ``msg.getBody() == null ? 1 : msg.getBody().length``）。
 
-    批量异步是 Java 没有的入口（Java 只有同步 ``send(Collection)``），这里按每条累加、
-    空 body 也算 1，整批为空时算 1 —— 不给它一个值就等于不限流。
+    批量异步（Java ``DefaultMQProducer.send(Collection, SendCallback, timeout)``，
+    :1121 起）没有 Java 那边的现成公式可依（Java 走 SEND_BATCH + invokeAsync，本实现批量
+    只有同步内核），这里按每条累加、空 body 也算 1，整批为空时算 1 —— 不给它一个值就等于
+    一批消息整体只占 1 份容量，字节闸对批量形同虚设。
     """
     if isinstance(msg, (list, tuple, MessageBatch)):
         messages = list(msg)
@@ -1435,14 +1438,19 @@ class DefaultMQProducer:
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         if not msgs:
             raise MQClientException("message list is empty")
-        # 对应 Java DefaultMQProducer.batch()：**每条子消息**都过一遍 Validators.checkMessage
-        # （在拼命名空间之前），再 MessageBatch.generateFromList 查同质性。
-        # 少这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
+        # 对应 Java DefaultMQProducer.batch():1172-1184：**每条子消息**先 Validators
+        # .checkMessage（在拼命名空间之前、用原始 topic），再 MessageClientIDSetter
+        # .setUniqID，然后才拼命名空间；批量消息本身也要一个 UNIQ_KEY（broker 判 inner-batch
+        # 用得到，SendMessageProcessor:617），最后**编码** —— 顺序错了就会把没有 UNIQ_KEY 的
+        # 子消息体写进 body，消费端每条子消息都没有客户端 ID。
+        # 少 checkMessage 这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
         for m in msgs:
             validators.check_message(m, self.max_message_size)
-        for m in msgs:
+            set_uniq_id(m)
             m.topic = self._with_namespace(m.topic)
         batch = MessageBatch.generate_from_list(msgs)
+        set_uniq_id(batch)
+        batch.set_body(batch.encode())
         # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
         sys_flag = self.try_to_compress_message(batch)
         if mq is not None:

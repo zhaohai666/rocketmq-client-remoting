@@ -257,6 +257,9 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
     public long? QueueOffset { get; set; }
     public string? TransactionId { get; set; }
     public long? MsgRegion { get; set; }
+    // 只有 inner-batch（消息落到 batch CQ）时 broker 才回：
+    // SendMessageProcessor:630 把批量消息自身的 UNIQ_KEY 原样填进来。
+    public string? BatchUniqId { get; set; }
     // 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
     // TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 null。
     public string? RecallHandle { get; set; }
@@ -269,6 +272,7 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
         HeaderCodec.PutOptLong(outMap, "queueOffset", QueueOffset);
         HeaderCodec.PutOptStr(outMap, "transactionId", TransactionId);
         HeaderCodec.PutOptLong(outMap, "msgRegion", MsgRegion);
+        HeaderCodec.PutOptStr(outMap, "batchUniqId", BatchUniqId);
         HeaderCodec.PutOptStr(outMap, "recallHandle", RecallHandle);
         return outMap;
     }
@@ -280,6 +284,7 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
         QueueOffset = HeaderCodec.GetOptLong(ext, "queueOffset");
         TransactionId = HeaderCodec.GetOptStr(ext, "transactionId");
         MsgRegion = HeaderCodec.GetOptLong(ext, "msgRegion");
+        BatchUniqId = HeaderCodec.GetOptStr(ext, "batchUniqId");
         RecallHandle = HeaderCodec.GetOptStr(ext, "recallHandle");
     }
 }

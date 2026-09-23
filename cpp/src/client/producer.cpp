@@ -98,6 +98,18 @@ int64_t backPressureMsgLen(const Message& msg) {
     return body.empty() ? 1 : static_cast<int64_t>(body.size());
 }
 
+// 批量异步扣多少「字节」许可（Python `_back_pressure_msg_len` 的 list 分支）：逐条累加、
+// 空 body 也算 1，整批为空算 1。Java 那边批量走 SEND_BATCH + invokeAsync、公式现成，本实现
+// 复用同步内核没有现成值可依——不给它按批累加，就等于一批整体只占 1 份容量，字节闸对批量
+// 形同虚设。
+int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
+    int64_t total = 0;
+    for (const Message& m : msgs) {
+        total += backPressureMsgLen(m);
+    }
+    return total == 0 ? 1 : total;
+}
+
 }  // namespace
 
 DefaultMQProducer::DefaultMQProducer(const std::string& producerGroup)
@@ -787,6 +799,26 @@ void DefaultMQProducer::sendAsync(const Message& msg, const MessageQueue& mq,
     enqueueAsync(state, &mq, timeoutMillis);
 }
 
+void DefaultMQProducer::sendBatchAsync(const std::vector<Message>& msgs,
+                                       std::shared_ptr<SendCallback> callback,
+                                       int32_t timeoutMillis) {
+    auto state = std::make_shared<AsyncSendState>();
+    state->batch = true;
+    state->batchMsgs = msgs;
+    state->callback = std::move(callback);
+    enqueueAsync(state, nullptr, timeoutMillis);
+}
+
+void DefaultMQProducer::sendBatchAsync(const std::vector<Message>& msgs, const MessageQueue& mq,
+                                       std::shared_ptr<SendCallback> callback,
+                                       int32_t timeoutMillis) {
+    auto state = std::make_shared<AsyncSendState>();
+    state->batch = true;
+    state->batchMsgs = msgs;
+    state->callback = std::move(callback);
+    enqueueAsync(state, &mq, timeoutMillis);
+}
+
 void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& state,
                                      const MessageQueue* pinned, int32_t timeoutMillis) {
     // 先确认已启动（与 Python 一致：未启动立即抛，而不是在后台线程里静默失败）
@@ -802,7 +834,8 @@ void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& stat
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     state->timeout = timeout;
     // 许可按**压缩前**的 body 长度扣（Java 在调用方线程上算，那时还没压缩）
-    state->msgLen = backPressureMsgLen(state->msg);
+    state->msgLen =
+        state->batch ? batchBackPressureMsgLen(state->batchMsgs) : backPressureMsgLen(state->msg);
     if (pinned != nullptr) {
         state->mq = *pinned;
         state->pinned = true;
@@ -820,7 +853,11 @@ void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& stat
         }
         state->timeout = timeout - cost;
         try {
-            sendAsyncInner(state, state->pinned ? &state->mq : nullptr);
+            if (state->batch) {
+                sendBatchAsyncInner(state, state->pinned ? &state->mq : nullptr);
+            } else {
+                sendAsyncInner(state, state->pinned ? &state->mq : nullptr);
+            }
         } catch (const std::exception& e) {
             // Java：runnable 的 catch → newCallBack.onException(e)
             const InvokeError err(InvokeError::Kind::OTHER, e.what());
@@ -889,6 +926,24 @@ void DefaultMQProducer::releaseBackPressure(const std::shared_ptr<AsyncSendState
     }
     if (state->numAcquired) {
         semaphoreAsyncSendNum_.release(1);
+    }
+}
+
+void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState>& state,
+                                            const MessageQueue* pinned) {
+    // Python _send_async_inner 的批量分支：批量在本实现里只有同步内核，所以「异步」= 在
+    // AsyncSenderExecutor 线程里同步发一批，结果挪到回调线程交付。对调用方语义没差别。
+    // 校验、组批、拼 namespace、选队列、钩子全在内核里，这里不重复做。
+    const int32_t timeout = state->timeout;
+    try {
+        const SendResult result = sendBatchKernel(state->batchMsgs, pinned, timeout);
+        executeOnCallbackThread([this, state, result]() { completeAsync(state, &result, nullptr); });
+    } catch (const std::exception& e) {
+        // 内核的失败（路由拿不到、校验不过、重试用尽）原样交付回调，与单条异步一致。
+        executeOnCallbackThread([this, state, text = std::string(e.what())]() {
+            const InvokeError err(InvokeError::Kind::OTHER, text);
+            completeAsync(state, nullptr, &err);
+        });
     }
 }
 
@@ -1247,29 +1302,59 @@ Message DefaultMQProducer::waitRequestResponse(const Message& outbound, int32_t 
 
 // ---------------------------------------------------------------- 批量
 SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis) {
+    return sendBatchKernel(msgs, nullptr, timeoutMillis);
+}
+
+SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, const MessageQueue& mq,
+                                        int32_t timeoutMillis) {
+    return sendBatchKernel(msgs, &mq, timeoutMillis);
+}
+
+// 两个公开重载 + 批量异步共用的内核。pinned 非空时整批定点落到该队列（Java
+// send(Collection, MessageQueue, timeout)），不查路由、不换 broker。
+SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
+                                              const MessageQueue* pinned,
+                                              int32_t timeoutMillis) {
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     if (msgs.empty()) {
         throw MQClientException("message list is empty");
     }
-    // 对应 Java DefaultMQProducer.batch() / Python _send_batch：**每条子消息**都过一遍
-    // Validators.checkMessage（在拼命名空间之前、用原始 topic），再 MessageBatch
-    // .generateFromList 查同质性。少这一步等于批量路径绕过了所有本地校验——
-    // 超长/空 body/非法 topic 都能发出去。
+    // 对应 Java DefaultMQProducer.batch():1172-1184 的**顺序**：逐条 Validators.checkMessage
+    // （在拼命名空间之前、用原始 topic）→ 逐条 setUniqID → 逐条拼命名空间 → 批量自身
+    // setUniqID → **才编码**。少 checkMessage 等于批量路径绕过所有本地校验（超长/空 body/
+    // 非法 topic 都能发出去）；少 setUniqID 或把编码放到写 ID 之前，批量 body 里每条子消息
+    // 都没有客户端 ID —— 消费端和轨迹控制台都串不起来，SendResult.msgId 也只能退化成
+    // broker 的 offsetMsgId，而「发成功了没」完全看不出来。
+    std::vector<Message> subs;
+    subs.reserve(msgs.size());
     for (const Message& m : msgs) {
         Validators::checkMessage(m, maxMessageSize_);
+        Message sub = m;
+        ensureUniqId(sub);
+        if (!namespace_.empty()) {
+            sub.topic = NamespaceUtil::wrapNamespace(namespace_, sub.topic);
+        }
+        subs.push_back(std::move(sub));
     }
-    MessageBatch batch = MessageBatch::generateFromList(msgs);
+    MessageBatch batch = MessageBatch::generateFromList(subs);
+    ensureUniqId(batch);
+    batch.body = batch.encode();
     checkMessage(batch);
     if (!namespace_.empty()) {
         batch.topic = NamespaceUtil::wrapNamespace(namespace_, batch.topic);
     }
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(batch.topic, /*isDefault=*/true);
-    MessageQueue selected = publish->selectOneMessageQueue();
+    MessageQueue target;
+    if (pinned != nullptr) {
+        target = *pinned;
+    } else {
+        std::shared_ptr<TopicPublishInfo> publish =
+            c.getTopicPublishInfo(batch.topic, /*isDefault=*/true);
+        target = publish->selectOneMessageQueue();
+    }
     // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
     const int32_t sysFlag = prepareForSend(batch);
-    return sendWithHooks(c, batch, selected, timeout, sysFlag);
+    return sendWithHooks(c, batch, target, timeout, sysFlag);
 }
 
 // ---------------------------------------------------------------- 心跳

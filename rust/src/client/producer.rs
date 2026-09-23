@@ -65,6 +65,7 @@ use crate::client::trace_hook::{
 };
 use crate::client::validators;
 use crate::common::compression;
+use crate::common::message_client_id_setter::set_uniq_id;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_const::{
     PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME_LEVEL, PROPERTY_DELAY_TIME,
@@ -1660,6 +1661,20 @@ fn back_pressure_msg_len(msg: &Message) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
+/// 批量异步扣多少「字节」许可：逐条累加（空 body 也算 1），整批为空时算 1 ——
+/// 对应 Python `_back_pressure_msg_len` 的 list/MessageBatch 分支。
+/// 不给整批一个值就等于让批量消息绕过字节闸：一批 100 条只占 1 份容量。
+fn batch_back_pressure_msg_len(msgs: &[Message]) -> i64 {
+    let mut total: i64 = 0;
+    for msg in msgs {
+        total = total.saturating_add(back_pressure_msg_len(msg));
+    }
+    if total == 0 {
+        return 1;
+    }
+    total
+}
+
 /// 一次异步发送拿到的背压许可（对应 Java `BackpressureSendCallBack:577-633` 的
 /// `isSemaphoreAsyncNumAcquired` / `isSemaphoreAsyncSizeAcquired` 两个标记）。
 ///
@@ -2218,19 +2233,26 @@ impl DefaultMQProducer {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .max_message_size;
-        // 对应 Java DefaultMQProducer.batch()：每条子消息都用**原始 topic**过一遍
-        // Validators.checkMessage，然后才拼命名空间 + generateFromList 查同质性。
-        // 少这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
+        // 对应 Java DefaultMQProducer.batch():1172-1184 的**顺序**：每条子消息先用**原始
+        // topic**过一遍 Validators.checkMessage，再逐条 setUniqID，然后才拼命名空间 +
+        // generateFromList 查同质性；批量自身也要一个 UNIQ_KEY，最后**才**编码 body。
+        // 少 checkMessage 等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去；
+        // 少 setUniqID（或把编码放到写 ID 之前）会让 broker 拆开批量后每条子消息都没有客户端
+        // ID，轨迹控制台串不起发送侧与消费侧，而发送侧看起来一切正常。
         for msg in &msgs {
             validators::check_message(msg, max)?;
         }
         let mut msgs = msgs;
         for msg in &mut msgs {
+            set_uniq_id(msg);
             let topic = self.with_namespace(&msg.topic);
             msg.topic = topic;
         }
         let topic = msgs[0].topic.clone();
         let mut batch = MessageBatch::generate_from_list(msgs)?;
+        set_uniq_id(&mut batch.message);
+        let body = batch.encode();
+        batch.message.set_body(Some(&body));
         let mut publish_msg = PublishMessage::Batch(&mut batch);
         // MessageBatch 会被压缩步骤直接跳过（返回 0），批量消息永不压缩
         let sys_flag = self.sys_flag_for(&mut publish_msg);
@@ -2429,6 +2451,20 @@ impl DefaultMQProducer {
             this.run_async_send(msg, msg_len, callback, timeout, began, mq)
                 .await;
         });
+        self.submit_async_job(handle, job)
+    }
+
+    /// 把一笔异步发送交进 `AsyncSenderExecutor`（Java 的 `asyncSenderExecutor.submit`）。
+    ///
+    /// 队满时 Java `:675-681` 分两派：没开背压直接抛 `MQClientException("executor rejected")`；
+    /// 开了背压就**就地跑完这一笔**，因为许可已经扣掉、不跑完就要白等超时归还。
+    /// Rust 的「就地」不能像 Java 那样阻塞调用方线程（见 [`send_async`](Self::send_async)
+    /// 文档里「闸在池子里等」那一段），所以派发到队列之外。
+    fn submit_async_job(
+        &self,
+        handle: tokio::runtime::Handle,
+        job: AsyncSendJob,
+    ) -> Result<()> {
         let submitted = {
             let slot = self
                 .inner
@@ -2444,8 +2480,6 @@ impl DefaultMQProducer {
             if !self.is_enable_backpressure_for_async_mode() {
                 return Err(Error::client("executor rejected"));
             }
-            // Java `:675-681` 的对位分支：队列满时这一笔仍然要跑完，只是这里派发到队列
-            // 之外（不占池、也不阻塞调用方，理由见本方法文档）。
             handle.spawn(job);
         }
         Ok(())
@@ -2489,6 +2523,76 @@ impl DefaultMQProducer {
             .await;
     }
 
+    /// 批量异步发送：对应 Java `DefaultMQProducer.send(Collection<Message>, SendCallback,
+    /// timeout)` → `defaultMQProducerImpl.send(batch(msgs), sendCallback, timeout)`，
+    /// 即 Python `send_async` 收到 list 时走进的 `_send_async_inner` 批量分支。
+    ///
+    /// 排队、预算、背压两道闸、回调恰好一次，与 [`send_async`](Self::send_async) 完全同一条
+    /// 前段；差别只在出队之后：Java 那边是 SEND_BATCH + `invokeAsync`，而本端口（同 Python）
+    /// 批量只有同步内核，于是「在异步池里跑完同步批量内核」。对调用方语义没差别 ——
+    /// 不阻塞提交线程、回调照样交付、失败照样归还许可。
+    ///
+    /// 背压按**整批**扣字节许可（Python `_back_pressure_msg_len`：逐条累加、空 body 也算 1），
+    /// 否则一批 100 条只占 1 份容量，等于批量消息绕过了字节闸。
+    ///
+    /// ⚠ 与单条异步的差别只在**重试语义**：批量路径没有异步链的换 broker 重试（`on_exception`），
+    /// 走的是同步内核自己的 `retry_times_when_send_failed` 循环。`SendMessageHook`
+    /// （before/after）**照跑** —— 同步内核内部就是 `send_with_hooks`，与 Python 的
+    /// `_send_batch` 同一口径；钩子上下文由内核建、由内核收尾，[`complete_async`] 只交付
+    /// 用户回调和归还许可，不会再跑一次 after。
+    pub fn send_batch_async(
+        &self,
+        msgs: Vec<Message>,
+        callback: Arc<dyn SendCallback>,
+        timeout_millis: Option<i64>,
+        mq: Option<MessageQueue>,
+    ) -> Result<()> {
+        let _ = self.require_client()?;
+        let handle = self.runtime_handle().ok_or_else(|| {
+            Error::client("send_batch_async needs a tokio runtime; call start() first")
+        })?;
+        let timeout = timeout_millis.unwrap_or_else(|| self.read_cfg(|c| c.send_msg_timeout));
+        let msg_len = batch_back_pressure_msg_len(&msgs);
+        let began = monotonic_millis();
+        let this = self.clone();
+        let job: AsyncSendJob = Box::pin(async move {
+            this.run_async_send_batch(msgs, msg_len, callback, timeout, began, mq)
+                .await;
+        });
+        self.submit_async_job(handle, job)
+    }
+
+    /// [`send_batch_async`](Self::send_batch_async) 出队之后的那一段，与
+    /// [`run_async_send`](Self::run_async_send) 同构：先过闸，再复检预算，最后才发请求。
+    async fn run_async_send_batch(
+        &self,
+        msgs: Vec<Message>,
+        msg_len: i64,
+        callback: Arc<dyn SendCallback>,
+        timeout: i64,
+        began: f64,
+        mq: Option<MessageQueue>,
+    ) {
+        let permits = match self.acquire_send_permits(msg_len, timeout, began).await {
+            Ok(permits) => permits,
+            Err(e) => {
+                self.complete_async(&callback, Err(e), None, None);
+                return;
+            }
+        };
+        let cost = latency_since(began);
+        if timeout <= cost {
+            return self.fail_async(
+                &callback,
+                Error::TooMuchRequest("DEFAULT ASYNC send call timeout".to_string()),
+                permits,
+            );
+        }
+        // 批量内核自己校验每条子消息、拼命名空间、查同质性；这里的错误原样交付回调。
+        let outcome = self.send_batch(msgs, mq.as_ref(), Some(timeout - cost)).await;
+        self.complete_async(&callback, outcome, None, Some(permits));
+    }
+
     /// 一个「不发请求就终止」的出口：归还许可 + 交付错误。
     fn fail_async(
         &self,
@@ -2505,9 +2609,8 @@ impl DefaultMQProducer {
     /// Java `sendDefaultImpl:756` —— ASYNC 的 `timesTotal` 固定为 1：**外层循环只跑一次**，
     /// 换 broker 的重试全部发生在 [`AsyncSendChain::on_exception`] 里。
     ///
-    /// ⚠ 批量消息没有异步内核可用：Python 的 `_send_async_inner` 对批量走的是「在
-    /// `AsyncSenderExecutor` 线程里同步发一批」，这里同构 —— 准备工作在池里，请求交给
-    /// 传输层后池就空出来。
+    /// 批量消息不走这里：它有自己的入口 [`send_batch_async`](Self::send_batch_async)
+    /// （对位 Java `send(Collection, SendCallback, long)`），出队之后交给同步批量内核。
     async fn async_send_inner(
         &self,
         msg: &mut Message,
@@ -4289,6 +4392,36 @@ mod tests {
             err.to_string().contains("producer not started"),
             "先查客户端、再查运行时句柄: {err}"
         );
+    }
+
+    /// 批量异步与单条异步同一口径：未启动**同步抛**，一个回调都不会交付。
+    #[test]
+    fn send_batch_async_before_start_reports_not_started() {
+        let p = producer("GID_batch_async");
+        let cb = Arc::new(ClosureSendCallback::new(None, None));
+        let err = p
+            .send_batch_async(vec![Message::new("T1", Some(b"x"))], cb, None, None)
+            .expect_err("未启动不该静默派发");
+        assert!(
+            err.to_string().contains("producer not started"),
+            "先查客户端、再查运行时句柄: {err}"
+        );
+    }
+
+    /// 整批扣字节许可：逐条累加、空 body 也算 1、空批算 1。
+    /// 写错这条不会让任何一笔发送失败，只会让批量消息在背压下**绕过字节闸**
+    /// （一批 100 条只占 1 份容量），而队列被打爆是长跑之后的事。
+    #[test]
+    fn batch_back_pressure_len_counts_every_message() {
+        let one = Message::new("T1", Some(b"12345"));
+        let empty = Message::new("T1", None);
+        assert_eq!(batch_back_pressure_msg_len(std::slice::from_ref(&one)), 5);
+        assert_eq!(batch_back_pressure_msg_len(&[one.clone(), one.clone()]), 10);
+        // 空 body 也算 1（与单条口径一致：0 等于不限流）
+        assert_eq!(batch_back_pressure_msg_len(std::slice::from_ref(&empty)), 1);
+        assert_eq!(batch_back_pressure_msg_len(&[empty.clone(), empty.clone()]), 2);
+        assert_eq!(batch_back_pressure_msg_len(&[one, empty]), 6);
+        assert_eq!(batch_back_pressure_msg_len(&[]), 1);
     }
 
     #[test]

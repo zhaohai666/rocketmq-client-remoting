@@ -343,14 +343,18 @@ public class MessageBatch : Message
         var batch = new MessageBatch { Messages = msgs };
         batch.Topic = first.Topic;
         batch.WaitStoreMsgOk = first.WaitStoreMsgOk;
-        // 对应 Java MessageBatch.generateFromList：每条子消息先写好 UNIQ_KEY，
-        // 编码后随 body 一起下发给 broker（落地 + 消费侧反查的轨迹 msgId 来源）。
-        // 发送侧只对非批量消息补 UNIQ_KEY，所以批量消息的 ID 必须在这里逐条写。
+        // 对应 Java MessageBatch.generateFromList + DefaultMQProducer.batch():1176-1182 的**顺序**：
+        // 每条子消息先写好 UNIQ_KEY，编码后随 body 一起下发给 broker（落地 + 消费侧反查的
+        // 轨迹 msgId 来源）。发送侧只对非批量消息补 UNIQ_KEY，所以批量消息的 ID 必须在这里逐条写。
         foreach (Message m in msgs)
         {
             MessageClientIDSetter.SetUniqId(m);
         }
 
+        // Java batch():1179 在 generateFromList 之后给整批那条消息也补一个 ID（inner-batch 时
+        // broker 把它原样回在 batchUniqId 里），它就是这个端口的 SendResult.MsgId；
+        // 最后才编码 body（对应 batch():1181 setBody(encode())）。
+        MessageClientIDSetter.SetUniqId(batch);
         batch.Body = batch.Encode();
         batch.IsBatch = true; // 让发送侧把 SendMessageRequestHeader.batch 置 true
         return batch;

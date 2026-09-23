@@ -132,6 +132,9 @@ struct SendMessageResponseHeader : public CommandCustomHeader {
     std::optional<int32_t> queueId;
     std::optional<int64_t> queueOffset;
     std::optional<std::string> transactionId;
+    // 批量消息（inner-batch）时 broker 回的是批量消息自身的 UNIQ_KEY
+    // （SendMessageProcessor:630），普通 topic 的客户端批量不会回。
+    std::optional<std::string> batchUniqId;
     std::optional<int64_t> msgRegion;
     // 只给定时/延迟消息：broker 的 SendMessageProcessor#attachRecallHandle 看到
     // TIMER_OUT_MS + REAL_TOPIC 才挂上，普通消息恒为 nullopt。

@@ -1314,6 +1314,23 @@ public class DefaultMQProducer
     public void SendAsync(Message msg, ISendCallback callback, int timeoutMillis = -1,
         MessageQueue? mq = null)
     {
+        // 链上带的是**克隆**：压缩会就地改 body，不能改调用方那份。克隆在池线程上做（与批量
+        // 同一条前段），许可长度仍在**调用方线程**上按压缩前的 body 算 —— Java 就是在那儿算的。
+        ExecuteAsyncSend(() => CloneMessage(msg), BackPressureMsgLen(msg), callback, timeoutMillis,
+            mq);
+    }
+
+    /// <summary>异步链的前段（Python <c>send_async</c> 的整体、Java
+    /// <c>executeAsyncMessageSend</c> + <c>AsyncSenderExecutor.submit</c>）：过闸、投池、
+    /// 出队后复检预算，再把 <paramref name="prepare"/> 造出来的消息交给
+    /// <see cref="SendAsyncInner"/>。</summary>
+    /// <param name="prepare">在<b>池线程</b>上造出这一笔要发的消息。放在池线程上是必须的：
+    /// 批量入口在那里才会抛「空列表 / 子消息非法 / 不同质」，异常得进回调而不是砸回调用方
+    /// 的栈（Python 的批量分支同样在 runnable 里抛、由外层 catch 交给回调）。</param>
+    /// <param name="msgLen">扣多少「字节」许可，在调用方线程上算好。</param>
+    private void ExecuteAsyncSend(Func<Message> prepare, long msgLen, ISendCallback callback,
+        int timeoutMillis, MessageQueue? mq)
+    {
         // 先确认已启动（与 Python 一致：未启动立即抛，而不是在后台线程里静默失败）
         _ = GetClient();
         ConsumeExecutor? executor;
@@ -1328,10 +1345,6 @@ public class DefaultMQProducer
         }
 
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
-        // 链上带的是**克隆**：压缩会就地改 body，不能改调用方那份；许可按**压缩前**的长度扣
-        //（Java 在调用方线程上算，那时还没压缩）
-        Message captured = CloneMessage(msg);
-        long msgLen = BackPressureMsgLen(msg);
         double began = UtilAll.MonotonicMillis();
         var permits = new AsyncSendPermits(_semaphoreAsyncSendNum, _semaphoreAsyncSendSize, msgLen);
 
@@ -1378,7 +1391,7 @@ public class DefaultMQProducer
 
             try
             {
-                SendAsyncInner(captured, mq, callback, permits, timeout - (int)cost);
+                SendAsyncInner(prepare(), mq, callback, permits, timeout - (int)cost);
             }
             catch (Exception e)
             {
@@ -1417,8 +1430,9 @@ public class DefaultMQProducer
         if (msg.IsBatch)
         {
             // 批量没有异步内核（Java 有，本端口的批量只有同步内核）：在池线程里同步发一批，
-            // 结果照样从 CompleteAsync 走回调池转交。与 Python/Rust 同一处理。
-            SendResult sent = Send(msg, timeout);
+            // 结果照样从 CompleteAsync 走回调池转交。与 Python/Rust/C++ 同一处理。
+            // mq 非空时必须把它传下去，否则「定点批量异步」会退化成轮询选队列。
+            SendResult sent = mq is null ? Send(msg, timeout) : Send(msg, mq, timeout);
             CompleteAsync(callback, sent, null, null, permits);
             return;
         }
@@ -1923,6 +1937,70 @@ public class DefaultMQProducer
         // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
         int sysFlag = PrepareForSend(outbound);
         return SendWithHooks(c, outbound, selected, timeout, sysFlag);
+    }
+
+    /// <summary>
+    /// 批量异步发送：对应 Java <c>DefaultMQProducer.send(Collection&lt;Message&gt;, SendCallback,
+    /// timeout)</c>（:1121）→ <c>defaultMQProducerImpl.send(batch(msgs), sendCallback, timeout)</c>，
+    /// 也就是 Python <c>send_async</c> 收到 list 时走进的那个批量分支。
+    ///
+    /// 本端口的批量只有同步内核，所以「异步」= 在 <c>AsyncSenderExecutor_N</c> 线程里跑完
+    /// 同步批量内核、结果照样从 <c>NettyClientPublicExecutor_N</c> 交付回调。对调用方语义没
+    /// 差别：不阻塞提交线程、回调恰好一次、失败照样归还许可。
+    /// <see cref="SendAsync(Message,ISendCallback,int,MessageQueue?)"/> 的整段前段（排队、
+    /// 预算复检、背压两道闸）在这里全部生效，字节许可按<b>整批每条子消息</b>的 body 长度累加
+    /// （空 body 也算 1、空列表算 1，Python <c>_back_pressure_msg_len</c> 的 list 分支同一
+    /// 公式）—— 只按一条扣等于一批整体占 1 格，字节闸对批量形同虚设。
+    ///
+    /// <paramref name="mq"/> 非空时整批定点落到该队列（Java
+    /// <c>send(Collection, MessageQueue, SendCallback, timeout)</c>）。
+    ///
+    /// 与 <see cref="SendBatch"/> 一样，<b>每条子消息</b>先过 <c>Validators.CheckMessage</c>：
+    /// 直接把 <see cref="MessageBatch"/> 丢给 <see cref="SendAsync(Message,ISendCallback,int,MessageQueue?)"/>
+    /// 会漏掉这一步，等于批量路径绕过本地校验（超长 body、非法 topic 都能发出去）。
+    /// 校验/组批的失败（空列表、超长、不同质）一律**进回调**，与 Python 一致：它们发生在
+    /// 池线程上的组批步骤里，被异步链的外层 catch 接住。
+    /// </summary>
+    public void SendBatchAsync(List<Message> msgs, ISendCallback callback, int timeoutMillis = -1,
+        MessageQueue? mq = null)
+    {
+        // 许可份数在调用方线程上算（Python 也在投队列前算好），公式与 _back_pressure_msg_len
+        // 的 list 分支一致：逐条累加、空 body 也算 1、空列表算 1
+        long msgLen = 0;
+        if (msgs is not null)
+        {
+            foreach (Message m in msgs)
+            {
+                msgLen += m.Body.Length == 0 ? 1 : m.Body.Length;
+            }
+        }
+
+        if (msgLen == 0)
+        {
+            msgLen = 1;
+        }
+
+        ExecuteAsyncSend(() => BuildBatchMessage(msgs), msgLen, callback, timeoutMillis, mq);
+    }
+
+    /// <summary>批量异步的组批步骤（在池线程上跑）：与 <see cref="SendBatch"/> 开头完全同一串
+    /// 动作 —— 逐条 <c>Validators.CheckMessage</c> → <c>GenerateFromList</c>（查同质性、逐条补
+    /// UNIQ_KEY、把整批编进 body）→ 整批再查一次。这里的异常由异步链外层交给回调。</summary>
+    private Message BuildBatchMessage(List<Message>? msgs)
+    {
+        if (msgs is null || msgs.Count == 0)
+        {
+            throw new MQClientException("message list is empty");
+        }
+
+        foreach (Message m in msgs)
+        {
+            Validators.CheckMessage(m, _maxMessageSize);
+        }
+
+        MessageBatch batch = MessageBatch.GenerateFromList(msgs);
+        CheckMessage(batch);
+        return batch;
     }
 
     // ---------------- Request-Reply（5.x）----------------

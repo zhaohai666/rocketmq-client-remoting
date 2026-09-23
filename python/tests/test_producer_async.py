@@ -40,10 +40,13 @@ from rocketmq.client.consume_executor import ConsumeExecutor
 from rocketmq.client.exception import (ClientErrorCode, MQBrokerException,
                                        MQClientException, RequestTimeoutException)
 from rocketmq.client.hook import CommunicationMode, SendMessageContext
-from rocketmq.client.mq_client import TopicPublishInfo
+from rocketmq.client.mq_client import MQClientInstance, TopicPublishInfo
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.client.send_result import SendResult, SendStatus
 from rocketmq.common.message import Message, MessageQueue
+from rocketmq.common.message_client_id_setter import get_uniq_id
+from rocketmq.common.message_const import MessageConst
+from rocketmq.common.message_decoder import decode_batch_messages
 from rocketmq.remoting.exception import (RemotingConnectException,
                                          RemotingSendRequestException,
                                          RemotingTimeoutException,
@@ -55,6 +58,7 @@ from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
 ADDR_A = "127.0.0.1:10911"
 ADDR_B = "127.0.0.1:10912"
 ADDR_COLD = "127.0.0.1:10913"
+UNIQ = MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX
 
 
 def _mq(broker: str, queue_id: int = 0) -> MessageQueue:
@@ -597,6 +601,53 @@ def test_batch_messages_fall_back_to_the_sync_batch_kernel():
     _wait_done(cb)
     assert calls and calls[0][0] == 2
     assert cb.results[0].msg_id == "b" * 32
+
+
+def test_send_batch_writes_client_ids_before_encoding_the_body():
+    """对应 Java DefaultMQProducer.batch():1172-1184 的**顺序**：逐条 checkMessage →
+    逐条 setUniqID → 逐条拼命名空间 → 给批量本身 setUniqID → 才 encode()。
+
+    顺序错或干脆不写（本端口原先就是这样）会让批量 body 里的每条子消息都没有 UNIQ_KEY：
+    消费端拿到没有客户端 ID 的消息、轨迹控制台串不起发送侧与消费侧，而 SendResult.msgId
+    只能退化成 broker 的 offsetMsgId —— 单看「发成功了没」完全看不出来。
+    """
+    p = _producer()
+    p.namespace = "BatchNs"
+    sent = []
+
+    def _fake_send(group, msg, mq, timeout, sys_flag, unit_mode=False):
+        sent.append(msg)
+        return SendResult(SendStatus.SEND_OK, msg_id="b" * 32,
+                          message_queue=_mq("broker-a", 0))
+
+    p._mq_client.send_message = _fake_send          # type: ignore[assignment]
+    msgs = [Message("TopicTest", b"one"), Message("TopicTest", b"two")]
+    result = p._send_batch(msgs)
+    assert result.send_status == SendStatus.SEND_OK
+    assert len(sent) == 1, "一批一个请求"
+    batch = sent[0]
+    # ① 每条子消息各有自己的 UNIQ_KEY，批量本身也有（broker 判 inner-batch 用得到）
+    sub_ids = [m.get_property(UNIQ) for m in batch.messages]
+    assert all(sub_ids) and len(set(sub_ids)) == len(sub_ids), sub_ids
+    assert get_uniq_id(batch) and get_uniq_id(batch) not in sub_ids
+    # ② 编码在写 ID **之后**：解出来的每条子消息都带着自己的 UNIQ_KEY。
+    #    （批量 body 是 6 段轻量格式，不带 topic，所以 ID 是唯一能证明顺序的证据。）
+    inner = decode_batch_messages(batch.get_body())
+    assert [m.get_property(UNIQ) for m in inner] == sub_ids
+    assert [m.topic for m in batch.messages] == [p._with_namespace("TopicTest")] * 2
+    # ③ 回调里的 msgId 是**批量自身**的 UNIQ_KEY（四语言统一口径；Java 在非 inner-batch
+    #    时拼逐条 ID，本端口解析层拿不到子消息列表，理由见 _parse_send_response 的注释）
+    response = RemotingCommand.create_response_command_with_header(ResponseCode.SUCCESS)
+    response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0"}
+    parsed = MQClientInstance._parse_send_response(None, response, batch, _mq("broker-a", 0))
+    assert parsed.msg_id == get_uniq_id(batch)
+    assert parsed.msg_id != "0" * 32, "不能退化成 broker 的 offsetMsgId"
+    assert "," not in parsed.msg_id
+    # broker 回了 batchUniqId（inner-batch）时同样用它
+    response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0",
+                           "batchUniqId": get_uniq_id(batch)}
+    parsed = MQClientInstance._parse_send_response(None, response, batch, _mq("broker-a", 0))
+    assert parsed.msg_id == get_uniq_id(batch)
 
 
 # ---------------------------------------------------------------- 线程名 / 生命周期

@@ -12,7 +12,7 @@
 //! ⚠ 没有它的话 `SendResult.msgId` 只能退化成 broker 的 offsetMsgId（含 commitlog 偏移），
 //! 与 Java 的语义不同，且轨迹里的 msgId 与消费侧对不上。
 
-use crate::common::message::{Message, MessageBatch, MessageExt};
+use crate::common::message::{Message, MessageExt};
 use crate::common::message_const::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX;
 use crate::common::util_all;
 
@@ -40,24 +40,6 @@ pub fn get_uniq_id_of_ext(msg: &MessageExt) -> Option<String> {
     msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).map(str::to_string)
 }
 
-/// 批量消息的 `UNIQ_KEY`：逐条 ID 用 `,` 拼接（对应 Java `getUniqID(MessageBatch)`）。
-///
-/// 注意 Python 的 `MessageBatch.generate_from_list` **不会**给子消息写 UNIQ_KEY
-/// （Java 会），所以直接构造的批量消息这里通常返回 None，
-/// `SendResult.msgId` 随即回落成 broker 的 offsetMsgId —— 与 Python 行为一致。
-pub fn get_uniq_id_from_batch(batch: &MessageBatch) -> Option<String> {
-    let ids: Vec<String> = batch
-        .messages()
-        .iter()
-        .filter_map(get_uniq_id)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if ids.is_empty() {
-        return None;
-    }
-    Some(ids.join(","))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,25 +55,6 @@ mod tests {
         // 与 Python 一致：32 个大写 hex（IPv4 环境）
         assert_eq!(first.len(), 32, "got {first}");
         assert_eq!(first, first.to_ascii_uppercase());
-    }
-
-    #[test]
-    fn batch_uniq_id_joins_with_comma() {
-        let one = {
-            let mut m = Message::new("T", Some(b"1"));
-            set_uniq_id(&mut m);
-            m
-        };
-        let mut plain = Message::new("T", Some(b"2"));
-        plain.put_property(UNIQ, "ID2");
-        let batch = MessageBatch::new(vec![one.clone(), plain]);
-        let joined = get_uniq_id_from_batch(&batch).unwrap();
-        assert_eq!(joined, format!("{},ID2", get_uniq_id(&one).unwrap()));
-
-        // 全都没有 UNIQ_KEY → None（Python 的 generate_from_list 就是这个形态）
-        let empty = MessageBatch::new(vec![Message::new("T", Some(b"a"))]);
-        assert_eq!(get_uniq_id_from_batch(&empty), None);
-        assert_eq!(get_uniq_id_from_batch(&MessageBatch::default()), None);
     }
 
     #[test]

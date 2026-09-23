@@ -18,7 +18,10 @@
 //!   A3  定点异步发送只落在指定队列上，别的队列一条都不多。
 //!   A4  拦截钩子（`CheckForbiddenHook`）拒绝时异常原样到了回调、看到的是 `ASYNC`，
 //!       而且被拒那笔在 broker 上没留痕（连路由都没建出来）；同一个生产者换个标签照常落地。
-//!   A5  批量异步：**本端口没有这个入口**，记为 SKIP（差异 ②）。
+//!   A5  批量异步（`send_batch_async`）：一批 5 条回调恰好一次 + broker 侧真落 5 条、
+//!       定点批量只落在指定队列、混 topic / 空批的本地校验异常照样**进回调**、
+//!       字节闸按**整批**算（1.2 MiB 的一批过不了 1 MiB 闸，200 KiB 的一批过得去）、
+//!       许可（含被闸拦下那笔已拿到的条数许可）原样归还。
 //!   A6  `shutdown()` **不等在途**（Java `ThreadPoolExecutor.shutdown()`：不接新的、队列里的
 //!       照跑，但主流程立刻返回）：交进来的每一笔仍然各自拿到一个终态回调，可这批是在
 //!       「客户端实例已拆」的状态上跑的 ⇒ 实测**一笔都没上线**（差异 ③）；
@@ -31,10 +34,12 @@
 //!   调用方那一段跑在 `spawn_blocking` 的阻塞线程池上：那条线程池与 tokio 工作线程集合
 //!   不相交，「不同线程」才是硬结论而不是运气。
 //!
-//! ② **A5 是真缺口，不是脚本偷懒**：Java `send(Collection<Message>, SendCallback, long)`、
-//!   Python `_send_async`（批量走同步批量内核）、C++ `sendAsync(MessageBatch,…)`、.NET
-//!   `SendAsync(IEnumerable<Message>,…)` 都有异步批量，本端口只有
-//!   `send_batch(...) -> Result<SendResult>`（同步语义）。
+//! ② **批量异步跑的是同步批量内核**：Java `send(Collection<Message>, SendCallback, long)`
+//!   在 `send(batch(msgs), sendCallback, timeout)` 之后走 SEND_BATCH + `invokeAsync`，
+//!   本端口（同 Python `_send_async_inner` 的批量分支）批量只有同步内核，于是「在异步池里
+//!   跑完 `send_batch`」。对调用方的四条语义（不阻塞、回调恰好一次、错误进回调、失败归还
+//!   许可）一致，差的只是「池内那一条任务会占住到网络回来为止」。Python/C++/.NET 三端口
+//!   同一口径（见各自的批量异步入口）。
 //!
 //! ③ **关停语义按语言分两派，本端口与 Java/Python 同派**：Java `shutdown()` 与 Python
 //!   都「不等」——队列里的任务照样跑完准备段、照样回调，但实例已经拆掉，所以这一批基本
@@ -92,7 +97,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// 断言累积器：跑完全部场景再汇总，首个失败不提前退出。
 struct Checker {
     passed: u32,
-    skipped: u32,
     failed: Vec<String>,
 }
 
@@ -100,7 +104,6 @@ impl Checker {
     fn new() -> Checker {
         Checker {
             passed: 0,
-            skipped: 0,
             failed: Vec::new(),
         }
     }
@@ -113,12 +116,6 @@ impl Checker {
             println!("  [FAIL] {name}: {detail}");
             self.failed.push(format!("{name}: {detail}"));
         }
-    }
-
-    /// 本端口没有对应能力，如实记下来而不是假装通过。
-    fn skip(&mut self, name: &str, why: &str) {
-        self.skipped += 1;
-        println!("  [SKIP] {name}: {why}");
     }
 
     fn abort(&mut self, name: &str, err: &str) {
@@ -827,19 +824,249 @@ async fn a4_forbidden_hook(ck: &mut Checker, env: &Env) {
     producer.shutdown();
 }
 
-// ------------------------------------------------- A5 批量异步（本端口没有这个入口）
+/// 一组队列上已落条数的总和（`.await` 不能待在 `map(...).sum()` 里，只能摊开写）。
+async fn queues_landed(env: &Env, queues: &[MessageQueue]) -> i64 {
+    let mut total = 0_i64;
+    for mq in queues {
+        total += queue_landed(env, mq).await.unwrap_or(0).max(0);
+    }
+    total
+}
 
-fn a5_batch_async(ck: &mut Checker) {
-    ck.skip(
-        "A5 批量异步发送",
-        "本端口没有 send_async 的批量入口（Java send(Collection, SendCallback, long)、\
-         Python/C++/.NET 均有对位实现，这里只有同步语义的 send_batch）—— 记为接口缺口",
+// ------------------------------------------------- A5 批量异步（send_batch_async）
+
+/// 批量异步入口对位 Java `send(Collection<Message>, SendCallback, long)` /
+/// Python `send_async(list)` / C++ `sendAsync(MessageBatch,…)` / .NET
+/// `SendAsync(IEnumerable<Message>,…)`。
+///
+/// 每条断言都刻意选在「只跑离线单测看不出来」的那一侧：回调有没有交付、批量内核的本地
+/// 校验有没有被异步路径绕过、错误有没有被静默吞掉、许可有没有漏。
+async fn a5_batch_async(ck: &mut Checker, env: &Env) {
+    let topic = env.topic("BatchAsync");
+    let producer = match env.producer("a5", None, None).await {
+        Ok(p) => p,
+        Err(e) => return ck.abort("A5 producer", &e),
+    };
+
+    // ① 一批 5 条：回调恰好一次、SEND_OK，并且 broker 上真的落了 5 条。
+    //    只看回调会被「回调报了 OK 但请求压根没发出去」蒙过去 —— 那条必须靠 broker 侧对账。
+    let rec = Arc::new(Recorder::default());
+    let batch: Vec<Message> = (0..5)
+        .map(|i| message(&topic, format!("async-a5-{i}").as_bytes(), "TagA5"))
+        .collect();
+    if let Err(e) = producer.send_batch_async(batch, rec.clone(), Some(10_000), None) {
+        return ck.abort("A5 批量异步提交", &e.to_string());
+    }
+    ck.check(
+        "A5 一批 5 条：回调恰好一次且 SEND_OK",
+        wait_until(|| rec.done() >= 1, 20).await
+            && rec.done() == 1
+            && rec.ok() == 1
+            && rec.errors().is_empty()
+            && rec.results().first().is_some_and(|r| {
+                r.msg_id.as_ref().is_some_and(|id| !id.is_empty())
+            }),
+        &rec.summary(),
+    );
+    let landed = wait_landed(env, &topic, 5).await;
+    ck.check(
+        "A5 broker 上真落了 5 条（不是回调自己说成功）",
+        landed == 5,
+        &format!("landed={landed}（-1 = 路由还没建出来）"),
+    );
+
+    // ①b 读回 broker 上**存下来的那条子消息**：它必须带客户端生成的 32 位 UNIQ_KEY。
+    //     Java DefaultMQProducer.batch():1176 是「逐条 setUniqID → 才 encode()」；顺序错了
+    //     （或像修复前的本端口那样干脆不写），broker 拆开批量后存的就是没有 ID 的裸消息 ——
+    //     消费端去重、轨迹控制台串线全废，而发送侧回调照样是 SEND_OK，看不出来。
+    let batch_offset = rec.results().first().and_then(|r| r.offset_msg_id.clone());
+    // 批量应答的 offsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个 commitLog
+    // 偏移），所以它自己就是「这一批真被拆开存成 5 条」的证据；读回时取第一条的偏移。
+    let sub_offsets: Vec<&str> = batch_offset
+        .as_deref()
+        .map(|s| s.split(',').filter(|o| !o.is_empty()).collect())
+        .unwrap_or_default();
+    ck.check(
+        "A5 broker 逐条回了 5 个 commitLog 偏移（批量确实被拆开落地）",
+        sub_offsets.len() == 5 && sub_offsets.iter().all(|o| decode_message_id(o).is_ok()),
+        &format!("offsetMsgId={batch_offset:?}"),
+    );
+    let mut stored_uniq = None;
+    if let Some(&id) = sub_offsets.first() {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(m) = env.admin.view_message(&topic, id).await {
+                // MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX
+                stored_uniq = m.get_property("UNIQ_KEY").map(str::to_string);
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    ck.check(
+        "A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+        stored_uniq.as_deref().is_some_and(|u| u.len() == 32),
+        &format!("stored UNIQ_KEY={stored_uniq:?} offsetMsgId={batch_offset:?}"),
     );
     ck.check(
-        "*  A5 同步批量 send_batch 的请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证",
-        true,
-        "真机看不到上线报文，这一条由 src/client/producer 的批量单测在进程内取证",
+        "A5 批量的 SendResult.msgId 是批量自身的 32 位 ID、不是 offsetMsgId",
+        rec.results().first().is_some_and(|r| {
+            r.msg_id.as_deref().is_some_and(|id| id.len() == 32 && !id.contains(','))
+                && r.msg_id != r.offset_msg_id
+        }),
+        &rec
+            .results()
+            .first()
+            .map(|r| format!("msgId={:?} offsetMsgId={:?}", r.msg_id, r.offset_msg_id))
+            .unwrap_or_default(),
     );
+
+    // ② 定点批量：`mq` 参数真的传到了批量内核，而不是被丢掉后自己挑一条。
+    let queues = match producer.fetch_publish_message_queues(&topic).await {
+        Ok(q) if !q.is_empty() => q,
+        Ok(_) => return ck.abort("A5 定点批量", "topic 没有可用队列"),
+        Err(e) => return ck.abort("A5 定点批量取队列", &e.to_string()),
+    };
+    let aimed = queues[0].clone();
+    let aimed_before = queue_landed(env, &aimed).await.unwrap_or(-1);
+    let others_before = queues_landed(env, &queues[1..]).await;
+    let pinned = Arc::new(Recorder::default());
+    let pin_batch: Vec<Message> = (0..3)
+        .map(|i| message(&topic, format!("async-a5-pin-{i}").as_bytes(), "TagA5"))
+        .collect();
+    if let Err(e) =
+        producer.send_batch_async(pin_batch, pinned.clone(), Some(10_000), Some(aimed.clone()))
+    {
+        return ck.abort("A5 定点批量提交", &e.to_string());
+    }
+    let pinned_ok = wait_until(|| pinned.done() >= 1, 20).await
+        && pinned.done() == 1
+        && pinned.ok() == 1;
+    let landed_on_aimed = pinned
+        .results()
+        .first()
+        .is_some_and(|r| r.message_queue.as_ref() == Some(&aimed));
+    let mut aimed_after = queue_landed(env, &aimed).await.unwrap_or(-1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while aimed_after != aimed_before + 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        aimed_after = queue_landed(env, &aimed).await.unwrap_or(-1);
+    }
+    let others_after = queues_landed(env, &queues[1..]).await;
+    ck.check(
+        "A5 定点批量落在指定队列、别的队列一条都没多",
+        pinned_ok
+            && landed_on_aimed
+            && aimed_after == aimed_before + 3
+            && others_after == others_before,
+        &format!(
+            "ok={} 落位={landed_on_aimed} 该队列 {aimed_before}->{aimed_after} 其它 {others_before}->{others_after}",
+            pinned.ok()
+        ),
+    );
+
+    // ③ 混 topic 的一批：批量内核的同质性校验必须在异步路径上照样跑，
+    //    且异常**进回调**（Java 的 runnable catch → onException），不是同步抛、也不是静默丢掉。
+    let mixed = Arc::new(Recorder::default());
+    let mixed_batch = vec![
+        message(&topic, b"async-a5-mixed-1", "TagA5"),
+        message(&env.topic("BatchOther"), b"async-a5-mixed-2", "TagA5"),
+    ];
+    if let Err(e) = producer.send_batch_async(mixed_batch, mixed.clone(), Some(5_000), None) {
+        return ck.abort("A5 混 topic 批次提交", &e.to_string());
+    }
+    ck.check(
+        "A5 混 topic 的一批在回调里报错（本地校验没被异步路径绕过）",
+        wait_until(|| mixed.done() >= 1, 10).await
+            && mixed.done() == 1
+            && mixed.ok() == 0
+            && mixed
+                .errors()
+                .first()
+                .is_some_and(|e| e.contains("should be the same")),
+        &mixed.summary(),
+    );
+
+    // ④ 空批次：同一口径 —— 错误进回调，一次回调都不欠。
+    let empty = Arc::new(Recorder::default());
+    if let Err(e) = producer.send_batch_async(Vec::new(), empty.clone(), Some(5_000), None) {
+        return ck.abort("A5 空批次提交", &e.to_string());
+    }
+    ck.check(
+        "A5 空批次也是「恰好一次失败回调」，不静默吞掉",
+        wait_until(|| empty.done() >= 1, 10).await
+            && empty.done() == 1
+            && empty.ok() == 0
+            && empty
+                .errors()
+                .first()
+                .is_some_and(|e| e.contains("message list is empty")),
+        &empty.summary(),
+    );
+
+    // ⑤ 背压扣的是**整批**字节，不是「一条」：把字节闸压到地板（1 MiB），
+    //    一批 2×600 KiB 就必须被闸拦下（整批 1.2 MiB > 1 MiB）；换一批 2×100 KiB 又必须过。
+    //    只按第一条算（600 KiB）或者干脆不扣，这两条就会同时反向。
+    producer.set_enable_backpressure_for_async_mode(true);
+    producer.set_back_pressure_for_async_send_num(1);
+    producer.set_back_pressure_for_async_send_size(1024 * 1024);
+    let big_body = vec![b'x'; 600 * 1024];
+    let gated = Arc::new(Recorder::default());
+    let big_batch = vec![
+        message(&topic, &big_body, "TagA5"),
+        message(&topic, &big_body, "TagA5"),
+    ];
+    if let Err(e) = producer.send_batch_async(big_batch, gated.clone(), Some(2_000), None) {
+        return ck.abort("A5 超闸批量提交", &e.to_string());
+    }
+    ck.check(
+        "A5 整批 1.2MiB 被 1MiB 字节闸拦下（回调拿到 TooMuchRequest，一次请求都没发）",
+        wait_until(|| gated.done() >= 1, 15).await
+            && gated.done() == 1
+            && gated.ok() == 0
+            && gated
+                .errors()
+                .first()
+                .is_some_and(|e| e.contains("semaphoreAsyncSize timeout")),
+        &gated.summary(),
+    );
+    // 同一道闸下的小批次必须照常落地：证明「拦住」是因为整批量，不是因为批量被一概论处
+    let small_body = vec![b'y'; 100 * 1024];
+    let passed = Arc::new(Recorder::default());
+    let small_batch = vec![
+        message(&topic, &small_body, "TagA5"),
+        message(&topic, &small_body, "TagA5"),
+    ];
+    if let Err(e) = producer.send_batch_async(small_batch, passed.clone(), Some(10_000), None) {
+        return ck.abort("A5 小批量提交", &e.to_string());
+    }
+    ck.check(
+        "A5 同一道闸下 200KiB 的一批照常拿到 SEND_OK",
+        wait_until(|| passed.done() >= 1, 20).await && passed.done() == 1 && passed.ok() == 1,
+        &passed.summary(),
+    );
+    // 许可必须原样归还：漏一份就是长跑之后「所有异步发送集体超时」，
+    // 而单次发送看不出来（条数闸只放过 1 份，被拦那笔必须把已拿到的条数许可还回去）。
+    let num_total = producer.get_back_pressure_for_async_send_num();
+    let size_total = producer.get_back_pressure_for_async_send_size();
+    ck.check(
+        "A5 批量路径把两份许可原样归还（空闲量回到总量，含被闸拦下那一笔）",
+        wait_until(
+            || producer.semaphore_async_send_num_available_permits() == num_total
+                && producer.semaphore_async_send_size_available_permits() == size_total,
+            10,
+        )
+        .await,
+        &format!(
+            "空闲条数={} 总量={num_total} 空闲字节={} 总量={size_total}",
+            producer.semaphore_async_send_num_available_permits(),
+            producer.semaphore_async_send_size_available_permits()
+        ),
+    );
+    producer.shutdown();
 }
 
 // ------------------------------------------------- A6 Shutdown 不等在途
@@ -875,9 +1102,18 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
         &format!("done={} 发送={sends} {}", rec.done(), rec.summary()),
     );
     let after_return = rec.after(returned_at);
+    // 真正的证据是「返回耗时远小于一笔的准备段」：每笔 before 钩子睡 100ms，池子只有
+    // cores*2 根线程，等在途的 shutdown 至少要几百 ms。上一版还要求「只有 1 笔在返回前
+    // 就交付」，那是拿调度赌运气：36 笔的提交循环本身就要几十 ms，先跑完的那几笔完全
+    // 可能赶在 shutdown 返回之前落终态。
     ck.check(
-        "A6 Shutdown 不等在途：返回之后回调还在往外发",
-        after_return + 1 >= sends,
+        "A6 Shutdown 返回得比一笔的准备段还快（它没有等在途）",
+        shut_took < Duration::from_millis(100),
+        &format!("返回耗时={}ms，单笔准备段=100ms", shut_took.as_millis()),
+    );
+    ck.check(
+        "A6 Shutdown 不等在途：返回之后大部分回调才落地",
+        after_return * 2 >= sends,
         &format!(
             "Shutdown 返回后才有 {after_return}/{sends} 笔落到终态，返回耗时={}ms",
             shut_took.as_millis()
@@ -967,7 +1203,7 @@ async fn run(namesrv: &str) -> Checker {
     a2_burst_exactly_once_each(&mut ck, &env).await;
     a3_pinned_queue(&mut ck, &env).await;
     a4_forbidden_hook(&mut ck, &env).await;
-    a5_batch_async(&mut ck);
+    a5_batch_async(&mut ck, &env).await;
     a6_shutdown_does_not_wait(&mut ck, &env).await;
     cleanup(&mut ck, &env).await;
     ck
@@ -1000,9 +1236,8 @@ fn main() -> ExitCode {
     };
     let ck = runtime.block_on(run(&namesrv));
     println!(
-        "== summary: {} passed, {} skipped, {} failed ==",
+        "== summary: {} passed, {} failed ==",
         ck.passed,
-        ck.skipped,
         ck.failed.len()
     );
     for f in &ck.failed {

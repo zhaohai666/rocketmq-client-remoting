@@ -1109,4 +1109,163 @@ public class ProducerAsyncTests : IDisposable
         next.Shutdown();
         Assert.True(WaitUntil(() => pool.WorkerCount() >= 1, 1000), "池子还归调用方");
     }
+
+    /// <summary>
+    /// 批量异步（Java <c>send(Collection, SendCallback, timeout)</c>:1121，也就是 Python
+    /// <c>send_async</c> 收到 list 时走的批量分支）：一批<b>一个请求</b>、请求码是
+    /// SendBatchMessage(320)、回调恰好一次。
+    ///
+    /// 后半段锁的是「每条子消息都要过 Validators.CheckMessage」：直接把 MessageBatch 丢给
+    /// SendAsync 会漏掉这步，等于批量路径绕过本地校验；而且这类失败必须<b>进回调</b>（Python
+    /// 的批量分支在 runnable 里抛、由外层 catch 接住），不能砸回调用方的栈。
+    /// </summary>
+    [Fact]
+    public void SendBatchAsync_SendsOneRequestPerBatch()
+    {
+        using var cluster = MockCluster.Start(1);
+        cluster.Script(0, new List<(int, int)>(), (ResponseCode.Success, 0));
+        DefaultMQProducer producer = Started(cluster, "GID_batch_async");
+        producer.MaxMessageSize = 4096;
+        var cb = new Recorder();
+        producer.SendBatchAsync(new List<Message> { Msg(10), Msg(10), Msg(10) }, cb, 5000);
+
+        Assert.True(cb.WaitDone(1, 5000), string.Join(" / ", cb.Errors()));
+        Assert.Equal(1, cb.Count);
+        Assert.Equal(SendStatus.SendOk, cb.Results()[0]!.SendStatus);
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
+        Assert.Equal(0, cluster.CountRequests(RequestCode.SendMessageV2));
+        WireRecord? wire = cluster.FirstSendRequest();
+        Assert.NotNull(wire);
+        Assert.True(wire!.HasBody);
+        // 一批三条：编码后的 body 必须比单条大得多，否则就是只发了其中一条
+        Assert.True(wire.Body.Length > 3 * 10, "batch body carries all sub-messages: " + wire.Body.Length);
+
+        // 超长子消息：整批就地拒掉，一条都不上线，且失败进回调
+        var bad = new Recorder();
+        producer.SendBatchAsync(new List<Message> { Msg(10), Msg(4096) }, bad, 5000);
+        Assert.True(bad.WaitDone(1, 5000), "校验失败也要有终态回调");
+        Assert.Contains("over max value", string.Join(" / ", bad.Errors()));
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
+
+        // 空列表：与同步内核同一句文案，同样进回调
+        var empty = new Recorder();
+        producer.SendBatchAsync(new List<Message>(), empty, 5000);
+        Assert.True(empty.WaitDone(1, 5000), "空批也要有终态回调");
+        Assert.Contains("message list is empty", string.Join(" / ", empty.Errors()));
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
+        producer.Shutdown();
+    }
+
+    /// <summary>
+    /// 批量发送的客户端 ID 口径（对应 Java <c>DefaultMQProducer.batch():1176-1182</c> 的顺序 +
+    /// <c>MQClientAPIImpl.processSendResponse:785</c>）：
+    ///   ① <b>每条子消息</b>的 UNIQ_KEY 必须在<b>编码之前</b>写好 —— 否则落进 commitLog 的子
+    ///     消息没有客户端 ID，消费端轨迹、按 uniqKey 反查全断，而发送侧看起来一切正常；
+    ///   ② <c>SendResult.MsgId</c> 取<b>批量自身</b>那条消息写在报文属性里的 UNIQ_KEY，
+    ///     不是 broker 回的 offsetMsgId。同步与异步两条入口必须同一口径。
+    ///
+    /// ⚠ 有意不跟 Java 的「broker 没回 batchUniqId 时把 MsgId 换成逐条逗号串」：同步批量在
+    /// <see cref="DefaultMQProducer.SendBatch"/> 里要 CloneMessage（免得把压缩后的 body 写回
+    /// 调用方的原始消息），克隆出来的是普通 Message，解析应答时子消息列表已经拿不到了；
+    /// 四种语言（Python/Rust/C++/.NET）统一取批量自身的 ID 才能互相比对。要紧的那一半
+    /// （逐条 ID 进 body）与 Java 一致。
+    /// </summary>
+    [Fact]
+    public void BatchSends_CarryPerSubClientIds_AndReportTheBatchId()
+    {
+        using var cluster = MockCluster.Start(1);
+        cluster.Script(0, new List<(int, int)>(), (ResponseCode.Success, 0));
+        DefaultMQProducer producer = Started(cluster, "GID_batch_client_id");
+
+        SendResult sync = producer.SendBatch(new List<Message> { Msg(), Msg(), Msg() });
+        var cb = new Recorder();
+        producer.SendBatchAsync(new List<Message> { Msg(), Msg(), Msg() }, cb, 5000);
+        Assert.True(cb.WaitDone(1, 5000), string.Join(" / ", cb.Errors()));
+        SendResult asyncResult = cb.Results()[0]!;
+
+        foreach (int n in new[] { 0, 1 })
+        {
+            WireRecord? wire = cluster.SendRequestAt(n);
+            Assert.NotNull(wire);
+            SendResult r = n == 0 ? sync : asyncResult;
+
+            // ① body 里每条子消息都带着互不相同的 32 位十六进制客户端 ID
+            List<Message> subs = MessageDecoder.DecodeBatchMessages(wire!.Body);
+            Assert.Equal(3, subs.Count);
+            var seen = new HashSet<string>();
+            foreach (Message m in subs)
+            {
+                string id = MessageClientIDSetter.GetUniqId(m);
+                Assert.Equal(32, id.Length);
+                Assert.True(seen.Add(id), "每条子消息的 UNIQ_KEY 必须各不相同");
+                // 整批的 ID 不能和某条子消息撞，否则等于没把两者区分开
+                Assert.NotEqual(r.MsgId, id);
+            }
+
+            // ② MsgId = 批量自身的客户端 ID（就在报文属性里），OffsetMsgId 才是 broker 那份
+            Assert.Equal(32, r.MsgId.Length);
+            Assert.DoesNotContain(",", r.MsgId);
+            Assert.Contains(r.MsgId, wire.Ext["i"]);
+            Assert.StartsWith("MOCK-", r.OffsetMsgId);
+            Assert.NotEqual(r.MsgId, r.OffsetMsgId);
+        }
+
+        producer.Shutdown();
+    }
+
+    /// <summary>
+    /// 批量消息过字节闸时按<b>整批</b>扣（Python <c>_back_pressure_msg_len</c> 的 list 分支：
+    /// 逐条累加、空 body 也算 1）。写成「一条」不会让任何一笔发送失败，只会让一批 100 条只占
+    /// 1 格容量 —— 字节闸对批量形同虚设，要等长跑把队列打爆才暴露。
+    /// </summary>
+    [Fact]
+    public void SendBatchAsync_ChargesWholeBatchToSizeGate()
+    {
+        using var cluster = MockCluster.Start(1);
+        cluster.MakeSilent(0);
+        DefaultMQProducer producer = Started(cluster, "GID_batch_async_bp");
+        producer.EnableBackpressureForAsyncMode = true;
+        producer.BackPressureForAsyncSendNum = 10;
+        producer.BackPressureForAsyncSendSize = 1024 * 1024;
+        const int each = 300 * 1024;
+        List<Message> batch = new List<Message> { Msg(each), Msg(each) };
+        var held = new Recorder();
+        producer.SendBatchAsync(batch, held, 2000);
+
+        long whole = 2L * each;
+        Assert.True(WaitUntil(
+            () => producer.SemaphoreAsyncSendSizeAvailablePermits == 1024 * 1024 - whole, 2000),
+            "字节闸要按整批扣，空闲=" + producer.SemaphoreAsyncSendSizeAvailablePermits);
+        Assert.Equal(9, producer.SemaphoreAsyncSendNumAvailablePermits);
+
+        // 闸上只剩 420 KiB：第二笔同样的批量扣不下，按 Java 原文拒掉（而且只占一格条数都不该留）
+        var rejected = new Recorder();
+        producer.SendBatchAsync(batch, rejected, 150);
+        Assert.True(rejected.WaitDone(1, 5000));
+        Assert.Equal("send message tryAcquire semaphoreAsyncSize timeout", rejected.Errors()[0]);
+        Assert.Equal(9, producer.SemaphoreAsyncSendNumAvailablePermits);
+        Assert.Equal(1024 * 1024 - whole, producer.SemaphoreAsyncSendSizeAvailablePermits);
+
+        Assert.True(held.WaitDone(1, 8000), "第一笔照样要有终态");
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
+        Assert.True(WaitUntil(
+            () => producer.SemaphoreAsyncSendSizeAvailablePermits == 1024 * 1024, 5000));
+        Assert.Equal(10, producer.SemaphoreAsyncSendNumAvailablePermits);
+        producer.Shutdown();
+    }
+
+    /// <summary>未启动时批量异步与单条异步同一口径：就地抛，一个回调都不交付。</summary>
+    [Fact]
+    public void SendBatchAsync_BeforeStartThrowsSynchronously()
+    {
+        var producer = new DefaultMQProducer("GID_batch_async_nostart")
+        {
+            NamesrvAddr = "127.0.0.1:9876",
+        };
+        var cb = new Recorder();
+        MQClientException e = Assert.Throws<MQClientException>(
+            () => producer.SendBatchAsync(new List<Message> { Msg() }, cb, 1000));
+        Assert.Contains("producer", e.Message);
+        Assert.Equal(0, cb.Count);
+    }
 }

@@ -763,14 +763,23 @@ class MQClientInstance:
         if response.code in status_map:
             header = SendMessageResponseHeader()
             header.from_ext_fields(response.ext_fields)
-            # 对应 Java MQClientAPIImpl.processSendResponse(:794-806)：
-            #   msgId         = 客户端唯一 ID（UNIQ_KEY，批量消息为逐条拼接）
+            # 对应 Java MQClientAPIImpl.processSendResponse(:785-793, :794-806)：
+            #   msgId         = 客户端唯一 ID：批量消息用**批量自身**的 UNIQ_KEY
+            #                   （inner-batch 时 broker 会把它原样回在 batchUniqId 里）
             #   offsetMsgId   = 响应头里的 msgId（broker 生成的 offset 消息 ID）
             #   regionId      = 响应头 MSG_REGION，缺省回落 DefaultRegion
             #   traceOn       = 响应头 TRACE_ON != "false"（broker 默认 true）
+            # ⚠ 有意偏离 Java：Java 在 broker **没**回 batchUniqId（= 普通 topic 上的客户端
+            # 批量，不是 inner-batch）时把 msgId 换成「逐条子消息 UNIQ_KEY 的逗号串」
+            # （processSendResponse:786-793）。本端口的解析层只拿得到「这一条发出去的消息」，
+            # 拿不到子消息列表（Rust/C++ 同样如此），而且四语言要能互相对拍 —— 所以统一用批量
+            # 自身的 ID。要紧的那一半已对齐：每条子消息在编码前就写好了自己的 UNIQ_KEY
+            # （DefaultMQProducer._send_batch），broker 拆开后消费端与轨迹看到的逐条 ID 与
+            # Java 完全一致。
+            uniq_msg_id = get_uniq_id(msg) or header.batch_uniq_id
             result = SendResult(
                 send_status=status_map[response.code],
-                msg_id=get_uniq_id(msg) or header.msg_id,
+                msg_id=uniq_msg_id or header.msg_id,
                 message_queue=MessageQueue(mq.topic, mq.broker_name, header.queue_id if header.queue_id is not None else mq.queue_id),
                 queue_offset=header.queue_offset or 0,
                 transaction_id=header.transaction_id,

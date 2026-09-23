@@ -229,9 +229,9 @@ public:
     // 所以背压打满时「异步」会退化成「等满 timeout 再报错」；队满时 Java 也允许就地跑完
     // 这一笔（同样阻塞调用方），为的是把已经扣掉的许可还得回来。
     //
-    // 与 Java 的两处有意差别：未 start() 时同步抛而不是走回调；批量消息复用同步批量内核
-    // （只是不阻塞调用方）。信号量本身另有两处（原地改容量、不需要 ReadWriteCASLock），
-    // 见 backpressure.h。
+    // 与 Java 的两处有意差别：未 start() 时同步抛而不是走回调；批量消息不进这里，它有独立
+    // 入口 sendBatchAsync（复用同步批量内核，只是不阻塞调用方）。信号量本身另有两处（原地
+    // 改容量、不需要 ReadWriteCASLock），见 backpressure.h。
     void sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback,
                    int32_t timeoutMillis = -1);
     // 定点异步发送：mq 非空时失败只在**同一台 broker** 上换 opaque 重试
@@ -257,6 +257,30 @@ public:
 
     // ---------------- 批量 ----------------
     SendResult sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis = -1);
+    // 定点批量发送（Java send(Collection, MessageQueue, timeout)）：整批落到 mq 所在队列，
+    // 不做轮询、不换 broker。
+    SendResult sendBatch(const std::vector<Message>& msgs, const MessageQueue& mq,
+                         int32_t timeoutMillis = -1);
+
+    // 批量异步（对应 Java DefaultMQProducer.send(Collection, SendCallback, timeout):1121
+    // → defaultMQProducerImpl.send(batch(msgs), callback, timeout)）。
+    //
+    // 与 Java 的差别要说清楚：Java 有 SEND_BATCH + invokeAsync 的真异步批量内核，本实现
+    // （与 Python 一致）批量只有同步内核，所以这里是**在 AsyncSenderExecutor 线程里同步发
+    // 一批**、结果照样挪到 NettyClientPublicExecutor 上回调。对调用方语义没差别——不阻塞
+    // 发送方、回调线程口径一致。
+    //
+    // SendMessageHook（before/after）**照跑**：复用的同步批量内核内部就是 sendWithHooks，
+    // 每轮尝试一个 context，与 Python 的批量分支同一口径。差别只在重试语义——这一条链走的
+    // 是同步内核的 retryTimesWhenSendFailed 循环，不是异步链 onSendException 的换 broker
+    // 重试；所以 completeAsync 不再重复跑 after（context 归内核自己收尾）。
+    //
+    // 背压闸与单条异步同口径，只是「字节」许可按整批每条 body 长度累加（空 body 也算 1，
+    // 整批为空算 1），见 batchBackPressureMsgLen。未 start() 时同样是同步抛。
+    void sendBatchAsync(const std::vector<Message>& msgs, std::shared_ptr<SendCallback> callback,
+                        int32_t timeoutMillis = -1);
+    void sendBatchAsync(const std::vector<Message>& msgs, const MessageQueue& mq,
+                        std::shared_ptr<SendCallback> callback, int32_t timeoutMillis = -1);
 
     // ---------------- 事务消息 ----------------
     // 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction 的**两阶段**：
@@ -300,6 +324,10 @@ protected:
     int32_t prepareForSend(Message& msg) const;
 
     // ---------------- 轨迹 / 钩子内部实现 ----------------
+    // 批量同步内核（sendBatch 两个重载与批量异步共用）：校验每条子消息 → 组批 → 压缩位 →
+    // 选队列（pinned 非空则定点）→ sendWithHooks。
+    SendResult sendBatchKernel(const std::vector<Message>& msgs, const MessageQueue* pinned,
+                               int32_t timeoutMillis);
     // 带 before/after 钩子的同步发送（对应 Java sendKernelImpl 的钩子点）：
     // 无钩子时直接透传，零开销。msgType 判定与 Java 一致：
     // TRAN_MSG=true -> Trans_Msg_Half；带 DELAY 属性 -> Delay_Msg；否则 Normal_Msg。
@@ -345,6 +373,11 @@ protected:
         bool sizeAcquired = false;                     // 已拿到 msgLen 份「字节」许可
         bool permitsReleased = false;                  // 只归还一次（链上多条终点会重复收尾）
         int64_t msgLen = 1;                            // 扣字节许可的份数，**压缩前**的 body 长度
+        // ---- 批量异步（sendBatchAsync）----
+        // batch=true 时这条链不建 request/publish/context，而是把 batchMsgs 交给同步批量内核
+        // （见 sendBatchAsyncInner）。msg 留空，重试链自然不参与。
+        bool batch = false;
+        std::vector<Message> batchMsgs;
         std::chrono::steady_clock::time_point attemptBegan;  // 本次尝试起点（单调钟）
     };
 
@@ -367,6 +400,10 @@ protected:
     void releaseBackPressure(const std::shared_ptr<AsyncSendState>& state);
     // 出队后的准备工作（Java sendDefaultImpl(ASYNC) → sendKernelImpl）
     void sendAsyncInner(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned);
+    // 批量分支（Python _send_async_inner 的 isinstance(msg, list) 那一段）：在
+    // AsyncSenderExecutor 线程里跑同步批量内核，结果挪到回调线程交付。
+    void sendBatchAsyncInner(const std::shared_ptr<AsyncSendState>& state,
+                             const MessageQueue* pinned);
     // 建请求 + before 钩子，然后发出第一笔尝试
     void sendKernelAsync(const std::shared_ptr<AsyncSendState>& state);
     // 一笔在途尝试（对应 Java MQClientAPIImpl#sendMessageAsync）。

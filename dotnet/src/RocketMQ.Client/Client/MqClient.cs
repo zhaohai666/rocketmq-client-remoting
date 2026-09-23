@@ -842,13 +842,23 @@ public sealed class MQClientInstance : IDisposable
         var respHeader = new SendMessageResponseHeader();
         respHeader.FromExtFields(response.ExtFields);
         // 对应 Java MQClientAPIImpl.processSendResponse：
-        //   msgId         = 客户端唯一 ID（UNIQ_KEY；批量消息为逐条逗号拼接）
+        //   msgId         = 客户端唯一 ID（UNIQ_KEY）
         //   offsetMsgId   = 响应头里的 msgId（broker 生成的 offset 消息 ID）
         //   regionId      = 响应头 MSG_REGION，缺省回落 DefaultRegion
         //   traceOn       = 响应头 TRACE_ON != "false"（broker 默认 true）
-        string msgId = msg.IsBatch
-            ? JoinBatchUniqId(msg) ?? (respHeader.MsgId ?? string.Empty)
-            : (MessageClientIDSetter.GetUniqId(msg) ?? respHeader.MsgId ?? string.Empty);
+        // 批量消息取的是**批量自身**那条消息的 ID（inner-batch 时 broker 会把它原样回在
+        // batchUniqId 里，客户端没带 ID 时用它兜底）。
+        // ⚠ 有意偏离 Java processSendResponse:786-793：Java 在 broker **没**回 batchUniqId
+        // （= 普通 topic 上的客户端批量）时把 msgId 换成「逐条子消息 UNIQ_KEY 的逗号串」，
+        // 本端口不跟随 —— 同步批量在 Producer.SendBatch 里会 CloneMessage（为了不把压缩后的
+        // body 写回调用方的原始消息），克隆出来的是普通 Message，子消息列表在这里已经拿不到了；
+        // 四种语言也要能互相比对，Python/Rust/C++ 同样取批量自身的 ID。要紧的那一半已经对齐：
+        // 每条子消息的 UNIQ_KEY 在编码前就写好（MessageBatch.GenerateFromList），broker 拆开后
+        // 消费端与轨迹看到的逐条 ID 和 Java 一致。
+        string clientUniqId = MessageClientIDSetter.GetUniqId(msg);
+        string msgId = !string.IsNullOrEmpty(clientUniqId)
+            ? clientUniqId
+            : respHeader.BatchUniqId ?? respHeader.MsgId ?? string.Empty;
         string regionId = MixAll.DefaultTraceRegionId;
         if (response.ExtFields.TryGetValue(MessageConst.PropertyMsgRegion, out string? rid)
             && !string.IsNullOrEmpty(rid))
@@ -876,26 +886,6 @@ public sealed class MQClientInstance : IDisposable
             // 定时/延迟消息才有；普通消息恒为 null（对齐 Java processSendResponse:798）。
             RecallHandle = respHeader.RecallHandle,
         };
-    }
-
-    private static string? JoinBatchUniqId(Message msg)
-    {
-        if (msg is not MessageBatch batch || batch.Messages.Count == 0)
-        {
-            return null;
-        }
-
-        var parts = new List<string>(batch.Messages.Count);
-        foreach (Message m in batch.Messages)
-        {
-            string? id = MessageClientIDSetter.GetUniqId(m);
-            if (!string.IsNullOrEmpty(id))
-            {
-                parts.Add(id);
-            }
-        }
-
-        return parts.Count == 0 ? null : string.Join(",", parts);
     }
 
     public void SendMessageOneway(string producerGroup, Message msg, MessageQueue mq,

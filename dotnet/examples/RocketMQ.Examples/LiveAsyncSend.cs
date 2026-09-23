@@ -16,8 +16,10 @@
 //   A3  定点发送（给了 mq）真的落在那条队列上，别的队列一条都不多。
 //   A4  拦截钩子（CheckForbidden）看到的是 CommunicationMode.Async；它拒绝时异常原样到
 //       回调，而且 broker 上一条都没落（连请求都没发出去）。
-//   A5  批量异步没有异步内核，走同步批量内核：一次回调、两条都落地、broker 收到的是
-//       SEND_BATCH_MESSAGE(320)。
+//   A5  批量异步（SendBatchAsync，对位 Java send(Collection, SendCallback, timeout)）：
+//       一批 3 条回调恰好一次 + broker 侧真落 3 条；**逐条客户端 ID 真的存进了 broker**
+//       （读回子消息看 UNIQ_KEY）；定点批量真的落在指定队列；混 topic / 空批的本地校验
+//       没被异步路径绕过（错误**进回调**，一次都不欠）；背压扣的是**整批**字节，两份许可原样归还。
 //   A6  Shutdown 排空在途准备段（Java/Python 用的是不等待的 shutdown()，队列里的任务会
 //       连同任务一起被丢掉）：交进来的每一笔都真的上线了，broker 上条条落地。
 //
@@ -480,28 +482,171 @@ public static class LiveAsyncSend
     }
 
     // ------------------------------------------------- A5 批量走同步批量内核
+    private static long OthersLanded(Env env, List<MessageQueue> queues)
+    {
+        long total = 0;
+        for (int i = 1; i < queues.Count; i++)
+        {
+            total += Math.Max(0, QueueLanded(env, queues[i]));
+        }
+
+        return total;
+    }
+
+    /// <summary>
+    /// 批量异步入口（对位 Java <c>send(Collection&lt;Message&gt;, SendCallback, long)</c>、Python
+    /// <c>send_async(list)</c>）在真 broker 上的五条口径。每条都刻意选在「只跑离线单测看不出来」
+    /// 的那一侧：回调有没有交付、逐条客户端 ID 有没有真的存进 broker、本地校验有没有被异步路径
+    /// 绕过、错误有没有被静默吞掉、字节许可有没有漏。
+    /// </summary>
     private static void A5BatchAsync(Env env, string t)
     {
         DefaultMQProducer p = MakeProducer(env, "a5");
+
+        // ① 一批 3 条：回调恰好一次、SEND_OK，而且 broker 上真的落了 3 条。
+        //    只看回调会被「回调报了 OK 但请求压根没发出去」蒙过去 —— 那条必须靠 broker 侧对账。
         var rec = new Recorder();
+        var list = new List<Message>
+        {
+            Msg(t, "async-a5-0"), Msg(t, "async-a5-1"), Msg(t, "async-a5-2"),
+        };
+        p.SendBatchAsync(list, rec, 10000);
+        Check("A5 一批 3 条：回调恰好一次且 SEND_OK",
+            rec.WaitDone(1, 20000) && rec.Done == 1 && rec.Ok == 1
+                && rec.Results().Count == 1 && rec.Results()[0].MsgId.Length == 32, rec.Summary());
+        long landed = WaitLanded(env, t, 3);
+        Check("A5 broker 上真落了 3 条（不是回调自己说成功）", landed == 3,
+            "landed=" + N(landed) + "（-1 = 路由还没建出来）");
+        Skip("A5 请求码 = SEND_BATCH_MESSAGE(320)",
+            "真机看不到上线报文，这一条由 ProducerAsyncTests.BatchAsync 在进程内取证");
+
+        // ①b 逐条 ID 的**落地**证据：读回 broker 存下来的那条子消息，它必须带客户端生成的
+        //     32 位 UNIQ_KEY。Java batch():1176 的顺序是「逐条 setUniqID → 才 encode()」；
+        //     顺序错了（或像修复前的本端口那样压根不写），broker 拆开批量后存的就是没有 ID 的
+        //     裸消息 —— 消费端去重、轨迹控制台串线全废，而发送侧回调照样 SEND_OK，看不出来。
+        SendResult batchResult = rec.Results().Count > 0 ? rec.Results()[0] : new SendResult();
+        Check("A5 批量的 MsgId 是客户端 32 位 ID、不是 broker 的 OffsetMsgId",
+            batchResult.MsgId.Length == 32 && !batchResult.MsgId.Contains(',')
+                && batchResult.MsgId != batchResult.OffsetMsgId,
+            "MsgId=" + batchResult.MsgId + " OffsetMsgId=" + batchResult.OffsetMsgId);
+        // 批量应答的 OffsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个
+        // commitLog 偏移），它本身就是「这一批被拆开存成 3 条」的证据
+        string[] subOffsets = Array.FindAll(
+            batchResult.OffsetMsgId.Split(','), s => s.Length > 0);
+        Check("A5 broker 逐条回了 3 个 commitLog 偏移（批量确实被拆开落地）",
+            subOffsets.Length == 3, "OffsetMsgId=" + batchResult.OffsetMsgId);
+        string storedUniq = string.Empty;
+        if (subOffsets.Length > 0)
+        {
+            MessageExt? storedSub = null;
+            Check("A5 能读回 broker 上存下来的那条子消息",
+                WaitUntil(() =>
+                {
+                    try
+                    {
+                        storedSub = env.Admin.ViewMessage(t, subOffsets[0]);
+                        return true;
+                    }
+                    catch (Exception)
+                    {
+                        return false; // commitLog 还没刷出去
+                    }
+                }, 15000), "offset=" + subOffsets[0]);
+            // MessageConst.PropertyUniqClientMessageIdKeyidx == "UNIQ_KEY"
+            storedUniq = storedSub?.GetProperty("UNIQ_KEY") ?? string.Empty;
+        }
+
+        Check("A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+            storedUniq.Length == 32, "stored UNIQ_KEY=" + storedUniq);
+
+        // ② 定点批量：mq 参数真的传到了批量内核，而不是被丢掉后自己挑一条。
+        List<MessageQueue> queues;
         try
         {
-            var list = new List<Message>
-            {
-                Msg(t, "async-a5-0"), Msg(t, "async-a5-1"), Msg(t, "async-a5-2"),
-            };
-            p.SendAsync(MessageBatch.GenerateFromList(list), rec, 8000);
-            Check("A5 批量异步只有一次回调且 SEND_OK",
-                rec.WaitDone(1, 20000) && rec.Done == 1 && rec.Ok == 1, rec.Summary());
-            Check("A5 三条一起落了地", WaitLanded(env, t, 3) == 3,
-                "landed=" + N(Landed(env, t)));
-            Skip("A5 请求码 = SEND_BATCH_MESSAGE(320)",
-                "真机看不到上线报文，这一条由 ProducerAsyncTests.BatchAsync 在进程内取证");
+            queues = env.Admin.ExamineTopicRoute(t).GetAllMessageQueue(t);
         }
-        finally
+        catch (Exception e)
         {
+            Check("A5 定点批量取到了发布队列", false, e.Message);
             p.Shutdown();
+            return;
         }
+
+        if (queues.Count == 0)
+        {
+            Check("A5 定点批量取到了发布队列", false, "queues=0");
+            p.Shutdown();
+            return;
+        }
+
+        MessageQueue aimed = queues[0];
+        long aimedBefore = QueueLanded(env, aimed);
+        long othersBefore = OthersLanded(env, queues);
+        var pinned = new Recorder();
+        p.SendBatchAsync(
+            new List<Message> { Msg(t, "async-a5-pin-0"), Msg(t, "async-a5-pin-1"), Msg(t, "async-a5-pin-2") },
+            pinned, 10000, aimed);
+        bool pinnedOk = pinned.WaitDone(1, 20000) && pinned.Done == 1 && pinned.Ok == 1;
+        List<SendResult> pr = pinned.Results();
+        bool landedOnAimed = pr.Count > 0 && pr[0].MessageQueue.BrokerName == aimed.BrokerName
+            && pr[0].MessageQueue.QueueId == aimed.QueueId;
+        long aimedAfter = QueueLanded(env, aimed);
+        Check("A5 定点批量那条队列正好多 3 条",
+            WaitUntil(() => (aimedAfter = QueueLanded(env, aimed)) == aimedBefore + 3, 20000),
+            "该队列 " + N(aimedBefore) + " -> " + N(aimedAfter));
+        long othersAfter = OthersLanded(env, queues);
+        Check("A5 定点批量落在指定队列、别的队列一条都没多",
+            pinnedOk && landedOnAimed && aimedAfter == aimedBefore + 3 && othersAfter == othersBefore,
+            "ok=" + N(pinned.Ok) + " 落位=" + (landedOnAimed ? "1" : "0")
+                + " 该队列 " + N(aimedBefore) + "->" + N(aimedAfter)
+                + " 其它 " + N(othersBefore) + "->" + N(othersAfter));
+
+        // ③ 混 topic 的一批：批量内核的同质性校验必须在异步路径上照样跑，且异常**进回调**
+        //    （Java 的 runnable catch → onException），不是同步抛、也不是静默丢掉。
+        var mixed = new Recorder();
+        p.SendBatchAsync(
+            new List<Message> { Msg(t, "async-a5-mixed-0"), Msg(env.Topic("BatchOther"), "async-a5-mixed-1") },
+            mixed, 5000);
+        Check("A5 混 topic 的一批在回调里报错（本地校验没被异步路径绕过）",
+            mixed.WaitDone(1, 10000) && mixed.Done == 1 && mixed.Ok == 0
+                && mixed.FirstError().Contains("should be the same"), mixed.Summary());
+
+        // ④ 空批次：同一口径 —— 错误进回调，一次回调都不欠。
+        var empty = new Recorder();
+        p.SendBatchAsync(new List<Message>(), empty, 5000);
+        Check("A5 空批次也是「恰好一次失败回调」，不静默吞掉",
+            empty.WaitDone(1, 10000) && empty.Done == 1 && empty.Ok == 0
+                && empty.FirstError().Contains("message list is empty"), empty.Summary());
+
+        // ⑤ 背压扣的是**整批**字节，不是「一条」：字节闸压到地板（1 MiB），一批 2×600 KiB
+        //    必须被拦下（整批 1.2 MiB > 1 MiB）；换一批 2×100 KiB 又必须过。只按第一条算
+        //    （600 KiB）或者干脆不扣，这两条就会同时反向。
+        p.EnableBackpressureForAsyncMode = true;
+        p.BackPressureForAsyncSendNum = 1;
+        p.BackPressureForAsyncSendSize = 1024 * 1024;
+        var gated = new Recorder();
+        p.SendBatchAsync(
+            new List<Message> { Msg(t, new string('x', 600 * 1024)), Msg(t, new string('x', 600 * 1024)) },
+            gated, 2000);
+        Check("A5 整批 1.2MiB 被 1MiB 字节闸拦下（回调拿到 TOO_MUCH_REQUEST）",
+            gated.WaitDone(1, 15000) && gated.Done == 1 && gated.Ok == 0
+                && gated.FirstError().Contains("semaphoreAsyncSize timeout"), gated.Summary());
+        // 同一道闸下的小批次必须照常落地：证明「拦住」是因为整批量，不是因为批量被一概论处
+        var passed = new Recorder();
+        p.SendBatchAsync(
+            new List<Message> { Msg(t, new string('y', 100 * 1024)), Msg(t, new string('y', 100 * 1024)) },
+            passed, 10000);
+        Check("A5 同一道闸下 200KiB 的一批照常拿到 SEND_OK",
+            passed.WaitDone(1, 20000) && passed.Done == 1 && passed.Ok == 1, passed.Summary());
+        // 许可必须原样归还：漏一份就是长跑之后「所有异步发送集体超时」，而单次发送看不出来。
+        int numTotal = p.GetBackPressureForAsyncSendNum();
+        int sizeTotal = p.GetBackPressureForAsyncSendSize();
+        Check("A5 批量路径把两份许可原样归还（空闲量回到总量，含被闸拦下那一笔）",
+            WaitUntil(() => p.SemaphoreAsyncSendNumAvailablePermits == numTotal
+                && p.SemaphoreAsyncSendSizeAvailablePermits == sizeTotal, 10000),
+            "空闲条数=" + N(p.SemaphoreAsyncSendNumAvailablePermits) + " 总量=" + N(numTotal)
+                + " 空闲字节=" + N(p.SemaphoreAsyncSendSizeAvailablePermits) + " 总量=" + N(sizeTotal));
+        p.Shutdown();
     }
 
     // ------------------------------------------------- A6 关池排空在途准备段

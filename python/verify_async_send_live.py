@@ -410,6 +410,37 @@ def a5_batch_async(admin, topic):
               "landed=%d" % _landed(admin, topic))
         check("*  A5 请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证",
               True, "真机看不到上线报文，见 tests/test_producer_async.py")
+
+        # 逐条 ID 的**落地**证据：读回 broker 存下来的那条子消息，它必须带客户端生成的
+        # 32 位 UNIQ_KEY。Java batch():1176 的顺序是「逐条 setUniqID → 才 encode()」；
+        # 顺序错了（或像修复前的本端口那样压根不写），broker 拆开批量后存的就是没有 ID 的
+        # 裸消息 —— 消费端去重、轨迹控制台串线全废，而发送侧回调照样 SEND_OK，看不出来。
+        r = rec.results[0] if rec.results else None
+        if r is None:
+            check("A5 批量读回", False, "回调没有交付 SendResult")
+            return
+        check("A5 批量的 msg_id 是客户端 32 位 ID、不是 broker 的 offset_msg_id",
+              len(r.msg_id) == 32 and "," not in r.msg_id and r.msg_id != r.offset_msg_id,
+              "msgId=%s offsetMsgId=%s" % (r.msg_id, r.offset_msg_id))
+        # 批量应答的 offset_msg_id 是 broker **逐条**回的一串（逗号分隔，一条子消息一个
+        # commitLog 偏移），它本身就是「这一批被拆开存成 3 条」的证据
+        sub_offsets = [o for o in r.offset_msg_id.split(",") if o]
+        check("A5 broker 逐条回了 3 个 commitLog 偏移（批量确实被拆开落地）",
+              len(sub_offsets) == 3, "offsetMsgId=%s" % r.offset_msg_id)
+        stored = [None]
+
+        def _read_sub():
+            try:
+                stored[0] = admin.view_message(topic, sub_offsets[0])
+                return True
+            except Exception:
+                return False  # commitLog 还没刷出去
+
+        uniq = ""
+        if sub_offsets and _wait_until(_read_sub, 15.0) and stored[0] is not None:
+            uniq = stored[0].get_property("UNIQ_KEY") or ""
+        check("A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+              len(uniq) == 32, "stored UNIQ_KEY=%s" % uniq)
     finally:
         p.shutdown()
 

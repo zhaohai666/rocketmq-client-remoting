@@ -16,8 +16,10 @@
 //   A3  定点发送（给了 mq）真的落在那条队列上，别的队列一条都不多。
 //   A4  拦截钩子（CheckForbidden）看到的是 CommunicationMode::ASYNC；它拒绝时异常文本原样
 //       到回调，而且 broker 上一条都没落（连请求都没发出去）。
-//   A5  批量异步（MessageBatch 过 sendAsync）没有异步批量内核，走同步批量内核：一次回调、
-//       三条都落地。
+//   A5  批量异步（sendBatchAsync，对位 Java send(Collection, SendCallback, timeout)）：
+//       一批 5 条回调恰好一次 + broker 侧真落 5 条；定点批量真的落在指定队列；
+//       混 topic / 空批的本地校验没被异步路径绕过（错误**进回调**，一次都不欠）；
+//       背压扣的是**整批**字节，而且两份许可原样归还。
 //   A6  Shutdown 排空在途准备段（C++ 这里用的是 ``shutdown(true)``，Java 用的是不等待的
 //       ``shutdown()``）：交进来的每一笔都真的上线了，broker 上条条落地。
 //
@@ -45,6 +47,7 @@
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message.h"
+#include "rocketmq/common/message_const.h"
 #include "rocketmq/remoting/protocol/route.h"
 
 using namespace rocketmq;
@@ -498,22 +501,168 @@ void a4ForbiddenHook(Env& env, const std::string& t) {
     p->shutdown();
 }
 
-// ------------------------------------------------- A5 批量走同步批量内核
+// ------------------------------------------------- A5 批量异步（sendBatchAsync）
+
+// 除第 0 条以外的队列合计落地条数（定点批量要证明「别的队列一条都没多」）。
+int64_t othersLanded(DefaultMQAdminExt& admin, const std::vector<MessageQueue>& queues) {
+    int64_t total = 0;
+    for (size_t i = 1; i < queues.size(); ++i) {
+        total += std::max<int64_t>(0, queueLanded(admin, queues[i]));
+    }
+    return total;
+}
+
+/// 批量异步入口对位 Java `send(Collection<Message>, SendCallback, long)` / Python
+/// `send_async(list)`（走同步批量内核 `_send_batch`）。每条断言都刻意选在「只跑离线单测
+/// 看不出来」的那一侧：回调有没有交付、批量内核的本地校验有没有被异步路径绕过、错误有没有
+/// 被静默吞掉、许可有没有漏。
 void a5BatchAsync(Env& env, const std::string& t) {
     auto p = makeProducer(env, "a5");
+
+    // ① 一批 5 条：回调恰好一次、SEND_OK，并且 broker 上真的落了 5 条。
+    //    只看回调会被「回调报了 OK 但请求压根没发出去」蒙过去 —— 那条必须靠 broker 侧对账。
     auto rec = std::make_shared<Recorder>();
-    std::vector<Message> list;
-    for (int32_t i = 0; i < 3; ++i) list.push_back(msg(t, "async-a5-" + num(i)));
-    MessageBatch batch = MessageBatch::generateFromList(list);
-    p->sendAsync(batch, rec, 8000);
-    check("A5 批量异步只有一次回调且 SEND_OK",
+    std::vector<Message> batch;
+    for (int32_t i = 0; i < 5; ++i) batch.push_back(msg(t, "async-a5-" + num(i)));
+    p->sendBatchAsync(batch, rec, 10000);
+    check("A5 一批 5 条：回调恰好一次且 SEND_OK",
           waitUntil([&]() { return rec->done() >= 1; }, 20000) && rec->done() == 1
-              && rec->ok() == 1,
+              && rec->ok() == 1 && rec->errorCount() == 0
+              && !rec->results().empty() && !rec->results()[0].msgId.empty(),
           rec->summary());
-    const int64_t landed = waitLanded(env, t, 3);
-    check("A5 三条一起落了地", landed == 3, "landed=" + num(landed));
+    const int64_t landed = waitLanded(env, t, 5);
+    check("A5 broker 上真落了 5 条（不是回调自己说成功）", landed == 5,
+          "landed=" + num(landed) + "（-1 = 路由还没建出来）");
     check("*  A5 请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证", true,
           "真机看不到上线报文，这一条由 tests/test_producer_async.cpp 在进程内取证");
+
+    // ①b 逐条 ID 的**落地**证据：读回 broker 存下来的那条子消息，它必须带客户端生成的
+    //     32 位 UNIQ_KEY。Java batch():1176 的顺序是「逐条 setUniqID → 才 encode()」；
+    //     顺序错了（或像修复前的本端口那样压根不写），broker 拆开批量后存的就是没有 ID 的
+    //     裸消息 —— 消费端去重、轨迹控制台串线全废，而发送侧回调照样 SEND_OK，看不出来。
+    const std::vector<SendResult> batchResults = rec->results();
+    const SendResult batchResult = batchResults.empty() ? SendResult{} : batchResults[0];
+    // 批量 msgId 口径：客户端为整批生成的 UNIQ_KEY，而不是 broker 那串 offsetMsgId
+    check("A5 批量的 msgId 是客户端 32 位 ID、不是 broker 的 offsetMsgId",
+          batchResult.msgId.size() == 32 && batchResult.msgId.find(',') == std::string::npos
+              && batchResult.msgId != batchResult.offsetMsgId,
+          "msgId=" + batchResult.msgId + " offsetMsgId=" + batchResult.offsetMsgId);
+    // 批量应答的 offsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个 commitLog
+    // 偏移），它本身就是「这一批被拆开存成 5 条」的证据
+    std::vector<std::string> subOffsets;
+    for (size_t pos = 0; pos <= batchResult.offsetMsgId.size();) {
+        size_t comma = batchResult.offsetMsgId.find(',', pos);
+        if (comma == std::string::npos) comma = batchResult.offsetMsgId.size();
+        if (comma > pos) subOffsets.push_back(batchResult.offsetMsgId.substr(pos, comma - pos));
+        pos = comma + 1;
+    }
+    check("A5 broker 逐条回了 5 个 commitLog 偏移（批量确实被拆开落地）",
+          subOffsets.size() == 5, "offsetMsgId=" + batchResult.offsetMsgId);
+    MessageExt storedSub;
+    const bool readSub =
+        !subOffsets.empty()
+        && waitUntil(
+               [&]() {
+                   try {
+                       storedSub = env.admin->viewMessage(t, subOffsets.front());
+                       return true;
+                   } catch (const std::exception&) {
+                       return false;  // commitLog 还没刷出去
+                   }
+               },
+               15000);
+    const std::string storedUniq =
+        readSub ? storedSub.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+                : std::string();
+    check("A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+          storedUniq.size() == 32, "stored UNIQ_KEY=" + storedUniq);
+
+    // ② 定点批量：mq 参数真的传到了批量内核，而不是被丢掉后自己挑一条。
+    const std::vector<MessageQueue> queues = p->fetchPublishMessageQueues(t);
+    if (queues.empty()) {
+        check("A5 定点批量取到了发布队列", false, "queues=0");
+        p->shutdown();
+        return;
+    }
+    const MessageQueue aimed = queues[0];
+    const int64_t aimedBefore = queueLanded(*env.admin, aimed);
+    const int64_t othersBefore = othersLanded(*env.admin, queues);
+    auto pinned = std::make_shared<Recorder>();
+    std::vector<Message> pinBatch;
+    for (int32_t i = 0; i < 3; ++i) pinBatch.push_back(msg(t, "async-a5-pin-" + num(i)));
+    p->sendBatchAsync(pinBatch, aimed, pinned, 10000);
+    const bool pinnedOk = waitUntil([&]() { return pinned->done() >= 1; }, 20000)
+                        && pinned->done() == 1 && pinned->ok() == 1;
+    const std::vector<SendResult> pr = pinned->results();
+    const bool landedOnAimed = !pr.empty() && pr[0].messageQueue.brokerName == aimed.brokerName
+                            && pr[0].messageQueue.queueId == aimed.queueId;
+    int64_t aimedAfter = queueLanded(*env.admin, aimed);
+    check("A5 定点批量那条队列正好多 3 条",
+          waitUntil([&]() { return (aimedAfter = queueLanded(*env.admin, aimed)) == aimedBefore + 3; },
+                    20000),
+          "该队列 " + num(aimedBefore) + " -> " + num(aimedAfter));
+    const int64_t othersAfter = othersLanded(*env.admin, queues);
+    check("A5 定点批量落在指定队列、别的队列一条都没多",
+          pinnedOk && landedOnAimed && aimedAfter == aimedBefore + 3 && othersAfter == othersBefore,
+          "ok=" + num(static_cast<int64_t>(pinned->ok())) + " 落位=" + std::string(landedOnAimed ? "1" : "0")
+              + " 该队列 " + num(aimedBefore) + "->" + num(aimedAfter)
+              + " 其它 " + num(othersBefore) + "->" + num(othersAfter));
+
+    // ③ 混 topic 的一批：批量内核的同质性校验必须在异步路径上照样跑，且异常**进回调**
+    //    （Java 的 runnable catch → onException），不是同步抛、也不是静默丢掉。
+    auto mixed = std::make_shared<Recorder>();
+    p->sendBatchAsync({msg(t, "async-a5-mixed-1"), msg(env.topic("BatchOther"), "async-a5-mixed-2")},
+                      mixed, 5000);
+    check("A5 混 topic 的一批在回调里报错（本地校验没被异步路径绕过）",
+          waitUntil([&]() { return mixed->done() >= 1; }, 10000) && mixed->done() == 1
+              && mixed->ok() == 0
+              && mixed->firstError().find("should be the same") != std::string::npos,
+          mixed->summary());
+
+    // ④ 空批次：同一口径 —— 错误进回调，一次回调都不欠。
+    auto empty = std::make_shared<Recorder>();
+    p->sendBatchAsync(std::vector<Message>(), empty, 5000);
+    check("A5 空批次也是「恰好一次失败回调」，不静默吞掉",
+          waitUntil([&]() { return empty->done() >= 1; }, 10000) && empty->done() == 1
+              && empty->ok() == 0
+              && empty->firstError().find("message list is empty") != std::string::npos,
+          empty->summary());
+
+    // ⑤ 背压扣的是**整批**字节，不是「一条」：字节闸压到地板（1 MiB），一批 2×600 KiB
+    //    必须被拦下（整批 1.2 MiB > 1 MiB）；换一批 2×100 KiB 又必须过。只按第一条算
+    //    （600 KiB）或者干脆不扣，这两条就会同时反向。
+    p->setEnableBackpressureForAsyncMode(true);
+    p->setBackPressureForAsyncSendNum(1);
+    p->setBackPressureForAsyncSendSize(1024 * 1024);
+    auto gated = std::make_shared<Recorder>();
+    p->sendBatchAsync({msg(t, std::string(600 * 1024, 'x')), msg(t, std::string(600 * 1024, 'x'))},
+                      gated, 2000);
+    check("A5 整批 1.2MiB 被 1MiB 字节闸拦下（回调拿到 TOO_MUCH_REQUEST）",
+          waitUntil([&]() { return gated->done() >= 1; }, 15000) && gated->done() == 1
+              && gated->ok() == 0
+              && gated->firstError().find("semaphoreAsyncSize timeout") != std::string::npos,
+          gated->summary());
+    // 同一道闸下的小批次必须照常落地：证明「拦住」是因为整批量，不是因为批量被一概论处
+    auto passed = std::make_shared<Recorder>();
+    p->sendBatchAsync({msg(t, std::string(100 * 1024, 'y')), msg(t, std::string(100 * 1024, 'y'))},
+                      passed, 10000);
+    check("A5 同一道闸下 200KiB 的一批照常拿到 SEND_OK",
+          waitUntil([&]() { return passed->done() >= 1; }, 20000) && passed->done() == 1
+              && passed->ok() == 1,
+          passed->summary());
+    // 许可必须原样归还：漏一份就是长跑之后「所有异步发送集体超时」，而单次发送看不出来。
+    const int32_t numTotal = p->getBackPressureForAsyncSendNum();
+    const int32_t sizeTotal = p->getBackPressureForAsyncSendSize();
+    check("A5 批量路径把两份许可原样归还（空闲量回到总量，含被闸拦下那一笔）",
+          waitUntil(
+              [&]() {
+                  return p->getSemaphoreAsyncSendNumAvailablePermits() == numTotal
+                      && p->getSemaphoreAsyncSendSizeAvailablePermits() == sizeTotal;
+              },
+              10000),
+          "空闲条数=" + num(p->getSemaphoreAsyncSendNumAvailablePermits()) + " 总量=" + num(numTotal)
+              + " 空闲字节=" + num(p->getSemaphoreAsyncSendSizeAvailablePermits())
+              + " 总量=" + num(sizeTotal));
     p->shutdown();
 }
 

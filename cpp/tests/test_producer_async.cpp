@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -48,6 +49,8 @@
 #include "rocketmq/common/byte_buffer.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message.h"
+#include "rocketmq/common/message_const.h"
+#include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
@@ -202,6 +205,8 @@ struct Attempt {
     int32_t code = 0;
     int32_t opaque = 0;
     PropertyMap ext;
+    // 上线的 body：批量消息的子消息 ID 只能从编码后的报文里取证
+    Bytes body;
 };
 
 // 一条 SEND 请求的脚本化响应
@@ -345,7 +350,7 @@ private:
             const int idx = sendCount_.fetch_add(1);
             {
                 std::lock_guard<std::mutex> lk(state_);
-                attempts_.push_back({req.code, req.opaque, req.extFields});
+                attempts_.push_back({req.code, req.opaque, req.extFields, req.body});
             }
             Reply reply;
             {
@@ -1264,6 +1269,165 @@ void testFailedAndRetriedSendsReleasePermits() {
     }
 }
 
+// 18. 批量异步（对应 Java DefaultMQProducer.send(Collection, SendCallback, timeout):1121，
+//     也就是 Python send_async 收到 list 时走的批量分支）：一批**一个请求**、回调恰好一次、
+//     请求码是 SEND_BATCH_MESSAGE，而**每条子消息**的本地校验照样生效。
+//     离线用例只能证到「校验/回调」这一半；真落盘的那一半在 live 用例里。
+void testBatchAsyncOneRequestOneCallback() {
+    AsyncFixture fx("BatchAsync");
+    auto hook = std::make_shared<ThreadNameHook>();
+    DefaultMQProducer p("PG_batch_async");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setMaxMessageSize(1024);
+    p.registerSendMessageHook(hook);
+    p.start();
+
+    std::vector<Message> msgs;
+    for (int i = 0; i < 3; ++i) {
+        msgs.push_back(plainMessage(fx.topic));
+    }
+    auto cb = std::make_shared<RecordingCallback>();
+    p.sendBatchAsync(msgs, cb, 3000);
+    expect(cb->waitDone(3000), "a batch async send calls the callback");
+    const RecordingCallback::Snapshot s = cb->snapshot();
+    expectInt(s.successCount, 1, "a good batch delivers exactly one onSuccess");
+    expectInt(s.exceptionCount, 0, "a good batch never reports onException");
+    expectInt(fx.broker.sendCount(), 1, "the whole batch is ONE request, not one per message");
+    const std::vector<Attempt> attempts = fx.broker.attempts();
+    expect(!attempts.empty() && attempts[0].code == RequestCode::SEND_BATCH_MESSAGE,
+           "the batch goes out as SEND_BATCH_MESSAGE",
+           attempts.empty() ? "no attempt recorded" : std::to_string(attempts[0].code));
+    // 同步批量内核里就有 sendWithHooks，所以批量异步不绕钩子（与 Python 同一口径）
+    expectInt(hook->beforeCount.load(), 1, "the batch runs SendMessageHook.before");
+    expectInt(hook->afterCount.load(), 1, "and after exactly once — not twice (no async-chain after)");
+
+    // 超长**子消息**：整批就地失败，一条都不发出去。少了逐条 Validators.checkMessage，
+    // 这一批会原样发到 broker，本地校验对批量路径形同虚设。
+    auto bad = std::make_shared<RecordingCallback>();
+    std::vector<Message> oversized = {plainMessage(fx.topic), Message(fx.topic, Bytes(4096, 'x'))};
+    p.sendBatchAsync(oversized, bad, 3000);
+    expect(bad->waitDone(3000), "an oversized sub-message reaches the callback");
+    expectInt(bad->snapshot().exceptionCount, 1, "the oversized batch is rejected");
+    expect(bad->snapshot().message.find("the message body size over max value, MAX: 1024")
+               != std::string::npos,
+           "the per-sub-message validation text matches Validators/Java", bad->snapshot().message);
+    expectInt(fx.broker.sendCount(), 1, "the rejected batch never reaches the broker");
+
+    // 空批：与同步内核同一句文案，且走回调而不是抛给调用方
+    auto empty = std::make_shared<RecordingCallback>();
+    p.sendBatchAsync(std::vector<Message>{}, empty, 3000);
+    expect(empty->waitDone(3000), "an empty batch reaches the callback");
+    expect(empty->snapshot().message.find("message list is empty") != std::string::npos,
+           "the empty-batch text matches the sync kernel", empty->snapshot().message);
+    expectInt(fx.broker.sendCount(), 1, "an empty batch never reaches the broker");
+    p.shutdown();
+}
+
+// 19. 批量消息过字节闸时按**整批**扣（Python _back_pressure_msg_len 的 list 分支）。
+//     写成「1 份」不会让任何一笔发送失败，只会让一批 100 条只占 1 格容量 ——
+//     字节闸对批量形同虚设，得等长跑把队列打爆才暴露。
+void testBatchAsyncChargesTheWholeBatchToTheSizeGate() {
+    AsyncFixture fx("BatchBp", 600);
+    DefaultMQProducer p("PG_batch_bp");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setEnableBackpressureForAsyncMode(true);
+    p.setBackPressureForAsyncSendNum(static_cast<int32_t>(kMinAsyncSendNum));
+    p.setBackPressureForAsyncSendSize(static_cast<int32_t>(kMinAsyncSendSize));
+    p.start();
+
+    std::vector<Message> msgs;
+    for (int i = 0; i < 2; ++i) {
+        // 每条 300 KiB，整批 600 KiB：默认 1 MiB 的字节闸扣得下，但扣完只剩 420 KiB
+        msgs.push_back(Message(fx.topic, Bytes(300 * 1024, '7')));
+    }
+    auto first = std::make_shared<RecordingCallback>();
+    p.sendBatchAsync(msgs, first, 8000);
+    const int64_t wholeBatch = kMinAsyncSendSize - 2LL * 300 * 1024;
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendSizeAvailablePermits() == wholeBatch; }, 3000),
+           "the size gate charges the WHOLE batch, not one message",
+           "available=" + std::to_string(p.getSemaphoreAsyncSendSizeAvailablePermits()));
+    expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), kMinAsyncSendNum - 1,
+              "a batch still borrows only one num permit");
+
+    auto second = std::make_shared<RecordingCallback>();
+    p.sendBatchAsync(msgs, second, 150);
+    expect(second->snapshot().exceptionCount == 1
+               && second->snapshot().message
+                      == "send message tryAcquire semaphoreAsyncSize timeout",
+           "the second batch is gated with Java's exact text", second->snapshot().message);
+    expect(first->waitDone(10000), "the first batch still completes");
+    expectInt(fx.broker.sendCount(), 1, "only the first batch reached the broker");
+    expect(waitFor([&] { return p.getSemaphoreAsyncSendSizeAvailablePermits() == kMinAsyncSendSize
+                                  && p.getSemaphoreAsyncSendNumAvailablePermits() == kMinAsyncSendNum; },
+                   3000),
+           "both permits come back after the batch settles");
+    p.shutdown();
+}
+
+// 20. 未启动时批量异步与单条异步同一口径：就地抛，一个回调都不交付
+void testBatchAsyncRejectsBeforeStart() {
+    DefaultMQProducer p("PG_batch_async_lifecycle");
+    p.setNamesrvAddr("127.0.0.1:9876");
+    auto cb = std::make_shared<RecordingCallback>();
+    bool threw = false;
+    std::string what;
+    try {
+        p.sendBatchAsync({plainMessage("BatchLifecycle")}, cb, 1000);
+    } catch (const MQClientException& e) {
+        threw = true;
+        what = e.what();
+    }
+    expect(threw, "sendBatchAsync before start() throws");
+    expect(what.find("producer") != std::string::npos,
+           "the rejection is a producer lifecycle error", what);
+    expectInt(cb->snapshot().successCount + cb->snapshot().exceptionCount, 0,
+              "no callback on a synchronous rejection");
+}
+
+// 21. 批量消息的**逐条客户端 ID**：Java DefaultMQProducer.batch():1172-1184 的顺序是
+//     逐条 setUniqID → 批量自身 setUniqID → **才** encode()。少了任何一步都只能在上线
+//     报文上取证：broker 把批量拆开之后每条子消息都没有 UNIQ_KEY，消费端与轨迹控制台
+//     串不起发送侧和消费侧，而发送侧看起来一切「正常」。
+void testBatchAsyncWritesClientIdsBeforeEncodingTheBody() {
+    AsyncFixture fx("BatchIds");
+    DefaultMQProducer p("PG_batch_ids");
+    p.setNamesrvAddr(fx.ns.address());
+    p.start();
+
+    std::vector<Message> msgs;
+    for (int i = 0; i < 3; ++i) {
+        msgs.push_back(plainMessage(fx.topic));
+    }
+    auto cb = std::make_shared<RecordingCallback>();
+    p.sendBatchAsync(msgs, cb, 3000);
+    expect(cb->waitDone(3000), "the batch settles");
+    const std::vector<Attempt> attempts = fx.broker.attempts();
+    expectInt(static_cast<int>(attempts.size()), 1, "the whole batch is one request");
+    if (attempts.empty()) {
+        p.shutdown();
+        return;
+    }
+    const std::vector<Message> subs = decodeBatchMessages(attempts[0].body);
+    expectInt(static_cast<int>(subs.size()), 3, "the batch body carries all three sub-messages");
+    std::set<std::string> ids;
+    bool everySubHasOne = !subs.empty();
+    for (const Message& m : subs) {
+        const std::string id = m.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+        if (id.size() != 32) everySubHasOne = false;
+        ids.insert(id);
+    }
+    expect(everySubHasOne, "every sub-message carries a 32-hex client UNIQ_KEY");
+    expectInt(static_cast<int>(ids.size()), static_cast<int>(subs.size()),
+              "and they are all different — one shared ID would look like a duplicate");
+    const auto props = attempts[0].ext.find("i");  // SendMessageRequestHeaderV2 的 properties
+    expect(props != attempts[0].ext.end()
+               && props->second.find(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+                      != std::string::npos,
+           "the batch message itself carries a UNIQ_KEY (Java setUniqID(msgBatch))",
+           props == attempts[0].ext.end() ? "no properties on the wire" : props->second);
+    p.shutdown();
+}
+
 // 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
 void runCase(const char* name, void (*fn)()) {
     const auto began = std::chrono::steady_clock::now();
@@ -1304,6 +1468,12 @@ int main() {
     runCase("runtimeResizeWakesABlockedSender", testRuntimeResizeWakesABlockedSender);
     runCase("queueFullRunsWithBackPressureOn", testQueueFullRunsWithBackPressureOn);
     runCase("failedAndRetriedSendsReleasePermits", testFailedAndRetriedSendsReleasePermits);
+    runCase("batchAsyncOneRequestOneCallback", testBatchAsyncOneRequestOneCallback);
+    runCase("batchAsyncChargesTheWholeBatchToTheSizeGate",
+            testBatchAsyncChargesTheWholeBatchToTheSizeGate);
+    runCase("batchAsyncRejectsBeforeStart", testBatchAsyncRejectsBeforeStart);
+    runCase("batchAsyncWritesClientIdsBeforeEncodingTheBody",
+            testBatchAsyncWritesClientIdsBeforeEncodingTheBody);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

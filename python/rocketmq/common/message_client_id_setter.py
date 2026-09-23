@@ -4,7 +4,9 @@
 用途：
   * ``create_uniq_id()`` 生成 32 位十六进制唯一 ID（IP + PID + 类哈希 + 当月毫秒 + 自增）；
   * ``set_uniq_id(msg)``  发送前把 UNIQ_KEY 写到消息属性上（Java 在
-    ``DefaultMQProducerImpl.sendKernelImpl`` 里对**非批量**消息调用）；
+    ``DefaultMQProducerImpl.sendKernelImpl`` 里对**非批量**消息调用；批量消息在
+    ``DefaultMQProducer.batch():1176/1179`` 里逐条写、再给批量自身写一个，见
+    ``DefaultMQProducer._send_batch``）；
   * ``get_uniq_id(msg)``  取 UNIQ_KEY —— SendResult.msgId、消息轨迹的 msgId、
     事务消息的 transactionId 都用它。
 
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .message import Message, MessageBatch
+from .message import Message
 from .message_accessor import MessageAccessor
 from .message_const import MessageConst
 from .util_all import InnerIdGenerator
@@ -40,18 +42,4 @@ def get_uniq_id(msg: Message) -> Optional[str]:
     return msg.get_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
 
 
-def get_uniq_id_from_batch(batch: "MessageBatch") -> Optional[str]:
-    """批量消息的 UNIQ_KEY：逐条 ID 用 ',' 拼接（Java getUniqID(MessageBatch)）。"""
-    if batch is None:
-        return None
-    if not isinstance(batch, MessageBatch):
-        return get_uniq_id(batch)
-    ids = []
-    for inner in getattr(batch, "messages", None) or []:
-        uid = get_uniq_id(inner)
-        if uid:
-            ids.append(uid)
-    return ",".join(ids) if ids else None
-
-
-__all__ = ["create_uniq_id", "set_uniq_id", "get_uniq_id", "get_uniq_id_from_batch"]
+__all__ = ["create_uniq_id", "set_uniq_id", "get_uniq_id"]

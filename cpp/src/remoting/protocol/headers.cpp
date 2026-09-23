@@ -126,6 +126,7 @@ PropertyMap SendMessageResponseHeader::toExtFields() const {
     putOptInt32(out, "queueId", queueId);
     putOptInt(out, "queueOffset", queueOffset);
     putOptStr(out, "transactionId", transactionId);
+    putOptStr(out, "batchUniqId", batchUniqId);
     putOptInt(out, "msgRegion", msgRegion);
     putOptStr(out, "recallHandle", recallHandle);
     return out;
@@ -136,6 +137,7 @@ void SendMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
     queueId = getOptInt(ext, "queueId");
     queueOffset = getOptLong(ext, "queueOffset");
     transactionId = getOptStr(ext, "transactionId");
+    batchUniqId = getOptStr(ext, "batchUniqId");
     msgRegion = getOptLong(ext, "msgRegion");
     recallHandle = getOptStr(ext, "recallHandle");
 }

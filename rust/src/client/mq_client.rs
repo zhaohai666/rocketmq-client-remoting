@@ -1681,8 +1681,18 @@ impl MQClientInstance {
         };
         let mut header = SendMessageResponseHeader::default();
         header.from_ext_fields(response.ext_fields());
-        // msgId = 客户端唯一 ID（UNIQ_KEY），缺省回落响应头的 msgId
-        let uniq_id = get_uniq_id(msg).filter(|s| !s.is_empty());
+        // msgId = 客户端唯一 ID（UNIQ_KEY），批量消息用的是**批量自身**的 ID（inner-batch
+        // 时 broker 会把它原样回在 batchUniqId 里），缺省才回落响应头的 msgId
+        // （= broker 的 offsetMsgId）。
+        // ⚠ 有意偏离 Java processSendResponse:786-793：Java 在 broker **没**回 batchUniqId
+        // （普通 topic 上的客户端批量）时把 msgId 换成「逐条子消息 UNIQ_KEY 的逗号串」。这里
+        // 只拿得到「发出去的那一条消息」，拿不到子消息列表（C++/.NET 同样如此），而且四语言
+        // 要能互相对拍，所以统一用批量自身的 ID。要紧的那一半已对齐：每条子消息在编码前就
+        // 写好了自己的 UNIQ_KEY（`DefaultMQProducer::send_batch`），broker 拆开后消费端与
+        // 轨迹看到的逐条 ID 与 Java 一致。
+        let uniq_id = get_uniq_id(msg)
+            .filter(|s| !s.is_empty())
+            .or_else(|| header.batch_uniq_id.clone().filter(|s| !s.is_empty()));
         Ok(SendResult {
             status,
             msg_id: uniq_id.or_else(|| header.msg_id.clone()),

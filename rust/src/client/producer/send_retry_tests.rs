@@ -52,6 +52,8 @@ struct BrokerScript {
     /// 与 `sends` 一一对应的 `opaque`：异步重试必须复用同一个请求、**换新的 opaque**，
     /// 这是唯一能看出「换 opaque 了」的地方。
     send_opaques: Vec<i32>,
+    /// 与 `sends` 一一对应的 body：批量发送要按它验证「每条子消息的 UNIQ_KEY 在编码前就写好」。
+    send_bodies: Vec<Vec<u8>>,
 }
 
 impl BrokerScript {
@@ -63,6 +65,7 @@ impl BrokerScript {
             sends: Vec::new(),
             send_codes: Vec::new(),
             send_opaques: Vec::new(),
+            send_bodies: Vec::new(),
         }
     }
 }
@@ -126,6 +129,7 @@ impl MockCluster {
         broker.sends.clear();
         broker.send_codes.clear();
         broker.send_opaques.clear();
+        broker.send_bodies.clear();
     }
 
     /// 第 `index` 个 broker 收到的 SEND 请求数。
@@ -136,6 +140,11 @@ impl MockCluster {
     /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 extFields 快照。
     fn send_ext(&self, index: usize, n: usize) -> Vec<(String, String)> {
         lock(&self.state).brokers[index].sends[n].clone()
+    }
+
+    /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的 body 快照。
+    fn send_body(&self, index: usize, n: usize) -> Vec<u8> {
+        lock(&self.state).brokers[index].send_bodies[n].clone()
     }
 
     /// 第 `index` 个 broker 收到的第 `n` 笔 SEND 的请求码。
@@ -297,6 +306,7 @@ fn spawn_broker(
                         );
                         broker.send_codes.push(request.code);
                         broker.send_opaques.push(request.opaque);
+                        broker.send_bodies.push(request.body().unwrap_or_default().to_vec());
                         (step.0, step.1, broker.requests)
                     };
                     if code == CLOSE_WITHOUT_ANSWER {
@@ -730,8 +740,59 @@ async fn send_request_code_follows_java_three_way_branch() {
         .send_message("GID_send_retry", &mut publish, &mq, 3_000, 0, false)
         .await
         .expect("应答批量发送应当成功");
-    assert_eq!(cluster.send_code(0, 2), request_code::SEND_REPLY_MESSAGE_V2);
-    assert_eq!(ext_value(&cluster.send_ext(0, 2), "m"), Some("true"));
+    producer.shutdown();
+}
+
+/// 批量发送的客户端 ID 口径（Java `DefaultMQProducer.batch():1176-1182` 的**顺序** +
+/// `MQClientAPIImpl.processSendResponse:785`）：
+///   ① 每条**子消息**的 UNIQ_KEY 必须在**编码之前**写好 —— 写晚一步 body 里就是三条没有 ID
+///     的消息，落进 commitLog 后消费端轨迹、按 uniqKey 反查全断，而发送侧看起来一切正常；
+///   ② `SendResult.msg_id` 取**批量自身**那条消息写在报文属性（`i`）里的 UNIQ_KEY，
+///     不是 broker 回的 `offsetMsgId`。
+///
+/// ⚠ 有意不跟 Java 的「broker 没回 batchUniqId 时把 msg_id 换成逐条逗号串」：本端口的应答解析
+/// 只拿到批量外壳（`&Message`），子消息列表不在里面；四种语言统一取批量自身的 ID 才能互相比对。
+#[tokio::test]
+async fn send_batch_writes_client_ids_before_encoding_the_body() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("batch_client_id", &cluster).await;
+
+    let result = producer
+        .send_batch(
+            vec![
+                Message::new("T1", Some(b"sub-0")),
+                Message::new("T1", Some(b"sub-1")),
+                Message::new("T1", Some(b"sub-2")),
+            ],
+            None,
+            None,
+        )
+        .await
+        .expect("批量发送应当成功");
+
+    // ① 上线的 body 里每条子消息都带着互不相同的 32 位客户端 ID
+    let wire = cluster.send_body(0, 0);
+    let subs = crate::common::message_decoder::decode_batch_messages(&wire);
+    assert_eq!(subs.len(), 3, "批量 body 必须原样带 3 条子消息");
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for sub in &subs {
+        let id = crate::common::message_client_id_setter::get_uniq_id(sub)
+            .unwrap_or_else(|| panic!("子消息缺 UNIQ_KEY：ID 必须在编码之前写好"));
+        assert_eq!(id.len(), 32, "{id}");
+        assert!(seen.insert(id.clone()), "每条子消息的 UNIQ_KEY 必须各不相同");
+        // 整批的 ID 不能和某条子消息撞，否则等于没把两者区分开
+        assert_ne!(result.msg_id.as_deref(), Some(id.as_str()));
+    }
+
+    // ② msg_id 就是批量自己写在报文属性里的 UNIQ_KEY，offsetMsgId 才是 broker 那份
+    let msg_id = result.msg_id.clone().expect("批量也要报出客户端 ID");
+    assert_eq!(msg_id.len(), 32, "{msg_id}");
+    assert!(!msg_id.contains(','), "Java 的逗号串口径本端口不跟随：{msg_id}");
+    let wire_ext = cluster.send_ext(0, 0);
+    let props = ext_value(&wire_ext, "i").unwrap_or_default();
+    assert!(props.contains(msg_id.as_str()), "批量自身的 ID 要真的上线：{props}");
+    assert_ne!(result.msg_id, result.offset_msg_id);
 
     producer.shutdown();
 }

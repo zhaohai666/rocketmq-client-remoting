@@ -619,9 +619,19 @@ SendResult MQClientInstance::parseSendResponse(const RemotingCommand& response, 
     respHeader.fromExtFields(response.extFields);
     SendResult result;
     result.sendStatus = status;
-    // msgId 对齐 Java processSendResponse：客户端 UNIQ_KEY（批量 = 逗号拼接）；
-    // offsetMsgId 是 broker 的 offset 消息 ID（响应头的 msgId）。
-    result.msgId = msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+    // msgId 对齐 Java processSendResponse:785-793：客户端 UNIQ_KEY；批量消息取的是**批量自身**
+    // 那条消息的 ID（inner-batch 时 broker 把它原样回在 batchUniqId 里，客户端没带 ID 时用它兜底）。
+    // ⚠ 有意偏离 Java：Java 在**非** inner-batch（普通 topic 上的客户端批量）时把 msgId 换成
+    // 「逐条子消息 UNIQ_KEY 的逗号串」，本端口不跟随 —— Message 不是多态类型（见 message.h
+    // 的 isBatch 注释：没有虚函数、RTTI 不可用），这里拿不到子消息列表；而且四种语言要能互相
+    // 比对，Python/Rust/.NET 同样取批量自身的 ID。真正要紧的那一半已经对齐：每条子消息的
+    // UNIQ_KEY 在编码前就写好（sendBatchKernel），broker 拆开后消费端与轨迹看到的逐条 ID
+    // 和 Java 一致。
+    const std::string clientUniqId =
+        msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+    result.msgId = !clientUniqId.empty()
+                       ? clientUniqId
+                       : respHeader.batchUniqId.value_or(respHeader.msgId.value_or(""));
     result.offsetMsgId = respHeader.msgId.value_or("");
     result.messageQueue = MessageQueue(mq.topic, mq.brokerName,
                                        respHeader.queueId.value_or(mq.queueId));
