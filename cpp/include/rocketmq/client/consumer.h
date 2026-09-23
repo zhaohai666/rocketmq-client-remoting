@@ -387,6 +387,13 @@ public:
     // 判据错了是"内存无上限堆消息 / 位点跨度失控"这类真机短期看不出的问题，必须能离线锁死，
     // 所以与 consumeBatch 同一理由放在 public。
     bool flowControlHit(const MessageQueue& mq, const std::string& key);
+    // 把一轮 POP 的结果记进拉取统计（Java `DefaultMQPushConsumerImpl.popMessage` 的
+    // PopCallback.onSuccess:556-563，与 pull 路径的 PullCallback 同一口径）：FOUND 就记
+    // pullRT（Java 在判空之前记），弹到消息才记 pullTPS。这两格是 307 应答 statusTable 的
+    // 唯一来源，漏记了消费一切正常、只有看板上一片 0，而真机要跑满两个 10s 采样周期才看得
+    // 出来 —— 所以判定本身要能离线直接喂 PopResult 锁死。
+    void recordPopPullStats(ConsumerStatsManager& stats, const std::string& topic,
+                            const PopResult& result, int64_t beganMs);
 
     // ---- 停摆自愈（Java isPullExpired）的观测/注入面 ----
     // 停摆判据算错方向是**静默**故障：阈值写太小会把健康队列反复撤走重投（凭空造重复），

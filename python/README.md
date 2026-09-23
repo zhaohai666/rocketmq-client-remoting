@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 833 条单元/协议测试（829 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 836 条单元/协议测试（832 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -47,7 +47,19 @@ python verify_send_header_live.py # 发送头 c/d/n 三个字段（14 PASS/0 FAI
 
 其它真机脚本：`verify_acl_live.py`（需开 ACL 的集群）/ `verify_pull_live.py` /
 `verify_rr_live.py` / `verify_latency_live.py` / `verify_pop_live.py` /
-`verify_pop_consumer_live.py` / `verify_redelivery_live.py`（30 PASS / 0 FAIL）。
+`verify_pop_consumer_live.py`（11 PASS / 0 FAIL） / `verify_redelivery_live.py`（30 PASS / 0 FAIL）。
+
+`verify_pop_consumer_live.py` 的 S5 证明 POP 循环和 pull 循环一样把拉取统计写进了 307 状态表
+（Java `DefaultMQPushConsumerImpl.popMessage` 的 `PopCallback.onSuccess:556-563`：`case FOUND:`
+里先 `incPullRT`，且这一格打在**空列表判定之前**，`msgFoundList` 非空才 `incPullTPS`；
+`POLLING_NOT_FOUND` 两格都不动 —— 空手而归是长轮询的常态，把挂起时间折进 RT 会把它毁掉）。
+这条链坏掉是**静默**的：消息照弹照 ack、消费完全正常，只有运维看板上一片 0，而看板上"这个消费者
+没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。快照每 10s 采样一次、窗口取 minute 差分，
+所以夹具必须**持续有流量**并跨过两个采样点（实测 52 条 / 约 26s），否则 `pullTPS` 仍是 0 —— 那是
+夹具不够长，不是判据错。拉取侧与消费侧两格各自独立：只有 `consumeOKTPS` 有值而 `pullRT`/`pullTPS`
+全 0，正是漏记的形状。`tests/test_pop_consumer.py`（`TestPopLoopPullStats`，3 项）跑**真实的**
+`_queue_pop_loop`，离线锁死三种 status 各自记哪几格。实测 `pullRT=2006.2`、`pullTPS=1.9982`、
+52 发 52 收（两格的具体取值随真机节奏浮动，判据只要求非 0）。
 
 `verify_redelivery_live.py` 的 S9 是**死信终态**：`maxReconsumeTimes=2` 的组对同一条消息只投
 3 次（listener 一直回 `RECONSUME_LATER`），实测档位 `0s / 10s / 40s` —— Java broker 用

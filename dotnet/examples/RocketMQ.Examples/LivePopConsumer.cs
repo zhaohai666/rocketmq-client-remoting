@@ -10,6 +10,7 @@
 //   S2 ack 生效：收满后再观察一段时间（> invisibleTime）→ 不应被重复投递
 //   S3 RECONSUME_LATER：listener 持续返回 RECONSUME_LATER → 按延迟档位重新投递
 //   S4 多队列：消息确实落到了多个队列且都被消费（POP 是逐队列弹的）
+//   S5 拉取统计：POP 路径也要把 pullRT/pullTPS 记进 307 状态表（持续流量 + 真实 RPC）
 //
 // ⚠ S2 的观测窗口必须 > PopInvisibleTime，否则"ack 完全没发出去"也看不出重复投递
 //   （消息还没到复活时间）——这是最容易伪装成通过的假绿。
@@ -18,6 +19,7 @@ using System.Text;
 
 using RocketMQ.Client;
 using RocketMQ.Common;
+using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
@@ -147,6 +149,8 @@ public static class LivePopConsumer
         string group = "GID_PopConsNet_" + Stamp;
         string topicLater = "PopConsNetLater_" + Stamp;
         string groupLater = "GID_PopConsNetLater_" + Stamp;
+        string topicStats = "PopConsNetStats_" + Stamp;
+        string groupStats = "GID_PopConsNetStats_" + Stamp;
         const int nMsg = 12;
 
         Console.WriteLine("=".PadRight(70, '='));
@@ -158,6 +162,7 @@ public static class LivePopConsumer
         prep.Start();
         PrepareTopic(prep, topic);
         PrepareTopic(prep, topicLater);
+        PrepareTopic(prep, topicStats);
         prep.Shutdown();
 
         // ---------------- S1 / S2 / S4：正常消费 + ack ----------------
@@ -252,6 +257,81 @@ public static class LivePopConsumer
                 + " deliveries=" + string.Join(",", laterListener.Snapshot()));
         c2.Shutdown();
         p2.Shutdown();
+
+        // ---------------- S5：POP 循环把 pullRT/pullTPS 写进 307 状态表 ----------------
+        // Java 的 popMessage 回调（DefaultMQPushConsumerImpl:556-563）与 pull 回调一样要把
+        // IncPullRT / IncPullTPS 记进状态表，307 应答的 statusTable 就靠这两格。POP 循环漏掉
+        // 它们是**静默**的：消息照弹照 ack、消费完全正常，只有运维看板上一片 0 —— 而看板上
+        // "这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。
+        // ⚠ 快照每 10s 采样一次、窗口取 minute 差分，所以必须**持续有流量**并跨过两个采样点，
+        //   否则 pullTPS 仍是 0，那是夹具不够长，不是判据错。
+        Console.WriteLine("=== S5 POP 循环把 pullRT/pullTPS 写进 307 状态表 ===");
+        var statsListener = new SuccessListener();
+        var c5 = new DefaultMQPushConsumer(groupStats);
+        c5.SetNamesrvAddr(nsAddr);
+        c5.PopMode = true;
+        c5.SetConsumeThreadNums(2);
+        c5.SetMessageListener(statsListener);
+        c5.Subscribe(topicStats, "*");
+        c5.Start();
+        Thread.Sleep(1000);
+
+        var p5 = new DefaultMQProducer("PG_PopConsNetStats_" + Stamp);
+        p5.NamesrvAddr = nsAddr;
+        p5.Start();
+        int sent5 = 0;
+        long began5 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        while (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - began5 < 26000)   // 约 3 个采样周期
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                p5.Send(new Message(topicStats,
+                    Encoding.UTF8.GetBytes("s5-" + i.ToString(CultureInfo.InvariantCulture))));
+                sent5++;
+            }
+            Thread.Sleep(2000);
+        }
+
+        var admin = new DefaultMQAdminExt("PopConsNetAdmin");
+        admin.SetNamesrvAddr(nsAddr);
+        admin.Start();
+        // 走 broker 转发到消费者本体的 307；statusTable 是透传 JSON，按键取回后再解
+        JsonValue status = JsonValue.Null;
+        try
+        {
+            ConsumerRunningInfo ri = admin.ExamineConsumerRunningInfo(groupStats, c5.ClientId);
+            status = ri.StatusTable;
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("  !! 307 failed: " + e.Message);
+        }
+
+        JsonValue cs = status.Get(topicStats);
+        double pullRT = cs.Get("pullRT").DoubleValue();
+        double pullTPS = cs.Get("pullTPS").DoubleValue();
+        double consumeOKTPS = cs.Get("consumeOKTPS").DoubleValue();
+        Console.WriteLine("  sent=" + sent5.ToString(CultureInfo.InvariantCulture)
+            + " pullRT=" + pullRT.ToString("0.00", CultureInfo.InvariantCulture)
+            + " pullTPS=" + pullTPS.ToString("0.0000", CultureInfo.InvariantCulture)
+            + " consumeOKTPS=" + consumeOKTPS.ToString("0.0000", CultureInfo.InvariantCulture));
+        Check("S5a pullRT 非 0（POP 每次 FOUND 记一次拉取耗时）", pullRT > 0.0,
+            "pullRT=" + pullRT.ToString(CultureInfo.InvariantCulture));
+        Check("S5b pullTPS 非 0（按弹到的条数计）", pullTPS > 0.0,
+            "pullTPS=" + pullTPS.ToString(CultureInfo.InvariantCulture));
+        // 拉取侧与消费侧两格各自独立：只有 consumeOKTPS 有值而 pull* 全 0，正是
+        // POP 循环漏记拉取统计的特征形状。
+        Check("S5c consumeOKTPS 同时非 0（两格各自独立上报）", consumeOKTPS > 0.0,
+            "consumeOKTPS=" + consumeOKTPS.ToString(CultureInfo.InvariantCulture));
+        // 状态表非 0 只说明"计数被调用过"，还得确认这些统计对应的流量真被消费掉：
+        // 否则 pullTPS 可以靠一直接触到从未 ack 的消息刷高，看板上好看、实际在打转。
+        bool consumed5 = WaitUntil(() => statsListener.Snapshot().Count >= sent5, 20000);
+        Check("S5d 状态表背后的流量确实被消费了", consumed5,
+            "received=" + statsListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture)
+                + " sent=" + sent5.ToString(CultureInfo.InvariantCulture));
+        c5.Shutdown();
+        p5.Shutdown();
+        admin.Shutdown();
 
         Console.WriteLine("########################################");
         Console.WriteLine("PASS=" + _pass.ToString(CultureInfo.InvariantCulture)

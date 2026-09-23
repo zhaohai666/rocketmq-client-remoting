@@ -162,6 +162,44 @@ void testIsPopTimeout() {
     expect(DefaultMQPushConsumer::isPopTimeout(now - 60001, 60000), "timeout.past");
 }
 
+// POP 循环的拉取统计（Java `popMessage` 的 PopCallback.onSuccess:556-563）。
+// 漏记是**静默**的：消息照弹照 ack、消费完全正常，只有 307 应答的 statusTable 里
+// pullRT/pullTPS 永远 0 —— 看板上"这个消费者没在拉取"和"压根没起来"分不开。真机要
+// 跨两个 10s 采样点才看得出来，所以判定必须离线锁死，而且锁的是那个**不对称**：
+// RT 每个 FOUND 轮次都记（Java 在判空之前记），TPS 只在真弹到消息时记。
+void testPopPullStats() {
+    DefaultMQPushConsumer c(kGroup);
+    ConsumerStatsManager stats;
+    const std::string key = std::string(kTopic) + "@" + kGroup;
+
+    PopResult found;
+    found.status = PopStatus::FOUND;
+    found.msgFoundList = {MessageExt(), MessageExt()};
+    // began 取 30ms 前：同一毫秒内取整成 0，"记了"和"记了个 0"就分不开了
+    c.recordPopPullStats(stats, kTopic, found, UtilAll::currentTimeMillis() - 30);
+    std::shared_ptr<StatsItem> rt = stats.topicAndGroupPullRT().find(key);
+    std::shared_ptr<StatsItem> tps = stats.topicAndGroupPullTPS().find(key);
+    expect(rt != nullptr && rt->times() == 1, "stats.found.rt_once");
+    expect(rt != nullptr && rt->value() >= 30, "stats.found.rt_positive",
+           rt ? std::to_string(rt->value()) : std::string("nullptr"));
+    expect(tps != nullptr && tps->times() == 1 && tps->value() == 2, "stats.found.tps_2",
+           tps ? std::to_string(tps->value()) : std::string("nullptr"));
+
+    PopResult emptyFound;
+    emptyFound.status = PopStatus::FOUND;
+    c.recordPopPullStats(stats, kTopic, emptyFound, UtilAll::currentTimeMillis() - 10);
+    expect(rt->times() == 2, "stats.empty_found.rt_still");
+    expect(tps->times() == 1 && tps->value() == 2, "stats.empty_found.tps_untouched");
+
+    // 长轮询空手而归（POLLING_NOT_FOUND）是 POP 的常态：一格都不许记，
+    // 否则平均拉取耗时被挂起时长稀释成假数据。
+    PopResult polling;
+    polling.status = PopStatus::POLLING_NOT_FOUND;
+    c.recordPopPullStats(stats, kTopic, polling, UtilAll::currentTimeMillis() - 5000);
+    expect(rt->times() == 2, "stats.polling.rt_untouched");
+    expect(tps->times() == 1, "stats.polling.tps_untouched");
+}
+
 }  // namespace
 
 int main() {
@@ -169,6 +207,7 @@ int main() {
     testDefaults();
     testPopCkTarget();
     testIsPopTimeout();
+    testPopPullStats();
     std::printf("pop consumer: %d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

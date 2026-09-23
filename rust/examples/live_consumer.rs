@@ -27,6 +27,9 @@
 //! - C5 POP 模式：弹出即带 `POP_CK`，消费成功后 `waitAckCounter` 归零，
 //!   等过一个 invisibleTime 窗口**不再重投**（证明 ack 真的写到了 broker）；
 //!   且 POP 路径完全不写消费位点。
+//! - C5b POP 循环的拉取统计：持续 26s 有流量后，用**独立 admin 实例**走真实 307
+//!   （admin → broker → 目标客户端）读回 `statusTable`，`pullRT`/`pullTPS` 必须非 0
+//!   —— 漏记是静默故障：消息照弹照 ack、消费完全正常，只有运维看板一片 0。
 //! - C6 广播模式：同组两个实例各拿到全量（不分摊）；位点**不落 broker**，
 //!   而是按 `$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json` 落盘并可解回。
 //! - C7 顺序消费：`LOCK_BATCH_MQ` 被 5.5.1 接受（runningInfo 的 `locked`），
@@ -40,6 +43,7 @@
 //!   确认它被撤掉重建（同一趟里换新属主、重新盖章），随后再发 3 条照样消费、
 //!   broker 位点从 3 前进到 6 且**不回退**，6 条各只投一次（撤走前持久化了位点）。
 //! - C10 清理：删掉本次建的 topic 与广播位点目录。
+//!
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -56,6 +60,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as JsonValue;
 
+use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
 use rocketmq_client_remoting::client::consumer::{
     ConsumerConfig, DefaultMQPushConsumer, PULL_MAX_IDLE_TIME,
 };
@@ -1496,6 +1501,111 @@ async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
+// ------------------------------------------- C5b POP 路径的拉取统计（307 statusTable）
+
+/// Java `popMessage` 的 `PopCallback.onSuccess:556-563`：POP 循环和 pull 循环一样要把
+/// `incPullRT` / `incPullTPS` 记进状态表，307 应答的 `statusTable` 全靠这两格。漏记是
+/// **静默**故障 —— 消息照弹照 ack、消费完全正常，只有运维看板上一片 0，而看板上
+/// "这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。
+///
+/// ⚠ 采样器每 10s 落一个 minute 点、快照取首尾差分，所以流量必须**持续**跨过两个采样点
+///   （这里 13 轮 × 2s ≈ 26s），否则 `pullTPS` 仍是 0 —— 那是夹具不够长，不是判据错。
+/// ⚠ 读的是 admin 侧的 307（经 broker 转发回本实例），不是进程内自查：序列化与转发那两段
+///   也在这条链路上，本进程读表看不到。
+async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C5b POP 循环把 pullRT/pullTPS 写进 307 状态表");
+    let topic = fx.topic_name("PopStats");
+    let group = fx.group_name("popstats");
+    if let Err(e) = fx.create_topic(&topic, 2).await {
+        return ck.abort("C5b create topic", &e);
+    }
+    let inbox = Arc::new(Inbox::default());
+    let c = match fx.consumer(&group, &topic, "*", LiveListener::collecting(inbox.clone())) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C5b build consumer", &e),
+    };
+    c.update_config(|x| {
+        x.pop_mode = true;
+        x.pop_invisible_time = 10_000;
+    });
+    if let Err(e) = c.start().await {
+        return ck.abort("C5b start", &format!("{e}"));
+    }
+    let mut sent = 0usize;
+    for _ in 0..13 {
+        sent += fx.produce(&topic, "TagA", 4, None).await.len();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let client_id = c.client_id();
+    // 独立的 admin 实例：307 是「admin → broker → 目标客户端」的转发链，
+    // 用消费者自己的实例查自己等于跳过整条链路。
+    let admin = DefaultMQAdminExt::with_config(AdminConfig {
+        instance_name: format!("ADMIN-C5B-{}", fx.stamp),
+        name_server_addrs: vec![fx.namesrv.clone()],
+        timeout_millis: 10_000,
+        ..Default::default()
+    });
+    if let Err(e) = admin.start().await {
+        c.shutdown();
+        return ck.abort("C5b admin start", &e.to_string());
+    }
+    let info = match admin
+        .examine_consumer_running_info(&group, &client_id, false, None)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            admin.shutdown();
+            c.shutdown();
+            return ck.abort("C5b 307 examineConsumerRunningInfo", &e.to_string());
+        }
+    };
+    let cs = match info.consume_status(&topic) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            admin.shutdown();
+            c.shutdown();
+            return ck.abort("C5b statusTable", "statusTable has no entry for the topic");
+        }
+        Err(e) => {
+            admin.shutdown();
+            c.shutdown();
+            return ck.abort("C5b statusTable decode", &e.to_string());
+        }
+    };
+    println!(
+        "   sent={sent} pullRT={:.2} pullTPS={:.4} consumeOKTPS={:.4}",
+        cs.pull_rt, cs.pull_tps, cs.consume_ok_tps
+    );
+    ck.check(
+        "C5b pullRT is non-zero (every FOUND pop records its elapsed time)",
+        cs.pull_rt > 0.0,
+        &format!("pullRT={}", cs.pull_rt),
+    );
+    ck.check(
+        "C5b pullTPS is non-zero (counted by the messages actually popped)",
+        cs.pull_tps > 0.0,
+        &format!("pullTPS={}", cs.pull_tps),
+    );
+    // 两格各自独立：只有 consumeOKTPS 有值而 pull* 全 0，正是 POP 循环漏记拉取统计的形状。
+    ck.check(
+        "C5b consumeOKTPS is non-zero as well (pull side and consume side report separately)",
+        cs.consume_ok_tps > 0.0,
+        &format!("consumeOKTPS={}", cs.consume_ok_tps),
+    );
+    // 状态表非 0 只说明"计数被调过"；还得确认这背后的流量真被消费掉 —— 否则 pullTPS
+    // 可以靠一直接触到从未 ack 完的消息刷高，看板上好看、实际在打转。
+    let consumed = poll_until(|| inbox.count() >= sent, 20).await;
+    let got = inbox.count();
+    ck.check(
+        "C5b the traffic behind those stats was really consumed (not just counted)",
+        consumed,
+        &format!("delivered={got} sent={sent}"),
+    );
+    admin.shutdown();
+    c.shutdown();
+}
+
 // ------------------------------------------------------- C6 广播 + 本地位点文件
 
 async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
@@ -2206,6 +2316,7 @@ async fn run(namesrv: &str) -> Checker {
     c4b_dlq_terminal(&mut ck, &fx).await;
     c4c_partial_ack(&mut ck, &fx).await;
     c5_pop_mode(&mut ck, &fx).await;
+    c5b_pop_pull_stats(&mut ck, &fx).await;
     c6_broadcasting_and_local_offsets(&mut ck, &fx).await;
     c7_orderly_and_lock(&mut ck, &fx).await;
     c8_scale_in_and_takeover(&mut ck, &fx).await;

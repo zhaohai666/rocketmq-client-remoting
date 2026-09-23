@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，548 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，551 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -98,7 +98,7 @@ dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(4
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
-其它子命令：`redelivery`（50 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈 十一段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
+其它子命令：`redelivery`（50 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈 十一段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环，11 PASS / 0 FAIL，见下）。
 
 `redelivery` 的 S9 是**死信终态**，也是「用尽」这条判据唯一能验的地方——客户端只把
 `maxReconsumeTimes` 通过 `sendMessageBack` 的 header 递上去，真正决定第几次转死信的是 broker
@@ -133,6 +133,19 @@ H2/H3 之后各发 3 条，位点走到 6/9，9 条各只投一次、`redelivere
 分不清走的是哪一支。本端口的存活代理是**登记线程的 `Thread.IsAlive`**（对位 Java 每队列一具
 ProcessQueue），POP 分支改读 `PopProcessQueue.LastPopTimestamp` 且撤走时 `SetDropped`。
 
+`popc` 的 S5 是**POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage`
+的 `PopCallback.onSuccess:556-563`：`case FOUND:` 先 `IncPullRT`，这一格打在**空列表判定之前**，
+`MsgFoundList` 非空才 `IncPullTPS`；`POLLING_NOT_FOUND` 两格都不动 —— 空手而归是长轮询的常态，
+把挂起时间折进 RT 会毁掉它）。漏记是**静默**的：弹、ack、消费完全正常，只有运维看板上
+`pullRT`/`pullTPS` 一片 0，而看板上"这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的
+处置。判据从 `DefaultMQAdminExt.ExamineConsumerRunningInfo`(307) 应答的 `StatusTable[topic]` 读，
+拉取侧两格与消费侧 `consumeOKTPS` **各自断言**（只有后者有值正是漏记的形状），实测
+`pullRT=2048.90`、`pullTPS=1.9998`、52 发 52 收（两格取值随真机节奏浮动，判据只要求非 0）。⚠ 快照每 10s 采样一次、窗口取 minute 差分，夹具
+必须**持续有流量**并跨过两个采样点（这里 26s 内每 2s 发 4 条），否则 `pullTPS` 仍是 0 —— 那是夹具
+不够长，不是判据错。三种 status 各自记哪几格由离线单测 `PopConsumerTests`（16 项）里的
+`RecordPopPullStats_*` 三项锁死：`RecordPopPullStats` 之所以是 `public`（本解决方案没有
+`InternalsVisibleTo`）就是为了让它能在进程内被单独喂 `PopResult` 断言，注释里写明了**勿用于业务代码**。
+
 单测里的 `ValidatorsTests`（45 项）锁死名字校验的文案、判定顺序与码值口径：topic/group 的
 blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 -1，本工程沿用默认 1），
 只有 `CheckMessage` 的 body 档位与 `INNER_MULTI_DISPATCH` 分隔符带 `MessageIllegal`(13)。
@@ -163,7 +176,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **548 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **551 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`

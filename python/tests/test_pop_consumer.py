@@ -13,9 +13,11 @@ invisibleTime 短，真机看起来还是"全过"。所以这些必须离线锁�
   - 延迟档位选择（Java checkNeedAckOrDelay / changePopInvisibleTime）
   - isPopTimeout 判定
   - 切批（consume_message_batch_max_size）
+  - POP 循环的 pullRT/pullTPS 上报（`consumerRunningInfo` 的唯一数据来源）
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -24,9 +26,12 @@ from rocketmq.client.consumer import (MAX_POP_INVISIBLE_TIME,
                                       MIN_POP_INVISIBLE_TIME, POP_DELAY_LEVEL,
                                       DefaultMQPushConsumer, PopProcessQueue)
 from rocketmq.client.consumer_result import (ConsumeConcurrentlyContext,
-                                             ConsumeConcurrentlyStatus)
-from rocketmq.common.message import MessageExt
+                                             ConsumeConcurrentlyStatus, PopResult,
+                                             PopStatus)
+from rocketmq.client.consumer_stats import ConsumerStatsManager
+from rocketmq.common.message import MessageExt, MessageQueue
 from rocketmq.common.message_const import MessageConst
+from rocketmq.common.subscription_data import SubscriptionData
 from rocketmq.remoting.protocol.extra_info import build_extra_info
 
 GROUP = "GID_PopUnitTest"
@@ -459,6 +464,79 @@ class TestTimeoutBatchDropped:
         msgs = [msg(pop_ck=ck(pop_time=now, invisible=60000))]
         c._consume_pop_batch(msgs, pq, None)
         assert seen == []
+
+
+# ------------------------------------------------ POP 循环的 pullRT / pullTPS
+
+
+class TestPopLoopPullStats:
+    """POP 循环要把 pullRT/pullTPS 记进状态表（Java `DefaultMQPushConsumerImpl.popMessage`
+    的 `PopCallback.onSuccess:556-563`）。
+
+    漏掉这两格是**静默**的：消息照弹、照消费、照 ack，功能上一点看不出来，只有
+    `consumerRunningInfo()` 的 PULL_RT/PULL_TPS 永远是 0 —— 控制台上"这个 POP 消费者
+    没有在拉取"和"这个消费者压根没起来"就分不开了，排障方向直接被带偏。
+    """
+
+    @staticmethod
+    def _run_rounds(results):
+        """跑真的 `_queue_pop_loop`，逐轮喂给定的 PopResult，喂完自动收线程。"""
+        c = consumer()
+        c._started = True
+        mq = MessageQueue(TOPIC, BROKER, 0)
+        key = c._mq_key(mq)
+        c._pop_queues[key] = PopProcessQueue()
+        c.subscription_data[TOPIC] = SubscriptionData(topic=TOPIC, sub_string="*")
+        c._stats_manager = ConsumerStatsManager()
+        delivered = []
+        c._submit_pop_consume_request = lambda msgs, pq, m: delivered.append(len(msgs))
+        pending = list(results)
+
+        class PopClient:
+            def pop_message(self, group, topic, queue_id, **kw):
+                # 每轮至少 20ms，否则 RT 取整成 0，"记了"和"记了个 0"分不开
+                time.sleep(0.02)
+                if not pending:
+                    c._stop.set()
+                    return PopResult(PopStatus.POLLING_NOT_FOUND)
+                return pending.pop(0)
+
+        c._mq_client = PopClient()
+        thread = threading.Thread(target=c._queue_pop_loop, args=(mq,))
+        c._queue_threads[key] = thread
+        thread.start()
+        thread.join(10)
+        assert not thread.is_alive(), "POP 循环没在喂完结果后退出"
+        return c, delivered
+
+    @staticmethod
+    def _items(c):
+        stats = c._stats_manager
+        key = "%s@%s" % (TOPIC, GROUP)
+        return (stats.topic_and_group_pull_rt.find(key),
+                stats.topic_and_group_pull_tps.find(key))
+
+    def test_found_round_records_rt_and_tps(self):
+        c, delivered = self._run_rounds(
+            [PopResult(PopStatus.FOUND, [msg(queue_offset=1), msg(queue_offset=2)])])
+        assert delivered == [2]
+        rt, tps = self._items(c)
+        assert rt is not None and rt.times == 1 and rt.value > 0, "RT 每轮 FOUND 都记一次"
+        assert tps is not None and tps.times == 1 and tps.value == 2, "TPS 按弹到的条数记"
+
+    def test_found_with_empty_list_records_rt_only(self):
+        """Java 在**判空之前**记 RT、只在非空时记 TPS：这个不对称是刻意的，别"顺手"对齐。"""
+        c, delivered = self._run_rounds([PopResult(PopStatus.FOUND, [])])
+        assert delivered == []
+        rt, tps = self._items(c)
+        assert rt is not None and rt.times == 1
+        assert tps is None, "空结果不产生 TPS 项"
+
+    def test_polling_not_found_records_nothing(self):
+        """长轮询空手而归（POP 模式下这是常态）不该进 RT，否则平均 RT 被稀释成假低。"""
+        c, _ = self._run_rounds([PopResult(PopStatus.POLLING_NOT_FOUND)])
+        rt, tps = self._items(c)
+        assert rt is None and tps is None
 
 
 if __name__ == "__main__":

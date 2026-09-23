@@ -191,4 +191,72 @@ public class PopConsumerTests
         Assert.False(DefaultMQPushConsumer.IsPopTimeout(now, 60000));
         Assert.True(DefaultMQPushConsumer.IsPopTimeout(now - 60001, 60000));
     }
+
+    // ------------------------------------------------- POP 循环的 pullRT/pullTPS
+    //
+    // Java popMessage 的 PopCallback.onSuccess:556-563 有一处不对称：RT 在 FOUND 分支
+    // **判空之前**就记，TPS 只按真正弹到的条数记。漏记或记反方向都是静默故障 ——
+    // 消息照弹照 ack、消费完全正常，只有 307 的 statusTable（运维看板）一片 0，
+    // 而看板上"这个消费者没在拉取"和"压根没起来"是两种完全不同的处置。
+
+    private static PopResult Popped(int n)
+    {
+        var r = new PopResult { Status = PopStatus.Found };
+        for (int i = 0; i < n; i++)
+        {
+            r.MsgFoundList.Add(Msg(Topic, i, i));
+        }
+
+        return r;
+    }
+
+    [Fact]
+    public void RecordPopPullStats_FoundRecordsRtThenTps()
+    {
+        var stats = new ConsumerStatsManager();
+        string key = Topic + "@" + Group;
+        // 倒退 30ms：RT = now - began，正向断言 >0 不依赖调度精度
+        long began = UtilAll.CurrentTimeMillis() - 30;
+
+        DefaultMQPushConsumer.RecordPopPullStats(stats, Group, Topic, Popped(2), began);
+
+        (long rtValue, long rtTimes) = stats.TopicAndGroupPullRT.Find(key)!.Snapshot();
+        (long tpsValue, long tpsTimes) = stats.TopicAndGroupPullTPS.Find(key)!.Snapshot();
+        Assert.Equal(1, rtTimes);
+        Assert.True(rtValue >= 30, $"RT 应是本轮弹出耗时，实得 {rtValue}");
+        Assert.Equal(1, tpsTimes);
+        Assert.Equal(2, tpsValue);
+    }
+
+    [Fact]
+    public void RecordPopPullStats_FoundWithEmptyListRecordsRtOnly()
+    {
+        // Java 在判空**之前**记 RT：FOUND 但 0 条也是"这一次确实拉了一回"
+        var stats = new ConsumerStatsManager();
+        string key = Topic + "@" + Group;
+        long began = UtilAll.CurrentTimeMillis() - 30;
+
+        DefaultMQPushConsumer.RecordPopPullStats(stats, Group, Topic, Popped(0), began);
+
+        Assert.Equal(1, stats.TopicAndGroupPullRT.Find(key)!.Snapshot().times);
+        // TPS 一格都不该动：0 条消息记进分子只会把平均值拉低
+        Assert.Null(stats.TopicAndGroupPullTPS.Find(key));
+    }
+
+    [Fact]
+    public void RecordPopPullStats_PollingNotFoundRecordsNothing()
+    {
+        // POP 的空轮询是常态（长轮询挂满 pollTime 后返回），算进 RT 等于用挂起时长
+        // 稀释平均拉取耗时 —— 看板上的 pullRT 会完全失去意义。
+        var stats = new ConsumerStatsManager();
+        string key = Topic + "@" + Group;
+
+        DefaultMQPushConsumer.RecordPopPullStats(
+            stats, Group, Topic,
+            new PopResult { Status = PopStatus.PollingNotFound, MsgFoundList = { Msg(Topic, 0, 0) } },
+            UtilAll.CurrentTimeMillis() - 30);
+
+        Assert.Null(stats.TopicAndGroupPullRT.Find(key));
+        Assert.Null(stats.TopicAndGroupPullTPS.Find(key));
+    }
 }

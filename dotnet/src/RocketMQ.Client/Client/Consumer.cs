@@ -2520,6 +2520,35 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>
+    /// POP 路径的拉取统计（Java <c>popMessage</c> 的 <c>PopCallback.onSuccess:556-563</c>）。
+    /// <para>
+    /// Java 的 pull 回调每次都记 RT，POP 回调只在 <c>FOUND</c> 记，而且是在判空**之前**记；
+    /// TPS 只按真正弹到的条数记。照抄这个不对称：POP 的空手而归是长轮询常态
+    /// （<c>POLLING_NOT_FOUND</c>），把它算进 RT 等于用挂起时长稀释平均拉取耗时。
+    /// </para>
+    /// <para>
+    /// 漏记是**静默**故障：消息照弹照 ack、消费完全正常，只有 307 应答的
+    /// <c>statusTable</c>（运维看板）上一片 0 —— 而看板上"这个消费者没在拉取"和
+    /// "这个消费者压根没起来"是两种完全不同的处置。判据本身要能离线锁死，
+    /// 所以与 <c>FlowControlHit</c> 同一理由放在 public（测试工程无 InternalsVisibleTo）。
+    /// </para>
+    /// </summary>
+    public static void RecordPopPullStats(ConsumerStatsManager stats, string group, string topic,
+                                          PopResult result, long beganMs)
+    {
+        if (result.Status != PopStatus.Found)
+        {
+            return;
+        }
+
+        stats.IncPullRT(group, topic, UtilAll.CurrentTimeMillis() - beganMs);
+        if (result.MsgFoundList.Count > 0)
+        {
+            stats.IncPullTPS(group, topic, result.MsgFoundList.Count);
+        }
+    }
+
     // ---------------- POP 消费循环（5.x 轻量消费）----------------
 
     /// <summary>
@@ -2623,6 +2652,9 @@ public sealed class DefaultMQPushConsumer
                                 + result.MsgFoundList.Count + " messages un-acked");
                 return;
             }
+
+            // 拉取统计（Java PopCallback.onSuccess:556-563，判定见 RecordPopPullStats）
+            RecordPopPullStats(Client().ConsumerStats, ConsumerGroup, mq.Topic, result, began);
 
             if (result.Status == PopStatus.Found && result.MsgFoundList.Count > 0)
             {

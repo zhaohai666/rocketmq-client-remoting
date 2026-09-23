@@ -1849,7 +1849,20 @@ class DefaultMQPushConsumer:
                 logger.debug("queue %s revoked during pop, discard %d messages un-acked",
                              mq, len(result.msg_found_list or ()))
                 return
-            if result.status == PopStatus.FOUND and result.msg_found_list:
+            found = result.status == PopStatus.FOUND
+            if found:
+                # 消费统计（Java popMessage 的 PopCallback.onSuccess:556-563）：POP 路径
+                # 与 pull 路径一样要把 RT/TPS 记进状态表，否则 POP 消费者的
+                # consumerRunningInfo() 里 pull 侧永远是 0 —— 运维看板上"这个消费者没在
+                # 拉取"和"这个消费者根本没起来"就分不出来了。RT 在 FOUND 分支入口就记
+                # （Java 在判空之前记），TPS 只按真正弹到的条数记。
+                if self._stats_manager is not None:
+                    self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
+                                                    int((time.time() - began) * 1000))
+                    if result.msg_found_list:
+                        self._stats_manager.inc_pull_tps(self.consumer_group, mq.topic,
+                                                         len(result.msg_found_list))
+            if found and result.msg_found_list:
                 pq.inc_found_msg(len(result.msg_found_list))
                 # 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
                 # 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。

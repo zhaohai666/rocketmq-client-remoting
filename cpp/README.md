@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 33 个用例，3047 项断言（32 个测试二进制 2974 + interop 73），~30s
+cd build && ctest --output-on-failure     # 33 个用例，3054 项断言（32 个测试二进制 2981 + interop 73），~30s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -87,7 +87,7 @@ cd build && ctest --output-on-failure     # 33 个用例，3047 项断言（32 �
 | `producer_async` | 209 | 真异步发送链（进程内 mock broker + 真 socket）：`sendAsync` 立刻返回、准备工作和请求都在 `AsyncSenderExecutor_N` 上、回调与 `SendMessageHook.after` 在 `NettyClientPublicExecutor_N` 上；出队后才算耗时（预算被排队吃光一次请求都不发）；只有 remoting 层失败才重试且重试**复用同一请求**只换 opaque；超时预算是整条链共享的剩余时间；已收到响应但 broker 报错码**不重试不包装**；定点发送只在同一台 broker 上重试、且必须自己刷出路由；队满把 `executor rejected` 抛给调用方；回调抛异常被吞掉。**异步发送背压**（用例 10~17）：开关默认关且关掉时**一格许可都不动**、两个配置的地板值、条数/字节闸在**调用方线程**上等到预算耗尽才回调（Java 文案逐字）、被拒的发送一次请求都没发出、许可在链终点按「先 size 后 num」归还（失败与重试路径同样归还）、运行时扩容叫醒卡在闸上的人、队满时开着背压改为就地跑；**批量异步**（用例 18~21，对位 Java `send(Collection, SendCallback, timeout):1121`）：一批只发**一个**请求、只交付**一个**回调，字节闸按**整批** body 长度扣（Python `_back_pressure_msg_len` 的 list 分支），未 `start()` 时与单条异步同一口径就地抛且**一个回调都不交付**，ID 顺序锁死 Java `batch():1172-1184`（先给每条子消息 `setUniqID` → 再给整批那条补一个 → **最后**才 `setBody(encode())`，所以抓到的报文里每条子消息各带一个不重复的 32 位 UNIQ_KEY、批量自身那个 ID 也在）；**异步链的发送头**（用例 22）：异步自己建头（`buildSendRequest`），所以同步侧对齐不代表它也对齐——抓真报文验 `n`=该请求落到的 broker 名、`c`/`d` 取生产者的 `setCreateTopicKey`/`setDefaultTopicQueueNums`（`AsyncTopicKey`/11） |
 | `backpressure` | 50 | `FairSemaphore`（对应 Java `new Semaphore(permits, true)`）：只有**队首**能拿许可（后来者不许插队）、超时返回 false 而不抛、超时/获准后都要**把队首换人这件事广播出去**（漏了这一步，后到的等待者会睡到自己的超时 —— 两个用例专门盯这两条）、`release` 超过总量不校验、原地平移总量并保留在途份数（算出负的空闲许可也照 Java 的 `new Semaphore(负数)` 接受）、改容量能叫醒正堵在旧容量上的人（Java 换对象做不到这一步） |
 | `pop` | 93 | POP 协议管道：CK 反构（8 段 + `startOffsetInfo`/`msgOffsetInfo` 下标选择）、`bornTime`、ACK offset 语义 |
-| `pop_consumer` | 47 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制 |
+| `pop_consumer` | 54 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制；**POP 循环把拉取统计记进状态表**（Java `popMessage` 的 `PopCallback.onSuccess:556-563`：`FOUND` 这一格打在**空列表判定之前**、`msgFoundList` 非空才计 TPS、`POLLING_NOT_FOUND` 两格都不动 —— 空手而归是长轮询常态，把挂起时间折进 RT 会毁掉它）：走的是 `recordPopPullStats` 这道离线接缝，key 是 `topic@group`，漏记是**静默**的（弹、ack、消费全正常，只有 307 看板一片 0），真机半边由 `rmq_live_pop_consumer` 的 S5 取证 |
 | `consume_ack_index` | 28 | classic 并发消费的 `ackIndex` 切分（Java `processConsumeResult:207-269`）：默认 `Integer.MAX_VALUE` 整批认可不回投、listener 收窄到 0 时尾巴逐条 `sendMessageBack`、`RECONSUME_LATER` 强制 `ackIndex=-1` 整批回投、广播模式不回投、**回投失败时塞回队首且位点不越过它**（未 `start()` 的消费者回投必定失败，所以离线锁的是失败分支；「回投成功 → 位点整批前进」由 `rmq_live_redelivery` 的 S10 在真机上取证） |
 | `trace` | 92 | 消息轨迹：与 Java 官方实现的**逐字节对拍**（Pub / SubBefore / SubAfter / EndTransaction / Recall）+ 编解码双向 + 无 keys 空段容错 + 坏记录隔离 + 分发器分组/切块 |
 | `pull_expired` | 12 | 拉取循环停摆自愈（Java `ProcessQueue.PULL_MAX_IDLE_TIME` = **120000ms**，读 `rocketmq.client.pull.pullMaxIdleTime`；判据在 `RebalanceImpl.updateProcessQueueTableInRebalance:438-461`）：阈值逐字锁死、判据是**严格大于**（正好 120s 不算停摆）、没盖过章的新循环不算、循环线程已退出即刻算（不等满阈值）、健康队列一律不动（换线程等于丢在途重投）、撤走时持久化已消费位点并丢掉拉取游标与缓冲、分配即登记 `mqMap`（否则撤时无 mq 可持久化）、POP 分支读 `lastPopTimestamp` 且 `setDropped` + 换一具干净的 `PopProcessQueue`、停机期间不判停摆（否则刷一堆假 `[BUG]` 日志）、307 运行信息把 `lastPullTimestamp` 报成盖章节的真时刻、且 **`mqTable` 与 `mqPopTable` 互斥**（Java `DefaultMQPushConsumerImpl#consumerRunningInfo` 分别取 `processQueueTable` / `popProcessQueueTable`：弹出去的队列只出现在 popTable） |
@@ -132,7 +132,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_request_reply 127.0.0.1:9876
 ./build/examples/rmq_live_latency       127.0.0.1:9876
 ./build/examples/rmq_live_pop           127.0.0.1:9876
-./build/examples/rmq_live_pop_consumer  127.0.0.1:9876
+./build/examples/rmq_live_pop_consumer  127.0.0.1:9876   # POP 消费：全收/不重投/不可见时间重投 + 307 状态表里的 pullRT/pullTPS
 ./build/examples/rmq_live_redelivery    127.0.0.1:9876   # 重投/死信/重启/广播/顺序/流控/namespace/部分 ack/停摆自愈 十一段
 ./build/examples/rmq_live_trace         127.0.0.1:9876   # 需 broker traceTopicEnable=true
 ./build/examples/rmq_live_hook          127.0.0.1:9876
@@ -169,6 +169,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 
 | `rmq_live_flow_control` | 13 PASS / 0 FAIL | 拉取前流控五个阈值的真机闭环（与 Python `verify_flow_control_live.py`、Rust `live_flow_control`、.NET `flow-control` 的 S0~S4 逐条同构）。离线用例只能证明"喂给它那份缓冲它会判"，真机要证两件离线证不出的事：**闸门确实会命中**（单位错一位、阈值读错一个字段，离线拿预置缓冲照样绿）与**命中之后一条不丢**（写成"命中就丢批/退出循环"在十几秒窗口里看不出来）。S0 默认闸门 + 快消费 ⇒ `triggered==0` 且 12 条全到（闸门误伤正常流量表现为吞吐莫名腰斩，最难查）；S1 只留队列级字节闸门（`size=1MiB`，条数/跨度放到关不掉的量级）⇒ 命中 13 次、8 条 400KB 一条不丢且不重复；S2 只留跨度闸门（`maxSpan=2`）⇒ 命中 5 次、14 条仍全部消费；S3 只留 topic 级条数闸门（`pullThresholdForTopic=4`，4 队列 topic）⇒ 单队列怎么都到不了 4 条、必须跨队列累计才命中（105 次），且每条队列最后都消费到底；S4 复用 S1 的组与 topic 再来一批 ⇒ 位点从 broker 末尾接着走、闸门**不是命中一次就失效**（恢复后仍命中 7 次）、6 条不重不丢（这条锁的是"暂停 100ms"被写成"退出拉取循环"——S1 看不出差别，那一路会永久停摆）。⚠ 命中**次数**随真机投递/消费节奏浮动（S2 两轮分别报 3 与 5），判据只要求 `triggered > 0`。⚠ 两条踩过的夹具坑：大消息必须**不可压缩**（全同字节的 body 会被生产者压到几百字节，broker 落盘 `storeSize` 跟着变几百字节，size 闸门于是"永不命中"，Python 侧第一次跑正是这么踩到的）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列上每条才 800KB，永远够不到队列级那道 1MiB） |
 | `rmq_live_send_header` | 14 PASS / 0 FAIL | 发送头 `c`/`d`/`n` 三字段真机（与 Python `verify_send_header_live.py`、Rust `live_send_header`、.NET `send-header` 的 H0~H5 一一对应）：H0 先量出 `TBW102` 的 read/write 队列数（本机 8/8）当算术基准 → H1 什么都不配、发到全新 topic，broker 按 `min(d=4, TBW102.writeQueueNums)` 建出 **4** 条队列（`TopicConfigManager.java:289`）→ H2 `setDefaultTopicQueueNums(2)` 真的让 broker 只建 **2** 条（修之前写死 4，这条必然红）→ H3 `setCreateTopicKey` 指向带 `PERM_INHERIT` 的 3 队列模板 topic 时，新 topic 继承**模板**的 **3** 条而不是 TBW102 的 8 条 → H4 补上三字段后五种入口（同步 / 定点 / 单向 / 批量 320 / 异步）逐条落地、7 条一条不差 → H5 落点 broker 名与路由选中那台一致。⚠ `n` 在经典 broker 的发送链路里**没有读者**（5.5.1 源码 grep 过），它上线的存在由离线抓帧用例（`test_send_retry` 的 8a2 + `producer_async` 的用例 22）取证，这里不假装能观测到 |
+| `rmq_live_pop_consumer` | 11 PASS / 0 FAIL | POP 消费循环真机：S1a 全收、S1b body 集合与发送一致、S2a 无重复投递、S2b 观察期内不再新增（ack 确实写到了 broker）、S4 消息分布在多个队列且每条队列都被消费、S3 消费失败后换个 `invisibleTime` 整批复活重投 → **S5 POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage` 的 `PopCallback.onSuccess:556-563`：`FOUND` 的 `incPullRT` 打在**空列表判定之前**，`msgFoundList` 非空才 `incPullTPS`，`POLLING_NOT_FOUND` 两格都不动）。漏记是**静默**的：弹、ack、消费完全正常，只有运维看板上 `pullRT`/`pullTPS` 一片 0，而看板上"这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。判据取 `examineConsumerRunningInfo`(307) 应答的 `statusTable[topic]`，拉取侧两格与消费侧 `consumeOKTPS` **各自断言**（只有后者有值正是漏记的形状），判定本身由离线接缝 `recordPopPullStats`（`pop_consumer` 用例）锁住。⚠ 快照每 10s 采样一次、窗口取 minute 差分，夹具必须**持续有流量**并跨过两个采样点（实测 26s 发 52 条：`pullRT=2006.95`、`pullTPS=1.9990`、52 发 52 收，两格取值随真机节奏浮动、判据只要求非 0），否则 `pullTPS` 仍是 0 —— 那是夹具不够长，不是判据错 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。

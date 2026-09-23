@@ -66,7 +66,7 @@ use crate::client::producer::{SinkAdapter, TraceDispatcherChannel};
 use crate::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, ConsumeOrderlyContext,
     ConsumeOrderlyStatus, ConsumeReturnType, MessageListenerConcurrently, MessageListenerOrderly,
-    PopStatus, PullStatus,
+    PopResult, PopStatus, PullStatus,
 };
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::AccessChannel;
@@ -2365,6 +2365,34 @@ fn load_local_offsets(inner: &Inner) -> BTreeMap<String, i64> {
 
 // ================================================================ POP 消费
 
+/// POP 路径的拉取统计（Java `popMessage` 的 `PopCallback.onSuccess:556-563`）。
+///
+/// Java 的 pull 回调每次都记 RT，POP 回调只在 `FOUND` 记，而且是在判空**之前**记；
+/// TPS 只按真正弹到的条数记。照抄这个不对称：POP 的空手而归是长轮询常态
+/// （`POLLING_NOT_FOUND`），把它算进 RT 等于用挂起时长稀释平均拉取耗时。
+///
+/// 独立成函数是因为漏记是**静默**故障：消息照弹照 ack、消费完全正常，只有 307
+/// 状态表（运维看板）上一片 0 —— 而"这个消费者没在拉取"和"压根没起来"是两种处置。
+fn record_pop_pull_stats(
+    stats: &ConsumerStatsManager,
+    group: &str,
+    topic: &str,
+    result: &PopResult,
+    began: i64,
+) {
+    if result.status != PopStatus::Found {
+        return;
+    }
+    stats.inc_pull_rt(group, topic, current_time_millis() - began);
+    if !result.msg_found_list.is_empty() {
+        stats.inc_pull_tps(
+            group,
+            topic,
+            i64::try_from(result.msg_found_list.len()).unwrap_or(i64::MAX),
+        );
+    }
+}
+
 /// Python `_queue_pop_loop`（Java `DefaultMQPushConsumerImpl.popMessage` 回调部分）。
 ///
 /// 与拉取路径的关键差别：**不查也不提交消费位点**（进度由 broker 侧 checkpoint
@@ -2462,6 +2490,12 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             return;
         }
         pq.touch(current_time_millis());
+        // 拉取统计：与 pull 路径同一份状态表，POP 模式才有；放在撤队列早退之后，
+        // 已丢弃的那一批不进统计（那批消息压根没投递）。
+        if let Some(stats) = lock(&inner.stats).clone() {
+            let group = read_cfg(&inner).consumer_group;
+            record_pop_pull_stats(&stats, &group, &mq.topic, &result, began);
+        }
         if result.status == PopStatus::Found && !result.msg_found_list.is_empty() {
             pq.inc_found_msg(
                 i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX),
@@ -4445,6 +4479,78 @@ mod tests {
     }
 
     // ---------------- POP ----------------
+
+    /// Java `PopCallback.onSuccess:556-563` 的那处不对称：RT 在 `FOUND` 分支入口就记
+    /// （**判空之前**），TPS 只按真正弹到的条数记。记错方向是静默故障 —— 消息照弹照
+    /// ack、消费完全正常，只有 307 状态表上一片 0，所以两条判据都要能离线锁死。
+    #[test]
+    fn pop_loop_records_pull_rt_even_when_the_pop_is_empty() {
+        let group = "GID_PopStats";
+        let topic = "PopStatsTopic";
+        let key = ConsumerStatsManager::key(topic, group);
+        let stats = ConsumerStatsManager::new();
+        // 倒退 30ms：RT 是 `now - began`，正向断言 >0 不依赖调度精度
+        let began = current_time_millis() - 30;
+
+        let rt = || {
+            stats
+                .topic_and_group_pull_rt()
+                .find(&key)
+                .unwrap_or_else(|| panic!("PULL_RT 应该被记进 {key}"))
+        };
+        let tps = || {
+            stats
+                .topic_and_group_pull_tps()
+                .find(&key)
+                .unwrap_or_else(|| panic!("PULL_TPS 应该被记进 {key}"))
+        };
+
+        // ① FOUND + 2 条：RT 记一次、TPS 按条数记一次
+        record_pop_pull_stats(
+            &stats,
+            group,
+            topic,
+            &PopResult {
+                status: PopStatus::Found,
+                msg_found_list: vec![ext(topic, None), ext(topic, None)],
+                ..Default::default()
+            },
+            began,
+        );
+        assert_eq!(rt().times(), 1);
+        assert!(rt().value() >= 30, "RT 应是本轮弹出耗时: {}", rt().value());
+        assert_eq!(tps().times(), 1);
+        assert_eq!(tps().value(), 2);
+
+        // ② FOUND 但空列表：RT 照记（Java 在判空前记），TPS 不记（0 条不该拉高分子）
+        record_pop_pull_stats(
+            &stats,
+            group,
+            topic,
+            &PopResult {
+                status: PopStatus::Found,
+                ..Default::default()
+            },
+            began,
+        );
+        assert_eq!(rt().times(), 2, "FOUND 的空手而归也要记 RT");
+        assert_eq!(tps().times(), 1, "空列表不能记 TPS");
+
+        // ③ POLLING_NOT_FOUND：两格都不记。POP 的空轮询是常态，把挂起时长算进平均
+        //    拉取耗时会让看板上的 pullRT 完全失去意义。
+        record_pop_pull_stats(
+            &stats,
+            group,
+            topic,
+            &PopResult {
+                status: PopStatus::PollingNotFound,
+                ..Default::default()
+            },
+            began,
+        );
+        assert_eq!(rt().times(), 2);
+        assert_eq!(tps().times(), 1);
+    }
 
     /// Python `_is_pop_timeout`：拿不到 popTime/invisibleTime 时**一律算超时**，
     /// 于是走「重新计算可见性」而不是「原样重投」。

@@ -18,6 +18,7 @@ POP 循环 + ack 确认），差别只在"谁决定分哪些队列"。
   S2 ack 生效：收满后再观察一段时间，不应被重复投递（ack 已抵消 checkpoint）
   S3 RECONSUME_LATER：listener 持续返回 RECONSUME_LATER → 消息按延迟档位被重新投递
   S4 多队列：消息确实落到了多个队列且都被消费（POP 是逐队列弹的）
+  S5 pullRT/pullTPS 进 307 状态表：POP 循环要和 pull 循环一样上报拉取统计
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import sys
 import threading
 import time
 
+from rocketmq.client.admin import DefaultMQAdminExt
 from rocketmq.client.consumer import (DefaultMQPushConsumer,
                                      SimpleMessageListener)
 from rocketmq.client.producer import DefaultMQProducer
@@ -64,6 +66,8 @@ def main():
     group = "GID_PopConsLive_" + stamp
     topic_later = "PopConsLater_" + stamp
     group_later = "GID_PopConsLater_" + stamp
+    topic_stats = "PopConsStats_" + stamp
+    group_stats = "GID_PopConsStats_" + stamp
     n_msg = 12
     queue_num = 4
 
@@ -78,6 +82,7 @@ def main():
     try:
         prep.create_topic("TBW102", topic, queue_num)
         prep.create_topic("TBW102", topic_later, queue_num)
+        prep.create_topic("TBW102", topic_stats, queue_num)
     except Exception as e:  # noqa: BLE001
         print("!! CreateTopic failed: %s" % e)
     prep.shutdown()
@@ -203,6 +208,73 @@ def main():
     c2.shutdown()
     p2.shutdown()
     producer.shutdown()
+
+    # ------------------------------------------------ S5 pullRT/pullTPS 进 307
+    # Java 的 popMessage 回调（DefaultMQPushConsumerImpl:556-563）与 pull 回调一样要把
+    # incPullRT / incPullTPS 记进状态表，307 应答的 statusTable 就靠这两格。POP 循环漏掉
+    # 它们是**静默**的：消息照弹照 ack、消费完全正常，只有运维看板上一片 0 —— 而看板上
+    # "这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。
+    # ⚠ 快照每 10s 采样一次、窗口取 minute 差分，所以必须**持续有流量**并跨过两个采样点，
+    #   否则 pullTPS 仍是 0，那是夹具不够长，不是判据错。
+    print("=== S5 POP 循环把 pullRT/pullTPS 写进 307 状态表 ===")
+    stats_delivered = []
+
+    def stats_listener(msgs):
+        with lock:
+            stats_delivered.extend(m.body for m in msgs)
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
+
+    c5 = DefaultMQPushConsumer(group_stats)
+    c5.set_namesrv_addr(namesrv)
+    c5.pop_mode = True
+    c5.consume_thread_max = 2
+    c5.set_message_listener(SimpleMessageListener(stats_listener))
+    c5.subscribe(topic_stats, "*")
+    c5.start()
+    time.sleep(1.0)
+
+    p5 = DefaultMQProducer("PG_PopConsStats_" + stamp)
+    p5.set_namesrv_addr(namesrv)
+    p5.start()
+    began = time.time()
+    rounds = 0
+    while time.time() - began < 26.0:      # 约 3 个采样周期
+        for i in range(4):
+            p5.send(Message(topic_stats, ("s5-%d-%d" % (rounds, i)).encode("utf-8")))
+        rounds += 1
+        time.sleep(2.0)
+    sent5 = rounds * 4
+
+    admin5 = DefaultMQAdminExt()
+    admin5.set_namesrv_addr(namesrv)
+    admin5.start()
+
+    def pop_status():
+        """走 broker 转发到消费者本体的 307，读回该 topic 的状态表；失败当空表。"""
+        try:
+            info = admin5.examine_consumer_running_info(group_stats, c5.client_id or "")
+            return info.status_table.get(topic_stats) or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    ok_stats = wait_until(lambda: (pop_status().get("pullRT") or 0) > 0
+                          and (pop_status().get("pullTPS") or 0) > 0, timeout=40.0)
+    st = pop_status()
+    check("S5a 307 状态表里 POP 消费者的 pullRT 非零", (st.get("pullRT") or 0) > 0,
+          "pullRT=%s" % st.get("pullRT"))
+    check("S5b 307 状态表里 POP 消费者的 pullTPS 非零", ok_stats and (st.get("pullTPS") or 0) > 0,
+          "pullTPS=%s" % st.get("pullTPS"))
+    # consumeOKTPS 是 POP 路径本来就有的那一格：两格同时非零才说明"拉取"与"消费"
+    # 两条统计都通，而不是把消费数字抄到了拉取栏。
+    check("S5c 同一张表里 consumeOKTPS 也非零（拉/消费两格各自独立）",
+          (st.get("consumeOKTPS") or 0) > 0, "consumeOKTPS=%s" % st.get("consumeOKTPS"))
+    with lock:
+        got5 = len(stats_delivered)
+    check("S5d 这一轮消息全部弹到并被消费", got5 >= sent5, "got=%d sent=%d" % (got5, sent5))
+
+    c5.shutdown()
+    p5.shutdown()
+    admin5.shutdown()
 
     print("#" * 40)
     print("PASS=%d FAIL=%d" % (PASS, FAIL))

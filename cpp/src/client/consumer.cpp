@@ -1106,6 +1106,8 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
                          + std::to_string(result.msgFoundList.size()) + " messages un-acked");
             return;
         }
+        // 拉取统计（Java PopCallback.onSuccess:556-563，判定见 recordPopPullStats）
+        recordPopPullStats(client().consumerStats(), mq.topic, result, began);
         if (result.status == PopStatus::FOUND && !result.msgFoundList.empty()) {
             pq->incFoundMsg(static_cast<int32_t>(result.msgFoundList.size()));
             // 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
@@ -1128,6 +1130,20 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         // NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL 都直接进下一轮
+    }
+}
+
+void DefaultMQPushConsumer::recordPopPullStats(ConsumerStatsManager& stats,
+                                               const std::string& topic,
+                                               const PopResult& result, int64_t beganMs) {
+    // Java 的 pull 回调每次都记 RT，POP 回调（popMessage:556-563）只在 FOUND 记，而且
+    // 是在判空**之前**记；TPS 只按真正弹到的条数记。照抄这个不对称：POP 的空手而归是
+    // 长轮询常态（POLLING_NOT_FOUND），把它算进 RT 等于用挂起时长稀释平均拉取耗时。
+    if (result.status != PopStatus::FOUND) return;
+    stats.incPullRT(consumerGroup_, topic, UtilAll::currentTimeMillis() - beganMs);
+    if (!result.msgFoundList.empty()) {
+        stats.incPullTPS(consumerGroup_, topic,
+                         static_cast<int64_t>(result.msgFoundList.size()));
     }
 }
 
