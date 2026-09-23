@@ -798,6 +798,83 @@ async fn broker_name_header_follows_the_selected_queue() {
     producer.shutdown();
 }
 
+/// Java `DefaultMQProducerImpl#sendKernelImpl:1004-1018`：发往 `%RETRY%` 时把
+/// `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` 两个属性**抬进请求头**（V2 头的 `j` / `l`）。
+///
+/// 为什么必须在**线上报文**这一层锁死：broker 判死信读的是
+/// `SendMessageProcessor#handleRetryAndDLQ:197-210` 里的 `requestHeader.reconsumeTimes`
+/// 与 `maxReconsumeTimes`，**不看报文属性**。抬错等于把消费者配的
+/// `maxReconsumeTimes` 变成摆设 —— 退回订阅组默认的 retryMaxTimes(16)，毒消息要多耗
+/// 十几轮才进 `%DLQ%`。真机上这条只表现为「死信来得慢」，离线抓一次报文才看得出来。
+#[test]
+fn retry_topic_properties_are_lifted_into_the_send_header() {
+    let mut msg = Message::new("%RETRY%GID_lift", Some(b"poison"));
+    msg.put_property(
+        crate::common::message_const::PROPERTY_RECONSUME_TIME,
+        "4",
+    );
+    msg.put_property(
+        crate::common::message_const::PROPERTY_MAX_RECONSUME_TIMES,
+        "6",
+    );
+    let mq = MessageQueue::new("%RETRY%GID_lift", "broker-0", 0);
+    let mut publish = PublishMessage::Single(&mut msg);
+    let mut request = MQClientInstance::build_send_request(
+        "PID_inner_lift",
+        &mut publish,
+        &mq,
+        0,
+        false,
+        MixAll::DEFAULT_TOPIC,
+        MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+    );
+    request.make_custom_header_to_net();
+    let ext = request.ext_fields();
+    assert_eq!(ext.get("j"), Some("4"), "reconsumeTimes 抬进 j");
+    assert_eq!(ext.get("l"), Some("6"), "maxReconsumeTimes 抬进 l");
+    // ⚠ 属性本身**不能丢**：消费端还要靠 `RECONSUME_TIME` 还原重试次数
+    //（Java 也是先 setProperties 再 clearProperty，线上两份都在）。
+    let props = ext.get("i").unwrap_or_default();
+    assert!(
+        props.contains(crate::common::message_const::PROPERTY_RECONSUME_TIME),
+        "抬进头之后属性仍要上线: {props}"
+    );
+}
+
+/// 反向对照：普通 topic 即使带着这两个属性也**不许**抬。
+///
+/// Java 的判据是 `MixAll.isRetryTopic(topic)`，不是「属性存在与否」。写成按属性存在
+/// 就抬，会让业务自发的一条带 `RECONSUME_TIME` 的普通消息一进 broker 就被当成重投，
+/// 甚至直接改投 `%DLQ%`。`j` 在这里是 Java 的默认值 0，`l` 整个不上线
+///（`@CFNullable` + `writeIfNotNull`）。
+#[test]
+fn ordinary_topic_never_lifts_reconsume_times() {
+    let mut msg = Message::new("T1", Some(b"normal"));
+    msg.put_property(
+        crate::common::message_const::PROPERTY_RECONSUME_TIME,
+        "4",
+    );
+    msg.put_property(
+        crate::common::message_const::PROPERTY_MAX_RECONSUME_TIMES,
+        "6",
+    );
+    let mq = MessageQueue::new("T1", "broker-0", 0);
+    let mut publish = PublishMessage::Single(&mut msg);
+    let mut request = MQClientInstance::build_send_request(
+        "PID_normal",
+        &mut publish,
+        &mq,
+        0,
+        false,
+        MixAll::DEFAULT_TOPIC,
+        MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+    );
+    request.make_custom_header_to_net();
+    let ext = request.ext_fields();
+    assert_eq!(ext.get("j"), Some("0"));
+    assert!(!ext.contains_key("l"), "没配就不该上线: {ext:?}");
+}
+
 /// 单位名要同时出现在 clientId 与线上报文里，且不影响发送。
 #[tokio::test]
 async fn unit_name_only_changes_the_client_id() {

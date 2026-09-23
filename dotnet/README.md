@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，551 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，561 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -98,7 +98,7 @@ dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(4
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
-其它子命令：`redelivery`（50 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈 十一段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环，11 PASS / 0 FAIL，见下）。
+其它子命令：`redelivery`（60 PASS / 0 FAIL，2026-09-24 实测；重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈/顺序死信 十二段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环，11 PASS / 0 FAIL，见下）。
 
 `redelivery` 的 S9 是**死信终态**，也是「用尽」这条判据唯一能验的地方——客户端只把
 `maxReconsumeTimes` 通过 `sendMessageBack` 的 header 递上去，真正决定第几次转死信的是 broker
@@ -132,6 +132,23 @@ H2/H3 之后各发 3 条，位点走到 6/9，9 条各只投一次、`redelivere
 `PullExpiredTests`（12 项）锁死；那一项用注入时钟调 `PullStalledForTest`，因为等真 120s 的判据
 分不清走的是哪一支。本端口的存活代理是**登记线程的 `Thread.IsAlive`**（对位 Java 每队列一具
 ProcessQueue），POP 分支改读 `PopProcessQueue.LastPopTimestamp` 且撤走时 `SetDropped`。
+
+`redelivery` 的 S12 是**顺序消费的死信终态**（Java `ConsumeMessageOrderlyService:236-362`，与并发侧
+的 S9 是两条不同的代码路径）：SUSPEND 先过 `checkReconsumeTimes:322-339` —— 没用尽就本地
+`ReconsumeTimes + 1` 并原地挂起，用尽则回投，**只有回投失败**才继续挂起（回投成功必须提交位点，
+否则一条毒消息永久占住那条队列，真机上跟"消费者挂了"长得一模一样）。1 队列 topic +
+`ConsumeMessageBatchMaxSize=1` + `SuspendCurrentQueueTimeMillis=500` + `MaxReconsumeTimes=2` 实测：
+毒消息恰好投 3 次、`reconsumeTimes` 走 0/1/2 的阶梯（每一格都是客户端自己 +1），第 3 次交回 broker
+后业务队列**立刻前进**（后一条被消费）、再等 15s 也没有第 4 次，挂起期间 listener 始终看到业务
+topic。`%DLQ%<group>` 的路由到这一刻才建出来，死信那条 `reconsumeTimes=3`（broker 存储时 +1）、
+`RETRY_TOPIC` 仍是业务 topic —— **顺序回投能落进死信而不是走延迟档位，本身就是 broker 此刻看到该组
+的重平衡锁没过期**（`SendMessageProcessor#handleRetryAndDLQ:202-207`）的证据，也就是"拿着
+`LOCK_BATCH_MQ` 把消息交给 broker"这条链真的接上了。S12b 反过来验 `-1` 那一支：顺序侧
+`getMaxReconsumeTimes:313-320` 把 `-1` 读成**不设上限**（**不是**并发侧 `DefaultMQPushConsumerImpl:890`
+的 16），实测投过 19 次、`reconsumeTimes` 已到 18 而 broker 连 `%DLQ%` 的 topic 都没建；写成 16 的话
+第 17 次投递就该有死信。三条分支（+1、用尽才回投、回投失败才继续挂起）与回投那条消息的字段由离线
+单测 `OrderlyReconsumeTests`（10 项）锁死 —— 离线未 `Start()` 的消费者拿不到内部生产者，回投必定
+失败，所以离线锁的只有失败分支，"回投成功 ⇒ 位点前进、队列不堵"只能靠这一段。
 
 `popc` 的 S5 是**POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage`
 的 `PopCallback.onSuccess:556-563`：`case FOUND:` 先 `IncPullRT`，这一格打在**空列表判定之前**，
@@ -176,7 +193,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **551 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **561 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`

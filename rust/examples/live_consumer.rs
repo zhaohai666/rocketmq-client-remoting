@@ -43,6 +43,11 @@
 //!   确认它被撤掉重建（同一趟里换新属主、重新盖章），随后再发 3 条照样消费、
 //!   broker 位点从 3 前进到 6 且**不回退**，6 条各只投一次（撤走前持久化了位点）。
 //! - C10 清理：删掉本次建的 topic 与广播位点目录。
+//! - C12 顺序消费毒消息：listener 一直 SUSPEND + `max_reconsume_times=2` ⇒ 本地恰好投 3 次
+//!   （`reconsumeTimes` 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，
+//!   消息因 rebalance 锁未过期被 broker 立刻改投 `%DLQ%<group>`（`reconsumeTimes=3`、
+//!   `RETRY_TOPIC` 保留业务 topic）。
+//! - C12b 顺序侧的 `-1` 是**不设上限**（投过 >=18 次、`%DLQ%` 空），不是并发侧的 16。
 //!
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
@@ -260,6 +265,10 @@ struct LiveListener {
     fail_always: bool,
     /// 每批固定耗时（C9 用来制造待消费积压以触发流控）。
     batch_cost: Duration,
+    /// 顺序 listener 命中该 body 时返回 SUSPEND_CURRENT_QUEUE_A_MOMENT（C12 毒消息）。
+    /// 与 `fail_once` 分开：并发侧的「失败」在顺序侧必须是**挂起**，两者走的
+    /// 是 Java 里两套完全不同的处理分支（回投 broker vs 本地原地重试）。
+    suspend_body: Option<String>,
     orderly: Arc<OrderlyState>,
 }
 
@@ -277,6 +286,7 @@ impl LiveListener {
             fail_once: None,
             fail_always: false,
             batch_cost: Duration::ZERO,
+            suspend_body: None,
             orderly: Arc::new(OrderlyState::default()),
         })
     }
@@ -287,6 +297,7 @@ impl LiveListener {
             fail_once: Some(body.to_string()),
             fail_always: false,
             batch_cost: Duration::ZERO,
+            suspend_body: None,
             orderly: Arc::new(OrderlyState::default()),
         })
     }
@@ -298,6 +309,7 @@ impl LiveListener {
             fail_once: Some(body.to_string()),
             fail_always: true,
             batch_cost: Duration::ZERO,
+            suspend_body: None,
             orderly: Arc::new(OrderlyState::default()),
         })
     }
@@ -308,6 +320,19 @@ impl LiveListener {
             fail_once: None,
             fail_always: false,
             batch_cost: cost,
+            suspend_body: None,
+            orderly: Arc::new(OrderlyState::default()),
+        })
+    }
+
+    /// 命中该 body 的**每一次**顺序投递都挂起当前队列（C12 的毒消息）。
+    fn orderly_suspending_always(inbox: Arc<Inbox>, body: &str) -> Arc<LiveListener> {
+        Arc::new(LiveListener {
+            inbox,
+            fail_once: None,
+            fail_always: false,
+            batch_cost: Duration::ZERO,
+            suspend_body: Some(body.to_string()),
             orderly: Arc::new(OrderlyState::default()),
         })
     }
@@ -376,7 +401,12 @@ impl MessageListenerOrderly for LiveListener {
         _context: &mut ConsumeOrderlyContext,
     ) -> ConsumeOrderlyStatus {
         self.record(msgs);
-        ConsumeOrderlyStatus::Success
+        match &self.suspend_body {
+            Some(body) if msgs.iter().any(|m| is_body(m, body)) => {
+                ConsumeOrderlyStatus::SuspendCurrentQueueAMoment
+            }
+            _ => ConsumeOrderlyStatus::Success,
+        }
     }
 }
 
@@ -1275,6 +1305,77 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
 
 // --------------------------------------------- C4b 重试耗尽 → %DLQ% 终态
 
+/// `%DLQ%<group>` 现场取证：等 broker 把死信 topic 建出来并注册进路由，再用**独立消费组
+/// + `seek_to_begin`** 把已有的死信读出来（新组从队尾开始会把那条死信直接跳过 ⇒ 假失败）。
+///
+/// 返回 `(是否有路由, 死信消息)`：负向用例里「broker 压根没建死信 topic」本身就是正确
+/// 结论，不能和「等不到路由」混成同一个空结果。
+async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) -> Result<(bool, Vec<Delivered>), String> {
+    let dlq_topic = MixAll::get_dlq_topic(group);
+    let mut route = None;
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    while Instant::now() < deadline {
+        if let Some(r) = fx.admin.get_topic_route_data(&dlq_topic).await {
+            if !r.broker_datas.is_empty() {
+                route = Some(r);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let Some(r) = route else {
+        return Ok((false, Vec::new()));
+    };
+    // 队列数取 broker 建出来的那份路由（`DLQ_NUMS_PER_GROUP` 在 5.5.1 是 1，
+    // 但这是 broker 侧常量，别在测试里复述它）
+    let nums = r
+        .queue_datas
+        .iter()
+        .map(|q| q.read_queue_nums)
+        .sum::<i32>()
+        .max(1);
+    let mqs = fx.queues(&dlq_topic, nums);
+    let lite = DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
+        consumer_group: fx.group_name(reader_kind),
+        name_server_addrs: vec![fx.namesrv.clone()],
+        instance_name: format!("live-{reader_kind}-{}", fx.stamp),
+        poll_timeout_millis: 1000,
+        ..Default::default()
+    })
+    .map_err(|e| format!("build lite pull failed: {e}"))?;
+    // assign 必须在 start 之前：start 之后那次 rebalance 只认订阅，会把分配算空
+    lite.assign(&mqs);
+    lite.start()
+        .await
+        .map_err(|e| format!("lite start failed: {e}"))?;
+    for mq in &mqs {
+        lite.seek_to_begin(mq)
+            .await
+            .map_err(|e| format!("seek_to_begin failed: {e}"))?;
+    }
+    let mut msgs: Vec<Delivered> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    while Instant::now() < deadline {
+        for m in lite.poll(Some(1000)).await {
+            msgs.push(Delivered::from(&m));
+        }
+        if msgs.is_empty() {
+            continue;
+        }
+        // 收到后再排空几趟：断言「死信里只有这一条」要求把后面的也看见，
+        // 但总窗口必须有界，否则正向用例每次都要白等满 wait_secs。
+        let drain_to = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < drain_to {
+            for m in lite.poll(Some(500)).await {
+                msgs.push(Delivered::from(&m));
+            }
+        }
+        break;
+    }
+    lite.shutdown();
+    Ok((true, msgs))
+}
+
 /// 死信终态：为什么只能真机验。
 ///
 /// 「重试到第几次算用尽」这件事**两端各写一半**：客户端只负责把 `maxReconsumeTimes`
@@ -1339,83 +1440,43 @@ async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
 
     // %DLQ%<group> 由 broker 在转死信那一刻才建出来并注册到 namesrv
     let dlq_topic = MixAll::get_dlq_topic(&group);
-    let route = {
-        let mut found = None;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if let Some(r) = fx.admin.get_topic_route_data(&dlq_topic).await {
-                if !r.broker_datas.is_empty() {
-                    found = Some(r);
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        found
+    let (has_route, dlq_msgs) = match read_dlq(fx, &group, "dlqread", 30).await {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C4b 读 %DLQ%", &e),
     };
     ck.check(
         "C4b broker 自动创建并注册了 %DLQ%<group> 的路由",
-        route.is_some(),
+        has_route,
         &format!("dlq={dlq_topic}"),
     );
-    let mut dlq_msgs: Vec<Delivered> = Vec::new();
-    if let Some(r) = route {
-        // 队列数取 broker 建出来的那份路由（`DLQ_NUMS_PER_GROUP` 在 5.5.1 是 1，
-        // 但这是 broker 侧常量，别在测试里复述它）
-        let nums = r.queue_datas.iter().map(|q| q.read_queue_nums).sum::<i32>().max(1);
-        let mqs = fx.queues(&dlq_topic, nums);
-        let lite = match DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
-            consumer_group: fx.group_name("dlqread"),
-            name_server_addrs: vec![fx.namesrv.clone()],
-            instance_name: format!("live-dlqread-{}", fx.stamp),
-            poll_timeout_millis: 1000,
-            ..Default::default()
-        }) {
-            Ok(v) => v,
-            Err(e) => return ck.abort("C4b build lite pull", &format!("{e}")),
-        };
-        // assign 必须在 start 之前：start 之后那次 rebalance 只认订阅，会把分配算空
-        lite.assign(&mqs);
-        if let Err(e) = lite.start().await {
-            return ck.abort("C4b lite start", &format!("{e}"));
-        }
-        for mq in &mqs {
-            if let Err(e) = lite.seek_to_begin(mq).await {
-                return ck.abort("C4b seek_to_begin", &format!("{e}"));
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(25);
-        while Instant::now() < deadline && dlq_msgs.is_empty() {
-            for m in lite.poll(Some(1000)).await {
-                dlq_msgs.push(Delivered::from(&m));
-            }
-        }
-        lite.shutdown();
+    if has_route {
         ck.check(
             "C4b %DLQ%<group> 只有那一条死信",
             dlq_msgs.len() == 1 && dlq_msgs[0].body == victim,
             &format!("{dlq_msgs:?}"),
         );
-        if let Some(d) = dlq_msgs.first() {
-            // broker 存储时 +1（AbstractSendMessageProcessor:226）⇒ 2 次重投后为 3
-            ck.check(
-                "C4b 死信消息的 reconsumeTimes = maxReconsumeTimes + 1",
-                d.reconsume_times == MAX_RECONSUME + 1,
-                &format!("reconsumeTimes={}", d.reconsume_times),
-            );
-            ck.check(
-                "C4b 死信消息保留 RETRY_TOPIC=业务原始 topic，且 topic 已是 %DLQ%<group>",
-                d.retry_topic_prop.as_deref() == Some(topic.as_str()) && d.topic == dlq_topic,
-                &format!("topic={} retryTopic={:?}", d.topic, d.retry_topic_prop),
-            );
-            // 重投过程中 properties 是整份搬过去的 ⇒ 唯一 ID 不会被改写
-            let origin = sent.first().map(|s| s.0.clone()).unwrap_or_default();
-            ck.check(
-                "C4b 死信消息的 UNIQ_KEY 仍是最初那条的 msgId",
-                !origin.is_empty() && d.uniq_key == origin,
-                &format!("sent={origin} dlqUniq={}", d.uniq_key),
-            );
-        }
+    }
+    if let Some(d) = dlq_msgs.first() {
+        // broker 存储时 +1（AbstractSendMessageProcessor:226）⇒ 2 次重投后为 3
+        ck.check(
+            "C4b 死信消息的 reconsumeTimes = maxReconsumeTimes + 1",
+            d.reconsume_times == MAX_RECONSUME + 1,
+            &format!("reconsumeTimes={}", d.reconsume_times),
+        );
+        ck.check(
+            "C4b 死信消息保留 RETRY_TOPIC=业务原始 topic，且 topic 已是 %DLQ%<group>",
+            d.retry_topic_prop.as_deref() == Some(topic.as_str()) && d.topic == dlq_topic,
+            &format!("topic={} retryTopic={:?}", d.topic, d.retry_topic_prop),
+        );
+        // 重投过程中 properties 是整份搬过去的 ⇒ 唯一 ID 不会被改写
+        let origin = sent.first().map(|s| s.0.clone()).unwrap_or_default();
+        ck.check(
+            "C4b 死信消息的 UNIQ_KEY 仍是最初那条的 msgId",
+            !origin.is_empty() && d.uniq_key == origin,
+            &format!("sent={origin} dlqUniq={}", d.uniq_key),
+        );
+    }
+    if has_route {
         // 交给 C10 一起删掉，别在 broker 上留 %DLQ%/%RETRY% 垃圾
         lock(&fx.topics).push(dlq_topic.clone());
         lock(&fx.topics).push(MixAll::get_retry_topic(&group));
@@ -2236,8 +2297,185 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
-// ---------------------------------------------------------------- C10 清理
+// ---------------------------------------------------------------- C12 顺序消费毒消息
 
+/// 顺序消费的毒消息终态：为什么只能真机验。
+///
+/// Java `ConsumeMessageOrderlyService#processConsumeResult:236-307` 的 SUSPEND 分支先过
+/// `checkReconsumeTimes:322-339`：次数没用尽就**本地** `reconsumeTimes + 1` 并原地挂起
+/// （broker 那边压根没记这次失败）；用尽了才 `sendMessageBack:341-362` 把整条投给
+/// `%RETRY%<group>`，**投成功就不再挂起**、commit 位点让路（所以下一条必须被消费）。
+/// 而「投给 `%RETRY%` 之后进不进 `%DLQ%`」全在 broker：`SendMessageProcessor#handleRetryAndDLQ:185-234`
+/// 读 SEND_MESSAGE_V2 的 `j`/`l`（`AbstractSendMessageProcessor:427` 把 `j` 直接写成存储消息的
+/// reconsumeTimes），且只有本组的 rebalance 锁还没过期（`:202-207` isLockAllExpired=false，
+/// 也就是这个实例真的握着 `LOCK_BATCH_MQ`）才「立刻改投死信」。
+///
+/// 三种写错在客户端本地都表现为「看起来正常」：少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；
+/// 把 `-1` 读成并发侧的 16 ⇒ 顺序消费凭空多出死信；回投成功后仍挂起 ⇒ 队列永久卡死，
+/// 与消费者进程死掉一模一样。离线单测只能锁「回投失败」那一半（未 `start()` 的内部生产者必败），
+/// 「回投成功 ⇒ 位点前进、`%DLQ%` 出现、锁真的握着」只有真 broker 说得了。
+async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C12 顺序消费毒消息：本地计数 → 交 broker → %DLQ%<group>");
+    const MAX_RECONSUME: i32 = 2;
+    let topic = fx.topic_name("OrdDlq");
+    let group = fx.group_name("orddlq");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C12 create topic", &e);
+    }
+    // 1 队列 + 每批 1 条：毒消息后面那条必须排在它后面，且挂起不会连带别的路径
+    let poison = format!("{topic}-000");
+    let inbox = Arc::new(Inbox::default());
+    let mut cfg = fx.base_config(&group);
+    cfg.max_reconsume_times = MAX_RECONSUME;
+    cfg.consume_message_batch_max_size = 1;
+    cfg.suspend_current_queue_time_millis = 500;
+    let c = match DefaultMQPushConsumer::with_config(cfg) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C12 build consumer", &format!("{e}")),
+    };
+    if let Err(e) = c.subscribe(&topic, "*") {
+        return ck.abort("C12 subscribe", &format!("{e}"));
+    }
+    c.set_message_listener_orderly(LiveListener::orderly_suspending_always(
+        inbox.clone(),
+        &poison,
+    ));
+    if let Err(e) = c.start().await {
+        return ck.abort("C12 start", &format!("{e}"));
+    }
+    fx.produce(&topic, "TagA", 2, Some(0)).await;
+
+    let three = poll_until(|| inbox.matching(&poison).len() >= 3, 60).await;
+    let times: Vec<i32> = inbox.matching(&poison).iter().map(|d| d.reconsume_times).collect();
+    ck.check(
+        "C12 毒消息恰好投 3 次（每次由客户端自己 +1：reconsumeTimes 0/1/2）",
+        three && times.starts_with(&[0, 1, 2]),
+        &format!("times={times:?}"),
+    );
+    // 交棒判据：回投成功后 Java commit 位点，队列必须往前走。少了这一步就是「毒消息把
+    // 整个队列钉住」，与消费者死掉无法区分；多了（回投还没成功就前进）则是静默丢消息。
+    let after = format!("{topic}-001");
+    let handed = poll_until(|| !inbox.matching(&after).is_empty(), 60).await;
+    ck.check(
+        "C12 交给 broker 后业务队列继续前进（后一条被消费）",
+        handed,
+        &format!("after={after} arrivals={}", inbox.matching(&after).len()),
+    );
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let seen = inbox.matching(&poison);
+    ck.check(
+        "C12 用尽后不再原地挂起（观察窗口内毒消息只投了 3 次）",
+        seen.len() == 3,
+        &format!("arrivals={}", seen.len()),
+    );
+    ck.check(
+        "C12 挂起期间 listener 始终看到业务 topic（本地重投不换 topic）",
+        seen.iter().all(|d| d.topic == topic),
+        &format!("topics={:?}", seen.iter().map(|d| d.topic.clone()).collect::<Vec<_>>()),
+    );
+    c.shutdown();
+
+    let dlq_topic = MixAll::get_dlq_topic(&group);
+    let (has_route, dlq_msgs) = match read_dlq(fx, &group, "orddlqread", 40).await {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C12 读 %DLQ%", &e),
+    };
+    ck.check(
+        "C12 broker 自动创建并注册了 %DLQ%<group> 的路由",
+        has_route,
+        &format!("dlq={dlq_topic}"),
+    );
+    // 顺序回投落进死信而不是退回 `%RETRY%` 重投，本身就是 broker 认定「本组 rebalance 锁
+    // 还没过期」⇒ 这个实例真的握着 LOCK_BATCH_MQ（handleRetryAndDLQ:202-207）。
+    if has_route {
+        ck.check(
+            "C12 毒消息落在 %DLQ%<group>（回投走 rebalance 锁，立刻进死信）",
+            dlq_msgs.len() == 1 && dlq_msgs[0].body == poison,
+            &format!("{dlq_msgs:?}"),
+        );
+    }
+    if let Some(d) = dlq_msgs.first() {
+        // 3 = 客户端在 RECONSUME_TIME 上写的 +1，经 V2 头 j 落成存储值；漏填 j 的话
+        // broker 按订阅组默认 16 判，这条永远进不了死信。
+        ck.check(
+            "C12 死信 reconsumeTimes = maxReconsumeTimes + 1",
+            d.reconsume_times == MAX_RECONSUME + 1,
+            &format!("reconsumeTimes={}", d.reconsume_times),
+        );
+        ck.check(
+            "C12 死信保留 RETRY_TOPIC=业务 topic，且 topic 已是 %DLQ%<group>",
+            d.retry_topic_prop.as_deref() == Some(topic.as_str()) && d.topic == dlq_topic,
+            &format!("topic={} retryTopic={:?}", d.topic, d.retry_topic_prop),
+        );
+    }
+    // 交给 C10 一起删掉，别在 broker 上留 %DLQ%/%RETRY% 垃圾
+    lock(&fx.topics).push(dlq_topic.clone());
+    lock(&fx.topics).push(MixAll::get_retry_topic(&group));
+}
+
+/// 顺序侧的 `-1` 是**不设上限**，不是并发侧的 16。
+///
+/// Java 两处 `getMaxReconsumeTimes` 故意不同：`ConsumeMessageOrderlyService:313-320` 把 `-1`
+/// 读成 `Integer.MAX_VALUE`（顺序消费一直在本地原地重试，broker 侧没有计数，默认就该重试到
+/// 成功为止）；`DefaultMQPushConsumerImpl:890` 把 `-1` 读成 16（那边每轮都过一遍 broker，
+/// 16 是 broker 默认的 retryMaxTimes）。合成一个常量的两种坏法都得分别挡住：顺序侧读成 16
+/// ⇒ 第 17 次投给 broker，而锁还没过期 ⇒ 直接造出一条死信；并发侧读成 MAX ⇒ 毒消息永远不进
+/// `%DLQ%`（C4b 用 `maxReconsumeTimes=2` 覆盖了「阈值生效」，这条覆盖「默认值绝不生效」）。
+async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C12b maxReconsumeTimes=-1 时顺序消费不设上限（不是并发侧的 16）");
+    let topic = fx.topic_name("OrdNoCap");
+    let group = fx.group_name("ordnocap");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C12b create topic", &e);
+    }
+    let poison = format!("{topic}-000");
+    let inbox = Arc::new(Inbox::default());
+    let mut cfg = fx.base_config(&group);
+    // 显式不设上限（base_config 的默认就是 -1，写出来是为了让「默认」这条断言有出处）
+    cfg.max_reconsume_times = -1;
+    cfg.consume_message_batch_max_size = 1;
+    cfg.suspend_current_queue_time_millis = 200;
+    let c = match DefaultMQPushConsumer::with_config(cfg) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C12b build consumer", &format!("{e}")),
+    };
+    if let Err(e) = c.subscribe(&topic, "*") {
+        return ck.abort("C12b subscribe", &format!("{e}"));
+    }
+    c.set_message_listener_orderly(LiveListener::orderly_suspending_always(
+        inbox.clone(),
+        &poison,
+    ));
+    if let Err(e) = c.start().await {
+        return ck.abort("C12b start", &format!("{e}"));
+    }
+    fx.produce(&topic, "TagA", 1, Some(0)).await;
+    // 只要越过并发侧的 16 就能证明没用错常量。窗口给到 90s：走错的话第 17 次的延迟档位
+    // 是 level20（2h），一旦投出去就再也回不来，只能靠「本地投了多少次 + %DLQ% 空」两头夹住。
+    let uncapped = poll_until(|| inbox.matching(&poison).len() >= 18, 90).await;
+    let times: Vec<i32> = inbox.matching(&poison).iter().map(|d| d.reconsume_times).collect();
+    let max_times = times.iter().copied().max().unwrap_or(-1);
+    ck.check(
+        "C12b -1 时顺序消费不设上限（投过 >=18 次，16 不生效）",
+        uncapped && max_times >= 17,
+        &format!("arrivals={} maxTimes={max_times}", times.len()),
+    );
+    c.shutdown();
+    let (has_route, dlq_msgs) = match read_dlq(fx, &group, "ordnocapread", 20).await {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C12b 读 %DLQ%", &e),
+    };
+    ck.check(
+        "C12b 没到阈值就不该有死信（broker 侧连 %DLQ% topic 都不必建）",
+        dlq_msgs.is_empty(),
+        &format!("routeFound={has_route} n={}", dlq_msgs.len()),
+    );
+    if has_route {
+        lock(&fx.topics).push(MixAll::get_dlq_topic(&group));
+    }
+}
+
+// ---------------------------------------------------------------- C10 清理
 async fn c10_cleanup(ck: &mut Checker, fx: &mut Fixture) {
     println!("-- C10 清理");
     let topics: Vec<String> = lock(&fx.topics).clone();
@@ -2322,6 +2560,8 @@ async fn run(namesrv: &str) -> Checker {
     c8_scale_in_and_takeover(&mut ck, &fx).await;
     c9_admin_and_flow_control(&mut ck, &fx).await;
     c11_pull_stall_self_heal(&mut ck, &fx).await;
+    c12_orderly_dlq(&mut ck, &fx).await;
+    c12b_orderly_no_cap(&mut ck, &fx).await;
     c10_cleanup(&mut ck, &mut fx).await;
     ck
 }

@@ -3066,6 +3066,10 @@ public sealed class DefaultMQPushConsumer
     public bool ConsumeBatchForTest(string key, MessageQueue mq, List<MessageExt> batch)
         => ConsumeBatch(key, mq, batch);
 
+    /// <summary>顺序回投的 newMsg 构造体（Java 两条链路共用），供单测直接查属性。</summary>
+    public Message BuildRetryMessageForTest(MessageExt msg, int maxReconsumeTimes)
+        => BuildRetryMessage(msg, maxReconsumeTimes);
+
     public static string OffsetKeyForTest(MessageQueue mq) => OffsetKey(mq);
 
     /// <summary>预置某队列的「已拉未消费」缓冲（Java ProcessQueue）；null = 撤走该队列。</summary>
@@ -3154,19 +3158,30 @@ public sealed class DefaultMQPushConsumer
 
             if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
             {
-                lock (_lock)
+                // Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
+                // 只有「还在重试次数内 / 回投失败」才把这一批塞回队首原地重试；已经交给
+                // broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列 ——
+                // 而那看起来跟「消费者死了」一模一样。
+                if (CheckOrderlyReconsumeTimes(batch))
                 {
-                    if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+                    lock (_lock)
                     {
-                        for (int i = batch.Count - 1; i >= 0; --i)
+                        if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
                         {
-                            PushFront(q, batch[i]);
+                            for (int i = batch.Count - 1; i >= 0; --i)
+                            {
+                                PushFront(q, batch[i]);
+                            }
                         }
                     }
+
+                    _stopEvent.Wait(TimeSpan.FromMilliseconds(_suspendCurrentQueueTimeMillis));
+                    return false;
                 }
 
-                _stopEvent.Wait(TimeSpan.FromMilliseconds(_suspendCurrentQueueTimeMillis));
-                return false;
+                AdvanceConsumeOffset(key, batch);
+                Interlocked.Add(ref _consumedCount, batch.Count);
+                return true;
             }
 
             AdvanceConsumeOffset(key, batch);
@@ -3334,6 +3349,141 @@ public sealed class DefaultMQPushConsumer
         }
 
         return failed;
+    }
+
+    // ---------------- 顺序消费的重试计数与回投 ----------------
+    // 对位 Java ConsumeMessageOrderlyService 的 getMaxReconsumeTimes / checkReconsumeTimes
+    // / sendMessageBack（:313-362），与上面并发那一套**不是同一条链路**，两处差异都要守住：
+    //   1. `-1` 在顺序侧是「不设限」（Integer.MAX_VALUE），在并发侧才是 16；
+    //   2. 顺序侧的回投是**普通消息发送**（发到 %RETRY%<group>），不是 ConsumerSendMsgBack(3)。
+
+    /// <summary>
+    /// Java <c>ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320</c>。
+    ///
+    /// 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认就该
+    /// 一直重试到成功为止 —— <c>-1</c> 在这里读成 <c>int.MaxValue</c>。并发消费的
+    /// <c>-1 → 16</c>（<c>DefaultMQPushConsumerImpl#getMaxReconsumeTimes</c>）是另一套语义：
+    /// 那边每轮回投都要过一遍 broker，16 是 broker 的默认 retryMaxTimes。把两者并成一个常量，
+    /// 等于要么给顺序消费凭空造出死信，要么让并发消息无限重投。
+    /// </summary>
+    public int OrderlyMaxReconsumeTimes() =>
+        _maxReconsumeTimes == -1 ? int.MaxValue : _maxReconsumeTimes;
+
+    /// <summary>并发侧的 <c>-1</c> 读成 broker 默认的 16（与顺序侧那条不是一条链路）。</summary>
+    public int MaxReconsumeTimesOrDefault() => _maxReconsumeTimes == -1 ? 16 : _maxReconsumeTimes;
+
+    /// <summary>
+    /// Java <c>ConsumeMessageOrderlyService#checkReconsumeTimes:322-339</c>。
+    /// 返回「这一批是否还要原地挂起重试」。逐条两种走法：
+    ///   - 次数没用尽：本地 <c>ReconsumeTimes + 1</c>（broker 那边压根没记这次失败，客户端
+    ///     不补就永远到不了阈值），继续挂起；
+    ///   - 次数已用尽：交给 broker 回投。<b>回投成功就不再挂起</b>（Java 此时 commit 位点，
+    ///     毒消息让路、队列继续往前），回投失败才 +1 并挂起。
+    /// </summary>
+    public bool CheckOrderlyReconsumeTimes(List<MessageExt>? msgs)
+    {
+        bool suspend = false;
+        int maxTimes = OrderlyMaxReconsumeTimes();
+        if (msgs is null)
+        {
+            return false;
+        }
+
+        foreach (MessageExt msg in msgs)
+        {
+            if (msg.ReconsumeTimes >= maxTimes)
+            {
+                if (!OrderlySendMessageBack(msg))
+                {
+                    suspend = true;
+                    msg.ReconsumeTimes += 1;
+                }
+            }
+            else
+            {
+                suspend = true;
+                msg.ReconsumeTimes += 1;
+            }
+        }
+
+        return suspend;
+    }
+
+    /// <summary>
+    /// Java <c>ConsumeMessageOrderlyService#sendMessageBack:341-362</c>。
+    ///
+    /// 拿实例自带的内部生产者，把这条消息<b>当普通消息</b>发到 <c>%RETRY%&lt;group&gt;</c>：
+    /// broker 的 <c>handleRetryAndDLQ</c>（<c>SendMessageProcessor:199-234</c>）见该组还持有
+    /// 未过期的队列锁（正是顺序消费组的特征），直接把它改投 <c>%DLQ%&lt;group&gt;</c>。
+    /// 其中 <c>RECONSUME_TIME</c> / <c>MAX_RECONSUME_TIMES</c> 会被发送侧抬进请求头
+    ///（<c>MQClientInstance.BuildSendRequest</c>，Java <c>sendKernelImpl:1004-1018</c>）。
+    ///
+    /// 失败只返回 false、绝不抛：Java 整段包在 try/catch 里，抛给消费线程等于这条既没
+    /// ack 也没回投，只能等锁超时 —— 而顺序消费的锁超时是分钟级，看起来就像卡死。
+    /// </summary>
+    private bool OrderlySendMessageBack(MessageExt msg)
+    {
+        try
+        {
+            MQClientInstance c = Client();
+            Message newMsg = BuildRetryMessage(msg, OrderlyMaxReconsumeTimes());
+            TopicPublishInfo? publish = c.GetTopicPublishInfo(newMsg.Topic, isDefault: true);
+            if (publish is null || publish.MsgQueueList.Count == 0)
+            {
+                ClientLog.Debug("orderly send back has no writable queue, topic=" + newMsg.Topic);
+                return false;
+            }
+
+            // unitMode 跟着消费者：Java 构造内部生产者时调过 resetClientConfig(clientConfig)，
+            // 不带的话重投出去的消息会丢单元标记。
+            c.SendMessage(MixAll.ClientInnerProducerGroup, newMsg, publish.SelectOneMessageQueue(),
+                3000, unitMode: _unitMode);
+            return true;
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("orderly send message back failed, group=" + ConsumerGroup
+                            + " msg=" + msg.MsgId + ": " + e.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Java <c>DefaultMQPushConsumerImpl#sendMessageBackAsNormalMessage:1148-1160</c> 与
+    /// <c>ConsumeMessageOrderlyService#sendMessageBack:341-362</c> 的两个 newMsg 构造体
+    /// <b>逐行相同</b>（只有 maxReconsumeTimes 各调各的 getter），所以抽成一个函数，
+    /// 避免两处属性置法漂移。
+    /// </summary>
+    private Message BuildRetryMessage(MessageExt msg, int maxReconsumeTimes)
+    {
+        var newMsg = new Message(MixAll.GetRetryTopic(ConsumerGroup), msg.Body);
+        newMsg.Properties = new PropertyMap(msg.Properties);
+        newMsg.Flag = msg.Flag;
+        string originMsgId = msg.GetProperty(MessageConst.PropertyOriginMessageId);
+        if (string.IsNullOrEmpty(originMsgId))
+        {
+            originMsgId = msg.MsgId;
+        }
+
+        if (!string.IsNullOrEmpty(originMsgId))
+        {
+            newMsg.PutProperty(MessageConst.PropertyOriginMessageId, originMsgId);
+        }
+
+        newMsg.PutProperty(MessageConst.PropertyRetryTopic, msg.Topic);
+        newMsg.PutProperty(MessageConst.PropertyReconsumeTime,
+            (msg.ReconsumeTimes + 1).ToString(CultureInfo.InvariantCulture));
+        newMsg.PutProperty(MessageConst.PropertyMaxReconsumeTimes,
+            maxReconsumeTimes.ToString(CultureInfo.InvariantCulture));
+        // 半消息重投时不能带上 TRAN_MSG，否则 broker 会把它再当回查消息处理
+        newMsg.RemoveProperty(MessageConst.PropertyTransactionPrepared);
+        newMsg.DelayTimeLevel = 3 + msg.ReconsumeTimes;
+        if (string.IsNullOrEmpty(newMsg.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx)))
+        {
+            MessageClientIDSetter.SetUniqId(newMsg);
+        }
+
+        return newMsg;
     }
 
     /// <summary>
@@ -4063,7 +4213,7 @@ public sealed class DefaultMQPushConsumer
             // 按消费者配置如实上报，单元化重试 topic 才会带上 UNIT_SUB 标记。
             UnitMode = _unitMode,
             // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
-            MaxReconsumeTimes = _maxReconsumeTimes == -1 ? 16 : _maxReconsumeTimes,
+            MaxReconsumeTimes = MaxReconsumeTimesOrDefault(),
         };
         c.InvokeSync(addr, RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
         return true;

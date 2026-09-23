@@ -17,7 +17,8 @@ import time
 from collections import deque
 from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
-from ..common.message import MessageExt, MessageQueue
+from ..common.message import Message, MessageExt, MessageQueue
+from ..common.message_accessor import MessageAccessor
 from ..common.message_const import MessageConst
 from ..common.mix_all import MixAll
 from ..common.subscription_data import ExpressionType, FilterAPI, SubscriptionData
@@ -66,6 +67,10 @@ MAX_POP_INVISIBLE_TIME = 300000
 # Java ConsumeInitMode
 CONSUME_INIT_MODE_MIN = 0
 CONSUME_INIT_MODE_MAX = 1
+
+# Java `Integer.MAX_VALUE`：顺序消费用尽判据的默认值（-1 在这条链路上读成它，
+# 见 DefaultMQPushConsumerImpl#checkReconsumeTimes 的注释「default reconsume times」）。
+_JAVA_INT_MAX = 0x7FFFFFFF
 
 # Java ProcessQueue.PULL_MAX_IDLE_TIME（`rocketmq.client.pull.pullMaxIdleTime`，默认 120000ms）：
 # 一个仍归本实例的队列如果超过这么久没发起过任何拉取/弹出，说明它的循环死了（或卡住了）。
@@ -2375,13 +2380,19 @@ class DefaultMQPushConsumer:
                 failed=status != ConsumeOrderlyStatus.SUCCESS,
                 succeeded=status == ConsumeOrderlyStatus.SUCCESS)
             if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
-                with self._lock:
-                    dq = self._pending.get(key)
-                    if dq is not None:
-                        for m in reversed(batch):
-                            dq.appendleft(m)
-                time.sleep(self.suspend_current_queue_time_millis / 1000.0)
-                return False
+                # Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
+                # 只有"还在重试次数内 / 回投失败"才把这一批塞回队首原地重试；已经交给
+                # broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列。
+                if self._check_orderly_reconsume_times(batch):
+                    with self._lock:
+                        dq = self._pending.get(key)
+                        if dq is not None:
+                            for m in reversed(batch):
+                                dq.appendleft(m)
+                    time.sleep(self.suspend_current_queue_time_millis / 1000.0)
+                    return False
+                self._advance_consume_offset(key, batch)
+                return True
             self._advance_consume_offset(key, batch)
             return True
         # ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
@@ -2475,6 +2486,89 @@ class DefaultMQPushConsumer:
                 msg.set_reconsume_times(msg.get_reconsume_times() + 1)
                 failed.append(msg)
         return failed
+
+    # ---------------- 顺序消费的重试计数与回投 ----------------
+    # 对位 Java ConsumeMessageOrderlyService 的 getMaxReconsumeTimes / checkReconsumeTimes
+    # / sendMessageBack（:313-360），与上面并发那一套**不是同一条链路**，两处差异都要守住：
+    #   1. `-1` 在顺序侧是「不设限」（Integer.MAX_VALUE），在并发侧才是 16；
+    #   2. 顺序侧的回投是**普通消息发送**（发到 %RETRY%<group>），不是 CONSUMER_SEND_MSG_BACK(3)。
+
+    def _orderly_max_reconsume_times(self) -> int:
+        """Java ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320。
+
+        顺序消费没有 broker 侧的重投计数（消息一直停在本地队列里原地重试），所以默认
+        就该一直重试到成功为止 —— `-1` 在这里读成 `Integer.MAX_VALUE`。并发消费的
+        `-1 → 16`（`DefaultMQPushConsumerImpl#getMaxReconsumeTimes`）是另一套语义：那边
+        每轮回投都要过一遍 broker，16 是 broker 的默认 retryMaxTimes。把两者并成一个
+        常量，等于要么给顺序消费凭空造出死信，要么让并发消息无限重投。
+        """
+        if self.max_reconsume_times == -1:
+            return _JAVA_INT_MAX
+        return self.max_reconsume_times
+
+    def _check_orderly_reconsume_times(self, msgs: Optional[List[MessageExt]]) -> bool:
+        """Java ConsumeMessageOrderlyService#checkReconsumeTimes:322-336。
+
+        返回「这一批是否还要原地挂起重试」。逐条两种走法：
+          - 次数没用尽：本地 `reconsumeTimes + 1`（broker 那边压根没记，客户端不补就
+            永远到不了阈值），继续挂起；
+          - 次数已用尽：交给 broker 回投。**回投成功就不再挂起**（Java 此时 commit 位点，
+            毒消息让路，队列继续往前），回投失败才 +1 并挂起。
+        """
+        suspend = False
+        max_times = self._orderly_max_reconsume_times()
+        for msg in msgs or []:
+            if msg.get_reconsume_times() >= max_times:
+                MessageAccessor.set_reconsume_time(msg, msg.get_reconsume_times())
+                if not self._orderly_send_message_back(msg):
+                    suspend = True
+                    msg.set_reconsume_times(msg.get_reconsume_times() + 1)
+            else:
+                suspend = True
+                msg.set_reconsume_times(msg.get_reconsume_times() + 1)
+        return suspend
+
+    def _orderly_send_message_back(self, msg: MessageExt) -> bool:
+        """Java ConsumeMessageOrderlyService#sendMessageBack:338-360。
+
+        拿实例自带的内部生产者，把这条消息**当普通消息**发到 `%RETRY%<group>`：
+        broker 的 `handleRetryAndDLQ`（`SendMessageProcessor:199-234`）见该组还持有未过期的
+        队列锁（正是顺序消费组的特征），直接把它改投 `%DLQ%<group>`。属性置法逐条照抄
+        Java，其中 `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` 会被发送侧抬进请求头
+        （`mq_client._build_send_request`，Java `sendKernelImpl:1004-1018`）。
+
+        失败只返回 false、绝不抛：Java 整段包在 try/catch 里，抛给消费线程等于这条既没
+        ack 也没回投，只能等锁超时。
+        """
+        try:
+            client = self._require_client()
+            new_msg = Message(MixAll.get_retry_topic(self.consumer_group), msg.body)
+            new_msg.properties = dict(msg.properties)
+            new_msg.flag = msg.flag
+            origin_msg_id = MessageAccessor.get_origin_message_id(msg) or msg.msg_id
+            if origin_msg_id:
+                MessageAccessor.set_origin_message_id(new_msg, origin_msg_id)
+            MessageAccessor.put_property(new_msg, MessageConst.PROPERTY_RETRY_TOPIC, msg.topic)
+            MessageAccessor.set_reconsume_time(new_msg, msg.get_reconsume_times() + 1)
+            MessageAccessor.set_max_reconsume_times(new_msg,
+                                                    self._orderly_max_reconsume_times())
+            # 半消息标记必须清掉，否则 broker 会把它再当事务回查消息处理
+            MessageAccessor.clear_property(new_msg,
+                                           MessageConst.PROPERTY_TRANSACTION_PREPARED)
+            new_msg.set_delay_time_level(3 + msg.get_reconsume_times())
+            publish = client.get_topic_publish_info(new_msg.topic, is_default=True)
+            mq = publish.select_one_message_queue() if publish is not None else None
+            if mq is None:
+                raise MQClientException("no writable queue for retry topic %s" % new_msg.topic)
+            # unitMode 跟着消费者：Java 构造内部生产者时调过 resetClientConfig(clientConfig)，
+            # 不带的话重投出去的消息会丢单元标记。
+            client.send_message(MixAll.CLIENT_INNER_PRODUCER_GROUP, new_msg, mq, 3000,
+                                unit_mode=self.unit_mode)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug("orderly send message back failed, group=%s msg=%s: %s",
+                         self.consumer_group, msg.msg_id, e)
+            return False
 
     def _advance_consume_offset(self, key: str, batch: List[MessageExt],
                                 floor: Optional[int] = None) -> None:

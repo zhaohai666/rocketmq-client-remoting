@@ -15,6 +15,10 @@
 //    叫醒生产 rebalance ⇒ 断言它被撤掉重建（新线程接管并重新盖章），之后 3 条照样消费、
 //    位点前进到 6；另有一轮"盖章倒拨 125s"验证阈值那一支与运行信息的 lastPullTimestamp；
 //    最终 9 条各只投一次、reconsumeTimes 全 0（撤走前持久化了位点，重建后从 broker 续拉）
+// S12 顺序消费毒消息：listener 一直 SUSPEND + maxReconsumeTimes=2 ⇒ 本地恰好投 3 次
+//    （reconsumeTimes 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，消息因
+//    rebalance 锁未过期被 broker 立刻改投 %DLQ%<group>（reconsumeTimes=3、RETRY_TOPIC 保留业务 topic）
+// S12b 顺序侧的 -1 是**不设上限**（投过 >=18 次、%DLQ% 空），不是并发侧的 16
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
 //   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
@@ -114,6 +118,8 @@ public static class LiveRedelivery
         ScenarioDlq(producer);
         ScenarioPartialAck(producer);
         ScenarioPullStallSelfHeal(producer);
+        ScenarioOrderlyDlq(producer);
+        ScenarioOrderlyNoCap(producer);
 
         producer.Shutdown();
         Console.WriteLine();
@@ -666,46 +672,8 @@ public static class LiveRedelivery
 
         // %DLQ%<group> 由 broker 在转死信那一刻才建出来并注册到 namesrv
         string dlqTopic = MixAll.GetDlqTopic(group);
-        TopicRouteData? route = null;
-        using (var probe = new MQClientInstance("dlqprobe-" + NowMs().ToString(CultureInfo.InvariantCulture),
-                   new List<string> { _namesrv }))
-        {
-            probe.Start();
-            for (int i = 0; i < 15; ++i)
-            {
-                route = probe.GetTopicRouteData(dlqTopic);
-                if (route != null && route.QueueDatas.Count > 0) break;
-                route = null;
-                Thread.Sleep(2000);
-            }
-        }
-
-        Check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", route != null,
-            "dlq=" + dlqTopic);
-
-        var dlqMsgs = new List<MessageExt>();
-        if (route != null)
-        {
-            var queues = new List<MessageQueue>();
-            foreach (QueueData q in route.QueueDatas)
-            {
-                for (int i = 0; i < q.ReadQueueNums; ++i)
-                {
-                    queues.Add(new MessageQueue(dlqTopic, q.BrokerName, i));
-                }
-            }
-
-            var reader = new DefaultLitePullConsumer(_gPrefix + "_g9dlq");
-            reader.SetNamesrvAddr(_namesrv);
-            // 新消费组 + LAST 会从队尾开始，把已经在死信里的那条跳过 ⇒ 假失败
-            reader.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
-            reader.Assign(queues);
-            reader.Start();
-            foreach (MessageQueue mq in queues) reader.SeekToBegin(mq);
-            deadline = NowMs() + 25000;
-            while (NowMs() < deadline && dlqMsgs.Count == 0) dlqMsgs.AddRange(reader.Poll(1000));
-            reader.Shutdown();
-        }
+        (bool routeFound, List<MessageExt> dlqMsgs) = ReadDlq(group, _gPrefix + "_g9dlq", 30000);
+        Check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", routeFound, "dlq=" + dlqTopic);
 
         bool one = dlqMsgs.Count == 1 && Body(dlqMsgs[0]) == "dlq-me";
         Check("S9-消息落在 %DLQ%<group>", one,
@@ -1059,5 +1027,237 @@ public static class LiveRedelivery
             c.Shutdown();
             admin.Shutdown();
         }
+    }
+
+    // ---------------- S12 顺序消费毒消息：本地计数 → 交 broker → %DLQ% ----------------
+
+    /// <summary>命中指定 body 的每次顺序投递都挂起当前队列（其余照常成功）。</summary>
+    private sealed class PoisonOrderlyListener : IMessageListenerOrderly
+    {
+        private readonly string _poison;
+        private readonly object _gate = new();
+        private readonly List<(string Body, string Topic, int ReconsumeTimes)> _seen = new();
+
+        public PoisonOrderlyListener(string poison)
+        {
+            _poison = poison;
+        }
+
+        public bool Orderly() => true;
+
+        public List<(string Body, string Topic, int ReconsumeTimes)> Snapshot()
+        {
+            lock (_gate) return new List<(string Body, string Topic, int ReconsumeTimes)>(_seen);
+        }
+
+        public int CountOf(string body)
+        {
+            lock (_gate) return _seen.Count(a => a.Body == body);
+        }
+
+        public ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext ctx)
+        {
+            bool mine = false;
+            lock (_gate)
+            {
+                foreach (MessageExt m in msgs)
+                {
+                    string body = Body(m);
+                    _seen.Add((body, m.Topic, m.ReconsumeTimes));
+                    if (body == _poison) mine = true;
+                }
+            }
+
+            return mine ? ConsumeOrderlyStatus.SuspendCurrentQueueAMoment
+                : ConsumeOrderlyStatus.Success;
+        }
+    }
+
+    /// <summary>
+    /// 顺序消费的毒消息终态。为什么只能真机验：
+    /// Java ConsumeMessageOrderlyService#processConsumeResult:236-307 的 SUSPEND 分支先过
+    /// checkReconsumeTimes:322-339 —— 次数没用尽就**本地** reconsumeTimes +1 并原地挂起
+    /// （broker 那边压根没记这次失败），用尽了才 sendMessageBack:341-362 把整条投给
+    /// %RETRY%&lt;group&gt;，**投成功就不再挂起**、commit 位点让路（所以下一条必须被消费）。
+    /// 而「投给 %RETRY% 之后进不进 %DLQ%」全在 broker：SendMessageProcessor#handleRetryAndDLQ:185-234
+    /// 读 SEND_MESSAGE_V2 的 j/l（AbstractSendMessageProcessor:427 把 j 直接写成存储消息的
+    /// reconsumeTimes），且只有本组 rebalance 锁还没过期（:202-207，即这个实例真的握着
+    /// LOCK_BATCH_MQ）才「立刻改投死信」。三种写错在客户端本地都表现为「看起来正常」：
+    /// 少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；-1 读成并发侧的 16 ⇒ 顺序消费凭空多出死信；
+    /// 回投成功后仍挂起 ⇒ 队列永久卡死，跟消费者进程死掉一模一样。
+    /// 离线单测（OrderlyReconsumeTests.cs）只能锁「回投失败」那一半——未 Start 的内部生产者必败。
+    /// </summary>
+    private static void ScenarioOrderlyDlq(DefaultMQProducer producer)
+    {
+        const int maxReconsume = 2;
+        const string poison = "ord-poison";
+        string topic = _gPrefix + "_OrdDlq";
+        string group = _gPrefix + "_g12";
+        // 1 队列 + 每批 1 条：ord-after 必须排在毒消息后面，挂起也不会牵连别的路径
+        PrepareTopic(producer, topic, 1);
+
+        var listener = new PoisonOrderlyListener(poison);
+        var consumer = NewConsumer(group);
+        consumer.ConsumeMessageBatchMaxSize = 1;
+        consumer.SuspendCurrentQueueTimeMillis = 500;
+        consumer.MaxReconsumeTimes = maxReconsume;
+        consumer.SetMessageListener(listener);
+        consumer.Subscribe(topic, "*");
+        consumer.Start();
+        Thread.Sleep(3000);
+        producer.Send(new Message(topic, Str2Bytes(poison)));
+        producer.Send(new Message(topic, Str2Bytes("ord-after")));
+
+        Check("S12-毒消息恰好投 3 次（每次由客户端自己 +1：reconsumeTimes 0/1/2）",
+            WaitUntil(() => listener.CountOf(poison) >= 3, 60000)
+            && LadderOf(listener, poison),
+            "times=[" + TimesOf(listener, poison) + "]");
+        // 交棒判据：回投成功后 Java commit 位点，队列必须往前走。少了这一步就是「毒消息把
+        // 整个队列钉住」，与消费者死掉无法区分；多了（回投还没成功就前进）则是静默丢消息。
+        Check("S12-交给 broker 后业务队列继续前进（后一条被消费）",
+            WaitUntil(() => listener.CountOf("ord-after") >= 1, 60000),
+            "after=" + listener.CountOf("ord-after").ToString(CultureInfo.InvariantCulture));
+        Thread.Sleep(15000);  // 反证：不该有第 4 次
+        Check("S12-用尽后不再原地挂起（观察窗口内毒消息只投了 3 次）",
+            listener.CountOf(poison) == 3,
+            "arrivals=" + listener.CountOf(poison).ToString(CultureInfo.InvariantCulture));
+        Check("S12-挂起期间 listener 始终看到业务 topic（本地重投不换 topic）",
+            listener.Snapshot().Where(a => a.Body == poison).All(a => a.Topic == topic));
+        consumer.Shutdown();
+
+        string dlqTopic = MixAll.GetDlqTopic(group);
+        (bool routeFound, List<MessageExt> dlqMsgs) = ReadDlq(group, _gPrefix + "_g12dlq", 40000);
+        Check("S12-broker 自动创建并注册了 %DLQ%<group> 路由", routeFound, "dlq=" + dlqTopic);
+        // 顺序回投落进死信而不是退回 %RETRY% 重投，本身就是 broker 认定「本组 rebalance 锁
+        // 还没过期」⇒ 这个实例真的握着 LOCK_BATCH_MQ（handleRetryAndDLQ:202-207）。
+        bool one = dlqMsgs.Count == 1 && Body(dlqMsgs[0]) == poison;
+        Check("S12-毒消息落在 %DLQ%<group>（回投走 rebalance 锁，立刻进死信）",
+            one, "n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
+        if (one)
+        {
+            MessageExt d = dlqMsgs[0];
+            // 3 = 客户端在 RECONSUME_TIME 上写的 +1，经 V2 头 j 落成存储值；漏填 j 的话
+            // broker 按订阅组默认 16 判，这条永远进不了死信。
+            Check("S12-死信 reconsumeTimes = maxReconsumeTimes + 1",
+                d.ReconsumeTimes == maxReconsume + 1,
+                "reconsumeTimes=" + d.ReconsumeTimes.ToString(CultureInfo.InvariantCulture));
+            bool hasRetryTopic = d.Properties.TryGetValue("RETRY_TOPIC", out string? retryTopic);
+            Check("S12-死信保留 RETRY_TOPIC=业务 topic，topic 已是 %DLQ%<group>",
+                hasRetryTopic && retryTopic == topic && d.Topic == dlqTopic,
+                "retryTopic=" + (hasRetryTopic ? retryTopic : "<missing>"));
+        }
+    }
+
+    /// <summary>
+    /// 顺序侧的 -1 是**不设上限**，不是并发侧的 16。Java 两处 getMaxReconsumeTimes 故意不同：
+    /// ConsumeMessageOrderlyService:313-320 把 -1 读成 Integer.MAX_VALUE（顺序消费一直在本地
+    /// 原地重试，broker 侧没有计数，默认就该重试到成功为止）；DefaultMQPushConsumerImpl:890 把
+    /// -1 读成 16（那边每轮都过一遍 broker，16 是 broker 默认的 retryMaxTimes）。合成一个常量
+    /// 的两种坏法都得分别挡住：顺序侧读成 16 ⇒ 第 17 次投给 broker，而锁还没过期 ⇒ 直接造出
+    /// 一条死信；并发侧读成 MAX ⇒ 毒消息永远不进 %DLQ%（S9 覆盖了「阈值生效」，这条覆盖
+    /// 「默认值绝不生效」）。
+    /// </summary>
+    private static void ScenarioOrderlyNoCap(DefaultMQProducer producer)
+    {
+        const string poison = "ord-forever";
+        string topic = _gPrefix + "_OrdNoCap";
+        string group = _gPrefix + "_g12b";
+        PrepareTopic(producer, topic, 1);
+
+        var listener = new PoisonOrderlyListener(poison);
+        var consumer = NewConsumer(group);
+        consumer.ConsumeMessageBatchMaxSize = 1;
+        consumer.SuspendCurrentQueueTimeMillis = 200;
+        // 显式不设上限（默认就是 -1，写出来是为了让「默认」这条断言有出处）
+        consumer.MaxReconsumeTimes = -1;
+        consumer.SetMessageListener(listener);
+        consumer.Subscribe(topic, "*");
+        consumer.Start();
+        Thread.Sleep(3000);
+        producer.Send(new Message(topic, Str2Bytes(poison)));
+
+        // 只要越过并发侧的 16 就能证明没用错常量。窗口给到 90s：走错的话第 17 次的延迟档位
+        // 是 level20（2h），一旦投出去就再也回不来，只能靠「本地投了多少次 + %DLQ% 空」两头夹住。
+        Check("S12b-maxReconsumeTimes=-1 时顺序消费不设上限（投过 >=18 次，16 不生效）",
+            WaitUntil(() => listener.CountOf(poison) >= 18, 90000)
+            && listener.Snapshot().Where(a => a.Body == poison).Max(a => a.ReconsumeTimes) >= 17,
+            "arrivals=" + listener.CountOf(poison).ToString(CultureInfo.InvariantCulture)
+            + " times=[" + TimesOf(listener, poison) + "]");
+        consumer.Shutdown();
+
+        (bool routeFound, List<MessageExt> dlqMsgs) = ReadDlq(group, _gPrefix + "_g12bdlq", 20000);
+        Check("S12b-没到阈值就不该有死信（broker 侧连 %DLQ% topic 都不必建）",
+            dlqMsgs.Count == 0,
+            "routeFound=" + (routeFound ? "true" : "false")
+            + " n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static bool LadderOf(PoisonOrderlyListener listener, string body)
+    {
+        List<int> times = listener.Snapshot()
+            .Where(a => a.Body == body).Select(a => a.ReconsumeTimes).ToList();
+        return times.Count >= 3 && times[0] == 0 && times[1] == 1 && times[2] == 2;
+    }
+
+    private static string TimesOf(PoisonOrderlyListener listener, string body) =>
+        string.Join(",", listener.Snapshot()
+            .Where(a => a.Body == body).Select(a => a.ReconsumeTimes.ToString(CultureInfo.InvariantCulture)));
+
+    /// <summary>
+    /// %DLQ%&lt;group&gt; 现场取证：先用一次性 probe 等 broker 把死信 topic 注册进路由，
+    /// 再用**独立消费组 + FirstOffset** 把已有的死信读出来（新组 + LAST 会从队尾开始，
+    /// 把已经落在死信里的那条直接跳过 ⇒ 假失败）。routeFound 单独返回：负向用例里
+    /// 「broker 压根没建死信 topic」本身就是正确结论，不能和「等不到路由」混成同一个空结果。
+    /// </summary>
+    private static (bool RouteFound, List<MessageExt> Msgs) ReadDlq(string group, string readerGroup,
+        int timeoutMs)
+    {
+        string dlqTopic = MixAll.GetDlqTopic(group);
+        TopicRouteData? route = null;
+        using (var probe = new MQClientInstance("dlqprobe-" + NowMs().ToString(CultureInfo.InvariantCulture),
+                   new List<string> { _namesrv }))
+        {
+            probe.Start();
+            long deadline = NowMs() + timeoutMs;
+            while (NowMs() < deadline)
+            {
+                route = probe.GetTopicRouteData(dlqTopic);
+                if (route != null && route.QueueDatas.Count > 0) break;
+                route = null;
+                Thread.Sleep(2000);
+            }
+        }
+
+        if (route == null) return (false, new List<MessageExt>());
+
+        var queues = new List<MessageQueue>();
+        foreach (QueueData q in route.QueueDatas)
+        {
+            for (int i = 0; i < q.ReadQueueNums; ++i)
+            {
+                queues.Add(new MessageQueue(dlqTopic, q.BrokerName, i));
+            }
+        }
+
+        var msgs = new List<MessageExt>();
+        var reader = new DefaultLitePullConsumer(readerGroup);
+        reader.SetNamesrvAddr(_namesrv);
+        reader.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
+        reader.Assign(queues);
+        reader.Start();
+        foreach (MessageQueue mq in queues) reader.SeekToBegin(mq);
+        long pollDeadline = NowMs() + timeoutMs;
+        while (NowMs() < pollDeadline)
+        {
+            msgs.AddRange(reader.Poll(1000));
+            if (msgs.Count == 0) continue;
+            // 收到后再排空几趟：断言「死信里只有这一条」要求把后面的也看见，
+            // 但总窗口必须有界，否则正向用例每次都要白等满 timeoutMs。
+            long drainTo = NowMs() + 3000;
+            while (NowMs() < drainTo) msgs.AddRange(reader.Poll(500));
+            break;
+        }
+        reader.Shutdown();
+        return (true, msgs);
     }
 }

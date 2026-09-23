@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -505,21 +506,24 @@ void DefaultMQPushConsumer::start() {
     }
 
     // 拉取：每队列一个线程（并发长轮询，避免空队列 suspend 阻塞其他队列投递）
+    // 这四个常驻循环与拉取线程同一口径：**异常必须在边界上接住**。线程里逃出一个异常
+    // 就是 std::terminate（整个进程陪葬，而不是这一个消费者少干活）；shutdown 先把
+    // started_ 置 false 再依次 join 线程，中间任何一句 client() 都会抛 "consumer not started"。
     dispatchThread_ = std::thread([this]() {
         setThreadName("ConsumeMessageThread");
-        dispatchLoop();
+        runLoop("dispatch", [this] { dispatchLoop(); });
     });
     persistThread_ = std::thread([this]() {
         setThreadName("MQClientFactoryScheduledThread");
-        offsetPersistLoop();
+        runLoop("offsetPersist", [this] { offsetPersistLoop(); });
     });
     lockThread_ = std::thread([this]() {
         setThreadName("ConsumeMessageOrderlyServiceThread");
-        lockLoop();
+        runLoop("orderlyLock", [this] { lockLoop(); });
     });
     rebalanceThread_ = std::thread([this]() {
         setThreadName("RebalanceThread");
-        rebalanceLoop();
+        runLoop("rebalance", [this] { rebalanceLoop(); });
     });
 
     // 消息轨迹：enableMsgTrace=true 时建 AsyncTraceDispatcher 并注册 ConsumeMessageTraceHook。
@@ -623,6 +627,26 @@ MQClientInstance& DefaultMQPushConsumer::client() {
     return *mqClient_;
 }
 
+// 常驻循环线程的边界。两件事缺一不可：
+//   1. **接住异常**：线程里逃出异常 = std::terminate，整个进程陪葬，而不是这一个消费者
+//      少干活。shutdown 第一步就把 started_ 置 false，之后任何一句 client() 都会抛
+//      "consumer not started"，而它 join 各线程是在更后面 —— 中间的空档必然有人踩到。
+//   2. **还在运行就重进循环**：只接不重跑，等于把一次偶发异常变成"心跳照发、位点照刷、
+//      就是不再消费"的静默停摆，比崩溃更难查。重进前睡 1s，持续失败会在日志里留痕。
+void DefaultMQPushConsumer::runLoop(const std::string& what, const std::function<void()>& body) {
+    while (started_.load() && !stop_.load()) {
+        try {
+            body();
+            return;  // 循环自己退出了（看到停机），正常收工
+        } catch (const std::exception& e) {
+            logger_warn(what + " loop threw: " + e.what());
+        } catch (...) {
+            logger_warn(what + " loop threw: unknown exception");
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
 // ---------------------------------------------------------------- 消费循环
 bool DefaultMQPushConsumer::isOrderly() const {
     return messageListener_ != nullptr && messageListener_->orderly();
@@ -710,6 +734,11 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
         //    成之后的状态，所以「先跑起来看不到归属」的窗口被彻底关死。
         for (const auto& kv : current) {
             if (pullThreads_.find(kv.first) != pullThreads_.end()) continue;
+            // shutdown 已经开始就只撤不建：`started_` 在 shutdown 第一步就被置成 false，
+            // 而 `client()` 此后必抛（"consumer not started"）——此刻起的线程一进门就死在
+            // 第一句上；更糟的是 shutdown 的 join 循环可能已经过去，没人 join 这条新线程，
+            // 它能活到本对象析构之后。Java 的 RebalanceService 是先 `isStopped` 再建，同一口径。
+            if (stop_.load() || !started_.load()) return;
             if (popMode_ && popQueues_.find(kv.first) == popQueues_.end()) {
                 popQueues_[kv.first] = std::make_shared<PopProcessQueue>();
             }
@@ -724,16 +753,27 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
             const MessageQueue mq = kv.second;
             try {
                 std::thread t([this, mq, key, token]() {
-                    if (popMode_) {
-                        setThreadName("PopMessageService");
-                        queuePopLoop(mq, token);
-                    } else {
-                        setThreadName("PullMessageService");
-                        queuePullLoop(mq, token);
+                    // 线程体的**边界**必须自己接住异常：这里逃出去就是 std::terminate，
+                    // 整个进程陪葬（真机实测：shutdown 与一轮 rebalance 抢在一起时，
+                    // 新起的线程第一句 client() 抛 "consumer not started"，把跑了一般的
+                    // 用例全带走）。消费循环内部的异常一律就地转成停摆上报。
+                    try {
+                        if (popMode_) {
+                            setThreadName("PopMessageService");
+                            queuePopLoop(mq, token);
+                        } else {
+                            setThreadName("PullMessageService");
+                            queuePullLoop(mq, token);
+                        }
+                    } catch (const std::exception& e) {
+                        logger_warn("pull loop died, queue=" + key + ": " + e.what());
+                    } catch (...) {
+                        logger_warn("pull loop died, queue=" + key + ": unknown exception");
                     }
                     // 走到这里说明循环自己返回了。若它返回时**仍然持有**该队列，就不是
                     // 被 rebalance 撤走的正常退出，而是"订阅没了/异常打穿"这类死法：
                     // 报到停摆，下一趟撤掉重建（std::thread 死了问不出 is_alive）。
+                    // 停机路上这一步无害：此刻已经没有下一趟 rebalance 了。
                     markPullLoopExited(key, token);
                 });
                 pullThreads_[key] = std::move(t);
@@ -902,6 +942,9 @@ void DefaultMQPushConsumer::rebalanceLoop() {
 }
 
 void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token) {
+    // 停机路上被起来过一趟（见 rebalancePullThreads 的"只撤不建"守卫）：直接收工，
+    // 别去碰 client()——shutdown 第一步就把 started_ 置了 false，那时它必抛。
+    if (!started_.load() || stop_.load()) return;
     MQClientInstance& c = client();
     const bool orderly = isOrderly();
     const std::string key = offsetKey(mq);
@@ -1814,7 +1857,12 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
                               ok ? "SUCCESS" : "SUSPEND_CURRENT_QUEUE_A_MOMENT");
         }
-        if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
+        if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT &&
+            checkOrderlyReconsumeTimes(restored)) {
+            // Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
+            // 只有「还在重试次数内 / 回投失败」才把这一批塞回队首原地重试；已经交给
+            // broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列
+            //（顺序消费的 head-of-line blocking 在真机上就是"这个组停在第 N 条不动"）。
             std::lock_guard<std::mutex> lk(lock_);
             auto it = pending_.find(key);
             if (it != pending_.end()) {
@@ -2449,6 +2497,22 @@ int32_t DefaultMQPushConsumer::maxReconsumeTimesOrDefault() const {
 // 由 broker 按 DELAY 档位重投。属性置法与 Java 逐条一致。
 void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg) {
     MQClientInstance& c = client();
+    Message newMsg = buildRetryMessage(msg, maxReconsumeTimesOrDefault());
+    std::shared_ptr<TopicPublishInfo> publish =
+        c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
+    MessageQueue selected = publish->selectOneMessageQueue();
+    // 走的是 MQClientInstance 的**内部生产者**，Java 在构造它时调过
+    // `resetClientConfig(clientConfig)`（MQClientInstance.java:218-219），
+    // 所以 unitMode 与本消费者一致 —— 这里必须带上，否则重投消息会丢单元标记。
+    c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0,
+                  unitMode_);
+}
+
+// Java DefaultMQPushConsumerImpl#sendMessageBackAsNormalMessage:1148-1160 与
+// ConsumeMessageOrderlyService#sendMessageBack:341-362 的两个 newMsg 构造体**逐行相同**
+// （只有 maxReconsumeTimes 各调各的 getter），所以抽成一个函数，避免两处属性置法漂移。
+Message DefaultMQPushConsumer::buildRetryMessage(const MessageExt& msg,
+                                                 int32_t maxReconsumeTimes) const {
     Message newMsg(MixAll::getRetryTopic(consumerGroup_), msg.body);
     newMsg.properties = msg.properties;
     newMsg.flag = msg.flag;
@@ -2461,7 +2525,7 @@ void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg
     newMsg.putProperty(MessageConst::PROPERTY_RECONSUME_TIME,
                        std::to_string(msg.reconsumeTimes + 1));
     newMsg.putProperty(MessageConst::PROPERTY_MAX_RECONSUME_TIMES,
-                       std::to_string(maxReconsumeTimesOrDefault()));
+                       std::to_string(maxReconsumeTimes));
     // 半消息重投时不能带上 TRAN_MSG，否则 broker 会把它再当回查消息处理
     newMsg.properties.erase(MessageConst::PROPERTY_TRANSACTION_PREPARED);
     newMsg.putProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL,
@@ -2470,15 +2534,62 @@ void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg
         newMsg.putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
                            InnerIdGenerator::createUniqId());
     }
+    return newMsg;
+}
 
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
-    MessageQueue selected = publish->selectOneMessageQueue();
-    // 走的是 MQClientInstance 的**内部生产者**，Java 在构造它时调过
-    // `resetClientConfig(clientConfig)`（MQClientInstance.java:218-219），
-    // 所以 unitMode 与本消费者一致 —— 这里必须带上，否则重投消息会丢单元标记。
-    c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0,
-                  unitMode_);
+int32_t DefaultMQPushConsumer::orderlyMaxReconsumeTimes() const {
+    // Java ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320。
+    // 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认
+    // 就该重试到成功为止 —— -1 在这里读成 Integer.MAX_VALUE。**不是**并发侧的 16
+    //（那边每轮回投都过一遍 broker，16 是 broker 的默认 retryMaxTimes）；把两套并成
+    // 一个常量，等于要么给顺序消费凭空造出死信，要么让并发消息无限重投。
+    return maxReconsumeTimes_ == -1 ? std::numeric_limits<int32_t>::max() : maxReconsumeTimes_;
+}
+
+bool DefaultMQPushConsumer::orderlySendMessageBack(const MessageExt& msg) {
+    // Java ConsumeMessageOrderlyService#sendMessageBack:341-362：整个函数包在
+    // try/catch(Exception) 里，只按返回值表成败。抛给消费线程等于这条既没 ack 也没
+    // 回投，只能等 broker 锁超时 —— 而顺序消费的锁超时是分钟级，看起来就像卡死。
+    try {
+        MQClientInstance& c = client();
+        Message newMsg = buildRetryMessage(msg, orderlyMaxReconsumeTimes());
+        std::shared_ptr<TopicPublishInfo> publish =
+            c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
+        if (!publish || publish->msgQueueList.empty()) {
+            logger_debug("orderly send back has no writable queue, topic=" + newMsg.topic);
+            return false;
+        }
+        const MessageQueue selected = publish->selectOneMessageQueue();
+        c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0,
+                      unitMode_);
+        return true;
+    } catch (const std::exception& e) {
+        logger_debug(std::string("orderly send message back failed, group=") + consumerGroup_ +
+                     ": " + e.what());
+        return false;
+    }
+}
+
+bool DefaultMQPushConsumer::checkOrderlyReconsumeTimes(std::vector<MessageExt>& msgs) {
+    // Java ConsumeMessageOrderlyService#checkReconsumeTimes:322-339。逐条两种走法：
+    //   - 次数没用尽：本地 reconsumeTimes + 1（broker 那边没记这次失败，客户端不补就
+    //     永远到不了阈值），继续挂起；
+    //   - 次数已用尽：交给 broker 回投。**回投成功就不挂起**（Java 这时 commit 位点，
+    //     毒消息让路、队列继续往前），回投失败才 +1 并挂起。
+    bool suspend = false;
+    const int32_t maxTimes = orderlyMaxReconsumeTimes();
+    for (MessageExt& msg : msgs) {
+        if (msg.reconsumeTimes >= maxTimes) {
+            if (!orderlySendMessageBack(msg)) {
+                suspend = true;
+                msg.setReconsumeTimes(msg.reconsumeTimes + 1);
+            }
+        } else {
+            suspend = true;
+            msg.setReconsumeTimes(msg.reconsumeTimes + 1);
+        }
+    }
+    return suspend;
 }
 
 bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel,

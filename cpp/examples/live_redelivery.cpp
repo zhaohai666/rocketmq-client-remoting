@@ -20,6 +20,11 @@
 //      %RETRY% 重投（reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口
 //      只投一次、3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）
 //      一条都不回投。
+//   S12 顺序消费毒消息：listener 一直 SUSPEND + maxReconsumeTimes=2 ⇒ 本地恰好投 3 次
+//      （reconsumeTimes 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，
+//      消息因 rebalance 锁未过期被 broker 立刻改投 %DLQ%<group>（reconsumeTimes=3、
+//      RETRY_TOPIC 保留业务 topic）。S12b：默认 -1 在顺序侧是不设上限（投过 >=18 次、
+//      %DLQ% 空），不是并发侧的 16。
 //   S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME=120s）：把仍归本实例的队列
 //      的 lastPull 时刻倒拨到阈值之外 ⇒ 这一趟 rebalance 必须撤掉它（持久化位点）并重建
 //      拉取线程，之后同一队列继续消费、307 运行信息里的 lastPullTimestamp 是真值、
@@ -102,6 +107,64 @@ bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return pred();
+}
+
+// %DLQ%<group> 的现场取证：先用一次性 probe 等 broker 将死信 topic 注册进路由，
+// 再用**独立消费组 + FIRST_OFFSET** 把已有的死信读出来（LAST 会从队尾开始，把已经
+// 落在死信里的那条直接跳过 ⇒ 假失败）。routeFound 单独返回：负向用例里「broker 压根
+// 没建死信 topic」本身就是正确结论，不能和「等不到路由」混成同一个空结果。
+struct DlqSight {
+    bool routeFound = false;
+    std::vector<MessageExt> msgs;
+};
+
+DlqSight readDlq(const std::string& nsAddr, const std::string& dlqTopic,
+                 const std::string& readerGroup, int64_t timeoutMs) {
+    DlqSight sight;
+    std::shared_ptr<TopicRouteData> route;
+    {
+        MQClientInstance probe("dlqprobe-" + std::to_string(nowMs()),
+                              std::vector<std::string>{nsAddr});
+        probe.start();
+        const int64_t deadline = nowMs() + timeoutMs;
+        while (nowMs() < deadline) {
+            route = probe.getTopicRouteData(dlqTopic);
+            if (route && !route->queueDatas.empty()) break;
+            route.reset();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        probe.shutdown();
+    }
+    if (!route || route->queueDatas.empty()) return sight;
+    sight.routeFound = true;
+    std::vector<MessageQueue> queues;
+    for (const QueueData& q : route->queueDatas) {
+        for (int32_t i = 0; i < q.readQueueNums; ++i) {
+            queues.emplace_back(dlqTopic, q.brokerName, i);
+        }
+    }
+    DefaultLitePullConsumer reader(readerGroup);
+    reader.setNamesrvAddr(nsAddr);
+    reader.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    reader.assign(queues);
+    reader.start();
+    for (const MessageQueue& mq : queues) reader.seekToBegin(mq);
+    const int64_t deadline = nowMs() + timeoutMs;
+    while (nowMs() < deadline) {
+        std::vector<MessageExt> batch = reader.poll(1000);
+        if (batch.empty()) continue;
+        sight.msgs.insert(sight.msgs.end(), batch.begin(), batch.end());
+        // 收到后再多轮询几趟：断言「死信里只有这一条」要求把后面的也排空，
+        // 但总窗口必须有界，否则正向用例每次都要白等满 timeoutMs。
+        const int64_t drainTo = nowMs() + 3000;
+        while (nowMs() < drainTo) {
+            std::vector<MessageExt> more = reader.poll(500);
+            sight.msgs.insert(sight.msgs.end(), more.begin(), more.end());
+        }
+        break;
+    }
+    reader.shutdown();
+    return sight;
 }
 
 // 收集盒：锁和缓冲区绑在一起，主线程读之前必须拿同一把锁。
@@ -681,42 +744,11 @@ int main(int argc, char* argv[]) {
         check("S9-重投期间 listener 看到业务 topic（不是 %RETRY%）", topicKept);
 
         const std::string dlqTopic = MixAll::getDlqTopic(group);
-        std::shared_ptr<TopicRouteData> dlqRoute;
-        MQClientInstance probe("dlqprobe-" + std::to_string(nowMs()),
-                               std::vector<std::string>{nsAddr});
-        probe.start();
-        for (int i = 0; i < 15; ++i) {
-            dlqRoute = probe.getTopicRouteData(dlqTopic);
-            if (dlqRoute && !dlqRoute->queueDatas.empty()) break;
-            dlqRoute.reset();
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        }
-        check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", dlqRoute != nullptr,
+        const DlqSight sight = readDlq(nsAddr, dlqTopic, gPrefix + "_g9dlq", 40000);
+        check("S9-broker 自动创建并注册了 %DLQ%<group> 路由", sight.routeFound,
               "dlq=" + dlqTopic);
-        probe.shutdown();
 
-        std::vector<MessageExt> dlqMsgs;
-        if (dlqRoute) {
-            std::vector<MessageQueue> queues;
-            for (const QueueData& q : dlqRoute->queueDatas) {
-                for (int32_t i = 0; i < q.readQueueNums; ++i) {
-                    queues.emplace_back(dlqTopic, q.brokerName, i);
-                }
-            }
-            DefaultLitePullConsumer reader(gPrefix + "_g9dlq");
-            reader.setNamesrvAddr(nsAddr);
-            // 新消费组 + LAST 会从队尾开始，把已经在死信里的那条跳过 ⇒ 假失败
-            reader.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-            reader.assign(queues);
-            reader.start();
-            for (const MessageQueue& mq : queues) reader.seekToBegin(mq);
-            int64_t deadline = nowMs() + 25000;
-            while (nowMs() < deadline && dlqMsgs.empty()) {
-                std::vector<MessageExt> batch = reader.poll(1000);
-                dlqMsgs.insert(dlqMsgs.end(), batch.begin(), batch.end());
-            }
-            reader.shutdown();
-        }
+        std::vector<MessageExt> dlqMsgs = sight.msgs;
         const bool one = dlqMsgs.size() == 1 && bodyOf(dlqMsgs[0]) == "dlq-me";
         check("S9-消息落在 %DLQ%<group>", one,
               "n=" + std::to_string(dlqMsgs.size()));
@@ -1006,6 +1038,207 @@ int main(int argc, char* argv[]) {
                       + " redelivered=" + std::to_string(redelivered));
         }
         c->shutdown();
+    }
+
+    // ---------------- S12 顺序消费毒消息：本地计数 → 交 broker → %DLQ% ----------------
+    // Java ConsumeMessageOrderlyService#processConsumeResult:236-307 的 SUSPEND 分支先过
+    // checkReconsumeTimes(:322-339)：次数没用尽就本地 reconsumeTimes+1 并原地挂起（broker
+    // 那边压根没记这次失败）；用尽了才 sendMessageBack(:341-362) 把整条投给 %RETRY%<group>，
+    // **投成功就不挂起**、commit 位点让路（所以下一条 ord-after 必须被消费）。
+    // 而「投给 %RETRY% 之后进不进 %DLQ%」全在 broker：SendMessageProcessor#handleRetryAndDLQ
+    // :185-234 读 V2 请求头 j/l（AbstractSendMessageProcessor:427 把 j 直接写进存储消息的
+    // reconsumeTimes），并且只有本组的 rebalance 锁还没过期（:202-207，即这个实例真的持有
+    // LOCK_BATCH_MQ）才「立刻进死信」。三种写错在客户端本地都表现为「看起来正常」：
+    // 少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；把 -1 读成并发侧的 16 ⇒ 顺序消费凭空
+    // 多出死信；回投成功后仍挂起 ⇒ 队列永久卡死，跟消费者进程死掉一模一样。
+    // 离线单测（tests/test_orderly_reconsume.cpp）只能锁「回投失败」那一半——未 start() 的
+    // 内部生产者必败；「回投成功 ⇒ 位点前进、%DLQ% 出现、锁真的握着」只有真 broker 说得了。
+    {
+        const std::string topic = gPrefix + "_OrdDlq";
+        const std::string group = gPrefix + "_g12";
+        const int32_t kMaxReconsume = 2;
+        prepareTopic(producer, topic, 1);  // 1 队列：ord-after 必须排在毒消息后面
+
+        struct OrdSink {
+            std::mutex mtx;
+            std::vector<std::pair<int32_t, std::string>> poison;  // (reconsumeTimes, topic)
+            size_t after = 0;
+
+            size_t poisonCount() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return poison.size();
+            }
+            size_t afterCount() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return after;
+            }
+            std::vector<std::pair<int32_t, std::string>> snapshot() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return poison;
+            }
+        };
+        class OL : public MessageListenerOrderly {
+        public:
+            explicit OL(OrdSink& s) : sink_(s) {}
+            ConsumeOrderlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                ConsumeOrderlyContext&) override {
+                bool mine = false;
+                {
+                    std::lock_guard<std::mutex> lk(sink_.mtx);
+                    for (const MessageExt& m : msgs) {
+                        const std::string b = bodyOf(m);
+                        if (b == "ord-poison") {
+                            sink_.poison.push_back({m.getReconsumeTimes(), m.topic});
+                            mine = true;
+                        } else if (b == "ord-after") {
+                            ++sink_.after;
+                        }
+                    }
+                }
+                return mine ? ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT
+                            : ConsumeOrderlyStatus::SUCCESS;
+            }
+
+        private:
+            OrdSink& sink_;
+        };
+
+        OrdSink sink;
+        auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+        consumer->setNamesrvAddr(nsAddr);
+        consumer->setConsumeMessageBatchMaxSize(1);
+        consumer->setSuspendCurrentQueueTimeMillis(500);
+        consumer->setMaxReconsumeTimes(kMaxReconsume);
+        consumer->setMessageListener(std::make_shared<OL>(sink));
+        consumer->subscribe(topic);
+        consumer->start();
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        producer.send(Message(topic, str2bytes("ord-poison")));
+        producer.send(Message(topic, str2bytes("ord-after")));
+
+        const bool threeTimes = waitUntil([&] { return sink.poisonCount() >= 3; }, 60000);
+        const std::vector<std::pair<int32_t, std::string>> firstThree = sink.snapshot();
+        std::string ladder;
+        for (const auto& p : firstThree) {
+            ladder += (ladder.empty() ? "" : ",") + std::to_string(p.first);
+        }
+        const bool counted = firstThree.size() >= 3 && firstThree[0].first == 0
+            && firstThree[1].first == 1 && firstThree[2].first == 2;
+        check("S12-毒消息恰好投 3 次（本地每次 +1：reconsumeTimes 0/1/2）",
+              threeTimes && counted, "times=[" + ladder + "]");
+        // 交棒判据：回投成功后 Java commit 位点，队列必须往前走。少了这一步就是
+        // 「毒消息把整个队列钉住」，与消费者死掉无法区分；多了（回投还没成功就前进）
+        // 则是静默丢消息。
+        const bool handedOver = waitUntil([&] { return sink.afterCount() >= 1; }, 60000);
+        check("S12-交给 broker 后业务队列继续前进（后一条被消费）", handedOver,
+              "after=" + std::to_string(sink.afterCount()));
+        std::this_thread::sleep_for(std::chrono::seconds(15));  // 反证：不该有第 4 次
+        check("S12-用尽后不再原地挂起（观察窗口内毒消息只投了 3 次）",
+              sink.poisonCount() == 3, "arrivals=" + std::to_string(sink.poisonCount()));
+        bool topicKept = true;
+        for (const auto& p : firstThree) {
+            if (p.second != topic) topicKept = false;
+        }
+        check("S12-挂起期间 listener 始终看到业务 topic（本地重投不换 topic）", topicKept);
+        consumer->shutdown();
+
+        const std::string dlqTopic = MixAll::getDlqTopic(group);
+        const DlqSight sight = readDlq(nsAddr, dlqTopic, gPrefix + "_g12dlq", 40000);
+        check("S12-broker 自动创建并注册了 %DLQ%<group> 路由", sight.routeFound,
+              "dlq=" + dlqTopic);
+        const bool one = sight.msgs.size() == 1 && bodyOf(sight.msgs.front()) == "ord-poison";
+        check("S12-毒消息落在 %DLQ%<group>（顺序消费的回投走 rebalance 锁，立刻进死信）", one,
+              "n=" + std::to_string(sight.msgs.size()));
+        if (one) {
+            const MessageExt& d = sight.msgs.front();
+            // 3 = 客户端在 RECONSUME_TIME 上写的 +1，经 V2 头 j 落成存储值（不是本地 2，
+            // 也不是并发路径的档位）；j 漏填的话 broker 会按 retryMaxTimes=16 判，永远不进死信。
+            check("S12-死信 reconsumeTimes = maxReconsumeTimes + 1",
+                  d.getReconsumeTimes() == kMaxReconsume + 1,
+                  "reconsumeTimes=" + std::to_string(d.getReconsumeTimes()));
+            auto retryIt = d.properties.find("RETRY_TOPIC");
+            check("S12-死信保留 RETRY_TOPIC=业务 topic，topic 已是 %DLQ%<group>",
+                  retryIt != d.properties.end() && retryIt->second == topic
+                      && d.topic == dlqTopic,
+                  "retryTopic="
+                      + (retryIt == d.properties.end() ? std::string("<missing>") : retryIt->second));
+        }
+    }
+
+    // ---------------- S12b 顺序消费默认 -1 = 不设上限（不是并发侧的 16）----------------
+    // 两处 getMaxReconsumeTimes 是**故意不同**的：Java ConsumeMessageOrderlyService:313-320
+    // 把 -1 读成 Integer.MAX_VALUE（顺序消费一直在本地原地重试，broker 侧没有计数，默认
+    // 就该重试到成功为止）；DefaultMQPushConsumerImpl:890 把 -1 读成 16（那边每轮都过一遍
+    // broker，16 是 broker 默认的 retryMaxTimes）。合成一个常量的两种坏法都得分别挡住：
+    // 顺序侧读成 16 ⇒ 第 17 次投给 broker，锁还没过期就直接造出一条死信；
+    // 并发侧读成 MAX ⇒ 毒消息永远不进 %DLQ%（S9 那条用 2 覆盖了阈值生效，这条覆盖
+    // 「默认值绝不生效」）。
+    {
+        const std::string topic = gPrefix + "_OrdNoCap";
+        const std::string group = gPrefix + "_g12b";
+        prepareTopic(producer, topic, 1);
+
+        struct CountSink {
+            std::mutex mtx;
+            std::vector<int32_t> times;
+            size_t count() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return times.size();
+            }
+            std::vector<int32_t> snapshot() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return times;
+            }
+        };
+        class OL : public MessageListenerOrderly {
+        public:
+            explicit OL(CountSink& s) : sink_(s) {}
+            ConsumeOrderlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                ConsumeOrderlyContext&) override {
+                {
+                    std::lock_guard<std::mutex> lk(sink_.mtx);
+                    for (const MessageExt& m : msgs) {
+                        sink_.times.push_back(m.getReconsumeTimes());
+                    }
+                }
+                return ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
+            }
+
+        private:
+            CountSink& sink_;
+        };
+
+        CountSink sink;
+        auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+        consumer->setNamesrvAddr(nsAddr);
+        consumer->setConsumeMessageBatchMaxSize(1);
+        consumer->setSuspendCurrentQueueTimeMillis(200);
+        // 显式不设上限（默认就是 -1，写出来是为了让「默认」这一条断言有出处）
+        consumer->setMaxReconsumeTimes(-1);
+        consumer->setMessageListener(std::make_shared<OL>(sink));
+        consumer->subscribe(topic);
+        consumer->start();
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        producer.send(Message(topic, str2bytes("ord-forever")));
+
+        // 只要越过并发侧的 16 就能证明没用错常量；窗口给到 90s 是因为第 17 次回投的
+        // 延迟档位是 level20（2h），一旦走错就再也投不回来了 —— 只能靠「本地投了多少次
+        // + %DLQ% 空」两头夹住。
+        const bool uncapped = waitUntil([&] { return sink.count() >= 18; }, 90000);
+        const std::vector<int32_t> times = sink.snapshot();
+        int32_t maxTimes = -1;
+        for (int32_t t : times) maxTimes = std::max(maxTimes, t);
+        check("S12b-maxReconsumeTimes=-1 时顺序消费不设上限（投过 >=18 次，16 不生效）",
+              uncapped && maxTimes >= 17,
+              "arrivals=" + std::to_string(times.size()) + " maxTimes=" + std::to_string(maxTimes));
+        consumer->shutdown();
+
+        const std::string dlqTopic = MixAll::getDlqTopic(group);
+        const DlqSight sight = readDlq(nsAddr, dlqTopic, gPrefix + "_g12bdlq", 20000);
+        check("S12b-没到阈值就不该有死信（broker 侧连 %DLQ% topic 都没建出来）",
+              sight.msgs.empty(),
+              "routeFound=" + std::string(sight.routeFound ? "true" : "false")
+                  + " n=" + std::to_string(sight.msgs.size()));
     }
 
     producer.shutdown();

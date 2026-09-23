@@ -63,8 +63,9 @@ use crate::common::compression::decompress_body;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_client_id_setter::{get_uniq_id, set_uniq_id};
 use crate::common::message_const::{
-    KEY_SEPARATOR, PROPERTY_CORRELATION_ID, PROPERTY_FIRST_POP_TIME, PROPERTY_MSG_REGION,
-    PROPERTY_POP_CK, PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, PROPERTY_TRACE_SWITCH,
+    KEY_SEPARATOR, PROPERTY_CORRELATION_ID, PROPERTY_FIRST_POP_TIME, PROPERTY_MAX_RECONSUME_TIMES,
+    PROPERTY_MSG_REGION, PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME,
+    PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, PROPERTY_TRACE_SWITCH,
 };
 use crate::common::message_decoder::{
     decode_message, decode_messages, message_properties_2_string, string_2_message_properties,
@@ -1650,6 +1651,30 @@ impl MQClientInstance {
             set_uniq_id(msg.as_message_mut());
         }
         let outer = msg.as_message();
+        // Java `sendKernelImpl:1004-1018`：发往 `%RETRY%` 时把这两个属性「抬进」请求头。
+        // broker 判死信（`SendMessageProcessor#handleRetryAndDLQ:197-210`）读的是
+        // `requestHeader.reconsumeTimes` / `maxReconsumeTimes`，**不是**报文里的属性；不抬
+        // 的话它退回订阅组默认的 retryMaxTimes(16)，客户端配的阈值形同虚设 —— 这条静默
+        // 差别只有在真机上数死信条数才看得出来。
+        // ⚠ 线上属性里 `RECONSUME_TIME` **仍然保留**（下面的 `properties` 先算好，Java 也是
+        //    先 setProperties 再 clearProperty）：消费端要靠它还原重试次数。
+        // 有意偏离 Java：Java 抬完 clearProperty 改本地对象；本端口不回写 —— 两个调用方
+        //（并发/顺序回投）发出去的都是一次性 newMsg，本地清不清都无人再读。
+        let (reconsume_times, max_reconsume_times) = if MixAll::is_retry_topic(Some(&outer.topic)) {
+            (
+                outer
+                    .properties
+                    .get(PROPERTY_RECONSUME_TIME)
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0),
+                outer
+                    .properties
+                    .get(PROPERTY_MAX_RECONSUME_TIMES)
+                    .and_then(|v| v.parse::<i32>().ok()),
+            )
+        } else {
+            (0, None)
+        };
         let header = SendMessageRequestHeaderV2 {
             producer_group: Some(producer_group.to_string()),
             topic: Some(outer.topic.clone()),
@@ -1668,7 +1693,7 @@ impl MQClientInstance {
             born_timestamp: Some(current_time_millis()),
             flag: Some(outer.flag),
             properties: Some(message_properties_2_string(&outer.properties)),
-            reconsume_times: Some(0),
+            reconsume_times: Some(reconsume_times),
             // Java `sendKernelImpl:1004` `requestHeader.setUnitMode(tc.isUnitMode())`。
             // V2 头把它映射成单字母键 `k`（`SendMessageRequestHeaderV2`）。
             unit_mode: Some(unit_mode),
@@ -1676,7 +1701,7 @@ impl MQClientInstance {
             // MAX_RECONSUME_TIMES 属性」时才设这个字段，平时留 null。这里必须留
             // `None`：broker 在 `version >= V3_4_9` 后无条件采纳请求里的值
             // （`SendMessageProcessor:196-199`），固定发 0 会让重试消息直接进 `%DLQ%`。
-            max_reconsume_times: None,
+            max_reconsume_times,
             batch: Some(msg.is_batch()),
             // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)` —— V2 的
             // 键是单字母 `n`（`SendMessageRequestHeaderV2:69`，`encode()` 用 writeIfNotNull）。

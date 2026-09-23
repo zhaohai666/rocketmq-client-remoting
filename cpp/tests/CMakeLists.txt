@@ -84,6 +84,12 @@ add_executable(rmq_test_consume_ack_index test_consume_ack_index.cpp)
 target_link_libraries(rmq_test_consume_ack_index PRIVATE rocketmq::remoting)
 add_test(NAME consume_ack_index COMMAND rmq_test_consume_ack_index)
 
+# 顺序消费的重投闸门（Java ConsumeMessageOrderlyService:236-362）：-1 的两套含义、
+# 本地 +1、用尽后回投那条消息的字段、回投失败仍挂起，以及 %RETRY% 属性抬进发送头
+add_executable(rmq_test_orderly_reconsume test_orderly_reconsume.cpp)
+target_link_libraries(rmq_test_orderly_reconsume PRIVATE rocketmq::remoting)
+add_test(NAME orderly_reconsume COMMAND rmq_test_orderly_reconsume)
+
 # 消息轨迹：Java 逐字节对拍向量 + javaSplit 语义 + 无 keys SubBefore / 坏记录隔离回归
 add_executable(rmq_test_trace test_trace.cpp)
 target_link_libraries(rmq_test_trace PRIVATE rocketmq::remoting)

@@ -60,7 +60,7 @@ use crate::client::hook::{
     ConsumeMessageHook, ConsumeMessageHookList, FilterMessageContext, FilterMessageHookList,
 };
 use crate::client::mq_client::{
-    ConsumerFuture, MQClientInstance, MQClientInstanceConfig, RegisteredConsumer,
+    ConsumerFuture, MQClientInstance, MQClientInstanceConfig, PublishMessage, RegisteredConsumer,
 };
 use crate::client::producer::{SinkAdapter, TraceDispatcherChannel};
 use crate::client::result::{
@@ -72,9 +72,11 @@ use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::AccessChannel;
 use crate::client::trace_hook::{ConsumeMessageTraceHook, TraceReportSink};
 use crate::client::validators;
-use crate::common::message::{MessageExt, MessageQueue};
+use crate::common::message::{Message, MessageExt, MessageQueue};
 use crate::common::message_const::{
-    PROPERTY_MAX_OFFSET, PROPERTY_POP_CK, PROPERTY_RETRY_TOPIC,
+    PROPERTY_MAX_OFFSET, PROPERTY_MAX_RECONSUME_TIMES, PROPERTY_ORIGIN_MESSAGE_ID,
+    PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME, PROPERTY_RETRY_TOPIC,
+    PROPERTY_TRANSACTION_PREPARED,
 };
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::{ConsumeInitMode, PullSysFlag};
@@ -3105,17 +3107,24 @@ async fn consume_batch(
             status,
             Some(ConsumeOrderlyStatus::SuspendCurrentQueueAMoment)
         ) {
-            {
-                let mut state = lock(&inner.state);
-                if let Some(dq) = state.pending.get_mut(key) {
-                    for m in batch.iter().rev() {
-                        dq.push_front(m.clone());
+            // Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
+            // 只有「还在重试次数内 / 回投失败」才把这一批塞回队首原地重试；已经交给
+            // broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列
+            //（顺序消费的 head-of-line blocking 在真机上就是「这个组停在第 N 条不动」）。
+            if check_orderly_reconsume_times(inner, &mut batch).await {
+                {
+                    let mut state = lock(&inner.state);
+                    if let Some(dq) = state.pending.get_mut(key) {
+                        for m in batch.iter().rev() {
+                            dq.push_front(m.clone());
+                        }
                     }
                 }
+                let suspend = cfg.suspend_current_queue_millis();
+                tokio::time::sleep(Duration::from_millis(suspend)).await;
+                return Ok(false);
             }
-            let suspend = cfg.suspend_current_queue_millis();
-            tokio::time::sleep(Duration::from_millis(suspend)).await;
-            return Ok(false);
+            // 回投成功：毒消息已经交给 broker，往下走和 SUCCESS 一样前进位点
         }
         advance_consume_offset(inner, key, &batch, None);
         return Ok(true);
@@ -3306,6 +3315,127 @@ fn send_message_back(
         }
     });
     Ok(())
+}
+
+/// Java `ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320`。
+///
+/// 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认就该
+/// 重试到成功为止 —— `-1` 在这里读成 `i32::MAX`。**不是**并发回投那条链路的 16
+///（[`send_message_back`]，那边每轮都过一遍 broker，16 是 broker 默认的 retryMaxTimes）：
+/// 把两套并成一个常量，等于要么给顺序消费凭空造出死信，要么让并发消息无限重投。
+fn orderly_max_reconsume_times(cfg: &ConsumerConfig) -> i32 {
+    if cfg.max_reconsume_times == -1 {
+        i32::MAX
+    } else {
+        cfg.max_reconsume_times
+    }
+}
+
+/// Java `ConsumeMessageOrderlyService#checkReconsumeTimes:322-339`。
+///
+/// 返回「这一批是否还要原地挂起重试」。逐条两种走法：
+///   - 次数没用尽：本地 `reconsume_times + 1`（broker 没记这次失败，客户端不补就永远
+///     到不了阈值），继续挂起；
+///   - 次数已用尽：交给 broker 回投。**回投成功就不再挂起**（Java 这时 commit 位点，
+///     毒消息让路、队列继续往前），只有回投失败才 +1 并挂起。
+async fn check_orderly_reconsume_times(inner: &Arc<Inner>, batch: &mut [MessageExt]) -> bool {
+    let cfg = read_cfg(inner);
+    let max_times = orderly_max_reconsume_times(&cfg);
+    let mut suspend = false;
+    for msg in batch {
+        if msg.reconsume_times >= max_times {
+            if !orderly_send_message_back(inner, msg, &cfg, max_times).await {
+                suspend = true;
+                msg.reconsume_times += 1;
+            }
+        } else {
+            suspend = true;
+            msg.reconsume_times += 1;
+        }
+    }
+    suspend
+}
+
+/// Java `ConsumeMessageOrderlyService#sendMessageBack:341-362`。
+///
+/// 拿实例自带的内部生产者，把这条消息**当普通消息**发到 `%RETRY%<group>`：broker 的
+/// `handleRetryAndDLQ`（`SendMessageProcessor:199-234`）见该组还持有未过期的队列锁
+///（正是顺序消费组的特征），直接把它改投 `%DLQ%<group>`。`RECONSUME_TIME` /
+/// `MAX_RECONSUME_TIMES` 会被发送侧抬进请求头（`MQClientInstance::build_send_request`，
+/// Java `sendKernelImpl:1004-1018`）。
+///
+/// 失败只返回 false、绝不抛：见 [`check_orderly_reconsume_times`]。
+async fn orderly_send_message_back(
+    inner: &Arc<Inner>,
+    msg: &MessageExt,
+    cfg: &ConsumerConfig,
+    max_times: i32,
+) -> bool {
+    let outcome: Result<()> = async {
+        let client = require_client(inner)?;
+        let mut new_msg = build_retry_message(cfg, msg, max_times);
+        let publish = client
+            .get_topic_publish_info(&new_msg.topic, true)
+            .await?;
+        let mq = publish
+            .select_one_message_queue(&[])?
+            .ok_or_else(|| Error::client(format!("no writable queue for {}", new_msg.topic)))?;
+        // unitMode 跟着消费者：Java 构造内部生产者时调过 resetClientConfig(clientConfig)，
+        // 不带的话重投出去的消息会丢单元标记。
+        client
+            .send_message(
+                MixAll::CLIENT_INNER_PRODUCER_GROUP,
+                &mut PublishMessage::Single(&mut new_msg),
+                &mq,
+                3000,
+                0,
+                cfg.unit_mode,
+                MixAll::DEFAULT_TOPIC,
+                MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+            )
+            .await?;
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => true,
+        Err(e) => {
+            rmq_debug!(
+                "orderly send message back failed, group={}: {e}",
+                read_cfg(inner).consumer_group
+            );
+            false
+        }
+    }
+}
+
+/// Java 两处 `sendMessageBack` 里那段 newMsg 构造体（并发侧
+/// `DefaultMQPushConsumerImpl#sendMessageBackAsNormalMessage:1148-1160` 与顺序侧
+/// `ConsumeMessageOrderlyService#sendMessageBack:344-353`）**逐行相同**，只有
+/// maxReconsumeTimes 各调各的 getter，所以抽成一个函数、把口径显式传进来。
+fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -> Message {
+    let mut new_msg = Message::new(
+        MixAll::get_retry_topic(&cfg.consumer_group).as_str(),
+        msg.body.as_deref(),
+    );
+    new_msg.properties = msg.properties.clone();
+    new_msg.flag = msg.flag;
+    let origin_msg_id = msg
+        .get_property(PROPERTY_ORIGIN_MESSAGE_ID)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .or_else(|| msg.msg_id.clone())
+        .unwrap_or_default();
+    if !origin_msg_id.is_empty() {
+        new_msg.put_property(PROPERTY_ORIGIN_MESSAGE_ID, &origin_msg_id);
+    }
+    new_msg.put_property(PROPERTY_RETRY_TOPIC, &msg.topic);
+    new_msg.put_property(PROPERTY_RECONSUME_TIME, &(msg.reconsume_times + 1).to_string());
+    new_msg.put_property(PROPERTY_MAX_RECONSUME_TIMES, &max_times.to_string());
+    // 半消息标记必须清掉，否则 broker 会把它再当事务回查消息处理
+    new_msg.properties.remove(PROPERTY_TRANSACTION_PREPARED);
+    new_msg.set_delay_time_level(3 + msg.reconsume_times);
+    new_msg
 }
 
 // ================================================================ broker 主动请求
@@ -3719,6 +3849,7 @@ impl ConsumerConfig {
 mod tests {
     use super::*;
     use crate::common::message::Message;
+    use crate::common::message_const::PROPERTY_KEYS;
     use crate::remoting::protocol::heartbeat::ExpressionType;
 
     fn ext(topic: &str, tags: Option<&str>) -> MessageExt {
@@ -4475,6 +4606,211 @@ mod tests {
         let h = AckHarness::new(true, None, ConsumeConcurrentlyStatus::ReconsumeLater);
         assert!(h.run(2).await);
         assert_eq!(h.offset(), 2);
+        assert_eq!(h.pending(), vec![]);
+    }
+
+    // ---------------- 顺序消费的 checkReconsumeTimes ----------------
+
+    /// Java `ConsumeMessageOrderlyService#processConsumeResult:254-266` +
+    /// `#checkReconsumeTimes:322-339` + `#getMaxReconsumeTimes:313-320`。
+    ///
+    /// 三处坏掉都是**静默**的：少 +1 永远到不了阈值（毒消息原地转到天荒地老）；`-1` 读成
+    /// 16 会给顺序消费凭空造死信；回投成功后还挂起，则一条毒消息永久占住那条队列 ——
+    /// 真机上看起来跟「消费者挂了」一模一样。所以判据全部离线锁死，只有「回投成功 →
+    /// 位点前进」那一支（未 `start()` 时必然走不到）交给真机 `examples/live_consumer.rs`。
+    struct OrderlyListener {
+        status: ConsumeOrderlyStatus,
+    }
+
+    impl MessageListenerOrderly for OrderlyListener {
+        fn consume_message(
+            &self,
+            _msgs: &[MessageExt],
+            _context: &mut ConsumeOrderlyContext,
+        ) -> ConsumeOrderlyStatus {
+            self.status
+        }
+    }
+
+    struct OrderlyHarness {
+        c: DefaultMQPushConsumer,
+        key: String,
+        mq: MessageQueue,
+    }
+
+    impl OrderlyHarness {
+        fn new(max_reconsume_times: i32, status: ConsumeOrderlyStatus) -> OrderlyHarness {
+            let cfg = ConsumerConfig {
+                consumer_group: "G".to_string(),
+                max_reconsume_times,
+                // 单测不干等默认的 1s
+                suspend_current_queue_time_millis: 0,
+                ..Default::default()
+            };
+            let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
+            c.set_message_listener_orderly(Arc::new(OrderlyListener { status }));
+            let mq = queue("T", "broker-a", 0);
+            let key = mq_key(&mq);
+            lock(&c.inner.state).pending.insert(key.clone(), VecDeque::new());
+            OrderlyHarness { c, key, mq }
+        }
+
+        async fn run(&self, batch: Vec<MessageExt>) -> bool {
+            consume_batch(&self.c.inner, &self.key, &self.mq, batch)
+                .await
+                .expect("consume_batch must not error")
+        }
+
+        fn offset(&self) -> i64 {
+            lock(&self.c.inner.state)
+                .consume_offsets
+                .get(&self.key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn pending(&self) -> Vec<(i64, i32)> {
+            lock(&self.c.inner.state)
+                .pending
+                .get(&self.key)
+                .map(|dq| dq.iter().map(|m| (m.queue_offset, m.reconsume_times)).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    /// queueOffset = `start`..`start+n`，每条自带 reconsumeTimes。
+    fn orderly_batch(start: i64, reconsume_times: &[i32]) -> Vec<MessageExt> {
+        reconsume_times
+            .iter()
+            .enumerate()
+            .map(|(i, rt)| {
+                let i = i64::try_from(i).expect("批次长度不会超过 i64");
+                let mut m = ext("T", None);
+                m.broker_name = Some("broker-a".to_string());
+                m.queue_offset = start + i;
+                m.reconsume_times = *rt;
+                m.msg_id = Some(format!("mid-{}", start + i));
+                m
+            })
+            .collect()
+    }
+
+    fn cfg_with(max_reconsume_times: i32) -> ConsumerConfig {
+        ConsumerConfig {
+            consumer_group: "G".to_string(),
+            max_reconsume_times,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn orderly_minus_one_means_unlimited_not_the_concurrent_sixteen() {
+        // 顺序侧 -1 → i32::MAX（Java:313-320）；并发侧同样写 -1 却是 16
+        //（`send_message_back` 里那份，Java DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890）。
+        // 并成一个常量 = 要么给顺序消费造死信，要么让并发消息无限重投。
+        assert_eq!(orderly_max_reconsume_times(&cfg_with(-1)), i32::MAX);
+        assert_eq!(orderly_max_reconsume_times(&cfg_with(3)), 3);
+    }
+
+    #[tokio::test]
+    async fn default_cap_never_judges_the_poison_message_exhausted() {
+        // 默认配置（-1）下即便 reconsumeTimes 已到 i32::MAX-1，也只是本地 +1 继续挂起
+        // 重试，不回投（更不会被 broker 投进 %DLQ%）。
+        let h = OrderlyHarness::new(-1, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        let inner = h.c.inner.clone();
+        let mut batch = orderly_batch(0, &[i32::MAX - 1]);
+        assert!(check_orderly_reconsume_times(&inner, &mut batch).await);
+        assert_eq!(batch[0].reconsume_times, i32::MAX);
+    }
+
+    #[tokio::test]
+    async fn below_cap_counts_locally_and_suspends() {
+        // 没用尽时压根不回投（未 start 也回投不了，所以这条判据必须自己走判据函数）
+        let h = OrderlyHarness::new(3, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        let inner = h.c.inner.clone();
+        let mut batch = orderly_batch(0, &[0, 2]);
+        assert!(check_orderly_reconsume_times(&inner, &mut batch).await);
+        assert_eq!(
+            batch.iter().map(|m| m.reconsume_times).collect::<Vec<_>>(),
+            vec![1, 3],
+            "broker 侧没记这次失败，客户端不就地 +1 就永远到不了阈值"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_cap_with_failed_send_back_still_suspends() {
+        // 未 start → require_client 失败 → 回投必败。Java :328-331 这时 suspend=true
+        // 并且再 +1，下一轮再来；写成「失败也前进位点」就等于把毒消息丢掉。
+        let h = OrderlyHarness::new(2, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        let inner = h.c.inner.clone();
+        let mut batch = orderly_batch(7, &[2]);
+        assert!(check_orderly_reconsume_times(&inner, &mut batch).await);
+        assert_eq!(batch[0].reconsume_times, 3);
+    }
+
+    #[tokio::test]
+    async fn empty_batch_does_not_suspend() {
+        let h = OrderlyHarness::new(0, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        let inner = h.c.inner.clone();
+        let mut empty: Vec<MessageExt> = Vec::new();
+        assert!(!check_orderly_reconsume_times(&inner, &mut empty).await);
+    }
+
+    #[test]
+    fn retry_message_carries_exactly_javas_fields() {
+        let cfg = cfg_with(2);
+        let poison = {
+            let mut m = orderly_batch(7, &[2]).remove(0);
+            m.put_property(PROPERTY_TRANSACTION_PREPARED, "true");
+            m.put_property(PROPERTY_KEYS, "k7");
+            m
+        };
+        let new_msg = build_retry_message(&cfg, &poison, orderly_max_reconsume_times(&cfg));
+        assert_eq!(new_msg.topic, "%RETRY%G", "顺序回投走 %RETRY%<group>");
+        assert_eq!(new_msg.body, poison.body);
+        assert_eq!(new_msg.get_property(PROPERTY_KEYS), Some("k7"));
+        assert_eq!(new_msg.get_property(PROPERTY_RETRY_TOPIC), Some("T"));
+        assert_eq!(new_msg.get_property(PROPERTY_RECONSUME_TIME), Some("3"));
+        assert_eq!(new_msg.get_property(PROPERTY_MAX_RECONSUME_TIMES), Some("2"));
+        assert_eq!(new_msg.get_property("DELAY"), Some("5"), "delayLevel = 3 + 2");
+        assert_eq!(
+            new_msg.get_property(PROPERTY_ORIGIN_MESSAGE_ID),
+            Some("mid-7"),
+            "轨迹要靠 ORIGIN_MESSAGE_ID 把重投串回原消息"
+        );
+        assert_eq!(
+            new_msg.get_property(PROPERTY_TRANSACTION_PREPARED),
+            None,
+            "半消息标记必须清掉，否则 broker 会把它当回查消息"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_requeues_batch_while_below_cap() {
+        let h = OrderlyHarness::new(3, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        // 队尾还有下一条（offset 2），本批要按原顺序插到它前面
+        let mut tail: VecDeque<MessageExt> = orderly_batch(2, &[0]).into_iter().collect();
+        lock(&h.c.inner.state)
+            .pending
+            .get_mut(&h.key)
+            .expect("pending")
+            .append(&mut tail);
+        assert!(!h.run(orderly_batch(0, &[0, 1])).await);
+        assert_eq!(h.offset(), 0, "还在原地重试，位点不能越过它");
+        assert_eq!(
+            h.pending(),
+            vec![(0, 1), (1, 2), (2, 0)],
+            "整批按原顺序塞回队首（顺序消费不许乱序）"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_path_skips_the_reconsume_gate() {
+        // 阈值 0：一旦走到判据就会尝试回投（离线必败 → 挂起），所以「位点前进」
+        // 本身就证明了 SUCCESS 没碰判据。
+        let h = OrderlyHarness::new(0, ConsumeOrderlyStatus::Success);
+        assert!(h.run(orderly_batch(0, &[0])).await);
+        assert_eq!(h.offset(), 1);
         assert_eq!(h.pending(), vec![]);
     }
 

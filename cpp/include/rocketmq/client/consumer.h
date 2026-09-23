@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -379,6 +380,18 @@ public:
     std::vector<MessageExt> pendingMessages(const std::string& key) const;
     // 读回某队列的已消费位点；nullopt = 还没有记录
     std::optional<int64_t> consumeOffset(const std::string& key) const;
+    // 顺序消费重试闸门的两个部件，同样「错了很安静」，所以与 consumeBatch 一起开放给单测：
+    // 少 +1 就永远到不了阈值（毒消息原地转到天荒地老），-1 读成 16 会给顺序消费凭空造死信。
+    // 返回「这一批是否还要原地挂起重试」；true=挂起，false=已交给 broker，位点可以前进。
+    bool checkOrderlyReconsumeTimes(std::vector<MessageExt>& msgs);
+    int32_t orderlyMaxReconsumeTimes() const;
+    // 并发侧的 -1 口径（Java DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890 的 16）。
+    // 与上面那个必须**并排**可见：两处 Java 各自调各自的 getMaxReconsumeTimes，
+    // 合成一个常量就等于要么给顺序消费造死信、要么让并发消息无限重投。
+    int32_t maxReconsumeTimesOrDefault() const;
+    // 按消息现带的重试次数拼那条发往 %RETRY%group 的普通消息。两条回投链路共用，只有
+    // maxReconsumeTimes 的口径不同（Java 两处各调各的 getMaxReconsumeTimes），所以显式传。
+    Message buildRetryMessage(const MessageExt& msg, int32_t maxReconsumeTimes) const;
     // 登记「本实例已分配到这条队列」（Java ProcessQueueTable / Python `_mq_map`）。
     // topic 级流控阈值要靠它把同 topic 的兄弟队列聚起来。
     void setAssignedQueue(const std::string& key, const MessageQueue& mq);
@@ -411,6 +424,9 @@ private:
     // 拉取：每个队列一个线程（对齐 Java PullMessageService 的并发长轮询语义：
     // broker 为每个队列挂起长轮询、消息到达立即返回；若单线程顺序轮询，
     // 一个空队列的 suspend 会阻塞其余队列的投递）。
+    // 常驻循环线程的统一外壳：异常在边界上接住（逃出线程 = std::terminate，整进程陪葬），
+    // 消费者还在运行就 1s 后重进循环，避免一次偶发异常变成"不再消费"的静默停摆。
+    void runLoop(const std::string& what, const std::function<void()>& body);
     void rebalancePullThreads();
     void rebalanceLoop();
     void queuePullLoop(const MessageQueue& mq, uint64_t token);
@@ -428,9 +444,11 @@ private:
     //  提交位点只能是 firstKey，否则会静默丢掉那条）。空批次直接返回。
     void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch,
                               const std::optional<int64_t>& floor = std::nullopt);
-    // 回投兜底（Java getMaxReconsumeTimes / sendMessageBackAsNormalMessage）
-    int32_t maxReconsumeTimesOrDefault() const;
+    // 回投兜底（Java sendMessageBackAsNormalMessage）
     void sendMessageBackAsNormalMessage(const MessageExt& msg);
+    // 顺序消费的重投闸门（Java ConsumeMessageOrderlyService#checkReconsumeTimes /
+    // #sendMessageBack），与上面并发那一套不是同一条链路
+    bool orderlySendMessageBack(const MessageExt& msg);
     // 位点持久化：每 5s 把"已消费位点"提交 broker（Java persistAllConsumerOffset）
     void offsetPersistLoop();
     void persistOffsetsOnce();

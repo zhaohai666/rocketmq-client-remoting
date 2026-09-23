@@ -14,6 +14,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
+from ..common.message_accessor import MessageAccessor
 from ..common.message_client_id_setter import get_uniq_id, set_uniq_id
 from ..common.message_const import MessageConst
 from ..common.message_decoder import (decode_message, decode_messages, decompress_body,
@@ -744,6 +745,22 @@ class MQClientInstance:
         # 会无条件采信这个字段（AbstractSendMessageProcessor:172-179），固定发 0 会让
         # 重试消息第一次回投就判定 reconsumeTimes(0) >= 0 直接进 %DLQ%。
         header.max_reconsume_times = None
+        # Java sendKernelImpl:1004-1018：发往 ``%RETRY%<group>`` 时这两个重试属性要**抬进
+        # 请求头**，因为 broker 的 handleRetryAndDLQ（SendMessageProcessor:197-210）读的是
+        # requestHeader.reconsumeTimes / maxReconsumeTimes，而不是报文里的属性；漏抬的后果
+        # 不是报错而是**静默错位**：broker 退回用订阅组默认的 retryMaxTimes(16) 判定，
+        # 该三次就进死信的消息会在重试 topic 上一直转。
+        # ⚠ 抬完的 clear 只作用在本地这条 msg 上：properties 字符串在上面已经序列化过，
+        #   Java 也是这个先后顺序（线上属性里 RECONSUME_TIME 依然在），别"顺手"调换。
+        if header.topic.startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
+            reconsume_times = MessageAccessor.get_reconsume_time(msg)
+            if reconsume_times is not None:
+                header.reconsume_times = int(reconsume_times)
+                MessageAccessor.clear_property(msg, MessageConst.PROPERTY_RECONSUME_TIME)
+            max_reconsume_times = MessageAccessor.get_max_reconsume_times(msg)
+            if max_reconsume_times is not None:
+                header.max_reconsume_times = int(max_reconsume_times)
+                MessageAccessor.clear_property(msg, MessageConst.PROPERTY_MAX_RECONSUME_TIMES)
         header.batch = isinstance(msg, MessageBatch)
         # Java sendKernelImpl:1007 `requestHeader.setBrokerName(brokerName)` —— V2 的键是
         # 单字母 `n`（SendMessageRequestHeaderV2:63）。发往哪台 broker 由路由选中，

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -574,6 +575,28 @@ std::vector<std::string> MQClientInstance::knownBrokerAddrs() { return getRouteO
 // ---------------------------------------------------------------- 消息发送
 // 建请求 / 解析应答 / 发送三件事分开，是为了让异步发送能跨重试复用同一个请求对象
 // （Java MQClientAPIImpl#onExceptionImpl 只换 opaque，不换队列也不重建头）。
+// 请求属性里的重试次数抬进请求头（Java sendKernelImpl:1004-1018）
+namespace {
+// Java 侧属性值是字符串，抬进请求头时走 Integer.valueOf。这里遇到非法值按「没带这个
+// 属性」处理（返回 nullopt）而不是抛：建头在发送线程上，一个坏属性不该把整次发送打断。
+std::optional<int32_t> propertyAsInt(const Message& msg, const char* key) {
+    const std::string value = msg.getProperty(key);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || *end != '\0') {
+        return std::nullopt;
+    }
+    if (parsed < INT32_MIN || parsed > INT32_MAX) {
+        return std::nullopt;
+    }
+    return static_cast<int32_t>(parsed);
+}
+}  // namespace
+
 RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGroup,
                                                    const Message& msg, const MessageQueue& mq,
                                                    int32_t sysFlag, bool unitMode,
@@ -600,6 +623,24 @@ RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGr
     // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
     // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
     header->maxReconsumeTimes = std::nullopt;
+    // Java sendKernelImpl:1004-1018：发往 %RETRY% 时把这两个属性「抬进」请求头。
+    // broker 判死信（SendMessageProcessor handleRetryAndDLQ:197-210）读的是
+    // requestHeader.reconsumeTimes / maxReconsumeTimes，**不是**报文里的属性；不抬的话
+    // 它退回订阅组默认的 retryMaxTimes(16)，客户端配的 maxReconsumeTimes 形同虚设，
+    // 而这条静默差别只有在真机上数死信条数才看得出来。
+    // ⚠ 必须放在上面的 header->properties 序列化**之后**：线上属性里 RECONSUME_TIME
+    //    仍然保留（Java 也是先 setProperties 再 clearProperty），消费端要靠它还原次数。
+    // 有意偏离 Java：Java 抬完 clearProperty 改本地对象，本端口 buildSendRequest 收的是
+    // const Message&，不回写。线上报文完全一致，而两个调用方（顺序/并发回投）发出去的都是
+    // 一次性 newMsg，本地清不清都无人再读。
+    if (MixAll::isRetryTopic(msg.topic)) {
+        const std::optional<int32_t> reconsumeTimes =
+            propertyAsInt(msg, MessageConst::PROPERTY_RECONSUME_TIME);
+        if (reconsumeTimes) {
+            header->reconsumeTimes = reconsumeTimes;
+        }
+        header->maxReconsumeTimes = propertyAsInt(msg, MessageConst::PROPERTY_MAX_RECONSUME_TIMES);
+    }
     header->batch = msg.isBatch;
     // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)` —— V2 的键是
     // 单字母 `n`（`SendMessageRequestHeaderV2:69`，`encode()` 用 writeIfNotNull）。

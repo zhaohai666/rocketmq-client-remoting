@@ -72,6 +72,17 @@ class MessageAccessor:
         return msg.properties.get(MessageConst.PROPERTY_CONSUME_START_TIMESTAMP)
 
     @staticmethod
+    def get_reconsume_time(msg: Message):
+        """Java MessageAccessor.getReconsumeTime：重试次数以**属性**形式挂在消息上，
+        只由回投链路（``sendMessageBack``）写入，与 MessageExt 线上第 13 字段的
+        reconsumeTimes 不是一回事 —— broker 消费投递给客户端的是后者。"""
+        return msg.properties.get(MessageConst.PROPERTY_RECONSUME_TIME)
+
+    @staticmethod
+    def set_reconsume_time(msg: Message, v) -> None:
+        msg.properties[MessageConst.PROPERTY_RECONSUME_TIME] = str(v)
+
+    @staticmethod
     def get_max_reconsume_times(msg: Message):
         return msg.properties.get(MessageConst.PROPERTY_MAX_RECONSUME_TIMES)
 

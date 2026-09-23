@@ -734,6 +734,19 @@ public sealed class MQClientInstance : IDisposable
     // ---------------- 消息发送 ----------------
 
     /// <summary>
+    /// Java 的属性值是字符串，抬进请求头时走 <c>Integer.valueOf</c>（非法值抛
+    /// <c>NumberFormatException</c>）。这里非法值按 0/「没带」处理而不是抛：建头在发送线程上，
+    /// 一个坏属性不该把整次发送打断。
+    /// </summary>
+    private static int ParseIntOrZero(string? value) =>
+        TryParseInt(value) ?? 0;
+
+    private static int? TryParseInt(string? value) =>
+        int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
+            ? parsed
+            : null;
+
+    /// <summary>
     /// 组装发送请求（对应 Java MQClientAPIImpl.sendMessage 的头部拼装 + V2 选择）。
     /// Request-Reply 的应答消息（MSG_TYPE == "reply"）会用 SEND_REPLY_MESSAGE_V2(325)
     /// 而不是普通 SEND_MESSAGE_V2(310)——broker 只在 324/325 上注册了 ReplyMessageProcessor。
@@ -750,6 +763,26 @@ public sealed class MQClientInstance : IDisposable
         int sysFlag = 0, bool unitMode = false, string? createTopicKey = null,
         int? defaultTopicQueueNums = null)
     {
+        // Java <c>DefaultMQProducerImpl#sendKernelImpl:1004-1018</c>：发往 <c>%RETRY%</c> 时把
+        // <c>RECONSUME_TIME</c> / <c>MAX_RECONSUME_TIMES</c> 两个属性「抬进」请求头。
+        // broker 判死信读的是 <c>requestHeader.reconsumeTimes</c> / <c>maxReconsumeTimes</c>
+        //（<c>SendMessageProcessor#handleRetryAndDLQ:197-210</c>），**不看报文属性**；不抬的话它
+        // 退回订阅组默认的 retryMaxTimes(16)，消费者配的阈值形同虚设 —— 真机上只表现为
+        //「死信来得慢」，抓一次报文才看得出来。
+        // ⚠ 属性本身仍然上线（<c>Properties</c> 在下面的头里照常整体序列化）：消费端要靠
+        //   <c>RECONSUME_TIME</c> 还原重试次数，Java 也是先 setProperties 再 clearProperty。
+        // 有意偏离 Java：Java 抬完 clearProperty 改本地对象；本端口不回写 —— 两个调用方
+        //（并发/顺序回投）发出去的都是一次性 newMsg，本地清不清都无人再读。
+        int reconsumeTimes = 0;
+        int? maxReconsumeTimes = null;
+        if (MixAll.IsRetryTopic(msg.Topic))
+        {
+            // Java 走 Integer.valueOf(属性)，非法值直接抛；这里按「没带这个属性」处理，
+            // 因为建头在发送线程上，一个坏属性不该把整次发送打断。
+            reconsumeTimes = ParseIntOrZero(msg.GetProperty(MessageConst.PropertyReconsumeTime));
+            maxReconsumeTimes = TryParseInt(msg.GetProperty(MessageConst.PropertyMaxReconsumeTimes));
+        }
+
         var header = new SendMessageRequestHeaderV2
         {
             ProducerGroup = producerGroup,
@@ -761,7 +794,7 @@ public sealed class MQClientInstance : IDisposable
             BornTimestamp = UtilAll.CurrentTimeMillis(),
             Flag = msg.Flag,
             Properties = MessageDecoder.MessagePropertiesToString(msg.Properties),
-            ReconsumeTimes = 0,
+            ReconsumeTimes = reconsumeTimes,
             // 对应 Java DefaultMQProducerImpl:1004 `requestHeader.setUnitMode(this.isUnitMode())`
             // → V2 的单字母键 `k`（SendMessageRequestHeaderV2.java:62）。broker 据此给
             // 自动创建的 topic 打 UNIT(0x1)/UNIT_SUB(0x2) 标记，单元化路由靠它。
@@ -769,7 +802,7 @@ public sealed class MQClientInstance : IDisposable
             // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
             // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
             // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
-            MaxReconsumeTimes = null,
+            MaxReconsumeTimes = maxReconsumeTimes,
             Batch = msg.IsBatch,
             // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)`，V2 的键是
             // 单字母 `n`（SendMessageRequestHeaderV2.java:69，`@CFNullable` 所以空值整条不上线）。
