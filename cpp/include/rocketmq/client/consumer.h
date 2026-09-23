@@ -72,6 +72,12 @@ inline const std::vector<int32_t>& popDelayLevelTable() {
 constexpr int64_t kMinPopInvisibleTime = 5000;
 constexpr int64_t kMaxPopInvisibleTime = 300000;
 
+// Java ProcessQueue.PULL_MAX_IDLE_TIME（`rocketmq.client.pull.pullMaxIdleTime`，默认
+// 120000ms）：仍归本实例的队列如果超过这么久没发起过任何一次拉取/弹出，说明这条循环
+// 死了或卡住了，RebalanceImpl.updateProcessQueueTableInRebalance:442 就按这个判据把
+// 它撤掉并重建（否则那个队列从此**静默**不再消费，客户端不报任何错）。
+constexpr int64_t kPullMaxIdleTime = 120000;
+
 // Java ConsumeInitMode
 enum class ConsumeInitMode : int32_t { MIN = 0, MAX = 1 };
 
@@ -104,10 +110,16 @@ public:
     bool isDropped() const { return dropped_.load(); }
     void setDropped(bool v) { dropped_.store(v); }
 
+    // Java PopProcessQueue.lastPopTimestamp：在**发起**弹出时盖章（:508），
+    // isPullExpired 读的就是它（:74-76）——POP 模式没有"拉取"动作，靠这个时刻判停摆。
+    int64_t lastPopTimestamp() const { return lastPopTimestamp_.load(); }
+    void setLastPopTimestamp(int64_t v) { lastPopTimestamp_.store(v); }
+
 private:
     mutable std::mutex lock_;
     int32_t waitAckCounter_ = 0;
     std::atomic<bool> dropped_{false};
+    std::atomic<int64_t> lastPopTimestamp_{0};
 };
 
 // 从 POP_CK 解出的 ack / 延长不可见时间目标。
@@ -353,6 +365,18 @@ public:
     // 读回某队列的已消费位点；nullopt = 还没有记录
     std::optional<int64_t> consumeOffset(const std::string& key) const;
 
+    // ---- 停摆自愈（Java isPullExpired）的观测/注入面 ----
+    // 停摆判据算错方向是**静默**故障：阈值写太小会把健康队列反复撤走重投（凭空造重复），
+    // 写太大或干脆不判，则循环死掉的队列永久不再消费。真机窗口里两种错都看不出差别，
+    // 所以阈值算术与时刻表要能在离线单测里直接读写。
+    bool pullStalled(const std::string& key) const;
+    // 该队列最近一次「发起拉取/弹出」的毫秒时刻；-1 = 还没有记录
+    int64_t lastPullAt(const std::string& key) const;
+    // 注入时刻（真机故障注入用）：倒拨到阈值之外即等价于"这路卡住了"
+    void setLastPullAt(const std::string& key, int64_t millis);
+    // 立刻按当前分配集撤/建一轮拉取线程（Java updateProcessQueueTableInRebalance）
+    void syncPullThreads();
+
 private:
     // 拉取：每个队列一个线程（对齐 Java PullMessageService 的并发长轮询语义：
     // broker 为每个队列挂起长轮询、消息到达立即返回；若单线程顺序轮询，
@@ -403,6 +427,15 @@ private:
     // 建好再登记，新线程可能先跑到 ownsQueue() 看到「这张表里还没有我」而当场退出，
     // 队列却被登记成「已有拉取线程」⇒ 永远没人再拉它（真机少消费一批的根因）。
     bool ownsQueue(const std::string& key, uint64_t token) const;
+    // 每次**发起**拉取/弹出时盖时刻（Java DefaultMQPushConsumerImpl.pullMessage:253 /
+    // popMessage:508 的位置：在流控、锁判定之前——判据是"这条循环还在跑"，不是"这轮真打了网络"）。
+    void stampPullAt(const std::string& key);
+    // 该队列是否已停摆（Java ProcessQueue.isPullExpired）。调用方须持 lock_。
+    bool pullStalledLocked(const std::string& key) const;
+    // 循环函数返回了、却仍持有该队列（不是被 rebalance 撤走的）：标记为停摆，
+    // 让下一趟 rebalance 走撤走+重建。std::thread 死了没法像 Python 那样问 is_alive()
+    // （joinable() 仍是 true），所以由线程包装器自己报到。
+    void markPullLoopExited(const std::string& key, uint64_t token);
     // 队列被撤走时的收尾（对应 Java removeUnnecessaryMessageQueue）：持久化已消费位点、
     // 丢弃在途缓冲、顺序消费集群模式解锁。revoked 为 (队列, 已消费位点) 列表。
     void onQueuesRevoked(const std::vector<std::pair<MessageQueue, int64_t>>& revoked);
@@ -533,6 +566,10 @@ private:
     // 再 start」，所以归属不能靠线程 id 反查，只能靠这张先写入的表。
     std::map<std::string, uint64_t> pullOwners_;
     uint64_t nextPullToken_ = 0;
+    // 每队列最近一次「发起拉取/弹出」的毫秒时刻（Java ProcessQueue.lastPullTimestamp /
+    // PopProcessQueue.lastPopTimestamp）。rebalance 用它判 pull 是否停摆（kPullMaxIdleTime）。
+    // 0 = 循环自己返回了却仍持有该队列（异常打穿），下一趟按停摆撤走重建。
+    std::map<std::string, int64_t> lastPullAt_;
     // 被撤销队列对应的旧拉取线程（已脱离 pullThreads_，等待其自然退出后回收）
     std::vector<std::thread> retiredThreads_;
     std::thread dispatchThread_;

@@ -577,6 +577,10 @@ void DefaultMQPushConsumer::shutdown() {
     }
     pullThreads_.clear();
     pullOwners_.clear();
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        lastPullAt_.clear();
+    }
     for (std::thread& t : retiredThreads_) {
         if (t.joinable()) t.join();
     }
@@ -633,10 +637,66 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
     for (const MessageQueue& mq : queues) {
         current[offsetKey(mq)] = mq;
     }
-    std::vector<std::pair<MessageQueue, int64_t>> revoked;
+    std::vector<std::pair<MessageQueue, int64_t>> retired;
     {
         std::lock_guard<std::mutex> lk(lock_);
-        // 1. 新分配的队列：**在同一把锁里**登记归属并把线程建出来。
+        // 1. 撤：被分走的 + **拉取停摆**的（Java 的 !mqSet.contains(mq) 与
+        //    pq.isPullExpired() 两个分支，RebalanceImpl:438-461）。停摆这一支防的是
+        //    "循环线程死了/卡住了但队列还归本实例"——不撤就永久静默，且没有任何异常。
+        for (auto it = pullThreads_.begin(); it != pullThreads_.end();) {
+            const std::string key = it->first;
+            const bool revoked = current.find(key) == current.end();
+            // 停机期间线程本来就陆续退出，这时不判停摆（否则会刷一堆假 [BUG] 日志）
+            const bool stalled = !revoked && started_.load() && !stop_.load()
+                && pullStalledLocked(key);
+            if (!revoked && !stalled) {
+                ++it;
+                continue;
+            }
+            if (stalled) {
+                // Java RebalanceImpl:449 的告警原文，用于排查"消费停摆被自愈"的现场
+                logger_error("[BUG]doRebalance, " + consumerGroup_
+                             + ", try remove unnecessary mq, " + key
+                             + ", because pull is pause, so try to fixed it");
+            }
+            MessageQueue mq;
+            auto mit = mqMap_.find(key);
+            if (mit != mqMap_.end()) mq = mit->second;
+            else {
+                auto cit = current.find(key);
+                if (cit != current.end()) mq = cit->second;   // 停摆队列可能一条都没拉过
+            }
+            int64_t off = -1;
+            auto oit = consumeOffsetTable_.find(key);
+            if (oit != consumeOffsetTable_.end()) off = oit->second;
+            if (!mq.topic.empty()) retired.emplace_back(mq, off);
+            retiredThreads_.push_back(std::move(it->second));
+            // 撤走归属：旧线程下一轮 ownsQueue 即失效并退出，即便同一队列马上
+            // 重新分配给本实例，也会拿到一份**新**凭据、起一条新线程。
+            pullOwners_.erase(key);
+            lastPullAt_.erase(key);
+            mqMap_.erase(key);
+            pending_.erase(key);
+            lockOk_.erase(key);
+            offsetTable_.erase(key);
+            consumeOffsetTable_.erase(key);
+            // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+            auto pqit = popQueues_.find(key);
+            if (pqit != popQueues_.end()) {
+                pqit->second->setDropped(true);
+                popQueues_.erase(pqit);
+            }
+            it = pullThreads_.erase(it);
+        }
+    }
+    // 撤的收尾（持久化位点 / UNLOCK）必须在起新线程**之前**做完：反过来会让新循环
+    // 拿旧位点起拉、又把更小的位点写回去，白增重复投递。网络/落盘在锁外做。
+    if (!retired.empty()) {
+        onQueuesRevoked(retired);
+    }
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        // 2. 建：为缺失的队列起拉取线程。
         //    std::thread 一构造就跑（不像 Python/.NET 能「先入表再 start」），所以
         //    「写 pullOwners_」必须在构造之前，而「写 pullThreads_」必须与它同批完成。
         //    错开一步就有两种坏结果：
@@ -654,6 +714,11 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
             }
             const uint64_t token = ++nextPullToken_;
             pullOwners_[kv.first] = token;
+            // 队列一旦分配就进 mqMap_（Java ProcessQueueTable 的键集即"已分配"），不等
+            // 第一条消息：位点持久化、307 运行信息、停摆自愈都要靠这份映射找得到队列。
+            mqMap_[kv.first] = kv.second;
+            // 线程刚建、还没跑到盖章处，先用当前时刻占位，避免下一趟误判停摆
+            lastPullAt_[kv.first] = UtilAll::currentTimeMillis();
             const std::string key = kv.first;
             const MessageQueue mq = kv.second;
             try {
@@ -665,52 +730,76 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
                         setThreadName("PullMessageService");
                         queuePullLoop(mq, token);
                     }
+                    // 走到这里说明循环自己返回了。若它返回时**仍然持有**该队列，就不是
+                    // 被 rebalance 撤走的正常退出，而是"订阅没了/异常打穿"这类死法：
+                    // 报到停摆，下一趟撤掉重建（std::thread 死了问不出 is_alive）。
+                    markPullLoopExited(key, token);
                 });
                 pullThreads_[key] = std::move(t);
             } catch (const std::system_error& e) {
                 // 起线程失败（资源耗尽）必须把归属收回，留着一个没人认领的 token
                 // 等于给这条队列判了永久静默；收回去下一轮 rebalance 会重试。
                 pullOwners_.erase(key);
+                lastPullAt_.erase(key);
                 logger_warn("rebalance: cannot start pull thread for " + key + ": " + e.what());
             }
         }
-        // 2. 被撤销的队列：清状态 + 收集 (mq, 已消费位点)，把旧线程移到 retiredThreads_
-        //    等待其自然退出（线程循环里 ownsQueue 返回 false 即退出）
-        for (auto it = pullThreads_.begin(); it != pullThreads_.end();) {
-            if (current.find(it->first) == current.end()) {
-                MessageQueue mq;
-                auto mit = mqMap_.find(it->first);
-                if (mit != mqMap_.end()) mq = mit->second;
-                int64_t off = -1;
-                auto oit = consumeOffsetTable_.find(it->first);
-                if (oit != consumeOffsetTable_.end()) off = oit->second;
-                revoked.emplace_back(mq, off);
-                retiredThreads_.push_back(std::move(it->second));
-                // 撤走归属：旧线程下一轮 ownsQueue 即失效并退出，即便同一队列马上
-                // 重新分配给本实例，也会拿到一份**新**凭据、起一条新线程。
-                pullOwners_.erase(it->first);
-                mqMap_.erase(it->first);
-                pending_.erase(it->first);
-                lockOk_.erase(it->first);
-                offsetTable_.erase(it->first);
-                consumeOffsetTable_.erase(it->first);
-                // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
-                auto pqit = popQueues_.find(it->first);
-                if (pqit != popQueues_.end()) {
-                    pqit->second->setDropped(true);
-                    popQueues_.erase(pqit);
-                }
-                it = pullThreads_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    // 网络/落盘在锁外做
-    if (!revoked.empty()) {
-        onQueuesRevoked(revoked);
     }
 }
+
+void DefaultMQPushConsumer::stampPullAt(const std::string& key) {
+    const int64_t now = UtilAll::currentTimeMillis();
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        lastPullAt_[key] = now;
+    }
+    if (popMode_) {
+        std::shared_ptr<PopProcessQueue> pq;
+        {
+            std::lock_guard<std::mutex> lk(lock_);
+            auto it = popQueues_.find(key);
+            if (it != popQueues_.end()) pq = it->second;
+        }
+        // Java PopProcessQueue.lastPopTimestamp 同一个时刻盖章（:508）
+        if (pq) pq->setLastPopTimestamp(now);
+    }
+}
+
+bool DefaultMQPushConsumer::pullStalledLocked(const std::string& key) const {
+    // Java ProcessQueue.isPullExpired / PopProcessQueue.isPullExpired：只看"多久没发起过
+    // 一次拉取/弹出"。没盖过章（新线程还没跑到入口）不算停摆，否则刚分配就被撤。
+    auto it = lastPullAt_.find(key);
+    if (it == lastPullAt_.end()) return false;
+    if (it->second == 0) return true;      // 循环自行退出的标记
+    return UtilAll::currentTimeMillis() - it->second > kPullMaxIdleTime;
+}
+
+void DefaultMQPushConsumer::markPullLoopExited(const std::string& key, uint64_t token) {
+    if (stop_.load() || !started_.load()) return;
+    std::lock_guard<std::mutex> lk(lock_);
+    // 直接查归属表：ownsQueue() 也要拿同一把非递归锁，这里已经持着它了。
+    auto it = pullOwners_.find(key);
+    if (it == pullOwners_.end() || it->second != token) return;   // 被撤走的正常退出
+    lastPullAt_[key] = 0;
+}
+
+bool DefaultMQPushConsumer::pullStalled(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return pullStalledLocked(key);
+}
+
+int64_t DefaultMQPushConsumer::lastPullAt(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = lastPullAt_.find(key);
+    return it == lastPullAt_.end() ? -1 : it->second;
+}
+
+void DefaultMQPushConsumer::setLastPullAt(const std::string& key, int64_t millis) {
+    std::lock_guard<std::mutex> lk(lock_);
+    lastPullAt_[key] = millis;
+}
+
+void DefaultMQPushConsumer::syncPullThreads() { rebalancePullThreads(); }
 
 void DefaultMQPushConsumer::rebalanceLoop() {
     // 周期重算分配（对齐 Java RebalanceService 默认 20s），或被 NOTIFY_CONSUMER_IDS_CHANGED
@@ -753,6 +842,9 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
         if (!ownsQueue(key, token)) {
             return;
         }
+        // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖时刻，
+        // 在流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
+        stampPullAt(key);
         SubscriptionData sub;
         {
             std::lock_guard<std::mutex> lk(lock_);
@@ -919,6 +1011,9 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             pq = it->second;
         }
         if (pq->isDropped()) return;
+        // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起即盖章（POP 模式的
+        // isPullExpired 读的就是 PopProcessQueue.lastPopTimestamp）。
+        stampPullAt(key);
         SubscriptionData sub;
         {
             std::lock_guard<std::mutex> lk(lock_);
@@ -1426,7 +1521,8 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
         for (const auto& kv : subscriptionData_) {
             subs.pushArray(kv.second.toJson());
         }
-        auto makePqi = [&](int64_t commitOffset, int64_t cachedMsgCount, bool droped) {
+        auto makePqi = [&](int64_t commitOffset, int64_t cachedMsgCount, bool droped,
+                           int64_t lastPullTimestamp) {
             // ProcessQueueInfo 全字段（Java body.ProcessQueueInfo；"droped" 拼写照抄）
             JsonValue pqi = JsonValue::makeObject();
             pqi.set("commitOffset", JsonValue::makeInt(commitOffset));
@@ -1441,11 +1537,16 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
             pqi.set("tryUnlockTimes", JsonValue::makeInt(0));
             pqi.set("lastLockTimestamp", JsonValue::makeInt(0));
             pqi.set("droped", JsonValue::makeBool(droped));
-            pqi.set("lastPullTimestamp", JsonValue::makeInt(0));
+            pqi.set("lastPullTimestamp", JsonValue::makeInt(lastPullTimestamp));
             pqi.set("lastConsumeTimestamp", JsonValue::makeInt(0));
             return pqi;
         };
         for (const auto& kv : mqMap_) {
+            // POP 模式下弹出去 popQueues_（Java 的 popProcessQueueTable），classic 的
+            // processQueueTable 是空的 —— 两把表在 Java 里互斥，307 里也必须互斥：同一把队列
+            // 既进 mqTable 又进 mqPopTable 会让控制台把一路消费数成两路。mqMap_ 是"已分配"
+            // 注册表（自愈、位点持久化都靠它），两种模式都写，所以这里按模式过滤而不是不写。
+            if (popMode_ && popQueues_.find(kv.first) != popQueues_.end()) continue;
             const MessageQueue& mq = kv.second;
             // fastjson2 内联对象键（键按字母序），与 Python message_queue_key 同款
             const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
@@ -1456,7 +1557,12 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
             int64_t cached = 0;
             auto pt = pending_.find(kv.first);
             if (pt != pending_.end()) cached = static_cast<int64_t>(pt->second.size());
-            info.mqTable.set(mqKey, makePqi(commit, cached, false));
+            // Java ProcessQueue.fillOutRunningInfo:456 报 lastPullTimestamp。
+            // 写死 0 等于把"这一路多久没拉了"这份停摆判据的现场证据全丢了。
+            int64_t lastPull = 0;
+            auto lt = lastPullAt_.find(kv.first);
+            if (lt != lastPullAt_.end()) lastPull = lt->second;
+            info.mqTable.set(mqKey, makePqi(commit, cached, false, lastPull));
         }
         if (popMode_) {
             for (const auto& kv : popQueues_) {
@@ -1465,8 +1571,11 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
                 const MessageQueue& mq = mt->second;
                 const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
                     + std::to_string(mq.queueId) + ",\"topic\":\"" + mq.topic + "\"}";
-                info.mqPopTable.set(mqKey,
-                                    makePqi(0, kv.second->waitAckCount(), kv.second->isDropped()));
+                // Java PopProcessQueue 用 lastPopTimestamp 顶替 lastPullTimestamp 判停摆
+                // （isPullExpired:74-76），这里填同一个时刻保持可比。
+                info.mqPopTable.set(mqKey, makePqi(0, kv.second->waitAckCount(),
+                                                   kv.second->isDropped(),
+                                                   kv.second->lastPopTimestamp()));
             }
         }
     }

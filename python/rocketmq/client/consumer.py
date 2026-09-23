@@ -67,6 +67,11 @@ MAX_POP_INVISIBLE_TIME = 300000
 CONSUME_INIT_MODE_MIN = 0
 CONSUME_INIT_MODE_MAX = 1
 
+# Java ProcessQueue.PULL_MAX_IDLE_TIME（`rocketmq.client.pull.pullMaxIdleTime`，默认 120000ms）：
+# 一个仍归本实例的队列如果超过这么久没发起过任何拉取/弹出，说明它的循环死了（或卡住了）。
+# Java RebalanceImpl.updateProcessQueueTableInRebalance:442 就按这个判据把它撤掉重建。
+PULL_MAX_IDLE_TIME = 120.0
+
 
 def _mq_sort_key(mq: MessageQueue):
     """队列排序键，语义对齐 Java MessageQueue.compareTo：topic → brokerName → queueId。
@@ -739,6 +744,9 @@ class DefaultMQPushConsumer:
         self._lock_thread: Optional[threading.Thread] = None
         self._rebalance_thread: Optional[threading.Thread] = None
         self._queue_threads: Dict[str, threading.Thread] = {}
+        # 每队列最近一次「发起拉取/弹出」的时刻（Java ProcessQueue.lastPullTimestamp /
+        # PopProcessQueue.lastPopTimestamp）。rebalance 用它判 pull 是否停摆（PULL_MAX_IDLE_TIME）。
+        self._last_pull_table: Dict[str, float] = {}
         # ---- 真实 rebalance（对齐 Java RebalanceImpl）----
         # _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
         # 由 _do_rebalance() 按 LOCK/分配策略计算；_rebalance_now 用于
@@ -1296,6 +1304,8 @@ class DefaultMQPushConsumer:
             if t.is_alive():
                 t.join(timeout=2)
         self._queue_threads.clear()
+        with self._lock:
+            self._last_pull_table.clear()
         if self._mq_client is not None:
             try:
                 self._mq_client.shutdown()
@@ -1414,22 +1424,50 @@ class DefaultMQPushConsumer:
         self._rebalance_pull_threads()
 
     def _rebalance_pull_threads(self) -> None:
-        """按当前分配的队列同步拉取线程集，并清理被撤销队列的状态。
+        """按当前分配的队列同步拉取线程集，并清理被撤销/已停摆队列的状态。
 
         对齐 Java ``RebalanceImpl.updateProcessQueueTableInRebalance``：队列被撤走时必须
         ①persist 该队列**已消费**位点 ②丢弃 ProcessQueue（在途消息不再消费，交新属主重投）
         ③顺序消费集群模式还要 UNLOCK_BATCH_MQ。少任何一步，被撤销队列里的在途消息都会被
         **旧实例继续消费**，与新属主重复（真机 S6 多出重复消息的根因）。
+
+        Java 在同一趟里还做**自愈**：仍归本实例、但拉取停摆超过 ``PULL_MAX_IDLE_TIME`` 的
+        ProcessQueue 也按撤走处理（``isPullExpired`` 分支，:442），紧接着的 add 分支用新的
+        ProcessQueue 重建拉取，从而把死掉/卡住的消费循环救回来。
+
+        这里刻意保持 Java 的**先撤后建**顺序，并且把撤的收尾（持久化位点 / UNLOCK）放在
+        建线程**之前**：反过来会让新循环拿旧位点起拉、又把更小的位点写回去，白增重复投递。
         """
         current = {self._mq_key(mq): mq for mq in self._assigned_queues()}
-        revoked: List[Tuple[MessageQueue, Optional[int]]] = []
+        retired: List[Tuple[MessageQueue, Optional[int]]] = []
         pop = self.pop_mode
         with self._lock:
+            # ①撤：被分走的 + 拉取停摆的（Java 的 !mqSet.contains / isPullExpired 两支）
+            for key in list(self._queue_threads.keys()):
+                if key not in current:
+                    self._retire_queue_locked(key, None, retired)
+                    continue
+                if self._started and self._pull_stalled_locked(key):
+                    # Java RebalanceImpl:449 的告警原文，用于排查"消费停摆被自愈"的现场
+                    logger.error("[BUG]doRebalance, %s, try remove unnecessary mq, %s, "
+                                 "because pull is pause, so try to fixed it",
+                                 self.consumer_group, key)
+                    self._retire_queue_locked(key, current[key], retired)
+        # 收尾在锁外做（网络 RPC），且必须早于 ②建
+        if retired:
+            self._on_queues_revoked(retired)
+        with self._lock:
+            # ②建：为缺失的队列起循环
             for key, mq in current.items():
                 if key in self._queue_threads:
                     continue
                 if pop and key not in self._pop_queues:
                     self._pop_queues[key] = PopProcessQueue()
+                # 线程刚建、循环还没跑到盖章处，先用当前时刻占位，避免下一趟误判停摆
+                self._last_pull_table[key] = time.time()
+                # 队列一旦分配就进 _mq_map（Java ProcessQueueTable 的键集即"已分配"），
+                # 不等第一条消息：位点持久化、307 运行信息、220 重置都靠这份映射。
+                self._mq_map[key] = mq
                 # POP 模式：每队列起一个 POP 循环（不拉位点、不建拉取缓冲区）
                 target = self._queue_pop_loop if pop else self._queue_pull_loop
                 t = threading.Thread(target=target, args=(mq,), daemon=True,
@@ -1437,23 +1475,43 @@ class DefaultMQPushConsumer:
                                                             self.consumer_group, key))
                 self._queue_threads[key] = t
                 t.start()
-            for key in list(self._queue_threads.keys()):
-                if key not in current:
-                    self._queue_threads.pop(key, None)  # 循环内检测到退出
-                    mq = self._mq_map.pop(key, None)
-                    self._pending.pop(key, None)
-                    self._lock_ok.discard(key)
-                    off = self._consume_offsets.pop(key, None)
-                    self._offset_table.pop(key, None)
-                    # POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
-                    pq = self._pop_queues.pop(key, None)
-                    if pq is not None:
-                        pq.set_dropped(True)
-                    if mq is not None:
-                        revoked.append((mq, off))
-        # 网络/落盘在锁外做
-        if revoked:
-            self._on_queues_revoked(revoked)
+
+    def _retire_queue_locked(self, key: str, fallback_mq: Optional[MessageQueue],
+                             retired: List[Tuple[MessageQueue, Optional[int]]]) -> None:
+        """丢弃一个队列的全部本地状态（调用方须持锁），位点交给调用方在锁外持久化。
+
+        线程表里的条目一删，原循环线程下一轮 ``_owns_queue`` 即失败并自行退出；
+        ``_last_pull_table`` 一并清掉，避免同名队列复用线程时继承旧时刻。
+        ``fallback_mq`` 用于自愈分支：停摆队列可能一条消息都没拉过，_mq_map 里还没有条目，
+        但它的已消费位点是真实的，漏 persist 就会让新属主从头重投。
+        """
+        self._queue_threads.pop(key, None)  # 循环内检测到退出
+        self._last_pull_table.pop(key, None)
+        mq = self._mq_map.pop(key, fallback_mq)
+        self._pending.pop(key, None)
+        self._lock_ok.discard(key)
+        off = self._consume_offsets.pop(key, None)
+        self._offset_table.pop(key, None)
+        # POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+        pq = self._pop_queues.pop(key, None)
+        if pq is not None:
+            pq.set_dropped(True)
+        if mq is not None:
+            retired.append((mq, off))
+
+    def _pull_stalled_locked(self, key: str) -> bool:
+        """该队列的拉取/弹出循环是否已停摆（Java ProcessQueue.isPullExpired）。须持锁调用。
+
+        两个判据都算死：线程已退出（异常穿透），或线程还在但超过 ``PULL_MAX_IDLE_TIME``
+        没发起过任何一次拉取（卡在锁/流控/网络之外的地方）。从未盖过章的新循环不算。
+        """
+        t = self._queue_threads.get(key)
+        if t is not None and not t.is_alive():
+            return True
+        began = self._last_pull_table.get(key)
+        if began is None:
+            return False
+        return time.time() - began > PULL_MAX_IDLE_TIME
 
     def _on_queues_revoked(self, revoked: List[Tuple[MessageQueue, Optional[int]]]) -> None:
         """被撤销队列的收尾（对应 Java RebalanceImpl.removeUnnecessaryMessageQueue）。"""
@@ -1603,6 +1661,10 @@ class DefaultMQPushConsumer:
         while not self._stop.is_set() and self._started:
             if not self._owns_queue(key):
                 return
+            # Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖时刻，
+            # 在流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
+            with self._lock:
+                self._last_pull_table[key] = time.time()
             with self._lock:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
@@ -1743,6 +1805,13 @@ class DefaultMQPushConsumer:
             pq = self._pop_queues.get(key)
             if pq is None or pq.is_dropped():
                 return
+            # Java PopProcessQueue.isPullExpired 读的是 lastPopTimestamp，而它在**发起**弹出时
+            # 就被盖章（DefaultMQPushConsumerImpl.popMessage 的入口）：流控/长轮询挂起都不该
+            # 让一条还在跑的循环被判成停摆。
+            with self._lock:
+                now = time.time()
+                self._last_pull_table[key] = now
+            pq.last_pop_timestamp = now
             with self._lock:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
@@ -1780,7 +1849,6 @@ class DefaultMQPushConsumer:
                 logger.debug("queue %s revoked during pop, discard %d messages un-acked",
                              mq, len(result.msg_found_list or ()))
                 return
-            pq.last_pop_timestamp = time.time()
             if result.status == PopStatus.FOUND and result.msg_found_list:
                 pq.inc_found_msg(len(result.msg_found_list))
                 # 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
@@ -2198,11 +2266,22 @@ class DefaultMQPushConsumer:
         }
         with self._lock:
             subs = list(self.subscription_data.values())
+            # POP 模式下弹出去 pop_queues（Java popProcessQueueTable），classic 的
+            # processQueueTable 是空的 —— 两把表在 Java 里互斥，307 里也互斥：同一把队列
+            # 既出现在 mqTable 又出现在 mqPopTable 会让控制台把一路消费数成两路。
+            # _mq_map 是"已分配"注册表（停摆自愈、位点持久化、220 重置都靠它），两种模式都写，
+            # 所以这里按模式过滤而不是不写。
+            pop_keys = set(self._pop_queues or ()) if self.pop_mode else ()
             for key, mq in self._mq_map.items():
+                if key in pop_keys:
+                    continue
                 pqi = ProcessQueueInfo()
                 pqi.commit_offset = int(self._consume_offsets.get(key, 0))
                 pqi.cached_msg_count = len(self._pending.get(key) or ())
                 pqi.droped = False
+                # Java ProcessQueue.fillOutRunningInfo:456 —— 运维看的就是这个时刻；
+                # 写死 0 会让"这一路有没有停摆"在 307 应答里完全看不出来。
+                pqi.last_pull_timestamp = int(self._last_pull_table.get(key, 0) * 1000)
                 info.mq_table[mq] = pqi.to_dict()
             if self.pop_mode:
                 for key, pq in (self._pop_queues or {}).items():
@@ -2212,6 +2291,9 @@ class DefaultMQPushConsumer:
                     pqi = ProcessQueueInfo()
                     pqi.cached_msg_count = pq.wait_ack_count()
                     pqi.droped = pq.is_dropped()
+                    # Java PopProcessQueue 用 lastPopTimestamp 顶替 lastPullTimestamp
+                    # 判停摆（isPullExpired:74），这里填同一个时刻保持可比。
+                    pqi.last_pull_timestamp = int(pq.last_pop_timestamp * 1000)
                     info.mq_pop_table[mq] = pqi.to_dict()
         info.subscription_set = [s.to_dict() if hasattr(s, "to_dict") else dict(s.__dict__)
                                  for s in subs]

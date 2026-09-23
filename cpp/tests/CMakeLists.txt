@@ -161,3 +161,9 @@ add_test(NAME recall_message COMMAND rmq_test_recall_message)
 add_executable(rmq_test_check_client_config test_check_client_config.cpp)
 target_link_libraries(rmq_test_check_client_config PRIVATE rocketmq::remoting)
 add_test(NAME check_client_config COMMAND rmq_test_check_client_config)
+
+# isPullExpired 停摆自愈：锁阈值算术与逐队列时刻表（判错方向要么静默不消费、要么凭空重投）。
+# 「撤掉之后真能重新消费」要起真线程，只能在真机验（examples/live_consumer.cpp 的停摆场景）。
+add_executable(rmq_test_pull_expired test_pull_expired.cpp)
+target_link_libraries(rmq_test_pull_expired PRIVATE rocketmq::remoting)
+add_test(NAME pull_expired COMMAND rmq_test_pull_expired)

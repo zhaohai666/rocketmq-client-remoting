@@ -35,6 +35,10 @@
 //!   重平衡下接管全部队列并继续消费，全量消息一条不丢。
 //! - C9 运维接口与背压：流控只暂停拉取不丢消息、核心线程数守卫、积压统计、
 //!   手工心跳/重平衡/订阅队列查询、经实例注册表调 `persist_consumer_offset()`。
+//! - C11 拉取停摆自愈（Java `ProcessQueue.isPullExpired` / 120s）：1 队列 topic 先消费 3 条，
+//!   把该队列的拉取盖章倒拨 125s（等价于"这条循环已经两分钟没动静"），走**生产** rebalance
+//!   确认它被撤掉重建（同一趟里换新属主、重新盖章），随后再发 3 条照样消费、
+//!   broker 位点从 3 前进到 6 且**不回退**，6 条各只投一次（撤走前持久化了位点）。
 //! - C10 清理：删掉本次建的 topic 与广播位点目录。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
@@ -52,7 +56,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as JsonValue;
 
-use rocketmq_client_remoting::client::consumer::{ConsumerConfig, DefaultMQPushConsumer};
+use rocketmq_client_remoting::client::consumer::{
+    ConsumerConfig, DefaultMQPushConsumer, PULL_MAX_IDLE_TIME,
+};
 use rocketmq_client_remoting::client::mq_client::{MQClientInstance, RegisteredConsumer};
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::pull_consumer::{
@@ -90,6 +96,14 @@ fn stamp() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs().to_string(),
         Err(_) => "0".to_string(),
+    }
+}
+
+/// 毫秒墙钟：`lastPullAt` / `lastPullTimestamp` 用的就是这个口径（Java `System.currentTimeMillis`）。
+fn now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(_) => 0,
     }
 }
 
@@ -627,6 +641,24 @@ fn table_sum(table: &BTreeMap<String, JsonValue>, field: &str) -> i64 {
         .sum()
 }
 
+/// 运行信息里业务那一路的拉取时钟距今多少毫秒（没有记录时 `None`，调用方直接判失败）。
+///
+/// 必须排除 `%RETRY%` 那条：Java 的 processQueueTable 按**分配队列**逐条填，自动订阅的重试
+/// 队列也在表里、也在被拉，取 `.max()` 会命中它的心跳，业务队列停摆就被掩盖掉了。
+/// C11 整段锁在单队列上，所以业务条目就是剩下的唯一一条。
+fn pull_clock_age_ms(info: &ConsumerRunningInfo) -> Option<i64> {
+    let table = running_table(info);
+    let stamp = table
+        .iter()
+        .filter(|(k, _)| !k.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX))
+        .filter_map(|(_, v)| v.get("lastPullTimestamp").and_then(JsonValue::as_i64))
+        .max()?;
+    if stamp <= 0 {
+        return None;
+    }
+    Some(now_ms() - stamp)
+}
+
 // --------------------------------------------------------------- C1 启动校验
 
 async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
@@ -897,13 +929,25 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
         &format!("buffered={}", c.buffered_message_count()),
     );
 
-    // 运维接口：runningInfo 的 mqTable 每队列一条，且 commitOffset 与进程内一致
+    // 运维接口：runningInfo 的 mqTable 每队列一条，且 commitOffset 与进程内一致。
+    // Java 的 processQueueTable 以「已分配的 MessageQueue」为键，而 `%RETRY%<group>` 那个
+    // 队列同样会被分配并建 ProcessQueue（Java consumerRunningInfo 直接遍历这张表），
+    // 所以这里必须数出 4 把业务队列 + 1 把重试队列；只数业务队列会漏掉自愈/位点视图。
     let info = c.consumer_running_info();
     let table = running_table(&info);
+    let business: Vec<String> = main_queues(&table.keys().cloned().collect::<Vec<_>>());
+    let retry_entries: Vec<&String> = table
+        .keys()
+        .filter(|k| k.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX))
+        .collect();
     ck.check(
-        "C2 consumerRunningInfo reports one ProcessQueueInfo per assigned queue",
-        table.len() == QUEUE_NUMS as usize,
-        &format!("{:?}", table.keys().collect::<Vec<_>>()),
+        "C2 consumerRunningInfo reports one ProcessQueueInfo per assigned queue (business + the %RETRY% queue, Java processQueueTable)",
+        business.len() == QUEUE_NUMS as usize && retry_entries.len() == 1,
+        &format!(
+            "business={} retry={:?}",
+            business.len(),
+            retry_entries
+        ),
     );
     ck.check(
         "C2 runningInfo commitOffset equals the in-process consume offsets",
@@ -1942,6 +1986,146 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
+// ------------------------------------------------- C11 拉取停摆自愈（isPullExpired）
+
+/// 用调用方给定的 body 发送，绕开 `produce` 的 `topic-00i` 编号。
+///
+/// 自愈场景必须"每一批 body 都不重名"，否则"撤走重建有没有把老消息重投一遍"这件事
+/// 会被编号撞车掩盖掉 —— `produce` 每轮都从 000 开始，两批之间天然重叠。
+async fn send_bodies(fx: &Fixture, topic: &str, bodies: &[String]) -> usize {
+    let mut sent = 0usize;
+    for body in bodies {
+        let mut msg = Message::new(topic, Some(body.as_bytes()));
+        msg.set_tags("TagA");
+        match fx.producer.send(&mut msg, Some(5000), None).await {
+            Ok(_) => sent += 1,
+            Err(e) => println!("  [WARN] send {body} failed: {e}"),
+        }
+    }
+    sent
+}
+
+fn batch(prefix: &str, n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{prefix}-{i}")).collect()
+}
+
+/// 注入一次停摆并走**生产路径**自愈，返回是否成功自愈。
+///
+/// 为什么允许重试：盖章只发生在**发起**拉取的那一刻，而真循环多半正挂在 30s 长轮询上，
+/// 所以倒拨之后基本第一次就能被判停摆。极少数情况下旧的拉取请求刚好回来并重新盖章，
+/// 这一趟判据就不成立了（不是 bug），重试比 sleep 满 120s 赌一次可靠。
+async fn heal_once(c: &DefaultMQPushConsumer, key: &str) -> bool {
+    let injected = now_ms() - PULL_MAX_IDLE_TIME - 5_000;
+    for _ in 0..20 {
+        c.set_last_pull_at(key, injected);
+        if !c.pull_stalled(key) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        // 撤走 + 重建都在这一次同步里完成，重建时会立刻把章盖成"现在"。
+        c.sync_pull_threads().await;
+        if c.last_pull_at(key).is_some_and(|t| t > injected + 60_000) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C11 拉取循环停摆 → 同一趟 rebalance 撤掉重建，消息不重不丢");
+    let topic = fx.topic_name("Heal");
+    let group = fx.group_name("heal");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C11 create topic", &e);
+    }
+    let inbox = Arc::new(Inbox::default());
+    let c = match fx.consumer(&group, &topic, "*", LiveListener::collecting(inbox.clone())) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C11 build consumer", &e),
+    };
+    if let Err(e) = c.start().await {
+        return ck.abort("C11 start", &format!("{e}"));
+    }
+    // 1 队列：循环只有一条，注入点唯一，位点判据也唯一（多队列会被分摊到别的实例）
+    let assigned = poll_until(|| main_queues(&c.assigned_queue_keys()).len() == 1, WAIT_SECONDS).await;
+    let key = main_queues(&c.assigned_queue_keys())
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    ck.check("C11 the single queue is assigned", assigned && !key.is_empty(), &key);
+    if !assigned {
+        c.shutdown();
+        return ck.abort("C11 assign", "no queue was assigned to this consumer");
+    }
+
+    // ---- 基线：3 条被消费，位点提交到 3，运行信息里的拉取时钟是真值 ----
+    let b1 = batch("heal-base", 3);
+    let sent = send_bodies(fx, &topic, &b1).await;
+    let got = poll_until(|| inbox.count() >= 3, WAIT_SECONDS).await;
+    let committed = fx.wait_committed(&group, &topic, 1, 3).await;
+    ck.check(
+        "C11 baseline: 3 messages sent and consumed, offset committed to the broker",
+        sent == 3 && got && committed == 3,
+        &format!("sent={sent} arrivals={} committed={committed}", inbox.count()),
+    );
+    ck.check(
+        "C11 consumerRunningInfo reports the real lastPullTimestamp (Java ProcessQueue#fillOutRunningInfo:456)",
+        pull_clock_age_ms(&c.consumer_running_info())
+            .is_some_and(|age| (0..60_000).contains(&age)),
+        &format!("ageMs={:?}", pull_clock_age_ms(&c.consumer_running_info())),
+    );
+
+    // ---- 注入停摆 → 自愈（Java updateProcessQueueTableInRebalance 的 [BUG] 分支）----
+    let healed = heal_once(&c, &key).await;
+    let stalled_after = c.pull_stalled(&key);
+    let fresh = c.last_pull_at(&key).unwrap_or_default();
+    ck.check(
+        "C11 a stalled queue is retired and rebuilt inside one rebalance (the stamp went back to now)",
+        healed && !stalled_after,
+        &format!("key={key} lastPullAt={fresh}"),
+    );
+
+    // ---- 自愈之后这把队列必须照常消费，而且不能把老消息重投 ----
+    let b2 = batch("heal-post", 3);
+    let sent2 = send_bodies(fx, &topic, &b2).await;
+    let got2 = poll_until(|| inbox.count() >= 6, WAIT_SECONDS).await;
+    let committed2 = fx.wait_committed(&group, &topic, 1, 6).await;
+    let got_bodies: BTreeSet<String> = inbox.bodies();
+    let want: BTreeSet<String> = b1.iter().chain(b2.iter()).cloned().collect();
+    let retried: Vec<String> = inbox
+        .snapshot()
+        .iter()
+        .filter(|d| d.reconsume_times != 0)
+        .map(|d| d.body.clone())
+        .collect();
+    ck.check(
+        "C11 the rebuilt loop keeps consuming the same queue (self-heal is not a no-op)",
+        sent2 == 3 && got2 && committed2 == 6,
+        &format!("arrivals={} committed={committed2}", inbox.count()),
+    );
+    ck.check(
+        "C11 the retired queue's offset was persisted before the rebuild, so nothing is redelivered",
+        got_bodies == want && retried.is_empty(),
+        &format!(
+            "distinct={} want={} redelivered={:?}",
+            got_bodies.len(),
+            want.len(),
+            retried
+        ),
+    );
+    // 留一个窗口给"新循环用陈旧游标回退位点"这类错误显形
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let committed3 = fx.committed_total(&group, &topic, 1).await;
+    let dup = inbox.count();
+    ck.check(
+        "C11 the offset never rolls back after the heal (no duplicate burst shows up later)",
+        committed3 >= 6 && dup == 6,
+        &format!("committed={committed3} arrivals={dup}"),
+    );
+    c.shutdown();
+}
+
 // ---------------------------------------------------------------- C10 清理
 
 async fn c10_cleanup(ck: &mut Checker, fx: &mut Fixture) {
@@ -2026,6 +2210,7 @@ async fn run(namesrv: &str) -> Checker {
     c7_orderly_and_lock(&mut ck, &fx).await;
     c8_scale_in_and_takeover(&mut ck, &fx).await;
     c9_admin_and_flow_control(&mut ck, &fx).await;
+    c11_pull_stall_self_heal(&mut ck, &fx).await;
     c10_cleanup(&mut ck, &mut fx).await;
     ck
 }

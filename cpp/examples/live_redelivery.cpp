@@ -20,6 +20,10 @@
 //      %RETRY% 重投（reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口
 //      只投一次、3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）
 //      一条都不回投。
+//   S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME=120s）：把仍归本实例的队列
+//      的 lastPull 时刻倒拨到阈值之外 ⇒ 这一趟 rebalance 必须撤掉它（持久化位点）并重建
+//      拉取线程，之后同一队列继续消费、307 运行信息里的 lastPullTimestamp 是真值、
+//      且前面消费过的 6 条一条都不重投（位点没回退）。
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 prepareTopic）。消费者不做默认 topic
 //   兜底（对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），所以 topic 不存在
@@ -895,6 +899,113 @@ int main(int argc, char* argv[]) {
         admin.shutdown();
         pc->shutdown();
         cc->shutdown();
+    }
+
+    // ---------------- S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME）----------------
+    // 队列还归本实例、但拉取循环死了或卡住：Java RebalanceImpl:438-461 会在同一趟
+    // rebalance 里把它撤掉（持久化位点 + 丢缓冲）再重建。不做这一步的坏法最难发现——
+    // 客户端不报错、心跳照发、别的队列照常推进，只有"这个队列的位点永远不动"。
+    // 阈值（120s）离线单测锁死（tests/test_pull_expired.cpp），这里锁真机闭环：
+    // 注入停摆 → 撤+建 → **同一个队列继续消费**，且位点不回退（前 3 条不重投）。
+    {
+        const std::string topic11 = gPrefix + "_Heal";
+        const std::string group11 = gPrefix + "_g11";
+        prepareTopic(producer, topic11, 1);   // 1 队列：注入点唯一，位点判据也唯一
+
+        struct Rec { std::string body; int32_t times; };
+        struct Sink {
+            std::mutex mtx;
+            std::vector<Rec> recs;
+            std::vector<Rec> snapshot() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return recs;
+            }
+            size_t count() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return recs.size();
+            }
+        };
+        class L : public MessageListenerConcurrently {
+        public:
+            explicit L(Sink& s) : sink_(s) {}
+            ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                     ConsumeConcurrentlyContext&) override {
+                std::lock_guard<std::mutex> lk(sink_.mtx);
+                for (const MessageExt& m : msgs) {
+                    sink_.recs.push_back({bodyOf(m), m.getReconsumeTimes()});
+                }
+                return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+            }
+
+        private:
+            Sink& sink_;
+        };
+
+        Sink sink;
+        auto c = std::make_shared<DefaultMQPushConsumer>(group11);
+        c->setNamesrvAddr(nsAddr);
+        c->subscribe(topic11);
+        c->setMessageListener(std::make_shared<L>(sink));
+        c->start();
+
+        const std::vector<MessageQueue> queues = c->fetchSubscribeMessageQueues(topic11);
+        check("S11-队列已分配", !queues.empty(), "queues=" + std::to_string(queues.size()));
+        if (!queues.empty()) {
+            const std::string key = DefaultMQPushConsumer::offsetKey(queues.front());
+            auto epochMs = [] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch()).count();
+            };
+
+            for (int i = 0; i < 3; ++i) {
+                producer.send(Message(topic11, str2bytes("heal-1-" + std::to_string(i))));
+            }
+            const bool base = waitUntil([&] { return sink.count() >= 3; }, 40000);
+            check("S11-基线：3 条被消费", base, "arrivals=" + std::to_string(sink.count()));
+
+            // 307 应答里必须看得见这个时刻（Java ProcessQueue.fillOutRunningInfo:456）；
+            // 写死 0 就等于把停摆判据的现场证据全丢了。
+            const int64_t injected = epochMs() - kPullMaxIdleTime - 5000;
+            c->setLastPullAt(key, injected);
+            std::string body;
+            try {
+                const Bytes encoded = c->consumerRunningInfo().encode();
+                body.assign(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+            } catch (const std::exception& e) {
+                body = std::string("threw: ") + e.what();
+            }
+            check("S11-运行信息把 lastPullTimestamp 报成真值",
+                  body.find("\"lastPullTimestamp\":" + std::to_string(injected)) != std::string::npos,
+                  "want=" + std::to_string(injected));
+            check("S11-倒拨超过 120s 即判停摆", c->pullStalled(key), "key=" + key);
+
+            c->syncPullThreads();   // Java updateProcessQueueTableInRebalance 的撤+建
+            const bool healed = waitUntil([&] {
+                const int64_t now = c->lastPullAt(key);
+                return now > injected && !c->pullStalled(key);
+            }, 30000);
+            check("S11-停摆队列被撤掉重建，新循环重新盖章", healed,
+                  "lastPullAt=" + std::to_string(c->lastPullAt(key)));
+
+            for (int i = 0; i < 3; ++i) {
+                producer.send(Message(topic11, str2bytes("heal-2-" + std::to_string(i))));
+            }
+            const bool resumed = waitUntil([&] { return sink.count() >= 6; }, 40000);
+            check("S11-自愈后同一个队列继续消费（重建不是空转）", resumed,
+                  "arrivals=" + std::to_string(sink.count()));
+
+            std::set<std::string> distinct;
+            int32_t redelivered = 0;
+            for (const Rec& r : sink.snapshot()) {
+                distinct.insert(r.body);
+                if (r.times >= 1) ++redelivered;
+            }
+            check("S11-6 条各只投一次（撤走前持久化了位点，重建后从 broker 续拉）",
+                  distinct.size() == 6 && redelivered == 0,
+                  "distinct=" + std::to_string(distinct.size())
+                      + " redelivered=" + std::to_string(redelivered));
+        }
+        c->shutdown();
     }
 
     producer.shutdown();

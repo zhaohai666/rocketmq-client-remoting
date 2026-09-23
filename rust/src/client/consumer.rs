@@ -109,6 +109,11 @@ pub const MAX_POP_INVISIBLE_TIME: i64 = 300000;
 /// 不可见时间越界时的回落值（Java `POP_HIDDEN_TIME_MAX/DEFAULT`）。
 pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 
+/// Java `ProcessQueue.PULL_MAX_IDLE_TIME`（系统属性 `rocketmq.client.pull.pullMaxIdleTime`，
+/// 默认 120000ms）：一条拉取/POP 循环超过这个时长没**发起**过拉取，rebalance 就认定它停摆，
+/// 主动撤掉并重建（`isPullExpired` 用严格 `>`）。
+pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
+
 // ================================================================ 队列与过滤工具
 
 /// 队列排序键，语义对齐 Java `MessageQueue.compareTo`：topic → brokerName → queueId。
@@ -257,9 +262,10 @@ pub trait MessageQueueListener: Send + Sync {
 pub struct PopProcessQueue {
     wait_ack_counter: AtomicI32,
     dropped: AtomicBool,
-    /// Python `last_pop_timestamp = time.time()`：**只写不读**（`consumer.py:276,1309`）。
-    /// Java 用它做过期清理，本项目没有那条清理路径，这里保留字段仅为了
-    /// 「最近一次弹出的时刻」在诊断时可见，单位换成毫秒。
+    /// Java `PopProcessQueue.lastPopTimestamp`：最近一次**发起**弹出的时刻（毫秒）。
+    /// Python 版只写不读（`consumer.py:276,1309`），这里补上了 Java 的两处读：
+    /// `isPopExpired`（超过 `PULL_MAX_IDLE_TIME` 判停摆，由 [`State::last_pull_at`] 承担）
+    /// 和 `ConsumerRunningInfo` 的运维视图。
     pub last_pop_timestamp: AtomicI64,
 }
 
@@ -551,6 +557,13 @@ struct State {
     queue_owners: BTreeMap<String, u64>,
     /// Python `_pop_queues`：队列 key -> [`PopProcessQueue`]。
     pop_queues: BTreeMap<String, Arc<PopProcessQueue>>,
+    /// Python `_last_pull_table`：每队列**最近一次发起**拉取/弹出的时刻（毫秒）。
+    ///
+    /// 对齐 Java `ProcessQueue.lastPullTimestamp` / `PopProcessQueue.lastPopTimestamp`：
+    /// 盖章发生在循环**发起**网络请求之前（`DefaultMQPushConsumerImpl.pullMessage:253` /
+    /// `popMessage:508`），所以长轮询挂起和流控等待都不会把还在跑的循环判成停摆。
+    /// 循环已退出但仍占着归属时写 `0`（Rust 任务没有 `is_alive()`，用这个哨兵表达「死了」）。
+    last_pull_at: BTreeMap<String, i64>,
 }
 
 impl State {
@@ -1165,6 +1178,9 @@ impl DefaultMQPushConsumer {
                 state.pop_queues.clear();
             }
             state.queue_owners.clear();
+            // Python `self._last_pull_table.clear()`：停机后残留的时刻会让下次
+            // start() 的自愈判定读到旧实例的盖章。
+            state.last_pull_at.clear();
         }
         if let Some(executor) = lock(&self.inner.pop_executor).take() {
             executor.shutdown();
@@ -1381,6 +1397,38 @@ impl DefaultMQPushConsumer {
         keys
     }
 
+    // ---------------- 拉取停摆自愈的可观测接缝 ----------------
+    //
+    // 与 C++/Python/.NET 三版一致地公开：真机验证脚本要能把时钟倒拨、触发一次
+    // rebalance，再确认「停摆的队列被撤掉重建、消息一条不重不丢」。这些判据本身
+    // 是内部状态，没有接缝就只能靠 sleep 120s 猜。
+
+    /// 该队列当前是否会被 rebalance 判成停摆（Java `isPullExpired`）。
+    pub fn pull_stalled(&self, key: &str) -> bool {
+        let state = lock(&self.inner.state);
+        pull_stalled_locked(&state, key, current_time_millis())
+    }
+
+    /// 最近一次发起拉取/弹出的时刻（毫秒）；`None` 表示这把队列没盖过章。
+    pub fn last_pull_at(&self, key: &str) -> Option<i64> {
+        lock(&self.inner.state).last_pull_at.get(key).copied()
+    }
+
+    /// 把盖章强行拨到某个时刻（验证用：等价于「这条循环已经 X 毫秒没动静了」）。
+    pub fn set_last_pull_at(&self, key: &str, millis: i64) {
+        lock(&self.inner.state)
+            .last_pull_at
+            .insert(key.to_string(), millis);
+    }
+
+    /// 立刻执行一次循环集合同步（等价于 rebalance 的那一步，验证用）。
+    ///
+    /// 刻意做成 `async`：收尾要发 RPC，在已经是 async 上下文的调用方里再 `block_on`
+    /// 会直接 panic。
+    pub async fn sync_pull_threads(&self) {
+        self.rebalance_pull_threads().await;
+    }
+
     // ---------------- 重平衡 ----------------
 
     /// Python `_all_queues_of_topic`（Java `RebalanceImpl.topicSubscribeInfoTable`）。
@@ -1514,6 +1562,14 @@ impl DefaultMQPushConsumer {
     /// 队列被撤走时必须 ①持久化已消费位点 ②丢弃缓冲（在途消息不再消费）
     /// ③顺序消费还要 UNLOCK_BATCH_MQ —— 少任何一步，被撤销队列里的在途消息会被
     /// 旧实例继续消费，与新属主重复。
+    ///
+    /// 三步顺序（撤 → 收尾 → 建）是刻意的：把收尾放在**起新循环之前**，否则新循环
+    /// 可能从旧循环最后持久化的位点之前开始拉，把已消费的消息再拉一遍（Java 在同一趟
+    /// `updateProcessQueueTableInRebalance` 里也是先 remove 再 build）。
+    ///
+    /// 第二步除了「不再归本实例」的队列，还要自愈 Java `isPullExpired` 那一条：仍归
+    /// 本实例、但拉取停摆超过 [`PULL_MAX_IDLE_TIME`]（或循环已经退出）的队列，撤掉重建，
+    /// 并打 Java 原样的 `[BUG]doRebalance ...` 错误日志。
     async fn rebalance_pull_threads(&self) {
         let pop = self.config().pop_mode;
         let current: BTreeMap<String, MessageQueue> = lock(&self.inner.state)
@@ -1523,8 +1579,35 @@ impl DefaultMQPushConsumer {
             .collect();
         let mut revoked: Vec<(MessageQueue, Option<i64>)> = Vec::new();
         let mut to_spawn: Vec<(MessageQueue, u64)> = Vec::new();
+        let group = self.consumer_group();
+        let now = current_time_millis();
         {
             let mut state = lock(&self.inner.state);
+            // ①撤：先收集，再统一摘干净（含停摆自愈）
+            let doomed: Vec<(String, Option<MessageQueue>)> = state
+                .queue_owners
+                .keys()
+                .filter_map(|key| {
+                    if !current.contains_key(key) {
+                        return Some((key.clone(), None));
+                    }
+                    if self.inner.started.load(Ordering::Acquire)
+                        && pull_stalled_locked(&state, key, now)
+                    {
+                        rmq_error!(
+                            "[BUG]doRebalance, {group}, try remove unnecessary mq, {key}, \
+                             because pull is pause, so try to fixed it"
+                        );
+                        return Some((key.clone(), current.get(key).cloned()));
+                    }
+                    None
+                })
+                .collect();
+            for (key, fallback) in doomed {
+                Self::retire_queue_locked(&mut state, &key, fallback.as_ref(), &mut revoked, pop);
+            }
+            // ②建（只登记归属与 token，真正把任务 spawn 出去要等 ③收尾之后）：
+            // 本轮不再拥有归属的队列（新分配 + 刚被自愈撤走的）都在这里重新接手
             for (key, mq) in &current {
                 if state.queue_owners.contains_key(key) {
                     continue;
@@ -1537,28 +1620,19 @@ impl DefaultMQPushConsumer {
                     .next_token
                     .fetch_add(1, Ordering::SeqCst);
                 state.queue_owners.insert(key.clone(), token);
+                // Python 在分配那一刻就把 `_mq_map[key] = mq` 登记好：队列即使一条消息都没
+                // 拉到，也要能在 307/220 里看到、位点也能持久化。
+                state.mq_map.insert(key.clone(), mq.clone());
+                // 新循环的第一次盖章由它自己在发起拉取时打；这里先给个起点，
+                // 免得刚建好就被下一轮 rebalance 误判成「从没盖过章 = 停摆」。
+                state.last_pull_at.insert(key.clone(), now);
                 to_spawn.push((mq.clone(), token));
             }
-            let stale: Vec<String> = state
-                .queue_owners
-                .keys()
-                .filter(|k| !current.contains_key(*k))
-                .cloned()
-                .collect();
-            for key in stale {
-                state.queue_owners.remove(&key); // 循环内检测到退出
-                state.pending.remove(&key);
-                state.lock_ok.remove(&key);
-                let off = state.consume_offsets.remove(&key);
-                state.offset_table.remove(&key);
-                let mq = state.mq_map.remove(&key);
-                if let Some(pq) = state.pop_queues.remove(&key) {
-                    pq.set_dropped(true);
-                }
-                if let Some(mq) = mq {
-                    revoked.push((mq, off));
-                }
-            }
+        }
+        // ②收尾：网络 RPC 必须在锁外，但也必须在 spawn **之前**await 完 —— 新循环起的瞬间
+        // 就去 broker 读起始位点，持久化没先落地它就会从旧位点重拉（Java 的撤在建之前，同理）。
+        if !revoked.is_empty() {
+            self.on_queues_revoked(&revoked).await;
         }
         let weak = Arc::downgrade(&self.inner);
         if let Some(handle) = self.runtime_handle() {
@@ -1580,8 +1654,34 @@ impl DefaultMQPushConsumer {
                     .push(task);
             }
         }
-        if !revoked.is_empty() {
-            self.on_queues_revoked(&revoked).await;
+    }
+
+    /// Python `_retire_queue_locked`：把一把队列的所有痕迹摘干净，并把它要持久化的
+    /// 已消费位点交给 `revoked` 列表。
+    ///
+    /// `fallback_mq` 是停摆自愈用的：队列仍在分配里（`mq_map` 不能留成脏），
+    /// 而真正被撤销的队列走 `mq_map` 反查即可。
+    fn retire_queue_locked(
+        state: &mut State,
+        key: &str,
+        fallback_mq: Option<&MessageQueue>,
+        revoked: &mut Vec<(MessageQueue, Option<i64>)>,
+        pop: bool,
+    ) {
+        state.queue_owners.remove(key); // 循环内下一轮 owns_queue 失效
+        state.pending.remove(key);
+        state.lock_ok.remove(key);
+        state.last_pull_at.remove(key); // 同名队列复用时不能继承旧时刻
+        let off = state.consume_offsets.remove(key);
+        state.offset_table.remove(key);
+        let mq = state.mq_map.remove(key).or_else(|| fallback_mq.cloned());
+        if pop {
+            if let Some(pq) = state.pop_queues.remove(key) {
+                pq.set_dropped(true);
+            }
+        }
+        if let Some(mq) = mq {
+            revoked.push((mq, off));
         }
     }
 
@@ -1713,11 +1813,61 @@ fn owns_queue(inner: &Inner, key: &str, token: u64) -> bool {
         .is_some_and(|t| *t == token)
 }
 
+/// Python 里循环入口的 `self._last_pull_table[key] = time.time()` +
+/// `pq.last_pop_timestamp = now`：在**发起**本轮拉取/弹出前盖章。
+///
+/// POP 模式下两处时间一起写：`_last_pull_table` 供 rebalance 判停摆，
+/// [`PopProcessQueue::last_pop_timestamp`] 供 `ConsumerRunningInfo` 的运维视图。
+fn stamp_pull_at(inner: &Inner, key: &str, pop: bool) {
+    let now = current_time_millis();
+    let pq = if pop {
+        lock(&inner.state).pop_queues.get(key).cloned()
+    } else {
+        None
+    };
+    lock(&inner.state).last_pull_at.insert(key.to_string(), now);
+    if let Some(pq) = pq {
+        pq.touch(now);
+    }
+}
+
+/// Python `_pull_stalled_locked`：仍归本实例、但拉取循环已经停摆的队列。
+///
+/// 三个判据，与 Java `isPullExpired` + Python 的线程存活检查一致：
+/// ① 从没盖过章（刚分配、还没跑到第一轮）不算停摆；② 哨兵 `0` = 循环已退出；
+/// ③ 超过 [`PULL_MAX_IDLE_TIME`] 才是停摆（严格 `>`，边界上不动）。
+fn pull_stalled_locked(state: &State, key: &str, now: i64) -> bool {
+    match state.last_pull_at.get(key) {
+        None => false,
+        Some(&0) => true,
+        Some(&began) => now - began > PULL_MAX_IDLE_TIME,
+    }
+}
+
+/// C++ `markPullLoopExited` 的等价物：循环**自己**退出时留下哨兵，
+/// 让下一轮 rebalance 把它当成停摆重建。仍在归属表里才写，否则说明已被撤走、
+/// 新属主已经接管，写 `0` 反而会误伤它。
+fn mark_pull_loop_exited(inner: &Inner, key: &str, token: u64) {
+    let mut state = lock(&inner.state);
+    if state.queue_owners.get(key).is_some_and(|t| *t == token) {
+        state.last_pull_at.insert(key.to_string(), 0);
+    }
+}
+
 /// Python `_queue_pull_loop`：单队列长轮询拉取 → 推入待消费缓冲。
 ///
 /// 每队列一个循环（不是共享线程池），因为 broker 为每个队列各挂起一个长轮询；
 /// 共用一个循环会让空队列的 ~15s 挂起阻塞其余队列的投递。
+///
+/// 这层壳只负责收尾：任务体无论从哪里 `return`，只要还占着归属就留下停摆哨兵，
+/// 下一轮 rebalance 会重建它（Python 靠 `thread.is_alive()`，tokio 任务没这个问法）。
 async fn queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
+    let key = mq_key(&mq);
+    run_queue_pull_loop(inner.clone(), mq, token).await;
+    mark_pull_loop_exited(&inner, &key, token);
+}
+
+async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let Ok(client) = require_client(&inner) else {
         return;
     };
@@ -1727,6 +1877,9 @@ async fn queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         if !owns_queue(&inner, &key, token) {
             return;
         }
+        // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖章，
+        // 在流控/订阅判定之前：判据是「这条循环还在跑」，不是「这轮真的打了网络」。
+        stamp_pull_at(&inner, &key, false);
         let sub = lock(&inner.state).subscription(&mq.topic).cloned();
         let Some(sub) = sub else { return };
         let cfg = read_cfg(&inner);
@@ -2217,6 +2370,12 @@ fn load_local_offsets(inner: &Inner) -> BTreeMap<String, i64> {
 /// 与拉取路径的关键差别：**不查也不提交消费位点**（进度由 broker 侧 checkpoint
 /// 跟踪，确认只靠 ack）；弹出即投递给消费线程；`POLLING_NOT_FOUND` 是正常态。
 async fn queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
+    let key = mq_key(&mq);
+    run_queue_pop_loop(inner.clone(), mq, token).await;
+    mark_pull_loop_exited(&inner, &key, token);
+}
+
+async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let Ok(client) = require_client(&inner) else {
         return;
     };
@@ -2246,6 +2405,8 @@ async fn queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         if pq.is_dropped() {
             return;
         }
+        // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起弹出即盖章，在流控判定之前。
+        stamp_pull_at(&inner, &key, true);
         let sub = match lock(&inner.state).subscription(&mq.topic).cloned() {
             Some(sub) => sub,
             None => return,
@@ -3285,7 +3446,14 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             ..Default::default()
         };
         let state = lock(&self.inner.state);
+        // POP 模式下弹出去 pop_queues（Java 的 popProcessQueueTable），classic 的
+        // processQueueTable 是空的 —— 两把表在 Java 里互斥，307 里也必须互斥：同一把队列
+        // 既进 mqTable 又进 mqPopTable 会让控制台把一路消费数成两路。mq_map 是"已分配"
+        // 注册表（自愈、位点持久化、220 重置都靠它），两种模式都写，所以按模式过滤而不是不写。
         for (key, mq) in &state.mq_map {
+            if cfg.pop_mode && state.pop_queues.contains_key(key) {
+                continue;
+            }
             let pqi = ProcessQueueInfo {
                 commit_offset: state.consume_offsets.get(key).copied().unwrap_or(0),
                 cached_msg_count: i32::try_from(
@@ -3293,6 +3461,9 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                 )
                 .unwrap_or(i32::MAX),
                 droped: false,
+                // Java ProcessQueue.fillOutRunningInfo:456 —— 运维靠这个字段判断
+                // 「队列还在不在拉」，rebalance 的自愈判据用的就是同一个时刻。
+                last_pull_timestamp: state.last_pull_at.get(key).copied().unwrap_or(0),
                 ..Default::default()
             };
             info.mq_table.push((
@@ -3320,6 +3491,9 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                 let pqi = ProcessQueueInfo {
                     cached_msg_count: pq.wait_ack_count(),
                     droped: pq.is_dropped(),
+                    // Java 的 pop 视图本没有这个字段（PopProcessQueue 不填），但运维上
+                    // 「上次弹出时间」正是停摆判据本身，这里如实暴露（Python 同样）。
+                    last_pull_timestamp: pq.last_pop_timestamp.load(Ordering::SeqCst),
                     ..Default::default()
                 };
                 info.mq_pop_table.push((
@@ -4526,5 +4700,329 @@ mod tests {
             consumer.locked_queue_keys(),
             vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]
         );
+    }
+
+    // ---------------- 拉取停摆自愈（Java `isPullExpired` / `PULL_MAX_IDLE_TIME`） ----------------
+
+    /// 直接种盖章，绕开真循环（本模块没有 `MQClientInstance`，循环一上来就会退出）。
+    fn stamp_at(consumer: &DefaultMQPushConsumer, key: &str, at: i64) {
+        lock(&consumer.inner.state)
+            .last_pull_at
+            .insert(key.to_string(), at);
+    }
+
+    fn stalled(consumer: &DefaultMQPushConsumer, key: &str, now: i64) -> bool {
+        let state = lock(&consumer.inner.state);
+        pull_stalled_locked(&state, key, now)
+    }
+
+    /// 让 consumer 看起来"已启动"，这样自愈判定才会参与 rebalance；
+    /// 但不注入 `MQClientInstance`，被撤队列的位点持久化会在这条路径上直接短路。
+    fn mark_started(consumer: &DefaultMQPushConsumer) {
+        consumer.inner.started.store(true, Ordering::SeqCst);
+    }
+
+    /// Java `ProcessQueue.PULL_MAX_IDLE_TIME` 默认值 + `isPullExpired` 的严格 `>` 边界。
+    #[test]
+    fn pull_idle_threshold_matches_java_and_is_strictly_greater() {
+        assert_eq!(PULL_MAX_IDLE_TIME, 120_000);
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let began = 1_700_000_000_000;
+
+        // 从没盖过章 = 刚分配、第一轮还没发起，不能被判停摆
+        assert!(!stalled(&consumer, &key, began + 10 * 60_000));
+        stamp_at(&consumer, &key, began);
+        assert!(!stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME - 1));
+        // 正好等于阈值：Java 用 `>` 而不是 `>=`，边界上不撤
+        assert!(!stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME));
+        assert!(stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME + 1));
+        // 哨兵 0 = 循环已退出（tokio 任务没有 `Thread.is_alive()` 可问）
+        stamp_at(&consumer, &key, 0);
+        assert!(stalled(&consumer, &key, 0));
+        // 逐队列独立：一把停摆不牵连另一把
+        let other = mq_key(&queue("T", "broker-a", 1));
+        stamp_at(&consumer, &other, began);
+        assert!(!stalled(&consumer, &other, began + 1000));
+    }
+
+    /// 盖章发生在**发起**拉取的那一刻（Java `pullMessage:253` / `popMessage:508`），
+    /// 而 POP 模式还要同步 `PopProcessQueue.lastPopTimestamp` —— Java 的
+    /// `isPullExpired` 在 pop 路径上读的就是它。
+    #[test]
+    fn stamping_marks_both_pop_clocks() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        let pq = PopProcessQueue::new();
+        pq.set_dropped(true); // 撤走过一次的队列，盖章不该把它复活
+        lock(&consumer.inner.state)
+            .pop_queues
+            .insert(key.clone(), pq.clone());
+        stamp_at(&consumer, &key, 0);
+        assert!(stalled(&consumer, &key, current_time_millis()));
+
+        stamp_pull_at(&consumer.inner, &key, true);
+        let popped = {
+            let state = lock(&consumer.inner.state);
+            assert!(!pull_stalled_locked(
+                &state,
+                &key,
+                current_time_millis()
+            ));
+            pq.last_pop_timestamp.load(Ordering::SeqCst)
+        };
+        assert!(current_time_millis() - popped < 5000);
+
+        // 循环退出留下哨兵，下一轮 rebalance 就能看见
+        lock(&consumer.inner.state)
+            .queue_owners
+            .insert(key.clone(), 42);
+        mark_pull_loop_exited(&consumer.inner, &key, 42);
+        assert_eq!(
+            lock(&consumer.inner.state).last_pull_at.get(&key).copied(),
+            Some(0)
+        );
+        // 归属已经换人时不能再写哨兵，否则会误伤新属主
+        let other = mq_key(&queue("T", "broker-a", 1));
+        stamp_at(&consumer, &other, 555);
+        lock(&consumer.inner.state)
+            .queue_owners
+            .insert(other.clone(), 7);
+        mark_pull_loop_exited(&consumer.inner, &other, 999); // 令牌对不上
+        assert_eq!(
+            lock(&consumer.inner.state).last_pull_at.get(&other).copied(),
+            Some(555)
+        );
+    }
+
+    /// `retire_queue_locked`：撤一把队列要把所有痕迹摘干净，并把已消费位点交给收尾路径。
+    #[test]
+    fn retiring_clears_every_trace_and_reports_the_offset_to_persist() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        let pq = PopProcessQueue::new();
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.queue_owners.insert(key.clone(), 7);
+            state.mq_map.insert(key.clone(), mq.clone());
+            state.pending.insert(key.clone(), VecDeque::new());
+            state.offset_table.insert(key.clone(), 99);
+            state.consume_offsets.insert(key.clone(), 42);
+            state.lock_ok.insert(key.clone());
+            state.last_pull_at.insert(key.clone(), 123);
+            state.pop_queues.insert(key.clone(), pq.clone());
+        }
+        let mut revoked = Vec::new();
+        let mut state = lock(&consumer.inner.state);
+        DefaultMQPushConsumer::retire_queue_locked(&mut state, &key, None, &mut revoked, true);
+        assert_eq!(revoked, vec![(mq.clone(), Some(42))]);
+        assert!(state.queue_owners.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(state.offset_table.is_empty());
+        assert!(state.consume_offsets.is_empty());
+        assert!(state.lock_ok.is_empty());
+        assert!(state.pop_queues.is_empty());
+        assert!(pq.is_dropped());
+        // 盖章必须一起清掉：同名队列复用时继承旧时刻会立刻被误判停摆
+        assert!(state.last_pull_at.is_empty());
+
+        // 队列不在 `mq_map` 里（停摆自愈：还归本实例，只是循环死了）走 fallback
+        let mut revoked = Vec::new();
+        state.mq_map.insert("gone".to_string(), mq.clone());
+        state.queue_owners.insert("gone".to_string(), 3);
+        DefaultMQPushConsumer::retire_queue_locked(
+            &mut state,
+            "gone",
+            Some(&mq),
+            &mut revoked,
+            false,
+        );
+        // 没有已消费位点就没什么可持久化，但队列仍要进收尾列表
+        assert_eq!(revoked, vec![(mq, None)]);
+        // 非 POP 模式不去碰 pop_queues（也不该凭空造一把）
+        assert!(state.pop_queues.is_empty());
+    }
+
+    /// 停摆的队列在**同一趟** rebalance 里被撤掉并重建（Java
+    /// `updateProcessQueueTableInRebalance` 的 remove + put 同一个 pass）。
+    #[tokio::test]
+    async fn a_stalled_queue_is_dropped_and_rebuilt_in_one_pass() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        mark_started(&consumer);
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        let before = current_time_millis();
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.assigned = vec![mq.clone()];
+            // 旧令牌故意用一个不会被重新发出的值，才能看出"归属确实换了"
+            state.queue_owners.insert(key.clone(), 999);
+            state.mq_map.insert(key.clone(), mq.clone());
+            state.consume_offsets.insert(key.clone(), 42);
+            state.pending.insert(key.clone(), VecDeque::from(vec![ext("T", None)]));
+            state.offset_table.insert(key.clone(), 7);
+            state
+                .last_pull_at
+                .insert(key.clone(), before - PULL_MAX_IDLE_TIME - 1000);
+        }
+        consumer.rebalance_pull_threads().await;
+        let state = lock(&consumer.inner.state);
+        // 换了归属令牌 = 旧循环失效、新循环接管
+        assert_ne!(state.queue_owners.get(&key).copied(), Some(999));
+        // 缓冲与游标全清：在途消息不再由旧循环消费
+        assert!(state.pending.is_empty());
+        assert!(state.offset_table.is_empty());
+        // 已消费位点交给收尾路径持久化（这里没有 client，只验它被摘了出来）
+        assert!(!state.consume_offsets.contains_key(&key));
+        // 队列对象仍登记着：自愈不该让订阅变得不可见
+        assert_eq!(state.mq_map.get(&key), Some(&mq));
+        // 新循环从"现在"重新计时，不会被下一轮立刻再判停摆
+        let seeded = *state.last_pull_at.get(&key).unwrap_or(&0);
+        assert!(
+            seeded >= before || seeded == 0,
+            "stamp should be reseeded, got {seeded} (before={before})"
+        );
+    }
+
+    /// 健康的队列必须**原封不动**：换令牌等于把在途消息丢掉。
+    #[tokio::test]
+    async fn a_healthy_queue_keeps_its_loop_and_offset() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        mark_started(&consumer);
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.assigned = vec![mq.clone()];
+            state.queue_owners.insert(key.clone(), 5);
+            state.mq_map.insert(key.clone(), mq.clone());
+            state.consume_offsets.insert(key.clone(), 42);
+            state.pending.insert(key.clone(), VecDeque::from(vec![ext("T", None)]));
+            state
+                .last_pull_at
+                .insert(key.clone(), current_time_millis());
+        }
+        consumer.rebalance_pull_threads().await;
+        let state = lock(&consumer.inner.state);
+        assert_eq!(state.queue_owners.get(&key).copied(), Some(5));
+        assert_eq!(state.pending.get(&key).map(VecDeque::len), Some(1));
+        assert_eq!(state.consume_offsets.get(&key).copied(), Some(42));
+    }
+
+    /// 未启动（含正在停机）时不做自愈：那会把清退过程变成 `[BUG]` 日志风暴，
+    /// 而且停摆判据本身在 `started=false` 下没有意义。
+    #[tokio::test]
+    async fn stalled_sweep_only_runs_while_started() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.assigned = vec![mq.clone()];
+            state.queue_owners.insert(key.clone(), 1);
+            state.mq_map.insert(key.clone(), mq.clone());
+        }
+        stamp_at(&consumer, &key, 1); // 老得不能再老
+        consumer.rebalance_pull_threads().await;
+        assert_eq!(
+            lock(&consumer.inner.state).queue_owners.get(&key).copied(),
+            Some(1)
+        );
+    }
+
+    /// POP 模式：自愈要换新 `PopProcessQueue`（Java `popProcessQueueTable` 重建），
+    /// 旧的标 dropped —— 否则在途批次还会被 ack，和新属主的批次重复。
+    #[tokio::test]
+    async fn pop_mode_swaps_the_process_queue_when_self_healing() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        mark_started(&consumer);
+        consumer.update_config(|c| c.pop_mode = true);
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        let old = PopProcessQueue::new();
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.assigned = vec![mq.clone()];
+            state.queue_owners.insert(key.clone(), 999);
+            state.mq_map.insert(key.clone(), mq.clone());
+            state.pop_queues.insert(key.clone(), old.clone());
+        }
+        stamp_at(&consumer, &key, current_time_millis() - PULL_MAX_IDLE_TIME - 1);
+        consumer.rebalance_pull_threads().await;
+        let state = lock(&consumer.inner.state);
+        assert!(old.is_dropped());
+        let fresh = state
+            .pop_queues
+            .get(&key)
+            .cloned()
+            .expect("rebuilt");
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert!(!fresh.is_dropped());
+        assert_ne!(state.queue_owners.get(&key).copied(), Some(999));
+    }
+
+    /// `ConsumerRunningInfo` 要如实报出 `lastPullTimestamp`（Java
+    /// `ProcessQueue.fillOutRunningInfo:456`），运维就是看这个字段判断停摆。
+    #[test]
+    fn running_info_publishes_the_pull_clock() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.mq_map.insert(key.clone(), mq.clone());
+        }
+        stamp_at(&consumer, &key, 1_700_000_000_456);
+        let info = consumer.consumer_running_info();
+        let pqi = &info.mq_table[0].1;
+        assert_eq!(
+            pqi.get("lastPullTimestamp"),
+            Some(&serde_json::Value::from(1_700_000_000_456_i64))
+        );
+        // 没盖过章的队列报 0，而不是拿当前时间冒充"还在拉"
+        let other = queue("T", "broker-a", 1);
+        lock(&consumer.inner.state)
+            .mq_map
+            .insert(mq_key(&other), other.clone());
+        let info = consumer.consumer_running_info();
+        let pqi = &info.mq_table[1].1;
+        assert_eq!(pqi.get("lastPullTimestamp"), Some(&serde_json::Value::from(0)));
+    }
+
+    /// POP 的运维视图暴露 `lastPopTimestamp`（Java 的 pop 视图本没有这个字段，
+    /// 与 Python 一致地补上）。
+    #[test]
+    fn pop_running_info_publishes_the_pop_clock() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.pop_mode = true);
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        let pq = PopProcessQueue::new();
+        pq.touch(1_700_000_000_789);
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.assigned = vec![mq.clone()];
+            state.pop_queues.insert(key.clone(), pq);
+        }
+        let info = consumer.consumer_running_info();
+        assert_eq!(info.mq_pop_table.len(), 1);
+        assert_eq!(
+            info.mq_pop_table[0].1.get("lastPullTimestamp"),
+            Some(&serde_json::Value::from(1_700_000_000_789_i64))
+        );
+    }
+
+    /// 停机要把盖章表清空：下次 start() 不能继承旧实例的时刻。
+    #[test]
+    fn shutdown_clears_the_pull_clock() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        mark_started(&consumer);
+        let key = mq_key(&queue("T", "broker-a", 0));
+        stamp_at(&consumer, &key, 123);
+        consumer.shutdown();
+        assert!(lock(&consumer.inner.state).last_pull_at.is_empty());
+        assert!(lock(&consumer.inner.state).queue_owners.is_empty());
     }
 }

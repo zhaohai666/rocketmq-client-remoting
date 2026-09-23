@@ -69,6 +69,20 @@ public sealed class PopProcessQueue
     private int _waitAckCounter;
     private volatile bool _dropped;
 
+    /// <summary>Java <c>PopProcessQueue.lastPopTimestamp</c>：最近一次**发起**弹出的时刻（毫秒），
+    /// 字段初始值同样是"现在"。Java 的 <c>isPullExpired</c> 在 pop 路径上读的就是它，
+    /// 所以这里不能只写不读。</summary>
+    private long _lastPopTimestamp = UtilAll.CurrentTimeMillis();
+
+    /// <summary>Java <c>getLastPopTimestamp()</c>。</summary>
+    public long LastPopTimestamp => Interlocked.Read(ref _lastPopTimestamp);
+
+    /// <summary>Java <c>setLastPopTimestamp(long)</c>。</summary>
+    public void Touch(long timestampMillis)
+    {
+        Interlocked.Exchange(ref _lastPopTimestamp, timestampMillis);
+    }
+
     public void IncFoundMsg(int n)
     {
         lock (_lock) { _waitAckCounter += n; }
@@ -436,6 +450,14 @@ public sealed class DefaultMQPushConsumer
     private Thread? _lockThread;
     private Thread? _rebalanceThread;
     private readonly Dictionary<string, Thread> _pullThreads = new(StringComparer.Ordinal);
+    // 队列 key -> 最近一次**发起**拉取/弹出的时刻（毫秒）。对齐 Java
+    // ProcessQueue.lastPullTimestamp / PopProcessQueue.lastPopTimestamp：rebalance 用它判
+    // 这条循环是不是停摆了（PullMaxIdleTime），307 也把它如实报出去。
+    private readonly Dictionary<string, long> _lastPullAt = new(StringComparer.Ordinal);
+    /// <summary>Java <c>ProcessQueue.PULL_MAX_IDLE_TIME</c>（系统属性
+    /// <c>rocketmq.client.pull.pullMaxIdleTime</c>，默认 120000ms）：超过它就判停摆，
+    /// 用严格 <c>&gt;</c>。</summary>
+    private const long PullMaxIdleTime = 120000;
     // 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
     private readonly Dictionary<string, PopProcessQueue> _popQueues = new(StringComparer.Ordinal);
 
@@ -1057,6 +1079,12 @@ public sealed class DefaultMQPushConsumer
         }
 
         _pullThreads.Clear();
+        // 停机后残留的盖章会让下次 Start() 的自愈判定读到旧实例的时刻
+        lock (_lock)
+        {
+            _lastPullAt.Clear();
+        }
+
         JoinIfAlive(_dispatchThread);
         JoinIfAlive(_persistThread);
         JoinIfAlive(_lockThread);
@@ -1283,6 +1311,285 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 消费循环 ----------------
     private bool IsOrderly() => _messageListener is not null && _messageListener.Orderly();
 
+    /// <summary>本线程是否仍是该队列的属主（Python <c>_owns_queue</c> / C++ 的归属令牌）。
+    /// 必须持 <c>_lock</c> 调用。</summary>
+    /// <remarks>Java 用 <c>ProcessQueue</c> 对象本身表达这件事（一次拉取请求绑一把队列对象，
+    /// 撤走时 <c>setDropped(true)</c>，请求回来见到就丢弃批次）。.NET 没有 per-queue 的
+    /// classic ProcessQueue，所以拿"登记在表里的线程是不是我自己"当等价物：
+    /// 自愈重建时旧线程即便还挂在长轮询上，回来后也会认输，不会和新线程同时服务一把队列。</remarks>
+    private bool OwnsQueueLocked(string key)
+    {
+        return _pullThreads.TryGetValue(key, out Thread? t) && ReferenceEquals(t, Thread.CurrentThread);
+    }
+
+    /// <summary>只在仍属主时摘除登记，避免把新属主的条目删掉。</summary>
+    private void UnregisterOwnLoop(string key)
+    {
+        lock (_lock)
+        {
+            if (OwnsQueueLocked(key))
+            {
+                _pullThreads.Remove(key);
+            }
+        }
+    }
+
+    /// <summary>发起本轮拉取/弹出前盖章（Java <c>pullMessage:253</c> / <c>popMessage:508</c>：
+    /// 盖章在流控与挂起**之前**，判据是"这条循环还在跑"，不是"这轮真的打了网络"）。</summary>
+    private void StampPullAt(string key, bool pop)
+    {
+        long now = UtilAll.CurrentTimeMillis();
+        PopProcessQueue? pq = null;
+        lock (_lock)
+        {
+            _lastPullAt[key] = now;
+            if (pop)
+            {
+                _popQueues.TryGetValue(key, out pq);
+            }
+        }
+
+        pq?.Touch(now);
+    }
+
+    /// <summary>Java <c>ProcessQueue.isPullExpired</c> + Python 的线程存活检查：两种都算停摆
+    /// —— 登记过的循环线程已经不在了（异常穿透），或还在但超过 <see cref="PullMaxIdleTime"/>
+    /// 没发起过拉取。从没盖过章（刚分配）不算停摆。</summary>
+    private bool PullStalledLocked(string key, long now)
+    {
+        if (!_lastPullAt.TryGetValue(key, out long began))
+        {
+            return false;
+        }
+
+        if (now - began > PullMaxIdleTime)
+        {
+            return true;
+        }
+
+        return !(_pullThreads.TryGetValue(key, out Thread? t) && t is not null && t.IsAlive);
+    }
+
+    /// <summary>停摆自愈（Java <c>updateProcessQueueTableInRebalance:438-461</c>）：队列仍分给
+    /// 本实例、但拉取循环已经停摆 → 撤销它并交位点，让本轮后面的
+    /// <see cref="RebalancePullThreads"/> 原地重建。</summary>
+    private void SweepStalledLoopsLocked(Dictionary<string, MessageQueue> current,
+                                         List<RetiredQueue> retired)
+    {
+        if (!_started || _stop)
+        {
+            // 停机过程中循环本来就在退出，别把清退变成 [BUG] 日志风暴
+            return;
+        }
+
+        long now = UtilAll.CurrentTimeMillis();
+        List<string> stalled = new();
+        foreach (string key in _pullThreads.Keys)
+        {
+            if (current.ContainsKey(key) && PullStalledLocked(key, now))
+            {
+                stalled.Add(key);
+            }
+        }
+
+        foreach (string key in stalled)
+        {
+            ClientLog.Error("[BUG]doRebalance, " + ConsumerGroup
+                            + ", try remove unnecessary mq, " + key
+                            + ", because pull is pause, so try to fixed it");
+            if (current.TryGetValue(key, out MessageQueue? mq) && mq is not null)
+            {
+                RetireQueueLocked(key, mq, retired);
+            }
+        }
+    }
+
+    /// <summary>一把被撤队列的收尾材料：队列对象 + 需要持久化的已消费位点（可能压根没有）。</summary>
+    private sealed record RetiredQueue(string Key, MessageQueue Mq, long ConsumeOffset, bool HadOffset);
+    /// <summary>撤掉一把队列在本实例里的所有痕迹（Python <c>_retire_queue_locked</c>）：
+    /// 线程登记、盖章、缓冲、两张位点表、锁状态、POP 队列一起摘掉，并把要持久化的
+    /// 已消费位点交给调用方的 <paramref name="retired"/>。</summary>
+    private void RetireQueueLocked(string key, MessageQueue mq, List<RetiredQueue> retired)
+    {
+        _pullThreads.Remove(key);   // 旧循环回来会发现属主已换 → 丢弃批次并退出
+        _lastPullAt.Remove(key);    // 同名队列复用不能继承旧时刻
+        _pending.Remove(key);
+        _offsetTable.Remove(key);
+        _lockOk.Remove(key);
+        _mqMap.Remove(key);
+        if (_popQueues.TryGetValue(key, out PopProcessQueue? pq))
+        {
+            pq.SetDropped(true);
+            _popQueues.Remove(key);
+        }
+
+        bool had = _consumeOffsetTable.TryGetValue(key, out long consumeOffset);
+        _consumeOffsetTable.Remove(key);
+        retired.Add(new RetiredQueue(key, mq, consumeOffset, had));
+        _retiredForTest.Add(new RetiredForTest(key, mq, consumeOffset, had));
+    }
+
+    /// <summary>单测专用：把已消费位点直接写进表（真实路径由 ConsumeBatch 推进，那需要先跑循环）。
+    /// 撤走队列时必须把这个位点交出去持久化，否则重建后从 broker 的旧位点重投。</summary>
+    public void SetConsumeOffsetForTest(string key, long offset)
+    {
+        lock (_lock)
+        {
+            _consumeOffsetTable[key] = offset;
+        }
+    }
+
+    /// <summary>单测专用：占住一把队列的 PopProcessQueue 并返回它，用于断言
+    /// 「自愈会把在途批次 setDropped，并换一具干净的队列缓冲」。</summary>
+    public PopProcessQueue RegisterPopQueueForTest(string key)
+    {
+        var pq = new PopProcessQueue();
+        lock (_lock)
+        {
+            _popQueues[key] = pq;
+        }
+
+        return pq;
+    }
+
+    /// <summary>单测专用：该队列当前挂着的 PopProcessQueue（自愈重建后应当是新的一具）。</summary>
+    public PopProcessQueue? PopQueueForTest(string key)
+    {
+        lock (_lock)
+        {
+            return _popQueues.TryGetValue(key, out PopProcessQueue? pq) ? pq : null;
+        }
+    }
+
+    // ---------------- 拉取停摆自愈的可观测接缝 ----------------
+    //
+    // 与 C++/Python/Rust 三版一致地公开（测试工程没有 InternalsVisibleTo，故用 public，
+    // 勿用于业务代码）：验证脚本要能把时钟倒拨、触发一次同步，再确认「停摆的队列被撤掉
+    // 重建、消息一条不重不丢」。没有接缝就只能 sleep 满 120s 去猜。
+
+    /// <summary>Java <c>ProcessQueue.PULL_MAX_IDLE_TIME</c> 的生效值。</summary>
+    public static long PullMaxIdleTimeMillis => PullMaxIdleTime;
+
+    /// <summary>该队列现在是否会被 rebalance 判成停摆。</summary>
+    public bool PullStalled(string key)
+    {
+        lock (_lock)
+        {
+            return PullStalledLocked(key, UtilAll.CurrentTimeMillis());
+        }
+    }
+
+    /// <summary>单测专用：把判据的时钟交给调用方。真实时钟下"正好等于 120s"这条边界
+    /// 无法稳定断言（读表与比较之间总会推进几毫秒），而 Java 用的是严格 <c>&gt;</c>，
+    /// 差一个字符的写法（<c>&gt;=</c>）只能靠注入时钟锁死。</summary>
+    public bool PullStalledForTest(string key, long now)
+    {
+        lock (_lock)
+        {
+            return PullStalledLocked(key, now);
+        }
+    }
+
+    /// <summary>最近一次发起拉取/弹出的时刻（毫秒）；<c>-1</c> = 没有记录。</summary>
+    public long LastPullAt(string key)
+    {
+        lock (_lock)
+        {
+            return _lastPullAt.TryGetValue(key, out long t) ? t : -1;
+        }
+    }
+
+    /// <summary>把盖章拨到指定时刻（验证用：等价于"这条循环已经 X 毫秒没动静了"）。</summary>
+    public void SetLastPullAt(string key, long millis)
+    {
+        lock (_lock)
+        {
+            _lastPullAt[key] = millis;
+        }
+    }
+
+    /// <summary>该队列当前有没有拉取/弹出循环在登记（自愈后必须换一个）。</summary>
+    public bool HasPullLoop(string key)
+    {
+        lock (_lock)
+        {
+            return _pullThreads.ContainsKey(key);
+        }
+    }
+
+    /// <summary>单测专用：一次撤走的完整收尾材料。<see cref="SweepStalledLoopsForTest"/>
+    /// 只返回"撤了几把"，锁不住撤走的**内容**（位点有没有带走、是不是撤错了队列）。</summary>
+    public sealed record RetiredForTest(string Key, MessageQueue Mq, long ConsumeOffset, bool HadOffset);
+
+    private readonly List<RetiredForTest> _retiredForTest = new();
+
+    public IReadOnlyList<RetiredForTest> RetiredQueuesForTest()
+    {
+        lock (_lock)
+        {
+            return _retiredForTest.ToList();
+        }
+    }
+
+    public void ClearRetiredForTest()
+    {
+        lock (_lock)
+        {
+            _retiredForTest.Clear();
+        }
+    }
+
+    /// <summary>跑一次停摆清扫，返回撤掉的队列数（验证/单测用）。</summary>
+    public int SweepStalledLoopsForTest(IEnumerable<MessageQueue> current)
+    {
+        var dict = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in current)
+        {
+            dict[OffsetKey(mq)] = mq;
+        }
+
+        var retired = new List<RetiredQueue>();
+        lock (_lock)
+        {
+            SweepStalledLoopsLocked(dict, retired);
+        }
+
+        return retired.Count;
+    }
+
+    /// <summary>把"已启动"标志拨成指定值（只喂给单测：真实 Start 会做网络注册）。</summary>
+    public void SetStartedForTest(bool started)
+    {
+        _started = started;
+    }
+
+    /// <summary>给某把队列登记一条占位循环线程（单测用）：<paramref name="alive"/>=false 时
+    /// 是一条"从未启动/已退出"的线程，正好触发 Java 侧 <c>isAlive</c> 那一半判据。
+    /// 活着的占位线程由 <see cref="ReleaseTestLoops"/> 统一放行。</summary>
+    public void RegisterLoopForTest(string key, bool alive)
+    {
+        Thread t = MakeThread("PullMessageService", () => _testLoopGate.Wait());
+        lock (_lock)
+        {
+            _pullThreads[key] = t;
+        }
+
+        if (alive)
+        {
+            t.Start();
+        }
+
+        // !alive 时不 Start：Thread 对象存在但 IsAlive=false，等价于线程已退出
+    }
+
+    /// <summary>释放 <see cref="RegisterLoopForTest"/> 起的占位线程，让单测不遗留活线程。</summary>
+    public void ReleaseTestLoops()
+    {
+        _testLoopGate.Set();
+    }
+
+    private readonly ManualResetEventSlim _testLoopGate = new(false);
+
     private void RebalancePullThreads()
     {
         List<MessageQueue> queues = AssignedQueues();
@@ -1293,13 +1600,19 @@ public sealed class DefaultMQPushConsumer
         }
 
         List<KeyValuePair<string, MessageQueue>> toStart = new();
+        long beganAt;
         lock (_lock)
         {
+            beganAt = UtilAll.CurrentTimeMillis();
             foreach (KeyValuePair<string, MessageQueue> kv in current)
             {
                 if (!_pullThreads.ContainsKey(kv.Key))
                 {
                     toStart.Add(kv);
+                    // 分配那一刻就登记队列对象与起点时刻：一条消息都没拉到的队列也要能在
+                    // 307/220 里看到、位点也能持久化；不种时刻的话下一轮 rebalance 无从判断。
+                    _mqMap[kv.Key] = kv.Value;
+                    _lastPullAt[kv.Key] = beganAt;
                 }
             }
         }
@@ -1332,23 +1645,27 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>broker 通知本消费组实例上下线（NOTIFY_CONSUMER_IDS_CHANGED=40）。对应 Java
-    /// ClientRemotingProcessor → rebalanceImmediately：置标记唤醒自己的 rebalance 线程，
-    /// 避免等下个 20s 周期。</summary>
-    /// <remarks>⚠ 本回调在 **remoting 读线程**上执行（RemotingClient 的分发路径）。这里**绝不能**
-    /// 同步调用 DoRebalance()：它内部会做阻塞式 invokeSync（GET_CONSUMER_LIST_BY_GROUP、心跳），
-    /// 而响应只能由**同一个读线程**投递 —— 读线程阻塞在自己发起的同步调用上必然自死锁，直到
-    /// invokeTimeout（实测 5s 超时、日志出现 "no consumer id list ..., keep current"，
-    /// 并连带把其它请求的响应一起卡住）。只置标志、交给 RebalanceThread 去算即可，
-    /// 与 C++ 侧只置 rebalanceNow_ 标志、Java 侧 rebalanceImmediately() 的语义一致。</remarks>
-    /// <summary>
-    /// 实例收到 broker 的 40 通知后叫醒本消费者的重平衡线程
+    /// <summary>实例收到 broker 的 40 通知后叫醒本消费者的重平衡线程
     /// （对应 Java MQClientInstance#rebalanceImmediately → RebalanceService#wakeup）。
-    /// 跑在 remoting 读线程上：只置位，不发 RPC、不做重活。
-    /// </summary>
+    /// 跑在 remoting 读线程上：只置位，不发 RPC、不做重活。</summary>
+    /// <remarks>⚠ 这里**绝不能**同步调用 DoRebalance()：它内部会做阻塞式 invokeSync
+    /// （GET_CONSUMER_LIST_BY_GROUP、心跳），而响应只能由**同一个读线程**投递 ——
+    /// 读线程阻塞在自己发起的同步调用上必然自死锁，直到 invokeTimeout
+    /// （实测 5s 超时、日志出现 "no consumer id list ..., keep current"，
+    /// 并连带把其它请求的响应一起卡住）。只置标志、交给 RebalanceThread 去算即可，
+    /// 与 C++ 侧只置 rebalanceNow_ 标志的语义一致。</remarks>
     private void WakeRebalanceLoop()
     {
         _rebalanceNow.Set();
+    }
+
+    /// <summary>真机验证专用：叫醒重平衡线程，等价于 broker 推来的
+    /// <c>NOTIFY_CONSUMER_IDS_CHANGED(40)</c>（同样只置位，真正的 rebalance 由
+    /// 重平衡线程去做，见 <see cref="WakeRebalanceLoop"/>）。注入停摆之后要等
+    /// 20s 周期才能观察到自愈，没这颗事件就只能 sleep 赌。</summary>
+    public void WakeupRebalanceForTest()
+    {
+        WakeRebalanceLoop();
     }
 
     private RemotingCommand? OnGetConsumerRunningInfo(RemotingCommand cmd, string addr)
@@ -1530,12 +1847,25 @@ public sealed class DefaultMQPushConsumer
 
             foreach (var kv in _mqMap)
             {
+                // POP 模式下弹出去 _popQueues（Java 的 popProcessQueueTable），classic 的
+                // processQueueTable 是空的 —— 两把表在 Java 里互斥，307 里也必须互斥：同一把
+                // 队列既进 mqTable 又进 mqPopTable 会让控制台把一路消费数成两路。
+                // _mqMap 是"已分配"注册表（自愈、位点持久化都靠它），两种模式都写，所以按模式过滤。
+                if (PopMode && _popQueues.ContainsKey(kv.Key))
+                {
+                    continue;
+                }
+
                 string mqKey = MessageQueueKeys.MessageQueueKey(kv.Value);
                 long commitOffset = _consumeOffsetTable.TryGetValue(kv.Key, out long co) ? co : 0;
                 int cachedMsgCount = _pending.TryGetValue(kv.Key, out Queue<MessageExt>? q)
                     ? q.Count
                     : 0;
-                info.MqTable.Set(mqKey, MakeProcessQueueInfo(commitOffset, cachedMsgCount, droped: false));
+                // Java ProcessQueue.fillOutRunningInfo:456 —— 运维看这个字段判断"还在不在拉"，
+                // rebalance 的停摆自愈用的就是同一个时刻。
+                long lastPull = _lastPullAt.TryGetValue(kv.Key, out long lpt) ? lpt : 0;
+                info.MqTable.Set(mqKey, MakeProcessQueueInfo(commitOffset, cachedMsgCount,
+                    droped: false, lastPullTimestamp: lastPull));
             }
 
             if (PopMode)
@@ -1548,7 +1878,10 @@ public sealed class DefaultMQPushConsumer
                     }
 
                     info.MqPopTable.Set(MessageQueueKeys.MessageQueueKey(mq),
-                        MakeProcessQueueInfo(0, kv.Value.WaitAckCount(), kv.Value.IsDropped()));
+                        MakeProcessQueueInfo(0, kv.Value.WaitAckCount(), kv.Value.IsDropped(),
+                            // Java 的 pop 视图本没有这个字段（PopProcessQueue 不填），但
+                            // lastPopTimestamp 正是停摆判据本身，如实暴露（与 Python 一致）。
+                            lastPullTimestamp: kv.Value.LastPopTimestamp));
                 }
             }
         }
@@ -1748,7 +2081,8 @@ public sealed class DefaultMQPushConsumer
         return result;
     }
 
-    private static JsonValue MakeProcessQueueInfo(long commitOffset, long cachedMsgCount, bool droped)
+    private static JsonValue MakeProcessQueueInfo(long commitOffset, long cachedMsgCount, bool droped,
+                                                  long lastPullTimestamp = 0)
     {
         // ProcessQueueInfo 全字段（Java body.ProcessQueueInfo；"droped" 拼写照抄）
         var pqi = JsonValue.MakeObject();
@@ -1764,7 +2098,7 @@ public sealed class DefaultMQPushConsumer
         pqi.Set("tryUnlockTimes", JsonValue.MakeInt(0));
         pqi.Set("lastLockTimestamp", JsonValue.MakeInt(0));
         pqi.Set("droped", JsonValue.MakeBool(droped));
-        pqi.Set("lastPullTimestamp", JsonValue.MakeInt(0));
+        pqi.Set("lastPullTimestamp", JsonValue.MakeInt(lastPullTimestamp));
         pqi.Set("lastConsumeTimestamp", JsonValue.MakeInt(0));
         return pqi;
     }
@@ -1842,21 +2176,29 @@ public sealed class DefaultMQPushConsumer
         string key = OffsetKey(mq);
         while (!_stop && _started)
         {
-            // 队列已被 rebalance 撤销（isDropped）：退出线程并摘除自身（对齐 Java
-            // ProcessQueue.isDropped → pull 线程停止服务该队列）。
+            // 队列已被 rebalance 撤销（isDropped）**或**已不再由本线程服务（自愈重建换了
+            // 线程）：退出，不再为该队列拉取。
             bool dropped;
+            bool owns;
             lock (_lock)
             {
                 dropped = _dropped.Contains(key);
+                owns = OwnsQueueLocked(key);
             }
-            if (dropped)
+
+            if (dropped || !owns)
             {
-                lock (_lock)
+                if (dropped)
                 {
-                    _pullThreads.Remove(key);
+                    UnregisterOwnLoop(key);
                 }
+
                 return;
             }
+
+            // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖章，在
+            // 流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
+            StampPullAt(key, pop: false);
 
             SubscriptionData sub;
             lock (_lock)
@@ -1970,13 +2312,22 @@ public sealed class DefaultMQPushConsumer
                 continue;
             }
 
-            // 长轮询返回后再次确认：若期间被撤销，丢弃本批消息并退出（对齐 Java
-            // ProcessQueue.isDropped 守卫——拉到的消息不再进入缓冲）。
+            // 长轮询返回后再次确认：若期间被撤销或本线程已被自愈换下，丢弃本批消息并退出
+            // （对齐 Java ProcessQueue.isDropped 守卫——拉到的消息不再进入缓冲）。
             lock (_lock)
             {
                 if (_dropped.Contains(key))
                 {
-                    _pullThreads.Remove(key);
+                    if (OwnsQueueLocked(key))
+                    {
+                        _pullThreads.Remove(key);
+                    }
+
+                    return;
+                }
+
+                if (!OwnsQueueLocked(key))
+                {
                     return;
                 }
             }
@@ -2073,7 +2424,21 @@ public sealed class DefaultMQPushConsumer
 
         while (!_stop && _started)
         {
-            if (_dropped.Contains(key)) return;
+            bool owns;
+            lock (_lock)
+            {
+                owns = !_dropped.Contains(key) && OwnsQueueLocked(key);
+            }
+
+            if (!owns)
+            {
+                UnregisterOwnLoop(key);
+                return;
+            }
+
+            // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起弹出即盖章（在流控之前），
+            // PopProcessQueue.lastPopTimestamp 与拉取时刻表一起写，Java 的停摆判据读的就是它。
+            StampPullAt(key, pop: true);
             PopProcessQueue? pq;
             SubscriptionData? sub;
             lock (_lock)
@@ -2112,11 +2477,22 @@ public sealed class DefaultMQPushConsumer
                 continue;
             }
 
-            // 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
+            // 弹出后队列被 rebalance 撤走（或本线程已被自愈换下）：这一批**既不消费也不 ack**
             // （Java 对应 PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
             // broker 自动复活重投给新属主。
-            if (_dropped.Contains(key) || pq.IsDropped())
+            bool discarded;
+            lock (_lock)
             {
+                discarded = _dropped.Contains(key) || !OwnsQueueLocked(key);
+            }
+
+            if (discarded || pq.IsDropped())
+            {
+                if (discarded)
+                {
+                    UnregisterOwnLoop(key);
+                }
+
                 ClientLog.Debug("queue " + key + " revoked during pop, discard "
                                 + result.MsgFoundList.Count + " messages un-acked");
                 return;
@@ -3105,9 +3481,19 @@ public sealed class DefaultMQPushConsumer
         // 在途/缓冲消息、解除顺序锁（orderly+clustering），并在 _dropped 打标记让 pull 线程
         // 长轮询返回后丢弃批次并退出。绝不能直接丢弃位点——否则重分配后从 0 重投。
         var assignedKeys = new HashSet<string>(StringComparer.Ordinal);
+        var current = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
         foreach (MessageQueue mq in assigned)
         {
             assignedKeys.Add(OffsetKey(mq));
+            current[OffsetKey(mq)] = mq;
+        }
+
+        // 停摆自愈（Java isPullExpired / PopProcessQueue.isPullExpired）：同一趟里还要撤掉
+        // "仍归本实例、但拉取循环已经停摆"的队列，交给后面的 RebalancePullThreads 原地重建。
+        List<RetiredQueue> healed = new();
+        lock (_lock)
+        {
+            SweepStalledLoopsLocked(current, healed);
         }
 
         // 重新分配给本实例的队列清除撤销标记（可能上轮被撤销、本轮又分回），否则 pull 线程
@@ -3189,6 +3575,52 @@ public sealed class DefaultMQPushConsumer
 
             ClientLog.Info("rebalance: revoked " + revoked.Count.ToString(CultureInfo.InvariantCulture)
                 + " queue(s), current assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // 自愈撤下的队列：位点必须在**重建之前**落盘（和上面的真撤销同一口径），否则新循环
+        // 会从更早的游标重拉，把已消费的消息再投一遍。顺序消费还要解锁，不然新属主抢不到锁。
+        if (healed.Count > 0)
+        {
+            bool healOrderly = IsOrderly();
+            bool healBroadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
+            MQClientInstance? healClient = _mqClient;
+            var healUnlockList = new List<MessageQueue>();
+            foreach (RetiredQueue r in healed)
+            {
+                if (healBroadcast || healClient is null)
+                {
+                    continue;
+                }
+
+                if (r.HadOffset)
+                {
+                    try
+                    {
+                        healClient.UpdateConsumerOffset(ConsumerGroup, r.Mq, r.ConsumeOffset);
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Debug("persist offset on self-heal failed for " + r.Mq + ": " + e.Message);
+                    }
+                }
+
+                if (healOrderly)
+                {
+                    healUnlockList.Add(r.Mq);
+                }
+            }
+
+            if (healUnlockList.Count > 0 && healClient is not null)
+            {
+                try
+                {
+                    healClient.UnlockBatchMq(ConsumerGroup, _clientId, healUnlockList);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("unlock on self-heal failed: " + e.Message);
+                }
+            }
         }
 
         // 新分配的队列**立刻**解析初始位点写入 offset 表（对齐 Java

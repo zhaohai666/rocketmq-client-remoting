@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 31 个用例，2994 项断言（2921 + interop 73），~29s
+cd build && ctest --output-on-failure     # 32 个用例，3006 项断言（31 个测试二进制 2933 + interop 73），~42s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -90,6 +90,7 @@ cd build && ctest --output-on-failure     # 31 个用例，2994 项断言（2921
 | `pop_consumer` | 47 | POP 消费循环：`ackIndex` 默认值、不可见时间内的 ack 与复活重投、`checkNeedAckOrDelay` 边界钳制 |
 | `consume_ack_index` | 28 | classic 并发消费的 `ackIndex` 切分（Java `processConsumeResult:207-269`）：默认 `Integer.MAX_VALUE` 整批认可不回投、listener 收窄到 0 时尾巴逐条 `sendMessageBack`、`RECONSUME_LATER` 强制 `ackIndex=-1` 整批回投、广播模式不回投、**回投失败时塞回队首且位点不越过它**（未 `start()` 的消费者回投必定失败，所以离线锁的是失败分支；「回投成功 → 位点整批前进」由 `rmq_live_redelivery` 的 S10 在真机上取证） |
 | `trace` | 92 | 消息轨迹：与 Java 官方实现的**逐字节对拍**（Pub / SubBefore / SubAfter / EndTransaction / Recall）+ 编解码双向 + 无 keys 空段容错 + 坏记录隔离 + 分发器分组/切块 |
+| `pull_expired` | 12 | 拉取循环停摆自愈（Java `ProcessQueue.PULL_MAX_IDLE_TIME` = **120000ms**，读 `rocketmq.client.pull.pullMaxIdleTime`；判据在 `RebalanceImpl.updateProcessQueueTableInRebalance:438-461`）：阈值逐字锁死、判据是**严格大于**（正好 120s 不算停摆）、没盖过章的新循环不算、循环线程已退出即刻算（不等满阈值）、健康队列一律不动（换线程等于丢在途重投）、撤走时持久化已消费位点并丢掉拉取游标与缓冲、分配即登记 `mqMap`（否则撤时无 mq 可持久化）、POP 分支读 `lastPopTimestamp` 且 `setDropped` + 换一具干净的 `PopProcessQueue`、停机期间不判停摆（否则刷一堆假 `[BUG]` 日志）、307 运行信息把 `lastPullTimestamp` 报成盖章节的真时刻、且 **`mqTable` 与 `mqPopTable` 互斥**（Java `DefaultMQPushConsumerImpl#consumerRunningInfo` 分别取 `processQueueTable` / `popProcessQueueTable`：弹出去的队列只出现在 popTable） |
 | `hook` | 65 | `CheckForbiddenHook`（异常不吞、沿重试链传播）+ `FilterMessageHook`（可变 msgList、摘掉即静默跳过）+ 钩子异常隔离 |
 | `consume_thread_pool` | 61 | 消费端有界 core/max 执行器：真实并发度 == corePoolSize、`setConsumeThreadNums` 生效、`updateCorePoolSize` 运行时调并发 |
 | `top_addressing` | 37 | 动态 name server：WS 地址 / unitName / para 拼装、`clearNewLine`、非 200 与连接失败回退为空 |
@@ -131,7 +132,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_latency       127.0.0.1:9876
 ./build/examples/rmq_live_pop           127.0.0.1:9876
 ./build/examples/rmq_live_pop_consumer  127.0.0.1:9876
-./build/examples/rmq_live_redelivery    127.0.0.1:9876   # 重投/死信/重启/广播/顺序/流控/namespace/部分 ack 十段
+./build/examples/rmq_live_redelivery    127.0.0.1:9876   # 重投/死信/重启/广播/顺序/流控/namespace/部分 ack/停摆自愈 十一段
 ./build/examples/rmq_live_trace         127.0.0.1:9876   # 需 broker traceTopicEnable=true
 ./build/examples/rmq_live_hook          127.0.0.1:9876
 ./build/examples/rmq_validators_live    127.0.0.1:9876
@@ -161,7 +162,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 
 | `rmq_live_async_send` | 43 PASS / 0 FAIL | 异步发送内核真机（与 Python `verify_async_send_live.py`、.NET `async-send`、Rust `live_async_send` 的 A1–A6 同场景）：A1 `sendAsync` 在准备段（`sendMessageBefore` 睡 400ms）之前就返回、回调恰好一次且 `SEND_OK`，**线程口径**实测 `AsyncSenderExecutor_1` 跑 before 钩子、`NettyClientPublicExecutor_1` 跑用户回调（Java `executeInvokeCallback`），用 broker 回的 `offsetMsgId` 能 `viewMessage` 读回原 body、`queueOffset == 该队列 maxOffset-1`、`msgId` 是 32 位客户端 UNIQ_KEY 且与 `offsetMsgId` 不同 → A2 并发 30 笔各**恰好一个**终态、全 `SEND_OK`、broker 落 30 条、30 个 `(broker,queueId,queueOffset)` 槽位与 30 个 UNIQ_KEY 两两不重复 → A3 定点异步发送只让指定的那条队列多 1 条、其它队列一条没多 → A4 `CheckForbiddenHook` 看到 `ASYNC`，拒绝时异常原样到回调且**连 topic 路由都没建出来**（`landed=-1`），换个标签照常落地、钩子被调 2 次 → A5 `sendBatchAsync`（对位 Java `send(Collection, SendCallback, timeout)`）一批 5 条：回调恰好一次且 `SEND_OK`、broker 侧 `landed=5`、应答的 `offsetMsgId` 是**逐条回的 5 个 commitLog 偏移**，用它 `viewMessage` 读回的那条**子消息**带着客户端生成的 32 位 `UNIQ_KEY`（逐条 ID 编在 body 里的落地证据，缺失时发送侧照样 `SEND_OK`，只有真 broker 看得出来）、`msgId` 是批量自身的 32 位客户端 ID 而非 `offsetMsgId`；定点批量只让那条队列多 3 条、其它队列一条没多；混 topic / 空批的本地校验在异步路径上照样跑且错误**进回调**；字节闸按**整批**扣（1 MiB 地板下 2×600 KiB 被拒、2×100 KiB 照常 `SEND_OK`、两份许可满额归还）。请求码 320 由离线单测取证→ A6 `shutdown()` 用 `shutdown(true)` **join 完池子才关客户端**，36 笔全部上线（`landed=36`）——这是本端口相对 Java 的**刻意偏离**（Java `:314` 只 `shutdown()` 不 `awaitTermination`，Python/Rust 照抄那一派，同一用例 36 笔全报错、一条都没落）。 |
 
-| `rmq_live_redelivery` | 35 PASS / 0 FAIL | 消费侧十段真机（与 Python/Rust/.NET 同场景）：S1 `RECONSUME_LATER` 走 `sendMessageBack`(code 3) 重投，实测延迟梯度 ≥8s、重投来自 `%RETRY%` 且 `reconsumeTimes` 递增、正常消息只投一次 → S2 重启后接着消费且不重复 → S3 顺序消费 → S4 广播两组各收全 → S5 慢消费下 10 条全到 + 流控触发计数 >0 → S6 同组两实例队列不重不漏 + 40 条无重复 + 收到 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED`(40) → S7 `shutdown()` 真的注销了 clientId（`queryConsumerIdList` 前后对照）→ S8 `namespace` 正腿/反腿（带 ns 收全、裸 topic 消费者收不到，证明真实 topic 是 `NS%topic`）→ **S9 死信终态**：`maxReconsumeTimes=2` 只投 3 次（实测 `0s/10s/40s`，即 Java `delayLevel = 3 + reconsumeTimes`，`AbstractSendMessageProcessor:209`），第 3 次回投被 broker 改写进 `%DLQ%<group>`（`:193`，路由此刻才建出来），lite pull 从队首读回的那条 `reconsumeTimes=3`（存储时 +1，`:228`）、`RETRY_TOPIC` 仍是业务 topic、之后不再投递。S9 的窗口给 150s：整机并发时定时服务会拖档，100s 会假失败。→ **S10 部分 ack（`ackIndex`）**：`CONSUME_SUCCESS` + 一批 3 条里 listener 只认可第 1 条 ⇒ 尾巴 2 条从 `%RETRY%` 回来（`reconsumeTimes>=1`、listener 看到的是业务 topic）、已认可那条整个窗口只投一次（没把前缀也回投）、3 条最终全部消费、业务队列位点仍整批前进到 3；对照组（完全不碰 `ackIndex`，Java 默认 `Integer.MAX_VALUE`）一条都不回投、位点同样到 3。topic 只建 1 个队列、并且**先发消息再起消费者**（新组显式 `CONSUME_FROM_FIRST_OFFSET`），批次切分才由不得拉取时机决定。所有断言的观察都用有界轮询（`waitUntil`）而不是固定 `sleep`，listener 的缓冲区由**跟着缓冲区走的互斥量**（`BodySink`）保护——原来「每个 listener 一把锁 + 主线程不持锁读」是数据竞争，会在高负载下漏读/误报重复。 |
+| `rmq_live_redelivery` | 42 PASS / 0 FAIL | 消费侧十一段真机（与 Python/Rust/.NET 同场景）：S1 `RECONSUME_LATER` 走 `sendMessageBack`(code 3) 重投，实测延迟梯度 ≥8s、重投来自 `%RETRY%` 且 `reconsumeTimes` 递增、正常消息只投一次 → S2 重启后接着消费且不重复 → S3 顺序消费 → S4 广播两组各收全 → S5 慢消费下 10 条全到 + 流控触发计数 >0 → S6 同组两实例队列不重不漏 + 40 条无重复 + 收到 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED`(40) → S7 `shutdown()` 真的注销了 clientId（`queryConsumerIdList` 前后对照）→ S8 `namespace` 正腿/反腿（带 ns 收全、裸 topic 消费者收不到，证明真实 topic 是 `NS%topic`）→ **S9 死信终态**：`maxReconsumeTimes=2` 只投 3 次（实测 `0s/10s/40s`，即 Java `delayLevel = 3 + reconsumeTimes`，`AbstractSendMessageProcessor:209`），第 3 次回投被 broker 改写进 `%DLQ%<group>`（`:193`，路由此刻才建出来），lite pull 从队首读回的那条 `reconsumeTimes=3`（存储时 +1，`:228`）、`RETRY_TOPIC` 仍是业务 topic、之后不再投递。S9 的窗口给 150s：整机并发时定时服务会拖档，100s 会假失败。→ **S10 部分 ack（`ackIndex`）**：`CONSUME_SUCCESS` + 一批 3 条里 listener 只认可第 1 条 ⇒ 尾巴 2 条从 `%RETRY%` 回来（`reconsumeTimes>=1`、listener 看到的是业务 topic）、已认可那条整个窗口只投一次（没把前缀也回投）、3 条最终全部消费、业务队列位点仍整批前进到 3；对照组（完全不碰 `ackIndex`，Java 默认 `Integer.MAX_VALUE`）一条都不回投、位点同样到 3。topic 只建 1 个队列、并且**先发消息再起消费者**（新组显式 `CONSUME_FROM_FIRST_OFFSET`），批次切分才由不得拉取时机决定。所有断言的观察都用有界轮询（`waitUntil`）而不是固定 `sleep`，listener 的缓冲区由**跟着缓冲区走的互斥量**（`BodySink`）保护——原来「每个 listener 一把锁 + 主线程不持锁读」是数据竞争，会在高负载下漏读/误报重复。→ **S11 拉取循环停摆自愈**（Java `isPullExpired` / `PULL_MAX_IDLE_TIME`=120s，`RebalanceImpl:438-461` 的 `[BUG]` 分支）：1 队列 topic 先发 3 条并确认位点到 3，然后把这一路的拉取时刻**倒拨 125s** 并就地确认 `pullStalled()` 为真、307 应答里能读到被倒拨的那个值（`"lastPullTimestamp":<injected>`），再走一次真 rebalance（`syncPullThreads()`）⇒ 判据必须把它撤掉重建（日志里就是 Java 那句 `[BUG]doRebalance ... because pull is pause, so try to fixed it`），时刻回到"现在"、判据不再报警，之后同一队列继续消费到 6 条、位点到 6、6 条各只投一次且 `redelivered=0`（撤走前把已消费位点持久化回了 broker）。这条路径坏掉是**静默的**：不报错、心跳照发、别的队列照常推进，只有"这一路位点永远不动"，所以停摆→恢复的闭环必须真机取证，阈值与判据边界由离线用例 `pull_expired` 锁死。 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -196,7 +197,7 @@ cpp/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 42 个 .cpp
 ├── examples/                   selfcheck / interop_tool + 20 个真机联调工具
-└── tests/                      30 个测试源文件、31 个 ctest 用例（含 Java 对拍与 interop_check.py）
+└── tests/                      31 个测试源文件、32 个 ctest 用例（含 Java 对拍与 interop_check.py）
 ```
 
 ## 几个必须知道的实现约定

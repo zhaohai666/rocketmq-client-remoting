@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，526 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，538 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -96,7 +96,7 @@ dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(4
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
-其它子命令：`redelivery`（35 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack 十段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
+其它子命令：`redelivery`（50 PASS / 0 FAIL，重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈 十一段）/ `acl` / `pull` / `rr` / `latency` / `pop` / `popc`（POP 消费循环）。
 
 `redelivery` 的 S9 是**死信终态**，也是「用尽」这条判据唯一能验的地方——客户端只把
 `maxReconsumeTimes` 通过 `sendMessageBack` 的 header 递上去，真正决定第几次转死信的是 broker
@@ -114,6 +114,22 @@ dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS �
 业务队列位点仍整批提交到 3；对照组完全不碰 `AckIndex` 一条都不回投。topic 只建 1 个队列，
 并且**先把 3 条发上去再起消费者**（新组显式 `ConsumeFromFirstOffset`）——批次怎么切由拉取时机
 决定，后起消费者时首批可能只有 1~2 条，前缀/后缀就不确定了。
+
+`redelivery` 的 S11 是**拉取循环停摆自愈**（Java `ProcessQueue.PULL_MAX_IDLE_TIME` = **120000ms**，
+判据 `pq.isPullExpired()` 打在 `RebalanceImpl.updateProcessQueueTableInRebalance:438-461`：队列仍归
+本实例却停摆 ⇒ `setDropped(true)` + `removeUnnecessaryMessageQueue`（持久化位点）+ 同一趟的 add 分支
+换一具新的 ProcessQueue 重建）。这条路径坏掉是**静默的**：客户端不报错、心跳照发、别的队列照常推进，
+真机上只能从「某个组的某条队列位点永远不动」反推，所以停摆→恢复的闭环必须真机取证。三步：
+H1 基线（3 条消费掉、位点到 3、`LastPullAt` 是循环自己盖的真时刻、进程内已消费位点 3）；
+H2 把这一路登记成**一条已退出的线程**（对位 Java 的「循环被异常打穿」）⇒ `PullStalled` 即刻为真
+（不等满 120s），叫醒 rebalance 后必须换成一条**新的活线程**才判恢复——注入的是死线程，旧循环不可能
+自己把判据翻回 false，所以这一步无歧义；H3 线程活着但把盖章时刻**倒拨 125s** ⇒ 同样被撤并重建，
+且 307 应答里能读到被倒拨的那个 `"lastPullTimestamp":<injected>`（证明运维看得见判据的现场证据）。
+H2/H3 之后各发 3 条，位点走到 6/9，9 条各只投一次、`redelivered=0`、时钟恢复新鲜。
+阈值 120s 与**严格大于**的边界（-120000ms 不算、-120001ms 才算）由离线单测
+`PullExpiredTests`（12 项）锁死；那一项用注入时钟调 `PullStalledForTest`，因为等真 120s 的判据
+分不清走的是哪一支。本端口的存活代理是**登记线程的 `Thread.IsAlive`**（对位 Java 每队列一具
+ProcessQueue），POP 分支改读 `PopProcessQueue.LastPopTimestamp` 且撤走时 `SetDropped`。
 
 单测里的 `ValidatorsTests`（45 项）锁死名字校验的文案、判定顺序与码值口径：topic/group 的
 blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 -1，本工程沿用默认 1），
@@ -143,8 +159,15 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **526 passed / 0 failed**，零 warning
-（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `SendRetryTests`（13 项）用
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **538 passed / 0 failed**，零 warning
+（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `PullExpiredTests`（12 项）锁住
+拉取循环停摆自愈的判据与收尾：阈值 120000ms 与**严格大于**边界（用注入时钟调
+`PullStalledForTest(key, now)`，-120000 不算、-120001 才算——等真 120s 分不清走的哪一支）、
+从没盖过章的新循环不算停摆、线程已退出即刻算（盖章再新鲜也照撤）、健康队列一律不动
+（换线程等于丢在途重投）、撤走时持久化已消费位点并清掉盖章/缓冲/游标（没有已消费位点就不臆造
+一个 0）、判据**逐队列独立**（一路停摆不许连带换掉兄弟队列的循环）、没分配给本实例的队列不扫、`Start()` 之前与停机途中都不判停摆（否则刷一堆假 `[BUG]`
+日志）、POP 分支扫掉 `PopProcessQueue` 并 `SetDropped`。
+`SendRetryTests`（13 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。
 同一种"抓 socket"的能力也被用来验请求钩子（`RequestHooksReachTheWire`）：只注册 ACL 时线上

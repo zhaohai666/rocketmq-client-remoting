@@ -10,6 +10,11 @@
 // S10 部分 ack（ackIndex）：一批 3 条只认可第 1 条 ⇒ 尾巴 2 条经 %RETRY% 重投
 //    （reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口只投一次、
 //    3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）一条都不回投
+// S11 拉取停摆自愈（Java isPullExpired，阈值 120s）：1 队列 topic 先消费 3 条并把位点提交到 3，
+//    再把该队列登记的循环线程换成一条永远起不来的占位线程（= 循环被异常打穿）⇒ 立刻判停摆 ⇒
+//    叫醒生产 rebalance ⇒ 断言它被撤掉重建（新线程接管并重新盖章），之后 3 条照样消费、
+//    位点前进到 6；另有一轮"盖章倒拨 125s"验证阈值那一支与运行信息的 lastPullTimestamp；
+//    最终 9 条各只投一次、reconsumeTimes 全 0（撤走前持久化了位点，重建后从 broker 续拉）
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
 //   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
@@ -108,6 +113,7 @@ public static class LiveRedelivery
         ScenarioNamespace();
         ScenarioDlq(producer);
         ScenarioPartialAck(producer);
+        ScenarioPullStallSelfHeal(producer);
 
         producer.Shutdown();
         Console.WriteLine();
@@ -888,5 +894,170 @@ public static class LiveRedelivery
         admin.Shutdown();
         pc.Shutdown();
         cc.Shutdown();
+    }
+
+    // ---------------- S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME=120s）----------------
+
+    /// <summary>
+    /// 一路拉取循环死了之后，下一趟 rebalance 必须把它**撤掉重建**，而且撤走前要把已消费位点
+    /// 持久化（Java RebalanceImpl#updateProcessQueueTableInRebalance:438-461 的 [BUG] 分支 +
+    /// removeUnnecessaryMessageQueue）。
+    /// </summary>
+    /// <remarks>
+    /// 为什么必须真机：判据本身（120s 阈值、严格 <c>&gt;</c>、撤走清哪些痕迹、撤/建顺序）
+    /// 已经由 tests/RocketMQ.Client.Tests/PullExpiredTests.cs 离线锁死，但"重建出来的那一路
+    /// 真的从 broker 位点接着往下消费、一条不重不丢"只有真 broker 能证明 —— 少持久化那一步
+    /// 在离线测试里看着照样能消费，真机才会暴露成"整把队列从旧位点重投"。
+    ///
+    /// 注入方式与 C++/Rust 那两版不同，是有意的：.NET 的存活判据就是登记线程本身
+    /// （<c>Thread.IsAlive</c>，Java per-queue ProcessQueue 的等价物），所以这里把登记表里那一路
+    /// 换成一条**永远起不来**的占位线程。好处是判据没有时钟竞态 —— 自愈之前
+    /// <c>PullStalled</c> 恒为 true（占位线程不可能变 alive），只有被换成真的新循环才会 false；
+    /// 用"倒拨盖章"注入反而会撞上旧循环自己刷新的那一次，判不出到底自愈没有。
+    /// 阈值那一支（H3）仍然照拨，但只断言"拨了会判停摆、运行信息如实报出、之后照常消费"。
+    /// </remarks>
+    private static void ScenarioPullStallSelfHeal(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_Heal";
+        string group = _gPrefix + "_g11";
+        // 1 队列：只有一路循环，注入点唯一，位点判据也唯一（多队列会被分摊，撤走的不一定是注入那把）
+        PrepareTopic(producer, topic, 1);
+
+        var admin = new DefaultMQAdminExt();
+        admin.SetNamesrvAddr(_namesrv);
+        admin.SetTimeoutMillis(10000);
+        admin.Start();
+
+        var listener = new RetryListener();
+        var c = NewConsumer(group);
+        c.SetMessageListener(listener);
+        c.Subscribe(topic, "*");
+        c.Start();
+
+        try
+        {
+            List<MessageQueue> queues = new();
+            WaitUntil(() =>
+            {
+                queues = c.FetchSubscribeMessageQueues(topic);
+                return queues.Count == 1 && c.AssignedQueueKeys().Contains(Key(queues[0]));
+            }, 30000);
+            Check("S11-单队列已分到本实例", queues.Count == 1 && c.AssignedQueueKeys().Contains(Key(queues[0])),
+                "queues=" + queues.Count.ToString(CultureInfo.InvariantCulture)
+                + " assigned=" + string.Join(",", c.AssignedQueueKeys()));
+            if (queues.Count != 1)
+            {
+                return;
+            }
+
+            MessageQueue mq = queues[0];
+            string key = Key(mq);
+
+            long Committed()
+            {
+                try
+                {
+                    return admin.ExamineConsumerOffset(group, mq, out long off) ? off : -1;
+                }
+                catch (Exception)
+                {
+                    return -1;
+                }
+            }
+
+            // ---- H1 基线：3 条消费掉，位点提交到 3，拉取时钟是真值 ----
+            for (int i = 0; i < 3; ++i)
+            {
+                producer.Send(new Message(topic, Str2Bytes("heal-1-" + i.ToString(CultureInfo.InvariantCulture))));
+            }
+
+            Check("S11-H1 基线：3 条被消费",
+                WaitUntil(() => listener.Snapshot().Count >= 3, 30000),
+                "arrivals=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
+            Check("S11-H1 基线：位点提交到 broker（撤走重建全靠它续拉）",
+                WaitUntil(() => Committed() == 3, 30000),
+                "committed=" + Committed().ToString(CultureInfo.InvariantCulture));
+
+            // 运行信息里的 lastPullTimestamp 必须是真时刻（Java ProcessQueue#fillOutRunningInfo:456）
+            long stamp = c.LastPullAt(key);
+            Check("S11-H1 循环在发起拉取时盖章", stamp > 0 && NowMs() - stamp < 60000,
+                "lastPullAt=" + stamp.ToString(CultureInfo.InvariantCulture));
+            Check("S11-H1 进程内已消费位点是 3（自愈时要带着它去持久化）",
+                c.ConsumeOffsetForTest(key) == 3,
+                "consumeOffset=" + (c.ConsumeOffsetForTest(key) ?? -1).ToString(CultureInfo.InvariantCulture));
+
+            // ---- H2 循环被异常打穿 → 同一趟 rebalance 撤掉重建 ----
+            c.RegisterLoopForTest(key, alive: false);
+            Check("S11-H2 线程已退出即刻判停摆（不必等满 120s）", c.PullStalled(key), "key=" + key);
+            c.WakeupRebalanceForTest();
+            // 只有"登记条目被换成一条真活着的线程"才会让 PullStalled 变 false：
+            // 注入的占位线程永远不会 alive，所以这一条断言就等价于"确实撤掉并重建了"。
+            Check("S11-H2 停摆队列被撤掉重建（新循环接管并重新盖章）",
+                WaitUntil(() => !c.PullStalled(key), 30000),
+                "lastPullAt=" + c.LastPullAt(key).ToString(CultureInfo.InvariantCulture));
+            Check("S11-H2 重建没有把位点写回去退", Committed() >= 3,
+                "committed=" + Committed().ToString(CultureInfo.InvariantCulture));
+
+            for (int i = 0; i < 3; ++i)
+            {
+                producer.Send(new Message(topic, Str2Bytes("heal-2-" + i.ToString(CultureInfo.InvariantCulture))));
+            }
+
+            Check("S11-H2 自愈后同一个队列继续消费（累计 6 条）",
+                WaitUntil(() => listener.Snapshot().Count >= 6, 30000) && WaitUntil(() => Committed() == 6, 30000),
+                "arrivals=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture)
+                + " committed=" + Committed().ToString(CultureInfo.InvariantCulture));
+
+            // ---- H3 盖章超出 120s（线程还活着）----
+            long injected = NowMs() - DefaultMQPushConsumer.PullMaxIdleTimeMillis - 5000;
+            string want = "\"lastPullTimestamp\":" + injected.ToString(CultureInfo.InvariantCulture);
+            bool reported = false;
+            bool expired = false;
+            // 重拨而不是只拨一次：真循环每发起一轮就会自己刷新这个时刻，撞上一次的概率很低
+            // 但不为零（长轮询刚好在这几毫秒里返回），重拨一次就能同时观察到判据和报文。
+            for (int attempt = 0; attempt < 5 && !(reported && expired); ++attempt)
+            {
+                c.SetLastPullAt(key, injected);
+                expired = c.PullStalled(key);
+                reported = Encoding.UTF8.GetString(c.BuildConsumerRunningInfo().Encode()).Contains(want);
+            }
+
+            Check("S11-H3 倒拨超过 120s 即判停摆", expired, "injected=" + injected);
+            Check("S11-H3 运行信息把 lastPullTimestamp 报成盖章的那个值", reported, "want=" + want);
+            c.WakeupRebalanceForTest();
+            Check("S11-H3 停摆分支被处理（这一路重新盖章或换上了新循环）",
+                WaitUntil(() => c.LastPullAt(key) > injected, 30000),
+                "lastPullAt=" + c.LastPullAt(key).ToString(CultureInfo.InvariantCulture));
+
+            for (int i = 0; i < 3; ++i)
+            {
+                producer.Send(new Message(topic, Str2Bytes("heal-3-" + i.ToString(CultureInfo.InvariantCulture))));
+            }
+
+            Check("S11-H3 之后仍然照常消费（累计 9 条、位点到 9）",
+                WaitUntil(() => listener.Snapshot().Count >= 9, 30000) && WaitUntil(() => Committed() == 9, 30000),
+                "arrivals=" + listener.Snapshot().Count.ToString(CultureInfo.InvariantCulture)
+                + " committed=" + Committed().ToString(CultureInfo.InvariantCulture));
+
+            // 留一个窗口给"重建时拿陈旧游标回退位点"这类错误显形：整把队列重投会在这里露出来
+            Thread.Sleep(8000);
+            List<(string Body, string Topic, int ReconsumeTimes, long Ts)> seen = listener.Snapshot();
+            int distinct = seen.Select(r => r.Body).Distinct().Count();
+            int redelivered = seen.Count(r => r.ReconsumeTimes != 0);
+            Check("S11-9 条各只投一次（撤走前持久化了位点，重建后从 broker 位点续拉）",
+                distinct == 9 && redelivered == 0 && seen.Count == 9,
+                "arrivals=" + seen.Count.ToString(CultureInfo.InvariantCulture)
+                + " distinct=" + distinct.ToString(CultureInfo.InvariantCulture)
+                + " redelivered=" + redelivered.ToString(CultureInfo.InvariantCulture));
+            Check("S11-自愈之后拉取时钟恢复新鲜（判据不再报警）",
+                !c.PullStalled(key) && NowMs() - c.LastPullAt(key) < 60000,
+                "age=" + (NowMs() - c.LastPullAt(key)).ToString(CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            c.ReleaseTestLoops();
+            c.Shutdown();
+            admin.Shutdown();
+        }
     }
 }

@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 806 条单元/协议测试（802 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 819 条单元/协议测试（815 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -39,6 +39,7 @@ python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 
 python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
 python verify_async_send_live.py  # 异步发送内核 A1~A6（39 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核（一次回调、broker 逐条回 3 个 commitLog 偏移、读回的子消息带客户端 32 位 UNIQ_KEY）、shutdown 不等在途（36 笔全报错、一条都没落）
 python verify_backpressure_live.py # 异步发送背压 B1~B5（Java 两个公平信号量，真机版）
+python verify_pull_expired_live.py # 拉取循环停摆**自愈**（Java isPullExpired / PULL_MAX_IDLE_TIME=120s，`RebalanceImpl.updateProcessQueueTableInRebalance:438-461`，11 PASS/0 FAIL）：A1 基线（3 条被消费、位点到 3、307 运行信息里 `lastPullTimestamp` 是循环自己盖的真时刻且新鲜）→ A2 把这一路的线程表条目换成一条**已退出的线程**（等价于循环被异常打穿）⇒ 下一趟 rebalance 必须换上另一条活线程，新发的 3 条照样被消费（位点到 6）→ A3 线程还活着但把盖章时刻**倒拨 121s**（> 120s）⇒ 同样被撤并重建、再发 3 条照样消费（位点到 9）→ A4 前 9 条各只投一次、`reconsumeTimes` 全 0、时钟恢复新鲜（撤走前持久化了位点，重建从 broker 位点续拉）。恢复判据用「既不是原线程、也不是注入的那条、而且活着」，否则注入还没被撤走也会被误判成通过。这条路径坏掉是**静默的**：不报错、心跳照发、别的队列照常推进，真机上只能从"某条队列位点永远不动"反推，所以停摆→恢复的闭环必须真机取证；阈值 120s 与**严格大于**的边界、盖章在流控/锁判定**之前**（`pullMessage:253`，卡住的循环也要留心跳）、POP 分支读 `lastPopTimestamp`（`PopProcessQueue:74`）、停机途中不判停摆，都由 `tests/test_pull_expired.py`（13 项）离线锁死
 python verify_ack_index_live.py   # classic 并发消费的 ackIndex 部分 ack（11 PASS/0 FAIL）：A1 对照组整批认可（3 条各投一次、位点到 3、零回投）→ A2 ackIndex=0 只认可首批第一条 ⇒ 尾巴 2 条经 %RETRY% 二次到达（reconsumeTimes>=1、topic 还原成业务 topic）、被认可那条整个窗口只投一次、3 条最终全部消费、业务队列位点仍整批提交到 3 → A3 ackIndex=2 压不住 RECONSUME_LATER（Java :222-226 强制 ackIndex=-1，3 条全重投）→ A4 广播模式下尾巴不回投。批次切分由拉取时机决定，所以三个用例都**先把 3 条放上去再起消费者**（新组显式 CONSUME_FROM_FIRST_OFFSET），否则首批可能是 1~2 条、前缀/后缀根本不确定
 ```
 
