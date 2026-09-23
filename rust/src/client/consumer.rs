@@ -2417,10 +2417,10 @@ async fn consume_pop_batch(
     let mut msgs = msgs;
     reset_retry_topic_and_namespace(&inner, &mut msgs);
     let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
-    // ⚠ 对齐 Java `ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE`：默认就是
-    // 「全部 ack」。本仓库 ConsumeConcurrentlyContext 的默认值是 -1（回投路径语义），
-    // 不在这里改成 size-1 会让 CONSUME_SUCCESS **一条都不 ack**，消息在 invisibleTime
-    // 到期后复活重投 —— 短观测窗口下会伪装成通过。
+    // 对齐 Java `ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE`（本端口的默认值
+    // 已经是它，这里显式钳成 size-1 只是省掉一次 clamp）：CONSUME_SUCCESS 默认全部 ack。
+    // 若这里是 -1，一条都不会被 ack，消息在 invisibleTime 到期后复活重投 ——
+    // 短观测窗口下会伪装成通过。
     context.ack_index = i32::try_from(msgs.len()).unwrap_or(i32::MAX) - 1;
 
     let mut hook_ctx = if inner.consume_hooks.has_hooks() {
@@ -2436,7 +2436,7 @@ async fn consume_pop_batch(
     let failed = matches!(status, Some(ConsumeConcurrentlyStatus::ReconsumeLater));
     let succeeded = matches!(status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
     // 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，与 Java 一致
-    record_consume_stats(&inner, &mq.topic, msgs.len(), begin_ms, failed);
+    record_consume_stats(&inner, &mq.topic, msgs.len(), begin_ms, failed, None);
     if let Some(ctx) = hook_ctx.as_mut() {
         finish_consume_hook(&inner, ctx, status, has_exception, begin_ms, failed, succeeded);
     }
@@ -2719,7 +2719,14 @@ fn consume_return_type(
 }
 
 /// Python `_record_consume_stats`（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
-fn record_consume_stats(inner: &Inner, topic: &str, msg_count: usize, begin_ms: i64, failed: bool) {
+fn record_consume_stats(
+    inner: &Inner,
+    topic: &str,
+    msg_count: usize,
+    begin_ms: i64,
+    failed: bool,
+    ack_count: Option<usize>,
+) {
     let Some(stats) = lock(&inner.stats).clone() else {
         return;
     };
@@ -2729,7 +2736,14 @@ fn record_consume_stats(inner: &Inner, topic: &str, msg_count: usize, begin_ms: 
     if failed {
         stats.inc_consume_failed_tps(&group, topic, msgs);
     } else {
-        stats.inc_consume_ok_tps(&group, topic, msgs);
+        // Java processConsumeResult:217-220 —— ok = ackIndex + 1，尾巴算 failed。
+        // 不传 ack_count 时按整批认可算（顺序/POP 路径的旧口径）。
+        let ok = ack_count.unwrap_or(msg_count);
+        let ok64 = i64::try_from(ok).unwrap_or(0);
+        stats.inc_consume_ok_tps(&group, topic, ok64);
+        if msgs > ok64 {
+            stats.inc_consume_failed_tps(&group, topic, msgs - ok64);
+        }
     }
     stats.inc_consume_rt(&group, topic, rt);
 }
@@ -2869,7 +2883,7 @@ async fn consume_batch(
         let begin_ms = current_time_millis();
         let (status, has_exception) = call_orderly_listener(inner, &batch, &mut ocontext).await;
         let failed = !matches!(status, Some(ConsumeOrderlyStatus::Success));
-        record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed);
+        record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed, None);
         if let Some(ctx) = hook_ctx.as_mut() {
             let succeeded = matches!(status, Some(ConsumeOrderlyStatus::Success));
             let rt = current_time_millis() - begin_ms;
@@ -2908,7 +2922,7 @@ async fn consume_batch(
             tokio::time::sleep(Duration::from_millis(suspend)).await;
             return Ok(false);
         }
-        advance_consume_offset(inner, key, &batch);
+        advance_consume_offset(inner, key, &batch, None);
         return Ok(true);
     }
 
@@ -2923,56 +2937,94 @@ async fn consume_batch(
         execute_consume_hook_before(&inner.consume_hooks, ctx);
     }
     let begin_ms = current_time_millis();
-    let (status, has_exception) = call_concurrently_listener(inner, &batch, &mut context).await;
-    let failed = matches!(status, Some(ConsumeConcurrentlyStatus::ReconsumeLater)) || status.is_none();
-    let succeeded = matches!(status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
-    record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed);
-    if let Some(ctx) = hook_ctx.as_mut() {
-        finish_consume_hook(inner, ctx, status, has_exception, begin_ms, failed, succeeded);
-    }
-    let status = match status {
-        Some(s) => s,
-        None => ConsumeConcurrentlyStatus::ReconsumeLater,
-    };
+    let (raw_status, has_exception) = call_concurrently_listener(inner, &batch, &mut context).await;
+    let failed = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ReconsumeLater))
+        || raw_status.is_none();
+    let succeeded = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
+    // 钩子/统计仍看**原始**返回值（None 要记 RETURNNULL），ackIndex 判定才归一化。
+    let status = raw_status.unwrap_or(ConsumeConcurrentlyStatus::ReconsumeLater);
+    // Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
+    // 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
+    // RECONSUME_LATER 强制 ackIndex=-1，整批回投。
+    let batch_len = i32::try_from(batch.len()).unwrap_or(i32::MAX);
+    let mut ack_index = context.ack_index;
     if status == ConsumeConcurrentlyStatus::ConsumeSuccess {
-        advance_consume_offset(inner, key, &batch);
-        return Ok(true);
+        if ack_index >= batch_len {
+            ack_index = batch_len - 1;
+        }
+    } else {
+        ack_index = -1;
     }
-    // RECONSUME_LATER：广播模式不回投（只告警，位点照常前进，重启后重新消费）；
-    // 集群模式逐条回投 %RETRY%topic（延迟档位 3+reconsumeTimes；超限由 broker 转 %DLQ%）
+    let acked = if ack_index >= 0 {
+        usize::try_from(ack_index).unwrap_or(0) + 1
+    } else {
+        0
+    };
+    // 统计口径同 Java 的 ok/failed 计数（:217-225）：部分 ack 时尾巴算 failed
+    record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed, Some(acked));
+    if let Some(ctx) = hook_ctx.as_mut() {
+        finish_consume_hook(inner, ctx, raw_status, has_exception, begin_ms, failed, succeeded);
+    }
     if broadcast {
-        rmq_warn!(
-            "BROADCASTING: message consume failed, no redelivery: {} msgs in {mq:?}",
-            batch.len()
-        );
-        advance_consume_offset(inner, key, &batch);
+        // Java:232-237 —— 广播模式不回投：未认可的尾巴只 warn 后丢掉，
+        // 整批位点照样前进（:266 的 removeMessage 拿到的就是整批）
+        let dropped = batch.len() - acked;
+        if dropped > 0 {
+            rmq_warn!(
+                "BROADCASTING, the message consume failed, drop it: {dropped} msgs in {mq:?}"
+            );
+        }
+        advance_consume_offset(inner, key, &batch, None);
         return Ok(true);
     }
-    if send_back_batch(inner, &batch, context.delay_level_when_next_consume).await {
-        advance_consume_offset(inner, key, &batch);
+    if acked >= batch.len() {
+        // 整批认可（默认路径）：什么都不用回投，位点直接前进
+        advance_consume_offset(inner, key, &batch, None);
         return Ok(true);
     }
-    // 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
-    {
-        let mut state = lock(&inner.state);
-        if let Some(dq) = state.pending.get_mut(key) {
-            for m in batch.iter().rev() {
-                dq.push_front(m.clone());
+    // 集群模式：未认可的 [acked..) 逐条回投 %RETRY%topic（延迟档位 3+reconsumeTimes；
+    // 超限由 broker 转 %DLQ%）
+    let msg_back_failed =
+        send_back_batch(inner, &batch[acked..], acked, context.delay_level_when_next_consume)
+            .await;
+    // Java:256-260 —— 回投失败的那几条从本批摘掉后 submitConsumeRequestLater 重投，
+    // 这里等价地塞回队首稍后再消费
+    if !msg_back_failed.is_empty() {
+        {
+            let mut state = lock(&inner.state);
+            if let Some(dq) = state.pending.get_mut(key) {
+                for (_, m) in msg_back_failed.iter().rev() {
+                    dq.push_front(m.clone());
+                }
             }
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Ok(false)
+    // Java:266-269 —— 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
+    // 仍留在队列里的那几条（removeMessage 这时返回它们的最小 offset）
+    let floor = msg_back_failed.iter().map(|(_, m)| m.queue_offset).min();
+    let handled: Vec<MessageExt> = batch
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !msg_back_failed.iter().any(|(fi, _)| fi == i))
+        .map(|(_, m)| m.clone())
+        .collect();
+    advance_consume_offset(inner, key, &handled, floor);
+    Ok(msg_back_failed.is_empty())
 }
 
-/// Python `_send_back_batch`（Java processConsumeResult → sendMessageBack）。
+/// Python `_send_back_batch`（Java processConsumeResult:238-254）。
+///
+/// 返回 `(在整批里的下标, 消息)`：回投失败的那些，`reconsume_times` 已按 Java:251
+/// 就地 +1 —— broker 那边没记上这次数，客户端不补就永远进不了 DLQ。
 async fn send_back_batch(
     inner: &Arc<Inner>,
     batch: &[MessageExt],
+    base: usize,
     delay_level_from_context: i32,
-) -> bool {
-    let mut ok = true;
-    for msg in batch {
+) -> Vec<(usize, MessageExt)> {
+    let mut failed: Vec<(usize, MessageExt)> = Vec::new();
+    for (i, msg) in batch.iter().enumerate() {
         // 重投次数在 MessageExt 线上格式第 13 字段（Java msg.getReconsumeTimes()），
         // broker 重投时 +1；不是 properties 键（PROPERTY_RECONSUME_TIME 是另一回事）。
         let mut delay_level = delay_level_from_context;
@@ -2980,17 +3032,28 @@ async fn send_back_batch(
             // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
             delay_level = 3 + msg.reconsume_times;
         }
-        if let Err(e) = send_message_back(inner, msg, delay_level, None) {
+        let mut msg = msg.clone();
+        if let Err(e) = send_message_back(inner, &msg, delay_level, None) {
             rmq_debug!("send message back failed: {e}");
-            ok = false;
+            // 与 Java 一样：次数在**要被重新消费的副本**上加，broker 没记成功
+            msg.reconsume_times += 1;
+            failed.push((base + i, msg));
         }
     }
-    ok
+    failed
 }
 
 /// Python `_advance_consume_offset`：取本批最大 queueOffset + 1，且**不回退**。
-fn advance_consume_offset(inner: &Inner, key: &str, batch: &[MessageExt]) {
-    let next_off = batch.iter().map(|m| m.queue_offset).max().unwrap_or(0) + 1;
+/// `floor` 是「不能越过的位点」（回投失败被塞回队首的那几条里最小的 offset）。
+fn advance_consume_offset(inner: &Inner, key: &str, batch: &[MessageExt], floor: Option<i64>) {
+    if batch.is_empty() {
+        // 整批回投都失败时没有任何条目被认可，位点原地不动
+        return;
+    }
+    let mut next_off = batch.iter().map(|m| m.queue_offset).max().unwrap_or(0) + 1;
+    if let Some(floor) = floor {
+        next_off = next_off.min(floor);
+    }
     let mut state = lock(&inner.state);
     let cur = state.consume_offsets.get(key).copied().unwrap_or(0);
     state.consume_offsets.insert(key.to_string(), cur.max(next_off));
@@ -4057,6 +4120,145 @@ mod tests {
         assert_eq!(table().get(key), Some(&10));
         update_msg_acc_cnt(&consumer.inner, key, &[with_max(10, "1000")]);
         assert_eq!(table().get(key), Some(&990));
+    }
+
+    // ---------------- 并发消费（classic 路径）的 ackIndex ----------------
+
+    /// Java `ConsumeMessageConcurrentlyService#processConsumeResult:202-270`。
+    ///
+    /// 这些断言**只能**离线做：这个端口在没有 `start()` 过的实例上回投必然失败
+    /// （`require_client` 直接 Err），于是「回投失败」那条分支的可见结果 ——
+    /// 尾巴塞回队首、`reconsumeTimes+1`、位点不越过它 —— 恰好是最容易被写错的部分。
+    /// 回投**成功**时的语义（尾巴交给 broker、位点整批前进）由真机
+    /// `examples/live_ack_index.rs` 取证。
+    struct AckListener {
+        ack_index: Option<i32>,
+        status: ConsumeConcurrentlyStatus,
+    }
+
+    impl MessageListenerConcurrently for AckListener {
+        fn consume_message(
+            &self,
+            _msgs: &[MessageExt],
+            context: &mut ConsumeConcurrentlyContext,
+        ) -> ConsumeConcurrentlyStatus {
+            if let Some(i) = self.ack_index {
+                context.ack_index = i;
+            }
+            self.status
+        }
+    }
+
+    /// 同一个队列上 queueOffset = 0..n 的一批。
+    fn offset_batch(n: i64) -> Vec<MessageExt> {
+        (0..n)
+            .map(|i| {
+                let mut m = ext("T", None);
+                m.broker_name = Some("broker-a".to_string());
+                m.queue_offset = i;
+                m
+            })
+            .collect()
+    }
+
+    struct AckHarness {
+        c: DefaultMQPushConsumer,
+        key: String,
+        mq: MessageQueue,
+    }
+
+    impl AckHarness {
+        fn new(
+            broadcast: bool,
+            ack_index: Option<i32>,
+            status: ConsumeConcurrentlyStatus,
+        ) -> AckHarness {
+            let cfg = ConsumerConfig {
+                consumer_group: "G".to_string(),
+                message_model: if broadcast {
+                    MessageModel::BROADCASTING.to_string()
+                } else {
+                    MessageModel::CLUSTERING.to_string()
+                },
+                ..Default::default()
+            };
+            let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
+            c.set_message_listener_concurrently(Arc::new(AckListener { ack_index, status }));
+            let mq = queue("T", "broker-a", 0);
+            let key = mq_key(&mq);
+            lock(&c.inner.state).pending.insert(key.clone(), VecDeque::new());
+            AckHarness { c, key, mq }
+        }
+
+        async fn run(&self, n: i64) -> bool {
+            consume_batch(&self.c.inner, &self.key, &self.mq, offset_batch(n))
+                .await
+                .expect("consume_batch must not error")
+        }
+
+        fn offset(&self) -> i64 {
+            lock(&self.c.inner.state)
+                .consume_offsets
+                .get(&self.key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn pending(&self) -> Vec<(i64, i32)> {
+            lock(&self.c.inner.state)
+                .pending
+                .get(&self.key)
+                .map(|dq| dq.iter().map(|m| (m.queue_offset, m.reconsume_times)).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    #[tokio::test]
+    async fn success_with_default_ack_index_never_send_backs() {
+        // 默认 Integer.MAX_VALUE 钳到 size-1：整批认可，一条都不回投
+        let h = AckHarness::new(false, None, ConsumeConcurrentlyStatus::ConsumeSuccess);
+        assert!(h.run(3).await);
+        assert_eq!(h.offset(), 3);
+        assert_eq!(h.pending(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn success_acks_prefix_and_holds_the_offset_at_the_first_unacked() {
+        let h = AckHarness::new(false, Some(0), ConsumeConcurrentlyStatus::ConsumeSuccess);
+        // 本端口未 start()，尾巴的回投必然失败 → 走「塞回队首 + 位点不越过」这条分支
+        assert!(!h.run(3).await);
+        assert_eq!(
+            h.pending(),
+            vec![(1, 1), (2, 1)],
+            "未认可的尾巴要按 Java:251 把 reconsumeTimes 补上再重投"
+        );
+        assert_eq!(h.offset(), 1, "位点只能停在第一条未被认可的消息上");
+    }
+
+    #[tokio::test]
+    async fn reconsume_later_overrides_a_wider_ack_index() {
+        // Java:222-226 —— RECONSUME_LATER 强制 ackIndex = -1，整批回投
+        let h = AckHarness::new(false, Some(2), ConsumeConcurrentlyStatus::ReconsumeLater);
+        assert!(!h.run(3).await);
+        assert_eq!(h.pending(), vec![(0, 1), (1, 1), (2, 1)]);
+        assert_eq!(h.offset(), 0, "整批都没被认可，位点原地不动");
+    }
+
+    #[tokio::test]
+    async fn broadcasting_drops_the_tail_without_send_back() {
+        // Java:232-237 —— 广播模式不回投，未认可的尾巴只 warn 后丢掉，位点整批前进
+        let h = AckHarness::new(true, Some(0), ConsumeConcurrentlyStatus::ConsumeSuccess);
+        assert!(h.run(3).await);
+        assert_eq!(h.offset(), 3);
+        assert_eq!(h.pending(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn broadcasting_reconsume_later_still_advances() {
+        let h = AckHarness::new(true, None, ConsumeConcurrentlyStatus::ReconsumeLater);
+        assert!(h.run(2).await);
+        assert_eq!(h.offset(), 2);
+        assert_eq!(h.pending(), vec![]);
     }
 
     // ---------------- POP ----------------

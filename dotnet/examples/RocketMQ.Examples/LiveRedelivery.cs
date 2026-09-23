@@ -7,6 +7,9 @@
 // S9 死信终态：maxReconsumeTimes=2 ⇒ 恰好投递 3 次（reconsumeTimes 0/1/2），第 3 次回投后
 //    broker 改投 %DLQ%<group>（自动建 topic 并注册路由），死信里 reconsumeTimes=3、
 //    RETRY_TOPIC 保留业务 topic，且原组不再有第 4 次投递
+// S10 部分 ack（ackIndex）：一批 3 条只认可第 1 条 ⇒ 尾巴 2 条经 %RETRY% 重投
+//    （reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口只投一次、
+//    3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）一条都不回投
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
 //   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
@@ -49,6 +52,21 @@ public static class LiveRedelivery
 
     private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
+    /// <summary>轮询到条件成立为止，返回是否在窗口内成立。
+    /// 真机断言一律用它而不是固定 sleep：几套 live 并发跑时 broker 会拖慢，
+    /// 固定 sleep 测出的是假失败（同一份代码复跑即绿）。</summary>
+    private static bool WaitUntil(Func<bool> pred, int timeoutMs)
+    {
+        long deadline = NowMs() + timeoutMs;
+        while (NowMs() < deadline)
+        {
+            if (pred()) return true;
+            Thread.Sleep(1000);
+        }
+
+        return pred();
+    }
+
     private sealed class CollectingListenerConcurrently : IMessageListenerConcurrently
     {
         private readonly object _lk = new();
@@ -89,6 +107,7 @@ public static class LiveRedelivery
         ScenarioUnregister();
         ScenarioNamespace();
         ScenarioDlq(producer);
+        ScenarioPartialAck(producer);
 
         producer.Shutdown();
         Console.WriteLine();
@@ -356,10 +375,12 @@ public static class LiveRedelivery
             producer.Send(new Message(topic, Str2Bytes("flow-" + i.ToString(CultureInfo.InvariantCulture))));
         }
 
-        Thread.Sleep(12000);
+        // 阈值 2 + 每条睡 300ms：全部落袋才说明「流控只是暂停拉取，不丢消息」。
+        // 固定 sleep 在机器忙时会测出 got=7/10 的假失败（同一份代码复跑即绿）。
+        bool allArrived = WaitUntil(() => listener.Got >= 10, 45000);
         long fc = consumer.FlowControlTriggered;
         consumer.Shutdown();
-        Check("S5-慢消费下消息全部到达", listener.Got == 10,
+        Check("S5-慢消费下消息全部到达", allArrived && listener.Got == 10,
             "got=" + listener.Got.ToString(CultureInfo.InvariantCulture));
         Check("S5-流控触发计数>0", fc > 0,
             "triggered=" + fc.ToString(CultureInfo.InvariantCulture));
@@ -695,5 +716,177 @@ public static class LiveRedelivery
                 "retryTopic=" + (d.Properties.TryGetValue("RETRY_TOPIC", out string? o)
                     ? o : "<missing>"));
         }
+    }
+
+    // ---------------- S10 部分 ack（ackIndex） ----------------
+    /// <summary>记录每条投递，并（可选）只在**首批**把 ctx.AckIndex 收窄。</summary>
+    private sealed class PartialAckListener : IMessageListenerConcurrently
+    {
+        private readonly object _lk = new();
+        private readonly List<(string Body, string Topic, int ReconsumeTimes)> _seen = new();
+        private readonly List<int> _batchSizes = new();
+
+        /// <summary>&lt; 0 = 完全不碰 ackIndex（对照组，走 Java 默认的整批认可）。</summary>
+        private readonly int _ackFirst;
+
+        public PartialAckListener(int ackFirst) => _ackFirst = ackFirst;
+
+        public bool Orderly() => false;
+
+        public List<(string Body, string Topic, int ReconsumeTimes)> Snapshot()
+        {
+            lock (_lk)
+            {
+                return new List<(string Body, string Topic, int ReconsumeTimes)>(_seen);
+            }
+        }
+
+        public int BatchCount => _batchSizes.Count;
+
+        public int FirstBatchSize => _batchSizes.Count > 0 ? _batchSizes[0] : 0;
+
+        public ConsumeConcurrentlyStatus ConsumeMessage(List<MessageExt> msgs,
+            ConsumeConcurrentlyContext ctx)
+        {
+            bool narrow = false;
+            lock (_lk)
+            {
+                foreach (MessageExt m in msgs) _seen.Add((Body(m), m.Topic, m.ReconsumeTimes));
+                _batchSizes.Add(msgs.Count);
+                // 只收窄首批：后续批次必须整批认可，否则那条尾巴永远回投不完，
+                // 「已认可前缀只投一次」的计数器也会被后续批次污染。
+                narrow = _ackFirst >= 0 && _batchSizes.Count == 1;
+            }
+
+            if (narrow) ctx.AckIndex = _ackFirst;
+            return ConsumeConcurrentlyStatus.ConsumeSuccess;
+        }
+    }
+
+    /// <summary>
+    /// 部分 ack（ackIndex）。为什么只能真机验：Java
+    /// ConsumeMessageConcurrentlyService#processConsumeResult:207-269 在 CONSUME_SUCCESS 时
+    /// 把 listener 写的 ackIndex 当切点——前缀提交位点、尾巴逐条 sendMessageBack；
+    /// 默认 Integer.MAX_VALUE 就是整批认可。离线单测（tests/.../ConsumeAckIndexTests.cs）
+    /// 只能锁「回投**失败**时位点不越过它」——未 start 的消费者回投必败；
+    /// 「回投成功时尾巴真被 broker 收下重投、已 ack 的那条整个窗口只投一次、业务队列位点仍整批
+    /// 前进」只有真 broker 说了算。两种写错在离线看不出差别：忘记回投（尾巴静默丢失，
+    /// 收到的条数照样对）、把已 ack 的前缀也回投（看起来"没丢"，其实是重复投递）。
+    /// </summary>
+    private static void ScenarioPartialAck(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_AckIndex";
+        // 1 队列：一批 3 条才连续且有序，尾巴才是真尾巴
+        PrepareTopic(producer, topic, 1);
+        string group = _gPrefix + "_g10";
+        string controlGroup = _gPrefix + "_g10ctrl";
+
+        var partial = new PartialAckListener(0);
+        var control = new PartialAckListener(-1);
+        var pc = NewConsumer(group);
+        var cc = NewConsumer(controlGroup);
+        // 默认一批 1 条，不收窄到 3 根本没有「部分」可言
+        pc.ConsumeMessageBatchMaxSize = 3;
+        cc.ConsumeMessageBatchMaxSize = 3;
+        pc.SetMessageListener(partial);
+        cc.SetMessageListener(control);
+        pc.Subscribe(topic, "*");
+        cc.Subscribe(topic, "*");
+        // 先把 3 条放上去再起消费者：批次怎么切由拉取时机决定，队列里已经躺着 3 条时第一次
+        // 拉取才会正好是「一整批 3 条」，否则首批可能只有 1~2 条，ackIndex=0 划出的
+        // 前缀/后缀就不确定了。新组在 LAST_OFFSET 下会从分配时刻的最新位点开始，故显式从 0 起消。
+        pc.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
+        cc.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
+        for (int i = 0; i < 3; ++i)
+        {
+            producer.Send(new Message(topic, Str2Bytes("ack-" + i.ToString(CultureInfo.InvariantCulture))));
+        }
+        pc.Start();
+        cc.Start();
+
+        WaitUntil(() => partial.Snapshot().Count >= 3 && control.Snapshot().Count >= 3, 40000);
+
+        string[] tail = { "ack-1", "ack-2" };
+
+        int Redelivered(PartialAckListener l)
+        {
+            List<(string Body, string Topic, int ReconsumeTimes)> seen = l.Snapshot();
+            int hit = 0;
+            foreach (string b in tail)
+            {
+                if (seen.Any(r => r.Body == b && r.ReconsumeTimes >= 1 && r.Topic == topic)) ++hit;
+            }
+
+            return hit;
+        }
+
+        // 尾巴要经 %RETRY%（延迟 level 3≈10s）+ 重试 topic 的路由注册 + 下一轮 rebalance
+        bool tailBack = WaitUntil(() => Redelivered(partial) == tail.Length, 150000);
+        Thread.Sleep(10000);  // 反证窗口：多余的重复投递会露出来
+        List<(string Body, string Topic, int ReconsumeTimes)> seenFinal = partial.Snapshot();
+
+        Check("S10-首批确实拿到 3 条（ackIndex=0 才有「部分」可言）",
+            partial.FirstBatchSize == 3,
+            "firstBatch=" + partial.FirstBatchSize.ToString(CultureInfo.InvariantCulture));
+        Check("S10-未认可的尾巴从 %RETRY% 回来（reconsumeTimes>=1 且 topic 是业务 topic）",
+            tailBack,
+            "redelivered=" + Redelivered(partial).ToString(CultureInfo.InvariantCulture) + "/2");
+        int ackedHits = seenFinal.Count(r => r.Body == "ack-0");
+        Check("S10-已认可的那条整个窗口只投一次（没有把前缀也回投）", ackedHits == 1,
+            "arrivals=" + ackedHits.ToString(CultureInfo.InvariantCulture));
+        Check("S10-3 条最终全部消费（不丢）",
+            seenFinal.Select(r => r.Body).Distinct().Count() == 3,
+            "distinct=" + seenFinal.Select(r => r.Body).Distinct().Count()
+                .ToString(CultureInfo.InvariantCulture));
+
+        List<(string Body, string Topic, int ReconsumeTimes)> ctrl = control.Snapshot();
+        Check("S10-对照组默认 ackIndex(MAX_VALUE)：一条都不回投",
+            ctrl.Count == 3 && ctrl.All(r => r.ReconsumeTimes == 0),
+            "deliveries=" + ctrl.Count.ToString(CultureInfo.InvariantCulture)
+            + " retried=" + ctrl.Count(r => r.ReconsumeTimes >= 1).ToString(CultureInfo.InvariantCulture));
+
+        // broker 侧口径：两个组的业务队列位点都必须整批提交到 3（部分 ack 不是「少提交」，
+        // 尾巴已交给 broker 重投，本队列没有欠账）
+        var admin = new DefaultMQAdminExt();
+        admin.SetNamesrvAddr(_namesrv);
+        admin.SetTimeoutMillis(10000);
+        try
+        {
+            admin.Start();
+            List<MessageQueue> queues = pc.FetchSubscribeMessageQueues(topic);
+            Check("S10-业务 topic 有队列可查位点", queues.Count > 0,
+                "queues=" + queues.Count.ToString(CultureInfo.InvariantCulture));
+            if (queues.Count > 0)
+            {
+                MessageQueue mq = queues[0];
+                // -1 = broker 还没有该组的位点（QUERY_NOT_FOUND）
+                long ReadOffset(string g)
+                {
+                    try
+                    {
+                        return admin.ExamineConsumerOffset(g, mq, out long off) ? off : -1;
+                    }
+                    catch (Exception)
+                    {
+                        return -1;
+                    }
+                }
+
+                bool p = WaitUntil(() => ReadOffset(group) == 3, 30000);
+                Check("S10-部分 ack 后业务队列位点仍整批前进到 3", p,
+                    "committed=" + ReadOffset(group).ToString(CultureInfo.InvariantCulture));
+                bool c = WaitUntil(() => ReadOffset(controlGroup) == 3, 30000);
+                Check("S10-对照组业务队列位点同样到 3", c,
+                    "committed=" + ReadOffset(controlGroup).ToString(CultureInfo.InvariantCulture));
+            }
+        }
+        catch (Exception e)
+        {
+            Check("S10-位点查询可用", false, e.Message);
+        }
+
+        admin.Shutdown();
+        pc.Shutdown();
+        cc.Shutdown();
     }
 }

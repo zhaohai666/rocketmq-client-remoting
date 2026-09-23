@@ -488,6 +488,9 @@ pub struct ConsumeConcurrentlyContext {
     /// 缺省 0；为 0 时由投递线程改写成 `3 + reconsumeTimes`
     /// （见 `consumer.rs` 的重投逻辑，对齐 Python `_send_back_batch`）。
     pub delay_level_when_next_consume: i32,
+    /// 对应 Java `ConsumeConcurrentlyContext.ackIndex`（默认 `Integer.MAX_VALUE`）：
+    /// listener 用它表达「这批只认可到第几条」（含自身），其后的条目按状态回投/丢弃。
+    /// 默认即「整批认可」，只有 listener 主动调小才会部分 ack。
     pub ack_index: i32,
 }
 
@@ -496,7 +499,7 @@ impl ConsumeConcurrentlyContext {
         ConsumeConcurrentlyContext {
             message_queue,
             delay_level_when_next_consume: 0,
-            ack_index: -1,
+            ack_index: i32::MAX,
         }
     }
 }
@@ -646,7 +649,8 @@ mod tests {
     fn consume_contexts_default_like_java() {
         let ctx = ConsumeConcurrentlyContext::new(None);
         assert_eq!(ctx.delay_level_when_next_consume, 0);
-        assert_eq!(ctx.ack_index, -1);
+        // Java ConsumeConcurrentlyContext:33 —— 默认「整批认可」，不是「一条都不认可」
+        assert_eq!(ctx.ack_index, i32::MAX);
         let orderly = ConsumeOrderlyContext::new(Some(MessageQueue::new("T", "b", 0)));
         assert!(orderly.auto_commit);
         assert_eq!(orderly.suspend_current_queue_time_millis, 1000);

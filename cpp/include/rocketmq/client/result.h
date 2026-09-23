@@ -11,6 +11,7 @@
 #define ROCKETMQ_CLIENT_RESULT_H
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -204,7 +205,10 @@ enum class ConsumeOrderlyStatus {
 struct ConsumeConcurrentlyContext {
     MessageQueue messageQueue;
     int32_t delayLevelWhenNextConsume = 0;
-    int32_t ackIndex = -1;
+    // 对应 Java ConsumeConcurrentlyContext.ackIndex（默认 Integer.MAX_VALUE）：
+    // 「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
+    // 默认值是「全批认可」，只有 listener 主动调小才会部分 ack。
+    int32_t ackIndex = std::numeric_limits<int32_t>::max();
     explicit ConsumeConcurrentlyContext(const MessageQueue& mq = MessageQueue()) : messageQueue(mq) {}
 };
 

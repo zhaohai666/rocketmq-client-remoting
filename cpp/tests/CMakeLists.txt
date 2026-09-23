@@ -78,6 +78,12 @@ add_executable(rmq_test_pop_consumer test_pop_consumer.cpp)
 target_link_libraries(rmq_test_pop_consumer PRIVATE rocketmq::remoting)
 add_test(NAME pop_consumer COMMAND rmq_test_pop_consumer)
 
+# classic 并发消费的 ackIndex 语义（Java processConsumeResult）：部分 ack 的尾巴回投、
+# 回投失败钳住位点、RECONSUME_LATER 覆盖宽 ackIndex、广播丢尾巴
+add_executable(rmq_test_consume_ack_index test_consume_ack_index.cpp)
+target_link_libraries(rmq_test_consume_ack_index PRIVATE rocketmq::remoting)
+add_test(NAME consume_ack_index COMMAND rmq_test_consume_ack_index)
+
 # 消息轨迹：Java 逐字节对拍向量 + javaSplit 语义 + 无 keys SubBefore / 坏记录隔离回归
 add_executable(rmq_test_trace test_trace.cpp)
 target_link_libraries(rmq_test_trace PRIVATE rocketmq::remoting)

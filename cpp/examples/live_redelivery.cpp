@@ -16,6 +16,10 @@
 //   S9 死信终态：maxReconsumeTimes=2 ⇒ 恰好投递 3 次（reconsumeTimes 0/1/2），第 3 次回投后
 //      broker 改投 %DLQ%<group>（自动建 topic 并注册路由），死信里 reconsumeTimes=3、
 //      RETRY_TOPIC 保留业务 topic，且原组不再有第 4 次投递。
+//   S10 部分 ack（ackIndex）：CONSUME_SUCCESS + 一批 3 条里只认可第 1 条 ⇒ 尾巴 2 条经
+//      %RETRY% 重投（reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口
+//      只投一次、3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）
+//      一条都不回投。
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 prepareTopic）。消费者不做默认 topic
 //   兜底（对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），所以 topic 不存在
@@ -33,6 +37,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/admin.h"
 #include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/lite_pull_consumer.h"
@@ -722,6 +727,174 @@ int main(int argc, char* argv[]) {
                 "retryTopic="
                     + (retryIt == d.properties.end() ? std::string("<missing>") : retryIt->second));
         }
+    }
+
+    // ---------------- S10 部分 ack（ackIndex） ----------------
+    // Java ConsumeMessageConcurrentlyService#processConsumeResult:207-269：CONSUME_SUCCESS
+    // 时 listener 写的 ackIndex 把本批切成「已认可前缀 / 待回投后缀」，尾巴逐条
+    // sendMessageBack；默认 Integer.MAX_VALUE 就是整批认可。
+    // 离线单测（tests/test_consume_ack_index.cpp）只能锁「回投**失败**时位点不越过它」
+    // —— 未 start 的消费者回投必败；「回投成功时尾巴真的被 broker 收下重投、已 ack 的那条
+    // 整个窗口只投一次、业务队列位点仍整批前进」只有真 broker 说得了算得了。
+    // 两种写错在离线看不出差别：忘记回投（尾巴静默丢失，收到的条数照样对）、
+    // 把已 ack 的前缀也回投（看起来"没丢"，其实重复投递）。
+    {
+        const std::string topic = gPrefix + "_AckIndex";
+        prepareTopic(producer, topic, 1);  // 1 队列：一批 3 条才连续且有序
+
+        struct Rec {
+            std::string body;
+            std::string topic;
+            int32_t times;
+        };
+        struct Sink {
+            std::mutex mtx;
+            std::vector<Rec> recs;
+            std::vector<size_t> batchSizes;
+
+            std::vector<Rec> snapshot() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return recs;
+            }
+            size_t batchSize(size_t i) {
+                std::lock_guard<std::mutex> lk(mtx);
+                return i < batchSizes.size() ? batchSizes[i] : 0;
+            }
+            size_t count() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return recs.size();
+            }
+        };
+
+        // ackFirst < 0 = 完全不碰 ackIndex（对照组）
+        class L : public MessageListenerConcurrently {
+        public:
+            L(Sink& sink, int32_t ackFirst) : sink_(sink), ackFirst_(ackFirst) {}
+            ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                     ConsumeConcurrentlyContext& ctx) override {
+                std::lock_guard<std::mutex> lk(sink_.mtx);
+                for (const MessageExt& m : msgs) {
+                    sink_.recs.push_back({bodyOf(m), m.topic, m.getReconsumeTimes()});
+                }
+                // 只在**首批**收窄 ackIndex：后续批次必须整批认可，否则尾巴永远回投不完
+                sink_.batchSizes.push_back(msgs.size());
+                if (ackFirst_ >= 0 && sink_.batchSizes.size() == 1) {
+                    ctx.ackIndex = ackFirst_;
+                }
+                return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+            }
+
+        private:
+            Sink& sink_;
+            int32_t ackFirst_;
+        };
+
+        const std::string group = gPrefix + "_g10";
+        const std::string controlGroup = gPrefix + "_g10ctrl";
+        Sink partial, control;
+        auto mk = [&](const std::string& g, Sink& s, int32_t ackFirst) {
+            auto c = std::make_shared<DefaultMQPushConsumer>(g);
+            c->setNamesrvAddr(nsAddr);
+            // 默认一批 1 条，不收窄到 3 就根本没有「部分」可言
+            c->setConsumeMessageBatchMaxSize(3);
+            c->subscribe(topic);
+            c->setMessageListener(std::make_shared<L>(s, ackFirst));
+            return c;
+        };
+        auto pc = mk(group, partial, 0);
+        auto cc = mk(controlGroup, control, -1);
+        // 先把 3 条放上去再起消费者：批次怎么切由拉取时机决定，先发才必然是「一整批 3 条」，
+        // 否则首批可能只有 1~2 条，ackIndex=0 扣下的尾巴数量就不确定了。
+        // 新组在 LAST_OFFSET 下会从分配时刻的最新位点开始，故显式从 FIRST_OFFSET 起消。
+        pc->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        cc->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        for (int i = 0; i < 3; ++i) {
+            producer.send(Message(topic, str2bytes("ack-" + std::to_string(i))));
+        }
+        pc->start();
+        cc->start();
+        waitUntil([&] { return partial.count() >= 3 && control.count() >= 3; }, 40000);
+
+        const std::vector<std::string> tail = {"ack-1", "ack-2"};
+        auto redelivered = [&](Sink& s) {
+            const std::vector<Rec> seen = s.snapshot();
+            size_t hit = 0;
+            for (const std::string& b : tail) {
+                for (const Rec& r : seen) {
+                    if (r.body == b && r.times >= 1 && r.topic == topic) {
+                        ++hit;
+                        break;
+                    }
+                }
+            }
+            return hit;
+        };
+        // 尾巴要经 %RETRY%（延迟 level 3≈10s）+ 重试 topic 的路由注册 + 下一轮 rebalance
+        const bool tailBack = waitUntil([&] { return redelivered(partial) == tail.size(); }, 150000);
+        std::this_thread::sleep_for(std::chrono::seconds(10));  // 反证窗口：多余的重复投递会露出来
+        const std::vector<Rec> seen = partial.snapshot();
+
+        check("S10-首批确实拿到 3 条（ackIndex=0 才有「部分」可言）",
+              partial.batchSize(0) == 3, "firstBatch=" + std::to_string(partial.batchSize(0)));
+        check("S10-未认可的尾巴从 %RETRY% 回来（reconsumeTimes>=1 且 topic 是业务 topic）",
+              tailBack, "redelivered=" + std::to_string(redelivered(partial)) + "/2");
+        size_t ackedHits = 0;
+        for (const Rec& r : seen) {
+            if (r.body == "ack-0") ++ackedHits;
+        }
+        check("S10-已认可的那条整个窗口只投一次（没有把前缀也回投）", ackedHits == 1,
+              "arrivals=" + std::to_string(ackedHits));
+        std::set<std::string> distinct;
+        for (const Rec& r : seen) distinct.insert(r.body);
+        check("S10-3 条最终全部消费（不丢）", distinct.size() == 3,
+              "distinct=" + std::to_string(distinct.size()));
+
+        size_t ctrlRetried = 0;
+        const std::vector<Rec> ctrl = control.snapshot();
+        for (const Rec& r : ctrl) {
+            if (r.times >= 1) ++ctrlRetried;
+        }
+        check("S10-对照组默认 ackIndex(MAX_VALUE)：一条都不回投",
+              ctrl.size() == 3 && ctrlRetried == 0,
+              "deliveries=" + std::to_string(ctrl.size()) + " retried=" + std::to_string(ctrlRetried));
+
+        // broker 侧口径：两条组的业务队列位点都必须整批提交到 3（部分 ack 不是「少提交」，
+        // 尾巴已交给 broker 重投，本队列没有欠账）
+        DefaultMQAdminExt admin(gPrefix + "_admin10");
+        admin.setNamesrvAddr(nsAddr);
+        try {
+            admin.start();
+            const std::vector<MessageQueue> queues = pc->fetchSubscribeMessageQueues(topic);
+            check("S10-业务 topic 有队列可查位点", !queues.empty(),
+                  "queues=" + std::to_string(queues.size()));
+            if (!queues.empty()) {
+                const MessageQueue mq = queues.front();
+                // -1 = broker 还没有该组的位点（QUERY_NOT_FOUND）
+                auto readOffset = [&](const std::string& g) -> int64_t {
+                    int64_t off = -1;
+                    try {
+                        if (!admin.examineConsumerOffset(g, mq, off)) return -1;
+                    } catch (const std::exception&) {
+                        return -1;
+                    }
+                    return off;
+                };
+                auto committedIs = [&](const std::string& g, int64_t want) {
+                    return readOffset(g) == want;
+                };
+                const bool p = waitUntil([&] { return committedIs(group, 3); }, 30000);
+                check("S10-部分 ack 后业务队列位点仍整批前进到 3", p,
+                      "committed=" + std::to_string(readOffset(group)));
+                const bool c = waitUntil([&] { return committedIs(controlGroup, 3); }, 30000);
+                check("S10-对照组业务队列位点同样到 3", c,
+                      "committed=" + std::to_string(readOffset(controlGroup)));
+            }
+        } catch (const std::exception& e) {
+            check("S10-位点查询可用", false, e.what());
+        }
+        admin.shutdown();
+        pc->shutdown();
+        cc->shutdown();
     }
 
     producer.shutdown();

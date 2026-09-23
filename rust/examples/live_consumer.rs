@@ -19,6 +19,11 @@
 //! - C4b 死信终态：`maxReconsumeTimes=2` ⇒ 恰好投递 3 次（0/1/2），第 3 次回投后
 //!   broker 把消息改投 `%DLQ%<group>`（自动建 topic 并注册路由），死信里
 //!   `reconsumeTimes=3`、`RETRY_TOPIC` 保留业务 topic，原组不再有第 4 次投递。
+//! - C4c 部分 ack：listener 在首批（`consumeMessageBatchMaxSize=3`）上设
+//!   `context.ack_index = 0` ⇒ 只有第一条被认可，后两条经 `%RETRY%` 二次到达
+//!   （`reconsumeTimes>=1`、listener 看到的仍是业务 topic），被 ack 的那条整个窗口
+//!   只投一次，3 条最终一条不丢，业务队列位点仍整批前进到 3；对照腿（不碰
+//!   `ack_index`，Java 默认 `Integer.MAX_VALUE`）一条都不回投。
 //! - C5 POP 模式：弹出即带 `POP_CK`，消费成功后 `waitAckCounter` 归零，
 //!   等过一个 invisibleTime 窗口**不再重投**（证明 ack 真的写到了 broker）；
 //!   且 POP 路径完全不写消费位点。
@@ -1037,6 +1042,188 @@ async fn c4_retry_and_topic_reset(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
 }
 
+// ------------------------------- C4c 部分 ack（ConsumeConcurrentlyContext.ackIndex）
+
+/// 只在**首批**把 ackIndex 收窄的并发 listener。
+///
+/// 后续批次必须整批认可，否则尾巴会永远回投不完，收敛不了。
+struct PartialAckListener {
+    inbox: Arc<Inbox>,
+    /// 首批要 ack 到的下标（含自身）；`None` = 完全不碰 ackIndex（对照腿）。
+    ack_index_first_batch: Option<i32>,
+    first_batch: Mutex<Vec<String>>,
+}
+
+impl MessageListenerConcurrently for PartialAckListener {
+    fn consume_message(
+        &self,
+        msgs: &[MessageExt],
+        context: &mut ConsumeConcurrentlyContext,
+    ) -> ConsumeConcurrentlyStatus {
+        {
+            let mut items = lock(&self.inbox.items);
+            for msg in msgs {
+                items.push(Delivered::from(msg));
+            }
+        }
+        let batch = self.inbox.batches.fetch_add(1, Ordering::SeqCst);
+        if batch == 0 {
+            let bodies: Vec<String> = msgs
+                .iter()
+                .map(|m| String::from_utf8_lossy(m.get_body()).into_owned())
+                .collect();
+            *lock(&self.first_batch) = bodies;
+            if let Some(index) = self.ack_index_first_batch {
+                context.ack_index = index;
+            }
+        }
+        ConsumeConcurrentlyStatus::ConsumeSuccess
+    }
+}
+
+/// `ackIndex` 的部分 ack：为什么只能真机验。
+///
+/// 离线单测（`consumer.rs` 的 `mod tests`）能锁住「尾巴回投**失败**时位点不越过它」，
+/// 但回投**成功**时的语义 —— 未认可的条目真的被 broker 收下并重新投递、已 ack 的那条
+/// 整个窗口只投一次、业务队列位点仍然整批前进 —— 只有真 broker 说得了算得了。
+/// 写错的两种形态在离线都看不出差别：忘记回投（尾巴静默丢失，收到的条数照样对）、
+/// 或者把已 ack 的前缀也回投（消息重复投递，看起来"没丢"）。
+/// 造一个「一批 3 条 + 可选收窄 ackIndex」的 push consumer。
+fn partial_ack_consumer(
+    fx: &Fixture,
+    topic: &str,
+    group: &str,
+    listener: Arc<PartialAckListener>,
+) -> Result<DefaultMQPushConsumer, String> {
+    // consumeMessageBatchMaxSize 默认 1，不收窄到 3 就根本没有「部分」可言。
+    // 用例是「先把 3 条放上去、再起消费者」，所以新组必须从 FIRST_OFFSET 起消：
+    // LAST_OFFSET 下新组会从分配时刻的最新位点开始，先发的那 3 条会被直接跳过。
+    let cfg = ConsumerConfig {
+        consume_message_batch_max_size: 3,
+        consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
+        ..fx.base_config(group)
+    };
+    let c = DefaultMQPushConsumer::with_config(cfg).map_err(|e| format!("build failed: {e}"))?;
+    c.subscribe(topic, "*")
+        .map_err(|e| format!("subscribe failed: {e}"))?;
+    c.set_message_listener_concurrently(listener);
+    Ok(c)
+}
+
+async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C4c CONSUME_SUCCESS + ackIndex 部分 ack → 尾巴经 %RETRY% 重投");
+    let topic = fx.topic_name("PartialAck");
+    let group = fx.group_name("partial-ack");
+    let control_group = fx.group_name("full-ack-control");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C4c create topic", &e);
+    }
+    let inbox = Arc::new(Inbox::default());
+    let control_inbox = Arc::new(Inbox::default());
+    let listener = Arc::new(PartialAckListener {
+        inbox: inbox.clone(),
+        ack_index_first_batch: Some(0),
+        first_batch: Mutex::new(Vec::new()),
+    });
+    let control_listener = Arc::new(PartialAckListener {
+        inbox: control_inbox.clone(),
+        // 对照腿：完全不碰 ackIndex（Java 默认 Integer.MAX_VALUE = 整批认可）
+        ack_index_first_batch: None,
+        first_batch: Mutex::new(Vec::new()),
+    });
+    let mut pairs = Vec::new();
+    for (g, l) in [(&group, listener.clone()), (&control_group, control_listener.clone())] {
+        match partial_ack_consumer(fx, &topic, g, l) {
+            Ok(c) => pairs.push(c),
+            Err(e) => return ck.abort("C4c build consumer", &e),
+        }
+    }
+    let (c, control) = (pairs.remove(0), pairs.remove(0));
+    // 先发再起消费者：批次怎么切由拉取时机决定，队列里已经躺着 3 条时第一次拉取才会
+    // 正好是「一整批 3 条」，否则首批可能是 1~2 条，ackIndex=0 划出的前缀/后缀就不确定了。
+    fx.produce(&topic, "TagA", 3, None).await;
+    if let Err(e) = c.start().await {
+        return ck.abort("C4c start", &format!("{e}"));
+    }
+    if let Err(e) = control.start().await {
+        return ck.abort("C4c control start", &format!("{e}"));
+    }
+
+    // 首批必须正好 3 条，否则 ackIndex=0 划出来的「前缀/后缀」根本不确定
+    let first = poll_until(|| !lock(&listener.first_batch).is_empty(), WAIT_SECONDS).await;
+    let first_batch = lock(&listener.first_batch).clone();
+    ck.check(
+        "C4c the listener really got one batch of 3 messages",
+        first && first_batch.len() == 3,
+        &format!("firstBatch={first_batch:?}"),
+    );
+    let tail: Vec<String> = first_batch[1..].to_vec();
+    let redelivered = {
+        let tail = tail.clone();
+        poll_until(
+            || {
+                tail.iter().all(|b| {
+                    inbox
+                        .matching(b)
+                        .iter()
+                        .any(|d| d.reconsume_times >= 1 && d.topic == topic)
+                })
+            },
+            WAIT_SECONDS * 3,
+        )
+        .await
+    };
+    let acked = first_batch.first().cloned().unwrap_or_default();
+    let seen = inbox.snapshot();
+    ck.check(
+        "C4c the unacked tail comes back from the broker's retry topic (reconsumeTimes>=1, original topic)",
+        redelivered,
+        &format!("tail={tail:?} deliveries={}", seen.len()),
+    );
+    ck.check(
+        "C4c the acked prefix message is delivered exactly once (no over-redelivery)",
+        !acked.is_empty() && inbox.matching(&acked).len() == 1,
+        &format!("acked={acked} times={}", inbox.matching(&acked).len()),
+    );
+    ck.check(
+        "C4c nothing is lost: all 3 bodies were consumed",
+        inbox.bodies().len() == 3,
+        &format!("distinct={}", inbox.bodies().len()),
+    );
+    // 尾巴已经交给 broker 重投，业务队列的位点仍要整批前进（Java:266 removeMessage(整批)）
+    let committed = fx.wait_committed(&group, &topic, 1, 3).await;
+    ck.check(
+        "C4c the business queue offset still advances past the whole batch",
+        committed == 3,
+        &format!("committed={committed}"),
+    );
+    // 对照腿：不碰 ackIndex ⇒ 一条都不该回投
+    let control_seen = poll_until(|| control_inbox.count() >= 3, WAIT_SECONDS).await;
+    let control_deliveries = control_inbox.snapshot();
+    ck.check(
+        "C4c control: default ackIndex (MAX_VALUE) sends NOTHING back",
+        control_seen
+            && control_inbox.count() == 3
+            && control_deliveries.iter().all(|d| d.reconsume_times == 0),
+        &format!(
+            "deliveries={} times={:?}",
+            control_inbox.count(),
+            control_deliveries
+                .iter()
+                .map(|d| d.reconsume_times)
+                .collect::<Vec<i32>>()
+        ),
+    );
+    let control_committed = fx.wait_committed(&control_group, &topic, 1, 3).await;
+    ck.check(
+        "C4c control: the untouched group commits all 3 offsets",
+        control_committed == 3,
+        &format!("committed={control_committed}"),
+    );
+    c.shutdown();
+    control.shutdown();
+}
+
 // --------------------------------------------- C4b 重试耗尽 → %DLQ% 终态
 
 /// 死信终态：为什么只能真机验。
@@ -1833,6 +2020,7 @@ async fn run(namesrv: &str) -> Checker {
     c3_tag_filter(&mut ck, &fx).await;
     c4_retry_and_topic_reset(&mut ck, &fx).await;
     c4b_dlq_terminal(&mut ck, &fx).await;
+    c4c_partial_ack(&mut ck, &fx).await;
     c5_pop_mode(&mut ck, &fx).await;
     c6_broadcasting_and_local_offsets(&mut ck, &fx).await;
     c7_orderly_and_lock(&mut ck, &fx).await;

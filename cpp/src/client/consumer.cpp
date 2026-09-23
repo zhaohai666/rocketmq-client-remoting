@@ -576,6 +576,7 @@ void DefaultMQPushConsumer::shutdown() {
         if (kv.second.joinable()) kv.second.join();
     }
     pullThreads_.clear();
+    pullOwners_.clear();
     for (std::thread& t : retiredThreads_) {
         if (t.joinable()) t.join();
     }
@@ -632,17 +633,45 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
     for (const MessageQueue& mq : queues) {
         current[offsetKey(mq)] = mq;
     }
-    std::vector<std::pair<std::string, MessageQueue>> toStart;
     std::vector<std::pair<MessageQueue, int64_t>> revoked;
     {
         std::lock_guard<std::mutex> lk(lock_);
-        // 1. 新分配的队列：起拉取线程
+        // 1. 新分配的队列：**在同一把锁里**登记归属并把线程建出来。
+        //    std::thread 一构造就跑（不像 Python/.NET 能「先入表再 start」），所以
+        //    「写 pullOwners_」必须在构造之前，而「写 pullThreads_」必须与它同批完成。
+        //    错开一步就有两种坏结果：
+        //      * 新线程先跑到 ownsQueue()，看到表里还没有自己 ⇒ 当场退出；而 key
+        //        随后被登记成「已有拉取线程」，之后每轮 rebalance 都不会再起 ——
+        //        这条队列**永久静默**，落在它上面的消息一条都不会投（真机少一整批
+        //        消息、且重复数=0 的根因）。
+        //      * 两轮 rebalance 交错给同一 key 起两条线程 ⇒ 同一队列重复消费。
+        //    新线程第一轮要拿的正是这把锁，它会等到我们 release，看到的一定是登记完
+        //    成之后的状态，所以「先跑起来看不到归属」的窗口被彻底关死。
         for (const auto& kv : current) {
-            if (pullThreads_.find(kv.first) == pullThreads_.end()) {
-                if (popMode_ && popQueues_.find(kv.first) == popQueues_.end()) {
-                    popQueues_[kv.first] = std::make_shared<PopProcessQueue>();
-                }
-                toStart.emplace_back(kv.first, kv.second);
+            if (pullThreads_.find(kv.first) != pullThreads_.end()) continue;
+            if (popMode_ && popQueues_.find(kv.first) == popQueues_.end()) {
+                popQueues_[kv.first] = std::make_shared<PopProcessQueue>();
+            }
+            const uint64_t token = ++nextPullToken_;
+            pullOwners_[kv.first] = token;
+            const std::string key = kv.first;
+            const MessageQueue mq = kv.second;
+            try {
+                std::thread t([this, mq, key, token]() {
+                    if (popMode_) {
+                        setThreadName("PopMessageService");
+                        queuePopLoop(mq, token);
+                    } else {
+                        setThreadName("PullMessageService");
+                        queuePullLoop(mq, token);
+                    }
+                });
+                pullThreads_[key] = std::move(t);
+            } catch (const std::system_error& e) {
+                // 起线程失败（资源耗尽）必须把归属收回，留着一个没人认领的 token
+                // 等于给这条队列判了永久静默；收回去下一轮 rebalance 会重试。
+                pullOwners_.erase(key);
+                logger_warn("rebalance: cannot start pull thread for " + key + ": " + e.what());
             }
         }
         // 2. 被撤销的队列：清状态 + 收集 (mq, 已消费位点)，把旧线程移到 retiredThreads_
@@ -657,6 +686,9 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
                 if (oit != consumeOffsetTable_.end()) off = oit->second;
                 revoked.emplace_back(mq, off);
                 retiredThreads_.push_back(std::move(it->second));
+                // 撤走归属：旧线程下一轮 ownsQueue 即失效并退出，即便同一队列马上
+                // 重新分配给本实例，也会拿到一份**新**凭据、起一条新线程。
+                pullOwners_.erase(it->first);
                 mqMap_.erase(it->first);
                 pending_.erase(it->first);
                 lockOk_.erase(it->first);
@@ -673,26 +705,6 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
                 ++it;
             }
         }
-    }
-    for (const auto& kv : toStart) {
-        // 捕获 kv.second（拷贝），线程内再通过成员访问共享状态
-        std::thread t([this, mq = kv.second, key = kv.first]() {
-            if (popMode_) {
-                setThreadName("PopMessageService");
-                queuePopLoop(mq);
-            } else {
-                setThreadName("PullMessageService");
-                queuePullLoop(mq);
-            }
-            (void)key;
-        });
-        std::lock_guard<std::mutex> lk(lock_);
-        // 竞态保护：rebalance 可能把同 key 再起一次
-        if (pullThreads_.find(kv.first) != pullThreads_.end()) {
-            if (t.joinable()) t.detach();  // 多余的线程自己退出
-            continue;
-        }
-        pullThreads_[kv.first] = std::move(t);
     }
     // 网络/落盘在锁外做
     if (!revoked.empty()) {
@@ -731,14 +743,14 @@ void DefaultMQPushConsumer::rebalanceLoop() {
     }
 }
 
-void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
+void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token) {
     MQClientInstance& c = client();
     const bool orderly = isOrderly();
     const std::string key = offsetKey(mq);
     while (!stop_.load() && started_.load()) {
         // 长轮询期间被 rebalance 撤走（队列或换了拉取线程）即失效：直接退出本线程，
         // 由新属主从我们最后持久化的位点接手，避免两实例重复消费同一条消息。
-        if (!ownsQueue(key)) {
+        if (!ownsQueue(key, token)) {
             return;
         }
         SubscriptionData sub;
@@ -847,7 +859,7 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
         // 入队与「是否仍持有该队列」必须一致：长轮询期间被 rebalance 撤走的队列，这批消息按
         // Java 语义（ProcessQueue.isDropped()）直接丢弃——不消费、不推进位点，由新属主从我们
         // 最后持久化的位点重投，否则两实例会重复消费同一条消息。
-        if (!ownsQueue(key)) {
+        if (!ownsQueue(key, token)) {
             logger_debug("queue " + mq.toString()
                          + " revoked during pull, discard fetched messages");
             return;
@@ -879,7 +891,7 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq) {
 }
 
 // ---------------------------------------------------------------- POP 消费循环
-void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq) {
+void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token) {
     // 与 pull 循环的关键差别：
     //   - **不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；
     //   - 弹出即投递给消费线程，本轮循环立刻继续（不等消费结果）；
@@ -898,7 +910,7 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq) {
             : static_cast<int32_t>(ConsumeInitMode::MAX);
 
     while (!stop_.load() && started_.load()) {
-        if (!ownsQueue(key)) return;
+        if (!ownsQueue(key, token)) return;
         std::shared_ptr<PopProcessQueue> pq;
         {
             std::lock_guard<std::mutex> lk(lock_);
@@ -938,7 +950,7 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq) {
         // 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
         // （Java 对应 PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
         // broker 自动复活重投给新属主。
-        if (!ownsQueue(key) || pq->isDropped()) {
+        if (!ownsQueue(key, token) || pq->isDropped()) {
             logger_debug("queue " + key + " revoked during pop, discard "
                          + std::to_string(result.msgFoundList.size()) + " messages un-acked");
             return;
@@ -1020,10 +1032,10 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
 
     resetRetryTopicAndNamespace(msgs);
     ConsumeConcurrentlyContext ctx(mq);
-    // ⚠ 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE：
-    // 默认就是"全部 ack"。本项目的默认值是 -1（push 回投路径的语义），若不在 POP 这里
-    // 改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，消息在 invisibleTime 到期后被
-    // broker 复活重投 —— 短观测窗口下会伪装成通过。
+    // 对应 Java ConsumeMessagePopConcurrentlyService：POP 路径把 ackIndex 当
+    // 「已 ack 到第几条」用，语义与 classic 回投路径一致，默认值 Integer.MAX_VALUE
+    // 已经表示「整批 ack」；这里钳到 size-1 只是让 ctx 上的值与本批条数对齐，
+    // 不影响 CONSUME_SUCCESS 的行为（不 ack 会让消息在 invisibleTime 后被复活重投）。
     ctx.ackIndex = static_cast<int32_t>(msgs.size()) - 1;
     // 消费钩子：before 在 listener 之前，after 紧跟在 listener 之后
     // （Java ConsumeMessagePopConcurrentlyService:360-422 就是这个顺序：
@@ -1373,14 +1385,19 @@ void DefaultMQPushConsumer::finishConsumeHook(ConsumeMessageContext* hookCtx, bo
 }
 
 void DefaultMQPushConsumer::recordConsumeStats(const std::string& topic, int64_t msgCount,
-                                               int64_t beginMs, bool failed) {
+                                               int64_t beginMs, bool failed,
+                                               const std::optional<int64_t>& ackCount) {
     if (!mqClient_) return;
     auto& stats = mqClient_->consumerStats();
     const int64_t rt = UtilAll::currentTimeMillis() - beginMs;
     if (failed) {
         stats.incConsumeFailedTPS(consumerGroup_, topic, msgCount);
     } else {
-        stats.incConsumeOKTPS(consumerGroup_, topic, msgCount);
+        // Java processConsumeResult:217-225 —— ok = ackIndex + 1，部分 ack 时
+        // 前缀记 OK、尾巴记 FAILED（否则整批算成功会低估失败量、看不出有多少条要重投）
+        const int64_t ok = ackCount.has_value() ? *ackCount : msgCount;
+        stats.incConsumeOKTPS(consumerGroup_, topic, ok);
+        if (msgCount > ok) stats.incConsumeFailedTPS(consumerGroup_, topic, msgCount - ok);
     }
     stats.incConsumeRT(consumerGroup_, topic, rt);
 }
@@ -1654,73 +1671,123 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
         hookHasException = true;
     }
-    recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs,
-                       status == ConsumeConcurrentlyStatus::RECONSUME_LATER);
+    // Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
+    // 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
+    // RECONSUME_LATER 强制 ackIndex=-1，整批回投。
+    const auto size32 = static_cast<int32_t>(restored.size());
+    int32_t ackIndex = ctx.ackIndex;
+    if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
+        if (ackIndex >= size32) {
+            ackIndex = size32 - 1;
+        }
+    } else {
+        ackIndex = -1;
+    }
+    const size_t acked = static_cast<size_t>(ackIndex + 1);  // 0..size
+    recordConsumeStats(mq.topic, size32, hookBeginMs,
+                       status == ConsumeConcurrentlyStatus::RECONSUME_LATER,
+                       static_cast<int64_t>(acked));
     if (useHook) {
         const bool ok = (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS);
         finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
                           ok ? "CONSUME_SUCCESS" : "RECONSUME_LATER");
     }
-    if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
-        advanceConsumeOffset(key, restored);
-        consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
-        return true;
-    }
-    // RECONSUME_LATER：广播模式不回投（仅告警，位点前进，重启后不重投）；
-    // 集群模式回投 %RETRY%topic（延迟梯度 3+reconsumeTimes，超限由 broker 转 %DLQ%）
     if (broadcast) {
-        logger_warn("BROADCASTING: message consume failed, no redelivery: "
-                    + std::to_string(restored.size()) + " msgs in " + mq.toString());
+        // Java:232-237 —— 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
+        // 整批位点照样前进（重启后不重投）
+        const size_t dropped = restored.size() - acked;
+        if (dropped > 0) {
+            logger_warn("BROADCASTING, the message consume failed, drop it: "
+                        + std::to_string(dropped) + " msgs in " + mq.toString());
+        }
         advanceConsumeOffset(key, restored);
         consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
-    if (sendBackBatch(restored, ctx)) {
+    if (acked >= restored.size()) {
+        // 整批认可（默认路径）：一条都不用回投，位点直接前进
         advanceConsumeOffset(key, restored);
         consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
-    // 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
-    {
+    // 集群模式：未认可的 [acked, size) 逐条回投 %RETRY%topic
+    //（延迟梯度 3+reconsumeTimes，超限由 broker 转 %DLQ%）
+    const std::vector<std::pair<size_t, MessageExt>> msgBackFailed = sendBackBatch(restored, ctx, acked);
+    std::set<size_t> failedIdx;
+    int64_t floorVal = 0;
+    bool hasFloor = false;
+    for (const std::pair<size_t, MessageExt>& p : msgBackFailed) {
+        failedIdx.insert(p.first);
+        const int64_t off = restored[p.first].queueOffset;
+        if (!hasFloor || off < floorVal) {
+            floorVal = off;
+            hasFloor = true;
+        }
+    }
+    // Java:256-260 —— 回投失败的那几条塞回队首稍后重试（ProcessQueue 里不摘掉它们）
+    if (!msgBackFailed.empty()) {
         std::lock_guard<std::mutex> lk(lock_);
         auto it = pending_.find(key);
         if (it != pending_.end()) {
-            for (auto rit = restored.rbegin(); rit != restored.rend(); ++rit) {
-                it->second.push_front(*rit);
+            for (auto rit = msgBackFailed.rbegin(); rit != msgBackFailed.rend(); ++rit) {
+                it->second.push_front(rit->second);
             }
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    return false;
+    // Java:266-269 —— 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
+    // 回投失败、仍留在缓冲里的那几条，否则那几条会被位点静默跳过（丢消息）
+    std::vector<MessageExt> handled;
+    handled.reserve(restored.size() - failedIdx.size());
+    for (size_t i = 0; i < restored.size(); i++) {
+        if (failedIdx.count(i) == 0) {
+            handled.push_back(restored[i]);
+        }
+    }
+    advanceConsumeOffset(key, handled, hasFloor ? std::optional<int64_t>(floorVal) : std::nullopt);
+    consumedCount_.fetch_add(static_cast<int64_t>(handled.size()));
+    return msgBackFailed.empty();
 }
 
-bool DefaultMQPushConsumer::sendBackBatch(const std::vector<MessageExt>& batch,
-                                          const ConsumeConcurrentlyContext& ctx) {
-    bool ok = true;
-    for (const MessageExt& msg : batch) {
-        try {
-            // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
-            //（reconsumeTimes 在 MessageExt 线上格式第 13 字段，broker 重投时 +1）
-            int32_t delayLevel = ctx.delayLevelWhenNextConsume;
-            if (delayLevel == 0) {
-                delayLevel = 3 + msg.getReconsumeTimes();
-            }
-            sendMessageBack(msg, delayLevel);
-        } catch (const std::exception& e) {
-            logger_debug("send message back failed for msg " + msg.msgId + ": " + e.what());
-            ok = false;
+std::vector<std::pair<size_t, MessageExt>> DefaultMQPushConsumer::sendBackBatch(
+    const std::vector<MessageExt>& batch, const ConsumeConcurrentlyContext& ctx, size_t base) {
+    std::vector<std::pair<size_t, MessageExt>> failed;
+    for (size_t i = base; i < batch.size(); i++) {
+        const MessageExt& msg = batch[i];
+        // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
+        //（reconsumeTimes 在 MessageExt 线上格式第 13 字段，broker 重投时 +1）
+        int32_t delayLevel = ctx.delayLevelWhenNextConsume;
+        if (delayLevel == 0) {
+            delayLevel = 3 + msg.getReconsumeTimes();
+        }
+        // ⚠ sendMessageBack 自己吞掉所有异常、用返回值表成败；只看异常等于把
+        // 「回投失败」当成「回投成功」，位点会越过这条静默丢消息。
+        if (!sendMessageBack(msg, delayLevel)) {
+            logger_debug("send message back failed for msg " + msg.msgId);
+            MessageExt retried = msg;
+            // 与 Java :251 一致：次数加在**要被重新消费的副本**上，broker 没记成功
+            retried.setReconsumeTimes(retried.getReconsumeTimes() + 1);
+            failed.emplace_back(i, retried);
         }
     }
-    return ok;
+    return failed;
 }
 
 void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
-                                                 const std::vector<MessageExt>& batch) {
+                                                 const std::vector<MessageExt>& batch,
+                                                 const std::optional<int64_t>& floor) {
+    if (batch.empty()) {
+        // 整批回投都失败时没有任何条目被认可，位点原地不动
+        return;
+    }
     int64_t nextOffset = 0;
     for (const MessageExt& m : batch) {
         if (m.queueOffset + 1 > nextOffset) {
             nextOffset = m.queueOffset + 1;
         }
+    }
+    if (floor.has_value() && *floor < nextOffset) {
+        nextOffset = *floor;
     }
     std::lock_guard<std::mutex> lk(lock_);
     auto it = consumeOffsetTable_.find(key);
@@ -1846,6 +1913,26 @@ void DefaultMQPushConsumer::lockLoop() {
 
 std::string DefaultMQPushConsumer::offsetKey(const MessageQueue& mq) {
     return mq.topic + mq.brokerName + std::to_string(mq.queueId);
+}
+
+void DefaultMQPushConsumer::setPendingMessages(const std::string& key,
+                                               const std::vector<MessageExt>& msgs) {
+    std::lock_guard<std::mutex> lk(lock_);
+    pending_[key] = std::deque<MessageExt>(msgs.begin(), msgs.end());
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::pendingMessages(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = pending_.find(key);
+    if (it == pending_.end()) return {};
+    return std::vector<MessageExt>(it->second.begin(), it->second.end());
+}
+
+std::optional<int64_t> DefaultMQPushConsumer::consumeOffset(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = consumeOffsetTable_.find(key);
+    if (it == consumeOffsetTable_.end()) return std::nullopt;
+    return it->second;
 }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::assignedQueues() {
@@ -1977,12 +2064,13 @@ std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::str
     return out;
 }
 
-bool DefaultMQPushConsumer::ownsQueue(const std::string& key) const {
+bool DefaultMQPushConsumer::ownsQueue(const std::string& key, uint64_t token) const {
     // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
+    // 比 token 而不是比 std::thread 的 id：归属是在**起线程之前**登记的，线程自己
+    // 拿不到自己的 std::thread 句柄，也就没有「先跑起来、后登记」的窗口。
     std::lock_guard<std::mutex> lk(lock_);
-    auto it = pullThreads_.find(key);
-    if (it == pullThreads_.end()) return false;
-    return it->second.get_id() == std::this_thread::get_id();
+    auto it = pullOwners_.find(key);
+    return it != pullOwners_.end() && it->second == token;
 }
 
 void DefaultMQPushConsumer::onQueuesRevoked(
@@ -2209,11 +2297,13 @@ void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg
 
 bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel,
                                            const std::string& brokerNameIn) {
-    MQClientInstance& c = client();
     std::string brokerName = brokerNameIn.empty() ? msg.brokerName : brokerNameIn;
     // Java：整个回投过程包在 try/catch(Throwable) 里，失败退化到"普通消息重投"，
     // 绝不把异常抛给消费线程（否则这条消息既没 ack 也没回投，只能等超时重复消费）。
+    // ⚠ client() 在未 start 时会抛，所以必须留在 try 内：本函数的契约是「只按返回值
+    // 表成败」，调用方（sendBackBatch）已经不再看异常了。
     try {
+        MQClientInstance& c = client();
         std::string addr = c.brokerAddrOf(brokerName);
         if (addr.empty()) {
             throw MQClientException("Broker[" + brokerName + "] master node does not exist");

@@ -1038,15 +1038,23 @@ class DefaultMQPushConsumer:
         return ConsumeReturnType.SUCCESS
 
     def _record_consume_stats(self, topic: str, msg_count: int, begin_ms: float,
-                              failed: bool) -> None:
-        """消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。"""
+                              failed: bool, ack_count: Optional[int] = None) -> None:
+        """消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
+
+        ``ack_count`` 对应 Java ``processConsumeResult:217-220`` 的 ``ok = ackIndex + 1``：
+        部分 ack 时前缀算 OK、尾巴算 FAILED。不传则按整批算（顺序/POP 路径的旧口径）。
+        """
         if self._stats_manager is None:
             return
         rt = int(time.time() * 1000 - begin_ms)
         if failed:
             self._stats_manager.inc_consume_failed_tps(self.consumer_group, topic, msg_count)
         else:
-            self._stats_manager.inc_consume_ok_tps(self.consumer_group, topic, msg_count)
+            ok = msg_count if ack_count is None else ack_count
+            self._stats_manager.inc_consume_ok_tps(self.consumer_group, topic, ok)
+            if msg_count > ok:
+                self._stats_manager.inc_consume_failed_tps(self.consumer_group, topic,
+                                                           msg_count - ok)
         self._stats_manager.inc_consume_rt(self.consumer_group, topic, rt)
 
     def _finish_consume_hook(self, hook_ctx: Optional[ConsumeMessageContext], status,
@@ -1839,10 +1847,10 @@ class DefaultMQPushConsumer:
 
         self._reset_retry_topic_and_namespace(msgs)
         context = ConsumeConcurrentlyContext(mq)
-        # ⚠ 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE：
-        # 默认就是"全部 ack"。本项目 ConsumeConcurrentlyContext 的默认值是 -1（push
-        # 回投路径的语义），若不在 POP 这里改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，
-        # 消息在 invisibleTime 到期后被 broker 复活重投 —— 短观测窗口下会伪装成通过。
+        # 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE（本端口的默认值
+        # 已经是它，这里显式钳成 size-1 只是省掉一次 clamp）：CONSUME_SUCCESS 默认全部 ack。
+        # 若这里写成 -1，一条都不会 ack，消息在 invisibleTime 到期后被 broker 复活重投 ——
+        # 短观测窗口下会伪装成通过。
         context.ack_index = len(msgs) - 1
         hook_ctx = None
         if self.consume_message_hook_list:
@@ -2298,39 +2306,65 @@ class DefaultMQPushConsumer:
             logger.debug("listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
             has_exception = True
+        # Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
+        # 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
+        # RECONSUME_LATER 强制 ackIndex=-1，整批回投。
+        ack_index = context.ack_index
+        if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
+            if ack_index >= len(batch):
+                ack_index = len(batch) - 1
+        else:
+            ack_index = -1
+        # 统计口径同 Java 的 ok/failed 计数（:217-225）：部分 ack 时尾巴算 failed
         self._record_consume_stats(mq.topic, len(batch), begin_ms,
-                                   failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER)
+                                   failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
+                                   ack_count=ack_index + 1)
         self._finish_consume_hook(
             hook_ctx, status, has_exception, begin_ms,
             failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
             succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
-        if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
-            self._advance_consume_offset(key, batch)
-            return True
-        # RECONSUME_LATER：广播模式不回投（仅告警，位点不前进，重启后重新消费）；
-        # 集群模式回投 %RETRY%topic（延迟梯度 3+reconsumeTimes；超过 maxReconsumeTimes
-        # 由 broker 自动转 %DLQ%）
         if broadcast:
-            logger.warning("BROADCASTING: message consume failed, no redelivery: %d msgs in %s",
-                           len(batch), mq)
+            # Java:232-237 —— 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
+            # 整批位点照样前进（:266 的 removeMessage 拿到的就是整批）
+            dropped = len(batch) - ack_index - 1
+            if dropped > 0:
+                logger.warning("BROADCASTING, the message consume failed, drop it: %d msgs in %s",
+                               dropped, mq)
             self._advance_consume_offset(key, batch)
             return True
-        if self._send_back_batch(batch, context):
+        if ack_index + 1 >= len(batch):
+            # 整批认可（默认路径）：什么都不用回投，位点直接前进
             self._advance_consume_offset(key, batch)
             return True
-        # 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
-        with self._lock:
-            dq = self._pending.get(key)
-            if dq is not None:
-                for m in reversed(batch):
-                    dq.appendleft(m)
-        time.sleep(0.2)
-        return False
+        # 集群模式：未认可的 [ack_index+1, size) 逐条回投 %RETRY%topic（延迟梯度
+        # 3+reconsumeTimes；超过 maxReconsumeTimes 由 broker 自动转 %DLQ%）
+        msg_back_failed = self._send_back_batch(batch[ack_index + 1:], context)
+        # Java:256-260 —— 回投失败的那几条从本批摘掉后 submitConsumeRequestLater 重投，
+        # 这里等价地塞回队首稍后再消费
+        if msg_back_failed:
+            with self._lock:
+                dq = self._pending.get(key)
+                if dq is not None:
+                    for m in reversed(msg_back_failed):
+                        dq.appendleft(m)
+            time.sleep(0.2)
+        failed_ids = {id(m) for m in msg_back_failed}
+        # Java:266-269 —— 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
+        # 仍留在 ProcessQueue 里的那几条（removeMessage 这时返回它们的最小 offset）
+        self._advance_consume_offset(
+            key, [m for m in batch if id(m) not in failed_ids],
+            floor=min((m.queue_offset or 0) for m in msg_back_failed) if msg_back_failed else None)
+        return not msg_back_failed
 
     def _send_back_batch(self, batch: List[MessageExt],
-                         context: ConsumeConcurrentlyContext) -> bool:
-        """失败批次逐条回投 broker（对齐 Java processConsumeResult → sendMessageBack）。"""
-        ok = True
+                         context: ConsumeConcurrentlyContext) -> List[MessageExt]:
+        """把未认可的条目逐条回投 broker，返回回投失败的那些。
+
+        对齐 Java ``ConsumeMessageConcurrentlyService#processConsumeResult:238-254``。
+        失败条目按 Java``:251`` 就地 ``reconsumeTimes + 1`` —— broker 那边没记上这次数，
+        客户端不补就永远进不了 DLQ。
+        """
+        failed: List[MessageExt] = []
         for msg in batch:
             try:
                 # 重投次数在 MessageExt 线上格式第 13 字段（Java msg.getReconsumeTimes()），
@@ -2343,11 +2377,18 @@ class DefaultMQPushConsumer:
                 self.send_message_back(msg, delay_level)
             except Exception as e:  # noqa: BLE001
                 logger.debug("send message back failed for msg %s: %s", msg.msg_id, e)
-                ok = False
-        return ok
+                msg.set_reconsume_times(msg.get_reconsume_times() + 1)
+                failed.append(msg)
+        return failed
 
-    def _advance_consume_offset(self, key: str, batch: List[MessageExt]) -> None:
+    def _advance_consume_offset(self, key: str, batch: List[MessageExt],
+                                floor: Optional[int] = None) -> None:
+        if not batch:
+            # 整批回投都失败时没有任何条目被认可，位点原地不动
+            return
         next_off = max((m.queue_offset or 0) for m in batch) + 1
+        if floor is not None:
+            next_off = min(next_off, floor)
         with self._lock:
             cur = self._consume_offsets.get(key)
             self._consume_offsets[key] = max(cur or 0, next_off)

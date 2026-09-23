@@ -1769,8 +1769,13 @@ public sealed class DefaultMQPushConsumer
         return pqi;
     }
 
-    /// <summary>消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。</summary>
-    private void RecordConsumeStats(string topic, int msgCount, long beginMs, bool failed)
+    /// <summary>
+    /// 消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
+    /// <paramref name="ackCount"/> 对应 Java processConsumeResult:217-220 的 ok = ackIndex + 1：
+    /// 部分 ack 时前缀算 OK、尾巴算 FAILED。不传则按整批算（顺序/POP 路径的旧口径）。
+    /// </summary>
+    private void RecordConsumeStats(string topic, int msgCount, long beginMs, bool failed,
+        int? ackCount = null)
     {
         if (_mqClient is null)
         {
@@ -1785,7 +1790,12 @@ public sealed class DefaultMQPushConsumer
         }
         else
         {
-            stats.IncConsumeOKTPS(ConsumerGroup, topic, msgCount);
+            int ok = ackCount ?? msgCount;
+            stats.IncConsumeOKTPS(ConsumerGroup, topic, ok);
+            if (msgCount > ok)
+            {
+                stats.IncConsumeFailedTPS(ConsumerGroup, topic, msgCount - ok);
+            }
         }
 
         stats.IncConsumeRT(ConsumerGroup, topic, rt);
@@ -2208,10 +2218,10 @@ public sealed class DefaultMQPushConsumer
         ResetRetryTopicAndNamespace(msgs);
         var ctx = new ConsumeConcurrentlyContext(mq);
 
-        // ⚠ 对齐 Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE：
-        // 默认就是"全部 ack"。本项目的默认值是 -1（push 回投路径的语义），若不在 POP 这里
-        // 改成 size-1，CONSUME_SUCCESS 会**一条都不 ack**，消息在 invisibleTime 到期后被
-        // broker 复活重投 —— 短观测窗口下会伪装成通过。
+        // 对应 Java ConsumeMessagePopConcurrentlyService：POP 路径把 ackIndex 当
+        // 「已 ack 到第几条」用，语义与 classic 回投路径一致，默认值 Integer.MAX_VALUE
+        // 已经表示「整批 ack」；这里钳到 size-1 只是让 ctx 上的值与本批条数对齐，
+        // 不影响 CONSUME_SUCCESS 的行为（不 ack 会让消息在 invisibleTime 后被复活重投）。
         ctx.AckIndex = msgs.Count - 1;
         ConsumeMessageContext? popHookCtx = null;
         if (_consumeMessageHooks.Count > 0)
@@ -2516,6 +2526,47 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    // ---------------- 仅供单测/联调：不经过网络直接驱动 classic 消费分发 ----------------
+    // classic 路径的 ackIndex 语义错得很安静（尾巴静默丢失、位点越过未消费完的消息），
+    // 必须能离线锁死再上真机，所以开这几个口子。
+    public bool ConsumeBatchForTest(string key, MessageQueue mq, List<MessageExt> batch)
+        => ConsumeBatch(key, mq, batch);
+
+    public static string OffsetKeyForTest(MessageQueue mq) => OffsetKey(mq);
+
+    /// <summary>预置某队列的「已拉未消费」缓冲（Java ProcessQueue）；null = 撤走该队列。</summary>
+    public void SetPendingForTest(string key, List<MessageExt>? msgs)
+    {
+        lock (_lock)
+        {
+            if (msgs is null)
+            {
+                _pending.Remove(key);
+            }
+            else
+            {
+                _pending[key] = new Queue<MessageExt>(msgs);
+            }
+        }
+    }
+
+    public List<MessageExt> PendingForTest(string key)
+    {
+        lock (_lock)
+        {
+            return _pending.TryGetValue(key, out Queue<MessageExt>? q) ? q.ToList() : new List<MessageExt>();
+        }
+    }
+
+    /// <summary>已消费位点；null = 该队列还没有记录。</summary>
+    public long? ConsumeOffsetForTest(string key)
+    {
+        lock (_lock)
+        {
+            return _consumeOffsetTable.TryGetValue(key, out long off) ? off : null;
+        }
+    }
+
     /// <summary>消费一个批次并处理回投/挂起。返回消费位点是否前进。</summary>
     private bool ConsumeBatch(string key, MessageQueue mq, List<MessageExt> batch)
     {
@@ -2603,58 +2654,117 @@ public sealed class DefaultMQPushConsumer
             hasException = true;
         }
 
+        // Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
+        // 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
+        // RECONSUME_LATER 强制 ackIndex=-1，整批回投。
+        int ackIndex = cctx.AckIndex;
+        if (cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess)
+        {
+            if (ackIndex >= batch.Count)
+            {
+                ackIndex = batch.Count - 1;
+            }
+        }
+        else
+        {
+            ackIndex = -1;
+        }
+
+        int acked = ackIndex + 1;  // 0..batch.Count
         RecordConsumeStats(mq.Topic, batch.Count, beginMs,
-            failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater);
+            failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater, ackCount: acked);
         FinishConsumeHook(hookCtx, true, hasException, beginMs, cstatus.ToString(),
             failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater,
             succeeded: cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess);
 
-        if (cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess)
-        {
-            AdvanceConsumeOffset(key, batch);
-            Interlocked.Add(ref _consumedCount, batch.Count);
-            return true;
-        }
-
-        // RECONSUME_LATER：广播模式不回投（仅告警，位点前进）；集群模式回投 %RETRY%topic
         if (broadcast)
         {
-            ClientLog.Warn("BROADCASTING: message consume failed, no redelivery: "
-                + batch.Count.ToString(CultureInfo.InvariantCulture) + " msgs in " + mq);
-            AdvanceConsumeOffset(key, batch);
-            Interlocked.Add(ref _consumedCount, batch.Count);
-            return true;
-        }
-
-        if (SendBackBatch(batch, cctx))
-        {
-            AdvanceConsumeOffset(key, batch);
-            Interlocked.Add(ref _consumedCount, batch.Count);
-            return true;
-        }
-
-        // 回投失败：批次塞回队首稍后重试（Java 中这些消息不从 ProcessQueue 移除）
-        lock (_lock)
-        {
-            if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+            // Java:232-237 —— 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
+            // 整批位点照样前进（重启后不重投）
+            int dropped = batch.Count - acked;
+            if (dropped > 0)
             {
-                for (int i = batch.Count - 1; i >= 0; --i)
-                {
-                    PushFront(q, batch[i]);
-                }
+                ClientLog.Warn("BROADCASTING, the message consume failed, drop it: "
+                    + dropped.ToString(CultureInfo.InvariantCulture) + " msgs in " + mq);
+            }
+
+            AdvanceConsumeOffset(key, batch);
+            Interlocked.Add(ref _consumedCount, batch.Count);
+            return true;
+        }
+
+        if (acked >= batch.Count)
+        {
+            // 整批认可（默认路径）：一条都不用回投，位点直接前进
+            AdvanceConsumeOffset(key, batch);
+            Interlocked.Add(ref _consumedCount, batch.Count);
+            return true;
+        }
+
+        // 集群模式：未认可的 [acked, size) 逐条回投 %RETRY%topic
+        //（延迟梯度 3+reconsumeTimes，超 maxReconsumeTimes 由 broker 转 %DLQ%）
+        List<(int Index, MessageExt Msg)> msgBackFailed = SendBackBatch(batch, cctx, acked);
+        var failedIdx = new HashSet<int>();
+        long floor = 0;
+        bool hasFloor = false;
+        foreach ((int index, MessageExt _) in msgBackFailed)
+        {
+            failedIdx.Add(index);
+            long off = batch[index].QueueOffset;
+            if (!hasFloor || off < floor)
+            {
+                floor = off;
+                hasFloor = true;
             }
         }
 
-        _stopEvent.Wait(TimeSpan.FromMilliseconds(200));
-        return false;
+        // Java:256-260 —— 回投失败的那几条塞回队首稍后重试（ProcessQueue 里不摘掉它们）
+        if (msgBackFailed.Count > 0)
+        {
+            lock (_lock)
+            {
+                if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+                {
+                    for (int i = msgBackFailed.Count - 1; i >= 0; --i)
+                    {
+                        PushFront(q, msgBackFailed[i].Msg);
+                    }
+                }
+            }
+
+            _stopEvent.Wait(TimeSpan.FromMilliseconds(200));
+        }
+
+        // Java:266-269 —— 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
+        // 回投失败、仍留在缓冲里的那几条，否则那几条会被位点静默跳过（丢消息）
+        var handled = new List<MessageExt>(batch.Count - failedIdx.Count);
+        for (int i = 0; i < batch.Count; ++i)
+        {
+            if (!failedIdx.Contains(i))
+            {
+                handled.Add(batch[i]);
+            }
+        }
+
+        AdvanceConsumeOffset(key, handled, hasFloor ? floor : null);
+        Interlocked.Add(ref _consumedCount, handled.Count);
+        return msgBackFailed.Count == 0;
     }
 
-    /// <summary>失败批次逐条回投 broker（对齐 Java processConsumeResult → sendMessageBack）。</summary>
-    private bool SendBackBatch(List<MessageExt> batch, ConsumeConcurrentlyContext ctx)
+    /// <summary>
+    /// 从 <paramref name="base"/> 起把 batch[base, size) 逐条回投 broker
+    /// （对齐 Java processConsumeResult → sendMessageBack）。<paramref name="base"/> 是尾巴在
+    /// 整批里的起始下标（部分 ack 时前缀已认可，不能再回投）。返回回投**失败**的
+    /// (整批下标, 消息)，失败条目的 ReconsumeTimes 已 +1（Java :251 —— broker 那边没记上
+    /// 这次数，客户端不补就永远进不了 %DLQ%）；调用方据此把尾巴塞回队首并钳住位点。
+    /// </summary>
+    private List<(int Index, MessageExt Msg)> SendBackBatch(List<MessageExt> batch,
+        ConsumeConcurrentlyContext ctx, int @base)
     {
-        bool ok = true;
-        foreach (MessageExt msg in batch)
+        var failed = new List<(int, MessageExt)>();
+        for (int i = @base; i < batch.Count; ++i)
         {
+            MessageExt msg = batch[i];
             try
             {
                 // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
@@ -2670,15 +2780,28 @@ public sealed class DefaultMQPushConsumer
             catch (Exception e)
             {
                 ClientLog.Debug("send message back failed for msg " + msg.MsgId + ": " + e.Message);
-                ok = false;
+                // 与 Java 一样：次数加在**要被重新消费的副本**上，broker 没记成功
+                msg.ReconsumeTimes += 1;
+                failed.Add((i, msg));
             }
         }
 
-        return ok;
+        return failed;
     }
 
-    private void AdvanceConsumeOffset(string key, List<MessageExt> batch)
+    /// <summary>
+    /// 推进位点到 batch 中最大 queueOffset+1；<paramref name="floor"/> 非空时不越过它
+    /// （对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时提交位点只能是
+    /// firstKey，否则会静默丢掉那条）。空批次直接返回。
+    /// </summary>
+    private void AdvanceConsumeOffset(string key, List<MessageExt> batch, long? floor = null)
     {
+        if (batch.Count == 0)
+        {
+            // 整批回投都失败时没有任何条目被认可，位点原地不动
+            return;
+        }
+
         long nextOffset = 0;
         foreach (MessageExt m in batch)
         {
@@ -2686,6 +2809,11 @@ public sealed class DefaultMQPushConsumer
             {
                 nextOffset = m.QueueOffset + 1;
             }
+        }
+
+        if (floor.HasValue && floor.Value < nextOffset)
+        {
+            nextOffset = floor.Value;
         }
 
         lock (_lock)

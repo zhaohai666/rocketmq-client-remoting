@@ -127,7 +127,10 @@ class ConsumeConcurrentlyContext:
         # 对应 Java ConsumeConcurrentlyContext.delayLevelWhenNextConsume（缺省 0）。
         # 为 0 时由 caller 改写为 3 + reconsumeTimes（见 consumer.py _send_back_batch）。
         self.delay_level_when_next_consume = 0
-        self.ack_index = -1
+        # 对应 Java ConsumeConcurrentlyContext.ackIndex（默认 Integer.MAX_VALUE）：
+        # 「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
+        # 默认值是「全批认可」，只有 listener 主动调小才会部分 ack。
+        self.ack_index = (1 << 31) - 1
 
 
 class ConsumeOrderlyContext:

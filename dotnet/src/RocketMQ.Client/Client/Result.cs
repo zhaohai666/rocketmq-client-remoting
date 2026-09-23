@@ -227,7 +227,13 @@ public sealed class ConsumeConcurrentlyContext
 {
     public MessageQueue MessageQueue { get; set; }
     public int DelayLevelWhenNextConsume { get; set; }
-    public int AckIndex { get; set; } = -1;
+
+    /// <summary>
+    /// 对应 Java ConsumeConcurrentlyContext.ackIndex（默认 Integer.MAX_VALUE）：
+    /// 「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
+    /// 默认值是「全批认可」，只有 listener 主动调小才会部分 ack。
+    /// </summary>
+    public int AckIndex { get; set; } = int.MaxValue;
 
     public ConsumeConcurrentlyContext(MessageQueue? mq = null) => MessageQueue = mq ?? new MessageQueue();
 }

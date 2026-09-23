@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -338,22 +339,41 @@ public:
     // 向所有已知 broker 发一次心跳（对应 Java sendHeartbeatToAllBrokerWithLock）
     int32_t sendHeartbeatToAllBroker();
 
+    // ---------------- 供单测/联调直接驱动消费分发（不经过网络）----------------
+    // classic 消费路径的 ackIndex 语义错得很安静（尾巴静默丢失、位点越过未消费完的
+    // 消息），必须能离线锁死再上真机，所以这一小段是 public。
+    // 消费一个批次，处理回投/挂起；返回消费位点是否前进。key 用 offsetKey(mq)。
+    bool consumeBatch(const std::string& key, const MessageQueue& mq,
+                      const std::vector<MessageExt>& batch);
+    // 队列在缓冲/位点表里的 key（topic + brokerName + queueId）。
+    static std::string offsetKey(const MessageQueue& mq);
+    // 预置某队列的「已拉未消费」缓冲（Java ProcessQueue），用于断言回投失败后塞回队首的内容
+    void setPendingMessages(const std::string& key, const std::vector<MessageExt>& msgs);
+    std::vector<MessageExt> pendingMessages(const std::string& key) const;
+    // 读回某队列的已消费位点；nullopt = 还没有记录
+    std::optional<int64_t> consumeOffset(const std::string& key) const;
+
 private:
     // 拉取：每个队列一个线程（对齐 Java PullMessageService 的并发长轮询语义：
     // broker 为每个队列挂起长轮询、消息到达立即返回；若单线程顺序轮询，
     // 一个空队列的 suspend 会阻塞其余队列的投递）。
     void rebalancePullThreads();
     void rebalanceLoop();
-    void queuePullLoop(const MessageQueue& mq);
+    void queuePullLoop(const MessageQueue& mq, uint64_t token);
     // 分发：单线程从各队列缓冲取批次交给监听器
     void dispatchLoop();
-    // 消费一个批次，处理回投/挂起；返回消费位点是否前进
-    bool consumeBatch(const std::string& key, const MessageQueue& mq,
-                      const std::vector<MessageExt>& batch);
-    // 失败批次逐条回投（Java processConsumeResult → sendMessageBack）
-    bool sendBackBatch(const std::vector<MessageExt>& batch,
-                       const ConsumeConcurrentlyContext& ctx);
-    void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch);
+    // 从 base 起把 batch[base, size) 逐条回投（Java processConsumeResult → sendMessageBack）：
+    // base 是尾巴在整批里的起始下标（部分 ack 时前缀已经认可，不能再回投）。
+    // 返回回投**失败**的 (整批下标, 消息)，失败条目的 reconsumeTimes 已 +1
+    //（Java :251 —— broker 那边没记上这次数，客户端不补就永远进不了 DLQ）；
+    // 调用方据此把尾巴塞回队首并钳住位点。
+    std::vector<std::pair<size_t, MessageExt>> sendBackBatch(
+        const std::vector<MessageExt>& batch, const ConsumeConcurrentlyContext& ctx, size_t base);
+    // 推进位点到 batch 中最大 queueOffset+1；floor 非空时不越过它
+    //（对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时，
+    //  提交位点只能是 firstKey，否则会静默丢掉那条）。空批次直接返回。
+    void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch,
+                              const std::optional<int64_t>& floor = std::nullopt);
     // 回投兜底（Java getMaxReconsumeTimes / sendMessageBackAsNormalMessage）
     int32_t maxReconsumeTimesOrDefault() const;
     void sendMessageBackAsNormalMessage(const MessageExt& msg);
@@ -371,7 +391,6 @@ private:
 
     std::vector<MessageQueue> assignedQueues();
     int64_t resolveInitialOffset(const MessageQueue& mq, const SubscriptionData& sub);
-    static std::string offsetKey(const MessageQueue& mq);
 
     // ---- 真实 rebalance（对齐 Java RebalanceImpl.rebalanceByTopic）----
     // 计算本实例应持有的队列集并写入 assignedQueues_，再同步拉取线程；
@@ -380,7 +399,10 @@ private:
     // 当前分配里「topic 的全部队列」（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
     std::vector<MessageQueue> allQueuesOfTopic(const std::string& topic);
     // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
-    bool ownsQueue(const std::string& key) const;
+    // token 在**起线程之前**就写进 pullOwners_：std::thread 一构造就跑，如果等到
+    // 建好再登记，新线程可能先跑到 ownsQueue() 看到「这张表里还没有我」而当场退出，
+    // 队列却被登记成「已有拉取线程」⇒ 永远没人再拉它（真机少消费一批的根因）。
+    bool ownsQueue(const std::string& key, uint64_t token) const;
     // 队列被撤走时的收尾（对应 Java removeUnnecessaryMessageQueue）：持久化已消费位点、
     // 丢弃在途缓冲、顺序消费集群模式解锁。revoked 为 (队列, 已消费位点) 列表。
     void onQueuesRevoked(const std::vector<std::pair<MessageQueue, int64_t>>& revoked);
@@ -392,7 +414,7 @@ private:
 
     // ---- POP 消费循环（5.x 轻量消费，对应 Java popMessage 回调 + ConsumeMessagePopConcurrentlyService）----
     // 单队列 POP 循环。**不查、不提交消费位点**：进度由 broker 侧 checkpoint 跟踪，确认只靠 ack。
-    void queuePopLoop(const MessageQueue& mq);
+    void queuePopLoop(const MessageQueue& mq, uint64_t token);
     // 按 consumeMessageBatchMaxSize 切批投递
     void submitPopConsumeRequest(std::vector<MessageExt> msgs,
                                  std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
@@ -423,8 +445,11 @@ private:
     // 收尾：写 props/status/success 后触发 after 钩子（对应 Java executeHookAfter 那一段）
     void finishConsumeHook(ConsumeMessageContext* hookCtx, bool hasException, int64_t beginMs,
                            bool failed, bool succeeded, const std::string& statusText);
-    // 消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）
-    void recordConsumeStats(const std::string& topic, int64_t msgCount, int64_t beginMs, bool failed);
+    // 消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
+    // ackCount 只有**并发 classic** 路径传（Java 按 ackIndex+1 拆 ok/failed，
+    // 部分 ack 的尾巴既记 FAILED 又会被重投）；POP 与顺序消费传 nullopt = 整批同一状态。
+    void recordConsumeStats(const std::string& topic, int64_t msgCount, int64_t beginMs,
+                            bool failed, const std::optional<int64_t>& ackCount = std::nullopt);
     // start() 里按 enableMsgTrace 建分发器并注册 ConsumeMessageTraceHook
     void startTraceDispatcher();
 
@@ -503,6 +528,11 @@ private:
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_{false};
     std::map<std::string, std::thread> pullThreads_;
+    // 每个队列当前拉取线程的「归属凭据」：在**起线程之前**登记，线程每轮自查
+    // （见 ownsQueue）。std::thread 一构造就开跑，没法像 Python/.NET 那样「先入表
+    // 再 start」，所以归属不能靠线程 id 反查，只能靠这张先写入的表。
+    std::map<std::string, uint64_t> pullOwners_;
+    uint64_t nextPullToken_ = 0;
     // 被撤销队列对应的旧拉取线程（已脱离 pullThreads_，等待其自然退出后回收）
     std::vector<std::thread> retiredThreads_;
     std::thread dispatchThread_;
