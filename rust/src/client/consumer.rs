@@ -61,6 +61,7 @@ use crate::client::hook::{
 };
 use crate::client::mq_client::{
     ConsumerFuture, MQClientInstance, MQClientInstanceConfig, PublishMessage, RegisteredConsumer,
+    MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
 use crate::client::producer::{SinkAdapter, TraceDispatcherChannel};
 use crate::client::result::{
@@ -1229,6 +1230,9 @@ impl DefaultMQPushConsumer {
             // （`send_heartbeat_to_all_broker` 空表直接返回 0）。Python 只在
             // start() 里 register，少了 Java `MQClientInstance#unregisterConsumer`。
             client.unregister_consumer(&group);
+            // 同生产者：注销 35 在 spawn 的任务里，登记表不能等任务 —— 立刻重启会
+            // 复用回这份正要被拆的实例（见 `MQClientInstance` 上那段注释）。
+            client.detach_from_registry_if_last_tenant();
             if let Some(handle) = self.runtime_handle() {
                 let client_id = self.client_id();
                 handle.spawn(async move {
@@ -1248,9 +1252,15 @@ impl DefaultMQPushConsumer {
                                 .await;
                         }
                     }
-                    // 优雅注销（Java MQClientInstance.unregisterClient），不必等心跳超时
+                    // 优雅注销（Java MQClientInstance.unregisterClient），不必等心跳超时。
+                    // 超时用 Java 的 mqClientApiTimeout（3000ms），见 :1170。
                     client
-                        .unregister_client_all_brokers(&client_id, "", &group, 5000)
+                        .unregister_client_all_brokers(
+                            &client_id,
+                            "",
+                            &group,
+                            MQ_CLIENT_API_TIMEOUT_MILLIS,
+                        )
                         .await;
                     // 被 abort 的心跳可能已经在线上（`JoinHandle::abort` 要到下一个让出点
                     // 才生效），它落回 broker 会把本 clientId 重新塞进 ConsumerManager，同组
@@ -1261,7 +1271,12 @@ impl DefaultMQPushConsumer {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if client.find_consumer(&group).is_none() {
                         client
-                            .unregister_client_all_brokers(&client_id, "", &group, 5000)
+                            .unregister_client_all_brokers(
+                                &client_id,
+                                "",
+                                &group,
+                                MQ_CLIENT_API_TIMEOUT_MILLIS,
+                            )
                             .await;
                     }
                     // 清退 RPC 跑完了才关实例（Java `DefaultMQPushConsumerImpl#shutdown`

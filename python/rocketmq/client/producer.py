@@ -767,7 +767,21 @@ class DefaultMQProducer:
             if self._callback_executor is not None:
                 self._callback_executor.shutdown()
                 self._callback_executor = None
+            # 优雅注销（对齐 Java DefaultMQProducerImpl.shutdown:313 →
+            # MQClientInstance.unregisterProducer:1198-1201 → unregisterClient(group, null)）：
+            # 逐台 broker 发 UNREGISTER_CLIENT(35)，让 broker 端 ProducerManager 立刻把本
+            # clientId 从 groupChannelTable 摘掉。不发的话只能等心跳超时（默认 ~120s）清理，
+            # 这段时间 broker 仍认为该组有连接（`examineProducerConnectionInfo` 看得见、
+            # 事务回查也会挑到这个已经退出的 channel）。
+            # ⚠ 必须在 _mq_client.shutdown() **之前**：35 只能走还开着的长连接，
+            #   broker 侧也只摘除「这条 frame 到达的那条 channel」（ClientManageProcessor:226-230）。
+            # 与消费侧同一口径：任何异常只记 debug，shutdown 不因网络抖动抛异常。
             if self._mq_client is not None:
+                try:
+                    self._mq_client.unregister_client_all_brokers(
+                        self.client_id or "", self.producer_group, "")
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("unregister on shutdown failed: %s", e)
                 self._mq_client.shutdown()
             self._started = False
         # 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器

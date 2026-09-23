@@ -319,15 +319,18 @@ public:
     // ---------------- 心跳 / 注销 ----------------
     void sendHeartbeat(const std::string& addr, const HeartbeatData& heartbeatData,
                        int32_t timeoutMillis = 5000);
+    // 注销走 Java 的 mqClientApiTimeout（3000ms，见下面 kMqClientApiTimeoutMillis 的出处）：
+    // Java `MQClientInstance#unregisterClient:1170` 传的就是它，与发送/拉取预算无关。
     void unregisterClient(const std::string& addr, const std::string& clientId,
                           const std::string& producerGroup, const std::string& consumerGroup,
-                          int32_t timeoutMillis = 5000);
-    // 向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）：
+                          int32_t timeoutMillis = kMqClientApiTimeoutMillis);
+    // 向所有已知 broker（**主 + 从**，见 getAllBrokerAddrs）注销本 clientId
+    // （对应 Java MQClientInstance.unregisterClient）：
     // 关闭连接前调用，broker 端立刻摘除，不必等心跳超时（~120s）。
     void unregisterClientAllBrokers(const std::string& clientId,
                                     const std::string& producerGroup,
                                     const std::string& consumerGroup,
-                                    int32_t timeoutMillis = 5000);
+                                    int32_t timeoutMillis = kMqClientApiTimeoutMillis);
 
     // ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
     // Java `ClientConfig#mqClientApiTimeout` 的默认值（`ClientConfig.java:81` = 3 * 1000）：
@@ -429,6 +432,12 @@ public:
     std::vector<std::string> getRouteOfAllBrokers();
     // 列出已知路由里所有 broker 地址（用于探活）
     std::vector<std::string> knownBrokerAddrs();
+    // 路由里出现过的**每一台** broker（主 + 从）。`getRouteOfAllBrokers` 走
+    // `selectBrokerAddr()`（主优先、没主才随机），适合「问到一台就行」的心跳；注销(35)
+    // 必须用这个 —— Java `MQClientInstance#unregisterClient`:1158-1182 遍历的是
+    // `brokerAddrTable` 的每个 brokerId，而 Producer/ConsumerManager 是每台 broker
+    // 各自一份状态，漏掉从节点就等于那台的注册要等通道扫描（默认 ~120s）才回收。
+    std::vector<std::string> getAllBrokerAddrs();
 
 private:
     // 解析 mq 对应 broker 地址；找不到抛 MQClientException

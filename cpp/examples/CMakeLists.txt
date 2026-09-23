@@ -93,3 +93,7 @@ target_link_libraries(rmq_live_send_header PRIVATE rocketmq::remoting)
 # 拉取前流控五个阈值真机联调：闸门真会命中 + 命中之后一条不丢（不打进 ctest）
 add_executable(rmq_live_flow_control live_flow_control.cpp)
 target_link_libraries(rmq_live_flow_control PRIVATE rocketmq::remoting)
+
+# 生产者退出注销 UNREGISTER_CLIENT(35) 真机联调：抓帧证明线上走了这一发 + 204 前后对比（不打进 ctest）
+add_executable(rmq_live_producer_unregister live_producer_unregister.cpp)
+target_link_libraries(rmq_live_producer_unregister PRIVATE rocketmq::remoting)

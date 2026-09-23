@@ -32,6 +32,11 @@
 //!   对照组照投），`%RETRY%` topic 与坏 handle 在任何 IO 之前按 Java 文案失败。
 //! - P8 **发送重试内核**：可重试码集合与 Java 对齐、单次超时上限与「非 SEND_OK 换
 //!   broker」开关不影响真集群上的正常发送、没有路由时按错误码定性而非空转重试。
+//! - P11 **退出注销**：`shutdown()` 逐台 broker 发 `UNREGISTER_CLIENT`(35)。同 `instanceName`
+//!   的两个生产者共用一条连接，先退的那个组照样从 broker 消失、另一个的连接仍在 ——
+//!   这条判据把「35 生效」和「TCP 断了才被清掉」分开（Python/C++/.NET 一生产者一实例，
+//!   只能用抓帧证明，见那边的 `verify_producer_unregister_live.py` / `live_producer_unregister.cpp`
+//!   / `ProducerUnregisterLive.cs`）。
 //!
 //! 用法（先按项目记忆里的 runbook 起本地集群）：
 //! ```text
@@ -46,6 +51,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rocketmq_client_remoting::client::admin::DefaultMQAdminExt;
 use rocketmq_client_remoting::client::hook::{
     CheckForbiddenContext, CheckForbiddenHook, EndTransactionContext, EndTransactionHook,
     SendMessageContext, SendMessageHook,
@@ -1813,6 +1819,153 @@ async fn p9_recall(
     Ok(())
 }
 
+// ------------------------------------------------- P11 退出时的 broker 侧注销
+
+/// 204 现在能看到这个生产组的 clientId 列表；broker 说「组不存在」时回空表。
+async fn producer_clients(admin: &DefaultMQAdminExt, group: &str) -> Vec<String> {
+    match admin.examine_producer_connection_info(group, None).await {
+        Ok(conn) => conn
+            .connection_set
+            .iter()
+            .map(|c| c.client_id.clone().unwrap_or_default())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// P11：生产者退出必须逐台 broker 发 `UNREGISTER_CLIENT`(35)。
+///
+/// Java 链路：`DefaultMQProducerImpl#shutdown:313` → `MQClientInstance#unregisterProducer:1198-1201`
+/// → 私有 `unregisterClient(group, null):1158-1182`。判别式在**同一条连接**上：
+/// 同一个 `instanceName` ⇒ 同一个 clientId ⇒ 同一个 `MQClientInstance` ⇒ 每台 broker 一条
+/// TCP 连接（Python/C++/.NET 每个生产者各自一份实例，做不了这条判据，那边改用抓帧证明）。
+/// 于是先退场的 A 并不会把连接关掉（`MQClientInstance#shutdown` 的租户守卫让实例活着，
+/// broker 那条 channel 依旧为 B 服务），这种情况下 A 的组能从 `ProducerManager.groupChannelTable`
+/// 里消失，只有一发被 broker 接受的 35 解释得通 —— 不发的话只能等通道断开或 120s 扫描。
+async fn p11_producer_unregister(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -> Live {
+    let shared = format!("{run}-unreg");
+    let group_a = format!("PID_rust_unreg_a_{run}");
+    let group_b = format!("PID_rust_unreg_b_{run}");
+
+    let a = DefaultMQProducer::new(&group_a).map_err(|e| format!("producer a: {e}"))?;
+    a.set_namesrv_addr(namesrv);
+    a.set_instance_name(&shared);
+    a.start().await.map_err(|e| format!("a start: {e}"))?;
+    let b = DefaultMQProducer::new(&group_b).map_err(|e| format!("producer b: {e}"))?;
+    b.set_namesrv_addr(namesrv);
+    b.set_instance_name(&shared);
+    b.start().await.map_err(|e| format!("b start: {e}"))?;
+    let id_a = a.client_id().unwrap_or_default();
+    let id_b = b.client_id().unwrap_or_default();
+    ck.check(
+        "P11 same instanceName means one clientId and one shared instance",
+        !id_a.is_empty() && id_a == id_b && MQClientInstance::find_instance(&id_a).is_some(),
+        &format!("a={id_a} b={id_b}"),
+    );
+
+    let mut ma = msg(topic, b"unreg-a", "", "");
+    let sent_a = a
+        .send(&mut ma, Some(5000), None)
+        .await
+        .map(|r| r.status == SendStatus::SendOk)
+        .unwrap_or(false);
+    let mut mb = msg(topic, b"unreg-b", "", "");
+    let sent_b = b
+        .send(&mut mb, Some(5000), None)
+        .await
+        .map(|r| r.status == SendStatus::SendOk)
+        .unwrap_or(false);
+    ck.check(
+        "P11 both producers on the shared channel send",
+        sent_a && sent_b,
+        &format!("a={sent_a} b={sent_b}"),
+    );
+
+    let admin = DefaultMQAdminExt::new();
+    admin.set_namesrv_addr(namesrv);
+    admin
+        .start()
+        .await
+        .map_err(|e| format!("admin start: {e}"))?;
+
+    // 注册靠心跳上线（30s 一轮），必须轮询等
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut seen_a = producer_clients(&admin, &group_a).await;
+    while !seen_a.contains(&id_a) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        seen_a = producer_clients(&admin, &group_a).await;
+    }
+    ck.check(
+        "P11 the broker sees producer A's registration (204)",
+        seen_a.contains(&id_a),
+        &format!("{seen_a:?}"),
+    );
+    let seen_b = producer_clients(&admin, &group_b).await;
+    ck.check(
+        "P11 the broker also sees producer B on that same channel",
+        seen_b.contains(&id_b),
+        &format!("{seen_b:?}"),
+    );
+
+    a.shutdown();
+    // 注销挂在运行时任务上（`shutdown()` 是同步的），给足一拍再判定
+    let budget = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let now = producer_clients(&admin, &group_a).await;
+            if !now.contains(&id_a) {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await;
+    ck.check(
+        "P11 A's group is gone right after shutdown (not after a heartbeat timeout)",
+        budget.is_ok(),
+        &format!("last={:?}", budget.unwrap_or_default()),
+    );
+    ck.check(
+        "P11 A's shutdown did not take the shared channel down (B still registered)",
+        producer_clients(&admin, &group_b).await.contains(&id_b),
+        "B 的连接也跟着没了 ⇒ 这条判据不成立",
+    );
+    let mut mb2 = msg(topic, b"unreg-b-after-a", "", "");
+    let b_still_sends = b
+        .send(&mut mb2, Some(5000), None)
+        .await
+        .map(|r| r.status == SendStatus::SendOk)
+        .unwrap_or(false);
+    ck.check(
+        "P11 B still sends through that channel after A left",
+        b_still_sends && b.is_started(),
+        "",
+    );
+    ck.check(
+        "P11 A itself is gone locally (producerTable entry removed)",
+        !a.is_started() && a.client().is_none(),
+        "",
+    );
+
+    b.shutdown();
+    let released = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if MQClientInstance::find_instance(&id_a).is_none() {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    ck.check(
+        "P11 the last tenant tears the shared instance down",
+        released,
+        &id_a,
+    );
+    admin.shutdown();
+    Ok(())
+}
+
 // ------------------------------------------------------------------- main
 
 async fn run(namesrv: &str) -> Checker {
@@ -1919,6 +2072,10 @@ async fn run(namesrv: &str) -> Checker {
         (
             "P9 recall",
             p9_recall(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
+        ),
+        (
+            "P11 producer unregister",
+            p11_producer_unregister(namesrv, &topic, &run, &mut ck).await,
         ),
     ];
     for (name, outcome) in scenarios {

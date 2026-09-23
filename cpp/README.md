@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 34 个用例，3088 项断言（33 个测试二进制 3015 + interop 73），~30s
+cd build && ctest --output-on-failure     # 35 个用例，3106 项断言（34 个测试二进制 3033 + interop 73），~30-40s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -107,6 +107,7 @@ cd build && ctest --output-on-failure     # 34 个用例，3088 项断言（33 �
 | `check_client_config` | 32 | broker 侧客户端配置校验 `CHECK_CLIENT_CONFIG`(46)：请求头为 **null**（线上没有 extFields）、body 是 `CheckClientRequestBody` 的 JSON、非 SUCCESS 抛 `MQClientException(响应码, remark)`；只发非 TAG 订阅（`null`/`""`/`TAG` 都算 TAG）、地址走**只读缓存**的 `findBrokerAddrByTopic` 且取不到就跳过、网络类异常换成固定文案、超时用 `mqClientApiTimeout`(3000ms) |
 | `client_id` | 32 | clientId 口径与 Java `ClientConfig` 对拍：`buildMqClientId` 的 `ip@instanceName[@unitName]`（空白 unitName 不拼）、`changeInstanceNameToPID` 只改默认名且幂等、四类 facade `start()` 盖出的 `<ip>@<pid>#<nanoTime>`、同进程两个生产者不撞号、广播消费者保持 `DEFAULT`、显式 instanceName 原样透传 |
 | `recall_message` | 28 | 定时消息撤回 `recallMessage`(370)：句柄编解码与 **Java `buildHandle` 真值向量**对拍（含无填充句柄、6 段新版本、v2/段数不足/非法 utf-8 全部按 Java 文案 `"recall handle is invalid"` 拒）、`RecallMessageRequestHeader` 逐键守卫（继承字段反射名是 **`bname`** 而不是 `brokerName`）、`SendMessageResponseHeader.recallHandle` 往返、producer 本地校验顺序（未 start / `%RETRY%` / `%DLQ%` / 非法句柄都在打网络**之前**秒回，路由拿不到时预热带异常照抛） |
+| `producer_unregister` | 18 | 退出注销 `UNREGISTER_CLIENT`(35) 的线上形状（Java `MQClientInstance#unregisterProducer:1198-1201` → 私有 `unregisterClient:1158-1182`）：生产者侧头只有 `clientID`+`producerGroup`、消费者侧只有 `clientID`+`consumerGroup`、两侧都有时三个键齐全；**空白组名整个字段不上线**（Java 传的是 null 而不是 `""`，broker `ClientManageProcessor#unregisterClient:213-249` 按 `group != null` 分派，传空串会拿 `""` 去查订阅组再白做一轮注销）；扇出**含从节点**且每台各一发（改成只打 master 的用例必然红）；单台回 `SYSTEM_ERROR` 时 `unregisterClient` 抛 `MQBrokerException`、`unregisterClientAllBrokers` 吞掉且**下一台照样发**；`getRouteOfAllBrokers`（心跳用的主优先那一台）与 `getAllBrokerAddrs`（35 用的主+从）分工守住 |
 
 ```bash
 # Java 对齐（断言数 32 -> 38）
@@ -145,6 +146,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_async_send    127.0.0.1:9876   # 异步发送内核（线程口径/并发/定点/拦截/批量/关池）
 ./build/examples/rmq_live_send_header   127.0.0.1:9876   # 发送头 c/d/n：自动建 topic 的队列数由模板与 d 决定
 ./build/examples/rmq_live_flow_control  127.0.0.1:9876   # 拉取前流控五个阈值（条数/字节/跨度/topic 级）+ 命中后不丢消息
+./build/examples/rmq_live_producer_unregister 127.0.0.1:9876   # 退出时向每台 broker 注销 clientId(35)
 ```
 
 | 工具 | 结果 | 覆盖 |
@@ -171,6 +173,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_live_flow_control` | 13 PASS / 0 FAIL | 拉取前流控五个阈值的真机闭环（与 Python `verify_flow_control_live.py`、Rust `live_flow_control`、.NET `flow-control` 的 S0~S4 逐条同构）。离线用例只能证明"喂给它那份缓冲它会判"，真机要证两件离线证不出的事：**闸门确实会命中**（单位错一位、阈值读错一个字段，离线拿预置缓冲照样绿）与**命中之后一条不丢**（写成"命中就丢批/退出循环"在十几秒窗口里看不出来）。S0 默认闸门 + 快消费 ⇒ `triggered==0` 且 12 条全到（闸门误伤正常流量表现为吞吐莫名腰斩，最难查）；S1 只留队列级字节闸门（`size=1MiB`，条数/跨度放到关不掉的量级）⇒ 命中 13 次、8 条 400KB 一条不丢且不重复；S2 只留跨度闸门（`maxSpan=2`）⇒ 命中 5 次、14 条仍全部消费；S3 只留 topic 级条数闸门（`pullThresholdForTopic=4`，4 队列 topic）⇒ 单队列怎么都到不了 4 条、必须跨队列累计才命中（105 次），且每条队列最后都消费到底；S4 复用 S1 的组与 topic 再来一批 ⇒ 位点从 broker 末尾接着走、闸门**不是命中一次就失效**（恢复后仍命中 7 次）、6 条不重不丢（这条锁的是"暂停 100ms"被写成"退出拉取循环"——S1 看不出差别，那一路会永久停摆）。⚠ 命中**次数**随真机投递/消费节奏浮动（S2 两轮分别报 3 与 5），判据只要求 `triggered > 0`。⚠ 两条踩过的夹具坑：大消息必须**不可压缩**（全同字节的 body 会被生产者压到几百字节，broker 落盘 `storeSize` 跟着变几百字节，size 闸门于是"永不命中"，Python 侧第一次跑正是这么踩到的）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列上每条才 800KB，永远够不到队列级那道 1MiB） |
 | `rmq_live_send_header` | 14 PASS / 0 FAIL | 发送头 `c`/`d`/`n` 三字段真机（与 Python `verify_send_header_live.py`、Rust `live_send_header`、.NET `send-header` 的 H0~H5 一一对应）：H0 先量出 `TBW102` 的 read/write 队列数（本机 8/8）当算术基准 → H1 什么都不配、发到全新 topic，broker 按 `min(d=4, TBW102.writeQueueNums)` 建出 **4** 条队列（`TopicConfigManager.java:289`）→ H2 `setDefaultTopicQueueNums(2)` 真的让 broker 只建 **2** 条（修之前写死 4，这条必然红）→ H3 `setCreateTopicKey` 指向带 `PERM_INHERIT` 的 3 队列模板 topic 时，新 topic 继承**模板**的 **3** 条而不是 TBW102 的 8 条 → H4 补上三字段后五种入口（同步 / 定点 / 单向 / 批量 320 / 异步）逐条落地、7 条一条不差 → H5 落点 broker 名与路由选中那台一致。⚠ `n` 在经典 broker 的发送链路里**没有读者**（5.5.1 源码 grep 过），它上线的存在由离线抓帧用例（`test_send_retry` 的 8a2 + `producer_async` 的用例 22）取证，这里不假装能观测到 |
 | `rmq_live_pop_consumer` | 11 PASS / 0 FAIL | POP 消费循环真机：S1a 全收、S1b body 集合与发送一致、S2a 无重复投递、S2b 观察期内不再新增（ack 确实写到了 broker）、S4 消息分布在多个队列且每条队列都被消费、S3 消费失败后换个 `invisibleTime` 整批复活重投 → **S5 POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage` 的 `PopCallback.onSuccess:556-563`：`FOUND` 的 `incPullRT` 打在**空列表判定之前**，`msgFoundList` 非空才 `incPullTPS`，`POLLING_NOT_FOUND` 两格都不动）。漏记是**静默**的：弹、ack、消费完全正常，只有运维看板上 `pullRT`/`pullTPS` 一片 0，而看板上"这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。判据取 `examineConsumerRunningInfo`(307) 应答的 `statusTable[topic]`，拉取侧两格与消费侧 `consumeOKTPS` **各自断言**（只有后者有值正是漏记的形状），判定本身由离线接缝 `recordPopPullStats`（`pop_consumer` 用例）锁住。⚠ 快照每 10s 采样一次、窗口取 minute 差分，夹具必须**持续有流量**并跨过两个采样点（实测 26s 发 52 条：`pullRT=2006.95`、`pullTPS=1.9990`、52 发 52 收，两格取值随真机节奏浮动、判据只要求非 0），否则 `pullTPS` 仍是 0 —— 那是夹具不够长，不是判据错 |
+| `rmq_live_producer_unregister` | 10 PASS / 0 FAIL | 退出注销 `UNREGISTER_CLIENT`(35) 真机（与 Python `verify_producer_unregister_live.py`、.NET `unreg-live`、Rust `live_producer` P11 同场景）：U1 生产者发送成功 → U2 等心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能读到本 clientId（U2b 先用一个没退出的对照组证明这条判据本身有效，否则"查不到"可能只是 204 从来不认生产者组）→ U3 退出**之前**钩子里一笔 35 都没有，`shutdown()` 之后**每台已知 broker 各一发**，头是 `clientID`+`producerGroup`、`consumerGroup` 整个字段不上线（U3b），且 35 排在业务发送之后（U3c）→ U5 紧接着查 204：这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 本移植每个生产者各自一具 `MQClientInstance` 与连接，退出时 TCP 连接也断，broker 的通道扫描同样会摘组 —— 单看 U5 分不出是 35 还是断连的功劳，所以线上这一发必须由钩子抓帧（U3）直接证明；Rust 复用同 clientId 的实例，`live_producer` 的 P11 才是行为级判别式。U4（每一发 35 都回 SUCCESS）在本移植**不可观测**：传输层有意不调 `RPCHook#doAfterResponse`，逐笔成败看离线 `producer_unregister` 那组断言 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -204,8 +207,8 @@ cpp/
 │       │                            钩子接口（Send/Consume/EndTransaction/CheckForbidden/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 42 个 .cpp
-├── examples/                   selfcheck / interop_tool + 22 个真机联调工具
-└── tests/                      33 个测试源文件、34 个 ctest 用例（含 Java 对拍与 interop_check.py）
+├── examples/                   selfcheck / interop_tool + 23 个真机联调工具
+└── tests/                      34 个测试源文件、35 个 ctest 用例（含 Java 对拍与 interop_check.py）
 ```
 
 ## 几个必须知道的实现约定

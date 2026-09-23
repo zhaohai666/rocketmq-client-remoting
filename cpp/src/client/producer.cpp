@@ -303,6 +303,23 @@ void DefaultMQProducer::shutdown() {
             if (t.joinable()) t.join();
         }
     }
+    // 优雅注销（对齐 Java DefaultMQProducerImpl.shutdown:313 → MQClientInstance
+    // #unregisterProducer:1198-1201 → unregisterClient(group, null)）：逐台 broker 发
+    // UNREGISTER_CLIENT(35)，broker 端 ProducerManager 立刻把本 clientId 从 groupChannelTable
+    // 摘掉。不发就只能等心跳超时（默认 ~120s）清理，这期间 `examineProducerConnectionInfo`
+    // 仍看得见这个已经退出的连接、事务回查也可能挑到它。
+    // ⚠ 必须在下面的 mqClient_->shutdown() **之前**：35 只能走还开着的长连接，且 broker
+    //   只摘除「这条 frame 到达的那条 channel」（ClientManageProcessor:226-230）。
+    // 与消费侧同一口径：异常只记 debug，shutdown 不因网络抖动抛出来。
+    if (mqClient_) {
+        try {
+            mqClient_->unregisterClientAllBrokers(clientId_, producerGroup_, "");
+        } catch (const std::exception& e) {
+            logger_debug("unregister on shutdown failed: " + std::string(e.what()));
+        } catch (...) {
+            logger_debug("unregister on shutdown failed: unknown exception");
+        }
+    }
     // 这一步 join 掉连接的读线程与超时清理线程：返回后不可能再有异步回调打进本对象，
     // 生产者的析构才是安全的（executeOnCallbackThread 在池子没了之后就地跑）。
     if (mqClient_) {

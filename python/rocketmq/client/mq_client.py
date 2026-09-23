@@ -1442,12 +1442,23 @@ class MQClientInstance:
         self._check_response(response)
 
     def unregister_client(self, addr: str, client_id: str, producer_group: str,
-                          consumer_group: str, timeout_millis: int = 5000) -> None:
+                          consumer_group: str, timeout_millis: int = 3000) -> None:
+        """UNREGISTER_CLIENT(35)：把本 clientId 从这台 broker 摘掉。
+
+        超时用 3000ms —— Java ``MQClientInstance#unregisterClient:1170`` 传的是
+        ``clientConfig.getMqClientApiTimeout()``（``ClientConfig.java:81`` = 3 * 1000），
+        与发送/拉取的超时预算无关；注销在 shutdown 路径上，预算越短退出越快。
+        """
         from ..remoting.protocol.headers import UnregisterClientRequestHeader
         header = UnregisterClientRequestHeader()
         header.client_id = client_id
-        header.producer_group = producer_group
-        header.consumer_group = consumer_group
+        # Java 没用的那个槽位传的是 null，`_ext` 会把 None 整个丢掉 —— 空串不一样，它会带着
+        # `consumerGroup: ""` 上线，而 broker 的 ClientManageProcessor:228/237 判的是
+        # `group != null`，于是会拿 "" 去 findSubscriptionGroupConfig 并白做一轮 unregister。
+        # 纯空白同样按「没这个组」处理：合法组名不可能全是空白（Validators 那一关就过不去），
+        # 传进来只可能是调用方漏了值，与空串同处理。
+        header.producer_group = (producer_group or "").strip() or None
+        header.consumer_group = (consumer_group or "").strip() or None
         request = RemotingCommand.create_request_command(RequestCode.UNREGISTER_CLIENT, header)
         response = self._invoke_sync(addr, request, timeout_millis)
         self._check_response(response)
@@ -1622,6 +1633,24 @@ class MQClientInstance:
                     addrs.append(a)
         return addrs
 
+    def get_all_broker_addrs(self) -> List[str]:
+        """路由里出现过的**每一台** broker 地址（主 + 从），不去重到「一个 brokerName 一台」。
+
+        `get_route_of_all_brokers` 走的是 `select_broker_addr()`（主优先，没主才随机），
+        心跳、拉取这类「问到一台就行」的调用用它。注销(35) 不行：Java
+        `MQClientInstance#unregisterClient`:1158-1182 遍历的是 `brokerAddrTable` 的
+        **每个 brokerId**，从节点也在里面 —— broker 的 `ProducerManager` /
+        `ConsumerManager` 是**每台 broker 各自一份**状态，漏掉从节点就等于那台的注册要等
+        通道扫描（默认 ~120s）才回收。
+        """
+        addrs = []
+        for route in self.topic_route_table.values():
+            for broker_data in route.get_broker_datas():
+                for a in broker_data.broker_addrs.values():
+                    if a and a not in addrs:
+                        addrs.append(a)
+        return addrs
+
     def get_consumer_id_list_by_group(self, topic: str, consumer_group: str,
                                       timeout_millis: int = 5000) -> Optional[List[str]]:
         """查询消费组内所有 clientId（对应 Java MQClientInstance.findConsumerIdList）。
@@ -1656,7 +1685,7 @@ class MQClientInstance:
         return list(body.consumer_id_list)
 
     def unregister_client_all_brokers(self, client_id: str, producer_group: str,
-                                      consumer_group: str, timeout_millis: int = 5000) -> None:
+                                      consumer_group: str, timeout_millis: int = 3000) -> None:
         """向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）。
 
         Java 在生产者/消费者 shutdown 时会逐台 broker 发 UNREGISTER_CLIENT(35)。
@@ -1664,7 +1693,10 @@ class MQClientInstance:
         期间事务回查、消费者变更通知仍可能发往已退出的实例。
         单台失败只记 debug —— shutdown 路径不应因网络抖动抛异常。
         """
-        for addr in self.get_route_of_all_brokers():
+        # 主 + 从都要发：Java :1159-1166 遍历的是 brokerAddrTable 的**每个 brokerId**，
+        # 而 Producer/ConsumerManager 是每台 broker 各自一份状态，漏掉从节点就等于那台的
+        # 注册要等通道扫描才回收。
+        for addr in self.get_all_broker_addrs():
             try:
                 self.unregister_client(addr, client_id, producer_group, consumer_group,
                                        timeout_millis)

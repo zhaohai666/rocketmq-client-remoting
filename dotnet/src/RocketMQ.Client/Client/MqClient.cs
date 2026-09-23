@@ -731,6 +731,37 @@ public sealed class MQClientInstance : IDisposable
 
     public List<string> KnownBrokerAddrs() => GetRouteOfAllBrokers();
 
+    /// <summary>
+    /// 路由里出现过的<strong>每一台</strong> broker（主 + 从）。
+    /// <see cref="GetRouteOfAllBrokers"/> 走 <c>SelectBrokerAddr()</c>（主优先、没主才随机），
+    /// 适合「问到一台就行」的心跳；注销(35) 必须用这个 —— Java
+    /// <c>MQClientInstance#unregisterClient</c>:1158-1182 遍历的是 <c>brokerAddrTable</c> 的
+    /// 每个 brokerId，而 Producer/ConsumerManager 是每台 broker 各自一份状态，漏掉从节点
+    /// 就等于那台的注册要等通道扫描（默认 ~120s）才回收。
+    /// </summary>
+    public List<string> GetAllBrokerAddrs()
+    {
+        var addrs = new List<string>();
+        lock (_routeLock)
+        {
+            foreach (var kv in _topicRouteTable)
+            {
+                foreach (BrokerData bd in kv.Value.BrokerDatas)
+                {
+                    foreach (string a in bd.BrokerAddrs.Values)
+                    {
+                        if (a.Length > 0 && !addrs.Contains(a))
+                        {
+                            addrs.Add(a);
+                        }
+                    }
+                }
+            }
+        }
+
+        return addrs;
+    }
+
     // ---------------- 消息发送 ----------------
 
     /// <summary>
@@ -1732,13 +1763,16 @@ public sealed class MQClientInstance : IDisposable
     }
 
     public void UnregisterClient(string addr, string clientId,
-        string producerGroup, string consumerGroup, int timeoutMillis = 5000)
+        string producerGroup, string consumerGroup,
+        int timeoutMillis = MqClientApiTimeoutMillis)
     {
         var header = new UnregisterClientRequestHeader
         {
             ClientId = clientId,
-            ProducerGroup = producerGroup,
-            ConsumerGroup = consumerGroup,
+            // 空着的那个槽位 Java 传的是 null（字段根本不上线），broker ClientManageProcessor:228/237
+            // 判的是 `group != null`，空串会被当成「真有个空组名」去查 "" 的订阅组配置。
+            ProducerGroup = string.IsNullOrWhiteSpace(producerGroup) ? null : producerGroup,
+            ConsumerGroup = string.IsNullOrWhiteSpace(consumerGroup) ? null : consumerGroup,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UnregisterClient, header);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
@@ -2155,15 +2189,17 @@ public sealed class MQClientInstance : IDisposable
     }
 
     /// <summary>
-    /// 向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）。
-    /// 对齐 Java 生产者/消费者 shutdown：逐台 broker 发 UNREGISTER_CLIENT(35)。
-    /// 不发的话 broker 端 ConsumerManager 只能等心跳超时（默认 ~120s）清理。
+    /// 向所有已知 broker（<b>主 + 从</b>，见 <see cref="GetAllBrokerAddrs"/>）注销本 clientId
+    /// （对应 Java MQClientInstance.unregisterClient:1158-1182）。
+    /// 对齐 Java 生产者/消费者 shutdown：逐台 broker 发 UNREGISTER_CLIENT(35)，
+    /// 超时用 Java 的 <see cref="MqClientApiTimeoutMillis"/>（:1170 传的正是它）。
+    /// 不发的话 broker 端 Consumer/ProducerManager 只能等心跳超时（默认 ~120s）清理。
     /// 单台失败只记 debug —— shutdown 路径不应因网络抖动抛异常。
     /// </summary>
     public void UnregisterClientAllBrokers(string clientId, string producerGroup, string consumerGroup,
-        int timeoutMillis = 5000)
+        int timeoutMillis = MqClientApiTimeoutMillis)
     {
-        foreach (string addr in GetRouteOfAllBrokers())
+        foreach (string addr in GetAllBrokerAddrs())
         {
             try
             {

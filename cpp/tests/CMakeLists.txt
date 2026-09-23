@@ -179,3 +179,10 @@ add_test(NAME pull_expired COMMAND rmq_test_pull_expired)
 add_executable(rmq_test_flow_control test_flow_control.cpp)
 target_link_libraries(rmq_test_flow_control PRIVATE rocketmq::remoting)
 add_test(NAME flow_control COMMAND rmq_test_flow_control)
+
+# 退出注销 UNREGISTER_CLIENT(35)：mock broker 锁死头的形状（空白组槽位整个不上线）与
+# 「每台 broker 含从节点」的扇出（broker 端判的是 group != null，真机看不出来）。
+# 真机侧的证据在 examples/live_producer_unregister.cpp（抓帧 + 204 前后对比）。
+add_executable(rmq_test_producer_unregister test_producer_unregister.cpp)
+target_link_libraries(rmq_test_producer_unregister PRIVATE rocketmq::remoting)
+add_test(NAME producer_unregister COMMAND rmq_test_producer_unregister)

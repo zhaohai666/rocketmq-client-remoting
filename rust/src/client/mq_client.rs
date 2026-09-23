@@ -112,8 +112,9 @@ use crate::{bail, rmq_debug, rmq_info, rmq_warn};
 // ================================================================ seams
 
 /// Java `ClientConfig.mqClientApiTimeout` 的默认值（`ClientConfig.java:81` = `3 * 1000`）：
-/// 管理类短 RPC（如 `CHECK_CLIENT_CONFIG`）走的就是它，与发送/拉取的超时预算无关。
-const MQ_CLIENT_API_TIMEOUT_MILLIS: i64 = 3000;
+/// 管理类短 RPC（如 `CHECK_CLIENT_CONFIG`、shutdown 时的 `UNREGISTER_CLIENT`）走的就是它，
+/// 与发送/拉取的超时预算无关。
+pub(crate) const MQ_CLIENT_API_TIMEOUT_MILLIS: i64 = 3000;
 
 /// 消费者对实例暴露的能力面（对应 Java `MQConsumerInner` 中
 /// `MQClientInstance` 心跳 / 位点持久化 / broker 主动请求分派真正读到的部分）。
@@ -1160,6 +1161,22 @@ impl MQClientInstance {
             return;
         }
         self.shutdown_factory();
+    }
+
+    /// Java 侧「shutdown 后立刻 restart」是安全的：`DefaultMQProducerImpl#shutdown` 是
+    /// 同步的，返回时 35 号注销已经发完，`factoryTable` 里也已经没有这份实例。
+    /// 本移植把注销挂 [`tokio::runtime::Handle::spawn`]（`shutdown()` 是同步 API，不能在
+    /// 调用线程上等网络），登记表却还留着这一份 ⇒ 重启会经
+    /// [`create_mq_client_instance`](Self::create_mq_client_instance) 复用回这份**正要被
+    /// 拆**的实例，再被那个任务连带拆掉（真机 `live_producer` 的 P1 踩过）。
+    ///
+    /// 所以最后一位使用者退场时**先同步摘登记**：旧实例把 35 发完再自己拆（连接归它自己，
+    /// 重启那份是干净的新实例）；表里还有别人时什么都不做 —— 实例要继续被复用，
+    /// 摘了就等于把共享它的客户端赶去各建一条连接（Java 不会这样）。
+    pub fn detach_from_registry_if_last_tenant(&self) {
+        if self.tenant_count() == 0 {
+            self.remove_from_instance_map();
+        }
     }
 
     /// Java `MQClientInstance#shutdown` 里 `case RUNNING` 的那一段（守卫通过之后）。
@@ -2357,6 +2374,28 @@ impl MQClientInstance {
         addrs
     }
 
+    /// 路由里出现过的**每一台** broker（主 + 从）。
+    ///
+    /// [`get_route_of_all_brokers`] 走 `select_broker_addr()`（主优先，没主才随机），
+    /// 适合「问到一台就行」的心跳。注销(35) 不行：Java
+    /// `MQClientInstance#unregisterClient`:1158-1182 遍历的是 `brokerAddrTable` 的
+    /// **每个 brokerId**，从节点也在里面 —— `ProducerManager` / `ConsumerManager` 是每台
+    /// broker 各自一份状态，漏掉从节点就等于那台的注册要等通道扫描（默认 ~120s）才回收。
+    pub fn get_all_broker_addrs(&self) -> Vec<String> {
+        let mut addrs: Vec<String> = Vec::new();
+        for route in self.cached_routes() {
+            for bd in route.get_broker_datas() {
+                for (_, addr) in &bd.broker_addrs {
+                    if !addr.is_empty() && !addrs.contains(addr) {
+                        addrs.push(addr.clone());
+                    }
+                }
+            }
+        }
+        addrs.sort();
+        addrs
+    }
+
     /// 已缓存路由快照（Python 直接遍历 `topic_route_table.values()`）。
     fn cached_routes(&self) -> Vec<TopicRouteData> {
         self.inner
@@ -2995,8 +3034,10 @@ impl MQClientInstance {
     ) -> Result<()> {
         let header = UnregisterClientRequestHeader {
             client_id: Some(client_id.to_string()),
-            producer_group: Some(producer_group.to_string()),
-            consumer_group: Some(consumer_group.to_string()),
+            // Java 空着的那个槽位传的是 null（字段根本不上线），broker `ClientManageProcessor:228/237`
+            // 判的是 `group != null`，空串会被当成「真有个空组名」去查 `""` 的订阅组配置。
+            producer_group: blank_group_to_none(producer_group),
+            consumer_group: blank_group_to_none(consumer_group),
         };
         let mut request = RemotingCommand::create_request_command(
             request_code::UNREGISTER_CLIENT,
@@ -3312,7 +3353,8 @@ impl MQClientInstance {
         consumer_group: &str,
         timeout_millis: i64,
     ) {
-        for addr in self.get_route_of_all_brokers() {
+        // 每台都发（含 slave）：见 [`get_all_broker_addrs`]，Java 遍历的是每个 brokerId。
+        for addr in self.get_all_broker_addrs() {
             if let Err(e) = self
                 .unregister_client(&addr, client_id, producer_group, consumer_group, timeout_millis)
                 .await
@@ -3321,6 +3363,16 @@ impl MQClientInstance {
             }
         }
     }
+}
+
+/// `UNREGISTER_CLIENT`(35) 的组名槽位：空白 ⇒ 不上线。
+///
+/// Java 的另一侧传的是 `null`（`unregisterClient(group, null)`），字段因此整个不出现在
+/// extFields 里；broker `ClientManageProcessor.unregisterClient:228/237` 用 `group != null`
+/// 决定要不要摘生产者/消费者那一侧，所以空串会变成「真有个叫 `""` 的组」——去查它的订阅组
+/// 配置、再白做一轮注销。
+fn blank_group_to_none(group: &str) -> Option<String> {
+    (!group.trim().is_empty()).then(|| group.to_string())
 }
 
 /// `wait_or_stop`：sleep 与 stop 信号赛跑；`true` 表示该停了。
@@ -4196,9 +4248,13 @@ mod tests {
 
         /// 只保留 46 号请求：路由刷新等副作用不该混进断言。
         fn checks(&self) -> Vec<Recorded> {
+            self.recorded(request_code::CHECK_CLIENT_CONFIG)
+        }
+
+        fn recorded(&self, code: i32) -> Vec<Recorded> {
             guard(&self.state)
                 .iter()
-                .filter(|r| r.code == request_code::CHECK_CLIENT_CONFIG)
+                .filter(|r| r.code == code)
                 .cloned()
                 .collect()
         }
@@ -4478,5 +4534,87 @@ mod tests {
         );
         assert_eq!(instance.find_broker_addr_by_topic("NoSuchTopic"), None);
         instance.shutdown();
+    }
+
+    /// 注销的扇出必须覆盖**每一台** broker（主 + 从）：Java
+    /// `MQClientInstance#unregisterClient`:1158-1182 遍历的是 `brokerAddrTable` 的每个
+    /// brokerId，而 `ProducerManager` / `ConsumerManager` 是每台各自一份状态 —— 漏掉从节点
+    /// 就等于那台的注册要等通道扫描（默认 120s）才回收。心跳那侧相反，只打 master。
+    #[tokio::test]
+    async fn unregister_reaches_slaves_too() {
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        let instance = new_instance();
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master.addr.clone()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
+        // 两个 helper 的分工：心跳一台、注销每台
+        assert_eq!(instance.get_route_of_all_brokers(), vec![master.addr.clone()]);
+        let mut want = vec![master.addr.clone(), slave.addr.clone()];
+        want.sort();
+        assert_eq!(instance.get_all_broker_addrs(), want);
+
+        instance
+            .unregister_client_all_brokers("cid-1", "GID_p", "", 3000)
+            .await;
+        let unregs = |b: &Arc<MockBroker>| b.recorded(request_code::UNREGISTER_CLIENT);
+        assert_eq!(unregs(&master).len(), 1, "master 收到一发 35");
+        assert_eq!(unregs(&slave).len(), 1, "slave 也收到一发 35");
+        for rec in unregs(&master).into_iter().chain(unregs(&slave)) {
+            let keys: Vec<&str> = rec.ext_fields.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, vec!["clientID", "producerGroup"], "空白槽位不上线");
+        }
+        instance.shutdown();
+    }
+
+    /// 35 的空槽位必须整个不上线（Java 的 `unregisterClient(group, null)`）。broker
+    /// `ClientManageProcessor.unregisterClient:228/237` 判的是 `group != null`，空串会被
+    /// 当成「真有个叫 `""` 的组」，白查一次订阅组配置。
+    #[test]
+    fn blank_unregister_groups_stay_off_the_wire() {
+        assert_eq!(blank_group_to_none(""), None);
+        assert_eq!(blank_group_to_none("   "), None);
+        assert_eq!(blank_group_to_none("GID_x").as_deref(), Some("GID_x"));
+
+        let header_ext =
+            |producer: &str, consumer: &str| -> Vec<String> {
+                crate::remoting::protocol::ext_fields::ExtFields::from_header(
+                    &UnregisterClientRequestHeader {
+                        client_id: Some("cid".to_string()),
+                        producer_group: blank_group_to_none(producer),
+                        consumer_group: blank_group_to_none(consumer),
+                    },
+                )
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect()
+            };
+        // 生产者退出：只有 clientID + producerGroup
+        assert_eq!(
+            header_ext("GID_p", ""),
+            vec!["clientID".to_string(), "producerGroup".to_string()]
+        );
+        // 消费者退出：只有 clientID + consumerGroup
+        assert_eq!(
+            header_ext("", "GID_c"),
+            vec!["clientID".to_string(), "consumerGroup".to_string()]
+        );
     }
 }

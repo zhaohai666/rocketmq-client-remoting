@@ -607,10 +607,8 @@ public class DefaultMQProducer
                 CheckTransactionState);
 
             _started = true;
-            // 允许 Shutdown 之后再 Start（Shutdown 的那半程里 _started 还是 true，靠这个标记
-            // 挡住重复 Shutdown；重新 Start 就要把它清掉）
-            _shutdownRequested = false;
-            // 允许 Shutdown 之后再 Start（Java 也支持重新 start）：这道闸必须跟着复位
+            // 允许 Shutdown 之后再 Start：Shutdown 的前半程里 _started 还是 true，靠 _shutdownRequested
+            // 挡住重复 Shutdown 与新请求，重新 Start 时这道闸必须复位（Java 也支持 start→shutdown→start）
             _shutdownRequested = false;
             // 异步发送池（Java 在 DefaultMQProducerImpl 构造时建，这里等价放在 Start 的锁内）：
             // 必须早于 _started=true 之后任何一次 SendAsync —— SendAsync 只在锁里取句柄。
@@ -732,6 +730,21 @@ public class DefaultMQProducer
 
         if (_mqClient is not null)
         {
+            // Java `DefaultMQProducerImpl.shutdown():313` → `MQClientInstance.unregisterProducer:1198-1201`
+            // → 私有 `unregisterClient(group, null):1158-1182`：给 brokerAddrTable 里**每台 broker
+            // （含 slave）**同步发一发 UNREGISTER_CLIENT(35)，超时 getMqClientApiTimeout()（3000ms），
+            // 异常只 log.warn。少了这一发，broker 侧 ProducerManager 要等通道断开（或 120s 扫描）
+            // 才回收本组连接。35 必须走**还没关的那条连接**，所以只能排在 Shutdown() 之前；
+            // 心跳线程已在上面停掉，不会被重新注册回去。
+            try
+            {
+                _mqClient.UnregisterClientAllBrokers(_clientId, ProducerGroup, "");
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unregister producer on shutdown failed: " + e.Message);
+            }
+
             _mqClient.Shutdown();
         }
 

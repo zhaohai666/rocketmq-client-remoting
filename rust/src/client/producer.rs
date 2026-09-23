@@ -50,6 +50,7 @@ use crate::client::latency::MQFaultStrategy;
 use crate::client::metrics::ClientMetrics;
 use crate::client::mq_client::{
     MQClientInstance, MQClientInstanceConfig, PublishMessage, TopicPublishInfo, TraceDispatcher,
+    MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
 use crate::client::request_reply::{
     create_correlation_id, request_future_holder, RequestResponseFuture,
@@ -1437,6 +1438,11 @@ impl DefaultMQProducer {
     }
 
     /// Python `shutdown()`。
+    ///
+    /// ⚠ 与 Python/C++/.NET 的同步 shutdown 不同：这里 35 号注销和实例拆解都挂在
+    /// `runtime_handle().spawn()` 上（`shutdown()` 本身是同步的，不能阻塞等 RPC 回来）。
+    /// 所以「shutdown 后立刻 `std::process::exit`」可能来不及把这帧发出去，需要注销
+    /// 真的落地就要给运行时一拍时间（等 `is_started()` 翻掉，或短 sleep）。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -1483,7 +1489,35 @@ impl DefaultMQProducer {
             // 再 `mQClientFactory.shutdown()`。守卫读的就是这张表，不先摘掉自己，
             // 最后一个使用者反而永远拆不掉实例。
             client.unregister_producer(&self.inner.producer_group());
-            client.shutdown();
+            client.detach_from_registry_if_last_tenant();
+            // `unregisterProducer` 并不是只改本地表：Java `MQClientInstance#unregisterProducer`:1198-1201
+            // → 私有 `unregisterClient(group, null)`:1158-1182，会给 brokerAddrTable 里**每个
+            // broker（含 slave）**同步发一发 code 35 UNREGISTER_CLIENT，超时取
+            // `getMqClientApiTimeout()`（3000ms），异常一律吞成 log.warn。少了这一发，
+            // broker 侧 ProducerManager 要等通道断开（或 120s 扫描）才回收本组连接。
+            // 35 必须走**还没关的那条连接**，所以 `client.shutdown()` 只能排在它之后
+            // （与 push 消费者 shutdown 同一套 spawn 形状）。
+            match (self.runtime_handle(), self.client_id()) {
+                (Some(handle), Some(client_id)) => {
+                    let group = self.inner.producer_group();
+                    handle.spawn(async move {
+                        client
+                            .unregister_client_all_brokers(
+                                &client_id,
+                                &group,
+                                "",
+                                MQ_CLIENT_API_TIMEOUT_MILLIS,
+                            )
+                            .await;
+                        client.shutdown();
+                    });
+                }
+                // 无运行时：这一发注销发不出去（Python 那里线程照起），但至少把实例还掉。
+                _ => {
+                    rmq_warn!("producer shutdown: no tokio runtime, skip broker unregister");
+                    client.shutdown();
+                }
+            }
         }
         // 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器
         // （分发器用的是**自己的**内部生产者，与本客户端实例无关，所以关掉了照样能发完）
@@ -4362,7 +4396,46 @@ mod tests {
         a.shutdown();
         assert!(shared.is_started(), "先退场的使用者把共用实例关掉了");
         b.shutdown();
+        // 注销(35) 与实例拆解现在排在同一个 spawn 出来的任务里，`shutdown()` 只是把它交出去
+        for _ in 0..200 {
+            if !shared.is_started() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(!shared.is_started(), "最后一个使用者退场后实例没被拆掉");
+    }
+
+    /// 真机 `live_producer` 的 P1（shutdown 后重启还能发）踩过的坑，离线版：
+    /// 注销(35) 和实例拆解都排在 `spawn` 的任务里，`shutdown()` 只是把它交出去。
+    /// 如果登记表也跟着晚一步腾空，同 clientId 的 `start()` 就会经
+    /// `create_mq_client_instance` 复用回那份**正要被拆**的实例，随后被那个任务
+    /// 连带 `shutdown` 掉 ⇒ 重启后的第一发送请求报 "client already shutdown"。
+    #[tokio::test]
+    async fn restart_after_shutdown_never_reuses_a_dying_instance() {
+        let name = format!("clientid-restart-{}", MixAll::cached_pid());
+        let p = producer("GID_clientid_restart");
+        p.set_instance_name(&name);
+        p.set_namesrv_addr("127.0.0.1:1");
+        p.start().await.expect("start 不该失败");
+        let client_id = p.client_id().expect("clientId");
+        p.shutdown();
+        // 不等任何任务：`shutdown()` 一返回，这份实例就不该再被同 clientId 找到
+        assert!(
+            MQClientInstance::find_instance(&client_id).is_none(),
+            "shutdown() 返回后实例还挂在 INSTANCE_MAP 上，重启会复用它"
+        );
+
+        p.start().await.expect("重启不该失败");
+        let fresh = MQClientInstance::find_instance(&client_id).expect("重启后要有一份实例");
+        assert!(fresh.has_producer(&p.config().producer_group));
+        // 让上一次 shutdown 的尾巴（35 + 拆解）先跑完
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            fresh.is_started(),
+            "重启拿到的实例被上一次 shutdown 的任务尾巴拆掉了"
+        );
+        p.shutdown();
     }
 
     #[tokio::test]

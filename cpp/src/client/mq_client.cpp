@@ -572,6 +572,23 @@ std::vector<std::string> MQClientInstance::getRouteOfAllBrokers() {
 
 std::vector<std::string> MQClientInstance::knownBrokerAddrs() { return getRouteOfAllBrokers(); }
 
+std::vector<std::string> MQClientInstance::getAllBrokerAddrs() {
+    // 与 getRouteOfAllBrokers 的唯一区别：不挑主，每个 brokerId 都算一台。
+    std::vector<std::string> addrs;
+    std::lock_guard<std::recursive_mutex> lk(routeLock_);
+    for (const auto& kv : topicRouteTable_) {
+        for (const BrokerData& bd : kv.second.brokerDatas) {
+            for (const auto& entry : bd.brokerAddrs) {
+                if (!entry.second.empty() &&
+                    std::find(addrs.begin(), addrs.end(), entry.second) == addrs.end()) {
+                    addrs.push_back(entry.second);
+                }
+            }
+        }
+    }
+    return addrs;
+}
+
 // ---------------------------------------------------------------- 消息发送
 // 建请求 / 解析应答 / 发送三件事分开，是为了让异步发送能跨重试复用同一个请求对象
 // （Java MQClientAPIImpl#onExceptionImpl 只换 opaque，不换队列也不重建头）。
@@ -1418,8 +1435,15 @@ void MQClientInstance::unregisterClient(const std::string& addr, const std::stri
                                        const std::string& consumerGroup, int32_t timeoutMillis) {
     auto header = std::make_shared<UnregisterClientRequestHeader>();
     header->clientId = clientId;
-    header->producerGroup = producerGroup;
-    header->consumerGroup = consumerGroup;
+    // 空着的那个槽位 Java 传的是 null，字段根本不上线；broker ClientManageProcessor:228/237
+    // 判的是 `group != null`，空串会被当成「真有个空组名」去查 "" 的订阅组配置。
+    // 纯空白同理：合法组名不可能全是空白（Validators 那一关过不去）。
+    header->producerGroup = UtilAll::isBlank(producerGroup)
+        ? std::nullopt
+        : std::optional<std::string>(producerGroup);
+    header->consumerGroup = UtilAll::isBlank(consumerGroup)
+        ? std::nullopt
+        : std::optional<std::string>(consumerGroup);
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::UNREGISTER_CLIENT, header);
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
@@ -1640,7 +1664,7 @@ void MQClientInstance::unregisterClientAllBrokers(const std::string& clientId,
     // 生产者/消费者 shutdown 时逐台 broker 发 UNREGISTER_CLIENT(35)。不发的话 broker 端
     // Consumer/ProducerManager 只能等心跳超时（默认 ~120s）清理，期间事务回查、消费者
     // 变更通知仍可能发往已退出的实例。单台失败只记 debug——shutdown 路径不应因网络抖动抛异常。
-    for (const std::string& addr : getRouteOfAllBrokers()) {
+    for (const std::string& addr : getAllBrokerAddrs()) {
         try {
             unregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
         } catch (const std::exception& e) {

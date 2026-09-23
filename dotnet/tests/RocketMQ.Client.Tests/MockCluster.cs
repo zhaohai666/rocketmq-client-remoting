@@ -225,6 +225,18 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
+    /// <summary>
+    /// 按到达顺序取出全部取证快照。判「谁先谁后」时唯一的落点 ——
+    /// 比如注销(35) 必须排在业务发送之后、且走的是还没关的那条长连接。
+    /// </summary>
+    public List<WireRecord> Records()
+    {
+        lock (_gate)
+        {
+            return new List<WireRecord>(_requests);
+        }
+    }
+
     /// <summary>指定请求码上收到过多少笔请求。</summary>
     public int CountRequests(int code)
     {
