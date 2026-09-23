@@ -81,3 +81,7 @@ target_link_libraries(rmq_sql92_live PRIVATE rocketmq::remoting)
 # 异步发送背压（两个公平信号量）真机联调：限流文案 + broker 侧对账 + 运行时扩容（不打进 ctest）
 add_executable(rmq_live_backpressure live_backpressure.cpp)
 target_link_libraries(rmq_live_backpressure PRIVATE rocketmq::remoting)
+
+# 异步发送内核（准备段/回调线程口径、并发不串台、定点/拦截/批量/关池排空）真机联调（不打进 ctest）
+add_executable(rmq_live_async_send live_async_send.cpp)
+target_link_libraries(rmq_live_async_send PRIVATE rocketmq::remoting)

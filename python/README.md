@@ -37,6 +37,8 @@ python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）
 python verify_lite_pull_live.py   # lite pull 全链路（32 PASS/0 FAIL）：rebalance/收 12 条/commit/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）
 python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS/0 FAIL）：SQL92 订阅启动时正好一笔 46、纯 TAG 订阅一笔不发；broker 真按属性过滤（red 只收 3 条、blue 不漏、'*' 对照组收 6 条、永不匹配收 0 条）；语法错的表达式让 start() 秒回 SUBSCRIPTION_PARSE_FAILED(23) 并就地回滚。需 broker 开 enablePropertyFilter=true
 python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
+python verify_async_send_live.py  # 异步发送内核 A1~A6（36 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核、shutdown 不等在途（36 笔全报错、一条都没落）
+python verify_backpressure_live.py # 异步发送背压 B1~B5（Java 两个公平信号量，真机版）
 ```
 
 其它真机脚本：`verify_acl_live.py`（需开 ACL 的集群）/ `verify_pull_live.py` /
@@ -325,10 +327,13 @@ raw-exception + `needRetry=true` 分支，**不包装**。`request()` 内部就�
 （`:1043-1046`）：钩子、压缩、建请求的耗时都算进预算，被吃光时不再发起请求，回调拿
 `RemotingTooMuchRequestException("sendKernelImpl call timeout")` 且不重试。
 
-刻意保留的四处偏差：未 `start()` 时 `send_async` 同步抛（Java 从回调给）；批量消息在 sender
-池里复用同步批量内核；没实现 Java 默认关闭的信号量背压；`shutdown()` 不等在途异步任务
-（Java `:314` 也只调 `shutdown()` 不 `awaitTermination`）——所以"发完立刻 shutdown"会丢任务，
-与 Java 一致。
+刻意保留的三处偏差：未 `start()` 时 `send_async` 同步抛（Java 从回调给）；批量消息在 sender
+池里复用同步批量内核；`shutdown()` 不等在途异步任务
+（Java `:314` 也只调 `shutdown()` 不 `awaitTermination`）——实测（`verify_async_send_live.py`
+A6）36 笔全部拿到终态回调但整轮以 `client already shutdown` 报错、broker 上一条都没落，
+所以"发完立刻 shutdown"会丢消息，与 Java 一致。Java 默认关闭的**信号量背压**已经按
+`executeAsyncMessageSend:635-682` 移植完（`enable_backpressure_for_async_mode` +
+`FairSemaphore` 两个维度，守卫见 `verify_backpressure_live.py`）。
 
 ## License
 

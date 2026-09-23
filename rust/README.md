@@ -96,14 +96,15 @@ cargo run --example live_admin              -- 127.0.0.1:9876
 cargo run --example live_unit_config        -- 127.0.0.1:9876
 cargo run --example live_sql92              -- 127.0.0.1:9876   # 需 broker enablePropertyFilter=true
 cargo run --example live_backpressure       -- 127.0.0.1:9876
+cargo run --example live_async_send         -- 127.0.0.1:9876
 cargo run --example live_acl                -- 127.0.0.1:9876 <AK> <SK>   # 需开 ACL 的集群
 cargo run --example live_compression_matrix -- send|recv ...             # 由 ../scripts/compression_matrix.sh 调度
 ```
 
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
-下表是 **2026-09-22 在本地 5.5.1 集群上的实测结果**（全表当轮重测；
-上表 14 个工具合计 761 项断言，`live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本
-调度，都不计进去）：
+下表是 **2026-09-22 在本地 5.5.1 集群上的实测结果**（全表当轮重测；`live_async_send` 是
+2026-09-23 补的，同日重测。上表 15 个工具合计 797 项断言，`live_acl` 本机集群没开鉴权、
+`live_compression_matrix` 由脚本调度，都不计进去）：
 
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
@@ -121,6 +122,7 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_unit_config` | 15 PASS | U1~U5（与 Python/C++/.NET 同场景）：`unit_name` 拼进 clientId（`<ip>@<instance>@<unitName>`）且照常发送、`@STREAM` 后缀的消费者在 **broker 的 `GET_CONSUMER_LIST_BY_GROUP` 里也是同一串**（唯一能证明「上线的就是拼好的 clientId」的观测点）、`unit_mode=true` 的发送让自动建出的 topic 带 `UNIT` 位而对照组不带、心跳里的 `ConsumerData.unit_mode` 让 `%RETRY%group` 带 `UNIT_SUB` 位、stream 生产者与 lite 消费者（默认开）每个请求带 `ReqT=0` 时收发照常 |
 | `live_sql92` | 15 PASS | S1~S4（与 Python/C++/.NET 同场景）：SQL92 订阅启动时正好一笔 `CHECK_CLIENT_CONFIG`(46)、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发 → 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，不是放行全部），`'*'` 对照组收全 6 条，永不匹配的 `color='green'` 收 0 条 → 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线单测 9 项（`client::mq_client`：真 socket mock broker，含 Java 那个「订阅集合里有空 subscriptions 就整轮 `return` 而非 `continue`」的短路怪癖） |
 | `live_backpressure` | 30 PASS | B1~B5（Java `executeAsyncMessageSend` 的两个公平闸 + 有界发送队列，真机版）：B1 默认容量 1024 条 / 100MiB 字节、40 笔并发异步发送全落 broker 且两个闸满额归还；B2 `minAsyncResendNum=10` 时**恰好**第 11、12 笔回调 `send message tryAcquire semaphoreAsyncNum timeout`（文案逐字对 Java）、闸等到 150ms 预算耗尽才报（不是看一眼就拒）、broker 上只落那 10 条、被拒的两笔**一笔都没进发送内核**（钩子计数 0）；B3 第 11 笔卡在闸上（**由看门 OS 线程在条数闸读到 0 的瞬间才补交**，否则池子里的任务和它会争公平闸的先后、断言就是假的），由**另一个 OS 线程**在 1000ms 时刻把容量抬到 12 才放它过去（钩子时间戳证明放行时刻 ∈ [1000, 2500)ms，早于在途那 10 笔归还），一共落 21 条、空闲许可 = 新容量 12；B4 一笔 600KB 在途精确扣掉 614400 个字节许可（剩 434176），超限两笔回调 `...semaphoreAsyncSize timeout`、只落 1 条，且**字节闸没过时已拿到的条数许可照样归还**；B5 配置越界被夹到地板值 10 条 / 1MiB，开关关掉时 30 笔并发（含 3 笔 300KB）全部落地、两个闸一分未动 |
+| `live_async_send` | 36 PASS / 0 FAIL / 1 SKIP（2026-09-23 实测） | A1~A6（异步发送内核，与 `python/verify_async_send_live.py`、`cpp/examples/live_async_send.cpp`、.NET `async-send` 同场景）：A1 `send_async` 在准备段（`send_message_before` 睡 400ms）**之前**就返回，回调恰好一次且 SEND_OK，**用 broker 回的 `offsetMsgId` 能 `view_message` 读回原 body**、`queueOffset == 该队列 maxOffset-1`、`msgId` 是 32 位客户端 UNIQ_KEY 且与 `offsetMsgId` 不同；线程口径本端口没有 `AsyncSenderExecutor_N` / `NettyClientPublicExecutor_N` 这种池线程名，故把调用方放到 `spawn_blocking`（与 tokio 工作线程集合不相交）后用 `ThreadId` 证「before 钩子与用户回调都不在调用方线程上」→ A2 并发 30 笔：一笔恰好一个终态、全 SEND_OK、broker 落 30 条、30 个 `(broker,queueId,queueOffset)` 槽位与 30 个 UNIQ_KEY 两两不重复 → A3 定点异步发送只让指定的那条队列多 1 条、其它队列一条没多 → A4 `CheckForbiddenHook` 看到 `ASYNC`，拒绝时异常原样到回调且**连 topic 路由都没建出来**（`landed=-1`），换个标签照常落地、钩子被调 2 次 → **A5 SKIP：本端口没有 `send_async` 的批量入口**（Java `send(Collection, SendCallback, long)`、Python/C++/.NET 均有对位实现，这里只有同步语义的 `send_batch`），是接口缺口 → A6 实测本端口与 **Java/Python 同派**：`shutdown()` 返回耗时 0ms、不等在途，交进来的 36 笔仍各拿到一个终态回调，但整轮以 `client already shutdown` 收场、broker 上一条都没落（连 topic 都没建出来，`landed=-1`）⇒「不等待真的会丢消息」，调用方要保消息得自己等回调再关；C++/.NET 那两版 join 完池子才关客户端、同一用例能落满 36 条，是它们相对 Java 的偏离。关停之后 `send_async` 同步被拒且不追加回调、新生产者照常能发（关掉的池子不会被复用） |
 | `live_acl` | 需开鉴权的集群 | S1~S8：签名被 broker 接受（建 topic / 发送 / 心跳+长轮询+位点三条 RPC 全程带签名）、不带凭据与 secretKey 写错都回 `NO_PERMISSION(16)`、拉模式签名链路。前置是 broker.conf 开 `authenticationEnabled=true` + `LocalAuthenticationMetadataProvider` + `initAuthenticationUser`（本机默认集群关着，跑不了这一项） |
 | `live_compression_matrix` | 矩阵一端 | 与 Java/Python/C++/.NET 探针双向收发压缩消息，由 `../scripts/compression_matrix.sh` 调度 |
 
@@ -277,7 +279,16 @@ rust/
   尝试共享**的剩余时间；broker 真返回的业务码**不进**重试链（与 Java/Python 一致，异步忽略
   `retry_response_codes`），只有传输层失败/超时才换 broker；终点固定是 `complete_async`：
   after 钩子 → 归还许可 → 用户回调**恰好一次**。`shutdown()` 按 Java 的顺序先 unregister 再
-  **排空**发送队列（`shutdown()` 后不再接收新任务，但已入队的每笔仍会跑完并回调）。
+  **排空**发送队列（`shutdown()` 后不再接收新任务，但已入队的每笔仍会跑完并回调）——⚠「跑完」指的
+  是跑完那条链，**不是**消息上线：实例是同一时刻拆掉的，所以关停时队列里那一笔一笔都会回调
+  `client already shutdown`、broker 上一条都不落（真机 `live_async_send` A6 实测 36 笔全报错、
+  `landed=-1`）。这与 Java/Python 同派，C++/.NET 那两版 join 完池子才关客户端、同一用例落满 36 条。
+  要保消息就得自己等回调再关。真机口径另有 `live_async_send` A1~A5 六节（线程口径、并发不串台、
+  定点、拦截钩子、批量缺口）。
+- **异步批量入口是本端口的一处真缺口**：Java `DefaultMQProducer.send(Collection<Message>,
+  SendCallback, long)` 与 Python `_send_async`、C++ `sendAsync(MessageBatch, …)`、.NET
+  `SendAsync(IEnumerable<Message>, …)` 都有对位实现，这里只有同步语义的
+  `send_batch(...) -> Result<SendResult>`（`live_async_send` A5 因此记 SKIP 而不是假通过）。
 - **上面那条「池子」为什么不是 `tokio::sync::Mutex<Receiver>` 那种一眼省事的写法**（实测过才写的）：
   互斥锁轮询队列看着等价，实际是**一次派发一份并发额度** —— 拿到锁的任务在被释放锁的那个工作线程
   本地队列上醒来，只要有一个发送钩子同步阻塞（`std::thread::sleep`）， baton 就落在那个睡着的
