@@ -444,6 +444,13 @@ public sealed class DefaultMQPushConsumer
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
     private readonly HashSet<string> _lockOk = new(StringComparer.Ordinal);
     private int _pullThresholdForQueue = 1000;
+    // Java ProcessQueue 余下四个阈值：字节闸门单位是 **MiB**（<=0 关闭）；跨度是 pending 里
+    // queueOffset 的 max-min，**严格大于**才算命中；topic 级两条默认 -1（关闭），统计的是
+    // 本实例该 topic **所有**队列的累计缓冲。
+    private int _pullThresholdSizeForQueue = 100;
+    private long _consumeConcurrentlyMaxSpan = 2000;
+    private int _pullThresholdForTopic = -1;
+    private int _pullThresholdSizeForTopic = -1;
     private long _flowControlTriggered;
     private Thread? _dispatchThread;
     private Thread? _persistThread;
@@ -731,6 +738,39 @@ public sealed class DefaultMQPushConsumer
     {
         get => _pullThresholdForQueue;
         set => _pullThresholdForQueue = value;
+    }
+
+    /// <summary>Java <c>pullThresholdSizeForQueue</c>（默认 100）：本队列「已拉未消费」
+    /// 字节阈值，单位 <b>MiB</b>；&lt;=0 表示关闭这条闸门。</summary>
+    public int PullThresholdSizeForQueue
+    {
+        get => _pullThresholdSizeForQueue;
+        set => _pullThresholdSizeForQueue = value;
+    }
+
+    /// <summary>Java <c>consumeMessageMaxSpan</c>（默认 2000）：本队列「已拉未消费」消息
+    /// queueOffset 的跨度阈值，严格大于才命中（防止队首一条卡住、后面无限堆）；&lt;=0 关闭。</summary>
+    public long ConsumeConcurrentlyMaxSpan
+    {
+        get => _consumeConcurrentlyMaxSpan;
+        set => _consumeConcurrentlyMaxSpan = value;
+    }
+
+    /// <summary>Java <c>pullThresholdForTopic</c>（默认 -1 关闭）：本实例同 topic <b>所有</b>队列
+    /// 累计「已拉未消费」条数阈值。注意 Java 在 RebalancePushImpl 里会把 topic 阈值除以队列数
+    /// 折算到队列级，本移植直接拿累计值比对（与 Python/Rust/C++ 同形）。</summary>
+    public int PullThresholdForTopic
+    {
+        get => _pullThresholdForTopic;
+        set => _pullThresholdForTopic = value;
+    }
+
+    /// <summary>Java <c>pullThresholdSizeForTopic</c>（默认 -1 关闭）：同 topic 累计字节阈值，
+    /// 单位 <b>MiB</b>。这条闸门只看本属性，<b>不复用</b>队列级那道开关。</summary>
+    public int PullThresholdSizeForTopic
+    {
+        get => _pullThresholdSizeForTopic;
+        set => _pullThresholdSizeForTopic = value;
     }
 
     // 流控触发次数（用于验证流控能力）
@@ -2162,6 +2202,103 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>拉取前的流控判定 —— Python <c>_flow_control_hit</c> / Java
+    /// <c>ProcessQueue.putMessage</c> 的五个阈值，按此顺序命中即返回（先命中的那条会掩盖后面的）：
+    /// <list type="number">
+    /// <item>条数 &gt;= <c>PullThresholdForQueue</c>（Java 的 <c>Math.max(1,n)</c> 守卫：配 0 也按 1 条算）</item>
+    /// <item>字节 &gt;= <c>PullThresholdSizeForQueue</c>，单位 <b>MiB</b>（&lt;=0 关闭）</item>
+    /// <item>跨度 <b>严格大于</b> <c>ConsumeConcurrentlyMaxSpan</c>（缓冲内 queueOffset 的 max-min）</item>
+    /// <item>topic 累计条数 &gt;= <c>PullThresholdForTopic</c>（本实例该 topic <b>所有</b>队列合起来）</item>
+    /// <item>topic 累计字节 &gt;= <c>PullThresholdSizeForTopic</c>，单位 MiB（不复用第 2 条的开关）</item>
+    /// </list>
+    /// 命中一次只把 <see cref="FlowControlTriggered"/> 加一格。只有真开着 topic 级闸门时才遍历
+    /// 全表聚合，否则每次判定都多走一遍所有队列的缓冲。</summary>
+    private bool FlowControlHit(MessageQueue mq, string key)
+    {
+        int count;
+        double sizeMb;
+        long span;
+        int topicCount = 0;
+        double topicSizeMb = 0.0;
+        lock (_lock)
+        {
+            if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
+            {
+                long bytes = 0;
+                long minOffset = long.MaxValue;
+                long maxOffset = long.MinValue;
+                foreach (MessageExt m in q)
+                {
+                    bytes += m.StoreSize;
+                    if (m.QueueOffset < minOffset) minOffset = m.QueueOffset;
+                    if (m.QueueOffset > maxOffset) maxOffset = m.QueueOffset;
+                }
+
+                count = q.Count;
+                sizeMb = bytes / (1024.0 * 1024.0);
+                span = maxOffset - minOffset;
+            }
+            else
+            {
+                count = 0;
+                sizeMb = 0;
+                span = 0;
+            }
+
+            if (_pullThresholdForTopic > 0 || _pullThresholdSizeForTopic > 0)
+            {
+                long topicBytes = 0;
+                foreach (KeyValuePair<string, Queue<MessageExt>> kv in _pending)
+                {
+                    if (!_mqMap.TryGetValue(kv.Key, out MessageQueue? other)
+                        || other.Topic != mq.Topic)
+                    {
+                        continue;
+                    }
+
+                    foreach (MessageExt m in kv.Value)
+                    {
+                        topicCount++;
+                        topicBytes += m.StoreSize;
+                    }
+                }
+
+                topicSizeMb = topicBytes / (1024.0 * 1024.0);
+            }
+        }
+
+        string? reason = null;
+        if (count >= Math.Max(1, _pullThresholdForQueue))
+        {
+            reason = "count=" + count.ToString(CultureInfo.InvariantCulture);
+        }
+        else if (_pullThresholdSizeForQueue > 0 && sizeMb >= _pullThresholdSizeForQueue)
+        {
+            reason = "size=" + sizeMb.ToString("F1", CultureInfo.InvariantCulture) + "MB";
+        }
+        else if (_consumeConcurrentlyMaxSpan > 0 && span > _consumeConcurrentlyMaxSpan)
+        {
+            reason = "span=" + span.ToString(CultureInfo.InvariantCulture);
+        }
+        else if (_pullThresholdForTopic > 0 && topicCount >= _pullThresholdForTopic)
+        {
+            reason = "topicCount=" + topicCount.ToString(CultureInfo.InvariantCulture);
+        }
+        else if (_pullThresholdSizeForTopic > 0 && topicSizeMb >= _pullThresholdSizeForTopic)
+        {
+            reason = "topicSize=" + topicSizeMb.ToString("F1", CultureInfo.InvariantCulture) + "MB";
+        }
+
+        if (reason is null)
+        {
+            return false;
+        }
+
+        Interlocked.Increment(ref _flowControlTriggered);
+        ClientLog.Debug("flow control: queue " + mq + " " + reason + ", pause pull");
+        return true;
+    }
+
     private void QueuePullLoop(MessageQueue mq)
     {
         // ⚠ 这里**不能**用 Client()：Shutdown() 会先置 _started=false，之后才 join 拉取线程；
@@ -2227,22 +2364,11 @@ public sealed class DefaultMQPushConsumer
                 }
             }
 
-            // 流控（对齐 Java ProcessQueue 的 pullThresholdForQueue 检查）：
-            // 已拉未消费的条数超过阈值就暂停本队列拉取
+            // 流控（Java ProcessQueue 的五个阈值，见 FlowControlHit）：命中任一条就暂停本队列拉取
+            if (FlowControlHit(mq, key))
             {
-                int pendingN;
-                lock (_lock)
-                {
-                    pendingN = _pending.TryGetValue(key, out Queue<MessageExt>? q) ? q.Count : 0;
-                }
-
-                if (pendingN >= Math.Max(1, _pullThresholdForQueue))
-                {
-                    Interlocked.Increment(ref _flowControlTriggered);
-                    ClientLog.Debug("flow control: queue " + mq + " pause pull");
-                    _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
-                    continue;
-                }
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
+                continue;
             }
 
             long offset;
@@ -2933,6 +3059,19 @@ public sealed class DefaultMQPushConsumer
             return _pending.TryGetValue(key, out Queue<MessageExt>? q) ? q.ToList() : new List<MessageExt>();
         }
     }
+
+    /// <summary>预置某队列的「已分配队列」登记（Java ProcessQueueTable 的键值）。topic 级
+    /// 阈值要靠这张表把同 topic 的兄弟队列聚合起来，不登记就等于队列已被 rebalance 撤走。</summary>
+    public void SetAssignedForTest(string key, MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            _mqMap[key] = mq;
+        }
+    }
+
+    /// <summary>跑一次拉取前流控判定（不经过网络）。命中会把 <see cref="FlowControlTriggered"/> 加一格。</summary>
+    public bool FlowControlHitForTest(MessageQueue mq, string key) => FlowControlHit(mq, key);
 
     /// <summary>已消费位点；null = 该队列还没有记录。</summary>
     public long? ConsumeOffsetForTest(string key)

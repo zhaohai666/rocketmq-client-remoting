@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -788,6 +789,74 @@ bool DefaultMQPushConsumer::pullStalled(const std::string& key) const {
     return pullStalledLocked(key);
 }
 
+bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::string& key) {
+    // Python `_flow_control_hit`（Java ProcessQueue 的五个阈值）：先队列级三条（条数、字节、
+    // 位点跨度），再 topic 级累计两条。字节阈值单位是 **MiB**，跨度是 pending 里
+    // queueOffset 的 max-min 且**严格大于**才算（Java 同）。
+    // 只有开着 topic 级阈值时才去遍历别的队列，否则一次判定多走一遍全表。
+    size_t count = 0;
+    double sizeMb = 0.0;
+    int64_t span = 0;
+    size_t topicCount = 0;
+    double topicSizeMb = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        auto it = pending_.find(key);
+        if (it != pending_.end()) {
+            int64_t bytes = 0;
+            int64_t minOffset = 0;
+            int64_t maxOffset = 0;
+            bool first = true;
+            for (const MessageExt& m : it->second) {
+                bytes += m.storeSize;
+                if (first) {
+                    minOffset = maxOffset = m.queueOffset;
+                    first = false;
+                } else {
+                    minOffset = std::min(minOffset, m.queueOffset);
+                    maxOffset = std::max(maxOffset, m.queueOffset);
+                }
+            }
+            count = it->second.size();
+            sizeMb = static_cast<double>(bytes) / (1024.0 * 1024.0);
+            span = maxOffset - minOffset;
+        }
+        if (pullThresholdForTopic_ > 0 || pullThresholdSizeForTopic_ > 0) {
+            int64_t topicBytes = 0;
+            for (const auto& kv : pending_) {
+                auto mqIt = mqMap_.find(kv.first);
+                if (mqIt == mqMap_.end() || mqIt->second.topic != mq.topic) continue;
+                for (const MessageExt& m : kv.second) {
+                    ++topicCount;
+                    topicBytes += m.storeSize;
+                }
+            }
+            topicSizeMb = static_cast<double>(topicBytes) / (1024.0 * 1024.0);
+        }
+    }
+
+    char number[32] = {0};
+    std::string reason;
+    if (count >= static_cast<size_t>(std::max(1, pullThresholdForQueue_))) {
+        reason = "count=" + std::to_string(count);
+    } else if (pullThresholdSizeForQueue_ > 0 && sizeMb >= pullThresholdSizeForQueue_) {
+        std::snprintf(number, sizeof(number), "%.1f", sizeMb);
+        reason = std::string("size=") + number + "MB";
+    } else if (consumeConcurrentlyMaxSpan_ > 0 && span > consumeConcurrentlyMaxSpan_) {
+        reason = "span=" + std::to_string(span);
+    } else if (pullThresholdForTopic_ > 0
+               && topicCount >= static_cast<size_t>(pullThresholdForTopic_)) {
+        reason = "topicCount=" + std::to_string(topicCount);
+    } else if (pullThresholdSizeForTopic_ > 0 && topicSizeMb >= pullThresholdSizeForTopic_) {
+        std::snprintf(number, sizeof(number), "%.1f", topicSizeMb);
+        reason = std::string("topicSize=") + number + "MB";
+    }
+    if (reason.empty()) return false;
+    flowControlTriggered_.fetch_add(1);
+    logger_debug("flow control: queue " + mq.toString() + " " + reason + ", pause pull");
+    return true;
+}
+
 int64_t DefaultMQPushConsumer::lastPullAt(const std::string& key) const {
     std::lock_guard<std::mutex> lk(lock_);
     auto it = lastPullAt_.find(key);
@@ -864,24 +933,11 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                 continue;
             }
         }
-        // 流控（对齐 Java ProcessQueue 的 pullThresholdForQueue 检查）：
-        // 已拉未消费的条数超过阈值就暂停本队列拉取
-        {
-            std::lock_guard<std::mutex> lk(lock_);
-            auto it = pending_.find(key);
-            const size_t pendingN = (it == pending_.end()) ? 0 : it->second.size();
-            if (pendingN >= static_cast<size_t>(std::max(1, pullThresholdForQueue_))) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            } else {
-                // 未触发流控，继续拉取
-                goto pullNow;
-            }
+        // 流控（Java ProcessQueue 的五个阈值，见 flowControlHit）：命中任一条就暂停本队列拉取
+        if (flowControlHit(mq, key)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
-        flowControlTriggered_.fetch_add(1);
-        logger_debug("flow control: queue " + mq.toString() + " pause pull");
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        continue;
-    pullNow:
         int64_t offset;
         {
             std::lock_guard<std::mutex> lk(lock_);
@@ -2042,6 +2098,11 @@ std::optional<int64_t> DefaultMQPushConsumer::consumeOffset(const std::string& k
     auto it = consumeOffsetTable_.find(key);
     if (it == consumeOffsetTable_.end()) return std::nullopt;
     return it->second;
+}
+
+void DefaultMQPushConsumer::setAssignedQueue(const std::string& key, const MessageQueue& mq) {
+    std::lock_guard<std::mutex> lk(lock_);
+    mqMap_[key] = mq;
 }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::assignedQueues() {

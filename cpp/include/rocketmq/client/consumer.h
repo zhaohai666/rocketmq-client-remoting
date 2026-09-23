@@ -215,6 +215,21 @@ public:
     void setPullIntervalMillis(int32_t t) { pullIntervalMillis_ = t; }
     // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（Java pullThresholdForQueue，默认 1000）
     void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
+    int32_t pullThresholdForQueue() const { return pullThresholdForQueue_; }
+    // 每队列"已拉未消费"**字节**阈值，单位 MiB（Java pullThresholdSizeForQueue，默认 100；<=0 关闭）
+    void setPullThresholdSizeForQueue(int32_t n) { pullThresholdSizeForQueue_ = n; }
+    int32_t pullThresholdSizeForQueue() const { return pullThresholdSizeForQueue_; }
+    // 已拉未消费消息 queueOffset 的**跨度**上限（Java consumeMessageMaxSpan，默认 2000；<=0 关闭）。
+    // 盯的是"队首那条一直消费失败、后面堆着"把位点跨度拉开的情况。
+    void setConsumeConcurrentlyMaxSpan(int64_t n) { consumeConcurrentlyMaxSpan_ = n; }
+    int64_t consumeConcurrentlyMaxSpan() const { return consumeConcurrentlyMaxSpan_; }
+    // topic 级累计阈值（本实例该 topic **所有**队列合起来算，Java pullThresholdForTopic /
+    // pullThresholdSizeForTopic；默认 -1 = 关闭）。Java 5.5.1 在 RebalancePushImpl:67-81 把
+    // 它按队列数摊到队列级，本端口与 Python/Rust 参考实现同一口径：直接跟累计值比。
+    void setPullThresholdForTopic(int32_t n) { pullThresholdForTopic_ = n; }
+    int32_t pullThresholdForTopic() const { return pullThresholdForTopic_; }
+    void setPullThresholdSizeForTopic(int32_t n) { pullThresholdSizeForTopic_ = n; }
+    int32_t pullThresholdSizeForTopic() const { return pullThresholdSizeForTopic_; }
     // 是否在消费循环里周期性发 HEART_BEAT（默认开启；失败仅告警不影响消费）
     // ---- POP 模式（5.x 轻量消费）----
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
@@ -364,6 +379,14 @@ public:
     std::vector<MessageExt> pendingMessages(const std::string& key) const;
     // 读回某队列的已消费位点；nullopt = 还没有记录
     std::optional<int64_t> consumeOffset(const std::string& key) const;
+    // 登记「本实例已分配到这条队列」（Java ProcessQueueTable / Python `_mq_map`）。
+    // topic 级流控阈值要靠它把同 topic 的兄弟队列聚起来。
+    void setAssignedQueue(const std::string& key, const MessageQueue& mq);
+    // 拉取前的流控判定（Java ProcessQueue 的五个阈值，与 Python `_flow_control_hit` 同构）：
+    // 命中任一条就返回 true，并把命中次数记进 flowControlTriggered()。
+    // 判据错了是"内存无上限堆消息 / 位点跨度失控"这类真机短期看不出的问题，必须能离线锁死，
+    // 所以与 consumeBatch 同一理由放在 public。
+    bool flowControlHit(const MessageQueue& mq, const std::string& key);
 
     // ---- 停摆自愈（Java isPullExpired）的观测/注入面 ----
     // 停摆判据算错方向是**静默**故障：阈值写太小会把健康队列反复撤走重投（凭空造重复），
@@ -527,6 +550,13 @@ private:
     int32_t maxReconsumeTimes_ = -1;
     int32_t pullIntervalMillis_ = 0;
     int32_t pullThresholdForQueue_ = 1000;
+    // 每队列已拉未消费的**字节**上限（MiB），Java pullThresholdSizeForQueue 默认 100
+    int32_t pullThresholdSizeForQueue_ = 100;
+    // 每队列已拉未消费消息的 queueOffset 跨度上限，Java consumeMessageMaxSpan 默认 2000
+    int64_t consumeConcurrentlyMaxSpan_ = 2000;
+    // topic 级累计阈值（条数 / MiB），Java 默认 -1 = 关闭
+    int32_t pullThresholdForTopic_ = -1;
+    int32_t pullThresholdSizeForTopic_ = -1;
 
     // ---- POP 模式（5.x 轻量消费）----
     bool popMode_ = false;

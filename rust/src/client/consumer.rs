@@ -2079,7 +2079,7 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
             && topic_pending.len() >= cfg.pull_threshold_for_topic as usize
         {
             Some(format!("topicCount={}", topic_pending.len()))
-        } else if cfg.pull_threshold_size_for_queue > 0 {
+        } else if cfg.pull_threshold_size_for_topic > 0 {
             let topic_mb = topic_pending
                 .iter()
                 .map(|(s, _)| i64::from(*s))
@@ -4243,7 +4243,8 @@ mod tests {
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 1)]);
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "2 >= 2");
 
-        // 主题级大小：闸门复用队列级 size 开关（Python 同形，非笔误）
+        // 主题级大小：闸门只看 pullThresholdSizeForTopic（Python 同一判据），
+        // 队列级那道关掉（0）时主题级那道必须照常生效 —— 复用队列级开关会让它静默失效
         only(&consumer, |c| {
             c.pull_threshold_size_for_queue = 100;
             c.pull_threshold_size_for_topic = 1;
@@ -4252,6 +4253,14 @@ mod tests {
         assert!(!flow_control_hit(&consumer.inner, &mq, &key), "0.5MiB < 1MiB");
         stage(&consumer, &mq, vec![sized_msg(2 * 1024 * 1024, 0)]);
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB >= 1MiB");
+        only(&consumer, |c| {
+            c.pull_threshold_size_for_queue = 0;
+            c.pull_threshold_size_for_topic = 1;
+        });
+        assert!(
+            flow_control_hit(&consumer.inner, &mq, &key),
+            "队列级 size 闸门关掉时主题级 size 仍要生效"
+        );
 
         // 默认配置：主题级阈值关闭，只看队列级
         let plain = DefaultMQPushConsumer::new("G").unwrap();

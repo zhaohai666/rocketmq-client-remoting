@@ -167,3 +167,9 @@ add_test(NAME check_client_config COMMAND rmq_test_check_client_config)
 add_executable(rmq_test_pull_expired test_pull_expired.cpp)
 target_link_libraries(rmq_test_pull_expired PRIVATE rocketmq::remoting)
 add_test(NAME pull_expired COMMAND rmq_test_pull_expired)
+
+# 拉取前流控五个阈值（Java ProcessQueue）：只有条数那条会在小消息场景先命中，其余四条
+# 判错方向是静默的（字节/跨度/topic 级闸门失效 ⇒ 缓冲无限堆），必须离线锁死再上真机。
+add_executable(rmq_test_flow_control test_flow_control.cpp)
+target_link_libraries(rmq_test_flow_control PRIVATE rocketmq::remoting)
+add_test(NAME flow_control COMMAND rmq_test_flow_control)

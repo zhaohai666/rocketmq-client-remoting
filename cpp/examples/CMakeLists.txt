@@ -89,3 +89,7 @@ target_link_libraries(rmq_live_async_send PRIVATE rocketmq::remoting)
 # 发送头 c/d/n 三个字段真机联调（模板 topic 决定自动建出来的队列数；不打进 ctest）
 add_executable(rmq_live_send_header live_send_header.cpp)
 target_link_libraries(rmq_live_send_header PRIVATE rocketmq::remoting)
+
+# 拉取前流控五个阈值真机联调：闸门真会命中 + 命中之后一条不丢（不打进 ctest）
+add_executable(rmq_live_flow_control live_flow_control.cpp)
+target_link_libraries(rmq_live_flow_control PRIVATE rocketmq::remoting)
