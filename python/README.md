@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 767 条单元/协议测试（763 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 806 条单元/协议测试（802 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -37,8 +37,9 @@ python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）
 python verify_lite_pull_live.py   # lite pull 全链路（32 PASS/0 FAIL）：rebalance/收 12 条/commit/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）
 python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS/0 FAIL）：SQL92 订阅启动时正好一笔 46、纯 TAG 订阅一笔不发；broker 真按属性过滤（red 只收 3 条、blue 不漏、'*' 对照组收 6 条、永不匹配收 0 条）；语法错的表达式让 start() 秒回 SUBSCRIPTION_PARSE_FAILED(23) 并就地回滚。需 broker 开 enablePropertyFilter=true
 python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
-python verify_async_send_live.py  # 异步发送内核 A1~A6（36 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核、shutdown 不等在途（36 笔全报错、一条都没落）
+python verify_async_send_live.py  # 异步发送内核 A1~A6（39 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核（一次回调、broker 逐条回 3 个 commitLog 偏移、读回的子消息带客户端 32 位 UNIQ_KEY）、shutdown 不等在途（36 笔全报错、一条都没落）
 python verify_backpressure_live.py # 异步发送背压 B1~B5（Java 两个公平信号量，真机版）
+python verify_ack_index_live.py   # classic 并发消费的 ackIndex 部分 ack（11 PASS/0 FAIL）：A1 对照组整批认可（3 条各投一次、位点到 3、零回投）→ A2 ackIndex=0 只认可首批第一条 ⇒ 尾巴 2 条经 %RETRY% 二次到达（reconsumeTimes>=1、topic 还原成业务 topic）、被认可那条整个窗口只投一次、3 条最终全部消费、业务队列位点仍整批提交到 3 → A3 ackIndex=2 压不住 RECONSUME_LATER（Java :222-226 强制 ackIndex=-1，3 条全重投）→ A4 广播模式下尾巴不回投。批次切分由拉取时机决定，所以三个用例都**先把 3 条放上去再起消费者**（新组显式 CONSUME_FROM_FIRST_OFFSET），否则首批可能是 1~2 条、前缀/后缀根本不确定
 ```
 
 其它真机脚本：`verify_acl_live.py`（需开 ACL 的集群）/ `verify_pull_live.py` /
