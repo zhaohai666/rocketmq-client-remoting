@@ -1428,6 +1428,37 @@ void testBatchAsyncWritesClientIdsBeforeEncodingTheBody() {
     p.shutdown();
 }
 
+// 22. 异步链的 n/c/d：异步自己建头（buildSendRequest），所以同步侧对齐了不代表它也对齐了。
+// Java sendKernelImpl:996-997/1007 对四种通信模式是同一段代码，报文形状必须一致；
+// 而且请求跨重试只建一次，n 应当始终是第一次选中的那台 broker。
+void testAsyncSendHeaderCarriesBrokerNameAndTopicKeys() {
+    AsyncFixture fx("AsyncHeaderFields");
+    DefaultMQProducer p("PG_async_header");
+    p.setNamesrvAddr(fx.ns.address());
+    p.setCreateTopicKey("AsyncTopicKey");
+    p.setDefaultTopicQueueNums(11);
+    p.start();
+
+    auto cb = std::make_shared<RecordingCallback>();
+    p.sendAsync(plainMessage(fx.topic), cb, 3000);
+    expect(cb->waitDone(3000), "the async send settles");
+    const std::vector<Attempt> attempts = fx.broker.attempts();
+    expectInt(static_cast<int>(attempts.size()), 1, "one request on the wire");
+    if (attempts.empty()) {
+        p.shutdown();
+        return;
+    }
+    const Attempt& a = attempts[0];
+    expect(a.code == RequestCode::SEND_MESSAGE_V2, "the async request is 310");
+    expect(a.ext.count("n") == 1 && a.ext.at("n") == fx.topic + "-broker",
+           "async request names its broker as V2 key n");
+    expect(a.ext.count("c") == 1 && a.ext.at("c") == "AsyncTopicKey",
+           "async request carries the producer createTopicKey as c");
+    expect(a.ext.count("d") == 1 && a.ext.at("d") == "11",
+           "and the producer defaultTopicQueueNums as d");
+    p.shutdown();
+}
+
 // 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
 void runCase(const char* name, void (*fn)()) {
     const auto began = std::chrono::steady_clock::now();
@@ -1474,6 +1505,8 @@ int main() {
     runCase("batchAsyncRejectsBeforeStart", testBatchAsyncRejectsBeforeStart);
     runCase("batchAsyncWritesClientIdsBeforeEncodingTheBody",
             testBatchAsyncWritesClientIdsBeforeEncodingTheBody);
+    runCase("asyncSendHeaderCarriesBrokerNameAndTopicKeys",
+            testAsyncSendHeaderCarriesBrokerNameAndTopicKeys);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

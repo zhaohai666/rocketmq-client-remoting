@@ -740,16 +740,22 @@ public sealed class MQClientInstance : IDisposable
     /// 批量消息（msg.IsBatch）用 SEND_BATCH_MESSAGE(320)，与 Java 的 msg instanceof MessageBatch 同判据。
     /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
     /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
+    /// createTopicKey / defaultTopicQueueNums 同样由调用方给（Java
+    /// <c>DefaultMQProducerImpl:996-997</c> 从 producer 取
+    /// <c>getCreateTopicKey()</c> / <c>getDefaultTopicQueueNums()</c>），留 null 才回落成
+    /// <c>TBW102</c>/4 —— 否则这两个 setter 是假的：broker 侧自动建 topic 时按这两个值
+    /// 决定队列数（<c>AbstractSendMessageProcessor.createTopicInSendMessageMethod</c>）。
     /// </summary>
     public RemotingCommand BuildSendRequest(string producerGroup, Message msg, MessageQueue mq,
-        int sysFlag = 0, bool unitMode = false)
+        int sysFlag = 0, bool unitMode = false, string? createTopicKey = null,
+        int? defaultTopicQueueNums = null)
     {
         var header = new SendMessageRequestHeaderV2
         {
             ProducerGroup = producerGroup,
             Topic = msg.Topic,
-            DefaultTopic = MixAll.DefaultTopic,
-            DefaultTopicQueueNums = MixAll.DefaultTopicQueueNums,
+            DefaultTopic = string.IsNullOrEmpty(createTopicKey) ? MixAll.DefaultTopic : createTopicKey,
+            DefaultTopicQueueNums = defaultTopicQueueNums ?? MixAll.DefaultTopicQueueNums,
             QueueId = mq.QueueId,
             SysFlag = sysFlag,
             BornTimestamp = UtilAll.CurrentTimeMillis(),
@@ -765,6 +771,11 @@ public sealed class MQClientInstance : IDisposable
             // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
             MaxReconsumeTimes = null,
             Batch = msg.IsBatch,
+            // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)`，V2 的键是
+            // 单字母 `n`（SendMessageRequestHeaderV2.java:69，`@CFNullable` 所以空值整条不上线）。
+            // 取的是**这一笔选中的**那个 broker 名，即 mq.BrokerName。经典 broker 按连接地址
+            // 寻址、不读它，但 proxy 与审计/轨迹侧读 —— 缺了它四个端口的线上报文就不等价。
+            BrokerName = string.IsNullOrEmpty(mq.BrokerName) ? null : mq.BrokerName,
         };
 
         // 对应 Java MQClientAPIImpl.sendMessage:550-563（sendSmartMsg 默认 true → V2）：
@@ -794,10 +805,12 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>
     /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
     /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
-    /// unitMode 同样由调用方给（Java 从 producer 的 ClientConfig 取，见 sendKernelImpl:1004）。
+    /// unitMode 同样由调用方给（Java 从 producer 的 ClientConfig 取，见 sendKernelImpl:1004），
+    /// createTopicKey / defaultTopicQueueNums 亦然（sendKernelImpl:996-997）。
     /// </summary>
     public SendResult SendMessage(string producerGroup, Message msg, MessageQueue mq,
-        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false)
+        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
+        string? createTopicKey = null, int? defaultTopicQueueNums = null)
     {
         string addr = BrokerAddr(mq);
         // 对应 Java DefaultMQProducerImpl.sendKernelImpl：非批量消息在**发请求之前**
@@ -808,7 +821,8 @@ public sealed class MQClientInstance : IDisposable
             MessageClientIDSetter.SetUniqId(msg);
         }
 
-        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode,
+            createTopicKey, defaultTopicQueueNums);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
         return ProcessSendResponse(response, msg, mq);
     }
@@ -889,7 +903,8 @@ public sealed class MQClientInstance : IDisposable
     }
 
     public void SendMessageOneway(string producerGroup, Message msg, MessageQueue mq,
-        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false)
+        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
+        string? createTopicKey = null, int? defaultTopicQueueNums = null)
     {
         string addr = BrokerAddr(mq);
         // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
@@ -898,7 +913,8 @@ public sealed class MQClientInstance : IDisposable
             MessageClientIDSetter.SetUniqId(msg);
         }
 
-        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode,
+            createTopicKey, defaultTopicQueueNums);
         request.MarkOnewayRpc();
         _remotingClient.InvokeOneway(addr, request);
     }

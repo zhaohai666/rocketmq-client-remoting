@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，538 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，541 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -92,6 +92,7 @@ dotnet $PROG async-send 127.0.0.1:9876    # 异步发送内核（43 PASS / 0 FAI
 dotnet $PROG validators-live 127.0.0.1:9876  # 名字校验（39 PASS / 0 FAIL）
 dotnet $PROG recall 127.0.0.1:9876        # 定时消息撤回（16 PASS / 0 FAIL，脚本负责开关并还原 recallMessageEnable）
 dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS / 0 FAIL）
+dotnet $PROG send-header 127.0.0.1:9876   # 发送头 c/d/n 三字段（14 PASS / 0 FAIL）
 dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
@@ -155,11 +156,12 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | recall | 16 PASS / 0 FAIL（定时消息撤回 `recallMessage`(370)，与 Python/C++/Rust 同场景：R0 读到并临时打开 broker 的 `recallMessageEnable` → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle` → R2 broker 给的句柄能被解码、`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4/R5 `%RETRY%`/`%DLQ%`/非法句柄都在打网络之前秒回 → R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：对照定时消息按时投递、被撤回那条整个窗口都不出现 → R7 无条件还原开关） |
 | unit-config | 20 PASS / 0 FAIL（unitName/unitMode/stream 四语言同场景：U1 `unitName` 拼进 clientId 且照常发送 → U2 stream 消费者 `@unitA@STREAM` 收尾，**broker 的 `examineConsumerConnectionInfo` 记录的 clientId 也带同一后缀**（唯一能证明「上线的就是拼好的那个」的观测点）→ U3 `unitMode=true` 自动建出的 topic `topicSysFlag` 带 UNIT 位、对照组不带 → U4 心跳 `ConsumerData.unitMode` 让 `%RETRY%` 带 UNIT_SUB 位 → U5 lite 消费者默认带 `@STREAM`、显式开 stream 的生产者同样，3 发 3 收） |
 
+| send-header | 14 PASS / 0 FAIL（发送头 `c`/`d`/`n` 三字段真机，与 Python `verify_send_header_live.py`、C++ `rmq_live_send_header`、Rust `live_send_header` 的 H0~H5 一一对应：H0 先量出 `TBW102` 的 read/write 队列数（本机 8/8）当算术基准 → H1 什么都不配、发到全新 topic，broker 按 `min(d=4, TBW102.writeQueueNums)` 建出 **4** 条队列（`TopicConfigManager.java:289`）→ H2 `DefaultTopicQueueNums=2` 真的让 broker 只建 **2** 条（修之前写死 4，这一条必然红）→ H3 `CreateTopicKey` 指向带 `PERM_INHERIT` 的 3 队列模板 topic 时，新 topic 继承**模板**的 **3** 条而不是 TBW102 的 8 条（`isInherited` + `min` 两道门）→ H4 补上三字段后五种入口（`Send` / 定点 `Send(msg, mq)` / `SendOneway` / `SendBatch` 320 / `SendAsync`）逐条落地、7 条一条不差 → H5 落点 broker 名与路由选中那台一致。⚠ `n` 在经典 broker 的发送链路里**没有读者**（5.5.1 源码 grep 过），它上线的存在由离线抓帧单测取证，这里不假装能观测到） |
 | sql92 | 20 PASS / 0 FAIL（SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 四语言同场景：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `Start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `Start()`）。协议形状与四条分支语义另有离线单测 10 项（`CheckClientConfigTests`，进程内 mock broker） |
 
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **538 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **541 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。其中 `PullExpiredTests`（12 项）锁住
 拉取循环停摆自愈的判据与收尾：阈值 120000ms 与**严格大于**边界（用注入时钟调
 `PullStalledForTest(key, now)`，-120000 不算、-120001 才算——等真 120s 分不清走的哪一支）、
@@ -167,9 +169,16 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 （换线程等于丢在途重投）、撤走时持久化已消费位点并清掉盖章/缓冲/游标（没有已消费位点就不臆造
 一个 0）、判据**逐队列独立**（一路停摆不许连带换掉兄弟队列的循环）、没分配给本实例的队列不扫、`Start()` 之前与停机途中都不判停摆（否则刷一堆假 `[BUG]`
 日志）、POP 分支扫掉 `PopProcessQueue` 并 `SetDropped`。
-`SendRetryTests`（13 项）用
+`SendRetryTests`（15 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。
+其中两项锁**发送头那三个跟着路由/配置走的字段**（`SendHeaderCarriesBrokerNameAndTopicKeys`、
+`EmptyBrokerNameStaysOutOfTheSendHeader`）：不配置时 `c`=`TBW102`/`d`=4（Java 那两个常量），配了
+`CreateTopicKey`/`DefaultTopicQueueNums` 后同步 / 批量 320 / 单向三种入口带同一份值，轮询换到
+broker-1 时 `n` 跟着换成**这一笔选中的**那台（不是路由里的第一台），`d=0` 原样上线（0 是调用方
+明说的 0，不能被默认值顶掉），手工指定空 brokerName 的队列时 `n` **整条键消失**而不是写 `n=`
+（Java `@CFNullable` + `writeIfNotNull`）；异步链自建头，单独一项抓真报文
+（`ProducerAsyncTests.SendAsyncHeaderCarriesBrokerNameAndTopicKeys`）。
 同一种"抓 socket"的能力也被用来验请求钩子（`RequestHooksReachTheWire`）：只注册 ACL 时线上
 有 `AccessKey`/`Signature` 而没有 `ReqT`；ACL + stream 时 `ReqT="0"` 在场，且把抓下来的报文按
 broker 的口径复算 HMAC-SHA1 **能对上签名**（等价于「`ReqT` 落在被签的那段内容里」，顺序写反
@@ -301,6 +310,7 @@ resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consist
   超时清理并清空在途表）。要每笔都有回调，调用方得自己等完再关。
   ③ **自带池**：`AsyncSenderExecutor` 属性在 `Start()` 之前挂上后，池的生命周期归调用方（Java
   `setAsyncSenderExecutor`），生产者既不排空也不关它。
-  回归：`tests/RocketMQ.Client.Tests/ProducerAsyncTests.cs`（28 项，进程内假 broker 取证：队满两条
-  分支、预算共享、重试链每轮换新 opaque、外层 catch 原样抛出并记 `UpdateFaultItem`）与
+  回归：`tests/RocketMQ.Client.Tests/ProducerAsyncTests.cs`（33 项，进程内假 broker 取证：队满两条
+  分支、预算共享、重试链每轮换新 opaque、外层 catch 原样抛出并记 `UpdateFaultItem`、异步链自建头的
+  `n`/`c`/`d` 三键）与
   `rmq async-send` 的 A1–A6（真 broker 上读回原文、线程口径、落地对账）。

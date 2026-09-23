@@ -570,6 +570,18 @@ impl Inner {
         self.cfg.read().unwrap_or_else(|e| e.into_inner()).unit_mode
     }
 
+    /// Python `_send_header_args` 里的另两项：每次发请求都要带上、且只来源于生产者配置的
+    /// `c`（createTopicKey）与 `d`（defaultTopicQueueNums），
+    /// 对位 Java `sendKernelImpl:996-997`（`producer.getCreateTopicKey()` /
+    /// `producer.getDefaultTopicQueueNums()`）。
+    fn create_topic_key(&self) -> String {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).create_topic_key.clone()
+    }
+
+    fn default_topic_queue_nums(&self) -> i32 {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).default_topic_queue_nums
+    }
+
     fn client(&self) -> Option<MQClientInstance> {
         self.client
             .lock()
@@ -1937,13 +1949,34 @@ impl DefaultMQProducer {
         }
         if !self.has_send_message_hook() {
             return client
-                .send_message(&group, msg, mq_sel, timeout, sys_flag, unit_mode)
+                .send_message(
+                    &group,
+                    msg,
+                    mq_sel,
+                    timeout,
+                    sys_flag,
+                    unit_mode,
+                    &self.inner.create_topic_key(),
+                    self.inner.default_topic_queue_nums(),
+                )
                 .await;
         }
         let mut context =
             self.build_send_context(msg.as_message(), &group, &namespace, mq_sel, &broker_addr, mode);
         crate::client::hook::execute_send_message_hook_before(&self.inner.send_hooks, &mut context);
-        match client.send_message(&group, msg, mq_sel, timeout, sys_flag, unit_mode).await {
+        match client
+            .send_message(
+                &group,
+                msg,
+                mq_sel,
+                timeout,
+                sys_flag,
+                unit_mode,
+                &self.inner.create_topic_key(),
+                self.inner.default_topic_queue_nums(),
+            )
+            .await
+        {
             Ok(result) => {
                 context.send_result = Some(result.clone());
                 crate::client::hook::execute_send_message_hook_after(
@@ -2025,6 +2058,8 @@ impl DefaultMQProducer {
                     timeout,
                     sys_flag,
                     self.inner.unit_mode(),
+                    &self.inner.create_topic_key(),
+                    self.inner.default_topic_queue_nums(),
                 )
                 .await;
         }
@@ -2288,6 +2323,8 @@ impl DefaultMQProducer {
                 timeout,
                 sys_flag,
                 self.inner.unit_mode(),
+                &self.inner.create_topic_key(),
+                self.inner.default_topic_queue_nums(),
             )
             .await
     }
@@ -2328,6 +2365,8 @@ impl DefaultMQProducer {
                 &addr,
                 sys_flag,
                 self.inner.unit_mode(),
+                &self.inner.create_topic_key(),
+                self.inner.default_topic_queue_nums(),
             )
             .await
     }
@@ -2380,6 +2419,8 @@ impl DefaultMQProducer {
                 timeout,
                 sys_flag,
                 self.inner.unit_mode(),
+                &self.inner.create_topic_key(),
+                self.inner.default_topic_queue_nums(),
             )
             .await
     }
@@ -2734,6 +2775,8 @@ impl DefaultMQProducer {
             mq,
             sys_flag,
             self.inner.unit_mode(),
+            &self.inner.create_topic_key(),
+            self.inner.default_topic_queue_nums(),
         );
         let group = self.inner.producer_group();
         let namespace = self.inner.namespace();

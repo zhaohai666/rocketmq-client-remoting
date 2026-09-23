@@ -630,7 +630,9 @@ class MQClientInstance:
     # ---------------- 消息发送 ----------------
     def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
                      timeout_millis: int = 3000, sys_flag: int = 0,
-                     unit_mode: bool = False) -> SendResult:
+                     unit_mode: bool = False,
+                     default_topic: Optional[str] = None,
+                     default_topic_queue_nums: Optional[int] = None) -> SendResult:
         addr = self.find_broker_addr_in_route(self.get_topic_route_data(mq.topic), mq.broker_name) if self.get_topic_route_data(mq.topic) else None
         if addr is None:
             route = self.get_topic_route_data(mq.topic)
@@ -640,36 +642,42 @@ class MQClientInstance:
             if addr is None:
                 raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
         request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
-                                           unit_mode)
+                                           unit_mode, default_topic, default_topic_queue_nums)
         response = self._invoke_sync(addr, request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_to_addr(self, producer_group: str, msg: Message, mq: MessageQueue,
                              addr: str, timeout_millis: int = 3000,
-                             sys_flag: int = 0, unit_mode: bool = False) -> SendResult:
+                             sys_flag: int = 0, unit_mode: bool = False,
+                             default_topic: Optional[str] = None,
+                             default_topic_queue_nums: Optional[int] = None) -> SendResult:
         request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
-                                           unit_mode)
+                                           unit_mode, default_topic, default_topic_queue_nums)
         response = self._invoke_sync(addr, request, timeout_millis)
         return self._parse_send_response(response, msg, mq)
 
     def send_message_oneway(self, producer_group: str, msg: Message, mq: MessageQueue,
                             addr: str, timeout_millis: int = 3000,
-                            sys_flag: int = 0, unit_mode: bool = False) -> None:
+                            sys_flag: int = 0, unit_mode: bool = False,
+                            default_topic: Optional[str] = None,
+                            default_topic_queue_nums: Optional[int] = None) -> None:
         request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
-                                           unit_mode)
+                                           unit_mode, default_topic, default_topic_queue_nums)
         request.mark_oneway_rpc()
         self.remoting_client.invoke_oneway(addr, request)
 
     def build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
                            timeout_millis: int = 3000, sys_flag: int = 0,
-                           unit_mode: bool = False) -> RemotingCommand:
+                           unit_mode: bool = False,
+                           default_topic: Optional[str] = None,
+                           default_topic_queue_nums: Optional[int] = None) -> RemotingCommand:
         """只**构建** SEND_MESSAGE 请求对象、不发送。
 
         异步发送链需要跨重试复用同一个请求（Java ``onExceptionImpl:728-730`` 只做
         ``request.setOpaque(createNewRequestId())`` 再递归），所以请求构建要拆出来给调用方持有。
         """
         return self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
-                                        unit_mode)
+                                        unit_mode, default_topic, default_topic_queue_nums)
 
     def send_message_async(self, addr: str, request: RemotingCommand, msg: Message,
                            mq: MessageQueue, timeout_millis: int,
@@ -700,9 +708,16 @@ class MQClientInstance:
 
     def _build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
                             timeout_millis: int = 3000, sys_flag: int = 0,
-                            unit_mode: bool = False) -> RemotingCommand:
+                            unit_mode: bool = False,
+                            default_topic: Optional[str] = None,
+                            default_topic_queue_nums: Optional[int] = None) -> RemotingCommand:
         """sys_flag 由 Producer 算好（压缩标志 + 压缩类型位），见
-        DefaultMQProducer.try_to_compress_message。"""
+        DefaultMQProducer.try_to_compress_message。
+
+        ``default_topic`` / ``default_topic_queue_nums`` 对位 Java
+        ``sendKernelImpl:996-997`` 读的生产者 ``createTopicKey`` 与
+        ``defaultTopicQueueNums``（不传则用 ``TBW102`` / 4 这两个 Java 默认值）。
+        """
         # 对齐 Java DefaultMQProducerImpl.sendKernelImpl:932-935：非批量消息在
         # **发请求之前**补一个客户端唯一 ID（UNIQ_KEY）；批量消息的 ID 在
         # MessageBatch.generateFromList 时已逐条写好，不覆盖。
@@ -713,8 +728,10 @@ class MQClientInstance:
         header = SendMessageRequestHeaderV2()
         header.producer_group = producer_group
         header.topic = msg.topic
-        header.default_topic = MixAll.DEFAULT_TOPIC
-        header.default_topic_queue_nums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
+        header.default_topic = default_topic or MixAll.DEFAULT_TOPIC
+        header.default_topic_queue_nums = (default_topic_queue_nums
+                                          if default_topic_queue_nums is not None
+                                          else MixAll.DEFAULT_TOPIC_QUEUE_NUMS)
         header.queue_id = mq.queue_id
         header.sys_flag = sys_flag
         header.born_timestamp = int(time.time() * 1000)
@@ -728,6 +745,10 @@ class MQClientInstance:
         # 重试消息第一次回投就判定 reconsumeTimes(0) >= 0 直接进 %DLQ%。
         header.max_reconsume_times = None
         header.batch = isinstance(msg, MessageBatch)
+        # Java sendKernelImpl:1007 `requestHeader.setBrokerName(brokerName)` —— V2 的键是
+        # 单字母 `n`（SendMessageRequestHeaderV2:63）。发往哪台 broker 由路由选中，
+        # 这里跟着 mq 走：请求跨重试复用时它也保持第一次的那个值（Java 同样只建一次头）。
+        header.broker_name = mq.broker_name or None
         # Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
         # 而不是普通的 SEND_MESSAGE_V2(310)。broker 只在 324/325 上注册了
         # ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT 把应答推回请求方）。

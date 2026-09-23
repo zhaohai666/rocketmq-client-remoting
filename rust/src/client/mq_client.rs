@@ -1501,6 +1501,9 @@ impl MQClientInstance {
     /// `unit_mode` 对应 Java `DefaultMQProducerImpl#sendKernelImpl:1004` 的
     /// `requestHeader.setUnitMode(tc.isUnitMode())`：broker 侧据此给自动创建的
     /// topic 打上 `TopicSysFlag.UNIT`（`AbstractSendMessageProcessor:491`）。
+    ///
+    /// `create_topic_key` / `default_topic_queue_nums` 对位同类 :996-997 ——
+    /// Java 发的是**生产者配置**（V2 头的 `c`/`d`），broker 自动建 topic 时按它决定队列数。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_message(
         &self,
@@ -1510,6 +1513,8 @@ impl MQClientInstance {
         timeout_millis: i64,
         sys_flag: i32,
         unit_mode: bool,
+        create_topic_key: &str,
+        default_topic_queue_nums: i32,
     ) -> Result<SendResult> {
         // Python 先 `... if self.get_topic_route_data(mq.topic) else None` 再取一次，
         // 两次调用读的是同一份缓存（第二次必然命中），语义等价于「取一次路由」。
@@ -1523,8 +1528,18 @@ impl MQClientInstance {
                 mq.broker_name, mq.topic
             ))
         })?;
-        self.send_message_to_addr(producer_group, msg, mq, &addr, timeout_millis, sys_flag, unit_mode)
-            .await
+        self.send_message_to_addr(
+            producer_group,
+            msg,
+            mq,
+            &addr,
+            timeout_millis,
+            sys_flag,
+            unit_mode,
+            create_topic_key,
+            default_topic_queue_nums,
+        )
+        .await
     }
 
     /// Python `send_message_to_addr`。
@@ -1538,8 +1553,18 @@ impl MQClientInstance {
         timeout_millis: i64,
         sys_flag: i32,
         unit_mode: bool,
+        create_topic_key: &str,
+        default_topic_queue_nums: i32,
     ) -> Result<SendResult> {
-        let mut request = Self::build_send_request(producer_group, msg, mq, sys_flag, unit_mode);
+        let mut request = Self::build_send_request(
+            producer_group,
+            msg,
+            mq,
+            sys_flag,
+            unit_mode,
+            create_topic_key,
+            default_topic_queue_nums,
+        );
         let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
         Self::parse_send_response(&response, msg.as_message(), mq)
     }
@@ -1548,6 +1573,7 @@ impl MQClientInstance {
     ///
     /// Python 的 `timeout_millis` 形参在本方法里从未被使用（oneway 不等响应），
     /// 这里省略该形参（唯一一处签名收窄）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_oneway(
         &self,
         producer_group: &str,
@@ -1556,8 +1582,18 @@ impl MQClientInstance {
         addr: &str,
         sys_flag: i32,
         unit_mode: bool,
+        create_topic_key: &str,
+        default_topic_queue_nums: i32,
     ) -> Result<()> {
-        let mut request = Self::build_send_request(producer_group, msg, mq, sys_flag, unit_mode);
+        let mut request = Self::build_send_request(
+            producer_group,
+            msg,
+            mq,
+            sys_flag,
+            unit_mode,
+            create_topic_key,
+            default_topic_queue_nums,
+        );
         request.mark_oneway_rpc();
         self.inner.remoting_client.invoke_oneway(addr, &mut request).await
     }
@@ -1607,6 +1643,8 @@ impl MQClientInstance {
         mq: &MessageQueue,
         sys_flag: i32,
         unit_mode: bool,
+        create_topic_key: &str,
+        default_topic_queue_nums: i32,
     ) -> RemotingCommand {
         if !msg.is_batch() {
             set_uniq_id(msg.as_message_mut());
@@ -1615,8 +1653,16 @@ impl MQClientInstance {
         let header = SendMessageRequestHeaderV2 {
             producer_group: Some(producer_group.to_string()),
             topic: Some(outer.topic.clone()),
-            default_topic: Some(MixAll::DEFAULT_TOPIC.to_string()),
-            default_topic_queue_nums: Some(MixAll::DEFAULT_TOPIC_QUEUE_NUMS),
+            // 对位 Java `sendKernelImpl:996-997`：`c`/`d` 是**生产者配置**
+            // （createTopicKey / defaultTopicQueueNums），broker 自动建 topic 时按 `d`
+            // 决定队列数。空串才是「没配」，落回 Java 的 TBW102；0 是一个显式配置值，
+            // 不能被当成「没传」。
+            default_topic: Some(if create_topic_key.is_empty() {
+                MixAll::DEFAULT_TOPIC.to_string()
+            } else {
+                create_topic_key.to_string()
+            }),
+            default_topic_queue_nums: Some(default_topic_queue_nums),
             queue_id: Some(mq.queue_id),
             sys_flag: Some(sys_flag),
             born_timestamp: Some(current_time_millis()),
@@ -1632,7 +1678,15 @@ impl MQClientInstance {
             // （`SendMessageProcessor:196-199`），固定发 0 会让重试消息直接进 `%DLQ%`。
             max_reconsume_times: None,
             batch: Some(msg.is_batch()),
-            broker_name: None,
+            // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)` —— V2 的
+            // 键是单字母 `n`（`SendMessageRequestHeaderV2:69`，`encode()` 用 writeIfNotNull）。
+            // 值就是路由选中的那台 broker 的名字，所以跟着 mq 走；异步链跨重试复用同一个请求时
+            // 它保持第一次建头时的值（Java 同样只建一次）。
+            broker_name: if mq.broker_name.is_empty() {
+                None
+            } else {
+                Some(mq.broker_name.clone())
+            },
         };
         // Request-Reply：`msgType == "reply"` 的应答消息走 SEND_REPLY_MESSAGE_V2(325)：
         // broker 只在 324/325 上注册了 ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT

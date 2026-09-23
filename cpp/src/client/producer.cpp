@@ -453,7 +453,8 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
     }
     // 没有任何拦截/钩子时零开销透传
     if (!hasSendInterceptors()) {
-        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_);
+        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
+                                    createTopicKey_, defaultTopicQueueNums_);
     }
     std::string brokerAddr;
     try {
@@ -466,14 +467,16 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
     //   3. 发请求  4. SendMessageHook.after
     runCheckForbidden(msg, mq, brokerAddr, arg, mode);
     if (sendMessageHookList_.empty()) {
-        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_);
+        return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
+                                    createTopicKey_, defaultTopicQueueNums_);
     }
     SendMessageContext context = buildSendMessageContext(msg, mq, brokerAddr);
     executeSendMessageHookBefore(context);
 
     SendResult result;
     try {
-        result = client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_);
+        result = client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
+                          createTopicKey_, defaultTopicQueueNums_);
     } catch (const std::exception& e) {
         context.exception = e.what();
         executeSendMessageHookAfter(context);
@@ -1017,7 +1020,8 @@ void DefaultMQProducer::sendKernelAsync(const std::shared_ptr<AsyncSendState>& s
     // 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），
     // 所以 header 里的 queueId 也跟着第一次那次 —— 这是 Java 的真实行为，别"修"它。
     state->request =
-        c.buildSendRequest(producerGroup_, state->msg, state->mq, state->sysFlag, unitMode_);
+        c.buildSendRequest(producerGroup_, state->msg, state->mq, state->sysFlag, unitMode_,
+                           createTopicKey_, defaultTopicQueueNums_);
     if (hasSendMessageHook()) {
         state->context = std::make_shared<SendMessageContext>(
             buildSendMessageContext(state->msg, state->mq, brokerAddr));
@@ -1196,7 +1200,8 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     if (enableTraceContext_) {
         injectTraceContext(&outbound);
     }
-    c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag, unitMode_);
+    c.sendMessageOneway(producerGroup_, outbound, selected, sendMsgTimeout_, sysFlag,
+                          unitMode_, createTopicKey_, defaultTopicQueueNums_);
 }
 
 // ---------------------------------------------------------------- Request-Reply
@@ -1262,7 +1267,8 @@ Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueu
     const int64_t cost = UtilAll::currentTimeMillis() - begin;
     try {
         const int32_t sysFlag = prepareForSend(outbound);
-        c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag, unitMode_);
+        c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag, unitMode_,
+                      createTopicKey_, defaultTopicQueueNums_);
     } catch (...) {
         // 发送失败三件事：标 !sendRequestOk + 空唤醒（别让等待方白等满 timeout）+ 记 cause。
         // 与 Java 的匿名 SendCallback#onException 完全一致。

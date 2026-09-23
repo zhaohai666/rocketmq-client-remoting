@@ -189,18 +189,30 @@ public:
     // （V2 头里映射成单字母键 `k`）。必须**逐次传入**而不是存在实例上：Java 的
     // MQClientInstance 按 clientId 共享，同一实例可能被 unitMode 不同的客户端复用。
     // broker 侧后果见 `AbstractSendMessageProcessor:485-497`（自动建 topic 时打 UNIT 位）。
+    //
+    // `createTopicKey` / `defaultTopicQueueNums` 对位 Java `sendKernelImpl:996-997`：
+    // 这两个值取自**生产者配置**（V2 头的单字母键 `c`/`d`），broker 自动建 topic 时按
+    // 它们决定队列数。不传才落回 `TBW102` / 4 —— 写死会让 `setCreateTopicKey` /
+    // `setDefaultTopicQueueNums` 变成假 setter。
+    // brokerName（键 `n`，`sendKernelImpl:1007`）不在参数里：它跟着 `mq` 走。
     SendResult sendMessage(const std::string& producerGroup, const Message& msg,
                            const MessageQueue& mq, int32_t timeoutMillis = 3000,
-                           int32_t sysFlag = 0, bool unitMode = false);
+                           int32_t sysFlag = 0, bool unitMode = false,
+                           const std::optional<std::string>& createTopicKey = std::nullopt,
+                           const std::optional<int32_t>& defaultTopicQueueNums = std::nullopt);
     void sendMessageOneway(const std::string& producerGroup, const Message& msg,
                            const MessageQueue& mq, int32_t timeoutMillis = 3000,
-                           int32_t sysFlag = 0, bool unitMode = false);
+                           int32_t sysFlag = 0, bool unitMode = false,
+                           const std::optional<std::string>& createTopicKey = std::nullopt,
+                           const std::optional<int32_t>& defaultTopicQueueNums = std::nullopt);
 
     // 只**构建** SEND_MESSAGE 请求对象、不发送（对应 Java sendKernelImpl 建头 +
     // MQClientAPIImpl#sendMessage 建 command）。异步发送要跨重试复用同一个请求
     // （Java ``onExceptionImpl`` 只换 opaque、不换队列），所以建与发必须能分开。
     RemotingCommand buildSendRequest(const std::string& producerGroup, const Message& msg,
-                                     const MessageQueue& mq, int32_t sysFlag, bool unitMode);
+                                     const MessageQueue& mq, int32_t sysFlag, bool unitMode,
+                                     const std::optional<std::string>& createTopicKey = std::nullopt,
+                                     const std::optional<int32_t>& defaultTopicQueueNums = std::nullopt);
     // 把应答解析成 SendResult；broker 回了非成功码时抛 MQBrokerException。
     static SendResult parseSendResponse(const RemotingCommand& response, const Message& msg,
                                         const MessageQueue& mq);

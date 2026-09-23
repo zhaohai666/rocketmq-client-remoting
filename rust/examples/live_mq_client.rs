@@ -267,7 +267,16 @@ async fn send_one(
     let mut pm = PublishMessage::Single(msg);
     instance
         // unitMode=false：本例是实例级裸发送，不模拟 unit mode
-        .send_message(producer_group, &mut pm, mq, 10_000, 0, false)
+        .send_message(
+            producer_group,
+            &mut pm,
+            mq,
+            10_000,
+            0,
+            false,
+            MixAll::DEFAULT_TOPIC,
+            MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+        )
         .await
         .map_err(|e| format!("send to {} queue {} failed: {e}", mq.topic, mq.queue_id))
 }
@@ -857,7 +866,16 @@ async fn m3_send_and_pull(
     let batch_mq = MessageQueue::new(topic, broker_name, 1);
     let mut pm_batch = PublishMessage::Batch(&mut batch);
     let batch_result = instance
-        .send_message(producer_group, &mut pm_batch, &batch_mq, 10_000, 0, false)
+        .send_message(
+            producer_group,
+            &mut pm_batch,
+            &batch_mq,
+            10_000,
+            0,
+            false,
+            MixAll::DEFAULT_TOPIC,
+            MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+        )
         .await;
     match batch_result {
         Ok(result) => {
@@ -911,7 +929,16 @@ async fn m3_send_and_pull(
     {
         let mut pm = PublishMessage::Single(&mut oneway_msg);
         instance
-            .send_message_oneway(producer_group, &mut pm, &oneway_mq, broker_addr, 0, false)
+            .send_message_oneway(
+                producer_group,
+                &mut pm,
+                &oneway_mq,
+                broker_addr,
+                0,
+                false,
+                MixAll::DEFAULT_TOPIC,
+                MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+            )
             .await
             .map_err(|e| format!("oneway send failed: {e}"))?;
     }

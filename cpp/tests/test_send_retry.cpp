@@ -790,6 +790,81 @@ void testUnitModeReachesWire(MockEndpoint& mock) {
     }
 }
 
+// 8a2. 发送头里那三个「跟着路由/配置走」的字段：n（brokerName）、c（defaultTopic）、
+// d（defaultTopicQueueNums）。
+//
+// Java `DefaultMQProducerImpl#sendKernelImpl`:996-997 把生产者的 createTopicKey /
+// defaultTopicQueueNums 写进 c/d，:1007 把**路由选中的 broker 名**写进 n
+// （`SendMessageRequestHeaderV2`:69 `@CFNullable private String n; // brokerName`，
+// `encode()` 用 writeIfNotNull 写字母键）。本端口原先把 c/d 写死成 TBW102/4、
+// 根本不写 n，于是 setCreateTopicKey / setDefaultTopicQueueNums 是假 setter，
+// 而且报文字段集与 Java 不一致。三者都只能在 socket 这头取证。
+void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
+    const std::string topic = "SendHeaderFields";
+    mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
+
+    {
+        // 默认配置：c/d 落回 Java 的 TBW102 / 4，n 取路由里的 broker 名
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_hdr_default");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("hdr-default");
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expectInt(rec.code, RequestCode::SEND_MESSAGE_V2, "single send goes out as 310");
+        expect(rec.ext.count("n") == 1 && rec.ext.at("n") == "broker-a",
+               "brokerName is on the wire as V2 key n");
+        expect(rec.ext.count("c") == 1 && rec.ext.at("c") == MixAll::DEFAULT_TOPIC,
+               "defaultTopic defaults to TBW102");
+        expect(rec.ext.count("d") == 1 && rec.ext.at("d") == "4",
+               "defaultTopicQueueNums defaults to 4");
+        p.shutdown();
+    }
+    {
+        // 生产者配置必须真的上线（旧代码：写死，setter 是假的）
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_hdr_configured");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("hdr-configured");
+        p.setCreateTopicKey("CreatedTopicKey");
+        p.setDefaultTopicQueueNums(9);
+        p.start();
+        p.send(plainMessage(topic), 3000);
+        const WireRecord rec = mock.sendRecord(0);
+        expect(rec.ext.count("c") == 1 && rec.ext.at("c") == "CreatedTopicKey",
+               "setCreateTopicKey reaches the wire as c");
+        expect(rec.ext.count("d") == 1 && rec.ext.at("d") == "9",
+               "setDefaultTopicQueueNums reaches the wire as d");
+        p.shutdown();
+    }
+    {
+        // 定点发送与批量：同一份建头代码，n/c/d 不能漏
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        DefaultMQProducer p("PG_hdr_pinned");
+        p.setNamesrvAddr(mock.address());
+        p.setInstanceName("hdr-pinned");
+        p.setCreateTopicKey("CreatedTopicKey");
+        p.start();
+        p.send(plainMessage(topic), MessageQueue(topic, "broker-a", 0), 3000);
+        const WireRecord pinned = mock.sendRecord(0);
+        expect(pinned.ext.count("n") == 1 && pinned.ext.at("n") == "broker-a",
+               "a pinned send still names its broker");
+        expect(pinned.ext.count("c") == 1 && pinned.ext.at("c") == "CreatedTopicKey",
+               "a pinned send carries the producer's createTopicKey");
+
+        mock.scriptSend({{ResponseCode::SUCCESS, 0}});
+        p.sendBatch({plainMessage(topic), plainMessage(topic)}, 3000);
+        const WireRecord batch = mock.sendRecord(0);
+        expectInt(batch.code, RequestCode::SEND_BATCH_MESSAGE, "batch goes out as 320");
+        expect(batch.ext.count("n") == 1 && batch.ext.at("n") == "broker-a",
+               "the batch request names its broker too");
+        expect(batch.ext.count("c") == 1 && batch.ext.at("c") == "CreatedTopicKey",
+               "and the batch request keeps c/d from the producer");
+        p.shutdown();
+    }
+}
+
 // 8b. 发送请求码的三级判据（Java `MQClientAPIImpl#sendMessage:550-563`）：先判
 // isReply ⇒ 325，再判「这条消息是不是批量」⇒ SEND_BATCH_MESSAGE(320)，否则 310。
 //
@@ -975,6 +1050,7 @@ int main() {
     runCase("errorCodeMapping", mock, testErrorCodeMapping);
     runCase("faultItemFlags", mock, testFaultItemFlags);
     runCase("unitModeReachesWire", mock, testUnitModeReachesWire);
+    runCase("sendHeaderFieldsReachWire", mock, testSendHeaderFieldsReachWire);
     runCase("sendRequestCodeFollowsJava", mock, testSendRequestCodeFollowsJava);
     runCase("requestHooksReachWire", mock, testRequestHooksReachWire);
 

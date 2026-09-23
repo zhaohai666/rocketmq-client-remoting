@@ -576,12 +576,19 @@ std::vector<std::string> MQClientInstance::knownBrokerAddrs() { return getRouteO
 // （Java MQClientAPIImpl#onExceptionImpl 只换 opaque，不换队列也不重建头）。
 RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGroup,
                                                    const Message& msg, const MessageQueue& mq,
-                                                   int32_t sysFlag, bool unitMode) {
+                                                   int32_t sysFlag, bool unitMode,
+                                                   const std::optional<std::string>& createTopicKey,
+                                                   const std::optional<int32_t>& defaultTopicQueueNums) {
     auto header = std::make_shared<SendMessageRequestHeaderV2>();
     header->producerGroup = producerGroup;
     header->topic = msg.topic;
-    header->defaultTopic = MixAll::DEFAULT_TOPIC;
-    header->defaultTopicQueueNums = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
+    // c/d 来自生产者配置（Java sendKernelImpl:996-997），空/未传才是 Java 默认值。
+    // ⚠ 0 是 defaultTopicQueueNums 的合法值，不能拿「等于默认值」当「没传」。
+    header->defaultTopic = (createTopicKey && !createTopicKey->empty())
+                               ? createTopicKey
+                               : std::optional<std::string>(MixAll::DEFAULT_TOPIC);
+    header->defaultTopicQueueNums =
+        defaultTopicQueueNums.value_or(MixAll::DEFAULT_TOPIC_QUEUE_NUMS);
     header->queueId = mq.queueId;
     header->sysFlag = sysFlag;
     header->bornTimestamp = UtilAll::currentTimeMillis();
@@ -594,6 +601,12 @@ RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGr
     // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
     header->maxReconsumeTimes = std::nullopt;
     header->batch = msg.isBatch;
+    // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)` —— V2 的键是
+    // 单字母 `n`（`SendMessageRequestHeaderV2:69`，`encode()` 用 writeIfNotNull）。
+    // 值就是路由选中的那台 broker 的名字，所以跟着 mq 走：异步链跨重试复用同一个请求时，
+    // 它保持第一次建头时的值（Java 同样只建一次）。
+    header->brokerName =
+        mq.brokerName.empty() ? std::nullopt : std::optional<std::string>(mq.brokerName);
 
     // 请求码选择（reply / batch / 普通）见 sendRequestCode：应答走 325、批量走 320，
     // 否则才是普通的 SEND_MESSAGE_V2(310)。
@@ -653,9 +666,13 @@ SendResult MQClientInstance::parseSendResponse(const RemotingCommand& response, 
 
 SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const Message& msg,
                                         const MessageQueue& mq, int32_t timeoutMillis,
-                                        int32_t sysFlag, bool unitMode) {
+                                        int32_t sysFlag, bool unitMode,
+                                        const std::optional<std::string>& createTopicKey,
+                                        const std::optional<int32_t>& defaultTopicQueueNums) {
     const std::string addr = brokerAddr(mq);
-    RemotingCommand request = buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
+    RemotingCommand request =
+        buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
+                         defaultTopicQueueNums);
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
     return parseSendResponse(response, msg, mq);
 }
@@ -714,12 +731,16 @@ std::string MQClientInstance::recallMessage(const std::string& addr,
 
 void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const Message& msg,
                                         const MessageQueue& mq, int32_t timeoutMillis,
-                                        int32_t sysFlag, bool unitMode) {
+                                        int32_t sysFlag, bool unitMode,
+                                        const std::optional<std::string>& createTopicKey,
+                                        const std::optional<int32_t>& defaultTopicQueueNums) {
     const std::string addr = brokerAddr(mq);
     (void)timeoutMillis;
 
     // 请求码选择（reply / batch / 普通）见 sendRequestCode；建头细节与同步/异步共用一份
-    RemotingCommand request = buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode);
+    RemotingCommand request =
+        buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
+                         defaultTopicQueueNums);
     request.markOnewayRpc();
     remotingClient_->invokeOneway(addr, request);
 }

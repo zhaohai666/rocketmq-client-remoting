@@ -889,7 +889,8 @@ public class DefaultMQProducer
 
         if (!HasSendInterceptors())
         {
-            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode);
+            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode,
+                _createTopicKey, _defaultTopicQueueNums);
         }
 
         string brokerAddr = string.Empty;
@@ -906,7 +907,8 @@ public class DefaultMQProducer
 
         if (_sendMessageHooks.Count == 0)
         {
-            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode);
+            return c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode,
+                _createTopicKey, _defaultTopicQueueNums);
         }
 
         SendMessageContext context = BuildSendContext(msg, mq, brokerAddr);
@@ -914,7 +916,8 @@ public class DefaultMQProducer
         SendResult result;
         try
         {
-            result = c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode);
+            result = c.SendMessage(_producerGroup, msg, mq, timeout, sysFlag, _unitMode,
+                _createTopicKey, _defaultTopicQueueNums);
         }
         catch (Exception e)
         {
@@ -1529,7 +1532,8 @@ public class DefaultMQProducer
             MessageClientIDSetter.SetUniqId(msg);
         }
 
-        RemotingCommand request = c.BuildSendRequest(_producerGroup, msg, mq, sysFlag, _unitMode);
+        RemotingCommand request = c.BuildSendRequest(_producerGroup, msg, mq, sysFlag, _unitMode,
+            _createTopicKey, _defaultTopicQueueNums);
         SendMessageContext? context = null;
         if (HasSendInterceptors())
         {
@@ -1902,7 +1906,8 @@ public class DefaultMQProducer
             TraceParentContext.Inject(outbound);
         }
 
-        c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag, _unitMode);
+        c.SendMessageOneway(_producerGroup, outbound, selected, _sendMsgTimeout, sysFlag, _unitMode,
+            _createTopicKey, _defaultTopicQueueNums);
     }
 
     // ---------------- 批量 ----------------

@@ -396,6 +396,116 @@ public class SendRetryTests
     }
 
     /// <summary>
+    /// Java <c>sendKernelImpl</c> 在同一个发送头上还写了三个值（本端口此前全部漏掉）：
+    /// <c>:996 setDefaultTopic(producer.getCreateTopicKey())</c> → V2 键 <c>c</c>、
+    /// <c>:997 setDefaultTopicQueueNums(...)</c> → V2 键 <c>d</c>、
+    /// <c>:1007 setBrokerName(brokerName)</c> → V2 键 <c>n</c>
+    /// （SendMessageRequestHeaderV2.java:69，<c>@CFNullable</c> 所以空值整条不上线）。
+    ///
+    /// <c>c</c>/<c>d</c> 是功能问题：broker 侧自动建 topic 时按这两个值决定队列数
+    /// （<c>AbstractSendMessageProcessor.createTopicInSendMessageMethod</c>），写死
+    /// TBW102/4 等于把 <c>CreateTopicKey</c> / <c>DefaultTopicQueueNums</c> 变成假 setter。
+    /// <c>n</c> 是线上报文对等：经典 broker 按连接地址寻址、不读它，proxy 与审计/轨迹侧读。
+    ///
+    /// 三种入口（同步 / 批量 320 / 单向）都要带同一份值，且 <c>d=0</c> 要原样上线 ——
+    /// 0 是「调用方明说的 0」，不是「没配」。异步入口的那一份见
+    /// ProducerAsyncTests.SendAsyncHeaderCarriesBrokerNameAndTopicKeys。
+    /// </summary>
+    [Fact]
+    public void SendHeaderCarriesBrokerNameAndTopicKeys()
+    {
+        using var cluster = MockCluster.Start(2);
+        DefaultMQProducer producer = Started(cluster, "GID_SendHeaderFields");
+
+        // ---- ① 不配置时就是 Java 的那两个常量；n 是这一笔选中的那台 broker
+        cluster.ClearRequests();
+        Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
+        WireRecord first = cluster.FirstSendRequest()!;
+        Assert.Equal(RequestCode.SendMessageV2, first.Code);
+        Assert.Equal("broker-0", first.Ext["n"]);
+        Assert.Equal(MixAll.DefaultTopic, first.Ext["c"]);
+        Assert.Equal("4", first.Ext["d"]);
+
+        // ---- ② c/d 跟着 producer 配置走；轮询换到 broker-1 时 n 也跟着换
+        cluster.ClearRequests();
+        producer.CreateTopicKey = "CreatedTopicKey";
+        producer.DefaultTopicQueueNums = 9;
+        Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
+        WireRecord second = cluster.FirstSendRequest()!;
+        Assert.Equal("broker-1", second.Ext["n"]); // n 是这一笔选中的 broker，不是路由里的第一台
+        Assert.Equal("CreatedTopicKey", second.Ext["c"]);
+        Assert.Equal("9", second.Ext["d"]);
+
+        // ---- ③ 批量走同一个建头函数（码 320 与 m=true 由上一节负责）
+        cluster.ClearRequests();
+        Assert.Equal(SendStatus.SendOk,
+            producer.SendBatch(new List<Message> { Msg(), Msg() }).SendStatus);
+        WireRecord batch = cluster.FirstSendRequest()!;
+        Assert.Equal(RequestCode.SendBatchMessage, batch.Code);
+        Assert.Equal("CreatedTopicKey", batch.Ext["c"]);
+        Assert.Equal("9", batch.Ext["d"]);
+        Assert.True(batch.Ext.ContainsKey("n"), "批量也要带 brokerName");
+
+        // ---- ④ 单向：d=0 必须原样上线，不能被默认值 4 顶掉
+        cluster.ClearRequests();
+        producer.DefaultTopicQueueNums = 0;
+        producer.SendOneway(Msg());
+        Assert.True(WaitUntil(() => cluster.FirstSendRequest() != null, 3000), "单向请求要被抓到");
+        WireRecord oneway = cluster.FirstSendRequest()!;
+        // "0" 是调用方明说的 0，不能被默认值 4 顶掉
+        Assert.Equal("0", oneway.Ext["d"]);
+        Assert.Equal("CreatedTopicKey", oneway.Ext["c"]);
+        Assert.True(oneway.Ext.ContainsKey("n"), "单向也要带 brokerName");
+
+        producer.Shutdown();
+    }
+
+    /// <summary>
+    /// 队列没有 broker 名（手工指定的 MessageQueue）时，<c>n</c> 整条不上线，而不是写
+    /// 一个空串 —— Java 那个字段是 <c>@CFNullable</c>，<c>writeIfNotNull</c> 会跳过 null。
+    /// 纯离线：只建请求、不发出去（Encode 前要把头展开成 extFields，同 broker 侧口径）。
+    /// </summary>
+    [Fact]
+    public void EmptyBrokerNameStaysOutOfTheSendHeader()
+    {
+        var inst = new MQClientInstance(
+            "SendHeaderOff_" + Environment.CurrentManagedThreadId.ToString(CultureInfo.InvariantCulture),
+            new List<string> { "127.0.0.1:9876" });
+        var msg = new Message(Topic, Encoding.UTF8.GetBytes("hello"));
+
+        RemotingCommand withName = inst.BuildSendRequest("PG_Header", msg,
+            new MessageQueue(Topic, "broker-a", 0));
+        withName.MakeCustomHeaderToNet();
+        Assert.Equal("broker-a", withName.ExtFields["n"]);
+
+        var noName = new Message(Topic, Encoding.UTF8.GetBytes("hello"));
+        RemotingCommand without = inst.BuildSendRequest("PG_Header", noName,
+            new MessageQueue(Topic, "", 0));
+        without.MakeCustomHeaderToNet();
+        Assert.False(without.ExtFields.ContainsKey("n"), "空 brokerName 不该上线");
+        // c/d 仍然按 Java 默认值上线
+        Assert.Equal(MixAll.DefaultTopic, without.ExtFields["c"]);
+        Assert.Equal("4", without.ExtFields["d"]);
+    }
+
+    /// <summary>轮询等待条件成立（单向发送没有应答可等）。</summary>
+    private static bool WaitUntil(Func<bool> cond, int millis)
+    {
+        Stopwatch watch = Stopwatch.StartNew();
+        while (watch.ElapsedMilliseconds < millis)
+        {
+            if (cond())
+            {
+                return true;
+            }
+
+            Thread.Sleep(5);
+        }
+
+        return cond();
+    }
+
+    /// <summary>
     /// 带 ACL 钩子的生产者。钩子必须排在 Start() **之前**：Java 的 rpcHook 随
     /// <c>MQClientAPIImpl</c> 构造传入，本端口各 facade 也在 <c>Start()</c> 里把它绑到
     /// 传输层 —— 启动后再 SetRpcHook 已经来不及，报文会裸着出去（这正是 ① ② 要抓的东西）。

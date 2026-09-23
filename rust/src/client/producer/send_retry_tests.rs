@@ -667,6 +667,137 @@ async fn unit_mode_is_carried_in_the_send_header() {
     off.shutdown();
 }
 
+/// Java `sendKernelImpl` 在同一个发送头上还写了三个值，本端口此前全部漏掉：
+///   - `:996 setDefaultTopic(producer.getCreateTopicKey())` → V2 键 `c`
+///   - `:997 setDefaultTopicQueueNums(producer.getDefaultTopicQueueNums())` → V2 键 `d`
+///   - `:1007 setBrokerName(brokerName)` → V2 键 `n`（`SendMessageRequestHeaderV2:69`，
+///     `@CFNullable`，所以空串不该上线）
+///
+/// `c`/`d` 是功能 bug：broker 侧自动建 topic 时用这两个值决定队列数
+/// （`AbstractSendMessageProcessor` 的 `createTopicInSendMessageMethod`），写死
+/// `TBW102`/4 等于把 `set_create_topic_key` / `set_default_topic_queue_nums` 变成假
+/// setter。`n` 是线上报文对等：经典 broker 按连接寻址、不读它，proxy 与审计侧读。
+///
+/// 五种入口（同步 / 配置覆盖 / 批量 320 / 单向 / 异步）必须带同一份值，且 `d=0`
+/// 要原样上线 —— 0 是「调用方明说的 0」，不是「没配」。
+#[tokio::test]
+async fn send_header_carries_broker_name_and_topic_keys() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("send_header_fields", &cluster).await;
+
+    // ① 不配置时就是 Java 的那两个常量
+    let mut msg = Message::new("T1", Some(b"single"));
+    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    let ext = cluster.send_ext(0, 0);
+    assert_eq!(cluster.send_code(0, 0), request_code::SEND_MESSAGE_V2);
+    assert_eq!(
+        ext_value(&ext, "n"),
+        Some("broker-0"),
+        "brokerName 要以单字母键 n 上线"
+    );
+    assert_eq!(ext_value(&ext, "c"), Some(MixAll::DEFAULT_TOPIC));
+    assert_eq!(ext_value(&ext, "d"), Some("4"));
+
+    // ② c/d 跟着 producer 配置走
+    producer.set_create_topic_key("CreatedTopicKey");
+    producer.set_default_topic_queue_nums(9);
+    let mut msg = Message::new("T1", Some(b"configured"));
+    producer.send(&mut msg, None, None).await.expect("发送应当成功");
+    let ext = cluster.send_ext(0, 1);
+    assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
+    assert_eq!(ext_value(&ext, "d"), Some("9"));
+    assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
+
+    // ③ 批量走同一个建头函数（码 320、`m=true` 由 send_request_code 那一节负责）
+    producer
+        .send_batch(
+            vec![
+                Message::new("T1", Some(b"b-0")),
+                Message::new("T1", Some(b"b-1")),
+            ],
+            None,
+            None,
+        )
+        .await
+        .expect("批量发送应当成功");
+    let ext = cluster.send_ext(0, 2);
+    assert_eq!(cluster.send_code(0, 2), request_code::SEND_BATCH_MESSAGE);
+    assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
+    assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
+    assert_eq!(ext_value(&ext, "d"), Some("9"));
+
+    // ④⑤ 单向与异步同样不能漏；顺手验证 d=0 不上浮成默认值
+    producer.set_default_topic_queue_nums(0);
+    let mut msg = Message::new("T1", Some(b"oneway"));
+    producer
+        .send_oneway(&mut msg, None)
+        .await
+        .expect("单向发送应当成功");
+    assert!(wait_until(|| cluster.requests(0) >= 4).await, "单向请求也要被抓到");
+    let ext = cluster.send_ext(0, 3);
+    assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
+    assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
+    assert_eq!(ext_value(&ext, "d"), Some("0"), "0 是调用方明说的 0");
+
+    let cb = Arc::new(Recorder::default());
+    producer
+        .send_async(body_of(10), cb.clone(), Some(3_000), None)
+        .expect("异步可派发");
+    assert!(wait_until(|| cluster.requests(0) >= 5).await);
+    let ext = cluster.send_ext(0, 4);
+    assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
+    assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
+    assert_eq!(ext_value(&ext, "d"), Some("0"));
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
+
+    producer.shutdown();
+}
+
+/// `n` 取的是**这一笔选中的**那个 broker 名（Java `:1007` 用 `mqSel.getBrokerName()`），
+/// 不是路由里的第一个；broker 名为空时 `@CFNullable` 让它整条不上线。
+#[tokio::test]
+async fn broker_name_header_follows_the_selected_queue() {
+    let cluster = MockCluster::start(2, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    cluster.script(1, vec![], (response_code::SUCCESS, 0));
+    let producer = started("send_header_broker_name", &cluster).await;
+
+    let mut first = Message::new("T1", Some(b"to-0"));
+    producer.send(&mut first, None, None).await.expect("发送应当成功");
+    let mut second = Message::new("T1", Some(b"to-1"));
+    producer.send(&mut second, None, None).await.expect("发送应当成功");
+    assert_eq!(ext_value(&cluster.send_ext(0, 0), "n"), Some("broker-0"));
+    assert_eq!(ext_value(&cluster.send_ext(1, 0), "n"), Some("broker-1"));
+
+    // 队列没有 broker 名（例如手工指定的 MessageQueue）时，键要整个消失而不是写 `n=`
+    let client = producer.require_client().expect("client 已启动");
+    let mut msg = Message::new("T1", Some(b"no-broker-name"));
+    let mut publish = PublishMessage::Single(&mut msg);
+    let mq = MessageQueue::new("T1", "", 0);
+    client
+        .send_message_to_addr(
+            "GID_send_retry",
+            &mut publish,
+            &mq,
+            &cluster.broker_addrs[0],
+            3_000,
+            0,
+            false,
+            MixAll::DEFAULT_TOPIC,
+            MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+        )
+        .await
+        .expect("空 brokerName 不该影响发送");
+    let ext = cluster.send_ext(0, 1);
+    assert!(ext_value(&ext, "n").is_none(), "空 brokerName 不该上线: {ext:?}");
+    assert_eq!(ext_value(&ext, "c"), Some(MixAll::DEFAULT_TOPIC));
+    assert_eq!(ext_value(&ext, "d"), Some("4"));
+
+    producer.shutdown();
+}
+
 /// 单位名要同时出现在 clientId 与线上报文里，且不影响发送。
 #[tokio::test]
 async fn unit_name_only_changes_the_client_id() {
@@ -737,7 +868,16 @@ async fn send_request_code_follows_java_three_way_branch() {
     let mq = MessageQueue::new("T1", "broker-0", 0);
     let client = producer.require_client().expect("client 已启动");
     client
-        .send_message("GID_send_retry", &mut publish, &mq, 3_000, 0, false)
+        .send_message(
+            "GID_send_retry",
+            &mut publish,
+            &mq,
+            3_000,
+            0,
+            false,
+            MixAll::DEFAULT_TOPIC,
+            MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
+        )
         .await
         .expect("应答批量发送应当成功");
     producer.shutdown();

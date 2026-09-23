@@ -147,7 +147,8 @@ class _FakeAsyncClient:
     def get_topic_route_data(self, topic):
         return self.route
 
-    def build_send_request(self, group, msg, mq, timeout, sys_flag, unit_mode=False):
+    def build_send_request(self, group, msg, mq, timeout, sys_flag, unit_mode=False,
+                           default_topic=None, default_topic_queue_nums=None):
         with self.lock:
             self.built.append(mq.broker_name)
             # 建请求发生在 AsyncSenderExecutor 线程上 —— 顺手记下线程名供断言用
@@ -615,7 +616,8 @@ def test_send_batch_writes_client_ids_before_encoding_the_body():
     p.namespace = "BatchNs"
     sent = []
 
-    def _fake_send(group, msg, mq, timeout, sys_flag, unit_mode=False):
+    def _fake_send(group, msg, mq, timeout, sys_flag, unit_mode=False,
+                   default_topic=None, default_topic_queue_nums=None):
         sent.append(msg)
         return SendResult(SendStatus.SEND_OK, msg_id="b" * 32,
                           message_queue=_mq("broker-a", 0))

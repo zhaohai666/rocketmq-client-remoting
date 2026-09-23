@@ -68,7 +68,8 @@ class _FakeClient:
     def broker_addr_of(self, broker_name):
         return ADDR
 
-    def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False):
+    def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False,
+                     default_topic=None, default_topic_queue_nums=None):
         self.sent.append((mq, timeout))
         if self.first_send_sleep_ms and len(self.sent) == 1:
             time.sleep(self.first_send_sleep_ms / 1000.0)

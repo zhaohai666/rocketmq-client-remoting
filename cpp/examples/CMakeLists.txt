@@ -85,3 +85,7 @@ target_link_libraries(rmq_live_backpressure PRIVATE rocketmq::remoting)
 # 异步发送内核（准备段/回调线程口径、并发不串台、定点/拦截/批量/关池排空）真机联调（不打进 ctest）
 add_executable(rmq_live_async_send live_async_send.cpp)
 target_link_libraries(rmq_live_async_send PRIVATE rocketmq::remoting)
+
+# 发送头 c/d/n 三个字段真机联调（模板 topic 决定自动建出来的队列数；不打进 ctest）
+add_executable(rmq_live_send_header live_send_header.cpp)
+target_link_libraries(rmq_live_send_header PRIVATE rocketmq::remoting)

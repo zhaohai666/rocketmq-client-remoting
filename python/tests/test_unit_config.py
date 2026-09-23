@@ -164,7 +164,8 @@ def test_producer_send_passes_its_own_unit_mode():
         def broker_addr_of(self, broker_name):
             return "127.0.0.1:10911"
 
-        def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False):
+        def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False,
+                         default_topic=None, default_topic_queue_nums=None):
             seen.append(unit_mode)
             from rocketmq.client.send_result import SendResult, SendStatus
             return SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq)

@@ -49,6 +49,7 @@ internal static class Program
                 "validators-live" => LiveValidators.Run(rest),
                 "recall" => LiveRecall.Run(rest),
                 "unit-config" => LiveUnitConfig.Run(rest),
+                "send-header" => LiveSendHeader.Run(rest),
                 "sql92" => LiveSql92.Run(rest),
                 _ => Unknown(command),
             };
@@ -92,6 +93,7 @@ internal static class Program
               validators-live [namesrv]     真实集群名字校验联调（本地快拒 + 合法名字收发 + 往返对照）
               recall     [namesrv]        真实集群定时消息撤回联调（需 broker 开 recallMessageEnable，脚本负责还原）
               unit-config [namesrv]      真实集群 unitName/unitMode/stream 联调（clientId 后缀、topic UNIT 位、%RETRY% UNIT_SUB 位）
+              send-header [namesrv]      真实集群发送头 c/d/n 联调（模板 topic 决定自动建出来的队列数、五种入口逐条落地）
               sql92      [namesrv]        真实集群 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 联调（需 broker 开 enablePropertyFilter）
             """);
     }

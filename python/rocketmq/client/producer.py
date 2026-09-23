@@ -615,6 +615,23 @@ class DefaultMQProducer:
         context.arg = arg
         self.execute_check_forbidden_hook(context)
 
+    def _send_header_args(self) -> dict:
+        """每次发请求都要带上、且只来源于 producer 配置的那几个头字段。
+
+        对位 Java `DefaultMQProducerImpl.sendKernelImpl`：
+          - :996-997 `setDefaultTopic(producer.getCreateTopicKey())` /
+            `setDefaultTopicQueueNums(producer.getDefaultTopicQueueNums())` ——
+            broker 侧新建 topic 时用这两个值决定队列数，写死默认值会让
+            `set_create_topic_key` / `set_default_topic_queue_nums` 变成假 setter。
+          - :1007 `setBrokerName(brokerName)`，V2 编码成单字母键 `n`。
+          - unit_mode 同 :991。
+        """
+        return {
+            "unit_mode": self.unit_mode,
+            "default_topic": self.create_topic_key,
+            "default_topic_queue_nums": self.default_topic_queue_nums,
+        }
+
     def _send_with_hooks(self, client: MQClientInstance, msg: Message, mq_sel: MessageQueue,
                          timeout: int, sys_flag: int, arg=None,
                          communication_mode: str = CommunicationMode.SYNC) -> SendResult:
@@ -639,12 +656,12 @@ class DefaultMQProducer:
             inject_trace_context(msg)
         if not self.send_message_hook_list:
             return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
-                                       unit_mode=self.unit_mode)
+                                       **self._send_header_args())
         context = self._build_send_context(msg, mq_sel, broker_addr, communication_mode)
         self.execute_send_message_hook_before(context)
         try:
             result = client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
-                                           unit_mode=self.unit_mode)
+                                           **self._send_header_args())
         except Exception as e:  # noqa: BLE001
             context.exception = e
             self.execute_send_message_hook_after(context)
@@ -883,7 +900,7 @@ class DefaultMQProducer:
             if self._has_send_interceptors():
                 return self._send_with_hooks(client, msg, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, msg, mq, timeout, sys_flag,
-                                   unit_mode=self.unit_mode)
+                                   **self._send_header_args())
         # 对应 Java sendDefaultImpl：重试分类逐异常类型走，不用"啥都重试"糊过去。
         try:
             publish = self._topic_publish_info(msg.topic)
@@ -1230,7 +1247,7 @@ class DefaultMQProducer:
         # 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），
         # 所以 header 里的 queueId 也跟着上一次 —— 这是 Java 的真实行为，别"修"它。
         request = client.build_send_request(self.producer_group, msg, mq, timeout, sys_flag,
-                                            unit_mode=self.unit_mode)
+                                            **self._send_header_args())
         context = None
         if self.send_message_hook_list:
             context = self._build_send_context(msg, mq, broker_addr, CommunicationMode.ASYNC)
@@ -1362,7 +1379,7 @@ class DefaultMQProducer:
                                               None, CommunicationMode.ONEWAY)
             client.send_message_oneway(self.producer_group, msg, mq,
                                        self._need_addr(client, mq), self.send_msg_timeout,
-                                       sys_flag, unit_mode=self.unit_mode)
+                                       sys_flag, **self._send_header_args())
             return
         publish = self._topic_publish_info(msg.topic)
         selected = self._mq_fault_strategy.select_one_message_queue(publish, None)
@@ -1372,7 +1389,7 @@ class DefaultMQProducer:
                                           None, CommunicationMode.ONEWAY)
         client.send_message_oneway(self.producer_group, msg, mq_sel,
                                    self._need_addr(client, mq_sel), self.send_msg_timeout,
-                                   sys_flag, unit_mode=self.unit_mode)
+                                   sys_flag, **self._send_header_args())
 
     def send_by_selector(self, msg: Message, selector: MessageQueueSelector, arg,
                          timeout_millis: Optional[int] = None) -> SendResult:
@@ -1390,7 +1407,7 @@ class DefaultMQProducer:
             # arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
             return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag, arg=arg)
         return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
-                                       unit_mode=self.unit_mode)
+                                       **self._send_header_args())
 
     # ---------------- 定时消息撤回（对应 Java recallMessage）----------------
     def recall_message(self, topic: str, recall_handle: str) -> str:
@@ -1457,14 +1474,14 @@ class DefaultMQProducer:
             if self._has_send_interceptors():
                 return self._send_with_hooks(client, batch, mq, timeout, sys_flag)
             return client.send_message(self.producer_group, batch, mq, timeout, sys_flag,
-                                   unit_mode=self.unit_mode)
+                                   **self._send_header_args())
         publish = self._topic_publish_info(batch.topic)
         selected = publish.select_one_message_queue()
         mq_sel = MessageQueue(batch.topic, selected.broker_name, selected.queue_id)
         if self._has_send_interceptors():
             return self._send_with_hooks(client, batch, mq_sel, timeout, sys_flag)
         return client.send_message(self.producer_group, batch, mq_sel, timeout, sys_flag,
-                                   unit_mode=self.unit_mode)
+                                   **self._send_header_args())
 
     # ---------------- 事务消息 ----------------
     # 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction（L1433-1509）的**两阶段**：

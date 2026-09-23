@@ -1157,6 +1157,36 @@ public class ProducerAsyncTests : IDisposable
     }
 
     /// <summary>
+    /// 异步内核自己建请求（<c>BuildSendRequest</c> 在 sendKernelAsync 里，不走
+    /// <c>MqClient.SendMessage</c>），所以 Java <c>sendKernelImpl:996-997</c> / <c>:1007</c>
+    /// 写进发送头的三个值要在这里再取证一遍：V2 的 <c>n</c>（brokerName）、
+    /// <c>c</c>（createTopicKey）、<c>d</c>（自动建 topic 的队列数）。
+    /// 只在同步路径补的话，异步这一路会裸着出去 —— 而同步/异步的报文形状必须一致。
+    /// </summary>
+    [Fact]
+    public void SendAsyncHeaderCarriesBrokerNameAndTopicKeys()
+    {
+        using var cluster = MockCluster.Start(1);
+        cluster.Script(0, new List<(int, int)>(), (ResponseCode.Success, 0));
+        DefaultMQProducer producer = Started(cluster, "GID_async_header");
+        producer.CreateTopicKey = "AsyncTopicKey";
+        producer.DefaultTopicQueueNums = 11;
+
+        var cb = new Recorder();
+        producer.SendAsync(Msg(10), cb, 5000);
+        Assert.True(cb.WaitDone(1, 5000), string.Join(" / ", cb.Errors()));
+        Assert.Equal(SendStatus.SendOk, cb.Results()[0]!.SendStatus);
+
+        WireRecord? wire = cluster.FirstSendRequest();
+        Assert.NotNull(wire);
+        Assert.Equal(RequestCode.SendMessageV2, wire!.Code);
+        Assert.Equal("broker-0", wire.Ext["n"]);
+        Assert.Equal("AsyncTopicKey", wire.Ext["c"]);
+        Assert.Equal("11", wire.Ext["d"]);
+        producer.Shutdown();
+    }
+
+    /// <summary>
     /// 批量发送的客户端 ID 口径（对应 Java <c>DefaultMQProducer.batch():1176-1182</c> 的顺序 +
     /// <c>MQClientAPIImpl.processSendResponse:785</c>）：
     ///   ① <b>每条子消息</b>的 UNIQ_KEY 必须在<b>编码之前</b>写好 —— 否则落进 commitLog 的子
