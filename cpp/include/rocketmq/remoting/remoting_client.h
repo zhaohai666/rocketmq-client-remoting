@@ -59,9 +59,15 @@ struct InvokeError {
 
     Kind kind = Kind::NONE;
     std::string message;
+    // 仅 RESPONSE_FAILED 有意义：broker 明确回的失败码（Java processSendResponse 抛
+    // MQBrokerException 时带的那个 code）。响应体解析不出来时保持 0 —— Java 那一支抛的是
+    // RemotingCommandException（不带码），两者在回调里必须是不同的异常类型。
+    int32_t responseCode = 0;
 
     InvokeError() = default;
     InvokeError(Kind k, std::string msg) : kind(k), message(std::move(msg)) {}
+    InvokeError(Kind k, std::string msg, int32_t code)
+        : kind(k), message(std::move(msg)), responseCode(code) {}
 
     bool empty() const { return kind == Kind::NONE && message.empty(); }
 };

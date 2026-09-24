@@ -81,14 +81,14 @@ public static class LiveSendHeader
     {
         private readonly object _lk = new();
         private readonly List<SendResult> _oks = new();
-        private readonly List<string> _errors = new();
+        private readonly List<Exception> _errors = new();
 
         public void OnSuccess(SendResult sendResult)
         {
             lock (_lk) _oks.Add(sendResult);
         }
 
-        public void OnException(string error)
+        public void OnException(Exception error)
         {
             lock (_lk) _errors.Add(error);
         }
@@ -106,7 +106,7 @@ public static class LiveSendHeader
 
         public string Errors()
         {
-            lock (_lk) return string.Join(";", _errors);
+            lock (_lk) return string.Join(";", _errors.Select(e => e.Message));
         }
     }
 

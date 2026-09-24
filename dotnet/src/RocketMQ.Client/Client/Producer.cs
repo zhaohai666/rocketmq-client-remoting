@@ -1682,7 +1682,9 @@ public class DefaultMQProducer
             }
             else
             {
-                callback.OnException(error?.Message ?? "unknown reason");
+                // Java 把异常对象原样交出去（`sendCallback.onException(e)`）；error 为空只可能
+                // 是内部约定被破坏，兜一个 MQClientException 而不是空引用。
+                callback.OnException(error ?? new MQClientException("unknown reason"));
             }
         }
         catch (Exception e)
@@ -1928,27 +1930,27 @@ public class DefaultMQProducer
         /// <b>不看</b> RetryResponseCodes：broker 明确回了错就不会换 broker。别与同步语义混了。</summary>
         private static (Exception, bool) ClassifyAsyncFailure(Exception err, long cost)
         {
+            // 文案与 cause 都按 Java `MQClientAPIImpl#operationFail:683-695`：
+            // `new MQClientException("send request failed", throwable)` 一类 —— **message 就是
+            // 这三个短语**（跨端比对看的就是它），底层细节挂在 InnerException 上（Python 的
+            // `cause` 同一条）。别把 err.Message 拼进 message：拼了就与 Java/Python 对不上。
             switch (err)
             {
                 case RemotingSendRequestException:
-                    return (new MQClientException("send request failed, last error: " + err.Message),
-                        true);
+                    return (new MQClientException("send request failed", err), true);
                 case RemotingTimeoutException:
                     return (new MQClientException("wait response timeout, cost="
-                                                  + cost.ToString(CultureInfo.InvariantCulture)
-                                                  + ", last error: " + err.Message), true);
+                        + cost.ToString(CultureInfo.InvariantCulture), err), true);
                 // 其余 RemotingException 都是「unknown reason」，但 TooMuchRequest 是「自己人太多」，
                 // 换 broker 也没用（Python 同一条判据）。
                 case RemotingTooMuchRequestException:
-                    return (new MQClientException("unknown reason, last error: " + err.Message),
-                        false);
+                    return (new MQClientException("unknown reason", err), false);
                 // 连不上（RemotingConnectException）与编解码/命令错也属 RemotingException：
                 // 换一台有机会。
                 case RemotingConnectException:
                 case RemotingCommandException:
                 case RemotingException:
-                    return (new MQClientException("unknown reason, last error: " + err.Message),
-                        true);
+                    return (new MQClientException("unknown reason", err), true);
                 default:
                     return (err, false);
             }

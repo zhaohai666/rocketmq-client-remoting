@@ -91,7 +91,7 @@ internal static class LiveMessageTypes
         private int _err;
         private readonly object _lk = new();
         private readonly List<SendResult> _results = new();
-        private readonly List<string> _errors = new();
+        private readonly List<Exception> _errors = new();
 
         public void OnSuccess(SendResult result)
         {
@@ -99,7 +99,7 @@ internal static class LiveMessageTypes
             lock (_lk) _results.Add(result);
         }
 
-        public void OnException(string error)
+        public void OnException(Exception error)
         {
             Interlocked.Increment(ref _err);
             lock (_lk) _errors.Add(error);
@@ -115,7 +115,7 @@ internal static class LiveMessageTypes
 
         public List<string> Errors()
         {
-            lock (_lk) return new List<string>(_errors);
+            lock (_lk) return _errors.Select(e => e.Message).ToList();
         }
     }
 

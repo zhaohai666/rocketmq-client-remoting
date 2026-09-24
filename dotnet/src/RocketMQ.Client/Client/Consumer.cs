@@ -2254,18 +2254,31 @@ public sealed class DefaultMQPushConsumer
         }
         else if (_messageListener is IMessageListenerOrderly orderlyListener)
         {
+            var ctx = new ConsumeOrderlyContext(mq);
             try
             {
-                var ctx = new ConsumeOrderlyContext(mq);
+                // Java 顺序 consumeMessageDirectly:103-161 —— 映射比并发侧多两个成员
+                //（COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK，broker 按它们区分 binlog 口径），
+                // 且 AutoCommit 取 listener 跑完**之后**的上下文值。
                 ConsumeOrderlyStatus status = orderlyListener.ConsumeMessage(msgs, ctx);
-                result.ConsumeResult = status == ConsumeOrderlyStatus.Success
-                    ? "CR_SUCCESS" : "CR_LATER";
+                result.ConsumeResult = status switch
+                {
+                    ConsumeOrderlyStatus.Commit => "CR_COMMIT",
+                    ConsumeOrderlyStatus.Rollback => "CR_ROLLBACK",
+                    ConsumeOrderlyStatus.Success => "CR_SUCCESS",
+                    _ => "CR_LATER",
+                };
             }
             catch (Exception e)
             {
                 result.ConsumeResult = "CR_THROW_EXCEPTION";
                 result.Remark = e.GetType().Name + ": " + e.Message;
             }
+
+            // Java:156 —— 读的是 listener 跑完之后的上下文值（异常路径同样读）。listener 里置
+            // false 的 binlog 用法靠这条回传让 broker 知道「这条直接消费没提交」；提前读初值
+            // 等于把它吞掉，真机上只表现为 mqadmin 返回的 AutoCommit 恒为 true。
+            result.AutoCommit = ctx.AutoCommit;
         }
         else if (_messageListener is IMessageListenerConcurrently concurrentListener)
         {
@@ -2953,7 +2966,8 @@ public sealed class DefaultMQPushConsumer
         // 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
         RecordConsumeStats(mq.Topic, msgs.Count, popBegin,
             failed: status == ConsumeConcurrentlyStatus.ReconsumeLater);
-        FinishConsumeHook(popHookCtx, true, popHasException, popBegin, status.ToString(),
+        FinishConsumeHook(popHookCtx, true, popHasException, popBegin,
+            ConsumeConcurrentlyStatusNames.Name(status),
             failed: status == ConsumeConcurrentlyStatus.ReconsumeLater,
             succeeded: status == ConsumeConcurrentlyStatus.ConsumeSuccess);
 
@@ -3320,34 +3334,55 @@ public sealed class DefaultMQPushConsumer
                 ohasException = true;
             }
 
-            // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
-            RecordConsumeStats(mq.Topic, batch.Count, obegin,
-                failed: status != ConsumeOrderlyStatus.Success);
-            FinishConsumeHook(ohookCtx, true, ohasException, obegin, status.ToString(),
-                failed: status != ConsumeOrderlyStatus.Success,
-                succeeded: status == ConsumeOrderlyStatus.Success);
-
-            if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
+            // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:502-511）：
+            // status 是归一化后的枚举名，success 判据是 SUCCESS||COMMIT，而 returnType
+            //（props 里的 CONSUME_CONTEXT_TYPE）按归一化前的 status 算。
+            if (status == ConsumeOrderlyStatus.Rollback ||
+                status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
             {
-                // Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
-                // 只有「还在重试次数内 / 回投失败」才把这一批塞回队首原地重试；已经交给
-                // broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列 ——
-                // 而那看起来跟「消费者死了」一模一样。
-                if (CheckOrderlyReconsumeTimes(batch))
-                {
-                    lock (_lock)
-                    {
-                        if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
-                        {
-                            for (int i = batch.Count - 1; i >= 0; --i)
-                            {
-                                PushFront(q, batch[i]);
-                            }
-                        }
-                    }
+                // Java:476-482 —— 返回「不是 OK」时打一条 warn（含抛异常归一化来的挂起）。
+                // 这条日志是顺序消费 head-of-line blocking 的唯一线索，缺了就只能看见
+                // "这个组不动了"。
+                ClientLog.Warn("consumeMessage Orderly return not OK, Group: " + ConsumerGroup +
+                    " Msgs: " + batch.Count + " MQ: " + key);
+            }
 
-                    _stopEvent.Wait(TimeSpan.FromMilliseconds(_suspendCurrentQueueTimeMillis));
-                    return false;
+            FinishConsumeHook(ohookCtx, true, ohasException, obegin,
+                ConsumeOrderlyStatusNames.Name(status),
+                failed: status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment,
+                succeeded: status == ConsumeOrderlyStatus.Success ||
+                           status == ConsumeOrderlyStatus.Commit);
+
+            if (ctx.AutoCommit)
+            {
+                // ---- Java processConsumeResult:244-269 ----
+                if (status == ConsumeOrderlyStatus.Commit || status == ConsumeOrderlyStatus.Rollback)
+                {
+                    // Java:246-250 —— AutoCommit=true 时 Commit/Rollback 是**非法**用法（只给
+                    // binlog 消费用）：Java 只 warn、**不写 break**，顺势落进 Success 分支，
+                    // 消息照 ack、不当回滚。
+                    ClientLog.Warn("the message queue consume result is illegal, we think you want " +
+                        "to ack these message " + key);
+                    status = ConsumeOrderlyStatus.Success;
+                }
+
+                if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
+                {
+                    RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: true);
+                    // Java:256-266 —— 挂起之前要先过 checkReconsumeTimes：只有「还在重试次数内 /
+                    // 回投失败」才把这一批塞回队首原地重试；已经交给 broker 的（回投成功）要
+                    // 前进位点，否则一条毒消息永久占住这条队列 —— 而那看起来跟「消费者死了」
+                    // 一模一样。
+                    if (CheckOrderlyReconsumeTimes(batch))
+                    {
+                        RequeuePending(key, batch);
+                        _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
+                        return false;
+                    }
+                }
+                else
+                {
+                    RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: false);
                 }
 
                 AdvanceConsumeOffset(key, batch);
@@ -3355,9 +3390,48 @@ public sealed class DefaultMQPushConsumer
                 return true;
             }
 
-            AdvanceConsumeOffset(key, batch);
-            Interlocked.Add(ref _consumedCount, batch.Count);
-            return true;
+            // ---- AutoCommit=false（Java:270-300，binlog 消费场景：提交权在 listener 手里）----
+            if (status == ConsumeOrderlyStatus.Commit)
+            {
+                // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+                RecordConsumeRt(mq.Topic, obegin);
+                AdvanceConsumeOffset(key, batch);
+                Interlocked.Add(ref _consumedCount, batch.Count);
+                return true;
+            }
+
+            if (status == ConsumeOrderlyStatus.Rollback)
+            {
+                // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
+                RecordConsumeRt(mq.Topic, obegin);
+                RequeuePending(key, batch);
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
+                return false;
+            }
+
+            if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
+            {
+                RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: true);
+                if (CheckOrderlyReconsumeTimes(batch))
+                {
+                    RequeuePending(key, batch);
+                    _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
+                }
+
+                // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
+                // 位点前不前进由 binlog 消费方自己拿主意。
+                return false;
+            }
+
+            // Success + AutoCommit=false：Java:272-274 只记 OK TPS、不提交。有意偏差：Java 把
+            // 消息留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()，而四个端口都
+            // 没把 ProcessQueue 暴露给 listener（没有 commit 的口子），照抄「什么都不做」会让这
+            // 批消息被分发线程吞掉而位点又没动。这里等价地塞回队首并等一个挂起周期：位点同样不
+            // 前进、消息不丢，也不会把消费线程变成忙等（不 sleep 的话下一轮立刻又拿到同一批）。
+            RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: false);
+            RequeuePending(key, batch);
+            _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
+            return false;
         }
 
         // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
@@ -3406,7 +3480,8 @@ public sealed class DefaultMQPushConsumer
         int acked = ackIndex + 1;  // 0..batch.Count
         RecordConsumeStats(mq.Topic, batch.Count, beginMs,
             failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater, ackCount: acked);
-        FinishConsumeHook(hookCtx, true, hasException, beginMs, cstatus.ToString(),
+        FinishConsumeHook(hookCtx, true, hasException, beginMs,
+            ConsumeConcurrentlyStatusNames.Name(cstatus),
             failed: cstatus == ConsumeConcurrentlyStatus.ReconsumeLater,
             succeeded: cstatus == ConsumeConcurrentlyStatus.ConsumeSuccess);
 
@@ -3542,6 +3617,63 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>并发侧的 <c>-1</c> 读成 broker 默认的 16（与顺序侧那条不是一条链路）。</summary>
     public int MaxReconsumeTimesOrDefault() => _maxReconsumeTimes == -1 ? 16 : _maxReconsumeTimes;
+
+    /// <summary>
+    /// 本端口的待消费缓冲是 <c>_pending</c> 队列，批次在分发给 listener <b>之前</b>就被弹出队首
+    /// 了；而拉取游标在拉取那一刻已经推到 nextBeginOffset，所以「位点不前进」并不会让 broker 把
+    /// 这几条再发一遍 —— 想让它们原地重试就必须显式放回去（Java 那边消息始终留在 ProcessQueue
+    /// 里，不需要这一步）。等价 Java <c>makeMessageToConsumeAgain</c>/<c>rollback</c>。
+    /// </summary>
+    private void RequeuePending(string key, List<MessageExt> batch)
+    {
+        lock (_lock)
+        {
+            if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+            {
+                for (int i = batch.Count - 1; i >= 0; --i)
+                {
+                    PushFront(q, batch[i]);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 只记 RT（Java <c>ConsumeMessageOrderlyService:515</c> 的 incConsumeRT 在
+    /// processConsumeResult <b>之外</b>、恒记）：顺序消费在 AutoCommit=false 的
+    /// Success/Commit/Rollback 三个分支上一条 TPS 都不记，但 RT 照记。
+    /// </summary>
+    private void RecordConsumeRt(string topic, long beginMs)
+    {
+        if (_mqClient is null)
+        {
+            return;
+        }
+
+        _mqClient.ConsumerStats.IncConsumeRT(ConsumerGroup, topic,
+            UtilAll.CurrentTimeMillis() - beginMs);
+    }
+
+    /// <summary>
+    /// 顺序消费的挂起时长（Java <c>ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234</c>）：
+    /// context 上的值优先、-1 回落到消费者配置，再钳到 [10, 30000]。listener 传 0 时 Java 仍然
+    /// 等 10ms（否则返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
+    /// </summary>
+    public int OrderlySuspendMillis(ConsumeOrderlyContext ctx)
+    {
+        int ms = ctx.SuspendCurrentQueueTimeMillis;
+        if (ms == -1)
+        {
+            ms = _suspendCurrentQueueTimeMillis;
+        }
+
+        if (ms < 10)
+        {
+            return 10;
+        }
+
+        return ms > 30000 ? 30000 : ms;
+    }
 
     /// <summary>
     /// Java <c>ConsumeMessageOrderlyService#checkReconsumeTimes:322-339</c>。

@@ -765,8 +765,10 @@ void MQClientInstance::sendMessageAsync(const std::string& addr, RemotingCommand
             try {
                 onComplete(parseSendResponse(response, msg, mq), InvokeError());
             } catch (const MQBrokerException& e) {
-                onComplete(SendResult(),
-                           InvokeError(InvokeError::Kind::RESPONSE_FAILED, e.what()));
+                // 带上 broker 那个码：回调里要还原成 MQBrokerException(code, msg)，
+                // 调用方按码分流（Java 的 processSendResponse 抛的就是它）。
+                onComplete(SendResult(), InvokeError(InvokeError::Kind::RESPONSE_FAILED,
+                                                     e.what(), e.responseCode));
             } catch (const std::exception& e) {
                 onComplete(SendResult(),
                            InvokeError(InvokeError::Kind::RESPONSE_FAILED, e.what()));

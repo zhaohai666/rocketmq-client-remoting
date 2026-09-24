@@ -37,6 +37,7 @@
 
 #include "rocketmq/client/admin.h"
 #include "rocketmq/client/backpressure.h"
+#include "rocketmq/client/exception.h"
 #include "rocketmq/client/hook.h"
 #include "rocketmq/client/producer.h"
 #include "rocketmq/client/result.h"
@@ -96,11 +97,12 @@ public:
         if (r.sendStatus == SendStatus::SEND_OK) ++ok_;
     }
 
-    void onException(const std::string& e) override {
+    void onException(const std::exception_ptr& e) override {
         std::lock_guard<std::mutex> lk(m_);
         ++done_;
-        errors_.push_back(e);
-        if (firstError_.empty()) firstError_ = e;
+        errors_.push_back(exceptionMessage(e));
+        errorTypes_.push_back(exceptionTypeName(e));
+        if (firstError_.empty()) firstError_ = errors_.back();
     }
 
     size_t done() {
@@ -128,10 +130,25 @@ public:
         return true;
     }
 
+    // 同上，但查的是**异常类型**：背压闸拒绝在 Java 里是 RemotingTooMuchRequestException
+    // （唯一不重试的传输错误，也是调用方区分"被限流"与"真失败"的唯一信号）
+    bool allErrorsAre(const std::string& typeName, size_t expected) {
+        std::lock_guard<std::mutex> lk(m_);
+        if (errorTypes_.size() != expected || done_ != expected) return false;
+        for (const std::string& t : errorTypes_) {
+            if (t != typeName) return false;
+        }
+        return true;
+    }
+
     std::string summary() {
         std::lock_guard<std::mutex> lk(m_);
         return "ok=" + std::to_string(ok_) + " err=" + std::to_string(errors_.size())
-             + (firstError_.empty() ? "" : " " + firstError_);
+             + (firstError_.empty() ? ""
+                                    : " " + firstError_
+                                          + (errorTypes_.empty() ? "" : " ["
+                                                                           + errorTypes_.front()
+                                                                           + "]"));
     }
 
 private:
@@ -139,6 +156,7 @@ private:
     size_t done_ = 0;
     size_t ok_ = 0;
     std::vector<std::string> errors_;
+    std::vector<std::string> errorTypes_;
     std::string firstError_;
 };
 
@@ -290,6 +308,8 @@ void b2AndB3NumGate(Env& env, const std::string& t) {
     check("B2 超限的两笔回调 TooMuchRequest，文案与 Java 逐字一致",
           rejected->allErrorsContain("send message tryAcquire semaphoreAsyncNum timeout", 2),
           rejected->summary());
+    check("B2 被拒的异常类型是 RemotingTooMuchRequestException（Java 原类型，不是通用 MQClientException）",
+          rejected->allErrorsAre("RemotingTooMuchRequestException", 2), rejected->summary());
 
     for (std::thread& th : holders) th.join();
     check("B2 在途的 10 笔都发出去了",
@@ -362,6 +382,8 @@ void b4SizeGate(Env& env, const std::string& t) {
     check("B4 第二笔 600KB 过不了字节闸，文案与 Java 逐字一致",
           two->allErrorsContain("send message tryAcquire semaphoreAsyncSize timeout", 1),
           two->summary());
+    check("B4 字节闸拒绝的异常类型是 RemotingTooMuchRequestException（Java BackpressureSendCallBack 原类型）",
+          two->allErrorsAre("RemotingTooMuchRequestException", 1), two->summary());
     // 字节闸没过时，先前拿到的条数许可必须原样还回去（Java BackpressureSendCallBack:599-610
     // 的先 size 后 num 归还）
     check("B4 字节闸没过时条数许可已经归还",

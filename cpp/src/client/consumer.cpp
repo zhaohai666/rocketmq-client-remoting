@@ -1872,9 +1872,24 @@ ConsumeMessageDirectlyResult DefaultMQPushConsumer::consumeMessageDirectly(
         auto* orderly = static_cast<MessageListenerOrderly*>(messageListener_.get());
         ConsumeOrderlyContext ctx(mq);
         try {
+            // Java 顺序 consumeMessageDirectly:103-161 —— 映射比并发侧多两个成员
+            //（COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK，broker 按它们区分 binlog 口径），
+            // 且 autoCommit 取 listener 跑完**之后**的上下文值。
             const ConsumeOrderlyStatus status = orderly->consumeMessage(msgs, ctx);
-            result.consumeResult = (status == ConsumeOrderlyStatus::SUCCESS)
-                ? "CR_SUCCESS" : "CR_LATER";
+            switch (status) {
+                case ConsumeOrderlyStatus::COMMIT:
+                    result.consumeResult = "CR_COMMIT";
+                    break;
+                case ConsumeOrderlyStatus::ROLLBACK:
+                    result.consumeResult = "CR_ROLLBACK";
+                    break;
+                case ConsumeOrderlyStatus::SUCCESS:
+                    result.consumeResult = "CR_SUCCESS";
+                    break;
+                case ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                    result.consumeResult = "CR_LATER";
+                    break;
+            }
         } catch (const std::exception& e) {
             result.consumeResult = "CR_THROW_EXCEPTION";
             result.remark = std::string("std::exception: ") + e.what();
@@ -1882,6 +1897,10 @@ ConsumeMessageDirectlyResult DefaultMQPushConsumer::consumeMessageDirectly(
             result.consumeResult = "CR_THROW_EXCEPTION";
             result.remark = "unknown exception";
         }
+        // Java:156 —— 读的是 listener 跑完之后的上下文值（异常路径同样读）。listener 里置
+        // false 的 binlog 用法靠这条回传让 broker 知道「这条直接消费没提交」；提前读初值
+        // 等于把它吞掉，真机上只表现为 mqadmin 返回的 autoCommit 恒为 true。
+        result.autoCommit = ctx.autoCommit;
     } else {
         auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
         ConsumeConcurrentlyContext ctx(mq);
@@ -1951,34 +1970,87 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             status = ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
             hookHasException = true;
         }
-        // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
-        recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs,
-                           status != ConsumeOrderlyStatus::SUCCESS);
-        if (useHook) {
-            const bool ok = (status == ConsumeOrderlyStatus::SUCCESS);
-            finishConsumeHook(&hookCtx, hookHasException, hookBeginMs, !ok, ok,
-                              ok ? "SUCCESS" : "SUSPEND_CURRENT_QUEUE_A_MOMENT");
+        if (status == ConsumeOrderlyStatus::ROLLBACK ||
+            status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
+            // Java:476-482 —— 返回「不是 OK」时打一条 warn（含抛异常归一化来的挂起）。
+            // 这条日志是顺序消费 head-of-line blocking 的唯一线索，缺了就只能看见"这个组不动了"。
+            logger_warn("consumeMessage Orderly return not OK, Group: " + consumerGroup_
+                        + " Msgs: " + std::to_string(restored.size()) + " MQ: " + key);
         }
-        if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT &&
-            checkOrderlyReconsumeTimes(restored)) {
-            // Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
-            // 只有「还在重试次数内 / 回投失败」才把这一批塞回队首原地重试；已经交给
-            // broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列
-            //（顺序消费的 head-of-line blocking 在真机上就是"这个组停在第 N 条不动"）。
-            std::lock_guard<std::mutex> lk(lock_);
-            auto it = pending_.find(key);
-            if (it != pending_.end()) {
-                for (auto rit = restored.rbegin(); rit != restored.rend(); ++rit) {
-                    it->second.push_front(*rit);
-                }
+        // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:502-511）：
+        // status 是归一化后的枚举名，success 判据是 SUCCESS||COMMIT，而 returnType
+        //（props 里的 CONSUME_CONTEXT_TYPE）按归一化前的 status 算。
+        if (useHook) {
+            const bool ok = (status == ConsumeOrderlyStatus::SUCCESS ||
+                             status == ConsumeOrderlyStatus::COMMIT);
+            finishConsumeHook(&hookCtx, hookHasException, hookBeginMs,
+                              status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT,
+                              ok, consumeOrderlyStatusName(status));
+        }
+        if (ctx.autoCommit) {
+            // ---- Java processConsumeResult:244-269 ----
+            if (status == ConsumeOrderlyStatus::COMMIT ||
+                status == ConsumeOrderlyStatus::ROLLBACK) {
+                // Java:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是**非法**用法（只给
+                // binlog 消费用）：Java 只 warn、**不写 break**，顺势落进 SUCCESS 分支，
+                // 消息照 ack、不当回滚。
+                logger_warn("the message queue consume result is illegal, we think you want to "
+                            "ack these message " + key);
+                status = ConsumeOrderlyStatus::SUCCESS;
             }
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(suspendCurrentQueueTimeMillis_));
+            if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
+                recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, true);
+                // Java:256-266 —— 挂起之前要先过 checkReconsumeTimes：只有「还在重试次数内 /
+                // 回投失败」才把这一批塞回队首原地重试；已经交给 broker 的（回投成功）要前进
+                // 位点，否则一条毒消息永久占住这条队列（head-of-line blocking 在真机上就是
+                // "这个组停在第 N 条不动"）。
+                if (checkOrderlyReconsumeTimes(restored)) {
+                    requeuePending(key, restored);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(orderlySuspendMillis(ctx)));
+                    return false;
+                }
+            } else {
+                recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, false);
+            }
+            advanceConsumeOffset(key, restored);
+            consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
+            return true;
+        }
+        // ---- autoCommit=false（Java:270-300，binlog 消费场景：提交权在 listener 手里）----
+        if (status == ConsumeOrderlyStatus::COMMIT) {
+            // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+            recordConsumeRt(mq.topic, hookBeginMs);
+            advanceConsumeOffset(key, restored);
+            consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
+            return true;
+        }
+        if (status == ConsumeOrderlyStatus::ROLLBACK) {
+            // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
+            recordConsumeRt(mq.topic, hookBeginMs);
+            requeuePending(key, restored);
+            std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
             return false;
         }
-        advanceConsumeOffset(key, restored);
-        consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
-        return true;
+        if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
+            recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, true);
+            if (checkOrderlyReconsumeTimes(restored)) {
+                requeuePending(key, restored);
+                std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
+            }
+            // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
+            // 位点前不前进由 binlog 消费方自己拿主意。
+            return false;
+        }
+        // SUCCESS + autoCommit=false：Java:272-274 只记 OK TPS、不提交。有意偏差：Java 把消息
+        // 留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()，而四个端口都没把
+        // ProcessQueue 暴露给 listener（没有 commit 的口子），照抄「什么都不做」会让这批消息
+        // 被分发线程吞掉而位点又没动。这里等价地塞回队首并等一个挂起周期：位点同样不前进、
+        // 消息不丢，也不会把消费线程变成忙等（不 sleep 的话下一轮立刻又拿到同一批）。
+        recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, false);
+        requeuePending(key, restored);
+        std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
+        return false;
     }
     // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
     const bool useHook = hasConsumeMessageHook();
@@ -2674,6 +2746,29 @@ bool DefaultMQPushConsumer::orderlySendMessageBack(const MessageExt& msg) {
                      ": " + e.what());
         return false;
     }
+}
+
+void DefaultMQPushConsumer::requeuePending(const std::string& key, const std::vector<MessageExt>& msgs) {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = pending_.find(key);
+    if (it == pending_.end()) return;
+    for (auto rit = msgs.rbegin(); rit != msgs.rend(); ++rit) {
+        it->second.push_front(*rit);
+    }
+}
+
+void DefaultMQPushConsumer::recordConsumeRt(const std::string& topic, int64_t beginMs) {
+    if (!mqClient_) return;
+    mqClient_->consumerStats().incConsumeRT(consumerGroup_, topic,
+                                            UtilAll::currentTimeMillis() - beginMs);
+}
+
+int32_t DefaultMQPushConsumer::orderlySuspendMillis(const ConsumeOrderlyContext& ctx) const {
+    int32_t ms = ctx.suspendCurrentQueueTimeMillis;
+    if (ms == -1) ms = suspendCurrentQueueTimeMillis_;
+    if (ms < 10) return 10;
+    if (ms > 30000) return 30000;
+    return ms;
 }
 
 bool DefaultMQPushConsumer::checkOrderlyReconsumeTimes(std::vector<MessageExt>& msgs) {

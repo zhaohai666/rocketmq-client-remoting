@@ -406,6 +406,16 @@ public:
     // 返回「这一批是否还要原地挂起重试」；true=挂起，false=已交给 broker，位点可以前进。
     bool checkOrderlyReconsumeTimes(std::vector<MessageExt>& msgs);
     int32_t orderlyMaxReconsumeTimes() const;
+    // 本端口的待消费缓冲是 pending_ 双端队列，批次在分发给 listener **之前**就被弹出队首了；
+    // 而拉取游标在拉取那一刻已经推到 nextBeginOffset，所以「位点不前进」并不会让 broker 把
+    // 这几条再发一遍 —— 想让它们原地重试就必须显式放回去（Java 那边消息始终留在 ProcessQueue
+    // 里，不需要这一步）。等价 Java makeMessageToConsumeAgain/rollback。
+    void requeuePending(const std::string& key, const std::vector<MessageExt>& msgs);
+    // 顺序消费的挂起时长（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234）：
+    // context 上的值优先、-1 回落到消费者配置，再钳到 [10, 30000]。listener 传 0 时 Java 仍然
+    // 等 10ms（否则返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
+    // 与上面两个一样「错了很安静」，所以开放给单测（真机上只表现为消费节奏不对）。
+    int32_t orderlySuspendMillis(const ConsumeOrderlyContext& ctx) const;
     // 并发侧的 -1 口径（Java DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890 的 16）。
     // 与上面那个必须**并排**可见：两处 Java 各自调各自的 getMaxReconsumeTimes，
     // 合成一个常量就等于要么给顺序消费造死信、要么让并发消息无限重投。
@@ -555,6 +565,10 @@ private:
     // 部分 ack 的尾巴既记 FAILED 又会被重投）；POP 与顺序消费传 nullopt = 整批同一状态。
     void recordConsumeStats(const std::string& topic, int64_t msgCount, int64_t beginMs,
                             bool failed, const std::optional<int64_t>& ackCount = std::nullopt);
+    // 只记 RT（Java ConsumeMessageOrderlyService:515 的 incConsumeRT 在 processConsumeResult
+    // **之外**、恒记）：顺序消费在 autoCommit=false 的 SUCCESS/COMMIT/ROLLBACK 三个分支上
+    // 一条 TPS 都不记，但 RT 照记。
+    void recordConsumeRt(const std::string& topic, int64_t beginMs);
     // start() 里按 enableMsgTrace 建分发器并注册 ConsumeMessageTraceHook
     void startTraceDispatcher();
 

@@ -89,12 +89,13 @@ public class ProducerAsyncTests : IDisposable
         return cond();
     }
 
-    /// <summary>记录每一笔终态回调（次数、结果/异常文本、跑在哪根线程上）。</summary>
+    /// <summary>记录每一笔终态回调（次数、结果/**异常对象**、跑在哪根线程上）。异常按对象存，
+    /// 因为 Java 的 onException 收的就是 Throwable —— 类型本身是失败分类，别退回成字符串。</summary>
     private sealed class Recorder : ISendCallback
     {
         private readonly object _gate = new();
         private readonly List<SendResult?> _results = new();
-        private readonly List<string> _errors = new();
+        private readonly List<Exception> _errors = new();
         private readonly List<int> _threads = new();
         private readonly List<string> _threadNames = new();
 
@@ -123,7 +124,15 @@ public class ProducerAsyncTests : IDisposable
         {
             lock (_gate)
             {
-                return new List<string>(_errors);
+                return _errors.Select(e => e.Message).ToList();
+            }
+        }
+
+        public List<Exception> Exceptions()
+        {
+            lock (_gate)
+            {
+                return new List<Exception>(_errors);
             }
         }
 
@@ -147,7 +156,7 @@ public class ProducerAsyncTests : IDisposable
             }
         }
 
-        public void OnException(string error)
+        public void OnException(Exception error)
         {
             lock (_gate)
             {
@@ -446,7 +455,7 @@ public class ProducerAsyncTests : IDisposable
             throw new InvalidOperationException("callback body blew up");
         }
 
-        public void OnException(string error)
+        public void OnException(Exception error)
         {
             Interlocked.Increment(ref Calls);
             throw new InvalidOperationException("callback body blew up");
@@ -687,8 +696,8 @@ public class ProducerAsyncTests : IDisposable
     /// 10004 那条判定（Java 的 ASYNC 走的正是 sendDefaultImpl:888 的 validateNameServerSetting）。
     /// 以前异步侧把异常重新包成 MQClientException 时会把码改写成 10005。
     ///
-    /// 只能按文案断言：ISendCallback.OnException 收的是 string（Java 收 Throwable），
-    /// 码在跨过这条接口边界时就丢了 —— 那是 #78 的事，不属于本用例。
+    /// onException 现在收的是**异常对象**（Java 的 Throwable），所以这里直接按码断言，
+    /// 不再只能靠文案反推。
     /// </summary>
     [Fact]
     public void NoNameServerAddress_Reports10004ThroughTheCallback()
@@ -702,6 +711,8 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(cb.WaitDone(1, 3000));
         Assert.Equal("No name server address, please set it.", cb.Errors()[0]);
         Assert.Equal(0, cluster.Requests(0));
+        Assert.Equal(ClientErrorCode.NoNameServerException,
+            ((MQClientException)cb.Exceptions()[0]).ResponseCode);
         producer.Shutdown();
     }
 

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "rocketmq/client/consumer.h"
+#include "rocketmq/client/exception.h"
 #include "rocketmq/client/producer.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/logging.h"
@@ -111,10 +112,10 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         results_.push_back(r);
     }
-    void onException(const std::string& e) override {
+    void onException(const std::exception_ptr& e) override {
         ++err_;
         std::lock_guard<std::mutex> lk(m_);
-        errors_.push_back(e);
+        errors_.push_back(exceptionMessage(e) + " [" + exceptionTypeName(e) + "]");
     }
 
     int ok() const { return ok_.load(); }

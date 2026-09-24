@@ -3,8 +3,11 @@
 #define ROCKETMQ_CLIENT_EXCEPTION_H
 
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <string>
+
+#include "rocketmq/remoting/exception.h"
 
 namespace rocketmq {
 
@@ -65,6 +68,57 @@ struct MQClientNoRouteException : public MQClientException {
     explicit MQClientNoRouteException(const std::string& topic)
         : MQClientException("No route info of this topic: " + topic) {}
 };
+
+// 回调里拿到的 exception_ptr → 文案（对应 Java 的 e.getMessage()）。
+// 空指针（没有具体异常）返回空串；非 std::exception 给个兜底文案。
+inline std::string exceptionMessage(const std::exception_ptr& e) {
+    if (e == nullptr) {
+        return "";
+    }
+    try {
+        std::rethrow_exception(e);
+    } catch (const std::exception& ex) {
+        return ex.what();
+    } catch (...) {
+        return "unknown exception";
+    }
+}
+
+// exception_ptr → 类型名（对应 Java 的 e.getClass().getSimpleName()）。typeid(...).name()
+// 在各平台是修饰名（Itanium ABI / MSVC 都不一样），跨语言对账时读不了，所以按本端口的
+// 异常层级显式映射 —— 断言"回调收到的是哪一类失败"时用它，别再对着文案做正则。
+inline std::string exceptionTypeName(const std::exception_ptr& e) {
+    if (e == nullptr) {
+        return "";
+    }
+    try {
+        std::rethrow_exception(e);
+    } catch (const MQBrokerException&) {
+        return "MQBrokerException";
+    } catch (const RequestTimeoutException&) {
+        return "RequestTimeoutException";
+    } catch (const MQClientNoRouteException&) {
+        return "MQClientNoRouteException";
+    } catch (const MQClientException&) {
+        return "MQClientException";
+    } catch (const RemotingTooMuchRequestException&) {
+        return "RemotingTooMuchRequestException";
+    } catch (const RemotingConnectException&) {
+        return "RemotingConnectException";
+    } catch (const RemotingSendRequestException&) {
+        return "RemotingSendRequestException";
+    } catch (const RemotingTimeoutException&) {
+        return "RemotingTimeoutException";
+    } catch (const RemotingCommandException&) {
+        return "RemotingCommandException";
+    } catch (const RemotingException&) {
+        return "RemotingException";
+    } catch (const std::exception&) {
+        return "std::exception";
+    } catch (...) {
+        return "unknown";
+    }
+}
 
 }  // namespace rocketmq
 

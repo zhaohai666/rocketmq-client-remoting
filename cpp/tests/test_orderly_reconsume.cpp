@@ -25,7 +25,9 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rocketmq/client/consumer.h"
@@ -77,13 +79,29 @@ class OrderlyListener : public MessageListenerOrderly {
 public:
     explicit OrderlyListener(ConsumeOrderlyStatus status) : status_(status) {}
 
+    // 模拟 binlog 消费方：listener 置 autoCommit=false 拿走提交权（Java 手动提交用法）。
+    OrderlyListener& manualCommit(bool autoCommit) {
+        autoCommit_ = autoCommit;
+        return *this;
+    }
+
+    // 在 context 上指定挂起时长（-1 = 没指定，回落到消费者配置）。
+    OrderlyListener& asking(int32_t ms) {
+        suspendMs_ = ms;
+        return *this;
+    }
+
     ConsumeOrderlyStatus consumeMessage(const std::vector<MessageExt>&,
-                                        ConsumeOrderlyContext&) override {
+                                        ConsumeOrderlyContext& ctx) override {
+        if (autoCommit_.has_value()) ctx.autoCommit = *autoCommit_;
+        if (suspendMs_.has_value()) ctx.suspendCurrentQueueTimeMillis = *suspendMs_;
         return status_;
     }
 
 private:
     ConsumeOrderlyStatus status_;
+    std::optional<bool> autoCommit_;
+    std::optional<int32_t> suspendMs_;
 };
 
 // 不碰网络的顺序消费者：位点与待发缓冲手动搭好。
@@ -99,6 +117,13 @@ public:
     bool run(const std::vector<MessageExt>& batch,
              ConsumeOrderlyStatus status = ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
         consumer_.setMessageListener(std::make_shared<OrderlyListener>(status));
+        return consumer_.consumeBatch(key_, queue0(), batch);
+    }
+
+    /// 用指定 listener（可带 autoCommit / 挂起时长设定）跑一批。
+    bool runWith(const std::vector<MessageExt>& batch,
+                 const std::shared_ptr<MessageListenerOrderly>& listener) {
+        consumer_.setMessageListener(listener);
         return consumer_.consumeBatch(key_, queue0(), batch);
     }
 
@@ -234,6 +259,140 @@ void testSuccessPathSkipsTheReconsumeGate() {
     expect(h.pending().empty(), "wire.success.noRequeue", h.pendingShape());
 }
 
+// ------------------------------------------------ 挂起时长（context 优先 + 钳位）
+
+void testOrderlySuspendMillisResolvesThenClamps() {
+    // Java submitConsumeRequestLater:211-234 —— context（默认 -1 = 没指定）优先，-1 回落
+    // 消费者配置，结果钳到 [10, 30000]。三个坏法都是静默的：不回落到配置等于吞掉用户的
+    // 配置；不钳下限则 listener 传 0 会把消费线程变成忙等；不钳上限则一次挂起能顶到天亮。
+    Harness h(0);
+    h.c().setSuspendCurrentQueueTimeMillis(900);
+    ConsumeOrderlyContext ctx;
+    const auto resolve = [&](int32_t asked) {
+        ctx.suspendCurrentQueueTimeMillis = asked;
+        return h.c().orderlySuspendMillis(ctx);
+    };
+    expect(resolve(-1) == 900, "suspend.minusOneFallsBackToConfig",
+           std::to_string(resolve(-1)));
+    expect(resolve(70) == 70, "suspend.contextWins", std::to_string(resolve(70)));
+    expect(resolve(0) == 10, "suspend.zeroClampsTo10", std::to_string(resolve(0)));
+    expect(resolve(9) == 10, "suspend.belowFloor", std::to_string(resolve(9)));
+    expect(resolve(10) == 10, "suspend.atFloor", std::to_string(resolve(10)));
+    expect(resolve(30000) == 30000, "suspend.atCeiling", std::to_string(resolve(30000)));
+    expect(resolve(30001) == 30000, "suspend.aboveCeiling", std::to_string(resolve(30001)));
+    expect(resolve(std::numeric_limits<int32_t>::max()) == 30000, "suspend.intMaxClamped",
+           std::to_string(resolve(std::numeric_limits<int32_t>::max())));
+    // 配置侧 -1 同样回落：Java 这时读到的还是 -1，落到钳位下限 10ms
+    h.c().setSuspendCurrentQueueTimeMillis(-1);
+    ctx.suspendCurrentQueueTimeMillis = -1;
+    expect(h.c().orderlySuspendMillis(ctx) == 10, "suspend.bothMinusOneHitsFloor",
+           std::to_string(h.c().orderlySuspendMillis(ctx)));
+}
+
+// ------------------------------------------------ autoCommit=true 的非法状态
+
+void testIllegalCommitAndRollbackUnderAutoCommitAreAcked() {
+    // Java processConsumeResult:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是**非法**
+    // 用法（只给 binlog 消费用）：Java 只 warn、**不写 break**，顺势落进 SUCCESS 分支。
+    // 写错方向（当回滚处理）会让普通消费者被一个手滑的返回值永久卡住队列。
+    for (ConsumeOrderlyStatus status :
+         {ConsumeOrderlyStatus::COMMIT, ConsumeOrderlyStatus::ROLLBACK}) {
+        Harness h(0);
+        std::vector<MessageExt> batch{ext(0, 0), ext(1, 0)};
+        h.c().setPendingMessages(DefaultMQPushConsumer::offsetKey(queue0()),
+                                 {ext(2, 0)});
+        expect(h.run(batch, status), "illegal.advanced");
+        expect(h.offset().has_value() && *h.offset() == 2, "illegal.offset",
+               h.offset() ? std::to_string(*h.offset()) : "none");
+        expect(h.pendingShape() == "[2:0]", "illegal.noRequeue", h.pendingShape());
+    }
+}
+
+// ------------------------------------------------ autoCommit=false（手动提交）
+
+void testManualCommitAdvancesWithoutRequeueing() {
+    // Java:275-277 —— 显式提交：位点前进、不回投（**不记 TPS**，但 RT 在分支外照记）。
+    Harness h(0);
+    auto listener = std::make_shared<OrderlyListener>(ConsumeOrderlyStatus::COMMIT);
+    listener->manualCommit(false);
+    std::vector<MessageExt> batch{ext(0, 0), ext(1, 0)};
+    expect(h.runWith(batch, listener), "manual.commit.advanced");
+    expect(h.offset().has_value() && *h.offset() == 2, "manual.commit.offset",
+           h.offset() ? std::to_string(*h.offset()) : "none");
+    expect(h.pending().empty(), "manual.commit.noRequeue", h.pendingShape());
+}
+
+void testManualRollbackRequeuesAndHoldsTheOffset() {
+    // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试，位点不动。
+    Harness h(0);
+    auto listener = std::make_shared<OrderlyListener>(ConsumeOrderlyStatus::ROLLBACK);
+    listener->manualCommit(false);
+    std::vector<MessageExt> batch{ext(0, 0), ext(1, 0)};
+    h.c().setPendingMessages(DefaultMQPushConsumer::offsetKey(queue0()), {ext(2, 0)});
+    expect(!h.runWith(batch, listener), "manual.rollback.notAdvanced");
+    expect(!h.offset().has_value(), "manual.rollback.offsetFrozen",
+           h.offset() ? std::to_string(*h.offset()) : "none");
+    expect(h.pendingShape() == "[0:0,1:0,2:0]", "manual.rollback.requeued", h.pendingShape());
+}
+
+void testManualSuccessHoldsTheBatchWithoutCommitting() {
+    // Java:272-274 —— autoCommit=false 的 SUCCESS 只记 OK TPS、**不提交**。本端口的等价
+    // 处理是把批次塞回队首（没有 ProcessQueue 可留给 listener），位点必须原地不动。
+    Harness h(0);
+    auto listener = std::make_shared<OrderlyListener>(ConsumeOrderlyStatus::SUCCESS);
+    listener->manualCommit(false);
+    std::vector<MessageExt> batch{ext(0, 0)};
+    expect(!h.runWith(batch, listener), "manual.success.notAdvanced");
+    expect(!h.offset().has_value(), "manual.success.offsetFrozen",
+           h.offset() ? std::to_string(*h.offset()) : "none");
+    expect(h.pendingShape() == "[0:0]", "manual.success.held", h.pendingShape());
+}
+
+void testManualSuspendNeverCommitsTheOffset() {
+    // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
+    // 位点前不前进由 binlog 消费方自己拿主意（写错成"照常提交"会静默丢消息）。
+    Harness h(0);
+    auto listener = std::make_shared<OrderlyListener>(
+        ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT);
+    listener->manualCommit(false);
+    std::vector<MessageExt> batch{ext(0, 0)};
+    expect(!h.runWith(batch, listener), "manual.suspend.notAdvanced");
+    expect(!h.offset().has_value(), "manual.suspend.offsetFrozen",
+           h.offset() ? std::to_string(*h.offset()) : "none");
+    expect(h.pendingShape() == "[0:1]", "manual.suspend.requeuedAndCounted", h.pendingShape());
+}
+
+// ------------------------------------------------ 309 CONSUME_MESSAGE_DIRECTLY 的映射
+
+void testDirectConsumeOrderlyMapping() {
+    // Java 顺序 consumeMessageDirectly:103-161 —— 比并发侧多 CR_COMMIT/CR_ROLLBACK 两档，
+    // 且 order=true、autoCommit 取 listener 跑完之后的值（broker 按它决定这条直接消费算不算
+    // 已提交）。映射写错是静默的：真机上只表现为 mqadmin 的返回少一档语义。
+    const std::pair<ConsumeOrderlyStatus, const char*> cases[] = {
+        {ConsumeOrderlyStatus::SUCCESS, "CR_SUCCESS"},
+        {ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT, "CR_LATER"},
+        {ConsumeOrderlyStatus::COMMIT, "CR_COMMIT"},
+        {ConsumeOrderlyStatus::ROLLBACK, "CR_ROLLBACK"},
+    };
+    for (const auto& c : cases) {
+        DefaultMQPushConsumer consumer(kGroup);
+        auto listener = std::make_shared<OrderlyListener>(c.first);
+        listener->manualCommit(false);
+        consumer.setMessageListener(listener);
+        ConsumeMessageDirectlyResult r = consumer.consumeMessageDirectly(ext(0), kBroker);
+        expect(r.consumeResult == c.second, std::string("direct.orderly.") + c.second,
+               r.consumeResult);
+        expect(r.order, "direct.orderly.orderTrue");
+        expect(!r.autoCommit, "direct.orderly.autoCommitFromContext");
+    }
+}
+
+void testDirectConsumeWithoutListenerIsReturnNull() {
+    DefaultMQPushConsumer consumer(kGroup);
+    ConsumeMessageDirectlyResult r = consumer.consumeMessageDirectly(ext(0), kBroker);
+    expect(r.consumeResult == "CR_RETURN_NULL", "direct.noListener.returnNull", r.consumeResult);
+}
+
 // ------------------------------------------------ 抬进请求头（sendKernelImpl:1004-1018）
 
 // 只用建头那一段：建请求不碰网络，抬字段的判据全在这一步的产物里。
@@ -304,6 +463,14 @@ int main() {
     testRetryMessageFields();
     testSuspendRequeuesBatchWhileBelowCap();
     testSuccessPathSkipsTheReconsumeGate();
+    testOrderlySuspendMillisResolvesThenClamps();
+    testIllegalCommitAndRollbackUnderAutoCommitAreAcked();
+    testManualCommitAdvancesWithoutRequeueing();
+    testManualRollbackRequeuesAndHoldsTheOffset();
+    testManualSuccessHoldsTheBatchWithoutCommitting();
+    testManualSuspendNeverCommitsTheOffset();
+    testDirectConsumeOrderlyMapping();
+    testDirectConsumeWithoutListenerIsReturnNull();
     testRetryTopicPropertiesAreLiftedIntoTheHeader();
     testOrdinaryTopicSendIsNotLifted();
     std::printf("orderly reconsume: %d checks, %d failures\n", checks, fails);

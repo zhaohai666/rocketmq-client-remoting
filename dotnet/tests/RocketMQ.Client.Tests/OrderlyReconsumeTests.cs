@@ -49,13 +49,42 @@ public class OrderlyReconsumeTests
     private sealed class OrderlyListener : IMessageListenerOrderly
     {
         private readonly ConsumeOrderlyStatus _status;
+        private bool? _autoCommit;
+        private int? _suspendMs;
 
         public OrderlyListener(ConsumeOrderlyStatus status) => _status = status;
+
+        /// <summary>模拟 binlog 消费方：listener 置 AutoCommit=false 拿走提交权。</summary>
+        public OrderlyListener ManualCommit(bool autoCommit)
+        {
+            _autoCommit = autoCommit;
+            return this;
+        }
+
+        /// <summary>在 context 上指定挂起时长（-1 = 没指定，回落到消费者配置）。</summary>
+        public OrderlyListener Asking(int ms)
+        {
+            _suspendMs = ms;
+            return this;
+        }
 
         public bool Orderly() => true;
 
         public ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs,
-                                                   ConsumeOrderlyContext context) => _status;
+                                                   ConsumeOrderlyContext context)
+        {
+            if (_autoCommit.HasValue)
+            {
+                context.AutoCommit = _autoCommit.Value;
+            }
+
+            if (_suspendMs.HasValue)
+            {
+                context.SuspendCurrentQueueTimeMillis = _suspendMs.Value;
+            }
+
+            return _status;
+        }
     }
 
     /// <summary>
@@ -83,6 +112,21 @@ public class OrderlyReconsumeTests
 
         public bool Run(List<MessageExt> batch)
             => _consumer.ConsumeBatchForTest(_key, Queue0(), batch);
+
+        /// <summary>用指定 listener（可带 AutoCommit / 挂起时长设定）跑一批。</summary>
+        public bool RunWith(IMessageListenerOrderly listener, List<MessageExt> batch,
+                            List<MessageExt>? pending = null)
+        {
+            if (pending is not null)
+            {
+                _consumer.SetPendingForTest(_key, pending);
+            }
+
+            _consumer.SetMessageListener(listener);
+            return _consumer.ConsumeBatchForTest(_key, Queue0(), batch);
+        }
+
+        public DefaultMQPushConsumer Consumer() => _consumer;
 
         public List<(long Offset, int Times)> Pending()
             => _consumer.PendingForTest(_key).Select(m => (m.QueueOffset, m.ReconsumeTimes)).ToList();
@@ -200,6 +244,142 @@ public class OrderlyReconsumeTests
         Assert.True(c.ConsumeBatchForTest(key, Queue0(), OffsetBatch(0, new[] { 0 })));
         Assert.Equal(1, c.ConsumeOffsetForTest(key));
         Assert.Empty(c.PendingForTest(key));
+    }
+
+    // ---------------- 挂起时长（context 优先 + 钳位） ----------------
+
+    /// <summary>
+    /// Java <c>submitConsumeRequestLater:211-234</c> —— context（默认 -1 = 没指定）优先，
+    /// -1 回落消费者配置，结果钳到 [10, 30000]。三个坏法都是静默的：不回落到配置等于吞掉
+    /// 用户的配置；不钳下限则 listener 传 0 会把消费线程变成忙等；不钳上限则一次挂起能顶到
+    /// 天亮。
+    /// </summary>
+    [Fact]
+    public void OrderlySuspendMillisResolvesThenClampsLikeJava()
+    {
+        var h = new Harness(0);
+        h.Consumer().SuspendCurrentQueueTimeMillis = 900;
+        var ctx = new ConsumeOrderlyContext();
+        int Resolve(int asked)
+        {
+            ctx.SuspendCurrentQueueTimeMillis = asked;
+            return h.Consumer().OrderlySuspendMillis(ctx);
+        }
+
+        Assert.Equal(900, Resolve(-1));       // 没指定 → 回落配置
+        Assert.Equal(70, Resolve(70));        // context 优先
+        Assert.Equal(10, Resolve(0));         // 钳下限
+        Assert.Equal(10, Resolve(9));
+        Assert.Equal(10, Resolve(10));
+        Assert.Equal(30000, Resolve(30000));
+        Assert.Equal(30000, Resolve(30001));  // 钳上限
+        Assert.Equal(30000, Resolve(int.MaxValue));
+
+        // 配置侧也是 -1：Java 这时读到的还是 -1，落到钳位下限 10ms
+        h.Consumer().SuspendCurrentQueueTimeMillis = -1;
+        Assert.Equal(10, Resolve(-1));
+    }
+
+    // ---------------- AutoCommit=true 下的非法状态 ----------------
+
+    /// <summary>
+    /// Java <c>processConsumeResult:246-250</c> —— AutoCommit=true 时 Commit/Rollback 是
+    /// <b>非法</b>用法（只给 binlog 消费用）：Java 只 warn、<b>不写 break</b>，顺势落进
+    /// Success 分支。写错方向（当回滚处理）会让普通消费者被一个手滑的返回值永久卡住队列。
+    /// </summary>
+    [Theory]
+    [InlineData(ConsumeOrderlyStatus.Commit)]
+    [InlineData(ConsumeOrderlyStatus.Rollback)]
+    public void IllegalCommitAndRollbackUnderAutoCommitAreAcked(ConsumeOrderlyStatus status)
+    {
+        var h = new Harness(0, OffsetBatch(2, new[] { 0 }));
+        Assert.True(h.RunWith(new OrderlyListener(status), OffsetBatch(0, new[] { 0, 0 })));
+        Assert.Equal(2, h.Offset());
+        Assert.Single(h.Pending());  // 队尾那条还在，本批没回投
+    }
+
+    // ---------------- AutoCommit=false（手动提交） ----------------
+
+    /// <summary>Java <c>:275-277</c> —— 显式提交：位点前进、不回投（<b>不记 TPS</b>，RT 照记）。</summary>
+    [Fact]
+    public void ManualCommitAdvancesWithoutRequeueing()
+    {
+        var h = new Harness(0);
+        var listener = new OrderlyListener(ConsumeOrderlyStatus.Commit).ManualCommit(false);
+        Assert.True(h.RunWith(listener, OffsetBatch(0, new[] { 0, 0 })));
+        Assert.Equal(2, h.Offset());
+        Assert.Empty(h.Pending());
+    }
+
+    /// <summary>Java <c>:278-285</c> —— rollback() 把消息退回 ProcessQueue 并延后重试，位点不动。</summary>
+    [Fact]
+    public void ManualRollbackRequeuesAndHoldsTheOffset()
+    {
+        var h = new Harness(0);
+        var listener = new OrderlyListener(ConsumeOrderlyStatus.Rollback).ManualCommit(false);
+        Assert.False(h.RunWith(listener, OffsetBatch(0, new[] { 0, 0 }),
+            pending: OffsetBatch(2, new[] { 0 })));
+        Assert.Null(h.Offset());
+        Assert.Equal(new[] { (0L, 0), (1L, 0), (2L, 0) }, h.Pending().ToArray());
+    }
+
+    /// <summary>
+    /// Java <c>:272-274</c> —— AutoCommit=false 的 Success 只记 OK TPS、<b>不提交</b>。本端口的
+    /// 等价处理是把批次塞回队首（没有 ProcessQueue 可留给 listener），位点必须原地不动。
+    /// </summary>
+    [Fact]
+    public void ManualSuccessHoldsTheBatchWithoutCommitting()
+    {
+        var h = new Harness(0);
+        var listener = new OrderlyListener(ConsumeOrderlyStatus.Success).ManualCommit(false);
+        Assert.False(h.RunWith(listener, OffsetBatch(0, new[] { 0 })));
+        Assert.Null(h.Offset());
+        Assert.Equal(new[] { (0L, 0) }, h.Pending().ToArray());
+    }
+
+    /// <summary>
+    /// Java <c>:288-296</c> —— 与自动提交分支的差别：毒消息交给 broker 之后<b>不 commit</b>，
+    /// 位点前不前进由 binlog 消费方自己拿主意（写错成「照常提交」会静默丢消息）。
+    /// </summary>
+    [Fact]
+    public void ManualSuspendNeverCommitsTheOffset()
+    {
+        var h = new Harness(0);
+        var listener = new OrderlyListener(ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
+            .ManualCommit(false);
+        Assert.False(h.RunWith(listener, OffsetBatch(0, new[] { 0 })));
+        Assert.Null(h.Offset());
+        Assert.Equal(new[] { (0L, 1) }, h.Pending().ToArray());  // 本地 +1 后塞回
+    }
+
+    // ---------------- 309 CONSUME_MESSAGE_DIRECTLY 的映射 ----------------
+
+    /// <summary>
+    /// Java 顺序 <c>consumeMessageDirectly:103-161</c> —— 比并发侧多 CR_COMMIT/CR_ROLLBACK
+    /// 两档，且 Order=true、AutoCommit 取 listener 跑完之后的值（broker 按它决定这条直接消费
+    /// 算不算已提交）。映射写错是静默的：真机上只表现为 mqadmin 的返回少一档语义。
+    /// </summary>
+    [Theory]
+    [InlineData(ConsumeOrderlyStatus.Success, "CR_SUCCESS")]
+    [InlineData(ConsumeOrderlyStatus.SuspendCurrentQueueAMoment, "CR_LATER")]
+    [InlineData(ConsumeOrderlyStatus.Commit, "CR_COMMIT")]
+    [InlineData(ConsumeOrderlyStatus.Rollback, "CR_ROLLBACK")]
+    public void DirectConsumeMapsOrderlyStatuses(ConsumeOrderlyStatus status, string expect)
+    {
+        var c = new DefaultMQPushConsumer(Group);
+        c.SetMessageListener(new OrderlyListener(status).ManualCommit(false));
+        ConsumeMessageDirectlyResult r = c.ConsumeMessageDirectly(Ext(0), Broker);
+        Assert.Equal(expect, r.ConsumeResult);
+        Assert.True(r.Order);
+        Assert.False(r.AutoCommit);  // listener 设的 false 要原样回给 broker
+    }
+
+    [Fact]
+    public void DirectConsumeWithoutListenerIsReturnNull()
+    {
+        var c = new DefaultMQPushConsumer(Group);
+        ConsumeMessageDirectlyResult r = c.ConsumeMessageDirectly(Ext(0), Broker);
+        Assert.Equal("CR_RETURN_NULL", r.ConsumeResult);
     }
 
     // ---------------- %RETRY% 属性抬进发送头 ----------------

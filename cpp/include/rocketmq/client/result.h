@@ -11,6 +11,7 @@
 #define ROCKETMQ_CLIENT_RESULT_H
 
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <random>
@@ -109,7 +110,16 @@ class SendCallback {
 public:
     virtual ~SendCallback() = default;
     virtual void onSuccess(const SendResult& sendResult) = 0;
-    virtual void onException(const std::string& error) = 0;
+    // 对应 Java ``onException(Throwable e)``：交出去的是**异常对象**，类型即失败原因
+    // —— broker 明确回错是 MQBrokerException（带 responseCode，调用方按码分流）、
+    // 背压闸/预算耗尽拒绝是 RemotingTooMuchRequestException、其余传输失败是
+    // MQClientException（Java operationFail 三包装的文案）。只给字符串等于把"哪一类失败"
+    // 丢掉，调用方只能对着文案做正则。
+    //
+    // 与 Java 的差异（结构性）：Java 在包装 MQClientException 时会把原始 Throwable 挂成
+    // cause，本端口跨不了这道边界 —— remoting 层按设计不抛异常（InvokeError 是纯数据），
+    // 所以回调拿到的是**没有 cause 的** MQClientException。文案与类型仍逐字对位。
+    virtual void onException(const std::exception_ptr& error) = 0;
 };
 
 // ---------------------------------------------------------------- 拉取结果
@@ -198,9 +208,29 @@ enum class ConsumeConcurrentlyStatus {
 };
 
 enum class ConsumeOrderlyStatus {
+    // 声明顺序与 Java ``ConsumeOrderlyStatus`` 逐字对齐（Java 里 ROLLBACK/COMMIT 带
+    // @Deprecated，注释写明 "only for binlog consumption"）：两侧数字一致才不会在
+    // 「按序号写死」的调用方手里错位。
     SUCCESS = 0,
-    SUSPEND_CURRENT_QUEUE_A_MOMENT = 1,
+    ROLLBACK = 1,
+    COMMIT = 2,
+    SUSPEND_CURRENT_QUEUE_A_MOMENT = 3,
 };
+
+/// Java 枚举名原文（钩子 status / 轨迹 contextCode 用它，不要用 C++ 的枚举拼写）。
+inline const char* consumeOrderlyStatusName(ConsumeOrderlyStatus s) {
+    switch (s) {
+        case ConsumeOrderlyStatus::SUCCESS:
+            return "SUCCESS";
+        case ConsumeOrderlyStatus::ROLLBACK:
+            return "ROLLBACK";
+        case ConsumeOrderlyStatus::COMMIT:
+            return "COMMIT";
+        case ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT:
+            return "SUSPEND_CURRENT_QUEUE_A_MOMENT";
+    }
+    return "UNKNOWN";
+}
 
 struct ConsumeConcurrentlyContext {
     MessageQueue messageQueue;
@@ -214,7 +244,14 @@ struct ConsumeConcurrentlyContext {
 
 struct ConsumeOrderlyContext {
     MessageQueue messageQueue;
+    // true 时由客户端按 listener 的状态提交位点（正常路径）；listener 置 false 拿走提交权
+    //（Java 的 binlog 用法）：只有 COMMIT 才提交、ROLLBACK 回滚重投。
     bool autoCommit = true;
+    // 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis，**默认 -1**（Java 就是
+    // 这个默认值）：-1 表示「没指定」，挂起时长回落到消费者配置的
+    // ``suspendCurrentQueueTimeMillis``（默认 1000）；解析出来的值再由调度侧钳到
+    // [10, 30000]（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:216-225）。
+    int32_t suspendCurrentQueueTimeMillis = -1;
     explicit ConsumeOrderlyContext(const MessageQueue& mq = MessageQueue()) : messageQueue(mq) {}
 };
 

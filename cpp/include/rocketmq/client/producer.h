@@ -422,6 +422,10 @@ protected:
     // 一笔在途尝试（对应 Java MQClientAPIImpl#sendMessageAsync）。
     // 就地抛出的异常（连不上、写失败）按 Java 的外层 catch 处理：**原样**传递、needRetry=true。
     void sendAttempt(const std::shared_ptr<AsyncSendState>& state, const std::string& addr);
+    // 就地抛出的传输异常：记容错表（不可达）、扣预算、原样进重试链（Java 外层 catch 那一支）。
+    // kind 必须来自**异常的实际类型** —— 回调拿到的就是那个对象，别统一成 OTHER。
+    void onTransportThrow(const std::shared_ptr<AsyncSendState>& state, const std::string& message,
+                          InvokeError::Kind kind);
     // 一笔尝试的结局（在 NettyClientPublicExecutor_N 上跑）：记容错表，然后要么收尾要么重试
     void onAttemptComplete(const std::shared_ptr<AsyncSendState>& state, const SendResult& result,
                            const InvokeError& error);

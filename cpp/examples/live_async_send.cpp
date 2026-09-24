@@ -108,9 +108,10 @@ public:
         threads_.push_back(currentThreadName());
     }
 
-    void onException(const std::string& e) override {
+    void onException(const std::exception_ptr& e) override {
         std::lock_guard<std::mutex> lk(m_);
-        errors_.push_back(e);
+        errors_.push_back(exceptionMessage(e));
+        errorTypes_.push_back(exceptionTypeName(e));
         threads_.push_back(currentThreadName());
     }
 
@@ -149,16 +150,27 @@ public:
         return errors_.empty() ? std::string() : errors_.front();
     }
 
+    // 第一笔异常的类型名（Java 的 e.getClass().getSimpleName()）：失败**分类**看这里
+    std::string firstErrorType() {
+        std::lock_guard<std::mutex> lk(m_);
+        return errorTypes_.empty() ? std::string() : errorTypes_.front();
+    }
+
     std::string summary() {
         std::lock_guard<std::mutex> lk(m_);
         return "ok=" + std::to_string(results_.size()) + " err=" + std::to_string(errors_.size())
-             + (errors_.empty() ? "" : " " + errors_.front());
+             + (errors_.empty() ? ""
+                                : " " + errors_.front()
+                                      + (errorTypes_.empty() ? "" : " ["
+                                                                       + errorTypes_.front()
+                                                                       + "]"));
     }
 
 private:
     std::mutex m_;
     std::vector<SendResult> results_;
     std::vector<std::string> errors_;
+    std::vector<std::string> errorTypes_;
     std::vector<std::string> threads_;
 };
 
@@ -479,6 +491,8 @@ void a4ForbiddenHook(Env& env, const std::string& t) {
           waitUntil([&]() { return rejected->done() >= 1; }, 10000)
               && rejected->firstError().find("tag forbidden is not allowed") != std::string::npos,
           rejected->summary());
+    check("A4 钩子拒绝的异常类型是 MQClientException（Java checkForbidden 抛的就是它）",
+          rejected->firstErrorType() == "MQClientException", rejected->summary());
     check("A4 拦截钩子看到的是 ASYNC", forbidden->mode() == CommunicationMode::ASYNC,
           "mode=" + std::string(forbidden->mode() == CommunicationMode::ASYNC      ? "ASYNC"
                                 : forbidden->mode() == CommunicationMode::ONEWAY ? "ONEWAY"

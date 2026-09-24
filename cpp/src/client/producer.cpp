@@ -804,6 +804,33 @@ void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* w
     }
 }
 
+// 交到用户回调手里的那个 Throwable（Java ``SendCallback#onException(Throwable)``）。
+// 与 Python ``_classify_async_failure`` / .NET ``ClassifyAsyncFailure`` 同口径：
+//   * 本地闸门（背压/预算）拒绝 → RemotingTooMuchRequestException（Java 直接抛的原类型）
+//   * broker 明确回错 → MQBrokerException(code, msg)（码随 InvokeError.responseCode 过来）
+//   * 响应到了但解析不出来 → RemotingCommandException（Java processSendResponse 那一支）
+//   * 其余（含 operationFail 三包装后的文案）→ MQClientException
+std::exception_ptr makeSendException(const InvokeError& error) {
+    switch (error.kind) {
+        case InvokeError::Kind::TOO_MUCH_REQUEST:
+            return std::make_exception_ptr(RemotingTooMuchRequestException(error.message));
+        case InvokeError::Kind::RESPONSE_FAILED:
+            if (error.responseCode != 0) {
+                return std::make_exception_ptr(
+                    MQBrokerException(error.responseCode, error.message));
+            }
+            return std::make_exception_ptr(RemotingCommandException(error.message));
+        case InvokeError::Kind::TIMEOUT:
+            return std::make_exception_ptr(RemotingTimeoutException(error.message));
+        case InvokeError::Kind::SEND_REQUEST:
+            return std::make_exception_ptr(RemotingSendRequestException(error.message));
+        case InvokeError::Kind::CONNECT:
+            return std::make_exception_ptr(RemotingConnectException(error.message));
+        default:
+            return std::make_exception_ptr(MQClientException(error.message));
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- 异步发送背压配置
@@ -1001,6 +1028,13 @@ void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState
     try {
         const SendResult result = sendBatchKernel(state->batchMsgs, pinned, timeout);
         executeOnCallbackThread([this, state, result]() { completeAsync(state, &result, nullptr); });
+    } catch (const MQBrokerException& e) {
+        // broker 明确回错：Java 的批量异步同样走 processSendResponse 的 catch，交给回调的是
+        // MQBrokerException（带码），不是包装层文案
+        executeOnCallbackThread([this, state, msg = std::string(e.what()), code = e.responseCode]() {
+            const InvokeError err(InvokeError::Kind::RESPONSE_FAILED, msg, code);
+            completeAsync(state, nullptr, &err);
+        });
     } catch (const std::exception& e) {
         // 内核的失败（路由拿不到、校验不过、重试用尽）原样交付回调，与单条异步一致。
         executeOnCallbackThread([this, state, text = std::string(e.what())]() {
@@ -1119,21 +1153,32 @@ void DefaultMQProducer::sendAttempt(const std::shared_ptr<AsyncSendState>& state
                                             onAttemptComplete(state, copy, err);
                                         });
                                     });
+    } catch (const RemotingConnectException& e) {
+        onTransportThrow(state, e.what(), InvokeError::Kind::CONNECT);
+    } catch (const RemotingSendRequestException& e) {
+        onTransportThrow(state, e.what(), InvokeError::Kind::SEND_REQUEST);
+    } catch (const RemotingTimeoutException& e) {
+        onTransportThrow(state, e.what(), InvokeError::Kind::TIMEOUT);
     } catch (const std::exception& e) {
         // Java sendMessageAsync 的外层 catch：就地失败（连不上/通道没了），
-        // 异常**原样**传递（不包装）、needRetry=true
-        const int32_t cost = elapsedMs(state->attemptBegan);
-        mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, false);
-        state->timeout -= cost;
-        const InvokeError raw(InvokeError::Kind::OTHER, e.what());
-        onSendException(state, raw, true);
+        // 异常**原样**传递（不包装）、needRetry=true —— 类名也要跟着走，
+        // 因为回调拿到的就是那个对象（建连失败给 RemotingConnectException）
+        onTransportThrow(state, e.what(), InvokeError::Kind::OTHER);
     } catch (...) {
-        const int32_t cost = elapsedMs(state->attemptBegan);
-        mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, false);
-        state->timeout -= cost;
-        const InvokeError raw(InvokeError::Kind::OTHER, "unknown error");
-        onSendException(state, raw, true);
+        onTransportThrow(state, "unknown error", InvokeError::Kind::OTHER);
     }
+}
+
+void DefaultMQProducer::onTransportThrow(const std::shared_ptr<AsyncSendState>& state,
+                                         const std::string& message, InvokeError::Kind kind) {
+    const int32_t cost = elapsedMs(state->attemptBegan);
+    // 同步就地失败 ⇒ 链路根本没通（Java 外层 catch 传 reachable=false，与 operationFail 的
+    // reachable=true 刻意不同）
+    mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, false);
+    state->timeout -= cost;
+    // 不在这里过 classifyAsyncFailure：Java 把**原对象**直接交给 onExceptionImpl，
+    // 包装只发生在 operationFail（异步应答那一侧）
+    onSendException(state, InvokeError(kind, message), true);
 }
 
 void DefaultMQProducer::onAttemptComplete(const std::shared_ptr<AsyncSendState>& state,
@@ -1232,7 +1277,7 @@ void DefaultMQProducer::completeAsync(const std::shared_ptr<AsyncSendState>& sta
     }
     try {
         if (error != nullptr) {
-            state->callback->onException(error->message);
+            state->callback->onException(makeSendException(*error));
         } else {
             state->callback->onSuccess(*result);
         }

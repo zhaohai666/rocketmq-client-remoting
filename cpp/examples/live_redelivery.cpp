@@ -24,7 +24,9 @@
 //      （reconsumeTimes 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，
 //      消息因 rebalance 锁未过期被 broker 立刻改投 %DLQ%<group>（reconsumeTimes=3、
 //      RETRY_TOPIC 保留业务 topic）。S12b：默认 -1 在顺序侧是不设上限（投过 >=18 次、
-//      %DLQ% 空），不是并发侧的 16。
+//      %DLQ% 空），不是并发侧的 16。S12c：context.suspendCurrentQueueTimeMillis 优先于
+//      消费者配置（配置 900/context 70 ⇒ 相邻投递中位间隔贴着 70ms+50ms 节拍；context -1
+//      ⇒ 回落配置 400ms；1ms/0 两个非法值钳到下限不忙等）。
 //   S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME=120s）：把仍归本实例的队列
 //      的 lastPull 时刻倒拨到阈值之外 ⇒ 这一趟 rebalance 必须撤掉它（持久化位点）并重建
 //      拉取线程，之后同一队列继续消费、307 运行信息里的 lastPullTimestamp 是真值、
@@ -1239,6 +1241,147 @@ int main(int argc, char* argv[]) {
               sight.msgs.empty(),
               "routeFound=" + std::string(sight.routeFound ? "true" : "false")
                   + " n=" + std::to_string(sight.msgs.size()));
+    }
+
+    // ---------------- S12c 顺序挂起时长：context 上的值优先于消费者配置（#74）----------------
+    // Java ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234：`-1`（context 默认）
+    // 才回落到消费者配置，解析出来的值再钳到 [10, 30000]。真机这一条证的是「listener 在
+    // context 上设的值真的决定等待时长」：配置故意设 900ms、context 要 70ms ⇒ 相邻两次投递
+    // 的中位间隔必须贴着 70ms —— 把 context 读丢或读成配置，间隔会落到 0.9s 以上。
+    //
+    // 钳位的两个端点用同一条链路的间隔法只能兜「不忙等」（`>= 10ms`）：分发循环本身有 50ms
+    // 固定节拍（consumer.cpp 里没进展就 sleep 50ms），间隔法分不出 10ms 与 1ms —— 精确值由
+    // 离线矩阵锁死（tests/test_orderly_reconsume.cpp::testOrderlySuspendMillisResolvesThenClamps）。
+    {
+        const auto medianOf = [](std::vector<double> xs) {
+            std::sort(xs.begin(), xs.end());
+            const size_t n = xs.size();
+            if (n == 0) return 0.0;
+            return (n % 2 == 1) ? xs[n / 2] : (xs[n / 2 - 1] + xs[n / 2]) / 2.0;
+        };
+
+        struct GapSink {
+            std::mutex mtx;
+            std::vector<int64_t> stampsMs;  // 每次命中毒消息的投递时刻
+            size_t count() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return stampsMs.size();
+            }
+            std::vector<double> gapsSeconds() {
+                std::lock_guard<std::mutex> lk(mtx);
+                std::vector<double> gaps;
+                for (size_t i = 1; i < stampsMs.size(); ++i) {
+                    gaps.push_back(static_cast<double>(stampsMs[i] - stampsMs[i - 1]) / 1000.0);
+                }
+                return gaps;
+            }
+        };
+        class Gaps : public MessageListenerOrderly {
+        public:
+            Gaps(GapSink& s, std::string poison, int32_t askedMs)
+                : sink_(s), poison_(std::move(poison)), askedMs_(askedMs) {}
+            ConsumeOrderlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                ConsumeOrderlyContext& ctx) override {
+                bool hit = false;
+                for (const MessageExt& m : msgs) {
+                    if (bodyOf(m) == poison_) hit = true;
+                }
+                if (!hit) return ConsumeOrderlyStatus::SUCCESS;
+                {
+                    std::lock_guard<std::mutex> lk(sink_.mtx);
+                    sink_.stampsMs.push_back(nowMs());
+                }
+                ctx.suspendCurrentQueueTimeMillis = askedMs_;
+                return ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
+            }
+
+        private:
+            GapSink& sink_;
+            std::string poison_;
+            int32_t askedMs_;
+        };
+
+        // ---- 探针 A：配置 900ms / context 70ms ⇒ 生效的是 context 的 70ms ----
+        {
+            const std::string topic = gPrefix + "_OrdSusp";
+            const std::string group = gPrefix + "_g12c";
+            prepareTopic(producer, topic, 1);
+            GapSink sink;
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->setConsumeMessageBatchMaxSize(1);
+            consumer->setMaxReconsumeTimes(-1);  // 顺序侧不设上限，才够采到足够多的间隔
+            consumer->setSuspendCurrentQueueTimeMillis(900);
+            consumer->setMessageListener(
+                std::make_shared<Gaps>(sink, "ord-susp-poison", 70));
+            consumer->subscribe(topic);
+            consumer->start();
+            // 等首轮 LOCK_BATCH_MQ：没拿到队列锁时 broker 会把顺序重投直接改投死信，间隔就没了
+            std::this_thread::sleep_for(std::chrono::seconds(4));
+            producer.send(Message(topic, str2bytes("ord-susp-poison")));
+            // 至少要 9 次投递才够 8 个间隔；命中 9 次约需 9*120ms
+            const bool enough = waitUntil([&] { return sink.count() >= 9; }, 25000);
+            const std::vector<double> gaps = sink.gapsSeconds();
+            const double med = medianOf(gaps);
+            check("S12c-context 的 70ms 生效（不是消费者配置的 900ms）",
+                  enough && gaps.size() >= 6 && med >= 0.03 && med <= 0.4,
+                  "n=" + std::to_string(sink.count()) + " median=" + std::to_string(med) + "s");
+            consumer->shutdown();
+        }
+
+        // ---- 探针 B：配置 0 / context 1ms，两个非法值都必须钳到下限，不能变成忙等 ----
+        {
+            const std::string topic = gPrefix + "_OrdSuspFloor";
+            const std::string group = gPrefix + "_g12cfloor";
+            prepareTopic(producer, topic, 1);
+            GapSink sink;
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->setConsumeMessageBatchMaxSize(1);
+            consumer->setMaxReconsumeTimes(-1);
+            consumer->setSuspendCurrentQueueTimeMillis(0);
+            consumer->setMessageListener(
+                std::make_shared<Gaps>(sink, "ord-susp-floor", 1));
+            consumer->subscribe(topic);
+            consumer->start();
+            std::this_thread::sleep_for(std::chrono::seconds(4));
+            producer.send(Message(topic, str2bytes("ord-susp-floor")));
+            const bool enough = waitUntil([&] { return sink.count() >= 9; }, 20000);
+            const std::vector<double> gaps = sink.gapsSeconds();
+            const double med = medianOf(gaps);
+            check("S12c-钳位下限：context 1ms / 配置 0 时不忙等（间隔 >= 10ms）",
+                  enough && gaps.size() >= 6 && med >= 0.009,
+                  "n=" + std::to_string(sink.count()) + " median=" + std::to_string(med) + "s");
+            consumer->shutdown();
+        }
+
+        // ---- 探针 C（反证 A 的另一半）：context 保持 -1 ⇒ 回落消费者配置，不是恒 70ms ----
+        // 少了这条，A 只能证明「70 生效」，证明不了「-1 会回落」；一个把 -1 也当成固定值
+        // （或直接忽略配置）的实现照样能过 A。这里配置 400ms、context 不动。
+        {
+            const std::string topic = gPrefix + "_OrdSuspCfg";
+            const std::string group = gPrefix + "_g12ccfg";
+            prepareTopic(producer, topic, 1);
+            GapSink sink;
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->setConsumeMessageBatchMaxSize(1);
+            consumer->setMaxReconsumeTimes(-1);
+            consumer->setSuspendCurrentQueueTimeMillis(400);
+            consumer->setMessageListener(
+                std::make_shared<Gaps>(sink, "ord-susp-cfg", -1));
+            consumer->subscribe(topic);
+            consumer->start();
+            std::this_thread::sleep_for(std::chrono::seconds(4));
+            producer.send(Message(topic, str2bytes("ord-susp-cfg")));
+            const bool enough = waitUntil([&] { return sink.count() >= 6; }, 25000);
+            const std::vector<double> gaps = sink.gapsSeconds();
+            const double med = medianOf(gaps);
+            check("S12c-context 保持 -1 时回落消费者配置的 400ms",
+                  enough && gaps.size() >= 4 && med >= 0.25 && med <= 0.75,
+                  "n=" + std::to_string(sink.count()) + " median=" + std::to_string(med) + "s");
+            consumer->shutdown();
+        }
     }
 
     producer.shutdown();

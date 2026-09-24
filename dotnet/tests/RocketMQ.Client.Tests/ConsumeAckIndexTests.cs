@@ -95,6 +95,8 @@ public class ConsumeAckIndexTests
             return _consumer.ConsumeBatchForTest(_key, Queue0(), batch);
         }
 
+        public void RegisterHook(IConsumeMessageHook hook) => _consumer.RegisterConsumeMessageHook(hook);
+
         /// <summary>队首缓冲的 (queueOffset, reconsumeTimes) 列表，便于一次性比对。</summary>
         public List<(long Offset, int Times)> Pending()
             => _consumer.PendingForTest(_key).Select(m => (m.QueueOffset, m.ReconsumeTimes)).ToList();
@@ -196,5 +198,50 @@ public class ConsumeAckIndexTests
         var h = new Harness(MessageModel.Broadcasting);
         Assert.True(h.Run(OffsetBatch(2), ConsumeConcurrentlyStatus.ReconsumeLater, null));
         Assert.Equal(2, h.Offset());
+    }
+
+    /// <summary>只记 after 钩子看到的 (status, success, ConsumeContextType)。</summary>
+    private sealed class RecordingConsumeHook : IConsumeMessageHook
+    {
+        public List<(string? Status, bool Success, string? ContextType)> After { get; } = new();
+
+        public string HookName() => "RecordingConsumeHook";
+
+        public void ConsumeMessageBefore(ConsumeMessageContext context)
+        {
+        }
+
+        public void ConsumeMessageAfter(ConsumeMessageContext context)
+        {
+            string? ctxType = null;
+            context.Props?.TryGetValue("ConsumeContextType", out ctxType);
+            After.Add((context.Status, context.Success, ctxType));
+        }
+    }
+
+    [Fact]
+    public void HookStatusIsTheJavaEnumName()
+    {
+        // Java 写进 ConsumeMessageContext.status 的是 status.toString()
+        //（ConsumeMessageConcurrentlyService:408），默认实现就是**裸成员名**：
+        // CONSUME_SUCCESS / RECONSUME_LATER。C# 的枚举拼写（ConsumeSuccess / ReconsumeLater）
+        // 不是 Java 的形态 —— 钩子是公开扩展点，用户按 Java 文档取值会拿到错的东西。
+        var success = new Harness();
+        var successHook = new RecordingConsumeHook();
+        success.RegisterHook(successHook);
+        Assert.True(success.Run(OffsetBatch(2), ConsumeConcurrentlyStatus.ConsumeSuccess, null));
+
+        var later = new Harness(MessageModel.Broadcasting);
+        var laterHook = new RecordingConsumeHook();
+        later.RegisterHook(laterHook);
+        // 广播模式下 RECONSUME_LATER 不回投（集群模式未 Start 时回投必定失败、
+        // 整批会退回队首），这里只关心钩子看到的 status。
+        Assert.True(later.Run(OffsetBatch(1), ConsumeConcurrentlyStatus.ReconsumeLater, null));
+
+        Assert.Equal(("CONSUME_SUCCESS", true, "SUCCESS"), successHook.After[0]);
+        Assert.Equal(("RECONSUME_LATER", false, "FAILED"), laterHook.After[0]);
+        // 反证：不能是 C# 枚举的拼写（旧实现的形态）
+        Assert.NotEqual(nameof(ConsumeConcurrentlyStatus.ConsumeSuccess), successHook.After[0].Status);
+        Assert.NotEqual(nameof(ConsumeConcurrentlyStatus.ReconsumeLater), laterHook.After[0].Status);
     }
 }

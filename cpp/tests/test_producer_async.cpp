@@ -421,6 +421,10 @@ public:
         SendStatus status = SendStatus::SEND_OK;
         int64_t offset = -1;
         std::string message;
+        // 回调拿到的**异常对象**的类型名（Java 的 e.getClass().getSimpleName()）：
+        // 失败分类靠它，别只看 message（#78）。
+        std::string errorType;
+        int32_t errorCode = 0;  // 仅 MQBrokerException 有意义
         std::string threadName;
         std::thread::id threadId;
     };
@@ -434,10 +438,18 @@ public:
         threadId = std::this_thread::get_id();
         done.store(true);
     }
-    void onException(const std::string& error) override {
+    void onException(const std::exception_ptr& error) override {
         std::lock_guard<std::mutex> lk(m_);
         ++exceptionCount;
-        message = error;
+        message = exceptionMessage(error);
+        errorType = exceptionTypeName(error);
+        try {
+            std::rethrow_exception(error);
+        } catch (const MQBrokerException& e) {
+            errorCode = e.responseCode;
+        } catch (...) {
+            errorCode = 0;
+        }
         threadName = currentThreadName();
         done.store(true);
     }
@@ -454,6 +466,8 @@ public:
         s.status = status;
         s.offset = offset;
         s.message = message;
+        s.errorType = errorType;
+        s.errorCode = errorCode;
         s.threadName = threadName;
         s.threadId = threadId;
         return s;
@@ -466,6 +480,8 @@ private:
     SendStatus status = SendStatus::SEND_OK;
     int64_t offset = -1;
     std::string message;
+    std::string errorType;
+    int32_t errorCode = 0;
     std::string threadName;
     std::thread::id threadId{};
     std::atomic<bool> done{false};
@@ -475,7 +491,9 @@ private:
 class ThrowingCallback : public SendCallback {
 public:
     void onSuccess(const SendResult&) override { throw std::runtime_error("boom in callback"); }
-    void onException(const std::string&) override { throw std::runtime_error("boom in cb"); }
+    void onException(const std::exception_ptr&) override {
+        throw std::runtime_error("boom in cb");
+    }
 };
 
 // 记录 sendMessageBefore/After 各自跑在哪个线程；可选地把 before 卡住一段时间
@@ -733,6 +751,13 @@ void testBrokerErrorCodeDoesNotRetry() {
         expectInt(s.exceptionCount, 1, "a broker error code goes to onException");
         expect(s.message.find("CODE:") != std::string::npos,
                "the broker's own exception text is passed through unwrapped", s.message);
+        // 回调拿到的是**异常对象**：类型是 MQBrokerException，码随响应一起过来
+        // （Java processSendResponse 抛的就是它，调用方按码分流）
+        expect(s.errorType == "MQBrokerException",
+               "the callback receives an MQBrokerException, not a generic client error",
+               "type=" + s.errorType);
+        expectInt(s.errorCode, static_cast<int>(ResponseCode::SYSTEM_ERROR),
+                  "the broker's response code rides along on the exception");
         expectInt(broker.sendCount(), 1, "an answered request is never retried on another broker");
         const FaultItem* item = p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("broker-a");
         expect(item != nullptr, "the failed broker is isolated in the fault table");
@@ -799,6 +824,11 @@ void testTimeoutSharesOneBudget() {
     expectInt(s.exceptionCount, 1, "timeout goes to onException");
     expect(s.message.find("wait response timeout, cost=") != std::string::npos,
            "Java's timeout wording is preserved", s.message);
+    // Java 在 operationFail 里把传输层异常**包成** MQClientException（文案是包装层写的），
+    // 所以回调看到的类型是 MQClientException 而不是 RemotingTimeoutException
+    expect(s.errorType == "MQClientException",
+           "the transport timeout reaches the callback as Java's wrapper type",
+           "type=" + s.errorType);
     expectInt(silent.sendCount(), 1,
               "the shared remaining budget stops the chain after one timed-out attempt");
     expectInt(live.sendCount(), 0, "no second attempt once the budget is gone");
@@ -1062,6 +1092,10 @@ void testNumGateRejectsOnCallerThread() {
     expectInt(s.exceptionCount, 1, "the over-budget send calls back an error");
     expect(s.message == "send message tryAcquire semaphoreAsyncNum timeout",
            "the num gate text matches Java word for word", s.message);
+    // 闸门拒绝在 Java 里是 RemotingTooMuchRequestException（唯一不重试的传输错误）
+    expect(s.errorType == "RemotingTooMuchRequestException",
+           "the gate rejection keeps the Java type (callers branch on it)",
+           "type=" + s.errorType);
     // Java 的 executeAsyncMessageSend 在调用方线程上直接 sendCallback.onException(...)
     expect(!startsWith(s.threadName, "AsyncSenderExecutor_")
                && !startsWith(s.threadName, "NettyClientPublicExecutor_"),
@@ -1107,6 +1141,8 @@ void testSizeGateRejectsAndGivesTheNumPermitBack() {
     expectInt(s.exceptionCount, 1, "the second big send is gated");
     expect(s.message == "send message tryAcquire semaphoreAsyncSize timeout",
            "the size gate text matches Java word for word", s.message);
+    expect(s.errorType == "RemotingTooMuchRequestException",
+           "the size gate keeps the Java type too", "type=" + s.errorType);
     // Java 用 isSemaphoreAsyncNumAcquired 标记做到「只还拿到的那份」
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), kMinAsyncSendNum - 1,
              "the in-flight send still holds exactly one num permit");

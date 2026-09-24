@@ -87,7 +87,7 @@ public static class LiveAsyncSend
     {
         private readonly object _lk = new();
         private readonly List<SendResult> _results = new();
-        private readonly List<string> _errors = new();
+        private readonly List<Exception> _errors = new();
 
         public string LastThreadName { get; private set; } = string.Empty;
 
@@ -113,7 +113,14 @@ public static class LiveAsyncSend
 
         public string FirstError()
         {
-            lock (_lk) return _errors.Count == 0 ? string.Empty : _errors[0];
+            lock (_lk) return _errors.Count == 0 ? string.Empty : _errors[0].Message;
+        }
+
+        /// <summary>首个失败的异常类型名 —— #78 之后回调收的是 Exception 本身，
+        /// 「哪一类失败」可以断言，不必对着文案做正则。</summary>
+        public string FirstErrorType()
+        {
+            lock (_lk) return _errors.Count == 0 ? string.Empty : _errors[0].GetType().Name;
         }
 
         public bool WaitDone(int n, int millis) => WaitUntil(() => Done >= n, millis);
@@ -136,7 +143,7 @@ public static class LiveAsyncSend
             }
         }
 
-        public void OnException(string error)
+        public void OnException(Exception error)
         {
             lock (_lk)
             {
@@ -453,11 +460,12 @@ public static class LiveAsyncSend
             Message bad = Msg(t, "async-a4-rejected");
             bad.Tags = "forbidden";
             p.SendAsync(bad, rejected, 5000);
-            Check("A4 钩子拒绝的异常原样到了回调",
+            Check("A4 钩子拒绝的异常原样到了回调（类型 + 文案，Java 传的是 Throwable）",
                 rejected.WaitDone(1, 10000)
                 && rejected.FirstError().Contains("tag forbidden is not allowed",
-                    StringComparison.Ordinal),
-                rejected.Summary());
+                    StringComparison.Ordinal)
+                && rejected.FirstErrorType() == nameof(MQClientException),
+                rejected.Summary() + " type=" + rejected.FirstErrorType());
             Check("A4 拦截钩子看到的是 ASYNC", forbidden.Mode() == CommunicationMode.Async,
                 "mode=" + forbidden.Mode());
             // 这个 topic 除了被拒的这一笔什么都没有 ⇒ 要么读到 0 条，要么连路由都还没

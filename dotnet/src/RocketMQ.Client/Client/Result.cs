@@ -103,7 +103,12 @@ public interface ISendCallback
 {
     void OnSuccess(SendResult sendResult);
 
-    void OnException(string error);
+    /// <summary>对应 Java <c>onException(Throwable e)</c>：交出去的是**异常对象**，类型即失败
+    /// 原因 —— broker 明确回错是 <see cref="MQBrokerException"/>（带 <c>ResponseCode</c>，
+    /// 调用方按码分流）、背压闸拒绝是 <c>RemotingTooMuchRequestException</c>、其余传输失败是
+    /// <see cref="MQClientException"/>（Java 的 operationFail 三包装）。给字符串等于把"哪一类
+    /// 失败"这个信息丢掉，调用方只能对着文案做正则。</summary>
+    void OnException(Exception error);
 }
 
 // ---------------------------------------------------------------- 拉取结果
@@ -218,8 +223,40 @@ public enum ConsumeConcurrentlyStatus
 /// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeOrderlyStatus。</summary>
 public enum ConsumeOrderlyStatus
 {
+    // 声明顺序与 Java ConsumeOrderlyStatus 逐字对齐（Java 里 Rollback/Commit 带 @Deprecated，
+    // 注释写明 "only for binlog consumption"）：两侧数字一致才不会在「按序号写死」的调用方
+    // 手里错位。
     Success = 0,
-    SuspendCurrentQueueAMoment = 1,
+    Rollback = 1,
+    Commit = 2,
+    SuspendCurrentQueueAMoment = 3,
+}
+
+/// <summary>Java 枚举名原文（钩子 status / 轨迹 contextCode 用它，不要用 C# 的枚举拼写）。
+/// Java 侧写进 <c>ConsumeMessageContext.status</c> 的是 <c>status.toString()</c>
+/// （并发 <c>ConsumeMessageConcurrentlyService:408</c>、顺序 <c>ConsumeMessageOrderlyService:507</c>），
+/// 默认实现就是成员名。</summary>
+public static class ConsumeConcurrentlyStatusNames
+{
+    public static string Name(ConsumeConcurrentlyStatus s) => s switch
+    {
+        ConsumeConcurrentlyStatus.ConsumeSuccess => "CONSUME_SUCCESS",
+        ConsumeConcurrentlyStatus.ReconsumeLater => "RECONSUME_LATER",
+        _ => "UNKNOWN",
+    };
+}
+
+/// <summary>Java 枚举名原文（钩子 status / 轨迹 contextCode 用它，不要用 C# 的枚举拼写）。</summary>
+public static class ConsumeOrderlyStatusNames
+{
+    public static string Name(ConsumeOrderlyStatus s) => s switch
+    {
+        ConsumeOrderlyStatus.Success => "SUCCESS",
+        ConsumeOrderlyStatus.Rollback => "ROLLBACK",
+        ConsumeOrderlyStatus.Commit => "COMMIT",
+        ConsumeOrderlyStatus.SuspendCurrentQueueAMoment => "SUSPEND_CURRENT_QUEUE_A_MOMENT",
+        _ => "UNKNOWN",
+    };
 }
 
 /// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyContext。</summary>
@@ -242,7 +279,20 @@ public sealed class ConsumeConcurrentlyContext
 public sealed class ConsumeOrderlyContext
 {
     public MessageQueue MessageQueue { get; set; }
+
+    /// <summary>
+    /// true 时由客户端按 listener 的状态提交位点（正常路径）；listener 置 false 拿走提交权
+    ///（Java 的 binlog 用法）：只有 Commit 才提交、Rollback 回滚重投。
+    /// </summary>
     public bool AutoCommit { get; set; } = true;
+
+    /// <summary>
+    /// 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis，<b>默认 -1</b>（Java 就是
+    /// 这个默认值）：-1 表示「没指定」，挂起时长回落到消费者配置的
+    /// <c>SuspendCurrentQueueTimeMillis</c>（默认 1000）；解析出来的值再由调度侧钳到
+    /// [10, 30000]（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:216-225）。
+    /// </summary>
+    public int SuspendCurrentQueueTimeMillis { get; set; } = -1;
 
     public ConsumeOrderlyContext(MessageQueue? mq = null) => MessageQueue = mq ?? new MessageQueue();
 }

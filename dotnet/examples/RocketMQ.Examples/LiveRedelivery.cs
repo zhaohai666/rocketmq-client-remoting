@@ -19,6 +19,8 @@
 //    （reconsumeTimes 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，消息因
 //    rebalance 锁未过期被 broker 立刻改投 %DLQ%<group>（reconsumeTimes=3、RETRY_TOPIC 保留业务 topic）
 // S12b 顺序侧的 -1 是**不设上限**（投过 >=18 次、%DLQ% 空），不是并发侧的 16
+// S12c context.SuspendCurrentQueueTimeMillis 优先于消费者配置（配置 900/context 70 ⇒ 相邻投递
+//    中位间隔贴着 70ms+50ms 节拍；context -1 ⇒ 回落配置 400ms；1ms/0 两个非法值钳到下限不忙等）
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
 //   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
@@ -120,6 +122,7 @@ public static class LiveRedelivery
         ScenarioPullStallSelfHeal(producer);
         ScenarioOrderlyDlq(producer);
         ScenarioOrderlyNoCap(producer);
+        ScenarioOrderlySuspendMillis(producer);
 
         producer.Shutdown();
         Console.WriteLine();
@@ -1190,6 +1193,110 @@ public static class LiveRedelivery
             dlqMsgs.Count == 0,
             "routeFound=" + (routeFound ? "true" : "false")
             + " n=" + dlqMsgs.Count.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>命中毒消息时，把 context 上的挂起时长设成指定值并记下本次投递时刻。</summary>
+    private sealed class SuspendTimingOrderlyListener : IMessageListenerOrderly
+    {
+        private readonly string _poison;
+        private readonly int _askedMs;
+        private readonly object _gate = new();
+        private readonly List<long> _stampsMs = new();
+
+        public SuspendTimingOrderlyListener(string poison, int askedMs)
+        {
+            _poison = poison;
+            _askedMs = askedMs;
+        }
+
+        public bool Orderly() => true;
+
+        public int Count()
+        {
+            lock (_gate) return _stampsMs.Count;
+        }
+
+        public List<double> GapsSeconds()
+        {
+            lock (_gate)
+            {
+                var gaps = new List<double>();
+                for (int i = 1; i < _stampsMs.Count; ++i)
+                {
+                    gaps.Add((_stampsMs[i] - _stampsMs[i - 1]) / 1000.0);
+                }
+
+                return gaps;
+            }
+        }
+
+        public ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext ctx)
+        {
+            bool hit = msgs.Any(m => Body(m) == _poison);
+            if (!hit) return ConsumeOrderlyStatus.Success;
+            lock (_gate) _stampsMs.Add(NowMs());
+            // 默认 -1；只有显式赋值才走 context 这一支（-1 表示回落消费者配置）
+            ctx.SuspendCurrentQueueTimeMillis = _askedMs;
+            return ConsumeOrderlyStatus.SuspendCurrentQueueAMoment;
+        }
+    }
+
+    private static double Median(List<double> xs)
+    {
+        if (xs.Count == 0) return 0.0;
+        var s = new List<double>(xs);
+        s.Sort();
+        int n = s.Count;
+        return n % 2 == 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2.0;
+    }
+
+    /// <summary>
+    /// #74：Java ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234 —— `-1`（context
+    /// 默认）才回落到消费者配置，解析出的值再钳到 [10, 30000]。真机这三条探针分别证：
+    /// context 70ms 压过配置 900ms（中位间隔贴着 70ms）、context 保持 -1 时回落配置 400ms、
+    /// 两个非法值（context 1ms / 配置 0）钳到下限不忙等。
+    /// 钳位端点只能兜「不忙等」（>= 10ms）：分发循环本身有 50ms 固定节拍，间隔法分不出 10ms
+    /// 与 1ms —— 精确值由离线矩阵锁死（OrderlyReconsumeTests.OrderlySuspendMillisResolvesThenClampsLikeJava）。
+    /// </summary>
+    private static void ScenarioOrderlySuspendMillis(DefaultMQProducer producer)
+    {
+        SuspendProbe(producer, "OrdSusp", "g12c", configMs: 900, askedMs: 70, poison: "ord-susp-poison",
+            need: 9, minGaps: 6, timeoutMs: 25000, lo: 0.03, hi: 0.4,
+            name: "S12c-context 的 70ms 生效（不是消费者配置的 900ms）");
+        SuspendProbe(producer, "OrdSuspCfg", "g12ccfg", configMs: 400, askedMs: -1, poison: "ord-susp-cfg",
+            need: 6, minGaps: 4, timeoutMs: 25000, lo: 0.25, hi: 0.75,
+            name: "S12c-context 保持 -1 时回落消费者配置的 400ms");
+        SuspendProbe(producer, "OrdSuspFloor", "g12cfloor", configMs: 0, askedMs: 1, poison: "ord-susp-floor",
+            need: 9, minGaps: 6, timeoutMs: 20000, lo: 0.009, hi: 10.0,
+            name: "S12c-钳位下限：context 1ms / 配置 0 时不忙等（间隔 >= 10ms）");
+    }
+
+    private static void SuspendProbe(DefaultMQProducer producer, string suffix, string groupSuffix,
+        int configMs, int askedMs, string poison, int need, int minGaps, int timeoutMs, double lo,
+        double hi, string name)
+    {
+        string topic = _gPrefix + "_" + suffix;
+        string group = _gPrefix + "_" + groupSuffix;
+        PrepareTopic(producer, topic, 1);  // 1 队列：同一队列的顺序重投才有可比间隔
+
+        var listener = new SuspendTimingOrderlyListener(poison, askedMs);
+        var consumer = NewConsumer(group);
+        consumer.ConsumeMessageBatchMaxSize = 1;
+        consumer.MaxReconsumeTimes = -1;  // 顺序侧不设上限，才够采到足够多的间隔
+        consumer.SuspendCurrentQueueTimeMillis = configMs;
+        consumer.SetMessageListener(listener);
+        consumer.Subscribe(topic, "*");
+        consumer.Start();
+        // 等首轮 LOCK_BATCH_MQ：没拿到队列锁时 broker 会把顺序重投直接改投死信，间隔就没了
+        Thread.Sleep(4000);
+        producer.Send(new Message(topic, Str2Bytes(poison)));
+        WaitUntil(() => listener.Count() >= need, timeoutMs);
+        List<double> gaps = listener.GapsSeconds();
+        double med = Median(gaps);
+        Check(name, gaps.Count >= minGaps && med >= lo && med <= hi,
+            "n=" + listener.Count().ToString(CultureInfo.InvariantCulture)
+            + " median=" + med.ToString("F3", CultureInfo.InvariantCulture) + "s");
+        consumer.Shutdown();
     }
 
     private static bool LadderOf(PoisonOrderlyListener listener, string body)
