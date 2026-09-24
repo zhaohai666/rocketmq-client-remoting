@@ -5,6 +5,8 @@
 // 这些形状 broker/admin 端会按 Java 语义解释，错一个键名就静默丢字段。
 #include <cstdint>
 #include <iostream>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -85,6 +87,84 @@ static void testLitePullPreStartBehavior() {
     c.subscribe("MyTopic", "TagC");
     // 不崩即通过（表达式存私有表，真机验证覆盖）
     ++g_pass;
+}
+
+// ---------------------------------------------------------------- 三张位点表（不起网络）
+// 对位 Java：拉取游标 / 已消费游标在 AssignedMessageQueue.MessageQueueState 里，
+// 提交落点在 OffsetStore 的内存位点表里。本端口改之前只有一张表（拉取游标），
+// 提交的是"已经拉进本地缓冲"的那一格 —— 调用方 poll 之前就崩掉的话，那段消息
+// 位点已经提交上去了，永久不再投递。这里锁死表形状：未启动也能验，
+// 因为 commit(map) 的内存写与 persist 是两步（persist 没 client 就静默跳过，
+// 这条与 Java 的 checkServiceState 抛错是已知偏离，写在 commitOffsets 的注释里）。
+static void testLitePullOffsetTable() {
+    DefaultLitePullConsumer c("LitePGOffsetTable");
+    const MessageQueue q0("MyTopic", "broker-a", 0);
+    const MessageQueue q1("MyTopic", "broker-a", 1);
+    const MessageQueue stranger("MyTopic", "broker-a", 7);
+    c.assign({q0, q1});
+
+    // 两条游标初值都是 -1（Java MessageQueueState 的 pullOffset/consumeOffset）
+    CHECK_EQ(c.pullCursorOf(q0), -1, "未解析起点前拉取游标 = -1");
+    CHECK_EQ(c.consumeCursorOf(q0), -1, "没交付过 ⇒ 已消费游标 = -1");
+
+    // commit()（无参 = Java commitAll）走已消费游标：一条都没交付 ⇒ 一格都不写
+    c.commit();
+    CHECK_EQ(c.committed(q0), -1, "commitAll 不提交没消费过的队列");
+
+    // commit(map)：调用方指定位点只写提交落点，两条游标一律不动
+    std::map<MessageQueue, int64_t> specified;
+    specified[q0] = 5;
+    specified[q1] = 8;
+    c.commit(specified, false);
+    CHECK_EQ(c.committed(q0), 5, "指定位点进内存位点表");
+    CHECK_EQ(c.committed(q1), 8, "指定位点进内存位点表(q1)");
+    CHECK_EQ(c.pullCursorOf(q0), -1, "提交位点不改拉取游标");
+    CHECK_EQ(c.consumeCursorOf(q0), -1, "提交位点不改已消费游标");
+
+    // -1 与「不是本实例持有的队列」两道守卫（Java 的 log.error + processQueue 守卫）
+    std::map<MessageQueue, int64_t> guarded;
+    guarded[q0] = -1;
+    guarded[stranger] = 3;
+    c.commit(guarded, false);
+    CHECK_EQ(c.committed(q0), 5, "offset == -1 只记日志，不覆盖已有位点");
+    CHECK_EQ(c.committed(stranger), -1, "没分配到的队列不替它提交");
+
+    // 空 map / 空集合：Java 都是直接 return，连表都不碰
+    c.commit(std::map<MessageQueue, int64_t>(), false);
+    CHECK_EQ(c.committed(q0), 5, "空 map 忽略这次提交");
+    c.commit(std::set<MessageQueue>(), false);
+    CHECK_EQ(c.committed(q0), 5, "空集合忽略这次提交");
+
+    // commit(set) 走的是已消费游标，不是任意指定值：未交付 ⇒ 守卫拦住
+    std::set<MessageQueue> only0;
+    only0.insert(q0);
+    c.commit(only0, false);
+    CHECK_EQ(c.committed(q0), 5, "commit(Set) 在没有交付记录时不写 -1");
+
+    // seek 同时改写两条游标（Java nextPullOffset 吃掉 seekOffset 时连 consumeOffset 一起改）
+    c.seek(q0, 2);
+    CHECK_EQ(c.pullCursorOf(q0), 2, "seek 改拉取游标");
+    CHECK_EQ(c.consumeCursorOf(q0), 2, "seek 也要改已消费游标，否则重放的段会被旧位点跳过");
+
+    // assign 缩范围：撤掉的队列连着两条游标一起丢（Java updateAssignedMessageQueue），
+    // 但内存位点表**不**清 —— 那份清理挂在 subscribe 模式的 rebalance 上（Java 同）。
+    c.assign({q0});
+    CHECK_EQ(c.pullCursorOf(q1), -1, "assign 撤队列后拉取游标消失");
+    CHECK_EQ(c.consumeCursorOf(q1), -1, "assign 撤队列后已消费游标消失");
+    CHECK_EQ(c.committed(q1), 8, "assign 模式不碰 offsetStore");
+    // 撤掉的队列再被指定提交要守卫拦住（不再是本实例持有的队列）
+    std::map<MessageQueue, int64_t> late;
+    late[q1] = 99;
+    c.commit(late, false);
+    CHECK_EQ(c.committed(q1), 8, "撤掉的队列不替它改位点");
+
+    // Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交只发被点名的
+    // 队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、还没落盘的值就此丢掉。
+    // （本用例没 start()，网络那半段自然跳过，验的是清理这半段。）
+    c.commit(only0, true);
+    // q0 这次提交用的是当下已消费游标（上面 seek 把它和拉取游标一起改成了 2）
+    CHECK_EQ(c.committed(q0), 2, "commit(Set) 提交的是已消费游标");
+    CHECK_EQ(c.committed(q1), -1, "persistAll 会把没点名的队列从内存表里丢掉");
 }
 
 // ---------------------------------------------------------------- consumeTimestamp（Java 格式）
@@ -195,6 +275,7 @@ static void testConsumeMessageDirectlyResult() {
 
 int main() {
     testLitePullPreStartBehavior();
+    testLitePullOffsetTable();
     testLitePullConsumeTimestamp();
     testGetConsumerStatusBodyWireShape();
     testConsumeMessageDirectlyResult();

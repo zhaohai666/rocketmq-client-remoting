@@ -8,7 +8,10 @@
 //   * subscribe 模式：登记订阅后自动 rebalance 分配队列（与 push 一致），后台拉取线程把
 //     消息灌进**本地缓冲**；Poll() 只从本地缓冲取消息，不用调用方管位点；
 //   * assign 模式：调用方 Assign([mq...]) 显式指定队列，不走 rebalance，同样后台灌本地缓冲。
-// 两种模式都用 Poll(timeout) 取批量消息；位点默认 AutoCommit（拉完即向 broker 提交）。
+// 两种模式都用 Poll(timeout) 取批量消息；位点默认 AutoCommit，但**提交的是"已消费游标"**
+// （Poll 交给调用方的那一格），不是后台的拉取游标 —— 与 Java
+// `AssignedMessageQueue.MessageQueueState{pullOffset, consumeOffset}` + `offsetStore` 的
+// 三张表同口径，详见 Commit() 的注释。
 //
 // 设计取舍（与 C++ / Python 参考实现一致）：
 // - 后台**单个**拉取线程顺序遍历所有已分配队列做短轮询（suspend=false），把消息塞进
@@ -78,9 +81,25 @@ public sealed class DefaultLitePullConsumer
 
     private readonly object _bufferLock = new();
     private readonly Queue<MessageExt> _localBuffer = new();
+    /// <summary>
+    /// **拉取游标**（Java <c>MessageQueueState.pullOffset</c>）：只回答"下一次从哪拉"，
+    /// 任何情况下都不是提交内容。
+    /// </summary>
     private readonly Dictionary<MessageQueue, long> _nextOffset = new();
+    /// <summary>
+    /// **已消费游标**（Java <c>MessageQueueState.consumeOffset</c>）：只有 Poll() 把消息交到
+    /// 调用方手上才前进，本地缓冲里压着的部分不算已消费。
+    /// </summary>
+    private readonly Dictionary<MessageQueue, long> _consumeOffset = new();
+    /// <summary>
+    /// 内存位点表，对位 Java <c>RemoteBrokerOffsetStore.offsetTable</c>：提交的落点，
+    /// <c>persist=false</c> 的值就攒在这里。
+    /// </summary>
+    private readonly Dictionary<MessageQueue, long> _offsetTable = new();
     private readonly Dictionary<MessageQueue, long> _seekOffset = new();
-    private readonly Dictionary<MessageQueue, long> _lastCommit = new();
+    // Java DefaultLitePullConsumerImpl.nextAutoCommitDeadline 的初值：**-1** 而不是 0
+    // （0 是 epoch 起点，等价于"永远不到点"）⇒ 第一次检查就会提交一次。
+    private long _nextAutoCommitDeadline = -1;
     private readonly HashSet<MessageQueue> _paused = new();
     private ILiteMessageQueueListener? _messageQueueListener;
 
@@ -243,6 +262,16 @@ public sealed class DefaultLitePullConsumer
         var set = new HashSet<MessageQueue>(messageQueues);
         lock (_lock)
         {
+            // Java assignedMessageQueue.updateAssignedMessageQueue：撤掉的队列连着整份
+            // MessageQueueState 丢掉（拉取游标与已消费游标一起消失）。**不**动内存位点表、
+            // 也不 persist —— 那份清理挂在 subscribe 模式的 rebalance 上，assign 不走 rebalance。
+            foreach (MessageQueue mq in _assigned)
+            {
+                if (set.Contains(mq)) continue;
+                _nextOffset.Remove(mq);
+                _consumeOffset.Remove(mq);
+            }
+
             _assigned.Clear();
             foreach (MessageQueue mq in set) _assigned.Add(mq);
             foreach (MessageQueue mq in _assigned)
@@ -339,17 +368,6 @@ public sealed class DefaultLitePullConsumer
                 foreach (MessageQueue mq in _assigned)
                 {
                     _mqClient.RegisterTopicInUse(mq.Topic);
-                    if (!_nextOffset.ContainsKey(mq))
-                    {
-                        try
-                        {
-                            _nextOffset[mq] = ResolveInitialOffset(mq);
-                        }
-                        catch
-                        {
-                            ClientLog.Debug("lite start: resolve initial offset failed for " + mq);
-                        }
-                    }
                 }
             }
 
@@ -363,6 +381,29 @@ public sealed class DefaultLitePullConsumer
             SendHeartbeatToAllBroker();
             _running = true;
             _started = true;
+
+            // assign 模式的起点必须排在「实例已启动 + 路由已刷新」之后：查已提交位点既要过
+            // RequireClient() 的状态检查，又要按 brokerName 找 broker 地址，而本端口的
+            // MQClientInstance 不像 Java 的 admin 路径那样按需拉路由 —— 早一步算就是查不到，
+            // 异常被吞掉之后 Start() 返回时拉取游标还停在 -1。
+            // Java 的对应位置在 start() 把 serviceState 置成 RUNNING 之后的
+            // operateAfterRunning → updateAssignPullTask → computePullOffset。
+            if (_assignMode)
+            {
+                foreach (MessageQueue mq in _assigned)
+                {
+                    if (_nextOffset.ContainsKey(mq)) continue;
+                    try
+                    {
+                        _nextOffset[mq] = ResolveInitialOffset(mq);
+                    }
+                    catch
+                    {
+                        ClientLog.Debug("lite start: resolve initial offset failed for " + mq);
+                    }
+                }
+            }
+
             _heartbeatThread = new Thread(HeartbeatLoop) { IsBackground = true, Name = "rmq-lite-hb-" + _clientId };
             _heartbeatThread.Start();
             _pullThread = new Thread(PullServiceLoop) { IsBackground = true, Name = "rmq-lite-pull-" + _consumerId() };
@@ -372,28 +413,39 @@ public sealed class DefaultLitePullConsumer
 
     public void Shutdown()
     {
+        bool autoCommit;
+        List<MessageQueue> scope;
         lock (_lock)
         {
             if (!_started) return;
             _started = false;
             _running = false;
-            if (_autoCommit)
-            {
-                try
-                {
-                    Commit();
-                }
-                catch
-                {
-                    ClientLog.Debug("lite shutdown commit failed");
-                }
-            }
+            autoCommit = _autoCommit;
+            scope = new List<MessageQueue>(_assigned);
+        }
 
-            lock (_bufferLock)
-            {
-                Monitor.PulseAll(_bufferLock);
-            }
+        // Java 的 shutdown 走 persistConsumerOffset()：把内存位点表按当下持有的队列刷一遍，
+        // 与 auto_commit 无关（手动模式 persist=false 攒下的值同样要落盘）。自动提交模式再多
+        // 走一步 Commit()：本端口没有 Java 那份 5s 定时器，"poll 交出去但还没到截止时刻"的
+        // 位点得在这里补上，否则重启后从上一格重投。
+        // ⚠ 必须在 _lock 之外发：提交是 RPC，抱着锁做网络会把整条 poll/拉取路径卡住。
+        try
+        {
+            if (autoCommit) Commit();
+            else PersistOffsetTable(scope);
+        }
+        catch
+        {
+            ClientLog.Debug("lite shutdown commit failed");
+        }
 
+        lock (_bufferLock)
+        {
+            Monitor.PulseAll(_bufferLock);
+        }
+
+        lock (_lock)
+        {
             if (_pullThread is { IsAlive: true }) _pullThread.Join(2000);
             if (_heartbeatThread is { IsAlive: true }) _heartbeatThread.Join(2000);
             _mqClient?.Shutdown();
@@ -493,10 +545,11 @@ public sealed class DefaultLitePullConsumer
                 Enqueue(msgs);
                 lock (_lock)
                 {
+                    // 只推进**拉取游标**。「已消费游标」是 Poll() 交付时才写的，两条线不是一条：
+                    // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
                     _nextOffset[mq] = msgs[msgs.Count - 1].QueueOffset + 1;
                 }
 
-                if (_autoCommit) MaybeCommit(mq);
                 return true;
             }
         }
@@ -530,36 +583,95 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    private void MaybeCommit(MessageQueue mq)
+    /// <summary>
+    /// 对位 Java <c>DefaultLitePullConsumerImpl#maybeAutoCommit</c>：只有一道全局截止时刻，
+    /// 到点走一次 <see cref="Commit()"/> 并把截止时刻推到 <c>now + autoCommitIntervalMillis</c>。
+    ///
+    /// 调用点与 Java 一致，只有 <see cref="Poll"/> 开头一处（外加 Shutdown 的兜底提交）。
+    /// Java 里空闲消费者靠 MQClientInstance 每 5s 的 persistConsumerOffset 定时器刷的是
+    /// **内存位点表**，而那张表也只有 commit 路径会写，所以停掉 poll 之后 Java 同样不会往前
+    /// 推进 broker 位点；这里若把它塞进拉取循环，就成了"没人 poll 也提交"，比 Java 激进。
+    /// </summary>
+    private void MaybeAutoCommit()
     {
         long now = UtilAll.CurrentTimeMillis();
-        bool due;
         lock (_lock)
         {
-            due = !_lastCommit.TryGetValue(mq, out long last) ||
-                  now - last >= _autoCommitIntervalMillis;
+            if (now < _nextAutoCommitDeadline) return;
+            _nextAutoCommitDeadline = now + _autoCommitIntervalMillis;
         }
 
-        if (!due) return;
         try
         {
-            RequireClient().UpdateConsumerOffset(_consumerGroup, mq, NextOffsetOf(mq));
-            lock (_lock)
-            {
-                _lastCommit[mq] = now;
-            }
+            Commit();
         }
         catch
         {
-            ClientLog.Debug("lite auto-commit failed for " + mq);
+            ClientLog.Debug("lite auto-commit failed");
         }
     }
 
-    private long NextOffsetOf(MessageQueue mq)
+    /// <summary>
+    /// Java <c>poll()</c> 出口处的 <c>updateConsumeOffset(mq, processQueue.removeMessage(msgs))</c>：
+    /// 消息交到调用方手上才算已消费。只更新**本实例持有**（有拉取记录）的队列，
+    /// 取每种队列里最大的那一格 +1。
+    /// </summary>
+    private void AdvanceConsumeOffset(IReadOnlyList<MessageExt> msgs)
+    {
+        if (msgs.Count == 0) return;
+        var held = new Dictionary<(string, string, int), MessageQueue>();
+        lock (_lock)
+        {
+            foreach (KeyValuePair<MessageQueue, long> kv in _nextOffset)
+            {
+                held[(kv.Key.Topic, kv.Key.BrokerName, kv.Key.QueueId)] = kv.Key;
+            }
+        }
+
+        var advanced = new Dictionary<MessageQueue, long>();
+        foreach (MessageExt m in msgs)
+        {
+            if (!held.TryGetValue((m.Topic, m.BrokerName, m.QueueId), out MessageQueue? mq)) continue;
+            long next = m.QueueOffset + 1;
+            if (!advanced.TryGetValue(mq, out long cur) || next > cur) advanced[mq] = next;
+        }
+
+        lock (_lock)
+        {
+            foreach (KeyValuePair<MessageQueue, long> kv in advanced)
+            {
+                if (kv.Value > (_consumeOffset.TryGetValue(kv.Key, out long cur) ? cur : -1))
+                {
+                    _consumeOffset[kv.Key] = kv.Value;
+                }
+            }
+        }
+    }
+
+    /// <summary>拉取游标（观测点：真机对拍要看的正是"拉了多少"与"交了多少"这两格的差）。</summary>
+    public long PullCursorOf(MessageQueue mq)
     {
         lock (_lock)
         {
-            return _nextOffset.TryGetValue(mq, out long o) ? o : 0;
+            return _nextOffset.TryGetValue(mq, out long o) ? o : -1;
+        }
+    }
+
+    /// <summary>已消费游标（Poll() 交出去的那一格）。</summary>
+    public long ConsumeCursorOf(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            return _consumeOffset.TryGetValue(mq, out long o) ? o : -1;
+        }
+    }
+
+    /// <summary>内存位点表里那一格（persist=false 提交但还没落盘的值就在这）。</summary>
+    public long PendingCommitOf(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            return _offsetTable.TryGetValue(mq, out long o) ? o : -1;
         }
     }
 
@@ -654,6 +766,7 @@ public sealed class DefaultLitePullConsumer
 
         HashSet<MessageQueue> old;
         bool changed;
+        List<MessageQueue> revoked = new();
         lock (_lock)
         {
             old = new HashSet<MessageQueue>(_assigned);
@@ -679,12 +792,29 @@ public sealed class DefaultLitePullConsumer
 
                 foreach (MessageQueue mq in old)
                 {
-                    if (!newSet.Contains(mq))
-                    {
-                        _nextOffset.Remove(mq);
-                        _lastCommit.Remove(mq);
-                    }
+                    if (newSet.Contains(mq)) continue;
+                    // Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq)
+                    // 再 removeOffset(mq) —— 撤手之前把最后一次提交的位点补发出去。
+                    // persist 是 RPC，抱着锁做网络会把整条 poll/拉取路径卡住，所以这里只把
+                    // **该补发的队列**记下来，锁外再发；表里那一格也留到发完再清。
+                    if (_offsetTable.ContainsKey(mq)) revoked.Add(mq);
+                    _nextOffset.Remove(mq);
+                    // 撤队列丢掉的是**整份 MessageQueueState**（pullOffset / consumeOffset /
+                    // seekOffset）：留着 seekOffset 就是让这条队列哪天回到本实例时静默跳回
+                    // 用户很久以前手动钉过的位置。
+                    _consumeOffset.Remove(mq);
+                    _seekOffset.Remove(mq);
                 }
+            }
+        }
+
+        // 锁外补发末次提交，发完再清掉内存位点表那一格（Java persist → removeOffset 的次序）。
+        foreach (MessageQueue mq in revoked)
+        {
+            PersistOffset(mq);
+            lock (_lock)
+            {
+                _offsetTable.Remove(mq);
             }
         }
 
@@ -728,8 +858,12 @@ public sealed class DefaultLitePullConsumer
     // ---------------- Poll / 位点 ----------------
     public List<MessageExt> Poll(int timeoutMillis = -1)
     {
+        // Java poll() 进来先按截止时刻试一次自动提交（拿锁之前做：提交要发 RPC，
+        // 抱着缓冲锁等网络会把 Enqueue 一起卡住）。
+        if (_autoCommit) MaybeAutoCommit();
         int timeout = timeoutMillis > 0 ? timeoutMillis : _pollTimeoutMillis;
         long deadline = UtilAll.CurrentTimeMillis() + timeout;
+        List<MessageExt> outMsgs;
         lock (_bufferLock)
         {
             while (_localBuffer.Count == 0)
@@ -739,14 +873,16 @@ public sealed class DefaultLitePullConsumer
                 Monitor.Wait(_bufferLock, (int)Math.Min(remaining, int.MaxValue - 1));
             }
 
-            var outMsgs = new List<MessageExt>();
+            outMsgs = new List<MessageExt>();
             while (_localBuffer.Count > 0 && outMsgs.Count < 1024)
             {
                 outMsgs.Add(_localBuffer.Dequeue());
             }
-
-            return outMsgs;
         }
+
+        // 消息交到调用方手上才推进已消费游标（Java 同一处 updateConsumeOffset）。
+        AdvanceConsumeOffset(outMsgs);
+        return outMsgs;
     }
 
     public void Seek(MessageQueue mq, long offset)
@@ -755,6 +891,9 @@ public sealed class DefaultLitePullConsumer
         {
             _seekOffset[mq] = offset;
             _nextOffset[mq] = offset;
+            // Java 的 seek 只置 seekOffset，下一次拉取时 nextPullOffset() 才把它同时写进
+            // consumeOffset（"跳回去"意味着"那里之前都还没消费"，否则重放的消息会被旧位点跳过）。
+            _consumeOffset[mq] = offset;
         }
 
         lock (_bufferLock)
@@ -777,42 +916,202 @@ public sealed class DefaultLitePullConsumer
 
     public void SeekToEnd(MessageQueue mq) => Seek(mq, RequireClient().GetMaxOffset(mq));
 
+    /// <summary>
+    /// Java <c>committed()</c> 走 <c>offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)</c>：
+    /// 先看内存位点表（<c>persist=false</c> 刚提交、还没发给 broker 的值也算数），
+    /// 再问 broker，并把 broker 的值回填进表里（Java 同一处也回填）。-1 表示 broker 无记录。
+    /// </summary>
     public long Committed(MessageQueue mq)
     {
-        if (_mqClient is null) return -1;
+        lock (_lock)
+        {
+            if (_offsetTable.TryGetValue(mq, out long cached)) return cached;
+        }
+
+        MQClientInstance? client = _mqClient;
+        if (client is null) return -1;
+        long off;
         try
         {
-            if (RequireClient().QueryConsumerOffset(_consumerGroup, mq, out long off)) return off;
+            if (!client.QueryConsumerOffset(_consumerGroup, mq, out off)) return -1;
         }
         catch
         {
+            return -1;
         }
 
-        return -1;
-    }
-
-    public void Commit()
-    {
-        long now = UtilAll.CurrentTimeMillis();
-        Dictionary<MessageQueue, long> snapshot;
         lock (_lock)
         {
-            snapshot = new Dictionary<MessageQueue, long>(_nextOffset);
+            _offsetTable[mq] = off;
         }
 
-        foreach (KeyValuePair<MessageQueue, long> kv in snapshot)
+        return off;
+    }
+
+    /// <summary>
+    /// 对位 Java <c>commitAll()</c>：按**已消费游标**提交所有当下持有的队列。
+    ///
+    /// 提交源绝不能是拉取游标：本地缓冲里压着没交出去的消息不算已消费，提前提交会让那段
+    /// 消息在重启后永远不再投递（静默丢消息）。
+    /// </summary>
+    public void Commit()
+    {
+        List<MessageQueue> scope;
+        Dictionary<MessageQueue, long> targets = new();
+        lock (_lock)
+        {
+            scope = new List<MessageQueue>(_assigned);
+            foreach (MessageQueue mq in scope)
+            {
+                targets[mq] = _consumeOffset.TryGetValue(mq, out long o) ? o : -1;
+            }
+        }
+
+        CommitTargets(targets, scope, persist: true);
+    }
+
+    /// <summary>
+    /// 对位 Java <c>commit(Map, persist)</c>：调用方指定位点，**只改提交落点，两条游标都不动**。
+    /// 空 map 与 Java 一样记一条 warn 就 return，连表都不碰（上一轮 persist=false 攒下的
+    /// 内存值原样保留）。
+    /// </summary>
+    public void Commit(IReadOnlyDictionary<MessageQueue, long> offsets, bool persist = true)
+    {
+        if (offsets.Count == 0)
+        {
+            ClientLog.Warn("MessageQueues is empty, Ignore this commit ");
+            return;
+        }
+
+        var targets = new Dictionary<MessageQueue, long>(offsets);
+        var scope = new List<MessageQueue>(targets.Keys);
+        CommitTargets(targets, scope, persist);
+    }
+
+    /// <summary>
+    /// 对位 Java <c>commit(Set, persist)</c>：只提交点名这几条队列，取的是它们当下的
+    /// **已消费游标**。空集合静默 return（Java 同）。
+    /// </summary>
+    public void Commit(IReadOnlyCollection<MessageQueue> messageQueues, bool persist = true)
+    {
+        if (messageQueues.Count == 0) return;
+        var scope = new List<MessageQueue>(messageQueues);
+        var targets = new Dictionary<MessageQueue, long>();
+        lock (_lock)
+        {
+            foreach (MessageQueue mq in scope)
+            {
+                targets[mq] = _consumeOffset.TryGetValue(mq, out long o) ? o : -1;
+            }
+        }
+
+        CommitTargets(targets, scope, persist);
+    }
+
+    /// <summary>
+    /// 三个入口的共同部分：写内存位点表（两道守卫），<c>persist</c> 再把这一批刷给 broker。
+    ///
+    /// 两处已知的偏离，与 Python 逐字对应：
+    /// ① Java 的 commitAll() 只写内存表，真正发给 broker 靠 MQClientInstance 每
+    ///    persistConsumerOffsetInterval（5s）一次的定时器；本端口的 lite 消费者没挂那个定时器，
+    ///    所以 persist=true（默认）就地发出去。
+    /// ② Java 的 persistAll 用 oneway、异常只记日志；这里发同步带应答，坏位点当场可见。
+    /// </summary>
+    private void CommitTargets(Dictionary<MessageQueue, long> targets, List<MessageQueue> scope,
+        bool persist)
+    {
+        lock (_lock)
+        {
+            foreach (KeyValuePair<MessageQueue, long> kv in targets)
+            {
+                if (kv.Value == -1)
+                {
+                    // Java 原文：这条队列还没消费过，记 error 并跳过。绝不能把 -1 写给 broker
+                    // —— 位点 -1 会让下次消费从队首重投全量。
+                    ClientLog.Error("consumerOffset is -1 in messageQueue [" + kv.Key + "].");
+                    continue;
+                }
+
+                if (!_assigned.Contains(kv.Key))
+                {
+                    // Java 的 processQueue != null && !isDropped() 守卫：不是本实例持有的队列
+                    // 一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
+                    continue;
+                }
+
+                _offsetTable[kv.Key] = kv.Value;
+            }
+        }
+
+        if (persist) PersistOffsetTable(scope);
+    }
+
+    /// <summary>
+    /// Java <c>OffsetStore#persist(mq)</c>：只把这一条队列的内存位点发给 broker，不做清理。
+    /// </summary>
+    private void PersistOffset(MessageQueue mq)
+    {
+        long offset;
+        lock (_lock)
+        {
+            if (!_offsetTable.TryGetValue(mq, out offset)) return;
+        }
+
+        MQClientInstance? client = _mqClient;
+        if (client is null) return;
+        try
+        {
+            client.UpdateConsumerOffset(_consumerGroup, mq, offset);
+        }
+        catch
+        {
+            ClientLog.Debug("lite persist failed for " + mq);
+        }
+    }
+
+    /// <summary>
+    /// Java <c>RemoteBrokerOffsetStore#persistAll(Set)</c>：内存位点表里落在 <c>mqs</c> 上的
+    /// 那部分写给 broker，**不在**其中的条目顺手从表里删掉（Java 日志里那句
+    /// <c>remove unused mq</c>）。
+    ///
+    /// 后半句是 Java 的真实行为：这张表只服务于当下持有的队列。代价是
+    /// <c>Commit(部分队列, persist: true)</c> 会把其余队列**尚未落盘**的内存值一起丢掉 ——
+    /// 要提交谁就一次给全。
+    /// </summary>
+    private void PersistOffsetTable(ICollection<MessageQueue> mqs)
+    {
+        if (mqs.Count == 0) return;
+        var wanted = new HashSet<MessageQueue>(mqs);
+        var toSend = new List<KeyValuePair<MessageQueue, long>>();
+        lock (_lock)
+        {
+            foreach (MessageQueue mq in new List<MessageQueue>(_offsetTable.Keys))
+            {
+                if (!wanted.Contains(mq))
+                {
+                    _offsetTable.Remove(mq);
+                    continue;
+                }
+
+                toSend.Add(new KeyValuePair<MessageQueue, long>(mq, _offsetTable[mq]));
+            }
+        }
+
+        // 未启动时表照样写得进去、只是发不出去（Python/C++/Rust 同）：Java 在这里会先
+        // checkServiceState 抛错，本端口放宽这一步，好让表逻辑能离线单测。
+        // 直接读连接字段而不是 RequireClient()：Shutdown 已经翻掉 started 标记，
+        // 但末次提交仍要用这条还没关掉的连接。
+        MQClientInstance? client = _mqClient;
+        if (client is null) return;
+        foreach (KeyValuePair<MessageQueue, long> kv in toSend)
         {
             try
             {
-                RequireClient().UpdateConsumerOffset(_consumerGroup, kv.Key, kv.Value);
-                lock (_lock)
-                {
-                    _lastCommit[kv.Key] = now;
-                }
+                client.UpdateConsumerOffset(_consumerGroup, kv.Key, kv.Value);
             }
             catch
             {
-                ClientLog.Debug("lite commit failed for " + kv.Key);
+                ClientLog.Debug("lite persist failed for " + kv.Key);
             }
         }
     }

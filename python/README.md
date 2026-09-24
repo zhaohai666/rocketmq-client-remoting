@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 921 条单元/协议测试（917 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 933 条单元/协议测试（929 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -34,7 +34,7 @@ python verify_hook_live.py        # CheckForbidden/FilterMessage 钩子（13 PAS
 python verify_validators_live.py  # 名字校验（24 PASS/0 FAIL）：非法 topic/group 本地快拒、合法名字照常收发、往返对照腿
 python verify_recall_live.py      # 定时消息撤回 recallMessage(370)（15 PASS/0 FAIL，脚本会打开并在退出时还原 broker 的 recallMessageEnable）
 python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）：clientId 后缀、broker 侧 topic 的 UNIT/UNIT_SUB 位、每笔请求的 ReqT
-python verify_lite_pull_live.py   # lite pull 全链路（32 PASS/0 FAIL）：rebalance/收 12 条/commit/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）
+python verify_lite_pull_live.py   # lite pull 全链路（61 PASS/0 FAIL）：rebalance/收 12 条/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）+ S3 **没人调 commit**、只继续 poll 过一整个自动提交周期（闸门只在 poll() 开头查）后 committed() 自己 >0 + **S8 三张位点表在真机各自数出来**（1 条队列的 topic 灌 1200 条：拉取游标 1200 / 已消费游标 -1 / broker 侧还查无提交（committed 回 -1）三个数互不相等 ⇒ 一次都没交付时把拉取游标提交上去就是静默丢消息；单次 poll 交 1024 ⇒ 落到 broker 的正是 1024 而不是 1200；commit(map) 改点位到 5 而两格游标都不动、退回的 176 条照旧交付、全程 1200 条不重不漏；persist=False 时 committed() 读到内存那格 777 而 broker 仍是 5；新实例的起点取 broker 上的 5 而不是另一个实例内存里的 777；seek 同时改两格游标；点名提交抹掉没点名的内存行（Java persistAll 的 remove unused mq）且清理不写 broker）
 python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS/0 FAIL）：SQL92 订阅启动时正好一笔 46、纯 TAG 订阅一笔不发；broker 真按属性过滤（red 只收 3 条、blue 不漏、'*' 对照组收 6 条、永不匹配收 0 条）；语法错的表达式让 start() 秒回 SUBSCRIPTION_PARSE_FAILED(23) 并就地回滚。需 broker 开 enablePropertyFilter=true
 python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
 python verify_async_send_live.py  # 异步发送内核 A1~A6（39 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核（一次回调、broker 逐条回 3 个 commitLog 偏移、读回的子消息带客户端 32 位 UNIQ_KEY）、shutdown 不等在途（36 笔全报错、一条都没落）

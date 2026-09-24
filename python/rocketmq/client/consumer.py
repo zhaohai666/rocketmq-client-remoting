@@ -3121,9 +3121,21 @@ class DefaultLitePullConsumer:
         self._local_buffer: Deque[MessageExt] = deque()
         self._buffer_lock = threading.Lock()
         self._buffer_cond = threading.Condition(self._buffer_lock)
+        # 拉取游标：对位 Java AssignedMessageQueue.MessageQueueState.pullOffset，
+        # 只表示"已经取到本地缓冲的最后一条之后"，由 _pull_one 前进。
         self._next_offset: Dict[MessageQueue, int] = {}
+        # 已消费游标：对位同一处的 consumeOffset，只有 poll() 把消息真交到调用方手上才前进
+        # （Java poll() 里的 assignedMessageQueue.updateConsumeOffset(mq, removeMessage(msgs))）。
+        # 与拉取游标分成两张表，才谈得上 commit(Map, persist)：调用方指定"提交到哪"时
+        # 绝不能顺手改掉"下次从哪拉"。
+        self._consume_offset: Dict[MessageQueue, int] = {}
+        # 提交落点：对位 Java OffsetStore 的内存位点表（RemoteBrokerOffsetStore.offsetTable）。
+        # commit* 三个入口都先写这张表，persist=true 才把它发给 broker；committed() 也先读它
+        # （Java 的 ReadOffsetType.MEMORY_FIRST_THEN_STORE）。
+        self._offset_table: Dict[MessageQueue, int] = {}
         self._seek_offset: Dict[MessageQueue, int] = {}
-        self._last_commit: Dict[MessageQueue, float] = {}
+        # Java DefaultLitePullConsumerImpl.nextAutoCommitDeadline：初值 -1 ⇒ 第一次 poll 就提交一次。
+        self._next_auto_commit_deadline = -1
         self._paused: Set[MessageQueue] = set()
         self._message_queue_listener = None
         self._last_rebalance_ts = 0
@@ -3238,7 +3250,15 @@ class DefaultLitePullConsumer:
 
     def assign(self, message_queues) -> None:
         self._assign_mode = True
-        self._assigned = set(message_queues)
+        queues = set(message_queues)
+        # Java assignedMessageQueue.updateAssignedMessageQueue：撤掉的队列连着整份
+        # MessageQueueState 丢掉（拉取游标与已消费游标一起消失）。**不**动 offsetStore 的
+        # 内存位点表——那份清理挂在 rebalance 的 removeUnnecessaryMessageQueue 上，
+        # assign 模式不走 rebalance，所以 persist 也发生在这里之外（Java 同）。
+        for mq in self._assigned - queues:
+            self._next_offset.pop(mq, None)
+            self._consume_offset.pop(mq, None)
+        self._assigned = queues
         for mq in self._assigned:
             if mq not in self._next_offset:
                 try:
@@ -3323,11 +3343,17 @@ class DefaultLitePullConsumer:
             return
         self._started = False
         self._running = False
-        if self.auto_commit:
-            try:
+        # Java 的 shutdown 走 persistConsumerOffset()：把内存位点表按当下持有的队列刷一遍，
+        # 与 auto_commit 无关（手动模式用 persist=False 攒下的值同样要落盘）。
+        # 自动提交模式再多走一步 commit()：本端口没有 Java 那份 5s 定时器，
+        # "poll 交出去但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
+        try:
+            if self.auto_commit:
                 self.commit()
-            except Exception:
-                logger.debug("shutdown commit failed")
+            else:
+                self._persist_offset_table(self._assigned)
+        except Exception:  # noqa: BLE001
+            logger.debug("shutdown commit failed")
         # 唤醒可能的 poll() 等待，让其在关闭后尽快返回
         with self._buffer_cond:
             self._buffer_cond.notify_all()
@@ -3438,8 +3464,6 @@ class DefaultLitePullConsumer:
                 self._enqueue(msgs)
                 last = msgs[-1]
                 self._next_offset[mq] = last.queue_offset + 1
-                if self.auto_commit:
-                    self._maybe_commit(mq)
                 return True
         return False
 
@@ -3466,16 +3490,23 @@ class DefaultLitePullConsumer:
             self._local_buffer.extend(msgs)
             self._buffer_cond.notify_all()
 
-    def _maybe_commit(self, mq: MessageQueue) -> None:
+    def _maybe_auto_commit(self) -> None:
+        """对位 Java ``DefaultLitePullConsumerImpl#maybeAutoCommit``：到点提交**全部**已分配队列。
+
+        调用点和 Java 一样只有 ``poll()`` 开头一处（外加 ``shutdown()`` 的兜底提交）：
+        Java 里空闲消费者靠 MQClientInstance 每 5s 的 ``persistConsumerOffset`` 定时器刷的
+        是**内存位点表**，而那张表也只有 ``commit`` 路径会写，所以停掉 poll 之后 Java 同样
+        不会往前推进 broker 位点。这里若偷放在拉取循环里查，就成了"没人 poll 也提交"，
+        比 Java 激进，故不放。
+
+        提交的是"已消费游标"而不是拉取游标——缓冲里还没交给调用方的消息不算已消费，
+        这和 Java 的 ``processQueue.removeMessage`` 只在 poll 里前进 consumeOffset 同口径。
+        """
         now = time.time() * 1000.0
-        last = self._last_commit.get(mq, 0.0)
-        if now - last < self.auto_commit_interval_millis:
+        if now < self._next_auto_commit_deadline:
             return
-        try:
-            self._mq_client.update_consumer_offset(self.consumer_group, mq, self._next_offset[mq])
-            self._last_commit[mq] = now
-        except Exception as e:  # noqa: BLE001
-            logger.debug("lite auto-commit failed for %s: %s", mq, e)
+        self._next_auto_commit_deadline = now + self.auto_commit_interval_millis
+        self.commit()
 
     def _resolve_initial_offset(self, mq: MessageQueue) -> int:
         if mq in self._seek_offset:
@@ -3543,8 +3574,18 @@ class DefaultLitePullConsumer:
                     except Exception:
                         logger.debug("rebalance: resolve offset failed for %s", mq)
             for mq in (old - new_set):
+                # Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq)
+                # 再 removeOffset(mq)——撤手之前把最后一次提交的位点补发出去，
+                # 别让已经消费过的队列从上一个 5s 窗口起重新投一遍。
+                self._persist_offset(mq)
                 self._next_offset.pop(mq, None)
-                self._last_commit.pop(mq, None)
+                # AssignedMessageQueue 的条目也一起丢掉：Java 撤队列时 removeAssignMessageQueue
+                # 丢掉的是**整份 MessageQueueState**（pullOffset / consumeOffset / seekOffset），
+                # 留着 seekOffset 就是让这条队列哪天回到本实例时静默跳回用户很久以前
+                # 手动钉过的位置。offsetStore 的那一格上面 persist 已经清掉了。
+                self._consume_offset.pop(mq, None)
+                self._offset_table.pop(mq, None)
+                self._seek_offset.pop(mq, None)
             if self._message_queue_listener is not None:
                 try:
                     self._message_queue_listener.message_queue_changed(list(new_set), list(old))
@@ -3555,6 +3596,10 @@ class DefaultLitePullConsumer:
     def poll(self, timeout: Optional[int] = None) -> List[MessageExt]:
         if timeout is None:
             timeout = self.poll_timeout_millis
+        # Java poll() 进来先按截止时刻试一次自动提交（拿锁之前做：提交要发 RPC，
+        # 抱着缓冲锁等网络会把 _enqueue 一起卡住）。
+        if self.auto_commit:
+            self._maybe_auto_commit()
         deadline = time.time() + (timeout / 1000.0)
         with self._buffer_cond:
             while not self._local_buffer:
@@ -3565,11 +3610,27 @@ class DefaultLitePullConsumer:
             out: List[MessageExt] = []
             while self._local_buffer and len(out) < 1024:
                 out.append(self._local_buffer.popleft())
-            return out
+        # 对位 Java poll()：消息交到调用方手上才推进"已消费游标"
+        # （assignedMessageQueue.updateConsumeOffset(mq, processQueue.removeMessage(msgs))）。
+        # 拉取游标 _next_offset 一律不动——提交位点绝不能改掉"下次从哪拉"。
+        held = {(q.topic, q.broker_name, q.queue_id): q for q in self._next_offset}
+        advanced: Dict[MessageQueue, int] = {}
+        for m in out:
+            mq = held.get((m.topic, m.broker_name, m.queue_id))
+            if mq is None:
+                continue
+            nxt = m.queue_offset + 1
+            if nxt > advanced.get(mq, -1):
+                advanced[mq] = nxt
+        self._consume_offset.update(advanced)
+        return out
 
     def seek(self, mq: MessageQueue, offset: int) -> None:
         self._seek_offset[mq] = offset
         self._next_offset[mq] = offset
+        # Java 的 seek 只置 seekOffset，下一次拉取时 nextPullOffset() 才把它同时写进
+        # consumeOffset（"跳回去"意味着"那里之前都还没消费"，否则重放的消息会被位点跳过）。
+        self._consume_offset[mq] = offset
         with self._buffer_cond:
             kept = [m for m in self._local_buffer
                     if not (m.topic == mq.topic and m.broker_name == mq.broker_name
@@ -3582,16 +3643,105 @@ class DefaultLitePullConsumer:
     def seek_to_end(self, mq: MessageQueue) -> None:
         self.seek(mq, self._mq_client.get_max_offset(mq))
 
-    def committed(self, mq: MessageQueue) -> Optional[int]:
-        return self._mq_client.query_consumer_offset(self.consumer_group, mq)
+    def pull_cursor_of(self, mq: MessageQueue) -> int:
+        """拉取游标（观测点：真机对拍要看的正是"拉了多少"与"交了多少"这两格的差）。"""
+        return self._next_offset.get(mq, -1)
 
-    def commit(self) -> None:
-        for mq, off in list(self._next_offset.items()):
-            try:
-                self._mq_client.update_consumer_offset(self.consumer_group, mq, off)
-                self._last_commit[mq] = time.time() * 1000.0
-            except Exception as e:  # noqa: BLE001
-                logger.debug("lite commit failed for %s: %s", mq, e)
+    def consume_cursor_of(self, mq: MessageQueue) -> int:
+        """已消费游标（``poll()`` 交出去的那一格）。"""
+        return self._consume_offset.get(mq, -1)
+
+    def pending_commit_of(self, mq: MessageQueue) -> int:
+        """内存位点表里那一格（``persist=False`` 提交但还没落盘的值就在这）。"""
+        return self._offset_table.get(mq, -1)
+
+    def committed(self, mq: MessageQueue) -> Optional[int]:
+        """Java ``committed()`` 走 ``offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)``：
+        先看内存位点表（``persist=False`` 刚提交、还没发给 broker 的值也算数），
+        再问 broker，并把 broker 的值回填进表里（Java 同一处也回填）。"""
+        cached = self._offset_table.get(mq)
+        if cached is not None:
+            return cached
+        broker_offset = self._mq_client.query_consumer_offset(self.consumer_group, mq)
+        if broker_offset is not None:
+            self._offset_table[mq] = broker_offset
+        return broker_offset
+
+    def _persist_offset(self, mq: MessageQueue) -> None:
+        """Java ``OffsetStore#persist(mq)``：只把这一条队列的内存位点发给 broker，不做清理。"""
+        offset = self._offset_table.get(mq)
+        if offset is None:
+            return
+        try:
+            self._mq_client.update_consumer_offset(self.consumer_group, mq, offset)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lite persist failed for %s: %s", mq, e)
+
+    def _persist_offset_table(self, mqs) -> None:
+        """Java ``RemoteBrokerOffsetStore#persistAll(Set)``：内存位点表里落在 ``mqs`` 上的
+        那部分写给 broker，**不在**其中的条目顺手从表里删掉（Java 日志里那句 ``remove unused mq``）。
+
+        后半句是 Java 的真实行为：这张表只服务于当下持有的队列，撤走的队列留在表里没人再
+        提交，persistAll 一路扫过去就清掉。代价是 ``commit(部分队列, persist=True)`` 会把其余
+        队列**尚未落盘**的内存值一起丢掉——要提交谁就一次给全，别指望上一轮的其余队列还在表里。
+        """
+        wanted = set(mqs)
+        if not wanted:
+            return
+        for mq in list(self._offset_table.keys()):
+            if mq not in wanted:
+                del self._offset_table[mq]
+                continue
+            self._persist_offset(mq)
+
+    def commit(self, offsets=None, persist: bool = True) -> None:
+        """提交消费位点。三个入口对位 Java ``DefaultLitePullConsumer`` 的三个重载：
+
+        - ``commit()``                       → ``commitAll()``：按"已消费游标"提交所有已分配队列
+        - ``commit({MessageQueue: offset})`` → ``commit(Map, persist)``：调用方指定位点
+        - ``commit([MessageQueue, ...])``     → ``commit(Set, persist)``：只提交这几条队列
+
+        指定位点**只改提交位置，不改拉取游标**：缓冲里已有的消息照旧交给调用方，下一轮
+        ``commit()`` 又会按游标把表覆盖回去（Java 同一处就是这个次序：Map 走
+        ``updateConsumeOffset`` 只写 offsetStore，``commitAll`` 每次重新从
+        ``assignedMessageQueue.getConsumerOffset`` 取数）。
+
+        两处已知的偏离，都在这条链路上：
+        ① Java 的 ``commitAll()`` 只写内存表，真正发给 broker 靠 MQClientInstance 每
+           ``persistConsumerOffsetInterval``（5s）一次的 ``persistConsumerOffset()``；本端口的
+           lite 消费者没挂那个定时器，所以 ``persist=True``（默认）就地发出去。
+        ② Java 的 ``persistAll`` 用 oneway（``updateConsumeOffsetToBroker(mq, offset)`` 那个
+           私有重载 ``isOneway=true``）、异常只记日志；这里发同步带应答，坏位点当场就能从日志看到。
+        """
+        if offsets is None:
+            # Java commitAll()：只遍历当下持有的队列
+            targets = {mq: self._consume_offset.get(mq, -1) for mq in self._assigned}
+            scope = self._assigned
+        elif isinstance(offsets, dict):
+            if not offsets:
+                logger.warning("MessageQueues is empty, Ignore this commit ")
+                return
+            targets = dict(offsets)
+            scope = targets.keys()
+        else:
+            queues = list(offsets)
+            if not queues:
+                return
+            targets = {mq: self._consume_offset.get(mq, -1) for mq in queues}
+            scope = queues
+
+        for mq, offset in targets.items():
+            if offset == -1:
+                logger.error("consumerOffset is -1 in messageQueue [%s].", mq)
+                continue
+            if mq not in self._assigned:
+                # Java 的 processQueue != null && !isDropped() 守卫：不是本实例持有的队列
+                # 一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
+                continue
+            self._offset_table[mq] = offset
+
+        if persist:
+            self._persist_offset_table(scope)
 
     def offset_for_timestamp(self, mq: MessageQueue, timestamp: int) -> int:
         return self._mq_client.search_offset_by_timestamp(mq, timestamp)

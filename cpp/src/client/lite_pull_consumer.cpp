@@ -142,17 +142,41 @@ void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic
 }
 
 void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQueues) {
-    assignMode_ = true;
-    assigned_ = std::set<MessageQueue>(messageQueues.begin(), messageQueues.end());
-    for (const MessageQueue& mq : assigned_) {
-        if (nextOffset_.find(mq) == nextOffset_.end()) {
-            try {
-                nextOffset_[mq] = resolveInitialOffset(mq);
-        } catch (...) {
-            logger_debug("lite assign: resolve initial offset failed for " + mq.toString());
+    std::set<MessageQueue> queues(messageQueues.begin(), messageQueues.end());
+    std::vector<MessageQueue> toResolve;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        assignMode_ = true;
+        // Java assignedMessageQueue.updateAssignedMessageQueue：撤掉的队列连着整份
+        // MessageQueueState 丢掉（拉取游标与已消费游标一起消失）。**不**动 offsetTable_——
+        // 那份清理挂在 rebalance 的 removeUnnecessaryMessageQueue 上，assign 模式不走
+        // rebalance，所以 persist 也发生在这里之外（Java 同）。
+        for (const MessageQueue& mq : assigned_) {
+            if (queues.find(mq) == queues.end()) {
+                nextOffset_.erase(mq);
+                consumeOffset_.erase(mq);
+            }
+        }
+        assigned_ = queues;
+        for (const MessageQueue& mq : assigned_) {
+            if (nextOffset_.find(mq) == nextOffset_.end()) toResolve.push_back(mq);
         }
     }
-}
+    // resolveInitialOffset 要发 RPC，绝不能抱着 stateMutex_ 做。
+    for (const MessageQueue& mq : toResolve) {
+        int64_t offset = 0;
+        try {
+            offset = resolveInitialOffset(mq);
+        } catch (...) {
+            logger_debug("lite assign: resolve initial offset failed for " + mq.toString());
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        // 期间可能被 rebalance/assign 改过：只给当下还持有的队列写回游标。
+        if (assigned_.find(mq) != assigned_.end() && nextOffset_.find(mq) == nextOffset_.end()) {
+            nextOffset_[mq] = offset;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 生命周期
@@ -254,12 +278,23 @@ void DefaultLitePullConsumer::shutdown() {
     if (!started_) return;
     started_ = false;
     running_ = false;
-    if (autoCommit_) {
-        try {
+    // Java 的 shutdown 走 persistConsumerOffset()：把内存位点表按当下持有的队列刷一遍，
+    // 与 autoCommit 无关（手动模式用 persist=false 攒下的值同样要落盘）。
+    // 自动提交模式再多走一步 commit()：本端口没有 Java 那份 5s 定时器，
+    // "poll 交出去但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
+    try {
+        if (autoCommit_) {
             commit();
-        } catch (...) {
-            logger_debug("lite shutdown commit failed");
+        } else {
+            std::set<MessageQueue> scope;
+            {
+                std::lock_guard<std::mutex> lk(stateMutex_);
+                scope = assigned_;
+            }
+            persistOffsetTable(scope);
         }
+    } catch (...) {
+        logger_debug("lite shutdown commit failed");
     }
     {
         std::lock_guard<std::mutex> lk(bufferMutex_);
@@ -286,9 +321,17 @@ void DefaultLitePullConsumer::pullServiceLoop() {
                 rebalance();
                 lastRebalanceTs_ = now;
             }
-            for (const MessageQueue& mq : assigned_) {
+            // assigned_ / paused_ 会被调用方线程的 assign()、pause() 改，先快照再遍历。
+            std::set<MessageQueue> snapshot;
+            std::set<MessageQueue> paused;
+            {
+                std::lock_guard<std::mutex> lk(stateMutex_);
+                snapshot = assigned_;
+                paused = paused_;
+            }
+            for (const MessageQueue& mq : snapshot) {
                 if (!running_) break;
-                if (paused_.find(mq) != paused_.end()) continue;
+                if (paused.find(mq) != paused.end()) continue;
                 if (pullOne(mq)) gotAny = true;
             }
         } catch (...) {
@@ -310,9 +353,33 @@ std::string DefaultLitePullConsumer::subscriptionFor(const std::string& topic) c
 }
 
 bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
-    auto it = nextOffset_.find(mq);
-    int64_t offset = (it != nextOffset_.end()) ? it->second : resolveInitialOffset(mq);
-    nextOffset_[mq] = offset;
+    int64_t offset = 0;
+    bool known = false;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        auto it = nextOffset_.find(mq);
+        if (it != nextOffset_.end()) {
+            offset = it->second;
+            known = true;
+        }
+    }
+    if (!known) {
+        // 首次拉取要问 broker 起点，这一步是 RPC：绝不能抱着 stateMutex_ 做。
+        int64_t resolved = 0;
+        try {
+            resolved = resolveInitialOffset(mq);
+        } catch (...) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        auto it = nextOffset_.find(mq);
+        if (it == nextOffset_.end()) {
+            nextOffset_[mq] = resolved;
+            offset = resolved;
+        } else {
+            offset = it->second;
+        }
+    }
     std::string sub = subscriptionFor(mq.topic);
     // 短轮询（suspend=false），位点由 auto-commit 单独提交（与 Java LitePull 一致）。
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
@@ -334,8 +401,12 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         filterTags(mq.topic, msgs, sub);
         if (!msgs.empty()) {
             enqueue(msgs);
-            nextOffset_[mq] = msgs.back().queueOffset + 1;
-            if (autoCommit_) maybeCommit(mq);
+            {
+                // 只推进拉取游标。「已消费游标」是 poll() 交付时才写的，两者不是一条线：
+                // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
+                std::lock_guard<std::mutex> lk(stateMutex_);
+                nextOffset_[mq] = msgs.back().queueOffset + 1;
+            }
             return true;
         }
     }
@@ -372,18 +443,23 @@ void DefaultLitePullConsumer::enqueue(const std::vector<MessageExt>& msgs) {
     bufferCv_.notify_all();
 }
 
-void DefaultLitePullConsumer::maybeCommit(const MessageQueue& mq) {
-    int64_t now = nowMillis();
-    auto lit = lastCommit_.find(mq);
-    if (lit != lastCommit_.end()) {
-        if (now - lit->second < autoCommitIntervalMillis_) return;
+void DefaultLitePullConsumer::maybeAutoCommit() {
+    // 对位 Java DefaultLitePullConsumerImpl#maybeAutoCommit：只有一道全局截止时刻，
+    // 到点提交**全部**已分配队列（Java 的 commitAll 也是遍历 assignedMessageQueue），
+    // 然后把截止时刻推到 now + autoCommitIntervalMillis_。初值 -1 ⇒ 第一次检查就提交一次，
+    // 那次手上还没有任何交付记录（游标是 -1），所发出去的仍是空操作。
+    //
+    // 调用点只有两个，和 Java 一致：poll() 开头，以及 shutdown()。Java 里空闲消费者
+    // 靠 MQClientInstance 每 5s 的 persistConsumerOffset 定时器兜底，本端口没挂那个定时器
+    // （见 commitOffsets 的偏离①），所以停 poll 之后到 shutdown 之前不会自动落位点。
+    // 拉取循环里**不**查这道闸：那会让本端口在没人 poll 时也往前提交，语义比 Java 激进。
+    const int64_t now = nowMillis();
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        if (now < nextAutoCommitDeadline_) return;
+        nextAutoCommitDeadline_ = now + autoCommitIntervalMillis_;
     }
-    try {
-        mqClient_->updateConsumerOffset(consumerGroup_, mq, nextOffset_[mq]);
-        lastCommit_[mq] = now;
-    } catch (...) {
-        logger_debug("lite auto-commit failed for " + mq.toString());
-    }
+    commit();
 }
 
 int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
@@ -392,8 +468,11 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    auto sit = seekOffset_.find(mq);
-    if (sit != seekOffset_.end()) return sit->second;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        auto sit = seekOffset_.find(mq);
+        if (sit != seekOffset_.end()) return sit->second;
+    }
     // 与 Java RebalanceLitePullImpl.computePullFromWhereWithException 同序：先读已提交位点，
     // 只有真正 QUERY_NOT_FOUND 时才按 consumeFromWhere 计算。broker 在 setZeroIfNotFound
     // 未设置且队首仍在 commitlog 内时会直接回 0，此时 consumeFromWhere 不参与。
@@ -442,35 +521,69 @@ void DefaultLitePullConsumer::rebalance() {
         } catch (const std::exception& e) {
             logger_error("allocate message queue exception. strategy name: "
                          + allocateStrategy_->getName() + ", ex: " + e.what());
+            std::lock_guard<std::mutex> lk(stateMutex_);
             for (const MessageQueue& mq : assigned_) {
                 if (mq.topic == kv.first) allocated.push_back(mq);
             }
         }
         newSet.insert(allocated.begin(), allocated.end());
     }
-    if (newSet != assigned_) {
-        std::set<MessageQueue> old = assigned_;
-        assigned_ = newSet;
-        for (const MessageQueue& mq : newSet) {
-            if (nextOffset_.find(mq) == nextOffset_.end()) {
-                try {
-                    nextOffset_[mq] = resolveInitialOffset(mq);
-                } catch (...) {
-                    logger_debug("lite rebalance: resolve offset failed for " + mq.toString());
+    std::set<MessageQueue> old;
+    std::vector<MessageQueue> toResolve;
+    std::vector<std::pair<MessageQueue, int64_t>> revoked;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        changed = (newSet != assigned_);
+        if (changed) {
+            old = assigned_;
+            assigned_ = newSet;
+            for (const MessageQueue& mq : newSet) {
+                if (nextOffset_.find(mq) == nextOffset_.end()) toResolve.push_back(mq);
+            }
+            for (const MessageQueue& mq : old) {
+                if (newSet.find(mq) == newSet.end()) {
+                    // Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq)
+                    // 再 removeOffset(mq)。persist 是 RPC，所以这里只把要补发的队列记下来，
+                    // 抱着锁做网络会把整条 poll/commit 路径卡住（下面统一发）。
+                    auto ot = offsetTable_.find(mq);
+                    if (ot != offsetTable_.end()) revoked.push_back(*ot);
+                    nextOffset_.erase(mq);
+                    // AssignedMessageQueue 的条目（连着 consumeOffset）一起丢掉：
+                    // 留着就是一个再没人提交的陈旧值。
+                    consumeOffset_.erase(mq);
+                    offsetTable_.erase(mq);
+                    seekOffset_.erase(mq);
                 }
             }
         }
-        for (const MessageQueue& mq : old) {
-            if (newSet.find(mq) == newSet.end()) {
-                nextOffset_.erase(mq);
-                lastCommit_.erase(mq);
-            }
+    }
+    if (!changed) return;
+            // 撤手之前把最后那次提交补发出去，别让新持有者从上一个窗口起重新投一遍。
+    for (const auto& kv : revoked) {
+        try {
+            mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
+        } catch (...) {
+            logger_debug("lite persist on revoke failed for " + kv.first.toString());
         }
-        if (messageQueueListener_ != nullptr) {
-            try {
-                messageQueueListener_->messageQueueChanged(mqAllOfSubscription(), newSetAsVector(newSet));
-            } catch (...) {
-            }
+    }
+    for (const MessageQueue& mq : toResolve) {
+        int64_t offset = 0;
+        try {
+            offset = resolveInitialOffset(mq);
+        } catch (...) {
+            logger_debug("lite rebalance: resolve offset failed for " + mq.toString());
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        if (assigned_.find(mq) != assigned_.end() && nextOffset_.find(mq) == nextOffset_.end()) {
+            nextOffset_[mq] = offset;
+        }
+    }
+    if (messageQueueListener_ != nullptr) {
+        try {
+            messageQueueListener_->messageQueueChanged(mqAllOfSubscription(), newSetAsVector(newSet));
+        } catch (...) {
         }
     }
 }
@@ -495,25 +608,54 @@ std::vector<MessageQueue> DefaultLitePullConsumer::newSetAsVector(const std::set
 // ---------------------------------------------------------------- poll / 位点
 std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
     int32_t timeout = timeoutMillis > 0 ? timeoutMillis : pollTimeoutMillis_;
+    // Java poll() 进来先按截止时刻试一次自动提交：拿缓冲锁之前做，提交要发 RPC，
+    // 抱着 bufferMutex_ 等网络会把 enqueue() 一起卡住。
+    if (autoCommit_) maybeAutoCommit();
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
-    std::unique_lock<std::mutex> lk(bufferMutex_);
-    while (localBuffer_.empty()) {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
-                             .count();
-        if (remaining <= 0) return {};
-        bufferCv_.wait_for(lk, std::chrono::milliseconds(remaining));
-    }
     std::vector<MessageExt> out;
-    while (!localBuffer_.empty() && out.size() < 1024) {
-        out.push_back(std::move(localBuffer_.front()));
-        localBuffer_.pop_front();
+    {
+        std::unique_lock<std::mutex> lk(bufferMutex_);
+        while (localBuffer_.empty()) {
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 deadline - std::chrono::steady_clock::now())
+                                 .count();
+            if (remaining <= 0) return {};
+            bufferCv_.wait_for(lk, std::chrono::milliseconds(remaining));
+        }
+        while (!localBuffer_.empty() && out.size() < 1024) {
+            out.push_back(std::move(localBuffer_.front()));
+            localBuffer_.pop_front();
+        }
     }
+    advanceConsumeOffset(out);
     return out;
 }
 
+void DefaultLitePullConsumer::advanceConsumeOffset(const std::vector<MessageExt>& msgs) {
+    if (msgs.empty()) return;
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    // 对位 Java poll()：消息交到调用方手上才推进「已消费游标」
+    // （assignedMessageQueue.updateConsumeOffset(mq, processQueue.removeMessage(msgs))）。
+    // 只认当下还持有（有拉取游标）的队列——别的实例刚被分走的队列不归我们记账；
+    // 同一次交付里按 offset 最大的那条定游标（缓冲可能交错混着几条队列）。
+    for (const MessageExt& m : msgs) {
+        const MessageQueue mq(m.topic, m.brokerName, m.queueId);
+        if (nextOffset_.find(mq) == nextOffset_.end()) continue;
+        const int64_t next = m.queueOffset + 1;
+        auto it = consumeOffset_.find(mq);
+        if (it == consumeOffset_.end() || next > it->second) consumeOffset_[mq] = next;
+    }
+}
+
 void DefaultLitePullConsumer::seek(const MessageQueue& mq, int64_t offset) {
-    seekOffset_[mq] = offset;
-    nextOffset_[mq] = offset;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        seekOffset_[mq] = offset;
+        nextOffset_[mq] = offset;
+        // Java nextPullOffset()：吃掉 seekOffset 时连同 consumeOffset 一起改写，
+        // 否则重放的那一段会被上一格的已提交位点盖过去（"跳回去"意味着"那里之前都还没消费"）。
+        consumeOffset_[mq] = offset;
+    }
     std::lock_guard<std::mutex> lk(bufferMutex_);
     std::deque<MessageExt> kept;
     for (MessageExt& m : localBuffer_) {
@@ -539,26 +681,142 @@ void DefaultLitePullConsumer::seekToEnd(const MessageQueue& mq) {
 }
 
 int64_t DefaultLitePullConsumer::committed(const MessageQueue& mq) {
+    // Java committed() 走 offsetStore.readOffset(mq, MEMORY_FIRST_THEN_STORE)：
+    // 先看内存位点表（persist=false 刚提交、还没发给 broker 的值也算数），
+    // 表里没有再问 broker，并把 broker 的值回填进表里（Java 同一处也回填）。
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        auto it = offsetTable_.find(mq);
+        if (it != offsetTable_.end()) return it->second;
+    }
     if (mqClient_ == nullptr) return -1;
     try {
         int64_t off = 0;
-        if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) return off;
+        if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) {
+            std::lock_guard<std::mutex> lk(stateMutex_);
+            offsetTable_[mq] = off;
+            return off;
+        }
     } catch (...) {
     }
     return -1;
 }
 
-void DefaultLitePullConsumer::commit() {
-    if (mqClient_ == nullptr) return;  // 未启动 / 已 shutdown：无可提交位点
-    int64_t now = nowMillis();
-    for (const auto& kv : nextOffset_) {
-        try {
-            mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
-            lastCommit_[kv.first] = now;
-        } catch (...) {
-            logger_debug("lite commit failed for " + kv.first.toString());
+void DefaultLitePullConsumer::persistOffset(const MessageQueue& mq) {
+    // Java OffsetStore#persist(mq)：只把这一条队列的内存位点发给 broker，不做清理。
+    int64_t offset = 0;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        auto it = offsetTable_.find(mq);
+        if (it == offsetTable_.end()) return;
+        offset = it->second;
+    }
+    if (mqClient_ == nullptr) return;
+    try {
+        mqClient_->updateConsumerOffset(consumerGroup_, mq, offset);
+    } catch (const std::exception& e) {
+        logger_debug("lite persist failed for " + mq.toString() + ": " + e.what());
+    } catch (...) {
+        logger_debug("lite persist failed for " + mq.toString());
+    }
+}
+
+void DefaultLitePullConsumer::persistOffsetTable(const std::set<MessageQueue>& mqs) {
+    // Java RemoteBrokerOffsetStore#persistAll(Set)：内存位点表里落在 mqs 上的那部分写给
+    // broker，**不在**其中的条目顺手从表里删掉（Java 日志里那句 remove unused mq）。
+    // 后半句是 Java 的真实行为：这张表只服务于当下持有的队列，撤走的队列留在表里没人再
+    // 提交，persistAll 一路扫过去就清掉。代价是 commit(部分队列, persist=true) 会把其余
+    // 队列**尚未落盘**的内存值一起丢掉——要提交谁就一次给全。
+    if (mqs.empty()) return;
+    std::vector<std::pair<MessageQueue, int64_t>> toSend;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        for (auto it = offsetTable_.begin(); it != offsetTable_.end();) {
+            if (mqs.find(it->first) == mqs.end()) {
+                it = offsetTable_.erase(it);
+                continue;
+            }
+            toSend.push_back(*it);
+            ++it;
         }
     }
+    if (mqClient_ == nullptr) return;
+    for (const auto& kv : toSend) {
+        try {
+            mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
+        } catch (...) {
+            logger_debug("lite persist failed for " + kv.first.toString());
+        }
+    }
+}
+
+void DefaultLitePullConsumer::commit() {
+    // Java commit() → commitAll()：按「已消费游标」提交所有已分配队列。
+    std::map<MessageQueue, int64_t> targets;
+    std::set<MessageQueue> scope;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        scope = assigned_;
+        for (const MessageQueue& mq : assigned_) {
+            auto it = consumeOffset_.find(mq);
+            targets[mq] = (it == consumeOffset_.end()) ? -1 : it->second;
+        }
+    }
+    commitOffsets(targets, scope, true);
+}
+
+void DefaultLitePullConsumer::commit(const std::map<MessageQueue, int64_t>& offsets,
+                                    bool persist) {
+    if (offsets.empty()) {
+        // Java commit(Map) 原文：空集合只记一条 warn 就 return，
+        // **不**碰 offsetStore，所以上一轮 persist=false 攒下的内存值也原样保留。
+        logger_warn("MessageQueues is empty, Ignore this commit ");
+        return;
+    }
+    std::set<MessageQueue> scope;
+    for (const auto& kv : offsets) scope.insert(kv.first);
+    commitOffsets(offsets, scope, persist);
+}
+
+void DefaultLitePullConsumer::commit(const std::set<MessageQueue>& messageQueues, bool persist) {
+    // Java commit(Set, persist)：集合为空直接 return（连 warn 都没有）。
+    if (messageQueues.empty()) return;
+    std::map<MessageQueue, int64_t> targets;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        for (const MessageQueue& mq : messageQueues) {
+            auto it = consumeOffset_.find(mq);
+            targets[mq] = (it == consumeOffset_.end()) ? -1 : it->second;
+        }
+    }
+    commitOffsets(targets, messageQueues, persist);
+}
+
+void DefaultLitePullConsumer::commitOffsets(const std::map<MessageQueue, int64_t>& targets,
+                                           const std::set<MessageQueue>& scope, bool persist) {
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        for (const auto& kv : targets) {
+            if (kv.second == -1) {
+                // Java commitAll 原文：这条队列还没消费过，记 error 并跳过，
+                // 绝不能把 -1 写进 broker（位点变 -1 会让下次消费从队首重投全量）。
+                logger_error("consumerOffset is -1 in messageQueue [" + kv.first.toString() + "].");
+                continue;
+            }
+            if (assigned_.find(kv.first) == assigned_.end()) {
+                // Java 的 processQueue != nullptr && !isDropped() 守卫：不是本实例持有的
+                // 队列一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
+                continue;
+            }
+            offsetTable_[kv.first] = kv.second;
+        }
+    }
+    // persistAll 只认 scope 里的队列：表里其余条目会被清掉（Java 同一处）。
+    // 两处与 Java 的偏离：① Java 的 commitAll 只写内存表，真正发给 broker 靠 MQClientInstance
+    // 每 persistConsumerOffsetInterval(5s) 一次的定时器，本端口的 lite 消费者没挂那个定时器，
+    // 所以 persist=true（默认）就地发出去；② Java 的 persistAll 用 oneway、异常只记日志，
+    // 这里发同步带应答，坏位点当场就能从日志看到。
+    if (persist) persistOffsetTable(scope);
 }
 
 int64_t DefaultLitePullConsumer::offsetForTimestamp(const MessageQueue& mq, int64_t timestamp) {
@@ -566,6 +824,18 @@ int64_t DefaultLitePullConsumer::offsetForTimestamp(const MessageQueue& mq, int6
         throw MQClientException("consumer not started, call start() first");
     }
     return mqClient_->searchOffsetByTimestamp(mq, timestamp);
+}
+
+int64_t DefaultLitePullConsumer::pullCursorOf(const MessageQueue& mq) {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    auto it = nextOffset_.find(mq);
+    return it == nextOffset_.end() ? -1 : it->second;
+}
+
+int64_t DefaultLitePullConsumer::consumeCursorOf(const MessageQueue& mq) {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    auto it = consumeOffset_.find(mq);
+    return it == consumeOffset_.end() ? -1 : it->second;
 }
 
 // ---------------------------------------------------------------- 队列查询 / 控制
@@ -578,14 +848,17 @@ std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std:
 }
 
 std::vector<MessageQueue> DefaultLitePullConsumer::assignment() {
+    std::lock_guard<std::mutex> lk(stateMutex_);
     return std::vector<MessageQueue>(assigned_.begin(), assigned_.end());
 }
 
 void DefaultLitePullConsumer::pause(const std::vector<MessageQueue>& messageQueues) {
+    std::lock_guard<std::mutex> lk(stateMutex_);
     paused_.insert(messageQueues.begin(), messageQueues.end());
 }
 
 void DefaultLitePullConsumer::resume(const std::vector<MessageQueue>& messageQueues) {
+    std::lock_guard<std::mutex> lk(stateMutex_);
     for (const MessageQueue& mq : messageQueues) {
         paused_.erase(mq);
     }

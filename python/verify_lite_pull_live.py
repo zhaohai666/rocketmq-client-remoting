@@ -12,7 +12,7 @@
 场景（围绕 Lite 相对 Pull 的本质区别：调用方不用管位点，poll 从本地缓冲拿消息）：
   S1 建 topic + subscribe 模式等待 rebalance 分到位点
   S2 先起消费者、再发 12 条（交替 TagA/TagB）→ subscribe + poll 收全 12 条且内容一致
-  S3 auto-commit：消费后 committed 位点 > 0，且 commit() 后可回读
+  S3 auto-commit：只读 committed()，继续 poll 过一整个自动提交周期后位点自己 > 0
   S4 assign 模式：显式 assign 全部队列 + seek 到队首 → poll 重新收全 12 条（验证 assign/seek/poll）
   S5 订阅 TagA：subscribe(T, "TagA") 只收 TagA 的 6 条（验证订阅级 tag 过滤）
   S6 CONSUME_FROM_TIMESTAMP：consumeTimestamp 按 Java 的 14 位本地墙钟解释
@@ -31,6 +31,8 @@
          resolver 的调用记录同时证明 rebalance 真的逐个问过队列/客户端的机房
      S7f MACHINE_ROOM：真实 brokerName 不含 '@'，白名单再怎么写都筛不出队列 ——
          验的是「配错机房安静饿死」（分不到队列、poll 不到消息、不打崩重平衡）
+  S8 三张位点表（对位 Java AssignedMessageQueue + OffsetStore）：1 队列 topic 灌 1200 条，
+      把「拉取游标 / 已消费游标 / 提交落点」三个数字在真机各自数出来
 """
 from __future__ import annotations
 
@@ -49,6 +51,7 @@ from rocketmq.client.consumer import (AllocateMachineRoomNearby,
                                       MachineRoomResolver)
 from rocketmq.client.exception import MQClientException
 from rocketmq.client.producer import DefaultMQProducer
+from rocketmq.client.send_result import SendStatus
 from rocketmq.common.message import Message, MessageQueue
 from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
 
@@ -258,6 +261,204 @@ class OneRoomResolver(MachineRoomResolver):
         return ROOM
 
 
+def broker_offset(probe: DefaultMQPullConsumer, mq: MessageQueue) -> int:
+    """独立探针读 broker 上这一格的位点；没提交过（QUERY_NOT_FOUND）记成 -1。"""
+    value = probe.fetch_consume_offset(mq)
+    return -1 if value is None else value
+
+
+def s8_three_offset_tables(foreign_pool: list) -> None:
+    """S8 三张位点表（对位 Java AssignedMessageQueue.MessageQueueState + RemoteBrokerOffsetStore）：
+    拉取游标 / 已消费游标 / 提交落点，在一队列 topic 上灌 1200 条，把三个数字在真机各自数出来。
+
+    单测锁得住表形状，锁不住「提交错一格在真机是静默丢消息」这条后果：把拉取游标当提交源，
+    位点会跑到消费前面，重启后那段消息永远不再投；反过来提交得太保守只会重复投，肉眼看得见。
+    与 C++ live_lite_pull.cpp 的 S8、Rust live_lite_pull_consumer.rs 的 L11 同场景同断言。
+    """
+    off_topic = "LiteOff_%d" % STAMP
+    off_group = "LiteOffPG_%d" % STAMP
+    n_big = 1200          # > poll 单次上限 1024 ⇒ 一次交付必然留下没交出去的尾巴
+
+    queues: list = []
+    landed = 0
+    prod = DefaultMQProducer("PG_PrepareOff_%d" % STAMP)
+    prod.set_namesrv_addr(NAMESRV)
+    prod.start()
+    try:
+        try:
+            prod.create_topic("TBW102", off_topic, 1)
+        except Exception as e:  # noqa: BLE001
+            print("!! create_topic(%s) failed: %s" % (off_topic, e))
+        route_deadline = time.time() + 20
+        while not queues and time.time() < route_deadline:
+            try:
+                queues = prod.fetch_publish_message_queues(off_topic)
+            except Exception:  # noqa: BLE001
+                queues = []
+            if not queues:
+                time.sleep(0.5)
+        check("S8 准备 topic（1 条队列）", len(queues) == 1, "queues=%d" % len(queues))
+        if len(queues) == 1:
+            for frm in range(0, n_big, 300):
+                chunk = [Message(off_topic, ("off-%04d" % i).encode())
+                         for i in range(frm, min(n_big, frm + 300))]
+                try:
+                    r = prod.send(chunk, timeout_millis=5000, mq=queues[0])
+                    if r.send_status == SendStatus.SEND_OK:
+                        landed += len(chunk)
+                except Exception as e:  # noqa: BLE001
+                    print("   send batch failed: %s" % e)
+    finally:
+        prod.shutdown()
+    check("S8 生产 %d 条成功" % n_big, landed == n_big, "landed=%d" % landed)
+
+    # 独立读 broker 位点的探针（自己的组、自己的连接，不碰被测实例的任何内存）
+    probe = DefaultMQPullConsumer(off_group)
+    probe.set_namesrv_addr(NAMESRV)
+    probe.start()
+
+    q0 = queues[0] if queues else MessageQueue(off_topic, "broker-a", 0)
+    o = DefaultLitePullConsumer(off_group)
+    o.set_namesrv_addr(NAMESRV)
+    o.instance_name = "liteoff"
+    o.client_id = "%s@%d#liteoff" % (off_group, STAMP)
+    o.set_poll_timeout_millis(1000)
+    o.set_pull_batch_size(32)
+    o.auto_commit = False            # 提交时机全部由场景控制
+    o.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
+    o.assign([q0])
+    o.start()
+    try:
+        # S8a 只拉不交付：拉取游标跑到 1200，已消费游标一格都不许动
+        pull_deadline = time.time() + 30
+        while o.pull_cursor_of(q0) < n_big and time.time() < pull_deadline:
+            time.sleep(0.2)
+        check("S8a 后台把 %d 条全拉进本地缓冲（拉取游标=%d）" % (n_big, o.pull_cursor_of(q0)),
+              o.pull_cursor_of(q0) == n_big, "pullCursor=%d" % o.pull_cursor_of(q0))
+        check("S8a 一条都没交付 ⇒ 已消费游标停在 -1", o.consume_cursor_of(q0) == -1,
+              "consumeCursor=%d" % o.consume_cursor_of(q0))
+        # 这条是 #68 的核心：旧实现 commit() 遍历的就是拉取游标，这里会把 1200 发出去，
+        # 调用方在此之前崩掉 ⇒ 1200 条一条都没消费过却再也不会投。
+        o.commit()
+        after_empty = broker_offset(probe, q0)
+        check("S8a 没交付过 ⇒ broker 位点没被推走（旧实现在这里提交 %d）" % n_big,
+              after_empty != n_big, "brokerOffset=%d" % after_empty)
+
+        # S8b poll 单次上限 1024 < 缓冲里的 1200 ⇒ 尾巴那 176 条不算已消费
+        first = o.poll(timeout=3000)
+        check("S8b 一次 poll 交出 1024 条（单次交付上限）", len(first) == 1024,
+              "got=%d" % len(first))
+        check("S8b 已消费游标 = 交出去的那一格", o.consume_cursor_of(q0) == 1024,
+              "consumeCursor=%d" % o.consume_cursor_of(q0))
+        check("S8b 缓冲里还压着 %d 条没交付" % (n_big - 1024),
+              o.pull_cursor_of(q0) == n_big and o.consume_cursor_of(q0) < o.pull_cursor_of(q0),
+              "pull=%d" % o.pull_cursor_of(q0))
+        o.commit()
+        broker_at = broker_offset(probe, q0)
+        check("S8b 提交给 broker 的正是 1024（不是 %d）" % n_big, broker_at == 1024,
+              "brokerOffset=%d" % broker_at)
+
+        # S8c 指定一个更靠前的位点：只改提交落点，两条游标都不许动
+        pull_before = o.pull_cursor_of(q0)
+        consume_before = o.consume_cursor_of(q0)
+        o.commit({q0: 5}, persist=True)
+        rewound = broker_offset(probe, q0)
+        check("S8c commit(map) 把 broker 位点改到调用方指定的 5", rewound == 5,
+              "brokerOffset=%d" % rewound)
+        check("S8c 提交位点不改拉取游标", o.pull_cursor_of(q0) == pull_before,
+              "pullCursor=%d" % o.pull_cursor_of(q0))
+        check("S8c 提交位点不改已消费游标", o.consume_cursor_of(q0) == consume_before,
+              "consumeCursor=%d" % o.consume_cursor_of(q0))
+        # 位点退回 5 之后，尾巴那 176 条照旧交付（缓冲与 broker 位点无关）
+        tail = o.poll(timeout=3000)
+        check("S8c 退回 5 之后缓冲里剩下的 %d 条照旧交付" % (n_big - 1024),
+              len(tail) == n_big - 1024, "got=%d" % len(tail))
+        bodies = {bytes(m.body) for m in first} | {bytes(m.body) for m in tail}
+        check("S8 全程收全 %d 条且一条不重不漏" % n_big, len(bodies) == n_big,
+              "distinct=%d" % len(bodies))
+
+        # S8d 一个字节都不许上线：committed() 看得见、broker 看不见
+        o.commit({q0: 777}, persist=False)
+        check("S8d persist=False：committed() 读到内存表的 777", o.committed(q0) == 777,
+              "committed=%s" % o.committed(q0))
+        still = broker_offset(probe, q0)
+        check("S8d persist=False：broker 侧还是上一轮的 5", still == 5,
+              "brokerOffset=%d" % still)
+
+        # S8e 新实例（同组）从 broker 上那一格续消费：内存表不跨实例
+        o2 = DefaultLitePullConsumer(off_group)
+        o2.set_namesrv_addr(NAMESRV)
+        o2.instance_name = "liteoff2"
+        o2.client_id = "%s@%d#liteoff2" % (off_group, STAMP)
+        o2.set_poll_timeout_millis(1000)
+        o2.set_pull_batch_size(32)
+        o2.auto_commit = False
+        o2.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
+        o2.assign([q0])
+        o2.start()
+        start2 = o2.pull_cursor_of(q0)
+        # 上界只要求「没吃到另一个实例内存里那格 777」：起点的拉取游标会被后台续拉往前推，
+        # 卡死等于 5 就成了赌时序（Rust L11e 同口径）。
+        check("S8e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
+              5 <= start2 < 777, "pullCursor=%d" % start2)
+        o2.shutdown()
+
+        # S8f seek 同时改写两条游标：重放的段不能被旧位点跳过
+        # 先暂停这条队列：后台续拉会把拉取游标推过 60，不停下来这条断言就成了赌时序。
+        o.pause([q0])
+        time.sleep(0.3)
+        o.seek(q0, 60)
+        check("S8f seek 改拉取游标", o.pull_cursor_of(q0) == 60,
+              "pullCursor=%d" % o.pull_cursor_of(q0))
+        check("S8f seek 也改已消费游标", o.consume_cursor_of(q0) == 60,
+              "consumeCursor=%d" % o.consume_cursor_of(q0))
+        o.commit()
+        seeked = broker_offset(probe, q0)
+        check("S8f seek 之后 commit 落到 60", seeked == 60, "brokerOffset=%d" % seeked)
+        o.resume([q0])
+
+        # S8g Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交
+        # 只发被点名的队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=False 攒下、
+        # 还没落盘的内存值就此丢掉。这条在 broker 上可观测：清掉之后 committed() 只能
+        # 回读到 broker 上那一格，再也读不到 300。
+        if len(foreign_pool) < 2:
+            check("S8g 需要主 topic 至少 2 条队列", False, "queues=%d" % len(foreign_pool))
+            return
+        foreign = foreign_pool[1]      # 另一个 topic 的队列，off_group 没碰过
+        o.assign([q0, foreign])        # 只多一条游标，不影响上面的对列
+        o.commit({q0: 300}, persist=False)
+        check("S8g 未落盘的内存值先看得见", o.pending_commit_of(q0) == 300,
+              "pending=%d" % o.pending_commit_of(q0))
+        # 空集合：Java 的 commit(Set) 直接 return，表不动、消息也不发
+        o.commit([], persist=True)
+        check("S8g 空集合不清表也不发消息", o.pending_commit_of(q0) == 300,
+              "pending=%d" % o.pending_commit_of(q0))
+        still2 = broker_offset(probe, q0)
+        check("S8g 空集合没动 broker", still2 == 60, "brokerOffset=%d" % still2)
+        # 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
+        # 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是「提交部分队列」的代价。
+        o.commit([foreign], persist=True)
+        check("S8g 点名提交会把没点名的内存值清掉（Java 的 remove unused mq）",
+              o.pending_commit_of(q0) == -1, "pending=%d" % o.pending_commit_of(q0))
+        check("S8g 清掉之后回读到的是 broker 上那一格（并回填进表）",
+              o.committed(q0) == 60 and o.pending_commit_of(q0) == 60,
+              "committed=%s pending=%d" % (o.committed(q0), o.pending_commit_of(q0)))
+        after_prune = broker_offset(probe, q0)
+        check("S8g 清理只是丢内存值，没往 broker 写 300", after_prune == 60,
+              "brokerOffset=%d" % after_prune)
+        # commit(Set) 取的是当下已消费游标，不是内存里那格
+        o.commit({q0: 300}, persist=False)
+        o.commit([q0], persist=True)
+        set_committed = broker_offset(probe, q0)
+        check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300",
+              set_committed == 60, "brokerOffset=%d" % set_committed)
+        check("S8g persistAll 之后内存表回到已消费游标（Java 的 updateConsumeOffset）",
+              o.pending_commit_of(q0) == 60, "pending=%d" % o.pending_commit_of(q0))
+    finally:
+        o.shutdown()
+        probe.shutdown()
+
+
 def main() -> int:
     print("LitePullConsumer 真机验证 topic=%s group=%s" % (TOPIC, GROUP1))
     prepare_topic()
@@ -285,11 +486,26 @@ def main() -> int:
 
     # ===== S3 auto-commit =====
     print("\nS3 auto-commit 位点")
+    # 场景故意不手动 commit：验的是「继续 poll 的常态下位点会自己落到 broker」。
+    # Java 的自动提交只在 poll() 开头按 nextAutoCommitDeadline 到点才跑（默认 5s），
+    # 而第一次检查发生在交付之前（已消费游标还是 -1，提交不出东西），所以要 poll 过一整个周期。
     before = {mq: c1.committed(mq) for mq in assigned}
-    c1.commit()
-    after = {mq: c1.committed(mq) for mq in assigned}
-    check("S3 各队列 committed 位点 > 0", all(v is not None and v > 0 for v in after.values()),
+    deadline = time.time() + 20
+    after = before
+    while time.time() < deadline:
+        c1.poll(timeout=500)          # 空转也算一次 poll：闸门是在 poll 里查的
+        after = {mq: c1.committed(mq) for mq in assigned}
+        if all(v is not None and v > 0 for v in after.values()):
+            break
+    check("S3 继续 poll 过自动提交周期后位点自己落盘（没人调 commit）",
+          all(v is not None and v > 0 for v in after.values()),
           "before=%s after=%s" % (before, after))
+    # 手动 commit 那条路也要能落盘：位点已经对上了，再提交一次不许把它挪回去
+    c1.commit()
+    after2 = {mq: c1.committed(mq) for mq in assigned}
+    check("S3 commit() 之后位点不回退",
+          all(after2[mq] is not None and after2[mq] >= (after[mq] or 0) for mq in assigned),
+          "after2=%s" % after2)
 
     # ===== S4 assign 模式：显式分配 + seek 到队首重新收全 =====
     print("\nS4 assign 模式：assign 全部队列 + seek 到队首重新收全")
@@ -520,6 +736,11 @@ def main() -> int:
     f2.shutdown()
 
     c1.shutdown()
+
+    # ===== S8 三张位点表 =====
+    print("\nS8 三张位点表：拉取游标 / 已消费游标 / 提交落点")
+    s8_three_offset_tables(assigned)
+
     print("\nLitePullConsumer: PASS=%d FAIL=%d" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
 

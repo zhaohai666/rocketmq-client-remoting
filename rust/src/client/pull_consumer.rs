@@ -79,7 +79,7 @@ use crate::remoting::protocol::heartbeat::{
 };
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::rpchook::RPCHook;
-use crate::{bail, rmq_debug, rmq_warn};
+use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 
 use crate::client::consumer::ExpressionType;
 use crate::client::validators;
@@ -882,7 +882,7 @@ impl Default for LitePullConsumerConfig {
 
 /// Python 里由 `_lock` 保护的那几张表（键统一是 [`mq_key`] 那串
 /// `topic+brokerName+queueId`，与推送消费者同口径）。
-#[derive(Default)]
+/// `Default` 手写：截止时刻的初值必须是 -1（Java 同值），不能是 0。
 struct LiteState {
     /// Python `subscription: Dict[topic, sub_expression]`（subscribe 模式）。
     subscription: BTreeMap<String, String>,
@@ -894,16 +894,44 @@ struct LiteState {
     assign_mode: bool,
     /// Python `_assigned`：当前分配（有序，见模块头差异 2）。
     assigned: BTreeMap<String, MessageQueue>,
-    /// Python `_next_offset`：**拉取游标**，也是 auto-commit 提交的内容。
+    /// Python `_next_offset`：**拉取游标**（Java `MessageQueueState.pullOffset`）。
+    /// 只回答"下一次从哪拉"，**绝不**是提交内容。
     next_offset: BTreeMap<String, i64>,
+    /// Python `_consume_offset`：**已消费游标**（Java `MessageQueueState.consumeOffset`）。
+    /// 只有 `poll()` 把消息交到调用方手上才前进，本地缓冲里压着的部分不算已消费。
+    consume_offset: BTreeMap<String, i64>,
+    /// Python `_offset_table`：提交落点，对位 Java
+    /// `RemoteBrokerOffsetStore.offsetTable`（内存位点表；`persist=False` 的值就在这张表里）。
+    offset_table: BTreeMap<String, i64>,
     /// Python `_seek_offset`：`seek()` 钉住的位点，优先于 `consume_from_where`。
     seek_offset: BTreeMap<String, i64>,
-    /// Python `_last_commit`：上次提交时间（毫秒），auto-commit 节流用。
-    last_commit: BTreeMap<String, i64>,
+    /// Python `_next_auto_commit_deadline`：全局自动提交截止时刻，初值 -1 ⇒ 第一次检查就提交
+    /// （Java `DefaultLitePullConsumerImpl.nextAutoCommitDeadline`）。
+    next_auto_commit_deadline: i64,
     /// Python `_paused`。
     paused: BTreeSet<String>,
     /// Python `_last_rebalance_ts`。
     last_rebalance_ts: i64,
+}
+
+impl Default for LiteState {
+    fn default() -> LiteState {
+        LiteState {
+            subscription: BTreeMap::new(),
+            subscription_data: BTreeMap::new(),
+            assign_sub_expr: BTreeMap::new(),
+            assign_mode: false,
+            assigned: BTreeMap::new(),
+            next_offset: BTreeMap::new(),
+            consume_offset: BTreeMap::new(),
+            offset_table: BTreeMap::new(),
+            seek_offset: BTreeMap::new(),
+            // Java 的初值是 -1 而不是 0：0 是 epoch 起点，等价于"永远不到点"。
+            next_auto_commit_deadline: -1,
+            paused: BTreeSet::new(),
+            last_rebalance_ts: 0,
+        }
+    }
 }
 
 struct LiteInner {
@@ -1264,10 +1292,23 @@ impl DefaultLitePullConsumer {
     pub fn assign(&self, message_queues: &[MessageQueue]) {
         let mut state = lock(&self.inner.state);
         state.assign_mode = true;
-        state.assigned.clear();
+        let keep: BTreeSet<String> = message_queues.iter().map(mq_key).collect();
+        // Java `assignedMessageQueue.updateAssignedMessageQueue`：撤掉的队列连着整份
+        // MessageQueueState 丢掉 ⇒ 两条游标一起消失。**不**动内存位点表，也**不** persist：
+        // 那份清理挂在 subscribe 模式的 rebalance 上，assign 模式不走 rebalance。
+        for key in state
+            .assigned
+            .keys()
+            .filter(|k| !keep.contains(*k))
+            .cloned()
+            .collect::<Vec<String>>()
+        {
+            state.next_offset.remove(&key);
+            state.consume_offset.remove(&key);
+        }
+        state.assigned.retain(|k, _| keep.contains(k));
         for mq in message_queues {
-            let key = mq_key(mq);
-            state.assigned.insert(key, mq.clone());
+            state.assigned.insert(mq_key(mq), mq.clone());
         }
     }
 
@@ -1446,46 +1487,49 @@ impl DefaultLitePullConsumer {
         // 唤醒可能卡在 poll() 里的调用方（Python `notify_all`）
         self.inner.buffer_signal.notify_waiters();
 
-        let client = lock(&self.inner.client).take();
         let auto_commit = self.config().auto_commit;
-        let items: Vec<(MessageQueue, i64)> = {
-            let state = lock(&self.inner.state);
-            state
-                .next_offset
-                .iter()
-                .filter_map(|(k, off)| state.assigned.get(k).map(|mq| (mq.clone(), *off)))
-                .collect()
-        };
-        let group = self.consumer_group();
-        match (client, auto_commit) {
-            (Some(client), true) => {
-                if let Some(handle) = self.runtime_handle() {
-                    handle.spawn(async move {
-                        for (mq, off) in &items {
-                            if let Err(e) =
-                                client.update_consumer_offset(&group, mq, *off, 5_000, None).await
-                            {
-                                rmq_debug!("lite shutdown commit failed for {mq:?}: {e}");
-                            }
-                        }
-                        // 末次提交还要用这条连接，所以摘登记与关实例都排在它之后
-                        // （Java `unregisterConsumer`:265 → `shutdown()`:269）。
-                        client.unregister_consumer_group(&group);
-                        client.shutdown();
-                    });
-                } else {
-                    // 无运行时：提交不了，至少把连接关掉（与 Python 的
-                    // 「commit 失败只 debug 日志」同级别降级）。
-                    rmq_warn!("lite shutdown: no tokio runtime, skip final offset commit");
-                    client.unregister_consumer_group(&group);
-                    client.shutdown();
+        // Java 的 shutdown 走 `persistConsumerOffset()`：把内存位点表按**当下持有的队列**
+        // 刷一遍，与 auto_commit 无关（手动模式 `persist=false` 攒下的值同样要落盘）。
+        // 自动提交模式再多走一步 commitAll：本端口没有 Java 那份 5s 定时器，
+        // "poll 交出去但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
+        if auto_commit {
+            let mut state = lock(&self.inner.state);
+            let scope: Vec<String> = state.assigned.keys().cloned().collect();
+            for key in &scope {
+                // -1 守卫：没交付过的队列绝不写表（Java 的 consumerOffset is -1 那条 error）
+                if let Some(offset) = state.consume_offset.get(key).copied() {
+                    if offset != -1 {
+                        state.offset_table.insert(key.clone(), offset);
+                    }
                 }
             }
-            (Some(client), false) => {
-                client.unregister_consumer_group(&group);
-                client.shutdown();
+        }
+        let scope: Vec<String> = lock(&self.inner.state).assigned.keys().cloned().collect();
+        let this = self.clone();
+        match self.runtime_handle() {
+            Some(handle) => {
+                handle.spawn(async move {
+                    // 里面含 Java persistAll 的"remove unused mq"清理
+                    let _ = this.persist_offset_table(&scope).await;
+                    this.close_client();
+                });
             }
-            (None, _) => {}
+            None => {
+                // 无运行时：提交不了，至少把连接关掉（与 Python 的
+                // 「commit 失败只 debug 日志」同级别降级）。
+                rmq_warn!("lite shutdown: no tokio runtime, skip final offset commit");
+                self.close_client();
+            }
+        }
+    }
+
+    /// 摘掉本组登记并关掉这条连接。末次提交还要用它，所以只能排在提交之后
+    /// （Java `unregisterConsumer`:265 → `shutdown()`:269）。
+    fn close_client(&self) {
+        if let Some(client) = lock(&self.inner.client).take() {
+            let group = self.consumer_group();
+            client.unregister_consumer_group(&group);
+            client.shutdown();
         }
     }
 
@@ -1580,6 +1624,11 @@ impl DefaultLitePullConsumer {
     /// Python `poll(timeout=None)`：等缓冲非空（最多 `poll_timeout_millis`），
     /// 一次最多取 [`MAX_POLL_BATCH_SIZE`] 条。
     pub async fn poll(&self, timeout_millis: Option<i64>) -> Vec<MessageExt> {
+        // Java poll() 进来先按全局截止时刻试一次自动提交：在拿缓冲锁之前做，
+        // 提交要发 RPC，抱着缓冲锁等网络会把 enqueue 一起卡住。
+        if self.config().auto_commit {
+            self.maybe_auto_commit().await;
+        }
         let timeout = timeout_millis.unwrap_or_else(|| self.config().poll_timeout_millis);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout.max(0) as u64);
         loop {
@@ -1589,6 +1638,9 @@ impl DefaultLitePullConsumer {
             let mut notified = std::pin::pin!(self.inner.buffer_signal.notified());
             notified.as_mut().enable();
             if let Some(drained) = self.try_drain() {
+                // 对位 Java `poll()`：消息交到调用方手上才推进"已消费游标"
+                // （`updateConsumeOffset(mq, processQueue.removeMessage(msgs))`）。
+                self.advance_consume_offset(&drained);
                 return drained;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1612,13 +1664,46 @@ impl DefaultLitePullConsumer {
         Some(buffer.drain(..take).collect())
     }
 
+    /// 交付出去的这批消息推进**已消费游标**（拉取游标一格都不动）。
+    ///
+    /// 只认当下持有且已有拉取记录的队列：Java 的 `updateConsumeOffset` 在
+    /// `MessageQueueState` 不存在时直接什么都不做。
+    fn advance_consume_offset(&self, msgs: &[MessageExt]) {
+        let mut state = lock(&self.inner.state);
+        // Python 同款做法：先把"有拉取记录的队列"按 (topic, brokerName, queueId) 建索引，
+        // 再用消息自己的坐标反查 mq_key —— 从消息字段拼 key 会绕过持有判断。
+        let held: BTreeMap<(String, String, i32), String> = state
+            .next_offset
+            .keys()
+            .filter_map(|k| state.assigned.get(k))
+            .map(|mq| ((mq.topic.clone(), mq.broker_name.clone(), mq.queue_id), mq_key(mq)))
+            .collect();
+        for m in msgs {
+            let Some(key) = held.get(&(
+                m.topic.clone(),
+                m.broker_name.clone().unwrap_or_default(),
+                m.queue_id,
+            )) else {
+                continue;
+            };
+            let nxt = m.queue_offset + 1;
+            if nxt > state.consume_offset.get(key).copied().unwrap_or(-1) {
+                state.consume_offset.insert(key.clone(), nxt);
+            }
+        }
+    }
+
     /// Python `seek`：钉住游标并丢掉缓冲里该队列早于 `offset` 的消息。
     pub fn seek(&self, mq: &MessageQueue, offset: i64) {
         let key = mq_key(mq);
         {
             let mut state = lock(&self.inner.state);
             state.seek_offset.insert(key.clone(), offset);
-            state.next_offset.insert(key, offset);
+            state.next_offset.insert(key.clone(), offset);
+            // Java 的 seek 只置 seekOffset，下一次拉取时 `nextPullOffset()` 才把它同时
+            // 写进 consumeOffset：跳回去意味着"那里之前都还没消费"，否则重放的消息会被
+            // 已提交位点直接跳过。这里一次性写全，效果相同。
+            state.consume_offset.insert(key, offset);
         }
         let mut buffer = lock(&self.inner.buffer);
         let kept: VecDeque<MessageExt> = buffer
@@ -1650,43 +1735,232 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
-    /// Python `committed`：broker 无记录 ⇒ `None`。
+    /// Python `committed`：Java `readOffset(MEMORY_FIRST_THEN_STORE)` —— 先看内存位点表
+    /// （`persist=false` 刚提交、还没发给 broker 的值也算数），再问 broker 并回填进表里。
+    /// broker 无记录 ⇒ `None`（对位 Java 的 -1）。
     pub async fn committed(&self, mq: &MessageQueue) -> Result<Option<i64>> {
+        let key = mq_key(mq);
+        if let Some(cached) = lock(&self.inner.state).offset_table.get(&key).copied() {
+            return Ok(Some(cached));
+        }
         let client = Self::require_client(&self.inner)?;
         let group = self.consumer_group();
-        client
+        let broker_offset = client
             .query_consumer_offset(&group, mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None, false)
-            .await
+            .await?;
+        if let Some(offset) = broker_offset {
+            lock(&self.inner.state).offset_table.insert(key, offset);
+        }
+        Ok(broker_offset)
     }
 
-    /// Python `commit`：把**全部**拉取游标提交给 broker。
+    /// 到点提交：只有一道全局截止时刻（Java `maybeAutoCommit`），到点走一次
+    /// [`commit`](Self::commit) 并把截止时刻推到 `now + auto_commit_interval_millis`。
+    ///
+    /// 调用点和 Java 一致，只有 [`poll`](Self::poll) 开头一处（外加 `shutdown` 的兜底提交）。
+    /// Java 里空闲消费者靠 MQClientInstance 每 5s 的 `persistConsumerOffset` 定时器刷的是
+    /// **内存位点表**，而那张表也只有 commit 路径会写，所以停掉 poll 之后 Java 同样不会
+    /// 往前推进 broker 位点；这里把它塞进拉取循环就会变成"没人 poll 也提交"，比 Java 激进。
+    async fn maybe_auto_commit(&self) {
+        let interval_millis = self.config().auto_commit_interval_millis;
+        let now = current_time_millis();
+        {
+            let mut state = lock(&self.inner.state);
+            if now < state.next_auto_commit_deadline {
+                return;
+            }
+            state.next_auto_commit_deadline = now + interval_millis;
+        }
+        if let Err(e) = self.commit().await {
+            rmq_debug!("lite auto-commit failed: {e}");
+        }
+    }
+
+    /// Python `commit(None)`：对位 Java `commitAll()` —— 按**已消费游标**提交全部已分配队列。
+    ///
+    /// 提交源绝不能是拉取游标：本地缓冲里压着没交出去的消息不算已消费，
+    /// 提前提交会让那段消息在重启后永远不再投递（静默丢消息）。
     pub async fn commit(&self) -> Result<()> {
-        let client = Self::require_client(&self.inner)?;
-        let group = self.consumer_group();
-        let items: Vec<(MessageQueue, i64)> = {
+        let scope: Vec<String> = lock(&self.inner.state).assigned.keys().cloned().collect();
+        let targets: BTreeMap<String, i64> = {
             let state = lock(&self.inner.state);
-            state
-                .next_offset
+            scope
                 .iter()
-                .filter_map(|(k, off)| state.assigned.get(k).map(|mq| (mq.clone(), *off)))
+                .map(|k| (k.clone(), state.consume_offset.get(k).copied().unwrap_or(-1)))
                 .collect()
         };
+        self.commit_targets(targets, &scope, true).await
+    }
+
+    /// Python `commit({MessageQueue: offset}, persist)`：调用方指定位点。
+    /// **只改提交落点，两条游标都不动**。空 map 对位 Java：记一条 warn 就 return，
+    /// 连表都不碰（上一轮 `persist=false` 攒下的内存值原样保留）。
+    pub async fn commit_offsets(
+        &self,
+        offsets: &BTreeMap<String, i64>,
+        persist: bool,
+    ) -> Result<()> {
+        if offsets.is_empty() {
+            rmq_warn!("MessageQueues is empty, Ignore this commit ");
+            return Ok(());
+        }
+        let scope: Vec<String> = offsets.keys().cloned().collect();
+        self.commit_targets(offsets.clone(), &scope, persist).await
+    }
+
+    /// Python `commit([MessageQueue, ...], persist)`：只提交点名这几条队列，
+    /// 取的是它们当下的**已消费游标**。空集合对位 Java：静默 return。
+    pub async fn commit_queues(
+        &self,
+        message_queues: &[MessageQueue],
+        persist: bool,
+    ) -> Result<()> {
+        if message_queues.is_empty() {
+            return Ok(());
+        }
+        let scope: Vec<String> = message_queues.iter().map(mq_key).collect();
+        let targets: BTreeMap<String, i64> = {
+            let state = lock(&self.inner.state);
+            scope
+                .iter()
+                .map(|k| (k.clone(), state.consume_offset.get(k).copied().unwrap_or(-1)))
+                .collect()
+        };
+        self.commit_targets(targets, &scope, persist).await
+    }
+
+    /// 三个入口的共同部分：写内存位点表（两道守卫），`persist` 再把这一批刷给 broker。
+    ///
+    /// 两处已知的偏离，与 Python 逐字对应（见 `consumer.py` 的 `commit`）：
+    /// ① Java 的 `commitAll()` 只写内存表，真正发给 broker 靠 MQClientInstance 每
+    ///    `persistConsumerOffsetInterval`（5s）一次的定时器；本端口的 lite 消费者没挂那个
+    ///    定时器，所以 `persist=true`（默认）就地发出去。
+    /// ② Java 的 `persistAll` 用 oneway、异常只记日志；这里发同步带应答，坏位点当场可见。
+    async fn commit_targets(
+        &self,
+        targets: BTreeMap<String, i64>,
+        scope: &[String],
+        persist: bool,
+    ) -> Result<()> {
+        {
+            let mut state = lock(&self.inner.state);
+            for (key, offset) in &targets {
+                if *offset == -1 {
+                    // Java 原文：这条队列还没消费过，记 error 并跳过。绝不能把 -1 写给
+                    // broker —— 位点 -1 会让下次消费从队首重投全量。
+                    rmq_error!("consumerOffset is -1 in messageQueue [{key}].");
+                    continue;
+                }
+                if !state.assigned.contains_key(key) {
+                    // Java 的 `processQueue != null && !isDropped()` 守卫：不是本实例持有的
+                    // 队列一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
+                    continue;
+                }
+                state.offset_table.insert(key.clone(), *offset);
+            }
+        }
+        if !persist {
+            return Ok(());
+        }
+        self.persist_offset_table(scope).await
+    }
+
+    /// Python `_persist_offset`：Java `OffsetStore#persist(mq)`，只把这一条队列的内存位点
+    /// 发给 broker，不做清理。
+    async fn persist_offset(&self, mq: &MessageQueue) {
+        let key = mq_key(mq);
+        let Some(offset) = lock(&self.inner.state).offset_table.get(&key).copied() else {
+            return;
+        };
+        let Ok(client) = Self::require_client(&self.inner) else {
+            return;
+        };
+        let group = self.consumer_group();
+        if let Err(e) = client
+            .update_consumer_offset(&group, mq, offset, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await
+        {
+            rmq_debug!("lite persist failed for {mq:?}: {e}");
+        }
+    }
+
+    /// Python `_persist_offset_table`：Java `RemoteBrokerOffsetStore#persistAll(Set)` ——
+    /// 内存位点表里落在 `mqs` 上的那部分写给 broker，**不在**其中的条目顺手从表里删掉
+    /// （Java 日志里那句 `remove unused mq`）。
+    ///
+    /// 后半句是 Java 的真实行为：这张表只服务于当下持有的队列。代价是
+    /// `commit(部分队列, persist=true)` 会把其余队列**尚未落盘**的内存值一起丢掉 ——
+    /// 要提交谁就一次给全。
+    async fn persist_offset_table(&self, mqs: &[String]) -> Result<()> {
+        if mqs.is_empty() {
+            return Ok(());
+        }
+        let wanted: BTreeSet<String> = mqs.iter().cloned().collect();
+        let to_send: Vec<(MessageQueue, i64)> = {
+            let mut state = lock(&self.inner.state);
+            let mut out = Vec::new();
+            for key in state.offset_table.keys().cloned().collect::<Vec<String>>() {
+                if !wanted.contains(&key) {
+                    state.offset_table.remove(&key);
+                    continue;
+                }
+                if let (Some(mq), Some(offset)) =
+                    (state.assigned.get(&key), state.offset_table.get(&key).copied())
+                {
+                    out.push((mq.clone(), offset));
+                }
+            }
+            out
+        };
+        // 未启动时表照样写得进去、只是发不出去（Python/C++ 同）：Java 在这里会先
+        // checkServiceState 抛错，本端口放宽这一步，好让表逻辑能离线单测。
+        // 这里直接读连接槽而不是 require_client()：shutdown 已经翻掉 started 标记，
+        // 但末次提交仍要用这条还没关掉的连接。
+        let Some(client) = lock(&self.inner.client).clone() else {
+            return Ok(());
+        };
+        let group = self.consumer_group();
         let mut first_err = None;
-        for (mq, off) in items {
+        for (mq, offset) in to_send {
             if let Err(e) = client
-                .update_consumer_offset(&group, &mq, off, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+                .update_consumer_offset(&group, &mq, offset, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
                 .await
             {
-                rmq_debug!("lite commit failed for {mq:?}: {e}");
+                rmq_debug!("lite persist failed for {mq:?}: {e}");
                 first_err.get_or_insert(e);
-            } else {
-                lock(&self.inner.state).last_commit.insert(mq_key(&mq), current_time_millis());
             }
         }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// 拉取游标（观测点：broker 侧流量分不出两条游标，真机对拍要看的就是这个数）。
+    pub fn pull_cursor_of(&self, mq: &MessageQueue) -> i64 {
+        lock(&self.inner.state)
+            .next_offset
+            .get(&mq_key(mq))
+            .copied()
+            .unwrap_or(-1)
+    }
+
+    /// 已消费游标（`poll()` 交付出去的那一格）。
+    pub fn consume_cursor_of(&self, mq: &MessageQueue) -> i64 {
+        lock(&self.inner.state)
+            .consume_offset
+            .get(&mq_key(mq))
+            .copied()
+            .unwrap_or(-1)
+    }
+
+    /// 内存位点表里那一格（`persist=false` 提交但还没落盘的值就在这）。
+    pub fn pending_commit_of(&self, mq: &MessageQueue) -> i64 {
+        lock(&self.inner.state)
+            .offset_table
+            .get(&mq_key(mq))
+            .copied()
+            .unwrap_or(-1)
     }
 
     /// Python `offset_for_timestamp`。
@@ -1831,9 +2105,10 @@ impl DefaultLitePullConsumer {
             per_topic.push((topic, mq_all, allocated));
         }
 
-        let (added, changed_topics) = {
+        let (added, changed_topics, revoked) = {
             let mut state = lock(&self.inner.state);
-            let old = &state.assigned;
+            // 先快照旧的分配：`state.assigned` 之后要被整体替换，借用不能跨过那次赋值。
+            let old: BTreeMap<String, MessageQueue> = state.assigned.clone();
             let added: Vec<MessageQueue> = new_assigned
                 .keys()
                 .filter(|k| !old.contains_key(*k))
@@ -1842,14 +2117,23 @@ impl DefaultLitePullConsumer {
                 .collect();
             let removed: Vec<String> = old.keys().filter(|k| !new_assigned.contains_key(*k)).cloned().collect();
             let changed = !added.is_empty() || !removed.is_empty();
+            // 撤销的队列要连着整份 MessageQueueState 一起丢（Java removeUnnecessaryMessageQueue
+            // = persist(mq) 再 removeOffset(mq)）。persist 是 RPC，抱着锁做网络会把整条
+            // poll/commit 路径卡住，所以这里只把**该补发的队列**记下来，锁外再发。
+            let revoked: Vec<MessageQueue> = removed
+                .iter()
+                .filter(|k| state.offset_table.contains_key(*k))
+                .filter_map(|k| old.get(k))
+                .cloned()
+                .collect();
             if changed {
-                state.assigned = new_assigned.clone();
+                state.assigned = new_assigned;
                 for key in &removed {
                     state.next_offset.remove(key);
-                    state.last_commit.remove(key);
-                    // ⚠ 与 Python 一致：撤销队列**只**清 next_offset / last_commit，
-                    // seek_offset 与 paused 保留（consumer.py:2714-2719）。队列回到本实例时
-                    // 用户先前 seek 的位置仍然生效。
+                    state.consume_offset.remove(key);
+                    state.seek_offset.remove(key);
+                    // ⚠ `offset_table` 那一格**留到 persist 发出去之后再清**：
+                    // Java 的顺序就是 removeUnnecessaryMessageQueue = persist(mq) → removeOffset(mq)。
                 }
             }
             let changed_topics: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = if changed {
@@ -1866,8 +2150,20 @@ impl DefaultLitePullConsumer {
             } else {
                 Vec::new()
             };
-            (added, changed_topics)
+            (added, changed_topics, revoked)
         };
+
+        // 撤手之后补发最后那次提交（Java 的 persist 在 removeOffset **之前**：上面刻意把
+        // offset_table 那一格留着就是为了这一步还能读到值）。
+        for mq in &revoked {
+            self.persist_offset(mq).await;
+        }
+        if !revoked.is_empty() {
+            let mut state = lock(&self.inner.state);
+            for mq in &revoked {
+                state.offset_table.remove(&mq_key(mq));
+            }
+        }
 
         if !added.is_empty() {
             self.resolve_offsets_for(&added).await;
@@ -1946,12 +2242,10 @@ impl DefaultLitePullConsumer {
             return false;
         };
         let next = last.queue_offset + 1;
+        // 只推进**拉取游标**。「已消费游标」是 poll() 交付时才写的，两条线不是一条：
+        // 缓冲里压着没交出去的消息不能算已消费（Java `processQueue.removeMessage` 同口径）。
         lock(&self.inner.state).next_offset.insert(key, next);
         self.enqueue(msgs);
-        if cfg.auto_commit {
-            self.maybe_commit(mq, &client, next, cfg.auto_commit_interval_millis)
-                .await;
-        }
         true
     }
 
@@ -1960,31 +2254,6 @@ impl DefaultLitePullConsumer {
         buffer.extend(msgs);
         drop(buffer);
         self.inner.buffer_signal.notify_waiters();
-    }
-
-    /// Python `_maybe_commit`：按 `auto_commit_interval_millis` 节流。
-    async fn maybe_commit(
-        &self,
-        mq: &MessageQueue,
-        client: &MQClientInstance,
-        offset: i64,
-        interval_millis: i64,
-    ) {
-        let key = mq_key(mq);
-        let now = current_time_millis();
-        let last = lock(&self.inner.state).last_commit.get(&key).copied().unwrap_or(0);
-        if now - last < interval_millis {
-            return;
-        }
-        let group = self.consumer_group();
-        if let Err(e) = client
-            .update_consumer_offset(&group, mq, offset, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
-            .await
-        {
-            rmq_debug!("lite auto-commit failed for {mq:?}: {e}");
-            return;
-        }
-        lock(&self.inner.state).last_commit.insert(key, now);
     }
 }
 
@@ -2364,6 +2633,125 @@ mod tests {
         assert_eq!(c.subscription_for("T"), "TagA");
         assert_eq!(c.subscription_for("other"), "*");
         assert_eq!(c.subscriptions().len(), 1);
+    }
+
+    // ---------------------------------------------------- 三张位点表（#68）
+
+    #[tokio::test]
+    async fn poll_advances_consume_cursor_not_pull_cursor() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        let q = queue("T", "broker-a", 0);
+        // 拉取游标由后台拉取推进：单测里没有网络，手工写成 5（缓冲里只有 3 条交付过）
+        {
+            let mut state = lock(&c.inner.state);
+            state.assigned.insert(mq_key(&q), q.clone());
+            state.next_offset.insert(mq_key(&q), 5);
+        }
+        assert_eq!(c.pull_cursor_of(&q), 5, "拉取游标 = 后台已经拉到的那一格");
+        assert_eq!(c.consume_cursor_of(&q), -1, "一条都没交付 ⇒ 已消费游标还是 -1");
+        // 缓冲里压着 3 条：交付之前不算已消费
+        c.enqueue((0..3).map(|i| msg("T", "broker-a", 0, i, &format!("m{i}"))).collect());
+        assert_eq!(c.consume_cursor_of(&q), -1, "没 poll 就不算已消费");
+        let got = c.poll(Some(10)).await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(c.consume_cursor_of(&q), 3, "交出去的那一格才是已消费");
+        assert_eq!(c.pull_cursor_of(&q), 5, "poll 绝不改拉取游标");
+    }
+
+    #[tokio::test]
+    async fn poll_ignores_queues_this_instance_does_not_hold() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        // 没有拉取记录（未分配）的队列：交付了也不写游标（Java 的 MessageQueueState==null）
+        c.enqueue(vec![msg("T", "broker-a", 9, 0, "m")]);
+        assert_eq!(c.poll(Some(10)).await.len(), 1);
+        assert_eq!(c.consume_cursor_of(&queue("T", "broker-a", 9)), -1);
+    }
+
+    #[tokio::test]
+    async fn commit_writes_only_what_poll_handed_out() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        let q0 = queue("T", "broker-a", 0);
+        let q1 = queue("T", "broker-a", 1);
+        c.assign(&[q0.clone(), q1.clone()]);
+        // commitAll 走的是已消费游标：一条都没交付 ⇒ 一格都不写
+        c.commit().await.unwrap();
+        assert_eq!(c.pending_commit_of(&q0), -1, "commitAll 不提交没消费过的队列");
+
+        // 指定位点只写提交落点，两条游标一律不动
+        let mut specified = BTreeMap::new();
+        specified.insert(mq_key(&q0), 5);
+        specified.insert(mq_key(&q1), 8);
+        c.commit_offsets(&specified, false).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q0), 5, "指定位点进内存位点表");
+        assert_eq!(c.pending_commit_of(&q1), 8, "指定位点进内存位点表(q1)");
+        assert_eq!(c.pull_cursor_of(&q0), -1, "提交位点不改拉取游标");
+        assert_eq!(c.consume_cursor_of(&q0), -1, "提交位点不改已消费游标");
+
+        // -1 与「不是本实例持有的队列」两道守卫（Java 的 log.error + processQueue 守卫）
+        let mut guarded = BTreeMap::new();
+        guarded.insert(mq_key(&q0), -1);
+        guarded.insert(mq_key(&queue("T", "broker-a", 7)), 3);
+        c.commit_offsets(&guarded, false).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q0), 5, "offset == -1 只记日志，不覆盖已有位点");
+        assert_eq!(
+            c.pending_commit_of(&queue("T", "broker-a", 7)),
+            -1,
+            "没分配到的队列不替它提交"
+        );
+
+        // 空 map / 空集合：Java 都是直接 return，连表都不碰
+        c.commit_offsets(&BTreeMap::new(), false).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q0), 5, "空 map 忽略这次提交");
+        c.commit_queues(&[], false).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q0), 5, "空集合忽略这次提交");
+
+        // commit(Set) 走的是已消费游标，不是任意指定值：未交付 ⇒ 守卫拦住
+        c.commit_queues(std::slice::from_ref(&q0), false).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q0), 5, "commit(Set) 在没有交付记录时不写 -1");
+
+        // assign 缩范围：撤掉的队列连着两条游标一起丢（Java updateAssignedMessageQueue），
+        // 但内存位点表**不**清 —— 那份清理挂在 subscribe 模式的 rebalance 上（Java 同）。
+        c.assign(std::slice::from_ref(&q0));
+        assert_eq!(c.pull_cursor_of(&q1), -1, "assign 撤队列后拉取游标消失");
+        assert_eq!(c.consume_cursor_of(&q1), -1, "assign 撤队列后已消费游标消失");
+        assert_eq!(c.pending_commit_of(&q1), 8, "assign 模式不碰 offsetStore");
+        let mut late = BTreeMap::new();
+        late.insert(mq_key(&q1), 99);
+        c.commit_offsets(&late, false).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q1), 8, "撤掉的队列不替它改位点");
+
+        // Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交只发被点名的
+        // 队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、还没落盘的值就此
+        // 丢掉。（这里没 start()，网络那半段自然跳过，验的是清理这半段。）
+        c.commit_queues(std::slice::from_ref(&q0), true).await.unwrap();
+        assert_eq!(c.pending_commit_of(&q1), -1, "persistAll 会把没点名的队列从内存表里丢掉");
+        assert_eq!(c.pending_commit_of(&q0), 5, "点名的队列留在表里");
+    }
+
+    #[test]
+    fn seek_moves_both_cursors() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        let q = queue("T", "broker-a", 0);
+        c.assign(std::slice::from_ref(&q));
+        // Java 的 nextPullOffset() 吃掉 seekOffset 时连 consumeOffset 一起改：
+        // "跳回去"意味着"那里之前都还没消费"，否则重放的段会被旧位点跳过。
+        c.seek(&q, 2);
+        assert_eq!(c.pull_cursor_of(&q), 2, "seek 改拉取游标");
+        assert_eq!(c.consume_cursor_of(&q), 2, "seek 也要改已消费游标");
+    }
+
+    #[tokio::test]
+    async fn auto_commit_deadline_starts_at_minus_one() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        // Java DefaultLitePullConsumerImpl:154：初值 -1 ⇒ 第一次检查就会提交一次
+        assert_eq!(lock(&c.inner.state).next_auto_commit_deadline, -1);
+        // 没交付过：这次"到点提交"发不出任何东西，只把截止时刻推到下一个周期
+        c.maybe_auto_commit().await;
+        assert!(lock(&c.inner.state).next_auto_commit_deadline > 0, "提交完要把截止时刻推到下一周期");
+        // 再查一次：还没到点，不该重复提交
+        let before = lock(&c.inner.state).next_auto_commit_deadline;
+        c.maybe_auto_commit().await;
+        assert_eq!(lock(&c.inner.state).next_auto_commit_deadline, before, "没到点就不该再提交");
     }
 
     #[test]

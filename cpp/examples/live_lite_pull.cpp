@@ -6,7 +6,7 @@
 // 场景（围绕 Lite 相对 Pull 的本质区别：调用方不用管位点，poll 从本地缓冲拿消息）：
 //   S1 建 topic + subscribe 模式等待 rebalance 分到位点（4/4 队列）
 //   S2 先起消费者、再发 12 条（交替 TagA/TagB）→ subscribe + poll 收全 12 条且内容一致
-//   S3 auto-commit：消费后 committed 位点 > 0，且 commit() 后可回读
+//   S3 auto-commit：只读 committed()，等一个自动提交周期后各队列位点自己 > 0
 //   S4 assign 模式：显式 assign 全部队列 + seek 到队首 → poll 重新收全 12 条
 //   S5 订阅 TagA：subscribe(T, "TagA") 只收 TagA 的 6 条（订阅级 tag 过滤）
 //   S6 CONSUME_FROM_TIMESTAMP：consumeTimestamp 按 Java 的 14 位本地墙钟解释
@@ -25,6 +25,11 @@
 //          resolver 的调用记录同时证明 rebalance 真的逐个问过队列/客户端的机房
 //      S7f MACHINE_ROOM：真实 brokerName 不含 '@'，白名单怎么写都筛不出队列 ——
 //          验的是「配错机房安静饿死」（分不到队列、poll 不到消息、不打崩重平衡）
+//   S8 三张位点表（对位 Java AssignedMessageQueue + OffsetStore）：1 队列 topic 灌 1200 条，
+//      让「拉取游标(1200) 跑在已消费游标(1024) 前面」在真机上可观测 ——
+//      没交付过 ⇒ commit 推不走 broker；一次 poll 后提交的是 1024 而不是 1200；
+//      commit(map) 只改提交落点、两条游标不动；persist=false 只进内存表（新实例读不到）；
+//      seek 同时改写两条游标；commit(set) + Java persistAll 的「remove unused mq」清掉旁支内存值。
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -38,6 +43,7 @@
 #include <vector>
 
 #include "rocketmq/client/allocate_strategy.h"
+#include "rocketmq/client/pull_consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/lite_pull_consumer.h"
 #include "rocketmq/client/producer.h"
@@ -357,14 +363,26 @@ int main(int argc, char** argv) {
     // ---------------- S3 auto-commit 位点 ----------------
     std::printf("\nS3 auto-commit 位点\n");
     {
-        bool allPositive = true;
+        // Java 的自动提交只在 poll() 开头按 nextAutoCommitDeadline 到点才跑（默认间隔 5s），
+        // 而第一次检查发生在交付之前（已消费游标还是 -1，提交不出东西）：
+        // 所以这里继续 poll 过一整个周期，位点才会自己落下去 —— 停掉 poll 就不该指望它动。
+        bool allPositive = false;
         std::string detail;
-        for (const MessageQueue& mq : assigned) {
-            const int64_t v = c1.committed(mq);
-            detail += std::to_string(v) + " ";
-            if (v <= 0) allPositive = false;
+        const int64_t deadline = nowMs() + 20000;
+        for (;;) {
+            const std::vector<MessageExt> idle = c1.poll(500);   // 空转也算一次 poll
+            (void)idle;
+            allPositive = true;
+            detail.clear();
+            for (const MessageQueue& mq : assigned) {
+                const int64_t v = c1.committed(mq);
+                detail += std::to_string(v) + " ";
+                if (v <= 0) allPositive = false;
+            }
+            if (allPositive || nowMs() >= deadline) break;
         }
-        check("S3 各队列 committed 位点 > 0", allPositive, "committed=" + detail);
+        check("S3 继续 poll 过自动提交周期后位点自己落盘（没人调 commit）", allPositive,
+              "committed=" + detail);
     }
 
     // ---------------- S4 assign 模式：assign 全部队列 + seek 到队首重新收全 ----------------
@@ -710,6 +728,225 @@ int main(int argc, char** argv) {
     }
 
     c1.shutdown();
+
+    // ---------------- S8 三张位点表（对位 Java AssignedMessageQueue + OffsetStore） ----------------
+    // 单测锁得住表形状，锁不住"这条链路真能改变 broker 侧的投递结果"：
+    // 提交错一格（把拉取游标当提交源）在真机上表现为**静默丢消息**，位点跑在消费前面，
+    // 重启后那段消息永远不会再投；反过来提交得太保守只会重复投，肉眼看得见。
+    // 所以这里用一条 1 队列的新 topic，让每个数字都是算得出来的。
+    std::printf("\nS8 三张位点表：拉取游标 / 已消费游标 / 提交落点\n");
+    {
+        const std::string offTopic = "LiteOffCpp_" + stamp;
+        const std::string offGroup = "LiteOffPGCpp_" + stamp;
+        const int32_t nBig = 1200;      // > poll 单次上限 1024 ⇒ 一次交付必然留下没交出去的尾巴
+        {
+            DefaultMQProducer prep("PG_PrepareOffCpp_" + stamp);
+            prep.setNamesrvAddr(namesrv);
+            prep.start();
+            try {
+                prep.createTopic("TBW102", offTopic, 1);
+            } catch (const std::exception& e) {
+                std::printf("!! createTopic(%s) failed: %s\n", offTopic.c_str(), e.what());
+            }
+            std::vector<MessageQueue> qs;
+            const int64_t routeDeadline = nowMs() + 20000;
+            while (qs.empty() && nowMs() < routeDeadline) {
+                try {
+                    qs = prep.fetchPublishMessageQueues(offTopic);
+                } catch (...) {
+                }
+                if (qs.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            check("S8 准备 topic（1 条队列）", qs.size() == 1,
+                  "queues=" + std::to_string(qs.size()));
+            int32_t landed = 0;
+            if (qs.size() == 1) {
+                for (int32_t from = 0; from < nBig; from += 300) {
+                    std::vector<Message> chunk;
+                    for (int32_t i = from; i < std::min(nBig, from + 300); ++i) {
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "off-%04d", i);
+                        chunk.emplace_back(offTopic, std::string(buf));
+                    }
+                    try {
+                        SendResult r = prep.sendBatch(chunk, qs[0]);
+                        if (r.getSendStatus() == SendStatus::SEND_OK) {
+                            landed += static_cast<int32_t>(chunk.size());
+                        }
+                    } catch (const std::exception& e) {
+                        std::printf("   sendBatch failed: %s\n", e.what());
+                    }
+                }
+            }
+            prep.shutdown();
+            check("S8 生产 " + std::to_string(nBig) + " 条成功", landed == nBig,
+                  "landed=" + std::to_string(landed));
+
+            // 独立读 broker 位点的探针（自己的组、自己的连接，不碰被测实例的任何内存）
+            DefaultMQPullConsumer probe(offGroup);
+            probe.setNamesrvAddr(namesrv);
+            probe.start();
+            const MessageQueue q0 = qs.empty() ? MessageQueue(offTopic, "broker-a", 0) : qs[0];
+
+            DefaultLitePullConsumer o(offGroup);
+            o.setNamesrvAddr(namesrv);
+            o.setInstanceName("liteoff");
+            o.setPollTimeoutMillis(1000);
+            o.setPullBatchSize(32);
+            o.setAutoCommit(false);          // 提交时机全部由场景控制
+            o.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+            o.assign({q0});
+            o.start();
+
+            // S8a 只拉不交付：拉取游标跑到 1200，已消费游标一格都不许动
+            std::vector<MessageExt> all;
+            const int64_t pullDeadline = nowMs() + 30000;
+            while (o.pullCursorOf(q0) < nBig && nowMs() < pullDeadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            check("S8a 后台把 " + std::to_string(nBig) + " 条全拉进本地缓冲（拉取游标=" +
+                      std::to_string(o.pullCursorOf(q0)) + "）",
+                  o.pullCursorOf(q0) == nBig, "pullCursor=" + std::to_string(o.pullCursorOf(q0)));
+            check("S8a 一条都没交付 ⇒ 已消费游标停在 -1", o.consumeCursorOf(q0) == -1,
+                  "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
+            // 这条是 #68 的核心：旧实现 commit() 遍历的就是拉取游标，这里会把 1200 发出去，
+            // 调用方在此之前崩掉 ⇒ 1200 条一条都没消费过却再也不会投。
+            o.commit();
+            int64_t brokerAfterEmptyCommit = -1;
+            probe.fetchConsumeOffset(q0, brokerAfterEmptyCommit);
+            check("S8a 没交付过 ⇒ broker 位点没被推走（旧实现在这里提交 1200）",
+                  brokerAfterEmptyCommit != nBig,
+                  "brokerOffset=" + std::to_string(brokerAfterEmptyCommit));
+
+            // S8b poll 单次上限 1024 < 缓冲里的 1200 ⇒ 尾巴那 176 条不算已消费
+            std::vector<MessageExt> first = o.poll(3000);
+            check("S8b 一次 poll 交出 1024 条（单次交付上限）", first.size() == 1024,
+                  "got=" + std::to_string(first.size()));
+            check("S8b 已消费游标 = 交出去的那一格", o.consumeCursorOf(q0) == 1024,
+                  "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
+            check("S8b 缓冲里还压着 " + std::to_string(nBig - 1024) + " 条没交付",
+                  o.pullCursorOf(q0) == nBig && o.consumeCursorOf(q0) < o.pullCursorOf(q0),
+                  "pull=" + std::to_string(o.pullCursorOf(q0)));
+            o.commit();
+            int64_t brokerOffset = -1;
+            probe.fetchConsumeOffset(q0, brokerOffset);
+            check("S8b 提交给 broker 的正是 1024（不是 1200）", brokerOffset == 1024,
+                  "brokerOffset=" + std::to_string(brokerOffset));
+            for (MessageExt& m : first) all.push_back(std::move(m));
+
+            // S8c 指定一个更靠前的位点：只改提交落点，两条游标都不许动
+            const int64_t pullBefore = o.pullCursorOf(q0);
+            const int64_t consumeBefore = o.consumeCursorOf(q0);
+            std::map<MessageQueue, int64_t> rewind;
+            rewind[q0] = 5;
+            o.commit(rewind, true);
+            int64_t brokerRewound = -1;
+            probe.fetchConsumeOffset(q0, brokerRewound);
+            check("S8c commit(map) 把 broker 位点改到调用方指定的 5", brokerRewound == 5,
+                  "brokerOffset=" + std::to_string(brokerRewound));
+            check("S8c 提交位点不改拉取游标", o.pullCursorOf(q0) == pullBefore,
+                  "pullCursor=" + std::to_string(o.pullCursorOf(q0)));
+            check("S8c 提交位点不改已消费游标", o.consumeCursorOf(q0) == consumeBefore,
+                  "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
+            // 位点退回 5 之后，尾巴那 176 条照旧交付（缓冲与 broker 位点无关）
+            std::vector<MessageExt> tail = o.poll(3000);
+            all.insert(all.end(), std::make_move_iterator(tail.begin()),
+                       std::make_move_iterator(tail.end()));
+            check("S8c 退回 5 之后缓冲里剩下的 " + std::to_string(nBig - 1024) + " 条照旧交付",
+                  static_cast<int64_t>(tail.size()) == nBig - 1024,
+                  "got=" + std::to_string(tail.size()));
+            {
+                std::set<std::string> bodies;
+                for (const MessageExt& m : all) bodies.insert(bodyOf(m));
+                check("S8 全程收全 " + std::to_string(nBig) + " 条且一条不重不漏",
+                      bodies.size() == static_cast<size_t>(nBig),
+                      "distinct=" + std::to_string(bodies.size()));
+            }
+
+            // S8d 一个字节都不许上线：committed() 看得见、broker 看不见
+            std::map<MessageQueue, int64_t> memoryOnly;
+            memoryOnly[q0] = 777;
+            o.commit(memoryOnly, false);
+            check("S8d persist=false：committed() 读到内存表的 777",
+                  o.committed(q0) == 777, "committed=" + std::to_string(o.committed(q0)));
+            int64_t brokerStill = -1;
+            probe.fetchConsumeOffset(q0, brokerStill);
+            check("S8d persist=false：broker 侧还是上一轮的 5", brokerStill == 5,
+                  "brokerOffset=" + std::to_string(brokerStill));
+
+            // S8e 新实例（同组）从 broker 上那一格续消费：内存表不跨实例
+            DefaultLitePullConsumer o2(offGroup);
+            o2.setNamesrvAddr(namesrv);
+            o2.setInstanceName("liteoff2");
+            o2.setPullBatchSize(32);
+            o2.setAutoCommit(false);
+            o2.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+            o2.assign({q0});
+            o2.start();
+            check("S8e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
+                  o2.pullCursorOf(q0) == 5, "pullCursor=" + std::to_string(o2.pullCursorOf(q0)));
+            o2.shutdown();
+
+            // S8f seek 同时改写两条游标：重放的段不能被旧位点跳过
+            o.seek(q0, 60);
+            check("S8f seek 改拉取游标", o.pullCursorOf(q0) == 60,
+                  "pullCursor=" + std::to_string(o.pullCursorOf(q0)));
+            check("S8f seek 也改已消费游标", o.consumeCursorOf(q0) == 60,
+                  "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
+            o.commit();
+            int64_t brokerSeeked = -1;
+            probe.fetchConsumeOffset(q0, brokerSeeked);
+            check("S8f seek 之后 commit 落到 60", brokerSeeked == 60,
+                  "brokerOffset=" + std::to_string(brokerSeeked));
+
+            // S8g Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交
+            // 只发被点名的队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、
+            // 还没落盘的内存值就此丢掉。这条在 broker 上可观测：清掉之后 committed() 只能
+            // 回读到 broker 上那一格，再也读不到 300。
+            const MessageQueue foreign = assigned[1];   // 另一个 topic 的队列，offGroup 没碰过
+            o.assign({q0, foreign});                   // 只多一条游标，不影响上面的对列
+            std::map<MessageQueue, int64_t> memoryOnly2;
+            memoryOnly2[q0] = 300;
+            o.commit(memoryOnly2, false);              // 只进内存表
+            check("S8g 未落盘的内存值先看得见", o.committed(q0) == 300,
+                  "committed=" + std::to_string(o.committed(q0)));
+            std::set<MessageQueue> none;               // 空集合：Java 直接 return，表不动
+            o.commit(none, true);
+            check("S8g 空集合不清表也不发消息", o.committed(q0) == 300,
+                  "committed=" + std::to_string(o.committed(q0)));
+            int64_t brokerStill2 = -1;
+            probe.fetchConsumeOffset(q0, brokerStill2);
+            check("S8g 空集合没动 broker", brokerStill2 == 60,
+                  "brokerOffset=" + std::to_string(brokerStill2));
+            // 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
+            // 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是"提交部分队列"的代价。
+            std::set<MessageQueue> onlyForeign;
+            onlyForeign.insert(foreign);
+            o.commit(onlyForeign, true);
+            check("S8g 点名提交会把没点名的内存值清掉（Java 的 remove unused mq）",
+                  o.committed(q0) != 300, "committed=" + std::to_string(o.committed(q0)));
+            check("S8g 清掉之后回读到的是 broker 上那一格",
+                  o.committed(q0) == 60, "committed=" + std::to_string(o.committed(q0)));
+            int64_t brokerAfterPrune = -1;
+            probe.fetchConsumeOffset(q0, brokerAfterPrune);
+            check("S8g 清理只是丢内存值，没往 broker 写 300", brokerAfterPrune == 60,
+                  "brokerOffset=" + std::to_string(brokerAfterPrune));
+            // commit(Set) 取的是当下已消费游标，不是内存里那格
+            std::map<MessageQueue, int64_t> rewindAgain;
+            rewindAgain[q0] = 300;
+            o.commit(rewindAgain, false);
+            o.commit({q0}, true);
+            int64_t brokerSet = -1;
+            probe.fetchConsumeOffset(q0, brokerSet);
+            check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300",
+                  brokerSet == 60, "brokerOffset=" + std::to_string(brokerSet));
+            check("S8g persistAll 之后内存表回到已消费游标（Java 的 updateConsumeOffset）",
+                  o.committed(q0) == 60, "committed=" + std::to_string(o.committed(q0)));
+
+            o.shutdown();
+            probe.shutdown();
+        }
+    }
 
     std::printf("\nLitePullConsumer: PASS=%d FAIL=%d\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
