@@ -122,6 +122,10 @@ public:
     bool isUnitMode() const { return unitMode_; }
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
+    // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：在用 topic 的
+    // 路由刷新周期，start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
+    void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
+    int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
 
     // ---------------- 故障规避（对应 Java sendLatencyFaultEnable，默认关闭）----------------
     // 开启后发送选队列会按 broker 延迟/隔离状态过滤（MQFaultStrategy）；发送结果回写
@@ -470,6 +474,8 @@ protected:
     // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
     // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
     bool enableStreamRequestType_ = false;
+    // Java ClientConfig:58，默认 30000ms（路由刷新周期）
+    int32_t pollNameServerIntervalMillis_ = 30000;
     std::string createTopicKey_ = MixAll::DEFAULT_TOPIC;
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();

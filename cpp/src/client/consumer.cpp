@@ -26,6 +26,7 @@
 #include "rocketmq/remoting/protocol/extra_info.h"
 #include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/json.h"
+#include "schedule_util.h"
 
 namespace rocketmq {
 
@@ -403,7 +404,8 @@ void DefaultMQPushConsumer::start() {
         mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                              /*connectTimeoutMillis=*/3000,
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_,
-                                             tlsEnable_, unitName_));
+                                             tlsEnable_, unitName_,
+                                             pollNameServerIntervalMillis_));
         // 请求钩子（ACL 签名 / stream 的 `ReqT`）：绑定在 **start() 之前** ——
         // Java 的 rpcHook 在 MQClientAPIImpl 构造时传入，实例第一笔报文就带着它。
         std::shared_ptr<RPCHook> requestHook =
@@ -2102,13 +2104,18 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
 
 // ---------------------------------------------------------------- 位点持久化
 void DefaultMQPushConsumer::offsetPersistLoop() {
-    // Java MQClientInstance.startScheduledTask：persistAllConsumerOffset 每 5s
+    // Java MQClientInstance.startScheduledTask:417-423：
+    //   scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
+    // ——首个任务延迟 10s，之后周期取 clientConfig.persistConsumerOffsetInterval（默认 5s）；
+    // 首笔落盘发生在 initialDelay **这一刻**，不是 initialDelay + 一个周期后（旧写法要 15s）。
+    // 周期是**固定速率**：每跳锚定在 10s + n×周期（见 schedule_util.h），不会像"干完再按
+    // 100ms 切片睡一个周期"那样被每段多出来的几毫秒越拖越长。
+    // 与 Java 一致：周期只在启动时读一次，运行期改字段不改变已排定的节奏。
+    auto next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (!stop_.load()) {
-        // 周期 5s，但按 100ms 切片以便 shutdown 立刻收手（整段 sleep 会把 join 拖满 5s）
-        for (int i = 0; i < 50 && !stop_.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (stop_.load() || !started_.load()) return;
+        if (!started_.load()) return;
+        sleepUntilDeadline(stop_, next);
+        next += std::chrono::milliseconds(persistConsumerOffsetIntervalMillis_);
         try {
             persistOffsetsOnce();
         } catch (const std::exception& e) {
@@ -2208,10 +2215,9 @@ void DefaultMQPushConsumer::lockLoop() {
         } catch (const std::exception& e) {
             logger_debug(std::string("lock mq error: ") + e.what());
         }
-        // 等待 20s（期间响应 stop）
-        for (int i = 0; i < 200 && !stop_.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        // 等待 20s（期间响应 stop）。按绝对 deadline 分段睡：100ms 的系统 sleep 实测多几毫秒，
+        // 200 段会把 Java 的 20s 轮次拖长；对着 deadline 算就不累积。
+        sleepUntilDeadline(stop_, std::chrono::steady_clock::now() + std::chrono::seconds(20));
     }
 }
 

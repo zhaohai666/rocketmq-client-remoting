@@ -97,6 +97,7 @@ dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS /
 dotnet $PROG send-header 127.0.0.1:9876   # 发送头 c/d/n 三字段（14 PASS / 0 FAIL）
 dotnet $PROG flow-control 127.0.0.1:9876  # 拉取前流控五个阈值 + 启动期数值闸门（29 PASS / 0 FAIL）
 dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
+dotnet $PROG scheduled-intervals 127.0.0.1:9876   # 周期任务的 initialDelay/固定速率（20 PASS / 0 FAIL，含位点落盘 10s 首跳）
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
@@ -195,9 +196,10 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | sql92 | 20 PASS / 0 FAIL（SQL92 过滤 + `CHECK_CLIENT_CONFIG`(46) 四语言同场景：S1 SQL92 订阅启动时正好一笔 46、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发（Java `ExpressionType.isTagType` 短路）→ S2 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，而不是拿不到编译过滤数据就放行全部），`'*'` 对照组收全 6 条 → S3 永不匹配的 `color='green'` 收 0 条 → S4 语法错的表达式让 `Start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `Start()`）。协议形状与四条分支语义另有离线单测 10 项（`CheckClientConfigTests`，进程内 mock broker） |
 
 | unreg-live | 10 PASS / 0 FAIL（生产者退出注销 `UNREGISTER_CLIENT`(35) 真机，与 Python `verify_producer_unregister_live.py`、C++ `rmq_live_producer_unregister`、Rust `live_producer` 的 P11 同一套场景）：U1 发送成功 → U2 心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId（注册确实发生过，"消失"才有意义，组靠心跳上线所以要轮询等）→ U2b 对照组注册可见（204 这条判据本身有效）→ U3 `Shutdown()` 给每台已知 broker 各发一发 35、头是 `clientID`+`producerGroup` 且 **`consumerGroup` 整个字段不上线**（Java 传 null；broker `ClientManageProcessor:228/237` 判的是 `group != null`）、addr 确实是路由里那台、且排在业务发送之后（`last_send=4 first_unreg=6`）→ U5 紧接着查 204 这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 判据强度：.NET 里每个生产者各持一份 `MQClientInstance`、各一条连接，退出时连接也关掉，单看 U5 分不出是 35 还是断连的功劳，所以这里必须由 `IRpcHook` 抓帧（钩子跑在 `Encode()` **之前**，头此时还挂在 `CustomHeader` 上）直接证明线上走了这一发；行为级的判别式证明在 Rust 的 P11（Rust 按 clientId 复用实例，先退的那个连接还活着）。⚠ 「每一发 35 都回 SUCCESS」在本移植**不可观测**——传输层有意不调 `IRpcHook#DoAfterResponse`（见 `Remoting/RemotingClient.cs`），U5 的 broker 侧效果是它的替代判据。头形状（含**纯空白组名**同空串处理，整个字段不上线）、扇出**含 slave**（`GetAllBrokerAddrs` vs 心跳用的 master 优先 `GetRouteOfAllBrokers`）、单台失败被吞且剩下的照旧注销、超时与 Java 的 `getMqClientApiTimeout()`=**3000ms** 同口径，共 9 项由 `ProducerUnregisterTests` 离线锁死（自带一个同一 brokerName 下挂 master(0)+slave(1) 的假集群——本机真集群只有一台 master，这条判据在真机上不可达） |
+| scheduled-intervals | 20 PASS / 0 FAIL（2026-09-24 实测） | I1~I3（与 Python `verify_interval_live.py`、C++ `rmq_live_scheduled_intervals`、Rust `live_scheduled_intervals` 同场景）：I3 门面配的周期真的落到实例（`PollNameServerIntervalMillis` → 路由刷新周期，1s 组与不配的 30s 对照组各断言一次）→ I1 两个生产者各把一个**还没建出来**的 topic 登记进在用集合，先等 1.5s 让两边首跳（`scheduleAtFixedRate` 的 initialDelay=10ms）都落空一次、再建 topic ⇒ 缓存里何时出现它只由周期决定：1s 组 0.53s 拿到，那一刻 30s 组**还没有**，最终 28.76s 拿到（固定速率锚定，逐跳对着同一时间轴算、误差不累积）→ I2 两个消费者（落盘周期 1s / 60s）各消费 3 条后 broker 位点仍是 0，首个落盘落在 **10.49s**（≈ Java `:417-423` 的 initialDelay 10s，60s 组同样是 10.81s —— 这一步由 initialDelay 驱动、不是周期），第二批后 1s 组 0.68s 内把 6 推上去、60s 组**仍是 3**（下一跳在 60s 后），`Shutdown()` 收尾补一笔把 6 落盘。⚠ 修之前这里必然红：macOS 上 `ManualResetEventSlim.Wait(100ms)` 实测 131ms（系统定时器多给一个 tick），「按 100ms 切片睡满 30s」实际要 39.2s，全部周期被拉长 ~31% —— 现在统一走 `Schedules.WaitUntil(...)`（`ManualResetEventSlim.Wait` 一次睡到绝对计划时刻，整段又能被 `Shutdown` 的 `Set` 立刻唤醒；落后于计划时不等待、立刻补跑，与 Java 的 catch-up 一致），另有一组离线用例证明首跳落在 initialDelay 而不是 initialDelay+period |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **600 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **604 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`
@@ -232,6 +234,15 @@ setter 的 `Math.Max(1, n)` 会把 0 抬成 1，这是本移植与 Java 的一�
 （换线程等于丢在途重投）、撤走时持久化已消费位点并清掉盖章/缓冲/游标（没有已消费位点就不臆造
 一个 0）、判据**逐队列独立**（一路停摆不许连带换掉兄弟队列的循环）、没分配给本实例的队列不扫、`Start()` 之前与停机途中都不判停摆（否则刷一堆假 `[BUG]`
 日志）、POP 分支扫掉 `PopProcessQueue` 并 `SetDropped`。
+`ScheduledIntervalsTests`（4 项）把 Java `MQClientInstance#startScheduledTask:389-432` 的
+`scheduleAtFixedRate(work, initialDelay, period)` 语义钉在 `WireRecord.ArrivalMs` 上：五个门面的
+默认值 = Java `ClientConfig:58/:66` 的 30000 / 5000（setter 也真的生效，不是只读装饰）、`Start()`
+时门面上的周期交给实例且**非正数回落到 30000**（不是退化成忙转）、路由刷新的**首跳落在 10ms 的
+initialDelay**（阈值取 period/2，只有顺序写错才会翻倍到一个周期）之后按配置周期重复（离线周期
+1200ms，实测 11 / 1212 / 2412ms）。⚠ 这两个偏差在真机上只表现为「慢」——没有异常、没有缺字段，
+只有「新 topic 的路由要等半分钟才刷新」这种没人会去计时的现象，所以判据必须钉在到达时刻上；
+位点落盘的节奏只能在真集群上验（`scheduled-intervals` 子命令），离线这一层锁的是「周期字段被读到、
+门面透传正确」。
 `SendRetryTests`（15 项）用
 **进程内 mock 集群**（真 socket + 脚本化响应码）锁死 `sendDefaultImpl` 的重试分类语义 ——
 这些分支真集群给不了： broker 不会稳定回 SYSTEM_BUSY，也不会刚好"路由里的地址连不上"。

@@ -103,6 +103,7 @@ cargo run --example live_async_send         -- 127.0.0.1:9876
 cargo run --example live_fail_fast          -- 127.0.0.1:9876   # 会停一次 broker 再拉起
 cargo run --example live_send_header        -- 127.0.0.1:9876
 cargo run --example live_flow_control       -- 127.0.0.1:9876   # 拉取前流控五个阈值（条数/字节/跨度/topic 级）
+cargo run --example live_scheduled_intervals -- 127.0.0.1:9876  # 周期任务的 initialDelay/固定速率（含位点落盘 10s 首跳）
 cargo run --example live_acl                -- 127.0.0.1:9876 <AK> <SK>   # 需开 ACL 的集群
 cargo run --example live_compression_matrix -- send|recv ...             # 由 ../scripts/compression_matrix.sh 调度
 ```
@@ -110,15 +111,17 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 任何一项失败进程以非 0 退出码结束；`== summary: N passed, M failed ==` 是收口行。
 下表是 **2026-09-22 在本地 5.5.1 集群上的实测结果**（全表当轮重测；`live_async_send` 与
 `live_send_header` 是 2026-09-23 补的，同日重测；`live_flow_control` 是 2026-09-23 深夜补的，
-同日重测；`live_fail_fast` 是 2026-09-24 补的，同日实测。上表 18 个可计数一行一行的数字相加
-= **935 项断言**（`live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本调度，都不计进去）。
+同日重测；`live_fail_fast` 是 2026-09-24 补的，同日实测；`live_scheduled_intervals` 是
+2026-09-24 补的，同日实测。上表 19 个可计数一行一行的数字相加 = **961 项断言**
+（`live_acl` 本机集群没开鉴权、`live_compression_matrix` 由脚本调度，都不计进去）。
 ⚠ 这个和是**各行最后一次实测**的拼接，不是某一次运行的快照：2026-09-24 当天重测的是
 `live_producer` 72（原记 62，新增 P11 的 9 项与 P5 的 10006 码）、`live_validators` 35（原记 31，
 新增 V8 的四项寻址故障定性）、`live_consumer` 123（原记 113，新增 C12/C12b 的
 10 项）、`live_lite_pull_consumer` 76（原记 48，新增 L11 三张位点表的 28 项）、
 `live_flow_control` 25（同日新增 S5 启动期数值闸门，从 11 涨 14）、`live_fail_fast` 17。
 早先这里写过一个 898 的总数：那是 lite-pull 还停在 48 时的旧和，且当时的拼接本身就漏了几行，
-**以本表逐行为准**。
+**以本表逐行为准**；紧接着又写过 955/935 两版，同样与逐行相加对不上（2026-09-24 加
+`live_scheduled_intervals` 时按行重算才发现差 6），现在这个 961 是**按当前表格逐行重算**的结果。
 
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
@@ -137,6 +140,7 @@ cargo run --example live_compression_matrix -- send|recv ...             # 由 .
 | `live_sql92` | 15 PASS | S1~S4（与 Python/C++/.NET 同场景）：SQL92 订阅启动时正好一笔 `CHECK_CLIENT_CONFIG`(46)、body 的 `clientId`/`group`/`subscriptionData` 逐字段对得上，纯 TAG 订阅一笔都不发 → 消费者**先起来再发** 6 条，`color='red'` 只收那 3 条 red、blue 一条没漏进来（broker 真在按属性过滤，不是放行全部），`'*'` 对照组收全 6 条，永不匹配的 `color='green'` 收 0 条 → 语法错的表达式让 `start()` 秒回 broker 的 `SUBSCRIPTION_PARSE_FAILED(23)` 并就地回滚（换个合法表达式能重新 `start()`）。协议形状与四条分支语义另有离线单测 9 项（`client::mq_client`：真 socket mock broker，含 Java 那个「订阅集合里有空 subscriptions 就整轮 `return` 而非 `continue`」的短路怪癖） |
 | `live_backpressure` | 30 PASS | B1~B5（Java `executeAsyncMessageSend` 的两个公平闸 + 有界发送队列，真机版）：B1 默认容量 1024 条 / 100MiB 字节、40 笔并发异步发送全落 broker 且两个闸满额归还；B2 `minAsyncResendNum=10` 时**恰好**第 11、12 笔回调 `send message tryAcquire semaphoreAsyncNum timeout`（文案逐字对 Java）、闸等到 150ms 预算耗尽才报（不是看一眼就拒）、broker 上只落那 10 条、被拒的两笔**一笔都没进发送内核**（钩子计数 0）；B3 第 11 笔卡在闸上（**由看门 OS 线程在条数闸读到 0 的瞬间才补交**，否则池子里的任务和它会争公平闸的先后、断言就是假的），由**另一个 OS 线程**在 1000ms 时刻把容量抬到 12 才放它过去（钩子时间戳证明放行时刻 ∈ [1000, 2500)ms，早于在途那 10 笔归还），一共落 21 条、空闲许可 = 新容量 12；B4 一笔 600KB 在途精确扣掉 614400 个字节许可（剩 434176），超限两笔回调 `...semaphoreAsyncSize timeout`、只落 1 条，且**字节闸没过时已拿到的条数许可照样归还**；B5 配置越界被夹到地板值 10 条 / 1MiB，开关关掉时 30 笔并发（含 3 笔 300KB）全部落地、两个闸一分未动 |
 | `live_flow_control` | 25 PASS / 0 FAIL（2026-09-24 实测） | 拉取前流控五个阈值的真机闭环（与 `python/verify_flow_control_live.py`、C++ `rmq_live_flow_control`、.NET `flow-control` 的 S0~S5 逐条同构）。离线单测 `flow_control_hits_each_threshold` 锁判据本身；真机锁离线锁不住的两件事：**闸门确实会命中**（单位错一位、阈值读错一个字段，离线拿预置缓冲照样绿）与**命中后一条不丢**（写成"命中就丢批/退出循环"在十几秒窗口里看不出来）。S0 默认闸门 + 快消费 ⇒ `triggered==0`、12 条全到；S1 只留队列级字节闸门 ⇒ 命中 15 次、8 条 400KB 不丢不重（另设一条独立断言：listener 看到的 `store_size >= 400KB`，先把"解码没带上 broker 的 TOTALSIZE"这个假阴性来源排除掉）；S2 只留跨度闸门（`max_span=2`）⇒ 命中 6 次、14 条仍全消费；S3 只留 topic 级条数闸门 ⇒ 单队列到不了阈值、必须跨队列累计（命中 144 次）且每条队列都消费到底；S4 复用 S1 的组与 topic ⇒ 位点从 broker 末尾续上、闸门不是命中一次就失效（仍命中 9 次）。S5 启动期数值闸门（Java `checkConfig` 数值段 `:1099-1209`）补两件离线证不出的事：**贴着 Java 区间端点的配置真能把消费者跑起来并收全 10 条**（闸门写坏最常见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来），以及**越界配置没有打到 broker 上**（写成"先注册再校验"会留下一堆永不心跳的僵尸 clientId，把 rebalance 用的 `cidAll` 撑歪，真机表现为队列分配不均，而客户端日志里只有启动失败那一条）——反证用**裸** `get_consumer_list_by_group` 查被拒的组（`get_consumer_id_list_by_group` 吞异常返回 `None`，"被拒绝"与"没注册"分不开），broker 对从未注册过的组回 `code=1 no consumer for this group`，空列表与该异常都算"查无此组"，其它异常一律 FAIL；同时正向对照要求边界值那个组在 broker 侧恰好查得到 1 个 clientId。⚠ 有了 S5 之后"把某道闸门关掉"的写法必须改成 Java 的**上界**（条数/跨度 `GATE_OFF=65535`、字节 `GATE_OFF_SIZE_MIB=1024`），不能再写 `0`：`0` 现在正是启动期会拒的配置。⚠ 命中**次数**随真机投递/消费节奏浮动（同一份判据两轮分别报 16/15、5/6、10/9），四语言与离线都只断言 `triggered > 0`。⚠ 三条夹具坑全是实测踩出来的：大消息必须**不可压缩**（否则 broker 落盘 `store_size` 只有几百字节）；S1/S4 的 topic 必须**只有 1 条队列**（8 条 400KB 摊到 4 条队列每条才 800KB，够不到队列级那道 1MiB）；大消息必须**并发投递**（`Fixture::produce` 用 `JoinSet`）——串行 send 每条 ~190ms 与 300ms/批的慢消费几乎同步，缓冲只堆到 1~2 条，字节闸门"真机永不命中"其实是投递节奏；本端口的消费池默认 20 线程（`consumeThreadMin`，对齐 Java）而 Python/C++ 的分发是单线程，故 S1/S2/S4 显式把池钉成 1 线程，四语言才跑同一条判据 |
+| `live_scheduled_intervals` | 20 PASS / 0 FAIL（2026-09-24 实测） | I1~I3（与 Python `verify_interval_live.py`、C++ `rmq_live_scheduled_intervals`、.NET `scheduled-intervals` 同场景）：I3 门面配的周期真的落到实例（`poll_name_server_interval` → `route_refresh_interval_millis`，1s 组与不配的 30s 对照组各断言一次）→ I1 两个生产者各把一个**还没建出来**的 topic 登记进在用集合，先等 1.5s 让两边首跳（`scheduleAtFixedRate` 的 initialDelay=10ms）都落空一次、再建 topic ⇒ 缓存里何时出现它只由周期决定：1s 组 0.58s 拿到，那一刻 30s 组**还没有**，最终 28.69s 拿到（固定速率锚定，逐跳对着同一时间轴算、误差不累积）→ I2 两个消费者（落盘周期 1s / 60s）各消费 3 条后 broker 位点仍是 0，首个落盘落在 **9.74s**（≈ Java `:417-423` 的 initialDelay 10s，60s 组同样是 9.94s —— 这一步由 initialDelay 驱动、不是周期），第二批后 1s 组 0.61s 内把 6 推上去、60s 组**仍是 3**（下一跳在 60s 后），`shutdown()` 收尾补一笔把 6 落盘。⚠ 括号里的秒数是两次实测里的一次，时间量本身有 ±0.2s 抖动（Python 侧同一条用例记的是 1.06s/30.20s/10.18s/10.48s/0.83s，C++ 是 0.52s/28.98s/10.21s/10.52s/0.61s，.NET 是 0.53s/28.76s/10.49s/10.81s/0.68s —— 四语言跑的是同一条判据，比的是量级不是小数点）。⚠ 这条用例抓出一个真缺陷：消费者自己还挂着一份**写死 5s** 的落盘循环，会抢在实例任务之前（实测首笔 4.87s，早于 Java 的 10s）且完全无视 `persist_consumer_offset_interval` —— 已删掉，只留实例上 Java 那一个（模块头差异 4）；同轮把心跳周期任务的 initialDelay 默认值从 2s 改回 Java `:408-415` 的 1s |
 | `live_async_send` | 47 PASS / 0 FAIL（2026-09-23 实测） | A1~A6（异步发送内核，与 `python/verify_async_send_live.py`、`cpp/examples/live_async_send.cpp`、.NET `async-send` 同场景）：A1 `send_async` 在准备段（`send_message_before` 睡 400ms）**之前**就返回，回调恰好一次且 SEND_OK，**用 broker 回的 `offsetMsgId` 能 `view_message` 读回原 body**、`queueOffset == 该队列 maxOffset-1`、`msgId` 是 32 位客户端 UNIQ_KEY 且与 `offsetMsgId` 不同；线程口径本端口没有 `AsyncSenderExecutor_N` / `NettyClientPublicExecutor_N` 这种池线程名，故把调用方放到 `spawn_blocking`（与 tokio 工作线程集合不相交）后用 `ThreadId` 证「before 钩子与用户回调都不在调用方线程上」→ A2 并发 30 笔：一笔恰好一个终态、全 SEND_OK、broker 落 30 条、30 个 `(broker,queueId,queueOffset)` 槽位与 30 个 UNIQ_KEY 两两不重复 → A3 定点异步发送只让指定的那条队列多 1 条、其它队列一条没多 → A4 `CheckForbiddenHook` 看到 `ASYNC`，拒绝时异常原样到回调且**连 topic 路由都没建出来**（`landed=-1`），换个标签照常落地、钩子被调 2 次 → A5 `send_batch_async`（对位 Java `send(Collection, SendCallback, timeout)`）一批 5 条：回调恰好一次且 SEND_OK、broker 侧 `landed=5`、应答的 `offsetMsgId` 是**逐条回的 5 个 commitLog 偏移**，用它 `view_message` 读回的那条**子消息**带着客户端生成的 32 位 `UNIQ_KEY`（逐条 ID 真编进了 body 的落地证据；缺了它发送侧照样 SEND_OK，只有真 broker 看得出来）、`msg_id` 是批量自身的 32 位客户端 ID；定点批量只让那条队列多 3 条；混 topic / 空批的本地校验在异步路径上照样跑且错误**进回调**；字节闸按**整批**扣（1 MiB 地板下 2×600 KiB 被拒、2×100 KiB 照常 SEND_OK、两份许可满额归还）→ A6 实测本端口与 **Java/Python 同派**：`shutdown()` 返回耗时 0ms、不等在途，交进来的 36 笔仍各拿到一个终态回调，但整轮以 `client already shutdown` 收场、broker 上一条都没落（连 topic 都没建出来，`landed=-1`）⇒「不等待真的会丢消息」，调用方要保消息得自己等回调再关；C++/.NET 那两版 join 完池子才关客户端、同一用例能落满 36 条，是它们相对 Java 的偏离。关停之后 `send_async` 同步被拒且不追加回调、新生产者照常能发（关掉的池子不会被复用）。**P11 退出注销 `UNREGISTER_CLIENT`(35)**（Java `DefaultMQProducerImpl#shutdown:313` → `MQClientInstance#unregisterProducer:1198-1201` → 私有 `unregisterClient(group, null):1158-1182`）：判别式是**同一条连接**——同一个 `instanceName` ⇒ 同一个 clientId ⇒ 同一份 `MQClientInstance` ⇒ 每台 broker 一条 TCP 连接，于是先退场的 A 并不会把连接关掉（共用实例的关闭守卫让实例活着，那条 channel 依旧为 B 服务），这种情况下 A 的组能从 broker 的 `ProducerManager.groupChannelTable` 里消失，**只有一发被 broker 接受的 35 解释得通**；不发就只能等通道断开或 120s 扫描。9 项依次锁：同 instanceName 真的共用一份实例与 clientId、两台生产者共用那条 channel 都能发、204 读得到 A 的注册（U 型前置：先证明这条判据本身有效）、B 也在同一 channel 上、A `shutdown()` 后**立刻**查不到 A 的组（不是等心跳超时）、A 的退出没把共用 channel 带下去（B 仍在）、B 之后照常发、A 本地 `producerTable` 腾空、最后一个租户退场才真拆实例 |
 | `live_fail_fast` | 17 PASS / 0 FAIL（2026-09-24 实测，最差一笔 2.19s） | L1~L5（Java `NettyRemotingHandler#close` → `failFast(channel)` → `requestFail(opaque)` 的真机版，与 `python/verify_fail_fast_live.py`、C++ `rmq_live_fail_fast`、.NET `fail-fast` 同场景）：**会先把测试 broker 停掉、跑完再拉起来**，store 不删。L1 真 broker 上 5 条同步发送 SEND_OK + 各队列队尾位点合计覆盖这 5 条（先确认后面的失败不是环境造成的；发送跨队列轮转，所以判据看**合计**而不是单条队列）→ L2 手工构三条 `suspend=True` 的长轮询（客户端超时 30s、broker suspend 20s，都不走 pull consumer 的钳制），2s 后一条都没返回、`in_flight_count` 从 0 涨到 3 —— 请求**确实在途** → L3 `mqshutdown broker`：三条全部返回、类型是 `Error::SendRequest`（文案 `send request to 127.0.0.1:10911 failed: connection closed`）、**一条都没被报成 `Error::Timeout`**（producer 的异步重试分类按错误类型分流，报成超时等于换一整套重试决策），最差一笔 2.19s ≪ 8s 阈值 ≪ 30s 客户端超时，判死后在途表排空 → L4 判死只覆盖死掉那条连接所在的地址：同一个 `RemotingClient` 上的 namesrv 连接照常服务，`GET_ALL_TOPIC_LIST_FROM_NAMESERVER` 仍回 `code=0`（⚠ 真机只能证**按地址隔离**——一台 broker 一个地址一条连接，"同地址换连接时旧连接的收尾不误伤新连接"那一层没有确定性的时间窗，由离线单测 `same_address_works_after_fail_fast` / `fail_fast_leaves_other_connections_alone` 负责）→ L5 broker 拉起后**同一个 producer 实例**重新建连照常发送（`attempts=1`，一次没重），且那 5 条已拿到 SEND_OK 的消息一条都没少（快速失败不能把已经落地的说成丢了）。收尾无论走到哪一步都由 `BrokerGuard::drop` 把 broker 拉回来，脚本的 `start` 本身幂等 |
 | `live_send_header` | 15 PASS / 0 FAIL | 发送头 `c`/`d`/`n` 三个字段真机（与 `python/verify_send_header_live.py`、C++ `rmq_live_send_header`、.NET `send-header` 同题）：H0 先量出 `TBW102` 的 read/write 队列数（本机 8/8）作为算术基准 → H1 什么都不配、发到全新 topic，broker 按 `min(d=4, TBW102.writeQueueNums)` 建出 **4** 条队列（`TopicConfigManager.java:289`）→ H2 `default_topic_queue_nums=2` 真的让 broker 只建 **2** 条（修之前写死 4，这一条必然红）→ H3 `create_topic_key` 指向一个带 `PERM_INHERIT`、3 条队列的模板 topic 时，新 topic 继承**模板**的 **3** 条而不是 TBW102 的 8 条（`isInherited` + `min` 两道门）→ H4 补上三字段后五种入口（同步 / 定点 / 单向 / 批量 320 / 异步）在真 broker 上逐条落地、7 条一条不差 → H5 落点 broker 名与路由选中那台一致。⚠ `n` 在经典 broker 的发送链路里**没有读者**（5.5.1 源码 grep 过），它上线的存在由离线抓帧单测取证，这里不假装能观测到 |
@@ -234,6 +238,16 @@ brokerId**，而 `sendHeartbeatToAllBroker` 用 `selectBrokerAddr`（master 优�
 是历史包袱，任何长度都不会失败）。锁中毒用 `unwrap_or_else(|e| e.into_inner())` 兜住，
 不给后台任务留 panic 入口。
 
+**周期任务按 `scheduleAtFixedRate` 的固定速率推进。** 实例上那五条任务（动态 namesrv 10s/2min、
+路由刷新 10ms/`pollNameServerInterval`、心跳 1s/`heartbeatBrokerInterval`、位点落盘
+10s/`persistConsumerOffsetInterval`、线程池巡检 1min/1min，见 Java `MQClientInstance:389-432`）
+与消费者的重平衡等待都锚在一个 `next` 截止时刻上：首跳落在 `initialDelay` 这一刻，
+之后每轮只睡"还差多少"到 `next + n×period`，睡醒再 `next += period`。写成"先睡 initial
+再睡 period"首跳就晚一整个周期；写成"每轮睡满一个周期"则每个周期叠加一次系统定时器误差
+（macOS 上 `sleep_for(100ms)` 实测多给 4.4ms，30s 周期真机量到 31.3s；切片式
+"按 100ms 睡满 30s"更糟，误差按片累加）。真机取证见 `live_scheduled_intervals`，
+离线守卫是 `mq_client::tests::spawn_periodic_first_tick_lands_at_initial_delay`。
+
 **日志刻意不叫 Java 的 `rocketmq_client.log`。** 落
 `$HOME/logs/rocketmqlogs/rocketmq_rs_client.log`，按天改名轮转。同机同文件会互相插行；
 更糟的是改名后其它进程仍持旧 fd，日志写进已 unlink 的 inode 而静默消失。
@@ -256,6 +270,14 @@ brokerId**，而 `sendHeartbeatToAllBroker` 用 `selectBrokerAddr`（master 优�
   保持 `DEFAULT`，因此同进程的广播消费者共用一份实例，与 Java 一致）。
   `unit_name` / `unit_mode` / `enable_stream_request_type` 三项配置 producer、push、pull、
   lite、admin 五个门面都有，默认值与 Java 相同（producer/push/admin 关 stream，pull/lite 开）。
+- **心跳有一处已知偏差**：Java 只有实例级那一份周期性心跳（`:408-415`，initialDelay 1s、周期
+  `heartbeatBrokerInterval`），这里实例级已经对齐（另有 `start()` 里消费者自己先同步打一轮），
+  但消费者仍保留着从 Python 移植过来的 `heartbeat_loop`（首跳在 30s、周期同
+  `heartbeat_interval_millis`）⇒ 真机上每 30s 会发两份心跳。内容一致、只是多一份流量，
+  是刻意的遗留：删掉它要动 `heartbeat_enabled` 这个门面的语义，收益不抵风险，连同此处记录。
+  位点落盘那一份重复的**已经删掉** —— `live_scheduled_intervals` 的 I2 抓到它抢跑（首笔
+  4.87s，早于 Java `:417-423` 的 initialDelay 10s，且完全无视 `persist_consumer_offset_interval`），
+  现在只留实例上 Java 那一个。
 - **本机 IP 探测方式不同**：Java 枚举网卡并优先非内网 IPv4，这里用 UDP「连」公网地址后
   读 sockname（不发包），取不到退化成 `127.0.0.1`。结果通常是同一块出口网卡的地址。
 - **unitMode / stream 是上线字段，不是本地摆设**（`live_unit_config` U1–U5 在真集群上验）：

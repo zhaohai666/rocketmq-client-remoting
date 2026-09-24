@@ -171,6 +171,9 @@ pub struct PullConsumerConfig {
     /// 的每个构造函数都置 `enableStreamRequestType = true`（:113/:126 与 :213/:228），
     /// 只有推送消费者和生产者默认 false。
     pub enable_stream_request_type: bool,
+    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
+    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
+    pub poll_name_server_interval_millis: u64,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
@@ -196,6 +199,8 @@ impl Default for PullConsumerConfig {
             unit_name: None,
             unit_mode: false,
             enable_stream_request_type: true,
+            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
+            poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
@@ -369,6 +374,11 @@ impl DefaultMQPullConsumer {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
+    /// Java `ClientConfig#setPollNameServerInterval`。
+    pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
+        self.update_config(|c| c.poll_name_server_interval_millis = millis);
+    }
+
     /// Python `set_namespace`。
     pub fn set_namespace(&self, namespace: &str) {
         let namespace = namespace.to_string();
@@ -518,6 +528,7 @@ impl DefaultMQPullConsumer {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
+            route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -821,6 +832,9 @@ pub struct LitePullConsumerConfig {
     /// 的每个构造函数都置 `enableStreamRequestType = true`（:113/:126 与 :213/:228），
     /// 只有推送消费者和生产者默认 false。
     pub enable_stream_request_type: bool,
+    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
+    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
+    pub poll_name_server_interval_millis: u64,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`（同上，与推送消费者统一）。
@@ -862,6 +876,8 @@ impl Default for LitePullConsumerConfig {
             unit_name: None,
             unit_mode: false,
             enable_stream_request_type: true,
+            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
+            poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
@@ -1148,6 +1164,11 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
+    /// Java `ClientConfig#setPollNameServerInterval`。
+    pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
+        self.update_config(|c| c.poll_name_server_interval_millis = millis);
+    }
+
     /// Python `set_message_model`。
     pub fn set_message_model(&self, model: &str) {
         let model = model.to_string();
@@ -1409,6 +1430,7 @@ impl DefaultLitePullConsumer {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
+            route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(

@@ -61,6 +61,8 @@ public sealed class DefaultLitePullConsumer
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType = true;
+    // Java ClientConfig#pollNameServerInterval 的默认值（:58）
+    private int _pollNameServerIntervalMillis = 30000;
 
     // subscribe 模式的订阅表（topic -> sub_expression，已套命名空间）
     private readonly Dictionary<string, string> _subscription = new(StringComparer.Ordinal);
@@ -176,6 +178,16 @@ public sealed class DefaultLitePullConsumer
     {
         get => _enableStreamRequestType;
         set => _enableStreamRequestType = value;
+    }
+
+    /// <summary>
+    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 路由刷新周期，Start() 时透传给 MqClient（之后改不重排已启动的周期任务）。
+    /// </summary>
+    public int PollNameServerIntervalMillis
+    {
+        get => _pollNameServerIntervalMillis;
+        set => _pollNameServerIntervalMillis = value;
     }
 
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
@@ -355,7 +367,7 @@ public sealed class DefaultLitePullConsumer
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
                 /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000,
-                unitName: _unitName);
+                unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("lite pull consumer rpc hook ignored: MqClient already has one (clientId="

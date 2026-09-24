@@ -26,6 +26,7 @@
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
+#include "schedule_util.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/extra_info.h"
@@ -180,9 +181,12 @@ bool MQClientInstance::tlsEnabledFromEnv() {
 MQClientInstance::MQClientInstance(const std::string& clientId,
                                   const std::vector<std::string>& nameServerAddrs,
                                   int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis,
-                                  bool tlsEnable, const std::string& unitName)
+                                  bool tlsEnable, const std::string& unitName,
+                                  int32_t pollNameServerIntervalMillis)
     : clientId_(clientId), nameServerAddrs_(nameServerAddrs),
       remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)),
+      pollNameServerIntervalMillis_(pollNameServerIntervalMillis > 0 ? pollNameServerIntervalMillis
+                                                                    : 30000),
       tlsEnable_(tlsEnable) {
     // 动态取址（对应 Java MQClientAPIImpl 构造里的 DefaultTopAddressing(unitName)）：
     // 配了 ROCKETMQ_NAMESRV_DOMAIN 才生效，wsAddr + unitName 一起决定 URL。
@@ -267,18 +271,15 @@ void MQClientInstance::registerTopicInUse(const std::string& topic) {
 }
 
 void MQClientInstance::routeRefreshLoop() {
-    // 首次延迟 ~10ms 后再开始周期刷新（对应 Java 的 10ms initialDelay）
-    if (routeRefreshStop_) return;
-    for (int i = 0; i < 10 && !routeRefreshStop_; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    while (!routeRefreshStop_) {
-        // 周期 30s（对应 Java pollNameServerInterval 默认 30000ms）
-        for (int i = 0; i < 300 && !routeRefreshStop_; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (routeRefreshStop_) return;
+    // Java `scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)`：
+    // 首跳落在 initialDelay（10ms）**这一刻**，之后每跳锚定在 initialDelay + n×周期（固定速率，
+    // 见 schedule_util.h），不是 initialDelay + 一个周期后（旧写法要等 10ms + 30s 才刷新第一次）。
+    // 周期取构造时定型的 pollNameServerIntervalMillis_。
+    auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+    while (!routeRefreshStop_.load()) {
         if (!started_) return;
+        sleepUntilDeadline(routeRefreshStop_, next);
+        next += std::chrono::milliseconds(pollNameServerIntervalMillis_);
         std::set<std::string> topics;
         {
             std::lock_guard<std::recursive_mutex> lk(routeLock_);
@@ -375,19 +376,16 @@ void MQClientInstance::fetchNameServerAddr() {
 }
 
 void MQClientInstance::namesrvRefreshLoop() {
-    // Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)：首次延迟 10s、周期 2min
-    for (int i = 0; i < 100 && !namesrvRefreshStop_; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    while (!namesrvRefreshStop_) {
+    // Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)：首跳 10s，之后固定速率 2min。
+    auto next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!namesrvRefreshStop_.load()) {
         if (!started_) return;
+        sleepUntilDeadline(namesrvRefreshStop_, next);
+        next += std::chrono::minutes(2);
         try {
             fetchNameServerAddr();
         } catch (const std::exception& e) {
             logger_debug(std::string("fetchNameServerAddr exception: ") + e.what());
-        }
-        for (int i = 0; i < 1200 && !namesrvRefreshStop_; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 }
@@ -527,6 +525,11 @@ std::shared_ptr<TopicRouteData> MQClientInstance::getTopicRouteData(const std::s
         return nullptr;
     }
     return std::make_shared<TopicRouteData>(it->second);
+}
+
+bool MQClientInstance::isTopicRouteCached(const std::string& topic) const {
+    std::lock_guard<std::recursive_mutex> lk(routeLock_);
+    return topicRouteTable_.find(topic) != topicRouteTable_.end();
 }
 
 std::string MQClientInstance::findBrokerAddrInRoute(const TopicRouteData& route,

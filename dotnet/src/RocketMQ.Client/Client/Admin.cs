@@ -109,6 +109,16 @@ public sealed class DefaultMQAdminExt
         set => _enableStreamRequestType = value;
     }
 
+    /// <summary>
+    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
+    /// </summary>
+    public int PollNameServerIntervalMillis
+    {
+        get => _pollNameServerIntervalMillis;
+        set => _pollNameServerIntervalMillis = value;
+    }
+
     // ---------------- ACL 鉴权（对应 Java DefaultMQAdminExt(rpcHook)）----------------
     // 必须在 Start() 之前调用。
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
@@ -121,6 +131,8 @@ public sealed class DefaultMQAdminExt
     private IRpcHook? _rpcHook;
     private string _unitName = string.Empty;
     private bool _enableStreamRequestType;
+    // Java ClientConfig#pollNameServerInterval 的默认值（:58）
+    private int _pollNameServerIntervalMillis = 30000;
 
     public void SetTimeoutMillis(int millis) => _timeoutMillis = millis;
 
@@ -151,7 +163,8 @@ public sealed class DefaultMQAdminExt
         // 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它）。
         // admin 在 Java 里既不置 unitMode 也不置 stream，默认全关。
         IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
-        _mqClient = new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName);
+        _mqClient = new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
+            pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
         if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
         {
             ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="

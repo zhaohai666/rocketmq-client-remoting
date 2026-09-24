@@ -121,7 +121,8 @@ void DefaultMQPullConsumer::start() {
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,
                                         consumerPullTimeoutMillis_,
-                                        MQClientInstance::tlsEnabledFromEnv(), unitName_));
+                                        MQClientInstance::tlsEnabledFromEnv(), unitName_,
+                                        pollNameServerIntervalMillis_));
     // 请求钩子（ACL 签名 / stream 的 `ReqT`）：必须在**实例 start() 之前**绑定 ——
     // Java 的 rpcHook 是在 MQClientAPIImpl 构造时传进去的（MQClientInstance:214 附近），
     // 也就是实例发出的第一笔报文就带着它；放到 start() 之后，start 期间的动态取址、

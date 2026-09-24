@@ -376,6 +376,12 @@ pub struct ConsumerConfig {
     ///
     /// Java `DefaultMQPushConsumer` 不碰这个开关，默认 false。
     pub enable_stream_request_type: bool,
+    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
+    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
+    pub poll_name_server_interval_millis: u64,
+    /// Java `ClientConfig#persistConsumerOffsetInterval`（默认 5000ms）：后台位点
+    /// 落盘周期；`shutdown()` 的收尾落盘与该值无关。同样只在 `start()` 时读一次。
+    pub persist_consumer_offset_interval_millis: u64,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
@@ -457,6 +463,9 @@ impl Default for ConsumerConfig {
             unit_name: None,
             unit_mode: false,
             enable_stream_request_type: false,
+            // Java `ClientConfig:58` / `:66`：1000 * 30 与 1000 * 5
+            poll_name_server_interval_millis: 30_000,
+            persist_consumer_offset_interval_millis: 5_000,
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
@@ -867,6 +876,11 @@ impl DefaultMQPushConsumer {
         self.inner.started.load(Ordering::Acquire)
     }
 
+    /// [`MQClientInstance`]（Python `_mq_client`、C++ `client()`），未启动时 `None`。
+    pub fn client(&self) -> Option<MQClientInstance> {
+        lock(&self.inner.client).clone()
+    }
+
     pub fn set_namesrv_addr(&self, addr: &str) {
         let addrs = addr
             .split(';')
@@ -901,6 +915,28 @@ impl DefaultMQPushConsumer {
     /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
+    }
+
+    /// Python `set_consume_from_where`（取 [`ConsumeFromWhere`] 里的常量）。
+    pub fn set_consume_from_where(&self, where_: &str) {
+        let where_ = where_.to_string();
+        self.update_config(|c| c.consume_from_where = where_);
+    }
+
+    /// Python `set_consume_timestamp`：`CONSUME_FROM_TIMESTAMP` 的起点，格式 `yyyyMMddHHmmss`。
+    pub fn set_consume_timestamp(&self, timestamp: &str) {
+        let timestamp = timestamp.to_string();
+        self.update_config(|c| c.consume_timestamp = timestamp);
+    }
+
+    /// Java `ClientConfig#setPollNameServerInterval`。
+    pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
+        self.update_config(|c| c.poll_name_server_interval_millis = millis);
+    }
+
+    /// Java `ClientConfig#setPersistConsumerOffsetInterval`。
+    pub fn set_persist_consumer_offset_interval_millis(&self, millis: u64) {
+        self.update_config(|c| c.persist_consumer_offset_interval_millis = millis);
     }
 
     pub fn set_message_listener(&self, listener: MessageListener) {
@@ -1163,6 +1199,8 @@ impl DefaultMQPushConsumer {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
+            route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
+            persist_offset_interval_millis: cfg.persist_consumer_offset_interval_millis,
             ..Default::default()
         };
         let client =
@@ -2281,20 +2319,6 @@ async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// Python `_offset_persist_loop`（Java `MQClientInstance.startScheduledTask`：每 5s）。
-async fn offset_persist_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
-    loop {
-        if wait_or_stop(&mut rx, 5_000).await {
-            return;
-        }
-        let client = match require_client(&inner) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        persist_offsets_once(&inner, &client).await;
-    }
-}
-
 /// Python `_lock_loop`（Java `ConsumeMessageOrderlyService.lockMQ`：每 20s，启动即试一次）。
 async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
@@ -2402,7 +2426,6 @@ impl DefaultMQPushConsumer {
         }
         let tasks = &mut *lock(&self.inner.tasks);
         tasks.push(spawn_loop!(heartbeat_loop));
-        tasks.push(spawn_loop!(offset_persist_loop));
         tasks.push(spawn_loop!(lock_loop));
         // 分发与重平衡：重平衡需要句柄（要起每队列循环），单独用消费者克隆体
         let consumer = self.clone();
@@ -2413,6 +2436,12 @@ impl DefaultMQPushConsumer {
 }
 
 /// Python `_persist_offsets_once`（集群模式刷 broker / 广播模式刷本地）。
+///
+/// 周期驱动**不在消费者这边**：Java 只有 `MQClientInstance.startScheduledTask` 里的一个
+/// `scheduleAtFixedRate(persistAllConsumerOffset, 1000*10, persistConsumerOffsetInterval)`，
+/// 这里同样收敛到实例（模块头差异 4），逐个 `consumer_table` 成员调用本函数。
+/// 消费者自己再起一个循环会**双写**，而且那个循环的 5s 首跳会盖过 Java 的 initialDelay 10s
+/// （真机 `live_scheduled_intervals` 的 I2 实测：首笔落盘提前到 4.9s）。
 async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
     let cfg = read_cfg(inner);
     if cfg.message_model == MessageModel::BROADCASTING {
@@ -4596,6 +4625,34 @@ mod tests {
             }
             consumer.shutdown();
         }
+    }
+
+    /// Java `ClientConfig:58/:66` 的两个周期：推送消费者能改，且 `start()` 真的把它们
+    /// 透传到实例上（路由刷新周期 + 后台位点落盘周期，后者默认 5000ms 而不是 30s）。
+    #[tokio::test]
+    async fn scheduled_intervals_reach_the_instance() {
+        let consumer = DefaultMQPushConsumer::new("CID_interval_probe_rust").unwrap();
+        assert_eq!(
+            consumer.config().poll_name_server_interval_millis,
+            30_000,
+            "ClientConfig:58 = 1000 * 30"
+        );
+        assert_eq!(
+            consumer.config().persist_consumer_offset_interval_millis,
+            5_000,
+            "ClientConfig:66 = 1000 * 5"
+        );
+        consumer.set_namesrv_addr("127.0.0.1:1");
+        consumer.subscribe("T", "TagA").unwrap();
+        consumer.set_message_listener_concurrently(Arc::new(NoopListener));
+        consumer.set_poll_name_server_interval_millis(2_000);
+        consumer.set_persist_consumer_offset_interval_millis(700);
+
+        consumer.start().await.expect("静态地址下 start 不该失败");
+        let client = lock(&consumer.inner.client).clone().expect("start 之后必须已有实例");
+        assert_eq!(client.config().route_refresh_interval_millis, 2_000);
+        assert_eq!(client.config().persist_offset_interval_millis, 700);
+        consumer.shutdown();
     }
 
     /// 起点时间也在 checkConfig 里（Java :1058）。原来只在算拉取位点时才解析，

@@ -442,7 +442,8 @@ pub struct MQClientInstanceConfig {
     /// Python `tls_enable`：`None` 走环境变量 `ROCKETMQ_TLS_ENABLE`（与
     /// [`RemotingClientConfig::default`] 同口径），`Some(v)` 强制。
     pub tls_enable: Option<bool>,
-    /// 路由周期刷新（Python `_route_refresh_loop` 的 30s）。
+    /// 路由周期刷新（Java `ClientConfig#pollNameServerInterval`，默认 30000ms；
+    /// initialDelay 10ms 见 `route_refresh_loop`）。
     pub route_refresh_interval_millis: u64,
     /// 动态 namesrv 首延迟 / 周期（Python `_namesrv_refresh_loop`：10s / 120s）。
     pub namesrv_refresh_initial_delay_millis: u64,
@@ -450,11 +451,13 @@ pub struct MQClientInstanceConfig {
     /// 线程弹性巡检（Python `_adjust_thread_pool_loop`：60s / 60s）。
     pub adjust_pool_initial_delay_millis: u64,
     pub adjust_pool_interval_millis: u64,
-    /// Java `sendHeartbeatToAllBroker` 周期任务（initialDelay 2s，
+    /// Java `sendHeartbeatToAllBroker` 周期任务（`MQClientInstance:408-415` 的
+    /// `scheduleAtFixedRate(..., 1000, heartbeatBrokerInterval)`：initialDelay 1s，
     /// `heartbeatBrokerInterval` 默认 30s）。Python 无实例级心跳循环（见模块头差异 4）。
     pub heartbeat_initial_delay_millis: u64,
     pub heartbeat_interval_millis: u64,
-    /// Java `persistAllConsumerOffset` 周期任务（10s / 30s）。
+    /// `persistAllConsumerOffset` 周期任务（initialDelay 10s，
+    /// Java `ClientConfig#persistConsumerOffsetInterval` 默认 5000ms）。
     pub persist_offset_initial_delay_millis: u64,
     pub persist_offset_interval_millis: u64,
     /// 实例级共享统计器（Python 内部构造 `ConsumerStatsManager()`；这里注入，
@@ -491,10 +494,12 @@ impl Default for MQClientInstanceConfig {
             namesrv_refresh_interval_millis: 120_000,
             adjust_pool_initial_delay_millis: 60_000,
             adjust_pool_interval_millis: 60_000,
-            heartbeat_initial_delay_millis: 2_000,
+            // Java `MQClientInstance:408-415`：initialDelay = 1000ms
+            heartbeat_initial_delay_millis: 1_000,
             heartbeat_interval_millis: 30_000,
             persist_offset_initial_delay_millis: 10_000,
-            persist_offset_interval_millis: 30_000,
+            // Java `ClientConfig:66`：persistConsumerOffsetInterval = 1000 * 5
+            persist_offset_interval_millis: 5_000,
             consumer_stats_manager: None,
             latency_fault_tolerance: None,
             trace_dispatcher: None,
@@ -727,6 +732,12 @@ impl MQClientInstance {
 
     pub fn name_server_addrs(&self) -> Vec<String> {
         self.inner.name_server_addrs.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 实例持有的周期配置（Java `ClientConfig` 的实例级副本）：门面 `start()` 透传的
+    /// `pollNameServerInterval` / `persistConsumerOffsetInterval` 断言用。
+    pub fn config(&self) -> &MQClientInstanceConfig {
+        &self.inner.config
     }
 
     pub fn remoting_client(&self) -> &RemotingClient {
@@ -1221,7 +1232,12 @@ impl MQClientInstance {
         self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
     }
 
-    /// 通用周期任务：initial 延迟 → 循环（sleep ∥ stop 信号），每轮先查 started。
+    /// 通用周期任务：initial 延迟 → 循环（work → sleep ∥ stop 信号），每轮先查 started。
+    ///
+    /// ⚠ 首跳落在 `initial_delay_millis` 这一刻，不是 `initial_delay + period`：Java 用的是
+    /// `ScheduledExecutorService#scheduleAtFixedRate`，任务在 initialDelay 后立刻跑第一次，
+    /// **之后**才按周期重复。按「先睡 initial 再睡 period」写会让首跳晚一整个周期
+    /// （真机实测：30s 周期组 30.19s 才刷新路由，而 Java 语义是 10ms + 立刻）。
     fn spawn_periodic<F, Fut>(&self, _name: &str, work: F, initial_delay_millis: u64, period_millis: u64)
     where
         F: Fn(MQClientInstance) -> Fut + Send + 'static,
@@ -1229,13 +1245,15 @@ impl MQClientInstance {
     {
         let me = self.clone();
         let handle = tokio::spawn(async move {
-            if wait_or_stop(&me.inner.stop, initial_delay_millis).await {
-                return;
-            }
+            // 固定速率（Java scheduleAtFixedRate）：第 n 跳锚定在 initialDelay + (n-1)×period，
+            // 不随后续每轮的耗时往后漂；落后于计划时不等待、立刻补跑，与 Java 一致。
+            let mut next = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(initial_delay_millis);
             loop {
-                if wait_or_stop(&me.inner.stop, period_millis).await {
+                if wait_until_or_stop(&me.inner.stop, next).await {
                     return;
                 }
+                next += std::time::Duration::from_millis(period_millis);
                 if !me.is_started() {
                     return;
                 }
@@ -1246,15 +1264,15 @@ impl MQClientInstance {
     }
 
     async fn route_refresh_loop(&self) {
-        if wait_or_stop(&self.inner.stop, 10).await {
-            return;
-        }
+        // 周期在入口取一次：Java 的 scheduleAtFixedRate 也是排队时就把周期定死，
+        // 之后改 clientConfig 不影响已排定的任务。
+        let period = self.inner.config.route_refresh_interval_millis;
+        let mut next = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
         loop {
-            if wait_or_stop(&self.inner.stop, self.inner.config.route_refresh_interval_millis)
-                .await
-            {
+            if wait_until_or_stop(&self.inner.stop, next).await {
                 return;
             }
+            next += std::time::Duration::from_millis(period);
             if !self.is_started() {
                 return;
             }
@@ -3406,14 +3424,18 @@ fn blank_group_to_none(group: &str) -> Option<String> {
     (!group.trim().is_empty()).then(|| group.to_string())
 }
 
-/// `wait_or_stop`：sleep 与 stop 信号赛跑；`true` 表示该停了。
-async fn wait_or_stop(stop: &watch::Sender<bool>, millis: u64) -> bool {
+/// 睡到绝对时刻 `deadline`（固定速率锚点，误差不累积：每轮都对着同一个时间轴算）；
+/// stop 置位时立刻返回 true，调用方收尾。
+async fn wait_until_or_stop(stop: &watch::Sender<bool>, deadline: tokio::time::Instant) -> bool {
     let mut rx = stop.subscribe();
     if *rx.borrow_and_update() {
         return true;
     }
+    if tokio::time::Instant::now() >= deadline {
+        return false; // 已落后于计划：不等待，立刻补跑（Java 的 catch-up）
+    }
     tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_millis(millis)) => false,
+        _ = tokio::time::sleep_until(deadline) => false,
         _ = rx.changed() => true,
     }
 }
@@ -3521,7 +3543,7 @@ mod tests {
     use crate::remoting::protocol::route::{BrokerData, QueueData};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use crate::common::message_decoder::encode_message_ext;
 
     const GROUP: &str = "GID_MqClientUnit";
@@ -3993,6 +4015,64 @@ mod tests {
 
     fn task_count(instance: &MQClientInstance) -> usize {
         guard(&instance.inner.tasks).len()
+    }
+
+    /// Java `MQClientInstance#startScheduledTask`(:389-432) 用 `scheduleAtFixedRate`：
+    /// 首跳落在 **initialDelay 这一刻**，之后才按周期重复 —— 不是 `initialDelay + period`。
+    /// 真机上按后者写会晚整整一个周期（30s 周期组的首跳实测 30.19s 才发生，而 Java 语义是
+    /// 10ms 就有第一跳），所以在 30ms / 300ms 这个量级上把两级时间都钉死。
+    #[tokio::test]
+    async fn spawn_periodic_first_tick_lands_at_initial_delay() {
+        let id = format!("{GROUP}@periodic-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig {
+                // 把内建循环全推到 1 小时之后，只留探测器在跑。
+                namesrv_refresh_initial_delay_millis: 3_600_000,
+                namesrv_refresh_interval_millis: 3_600_000,
+                adjust_pool_initial_delay_millis: 3_600_000,
+                adjust_pool_interval_millis: 3_600_000,
+                route_refresh_interval_millis: 3_600_000,
+                heartbeat_initial_delay_millis: 3_600_000,
+                heartbeat_interval_millis: 3_600_000,
+                persist_offset_initial_delay_millis: 3_600_000,
+                persist_offset_interval_millis: 3_600_000,
+                ..MQClientInstanceConfig::default()
+            },
+        );
+        instance.start().await.unwrap();
+
+        let ticks = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let probe = ticks.clone();
+        instance.spawn_periodic(
+            "probe",
+            move |_me| {
+                let probe = probe.clone();
+                async move {
+                    guard(&probe).push(Instant::now());
+                }
+            },
+            30,
+            300,
+        );
+
+        let t0 = Instant::now();
+        assert!(wait_until(|| !guard(&ticks).is_empty()).await, "首跳压根没发生");
+        let first = guard(&ticks)[0].duration_since(t0);
+        assert!(
+            first < Duration::from_millis(250),
+            "首跳晚了 {first:?}：initialDelay=30ms 时首跳就该发生（旧写法要等到 330ms）"
+        );
+
+        assert!(wait_until(|| guard(&ticks).len() >= 2).await, "第二跳没发生");
+        let second = guard(&ticks)[1].duration_since(t0);
+        assert!(
+            second >= Duration::from_millis(300) && second < Duration::from_millis(600),
+            "第二跳应落在 initialDelay+period（~330ms），实测 {second:?}"
+        );
+
+        instance.shutdown();
     }
 
     #[tokio::test]

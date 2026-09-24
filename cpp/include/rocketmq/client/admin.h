@@ -58,6 +58,10 @@ public:
     // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
+    // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：在用 topic 的
+    // 路由刷新周期，start() 时透传给 MQClientInstance。
+    void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
+    int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
     std::string getNamesrvAddr() const;
     std::vector<std::string> getNameServerAddressList() const { return nameServerAddrs_; }
     void setTimeoutMillis(int32_t millis) { timeoutMillis_ = millis; }
@@ -272,6 +276,8 @@ private:
     std::string clientId_;
     std::string unitName_;
     bool enableStreamRequestType_ = false;
+    // Java ClientConfig:58，默认 30000ms（路由刷新周期）
+    int32_t pollNameServerIntervalMillis_ = 30000;
     std::vector<std::string> nameServerAddrs_;
     std::vector<std::string> kvNamespaceToDeleteList_;
     int32_t timeoutMillis_ = DEFAULT_TIMEOUT;

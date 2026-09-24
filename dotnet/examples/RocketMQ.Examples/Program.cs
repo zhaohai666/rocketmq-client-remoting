@@ -54,6 +54,7 @@ internal static class Program
                 "sql92" => LiveSql92.Run(rest),
                 "unreg-live" => ProducerUnregisterLive.Run(rest),
                 "fail-fast" => LiveFailFast.Run(rest),
+                "scheduled-intervals" => LiveScheduledIntervals.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -101,6 +102,7 @@ internal static class Program
               sql92      [namesrv]        真实集群 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 联调（需 broker 开 enablePropertyFilter）
               unreg-live [namesrv]        真实集群退出注销联调（UNREGISTER_CLIENT(35) 抓帧 + 204 前后对照 + 对照组）
               fail-fast  [namesrv]        broker 真死时在途请求立刻判死（Java failFast）联调（会重启 broker）
+              scheduled-intervals [namesrv] 真实集群周期任务联调（路由刷新周期 1s/30s、位点落盘周期 1s/60s 真机计时）
             """);
     }
 }

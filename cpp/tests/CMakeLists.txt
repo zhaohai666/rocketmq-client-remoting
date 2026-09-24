@@ -200,3 +200,12 @@ add_test(NAME producer_unregister COMMAND rmq_test_producer_unregister)
 add_executable(rmq_test_consumer_check_config test_consumer_check_config.cpp)
 target_link_libraries(rmq_test_consumer_check_config PRIVATE rocketmq::remoting)
 add_test(NAME consumer_check_config COMMAND rmq_test_consumer_check_config)
+
+# 定时任务节奏（Java MQClientInstance#startScheduledTask :389-432）：五个门面的
+# pollNameServerInterval=30000 / persistConsumerOffsetInterval=5000 默认值与透传 +
+# 「首跳落在 initialDelay（10ms）而不是 initialDelay+周期」+ 周期真按传入值走。
+# 假 name server 记录 GET_ROUTEINFO_BY_TOPIC 的到达时刻 —— 这两个偏差在真机上只
+# 表现为「慢」，不表现为「错」，只有计时断言能抓住。
+add_executable(rmq_test_scheduled_intervals test_scheduled_intervals.cpp)
+target_link_libraries(rmq_test_scheduled_intervals PRIVATE rocketmq::remoting)
+add_test(NAME scheduled_intervals COMMAND rmq_test_scheduled_intervals)

@@ -42,6 +42,8 @@ public class DefaultMQProducer
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType;
+    // Java ClientConfig#pollNameServerInterval 的默认值（:58）
+    private int _pollNameServerIntervalMillis = 30000;
     private string _createTopicKey = MixAll.DefaultTopic;
     private int _defaultTopicQueueNums = MixAll.DefaultTopicQueueNums;
     private int _sendMsgTimeout = 3000;
@@ -374,6 +376,16 @@ public class DefaultMQProducer
         set => _enableStreamRequestType = value;
     }
 
+    /// <summary>
+    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
+    /// </summary>
+    public int PollNameServerIntervalMillis
+    {
+        get => _pollNameServerIntervalMillis;
+        set => _pollNameServerIntervalMillis = value;
+    }
+
     // ---------------- ACL 鉴权（对应 Java DefaultMQProducer(group, rpcHook)）----------------
     // 必须在 Start() 之前调用：钩子在 Start() 里绑定到 MQClientInstance（同一 clientId
     // 复用实例时以先注册者为准，与 Java 的绑定时机一致）。
@@ -592,7 +604,8 @@ public class DefaultMQProducer
             // composeRequestHooks 还原 Java 的 stream → 用户钩子顺序（单槽传输层）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
-                tlsEnable: _tlsEnable, unitName: _unitName);
+                tlsEnable: _tlsEnable, unitName: _unitName,
+                pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
@@ -2288,8 +2301,14 @@ public class DefaultMQProducer
     {
         ClientLog.SetThreadName("ProducerHeartbeatThread");
         int intervalMs = _heartbeatIntervalMillis;
+        // 固定速率：首跳立即（Java 的 MQClientInstance 心跳任务 initialDelay=1s，本端口从旧行为
+        // 就是立刻发一次，保留），之后每 intervalMs 一跳且锚定计划时刻（见 Schedules）——
+        // 旧写法"干完再按 100ms 切片睡 30s"在 macOS 上要睡 30.6s，心跳周期被拉长 2%。
+        long next = Environment.TickCount64;
         while (_heartbeatRunning)
         {
+            Schedules.WaitUntil(() => _heartbeatRunning, next);
+            next += intervalMs;
             try
             {
                 SendHeartbeatToAllBroker();
@@ -2297,11 +2316,6 @@ public class DefaultMQProducer
             catch (Exception e)
             {
                 ClientLog.Debug("producer heartbeat failed: " + e.Message);
-            }
-
-            for (int i = 0; i < intervalMs / 100 && _heartbeatRunning; ++i)
-            {
-                Thread.Sleep(100);
             }
         }
     }

@@ -24,6 +24,7 @@
 #include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/exception.h"
+#include "schedule_util.h"
 
 namespace rocketmq {
 
@@ -200,7 +201,8 @@ void DefaultMQProducer::start() {
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                          /*connectTimeoutMillis=*/3000,
                                          /*invokeTimeoutMillis=*/15000,
-                                         tlsEnable_, unitName_));
+                                         tlsEnable_, unitName_,
+                                         pollNameServerIntervalMillis_));
     // 请求钩子：必须在**任何请求发出之前**绑定（start() 里的路由拉取与心跳也要带签名，
     // 开了 stream 时还要带 `ReqT`）。Java 把钩子绑在 MQClientAPIImpl 构造函数里，
     // 这里同样先绑钩子再 start()。
@@ -240,15 +242,17 @@ void DefaultMQProducer::start() {
     heartbeatRunning_.store(true);
     heartbeatThread_ = std::thread([this]() {
         setThreadName("ProducerHeartbeatThread");
-        // 启动后立刻发一次：让 broker 尽快登记 channel，避免首条事务消息错过回查窗口
+        // 启动后立刻发一次：让 broker 尽快登记 channel，避免首条事务消息错过回查窗口。
+        // 之后固定速率：每跳锚定在 heartbeatIntervalMillis_（见 schedule_util.h）——
+        // "干完再按 100ms 切片睡满 30s"每轮会多出十几毫秒，心跳周期被越拖越长。
+        auto next = std::chrono::steady_clock::now();
         while (heartbeatRunning_.load()) {
+            sleepUntilDeadline(heartbeatRunning_, next);
+            next += std::chrono::milliseconds(heartbeatIntervalMillis_);
             try {
                 sendHeartbeatToAllBroker();
             } catch (const std::exception& e) {
                 logger_debug("producer heartbeat failed: " + std::string(e.what()));
-            }
-            for (int i = 0; i < heartbeatIntervalMillis_ / 100 && heartbeatRunning_.load(); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
     });

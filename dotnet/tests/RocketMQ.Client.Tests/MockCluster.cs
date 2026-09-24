@@ -7,6 +7,7 @@
 // 内核（ProducerAsyncTests）。与 python/tests/test_send_retry.py、
 // cpp/tests/test_producer_async.cpp、rust/src/client/producer/send_retry_tests.rs 同题。
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -33,13 +34,18 @@ internal sealed class WireRecord
     public byte[] Body { get; init; } = Array.Empty<byte>();
     public bool HasBody { get; init; }
 
-    public static WireRecord Of(RemotingCommand req) => new()
+    /// <summary>到达时刻（ms，相对 <see cref="MockCluster.ClockOrigin" />）。
+    /// 定时任务的节奏断言只能靠它：报文内容完全正常，只有到达时刻能证明周期对不对。</summary>
+    public long ArrivalMs { get; init; }
+
+    public static WireRecord Of(RemotingCommand req, long arrivalMs = 0) => new()
     {
         Code = req.Code,
         Opaque = req.Opaque,
         Ext = new PropertyMap(req.ExtFields),
         Body = req.Body,
         HasBody = req.HasBody,
+        ArrivalMs = arrivalMs,
     };
 
     /// <summary>还原成裸报文，用来做 broker 侧的验签复算。</summary>
@@ -77,6 +83,7 @@ internal sealed class MockCluster : IDisposable
     private readonly List<string> _brokerAddrs = new();
     private readonly List<Socket> _sockets = new();
     private readonly List<WireRecord> _requests = new();
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
     private bool _routeOk = true;
 
     public string NamesrvAddr { get; private init; } = string.Empty;
@@ -212,10 +219,13 @@ internal sealed class MockCluster : IDisposable
         {
             if (_requests.Count < RequestLogCap)
             {
-                _requests.Add(WireRecord.Of(req));
+                _requests.Add(WireRecord.Of(req, _clock.ElapsedMilliseconds));
             }
         }
     }
+
+    /// <summary>假集群起点的单调钟（<see cref="WireRecord.ArrivalMs" /> 的时间原点）。</summary>
+    public long ClockOrigin => _clock.ElapsedMilliseconds;
 
     public void ClearRequests()
     {

@@ -92,7 +92,7 @@ void DefaultMQAdminExt::start() {
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         3000, 15000, MQClientInstance::tlsEnabledFromEnv(),
-                                        unitName_));
+                                        unitName_, pollNameServerIntervalMillis_));
     // 请求钩子（ACL 签名 / stream 的 `ReqT`）：管理端所有请求同样要带上。
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_);

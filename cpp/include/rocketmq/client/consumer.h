@@ -159,6 +159,18 @@ public:
     // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
+    // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：在用 topic 的
+    // 路由刷新周期，start() 时透传给 MQClientInstance。
+    void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
+    int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
+    // Java `ClientConfig#persistConsumerOffsetInterval`（:66，默认 5000ms）：后台位点
+    // 落盘周期；shutdown() 的收尾落盘与该值无关（调大只推迟时机，不丢位点）。
+    void setPersistConsumerOffsetIntervalMillis(int32_t millis) {
+        persistConsumerOffsetIntervalMillis_ = millis;
+    }
+    int32_t persistConsumerOffsetIntervalMillis() const {
+        return persistConsumerOffsetIntervalMillis_;
+    }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
     // 队列分配策略（对应 Java DefaultMQPushConsumer.setAllocateMessageQueueStrategy）。
@@ -557,6 +569,9 @@ private:
     // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
     // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
     bool enableStreamRequestType_ = false;
+    // Java ClientConfig:58 / :66 的门面级副本（start() 时各透传/读取一次）
+    int32_t pollNameServerIntervalMillis_ = 30000;
+    int32_t persistConsumerOffsetIntervalMillis_ = 5000;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
 

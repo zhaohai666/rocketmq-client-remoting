@@ -106,7 +106,10 @@ public:
                      int32_t connectTimeoutMillis = 3000,
                      int32_t invokeTimeoutMillis = 15000,
                      bool tlsEnable = tlsEnabledFromEnv(),
-                     const std::string& unitName = std::string());
+                     const std::string& unitName = std::string(),
+                     // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：
+                     // 在用 topic 的路由刷新周期，门面 start() 时透传一次。
+                     int32_t pollNameServerIntervalMillis = 30000);
     ~MQClientInstance();
 
     MQClientInstance(const MQClientInstance&) = delete;
@@ -120,6 +123,8 @@ public:
     std::vector<std::string> nameServerAddrs() const;
     void updateNameServerAddressList(const std::vector<std::string>& addrs);
     RemotingClient& remotingClient() { return *remotingClient_; }
+    // 实例持有的路由刷新周期（离线/真机用例断言门面透传结果用）。
+    int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
 
     // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
     // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 wsAddr 为空 → fetch 是 no-op，行为不变。
@@ -177,6 +182,9 @@ public:
     // 或生产者下次发送才被发现。
     void registerTopicInUse(const std::string& topic);
     std::shared_ptr<TopicRouteData> getTopicRouteData(const std::string& topic);
+    // 只读缓存命中探测（**不触发网络拉取**）：getTopicRouteData 未命中会立刻拉一次，
+    // 真机验证「周期刷新何时把新 topic 带进缓存」时用它才不会被按需拉取掩盖周期本身。
+    bool isTopicRouteCached(const std::string& topic) const;
 
     static std::string findBrokerAddrInRoute(const TopicRouteData& route,
                                             const std::string& brokerName);
@@ -458,6 +466,8 @@ private:
     std::string clientId_;
     std::vector<std::string> nameServerAddrs_;
     std::unique_ptr<RemotingClient> remotingClient_;
+    // Java ClientConfig:58 的实例级副本（构造时定型，运行期改不重排已启动的周期任务）
+    int32_t pollNameServerIntervalMillis_ = 30000;
 
     mutable std::recursive_mutex routeLock_;
     std::map<std::string, TopicRouteData> topicRouteTable_;
@@ -466,7 +476,7 @@ private:
     std::set<std::string> topicsInUse_;
     bool tlsEnable_ = false;
     bool started_ = false;
-    bool routeRefreshStop_ = false;
+    std::atomic<bool> routeRefreshStop_{false};
     std::thread routeRefreshThread_;
     // 动态 name server 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
     std::atomic<bool> namesrvRefreshStop_{false};

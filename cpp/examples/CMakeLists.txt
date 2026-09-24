@@ -101,3 +101,7 @@ target_link_libraries(rmq_live_producer_unregister PRIVATE rocketmq::remoting)
 # broker 真死掉时在途请求立刻判死（Java failFast）真机联调：会停一次 broker 再拉起（不打进 ctest）
 add_executable(rmq_live_fail_fast live_fail_fast.cpp)
 target_link_libraries(rmq_live_fail_fast PRIVATE rocketmq::remoting)
+
+# 路由刷新周期 / 位点落盘周期真机联调：两个实例不同周期，缓存/位点何时动（不打进 ctest）
+add_executable(rmq_live_scheduled_intervals live_scheduled_intervals.cpp)
+target_link_libraries(rmq_live_scheduled_intervals PRIVATE rocketmq::remoting)

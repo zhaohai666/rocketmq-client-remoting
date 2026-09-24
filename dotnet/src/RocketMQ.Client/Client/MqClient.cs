@@ -77,6 +77,41 @@ public static class ClientIds
 }
 
 /// <summary>
+/// Java <c>ScheduledExecutorService#scheduleAtFixedRate</c> 的「固定速率」推进，各周期任务共用。
+///
+/// 速率锚定在**计划时刻**（start + initialDelay + n × period），不是「上一轮干完再睡一个周期」：
+/// 后者的耗时（以及下面这条坑）会一轮轮累加。真机量化过：macOS 上
+/// <c>ManualResetEventSlim.Wait(100ms)</c> 实测 131ms（系统定时器多给一个 tick），
+/// 于是「按 100ms 切片睡满 30s」实际要 39.2s —— 路由刷新、位点落盘的周期全被拉长 ~31%。
+/// 整段 wait 既能被 Shutdown 的 Set 立刻唤醒，又只有一次定时器误差（30s 实测 30.002s）。
+/// 落后于计划（上一轮超时）时不等待、立刻补跑，与 Java 的 catch-up 行为一致。
+/// </summary>
+internal static class Schedules
+{
+    /// <summary>睡到 <paramref name="deadlineTick"/>（Environment.TickCount64 口径），
+    /// <paramref name="stop"/> 被 Set 时立刻返回（提前返回由调用方的循环条件收尾）。</summary>
+    public static void WaitUntil(ManualResetEventSlim stop, long deadlineTick)
+    {
+        long remain = deadlineTick - Environment.TickCount64;
+        if (remain > 0)
+        {
+            stop.Wait(TimeSpan.FromMilliseconds(remain));
+        }
+    }
+
+    /// <summary>没有可等待事件的任务（生产者心跳线程）用 100ms 分段睡到计划时刻：
+    /// 每段都重新对着**绝对时刻**算，误差不累积，关停响应也在 100ms 内。</summary>
+    public static void WaitUntil(Func<bool> running, long deadlineTick)
+    {
+        long remain;
+        while ((remain = deadlineTick - Environment.TickCount64) > 0 && running())
+        {
+            Thread.Sleep((int)Math.Min(100, remain));
+        }
+    }
+}
+
+/// <summary>
 /// 对应 org.apache.rocketmq.client.impl.producer.TopicPublishInfo。
 ///
 /// 注意：本类型的**轮询游标是共享状态**（Java 用 ThreadLocal，Python 用缓存的单例），
@@ -180,6 +215,12 @@ public sealed class MQClientInstance : IDisposable
     private Thread? _routeRefreshThread;
     private readonly ManualResetEventSlim _routeRefreshStop = new(false);
 
+    /// <summary>
+    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 路由刷新周期。与 Java 同：构造时定型，之后改门面上的字段不重排已启动的周期任务。
+    /// </summary>
+    private readonly int _pollNameServerIntervalMillis;
+
     // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
     // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 → fetch 是 no-op，行为不变。
     // 非空白 unitName 会让 URL 多出 `-<unitName>?nofix=1`（Java `MQClientAPIImpl` 构造里
@@ -213,6 +254,9 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>是否已 Start（诊断用）。</summary>
     public bool Started => _started;
 
+    /// <summary>实例持有的路由刷新周期（离线用例断言门面透传结果用）。</summary>
+    public int PollNameServerIntervalMillis => _pollNameServerIntervalMillis;
+
     /// <summary>Java 的 tls.enable 是 JVM 全局系统属性；这里等价为 env ROCKETMQ_TLS_ENABLE。</summary>
     internal static bool TlsEnabledFromEnv() => RemotingClient.EnvTlsEnabled();
 
@@ -222,10 +266,16 @@ public sealed class MQClientInstance : IDisposable
     /// </summary>
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
         int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
-        string? unitName = null)
+        string? unitName = null, int pollNameServerIntervalMillis = 30000)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
+        // Java `ClientConfig#pollNameServerInterval`（:58）的实例级副本：非正数回落到 Java
+        // 默认 30000（照抄 Java 的契约 —— scheduleAtFixedRate 收到非正周期会抛，
+        // 客户端应当拒绝，而不是退化成每 100ms 忙转一次路由拉取）。
+        _pollNameServerIntervalMillis = pollNameServerIntervalMillis > 0
+            ? pollNameServerIntervalMillis
+            : 30000;
         _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable);
         // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 = 动态取址关闭（与 Java 默认
         // jmenv.tbsite.net 不同：那是个依赖 /etc/hosts 的域名，照抄会让未配置的用户
@@ -397,13 +447,13 @@ public sealed class MQClientInstance : IDisposable
     /// <summary>动态 name server 周期刷新：Java 首次延迟 10s、周期 2 分钟。</summary>
     private void NamesrvRefreshLoop()
     {
-        if (_namesrvRefreshStop.Wait(TimeSpan.FromSeconds(10)))
-        {
-            return;
-        }
+        // Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)：首跳 10s，之后固定速率 2min。
+        long next = Environment.TickCount64 + 10_000;
         while (!_namesrvRefreshStop.IsSet)
         {
             if (!_started) return;
+            Schedules.WaitUntil(_namesrvRefreshStop, next);
+            next += 120_000;
             try
             {
                 FetchNameServerAddr();
@@ -411,10 +461,6 @@ public sealed class MQClientInstance : IDisposable
             catch (Exception e)
             {
                 ClientLog.Debug("fetchNameServerAddr exception: " + e.Message);
-            }
-            if (_namesrvRefreshStop.Wait(TimeSpan.FromMinutes(2)))
-            {
-                return;
             }
         }
     }
@@ -433,25 +479,23 @@ public sealed class MQClientInstance : IDisposable
 
     private void RouteRefreshLoop()
     {
-        // 对齐 Java MQClientInstance.startScheduledTask 的
-        // scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)（默认 30s）。
-        if (_routeRefreshStop.Wait(30))
-        {
-            return; // 启动后立刻收到 stop，直接退出
-        }
-
+        // 对齐 Java MQClientInstance.startScheduledTask:400-406 的
+        // scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)。
+        //
+        // Java 的 scheduleAtFixedRate：**首跳落在 initialDelay（10ms）这一刻**，不是
+        // initialDelay + 一个周期之后；之后的每跳锚定在 initialDelay + n*周期（固定速率）。
+        // 旧写法在循环头先整睡一个周期（30s），首跳要 30.03s，周期还写死 30s ——
+        // ClientConfig#pollNameServerInterval 形同虚设。这两个偏差真机上只表现为「慢」：
+        // 新 topic 的路由要等半分钟才刷出来，不报任何错。
+        // 固定速率：首跳在 initialDelay(10ms)，之后每 pollNameServerIntervalMillis 一跳，
+        // 计划时刻锚定（见 Schedules），不是"干完再睡一个周期"。
+        long next = Environment.TickCount64 + 10;
         while (!_routeRefreshStop.IsSet)
         {
-            // 等待 30s（期间响应 stop），再刷新在用 topic 的路由
-            for (int i = 0; i < 300 && !_routeRefreshStop.IsSet; ++i)
-            {
-                _routeRefreshStop.Wait(TimeSpan.FromMilliseconds(100));
-            }
+            if (!_started) return;
 
-            if (_routeRefreshStop.IsSet)
-            {
-                break;
-            }
+            Schedules.WaitUntil(_routeRefreshStop, next);
+            next += _pollNameServerIntervalMillis;
 
             List<string> topics;
             lock (_routeLock)

@@ -175,6 +175,27 @@ public sealed class DefaultMQPushConsumer
         set => _enableStreamRequestType = value;
     }
 
+    /// <summary>
+    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
+    /// </summary>
+    public int PollNameServerIntervalMillis
+    {
+        get => _pollNameServerIntervalMillis;
+        set => _pollNameServerIntervalMillis = value;
+    }
+
+    /// <summary>
+    /// Java <c>ClientConfig#persistConsumerOffsetInterval</c>（:66，默认 5000ms）：
+    /// 后台位点落盘周期。首个落盘在 10s 的 initialDelay 处（Java startScheduledTask:417-423），
+    /// Shutdown() 的收尾落盘与该值无关（调大只推迟时机，不丢位点）。
+    /// </summary>
+    public int PersistConsumerOffsetIntervalMillis
+    {
+        get => _persistConsumerOffsetIntervalMillis;
+        set => _persistConsumerOffsetIntervalMillis = value;
+    }
+
     // ---------------- ACL 鉴权（对应 Java DefaultMQPushConsumer(group, rpcHook)）----------------
     // 必须在 Start() 之前调用：钩子在 Start() 里绑定到 MQClientInstance。
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
@@ -384,6 +405,10 @@ public sealed class DefaultMQPushConsumer
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType;
+
+    // ClientConfig 的两个周期（Java :58 / :66 的默认值，Start() 时定型）
+    private int _pollNameServerIntervalMillis = 30000;
+    private int _persistConsumerOffsetIntervalMillis = 5000;
 
     // ---------------- 消息轨迹（消费侧）----------------
     private bool _enableTrace;
@@ -1041,7 +1066,8 @@ public sealed class DefaultMQPushConsumer
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
                 /*connectTimeoutMillis=*/3000,
                 /*invokeTimeoutMillis=*/_pullTimeoutMillis,
-                tlsEnable: TlsEnable, unitName: _unitName);
+                tlsEnable: TlsEnable, unitName: _unitName,
+                pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
@@ -3633,11 +3659,18 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 位点持久化 ----------------
     private void OffsetPersistLoop()
     {
-        // Java MQClientInstance.startScheduledTask：persistAllConsumerOffset 每 5s
+        // Java MQClientInstance.startScheduledTask:417-423：
+        //   scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
+        // ——首个任务延迟 10s，之后周期取 ClientConfig#persistConsumerOffsetInterval（:66，
+        // 默认 5s）。首笔落盘发生在 initialDelay **这一刻**，不是 initialDelay + 一个周期后；
+        // 周期是**固定速率**：计划时刻锚定在 initialDelay + n*周期（见 Schedules），
+        // 所以不会像"干完再按 100ms 切片睡一个周期"那样把周期越拖越长。
+        long next = Environment.TickCount64 + 10_000;
         while (!_stop)
         {
-            _stopEvent.Wait(TimeSpan.FromMilliseconds(5000));
-            if (_stop || !_started) return;
+            if (!_started) return;
+            Schedules.WaitUntil(_stopEvent, next);
+            next += _persistConsumerOffsetIntervalMillis;
             try
             {
                 PersistOffsetsOnce();
@@ -3786,11 +3819,9 @@ public sealed class DefaultMQPushConsumer
                 ClientLog.Debug("lock mq error: " + e.Message);
             }
 
-            // 等待 20s（期间响应 stop）
-            for (int i = 0; i < 200 && !_stop; ++i)
-            {
-                _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
-            }
+            // 等待 20s（期间响应 stop）。整段 wait：100ms 切片在 macOS 上每段实测 131ms，
+            // 200 段会把 Java 的 20s 轮次拖成 26s；Wait 本身被 Set 唤醒，照样立刻收手。
+            _stopEvent.Wait(TimeSpan.FromSeconds(20));
         }
     }
 

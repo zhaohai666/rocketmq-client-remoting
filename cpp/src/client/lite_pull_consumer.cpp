@@ -219,7 +219,8 @@ void DefaultLitePullConsumer::start() {
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,
                                         /*invokeTimeoutMillis=*/10000,
-                                        MQClientInstance::tlsEnabledFromEnv(), unitName_));
+                                        MQClientInstance::tlsEnabledFromEnv(), unitName_,
+                                        pollNameServerIntervalMillis_));
     // 请求钩子（ACL 签名 / stream 的 `ReqT`）：lite 消费者在 Java 里**默认**开 stream
     //（DefaultLitePullConsumer:213/228），所以这里必须走 composeRequestHooks 把
     // StreamTypeRPCHook 排在用户钩子之前 —— 直接注册 rpcHook_ 会让 ReqT 漏发，

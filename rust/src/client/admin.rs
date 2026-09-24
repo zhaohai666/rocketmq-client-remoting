@@ -106,6 +106,9 @@ pub struct AdminConfig {
     /// ⚠ admin 没有 `unitMode` 的落点：管理端不发普通消息、也不做消息过滤，
     /// Java 的 `DefaultMQAdminExtImpl` 全程没读过 `isUnitMode()`，所以这里不设该字段。
     pub enable_stream_request_type: bool,
+    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
+    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
+    pub poll_name_server_interval_millis: u64,
     pub name_server_addrs: Vec<String>,
     pub timeout_millis: i64,
     /// Java `kvNamespaceToDeleteList`：`delete_topic` 时顺带清掉的 KV namespace。
@@ -119,6 +122,8 @@ impl Default for AdminConfig {
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
             enable_stream_request_type: false,
+            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
+            poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
             timeout_millis: DEFAULT_TIMEOUT_MILLIS,
@@ -418,6 +423,11 @@ impl DefaultMQAdminExt {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
+    /// Java `ClientConfig#setPollNameServerInterval`。
+    pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
+        self.update_config(|c| c.poll_name_server_interval_millis = millis);
+    }
+
     /// Python `set_timeout_millis`。
     pub fn set_timeout_millis(&self, timeout_millis: i64) {
         self.update_config(|c| c.timeout_millis = timeout_millis);
@@ -502,6 +512,7 @@ impl DefaultMQAdminExt {
             MQClientInstanceConfig {
                 unit_name: cfg.unit_name.clone(),
                 enable_stream_request_type: cfg.enable_stream_request_type,
+                route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
                 ..Default::default()
             },
         );

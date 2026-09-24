@@ -384,6 +384,10 @@ pub struct ProducerConfig {
     /// Java `ClientConfig#enableStreamRequestType`（生产者默认 false）：
     /// true 时每个请求都带 `ReqT=0`，clientId 末尾多一段 `@STREAM`。
     pub enable_stream_request_type: bool,
+    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
+    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`，之后改不改都不再影响
+    /// 已排定的任务（`scheduleAtFixedRate` 一次性排定周期）。
+    pub poll_name_server_interval_millis: u64,
     /// Python `client_id`：`None` 时 `start()` 生成 `<instanceName>@<yyyyMMddHHmmss>`。
     pub client_id: Option<String>,
     /// Python `create_topic_key`。
@@ -463,6 +467,8 @@ impl Default for ProducerConfig {
             unit_mode: false,
             // Java `DefaultMQProducer` 不碰这个开关（只有拉模式/轻量消费者构造函数里置 true）
             enable_stream_request_type: false,
+            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
+            poll_name_server_interval_millis: 30_000,
             client_id: None,
             create_topic_key: MixAll::DEFAULT_TOPIC.to_string(),
             default_topic_queue_nums: MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
@@ -893,6 +899,11 @@ impl DefaultMQProducer {
     /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.write_cfg(|c| c.enable_stream_request_type = enable);
+    }
+
+    /// Java `ClientConfig#setPollNameServerInterval`。
+    pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
+        self.write_cfg(|c| c.poll_name_server_interval_millis = millis);
     }
 
     /// Python `set_namespace`（`__init__` 的 `namespace` 参数）。
@@ -1336,6 +1347,7 @@ impl DefaultMQProducer {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
+            route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -4507,6 +4519,27 @@ mod tests {
             assert!(err.to_string().contains(needle), "{group}: {err}");
             assert!(!p.is_started(), "{group}: 启动失败后不能留在 started");
         }
+    }
+
+    /// Java `ClientConfig:58` 的 `pollNameServerInterval` 默认 30000ms：生产者能改，
+    /// 而且 `start()` 真的把它透传到实例上（不是只在门面里躺着）。
+    #[tokio::test]
+    async fn poll_name_server_interval_reaches_the_instance() {
+        let p = producer("GID_interval_probe");
+        assert_eq!(
+            p.config().poll_name_server_interval_millis,
+            30_000,
+            "ClientConfig:58 = 1000 * 30"
+        );
+        p.set_namesrv_addr("127.0.0.1:1");
+        p.set_poll_name_server_interval_millis(1_500);
+        p.start().await.expect("静态地址下 start 不该失败");
+
+        let client = p.client().expect("start 之后必须已有实例");
+        assert_eq!(client.config().route_refresh_interval_millis, 1_500);
+        // 生产者不碰 persistConsumerOffsetInterval，实例上留 Java 默认值（ClientConfig:66）
+        assert_eq!(client.config().persist_offset_interval_millis, 5_000);
+        p.shutdown();
     }
 
     /// 拼了命名空间的组名按**包装后**的形状校验（Java 的 start 先 withNamespace 再
