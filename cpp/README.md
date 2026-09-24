@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 38 个用例，3288 项断言（37 个测试二进制 3215 + interop 73），~50s
+cd build && ctest --output-on-failure     # 39 个用例，3300 项断言（38 个测试二进制 3227 + interop 73），~50s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -110,6 +110,7 @@ cd build && ctest --output-on-failure     # 38 个用例，3288 项断言（37 �
 | `recall_message` | 28 | 定时消息撤回 `recallMessage`(370)：句柄编解码与 **Java `buildHandle` 真值向量**对拍（含无填充句柄、6 段新版本、v2/段数不足/非法 utf-8 全部按 Java 文案 `"recall handle is invalid"` 拒）、`RecallMessageRequestHeader` 逐键守卫（继承字段反射名是 **`bname`** 而不是 `brokerName`）、`SendMessageResponseHeader.recallHandle` 往返、producer 本地校验顺序（未 start / `%RETRY%` / `%DLQ%` / 非法句柄都在打网络**之前**秒回，路由拿不到时预热带异常照抛） |
 | `consumer_check_config` | 85 | 启动期数值闸门（Java `DefaultMQPushConsumerImpl#checkConfig` 的数值段 `:1099-1209`）：13 条区间的**两端各测一次**（`consumeThreadMin/Max [1,1000]`、`consumeConcurrentlyMaxSpan`/`pullThresholdForQueue [1,65535]`、`pullThresholdForTopic [1,6553500]`、`pullThresholdSizeForQueue [1,1024]` **MiB**、`pullThresholdSizeForTopic [1,102400]`、`pullInterval [0,65535]`（**下界是 0**，别照抄邻居的 1）、`consumeMessageBatchMaxSize`/`pullBatchSize [1,1024]`、`popInvisibleTime [5000,300000]`、`popBatchNums [1,32]`），文案逐字对 Java（只去掉 `FAQUrl.suggestTodo` 尾巴）；`pullThresholdForTopic`/`pullThresholdSizeForTopic` 的 `-1` 是"关闭"哨兵、其余闸门没有这层豁免；`consumeThreadMin > consumeThreadMax` **严格大于**（相等合法）且消息带两个数值；`popBatchNums` 跟随 Java 字面 `<= 0`；比较一律 `< lo \|\| > hi`（两端闭）；多条同时越界时**按 Java 顺序**报第一条 |
 | `producer_unregister` | 18 | 退出注销 `UNREGISTER_CLIENT`(35) 的线上形状（Java `MQClientInstance#unregisterProducer:1198-1201` → 私有 `unregisterClient:1158-1182`）：生产者侧头只有 `clientID`+`producerGroup`、消费者侧只有 `clientID`+`consumerGroup`、两侧都有时三个键齐全；**空白组名整个字段不上线**（Java 传的是 null 而不是 `""`，broker `ClientManageProcessor#unregisterClient:213-249` 按 `group != null` 分派，传空串会拿 `""` 去查订阅组再白做一轮注销）；扇出**含从节点**且每台各一发（改成只打 master 的用例必然红）；单台回 `SYSTEM_ERROR` 时 `unregisterClient` 抛 `MQBrokerException`、`unregisterClientAllBrokers` 吞掉且**下一台照样发**；`getRouteOfAllBrokers`（心跳用的主优先那一台）与 `getAllBrokerAddrs`（35 用的主+从）分工守住 |
+| `subscribe_after_start` | 12 | 后置订阅与立即心跳（Java `DefaultMQPushConsumerImpl#subscribe:1265-1287`）：`start()` 之后 `subscribe` **不再**报 `already started`、新订阅立刻进活订阅表（`subscribedTopics()`，心跳与 rebalance 读的同一张表）且立刻推一次心跳；`unsubscribe` 只删表项、**不**发心跳（Java `:1317-1319`）；启动前订阅照旧、那时一笔心跳都不发。对着**连不上的** name server 启动（零 broker ⇒ 心跳一台都发不出去），所以离线只能锁到"表进对了、`already started` 不再抛"这一步——报文层面"broker 真收到带新订阅的心跳"由 `rmq_live_subscribe` 真机取证 |
 | `scheduled_intervals` | 21 | 周期任务的推进口径（Java `ScheduledExecutorService#scheduleAtFixedRate`）：**首跳落在 initialDelay 这一刻**而不是 initialDelay+period（离线把路由刷新周期设成 1200ms，实测到达时刻 11 / 1212 / 2412ms —— 旧写法是 1211 / 2411 / 3611）；**固定速率**而非「干完再睡一个周期」（逐跳对着同一时间轴算，慢一拍的轮次不累积漂移）；落后于计划时不等待、立刻补跑（catch-up）；`pollNameServerIntervalMillis` 门面→构造→实例一路透传、非正数回落 Java 默认 30000；位点落盘循环的周期只在 `start()` 读一次，运行期改字段不重排已定型的节奏 |
 
 ```bash
@@ -152,6 +153,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_producer_unregister 127.0.0.1:9876   # 退出时向每台 broker 注销 clientId(35)
 ./build/examples/rmq_live_fail_fast   127.0.0.1:9876   # broker 真死掉：挂起的长轮询 2.2s 内判死（会停一次 broker 再拉起，不删 store）
 ./build/examples/rmq_live_scheduled_intervals 127.0.0.1:9876   # 周期任务的 initialDelay/固定速率（含位点落盘 10s 首跳）
+./build/examples/rmq_live_subscribe     127.0.0.1:9876   # 后置订阅：start() 之后 subscribe 立即推心跳、新 topic 真被消费
 ```
 
 | 工具 | 结果 | 覆盖 |
@@ -180,6 +182,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_live_pop_consumer` | 11 PASS / 0 FAIL | POP 消费循环真机：S1a 全收、S1b body 集合与发送一致、S2a 无重复投递、S2b 观察期内不再新增（ack 确实写到了 broker）、S4 消息分布在多个队列且每条队列都被消费、S3 消费失败后换个 `invisibleTime` 整批复活重投 → **S5 POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage` 的 `PopCallback.onSuccess:556-563`：`FOUND` 的 `incPullRT` 打在**空列表判定之前**，`msgFoundList` 非空才 `incPullTPS`，`POLLING_NOT_FOUND` 两格都不动）。漏记是**静默**的：弹、ack、消费完全正常，只有运维看板上 `pullRT`/`pullTPS` 一片 0，而看板上"这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。判据取 `examineConsumerRunningInfo`(307) 应答的 `statusTable[topic]`，拉取侧两格与消费侧 `consumeOKTPS` **各自断言**（只有后者有值正是漏记的形状），判定本身由离线接缝 `recordPopPullStats`（`pop_consumer` 用例）锁住。⚠ 快照每 10s 采样一次、窗口取 minute 差分，夹具必须**持续有流量**并跨过两个采样点（实测 26s 发 52 条：`pullRT=2006.95`、`pullTPS=1.9990`、52 发 52 收，两格取值随真机节奏浮动、判据只要求非 0），否则 `pullTPS` 仍是 0 —— 那是夹具不够长，不是判据错 |
 | `rmq_live_scheduled_intervals` | 20 PASS / 0 FAIL（2026-09-24 实测） | I1~I3（与 Python `verify_interval_live.py`、.NET `scheduled-intervals`、Rust `live_scheduled_intervals` 同场景）：I3 门面配的周期真的落到实例（`pollNameServerIntervalMillis` → 路由刷新周期，1s 组与不配的 30s 对照组各断言一次）→ I1 两个生产者各把一个**还没建出来**的 topic 登记进在用集合，先等 1.5s 让两边首跳（`scheduleAtFixedRate` 的 initialDelay=10ms）都落空一次、再建 topic ⇒ 缓存里何时出现它只由周期决定：1s 组 0.52s 拿到，那一刻 30s 组**还没有**，最终 28.98s 拿到（固定速率锚定，逐跳对着同一时间轴算、误差不累积）→ I2 两个消费者（落盘周期 1s / 60s）各消费 3 条后 broker 位点仍是 0，首个落盘落在 **10.21s**（≈ Java `:417-423` 的 initialDelay 10s，60s 组同样是 10.52s —— 这一步由 initialDelay 驱动、不是周期），第二批后 1s 组 0.61s 内把 6 推上去、60s 组**仍是 3**（下一跳在 60s 后），`shutdown()` 收尾补一笔把 6 落盘。⚠ 修之前这里必然红：旧写法是「先 initialDelay 再 100ms 切片睡满一个周期」，首跳要等到 `10ms + 周期`、且 macOS 上 `sleep_for(100ms)` 实测 104.4ms⇒「睡满 30s」实际 31.3s，全部周期被拉长；现在统一走 `src/client/schedule_util.h` 的 `sleepUntilDeadline`（每段对着**绝对计划时刻**重算、100ms 分段只为让 stop 在 100ms 内生效，落后于计划时不等待、立刻补跑 = Java 的 catch-up）。周期任务与 Java 同：只在 `start()` 时读一次，运行期改门面上的字段不重排已定型的节奏。离线用例 `ctest -R scheduled_intervals` 锁首跳落在 initialDelay 而不是 initialDelay+period |
 | `rmq_live_producer_unregister` | 10 PASS / 0 FAIL | 退出注销 `UNREGISTER_CLIENT`(35) 真机（与 Python `verify_producer_unregister_live.py`、.NET `unreg-live`、Rust `live_producer` P11 同场景）：U1 生产者发送成功 → U2 等心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能读到本 clientId（U2b 先用一个没退出的对照组证明这条判据本身有效，否则"查不到"可能只是 204 从来不认生产者组）→ U3 退出**之前**钩子里一笔 35 都没有，`shutdown()` 之后**每台已知 broker 各一发**，头是 `clientID`+`producerGroup`、`consumerGroup` 整个字段不上线（U3b），且 35 排在业务发送之后（U3c）→ U5 紧接着查 204：这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 本移植每个生产者各自一具 `MQClientInstance` 与连接，退出时 TCP 连接也断，broker 的通道扫描同样会摘组 —— 单看 U5 分不出是 35 还是断连的功劳，所以线上这一发必须由钩子抓帧（U3）直接证明；Rust 复用同 clientId 的实例，`live_producer` 的 P11 才是行为级判别式。U4（每一发 35 都回 SUCCESS）在本移植**不可观测**：传输层有意不调 `RPCHook#doAfterResponse`，逐笔成败看离线 `producer_unregister` 那组断言 |
+| `rmq_live_subscribe` | 8 PASS / 0 FAIL（2026-09-24 实测，S2 登记耗时 1ms） | 后置订阅 + 立即心跳真机（与 Python `verify_subscribe_live.py`、.NET `subscribe`、Rust `live_subscribe` 同场景，Java `DefaultMQPushConsumerImpl#subscribe:1265-1275` 就是 put 完直接 `sendHeartbeatToAllBrokerWithLock()`）：S0 正腿对照 —— 起消费者时订阅的 topic B 在 `QUERY_TOPIC_CONSUME_BY_WHO(300)` 里查得到本组（先证明"心跳路径 + 300 号查询"这条观测链本身有效）→ S1 反腿对照 —— **没订阅**的 topic L 查不到本组（排掉"300 恒回本组"的假阳性）→ **S2 本条**：`start()` 之后才 `subscribe(L)`，紧接着查 300 立刻就有本组，耗时 **1ms** ≪ 30s 周期（Java `ClientConfig#heartbeatBrokerInterval`）—— 这个时间差就是"心跳是订阅路径推的、不是下一次定期心跳顺带发的"唯一证据；同时 `subscribedTopics()` 里立刻能看到 L（活订阅表 = 心跳与 rebalance 读的同一张表）→ S3 订阅真生效：L 的队列进 `assignedQueueKeys()`、发进去的消息被消费到（不是只把名字记进表）→ S4 `unsubscribe(L)` 后本地订阅集合里 L 消失（broker 侧不退组：`ConsumerManager#clearTopicGroupTable` 只在整组消失时才摘，Java 同样，所以这条只能在本地断言）。⚠ 时间判据取 `elapsed < 30s/6`：写"0ms 断言"会在 CI 抖一下变红，而放宽到 30s 又等于什么都没证 |
 
 SKIP 项与原因会在输出里写清楚（例如 uniqKey 查询需要 broker 开 RocksDB 索引，
 本机默认文件索引查不到属 **broker 配置差异，不是客户端 bug**）。
@@ -213,9 +216,9 @@ cpp/
 │       ├── hook.h / trace.h / trace_hook.h / trace_dispatcher.h
 │       │                            钩子接口（Send/Consume/EndTransaction/CheckForbidden/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
-├── src/                        与 include 同构的 42 个 .cpp
-├── examples/                   selfcheck / interop_tool + 23 个真机联调工具
-└── tests/                      35 个测试源文件、36 个 ctest 用例（含 Java 对拍与 interop_check.py）
+├── src/                        与 include 同构的 43 个 .cpp
+├── examples/                   selfcheck / interop_tool + 26 个真机联调工具
+└── tests/                      38 个测试源文件、39 个 ctest 用例（含 Java 对拍与 interop_check.py）
 ```
 
 ## 几个必须知道的实现约定

@@ -1107,14 +1107,22 @@ class DefaultMQPushConsumer:
 
     # ---------------- 订阅 ----------------
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
-        self._assert_not_started()
+        """订阅 topic（对应 Java ``DefaultMQPushConsumerImpl#subscribe:1265-1275``）。
+
+        与 Java 一致，``start()`` 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
+        put 进去之后立即发一次心跳（见 ``_notify_subscription_changed``）。
+        """
         topic = self._with_namespace(topic)
         sub = FilterAPI.build_subscription_data(topic, sub_expression)
         with self._lock:
             self.subscription_data[topic] = sub
+        self._notify_subscription_changed(topic)
 
     def subscribe_with_selector(self, topic: str, selector: MessageSelector) -> None:
-        self._assert_not_started()
+        """对应 Java ``DefaultMQPushConsumerImpl#subscribe(topic, MessageSelector):1277-1287``。
+
+        同 ``subscribe``：start() 之后可调用，并立即发一次心跳。
+        """
         topic = self._with_namespace(topic)
         # 对齐 Java FilterAPI.build(topic, subString, type)：
         #   TAG（或 type 为空）→ 走 buildSubscriptionData（填 tagsSet + codeSet）
@@ -1129,10 +1137,38 @@ class DefaultMQPushConsumer:
             sub.expression_type = selector.type
         with self._lock:
             self.subscription_data[topic] = sub
+        self._notify_subscription_changed(topic)
 
     def unsubscribe(self, topic: str) -> None:
+        """取消订阅（对应 Java ``DefaultMQPushConsumerImpl#unsubscribe:1317-1319``）。
+
+        Java 这里**只删表项、不发心跳**（后一轮心跳自然带出新订阅集），所以本方法
+        刻意不调 ``_notify_subscription_changed``，只有 ``subscribe`` 会立即推心跳。
+        """
         with self._lock:
             self.subscription_data.pop(self._with_namespace(topic), None)
+
+    def _notify_subscription_changed(self, topic: str) -> None:
+        """订阅表新增/更新后的立即动作，对齐 Java ``subscribe`` 里的第二句。
+
+        Java ``DefaultMQPushConsumerImpl:1265-1287`` 三处 subscribe 都是：
+        ``subscriptionInner.put(...)`` 之后 ``if (this.mQClientFactory != null)
+        this.mQClientFactory.sendHeartbeatToAllBrokerWithLock();`` —— 同步推一轮心跳。
+        为什么必须立即推：broker 的 ``ConsumerManager`` 只在收到心跳时才把 topic→group 记进
+        **它自己那张** topicGroupTable（ClientManageProcessor → registerConsumer），而
+        ``QUERY_TOPIC_CONSUME_BY_WHO(300)`` 读的正是这张表；晚一轮就是默认 30s 的空窗。
+
+        另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它 —— 对应 Java
+        ``MQClientInstance:438-454`` 直接遍历消费者的**当前**订阅表收集要刷的 topic。
+        未启动时没有 client（Java 的 ``mQClientFactory == null``），只落订阅表。
+        """
+        if not self._started or self._mq_client is None:
+            return
+        self._mq_client.register_topic_in_use(topic)
+        try:
+            self._send_heartbeat_to_all_broker()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("immediate heartbeat after subscribe(%s) failed: %s", topic, e)
 
     def _with_namespace(self, topic: str) -> str:
         """topic 拼命名空间前缀（对应 Java DefaultMQPushConsumer.subscribe(withNamespace(topic))）。"""
@@ -1406,10 +1442,6 @@ class DefaultMQPushConsumer:
                 self.trace_dispatcher.shutdown()
             except Exception as e:  # noqa: BLE001
                 logger.warning("trace dispatcher shutdown failed: %s", e)
-
-    def _assert_not_started(self) -> None:
-        if self._started:
-            raise MQClientException("consumer already started, cannot change configuration")
 
     def _require_client(self) -> MQClientInstance:
         if not self._started or self._mq_client is None:

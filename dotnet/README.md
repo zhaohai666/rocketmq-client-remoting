@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，587 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，608 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -98,6 +98,7 @@ dotnet $PROG send-header 127.0.0.1:9876   # 发送头 c/d/n 三字段（14 PASS 
 dotnet $PROG flow-control 127.0.0.1:9876  # 拉取前流控五个阈值 + 启动期数值闸门（29 PASS / 0 FAIL）
 dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS / 0 FAIL，需 broker enablePropertyFilter=true）
 dotnet $PROG scheduled-intervals 127.0.0.1:9876   # 周期任务的 initialDelay/固定速率（20 PASS / 0 FAIL，含位点落盘 10s 首跳）
+dotnet $PROG subscribe 127.0.0.1:9876     # 后置订阅：start() 之后 Subscribe 立即推心跳、新 topic 真被消费（8 PASS / 0 FAIL）
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
@@ -197,9 +198,10 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 
 | unreg-live | 10 PASS / 0 FAIL（生产者退出注销 `UNREGISTER_CLIENT`(35) 真机，与 Python `verify_producer_unregister_live.py`、C++ `rmq_live_producer_unregister`、Rust `live_producer` 的 P11 同一套场景）：U1 发送成功 → U2 心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId（注册确实发生过，"消失"才有意义，组靠心跳上线所以要轮询等）→ U2b 对照组注册可见（204 这条判据本身有效）→ U3 `Shutdown()` 给每台已知 broker 各发一发 35、头是 `clientID`+`producerGroup` 且 **`consumerGroup` 整个字段不上线**（Java 传 null；broker `ClientManageProcessor:228/237` 判的是 `group != null`）、addr 确实是路由里那台、且排在业务发送之后（`last_send=4 first_unreg=6`）→ U5 紧接着查 204 这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 判据强度：.NET 里每个生产者各持一份 `MQClientInstance`、各一条连接，退出时连接也关掉，单看 U5 分不出是 35 还是断连的功劳，所以这里必须由 `IRpcHook` 抓帧（钩子跑在 `Encode()` **之前**，头此时还挂在 `CustomHeader` 上）直接证明线上走了这一发；行为级的判别式证明在 Rust 的 P11（Rust 按 clientId 复用实例，先退的那个连接还活着）。⚠ 「每一发 35 都回 SUCCESS」在本移植**不可观测**——传输层有意不调 `IRpcHook#DoAfterResponse`（见 `Remoting/RemotingClient.cs`），U5 的 broker 侧效果是它的替代判据。头形状（含**纯空白组名**同空串处理，整个字段不上线）、扇出**含 slave**（`GetAllBrokerAddrs` vs 心跳用的 master 优先 `GetRouteOfAllBrokers`）、单台失败被吞且剩下的照旧注销、超时与 Java 的 `getMqClientApiTimeout()`=**3000ms** 同口径，共 9 项由 `ProducerUnregisterTests` 离线锁死（自带一个同一 brokerName 下挂 master(0)+slave(1) 的假集群——本机真集群只有一台 master，这条判据在真机上不可达） |
 | scheduled-intervals | 20 PASS / 0 FAIL（2026-09-24 实测） | I1~I3（与 Python `verify_interval_live.py`、C++ `rmq_live_scheduled_intervals`、Rust `live_scheduled_intervals` 同场景）：I3 门面配的周期真的落到实例（`PollNameServerIntervalMillis` → 路由刷新周期，1s 组与不配的 30s 对照组各断言一次）→ I1 两个生产者各把一个**还没建出来**的 topic 登记进在用集合，先等 1.5s 让两边首跳（`scheduleAtFixedRate` 的 initialDelay=10ms）都落空一次、再建 topic ⇒ 缓存里何时出现它只由周期决定：1s 组 0.53s 拿到，那一刻 30s 组**还没有**，最终 28.76s 拿到（固定速率锚定，逐跳对着同一时间轴算、误差不累积）→ I2 两个消费者（落盘周期 1s / 60s）各消费 3 条后 broker 位点仍是 0，首个落盘落在 **10.49s**（≈ Java `:417-423` 的 initialDelay 10s，60s 组同样是 10.81s —— 这一步由 initialDelay 驱动、不是周期），第二批后 1s 组 0.68s 内把 6 推上去、60s 组**仍是 3**（下一跳在 60s 后），`Shutdown()` 收尾补一笔把 6 落盘。⚠ 修之前这里必然红：macOS 上 `ManualResetEventSlim.Wait(100ms)` 实测 131ms（系统定时器多给一个 tick），「按 100ms 切片睡满 30s」实际要 39.2s，全部周期被拉长 ~31% —— 现在统一走 `Schedules.WaitUntil(...)`（`ManualResetEventSlim.Wait` 一次睡到绝对计划时刻，整段又能被 `Shutdown` 的 `Set` 立刻唤醒；落后于计划时不等待、立刻补跑，与 Java 的 catch-up 一致），另有一组离线用例证明首跳落在 initialDelay 而不是 initialDelay+period |
+| subscribe | 8 PASS / 0 FAIL（2026-09-24 实测，S2 登记耗时 21ms） | 后置订阅 + 立即心跳真机（与 Python `verify_subscribe_live.py`、C++ `rmq_live_subscribe`、Rust `live_subscribe` 同场景；Java `DefaultMQPushConsumerImpl#subscribe:1265-1275` 就是 put 完直接 `sendHeartbeatToAllBrokerWithLock()`，**没有** started 闸门）：S0 正腿对照 —— 起消费者时订阅的 topic B 在 `QUERY_TOPIC_CONSUME_BY_WHO(300)` 里查得到本组（先证明"心跳路径 + 300 号查询"这条观测链本身有效）→ S1 反腿对照 —— **没订阅**的 topic L 查不到本组（排掉"300 恒回本组"的假阳性）→ **S2 本条**：`Start()` 之后才 `Subscribe(L)`，紧接着查 300 立刻就有本组，耗时 **21ms** ≪ 30s 周期（`ClientConfig.HeartbeatBrokerInterval`）—— 这个时间差就是"心跳是订阅路径推的、不是下一次定期心跳顺带发的"唯一证据；同时 `SubscribedTopics()` 里立刻能看到 L（活订阅表 = 心跳与 rebalance 读的同一张表）→ S3 订阅真生效：L 的队列进分配集合、发进去的消息被消费到（不是只把名字记进表）→ S4 `Unsubscribe(L)` 后本地订阅集合里 L 消失（broker 侧不退组：`ConsumerManager#clearTopicGroupTable` 只在整组消失时才摘，Java 同样，所以这条只能在本地断言）。⚠ 时间判据取 `elapsed < 30s/6`：写"0ms 断言"会在真机抖一下变红，放宽到 30s 又等于什么都没证。离线半边由 `SubscribeAfterStartTests` 锁死（消费者对着连不上的 name server 启动 ⇒ 心跳一台都发不出去，只能验"表进对了、不再抛 already started"） |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **605 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **608 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`ConsumeThreadPoolTests`（23 项，消费线程弹性）锁住
 Java 5.x 的**默认值两侧同为 20**（`DefaultMQPushConsumer:162/:169`；4.x 才是 min=20/max=64，早年照抄了 4.x）
 以及 `UpdateCorePoolSize` 的三道守卫：无界队列下真实并发度 == `CorePoolSize`，默认配置里 core 只能往**下**调，

@@ -481,6 +481,9 @@ private:
     void lockLoop();
     bool isOrderly() const;
     void maybeSendHeartbeat();
+    // 订阅表新增/更新后的立即动作（Java DefaultMQPushConsumerImpl.subscribe 里的
+    // sendHeartbeatToAllBrokerWithLock）：登记路由刷新 + 同步推一轮心跳。unsubscribe 不调。
+    void notifySubscriptionChanged(const std::string& topic);
 
     std::vector<MessageQueue> assignedQueues();
     int64_t resolveInitialOffset(const MessageQueue& mq, const SubscriptionData& sub);

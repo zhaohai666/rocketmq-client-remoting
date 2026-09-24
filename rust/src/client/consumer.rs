@@ -1014,11 +1014,15 @@ impl DefaultMQPushConsumer {
     // ---------------- 订阅 ----------------
 
     /// Python `subscribe(topic, sub_expression="*")`。
+    ///
+    /// 对齐 Java `DefaultMQPushConsumerImpl#subscribe:1265-1275`：`start()` 之后**仍可**调用，
+    /// 订阅表是活的（心跳与重平衡每轮都重读它），put 进去之后立即推一轮心跳
+    /// （见 [`Self::notify_subscription_changed`]）。
     pub fn subscribe(&self, topic: &str, sub_expression: &str) -> Result<()> {
-        self.assert_not_started()?;
         let topic = self.with_namespace(topic);
         let sub = FilterAPI::build_subscription_data(&topic, Some(sub_expression))?;
-        self.put_subscription(topic, sub);
+        self.put_subscription(topic.clone(), sub);
+        self.notify_subscription_changed(&topic);
         Ok(())
     }
 
@@ -1032,8 +1036,8 @@ impl DefaultMQPushConsumer {
     /// 对齐 Java `FilterAPI.build(topic, subString, type)`：
     /// TAG（或 type 为空）走 `buildSubscriptionData` 填 `tagsSet`/`codeSet`；
     /// SQL92 / CLASS_FILTER 只设 topic/subString/expressionType，两个集合留空。
+    /// 与 `subscribe` 相同：start() 之后可调用，并立即推一轮心跳。
     pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) -> Result<()> {
-        self.assert_not_started()?;
         let topic = self.with_namespace(topic);
         let sub = if selector.selector_type == ExpressionType::TAG {
             let mut s = FilterAPI::build_subscription_data(&topic, Some(&selector.expression))?;
@@ -1050,15 +1054,51 @@ impl DefaultMQPushConsumer {
                 ..Default::default()
             }
         };
-        self.put_subscription(topic, sub);
+        self.put_subscription(topic.clone(), sub);
+        self.notify_subscription_changed(&topic);
         Ok(())
     }
 
-    /// Python `unsubscribe`。
+    /// Python `unsubscribe`（对应 Java `DefaultMQPushConsumerImpl#unsubscribe:1317-1319`）。
+    ///
+    /// Java 这里**只删表项、不发心跳**（后一轮心跳自然带出新订阅集），所以刻意不调
+    /// `notify_subscription_changed`。
     pub fn unsubscribe(&self, topic: &str) {
         let topic = self.with_namespace(topic);
         let mut state = lock(&self.inner.state);
         state.subscription_data.retain(|(k, _)| *k != topic);
+    }
+
+    /// 订阅表新增/更新后的立即动作，对齐 Java `subscribe` 里的第二句。
+    ///
+    /// Java `DefaultMQPushConsumerImpl:1265-1287` 三处 subscribe 都是：
+    /// `subscriptionInner.put(...)` 之后 `if (mQClientFactory != null)
+    /// mQClientFactory.sendHeartbeatToAllBrokerWithLock();` —— 同步推一轮心跳。为什么必须立即：
+    /// broker 的 `ConsumerManager` 只在收到心跳时才把 topic→group 记进它自己那张
+    /// topicGroupTable（ClientManageProcessor → registerConsumer），而
+    /// `QUERY_TOPIC_CONSUME_BY_WHO(300)` 读的正是这张表；晚一轮就是默认 30s 的空窗。
+    ///
+    /// 另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（对应 Java
+    /// `MQClientInstance:438-454` 直接遍历消费者的**当前**订阅表收集要刷的 topic）。
+    /// 未启动时没有 client（Java 的 `mQClientFactory == null`），只落订阅表。
+    ///
+    /// `subscribe` 是同步签名而心跳是异步 RPC：放到 runtime 上 fire-and-forget
+    /// （与 `rebalance` 起每队列拉取循环同一套 `runtime_handle()` 手法）。
+    fn notify_subscription_changed(&self, topic: &str) {
+        let Ok(client) = require_client(&self.inner) else {
+            return;
+        };
+        client.register_topic_in_use(topic);
+        let Some(handle) = self.runtime_handle() else {
+            rmq_debug!("subscribe: no tokio runtime, immediate heartbeat skipped");
+            return;
+        };
+        let weak = Arc::downgrade(&self.inner);
+        handle.spawn(async move {
+            if let Some(inner) = weak.upgrade() {
+                heartbeat_once(&inner).await;
+            }
+        });
     }
 
     fn put_subscription(&self, topic: String, sub: SubscriptionData) {
@@ -1086,15 +1126,6 @@ impl DefaultMQPushConsumer {
         } else {
             NamespaceUtil::wrap_namespace(&namespace, topic)
         }
-    }
-
-    fn assert_not_started(&self) -> Result<()> {
-        if self.is_started() {
-            return Err(Error::client(
-                "consumer already started, cannot change configuration",
-            ));
-        }
-        Ok(())
     }
 
     // ---------------- 生命周期 ----------------
@@ -1504,14 +1535,7 @@ impl DefaultMQPushConsumer {
 
     /// Python `_send_heartbeat_to_all_broker`：返回成功的 broker 台数。
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
-        let Ok(client) = require_client(&self.inner) else {
-            return 0;
-        };
-        let ok = client.send_heartbeat_to_all_broker(5000).await;
-        if ok > 0 {
-            self.inner.heartbeat_count.fetch_add(1, Ordering::SeqCst);
-        }
-        ok
+        heartbeat_once(&self.inner).await
     }
 
     /// Python `heartbeat_count`（真机验证用）。
@@ -2299,6 +2323,19 @@ async fn rebalance_loop(consumer: DefaultMQPushConsumer, rx: watch::Receiver<boo
     }
 }
 
+/// 发一轮心跳（`heartbeat_loop` 的周期心跳、`send_heartbeat_to_all_broker` 的显式调用、
+/// 以及 `subscribe` 之后的立即心跳共用），返回成功的 broker 台数。
+async fn heartbeat_once(inner: &Arc<Inner>) -> usize {
+    let Ok(client) = require_client(inner) else {
+        return 0;
+    };
+    let ok = client.send_heartbeat_to_all_broker(5000).await;
+    if ok > 0 {
+        inner.heartbeat_count.fetch_add(1, Ordering::SeqCst);
+    }
+    ok
+}
+
 /// Python `_heartbeat_loop`（消费者**必须**注册到 broker，否则 rebalance 的
 /// GET_CONSUMER_LIST_BY_GROUP 拿不到列表）。
 async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
@@ -2311,13 +2348,7 @@ async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
         if !cfg.heartbeat_enabled || !inner.started.load(Ordering::Acquire) {
             continue;
         }
-        let Ok(client) = require_client(&inner) else {
-            return;
-        };
-        let ok = client.send_heartbeat_to_all_broker(5000).await;
-        if ok > 0 {
-            inner.heartbeat_count.fetch_add(1, Ordering::SeqCst);
-        }
+        heartbeat_once(&inner).await;
     }
 }
 
@@ -4084,6 +4115,40 @@ mod tests {
         let sql = MessageSelector::by_sql("a > 1");
         assert_eq!(sql.selector_type, ExpressionType::SQL92);
         assert_eq!(sql.sub_expression(), "a > 1");
+    }
+
+    /// #73：`start()` 之后仍可 `subscribe()`（Java `DefaultMQPushConsumerImpl#subscribe:1265-1287`）。
+    ///
+    /// 离线只能证明「不再拒绝 + 都落进活订阅表 + unsubscribe 不发心跳」：立即心跳是异步 RPC
+    /// （`notify_subscription_changed` fire-and-forget 到 runtime），零 broker 时不发包。
+    /// 真机报文与 broker 侧 topicGroupTable 的对照见 `examples/live_subscribe.rs`。
+    #[tokio::test]
+    async fn subscribe_is_allowed_after_start_and_lands_in_the_live_table() {
+        let consumer = DefaultMQPushConsumer::new("GID_SubAfterStartUnit").unwrap();
+        // 造一个「已启动 + 有 client」的状态；client 指向零路由实例，不发任何包。
+        *lock(&consumer.inner.client) = Some(MQClientInstance::new("unit-sub-after-start", vec![]));
+        consumer.inner.started.store(true, Ordering::Release);
+
+        consumer.subscribe("T_A", "*").unwrap();
+        consumer.subscribe_all("T_B").unwrap();
+        consumer
+            .subscribe_with_selector("T_C", &MessageSelector::by_sql("a > 1"))
+            .unwrap();
+
+        let topics: Vec<String> = consumer
+            .subscriptions()
+            .into_iter()
+            .map(|s| s.topic)
+            .collect();
+        assert!(topics.contains(&"T_A".to_string()), "后置 subscribe 要落进活订阅表");
+        assert!(topics.contains(&"T_B".to_string()));
+        assert!(topics.contains(&"T_C".to_string()));
+
+        // Java :1317-1319 只删表项、不发心跳：计数器不动（这里本来就是 0，重点是"不发"）。
+        let before = consumer.heartbeat_count();
+        consumer.unsubscribe("T_B");
+        assert_eq!(consumer.heartbeat_count(), before);
+        assert!(!consumer.subscriptions().iter().any(|s| s.topic == "T_B"));
     }
 
     #[test]

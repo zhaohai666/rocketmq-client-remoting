@@ -105,3 +105,7 @@ target_link_libraries(rmq_live_fail_fast PRIVATE rocketmq::remoting)
 # 路由刷新周期 / 位点落盘周期真机联调：两个实例不同周期，缓存/位点何时动（不打进 ctest）
 add_executable(rmq_live_scheduled_intervals live_scheduled_intervals.cpp)
 target_link_libraries(rmq_live_scheduled_intervals PRIVATE rocketmq::remoting)
+
+# 后置订阅立即生效真机联调：subscribe 之后 broker 的 topic→group 表立刻登记本组（不打进 ctest）
+add_executable(rmq_live_subscribe live_subscribe.cpp)
+target_link_libraries(rmq_live_subscribe PRIVATE rocketmq::remoting)

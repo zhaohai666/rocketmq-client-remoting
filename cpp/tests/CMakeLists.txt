@@ -201,6 +201,14 @@ add_executable(rmq_test_consumer_check_config test_consumer_check_config.cpp)
 target_link_libraries(rmq_test_consumer_check_config PRIVATE rocketmq::remoting)
 add_test(NAME consumer_check_config COMMAND rmq_test_consumer_check_config)
 
+# 订阅后置 + 立即心跳（Java DefaultMQPushConsumerImpl#subscribe:1265-1287）：
+# start() 之后 subscribe 不再抛 already started，且立刻进活订阅表；unsubscribe 只删表项。
+# 消费者对着连不上的 name server 启动（零 broker ⇒ 心跳一台都发不出去），
+# 报文层面「broker 真收到带新订阅的心跳」由 examples/live_subscribe.cpp 真机验证。
+add_executable(rmq_test_subscribe_after_start test_subscribe_after_start.cpp)
+target_link_libraries(rmq_test_subscribe_after_start PRIVATE rocketmq::remoting)
+add_test(NAME subscribe_after_start COMMAND rmq_test_subscribe_after_start)
+
 # 定时任务节奏（Java MQClientInstance#startScheduledTask :389-432）：五个门面的
 # pollNameServerInterval=30000 / persistConsumerOffsetInterval=5000 默认值与透传 +
 # 「首跳落在 initialDelay（10ms）而不是 initialDelay+周期」+ 周期真按传入值走。

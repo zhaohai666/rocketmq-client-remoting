@@ -821,28 +821,26 @@ public sealed class DefaultMQPushConsumer
     public long HeartbeatCount => _heartbeatCount;
 
     // ---------------- 订阅 ----------------
+    /// <summary>
+    /// 订阅 topic（对应 Java DefaultMQPushConsumerImpl#subscribe:1265-1275）。
+    /// 与 Java 一致，start() 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
+    /// put 进去之后立即推一轮心跳（见 NotifySubscriptionChanged）。
+    /// </summary>
     public void Subscribe(string topic, string subExpression = "*")
     {
-        if (_started)
-        {
-            throw new MQClientException("consumer already started, cannot change configuration");
-        }
-
         string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
         SubscriptionData sub = FilterAPI.BuildSubscriptionData(realTopic, subExpression);
         lock (_lock)
         {
             _subscriptionData[realTopic] = sub;
         }
+
+        NotifySubscriptionChanged(realTopic);
     }
 
+    /// <summary>对应 Java DefaultMQPushConsumerImpl#subscribe(topic, MessageSelector):1277-1287。</summary>
     public void Subscribe(string topic, MessageSelector selector)
     {
-        if (_started)
-        {
-            throw new MQClientException("consumer already started, cannot change configuration");
-        }
-
         string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
         var sub = new SubscriptionData(realTopic, selector.Expression)
         {
@@ -858,13 +856,49 @@ public sealed class DefaultMQPushConsumer
         {
             _subscriptionData[realTopic] = sub;
         }
+
+        NotifySubscriptionChanged(realTopic);
     }
 
+    /// <summary>
+    /// 取消订阅（对应 Java DefaultMQPushConsumerImpl#unsubscribe:1317-1319）。
+    /// Java 这里只删表项、不发心跳（后一轮心跳自然带出新订阅集），
+    /// 所以刻意不调 NotifySubscriptionChanged。
+    /// </summary>
     public void Unsubscribe(string topic)
     {
         lock (_lock)
         {
             _subscriptionData.Remove(topic);
+        }
+    }
+
+    /// <summary>
+    /// 订阅表新增/更新后的立即动作，对齐 Java subscribe 里的第二句：
+    /// `subscriptionInner.put(...)` 之后 `if (mQClientFactory != null)
+    /// mQClientFactory.sendHeartbeatToAllBrokerWithLock();` —— 同步推一轮心跳。
+    /// 为什么必须立即：broker 的 ConsumerManager 只在收到心跳时才把 topic→group 记进
+    /// 它自己那张 topicGroupTable（ClientManageProcessor → registerConsumer），而
+    /// QUERY_TOPIC_CONSUME_BY_WHO(300) 读的正是这张表；晚一轮就是默认 30s 的空窗。
+    /// 同时把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（对应 Java
+    /// MQClientInstance:438-454 直接遍历消费者的**当前**订阅表收集要刷的 topic）。
+    /// 未启动时没有 client（Java 的 mQClientFactory == null），只落订阅表。
+    /// </summary>
+    private void NotifySubscriptionChanged(string topic)
+    {
+        if (!_started || _mqClient is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _mqClient.RegisterTopicInUse(topic);
+            SendHeartbeatToAllBroker();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("immediate heartbeat after subscribe(" + topic + ") failed: " + e.Message);
         }
     }
 

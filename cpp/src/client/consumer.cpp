@@ -231,19 +231,16 @@ void DefaultMQPushConsumer::setMessageListener(std::shared_ptr<MessageListener> 
 
 // ---------------------------------------------------------------- 订阅
 void DefaultMQPushConsumer::subscribe(const std::string& topic, const std::string& subExpression) {
-    if (started_.load()) {
-        throw MQClientException("consumer already started, cannot change configuration");
-    }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
     SubscriptionData sub = FilterAPI::buildSubscriptionData(realTopic, subExpression);
-    std::lock_guard<std::mutex> lk(lock_);
-    subscriptionData_[realTopic] = sub;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        subscriptionData_[realTopic] = sub;
+    }
+    notifySubscriptionChanged(realTopic);
 }
 
 void DefaultMQPushConsumer::subscribe(const std::string& topic, const MessageSelector& selector) {
-    if (started_.load()) {
-        throw MQClientException("consumer already started, cannot change configuration");
-    }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
     SubscriptionData sub(realTopic, selector.expression);
     sub.expressionType = selector.type;
@@ -251,8 +248,36 @@ void DefaultMQPushConsumer::subscribe(const std::string& topic, const MessageSel
         SubscriptionData built = FilterAPI::buildSubscriptionData(realTopic, selector.expression);
         sub.tagsSet = built.tagsSet;
     }
-    std::lock_guard<std::mutex> lk(lock_);
-    subscriptionData_[realTopic] = sub;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        subscriptionData_[realTopic] = sub;
+    }
+    notifySubscriptionChanged(realTopic);
+}
+
+// 订阅表新增/更新后的立即动作，对齐 Java DefaultMQPushConsumerImpl.subscribe:1265-1287。
+//
+// Java 三处 subscribe 都是 `subscriptionInner.put(...)` 之后
+// `if (mQClientFactory != null) mQClientFactory.sendHeartbeatToAllBrokerWithLock();`
+// —— **start() 之后仍可订阅**，且 put 完立即同步推一轮心跳。为什么必须立即：broker 的
+// ConsumerManager 只在收到心跳时才把 topic→group 记进它自己那张 topicGroupTable
+// （ClientManageProcessor → registerConsumer），而 QUERY_TOPIC_CONSUME_BY_WHO(300)
+// 读的正是这张表；晚一轮就是默认 30s 的空窗。
+//
+// 另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（对应 Java
+// MQClientInstance:438-454 直接遍历消费者的**当前**订阅表收集要刷的 topic）。
+// 未启动时没有 client（Java 的 mQClientFactory == null），只落订阅表。
+// unsubscribe 不调本函数：Java 那边也只删表项、不发心跳（:1317-1319）。
+void DefaultMQPushConsumer::notifySubscriptionChanged(const std::string& topic) {
+    if (!started_.load() || mqClient_ == nullptr) {
+        return;
+    }
+    try {
+        mqClient_->registerTopicInUse(topic);
+        sendHeartbeatToAllBroker();
+    } catch (const std::exception& e) {
+        logger_debug("immediate heartbeat after subscribe(" + topic + ") failed: " + e.what());
+    }
 }
 
 void DefaultMQPushConsumer::unsubscribe(const std::string& topic) {
