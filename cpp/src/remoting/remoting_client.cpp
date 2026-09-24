@@ -154,6 +154,14 @@ struct RemotingClient::Impl {
         int64_t deadlineMs = 0;
         int64_t timeoutMs = 0;
         bool callbackFired = false;
+        // 请求真正写出去时所用的连接（对应 Java ResponseFuture 的 channel 字段）。
+        // 连接断开时按**对象身份**认领在途请求，见 failFast()。空指针 = 还没写出去，
+        // 这条连接的断连不该牵连它（写失败时调用方会就地拿到异常并自己摘掉条目）。
+        std::shared_ptr<Connection> conn;
+        // 失败原因（对应 Java 的 cause + ResponseFuture#executeInvokeCallback 的类型判定）：
+        // 断连时由 failFast 填成 SEND_REQUEST，同步等待方据此抛 RemotingSendRequestException
+        // 而不是等满超时抛 RemotingTimeoutException。
+        InvokeError failure;
 
         static int64_t monoNowMs() {
             return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -218,6 +226,12 @@ struct RemotingClient::Impl {
 
     // 取出并创建/复用连接；不持有 connMutex 的调用方负责传入已锁定的上下文
     std::shared_ptr<Connection> getOrCreateConnection(const std::string& addr) {
+        // shutdown 之后不再建连：读线程退出时会投递回调（failFast / 正常响应），回调里
+        // 若重进传输层，就会在 shutdown 正持有 threadMutex 等 join 的当口往账本里塞新线程
+        // ——轻则迭代器失效，重则线程句柄永不回收、~std::thread(joinable) 直接 terminate。
+        if (!running.load()) {
+            throw RemotingConnectException("remoting client is shut down, " + addr);
+        }
         {
             std::lock_guard<std::mutex> lk(connMutex);
             auto it = conns.find(addr);
@@ -344,8 +358,9 @@ struct RemotingClient::Impl {
                 dispatch(frame, conn->addr);
             }
         }
-        conn->readerDone.store(true);
-        // 把自己从连接表摘掉（避免留下失效条目）
+        // ---- 连接生命周期收口，顺序照 Java 的 NettyRemotingHandler#close ----
+        // 先 closeChannel（摘出连接表 + 关掉 fd），再 failFast。反过来会白丢一次重试：
+        // 条目还挂在表里时投递回调，回调里的重发会拿到这条已死的连接继续写。
         {
             std::lock_guard<std::mutex> lk(connMutex);
             auto it = conns.find(conn->addr);
@@ -353,6 +368,79 @@ struct RemotingClient::Impl {
                 conns.erase(it);
             }
         }
+        closeConnectionSocket(conn);
+        // failFast 在**本读线程**上投递业务回调，必须赶在 readerDone 置位之前做完：
+        // 回调只要重进传输层就会走到 getOrCreateConnection -> pruneThreads，而那里会
+        // join 掉所有 readerDone 的线程句柄——包括我们自己，std::thread::join join 自己
+        // 直接抛 std::system_error，读线程当场 terminate。
+        failFast(conn);
+        conn->readerDone.store(true);
+    }
+
+    // 关掉一条连接的 fd，幂等。writeMutex 同时也是 socket 生命周期的锁：写路径失败时
+    // 持锁关掉它，这里也持同一把锁，于是既不会重复 close（fd 号可能被新连接复用，重复
+    // close 会关错人），也不会出现"一个线程在 send、另一个线程把 fd 抽走"的窗口。
+    void closeConnectionSocket(const std::shared_ptr<Connection>& conn) {
+        std::lock_guard<std::mutex> wlk(conn->writeMutex);
+        if (conn->sock != kInvalidSocket) {
+            closeSocket(conn->sock);
+            conn->sock = kInvalidSocket;
+        }
+    }
+
+    // ---- 连接断开时立刻失败在途请求（对应 Java NettyRemotingAbstract#failFast + #requestFail）----
+    /// 把 `conn` 这条连接上还没收到响应的在途请求全部判为**发送失败**：置 done 唤醒同步
+    /// 等待方、异步回调恰好投递一次（Java requestFail 的四步：setSendRequestOK(false)
+    /// -> putResponse(null) -> executeInvokeCallback -> release；本端口没有传输层反压
+    /// 许可，release 那步在客户端层的回调里）。返回被判死的条数，只为日志与测试断言服务。
+    ///
+    /// 不这么做会错两件事，都不只是"慢一点"：
+    ///   1. 时机——同步调用要等满 invoke 超时、异步回调要等 timeout + 1s（清理线程的宽限
+    ///      口径）才发现对端早就断了；broker 重启 / 主备切换 / 网络抖动时这段空等压在发送链路上。
+    ///   2. 语义——报的是 TIMEOUT，Java 报的是 SEND_REQUEST。异步发送的重试判据按类型分流
+    ///      （见 MQClientAPIImpl 的 operationFail 三个 instanceof 分支），错类型等于错决策。
+    ///
+    /// 按 Connection **对象身份**认领，不按地址串：地址相同但连接已换新是常见形状
+    /// （GO_AWAY 换连接重发、写失败后关连接），旧读线程收尾时不能把新连接的请求一起误杀。
+    int failFast(const std::shared_ptr<Connection>& conn) {
+        std::vector<std::pair<std::shared_ptr<Future>, int32_t>> doomed;
+        {
+            std::lock_guard<std::mutex> lk(respMutex);
+            for (auto it = respTable.begin(); it != respTable.end();) {
+                if (it->second && it->second->conn == conn) {
+                    doomed.emplace_back(it->second, it->first);
+                    it = respTable.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& kv : doomed) {
+            const std::shared_ptr<Future>& f = kv.first;
+            const InvokeError error(InvokeError::Kind::SEND_REQUEST,
+                                    f->addr + " connection closed before response, opaque="
+                                        + std::to_string(kv.second));
+            bool mine = false;
+            {
+                std::lock_guard<std::mutex> flk(f->m);
+                f->failure = error;
+                f->done = true;  // 对应 Java 的 putResponse(null)：同步等待方立刻醒
+                if (!f->callbackFired) {
+                    f->callbackFired = true;
+                    mine = true;
+                }
+            }
+            f->cv.notify_all();
+            // 与 sweepExpired 同理：回调必须在 respMutex 之外投递
+            if (mine && f->callback) {
+                f->callback(RemotingCommand(), error);
+            }
+        }
+        if (!doomed.empty()) {
+            logger_warn("remoting reader: connection " + conn->addr + " closed, "
+                        + std::to_string(doomed.size()) + " in-flight request(s) failed fast");
+        }
+        return static_cast<int>(doomed.size());
     }
 
     void dispatch(const Bytes& frame, const std::string& from) {
@@ -472,12 +560,14 @@ struct RemotingClient::Impl {
 
     // ---- GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）----
     // 单次请求-应答：不含 GO_AWAY 判定，重发与首发都走这里。
+    // 返回的连接挂在在途表项上（Future::conn），断连时靠它认领该失败哪几条请求。
     RemotingCommand invokeOnce(const std::string& addr, RemotingCommand& request,
                                int32_t timeoutMillis) {
-        auto future = registerFutureAcquiringOpaque(request, nullptr);
+        // timeoutMillis 传 0：同步路径自己等、自己摘，不交给清理线程重复判超时。
+        auto future = registerFutureAcquiringOpaque(request, nullptr, addr, 0);
         const int32_t opaque = request.opaque;
         try {
-            sendRequest(addr, request);
+            future->conn = sendRequest(addr, request);
         } catch (...) {
             unregisterFuture(opaque);
             throw;
@@ -491,6 +581,14 @@ struct RemotingClient::Impl {
             throw RemotingTimeoutException(addr + " wait response timeout "
                                            + std::to_string(timeoutMillis) + " ms, opaque="
                                            + std::to_string(opaque));
+        }
+        if (!future->hasResponse) {
+            lk.unlock();
+            unregisterFuture(opaque);
+            // done 却没有响应 = 连接断开时被 failFast 判死（Java 的 invokeSyncImpl 把这条
+            // 路径上的 ExecutionException 翻成 RemotingSendRequestException）。类型必须是
+            // 发送失败：上层按它决定"换一台 broker 重试"，按超时会走成另一条决策。
+            throw RemotingSendRequestException(future->failure.message);
         }
         return future->response;
     }
@@ -506,9 +604,9 @@ struct RemotingClient::Impl {
             conn = it->second;
             conns.erase(it);
         }
-        // 关闭 socket 会让读线程的 select()/recv() 立刻返回并自行退出
-        closeSocket(conn->sock);
-        conn->sock = kInvalidSocket;
+        // 关闭 socket 会让读线程的 select()/recv() 立刻返回并自行退出；
+        // 它退出时负责把这条连接名下的在途请求 failFast 掉（见 readLoop 末尾）。
+        closeConnectionSocket(conn);
     }
 
     /// GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
@@ -719,7 +817,8 @@ struct RemotingClient::Impl {
         }
     }
 
-    void sendRequest(const std::string& addr, RemotingCommand& request) {        // RPC 钩子必须在 encode() **之前**执行：ACL 钩子把 AccessKey/Signature
+    std::shared_ptr<Connection> sendRequest(const std::string& addr, RemotingCommand& request) {
+        // RPC 钩子必须在 encode() **之前**执行：ACL 钩子把 AccessKey/Signature
         // 写进 extFields，而签名覆盖的正是「即将上线的这份 extFields + body」。
         // 先取快照再调用，避免持锁跑钩子。
         if (auto hook = currentHook()) {
@@ -733,8 +832,12 @@ struct RemotingClient::Impl {
                                                             data.size())
                                       : sendAll(conn->sock, data);
         if (!sentOk) {
-            closeSocket(conn->sock);
-            conn->sock = kInvalidSocket;
+            // 幂等关闭：读线程可能已经先一步关掉它并把 fd 置空（对端同时断了），
+            // 拿已经还给内核的 fd 号再 close 一次会关错新连接。
+            if (conn->sock != kInvalidSocket) {
+                closeSocket(conn->sock);
+                conn->sock = kInvalidSocket;
+            }
             {
                 std::lock_guard<std::mutex> clk(connMutex);
                 auto it = conns.find(addr);
@@ -744,6 +847,7 @@ struct RemotingClient::Impl {
             }
             throw RemotingSendRequestException(formatAddr(addr));
         }
+        return conn;
     }
 
     void shutdown() {
@@ -838,7 +942,7 @@ void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& reque
     // 只有真收到 GO_AWAY 才用得上 —— 传输层不为每次调用都留请求副本（见头文件说明），
     // 而重发必须能拿到原始报文。
     RemotingCommand original = request;
-    impl_->registerFutureAcquiringOpaque(
+    auto future = impl_->registerFutureAcquiringOpaque(
         request,
         [this, user, addr, deadline, original](const RemotingCommand& response,
                                                const InvokeError& error) {
@@ -856,7 +960,7 @@ void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& reque
         addr, timeout);
     const int32_t opaque = request.opaque;
     try {
-        impl_->sendRequest(addr, request);
+        future->conn = impl_->sendRequest(addr, request);
     } catch (...) {
         impl_->unregisterFuture(opaque);
         throw;
@@ -935,6 +1039,11 @@ void RemotingClient::shutdown() { impl_->shutdown(); }
 size_t RemotingClient::connectionCount() const {
     std::lock_guard<std::mutex> lk(impl_->connMutex);
     return impl_->conns.size();
+}
+
+size_t RemotingClient::pendingRequestCount() const {
+    std::lock_guard<std::mutex> lk(impl_->respMutex);
+    return impl_->respTable.size();
 }
 
 }  // namespace rocketmq

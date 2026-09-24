@@ -97,3 +97,7 @@ target_link_libraries(rmq_live_flow_control PRIVATE rocketmq::remoting)
 # 生产者退出注销 UNREGISTER_CLIENT(35) 真机联调：抓帧证明线上走了这一发 + 204 前后对比（不打进 ctest）
 add_executable(rmq_live_producer_unregister live_producer_unregister.cpp)
 target_link_libraries(rmq_live_producer_unregister PRIVATE rocketmq::remoting)
+
+# broker 真死掉时在途请求立刻判死（Java failFast）真机联调：会停一次 broker 再拉起（不打进 ctest）
+add_executable(rmq_live_fail_fast live_fail_fast.cpp)
+target_link_libraries(rmq_live_fail_fast PRIVATE rocketmq::remoting)

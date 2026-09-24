@@ -16,7 +16,9 @@
 // 与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
 // （channelNotActiveInterval=60s）在 Java 客户端里**从未被调度** —— client + remoting 全树
 // grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
-// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现。
+// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现，连接断开时立刻
+// 失败该连接名下的在途请求（failFast / requestFail）也有实现：读线程退出时把这些请求判为
+// RemotingSendRequestException（不是超时），并唤醒还在等响应的同步调用方。
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
@@ -71,6 +73,10 @@ public sealed class RemotingClient : IDisposable
     {
         public readonly ManualResetEventSlim Done = new(false);
         public RemotingCommand Response = new();
+
+        // 响应是否真的到达（对应 Java 的 responseCommand != null）。断连 failFast 只会
+        // 置 Done 唤醒同步等待方而没有响应，同步路径靠这个位区分"抛发送失败"还是"返回响应"。
+        public bool HasResponse;
         public InvokeCallback? Callback;
 
         // 异步请求的超时账目（对应 Java ResponseFuture 的 timeoutMillis + beginTimestamp）。
@@ -80,6 +86,15 @@ public sealed class RemotingClient : IDisposable
         public long DeadlineMs;
         public long TimeoutMs;
         public bool CallbackFired;
+
+        // 请求真正写出去时所用的连接（对应 Java ResponseFuture 的 channel 字段）。
+        // 断连时按**对象引用**认领在途请求，见 FailFast()。null = 还没写出去，
+        // 这条连接的断开不该牵连它（写失败时调用方就地拿到异常并自己摘掉条目）。
+        public Connection? Conn;
+
+        // 失败原因（对应 Java 的 cause）：同步等待方据此抛 RemotingSendRequestException
+        // 而不是等满 timeout 抛 RemotingTimeoutException。
+        public Exception? Cause;
 
         // 单调时钟：不受系统时间调整影响（Java 用 currentTimeMillis，这里刻意取更稳的口径）
         public static long MonoNowMs() => Environment.TickCount64;
@@ -199,6 +214,12 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// 当前在途请求数（测试/诊断用）。对应 Java <c>NettyRemotingAbstract.responseTable</c>
+    /// 的大小：真机验证用它证明"对端断开后在途表被 failFast 排空"，而不是等超时清理线程慢慢扫。
+    /// </summary>
+    public int PendingRequestCount => _respTable.Count;
+
     // ---------------------------------------------------------------- 建连
 
     private static Socket ConnectWithTimeout(string host, int port, int timeoutMillis, out string error)
@@ -313,6 +334,13 @@ public sealed class RemotingClient : IDisposable
 
     private Connection GetOrCreateConnection(string addr)
     {
+        // shutdown 之后不再建连：读线程退出时会投递回调（FailFast / 正常响应），回调里
+        // 若重进传输层，就会在 Shutdown 正持有 _threadMutex 等 Join 的当口往账本里塞新线程。
+        if (!_running)
+        {
+            throw new RemotingConnectException("remoting client is shut down, " + addr);
+        }
+
         lock (_connMutex)
         {
             if (_conns.TryGetValue(addr, out Connection? existing) && existing.Sock is { Connected: true })
@@ -483,8 +511,9 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
-        conn.ReaderDone = true;
-        // 把自己从连接表摘掉（避免留下失效条目）
+        // ---- 连接生命周期收口，顺序照 Java 的 NettyRemotingHandler#close ----
+        // 先 closeChannel（摘出连接表 + 关掉 socket），再 failFast。反过来会白丢一次重试：
+        // 条目还挂在表里时投递回调，回调里的重发会拿到这条已死的连接继续写。
         lock (_connMutex)
         {
             if (_conns.TryGetValue(conn.Addr, out Connection? found) && ReferenceEquals(found, conn))
@@ -492,6 +521,82 @@ public sealed class RemotingClient : IDisposable
                 _conns.Remove(conn.Addr);
             }
         }
+
+        CloseQuietly(conn);
+        FailFast(conn);
+        conn.ReaderDone = true;
+    }
+
+    /// <summary>
+    /// <paramref name="conn"/> 这条连接已经关了：把它名下还没响应的在途请求全部判为
+    /// **发送失败**（对应 Java <c>NettyRemotingAbstract#failFast</c> + <c>#requestFail</c>）。
+    /// </summary>
+    /// <remarks>
+    /// Java 的 <c>NettyRemotingHandler#close</c> 在 <c>closeChannel</c> 之后紧接着调
+    /// <c>failFast(ctx.channel())</c>（NettyRemotingClient.java:1191），逐条
+    /// <c>requestFail</c>：<c>setSendRequestOK(false)</c> → <c>putResponse(null)</c> →
+    /// 恰好投递一次回调。缺了这一步会错两件事，都不只是"慢一点"：
+    /// <list type="number">
+    /// <item><description>时机——同步调用要等满 invoke 超时、异步回调要等
+    /// <c>timeout + 1s</c>（清理线程的宽限口径）才发现对端早就断了；broker 重启、主备切换、
+    /// 网络抖动时这段空等直接压在发送链路上。</description></item>
+    /// <item><description>语义——报的是 <c>RemotingTimeoutException</c>，Java 报
+    /// <c>RemotingSendRequestException</c>。异步发送的重试分类按异常类型分流，错类型等于错决策。</description></item>
+    /// </list>
+    /// 按 Connection **对象引用**认领，不按地址：地址相同但连接已换新是常见形状
+    /// （GO_AWAY 换连接重发、写失败后关连接），旧读线程收尾时不能误伤新连接的请求。
+    /// 返回被判死的条数，只为日志与测试断言服务。
+    /// </remarks>
+    private int FailFast(Connection conn)
+    {
+        List<(Future Future, int Opaque)>? doomed = null;
+        foreach (KeyValuePair<int, Future> kv in _respTable)
+        {
+            if (!ReferenceEquals(kv.Value.Conn, conn))
+            {
+                continue;
+            }
+
+            // TryRemove 决定归属：与读线程/清理线程抢同一 opaque 时只有一方拿到非空值
+            if (!_respTable.TryRemove(kv.Key, out Future? removed) || removed is null)
+            {
+                continue;
+            }
+
+            doomed ??= new List<(Future, int)>();
+            doomed.Add((removed, kv.Key));
+        }
+
+        if (doomed is null)
+        {
+            return 0;
+        }
+
+        foreach ((Future f, int opaque) in doomed)
+        {
+            var error = new RemotingSendRequestException(f.Addr
+                + " connection closed before response, opaque="
+                + opaque.ToString(CultureInfo.InvariantCulture));
+            InvokeCallback? cb = null;
+            lock (f.Done)
+            {
+                f.Cause = error;
+                f.Done.Set(); // 对应 Java 的 putResponse(null)：同步等待方立刻醒
+                if (!f.CallbackFired)
+                {
+                    f.CallbackFired = true;
+                    cb = f.Callback;
+                }
+            }
+
+            // 与 SweepExpired 同理：回调必须脱离在途表执行
+            cb?.Invoke(null, error);
+        }
+
+        ClientLog.Warn("remoting reader: connection " + conn.Addr + " closed, "
+            + doomed.Count.ToString(CultureInfo.InvariantCulture)
+            + " in-flight request(s) failed fast");
+        return doomed.Count;
     }
 
     private void Dispatch(byte[] frame, string from)
@@ -562,6 +667,7 @@ public sealed class RemotingClient : IDisposable
         lock (future.Done)
         {
             future.Response = cmd;
+            future.HasResponse = true;
             // 与超时清理线程抢同一个回调：谁先置位谁投递，另一个只能放弃
             // （Java 用 ResponseFuture.executeCallbackOnlyOnce 表达同一约束）。
             if (!future.CallbackFired)
@@ -599,7 +705,9 @@ public sealed class RemotingClient : IDisposable
 
     // ---------------------------------------------------------------- 发送
 
-    private void SendRequest(string addr, RemotingCommand request)
+    // 把请求写出去，返回**实际使用的那条连接**：调用方把它记在在途表项上，
+    // 连接断开时靠对象引用判断该失败哪些请求（见 FailFast）。
+    private Connection SendRequest(string addr, RemotingCommand request)
     {
         // RPC 钩子必须在 Encode() **之前**执行：ACL 钩子把 AccessKey/Signature 写进
         // ExtFields，而签名覆盖的正是「即将上线的这份 ExtFields + Body」。
@@ -626,6 +734,8 @@ public sealed class RemotingClient : IDisposable
                 throw new RemotingSendRequestException(addr);
             }
         }
+
+        return conn;
     }
 
     private static void SendAll(Connection conn, byte[] data)
@@ -830,6 +940,8 @@ public sealed class RemotingClient : IDisposable
     /// 同步调用：等到响应或超时，含 GO_AWAY 换连接重发（对应 Java
     /// <c>NettyRemotingClient#invokeImpl:828-873</c>）。超时抛 RemotingTimeoutException；
     /// 建连失败抛 RemotingConnectException；发送失败抛 RemotingSendRequestException。
+    /// 对端在响应之前断开连接时也立刻抛 RemotingSendRequestException（Java 的 failFast
+    /// 唤醒等待方），不会让调用方等满 timeout 才拿到一个语义错误的超时。
     /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
     /// </summary>
     public RemotingCommand InvokeSync(string addr, RemotingCommand request, int timeoutMillis = -1)
@@ -845,14 +957,19 @@ public sealed class RemotingClient : IDisposable
         return RetryAfterGoAway(addr, request, deadline);
     }
 
-    /// <summary>单次请求-应答：登记 opaque、写出、等响应或超时。不含 GO_AWAY 判定。</summary>
+    /// <summary>
+    /// 单次请求-应答：登记 opaque、写出、等响应或超时。不含 GO_AWAY 判定。
+    /// 对端在响应之前断开连接时立刻抛 RemotingSendRequestException（读线程的 FailFast
+    /// 把等待方叫醒），不会等满 timeout 再报一个语义错误的超时。
+    /// </summary>
     private RemotingCommand InvokeOnce(string addr, RemotingCommand request, int timeout)
     {
-        Future future = RegisterFutureAcquiringOpaque(request, null);
+        // timeoutMillis 传 0：同步路径自己等、自己摘，不交给清理线程重复判超时。
+        Future future = RegisterFutureAcquiringOpaque(request, null, addr, 0);
         int opaque = request.Opaque;
         try
         {
-            SendRequest(addr, request);
+            future.Conn = SendRequest(addr, request);
         }
         catch (Exception)
         {
@@ -866,6 +983,17 @@ public sealed class RemotingClient : IDisposable
             throw new RemotingTimeoutException(addr + " wait response timeout "
                 + timeout.ToString(CultureInfo.InvariantCulture) + " ms, opaque="
                 + opaque.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (!future.HasResponse)
+        {
+            UnregisterFuture(opaque);
+            // Done 却没有响应 = 连接断开时被 FailFast 判死（Java 的 invokeSyncImpl 把这条
+            // 路径上的 ExecutionException 翻成 RemotingSendRequestException）。
+            throw future.Cause is not null
+                ? new RemotingSendRequestException(future.Cause.Message)
+                : new RemotingSendRequestException(addr + " connection closed before response, opaque="
+                    + opaque.ToString(CultureInfo.InvariantCulture));
         }
 
         return future.Response;
@@ -930,7 +1058,9 @@ public sealed class RemotingClient : IDisposable
 
     /// <summary>
     /// 异步调用：发送后立即返回。回调**恰好触发一次**——响应到达时在读线程里带 response，
-    /// 超时或无响应时由清理线程带 error（对应 Java scanResponseTable → operationFail）。
+    /// 超时或无响应时由清理线程带 error（对应 Java scanResponseTable → operationFail），
+    /// 对端在响应之前断开连接时由该连接的读线程**立刻**带 RemotingSendRequestException
+    /// （对应 Java failFast → requestFail，不等清理线程、也不报成超时）。
     /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
     ///
     /// GO_AWAY 与同步路径同一套语义（Java 里两条路共用 invokeImpl）：重发要建新连接并等
@@ -943,7 +1073,7 @@ public sealed class RemotingClient : IDisposable
         long deadline = Future.MonoNowMs() + timeout;
         RemotingCommand original = CopyForRetry(request);
         original.Opaque = request.Opaque;
-        RegisterFutureAcquiringOpaque(request, (response, error) =>
+        Future future = RegisterFutureAcquiringOpaque(request, (response, error) =>
         {
             if (response is null || error is not null || response.Code != ResponseCode.GoAway)
             {
@@ -967,7 +1097,7 @@ public sealed class RemotingClient : IDisposable
         int opaque = request.Opaque;
         try
         {
-            SendRequest(addr, request);
+            future.Conn = SendRequest(addr, request);
         }
         catch (Exception)
         {
@@ -994,25 +1124,36 @@ public sealed class RemotingClient : IDisposable
 
     private static void CloseQuietly(Connection conn)
     {
-        try
+        // WriteLock 同时也是 socket 生命周期的锁：写路径失败时持锁关掉它，读线程退出时也走
+        // 这里，于是既不会重复 Dispose（SslStream/Socket 二次 dispose 只是没意义，把已归还
+        // 的句柄再关一次才真危险），也不会出现"一路在 Send、另一路把 socket 抽走"的窗口。
+        lock (conn.WriteLock)
         {
-            conn.Tls?.Dispose();
-        }
-        catch
-        {
-            // dispose 失败忽略
-        }
+            if (conn.Sock is null)
+            {
+                return;
+            }
 
-        try
-        {
-            conn.Sock.Dispose();
-        }
-        catch
-        {
-            // dispose 失败忽略
-        }
+            try
+            {
+                conn.Tls?.Dispose();
+            }
+            catch
+            {
+                // dispose 失败忽略
+            }
 
-        conn.Sock = null!;
+            try
+            {
+                conn.Sock.Dispose();
+            }
+            catch
+            {
+                // dispose 失败忽略
+            }
+
+            conn.Sock = null!;
+        }
     }
 
     /// <summary>主动关闭单条连接；读线程会自行退出并清理。</summary>

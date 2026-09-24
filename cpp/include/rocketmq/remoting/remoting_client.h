@@ -14,7 +14,9 @@
 // 与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
 // （channelNotActiveInterval=60s）在 Java 客户端里**从未被调度** —— client + remoting 全树
 // grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
-// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现。
+// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现，连接断开时立刻
+// 失败该连接名下的在途请求（failFast / requestFail）也有实现：读线程退出时把这些请求判为
+// RemotingSendRequestException（不是超时），并唤醒还在等响应的同步调用方。
 #ifndef ROCKETMQ_REMOTING_REMOTING_CLIENT_H
 #define ROCKETMQ_REMOTING_REMOTING_CLIENT_H
 
@@ -97,6 +99,8 @@ public:
     // ---- 请求发送 ----
     // 同步调用：等到响应或超时。超时抛 RemotingTimeoutException；
     // 建连失败抛 RemotingConnectException；发送失败抛 RemotingSendRequestException。
+    // 对端在响应之前断开连接时也立刻抛 RemotingSendRequestException（对应 Java failFast
+    // 唤醒等待方），不会让调用方等满 timeout 才拿到一个语义错误的超时。
     // timeoutMillis < 0 表示使用 invokeTimeoutMillis。
     //
     // opaque 由调用方负责唯一性——用 RemotingCommand::createRequestCommand() 创建即可
@@ -110,8 +114,10 @@ public:
     // 注意 callback 在**读线程**（或超时清理线程）中执行，实现需自行保证线程安全。
     // timeoutMillis 会登记到在途表项，超时后由清理线程以 error(kind=TIMEOUT) 回调一次
     // （对应 Java NettyRemotingAbstract 的 scanResponseTable），不会因对端不回包而永久悬挂。
+    // 对端在响应之前断开连接时，改由该连接的读线程以 error(kind=SEND_REQUEST) 立刻回调一次
+    // （对应 Java failFast -> requestFail，不等超时清理线程，也不报成超时）。
     // ⚠ 建连/写失败在**本函数上就地抛出**类型化异常（Java 的 invokeAsync 也这样），
-    //    调用方要 try/catch；异步回来的错误只可能是超时或 GO_AWAY 重发失败。
+    //    调用方要 try/catch；异步回来的错误只可能是超时、断连或 GO_AWAY 重发失败。
     void invokeAsync(const std::string& addr, RemotingCommand& request,
                      InvokeCallback callback, int32_t timeoutMillis = -1);
 
@@ -175,6 +181,11 @@ public:
 
     // 当前活跃连接数（测试/诊断用）
     size_t connectionCount() const;
+
+    // 当前在途请求数（测试/诊断用）。对应 Java NettyRemotingAbstract.responseTable
+    // 的大小：真机验证用它证明「对端断开后在途表被 failFast 排空」，而不是等超时
+    // 清理线程慢慢扫。
+    size_t pendingRequestCount() const;
 
     // "host:port" 拆分，支持 IPv6 的 [::1]:10911 形式
     static void parseAddress(const std::string& addr, std::string& host, std::string& port);

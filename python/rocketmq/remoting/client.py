@@ -2,7 +2,8 @@
 """socket 长连接客户端（对应 org.apache.rocketmq.remoting.netty.NettyRemotingClient 的核心能力）。
 
 提供：连接管理（惰性建连 + 复用）、invokeSync/invokeAsync/invokeOneway、
-opaque 映射回调分发、超时控制、连接状态探活、GO_AWAY 换连接重发。
+opaque 映射回调分发、超时控制、连接状态探活、GO_AWAY 换连接重发、
+连接断开时立刻失败该连接上的在途请求（对应 Java failFast）。
 
 与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
 （channelNotActiveInterval=60s）在 Java 客户端里**从未被调度**——client + remoting 全树
@@ -118,6 +119,15 @@ class _ResponseFuture:
         self.begin_timestamp = _mono_millis()
         self.response: Optional[RemotingCommand] = None
         self.send_request_ok = False
+        # 请求真正写出去时所用的套接字（对应 Java ResponseFuture 里的 channel 字段）。
+        # 连接断开时按**对象身份**认领在途请求：只比地址串会误伤——同地址可能已经换了一条
+        # 新连接（close_channel/GO_AWAY 重发就是这个形状），旧连接的读线程收尾时不能把
+        # 新连接上的请求一起判死。None 表示还没写出去，这条连接的 failFast 不该牵连它。
+        self.conn: Optional[socket.socket] = None
+        # 失败原因（对应 Java 的 cause）。同步等待方靠它区分"发送失败"与"超时"：
+        # Java 的 invokeSyncImpl 把 ExecutionException 翻成 RemotingSendRequestException，
+        # TimeoutException 才翻成 RemotingTimeoutException。
+        self.cause: Optional[BaseException] = None
         self._done = threading.Event()
         self._lock = threading.Lock()
         self._callback_once = threading.Lock()
@@ -152,6 +162,22 @@ class _ResponseFuture:
             # 回调里抛出的异常不能带走读线程/清理线程（对应 Java 的 try-catch + warn）
             logger.warning("remoting: invoke callback raised: %s" % e)
         return True
+
+    def fail_fast(self) -> bool:
+        """连接已断：把这条在途请求判为发送失败（对应 Java ``NettyRemotingAbstract#requestFail``）。
+
+        Java 那四步一一对应：``setSendRequestOK(false)``、``putResponse(null)``、
+        ``executeInvokeCallback``、``release()``。第一步是**语义**关键——回调里
+        ``ResponseFuture#executeInvokeCallback`` 按 ``sendRequestOK=false`` 报
+        ``RemotingSendRequestException``（而不是超时），异步发送的重试分类就吃这个区别。
+        ``putResponse(null)`` 唤醒的是同步等待方：没有它，发送明明已经失败调用方还要等满
+        invoke 超时。``release()`` 在本端口不存在于传输层（反压许可由 producer 的回调链归还，
+        见 ``client/producer.py`` 的 ``_release``），投递回调即触发归还。
+        """
+        self.send_request_ok = False
+        self.cause = RemotingSendRequestException(self.addr, "connection closed")
+        self.put_response(None)
+        return self.execute_invoke_callback(error=self.cause)
 
 
 class RemotingClient:
@@ -385,6 +411,8 @@ class RemotingClient:
                     self._reader_threads.pop(addr, None)
                     self._conn_stops.pop(addr, None)
             _close_socket(sock)
+            # 对端再也不会回这些请求了：立刻判死，别让调用方等满超时（Java 的 failFast）
+            self._fail_fast(addr, sock)
 
     def _dispatch(self, frame: bytes, addr: str) -> None:
         try:
@@ -474,9 +502,9 @@ class RemotingClient:
                 pass
 
     # ---------- 请求发送 ----------
-    def _send(self, addr: str, cmd: RemotingCommand) -> None:
+    def _send(self, addr: str, cmd: RemotingCommand) -> socket.socket:
         self._apply_before_request_hooks(addr, cmd)
-        self._write(addr, cmd)
+        return self._write(addr, cmd)
 
     def _write_response(self, addr: str, cmd: RemotingCommand) -> None:
         """把响应写回 broker。
@@ -493,8 +521,11 @@ class RemotingClient:
             logger.warning("remoting: failed to write response (code=%s) to %s",
                            cmd.code, addr, exc_info=True)
 
-    def _write(self, addr: str, cmd: RemotingCommand) -> None:
-        """把命令写到连接上，并保证这条连接的读线程已经起起来。
+    def _write(self, addr: str, cmd: RemotingCommand) -> socket.socket:
+        """把命令写到连接上，并保证这条连接的读线程已经起起来；返回所用的套接字。
+
+        返回值给在途请求记账用（``_ResponseFuture.conn``）：连接断开时只有真正写到这条
+        连接上的请求才该被它牵连。
 
         TLS 连接的读线程推迟到这里、第一个记录写出去之后才起：实测（macOS loopback，
         对端是 CPython ``ssl``，每轮新建 TLS 连接）握手刚完成就读线程已经进过 OpenSSL 的
@@ -518,6 +549,7 @@ class RemotingClient:
                     raise RemotingSendRequestException(addr)
         finally:
             self._start_reader(addr)
+        return sock
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
         """同步 RPC，含 GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）。"""
@@ -550,11 +582,11 @@ class RemotingClient:
         return response
 
     def _invoke_once(self, addr: str, request: RemotingCommand, timeout: int) -> RemotingCommand:
-        future = _ResponseFuture(request.opaque, timeout, request=request)
+        future = _ResponseFuture(request.opaque, timeout, request=request, addr=addr)
         with self._response_lock:
             self._response_table[request.opaque] = future
         try:
-            self._send(addr, request)
+            future.conn = self._send(addr, request)
             future.send_request_ok = True
         except Exception:
             with self._response_lock:
@@ -564,6 +596,10 @@ class RemotingClient:
         if response is None:
             with self._response_lock:
                 self._response_table.pop(request.opaque, None)
+            # 连接断掉时 _fail_fast 已经置好 cause 并唤醒了我：按 Java 的口径报"发送失败"，
+            # 而不是等满 timeout 再报超时。两条路的可重试性不一样（见 producer 的重试分类）。
+            if future.cause is not None:
+                raise future.cause
             raise RemotingTimeoutException(addr, timeout)
         return response
 
@@ -575,6 +611,9 @@ class RemotingClient:
         - 正常收到响应 -> ``callback(response, None)``
         - 超过 timeout_millis 仍无响应 -> ``callback(None, RemotingTimeoutException)``
           （由超时清理线程投递，等价于 Java scanResponseTable 里的 operationFail）
+        - 连接在响应之前断开 -> ``callback(None, RemotingSendRequestException)``
+          （由读线程收尾时投递，等价于 Java failFast -> requestFail 的 operationFail；
+          不等超时清理线程，因为那一刻已经确定不会有任何响应了）
 
         timeout_millis 为 None 时使用 invoke_timeout_millis。
 
@@ -604,7 +643,7 @@ class RemotingClient:
         with self._response_lock:
             self._response_table[request.opaque] = future
         try:
-            self._send(addr, request)
+            future.conn = self._send(addr, request)
             future.send_request_ok = True
         except Exception:
             with self._response_lock:
@@ -667,6 +706,42 @@ class RemotingClient:
             # 回调必须在 _response_lock **之外**执行：回调里常常还要回到传输层或业务层，
             # 持锁回调会和 shutdown 抢同一把锁，甚至自锁。
             f.execute_invoke_callback(error=error)
+
+    # ---------- 连接断开时立刻失败在途请求（对应 Java failFast / requestFail） ----------
+    def _fail_fast(self, addr: str, sock: socket.socket) -> int:
+        """``sock`` 这条连接已经关了：把它名下还没响应的在途请求全部判为发送失败。
+
+        Java 的 ``NettyRemotingHandler#close`` 在 ``closeChannel`` 之后紧接着调
+        ``failFast(channel)``（``NettyRemotingClient.java:1191``），因为这条连接上的请求
+        永远等不到响应了。少了这一步会错两件事，都不只是"慢一点"：
+
+        1. 同步调用方要等满 invoke 超时才发现连接早断了；异步回调更糟，要等
+           ``timeout + 1s``（那是清理线程的宽限口径）。
+        2. 报出来的是 ``RemotingTimeoutException``，Java 报的是
+           ``RemotingSendRequestException``。异步发送的重试分类按这两个类型分流
+           （``client/producer.py`` 的 ``_classify_async_failure``），错类型等于错语义。
+
+        按套接字**对象身份**认领，不按地址：地址相同但连接已经换新是常见形状
+        （GO_AWAY 换连接重发、写失败后的 close_channel），旧读线程收尾时不能误伤新连接。
+        返回被判死的请求数，只为日志和测试断言服务。
+        """
+        doomed = []
+        with self._response_lock:
+            for opaque in list(self._response_table.keys()):
+                f = self._response_table.get(opaque)
+                if f is None or f.conn is not sock:
+                    continue
+                # pop 决定归属：与读线程/清理线程抢同一个 opaque 时只有一方拿到非空值
+                removed = self._response_table.pop(opaque, None)
+                if removed is not None:
+                    doomed.append(removed)
+        for f in doomed:
+            # 同样在 _response_lock 之外投递，理由见 _sweep_expired
+            f.fail_fast()
+        if doomed:
+            logger.warning("remoting: connection to %s closed, %d in-flight request(s) failed fast",
+                           addr, len(doomed))
+        return len(doomed)
 
     def invoke_oneway(self, addr: str, request: RemotingCommand) -> None:
         request.mark_oneway_rpc()

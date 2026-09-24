@@ -22,6 +22,12 @@ add_executable(rmq_test_transport test_transport.cpp)
 target_link_libraries(rmq_test_transport PRIVATE rocketmq::remoting)
 add_test(NAME transport COMMAND rmq_test_transport)
 
+# 断连立刻失败在途请求（Java failFast / requestFail）：真 socket 对端读完就关，
+# 断言"毫秒级判死 + 报 SEND_REQUEST 而不是超时 + 回调只一次 + 不牵连别人家的请求"
+add_executable(rmq_test_fail_fast test_fail_fast.cpp)
+target_link_libraries(rmq_test_fail_fast PRIVATE rocketmq::remoting)
+add_test(NAME fail_fast COMMAND rmq_test_fail_fast)
+
 # 压缩：zlib 往返 + 外部夹具交叉验证 + 失败必须显式抛错
 add_executable(rmq_test_compression test_compression.cpp)
 target_link_libraries(rmq_test_compression PRIVATE rocketmq::remoting)

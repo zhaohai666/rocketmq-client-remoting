@@ -183,9 +183,13 @@ private:
                 opaqueLog_.push_back(req.opaque);
             }
             if (mode_ == ServerMode::Silent) {
-                // 不回复：让客户端超时
-                std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-                continue;
+                // 不回复，而且**不关连接**：这条用例要测的是"对端一直不收口"下的超时清理
+                // （scanResponseTable 口径）。早先这里睡 1200ms 就返回，等于在 timeout + 宽限
+                // 之前把连接关了 —— 断连 failFast 会先一步把回调投递掉，报的就不是 TIMEOUT。
+                while (!stop_.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+                return;
             }
             RemotingCommand resp;
             resp.code = mode_ == ServerMode::GoAway && connIndex < goAwayConns_

@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 36 个用例，3191 项断言（35 个测试二进制 3118 + interop 73），~30-40s
+cd build && ctest --output-on-failure     # 37 个用例，3210 项断言（36 个测试二进制 3137 + interop 73），~45s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -77,6 +77,7 @@ cd build && ctest --output-on-failure     # 36 个用例，3191 项断言（35 �
 | `java_alignment` | 32（带 `ROCKETMQ_JAVA_SRC` 为 38） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对 |
 | `route_heartbeat` | 99 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
 | `transport` | 55 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、**GO_AWAY 重发（同步+异步、只重发一次、开关关掉不重连）**、地址解析 |
+| `fail_fast` | 19 | 对端断开时在途请求立刻判死（Java `NettyRemotingHandler#close` → `failFast` → `requestFail`）：真 socket 对端读完一帧就关 ⇒ 同步调用毫秒级抛 `RemotingSendRequestException`（不是等满超时才报 `RemotingTimeoutException`——异步发送的重试分类按异常**类型**分流）、异步回调**恰好一次**、按**连接对象身份**认领在途请求（别人家的请求不受牵连，同地址换新连接后的新请求也不被旧读线程误伤）、`shutdown` 把在途排空 |
 | `compression` | 152 | 三后端：类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib / **LZ4 Frame** / **ZSTD** 往返、**外部硬编码真值夹具**（Python zlib.compress、Java lz4-java、zstd-jni、`zstd -3` CLI 各产的帧）、帧头 magic 与 LZ4 block-independence 位、17 段报文 × 三种类型、解压后清 flag、后端缺失或未知类型必须抛错而非交出压缩流 |
 | `admin` | 159 | fastjson2 非法 JSON 容错、`ConsumeStatsList` 的 **Java 字段名 `consumeStatsList`**（键名错一个字符就静默解析成空列表）、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
@@ -148,6 +149,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_send_header   127.0.0.1:9876   # 发送头 c/d/n：自动建 topic 的队列数由模板与 d 决定
 ./build/examples/rmq_live_flow_control  127.0.0.1:9876   # 拉取前流控五个阈值（条数/字节/跨度/topic 级）+ 命中后不丢消息
 ./build/examples/rmq_live_producer_unregister 127.0.0.1:9876   # 退出时向每台 broker 注销 clientId(35)
+./build/examples/rmq_live_fail_fast   127.0.0.1:9876   # broker 真死掉：挂起的长轮询 2.2s 内判死（会停一次 broker 再拉起，不删 store）
 ```
 
 | 工具 | 结果 | 覆盖 |

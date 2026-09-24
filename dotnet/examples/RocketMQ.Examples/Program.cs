@@ -53,6 +53,7 @@ internal static class Program
                 "send-header" => LiveSendHeader.Run(rest),
                 "sql92" => LiveSql92.Run(rest),
                 "unreg-live" => ProducerUnregisterLive.Run(rest),
+                "fail-fast" => LiveFailFast.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -99,6 +100,7 @@ internal static class Program
               send-header [namesrv]      真实集群发送头 c/d/n 联调（模板 topic 决定自动建出来的队列数、五种入口逐条落地）
               sql92      [namesrv]        真实集群 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 联调（需 broker 开 enablePropertyFilter）
               unreg-live [namesrv]        真实集群退出注销联调（UNREGISTER_CLIENT(35) 抓帧 + 204 前后对照 + 对照组）
+              fail-fast  [namesrv]        broker 真死时在途请求立刻判死（Java failFast）联调（会重启 broker）
             """);
     }
 }

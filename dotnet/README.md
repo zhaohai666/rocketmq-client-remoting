@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，581 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，587 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -89,6 +89,7 @@ dotnet $PROG trace 127.0.0.1:9876         # 消息轨迹全链路（17 PASS / 0 
 dotnet $PROG hook 127.0.0.1:9876          # CheckForbidden/FilterMessage 钩子（13 PASS / 0 FAIL）
 dotnet $PROG backpressure 127.0.0.1:9876  # 异步发送背压公平信号量（25 PASS / 0 FAIL）
 dotnet $PROG async-send 127.0.0.1:9876    # 异步发送内核（43 PASS / 0 FAIL / 1 SKIP）
+dotnet $PROG fail-fast 127.0.0.1:9876     # broker 真死时在途请求立刻判死（18 PASS / 0 FAIL，会停一次 broker 再拉起）
 dotnet $PROG validators-live 127.0.0.1:9876  # 名字校验（39 PASS / 0 FAIL）
 dotnet $PROG recall 127.0.0.1:9876        # 定时消息撤回（16 PASS / 0 FAIL，脚本负责开关并还原 recallMessageEnable）
 dotnet $PROG unit-config 127.0.0.1:9876   # unitName/unitMode/stream（20 PASS / 0 FAIL）
@@ -182,6 +183,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | hook | 13 PASS / 0 FAIL（CheckForbiddenHook 放行/拦截/单向/不落 broker + FilterMessageHook 拉取与 POP 两条路径 + 二次 tag 过滤 + 钩子异常吞掉） |
 | backpressure | 25 PASS / 0 FAIL（异步发送背压 B1-B5，与 Python/C++/Rust 同场景：B1 默认容量 40 笔异步全 SEND_OK、broker 侧正好落 40 条、两个信号量满额归还 1024 / 104857600 → B2 条数闸夹到地板值 10 时在途占满后空闲为 0，超额的 2 笔在调用方线程上等满预算才回调（实测等了 151ms）、文案与 Java 逐字一致，且 broker 上一条没留（`landed=10`）→ B3 运行时扩容到 12 叫醒卡在闸上的发送方、全部归还后空闲 = 新容量 12、broker 总数 21 → B4 字节闸 1M 地板 + 600KB body：在途空闲字节 434176、第二笔回调 `semaphoreAsyncSize timeout`、被拒时条数许可已归还、broker 只落 1 条 → B5 关背压后 30 笔并发（含 300KB 大 body）全落地） |
 | async-send | 43 PASS / 0 FAIL / 1 SKIP（异步发送内核 A1-A6：A1 before 钩子睡 400ms 时调用方 17ms 就返回，这一笔 SEND_OK 后**用 broker 回的 `offsetMsgId` 能 `ViewMessage` 读回原 body**、`queueOffset` 正好等于该队列 `maxOffset-1`、`MsgId` 是 32 位客户端 UNIQ_KEY 且与 `offsetMsgId` 不同；线程口径实测 `AsyncSenderExecutor_1` 跑准备段、`NettyClientPublicExecutor_1` 跑用户回调 → A2 并发 30 笔：一笔恰好一个终态、全 SEND_OK、broker 落 30 条、30 个 `(broker,queueId,queueOffset)` 槽位与 30 个 UNIQ_KEY 两两不重复 → A3 定点异步发送只让指定的那条队列多 1 条、其它队列一条没多 → A4 `CheckForbiddenHook` 看到 `CommunicationMode.Async`，拒绝时异常原样到回调且**连 topic 路由都没建出来**（`landed=-1`），换个标签照常落地、钩子被调 2 次 → A5 `SendBatchAsync`（对位 Java `send(Collection, SendCallback, timeout)`）一批 3 条：回调恰好一次且 SEND_OK、broker 侧 `landed=3`、应答的 `OffsetMsgId` 是**逐条回的 3 个 commitLog 偏移**，用它 `ViewMessage` 读回的那条**子消息**带着客户端生成的 32 位 `UNIQ_KEY`（逐条 ID 真编进了 body 的落地证据；缺了它发送侧照样 SEND_OK，只有真 broker 看得出来）、`MsgId` 是批量自身的 32 位客户端 ID；定点批量只让那条队列多 3 条；混 topic / 空批的本地校验在异步路径上照样跑且错误**进回调**；字节闸按**整批**扣（1 MiB 地板下 2×600 KiB 被拒、2×100 KiB 照常 SEND_OK、两份许可满额归还）→ A6 `Shutdown()` 排空：36 笔全部上线（`landed=36`），至多 35 笔拿到终态回调（响应没回来就关了客户端，与 Java 同一条）） |
+| fail-fast | 18 PASS / 0 FAIL（2026-09-24 实测，最差一笔 2430ms；broker 真死掉时在途请求立刻判死，Java `NettyRemotingHandler#close` → `failFast(channel)` → `requestFail(opaque)`，与 Python `verify_fail_fast_live.py`、C++ `rmq_live_fail_fast`、Rust `live_fail_fast` 的 L1~L5 同场景。**这个子命令会停一次测试 broker、跑完再拉起来**，store 不删）：L1 真 broker 上 5 条同步发送 SEND_OK、各队列队尾位点**合计**覆盖这 5 条（发送跨队列轮转，看单条队列会假红）→ L2 手工构三条 `suspend=true` 的长轮询（客户端超时 30s、broker suspend 20s，绕开 pull consumer 的钳制），2s 后一条都没返回、`PendingRequestCount` 从 0 涨到 3，请求**确实在途** → L3 `mqshutdown broker`：三条全部返回、异常类型是 `RemotingSendRequestException`（文案 `connection closed before response`）、**一条都没被报成 `RemotingTimeoutException`**（异步发送的重试分类按异常类型分流，报成超时等于换一整套决策），最差一笔 2430ms ≪ 8s 阈值 ≪ 30s 超时，判死后在途表排空 → L4 判死只覆盖死掉那条连接所在的地址：同一个 `RemotingClient` 上的 namesrv 连接照常服务，`GET_ALL_TOPIC_LIST_FROM_NAMESERVER` 仍回 `code=0`。⚠ 真机只能证**按地址隔离**（一台 broker 一个地址一条连接），"同地址换连接时旧连接的收尾不误伤新连接"没有确定性的时间窗，由离线 `FailFastTests` 的 `AfterFailFast_SameAddress_KeepsWorking` 负责 → L5 broker 拉起后**同一个 producer 实例**重新建连照常发送（`attempts=1`，一次没重），已拿到 SEND_OK 的那 5 条一条都没少。收尾无论走到哪一步都会把 broker 拉回来（`Finish()`），脚本的 `start` 本身幂等 |
 | lite-pull | 33 PASS / 0 FAIL（`DefaultLitePullConsumer` 真机全链路：S1 rebalance 拿 4 队列 → S2 subscribe+poll 收全 12 条 → S3 commit 位点 >0 → S4 assign+seek 重收 → S5 订阅级 tag 只收 6 条 → S6a `ConsumeFromTimestamp` 收全、S6b `OffsetForTimestamp` 双向（30 分钟前→Σ=0，10 分钟后→Σ=12）→ S7a 默认策略 `AVG` + 策略为 null 时 `Start()` 报 Java 同款文案、S7b 换 `AVG_BY_CIRCLE` 同组两实例无交集/并集覆盖 4 队列/步长 2 交叉、S7c 两半 `CONFIG` 各自只收配置队列且合起来恰好 12 条互不重叠、S7d `CONSISTENT_HASH` 用**真实 clientId** 建环且线上分配收敛到「真实 mqAll/cidAll 离线跑同一策略」的预测（合起来收全 12 条）、S7e `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 单机房下原样透传内层策略 + resolver 被逐个队列和两个真实 clientId 问过、S7f `MACHINE_ROOM` 白名单不匹配真实 `broker-a` → 安静饿死（分不到队列、poll 不到消息，同组 AVG 对照组仍只拿自己半边）） |
 | validators-live | 39 PASS / 0 FAIL（名字校验四语言对拍：S1 发送路径 13 项本地快拒（<50ms、不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `Start()` 三道组名门 + 120 等长边界、S4 正腿 push/lite 各收 3 条、S5 对照腿（合法但不存在的 topic 真往返 45ms vs 本地 0.66ms）、S6 pull/lite 组名门 + 查队列与位点、S7 `CreateTopic` 挡空白/非法/系统 topic） |
 | recall | 16 PASS / 0 FAIL（定时消息撤回 `recallMessage`(370)，与 Python/C++/Rust 同场景：R0 读到并临时打开 broker 的 `recallMessageEnable` → R1 只有带 `TIMER_DELAY_SEC` 的消息回 `recallHandle` → R2 broker 给的句柄能被解码、`topic`/`brokerName`/`uniqKey` 与发送结果逐字段一致 → R4/R5 `%RETRY%`/`%DLQ%`/非法句柄都在打网络之前秒回 → R3 撤回返回被撤回消息的 uniqKey → **R6 语义**：对照定时消息按时投递、被撤回那条整个窗口都不出现 → R7 无条件还原开关） |
@@ -194,7 +196,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | unreg-live | 10 PASS / 0 FAIL（生产者退出注销 `UNREGISTER_CLIENT`(35) 真机，与 Python `verify_producer_unregister_live.py`、C++ `rmq_live_producer_unregister`、Rust `live_producer` 的 P11 同一套场景）：U1 发送成功 → U2 心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId（注册确实发生过，"消失"才有意义，组靠心跳上线所以要轮询等）→ U2b 对照组注册可见（204 这条判据本身有效）→ U3 `Shutdown()` 给每台已知 broker 各发一发 35、头是 `clientID`+`producerGroup` 且 **`consumerGroup` 整个字段不上线**（Java 传 null；broker `ClientManageProcessor:228/237` 判的是 `group != null`）、addr 确实是路由里那台、且排在业务发送之后（`last_send=4 first_unreg=6`）→ U5 紧接着查 204 这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 判据强度：.NET 里每个生产者各持一份 `MQClientInstance`、各一条连接，退出时连接也关掉，单看 U5 分不出是 35 还是断连的功劳，所以这里必须由 `IRpcHook` 抓帧（钩子跑在 `Encode()` **之前**，头此时还挂在 `CustomHeader` 上）直接证明线上走了这一发；行为级的判别式证明在 Rust 的 P11（Rust 按 clientId 复用实例，先退的那个连接还活着）。⚠ 「每一发 35 都回 SUCCESS」在本移植**不可观测**——传输层有意不调 `IRpcHook#DoAfterResponse`（见 `Remoting/RemotingClient.cs`），U5 的 broker 侧效果是它的替代判据。头形状（含**纯空白组名**同空串处理，整个字段不上线）、扇出**含 slave**（`GetAllBrokerAddrs` vs 心跳用的 master 优先 `GetRouteOfAllBrokers`）、单台失败被吞且剩下的照旧注销、超时与 Java 的 `getMqClientApiTimeout()`=**3000ms** 同口径，共 9 项由 `ProducerUnregisterTests` 离线锁死（自带一个同一 brokerName 下挂 master(0)+slave(1) 的假集群——本机真集群只有一台 master，这条判据在真机上不可达） |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **581 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **587 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`
@@ -204,6 +206,13 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 那道开关——Rust 曾这么错过：离线全绿，真机上那道闸门静默失效）、判定顺序条数→字节→跨度→
 topic 条数→topic 字节、**命中一次只记一格** `FlowControlTriggered`。命中原因串按 Java 的口径
 用 `F1` + `MB` 后缀（`size=1.2MB`），单测把文案也锁死，因为运维只看得到这一行。
+`FailFastTests`（6 项，真 socket 而不是 mock 集群——被测的正是"读线程看见 EOF 之后做了什么"）锁住
+连接判死（Java `NettyRemotingHandler#close` → `failFast` → `requestFail`）：同步调用在对端断开后**毫秒级**
+抛 `RemotingSendRequestException` 而不是等满 30s 超时（超时故意设长一个量级，任何"等到超时才算失败"的实现
+都会被耗时上限抓住）、异步回调同理、**failFast 与超时清理线程抢同一条 opaque 时回调只投递一次**（这里把超时
+压到 200ms 让两条路径真的撞上）、判死一条连接不牵连另一条连接上尚未应答的请求（它最终拿到自己的成功响应）、
+判死之后**同一地址**建新连接跑完新请求（按 `Connection` **对象引用**认领在途请求，旧读线程的收尾不许误伤新连接
+——真机给不出这个时间窗，只有这里能锁）、`Shutdown()` 把在途排空且可重复调用不补投。
 `ConsumerCheckConfigTests`（11 项）锁住启动期数值闸门（Java
 `DefaultMQPushConsumerImpl#checkConfig` 数值段 `:1099-1209`）：一张与 Python/C++/Rust 同构的
 `Gates` 表把 12 条区间的**两端各测一次**（越界各拒一次、放行各一次，文案逐字对 Java 只去

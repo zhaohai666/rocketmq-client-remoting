@@ -13,11 +13,14 @@
 //!   = 60s）**在 Java 客户端里从未被调度**——grep 遍 client + remoting 全树只有一个调用点
 //!   都没有，属于死代码。所以这里不做空闲连接回收： broker 侧的 `connectionLivenessCheckMillis`
 //!   断开连接时，读任务会立刻见到 EOF，惰性清理已经覆盖真实场景。
+//!
+//! 对端断开时的在途请求收口（Java `failFast` → `requestFail`）按**连接身份**认领，
+//! 见 [`Connection::id`] 与 [`Pending::conn_id`]。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +36,15 @@ use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
 
 pub const MAX_FRAME_LENGTH: i32 = 16 * 1024 * 1024;
+
+/// 连接身份：单调递增，用来把在途请求绑到"真正写出去的那条连接"上。
+/// 地址不能当身份用——同地址换连接（GO_AWAY 重发、EOF 后重连）是常见形状，
+/// 按地址收口会误伤新连接上的请求，见 [`fail_pending_for`]。
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// TLS 读写单次尝试拿不到数据时的退避：socket 为非阻塞，靠这个小睡避免空转，
 /// 同时保证 [`TlsStream`] 那把双向锁的持有时长只有一次 syscall 量级。
@@ -121,6 +133,9 @@ struct Pending {
     sender: oneshot::Sender<RemotingCommand>,
     request: Option<RemotingCommand>,
     addr: String,
+    /// 请求真正写出去时所用的连接（对应 Java `ResponseFuture` 里的 `channel` 字段）。
+    /// `None` = 还没写出去，这条连接的收口不该牵连它。
+    conn_id: Option<u64>,
 }
 
 #[derive(Default)]
@@ -149,6 +164,8 @@ enum TaskHandle {
 }
 
 struct Connection {
+    /// 本进程内唯一的连接身份，见 [`next_conn_id`]。
+    id: u64,
     addr: String,
     writer: WriterHandle,
     alive: AtomicBool,
@@ -294,7 +311,7 @@ impl RemotingClient {
 
     pub async fn invoke_oneway(&self, addr: &str, request: &mut RemotingCommand) -> Result<()> {
         request.mark_oneway_rpc();
-        send_request(&self.inner, addr, request).await
+        send_request(&self.inner, addr, request).await.map(|_| ())
     }
 
     // ---------------- 连接状态 ----------------
@@ -381,7 +398,19 @@ impl Inner {
         addr: &str,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.pending.insert(opaque, Pending { sender, request, addr: addr.to_string() });
+        state
+            .pending
+            .insert(opaque, Pending { sender, request, addr: addr.to_string(), conn_id: None });
+    }
+
+    /// 请求真正写出去之后补上连接身份（对应 Java 在 `invokeAsync`/`invokeSync` 里
+    /// 把 `channel` 塞进 `ResponseFuture`）。只有这一步做过的请求才会被那条连接的
+    /// 收口牵连；还没写出去的请求不属于任何连接。
+    fn attach_pending_conn(&self, opaque: i32, conn_id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = state.pending.get_mut(&opaque) {
+            pending.conn_id = Some(conn_id);
+        }
     }
 
     fn cancel(&self, opaque: i32) {
@@ -441,9 +470,12 @@ async fn invoke_with_timeout(
     let opaque = request.opaque;
     let (tx, rx) = oneshot::channel();
     inner.register_pending(opaque, tx, Some(request.clone()), addr);
-    if let Err(e) = send_request(inner, addr, request).await {
-        inner.cancel(opaque);
-        return Err(e);
+    match send_request(inner, addr, request).await {
+        Ok(conn_id) => inner.attach_pending_conn(opaque, conn_id),
+        Err(e) => {
+            inner.cancel(opaque);
+            return Err(e);
+        }
     }
     match tokio::time::timeout(Duration::from_millis(timeout.max(1) as u64), rx).await {
         Ok(Ok(response)) => Ok(response),
@@ -459,8 +491,9 @@ async fn invoke_with_timeout(
 }
 
 /// 对应 Java `doBeforeRpcHooks` + 写出：**必须在 encode 之前**跑钩子，
-/// ACL 签名覆盖的必须是真正上线的那份 extFields。
-async fn send_request(inner: &Arc<Inner>, addr: &str, request: &mut RemotingCommand) -> Result<()> {
+/// ACL 签名覆盖的必须是真正上线的那份 extFields。返回所用连接的身份，供调用方
+/// 把请求绑到这条连接上（见 [`Inner::attach_pending_conn`]）。
+async fn send_request(inner: &Arc<Inner>, addr: &str, request: &mut RemotingCommand) -> Result<u64> {
     {
         let hooks = inner.hooks.read().unwrap_or_else(|e| e.into_inner());
         for hook in hooks.iter() {
@@ -470,11 +503,11 @@ async fn send_request(inner: &Arc<Inner>, addr: &str, request: &mut RemotingComm
     write_frame(inner, addr, request).await
 }
 
-async fn write_frame(inner: &Arc<Inner>, addr: &str, request: &mut RemotingCommand) -> Result<()> {
+async fn write_frame(inner: &Arc<Inner>, addr: &str, request: &mut RemotingCommand) -> Result<u64> {
     let conn = get_or_create(inner, addr).await?;
     let data = request.encode();
     if conn.writer.send(data) {
-        Ok(())
+        Ok(conn.id)
     } else {
         conn.mark_dead();
         close_channel(inner, &conn.addr);
@@ -482,6 +515,8 @@ async fn write_frame(inner: &Arc<Inner>, addr: &str, request: &mut RemotingComma
     }
 }
 
+/// 按**地址**收口：调用方手上只有地址（GO_AWAY 重发、显式 `close_channel`、`shutdown`、
+/// 写失败），所以摘掉该地址当前的连接，并只判死**这条连接**名下的在途请求。
 fn close_channel(inner: &Arc<Inner>, addr: &str) {
     let conn = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -490,37 +525,60 @@ fn close_channel(inner: &Arc<Inner>, addr: &str) {
     if let Some(conn) = conn {
         conn.mark_dead();
         conn.abort_tasks();
+        fail_pending_for(inner, conn.id);
     }
-    fail_pending_for(inner, addr);
 }
 
-/// 连接死亡：把该地址上的在途请求全部失败掉（丢弃 sender 即可唤醒 `invoke_sync`）。
-fn fail_pending_for(inner: &Arc<Inner>, addr: &str) {
+/// 对应 Java `NettyRemotingAbstract#failFast` + `#requestFail`：连接死亡时把它名下
+/// 还没响应的在途请求全部判为发送失败（丢掉 `sender` 即唤醒等待方，
+/// `invoke_with_timeout` 那侧翻成 `Error::SendRequest{ "connection closed" }`，
+/// 与 Java 的 `RemotingSendRequestException` 同一口径）。
+///
+/// 认领按 `conn_id` 而不是地址：同地址换连接是常见形状（EOF 后重连、GO_AWAY 重发），
+/// 旧连接的读任务收尾时若按地址收口，会把**新**连接上刚登记的请求一起判死。
+/// 还没写出去的请求 `conn_id` 为 `None`，同样不该被牵连。
+fn fail_pending_for(inner: &Arc<Inner>, conn_id: u64) {
     let dropped: Vec<Pending> = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<i32> = state
             .pending
             .iter()
-            .filter(|(_, p)| p.addr == addr)
+            .filter(|(_, p)| p.conn_id == Some(conn_id))
             .map(|(k, _)| *k)
             .collect();
         keys.into_iter().filter_map(|k| state.pending.remove(&k)).collect()
     };
+    if dropped.is_empty() {
+        return;
+    }
+    // 日志带上地址：同一时刻可能有几条连接各自收口，只有 addr 能区分是谁断了。
+    let addr = &dropped[0].addr;
+    rmq_warn!(
+        "remoting: connection to {addr} (id={conn_id}) closed, {} in-flight request(s) failed fast",
+        dropped.len()
+    );
     for pending in dropped {
         drop(pending);
     }
 }
 
-fn on_connection_lost(inner: &Arc<Inner>, addr: &str) {
-    let matches = {
-        let state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.conns.get(addr).map(|c| c.alive.load(Ordering::Acquire)).unwrap_or(false)
+/// 读/写任务退出时调用：`conn_id` 是**自己**这条连接的身份。
+/// 只有表里那条连接还是自己的时候才摘掉它——已经换成新连接时不能动它，
+/// 但自己名下的请求无论如何都要立刻收口，不能让调用方等到超时。
+fn on_connection_lost(inner: &Arc<Inner>, addr: &str, conn_id: u64) {
+    let mine = {
+        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.conns.get(addr).map(|c| c.id) == Some(conn_id) {
+            state.conns.remove(addr)
+        } else {
+            None
+        }
     };
-    if matches {
-        close_channel(inner, addr);
-    } else {
-        fail_pending_for(inner, addr);
+    if let Some(conn) = mine {
+        conn.mark_dead();
+        conn.abort_tasks();
     }
+    fail_pending_for(inner, conn_id);
 }
 
 /// 读线程解出的每一帧走这里：响应交给在途表，请求交给处理器表。
@@ -659,11 +717,13 @@ async fn connect_plain(inner: &Arc<Inner>, socket_addr: SocketAddr, addr: &str) 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let conn = Arc::new(Connection {
+        id: next_conn_id(),
         addr: addr.to_string(),
         writer: WriterHandle::Async(tx),
         alive: AtomicBool::new(true),
         tasks: Mutex::new(Vec::new()),
     });
+    let conn_id = conn.id;
 
     let reader_inner = inner.clone();
     let reader_addr = addr.to_string();
@@ -689,7 +749,7 @@ async fn connect_plain(inner: &Arc<Inner>, socket_addr: SocketAddr, addr: &str) 
             }
             dispatch(&reader_inner, &reader_addr, frame);
         }
-        on_connection_lost(&reader_inner, &reader_addr);
+        on_connection_lost(&reader_inner, &reader_addr, conn_id);
     });
 
     let writer_inner = inner.clone();
@@ -701,7 +761,7 @@ async fn connect_plain(inner: &Arc<Inner>, socket_addr: SocketAddr, addr: &str) 
                 break;
             }
         }
-        on_connection_lost(&writer_inner, &writer_addr);
+        on_connection_lost(&writer_inner, &writer_addr, conn_id);
     });
 
     {
@@ -765,18 +825,20 @@ async fn connect_tls(
     let rx = Arc::new(Mutex::new(rx));
 
     let conn = Arc::new(Connection {
+        id: next_conn_id(),
         addr: addr.to_string(),
         writer: WriterHandle::Blocking(Arc::new(tx)),
         alive: AtomicBool::new(true),
         tasks: Mutex::new(vec![TaskHandle::Blocking]),
     });
+    let conn_id = conn.id;
 
     // 读线程是普通 std 线程，本身没有 tokio 上下文；而 broker 主动推来的请求（事务回查、
     // 心跳应答）都在那条线程上同步处理，处理器要靠运行时派后台任务。本函数是 async，
     // 一定跑在运行时里，就在这里把句柄取出来（同时缓存进 Inner 供其它线程用）。
     let runtime = inner.runtime_handle();
-    spawn_tls_writer(inner.clone(), addr, shared.clone(), rx.clone(), alive.clone());
-    spawn_tls_reader(inner.clone(), addr, shared, alive, runtime);
+    spawn_tls_writer(inner.clone(), addr, shared.clone(), rx.clone(), alive.clone(), conn_id);
+    spawn_tls_reader(inner.clone(), addr, shared, alive, runtime, conn_id);
     Ok(conn)
 }
 
@@ -786,13 +848,14 @@ fn spawn_tls_reader(
     shared: SharedTls,
     alive: Arc<AtomicBool>,
     runtime: Option<tokio::runtime::Handle>,
+    conn_id: u64,
 ) {
     let addr = addr.to_string();
     std::thread::spawn(move || {
         // enter() 让读线程上的 `Handle::try_current()` 与明文 tokio 读任务表现一致，
         // 否则纯 TLS 会话里 broker 的回查请求会到得了处理器、却派不出去。
         let _guard = runtime.as_ref().map(|handle| handle.enter());
-        tls_read_loop(inner, addr, shared, alive);
+        tls_read_loop(inner, addr, shared, alive, conn_id);
     });
 }
 
@@ -802,6 +865,7 @@ fn spawn_tls_writer(
     shared: SharedTls,
     rx: Arc<Mutex<std_mpsc::Receiver<Vec<u8>>>>,
     alive: Arc<AtomicBool>,
+    conn_id: u64,
 ) {
     let addr = addr.to_string();
     std::thread::spawn(move || {
@@ -817,7 +881,7 @@ fn spawn_tls_writer(
                 break;
             }
         }
-        on_connection_lost(&inner, &addr);
+        on_connection_lost(&inner, &addr, conn_id);
     });
 }
 
@@ -852,7 +916,13 @@ fn tls_write_all(shared: &SharedTls, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn tls_read_loop(inner: Arc<Inner>, addr: String, shared: SharedTls, alive: Arc<AtomicBool>) {
+fn tls_read_loop(
+    inner: Arc<Inner>,
+    addr: String,
+    shared: SharedTls,
+    alive: Arc<AtomicBool>,
+    conn_id: u64,
+) {
     let mut len_buf = [0u8; 4];
     let mut header_done = false;
     loop {
@@ -888,7 +958,7 @@ fn tls_read_loop(inner: Arc<Inner>, addr: String, shared: SharedTls, alive: Arc<
         dispatch(&inner, &addr, frame);
     }
     alive.store(false, Ordering::Release);
-    on_connection_lost(&inner, &addr);
+    on_connection_lost(&inner, &addr, conn_id);
 }
 
 /// `Ok(true)` 读满，`Ok(false)` 暂无数据（调用方重试），`Err` 连接不可用。
@@ -1214,6 +1284,186 @@ mod tests {
         let response = client.invoke_sync(&addr, &mut second, Some(3000)).await.unwrap();
         assert_eq!(response.remark.as_deref(), Some("pong:second"));
         client.shutdown();
+    }
+
+    // ------------------------------------------------ 断连收口（Java failFast）
+    //
+    // 对应 Java `NettyRemotingHandler#close` → `NettyRemotingAbstract#failFast` →
+    // `#requestFail`：连接死了，它名下的在途请求必须**立刻**判为发送失败。
+    // 少了这一步会错两件事：时机（等满 invoke 超时）和语义（报超时而非发送失败，
+    // 而异步发送的重试分类按错误类型分流）。用真 socket，被测的正是"读任务见到 EOF
+    // 之后做了什么"。
+
+    /// 轮询等到条件成立，最多 5s；超时直接 panic（测试里可以 panic）。
+    async fn wait_until(cond: impl Fn() -> bool, what: &str) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("等不到{what}");
+    }
+
+    /// 前 `drop_conns` 条连接读完一帧就关掉、永不回复；之后的连接照常回 SUCCESS。
+    async fn eof_server(drop_conns: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let idx = counter.fetch_add(1, Ordering::SeqCst);
+                if idx < drop_conns {
+                    tokio::spawn(async move {
+                        // 收到请求再关：制造"请求已写出、对端永不回复"的 EOF。
+                        let frame = read_frame(&mut stream).await;
+                        assert!(frame.is_some(), "断开前应当收到请求");
+                        drop(stream);
+                    });
+                    continue;
+                }
+                tokio::spawn(async move {
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let cmd = RemotingCommand::decode(&frame).unwrap();
+                        let mut response = response_for(&cmd, response_code::SUCCESS);
+                        write_command(&mut stream, &mut response).await;
+                    }
+                });
+            }
+        });
+        (addr, conns)
+    }
+
+    /// 只 accept、读完请求既不回复也不关连接：请求会一直停在途，
+    /// 除非客户端自己收口（超时、failFast、shutdown）。
+    async fn silent_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counter = frames.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    while read_frame(&mut stream).await.is_some() {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        (addr, frames)
+    }
+
+    #[tokio::test]
+    async fn connection_eof_fails_in_flight_request_fast() {
+        let (addr, conns) = eof_server(usize::MAX).await;
+        let client = RemotingClient::new();
+        let started = Instant::now();
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "eof");
+        let err = client.invoke_sync(&addr, &mut cmd, Some(30_000)).await.unwrap_err();
+        let cost = started.elapsed();
+
+        // 类型必须是 SendRequest（Java 的 RemotingSendRequestException），异步发送的
+        // 重试判定按错误类型分流，报成 Timeout 就是另一个决策。
+        assert!(matches!(err, Error::SendRequest { .. }), "必须是发送失败，got {err}");
+        assert!(err.to_string().contains("connection closed"), "文案对齐 Java requestFail: {err}");
+        assert!(cost < Duration::from_secs(5), "毫秒级判死，不能等满 30s 超时: {cost:?}");
+        assert_eq!(client.in_flight_count(), 0, "判死之后在途表要清空");
+        assert_eq!(conns.load(Ordering::SeqCst), 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn connection_eof_fails_async_callback_exactly_once() {
+        let (addr, _conns) = eof_server(usize::MAX).await;
+        let client = RemotingClient::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = oneshot::channel();
+        let counter = hits.clone();
+        client.invoke_async(
+            &addr,
+            request(request_code::SEND_MESSAGE_V2, "eof"),
+            Box::new(move |result| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(result);
+            }),
+            Some(30_000),
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx).await.expect("回调没触发").unwrap();
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "回调只能投递一次");
+        client.shutdown();
+    }
+
+    /// 死连接的收口不能牵连别的连接：另一条连接上的在途请求要原样留着。
+    #[tokio::test]
+    async fn fail_fast_leaves_other_connections_alone() {
+        let (alive_addr, frames) = silent_server().await;
+        let (doomed_addr, _c) = eof_server(usize::MAX).await;
+        let client = RemotingClient::new();
+
+        let slow = {
+            let client = client.clone();
+            let addr = alive_addr.clone();
+            tokio::spawn(async move {
+                let mut cmd = request(request_code::PULL_MESSAGE, "slow");
+                client.invoke_sync(&addr, &mut cmd, Some(30_000)).await
+            })
+        };
+        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "活连接收到请求").await;
+
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "eof");
+        let err = client.invoke_sync(&doomed_addr, &mut cmd, Some(30_000)).await.unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
+
+        assert_eq!(client.in_flight_count(), 1, "只该判死自己那条连接上的请求");
+        assert!(!slow.is_finished(), "活连接上的请求不该被误伤");
+        slow.abort();
+        client.shutdown();
+    }
+
+    /// 判死之后同一个地址还能建新连接、跑完新请求：死连接必须已经摘出连接表。
+    #[tokio::test]
+    async fn same_address_works_after_fail_fast() {
+        let (addr, conns) = eof_server(1).await;
+        let client = RemotingClient::new();
+
+        let mut first = request(request_code::SEND_MESSAGE_V2, "eof");
+        let err = client.invoke_sync(&addr, &mut first, Some(30_000)).await.unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
+        assert!(!client.is_channel_writable(&addr), "死连接要摘出连接表");
+
+        let mut second = request(request_code::SEND_MESSAGE_V2, "ok");
+        let response = client.invoke_sync(&addr, &mut second, Some(5_000)).await.unwrap();
+        assert_eq!(response.code, response_code::SUCCESS);
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "第二次请求走的是新建的连接");
+        client.shutdown();
+    }
+
+    /// Shutdown 也要给在途请求一个交代：调用方等到的是发送失败，而不是永久悬挂。
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_requests() {
+        let (addr, frames) = silent_server().await;
+        let client = RemotingClient::new();
+        let waiter = {
+            let client = client.clone();
+            let addr = addr.clone();
+            tokio::spawn(async move {
+                let mut cmd = request(request_code::PULL_MESSAGE, "pending");
+                client.invoke_sync(&addr, &mut cmd, Some(30_000)).await
+            })
+        };
+        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "请求写出").await;
+
+        client.shutdown();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("调用方被挂住").unwrap();
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "shutdown 要立刻收口，got {err}");
+        assert_eq!(client.in_flight_count(), 0);
     }
 
     /// broker 主动推请求（PUSH_REPLY_MESSAGE_TO_CLIENT），客户端处理器必须回响应。
