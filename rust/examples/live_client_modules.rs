@@ -1578,11 +1578,25 @@ async fn t7_request_reply(
     );
     let mut no_cluster = Message::new(topic, Some(b"x"));
     no_cluster.set_topic(topic);
-    ck.check(
-        "T7 create_reply_message refuses a request without CLUSTER",
-        create_reply_message(&no_cluster, b"y").is_err(),
-        "missing CLUSTER must be an error",
-    );
+    // Java `MessageUtil:49` 抛的是带 `CREATE_REPLY_MESSAGE_EXCEPTION`(10007) 的
+    // MQClientException，不是裸的本地错误：应答 listener 在业务代码里，按码分流才能把
+    //「这条请求不能回话」和别的本地故障分开。
+    match create_reply_message(&no_cluster, b"y") {
+        Ok(_) => ck.check(
+            "T7 create_reply_message refuses a request without CLUSTER",
+            false,
+            "missing CLUSTER must be an error",
+        ),
+        Err(e) => {
+            let code = e.response_code();
+            ck.check(
+                "T7 create_reply_message refuses a request without CLUSTER (10007)",
+                code == Some(10007)
+                    && e.to_string().contains("property[CLUSTER] is null."),
+                &format!("code={code:?} err={e}"),
+            );
+        }
+    }
     let _ = no_cluster.get_topic();
     Ok(())
 }

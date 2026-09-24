@@ -1231,9 +1231,9 @@ async fn p5_request_reply(
     let err = p
         .request(&mut req, Some(REQUEST_TIMEOUT_MS), Some(&MessageQueue::new(topic, broker_name, 0)))
         .await
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .err();
+    let code = err.as_ref().and_then(|e| e.response_code());
+    let err = err.map(|e| e.to_string()).unwrap_or_default();
     let cid = req.get_property(PROPERTY_CORRELATION_ID).unwrap_or_default().to_string();
     let reply_to = req
         .get_property(PROPERTY_MESSAGE_REPLY_TO_CLIENT)
@@ -1252,6 +1252,15 @@ async fn p5_request_reply(
         "P5 with nobody answering, request() reports RequestTimeout (the request really was sent)",
         err.contains("wait reply message timeout"),
         &err,
+    );
+    // 光有类型和文案不够：Java 抛的是
+    // `RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)`，
+    // 10006 这个码也要在 —— 调用方按码分流时「没等到应答」（对方可能只是慢，
+    // 消息其实已投出去）和别的客户端故障不是一类处置。
+    ck.check(
+        "P5 the timeout carries 10006 REQUEST_TIMEOUT_EXCEPTION",
+        code == Some(10006),
+        &format!("code={code:?} err={err}"),
     );
     ck.check(
         "P5 the wait slot is removed again, so the table does not leak",

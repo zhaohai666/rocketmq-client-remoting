@@ -27,10 +27,15 @@ namespace RocketMQ.Client;
 /// <summary>
 /// 对应 Java RequestTimeoutException：请求已发出但超时没收到应答。必须继承
 /// MQClientException（Java 中 RequestTimeoutException extends MQClientException）。
+///
+/// Java 抛的是 <c>RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, msg)</c>：
+/// 光有类型不够，10006 这个码也要带上 —— 调用方按 ResponseCode 分流时才知道
+/// "消息已经投出去了，只是没等到应答"（对方可能只是慢），这跟发送本身失败是两类处置。
 /// </summary>
 public class RequestTimeoutException : MQClientException
 {
-    public RequestTimeoutException(string msg) : base(msg)
+    public RequestTimeoutException(string msg)
+        : base(msg, ClientErrorCode.RequestTimeoutException)
     {
     }
 }
@@ -210,12 +215,17 @@ public static class RequestReply
     /// CLUSTER 属性由 broker 在投递时写入（SendMessageProcessor），拿不到就说明这条消息
     /// 不是经 broker 转发过来的（或 topic 配得不对），与 Java 一样直接抛错，而不是造一条
     /// 投不出去的应答。
+    ///
+    /// Java 抛的是 <c>MQClientException(ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION, 同样的文案)</c>
+    /// （<c>MessageUtil:46/49</c>）：应答方通常写在业务 listener 里，按 ResponseCode 分流
+    /// 才能把"这条请求不能回话"和别的本地错误分开。
     /// </summary>
     public static Message CreateReplyMessage(Message requestMessage, byte[] body)
     {
         if (requestMessage is null)
         {
-            throw new MQClientException("create reply message fail, requestMessage cannot be null");
+            throw new MQClientException("create reply message fail, requestMessage cannot be null.",
+                ClientErrorCode.CreateReplyMessageException);
         }
 
         string cluster = requestMessage.GetProperty(MessageConst.PropertyCluster);
@@ -223,7 +233,7 @@ public static class RequestReply
         {
             throw new MQClientException(
                 "create reply message fail, requestMessage error, property[" + MessageConst.PropertyCluster
-                + "] is null.");
+                + "] is null.", ClientErrorCode.CreateReplyMessageException);
         }
 
         var reply = new Message

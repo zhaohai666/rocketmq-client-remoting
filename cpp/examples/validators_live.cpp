@@ -3,6 +3,7 @@
 //
 // 与 python/verify_validators_live.py、rust/examples/live_validators.rs 同场景对拍：
 // 四语言要拿同一份断言证明「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。
+// （编号有偏移：Python 那份把寻址故障那一腿编在 S7，本份里是 S8。）
 //
 // 前置：NameServer + Broker 已起（普通配置，不需要 ACL/TLS/trace）。
 //
@@ -16,6 +17,8 @@
 //      比本地拒慢一个数量级以上 —— 这条量化了「本地校验省掉的是什么」
 //   S6 pull / lite 的组名门 + 合法 pull 组能查到队列与位点
 //   S7 createTopic 的本地拒（空白 / 非法字符 / 系统 topic）
+//   S8 寻址故障（10004 一个 name server 地址都没有）不能被说成"topic 没路由"（10005）；
+//      地址配了只是连不上（10005）与地址压根没配（10004）是两件事，排障方向完全不同
 //
 // 码值口径（四语言一致，见 validators.h 注释）：Java 的 MQClientException(String, Throwable)
 // 用 responseCode=-1 表示「纯客户端错误」；本项目（Python 先定、其余照抄）用
@@ -33,12 +36,14 @@
 #include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/lite_pull_consumer.h"
+#include "rocketmq/client/mq_client.h"
 #include "rocketmq/client/producer.h"
 #include "rocketmq/client/pull_consumer.h"
 #include "rocketmq/client/validators.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/mix_all.h"
+#include "rocketmq/common/top_addressing.h"
 #include "rocketmq/remoting/protocol/codes.h"
 
 using namespace rocketmq;
@@ -441,6 +446,80 @@ void s7_createTopicRejects(DefaultMQProducer& p) {
                       "The specified topic is blank", ResponseCode::SYSTEM_ERROR);
 }
 
+// ---------------------------------------------------------------- S8 寻址故障
+
+/// 本机上一个没人监听的端口：地址「配了但连不上」，用来和「压根没配」区分开。
+std::string deadAddress() { return "127.0.0.1:19876"; }
+
+/// 路由漏斗（对应 Java DefaultMQProducerImpl#tryToFindTopicPublishInfo）在生产者里是
+/// protected，这里只为让真机用例能直接驱动那一条分支。漏斗的第一个参数就是
+/// MQClientInstance，所以能拿任意一个实例（哪怕是零地址那一个）走同一段代码。
+struct RouteFunnelProbe : public DefaultMQProducer {
+    explicit RouteFunnelProbe(const std::string& group) : DefaultMQProducer(group) {}
+    using DefaultMQProducer::topicPublishInfo;
+};
+
+void s8_nameServerAddressing(DefaultMQProducer& p, const std::string& topic) {
+    std::printf("== S8 寻址故障（10004）与「topic 没路由」（10005）的分界 ==\n");
+    RouteFunnelProbe funnel("GID_validators_live_funnel");
+
+    // S8a：一个地址都没有。Java 的 validateNameServerSetting（:729）读的是**配置**，
+    // 所以必须在不碰网络的前提下就地判 10004，文案指向寻址（Java 原文）。
+    MQClientInstance noAddr("validators_live_noaddr", std::vector<std::string>{});
+    expectLocalReject("S8a 零地址时漏斗报 10004 NO_NAME_SERVER（不是 10005）",
+                      [&] { funnel.topicPublishInfo(noAddr, topic); },
+                      "No name server address, please set it.",
+                      ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
+
+    // S8b/S8c：地址配了、只是连不上 —— 这一档 Java 给的是「没路由」，不能冒充寻址故障，
+    // 否则配错端口的人会去查建 topic 和权限，而真正坏的只是那一行地址。
+    MQClientInstance deadAddr("validators_live_deadaddr",
+                              std::vector<std::string>{deadAddress()});
+    Captured f = capture([&] { funnel.topicPublishInfo(deadAddr, topic); });
+    check("S8b 地址连不上时漏斗不冒充 10004（判的是配置，不是可达性）",
+          f.threw && f.code != ClientErrorCode::NO_NAME_SERVER_EXCEPTION &&
+              startsWith(f.what, "Can not find Message Queue for topic"),
+          f.threw ? f.what + "  code=" + std::to_string(f.code) : std::string("没有抛异常"));
+    {
+        // 端到端：同一条发送路径（同步发送的重试循环把漏斗异常定性成客户端错误码）
+        DefaultMQProducer mis("GID_validators_live_deadns_" + std::to_string(stamp()));
+        mis.setNamesrvAddr(deadAddress());
+        Captured started = capture([&] { mis.start(); });
+        if (started.threw) {
+            check("S8c 配了但连不上 → 发送定性 10005 NOT_FOUND_TOPIC", false,
+                  "start 先失败: " + started.what);
+        } else {
+            Captured s = capture([&] { mis.send(msg(topic, "dead-namesrv"), 3000); });
+            check("S8c 配了但连不上 → 发送定性 10005 NOT_FOUND_TOPIC（不是 10004）",
+                  s.threw && s.code == ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION,
+                  s.threw ? s.what + "  code=" + std::to_string(s.code) + "  " + ms(s.elapsedMs)
+                          : std::string("没有抛异常"));
+            mis.shutdown();
+        }
+    }
+
+    // S8d：本端口比 Java 严格——没配地址时在 start() 就先拦下来（Java 要等第一次发送
+    // 才由漏斗给 10004）。同一个故障只能有一种码，否则调用方得按两条路径分别处理。
+    // 配了动态取址（ROCKETMQ_NAMESRV_DOMAIN）时 start() 允许静态地址为空，跳过这一腿。
+    if (!DefaultTopAddressing::isConfigured()) {
+        DefaultMQProducer unaddressed("GID_validators_live_unaddressed");
+        Captured started = capture([&] { unaddressed.start(); });
+        check("S8d 完全没配 name server 时 start() 就报 10004，且不进 started 态",
+              started.threw && started.code == ClientErrorCode::NO_NAME_SERVER_EXCEPTION &&
+                  !unaddressed.isStarted() && started.elapsedMs < kLocalBudgetMs,
+              (started.threw ? started.what : std::string("没有抛异常")) +
+                  "  code=" + std::to_string(started.code) + "  " + ms(started.elapsedMs));
+    } else {
+        std::printf("  [skip] S8d：ROCKETMQ_NAMESRV_DOMAIN 已配，start() 允许静态地址为空\n");
+    }
+
+    // S8e：对照腿（真集群）——寻址正常时同一条 topic 照常 SEND_OK，
+    // 说明 S8a 挡的是寻址，而不是顺手把这条 topic 也判死了。
+    Captured ok = capture([&] { p.send(msg(topic, "addressing-fine"), 5000); });
+    check("S8e 对照：真集群上寻址正常，同一条 topic 照常 SEND_OK", !ok.threw,
+          ok.threw ? ok.what : std::string("SEND_OK"));
+}
+
 void report() {
     std::printf("############ PASS=%d FAIL=%d ############\n", gPass, gFail);
 }
@@ -488,6 +567,7 @@ int main(int argc, char* argv[]) {
     if (routed) {
         s4_positiveLeg(p, topic, group, prefix);
         s6_consumerGates(topic);
+        s8_nameServerAddressing(p, topic);
     }
     s5_controlLeg(p, localMs);
     s7_createTopicRejects(p);

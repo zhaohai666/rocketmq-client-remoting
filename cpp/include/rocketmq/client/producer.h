@@ -323,6 +323,15 @@ protected:
     // （COMPRESSED_FLAG | 压缩类型位）；不压缩时返回 0。
     int32_t prepareForSend(Message& msg) const;
 
+    // 对应 Java DefaultMQProducerImpl.tryToFindTopicPublishInfo（:875-911）：先拉**真实**路由，
+    // 拉不到才用默认 topic（TBW102）为本 topic 合成发布信息；两条路都没有时先跑
+    // validateNameServerSetting 再原样抛出 —— 见该函数注释。
+    std::shared_ptr<TopicPublishInfo> topicPublishInfo(MQClientInstance& client,
+                                                      const std::string& topic);
+    // 对应 Java DefaultMQProducerImpl.validateNameServerSetting（:729）：一个 name server
+    // 地址都没有 → 10004，别把寻址故障说成"这个 topic 没路由"。
+    void validateNameServerSetting(MQClientInstance& client);
+
     // ---------------- 轨迹 / 钩子内部实现 ----------------
     // 批量同步内核（sendBatch 两个重载与批量异步共用）：校验每条子消息 → 组批 → 压缩位 →
     // 选队列（pinned 非空则定点）→ sendWithHooks。

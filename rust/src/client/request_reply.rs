@@ -47,7 +47,7 @@ use crate::common::message_const::{
 };
 use crate::common::mix_all::MixAll;
 use crate::common::util_all;
-use crate::error::{Error, Result};
+use crate::error::{client_error_code, Error, Result};
 
 /// Java `RequestCallback` 的默认超时（`DefaultMQProducer.request` 未显式给超时时用）。
 pub const DEFAULT_REQUEST_TIMEOUT_MILLIS: i64 = 3000;
@@ -339,13 +339,20 @@ fn splitmix64(mut x: u64) -> u64 {
 /// `CLUSTER` 属性由 **broker** 在投递时写入（`SendMessageProcessor`），拿不到就说明
 /// 这条消息不是经 broker 转发过来的（或 topic 配得不对），与 Java 一样直接报错，
 /// 而不是造一条投不出去的应答。
+///
+/// 码值是 Java 的 `ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION`(10007)：应答方通常
+/// 写在业务 listener 里，按 `response_code` 分流才能把「这条请求不能回话」和别的本地错误
+/// 分开。Java 还有一个 `requestMessage == null` 的分支（同样 10007），Rust 的入参是
+/// `&Message`，空引用编译不过，所以那一档由类型系统兜住。
 pub fn create_reply_message(request_message: &Message, body: &[u8]) -> Result<Message> {
     let cluster = request_message.get_property(PROPERTY_CLUSTER).unwrap_or_default();
     if cluster.is_empty() {
-        crate::bail!(
-            "create reply message fail, requestMessage error, property[{}] is null.",
-            PROPERTY_CLUSTER
-        );
+        return Err(Error::client_with_code(
+            client_error_code::CREATE_REPLY_MESSAGE_EXCEPTION,
+            format!(
+                "create reply message fail, requestMessage error, property[{PROPERTY_CLUSTER}] is null."
+            ),
+        ));
     }
     let reply_topic = MixAll::get_reply_topic(cluster);
     let mut reply = Message::new(&reply_topic, Some(body));
@@ -406,7 +413,18 @@ mod tests {
     fn create_reply_message_requires_cluster() {
         let m = Message::new("RRUnitTopic", Some(b"ping"));
         let err = create_reply_message(&m, b"pong").unwrap_err();
-        assert!(err.to_string().contains("CLUSTER"), "got {err}");
+        // Java `MessageUtil:49` 抛的是带 10007 的 MQClientException，文案逐字一致：
+        // 应答 listener 在业务代码里，按码分流才能把「这条请求不能回话」和别的故障分开。
+        assert_eq!(
+            err.response_code(),
+            Some(client_error_code::CREATE_REPLY_MESSAGE_EXCEPTION),
+            "got {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "MQClientException(code=10007): create reply message fail, \
+             requestMessage error, property[CLUSTER] is null."
+        );
     }
 
     #[test]

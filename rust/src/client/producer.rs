@@ -1300,8 +1300,14 @@ impl DefaultMQProducer {
         }
         if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
             self.inner.started.store(false, Ordering::Release);
-            // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
-            return Err(Error::client("name server address is not set"));
+            // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用。
+            // 码值用 Java 的 10004（`validateNameServerSetting` 对同一个故障给的码）：
+            // Java 不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口
+            // 提前到 start（更可预期），但不能让调用方看到两种不同的码。
+            return Err(Error::client_with_code(
+                client_error_code::NO_NAME_SERVER_EXCEPTION,
+                "name server address is not set",
+            ));
         }
         // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
         // （非 CLIENT_INNER_PRODUCER 才做，本移植没有内部生产者所以无条件执行），再
@@ -1856,9 +1862,39 @@ impl DefaultMQProducer {
         client.register_topic_in_use(topic);
         match client.get_topic_publish_info(topic, false).await {
             Ok(info) => Ok(info),
-            Err(e) if retryable(&e) => client.get_topic_publish_info(topic, true).await,
+            Err(e) if retryable(&e) => match client.get_topic_publish_info(topic, true).await {
+                Ok(info) => Ok(info),
+                Err(e) => {
+                    // Java 的三条「拿不到路由」分支都先 validateNameServerSetting() 再抛
+                    // no-route：一个 name server 地址都没有（配了地址服务器却没返回地址
+                    // 也算）时报 10004，而不是把寻址故障说成「这个 topic 没路由」。
+                    self.validate_name_server_setting(client)?;
+                    Err(e)
+                }
+            },
             Err(e) => Err(e),
         }
+    }
+
+    /// 对应 Java `DefaultMQProducerImpl#validateNameServerSetting`（:729）。
+    ///
+    /// 只在「拿不到路由」这条分支上跑，把两种完全不同的故障分开：
+    /// * 压根一个 name server 地址都没有（配了地址服务器却没返回地址也算）
+    ///   → 10004 `No name server address, please set it.`
+    /// * 地址有、只是这个 topic 没路由 → 让原来那条异常照旧抛（调用方定性成 10005）。
+    ///
+    /// 少了这一步，用户把地址服务器配错拿到空列表，看到的却是「no route info of this
+    /// topic」——那是「topic 不存在」的意思，把人往建 topic 的方向查，而真正坏的是寻址。
+    /// 读的是 `name_server_addrs`（**配置**），不是「能不能连通」，所以配了但连不上时
+    /// 这一关必须闭嘴。Java 的文案后面拼了 `FAQUrl.suggestTodo(...)`，本仓库按约定不带后缀。
+    fn validate_name_server_setting(&self, client: &MQClientInstance) -> Result<()> {
+        if client.name_server_addrs().is_empty() {
+            return Err(Error::client_with_code(
+                client_error_code::NO_NAME_SERVER_EXCEPTION,
+                "No name server address, please set it.",
+            ));
+        }
+        Ok(())
     }
 
     /// Python `_need_addr`：broker 地址缺失时报错（oneway 路径没有「拿不到就不填」
@@ -2101,11 +2137,14 @@ impl DefaultMQProducer {
         // 对应 Java `sendDefaultImpl`：重试分类逐异常类型走，不用"啥都重试"糊过去。
         // 路由在循环**之外**只取一次；拿不到就立刻按 NOT_FOUND_TOPIC 定性，
         // 不把重试次数空转掉（Python `producer.py:665-670`）。
+        // 已经带码的（10004「没有 name server」，在漏斗里判的）原样透传 —— 那是两种
+        // 故障，覆盖成 10005 就白判了，排障方向也会被带偏。
         let publish = match self.topic_publish_info(&client, &topic).await {
             Ok(publish) => publish,
             Err(e @ Error::Client { .. }) => {
                 return Err(Error::client_with_code(
-                    client_error_code::NOT_FOUND_TOPIC_EXCEPTION,
+                    e.response_code()
+                        .unwrap_or(client_error_code::NOT_FOUND_TOPIC_EXCEPTION),
                     e.to_string(),
                 ))
             }
@@ -2713,10 +2752,12 @@ impl DefaultMQProducer {
                 let publish = match self.topic_publish_info(&client, &topic).await {
                     Ok(publish) => publish,
                     Err(e @ Error::Client { .. }) => {
+                        // 同同步发送：10004 原样透传，其余才按 10005 定性
                         return self.fail_async(
                             &callback,
                             Error::client_with_code(
-                                client_error_code::NOT_FOUND_TOPIC_EXCEPTION,
+                                e.response_code()
+                                    .unwrap_or(client_error_code::NOT_FOUND_TOPIC_EXCEPTION),
                                 e.to_string(),
                             ),
                             permits,

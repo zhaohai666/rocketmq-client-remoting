@@ -682,6 +682,29 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
+    /// <summary>
+    /// 异步链的定性不能和同步链分叉：一个 name server 地址都没有时，回调里拿到的也是
+    /// 10004 那条判定（Java 的 ASYNC 走的正是 sendDefaultImpl:888 的 validateNameServerSetting）。
+    /// 以前异步侧把异常重新包成 MQClientException 时会把码改写成 10005。
+    ///
+    /// 只能按文案断言：ISendCallback.OnException 收的是 string（Java 收 Throwable），
+    /// 码在跨过这条接口边界时就丢了 —— 那是 #78 的事，不属于本用例。
+    /// </summary>
+    [Fact]
+    public void NoNameServerAddress_Reports10004ThroughTheCallback()
+    {
+        using var cluster = MockCluster.Start(1, routeOk: false);
+        DefaultMQProducer producer = Started(cluster, "GID_async_no_namesrv");
+        ((List<string>)producer.Client().NameServerAddrs).Clear();
+
+        var cb = new Recorder();
+        producer.SendAsync(Msg(), cb, 3000);
+        Assert.True(cb.WaitDone(1, 3000));
+        Assert.Equal("No name server address, please set it.", cb.Errors()[0]);
+        Assert.Equal(0, cluster.Requests(0));
+        producer.Shutdown();
+    }
+
     /// <summary>并发的一批异步发送彼此不串台：每笔一个终态回调，且上线的 opaque 互不相同。</summary>
     [Fact]
     public void ConcurrentAsyncSends_NeverCrossTalk()

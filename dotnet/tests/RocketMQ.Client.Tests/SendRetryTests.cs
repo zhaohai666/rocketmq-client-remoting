@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
@@ -142,6 +143,73 @@ public class SendRetryTests
         // 一次 broker 都没联系过 —— 失败发生在选队列之前
         Assert.Equal(0, cluster.Requests(0));
         producer.Shutdown();
+    }
+
+    /// <summary>
+    /// Java <c>validateNameServerSetting</c>（DefaultMQProducerImpl:729）：一个 name server 地址
+    /// 都没有时报 10004，而不是把寻址故障说成"这个 topic 没路由"（10005）。
+    ///
+    /// 少了这一步，配错地址服务器的运维会去查 topic 存在不存在，方向完全错。
+    /// 这里在 Start 之后把实例的地址列表清空，模拟"跑着跑着地址没了"。
+    /// </summary>
+    [Fact]
+    public void NoNameServerAddress_Reports10004NotMissingRoute()
+    {
+        using var cluster = MockCluster.Start(1, routeOk: false);
+        DefaultMQProducer producer = Started(cluster, "GID_NoNamesrv");
+        // NameServerAddrs 暴露的是实例内部那个 List 本身，所以 Clear 就是改它
+        ((List<string>)producer.Client().NameServerAddrs).Clear();
+
+        MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg()));
+        Assert.Equal(ClientErrorCode.NoNameServerException, e.ResponseCode);
+        Assert.Equal("No name server address, please set it.", e.Message);
+        Assert.Equal(0, cluster.Requests(0));
+        producer.Shutdown();
+    }
+
+    /// <summary>
+    /// 对照分支：地址在、只是这个 topic 拉不到路由 → 10004 不能把 10005 顶掉。
+    /// 与 <see cref="MissingRoute_FailsFastWithNotFoundTopicCode"/> 同一条检查的两面。
+    /// </summary>
+    [Fact]
+    public void NameServerConfigured_KeepsThe10005NoRouteCode()
+    {
+        using var cluster = MockCluster.Start(1, routeOk: false);
+        DefaultMQProducer producer = Started(cluster, "GID_NamesrvOk");
+
+        MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg()));
+        Assert.Equal(ClientErrorCode.NotFoundTopicException, e.ResponseCode);
+        producer.Shutdown();
+    }
+
+    /// <summary>
+    /// client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java 一共七个常量，
+    /// 一个都不能少、一个都不能改值。10001~10005 是发送重试的定性；10006/10007 各有各的抛出点
+    /// （request-reply 超时、造应答消息失败），以前表里缺这两个，站点只能拿默认码 1 抛出去。
+    /// </summary>
+    [Fact]
+    public void ClientErrorCodeTable_MatchesJava()
+    {
+        var expected = new Dictionary<string, int>
+        {
+            ["ConnectBrokerException"] = 10001,
+            ["AccessBrokerTimeout"] = 10002,
+            ["BrokerNotExistException"] = 10003,
+            ["NoNameServerException"] = 10004,
+            ["NotFoundTopicException"] = 10005,
+            ["RequestTimeoutException"] = 10006,
+            ["CreateReplyMessageException"] = 10007,
+        };
+        var got = new Dictionary<string, int>();
+        foreach (FieldInfo f in typeof(ClientErrorCode).GetFields(BindingFlags.Public | BindingFlags.Static))
+        {
+            if (f.IsLiteral)
+            {
+                got[f.Name] = (int)f.GetRawConstantValue()!;
+            }
+        }
+
+        Assert.Equal(expected, got);
     }
 
     /// <summary>连不上 broker：定性成 CONNECT_BROKER_EXCEPTION(10001)，而不是原样冒泡。</summary>

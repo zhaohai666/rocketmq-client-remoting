@@ -182,7 +182,11 @@ void DefaultMQProducer::start() {
     }
     // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
     if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
-        throw MQClientException("name server address is not set");
+        // 码值用 Java 的 10004（validateNameServerSetting 对同一个故障给的码）：
+        // Java 不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口提前到
+        // start()（更可预期），但不能让调用方看到两种不同的码。
+        throw MQClientException("name server address is not set",
+                                ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
     // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
     // （Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，本端口没有内部生产者，所以无条件
@@ -554,6 +558,39 @@ void DefaultMQProducer::startTraceDispatcher() {
     }
 }
 
+// ---------------------------------------------------------------- 路由漏斗
+// 对应 Java DefaultMQProducerImpl#tryToFindTopicPublishInfo（:875-911）。Java 里三条
+// "拿不到路由"的分支（sendDefaultImpl:888 / sendSelectImpl:1366 / invokeMessageQueueSelector:716）
+// 都是同一个形状：先真实路由、失败才 isDefault=true、再失败先 validateNameServerSetting。
+// 本端口原来只在同步发送那一处做了两步，其余入口只调 isDefault=true 的那一次，
+// 于是 selector/oneway/batch/request/recall 五条链把"寻址坏了"和"这个 topic 没路由"
+// 混成同一条 "Can not find Message Queue for topic" —— 收口到这里，一处定义处处生效。
+std::shared_ptr<TopicPublishInfo> DefaultMQProducer::topicPublishInfo(MQClientInstance& c,
+                                                                     const std::string& topic) {
+    try {
+        return c.getTopicPublishInfo(topic, /*isDefault=*/false);
+    } catch (const MQClientException&) {
+        try {
+            return c.getTopicPublishInfo(topic, /*isDefault=*/true);
+        } catch (const MQClientException&) {
+            validateNameServerSetting(c);
+            throw;
+        }
+    }
+}
+
+// 对应 Java DefaultMQProducerImpl#validateNameServerSetting（:729）：读的是
+// MQClientAPIImpl#getNameServerAddressList，空列表 → 10004。
+// 少了这一步，用户把地址服务器配错（拿到空列表）看到的会是 "No route info of this topic"
+// ——那是"topic 不存在"的意思，把人往建 topic 的方向查，而真正坏的是寻址。
+// Java 的文案后面拼了 FAQUrl.suggestTodo(...)，本仓库按约定不带后缀。
+void DefaultMQProducer::validateNameServerSetting(MQClientInstance& c) {
+    if (c.nameServerAddrs().empty()) {
+        throw MQClientException("No name server address, please set it.",
+                                ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
+    }
+}
+
 // ---------------------------------------------------------------- 同步发送
 // 逐条对齐 Java DefaultMQProducerImpl#sendDefaultImpl：
 //   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
@@ -573,9 +610,12 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     // 与 Java 一致：整条重试链只用这一份发布信息，中途路由刷新不会换掉候选队列。
     std::shared_ptr<TopicPublishInfo> publish;
     try {
-        publish = c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+        publish = topicPublishInfo(c, outbound.topic);
     } catch (const MQClientException& e) {
-        throw MQClientException(e.what(), ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
+        // 已经定过性的 10004（压根没配 name server）必须原样透传，否则两种故障又糊成一条
+        throw MQClientException(e.what(), e.responseCode == ClientErrorCode::NO_NAME_SERVER_EXCEPTION
+                                               ? e.responseCode
+                                               : ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
     }
 
     const int32_t timesTotal = retryTimesWhenSendFailed_ + 1;
@@ -705,8 +745,7 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     checkMessage(msg);
     Message outbound = withNamespace(msg);
     ensureUniqId(outbound);
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = selector.select(publish->msgQueueList, outbound, arg);
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
     const int32_t sysFlag = prepareForSend(outbound);
@@ -983,9 +1022,12 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
     }
     // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉
     try {
-        state->publish = c.getTopicPublishInfo(state->msg.topic, /*isDefault=*/true);
+        state->publish = topicPublishInfo(c, state->msg.topic);
     } catch (const MQClientException& e) {
-        throw MQClientException(e.what(), ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
+        // 同 sendDefaultImpl：10004 不能被改写成 10005，异步链的定性和同步链不能分叉
+        throw MQClientException(e.what(), e.responseCode == ClientErrorCode::NO_NAME_SERVER_EXCEPTION
+                                               ? e.responseCode
+                                               : ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
     }
     // ASYNC 的 timesTotal 固定为 1：外层只跑一次，换 broker 全在 onSendException 里
     MessageQueue selected =
@@ -1201,8 +1243,7 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     MQClientInstance& c = client();
     checkMessage(msg);
     Message outbound = withNamespace(msg);
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
     const int32_t sysFlag = prepareForSend(outbound);
     // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效
@@ -1239,8 +1280,7 @@ Message DefaultMQProducer::request(const Message& msg, int32_t timeoutMillis) {
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : requestTimeoutMillis_;
     checkMessage(msg);
     Message outbound = withNamespace(msg);
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
     return requestWithQueue(outbound, selected, timeout);
 }
@@ -1269,7 +1309,7 @@ Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueu
     // 先确认路由已知，再补一次心跳：没在 broker 上登记为 producer，broker 就找不到
     // channel 把应答推回来（REPLY_TO_CLIENT 反查 ProducerManager 的 clientChannelTable）。
     try {
-        (void)c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+        (void)topicPublishInfo(c, outbound.topic);
         sendHeartbeatToAllBroker();
     } catch (const std::exception& e) {
         // 拿不到路由就让下面的发送路径自己报错
@@ -1371,8 +1411,7 @@ SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
     if (pinned != nullptr) {
         target = *pinned;
     } else {
-        std::shared_ptr<TopicPublishInfo> publish =
-            c.getTopicPublishInfo(batch.topic, /*isDefault=*/true);
+        std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, batch.topic);
         target = publish->selectOneMessageQueue();
     }
     // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
@@ -1577,8 +1616,7 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     outbound.putProperty(MessageConst::PROPERTY_PRODUCER_GROUP, producerGroup_);
     txListener_ = &listener;
 
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(outbound.topic, /*isDefault=*/true);
+    std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
 
     // 压缩与普通发送一致；再叠加事务类型位（Java sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
@@ -1657,8 +1695,7 @@ std::vector<MessageExt> DefaultMQProducer::queryMessage(const std::string& topic
 std::vector<MessageQueue> DefaultMQProducer::fetchPublishMessageQueues(const std::string& topic) {
     MQClientInstance& c = client();
     const std::string realTopic = namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
-    std::shared_ptr<TopicPublishInfo> publish =
-        c.getTopicPublishInfo(realTopic, /*isDefault=*/true);
+    std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, realTopic);
     return publish->msgQueueList;
 }
 
@@ -1692,7 +1729,7 @@ std::string DefaultMQProducer::recallMessage(const std::string& topic,
     // Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
     // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
     c.registerTopicInUse(realTopic);
-    (void)c.getTopicPublishInfo(realTopic, /*isDefault=*/true);
+    (void)topicPublishInfo(c, realTopic);
 
     // Java findBrokerAddressInPublish(brokerName) → 退化到 findBrokerAddrByTopic(topic)。
     std::string addr = c.brokerAddrOf(handle.brokerName);

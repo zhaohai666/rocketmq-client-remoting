@@ -74,7 +74,7 @@ use crate::common::mix_all::MixAll;
 use crate::common::sysflag::MessageSysFlag;
 use crate::common::topic_config::TopicFilterType;
 use crate::common::util_all::current_time_millis;
-use crate::error::{Error, Result};
+use crate::error::{client_error_code, Error, Result};
 use crate::remoting::client::{RemotingClient, RemotingClientConfig, RequestProcessor, ResponseSink};
 use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
@@ -1094,9 +1094,13 @@ impl MQClientInstance {
             if self.name_server_addrs().is_empty() {
                 let ws_addr = self.inner.top_addressing.lock().await.ws_addr().to_string();
                 self.shutdown_factory();
-                return Err(Error::client(format!(
-                    "name server address is not set and address server ({ws_addr}) returned none"
-                )));
+                // 码值用 Java 的 10004（validateNameServerSetting 对同一个故障给的码）：
+                // 本端口比 Java 严格，在 start 时就拦下来，但要让调用方看到同一个码 ——
+                // 别让「配了地址服务器却没返回地址」落到 no-route(10005) 那种误导文案上。
+                return Err(Error::client_with_code(
+                    client_error_code::NO_NAME_SERVER_EXCEPTION,
+                    format!("name server address is not set and address server ({ws_addr}) returned none"),
+                ));
             }
             // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
             self.spawn_periodic(
@@ -1366,7 +1370,13 @@ impl MQClientInstance {
     ) -> Result<bool> {
         let addrs = self.name_server_addrs();
         if addrs.is_empty() {
-            bail!("name server address list is empty");
+            // Java 这里只 log.warn 并返回 false，故障最终由生产者的
+            // ``validateNameServerSetting`` 以 10004 报出；本端口的路由拉取是拉不到就抛，
+            // 所以直接把同一个码带上 —— 一个地址都没有时不能报成「这个 topic 没路由」(10005)。
+            return Err(Error::client_with_code(
+                client_error_code::NO_NAME_SERVER_EXCEPTION,
+                "name server address list is empty",
+            ));
         }
         let mut route = self
             .fetch_topic_route_from_namesrv(topic, timeout_millis, &addrs)

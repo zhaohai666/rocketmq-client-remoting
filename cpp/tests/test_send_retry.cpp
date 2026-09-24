@@ -12,6 +12,8 @@
 //   4. sendMsgMaxTimeoutPerRequest：还剩重试机会时单次请求超时被压到该值（慢 broker 必须被换掉）；
 //   5. 总超时用尽 → RemotingTooMuchRequestException；
 //   6. 失败原因映射 ClientErrorCode：连不上→10001，broker 码→原码，无路由→10005；
+//   6b. 寻址故障与无路由的分界：一个 name server 地址都没有→10004（Java
+//       validateNameServerSetting），配了但连不上仍是 10005；
 //   7. 容错表分档：broker 错误码=隔离+不可达，传输异常=隔离但可达，成功=只记延迟。
 //   8. unitMode 上线：SEND_MESSAGE_V2 的单字母键 `k`。
 //   9. 请求钩子上线：stream 的 `ReqT=0`、ACL 的 AccessKey/Signature，以及
@@ -676,6 +678,97 @@ void testErrorCodeMapping(MockEndpoint& mock) {
     }
 }
 
+// 6b. 寻址故障（10004）不能被说成"这个 topic 没路由"（10005）
+//
+// Java DefaultMQProducerImpl#validateNameServerSetting（:729）读的是
+// MQClientAPIImpl#getNameServerAddressList，空列表 → 10004。C++ 的 MQClientInstance
+// 一旦建好就没有"清空地址表"的公开口（updateNameServerAddressList 只接受非空，同 Java），
+// 所以这里直接把漏斗 topicPublishInfo 单独测：它是 protected，探针子类能拿到。
+namespace {
+struct RouteFunnelProbe : public DefaultMQProducer {
+    RouteFunnelProbe() : DefaultMQProducer("PG_funnel_probe") {}
+    using DefaultMQProducer::topicPublishInfo;
+    using DefaultMQProducer::validateNameServerSetting;
+};
+}  // namespace
+
+void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
+    RouteFunnelProbe probe;
+    {
+        // 一个地址都没有 → 10004，文案指向寻址（Java 原文）
+        MQClientInstance empty("PG_funnel_probe_client", std::vector<std::string>{});
+        int code = 0;
+        std::string msg;
+        try {
+            probe.topicPublishInfo(empty, "SendRetryNoNamesrv");
+        } catch (const MQClientException& e) {
+            code = e.getResponseCode();
+            msg = e.what();
+        } catch (const std::exception& e) {
+            msg = e.what();
+        }
+        expectInt(code, ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
+                  "empty name server list -> NO_NAME_SERVER_EXCEPTION(10004)");
+        expect(msg == "No name server address, please set it.",
+               "10004 keeps Java's wording", "msg=" + msg);
+    }
+    {
+        // 地址在、只是这个 topic 拉不到路由 → 10004 那道闸必须闭嘴，原异常照旧抛
+        // （调用方再按 10005 定性，见下面 producer 那一腿）
+        MQClientInstance hasAddr("PG_funnel_probe_dead",
+                                 std::vector<std::string>{deadAddress()});
+        int code = 0;
+        std::string msg;
+        try {
+            probe.topicPublishInfo(hasAddr, "SendRetryNoRoute");
+        } catch (const MQClientException& e) {
+            code = e.getResponseCode();
+            msg = e.what();
+        } catch (const std::exception& e) {
+            msg = e.what();
+        }
+        expect(code != ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
+               "configured (even unreachable) name server never reports 10004",
+               "code=" + std::to_string(code) + " msg=" + msg);
+        expect(msg.find("Can not find Message Queue for topic") == 0,
+               "no route keeps its own message", "msg=" + msg);
+    }
+    {
+        // 端到端：配了名字服务器但连不上 → 发送定性成 10005，不是 10004。
+        // Java 判的是"配置里有没有地址"，不是"地址能不能连通"，所以这一腿是 10004 的对照。
+        DefaultMQProducer p("PG_dead_namesrv");
+        p.setNamesrvAddr(deadAddress());
+        p.setRetryTimesWhenSendFailed(0);
+        p.start();
+        int code = 0;
+        try {
+            p.send(plainMessage("SendRetryDeadNamesrv"), 3000);
+        } catch (const MQClientException& e) {
+            code = e.getResponseCode();
+        } catch (const std::exception& e) {
+            std::printf("  wrong exception: %s\n", e.what());
+        }
+        expectInt(code, ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION,
+                  "dead-but-configured name server -> 10005, not 10004");
+        p.shutdown();
+    }
+    {
+        // start() 那道闸（本端口比 Java 提前，Java 要等第一次发送才报）也带同一个码
+        DefaultMQProducer p("PG_no_namesrv");
+        p.setNamesrvAddr("");
+        int code = 0;
+        try {
+            p.start();
+        } catch (const MQClientException& e) {
+            code = e.getResponseCode();
+        }
+        expectInt(code, ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
+                  "start() without any name server address -> 10004");
+        expect(!p.isStarted(), "failed start() leaves the producer unstarted");
+    }
+    (void)mock;
+}
+
 // 7. 容错表分档（Java updateFaultItem 的 isolation/reachable 组合）
 void testFaultItemFlags(MockEndpoint& mock) {
     const std::string deadTopic = "SendFaultConnect";
@@ -1048,6 +1141,8 @@ int main() {
     runCase("sendMsgMaxTimeoutPerRequest", mock, testSendMsgMaxTimeoutPerRequest);
     runCase("callTimeout", mock, testCallTimeout);
     runCase("errorCodeMapping", mock, testErrorCodeMapping);
+    runCase("noNameServerAddressQualifies10004", mock,
+            testNoNameServerAddressQualifies10004);
     runCase("faultItemFlags", mock, testFaultItemFlags);
     runCase("unitModeReachesWire", mock, testUnitModeReachesWire);
     runCase("sendHeaderFieldsReachWire", mock, testSendHeaderFieldsReachWire);

@@ -46,11 +46,16 @@ class _FakeClient:
     """MQClientInstance 替身：按脚本回放 SendResult / 异常，并记录每次的超时预算。"""
 
     def __init__(self, queues: List[MessageQueue], outcomes: Optional[list] = None,
-                 no_route: bool = False, first_send_sleep_ms: int = 0):
+                 no_route: bool = False, first_send_sleep_ms: int = 0,
+                 namesrv_addrs: Optional[List[str]] = None):
         self.publish = TopicPublishInfo()
         self.publish.msg_queue_list = list(queues)
         self.outcomes = list(outcomes or [])
         self.no_route = no_route
+        # MQClientInstance 真有这个字段（动态取址时它才是权威来源），
+        # validateNameServerSetting 读的就是它，替身少了会 AttributeError。
+        self.name_server_addrs = (["127.0.0.1:9876"] if namesrv_addrs is None
+                                  else list(namesrv_addrs))
         self.first_send_sleep_ms = first_send_sleep_ms
         self.sent: List[tuple] = []      # (mq, timeout)
 
@@ -96,7 +101,7 @@ class _FakeClient:
 
 def _producer(queues=None, outcomes=None, retry=2, no_route=False,
               first_send_sleep_ms=0, latency_fault=False, max_per_request=None,
-              retry_not_store_ok=None) -> DefaultMQProducer:
+              retry_not_store_ok=None, namesrv_addrs=None) -> DefaultMQProducer:
     p = DefaultMQProducer("GID_test")
     p.set_namesrv_addr("127.0.0.1:9876")
     p.set_retry_times_when_send_failed(retry)
@@ -107,7 +112,8 @@ def _producer(queues=None, outcomes=None, retry=2, no_route=False,
     if retry_not_store_ok is not None:
         p.set_retry_another_broker_when_not_store_ok(retry_not_store_ok)
     p._mq_client = _FakeClient([_mq("broker-a")] if queues is None else list(queues),
-                               outcomes, no_route, first_send_sleep_ms)
+                               outcomes, no_route, first_send_sleep_ms,
+                               namesrv_addrs=namesrv_addrs)
     p._started = True
     return p
 
@@ -136,6 +142,49 @@ def test_empty_publish_info_also_maps_to_not_found_topic():
         p.send(Message("TopicTest", b"x"))
     assert ei.value.response_code == ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION
     assert _client(p).sends == 0
+
+
+def test_no_name_server_address_reports_10004_not_missing_route():
+    """Java ``validateNameServerSetting``（DefaultMQProducerImpl:729）：一个地址都没有时报
+    10004，而不是把寻址故障说成"这个 topic 没路由"（10005）。
+
+    少了这一步，配错地址服务器的运维会去查 topic 存在不存在，方向完全错。
+    """
+    p = _producer(no_route=True, retry=2, namesrv_addrs=[])
+    with pytest.raises(MQClientException) as ei:
+        p.send(Message("TopicTest", b"x"))
+    assert ei.value.response_code == ClientErrorCode.NO_NAME_SERVER_EXCEPTION
+    assert str(ei.value) == "No name server address, please set it."
+    assert _client(p).sends == 0
+
+
+def test_name_server_configured_keeps_the_10005_no_route_code():
+    """有地址、只是这个 topic 没路由 → 10004 不能把 10005 顶掉（同一条检查的对照分支）。"""
+    p = _producer(no_route=True, retry=2, namesrv_addrs=["127.0.0.1:9876"])
+    with pytest.raises(MQClientException) as ei:
+        p.send(Message("TopicTest", b"x"))
+    assert ei.value.response_code == ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION
+
+
+# ---------------------------------------------------------------- 错误码表
+def test_client_error_code_table_matches_java():
+    """``client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java``
+    一共七个常量，一个都不能少、一个都不能改值。
+
+    10001~10005 是发送重试的定性；10006/10007 各有各的抛出点（request-reply 超时、
+    造应答消息失败），以前表里缺这两个，站点只能拿默认码 1/None 抛出去。
+    """
+    expected = {
+        "CONNECT_BROKER_EXCEPTION": 10001,
+        "ACCESS_BROKER_TIMEOUT": 10002,
+        "BROKER_NOT_EXIST_EXCEPTION": 10003,
+        "NO_NAME_SERVER_EXCEPTION": 10004,
+        "NOT_FOUND_TOPIC_EXCEPTION": 10005,
+        "REQUEST_TIMEOUT_EXCEPTION": 10006,
+        "CREATE_REPLY_MESSAGE_EXCEPTION": 10007,
+    }
+    got = {k: v for k, v in vars(ClientErrorCode).items() if k.isupper()}
+    assert got == expected
 
 
 # ---------------------------------------------------------------- 尝试次数

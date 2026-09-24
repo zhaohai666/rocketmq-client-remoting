@@ -108,11 +108,15 @@ class _FakeAsyncClient:
 
     def __init__(self, queues: List[MessageQueue], outcomes: Optional[list] = None,
                  no_route: bool = False, block: Optional[threading.Event] = None,
-                 route=None, cold_brokers=()):
+                 route=None, cold_brokers=(), namesrv_addrs: Optional[List[str]] = None):
         self.publish = TopicPublishInfo()
         self.publish.msg_queue_list = list(queues)
         self.outcomes = list(outcomes or [])
         self.no_route = no_route
+        # MQClientInstance 真有这个字段，validateNameServerSetting（拿不到路由时判断
+        # 是"压根没配 name server"还是"这个 topic 没路由"）读的就是它。
+        self.name_server_addrs = (["127.0.0.1:9876"] if namesrv_addrs is None
+                                  else list(namesrv_addrs))
         self.block = block
         # 路由表里查不到发布地址的 broker（对应 Java findBrokerAddressInPublish 返回 null）
         self.cold_brokers = set(cold_brokers)
@@ -211,7 +215,8 @@ class _RecordingHook:
 
 
 def _producer(queues=None, outcomes=None, async_retry=2, no_route=False,
-              block=None, queue_capacity=50000, route=None, cold_brokers=()) -> DefaultMQProducer:
+              block=None, queue_capacity=50000, route=None, cold_brokers=(),
+              namesrv_addrs=None) -> DefaultMQProducer:
     p = DefaultMQProducer("GID_async_test")
     p.set_namesrv_addr("127.0.0.1:9876")
     p.set_retry_times_when_send_failed(2)
@@ -221,7 +226,7 @@ def _producer(queues=None, outcomes=None, async_retry=2, no_route=False,
     p._create_async_executors()
     p._mq_client = _FakeAsyncClient(
         [_mq("broker-a", 0), _mq("broker-b", 1)] if queues is None else list(queues),
-        outcomes, no_route, block, route, cold_brokers)
+        outcomes, no_route, block, route, cold_brokers, namesrv_addrs=namesrv_addrs)
     p._started = True
     return p
 
@@ -585,6 +590,23 @@ def test_missing_route_reports_not_found_topic_through_callback():
     assert _client(p).attempts_count == 0
     assert isinstance(cb.errors[0], MQClientException)
     assert cb.errors[0].response_code == ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION
+
+
+def test_no_name_server_address_reaches_the_callback_as_10004():
+    """异步链的定性不能和同步链分叉：没有 name server 地址时回调里拿到的也得是 10004。
+
+    Java 的 ASYNC 走的正是 sendDefaultImpl 那条分支（:888 先 validateNameServerSetting
+    再抛 no-route），所以两条链共用同一个判定；异步侧以前把异常包成新的 MQClientException
+    时丢了码，10004 会被改写成 10005。
+    """
+    p = _producer(outcomes=[], no_route=True, queues=[], namesrv_addrs=[])
+    cb = _Callback()
+    p.send_async(Message("TopicTest", b"x"), cb, 3000)
+    _wait_done(cb)
+    assert _client(p).attempts_count == 0
+    assert isinstance(cb.errors[0], MQClientException)
+    assert cb.errors[0].response_code == ClientErrorCode.NO_NAME_SERVER_EXCEPTION
+    assert str(cb.errors[0]) == "No name server address, please set it."
 
 
 def test_batch_messages_fall_back_to_the_sync_batch_kernel():
@@ -1018,8 +1040,12 @@ def test_request_goes_through_the_same_gate_and_leaks_nothing():
 
     client.send_message_async = _capture      # type: ignore[assignment]
     # 应答通道本来就不存在（fake 客户端没有 326 推送），所以按 Java 语义抛等应答超时
-    with pytest.raises(RequestTimeoutException):
+    with pytest.raises(RequestTimeoutException) as ei:
         p.request(Message("TopicTest", b"q" * 30), 300)
+    # 类型之外还要带上 10006：调用方按 response_code 分流时，"消息已发出去、只是没等到
+    # 应答"和别的客户端故障不是一类处置（Java RequestTimeoutException(10006, ...)）。
+    assert ei.value.response_code == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION
+    assert "wait reply message timeout" in str(ei.value)
     assert delivered, "request() 应当走异步链"
     assert p.get_semaphore_async_send_num_available_permits() == 10
     assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE

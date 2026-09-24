@@ -18,9 +18,13 @@
 //   S2 请求消息确实带 CORRELATION_ID / REPLY_TO_CLIENT / TTL
 //   S3 Request() 拿回应答：body 正确、topic 是 <cluster>_REPLY_TOPIC、带 REPLY_MESSAGE_ARRIVE_TIME
 //   S4 应答确实走了 SEND_REPLY_MESSAGE_V2(325)：第三个客户端订阅 <cluster>_REPLY_TOPIC 能看到
-//   S5 无应答方时 Request() 在 timeout 附近抛 RequestTimeoutException（不卡死/不静默返回）
+//   S5 无应答方时 Request() 在 timeout 附近抛 RequestTimeoutException（不卡死/不静默返回），
+//      且异常带 10006 REQUEST_TIMEOUT_EXCEPTION（Java 抛的就是带码的那一个构造）
 //   S6 并发 3 个 request：每个拿到的都是自己的应答（CORRELATION_ID 不串台）
 //   S7 应答方（消费者）本身是普通 push 消费者：Reply 流量不影响后续普通消费
+//   S8 CLUSTER 属性由 broker 在存储时写入：投递到的那份有、客户端手里那份没有 ——
+//      这正是 MessageUtil.createReplyMessage 存在的意思；拿本地那份造应答必须撞上
+//      带 10007 CREATE_REPLY_MESSAGE_EXCEPTION 的 MQClientException，而不是别的错
 //
 // ⚠ 两个真机必踩点（与 Python 文档一致）：
 //   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**，客户端 createTopic 会被
@@ -121,6 +125,19 @@ public static class LiveRR
         private string? _firstCorr;
         private string? _firstReplyTo;
         private string? _firstTtl;
+        private MessageExt? _deliveredPing;
+
+        /// <summary>投递到的那条 "ping-1" 请求原文（S8 要用它验 broker 写的 CLUSTER）。</summary>
+        public MessageExt? DeliveredPing
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _deliveredPing;
+                }
+            }
+        }
 
         public ReplierListener(DefaultMQProducer producer) => _producer = producer;
 
@@ -189,6 +206,12 @@ public static class LiveRR
                 lock (_lock)
                 {
                     _received.Add(body);
+                    if (body == "ping-1")
+                    {
+                        // S8 要用**投递到的**那条原始消息验 CLUSTER 是 broker 补的
+                        _deliveredPing = m;
+                    }
+
                     if (!_gotFirst)
                     {
                         _gotFirst = true;
@@ -432,6 +455,13 @@ public static class LiveRR
             Check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
                 raised is RequestTimeoutException,
                 "raised=" + (raised?.GetType().Name ?? "null") + ": " + raised?.Message);
+            // Java 抛的是 RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)：
+            // 光有类型不够，调用方按 ResponseCode 分流时要知道"请求已经投出去了，只是没等到应答"
+            // （对方可能只是慢），这跟发送本身失败是两类处置。
+            Check("S5 异常带 10006 REQUEST_TIMEOUT_EXCEPTION",
+                raised is MQClientException mce
+                && mce.ResponseCode == ClientErrorCode.RequestTimeoutException,
+                "code=" + (raised as MQClientException)?.ResponseCode);
             Check("S5 超时时长接近设定值（2s ~ 12s，说明真的等了而不是立即失败）",
                 2000 <= elapsed && elapsed <= 12000, "elapsed=" + elapsed.ToString(CultureInfo.InvariantCulture) + "ms");
 
@@ -493,6 +523,60 @@ public static class LiveRR
             bool plainOk = WaitFor(() => replier.ReceivedBody("plain-after-replies"), 15000);
             Check("S7 后续普通消息仍被消费", plainOk,
                 "received=" + replier.ReceivedCount);
+
+            // ---------------- S8 CLUSTER 属性来自 broker；造不出应答时报 10007 ----------------
+            // Java MessageUtil.createReplyMessage（:46/49）抛的是
+            // MQClientException(ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION=10007, ...)。
+            // 这条既验"错误码带上了"，也验它**为什么**存在：CLUSTER 是 broker 存储时补的
+            // （SendMessageProcessor:318/614），客户端手里那份永远没有 ⇒ 应答必须建立在
+            // **投递到的**那条消息上，用错对象就撞上 10007。
+            Console.WriteLine();
+            Console.WriteLine("S8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错");
+            MessageExt? delivered = replier.DeliveredPing;
+            Check("S8 投递到的请求消息带 broker 写入的 CLUSTER=" + Cluster,
+                delivered?.GetProperty(MessageConst.PropertyCluster) == Cluster,
+                "cluster=" + delivered?.GetProperty(MessageConst.PropertyCluster));
+            // GetProperty 对不存在的键返回空串（不是 null），所以这里判"空"而不是"null"；
+            // 下面那条 10007 断言才是"这份确实没有 CLUSTER"的硬证据。
+            Check("S8 客户端手里那份请求消息**没有** CLUSTER（属性确实是 broker 补的）",
+                msg.GetProperty(MessageConst.PropertyCluster).Length == 0,
+                "value=\"" + msg.GetProperty(MessageConst.PropertyCluster) + "\"");
+
+            Exception? raised8 = null;
+            try
+            {
+                RequestReply.CreateReplyMessage(msg, Str2Bytes("pong"));
+            }
+            catch (Exception e)
+            {
+                raised8 = e;
+            }
+
+            Check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
+                raised8 is MQClientException c8
+                && c8.ResponseCode == ClientErrorCode.CreateReplyMessageException,
+                "raised=" + (raised8?.GetType().Name ?? "null") + " code="
+                + (raised8 as MQClientException)?.ResponseCode);
+            Check("S8 10007 的文案点到缺失的 CLUSTER 属性（Java 原文）",
+                raised8?.Message.Contains("property[" + MessageConst.PropertyCluster
+                                          + "] is null.") == true,
+                "msg=" + raised8?.Message);
+
+            Exception? raised8b = null;
+            try
+            {
+                RequestReply.CreateReplyMessage(null!, Str2Bytes("pong"));
+            }
+            catch (Exception e)
+            {
+                raised8b = e;
+            }
+
+            Check("S8 请求消息为 null → 同样是 10007（不是裸 NullReferenceException）",
+                raised8b is MQClientException c8b
+                && c8b.ResponseCode == ClientErrorCode.CreateReplyMessageException,
+                "raised=" + (raised8b?.GetType().Name ?? "null") + " code="
+                + (raised8b as MQClientException)?.ResponseCode);
         }
         finally
         {

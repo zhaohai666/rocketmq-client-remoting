@@ -22,6 +22,9 @@
   S4 正腿：合法 topic 建队列 + 起 push/lite 消费者 + 发送 SEND_OK + 两边都收到
   S5 对照腿：合法但不存在的 topic 本地放行、走完整集群链路，耗时比反腿高两个数量级
   S6 拉取消费者：DEFAULT_CONSUMER / 非法字符组名本地失败；合法组名能启动并查到位点
+  S7 寻址故障与"topic 没路由"的分界（Java ``validateNameServerSetting``）：一个 name server
+     地址都没有 → 10004「No name server address, please set it.」且亚毫秒本地失败；
+     地址恢复后同一条 topic 立刻 SEND_OK（对照腿，证明 S7a 判的是寻址而不是 topic）
 """
 from __future__ import annotations
 
@@ -38,7 +41,7 @@ from rocketmq.client.consumer import (
     SimpleMessageListener,
 )
 from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import MQClientException
+from rocketmq.client.exception import ClientErrorCode, MQClientException
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.client.send_result import SendStatus
 from rocketmq.common.message import Message
@@ -269,6 +272,45 @@ def main() -> int:
                 e = ex
             check("S6b %s 拒绝非法字符组名（本地）" % cls.__name__,
                   e is not None and "contains illegal characters" in str(e))
+
+        # ---------------- S7 寻址故障（10004）不能伪装成"topic 没路由"（10005）----------------
+        # Java ``DefaultMQProducerImpl#validateNameServerSetting``（:729）在三条"拿不到路由"
+        # 分支的最前面跑：一个 name server 地址都没有 → 10004「No name server address,
+        # please set it.」；地址在、只是这个 topic 查不到 → 才是 10005。
+        # 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是"这个 topic 不存在"，
+        # 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
+        print("=== S7 10004（没配 name server）vs 10005（topic 没路由）的分界 ===")
+        mis = DefaultMQProducer("GID_ValidatorsLive_%d_addr" % STAMP)
+        mis.set_namesrv_addr(NAMESRV)
+        mis.start()
+        try:
+            addr_client = mis._require_client()
+            saved_addrs = list(addr_client.name_server_addrs)
+            # 一个活着的 producer、一条**已存在**的 topic：唯一坏掉的就是寻址表空了。
+            # 这正是地址服务器返回空列表后本端实例的状态（``update_name_server_address_list``
+            # 只在非空时应用，所以空表只会来自"压根没取到地址"这一种故障）。
+            addr_client.name_server_addrs = []
+            began = time.monotonic()
+            try:
+                mis.send(Message(TOPIC, b"no-name-server"))
+                e = None
+            except MQClientException as ex:
+                e = ex
+            elapsed_ms = (time.monotonic() - began) * 1000.0
+            check("S7a 一个地址都没有时报 10004 NO_NAME_SERVER_EXCEPTION（不是 10005）",
+                  e is not None
+                  and e.response_code == ClientErrorCode.NO_NAME_SERVER_EXCEPTION,
+                  "code=%s msg=%s" % (getattr(e, "response_code", None), e))
+            check("S7b 文案是 Java 的「No name server address, please set it.」（指向寻址）",
+                  str(e) == "No name server address, please set it.", "msg=%s" % e)
+            check("S7c 失败发生在本地判定，没有把重试预算空转掉（<%gms）" % LOCAL_BUDGET_MS,
+                  elapsed_ms < LOCAL_BUDGET_MS, "elapsed=%.2fms" % elapsed_ms)
+            addr_client.name_server_addrs = saved_addrs
+            r = mis.send(Message(TOPIC, b"name-server-back"))
+            check("S7d 对照：地址恢复后同一条 topic 立刻 SEND_OK（说明 S7a 判的是寻址，不是 topic）",
+                  r.send_status == SendStatus.SEND_OK, "status=%s" % r.send_status)
+        finally:
+            mis.shutdown()
 
         # 正腿：合法组名的 pull 消费者不光能启动，还能真查位点（走的是 broker RPC）
         pull_ok = DefaultMQPullConsumer(GROUP + "_pull_ok")

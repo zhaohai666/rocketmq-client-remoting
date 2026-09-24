@@ -18,6 +18,9 @@
 //! - V6 正腿：合法 topic 建队列 + 发送 SEND_OK，lite 消费者 poll 收全、pull 查得到位点。
 //! - V7 对照腿：合法但**不存在**的 topic 本地放行、走完整集群链路，耗时比反腿高两个数量级
 //!   —— 差值就是本地校验省掉的空转。
+//! - V8 寻址故障：没配 name server（或地址服务器没返回地址）是 10004「No name server
+//!   address, please set it.」，地址配了只是连不上不算 —— 判的是**配置**，不是可达性。
+//!   把寻址坏说成「这个 topic 没路由」，排障方向会整个反过来。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -29,15 +32,17 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::consumer::DefaultMQPushConsumer;
+use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::pull_consumer::{
     DefaultLitePullConsumer, DefaultMQPullConsumer,
 };
 use rocketmq_client_remoting::client::result::SendStatus;
+use rocketmq_client_remoting::client::top_addressing::DefaultTopAddressing;
 use rocketmq_client_remoting::common::message::{Message, MessageExt};
 use rocketmq_client_remoting::common::message_const::PROPERTY_INNER_MULTI_DISPATCH;
 use rocketmq_client_remoting::common::mix_all::MixAll;
-use rocketmq_client_remoting::error::Error;
+use rocketmq_client_remoting::error::{client_error_code, Error};
 
 /// 本地反腿的耗时上界（毫秒）：纯本地计算，真机给 50ms 已经留了两个数量级的余量。
 const LOCAL_BUDGET_MS: f64 = 50.0;
@@ -516,6 +521,110 @@ async fn v7_control_leg(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str, lo
     );
 }
 
+// ---------------------------------------------------------------------- V8
+
+/// 寻址故障（10004）与「topic 没路由」（10005）的分界。
+///
+/// Java `DefaultMQProducerImpl#validateNameServerSetting`（:729）在三条「拿不到路由」
+/// 分支的最前面跑，读的是**配置**：一个 name server 地址都没有时报 10004「No name server
+/// address, please set it.」；地址在、只是这个 topic 查不到才是 10005。
+/// 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是「这个 topic 没路由」，
+/// 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
+async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str) {
+    println!("== V8 寻址故障（10004）与「topic 没路由」（10005）的分界 ==");
+
+    // V8a：完全没配寻址 → start() 就地拦下（本端口比 Java 严格：Java 要等第一次发送
+    // 才由漏斗报 10004），码值同样是 10004 —— 同一个故障只能有一种码。
+    if DefaultTopAddressing::is_configured() {
+        println!("   (skip V8a：ROCKETMQ_NAMESRV_DOMAIN 已配，start() 允许静态地址为空)");
+    } else {
+        let bare = match DefaultMQProducer::new(&format!("rust-live-validators-noaddr-{stamp}")) {
+            Ok(p) => p,
+            Err(e) => {
+                ck.check("V8a producer 构造", false, &e.to_string());
+                return;
+            }
+        };
+        let began = Instant::now();
+        let err = bare.start().await.err();
+        let ms = elapsed_ms(began);
+        let code = err.as_ref().and_then(|e| e.response_code());
+        ck.check(
+            "V8a 没配 name server 时 start() 报 10004，且不留 started 态",
+            code == Some(client_error_code::NO_NAME_SERVER_EXCEPTION)
+                && !bare.is_started()
+                && ms < LOCAL_BUDGET_MS,
+            &format!(
+                "code={code:?} started={} {ms:.2}ms err={:?}",
+                bare.is_started(),
+                err.map(|e| e.to_string())
+            ),
+        );
+    }
+
+    // V8b：实例级：一个地址都没有时，路由接口给的是 10004，而不是「找不到这个 topic 的队列」
+    // （10005 的文案）。这是漏斗里 `validate_name_server_setting` 读的那份配置。
+    let no_addr_client = MQClientInstance::new(&format!("rust-live-validators-noaddr-c-{stamp}"), Vec::new());
+    let err = no_addr_client.get_topic_publish_info("V8NoAddrTopic", false).await.err();
+    let code = err.as_ref().and_then(|e| e.response_code());
+    ck.check(
+        "V8b 零地址实例查路由报 10004（不是「topic 没队列」）",
+        code == Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
+        &format!("code={code:?} err={:?}", err.map(|e| e.to_string())),
+    );
+    no_addr_client.shutdown();
+
+    // V8c：地址配了、只是连不上（本机一个刚释放的端口）⇒ 10004 那道闸必须闭嘴：
+    // 判的是「配置里有没有地址」，不是「地址能不能连通」。
+    let dead = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+        Err(e) => {
+            ck.check("V8c bind dead port", false, &e.to_string());
+            String::new()
+        }
+    };
+    if !dead.is_empty() {
+        let mis = match DefaultMQProducer::new(&format!("rust-live-validators-deadns-{stamp}")) {
+            Ok(p) => p,
+            Err(e) => {
+                ck.check("V8c producer 构造", false, &e.to_string());
+                return;
+            }
+        };
+        mis.set_namesrv_addr(&dead);
+        match mis.start().await {
+            Err(e) => ck.check("V8c start 不查可达性，不该失败", false, &e.to_string()),
+            Ok(()) => {
+                let began = Instant::now();
+                let mut m = message("V8DeadNamesrvTopic", b"x");
+                let err = mis.send(&mut m, Some(3000), None).await.err();
+                let ms = elapsed_ms(began);
+                let code = err.as_ref().and_then(|e| e.response_code());
+                ck.check(
+                    "V8c 地址连不上时不冒充 10004（判的是配置，不是可达性）",
+                    code != Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
+                    &format!("code={code:?} {ms:.1}ms err={:?}", err.map(|e| e.to_string())),
+                );
+                mis.shutdown();
+            }
+        }
+    }
+
+    // V8d：对照腿（真集群）——寻址正常时照常 SEND_OK，说明上面挡的是寻址，
+    // 而不是顺手把 topic 判死了。
+    let mut m = message(&format!("RustLiveValidatorsAddr{stamp}"), b"addressing-ok");
+    let began = Instant::now();
+    let r = p.send(&mut m, Some(5000), None).await;
+    let ms = elapsed_ms(began);
+    let ok = r.is_ok();
+    let text = r.err().map(|e| e.to_string()).unwrap_or_default();
+    ck.check(
+        "V8d 对照：真集群上同一条发送链路照常 SEND_OK",
+        ok,
+        &format!("{text} in {ms:.1}ms"),
+    );
+}
+
 async fn run(namesrv: &str) -> Checker {
     let mut ck = Checker::new();
     let stamp = stamp();
@@ -539,6 +648,7 @@ async fn run(namesrv: &str) -> Checker {
     v5_admin_negatives(&mut ck, &p).await;
     v6_positive(&mut ck, &p, namesrv, &stamp).await;
     v7_control_leg(&mut ck, &p, &stamp, local_ms).await;
+    v8_name_server_addressing(&mut ck, &p, &stamp).await;
     p.shutdown();
     ck
 }

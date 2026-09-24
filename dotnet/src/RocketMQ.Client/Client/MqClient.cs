@@ -336,8 +336,12 @@ public sealed class MQClientInstance : IDisposable
             FetchNameServerAddr();
             if (_nameServerAddrs.Count == 0)
             {
+                // Java 在这一步不报错（MQClientInstance.start 只 fetch 一次，取不到照样启动），
+                // 故障要等第一次发送才以 validateNameServerSetting 的 10004 冒出来；本端口在
+                // Start 时就失败（更可预期），码值仍用同一条 10004。
                 throw new MQClientException("name server address is not set and address server ("
-                    + TopAddressing.WsAddr + ") returned none");
+                    + TopAddressing.WsAddr + ") returned none",
+                    ClientErrorCode.NoNameServerException);
             }
             // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
             if (_namesrvRefreshThread is null)
@@ -524,7 +528,11 @@ public sealed class MQClientInstance : IDisposable
     {
         if (_nameServerAddrs.Count == 0)
         {
-            throw new MQClientException("name server address list is empty");
+            // Java 这里只 log.warn 并返回 false，故障最终由生产者的 validateNameServerSetting
+            // 以 10004 报出；本端口的路由拉取是拉不到就抛，所以直接把同一个码带上 ——
+            // 一个地址都没有时不能报成"这个 topic 没路由"(10005)。
+            throw new MQClientException("name server address list is empty",
+                ClientErrorCode.NoNameServerException);
         }
 
         bool Fetch(string t, out TopicRouteData @out)

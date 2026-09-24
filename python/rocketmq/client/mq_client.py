@@ -60,7 +60,7 @@ from ..remoting.protocol.remoting_command import RemotingCommand
 from ..remoting.protocol.route import TopicRouteData
 from ..remoting.rpchook import StreamTypeRPCHook
 from .consumer_stats import ConsumerStatsManager
-from .exception import MQBrokerException, MQClientException
+from .exception import ClientErrorCode, MQBrokerException, MQClientException
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
 from .send_result import SendResult, SendStatus
 from .top_addressing import DefaultTopAddressing
@@ -422,9 +422,14 @@ class MQClientInstance:
         if dynamic_ns:
             self.fetch_name_server_addr()
             if not self.name_server_addrs:
+                # Java 在这一步不报错（``MQClientInstance.start`` 只是 fetch 一次，取不到
+                # 照样启动），故障要等到第一次发送才以 ``validateNameServerSetting`` 的
+                # 10004 冒出来；本端口在 start 时就失败（更可预期），码值仍用同一条 10004，
+                # 别让"配了地址服务器却没返回地址"落到 no-route(10005) 那种误导性文案上。
                 raise MQClientException(
                     "name server address is not set and address server (%s) returned none"
-                    % self.top_addressing.ws_addr)
+                    % self.top_addressing.ws_addr,
+                    ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
             # 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
             self._namesrv_refresh_stop.clear()
             t = threading.Thread(target=self._namesrv_refresh_loop, daemon=True,
@@ -539,7 +544,11 @@ class MQClientInstance:
         被合成出一组假队列，两个实例在不同时刻拉取会得到不同的队列数，rebalance 视图不一致。
         """
         if not self.name_server_addrs:
-            raise MQClientException("name server address list is empty")
+            # Java 这里只 log.warn 并返回 false，故障最终由生产者的
+            # ``validateNameServerSetting`` 以 10004 报出；本端口的路由拉取是拉不到就抛，
+            # 所以直接把同一个码带上 —— 一个地址都没有时不能报成"这个 topic 没路由"(10005)。
+            raise MQClientException("name server address list is empty",
+                                    ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
 
         def _fetch(t: str):
             request = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC, None)

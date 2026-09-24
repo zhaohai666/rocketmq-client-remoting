@@ -24,9 +24,15 @@
   S3 request() 拿回应答：body 正确、topic 是 <cluster>_REPLY_TOPIC、带 REPLY_MESSAGE_ARRIVE_TIME
   S4 应答确实走了 SEND_REPLY_MESSAGE_V2(325)：第三个客户端订阅 <cluster>_REPLY_TOPIC 能看到该消息
      （broker 的 storeReplyMessageEnable 默认 true，应答会落盘 → 可被独立订阅证明）
-  S5 无应答方时 request() 在 timeout 附近抛 RequestTimeoutException（而不是卡死/静默返回）
+  S5 无应答方时 request() 在 timeout 附近抛 RequestTimeoutException（而不是卡死/静默返回），
+     并且带上 Java 的 10006 ``REQUEST_TIMEOUT_EXCEPTION`` —— 只有类型没有码不够：调用方按
+     ``response_code`` 分流时，"消息已发出去、只是没等到应答"和别的客户端故障是两类处置
   S6 并发 3 个 request：每个拿到的都是自己的应答（CORRELATION_ID 不串台）
   S7 应答方（消费者）本身是普通 push 消费者：Reply 流量不影响后续普通消费
+  S8 CLUSTER 属性由 broker 在存储时写入（``SendMessageProcessor``）：投递到的消息有、
+     客户端手里那份没有 —— 这正是 ``MessageUtil.createReplyMessage`` 存在意义；用错对象
+     （拿本地那份发请求）必须撞上带 10007 ``CREATE_REPLY_MESSAGE_EXCEPTION`` 的
+     MQClientException，文案点到缺失的 CLUSTER，而不是裸 ValueError
 
 ⚠ 两个真机必踩点：
    1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**
@@ -46,7 +52,8 @@ sys.path.insert(0, ".")
 
 from rocketmq.client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
                                       SimpleMessageListener)
-from rocketmq.client.exception import RequestTimeoutException
+from rocketmq.client.exception import (ClientErrorCode, MQClientException,
+                                        RequestTimeoutException)
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.client.request_reply import create_reply_message
 from rocketmq.common.message import Message
@@ -143,6 +150,7 @@ class Replier:
 
     def __init__(self) -> None:
         self.received: list = []          # (body, correlation_id, reply_to, ttl)
+        self.delivered: list = []         # broker 投递的原始消息（S8 要用它验 CLUSTER）
         self.replied: list = []
         self.reply_errors: list = []
         self.lock = threading.Lock()
@@ -159,6 +167,7 @@ class Replier:
         for m in msgs:
             body = bytes(m.body)
             with self.lock:
+                self.delivered.append(m)
                 self.received.append((
                     body,
                     m.get_property(MessageConst.PROPERTY_CORRELATION_ID),
@@ -274,6 +283,12 @@ def main() -> int:
         check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
               isinstance(raised, RequestTimeoutException),
               "raised=%s: %s" % (type(raised).__name__, raised))
+        # 只有类型不够：Java 的 waitResponse 抛的是 RequestTimeoutException(10006, ...)，
+        # 调用方按 response_code 分流时才知道"消息已发出去、只是没等到应答"（对方可能只是慢），
+        # 这跟"发送本身失败"是两类处置。
+        check("S5 异常带上 Java 的 10006 REQUEST_TIMEOUT_EXCEPTION",
+              getattr(raised, "response_code", None) == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION,
+              "code=%s" % getattr(raised, "response_code", None))
         check("S5 超时时长接近设定值（2s ~ 12s，说明真的等了而不是立即失败）",
               2.0 <= elapsed <= 12.0, "elapsed=%.2fs" % elapsed)
 
@@ -310,6 +325,54 @@ def main() -> int:
                       15)
         check("S7 后续普通消息仍被消费", ok,
               "received=%s" % [b for b, _, _, _ in replier.received])
+
+        # ---------------- S8 CLUSTER 属性来自 broker；拿不到时是 10007 ----------------
+        # Java ``MessageUtil.createReplyMessage``（:46/49）抛的是
+        # ``MQClientException(ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION=10007, ...)``。
+        # 这一条既要验"错误码带上了"，也要验它**为什么**存在：CLUSTER 是 broker 在存储时
+        # 补的（``SendMessageProcessor``），客户端手里那份消息永远没有 —— 所以应答必须
+        # 建立在**投递到的**那条消息上，用错对象就会撞上 10007。
+        print("\nS8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错")
+        delivered = None
+        with replier.lock:
+            for m in replier.delivered:
+                if bytes(m.body) == b"ping-1":
+                    delivered = m
+                    break
+        check("S8 投递到的请求消息带 broker 写入的 CLUSTER=%s" % CLUSTER,
+              delivered is not None
+              and delivered.get_property(MessageConst.PROPERTY_CLUSTER) == CLUSTER,
+              "cluster=%s" % (delivered.get_property(MessageConst.PROPERTY_CLUSTER)
+                              if delivered else None))
+        check("S8 客户端手里那份请求消息**没有** CLUSTER（属性确实是 broker 补的）",
+              msg.get_property(MessageConst.PROPERTY_CLUSTER) is None,
+              "value=%s" % msg.get_property(MessageConst.PROPERTY_CLUSTER))
+        # 用错对象（拿本地那份发请求）→ 必须撞 10007，且文案指到 CLUSTER
+        raised8 = None
+        try:
+            create_reply_message(msg, b"pong")
+        except BaseException as e:  # noqa: BLE001
+            raised8 = e
+        check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
+              isinstance(raised8, MQClientException)
+              and raised8.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION,
+              "raised=%s code=%s" % (type(raised8).__name__ if raised8 else None,
+                                     getattr(raised8, "response_code", None)))
+        check("S8 10007 的文案点到缺失的 CLUSTER 属性（Java 原文）",
+              raised8 is not None
+              and "property[%s] is null." % MessageConst.PROPERTY_CLUSTER in str(raised8),
+              "msg=%s" % raised8)
+        raised8b = None
+        try:
+            create_reply_message(None, b"pong")
+        except BaseException as e:  # noqa: BLE001
+            raised8b = e
+        check("S8 请求消息为 None → 同样是 10007（不是裸 ValueError）",
+              isinstance(raised8b, MQClientException)
+              and raised8b.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION
+              and "requestMessage cannot be null." in str(raised8b),
+              "raised=%s code=%s msg=%s" % (type(raised8b).__name__ if raised8b else None,
+                                            getattr(raised8b, "response_code", None), raised8b))
     finally:
         requester.shutdown()
         replier.shutdown()

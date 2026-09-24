@@ -16,7 +16,8 @@ import threading
 
 import pytest
 
-from rocketmq.client.exception import MQClientException, RequestTimeoutException
+from rocketmq.client.exception import (ClientErrorCode, MQClientException,
+                                        RequestTimeoutException)
 from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.client.request_reply import (REQUEST_FUTURE_HOLDER, RequestFutureHolder,
                                             RequestResponseFuture, create_correlation_id,
@@ -57,13 +58,19 @@ def test_create_reply_message_matches_java_shape():
 
 
 def test_create_reply_message_requires_cluster():
-    # CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错
+    # CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错。
+    # 抛的是带 10007 的 MQClientException（MessageUtil:46/49），不是裸 ValueError：
+    # 应答方写在业务 listener 里时只能按 response_code 分流。
     m = Message(BASE_TOPIC, b"ping")
     m.put_property(MessageConst.PROPERTY_CORRELATION_ID, "corr-1")
-    with pytest.raises(ValueError):
+    with pytest.raises(MQClientException) as ei:
         create_reply_message(m, b"pong")
-    with pytest.raises(ValueError):
+    assert ei.value.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION
+    assert "property[%s] is null." % MessageConst.PROPERTY_CLUSTER in str(ei.value)
+    with pytest.raises(MQClientException) as ei:
         create_reply_message(None, b"pong")
+    assert ei.value.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION
+    assert "requestMessage cannot be null." in str(ei.value)
 
 
 def test_is_reply_message_flag():

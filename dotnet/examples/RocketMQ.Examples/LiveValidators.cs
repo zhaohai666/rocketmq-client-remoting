@@ -16,6 +16,7 @@
 //   S5 对照腿：合法但**不存在**的 topic 要走真往返（broker 自动建出来），比本地拒慢一个数量级
 //   S6 pull / lite 的组名门 + 合法 pull 组查队列与位点
 //   S7 CreateTopic 的本地拒（空白 / 非法字符 / 系统 topic）
+//   S8 寻址故障（10004 一个 name server 地址都没有）不能被说成"topic 没路由"（10005）
 //
 // 码值口径（四语言一致）：Java 的 MQClientException(String, Throwable) 用 responseCode=-1
 // 表示「纯客户端错误」；本工程（Python 先定、其余照抄）用 SystemError/UNKNOWN=1，
@@ -499,10 +500,73 @@ public static class LiveValidators
 
         S5ControlLeg(producer, localMs);
         S7CreateTopicRejects(producer);
+        if (routed)
+        {
+            // S8 要一条**已存在**的 topic：唯一坏掉的必须只有寻址表
+            S8NameServerAddressing(topic);
+        }
 
         producer.Shutdown();
         Report();
         return _fail == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// S8：寻址故障（10004）不能伪装成"topic 没路由"（10005）。
+    ///
+    /// Java <c>DefaultMQProducerImpl#validateNameServerSetting</c>（:729）在三条"拿不到路由"
+    /// 分支的最前面跑：一个 name server 地址都没有 → 10004「No name server address,
+    /// please set it.」；地址在、只是这个 topic 查不到 → 才是 10005。少了这一步，把地址
+    /// 服务器配错（或它返回空列表）的人看到的会是"这个 topic 不存在"，于是去查建 topic /
+    /// 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
+    /// </summary>
+    private static void S8NameServerAddressing(string topic)
+    {
+        Console.WriteLine("== S8 10004（没配 name server）vs 10005（topic 没路由）的分界 ==");
+        var p = new DefaultMQProducer("PID_ValidatorsLive_Addr")
+        {
+            NamesrvAddr = Namesrv,
+            InstanceName = "ValidatorsAddr",
+        };
+        p.Start();
+        try
+        {
+            // NameServerAddrs 返回的就是实例内部那个 List，所以 Clear 就是把它清空：
+            // 一个活着的 producer、一条**已存在**的 topic，唯一坏掉的是寻址表。
+            var addrs = (List<string>)p.Client().NameServerAddrs;
+            var saved = new List<string>(addrs);
+            addrs.Clear();
+
+            var sw = Stopwatch.StartNew();
+            MQClientException? e = null;
+            try
+            {
+                p.Send(new Message(topic, Bytes("no-name-server")));
+            }
+            catch (MQClientException ex)
+            {
+                e = ex;
+            }
+
+            double elapsedMs = sw.Elapsed.TotalMilliseconds;
+            Check("S8a 一个地址都没有时报 10004 NO_NAME_SERVER_EXCEPTION（不是 10005）",
+                e is not null && e.ResponseCode == ClientErrorCode.NoNameServerException,
+                "code=" + e?.ResponseCode + " msg=" + e?.Message);
+            Check("S8b 文案是 Java 的「No name server address, please set it.」（指向寻址）",
+                e?.Message == "No name server address, please set it.", "msg=" + e?.Message);
+            Check("S8c 失败发生在本地判定，没有把重试预算空转掉（<"
+                  + LocalBudgetMs.ToString(CultureInfo.InvariantCulture) + "ms）",
+                elapsedMs < LocalBudgetMs, "elapsed=" + elapsedMs.ToString("F2", CultureInfo.InvariantCulture) + "ms");
+
+            addrs.AddRange(saved);
+            SendResult r = p.Send(new Message(topic, Bytes("name-server-back")));
+            Check("S8d 对照：地址恢复后同一条 topic 立刻 SEND_OK（说明 S8a 判的是寻址，不是 topic）",
+                r.SendStatus == SendStatus.SendOk, "status=" + r.SendStatus);
+        }
+        finally
+        {
+            p.Shutdown();
+        }
     }
 
     private static void Report()

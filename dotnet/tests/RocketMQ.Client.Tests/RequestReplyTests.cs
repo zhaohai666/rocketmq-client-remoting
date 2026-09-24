@@ -56,10 +56,18 @@ public class RequestReplyTests
     public void CreateReplyMessageRequiresCluster()
     {
         // CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错
+        // Java MessageUtil.createReplyMessage 两个分支都带 10007 CREATE_REPLY_MESSAGE_EXCEPTION：
+        // 应答方写在业务 listener 里，只能按 responseCode 分流。
         var noCluster = new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("ping"));
         noCluster.PutProperty(MessageConst.PropertyCorrelationId, "corr-1");
-        Assert.Throws<MQClientException>(() => RequestReply.CreateReplyMessage(noCluster, System.Text.Encoding.UTF8.GetBytes("pong")));
-        Assert.Throws<MQClientException>(() => RequestReply.CreateReplyMessage(null!, System.Text.Encoding.UTF8.GetBytes("pong")));
+        Assert.Equal(ClientErrorCode.CreateReplyMessageException,
+            Assert.Throws<MQClientException>(
+                () => RequestReply.CreateReplyMessage(noCluster, System.Text.Encoding.UTF8.GetBytes("pong")))
+            .ResponseCode);
+        Assert.Equal(ClientErrorCode.CreateReplyMessageException,
+            Assert.Throws<MQClientException>(
+                    () => RequestReply.CreateReplyMessage(null!, System.Text.Encoding.UTF8.GetBytes("pong")))
+                .ResponseCode);
     }
 
     [Fact]
@@ -158,8 +166,12 @@ public class RequestReplyTests
     [Fact]
     public void RequestTimeoutExceptionIsMQClientException()
     {
-        // Java: RequestTimeoutException extends MQClientException
-        Assert.IsAssignableFrom<MQClientException>(new RequestTimeoutException("x"));
+        // Java: RequestTimeoutException extends MQClientException，
+        // 且 waitResponse 抛的是 RequestTimeoutException(10006, ...)：只有类型不够，
+        // 调用方按 ResponseCode 分流时要知道"消息已投出去、只是没等到应答"。
+        var e = new RequestTimeoutException("x");
+        Assert.IsAssignableFrom<MQClientException>(e);
+        Assert.Equal(ClientErrorCode.RequestTimeoutException, e.ResponseCode);
     }
 
     // ---------------------------------------------------------------- 线上编码

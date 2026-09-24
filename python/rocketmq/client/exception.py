@@ -6,11 +6,15 @@ from typing import Optional
 
 
 class ClientErrorCode:
-    """对应 org.apache.rocketmq.client.exception.ClientErrorCode。
+    """对应 org.apache.rocketmq.client.common.ClientErrorCode（七个常量，逐个齐全）。
 
     sendDefaultImpl 重试耗尽后用它给最终的 MQClientException 定性：
     连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
     地址服务器没给地址→10004，路由查不到→10005。
+    另两个不在重试定性里，各有各的抛出点：
+    * 10006 —— request-reply 等到点没等到应答（``DefaultMQProducerImpl#waitResponse``，
+      以及 Java ``RequestFutureHolder#scanExpiredRequest`` 的清理路径）。
+    * 10007 —— 由请求消息造应答消息失败（``MessageUtil#createReplyMessage``）。
     """
 
     CONNECT_BROKER_EXCEPTION = 10001
@@ -18,6 +22,8 @@ class ClientErrorCode:
     BROKER_NOT_EXIST_EXCEPTION = 10003
     NO_NAME_SERVER_EXCEPTION = 10004
     NOT_FOUND_TOPIC_EXCEPTION = 10005
+    REQUEST_TIMEOUT_EXCEPTION = 10006
+    CREATE_REPLY_MESSAGE_EXCEPTION = 10007
 
 
 class MQClientException(Exception):

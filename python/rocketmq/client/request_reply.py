@@ -37,6 +37,7 @@ from typing import Callable, Dict, Optional
 from ..common.message import Message
 from ..common.message_const import MessageConst
 from ..common.mix_all import MixAll
+from .exception import ClientErrorCode, MQClientException
 
 # 应答消息的请求码：MSG_TYPE == "reply" 时用这两个（Java MQClientAPIImpl.sendMessage）
 # 我们统一用 V2 头，所以取 SEND_REPLY_MESSAGE_V2。
@@ -159,14 +160,20 @@ def create_reply_message(request_message: Message, body: bytes) -> Message:
     ``CLUSTER`` 属性由 **broker** 在投递时写入（``SendMessageProcessor``），
     拿不到就说明这条消息不是经 broker 转发过来的（或 topic 配得不对），
     与 Java 一样直接抛错，而不是造一条投不出去的应答。
+
+    Java 抛的是 ``MQClientException(ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION, 同样的文案)``
+    （``MessageUtil:46/49``）而不是裸 ``ValueError``：应答方通常写在业务 listener 里，
+    按 ``response_code`` 分流才能把"这条请求不能回话"和别的本地错误分开。
     """
     if request_message is None:
-        raise ValueError("create reply message fail, requestMessage cannot be null.")
+        raise MQClientException("create reply message fail, requestMessage cannot be null.",
+                                ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION)
     cluster = request_message.get_property(MessageConst.PROPERTY_CLUSTER)
     if not cluster:
-        raise ValueError(
+        raise MQClientException(
             "create reply message fail, requestMessage error, property[%s] is null."
-            % MessageConst.PROPERTY_CLUSTER)
+            % MessageConst.PROPERTY_CLUSTER,
+            ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION)
     reply = Message()
     reply.topic = MixAll.get_reply_topic(cluster)
     reply.set_body(body)

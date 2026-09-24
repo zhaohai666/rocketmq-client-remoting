@@ -226,8 +226,11 @@ void MQClientInstance::start() {
     if (nameServerAddrs_.empty() && !topAddressing_.wsAddr().empty()) {
         fetchNameServerAddr();
         if (nameServerAddrs_.empty()) {
+            // 码值用 Java 的 10004（validateNameServerSetting 对同一故障给的码）：本端口比
+            // Java 严格，在 start() 就拦下来，但不能让调用方看到两种不同的码。
             throw MQClientException("name server address is not set and address server ("
-                                    + topAddressing_.wsAddr() + ") returned none");
+                                    + topAddressing_.wsAddr() + ") returned none",
+                                    ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
         }
         // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
         if (!namesrvRefreshThread_.joinable()) {
@@ -416,7 +419,11 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
                                                          int32_t timeoutMillis,
                                                          bool isDefault) {
     if (nameServerAddrs_.empty()) {
-        throw MQClientException("name server address list is empty");
+        // Java 这里只 log.warn 并返回 false，故障最终由生产者的 validateNameServerSetting
+        // 以 10004 报出；本端口的路由拉取是拉不到就抛，所以直接把同一个码带上 ——
+        // 一个地址都没有时不能报成"这个 topic 没路由"(10005)。
+        throw MQClientException("name server address list is empty",
+                                ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
 
     auto fetch = [&](const std::string& t, TopicRouteData& out) -> bool {

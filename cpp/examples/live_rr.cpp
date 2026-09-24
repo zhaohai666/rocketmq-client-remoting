@@ -1,4 +1,4 @@
-// Request-Reply（5.x）真机验证（与 python/verify_request_reply_live.py 的 S1–S7 同套场景）。
+// Request-Reply（5.x）真机验证（与 python/verify_request_reply_live.py 的 S1–S8 同套场景）。
 // 用法：rmq_live_rr 127.0.0.1:9876
 //
 // 链路：
@@ -9,6 +9,11 @@
 //                                                         → topic=<CLUSTER>_REPLY_TOPIC
 //                                                         → MSG_TYPE="reply"
 //     ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ◄─────      producer.send(reply) → 325
+//
+// 错误码两条硬断言（Java 同款，缺了就是两类故障糊成一条）：
+//   S5 无应答方 → RequestTimeoutException 带 10006 REQUEST_TIMEOUT_EXCEPTION；
+//   S8 拿客户端手里那份（没有 broker 写的 CLUSTER）造应答 → MQClientException 带
+//      10007 CREATE_REPLY_MESSAGE_EXCEPTION，文案点到缺失的 CLUSTER。
 //
 // ⚠ 两个真机必踩点：
 //   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**，客户端 createTopic 它
@@ -66,12 +71,14 @@ void prepareTopic(DefaultMQProducer& producer, const std::string& topic, int32_t
     std::this_thread::sleep_for(std::chrono::seconds(3));
 }
 
-// 应答方收到的请求记录：(body, correlationId, replyTo, ttl)
+// 应答方收到的请求记录：(body, correlationId, replyTo, ttl, cluster)
 struct RequestRecord {
     std::string body;
     std::string correlationId;
     std::string replyTo;
     std::string ttl;
+    // broker 在存储时补的 CLUSTER（S8 要用它证明应答必须建立在投递到的那份消息上）
+    std::string cluster;
 };
 
 // 应答方：普通 push 消费者 + 用来发应答的生产者（Java 文档里 Request-Reply 的标准写法）
@@ -109,7 +116,8 @@ private:
                 RequestRecord rec{bodyOf(m),
                                   m.getProperty(MessageConst::PROPERTY_CORRELATION_ID),
                                   m.getProperty(MessageConst::PROPERTY_MESSAGE_REPLY_TO_CLIENT),
-                                  m.getProperty(MessageConst::PROPERTY_MESSAGE_TTL)};
+                                  m.getProperty(MessageConst::PROPERTY_MESSAGE_TTL),
+                                  m.getProperty(MessageConst::PROPERTY_CLUSTER)};
                 try {
                     Message reply = createReplyMessage(m, "reply:" + m.body);
                     owner_->producer_.send(reply);
@@ -283,18 +291,25 @@ int main(int argc, char* argv[]) {
         prepareTopic(prep, silentTopic);
         const int64_t s5Begin = nowMs();
         bool raisedTimeout = false;
+        int32_t raisedCode = 0;
         std::string raisedWhat;
         try {
             Message silent(silentTopic, "nobody-home");
             requester.request(silent, 3000);
         } catch (const RequestTimeoutException& e) {
             raisedTimeout = true;
+            raisedCode = e.getResponseCode();
             raisedWhat = e.what();
         } catch (const std::exception& e) {
             raisedWhat = std::string("wrong exception: ") + e.what();
         }
         const int64_t s5Elapsed = nowMs() - s5Begin;
         check("S5 抛的是 RequestTimeoutException", raisedTimeout, raisedWhat);
+        // Java 抛的是 RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, msg)：
+        // 光有类型不够，10006 也要带上 —— 调用方按码分流时才知道"请求已投出去、只是没等到应答"。
+        check("S5 异常带 10006 REQUEST_TIMEOUT_EXCEPTION",
+              raisedCode == ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION,
+              "code=" + std::to_string(raisedCode));
         check("S5 超时时长接近设定值（2s~12s）", s5Elapsed >= 2000 && s5Elapsed <= 12000,
               "elapsedMs=" + std::to_string(s5Elapsed));
 
@@ -335,6 +350,41 @@ int main(int argc, char* argv[]) {
             },
             15000);
         check("S7 后续普通消息仍被消费", plain, "");
+
+        // ---------------- S8 CLUSTER 由 broker 写入；造不出应答时报 10007 ----------------
+        // Java MessageUtil.createReplyMessage（:46/49）抛的是
+        // MQClientException(CREATE_REPLY_MESSAGE_EXCEPTION=10007, ...)。这条既验"错误码带上了"，
+        // 也验它**为什么**存在：CLUSTER 是 broker 存储时补的（SendMessageProcessor:318/614），
+        // 客户端手里那份永远没有 ⇒ 应答必须建立在**投递到的**那条消息上，用错对象就撞上 10007。
+        std::printf("\nS8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错\n");
+        RequestRecord pingRec;
+        {
+            std::lock_guard<std::mutex> lk(replier.mtx);
+            for (const auto& r : replier.received) {
+                if (r.body == "ping-1") pingRec = r;
+            }
+        }
+        check("S8 投递到的请求消息带 broker 写入的 CLUSTER=DefaultCluster",
+              pingRec.cluster == "DefaultCluster", "cluster=" + pingRec.cluster);
+        check("S8 客户端手里那份请求消息**没有** CLUSTER（属性确实是 broker 补的）",
+              ping.getProperty(MessageConst::PROPERTY_CLUSTER).empty(),
+              "value=" + ping.getProperty(MessageConst::PROPERTY_CLUSTER));
+        int32_t replyCode = 0;
+        std::string replyWhat;
+        try {
+            createReplyMessage(ping, "pong");
+        } catch (const MQClientException& e) {
+            replyCode = e.getResponseCode();
+            replyWhat = e.what();
+        } catch (const std::exception& e) {
+            replyWhat = std::string("wrong exception: ") + e.what();
+        }
+        check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
+              replyCode == ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION,
+              "code=" + std::to_string(replyCode) + " what=" + replyWhat);
+        check("S8 10007 的文案点到缺失的 CLUSTER 属性（Java 原文）",
+              replyWhat.find("property[CLUSTER] is null.") != std::string::npos,
+              "what=" + replyWhat);
     } catch (const std::exception& e) {
         std::printf("  [FATAL] 场景执行异常: %s\n", e.what());
         ++gFail;

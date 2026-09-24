@@ -186,11 +186,16 @@ std::string createCorrelationId() {
 }
 
 Message createReplyMessage(const Message& requestMessage, const Bytes& body) {
+    // 对应 Java ``MessageUtil.createReplyMessage``。Java 签名是 ``throws MQClientException``
+    // 且带 10007：应答方通常写在业务 listener 里，按 responseCode 分流才能把"这条请求
+    // 回不了话"和别的本地故障分开。C++ 这边 requestMessage 是引用，"为 null" 那条分支
+    // 在类型上就不存在（调用方拿不到引用只能传值），所以只有 CLUSTER 缺失这一个入口。
     const std::string cluster = requestMessage.getProperty(MessageConst::PROPERTY_CLUSTER);
     if (cluster.empty()) {
         throw MQClientException(
             std::string("create reply message fail, requestMessage error, property[") +
-            MessageConst::PROPERTY_CLUSTER + "] is null.");
+            MessageConst::PROPERTY_CLUSTER + "] is null.",
+            ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION);
     }
     Message reply;
     reply.topic = MixAll::getReplyTopic(cluster);

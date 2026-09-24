@@ -99,21 +99,40 @@ int main() {
                "reply TTL echoed");
     }
     {
-        // CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错
+        // CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错，
+        // 而且抛的是带 10007 CREATE_REPLY_MESSAGE_EXCEPTION 的 MQClientException
+        // （MessageUtil.createReplyMessage:46/49）：应答方写在业务 listener 里，
+        // 只能按 responseCode 把"这条请求不能回话"和别的本地错误分开。
         Message noCluster(kTopic, Bytes{'x'});
         noCluster.putProperty(MessageConst::PROPERTY_CORRELATION_ID, "corr-1");
         bool threwNull = false, threwNoCluster = false;
+        int nullCode = 0, noClusterCode = 0;
+        std::string noClusterMsg;
+        const std::string kCreateReply10007 = "CREATE_REPLY_MESSAGE_EXCEPTION(10007)";
         try {
             createReplyMessage(Message(), Bytes{'p'});
-        } catch (const std::exception&) {
+        } catch (const MQClientException& e) {
             threwNull = true;
+            nullCode = e.getResponseCode();
+        } catch (const std::exception&) {
         }
         try {
             createReplyMessage(noCluster, Bytes{'p'});
-        } catch (const std::exception&) {
+        } catch (const MQClientException& e) {
             threwNoCluster = true;
+            noClusterCode = e.getResponseCode();
+            noClusterMsg = e.what();
+        } catch (const std::exception&) {
         }
         expect(threwNull && threwNoCluster, "createReplyMessage requires CLUSTER (and non-null)");
+        expect(noClusterCode == ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION,
+               "missing CLUSTER -> " + kCreateReply10007 + " (got "
+                   + std::to_string(noClusterCode) + ")");
+        expect(nullCode == ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION,
+               "empty request message -> " + kCreateReply10007 + " too (got "
+                   + std::to_string(nullCode) + ")");
+        expect(noClusterMsg.find("property[CLUSTER] is null.") != std::string::npos,
+               "10007 points at the missing CLUSTER property (Java wording): " + noClusterMsg);
     }
     {
         Message reply = createReplyMessage(requestMsg(), Bytes{'p'});

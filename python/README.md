@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 933 条单元/协议测试（929 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 937 条单元/协议测试（933 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -25,13 +25,13 @@ ROCKETMQ_JAVA_SRC=<...>/remoting/src/main/java/org/apache/rocketmq/remoting/prot
 
 ```bash
 python verify_message_types.py    # 7 类消息能力，18 PASS/0 FAIL（异步 9 项：不阻塞返回、线程口径、并发、定点、失败只走回调）
-python verify_request_reply_live.py # request-reply 全链路（16 PASS/0 FAIL）：325 落地、REPLY_TO_CLIENT=真实 clientId、超时/并发/普通消费不受影响
+python verify_request_reply_live.py # request-reply 全链路（22 PASS/0 FAIL）：325 落地、REPLY_TO_CLIENT=真实 clientId、超时/并发/普通消费不受影响；**错误码口径**：等应答超时带 Java 的 10006 `REQUEST_TIMEOUT_EXCEPTION`，`create_reply_message` 拿不到 broker 写的 `CLUSTER`/请求为 None 时带 10007 `CREATE_REPLY_MESSAGE_EXCEPTION`（文案逐字对 Java）
 python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（63 PASS/0 FAIL/1 SKIP）
 python verify_compression_live.py selftest   # 自动压缩自产自销 + broker 侧压缩体校验
 python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 探针跨客户端互通
 python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需 broker traceTopicEnable=true）
 python verify_hook_live.py        # CheckForbidden/FilterMessage 钩子（13 PASS/0 FAIL）
-python verify_validators_live.py  # 名字校验（24 PASS/0 FAIL）：非法 topic/group 本地快拒、合法名字照常收发、往返对照腿
+python verify_validators_live.py  # 名字校验（28 PASS/0 FAIL）：非法 topic/group 本地快拒、合法名字照常收发、往返对照腿；S7 寻址故障定性（一个地址都没配 ⇒ 10004 NO_NAME_SERVER_EXCEPTION + Java 原文案「No name server address, please set it.」，<50ms 本地判定不空转重试预算；对照组地址恢复后同一条 topic 立刻 SEND_OK，说明判的是寻址不是 topic）
 python verify_recall_live.py      # 定时消息撤回 recallMessage(370)（15 PASS/0 FAIL，脚本会打开并在退出时还原 broker 的 recallMessageEnable）
 python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）：clientId 后缀、broker 侧 topic 的 UNIT/UNIT_SUB 位、每笔请求的 ReqT
 python verify_lite_pull_live.py   # lite pull 全链路（61 PASS/0 FAIL）：rebalance/收 12 条/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）+ S3 **没人调 commit**、只继续 poll 过一整个自动提交周期（闸门只在 poll() 开头查）后 committed() 自己 >0 + **S8 三张位点表在真机各自数出来**（1 条队列的 topic 灌 1200 条：拉取游标 1200 / 已消费游标 -1 / broker 侧还查无提交（committed 回 -1）三个数互不相等 ⇒ 一次都没交付时把拉取游标提交上去就是静默丢消息；单次 poll 交 1024 ⇒ 落到 broker 的正是 1024 而不是 1200；commit(map) 改点位到 5 而两格游标都不动、退回的 176 条照旧交付、全程 1200 条不重不漏；persist=False 时 committed() 读到内存那格 777 而 broker 仍是 5；新实例的起点取 broker 上的 5 而不是另一个实例内存里的 777；seek 同时改两格游标；点名提交抹掉没点名的内存行（Java persistAll 的 remove unused mq）且清理不写 broker）

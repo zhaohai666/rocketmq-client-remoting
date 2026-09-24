@@ -570,7 +570,11 @@ public class DefaultMQProducer
             // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
             if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
             {
-                throw new MQClientException("name server address is not set");
+                // 码值用 Java 的 10004（validateNameServerSetting 对同一个故障给的码）：
+                // Java 不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口提前到
+                // Start（更可预期），但不能让调用方看到两种不同的码。
+                throw new MQClientException("name server address is not set",
+                    ClientErrorCode.NoNameServerException);
             }
 
             // 对应 Java DefaultMQProducerImpl.start()（:251）：非 inner 生产者无条件把默认的
@@ -876,7 +880,40 @@ public class DefaultMQProducer
         }
         catch (MQClientException)
         {
-            return c.GetTopicPublishInfo(topic, true);
+            try
+            {
+                return c.GetTopicPublishInfo(topic, true);
+            }
+            catch (MQClientException)
+            {
+                // Java 的三条「拿不到路由」分支（sendDefaultImpl:888 / sendSelectImpl:1366 /
+                // invokeMessageQueueSelector:716）都先 validateNameServerSetting() 再抛 no-route：
+                // 一个 name server 地址都没有（配了地址服务器却没返回地址也算）时报 10004，
+                // 而不是把寻址故障说成"这个 topic 没路由"。
+                ValidateNameServerSetting(c);
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>DefaultMQProducerImpl#validateNameServerSetting</c>（:729）。
+    ///
+    /// 只在「拿不到路由」这条分支上跑，把两种完全不同的故障分开：
+    /// <list type="bullet">
+    /// <item>压根一个 name server 地址都没有（配了地址服务器却没返回地址也算）→ 10004。</item>
+    /// <item>地址有、只是这个 topic 没路由 → 让调用方原来那条异常照旧抛（10005 等）。</item>
+    /// </list>
+    /// 少了这一步，用户把地址服务器配错拿到空列表，看到的却是 "No route info of this topic"
+    /// ——那是"topic 不存在"的意思，把人往建 topic 的方向查，而真正坏的是寻址。
+    /// Java 的文案后面拼了 <c>FAQUrl.suggestTodo(...)</c>，本仓库按约定不带后缀。
+    /// </summary>
+    private void ValidateNameServerSetting(MQClientInstance? c)
+    {
+        if (c is null || c.NameServerAddrs.Count == 0)
+        {
+            throw new MQClientException("No name server address, please set it.",
+                ClientErrorCode.NoNameServerException);
         }
     }
 
@@ -1124,7 +1161,13 @@ public class DefaultMQProducer
         }
         catch (MQClientException e)
         {
-            throw new MQClientException(e.Message, ClientErrorCode.NotFoundTopicException);
+            // 路由拿不到 → Java 在循环外就抛 10005，不会把重试次数空转掉；
+            // 但 TryToFindTopicPublishInfo 里已经定过性的 10004（压根没配 name server）
+            // 必须原样透传，否则两种故障又被糊成同一条。
+            throw new MQClientException(e.Message,
+                e.ResponseCode == ClientErrorCode.NoNameServerException
+                    ? e.ResponseCode
+                    : ClientErrorCode.NotFoundTopicException);
         }
 
         int timesTotal = _retryTimesWhenSendFailed + 1;
@@ -1475,7 +1518,13 @@ public class DefaultMQProducer
         }
         catch (MQClientException e)
         {
-            throw new MQClientException(e.Message, ClientErrorCode.NotFoundTopicException);
+            // 路由拿不到 → Java 在循环外就抛 10005，不会把重试次数空转掉；
+            // 但 TryToFindTopicPublishInfo 里已经定过性的 10004（压根没配 name server）
+            // 必须原样透传，否则两种故障又被糊成同一条。
+            throw new MQClientException(e.Message,
+                e.ResponseCode == ClientErrorCode.NoNameServerException
+                    ? e.ResponseCode
+                    : ClientErrorCode.NotFoundTopicException);
         }
 
         MessageQueue selected;

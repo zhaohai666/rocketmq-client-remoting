@@ -68,13 +68,13 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 37 个用例，3230 项断言（36 个测试二进制 3157 + interop 73），~45s
+cd build && ctest --output-on-failure     # 37 个用例，3248 项断言（36 个测试二进制 3175 + interop 73），~45s
 ```
 
 | 用例 | 断言 | 覆盖 |
 | --- | --- | --- |
 | `codec` | 65 | JSON / ROCKETMQ / `RemotingCommand` 两路 / 消息 17 段与 6 段 / header V1↔V2 / hashCode / CRC32 / msgId |
-| `java_alignment` | 32（带 `ROCKETMQ_JAVA_SRC` 为 38） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对 |
+| `java_alignment` | 40（带 `ROCKETMQ_JAVA_SRC` 为 53） | `codes.h` 常量守卫，设了环境变量后**读真实 Java 源码**逐条比对（含 `ClientErrorCode` 七个常量 10001..10007） |
 | `route_heartbeat` | 99 | 路由类往返 + 按 perm 过滤队列；`SubscriptionData` / `HeartbeatData` 往返 + **Java 字段名守卫** |
 | `transport` | 55 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、**GO_AWAY 重发（同步+异步、只重发一次、开关关掉不重连）**、地址解析 |
 | `fail_fast` | 19 | 对端断开时在途请求立刻判死（Java `NettyRemotingHandler#close` → `failFast` → `requestFail`）：真 socket 对端读完一帧就关 ⇒ 同步调用毫秒级抛 `RemotingSendRequestException`（不是等满超时才报 `RemotingTimeoutException`——异步发送的重试分类按异常**类型**分流）、异步回调**恰好一次**、按**连接对象身份**认领在途请求（别人家的请求不受牵连，同地址换新连接后的新请求也不被旧读线程误伤）、`shutdown` 把在途排空 |
@@ -82,9 +82,9 @@ cd build && ctest --output-on-failure     # 37 个用例，3230 项断言（36 �
 | `admin` | 159 | fastjson2 非法 JSON 容错、`ConsumeStatsList` 的 **Java 字段名 `consumeStatsList`**（键名错一个字符就静默解析成空列表）、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
 | `acl` | 56 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
-| `request_reply` | 37 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时 |
+| `request_reply` | 40 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时；**错误码口径**：等应答超时抛 `RemotingTimeoutException` 并带 Java 的 10006 `REQUEST_TIMEOUT_EXCEPTION`、`createReplyMessage` 造不出应答时带 10007 `CREATE_REPLY_MESSAGE_EXCEPTION`（文案点到缺失的 `CLUSTER` 属性） |
 | `latency` | 31 | 故障规避：延迟窗口滑窗统计、可用性判定、broker 隔离与恢复、`sendLatencyFaultEnable` 开关 |
-| `send_retry` | 68 | `sendDefaultImpl` 重试分类语义（进程内 mock 集群 + 真 socket）：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离；同一套抓包还取证明线上报文（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据）；**发送头那三个跟着路由/配置走的字段**同样抓真报文取证（用例 8a2）：默认 `c`=`TBW102`/`d`=4、`setCreateTopicKey`/`setDefaultTopicQueueNums` 之后二键换成配置值（旧实现写死，setter 是假的），`n` 取**路由选中的** broker 名，定点发送与批量 320 走同一份建头代码、三键都不能漏 |
+| `send_retry` | 75 | `sendDefaultImpl` 重试分类语义（进程内 mock 集群 + 真 socket）：可重试码换 broker、不可重试码立即抛、重试耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离；**寻址缺失报 10004 而不是 10005**（Java `validateNameServerSetting`：一个地址都没配 ⇒ `NO_NAME_SERVER_EXCEPTION` + Java 原文案，配了但连不上 ⇒ 码值不是 10004）；同一套抓包还取证明线上报文（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 的三级判据）；**发送头那三个跟着路由/配置走的字段**同样抓真报文取证（用例 8a2）：默认 `c`=`TBW102`/`d`=4、`setCreateTopicKey`/`setDefaultTopicQueueNums` 之后二键换成配置值（旧实现写死，setter 是假的），`n` 取**路由选中的** broker 名，定点发送与批量 320 走同一份建头代码、三键都不能漏 |
 | `producer_async` | 209 | 真异步发送链（进程内 mock broker + 真 socket）：`sendAsync` 立刻返回、准备工作和请求都在 `AsyncSenderExecutor_N` 上、回调与 `SendMessageHook.after` 在 `NettyClientPublicExecutor_N` 上；出队后才算耗时（预算被排队吃光一次请求都不发）；只有 remoting 层失败才重试且重试**复用同一请求**只换 opaque；超时预算是整条链共享的剩余时间；已收到响应但 broker 报错码**不重试不包装**；定点发送只在同一台 broker 上重试、且必须自己刷出路由；队满把 `executor rejected` 抛给调用方；回调抛异常被吞掉。**异步发送背压**（用例 10~17）：开关默认关且关掉时**一格许可都不动**、两个配置的地板值、条数/字节闸在**调用方线程**上等到预算耗尽才回调（Java 文案逐字）、被拒的发送一次请求都没发出、许可在链终点按「先 size 后 num」归还（失败与重试路径同样归还）、运行时扩容叫醒卡在闸上的人、队满时开着背压改为就地跑；**批量异步**（用例 18~21，对位 Java `send(Collection, SendCallback, timeout):1121`）：一批只发**一个**请求、只交付**一个**回调，字节闸按**整批** body 长度扣（Python `_back_pressure_msg_len` 的 list 分支），未 `start()` 时与单条异步同一口径就地抛且**一个回调都不交付**，ID 顺序锁死 Java `batch():1172-1184`（先给每条子消息 `setUniqID` → 再给整批那条补一个 → **最后**才 `setBody(encode())`，所以抓到的报文里每条子消息各带一个不重复的 32 位 UNIQ_KEY、批量自身那个 ID 也在）；**异步链的发送头**（用例 22）：异步自己建头（`buildSendRequest`），所以同步侧对齐不代表它也对齐——抓真报文验 `n`=该请求落到的 broker 名、`c`/`d` 取生产者的 `setCreateTopicKey`/`setDefaultTopicQueueNums`（`AsyncTopicKey`/11） |
 | `backpressure` | 50 | `FairSemaphore`（对应 Java `new Semaphore(permits, true)`）：只有**队首**能拿许可（后来者不许插队）、超时返回 false 而不抛、超时/获准后都要**把队首换人这件事广播出去**（漏了这一步，后到的等待者会睡到自己的超时 —— 两个用例专门盯这两条）、`release` 超过总量不校验、原地平移总量并保留在途份数（算出负的空闲许可也照 Java 的 `new Semaphore(负数)` 接受）、改容量能叫醒正堵在旧容量上的人（Java 换对象做不到这一步） |
 | `pop` | 93 | POP 协议管道：CK 反构（8 段 + `startOffsetInfo`/`msgOffsetInfo` 下标选择）、`bornTime`、ACK offset 语义 |
@@ -133,7 +133,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 ./build/examples/rmq_live_acl           127.0.0.1:9876   # 需开 ACL 的集群
 ./build/examples/rmq_live_pull          127.0.0.1:9876
 ./build/examples/rmq_live_lite_pull     127.0.0.1:9876
-./build/examples/rmq_live_request_reply 127.0.0.1:9876
+./build/examples/rmq_live_request_reply 127.0.0.1:9876   # 20 PASS / 0 FAIL：325 应答链路 + 10006/10007 码
 ./build/examples/rmq_live_latency       127.0.0.1:9876
 ./build/examples/rmq_live_pop           127.0.0.1:9876
 ./build/examples/rmq_live_pop_consumer  127.0.0.1:9876   # POP 消费：全收/不重投/不可见时间重投 + 307 状态表里的 pullRT/pullTPS
@@ -158,7 +158,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | `rmq_admin_live` | 57 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → `resetOffsetByQueueId`（25 + 带 queueId/offset 的 222：重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构）→ `queryTopicsByConsumer(group)`（按 `%RETRY%` 路由扇出合并）与 `queryTopicsByConsumerToBroker` → 清理 |
 | `rmq_compression_live` | 10 PASS | 三后端（zlib / LZ4 Frame / ZSTD）自动压缩自产自销 + **与真实 Java/Python/.NET/Rust 客户端双向互通**（互通矩阵见 `../scripts/compression_matrix.sh`）；构建时未编入的后端打 SKIP |
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
-| `rmq_validators_live` | 39 PASS / 0 FAIL | 名字校验真机对拍（与 Python/Rust/.NET 同场景）：S1 发送路径 13 项本地快拒（空白/超长/非法字符 topic、禁发的 broker 内部流水、body 三档 + `INNER_MULTI_DISPATCH` 分隔符，全部 <50ms 且不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `start()` 三道组名门 + 120 等长边界放行、S4 正腿（合法名字建 topic → push/lite 两路各收 3 条）、S5 对照腿（合法但不存在的 topic 不被误伤，真往返 46ms vs 本地 0.17ms）、S6 pull/lite 组名门 + 合法 pull 组查队列与位点、S7 `createTopic` 挡空白/非法/系统 topic |
+| `rmq_validators_live` | 44 PASS / 0 FAIL | 名字校验真机对拍（与 Python/Rust/.NET 同场景）：S1 发送路径 13 项本地快拒（空白/超长/非法字符 topic、禁发的 broker 内部流水、body 三档 + `INNER_MULTI_DISPATCH` 分隔符，全部 <50ms 且不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `start()` 三道组名门 + 120 等长边界放行、S4 正腿（合法名字建 topic → push/lite 两路各收 3 条）、S5 对照腿（合法但不存在的 topic 不被误伤，真往返 46ms vs 本地 0.17ms）、S6 pull/lite 组名门 + 合法 pull 组查队列与位点、S7 `createTopic` 挡空白/非法/系统 topic、**S8 寻址故障定性**（零地址时路由漏斗报 10004 + Java 原文案、地址配了只是连不上时报的**不是** 10004 —— 判的是配置不是可达性、真发送定性 10005、完全没配时 `start()` 就地 10004 且不进 `started` 态、真集群对照腿照常 `SEND_OK`） |
 | `rmq_live_hook` | 13 PASS / 0 FAIL | `CheckForbiddenHook`（放行 / 每次发送尝试都回调 / 单向也拦截 / 被拦截的消息确实没落 broker）+ `FilterMessageHook`（拉取路径 3 收 2 丢且不重投、POP 路径 2 收 1 丢且**摘掉即 ack**）+ 客户端二次 tag 过滤（订阅 `TagA` 只收 `TagA`）+ 钩子异常被吞掉不影响后续钩子 |
 | `rmq_live_lite_pull` | 61 PASS / 0 FAIL | `DefaultLitePullConsumer` 真机全链路：S1 后台 rebalance 拿到 4 个队列 → S2 subscribe+poll 收全 12 条且内容一致 → S3 **没人调 `commit`**、只继续 `poll()` 过一整个自动提交周期（默认 5s 闸门只在 `poll()` 开头查）后各队列 `committed()` 自己 >0 → S4 assign+seek 从头重收 → S5 订阅级 tag 只收 6 条 → S6a `CONSUME_FROM_TIMESTAMP`（墙钟起点早于全部消息 → 收全）、S6b `offset_for_timestamp` 双向（30 分钟前 → 队首 Σ=0，10 分钟后 → Σ=12）→ S7a 默认策略名 `AVG` 且策略为 null 时 `start()` 报 Java 同款文案、S7b 换 `AVG_BY_CIRCLE` 后**同组两实例**分配无交集、并集覆盖 4 队列、下标步长 2（交叉而非连续段）、S7c 两半 `CONFIG` 各自只收到配置队列里的消息且合起来恰好 12 条互不重叠、S7d `CONSISTENT_HASH` 用**真实 clientId** 建环且线上分配收敛到「真实 mqAll/cidAll 离线跑同一策略」的预测（合起来收全 12 条）、S7e `MACHINE_ROOM_NEARBY-CONSISTENT_HASH` 在单机房下**原样透传**内层策略 + resolver 被逐个队列/两个真实 clientId 问过、S7f `MACHINE_ROOM` 白名单不匹配真实 `broker-a` → 安静饿死（分不到队列、poll 不到消息、同组 AVG 对照组仍只拿自己那半边）、**S8 三张位点表在真机各自数出来**（1 条队列的 topic 灌 1200 条，`pullCursor`/`consumeCursor` 与 broker 位点是三个互不相等的数）：S8a 后台把 1200 条全拉进本地缓冲而一次 `poll` 都没交 ⇒ 已消费游标仍是 -1、broker 位点仍是 0（**旧实现在这里提交 1200，等于静默丢掉缓冲里 176 条之后重启还当它们已消费**）、空 `commit()` 一笔 RPC 都不发；S8b 单次 `poll` 交出 1024（交付上限）⇒ 已消费游标 1024、拉取游标仍 1200、`commit` 落到 broker 的正是 **1024 而不是 1200**；S8c `commit(map)` 能把位点改成调用方指定的 5 且**两格游标都不动**、退回的 176 条照旧交付、全程 1200 条不重不漏；S8d `persist=false` 时 `committed()` 读到内存表那格 777 而 broker 仍是 5；S8e 新实例的起点取 broker 上的 5（不是另一个实例内存里的 777）；S8f `seek` 同时改两格游标、`commit` 落到 60；S8g 未落盘的内存值先看得见、`commit(空集)` 不清表也不发消息、**点名提交会把没点名的内存值清掉**（Java `persistAll` 的 remove unused mq，且清理只是丢内存值、没把 300 写去 broker）、`commit(Set)` 提交的是已消费游标而非内存那格、`persistAll` 之后内存表回到已消费游标（Java 的 `updateConsumeOffset`）|
 

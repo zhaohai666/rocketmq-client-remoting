@@ -689,8 +689,12 @@ class DefaultMQProducer:
                     "producerGroup can not equal %s, please specify another one."
                     % MixAll.DEFAULT_PRODUCER_GROUP)
             if not self.name_server_addrs and not DefaultTopAddressing.is_configured():
-                # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
-                raise MQClientException("name server address is not set")
+                # 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用。
+                # 码值用 Java 的 10004（``validateNameServerSetting`` 对同一个故障给的码）：
+                # Java 不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口
+                # 提前到 start（更可预期），但不能让调用方看到两种不同的码。
+                raise MQClientException("name server address is not set",
+                                        ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
             # 对应 Java `DefaultMQProducerImpl#start`:250-252 的两步：先
             # `changeInstanceNameToPID`（Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，
             # 本客户端没有内部生产者，所以无条件执行），再由 `ClientConfig#buildMQClientId`
@@ -883,8 +887,31 @@ class DefaultMQProducer:
         client.register_topic_in_use(topic)
         try:
             return client.get_topic_publish_info(topic)
-        except MQClientException:
-            return client.get_topic_publish_info(topic, is_default=True)
+        except MQClientException as e:
+            try:
+                return client.get_topic_publish_info(topic, is_default=True)
+            except MQClientException:
+                # Java 的三条「拿不到路由」分支都是先 validateNameServerSetting() 再抛
+                # no-route：一个 name server 地址都没有（配了地址服务器却没返回地址也算）
+                # 时报 10004，而不是把寻址故障说成"这个 topic 没路由"。
+                self._validate_name_server_setting()
+                raise
+
+    def _validate_name_server_setting(self) -> None:
+        """对应 Java ``DefaultMQProducerImpl#validateNameServerSetting``。
+
+        只在「拿不到路由」这条分支上跑，把两种完全不同的故障分开：
+        * 压根一个 name server 地址都没有（配了地址服务器却没返回地址也算这种）
+          → 10004 ``No name server address, please set it.``
+        * 地址有、只是这个 topic 没路由 → 让调用方原来那条异常照旧抛（10005 等）。
+        少了这一步，用户把地址服务器配错拿到空列表，看到的却是"No route info of this
+        topic"——那是"topic 不存在"的意思，把人往建 topic 的方向查，而真正坏的是寻址。
+        Java 的文案后面拼了 ``FAQUrl.suggestTodo(...)``，本仓库按约定不带后缀。
+        """
+        client = self._mq_client
+        if client is None or not client.name_server_addrs:
+            raise MQClientException("No name server address, please set it.",
+                                    ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
 
     def _update_fault_item(self, selected, began: float, isolation: bool,
                            reachable: bool) -> None:
@@ -919,8 +946,11 @@ class DefaultMQProducer:
         try:
             publish = self._topic_publish_info(msg.topic)
         except MQClientException as e:
-            # Java：路由拿不到时立刻抛 NOT_FOUND_TOPIC_EXCEPTION，不把重试次数空转掉
-            raise MQClientException(str(e), ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
+            # Java：路由拿不到时立刻按 NOT_FOUND_TOPIC_EXCEPTION 定性，不把重试次数空转掉。
+            # 已经带码的（10004「没有 name server」，在 _topic_publish_info 里判的）原样透传，
+            # 别把它改写成 10005 —— 那是两种故障，覆盖掉就白判了。
+            raise MQClientException(str(e),
+                                    e.response_code or ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
         times_total = self.retry_times_when_send_failed + 1
         begin_first = time.monotonic()
         brokers_sent: List[str] = []
@@ -1067,9 +1097,12 @@ class DefaultMQProducer:
         response = future.wait_response_message(timeout - cost)
         if response is None:
             if future.send_request_ok:
+                # Java ``RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)``：
+                # 光有类型和文案不够，10006 这个码也要带上 —— 调用方按码分流时
+                # "没等到应答"（可能对方只是慢，消息其实已投出去）和别的客户端故障不是一类处置。
                 raise RequestTimeoutException(
                     "send request message to <%s> OK, but wait reply message timeout, %d ms."
-                    % (msg.topic, timeout))
+                    % (msg.topic, timeout), ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION)
             raise MQClientException(
                 "send request message to <%s> fail" % msg.topic, None, future.cause)
         return response
@@ -1218,7 +1251,9 @@ class DefaultMQProducer:
         try:
             publish = self._topic_publish_info(msg.topic)
         except MQClientException as e:
-            raise MQClientException(str(e), ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
+            # 同同步发送：10004 原样透传，其余按 10005 定性
+            raise MQClientException(str(e),
+                                    e.response_code or ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION)
         # Java sendDefaultImpl:756 —— ASYNC 的 timesTotal 固定为 1：外层循环只跑一次，
         # 换 broker 的重试全部发生在 onExceptionImpl 里。
         selected = self._mq_fault_strategy.select_one_message_queue(publish, None, False)

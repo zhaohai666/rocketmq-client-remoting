@@ -528,6 +528,68 @@ async fn connect_failure_is_qualified_with_10001() {
     producer.shutdown();
 }
 
+// ---------------- 6b. 寻址故障（10004）不能被说成「这个 topic 没路由」（10005）
+
+/// Java `DefaultMQProducerImpl#validateNameServerSetting`（:729）读的是**配置**，
+/// 一个地址都没有时报 10004 + 原文案。
+///
+/// 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是「这个 topic 没路由」，
+/// 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
+#[tokio::test]
+async fn no_name_server_address_reports_10004_not_missing_route() {
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    let client = MQClientInstance::new("retry_no_namesrv", Vec::new());
+
+    let err = producer
+        .topic_publish_info(&client, "T1")
+        .await
+        .expect_err("一个 name server 地址都没有，必须失败");
+    let (code, message) = expect_client_code(err);
+    assert_eq!(code, Some(client_error_code::NO_NAME_SERVER_EXCEPTION));
+    assert_eq!(message, "No name server address, please set it.");
+}
+
+/// 对照腿：地址配了、只是连不上（没人监听的端口）⇒ 10004 那道闸必须闭嘴。
+///
+/// Java 判的是「配置里有没有地址」，不是「地址能不能连通」：把连不上说成「没配地址」
+/// 会把排障带向反方向（去翻配置文件，而其实是对端没起来 / 端口写错）。
+#[tokio::test]
+async fn unreachable_name_server_is_never_reported_as_10004() {
+    let addr = dead_addr().await;
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    producer.set_instance_name("retry_dead_namesrv");
+    producer.set_namesrv_addr(&addr);
+    // start() 不查 namesrv 可达性（Java 同：地址非空就放行）
+    producer.start().await.expect("配置非空即应放行");
+
+    let mut msg = Message::new("T1", Some(b"body"));
+    let err = producer
+        .send(&mut msg, Some(3000), None)
+        .await
+        .expect_err("连不上必须失败");
+    assert_ne!(
+        err.response_code(),
+        Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
+        "配置里有地址就不能报 10004: {err}"
+    );
+    producer.shutdown();
+}
+
+/// 生产者 `start()`：完全没有寻址时也在本地就拦下来（本端口比 Java 严格，
+/// Java 要等第一次发送才由漏斗报 10004），码值同样是 10004 —— 同一个故障只有一种码。
+#[tokio::test]
+async fn producer_start_reports_10004_when_addressing_is_missing() {
+    let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
+    producer.set_instance_name("retry_start_noaddr");
+    if DefaultTopAddressing::is_configured() {
+        return; // 配了动态取址时 start() 允许静态地址为空（与 Java 一致）
+    }
+    let err = producer.start().await.expect_err("没有寻址必须起不来");
+    assert_eq!(err.response_code(), Some(client_error_code::NO_NAME_SERVER_EXCEPTION), "{err}");
+    let (_, message) = expect_client_code(err);
+    assert!(message.contains("name server address is not set"), "{message}");
+}
+
 /// `sendMsgMaxTimeoutPerRequest` 的全部意义：慢 broker 只能吃掉被压过的那一小段，
 /// 剩下的预算留给下一台。不设上限时第一台会独占 700ms，整次发送必然更慢。
 #[tokio::test]

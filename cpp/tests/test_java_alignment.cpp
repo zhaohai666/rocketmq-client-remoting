@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "rocketmq/client/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
 
 using namespace rocketmq;
@@ -100,6 +101,21 @@ static void checkBuiltinTable() {
     CHECK(LanguageCode::valueOf(999) == nullptr, "LanguageCode::valueOf unknown -> nullptr");
     CHECK(std::string(SerializeType::valueOf(SerializeType::ROCKETMQ)) == "ROCKETMQ",
           "SerializeType::valueOf");
+
+    // ClientErrorCode：Java 的 client/common/ClientErrorCode.java 一共七个常量，
+    // 一个都不能少、一个都不能改值。10001~10005 是发送重试的定性；10006/10007 各有各的
+    // 抛出点（request-reply 超时、造应答消息失败），以前表里缺这两个，站点只能拿默认码 1 抛出去。
+    CHECK(ClientErrorCode::CONNECT_BROKER_EXCEPTION == 10001, "CONNECT_BROKER_EXCEPTION==10001");
+    CHECK(ClientErrorCode::ACCESS_BROKER_TIMEOUT == 10002, "ACCESS_BROKER_TIMEOUT==10002");
+    CHECK(ClientErrorCode::BROKER_NOT_EXIST_EXCEPTION == 10003, "BROKER_NOT_EXIST_EXCEPTION==10003");
+    CHECK(ClientErrorCode::NO_NAME_SERVER_EXCEPTION == 10004, "NO_NAME_SERVER_EXCEPTION==10004");
+    CHECK(ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION == 10005, "NOT_FOUND_TOPIC_EXCEPTION==10005");
+    CHECK(ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION == 10006, "REQUEST_TIMEOUT_EXCEPTION==10006");
+    CHECK(ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION == 10007,
+          "CREATE_REPLY_MESSAGE_EXCEPTION==10007");
+    // 抛出点确实带上了这两个码（以前 RequestTimeoutException 走默认码 1）
+    CHECK(RequestTimeoutException("x").getResponseCode() == ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION,
+          "RequestTimeoutException carries 10006");
 }
 
 static bool readFile(const std::string& path, std::string& out) {
@@ -151,9 +167,48 @@ static void checkAgainstJavaSource() {
     }
 }
 
+// ClientErrorCode.java 单独一趟：上面那个函数在 RequestCode.java 缺失时会提前 return，
+// 不能连带把这张表的回归检查也跳掉。
+static void checkClientErrorCodeAgainstJava() {
+    const char* src = std::getenv("ROCKETMQ_JAVA_SRC");
+    if (src == nullptr || *src == '\0') {
+        return;
+    }
+    std::string text;
+    if (!readFile(std::string(src)
+                      + "/client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java",
+                  text)) {
+        std::cout << "[warn] ClientErrorCode.java not found under ROCKETMQ_JAVA_SRC=" << src
+                  << "; skipped\n";
+        return;
+    }
+
+    struct Pair { const char* name; long long expect; };
+    const Pair pairs[] = {
+        {"CONNECT_BROKER_EXCEPTION", ClientErrorCode::CONNECT_BROKER_EXCEPTION},
+        {"ACCESS_BROKER_TIMEOUT", ClientErrorCode::ACCESS_BROKER_TIMEOUT},
+        {"BROKER_NOT_EXIST_EXCEPTION", ClientErrorCode::BROKER_NOT_EXIST_EXCEPTION},
+        {"NO_NAME_SERVER_EXCEPTION", ClientErrorCode::NO_NAME_SERVER_EXCEPTION},
+        {"NOT_FOUND_TOPIC_EXCEPTION", ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION},
+        {"REQUEST_TIMEOUT_EXCEPTION", ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION},
+        {"CREATE_REPLY_MESSAGE_EXCEPTION", ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION},
+    };
+    for (const auto& pr : pairs) {
+        long long v = 0;
+        if (parseJavaConst(text, pr.name, v)) {
+            CHECK(v == pr.expect, std::string("java ClientErrorCode.") + pr.name
+                                      + " matches exception.h");
+        } else {
+            // Java 侧少一个常量本身就是漂移：这张表 C++ 必须与 Java 同名同值
+            std::cout << "[warn] java const ClientErrorCode." << pr.name << " not found; skipped\n";
+        }
+    }
+}
+
 int main() {
     checkBuiltinTable();
     checkAgainstJavaSource();
+    checkClientErrorCodeAgainstJava();
 
     std::cout << "\n===== java alignment summary =====\n";
     std::cout << "  PASS=" << g_pass << " FAIL=" << g_fail << "\n";

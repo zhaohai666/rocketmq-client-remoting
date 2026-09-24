@@ -189,6 +189,9 @@ class _NoIoClient:
         self.touched: List[str] = []
         # False = 模拟「路由拿不到」；True = 预热成功，让流程继续往下走。
         self.no_publish_error = False
+        # MQClientInstance 上的真字段：拿不到路由时 validateNameServerSetting 靠它
+        # 分辨"没配 name server"(10004) 和"这个 topic 没路由"(10005)，这里给个地址。
+        self.name_server_addrs: List[str] = [ADDR]
 
     def register_topic_in_use(self, topic):
         self.touched.append("register")
