@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 944 条单元/协议测试（940 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 956 条单元/协议测试（952 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -45,6 +45,7 @@ python verify_ack_index_live.py   # classic 并发消费的 ackIndex 部分 ack�
 python verify_orderly_reconsume_live.py # 顺序消费的重投闸门 O1~O3（12 PASS/0 FAIL，Java ConsumeMessageOrderlyService:236-362，与 verify_redelivery_live.py 的并发侧 S9 是两条不同代码路径）：O1 `max_reconsume_times=2` + `consume_message_batch_max_size=1` + `suspend_current_queue_time_millis=500` + 1 队列 topic ⇒ 毒消息恰好投 3 次、`reconsumeTimes` 走 0/1/2 的阶梯（每一格都是**客户端自己 +1**，broker 收到时已经加过）、第 3 次交回 broker 后业务队列**立刻前进**（后一条被消费，不是被毒消息永久堵住）、再等 15s 没有第 4 次、挂起期间 listener 始终看到业务 topic（本地重投不换 topic）→ O2 broker 把毒消息改写进 `%DLQ%<g>`（路由此刻才建出来），死信那条 `reconsumeTimes=3`（存储时 +1）、`RETRY_TOPIC` 仍是业务 topic。**顺序回投能落进死信而不是走延迟档位，本身就是 broker 此刻看到该组的重平衡锁没过期**（`SendMessageProcessor#handleRetryAndDLQ:202-207` 只在 `!isLockAllExpired` 时立刻判死信）——也就是「拿着 `LOCK_BATCH_MQ` 把消息交给 broker」这条链真的接上了（O1 另外直接数了该组 `LOCK_BATCH_MQ` 续锁成功的次数，>0 才算拿到判据的现场证据） → O3 反过来验 `-1` 那一支：顺序侧 `getMaxReconsumeTimes:313-320` 把 `-1` 读成**不设上限**（**不是**并发侧 `DefaultMQPushConsumerImpl:890` 的 16），实测同一条毒消息被持续重试 28 次、`reconsumeTimes` 阶梯一路爬到 19，而 `%DLQ%` 连 topic 都没建出来。三条分支（+1、用尽才回投、回投失败才继续挂起）与回投那条消息的字段由 `tests/test_orderly_reconsume.py`（13 项）离线锁死——离线未 `start()` 的消费者拿不到内部生产者，回投必定失败，所以离线只锁得住失败分支，「回投成功 ⇒ 位点前进、队列不堵」只能靠真机这一段
 python verify_send_header_live.py # 发送头 c/d/n 三个字段（14 PASS/0 FAIL）：H1 默认 `d=4` 时自动建出的 topic 队列数 = `min(4, TBW102.writeQueueNums)`；H2 `set_default_topic_queue_nums(2)` 真的让 broker 只建 2 条队列（写死 4 的旧行为必然是 4）；H3 `set_create_topic_key(模板)` 时继承**模板**的 3 条队列而不是 TBW102 的 8 条（`TopicConfigManager.java:286-289` 的 `isInherited` + `min`）；H4 同步/定点/单向/批量 320/异步五种入口逐条落地（7 条一条不差）；H5 落点 broker 名与路由一致。`n`（brokerName）在经典 broker 的发送链路里**没有读者**（5.5.1 源码 grep 过），它的线上存在由 `tests/test_send_header_fields.py`（7 项，抓真报文）取证
 python verify_producer_unregister_live.py # 生产者退出注销 UNREGISTER_CLIENT(35)（11 PASS/0 FAIL）：U1 发送成功 → U2 心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId（注册确实发生过，"消失"才有意义；组靠心跳上线，所以要轮询等）→ U2b 对照组注册可见（204 这条判据本身有效）→ U3 `shutdown()` 期间钩子抓到 35：每台已知 broker 各一发、头是 `clientID`+`producerGroup` 且 **`consumerGroup` 整个字段不上线**（Java 传 null；broker `ClientManageProcessor:228/237` 判的是 `group != null`，空串会被拿去查 `""` 的订阅组配置）→ U4 每一发 35 都回 SUCCESS（走的是**还没关**的那条长连接）→ U4b 35 排在业务发送之后 → U5 紧接着查 204 这个组已经不在（broker 回 `the producer group[...] not exist`）→ U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 判据强度：Python 里每个生产者各持一份 `MQClientInstance`、各一条连接，退出时连接也关掉，单看 U5 分不出是 35 还是断连的功劳，所以这里必须由钩子抓帧直接证明线上走了这一发；行为级的判别式证明在 `rust/examples/live_producer.rs` 的 P11（Rust 按 clientId 复用实例，先退的那个连接还活着）。超时预算跟 Java 同一口径：`MQClientInstance#unregisterClient:1170` 传 `getMqClientApiTimeout()`=**3000ms**，异常一律吞成 debug（shutdown 不因单台抖动中断）。扇出**含 slave**（`get_all_broker_addrs`），心跳一侧仍只打 master 优先那台（`get_route_of_all_brokers`），这个分工与四种"空白组名不上线"的分支由 `tests/test_producer_unregister.py`（9 项，含「默认预算就是 3000ms」那条——shutdown 路径不显式传参，写歪只会让退出慢一档，不会有任何用例变红）离线锁死
+python verify_interval_live.py   # 定时任务周期（22 PASS/0 FAIL）：I1 两条生产者（刷新周期 1s / 默认 30s）都把同一个**还没建**的 topic 登记进在用集合，建完后 1s 组 1.06s 拉到路由、30s 组此刻还没有、30.20s 才拉到（周期决定时机，不是缓存坏了）；I2 两条消费者（落盘周期 1s / 60s）首笔落盘都在 initialDelay 实测 10.18s / 10.48s（**不是立刻、也不是 initialDelay+一个周期**），第二批消费后 1s 组 0.83s 把 broker 位点推到 6 而 60s 组仍是 3，60s 组 `shutdown()` 收尾落盘到 6（只是周期没到，不是坏了）；I3 实例上拿到的就是调用方设的值。周期是配置项、时间是唯一可观测量，跑一遍数值会有 ±0.1s 抖动，量级与判据（"30s 组至少晚 20s""首笔落盘 ≥10s"）才是断言对象
 python verify_fail_fast_live.py # broker 真死掉时在途请求立刻判死（Java failFast → requestFail，18 PASS/0 FAIL）：L1 基线（5 条同步发送 SEND_OK、各队列队尾位点合计覆盖 = 真的落盘）→ L2 三条 suspend=20s 的长轮询确实挂在 broker 上（2s 后仍未返回）且占了在途表 → L3 用 `scripts/rmq_test_broker.sh stop` 杀掉 broker，三条都在 **2.2s** 内拿到 `RemotingSendRequestException`（不是等满 30s 才报 `RemotingTimeoutException`：异步发送的重试分类按异常**类型**分流，报成超时等于换一整套重试决策）、在途表随后排空 → L4 同一个传输实例上的 namesrv 连接没被牵连（206 仍回 SUCCESS）→ L5 broker 拉起后**同一个 producer 实例**重新建连照常发送，那 5 条 SEND_OK 的消息一条不少。脚本只启停 broker、不删 store（四个语言的同一用例共用它）。⚠ 真机只能证"按地址隔离"；"同地址换连接时旧读线程收尾不误伤新连接"那一层由 `tests/test_fail_fast.py`（6 项，含回调恰好一次、`shutdown` 排空在途）离线锁死
 
 ```
@@ -176,6 +177,39 @@ Java `:1058` 的 `consumeTimestamp` 格式校验本端口**会真拒**（`consum
 真机守卫见上面 `verify_flow_control_live.py` 的 S5。C++ / Rust / .NET 用同一张闸门表、同一段
 顺序、同一条文案（`cpp/tests/test_consumer_check_config.cpp`、`rust/src/client/consumer.rs` 的
 `RANGE_GATES`、`dotnet/tests/RocketMQ.Client.Tests/ConsumerCheckConfigTests.cs`）。
+
+## 定时任务周期（pollNameServerInterval / persistConsumerOffsetInterval）
+
+`MQClientInstance` 的后台周期任务逐条对齐 Java `MQClientInstance#startScheduledTask`
+（`:389-432`）。**每个循环的首跳都落在 `initialDelay` 这一刻**，不是 `initialDelay + period`
+—— 对应 `scheduleAtFixedRate` 的语义（真机实测抓到过本端口按后者排的错误，见下）：
+
+| 循环 | Java 锚点 | initialDelay | 周期 | 可配字段（默认） |
+|------|-----------|--------------|------|------------------|
+| 动态 name server 刷新 | `:390-398` | 10s | 2min | —（仅未配置静态地址且有地址服务器时调度） |
+| 在用 topic 路由刷新 | `:400-406` | 10ms | `pollNameServerInterval` | `poll_name_server_interval`（30000ms） |
+| 心跳 | `:408-415` | 1s | `heartbeatBrokerInterval` | —（见下） |
+| 消费者位点落盘 | `:417-423` | 10s | `persistConsumerOffsetInterval` | `persist_consumer_offset_interval`（5000ms） |
+| 线程池弹性巡检 | `:425-431` | 1min | 1min | —（inc/dec 本是空实现） |
+
+要点：
+
+- `poll_name_server_interval` **五个门面都有**（producer / push / pull / lite / admin，与 Java
+  一样继承自 `ClientConfig`，`ClientConfig:58`），并在各自 `start()` 里透传给
+  `MQClientInstance`；周期只在循环入口读一次，之后再改字段不影响已排定的任务
+  （对齐 `scheduleAtFixedRate` 一次性排定）。
+- `persist_consumer_offset_interval` 只管**后台周期落盘**；`shutdown()` 里的收尾落盘是
+  无条件的（`DefaultMQPushConsumerImpl#shutdown` 先 `persistConsumerOffset` 再停服务），
+  所以调大周期只推迟落盘时机、不丢位点。集群模式下位点落盘走**同步**
+  `UPDATE_CONSUMER_OFFSET`，广播模式写本地 `~/.rocketmq_offsets/<clientId>/<group>/offsets.json`。
+- 心跳有一处**已知且有意的偏差**：Python 在 `start()` 里先同步打一轮心跳，之后按 30s 周期跑；
+  Java 的循环首跳在 1s。首轮同步心跳覆盖了 Java 首跳的作用（注册 clientId 后立刻可见），
+  周期与 Java 默认值一致，回归守卫 `tests/test_scheduled_intervals.py` 锁的是这个口径。
+- 上述四条（动态地址 / 路由 / 落盘 / 弹性）的周期与首跳次序由
+  `tests/test_scheduled_intervals.py`（12 项，用 `_RecordingStop` 记录 `wait()` 实参）逐条锁死；
+  真机守卫 `verify_interval_live.py` 用两条不同周期的实例对照，证明差异来自周期本身
+  而不是路由缓存或 broker 行为（I1 快慢组 1.06s vs 30.20s，I2 首笔落盘 10.18s × 双组、
+  第二批 0.83s vs 60s 组仍在原地）。
 
 ## 管理端（`client/admin.py`）
 

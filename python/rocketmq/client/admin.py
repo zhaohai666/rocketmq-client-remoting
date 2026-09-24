@@ -63,6 +63,9 @@ class DefaultMQAdminExt:
         self.unit_name: Optional[str] = None
         self.enable_stream_request_type = False
         self.name_server_addrs: List[str] = []
+        # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
+        # 只在 start() 建 MQClientInstance 时透传一次。
+        self.poll_name_server_interval = 30000
         self.rpc_hook = rpc_hook
         # 删除 topic 时一并清理的 KV namespace（Java 的 kvNamespaceToDeleteList）
         self.kv_namespace_to_delete_list: List[str] = []
@@ -117,7 +120,8 @@ class DefaultMQAdminExt:
                                                   self.enable_stream_request_type)
         self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                            enable_stream_request_type=self.enable_stream_request_type,
-                                           unit_name=self.unit_name)
+                                           unit_name=self.unit_name,
+                                           poll_name_server_interval=self.poll_name_server_interval)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         self._mq_client.start()

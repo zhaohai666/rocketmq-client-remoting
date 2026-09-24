@@ -124,9 +124,16 @@ class MQClientInstance:
                  connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
                  tls_enable: Optional[bool] = None,
                  enable_stream_request_type: bool = False,
-                 unit_name: Optional[str] = None):
+                 unit_name: Optional[str] = None,
+                 poll_name_server_interval: int = 30000):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
+        # 在用 topic 的路由刷新周期（对应 Java ClientConfig.pollNameServerInterval，
+        # 默认 30000ms —— MQClientInstance.startScheduledTask:406 把它作为
+        # scheduleAtFixedRate 的周期参数）。和各 facade 上的同名字段一样，**只在
+        # start() 时取一次**：循环起来之后改这个值不会改变已经排定的周期（Java 的
+        # scheduledExecutorService 同理）。
+        self.poll_name_server_interval = poll_name_server_interval
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
                                               tls_enable=tls_enable)
         # 对应 Java `MQClientAPIImpl:329-332`：stream 钩子必须注册在用户 rpcHook 之前，
@@ -472,13 +479,15 @@ class MQClientInstance:
         """
         if self._namesrv_refresh_stop.wait(10.0):    # Java initialDelay = 10s
             return
-        while not self._namesrv_refresh_stop.wait(120.0):
+        while True:
             if not self._started:
                 return
             try:
                 self.fetch_name_server_addr()
             except Exception as e:  # noqa: BLE001
                 logger.debug("fetchNameServerAddr exception: %s", e)
+            if self._namesrv_refresh_stop.wait(120.0):    # Java 周期 = 2 分钟
+                return
 
     def _adjust_thread_pool_loop(self) -> None:
         """周期触发线程弹性巡检。
@@ -492,10 +501,12 @@ class MQClientInstance:
         """
         if self._adjust_pool_stop.wait(60.0):    # Java initialDelay = 1 分钟
             return
-        while not self._adjust_pool_stop.wait(60.0):
+        while True:
             if not self._started:
                 return
             self.adjust_thread_pool()
+            if self._adjust_pool_stop.wait(60.0):    # Java 周期 = 1 分钟
+                return
 
     def register_topic_in_use(self, topic: str) -> None:
         """登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。"""
@@ -503,14 +514,20 @@ class MQClientInstance:
             self._topics_in_use.add(topic)
 
     def _route_refresh_loop(self) -> None:
-        """周期刷新在用 topic 的路由（对应 Java MQClientInstance.startScheduledTask 中
+        """周期刷新在用 topic 的路由（对应 Java MQClientInstance.startScheduledTask:400-406 中
         ``scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)``，
-        默认 30s）。没有这个任务，路由变化（如新 topic 被 broker 创建、队列扩容）只能等
+        initialDelay 10ms、周期取 ``clientConfig.getPollNameServerInterval()`` 默认 30s）。
+        周期由 ``poll_name_server_interval``（毫秒）决定，只在 start() 时读一次。
+        没有这个任务，路由变化（如新 topic 被 broker 创建、队列扩容）只能等
         消费者自己的 rebalance 轮次或生产者的下次发送才被发现。
         """
         if self._route_refresh_stop.wait(0.01):  # Java 首个任务延迟 10ms
             return
-        while not self._route_refresh_stop.wait(30.0):
+        # 周期在循环入口取一次：Java 的 scheduleAtFixedRate 也是启动时把周期排定，
+        # 之后改 clientConfig 不影响已排定的任务。首轮刷新就发生在 initialDelay 之后
+        # （不是 initialDelay + 一个周期后），调用顺序与 scheduleAtFixedRate 一致。
+        period = self.poll_name_server_interval / 1000.0
+        while True:
             if not self._started:
                 return
             for topic in list(self._topics_in_use):
@@ -518,6 +535,8 @@ class MQClientInstance:
                     self.update_topic_route_info_from_name_server(topic)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("route refresh failed for %s: %s", topic, e)
+            if self._route_refresh_stop.wait(period):
+                return
 
     def update_name_server_address_list(self, addrs: List[str]) -> None:
         if addrs:

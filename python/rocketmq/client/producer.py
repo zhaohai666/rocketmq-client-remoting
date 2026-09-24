@@ -321,6 +321,10 @@ class DefaultMQProducer:
         self._transaction_listener: Optional[TransactionListener] = None
         self._heartbeat_running = False
         self.heartbeat_interval_millis = 30000
+        # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）。
+        # 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效（Java 的
+        # scheduledExecutorService 也是按启动时的周期排定）。
+        self.poll_name_server_interval = 30000
         # 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
         self.send_latency_fault_enable = False
         self._mq_fault_strategy = MQFaultStrategy(False)
@@ -707,7 +711,8 @@ class DefaultMQProducer:
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable,
                                                enable_stream_request_type=self.enable_stream_request_type,
-                                               unit_name=self.unit_name)
+                                               unit_name=self.unit_name,
+                                               poll_name_server_interval=self.poll_name_server_interval)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()

@@ -765,6 +765,15 @@ class DefaultMQPushConsumer:
         # rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
         self.heartbeat_enabled = True
         self.heartbeat_interval_millis = 30000
+        # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）。
+        # 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效
+        # （Java 的 scheduledExecutorService 按启动时的周期排定）。
+        self.poll_name_server_interval = 30000
+        # 已消费位点落盘周期（对应 Java ClientConfig.persistConsumerOffsetInterval
+        # 默认 5000ms；MQClientInstance.startScheduledTask:417-423 的
+        # ``scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, <本值>)``）。
+        # 同样只在 start() 时被 ``_offset_persist_loop`` 读一次。
+        self.persist_consumer_offset_interval = 5000
         self._heartbeat_count = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
         # ---- POP 模式（5.x 轻量消费）----
@@ -1240,7 +1249,8 @@ class DefaultMQPushConsumer:
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable,
                                                enable_stream_request_type=self.enable_stream_request_type,
-                                               unit_name=self.unit_name)
+                                               unit_name=self.unit_name,
+                                               poll_name_server_interval=self.poll_name_server_interval)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
             self._mq_client.start()
@@ -2657,12 +2667,22 @@ class DefaultMQPushConsumer:
         self._persist_thread = t
 
     def _offset_persist_loop(self) -> None:
-        # Java MQClientInstance.startScheduledTask：persistAllConsumerOffset 每 5s
-        while not self._stop.wait(5.0):
+        # Java MQClientInstance.startScheduledTask:417-423：
+        #   scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
+        # ——首个任务延迟 10s，之后的周期取 clientConfig.persistConsumerOffsetInterval（默认 5s）。
+        # 与 Java 一致：这两步都只在 start() 时读一次，运行期改值不改变已排定的节奏。
+        if self._stop.wait(10.0):    # Java initialDelay = 1000 * 10
+            return
+        # 周期在循环入口取一次（Java 排定的是固定周期，运行期改字段不改变已排定的任务）。
+        # 首笔落盘发生在 initialDelay 之后，而不是 initialDelay + 一个周期后。
+        period = self.persist_consumer_offset_interval / 1000.0
+        while True:
             try:
                 self._persist_offsets_once()
             except Exception as e:  # noqa: BLE001
                 logger.debug("persist offsets error: %s", e)
+            if self._stop.wait(period):
+                return
 
     def _persist_offsets_once(self) -> None:
         if self.message_model == MessageModel.BROADCASTING:
@@ -2790,6 +2810,9 @@ class DefaultMQPullConsumer:
         self.broker_suspend_max_time_millis = 20000
         self.consumer_pull_timeout_millis = 10000
         self.consumer_timeout_millis_when_suspend = 30000
+        # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
+        # 只在 start() 建 MQClientInstance 时透传一次。
+        self.poll_name_server_interval = 30000
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
         self.register_topics: Set[str] = set()
@@ -2901,7 +2924,8 @@ class DefaultMQPullConsumer:
                                                   self.enable_stream_request_type)
         self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                            enable_stream_request_type=self.enable_stream_request_type,
-                                           unit_name=self.unit_name)
+                                           unit_name=self.unit_name,
+                                           poll_name_server_interval=self.poll_name_server_interval)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         self._mq_client.start()
@@ -3103,6 +3127,9 @@ class DefaultLitePullConsumer:
             "%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
         self.pull_batch_size = 32
         self.poll_timeout_millis = 5000
+        # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
+        # 只在 start() 建 MQClientInstance 时透传一次。
+        self.poll_name_server_interval = 30000
         self.auto_commit = True
         self.auto_commit_interval_millis = 5000
         self.consumer_timeout_millis_when_suspend = 30000
@@ -3270,7 +3297,8 @@ class DefaultLitePullConsumer:
     def _create_client(self) -> MQClientInstance:
         return MQClientInstance(self.client_id, self.name_server_addrs,
                                 enable_stream_request_type=self.enable_stream_request_type,
-                                unit_name=self.unit_name)
+                                unit_name=self.unit_name,
+                                poll_name_server_interval=self.poll_name_server_interval)
 
     def start(self) -> None:
         if self._started:
