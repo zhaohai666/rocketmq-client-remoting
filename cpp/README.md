@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 38 个用例，3282 项断言（37 个测试二进制 3209 + interop 73），~40s
+cd build && ctest --output-on-failure     # 38 个用例，3288 项断言（37 个测试二进制 3215 + interop 73），~50s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -95,7 +95,7 @@ cd build && ctest --output-on-failure     # 38 个用例，3282 项断言（37 �
 | `pull_expired` | 12 | 拉取循环停摆自愈（Java `ProcessQueue.PULL_MAX_IDLE_TIME` = **120000ms**，读 `rocketmq.client.pull.pullMaxIdleTime`；判据在 `RebalanceImpl.updateProcessQueueTableInRebalance:438-461`）：阈值逐字锁死、判据是**严格大于**（正好 120s 不算停摆）、没盖过章的新循环不算、循环线程已退出即刻算（不等满阈值）、健康队列一律不动（换线程等于丢在途重投）、撤走时持久化已消费位点并丢掉拉取游标与缓冲、分配即登记 `mqMap`（否则撤时无 mq 可持久化）、POP 分支读 `lastPopTimestamp` 且 `setDropped` + 换一具干净的 `PopProcessQueue`、停机期间不判停摆（否则刷一堆假 `[BUG]` 日志）、307 运行信息把 `lastPullTimestamp` 报成盖章节的真时刻、且 **`mqTable` 与 `mqPopTable` 互斥**（Java `DefaultMQPushConsumerImpl#consumerRunningInfo` 分别取 `processQueueTable` / `popProcessQueueTable`：弹出去的队列只出现在 popTable） |
 | `flow_control` | 24 | 拉取前流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= pullThresholdForQueue`（含 Java `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= pullThresholdSizeForQueue` 且单位是 **MiB**（`<=0` 关闭，正好 1MiB 即命中）、位点跨度**严格大于** `consumeConcurrentlyMaxSpan`（乱序缓冲量真实 min/max 而非首尾差）、topic 级累计条数/字节（`pullThresholdForTopic` / `pullThresholdSizeForTopic`，跨本实例该 topic **所有**队列聚合，别的 topic 不许掺进来，且 topic 字节闸门**不复用**队列级那道开关——Rust 曾这么错过，离线全绿而真机上那道闸门静默失效）、判定顺序条数→字节→跨度→topic 条数→topic 字节，**命中一次只记一格** `flowControlTriggered()` |
 | `hook` | 65 | `CheckForbiddenHook`（异常不吞、沿重试链传播）+ `FilterMessageHook`（可变 msgList、摘掉即静默跳过）+ 钩子异常隔离 |
-| `consume_thread_pool` | 61 | 消费端有界 core/max 执行器：真实并发度 == corePoolSize、`setConsumeThreadNums` 生效、`updateCorePoolSize` 运行时调并发 |
+| `consume_thread_pool` | 67 | 消费端 core/max 两档执行器（队列无界）：真实并发度 == corePoolSize、`setConsumeThreadNums` 生效、`updateCorePoolSize` 运行时调并发。**默认值两侧同为 20**（Java 5.x `DefaultMQPushConsumer:162/:169`；4.x 才是 min=20/max=64，早年照抄错了），于是默认配置下 `updateCorePoolSize` 只能往**下**调（守卫 `core < max`）—— 20~63 这些值 Java 会**静默忽略**，max 写 64 时本端口却会真的改并发度，回归用例 `testDefaultMaxIsJava5xTwenty` 钉住 |
 | `top_addressing` | 37 | 动态 name server：WS 地址 / unitName / para 拼装、`clearNewLine`、非 200 与连接失败回退为空 |
 | `consumer_stats` | 24 | `ConsumerStatsManager` 采样（sum/tps 窗口端点差分，不依赖真实时钟）+ `ConsumeStatus` / `ConsumerRunningInfo`(307) 编码 |
 | `trace_context` | 24 | W3C `traceparent` 生成/校验/子 span/注入不覆盖/属性提取 |

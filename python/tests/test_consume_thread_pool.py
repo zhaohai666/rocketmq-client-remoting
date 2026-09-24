@@ -162,15 +162,16 @@ class TestConsumeExecutor:
 class TestConsumerDefaultsAndGuards:
     def test_java_defaults(self):
         c = DefaultMQPushConsumer(GROUP)
-        assert c.get_consume_thread_min() == 20          # Java consumeThreadMin 默认 20
-        assert c.get_consume_thread_max() == 64          # Java consumeThreadMax 默认 64
+        assert c.get_consume_thread_min() == 20          # Java consumeThreadMin 默认 20 (:162)
+        assert c.get_consume_thread_max() == 20          # Java consumeThreadMax 默认 20 (:169)
         assert c.get_adjust_thread_pool_nums_threshold() == 100000
         assert c.get_core_pool_size() == 20              # = consumeThreadMin
 
     def test_update_core_pool_size_happy_path(self):
+        """Java 用无界队列 ⇒ 真实并发度 == core；默认配置下 core 只能往**下**调。"""
         c = DefaultMQPushConsumer(GROUP)
-        assert c.update_core_pool_size(30) is True
-        assert c.get_core_pool_size() == 30
+        assert c.update_core_pool_size(15) is True
+        assert c.get_core_pool_size() == 15
 
     def test_update_core_pool_size_rejects_zero_and_negative(self):
         c = DefaultMQPushConsumer(GROUP)
@@ -193,9 +194,26 @@ class TestConsumerDefaultsAndGuards:
     def test_update_core_pool_size_rejects_equal_to_consume_thread_max(self):
         """Java 守卫 corePoolSize < consumeThreadMax —— **等于**也不行。"""
         c = DefaultMQPushConsumer(GROUP)
-        assert c.update_core_pool_size(64) is False      # == consumeThreadMax
-        assert c.update_core_pool_size(63) is True
-        assert c.get_core_pool_size() == 63
+        assert c.update_core_pool_size(20) is False      # == consumeThreadMax（5.x 默认）
+        assert c.update_core_pool_size(19) is True
+        assert c.get_core_pool_size() == 19
+
+    def test_default_max_is_java_5x_twenty_not_four_x_sixty_four(self):
+        """回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
+
+        Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），
+        守卫 ``n < consumeThreadMax`` 因此把默认配置下的上调全挡掉 —— 差异不会报错，
+        只表现为"同一个 update_core_pool_size(30)，本端口真的改了并发度、Java 没改"。
+        """
+        c = DefaultMQPushConsumer(GROUP)
+        assert c.get_consume_thread_max() == 20
+        assert c.update_core_pool_size(30) is False
+        assert c.update_core_pool_size(21) is False
+        assert c.get_core_pool_size() == 20              # 一个都没落下去
+        # 抬 max 之后区间重新打开（setter 与 Java 一样是裸赋值，只夹 >= 1）
+        c.set_consume_thread_max(30)
+        assert c.update_core_pool_size(25) is True
+        assert c.get_core_pool_size() == 25
 
     def test_set_consume_thread_nums_sets_min_max_and_core(self):
         c = DefaultMQPushConsumer(GROUP)
@@ -231,7 +249,7 @@ class TestConsumerDefaultsAndGuards:
     def test_executor_is_owned_so_guard_passes(self):
         c = DefaultMQPushConsumer(GROUP)
         assert c._owns_consume_executor is True
-        assert c.update_core_pool_size(25) is True
+        assert c.update_core_pool_size(15) is True
 
 
 # ------------------------------------------------------------------ msgAccCnt / 阈值
@@ -318,9 +336,9 @@ class TestRunningInfoReflectsCorePoolSize:
         c.name_server_addrs = ["127.0.0.1:9876"]
         c.namespace = None
         c._start_time = time.time()
-        c.update_core_pool_size(33)
+        c.update_core_pool_size(13)
         info = c.consumer_running_info()
-        assert info.properties[ConsumerRunningInfo.PROP_THREADPOOL_CORE_SIZE] == "33"
+        assert info.properties[ConsumerRunningInfo.PROP_THREADPOOL_CORE_SIZE] == "13"
         assert info.properties[ConsumerRunningInfo.PROP_CONSUME_TYPE] == "CONSUME_PASSIVELY"
 
     def test_prop_follows_set_consume_thread_nums(self):

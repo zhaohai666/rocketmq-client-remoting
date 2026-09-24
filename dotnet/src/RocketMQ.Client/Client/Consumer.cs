@@ -428,11 +428,14 @@ public sealed class DefaultMQPushConsumer
     private string _consumeFromWhere = RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromLastOffset;
 
     // ---- 消费线程池（对齐 Java DefaultMQPushConsumer 的 consumeThreadMin/Max）----
-    // Java 默认 min=20 / max=64。本实现的**拉取**路径是"每队列一个拉取线程 + 单分发线程"，
+    // Java 5.x 的默认值是 min=20（:162）**且** max=20（:169）—— 两侧同为 20
+    // （4.x 时代才是 min=20/max=64，本端口早年照抄的是 4.x 那一组）。
+    // 本实现的**拉取**路径是"每队列一个拉取线程 + 单分发线程"，
     // 只有 **POP** 路径用真正的线程池（对应 Java ConsumeMessagePopConcurrentlyService），
-    // 因此 CorePoolSize 直接决定 POP 的消费并发度（Java 无界队列下 max 实际用不到）。
+    // 因此 CorePoolSize 直接决定 POP 的消费并发度（Java 无界队列下 max 实际用不到）；
+    // 默认配置下 UpdateCorePoolSize 只能往**下**调（守卫 n < max = 20）。
     private int _consumeThreadMin = 20;
-    private int _consumeThreadMax = 64;
+    private int _consumeThreadMax = 20;
     // Java adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；上游 inc/dec 是空实现）
     private long _adjustThreadPoolNumsThreshold = 100000;
     // 声明式 core pool size（Java setCorePoolSize 的等价物），默认 = consumeThreadMin
@@ -2826,7 +2829,8 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>按 ConsumeMessageBatchMaxSize 切批后投给消费线程（对应 Java
     /// ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest）。
-    /// <para>投给**有界线程池**（core=ConsumeThreadMin / max=ConsumeThreadMax）。
+    /// <para>投给 **core/max 两档线程池**（core=ConsumeThreadMin / max=ConsumeThreadMax，
+    /// 队列无界，同 Java 的 `LinkedBlockingQueue()`）。
     /// 此前这里每批起一个裸线程（无上限），慢监听器一上来就线程爆炸，而
     /// SetConsumeThreadNums() 设的值完全没作用。Java 用线程池 + 无界队列，
     /// 因此真实并发度 == CorePoolSize，UpdateCorePoolSize() 在运行时能改它。</para></summary>

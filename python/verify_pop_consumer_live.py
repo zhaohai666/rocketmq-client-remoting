@@ -104,6 +104,10 @@ def main():
     consumer = DefaultMQPushConsumer(group)
     consumer.set_namesrv_addr(namesrv)
     consumer.pop_mode = True
+    # 消费池是 core/max 两档：只压 max 会让默认的 min(20) > max 顶掉启动期的
+    # `consumeThreadMin (20) is larger than consumeThreadMax (4)` 闸门
+    # （Java DefaultMQPushConsumerImpl:1116），两个一起压才是"小池子"。
+    consumer.consume_thread_min = 4
     consumer.consume_thread_max = 4
     consumer.consume_message_batch_max_size = 4
     # ⚠ 故意压到 10s：让"没 ack → invisibleTime 到期复活重投"在观测窗口内**来得及暴露**。
@@ -168,6 +172,7 @@ def main():
     c2 = DefaultMQPushConsumer(group_later)
     c2.set_namesrv_addr(namesrv)
     c2.pop_mode = True
+    c2.consume_thread_min = 2      # 同上：min/max 必须成对压，否则启动期闸门先拒
     c2.consume_thread_max = 2
     c2.pop_invisible_time = 5000
     # 消费失败时的延迟档位：把第一档压到 3s，让"延长不可见时间 → 重新可见"尽快发生
@@ -227,6 +232,7 @@ def main():
     c5 = DefaultMQPushConsumer(group_stats)
     c5.set_namesrv_addr(namesrv)
     c5.pop_mode = True
+    c5.consume_thread_min = 2      # 同上：min/max 必须成对压
     c5.consume_thread_max = 2
     c5.set_message_listener(SimpleMessageListener(stats_listener))
     c5.subscribe(topic_stats, "*")

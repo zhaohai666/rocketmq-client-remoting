@@ -1271,7 +1271,7 @@ void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs
                                                     std::shared_ptr<PopProcessQueue> pq,
                                                     const MessageQueue& mq) {
     // 对应 Java ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest。
-    // 投给**有界线程池**（core=consumeThreadMin / max=consumeThreadMax）：
+    // 投给**core/max 两档线程池**（core=consumeThreadMin / max=consumeThreadMax，队列无界）：
     // 此前这里每批起一个 detached 线程（无上限），慢监听器一上来就线程爆炸，
     // 而 setConsumeThreadNums() 设的值完全没作用。Java 用线程池 + 无界队列，
     // 因此真实并发度 == corePoolSize，updateCorePoolSize() 在运行时能改它。

@@ -237,8 +237,8 @@ public class ConsumeExecutorTests
     public void JavaDefaults()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
-        Assert.Equal(20, c.ConsumeThreadMin);       // Java consumeThreadMin 默认 20
-        Assert.Equal(64, c.ConsumeThreadMax);       // Java consumeThreadMax 默认 64
+        Assert.Equal(20, c.ConsumeThreadMin);       // Java consumeThreadMin 默认 20 (:162)
+        Assert.Equal(20, c.ConsumeThreadMax);       // Java consumeThreadMax 默认 20 (:169)
         Assert.Equal(100000L, c.AdjustThreadPoolNumsThreshold);
         Assert.Equal(20, c.GetCorePoolSize());      // = consumeThreadMin
     }
@@ -247,18 +247,37 @@ public class ConsumeExecutorTests
     public void UpdateCorePoolSizeGuards()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
-        Assert.True(c.UpdateCorePoolSize(30));
-        Assert.Equal(30, c.GetCorePoolSize());
+        // Java 用无界队列 ⇒ 真实并发度 == core；默认 max=20，故 core 只能往**下**调
+        Assert.True(c.UpdateCorePoolSize(15));
+        Assert.Equal(15, c.GetCorePoolSize());
         Assert.False(c.UpdateCorePoolSize(0));
         Assert.False(c.UpdateCorePoolSize(-1));
-        Assert.False(c.UpdateCorePoolSize(64));     // == consumeThreadMax
-        Assert.True(c.UpdateCorePoolSize(63));      // 刚好低于 max
-        Assert.Equal(63, c.GetCorePoolSize());
+        Assert.False(c.UpdateCorePoolSize(20));     // == consumeThreadMax
+        Assert.True(c.UpdateCorePoolSize(19));      // 刚好低于 max
+        Assert.Equal(19, c.GetCorePoolSize());
         // Short.MAX_VALUE 上界：要把 consumeThreadMax 抬上去才轮得到这条守卫
         c.SetConsumeThreadMax(40000);
         Assert.False(c.UpdateCorePoolSize(32768));  // above Short.MAX_VALUE
         Assert.True(c.UpdateCorePoolSize(32767));   // 上界本身合法
         Assert.Equal(32767, c.GetCorePoolSize());
+    }
+
+    [Fact]
+    public void DefaultMaxIsJava5xTwentyNot4xSixtyFour()
+    {
+        // 回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
+        // Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），
+        // 守卫 n < max 把默认配置下的上调全挡掉；差异不报错，只表现为
+        // "同一个 UpdateCorePoolSize(30)，本端口真的改了并发度、Java 没改"。
+        var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
+        Assert.Equal(20, c.ConsumeThreadMax);
+        Assert.False(c.UpdateCorePoolSize(30));
+        Assert.False(c.UpdateCorePoolSize(21));
+        Assert.Equal(20, c.GetCorePoolSize());      // 一个都没落下去
+        // 抬 max 之后区间重新打开（setter 与 Java 一样是裸赋值，只夹 >= 1）
+        c.SetConsumeThreadMax(30);
+        Assert.True(c.UpdateCorePoolSize(25));
+        Assert.Equal(25, c.GetCorePoolSize());
     }
 
     [Fact]
@@ -374,10 +393,14 @@ public class ConsumeExecutorTests
         using var ex = new ConsumeExecutor(20, 64, keepAliveSeconds: 30);
         c.PopConsumeExecutorForTest = ex;
         Assert.Equal(20, c.GetCorePoolSize());
+        Assert.True(c.UpdateCorePoolSize(13));      // < 默认 max 20，能落下去
+        Assert.Equal(13, ex.GetCorePoolSize());
+        Assert.Equal(13, c.GetCorePoolSize());
+        Assert.False(c.UpdateCorePoolSize(20));     // 守卫仍按 consumeThreadMax 判
+        Assert.Equal(13, ex.GetCorePoolSize());
+        // 抬 max 之后即可上调（core 变大 → 执行器按 Java 启发式补线程）
+        c.SetConsumeThreadMax(40);
         Assert.True(c.UpdateCorePoolSize(33));
-        Assert.Equal(33, ex.GetCorePoolSize());
-        Assert.Equal(33, c.GetCorePoolSize());
-        Assert.False(c.UpdateCorePoolSize(64));     // 守卫仍按 consumeThreadMax 判
         Assert.Equal(33, ex.GetCorePoolSize());
     }
 }

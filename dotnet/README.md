@@ -199,8 +199,13 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | scheduled-intervals | 20 PASS / 0 FAIL（2026-09-24 实测） | I1~I3（与 Python `verify_interval_live.py`、C++ `rmq_live_scheduled_intervals`、Rust `live_scheduled_intervals` 同场景）：I3 门面配的周期真的落到实例（`PollNameServerIntervalMillis` → 路由刷新周期，1s 组与不配的 30s 对照组各断言一次）→ I1 两个生产者各把一个**还没建出来**的 topic 登记进在用集合，先等 1.5s 让两边首跳（`scheduleAtFixedRate` 的 initialDelay=10ms）都落空一次、再建 topic ⇒ 缓存里何时出现它只由周期决定：1s 组 0.53s 拿到，那一刻 30s 组**还没有**，最终 28.76s 拿到（固定速率锚定，逐跳对着同一时间轴算、误差不累积）→ I2 两个消费者（落盘周期 1s / 60s）各消费 3 条后 broker 位点仍是 0，首个落盘落在 **10.49s**（≈ Java `:417-423` 的 initialDelay 10s，60s 组同样是 10.81s —— 这一步由 initialDelay 驱动、不是周期），第二批后 1s 组 0.68s 内把 6 推上去、60s 组**仍是 3**（下一跳在 60s 后），`Shutdown()` 收尾补一笔把 6 落盘。⚠ 修之前这里必然红：macOS 上 `ManualResetEventSlim.Wait(100ms)` 实测 131ms（系统定时器多给一个 tick），「按 100ms 切片睡满 30s」实际要 39.2s，全部周期被拉长 ~31% —— 现在统一走 `Schedules.WaitUntil(...)`（`ManualResetEventSlim.Wait` 一次睡到绝对计划时刻，整段又能被 `Shutdown` 的 `Set` 立刻唤醒；落后于计划时不等待、立刻补跑，与 Java 的 catch-up 一致），另有一组离线用例证明首跳落在 initialDelay 而不是 initialDelay+period |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **604 passed / 0 failed**，零 warning
-（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **605 passed / 0 failed**，零 warning
+（`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`ConsumeThreadPoolTests`（23 项，消费线程弹性）锁住
+Java 5.x 的**默认值两侧同为 20**（`DefaultMQPushConsumer:162/:169`；4.x 才是 min=20/max=64，早年照抄了 4.x）
+以及 `UpdateCorePoolSize` 的三道守卫：无界队列下真实并发度 == `CorePoolSize`，默认配置里 core 只能往**下**调，
+`UpdateCorePoolSize(20)`（等于 max）与 `30` 一律**静默忽略**，把 `SetConsumeThreadMax(40)` 抬上去之后 33 才生效。
+max 写成 64 时这些值会真的改并发度，而 Java 侧什么都不会发生——不报错、不抛异常，只有两边跑出不同吞吐。
+`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`
 且单位是 **MiB**（`<=0` 关闭，正好 1MiB 即算命中）、位点跨度**严格大于**

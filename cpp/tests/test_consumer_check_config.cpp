@@ -145,7 +145,7 @@ void testDefaultsClearEveryGate() {
     DefaultMQPushConsumer c = fresh();
     expect(gateMessage(c).empty(), "defaults.pass", gateMessage(c));
     // 默认值本身就是 Java 的那一组（改了会连带 #72 一起对不上）
-    expect(c.getConsumeThreadMin() == 20 && c.getConsumeThreadMax() == 64, "defaults.threadNums",
+    expect(c.getConsumeThreadMin() == 20 && c.getConsumeThreadMax() == 20, "defaults.threadNums",
            num(c.getConsumeThreadMin()) + "/" + num(c.getConsumeThreadMax()));
     expect(c.consumeConcurrentlyMaxSpan() == 2000, "defaults.maxSpan",
            num(c.consumeConcurrentlyMaxSpan()));

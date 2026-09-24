@@ -182,25 +182,42 @@ void testCorePoolSizeMutation() {
 void testJavaDefaults() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
     expectEq(c.getConsumeThreadMin(), 20, "consumeThreadMin default = 20");
-    expectEq(c.getConsumeThreadMax(), 64, "consumeThreadMax default = 64");
+    expectEq(c.getConsumeThreadMax(), 20, "consumeThreadMax default = 20");
     expectEq(c.getAdjustThreadPoolNumsThreshold(), 100000, "adjustThreadPoolNumsThreshold default");
     expectEq(c.getCorePoolSize(), 20, "corePoolSize default = consumeThreadMin");
 }
 
 void testUpdateCorePoolSizeGuards() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
-    expect(c.updateCorePoolSize(30), "30 accepted");
-    expectEq(c.getCorePoolSize(), 30, "core updated to 30");
+    // Java 用无界队列 ⇒ 真实并发度 == core；默认 max=20，故 core 只能往**下**调
+    expect(c.updateCorePoolSize(15), "15 accepted (below default max)");
+    expectEq(c.getCorePoolSize(), 15, "core updated to 15");
     expect(!c.updateCorePoolSize(0), "0 rejected");
     expect(!c.updateCorePoolSize(-1), "-1 rejected");
-    expect(!c.updateCorePoolSize(64), "== consumeThreadMax rejected");
-    expect(c.updateCorePoolSize(63), "63 accepted (just below max)");
-    expectEq(c.getCorePoolSize(), 63, "core updated to 63");
+    expect(!c.updateCorePoolSize(20), "== consumeThreadMax rejected");
+    expect(c.updateCorePoolSize(19), "19 accepted (just below max)");
+    expectEq(c.getCorePoolSize(), 19, "core updated to 19");
     // Short.MAX_VALUE 上界：要把 consumeThreadMax 抬上去才轮得到这条守卫
     c.setConsumeThreadMax(40000);
     expect(!c.updateCorePoolSize(32768), "32768 rejected (above Short.MAX_VALUE)");
     expect(c.updateCorePoolSize(32767), "32767 accepted (upper bound itself)");
     expectEq(c.getCorePoolSize(), 32767, "core updated to Short.MAX_VALUE");
+}
+
+// 回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
+// Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），守卫
+// `corePoolSize < consumeThreadMax` 把默认配置下的上调全挡掉；差异不报错，只表现为
+// "同一个 updateCorePoolSize(30)，本端口真的改了并发度、Java 没改"。
+void testDefaultMaxIsJava5xTwenty() {
+    DefaultMQPushConsumer c("GID_ThreadPoolUnit");
+    expectEq(c.getConsumeThreadMax(), 20, "default max is Java 5.x's 20");
+    expect(!c.updateCorePoolSize(30), "30 rejected under default max");
+    expect(!c.updateCorePoolSize(21), "21 rejected under default max");
+    expectEq(c.getCorePoolSize(), 20, "nothing landed");
+    // 抬 max 之后区间重新打开（setter 与 Java 一样是裸赋值，只夹 >= 1）
+    c.setConsumeThreadMax(30);
+    expect(c.updateCorePoolSize(25), "25 accepted after raising max to 30");
+    expectEq(c.getCorePoolSize(), 25, "core updated to 25");
 }
 
 void testSetConsumeThreadNumsSetsBothAndCore() {
@@ -291,6 +308,7 @@ int main() {
     testCorePoolSizeMutation();
     testJavaDefaults();
     testUpdateCorePoolSizeGuards();
+    testDefaultMaxIsJava5xTwenty();
     testSetConsumeThreadNumsSetsBothAndCore();
     testConsumeThreadMinSetterMovesCoreMaxDoesNot();
     testMsgAccCntRules();

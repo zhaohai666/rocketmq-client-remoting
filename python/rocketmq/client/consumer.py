@@ -683,13 +683,16 @@ class DefaultMQPushConsumer:
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         self.consume_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
         # ---- 消费线程池（对齐 Java DefaultMQPushConsumer / ThreadPoolExecutor）----
-        # Java 默认 consumeThreadMin=20、consumeThreadMax=64。
+        # Java 5.x 的默认值是 min=20（:162）**且** max=20（:169）—— 两侧同为 20
+        # （4.x 时代才是 min=20/max=64，本端口早年照抄的是 4.x 那一组）。
         # 本实现的**拉取**路径是"每队列一个拉取线程"（不是共享线程池），只有 **POP**
         # 路径才真正建线程池（Java 的 ConsumeMessagePopConcurrentlyService 也是线程池）。
         # 两个值同时是"声明值"：consume_thread_max 既是 POP 线程池的 max，也是
         # update_core_pool_size 的上界（Java 守卫 n < getConsumeThreadMax()）。
+        # 因为 Java 用**无界**队列（真实并发度 == core），默认配置下 core 只能往**下**
+        # 调（n < 20）—— 这是 Java 的既有行为，不是本端口的额外限制。
         self.consume_thread_min = 20
-        self.consume_thread_max = 64
+        self.consume_thread_max = 20
         # 自动弹性阈值（Java DefaultMQPushConsumer.adjustThreadPoolNumsThreshold，默认 100000）。
         # ⚠ 自动 inc/dec 在 Java 5.5.1 是**空实现**（AbstractConsumeMessageService:70-75），
         # 见 adjust_thread_pool()：保留计算与配置是为了可观测，不要"顺手修好"。

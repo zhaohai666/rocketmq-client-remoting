@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 956 条单元/协议测试（952 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 957 条单元/协议测试（953 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -65,6 +65,12 @@ python verify_fail_fast_live.py # broker 真死掉时在途请求立刻判死（
 全 0，正是漏记的形状。`tests/test_pop_consumer.py`（`TestPopLoopPullStats`，3 项）跑**真实的**
 `_queue_pop_loop`，离线锁死三种 status 各自记哪几格。实测 `pullRT=2006.2`、`pullTPS=1.9982`、
 52 发 52 收（两格的具体取值随真机节奏浮动，判据只要求非 0）。
+
+⚠ 这个脚本曾因**只压 `consume_thread_max` 不压 `consume_thread_min`** 起不来：默认值两侧同为
+20（Java 5.x `DefaultMQPushConsumer:162/:169`），把 max 压到 4 之后 `consumeThreadMin (20) is
+larger than consumeThreadMax (4)` 会直接在 `start()` 被 #66 那道闸门挡下
+（`DefaultMQPushConsumerImpl:1116`）。小池子必须**两个一起压**（脚本在三处都补上了 min），
+否则看到的是启动失败，而不是"并发度调小了"。
 
 `verify_redelivery_live.py` 的 S9 是**死信终态**：`maxReconsumeTimes=2` 的组对同一条消息只投
 3 次（listener 一直回 `RECONSUME_LATER`），实测档位 `0s / 10s / 40s` —— Java broker 用

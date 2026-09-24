@@ -392,9 +392,11 @@ pub struct ConsumerConfig {
     pub consume_from_where: String,
     /// Python `consume_timestamp`：`yyyyMMddHHmmss`，默认 30 分钟前。
     pub consume_timestamp: String,
-    /// Java `consumeThreadMin` = 20。
+    /// Java `consumeThreadMin` = 20（`DefaultMQPushConsumer:162`）。
     pub consume_thread_min: i32,
-    /// Java `consumeThreadMax` = 64。
+    /// Java `consumeThreadMax` = 20（`DefaultMQPushConsumer:169`）—— 5.x 起与 min 同为 20，
+    /// 4.x 才是 64。它同时是 `update_core_pool_size` 的上界（守卫 `core < max`），
+    /// 于是默认配置下只能把并发度往**下**调。
     pub consume_thread_max: i32,
     /// Java `adjustThreadPoolNumsThreshold` = 100000。
     pub adjust_thread_pool_nums_threshold: i64,
@@ -473,7 +475,7 @@ impl Default for ConsumerConfig {
             consume_from_where: ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET.to_string(),
             consume_timestamp: default_consume_timestamp(),
             consume_thread_min: 20,
-            consume_thread_max: 64,
+            consume_thread_max: 20,
             adjust_thread_pool_nums_threshold: 100_000,
             consume_concurrently_max_span: 2000,
             pull_threshold_for_queue: 1000,
@@ -4132,7 +4134,7 @@ mod tests {
             cfg.consume_from_where,
             ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET
         );
-        assert_eq!((cfg.consume_thread_min, cfg.consume_thread_max), (20, 64));
+        assert_eq!((cfg.consume_thread_min, cfg.consume_thread_max), (20, 20));
         assert_eq!(cfg.adjust_thread_pool_nums_threshold, 100_000);
         assert_eq!(cfg.consume_concurrently_max_span, 2000);
         assert_eq!(
@@ -4207,6 +4209,32 @@ mod tests {
             );
         }
         assert!(DefaultMQPushConsumer::new("G").is_ok());
+    }
+
+    /// `update_core_pool_size` 的三道守卫（Java `AbstractConsumeMessageService:63-71`）。
+    ///
+    /// ⚠ 默认 `consume_thread_max` 曾是照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**
+    /// 的值在本端口能生效（Java 5.x 两侧同为 20，`DefaultMQPushConsumer:162/:169`）。
+    /// 差异不报错，只表现为「同一个 `update_core_pool_size(30)`，本端口真的改了并发度、
+    /// Java 没改」，所以这五格必须钉住。
+    #[test]
+    fn update_core_pool_size_guards_match_java() {
+        let c = DefaultMQPushConsumer::new("G").unwrap();
+        assert_eq!(c.config().consume_thread_max, 20, "Java 5.x 默认两侧同为 20");
+        // 无界队列 ⇒ 真实并发度 == core；默认 max=20，故只能往**下**调
+        assert!(c.update_core_pool_size(15));
+        assert_eq!(c.get_core_pool_size(), 15);
+        assert!(!c.update_core_pool_size(0));
+        assert!(!c.update_core_pool_size(-1));
+        assert!(!c.update_core_pool_size(20), "== consume_thread_max 也不行");
+        assert!(!c.update_core_pool_size(30), "回归：默认 max 不能是 4.x 的 64");
+        assert!(c.update_core_pool_size(19), "刚好低于 max");
+        assert_eq!(c.get_core_pool_size(), 19);
+        // 抬 max 之后区间重新打开（update_config 是裸赋值，与 Java 的 setter 一致）
+        c.update_config(|x| x.consume_thread_max = 40_000);
+        assert!(!c.update_core_pool_size(32768), "above Short.MAX_VALUE");
+        assert!(c.update_core_pool_size(32767), "上界本身合法");
+        assert_eq!(c.get_core_pool_size(), 32767);
     }
 
     /// Java `DefaultMQPushConsumer:89`（字段默认 `new AllocateMessageQueueAveragely()`）

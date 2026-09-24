@@ -2,8 +2,8 @@
 //
 // 为什么不用 std::async / 裸 std::thread：
 //   * 之前 C++ 的 POP 路径是"每个批次起一个 detached 线程"，**无上限**，慢监听器一上来
-//     就线程爆炸；Java 用的是有界线程池（ConsumeMessagePopConcurrentlyService 持有
-//     consumeExecutor），并且线程数与 consumeThreadMin/Max 挂钩 —— 但本项目的
+//     就线程爆炸；Java 用的是 core/max 两档线程池（ConsumeMessagePopConcurrentlyService 持有
+//     consumeExecutor，队列无界），并且线程数与 consumeThreadMin/Max 挂钩 —— 但本项目的
 //     consumeThreadNums_ 此前**设了没有任何作用**（`setConsumeThreadNums(4)` 实际是死配置）。
 //   * Java 在 LinkedBlockingQueue（无界）下 **真实并发度 == corePoolSize**
 //     （poolSize < corePoolSize 才新建线程，否则入队），所以线程弹性全挂在 core 上：

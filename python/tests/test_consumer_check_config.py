@@ -82,7 +82,7 @@ class TestDefaultsPass:
         c = _consumer()
         c._check_config_ranges()
         # 默认值本身就是 Java 的那一组，改默认会连带 #72 一起对不上
-        assert (c.consume_thread_min, c.consume_thread_max) == (20, 64)
+        assert (c.consume_thread_min, c.consume_thread_max) == (20, 20)
         assert c.consume_concurrently_max_span == 2000
         assert (c.pull_threshold_for_queue, c.pull_threshold_size_for_queue) == (1000, 100)
         assert (c.pull_threshold_for_topic, c.pull_threshold_size_for_topic) == (-1, -1)
@@ -93,7 +93,7 @@ class TestDefaultsPass:
     def test_both_bounds_are_inclusive(self, field, lo, hi, _msg):
         """下界与上界**本身**合法：把 ``< lo`` 写成 ``<= lo`` 只有这一格能抓到。
 
-        ``consume_thread_*`` 要把 min/max 一起放到各自的极值上：默认 (20, 64) 下
+        ``consume_thread_*`` 要把 min/max 一起放到各自的极值上：默认 (20, 20) 下
         单独抬 min 到 1000 或压 max 到 1 都会先撞上"min 不能大于 max"那道门，
         区间边界这一格就没测到。
         """
