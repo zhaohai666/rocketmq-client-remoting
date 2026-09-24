@@ -504,6 +504,80 @@ internal static class AdminLive
             Check("Offset 只读查询", false, e.Message);
         }
 
+        // ---------- 7.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）----------
+        // 单开一个 1 队列 topic：位点语义只在单队列上才确定（多队列时分不清落哪一条）。
+        // 3 条消息 ⇒ maxOffset=3；远未来时间戳下 UPPER = 最后一条自身位点(2)、
+        // LOWER = 它的下一个位点(3) = maxOffset（ConsumeQueue.binarySearchInQueueByTime
+        // 的 case 1）。两者不同即证明 boundaryType 字段真的到了 broker 并被解析 ——
+        // 若字段丢失或被忽略，两次都会落到 LOWER。
+        string bndTopic = "AdminBoundaryTopicDotnet_" + stamp;
+        try
+        {
+            admin.CreateTopic(MixAll.DefaultTopic, bndTopic, 1);
+            Check("createTopic(" + bndTopic + ", 1 队列)", true, "queueNum=1");
+        }
+        catch (Exception e)
+        {
+            Check("createTopic(" + bndTopic + ", 1 队列)", false, e.Message);
+        }
+
+        try
+        {
+            var bprod = new DefaultMQProducer("AdminLiveDotnetBoundaryProducer_" + stamp)
+            {
+                NamesrvAddr = _gNamesrv,
+                SendMsgTimeout = 5000,
+            };
+            bprod.Start();
+            for (int i = 0; i < 3; ++i)
+            {
+                bprod.Send(new Message(bndTopic,
+                    Str2Bytes("boundary-" + i.ToString(CultureInfo.InvariantCulture))));
+            }
+
+            Check("boundary topic 发送 3 条", true, "ok");
+            bprod.Shutdown();
+        }
+        catch (Exception e)
+        {
+            Check("boundary topic 发送 3 条", false, e.Message);
+        }
+
+        Thread.Sleep(2000);
+        try
+        {
+            var bmq = new MessageQueue(bndTopic, firstMq.BrokerName, 0);
+            long future = UtilAll.CurrentTimeMillis() + 600000;
+            long bMax = admin.MaxOffset(bmq);
+            long lo = admin.SearchLowerBoundaryOffset(bmq, future);
+            long up = admin.SearchUpperBoundaryOffset(bmq, future);
+            long loPast = admin.SearchLowerBoundaryOffset(bmq, 1);
+            long upPast = admin.SearchUpperBoundaryOffset(bmq, 1);
+            Check("boundary topic maxOffset == 3", bMax == 3,
+                "max=" + bMax.ToString(CultureInfo.InvariantCulture));
+            Check("LOWER 边界 = maxOffset（队尾之后的下一个位点）", lo == bMax,
+                "lower=" + lo.ToString(CultureInfo.InvariantCulture)
+                + " maxOffset=" + bMax.ToString(CultureInfo.InvariantCulture));
+            Check("UPPER 边界 = maxOffset-1（最后一条自身位点）", up == bMax - 1,
+                "upper=" + up.ToString(CultureInfo.InvariantCulture)
+                + " maxOffset-1=" + (bMax - 1).ToString(CultureInfo.InvariantCulture));
+            Check("两个边界确实不同（证明 boundaryType 生效）", lo != up,
+                "lower=" + lo.ToString(CultureInfo.InvariantCulture)
+                + " upper=" + up.ToString(CultureInfo.InvariantCulture));
+            Check("时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+                loPast == 0 && upPast == 0,
+                "lower=" + loPast.ToString(CultureInfo.InvariantCulture)
+                + " upper=" + upPast.ToString(CultureInfo.InvariantCulture));
+            // admin.SearchOffset 走的就是 LOWER（Java MQAdminImpl:189）：同时间戳必须同结果
+            Check("searchOffset 默认边界与显式 LOWER 同结果",
+                admin.SearchOffset(bmq, future) == lo,
+                "lower=" + lo.ToString(CultureInfo.InvariantCulture));
+        }
+        catch (Exception e)
+        {
+            Check("searchOffset boundaryType", false, e.Message);
+        }
+
         // ---------- 8. 消费 + sendMessageBack 重投 ----------
         // 顺序很关键：必须**先消费**再重投。若先把位点重置到 max，消费者就再也拉不到
         // 历史消息，sendMessageBack 路径根本没机会执行。
@@ -784,6 +858,16 @@ internal static class AdminLive
         catch (Exception e)
         {
             Check("deleteTopic", false, e.Message);
+        }
+
+        try
+        {
+            admin.DeleteTopic(bndTopic);
+            Check("deleteTopic(boundary)", true, "OK");
+        }
+        catch (Exception e)
+        {
+            Check("deleteTopic(boundary)", false, e.Message);
         }
 
         admin.Shutdown();

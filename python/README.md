@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 937 条单元/协议测试（933 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 944 条单元/协议测试（940 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -26,7 +26,7 @@ ROCKETMQ_JAVA_SRC=<...>/remoting/src/main/java/org/apache/rocketmq/remoting/prot
 ```bash
 python verify_message_types.py    # 7 类消息能力，18 PASS/0 FAIL（异步 9 项：不阻塞返回、线程口径、并发、定点、失败只走回调）
 python verify_request_reply_live.py # request-reply 全链路（22 PASS/0 FAIL）：325 落地、REPLY_TO_CLIENT=真实 clientId、超时/并发/普通消费不受影响；**错误码口径**：等应答超时带 Java 的 10006 `REQUEST_TIMEOUT_EXCEPTION`，`create_reply_message` 拿不到 broker 写的 `CLUSTER`/请求为 None 时带 10007 `CREATE_REPLY_MESSAGE_EXCEPTION`（文案逐字对 Java）
-python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（63 PASS/0 FAIL/1 SKIP）
+python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（72 PASS/0 FAIL/1 SKIP）
 python verify_compression_live.py selftest   # 自动压缩自产自销 + broker 侧压缩体校验
 python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 探针跨客户端互通
 python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需 broker traceTopicEnable=true）
@@ -107,6 +107,7 @@ rocketmq/
 │   ├── message_decoder.py     17 段存储格式 + 6 段批量格式的编解码（含 zlib 解压）
 │   ├── message_const.py       MessageConst 属性键（含 INDEX_KEY/UNIQUE/TAG_TYPE）
 │   ├── sysflag.py             MessageSysFlag / PullSysFlag / PermName
+│   ├── boundary_type.py       时间戳查位点的边界语义（LOWER/UPPER，含 getType 宽松解析）
 │   ├── mix_all.py / util_all.py
 │   ├── recall_message_handle.py 定时消息撤回句柄 v1（base64url + 5 段，Java 同格式）
 │   └── subscription_data.py / topic_config.py / message_accessor.py
@@ -217,6 +218,20 @@ Admin 响应体全崩。
 逐 broker 扇出 343、按 Set 去重合并），原先那笔单 broker 的原始调用改名为
 `query_topics_by_consumer_to_broker`。343 读的是 offsetTable（`whichTopicByConsumer`），
 所以**组没提交过位点时回空表是预期**。
+
+时间戳查位点带 **`boundaryType`**（`SearchOffsetRequestHeader:41`）：admin 的两个边界入口
+`search_lower_boundary_offset` / `search_upper_boundary_offset`（`DefaultMQAdminExt:133/:137`）
+分别固定发 `LOWER` / `UPPER`，`search_offset` 等价于 LOWER（`MQAdminImpl:189`）；MQ 级
+`search_offset_by_timestamp` 默认也是显式 LOWER（`MQClientAPIImpl:1381`），传
+`boundary_type=None` 则整键不写，复现已废弃的 5 参重载（`:1352`）的报文。入网文本是
+`Enum.toString()` 的**大写枚举名**（`RemotingCommand.makeCustomHeaderToNet:430`），
+`BoundaryType.getName()` 的小写名只喂给 `getType` 做比对、从不上报文；字段 `@CFNullable`，
+broker 缺键回落 LOWER，有键但值不认识（`getType:41` 只认 `equalsIgnoreCase("upper")`）同样回落。
+真机判别式（`verify_admin_live.py` 第 7.5 节）：1 队列 topic 发 3 条后对远未来时间戳查位点，
+LOWER = maxOffset(3)、UPPER = maxOffset-1(2) —— 两个数不同即证明字段真的到了 broker 并被解析
+（字段丢失或两边都按 LOWER 处理时两个数必然相等）。报文形状（含 `boundary_type=None` 时
+**整键不写**、缺键回 `None`、未知值宽松回落 LOWER）由 `tests/test_search_offset_boundary.py`
+（7 项，离线抓 `make_custom_header_to_net()` 的 extFields）锁死。
 
 ## 两条消息编码路径
 

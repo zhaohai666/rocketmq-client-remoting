@@ -68,7 +68,7 @@ SSL 会话上交叠，而 OpenSSL 明确不支持两个线程同时用一个 `SS
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 37 个用例，3248 项断言（36 个测试二进制 3175 + interop 73），~45s
+cd build && ctest --output-on-failure     # 37 个用例，3261 项断言（36 个测试二进制 3188 + interop 73），~50s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -79,7 +79,7 @@ cd build && ctest --output-on-failure     # 37 个用例，3248 项断言（36 �
 | `transport` | 55 | 真实本机 TCP：同步/异步/oneway、**半包重组**、opaque 匹配、建连失败、超时、重连、**GO_AWAY 重发（同步+异步、只重发一次、开关关掉不重连）**、地址解析 |
 | `fail_fast` | 19 | 对端断开时在途请求立刻判死（Java `NettyRemotingHandler#close` → `failFast` → `requestFail`）：真 socket 对端读完一帧就关 ⇒ 同步调用毫秒级抛 `RemotingSendRequestException`（不是等满超时才报 `RemotingTimeoutException`——异步发送的重试分类按异常**类型**分流）、异步回调**恰好一次**、按**连接对象身份**认领在途请求（别人家的请求不受牵连，同地址换新连接后的新请求也不被旧读线程误伤）、`shutdown` 把在途排空 |
 | `compression` | 152 | 三后端：类型解析（含 Java 的 `0→ZLIB` 兼容映射）、zlib / **LZ4 Frame** / **ZSTD** 往返、**外部硬编码真值夹具**（Python zlib.compress、Java lz4-java、zstd-jni、`zstd -3` CLI 各产的帧）、帧头 magic 与 LZ4 block-independence 位、17 段报文 × 三种类型、解压后清 flag、后端缺失或未知类型必须抛错而非交出压缩流 |
-| `admin` | 159 | fastjson2 非法 JSON 容错、`ConsumeStatsList` 的 **Java 字段名 `consumeStatsList`**（键名错一个字符就静默解析成空列表）、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid` |
+| `admin` | 172 | fastjson2 非法 JSON 容错、`ConsumeStatsList` 的 **Java 字段名 `consumeStatsList`**（键名错一个字符就静默解析成空列表）、`TopicConfig` / `SubscriptionGroupConfig` 默认值与字段名、`TopicStatsTable` / `ConsumeStats` / `ResetOffsetBody`、properties 文本往返、`PermName::isValid`、`SearchOffsetRequestHeader.boundaryType`（入网是大写枚举名、`@CFNullable` 缺键不写、回解只认 `equalsIgnoreCase("upper")`） |
 | `logging` | 36 | 行格式（毫秒 / pid / 线程名 / `文件:行号`）、主线程落 `main`、线程名 thread-local、按大小轮转与 `maxIndex` 上限、级别过滤、关闭文件输出后不写盘 |
 | `acl` | 56 | ACL 签名算法（extFields 按 key 字典序、只拼 value、跳过 Signature，再拼 body）与 Java 官方实现对拍 |
 | `request_reply` | 40 | 请求-响应模式的消息编解码、`reply_to` 属性、correlationId 匹配与超时；**错误码口径**：等应答超时抛 `RemotingTimeoutException` 并带 Java 的 10006 `REQUEST_TIMEOUT_EXCEPTION`、`createReplyMessage` 造不出应答时带 10007 `CREATE_REPLY_MESSAGE_EXCEPTION`（文案点到缺失的 `CLUSTER` 属性） |
@@ -155,7 +155,7 @@ ROCKETMQ_JAVA_SRC=/path/to/zhaohai666-rocketmq ./tests/rmq_test_java_alignment
 | 工具 | 结果 | 覆盖 |
 | --- | --- | --- |
 | `rmq_live_message_types` | 20/20 | 异步发送（`sendAsync` 不阻塞调用方 + 定点 `sendAsync(msg, mq)` 在全新实例上自己刷出路由）/ 顺序消息（同 key 同队列 + 保序）/ Tag 过滤 / 用户属性 / 延迟消息 / 按 Key 查询 / 事务消息 / 批量发送（320，投成 3 条独立消息且 offset 连续）/ 心跳注册 |
-| `rmq_admin_live` | 57 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → `resetOffsetByQueueId`（25 + 带 queueId/offset 的 222：重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构）→ `queryTopicsByConsumer(group)`（按 `%RETRY%` 路由扇出合并）与 `queryTopicsByConsumerToBroker` → 清理 |
+| `rmq_admin_live` | 66 PASS / 1 SKIP | 集群探活 → 建 topic → 路由/配置查询 → **broker 配置（properties 文本）读改写回** → NameServer KV → 订阅组（建/单查/分页/examine/删）→ 生产 → 各类统计与查询 → `viewMessage` → **`searchOffset` 的 `boundaryType`**（1 队列 topic 发 3 条：远未来时间戳下 LOWER = maxOffset(3)、UPPER = maxOffset-1(2)，**两数不同**才证明字段真到了 broker 并被解析；时间戳早于全部消息时两个边界都塌到 0）→ **`sendMessageBack` 重投到 `%RETRY%`** → `resetOffsetByTimestamp` → `resetOffsetByQueueId`（25 + 带 queueId/offset 的 222：重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构）→ `queryTopicsByConsumer(group)`（按 `%RETRY%` 路由扇出合并）与 `queryTopicsByConsumerToBroker` → 清理 |
 | `rmq_compression_live` | 10 PASS | 三后端（zlib / LZ4 Frame / ZSTD）自动压缩自产自销 + **与真实 Java/Python/.NET/Rust 客户端双向互通**（互通矩阵见 `../scripts/compression_matrix.sh`）；构建时未编入的后端打 SKIP |
 | `rmq_live_trace` | 17 PASS / 0 FAIL | 消息轨迹全链路：`SendResult`（UNIQ_KEY / offsetMsgId / regionId / traceOn）→ Pub 轨迹 → 业务消费 → SubBefore/SubAfter 配对与 contextCode → 轨迹消息 keys 反查 → 防递归（轨迹 topic 自身不上报）→ `enable_trace=false` 不产生轨迹 → 编码段数 == 解码记录数 → 无 keys 消息的空段容错 |
 | `rmq_validators_live` | 44 PASS / 0 FAIL | 名字校验真机对拍（与 Python/Rust/.NET 同场景）：S1 发送路径 13 项本地快拒（空白/超长/非法字符 topic、禁发的 broker 内部流水、body 三档 + `INNER_MULTI_DISPATCH` 分隔符，全部 <50ms 且不碰网络）、S2 批量逐条校验 + 同质性、S3 生产者 `start()` 三道组名门 + 120 等长边界放行、S4 正腿（合法名字建 topic → push/lite 两路各收 3 条）、S5 对照腿（合法但不存在的 topic 不被误伤，真往返 46ms vs 本地 0.17ms）、S6 pull/lite 组名门 + 合法 pull 组查队列与位点、S7 `createTopic` 挡空白/非法/系统 topic、**S8 寻址故障定性**（零地址时路由漏斗报 10004 + Java 原文案、地址配了只是连不上时报的**不是** 10004 —— 判的是配置不是可达性、真发送定性 10005、完全没配时 `start()` 就地 10004 且不进 `started` 态、真集群对照腿照常 `SEND_OK`） |
@@ -194,6 +194,7 @@ cpp/
 │   │   ├── byte_buffer.h           大端读写游标
 │   │   ├── consistent_hash.h       一致性哈希环（`ConsistentHashRouter` + 自带 MD5）
 │   │   ├── recall_message_handle.h 定时消息撤回句柄 v1 编解码（Java `RecallMessageHandle`）
+│   │   ├── boundary_type.h         时间戳查位点的边界语义（LOWER/UPPER，含 getType 宽松解析）
 │   │   ├── logging.h               header-only 日志（默认 INFO，按大小轮转，线程名/毫秒/文件:行）
 │   │   └── net_compat.h            socket 跨平台兼容（含 SIGPIPE 处理）
 │   ├── remoting/
@@ -219,6 +220,15 @@ cpp/
 **字段名一律以 Java 为准。** broker 用 fastjson2 按 Java 属性名反序列化，
 字段名错一个就**静默丢字段**（不报错）。差异清单见技能文档
 `~/.workbuddy/skills/rocketmq-cpp-build-verify/SKILL.md`。
+
+**枚举字段入网走 `Enum.toString()` = 大写枚举名**，不是 Java 的 `getName()` 小写名。
+`SearchOffsetRequestHeader.boundaryType` 就是实例：`RemotingCommand.makeCustomHeaderToNet`
+对每个非 null 字段写 `value.toString()` ⇒ 线上是 `"LOWER"`/`"UPPER"`，
+`BoundaryType.getName()` 的 `"lower"`/`"upper"` 只喂给 `BoundaryType.getType` 做比对。
+broker 侧 `getType` 是**宽松**解析（只有 `equalsIgnoreCase("upper")` 才是 UPPER，
+未知值一律 LOWER），字段本身是 `@CFNullable`（不 set 就整键不写、缺键回落 LOWER）。
+`DefaultMQAdminExt::searchLowerBoundaryOffset` / `searchUpperBoundaryOffset`（Java `:133`/`:137`）
+分别固定发这两个值，`searchOffset` 等价于 LOWER（Java `MQAdminImpl:189`）。
 
 **fastjson2 会产出非法 JSON。** map 的对象 key 会被内联
 （`{"offsetTable":{{"brokerName":"b",...}:{...}}}`）、数字 key 不加引号、允许

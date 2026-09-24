@@ -1312,11 +1312,20 @@ int64_t MQClientInstance::getMinOffset(const MessageQueue& mq, int32_t timeoutMi
 int64_t MQClientInstance::searchOffsetByTimestamp(const MessageQueue& mq, int64_t timestamp,
                                                  int32_t timeoutMillis,
                                                  const std::string& addrIn) {
+    // Java MQClientAPIImpl:1377 → :1381 把 LOWER 转给带边界类型的重载。
+    return searchOffsetByBoundary(mq, timestamp, BoundaryType::LOWER, timeoutMillis, addrIn);
+}
+
+int64_t MQClientInstance::searchOffsetByBoundary(const MessageQueue& mq, int64_t timestamp,
+                                                const std::optional<BoundaryType>& boundaryType,
+                                                int32_t timeoutMillis,
+                                                const std::string& addrIn) {
     std::string addr = addrIn.empty() ? brokerAddr(mq) : addrIn;
     auto header = std::make_shared<SearchOffsetRequestHeader>();
     header->topic = mq.topic;
     header->queueId = mq.queueId;
     header->timestamp = timestamp;
+    header->boundaryType = boundaryType;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::SEARCH_OFFSET_BY_TIMESTAMP, header);
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);

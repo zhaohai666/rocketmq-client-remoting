@@ -357,6 +357,7 @@ PropertyMap SearchOffsetRequestHeader::toExtFields() const {
     putOptStr(out, "topic", topic);
     putOptInt32(out, "queueId", queueId);
     putOptInt(out, "timestamp", timestamp);
+    putOptBoundaryType(out, "boundaryType", boundaryType);
     return out;
 }
 
@@ -364,6 +365,7 @@ void SearchOffsetRequestHeader::fromExtFields(const PropertyMap& ext) {
     topic = getOptStr(ext, "topic");
     queueId = getOptInt(ext, "queueId");
     timestamp = getOptLong(ext, "timestamp");
+    boundaryType = getOptBoundaryType(ext, "boundaryType");
 }
 
 PropertyMap SearchOffsetResponseHeader::toExtFields() const {

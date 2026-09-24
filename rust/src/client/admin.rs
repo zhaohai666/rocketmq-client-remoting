@@ -48,6 +48,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use crate::client::mq_client::{MQClientInstance, MQClientInstanceConfig};
+use crate::common::boundary_type::BoundaryType;
 use crate::common::message::{MessageExt, MessageQueue};
 use crate::common::message_const::{INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE};
 use crate::common::message_decoder::{decode_message, decode_message_id};
@@ -1776,9 +1777,46 @@ impl DefaultMQAdminExt {
     }
 
     /// Python `search_offset`。
+    ///
+    /// 对应 Java `MQAdminImpl#searchOffset(mq, ts)`:189 —— 显式下发 LOWER 边界。
     pub async fn search_offset(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
+        self.search_lower_boundary_offset(mq, timestamp).await
+    }
+
+    /// 对应 Java `DefaultMQAdminExt#searchLowerBoundaryOffset`:133。
+    pub async fn search_lower_boundary_offset(
+        &self,
+        mq: &MessageQueue,
+        timestamp: i64,
+    ) -> Result<i64> {
         self.require_client()?
-            .search_offset_by_timestamp(mq, timestamp, self.timeout_millis(), None)
+            .search_offset_by_boundary(
+                mq,
+                timestamp,
+                Some(BoundaryType::Lower),
+                self.timeout_millis(),
+                None,
+            )
+            .await
+    }
+
+    /// 对应 Java `DefaultMQAdminExt#searchUpperBoundaryOffset`:137。
+    ///
+    /// 与 LOWER 的差异只在多条消息共享 storeTime、或时间戳落在空档/队尾时可见：
+    /// 队尾之后 UPPER 回最后一条自己的位点，LOWER 回它的下一个位点（maxOffset）。
+    pub async fn search_upper_boundary_offset(
+        &self,
+        mq: &MessageQueue,
+        timestamp: i64,
+    ) -> Result<i64> {
+        self.require_client()?
+            .search_offset_by_boundary(
+                mq,
+                timestamp,
+                Some(BoundaryType::Upper),
+                self.timeout_millis(),
+                None,
+            )
             .await
     }
 

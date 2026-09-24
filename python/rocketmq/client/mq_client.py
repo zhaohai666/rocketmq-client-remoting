@@ -13,6 +13,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
+from ..common.boundary_type import BoundaryType
 from ..common.message import Message, MessageBatch, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
 from ..common.message_client_id_setter import get_uniq_id, set_uniq_id
@@ -1282,13 +1283,21 @@ class MQClientInstance:
         return resp_header.offset or 0
 
     def search_offset_by_timestamp(self, mq: MessageQueue, timestamp: int,
-                                   timeout_millis: int = 5000, addr: Optional[str] = None) -> int:
+                                   timeout_millis: int = 5000, addr: Optional[str] = None,
+                                   boundary_type: Optional[BoundaryType] = BoundaryType.LOWER) -> int:
+        """对应 Java MQClientAPIImpl#searchOffset(addr, mq, timestamp, boundaryType, timeout)。
+
+        ``boundary_type`` 默认 LOWER（Java 同签名重载 :1381 直接传 ``BoundaryType.LOWER``）；
+        传 ``None`` 就不写 ``boundaryType`` 字段，对应 Java 那个已废弃的
+        5 参重载（只 set topic/queueId/timestamp，“边界”由 broker 的默认值兜底）。
+        """
         if addr is None:
             addr = self._broker_addr(mq)
         header = SearchOffsetRequestHeader()
         header.topic = mq.topic
         header.queue_id = mq.queue_id
         header.timestamp = timestamp
+        header.boundary_type = boundary_type
         request = RemotingCommand.create_request_command(RequestCode.SEARCH_OFFSET_BY_TIMESTAMP, header)
         response = self._invoke_sync(addr, request, timeout_millis)
         self._check_response(response)

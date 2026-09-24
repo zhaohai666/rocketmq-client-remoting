@@ -446,6 +446,58 @@ int main(int argc, char** argv) {
         check("Offset 只读查询", false, e.what());
     }
 
+    // ---------- 7.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）----------
+    // 单开一个 1 队列 topic：位点语义只在单队列上才确定（多队列时分不清落哪一条）。
+    // 3 条消息 ⇒ maxOffset=3；远未来时间戳下 UPPER = 最后一条自身位点(2)、
+    // LOWER = 它的下一个位点(3) = maxOffset（ConsumeQueue.binarySearchInQueueByTime:261-270
+    // 的 case 1）。两者不同即证明 boundaryType 字段真的到了 broker 并被解析 ——
+    // 若字段丢失或被忽略，两次都会落到 LOWER。
+    const std::string bndTopic = "AdminBoundaryTopicCpp_" + stamp;
+    try {
+        admin.createTopic(MixAll::DEFAULT_TOPIC, bndTopic, 1);
+        check("createTopic(" + bndTopic + ", 1 队列)", true, "queueNum=1");
+    } catch (const std::exception& e) {
+        check("createTopic(" + bndTopic + ", 1 队列)", false, e.what());
+    }
+    try {
+        DefaultMQProducer bprod("AdminLiveCppBoundaryProducer_" + stamp);
+        bprod.setNamesrvAddr(gNamesrv);
+        bprod.setSendMsgTimeout(5000);
+        bprod.start();
+        for (int i = 0; i < 3; ++i) {
+            bprod.send(Message(bndTopic, str2bytes("boundary-" + std::to_string(i))));
+        }
+        check("boundary topic 发送 3 条", true, "ok");
+        bprod.shutdown();
+    } catch (const std::exception& e) {
+        check("boundary topic 发送 3 条", false, e.what());
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    try {
+        MessageQueue bmq(bndTopic, firstMq.brokerName, 0);
+        int64_t bMax = admin.maxOffset(bmq);
+        int64_t lo = admin.searchLowerBoundaryOffset(bmq, nowMs() + 600000);
+        int64_t up = admin.searchUpperBoundaryOffset(bmq, nowMs() + 600000);
+        int64_t loPast = admin.searchLowerBoundaryOffset(bmq, 1);
+        int64_t upPast = admin.searchUpperBoundaryOffset(bmq, 1);
+        check("boundary topic maxOffset == 3", bMax == 3, "max=" + std::to_string(bMax));
+        check("LOWER 边界 = maxOffset（队尾之后的下一个位点）", lo == bMax,
+              "lower=" + std::to_string(lo) + " maxOffset=" + std::to_string(bMax));
+        check("UPPER 边界 = maxOffset-1（最后一条自身位点）", up == bMax - 1,
+              "upper=" + std::to_string(up) + " maxOffset-1=" + std::to_string(bMax - 1));
+        check("两个边界确实不同（证明 boundaryType 生效）", lo != up,
+              "lower=" + std::to_string(lo) + " upper=" + std::to_string(up));
+        check("时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+              loPast == 0 && upPast == 0,
+              "lower=" + std::to_string(loPast) + " upper=" + std::to_string(upPast));
+        // admin.searchOffset 走的就是 LOWER（Java MQAdminImpl:189）：同时间戳必须同结果
+        check("searchOffset 默认边界与显式 LOWER 同结果",
+              admin.searchOffset(bmq, nowMs() + 600000) == lo,
+              "lower=" + std::to_string(lo));
+    } catch (const std::exception& e) {
+        check("searchOffset boundaryType", false, e.what());
+    }
+
     // ---------- 8. 消费 + sendMessageBack 重投 ----------
     // 顺序很关键：必须**先消费**再重投。若先把位点重置到 max，消费者就再也拉不到
     // 历史消息，sendMessageBack 路径根本没机会执行。
@@ -668,10 +720,12 @@ int main(int argc, char** argv) {
     }
     try {
         admin.deleteTopic(topic);
+        admin.deleteTopic(bndTopic);
         check("deleteTopic", true, "OK");
         std::this_thread::sleep_for(std::chrono::seconds(1));
         TopicList after = admin.fetchAllTopicList();
         check("deleteTopic 后 topic 消失", !after.contains(topic), topic);
+        check("deleteTopic 后 boundary topic 消失", !after.contains(bndTopic), bndTopic);
     } catch (const std::exception& e) {
         check("deleteTopic", false, e.what());
     }

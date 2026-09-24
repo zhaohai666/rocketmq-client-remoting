@@ -1741,7 +1741,20 @@ public sealed class MQClientInstance : IDisposable
         return respHeader.Offset ?? 0;
     }
 
+    /// <summary>
+    /// 对应 Java MQClientAPIImpl#searchOffset(addr, mq, ts, timeout):1377 —— 它只是把
+    /// BoundaryType.LOWER 转给带边界类型的重载（:1381）。
+    /// </summary>
     public long SearchOffsetByTimestamp(MessageQueue mq, long timestamp,
+        int timeoutMillis = 5000, string? addrIn = null) =>
+        SearchOffsetByBoundary(mq, timestamp, BoundaryType.Lower, timeoutMillis, addrIn);
+
+    /// <summary>
+    /// 带边界类型的重载（Java MQClientAPIImpl#searchOffset(addr, mq, ts, boundaryType, timeout):1384）。
+    /// boundaryType 为 null 时不写 boundaryType 字段，对应 Java 那个已废弃的 5 参重载
+    /// （只 set topic/queueId/timestamp，"边界"由 broker 的默认值兜底）。
+    /// </summary>
+    public long SearchOffsetByBoundary(MessageQueue mq, long timestamp, BoundaryType? boundaryType,
         int timeoutMillis = 5000, string? addrIn = null)
     {
         string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);
@@ -1750,6 +1763,7 @@ public sealed class MQClientInstance : IDisposable
             Topic = mq.Topic,
             QueueId = mq.QueueId,
             Timestamp = timestamp,
+            BoundaryType = boundaryType,
         };
         RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.SearchOffsetByTimestamp, header);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);

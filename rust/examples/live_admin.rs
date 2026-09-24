@@ -32,7 +32,9 @@
 //!   （命中依赖 broker 索引实现，按 Python 口径显式 SKIP）、`view_message(offsetMsgId)`
 //!   body 一致、`view_message(uniqKey)` 走兜底并给出干净的 code=208。
 //! - A10 Offset：`max/min/search_offset`、`earliest_msg_store_time`、未提交位点回 `None`、
-//!   `update_consumer_offset(_to_broker)` 写回、`clone_group_offset`。
+//!   `update_consumer_offset(_to_broker)` 写回、`clone_group_offset`；A10.5 时间戳查位点的
+//!   `boundaryType`（`search_lower_boundary_offset`/`search_upper_boundary_offset`，Java
+//!   `DefaultMQAdminExt:133/:137`：1 队列 topic 发 3 条 ⇒ LOWER = maxOffset、UPPER = maxOffset-1）。
 //! - A11 `send_message_back` 重投 → 管理端轮询 `%RETRY%<group>` 的统计（broker 把
 //!   delayLevel=0 改写成 3，约 10s 后可见）。
 //! - A12 位点重置：`reset_offset_by_timestamp`(222, broker 端) 推到未来 → 位点 == max、
@@ -1444,6 +1446,84 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
             Err(e) => ck.abort("A10 回读克隆后的位点", &e.to_string()),
         },
         Err(e) => ck.abort("A10 cloneGroupOffset", &e.to_string()),
+    }
+
+    // A10.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）。
+    // 单开一个 1 队列 topic：位点语义只在单队列上才确定。3 条消息 ⇒ maxOffset=3；
+    // 远未来时间戳下 UPPER = 最后一条自身位点(2)、LOWER = 它的下一个位点(3) = maxOffset
+    // （ConsumeQueue.binarySearchInQueueByTime 的 case 1）。两者不同即证明 boundaryType
+    // 字段真的到了 broker 并被解析 —— 若字段丢失或被忽略，两次都会落到 LOWER。
+    let bnd_topic = format!("RustLiveAdminBoundary{}", env.stamp);
+    if let Err(e) = admin
+        .create_topic(MixAll::DEFAULT_TOPIC, &bnd_topic, 1, 0)
+        .await
+    {
+        ck.abort("A10.5 createTopic(1 队列)", &e.to_string());
+        return;
+    }
+    match env.produce(&bnd_topic, 0, 3).await.len() {
+        3 => println!("  [INFO] A10.5 boundary topic 已发送 3 条"),
+        n => ck.check("A10.5 boundary topic 发送 3 条", false, &format!("ok={n}")),
+    }
+    sleep_millis(2000).await;
+    let bmq = MessageQueue::new(&bnd_topic, &env.broker_name(), 0);
+    let bmax = step!(ck, "A10.5 maxOffset", admin.max_offset(&bmq).await);
+    let future = now_millis() + 600_000;
+    let lo = step!(ck, "A10.5 searchLowerBoundaryOffset", admin
+        .search_lower_boundary_offset(&bmq, future)
+        .await);
+    let up = step!(ck, "A10.5 searchUpperBoundaryOffset", admin
+        .search_upper_boundary_offset(&bmq, future)
+        .await);
+    let lo_past = step!(ck, "A10.5 LOWER(过去)", admin
+        .search_lower_boundary_offset(&bmq, 1)
+        .await);
+    let up_past = step!(ck, "A10.5 UPPER(过去)", admin
+        .search_upper_boundary_offset(&bmq, 1)
+        .await);
+    if let Some(bmax) = bmax {
+        ck.check(
+            "A10.5 boundary topic maxOffset == 3",
+            bmax == 3,
+            &format!("max={bmax}"),
+        );
+        if let (Some(lo), Some(up)) = (lo, up) {
+            ck.check(
+                "A10.5 LOWER 边界 = maxOffset（队尾之后的下一个位点）",
+                lo == bmax,
+                &format!("lower={lo} maxOffset={bmax}"),
+            );
+            ck.check(
+                "A10.5 UPPER 边界 = maxOffset-1（最后一条自身位点）",
+                up == bmax - 1,
+                &format!("upper={up} maxOffset-1={}", bmax - 1),
+            );
+            ck.check(
+                "A10.5 两个边界确实不同（证明 boundaryType 生效）",
+                lo != up,
+                &format!("lower={lo} upper={up}"),
+            );
+        }
+    }
+    if let (Some(lo_past), Some(up_past)) = (lo_past, up_past) {
+        ck.check(
+            "A10.5 时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+            lo_past == 0 && up_past == 0,
+            &format!("lower={lo_past} upper={up_past}"),
+        );
+    }
+    // searchOffset 走的就是 LOWER（Java MQAdminImpl:189）：同时间戳必须同结果。
+    match admin.search_offset(&bmq, future).await {
+        Ok(same) => ck.check(
+            "A10.5 searchOffset 默认边界与显式 LOWER 同结果",
+            Some(same) == lo,
+            &format!("searchOffset={same} lower={lo:?}"),
+        ),
+        Err(e) => ck.abort("A10.5 searchOffset", &e.to_string()),
+    }
+    match admin.delete_topic(&bnd_topic, None).await {
+        Ok(()) => println!("  [INFO] A10.5 deleteTopic(boundary) 已下发"),
+        Err(e) => println!("  [WARN] A10.5 deleteTopic(boundary): {e}"),
     }
 }
 

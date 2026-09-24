@@ -203,6 +203,9 @@ public:
     int64_t maxOffset(const MessageQueue& mq);
     int64_t minOffset(const MessageQueue& mq);
     int64_t searchOffset(const MessageQueue& mq, int64_t timestamp);
+    // Java DefaultMQAdminExt:133/:137 的两个方法名，分别固定 LOWER / UPPER 边界。
+    int64_t searchLowerBoundaryOffset(const MessageQueue& mq, int64_t timestamp);
+    int64_t searchUpperBoundaryOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t earliestMsgStoreTime(const MessageQueue& mq);
     // 返回 false 表示该消费组在该队列上尚无位点
     bool examineConsumerOffset(const std::string& consumerGroup, const MessageQueue& mq,

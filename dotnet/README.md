@@ -31,6 +31,7 @@ dotnet/
 │   │   ├── Compression.cs          #   zlib / LZ4 / ZSTD 三后端；类型位 0/3 = ZLIB；未支持类型必须抛异常（不透传）
 │   │   ├── NativeCompression.cs    #   P/Invoke 到系统 liblz4（LZ4 Frame）/ libzstd，缺库时该后端抛异常
 │   │   ├── SubscriptionData.cs     #   FilterAPI.BuildSubscriptionData / Equals 语义对齐 Java
+│   │   ├── BoundaryType.cs         #   时间戳查位点的边界语义（LOWER/UPPER，含 getType 宽松解析）
 │   │   ├── TopicConfig.cs
 │   │   └── ClientLog.cs            #   对齐 Java logback：按大小轮转 + 线程名 + 毫秒 + 文件:行号
 │   ├── Remoting/
@@ -48,7 +49,7 @@ dotnet/
 │   │   ├── MqClient.cs             # MQClientInstance：路由发现 + TBW102 回退裁剪、心跳、offset 请求
 │   │   ├── Producer.cs             # DefaultMQProducer：同步/定点/选择器/异步/单向/批量/事务简化
 │   │   ├── Consumer.cs             # DefaultMQPushConsumer：拉取循环、并发/顺序监听、sendMessageBack
-│   │   ├── Admin.cs                # DefaultMQAdminExt 全套（47 项真机检查全通过）
+│   │   ├── Admin.cs                # DefaultMQAdminExt 全套（admin-live 66 项真机检查全通过）
 │   │   ├── Result.cs               # SendResult/PullResult/监听器接口/队列选择器
 │   │   ├── Hook.cs                 # Send/Consume/EndTransaction + CheckForbidden/FilterMessage 钩子与上下文
 │   │   ├── Trace.cs                # 消息轨迹模型 + 文本编解码（与 Java 官方实现逐字节对拍）
@@ -79,7 +80,7 @@ dotnet/
 PROG=examples/RocketMQ.Examples/bin/Debug/net10.0/rmq.dll
 dotnet $PROG selfcheck                    # 本地自检（无需集群）
 dotnet $PROG message-types 127.0.0.1:9876  # 8 类消息能力（19 项检查）
-dotnet $PROG admin-live 127.0.0.1:9876     # Admin 全链路（57 PASS / 0 FAIL / 1 SKIP）
+dotnet $PROG admin-live 127.0.0.1:9876     # Admin 全链路（66 PASS / 0 FAIL / 1 SKIP）
 dotnet $PROG compression-live selftest 127.0.0.1:9876   # 压缩真实性（真机发送→消费→解压→CRC）
 dotnet $PROG compression-live send 127.0.0.1:9876 <topic> <group> <size> [codec]
 dotnet $PROG compression-live recv 127.0.0.1:9876 <topic> <group> <size>
@@ -174,7 +175,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 |---|---|
 | selfcheck | PASS=3 FAIL=0 |
 | message-types | 19 PASS / 0 FAIL（含批量：`SendBatch` 走 `SEND_BATCH_MESSAGE(320)`，真 broker 投成 3 条独立消息、offset 连续 0,1,2） |
-| admin-live | 57 PASS / 0 FAIL / 1 SKIP（含 `ResetOffsetByQueueId`：25 + 带 queueId/offset 的 222，重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构；`QueryTopicsByConsumer(group)` 按 `%RETRY%` 路由扇出合并 + `QueryTopicsByConsumerToBroker`） |
+| admin-live | 66 PASS / 0 FAIL / 1 SKIP（含 `SearchOffset` 的 `boundaryType`：1 队列 topic 发 3 条 ⇒ 远未来时间戳下 LOWER = maxOffset(3)、UPPER = maxOffset-1(2)，两数不同才证明字段真到了 broker；时间戳早于全部消息时两个边界都塌到 0。含 `ResetOffsetByQueueId`：25 + 带 queueId/offset 的 222，重置后首笔 pull 被 broker 短路成 `PULL_OFFSET_MOVED`、第二笔才取到历史消息；越界目标被拒时位点停在第 1 笔写入的非法值 ⇒ 两笔 RPC 非原子，与 Java 同构；`QueryTopicsByConsumer(group)` 按 `%RETRY%` 路由扇出合并 + `QueryTopicsByConsumerToBroker`） |
 | compression-live selftest | 10 PASS / 0 FAIL（zlib 真机往返 storeSize 8192→~360、CRC 一致、flag 清除、阈值与编解码闭环 + **后端 lz4 / zstd 真机往返**） |
 | compression-live send/recv | 作为 `../scripts/compression_matrix.sh` 的一端参与四语言矩阵（zlib 13/13、lz4 13/13、zstd 7/7，全 PASS） |
 | interop | Python ↔ .NET 双向解码逐字段一致（JSON 与 ROCKETMQ 双序列化） |
@@ -196,7 +197,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | unreg-live | 10 PASS / 0 FAIL（生产者退出注销 `UNREGISTER_CLIENT`(35) 真机，与 Python `verify_producer_unregister_live.py`、C++ `rmq_live_producer_unregister`、Rust `live_producer` 的 P11 同一套场景）：U1 发送成功 → U2 心跳后 204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId（注册确实发生过，"消失"才有意义，组靠心跳上线所以要轮询等）→ U2b 对照组注册可见（204 这条判据本身有效）→ U3 `Shutdown()` 给每台已知 broker 各发一发 35、头是 `clientID`+`producerGroup` 且 **`consumerGroup` 整个字段不上线**（Java 传 null；broker `ClientManageProcessor:228/237` 判的是 `group != null`）、addr 确实是路由里那台、且排在业务发送之后（`last_send=4 first_unreg=6`）→ U5 紧接着查 204 这个组已经不在了 → U6 对照组仍在（排掉"broker 把所有连接都清了"这种假阳性）。⚠ 判据强度：.NET 里每个生产者各持一份 `MQClientInstance`、各一条连接，退出时连接也关掉，单看 U5 分不出是 35 还是断连的功劳，所以这里必须由 `IRpcHook` 抓帧（钩子跑在 `Encode()` **之前**，头此时还挂在 `CustomHeader` 上）直接证明线上走了这一发；行为级的判别式证明在 Rust 的 P11（Rust 按 clientId 复用实例，先退的那个连接还活着）。⚠ 「每一发 35 都回 SUCCESS」在本移植**不可观测**——传输层有意不调 `IRpcHook#DoAfterResponse`（见 `Remoting/RemotingClient.cs`），U5 的 broker 侧效果是它的替代判据。头形状（含**纯空白组名**同空串处理，整个字段不上线）、扇出**含 slave**（`GetAllBrokerAddrs` vs 心跳用的 master 优先 `GetRouteOfAllBrokers`）、单台失败被吞且剩下的照旧注销、超时与 Java 的 `getMqClientApiTimeout()`=**3000ms** 同口径，共 9 项由 `ProducerUnregisterTests` 离线锁死（自带一个同一 brokerName 下挂 master(0)+slave(1) 的假集群——本机真集群只有一台 master，这条判据在真机上不可达） |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **592 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **600 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`FlowControlTests`（7 项）锁住拉取前
 流控的**五个阈值**（Java `ProcessQueue`）：条数 `>= PullThresholdForQueue`（含 Java
 `Math.max(1,n)` 的守卫——配 0 不是全放行而是 1 条就停）、字节 `>= PullThresholdSizeForQueue`
@@ -263,6 +264,12 @@ resolver 空机房抛错语义），口径与 C++ `allocate_strategy` / `consist
 同进程两个生产者不撞号、广播消费者保持 `DEFAULT`、五个门面的 stream 默认值
 （producer/push/admin 关，pull/lite 开 —— Java 在 `DefaultMQPullConsumer:113/126` 和
 `DefaultLitePullConsumer:213/228` 的构造函数里置真）。
+`SearchOffsetBoundaryTests`（8 项）锁时间戳查位点的 `boundaryType`：入网文本是
+`Enum.toString()` 的**大写枚举名** `LOWER`/`UPPER`（不是 `getName()` 的小写名）、
+`@CFNullable` 缺键不写且回读为 null、`BoundaryTypeNames.GetType` 的宽松解析
+（只有 `equalsIgnoreCase("upper")` 才是 UPPER）、以及 **MockCluster 抓真报文**验三个 admin 入口
+（`SearchOffset`/`SearchLowerBoundaryOffset` 发 LOWER、`SearchUpperBoundaryOffset` 发 UPPER、
+`SearchOffsetByBoundary(..., null)` 整键不上线）。
 `AclTests` 里新增的 4 项锁住请求钩子的**组合顺序**：`RequestHooks.Compose` 的形状
 （stream 在前、用户钩子在后）、`ReqT="0"` 落在 ACL 签名**之内**（用签名后的 ExtFields 复算
 能对上）、反证（顺序写反时同一断言必须红）、`ChainedRpcHook` 逐个转发 `doAfterResponse`。

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ...common.boundary_type import BoundaryType
+
 # ---------------- 基类 ----------------
 
 
@@ -504,14 +506,28 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
         self.topic: Optional[str] = None
         self.queue_id: Optional[int] = None
         self.timestamp: Optional[int] = None
+        # Java 该字段是 @CFNullable：为 None 时**不写键**（Java 的
+        # MQClientAPIImpl 已废弃的 5 参 searchOffset 就是这种形状）。
+        self.boundary_type: Optional[BoundaryType] = None
 
     def to_ext_fields(self) -> dict:
-        return _ext({"topic": self.topic, "queueId": self.queue_id, "timestamp": self.timestamp})
+        return _ext({
+            "topic": self.topic,
+            "queueId": self.queue_id,
+            "timestamp": self.timestamp,
+            # 入网文本是枚举名大写（Java makeCustomHeaderToNet 的 Enum.toString()），
+            # 不是 BoundaryType.getName() 的小写名。
+            "boundaryType": self.boundary_type.value if self.boundary_type is not None else None,
+        })
 
     def from_ext_fields(self, ext: dict) -> None:
         self.topic = ext.get("topic")
         self.queue_id = _i(ext.get("queueId"))
         self.timestamp = _l(ext.get("timestamp"))
+        value = ext.get("boundaryType")
+        # 缺键 ⇒ None（Java 端 getBoundaryType() 自行回落 LOWER）；
+        # 有键但值不认识 ⇒ Java BoundaryType.getType 的宽松语义，给 LOWER。
+        self.boundary_type = BoundaryType.get_type(value) if value is not None else None
 
 
 class SearchOffsetResponseHeader(CommandCustomHeader):

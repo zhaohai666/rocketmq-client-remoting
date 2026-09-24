@@ -577,12 +577,24 @@ public sealed class SearchOffsetRequestHeader : ICommandCustomHeader
     public int? QueueId { get; set; }
     public long? Timestamp { get; set; }
 
+    /// <summary>
+    /// Java 该字段是 @CFNullable：为 null 时**不写键**（只有已废弃的 5 参
+    /// MQClientAPIImpl#searchOffset 会这样发）。
+    /// </summary>
+    public BoundaryType? BoundaryType { get; set; }
+
     public PropertyMap ToExtFields()
     {
         var outMap = new PropertyMap();
         HeaderCodec.PutOptStr(outMap, "topic", Topic);
         HeaderCodec.PutOptInt(outMap, "queueId", QueueId);
         HeaderCodec.PutOptLong(outMap, "timestamp", Timestamp);
+        // 入网文本是枚举名大写（Java makeCustomHeaderToNet 的 Enum.toString()）
+        if (BoundaryType is { } bt)
+        {
+            outMap["boundaryType"] = BoundaryTypeNames.Name(bt);
+        }
+
         return outMap;
     }
 
@@ -591,6 +603,10 @@ public sealed class SearchOffsetRequestHeader : ICommandCustomHeader
         Topic = HeaderCodec.GetOptStr(ext, "topic");
         QueueId = HeaderCodec.GetOptInt(ext, "queueId");
         Timestamp = HeaderCodec.GetOptLong(ext, "timestamp");
+        // 缺键 ⇒ null（读取端自行回落 LOWER）；有键但值不认识 ⇒ Java getType 的宽松语义
+        BoundaryType = ext.TryGetValue("boundaryType", out string? boundary)
+            ? BoundaryTypeNames.GetType(boundary)
+            : null;
     }
 }
 

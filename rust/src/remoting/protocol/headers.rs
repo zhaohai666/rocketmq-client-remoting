@@ -68,7 +68,8 @@ pub fn ext_bool(ext: &ExtFields, key: &str) -> Option<bool> {
 /// 字段种类 -> Rust 类型。
 ///
 /// `s` String，`i` Integer/int，`l` Long/long，`b` Boolean（可空），
-/// `B` Java 原始 `boolean`（恒有值，默认 false），`I` Java 有默认值的 `int`。
+/// `B` Java 原始 `boolean`（恒有值，默认 false），`I` Java 有默认值的 `int`，
+/// `E` 枚举（入网写 `Enum.toString()`，如 `BoundaryType`）。
 macro_rules! field_ty {
     (s) => { Option<String> };
     (i) => { Option<i32> };
@@ -76,6 +77,7 @@ macro_rules! field_ty {
     (b) => { Option<bool> };
     (B) => { bool };
     (I) => { i32 };
+    (E) => { Option<crate::common::boundary_type::BoundaryType> };
 }
 
 /// 定义一个 `CommandCustomHeader`：字段声明顺序 == extFields 写入顺序。
@@ -117,7 +119,13 @@ macro_rules! header_struct {
     (@put b, $out:expr, $key:expr, $v:expr) => { $out.insert_opt($key, $v.map(bool_text)); };
     (@put B, $out:expr, $key:expr, $v:expr) => { $out.insert($key, bool_text($v)); };
     (@put I, $out:expr, $key:expr, $v:expr) => { $out.insert($key, $v.to_string()); };
+    // Java makeCustomHeaderToNet 写 value.toString()：枚举的入网文本是枚举名大写。
+    (@put E, $out:expr, $key:expr, $v:expr) => { $out.insert_opt($key, $v.map(|x| x.name().to_string())); };
     (@get s, $ext:expr, $key:expr) => { ext_str($ext, $key) };
+    // 缺键回 None（读取端自行回落 LOWER）；有键则走 Java BoundaryType.getType 的宽松解析。
+    (@get E, $ext:expr, $key:expr) => {
+        ext_str($ext, $key).map(|s| crate::common::boundary_type::BoundaryType::get_type(&s))
+    };
     (@get i, $ext:expr, $key:expr) => { ext_i32($ext, $key) };
     (@get l, $ext:expr, $key:expr) => { ext_i64($ext, $key) };
     (@get b, $ext:expr, $key:expr) => { ext_bool($ext, $key) };
@@ -137,7 +145,7 @@ impl fmt::Debug for dyn CustomHeader + '_ {
 
 
 //   GetMaxOffsetRequestHeader: java-only fields ["committed"]
-//   SearchOffsetRequestHeader: java-only fields ["liteTopic", "boundaryType"]
+//   SearchOffsetRequestHeader: java-only fields ["liteTopic"]
 //   QueryMessageResponseHeader: java-only fields ["indexLastUpdatePhyoffset"]
 //   ViewMessageRequestHeader: java-only fields ["topic"]
 //   ConsumeMessageDirectlyResultRequestHeader: java-only fields ["topic", "topicSysFlag", "groupSysFlag"]
@@ -379,6 +387,9 @@ header_struct! {
         topic: s => "topic",
         queue_id: i => "queueId",
         timestamp: l => "timestamp",
+        // Java 该字段 @CFNullable：None 时整键不写（只有已废弃的 5 参
+        // MQClientAPIImpl#searchOffset 会这样发）。
+        boundary_type: E => "boundaryType",
 
     }
 }
@@ -1074,7 +1085,7 @@ const JAVA_HEADER_FIELDS: &[(&str, &[&str])] = &[
     ("GetMaxOffsetResponseHeader", &["offset", ]),
     ("GetMinOffsetRequestHeader", &["topic", "queueId", ]),
     ("GetMinOffsetResponseHeader", &["offset", ]),
-    ("SearchOffsetRequestHeader", &["topic", "queueId", "timestamp", ]),
+    ("SearchOffsetRequestHeader", &["topic", "queueId", "timestamp", "boundaryType", ]),
     ("SearchOffsetResponseHeader", &["offset", ]),
     ("GetEarliestMsgStoretimeRequestHeader", &["topic", "queueId", ]),
     ("GetEarliestMsgStoretimeResponseHeader", &["timestamp", ]),
@@ -1150,6 +1161,7 @@ const JAVA_HEADER_FIELDS: &[(&str, &[&str])] = &[
 mod tests {
     use super::*;
     use super::JAVA_HEADER_FIELDS;
+    use crate::common::boundary_type::BoundaryType;
     use crate::remoting::protocol::codes::request_code;
     use crate::remoting::protocol::ext_fields::ExtFields;
 
@@ -1507,6 +1519,47 @@ mod tests {
         let mut back = QueryMessageRequestHeader::default();
         back.from_ext_fields(&ext);
         assert_eq!(back, h);
+    }
+
+    /// `SearchOffsetRequestHeader.boundaryType`（Java `DefaultMQAdminExt`:133/:137）。
+    ///
+    /// 入网文本是 `Enum.toString()` 的大写枚举名（不是 `getName()` 的小写名）；
+    /// 未设置时整键不写（@CFNullable）；回解走 Java `BoundaryType.getType` 的宽松语义。
+    #[test]
+    fn search_offset_request_header_carries_the_java_boundary_type() {
+        let mut h = SearchOffsetRequestHeader {
+            topic: Some(TOPIC.into()),
+            queue_id: Some(2),
+            timestamp: Some(1700000000000),
+            ..Default::default()
+        };
+        let mut ext = ExtFields::new();
+        h.to_ext_fields(&mut ext);
+        assert_eq!(keys(&ext), vec!["topic", "queueId", "timestamp"]);
+
+        h.boundary_type = Some(BoundaryType::Lower);
+        let mut ext = ExtFields::new();
+        h.to_ext_fields(&mut ext);
+        assert_eq!(ext.get("boundaryType"), Some("LOWER"));
+        h.boundary_type = Some(BoundaryType::Upper);
+        let mut ext = ExtFields::new();
+        h.to_ext_fields(&mut ext);
+        assert_eq!(ext.get("boundaryType"), Some("UPPER"));
+
+        let mut back = SearchOffsetRequestHeader::default();
+        back.from_ext_fields(&ext);
+        assert_eq!(back.boundary_type, Some(BoundaryType::Upper));
+        // 未知值 / 小写名一律 LOWER（Java getType），缺键回 None
+        for text in ["LOWER", "lower", "", "junk"] {
+            let mut e = ExtFields::new();
+            e.insert("boundaryType", text);
+            let mut b = SearchOffsetRequestHeader::default();
+            b.from_ext_fields(&e);
+            assert_eq!(b.boundary_type, Some(BoundaryType::Lower), "{text}");
+        }
+        let mut b = SearchOffsetRequestHeader::default();
+        b.from_ext_fields(&ExtFields::new());
+        assert_eq!(b.boundary_type, None);
     }
 
     /// Java 的字段名是 `clientID`（ID 全大写），不是 `clientId`。

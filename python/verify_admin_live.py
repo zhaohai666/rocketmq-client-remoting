@@ -298,6 +298,44 @@ def main():
         check("maxOffset >= minOffset", max_off >= min_off,
               "min=%d max=%d" % (min_off, max_off))
 
+    # ---------- 7.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）----------
+    # 单开一个 1 队列 topic：位点语义只在单队列上才是确定的（多队列时分不清落哪一条）。
+    # 3 条消息 ⇒ maxOffset=3；用「远未来时间戳」这把尺子同时量两个边界：
+    # 队尾之后 UPPER = 最后一条自己的位点(2)，LOWER = 它的下一个位点(3) = maxOffset
+    # （ConsumeQueue.binarySearchInQueueByTime:261-270 的 case 1）。这条断言同时是
+    # 「boundaryType 字段真的到了 broker」的证据 —— 若字段没被解析，两者都只会是 LOWER。
+    bnd_topic = "AdminBoundaryTopic_%d" % STAMP
+    safe("createTopic(%s, 1 队列)" % bnd_topic,
+         lambda: admin.create_topic(MixAll.DEFAULT_TOPIC, bnd_topic, 1),
+         lambda _: "queueNum=1")
+    bnd_mq = MessageQueue(bnd_topic, mq.broker_name, 0)
+    for i in range(3):
+        prod.send(Message(bnd_topic, ("boundary-%d" % i).encode("utf-8")))
+    time.sleep(2)
+    bnd_max = safe("boundary topic maxOffset", lambda: admin.max_offset(bnd_mq),
+                   lambda v: str(v))
+    future = int(time.time() * 1000) + 600000
+    if bnd_max == 3:
+        lo = safe("searchLowerBoundaryOffset(未来时间戳)",
+                  lambda: admin.search_lower_boundary_offset(bnd_mq, future),
+                  lambda v: str(v))
+        up = safe("searchUpperBoundaryOffset(未来时间戳)",
+                  lambda: admin.search_upper_boundary_offset(bnd_mq, future),
+                  lambda v: str(v))
+        check("LOWER 边界 = maxOffset（队尾之后的下一个位点）", lo == bnd_max,
+              "lower=%s maxOffset=%s" % (lo, bnd_max))
+        check("UPPER 边界 = maxOffset-1（最后一条自身位点）", up == bnd_max - 1,
+              "upper=%s maxOffset-1=%s" % (up, bnd_max - 1))
+        check("两个边界确实不同（证明 boundaryType 生效）", lo != up,
+              "lower=%s upper=%s" % (lo, up))
+        past = 1
+        check("时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
+              admin.search_lower_boundary_offset(bnd_mq, past) == min_off
+              and admin.search_upper_boundary_offset(bnd_mq, past) == min_off,
+              "minOffset=%s" % min_off)
+    else:
+        check("boundary topic 恰好 3 条消息（前置）", False, "maxOffset=%s" % bnd_max)
+
     # ---------- 8. 消费 + sendMessageBack 重投 ----------
     # 顺序很关键：必须**先消费**再重投。若先把位点重置到 max，消费者就再也
     # 拉不到历史消息，sendMessageBack 路径根本没机会执行（前一版的假失败）。
@@ -496,6 +534,7 @@ def main():
     safe("deleteSubscriptionGroup", lambda: admin.delete_subscription_group(
         broker_addr, GROUP, True), lambda _: "OK")
     safe("deleteTopic", lambda: admin.delete_topic(TOPIC), lambda _: "OK")
+    safe("deleteTopic(boundary)", lambda: admin.delete_topic(bnd_topic), lambda _: "OK")
     time.sleep(1)
     topics_after = safe("删除后 fetchAllTopicList",
                         lambda: admin.fetch_all_topic_list(),

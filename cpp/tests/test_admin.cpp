@@ -519,6 +519,40 @@ void testQueryMessageRequestHeaderIndexType() {
     CHECK_EQ(back.key.value_or(""), std::string("k"), "key 回读");
 }
 
+void testSearchOffsetRequestHeaderBoundaryType() {
+    // Java DefaultMQAdminExt:133/:137 —— 入网文本是 Enum.toString() 的大写枚举名，
+    // 未设置时整键不写（@CFNullable），回解走 BoundaryType.getType 的宽松语义。
+    SearchOffsetRequestHeader h;
+    h.topic = "t";
+    h.queueId = 2;
+    h.timestamp = 1700000000000LL;
+    PropertyMap ext = h.toExtFields();
+    CHECK(ext.count("boundaryType") == 0, "未设置边界类型时不写键（@CFNullable）");
+
+    h.boundaryType = BoundaryType::LOWER;
+    CHECK_EQ(h.toExtFields()["boundaryType"], std::string("LOWER"), "LOWER 入网为大写枚举名");
+    h.boundaryType = BoundaryType::UPPER;
+    PropertyMap up = h.toExtFields();
+    CHECK_EQ(up["boundaryType"], std::string("UPPER"), "UPPER 入网为大写枚举名");
+
+    SearchOffsetRequestHeader back;
+    back.fromExtFields(up);
+    CHECK(back.boundaryType.value_or(BoundaryType::LOWER) == BoundaryType::UPPER,
+          "boundaryType 回读 UPPER");
+    CHECK_EQ(boundaryTypeLowercaseName(BoundaryType::UPPER), std::string("upper"),
+             "getName() 小写名");
+    // 宽松解析：只有 upper（大小写不敏感）才是 UPPER
+    for (const char* text : {"UPPER", "upper", "Upper"}) {
+        CHECK(boundaryTypeFromString(text) == BoundaryType::UPPER, std::string(text) + " ⇒ UPPER");
+    }
+    for (const char* text : {"LOWER", "lower", "", "junk"}) {
+        CHECK(boundaryTypeFromString(text) == BoundaryType::LOWER, std::string(text) + " ⇒ LOWER");
+    }
+    SearchOffsetRequestHeader empty;
+    empty.fromExtFields(PropertyMap{});
+    CHECK(!empty.boundaryType.has_value(), "缺键回 nullopt");
+}
+
 }  // namespace
 
 int main() {
@@ -537,6 +571,7 @@ int main() {
     testPermAndGroupHelpers();
     testCreateTopicRequestHeaderSendsTopicFilterType();
     testQueryMessageRequestHeaderIndexType();
+    testSearchOffsetRequestHeaderBoundaryType();
 
     std::cout << "admin: " << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;

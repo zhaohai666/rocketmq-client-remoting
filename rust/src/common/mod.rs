@@ -1,3 +1,4 @@
+pub mod boundary_type;
 pub mod buffer;
 pub mod compression;
 pub mod consistent_hash;

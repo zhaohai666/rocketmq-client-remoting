@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 
+#include "rocketmq/common/boundary_type.h"
 #include "rocketmq/common/types.h"
 
 namespace rocketmq {
@@ -49,6 +50,20 @@ inline std::optional<std::string> getOptStr(const PropertyMap& ext, const std::s
     auto it = ext.find(key);
     if (it == ext.end()) return std::nullopt;
     return it->second;
+}
+
+// Java makeCustomHeaderToNet 写 Enum.toString()：枚举字段的入网文本是枚举名大写。
+inline void putOptBoundaryType(PropertyMap& out, const std::string& key,
+                               const std::optional<BoundaryType>& v) {
+    if (v.has_value()) out[key] = boundaryTypeName(*v);
+}
+
+// 缺键回 nullopt（读取端自行回落 LOWER）；有键则走 Java getType 的宽松解析。
+inline std::optional<BoundaryType> getOptBoundaryType(const PropertyMap& ext,
+                                                      const std::string& key) {
+    auto it = ext.find(key);
+    if (it == ext.end()) return std::nullopt;
+    return boundaryTypeFromString(it->second);
 }
 
 inline std::optional<int64_t> getOptLong(const PropertyMap& ext, const std::string& key) {
@@ -291,6 +306,9 @@ struct SearchOffsetRequestHeader : public CommandCustomHeader {
     std::optional<std::string> topic;
     std::optional<int32_t> queueId;
     std::optional<int64_t> timestamp;
+    // Java 该字段是 @CFNullable：未设置时**不写键**（只有已废弃的 5 参
+    // MQClientAPIImpl#searchOffset 会这样发）。
+    std::optional<BoundaryType> boundaryType;
 
     PropertyMap toExtFields() const override;
     void fromExtFields(const PropertyMap& ext) override;

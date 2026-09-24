@@ -265,9 +265,17 @@ public:
                          const std::string& addr = std::string());
     int64_t getMinOffset(const MessageQueue& mq, int32_t timeoutMillis = 5000,
                          const std::string& addr = std::string());
+    // 对应 Java MQClientAPIImpl#searchOffset(addr, mq, ts, timeout)：内部固定 LOWER。
     int64_t searchOffsetByTimestamp(const MessageQueue& mq, int64_t timestamp,
                                     int32_t timeoutMillis = 5000,
                                     const std::string& addr = std::string());
+    // 带边界类型的重载（Java MQClientAPIImpl#searchOffset(addr, mq, ts, boundaryType, timeout)：
+    // 时间戳落在队尾之后时 LOWER 给 maxOffset、UPPER 给最后一条自身的位点）。
+    // boundaryType 为 nullopt 时不写 boundaryType 字段（Java 已废弃的 5 参重载的形状）。
+    int64_t searchOffsetByBoundary(const MessageQueue& mq, int64_t timestamp,
+                                   const std::optional<BoundaryType>& boundaryType,
+                                   int32_t timeoutMillis = 5000,
+                                   const std::string& addr = std::string());
 
     // ---------------- POP 模式（5.x 轻量消费） ----------------
     //

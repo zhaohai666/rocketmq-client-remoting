@@ -886,7 +886,19 @@ int64_t DefaultMQAdminExt::minOffset(const MessageQueue& mq) {
 }
 
 int64_t DefaultMQAdminExt::searchOffset(const MessageQueue& mq, int64_t timestamp) {
-    return requireClient().searchOffsetByTimestamp(mq, timestamp);
+    // Java MQAdminImpl:189：显式下发 LOWER 边界。
+    return searchLowerBoundaryOffset(mq, timestamp);
+}
+
+int64_t DefaultMQAdminExt::searchLowerBoundaryOffset(const MessageQueue& mq, int64_t timestamp) {
+    // 对应 Java DefaultMQAdminExt:133。
+    return requireClient().searchOffsetByBoundary(mq, timestamp, BoundaryType::LOWER);
+}
+
+int64_t DefaultMQAdminExt::searchUpperBoundaryOffset(const MessageQueue& mq, int64_t timestamp) {
+    // 对应 Java DefaultMQAdminExt:137。时间戳落在队尾之后时 UPPER 给最后一条自身的位点，
+    // LOWER 给它的下一个位点（maxOffset）。
+    return requireClient().searchOffsetByBoundary(mq, timestamp, BoundaryType::UPPER);
 }
 
 int64_t DefaultMQAdminExt::earliestMsgStoreTime(const MessageQueue& mq) {

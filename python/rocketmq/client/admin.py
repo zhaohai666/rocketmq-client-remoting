@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Optional, Set
 
+from ..common.boundary_type import BoundaryType
 from ..common.message import MessageExt, MessageQueue
 from ..common.message_decoder import decode_message_id, decode_message, decode_messages
 from ..common.mix_all import MixAll
@@ -754,7 +755,23 @@ class DefaultMQAdminExt:
         return self._require_client().get_min_offset(mq)
 
     def search_offset(self, mq: MessageQueue, timestamp: int) -> int:
-        return self._require_client().search_offset_by_timestamp(mq, timestamp)
+        """对应 Java MQAdminImpl#searchOffset(mq, ts)：显式下发 LOWER 边界。"""
+        return self._require_client().search_offset_by_timestamp(
+            mq, timestamp, boundary_type=BoundaryType.LOWER)
+
+    def search_lower_boundary_offset(self, mq: MessageQueue, timestamp: int) -> int:
+        """对应 Java DefaultMQAdminExt#searchLowerBoundaryOffset(:133)。"""
+        return self._require_client().search_offset_by_timestamp(
+            mq, timestamp, boundary_type=BoundaryType.LOWER)
+
+    def search_upper_boundary_offset(self, mq: MessageQueue, timestamp: int) -> int:
+        """对应 Java DefaultMQAdminExt#searchUpperBoundaryOffset(:137)。
+
+        与 LOWER 的差异只在多条消息共享 storeTime、或时间戳落在空档/队尾时可见：
+        队尾之后 UPPER 回最后一条自己的位点，LOWER 回它的下一个位点（maxOffset）。
+        """
+        return self._require_client().search_offset_by_timestamp(
+            mq, timestamp, boundary_type=BoundaryType.UPPER)
 
     def earliest_msg_store_time(self, mq: MessageQueue) -> int:
         client = self._require_client()

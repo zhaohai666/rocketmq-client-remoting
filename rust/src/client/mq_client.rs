@@ -59,6 +59,7 @@ use crate::client::result::{
 };
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::remoting::rpchook::StreamTypeRPCHook;
+use crate::common::boundary_type::BoundaryType;
 use crate::common::compression::decompress_body;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_client_id_setter::{get_uniq_id, set_uniq_id};
@@ -2530,11 +2531,30 @@ impl MQClientInstance {
         Ok(resp_header.offset.unwrap_or(0))
     }
 
-    /// Python `search_offset_by_timestamp`。
+    /// Python `search_offset_by_timestamp`（不带边界参数的重载）。
+    ///
+    /// 对应 Java `MQClientAPIImpl#searchOffset(addr, mq, ts, timeout)`:1377 —— 它只是把
+    /// `BoundaryType.LOWER` 转给下面那个带边界类型的重载（:1381）。
     pub async fn search_offset_by_timestamp(
         &self,
         mq: &MessageQueue,
         timestamp: i64,
+        timeout_millis: i64,
+        addr: Option<&str>,
+    ) -> Result<i64> {
+        self.search_offset_by_boundary(mq, timestamp, Some(BoundaryType::Lower), timeout_millis, addr)
+            .await
+    }
+
+    /// 带边界类型的重载（Java `MQClientAPIImpl#searchOffset(addr, mq, ts, boundaryType, timeout)`:1384）。
+    ///
+    /// `boundary` 为 `None` 时不写 `boundaryType` 字段，对应 Java 那个已废弃的
+    /// 5 参重载（只 set topic/queueId/timestamp，"边界"由 broker 的默认值兜底）。
+    pub async fn search_offset_by_boundary(
+        &self,
+        mq: &MessageQueue,
+        timestamp: i64,
+        boundary: Option<BoundaryType>,
         timeout_millis: i64,
         addr: Option<&str>,
     ) -> Result<i64> {
@@ -2546,6 +2566,7 @@ impl MQClientInstance {
             topic: Some(mq.topic.clone()),
             queue_id: Some(mq.queue_id),
             timestamp: Some(timestamp),
+            boundary_type: boundary,
         };
         let mut request = RemotingCommand::create_request_command(
             request_code::SEARCH_OFFSET_BY_TIMESTAMP,

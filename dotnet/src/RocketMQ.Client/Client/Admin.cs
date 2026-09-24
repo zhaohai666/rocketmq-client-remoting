@@ -1063,8 +1063,20 @@ public sealed class DefaultMQAdminExt
 
     public long MinOffset(MessageQueue mq) => RequireClient().GetMinOffset(mq);
 
+    /// <summary>对应 Java MQAdminImpl:189：显式下发 LOWER 边界。</summary>
     public long SearchOffset(MessageQueue mq, long timestamp) =>
-        RequireClient().SearchOffsetByTimestamp(mq, timestamp);
+        SearchLowerBoundaryOffset(mq, timestamp);
+
+    /// <summary>对应 Java DefaultMQAdminExt:133。</summary>
+    public long SearchLowerBoundaryOffset(MessageQueue mq, long timestamp) =>
+        RequireClient().SearchOffsetByBoundary(mq, timestamp, BoundaryType.Lower);
+
+    /// <summary>
+    /// 对应 Java DefaultMQAdminExt:137。时间戳落在队尾之后时 UPPER 给最后一条自身的位点，
+    /// LOWER 给它的下一个位点（maxOffset）。
+    /// </summary>
+    public long SearchUpperBoundaryOffset(MessageQueue mq, long timestamp) =>
+        RequireClient().SearchOffsetByBoundary(mq, timestamp, BoundaryType.Upper);
 
     public long EarliestMsgStoreTime(MessageQueue mq)
     {
