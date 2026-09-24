@@ -457,17 +457,25 @@ impl fmt::Display for ConsumeConcurrentlyStatus {
 }
 
 /// 对应 Java `ConsumeOrderlyStatus`。
+///
+/// 变体顺序与判别值逐字对齐 Java 枚举（`SUCCESS, ROLLBACK, COMMIT, SUSPEND_...`）：
+/// `ROLLBACK` / `COMMIT` 在 Java 侧标着 `@Deprecated` + "only for binlog consumption"，
+/// 用法见 `consumer.rs` 的 `auto_commit` 两条分支。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ConsumeOrderlyStatus {
     #[default]
     Success = 0,
-    SuspendCurrentQueueAMoment = 1,
+    Rollback = 1,
+    Commit = 2,
+    SuspendCurrentQueueAMoment = 3,
 }
 
 impl ConsumeOrderlyStatus {
     pub fn name(self) -> &'static str {
         match self {
             ConsumeOrderlyStatus::Success => "SUCCESS",
+            ConsumeOrderlyStatus::Rollback => "ROLLBACK",
+            ConsumeOrderlyStatus::Commit => "COMMIT",
             ConsumeOrderlyStatus::SuspendCurrentQueueAMoment => {
                 "SUSPEND_CURRENT_QUEUE_A_MOMENT"
             }
@@ -508,7 +516,13 @@ impl ConsumeConcurrentlyContext {
 #[derive(Debug, Clone)]
 pub struct ConsumeOrderlyContext {
     pub message_queue: Option<MessageQueue>,
+    /// 对应 Java `ConsumeOrderlyContext.autoCommit`（默认 true）。置 false 后 SUCCESS 只记
+    /// TPS 不提交、COMMIT/ROLLBACK 才生效（只给 binlog 消费用）。
     pub auto_commit: bool,
+    /// 对应 Java `ConsumeOrderlyContext.suspendCurrentQueueTimeMillis`，**默认 -1**
+    /// （Java 就是这个默认值）：-1 表示"没指定"，挂起时长回落到消费者配置的
+    /// `suspend_current_queue_time_millis`；解析出来的值再由投递侧钳到 [10, 30000]
+    /// （Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`）。
     pub suspend_current_queue_time_millis: i64,
 }
 
@@ -517,7 +531,7 @@ impl ConsumeOrderlyContext {
         ConsumeOrderlyContext {
             message_queue,
             auto_commit: true,
-            suspend_current_queue_time_millis: 1000,
+            suspend_current_queue_time_millis: -1,
         }
     }
 }
@@ -653,12 +667,19 @@ mod tests {
         assert_eq!(ctx.ack_index, i32::MAX);
         let orderly = ConsumeOrderlyContext::new(Some(MessageQueue::new("T", "b", 0)));
         assert!(orderly.auto_commit);
-        assert_eq!(orderly.suspend_current_queue_time_millis, 1000);
+        // Java ConsumeOrderlyContext:27 —— 默认 -1 = 「没指定」，回落到消费者配置
+        assert_eq!(orderly.suspend_current_queue_time_millis, -1);
         assert_eq!(ConsumeConcurrentlyStatus::ReconsumeLater.to_string(), "RECONSUME_LATER");
         assert_eq!(
             ConsumeOrderlyStatus::SuspendCurrentQueueAMoment.name(),
             "SUSPEND_CURRENT_QUEUE_A_MOMENT"
         );
+        // 声明顺序（= Java 枚举序号）也要对得上：COMMIT/ROLLBACK 只给 binlog 消费用
+        assert_eq!(ConsumeOrderlyStatus::Success as i32, 0);
+        assert_eq!(ConsumeOrderlyStatus::Rollback as i32, 1);
+        assert_eq!(ConsumeOrderlyStatus::Commit as i32, 2);
+        assert_eq!(ConsumeOrderlyStatus::SuspendCurrentQueueAMoment as i32, 3);
+        assert_eq!(ConsumeOrderlyStatus::Commit.name(), "COMMIT");
     }
 
     #[test]

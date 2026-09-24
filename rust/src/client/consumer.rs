@@ -2805,17 +2805,36 @@ async fn consume_pop_batch(
     }
     let begin_ms = current_time_millis();
     let (status, has_exception) = call_concurrently_listener(&inner, &msgs, &mut context).await;
-    let failed = matches!(status, Some(ConsumeConcurrentlyStatus::ReconsumeLater));
-    let succeeded = matches!(status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
-    // 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，与 Java 一致
-    record_consume_stats(&inner, &mq.topic, msgs.len(), begin_ms, failed, None);
-    if let Some(ctx) = hook_ctx.as_mut() {
-        finish_consume_hook(&inner, ctx, status, has_exception, begin_ms, failed, succeeded);
-    }
+    // Java POP :396-405 —— listener 返回 null 同样按 RECONSUME_LATER 处理（与经典并发同一套
+    // ConsumeRequest.run）；归一化**前**的 status 留给 returnType（返回 null 记 RETURNNULL，
+    // 而不是 FAILED），TPS 与钩子上下文都用归一化**后**的值。
+    let raw_status = status;
     let status = match status {
         Some(s) => s,
-        None => ConsumeConcurrentlyStatus::ReconsumeLater,
+        None => {
+            rmq_warn!(
+                "consumeMessage return null, Group: {} Msgs: {} MQ: {mq:?}",
+                read_cfg(&inner).consumer_group,
+                msgs.len()
+            );
+            ConsumeConcurrentlyStatus::ReconsumeLater
+        }
     };
+    let failed = matches!(status, ConsumeConcurrentlyStatus::ReconsumeLater);
+    let succeeded = matches!(status, ConsumeConcurrentlyStatus::ConsumeSuccess);
+    record_consume_stats(&inner, &mq.topic, msgs.len(), begin_ms, failed, None);
+    if let Some(ctx) = hook_ctx.as_mut() {
+        finish_consume_hook(
+            &inner,
+            ctx,
+            raw_status.map(ConsumeConcurrentlyStatus::name),
+            status.name(),
+            has_exception,
+            begin_ms,
+            failed,
+            succeeded,
+        );
+    }
     // 消费期间队列被撤走或已超时：结果不再处理
     if pq.is_dropped() || is_pop_timeout(&msgs, pop_time, invisible) {
         pq.dec_found_msg(i32::try_from(msgs.len()).unwrap_or(i32::MAX));
@@ -3120,11 +3139,28 @@ fn record_consume_stats(
     stats.inc_consume_rt(&group, topic, rt);
 }
 
-/// Python `_finish_consume_hook`：写回 returnType/status/success 并触发 after 钩子。
+/// Python `_record_consume_rt`（Java ConsumeRequest.run 里那条**无条件**的 incConsumeRT：
+/// 并发 `:414-415`、顺序 `:514-515`）。TPS 只在结果落进某个分支时才记，RT 每次都记。
+fn record_consume_rt(inner: &Inner, topic: &str, begin_ms: i64) {
+    let Some(stats) = lock(&inner.stats).clone() else {
+        return;
+    };
+    let rt = current_time_millis() - begin_ms;
+    stats.inc_consume_rt(&read_cfg(inner).consumer_group, topic, rt);
+}
+
+/// Python `_finish_consume_hook`：把 returnType/status/success 写回上下文并触发 after 钩子。
+///
+/// `raw_status_name` 是决定 returnType 的那一个；`hook_status_name` 是写进上下文的那个 ——
+/// Java 里这两步用的**不是同一个值**：returnType 在 status 归一化（null →
+/// RECONSUME_LATER / 挂起）**之前**算好（并发 `:381-393`、顺序 `:483-496`），而
+/// `setStatus` 拿的是归一化**之后**的值（并发 `:399-410`、顺序 `:502-507`）。
+#[allow(clippy::too_many_arguments)]
 fn finish_consume_hook(
     inner: &Inner,
     ctx: &mut ConsumeMessageContext,
-    status: Option<ConsumeConcurrentlyStatus>,
+    raw_status_name: Option<&str>,
+    hook_status_name: &str,
     has_exception: bool,
     begin_ms: i64,
     failed: bool,
@@ -3133,10 +3169,7 @@ fn finish_consume_hook(
     let cfg = read_cfg(inner);
     let rt = current_time_millis() - begin_ms;
     let ret = consume_return_type(
-        status.map(|s| match s {
-            ConsumeConcurrentlyStatus::ConsumeSuccess => "CONSUME_SUCCESS",
-            ConsumeConcurrentlyStatus::ReconsumeLater => "RECONSUME_LATER",
-        }),
+        raw_status_name,
         has_exception,
         rt,
         cfg.consume_timeout,
@@ -3146,11 +3179,7 @@ fn finish_consume_hook(
         .props
         .get_or_insert_with(Default::default)
         .insert("ConsumeContextType".to_string(), ret.name().to_string());
-    ctx.status = Some(
-        status
-            .map(|s| s.name().to_string())
-            .unwrap_or_else(|| "None".to_string()),
-    );
+    ctx.status = Some(hook_status_name.to_string());
     ctx.success = succeeded;
     execute_consume_hook_after(&inner.consume_hooks, ctx);
 }
@@ -3253,56 +3282,114 @@ async fn consume_batch(
             execute_consume_hook_before(&inner.consume_hooks, ctx);
         }
         let begin_ms = current_time_millis();
-        let (status, has_exception) = call_orderly_listener(inner, &batch, &mut ocontext).await;
-        let failed = !matches!(status, Some(ConsumeOrderlyStatus::Success));
-        record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed, None);
-        if let Some(ctx) = hook_ctx.as_mut() {
-            let succeeded = matches!(status, Some(ConsumeOrderlyStatus::Success));
-            let rt = current_time_millis() - begin_ms;
-            let ret = consume_return_type(
-                status.map(|s| s.name()),
-                has_exception,
-                rt,
-                cfg.consume_timeout,
-                failed,
-            );
-            ctx
-                .props
-                .get_or_insert_with(Default::default)
-                .insert("ConsumeContextType".to_string(), ret.name().to_string());
-            ctx.status = Some(
-                status
-                    .map(|s| s.name().to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-            );
-            ctx.success = succeeded;
-            execute_consume_hook_after(&inner.consume_hooks, ctx);
-        }
+        // `raw_status` 为 None 只可能是 listener 抛异常（call_orderly_listener 的 join 失败）
+        let (raw_status, has_exception) = call_orderly_listener(inner, &batch, &mut ocontext).await;
+        // Java:474-481 —— null / ROLLBACK / 挂起都要留一条 warn
         if matches!(
-            status,
-            Some(ConsumeOrderlyStatus::SuspendCurrentQueueAMoment)
+            raw_status,
+            None | Some(ConsumeOrderlyStatus::Rollback)
+                | Some(ConsumeOrderlyStatus::SuspendCurrentQueueAMoment)
         ) {
-            // Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
-            // 只有「还在重试次数内 / 回投失败」才把这一批塞回队首原地重试；已经交给
-            // broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列
-            //（顺序消费的 head-of-line blocking 在真机上就是「这个组停在第 N 条不动」）。
-            if check_orderly_reconsume_times(inner, &mut batch).await {
-                {
-                    let mut state = lock(&inner.state);
-                    if let Some(dq) = state.pending.get_mut(key) {
-                        for m in batch.iter().rev() {
-                            dq.push_front(m.clone());
-                        }
-                    }
+            rmq_warn!(
+                "consumeMessage Orderly return not OK, Group: {} Msgs: {} MQ: {mq:?}",
+                cfg.consumer_group,
+                batch.len()
+            );
+        }
+        // Java:502-504 —— null 在钩子之前就按挂起处理：顺序消费没有「异常即 ack」这条路
+        let status = raw_status.unwrap_or(ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        let failed = status == ConsumeOrderlyStatus::SuspendCurrentQueueAMoment;
+        let succeeded = matches!(
+            status,
+            ConsumeOrderlyStatus::Success | ConsumeOrderlyStatus::Commit
+        );
+        if let Some(ctx) = hook_ctx.as_mut() {
+            // 钩子拿归一化**后**的 status、success 判据是 SUCCESS||COMMIT（Java:506-511），
+            // 而 returnType 用归一化**前**的（Java:483-496）
+            finish_consume_hook(
+                inner,
+                ctx,
+                raw_status.map(|s| s.name()),
+                status.name(),
+                has_exception,
+                begin_ms,
+                failed,
+                succeeded,
+            );
+        }
+        if ocontext.auto_commit {
+            // Java processConsumeResult:244-269
+            let status = match status {
+                ConsumeOrderlyStatus::Commit | ConsumeOrderlyStatus::Rollback => {
+                    // Java:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是非法用法（只给
+                    // binlog 消费用），Java 只警告、**不写 break**，顺势落进 SUCCESS 分支：
+                    // 消息照 ack，不当成回滚
+                    rmq_warn!(
+                        "the message queue consume result is illegal, \
+                         we think you want to ack these message {mq:?}"
+                    );
+                    ConsumeOrderlyStatus::Success
                 }
-                let suspend = cfg.suspend_current_queue_millis();
+                other => other,
+            };
+            if status == ConsumeOrderlyStatus::SuspendCurrentQueueAMoment {
+                record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, true, None);
+                // Java:256-266：挂起之前要先过 checkReconsumeTimes。只有「还在重试次数内 /
+                // 回投失败」才把这一批塞回队首原地重试；已经交给 broker 的（回投成功）要
+                // 前进位点，否则一条毒消息永久占住这条队列（顺序消费的 head-of-line
+                // blocking 在真机上就是「这个组停在第 N 条不动」）。
+                if check_orderly_reconsume_times(inner, &mut batch).await {
+                    requeue_pending(inner, key, &batch);
+                    let suspend = orderly_suspend_millis(&cfg, &ocontext);
+                    tokio::time::sleep(Duration::from_millis(suspend)).await;
+                    return Ok(false);
+                }
+            } else {
+                record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, false, None);
+            }
+            advance_consume_offset(inner, key, &batch, None);
+            return Ok(true);
+        }
+        // ---- autoCommit=false（Java:270-300，binlog 消费场景）----
+        match status {
+            ConsumeOrderlyStatus::Commit => {
+                // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+                record_consume_rt(inner, &mq.topic, begin_ms);
+                advance_consume_offset(inner, key, &batch, None);
+                return Ok(true);
+            }
+            ConsumeOrderlyStatus::Rollback => {
+                // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
+                record_consume_rt(inner, &mq.topic, begin_ms);
+                requeue_pending(inner, key, &batch);
+                let suspend = orderly_suspend_millis(&cfg, &ocontext);
                 tokio::time::sleep(Duration::from_millis(suspend)).await;
                 return Ok(false);
             }
-            // 回投成功：毒消息已经交给 broker，往下走和 SUCCESS 一样前进位点
+            ConsumeOrderlyStatus::SuspendCurrentQueueAMoment => {
+                record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, true, None);
+                if check_orderly_reconsume_times(inner, &mut batch).await {
+                    requeue_pending(inner, key, &batch);
+                    let suspend = orderly_suspend_millis(&cfg, &ocontext);
+                    tokio::time::sleep(Duration::from_millis(suspend)).await;
+                }
+                // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 后**不 commit**，
+                // 位点前不前进由 binlog 消费方自己拿主意
+                return Ok(false);
+            }
+            ConsumeOrderlyStatus::Success => {
+                // Java:272-274 只记 OK TPS、不提交。有意偏差：Java 把消息留在
+                // ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()，而本端口没把
+                // ProcessQueue 交给 listener（没有 commit 的口子），照抄「什么都不做」会让
+                // 这批消息被分发线程吞掉而位点又没动。这里等价地塞回队首并等一个挂起周期：
+                // 位点同样不前进、消息不丢，也不会把消费线程变成忙等。
+                record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, false, None);
+                requeue_pending(inner, key, &batch);
+                let suspend = orderly_suspend_millis(&cfg, &ocontext);
+                tokio::time::sleep(Duration::from_millis(suspend)).await;
+                return Ok(false);
+            }
         }
-        advance_consume_offset(inner, key, &batch, None);
-        return Ok(true);
     }
 
     // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
@@ -3317,6 +3404,14 @@ async fn consume_batch(
     }
     let begin_ms = current_time_millis();
     let (raw_status, has_exception) = call_concurrently_listener(inner, &batch, &mut context).await;
+    if raw_status.is_none() {
+        // Java:399-405 —— listener 返回 null 先告警再归一化，告警里带的是**原始**返回值
+        rmq_warn!(
+            "consumeMessage return null, Group: {} Msgs: {} MQ: {mq:?}",
+            cfg.consumer_group,
+            batch.len()
+        );
+    }
     let failed = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ReconsumeLater))
         || raw_status.is_none();
     let succeeded = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
@@ -3342,7 +3437,18 @@ async fn consume_batch(
     // 统计口径同 Java 的 ok/failed 计数（:217-225）：部分 ack 时尾巴算 failed
     record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed, Some(acked));
     if let Some(ctx) = hook_ctx.as_mut() {
-        finish_consume_hook(inner, ctx, raw_status, has_exception, begin_ms, failed, succeeded);
+        // returnType 用归一化前的 raw_status（None → RETURNNULL），写进上下文的 status 用
+        // 归一化后的（Java:399-410）
+        finish_consume_hook(
+            inner,
+            ctx,
+            raw_status.map(|s| s.name()),
+            status.name(),
+            has_exception,
+            begin_ms,
+            failed,
+            succeeded,
+        );
     }
     if broadcast {
         // Java:232-237 —— 广播模式不回投：未认可的尾巴只 warn 后丢掉，
@@ -3436,6 +3542,36 @@ fn advance_consume_offset(inner: &Inner, key: &str, batch: &[MessageExt], floor:
     let mut state = lock(&inner.state);
     let cur = state.consume_offsets.get(key).copied().unwrap_or(0);
     state.consume_offsets.insert(key.to_string(), cur.max(next_off));
+}
+
+/// Python `_requeue_pending`：把这一批按原顺序塞回本地队列队首，等价 Java
+/// `makeMessageToConsumeAgain` / `rollback`。
+///
+/// 本端口的待消费缓冲是 `pending` 双端队列，批次在分发给 listener **之前**就被弹出队首了；
+/// 而拉取游标在拉取那一刻已经推到 `nextBeginOffset`，所以「位点不前进」并不会让 broker
+/// 把这几条再发一遍 —— 想让它们原地重试就必须显式放回去（Java 那边消息始终留在
+/// `ProcessQueue.consumingMsgOrderlyTreeMap` 里，不需要这一步）。
+fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
+    let mut state = lock(&inner.state);
+    if let Some(dq) = state.pending.get_mut(key) {
+        for m in batch.iter().rev() {
+            dq.push_front(m.clone());
+        }
+    }
+}
+
+/// Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`。
+///
+/// 先解析 `-1`（`ConsumeOrderlyContext.suspendCurrentQueueTimeMillis` 的默认值，意思是
+/// 「没指定」）→ 回落到消费者配置 `suspendCurrentQueueTimeMillis`（默认 1000），再把结果
+/// **钳到 [10, 30000]**。这个钳位不是装饰：listener 传 0 时 Java 仍然等 10ms（否则一个
+/// 返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
+fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> u64 {
+    let mut ms = ctx.suspend_current_queue_time_millis;
+    if ms == -1 {
+        ms = cfg.suspend_current_queue_time_millis;
+    }
+    ms.clamp(10, 30000) as u64
 }
 
 /// Python `send_message_back`（CONSUMER_SEND_MSG_BACK=36）。
@@ -3878,28 +4014,31 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
         // 读线程上直接调 listener。差别只在这一条路径上用户代码会占住读线程。
         let status = match lock(&self.inner.listener).as_ref().cloned() {
             Some(MessageListener::Concurrently(listener)) => {
-                Some(listener.consume_message(&msgs, &mut context))
+                result.order = false;
+                match listener.consume_message(&msgs, &mut context) {
+                    ConsumeConcurrentlyStatus::ConsumeSuccess => CMResult::CR_SUCCESS,
+                    ConsumeConcurrentlyStatus::ReconsumeLater => CMResult::CR_LATER,
+                }
             }
             Some(MessageListener::Orderly(listener)) => {
                 let mut octx = ConsumeOrderlyContext::new(Some(mq));
-                match listener.consume_message(&msgs, &mut octx) {
-                    ConsumeOrderlyStatus::Success => {
-                        Some(ConsumeConcurrentlyStatus::ConsumeSuccess)
-                    }
-                    ConsumeOrderlyStatus::SuspendCurrentQueueAMoment => {
-                        Some(ConsumeConcurrentlyStatus::ReconsumeLater)
-                    }
+                let status = listener.consume_message(&msgs, &mut octx);
+                // Java 顺序 `consumeMessageDirectly`:103-161 —— order=true 且把上下文里的
+                // autoCommit 原样回给 broker（broker 按它决定这条直接消费算不算「已提交」），
+                // 映射比并发侧多两个成员：COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK
+                result.order = true;
+                result.auto_commit = octx.auto_commit;
+                match status {
+                    ConsumeOrderlyStatus::Success => CMResult::CR_SUCCESS,
+                    ConsumeOrderlyStatus::SuspendCurrentQueueAMoment => CMResult::CR_LATER,
+                    ConsumeOrderlyStatus::Commit => CMResult::CR_COMMIT,
+                    ConsumeOrderlyStatus::Rollback => CMResult::CR_ROLLBACK,
                 }
             }
             // Python 的 `else None`：没有监听器 → 状态为 None → CR_RETURN_NULL
-            None => None,
-        };
-        result.consume_result = Some(match status {
-            Some(ConsumeConcurrentlyStatus::ConsumeSuccess) => CMResult::CR_SUCCESS,
-            Some(ConsumeConcurrentlyStatus::ReconsumeLater) => CMResult::CR_LATER,
             None => CMResult::CR_RETURN_NULL,
-        }
-        .to_string());
+        };
+        result.consume_result = Some(status.to_string());
         result.spent_time_mills = current_time_millis() - begin;
         let _ = msgs;
         Ok(result)
@@ -4010,13 +4149,6 @@ impl DefaultMQPushConsumer {
     /// 触发一次立即重平衡（等价 broker 的 40 通知；测试与运维手动触发用）。
     pub fn rebalance_immediately(&self) {
         self.request_rebalance();
-    }
-}
-
-impl ConsumerConfig {
-    /// `suspend_current_queue_time_millis` 的取整小工具（i64 -> u64 毫秒）。
-    fn suspend_current_queue_millis(&self) -> u64 {
-        u64::try_from(self.suspend_current_queue_time_millis.max(0)).unwrap_or(0)
     }
 }
 
@@ -5199,15 +5331,45 @@ mod tests {
     /// 位点前进」那一支（未 `start()` 时必然走不到）交给真机 `examples/live_consumer.rs`。
     struct OrderlyListener {
         status: ConsumeOrderlyStatus,
+        /// `Some(false)` 模拟 binlog 消费方关掉 autoCommit（Java 手动提交模式）。
+        auto_commit: Option<bool>,
     }
 
     impl MessageListenerOrderly for OrderlyListener {
         fn consume_message(
             &self,
             _msgs: &[MessageExt],
-            _context: &mut ConsumeOrderlyContext,
+            context: &mut ConsumeOrderlyContext,
         ) -> ConsumeOrderlyStatus {
+            if let Some(auto) = self.auto_commit {
+                context.auto_commit = auto;
+            }
             self.status
+        }
+    }
+
+    /// 记录 after 钩子看到的 `(status, success, ConsumeContextType)`。
+    struct RecordingHook {
+        after: Mutex<Vec<(String, bool, String)>>,
+    }
+
+    impl ConsumeMessageHook for RecordingHook {
+        fn hook_name(&self) -> &str {
+            "recording-hook"
+        }
+
+        fn consume_message_after(&self, ctx: &mut ConsumeMessageContext) -> Result<()> {
+            let context_type = ctx
+                .props
+                .as_ref()
+                .and_then(|p| p.get("ConsumeContextType").cloned())
+                .unwrap_or_default();
+            lock(&self.after).push((
+                ctx.status.clone().unwrap_or_default(),
+                ctx.success,
+                context_type,
+            ));
+            Ok(())
         }
     }
 
@@ -5219,19 +5381,38 @@ mod tests {
 
     impl OrderlyHarness {
         fn new(max_reconsume_times: i32, status: ConsumeOrderlyStatus) -> OrderlyHarness {
+            OrderlyHarness::build(max_reconsume_times, status, None)
+        }
+
+        /// 关掉 autoCommit 的监听器（Java 手动提交 / binlog 用法）。
+        fn new_manual(max_reconsume_times: i32, status: ConsumeOrderlyStatus) -> OrderlyHarness {
+            OrderlyHarness::build(max_reconsume_times, status, Some(false))
+        }
+
+        fn build(
+            max_reconsume_times: i32,
+            status: ConsumeOrderlyStatus,
+            auto_commit: Option<bool>,
+        ) -> OrderlyHarness {
             let cfg = ConsumerConfig {
                 consumer_group: "G".to_string(),
                 max_reconsume_times,
-                // 单测不干等默认的 1s
+                // 配置侧 0 会被钳到 10ms（Java submitConsumeRequestLater 的下限），
+                // 单测因此只等 10ms 而不是默认的 1s
                 suspend_current_queue_time_millis: 0,
                 ..Default::default()
             };
             let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
-            c.set_message_listener_orderly(Arc::new(OrderlyListener { status }));
+            c.set_message_listener_orderly(Arc::new(OrderlyListener { status, auto_commit }));
             let mq = queue("T", "broker-a", 0);
             let key = mq_key(&mq);
             lock(&c.inner.state).pending.insert(key.clone(), VecDeque::new());
             OrderlyHarness { c, key, mq }
+        }
+
+        fn with_hook(self, hook: Arc<dyn ConsumeMessageHook>) -> OrderlyHarness {
+            self.c.register_consume_message_hook(hook);
+            self
         }
 
         async fn run(&self, batch: Vec<MessageExt>) -> bool {
@@ -5391,6 +5572,178 @@ mod tests {
         assert!(h.run(orderly_batch(0, &[0])).await);
         assert_eq!(h.offset(), 1);
         assert_eq!(h.pending(), vec![]);
+    }
+
+    // ---------------- 挂起时长：context 优先 + 钳到 [10, 30000] ----------------
+
+    #[test]
+    fn orderly_suspend_millis_resolves_then_clamps_like_java() {
+        // Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`：
+        // 先解析 -1（`ConsumeOrderlyContext` 的默认值 = 「没指定」）→ 回落到消费者配置，
+        // 再把结果钳到 [10, 30000]。钳位不是装饰：listener 传 0 时 Java 仍然等 10ms
+        // （否则一个返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
+        let cfg = |ms: i64| ConsumerConfig {
+            suspend_current_queue_time_millis: ms,
+            ..Default::default()
+        };
+        let ctx = |ms: i64| {
+            let mut c = ConsumeOrderlyContext::new(None);
+            c.suspend_current_queue_time_millis = ms;
+            c
+        };
+        assert_eq!(orderly_suspend_millis(&cfg(1000), &ctx(-1)), 1000, "-1 = 用配置");
+        assert_eq!(orderly_suspend_millis(&cfg(250), &ctx(-1)), 250);
+        assert_eq!(orderly_suspend_millis(&cfg(0), &ctx(-1)), 10, "配置侧也要过钳位");
+        assert_eq!(orderly_suspend_millis(&cfg(60_000), &ctx(-1)), 30_000);
+        assert_eq!(orderly_suspend_millis(&cfg(900), &ctx(70)), 70, "给了值就忽略配置");
+        for (asked, expect) in [
+            (0i64, 10u64),
+            (9, 10),
+            (10, 10),
+            (250, 250),
+            (30_000, 30_000),
+            (30_001, 30_000),
+            (i64::MAX, 30_000),
+        ] {
+            assert_eq!(
+                orderly_suspend_millis(&cfg(1000), &ctx(asked)),
+                expect,
+                "asked={asked}"
+            );
+        }
+    }
+
+    // ---------------- autoCommit=true：COMMIT/ROLLBACK 是非法用法 ----------------
+
+    #[tokio::test]
+    async fn illegal_commit_and_rollback_under_auto_commit_are_acked() {
+        // Java processConsumeResult:244-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是非法用法
+        // （只给 binlog 消费用）：Java 只 warn 一句、**没写 break**，顺势落进 SUCCESS 分支
+        // 照常 ack。真把它当回滚，一个「返回 COMMIT 的监听器」会让这条队列原地卡死。
+        for status in [ConsumeOrderlyStatus::Commit, ConsumeOrderlyStatus::Rollback] {
+            let h = OrderlyHarness::new(0, status);
+            assert!(h.run(orderly_batch(0, &[0])).await, "{status:?} 应按整批认可处理");
+            assert_eq!(h.offset(), 1, "{status:?} 位点必须前进");
+            assert_eq!(h.pending(), vec![], "{status:?} 不该回投");
+        }
+    }
+
+    // ---------------- autoCommit=false：手动提交模式（Java:270-300）----------------
+
+    #[tokio::test]
+    async fn manual_commit_advances_without_requeueing() {
+        let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Commit);
+        assert!(h.run(orderly_batch(0, &[0])).await);
+        assert_eq!(h.offset(), 1, "COMMIT 就是要提交位点");
+        assert_eq!(h.pending(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn manual_rollback_requeues_and_holds_the_offset() {
+        // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试，位点不动。
+        let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Rollback);
+        assert!(!h.run(orderly_batch(0, &[0])).await);
+        assert_eq!(h.offset(), 0, "回滚不能提交位点");
+        assert_eq!(h.pending(), vec![(0, 0)], "消息退回队首重试");
+    }
+
+    #[tokio::test]
+    async fn manual_success_holds_the_batch_without_committing() {
+        // 有意偏差：Java 把消息留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式
+        // commit()，本端口没把 ProcessQueue 交给 listener（没有 commit 的口子），照抄
+        // 「什么都不做」会让这批消息被分发线程吞掉而位点又没动。等价地塞回队首并等一个
+        // 挂起周期：位点同样不前进、消息不丢，也不会把消费线程变成忙等。
+        let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Success);
+        // 两条都是 reconsumeTimes=0：手动模式下 SUCCESS 连本地计数都不该动
+        assert!(!h.run(orderly_batch(0, &[0, 0])).await);
+        assert_eq!(h.offset(), 0, "手动模式下 SUCCESS 不提交");
+        assert_eq!(h.pending(), vec![(0, 0), (1, 0)], "整批按原顺序退回");
+    }
+
+    #[tokio::test]
+    async fn manual_suspend_never_commits_the_offset() {
+        // Java:288-296 —— 与自动提交分支的关键差别：毒消息交给 broker 之后**不 commit**，
+        // 位点前不前进由 binlog 消费方自己拿主意（自动提交那条会 commit 放行）。
+        let h = OrderlyHarness::new_manual(2, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
+        assert!(!h.run(orderly_batch(7, &[2])).await);
+        assert_eq!(h.offset(), 0, "手动模式挂了也不提交位点");
+    }
+
+    #[tokio::test]
+    async fn orderly_hook_gets_raw_status_and_normalized_success() {
+        // Java 顺序 `:502-511`：returnType 按归一化**前**的 status 算，`setStatus` 拿的是
+        // 归一化**后**的；success 判据是 `SUCCESS || COMMIT`（COMMIT 视为「这批算过了」，
+        // ROLLBACK 不是）。写反的话轨迹里的 contextCode 与业务分支对不上。
+        let cases = [
+            (ConsumeOrderlyStatus::Commit, "COMMIT", true),
+            (ConsumeOrderlyStatus::Rollback, "ROLLBACK", false),
+            (
+                ConsumeOrderlyStatus::SuspendCurrentQueueAMoment,
+                "SUSPEND_CURRENT_QUEUE_A_MOMENT",
+                false,
+            ),
+            (ConsumeOrderlyStatus::Success, "SUCCESS", true),
+        ];
+        for (status, expect_status, expect_success) in cases {
+            let hook = Arc::new(RecordingHook {
+                after: Mutex::new(Vec::new()),
+            });
+            let h = OrderlyHarness::new(0, status).with_hook(hook.clone());
+            let _ = h.run(orderly_batch(0, &[0])).await;
+            let seen = lock(&hook.after);
+            assert_eq!(seen.len(), 1, "{status:?}: after 钩子必须触发一次");
+            assert_eq!(seen[0].0, expect_status, "{status:?} 的钩子 status");
+            assert_eq!(seen[0].1, expect_success, "{status:?} 的钩子 success");
+        }
+    }
+
+    // ---------------- 309 CONSUME_MESSAGE_DIRECTLY ----------------
+
+    /// Java 顺序 `consumeMessageDirectly:103-161` 与并发 `:309` 的映射差异：并发只有
+    /// SUCCESS/LATER 两档且 `order=false, autoCommit=true`（用默认值）；顺序多出
+    /// COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK，并且 `order=true`、`autoCommit`
+    /// 取 listener 在上下文里设的值（broker 按它决定这条直接消费算不算已提交）。
+    /// 映射写错是静默的：真机上只表现为某个队列的位点偶尔不回退或该挂起时被吞掉。
+    #[test]
+    fn direct_consume_maps_orderly_commit_rollback_and_auto_commit() {
+        let cases = [
+            (ConsumeOrderlyStatus::Success, CMResult::CR_SUCCESS),
+            (
+                ConsumeOrderlyStatus::SuspendCurrentQueueAMoment,
+                CMResult::CR_LATER,
+            ),
+            (ConsumeOrderlyStatus::Commit, CMResult::CR_COMMIT),
+            (ConsumeOrderlyStatus::Rollback, CMResult::CR_ROLLBACK),
+        ];
+        for (status, expect) in cases {
+            let h = OrderlyHarness::new_manual(0, status);
+            let r = h
+                .c
+                .consume_message_directly(orderly_batch(0, &[0]).remove(0), Some("broker-a".to_string()))
+                .expect("direct consume must not error");
+            assert_eq!(r.consume_result.as_deref(), Some(expect), "{status:?} 的映射");
+            assert!(r.order, "{status:?}: 顺序 listener 必须报 order=true");
+            assert!(
+                !r.auto_commit,
+                "{status:?}: listener 设的 autoCommit=false 要原样回给 broker"
+            );
+        }
+    }
+
+    /// 并发侧：`order=false` 且 autoCommit 保持 Java 初值 `true`（顺序上下文才是可改的）。
+    #[test]
+    fn direct_consume_maps_concurrent_success_and_auto_commit_default() {
+        let c = DefaultMQPushConsumer::with_config(cfg_with(0)).expect("consumer");
+        c.set_message_listener_concurrently(Arc::new(AckListener {
+            ack_index: None,
+            status: ConsumeConcurrentlyStatus::ConsumeSuccess,
+        }));
+        let r = c
+            .consume_message_directly(ext("T", None), Some("broker-a".to_string()))
+            .expect("direct consume must not error");
+        assert_eq!(r.consume_result.as_deref(), Some(CMResult::CR_SUCCESS));
+        assert!(!r.order, "并发 listener 必须报 order=false");
+        assert!(r.auto_commit, "并发侧沿用 Java 初值 autoCommit=true");
     }
 
     // ---------------- POP ----------------

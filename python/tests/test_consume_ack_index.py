@@ -22,6 +22,7 @@ from collections import deque
 
 from rocketmq.client.consumer import DefaultMQPushConsumer
 from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq.client.hook import ConsumeMessageHook
 from rocketmq.common.message import MessageExt, MessageQueue
 from rocketmq.remoting.protocol.heartbeat import MessageModel
 
@@ -29,6 +30,23 @@ GROUP = "GID_AckIndexUnitTest"
 TOPIC = "AckIndexUnitTestTopic"
 BROKER = "broker-a"
 KEY = "key"
+
+
+class _RecordingConsumeHook(ConsumeMessageHook):
+    """只记 after 钩子看到的 (status, success, ConsumeContextType)。"""
+
+    def __init__(self):
+        self.after = []
+
+    def hook_name(self):
+        return "RecordingConsumeHook"
+
+    def consume_message_before(self, context):
+        pass
+
+    def consume_message_after(self, context):
+        self.after.append((context.status, context.success,
+                           context.props.get("ConsumeContextType")))
 
 
 def msg(queue_offset: int, reconsume_times: int = 0) -> MessageExt:
@@ -186,6 +204,35 @@ class TestReconsumeLater:
 
         assert h.consume([msg(0), msg(1)], Boom()) is True
         assert h.backed_offsets == [0, 1]
+
+    def test_null_return_is_reconsume_later_not_a_silent_ack(self):
+        """Java:399-405 —— listener 返回 null 按 RECONSUME_LATER 处理。
+
+        钩子里的 ConsumeContextType 用的是归一化**前**的 status（null → RETURNNULL），
+        而写进上下文的 status 是归一化后的 RECONSUME_LATER —— 两个值在 Java 里就不同。
+        """
+        h = Harness()
+        hook = _RecordingConsumeHook()
+        h.c.register_consume_message_hook(hook)
+        assert h.consume([msg(0), msg(1)], FixedListener(None)) is True
+        assert h.backed_offsets == [0, 1], "整批回投"
+        assert hook.after == [("RECONSUME_LATER", False, "RETURNNULL")], (
+            "status 的形态按 Java 的 Enum.toString()（裸成员名），不是 str(枚举) 那种带类名的")
+
+    def test_hook_status_is_java_enum_name_on_the_success_path_too(self):
+        """成功路径同样：``ConsumeConcurrentlyService:408`` 写的是 ``CONSUME_SUCCESS``。
+
+        反证「没写错形态」得同时钉住两件事：等于 Java 的裸成员名，且**不等于** Python
+        的 ``str(枚举)`` —— 只断言"以 C 开头"之类的模糊判据会让 `"ConsumeConcurrentlyStatus.CONSUME_SUCCESS"`
+        这种带类名的形态蒙过去。
+        """
+        h = Harness()
+        hook = _RecordingConsumeHook()
+        h.c.register_consume_message_hook(hook)
+        assert h.consume([msg(0)], FixedListener(ConsumeConcurrentlyStatus.CONSUME_SUCCESS)) is True
+        status, success, ctx_type = hook.after[0]
+        assert (status, success, ctx_type) == ("CONSUME_SUCCESS", True, "SUCCESS")
+        assert status != str(ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
 
 
 # ---------------------------------------------------------- BROADCASTING

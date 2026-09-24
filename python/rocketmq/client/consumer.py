@@ -39,7 +39,7 @@ from . import validators
 from .consume_executor import ConsumeExecutor
 from .consumer_result import (ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus,
                               ConsumeOrderlyContext, ConsumeOrderlyStatus,
-                              ConsumeReturnType,
+                              ConsumeReturnType, consume_status_name,
                               MessageListener, MessageListenerConcurrently,
                               MessageListenerOrderly, PopResult, PopStatus,
                               PullResult, PullStatus)
@@ -71,6 +71,13 @@ CONSUME_INIT_MODE_MAX = 1
 # Java `Integer.MAX_VALUE`：顺序消费用尽判据的默认值（-1 在这条链路上读成它，
 # 见 DefaultMQPushConsumerImpl#checkReconsumeTimes 的注释「default reconsume times」）。
 _JAVA_INT_MAX = 0x7FFFFFFF
+
+# Java ConsumeOrderlyStatus 的四个成员（声明顺序见其枚举：SUCCESS/ROLLBACK/COMMIT/挂起）。
+# 顺序消费的 listener 只允许返回这四个之一：null 由 Java 兜成挂起，未知值在动态类型下
+# 也得走同一条兜底，否则会被当成 SUCCESS 静默 ack。
+_ORDERLY_STATUSES = (ConsumeOrderlyStatus.SUCCESS, ConsumeOrderlyStatus.ROLLBACK,
+                     ConsumeOrderlyStatus.COMMIT,
+                     ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT)
 
 # Java ProcessQueue.PULL_MAX_IDLE_TIME（`rocketmq.client.pull.pullMaxIdleTime`，默认 120000ms）：
 # 一个仍归本实例的队列如果超过这么久没发起过任何拉取/弹出，说明它的循环死了（或卡住了）。
@@ -1062,16 +1069,27 @@ class DefaultMQPushConsumer:
             return ConsumeReturnType.SUCCESS
         return ConsumeReturnType.SUCCESS
 
+    def _record_consume_rt(self, topic: str, begin_ms: float) -> None:
+        """消费耗时记数（Java ConsumeRequest.run 里那条**无条件**的 ``incConsumeRT``：并发
+        ``:414-415``、顺序 ``:514-515``）。
+
+        与 ok/failed 计数分开：RT 直方图每次消费都记，而 TPS 只在结果落在某个分支时才记
+        （顺序消费的 ``COMMIT``/``ROLLBACK`` 分支一个 TPS 都不加，但 RT 照记）。
+        """
+        if self._stats_manager is None:
+            return
+        self._stats_manager.inc_consume_rt(self.consumer_group, topic,
+                                           int(time.time() * 1000 - begin_ms))
+
     def _record_consume_stats(self, topic: str, msg_count: int, begin_ms: float,
                               failed: bool, ack_count: Optional[int] = None) -> None:
-        """消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
+        """消费侧 TPS 记数（Java ``processConsumeResult`` 的 ok/failed 分支）。
 
         ``ack_count`` 对应 Java ``processConsumeResult:217-220`` 的 ``ok = ackIndex + 1``：
         部分 ack 时前缀算 OK、尾巴算 FAILED。不传则按整批算（顺序/POP 路径的旧口径）。
         """
         if self._stats_manager is None:
             return
-        rt = int(time.time() * 1000 - begin_ms)
         if failed:
             self._stats_manager.inc_consume_failed_tps(self.consumer_group, topic, msg_count)
         else:
@@ -1080,18 +1098,25 @@ class DefaultMQPushConsumer:
             if msg_count > ok:
                 self._stats_manager.inc_consume_failed_tps(self.consumer_group, topic,
                                                            msg_count - ok)
-        self._stats_manager.inc_consume_rt(self.consumer_group, topic, rt)
+        self._record_consume_rt(topic, begin_ms)
 
     def _finish_consume_hook(self, hook_ctx: Optional[ConsumeMessageContext], status,
                              has_exception: bool, begin_ms: float, failed: bool,
-                             succeeded: bool) -> None:
-        """把 returnType/status/success 写回上下文并触发 after 钩子（对齐 Java）。"""
+                             succeeded: bool, hook_status=None) -> None:
+        """把 returnType/status/success 写回上下文并触发 after 钩子（对齐 Java）。
+
+        ``status`` 是决定 returnType 的那一个；``hook_status`` 是写进上下文的那个 ——
+        Java 里这两步用的**不是同一个值**：returnType 在 status 归一化（null →
+        RECONSUME_LATER / 挂起）**之前**算好（并发 :381-393、顺序 :483-496），而
+        context.setStatus 拿的是归一化**之后**的值（并发 :399-410、顺序 :502-507）。
+        不传 ``hook_status`` 时两者相同。
+        """
         if hook_ctx is None:
             return
         rt = time.time() * 1000 - begin_ms
         ret = self._consume_return_type(status, has_exception, rt, failed, succeeded)
         hook_ctx.props["ConsumeContextType"] = ret.name
-        hook_ctx.status = str(status)
+        hook_ctx.status = consume_status_name(status if hook_status is None else hook_status)
         hook_ctx.success = succeeded
         self.execute_consume_hook_after(hook_ctx)
 
@@ -2063,17 +2088,22 @@ class DefaultMQPushConsumer:
             logger.debug("pop listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
             has_exception = True
-        # 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，
-        # 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
+        # Java POP :396-405 —— listener 返回 null 同样按 RECONSUME_LATER 处理（与经典并发同一套
+        # ConsumeRequest.run）。归一化**前**的 status 留给 returnType（返回 null 记 RETURNNULL，
+        # 不是 FAILED）；TPS 与钩子上下文都用归一化**后**的值（Java 的 processConsumeResult
+        # 拿到的也是归一化后的 —— 返回 null 的 listener 在 Java 里算**失败**，不是成功）
+        raw_status = status
+        if status is None:
+            logger.warning("consumeMessage return null, Group: %s Msgs: %d MQ: %s",
+                           self.consumer_group, len(msgs), mq)
+            status = ConsumeConcurrentlyStatus.RECONSUME_LATER
         self._record_consume_stats(mq.topic, len(msgs), begin_ms,
                                    failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER)
         self._finish_consume_hook(
-            hook_ctx, status, has_exception, begin_ms,
+            hook_ctx, raw_status, has_exception, begin_ms,
             failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
-            succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
-        if status is None:
-            logger.debug("pop listener returned None, treat as RECONSUME_LATER for %s", mq)
-            status = ConsumeConcurrentlyStatus.RECONSUME_LATER
+            succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS,
+            hook_status=status)
 
         if pq.is_dropped() or self._is_pop_timeout(msgs, pop_time, invisible):
             # 消费期间队列被撤走或已超时：结果不再处理
@@ -2438,20 +2468,37 @@ class DefaultMQPushConsumer:
 
     def consume_message_directly(self, msg: MessageExt,
                                  broker_name: Optional[str]) -> ConsumeMessageDirectlyResult:
-        """对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）。"""
+        """对应 Java 的 consumeMessageDirectly（并发 :102-139 / 顺序 :103-161）。
+
+        由管理端 ``CONSUME_MESSAGE_DIRECTLY`` 触发，把 broker 上的一条消息直接丢给
+        listener，应答里的 ``order`` 标志区分消费模式（broker 侧按它选 DLQ 口径）。
+        顺序侧的映射比并发侧多两个成员：COMMIT → ``CR_COMMIT``、ROLLBACK →
+        ``CR_ROLLBACK``（Java 顺序 :125-140），并发侧返回它们只会落到 ``default:``。
+        """
         result = ConsumeMessageDirectlyResult()
-        result.order = False
-        result.auto_commit = True
+        orderly = self._is_orderly()
+        result.order = orderly
         msgs = [msg]
         mq = MessageQueue(topic=msg.topic, broker_name=broker_name or "",
                           queue_id=msg.queue_id)
         self._reset_retry_topic_and_namespace(msgs)
-        context = ConsumeConcurrentlyContext(mq)
+        context = ConsumeOrderlyContext(mq) if orderly else ConsumeConcurrentlyContext(mq)
         begin = int(time.time() * 1000)
         try:
             status = self.message_listener.consume_message(msgs, context) \
                 if self.message_listener is not None else None
-            if status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
+            if orderly:
+                if status == ConsumeOrderlyStatus.SUCCESS:
+                    result.consume_result = CMResult.CR_SUCCESS
+                elif status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                    result.consume_result = CMResult.CR_LATER
+                elif status == ConsumeOrderlyStatus.COMMIT:
+                    result.consume_result = CMResult.CR_COMMIT
+                elif status == ConsumeOrderlyStatus.ROLLBACK:
+                    result.consume_result = CMResult.CR_ROLLBACK
+                elif status is None:
+                    result.consume_result = CMResult.CR_RETURN_NULL
+            elif status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS:
                 result.consume_result = CMResult.CR_SUCCESS
             elif status == ConsumeConcurrentlyStatus.RECONSUME_LATER:
                 result.consume_result = CMResult.CR_LATER
@@ -2460,8 +2507,27 @@ class DefaultMQPushConsumer:
         except Exception as e:  # noqa: BLE001
             result.consume_result = CMResult.CR_THROW_EXCEPTION
             result.remark = "%s: %s" % (type(e).__name__, e)
+        # Java 顺序 :156 —— autoCommit 读的是 **listener 跑完之后**的上下文值（放在
+        # try/catch 之外、异常路径同样读）。listener 里置 false 的 binlog 用法靠这条
+        # 回传让 broker 知道「这条直接消费没提交」；提前读初值等于把它吞掉，
+        # 真机上只表现为 mqadmin 返回的 autoCommit 恒为 true。
+        result.auto_commit = context.auto_commit if orderly else True
         result.spent_time_mills = int(time.time() * 1000) - begin
         return result
+
+    def _requeue_pending(self, key: str, batch: List[MessageExt]) -> None:
+        """把这一批塞回本地队列队首，等价 Java ``makeMessageToConsumeAgain``/``rollback``。
+
+        本端口的待消费缓冲是 ``_pending`` 双端队列，批次在分发给 listener **之前**就被
+        弹出队首了；而拉取游标（``_offset_table``）在拉取那一刻已经推到 ``nextBeginOffset``，
+        所以"位点不前进"并不会让 broker 把这几条再发一遍 —— 想让它们原地重试就必须显式
+        放回去（Java 那边消息始终留在 ProcessQueue 里，不需要这一步）。
+        """
+        with self._lock:
+            dq = self._pending.get(key)
+            if dq is not None:
+                for m in reversed(batch):
+                    dq.appendleft(m)
 
     def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt]) -> bool:
         """消费一个批次并处理回投/挂起。返回消费位点是否前进。"""
@@ -2480,33 +2546,81 @@ class DefaultMQPushConsumer:
             try:
                 status = listener.consume_message(batch, ocontext)
             except Exception as e:  # noqa: BLE001
-                # Java 顺序消费：异常 → 不提交 offset，原地重试
+                # Java:463-469 —— 异常只置 hasException，status 留 null，由下面统一
+                # 变成挂起：顺序消费永远没有"异常即 ack"这条路
                 logger.debug("orderly listener error (retry in place): %s", e)
-                status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT
+                status = None
                 ohas_exception = True
-            # 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:511）
-            self._record_consume_stats(mq.topic, len(batch), obegin_ms,
-                                       failed=status != ConsumeOrderlyStatus.SUCCESS)
+            # Java:474-481 —— null / ROLLBACK / 挂起都要留一条 warn
+            if (status is None or status == ConsumeOrderlyStatus.ROLLBACK
+                    or status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT):
+                logger.warning("consumeMessage Orderly return not OK, Group: %s Msgs: %d MQ: %s",
+                               self.consumer_group, len(batch), mq)
+            raw_status = status
+            if status is None or status not in _ORDERLY_STATUSES:
+                # Java:502-504 —— null 在钩子之前就按挂起处理；Java 靠静态类型保证
+                # status 只能是枚举成员，动态类型下"返回了别的东西"走同一条兜底：
+                # 否则它会一路落进 SUCCESS 分支，把没消费成功的消息静默 ack 掉。
+                status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT
+            # 钩子拿**归一化后**的 status，success 判据是 SUCCESS||COMMIT（Java:506-511），
+            # 而 returnType 用归一化**前**的（Java:483-496）
             self._finish_consume_hook(
-                ohook_ctx, status, ohas_exception, obegin_ms,
-                failed=status != ConsumeOrderlyStatus.SUCCESS,
-                succeeded=status == ConsumeOrderlyStatus.SUCCESS)
-            if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
-                # Java processConsumeResult:254-266：挂起之前要先过 checkReconsumeTimes。
-                # 只有"还在重试次数内 / 回投失败"才把这一批塞回队首原地重试；已经交给
-                # broker 的（回投成功）要前进位点，否则一条毒消息永久占住这条队列。
-                if self._check_orderly_reconsume_times(batch):
-                    with self._lock:
-                        dq = self._pending.get(key)
-                        if dq is not None:
-                            for m in reversed(batch):
-                                dq.appendleft(m)
-                    time.sleep(self.suspend_current_queue_time_millis / 1000.0)
-                    return False
+                ohook_ctx, raw_status, ohas_exception, obegin_ms,
+                failed=status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT,
+                succeeded=status in (ConsumeOrderlyStatus.SUCCESS, ConsumeOrderlyStatus.COMMIT),
+                hook_status=status)
+            if ocontext.auto_commit:
+                # Java processConsumeResult:244-269
+                if status in (ConsumeOrderlyStatus.COMMIT, ConsumeOrderlyStatus.ROLLBACK):
+                    # Java:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是非法用法
+                    # （只给 binlog 消费用），Java 只警告、**不写 break**，顺势落进
+                    # SUCCESS 分支：消息照 ack，不当成回滚
+                    logger.warning("the message queue consume result is illegal, "
+                                   "we think you want to ack these message %s", mq)
+                    status = ConsumeOrderlyStatus.SUCCESS
+                if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                    self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=True)
+                    # Java:256-266 —— 挂起之前先过 checkReconsumeTimes：只有"还在重试
+                    # 次数内 / 回投失败"才原地重试；已经交给 broker 的（回投成功）要
+                    # 前进位点，否则一条毒消息永久占住这条队列
+                    if self._check_orderly_reconsume_times(batch):
+                        self._requeue_pending(key, batch)
+                        time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
+                        return False
+                else:
+                    self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=False)
                 self._advance_consume_offset(key, batch)
                 return True
-            self._advance_consume_offset(key, batch)
-            return True
+            # ---- autoCommit=False（Java:270-300，binlog 消费场景）----
+            if status == ConsumeOrderlyStatus.COMMIT:
+                # Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+                self._record_consume_rt(mq.topic, obegin_ms)
+                self._advance_consume_offset(key, batch)
+                return True
+            if status == ConsumeOrderlyStatus.ROLLBACK:
+                # Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
+                self._record_consume_rt(mq.topic, obegin_ms)
+                self._requeue_pending(key, batch)
+                time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
+                return False
+            if status == ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=True)
+                if self._check_orderly_reconsume_times(batch):
+                    self._requeue_pending(key, batch)
+                    time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
+                # Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 后**不 commit**，
+                # 位点前不前进由 binlog 消费方自己拿主意
+                return False
+            # SUCCESS + autoCommit=False：Java:272-274 只记 OK TPS、不提交。有意偏差：
+            # Java 把消息留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()，
+            # 而四个端口都没把 ProcessQueue 暴露给 listener（没有 commit 的口子），
+            # 照抄"什么都不做"会让这批消息被分发线程吞掉而位点又没动。这里等价地塞回
+            # 队首并等一个挂起周期：位点同样不前进、消息不丢，也不会把消费线程变成忙等
+            # （不 sleep 的话下一轮立刻又拿到同一批，DEFAULT 配置下就是 100% CPU 空转）。
+            self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=False)
+            self._requeue_pending(key, batch)
+            time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
+            return False
         # ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
         context = ConsumeConcurrentlyContext(mq)
         hook_ctx = None
@@ -2524,6 +2638,14 @@ class DefaultMQPushConsumer:
             logger.debug("listener error, treat as RECONSUME_LATER: %s", e)
             status = ConsumeConcurrentlyStatus.RECONSUME_LATER
             has_exception = True
+        # Java:399-405 —— listener 返回 null 同样按 RECONSUME_LATER 处理（默认的 ackIndex
+        # 只对 CONSUME_SUCCESS 有意义，null 落到下面就是整批回投）。归一化前的 status 要
+        # 留给 returnType（返回 null 记 RETURNNULL，不是 FAILED）
+        raw_status = status
+        if status is None:
+            logger.warning("consumeMessage return null, Group: %s Msgs: %d MQ: %s",
+                           self.consumer_group, len(batch), mq)
+            status = ConsumeConcurrentlyStatus.RECONSUME_LATER
         # Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
         # 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
         # RECONSUME_LATER 强制 ackIndex=-1，整批回投。
@@ -2538,9 +2660,10 @@ class DefaultMQPushConsumer:
                                    failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
                                    ack_count=ack_index + 1)
         self._finish_consume_hook(
-            hook_ctx, status, has_exception, begin_ms,
+            hook_ctx, raw_status, has_exception, begin_ms,
             failed=status == ConsumeConcurrentlyStatus.RECONSUME_LATER,
-            succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS)
+            succeeded=status == ConsumeConcurrentlyStatus.CONSUME_SUCCESS,
+            hook_status=status)
         if broadcast:
             # Java:232-237 —— 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
             # 整批位点照样前进（:266 的 removeMessage 拿到的就是整批）
@@ -2604,6 +2727,23 @@ class DefaultMQPushConsumer:
     # / sendMessageBack（:313-360），与上面并发那一套**不是同一条链路**，两处差异都要守住：
     #   1. `-1` 在顺序侧是「不设限」（Integer.MAX_VALUE），在并发侧才是 16；
     #   2. 顺序侧的回投是**普通消息发送**（发到 %RETRY%<group>），不是 CONSUMER_SEND_MSG_BACK(3)。
+
+    def _orderly_suspend_millis(self, context: ConsumeOrderlyContext) -> int:
+        """Java ``ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234``。
+
+        先解析 ``-1``（``ConsumeOrderlyContext.suspendCurrentQueueTimeMillis`` 的默认值，
+        意思是"没指定"）→ 回落到消费者配置 ``suspendCurrentQueueTimeMillis``（默认 1000），
+        再把结果**钳到 [10, 30000]**。这个钳位不是装饰：listener 传 0 时 Java 仍然等 10ms
+        （否则一个返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
+        """
+        ms = context.suspend_current_queue_time_millis
+        if ms == -1:
+            ms = self.suspend_current_queue_time_millis
+        if ms < 10:
+            return 10
+        if ms > 30000:
+            return 30000
+        return ms
 
     def _orderly_max_reconsume_times(self) -> int:
         """Java ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320。

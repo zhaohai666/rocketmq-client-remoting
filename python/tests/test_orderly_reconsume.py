@@ -6,6 +6,11 @@
   - ``processConsumeResult``:254-266 —— ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` 先过
     ``checkReconsumeTimes``；返回 true 才 ``makeMessageToConsumeAgain`` + 延后重试，
     返回 false 走 ``commit()``，位点前进
+  - ``processConsumeResult``:244-300 —— ``autoCommit`` 两条分支：true 时 COMMIT/ROLLBACK
+    是**非法**用法（Java 少了 ``break``，警告后落进 SUCCESS 分支照 ack）；false 时
+    COMMIT 提交、ROLLBACK 退回重试、SUCCESS 只记 TPS 不动位点
+  - ``submitConsumeRequestLater``:211-234 —— 挂起时长解析：``-1`` 回落到消费者配置，
+    再钳到 ``[10, 30000]``
   - ``getMaxReconsumeTimes``:313-320 —— 顺序侧 ``-1`` 读成 ``Integer.MAX_VALUE``
     （**不是**并发侧的 16）
   - ``checkReconsumeTimes``:322-336 —— 没用尽就本地 ``reconsumeTimes+1`` 并挂起；
@@ -24,13 +29,17 @@ broker 就拿订阅组默认的 16 判定；回投成功后还挂起，则一条
 """
 from __future__ import annotations
 
+import time
 from collections import deque
 
 import pytest
 
+from rocketmq.client import consumer
 from rocketmq.client.consumer import (_JAVA_INT_MAX, DefaultMQPushConsumer,
                                      MessageListenerOrderly)
-from rocketmq.client.consumer_result import ConsumeOrderlyStatus
+from rocketmq.client.consumer_result import (ConsumeConcurrentlyStatus,
+                                             ConsumeOrderlyContext, ConsumeOrderlyStatus)
+from rocketmq.client.hook import ConsumeMessageHook
 from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.common.message import MessageExt, MessageQueue
 from rocketmq.common.message_const import MessageConst
@@ -65,15 +74,86 @@ class OrderlyListener(MessageListenerOrderly):
         return self.status
 
 
+class ScriptedListener(MessageListenerOrderly):
+    """按脚本返回状态，并可在调用现场改写 context（autoCommit / 挂起时长）。
+
+    真实监听器改这两样的姿势就是这样：拿到 context 之后当场 set，再 return 一个状态。
+    """
+
+    def __init__(self, status, mutate=None, raise_exc=False):
+        self.status = status
+        self.mutate = mutate
+        self.raise_exc = raise_exc
+        self.contexts = []
+
+    def consume_message(self, msgs, context):
+        self.contexts.append(context)
+        if self.mutate is not None:
+            self.mutate(context)
+        if self.raise_exc:
+            raise RuntimeError("listener blew up")
+        return self.status
+
+
+class RecordingStats:
+    """替代实例上的 ConsumerStatsManager，只记录三个计数入口。"""
+
+    def __init__(self):
+        self.ok = []
+        self.failed = []
+        self.rt = []
+
+    def inc_consume_ok_tps(self, group, topic, count):
+        self.ok.append(count)
+
+    def inc_consume_failed_tps(self, group, topic, count):
+        self.failed.append(count)
+
+    def inc_consume_rt(self, group, topic, rt):
+        self.rt.append(rt)
+
+
+class RecordingHook(ConsumeMessageHook):
+    """记录 after 钩子看到的 (status, success, ConsumeContextType)。"""
+
+    def __init__(self):
+        self.after = []
+
+    def hook_name(self):
+        return "RecordingHook"
+
+    def consume_message_before(self, context):
+        pass
+
+    def consume_message_after(self, context):
+        self.after.append((context.status, context.success,
+                           context.props.get("ConsumeContextType")))
+
+
+class _FakeTime:
+    """只替掉 consumer 模块里的 time.sleep，其余（time.time）转发真模块。"""
+
+    def __init__(self, slept):
+        self.slept = slept
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+    def time(self):
+        return time.time()
+
+
 class Harness:
     """不碰网络的顺序消费者：内部生产者只记录发出去的那条消息。"""
 
-    def __init__(self, max_reconsume_times: int = -1) -> None:
+    def __init__(self, max_reconsume_times: int = -1, stats=None) -> None:
         self.c = DefaultMQPushConsumer(GROUP)
         self.c.max_reconsume_times = max_reconsume_times
-        self.c.suspend_current_queue_time_millis = 0   # 单测不干等 1s
+        # 配置成 0 也不忙等：Java 侧这个值会被 submitConsumeRequestLater 钳到 10ms 下限
+        self.c.suspend_current_queue_time_millis = 0
         self.c._pending[KEY] = deque()
         self.c._consume_offsets[KEY] = 0
+        self.c._stats_manager = stats
         self.sent = []
         self.fail_send = False
         self.mq = MessageQueue(TOPIC, BROKER, 0)
@@ -102,9 +182,8 @@ class _PublishInfo:
         return self._mq
 
 
-def _consume(h: Harness, batch):
-    listener = OrderlyListener()
-    h.c.message_listener = listener
+def _consume(h: Harness, batch, listener=None):
+    h.c.message_listener = listener if listener is not None else OrderlyListener()
     return h.c._consume_batch(KEY, h.mq, batch)
 
 
@@ -296,6 +375,231 @@ def test_ordinary_topic_send_is_not_lifted():
     assert ext["j"] == 0
     assert "l" not in ext, \
         "非 %RETRY% 发送不下发 maxReconsumeTimes（固定发 0 会让首投就判超限）"
+
+
+# ------------------------------------------------ 挂起时长：-1 → 配置 → [10, 30000]
+
+
+def test_orderly_context_defaults_are_java_defaults():
+    h = Harness()
+    ctx = ConsumeOrderlyContext(h.mq)
+    assert ctx.suspend_current_queue_time_millis == -1, "Java 默认 -1 = 未指定"
+    assert ctx.auto_commit is True
+
+
+def test_minus_one_falls_back_to_the_consumer_config():
+    h = Harness()
+    h.c.suspend_current_queue_time_millis = 1000
+    ctx = ConsumeOrderlyContext(h.mq)          # 默认 -1 → 回落到配置
+    assert h.c._orderly_suspend_millis(ctx) == 1000
+
+
+def test_context_value_wins_over_the_consumer_config():
+    h = Harness()
+    h.c.suspend_current_queue_time_millis = 1000
+    ctx = ConsumeOrderlyContext(h.mq)
+    ctx.suspend_current_queue_time_millis = 250
+    assert h.c._orderly_suspend_millis(ctx) == 250
+
+
+def test_suspend_millis_is_clamped_to_java_bounds():
+    h = Harness()
+    h.c.suspend_current_queue_time_millis = 1000
+    ctx = ConsumeOrderlyContext(h.mq)
+    # 0 会让消费线程忙等、一天会让队列假死：Java 在同一个地方钳到 [10, 30000]
+    for asked, expected in ((0, 10), (9, 10), (10, 10), (250, 250),
+                            (30000, 30000), (30001, 30000), (1 << 40, 30000)):
+        ctx.suspend_current_queue_time_millis = asked
+        assert h.c._orderly_suspend_millis(ctx) == expected, asked
+    # 配置侧（-1 的落点）同样要过钳位
+    ctx.suspend_current_queue_time_millis = -1
+    h.c.suspend_current_queue_time_millis = 0
+    assert h.c._orderly_suspend_millis(ctx) == 10
+    h.c.suspend_current_queue_time_millis = 60000
+    assert h.c._orderly_suspend_millis(ctx) == 30000
+
+
+def test_suspend_sleep_uses_the_resolved_millis(monkeypatch):
+    h = Harness(max_reconsume_times=3)
+    h.c.suspend_current_queue_time_millis = 1000
+    slept = []
+    monkeypatch.setattr(consumer, "time", _FakeTime(slept))
+    assert _consume(h, [msg(0, 0)]) is False
+    assert slept == [1.0], "-1 → 消费者配置(1000ms) 这条链要真的落到 sleep 上"
+
+
+def test_listener_suspend_override_reaches_the_sleep(monkeypatch):
+    h = Harness(max_reconsume_times=3)
+    h.c.suspend_current_queue_time_millis = 1000
+    slept = []
+    monkeypatch.setattr(consumer, "time", _FakeTime(slept))
+    listener = ScriptedListener(
+        ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT,
+        mutate=lambda ctx: setattr(ctx, "suspend_current_queue_time_millis", 50))
+    assert _consume(h, [msg(0, 0)], listener) is False
+    assert slept == [0.05], "listener 在 context 上设的值优先于消费者配置"
+
+
+# ------------------------------------------------ autoCommit=true 下的非法 COMMIT/ROLLBACK
+
+
+@pytest.mark.parametrize("status", [ConsumeOrderlyStatus.COMMIT, ConsumeOrderlyStatus.ROLLBACK])
+def test_commit_and_rollback_are_illegal_under_auto_commit(status, caplog):
+    """Java:246-250 —— 这两个值只给 binlog 消费用；Java 少了 ``break``，警告之后
+    **落进 SUCCESS 分支**：消息照 ack。写成"回滚/不提交"都会让队列原地打转。"""
+    h = Harness(max_reconsume_times=0)   # 阈值 0：只要走到回投判据就会发出去
+    batch = [msg(9, 0)]
+    with caplog.at_level("WARNING"):
+        assert _consume(h, batch, ScriptedListener(status)) is True
+    assert h.c._consume_offsets[KEY] == 10, "非法状态按 SUCCESS 处理：位点前进"
+    assert list(h.c._pending[KEY]) == [], "既不回投也不原地重试"
+    assert h.sent == [], "COMMIT/ROLLBACK 不是回投信号"
+    assert "the message queue consume result is illegal" in caplog.text
+
+
+# ------------------------------------------------ autoCommit=false（binlog 消费）
+
+
+def _manual(status):
+    return ScriptedListener(status,
+                            mutate=lambda ctx: setattr(ctx, "auto_commit", False))
+
+
+def test_manual_commit_advances_without_tps():
+    stats = RecordingStats()
+    h = Harness(stats=stats)
+    assert _consume(h, [msg(7, 0)], _manual(ConsumeOrderlyStatus.COMMIT)) is True
+    assert h.c._consume_offsets[KEY] == 8, "Java:275-277 commit()"
+    assert list(h.c._pending[KEY]) == []
+    assert stats.ok == [] and stats.failed == [], "提交分支一个 TPS 都不记"
+    assert len(stats.rt) == 1, "RT 在 processConsumeResult 之外，照记"
+
+
+def test_manual_rollback_requeues_without_tps():
+    stats = RecordingStats()
+    h = Harness(stats=stats)
+    assert _consume(h, [msg(7, 0)], _manual(ConsumeOrderlyStatus.ROLLBACK)) is False
+    assert h.c._consume_offsets[KEY] == 0
+    assert [m.queue_offset for m in h.c._pending[KEY]] == [7]
+    assert h.sent == [], "rollback 不是回投：消息留在本地队列"
+    assert stats.ok == [] and stats.failed == []
+    assert len(stats.rt) == 1
+
+
+def test_manual_success_holds_the_batch_without_committing(monkeypatch):
+    """有意偏差：Java:272-274 把消息留在 ProcessQueue 里等显式 commit()，而本端口没有把
+    ProcessQueue 暴露给 listener（没有 commit 的口子），照抄"什么都不做"会让这批消息
+    被分发线程吞掉、位点又没动 —— 这里等价地塞回队首并等一个挂起周期：位点同样不前进，
+    消息不丢，也不会忙等。"""
+    stats = RecordingStats()
+    h = Harness(stats=stats)
+    h.c.suspend_current_queue_time_millis = 1000
+    slept = []
+    monkeypatch.setattr(consumer, "time", _FakeTime(slept))
+    assert _consume(h, [msg(3, 0)], _manual(ConsumeOrderlyStatus.SUCCESS)) is False
+    assert h.c._consume_offsets[KEY] == 0
+    assert [m.queue_offset for m in h.c._pending[KEY]] == [3]
+    assert slept == [1.0], "不 sleep 的话下一轮立刻又拿到同一批：100% CPU 空转"
+    assert stats.ok == [1], "Java:272-274 只记 OK TPS"
+    assert stats.failed == []
+
+
+def test_manual_suspend_below_cap_requeues():
+    stats = RecordingStats()
+    h = Harness(max_reconsume_times=3, stats=stats)
+    assert _consume(h, [msg(4, 0)],
+                    _manual(ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT)) is False
+    assert [m.queue_offset for m in h.c._pending[KEY]] == [4]
+    assert h.c._consume_offsets[KEY] == 0
+    assert stats.failed == [1]
+    assert h.sent == [], "还没用尽次数：不该回投"
+
+
+def test_manual_suspend_at_cap_does_not_commit_after_hand_over():
+    """与自动提交分支的差别：Java:288-296 毒消息交给 broker 之后**没有 else 分支**，
+    位点不前进（要不要提交由 binlog 消费方自己定）。"""
+    h = Harness(max_reconsume_times=1)
+    assert _consume(h, [msg(5, 1)],
+                    _manual(ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT)) is False
+    assert len(h.sent) == 1, "次数用尽：交给 broker"
+    assert h.c._consume_offsets[KEY] == 0, "交出去也不提交"
+    assert list(h.c._pending[KEY]) == []
+
+
+# ------------------------------------------------ listener 没给出合法状态
+
+
+@pytest.mark.parametrize("returned", [None, "SUCCESS", 0])
+def test_bogus_listener_return_is_treated_as_suspend(returned):
+    """Java:474-504 —— null 兜成挂起（Java 靠静态类型挡掉"返回别的东西"）。
+    旧实现在这两种情况下会一路落进 SUCCESS 分支：消息被 ack、位点前进、**静默丢失**。"""
+    h = Harness(max_reconsume_times=3)
+    batch = [msg(2, 0)]
+    assert _consume(h, batch, ScriptedListener(returned)) is False
+    assert h.c._consume_offsets[KEY] == 0, "不能当成功 ack"
+    assert [m.queue_offset for m in h.c._pending[KEY]] == [2]
+    assert h.sent == [], "还没到阈值：原地重试"
+
+
+def test_listener_exception_suspends_instead_of_acking():
+    h = Harness(max_reconsume_times=3)
+    assert _consume(h, [msg(2, 0)], ScriptedListener(None, raise_exc=True)) is False
+    assert h.c._consume_offsets[KEY] == 0
+    assert [m.queue_offset for m in h.c._pending[KEY]] == [2]
+
+
+# ------------------------------------------------ 钩子看到的 status / success / returnType
+
+
+def _hooked(h, listener):
+    hook = RecordingHook()
+    h.c.register_consume_message_hook(hook)
+    _consume(h, [msg(0, 0)], listener)
+    assert len(hook.after) == 1
+    return hook.after[0]
+
+
+def test_orderly_hook_marks_commit_as_success():
+    h = Harness()
+    status, success, ctx_type = _hooked(h, _manual(ConsumeOrderlyStatus.COMMIT))
+    # Java 写进上下文的是归一化后那个枚举的 ``toString()``（ConsumeMessageOrderlyService:507），
+    # 默认实现就是**裸成员名** —— 不是 Python 的 ``"ConsumeOrderlyStatus.COMMIT"``。
+    assert status == "COMMIT", "钩子拿的是原始 status，形态按 Java Enum.toString()"
+    assert status != str(ConsumeOrderlyStatus.COMMIT), "不能带上 Python 的类名前缀"
+    assert success is True, "Java:509 —— success 判据是 SUCCESS || COMMIT"
+    assert ctx_type == "SUCCESS"
+
+
+def test_orderly_hook_marks_suspend_as_failure():
+    h = Harness(max_reconsume_times=0)
+    status, success, ctx_type = _hooked(h, OrderlyListener())
+    assert status == "SUSPEND_CURRENT_QUEUE_A_MOMENT"
+    assert success is False
+    assert ctx_type == "FAILED"
+
+
+def test_orderly_hook_sees_success_for_success():
+    h = Harness()
+    _, success, ctx_type = _hooked(h, ScriptedListener(ConsumeOrderlyStatus.SUCCESS))
+    assert success is True
+    assert ctx_type == "SUCCESS"
+
+
+def test_orderly_hook_sees_returnnull_for_a_null_return():
+    """Java:483-496 的 returnType 在归一化**之前**算（null → RETURNNULL），而写进上下文的
+    status 是归一化后的挂起（:502-507）—— 这两步用的不是同一个值。"""
+    h = Harness(max_reconsume_times=3)
+    status, success, ctx_type = _hooked(h, ScriptedListener(None))
+    assert status == "SUSPEND_CURRENT_QUEUE_A_MOMENT"
+    assert success is False
+    assert ctx_type == "RETURNNULL", "不能记成 FAILED"
+
+
+def test_orderly_hook_sees_exception_for_a_raising_listener():
+    h = Harness(max_reconsume_times=3)
+    status, _, ctx_type = _hooked(h, ScriptedListener(None, raise_exc=True))
+    assert status == "SUSPEND_CURRENT_QUEUE_A_MOMENT"
+    assert ctx_type == "EXCEPTION"
 
 
 if __name__ == "__main__":

@@ -117,8 +117,29 @@ class ConsumeConcurrentlyStatus(Enum):
 
 
 class ConsumeOrderlyStatus(Enum):
+    # 声明顺序与 Java ``ConsumeOrderlyStatus`` 逐字对齐（ORDINAL 不是线上值，但两侧
+    # 一致才不会在"按 ordinal 写死"的调用方手里错位）；COMMIT/ROLLBACK 在 Java 侧
+    # 标注为 ``@Deprecated`` + "only for binlog consumption"，语义见 ``_consume_batch``。
     SUCCESS = 0
-    SUSPEND_CURRENT_QUEUE_A_MOMENT = 1
+    ROLLBACK = 1
+    COMMIT = 2
+    SUSPEND_CURRENT_QUEUE_A_MOMENT = 3
+
+
+def consume_status_name(status) -> str:
+    """钩子上下文里的 ``status``：Java ``status.toString()`` 的形态，即**裸枚举成员名**。
+
+    Java 写进 ``ConsumeMessageContext.status`` 的是归一化后那个枚举的 ``toString()``
+    （并发 ``ConsumeMessageConcurrentlyService:408``、顺序 ``ConsumeMessageOrderlyService:507``），
+    默认实现就是成员名：``CONSUME_SUCCESS`` / ``RECONSUME_LATER`` / ``SUCCESS`` /
+    ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` / ``COMMIT`` / ``ROLLBACK``。Python 的
+    ``str(Enum member)`` 给的是 ``"ConsumeOrderlyStatus.SUCCESS"`` 这种带类名的形态，
+    不是 Java 的；钩子 status 是**公开可见**的（用户 ``ConsumeMessageHook`` 直接读它），
+    所以这里统一按 ``name`` 取。非枚举（动态类型下 listener 可能返回别的东西）保持
+    ``str()`` 兜底，与归一化兜底分支的取值一致。
+    """
+    name = getattr(status, "name", None)
+    return name if isinstance(name, str) else str(status)
 
 
 class ConsumeConcurrentlyContext:
@@ -136,9 +157,15 @@ class ConsumeConcurrentlyContext:
 class ConsumeOrderlyContext:
     def __init__(self, message_queue=None):
         self.message_queue = message_queue
+        # 对应 Java ConsumeOrderlyContext.autoCommit：true 时由客户端按 listener 的
+        # 状态提交位点（正常路径）；listener 置 false 拿走提交权（Java 的 binlog 用法），
+        # 只有 COMMIT 才提交、ROLLBACK 回滚重投。
         self.auto_commit = True
-        # 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis
-        self.suspend_current_queue_time_millis = 1000
+        # 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis，**默认 -1**
+        # （Java 就是这个默认值）：-1 表示"没指定"，挂起时长回落到消费者配置的
+        # ``suspend_current_queue_time_millis``（默认 1000）；解析出来的值再由调度侧
+        # 钳到 [10, 30000]（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:216-225）。
+        self.suspend_current_queue_time_millis = -1
 
 
 class MessageListenerConcurrently:

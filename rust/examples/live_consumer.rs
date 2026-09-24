@@ -806,10 +806,23 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         again.is_ok() && c.is_started(),
         &format!("{:?}", again.err()),
     );
+    // Java `DefaultMQPushConsumerImpl#subscribe:1265-1275` 只把订阅 put 进表再推一轮心跳，
+    // **没有 already-started 守卫**：活着的消费者必须能接新 topic。这里曾经断言「后置订阅
+    // 必须被拒」（那是四个移植版早期的自造规矩），5d5ebe7 按 Java 拆掉守卫后这条就成了假失败
+    // —— 别再把它改回去。broker 侧「登记真的发生了」由 examples/live_subscribe.rs 的
+    // S1 负对照 / S2 后置订阅（300 查询）负责，这里只锁本地语义：接受 + 进表 + unsubscribe 摘掉。
+    let late = fx.topic_name("Late");
+    let accepted = c.subscribe(&late, "*").is_ok();
     ck.check(
-        "C1 subscribe() after start() is rejected",
-        c.subscribe(&fx.topic_name("Late"), "*").is_err(),
-        "a running consumer accepted a new subscription",
+        "C1 subscribe() after start() is accepted (Java has no already-started guard)",
+        accepted && c.subscriptions().iter().any(|s| s.topic == late),
+        &format!("{accepted:?} subs={:?}", c.subscriptions()),
+    );
+    c.unsubscribe(&late);
+    ck.check(
+        "C1 unsubscribe() removes the topic from the live subscription table",
+        !c.subscriptions().iter().any(|s| s.topic == late),
+        &format!("{:?}", c.subscriptions()),
     );
     // 与 Java/Python 的显式 setter 不同：本项目 update_config 是裸写字段（已在模块头记为差异）
     let before = c.config().message_model.clone();
@@ -2477,6 +2490,146 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     }
 }
 
+/// 观测顺序挂起时长的 listener：命中 `poison` 时把 context 的挂起时长设成 `asked_ms`，
+/// 并记下每次投递的时刻（相邻两次的间隔 = 挂起时长 + 分发循环的 50ms 节拍）。
+struct SuspendTimingListener {
+    poison: String,
+    asked_ms: i64,
+    times: Mutex<Vec<Instant>>,
+}
+
+impl SuspendTimingListener {
+    fn new(poison: &str, asked_ms: i64) -> Arc<SuspendTimingListener> {
+        Arc::new(SuspendTimingListener {
+            poison: poison.to_string(),
+            asked_ms,
+            times: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn gaps(&self) -> Vec<f64> {
+        let times = lock(&self.times);
+        times
+            .windows(2)
+            .map(|w| (w[1] - w[0]).as_secs_f64())
+            .collect()
+    }
+}
+
+impl MessageListenerOrderly for SuspendTimingListener {
+    fn consume_message(
+        &self,
+        msgs: &[MessageExt],
+        context: &mut ConsumeOrderlyContext,
+    ) -> ConsumeOrderlyStatus {
+        if msgs.iter().any(|m| is_body(m, &self.poison)) {
+            context.suspend_current_queue_time_millis = self.asked_ms;
+            lock(&self.times).push(Instant::now());
+            return ConsumeOrderlyStatus::SuspendCurrentQueueAMoment;
+        }
+        ConsumeOrderlyStatus::Success
+    }
+}
+
+fn median(xs: &[f64]) -> f64 {
+    let mut s = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    match s.len() {
+        0 => 0.0,
+        n if n % 2 == 1 => s[n / 2],
+        n => (s[n / 2 - 1] + s[n / 2]) / 2.0,
+    }
+}
+
+/// #74：`suspendCurrentQueueTimeMillis` 在 context 上优先于消费者配置。
+///
+/// Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`：`-1`（默认）→ 回落
+/// 消费者配置，再钳到 `[10, 30000]`。真机这一条证的是「listener 在 context 上设的值真的决定
+/// 等待时长」：配置故意设 900ms、context 要 70ms ⇒ 相邻投递的中位间隔必须贴着 70ms ——
+/// 把 context 读丢或读成配置，间隔会落到 0.9s 以上。
+///
+/// 钳位的两个端点用同一条链路的间隔只能兜「不忙等」（`>= 10ms`）：分发循环本身有 50ms 固定
+/// 节拍，间隔法分不出 10ms 与 1ms —— 精确值由 `orderly_suspend_millis` 的离线矩阵锁死
+/// （Python 侧另有拦 `time.sleep` 的真机判据可以直接读到请求值）。
+async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C12c context 上的挂起时长优先于消费者配置（Java submitConsumeRequestLater）");
+    let topic = fx.topic_name("OrdSuspend");
+    let group = fx.group_name("ordsusp");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C12c create topic", &e);
+    }
+    let poison = format!("{topic}-000");
+    let listener = SuspendTimingListener::new(&poison, 70);
+    let mut cfg = fx.base_config(&group);
+    cfg.consume_message_batch_max_size = 1;
+    cfg.max_reconsume_times = -1;
+    cfg.suspend_current_queue_time_millis = 900;
+    let c = match DefaultMQPushConsumer::with_config(cfg) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C12c build consumer", &format!("{e}")),
+    };
+    if let Err(e) = c.subscribe(&topic, "*") {
+        return ck.abort("C12c subscribe", &format!("{e}"));
+    }
+    c.set_message_listener_orderly(listener.clone());
+    if let Err(e) = c.start().await {
+        return ck.abort("C12c start", &format!("{e}"));
+    }
+    // 等首轮 LOCK_BATCH_MQ：没有队列锁时 broker 会把顺序重投直接改投死信，间隔就没意义了
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    fx.produce(&topic, "TagA", 1, Some(0)).await;
+    let _ = poll_until(|| lock(&listener.times).len() >= 9, 25).await;
+    let gaps = listener.gaps();
+    let med = median(&gaps);
+    ck.check(
+        "C12c context 的 70ms 生效（不是消费者配置的 900ms）",
+        gaps.len() >= 6 && (0.03..=0.4).contains(&med),
+        &format!(
+            "n={} median={med:.3}s gaps={:?}",
+            gaps.len(),
+            gaps.iter()
+                .take(5)
+                .map(|g| (g * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>()
+        ),
+    );
+    c.shutdown();
+
+    // 钳位下限：context 1ms + 配置 0（两个非法值）都必须按 10ms 走，不能变成忙等
+    let topic_b = fx.topic_name("OrdSuspendFloor");
+    let group_b = fx.group_name("ordsuspfloor");
+    if let Err(e) = fx.create_topic(&topic_b, 1).await {
+        return ck.abort("C12c create floor topic", &e);
+    }
+    let poison_b = format!("{topic_b}-000");
+    let listener_b = SuspendTimingListener::new(&poison_b, 1);
+    let mut cfg_b = fx.base_config(&group_b);
+    cfg_b.consume_message_batch_max_size = 1;
+    cfg_b.max_reconsume_times = -1;
+    cfg_b.suspend_current_queue_time_millis = 0;
+    let cb = match DefaultMQPushConsumer::with_config(cfg_b) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C12c build floor consumer", &format!("{e}")),
+    };
+    if let Err(e) = cb.subscribe(&topic_b, "*") {
+        return ck.abort("C12c subscribe floor", &format!("{e}"));
+    }
+    cb.set_message_listener_orderly(listener_b.clone());
+    if let Err(e) = cb.start().await {
+        return ck.abort("C12c start floor", &format!("{e}"));
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    fx.produce(&topic_b, "TagA", 1, Some(0)).await;
+    let _ = poll_until(|| lock(&listener_b.times).len() >= 9, 20).await;
+    let gaps_b = listener_b.gaps();
+    ck.check(
+        "C12c 钳位下限：context 1ms / 配置 0 时不忙等（间隔 ≥ 10ms）",
+        gaps_b.len() >= 6 && median(&gaps_b) >= 0.009,
+        &format!("n={} median={:.4}s", gaps_b.len(), median(&gaps_b)),
+    );
+    cb.shutdown();
+}
+
 // ---------------------------------------------------------------- C10 清理
 async fn c10_cleanup(ck: &mut Checker, fx: &mut Fixture) {
     println!("-- C10 清理");
@@ -2564,6 +2717,7 @@ async fn run(namesrv: &str) -> Checker {
     c11_pull_stall_self_heal(&mut ck, &fx).await;
     c12_orderly_dlq(&mut ck, &fx).await;
     c12b_orderly_no_cap(&mut ck, &fx).await;
+    c12c_orderly_suspend_millis(&mut ck, &fx).await;
     c10_cleanup(&mut ck, &mut fx).await;
     ck
 }

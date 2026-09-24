@@ -22,7 +22,9 @@ import threading
 
 from rocketmq.client.consumer import DefaultMQPushConsumer
 from rocketmq.client.consumer_result import (ConsumeConcurrentlyContext,
-                                             ConsumeConcurrentlyStatus, MessageListener)
+                                             ConsumeConcurrentlyStatus,
+                                             ConsumeOrderlyStatus,
+                                             MessageListener, MessageListenerOrderly)
 from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.common.message import MessageExt, MessageQueue
 from rocketmq.common.message_decoder import decode_message, encode_message_ext
@@ -180,6 +182,41 @@ class TestConsumerHandlers:
         r = c.consume_message_directly(MessageExt(topic=TOPIC, body=b"x"), BROKER)
         assert r.consume_result == CMResult.CR_THROW_EXCEPTION
         assert "boom" in (r.remark or "")
+
+    def test_consume_message_directly_orderly_maps_commit_rollback(self):
+        """顺序侧比并发侧多 CR_COMMIT/CR_ROLLBACK 两档，且 order=True、autoCommit 回传。
+
+        映射写错是静默的：Java 顺序 consumeMessageDirectly:125-140 的这两个成员
+        broker 侧按 binlog 口径用（COMMIT = 已提交、ROLLBACK = 回滚重投），落成
+        CR_SUCCESS 只会让 mqadmin 的返回少一档语义，消费侧毫无异常。
+        """
+        for status, expect in (
+            (ConsumeOrderlyStatus.SUCCESS, CMResult.CR_SUCCESS),
+            (ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT, CMResult.CR_LATER),
+            (ConsumeOrderlyStatus.COMMIT, CMResult.CR_COMMIT),
+            (ConsumeOrderlyStatus.ROLLBACK, CMResult.CR_ROLLBACK),
+        ):
+            class L(MessageListenerOrderly):
+                def consume_message(self, msgs, context):
+                    context.auto_commit = False
+                    return status
+            c = consumer_with_state()
+            c.set_message_listener(L())
+            r = c.consume_message_directly(MessageExt(topic=TOPIC, body=b"x"), BROKER)
+            assert r.consume_result == expect, status
+            assert r.order is True, status
+            assert r.auto_commit is False, status
+
+    def test_consume_message_directly_orderly_none_is_return_null(self):
+        """顺序 + 无 listener：Java 顺序 :150-156 的 `status == null` → CR_RETURN_NULL。
+
+        并发侧同一分支在 :128-133；两侧都要有，漏掉就不是 CR_RETURN_NULL 而是
+        consume_result 留下初值（None），broker 解析出空串。
+        """
+        c = consumer_with_state()
+        c.set_message_listener(None)
+        r = c.consume_message_directly(MessageExt(topic=TOPIC, body=b"x"), BROKER)
+        assert r.consume_result == CMResult.CR_RETURN_NULL
 
     def test_reset_offset_writes_position(self):
         """220 的处理逻辑：命中的队列写新位点并触发 rebalance。"""
