@@ -531,6 +531,29 @@ public class SendRetryTests
     }
 
     /// <summary>
+    /// 定点批量 <c>send(Collection, MessageQueue, timeout)</c>：整批落进指定队列
+    /// （V2 头 e=queueId、n=brokerName），码仍是 320、m 仍是 true，且不做任何
+    /// 选队/重试（Java 直接进 sendKernelImpl）。
+    /// </summary>
+    [Fact]
+    public void PinnedSendBatch_LandsOnTheGivenQueue()
+    {
+        using var cluster = MockCluster.Start(2);
+        DefaultMQProducer producer = Started(cluster, "GID_BatchPinned");
+
+        cluster.ClearRequests();
+        var pinned = new MessageQueue(Topic, MockCluster.BrokerName(1), 1);
+        Assert.Equal(SendStatus.SendOk,
+            producer.SendBatch(new List<Message> { Msg(), Msg() }, pinned).SendStatus);
+        WireRecord batch = cluster.FirstSendRequest()!;
+        Assert.Equal(RequestCode.SendBatchMessage, batch.Code);
+        Assert.Equal("true", batch.Ext["m"]);
+        Assert.Equal("1", batch.Ext["e"]);
+        Assert.Equal(MockCluster.BrokerName(1), batch.Ext["n"]);
+        producer.Shutdown();
+    }
+
+    /// <summary>
     /// 队列没有 broker 名（手工指定的 MessageQueue）时，<c>n</c> 整条不上线，而不是写
     /// 一个空串 —— Java 那个字段是 <c>@CFNullable</c>，<c>writeIfNotNull</c> 会跳过 null。
     /// 纯离线：只建请求、不发出去（Encode 前要把头展开成 extFields，同 broker 侧口径）。

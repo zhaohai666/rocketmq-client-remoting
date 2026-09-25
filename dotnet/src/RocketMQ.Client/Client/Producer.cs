@@ -1993,6 +1993,32 @@ public class DefaultMQProducer
     {
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
+        Message outbound = BuildBatchOutbound(msgs);
+
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
+        MessageQueue selected = publish.SelectOneMessageQueue();
+        // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
+        int sysFlag = PrepareForSend(outbound);
+        return SendWithHooks(c, outbound, selected, timeout, sysFlag);
+    }
+
+    /// <summary>定点批量发送，对应 Java <c>send(Collection&lt;Message&gt;, MessageQueue,
+    /// long)</c>：组批后直接走 sendKernelImpl，不拉路由、不选队、不重试，整批落进指定队列。
+    /// 子消息校验、组批同质性与命名空间与轮询批量同一串动作。</summary>
+    public SendResult SendBatch(List<Message> msgs, MessageQueue mq, int timeoutMillis = -1)
+    {
+        MQClientInstance c = GetClient();
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
+        Message outbound = BuildBatchOutbound(msgs);
+        int sysFlag = PrepareForSend(outbound);
+        return SendWithHooks(c, outbound, mq, timeout, sysFlag);
+    }
+
+    /// <summary>批量公共前段：逐条 <c>Validators.CheckMessage</c> → <c>MessageBatch.GenerateFromList</c>
+    /// （查同质性、逐条补 UNIQ_KEY、整批编进 body）→ 整批再查一次 → 套命名空间。
+    /// 轮询与定点批量都必须过这里：绕过即绕过全部本地校验。</summary>
+    private Message BuildBatchOutbound(List<Message> msgs)
+    {
         if (msgs is null || msgs.Count == 0)
         {
             throw new MQClientException("message list is empty");
@@ -2013,12 +2039,7 @@ public class DefaultMQProducer
         {
             outbound.Topic = NamespaceUtil.WrapNamespace(_namespace, batch.Topic);
         }
-
-        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
-        MessageQueue selected = publish.SelectOneMessageQueue();
-        // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
-        int sysFlag = PrepareForSend(outbound);
-        return SendWithHooks(c, outbound, selected, timeout, sysFlag);
+        return outbound;
     }
 
     /// <summary>
