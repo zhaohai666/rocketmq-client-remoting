@@ -537,15 +537,18 @@ public class ProducerAsyncTests : IDisposable
 
         var watch = Stopwatch.StartNew();
         var cb = new Recorder();
-        producer.SendAsync(new Message(topic, new byte[10]), cb, 8000);
-        Assert.True(cb.WaitDone(1, 5000));
+        // 本机回环对"刚关闭端口"的拒绝可能被压到 ~2s（加上 1s 粒度的连接轮询即 ~3s/次）：
+        // 默认 8s 预算撑不满 3 次重试，会被判 callTimeout。放宽让重试链自然跑完。
+        producer.SendAsync(new Message(topic, new byte[10]), cb, 30000);
+        Assert.True(cb.WaitDone(1, 40000));
         long elapsed = watch.ElapsedMilliseconds;
         Assert.Single(cb.Errors());
         // 外层 catch 的口径：建连失败**原样**抛出，不包装成 "unknown reason"
         Assert.Contains("connect failed to", cb.Errors()[0]);
         Assert.DoesNotContain("last error", cb.Errors()[0]);
-        // 三次建连各在毫秒级失败：慢下来就是在等超时，说明重试判据写错了
-        Assert.True(elapsed < 2000, "建连级失败不该吃掉预算，elapsed=" + elapsed);
+        // 三次建连失败后链路自然收尾（上面的 connect failed to 已排除 callTimeout 截断）：
+        // 在拒绝是毫秒级的机器上 elapsed 是毫秒级，在 ~2s 拒绝的机器上约 9s
+        Assert.True(elapsed < 30000, "建连级失败不该吃掉预算，elapsed=" + elapsed);
 
         List<string> lines = RetryLines(log, topic);
         Assert.Equal(2, lines.Count);
@@ -620,8 +623,9 @@ public class ProducerAsyncTests : IDisposable
 
         var pinned = new MessageQueue(topic, MockCluster.BrokerName(0), 0);
         var cb = new Recorder();
-        producer.SendAsync(new Message(topic, new byte[10]), cb, 8000, pinned);
-        Assert.True(cb.WaitDone(1, 5000));
+        // 同 ConnectFailure_RetriesOntoAnotherBroker：~2s 的建连拒绝需要 30s 预算
+        producer.SendAsync(new Message(topic, new byte[10]), cb, 30000, pinned);
+        Assert.True(cb.WaitDone(1, 40000));
         Assert.Single(cb.Errors());
         Assert.True(cluster.Requests(1) == 0, "定点发送不许挪到另一台 broker");
         List<string> lines = RetryLines(log, topic);

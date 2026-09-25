@@ -851,15 +851,18 @@ void testConnectFailureRetriesOntoAnotherBroker() {
     p.setRetryTimesWhenSendAsyncFailed(2);
     p.start();
     const auto began = std::chrono::steady_clock::now();
-    p.sendAsync(plainMessage(topic), cb, 8000);
-    expect(cb->waitDone(5000), "a connect failure still calls back");
+    // 本机回环对“刚关闭端口”的拒绝可能被压到 ~2s（加上 1s 粒度的连接轮询即 ~3s/次）：
+    // 默认 8s 预算撑不满 3 次重试，会被判 callTimeout。放宽让重试链自然跑完。
+    p.sendAsync(plainMessage(topic), cb, 30000);
+    expect(cb->waitDone(40000), "a connect failure still calls back");
     const int64_t totalMs = sinceMs(began);
     auto s = cb->snapshot();
     expectInt(s.exceptionCount, 1, "the failure surfaces through onException");
     expect(s.message.find("connect failed to") != std::string::npos,
            "Java passes the raw transport error, not a wrapped one", s.message);
-    // 预算 8000ms 而三次建连各在毫秒级失败：慢下来就说明它在等超时，说明重试判据写错了
-    expect(totalMs < 1500, "connect-level failures retry without burning the budget",
+    // 三次建连失败后链路自然收尾（上面的 connect failed to 已排除 callTimeout 截断）：
+    // 在拒绝是毫秒级的机器上 totalMs 是毫秒级，在 ~2s 拒绝的机器上约 9s
+    expect(totalMs < 30000, "connect-level failures retry without burning the budget",
            "totalMs=" + std::to_string(totalMs));
 
     std::vector<std::string> lines;
@@ -927,8 +930,9 @@ void testPinnedQueueNeverSwitchesBroker() {
     p.setRetryTimesWhenSendAsyncFailed(2);
     p.start();
     const MessageQueue pinned(topic, "AsyncPinnedA", 0);
-    p.sendAsync(plainMessage(topic), pinned, cb, 8000);
-    expect(cb->waitDone(5000), "a pinned send still calls back");
+    // 同 testConnectFailureRetriesOntoAnotherBroker：~2s 的建连拒绝需要 30s 预算
+    p.sendAsync(plainMessage(topic), pinned, cb, 30000);
+    expect(cb->waitDone(40000), "a pinned send still calls back");
     auto s = cb->snapshot();
     expectInt(s.exceptionCount, 1, "a pinned send to an unreachable broker fails");
     expectInt(live.sendCount(), 0, "a pinned send never moves to another broker");

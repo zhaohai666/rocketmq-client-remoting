@@ -522,7 +522,12 @@ async fn connect_failure_is_qualified_with_10001() {
     let producer = started("retry_connect", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("连不上必须失败");
+    // 本机回环对"刚关闭端口"的拒绝可能被防火墙压到 ~2s 才回：默认 3s 预算撑不满
+    // 3 次重试，会被判 callTimeout 抛 TooMuchRequest；放宽让重试跑完，落进 10001。
+    let err = producer
+        .send(&mut msg, Some(30_000), None)
+        .await
+        .expect_err("连不上必须失败");
     let (code, message) = expect_client_code(err);
     assert_eq!(code, Some(client_error_code::CONNECT_BROKER_EXCEPTION), "{message}");
     producer.shutdown();

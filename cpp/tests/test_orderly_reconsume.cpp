@@ -449,7 +449,10 @@ void testOrdinaryTopicSendIsNotLifted() {
     expect(wire["j"] == "0", "noLift.wireJ", wire["j"]);
     // 非 %RETRY% 发送不下发 maxReconsumeTimes：broker ≥V3_4_9 无条件采信它，
     // 固定发 0 会让首投就判定 reconsumeTimes(0) >= 0 直接进 %DLQ%。
-    expect(wire.find("l") == wire.end(), "noLift.wireLAbsent", wire["l"]);
+    // ⚠ 不能写成 expect(..., wire["l"])：MSVC 从右往左求值实参，operator[] 会先把
+    //    "l" 插进 map，缺席断言就永远假失败。find 只跑一次、先存后用。
+    auto it = wire.find("l");
+    expect(it == wire.end(), "noLift.wireLAbsent", it == wire.end() ? "(absent)" : it->second);
 }
 
 }  // namespace

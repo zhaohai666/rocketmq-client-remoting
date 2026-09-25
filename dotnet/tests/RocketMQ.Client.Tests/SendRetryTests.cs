@@ -226,7 +226,9 @@ public class SendRetryTests
         DefaultMQProducer producer = Started(cluster, "GID_RetryConnect");
         producer.RetryTimesWhenSendFailed = 2;
 
-        MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg()));
+        // 本机回环对"刚释放端口"的拒绝可能被防火墙压到 ~2s 才回：默认 3s 预算撑不满
+        // 3 次尝试，会被判 callTimeout 抛超时；放宽让重试跑完，落进 10001。
+        MQClientException e = Assert.Throws<MQClientException>(() => producer.Send(Msg(), 30_000));
         Assert.Equal(ClientErrorCode.ConnectBrokerException, e.ResponseCode);
         Assert.Contains("Send [3] times, still failed", e.Message);
         producer.Shutdown();
