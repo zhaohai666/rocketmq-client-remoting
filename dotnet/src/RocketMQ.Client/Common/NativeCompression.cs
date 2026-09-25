@@ -39,6 +39,8 @@ internal static class NativeCompressionLibrary
 
     // 候选名按「最可能且最具体」排序；NativeLibrary 的默认探测（DllImportSearchPath）
     // 在 macOS 上不会命中这些绝对路径，所以全部显式列出。
+    // Windows 的 DLL 名不落在此表：由 LoadFirst 前置的 RMQ_NATIVE_COMPRESSION_DIR
+    // 探测（见下）与运行时默认解析补齐。
     private static readonly string[] ZstdCandidates =
     {
         "libzstd.dylib",
@@ -47,6 +49,8 @@ internal static class NativeCompressionLibrary
         "/opt/homebrew/lib/libzstd.dylib",
         "libzstd.so.1",
         "libzstd.so",
+        "libzstd.dll",
+        "zstd.dll",
         "zstd",
     };
 
@@ -58,11 +62,14 @@ internal static class NativeCompressionLibrary
         "/opt/homebrew/lib/liblz4.dylib",
         "liblz4.so.1",
         "liblz4.so",
+        "liblz4.dll",
+        "lz4.dll",
         "lz4",
     };
 
-    private static readonly Lazy<IntPtr> ZstdHandle = new(() => LoadFirst(ZstdCandidates));
-    private static readonly Lazy<IntPtr> Lz4Handle = new(() => LoadFirst(Lz4Candidates));
+    private static readonly Lazy<IntPtr> ZstdHandle = new(() => LoadFirst(WithEnvDir(ZstdCandidates)));
+
+    private static readonly Lazy<IntPtr> Lz4Handle = new(() => LoadFirst(WithEnvDir(Lz4Candidates)));
 
     // 符号级校验：库能加载但少了 LZ4F_* 导出（例如被换成了裁剪过的静态库）时，
     // 必须在探测阶段就判定不可用，而不是等 DllImport 抛 EntryPointNotFoundException。
@@ -123,6 +130,28 @@ internal static class NativeCompressionLibrary
         }
 
         return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// RMQ_NATIVE_COMPRESSION_DIR 指向装着 liblz4/libzstd 的目录（如 zlib 的
+    /// CMAKE_PREFIX_PATH 同一惯例），其下的候选名排在系统默认解析之前。
+    /// </summary>
+    private static string[] WithEnvDir(string[] candidates)
+    {
+        string? dir = Environment.GetEnvironmentVariable("RMQ_NATIVE_COMPRESSION_DIR");
+        if (string.IsNullOrEmpty(dir))
+        {
+            return candidates;
+        }
+
+        var all = new List<string>(candidates.Length * 2);
+        foreach (string name in candidates)
+        {
+            all.Add(Path.Combine(dir, name));
+        }
+
+        all.AddRange(candidates);
+        return all.ToArray();
     }
 
     private static bool HasAll(IntPtr handle, params string[] symbols)
