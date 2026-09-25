@@ -2254,37 +2254,257 @@ std::string DefaultMQPushConsumer::localOffsetPath() const {
            + "/" + consumerGroup_ + "/offsets.json";
 }
 
-void DefaultMQPushConsumer::saveLocalOffsets() {
-    std::map<std::string, int64_t> items;
-    {
-        std::lock_guard<std::mutex> lk(lock_);
-        items = consumeOffsetTable_;
-    }
-    std::string path = localOffsetPath();
-    std::string dir = path.substr(0, path.find_last_of('/'));
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    JsonValue root = JsonValue::makeObject();
-    for (const auto& kv : items) {
-        root.set(kv.first, JsonValue::makeInt(kv.second));
-    }
-    std::ofstream f(path, std::ios::trunc);
-    if (f.is_open()) {
-        f << root.dump();
+namespace {
+// 「对象作 JSON key」扫描器的底层件（无 regex 依赖，手写扫描，容忍 fastjson2
+// pretty 版的换行缩进）。文件内容是外部输入，任何结构不对都判整体失败。
+
+void offsetScanSkipWs(const std::string& s, size_t& pos) {
+    while (pos < s.size()
+           && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) {
+        ++pos;
     }
 }
 
-std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsets() const {
-    std::ifstream f(localOffsetPath());
-    std::map<std::string, int64_t> out;
-    if (!f.is_open()) return out;
-    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    JsonValue root;
-    if (!jsonParse(text, root)) return out;
-    for (const auto& kv : root.objectItems()) {
-        out[kv.first] = kv.second.intValue();
+bool offsetScanEat(const std::string& s, size_t& pos, char c) {
+    offsetScanSkipWs(s, pos);
+    if (pos < s.size() && s[pos] == c) {
+        ++pos;
+        return true;
     }
+    return false;
+}
+
+bool offsetScanPeek(const std::string& s, size_t pos, char c) {
+    offsetScanSkipWs(s, pos);
+    return pos < s.size() && s[pos] == c;
+}
+
+bool offsetScanString(const std::string& s, size_t& pos, std::string& out) {
+    offsetScanSkipWs(s, pos);
+    if (pos >= s.size() || s[pos] != '"') return false;
+    ++pos;
+    out.clear();
+    while (pos < s.size()) {
+        char c = s[pos++];
+        if (c == '"') return true;
+        if (c != '\\') {
+            out += c;
+            continue;
+        }
+        if (pos >= s.size()) return false;
+        char e = s[pos++];
+        switch (e) {
+            case '"': out += '"'; break;
+            case '\\': out += '\\'; break;
+            case '/': out += '/'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            case 'u': {
+                if (pos + 4 > s.size()) return false;
+                int cp = 0;
+                for (int i = 0; i < 4; ++i) {
+                    char h = s[pos + i];
+                    int d;
+                    if (h >= '0' && h <= '9') d = h - '0';
+                    else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+                    else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+                    else return false;
+                    cp = cp * 16 + d;
+                }
+                pos += 4;
+                // 位点文件里是 topic/broker 名，BMP 内按 UTF-8 编出即可
+                if (cp < 0x80) {
+                    out += static_cast<char>(cp);
+                } else if (cp < 0x800) {
+                    out += static_cast<char>(0xC0 | (cp >> 6));
+                    out += static_cast<char>(0x80 | (cp & 0x3F));
+                } else {
+                    out += static_cast<char>(0xE0 | (cp >> 12));
+                    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                    out += static_cast<char>(0x80 | (cp & 0x3F));
+                }
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+bool offsetScanInt(const std::string& s, size_t& pos, int64_t& out) {
+    offsetScanSkipWs(s, pos);
+    size_t start = pos;
+    if (pos < s.size() && s[pos] == '-') ++pos;
+    size_t digits = pos;
+    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') ++pos;
+    if (pos == digits || pos - digits > 18) return false;
+    out = std::stoll(s.substr(start, pos - start));
+    return true;
+}
+}  // namespace
+
+std::string DefaultMQPushConsumer::buildLocalOffsetsJson(
+    const std::map<std::string, int64_t>& items,
+    const std::map<std::string, MessageQueue>& mqMap) {
+    // Java persistAll + fastjson2 的落盘格式（真实 rocketmq-client 5.5.0 jar 实测）：
+    // {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
+    // —— MessageQueue 对象直接当 JSON key。没有队列信息的条目跳过（persistAll 同款）。
+    std::string s = "{\"offsetTable\":{";
+    bool first = true;
+    for (const auto& kv : items) {
+        auto it = mqMap.find(kv.first);
+        if (it == mqMap.end()) continue;
+        if (!first) s += ',';
+        first = false;
+        s += "{\"brokerName\":" + JsonValue::makeString(it->second.brokerName).dump();
+        s += ",\"queueId\":" + std::to_string(it->second.queueId);
+        s += ",\"topic\":" + JsonValue::makeString(it->second.topic).dump();
+        s += "}:" + std::to_string(kv.second);
+    }
+    s += "}}";
+    return s;
+}
+
+std::optional<std::map<std::string, int64_t>> DefaultMQPushConsumer::parseLocalOffsetsText(
+    const std::string& text) {
+    // 先按严格 JSON 解析（旧版本端写过的扁平 map）；Java fastjson2 的「对象作 key」
+    // 格式对严格解析必然失败（含 pretty 版），落进下面的扫描器。
+    size_t b = text.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return std::nullopt;
+    size_t e = text.find_last_not_of(" \t\r\n");
+    std::string trimmed = text.substr(b, e - b + 1);
+
+    JsonValue root;
+    if (jsonParse(trimmed, root) && root.isObject()) {
+        std::map<std::string, int64_t> flat;
+        bool allNumbers = true;
+        for (const auto& kv : root.objectItems()) {
+            if (!kv.second.isNumber()) {
+                allNumbers = false;
+                break;
+            }
+            flat[kv.first] = kv.second.intValue();
+        }
+        if (allNumbers) return flat;
+    }
+
+    size_t pos = 0;
+    if (!offsetScanEat(trimmed, pos, '{')) return std::nullopt;
+    std::string key;
+    if (!offsetScanString(trimmed, pos, key) || key != "offsetTable") return std::nullopt;
+    if (!offsetScanEat(trimmed, pos, ':') || !offsetScanEat(trimmed, pos, '{')) {
+        return std::nullopt;
+    }
+    std::map<std::string, int64_t> out;
+    while (true) {
+        if (offsetScanEat(trimmed, pos, '}')) break;
+        if (!offsetScanEat(trimmed, pos, '{')) return std::nullopt;
+        std::string topic;
+        std::string broker;
+        bool hasTopic = false;
+        bool hasBroker = false;
+        int64_t queueId = 0;
+        bool hasQueueId = false;
+        while (true) {
+            if (offsetScanEat(trimmed, pos, '}')) break;
+            std::string fkey;
+            if (!offsetScanString(trimmed, pos, fkey) || !offsetScanEat(trimmed, pos, ':')) {
+                return std::nullopt;
+            }
+            if (offsetScanPeek(trimmed, pos, '"')) {
+                std::string v;
+                if (!offsetScanString(trimmed, pos, v)) return std::nullopt;
+                if (fkey == "topic") {
+                    topic = v;
+                    hasTopic = true;
+                } else if (fkey == "brokerName") {
+                    broker = v;
+                    hasBroker = true;
+                }
+            } else {
+                int64_t v = 0;
+                if (!offsetScanInt(trimmed, pos, v)) return std::nullopt;
+                if (fkey == "queueId") {
+                    queueId = v;
+                    hasQueueId = true;
+                }
+            }
+            if (offsetScanEat(trimmed, pos, ',')) continue;
+            if (offsetScanEat(trimmed, pos, '}')) break;
+            return std::nullopt;
+        }
+        int64_t off = 0;
+        if (!offsetScanEat(trimmed, pos, ':') || !hasTopic || !hasBroker || !hasQueueId
+            || !offsetScanInt(trimmed, pos, off)) {
+            return std::nullopt;
+        }
+        out[topic + broker + std::to_string(queueId)] = off;
+        if (offsetScanEat(trimmed, pos, ',')) continue;
+        if (offsetScanEat(trimmed, pos, '}')) break;
+        return std::nullopt;
+    }
+    // 表收尾后还有 wrapper 本身的 }（{"offsetTable":{...}} 两层括号）
+    if (!offsetScanEat(trimmed, pos, '}')) return std::nullopt;
+    offsetScanSkipWs(trimmed, pos);
+    if (pos != trimmed.size()) return std::nullopt;
     return out;
+}
+
+void DefaultMQPushConsumer::saveLocalOffsetsAt(const std::string& path,
+                                               const std::map<std::string, int64_t>& items,
+                                               const std::map<std::string, MessageQueue>& mqMap) {
+    std::string dir = path.substr(0, path.find_last_of('/'));
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    // Java MixAll.string2File：旧内容先滚到 .bak 再写新文件
+    std::ifstream prevIn(path);
+    if (prevIn.is_open()) {
+        std::string prev((std::istreambuf_iterator<char>(prevIn)),
+                         std::istreambuf_iterator<char>());
+        prevIn.close();
+        if (!prev.empty()) {
+            std::ofstream bak(path + ".bak", std::ios::trunc);
+            if (bak.is_open()) bak << prev;
+        }
+    }
+    // 先写 .tmp 再原子改名，避免半截文件（Java string2File 同款）
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (f.is_open()) f << buildLocalOffsetsJson(items, mqMap);
+    }
+    std::filesystem::rename(tmp, path, ec);
+}
+
+std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsetsAt(const std::string& path) {
+    // 主文件缺失/损坏时回退 .bak（Java readLocalOffset → readLocalOffsetBak）
+    for (const std::string& candidate : {path, path + ".bak"}) {
+        std::ifstream f(candidate);
+        if (!f.is_open()) continue;
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        auto parsed = parseLocalOffsetsText(text);
+        if (parsed.has_value()) return *parsed;
+    }
+    return {};
+}
+
+void DefaultMQPushConsumer::saveLocalOffsets() {
+    std::map<std::string, int64_t> items;
+    std::map<std::string, MessageQueue> mqMap;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        items = consumeOffsetTable_;
+        mqMap = mqMap_;
+    }
+    saveLocalOffsetsAt(localOffsetPath(), items, mqMap);
+}
+
+std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsets() const {
+    return loadLocalOffsetsAt(localOffsetPath());
 }
 
 // ---------------------------------------------------------------- 顺序消费队列锁

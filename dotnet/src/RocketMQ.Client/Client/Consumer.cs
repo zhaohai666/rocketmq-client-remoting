@@ -18,6 +18,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Text;
 using System.Threading;
 
 using RocketMQ.Common;
@@ -3901,50 +3902,376 @@ public sealed class DefaultMQPushConsumer
     private void SaveLocalOffsets()
     {
         Dictionary<string, long> items;
+        Dictionary<string, MessageQueue> mqMap;
         lock (_lock)
         {
             items = new Dictionary<string, long>(_consumeOffsetTable, StringComparer.Ordinal);
+            mqMap = new Dictionary<string, MessageQueue>(_mqMap, StringComparer.Ordinal);
         }
 
-        string path = LocalOffsetPath();
-        string dir = path[..path.LastIndexOf('/')];
-        Directory.CreateDirectory(dir);
-        var root = JsonValue.MakeObject();
+        SaveLocalOffsetsAt(LocalOffsetPath(), items, mqMap);
+    }
+
+    // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
+    public static void SaveLocalOffsetsAt(string path, Dictionary<string, long> items,
+        Dictionary<string, MessageQueue> mqMap)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        // Java MixAll.string2File：旧内容先滚到 .bak 再写新文件
+        try
+        {
+            string prev = File.ReadAllText(path);
+            if (prev.Length > 0)
+            {
+                File.WriteAllText(path + ".bak", prev);
+            }
+        }
+        catch (IOException)
+        {
+            // 主文件还不存在：首次写，没有上一代可滚
+        }
+
+        string tmp = path + ".tmp";
+        File.WriteAllText(tmp, BuildLocalOffsetsJson(items, mqMap));
+        File.Move(tmp, path, true);
+    }
+
+    // Java persistAll + fastjson2 的落盘格式（真实 rocketmq-client 5.5.0 jar 实测）：
+    // {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
+    // —— MessageQueue 对象直接当 JSON key。没有队列信息的条目跳过（persistAll(mqs) 同款）。
+    // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
+    public static string BuildLocalOffsetsJson(Dictionary<string, long> items,
+        Dictionary<string, MessageQueue> mqMap)
+    {
+        var sb = new StringBuilder("{\"offsetTable\":{");
+        bool first = true;
         foreach (KeyValuePair<string, long> kv in items)
         {
-            root.Set(kv.Key, JsonValue.MakeInt(kv.Value));
+            if (!mqMap.TryGetValue(kv.Key, out MessageQueue? mq) || mq is null)
+            {
+                continue;
+            }
+
+            if (!first)
+            {
+                sb.Append(',');
+            }
+
+            first = false;
+            sb.Append("{\"brokerName\":").Append(Json.Dump(JsonValue.MakeString(mq.BrokerName)))
+                .Append(",\"queueId\":").Append(mq.QueueId.ToString(CultureInfo.InvariantCulture))
+                .Append(",\"topic\":").Append(Json.Dump(JsonValue.MakeString(mq.Topic)))
+                .Append("}:").Append(kv.Value.ToString(CultureInfo.InvariantCulture));
         }
 
-        File.WriteAllText(path, root.Dump());
+        sb.Append("}}");
+        return sb.ToString();
     }
 
     private Dictionary<string, long> LoadLocalOffsets()
     {
+        return LoadLocalOffsetsAt(LocalOffsetPath());
+    }
+
+    // 主文件缺失/损坏时回退 .bak（Java readLocalOffset → readLocalOffsetBak）；都失败返回空。
+    // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
+    public static Dictionary<string, long> LoadLocalOffsetsAt(string path)
+    {
         var outMap = new Dictionary<string, long>(StringComparer.Ordinal);
-        try
+        foreach (string candidate in new[] { path, path + ".bak" })
         {
-            if (!File.Exists(LocalOffsetPath()))
+            string text;
+            try
             {
-                return outMap;
+                text = File.ReadAllText(candidate);
+            }
+            catch (IOException)
+            {
+                continue;
             }
 
-            string text = File.ReadAllText(LocalOffsetPath());
-            if (!Json.TryParse(text, out JsonValue root, out _) || root is null)
+            Dictionary<string, long>? parsed = ParseLocalOffsetsText(text);
+            if (parsed is not null)
             {
-                return outMap;
+                return parsed;
             }
-
-            foreach (KeyValuePair<string, JsonValue> kv in root.ObjectItems())
-            {
-                outMap[kv.Key] = kv.Value.IntValue();
-            }
-        }
-        catch (Exception)
-        {
-            // 本地位点文件缺失/损坏按首次启动处理
         }
 
         return outMap;
+    }
+
+    // 先按严格 JSON 解析（旧版本端写过的扁平 map）；Java fastjson2 的「对象作 key」
+    // 格式对严格解析必然失败（含 pretty 版），落进 ScanJavaOffsetEntries。
+    // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
+    public static Dictionary<string, long>? ParseLocalOffsetsText(string text)
+    {
+        string trimmed = text.Trim();
+        if (trimmed.Length == 0)
+        {
+            return null;
+        }
+
+        if (Json.TryParse(trimmed, out JsonValue root, out _) && root is not null)
+        {
+            var flat = new Dictionary<string, long>(StringComparer.Ordinal);
+            bool allNumbers = true;
+            foreach (KeyValuePair<string, JsonValue> kv in root.ObjectItems())
+            {
+                if (!kv.Value.IsNumber)
+                {
+                    allNumbers = false;
+                    break;
+                }
+
+                flat[kv.Key] = kv.Value.IntValue();
+            }
+
+            if (allNumbers)
+            {
+                return flat;
+            }
+        }
+
+        return ScanJavaOffsetEntries(trimmed);
+    }
+
+    private static Dictionary<string, long>? ScanJavaOffsetEntries(string text)
+    {
+        int pos = 0;
+        if (!Eat(text, ref pos, '{'))
+        {
+            return null;
+        }
+
+        if (ScanString(text, ref pos) != "offsetTable")
+        {
+            return null;
+        }
+
+        if (!Eat(text, ref pos, ':') || !Eat(text, ref pos, '{'))
+        {
+            return null;
+        }
+
+        var outMap = new Dictionary<string, long>(StringComparer.Ordinal);
+        while (true)
+        {
+            if (Eat(text, ref pos, '}'))
+            {
+                break;
+            }
+
+            if (!Eat(text, ref pos, '{'))
+            {
+                return null;
+            }
+
+            string? topic = null;
+            string? broker = null;
+            long? queueId = null;
+            while (true)
+            {
+                if (Eat(text, ref pos, '}'))
+                {
+                    break;
+                }
+
+                string? fkey = ScanString(text, ref pos);
+                if (fkey is null || !Eat(text, ref pos, ':'))
+                {
+                    return null;
+                }
+
+                if (Peek(text, pos) == '"')
+                {
+                    string? v = ScanString(text, ref pos);
+                    if (v is null)
+                    {
+                        return null;
+                    }
+
+                    if (fkey == "topic")
+                    {
+                        topic = v;
+                    }
+                    else if (fkey == "brokerName")
+                    {
+                        broker = v;
+                    }
+                }
+                else
+                {
+                    if (!ScanLong(text, ref pos, out long v))
+                    {
+                        return null;
+                    }
+
+                    if (fkey == "queueId")
+                    {
+                        queueId = v;
+                    }
+                }
+
+                if (Eat(text, ref pos, ','))
+                {
+                    continue;
+                }
+
+                if (Eat(text, ref pos, '}'))
+                {
+                    break;
+                }
+
+                return null;
+            }
+
+            if (!Eat(text, ref pos, ':') || topic is null || broker is null || queueId is null
+                || !ScanLong(text, ref pos, out long off))
+            {
+                return null;
+            }
+
+            outMap[topic + broker + queueId.Value.ToString(CultureInfo.InvariantCulture)] = off;
+            if (Eat(text, ref pos, ','))
+            {
+                continue;
+            }
+
+            if (Eat(text, ref pos, '}'))
+            {
+                break;
+            }
+
+            return null;
+        }
+
+        // 表收尾后还有 wrapper 本身的 }（{"offsetTable":{...}} 两层括号）
+        if (!Eat(text, ref pos, '}'))
+        {
+            return null;
+        }
+
+        while (pos < text.Length && char.IsWhiteSpace(text[pos]))
+        {
+            pos++;
+        }
+
+        return pos == text.Length ? outMap : null;
+    }
+
+    private static bool Eat(string s, ref int pos, char c)
+    {
+        SkipWs(s, ref pos);
+        if (pos < s.Length && s[pos] == c)
+        {
+            pos++;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static char Peek(string s, int pos)
+    {
+        SkipWs(s, ref pos);
+        return pos < s.Length ? s[pos] : '\0';
+    }
+
+    private static void SkipWs(string s, ref int pos)
+    {
+        while (pos < s.Length && char.IsWhiteSpace(s[pos]))
+        {
+            pos++;
+        }
+    }
+
+    private static string? ScanString(string s, ref int pos)
+    {
+        SkipWs(s, ref pos);
+        if (pos >= s.Length || s[pos] != '"')
+        {
+            return null;
+        }
+
+        pos++;
+        var sb = new StringBuilder();
+        while (pos < s.Length)
+        {
+            char c = s[pos++];
+            if (c == '"')
+            {
+                return sb.ToString();
+            }
+
+            if (c != '\\')
+            {
+                sb.Append(c);
+                continue;
+            }
+
+            if (pos >= s.Length)
+            {
+                return null;
+            }
+
+            char e = s[pos++];
+            switch (e)
+            {
+                case '"': sb.Append('"'); break;
+                case '\\': sb.Append('\\'); break;
+                case '/': sb.Append('/'); break;
+                case 'b': sb.Append('\b'); break;
+                case 'f': sb.Append('\f'); break;
+                case 'n': sb.Append('\n'); break;
+                case 'r': sb.Append('\r'); break;
+                case 't': sb.Append('\t'); break;
+                case 'u':
+                    if (pos + 4 > s.Length
+                        || !int.TryParse(s.Substring(pos, 4), NumberStyles.HexNumber,
+                            CultureInfo.InvariantCulture, out int cp))
+                    {
+                        return null;
+                    }
+
+                    sb.Append((char)cp);
+                    pos += 4;
+                    break;
+                default:
+                    return null;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool ScanLong(string s, ref int pos, out long value)
+    {
+        value = 0;
+        SkipWs(s, ref pos);
+        int start = pos;
+        if (pos < s.Length && s[pos] == '-')
+        {
+            pos++;
+        }
+
+        int digits = pos;
+        while (pos < s.Length && s[pos] >= '0' && s[pos] <= '9')
+        {
+            pos++;
+        }
+
+        if (pos == digits)
+        {
+            return false;
+        }
+
+        return long.TryParse(s[start..pos], NumberStyles.Integer, CultureInfo.InvariantCulture,
+            out value);
     }
 
     // ---------------- 顺序消费队列锁 ----------------

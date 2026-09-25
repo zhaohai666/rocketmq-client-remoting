@@ -2513,31 +2513,265 @@ fn local_offset_path(inner: &Inner) -> Option<std::path::PathBuf> {
     Some(base.join("offsets.json"))
 }
 
-/// Python `_save_local_offsets`：先写 `.tmp` 再 `os.replace`，避免半截文件。
+/// Java `persistAll` + fastjson2 的落盘格式（用真实 rocketmq-client 5.5.0 jar 实测）：
+/// `{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}`
+/// —— MessageQueue 对象直接当 JSON key。没有队列信息（`mq_map` 查不到）的条目
+/// 跳过，与 Java `persistAll(mqs)` 只写仍持有队列一致。
+fn build_local_offsets_json(
+    items: &BTreeMap<String, i64>,
+    mq_map: &BTreeMap<String, MessageQueue>,
+) -> String {
+    fn jstr(s: &str) -> String {
+        serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+    }
+    let mut s = String::from("{\"offsetTable\":{");
+    let mut first = true;
+    for (key, off) in items {
+        let Some(mq) = mq_map.get(key) else { continue };
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        s.push_str(&format!(
+            "{{\"brokerName\":{},\"queueId\":{},\"topic\":{}}}:{}",
+            jstr(&mq.broker_name),
+            mq.queue_id,
+            jstr(&mq.topic),
+            off
+        ));
+    }
+    s.push_str("}}");
+    s
+}
+
+/// 与 Python `_parse_local_offsets_json` 同口径：先按严格 JSON 解析（旧版本端写过
+/// 的扁平 map），失败再扫 Java fastjson2 的「对象作 key」格式。都失败返回 `None`
+/// （上层继续找 `.bak`）。
+fn parse_local_offsets_text(text: &str) -> Option<BTreeMap<String, i64>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(flat) = serde_json::from_str::<BTreeMap<String, i64>>(trimmed) {
+        return Some(flat);
+    }
+    let entries = scan_java_offset_entries(trimmed)?;
+    Some(
+        entries
+            .into_iter()
+            .map(|(topic, broker, qid, off)| (mq_key(&MessageQueue::new(&topic, &broker, qid)), off))
+            .collect(),
+    )
+}
+
+/// 无 regex crate，手写扫描器：`{"offsetTable":{{...}:9,...}}`（容忍 fastjson2
+/// pretty 版的换行缩进）。返回 `(topic, brokerName, queueId, offset)` 列表。
+fn scan_java_offset_entries(text: &str) -> Option<Vec<(String, String, i32, i64)>> {
+    struct Scanner<'a> {
+        b: &'a [u8],
+        pos: usize,
+    }
+    impl<'a> Scanner<'a> {
+        fn skip_ws(&mut self) {
+            while self.pos < self.b.len() && self.b[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+        }
+        fn eat(&mut self, c: u8) -> bool {
+            self.skip_ws();
+            if self.b.get(self.pos) == Some(&c) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            }
+        }
+        fn peek(&mut self) -> Option<u8> {
+            self.skip_ws();
+            self.b.get(self.pos).copied()
+        }
+        fn scan_string(&mut self) -> Option<String> {
+            if self.peek()? != b'"' {
+                return None;
+            }
+            self.pos += 1;
+            let mut out = String::new();
+            let mut raw_start = self.pos;
+            loop {
+                let c = *self.b.get(self.pos)?;
+                if c == b'"' {
+                    out.push_str(std::str::from_utf8(&self.b[raw_start..self.pos]).ok()?);
+                    self.pos += 1;
+                    return Some(out);
+                }
+                if c == b'\\' {
+                    out.push_str(std::str::from_utf8(&self.b[raw_start..self.pos]).ok()?);
+                    self.pos += 1;
+                    let e = *self.b.get(self.pos)?;
+                    self.pos += 1;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hex = std::str::from_utf8(self.b.get(self.pos..self.pos + 4)?)
+                                .ok()?;
+                            out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
+                            self.pos += 4;
+                        }
+                        _ => return None,
+                    }
+                    raw_start = self.pos;
+                    continue;
+                }
+                self.pos += 1;
+            }
+        }
+        fn scan_int(&mut self) -> Option<i64> {
+            self.skip_ws();
+            let start = self.pos;
+            if self.b.get(self.pos) == Some(&b'-') {
+                self.pos += 1;
+            }
+            let digits = self.pos;
+            while matches!(self.b.get(self.pos), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+            if self.pos == digits {
+                return None;
+            }
+            std::str::from_utf8(&self.b[start..self.pos]).ok()?.parse().ok()
+        }
+    }
+
+    let mut s = Scanner { b: text.as_bytes(), pos: 0 };
+    if !s.eat(b'{') {
+        return None;
+    }
+    if s.scan_string()?.as_str() != "offsetTable" {
+        return None;
+    }
+    if !s.eat(b':') || !s.eat(b'{') {
+        return None;
+    }
+    let mut out = Vec::new();
+    loop {
+        if s.eat(b'}') {
+            break;
+        }
+        if !s.eat(b'{') {
+            return None;
+        }
+        let (mut topic, mut broker, mut qid) = (None, None, None);
+        loop {
+            if s.eat(b'}') {
+                break;
+            }
+            let fkey = s.scan_string()?;
+            if !s.eat(b':') {
+                return None;
+            }
+            if s.peek() == Some(b'"') {
+                let v = s.scan_string()?;
+                match fkey.as_str() {
+                    "topic" => topic = Some(v),
+                    "brokerName" => broker = Some(v),
+                    _ => {}
+                }
+            } else {
+                let v = s.scan_int()?;
+                if fkey == "queueId" {
+                    qid = Some(i32::try_from(v).ok()?);
+                }
+            }
+            if s.eat(b',') {
+                continue;
+            }
+            if s.eat(b'}') {
+                break;
+            }
+            return None;
+        }
+        if !s.eat(b':') {
+            return None;
+        }
+        let off = s.scan_int()?;
+        out.push((topic?, broker?, qid?, off));
+        if s.eat(b',') {
+            continue;
+        }
+        if s.eat(b'}') {
+            break;
+        }
+        return None;
+    }
+    // 表收尾后还有 wrapper 本身的 `}`（{"offsetTable":{...}} 两层括号）
+    if !s.eat(b'}') {
+        return None;
+    }
+    s.skip_ws();
+    if s.pos != s.b.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Python `_save_local_offsets`：先写 `.tmp` 再 `os.replace`，避免半截文件；
+/// 旧内容先滚到 `.bak`（Java `MixAll.string2File` 语义）。
 fn save_local_offsets(inner: &Inner) -> Result<()> {
     let Some(path) = local_offset_path(inner) else {
         return Err(Error::client("HOME is not set, cannot store local offsets"));
     };
-    let items: BTreeMap<String, i64> = lock(&inner.state).consume_offsets.clone();
+    let (items, mq_map) = {
+        let st = lock(&inner.state);
+        (st.consume_offsets.clone(), st.mq_map.clone())
+    };
+    save_local_offsets_at(&path, &items, &mq_map)
+}
+
+fn save_local_offsets_at(
+    path: &std::path::Path,
+    items: &BTreeMap<String, i64>,
+    mq_map: &BTreeMap<String, MessageQueue>,
+) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    if let Ok(prev) = std::fs::read_to_string(path) {
+        if !prev.is_empty() {
+            let _ = std::fs::write(path.with_file_name("offsets.json.bak"), prev);
+        }
+    }
     let tmp = path.with_file_name("offsets.json.tmp");
-    let text = serde_json::to_string(&items)?;
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path)?;
+    std::fs::write(&tmp, build_local_offsets_json(items, mq_map))?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// Python `_load_local_offsets`：任何读失败都当「没有本地位点」。
+/// Python `_load_local_offsets`：主文件缺失/损坏时回退 `.bak`，都失败当「没有
+/// 本地位点」。
 fn load_local_offsets(inner: &Inner) -> BTreeMap<String, i64> {
     let Some(path) = local_offset_path(inner) else {
         return BTreeMap::new();
     };
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => BTreeMap::new(),
+    load_local_offsets_at(&path)
+}
+
+fn load_local_offsets_at(path: &std::path::Path) -> BTreeMap<String, i64> {
+    for candidate in [path.to_path_buf(), path.with_file_name("offsets.json.bak")] {
+        let Ok(text) = std::fs::read_to_string(&candidate) else {
+            continue;
+        };
+        if let Some(parsed) = parse_local_offsets_text(&text) {
+            return parsed;
+        }
     }
+    BTreeMap::new()
 }
 
 // ================================================================ POP 消费
@@ -6407,5 +6641,149 @@ mod tests {
         consumer.shutdown();
         assert!(lock(&consumer.inner.state).last_pull_at.is_empty());
         assert!(lock(&consumer.inner.state).queue_owners.is_empty());
+    }
+
+    // ---------------- 本地位点文件：对齐 Java LocalFileOffsetStore ----------------
+
+    // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
+    const JAVA_COMPACT: &str = concat!(
+        r#"{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,"#,
+        r#"{"brokerName":"broker-a","queueId":0,"topic":"Tt"}:7}}"#,
+    );
+    const JAVA_PRETTY: &str =
+        "{\n\t\"offsetTable\":{\n\t\t{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7\n\t}\n}";
+
+    fn test_mq_map() -> BTreeMap<String, MessageQueue> {
+        (0..3)
+            .map(|i| {
+                let mq = MessageQueue::new("Tt", "broker-a", i);
+                (mq_key(&mq), mq)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_offsets_build_uses_java_object_as_key_format() {
+        let text = build_local_offsets_json(
+            &BTreeMap::from([("Ttbroker-a0".to_string(), 7), ("Ttbroker-a1".to_string(), 9)]),
+            &test_mq_map(),
+        );
+        assert!(text.starts_with("{\"offsetTable\":{"));
+        // 字段序 brokerName/queueId/topic（fastjson2 字母序），每个 key 是内嵌对象
+        assert!(text.contains(r#""brokerName":"broker-a","queueId":0,"topic":"Tt"}:7"#));
+        assert!(text.contains(r#""brokerName":"broker-a","queueId":1,"topic":"Tt"}:9"#));
+    }
+
+    #[test]
+    fn local_offsets_build_skips_entries_without_queue_info() {
+        let text = build_local_offsets_json(
+            &BTreeMap::from([("Ttbroker-a0".to_string(), 7), ("Orphan_b0".to_string(), 3)]),
+            &test_mq_map(),
+        );
+        assert!(!text.contains("Orphan"));
+    }
+
+    #[test]
+    fn local_offsets_parse_java_format_compact_and_pretty() {
+        let compact = parse_local_offsets_text(JAVA_COMPACT).unwrap();
+        assert_eq!(compact.get("Ttbroker-a1"), Some(&9));
+        assert_eq!(compact.get("Ttbroker-a0"), Some(&7));
+        let pretty = parse_local_offsets_text(JAVA_PRETTY).unwrap();
+        assert_eq!(pretty.get("Ttbroker-a0"), Some(&7));
+    }
+
+    #[test]
+    fn local_offsets_parse_accepts_legacy_flat_map() {
+        let flat = parse_local_offsets_text(r#"{"Ttbroker-a0":5}"#).unwrap();
+        assert_eq!(flat.get("Ttbroker-a0"), Some(&5));
+    }
+
+    #[test]
+    fn local_offsets_parse_rejects_garbage() {
+        assert!(parse_local_offsets_text("{\"offsetTable\":{{{").is_none());
+        assert!(parse_local_offsets_text("{\"offsetTable\":").is_none());
+        assert!(parse_local_offsets_text("").is_none());
+    }
+
+    #[test]
+    fn local_offsets_roundtrip_built_text() {
+        let text = build_local_offsets_json(
+            &BTreeMap::from([
+                ("Ttbroker-a0".to_string(), 7),
+                ("Ttbroker-a1".to_string(), 9),
+                ("Ttbroker-a2".to_string(), 11),
+            ]),
+            &test_mq_map(),
+        );
+        let parsed = parse_local_offsets_text(&text).unwrap();
+        assert_eq!(parsed.get("Ttbroker-a0"), Some(&7));
+        assert_eq!(parsed.get("Ttbroker-a1"), Some(&9));
+        assert_eq!(parsed.get("Ttbroker-a2"), Some(&11));
+    }
+
+    #[test]
+    fn local_offsets_save_writes_java_format_and_rolls_bak() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmq_rust_offsets_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("offsets.json");
+        let items = BTreeMap::from([
+            ("Ttbroker-a0".to_string(), 7),
+            ("Ttbroker-a1".to_string(), 9),
+            ("Ttbroker-a2".to_string(), 11),
+        ]);
+        let mq_map = test_mq_map();
+
+        save_local_offsets_at(&path, &items, &mq_map).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with("{\"offsetTable\":{"));
+        // 首次写不产生 .bak（Java string2File 只在已有旧内容时滚动）
+        assert!(!path.with_file_name("offsets.json.bak").exists());
+
+        save_local_offsets_at(
+            &path,
+            &BTreeMap::from([("Ttbroker-a0".to_string(), 99)]),
+            &mq_map,
+        )
+        .unwrap();
+        // .bak = 上一代内容（Java MixAll.string2File 语义）
+        assert_eq!(std::fs::read_to_string(path.with_file_name("offsets.json.bak")).unwrap(), raw);
+
+        // 主文件在 → 读主文件；主文件缺失 → .bak（上一代）
+        let loaded = load_local_offsets_at(&path);
+        assert_eq!(loaded.get("Ttbroker-a0"), Some(&99));
+        std::fs::remove_file(&path).unwrap();
+        let loaded = load_local_offsets_at(&path);
+        assert_eq!(loaded.get("Ttbroker-a0"), Some(&7));
+
+        // .bak 也缺失 → 空（按首次启动处理）
+        std::fs::remove_file(path.with_file_name("offsets.json.bak")).unwrap();
+        assert!(load_local_offsets_at(&path).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_offsets_load_reads_java_written_file() {
+        // Java 写出的文件本端要能读（跨端互认的核心）
+        let dir = std::env::temp_dir().join(format!(
+            "rmq_rust_offsets_java_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("offsets.json");
+        std::fs::write(&path, JAVA_COMPACT).unwrap();
+        let loaded = load_local_offsets_at(&path);
+        assert_eq!(loaded.get("Ttbroker-a1"), Some(&9));
+        assert_eq!(loaded.get("Ttbroker-a0"), Some(&7));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

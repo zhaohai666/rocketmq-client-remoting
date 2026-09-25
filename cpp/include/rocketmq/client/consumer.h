@@ -396,6 +396,19 @@ public:
                       const std::vector<MessageExt>& batch);
     // 队列在缓冲/位点表里的 key（topic + brokerName + queueId）。
     static std::string offsetKey(const MessageQueue& mq);
+    // 广播本地位点文件（Java LocalFileOffsetStore）的纯函数部件，开放给单测。
+    // 落盘格式是 fastjson2 的「MessageQueue 对象当 JSON key」（真实 5.5.0 jar 实测）：
+    // {"offsetTable":{{"brokerName":"b","queueId":0,"topic":"T"}:7,...}}
+    static std::string buildLocalOffsetsJson(const std::map<std::string, int64_t>& items,
+                                             const std::map<std::string, MessageQueue>& mqMap);
+    // 严格 JSON（旧版扁平 map）优先，失败再扫「对象作 key」格式；都失败返回 nullopt。
+    static std::optional<std::map<std::string, int64_t>> parseLocalOffsetsText(
+        const std::string& text);
+    // 指定路径的落盘/读回（.bak 滚动、.tmp 原子改名都在这里），实例方法委托它们。
+    static void saveLocalOffsetsAt(const std::string& path,
+                                   const std::map<std::string, int64_t>& items,
+                                   const std::map<std::string, MessageQueue>& mqMap);
+    static std::map<std::string, int64_t> loadLocalOffsetsAt(const std::string& path);
     // 预置某队列的「已拉未消费」缓冲（Java ProcessQueue），用于断言回投失败后塞回队首的内容
     void setPendingMessages(const std::string& key, const std::vector<MessageExt>& msgs);
     std::vector<MessageExt> pendingMessages(const std::string& key) const;

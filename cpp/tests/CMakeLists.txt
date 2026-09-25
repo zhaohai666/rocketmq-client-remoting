@@ -209,6 +209,12 @@ add_executable(rmq_test_subscribe_after_start test_subscribe_after_start.cpp)
 target_link_libraries(rmq_test_subscribe_after_start PRIVATE rocketmq::remoting)
 add_test(NAME subscribe_after_start COMMAND rmq_test_subscribe_after_start)
 
+# 广播本地位点文件（Java LocalFileOffsetStore）：fastjson2「对象作 key」格式与 Java
+# 逐字节对拍 + .bak 滚动 + 主文件缺失回退 .bak（四端互认 ~/.rocketmq_offsets 的底座）
+add_executable(rmq_test_local_offsets test_local_offsets.cpp)
+target_link_libraries(rmq_test_local_offsets PRIVATE rocketmq::remoting)
+add_test(NAME local_offsets COMMAND rmq_test_local_offsets)
+
 # 定时任务节奏（Java MQClientInstance#startScheduledTask :389-432）：五个门面的
 # pollNameServerInterval=30000 / persistConsumerOffsetInterval=5000 默认值与透传 +
 # 「首跳落在 initialDelay（10ms）而不是 initialDelay+周期」+ 周期真按传入值走。

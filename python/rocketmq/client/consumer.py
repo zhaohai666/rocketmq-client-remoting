@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -611,6 +612,78 @@ class AllocateMachineRoomNearby(AllocateMessageQueueStrategy):
     def get_name(self) -> str:
         return "MACHINE_ROOM_NEARBY-%s" % _strategy_name(
             self.allocate_message_queue_strategy)
+
+
+# ---------------- 本地位点文件格式（对齐 Java LocalFileOffsetStore）----------------
+# Java 侧 fastjson2 序列化 Map<MessageQueue, AtomicLong> 时把 MessageQueue 对象**直接
+# 当 JSON key** 写出 —— 严格 JSON 非法，但 fastjson2 自产自销能读回。字段序固定为
+# brokerName/queueId/topic（fastjson2 字母序）。队列 key 仍用 topic+broker+queueId 拼接。
+def _build_local_offsets_json(items: Dict[str, int],
+                              mq_map: Dict[str, MessageQueue]) -> str:
+    parts = []
+    for key, off in items.items():
+        mq = mq_map.get(key)
+        if mq is None:
+            # 与 Java persistAll(mqs) 一样：只写仍持有队列信息的条目
+            continue
+        obj = json.dumps({"brokerName": mq.broker_name, "queueId": int(mq.queue_id),
+                          "topic": mq.topic}, separators=(",", ":"))
+        parts.append(obj + ":" + str(int(off)))
+    return '{"offsetTable":{' + ",".join(parts) + "}}"
+
+
+def _parse_local_offsets_json(text: str) -> Optional[Dict[str, int]]:
+    if not text or not text.strip():
+        return None
+    stripped = text.strip()
+    # 先按严格 JSON 解析（旧版本端写过的扁平 map）；Java fastjson2 的"对象作 key"
+    # 格式对严格解析必然失败（含 pretty 版），落进下面的容忍扫描器。
+    try:
+        return {k: int(v) for k, v in json.loads(stripped).items()}
+    except (ValueError, AttributeError):
+        pass
+    body = _scan_offset_table_body(stripped)
+    if body is None:
+        return None
+    return {topic + broker + str(qid): off
+            for (topic, broker, qid), off in body}
+
+
+def _scan_offset_table_body(text: str) -> Optional[list]:
+    """容忍解析 {"offsetTable":{{..}:off,{..}:off}}；失败返回 None。"""
+    m = re.match(r'^\{\s*"offsetTable"\s*:\s*\{(.*)\}\s*\}\s*$', text, re.S)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    entries = []
+    if not body:
+        return entries
+    pos = 0
+    for mo in _OBJ_AS_KEY_RE.finditer(body):
+        if body[pos:mo.start()].strip() not in ("", ","):
+            return None
+        fields = {}
+        for fo in _FIELD_RE.finditer(mo.group(1)):
+            raw = fo.group(2)
+            if raw.startswith('"'):
+                try:
+                    fields[fo.group(1)] = json.loads(raw)
+                except ValueError:
+                    return None
+            else:
+                fields[fo.group(1)] = int(raw)
+        if not {"topic", "brokerName", "queueId"} <= fields.keys():
+            return None
+        entries.append(((fields["topic"], fields["brokerName"],
+                         int(fields["queueId"])), int(mo.group(2))))
+        pos = mo.end()
+    if body[pos:].strip():
+        return None
+    return entries
+
+
+_OBJ_AS_KEY_RE = re.compile(r'(\{[^{}]*\})\s*:\s*(-?\d+)')
+_FIELD_RE = re.compile(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)')
 
 
 class PopProcessQueue:
@@ -2884,19 +2957,36 @@ class DefaultMQPushConsumer:
     def _save_local_offsets(self) -> None:
         with self._lock:
             items = dict(self._consume_offsets)
+            mq_map = dict(self._mq_map)
         path = self._local_offset_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        text = _build_local_offsets_json(items, mq_map)
+        # Java MixAll.string2File：旧内容先滚到 .bak 再写新文件
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                prev = f.read()
+            if prev:
+                with open(path + ".bak", "w", encoding="utf-8") as f:
+                    f.write(prev)
+        except OSError:
+            pass
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(items, f)
+            f.write(text)
         os.replace(tmp, path)
 
     def _load_local_offsets(self) -> Dict[str, int]:
-        try:
-            with open(self._local_offset_path(), "r", encoding="utf-8") as f:
-                return {k: int(v) for k, v in json.load(f).items()}
-        except (OSError, ValueError):
-            return {}
+        # Java readLocalOffset：主文件缺失/为空/解析失败 → .bak
+        for path in (self._local_offset_path(), self._local_offset_path() + ".bak"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            parsed = _parse_local_offsets_json(text)
+            if parsed is not None:
+                return parsed
+        return {}
 
     # ---------------- 顺序消费队列锁 ----------------
     def _start_lock_loop(self) -> None:

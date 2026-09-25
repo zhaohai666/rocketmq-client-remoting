@@ -1785,21 +1785,71 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
     if written {
         match std::fs::read_to_string(&file_a) {
             Ok(text) => {
-                let parsed: BTreeMap<String, i64> = serde_json::from_str(&text).unwrap_or_default();
+                // Java fastjson2 落盘格式（真实 rocketmq-client 5.5.0 实测）：
+                // {"offsetTable":{{"brokerName":..,"queueId":..,"topic":..}:off,...}}
+                let offsets = java_format_offsets(&text);
                 ck.check(
-                    "C6 the local offset file is a flat queueKey->offset JSON object summing to 8",
-                    parsed.len() == 2 && parsed.values().sum::<i64>() == 8,
-                    &format!("{parsed:?} raw={text}"),
+                    "C6 the local offset file uses Java's object-as-key offsetTable format with 2 entries summing to 8",
+                    matches!(&offsets, Some(v) if v.len() == 2 && v.iter().sum::<i64>() == 8),
+                    &format!("{offsets:?} raw={text}"),
+                );
+                ck.check(
+                    "C6 each offsetTable key carries the real topic/broker/queueId",
+                    text.matches(&format!("\"topic\":\"{topic}\"")).count() == 2
+                        && text.matches("\"brokerName\":").count() == 2,
+                    &format!("raw={text}"),
                 );
                 ck.check(
                     "C6 no half-written offset file is left behind (tmp is renamed away)",
                     !file_a.with_file_name("offsets.json.tmp").exists(),
                     "offsets.json.tmp survived",
                 );
+
+                // 同 clientId 重启：读回本地位点，广播不重投（Java load() 同口径）
+                let inbox_r = Arc::new(Inbox::default());
+                let mut cfg_r = cfg_a.clone();
+                cfg_r.instance_name = client_a.clone();
+                cfg_r.client_id = Some(client_a.clone());
+                let r = match DefaultMQPushConsumer::with_config(cfg_r) {
+                    Ok(c) => c,
+                    Err(e) => return ck.abort("C6 build restart", &e.to_string()),
+                };
+                if let Err(e) = r.subscribe(&topic, "*") {
+                    return ck.abort("C6 subscribe restart", &e.to_string());
+                }
+                r.set_message_listener_concurrently(LiveListener::collecting(inbox_r.clone()));
+                if let Err(e) = r.start().await {
+                    return ck.abort("C6 start restart", &format!("{e}"));
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                ck.check(
+                    "C6 restarting with the same clientId resumes from the local offsets (no redelivery)",
+                    inbox_r.count() == 0,
+                    &format!("redelivered={}", inbox_r.count()),
+                );
+                r.shutdown();
             }
             Err(e) => ck.abort("C6 read the local offset file", &e.to_string()),
         }
     }
+}
+
+/// 从 `{"offsetTable":{{...}:7,{...}:9}}` 抽出位点列表；格式不对返回 `None`。
+fn java_format_offsets(text: &str) -> Option<Vec<i64>> {
+    let body = text.strip_prefix("{\"offsetTable\":{")?.strip_suffix("}}")?;
+    let mut offs = Vec::new();
+    for (i, seg) in body.split("}:").enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let num = if seg.contains(',') {
+            seg.split(',').next()?
+        } else {
+            seg
+        };
+        offs.push(num.trim().parse().ok()?);
+    }
+    Some(offs)
 }
 
 // --------------------------------------------------------------- C7 顺序消费
