@@ -84,6 +84,12 @@ add_executable(rmq_test_pop_consumer test_pop_consumer.cpp)
 target_link_libraries(rmq_test_pop_consumer PRIVATE rocketmq::remoting)
 add_test(NAME pop_consumer COMMAND rmq_test_pop_consumer)
 
+# POP + 顺序监听器（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）：
+# 分派进骨架后 listener 不被调、不 ack，请求集按 (pq, mq) 去重、pq 撤销才摘
+add_executable(rmq_test_pop_orderly test_pop_orderly.cpp)
+target_link_libraries(rmq_test_pop_orderly PRIVATE rocketmq::remoting)
+add_test(NAME pop_orderly COMMAND rmq_test_pop_orderly)
+
 # classic 并发消费的 ackIndex 语义（Java processConsumeResult）：部分 ack 的尾巴回投、
 # 回投失败钳住位点、RECONSUME_LATER 覆盖宽 ackIndex、广播丢尾巴
 add_executable(rmq_test_consume_ack_index test_consume_ack_index.cpp)

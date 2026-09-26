@@ -668,8 +668,10 @@ void DefaultMQPushConsumer::shutdown() {
     } catch (const std::exception& e) {
         logger_debug(std::string("persist offsets on shutdown failed: ") + e.what());
     }
-    // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）
-    if (isOrderly() && messageModel_ != MessageModel::BROADCASTING) {
+    // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）。
+    // POP 顺序服务（ConsumeMessagePopOrderlyService.shutdown:79-87 → unlockAll）走同一个
+    // RebalanceImpl.unlockAll，而它只读 processQueueTable —— POP 模式下是空表，不发报文。
+    if (isOrderly() && !popMode_ && messageModel_ != MessageModel::BROADCASTING) {
         try {
             std::vector<MessageQueue> mqs = assignedQueues();
             if (!mqs.empty()) {
@@ -1295,6 +1297,17 @@ void DefaultMQPushConsumer::recordPopPullStats(ConsumerStatsManager& stats,
 void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs,
                                                     std::shared_ptr<PopProcessQueue> pq,
                                                     const MessageQueue& mq) {
+    // Java DefaultMQPushConsumerImpl:960-990 按 listener 类型选消费服务：顺序监听器 +
+    // POP 走 ConsumeMessagePopOrderlyService。上游 5.5.0 那是个未完成骨架（:533
+    // POPTODO）：请求去重入队后 run() 拿到队列锁就返回 —— 消息**不消费、不 ack**，
+    // invisibleTime 到期由 broker 复活重投，宏观表现是「顺序 + POP 收不到消息且积压
+    // 不消」。照抄这个行为，别"修好"：POP 路径的顺序语义（队列锁、COMMIT/ROLLBACK）
+    // 上游还没定论。msgs 在这条路径被忽略（Java 的 ConsumeRequest 只带 pq + mq）；
+    // 弹出批次的预过滤与被摘条目的 ack 在分派之前，两种服务共享，不受影响。
+    if (isOrderly()) {
+        submitPopOrderlyRequest(pq, mq, /*force=*/false);
+        return;
+    }
     // 对应 Java ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest。
     // 投给**core/max 两档线程池**（core=consumeThreadMin / max=consumeThreadMax，队列无界）：
     // 此前这里每批起一个 detached 线程（无上限），慢监听器一上来就线程爆炸，
@@ -1316,6 +1329,53 @@ void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs
             consumePopBatch(std::move(*batch), pq, mq);
         }
     }
+}
+
+void DefaultMQPushConsumer::submitPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
+                                                    const MessageQueue& mq, bool force) {
+    // 对应 Java ConsumeMessagePopOrderlyService.submitConsumeRequest:178-191：
+    // 在 (mq, shardingKeyIndex=0) 的锁下去重（Java：MessageQueueLock + ConcurrentSet，
+    // 相等性 = (shardingKeyIndex, pq 引用, mq)），新请求才投执行器。rebalance 撤走队列
+    // 会换**新** PopProcessQueue（指针身份不同），新请求照常入队，与 Java 一致。
+    // Java 的每 key 锁在这里折进 lock_：临界区只有一次 set 插入，等价且少一张锁表。
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        const bool isNew = popOrderlyRequests_.insert({pq.get(), mq}).second;
+        if (!force && !isNew) return;
+    }
+    std::shared_ptr<ConsumeExecutor> exec = popConsumeExecutor_;
+    try {
+        if (exec) {
+            exec->submit([this, pq, mq]() { runPopOrderlyRequest(pq, mq); });
+        } else {
+            // 未 start（单测）时没有执行器：同步执行，与并发路径的可测行为一致。
+            runPopOrderlyRequest(pq, mq);
+        }
+    } catch (const std::exception& e) {
+        // Java :185-188 —— 提交失败只打日志，请求留在集合里（不会自动重投）。
+        logger_error("error submit pop orderly request: " + std::string(e.what())
+                     + ", mq: " + mq.toString());
+    }
+}
+
+void DefaultMQPushConsumer::runPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
+                                                 const MessageQueue& mq) {
+    // 对应 Java ConsumeMessagePopOrderlyService$ConsumeRequest.run:315-324 —— 上游
+    // 5.5.0 的骨架到此为止：pq 被撤销才摘请求（Java removeConsumeRequest 同款日志）；
+    // 否则拿到队列锁就**什么都不做**。fetchLockObject 的对应物是调用方的去重集
+    // （同队列同时至多一个请求在跑），无需再取锁。
+    if (pq->isDropped()) {
+        logger_warn("run, message queue not be able to consume, because it's dropped. "
+                    + mq.toString());
+        std::lock_guard<std::mutex> lk(lock_);
+        popOrderlyRequests_.erase({pq.get(), mq});
+        return;
+    }
+}
+
+size_t DefaultMQPushConsumer::popOrderlyRequestCount() const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return popOrderlyRequests_.size();
 }
 
 void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
@@ -2515,22 +2575,28 @@ void DefaultMQPushConsumer::lockLoop() {
     // Java ConsumeMessageOrderlyService.lockMQ：每 20s 批量锁分到的队列；
     // 启动时立刻尝试一次，避免首个 20s 空转
     while (!stop_.load()) {
-        try {
-            std::vector<MessageQueue> mqs = assignedQueues();
-            if (!mqs.empty()) {
-                std::vector<MessageQueue> ok =
-                    mqClient_->lockBatchMq(consumerGroup_, clientId_, mqs);
-                std::set<std::string> okKeys;
-                for (const MessageQueue& mq : ok) {
-                    okKeys.insert(offsetKey(mq));
+        // POP 顺序（Java ConsumeMessagePopOrderlyService.start:68-77）同样跑这个 20s
+        // 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
+        // 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
+        // 按同一口径：POP 模式只保留定时器，不发 LOCK_BATCH_MQ。
+        if (!popMode_) {
+            try {
+                std::vector<MessageQueue> mqs = assignedQueues();
+                if (!mqs.empty()) {
+                    std::vector<MessageQueue> ok =
+                        mqClient_->lockBatchMq(consumerGroup_, clientId_, mqs);
+                    std::set<std::string> okKeys;
+                    for (const MessageQueue& mq : ok) {
+                        okKeys.insert(offsetKey(mq));
+                    }
+                    std::lock_guard<std::mutex> lk(lock_);
+                    lockOk_ = std::move(okKeys);
+                    logger_debug("lock_batch_mq: " + std::to_string(lockOk_.size()) + "/"
+                                 + std::to_string(mqs.size()) + " queues locked");
                 }
-                std::lock_guard<std::mutex> lk(lock_);
-                lockOk_ = std::move(okKeys);
-                logger_debug("lock_batch_mq: " + std::to_string(lockOk_.size()) + "/"
-                             + std::to_string(mqs.size()) + " queues locked");
+            } catch (const std::exception& e) {
+                logger_debug(std::string("lock mq error: ") + e.what());
             }
-        } catch (const std::exception& e) {
-            logger_debug(std::string("lock mq error: ") + e.what());
         }
         // 等待 20s（期间响应 stop）。按绝对 deadline 分段睡：100ms 的系统 sleep 实测多几毫秒，
         // 200 段会把 Java 的 20s 轮次拖长；对着 deadline 算就不累积。
@@ -2727,7 +2793,10 @@ void DefaultMQPushConsumer::onQueuesRevoked(
                              + e.what());
             }
         }
-        if (isOrderly()) {
+        // 撤队列时的单队列解锁只属于 classic 顺序（Java
+        // RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 拿的是 processQueueTable
+        // 里的 ProcessQueue —— POP 模式下那张表是空的，这条路径根本不会跑）。
+        if (isOrderly() && !popMode_) {
             toUnlock.push_back(mq);
         }
     }

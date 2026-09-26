@@ -496,6 +496,9 @@ public sealed class DefaultMQPushConsumer
     private const long PullMaxIdleTime = 120000;
     // 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
     private readonly Dictionary<string, PopProcessQueue> _popQueues = new(StringComparer.Ordinal);
+    // POP 顺序请求去重集（Java ConcurrentSet<ConsumeRequest>，相等性 =
+    // (shardingKeyIndex, pq 引用, mq)；shardingKeyIndex 恒 0，mq 用 key 串）
+    private readonly HashSet<(PopProcessQueue, string)> _popOrderlyRequests = new();
 
     // ---- 真实 rebalance（对齐 Java RebalanceImpl）----
     // _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
@@ -1267,8 +1270,11 @@ public sealed class DefaultMQPushConsumer
             ClientLog.Debug("persist offsets on shutdown failed: " + e.Message);
         }
 
-        // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）
-        if (IsOrderly() && _messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）。
+        // POP 顺序服务（ConsumeMessagePopOrderlyService.shutdown:79-87 → unlockAll）走同一个
+        // RebalanceImpl.unlockAll，而它只读 processQueueTable —— POP 模式下是空表，不发报文。
+        if (IsOrderly() && !PopMode
+            && _messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
         {
             try
             {
@@ -2875,15 +2881,24 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>按 ConsumeMessageBatchMaxSize 切批后投给消费线程（对应 Java
-    /// ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest）。
-    /// <para>投给 **core/max 两档线程池**（core=ConsumeThreadMin / max=ConsumeThreadMax，
-    /// 队列无界，同 Java 的 `LinkedBlockingQueue()`）。
-    /// 此前这里每批起一个裸线程（无上限），慢监听器一上来就线程爆炸，而
-    /// SetConsumeThreadNums() 设的值完全没作用。Java 用线程池 + 无界队列，
-    /// 因此真实并发度 == CorePoolSize，UpdateCorePoolSize() 在运行时能改它。</para></summary>
-    private void SubmitPopConsumeRequest(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
+    /// <summary>POP 弹出批次的统一入口（Java service 接口的公开方法）：顺序监听器分流进
+    /// <see cref="SubmitPopOrderlyRequest"/> 骨架，并发监听器走
+    /// ConsumeMessagePopConcurrentlyService。公开给测试工程（无 InternalsVisibleTo）。
+    /// <para>Java DefaultMQPushConsumerImpl:960-990 按 listener 类型选服务：顺序监听器 +
+    /// POP 走 ConsumeMessagePopOrderlyService。上游 5.5.0 那是个未完成骨架（:533
+    /// POPTODO）：请求去重入队后 run() 拿到队列锁就返回 —— 消息**不消费、不 ack**，
+    /// invisibleTime 到期由 broker 复活重投。照抄这个行为，别"修好"。msgs 在顺序路径
+    /// 被忽略（Java 的 ConsumeRequest 只带 pq + mq）。</para>
+    /// <para>并发分支：按 ConsumeMessageBatchMaxSize 切批后投给 **core/max 两档线程池**
+    /// （core=ConsumeThreadMin / max=ConsumeThreadMax，队列无界，同 Java 的
+    /// `LinkedBlockingQueue()`）。</para></summary>
+    public void SubmitPopConsumeRequest(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
     {
+        if (IsOrderly())
+        {
+            SubmitPopOrderlyRequest(pq, mq, force: false);
+            return;
+        }
         int size = Math.Max(1, _consumeMessageBatchMaxSize);
         ConsumeExecutor? exec = _popConsumeExecutor;
         for (int i = 0; i < msgs.Count; i += size)
@@ -2901,6 +2916,64 @@ public sealed class DefaultMQPushConsumer
                 // 未 Start（单测）时没有执行器：同步执行，保持与改动前一致的可测行为。
                 ConsumePopBatch(batch, pq, mq);
             }
+        }
+    }
+
+    /// <summary>提交一份 POP 顺序请求（Java submitConsumeRequest:178-191）：force=false
+    /// 时按 (pq, mq) 去重，重复请求直接丢弃；新请求才投执行器。Java 的每 key
+    /// MessageQueueLock 折进 _lock：临界区只有一次集合操作。公开给测试工程。</summary>
+    public void SubmitPopOrderlyRequest(PopProcessQueue pq, MessageQueue mq, bool force)
+    {
+        lock (_lock)
+        {
+            bool isNew = _popOrderlyRequests.Add((pq, OffsetKey(mq)));
+            if (!force && !isNew)
+            {
+                return;
+            }
+        }
+        ConsumeExecutor? exec = _popConsumeExecutor;
+        try
+        {
+            if (exec != null)
+            {
+                exec.Submit(() => RunPopOrderlyRequest(pq, mq));
+            }
+            else
+            {
+                // 未 Start（单测）：同步执行
+                RunPopOrderlyRequest(pq, mq);
+            }
+        }
+        catch (Exception e)
+        {
+            // Java :185-188 —— 提交失败只打日志，请求留在集合里（不会自动重投）。
+            ClientLog.Error("error submit pop orderly request: " + e.Message + ", mq: " + mq);
+        }
+    }
+
+    /// <summary>请求的执行体（Java ConsumeRequest.run:315-324）—— 上游 5.5.0 的骨架
+    /// 到此为止：pq 被撤销才摘请求（Java removeConsumeRequest 同款日志）；否则拿到
+    /// 队列锁就**什么都不做** —— 不调 listener、不 ack。</summary>
+    public void RunPopOrderlyRequest(PopProcessQueue pq, MessageQueue mq)
+    {
+        if (pq.IsDropped())
+        {
+            ClientLog.Warn("run, message queue not be able to consume, because it's dropped. "
+                + mq);
+            lock (_lock)
+            {
+                _popOrderlyRequests.Remove((pq, OffsetKey(mq)));
+            }
+        }
+    }
+
+    /// <summary>请求集条数（Java consumeRequestSet.size()；去重行为要能离线锁死）。</summary>
+    public int PopOrderlyRequestCount()
+    {
+        lock (_lock)
+        {
+            return _popOrderlyRequests.Count;
         }
     }
 
@@ -4286,34 +4359,40 @@ public sealed class DefaultMQPushConsumer
         // 启动时立刻尝试一次，避免首个 20s 空转
         while (!_stop)
         {
-            try
+            // POP 顺序（Java ConsumeMessagePopOrderlyService.start:68-77）同样跑这个 20s
+            // 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
+            // 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
+            if (!PopMode)
             {
-                List<MessageQueue> mqs = AssignedQueues();
-                if (mqs.Count > 0 && _mqClient is not null)
+                try
                 {
-                    List<MessageQueue> ok = _mqClient.LockBatchMq(ConsumerGroup, _clientId, mqs);
-                    var okKeys = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (MessageQueue mq in ok)
+                    List<MessageQueue> mqs = AssignedQueues();
+                    if (mqs.Count > 0 && _mqClient is not null)
                     {
-                        okKeys.Add(OffsetKey(mq));
-                    }
-
-                    lock (_lock)
-                    {
-                        _lockOk.Clear();
-                        foreach (string k in okKeys)
+                        List<MessageQueue> ok = _mqClient.LockBatchMq(ConsumerGroup, _clientId, mqs);
+                        var okKeys = new HashSet<string>(StringComparer.Ordinal);
+                        foreach (MessageQueue mq in ok)
                         {
-                            _lockOk.Add(k);
+                            okKeys.Add(OffsetKey(mq));
                         }
-                    }
 
-                    ClientLog.Debug("lock_batch_mq: " + okKeys.Count.ToString(CultureInfo.InvariantCulture)
-                        + "/" + mqs.Count.ToString(CultureInfo.InvariantCulture) + " queues locked");
+                        lock (_lock)
+                        {
+                            _lockOk.Clear();
+                            foreach (string k in okKeys)
+                            {
+                                _lockOk.Add(k);
+                            }
+                        }
+
+                        ClientLog.Debug("lock_batch_mq: " + okKeys.Count.ToString(CultureInfo.InvariantCulture)
+                            + "/" + mqs.Count.ToString(CultureInfo.InvariantCulture) + " queues locked");
+                    }
                 }
-            }
-            catch (Exception e)
-            {
-                ClientLog.Debug("lock mq error: " + e.Message);
+                catch (Exception e)
+                {
+                    ClientLog.Debug("lock mq error: " + e.Message);
+                }
             }
 
             // 等待 20s（期间响应 stop）。整段 wait：100ms 切片在 macOS 上每段实测 131ms，
@@ -4510,7 +4589,10 @@ public sealed class DefaultMQPushConsumer
 
                     // 2) 顺序消费（orderly + clustering）撤销队列需主动解锁（UNLOCK_BATCH_MQ=42），
                     //    否则 broker 侧锁长期不释放，新 owner 抢不到锁会在原地空转。
-                    if (orderly)
+                    //    仅 classic 顺序：Java removeUnnecessaryMessageQueue:94-108 拿的是
+                    //    processQueueTable 里的 ProcessQueue —— POP 模式下那张表是空的，
+                    //    这条路径根本不会跑。
+                    if (orderly && !PopMode)
                     {
                         unlockList.Add(mq);
                     }
@@ -4560,7 +4642,8 @@ public sealed class DefaultMQPushConsumer
                     }
                 }
 
-                if (healOrderly)
+                // 自愈解锁同样仅 classic 顺序（POP 模式下 Java 侧零网络）
+                if (healOrderly && !PopMode)
                 {
                     healUnlockList.Add(r.Mq);
                 }

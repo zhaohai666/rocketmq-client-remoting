@@ -655,6 +655,10 @@ struct State {
     queue_owners: BTreeMap<String, u64>,
     /// Python `_pop_queues`：队列 key -> [`PopProcessQueue`]。
     pop_queues: BTreeMap<String, Arc<PopProcessQueue>>,
+    /// Python `_pop_orderly_requests`（Java `ConcurrentSet<ConsumeRequest>`）：POP 顺序
+    /// 消费的去重集。Java 的 ConsumeRequest 相等性 = shardingKeyIndex(0) + pq 引用 + mq，
+    /// 这里用 Arc 指针地址表达 pq 引用、[`mq_key`] 表达 mq。
+    pop_orderly_requests: BTreeSet<(usize, String)>,
     /// Python `_last_pull_table`：每队列**最近一次发起**拉取/弹出的时刻（毫秒）。
     ///
     /// 对齐 Java `ProcessQueue.lastPullTimestamp` / `PopProcessQueue.lastPopTimestamp`：
@@ -1385,11 +1389,14 @@ impl DefaultMQPushConsumer {
                     .filter_map(|(k, off)| state.mq_map.get(k).map(|mq| (mq.clone(), *off)))
                     .collect()
             };
-            let locked_mqs: Vec<MessageQueue> = if orderly && !broadcast {
-                lock(&self.inner.state).assigned.clone()
-            } else {
-                Vec::new()
-            };
+            // POP 顺序同样没有队列锁可解：Java unlockAll() 只遍历 processQueueTable，
+            // POP 的队列在 popProcessQueueTable 里，这张表是空的 ⇒ UNLOCK 一发不出。
+            let locked_mqs: Vec<MessageQueue> =
+                if orderly && !broadcast && !self.config().pop_mode {
+                    lock(&self.inner.state).assigned.clone()
+                } else {
+                    Vec::new()
+                };
             if broadcast {
                 if let Err(e) = save_local_offsets(&self.inner) {
                     rmq_debug!("persist local offsets on shutdown failed: {e}");
@@ -1574,6 +1581,11 @@ impl DefaultMQPushConsumer {
         let mut keys: Vec<String> = lock(&self.inner.state).lock_ok.iter().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// POP 顺序消费去重集的大小（单测/运维观测口；Java 骨架无对应查询，四端同加）。
+    pub fn pop_orderly_request_count(&self) -> usize {
+        lock(&self.inner.state).pop_orderly_requests.len()
     }
 
     // ---------------- 拉取停摆自愈的可观测接缝 ----------------
@@ -1891,8 +1903,10 @@ impl DefaultMQPushConsumer {
                     rmq_debug!("persist offset on revoke failed for {mq:?}: {e}");
                 }
             }
-            // 顺序消费：释放 broker 队列锁，新属主才能立刻接上
-            if orderly {
+            // 顺序消费：释放 broker 队列锁，新属主才能立刻接上。POP 顺序例外：
+            // Java RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 的撤销解锁
+            // 同样只看见 processQueueTable —— POP 队列不在里面 ⇒ UNLOCK 一发不出。
+            if orderly && !cfg.pop_mode {
                 let _ = client
                     .unlock_batch_mq(&group, &self.client_id(), std::slice::from_ref(mq), 1000)
                     .await;
@@ -2355,25 +2369,30 @@ async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
 /// Python `_lock_loop`（Java `ConsumeMessageOrderlyService.lockMQ`：每 20s，启动即试一次）。
 async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
-        let mqs: Vec<MessageQueue> = lock(&inner.state).assigned.clone();
-        if !mqs.is_empty() {
-            let cfg = read_cfg(&inner);
-            let client = match require_client(&inner) {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            let client_id = cfg.client_id.clone().unwrap_or_default();
-            match client
-                .lock_batch_mq(&cfg.consumer_group, &client_id, &mqs, 1000)
-                .await
-            {
-                Ok(ok) => {
-                    let keys: BTreeSet<String> = ok.iter().map(mq_key).collect();
-                    let n = keys.len();
-                    lock(&inner.state).lock_ok = keys;
-                    rmq_debug!("lock_batch_mq: {n}/{} queues locked", mqs.len());
+        // POP 顺序（Java ConsumeMessagePopOrderlyService.start:68-77）同样跑这个 20s
+        // 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
+        // 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
+        if !read_cfg(&inner).pop_mode {
+            let mqs: Vec<MessageQueue> = lock(&inner.state).assigned.clone();
+            if !mqs.is_empty() {
+                let cfg = read_cfg(&inner);
+                let client = match require_client(&inner) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let client_id = cfg.client_id.clone().unwrap_or_default();
+                match client
+                    .lock_batch_mq(&cfg.consumer_group, &client_id, &mqs, 1000)
+                    .await
+                {
+                    Ok(ok) => {
+                        let keys: BTreeSet<String> = ok.iter().map(mq_key).collect();
+                        let n = keys.len();
+                        lock(&inner.state).lock_ok = keys;
+                        rmq_debug!("lock_batch_mq: {n}/{} queues locked", mqs.len());
+                    }
+                    Err(e) => rmq_debug!("lock mq error: {e}"),
                 }
-                Err(e) => rmq_debug!("lock mq error: {e}"),
             }
         }
         if wait_or_stop(&mut rx, 20_000).await {
@@ -2961,6 +2980,15 @@ async fn submit_pop_consume_request(
     pq: Arc<PopProcessQueue>,
     mq: MessageQueue,
 ) {
+    // Java DefaultMQPushConsumerImpl:960-990 在 POP+顺序监听器时选的是
+    // ConsumeMessagePopOrderlyService（另一套 submit 语义），这里同一分流。
+    let orderly = lock(&inner.listener)
+        .as_ref()
+        .is_some_and(MessageListener::is_orderly);
+    if orderly {
+        submit_pop_orderly_request(inner, pq, mq, false).await;
+        return;
+    }
     let size = read_cfg(inner).consume_message_batch_max_size.max(1) as usize;
     let mut batches: Vec<Vec<MessageExt>> = Vec::new();
     let mut rest = msgs;
@@ -2989,6 +3017,58 @@ async fn submit_pop_consume_request(
             // 未起执行器（单测或未 start）：同步执行，与 Python 一致
             None => consume_pop_batch(inner.clone(), batch, pq, mq).await,
         }
+    }
+}
+
+/// Java `ConsumeMessagePopOrderlyService.submitConsumeRequest`（5.5.0 未完成骨架）：
+/// 去重集里已有同 (pq, mq) 的请求且非 force 时直接丢弃；新增（或 force）才投递。
+/// 与并发路径不同，这里**不切批、不携带消息** —— Java 的 PopOrderly ConsumeRequest
+/// 只持有 pq 和 mq，msgs 被无视（:178-186）。提交失败只记日志，条目留在集合里
+/// （Java :185-188 的 RejectedExecutionException 同样不摘），消息靠 invisibleTime
+/// 到期由 broker 复活重投。
+async fn submit_pop_orderly_request(
+    inner: &Arc<Inner>,
+    pq: Arc<PopProcessQueue>,
+    mq: MessageQueue,
+    force: bool,
+) {
+    let key = (Arc::as_ptr(&pq) as usize, mq_key(&mq));
+    {
+        let mut state = lock(&inner.state);
+        let is_new = state.pop_orderly_requests.insert(key.clone());
+        if !force && !is_new {
+            return;
+        }
+    }
+    let executor = lock(&inner.pop_executor).clone();
+    match executor {
+        Some(executor) => {
+            let w = Arc::downgrade(inner);
+            let task_mq = mq.clone();
+            let task: ConsumeTask = Box::pin(async move {
+                if let Some(inner) = w.upgrade() {
+                    run_pop_orderly_request(inner, pq, task_mq).await;
+                }
+            });
+            if let Err(e) = executor.submit(task) {
+                rmq_error!("error submit pop orderly request: {e}, mq: {mq:?}");
+            }
+        }
+        // 未起执行器（单测或未 start）：同步执行，与并发路径一致
+        None => run_pop_orderly_request(inner.clone(), pq, mq).await,
+    }
+}
+
+/// Java `ConsumeMessagePopOrderlyService$ConsumeRequest.run`（5.5.0 未完成骨架）：
+/// 队列已撤 → 记日志并出集（:228-235）；队列还活着 → **什么都不做**
+/// （`DefaultMQPushConsumerImpl:533` 的 POPTODO，等上游补齐再移植）。
+/// 消息不消费、不 ack，invisibleTime 到期后由 broker 复活重投 —— 与 Java 行为
+/// 完全一致（顺序 POP 在 5.5.0 就是停摆的）。
+async fn run_pop_orderly_request(inner: Arc<Inner>, pq: Arc<PopProcessQueue>, mq: MessageQueue) {
+    if pq.is_dropped() {
+        rmq_warn!("run, message queue not be able to consume, because it's dropped. {mq:?}");
+        let key = (Arc::as_ptr(&pq) as usize, mq_key(&mq));
+        lock(&inner.state).pop_orderly_requests.remove(&key);
     }
 }
 
@@ -6159,6 +6239,159 @@ mod tests {
             "1234 1700000000000 60000 0 T broker-a 3 99",
         );
         assert!(pop_ck_target(inner, &bad_flag).is_none());
+    }
+
+    // ---------------- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 骨架） ----------------
+
+    struct CountingOrderlyListener(Arc<AtomicUsize>);
+
+    impl MessageListenerOrderly for CountingOrderlyListener {
+        fn consume_message(
+            &self,
+            _msgs: &[MessageExt],
+            _context: &mut ConsumeOrderlyContext,
+        ) -> ConsumeOrderlyStatus {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ConsumeOrderlyStatus::Success
+        }
+    }
+
+    struct CountingConcurrentlyListener(Arc<AtomicUsize>);
+
+    impl MessageListenerConcurrently for CountingConcurrentlyListener {
+        fn consume_message(
+            &self,
+            _msgs: &[MessageExt],
+            _context: &mut ConsumeConcurrentlyContext,
+        ) -> ConsumeConcurrentlyStatus {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ConsumeConcurrentlyStatus::ConsumeSuccess
+        }
+    }
+
+    fn pop_ck_msg(queue_offset: i64) -> MessageExt {
+        let mut m = ext("T", None);
+        m.put_property(
+            PROPERTY_POP_CK,
+            &extra_info::build_extra_info(
+                queue_offset,
+                current_time_millis(),
+                60_000,
+                0,
+                "T",
+                "broker-a",
+                0,
+                Some(queue_offset),
+            ),
+        );
+        m
+    }
+
+    /// 忠实移植 Java 5.5.0 骨架（DefaultMQPushConsumerImpl:533 的 POPTODO）：顺序
+    /// 监听器分流的 POP 批次**不投监听器、不 ack** —— 消息靠 invisibleTime 到期由
+    /// broker 复活重投。「POP 模式下零 LOCK/UNLOCK_BATCH_MQ 报文」在离线环境注入
+    /// 不了反向验证，真机证据归 examples/live_* 收口（四端同一约定）。
+    #[tokio::test]
+    async fn pop_orderly_dispatch_never_invokes_the_listener() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.pop_mode = true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        consumer.set_message_listener_orderly(Arc::new(CountingOrderlyListener(calls.clone())));
+        let inner = consumer.inner.clone();
+        let mq = queue("T", "broker-a", 0);
+        let pq = PopProcessQueue::new();
+        pq.inc_found_msg(2);
+        submit_pop_consume_request(
+            &inner,
+            vec![pop_ck_msg(0), pop_ck_msg(1)],
+            pq.clone(),
+            mq.clone(),
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "顺序 POP 停摆（与 Java 5.5.0 行为一致）"
+        );
+        assert_eq!(
+            pq.wait_ack_count(),
+            2,
+            "未 ack：等 invisibleTime 到期 broker 复活重投"
+        );
+        assert_eq!(consumer.pop_orderly_request_count(), 1);
+    }
+
+    /// 同一入口、并发监听器：走 ConsumeMessagePopConcurrentlyService，照常消费 + ack。
+    #[tokio::test]
+    async fn pop_concurrent_dispatch_still_consumes() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.pop_mode = true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        consumer.set_message_listener_concurrently(Arc::new(CountingConcurrentlyListener(
+            calls.clone(),
+        )));
+        let inner = consumer.inner.clone();
+        let mq = queue("T", "broker-a", 0);
+        let pq = PopProcessQueue::new();
+        pq.inc_found_msg(1);
+        submit_pop_consume_request(&inner, vec![pop_ck_msg(0)], pq.clone(), mq.clone()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pq.wait_ack_count(), 0);
+    }
+
+    /// Java 的 ConsumeRequest 相等性 = shardingKeyIndex(0) + pq 引用 + mq：
+    /// 同 (pq, mq) 去重、mq 不同 / pq 不同都算新请求，force 不新增集合条目。
+    #[tokio::test]
+    async fn pop_orderly_requests_dedup_by_pq_and_queue() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let inner = consumer.inner.clone();
+        let pq = PopProcessQueue::new();
+        let q0 = queue("T", "broker-a", 0);
+        let q1 = queue("T", "broker-a", 1);
+        submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), false).await;
+        submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), false).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 1, "同 (pq, mq) 去重");
+        submit_pop_orderly_request(&inner, pq.clone(), q1.clone(), false).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 2, "mq 不同算新请求");
+        let pq2 = PopProcessQueue::new();
+        submit_pop_orderly_request(&inner, pq2.clone(), q0.clone(), false).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 3, "pq 不同算新请求");
+        submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), true).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 3, "force 只放行投递，不加集合条目");
+    }
+
+    /// Java :228-235：run 里发现队列已撤 → 记 warn 日志并把自己从集合里摘掉。
+    /// （入集之后才撤的场景要用 force 才能再进 run —— 非 force 的重复提交被去重挡住。）
+    #[tokio::test]
+    async fn pop_orderly_dropped_request_is_removed_from_the_set() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let inner = consumer.inner.clone();
+        let pq = PopProcessQueue::new();
+        let mq = queue("T", "broker-a", 0);
+        submit_pop_orderly_request(&inner, pq.clone(), mq.clone(), false).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 1);
+        pq.set_dropped(true);
+        submit_pop_orderly_request(&inner, pq.clone(), mq.clone(), true).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 0, "已撤队列：出集，不滞留");
+
+        // 先撤再提交：进得了集合，run 立刻又把它摘掉
+        let pq2 = PopProcessQueue::new();
+        pq2.set_dropped(true);
+        submit_pop_orderly_request(&inner, pq2, mq.clone(), false).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 0);
+    }
+
+    /// 活队列上的 run 就是 POPTODO 本体：既不消费也不摘条目（等 Java 上游补齐再移植）。
+    #[tokio::test]
+    async fn pop_orderly_run_on_live_queue_is_noop() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let inner = consumer.inner.clone();
+        let pq = PopProcessQueue::new();
+        let mq = queue("T", "broker-a", 0);
+        submit_pop_orderly_request(&inner, pq.clone(), mq.clone(), false).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 1);
+        run_pop_orderly_request(inner, pq, mq).await;
+        assert_eq!(consumer.pop_orderly_request_count(), 1);
     }
 
     // ---------------- 消费结果与投递前还原 ----------------

@@ -877,6 +877,9 @@ class DefaultMQPushConsumer:
         # 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
         self._pop_queues: Dict[str, PopProcessQueue] = {}
         self._pop_executor: Optional[ConsumeExecutor] = None
+        # POP 顺序请求去重集（Java ConcurrentSet<ConsumeRequest>，相等性 =
+        # (shardingKeyIndex, pq 引用, mq)；shardingKeyIndex 恒 0，pq 用对象身份）
+        self._pop_orderly_requests: set = set()
         # ---- 消息轨迹（对应 Java ClientConfig.enableTrace / traceTopic）----
         # 开启后 start() 注册 ConsumeMessageTraceHook，落 SubBefore/SubAfter 两段轨迹
         self.enable_trace = False
@@ -1497,8 +1500,11 @@ class DefaultMQPushConsumer:
             self._persist_offsets_once()
         except Exception as e:  # noqa: BLE001
             logger.debug("persist offsets on shutdown failed: %s", e)
-        # 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）
-        if self._is_orderly() and self.message_model != MessageModel.BROADCASTING:
+        # 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）。
+        # POP 顺序服务（ConsumeMessagePopOrderlyService.shutdown:79-87 → unlockAll）走同一个
+        # RebalanceImpl.unlockAll，而它只读 processQueueTable —— POP 模式下是空表，不发报文。
+        if self._is_orderly() and not self.pop_mode \
+                and self.message_model != MessageModel.BROADCASTING:
             try:
                 mqs = self._assigned_queues()
                 if mqs:
@@ -1744,7 +1750,10 @@ class DefaultMQPushConsumer:
                     client.update_consumer_offset(self.consumer_group, mq, off)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("persist offset on revoke failed for %s: %s", mq, e)
-            if self._is_orderly():
+            # 撤队列时的单队列解锁只属于 classic 顺序（Java
+            # RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 拿的是 processQueueTable
+            # 里的 ProcessQueue —— POP 模式下那张表是空的，这条路径根本不会跑）。
+            if self._is_orderly() and not self.pop_mode:
                 # 顺序消费：释放 broker 队列锁，新属主才能立刻接上
                 try:
                     client.unlock_batch_mq(self.consumer_group, self.client_id or "", [mq])
@@ -2102,10 +2111,18 @@ class DefaultMQPushConsumer:
 
     def _submit_pop_consume_request(self, msgs: List[MessageExt], pq: PopProcessQueue,
                                     mq: MessageQueue) -> None:
-        """按 consume_message_batch_max_size 切批后投给消费线程池。
+        """Java DefaultMQPushConsumerImpl:960-990 按 listener 类型选服务：顺序监听器 +
+        POP 走 ConsumeMessagePopOrderlyService。上游 5.5.0 那是个未完成骨架（:533
+        POPTODO）：请求去重入队后 run() 拿到队列锁就返回 —— 消息**不消费、不 ack**，
+        invisibleTime 到期由 broker 复活重投，宏观表现是「顺序 + POP 收不到消息且积压
+        不消」。照抄这个行为，别"修好"：POP 路径的顺序语义（队列锁、COMMIT/ROLLBACK）
+        上游还没定论。msgs 在这条路径被忽略（Java 的 ConsumeRequest 只带 pq + mq）。
 
-        对应 Java ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest。
+        并发监听器走 ConsumeMessagePopConcurrentlyService（见下）。
         """
+        if self._is_orderly():
+            self._submit_pop_orderly_request(pq, mq)
+            return
         size = max(1, self.consume_message_batch_max_size)
         batches = [msgs[i:i + size] for i in range(0, len(msgs), size)] or [msgs]
         for batch in batches:
@@ -2116,6 +2133,45 @@ class DefaultMQPushConsumer:
             else:
                 # 未起线程池（单测或未 start）：同步执行
                 self._consume_pop_batch(batch, pq, mq)
+
+    def _submit_pop_orderly_request(self, pq: PopProcessQueue, mq: MessageQueue,
+                                    force: bool = False) -> None:
+        """对应 Java ConsumeMessagePopOrderlyService.submitConsumeRequest:178-191：
+        锁下去重（Java：MessageQueueLock + ConcurrentSet），新请求才投执行器。
+        Java 的每 key 锁折进 self._lock：临界区只有一次集合操作。
+        """
+        with self._lock:
+            is_new = (pq, mq) not in self._pop_orderly_requests
+            if is_new:
+                self._pop_orderly_requests.add((pq, mq))
+            if not force and not is_new:
+                return
+        if self._pop_executor is not None:
+            try:
+                self._pop_executor.submit(self._run_pop_orderly_request, pq, mq)
+            except Exception as e:  # noqa: BLE001
+                # Java :185-188 —— 提交失败只打日志，请求留在集合里（不会自动重投）。
+                logger.error("error submit pop orderly request: %s, mq: %s", e, mq)
+        else:
+            # 未起线程池（单测或未 start）：同步执行
+            self._run_pop_orderly_request(pq, mq)
+
+    def _run_pop_orderly_request(self, pq: PopProcessQueue, mq: MessageQueue) -> None:
+        """对应 Java ConsumeMessagePopOrderlyService$ConsumeRequest.run:315-324 —— 上游
+        5.5.0 的骨架到此为止：pq 被撤销才摘请求（Java removeConsumeRequest 同款日志）；
+        否则拿到队列锁就**什么都不做**。fetchLockObject 的对应物是调用方的去重集。
+        """
+        if pq.is_dropped():
+            logger.warning("run, message queue not be able to consume, because it's dropped. %s",
+                           mq)
+            with self._lock:
+                self._pop_orderly_requests.discard((pq, mq))
+            return
+
+    def pop_orderly_request_count(self) -> int:
+        """请求集条数（Java consumeRequestSet.size()；去重行为要能离线锁死）。"""
+        with self._lock:
+            return len(self._pop_orderly_requests)
 
     def _consume_pop_batch(self, msgs: List[MessageExt], pq: PopProcessQueue,
                            mq: MessageQueue) -> None:
@@ -3002,16 +3058,20 @@ class DefaultMQPushConsumer:
         # Java ConsumeMessageOrderlyService.lockMQ：每 20s 批量锁分到的队列；
         # 启动时立刻尝试一次，避免首个 20s 空转
         while not self._stop.is_set():
-            try:
-                mqs = self._assigned_queues()
-                if mqs:
-                    ok = client.lock_batch_mq(self.consumer_group, self.client_id or "", mqs)
-                    ok_keys = {"%s%s%d" % (m.topic, m.broker_name, m.queue_id) for m in ok}
-                    with self._lock:
-                        self._lock_ok = ok_keys
-                    logger.debug("lock_batch_mq: %d/%d queues locked", len(ok_keys), len(mqs))
-            except Exception as e:  # noqa: BLE001
-                logger.debug("lock mq error: %s", e)
+            # POP 顺序（Java ConsumeMessagePopOrderlyService.start:68-77）同样跑这个 20s
+            # 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
+            # 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
+            if not self.pop_mode:
+                try:
+                    mqs = self._assigned_queues()
+                    if mqs:
+                        ok = client.lock_batch_mq(self.consumer_group, self.client_id or "", mqs)
+                        ok_keys = {"%s%s%d" % (m.topic, m.broker_name, m.queue_id) for m in ok}
+                        with self._lock:
+                            self._lock_ok = ok_keys
+                        logger.debug("lock_batch_mq: %d/%d queues locked", len(ok_keys), len(mqs))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("lock mq error: %s", e)
             self._stop.wait(20.0)
 
     def _is_orderly(self) -> bool:

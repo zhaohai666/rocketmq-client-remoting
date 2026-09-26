@@ -436,6 +436,28 @@ public:
     // 按消息现带的重试次数拼那条发往 %RETRY%group 的普通消息。两条回投链路共用，只有
     // maxReconsumeTimes 的口径不同（Java 两处各调各的 getMaxReconsumeTimes），所以显式传。
     Message buildRetryMessage(const MessageExt& msg, int32_t maxReconsumeTimes) const;
+
+    // ---- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）----
+    // 上游 5.5.0：请求去重入队后 run() 拿到队列锁就返回（POPTODO，
+    // DefaultMQPushConsumerImpl:533）——消息**不消费、不 ack**，invisibleTime 到期由
+    // broker 复活重投，宏观表现是「顺序 + POP 收不到消息、积压不消」。骨架里的
+    // checkReconsumeTimes / sendMessageBack / submitConsumeRequestLater / processConsumeResult
+    // 随上游一起未被接通，等上游补齐时再移植。
+    // POP 弹出批次的统一入口（Java service 接口的公开方法）：顺序监听器分流进
+    // submitPopOrderlyRequest 骨架，并发监听器走 ConsumeMessagePopConcurrentlyService。
+    // 与 consumeBatch 一起开放给单测：分派错了很安静（顺序消息被消费 / 并发消息消失）。
+    void submitPopConsumeRequest(std::vector<MessageExt> msgs,
+                                 std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
+    // 提交一份 POP 顺序请求（Java submitConsumeRequest:178-191）：force=false 时按
+    // (pq, mq) 去重，重复请求直接丢弃。
+    void submitPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
+                                 const MessageQueue& mq, bool force);
+    // 请求的执行体（Java ConsumeRequest.run:315-324）：pq 被撤销才摘请求；否则拿到
+    // 队列锁就什么都不做 —— 不调 listener、不 ack。
+    void runPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq, const MessageQueue& mq);
+    // 请求集条数（Java consumeRequestSet.size()；去重行为要能离线锁死）
+    size_t popOrderlyRequestCount() const;
+
     // 登记「本实例已分配到这条队列」（Java ProcessQueueTable / Python `_mq_map`）。
     // topic 级流控阈值要靠它把同 topic 的兄弟队列聚起来。
     void setAssignedQueue(const std::string& key, const MessageQueue& mq);
@@ -543,9 +565,6 @@ private:
     // ---- POP 消费循环（5.x 轻量消费，对应 Java popMessage 回调 + ConsumeMessagePopConcurrentlyService）----
     // 单队列 POP 循环。**不查、不提交消费位点**：进度由 broker 侧 checkpoint 跟踪，确认只靠 ack。
     void queuePopLoop(const MessageQueue& mq, uint64_t token);
-    // 按 consumeMessageBatchMaxSize 切批投递
-    void submitPopConsumeRequest(std::vector<MessageExt> msgs,
-                                 std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
     // 消费一个批次并按结果 ack / 延长不可见时间
     void consumePopBatch(std::vector<MessageExt> msgs,
                          std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
@@ -622,6 +641,10 @@ private:
     mutable std::map<std::string, int64_t> msgAccCntTable_;
     // POP 消费执行器（start 且 popMode_ 时创建；stop 时 shutdown）
     std::shared_ptr<ConsumeExecutor> popConsumeExecutor_;
+    // POP 顺序请求去重集（Java ConcurrentSet<ConsumeRequest>，相等性 =
+    // (shardingKeyIndex, pq 引用, mq)；shardingKeyIndex 恒 0，pq 用指针身份 ——
+    // rebalance 撤走队列换新 PopProcessQueue 后，新请求照常入队）
+    std::set<std::pair<const PopProcessQueue*, MessageQueue>> popOrderlyRequests_;
 
     int32_t pullBatchSize_ = 32;
     int32_t pullBatchSizeInBytes_ = 256 * 1024;
