@@ -1,4 +1,6 @@
 // org.apache.rocketmq.common.MixAll 的 C# 对应：全局常量与静态工具。
+using System.Globalization;
+
 namespace RocketMQ.Common;
 
 public static class MixAll
@@ -103,6 +105,21 @@ public static class MixAll
     public static string GetDlqTopic(string consumerGroup) => DlqGroupTopicPrefix + consumerGroup;
 
     public static bool IsDlqTopic(string topic) => topic.StartsWith(DlqGroupTopicPrefix, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Java <c>MixAll.brokerVIPChannel</c>：VIP 通道 = 端口 - 2。
+    /// 端口不可解析时原样返回（Java 会抛 NumberFormatException，这里不让调用方崩）。
+    /// </summary>
+    public static string BrokerVipChannel(bool isChange, string brokerAddr)
+    {
+        if (!isChange) return brokerAddr;
+        int index = brokerAddr.LastIndexOf(':');
+        if (index <= 0) return brokerAddr;
+        string host = brokerAddr[..index];
+        string port = brokerAddr[(index + 1)..];
+        if (!long.TryParse(port, CultureInfo.InvariantCulture, out long portNum)) return brokerAddr;
+        return host + ":" + (portNum - 2).ToString(CultureInfo.InvariantCulture);
+    }
 
     /// <summary>
     /// 应答 topic = &lt;cluster&gt;_REPLY_TOPIC（Java MixAll.getReplyTopic）。

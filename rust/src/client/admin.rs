@@ -106,6 +106,11 @@ pub struct AdminConfig {
     /// ⚠ admin 没有 `unitMode` 的落点：管理端不发普通消息、也不做消息过滤，
     /// Java 的 `DefaultMQAdminExtImpl` 全程没读过 `isUnitMode()`，所以这里不设该字段。
     pub enable_stream_request_type: bool,
+    /// Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 请求
+    /// 改走 VIP 端口（端口 - 2，[`MixAll::broker_vip_channel`]）。只对本 admin 的
+    /// broker 调用生效——admin 不发消息、不注册消费者，普通收发路径的同一开关
+    /// 在本项目四端均未接线。
+    pub vip_channel_enabled: bool,
     /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
     /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
     pub poll_name_server_interval_millis: u64,
@@ -122,6 +127,7 @@ impl Default for AdminConfig {
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
             enable_stream_request_type: false,
+            vip_channel_enabled: false,
             // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
             poll_name_server_interval_millis: 30_000,
             client_id: None,
@@ -321,6 +327,42 @@ fn effective_timeout(configured: i64, explicit: Option<i64>) -> i64 {
     explicit.filter(|t| *t > 0).unwrap_or(configured)
 }
 
+// ---------------------------------------------------------------- 消息轨迹 DTO
+
+/// 对应 Java `org.apache.rocketmq.tools.admin.api.TrackType`（字符串值即枚举名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackType {
+    Consumed,
+    ConsumedButFiltered,
+    Pull,
+    NotConsumeYet,
+    NotOnline,
+    ConsumeBroadcasting,
+    Unknown,
+}
+
+impl TrackType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrackType::Consumed => "CONSUMED",
+            TrackType::ConsumedButFiltered => "CONSUMED_BUT_FILTERED",
+            TrackType::Pull => "PULL",
+            TrackType::NotConsumeYet => "NOT_CONSUME_YET",
+            TrackType::NotOnline => "NOT_ONLINE",
+            TrackType::ConsumeBroadcasting => "CONSUME_BROADCASTING",
+            TrackType::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// 对应 Java `MessageTrack`：一条消息在某消费组的投递判定。
+#[derive(Debug, Clone)]
+pub struct MessageTrack {
+    pub consumer_group: String,
+    pub track_type: TrackType,
+    pub exception_desc: Option<String>,
+}
+
 // ---------------------------------------------------------------- facade
 
 /// 管理客户端（对应 Java `DefaultMQAdminExt`，移植自 Python `admin.DefaultMQAdminExt`）。
@@ -421,6 +463,11 @@ impl DefaultMQAdminExt {
     /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
+    }
+
+    /// Java `ClientConfig#setVipChannelEnabled`。
+    pub fn set_vip_channel_enabled(&self, enable: bool) {
+        self.update_config(|c| c.vip_channel_enabled = enable);
     }
 
     /// Java `ClientConfig#setPollNameServerInterval`。
@@ -575,6 +622,8 @@ impl DefaultMQAdminExt {
     ) -> Result<RemotingCommand> {
         let client = self.require_client()?;
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        // Java `brokerVIPChannel(vipChannelEnabled, addr)`：开 VIP 时端口 - 2
+        let addr = &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, addr);
         let mut request = build_request(code, ext, body);
         let response = client.invoke_sync(addr, &mut request, timeout).await?;
         MQClientInstance::check_response(&response)?;
@@ -745,6 +794,23 @@ impl DefaultMQAdminExt {
             .await
     }
 
+    /// 显式给定 NameServer 地址的同步调用（不走 VIP 通道——`invoke_broker` 开 VIP
+    /// 时会把端口 -2，NameServer 端口不能跟着改）。
+    async fn invoke_namesrv_addr(
+        &self,
+        addr: &str,
+        code: i32,
+        ext: &StringMap,
+        timeout_millis: Option<i64>,
+    ) -> Result<RemotingCommand> {
+        let client = self.require_client()?;
+        let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        let mut request = build_request(code, ext, None);
+        let response = client.invoke_sync(addr, &mut request, timeout).await?;
+        MQClientInstance::check_response(&response)?;
+        Ok(response)
+    }
+
     /// Python `delete_topic_in_name_server`：不给地址列表就清自己配的全部 NameServer。
     pub async fn delete_topic_in_name_server(
         &self,
@@ -757,14 +823,8 @@ impl DefaultMQAdminExt {
         };
         let ext = ext_pairs(&[("topic", topic.to_string())]);
         for ns_addr in targets {
-            self.invoke_broker(
-                &ns_addr,
-                request_code::DELETE_TOPIC_IN_NAMESRV,
-                &ext,
-                None,
-                None,
-            )
-            .await?;
+            self.invoke_namesrv_addr(&ns_addr, request_code::DELETE_TOPIC_IN_NAMESRV, &ext, None)
+                .await?;
         }
         Ok(())
     }
@@ -1115,13 +1175,7 @@ impl DefaultMQAdminExt {
     ) -> Result<i64> {
         let ext = ext_pairs(&[("brokerName", broker_name.to_string())]);
         let response = self
-            .invoke_broker(
-                namesrv_addr,
-                request_code::WIPE_WRITE_PERM_OF_BROKER,
-                &ext,
-                None,
-                None,
-            )
+            .invoke_namesrv_addr(namesrv_addr, request_code::WIPE_WRITE_PERM_OF_BROKER, &ext, None)
             .await?;
         Ok(ext_int(&response, "wipeTopicCount"))
     }
@@ -1134,13 +1188,7 @@ impl DefaultMQAdminExt {
     ) -> Result<i64> {
         let ext = ext_pairs(&[("brokerName", broker_name.to_string())]);
         let response = self
-            .invoke_broker(
-                namesrv_addr,
-                request_code::ADD_WRITE_PERM_OF_BROKER,
-                &ext,
-                None,
-                None,
-            )
+            .invoke_namesrv_addr(namesrv_addr, request_code::ADD_WRITE_PERM_OF_BROKER, &ext, None)
             .await?;
         Ok(ext_int(&response, "addTopicCount"))
     }
@@ -1341,7 +1389,12 @@ impl DefaultMQAdminExt {
             }
             let mut request =
                 build_request(request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, &ext, None);
-            let response = client.invoke_sync(broker_addr, &mut request, left).await?;
+            let response = client.invoke_sync(
+                &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, broker_addr),
+                &mut request,
+                left,
+            )
+            .await?;
             if response.code != response_code::SUCCESS {
                 return Err(Error::Broker {
                     response_code: response.code,
@@ -1633,6 +1686,179 @@ impl DefaultMQAdminExt {
             )),
             None => Ok(Vec::new()),
         }
+    }
+
+    // ---------------- 消息轨迹（Java DefaultMQAdminExtImpl.messageTrackDetail） ----------------
+
+    /// 对应 Java `examineConsumeStats(group[, topic])`（:389-424）：按 `%RETRY%<group>`
+    /// 的路由扇出全部 broker，逐台取统计并合并（offsetTable 并入、consumeTps 累加）；
+    /// 全空时抛错（Java 的 MQClientException 同口径）。
+    pub async fn examine_consume_stats_group(
+        &self,
+        consumer_group: &str,
+        topic: Option<&str>,
+    ) -> Result<ConsumeStats> {
+        let route = self
+            .examine_topic_route(&MixAll::get_retry_topic(consumer_group))
+            .await?;
+        let mut result = ConsumeStats::new();
+        for bd in &route.broker_datas {
+            if let Some(addr) = bd.select_broker_addr() {
+                let part = self
+                    .examine_consume_stats(&addr, consumer_group, topic, None)
+                    .await?;
+                for (key, wrapper) in part.offset_table {
+                    match result.offset_table.iter_mut().find(|(k, _)| *k == key) {
+                        Some(slot) => slot.1 = wrapper,
+                        None => result.offset_table.push((key, wrapper)),
+                    }
+                }
+                result.consume_tps += part.consume_tps;
+            }
+        }
+        if result.offset_table.is_empty() {
+            return Err(Error::client_with_code(
+                response_code::CONSUMER_NOT_ONLINE,
+                format!("no consume stats for group {consumer_group}"),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// 对应 Java `DefaultMQAdminExtImpl.consumed:1533-1557`：该组在本队列的
+    /// consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
+    pub async fn consumed(&self, msg: &MessageExt, group: &str) -> Result<bool> {
+        let cstats = self.examine_consume_stats_group(group, None).await?;
+        let ci = self.examine_broker_cluster_info().await?;
+        let store_host = msg.get_store_host_string();
+        for (key, wrapper) in &cstats.offset_table {
+            if key.topic == msg.topic && key.queue_id == msg.queue_id {
+                let broker_addrs = ci
+                    .broker_addr_table
+                    .iter()
+                    .find(|(name, _)| *name == key.broker_name)
+                    .map(|(_, addrs)| addrs);
+                if let Some(addrs) = broker_addrs {
+                    let addr = addrs
+                        .iter()
+                        .find(|(id, _)| *id == MixAll::MASTER_ID as i64)
+                        .map(|(_, a)| a);
+                    // Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
+                    // 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
+                    if let (Some(addr), Some(store_host)) = (addr, store_host.as_deref()) {
+                        if *addr == store_host && wrapper.consumer_offset > msg.queue_offset {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// 对应 Java `DefaultMQAdminExtImpl.messageTrackDetail:1349-1427`：查谁在消费
+    /// 这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
+    pub async fn message_track_detail(&self, msg: &MessageExt) -> Result<Vec<MessageTrack>> {
+        let mut result: Vec<MessageTrack> = Vec::new();
+        let route = self.examine_topic_route(&msg.topic).await?;
+        let mut broker_addr: Option<String> = None;
+        for bd in &route.broker_datas {
+            if let Some(addr) = bd.select_broker_addr() {
+                broker_addr = Some(addr);
+                break;
+            }
+        }
+        let Some(broker_addr) = broker_addr else {
+            return Ok(result);
+        };
+        let mut groups = self
+            .query_topic_consume_by_who(&broker_addr, &msg.topic)
+            .await?;
+        groups.sort(); // Java 按 broker 返回顺序遍历；这里排序让输出确定
+        for group in groups {
+            let mut mt = MessageTrack {
+                consumer_group: group.clone(),
+                track_type: TrackType::Unknown,
+                exception_desc: None,
+            };
+            let cc = match self.examine_consumer_connection_info(&group, None).await {
+                Ok(cc) => cc,
+                Err(e) => {
+                    if e.response_code() == Some(response_code::CONSUMER_NOT_ONLINE) {
+                        mt.track_type = TrackType::NotOnline;
+                    }
+                    mt.exception_desc = Some(format!("CODE:{:?} DESC:{e}", e.response_code()));
+                    result.push(mt);
+                    continue;
+                }
+            };
+
+            match cc.consume_type.as_deref() {
+                Some("CONSUME_ACTIVELY") => mt.track_type = TrackType::Pull,
+                Some("CONSUME_PASSIVELY") => {
+                    let if_consumed = match self.consumed(msg, &group).await {
+                        Ok(v) => v,
+                        Err(e) => match e.response_code() {
+                            Some(code)
+                                if code == response_code::CONSUMER_NOT_ONLINE
+                                    || code == response_code::BROADCAST_CONSUMPTION =>
+                            {
+                                if code == response_code::CONSUMER_NOT_ONLINE {
+                                    mt.track_type = TrackType::NotOnline;
+                                    mt.exception_desc =
+                                        Some(format!("CODE:{code} DESC:{e}"));
+                                } else {
+                                    mt.track_type = TrackType::ConsumeBroadcasting;
+                                }
+                                result.push(mt);
+                                continue;
+                            }
+                            _ => {
+                                mt.exception_desc = Some(format!("{e}"));
+                                result.push(mt);
+                                continue;
+                            }
+                        },
+                    };
+
+                    if if_consumed {
+                        mt.track_type = TrackType::Consumed;
+                        // Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
+                        // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
+                        // 为空，同样落回 CONSUMED —— 忠实保留 Java 语义）。
+                        let sub = cc
+                            .subscription_table
+                            .iter()
+                            .find(|(topic, _)| *topic == msg.topic)
+                            .map(|(_, v)| v);
+                        if let Some(sub) = sub {
+                            let tags_set: Vec<String> = sub
+                                .get("tagsSet")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let msg_tag = msg.get_tags();
+                            if !tags_set.is_empty()
+                                && !tags_set.iter().any(|t| t == "*")
+                                && !tags_set.iter().any(|t| Some(t.as_str()) == msg_tag)
+                            {
+                                mt.track_type = TrackType::ConsumedButFiltered;
+                            }
+                        }
+                    } else {
+                        mt.track_type = TrackType::NotConsumeYet;
+                    }
+                }
+                _ => {}
+            }
+            result.push(mt);
+        }
+        Ok(result)
     }
 
     /// 对应 Java `MQClientAPIImpl#queryTopicsByConsumer:2525`（343）的单 broker 原始调用。
@@ -1972,7 +2198,11 @@ impl DefaultMQAdminExt {
             request.language = language_code::CPP;
         }
         let response = client
-            .invoke_sync(broker_addr, &mut request, self.timeout_millis())
+            .invoke_sync(
+                &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, broker_addr),
+                &mut request,
+                self.timeout_millis(),
+            )
             .await?;
         if response.code != response_code::SUCCESS {
             return Err(Error::client_with_code(
@@ -2351,6 +2581,32 @@ mod tests {
         assert!(cfg.kv_namespace_to_delete_list.is_empty());
         assert!(!admin.is_started());
         assert_eq!(admin.client_id(), "");
+        // Java ClientConfig#vipChannelEnabled 5.x 默认 false
+        assert!(!cfg.vip_channel_enabled);
+    }
+
+    /// VIP 通道开关：set 之后生效（默认 false，配合 mix_all 的
+    /// `broker_vip_channel` 端口减 2 测试覆盖取址语义）。
+    #[test]
+    fn vip_channel_knob_defaults_off_and_toggles() {
+        let admin = DefaultMQAdminExt::new();
+        assert!(!admin.config().vip_channel_enabled);
+        admin.set_vip_channel_enabled(true);
+        assert!(admin.config().vip_channel_enabled);
+        admin.set_vip_channel_enabled(false);
+        assert!(!admin.config().vip_channel_enabled);
+    }
+
+    /// TrackType 字符串值必须与 Java 枚举名逐字一致（探针/控制台按名字展示）。
+    #[test]
+    fn track_type_names_match_java() {
+        assert_eq!(TrackType::Consumed.as_str(), "CONSUMED");
+        assert_eq!(TrackType::ConsumedButFiltered.as_str(), "CONSUMED_BUT_FILTERED");
+        assert_eq!(TrackType::Pull.as_str(), "PULL");
+        assert_eq!(TrackType::NotConsumeYet.as_str(), "NOT_CONSUME_YET");
+        assert_eq!(TrackType::NotOnline.as_str(), "NOT_ONLINE");
+        assert_eq!(TrackType::ConsumeBroadcasting.as_str(), "CONSUME_BROADCASTING");
+        assert_eq!(TrackType::Unknown.as_str(), "UNKNOWN");
     }
 
     #[test]

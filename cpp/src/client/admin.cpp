@@ -297,7 +297,7 @@ TopicConfig DefaultMQAdminExt::examineTopicConfig(const std::string& addr,
     ext["topic"] = topic;
     ext["lo"] = "true";
     RemotingCommand response = requireClient().invokeSync(
-        addr, RequestCode::GET_TOPIC_CONFIG, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(addr), RequestCode::GET_TOPIC_CONFIG, ext, Bytes(), false, timeoutMillis_);
     if (response.body.empty()) {
         throw MQBrokerException(ResponseCode::SYSTEM_ERROR, "empty topic config for " + topic);
     }
@@ -311,7 +311,7 @@ TopicConfig DefaultMQAdminExt::examineTopicConfig(const std::string& addr,
 TopicConfigSerializeWrapper DefaultMQAdminExt::getAllTopicConfig(const std::string& brokerAddr,
                                                                 int32_t timeoutMillis) {
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_ALL_TOPIC_CONFIG, PropertyMap(), Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::GET_ALL_TOPIC_CONFIG, PropertyMap(), Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
     TopicConfigSerializeWrapper w;
     if (!response.body.empty()) {
@@ -344,7 +344,7 @@ TopicConfigSerializeWrapper DefaultMQAdminExt::getUserTopicConfig(
 TopicList DefaultMQAdminExt::getSystemTopicListFromBroker(const std::string& brokerAddr,
                                                          int32_t timeoutMillis) {
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_SYSTEM_TOPIC_LIST_FROM_BROKER, PropertyMap(), Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::GET_SYSTEM_TOPIC_LIST_FROM_BROKER, PropertyMap(), Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
     TopicList tl;
     if (!response.body.empty()) TopicList::decode(response.body, tl);
@@ -377,7 +377,7 @@ TopicStatsTable DefaultMQAdminExt::examineTopicStatsByBroker(const std::string& 
     PropertyMap ext;
     ext["topic"] = topic;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_TOPIC_STATS_INFO, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(brokerAddr), RequestCode::GET_TOPIC_STATS_INFO, ext, Bytes(), false, timeoutMillis_);
     TopicStatsTable t;
     if (!response.body.empty()) TopicStatsTable::decode(response.body, t);
     return t;
@@ -391,7 +391,7 @@ ClusterInfo DefaultMQAdminExt::fetchBrokerClusterInfo() {
 KVTable DefaultMQAdminExt::fetchBrokerRuntimeStats(const std::string& brokerAddr,
                                                   int32_t timeoutMillis) {
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_BROKER_RUNTIME_INFO, PropertyMap(), Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::GET_BROKER_RUNTIME_INFO, PropertyMap(), Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
     KVTable t;
     if (!response.body.empty()) KVTable::decode(response.body, t);
@@ -403,7 +403,7 @@ PropertyMap DefaultMQAdminExt::getBrokerConfig(const std::string& brokerAddr,
     // ⚠ 响应体是 **properties 文本**（"k=v\n"），不是 JSON/KVTable。
     // 早期实现把它当 KVTable JSON 解析，真实 broker 上必然失败。
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_BROKER_CONFIG, PropertyMap(), Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::GET_BROKER_CONFIG, PropertyMap(), Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
     return MixAll::string2Properties(response.body);
 }
@@ -427,7 +427,7 @@ void DefaultMQAdminExt::updateBrokerConfig(const std::string& brokerAddr,
     }
     std::string text = MixAll::properties2String(properties);
     if (text.empty()) return;
-    requireClient().invokeSync(brokerAddr, RequestCode::UPDATE_BROKER_CONFIG, PropertyMap(),
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::UPDATE_BROKER_CONFIG, PropertyMap(),
                                text, true, timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
 }
 
@@ -455,8 +455,8 @@ bool DefaultMQAdminExt::cleanUnusedTopic(const std::string& clusterName,
     bool ok = true;
     for (const std::string& addr : brokerAddrsOfCluster(client, clusterName)) {
         try {
-            client.invokeSync(addr, RequestCode::CLEAN_UNUSED_TOPIC, PropertyMap(), Bytes(), false,
-                              timeoutMillis_);
+            client.invokeSync(vipAddr(addr), RequestCode::CLEAN_UNUSED_TOPIC, PropertyMap(), Bytes(),
+                              false, timeoutMillis_);
         } catch (const std::exception& e) {
             logger_warn("cleanUnusedTopic on " + addr + " failed: " + std::string(e.what()));
             ok = false;
@@ -472,7 +472,7 @@ JsonValue DefaultMQAdminExt::viewBrokerStatsData(const std::string& brokerAddr,
     ext["statsName"] = statsName;
     ext["statsKey"] = statsKey;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::VIEW_BROKER_STATS_DATA, ext);
+        vipAddr(brokerAddr), RequestCode::VIEW_BROKER_STATS_DATA, ext);
     JsonValue v;
     if (response.body.empty()) return JsonValue::makeNull();
     RemotingSerializable::decode(response.body, v);
@@ -571,7 +571,7 @@ KVTable DefaultMQAdminExt::getKvListByNamespace(const std::string& ns) {
 void DefaultMQAdminExt::createAndUpdateSubscriptionGroupConfig(
     const std::string& addr, const SubscriptionGroupConfig& config) {
     Bytes body = config.encode();
-    requireClient().invokeSync(addr, RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP,
+    requireClient().invokeSync(vipAddr(addr), RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP,
                                PropertyMap(), body, true, timeoutMillis_);
 }
 
@@ -591,7 +591,8 @@ bool DefaultMQAdminExt::getSubscriptionGroupConfig(const std::string& addr,
     PropertyMap ext;
     ext["group"] = group;
     RemotingCommand response = requireClient().invokeSync(
-        addr, RequestCode::GET_SUBSCRIPTIONGROUP_CONFIG, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(addr), RequestCode::GET_SUBSCRIPTIONGROUP_CONFIG, ext, Bytes(), false,
+        timeoutMillis_);
     if (response.body.empty()) return false;
     return SubscriptionGroupConfig::decode(response.body, out);
 }
@@ -621,7 +622,7 @@ SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::s
         if (haveVersion) ext["dataVersion"] = dvText(currentDataVersion);
 
         RemotingCommand response = client.invokeSyncRaw(
-            brokerAddr, RequestCode::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, ext, Bytes(), false,
+            vipAddr(brokerAddr), RequestCode::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, ext, Bytes(), false,
             static_cast<int32_t>(left));
         if (response.code != ResponseCode::SUCCESS) {
             throw MQBrokerException(response.code, response.remark);
@@ -689,8 +690,8 @@ void DefaultMQAdminExt::deleteSubscriptionGroup(const std::string& addr,
     PropertyMap ext;
     ext["groupName"] = groupName;
     ext["cleanOffset"] = removeOffset ? "true" : "false";
-    requireClient().invokeSync(addr, RequestCode::DELETE_SUBSCRIPTIONGROUP, ext, Bytes(), false,
-                               timeoutMillis_);
+    requireClient().invokeSync(vipAddr(addr), RequestCode::DELETE_SUBSCRIPTIONGROUP, ext, Bytes(),
+                               false, timeoutMillis_);
 }
 
 // ---------------------------------------------------------------- 连接信息
@@ -700,7 +701,7 @@ ConsumerConnection DefaultMQAdminExt::examineConsumerConnectionInfo(
     std::string addr = brokerAddr.empty() ? findFirstBrokerAddr(client) : brokerAddr;
     PropertyMap ext;
     ext["consumerGroup"] = consumerGroup;
-    RemotingCommand response = client.invokeSync(addr, RequestCode::GET_CONSUMER_CONNECTION_LIST,
+    RemotingCommand response = client.invokeSync(vipAddr(addr), RequestCode::GET_CONSUMER_CONNECTION_LIST,
                                                  ext, Bytes(), false, timeoutMillis_);
     if (response.body.empty()) {
         throw MQClientException("consumer group " + consumerGroup + " not online");
@@ -716,7 +717,7 @@ ProducerConnection DefaultMQAdminExt::examineProducerConnectionInfo(
     std::string addr = brokerAddr.empty() ? findFirstBrokerAddr(client) : brokerAddr;
     PropertyMap ext;
     ext["producerGroup"] = producerGroup;
-    RemotingCommand response = client.invokeSync(addr, RequestCode::GET_PRODUCER_CONNECTION_LIST,
+    RemotingCommand response = client.invokeSync(vipAddr(addr), RequestCode::GET_PRODUCER_CONNECTION_LIST,
                                                  ext, Bytes(), false, timeoutMillis_);
     ProducerConnection pc;
     if (!response.body.empty()) ProducerConnection::decode(response.body, pc);
@@ -732,8 +733,8 @@ ConsumerRunningInfo DefaultMQAdminExt::examineConsumerRunningInfo(
     ext["consumerGroup"] = consumerGroup;
     ext["clientId"] = clientId;
     ext["jstackEnable"] = jstack ? "true" : "false";
-    RemotingCommand response = client.invokeSync(addr, RequestCode::GET_CONSUMER_RUNNING_INFO, ext,
-                                                 Bytes(), false, timeoutMillis_);
+    RemotingCommand response = client.invokeSync(vipAddr(addr), RequestCode::GET_CONSUMER_RUNNING_INFO,
+                                                 ext, Bytes(), false, timeoutMillis_);
     if (response.body.empty()) {
         throw MQClientException("no running info for client " + clientId);
     }
@@ -766,7 +767,7 @@ ConsumeStats DefaultMQAdminExt::examineConsumeStats(const std::string& brokerAdd
         ext["topicList"] = joined;
     }
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_CONSUME_STATS, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(brokerAddr), RequestCode::GET_CONSUME_STATS, ext, Bytes(), false, timeoutMillis_);
     ConsumeStats cs;
     if (!response.body.empty()) ConsumeStats::decode(response.body, cs);
     return cs;
@@ -778,7 +779,7 @@ ConsumeStatsList DefaultMQAdminExt::fetchConsumeStatsInBroker(const std::string&
     PropertyMap ext;
     ext["isOrder"] = isOrder ? "true" : "false";
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::GET_BROKER_CONSUME_STATS, ext, Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::GET_BROKER_CONSUME_STATS, ext, Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
     ConsumeStatsList sl;
     if (!response.body.empty()) ConsumeStatsList::decode(response.body, sl);
@@ -790,7 +791,7 @@ std::set<std::string> DefaultMQAdminExt::queryTopicConsumeByWho(const std::strin
     PropertyMap ext;
     ext["topic"] = topic;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::QUERY_TOPIC_CONSUME_BY_WHO, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(brokerAddr), RequestCode::QUERY_TOPIC_CONSUME_BY_WHO, ext, Bytes(), false, timeoutMillis_);
     std::set<std::string> groups;
     if (response.body.empty()) return groups;
     JsonValue v;
@@ -804,12 +805,170 @@ std::set<std::string> DefaultMQAdminExt::queryTopicConsumeByWho(const std::strin
     return groups;
 }
 
+ConsumeStats DefaultMQAdminExt::examineConsumeStatsGroup(const std::string& consumerGroup,
+                                                        const std::string& topic) {
+    // 对应 Java `examineConsumeStats(group[, topic])`（:389-424）：按
+    // `%RETRY%<group>` 的路由扇出全部 broker，逐台取统计并合并（offsetTable
+    // 并入、consumeTps 累加）；全空时抛错（Java 的 MQClientException 同口径，
+    // 带 CONSUMER_NOT_ONLINE 让 resetOffsetNew 式的退化分支可用）。
+    TopicRouteData route = examineTopicRoute(MixAll::getRetryTopic(consumerGroup));
+    ConsumeStats result;
+    for (const BrokerData& bd : route.brokerDatas) {
+        std::string addr = bd.selectBrokerAddr();
+        if (addr.empty()) continue;
+        ConsumeStats part = examineConsumeStats(addr, consumerGroup, topic);
+        for (const auto& kv : part.offsetTable) result.offsetTable[kv.first] = kv.second;
+        result.consumeTps += part.consumeTps;
+    }
+    if (result.offsetTable.empty()) {
+        throw MQClientException("no consume stats for group " + consumerGroup,
+                                ResponseCode::CONSUMER_NOT_ONLINE);
+    }
+    return result;
+}
+
+bool DefaultMQAdminExt::consumed(const MessageExt& msg, const std::string& consumerGroup) {
+    // 对应 Java `DefaultMQAdminExtImpl.consumed:1533-1557`：该组在本队列的
+    // consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
+    ConsumeStats cstats = examineConsumeStatsGroup(consumerGroup);
+    ClusterInfo ci = examineBrokerClusterInfo();
+    std::string storeHost = msg.getStoreHostString();
+    for (const auto& kv : cstats.offsetTable) {
+        const MessageQueue& mq = kv.first;
+        if (mq.topic != msg.topic || mq.queueId != msg.queueId) continue;
+        auto bdIt = ci.brokerAddrTable.find(mq.brokerName);
+        if (bdIt == ci.brokerAddrTable.end()) continue;
+        auto addrIt = bdIt->second.brokerAddrs.find(MixAll::MASTER_ID);
+        if (addrIt == bdIt->second.brokerAddrs.end()) continue;
+        // Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
+        // 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
+        if (storeHost.empty() || addrIt->second != storeHost) continue;
+        if (kv.second.consumerOffset > msg.getQueueOffset()) return true;
+    }
+    return false;
+}
+
+// Java 枚举名原文（对账用；C++ 成员名相同，只是给测试/日志一个稳定的字符串形态）
+const char* trackTypeName(TrackType type) {
+    switch (type) {
+        case TrackType::CONSUMED: return "CONSUMED";
+        case TrackType::CONSUMED_BUT_FILTERED: return "CONSUMED_BUT_FILTERED";
+        case TrackType::PULL: return "PULL";
+        case TrackType::NOT_CONSUME_YET: return "NOT_CONSUME_YET";
+        case TrackType::NOT_ONLINE: return "NOT_ONLINE";
+        case TrackType::CONSUME_BROADCASTING: return "CONSUME_BROADCASTING";
+        default: return "UNKNOWN";
+    }
+}
+
+namespace {
+
+// Java 分支里 exceptionDesc 的统一格式："CODE:n DESC:msg"
+std::string codeDesc(int32_t code, const std::string& msg) {
+    return "CODE:" + std::to_string(code) + " DESC:" + msg;
+}
+
+}  // namespace
+
+std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetail(const MessageExt& msg) {
+    // 对应 Java `DefaultMQAdminExtImpl.messageTrackDetail:1349-1427`：查谁在消费
+    // 这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
+    std::vector<MessageTrack> result;
+    TopicRouteData route = examineTopicRoute(msg.topic);
+    std::string brokerAddr;
+    for (const BrokerData& bd : route.brokerDatas) {
+        brokerAddr = bd.selectBrokerAddr();
+        if (!brokerAddr.empty()) break;
+    }
+    if (brokerAddr.empty()) return result;
+    std::set<std::string> groups = queryTopicConsumeByWho(brokerAddr, msg.topic);
+    // Java 按 broker 返回顺序遍历；本端拿到的是 set，排序让输出确定
+    for (const std::string& group : groups) {
+        MessageTrack mt;
+        mt.consumerGroup = group;
+        ConsumerConnection cc;
+        try {
+            cc = examineConsumerConnectionInfo(group);
+        } catch (const MQBrokerException& e) {
+            if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+                mt.trackType = TrackType::NOT_ONLINE;
+            }
+            mt.exceptionDesc = codeDesc(e.getResponseCode(), e.getResponseMessage());
+            result.push_back(mt);
+            continue;
+        } catch (const std::exception& e) {
+            mt.exceptionDesc = e.what();
+            result.push_back(mt);
+            continue;
+        }
+
+        if (cc.consumeType == "CONSUME_ACTIVELY") {
+            mt.trackType = TrackType::PULL;
+        } else if (cc.consumeType == "CONSUME_PASSIVELY") {
+            bool ifConsumed = false;
+            try {
+                ifConsumed = consumed(msg, group);
+            } catch (const MQBrokerException& e) {
+                if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+                    mt.trackType = TrackType::NOT_ONLINE;
+                    mt.exceptionDesc =
+                        codeDesc(e.getResponseCode(), e.getResponseMessage());
+                } else if (e.getResponseCode() == ResponseCode::BROADCAST_CONSUMPTION) {
+                    mt.trackType = TrackType::CONSUME_BROADCASTING;
+                }
+                result.push_back(mt);
+                continue;
+            } catch (const MQClientException& e) {
+                if (e.getResponseCode() == ResponseCode::CONSUMER_NOT_ONLINE) {
+                    mt.trackType = TrackType::NOT_ONLINE;
+                    mt.exceptionDesc = codeDesc(e.getResponseCode(), e.what());
+                } else if (e.getResponseCode() == ResponseCode::BROADCAST_CONSUMPTION) {
+                    mt.trackType = TrackType::CONSUME_BROADCASTING;
+                }
+                result.push_back(mt);
+                continue;
+            } catch (const std::exception& e) {
+                mt.exceptionDesc = e.what();
+                result.push_back(mt);
+                continue;
+            }
+
+            if (ifConsumed) {
+                mt.trackType = TrackType::CONSUMED;
+                // Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
+                // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
+                // 为空，同样落回 CONSUMED —— 忠实保留 Java 语义）。
+                const JsonValue* sub = cc.subscriptionTable.find(msg.topic);
+                if (sub != nullptr && sub->isObject()) {
+                    const JsonValue* tags = sub->find("tagsSet");
+                    std::set<std::string> tagsSet;
+                    if (tags != nullptr && tags->isArray()) {
+                        for (size_t i = 0; i < tags->size(); ++i) {
+                            if (tags->at(i).isString()) {
+                                tagsSet.insert(tags->at(i).stringValue());
+                            }
+                        }
+                    }
+                    if (!tagsSet.empty() && tagsSet.count("*") == 0
+                        && tagsSet.count(msg.getTags()) == 0) {
+                        mt.trackType = TrackType::CONSUMED_BUT_FILTERED;
+                    }
+                }
+            } else {
+                mt.trackType = TrackType::NOT_CONSUME_YET;
+            }
+        }
+        result.push_back(mt);
+    }
+    return result;
+}
+
 TopicList DefaultMQAdminExt::queryTopicsByConsumerToBroker(const std::string& brokerAddr,
                                                           const std::string& group) {
     PropertyMap ext;
     ext["group"] = group;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::QUERY_TOPICS_BY_CONSUMER, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(brokerAddr), RequestCode::QUERY_TOPICS_BY_CONSUMER, ext, Bytes(), false, timeoutMillis_);
     TopicList tl;
     if (!response.body.empty()) TopicList::decode(response.body, tl);
     return tl;
@@ -839,7 +998,7 @@ JsonValue DefaultMQAdminExt::querySubscription(const std::string& brokerAddr,
     ext["group"] = group;
     ext["topic"] = topic;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::QUERY_SUBSCRIPTION_BY_CONSUMER, ext, Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::QUERY_SUBSCRIPTION_BY_CONSUMER, ext, Bytes(), false,
         timeoutMillis_);
     JsonValue v;
     if (response.body.empty()) return JsonValue::makeNull();
@@ -855,7 +1014,7 @@ JsonValue DefaultMQAdminExt::getConsumeStatus(const std::string& brokerAddr,
     ext["group"] = group;
     ext["clientAddr"] = clientAddr;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::INVOKE_BROKER_TO_GET_CONSUMER_STATUS, ext, Bytes(), false,
+        vipAddr(brokerAddr), RequestCode::INVOKE_BROKER_TO_GET_CONSUMER_STATUS, ext, Bytes(), false,
         timeoutMillis_);
     JsonValue v;
     if (response.body.empty()) return JsonValue::makeNull();
@@ -872,8 +1031,8 @@ void DefaultMQAdminExt::cloneGroupOffset(const std::string& brokerAddr,
     ext["destGroup"] = destGroup;
     ext["topic"] = topic;
     ext["offline"] = offline ? "true" : "false";
-    requireClient().invokeSync(brokerAddr, RequestCode::CLONE_GROUP_OFFSET, ext, Bytes(), false,
-                               timeoutMillis_);
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::CLONE_GROUP_OFFSET, ext, Bytes(),
+                               false, timeoutMillis_);
 }
 
 // ---------------------------------------------------------------- Offset 管理
@@ -908,8 +1067,8 @@ int64_t DefaultMQAdminExt::earliestMsgStoreTime(const MessageQueue& mq) {
     ext["topic"] = mq.topic;
     ext["queueId"] = i64str(mq.queueId);
     ext["brokerName"] = mq.brokerName;
-    RemotingCommand response = client.invokeSync(addr, RequestCode::GET_EARLIEST_MSG_STORETIME, ext,
-                                                 Bytes(), false, timeoutMillis_);
+    RemotingCommand response = client.invokeSync(vipAddr(addr), RequestCode::GET_EARLIEST_MSG_STORETIME,
+                                                 ext, Bytes(), false, timeoutMillis_);
     return extInt(response, "timestamp", 0);
 }
 
@@ -942,7 +1101,8 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffset(
     ext["offset"] = i64str(offset);
     if (queueId >= 0) ext["queueId"] = i64str(queueId);
     RemotingCommand response = client.invokeSyncRaw(
-        brokerAddr, RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, ext, Bytes(), false, timeoutMillis_,
+        vipAddr(brokerAddr), RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, ext, Bytes(), false,
+        timeoutMillis_,
         isCpp ? LanguageCode::CPP : -1);
     if (response.code != ResponseCode::SUCCESS) {
         throw MQClientException(response.remark.empty() ? "reset offset failed" : response.remark,
@@ -1107,7 +1267,7 @@ MessageExt DefaultMQAdminExt::viewMessage(const std::string& topic, const std::s
         ext["topic"] = topic;
         ext["offset"] = i64str(offset);
         RemotingCommand response = requireClient().invokeSync(
-            addr, RequestCode::VIEW_MESSAGE_BY_ID, ext, Bytes(), false, timeoutMillis_);
+            vipAddr(addr), RequestCode::VIEW_MESSAGE_BY_ID, ext, Bytes(), false, timeoutMillis_);
         if (response.body.empty()) {
             throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
         }
@@ -1140,7 +1300,7 @@ QueryConsumeQueueResponseBody DefaultMQAdminExt::queryConsumeQueue(
     ext["count"] = i64str(count);
     ext["consumerGroup"] = consumerGroup;
     RemotingCommand response = requireClient().invokeSync(
-        brokerAddr, RequestCode::QUERY_CONSUME_QUEUE, ext, Bytes(), false, timeoutMillis_);
+        vipAddr(brokerAddr), RequestCode::QUERY_CONSUME_QUEUE, ext, Bytes(), false, timeoutMillis_);
     QueryConsumeQueueResponseBody body;
     if (!response.body.empty()) QueryConsumeQueueResponseBody::decode(response.body, body);
     return body;

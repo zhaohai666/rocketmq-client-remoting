@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "rocketmq/client/admin.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/message_const.h"
 #include "rocketmq/common/mix_all.h"
@@ -553,6 +554,45 @@ void testSearchOffsetRequestHeaderBoundaryType() {
     CHECK(!empty.boundaryType.has_value(), "缺键回 nullopt");
 }
 
+// 对应 Java MixAll.brokerVIPChannel：端口 - 2；关着/端口不可解析时原样返回。
+void testBrokerVipChannel() {
+    CHECK(MixAll::brokerVipChannel(false, "127.0.0.1:10911") == "127.0.0.1:10911",
+          "isChange=false 原样返回");
+    CHECK(MixAll::brokerVipChannel(true, "127.0.0.1:10911") == "127.0.0.1:10909",
+          "10911 ⇒ 10909");
+    CHECK(MixAll::brokerVipChannel(true, "127.0.0.1:abc") == "127.0.0.1:abc",
+          "端口不可解析原样返回（Java 抛 NumberFormatException，本端口不崩）");
+    CHECK(MixAll::brokerVipChannel(true, "127.0.0.1") == "127.0.0.1", "无冒号原样返回");
+    CHECK(MixAll::brokerVipChannel(true, "10.0.0.1:8899") == "10.0.0.1:8897", "8899 ⇒ 8897");
+}
+
+// 对应 Java org.apache.rocketmq.remoting.admin.track.TrackType 的枚举名集合。
+void testTrackTypeNamesMatchJava() {
+    CHECK(std::string(trackTypeName(TrackType::CONSUMED)) == "CONSUMED", "CONSUMED");
+    CHECK(std::string(trackTypeName(TrackType::CONSUMED_BUT_FILTERED)) == "CONSUMED_BUT_FILTERED",
+          "CONSUMED_BUT_FILTERED");
+    CHECK(std::string(trackTypeName(TrackType::PULL)) == "PULL", "PULL");
+    CHECK(std::string(trackTypeName(TrackType::NOT_CONSUME_YET)) == "NOT_CONSUME_YET",
+          "NOT_CONSUME_YET");
+    CHECK(std::string(trackTypeName(TrackType::NOT_ONLINE)) == "NOT_ONLINE", "NOT_ONLINE");
+    CHECK(std::string(trackTypeName(TrackType::CONSUME_BROADCASTING)) == "CONSUME_BROADCASTING",
+          "CONSUME_BROADCASTING");
+    CHECK(std::string(trackTypeName(TrackType::UNKNOWN)) == "UNKNOWN", "UNKNOWN");
+    MessageTrack mt;
+    CHECK(mt.trackType == TrackType::UNKNOWN && mt.exceptionDesc.empty(),
+          "MessageTrack 默认 UNKNOWN、无异常描述");
+}
+
+// 对应 Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）。
+void testAdminVipChannelKnobDefaultsOff() {
+    DefaultMQAdminExt admin;
+    CHECK(!admin.isVipChannelEnabled(), "默认 false");
+    admin.setVipChannelEnabled(true);
+    CHECK(admin.isVipChannelEnabled(), "setVipChannelEnabled(true) 生效");
+    admin.setVipChannelEnabled(false);
+    CHECK(!admin.isVipChannelEnabled(), "再关回去生效");
+}
+
 }  // namespace
 
 int main() {
@@ -572,6 +612,9 @@ int main() {
     testCreateTopicRequestHeaderSendsTopicFilterType();
     testQueryMessageRequestHeaderIndexType();
     testSearchOffsetRequestHeaderBoundaryType();
+    testBrokerVipChannel();
+    testTrackTypeNamesMatchJava();
+    testAdminVipChannelKnobDefaultsOff();
 
     std::cout << "admin: " << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;

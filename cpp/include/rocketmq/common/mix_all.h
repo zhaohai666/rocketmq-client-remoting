@@ -83,6 +83,20 @@ struct MixAll {
         return std::string(RETRY_GROUP_TOPIC_PREFIX) + consumerGroup;
     }
 
+    // 对应 Java MixAll.brokerVIPChannel：VIP 通道 = 端口 - 2。
+    // 端口不可解析时原样返回（Java 会抛 NumberFormatException，这里不让传输层崩掉）。
+    static std::string brokerVipChannel(bool isChange, const std::string& brokerAddr) {
+        if (!isChange) return brokerAddr;
+        size_t colon = brokerAddr.rfind(':');
+        if (colon == std::string::npos) return brokerAddr;
+        try {
+            int64_t port = std::stoll(brokerAddr.substr(colon + 1));
+            return brokerAddr.substr(0, colon) + ":" + std::to_string(port - 2);
+        } catch (...) {
+            return brokerAddr;
+        }
+    }
+
     static bool isRetryTopic(const std::string& topic) {
         return topic.rfind(RETRY_GROUP_TOPIC_PREFIX, 0) == 0;
     }

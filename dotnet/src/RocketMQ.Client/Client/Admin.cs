@@ -17,12 +17,40 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
 using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
+
+/// <summary>
+/// 对应 Java org.apache.rocketmq.tools.admin.api.TrackType（字符串值即枚举名）。
+/// </summary>
+public enum TrackType
+{
+    Consumed,
+    ConsumedButFiltered,
+    Pull,
+    NotConsumeYet,
+    NotOnline,
+    ConsumeBroadcasting,
+    Unknown,
+}
+
+/// <summary>对应 Java org.apache.rocketmq.tools.admin.api.MessageTrack：
+/// 一条消息在某消费组的投递判定。</summary>
+public sealed class MessageTrack
+{
+    public string ConsumerGroup { get; set; } = string.Empty;
+    public TrackType TrackType { get; set; } = TrackType.Unknown;
+    public string? ExceptionDesc { get; set; }
+
+    public override string ToString()
+        => "MessageTrack [consumerGroup=" + ConsumerGroup + ", trackType=" + TrackType
+           + ", exceptionDesc=" + ExceptionDesc + "]";
+}
 
 /// <summary>
 /// 对应 C++ DefaultMQAdminExt（org.apache.rocketmq.client.admin.DefaultMQAdminExt）。
@@ -110,6 +138,17 @@ public sealed class DefaultMQAdminExt
     }
 
     /// <summary>
+    /// Java <c>ClientConfig#vipChannelEnabled</c>（5.x 默认 false）：true 时 broker 请求
+    /// 改走 VIP 端口（端口 - 2，MixAll.BrokerVipChannel）。只对本 admin 的 broker 调用
+    /// 生效——admin 不发消息、不注册消费者，普通收发路径的同一开关本项目四端均未接线。
+    /// </summary>
+    public bool VipChannelEnabled
+    {
+        get => _vipChannelEnabled;
+        set => _vipChannelEnabled = value;
+    }
+
+    /// <summary>
     /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
     /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
     /// </summary>
@@ -131,6 +170,7 @@ public sealed class DefaultMQAdminExt
     private IRpcHook? _rpcHook;
     private string _unitName = string.Empty;
     private bool _enableStreamRequestType;
+    private bool _vipChannelEnabled;
     // Java ClientConfig#pollNameServerInterval 的默认值（:58）
     private int _pollNameServerIntervalMillis = 30000;
 
@@ -193,6 +233,10 @@ public sealed class DefaultMQAdminExt
 
         return _mqClient;
     }
+
+    /// <summary>VIP 通道开关（VipChannelEnabled）开启时把 broker 地址改写到 VIP 端口。
+    /// NameServer 调用不走这里——VIP 端口只在 broker 侧存在。</summary>
+    private string AddrForRpc(string addr) => MixAll.BrokerVipChannel(_vipChannelEnabled, addr);
 
     public MQClientInstance GetMQClientInstance() => RequireClient();
 
@@ -330,8 +374,7 @@ public sealed class DefaultMQAdminExt
         {
             try
             {
-                RemotingCommand response = client.InvokeSync(
-                    ns, RequestCode.GetTopicsByCluster, ext, null, false, _timeoutMillis);
+                RemotingCommand response = client.InvokeSync(ns, RequestCode.GetTopicsByCluster, ext, null, false, _timeoutMillis);
                 if (response.Body.Length > 0)
                 {
                     if (RemotingSerializable.Decode(response.Body, out JsonValue v))
@@ -413,8 +456,7 @@ public sealed class DefaultMQAdminExt
     public TopicConfig ExamineTopicConfig(string addr, string topic)
     {
         PropertyMap ext = new() { ["topic"] = topic, ["lo"] = "true" };
-        RemotingCommand response = RequireClient().InvokeSync(
-            addr, RequestCode.GetTopicConfig, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(addr), RequestCode.GetTopicConfig, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0)
         {
             throw new MQBrokerException(ResponseCode.SystemError, "empty topic config for " + topic);
@@ -431,8 +473,7 @@ public sealed class DefaultMQAdminExt
     public TopicConfigSerializeWrapper GetAllTopicConfig(string brokerAddr, int timeoutMillis = -1)
     {
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetAllTopicConfig, new PropertyMap(), null, false, to);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetAllTopicConfig, new PropertyMap(), null, false, to);
         var w = new TopicConfigSerializeWrapper();
         if (response.Body.Length > 0) TopicConfigSerializeWrapper.Decode(response.Body, out w);
         return w;
@@ -466,8 +507,7 @@ public sealed class DefaultMQAdminExt
     public TopicList GetSystemTopicListFromBroker(string brokerAddr, int timeoutMillis = -1)
     {
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetSystemTopicListFromBroker, new PropertyMap(), null, false, to);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetSystemTopicListFromBroker, new PropertyMap(), null, false, to);
         var tl = new TopicList();
         if (response.Body.Length > 0) TopicList.Decode(response.Body, out tl);
         return tl;
@@ -504,8 +544,7 @@ public sealed class DefaultMQAdminExt
     public TopicStatsTable ExamineTopicStatsByBroker(string brokerAddr, string topic)
     {
         PropertyMap ext = new() { ["topic"] = topic };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetTopicStatsInfo, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetTopicStatsInfo, ext, null, false, _timeoutMillis);
         var t = new TopicStatsTable();
         if (response.Body.Length > 0) TopicStatsTable.Decode(response.Body, out t);
         return t;
@@ -520,8 +559,7 @@ public sealed class DefaultMQAdminExt
     public KvTable FetchBrokerRuntimeStats(string brokerAddr, int timeoutMillis = -1)
     {
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetBrokerRuntimeInfo, new PropertyMap(), null, false, to);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetBrokerRuntimeInfo, new PropertyMap(), null, false, to);
         var t = new KvTable();
         if (response.Body.Length > 0) KvTable.Decode(response.Body, out t);
         return t;
@@ -537,8 +575,7 @@ public sealed class DefaultMQAdminExt
     public PropertyMap GetBrokerConfig(string brokerAddr, int timeoutMillis = -1)
     {
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetBrokerConfig, new PropertyMap(), null, false, to);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetBrokerConfig, new PropertyMap(), null, false, to);
         return MixAll.String2Properties(Encoding.UTF8.GetString(response.Body));
     }
 
@@ -563,23 +600,21 @@ public sealed class DefaultMQAdminExt
         string text = MixAll.Properties2String(properties);
         if (text.Length == 0) return;
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
-        RequireClient().InvokeSync(brokerAddr, RequestCode.UpdateBrokerConfig, new PropertyMap(),
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.UpdateBrokerConfig, new PropertyMap(),
             Encoding.UTF8.GetBytes(text), true, to);
     }
 
     public int WipeWritePermOfBroker(string namesrvAddr, string brokerName)
     {
         PropertyMap ext = new() { ["brokerName"] = brokerName };
-        RemotingCommand response = RequireClient().InvokeSync(
-            namesrvAddr, RequestCode.WipeWritePermOfBroker, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(namesrvAddr, RequestCode.WipeWritePermOfBroker, ext, null, false, _timeoutMillis);
         return (int)ExtInt(response, "wipeTopicCount", 0);
     }
 
     public int AddWritePermOfBroker(string namesrvAddr, string brokerName)
     {
         PropertyMap ext = new() { ["brokerName"] = brokerName };
-        RemotingCommand response = RequireClient().InvokeSync(
-            namesrvAddr, RequestCode.AddWritePermOfBroker, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(namesrvAddr, RequestCode.AddWritePermOfBroker, ext, null, false, _timeoutMillis);
         return (int)ExtInt(response, "addTopicCount", 0);
     }
 
@@ -591,7 +626,7 @@ public sealed class DefaultMQAdminExt
         {
             try
             {
-                client.InvokeSync(addr, RequestCode.CleanUnusedTopic, new PropertyMap(), null, false, _timeoutMillis);
+                client.InvokeSync(AddrForRpc(addr), RequestCode.CleanUnusedTopic, new PropertyMap(), null, false, _timeoutMillis);
             }
             catch (Exception e)
             {
@@ -606,8 +641,7 @@ public sealed class DefaultMQAdminExt
     public JsonValue ViewBrokerStatsData(string brokerAddr, string statsName, string statsKey)
     {
         PropertyMap ext = new() { ["statsName"] = statsName, ["statsKey"] = statsKey };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.ViewBrokerStatsData, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.ViewBrokerStatsData, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0) return JsonValue.Null;
         RemotingSerializable.Decode(response.Body, out JsonValue v);
         return v;
@@ -704,8 +738,7 @@ public sealed class DefaultMQAdminExt
         {
             try
             {
-                RemotingCommand response = client.InvokeSync(
-                    addr, RequestCode.GetKvlistByNamespace, ext, null, false, _timeoutMillis);
+                RemotingCommand response = client.InvokeSync(addr, RequestCode.GetKvlistByNamespace, ext, null, false, _timeoutMillis);
                 var t = new KvTable();
                 if (response.Body.Length > 0) KvTable.Decode(response.Body, out t);
                 return t;
@@ -724,7 +757,7 @@ public sealed class DefaultMQAdminExt
     public void CreateAndUpdateSubscriptionGroupConfig(string addr, SubscriptionGroupConfig config)
     {
         byte[] body = config.Encode();
-        RequireClient().InvokeSync(addr, RequestCode.UpdateAndCreateSubscriptiongroup,
+        RequireClient().InvokeSync(AddrForRpc(addr), RequestCode.UpdateAndCreateSubscriptiongroup,
             new PropertyMap(), body, true, _timeoutMillis);
     }
 
@@ -746,8 +779,7 @@ public sealed class DefaultMQAdminExt
     public bool GetSubscriptionGroupConfig(string addr, string group, out SubscriptionGroupConfig outCfg)
     {
         PropertyMap ext = new() { ["group"] = group };
-        RemotingCommand response = RequireClient().InvokeSync(
-            addr, RequestCode.GetSubscriptiongroupConfig, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(addr), RequestCode.GetSubscriptiongroupConfig, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0)
         {
             outCfg = new SubscriptionGroupConfig();
@@ -869,7 +901,7 @@ public sealed class DefaultMQAdminExt
             ["groupName"] = groupName,
             ["cleanOffset"] = removeOffset ? "true" : "false",
         };
-        RequireClient().InvokeSync(addr, RequestCode.DeleteSubscriptiongroup, ext, null, false, _timeoutMillis);
+        RequireClient().InvokeSync(AddrForRpc(addr), RequestCode.DeleteSubscriptiongroup, ext, null, false, _timeoutMillis);
     }
 
     // ---------------------------------------------------------------- 消费者 / 生产者连接
@@ -879,8 +911,7 @@ public sealed class DefaultMQAdminExt
         MQClientInstance client = RequireClient();
         string addr = brokerAddr.Length == 0 ? FindFirstBrokerAddr(client) : brokerAddr;
         PropertyMap ext = new() { ["consumerGroup"] = consumerGroup };
-        RemotingCommand response = client.InvokeSync(
-            addr, RequestCode.GetConsumerConnectionList, ext, null, false, _timeoutMillis);
+        RemotingCommand response = client.InvokeSync(AddrForRpc(addr), RequestCode.GetConsumerConnectionList, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0)
         {
             throw new MQClientException("consumer group " + consumerGroup + " not online");
@@ -898,8 +929,7 @@ public sealed class DefaultMQAdminExt
         MQClientInstance client = RequireClient();
         string addr = brokerAddr.Length == 0 ? FindFirstBrokerAddr(client) : brokerAddr;
         PropertyMap ext = new() { ["producerGroup"] = producerGroup };
-        RemotingCommand response = client.InvokeSync(
-            addr, RequestCode.GetProducerConnectionList, ext, null, false, _timeoutMillis);
+        RemotingCommand response = client.InvokeSync(AddrForRpc(addr), RequestCode.GetProducerConnectionList, ext, null, false, _timeoutMillis);
         var pc = new ProducerConnection();
         if (response.Body.Length > 0) ProducerConnection.Decode(response.Body, out pc);
         return pc;
@@ -916,8 +946,7 @@ public sealed class DefaultMQAdminExt
             ["clientId"] = clientId,
             ["jstackEnable"] = jstack ? "true" : "false",
         };
-        RemotingCommand response = client.InvokeSync(
-            addr, RequestCode.GetConsumerRunningInfo, ext, null, false, _timeoutMillis);
+        RemotingCommand response = client.InvokeSync(AddrForRpc(addr), RequestCode.GetConsumerRunningInfo, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0)
         {
             throw new MQClientException("no running info for client " + clientId);
@@ -954,8 +983,7 @@ public sealed class DefaultMQAdminExt
             ext["topicList"] = joined.ToString();
         }
 
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetConsumeStats, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetConsumeStats, ext, null, false, _timeoutMillis);
         var cs = new ConsumeStats();
         if (response.Body.Length > 0) ConsumeStats.Decode(response.Body, out cs);
         return cs;
@@ -966,8 +994,7 @@ public sealed class DefaultMQAdminExt
     {
         int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
         PropertyMap ext = new() { ["isOrder"] = isOrder ? "true" : "false" };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.GetBrokerConsumeStats, ext, null, false, to);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.GetBrokerConsumeStats, ext, null, false, to);
         var sl = new ConsumeStatsList();
         if (response.Body.Length > 0) ConsumeStatsList.Decode(response.Body, out sl);
         return sl;
@@ -976,8 +1003,7 @@ public sealed class DefaultMQAdminExt
     public HashSet<string> QueryTopicConsumeByWho(string brokerAddr, string topic)
     {
         PropertyMap ext = new() { ["topic"] = topic };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.QueryTopicConsumeByWho, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.QueryTopicConsumeByWho, ext, null, false, _timeoutMillis);
         var groups = new HashSet<string>();
         if (response.Body.Length == 0) return groups;
         if (!RemotingSerializable.Decode(response.Body, out JsonValue v)) return groups;
@@ -993,6 +1019,202 @@ public sealed class DefaultMQAdminExt
         return groups;
     }
 
+    // ---------------- 消息轨迹（Java DefaultMQAdminExtImpl.messageTrackDetail） ----------------
+
+    /// <summary>
+    /// 对应 Java <c>examineConsumeStats(group[, topic])</c>（:389-424）：按
+    /// <c>%RETRY%&lt;group&gt;</c> 的路由扇出全部 broker，逐台取统计并合并
+    /// （offsetTable 并入、consumeTps 累加）；全空时抛错（Java 的 MQClientException 同口径）。
+    /// </summary>
+    public ConsumeStats ExamineConsumeStatsGroup(string consumerGroup, string topic = "")
+    {
+        TopicRouteData route = ExamineTopicRoute(MixAll.GetRetryTopic(consumerGroup));
+        var merged = new ConsumeStats();
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length == 0) continue;
+            ConsumeStats part = ExamineConsumeStats(addr, consumerGroup, topic);
+            foreach (var kv in part.OffsetTable) merged.OffsetTable[kv.Key] = kv.Value;
+            merged.ConsumeTps += part.ConsumeTps;
+        }
+
+        if (merged.OffsetTable.Count == 0)
+        {
+            throw new MQClientException("no consume stats for group " + consumerGroup,
+                ResponseCode.SystemError);
+        }
+
+        return merged;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>DefaultMQAdminExtImpl.consumed:1533-1557</c>：该组在本队列的
+    /// consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
+    /// </summary>
+    public bool Consumed(MessageExt msg, string group)
+    {
+        ConsumeStats cstats = ExamineConsumeStatsGroup(group);
+        ClusterInfo ci = ExamineBrokerClusterInfo();
+        string? storeHost = msg.StoreHostString;
+        foreach (var kv in cstats.OffsetTable)
+        {
+            MessageQueue mq = kv.Key;
+            if (mq.Topic == msg.Topic && mq.QueueId == msg.QueueId
+                && ci.BrokerAddrTable.TryGetValue(mq.BrokerName, out BrokerData? bd))
+            {
+                if (bd.BrokerAddrs.TryGetValue(MixAll.MasterId, out string? addr))
+                {
+                    // Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
+                    // 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
+                    if (addr == storeHost && kv.Value.ConsumerOffset > msg.QueueOffset)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>DefaultMQAdminExtImpl.messageTrackDetail:1349-1427</c>：查谁在消费
+    /// 这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
+    /// </summary>
+    public List<MessageTrack> MessageTrackDetail(MessageExt msg)
+    {
+        var result = new List<MessageTrack>();
+        TopicRouteData route = ExamineTopicRoute(msg.Topic);
+        string? brokerAddr = null;
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length != 0)
+            {
+                brokerAddr = addr;
+                break;
+            }
+        }
+
+        if (brokerAddr is null) return result;
+
+        HashSet<string> groups = QueryTopicConsumeByWho(brokerAddr, msg.Topic);
+        foreach (string group in groups.OrderBy(g => g, StringComparer.Ordinal))
+        {
+            // Java 按 broker 返回顺序遍历；这里排序让输出确定
+            var mt = new MessageTrack { ConsumerGroup = group };
+            ConsumerConnection cc;
+            try
+            {
+                cc = ExamineConsumerConnectionInfo(group);
+            }
+            catch (MQBrokerException e)
+            {
+                if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+                {
+                    mt.TrackType = TrackType.NotOnline;
+                }
+
+                mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
+                result.Add(mt);
+                continue;
+            }
+            catch (Exception e)
+            {
+                mt.ExceptionDesc = e.Message;
+                result.Add(mt);
+                continue;
+            }
+
+            switch (cc.ConsumeType)
+            {
+                case "CONSUME_ACTIVELY":
+                    mt.TrackType = TrackType.Pull;
+                    break;
+                case "CONSUME_PASSIVELY":
+                    bool ifConsumed;
+                    try
+                    {
+                        ifConsumed = Consumed(msg, group);
+                    }
+                    catch (MQClientException e)
+                    {
+                        if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+                        {
+                            mt.TrackType = TrackType.NotOnline;
+                            mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
+                        }
+                        else if (e.ResponseCode == ResponseCode.BroadcastConsumption)
+                        {
+                            mt.TrackType = TrackType.ConsumeBroadcasting;
+                        }
+
+                        result.Add(mt);
+                        continue;
+                    }
+                    catch (MQBrokerException e)
+                    {
+                        if (e.ResponseCode == ResponseCode.ConsumerNotOnline)
+                        {
+                            mt.TrackType = TrackType.NotOnline;
+                            mt.ExceptionDesc = "CODE:" + e.ResponseCode + " DESC:" + e.Message;
+                        }
+                        else if (e.ResponseCode == ResponseCode.BroadcastConsumption)
+                        {
+                            mt.TrackType = TrackType.ConsumeBroadcasting;
+                        }
+
+                        result.Add(mt);
+                        continue;
+                    }
+                    catch (Exception e)
+                    {
+                        mt.ExceptionDesc = e.Message;
+                        result.Add(mt);
+                        continue;
+                    }
+
+                    if (ifConsumed)
+                    {
+                        mt.TrackType = TrackType.Consumed;
+                        // Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
+                        // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
+                        // 为空，同样落回 Consumed —— 忠实保留 Java 语义）。
+                        JsonValue? sub = cc.SubscriptionTable.Find(msg.Topic);
+                        if (sub is not null)
+                        {
+                            JsonValue? tagsSet = sub.Find("tagsSet");
+                            bool empty = tagsSet is not { IsArray: true } || tagsSet.Size() == 0;
+                            bool wildcard = tagsSet is { IsArray: true }
+                                            && Enumerable.Range(0, tagsSet.Size())
+                                                .Any(i => tagsSet.At(i).IsString
+                                                          && tagsSet.At(i).StringValue() == "*");
+                            bool hasTag = msg.Tags is string tag
+                                          && tagsSet is { IsArray: true }
+                                          && Enumerable.Range(0, tagsSet.Size())
+                                              .Any(i => tagsSet.At(i).IsString
+                                                        && tagsSet.At(i).StringValue() == tag);
+                            if (!empty && !wildcard && !hasTag)
+                            {
+                                mt.TrackType = TrackType.ConsumedButFiltered;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        mt.TrackType = TrackType.NotConsumeYet;
+                    }
+
+                    break;
+            }
+
+            result.Add(mt);
+        }
+
+        return result;
+    }
+
     /// <summary>
     /// 对应 Java MQClientAPIImpl#queryTopicsByConsumer:2525（343）的单 broker 原始调用。
     /// broker 端走 AdminBrokerProcessor#queryTopicsByConsumer:2421 →
@@ -1002,8 +1224,7 @@ public sealed class DefaultMQAdminExt
     public TopicList QueryTopicsByConsumerToBroker(string brokerAddr, string group)
     {
         PropertyMap ext = new() { ["group"] = group };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.QueryTopicsByConsumer, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.QueryTopicsByConsumer, ext, null, false, _timeoutMillis);
         var tl = new TopicList();
         if (response.Body.Length > 0) TopicList.Decode(response.Body, out tl);
         return tl;
@@ -1035,8 +1256,7 @@ public sealed class DefaultMQAdminExt
     public JsonValue QuerySubscription(string brokerAddr, string group, string topic)
     {
         PropertyMap ext = new() { ["group"] = group, ["topic"] = topic };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.QuerySubscriptionByConsumer, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.QuerySubscriptionByConsumer, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0) return JsonValue.Null;
         RemotingSerializable.Decode(response.Body, out JsonValue v);
         return v;
@@ -1050,8 +1270,7 @@ public sealed class DefaultMQAdminExt
             ["group"] = group,
             ["clientAddr"] = clientAddr,
         };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.InvokeBrokerToGetConsumerStatus, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.InvokeBrokerToGetConsumerStatus, ext, null, false, _timeoutMillis);
         if (response.Body.Length == 0) return JsonValue.Null;
         if (!RemotingSerializable.Decode(response.Body, out JsonValue v)) return JsonValue.Null;
         return v.Get("consumerTable");
@@ -1067,7 +1286,7 @@ public sealed class DefaultMQAdminExt
             ["topic"] = topic,
             ["offline"] = offline ? "true" : "false",
         };
-        RequireClient().InvokeSync(brokerAddr, RequestCode.CloneGroupOffset, ext, null, false, _timeoutMillis);
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.CloneGroupOffset, ext, null, false, _timeoutMillis);
     }
 
     // ---------------------------------------------------------------- Offset 管理
@@ -1101,8 +1320,7 @@ public sealed class DefaultMQAdminExt
             ["queueId"] = I64Str(mq.QueueId),
             ["brokerName"] = mq.BrokerName,
         };
-        RemotingCommand response = client.InvokeSync(
-            addr, RequestCode.GetEarliestMsgStoretime, ext, null, false, _timeoutMillis);
+        RemotingCommand response = client.InvokeSync(AddrForRpc(addr), RequestCode.GetEarliestMsgStoretime, ext, null, false, _timeoutMillis);
         return ExtInt(response, "timestamp", 0);
     }
 
@@ -1360,7 +1578,7 @@ public sealed class DefaultMQAdminExt
                 ["offset"] = I64Str(offset),
             };
             RemotingCommand response = RequireClient().InvokeSync(
-                ip + ":" + port.ToString(CultureInfo.InvariantCulture),
+                AddrForRpc(ip + ":" + port.ToString(CultureInfo.InvariantCulture)),
                 RequestCode.ViewMessageById, ext, null, false, _timeoutMillis);
             if (response.Body.Length == 0)
             {
@@ -1402,8 +1620,7 @@ public sealed class DefaultMQAdminExt
             ["count"] = I64Str(count),
             ["consumerGroup"] = consumerGroup,
         };
-        RemotingCommand response = RequireClient().InvokeSync(
-            brokerAddr, RequestCode.QueryConsumeQueue, ext, null, false, _timeoutMillis);
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.QueryConsumeQueue, ext, null, false, _timeoutMillis);
         var body = new QueryConsumeQueueResponseBody();
         if (response.Body.Length > 0) QueryConsumeQueueResponseBody.Decode(response.Body, out body);
         return body;

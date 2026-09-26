@@ -109,6 +109,22 @@ class MixAll:
         return topic is not None and topic.startswith(MixAll.DLQ_GROUP_TOPIC_PREFIX)
 
     @staticmethod
+    def broker_vip_channel(is_change: bool, broker_addr: str) -> str:
+        """对应 Java `MixAll.brokerVIPChannel`：VIP 通道 = 端口 - 2。
+
+        端口不可解析时原样返回（Java 会抛 NumberFormatException，这里不让调用方崩）。
+        """
+        if not is_change:
+            return broker_addr
+        host, _, port = broker_addr.rpartition(":")
+        if not host or not port:
+            return broker_addr
+        try:
+            return "%s:%d" % (host, int(port) - 2)
+        except ValueError:
+            return broker_addr
+
+    @staticmethod
     def get_reply_topic(cluster_name: str) -> str:
         """对应 Java MixAll.getReplyTopic(clusterName) = clusterName + "_REPLY_TOPIC"。
 

@@ -48,6 +48,57 @@ logger = get_logger()
 DEFAULT_TIMEOUT = 5000 * 3
 
 
+# ---------------- 消息轨迹 DTO（org.apache.rocketmq.tools.admin.api） ----------------
+
+class TrackType:
+    """对应 Java `TrackType` 枚举（字符串值即枚举名）。"""
+
+    CONSUMED = "CONSUMED"
+    CONSUMED_BUT_FILTERED = "CONSUMED_BUT_FILTERED"
+    PULL = "PULL"
+    NOT_CONSUME_YET = "NOT_CONSUME_YET"
+    NOT_ONLINE = "NOT_ONLINE"
+    CONSUME_BROADCASTING = "CONSUME_BROADCASTING"
+    UNKNOWN = "UNKNOWN"
+
+
+class MessageTrack:
+    """对应 Java `MessageTrack`：一条消息在某消费组的投递判定。"""
+
+    def __init__(self, consumer_group: Optional[str] = None,
+                 track_type: str = TrackType.UNKNOWN,
+                 exception_desc: Optional[str] = None):
+        self.consumer_group = consumer_group
+        self.track_type = track_type
+        self.exception_desc = exception_desc
+
+    def to_dict(self) -> dict:
+        d = {"consumerGroup": self.consumer_group,
+             "trackType": self.track_type}
+        if self.exception_desc is not None:
+            d["exceptionDesc"] = self.exception_desc
+        return d
+
+    @staticmethod
+    def from_dict(d: dict) -> "MessageTrack":
+        return MessageTrack(
+            consumer_group=d.get("consumerGroup"),
+            track_type=d.get("trackType") or TrackType.UNKNOWN,
+            exception_desc=d.get("exceptionDesc"),
+        )
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "MessageTrack":
+        return MessageTrack.from_dict(fastjson_loads(data.decode("utf-8")))
+
+    def __repr__(self):
+        return "MessageTrack [consumerGroup=%s, trackType=%s, exceptionDesc=%s]" % (
+            self.consumer_group, self.track_type, self.exception_desc)
+
+
 class DefaultMQAdminExt:
     """管理客户端（对应 org.apache.rocketmq.client.admin.DefaultMQAdminExt）。"""
 
@@ -62,6 +113,10 @@ class DefaultMQAdminExt:
         # 也不注册消费者，Java 里它只是个继承来的字段。）
         self.unit_name: Optional[str] = None
         self.enable_stream_request_type = False
+        # Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 请求
+        # 改走 VIP 端口（端口 - 2）。只对本 admin 的 broker 调用生效——admin 不发消息、
+        # 不注册消费者，Java 里普通收发路径的同一开关在本项目四端均未接线。
+        self.vip_channel_enabled = False
         self.name_server_addrs: List[str] = []
         # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
         # 只在 start() 建 MQClientInstance 时透传一次。
@@ -93,6 +148,10 @@ class DefaultMQAdminExt:
     def set_enable_stream_request_type(self, enable: bool) -> None:
         """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
         self.enable_stream_request_type = bool(enable)
+
+    def set_vip_channel_enabled(self, enable: bool) -> None:
+        """对应 Java `ClientConfig#setVipChannelEnabled`。"""
+        self.vip_channel_enabled = bool(enable)
 
     def get_name_server_addr(self) -> str:
         return ";".join(self.name_server_addrs)
@@ -149,6 +208,7 @@ class DefaultMQAdminExt:
                        timeout_millis: Optional[int] = None) -> RemotingCommand:
         """发到指定 Broker 并校验 SUCCESS。"""
         client = self._require_client()
+        addr = MixAll.broker_vip_channel(self.vip_channel_enabled, addr)
         request = RemotingCommand.create_request_command(code, None)
         if ext_fields:
             for k, v in ext_fields.items():
@@ -248,9 +308,11 @@ class DefaultMQAdminExt:
     def delete_topic_in_name_server(self, addrs: Optional[Set[str]], topic: str) -> None:
         client = self._require_client()
         targets = list(addrs) if addrs else list(client.name_server_addrs)
+        # NameServer 请求不能走 _invoke_broker：VIP 开关打开时它会把 NameServer
+        # 的端口也 -2（Java 的 deleteTopicInNameServer 同样直连 NameServer）。
         for ns_addr in targets:
-            self._invoke_broker(ns_addr, RequestCode.DELETE_TOPIC_IN_NAMESRV,
-                                {"topic": topic})
+            self._invoke_namesrv_addr(ns_addr, RequestCode.DELETE_TOPIC_IN_NAMESRV,
+                                      {"topic": topic})
 
     def delete_topic_in_namesrv(self, topic: str) -> None:
         """兼容旧名：删除 NameServer 上的 topic 路由。"""
@@ -459,14 +521,27 @@ class DefaultMQAdminExt:
         self._invoke_broker(broker_addr, RequestCode.UPDATE_BROKER_CONFIG,
                             body=text.encode("utf-8"), timeout_millis=timeout_millis)
 
+    def _invoke_namesrv_addr(self, addr: str, code: int,
+                             ext_fields: Optional[Dict[str, str]] = None,
+                             timeout_millis: Optional[int] = None) -> RemotingCommand:
+        """发到**显式给定**的 NameServer 并校验 SUCCESS（不走 VIP 通道）。"""
+        client = self._require_client()
+        request = RemotingCommand.create_request_command(code, None)
+        if ext_fields:
+            for k, v in ext_fields.items():
+                request.ext_fields[k] = str(v)
+        response = client._invoke_sync(addr, request, timeout_millis or self.timeout_millis)
+        client._check_response(response)
+        return response
+
     def wipe_write_perm_of_broker(self, namesrv_addr: str, broker_name: str) -> int:
-        response = self._invoke_broker(namesrv_addr, RequestCode.WIPE_WRITE_PERM_OF_BROKER,
-                                       {"brokerName": broker_name})
+        response = self._invoke_namesrv_addr(namesrv_addr, RequestCode.WIPE_WRITE_PERM_OF_BROKER,
+                                             {"brokerName": broker_name})
         return int(response.ext_fields.get("wipeTopicCount", 0) or 0)
 
     def add_write_perm_of_broker(self, namesrv_addr: str, broker_name: str) -> int:
-        response = self._invoke_broker(namesrv_addr, RequestCode.ADD_WRITE_PERM_OF_BROKER,
-                                       {"brokerName": broker_name})
+        response = self._invoke_namesrv_addr(namesrv_addr, RequestCode.ADD_WRITE_PERM_OF_BROKER,
+                                             {"brokerName": broker_name})
         return int(response.ext_fields.get("addTopicCount", 0) or 0)
 
     def clean_unused_topic(self, cluster_name: Optional[str] = None,
@@ -694,6 +769,106 @@ class DefaultMQAdminExt:
             return set()
         obj = RemotingSerializable.decode_json(response.body)
         return set(obj.get("groupList", []))
+
+    # ---------------- 消息轨迹（Java DefaultMQAdminExtImpl.messageTrackDetail） ----------------
+
+    def examine_consume_stats_group(self, consumer_group: str,
+                                    topic: Optional[str] = None) -> ConsumeStats:
+        """对应 Java `examineConsumeStats(group[, topic])`（:389-424）：按
+        `%RETRY%<group>` 的路由扇出全部 broker，逐台取统计并合并（offsetTable
+        并入、consumeTps 累加）；全空时抛错（Java 的 MQClientException 同口径）。"""
+        route = self.examine_topic_route(MixAll.get_retry_topic(consumer_group))
+        result = ConsumeStats()
+        for bd in route.broker_datas:
+            addr = bd.select_broker_addr()
+            if addr:
+                part = self.examine_consume_stats(addr, consumer_group, topic)
+                result.offset_table.update(part.offset_table)
+                result.consume_tps += part.consume_tps
+        if not result.offset_table:
+            raise MQClientException("no consume stats for group %s" % consumer_group)
+        return result
+
+    def consumed(self, msg: MessageExt, group: str) -> bool:
+        """对应 Java `DefaultMQAdminExtImpl.consumed:1533-1557`：该组在本队列的
+        consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。"""
+        cstats = self.examine_consume_stats_group(group)
+        ci = self.examine_broker_cluster_info()
+        store_host = msg.get_store_host_string()
+        for mq, wrapper in cstats.offset_table.items():
+            if mq.topic == msg.topic and mq.queue_id == msg.queue_id:
+                broker_addrs = ci.broker_addr_table.get(mq.broker_name)
+                if broker_addrs:
+                    addr = broker_addrs.get(MixAll.MASTER_ID)
+                    # Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
+                    # 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
+                    if addr and store_host and addr == store_host:
+                        if wrapper.consumer_offset > msg.queue_offset:
+                            return True
+        return False
+
+    def message_track_detail(self, msg: MessageExt) -> List[MessageTrack]:
+        """对应 Java `DefaultMQAdminExtImpl.messageTrackDetail:1349-1427`：查谁在消费
+        这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。"""
+        result: List[MessageTrack] = []
+        route = self.examine_topic_route(msg.topic)
+        broker_addr = None
+        for bd in route.broker_datas:
+            broker_addr = bd.select_broker_addr()
+            if broker_addr:
+                break
+        if broker_addr is None:
+            return result
+        groups = self.query_topic_consume_by_who(broker_addr, msg.topic)
+        # Java 按 broker 返回顺序遍历；python 侧这里拿到的是 set，排序让输出确定
+        for group in sorted(groups):
+            mt = MessageTrack(consumer_group=group)
+            try:
+                cc = self.examine_consumer_connection_info(group)
+            except MQBrokerException as e:
+                if e.response_code == ResponseCode.CONSUMER_NOT_ONLINE:
+                    mt.track_type = TrackType.NOT_ONLINE
+                mt.exception_desc = "CODE:%s DESC:%s" % (e.response_code, e.error_message)
+                result.append(mt)
+                continue
+            except Exception as e:  # noqa: BLE001
+                mt.exception_desc = str(e)
+                result.append(mt)
+                continue
+
+            if cc.consume_type == "CONSUME_ACTIVELY":
+                mt.track_type = TrackType.PULL
+            elif cc.consume_type == "CONSUME_PASSIVELY":
+                try:
+                    if_consumed = self.consumed(msg, group)
+                except (MQClientException, MQBrokerException) as e:
+                    if e.response_code == ResponseCode.CONSUMER_NOT_ONLINE:
+                        mt.track_type = TrackType.NOT_ONLINE
+                        mt.exception_desc = ("CODE:%s DESC:%s"
+                                             % (e.response_code, getattr(e, "error_message", e)))
+                    elif e.response_code == ResponseCode.BROADCAST_CONSUMPTION:
+                        mt.track_type = TrackType.CONSUME_BROADCASTING
+                    result.append(mt)
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    mt.exception_desc = str(e)
+                    result.append(mt)
+                    continue
+
+                if if_consumed:
+                    mt.track_type = TrackType.CONSUMED
+                    # Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
+                    # "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
+                    # 为空，同样落回 CONSUMED —— 忠实保留 Java 语义）。
+                    sub = cc.subscription_table.get(msg.topic)
+                    if sub:
+                        tags_set = set(sub.get("tagsSet") or [])
+                        if tags_set and "*" not in tags_set and msg.get_tags() not in tags_set:
+                            mt.track_type = TrackType.CONSUMED_BUT_FILTERED
+                else:
+                    mt.track_type = TrackType.NOT_CONSUME_YET
+            result.append(mt)
+        return result
 
     def query_topics_by_consumer_to_broker(self, broker_addr: str, group: str) -> TopicList:
         """对应 Java `MQClientAPIImpl#queryTopicsByConsumer:2525`（343）的单 broker 原始调用。

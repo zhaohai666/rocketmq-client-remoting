@@ -34,6 +34,28 @@
 
 namespace rocketmq {
 
+// 对应 Java org.apache.rocketmq.remoting.admin.track.TrackType（消息轨迹判定结果）
+enum class TrackType {
+    CONSUMED,
+    CONSUMED_BUT_FILTERED,
+    PULL,
+    NOT_CONSUME_YET,
+    NOT_ONLINE,
+    CONSUME_BROADCASTING,
+    UNKNOWN,
+};
+
+// Java 枚举名原文（对账用；C++ 成员名相同，只是给测试/日志一个稳定的字符串形态）
+const char* trackTypeName(TrackType type);
+
+// 对应 Java org.apache.rocketmq.remoting.admin.track.MessageTrack
+struct MessageTrack {
+    std::string consumerGroup;
+    TrackType trackType = TrackType::UNKNOWN;
+    // 空 = 无异常；非空时形如 "CODE:n DESC:msg"（与 Java exceptionDesc 同口径）
+    std::string exceptionDesc;
+};
+
 class DefaultMQAdminExt {
 public:
     // 对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
@@ -62,6 +84,11 @@ public:
     // 路由刷新周期，start() 时透传给 MQClientInstance。
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
+    // 对应 Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 类请求
+    // 走 VIP 通道（端口 - 2）。**只作用于 admin 直接下发的 broker 调用**；NameServer 类
+    // 请求（KV 配置、topic 删除等）永远走原端口。
+    void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
+    bool isVipChannelEnabled() const { return vipChannelEnabled_; }
     std::string getNamesrvAddr() const;
     std::vector<std::string> getNameServerAddressList() const { return nameServerAddrs_; }
     void setTimeoutMillis(int32_t millis) { timeoutMillis_ = millis; }
@@ -184,6 +211,16 @@ public:
                                                int32_t timeoutMillis = -1);
     std::set<std::string> queryTopicConsumeByWho(const std::string& brokerAddr,
                                                  const std::string& topic);
+    // 对应 Java DefaultMQAdminExtImpl.examineConsumeStats(group[, topic])（:389-424）：
+    // 按 %RETRY%<group> 的路由扇出全部 broker，逐台取统计并合并；全空时抛
+    // MQClientException(CONSUMER_NOT_ONLINE)。
+    ConsumeStats examineConsumeStatsGroup(const std::string& consumerGroup,
+                                          const std::string& topic = std::string());
+    // 对应 Java DefaultMQAdminExtImpl.consumed:1533-1557：该组在本队列的 consumerOffset
+    // 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
+    bool consumed(const MessageExt& msg, const std::string& consumerGroup);
+    // 对应 Java DefaultMQAdminExtImpl.messageTrackDetail:1349-1427
+    std::vector<MessageTrack> messageTrackDetail(const MessageExt& msg);
     // 对应 Java MQClientAPIImpl#queryTopicsByConsumer:2525（343）的单 broker 原始调用。
     // broker 端走 AdminBrokerProcessor#queryTopicsByConsumer:2421 →
     // ConsumerOffsetManager#whichTopicByConsumer：**从位点表**（topic@group 键）反查该组
@@ -259,6 +296,10 @@ public:
 private:
     // ---------------- 底层调用助手 ----------------
     MQClientInstance& requireClient();
+    // broker 类请求的目标地址：VIP 开关打开时端口 - 2。NameServer 类请求不走这里。
+    std::string vipAddr(const std::string& addr) const {
+        return MixAll::brokerVipChannel(vipChannelEnabled_, addr);
+    }
     // 一笔 INVOKE_BROKER_TO_RESET_OFFSET(222)。Java 在这里有两个重载：不带 queueId 的按
     // timestamp 重置整个 topic，带 queueId + offset 的只重置单个队列。这里用哨兵值表示
     // 「不带该字段」：queueId < 0 即 Java 的默认 -1，offset < 0 即 Java 的「offset=-1 表示
@@ -276,6 +317,8 @@ private:
     std::string clientId_;
     std::string unitName_;
     bool enableStreamRequestType_ = false;
+    // Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）
+    bool vipChannelEnabled_ = false;
     // Java ClientConfig:58，默认 30000ms（路由刷新周期）
     int32_t pollNameServerIntervalMillis_ = 30000;
     std::vector<std::string> nameServerAddrs_;
