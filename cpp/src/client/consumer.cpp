@@ -1110,15 +1110,37 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
 
         PullResult result;
         try {
+            // Java DefaultMQPushConsumerImpl.pullMessage:458-468 —— subscription 位置位
+            // 与否完全由 subExpression 是否为空决定；默认关闭时表达式**根本不进报文的
+            // subscription 字段**（见 MQClientInstance::pullMessage）。
+            const bool postSub = shouldPostSubscriptionWhenPull(postSubscriptionWhenPull_,
+                                                               sub.classFilterMode);
             const int32_t sysFlag =
                 PullSysFlag::buildSysFlag(/*commitOffset=*/false, /*suspend=*/true,
-                                          /*subscription=*/true, /*classFilter=*/false);
-            const std::string expr = sub.subString.empty() ? std::string("*") : sub.subString;
+                                          /*subscription=*/postSub, /*classFilter=*/false);
+            const std::string expr = postSub
+                                         ? (sub.subString.empty() ? std::string("*") : sub.subString)
+                                         : std::string();
+            int64_t brokerId;
+            {
+                std::lock_guard<std::mutex> lk(lock_);
+                // Java PullAPIWrapper#recalculatePullFromWhichNode：无记录按 master=0
+                auto it = pullFromWhichNode_.find(key);
+                brokerId = (it != pullFromWhichNode_.end()) ? it->second : MixAll::MASTER_ID;
+            }
             const int64_t pullBegan = UtilAll::currentTimeMillis();
             result = c.pullMessage(consumerGroup_, mq, offset, pullBatchSize_, sysFlag,
                                    /*commitOffset=*/0, expr, sub.subVersion, sub.expressionType,
                                    pullTimeoutMillis_, pullBatchSizeInBytes_,
-                                   pullSuspendTimeoutMillis_);
+                                   pullSuspendTimeoutMillis_, /*addr=*/std::string(),
+                                   /*requestSource=*/0, /*brokerId=*/brokerId);
+            {
+                // Java PullAPIWrapper#processPullResult:77：每轮应答都回写
+                // pullFromWhichNodeTable（缺省按 master=0 记账，与 Java long 原语口径一致）
+                std::lock_guard<std::mutex> lk(lock_);
+                pullFromWhichNode_[key] =
+                    result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
+            }
             // 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
             mqClient_->consumerStats().incPullRT(consumerGroup_, mq.topic,
                                                  UtilAll::currentTimeMillis() - pullBegan);

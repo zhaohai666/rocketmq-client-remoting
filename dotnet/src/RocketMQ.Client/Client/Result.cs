@@ -143,6 +143,13 @@ public sealed class PullResult
     public long MaxOffset { get; set; }
     public List<MessageExt> MsgFoundList { get; set; } = new();
 
+    /// <summary>
+    /// 对应 Java <c>PullResultExt.suggestWhichBrokerId</c>：broker 建议下次从哪个 brokerId
+    /// 拉（主从部署时可能是从节点）。<c>PullAPIWrapper#processPullResult:77</c> 用它更新
+    /// pullFromWhichNodeTable。null = 响应头没带（老 broker），调用方按 master=0 记账。
+    /// </summary>
+    public long? SuggestWhichBrokerId { get; set; }
+
     public bool IsFound => Status == PullStatus.Found;
 
     public bool IsNoNewMsg => Status == PullStatus.NoNewMsg;

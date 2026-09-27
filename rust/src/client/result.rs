@@ -263,6 +263,8 @@ pub struct PullResult {
     pub min_offset: i64,
     pub max_offset: i64,
     pub msg_found_list: Vec<MessageExt>,
+    /// Java `PullResultExt.suggestWhichBrokerId`：每次拉取后回写 pullFromWhichNodeTable。
+    pub suggest_which_broker_id: Option<i64>,
 }
 
 impl PullResult {
@@ -637,6 +639,7 @@ mod tests {
             min_offset: 1,
             max_offset: 6,
             msg_found_list: vec![MessageExt::new(), MessageExt::new()],
+            ..Default::default()
         };
         assert_eq!(
             pull.to_string(),

@@ -49,7 +49,7 @@
 //!    这里回调 `(topic, mqAll, mqDivided)`（Java `RebalanceImpl#messageQueueChanged`），
 //!    与本项目已有的 trait 形状一致。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -224,6 +224,9 @@ struct PullInner {
     /// （见模块头偏离 2），所以它只是配置形状，与 Python/C++/dotnet 同口径。
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
+    /// Java `PullAPIWrapper.pullFromWhichNodeTable`：每次拉取回写响应头里的
+    /// `suggestWhichBrokerId`，下次拉取按它选主/从。
+    pull_from_which_node: Mutex<HashMap<MessageQueue, i64>>,
 }
 
 impl Default for PullInner {
@@ -237,6 +240,7 @@ impl Default for PullInner {
             listener: Mutex::new(None),
             strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
             rpc_hook: RwLock::new(None),
+            pull_from_which_node: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -619,6 +623,10 @@ impl DefaultMQPullConsumer {
         let cfg = self.config();
         let timeout = timeout_millis.unwrap_or(cfg.consumer_pull_timeout_millis);
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(sub_expression))?;
+        let broker_id = lock(&self.inner.pull_from_which_node)
+            .get(mq)
+            .copied()
+            .unwrap_or(MixAll::MASTER_ID as i64);
         let result = client
             .pull_message(
                 &cfg.consumer_group,
@@ -636,8 +644,13 @@ impl DefaultMQPullConsumer {
                 PULL_SUSPEND_TIMEOUT_MILLIS,
                 None,
                 0,
+                Some(broker_id),
             )
             .await?;
+        lock(&self.inner.pull_from_which_node).insert(
+            mq.clone(),
+            result.suggest_which_broker_id.unwrap_or(MixAll::MASTER_ID as i64),
+        );
         Ok(self.apply_delivery_filter(mq, result))
     }
 
@@ -657,6 +670,10 @@ impl DefaultMQPullConsumer {
         let client = self.require_client()?;
         let cfg = self.config();
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(sub_expression))?;
+        let broker_id = lock(&self.inner.pull_from_which_node)
+            .get(mq)
+            .copied()
+            .unwrap_or(MixAll::MASTER_ID as i64);
         let result = client
             .pull_message(
                 &cfg.consumer_group,
@@ -673,8 +690,13 @@ impl DefaultMQPullConsumer {
                 cfg.broker_suspend_max_time_millis,
                 None,
                 0,
+                Some(broker_id),
             )
             .await?;
+        lock(&self.inner.pull_from_which_node).insert(
+            mq.clone(),
+            result.suggest_which_broker_id.unwrap_or(MixAll::MASTER_ID as i64),
+        );
         Ok(self.apply_delivery_filter(mq, result))
     }
 
@@ -2243,6 +2265,7 @@ impl DefaultLitePullConsumer {
                 PULL_SUSPEND_TIMEOUT_MILLIS,
                 None,
                 0,
+                None,
             )
             .await
         {

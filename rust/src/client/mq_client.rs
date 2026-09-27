@@ -72,7 +72,7 @@ use crate::common::message_decoder::{
     decode_message, decode_messages, message_properties_2_string, string_2_message_properties,
 };
 use crate::common::mix_all::MixAll;
-use crate::common::sysflag::MessageSysFlag;
+use crate::common::sysflag::{MessageSysFlag, PullSysFlag};
 use crate::common::topic_config::TopicFilterType;
 use crate::common::util_all::current_time_millis;
 use crate::error::{client_error_code, Error, Result};
@@ -1893,7 +1893,9 @@ impl MQClientInstance {
         suspend_timeout_millis: i64,
         addr: Option<&str>,
         request_source: i32,
+        broker_id: Option<i64>,
     ) -> Result<PullResult> {
+        let mut sys_flag = sys_flag;
         let addr = match addr {
             Some(a) => a.to_string(),
             None => {
@@ -1901,12 +1903,34 @@ impl MQClientInstance {
                     .get_topic_route_data(&mq.topic)
                     .await
                     .ok_or_else(|| Error::client(format!("No route info of this topic: {}", mq.topic)))?;
-                Self::find_broker_addr_in_route(&route, &mq.broker_name).ok_or_else(|| {
-                    Error::client(format!(
-                        "Broker {} not found in route of topic {}",
-                        mq.broker_name, mq.topic
-                    ))
-                })?
+                match broker_id {
+                    // Java `PullAPIWrapper#pullKernelImpl:197-205`：按 pullFromWhichNode 选
+                    // brokerId，`findBrokerAddressInSubscribe(brokerName, recalc, false)` 解析地址；
+                    // 命中 slave 时清掉 COMMIT_OFFSET 标记（位点只在 master 上维护）。
+                    Some(id) => {
+                        let broker_data = route
+                            .get_broker_datas()
+                            .iter()
+                            .find(|bd| bd.broker_name == mq.broker_name)
+                            .ok_or_else(|| Error::client(format!("Broker {} not exist", mq.broker_name)))?;
+                        let (chosen, slave) = Self::find_broker_addr_in_subscribe(
+                            &broker_data.broker_addrs,
+                            id,
+                            false,
+                        )
+                        .ok_or_else(|| Error::client(format!("Broker {} not exist", mq.broker_name)))?;
+                        if slave {
+                            sys_flag = PullSysFlag::clear_commit_offset_flag(sys_flag);
+                        }
+                        chosen
+                    }
+                    None => Self::find_broker_addr_in_route(&route, &mq.broker_name).ok_or_else(|| {
+                        Error::client(format!(
+                            "Broker {} not found in route of topic {}",
+                            mq.broker_name, mq.topic
+                        ))
+                    })?,
+                }
             }
         };
         let header = PullMessageRequestHeader {
@@ -1919,7 +1943,16 @@ impl MQClientInstance {
             sys_flag: Some(sys_flag),
             commit_offset: Some(commit_offset),
             suspend_timeout_millis: Some(suspend_timeout_millis),
-            subscription: Some(subscription.to_string()),
+            // Java `PullAPIWrapper#pullKernelImpl:224` 写的是 `subExpression`，push 侧
+            // `DefaultMQPushConsumerImpl.pullMessage:458-468` 在未开 postSubscriptionWhenPull
+            // （或类过滤模式）时它**是 null**；`RemotingCommand.makeCustomHeaderToNet` 跳过
+            // null 字段，于是 `subscription` 键根本不进 extFields。这里按 SUBSCRIPTION 位
+            // 还原这个形状（broker 也只在该位置位时才读它）。
+            subscription: if PullSysFlag::has_subscription_flag(sys_flag) {
+                Some(subscription.to_string())
+            } else {
+                None
+            },
             sub_version: Some(sub_version),
             expression_type: Some(expression_type.to_string()),
             max_msg_bytes: Some(max_msg_bytes),
@@ -1955,7 +1988,36 @@ impl MQClientInstance {
             min_offset: resp_header.min_offset.unwrap_or(0),
             max_offset: resp_header.max_offset.unwrap_or(0),
             msg_found_list: found,
+            suggest_which_broker_id: resp_header.suggest_which_broker_id,
         })
+    }
+
+    /// Java `MQClientInstance#findBrokerAddressInSubscribe`：按 brokerId 选地址。
+    /// 命中 brokerId 直接用；brokerId 是从节点且没命中时按 brokerId+1 再试
+    /// （Java 对从节点 id 的 +1 约定）；仍没有且不限定 brokerId 时取 id 最小的
+    /// （Java 取 map 第一个 entry，这里取确定性形态）。返回 `(addr, is_slave)`。
+    pub(crate) fn find_broker_addr_in_subscribe(
+        broker_addrs: &[(i64, String)],
+        broker_id: i64,
+        only_this_broker: bool,
+    ) -> Option<(String, bool)> {
+        if broker_addrs.is_empty() {
+            return None;
+        }
+        let master_id = MixAll::MASTER_ID as i64;
+        if let Some((_, addr)) = broker_addrs.iter().find(|(id, _)| *id == broker_id) {
+            return Some((addr.clone(), broker_id != master_id));
+        }
+        if broker_id != master_id {
+            if let Some((_, addr)) = broker_addrs.iter().find(|(id, _)| *id == broker_id + 1) {
+                return Some((addr.clone(), true));
+            }
+        }
+        if !only_this_broker {
+            let min = broker_addrs.iter().min_by_key(|(id, _)| *id)?;
+            return Some((min.1.clone(), min.0 != master_id));
+        }
+        None
     }
 }
 
@@ -4298,6 +4360,9 @@ mod tests {
         /// 脚本：下一笔请求的应答码（用完一律回 SUCCESS）。
         codes: Arc<Mutex<VecDeque<i32>>>,
         remarks: Arc<Mutex<VecDeque<String>>>,
+        /// 脚本：下一笔应答的 extFields（用完为空表）。PULL_MESSAGE 的
+        /// `suggestWhichBrokerId` / `nextBeginOffset` 之类都靠它上线。
+        resp_ext: Arc<Mutex<VecDeque<Vec<(String, String)>>>>,
     }
 
     impl MockBroker {
@@ -4315,6 +4380,7 @@ mod tests {
                 state: Arc::new(Mutex::new(Vec::new())),
                 codes: Arc::new(Mutex::new(VecDeque::new())),
                 remarks: Arc::new(Mutex::new(VecDeque::new())),
+                resp_ext: Arc::new(Mutex::new(VecDeque::new())),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -4329,6 +4395,7 @@ mod tests {
                         while let Some(request) = read_request(&mut stream).await {
                             let code = guard(&broker.codes).pop_front();
                             let remark = guard(&broker.remarks).pop_front();
+                            let ext = guard(&broker.resp_ext).pop_front().unwrap_or_default();
                             guard(&broker.state).push(Recorded {
                                 code: request.code,
                                 ext_fields: request
@@ -4343,6 +4410,7 @@ mod tests {
                                 &request,
                                 code.unwrap_or(response_code::SUCCESS),
                                 remark,
+                                ext,
                             )
                             .await;
                         }
@@ -4355,6 +4423,11 @@ mod tests {
         fn script(&self, codes: Vec<i32>, remarks: Vec<String>) {
             *guard(&self.codes) = codes.into();
             *guard(&self.remarks) = remarks.into();
+        }
+
+        /// 脚本化后续应答的 extFields（缺省空表，与改造前行为一致）。
+        fn script_resp_ext(&self, exts: Vec<Vec<(String, String)>>) {
+            *guard(&self.resp_ext) = exts.into();
         }
 
         /// 只保留 46 号请求：路由刷新等副作用不该混进断言。
@@ -4403,12 +4476,16 @@ mod tests {
         request: &RemotingCommand,
         code: i32,
         remark: Option<String>,
+        ext_fields: Vec<(String, String)>,
     ) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt as _;
         let mut response = RemotingCommand::create_response(code, remark);
         // 客户端按 opaque 配对响应，串了就当噪声丢掉，所以必须回原值。
         response.opaque = request.opaque;
         response.serialize_type_current_rpc = request.serialize_type_current_rpc;
+        for (k, v) in ext_fields {
+            response.ext_fields_mut().insert(&k, v);
+        }
         let bytes = response.encode();
         stream.write_all(&bytes).await?;
         stream.flush().await
@@ -4727,5 +4804,205 @@ mod tests {
             header_ext("", "GID_c"),
             vec!["clientID".to_string(), "consumerGroup".to_string()]
         );
+    }
+
+    // ---------------- P5: pullFromWhichNode / findBrokerAddressInSubscribe ----------------
+    //
+    // 对齐 `python/tests/test_pull_post_subscription.py`。Java 契约：
+    //   * `PullAPIWrapper#pullKernelImpl:197-205` 用 `recalculatePullFromWhichNode(mq)`
+    //     调 `MQClientInstance#findBrokerAddressInSubscribe(brokerName, brokerId, false)`；
+    //   * `isSlave()` 时 `PullSysFlag.clearCommitOffsetFlag`（:219-221）——从节点不维护位点；
+    //   * 应答头 `suggestWhichBrokerId` 由 `processPullResult:77` 回写（这里只验证它
+    //     确实带出了 PullResult，回写动作在 consumer.rs 侧）。
+
+    /// Java `findBrokerAddressInSubscribe:1307-1336` 的四个分支，其中 `slave` 判定
+    /// 处处都是「命中的 id != MASTER_ID」，不是「传进来的 brokerId」。
+    #[test]
+    fn find_broker_addr_in_subscribe_branches() {
+        let addrs = vec![
+            (0_i64, "127.0.0.1:10911".to_string()),
+            (1, "127.0.0.1:10921".to_string()),
+            (2, "127.0.0.1:10931".to_string()),
+        ];
+        // 命中：id 直接用，slave = id != 0
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(&addrs, 0, false),
+            Some(("127.0.0.1:10911".to_string(), false))
+        );
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(&addrs, 1, false),
+            Some(("127.0.0.1:10921".to_string(), true))
+        );
+        // 从节点 id 缺失时按 id+1 再试（Java 的从节点编号约定）
+        let sparse = vec![
+            (0_i64, "127.0.0.1:10911".to_string()),
+            (2, "127.0.0.1:10931".to_string()),
+        ];
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(&sparse, 1, false),
+            Some(("127.0.0.1:10931".to_string(), true))
+        );
+        // 都不命中且不限定时回退到 id 最小的那台（Java 取 map 首项，这里取确定性形态）
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(&addrs, 9, false),
+            Some(("127.0.0.1:10911".to_string(), false))
+        );
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(
+                &[(1_i64, "127.0.0.1:10921".to_string())],
+                3,
+                false
+            ),
+            Some(("127.0.0.1:10921".to_string(), true))
+        );
+        // 只认这台（onlyThisBroker）时宁缺毋滥
+        assert_eq!(MQClientInstance::find_broker_addr_in_subscribe(&addrs, 9, true), None);
+        assert_eq!(MQClientInstance::find_broker_addr_in_subscribe(&[], 0, false), None);
+    }
+
+    /// 建好「主 slave 各一台假 broker」的实例：返回 (instance, master, slave)。
+    async fn instance_with_master_slave() -> (
+        MQClientInstance,
+        Arc<MockBroker>,
+        Arc<MockBroker>,
+    ) {
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        let instance = new_instance();
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master.addr.clone()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
+        (instance, master, slave)
+    }
+
+    /// 拉取请求的 extFields 里挑后缀匹配的键（断言报文形状用）。
+    fn ext_of(rec: &Recorded, key: &str) -> Option<String> {
+        rec.ext_fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// brokerId=1（从节点）时：请求打到 slave 地址，`COMMIT_OFFSET` 位被清掉
+    /// （Java `pullKernelImpl:219-221`），SUBSCRIPTION 位关闭时 `subscription`
+    /// 键**整个不上线**。
+    #[tokio::test]
+    async fn pull_message_routes_to_slave_and_clears_commit_offset() {
+        let (instance, master, slave) = instance_with_master_slave().await;
+        slave.script_resp_ext(vec![vec![
+            ("nextBeginOffset".to_string(), "1".to_string()),
+            ("minOffset".to_string(), "0".to_string()),
+            ("maxOffset".to_string(), "10".to_string()),
+            ("suggestWhichBrokerId".to_string(), "0".to_string()),
+        ]]);
+
+        let mq = MessageQueue::new(TOPIC, BROKER, 0);
+        let sys_flag = PullSysFlag::build_sys_flag_basic(true, true, false, false);
+        assert!(PullSysFlag::has_commit_offset_flag(sys_flag));
+
+        let result = instance
+            .pull_message(
+                GROUP,
+                &mq,
+                0,
+                32,
+                sys_flag,
+                0,
+                "TagA",
+                0,
+                "TAG",
+                3000,
+                -1,
+                15000,
+                None,
+                0,
+                Some(i64::from(MixAll::MASTER_ID) + 1),
+            )
+            .await
+            .expect("pull to slave");
+
+        // 打到了 slave，不是 master
+        assert_eq!(slave.recorded(request_code::PULL_MESSAGE).len(), 1);
+        assert!(master.recorded(request_code::PULL_MESSAGE).is_empty());
+        let rec = &slave.recorded(request_code::PULL_MESSAGE)[0];
+        let sent_flag: i32 = ext_of(rec, "sysFlag").expect("sysFlag").parse().unwrap();
+        assert!(
+            !PullSysFlag::has_commit_offset_flag(sent_flag),
+            "slave 上一次 COMMIT_OFFSET 都没有意义"
+        );
+        assert!(PullSysFlag::has_suspend_flag(sent_flag), "suspend 位保持");
+        assert!(
+            ext_of(rec, "subscription").is_none(),
+            "SUBSCRIPTION 位关闭时该字段根本不进 extFields（Java 的 null → 丢字段）"
+        );
+        // 应答头 suggestWhichBrokerId 透传给调用方，供回写 pullFromWhichNodeTable
+        assert_eq!(result.suggest_which_broker_id, Some(0));
+        instance.shutdown();
+    }
+
+    /// brokerId=0（主节点）时：请求打到 master、`COMMIT_OFFSET` 位保留；SUBSCRIPTION
+    /// 位置位时 `subscription` 才上线，内容是调用方给的表达式。
+    #[tokio::test]
+    async fn pull_message_keeps_commit_offset_on_master_and_posts_subscription() {
+        let (instance, master, _slave) = instance_with_master_slave().await;
+        master.script_resp_ext(vec![vec![
+            ("nextBeginOffset".to_string(), "7".to_string()),
+            ("minOffset".to_string(), "0".to_string()),
+            ("maxOffset".to_string(), "10".to_string()),
+        ]]);
+
+        let mq = MessageQueue::new(TOPIC, BROKER, 0);
+        let sys_flag = PullSysFlag::build_sys_flag_basic(true, true, true, false);
+        let result = instance
+            .pull_message(
+                GROUP,
+                &mq,
+                3,
+                32,
+                sys_flag,
+                0,
+                "TagA||TagB",
+                0,
+                "TAG",
+                3000,
+                -1,
+                15000,
+                None,
+                0,
+                Some(i64::from(MixAll::MASTER_ID)),
+            )
+            .await
+            .expect("pull to master");
+
+        let recs = master.recorded(request_code::PULL_MESSAGE);
+        assert_eq!(recs.len(), 1);
+        let sent_flag: i32 = ext_of(&recs[0], "sysFlag").unwrap().parse().unwrap();
+        assert!(PullSysFlag::has_commit_offset_flag(sent_flag), "master 上位点照提交");
+        assert!(PullSysFlag::has_subscription_flag(sent_flag));
+        assert_eq!(ext_of(&recs[0], "subscription").as_deref(), Some("TagA||TagB"));
+        assert_eq!(ext_of(&recs[0], "queueOffset").as_deref(), Some("3"));
+        // 老 broker 不带 suggestWhichBrokerId：调用方按 master=0 记账（None 传出去）
+        assert_eq!(result.suggest_which_broker_id, None);
+        assert_eq!(result.next_begin_offset, 7);
+        instance.shutdown();
     }
 }

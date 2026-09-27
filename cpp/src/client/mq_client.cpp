@@ -542,6 +542,30 @@ std::string MQClientInstance::findBrokerAddrInRoute(const TopicRouteData& route,
     return std::string();
 }
 
+std::pair<std::string, bool> MQClientInstance::findBrokerAddressInSubscribe(
+    const std::map<int64_t, std::string>& brokerAddrs, int64_t brokerId, bool onlyThisBroker) {
+    const int64_t masterId = MixAll::MASTER_ID;
+    if (brokerAddrs.empty()) {
+        return {std::string(), false};
+    }
+    auto hit = brokerAddrs.find(brokerId);
+    if (hit != brokerAddrs.end()) {
+        return {hit->second, brokerId != masterId};
+    }
+    if (brokerId != masterId) {
+        auto next = brokerAddrs.find(brokerId + 1);
+        if (next != brokerAddrs.end()) {
+            return {next->second, true};
+        }
+    }
+    if (!onlyThisBroker) {
+        // Java 取 map 首个 entry（HashMap 序不确定）；这里取 id 最小者，确定化。
+        const auto& first = *brokerAddrs.begin();
+        return {first.second, first.first != masterId};
+    }
+    return {std::string(), false};
+}
+
 std::string MQClientInstance::brokerAddr(const MessageQueue& mq) {
     auto route = getTopicRouteData(mq.topic);
     if (route == nullptr) {
@@ -822,10 +846,41 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
                                         int64_t subVersion, const std::string& expressionType,
                                         int32_t timeoutMillis, int32_t maxMsgBytes,
                                         int32_t suspendTimeoutMillis, const std::string& addrIn,
-                                        int32_t requestSource) {
+                                        int32_t requestSource,
+                                        std::optional<int64_t> brokerId) {
     std::string addr = addrIn;
     if (addr.empty()) {
-        addr = brokerAddr(mq);
+        if (!brokerId.has_value()) {
+            addr = brokerAddr(mq);
+        } else {
+            // 对应 Java pullKernelImpl:197-205 的
+            // findBrokerAddressInSubscribe(brokerName, recalculatePullFromWhichNode(mq), false)：
+            // 按 brokerId 选主/从，而不是 findBrokerAddrInRoute 的「有 master 就用 master」。
+            auto route = getTopicRouteData(mq.topic);
+            if (route == nullptr) {
+                throw MQClientNoRouteException(mq.topic);
+            }
+            const BrokerData* brokerData = nullptr;
+            for (const BrokerData& bd : route->brokerDatas) {
+                if (bd.brokerName == mq.brokerName) {
+                    brokerData = &bd;
+                    break;
+                }
+            }
+            if (brokerData == nullptr) {
+                throw MQClientException("Broker " + mq.brokerName + " not exist");
+            }
+            auto [chosen, slave] =
+                findBrokerAddressInSubscribe(brokerData->brokerAddrs, *brokerId);
+            if (chosen.empty()) {
+                throw MQClientException("Broker " + mq.brokerName + " not exist");
+            }
+            addr = chosen;
+            if (slave) {
+                // Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位
+                sysFlag = PullSysFlag::clearCommitOffsetFlag(sysFlag);
+            }
+        }
     }
 
     auto header = std::make_shared<PullMessageRequestHeader>();
@@ -837,7 +892,13 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     header->sysFlag = sysFlag;
     header->commitOffset = commitOffset;
     header->suspendTimeoutMillis = suspendTimeoutMillis;
-    header->subscription = subscription;
+    // Java `pullKernelImpl` 写的是 subExpression，push 侧未开 postSubscriptionWhenPull
+    // （或类过滤模式）时它是 null，makeCustomHeaderToNet 跳过 null 字段 —— 于是
+    // `subscription` 键根本不进 extFields。这里按 SUBSCRIPTION 位还原该形状
+    // （broker 也只在该位置位时才读它）。
+    header->subscription =
+        PullSysFlag::hasSubscriptionFlag(sysFlag) ? std::optional<std::string>(subscription)
+                                                  : std::nullopt;
     header->subVersion = subVersion;
     header->expressionType = expressionType;
     header->maxMsgBytes = maxMsgBytes;
@@ -860,6 +921,7 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     result.nextBeginOffset = respHeader.nextBeginOffset.value_or(0);
     result.minOffset = respHeader.minOffset.value_or(0);
     result.maxOffset = respHeader.maxOffset.value_or(0);
+    result.suggestWhichBrokerId = respHeader.suggestWhichBrokerId;
     if (!response.body.empty()) {
         result.msgFoundList = decodeMessages(response.body);
         for (MessageExt& m : result.msgFoundList) {

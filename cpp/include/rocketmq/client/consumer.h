@@ -159,6 +159,20 @@ public:
     // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
+
+    // Java `DefaultMQPushConsumer#postSubscriptionWhenPull`（默认 false）：true 时每次
+    // PULL_MESSAGE 把订阅表达式随请求上送（SUBSCRIPTION 位置位），让 broker 侧做过滤；
+    // 默认关闭 —— tag 过滤由客户端 filterMessagesForDelivery 兜底，与 Java 5.x 一致。
+    void setPostSubscriptionWhenPull(bool enable) { postSubscriptionWhenPull_ = enable; }
+    bool isPostSubscriptionWhenPull() const { return postSubscriptionWhenPull_; }
+
+    // Java DefaultMQPushConsumerImpl.pullMessage:458-468 的订阅门控：只有开关打开**且非**
+    // 类过滤模式时才把 subString 随拉取上送（SUBSCRIPTION 位 = subExpression != null）。
+    // 抽成静态纯函数只为单测能覆盖拉取循环里这唯一一处判定。
+    static bool shouldPostSubscriptionWhenPull(bool postSubscriptionWhenPull,
+                                               bool classFilterMode) {
+        return postSubscriptionWhenPull && !classFilterMode;
+    }
     // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：在用 topic 的
     // 路由刷新周期，start() 时透传给 MQClientInstance。
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
@@ -618,6 +632,10 @@ private:
     // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
     // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
     bool enableStreamRequestType_ = false;
+
+    // Java DefaultMQPushConsumer#postSubscriptionWhenPull（默认 false）。push 侧拉取门控：
+    // 只有它打开**且非**类过滤模式时才把 subString 随 PULL_MESSAGE 上送。
+    bool postSubscriptionWhenPull_ = false;
     // Java ClientConfig:58 / :66 的门面级副本（start() 时各透传/读取一次）
     int32_t pollNameServerIntervalMillis_ = 30000;
     int32_t persistConsumerOffsetIntervalMillis_ = 5000;
@@ -705,6 +723,9 @@ private:
     // PopProcessQueue.lastPopTimestamp）。rebalance 用它判 pull 是否停摆（kPullMaxIdleTime）。
     // 0 = 循环自己返回了却仍持有该队列（异常打穿），下一趟按停摆撤走重建。
     std::map<std::string, int64_t> lastPullAt_;
+    // Java PullAPIWrapper#pullFromWhichNodeTable（键 = 本端 offsetKey）：每次拉取应答头里的
+    // suggestWhichBrokerId 回写进来，下次拉取按它选主/从（缺省 MASTER_ID=0）。
+    std::map<std::string, int64_t> pullFromWhichNode_;
     // 被撤销队列对应的旧拉取线程（已脱离 pullThreads_，等待其自然退出后回收）
     std::vector<std::thread> retiredThreads_;
     std::thread dispatchThread_;

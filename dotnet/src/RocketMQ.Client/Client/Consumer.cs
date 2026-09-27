@@ -177,6 +177,18 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
+    /// 对应 Java <c>DefaultMQPushConsumer#postSubscriptionWhenPull</c>（默认 false）。
+    /// 打开后每次 PULL_MESSAGE 把订阅表达式随请求上送（SUBSCRIPTION 位置位），
+    /// 让 broker 侧做过滤；默认关闭 —— tag 过滤由客户端
+    /// <c>FilterMessagesForDelivery</c> 兜底，与 Java 5.x 的默认行为一致。
+    /// </summary>
+    public bool PostSubscriptionWhenPull
+    {
+        get => _postSubscriptionWhenPull;
+        set => _postSubscriptionWhenPull = value;
+    }
+
+    /// <summary>
     /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
     /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
     /// </summary>
@@ -406,6 +418,14 @@ public sealed class DefaultMQPushConsumer
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType;
+
+    // Java DefaultMQPushConsumer#postSubscriptionWhenPull：默认 false（表达式不败上送，
+    // tag 过滤走客户端 FilterMessagesForDelivery）。
+    private bool _postSubscriptionWhenPull;
+
+    // Java PullAPIWrapper#pullFromWhichNodeTable（键 = Java toString 形态的 MessageQueue）：
+    // 每次拉取应答头里的 suggestWhichBrokerId 回写进来，下次拉取按它选主/从。
+    private readonly Dictionary<string, long> _pullFromWhichNode = new(StringComparer.Ordinal);
 
     // ClientConfig 的两个周期（Java :58 / :66 的默认值，Start() 时定型）
     private int _pollNameServerIntervalMillis = 30000;
@@ -2589,13 +2609,29 @@ public sealed class DefaultMQPushConsumer
             PullResult result;
             try
             {
+                // Java DefaultMQPushConsumerImpl.pullMessage:458-468：只有
+                // postSubscriptionWhenPull 打开且**非**类过滤模式时才带订阅表达式
+                // （SUBSCRIPTION 位 = subExpression != null）。
+                string? expr = PullSubscriptionExpression(sub);
                 int sysFlag = PullSysFlag.BuildSysFlag(
-                    /*commitOffset=*/false, /*suspend=*/true, /*subscription=*/true, /*classFilter=*/false);
-                string expr = UtilAll.IsBlank(sub.SubString) ? "*" : sub.SubString;
+                    /*commitOffset=*/false, /*suspend=*/true,
+                    /*subscription=*/expr is not null, /*classFilter=*/false);
+                long brokerId;
+                lock (_lock)
+                {
+                    // Java PullAPIWrapper#recalculatePullFromWhichNode：无记录按 master=0
+                    brokerId = _pullFromWhichNode.TryGetValue(key, out long bid) ? bid : MixAll.MasterId;
+                }
+
                 long pullBegan = UtilAll.CurrentTimeMillis();
                 result = c.PullMessage(ConsumerGroup, mq, offset, _pullBatchSize, sysFlag,
-                    /*commitOffset=*/0, expr, sub.SubVersion, sub.ExpressionType,
-                    _pullTimeoutMillis, _pullBatchSizeInBytes, _pullSuspendTimeoutMillis);
+                    /*commitOffset=*/0, expr ?? string.Empty, sub.SubVersion, sub.ExpressionType,
+                    _pullTimeoutMillis, _pullBatchSizeInBytes, _pullSuspendTimeoutMillis,
+                    /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/brokerId);
+                // Java PullAPIWrapper#processPullResult:77：每轮应答都回写
+                // pullFromWhichNodeTable（缺省按 master=0 记账，与 Java long 原语同口径）
+                UpdatePullFromWhichNode(key, result.SuggestWhichBrokerId);
+
                 // 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
                 _mqClient!.ConsumerStats.IncPullRT(ConsumerGroup, mq.Topic,
                     UtilAll.CurrentTimeMillis() - pullBegan);
@@ -3367,6 +3403,57 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>跑一次拉取前流控判定（不经过网络）。命中会把 <see cref="FlowControlTriggered"/> 加一格。</summary>
     public bool FlowControlHitForTest(MessageQueue mq, string key) => FlowControlHit(mq, key);
+
+    // ---------------- postSubscriptionWhenPull / pullFromWhichNode ----------------
+
+    /// <summary>
+    /// Java <c>DefaultMQPushConsumerImpl.pullMessage:458-468</c> 的订阅门控：只有
+    /// <see cref="PostSubscriptionWhenPull"/> 打开**且非**类过滤模式时才把订阅表达式随请求
+    /// 上送；默认关闭（Java 5.x 默认 false），tag 过滤交给客户端
+    /// <c>FilterMessagesForDelivery</c> 兜底。空表达式归一成 <c>"*"</c>（与 FilterAPI 同口径）。
+    /// </summary>
+    private string? PullSubscriptionExpression(SubscriptionData sub)
+    {
+        if (!PostSubscriptionWhenPull || sub.ClassFilterMode)
+        {
+            return null;
+        }
+
+        return UtilAll.IsBlank(sub.SubString) ? "*" : sub.SubString;
+    }
+
+    /// <summary>
+    /// Java <c>PullAPIWrapper#updatePullFromWhichNode:157-164</c>：把应答头里的
+    /// <c>suggestWhichBrokerId</c> 写回表；缺省（老 broker 不带该字段）按 master=0 记账 ——
+    /// 与 Java 的 long 原语口径一致，所以**不能**把 null 当成「保留旧值」。
+    /// </summary>
+    private void UpdatePullFromWhichNode(string key, long? suggest)
+    {
+        lock (_lock)
+        {
+            _pullFromWhichNode[key] = suggest ?? MixAll.MasterId;
+        }
+    }
+
+    /// <summary>Java <c>PullAPIWrapper#recalculatePullFromWhichNode</c>：无记录按 master=0。</summary>
+    private long PullFromWhichNode(string key)
+    {
+        lock (_lock)
+        {
+            return _pullFromWhichNode.TryGetValue(key, out long brokerId) ? brokerId : MixAll.MasterId;
+        }
+    }
+
+    /// <summary>单测入口：拉取循环里那两段门控/记账逻辑（不起集群也能锁语义）。</summary>
+    public string? PullSubscriptionExpressionForTest(SubscriptionData sub) =>
+        PullSubscriptionExpression(sub);
+
+    /// <summary>单测入口：见 <see cref="PullFromWhichNode"/>。</summary>
+    public long PullFromWhichNodeForTest(string key) => PullFromWhichNode(key);
+
+    /// <summary>单测入口：见 <see cref="UpdatePullFromWhichNode"/>。</summary>
+    public void UpdatePullFromWhichNodeForTest(string key, long? suggest) =>
+        UpdatePullFromWhichNode(key, suggest);
 
     /// <summary>已消费位点；null = 该队列还没有记录。</summary>
     public long? ConsumeOffsetForTest(string key)

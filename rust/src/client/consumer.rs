@@ -42,7 +42,7 @@
 //! 循环/重平衡状态机没有共享代码；两模块共用的只有本文件导出的
 //! [`filter_messages_for_delivery`] 等工具。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -454,6 +454,9 @@ pub struct ConsumerConfig {
     pub trace_topic: Option<String>,
     /// Python `trace_msg_batch_num` = 10。
     pub trace_msg_batch_num: i32,
+    /// Java `DefaultMQPushConsumer.postSubscriptionWhenPull` = false：true 时把订阅
+    /// 表达式随 PULL_MESSAGE 上送（SUBSCRIPTION 位）——仅类过滤模式的服务端场景需要。
+    pub post_subscription_when_pull: bool,
 }
 
 impl Default for ConsumerConfig {
@@ -504,6 +507,7 @@ impl Default for ConsumerConfig {
             enable_trace: false,
             trace_topic: None,
             trace_msg_batch_num: 10,
+            post_subscription_when_pull: false,
         }
     }
 }
@@ -666,6 +670,13 @@ struct State {
     /// `popMessage:508`），所以长轮询挂起和流控等待都不会把还在跑的循环判成停摆。
     /// 循环已退出但仍占着归属时写 `0`（Rust 任务没有 `is_alive()`，用这个哨兵表达「死了」）。
     last_pull_at: BTreeMap<String, i64>,
+    /// Java `PullAPIWrapper.pullFromWhichNodeTable`：队列 → 下一轮拉取该选的 brokerId。
+    ///
+    /// 由拉取应答头里的 `suggestWhichBrokerId` 驱动（`processPullResult:77`），缺省
+    /// 按 master(=0) 记账；下次拉取据此走 `findBrokerAddressInSubscribe` 选主/从。
+    /// 用 `HashMap` 而不是 `BTreeMap`：与 Java 的 `ConcurrentMap` 同形，且 `MessageQueue`
+    /// 已实现 `Hash + Eq`；这张表不参与任何报文序列化，遍历顺序无影响。
+    pull_from_which_node: HashMap<MessageQueue, i64>,
 }
 
 impl State {
@@ -921,6 +932,15 @@ impl DefaultMQPushConsumer {
     /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
+    }
+
+    /// Java `DefaultMQPushConsumer#setPostSubscriptionWhenPull`（默认 false）。
+    ///
+    /// 打开后每次 PULL_MESSAGE 会把订阅表达式随请求上送（SUBSCRIPTION 位置位），
+    /// 让 broker 侧做过滤；默认关闭 —— 过滤由客户端 `filter_messages_for_delivery`
+    /// 兜底，与 Java 5.x 的默认行为一致。
+    pub fn set_post_subscription_when_pull(&self, enable: bool) {
+        self.update_config(|c| c.post_subscription_when_pull = enable);
     }
 
     /// Python `set_consume_from_where`（取 [`ConsumeFromWhere`] 里的常量）。
@@ -2047,6 +2067,38 @@ fn mark_pull_loop_exited(inner: &Inner, key: &str, token: u64) {
     }
 }
 
+/// Java `DefaultMQPushConsumerImpl.pullMessage:458-468` 的订阅门控：
+/// 只有 `postSubscriptionWhenPull` 打开**且非**类过滤模式时才把订阅表达式随请求上送；
+/// 默认关闭（Java 5.x 默认 false），tag 过滤交给客户端
+/// [`filter_messages_for_delivery`] 兜底。
+fn pull_subscription_expression(cfg: &ConsumerConfig, sub: &SubscriptionData) -> Option<String> {
+    if cfg.post_subscription_when_pull && !sub.class_filter_mode {
+        Some(sub.sub_string.clone())
+    } else {
+        None
+    }
+}
+
+/// Java `PullAPIWrapper#recalculatePullFromWhichNode`：表里没有该队列时按
+/// `defaultBrokerId`（= `MixAll.MASTER_ID`）算，于是首轮总是打主节点。
+fn recalc_pull_from_which_node(state: &State, mq: &MessageQueue) -> i64 {
+    state
+        .pull_from_which_node
+        .get(mq)
+        .copied()
+        .unwrap_or(MixAll::MASTER_ID as i64)
+}
+
+/// Java `PullAPIWrapper#updatePullFromWhichNode:157-164`：把应答头里的
+/// `suggestWhichBrokerId` 写回表。缺省（老 broker 不带该字段）按 master=0 记账 ——
+/// 与 Java 的 `PullResultExt.getSuggestWhichBrokerId()`（long 原语，默认 0）同口径，
+/// 所以**不能**把 `None` 当成「保留旧值」。
+fn update_pull_from_which_node(state: &mut State, mq: &MessageQueue, suggest: Option<i64>) {
+    state
+        .pull_from_which_node
+        .insert(mq.clone(), suggest.unwrap_or(MixAll::MASTER_ID as i64));
+}
+
 /// Python `_queue_pull_loop`：单队列长轮询拉取 → 推入待消费缓冲。
 ///
 /// 每队列一个循环（不是共享线程池），因为 broker 为每个队列各挂起一个长轮询；
@@ -2109,7 +2161,21 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 }
             },
         };
-        let sys_flag = PullSysFlag::build_sys_flag_basic(false, true, true, false);
+        // Java DefaultMQPushConsumerImpl.pullMessage:458-468 —— subscription 位置位
+        // 与否完全由 subExpression 是否为 null 决定（见 helper 文档）。
+        let sub_expression = pull_subscription_expression(&cfg, &sub);
+        let sys_flag = PullSysFlag::build_sys_flag_basic(
+            false,
+            true,
+            sub_expression.is_some(),
+            false,
+        );
+        // Java PullAPIWrapper#pullKernelImpl:197-205：按 pullFromWhichNodeTable 里的
+        // brokerId 选主/从（缺省 MASTER_ID=0），应答后回写。
+        let broker_id = {
+            let state = lock(&inner.state);
+            recalc_pull_from_which_node(&state, &mq)
+        };
         let began = current_time_millis();
         let result = match client
             .pull_message(
@@ -2119,7 +2185,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 cfg.pull_batch_size,
                 sys_flag,
                 0,
-                &sub.sub_string,
+                sub_expression.as_deref().unwrap_or(""),
                 sub.sub_version,
                 &sub.expression_type,
                 cfg.pull_timeout_millis,
@@ -2127,6 +2193,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 cfg.pull_suspend_timeout_millis,
                 None,
                 0,
+                Some(broker_id),
             )
             .await
         {
@@ -2150,6 +2217,12 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 continue;
             }
         };
+        // Java PullAPIWrapper#processPullResult:77 —— 每轮应答都更新 pullFromWhichNodeTable
+        // （缺省按 master=0 记账，见 helper 文档）。
+        {
+            let mut state = lock(&inner.state);
+            update_pull_from_which_node(&mut state, &mq, result.suggest_which_broker_id);
+        }
         // 消费统计（Java PullCallback.onSuccess：RT 恒记，TPS 只在有消息时记）
         if let Some(stats) = lock(&inner.stats).clone() {
             stats.inc_pull_rt(&cfg.consumer_group, &mq.topic, current_time_millis() - began);
@@ -7018,5 +7091,55 @@ mod tests {
         assert_eq!(loaded.get("Ttbroker-a1"), Some(&9));
         assert_eq!(loaded.get("Ttbroker-a0"), Some(&7));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---------------- P5: postSubscriptionWhenPull / pullFromWhichNode ----------------
+    //
+    // 对齐 `python/tests/test_pull_post_subscription.py` 的 push 侧两节。这层是纯函数，
+    // 真报文形状（SUBSCRIPTION 位与 `subscription` 键是否上线、slave 地址选择、从节点
+    // COMMIT_OFFSET 清位、suggestWhichBrokerId 透传）在 `mq_client.rs` 的假 broker 用例里锁死。
+
+    const P5_TOPIC: &str = "P5PostSubscriptionTopic";
+
+    /// Java `DefaultMQPushConsumer.postSubscriptionWhenPull` 默认 false：默认**不上送**
+    /// 订阅表达式（SUBSCRIPTION 位清零），tag 过滤靠客户端
+    /// `filter_messages_for_delivery` 兜底；打开且非类过滤模式才上送。
+    #[test]
+    fn pull_subscription_expression_follows_java_default() {
+        let s = sub(P5_TOPIC, "TagA");
+        // 默认关闭
+        assert_eq!(pull_subscription_expression(&ConsumerConfig::default(), &s), None);
+        // 打开
+        let mut cfg = ConsumerConfig::default();
+        cfg.post_subscription_when_pull = true;
+        assert_eq!(pull_subscription_expression(&cfg, &s).as_deref(), Some("TagA"));
+        // 类过滤模式：即使打开也不上送（表达式是过滤类名，broker 侧 TAG 过滤会误判）
+        let mut class_mode = sub(P5_TOPIC, "com.example.MyFilter");
+        class_mode.class_filter_mode = true;
+        assert_eq!(pull_subscription_expression(&cfg, &class_mode), None);
+    }
+
+    /// Java `PullAPIWrapper#recalculatePullFromWhichNode` / `#updatePullFromWhichNode`：
+    /// 首轮无记录按主节点 0；应答缺 `suggestWhichBrokerId` 也按 0 记账（Java long 原语），
+    /// 有了 suggest 就按它选路；表按队列隔离。
+    #[test]
+    fn pull_from_which_node_defaults_to_master_and_round_trips() {
+        let mut state = State::default();
+        let mq = MessageQueue::new(P5_TOPIC, "broker-a", 0);
+        let other = MessageQueue::new(P5_TOPIC, "broker-a", 1);
+        let master = i64::from(MixAll::MASTER_ID);
+
+        assert_eq!(recalc_pull_from_which_node(&state, &mq), master, "首轮打主节点");
+
+        // 老 broker 不带 suggest：按 master 记账，而不是保留旧值
+        update_pull_from_which_node(&mut state, &mq, Some(master + 1));
+        assert_eq!(recalc_pull_from_which_node(&state, &mq), master + 1);
+        update_pull_from_which_node(&mut state, &mq, None);
+        assert_eq!(recalc_pull_from_which_node(&state, &mq), master);
+
+        // 按队列隔离
+        update_pull_from_which_node(&mut state, &mq, Some(2));
+        assert_eq!(recalc_pull_from_which_node(&state, &mq), 2);
+        assert_eq!(recalc_pull_from_which_node(&state, &other), master);
     }
 }

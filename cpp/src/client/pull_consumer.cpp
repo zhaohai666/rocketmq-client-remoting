@@ -185,12 +185,16 @@ PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string
     MessageQueue real = mq;
     real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
     const SubscriptionData sub = FilterAPI::buildSubscriptionData(real.topic, subExpression);
-    return mqClient_->pullMessage(
+    // Java PullAPIWrapper#pullKernelImpl：按 pullFromWhichNodeTable 选主/从
+    PullResult result = mqClient_->pullMessage(
         consumerGroup_, real, offset, maxNums, sysFlag, /*commitOffset=*/0,
         sub.subString.empty() ? std::string("*") : sub.subString,
         // Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
         /*subVersion=*/0, ExpressionType::TAG, timeout, /*maxMsgBytes=*/-1,
-        /*suspendTimeoutMillis=*/15000);
+        /*suspendTimeoutMillis=*/15000, /*addr=*/std::string(), /*requestSource=*/0,
+        /*brokerId=*/recalculatePullFromWhichNode(real));
+    updatePullFromWhichNode(real, result);
+    return result;
 }
 
 PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
@@ -208,11 +212,28 @@ PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
     MessageQueue real = mq;
     real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
     const SubscriptionData sub = FilterAPI::buildSubscriptionData(real.topic, subExpression);
-    return mqClient_->pullMessage(
+    PullResult result = mqClient_->pullMessage(
         consumerGroup_, real, offset, maxNums, sysFlag, /*commitOffset=*/0,
         sub.subString.empty() ? std::string("*") : sub.subString,
         /*subVersion=*/0, ExpressionType::TAG, consumerTimeoutMillisWhenSuspend_,
-        /*maxMsgBytes=*/-1, brokerSuspendMaxTimeMillis_);
+        /*maxMsgBytes=*/-1, brokerSuspendMaxTimeMillis_, /*addr=*/std::string(),
+        /*requestSource=*/0, /*brokerId=*/recalculatePullFromWhichNode(real));
+    updatePullFromWhichNode(real, result);
+    return result;
+}
+
+// Java PullAPIWrapper#recalculatePullFromWhichNode：表里没有该队列时按 master=0。
+int64_t DefaultMQPullConsumer::recalculatePullFromWhichNode(const MessageQueue& mq) const {
+    auto it = pullFromWhichNode_.find(mq);
+    return it != pullFromWhichNode_.end() ? it->second : MixAll::MASTER_ID;
+}
+
+// Java PullAPIWrapper#updatePullFromWhichNode:157-164：把应答头里的 suggestWhichBrokerId
+// 写回表；缺省（老 broker 不带该字段）按 master=0 记账 —— 与 Java 的 long 原语口径一致，
+// 所以不能把「没有该字段」当成"保留旧值"。
+void DefaultMQPullConsumer::updatePullFromWhichNode(const MessageQueue& mq,
+                                                    const PullResult& result) {
+    pullFromWhichNode_[mq] = result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
 }
 
 // ---------------------------------------------------------------- 位点管理

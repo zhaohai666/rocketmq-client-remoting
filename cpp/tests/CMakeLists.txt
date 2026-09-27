@@ -229,3 +229,12 @@ add_test(NAME local_offsets COMMAND rmq_test_local_offsets)
 add_executable(rmq_test_scheduled_intervals test_scheduled_intervals.cpp)
 target_link_libraries(rmq_test_scheduled_intervals PRIVATE rocketmq::remoting)
 add_test(NAME scheduled_intervals COMMAND rmq_test_scheduled_intervals)
+
+# postSubscriptionWhenPull（Java DefaultMQPushConsumer 默认 false）+ pullFromWhichNode
+# （Java PullAPIWrapper#recalculatePullFromWhichNode / #updatePullFromWhichNode）：
+# findBrokerAddressInSubscribe 的四个分支、按 brokerId 选主/从的真实 socket 报文、
+# 从节点清 COMMIT_OFFSET 位（:219-221）、SUBSCRIPTION 位关闭时 subscription 键不上线、
+# 以及从节点缺席时回退主节点。与 python/tests/test_pull_post_subscription.py 同题。
+add_executable(rmq_test_pull_post_subscription test_pull_post_subscription.cpp)
+target_link_libraries(rmq_test_pull_post_subscription PRIVATE rocketmq::remoting)
+add_test(NAME pull_post_subscription COMMAND rmq_test_pull_post_subscription)

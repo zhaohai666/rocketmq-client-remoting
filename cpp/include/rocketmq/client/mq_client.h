@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "rocketmq/client/consumer_stats.h"
@@ -187,7 +188,16 @@ public:
     bool isTopicRouteCached(const std::string& topic) const;
 
     static std::string findBrokerAddrInRoute(const TopicRouteData& route,
-                                            const std::string& brokerName);
+                                             const std::string& brokerName);
+
+    // 对应 Java MQClientInstance#findBrokerAddressInSubscribe:1307-1336：按 brokerId 取地址。
+    // 命中 brokerId 直接用（isSlave = brokerId != MASTER_ID）；brokerId 是从节点且没命中时
+    // 按 brokerId+1 再试（Java 的从节点编号约定）；仍没命中且 onlyThisBroker=false 时取
+    // id 最小的那台（Java 取 map 首项，这里取确定性形态）。返回 (地址, 是否从节点)；
+    // 找不到时地址为空串、isSlave=false。
+    static std::pair<std::string, bool> findBrokerAddressInSubscribe(
+        const std::map<int64_t, std::string>& brokerAddrs, int64_t brokerId,
+        bool onlyThisBroker = false);
 
     // ---------------- 消息发送 ----------------
     // sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
@@ -240,6 +250,10 @@ public:
                               int32_t timeoutMillis = 3000);
 
     // ---------------- 消息拉取 ----------------
+    // brokerId：对应 Java PullAPIWrapper#pullKernelImpl:197-205 的
+    // findBrokerAddressInSubscribe(brokerName, recalculatePullFromWhichNode(mq), false)。
+    // nullopt = 走老路径（findBrokerAddrInRoute，有 master 就用 master）；给了值就按
+    // brokerId 选主/从，命中从节点时清掉 COMMIT_OFFSET 位（:219-221）。
     PullResult pullMessage(const std::string& consumerGroup, const MessageQueue& mq,
                            int64_t queueOffset, int32_t maxMsgNums, int32_t sysFlag,
                            int64_t commitOffset, const std::string& subscription,
@@ -247,7 +261,8 @@ public:
                            int32_t timeoutMillis = 30000, int32_t maxMsgBytes = -1,
                            int32_t suspendTimeoutMillis = 15000,
                            const std::string& addr = std::string(),
-                           int32_t requestSource = 0);
+                           int32_t requestSource = 0,
+                           std::optional<int64_t> brokerId = std::nullopt);
 
     // ---------------- 消费位点 ----------------
     // 返回 false 表示 broker 回 QUERY_NOT_FOUND（消费组尚无位点）

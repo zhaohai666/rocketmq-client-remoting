@@ -130,6 +130,14 @@ public:
     PullResult pullBlockIfNotFound(const MessageQueue& mq, const std::string& subExpression,
                                    int64_t offset, int32_t maxNums);
 
+    // Java `PullAPIWrapper#recalculatePullFromWhichNode`：下一轮该向哪个 brokerId 拉
+    // （表里没有该队列时按 MASTER_ID=0）。公开是为了单测能直接覆盖这段纯逻辑。
+    int64_t recalculatePullFromWhichNode(const MessageQueue& mq) const;
+
+    // Java `PullAPIWrapper#updatePullFromWhichNode:157-164`：把应答头里的
+    // suggestWhichBrokerId 写回表；缺省（老 broker）按 master=0 记账。
+    void updatePullFromWhichNode(const MessageQueue& mq, const PullResult& result);
+
     // ---------------- 位点管理 ----------------
     // 返回 false 表示该消费组在该队列上尚无位点（broker 回 QUERY_NOT_FOUND）。
     bool fetchConsumeOffset(const MessageQueue& mq, int64_t& outOffset);
@@ -176,6 +184,9 @@ private:
         std::make_shared<AllocateMessageQueueAveragely>();
 
     std::unique_ptr<MQClientInstance> mqClient_;
+    // Java DefaultMQPullConsumerImpl.pullAPIWrapper.pullFromWhichNodeTable：每次拉取应答头里的
+    // suggestWhichBrokerId 回写进来，下次拉取按它选主/从（缺省 MASTER_ID=0）。
+    std::map<MessageQueue, int64_t> pullFromWhichNode_;
     bool started_ = false;
 };
 

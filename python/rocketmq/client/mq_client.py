@@ -23,7 +23,7 @@ from ..common.message_decoder import (decode_message, decode_messages, decompres
                                       string_2_message_properties)
 from ..common.mix_all import MixAll
 from ..common.subscription_data import ExpressionType, SubscriptionData
-from ..common.sysflag import MessageSysFlag
+from ..common.sysflag import MessageSysFlag, PullSysFlag
 from ..common.topic_config import TopicFilterType
 from ..logging import get_logger
 from ..remoting.client import RemotingClient
@@ -927,15 +927,32 @@ class MQClientInstance:
                      subscription: str, sub_version: int, expression_type: str,
                      timeout_millis: int = 30000, max_msg_bytes: int = -1,
                      suspend_timeout_millis: int = 15000, addr: Optional[str] = None,
-                     request_source: int = 0) -> "PullResult":
+                     request_source: int = 0,
+                     broker_id: Optional[int] = None) -> "PullResult":
         from .consumer_result import PullResult, PullStatus
+        slave = False
         if addr is None:
             route = self.get_topic_route_data(mq.topic)
             if route is None:
                 raise MQClientException("No route info of this topic: %s" % mq.topic)
-            addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
-            if addr is None:
-                raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
+            if broker_id is not None:
+                # 对应 Java pullKernelImpl 的 findBrokerAddressInSubscribe(brokerName,
+                # recalculatePullFromWhichNode(mq), false)：按 brokerId 选主/从。
+                broker_data = next((bd for bd in route.broker_datas
+                                    if bd.broker_name == mq.broker_name), None)
+                if broker_data is None:
+                    raise MQClientException("Broker %s not exist" % mq.broker_name)
+                addr, slave = MQClientInstance.find_broker_addr_in_subscribe(
+                    broker_data.broker_addrs, broker_id)
+                if addr is None:
+                    raise MQClientException("Broker %s not exist" % mq.broker_name)
+            else:
+                addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
+                if addr is None:
+                    raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
+        if slave:
+            # Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位
+            sys_flag = PullSysFlag.clear_commit_offset_flag(sys_flag)
         header = PullMessageRequestHeader()
         header.consumer_group = consumer_group
         header.topic = mq.topic
@@ -974,7 +991,30 @@ class MQClientInstance:
                 m.broker_name = mq.broker_name
                 m.queue_id = mq.queue_id
         return PullResult(status, resp_header.next_begin_offset or 0,
-                          resp_header.min_offset or 0, resp_header.max_offset or 0, found)
+                          resp_header.min_offset or 0, resp_header.max_offset or 0, found,
+                          suggest_which_broker_id=resp_header.suggest_which_broker_id)
+
+    @staticmethod
+    def find_broker_addr_in_subscribe(broker_addrs: Dict[int, str], broker_id: int,
+                                      only_this_broker: bool = False):
+        """对应 Java `MQClientInstance#findBrokerAddressInSubscribe`：按 brokerId 选地址。
+        命中 brokerId 直接用；brokerId 是从节点且没命中时按 brokerId+1 再试
+        （Java 对从节点 id 的 +1 约定）；仍没有且不限定 brokerId 时取 id 最小的
+        （即 master，Java 取 map 第一个 entry，这里取确定性形态）。
+        返回 ``(addr, is_slave)``；找不到时 ``(None, False)``。"""
+        if not broker_addrs:
+            return None, False
+        addr = broker_addrs.get(broker_id)
+        if addr is not None:
+            return addr, broker_id != MixAll.MASTER_ID
+        if broker_id != MixAll.MASTER_ID:
+            addr = broker_addrs.get(broker_id + 1)
+            if addr is not None:
+                return addr, True
+        if not only_this_broker:
+            first_id = min(broker_addrs)
+            return broker_addrs[first_id], first_id != MixAll.MASTER_ID
+        return None, False
 
     # ---------------- POP 模式（5.x 轻量消费） ----------------
 

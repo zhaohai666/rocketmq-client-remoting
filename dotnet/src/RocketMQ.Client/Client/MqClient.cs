@@ -725,6 +725,41 @@ public sealed class MQClientInstance : IDisposable
         return string.Empty;
     }
 
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#findBrokerAddressInSubscribe:1307-1336</c>：按 brokerId 取地址。
+    /// 命中 brokerId 直接用（<c>IsSlave = brokerId != MASTER_ID</c>）；brokerId 是从节点且没命中时
+    /// 按 brokerId+1 再试（Java 的从节点编号约定）；都没命中且不限定 brokerId 时取 id 最小的那台
+    /// （Java 取 map 首个 entry，这里取确定性形态）。返回 <c>(地址, 是否从节点)</c>；
+    /// 找不到时地址为空串。
+    /// </summary>
+    public static (string Addr, bool IsSlave) FindBrokerAddressInSubscribe(
+        IReadOnlyDictionary<long, string> brokerAddrs, long brokerId, bool onlyThisBroker = false)
+    {
+        if (brokerAddrs.Count == 0)
+        {
+            return (string.Empty, false);
+        }
+
+        if (brokerAddrs.TryGetValue(brokerId, out string? hit))
+        {
+            return (hit, brokerId != MixAll.MasterId);
+        }
+
+        if (brokerId != MixAll.MasterId
+            && brokerAddrs.TryGetValue(brokerId + 1, out string? next))
+        {
+            return (next, true);
+        }
+
+        if (!onlyThisBroker)
+        {
+            long minId = brokerAddrs.Keys.Min();
+            return (brokerAddrs[minId], minId != MixAll.MasterId);
+        }
+
+        return (string.Empty, false);
+    }
+
     private string BrokerAddr(MessageQueue mq)
     {
         TopicRouteData? route = GetTopicRouteData(mq.Topic);
@@ -1156,12 +1191,51 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 30000, int maxMsgBytes = -1,
         int suspendTimeoutMillis = 15000,
         string? addrIn = null,
-        int requestSource = 0)
+        int requestSource = 0,
+        long? brokerId = null)
     {
         string addr = addrIn ?? string.Empty;
         if (addr.Length == 0)
         {
-            addr = BrokerAddr(mq);
+            if (brokerId is null)
+            {
+                addr = BrokerAddr(mq);
+            }
+            else
+            {
+                // 对应 Java pullKernelImpl:197-205 的
+                // findBrokerAddressInSubscribe(brokerName, recalculatePullFromWhichNode(mq), false)：
+                // 按 brokerId 选主/从，而不是 findBrokerAddrInRoute 的「有 master 就用 master」。
+                TopicRouteData? route = GetTopicRouteData(mq.Topic)
+                    ?? throw new MQClientNoRouteException(mq.Topic);
+                BrokerData? brokerData = null;
+                foreach (BrokerData bd in route.BrokerDatas)
+                {
+                    if (bd.BrokerName == mq.BrokerName)
+                    {
+                        brokerData = bd;
+                        break;
+                    }
+                }
+
+                if (brokerData is null)
+                {
+                    throw new MQClientException("Broker " + mq.BrokerName + " not exist");
+                }
+
+                (addr, bool isSlave) = FindBrokerAddressInSubscribe(
+                    brokerData.BrokerAddrs, brokerId.Value);
+                if (addr.Length == 0)
+                {
+                    throw new MQClientException("Broker " + mq.BrokerName + " not exist");
+                }
+
+                if (isSlave)
+                {
+                    // Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位
+                    sysFlag = PullSysFlag.ClearCommitOffsetFlag(sysFlag);
+                }
+            }
         }
 
         var header = new PullMessageRequestHeader
@@ -1174,7 +1248,11 @@ public sealed class MQClientInstance : IDisposable
             SysFlag = sysFlag,
             CommitOffset = commitOffset,
             SuspendTimeoutMillis = suspendTimeoutMillis,
-            Subscription = subscription,
+            // Java `pullKernelImpl` 写的是 subExpression，push 侧未开 postSubscriptionWhenPull
+            // （或类过滤模式）时它是 null，`makeCustomHeaderToNet` 跳过 null 字段 —— 于是
+            // `subscription` 键根本不进 extFields。这里按 SUBSCRIPTION 位还原该形状
+            // （broker 也只在该位置位时才读它）。
+            Subscription = PullSysFlag.HasSubscriptionFlag(sysFlag) ? subscription : null,
             SubVersion = subVersion,
             ExpressionType = expressionType,
             MaxMsgBytes = maxMsgBytes,
@@ -1212,6 +1290,8 @@ public sealed class MQClientInstance : IDisposable
             NextBeginOffset = respHeader.NextBeginOffset ?? 0,
             MinOffset = respHeader.MinOffset ?? 0,
             MaxOffset = respHeader.MaxOffset ?? 0,
+            // 透传给调用方，由它回写 pullFromWhichNodeTable（processPullResult:77）
+            SuggestWhichBrokerId = respHeader.SuggestWhichBrokerId,
         };
         if (response.Body.Length > 0)
         {

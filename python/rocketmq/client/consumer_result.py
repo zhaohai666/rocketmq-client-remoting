@@ -39,12 +39,17 @@ class ConsumeReturnType(Enum):
 class PullResult:
     def __init__(self, status: PullStatus, next_begin_offset: int = 0,
                  min_offset: int = 0, max_offset: int = 0,
-                 msg_found_list: Optional[List[MessageExt]] = None):
+                 msg_found_list: Optional[List[MessageExt]] = None,
+                 suggest_which_broker_id: Optional[int] = None):
         self.status = status
         self.next_begin_offset = next_begin_offset
         self.min_offset = min_offset
         self.max_offset = max_offset
         self.msg_found_list = msg_found_list or []
+        # 对应 Java PullResultExt.suggestWhichBrokerId：broker 建议下次从哪个 brokerId
+        # 拉（主从部署时可能是从节点）。PullAPIWrapper#processPullResult 拿它更新
+        # pullFromWhichNodeTable。None = 响应头没带（老 broker）。
+        self.suggest_which_broker_id = suggest_which_broker_id
 
     def __repr__(self):
         return "PullResult [status=%s, nextBeginOffset=%d, minOffset=%d, maxOffset=%d, msgFoundList.size=%d]" % (

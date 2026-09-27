@@ -371,6 +371,8 @@ async fn pull_from(
             0,
             Some(broker_addr),
             0,
+            // 显式给了 addr：不走 pullFromWhichNodeTable 选路（P5 前的老路径）
+            None,
         )
         .await
         .map_err(|e| format!("pull {} queue {} failed: {e}", mq.topic, mq.queue_id))

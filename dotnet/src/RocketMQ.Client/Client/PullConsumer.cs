@@ -63,6 +63,10 @@ public sealed class DefaultMQPullConsumer
     private readonly int _consumerPullTimeoutMillis = 10000;
     private readonly int _consumerTimeoutMillisWhenSuspend = 30000;
 
+    // Java DefaultMQPullConsumerImpl.pullAPIWrapper.pullFromWhichNodeTable：每次拉取应答头里的
+    // suggestWhichBrokerId 回写进来，下次拉取按它选主/从（缺省 master=0）。
+    private readonly Dictionary<MessageQueue, long> _pullFromWhichNode = new();
+
     private MQClientInstance? _mqClient;
     private bool _started;
 
@@ -295,10 +299,15 @@ public sealed class DefaultMQPullConsumer
             subscription: true, classFilter: false);
         MessageQueue real = WrapMq(mq);
         SubscriptionData sub = FilterAPI.BuildSubscriptionData(real.Topic, subExpression);
-        return c.PullMessage(_consumerGroup, real, offset, maxNums, sysFlag, 0,
+        // Java PullAPIWrapper#pullKernelImpl：按 pullFromWhichNodeTable 选主/从
+        long brokerId = TakePullFromWhichNode(real);
+        PullResult result = c.PullMessage(_consumerGroup, real, offset, maxNums, sysFlag, 0,
             string.IsNullOrEmpty(sub.SubString) ? "*" : sub.SubString,
             // Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
-            0, ExpressionType.TAG, timeout, -1, 15000);
+            0, ExpressionType.TAG, timeout, -1, 15000,
+            /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/brokerId);
+        UpdatePullFromWhichNode(real, result);
+        return result;
     }
 
     /// <summary>长轮询拉取（Java pullBlockIfNotFound，block=true → 挂起等消息）。</summary>
@@ -312,10 +321,36 @@ public sealed class DefaultMQPullConsumer
             subscription: true, classFilter: false);
         MessageQueue real = WrapMq(mq);
         SubscriptionData sub = FilterAPI.BuildSubscriptionData(real.Topic, subExpression);
-        return c.PullMessage(_consumerGroup, real, offset, maxNums, sysFlag, 0,
+        long brokerId = TakePullFromWhichNode(real);
+        PullResult result = c.PullMessage(_consumerGroup, real, offset, maxNums, sysFlag, 0,
             string.IsNullOrEmpty(sub.SubString) ? "*" : sub.SubString,
             0, ExpressionType.TAG, _consumerTimeoutMillisWhenSuspend, -1,
-            _brokerSuspendMaxTimeMillis);
+            _brokerSuspendMaxTimeMillis,
+            /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/brokerId);
+        UpdatePullFromWhichNode(real, result);
+        return result;
+    }
+
+    /// <summary>Java <c>PullAPIWrapper#recalculatePullFromWhichNode</c>：无记录按 master=0。</summary>
+    private long TakePullFromWhichNode(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            return _pullFromWhichNode.TryGetValue(mq, out long brokerId) ? brokerId : MixAll.MasterId;
+        }
+    }
+
+    /// <summary>
+    /// Java <c>PullAPIWrapper#updatePullFromWhichNode:157-164</c>：把应答头里的
+    /// <c>suggestWhichBrokerId</c> 写回表；缺省（老 broker 不带该字段）按 master=0 记账 ——
+    /// 与 Java 的 long 原语口径一致，所以**不能**把 null 当成「保留旧值」。
+    /// </summary>
+    private void UpdatePullFromWhichNode(MessageQueue mq, PullResult result)
+    {
+        lock (_lock)
+        {
+            _pullFromWhichNode[mq] = result.SuggestWhichBrokerId ?? MixAll.MasterId;
+        }
     }
 
     // ---------------- 位点管理 ----------------

@@ -146,6 +146,10 @@ struct PullResult {
     int64_t minOffset = 0;
     int64_t maxOffset = 0;
     std::vector<MessageExt> msgFoundList;
+    // 对应 Java PullResultExt.suggestWhichBrokerId：broker 建议下次从哪个 brokerId 拉
+    // （主从部署时可能是从节点）。PullAPIWrapper#processPullResult:77 用它更新
+    // pullFromWhichNodeTable。nullopt = 响应头没带（老 broker），调用方按 master=0 记账。
+    std::optional<int64_t> suggestWhichBrokerId;
 
     bool isFound() const { return status == PullStatus::FOUND; }
     bool isNoNewMsg() const { return status == PullStatus::NO_NEW_MSG; }

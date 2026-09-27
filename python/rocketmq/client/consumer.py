@@ -799,6 +799,10 @@ class DefaultMQPushConsumer:
         self.consume_message_batch_max_size = 1
         self.pull_batch_size = 32
         self.pull_batch_size_in_bytes = 256 * 1024
+        # 对应 Java `DefaultMQPushConsumer#postSubscriptionWhenPull`（默认 false）：
+        # true 时每次拉取把订阅表达式放进请求头的 subscription 字段（broker 侧过滤）。
+        # Java 默认不发 —— broker 不过滤，由客户端 processPullResult 的 tag 过滤兜底。
+        self.post_subscription_when_pull = False
         self.max_reconsume_times = -1
         self.suspend_current_queue_time_millis = 1000
         self.consume_timeout = 15
@@ -835,6 +839,9 @@ class DefaultMQPushConsumer:
         # 每队列最近一次「发起拉取/弹出」的时刻（Java ProcessQueue.lastPullTimestamp /
         # PopProcessQueue.lastPopTimestamp）。rebalance 用它判 pull 是否停摆（PULL_MAX_IDLE_TIME）。
         self._last_pull_table: Dict[str, float] = {}
+        # 对应 Java PullAPIWrapper.pullFromWhichNodeTable：MessageQueue → 下一轮
+        # 拉取应选的 brokerId（由应答头 suggestWhichBrokerId 驱动，默认主节点 0）
+        self._pull_from_which_node: Dict[MessageQueue, int] = {}
         # ---- 真实 rebalance（对齐 Java RebalanceImpl）----
         # _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
         # 由 _do_rebalance() 按 LOCK/分配策略计算；_rebalance_now 用于
@@ -1048,6 +1055,10 @@ class DefaultMQPushConsumer:
 
     def set_pull_suspend_timeout_millis(self, millis: int) -> None:
         self.pull_suspend_timeout_millis = int(millis)
+
+    def set_post_subscription_when_pull(self, enable: bool) -> None:
+        """对应 Java `DefaultMQPushConsumer#setPostSubscriptionWhenPull`。"""
+        self.post_subscription_when_pull = bool(enable)
 
     def set_message_listener(self, listener) -> None:
         self.message_listener = listener
@@ -1912,18 +1923,31 @@ class DefaultMQPushConsumer:
                     continue
                 self._offset_table[key] = offset
             try:
+                # Java DefaultMQPushConsumerImpl.pullMessage:458-468：仅当
+                # postSubscriptionWhenPull 打开且非类过滤模式时才把订阅表达式
+                # 发给 broker；默认不发，过滤由客户端 processPullResult 兜底。
+                sub_expression = sub.sub_string if (
+                    self.post_subscription_when_pull and not sub.class_filter_mode) else None
                 sys_flag = PullSysFlag.build_sys_flag(commit_offset=False,
                                                       suspend=True,
-                                                      subscription=True,
+                                                      subscription=sub_expression is not None,
                                                       class_filter=False)
+                # Java PullAPIWrapper#pullKernelImpl：按上轮应答的
+                # suggestWhichBrokerId 选主/从节点拉取
+                broker_id = self._pull_from_which_node.get(mq, MixAll.MASTER_ID)
                 pull_began = time.time()
                 result = client.pull_message(self.consumer_group, mq, offset,
                                              self.pull_batch_size, sys_flag, 0,
-                                             sub.sub_string or "*", sub.sub_version,
+                                             sub_expression, sub.sub_version,
                                              sub.expression_type,
                                              timeout_millis=self.pull_timeout_millis,
                                              max_msg_bytes=self.pull_batch_size_in_bytes,
-                                             suspend_timeout_millis=self.pull_suspend_timeout_millis)
+                                             suspend_timeout_millis=self.pull_suspend_timeout_millis,
+                                             broker_id=broker_id)
+                # Java PullAPIWrapper#processPullResult:77 —— 每轮应答都更新
+                # pullFromWhichNodeTable（缺省当作 master=0，与 Java 的 long 原语一致）
+                self._pull_from_which_node[mq] = result.suggest_which_broker_id \
+                    if result.suggest_which_broker_id is not None else MixAll.MASTER_ID
                 # 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
                 if self._stats_manager is not None:
                     self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
@@ -3152,6 +3176,8 @@ class DefaultMQPullConsumer:
         # 投递前过滤钩子（Java DefaultMQPullConsumerImpl.filterMessageHookList:80，
         # start() 时注册进 PullAPIWrapper:726）
         self.filter_message_hook_list: List[FilterMessageHook] = []
+        # 对应 Java DefaultMQPullConsumerImpl.pullAPIWrapper.pullFromWhichNodeTable
+        self._pull_from_which_node: Dict[MessageQueue, int] = {}
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
 
@@ -3292,7 +3318,11 @@ class DefaultMQPullConsumer:
                                      # Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
                                      0,
                                      ExpressionType.TAG, timeout_millis=timeout,
-                                     max_msg_bytes=-1, suspend_timeout_millis=15000)
+                                     max_msg_bytes=-1, suspend_timeout_millis=15000,
+                                     broker_id=self._pull_from_which_node.get(
+                                         mq, MixAll.MASTER_ID))
+        self._pull_from_which_node[mq] = result.suggest_which_broker_id \
+            if result.suggest_which_broker_id is not None else MixAll.MASTER_ID
         if result.status == PullStatus.FOUND and result.msg_found_list:
             result.msg_found_list = self._filter_messages_for_delivery(mq, result.msg_found_list)
         return result
@@ -3311,7 +3341,11 @@ class DefaultMQPullConsumer:
                                      ExpressionType.TAG,
                                      timeout_millis=self.consumer_timeout_millis_when_suspend,
                                      max_msg_bytes=-1,
-                                     suspend_timeout_millis=self.broker_suspend_max_time_millis)
+                                     suspend_timeout_millis=self.broker_suspend_max_time_millis,
+                                     broker_id=self._pull_from_which_node.get(
+                                         mq, MixAll.MASTER_ID))
+        self._pull_from_which_node[mq] = result.suggest_which_broker_id \
+            if result.suggest_which_broker_id is not None else MixAll.MASTER_ID
         if result.status == PullStatus.FOUND and result.msg_found_list:
             result.msg_found_list = self._filter_messages_for_delivery(mq, result.msg_found_list)
         return result
