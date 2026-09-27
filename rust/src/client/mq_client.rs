@@ -428,6 +428,18 @@ impl<'a> PublishMessage<'a> {
     pub fn is_batch(&self) -> bool {
         matches!(self, PublishMessage::Batch(_))
     }
+
+    /// 重新借出同一份消息，借期缩短到本次调用 —— 发送**重试链**每轮都要新建一个
+    /// `PublishMessage`（每轮按选中的 broker 重建请求），但底层消息只有一份。
+    ///
+    /// Python/Java 那边没有这个问题：`MessageBatch` 继承 `Message`，重试循环里的
+    /// `msg` 直接就是一个可复用的引用。
+    pub fn reborrow(&mut self) -> PublishMessage<'_> {
+        match self {
+            PublishMessage::Single(m) => PublishMessage::Single(&mut **m),
+            PublishMessage::Batch(b) => PublishMessage::Batch(&mut **b),
+        }
+    }
 }
 
 // ================================================================ 配置

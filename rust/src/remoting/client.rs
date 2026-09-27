@@ -1026,7 +1026,7 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    // `AsyncReadExt` / `AsyncWriteExt` 已由模块顶部的 `use` 经 `use super::*` 带进来。
     use tokio::net::TcpListener;
 
     use super::*;

@@ -212,6 +212,47 @@ static void testBatchCodec() {
     CHECK(batch.body == body, "MessageBatch encode equals encodeMessages");
 }
 
+// 回归：**没设过 WAIT** 的普通消息组成的批量必须是 WAIT=true。
+// Java MessageBatch.generateFromList:70 是 setWaitStoreMsgOK(first.isWaitStoreMsgOK()) ——
+// 属性缺省即 true；判成 false 会让批量以 WAIT=false 下发，broker 不等刷盘就回 SEND_OK。
+// Python / Rust 两端此前正是这个缺陷，四端在本提交里统一。
+static void testBatchDefaultsWaitStoreMsgOkToTrue() {
+    Message a("T_W", "a");
+    Message b("T_W", "b");
+    CHECK(a.properties.count(MessageConst::PROPERTY_WAIT_STORE_MSG_OK) == 0, "WAIT not preset");
+    CHECK(a.isWaitStoreMsgOk(), "default waitStoreMsgOK is true");
+
+    MessageBatch batch = MessageBatch::generateFromList({a, b});
+    CHECK(batch.getProperty(MessageConst::PROPERTY_WAIT_STORE_MSG_OK) == "true",
+          "batch defaults WAIT=true");
+
+    Message c("T_W", "c");
+    Message d("T_W", "d");
+    c.setWaitStoreMsgOk(false);
+    d.setWaitStoreMsgOk(false);
+    MessageBatch off = MessageBatch::generateFromList({c, d});
+    CHECK(off.getProperty(MessageConst::PROPERTY_WAIT_STORE_MSG_OK) == "false",
+          "batch keeps explicit WAIT=false");
+}
+
+// 判据本身：Java Message.isWaitStoreMsgOK() = 缺省 true + Boolean.parseBoolean
+// （只有忽略大小写的 "true" 为真）。
+static void testWaitStoreMsgOkFollowsJavaParseBoolean() {
+    Message msg("T_W", "x");
+    CHECK(msg.isWaitStoreMsgOk(), "absent -> true");
+    msg.setWaitStoreMsgOk(true);
+    CHECK(msg.isWaitStoreMsgOk(), "explicit true");
+    msg.setWaitStoreMsgOk(false);
+    CHECK(!msg.isWaitStoreMsgOk(), "explicit false");
+    msg.properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK] = "TRUE";
+    CHECK(msg.isWaitStoreMsgOk(), "case-insensitive true");
+    // 其它值一律 false（不是"非 false 即真"）
+    for (const char* bad : {"1", "", "yes", "tru"}) {
+        msg.properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK] = bad;
+        CHECK(!msg.isWaitStoreMsgOk(), std::string("non-canonical value is false: ") + bad);
+    }
+}
+
 static void testUtilAndHash() {
     // MessageQueue.hashCode 与 Java 语义一致（topic=A, broker=B, qid=0 -> 93282）
     MessageQueue mq("A", "B", 0);
@@ -249,6 +290,8 @@ int main() {
     testHeaderV1V2();
     testMessageCodec();
     testBatchCodec();
+    testBatchDefaultsWaitStoreMsgOkToTrue();
+    testWaitStoreMsgOkFollowsJavaParseBoolean();
     testUtilAndHash();
 
     std::cout << "\n===== codec test summary =====\n";

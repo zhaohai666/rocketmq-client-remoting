@@ -67,6 +67,7 @@ set(RMQ_SOURCES
     src/client/consumer_stats.cpp
     src/client/trace_context.cpp
     src/client/producer.cpp
+    src/client/produce_accumulator.cpp
     src/client/consumer.cpp
     src/client/consume_executor.cpp
     src/client/backpressure.cpp

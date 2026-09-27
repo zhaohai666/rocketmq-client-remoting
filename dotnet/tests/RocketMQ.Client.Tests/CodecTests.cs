@@ -260,6 +260,52 @@ public class CodecTests
         Assert.Equal(32, MessageClientIDSetter.GetUniqId(b).Length);
     }
 
+    /// <summary>回归：**没设过 WAIT** 的普通消息组成的批量必须是 WAIT=true。</summary>
+    /// <remarks>Java <c>MessageBatch.generateFromList:70</c> 是
+    /// <c>setWaitStoreMsgOK(first.isWaitStoreMsgOK())</c> —— 属性缺省即 true。
+    /// 判成 false 会让批量以 <c>WAIT=false</c> 下发，broker 不等刷盘就回 SEND_OK。
+    /// Python / Rust 两端此前正是这个缺陷，四端在本提交里统一。</remarks>
+    [Fact]
+    public void BatchDefaultsWaitStoreMsgOkToTrue()
+    {
+        var a = new Message("T_W", Encoding.UTF8.GetBytes("a"));
+        var b = new Message("T_W", Encoding.UTF8.GetBytes("b"));
+        Assert.DoesNotContain(MessageConst.PropertyWaitStoreMsgOk, a.Properties.Keys);
+        Assert.True(a.WaitStoreMsgOk);
+
+        MessageBatch batch = MessageBatch.GenerateFromList(new List<Message> { a, b });
+        Assert.Equal("true", batch.WaitStoreMsgOkStr);
+        Assert.True(batch.WaitStoreMsgOk);
+
+        // 显式 false 要原样传下去
+        var c = new Message("T_W", Encoding.UTF8.GetBytes("c")) { WaitStoreMsgOk = false };
+        var d = new Message("T_W", Encoding.UTF8.GetBytes("d")) { WaitStoreMsgOk = false };
+        MessageBatch off = MessageBatch.GenerateFromList(new List<Message> { c, d });
+        Assert.Equal("false", off.WaitStoreMsgOkStr);
+        Assert.False(off.WaitStoreMsgOk);
+    }
+
+    /// <summary>判据本身：Java <c>Message.isWaitStoreMsgOK()</c> =
+    /// 缺省 true + <c>Boolean.parseBoolean</c>（只有忽略大小写的 "true" 为真）。</summary>
+    [Fact]
+    public void WaitStoreMsgOkFollowsJavaParseBoolean()
+    {
+        var msg = new Message("T_W", Encoding.UTF8.GetBytes("x"));
+        Assert.True(msg.WaitStoreMsgOk);                                  // 缺省
+        msg.WaitStoreMsgOk = true;
+        Assert.True(msg.WaitStoreMsgOk);
+        msg.WaitStoreMsgOk = false;
+        Assert.False(msg.WaitStoreMsgOk);
+        msg.Properties[MessageConst.PropertyWaitStoreMsgOk] = "TRUE";
+        Assert.True(msg.WaitStoreMsgOk);
+        // 其它值一律 false（不是"非 false 即真"）
+        foreach (string raw in new[] { "1", "", "yes", "tru" })
+        {
+            msg.Properties[MessageConst.PropertyWaitStoreMsgOk] = raw;
+            Assert.False(msg.WaitStoreMsgOk);
+        }
+    }
+
     // ---------------------------------------------------------------- 工具与哈希
 
     [Fact]

@@ -111,6 +111,34 @@ int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
     return total == 0 ? 1 : total;
 }
 
+// Java `canBatch` 里四个延时属性的最大值（缺省 0）：`DELAY`（getDelayTimeLevel）+
+// `TIMER_DELAY_MS` / `TIMER_DELAY_SEC` / `TIMER_DELIVER_MS`（MessageConst:73-74/112）。
+//
+// 一个 `MessageBatch` 只能有一个延时属性，所以任何一个 > 0 都不攒批。
+//
+// ⚠ cpp 的 `MessageConst` 还没有这三个常量（timer 消息本端口只在
+// `recall_message_handle.h` 里以字面量出现），所以这里用字面量而不是常量 ——
+// 与 python `_TIMER_DELAY_PROPERTIES` / dotnet `TimerDelayProperties` 同一份清单。
+//
+// 取值口径：`getDelayTimeLevel()` 与 python 一致 —— 属性缺失返回 0；**值非法时不吞**
+// （python 的 `int(raw)` 会抛，Java 的 `Integer/Long.parseLong` 也会抛）。
+int64_t maxDelayValue(const Message& msg) {
+    int64_t result = msg.getDelayTimeLevel();
+    static const char* kTimerDelayProperties[] = {"TIMER_DELAY_MS", "TIMER_DELAY_SEC",
+                                                 "TIMER_DELIVER_MS"};
+    for (const char* name : kTimerDelayProperties) {
+        auto it = msg.properties.find(name);
+        if (it == msg.properties.end() || it->second.empty()) {
+            continue;
+        }
+        const int64_t value = std::stoll(it->second);
+        if (value > result) {
+            result = value;
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 DefaultMQProducer::DefaultMQProducer(const std::string& producerGroup)
@@ -234,6 +262,15 @@ void DefaultMQProducer::start() {
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
 
+    // 自动攒批：按 clientId 取（或建）进程级累加器，再起两根守卫线程
+    // （Java `DefaultMQProducer.start():377-379` 的 `produceAccumulator.start()`）。
+    // 必须排在 `started_ = true` 之后：守卫线程攒够一批就会调 `sendDirectBlocking`，
+    // 而那要求生产者可用（`client()` / 两个线程池都已在位）。
+    initProduceAccumulator();
+    if (produceAccumulator_ != nullptr) {
+        produceAccumulator_->start();
+    }
+
     // 消息轨迹：enableTrace=true 时建 AsyncTraceDispatcher 并注册 Send/EndTransaction 钩子。
     // 必须在心跳线程之前完成 —— 分发器内部生产者要先把轨迹 topic 的路由拉起来。
     startTraceDispatcher();
@@ -259,6 +296,19 @@ void DefaultMQProducer::start() {
 }
 
 void DefaultMQProducer::shutdown() {
+    // 自动攒批：先停守卫线程 + 解除绑定（Java `shutdown()` 里那句
+    // `produceAccumulator.shutdown()`）。
+    //
+    // ⚠ ① 必须放在最前面：守卫线程跑在**别人**的线程上、会调 `sendDirectBlocking`
+    //      → `client()` / 两个线程池 / 传输层，晚于它们被拆掉就会在别人线程上摸到
+    //      已析构的成员。
+    //   ② 必须在 `lock_` **之外** join（下面的临界区会拿走 lock_）。
+    //   ③ `detachSender` 是本端口的必要补充（cpp 结构性差异，见 produce_accumulator.h）：
+    //      Java 的累加器强引用生产者，所以不需要；cpp 的生产者常是栈对象。
+    if (produceAccumulator_ != nullptr) {
+        produceAccumulator_->shutdown();
+        produceAccumulator_->detachSender();
+    }
     std::shared_ptr<ConsumeExecutor> asyncSender;
     std::shared_ptr<ConsumeExecutor> callbackPool;
     {
@@ -595,14 +645,207 @@ void DefaultMQProducer::validateNameServerSetting(MQClientInstance& c) {
     }
 }
 
+// ---------------------------------------------------------------- 自动攒批的转发层
+// 对应 Java `DefaultMQProducer:434-452`（canBatch）/ `:759-776`（sendDirect）/
+// `:778-793`（sendByAccumulator）/ `:1190-1243`（阈值读写）/ `:1475-1490`（初始化）。
+
+bool DefaultMQProducer::getAutoBatch() const {
+    // Java `getAutoBatch():1232-1236`：累加器为空时恒 false（哪怕 autoBatch=true）。
+    if (produceAccumulator_ == nullptr) {
+        return false;
+    }
+    return autoBatch_;
+}
+
+void DefaultMQProducer::initProduceAccumulator() {
+    // Java 在 `DefaultMQProducerImpl` 的构造里调（:256），本端口在 `start()` 里调 ——
+    // 因为 cpp 的 clientId 是 start() 里才由 `changeInstanceNameToPID` + `buildClientId`
+    // 拼出来的（Java 的 `buildMQClientId()` 在构造时就能算）。注册表按 clientId 分桶，
+    // 键为空会把同进程所有生产者塞进同一桶，所以必须等到 clientId 有值。
+    produceAccumulator_ = getOrCreateProduceAccumulator(clientId_, this);
+    // Java 只下发「调用方设过」的那几项（> -1）—— 同一个 clientId 的第二个生产者不能把
+    // 第一个调好的阈值改掉。
+    if (batchMaxDelayMs_ > -1) {
+        produceAccumulator_->setBatchMaxDelayMs(batchMaxDelayMs_);
+    }
+    if (batchMaxBytes_ > -1) {
+        produceAccumulator_->setBatchMaxBytes(static_cast<int32_t>(batchMaxBytes_));
+    }
+    if (totalBatchMaxBytes_ > -1) {
+        produceAccumulator_->setTotalBatchMaxBytes(static_cast<int32_t>(totalBatchMaxBytes_));
+    }
+}
+
+void DefaultMQProducer::setBatchMaxDelayMs(int32_t holdMs) {
+    batchMaxDelayMs_ = holdMs;
+    if (produceAccumulator_ != nullptr) {
+        produceAccumulator_->setBatchMaxDelayMs(holdMs);
+    }
+}
+
+int32_t DefaultMQProducer::getBatchMaxDelayMs() const {
+    if (produceAccumulator_ == nullptr) {
+        return batchMaxDelayMs_;
+    }
+    return produceAccumulator_->getBatchMaxDelayMs();
+}
+
+void DefaultMQProducer::setBatchMaxBytes(int64_t holdSize) {
+    batchMaxBytes_ = holdSize;
+    if (produceAccumulator_ != nullptr) {
+        produceAccumulator_->setBatchMaxBytes(static_cast<int32_t>(holdSize));
+    }
+}
+
+int64_t DefaultMQProducer::getBatchMaxBytes() const {
+    if (produceAccumulator_ == nullptr) {
+        return batchMaxBytes_;
+    }
+    return produceAccumulator_->getBatchMaxBytes();
+}
+
+void DefaultMQProducer::setTotalBatchMaxBytes(int64_t totalHoldBytes) {
+    totalBatchMaxBytes_ = totalHoldBytes;
+    if (produceAccumulator_ != nullptr) {
+        produceAccumulator_->setTotalBatchMaxBytes(static_cast<int32_t>(totalHoldBytes));
+    }
+}
+
+int64_t DefaultMQProducer::getTotalBatchMaxBytes() const {
+    if (produceAccumulator_ == nullptr) {
+        return totalBatchMaxBytes_;
+    }
+    return produceAccumulator_->getTotalBatchMaxBytes();
+}
+
+bool DefaultMQProducer::canBatch(const Message& msg) const {
+    // ⚠ 先过全局字节闸门：**放行即记账**，而后面三条「不能攒批」的判断只是让调用方退回
+    // 直发 —— 那条消息的字节数**不会被归还**（Java 遗漏，照抄；改掉就与 Java 对不上了）。
+    if (produceAccumulator_ == nullptr || !produceAccumulator_->tryAddMessage(msg)) {
+        return false;
+    }
+    // 延时/定时消息不攒批：一个 MessageBatch 只能有一个延时属性
+    if (maxDelayValue(msg) > 0) {
+        return false;
+    }
+    // 重试消息不攒批：%RETRY% topic 的位点语义特殊
+    if (msg.getTopic().rfind(MixAll::RETRY_GROUP_TOPIC_PREFIX, 0) == 0) {
+        return false;
+    }
+    // 已带 PGROUP 的消息（事务半消息那种）不攒批：broker 侧要按组找连接
+    if (msg.properties.count(MessageConst::PROPERTY_PRODUCER_GROUP) > 0) {
+        return false;
+    }
+    return true;
+}
+
+std::optional<SendResult> DefaultMQProducer::sendDirect(const Message& msg, const MessageQueue* mq,
+                                                        std::shared_ptr<SendCallback> callback) {
+    // Java `sendDirect`：mq == null 走轮询选队列（`defaultMQProducerImpl.send(msg)`），
+    // 否则定点。两条都**不走**公开入口 —— 那会再判一次 autoBatch，攒批被拒时就成了
+    // 无限递归。
+    if (callback == nullptr) {
+        return mq == nullptr ? sendDefaultImpl(msg, -1) : sendToMqImpl(msg, *mq, -1);
+    }
+    if (mq == nullptr) {
+        sendAsyncImpl(msg, std::move(callback), -1);
+    } else {
+        sendAsyncToMqImpl(msg, *mq, std::move(callback), -1);
+    }
+    return std::nullopt;
+}
+
+std::optional<SendResult> DefaultMQProducer::sendByAccumulator(
+    const Message& msg, const MessageQueue* mq, std::shared_ptr<SendCallback> callback) {
+    if (!canBatch(msg)) {
+        return sendDirect(msg, mq, std::move(callback));
+    }
+    checkMessage(msg);
+    // 在**编码成批量 body 之前**给这条子消息写好客户端 ID（Java `setUniqID(msg)`）。
+    // `buildBatch()` 里再补的那次是给**批量对象自己**的，两者不能混。
+    Message stamped = msg;
+    ensureUniqId(stamped);
+    if (callback == nullptr) {
+        return mq == nullptr ? produceAccumulator_->send(stamped)
+                             : produceAccumulator_->sendWithMq(stamped, *mq);
+    }
+    if (mq == nullptr) {
+        produceAccumulator_->sendAsync(stamped, std::move(callback));
+    } else {
+        produceAccumulator_->sendAsyncWithMq(stamped, *mq, std::move(callback));
+    }
+    return std::nullopt;
+}
+
+// ---------------- AccumulatorSender 实现 ----------------
+
+SendResult DefaultMQProducer::sendDirectBlocking(const MessageBatch& batch,
+                                                 const MessageQueue* mq) {
+    // Java `sendDirect(batch, mq, null)` → `defaultMQProducerImpl.send(batch[, mq])`，
+    // 默认超时（`sendMsgTimeout`）—— 攒批的调用方没有自己的超时可传。
+    return sendPreparedBatch(batch, mq, -1);
+}
+
+void DefaultMQProducer::sendDirectAsync(const MessageBatch& batch, const MessageQueue* mq,
+                                        std::shared_ptr<SendCallback> callback) {
+    // Java `sendDirect(batch, mq, callback)` → `defaultMQProducerImpl.send(batch[, mq], cb)`。
+    // 复用既有的批量异步入口（不阻塞调用方、回调在同口径的线程上跑）。
+    if (mq == nullptr) {
+        sendBatchAsync(batch.messages, std::move(callback), -1);
+    } else {
+        sendBatchAsync(batch.messages, *mq, std::move(callback), -1);
+    }
+}
+
+SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const MessageQueue* pinned,
+                                               int32_t timeoutMillis) {
+    MQClientInstance& c = client();
+    const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
+    // 批级校验（Java `sendDefaultImpl` 第一步的 `Validators.checkMessage(batch, this)`）：
+    // 子消息在 `sendByAccumulator` 里已经逐条校验过，这里校验的是**编码后的整批**。
+    checkMessage(batch);
+    MessageBatch outbound = batch;
+    // 累加器的 AggregateKey.topic 已经是拼过命名空间的（生产者的公开入口先 withNamespace
+    // 再分流），`wrapNamespace` 幂等，所以这一步只是补齐「直接调 sender」这条路径。
+    if (!namespace_.empty()) {
+        outbound.topic = NamespaceUtil::wrapNamespace(namespace_, outbound.topic);
+    }
+    MessageQueue target;
+    if (pinned != nullptr) {
+        target = *pinned;
+    } else {
+        std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
+        target = publish->selectOneMessageQueue();
+    }
+    // isBatch ⇒ prepareForSend 直接返回 0（批量永不压缩），但 batch.body 已经是编码结果，
+    // 不需要（也不该）再 encode 一次。
+    const int32_t sysFlag = prepareForSend(outbound);
+    return sendWithHooks(c, outbound, target, timeout, sysFlag);
+}
+
 // ---------------------------------------------------------------- 同步发送
+// 公开入口只做一件事：判 autoBatch 决定走累加器还是直发（Java `DefaultMQProducer:469-478`）。
+// 真正的发送链在 `sendDefaultImpl` 里（见下面）。
+//
+// 不分流的两条与 Java 一一对应：
+//   * **显式给了 timeout** → `sendDefaultImpl`，不攒批（Java 的 `send(msg, timeout)` 重载）；
+//   * `msg.isBatch` → 那是累加器自己发出去的东西，不挡就会无限递归。
+SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
+    if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
+        // Java 在入口就地 setTopic；本工程按既有口径不动调用方那份，传副本进去
+        // （子消息的 topic 会逐条编码进批量 body，broker 落盘、消费侧看到的是带前缀的）。
+        return *sendByAccumulator(withNamespace(msg), nullptr, nullptr);
+    }
+    return sendDefaultImpl(msg, timeoutMillis);
+}
+
 // 逐条对齐 Java DefaultMQProducerImpl#sendDefaultImpl：
 //   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
 //   * 每次尝试先算 costTime，总超时已用完则整体放弃（→ RemotingTooMuchRequestException）；
 //     还剩重试机会时，单次请求超时被 sendMsgMaxTimeoutPerRequest 压住，把余量留给后面的 broker；
 //   * 异常按类型分档写容错表，且只有 retryResponseCodes 里的 broker 响应码才继续重试；
 //   * 全部失败时把原因映射成 ClientErrorCode 塞进 MQClientException。
-SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
+SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeoutMillis) {
     MQClientInstance& c = client();
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
@@ -730,8 +973,18 @@ SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     throw MQClientException(info, responseCode);
 }
 
+// 定点同步发送（Java `DefaultMQProducer.send(Message, MessageQueue):574-582`）。
 SendResult DefaultMQProducer::send(const Message& msg, const MessageQueue& mq,
                                    int32_t timeoutMillis) {
+    if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
+        MessageQueue target = mq;
+        return *sendByAccumulator(withNamespace(msg), &target, nullptr);
+    }
+    return sendToMqImpl(msg, mq, timeoutMillis);
+}
+
+SendResult DefaultMQProducer::sendToMqImpl(const Message& msg, const MessageQueue& mq,
+                                           int32_t timeoutMillis) {
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
@@ -741,6 +994,9 @@ SendResult DefaultMQProducer::send(const Message& msg, const MessageQueue& mq,
     return sendWithHooks(c, outbound, mq, timeout, sysFlag);
 }
 
+// 按选择器发送（顺序消息：同一 arg 落到同一队列）。
+// Java `DefaultMQProducer.send(Message, MessageQueueSelector, Object):678-688`：
+// **先算队列**（选择器可能触发一次路由拉取），再判 autoBatch 分流。
 SendResult DefaultMQProducer::sendBySelector(const Message& msg,
                                              const MessageQueueSelector& selector,
                                              const std::string& arg, int32_t timeoutMillis) {
@@ -751,6 +1007,9 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     ensureUniqId(outbound);
     std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = selector.select(publish->msgQueueList, outbound, arg);
+    if (timeoutMillis < 0 && getAutoBatch() && !outbound.isBatch) {
+        return *sendByAccumulator(outbound, &selected, nullptr);
+    }
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
     const int32_t sysFlag = prepareForSend(outbound);
     // arg 透传给 CheckForbiddenHook（Java CheckForbiddenContext.arg 就是它）
@@ -873,16 +1132,43 @@ void DefaultMQProducer::createAsyncExecutors() {
         callbackThreads, callbackThreads, 60.0, "NettyClientPublicExecutor", 0, "_", 1);
 }
 
+// 公开入口的 autoBatch 分流（Java `DefaultMQProducer.send(Message, SendCallback):514-525`）：
+// 同样只在**没显式给 timeout** 时判（`send(msg, cb, timeout)` 那个重载不攒批）。
+//
+// ⚠ 与 Java 的差别：Java 把这段包在 `try { } catch (Throwable e) { sendCallback.onException(e); }`
+// 里，所以本地校验失败也是"进回调"。本端口沿用既有口径 —— 未 start() 时同步抛
+// （见头文件 `sendAsync` 的注释），累加器路径的本地校验失败同样同步抛，两条一致。
 void DefaultMQProducer::sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback,
                                   int32_t timeoutMillis) {
+    if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
+        sendByAccumulator(withNamespace(msg), nullptr, std::move(callback));
+        return;
+    }
+    sendAsyncImpl(msg, std::move(callback), timeoutMillis);
+}
+
+void DefaultMQProducer::sendAsyncImpl(const Message& msg, std::shared_ptr<SendCallback> callback,
+                                      int32_t timeoutMillis) {
     auto state = std::make_shared<AsyncSendState>();
     state->msg = msg;
     state->callback = std::move(callback);
     enqueueAsync(state, nullptr, timeoutMillis);
 }
 
+// 定点异步（Java `send(Message, MessageQueue, SendCallback):615-632`）
 void DefaultMQProducer::sendAsync(const Message& msg, const MessageQueue& mq,
                                   std::shared_ptr<SendCallback> callback, int32_t timeoutMillis) {
+    if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
+        MessageQueue target = mq;
+        sendByAccumulator(withNamespace(msg), &target, std::move(callback));
+        return;
+    }
+    sendAsyncToMqImpl(msg, mq, std::move(callback), timeoutMillis);
+}
+
+void DefaultMQProducer::sendAsyncToMqImpl(const Message& msg, const MessageQueue& mq,
+                                          std::shared_ptr<SendCallback> callback,
+                                          int32_t timeoutMillis) {
     auto state = std::make_shared<AsyncSendState>();
     state->msg = msg;
     state->callback = std::move(callback);

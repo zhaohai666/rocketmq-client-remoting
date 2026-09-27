@@ -238,3 +238,12 @@ add_test(NAME scheduled_intervals COMMAND rmq_test_scheduled_intervals)
 add_executable(rmq_test_pull_post_subscription test_pull_post_subscription.cpp)
 target_link_libraries(rmq_test_pull_post_subscription PRIVATE rocketmq::remoting)
 add_test(NAME pull_post_subscription COMMAND rmq_test_pull_post_subscription)
+
+# 生产者自动攒批（Java ProduceAccumulator，526 行）：归并键四元组 / 批量 body 组装的
+# ID 顺序 / 四组批级属性口径 / 全局字节闸门 / 守卫线程对空批的清理 / 拆分批量应答 /
+# 同步阻塞语义 / 异步回调与额度归还（含 Java 的漏还路径）/ sender 生命周期。
+# 与 python/tests/test_produce_accumulator.py、.NET ProduceAccumulatorTests.cs、
+# rust/src/client/produce_accumulator/tests.rs 同题。
+add_executable(rmq_test_produce_accumulator test_produce_accumulator.cpp)
+target_link_libraries(rmq_test_produce_accumulator PRIVATE rocketmq::remoting)
+add_test(NAME produce_accumulator COMMAND rmq_test_produce_accumulator)

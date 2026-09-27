@@ -14,6 +14,20 @@ use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
 
+/// `WAIT` 属性的原始值 → 布尔，对应 Java `Message#isWaitStoreMsgOK()`：
+/// **缺省（`None`）为 `true`**，否则 `Boolean.parseBoolean(value)`
+/// （即只有忽略大小写的 `"true"` 为真，`"1"` / `""` / `"yes"` 都是假）。
+///
+/// 四端共用同一条判据（Python `message.is_wait_store_msg_ok`、C# `Message.WaitStoreMsgOk`、
+/// C++ `Message::isWaitStoreMsgOk`）—— 所有写 `WAIT` 的地方（`MessageBatch::generate_from_list`、
+/// `AggregateKey::of_message`）都必须走它，见 [`Message::is_wait_store_msg_ok`] 的注释。
+pub fn wait_store_msg_ok_of(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(value) => value.eq_ignore_ascii_case("true"),
+    }
+}
+
 /// 对应 Java `MessageQueue`（Python 里也在 `common/message.py`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct MessageQueue {
@@ -218,6 +232,18 @@ impl Message {
 
     pub fn get_keys(&self) -> Option<&str> {
         self.properties.get(PROPERTY_KEYS)
+    }
+
+    /// Java `Message#isWaitStoreMsgOK()`：属性**缺省即 `true`**，其余走
+    /// `Boolean.parseBoolean` —— 也就是**只有**忽略大小写的 `"true"` 为真。
+    ///
+    /// ⚠ 千万别写成 `get_wait_store_msg_ok() == Some("true")`。本端口的 `Message::new`
+    /// （与 Python 的 `Message.__init__` 一样）**不**预先写 `WAIT`，所以"属性缺省"是
+    /// **常态而不是边角**：按 `== Some("true")` 判会让一条普通消息变成 `WAIT=false`，
+    /// 批量发送时就会以 `WAIT=false` 下发 —— broker 不等刷盘就回 `SEND_OK`，
+    /// 持久性悄悄降级，而客户端侧一切正常。Python / C# / C++ 三端统一用本函数的语义。
+    pub fn is_wait_store_msg_ok(&self) -> bool {
+        wait_store_msg_ok_of(self.get_wait_store_msg_ok())
     }
 
     pub fn set_delay_time_level(&mut self, level: i32) {
@@ -676,7 +702,10 @@ impl MessageBatch {
         }
 
         let topic = first.get_topic().to_string();
-        let wait_store_msg_ok = first.get_wait_store_msg_ok() == Some("true");
+        // Java `generateFromList:70` 是 `batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK())`：
+        // 缺省即 true。**不能**写成 `== Some("true")`，否则普通消息（没设过 WAIT）组成的
+        // 批量会以 `WAIT=false` 下发，broker 不等刷盘就回 SEND_OK。
+        let wait_store_msg_ok = first.is_wait_store_msg_ok();
 
         let mut batch = MessageBatch { message: Message::default(), messages };
         batch.message.set_topic(&topic);
@@ -914,6 +943,53 @@ mod tests {
         b.set_wait_store_msg_ok(true);
         let batch = MessageBatch::generate_from_list(vec![a, b]).unwrap();
         assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("true"));
+
+        // 显式 false 要原样传下去
+        let mut c = Message::new("T", Some(b"c"));
+        c.set_wait_store_msg_ok(false);
+        let mut d = Message::new("T", Some(b"d"));
+        d.set_wait_store_msg_ok(false);
+        let batch = MessageBatch::generate_from_list(vec![c, d]).unwrap();
+        assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("false"));
+    }
+
+    /// 回归：**没设过 `WAIT` 的普通消息**组成的批量必须是 `WAIT=true`。
+    ///
+    /// 这里曾经是 `first.get_wait_store_msg_ok() == Some("true")` —— 缺省（`None`）被判成
+    /// `false`，于是 `send_batch` 把 Java 的 `WAIT=true` 发成了 `WAIT=false`：broker 不再
+    /// 等刷盘就回 `SEND_OK`，持久性静默降级。Python 侧同款缺陷一起修掉了。
+    #[test]
+    fn batch_defaults_wait_store_msg_ok_to_true() {
+        let messages = vec![
+            Message::new("T", Some(b"a")),
+            Message::new("T", Some(b"b")),
+        ];
+        // 前提：Message::new（同 Python）不预写 WAIT
+        assert_eq!(messages[0].get_wait_store_msg_ok(), None);
+        let batch = MessageBatch::generate_from_list(messages).unwrap();
+        assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("true"));
+    }
+
+    /// 判据本身：Java `Message.isWaitStoreMsgOK()` = 缺省 true + `Boolean.parseBoolean`。
+    #[test]
+    fn wait_store_msg_ok_follows_java_parse_boolean() {
+        assert!(wait_store_msg_ok_of(None));
+        assert!(wait_store_msg_ok_of(Some("true")));
+        assert!(wait_store_msg_ok_of(Some("TRUE")));
+        assert!(wait_store_msg_ok_of(Some("True")));
+        assert!(!wait_store_msg_ok_of(Some("false")));
+        assert!(!wait_store_msg_ok_of(Some("FALSE")));
+        // Java `Boolean.parseBoolean` 对其它任何值都是 false（不是"非 false 即真"）
+        assert!(!wait_store_msg_ok_of(Some("1")));
+        assert!(!wait_store_msg_ok_of(Some("")));
+        assert!(!wait_store_msg_ok_of(Some("yes")));
+
+        let mut msg = Message::new("T", Some(b"a"));
+        assert!(msg.is_wait_store_msg_ok());
+        msg.set_wait_store_msg_ok(false);
+        assert!(!msg.is_wait_store_msg_ok());
+        msg.set_user_property(PROPERTY_WAIT_STORE_MSG_OK, "TRUE");
+        assert!(msg.is_wait_store_msg_ok());
     }
 
     #[test]

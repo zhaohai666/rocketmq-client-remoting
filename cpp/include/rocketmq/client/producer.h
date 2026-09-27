@@ -3,6 +3,7 @@
 //
 // 能力覆盖：同步发送（轮询选队列 / 定点发送）、按选择器发送（顺序消息）、
 // 异步发送、单向发送、批量发送、事务消息（两阶段：半消息 → 本地事务 → END_TRANSACTION → broker 回查）、
+// **自动攒批（autoBatch + ProduceAccumulator，见 client/produce_accumulator.h）**、
 // 按 Key 查询、
 // offset 查询、建 topic。
 #ifndef ROCKETMQ_CLIENT_PRODUCER_H
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -22,6 +24,7 @@
 #include "rocketmq/client/consume_executor.h"
 #include "rocketmq/client/latency.h"
 #include "rocketmq/client/mq_client.h"
+#include "rocketmq/client/produce_accumulator.h"
 #include "rocketmq/client/request_reply.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/client/trace_context.h"
@@ -35,7 +38,10 @@
 
 namespace rocketmq {
 
-class DefaultMQProducer {
+// `AccumulatorSender`（见 produce_accumulator.h）是累加器唯一的对外依赖：它需要一个
+// 「绕过累加器、直接发一批」的入口。真实生产者就是 `DefaultMQProducer` 自己 ——
+// 与 Java 的 `DefaultMQProducer.sendDirect(MessageBatch, mq, callback)` 同一分工。
+class DefaultMQProducer : public AccumulatorSender {
 public:
     explicit DefaultMQProducer(const std::string& producerGroup = MixAll::DEFAULT_PRODUCER_GROUP);
 
@@ -73,6 +79,29 @@ public:
         return retryResponseCodes_.count(responseCode) > 0;
     }
     void setMaxMessageSize(int32_t bytes) { maxMessageSize_ = bytes; }
+    // ---------------- 自动攒批（对应 Java DefaultMQProducer:156-196 / 1190-1243）----------------
+    // 开关默认 false（与 Java 同）。打开后 `send(msg)` 系列不再一条条直发，而是按
+    // `AggregateKey(topic, mq, waitStoreMsgOK, tag)` 归并进累加器攒批（见
+    // produce_accumulator.h 的契约）。三个阈值在累加器**创建之前**设也能生效 ——
+    // `initProduceAccumulator()` 会把它们同步下去（Java 的 `> -1` 才下发）。
+    void setAutoBatch(bool autoBatch) { autoBatch_ = autoBatch; }
+    // ⚠ 累加器为空时恒返回 false（Java `getAutoBatch():1232-1236` 同）。
+    bool getAutoBatch() const;
+    // 单个批次的最长攒批时间，合法区间 (0, 30s]（默认 10ms）
+    void setBatchMaxDelayMs(int32_t holdMs);
+    int32_t getBatchMaxDelayMs() const;
+    // 单个批次的 body 上限，合法区间 (0, 2MB]（默认 32KB）
+    void setBatchMaxBytes(int64_t holdSize);
+    int64_t getBatchMaxBytes() const;
+    // 累加器的在途总量上限，必须 > 0（默认 32MB）
+    void setTotalBatchMaxBytes(int64_t totalHoldBytes);
+    int64_t getTotalBatchMaxBytes() const;
+    // Java `initProduceAccumulator():1475-1490`：按 clientId 取（或建）进程级累加器，
+    // 并把「建累加器之前设过的」三个阈值补下发。Java 在 DefaultMQProducerImpl 的构造里调，
+    // 本端口在 start() 里调 —— 见 producer.cpp 的注释（差异：未 start() 时不建线程）。
+    void initProduceAccumulator();
+    std::shared_ptr<ProduceAccumulator> produceAccumulator() const { return produceAccumulator_; }
+
     // ---------------- 异步发送（对应 Java DefaultMQProducerImpl 的 AsyncSenderExecutor）----
     // 异步链的失败重试次数。Java DefaultMQProducer:140 默认 2，与同步的
     // retryTimesWhenSendFailed 是**两个独立**配置（同步循环用它、异步 onExceptionImpl 用它）。
@@ -203,6 +232,35 @@ public:
     int32_t maxMessageSize() const { return maxMessageSize_; }
     bool isStarted() const { return started_; }
 
+    // ---------------- 自动攒批的转发层（对应 Java DefaultMQProducer:434-452 / 759-793）--------
+    // 对应 Java `DefaultMQProducer.canBatch`：先过累加器的全局字节闸门，再过三条
+    // 「不能攒批」的判断。⚠ **放行即记账** —— 后面三条只是让调用方退回直发，那条消息的
+    // 字节数**不会被归还**（上游遗漏，照抄）。
+    bool canBatch(const Message& msg) const;
+
+    // 对应 Java `DefaultMQProducer.sendDirect`：**绕过累加器**直发（内部照样走重试链）。
+    // 同步版返回结果；异步版立刻返回 `nullopt`、结果走 callback。
+    // ⚠ 必须落到 `send`/`sendAsync`，不能再绕回公开入口 —— 调用方进到这里恰恰是因为
+    // 攒批被拒，绕回去就是无限递归。
+    std::optional<SendResult> sendDirect(const Message& msg, const MessageQueue* mq,
+                                         std::shared_ptr<SendCallback> callback);
+
+    // 对应 Java `DefaultMQProducer.sendByAccumulator`：不能攒批 → 退回直发；否则先过
+    // `Validators.checkMessage` 再给本条消息打 UNIQ_KEY（批量 body 里每条子消息的客户端 ID
+    // 就靠它），然后交给累加器（同步版返回本条自己的 SendResult，异步版立刻返回 nullopt）。
+    std::optional<SendResult> sendByAccumulator(const Message& msg, const MessageQueue* mq,
+                                                std::shared_ptr<SendCallback> callback);
+
+    // `AccumulatorSender` 实现：累加器攒够一批后从这里出去。
+    //   * 同步：Java `sendDirect(batch, mq, null)`。⚠ cpp 的批量内核（`sendBatchKernel`）
+    //     本身不含重试链，与 cpp 既有的 `sendBatch` 同一口径；Java 的 sendDirect 会落到
+    //     `sendDefaultImpl` 的重试链上。这是本端口批量路径**既有**的结构性简化，不在本
+    //     次改动范围内（单条发送的重试链是完整的，见 `send`）。
+    //   * 异步：Java `sendDirect(batch, mq, callback)`。
+    SendResult sendDirectBlocking(const MessageBatch& batch, const MessageQueue* mq) override;
+    void sendDirectAsync(const MessageBatch& batch, const MessageQueue* mq,
+                         std::shared_ptr<SendCallback> callback) override;
+
     // ---------------- 生命周期 ----------------
     void start();
     void shutdown();
@@ -314,6 +372,18 @@ public:
 
 protected:
     void checkMessage(const Message& msg) const;
+    // ---------------- 「判完 autoBatch」之后的真实发送链 ----------------
+    // 公开入口（send/sendAsync/sendBySelector）先判一次 `getAutoBatch() && !msg.isBatch`，
+    // 这两个（+两个异步版）就是**不判**的那一半，对应 Java 的
+    // `DefaultMQProducerImpl#send*`。`sendDirect` 必须落到这里而不是公开入口 ——
+    // 公开入口会再判一次 autoBatch，而调用方进 `sendDirect` 恰恰是因为攒批被拒
+    // （延时消息 / 重试 topic / PGROUP），绕回去就成了死循环。
+    SendResult sendDefaultImpl(const Message& msg, int32_t timeoutMillis);
+    SendResult sendToMqImpl(const Message& msg, const MessageQueue& mq, int32_t timeoutMillis);
+    void sendAsyncImpl(const Message& msg, std::shared_ptr<SendCallback> callback,
+                       int32_t timeoutMillis);
+    void sendAsyncToMqImpl(const Message& msg, const MessageQueue& mq,
+                           std::shared_ptr<SendCallback> callback, int32_t timeoutMillis);
     // 发送前给 topic 套上 namespace 前缀（对应 Java withNamespace）；namespace 为空原样返回。
     Message withNamespace(const Message& msg) const;
     // request() 的公共收尾（两个公开重载都会走到这里；outbound 已过 withNamespace/checkMessage）
@@ -341,6 +411,15 @@ protected:
     // 选队列（pinned 非空则定点）→ sendWithHooks。
     SendResult sendBatchKernel(const std::vector<Message>& msgs, const MessageQueue* pinned,
                                int32_t timeoutMillis);
+    // 发送一个**已经编码好**的批量（Java `sendDirect(MessageBatch, mq, callback)` 落到
+    // `defaultMQProducerImpl.send(batch)`）。
+    //
+    // 为什么不复用 `sendBatchKernel`：那个内核按 `std::vector<Message>` 入参、会
+    // `MessageBatch::generateFromList` 重建批量，而批级的 KEYS / TAGS 是累加器 `batch()`
+    // 算出来写在 body 之外（请求头）的 —— 重建只剩 topic + WAIT，KEYS 的并集会丢。
+    // 这里按 Java 的做法把整批**原样**送出去。
+    SendResult sendPreparedBatch(const MessageBatch& batch, const MessageQueue* pinned,
+                                 int32_t timeoutMillis);
     // 带 before/after 钩子的同步发送（对应 Java sendKernelImpl 的钩子点）：
     // 无钩子时直接透传，零开销。msgType 判定与 Java 一致：
     // TRAN_MSG=true -> Trans_Msg_Half；带 DELAY 属性 -> Delay_Msg；否则 Normal_Msg。
@@ -499,6 +578,18 @@ protected:
         ResponseCode::TOPIC_NOT_EXIST,     ResponseCode::NO_BUYER_ID,
         ResponseCode::NOT_IN_CURRENT_UNIT, ResponseCode::GO_AWAY};
     int32_t maxMessageSize_ = 1024 * 1024 * 4;
+    // ---------------- 自动攒批（对应 Java DefaultMQProducer:156-196）----------------
+    bool autoBatch_ = false;
+    // Java 的 batchMaxDelayMs / batchMaxBytes / totalBatchMaxBytes，默认 **-1 = 没设过**：
+    // 只有 `> -1` 才在 `initProduceAccumulator()` 里覆盖累加器的值 —— 同一个 clientId 的
+    // 第二个生产者不能把第一个人调好的阈值改掉。
+    int32_t batchMaxDelayMs_ = -1;
+    int64_t batchMaxBytes_ = -1;
+    int64_t totalBatchMaxBytes_ = -1;
+    // 进程级注册表（produce_accumulator.h 尾部）也持有一份，所以是 shared_ptr。
+    // `~DefaultMQProducer` / `shutdown()` 会 `detachSender()`：之后守卫线程不再碰这个
+    // 已析构的生产者（cpp 结构性差异，Java 靠强引用"泄漏"规避）。
+    std::shared_ptr<ProduceAccumulator> produceAccumulator_;
     // 压缩配置，默认值与 Java DefaultMQProducer 一致
     int32_t compressMsgBodyOverHowmuch_ = 1024 * 4;
     int32_t compressLevel_ = 5;

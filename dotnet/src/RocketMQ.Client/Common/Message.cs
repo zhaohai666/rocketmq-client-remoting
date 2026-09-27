@@ -162,19 +162,16 @@ public class Message
         set => Properties[MessageConst.PropertyDelayTimeLevel] = value.ToString(CultureInfo.InvariantCulture);
     }
 
+    /// <summary>Java <c>Message.isWaitStoreMsgOK()</c>：属性**缺省即 true**，其余走
+    /// <c>Boolean.parseBoolean</c> —— 只有忽略大小写的 "true" 为真。</summary>
+    /// <remarks>别把缺省判成 false：本类的构造器（同 Python / Rust）<b>不</b>预写 WAIT，
+    /// 所以"属性缺省"是常态。缺省判成 false 会让 <c>MessageBatch.GenerateFromList</c> 攒出
+    /// <c>WAIT=false</c> 的批量，broker 不等刷盘就回 SEND_OK（持久性静默降级）。
+    /// Rust / Python / C++ 三端同名判据完全一致。</remarks>
     public bool WaitStoreMsgOk
     {
-        get
-        {
-            if (!Properties.TryGetValue(MessageConst.PropertyWaitStoreMsgOk, out var s))
-            {
-                return true;
-            }
-
-            return !(s.Length == 5 && (s[0] == 'f' || s[0] == 'F') && (s[1] == 'a' || s[1] == 'A') &&
-                     (s[2] == 'l' || s[2] == 'L') && (s[3] == 's' || s[3] == 'S') &&
-                     (s[4] == 'e' || s[4] == 'E'));
-        }
+        get => !Properties.TryGetValue(MessageConst.PropertyWaitStoreMsgOk, out var s)
+               || string.Equals(s, "true", StringComparison.OrdinalIgnoreCase);
         set => Properties[MessageConst.PropertyWaitStoreMsgOk] = value ? "true" : "false";
     }
 

@@ -110,6 +110,16 @@ public class DefaultMQProducer
     private int _backPressureForAsyncSendSize = 100 * 1024 * 1024;
     private readonly FairSemaphore _semaphoreAsyncSendNum;
     private readonly FairSemaphore _semaphoreAsyncSendSize;
+    // ---------------- 自动攒批（对应 Java DefaultMQProducer:160-196 + ProduceAccumulator）----------------
+    // 打开后 Send(Message) 先按 AggregateKey 归并成 MessageBatch 再发（见 ProduceAccumulator.cs 头部）。
+    // 三个 -1 是「调用方没表态」的哨兵：InitProduceAccumulator() 里只把 > -1 的灌给累加器，
+    // 所以构造函数里设的值不会被默认值盖掉（Java 同一口径）。
+    private bool _autoBatch;
+    private int _batchMaxDelayMs = -1;
+    private long _batchMaxBytes = -1;
+    private long _totalBatchMaxBytes = -1;
+    /// <summary>按 clientId 复用的累加器（Java MQClientManager.getOrCreateProduceAccumulator）。</summary>
+    private ProduceAccumulator? _produceAccumulator;
 
     // 建背压信号量时的初始许可（Java DefaultMQProducerImpl:141-153）：配置**不高于**地板值时
     // 用地板值，并记一条 info —— Java 的分支是 `cfg > 10 ? new Semaphore(max(cfg, 10)) : new
@@ -555,9 +565,104 @@ public class DefaultMQProducer
         set => _requestTimeout = value > 0 ? value : 3000;
     }
 
-    public string ClientId => _clientId;
+    /// <summary>本客户端标识（Java <c>ClientConfig#buildMQClientId</c> 的结果）。可写：非空时
+    /// <see cref="Start"/> 不再自己拼，直接沿用（累加器就是按它复用的，测试要能各用各的）。</summary>
+    public string ClientId
+    {
+        get => _clientId;
+        set => _clientId = value;
+    }
 
     public bool IsStarted => _started;
+
+    // ---------------- 自动攒批参数（对应 Java DefaultMQProducer:1186-1241）----------------
+    // ⚠ 四个 getter 在累加器还没建起来（= 没 Start 过）时都返回「没打开」的那一档：
+    //   getAutoBatch→false，三个字节/时延 getter→0。Java 逐字如此（:1191-1236），
+    //   所以 Start() 之前读到的值与设进去的值**无关**，别当配置回读用。
+    public bool AutoBatch
+    {
+        get => _produceAccumulator is not null && _autoBatch;
+        set
+        {
+            _autoBatch = value;
+            ClientLog.Info("Set autoBatch=" + value);
+        }
+    }
+
+    public bool GetAutoBatch() => AutoBatch;
+
+    /// <summary>累加器实例（Java <c>DefaultMQProducer.produceAccumulator</c>）。正常由
+    /// <see cref="Start"/> 里的 <see cref="InitProduceAccumulator"/> 建立；可写是为了让测试
+    /// 能在不 Start 的情况下注一个进去（Java 的单测同样是直接怼字段）。</summary>
+    public ProduceAccumulator? ProduceAccumulator
+    {
+        get => _produceAccumulator;
+        set => _produceAccumulator = value;
+    }
+
+    /// <summary>Java <c>batchMaxDelayMs(int)</c>：先记在本对象上，已是 Start 过的对象则立即同步给累加器。</summary>
+    public int BatchMaxDelayMs
+    {
+        get => _produceAccumulator is null ? 0 : _produceAccumulator.GetBatchMaxDelayMs();
+        set
+        {
+            _batchMaxDelayMs = value;
+            if (_produceAccumulator is not null)
+            {
+                _produceAccumulator.BatchMaxDelayMs(value);
+            }
+        }
+    }
+
+    public long BatchMaxBytes
+    {
+        get => _produceAccumulator is null ? 0 : _produceAccumulator.GetBatchMaxBytes();
+        set
+        {
+            _batchMaxBytes = value;
+            if (_produceAccumulator is not null)
+            {
+                _produceAccumulator.BatchMaxBytes(value);
+            }
+        }
+    }
+
+    public long TotalBatchMaxBytes
+    {
+        get => _produceAccumulator is null ? 0 : _produceAccumulator.GetTotalBatchMaxBytes();
+        set
+        {
+            _totalBatchMaxBytes = value;
+            if (_produceAccumulator is not null)
+            {
+                _produceAccumulator.TotalBatchMaxBytes(value);
+            }
+        }
+    }
+
+    /// <summary>Java <c>initProduceAccumulator():1475-1490</c>：按 clientId 复用累加器，再把
+    /// 构造函数期间设下的三个 <c>&gt; -1</c> 阈值灌进去。upstream 在
+    /// <c>DefaultMQProducerImpl.start():256</c> 调用它 —— 必须早于本类的 <c>_started = true</c>，
+    /// 否则「start 之后立刻 send」会撞上空累加器。</summary>
+    public void InitProduceAccumulator()
+    {
+        _produceAccumulator = ProduceAccumulatorRegistry.GetOrCreate(
+            string.IsNullOrEmpty(_clientId) ? MixAll.DefaultInstanceName : _clientId);
+        if (_batchMaxDelayMs > -1)
+        {
+            _produceAccumulator.BatchMaxDelayMs(_batchMaxDelayMs);
+        }
+
+        if (_batchMaxBytes > -1)
+        {
+            _produceAccumulator.BatchMaxBytes(_batchMaxBytes);
+        }
+
+        if (_totalBatchMaxBytes > -1)
+        {
+            _produceAccumulator.TotalBatchMaxBytes(_totalBatchMaxBytes);
+        }
+    }
 
     // ---------------- 生命周期 ----------------
 
@@ -623,6 +728,11 @@ public class DefaultMQProducer
             _mqClient.RemotingClient.RegisterProcessor(RequestCode.CheckTransactionState,
                 CheckTransactionState);
 
+            // 累加器必须在 _started=true **之前**建好：AutoBatch 的 getter 见不到累加器就报
+            // "没打开"，start 之后立刻 send 的第一笔会绕过攒批直发（Java 在 impl.start():256
+            // 也是这个次序）。按 clientId 复用，所以 restart 拿到的是同一个累加器。
+            InitProduceAccumulator();
+
             _started = true;
             // 允许 Shutdown 之后再 Start：Shutdown 的前半程里 _started 还是 true，靠 _shutdownRequested
             // 挡住重复 Shutdown 与新请求，重新 Start 时这道闸必须复位（Java 也支持 start→shutdown→start）
@@ -630,6 +740,9 @@ public class DefaultMQProducer
             // 异步发送池（Java 在 DefaultMQProducerImpl 构造时建，这里等价放在 Start 的锁内）：
             // 必须早于 _started=true 之后任何一次 SendAsync —— SendAsync 只在锁里取句柄。
             CreateAsyncExecutors();
+            // 守卫线程同理放最后：它们是纯后台线程，早开晚会都不影响对外语义，
+            // 但必须在能进 Send 之前就位（否则攒批会一直等到第一个守卫轮次）。
+            _produceAccumulator?.Start();
             ClientLog.Info("DefaultMQProducer[" + _producerGroup + "] started, clientId=" + _clientId);
 
             // 心跳线程：周期性向 broker 注册 ProducerData。broker 的事务回查正是通过
@@ -731,6 +844,11 @@ public class DefaultMQProducer
         {
             _started = false;
         }
+
+        // 守卫线程跟着生产者一起停（Java DefaultMQProducer.shutdown():414-416：在
+        // impl.shutdown() **之后**关累加器）。累加器本身留在按 clientId 的复用表里，
+        // 里面的表项不清 —— 与 Java 同：残留批次下次 start 后仍由新守卫线程处理。
+        _produceAccumulator?.Shutdown();
 
         // 事务回查线程仍按老口径 join（它们也持有 mqClient 引用）
         foreach (Thread t in threads)
@@ -1148,6 +1266,120 @@ public class DefaultMQProducer
         Other,
     }
 
+    // ---------------- 自动攒批的转发层（对应 Java DefaultMQProducer:434-452 / 759-793）----------------
+
+    /// <summary>Java <c>Message.getDelayTimeMs/Sec()</c> + <c>getDeliverTimeMs()</c> 的最大值
+    /// （缺省 0）。属性名逐字对齐 <c>MessageConst</c>；值非法时与 Java 的
+    /// <c>Long.parseLong</c> 一样**直接抛**，不静默当 0。</summary>
+    private static long MaxDelayValue(Message msg)
+    {
+        long result = msg.DelayTimeLevel;
+        foreach (string name in TimerDelayProperties)
+        {
+            if (!msg.Properties.TryGetValue(name, out var raw) || raw is null)
+            {
+                continue;
+            }
+
+            long value = long.Parse(raw, CultureInfo.InvariantCulture);
+            if (value > result)
+            {
+                result = value;
+            }
+        }
+
+        return result;
+    }
+
+    private static readonly string[] TimerDelayProperties =
+    {
+        "TIMER_DELAY_MS", "TIMER_DELAY_SEC", "TIMER_DELIVER_MS",
+    };
+
+    /// <summary>Java <c>DefaultMQProducer.canBatch:434-452</c>。
+    ///
+    /// ⚠ 先过全局字节闸门 <see cref="ProduceAccumulator.TryAddMessage"/>：**放行即记账**，
+    /// 而后面三条「不能攒批」的判断只让调用方退回直发 —— 那条消息的字节数**不会被归还**
+    /// （上游遗漏，照抄；改掉就与 Java 对不上了）。三条排除项：
+    ///   1. 延时/定时消息（DELAY / TIMER_DELAY_MS / TIMER_DELAY_SEC / TIMER_DELIVER_MS）
+    ///      任何一个 &gt; 0 都不攒批 —— 一个 MessageBatch 只能有一个延时属性；
+    ///   2. 重试 topic（<c>%RETRY%</c> 前缀）：重试消息的位点语义特殊；
+    ///   3. 已带 PGROUP 属性的消息（事务半消息那种）：broker 侧要按组找连接。
+    ///
+    /// 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。</summary>
+    public bool CanBatch(Message msg)
+    {
+        if (_produceAccumulator is null || !_produceAccumulator.TryAddMessage(msg))
+        {
+            return false;
+        }
+
+        if (MaxDelayValue(msg) > 0)
+        {
+            return false;
+        }
+
+        if (msg.Topic.StartsWith(MixAll.RetryGroupTopicPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (msg.Properties.ContainsKey(MessageConst.PropertyProducerGroup))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>Java <c>DefaultMQProducer.sendDirect:759-776</c>：绕过累加器直发（同步或异步）。
+    /// 注意"直发"指的是**不经累加器**，内部照样走重试链。
+    /// ⚠ 必须落到 *Impl 变体（= Java 的 <c>DefaultMQProducerImpl.send*</c>）：公开入口会再判
+    /// 一次 AutoBatch，而调用方进到这里恰恰是因为攒批被拒，绕回公开入口就是无限递归。
+    /// virtual 是为了测试能造一个"只记账不联网"的假生产者（Java 单测的 MockMQProducer 同款）。</summary>
+    public virtual SendResult? SendDirect(Message msg, MessageQueue? mq, ISendCallback? sendCallback)
+    {
+        if (sendCallback is null)
+        {
+            return mq is null ? SendImpl(msg, -1) : SendToMqImpl(msg, mq, -1);
+        }
+
+        SendAsyncImpl(msg, sendCallback, -1, mq);
+        return null;
+    }
+
+    /// <summary>Java <c>DefaultMQProducer.sendByAccumulator:778-793</c>。
+    /// 不能攒批（见 <see cref="CanBatch"/>）→ 退回直发；否则先过 <c>Validators.checkMessage</c>
+    /// 再给本条消息打 UNIQ_KEY（批量消息的 ID 在编码成 body 前就得写好），然后交给累加器
+    /// （同步版返回本条自己的 SendResult，异步版立刻返回 null、结果走回调）。</summary>
+    public SendResult? SendByAccumulator(Message msg, MessageQueue? mq, ISendCallback? sendCallback)
+    {
+        if (!CanBatch(msg))
+        {
+            return SendDirect(msg, mq, sendCallback);
+        }
+
+        Validators.CheckMessage(msg, _maxMessageSize);
+        MessageClientIDSetter.SetUniqId(msg);
+        if (sendCallback is null)
+        {
+            return mq is null
+                ? _produceAccumulator!.Send(msg, this)
+                : _produceAccumulator!.Send(msg, mq, this);
+        }
+
+        if (mq is null)
+        {
+            _produceAccumulator!.SendAsync(msg, sendCallback, this);
+        }
+        else
+        {
+            _produceAccumulator!.SendAsync(msg, mq, sendCallback, this);
+        }
+
+        return null;
+    }
+
     // 不指定队列：按 broker 延迟/隔离状态选队列，失败按 retryTimesWhenSendFailed 重试。
     // 逐条对齐 Java DefaultMQProducerImpl#sendDefaultImpl：
     //   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
@@ -1158,6 +1390,28 @@ public class DefaultMQProducer
     //   * 异常按类型分档写容错表，且只有 RetryResponseCodes 里的 broker 响应码才继续重试；
     //   * 全部失败时把原因映射成 ClientErrorCode 塞进 MQClientException。
     public SendResult Send(Message msg, int timeoutMillis = -1)
+    {
+        // 自动攒批分流（Java DefaultMQProducer.send(Message):472-478）。两个不分流的情况与
+        // Java 一一对应：
+        //   * **显式给了 timeout** 的重载（Java send(msg, timeout)）直接进 impl，不攒批；
+        //   * 批量消息被 `msg is not MessageBatch` 挡住 —— 那正是累加器自己发出去的东西，
+        //     不挡就会无限递归。
+        // 这里先过 namespace 再把**副本**交给累加器（Java 是在入口就地 setTopic，之后每条
+        // 子消息的 topic 会逐条编码进批量 body，broker 落盘、消费侧看到的就是带前缀的；
+        // 本工程按既有口径不动调用方那份消息）。
+        if (timeoutMillis < 0 && AutoBatch && msg is not MessageBatch)
+        {
+            return SendByAccumulator(WithNamespace(msg), null, null)!;
+        }
+
+        return SendImpl(msg, timeoutMillis);
+    }
+
+    /// <summary>Java <c>DefaultMQProducerImpl.send(msg, timeout)</c> 的整条同步发送链
+    /// （"绕过累加器"的那一半）。<see cref="SendDirect"/> 必须走这里而不是公开的
+    /// <see cref="Send(Message,int)"/>：后者会再判一次 AutoBatch，攒批失败时两边互相调用，
+    /// 成了无限递归。</summary>
+    private SendResult SendImpl(Message msg, int timeoutMillis)
     {
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
@@ -1327,6 +1581,18 @@ public class DefaultMQProducer
     // 定点发送到指定队列
     public SendResult Send(Message msg, MessageQueue mq, int timeoutMillis = -1)
     {
+        // 与无 mq 的重载同一条分流（Java DefaultMQProducer:578-582）：
+        // 指定队列与不指定队列归并键不同（AggregateKey.mq），但判据一样。
+        if (timeoutMillis < 0 && AutoBatch && msg is not MessageBatch)
+        {
+            return SendByAccumulator(WithNamespace(msg), mq, null)!;
+        }
+
+        return SendToMqImpl(msg, mq, timeoutMillis);
+    }
+
+    private SendResult SendToMqImpl(Message msg, MessageQueue mq, int timeoutMillis)
+    {
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
@@ -1385,6 +1651,29 @@ public class DefaultMQProducer
     /// </summary>
     public void SendAsync(Message msg, ISendCallback callback, int timeoutMillis = -1,
         MessageQueue? mq = null)
+    {
+        // 自动攒批分流（Java DefaultMQProducer.send(msg, sendCallback):517-526）。Java 在
+        // 同一个 try 里把两种分流的 **Throwable** 都交给 onException —— 攒批路径上的
+        // 「不合法消息 / 累加器参数非法」不能砸回调用方栈。
+        if (timeoutMillis < 0 && AutoBatch && msg is not MessageBatch)
+        {
+            try
+            {
+                SendByAccumulator(WithNamespace(msg), mq, callback);
+            }
+            catch (Exception e)
+            {
+                callback.OnException(e);
+            }
+
+            return;
+        }
+
+        SendAsyncImpl(msg, callback, timeoutMillis, mq);
+    }
+
+    private void SendAsyncImpl(Message msg, ISendCallback callback, int timeoutMillis,
+        MessageQueue? mq)
     {
         // 链上带的是**克隆**：压缩会就地改 body，不能改调用方那份。克隆在池线程上做（与批量
         // 同一条前段），许可长度仍在**调用方线程**上按压缩前的 body 算 —— Java 就是在那儿算的。

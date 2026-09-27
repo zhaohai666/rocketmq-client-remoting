@@ -49,12 +49,17 @@ int32_t Message::getDelayTimeLevel() const {
 }
 
 bool Message::isWaitStoreMsgOk() const {
+    // Java Message.isWaitStoreMsgOK()：属性**缺省即 true**，其余走 Boolean.parseBoolean
+    // —— 只有忽略大小写的 "true" 为真。
+    // ⚠ 别把缺省判成 false：本类（同 Python / Rust / C#）**不**在构造时预写 WAIT，
+    // 所以"属性缺省"是常态。缺省判成 false 会让 MessageBatch::generateFromList 攒出
+    // WAIT=false 的批量，broker 不等刷盘就回 SEND_OK（持久性静默降级）。
     auto it = properties.find(MessageConst::PROPERTY_WAIT_STORE_MSG_OK);
     if (it == properties.end()) return true;
     const std::string& s = it->second;
-    return !(s.size() == 5 && (s[0] == 'f' || s[0] == 'F') && (s[1] == 'a' || s[1] == 'A') &&
-             (s[2] == 'l' || s[2] == 'L') && (s[3] == 's' || s[3] == 'S') &&
-             (s[4] == 'e' || s[4] == 'E'));
+    if (s.size() != 4) return false;
+    return (s[0] == 't' || s[0] == 'T') && (s[1] == 'r' || s[1] == 'R') &&
+           (s[2] == 'u' || s[2] == 'U') && (s[3] == 'e' || s[3] == 'E');
 }
 
 std::string Message::getWaitStoreMsgOkStr() const {

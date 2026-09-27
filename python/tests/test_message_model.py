@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from rocketmq.common.message import Message, MessageBatch, MessageExt, MessageQueue
+from rocketmq.common.message import (Message, MessageBatch, MessageExt, MessageQueue,
+                                     is_wait_store_msg_ok)
 from rocketmq.common.message_const import MessageConst
 
 
@@ -194,3 +195,37 @@ class TestMessageBatch:
         m2.set_wait_store_msg_ok(False)
         with pytest.raises(ValueError):
             MessageBatch.generate_from_list([m1, m2])
+
+    def test_batch_defaults_wait_store_msg_ok_to_true(self):
+        """回归：**没设过 WAIT** 的普通消息组成的批量必须是 WAIT=true。
+
+        曾经写成 ``first.get_wait_store_msg_ok() == "true"`` —— 缺省（None）被判成 False，
+        于是 ``send_batch`` 把 Java 的 ``WAIT=true`` 发成了 ``WAIT=false``：broker 不再等刷盘
+        就回 SEND_OK，持久性静默降级。Rust 侧同款缺陷一起修掉了。
+        """
+        messages = [Message(topic="T", body=b"a"), Message(topic="T", body=b"b")]
+        # 前提：Message.__init__（同 Rust 的 Message::new）不预写 WAIT
+        assert messages[0].get_wait_store_msg_ok() is None
+        batch = MessageBatch.generate_from_list(messages)
+        assert batch.get_wait_store_msg_ok() == "true"
+
+        # 显式 false 要原样传下去
+        for m in messages:
+            m.set_wait_store_msg_ok(False)
+        assert MessageBatch.generate_from_list(messages).get_wait_store_msg_ok() == "false"
+
+    def test_is_wait_store_msg_ok_follows_java_parse_boolean(self):
+        """Java ``Message.isWaitStoreMsgOK()`` = 缺省 true + ``Boolean.parseBoolean``。"""
+        msg = Message(topic="T", body=b"a")
+        assert is_wait_store_msg_ok(msg)                      # 缺省
+        msg.set_wait_store_msg_ok(True)
+        assert is_wait_store_msg_ok(msg)
+        msg.set_wait_store_msg_ok(False)
+        assert not is_wait_store_msg_ok(msg)
+        # 大小写不敏感
+        msg.properties["WAIT"] = "TRUE"
+        assert is_wait_store_msg_ok(msg)
+        # 其它值一律 false（不是"非 false 即真"）
+        for raw in ("1", "", "yes", "tru"):
+            msg.properties["WAIT"] = raw
+            assert not is_wait_store_msg_ok(msg), raw

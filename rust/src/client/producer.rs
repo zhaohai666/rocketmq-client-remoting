@@ -52,6 +52,10 @@ use crate::client::mq_client::{
     MQClientInstance, MQClientInstanceConfig, PublishMessage, TopicPublishInfo, TraceDispatcher,
     MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
+use crate::client::produce_accumulator::{
+    get_or_create_produce_accumulator, AccumulatorSender, ProduceAccumulator,
+    TIMER_DELAY_KEYS,
+};
 use crate::client::request_reply::{
     create_correlation_id, request_future_holder, RequestResponseFuture,
     DEFAULT_REQUEST_TIMEOUT_MILLIS,
@@ -453,6 +457,18 @@ pub struct ProducerConfig {
     pub trace_msg_batch_num: i32,
     /// Python `request_timeout`（`request()` 未显式给 timeout 时用）。
     pub request_timeout: i64,
+    /// Java `DefaultMQProducer.autoBatch`（默认 **false**）：打开后 `send(Message)`
+    /// 先按 `AggregateKey` 归并成批量再发（见 [`crate::client::produce_accumulator`]）。
+    pub auto_batch: bool,
+    /// Java `DefaultMQProducer.batchMaxDelayMs`：一个批次的存活时间上限（ms）。
+    /// **-1 是「调用方没表态」的哨兵** —— 只有 `> -1` 的值才会在
+    /// [`DefaultMQProducer::init_produce_accumulator`] 里灌给累加器。
+    pub batch_max_delay_ms: i64,
+    /// Java `DefaultMQProducer.batchMaxBytes`：一个批次的字节数上限。同上，`-1` = 没表态。
+    pub batch_max_bytes: i64,
+    /// Java `DefaultMQProducer.totalBatchMaxBytes`：在途攒批的**全局**字节上限。
+    /// 同上，`-1` = 没表态。
+    pub total_batch_max_bytes: i64,
 }
 
 impl Default for ProducerConfig {
@@ -500,6 +516,12 @@ impl Default for ProducerConfig {
             trace_topic: None,
             trace_msg_batch_num: 10,
             request_timeout: DEFAULT_REQUEST_TIMEOUT_MILLIS,
+            // Java `DefaultMQProducer:160/186/191/196`：开关默认关，三个阈值默认 -1
+            // （-1 = 「调用方没表态」，见字段说明）。
+            auto_batch: false,
+            batch_max_delay_ms: -1,
+            batch_max_bytes: -1,
+            total_batch_max_bytes: -1,
         }
     }
 }
@@ -552,6 +574,9 @@ struct Inner {
     /// （Python `_async_sender_executor`）：有界队列 + 固定并发额度 + 一个派发任务。
     /// `start()` 建、`shutdown()` 关；`None` = 没启动过或已关闭。
     async_sender: Mutex<Option<AsyncSenderExecutor>>,
+    /// Java `DefaultMQProducer.produceAccumulator`（默认 `null`）：自动攒批的累加器。
+    /// `start()` 里按 clientId 取（或建），`get_auto_batch()` 见不到它就报「没打开」。
+    produce_accumulator: RwLock<Option<ProduceAccumulator>>,
 }
 
 impl Inner {
@@ -817,6 +842,9 @@ impl DefaultMQProducer {
             // Java 的池子在 impl 构造时就建好；本端口没有运行时句柄可用（构造允许发生
             // 在运行时之外），所以推迟到 `start()` 建、`shutdown()` 关。
             async_sender: Mutex::new(None),
+            // Java 的累加器同样在 `start()` 里建（`initProduceAccumulator`），见
+            // `init_produce_accumulator`。
+            produce_accumulator: RwLock::new(None),
         });
         Ok(DefaultMQProducer { inner })
     }
@@ -1782,6 +1810,62 @@ const DELAY_PROPERTY_KEYS: [&str; 5] = [
     "TIMER_DELAY_MS",
 ];
 
+/// Java `canBatch` 里那四个延时属性的最大值（缺省 0）：`DELAY`（delayTimeLevel）
+/// 加上 [`TIMER_DELAY_KEYS`] 三个。
+///
+/// ⚠ 值非法时 Java 的 `Long.parseLong` 会抛、Python 也抛，本端口沿用 crate 里
+/// [`MessageBatch::generate_from_list`](crate::common::message::MessageBatch::generate_from_list)
+/// 的既有口径：`trim().parse().unwrap_or(0)`（非数字当 0）。三处口径一致才不会互相打架。
+fn max_delay_value(msg: &Message) -> i64 {
+    let mut max = 0i64;
+    if let Some(level) = msg.get_delay_time_level() {
+        max = level.trim().parse::<i64>().unwrap_or(0);
+    }
+    for key in TIMER_DELAY_KEYS {
+        if let Some(raw) = msg.get_property(key) {
+            let value = raw.trim().parse::<i64>().unwrap_or(0);
+            if value > max {
+                max = value;
+            }
+        }
+    }
+    max
+}
+
+/// 累加器的 `send_direct_*` 落到生产者的哪条路上
+/// （Java `DefaultMQProducer.sendDirect:759-776`）。
+///
+/// ⚠ 两个入口都**不**走公开的 [`DefaultMQProducer::send`] / `send_async` ——
+/// 那会再判一次 `autoBatch`，而调用方进到这里恰恰是因为攒批被拒，绕回公开入口
+/// 就是无限递归。改成直接调「已编码批量」专用的两个内核。
+impl AccumulatorSender for DefaultMQProducer {
+    fn send_direct_blocking(
+        &self,
+        batch: MessageBatch,
+        mq: Option<&MessageQueue>,
+    ) -> Result<SendResult> {
+        let handle = self.runtime_handle().ok_or_else(|| {
+            Error::client("send_direct_blocking needs a tokio runtime; call start() first")
+        })?;
+        let mut batch = batch;
+        // ⚠ 超时**不显式传**：Java 这条路上是 `send(msg, mq)` → `send(msg, mq,
+        // getSendMsgTimeout())`，取的就是生产者自己的 `sendMsgTimeout`。
+        // ⚠ `Handle::block_on` 不能在异步执行上下文里调用（会 panic）。调用点只有两处：
+        // 累加器的**守卫线程**（普通 OS 线程）和 `send_by_accumulator` 派出去的
+        // `spawn_blocking` 线程 —— 都不是运行时线程。
+        handle.block_on(self.send_prepared_batch(&mut batch, mq, None))
+    }
+
+    fn send_direct_async(
+        &self,
+        batch: MessageBatch,
+        mq: Option<&MessageQueue>,
+        callback: Arc<dyn SendCallback>,
+    ) -> Result<()> {
+        self.send_prepared_batch_async(batch, mq.cloned(), callback, None)
+    }
+}
+
 // ================================================================ 发送路径
 
 impl DefaultMQProducer {
@@ -2082,6 +2166,182 @@ impl DefaultMQProducer {
         }
     }
 
+    // ---------------- 自动攒批的转发层（Java DefaultMQProducer:434-452 / 759-793 / 1186-1241 / 1475-1490）----------------
+
+    /// Java `DefaultMQProducer.produceAccumulator` 的只读句柄（`None` = 还没 start 过）。
+    pub fn produce_accumulator(&self) -> Option<ProduceAccumulator> {
+        self.inner
+            .produce_accumulator
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Java `DefaultMQProducer.initProduceAccumulator():1475-1490`：按 clientId 复用累加器，
+    /// 再把配置里三个 `> -1` 的阈值灌进去。upstream 在
+    /// `DefaultMQProducerImpl.start():256` 调用它 —— 必须早于 `started = true`，
+    /// 否则「start 之后立刻 send」会撞上空累加器。
+    pub fn init_produce_accumulator(&self) -> Result<()> {
+        let client_id = self
+            .read_cfg(|c| c.client_id.clone())
+            .unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_string());
+        // 累加器记住的是**这个生产者句柄**（Java 记的是 `this`）：批次创建时捕获，之后不再换。
+        let sender: Arc<dyn AccumulatorSender> = Arc::new(self.clone());
+        let accumulator = get_or_create_produce_accumulator(&client_id, sender);
+        let (delay_ms, bytes, total) = self.read_cfg(|c| {
+            (c.batch_max_delay_ms, c.batch_max_bytes, c.total_batch_max_bytes)
+        });
+        if delay_ms > -1 {
+            accumulator.batch_max_delay_ms(delay_ms)?;
+        }
+        if bytes > -1 {
+            accumulator.batch_max_bytes(bytes)?;
+        }
+        if total > -1 {
+            accumulator.total_batch_max_bytes(total)?;
+        }
+        *self
+            .inner
+            .produce_accumulator
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(accumulator);
+        Ok(())
+    }
+
+    /// Java `DefaultMQProducer.getAutoBatch():1233-1236`。
+    ///
+    /// ⚠ 累加器还没建起来（= 没 start 过）时**一律**报「没打开」，与配置里设进去的值无关 ——
+    /// 这是 Java 的 null 短路，别当配置回读用。
+    pub fn get_auto_batch(&self) -> bool {
+        if self.produce_accumulator().is_none() {
+            return false;
+        }
+        self.read_cfg(|c| c.auto_batch)
+    }
+
+    pub fn set_auto_batch(&self, auto_batch: bool) {
+        self.write_cfg(|c| c.auto_batch = auto_batch);
+    }
+
+    /// Java `DefaultMQProducer.getBatchMaxDelayMs():1191-1194`：累加器为 `null` 时返回 0。
+    pub fn get_batch_max_delay_ms(&self) -> i64 {
+        self.produce_accumulator().map_or(0, |a| a.get_batch_max_delay_ms())
+    }
+
+    /// Java `batchMaxDelayMs(int)`：先记在配置上，已经是 start 过的生产者则立即同步给累加器。
+    pub fn set_batch_max_delay_ms(&self, hold_ms: i64) -> Result<()> {
+        self.write_cfg(|c| c.batch_max_delay_ms = hold_ms);
+        if let Some(a) = self.produce_accumulator() {
+            a.batch_max_delay_ms(hold_ms)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_batch_max_bytes(&self) -> i64 {
+        self.produce_accumulator().map_or(0, |a| a.get_batch_max_bytes())
+    }
+
+    pub fn set_batch_max_bytes(&self, hold_size: i64) -> Result<()> {
+        self.write_cfg(|c| c.batch_max_bytes = hold_size);
+        if let Some(a) = self.produce_accumulator() {
+            a.batch_max_bytes(hold_size)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_total_batch_max_bytes(&self) -> i64 {
+        self.produce_accumulator().map_or(0, |a| a.get_total_batch_max_bytes())
+    }
+
+    pub fn set_total_batch_max_bytes(&self, total_hold_size: i64) -> Result<()> {
+        self.write_cfg(|c| c.total_batch_max_bytes = total_hold_size);
+        if let Some(a) = self.produce_accumulator() {
+            a.total_batch_max_bytes(total_hold_size)?;
+        }
+        Ok(())
+    }
+
+    /// Java `DefaultMQProducer.canBatch:434-452`。
+    ///
+    /// ⚠ 先过全局字节闸门 [`ProduceAccumulator::try_add_message`]：**放行即记账**，而后面
+    /// 三条「不能攒批」的判断只是让调用方退回直发 —— 那条消息的字节数**不会被归还**
+    /// （上游遗漏，照抄；改掉就与 Java 对不上了）。三条排除项：
+    ///   1. 延时/定时消息（DELAY / TIMER_DELAY_MS / TIMER_DELAY_SEC / TIMER_DELIVER_MS）
+    ///      任何一个 > 0 都不攒批 —— 一个 `MessageBatch` 只能有一个延时属性；
+    ///   2. 重试 topic（`%RETRY%` 前缀）：重试消息的位点语义特殊；
+    ///   3. 已带 PGROUP 属性的消息（事务半消息那种）：broker 侧要按组找连接。
+    pub fn can_batch(&self, msg: &Message) -> bool {
+        let Some(accumulator) = self.produce_accumulator() else {
+            return false;
+        };
+        if !accumulator.try_add_message(msg) {
+            return false;
+        }
+        if max_delay_value(msg) > 0 {
+            return false;
+        }
+        if msg.get_topic().starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX) {
+            return false;
+        }
+        if msg.get_property(PROPERTY_PRODUCER_GROUP).is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// `canBatch` 通过之后、进累加器之前的两步（Java `sendByAccumulator:784-785`）：
+    /// 本地校验 + 给本条消息打 `UNIQ_KEY`（批量 body 里每条子消息的客户端 ID 就靠它）。
+    fn check_and_stamp(&self, msg: &mut Message) -> Result<()> {
+        let max = self.read_cfg(|c| c.max_message_size);
+        validators::check_message(msg, max)?;
+        set_uniq_id(msg);
+        Ok(())
+    }
+
+    /// Java `DefaultMQProducer.sendByAccumulator(msg, mq, null):778-793` 的同步语义：
+    /// 不能攒批就退回直发，否则交给累加器并**等**到本批发完，返回本条消息自己的
+    /// `SendResult`。
+    ///
+    /// 累加器的同步 `send` 会阻塞到 `holdMs` 到点，所以这里挪到 tokio 的**阻塞线程池**
+    /// 上执行 —— 直接在异步 worker 上等会把并发额度占死（Java 那边本来就是阻塞调用方线程，
+    /// 语义一致）。
+    pub async fn send_by_accumulator(
+        &self,
+        mut msg: Message,
+        mq: Option<&MessageQueue>,
+    ) -> Result<SendResult> {
+        if !self.can_batch(&msg) {
+            return self.send_inner(&mut msg, None, mq).await;
+        }
+        self.check_and_stamp(&mut msg)?;
+        let accumulator = self
+            .produce_accumulator()
+            .ok_or_else(|| Error::client("produceAccumulator is null"))?;
+        let mq_owned = mq.cloned();
+        tokio::task::spawn_blocking(move || accumulator.send(msg, mq_owned.as_ref()))
+            .await
+            .map_err(|e| Error::client(format!("sendByAccumulator join error: {e}")))?
+    }
+
+    /// Java `DefaultMQProducer.sendByAccumulator(msg, mq, sendCallback):778-793` 的异步语义：
+    /// **立刻返回**，结果走回调。
+    pub fn send_by_accumulator_async(
+        &self,
+        mut msg: Message,
+        mq: Option<&MessageQueue>,
+        callback: Arc<dyn SendCallback>,
+    ) -> Result<()> {
+        if !self.can_batch(&msg) {
+            return self.send_async_inner(msg, callback, None, mq.cloned());
+        }
+        self.check_and_stamp(&mut msg)?;
+        let accumulator = self
+            .produce_accumulator()
+            .ok_or_else(|| Error::client("produceAccumulator is null"))?;
+        accumulator.send_async(msg, mq, callback);
+        Ok(())
+    }
+
     // ---------------- 正常发送 ----------------
 
     /// 同步发送（Python `send(msg, timeout_millis=None, mq=None)`）。
@@ -2096,62 +2356,119 @@ impl DefaultMQProducer {
         timeout_millis: Option<i64>,
         mq: Option<&MessageQueue>,
     ) -> Result<SendResult> {
+        // 自动攒批分流（Java `DefaultMQProducer.send(Message):472-478`）。两个**不分流**的
+        // 情况与 Java 一一对应：
+        //   * **显式给了 timeout** 的重载（Java `send(msg, timeout)`）直接进 impl，不攒批；
+        //   * 批量消息 —— Rust 的类型系统里 `MessageBatch` 根本不是 `Message`，进不了这个入口
+        //     （Java 的 `!(msg instanceof MessageBatch)` 是防"累加器自己发出去的那条再被归并"，
+        //     这里结构上不可能）。
+        // Java 是在这里就地把 topic 改成带命名空间的形式（`msg.setTopic(withNamespace(...))`），
+        // 之后每条子消息的 topic 会逐条编码进批量 body —— 所以这条赋值必须在进累加器之前。
+        if timeout_millis.is_none() && self.get_auto_batch() {
+            let topic = self.with_namespace(msg.get_topic());
+            msg.set_topic(&topic);
+            let owned = msg.clone();
+            return self.send_by_accumulator(owned, mq).await;
+        }
+        self.send_inner(msg, timeout_millis, mq).await
+    }
+
+    /// Java `DefaultMQProducerImpl.send(msg, timeout)` 的整条同步发送链
+    /// （"绕过累加器"的那一半）。自动攒批的直发回退、事务半消息都落在这里 ——
+    /// 走公开的 [`send`](Self::send) 会再判一次 `autoBatch`，攒批失败时两边互相调用，
+    /// 成了无限递归。
+    async fn send_inner(
+        &self,
+        msg: &mut Message,
+        timeout_millis: Option<i64>,
+        mq: Option<&MessageQueue>,
+    ) -> Result<SendResult> {
         let client = self.require_client()?;
-        let (timeout, retry_times) = {
-            let cfg = self
-                .inner
-                .cfg
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+        let (timeout, retry_times) = self.read_cfg(|cfg| {
             (
                 timeout_millis.unwrap_or(cfg.send_msg_timeout),
                 cfg.retry_times_when_send_failed,
             )
-        };
+        });
         let topic = self.with_namespace(&msg.topic);
-        msg.topic = topic.clone();
+        msg.topic = topic;
         self.check_message(msg)?;
         // 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
         // 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
         // 消费端只解一层就拿到压缩流。这里避免该问题。
         let sys_flag = self.try_to_compress_message(msg);
 
+        let mut publish = PublishMessage::Single(msg);
         if let Some(mq) = mq {
-            // 定点发送同样要过钩子（Java：目标是 mq 也走 sendKernelImpl）
-            let mut publish = PublishMessage::Single(msg);
-            if self.has_send_interceptors() {
-                return self
-                    .send_with_hooks(
-                        &client,
-                        &mut publish,
-                        mq,
-                        timeout,
-                        sys_flag,
-                        None,
-                        CommunicationMode::Sync,
-                    )
-                    .await;
-            }
-            return client
-                .send_message(
-                    &self.inner.producer_group(),
-                    &mut publish,
+            return self.send_pinned(&client, &mut publish, mq, timeout, sys_flag).await;
+        }
+        self.send_with_retry(&client, &mut publish, timeout, retry_times, sys_flag)
+            .await
+    }
+
+    /// Java `DefaultMQProducerImpl.send(msg, mq, timeout)` → `sendKernelImpl`：调用方
+    /// **已经指定**队列，不查路由、不换 broker 重试，只在同一台 broker 上换 opaque。
+    ///
+    /// 三种调用方共用：定点同步发送（[`send_inner`](Self::send_inner)）、批量发送
+    /// （[`send_batch`](Self::send_batch)）、累加器守卫线程的批量直发
+    /// （[`send_prepared_batch`](Self::send_prepared_batch)）。`sys_flag` 由调用方给：
+    /// 普通消息是压缩位，批量恒 0。
+    async fn send_pinned(
+        &self,
+        client: &MQClientInstance,
+        publish: &mut PublishMessage<'_>,
+        mq: &MessageQueue,
+        timeout: i64,
+        sys_flag: i32,
+    ) -> Result<SendResult> {
+        // 定点发送同样要过钩子（Java：目标是 mq 也走 sendKernelImpl）
+        if self.has_send_interceptors() {
+            return self
+                .send_with_hooks(
+                    client,
+                    publish,
                     mq,
                     timeout,
                     sys_flag,
-                    self.inner.unit_mode(),
-                    &self.inner.create_topic_key(),
-                    self.inner.default_topic_queue_nums(),
+                    None,
+                    CommunicationMode::Sync,
                 )
                 .await;
         }
+        client
+            .send_message(
+                &self.inner.producer_group(),
+                publish,
+                mq,
+                timeout,
+                sys_flag,
+                self.inner.unit_mode(),
+                &self.inner.create_topic_key(),
+                self.inner.default_topic_queue_nums(),
+            )
+            .await
+    }
 
+    /// Java `DefaultMQProducerImpl.sendDefaultImpl(..., CommunicationMode.SYNC, ...)`：
+    /// 路由取一次 → 每轮换 broker（故障规避 `MQFaultStrategy`）→ 按异常分类决定是否继续。
+    ///
+    /// `publish` 在**每轮**重新借出（[`PublishMessage::reborrow`]），因为请求要按本轮选中的
+    /// broker 重建 header；底层消息只有一份，轮次之间必须共享同一份 body / UNIQ_KEY。
+    async fn send_with_retry(
+        &self,
+        client: &MQClientInstance,
+        publish: &mut PublishMessage<'_>,
+        timeout: i64,
+        retry_times: i32,
+        sys_flag: i32,
+    ) -> Result<SendResult> {
+        let topic = publish.as_message().topic.clone();
         // 对应 Java `sendDefaultImpl`：重试分类逐异常类型走，不用"啥都重试"糊过去。
         // 路由在循环**之外**只取一次；拿不到就立刻按 NOT_FOUND_TOPIC 定性，
         // 不把重试次数空转掉（Python `producer.py:665-670`）。
         // 已经带码的（10004「没有 name server」，在漏斗里判的）原样透传 —— 那是两种
         // 故障，覆盖成 10005 就白判了，排障方向也会被带偏。
-        let publish = match self.topic_publish_info(&client, &topic).await {
+        let route = match self.topic_publish_info(client, &topic).await {
             Ok(publish) => publish,
             Err(e @ Error::Client { .. }) => {
                 return Err(Error::client_with_code(
@@ -2177,7 +2494,7 @@ impl DefaultMQProducer {
             // 关闭时退化为普通轮询（策略内部判断）。重试时 reset_index 让轮询从头开始，
             // 从而能避开 last_broker_name 选到别的 broker。
             let selected = match self.inner.fault_strategy.select_one_message_queue(
-                &*publish,
+                &*route,
                 last_broker_name.as_deref(),
                 attempt > 0,
             ) {
@@ -2209,10 +2526,10 @@ impl DefaultMQProducer {
                 cur_timeout = max_per_request;
             }
             let send_start = self.inner.metrics.record_send_start();
-            let mut publish_msg = PublishMessage::Single(msg);
+            let mut publish_msg = publish.reborrow();
             let outcome = self
                 .send_with_hooks(
-                    &client,
+                    client,
                     &mut publish_msg,
                     &mq_sel,
                     cur_timeout,
@@ -2376,42 +2693,136 @@ impl DefaultMQProducer {
         let mut publish_msg = PublishMessage::Batch(&mut batch);
         // MessageBatch 会被压缩步骤直接跳过（返回 0），批量消息永不压缩
         let sys_flag = self.sys_flag_for(&mut publish_msg);
-        let target = match mq {
-            Some(mq) => Some(mq.clone()),
+        // Java `send(Collection)` 这条路上是 `sendDefaultImpl`（有重试）；但本端口与 Python
+        // `_send_batch` 一致只选一次队列定点发 —— 见 [`send_pinned`](Self::send_pinned)。
+        // 累加器那条路（[`send_prepared_batch`](Self::send_prepared_batch)）走的是带重试的
+        // [`send_with_retry`](Self::send_with_retry)，与 Java `sendDirect` 对齐。
+        let mq_sel = match mq {
+            Some(mq) => mq.clone(),
             None => {
-                let publish = self.topic_publish_info(&client, &topic).await?;
-                publish
-                    .select_one_message_queue(&[])?
-                    .map(|mq| MessageQueue::new(&topic, &mq.broker_name, mq.queue_id))
+                let route = self.topic_publish_info(&client, &topic).await?;
+                // Python 用 batch.topic 建 mq_sel；Rust 的批量外层 topic 已等于 topic
+                match route.select_one_message_queue(&[])? {
+                    Some(mq) => MessageQueue::new(&topic, &mq.broker_name, mq.queue_id),
+                    None => return Err(Error::client("no message queue for publish info")),
+                }
             }
         };
-        // Python 用 batch.topic 建 mq_sel；Rust 的批量外层 topic 已等于 topic
-        let mq_sel = target.ok_or_else(|| Error::client("no message queue for publish info"))?;
-        if self.has_send_interceptors() {
-            return self
-                .send_with_hooks(
-                    &client,
-                    &mut publish_msg,
-                    &mq_sel,
-                    timeout,
-                    sys_flag,
-                    None,
-                    CommunicationMode::Sync,
-                )
-                .await;
-        }
-        client
-            .send_message(
-                &self.inner.producer_group(),
-                &mut publish_msg,
-                &mq_sel,
-                timeout,
-                sys_flag,
-                self.inner.unit_mode(),
-                &self.inner.create_topic_key(),
-                self.inner.default_topic_queue_nums(),
-            )
+        self.send_pinned(&client, &mut publish_msg, &mq_sel, timeout, sys_flag)
             .await
+    }
+
+    /// 把**已经编码好的批量**投出去 —— 攒批（[`ProduceAccumulator`]）那条路专用的发送尾巴。
+    ///
+    /// Java 同一段落落在 `DefaultMQProducerImpl.send(msg, mq, timeout)`：累加器的守卫线程经
+    /// `sendDirect(batch, mq, null)` 抵达 ——
+    ///   * `mq == null` 时是 `send(msg)` → `sendDefaultImpl(SYNC)`，**整条换 broker 重试链**
+    ///     加故障规避都在（Python 的累加器走 `producer.send(batch)` 拿到的也是这一条）；
+    ///   * 给了 `mq` 就是定点直发。超时取 `getSendMsgTimeout()`（`send(msg, mq)` 那个重载）。
+    ///
+    /// ⚠ 与 [`send_batch`](Self::send_batch) 的差别**不是笔误**：那条路对应 Python
+    /// `_send_batch`，只选一次队列、不重试；攒批这条对应 Java `sendDirect`，必须带重试。
+    ///
+    /// ⚠ 这里**不**重做命名空间、`checkMessage`、`setUniqID`、编码 —— 那些在
+    /// `sendByAccumulator`（逐条）与 `MessageBatch::generate_from_list`（批量自身）里就已经
+    /// 落在对象上了，再来一次会把子消息的 UNIQ_KEY 覆盖成新的：broker 拆开批量后每条子消息的
+    /// 客户端 ID 就与发送侧记录的串不起来。压缩同样跳过（`SEND_BATCH` 批量永不压缩）。
+    ///
+    /// [`ProduceAccumulator`]: crate::client::produce_accumulator::ProduceAccumulator
+    async fn send_prepared_batch(
+        &self,
+        batch: &mut MessageBatch,
+        mq: Option<&MessageQueue>,
+        timeout_millis: Option<i64>,
+    ) -> Result<SendResult> {
+        let client = self.require_client()?;
+        let (timeout, retry_times) = self.read_cfg(|cfg| {
+            (
+                timeout_millis.unwrap_or(cfg.send_msg_timeout),
+                cfg.retry_times_when_send_failed,
+            )
+        });
+        let mut publish = PublishMessage::Batch(batch);
+        let sys_flag = self.sys_flag_for(&mut publish);
+        if let Some(mq) = mq {
+            return self.send_pinned(&client, &mut publish, mq, timeout, sys_flag).await;
+        }
+        self.send_with_retry(&client, &mut publish, timeout, retry_times, sys_flag)
+            .await
+    }
+
+    /// 攒批那条路的**异步**尾巴 —— Java `DefaultMQProducer.sendDirect(batch, mq, cb)` →
+    /// `defaultMQProducerImpl.send(msg, mq, cb, getSendMsgTimeout())`：整批交进异步池，结果
+    /// 走回调。
+    ///
+    /// 前段与 [`send_batch_async`](Self::send_batch_async) 完全同一条：背压两道闸 →
+    /// 预算复检 → 出队后跑内核 → 回调恰好一次（含 `complete_async` 里的 after 钩子）。
+    /// 差别只在「批量对象**已经**备好」：不重做校验、命名空间、UNIQ_KEY、编码。
+    ///
+    /// ⚠ 与 Java 的已知差别（同 [`send_batch_async`](Self::send_batch_async) 的既有口径）：
+    /// Java 走的是 `SEND_BATCH_MESSAGE` + `invokeAsync` 的**异步**重试链，本端口的批量只有
+    /// 同步内核，于是「在异步池里跑完同步批量内核」。重试照样有，只是落在同步内核自己的
+    /// `retryTimesWhenSendFailed` 循环里（见 [`send_prepared_batch`](Self::send_prepared_batch)）。
+    ///
+    /// ⚠ 字节许可按**编码后 body** 的真长扣（Java `executeAsyncMessageSend:642`
+    /// `msg.getBody() == null ? 1 : length`）—— 这里批量已经编码过，能拿到真值；公共的
+    /// [`send_batch_async`](Self::send_batch_async) 是在编码之前扣的，只能逐条累加，
+    /// 那是那条路的既有偏差。
+    fn send_prepared_batch_async(
+        &self,
+        batch: MessageBatch,
+        mq: Option<MessageQueue>,
+        callback: Arc<dyn SendCallback>,
+        timeout_millis: Option<i64>,
+    ) -> Result<()> {
+        let _ = self.require_client()?;
+        let handle = self.runtime_handle().ok_or_else(|| {
+            Error::client("send_prepared_batch_async needs a tokio runtime; call start() first")
+        })?;
+        let timeout = timeout_millis.unwrap_or_else(|| self.read_cfg(|c| c.send_msg_timeout));
+        let msg_len = match batch.message.body.as_deref() {
+            Some(body) => i64::try_from(body.len()).unwrap_or(i64::MAX),
+            None => 1,
+        };
+        let began = monotonic_millis();
+        let this = self.clone();
+        let job: AsyncSendJob = Box::pin(async move {
+            this.run_async_send_prepared_batch(batch, msg_len, callback, timeout, began, mq)
+                .await;
+        });
+        self.submit_async_job(handle, job)
+    }
+
+    /// [`send_prepared_batch_async`](Self::send_prepared_batch_async) 出队之后的那一段，
+    /// 与 [`run_async_send_batch`](Self::run_async_send_batch) 逐行同构。
+    async fn run_async_send_prepared_batch(
+        &self,
+        mut batch: MessageBatch,
+        msg_len: i64,
+        callback: Arc<dyn SendCallback>,
+        timeout: i64,
+        began: f64,
+        mq: Option<MessageQueue>,
+    ) {
+        let permits = match self.acquire_send_permits(msg_len, timeout, began).await {
+            Ok(permits) => permits,
+            Err(e) => {
+                self.complete_async(&callback, Err(e), None, None);
+                return;
+            }
+        };
+        let cost = latency_since(began);
+        if timeout <= cost {
+            return self.fail_async(
+                &callback,
+                Error::TooMuchRequest("DEFAULT ASYNC send call timeout".to_string()),
+                permits,
+            );
+        }
+        let outcome = self
+            .send_prepared_batch(&mut batch, mq.as_ref(), Some(timeout - cost))
+            .await;
+        self.complete_async(&callback, outcome, None, Some(permits));
     }
 
     /// Python `send_oneway`（对应 Java `sendOneway`）。
@@ -2556,6 +2967,29 @@ impl DefaultMQProducer {
     /// 与 Java 的另一处有意差别：未 `start()` 时**同步抛**（Java 走回调，那样问题更难查），
     /// 与 Python 一致。
     pub fn send_async(
+        &self,
+        mut msg: Message,
+        callback: Arc<dyn SendCallback>,
+        timeout_millis: Option<i64>,
+        mq: Option<MessageQueue>,
+    ) -> Result<()> {
+        // 自动攒批分流（Java `DefaultMQProducer.send(msg, sendCallback):517-526`）。
+        // Java 在同一个 try 里把两种分流的 **Throwable** 都交给 `onException` ——
+        // 攒批路径上的「消息不合法 / 累加器参数非法」不能砸回调用方栈。
+        if timeout_millis.is_none() && self.get_auto_batch() {
+            let topic = self.with_namespace(msg.get_topic());
+            msg.set_topic(&topic);
+            if let Err(e) = self.send_by_accumulator_async(msg, mq.as_ref(), Arc::clone(&callback)) {
+                callback.on_exception(e);
+            }
+            return Ok(());
+        }
+        self.send_async_inner(msg, callback, timeout_millis, mq)
+    }
+
+    /// Java `DefaultMQProducerImpl.send(msg, sendCallback, timeout)` 的整条异步发送链
+    /// （"绕过累加器"的那一半，见 [`send_inner`](Self::send_inner) 的同款理由）。
+    fn send_async_inner(
         &self,
         msg: Message,
         callback: Arc<dyn SendCallback>,

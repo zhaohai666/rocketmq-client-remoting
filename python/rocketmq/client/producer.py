@@ -49,6 +49,7 @@ from .mq_client import MQClientInstance
 from .top_addressing import DefaultTopAddressing
 from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
                             RequestResponseFuture, create_correlation_id)
+from .produce_accumulator import ProduceAccumulator, get_or_create_produce_accumulator
 from .send_result import SendResult, SendStatus
 from .trace_context import inject_trace_context, trace_context_enabled_from_env
 from .trace import AccessChannel
@@ -153,6 +154,27 @@ class _BackPressureSendCallback:
             self._size_semaphore.release(self.msg_len)
         if self.num_acquired:
             self._num_semaphore.release(1)
+
+
+_TIMER_DELAY_PROPERTIES = ("DELAY", "TIMER_DELAY_MS", "TIMER_DELAY_SEC", "TIMER_DELIVER_MS")
+
+
+def _max_delay_value(msg: Message) -> int:
+    """Java ``canBatch`` 里四个延时属性的最大值（缺省 0）。
+
+    属性名逐字对齐 ``MessageConst``：``DELAY``（delayTimeLevel）、``TIMER_DELAY_MS``、
+    ``TIMER_DELAY_SEC``、``TIMER_DELIVER_MS``。值非法时与 Java 的
+    ``Integer/Long.parseLong`` 一样**直接抛**，不静默当 0。
+    """
+    result = 0
+    for name in _TIMER_DELAY_PROPERTIES:
+        raw = msg.properties.get(name)
+        if raw is None:
+            continue
+        value = int(raw)
+        if value > result:
+            result = value
+    return result
 
 
 def _classify_async_failure(error: BaseException,
@@ -328,6 +350,16 @@ class DefaultMQProducer:
         # 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
         self.send_latency_fault_enable = False
         self._mq_fault_strategy = MQFaultStrategy(False)
+        # ---- 自动攒批（对应 Java DefaultMQProducer 的 autoBatch / batchMaxDelayMs /
+        # batchMaxBytes / totalBatchMaxBytes）----
+        # 四个配置在 Java 里都是"先记在 producer 上、start() 建累加器时再同步下去"，
+        # 因为累加器是按 clientId 复用的（同 clientId 的第二个 producer 会**复用**第一个
+        # 的累加器，此时 setter 立即生效、不再重新初始化）。-1 表示"不动累加器的默认值"。
+        self.auto_batch = False
+        self.batch_max_delay_ms = -1
+        self.batch_max_bytes = -1
+        self.total_batch_max_bytes = -1
+        self.produce_accumulator: Optional[ProduceAccumulator] = None
         # ---- 消息轨迹（对应 Java ClientConfig.enableTrace / traceTopic / traceMsgBatchNum）----
         self.enable_trace = False
         self.trace_topic: Optional[str] = None      # None → 用 RMQ_SYS_TRACE_TOPIC
@@ -496,6 +528,64 @@ class DefaultMQProducer:
     def set_request_timeout(self, timeout_millis: int) -> None:
         """设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。"""
         self.request_timeout = timeout_millis
+
+    # ---------------- 自动攒批（对应 Java DefaultMQProducer:1189-1243）----------------
+    # 这套 setter 是"两处记账"：先写 producer 自己的字段（保证 start() 之前设置也生效），
+    # 累加器已存在时**立刻**同步下去（Java 同）。三个 getter 在累加器还没建时返回 0，
+    # 与 Java 的 `if (produceAccumulator == null) return 0;` 一致（不是 -1）。
+    def set_auto_batch(self, auto_batch: bool) -> None:
+        """开关自动攒批（Java ``setAutoBatch``，默认 false）。
+
+        打开后 ``send(Message)``（未显式给 timeout、且不是批量消息）会按
+        ``AggregateKey(topic, mq, waitStoreMsgOK, tag)`` 攒批，攒够 ``batchMaxDelayMs``
+        或 ``batchMaxBytes`` 再发。**没 start 时 getAutoBatch() 恒为 false**（Java 的
+        ``getAutoBatch`` 有 ``produceAccumulator == null`` 短路）。
+        """
+        self.auto_batch = auto_batch
+
+    def get_auto_batch(self) -> bool:
+        if self.produce_accumulator is None:
+            return False
+        return self.auto_batch
+
+    def is_auto_batch(self) -> bool:
+        return self.get_auto_batch()
+
+    def set_batch_max_delay_ms(self, hold_ms: int) -> None:
+        """单批最大等待毫秒（Java ``batchMaxDelayMs``，取值 (0, 30000]）。"""
+        self.batch_max_delay_ms = hold_ms
+        if self.produce_accumulator is not None:
+            self.produce_accumulator.batch_max_delay_ms(hold_ms)
+
+    def get_batch_max_delay_ms(self) -> int:
+        if self.produce_accumulator is None:
+            return 0
+        return self.produce_accumulator.get_batch_max_delay_ms()
+
+    def set_batch_max_bytes(self, hold_size: int) -> None:
+        """单批最大字节（Java ``batchMaxBytes``，取值 (0, 2MB]）。"""
+        self.batch_max_bytes = hold_size
+        if self.produce_accumulator is not None:
+            self.produce_accumulator.batch_max_bytes(hold_size)
+
+    def get_batch_max_bytes(self) -> int:
+        if self.produce_accumulator is None:
+            return 0
+        return self.produce_accumulator.get_batch_max_bytes()
+
+    def set_total_batch_max_bytes(self, total_hold_size: int) -> None:
+        """**全部**在途批次的总字节上限（Java ``totalBatchMaxBytes``，> 0）。
+
+        超过之后 ``try_add_message`` 会拒绝新消息，``send()`` 自动退回直发。
+        """
+        self.total_batch_max_bytes = total_hold_size
+        if self.produce_accumulator is not None:
+            self.produce_accumulator.total_batch_max_bytes(total_hold_size)
+
+    def get_total_batch_max_bytes(self) -> int:
+        if self.produce_accumulator is None:
+            return 0
+        return self.produce_accumulator.get_total_batch_max_bytes()
 
     def get_metrics(self) -> ClientMetrics:
         """返回本生产者的基础指标计数器（send/consume RT 与计数）。"""
@@ -725,7 +815,15 @@ class DefaultMQProducer:
                 RequestCode.CHECK_TRANSACTION_STATE, self._handle_check_transaction_state)
             # 异步发送的两个线程池（Java 在构造器里 new，线程本身按需创建）
             self._create_async_executors()
+            # 自动攒批：按 clientId 复用累加器（Java DefaultMQProducerImpl:256 →
+            # MQClientManager.getOrCreateProduceAccumulator），并把 producer 上先设好的
+            # 三个阈值同步过去。放在 registerProducer 之前，与 Java 同序。
+            self.init_produce_accumulator()
             self._started = True
+            # 守卫线程要在生产者本体起来之后再拉（Java DefaultMQProducer.start:377-379：
+            # impl.start() 返回后 accumulated.start()）。
+            if self.produce_accumulator is not None:
+                self.produce_accumulator.start()
             # 心跳线程：周期性向 broker 注册 ProducerData。
             # broker 的事务回查正是通过这一步登记的 channel 反向联系生产者的；
             # 生产者不发心跳时 COMMIT/ROLLBACK 仍能成功（客户端主动 END_TRANSACTION），
@@ -793,6 +891,11 @@ class DefaultMQProducer:
                     logger.debug("unregister on shutdown failed: %s", e)
                 self._mq_client.shutdown()
             self._started = False
+            # Java DefaultMQProducer.shutdown():410-412：impl.shutdown() 之后关累加器的
+            # 两个守卫线程。注意**只停线程**，不清表：在途批次没了守卫线程唤醒，同步
+            # send 会一直等到自己的 holdMs 阈值再自己发出去（与 Java 同）。
+            if self.produce_accumulator is not None:
+                self.produce_accumulator.shutdown()
         # 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器
         # （分发器用的是**自己的**内部生产者，与本客户端实例无关，所以关掉了照样能发完）
         if self.trace_dispatcher is not None:
@@ -931,6 +1034,14 @@ class DefaultMQProducer:
     def send(self, msg: Message, timeout_millis: Optional[int] = None,
              mq: Optional[MessageQueue] = None) -> SendResult:
         """同步发送：msg 或 Collection；指定 mq 走定点发送，否则轮询选择。"""
+        # 自动攒批分流（Java DefaultMQProducer.send(Message):472-478）。两个不分流的情况
+        # 与 Java 一一对应：显式给了 timeout 的重载直接进 impl；
+        # 批量消息（MessageBatch）被 `!(msg instanceof MessageBatch)` 挡住 —— 那正是
+        # accumulator 自己发出去的东西，不挡就会无限递归。
+        if (timeout_millis is None and self.get_auto_batch()
+                and not isinstance(msg, (list, tuple))
+                and not isinstance(msg, MessageBatch)):
+            return self.send_by_accumulator(msg, mq, None)
         client = self._require_client()
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         if isinstance(msg, (list, tuple)):
@@ -1168,6 +1279,16 @@ class DefaultMQProducer:
         与 Java 的两处有意差别：未 start 时**同步抛**（Java 走回调，那样问题更难查）；
         批量消息复用同步批量内核（只是不阻塞调用方，见 ``_send_async_inner``）。
         """
+        # 自动攒批分流（Java DefaultMQProducer.send(Message, SendCallback):517-527）：
+        # 整段包在 try 里，异常统一转给回调。
+        if (timeout_millis is None and self.get_auto_batch()
+                and not isinstance(msg, (list, tuple))
+                and not isinstance(msg, MessageBatch)):
+            try:
+                self.send_by_accumulator(msg, mq, callback)
+            except BaseException as e:  # noqa: BLE001 —— Java：catch (Throwable) → onException
+                callback.on_exception(e)
+            return
         self._require_client()
         executor = self._async_sender_executor
         if executor is None:
@@ -1501,6 +1622,74 @@ class DefaultMQProducer:
         header.recall_handle = recall_handle
         header.bname = handle.broker_name
         return client.recall_message(addr, header, self.send_msg_timeout)
+
+    # ---------------- 自动攒批的转发层（对应 Java DefaultMQProducer:434-452/759-793）----------------
+    def init_produce_accumulator(self) -> None:
+        """Java ``DefaultMQProducer.initProduceAccumulator()``：建/复用累加器并同步阈值。"""
+        self.produce_accumulator = get_or_create_produce_accumulator(
+            self.client_id or MixAll.DEFAULT_INSTANCE_NAME)
+        if self.batch_max_delay_ms > -1:
+            self.produce_accumulator.batch_max_delay_ms(self.batch_max_delay_ms)
+        if self.batch_max_bytes > -1:
+            self.produce_accumulator.batch_max_bytes(self.batch_max_bytes)
+        if self.total_batch_max_bytes > -1:
+            self.produce_accumulator.total_batch_max_bytes(self.total_batch_max_bytes)
+
+    def _can_batch(self, msg: Message) -> bool:
+        """Java ``DefaultMQProducer.canBatch:434-452``。
+
+        ⚠ 先过全局字节闸门 ``try_add_message``：**放行即记账**，而后面四条「不能攒批」
+        的判断只是让调用方退回直发 —— 那条消息的字节数**不会被归还**（上游遗漏，
+        照抄；改掉就与 Java 对不上了）。四条排除项：
+          1. 延时/定时消息（DELAY / TIMER_DELAY_MS / TIMER_DELAY_SEC / TIMER_DELIVER_MS）
+             任何一个 > 0 都不攒批 —— 一个 MessageBatch 只能有一个延时属性；
+          2. 重试 topic（``%RETRY%`` 前缀）：重试消息的位点语义特殊；
+          3. 已带 PGROUP 属性的消息（事务半消息那种）：broker 侧要按组找连接。
+        """
+        if not self.produce_accumulator.try_add_message(msg):
+            return False
+        if _max_delay_value(msg) > 0:
+            return False
+        if msg.get_topic().startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
+            return False
+        if MessageConst.PROPERTY_PRODUCER_GROUP in msg.properties:
+            return False
+        return True
+
+    def send_direct(self, msg: Message, mq: Optional[MessageQueue],
+                    send_callback: Optional[SendCallback]) -> Optional[SendResult]:
+        """Java ``DefaultMQProducer.sendDirect``：绕过累加器直发（同步或异步）。"""
+        if send_callback is None:
+            if mq is None:
+                return self.send(msg)
+            return self.send(msg, mq=mq)
+        if mq is None:
+            self.send_async(msg, send_callback)
+        else:
+            self.send_async(msg, send_callback, mq=mq)
+        return None
+
+    def send_by_accumulator(self, msg: Message, mq: Optional[MessageQueue],
+                            send_callback: Optional[SendCallback]) -> Optional[SendResult]:
+        """Java ``DefaultMQProducer.sendByAccumulator:778-793``。
+
+        不能攒批（见 ``_can_batch``）→ 退回直发；否则先过 ``validators.check_message``
+        再给本条消息打 UNIQ_KEY，然后交给累加器（同步版返回本条自己的 SendResult，
+        异步版立刻返回 None、结果走回调）。
+        """
+        if not self._can_batch(msg):
+            return self.send_direct(msg, mq, send_callback)
+        validators.check_message(msg, self.max_message_size)
+        set_uniq_id(msg)
+        if send_callback is None:
+            if mq is None:
+                return self.produce_accumulator.send(msg, self)
+            return self.produce_accumulator.send_with_mq(msg, mq, self)
+        if mq is None:
+            self.produce_accumulator.send_async(msg, send_callback, self)
+        else:
+            self.produce_accumulator.send_async_with_mq(msg, mq, send_callback, self)
+        return None
 
     # ---------------- 批量发送 ----------------
     def _send_batch(self, msgs: List[Message], mq: Optional[MessageQueue] = None,

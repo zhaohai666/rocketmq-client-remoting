@@ -82,6 +82,22 @@ def c_int32(x: int) -> int:
     return x if x < 0x80000000 else x - 0x100000000
 
 
+def is_wait_store_msg_ok(msg: "Message") -> bool:
+    """Java ``Message.isWaitStoreMsgOK()``：**属性缺省即 true**，其余走
+    ``Boolean.parseBoolean`` —— 只有忽略大小写的 ``"true"`` 为真。
+
+    ⚠ 别写成 ``msg.get_wait_store_msg_ok() == "true"``。本模块的 ``Message.__init__``
+    （与 Rust 的 ``Message::new`` 一样）**不**预写 ``WAIT``，所以"属性缺省"是**常态而不是
+    边角**：按 ``== "true"`` 判会让普通消息变成 ``WAIT=false``，``MessageBatch`` 就会以
+    ``WAIT=false`` 下发 —— broker 不等刷盘就回 ``SEND_OK``。
+    Rust / C# / C++ 三端同名函数用同一条判据。
+    """
+    value = msg.get_wait_store_msg_ok()
+    if value is None:
+        return True
+    return value.lower() == "true"
+
+
 class Message:
     """对应 org.apache.rocketmq.common.message.Message."""
 
@@ -366,6 +382,10 @@ class MessageBatch(Message):
 
         batch = MessageBatch(message_list)
         batch.set_topic(first.get_topic())
-        batch.set_wait_store_msg_ok(first.get_wait_store_msg_ok() == "true")
+        # Java generateFromList:70 是 ``batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK())``：
+        # **属性缺省即 true**。曾经写成 ``first.get_wait_store_msg_ok() == "true"`` ——
+        # 缺省（None）被判成 False，于是普通消息（``Message.__init__`` 不写 WAIT）组成的
+        # 批量会以 ``WAIT=false`` 下发：broker 不等刷盘就回 SEND_OK，持久性静默降级。
+        batch.set_wait_store_msg_ok(is_wait_store_msg_ok(first))
         batch.set_body(batch.encode())
         return batch
