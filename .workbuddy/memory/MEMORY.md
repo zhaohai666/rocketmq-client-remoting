@@ -1,9 +1,11 @@
 # rocketmq-client-remoting · 长期项目笔记
 
-RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参照 Java 5.x
-（`/Users/haizai/project/jingsai/roocketmq/zhaohai666-rocketmq`）。三侧均已对真实 5.5.1 集群验证。
-**详细坑位清单 / 编译命令 / 断言数 / 真机 harness 全在技能
-`~/.workbuddy/skills/rocketmq-cpp-build-verify/SKILL.md`** —— 本文件只留跨语言硬约定与验证入口。
+RocketMQ remoting 协议层用 **Python / C++ / .NET(C#) / Rust** 各实现一遍，参照 Java 5.x
+（本机参考源码 `D:\zhaohai666-rocketmq\rocketmq`）。四端均已对真实 5.5.1 集群验证。
+**四端构建/验证/加夹具/提交的命令与坑位全在技能
+`~/.workbuddy/skills/rocketmq-four-end-verify/SKILL.md`**（本机原先引用的
+`rocketmq-cpp-build-verify` 不存在，2026-09-27 已用同名用途的新技能替代，含沙箱绕 vcvars 的
+手工 MSVC 环境）—— 本文件只留跨语言硬约定与验证入口。
 
 ## 目录 / 状态
 - `python/rocketmq/` 参考实现 · `cpp/` C++ · `dotnet/` .NET 10（零 NuGet）。
@@ -18,8 +20,9 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
   心跳 V2 指纹刻意留 0 走 V1（有意设计，非缺口）。
 
 ## 验证入口（改完必跑）
-- Python `pytest`（当前 **415 passed / 4 skipped**；tmpdir 报 EEXIST 是沙箱噪音，加
-  `--basetemp=/tmp/rmq_pytest_tmp`）；C++ ctest **18/18**、零 warning；.NET xunit **233/233**、
+- Python `pytest`（当前 **1026 passed / 4 skipped**；tmpdir 报 EEXIST 是沙箱噪音，加
+  `--basetemp=/tmp/rmq_pytest_tmp`，且必须用 `envs/default/Scripts/python.exe`）；
+  Rust `cargo test` **806 passed**；C++ ctest **41/41**、零 warning；.NET xunit **646/646**、
   零 warning（测试并行已禁用：Logging/TopAddressing 测试动进程级全局状态）。
 - 真机（**起集群 + 等端口 + 跑测试 + kill 必须在同一条 Bash 命令里**，前台返回会回收后台 JVM）：
   `run_redelivery_live.sh cpp|python|dotnet|all`、`run_admin_live{,_cpp}.sh`、`run_compression_live.sh`、
@@ -102,3 +105,15 @@ RocketMQ remoting 协议层用 **Python / C++ / .NET(C#)** 各实现一遍，参
     的路径），否则 opt-in 注入被静默跳过（C++/.NET 双踩）。键小写 `traceparent`，不覆盖已有值。
 20. **消费 0 条假象**：把裸函数传给 Python set_message_listener → `'function' object has no
     attribute 'consume_message'` 被吞成 RECONSUME_LATER（仅 DEBUG 可见），消息其实拉到了。
+21. **拉取请求的 `subscription` 字段按 SUBSCRIPTION 位决定是否上线**（Java `subExpression=null`
+    → `makeCustomHeaderToNet` 丢字段）。四端统一：位关时该键**根本不进 extFields**。
+    `postSubscriptionWhenPull`（push 消费者，默认 **false**）关闭时 broker 走
+    `PullMessageProcessor:418` 的 else 分支 —— 订阅取自 **ConsumerManager 里心跳注册的那份**，
+    查不到回 `SUBSCRIPTION_NOT_EXIST`；tag 过滤由客户端 `filterMessagesForDelivery` 兜底。
+    pull / lite pull 消费者**恒带上表达式**（位恒真），别顺手一起关。
+22. **`PullAPIWrapper.pullFromWhichNodeTable`**：每次拉取用应答头 `suggestWhichBrokerId` 回写
+    （`processPullResult:77`；**缺字段按 master=0 记账，不是"保留旧值"**），下一轮用该 brokerId
+    走 `findBrokerAddressInSubscribe(brokerName, id, false)` 选主/从；选中从节点时
+    `clearCommitOffsetFlag`（`pullKernelImpl:219-221`）。`isSlave` 一律按**命中的 id** 判 ——
+    所以「请求 id=3 但从节点缺席 → 回退 master」时 COMMIT_OFFSET **不清**。
+    未命中且 id 非主时先试 `id+1`（Java 从节点编号约定），再退到 id 最小的那台。
