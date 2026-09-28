@@ -611,6 +611,16 @@ void DefaultMQPushConsumer::start() {
         setThreadName("ConsumeMessageThread");
         runLoop("dispatch", [this] { dispatchLoop(); });
     });
+    // 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
+    // ConsumeMessageConcurrentlyService 的构造/start 里（:68-88），顺序消费的
+    // ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
+    // ConsumeMessagePopConcurrentlyService 没有对应的调度。
+    if (!isOrderly() && !popMode_) {
+        cleanExpireThread_ = std::thread([this]() {
+            setThreadName("CleanExpireMsgScheduledThread_" + consumerGroup_);
+            runLoop("cleanExpiredMsg", [this] { cleanExpiredMsgLoop(); });
+        });
+    }
     persistThread_ = std::thread([this]() {
         setThreadName("MQClientFactoryScheduledThread");
         runLoop("offsetPersist", [this] { offsetPersistLoop(); });
@@ -694,6 +704,7 @@ void DefaultMQPushConsumer::shutdown() {
     if (persistThread_.joinable()) persistThread_.join();
     if (lockThread_.joinable()) lockThread_.join();
     if (rebalanceThread_.joinable()) rebalanceThread_.join();
+    if (cleanExpireThread_.joinable()) cleanExpireThread_.join();
     // 消费线程都停了之后再关轨迹分发器：先把队列里剩余的轨迹强刷出去（SubBefore/SubAfter
     // 落盘就靠这一步），再关内部生产者。必须在 mqClient_->shutdown() 之前。
     if (traceDispatcher_) {
@@ -1441,6 +1452,14 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
     bool hookHasException = false;
     int64_t hookBeginMs = UtilAll::currentTimeMillis();
     try {
+        // Java ConsumeMessagePopConcurrentlyService:379-385 —— POP 并发路径同样在交给
+        // listener 前逐条盖 CONSUME_START_TIME（POP 没有 cleanExpiredMsg 清扫，但这条
+        // 属性对 listener/轨迹可见，口径要与经典并发一致）。
+        const int64_t popStampNow = UtilAll::currentTimeMillis();
+        for (MessageExt& m : msgs) {
+            m.putProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP,
+                          std::to_string(popStampNow));
+        }
         auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
         status = conc->consumeMessage(msgs, ctx);
     } catch (const std::exception& e) {
@@ -2168,6 +2187,21 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         return false;
     }
     // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
+    // 「登记在途 → 消费 → 注销在途」用 RAII 围起来：并发分支一堆 return（整批认可、
+    // 广播丢弃、回投失败……），手工注销漏一条，登记表就永远摘不干净，位点还会被
+    // correctTagsOffset 的在途闸门永久挡停。
+    struct InflightGuard {
+        DefaultMQPushConsumer* self;
+        const std::string* guardKey;
+        const std::vector<MessageExt>* guardMsgs;
+        ~InflightGuard() { self->deregisterInflight(*guardKey, *guardMsgs); }
+    } inflightGuard{this, &key, &restored};
+    return consumeConcurrentBatch(key, mq, restored, broadcast, epoch);
+}
+
+bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const MessageQueue& mq,
+                                                   std::vector<MessageExt>& restored, bool broadcast,
+                                                   const std::optional<uint64_t>& epoch) {
     const bool useHook = hasConsumeMessageHook();
     ConsumeMessageContext hookCtx;
     if (useHook) {
@@ -2176,6 +2210,15 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         hookCtx = buildConsumeHookContext(restored, mq);
         executeConsumeHookBefore(hookCtx);
     }
+    // Java:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME，每次投递（含重试）
+    // 重新盖；cleanExpiredMsg 的挂起逃生口靠它判「这条在手里挂了多久」。登记紧随盖章：
+    // 本端口的批次是 MessageExt **值拷贝**（Python/Java 是共享引用），登记早了表里躺的
+    // 就是未盖章的副本，清扫永远看不见它们。
+    const int64_t stampNow = UtilAll::currentTimeMillis();
+    for (MessageExt& m : restored) {
+        m.putProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP, std::to_string(stampNow));
+    }
+    registerInflight(key, restored);
     auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
     ConsumeConcurrentlyContext ctx(mq);
     ConsumeConcurrentlyStatus status;
@@ -2230,7 +2273,8 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
     }
     // 集群模式：未认可的 [acked, size) 逐条回投 %RETRY%topic
     //（延迟梯度 3+reconsumeTimes，超限由 broker 转 %DLQ%）
-    const std::vector<std::pair<size_t, MessageExt>> msgBackFailed = sendBackBatch(restored, ctx, acked);
+    const std::vector<std::pair<size_t, MessageExt>> msgBackFailed =
+        sendBackBatch(key, restored, ctx, acked);
     std::set<size_t> failedIdx;
     int64_t floorVal = 0;
     bool hasFloor = false;
@@ -2269,10 +2313,21 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
 }
 
 std::vector<std::pair<size_t, MessageExt>> DefaultMQPushConsumer::sendBackBatch(
-    const std::vector<MessageExt>& batch, const ConsumeConcurrentlyContext& ctx, size_t base) {
+    const std::string& key, const std::vector<MessageExt>& batch,
+    const ConsumeConcurrentlyContext& ctx, size_t base) {
     std::vector<std::pair<size_t, MessageExt>> failed;
     for (size_t i = base; i < batch.size(); i++) {
         const MessageExt& msg = batch[i];
+        // Java processConsumeResult:243-248 —— 回投前先 containsMessage：listener 挂着
+        // 期间被 cleanExpiredMsg 清扫回投（并摘除）的消息，listener 事后返回
+        // RECONSUME_LATER 时**不能再回投一次**，否则同一个位点会被投两次。
+        if (!processQueueContains(key, msg)) {
+            logger_info("Message is not found in its process queue; skip send-back-procedure"
+                        ", topic=" + msg.topic + ", brokerName=" + msg.brokerName
+                        + ", queueId=" + std::to_string(msg.queueId)
+                        + ", queueOffset=" + std::to_string(msg.queueOffset));
+            continue;
+        }
         // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
         //（reconsumeTimes 在 MessageExt 线上格式第 13 字段，broker 重投时 +1）
         int32_t delayLevel = ctx.delayLevelWhenNextConsume;
@@ -2805,6 +2860,257 @@ std::vector<MessageExt> DefaultMQPushConsumer::pendingMessages(const std::string
     return std::vector<MessageExt>(it->second.begin(), it->second.end());
 }
 
+// ---------------------------------------------------------------- cleanExpiredMsg
+//
+// 对应 Java ConsumeMessageConcurrentlyService:68-88（建 CleanExpireMsgScheduledThread_
+// <group> 单线程调度，scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout,
+// MINUTES) —— initialDelay 与 period 同值）、:192-200（遍历 processQueueTable 逐队列清扫）
+// 与 ProcessQueue.cleanExpiredMsg:75-127（逐句转写）。
+//
+// 这是"listener 卡死不返回"时唯一的回收路径：把在手里超过 consumeTimeout 分钟的消息发回
+// broker（delayLevel 固定 3），由 %RETRY% 重新投递。少了它，一条卡住的消息让该队列位点
+// 永久停在原地，且没有任何异常、日志或超时可见。语义三件套（错一个方向都是静默故障）：
+// 只看队首（最小位点）、单条判据**严格大于** consumeTimeout、每轮最多 16 条。
+bool DefaultMQPushConsumer::isConsumeExpired(const MessageExt& msg, int32_t consumeTimeoutMinutes,
+                                             int64_t nowMs) {
+    const std::string stamp = msg.getProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP);
+    if (stamp.empty()) {
+        // Java:87-90 —— 没盖过章（还没进过 listener 的缓冲消息）不算过期。
+        // 这一条同时把"还没被消费过的积压"整个挡在清扫之外。
+        return false;
+    }
+    // 过期判据是**严格大于**（等于阈值不动手）。std::stoll 对非数字抛 invalid_argument，
+    // 与 Java 的 NumberFormatException 同路：由 cleanExpiredMsgLoop 的调度壳子接住并
+    // log.error，不在这里吞掉（吞掉就变成"整个队列静默不再清扫"）。
+    return nowMs - std::stoll(stamp) > static_cast<int64_t>(consumeTimeoutMinutes) * 60 * 1000;
+}
+
+int64_t DefaultMQPushConsumer::cleanExpirePeriodMillis(int32_t consumeTimeoutMinutes) {
+    // Java 的 initialDelay 与 period 同源，都是 consumeTimeout 分钟（默认 15 → 900000ms）。
+    // max(1,·) 兜底：Java 的 setConsumeTimeout 不做校验，配成 0 会让调度变成每 0 分钟
+    // 空转（真跟着跑就是忙等），这里按 1 分钟下限处理（与 Python 端口同一口径）。
+    return static_cast<int64_t>(std::max(1, consumeTimeoutMinutes)) * 60 * 1000;
+}
+
+void DefaultMQPushConsumer::setInflightMessages(const std::string& key,
+                                                const std::vector<MessageExt>& msgs) {
+    std::lock_guard<std::mutex> lk(lock_);
+    inflightMsgs_[key] = msgs;
+}
+
+void DefaultMQPushConsumer::registerInflight(const std::string& key,
+                                             const std::vector<MessageExt>& msgs) {
+    std::lock_guard<std::mutex> lk(lock_);
+    auto& bucket = inflightMsgs_[key];
+    bucket.insert(bucket.end(), msgs.begin(), msgs.end());
+}
+
+void DefaultMQPushConsumer::deregisterInflight(const std::string& key,
+                                               const std::vector<MessageExt>& msgs) {
+    // 只摘「在途」这一边（缓冲里可能有一份"回投失败塞回队首"的同位点副本，它得留着）。
+    // 按 queueOffset 摘除：本端口的批次是拷贝，没有对象身份可用；而 Java 的 msgTreeMap
+    // 本来就是 offset → msg 的映射，同一条消息在表里只可能有一份。
+    std::lock_guard<std::mutex> lk(lock_);
+    auto it = inflightMsgs_.find(key);
+    if (it == inflightMsgs_.end()) return;
+    for (const MessageExt& m : msgs) {
+        for (auto vit = it->second.begin(); vit != it->second.end(); ++vit) {
+            if (vit->queueOffset == m.queueOffset) {
+                it->second.erase(vit);
+                break;
+            }
+        }
+    }
+    if (it->second.empty()) inflightMsgs_.erase(it);
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::processQueueEntriesLocked(
+    const std::string& key) const {
+    // pending_（已拉未分发）∪ inflightMsgs_（已分发未落定）= Java 的 msgTreeMap。
+    // 两边都在同一把 lock_ 内成对维护，同一条消息在同一瞬间只可能在一边；按 queueOffset
+    // 再去一次重只为防御未来新调用点写出重叠。
+    std::vector<MessageExt> out;
+    std::set<int64_t> seen;
+    auto iit = inflightMsgs_.find(key);
+    if (iit != inflightMsgs_.end()) {
+        for (const MessageExt& m : iit->second) {
+            if (seen.insert(m.queueOffset).second) out.push_back(m);
+        }
+    }
+    auto pit = pending_.find(key);
+    if (pit != pending_.end()) {
+        for (const MessageExt& m : pit->second) {
+            if (seen.insert(m.queueOffset).second) out.push_back(m);
+        }
+    }
+    return out;
+}
+
+std::optional<MessageExt> DefaultMQPushConsumer::processQueueHeadLocked(
+    const std::string& key) const {
+    // 队首 = 最小 queueOffset 的那条（Java msgTreeMap.firstEntry()）。
+    const std::vector<MessageExt> entries = processQueueEntriesLocked(key);
+    if (entries.empty()) return std::nullopt;
+    const MessageExt* best = &entries[0];
+    for (const MessageExt& m : entries) {
+        if (m.queueOffset < best->queueOffset) best = &m;
+    }
+    return *best;
+}
+
+bool DefaultMQPushConsumer::processQueueContainsLocked(const std::string& key,
+                                                       const MessageExt& msg) const {
+    // Java ProcessQueue.containsMessage:341-357 —— msgTreeMap.containsKey(queueOffset)。
+    // 不是"对象身份"：本端口的批次本来就是拷贝，而且要的语义正是"这个位点还挂在表上吗"。
+    auto iit = inflightMsgs_.find(key);
+    if (iit != inflightMsgs_.end()) {
+        for (const MessageExt& m : iit->second) {
+            if (m.queueOffset == msg.queueOffset) return true;
+        }
+    }
+    auto pit = pending_.find(key);
+    if (pit != pending_.end()) {
+        for (const MessageExt& m : pit->second) {
+            if (m.queueOffset == msg.queueOffset) return true;
+        }
+    }
+    return false;
+}
+
+void DefaultMQPushConsumer::removeProcessQueueEntryLocked(const std::string& key,
+                                                          const MessageExt& msg) {
+    auto iit = inflightMsgs_.find(key);
+    if (iit != inflightMsgs_.end()) {
+        for (auto vit = iit->second.begin(); vit != iit->second.end(); ++vit) {
+            if (vit->queueOffset == msg.queueOffset) {
+                iit->second.erase(vit);
+                break;
+            }
+        }
+        if (iit->second.empty()) inflightMsgs_.erase(iit);
+    }
+    // 缓冲这一边同样摘：并发路径"回投失败塞回队首"与"方法收尾注销登记"之间有一瞬两边
+    // 都在，只摘一边会让下一轮清扫再看见它（同一条消息被投第二次）。按位点扫而不是只看
+    // 队首：缓冲在乱序场景（回投失败条目 push_front）里不一定严格按位点排。
+    auto pit = pending_.find(key);
+    if (pit != pending_.end()) {
+        for (auto vit = pit->second.begin(); vit != pit->second.end(); ++vit) {
+            if (vit->queueOffset == msg.queueOffset) {
+                pit->second.erase(vit);
+                break;
+            }
+        }
+    }
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::processQueueEntries(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return processQueueEntriesLocked(key);
+}
+
+std::optional<MessageExt> DefaultMQPushConsumer::processQueueHead(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return processQueueHeadLocked(key);
+}
+
+bool DefaultMQPushConsumer::processQueueContains(const std::string& key,
+                                                 const MessageExt& msg) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return processQueueContainsLocked(key, msg);
+}
+
+void DefaultMQPushConsumer::removeExpiredEntryIfStillHead(const std::string& key,
+                                                          const MessageExt& msg) {
+    std::lock_guard<std::mutex> lk(lock_);
+    // Java:106-115 —— 回投成功之后才走到这里；只有它**仍是**队首时才摘除：
+    // listener 恰好在此期间正常收尾（或前面冒出了更小的位点）就让位给正常路径，别抢。
+    const std::optional<MessageExt> head = processQueueHeadLocked(key);
+    if (!head.has_value() || head->queueOffset != msg.queueOffset) {
+        return;
+    }
+    removeProcessQueueEntryLocked(key, msg);
+}
+
+int32_t DefaultMQPushConsumer::cleanExpiredQueue(const std::string& key, int64_t nowMs) {
+    // Java ProcessQueue.cleanExpiredMsg:75-127 的循环体。
+    if (isOrderly()) {
+        // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+        return 0;
+    }
+    size_t loop = 0;
+    {
+        // Java:80 —— loop 在**进入循环前**算一次（本轮最多 16 条），不随摘除动态缩小
+        std::lock_guard<std::mutex> lk(lock_);
+        loop = std::min<size_t>(processQueueEntriesLocked(key).size(), 16);
+    }
+    int32_t attempts = 0;
+    for (size_t i = 0; i < loop; i++) {
+        std::optional<MessageExt> head;
+        {
+            std::lock_guard<std::mutex> lk(lock_);
+            head = processQueueHeadLocked(key);
+        }
+        if (!head.has_value()) break;
+        if (!isConsumeExpired(*head, consumeTimeoutMinutes_, nowMs)) {
+            break;  // Java:97-99 —— 队首没过期，后面的更不可能过期
+        }
+        const MessageExt msg = *head;
+        attempts++;
+        if (!sendMessageBack(msg, 3)) {  // Java:103 —— delayLevel 固定 3
+            // Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮再试；绝不摘除
+            logger_error("send expired msg exception: send message back failed, msgId="
+                         + msg.msgId + ", topic=" + msg.topic
+                         + ", queueOffset=" + std::to_string(msg.queueOffset));
+            continue;
+        }
+        logger_info("send expire msg back. topic=" + msg.topic + ", msgId=" + msg.msgId
+                    + ", storeHost=" + msg.storeHost
+                    + ", queueId=" + std::to_string(msg.queueId)
+                    + ", queueOffset=" + std::to_string(msg.queueOffset));
+        removeExpiredEntryIfStillHead(key, msg);
+    }
+    return attempts;
+}
+
+int32_t DefaultMQPushConsumer::cleanExpiredMsgOnce(int64_t nowMs) {
+    // Java cleanExpireMsg():192-200 —— 遍历 rebalance 的 processQueueTable，逐个
+    // pq.cleanExpiredMsg(pushConsumer)。清扫范围 = **当前持有**的队列（撤走的不再被扫）。
+    std::vector<std::string> keys;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const auto& kv : mqMap_) {
+            keys.push_back(kv.first);
+        }
+    }
+    int32_t attempts = 0;
+    for (const std::string& key : keys) {
+        attempts += cleanExpiredQueue(key, nowMs);
+    }
+    return attempts;
+}
+
+void DefaultMQPushConsumer::cleanExpiredMsgLoop() {
+    // Java ConsumeMessageConcurrentlyService:70-81：
+    //   scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)
+    // —— initialDelay 与 period 同值（都是 consumeTimeout 分钟），首轮也要等满一个周期；
+    // 立刻扫会把刚开始消费、还没超时的消息整批看一遍（不会误伤，但完全没必要）。
+    // 与其它定时任务同一口径（schedule_util.h 的固定速率推进 + 100ms 分段响 stop_）。
+    const auto period = std::chrono::milliseconds(cleanExpirePeriodMillis(consumeTimeoutMinutes_));
+    auto next = std::chrono::steady_clock::now() + period;
+    while (!stop_.load()) {
+        if (!started_.load()) return;
+        sleepUntilDeadline(stop_, next);
+        next += period;
+        try {
+            cleanExpiredMsgOnce(UtilAll::currentTimeMillis());
+        } catch (const std::exception& e) {
+            // Java 的调度壳子 catch (Throwable)（:77-81）：单轮清扫出错不能打死调度，
+            // 否则一条坏时间戳就变成"这个消费者从此不再有清扫"。
+            logger_error(std::string("scheduleAtFixedRate cleanExpireMsg exception: ") + e.what());
+        }
+    }
+}
+
 std::optional<int64_t> DefaultMQPushConsumer::consumeOffset(const std::string& key) const {
     std::lock_guard<std::mutex> lk(lock_);
     auto it = consumeOffsetTable_.find(key);
@@ -3025,6 +3331,9 @@ void DefaultMQPushConsumer::retireQueueLocked(
     lastPullAt_.erase(key);
     mqMap_.erase(key);
     pending_.erase(key);
+    // 队列已从 processQueueTable 摘除，Java 的清扫不会再碰它 —— 在途登记一并清掉，
+    // 免得旧副本继续被 cleanExpiredMsgOnce 的并集视图看见。
+    inflightMsgs_.erase(key);
     lockOk_.erase(key);
     offsetTable_.erase(key);
     consumeOffsetTable_.erase(key);

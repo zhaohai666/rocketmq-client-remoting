@@ -75,8 +75,8 @@ use crate::client::trace_hook::{ConsumeMessageTraceHook, TraceReportSink};
 use crate::client::validators;
 use crate::common::message::{Message, MessageExt, MessageQueue};
 use crate::common::message_const::{
-    PROPERTY_MAX_OFFSET, PROPERTY_MAX_RECONSUME_TIMES, PROPERTY_ORIGIN_MESSAGE_ID,
-    PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME, PROPERTY_RETRY_TOPIC,
+    PROPERTY_CONSUME_START_TIMESTAMP, PROPERTY_MAX_OFFSET, PROPERTY_MAX_RECONSUME_TIMES,
+    PROPERTY_ORIGIN_MESSAGE_ID, PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME, PROPERTY_RETRY_TOPIC,
     PROPERTY_TRANSACTION_PREPARED,
 };
 use crate::common::mix_all::MixAll;
@@ -651,6 +651,17 @@ struct State {
     /// （含异常回塞）时 -1。`pending` 与它合起来才是 `ProcessQueue.getMsgCount()`，
     /// [`correct_tags_offset_locked`] 的闸门两个都要看。
     inflight: BTreeMap<String, usize>,
+    /// Python `_inflight_msgs`：已分发给 listener、还没落定的消息本体
+    /// （Java `ProcessQueue.msgTreeMap` 里被 ConsumeRequest 持有、但 `removeMessage`
+    /// 之前仍留在树上的那部分）。
+    ///
+    /// `pending`（已拉未分发）∪ 它 = `msgTreeMap` 的完整视图，cleanExpiredMsg 的
+    /// 「队首清扫」与 [`process_queue_contains_locked`]（Java `containsMessage:341-357`）
+    /// 都看这个并集。**只登记并发批次**：顺序消费在 Java 里消息被挪进
+    /// `consumingMsgOrderlyTreeMap`，而清扫对顺序直接早退（`ProcessQueue:76-78`）。
+    /// 身份用 `queue_offset`（Java 的树就是按位点建的；本端口的批次是值拷贝，
+    /// 拿引用身份对不上）。
+    inflight_msgs: BTreeMap<String, Vec<MessageExt>>,
     /// Python `_frozen_offsets`：被 `OFFSET_ILLEGAL` 纠错冻结的位点（Java
     /// `ControllableOffset.allowToUpdate=false`）。冻结期间在途 ack 与空应答修正都不许改它，
     /// 直到这条队列按修正位点重建（`rebalance_pull_threads` 的建分支解冻）。
@@ -1680,6 +1691,28 @@ impl DefaultMQPushConsumer {
             .map_or(0, VecDeque::len)
     }
 
+    // ---------------- cleanExpiredMsg 的可观测接缝 ----------------
+    //
+    // 与 C++/Python/.NET 三版一致地公开：真机验证要能断言「挂住的批次登记在册（带
+    // CONSUME_START_TIME）、清扫把它从视图里收走、回投消息停在哪条队列的缓冲里」，
+    // 判据全是内部状态，没有接缝就只能靠「消息有没有来第二次」间接猜。
+
+    /// 「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java
+    /// `ProcessQueue.msgTreeMap`（并集按 queueOffset 去重）。
+    pub fn process_queue_entries(&self, key: &str) -> Vec<MessageExt> {
+        let state = lock(&self.inner.state);
+        process_queue_entries_locked(&state, key)
+    }
+
+    /// 该队列「已拉未分发」的缓冲（Java `ProcessQueue.msgTreeMap` 里还没被取走的部分）。
+    pub fn pending_messages(&self, key: &str) -> Vec<MessageExt> {
+        lock(&self.inner.state)
+            .pending
+            .get(key)
+            .map(|dq| dq.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// 立刻执行一次循环集合同步（等价于 rebalance 的那一步，验证用）。
     ///
     /// 刻意做成 `async`：收尾要发 RPC，在已经是 async 上下文的调用方里再 `block_on`
@@ -1932,6 +1965,9 @@ impl DefaultMQPushConsumer {
     ) {
         state.queue_owners.remove(key); // 循环内下一轮 owns_queue 失效
         state.pending.remove(key);
+        // 在途登记一并作废：队列已从 processQueueTable 摘除，Java 的清扫（cleanExpireMsg
+        // 只遍历 processQueueTable）不会再碰它，这里也不能让旧批次的引用留在登记里。
+        state.inflight_msgs.remove(key);
         state.lock_ok.remove(key);
         state.last_pull_at.remove(key); // 同名队列复用时不能继承旧时刻
         // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java `ProcessQueue.setDropped(true)`）。
@@ -2711,6 +2747,16 @@ impl DefaultMQPushConsumer {
         let rx = self.inner.stop.subscribe();
         tasks.push(handle.spawn(async move { rebalance_loop(consumer, rx).await }));
         tasks.push(spawn_loop!(dispatch_loop));
+        // 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
+        // ConsumeMessageConcurrentlyService 的构造/start 里（:68-88），顺序消费的
+        // ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
+        // ConsumeMessagePopConcurrentlyService 没有对应的调度。
+        let orderly = lock(&self.inner.listener)
+            .as_ref()
+            .is_some_and(MessageListener::is_orderly);
+        if !orderly && !read_cfg(&self.inner).pop_mode {
+            tasks.push(spawn_loop!(clean_expire_loop));
+        }
     }
 }
 
@@ -3372,6 +3418,13 @@ async fn consume_pop_batch(
         execute_consume_hook_before(&inner.consume_hooks, ctx);
     }
     let begin_ms = current_time_millis();
+    // Java ConsumeMessagePopConcurrentlyService:379-385 —— POP 路径同样在交给 listener
+    // 之前逐条盖 CONSUME_START_TIME。POP 没有清扫调度（Java 也没给 POP 建），盖章只为
+    // listener/轨迹可见性与经典路径保持一致。
+    let pop_stamp_now = current_time_millis();
+    for m in msgs.iter_mut() {
+        m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &pop_stamp_now.to_string());
+    }
     let (status, has_exception) = call_concurrently_listener(&inner, &msgs, &mut context).await;
     // Java POP :396-405 —— listener 返回 null 同样按 RECONSUME_LATER 处理（与经典并发同一套
     // ConsumeRequest.run）；归一化**前**的 status 留给 returnType（返回 null 记 RETURNNULL，
@@ -3995,17 +4048,60 @@ async fn consume_batch(
     }
 
     // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
-    let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
-    let mut hook_ctx = if inner.consume_hooks.has_hooks() {
-        Some(build_consume_hook_context(inner, &batch, mq))
+    let hook_ctx = if inner.consume_hooks.has_hooks() {
+        // 顺序与 Java 一致：before 在 listener **之前**（生成 SubBefore 轨迹），
+        // after 在拿到 status 之后（生成 SubAfter，带 contextCode）
+        let mut ctx = build_consume_hook_context(inner, &batch, mq);
+        execute_consume_hook_before(&inner.consume_hooks, &mut ctx);
+        Some(ctx)
     } else {
         None
     };
-    if let Some(ctx) = hook_ctx.as_mut() {
-        execute_consume_hook_before(&inner.consume_hooks, ctx);
-    }
     let begin_ms = current_time_millis();
-    let (raw_status, has_exception) = call_concurrently_listener(inner, &batch, &mut context).await;
+    // Java ConsumeRequest.run:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME，
+    // 每次投递（含重试）重新盖；cleanExpiredMsg 的挂起逃生口靠它判「这条在手里挂了多久」。
+    // 登记紧随盖章：本端口的批次是值拷贝（Java/Python 是共享引用），登记早了表里躺的
+    // 就是未盖章的副本，清扫永远看不见它们。
+    let stamp_now = current_time_millis();
+    for m in batch.iter_mut() {
+        m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &stamp_now.to_string());
+    }
+    // 登记在途消息：Java 并发路径下消息被 ConsumeRequest 持有期间**仍留在**
+    // ProcessQueue.msgTreeMap 里（直到 processConsumeResult 的 removeMessage），
+    // cleanExpiredMsg 的「队首」清扫与 containsMessage 判据都看它。顺序路径相反
+    // （takeMessages 把它们挪进 consumingMsgOrderlyTreeMap，清扫对顺序直接早退），
+    // 所以只登记并发批次。
+    register_inflight_msgs(inner, key, &batch);
+    let result = consume_concurrent_batch(
+        inner, key, mq, &batch, epoch, &cfg, broadcast, hook_ctx, begin_ms,
+    )
+    .await;
+    // 正常收尾（含回投失败回塞、被清扫摘除）后这批不再「在 listener 手里」；
+    // 被清扫/回塞提前摘过的条目在这里是幂等的。
+    deregister_inflight_msgs(inner, key, &batch);
+    result
+}
+
+/// 并发消费一个批次（对应 Java `ConsumeMessageConcurrentlyService$ConsumeRequest.run`）。
+///
+/// 从 [`consume_batch`] 拆出来只为把「登记在途 → 消费 → 注销在途」围成一段：
+/// 并发分支有一堆提前返回（整批认可、广播丢弃、回投失败……），登记表摘不干净的话
+/// 位点会被 `correct_tags_offset_locked` 的在途闸门永久挡停。before 钩子与
+/// `begin_ms` 由调用方做（要在盖章/登记之前），这里只负责 listener 与其后的收尾。
+#[allow(clippy::too_many_arguments)]
+async fn consume_concurrent_batch(
+    inner: &Arc<Inner>,
+    key: &str,
+    mq: &MessageQueue,
+    batch: &[MessageExt],
+    epoch: Option<u64>,
+    cfg: &ConsumerConfig,
+    broadcast: bool,
+    mut hook_ctx: Option<ConsumeMessageContext>,
+    begin_ms: i64,
+) -> Result<bool> {
+    let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
+    let (raw_status, has_exception) = call_concurrently_listener(inner, batch, &mut context).await;
     if raw_status.is_none() {
         // Java:399-405 —— listener 返回 null 先告警再归一化，告警里带的是**原始**返回值
         rmq_warn!(
@@ -4061,19 +4157,24 @@ async fn consume_batch(
                 "BROADCASTING, the message consume failed, drop it: {dropped} msgs in {mq:?}"
             );
         }
-        advance_consume_offset(inner, key, &batch, None, epoch);
+        advance_consume_offset(inner, key, batch, None, epoch);
         return Ok(true);
     }
     if acked >= batch.len() {
         // 整批认可（默认路径）：什么都不用回投，位点直接前进
-        advance_consume_offset(inner, key, &batch, None, epoch);
+        advance_consume_offset(inner, key, batch, None, epoch);
         return Ok(true);
     }
     // 集群模式：未认可的 [acked..) 逐条回投 %RETRY%topic（延迟档位 3+reconsumeTimes；
     // 超限由 broker 转 %DLQ%）
-    let msg_back_failed =
-        send_back_batch(inner, &batch[acked..], acked, context.delay_level_when_next_consume)
-            .await;
+    let msg_back_failed = send_back_batch(
+        inner,
+        key,
+        &batch[acked..],
+        acked,
+        context.delay_level_when_next_consume,
+    )
+    .await;
     // Java:256-260 —— 回投失败的那几条从本批摘掉后 submitConsumeRequestLater 重投，
     // 这里等价地塞回队首稍后再消费
     if !msg_back_failed.is_empty() {
@@ -4106,12 +4207,29 @@ async fn consume_batch(
 /// 就地 +1 —— broker 那边没记上这次数，客户端不补就永远进不了 DLQ。
 async fn send_back_batch(
     inner: &Arc<Inner>,
+    key: &str,
     batch: &[MessageExt],
     base: usize,
     delay_level_from_context: i32,
 ) -> Vec<(usize, MessageExt)> {
     let mut failed: Vec<(usize, MessageExt)> = Vec::new();
     for (i, msg) in batch.iter().enumerate() {
+        {
+            let state = lock(&inner.state);
+            if !process_queue_contains_locked(&state, key, msg.queue_offset) {
+                // Java processConsumeResult:243-248 —— 已被 cleanExpiredMsg 清扫（或队列已
+                // 撤销）的条目跳过回投：它已经在回 broker 的路上了，再发一次就是重复消息
+                rmq_info!(
+                    "Message is not found in its process queue; skip send-back-procedure, \
+                     topic={}, brokerName={}, queueId={}, queueOffset={}",
+                    msg.topic,
+                    msg.broker_name.as_deref().unwrap_or(""),
+                    msg.queue_id,
+                    msg.queue_offset
+                );
+                continue;
+            }
+        }
         // 重投次数在 MessageExt 线上格式第 13 字段（Java msg.getReconsumeTimes()），
         // broker 重投时 +1；不是 properties 键（PROPERTY_RECONSUME_TIME 是另一回事）。
         let mut delay_level = delay_level_from_context;
@@ -4175,6 +4293,240 @@ fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
     if let Some(dq) = state.pending.get_mut(key) {
         for m in batch.iter().rev() {
             dq.push_front(m.clone());
+        }
+    }
+}
+
+// ---------------- cleanExpiredMsg：挂起 listener 的逃生口 ----------------
+// 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:192-200 清扫入口）
+// ＋ ProcessQueue.cleanExpiredMsg（:75-127）。这是「listener 卡死不返回」时唯一的回收
+// 机制：把在手里超过 consumeTimeout 分钟的消息发回 broker（delayLevel=3），走 %RETRY%
+// 重新投递。少了它，一条卡住的消息会让该队列的位点永久停住，broker 侧只能等下一次
+// 客户端重启 —— 真机上表现为「消息明明投出去了却永远收不到第二次」，没有任何异常可看。
+
+/// 把这一批登记进「在 listener 手里」的视图（须与 [`deregister_inflight_msgs`] 成对）。
+///
+/// Python `_inflight_msgs`（Java 并发路径下消息在被 ConsumeRequest 持有期间仍留在
+/// `ProcessQueue.msgTreeMap` 上）。值拷贝语义：存的是这一份的克隆，身份按
+/// `queue_offset` 认（同一队列内位点唯一，与 Java 按位点建树同口径）。
+fn register_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut state = lock(&inner.state);
+    state
+        .inflight_msgs
+        .entry(key.to_string())
+        .or_default()
+        .extend(batch.iter().cloned());
+}
+
+/// 把这批消息从「在 listener 手里」的视图摘除（按位点，幂等）。
+fn deregister_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
+    if batch.is_empty() {
+        return;
+    }
+    let offsets: std::collections::BTreeSet<i64> = batch.iter().map(|m| m.queue_offset).collect();
+    let mut state = lock(&inner.state);
+    let Some(bucket) = state.inflight_msgs.get_mut(key) else {
+        return;
+    };
+    bucket.retain(|m| !offsets.contains(&m.queue_offset));
+    if bucket.is_empty() {
+        state.inflight_msgs.remove(key);
+    }
+}
+
+/// Java `ProcessQueue.msgTreeMap` 的等价视图：在途（已分发未落定）∪ 已拉未分发。
+///
+/// 配对操作（登记/摘除、塞回缓冲）都在 `state` 锁内成对完成，一条消息在同一瞬间只会
+/// 出现在一边；这里按位点再去一次重只为防御未来新调用点写出重叠。
+fn process_queue_entries_locked(state: &State, key: &str) -> Vec<MessageExt> {
+    let mut seen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut out: Vec<MessageExt> = Vec::new();
+    for m in state
+        .inflight_msgs
+        .get(key)
+        .into_iter()
+        .flatten()
+        .chain(state.pending.get(key).into_iter().flatten())
+    {
+        if seen.insert(m.queue_offset) {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
+/// 队首 = 最小 `queueOffset` 的那条（Java `msgTreeMap.firstEntry()`）。
+fn process_queue_first_entry_locked(state: &State, key: &str) -> Option<MessageExt> {
+    process_queue_entries_locked(state, key)
+        .into_iter()
+        .min_by_key(|m| m.queue_offset)
+}
+
+/// Java `ProcessQueue.containsMessage`（:341-357）：这条消息还挂在队列上吗。
+///
+/// 被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上）。
+fn process_queue_contains_locked(state: &State, key: &str, queue_offset: i64) -> bool {
+    state
+        .inflight_msgs
+        .get(key)
+        .into_iter()
+        .flatten()
+        .chain(state.pending.get(key).into_iter().flatten())
+        .any(|m| m.queue_offset == queue_offset)
+}
+
+/// 摘除刚清扫过的那条（调用方已确认它就是队首）。须持 `state` 锁。
+///
+/// 两边都摘：正常情况下它只在一边；并发路径「回投失败塞回缓冲」与「收尾摘除登记」
+/// 之间有一瞬两边都在，从两处一起摘掉才能保证下轮清扫不会再看见它。缓冲侧按位点扫，
+/// 不是只看队首 —— 回投失败的条目是 `push_front` 进去的，缓冲不一定严格按位点排序。
+fn remove_process_queue_entry_locked(state: &mut State, key: &str, queue_offset: i64) {
+    if let Some(bucket) = state.inflight_msgs.get_mut(key) {
+        bucket.retain(|m| m.queue_offset != queue_offset);
+        if bucket.is_empty() {
+            state.inflight_msgs.remove(key);
+        }
+    }
+    if let Some(dq) = state.pending.get_mut(key) {
+        dq.retain(|m| m.queue_offset != queue_offset);
+    }
+}
+
+/// Java `ProcessQueue:106-115` —— 只有它**仍是**队首时才摘除。返回是否真的摘了。
+///
+/// 「仍是队首」这一问不能省：listener 恰好在此期间正常收尾（消息已被
+/// `deregister_inflight_msgs` 摘掉），或前面冒出了更小的位点（回投失败塞回的条目），
+/// 都该让位给正常路径 —— 抢摘会把不该动的那条从视图里抹掉。须持 `state` 锁。
+fn remove_expired_entry_if_still_head(state: &mut State, key: &str, queue_offset: i64) -> bool {
+    let still_head = process_queue_first_entry_locked(state, key)
+        .is_some_and(|m| m.queue_offset == queue_offset);
+    if still_head {
+        remove_process_queue_entry_locked(state, key, queue_offset);
+    }
+    still_head
+}
+
+/// Java `ConsumeRequest.run:366-370` 盖章的解析：`StringUtils.isNotEmpty(...)` 且能
+/// 解析成整数才算「有戳」。没盖过章（还没进过 listener 的缓冲消息、老版本客户端）与
+/// 坏值一样按 [`is_consume_expired`] 的 `None` 处理。
+fn consume_start_timestamp(msg: &MessageExt) -> Option<i64> {
+    let raw = msg.get_property(PROPERTY_CONSUME_START_TIMESTAMP)?;
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<i64>().ok()
+}
+
+/// Java `ProcessQueue.cleanExpiredMsg:88` 的过期判据：**严格**大于阈值。
+///
+/// 没有戳（`None`）不当过期（Java 的 `StringUtils.isNotEmpty` 短路）；等于阈值也不动手
+/// （严格 `>`）。这两个「差不多」的方向都错得安静：判松了会把刚投递的消息在下一轮周期
+/// 就抢走回投，判紧了卡死消息永远等不到清扫。
+fn is_consume_expired(stamp: Option<i64>, now_ms: i64, consume_timeout_minutes: i64) -> bool {
+    match stamp {
+        Some(ts) => now_ms - ts > consume_timeout_minutes * 60 * 1000,
+        None => false,
+    }
+}
+
+/// Java `scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)`：
+/// initialDelay 与 period 同值（都是 consumeTimeout 分钟）。0/负值按 Java 的
+/// `scheduleAtFixedRate` 语义会退化成「立刻且背靠背」，这里钳到 1 分钟避免忙等
+/// （Python `max(1, consume_timeout)` 同口径）。
+fn clean_expire_period_millis(consume_timeout_minutes: i64) -> u64 {
+    let minutes = consume_timeout_minutes.max(1);
+    u64::try_from(minutes).unwrap_or(u64::MAX / 60_000) * 60_000
+}
+
+/// 清理一条队列（Java `ProcessQueue.cleanExpiredMsg:80-127`），返回本轮实际发起回投的
+/// 次数（单测取证「队首才动、失败重试同一条、单轮上限 16」用）。
+///
+/// 语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
+fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
+    // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+    if lock(&inner.listener)
+        .as_ref()
+        .is_some_and(MessageListener::is_orderly)
+    {
+        return 0;
+    }
+    let cfg = read_cfg(inner);
+    // Java:80 —— loop 在循环**之前**算一次（min(size, 16)）
+    let loop_n = {
+        let state = lock(&inner.state);
+        process_queue_entries_locked(&state, key).len().min(16)
+    };
+    let mut attempts = 0usize;
+    for _ in 0..loop_n {
+        let head = {
+            let state = lock(&inner.state);
+            match process_queue_first_entry_locked(&state, key) {
+                Some(m) => m,
+                None => break, // Java NoSuchElementException 分支
+            }
+        };
+        // Java:87-90 —— 没盖过章的直接当成未过期；过期判据是**严格**大于
+        if !is_consume_expired(
+            consume_start_timestamp(&head),
+            current_time_millis(),
+            cfg.consume_timeout,
+        ) {
+            break; // Java:97-99 —— 队首没过期，后面的更不可能过期
+        }
+        attempts += 1;
+        if let Err(e) = send_message_back(inner, &head, 3, None) {
+            // Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
+            // 再试；绝不摘除（摘了就真丢了）
+            rmq_error!("send expired msg exception: {e}");
+            continue;
+        }
+        rmq_info!(
+            "send expire msg back. topic={}, msgId={}, storeHost={}, queueId={}, queueOffset={}",
+            head.topic,
+            head.msg_id.as_deref().unwrap_or(""),
+            head.get_store_host().unwrap_or(""),
+            head.queue_id,
+            head.queue_offset
+        );
+        // Java:106-115 —— 只有它**仍是**队首时才摘除：listener 恰好在此期间正常收尾
+        // （或前面冒出了更小的位点）就让位给正常路径，别抢
+        let mut state = lock(&inner.state);
+        remove_expired_entry_if_still_head(&mut state, key, head.queue_offset);
+    }
+    attempts
+}
+
+/// 对应 Java `cleanExpireMsg()`（:192-200）：遍历当前持有的队列逐个清扫。
+///
+/// 任一条队列抛出异常（如时间戳坏值）与 Java 一样让整轮中止 —— 调度壳子的
+/// `catch (Throwable)`（:77-81）兜住它，下一轮照常。
+fn clean_expired_msg_once(inner: &Arc<Inner>) -> usize {
+    let keys: Vec<String> = lock(&inner.state).mq_map.keys().cloned().collect();
+    let mut attempts = 0;
+    for key in keys {
+        attempts += clean_expired_queue(inner, &key);
+    }
+    attempts
+}
+
+/// Python `_clean_expire_loop`（Java `scheduleAtFixedRate` 的 initialDelay=period）。
+async fn clean_expire_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
+    // initialDelay 与 period 同值（都是 consumeTimeout 分钟），所以首轮清扫也要等满
+    // 一个周期 —— 立刻扫会把刚开始消费、还没超时的消息全看一遍（虽不会误伤，但没必要）。
+    let period = clean_expire_period_millis(read_cfg(&inner).consume_timeout);
+    if wait_or_stop(&mut rx, period).await {
+        return;
+    }
+    loop {
+        if stopped(&rx) || !inner.started.load(Ordering::Acquire) {
+            return;
+        }
+        clean_expired_msg_once(&inner);
+        if wait_or_stop(&mut rx, period).await {
+            return;
         }
     }
 }
@@ -7020,6 +7372,9 @@ mod tests {
             state.lock_ok.insert(key.clone());
             state.last_pull_at.insert(key.clone(), 123);
             state.pop_queues.insert(key.clone(), pq.clone());
+            // 在途批次的清扫视图：撤销后旧批次的引用不能留着（
+            // Java cleanExpireMsg 只遍历 processQueueTable，摘掉的队列扫不到）
+            state.inflight_msgs.insert(key.clone(), vec![ext("T", None)]);
         }
         let mut revoked = Vec::new();
         let mut state = lock(&consumer.inner.state);
@@ -7027,6 +7382,10 @@ mod tests {
         assert_eq!(revoked, vec![(mq.clone(), Some(42))]);
         assert!(state.queue_owners.is_empty());
         assert!(state.pending.is_empty());
+        assert!(
+            state.inflight_msgs.is_empty(),
+            "撤销后旧批次的引用不能留在清扫视图里"
+        );
         assert!(state.offset_table.is_empty());
         assert!(state.consume_offsets.is_empty());
         assert!(state.lock_ok.is_empty());
@@ -7657,6 +8016,426 @@ mod tests {
 
         drop(stop_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ---------------- cleanExpiredMsg（挂起 listener 的逃生口） ----------------
+    //
+    // 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:192-200 清扫入口）
+    // ＋ ProcessQueue.cleanExpiredMsg（:75-127）。三条「错了很安静」的语义在这里钉死：
+    //   1. **只看队首**（最小位点）：非队首的过期消息不动手（Java:97-99 队首不过期就
+    //      直接 break）；
+    //   2. **严格大于** consumeTimeout：等于阈值不碰；
+    //   3. **单轮上限 16**，且 loop 在循环之前算一次（Java:80）——写松了会把整条队列
+    //      一次性全清空，位点/重投节奏全乱。
+    // 离线能锁死的只有「判定」与「回投失败后原地保留」两条分支（未 start 的消费者
+    // 回投必定失败）；真机链路（挂起 → 清扫 → %RETRY% 重投到达）见
+    // `examples/live_clean_expired_msg.rs`。
+
+    /// Java `scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)`：
+    /// initialDelay 与 period 同值，都是 consumeTimeout 分钟。
+    #[test]
+    fn clean_expire_period_equals_consume_timeout_minutes() {
+        assert_eq!(clean_expire_period_millis(15), 900_000, "默认 15 分钟");
+        assert_eq!(clean_expire_period_millis(1), 60_000);
+        assert_eq!(clean_expire_period_millis(0), 60_000, "0 钳到 1 分钟，别忙等");
+        assert_eq!(clean_expire_period_millis(-3), 60_000);
+    }
+
+    /// 盖章解析对齐 Java 的 `StringUtils.isNotEmpty(...) && Long.parseLong(...)`：
+    /// 没有/空/坏值一律按「没盖过章」处理，不当成过期（判松了会抢走刚投递的消息）。
+    #[test]
+    fn consume_start_timestamp_reads_only_well_formed_stamps() {
+        let mut m = ext("T", None);
+        assert_eq!(consume_start_timestamp(&m), None, "没盖章");
+        m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, "");
+        assert_eq!(consume_start_timestamp(&m), None, "空串");
+        m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, "not-a-number");
+        assert_eq!(consume_start_timestamp(&m), None, "坏值");
+        m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, "1700000000000");
+        assert_eq!(consume_start_timestamp(&m), Some(1_700_000_000_000));
+    }
+
+    /// 过期判据是**严格**大于（等于阈值不动手），没盖章不当过期。
+    #[test]
+    fn is_consume_expired_is_strict_and_ignores_missing_stamps() {
+        let now = 10_000_000i64;
+        assert!(is_consume_expired(Some(now - 60_001), now, 1), "刚过阈值 1ms");
+        assert!(
+            !is_consume_expired(Some(now - 60_000), now, 1),
+            "恰好等于阈值：严格大于才动手"
+        );
+        assert!(!is_consume_expired(Some(now), now, 1));
+        assert!(!is_consume_expired(None, now, 1), "没盖章不当过期");
+        // 默认 15 分钟：14 分 59.999 秒不动手，15 分零 1 毫秒动手
+        assert!(!is_consume_expired(Some(now - 899_999), now, 15));
+        assert!(is_consume_expired(Some(now - 900_001), now, 15));
+    }
+
+    /// 队首没过期 → 整条队列都不动（Java:97-99 的 break，不是 continue）。
+    #[test]
+    fn clean_expired_queue_stops_at_a_fresh_head() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.consume_timeout = 1);
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let now = current_time_millis();
+        {
+            let mut state = lock(&consumer.inner.state);
+            let mut head = ext("T", None); // 头没盖章
+            head.queue_offset = 0;
+            let mut tail = ext("T", None); // 尾巴过期了也不该动
+            tail.queue_offset = 1;
+            tail.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+            state
+                .pending
+                .insert(key.clone(), VecDeque::from(vec![head, tail]));
+        }
+        assert_eq!(
+            clean_expired_queue(&consumer.inner, &key),
+            0,
+            "队首没过期：后面的更不可能过期（Java break 语义）"
+        );
+        let state = lock(&consumer.inner.state);
+        assert_eq!(state.pending.get(&key).unwrap().len(), 2, "一条都不许动");
+    }
+
+    /// 没有盖章的消息即便在队首也绝不回投（Java `StringUtils.isNotEmpty` 短路）。
+    #[test]
+    fn clean_expired_queue_leaves_unsigned_messages_alone() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.consume_timeout = 1);
+        let key = mq_key(&queue("T", "broker-a", 0));
+        {
+            let mut state = lock(&consumer.inner.state);
+            let mut m = ext("T", None);
+            m.queue_offset = 0;
+            state.pending.insert(key.clone(), VecDeque::from(vec![m]));
+        }
+        assert_eq!(clean_expired_queue(&consumer.inner, &key), 0);
+        assert_eq!(lock(&consumer.inner.state).pending.get(&key).unwrap().len(), 1);
+    }
+
+    /// 回投失败（未 start 的消费者）→ 条目原地保留、下一轮还是它；单轮内 Java 会对
+    /// **同一条队首**重试到 loop 用尽（:80 的 loop 与循环体里的 continue）。
+    #[test]
+    fn clean_expired_queue_keeps_the_entry_when_send_back_fails() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.consume_timeout = 1);
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let now = current_time_millis();
+        let expired = |off: i64| {
+            let mut m = ext("T", None);
+            m.queue_offset = off;
+            m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+            m
+        };
+        {
+            let mut state = lock(&consumer.inner.state);
+            state
+                .pending
+                .insert(key.clone(), VecDeque::from(vec![expired(0), expired(1)]));
+        }
+        assert_eq!(
+            clean_expired_queue(&consumer.inner, &key),
+            2,
+            "loop=min(2,16)=2：回投失败后本轮仍会对同一条队首再试一次"
+        );
+        let state = lock(&consumer.inner.state);
+        assert_eq!(
+            state.pending.get(&key).unwrap().len(),
+            2,
+            "回投失败绝不摘除（摘了就真丢了）"
+        );
+        assert!(!state.consume_offsets.contains_key(&key), "位点不许动");
+    }
+
+    /// 单轮上限 16：20 条过期条目一轮只发起 16 次回投（Java:80）。
+    #[test]
+    fn clean_expired_queue_caps_one_round_at_sixteen() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.consume_timeout = 1);
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let now = current_time_millis();
+        let batch: Vec<MessageExt> = (0..20)
+            .map(|i| {
+                let mut m = ext("T", None);
+                m.queue_offset = i;
+                m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+                m
+            })
+            .collect();
+        lock(&consumer.inner.state).pending.insert(key.clone(), batch.into());
+        assert_eq!(
+            clean_expired_queue(&consumer.inner, &key),
+            16,
+            "loop 在循环之前算一次：上限 16"
+        );
+    }
+
+    /// 顺序消费没有这条路径（`ProcessQueue:76-78` 直接早退）。
+    #[test]
+    fn clean_expired_queue_skips_orderly_consumers() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.consume_timeout = 1);
+        consumer.set_message_listener_orderly(Arc::new(NoopOrderlyListener));
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let mut m = ext("T", None);
+        m.queue_offset = 0;
+        m.put_property(
+            PROPERTY_CONSUME_START_TIMESTAMP,
+            &(current_time_millis() - 120_000).to_string(),
+        );
+        lock(&consumer.inner.state)
+            .pending
+            .insert(key.clone(), VecDeque::from(vec![m]));
+        assert_eq!(clean_expired_queue(&consumer.inner, &key), 0);
+    }
+
+    /// 「仍是队首才摘」的两种让位：正常收尾（条目已摘/已前进）与更小位点冒头。
+    #[test]
+    fn remove_expired_entry_only_when_still_head() {
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let msg = |off: i64| {
+            let mut m = ext("T", None);
+            m.queue_offset = off;
+            m
+        };
+
+        // 仍是队首：两边一起摘
+        let mut state = State::default();
+        state
+            .inflight_msgs
+            .insert(key.clone(), vec![msg(0), msg(1)]);
+        state.pending.insert(key.clone(), VecDeque::from(vec![msg(0)]));
+        assert!(remove_expired_entry_if_still_head(&mut state, &key, 0));
+        assert_eq!(
+            state.inflight_msgs.get(&key).unwrap().len(),
+            1,
+            "登记侧摘掉"
+        );
+        assert!(state.pending.get(&key).unwrap().is_empty(), "缓冲侧也摘");
+
+        // 前面冒出了更小的位点：让位，不许抢摘
+        let mut state = State::default();
+        state.inflight_msgs.insert(key.clone(), vec![msg(5)]);
+        state.pending.insert(key.clone(), VecDeque::from(vec![msg(3)]));
+        assert!(!remove_expired_entry_if_still_head(&mut state, &key, 5));
+        assert_eq!(state.inflight_msgs.get(&key).unwrap().len(), 1);
+
+        // 已经不在视图里（listener 正常收尾先摘了）：同样为 false，且不 panic
+        let mut state = State::default();
+        assert!(!remove_expired_entry_if_still_head(&mut state, &key, 0));
+    }
+
+    /// 并集视图与 containsMessage：被清扫摘掉的条目对回投判据立刻不可见。
+    #[test]
+    fn process_queue_view_unions_inflight_and_pending_by_offset() {
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let msg = |off: i64| {
+            let mut m = ext("T", None);
+            m.queue_offset = off;
+            m
+        };
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.inflight_msgs.insert(key.clone(), vec![msg(1)]);
+            state.pending.insert(key.clone(), VecDeque::from(vec![msg(2), msg(1)]));
+            assert_eq!(
+                process_queue_entries_locked(&state, &key).len(),
+                2,
+                "按位点去重（登记的与缓冲的重叠只算一条）"
+            );
+            assert_eq!(
+                process_queue_first_entry_locked(&state, &key)
+                    .unwrap()
+                    .queue_offset,
+                1
+            );
+            assert!(process_queue_contains_locked(&state, &key, 1));
+            assert!(process_queue_contains_locked(&state, &key, 2));
+            assert!(!process_queue_contains_locked(&state, &key, 3));
+        }
+        // 摘除后：两边都没有它了，containsMessage（Java:341-357）立刻翻 false
+        {
+            let mut state = lock(&consumer.inner.state);
+            remove_process_queue_entry_locked(&mut state, &key, 1);
+            assert!(!process_queue_contains_locked(&state, &key, 1));
+            assert!(process_queue_contains_locked(&state, &key, 2));
+            assert!(!state.inflight_msgs.contains_key(&key), "空桶要删掉");
+        }
+    }
+
+    /// Java processConsumeResult:243-248：已被清扫的条目**跳过回投**（它已经在回
+    /// broker 的路上，再发一次就是重复消息）。这里用「未 start 的消费者回投必失败」
+    /// 把两条腿分开：没被清扫的那条落在 failed 里，被清扫的那条根本不进循环体。
+    #[tokio::test]
+    async fn send_back_batch_skips_entries_swept_away() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let key = mq_key(&queue("T", "broker-a", 0));
+        let batch: Vec<MessageExt> = {
+            let mut a = ext("T", None);
+            a.queue_offset = 0;
+            let mut b = ext("T", None);
+            b.queue_offset = 1;
+            vec![a, b]
+        };
+        // 两条都在清扫视图里（正常在途态）
+        register_inflight_msgs(&consumer.inner, &key, &batch);
+        // 清扫把 o1 摘走（模拟挂起超时后被打回 broker）：视图里从此没有它
+        {
+            let mut state = lock(&consumer.inner.state);
+            remove_process_queue_entry_locked(&mut state, &key, 1);
+            assert!(!process_queue_contains_locked(&state, &key, 1));
+        }
+
+        let failed = send_back_batch(&consumer.inner, &key, &batch, 0, 0).await;
+        assert_eq!(
+            failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0],
+            "o0 尝试回投但失败（未 start）；o1 已被清扫，直接跳过"
+        );
+        assert_eq!(failed[0].1.reconsume_times, 1, "失败就地 +1（Java:251）");
+        assert_eq!(batch[1].reconsume_times, 0, "被跳过的条目不许加次数");
+    }
+
+    /// 接线取证：`dispatch_loop` 走并发路径时必须把**盖过章**的这批登记进清扫视图，
+    /// 并在收尾后注销。登记早了（盖章之前）表里就是未盖章副本，清扫永远看不见它们；
+    /// 漏注销则位点被 correctTagsOffset 的在途闸门永久挡停。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_registers_a_stamped_inflight_view() {
+        let cfg = ConsumerConfig {
+            consume_message_batch_max_size: 2,
+            consume_timeout: 1,
+            ..Default::default()
+        };
+        let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        c.set_message_listener_concurrently(Arc::new(GatedListener {
+            inner: c.inner.clone(),
+            key: key.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        {
+            let mut state = lock(&c.inner.state);
+            state.mq_map.insert(key.clone(), mq.clone());
+            state.pending.insert(key.clone(), offset_batch(2).into());
+        }
+        c.inner.started.store(true, Ordering::Release);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(dispatch_loop(c.inner.clone(), stop_rx));
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("listener 未被调用（5s）")
+            .expect("entered 通道意外关闭");
+        {
+            let state = lock(&c.inner.state);
+            let entries = process_queue_entries_locked(&state, &key);
+            assert_eq!(entries.len(), 2, "在途批次要出现在清扫视图里");
+            assert!(
+                entries
+                    .iter()
+                    .all(|m| consume_start_timestamp(m).is_some()),
+                "登记进视图的副本必须已盖 CONSUME_START_TIME"
+            );
+            assert!(
+                !is_consume_expired(
+                    consume_start_timestamp(&entries[0]),
+                    current_time_millis(),
+                    1
+                ),
+                "刚登记的消息不该立刻判成过期"
+            );
+        }
+
+        release_tx.send(()).expect("release 通道已关闭");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !lock(&c.inner.state).inflight_msgs.contains_key(&key) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "登记未在 5s 内注销");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // 清扫视图随之回到「只剩缓冲消息」的状态
+        assert!(process_queue_entries_locked(&lock(&c.inner.state), &key).is_empty());
+
+        drop(stop_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// 清扫入口只扫「当前持有」的队列（Java cleanExpireMsg:192-200 遍历
+    /// processQueueTable）；撤掉的队列连登记都一并没了（retire 的清理）。
+    #[tokio::test]
+    async fn clean_expired_msg_once_scans_held_queues_only() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.consume_timeout = 1);
+        let held = mq_key(&queue("T", "broker-a", 0));
+        let other = mq_key(&queue("T", "broker-a", 1));
+        let now = current_time_millis();
+        let expired = {
+            let mut m = ext("T", None);
+            m.queue_offset = 0;
+            m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+            m
+        };
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.mq_map.insert(held.clone(), queue("T", "broker-a", 0));
+            state
+                .pending
+                .insert(held.clone(), VecDeque::from(vec![expired.clone()]));
+            // 另一个队列不在 mq_map 里（已撤）：即便缓冲里还残留也不该被扫到
+            state.pending.insert(other.clone(), VecDeque::from(vec![expired]));
+        }
+        assert_eq!(
+            clean_expired_msg_once(&consumer.inner),
+            1,
+            "只有仍持有的那条队列被扫"
+        );
+    }
+
+    /// POP 路径同样在交给 listener 之前盖章（Java ConsumeMessagePopConcurrentlyService
+    /// :379-385）；POP 没有清扫调度，盖章只为 listener/轨迹可见性一致。
+    #[tokio::test]
+    async fn pop_dispatch_stamps_the_consume_start_time() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| c.pop_mode = true);
+        let seen = Arc::new(Mutex::new(Vec::<Option<i64>>::new()));
+        consumer.set_message_listener_concurrently(Arc::new(StampRecordingListener(seen.clone())));
+        let inner = consumer.inner.clone();
+        let mq = queue("T", "broker-a", 0);
+        let pq = PopProcessQueue::new();
+        pq.inc_found_msg(1);
+        submit_pop_consume_request(&inner, vec![pop_ck_msg(0)], pq.clone(), mq.clone()).await;
+        let stamps = seen.lock().unwrap().clone();
+        assert_eq!(stamps.len(), 1);
+        assert!(
+            stamps[0].is_some(),
+            "POP 批次在 listener 之前必须盖 CONSUME_START_TIME"
+        );
+    }
+
+    /// 记录 listener 看到的 CONSUME_START_TIME（POP 盖章取证用）。
+    struct StampRecordingListener(Arc<Mutex<Vec<Option<i64>>>>);
+
+    impl MessageListenerConcurrently for StampRecordingListener {
+        fn consume_message(
+            &self,
+            msgs: &[MessageExt],
+            _context: &mut ConsumeConcurrentlyContext,
+        ) -> ConsumeConcurrentlyStatus {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(msgs.iter().map(consume_start_timestamp));
+            ConsumeConcurrentlyStatus::ConsumeSuccess
+        }
     }
 
     // ---------------- OFFSET_ILLEGAL 纠错（Java `DefaultMQPushConsumerImpl:402-427`） ----------------

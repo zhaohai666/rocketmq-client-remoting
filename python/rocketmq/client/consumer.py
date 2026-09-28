@@ -822,6 +822,11 @@ class DefaultMQPushConsumer:
         # _dispatch_loop 取走批次时 +1、消费收尾（含异常回塞）时 -1。_pending 与它合起来
         # 才是 Java 的 ProcessQueue.getMsgCount()，correctTagsOffset 的闸门两个都要看。
         self._msg_queue_inflight: Dict[str, int] = {}
+        # 在途批次的**消息本体**（key → 列表，取走批次时登记、消费收尾时摘除）。
+        # 对齐 Java ProcessQueue.msgTreeMap 里"已分发给 listener、还没 ack"的那部分：
+        # _pending（已拉未分发）∪ _inflight_msgs（已分发未落定）= Java 的 msgTreeMap。
+        # cleanExpiredMsg 的"只看队首（最小位点）"判据在这个并集上取第一条。
+        self._inflight_msgs: Dict[str, List[MessageExt]] = {}
         self._offset_table: Dict[str, int] = {}
         self._stop = threading.Event()
         # ---- 对齐 Java 的消费进度 / 缓冲 / 锁状态 ----
@@ -845,6 +850,7 @@ class DefaultMQPushConsumer:
         self._lock_ok: Set[str] = set()
         self._flow_control_triggered = 0
         self._dispatch_thread: Optional[threading.Thread] = None
+        self._clean_expire_thread: Optional[threading.Thread] = None
         self._persist_thread: Optional[threading.Thread] = None
         self._lock_thread: Optional[threading.Thread] = None
         self._rebalance_thread: Optional[threading.Thread] = None
@@ -1477,6 +1483,12 @@ class DefaultMQPushConsumer:
         self._start_heartbeat_loop()
         self._start_pull_loop()
         self._start_dispatch_loop()
+        # 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
+        # ConsumeMessageConcurrentlyService 的构造/start 里（:71-88），顺序消费的
+        # ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
+        # ConsumeMessagePopConcurrentlyService 没有对应的调度。
+        if not self._is_orderly() and not self.pop_mode:
+            self._start_clean_expire_loop()
         self._start_offset_persist_loop()
         self._start_lock_loop()
         t = threading.Thread(target=self._rebalance_loop, daemon=True,
@@ -1546,7 +1558,7 @@ class DefaultMQPushConsumer:
         with self._lock:
             self._started = False
         for t in (self._persist_thread, self._lock_thread, self._dispatch_thread,
-                  self._rebalance_thread, self._heartbeat_thread):
+                  self._clean_expire_thread, self._rebalance_thread, self._heartbeat_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=2)
         for t in list(self._queue_threads.values()):
@@ -1748,6 +1760,9 @@ class DefaultMQPushConsumer:
         self._last_pull_table.pop(key, None)
         mq = self._mq_map.pop(key, fallback_mq)
         self._pending.pop(key, None)
+        # 在途登记一并作废：队列已从 processQueueTable 摘除，Java 的清扫（cleanExpireMsg
+        # 只遍历 processQueueTable）不会再碰它，这里也不能让旧批次的引用留在登记里。
+        self._inflight_msgs.pop(key, None)
         self._lock_ok.discard(key)
         # 代号 +1 ⇒ 在途批次的 ack 全部失效（Java setDropped(true)）；冻结标记**保留**到
         # 队列重建为止（_rebalance_pull_threads 解冻），避免纠错后的位点被旧 ack 覆盖。
@@ -2287,6 +2302,11 @@ class DefaultMQPushConsumer:
         begin_ms = time.time() * 1000
         has_exception = False
         try:
+            # Java ConsumeMessagePopConcurrentlyService:379-385 —— POP 并发路径同样在
+            # 交给 listener 前逐条盖 CONSUME_START_TIME（POP 没有 cleanExpiredMsg 清扫，
+            # 但这条属性对 listener/轨迹可见，口径要与经典并发一致）
+            for m in msgs:
+                MessageAccessor.set_consume_start_timestamp(m, int(time.time() * 1000))
             status = self.message_listener.consume_message(msgs, context)
         except Exception as e:  # noqa: BLE001
             # Java：消费抛异常按 RECONSUME_LATER 处理
@@ -2762,6 +2782,138 @@ class DefaultMQPushConsumer:
                 for m in reversed(batch):
                     dq.appendleft(m)
 
+    def _deregister_inflight_locked(self, key: str, batch: List[MessageExt]) -> None:
+        """把这批消息从"在 listener 手里"的登记里摘除（按对象身份，幂等）。须持锁调用。"""
+        bucket = self._inflight_msgs.get(key)
+        if not bucket:
+            return
+        gone = {id(m) for m in batch}
+        bucket[:] = [m for m in bucket if id(m) not in gone]
+        if not bucket:
+            self._inflight_msgs.pop(key, None)
+
+    def _process_queue_entries_locked(self, key: str) -> List[MessageExt]:
+        """Java ``ProcessQueue.msgTreeMap`` 的等价视图：在途（已分发未落定）∪ 已拉未分发。
+
+        配对操作（登记/摘除、塞回缓冲）都在 ``self._lock`` 内成对完成，一条消息在同一
+        瞬间只会出现在一边；这里按对象身份再去一次重只为防御未来新调用点写出重叠。
+        """
+        out: List[MessageExt] = []
+        seen: Set[int] = set()
+        for m in list(self._inflight_msgs.get(key) or ()) + list(self._pending.get(key) or ()):
+            if id(m) not in seen:
+                seen.add(id(m))
+                out.append(m)
+        return out
+
+    def _process_queue_first_entry_locked(self, key: str) -> Optional[MessageExt]:
+        """队首 = 最小 ``queueOffset`` 的那条（Java ``msgTreeMap.firstEntry()``）。"""
+        entries = self._process_queue_entries_locked(key)
+        if not entries:
+            return None
+        return min(entries, key=lambda m: m.queue_offset or 0)
+
+    def _process_queue_contains_locked(self, key: str, msg: MessageExt) -> bool:
+        """Java ``ProcessQueue.containsMessage``（:341-357）：这条消息还挂在队列上吗。
+
+        被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上）。
+        """
+        for m in self._inflight_msgs.get(key) or ():
+            if m is msg:
+                return True
+        for m in self._pending.get(key) or ():
+            if m is msg:
+                return True
+        return False
+
+    def _remove_process_queue_entry_locked(self, key: str, msg: MessageExt) -> None:
+        """摘除刚清扫过的那条（须持锁；调用方已确认它就是队首）。
+
+        两边都摘：正常情况下它只在一边；并发路径"回投失败塞回缓冲"与"方法收尾摘除登记"
+        之间有一瞬两边都在，从两处一起摘掉才能保证下轮清扫不会再看见它。
+        """
+        self._deregister_inflight_locked(key, [msg])
+        dq = self._pending.get(key)
+        if dq and dq[0] is msg:
+            dq.popleft()
+
+    # ---------------- cleanExpiredMsg：挂起 listener 的逃生口 ----------------
+    # 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:77-81/192-200 清扫入口）
+    # ＋ ProcessQueue.cleanExpiredMsg（:75-127）。这是"listener 卡死不返回"时唯一的回收
+    # 机制：把在手里超过 consumeTimeout 分钟的消息发回 broker（delayLevel=3），走 %RETRY%
+    # 重新投递。少了它，一条卡住的消息会让该队列的位点永久停住，broker 侧只能等下一次
+    # 客户端重启 —— 真机上表现为"消息明明投出去了却永远收不到第二次"，没有任何异常可看。
+
+    def _start_clean_expire_loop(self) -> None:
+        t = threading.Thread(target=self._clean_expire_loop, daemon=True,
+                             name="rmq-cleanexpire-%s" % self.consumer_group)
+        t.start()
+        self._clean_expire_thread = t
+
+    def _clean_expire_loop(self) -> None:
+        # Java scheduleAtFixedRate(..., consumeTimeout, consumeTimeout, MINUTES)：initialDelay
+        # 与 period 同值（都是 consumeTimeout 分钟），所以首轮清扫也要等满一个周期 ——
+        # 立刻扫会把刚开始消费、还没超时的消息全看一遍（虽然不会误伤，但完全没必要）。
+        period = max(1, self.consume_timeout) * 60.0
+        if self._stop.wait(period):                # Java initialDelay = consumeTimeout 分钟
+            return
+        while True:
+            if not self._started:
+                return
+            try:
+                self._clean_expired_msg_once()
+            except Exception as e:  # noqa: BLE001
+                # Java 的调度壳子 catch (Throwable)（:77-81）：单轮清扫出错不能打死调度
+                logger.error("scheduleAtFixedRate cleanExpireMsg exception: %s", e)
+            if self._stop.wait(period):            # Java 周期 = consumeTimeout 分钟
+                return
+
+    def _clean_expired_msg_once(self) -> None:
+        """对应 Java ``cleanExpireMsg()``（:192-200）：遍历当前持有的队列逐个清扫。"""
+        with self._lock:
+            keys = list(self._mq_map.keys())
+        for key in keys:
+            self._clean_expired_queue(key)
+
+    def _clean_expired_queue(self, key: str) -> None:
+        """对应 Java ``ProcessQueue.cleanExpiredMsg``（:80-127），逐句转写。
+
+        语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
+        """
+        if self._is_orderly():
+            # Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+            return
+        with self._lock:
+            loop = min(len(self._process_queue_entries_locked(key)), 16)  # Java:80
+        for _ in range(loop):
+            msg = None
+            with self._lock:
+                first = self._process_queue_first_entry_locked(key)
+                if first is not None:
+                    stamp = MessageAccessor.get_consume_start_timestamp(first)
+                    # Java:87-90 —— 没盖过章（还没进过 listener 的缓冲消息）直接当成未过期；
+                    # 过期判据是**严格**大于（等于阈值不动手）
+                    if stamp and (time.time() * 1000 - float(stamp)) > self.consume_timeout * 60 * 1000:
+                        msg = first
+            if msg is None:
+                break                          # Java:97-99 —— 队首没过期，后面的更不可能过期
+            try:
+                self.send_message_back(msg, 3)  # Java:103 —— delayLevel 固定 3
+            except Exception as e:  # noqa: BLE001
+                # Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
+                # 再试；绝不摘除（摘了就真丢了）
+                logger.error("send expired msg exception: %s", e)
+                continue
+            logger.info("send expire msg back. topic=%s, msgId=%s, storeHost=%s, "
+                        "queueId=%s, queueOffset=%s",
+                        msg.topic, msg.msg_id, msg.get_store_host_string(),
+                        msg.queue_id, msg.queue_offset)
+            with self._lock:
+                # Java:106-115 —— 只有它**仍是**队首时才摘除：listener 恰好在此期间正常
+                # 收尾（或前面冒出了更小的位点）就让位给正常路径，别抢
+                if self._process_queue_first_entry_locked(key) is msg:
+                    self._remove_process_queue_entry_locked(key, msg)
+
     def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
                        epoch: Optional[int] = None) -> bool:
         """消费一个批次并处理回投/挂起。返回消费位点是否前进。
@@ -2868,6 +3020,24 @@ class DefaultMQPushConsumer:
             time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
             return False
         # ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
+        # 登记在途消息：Java 并发路径下消息被 ConsumeRequest 持有期间**仍留在**
+        # ProcessQueue.msgTreeMap 里（直到 processConsumeResult 的 removeMessage），
+        # cleanExpiredMsg 的"队首"清扫与 containsMessage 判据都看它。顺序路径相反
+        # （takeMessages 把它们挪进 consumingMsgOrderlyTreeMap，清扫对顺序直接早退），
+        # 所以只登记并发批次。
+        with self._lock:
+            self._inflight_msgs.setdefault(key, []).extend(batch)
+        try:
+            return self._consume_concurrent_batch(key, mq, batch, epoch, listener, broadcast)
+        finally:
+            # 正常收尾（含回投失败回塞、被清扫摘除）后这批不再"在 listener 手里"；
+            # 被清扫/回塞提前摘过的条目在这里是幂等的。
+            with self._lock:
+                self._deregister_inflight_locked(key, batch)
+
+    def _consume_concurrent_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
+                                  epoch: Optional[int], listener, broadcast: bool) -> bool:
+        """并发消费一个批次（对应 Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）。"""
         context = ConsumeConcurrentlyContext(mq)
         hook_ctx = None
         if self.consume_message_hook_list:
@@ -2878,6 +3048,10 @@ class DefaultMQPushConsumer:
         begin_ms = time.time() * 1000
         has_exception = False
         try:
+            # Java:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME，每次投递
+            # （含重试）重新盖。cleanExpiredMsg 的挂起逃生口靠它判"这条在手里挂了多久"。
+            for m in batch:
+                MessageAccessor.set_consume_start_timestamp(m, int(time.time() * 1000))
             status = listener.consume_message(batch, context)
         except Exception as e:  # noqa: BLE001
             # Java：消费抛异常按 RECONSUME_LATER 处理
@@ -2925,7 +3099,7 @@ class DefaultMQPushConsumer:
             return True
         # 集群模式：未认可的 [ack_index+1, size) 逐条回投 %RETRY%topic（延迟梯度
         # 3+reconsumeTimes；超过 maxReconsumeTimes 由 broker 自动转 %DLQ%）
-        msg_back_failed = self._send_back_batch(batch[ack_index + 1:], context)
+        msg_back_failed = self._send_back_batch(key, batch[ack_index + 1:], context)
         # Java:256-260 —— 回投失败的那几条从本批摘掉后 submitConsumeRequestLater 重投，
         # 这里等价地塞回队首稍后再消费
         if msg_back_failed:
@@ -2944,7 +3118,7 @@ class DefaultMQPushConsumer:
             epoch=epoch)
         return not msg_back_failed
 
-    def _send_back_batch(self, batch: List[MessageExt],
+    def _send_back_batch(self, key: str, batch: List[MessageExt],
                          context: ConsumeConcurrentlyContext) -> List[MessageExt]:
         """把未认可的条目逐条回投 broker，返回回投失败的那些。
 
@@ -2954,6 +3128,15 @@ class DefaultMQPushConsumer:
         """
         failed: List[MessageExt] = []
         for msg in batch:
+            with self._lock:
+                present = self._process_queue_contains_locked(key, msg)
+            if not present:
+                # Java:243-248 —— 已被 cleanExpiredMsg 清扫（或队列已撤销）的条目跳过
+                # 回投：它已经在回 broker 的路上了，再发一次就是重复消息
+                logger.info("Message is not found in its process queue; skip send-back-procedure, "
+                            "topic=%s, brokerName=%s, queueId=%s, queueOffset=%s",
+                            msg.topic, msg.broker_name, msg.queue_id, msg.queue_offset)
+                continue
             try:
                 # 重投次数在 MessageExt 线上格式第 13 字段（Java msg.getReconsumeTimes()），
                 # broker 重投时会 +1；不是 properties 键（Java 的 PROPERTY_RECONSUME_TIME

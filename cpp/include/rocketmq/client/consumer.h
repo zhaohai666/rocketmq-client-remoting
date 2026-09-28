@@ -330,8 +330,10 @@ public:
     // SubAfter 是否补 timestamp + groupName 两段由此决定（CLOUD 不补，Java 默认 LOCAL）
     void setAccessChannel(AccessChannel ch) { accessChannel_ = ch; }
     AccessChannel accessChannel() const { return accessChannel_; }
-    // 单批消费超时（分钟），用于 ConsumeReturnType.TIME_OUT 判定（Java 默认 15）
+    // 单批消费超时（分钟），用于 ConsumeReturnType.TIME_OUT 判定（Java 默认 15）；
+    // cleanExpiredMsg 的扫除阈值与周期也读它（Java 两处都调 getConsumeTimeout()）。
     void setConsumeTimeout(int32_t minutes) { consumeTimeoutMinutes_ = minutes; }
+    int32_t consumeTimeoutMinutes() const { return consumeTimeoutMinutes_; }
 
     void registerConsumeMessageHook(std::shared_ptr<ConsumeMessageHook> hook) {
         if (hook) consumeMessageHookList_.push_back(std::move(hook));
@@ -491,6 +493,42 @@ public:
     // allowToUpdate=false）：冻结期间 ack 与空应答修正都不许改它。
     bool offsetFrozen(const std::string& key) const;
 
+    // ---- cleanExpiredMsg（Java ConsumeMessageConcurrentlyService:68-88/192-200
+    //      ＋ ProcessQueue.cleanExpiredMsg:75-127）----
+    // listener 卡死不返回时唯一的回收路径：把在手里超过 consumeTimeout 分钟的消息发回
+    // broker（delayLevel 固定 3）走 %RETRY% 重投。少了它，一条卡住的消息让该队列位点
+    // 永久停在原地，且没有任何异常、日志或超时可见 —— 真机上只能靠"消息发了却永远不来
+    // 第二次"这种间接现象暴露。选条/摘除/上限三件事全都"错了很安静"，所以整体开放给
+    // 离线单测（真机窗口是分钟级，秒级只能靠假时刻）。
+    // Java:87-90 的过期判据本体：没盖过 CONSUME_START_TIME（空串）→ 不算过期；否则
+    // nowMs - 盖章时刻 > consumeTimeout*60*1000（**严格大于**）。nowMs 显式传入：真机
+    // 路径传 currentTimeMillis()，离线用例用假时钟把边界钉死。
+    // ⚠ 盖章不是数字时 std::stoll 会抛（Java 是 NumberFormatException，由
+    // cleanExpireMsg 的调度壳子 catch(Throwable) 接住）——调用方不得吞掉这个语义。
+    static bool isConsumeExpired(const MessageExt& msg, int32_t consumeTimeoutMinutes, int64_t nowMs);
+    // 一个队列的一轮清扫（Java ProcessQueue.cleanExpiredMsg）；顺序消费直接返回 0。
+    // 返回**本轮实际发起回投的条数**（Java 无返回值：与 updateCorePoolSize 同一口径，
+    // 只用于单测断言 16 条上限与选条顺序）。
+    int32_t cleanExpiredQueue(const std::string& key, int64_t nowMs);
+    // 清扫一遍**当前持有**的队列（Java cleanExpireMsg():192-200 遍历 processQueueTable）。
+    int32_t cleanExpiredMsgOnce(int64_t nowMs);
+    // Java:106-115 —— 回投成功后，只有它**仍是**队首（最小 queueOffset 还是它）时才摘除：
+    // listener 恰好在此期间正常收尾（或前面冒出了更小的位点）就让位给正常路径。
+    void removeExpiredEntryIfStillHead(const std::string& key, const MessageExt& msg);
+    // 「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java ProcessQueue.msgTreeMap。
+    std::vector<MessageExt> processQueueEntries(const std::string& key) const;
+    // 队首 = 最小 queueOffset 的那条（Java msgTreeMap.firstEntry()）。
+    std::optional<MessageExt> processQueueHead(const std::string& key) const;
+    // Java ProcessQueue.containsMessage:341-357 —— **按 queueOffset**（不是对象身份）判断
+    // 这条消息还挂在队列上：listener 返回后的回投要跳过已被清扫回投的条目，否则投两次。
+    bool processQueueContains(const std::string& key, const MessageExt& msg) const;
+    // 预置某队列的「在途」登记（Java ProcessQueue 里已分发给 listener 的那部分），
+    // 与 setPendingMessages 同一用途：离线驱动清扫而不用真起分发线程。
+    void setInflightMessages(const std::string& key, const std::vector<MessageExt>& msgs);
+    // Java 的调度口径：initialDelay == period == consumeTimeout 分钟（默认 15 → 900000ms，
+    // ConsumeMessageConcurrentlyService:70-81 的 scheduleAtFixedRate 两个参数同源）。
+    static int64_t cleanExpirePeriodMillis(int32_t consumeTimeoutMinutes);
+
     // ---- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）----
     // 上游 5.5.0：请求去重入队后 run() 拿到队列锁就返回（POPTODO，
     // DefaultMQPushConsumerImpl:533）——消息**不消费、不 ack**，invisibleTime 到期由
@@ -558,7 +596,27 @@ private:
     //（Java :251 —— broker 那边没记上这次数，客户端不补就永远进不了 DLQ）；
     // 调用方据此把尾巴塞回队首并钳住位点。
     std::vector<std::pair<size_t, MessageExt>> sendBackBatch(
-        const std::vector<MessageExt>& batch, const ConsumeConcurrentlyContext& ctx, size_t base);
+        const std::string& key, const std::vector<MessageExt>& batch,
+        const ConsumeConcurrentlyContext& ctx, size_t base);
+    // 并发消费一个批次（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run 的
+    // 监听器/回投/位点段）。抽出来只为在 consumeBatch 里用 RAII 把「登记在途 → 消费 →
+    // 注销在途」围起来：中途任何一条 return 都必须注销，漏了登记表就再也摘不干净。
+    // epoch 原样透传给位点推进（ack 作废判据，见 advanceConsumeOffset）。
+    bool consumeConcurrentBatch(const std::string& key, const MessageQueue& mq,
+                                std::vector<MessageExt>& restored, bool broadcast,
+                                const std::optional<uint64_t>& epoch);
+    // cleanExpiredMsg 的调度循环（Java scheduleAtFixedRate(cleanExpireMsg,
+    // consumeTimeout, consumeTimeout, MINUTES)）。
+    void cleanExpiredMsgLoop();
+    // 「在途」登记的加/解锁（须与 pending_ 同一把 lock_：并集视图必须原子读）。
+    void registerInflight(const std::string& key, const std::vector<MessageExt>& msgs);
+    void deregisterInflight(const std::string& key, const std::vector<MessageExt>& msgs);
+    std::vector<MessageExt> processQueueEntriesLocked(const std::string& key) const;
+    std::optional<MessageExt> processQueueHeadLocked(const std::string& key) const;
+    bool processQueueContainsLocked(const std::string& key, const MessageExt& msg) const;
+    // 按 queueOffset 摘除一条（inflight 与 pending 两边都摘：回投失败塞回缓冲的那一瞬
+    // 两边都在，只摘一边会让下轮清扫再看见它）。
+    void removeProcessQueueEntryLocked(const std::string& key, const MessageExt& msg);
     // 推进位点到 batch 中最大 queueOffset+1；floor 非空时不越过它
     //（对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时，
     //  提交位点只能是 firstKey，否则会静默丢掉那条）。空批次直接返回。
@@ -766,6 +824,10 @@ private:
     std::map<std::string, MessageQueue> mqMap_;
     // 已拉未消费缓冲（Java ProcessQueue 的简化版）
     std::map<std::string, std::deque<MessageExt>> pending_;
+    // 在途批次的**消息本体**（Java ProcessQueue.msgTreeMap 里已分发给 listener、还没 ack
+    // 的那部分）。pending_（已拉未分发）∪ 它 = Java 的 msgTreeMap：cleanExpiredMsg 的
+    // 「只看队首」清扫与回投前的 containsMessage 判据都看这个并集。
+    std::map<std::string, std::vector<MessageExt>> inflightMsgs_;
     // 在途批次计数（Java ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
     // dispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。pending_ 与它合起来才是
     // Java 的 ProcessQueue.getMsgCount()，correctTagsOffsetLocked 的闸门两个都要看。
@@ -802,6 +864,9 @@ private:
     std::thread persistThread_;
     std::thread lockThread_;
     std::thread rebalanceThread_;
+    // cleanExpiredMsg 的清扫线程（Java ConsumeMessageConcurrentlyService 的
+    // cleanExpireMsgExecutors 单线程调度；顺序/POP 不建）。
+    std::thread cleanExpireThread_;
     // 真实 rebalance 计算出的本实例队列集（对应 Java ProcessQueueTable 的键集）。
     // 取代旧实现里「订阅 topic 的全部队列」，避免同组多实例重复消费。
     std::vector<MessageQueue> assignedQueues_;

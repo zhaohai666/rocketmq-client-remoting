@@ -92,7 +92,14 @@ public class ConsumeAckIndexTests
                         bool @throw = false)
         {
             _consumer.SetMessageListener(new AckListener(status, ackIndex, @throw));
-            return _consumer.ConsumeBatchForTest(_key, Queue0(), batch);
+            // 走真机路径的形状：先入缓冲 → dispatchLoop 取批（取走与登记在途同一临界区）
+            // → 消费。少了「取批」这一步，这些批次对回投的 containsMessage 闸门
+            //（Java ConsumeMessageConcurrentlyService:243-248）就是「已被 cleanExpiredMsg
+            // 清扫」的样子，整批回投会被跳过 —— 真机上 batch 一定来自这次取批。
+            _consumer.ConsumeMessageBatchMaxSize = Math.Max(1, batch.Count);
+            _consumer.SetPendingForTest(_key, new List<MessageExt>(batch));
+            List<MessageExt> taken = _consumer.TakeBatchForConsume(_key, out long epoch);
+            return _consumer.ConsumeBatchForTest(_key, Queue0(), taken, epoch);
         }
 
         public void RegisterHook(IConsumeMessageHook hook) => _consumer.RegisterConsumeMessageHook(hook);

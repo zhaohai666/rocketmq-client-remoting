@@ -492,6 +492,11 @@ public sealed class DefaultMQPushConsumer
     // DispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。_pending 与它合起来才是
     // Java 的 ProcessQueue.GetMsgCount()，CorrectTagsOffsetLocked 的闸门两个都要看。
     private readonly Dictionary<string, int> _inFlight = new(StringComparer.Ordinal);
+    // 「在途」批次的消息本体：Java 并发路径下消息被 ConsumeRequest 持有期间**仍留在**
+    // ProcessQueue.msgTreeMap 里，直到 processConsumeResult 的 removeMessage —— cleanExpiredMsg
+    // 的"队首"清扫与 containsMessage 判据都看它。_inFlight 只记条数（correctTagsOffset 闸门），
+    // 这里记本体；两者在 _lock 下同增同减。身份用引用（批次与登记共用同一批对象）。
+    private readonly Dictionary<string, List<MessageExt>> _inFlightMsgs = new(StringComparer.Ordinal);
     // Start() 时刻（307 应答 PROP_CONSUMER_START_TIMESTAMP，对应 Java consumerStartTimestamp）
     private long _startTimestamp;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
@@ -509,6 +514,9 @@ public sealed class DefaultMQPushConsumer
     private Thread? _persistThread;
     private Thread? _lockThread;
     private Thread? _rebalanceThread;
+    // 挂起 listener 的清扫调度（Java ConsumeMessageConcurrentlyService:68-88 的
+    // scheduleAtFixedRate(cleanExpireMsg, ...)）；顺序消费与 POP 没有这条调度
+    private Thread? _cleanExpireThread;
     private readonly Dictionary<string, Thread> _pullThreads = new(StringComparer.Ordinal);
     // 队列 key -> 最近一次**发起**拉取/弹出的时刻（毫秒）。对齐 Java
     // ProcessQueue.lastPullTimestamp / PopProcessQueue.lastPopTimestamp：rebalance 用它判
@@ -1250,6 +1258,17 @@ public sealed class DefaultMQPushConsumer
         _rebalanceThread = MakeThread("RebalanceThread", RebalanceLoop);
         _rebalanceThread.Start();
 
+        // 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
+        // ConsumeMessageConcurrentlyService 的构造/start 里（:68-88），顺序消费的
+        // ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
+        // ConsumeMessagePopConcurrentlyService 没有对应的调度。
+        if (!IsOrderly() && !PopMode)
+        {
+            _cleanExpireThread = MakeThread("CleanExpireMsgScheduledThread_" + ConsumerGroup,
+                                            CleanExpiredMsgLoop);
+            _cleanExpireThread.Start();
+        }
+
         string topics = string.Empty;
         foreach (string t in SubscribedTopics())
         {
@@ -1666,6 +1685,9 @@ public sealed class DefaultMQPushConsumer
         _offsetTable.Remove(key);
         _lockOk.Remove(key);
         _mqMap.Remove(key);
+        // 在途登记一并作废：队列已从 ProcessQueueTable 摘除（Java cleanExpireMsg:192-200
+        // 只遍历它），旧批次的引用不该继续留在清扫视图里
+        _inFlightMsgs.Remove(key);
         // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java setDropped(true)）；冻结标记**保留**到
         // 队列重建为止（RebalancePullThreads 解冻），避免纠错后的位点被旧 ack 覆盖。
         _queueEpoch.TryGetValue(key, out long epoch);
@@ -3165,6 +3187,14 @@ public sealed class DefaultMQPushConsumer
         }
 
         long popBegin = UtilAll.CurrentTimeMillis();
+        // Java ConsumeMessagePopConcurrentlyService:379-385 —— POP 路径同样在交给 listener
+        // 之前盖章（POP 没有清扫调度，这里只为 listener/轨迹可见性与其余三端一致）
+        string popStamp = popBegin.ToString(CultureInfo.InvariantCulture);
+        foreach (MessageExt m in msgs)
+        {
+            m.PutProperty(MessageConst.PropertyConsumeStartTimestamp, popStamp);
+        }
+
         bool popHasException = false;
         ConsumeConcurrentlyStatus status = ConsumeConcurrentlyStatus.ReconsumeLater;
         try
@@ -3428,7 +3458,7 @@ public sealed class DefaultMQPushConsumer
                 }
                 finally
                 {
-                    FinishBatchConsume(key);
+                    FinishBatchConsume(key, batch);
                 }
             }
 
@@ -3491,6 +3521,47 @@ public sealed class DefaultMQPushConsumer
             return _pending.TryGetValue(key, out Queue<MessageExt>? q) ? q.ToList() : new List<MessageExt>();
         }
     }
+
+    /// <summary>「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java
+    /// ProcessQueue.msgTreeMap；单测/真机验证断言清扫前后的在册状态用。</summary>
+    public List<MessageExt> ProcessQueueEntriesForTest(string key)
+    {
+        lock (_lock)
+        {
+            return ProcessQueueEntriesLocked(key);
+        }
+    }
+
+    /// <summary>单测入口：清理一条队列的过期队首，返回本轮发起回投的次数（见 CleanExpiredQueue）。</summary>
+    public int CleanExpiredQueueForTest(string key) => CleanExpiredQueue(key);
+
+    /// <summary>单测入口：清扫一遍当前持有的队列（见 CleanExpiredMsgOnce）。</summary>
+    public int CleanExpiredMsgOnceForTest() => CleanExpiredMsgOnce();
+
+    /// <summary>单测入口：清扫周期毫秒数（initialDelay == period，见 CleanExpirePeriodMillis）。</summary>
+    public long CleanExpirePeriodMillisForTest() => CleanExpirePeriodMillis();
+
+    /// <summary>单测入口：把某条消息从「在册」视图里摘掉（模拟 cleanExpiredMsg 已把它
+    /// 回投并摘除），用于断言回投会跳过已被清扫的条目（Java processConsumeResult:243-248）。</summary>
+    public void RemoveProcessQueueEntryForTest(string key, MessageExt msg)
+    {
+        lock (_lock)
+        {
+            RemoveProcessQueueEntryLocked(key, msg);
+        }
+    }
+
+    /// <summary>单测入口：过期判据（见 IsConsumeExpired）。now 由调用方给，才能确定性地
+    /// 锁死「恰好等于阈值不动手」这条边界（内部取时钟会差几毫秒）。</summary>
+    public static bool IsConsumeExpiredForTest(long? stamp, long nowMs, int consumeTimeoutMinutes)
+        => IsConsumeExpired(stamp, nowMs, consumeTimeoutMinutes);
+
+    /// <summary>单测入口：CONSUME_START_TIME 的解析（见 ConsumeStartTimestamp）。</summary>
+    public static long? ConsumeStartTimestampForTest(MessageExt msg) => ConsumeStartTimestamp(msg);
+
+    /// <summary>单测入口：回投成功后的「仍是队首才摘」（见 RemoveExpiredEntryIfStillHead）。</summary>
+    public bool RemoveExpiredEntryIfStillHeadForTest(string key, MessageExt msg)
+        => RemoveExpiredEntryIfStillHead(key, msg);
 
     /// <summary>预置某队列的「已分配队列」登记（Java ProcessQueueTable 的键值）。topic 级
     /// 阈值要靠这张表把同 topic 的兄弟队列聚合起来，不登记就等于队列已被 rebalance 撤走。</summary>
@@ -3745,6 +3816,15 @@ public sealed class DefaultMQPushConsumer
         }
 
         long beginMs = UtilAll.CurrentTimeMillis();
+        // Java ConsumeRequest.run:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME：
+        // cleanExpiredMsg:88 的过期判据读它（StringUtils.isNotEmpty 短路，没盖章的不清扫），
+        // 盖晚了清扫永远看不见在途批次
+        string stampText = beginMs.ToString(CultureInfo.InvariantCulture);
+        foreach (MessageExt m in batch)
+        {
+            m.PutProperty(MessageConst.PropertyConsumeStartTimestamp, stampText);
+        }
+
         bool hasException = false;
         ConsumeConcurrentlyStatus cstatus;
         try
@@ -3868,9 +3948,24 @@ public sealed class DefaultMQPushConsumer
         ConsumeConcurrentlyContext ctx, int @base)
     {
         var failed = new List<(int, MessageExt)>();
+        string key = OffsetKey(ctx.MessageQueue);
         for (int i = @base; i < batch.Count; ++i)
         {
             MessageExt msg = batch[i];
+            // Java processConsumeResult:243-248 —— 已被 cleanExpiredMsg 清扫（或队列已撤销）
+            // 的条目**跳过回投**：它已经在回 broker 的路上，再发一次就是重复消息
+            lock (_lock)
+            {
+                if (!ProcessQueueContainsLocked(key, msg))
+                {
+                    ClientLog.Info("Message is not found in its process queue; skip send-back-procedure, topic="
+                        + msg.Topic + ", brokerName=" + msg.BrokerName + ", queueId="
+                        + msg.QueueId.ToString(CultureInfo.InvariantCulture) + ", queueOffset="
+                        + msg.QueueOffset.ToString(CultureInfo.InvariantCulture));
+                    continue;
+                }
+            }
+
             try
             {
                 // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
@@ -3893,6 +3988,259 @@ public sealed class DefaultMQPushConsumer
         }
 
         return failed;
+    }
+
+    // ---------------- cleanExpiredMsg（挂起 listener 的逃生口） ----------------
+    //
+    // 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:192-200 清扫入口）
+    // ＋ ProcessQueue.cleanExpiredMsg（:75-127）。三条「错了很安静」的语义在这里钉死：
+    //   1. **只看队首**（最小位点）：队首不过期就整条队列都不动手（Java:97-99 的 break）；
+    //   2. **严格大于** consumeTimeout：等于阈值不碰；没盖章的不当过期；
+    //   3. **单轮上限 16**，且 loop 在循环之前算一次（Java:80）——写松了会把整条队列
+    //      一次性全清空，位点/重投节奏全乱。
+    // 离线能锁死的只有「判定」与「回投失败后原地保留」两条分支（未 start 的消费者
+    // 回投必定失败）；真机链路（挂起 → 清扫 → %RETRY% 重投到达）见
+    // examples/RocketMQ.Examples/LiveCleanExpiredMsg.cs。
+
+    /// <summary>Java ProcessQueue.cleanExpiredMsg:88 的过期判据：**严格**大于阈值；
+    /// 没有戳（null）不当过期（Java 的 StringUtils.isNotEmpty 短路）。</summary>
+    private static bool IsConsumeExpired(long? stamp, long nowMs, int consumeTimeoutMinutes) =>
+        stamp.HasValue && nowMs - stamp.Value > (long)consumeTimeoutMinutes * 60_000L;
+
+    /// <summary>Java ConsumeRequest.run:366-370 盖章的解析：空串/坏值一律按「没盖过章」。</summary>
+    private static long? ConsumeStartTimestamp(MessageExt msg)
+    {
+        string? raw = msg.GetProperty(MessageConst.PropertyConsumeStartTimestamp);
+        if (string.IsNullOrEmpty(raw))
+        {
+            return null;
+        }
+
+        return long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v) ? v : null;
+    }
+
+    /// <summary>Java scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)：
+    /// initialDelay 与 period 同值，都是 consumeTimeout 分钟。0/负值钳到 1 分钟避免忙等
+    /// （Python/Rust/C++ 同口径）。</summary>
+    private long CleanExpirePeriodMillis() => Math.Max(1, ConsumeTimeout) * 60_000L;
+
+    /// <summary>「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java
+    /// ProcessQueue.msgTreeMap。须持锁调用；按引用去重只为防御未来新调用点写出重叠。</summary>
+    private List<MessageExt> ProcessQueueEntriesLocked(string key)
+    {
+        var outList = new List<MessageExt>();
+        var seen = new HashSet<MessageExt>();
+        if (_inFlightMsgs.TryGetValue(key, out List<MessageExt>? inflight))
+        {
+            foreach (MessageExt m in inflight)
+            {
+                if (seen.Add(m))
+                {
+                    outList.Add(m);
+                }
+            }
+        }
+
+        if (_pending.TryGetValue(key, out Queue<MessageExt>? q))
+        {
+            foreach (MessageExt m in q)
+            {
+                if (seen.Add(m))
+                {
+                    outList.Add(m);
+                }
+            }
+        }
+
+        return outList;
+    }
+
+    /// <summary>队首 = 最小 queueOffset 的那条（Java msgTreeMap.firstEntry()）。须持锁调用。</summary>
+    private MessageExt? ProcessQueueFirstEntryLocked(string key)
+    {
+        MessageExt? head = null;
+        foreach (MessageExt m in ProcessQueueEntriesLocked(key))
+        {
+            if (head is null || m.QueueOffset < head.QueueOffset)
+            {
+                head = m;
+            }
+        }
+
+        return head;
+    }
+
+    /// <summary>Java ProcessQueue.containsMessage(:341-357)：这条消息还挂在队列上吗。
+    /// 被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上），回投要跳过它。</summary>
+    private bool ProcessQueueContainsLocked(string key, MessageExt msg)
+    {
+        if (_inFlightMsgs.TryGetValue(key, out List<MessageExt>? inflight)
+            && inflight.Exists(m => ReferenceEquals(m, msg)))
+        {
+            return true;
+        }
+
+        return _pending.TryGetValue(key, out Queue<MessageExt>? q)
+            && q.Contains(msg);
+    }
+
+    /// <summary>摘除刚清扫过的那条（调用方已确认它就是队首）。须持锁调用。</summary>
+    private void RemoveProcessQueueEntryLocked(string key, MessageExt msg)
+    {
+        if (_inFlightMsgs.TryGetValue(key, out List<MessageExt>? inflight))
+        {
+            inflight.RemoveAll(m => ReferenceEquals(m, msg));
+            if (inflight.Count == 0)
+            {
+                _inFlightMsgs.Remove(key);
+            }
+        }
+
+        // Queue<T> 无按下标删除：重组（批次很小，开销可忽略）
+        if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
+        {
+            var kept = new Queue<MessageExt>(q.Count);
+            bool removed = false;
+            foreach (MessageExt m in q)
+            {
+                if (!removed && ReferenceEquals(m, msg))
+                {
+                    removed = true;
+                    continue;
+                }
+
+                kept.Enqueue(m);
+            }
+
+            if (removed)
+            {
+                _pending[key] = kept;
+            }
+        }
+    }
+
+    /// <summary>Java:106-115 —— 回投成功后，只有它**仍是**队首（最小位点还是它）时才摘除：
+    /// listener 恰好在此期间正常收尾（或前面冒出了更小的位点）就让位给正常路径，别抢。</summary>
+    private bool RemoveExpiredEntryIfStillHead(string key, MessageExt msg)
+    {
+        lock (_lock)
+        {
+            MessageExt? head = ProcessQueueFirstEntryLocked(key);
+            if (head is null || head.QueueOffset != msg.QueueOffset)
+            {
+                return false;
+            }
+
+            RemoveProcessQueueEntryLocked(key, msg);
+            return true;
+        }
+    }
+
+    /// <summary>清理一条队列（Java ProcessQueue.cleanExpiredMsg:80-127），返回本轮实际发起
+    /// 回投的次数（单测取证「队首才动、失败重试同一条、单轮上限 16」用）。</summary>
+    private int CleanExpiredQueue(string key)
+    {
+        // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+        if (IsOrderly())
+        {
+            return 0;
+        }
+
+        int loop;
+        lock (_lock)
+        {
+            // Java:80 —— loop 在循环**之前**算一次（min(size, 16)）
+            loop = Math.Min(ProcessQueueEntriesLocked(key).Count, 16);
+        }
+
+        int attempts = 0;
+        for (int i = 0; i < loop; ++i)
+        {
+            MessageExt? head;
+            lock (_lock)
+            {
+                head = ProcessQueueFirstEntryLocked(key);
+            }
+
+            if (head is null)
+            {
+                break;   // Java NoSuchElementException 分支
+            }
+
+            // Java:87-90 —— 没盖过章的直接当成未过期；过期判据是**严格**大于
+            if (!IsConsumeExpired(ConsumeStartTimestamp(head), UtilAll.CurrentTimeMillis(), ConsumeTimeout))
+            {
+                break;   // Java:97-99 —— 队首没过期，后面的更不可能过期
+            }
+
+            attempts++;
+            try
+            {
+                // Java `pushConsumer.sendMessageBack(msg, 3)`：固定 delayLevel 3
+                SendMessageBack(head, 3);
+            }
+            catch (Exception e)
+            {
+                // Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
+                // 再试；绝不摘除（摘了就真丢了）
+                ClientLog.Error("send expired msg exception: " + e.Message);
+                continue;
+            }
+
+            ClientLog.Info("send expire msg back. topic=" + head.Topic + ", msgId=" + head.MsgId
+                + ", storeHost=" + head.StoreHost + ", queueId="
+                + head.QueueId.ToString(CultureInfo.InvariantCulture) + ", queueOffset="
+                + head.QueueOffset.ToString(CultureInfo.InvariantCulture));
+            RemoveExpiredEntryIfStillHead(key, head);
+        }
+
+        return attempts;
+    }
+
+    /// <summary>对应 Java cleanExpireMsg()（:192-200）：遍历当前持有的队列逐个清扫。
+    /// 任一条队列抛出异常与 Java 一样让整轮中止（调度壳子的 catch 兜住它，下一轮照常）。</summary>
+    private int CleanExpiredMsgOnce()
+    {
+        List<string> keys;
+        lock (_lock)
+        {
+            keys = new List<string>(_mqMap.Keys);
+        }
+
+        int attempts = 0;
+        foreach (string key in keys)
+        {
+            attempts += CleanExpiredQueue(key);
+        }
+
+        return attempts;
+    }
+
+    /// <summary>cleanExpiredMsg 的调度循环（Java scheduleAtFixedRate(cleanExpireMsg,
+    /// consumeTimeout, consumeTimeout, MINUTES)：initialDelay == period）。</summary>
+    private void CleanExpiredMsgLoop()
+    {
+        long period = CleanExpirePeriodMillis();
+        long next = Environment.TickCount64 + period;
+        while (!_stop)
+        {
+            if (!_started)
+            {
+                return;
+            }
+
+            Schedules.WaitUntil(_stopEvent, next);
+            next += period;
+            try
+            {
+                CleanExpiredMsgOnce();
+            }
+            catch (Exception e)
+            {
+                // Java:77-81 —— 整轮中止但调度照常（下一轮继续）
+                ClientLog.Error("cleanExpireMsg error: " + e.Message);
+            }
+        }
     }
 
     // ---------------- 顺序消费的重试计数与回投 ----------------
@@ -4323,6 +4671,14 @@ public sealed class DefaultMQPushConsumer
             {
                 _inFlight.TryGetValue(key, out int cur);
                 _inFlight[key] = cur + 1;
+                // 在途本体与计数同锁登记：cleanExpiredMsg 的在册视图（msgTreeMap）此刻就能看见它
+                if (!_inFlightMsgs.TryGetValue(key, out List<MessageExt>? bucket))
+                {
+                    bucket = new List<MessageExt>();
+                    _inFlightMsgs[key] = bucket;
+                }
+
+                bucket.AddRange(batch);
             }
         }
 
@@ -4333,8 +4689,10 @@ public sealed class DefaultMQPushConsumer
     private long QueueEpochLocked(string key) =>
         _queueEpoch.TryGetValue(key, out long epoch) ? epoch : 0;
 
-    /// <summary>「消费收尾 + 注销在途」：异常回塞路径同样要调，否则闸门永远关着。</summary>
-    public void FinishBatchConsume(string key)
+    /// <summary>「消费收尾 + 注销在途」：异常回塞路径同样要调，否则闸门永远关着。
+    /// <paramref name="batch"/> 给出时要连在途本体（<see cref="_inFlightMsgs"/>）一起摘除；
+    /// 被 cleanExpiredMsg 提前摘过的条目在这里是幂等的。</summary>
+    public void FinishBatchConsume(string key, List<MessageExt>? batch = null)
     {
         lock (_lock)
         {
@@ -4347,6 +4705,17 @@ public sealed class DefaultMQPushConsumer
                 else
                 {
                     _inFlight[key] = cur - 1;
+                }
+            }
+
+            if (batch is not null && _inFlightMsgs.TryGetValue(key, out List<MessageExt>? bucket))
+            {
+                // 引用相等（MessageExt 未重写 Equals）：批次与登记是同一批对象
+                var gone = new HashSet<MessageExt>(batch);
+                bucket.RemoveAll(m => gone.Contains(m));
+                if (bucket.Count == 0)
+                {
+                    _inFlightMsgs.Remove(key);
                 }
             }
         }

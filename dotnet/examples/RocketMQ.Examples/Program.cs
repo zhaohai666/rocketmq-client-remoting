@@ -63,6 +63,7 @@ internal static class Program
                 "offset-illegal" => LiveOffsetIllegal.Run(rest),
                 "reset-offset" => LiveResetOffset.Run(rest),
                 "publish-route-master" => LivePublishRouteMaster.Run(rest),
+                "clean-expired-msg" => LiveCleanExpiredMsg.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -122,6 +123,7 @@ internal static class Program
               reset-offset [namesrv]      真实集群 220 重置消费位点联调（broker 推 220 后立刻落盘 + 在途批次作废 + 队列按新位点重建）
               publish-route-master [namesrv] [master] [slave]
                                             发布路由跳过无 master 的 broker 联调（停一次 master：发布队列归零、订阅不变、仍能从从节点消费）
+              clean-expired-msg [namesrv] 真实集群 cleanExpiredMsg 挂起逃生口联调（挂住 listener 超时 → 清扫回投 → %RETRY% 重投到达；约 4 分钟）
             """);
     }
 }

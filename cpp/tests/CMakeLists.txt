@@ -302,3 +302,13 @@ add_test(NAME pull_consumer_heartbeat COMMAND rmq_test_pull_consumer_heartbeat)
 add_executable(rmq_test_publish_route_master test_publish_route_master.cpp)
 target_link_libraries(rmq_test_publish_route_master PRIVATE rocketmq::remoting)
 add_test(NAME publish_route_master COMMAND rmq_test_publish_route_master)
+
+# cleanExpiredMsg 挂起逃生口（Java ConsumeMessageConcurrentlyService:68-88/192-200 +
+# ProcessQueue.cleanExpiredMsg:75-127）：listener 卡死不返回时唯一的回收路径。离线锁
+# 「只看队首 / 严格大于阈值 / 单轮 16 条 / 回投失败留在原地 / 撤走的队列不再被扫」与
+# 消费路径的配合（在途登记、containsMessage 闸门、隔轮不泄漏）；
+# 「回投成功 → %RETRY% 重投 → reconsumeTimes=1 的第二次投递」只能在真机验
+#（examples/live_clean_expired_msg.cpp）。与 python/tests/test_clean_expired_msg.py 同题。
+add_executable(rmq_test_clean_expired_msg test_clean_expired_msg.cpp)
+target_link_libraries(rmq_test_clean_expired_msg PRIVATE rocketmq::remoting)
+add_test(NAME clean_expired_msg COMMAND rmq_test_clean_expired_msg)

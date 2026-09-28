@@ -141,3 +141,8 @@ target_link_libraries(rmq_live_pull_heartbeat PRIVATE rocketmq::remoting)
 # 发布路由跳过没有 master 的 broker 真机联调：停一次 master，发布队列归零/订阅不变/从节点收消息（不打进 ctest）
 add_executable(rmq_live_publish_route_master live_publish_route_master.cpp)
 target_link_libraries(rmq_live_publish_route_master PRIVATE rocketmq::remoting)
+
+# cleanExpiredMsg 挂起逃生口真机联调：listener 挂住 2 分钟 → 清扫回投 → %RETRY% 重投到达
+# （约 4 分钟，等两个清扫周期；不打进 ctest）
+add_executable(rmq_live_clean_expired_msg live_clean_expired_msg.cpp)
+target_link_libraries(rmq_live_clean_expired_msg PRIVATE rocketmq::remoting)
