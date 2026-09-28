@@ -1890,7 +1890,12 @@ impl DefaultMQProducer {
     ///
     /// 与 Java 逐条对齐：批量消息永不压缩；body 长度 >= 阈值才压；压缩失败**降级为
     /// 不压缩**（不让发送失败）；压缩后不比较体积。不压缩时返回 0。
-    fn try_to_compress_message(&self, msg: &mut Message) -> i32 {
+    ///
+    /// 第二个返回值是 Java `sendKernelImpl:930` 的 `prevBody`：压缩过就把**压缩前那份
+    /// body 原样挪出来**交给调用方（`Vec` 移动，不拷贝），发完必须用它 +
+    /// [`restore_caller_message`](Self::restore_caller_message) 换回去；没压缩则返回
+    /// `None`（body 未被改动，不需要还原）。
+    fn try_to_compress_message(&self, msg: &mut Message) -> (i32, Option<Vec<u8>>) {
         let (threshold, compress_type, level) = {
             let cfg = self
                 .inner
@@ -1905,29 +1910,53 @@ impl DefaultMQProducer {
         };
         let body = msg.get_body();
         if body.is_empty() || (body.len() as i32) < threshold {
-            return 0;
+            return (0, None);
         }
         let compressed = match compression::compress(body, compress_type, level) {
             Ok(c) => c,
             Err(e) => {
                 // 对齐 Java：压缩失败降级为不压缩
                 rmq_warn!("tryToCompressMessage failed, send uncompressed: {e}");
-                return 0;
+                return (0, None);
             }
         };
         if compressed.is_empty() {
-            return 0;
+            return (0, None);
         }
-        msg.set_body(Some(&compressed));
-        MessageSysFlag::set_compression_type(MessageSysFlag::COMPRESSED_FLAG, compress_type)
+        let prev_body = msg.body.take();
+        msg.body = Some(compressed);
+        (
+            MessageSysFlag::set_compression_type(MessageSysFlag::COMPRESSED_FLAG, compress_type),
+            prev_body,
+        )
+    }
+
+    /// Java `sendKernelImpl:1095-1096` 的 `finally`：把**调用方**那条消息换回压缩前的
+    /// body、并把 topic 上的命名空间剥掉。
+    ///
+    /// 不还原会坏在哪：压缩是就地换 body，调用方拿着同一个对象再发一次，第二次就把压缩流
+    /// 当原文又压一遍（zlib(zlib(x))），且长度已低于阈值、压缩标志也不会置位 —— broker 照存、
+    /// 消费者照收，业务侧解出来是乱码，全程零报错。
+    ///
+    /// topic 用 `without_namespace` 而不是"恢复进入时的字符串"—— Java 的 finally 就是
+    /// 这么写的：调用方自己传进来、本来就带前缀的 topic 同样会被剥掉。
+    /// `prev_body == None` 表示这一趟没压缩过（body 没被改），只剥 topic。
+    fn restore_caller_message(&self, msg: &mut Message, prev_body: Option<Vec<u8>>) {
+        if let Some(prev) = prev_body {
+            msg.body = Some(prev);
+        }
+        msg.topic = NamespaceUtil::without_namespace(&msg.topic, &self.inner.namespace());
     }
 
     /// 批量版本的压缩判定（Python 由 `isinstance(msg, MessageBatch)` 直接返回 0）。
+    ///
+    /// 批量**永不压缩**（`MessageBatch.encode()` 出来的拼接体不压），所以这里也不需要
+    /// `prevBody`：返回的 flag 恒 0，调用方没有要还原的 body。
     fn sys_flag_for(&self, msg: &mut PublishMessage<'_>) -> i32 {
         if msg.is_batch() {
             return 0;
         }
-        self.try_to_compress_message(msg.as_message_mut())
+        self.try_to_compress_message(msg.as_message_mut()).0
     }
 
     /// Python `_with_namespace`：给 topic 拼上命名空间前缀
@@ -2396,14 +2425,21 @@ impl DefaultMQProducer {
         // 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
         // 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
         // 消费端只解一层就拿到压缩流。这里避免该问题。
-        let sys_flag = self.try_to_compress_message(msg);
+        let (sys_flag, prev_body) = self.try_to_compress_message(msg);
 
-        let mut publish = PublishMessage::Single(msg);
-        if let Some(mq) = mq {
-            return self.send_pinned(&client, &mut publish, mq, timeout, sys_flag).await;
-        }
-        self.send_with_retry(&client, &mut publish, timeout, retry_times, sys_flag)
-            .await
+        let outcome = {
+            let mut publish = PublishMessage::Single(msg);
+            if let Some(mq) = mq {
+                self.send_pinned(&client, &mut publish, mq, timeout, sys_flag)
+                    .await
+            } else {
+                self.send_with_retry(&client, &mut publish, timeout, retry_times, sys_flag)
+                    .await
+            }
+        };
+        // 借期在块尾结束才能再动 msg（Java 的 finally 与 `sendKernelImpl` 的局部变量同域）。
+        self.restore_caller_message(msg, prev_body);
+        outcome
     }
 
     /// Java `DefaultMQProducerImpl.send(msg, mq, timeout)` → `sendKernelImpl`：调用方
@@ -2835,7 +2871,9 @@ impl DefaultMQProducer {
         let wrapped = self.with_namespace(&msg.topic);
         msg.topic = wrapped.clone();
         self.check_message(msg)?;
-        let sys_flag = self.try_to_compress_message(msg);
+        // 路由/地址解析放在压缩**之前**（Java：sendOneway 先 tryToFindTopicPublishInfo，
+        // 地址在 sendKernelImpl 开头、prevBody 之前）—— 这两步失败时消息还没被改过，
+        // 不必还原，与 Java 落点一致。
         let mq_sel = match mq {
             Some(mq) => mq.clone(),
             None => {
@@ -2848,23 +2886,31 @@ impl DefaultMQProducer {
             }
         };
         let addr = self.need_addr(&client, &mq_sel)?;
-        if self.has_check_forbidden_hook() {
-            // Java sendOneway 同样走 sendKernelImpl → 拦截钩子照跑（communicationMode=ONEWAY）
-            self.execute_check_forbidden(msg, &mq_sel, &addr, None, CommunicationMode::Oneway)?;
+        let (sys_flag, prev_body) = self.try_to_compress_message(msg);
+        // 一段与 Java `sendKernelImpl` 的 try 同域的代码：拦截钩子抛错也要还原，
+        // 所以它和发送一起进这个作用域。
+        let outcome = async {
+            if self.has_check_forbidden_hook() {
+                // Java sendOneway 同样走 sendKernelImpl → 拦截钩子照跑（communicationMode=ONEWAY）
+                self.execute_check_forbidden(msg, &mq_sel, &addr, None, CommunicationMode::Oneway)?;
+            }
+            let mut publish_msg = PublishMessage::Single(msg);
+            client
+                .send_message_oneway(
+                    &self.inner.producer_group(),
+                    &mut publish_msg,
+                    &mq_sel,
+                    &addr,
+                    sys_flag,
+                    self.inner.unit_mode(),
+                    &self.inner.create_topic_key(),
+                    self.inner.default_topic_queue_nums(),
+                )
+                .await
         }
-        let mut publish_msg = PublishMessage::Single(msg);
-        client
-            .send_message_oneway(
-                &self.inner.producer_group(),
-                &mut publish_msg,
-                &mq_sel,
-                &addr,
-                sys_flag,
-                self.inner.unit_mode(),
-                &self.inner.create_topic_key(),
-                self.inner.default_topic_queue_nums(),
-            )
-            .await
+        .await;
+        self.restore_caller_message(msg, prev_body);
+        outcome
     }
 
     /// Python `send_by_selector`（对应 Java `send(msg, selector, arg)`）。
@@ -2891,34 +2937,40 @@ impl DefaultMQProducer {
         let mq_sel = MessageQueue::new(&topic, &selected.broker_name, selected.queue_id);
         // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
         self.check_message(msg)?;
-        let sys_flag = self.try_to_compress_message(msg);
+        let (sys_flag, prev_body) = self.try_to_compress_message(msg);
         let holder: Option<AnyHolder> = Some(Arc::new(arg.to_string()));
-        if self.has_send_interceptors() {
-            // arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
-            return self
-                .send_with_hooks(
+        let outcome = {
+            let mut publish = PublishMessage::Single(msg);
+            if self.has_send_interceptors() {
+                // arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
+                self.send_with_hooks(
                     &client,
-                    &mut PublishMessage::Single(msg),
+                    &mut publish,
                     &mq_sel,
                     timeout,
                     sys_flag,
                     holder,
                     CommunicationMode::Sync,
                 )
-                .await;
-        }
-        client
-            .send_message(
-                &self.inner.producer_group(),
-                &mut PublishMessage::Single(msg),
-                &mq_sel,
-                timeout,
-                sys_flag,
-                self.inner.unit_mode(),
-                &self.inner.create_topic_key(),
-                self.inner.default_topic_queue_nums(),
-            )
-            .await
+                .await
+            } else {
+                client
+                    .send_message(
+                        &self.inner.producer_group(),
+                        &mut publish,
+                        &mq_sel,
+                        timeout,
+                        sys_flag,
+                        self.inner.unit_mode(),
+                        &self.inner.create_topic_key(),
+                        self.inner.default_topic_queue_nums(),
+                    )
+                    .await
+            }
+        };
+        // 借期在块尾结束才能再动 msg
+        self.restore_caller_message(msg, prev_body);
+        outcome
     }
 
     /// Python `send_async`（对应 Java `send(msg, callBack, timeout)`）。
@@ -3189,7 +3241,10 @@ impl DefaultMQProducer {
             return self.fail_async(&callback, e, permits);
         }
         // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍。
-        let sys_flag = self.try_to_compress_message(msg);
+        // 这里**不需要**还原句柄：异步入口把 `Message` 按值收走（调用方已经拿不到它），
+        // 没有"调用方那条消息"要还原 —— Java 之所以在 ASYNC 分支克隆+立刻还原，是因为
+        // 它后面还要把**同一个对象**交回调用方。
+        let (sys_flag, _prev_body) = self.try_to_compress_message(msg);
         let (mq_sel, publish) = match mq {
             // Java `send(msg, mq, cb, timeout)` → sendKernelImpl 定点发，传下去的
             // topicPublishInfo 是 null，所以失败只在**同一台 broker** 上换 opaque 重试。
@@ -3729,7 +3784,7 @@ impl DefaultMQProducer {
 
         // 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl），
         // 再叠加事务类型位（对应 Java L951-953 检测 TRAN_MSG 后置 TRANSACTION_PREPARED）
-        let mut sys_flag = self.try_to_compress_message(msg);
+        let (mut sys_flag, prev_body) = self.try_to_compress_message(msg);
         sys_flag = MessageSysFlag::reset_transaction_value(
             sys_flag,
             MessageSysFlag::TRANSACTION_PREPARED_TYPE,
@@ -3743,7 +3798,7 @@ impl DefaultMQProducer {
             .send_msg_timeout;
         // 事务发送同样走 sendKernelImpl（→ 同样触发发送钩子），所以开启轨迹后
         // 事务消息会先落一条 Pub（Trans_Msg_Half）轨迹
-        let send_result = self
+        let half_sent = self
             .send_with_hooks(
                 &client,
                 &mut PublishMessage::Single(msg),
@@ -3753,7 +3808,13 @@ impl DefaultMQProducer {
                 None,
                 CommunicationMode::Sync,
             )
-            .await
+            .await;
+        // Java 的 finally（`sendKernelImpl:1095-1096`）：**半消息发完**就还原，成功失败都还原。
+        // 下面的 `execute_local_transaction` 因此看到原始 body + 已剥命名空间的 topic，
+        // `end_transaction` 报的也是剥过的 topic —— Java 5.5.1 `endTransaction:1543` 用的
+        // 正是 `msg.getTopic()`（`queueWithNamespace` 只管定位 brokerName）。
+        self.restore_caller_message(msg, prev_body);
+        let send_result = half_sent
             .map_err(|e| Error::client(format!("send message Exception: {e}")))?;
 
         let mut state = LocalTransactionState::Unknow;
@@ -4346,6 +4407,14 @@ mod tests {
         DefaultMQProducer::new(group).expect("合法组名不该构造失败")
     }
 
+    /// 本生产者压缩时应置的 sysFlag 位（COMPRESSED_FLAG + 压缩类型，Python 同款判据）。
+    fn compression_flag(p: &DefaultMQProducer) -> i32 {
+        MessageSysFlag::set_compression_type(
+            MessageSysFlag::COMPRESSED_FLAG,
+            p.read_cfg(|c| c.compress_type),
+        )
+    }
+
     fn mq(broker: &str, queue_id: i32) -> MessageQueue {
         MessageQueue::new("T1", broker, queue_id)
     }
@@ -4574,21 +4643,69 @@ mod tests {
         p.set_compress_msg_body_over_howmuch(1024);
         let mut msg = Message::new("T1", Some(&[b'a'; 1023]));
         let before = msg.get_body().to_vec();
-        assert_eq!(p.try_to_compress_message(&mut msg), 0);
+        let (flag, prev) = p.try_to_compress_message(&mut msg);
+        assert_eq!(flag, 0);
+        assert!(prev.is_none(), "没压缩就不该交出 prevBody");
         assert_eq!(msg.get_body(), before.as_slice(), "未过阈值不该动正文");
 
         let mut big = Message::new("T1", Some(&[b'a'; 4096]));
-        let flag = p.try_to_compress_message(&mut big);
+        let (flag, prev) = p.try_to_compress_message(&mut big);
         assert_eq!(flag & MessageSysFlag::COMPRESSED_FLAG, MessageSysFlag::COMPRESSED_FLAG);
         assert_eq!(
             MessageSysFlag::get_compression_type(flag),
             MessageSysFlag::ZLIB_TYPE
         );
+        // 压缩前那份 body 原样交了出来（Java `sendKernelImpl:930` 的 prevBody），
+        // 发完由 restore_caller_message 换回去
+        assert_eq!(prev.as_deref(), Some(&[b'a'; 4096][..]));
         // 正文确实被换成了压缩流，且能原样解回
         let compressed = big.get_body().to_vec();
         assert_ne!(compressed, vec![b'a'; 4096]);
         let raw = compression::decompress(&compressed, MessageSysFlag::ZLIB_TYPE).unwrap();
         assert_eq!(raw, vec![b'a'; 4096]);
+    }
+
+    /// Java `sendKernelImpl` 的 finally：发完把 body 换回来。少了对同一个 Message
+    /// 连发两次就会把压缩流再压一遍 —— 第二次长度低于阈值、压缩标志也不置位，
+    /// 消费端只解一层拿到 zlib 裸流，发送/存储/消费全程零报错。
+    #[test]
+    fn restore_caller_message_prevents_double_compression() {
+        let p = producer("GID_restore");
+        p.set_compress_msg_body_over_howmuch(1024);
+        let mut msg = Message::new("T1", Some(&[b'a'; 4096]));
+
+        let (first_flag, prev) = p.try_to_compress_message(&mut msg);
+        assert_eq!(first_flag, compression_flag(&p));
+        let first_wire_body = msg.get_body().to_vec();
+        p.restore_caller_message(&mut msg, prev);
+        assert_eq!(msg.get_body(), &[b'a'; 4096][..], "还原后应等于发送前的正文");
+
+        // 再发一次：上线的仍是「原文压出来的那一串」
+        let (second_flag, prev) = p.try_to_compress_message(&mut msg);
+        assert_eq!(second_flag, compression_flag(&p));
+        assert_eq!(msg.get_body(), first_wire_body.as_slice());
+        p.restore_caller_message(&mut msg, prev);
+
+        // 负向对照：跳过还原，第二次压缩直接失效（这就是会被本测试抓住的回归形态）
+        let mut unguarded = Message::new("T1", Some(&[b'a'; 4096]));
+        let (_flag, prev) = p.try_to_compress_message(&mut unguarded);
+        drop(prev);
+        let (again_flag, _prev) = p.try_to_compress_message(&mut unguarded);
+        assert_eq!(again_flag, 0, "没有还原时第二次压缩必然失效");
+    }
+
+    /// 还原的 topic 半边：无论这趟压没压过 body，命名空间都要剥掉
+    /// （Java 的 finally 无条件执行 `withoutNamespace`）。
+    #[test]
+    fn restore_caller_message_strips_namespace_without_compression() {
+        let p = producer("GID_restore_ns");
+        p.set_namespace("ns1");
+        let mut msg = Message::new("ns1%T1", Some(b"x"));
+
+        p.restore_caller_message(&mut msg, None);
+
+        assert_eq!(msg.topic, "T1");
+        assert_eq!(msg.get_body(), b"x");
     }
 
     #[test]
@@ -4597,13 +4714,17 @@ mod tests {
         p.set_compress_msg_body_over_howmuch(1);
         // 空正文：即便阈值最低也不压（Python `if not body: return 0`）
         let mut empty = Message::new("T1", Some(b""));
-        assert_eq!(p.try_to_compress_message(&mut empty), 0);
+        let (flag, prev) = p.try_to_compress_message(&mut empty);
+        assert_eq!(flag, 0);
+        assert!(prev.is_none());
 
         // 不支持的算法：降级为不压缩，正文保持原样
         p.set_compress_type(9);
         let mut msg = Message::new("T1", Some(b"payload payload payload"));
         let before = msg.get_body().to_vec();
-        assert_eq!(p.try_to_compress_message(&mut msg), 0);
+        let (flag, prev) = p.try_to_compress_message(&mut msg);
+        assert_eq!(flag, 0);
+        assert!(prev.is_none(), "降级为不压缩时不应交出 prevBody");
         assert_eq!(msg.get_body(), before.as_slice());
     }
 

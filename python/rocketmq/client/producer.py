@@ -7,6 +7,7 @@ LocalTransactionState / TransactionListener 等。
 """
 from __future__ import annotations
 
+import functools
 import os
 import random
 import threading
@@ -58,6 +59,35 @@ from .trace_hook import EndTransactionTraceHook, SendMessageTraceHook
 from . import validators
 
 logger = get_logger()
+
+
+def _restores_caller_message(fn):
+    """发送结束后还原**调用方**那条 Message（Java ``sendKernelImpl:1095-1096`` 的 finally）：
+    body 换回压缩前那一份、topic 剥掉命名空间。
+
+    不还原会坏在哪：压缩是就地 ``msg.set_body(...)``，调用方拿着同一个对象再发一次，
+    第二次就把压缩流当原文又压一遍（zlib(zlib(x))），消费端只解一层、拿到的是压缩流；
+    带 namespace 时调用方还会一直盯着被改写的 ``ns%topic``。Java 的两个入口
+    （``DefaultMQProducerImpl:930`` 取 ``prevBody``）在成功、失败、拦截钩子抛异常三条路上
+    都会还原，所以这里用 ``finally`` 而不是正常返回路径。
+
+    topic 是 ``without_namespace`` 而不是"恢复进入时的字符串"——Java 的 finally 就是这么
+    写的：调用方自己传进来、本来就带前缀的 topic 同样会被剥掉。
+
+    只对单条消息生效。批量路径（``MessageBatch`` 及其子消息）不还原，与 Java 的
+    ``batch()`` 一致，且批量消息永不压缩，没有重复压缩的风险。
+    """
+    @functools.wraps(fn)
+    def wrapper(self, msg, *args, **kwargs):
+        if isinstance(msg, (list, tuple)):
+            return fn(self, msg, *args, **kwargs)
+        prev_body = msg.body
+        try:
+            return fn(self, msg, *args, **kwargs)
+        finally:
+            msg.body = prev_body
+            msg.topic = NamespaceUtil.without_namespace(msg.topic, self.namespace)
+    return wrapper
 
 
 class _NullSendCallback:
@@ -1031,6 +1061,7 @@ class DefaultMQProducer:
             selected.broker_name, (time.monotonic() - began) * 1000.0, isolation, reachable)
 
     # ---------------- 正常发送 ----------------
+    @_restores_caller_message
     def send(self, msg: Message, timeout_millis: Optional[int] = None,
              mq: Optional[MessageQueue] = None) -> SendResult:
         """同步发送：msg 或 Collection；指定 mq 走定点发送，否则轮询选择。"""
@@ -1353,9 +1384,16 @@ class DefaultMQProducer:
             else:
                 raise MQClientException("executor rejected", None, e) from e
 
+    @_restores_caller_message
     def _send_async_inner(self, msg: Message, mq: Optional[MessageQueue],
                           callback: SendCallback, timeout: int) -> None:
-        """出队后的准备工作（Java ``sendDefaultImpl(ASYNC)`` → ``sendKernelImpl``）。"""
+        """出队后的准备工作（Java ``sendDefaultImpl(ASYNC)`` → ``sendKernelImpl``）。
+
+        还原放在这一层而不是 ``send_async``：Java 5.5.1 的异步链把**调用方那条消息**
+        交给 ``AsyncSenderExecutor`` 的 runnable，`finally` 是在**工作线程**上跑的
+        （调用方从 ``send_async`` 返回时消息还是压缩后的样子，发完才还原），
+        装饰器跟到工作线程才等价。
+        """
         client = self._require_client()
         if isinstance(msg, (list, tuple)):
             # 批量异步：Java 走 SEND_BATCH_MESSAGE + invokeAsync，本实现的批量发送只有同步内核，
@@ -1541,6 +1579,7 @@ class DefaultMQProducer:
         except Exception as e:  # noqa: BLE001
             logger.warning("send callback raised: %s", e)
 
+    @_restores_caller_message
     def send_oneway(self, msg: Message, mq: Optional[MessageQueue] = None) -> None:
         """单向发送（对应 Java sendOneway）。"""
         client = self._require_client()
@@ -1566,6 +1605,7 @@ class DefaultMQProducer:
                                    self._need_addr(client, mq_sel), self.send_msg_timeout,
                                    sys_flag, **self._send_header_args())
 
+    @_restores_caller_message
     def send_by_selector(self, msg: Message, selector: MessageQueueSelector, arg,
                          timeout_millis: Optional[int] = None) -> SendResult:
         """使用 MessageQueueSelector 选择队列发送（对应 Java send(msg, selector, arg)）。"""
@@ -1753,6 +1793,11 @@ class DefaultMQProducer:
         """
         if listener is None:
             raise MQClientException("tranExecutor is null", None)
+        # Java `sendKernelImpl:930` 的 `prevBody`：半消息发完就还原调用方那份 body，
+        # 所以随后的 `executeLocalTransaction(msg, arg)` 看到的是**原始 body**（不是压缩流）。
+        # 这一层不能用 `_restores_caller_message`：那样要等方法结束才还原，
+        # listener 与 `_end_transaction` 都会拿到压缩后的消息。
+        prev_body = msg.body
         msg.topic = self._with_namespace(msg.topic)
 
         # Java ensureNotDelayedForTransactional：事务消息不支持任何形式的延迟投递
@@ -1794,6 +1839,13 @@ class DefaultMQProducer:
                                                self.send_msg_timeout, sys_flag)
         except Exception as e:  # noqa: BLE001
             raise MQClientException("send message Exception", e)
+        finally:
+            # 与 Java 的 finally 同点位（`sendKernelImpl:1095-1096`）：**半消息发完**就还原，
+            # 所以下面的 `execute_local_transaction` 和 `_end_transaction` 看到的是原始
+            # body + 已剥命名空间的 topic（Java 5.5.1 的 `endTransaction:1543` 用的正是
+            # `msg.getTopic()`）。属性不动：UNIQ_KEY 那些 Java 也不还原。
+            msg.body = prev_body
+            msg.topic = NamespaceUtil.without_namespace(msg.topic, self.namespace)
 
         state = LocalTransactionState.UNKNOW
         local_exception = None

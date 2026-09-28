@@ -67,13 +67,12 @@ def crc32(data):
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
-def recv_one(topic, group, timeout_sec=30):
-    """消费 1 条消息（CONSUME_FROM_FIRST_OFFSET），超时返回 None。"""
+def recv_n(topic, group, n, timeout_sec=30):
+    """消费 n 条消息（CONSUME_FROM_FIRST_OFFSET），超时返回已收到的（可能不足 n）。"""
     got = []
 
     def on_msg(msgs):
-        if not got:
-            got.extend(msgs)
+        got.extend(m for m in msgs if m.topic == topic)
         return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
 
     cons = DefaultMQPushConsumer(consumer_group=group)
@@ -83,9 +82,15 @@ def recv_one(topic, group, timeout_sec=30):
     cons.set_message_listener(SimpleMessageListener(on_msg))
     cons.start()
     deadline = time.time() + timeout_sec
-    while time.time() < deadline and not got:
+    while time.time() < deadline and len(got) < n:
         time.sleep(0.25)
     cons.shutdown()
+    return got
+
+
+def recv_one(topic, group, timeout_sec=30):
+    """消费 1 条消息（CONSUME_FROM_FIRST_OFFSET），超时返回 None。"""
+    got = recv_n(topic, group, 1, timeout_sec)
     return got[0] if got else None
 
 
@@ -234,6 +239,34 @@ def selftest():
               and 0 < bstore < size // 2
               and not MessageSysFlag.is_compressed(getattr(bm, "sys_flag", 0)),
               "len=%d storeSize=%d sysFlag=%d" % (len(bbody), bstore, getattr(bm, "sys_flag", 0)))
+
+    # 8) 同一条 Message 复用两次（Java ``sendKernelImpl:1095-1096`` 的 finally）。
+    #    发送必须**还原调用方**那条消息：不还原时第一次发送就地把 body 换成压缩流，
+    #    第二次发出去的是压缩字节、长度已低于阈值不再压、COMPRESSED_FLAG 也不置位；
+    #    broker 照存、消费端照收（不解压），业务拿到的是 zlib 流 —— 全程零报错，
+    #    真机上表现为第二条消息 ``match=0``。这里两条都收回来逐字节比对。
+    reuse_topic = "CompressLivePyReuse_%d" % stamp
+    reuse_group = "CompressLivePyReuseGroup_%d" % stamp
+    rp = DefaultMQProducer("CompressLivePyReuseProducer_%d" % stamp)
+    rp.set_namesrv_addr(NAMESRV)
+    rp.set_send_msg_timeout(10000)
+    rp.start()
+    reused = Message(reuse_topic, payload)
+    rp.send(reused)
+    after_first = reused.get_body()
+    rp.send(reused)
+    rp.shutdown()
+    check("复用同一条 Message：发送后调用方 body 未被就地改写（prevBody 还原）",
+          len(after_first) == size and crc32(after_first) == payload_crc,
+          "第一次发送后 len=%d crc=%d（失败=调用方拿到了压缩流）"
+          % (len(after_first), crc32(after_first)))
+    rms = recv_n(reuse_topic, reuse_group, 2)
+    check("复用同一条 Message：两次真机往返都还原原文",
+          len(rms) == 2 and all(
+              len(x.get_body()) == size and crc32(x.get_body()) == payload_crc for x in rms),
+          "收到 %d 条 storeSize=%s len=%s"
+          % (len(rms), [getattr(x, "store_size", "?") for x in rms],
+             [len(x.get_body()) for x in rms]))
 
     failed = [r for r in results if not r[1]]
     print("\n==== compression live summary ====")

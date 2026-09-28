@@ -10,6 +10,7 @@
 //! ```text
 //! cargo run --example live_compression_matrix -- send <topic> <group> <size> [namesrv] [codec]
 //! cargo run --example live_compression_matrix -- recv <topic> <group> <size> [namesrv] [codec]
+//! cargo run --example live_compression_matrix -- reuse <topic> <group> <size> [namesrv] [codec]
 //! ```
 //!
 //! `codec`（`zlib` / `lz4` / `zstd`，默认 `zlib`）只决定发送端用哪个压缩算法；
@@ -17,6 +18,11 @@
 //!
 //! `recv` 走 lite 拉取消费者（订阅 + 后台灌缓冲 + poll），顺带证明解压发生在
 //! 解码路径里（`MessageDecoder` 会清掉 `COMPRESSED_FLAG`）。
+//!
+//! `reuse` 用**同一条 `Message`** 连发两次再各收一条：证明发送后调用方那条消息被
+//! 还原（Java `sendKernelImpl:1095-1096` 的 finally）。不还原时第二次发出去的是
+//! 压缩流、长度已低于阈值不再压、`COMPRESSED_FLAG` 也不置位 —— broker 照存、
+//! 消费端不解压，业务拿到 zlib 字节，全程零报错。
 
 use std::env;
 use std::process::ExitCode;
@@ -26,7 +32,7 @@ use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::pull_consumer::{
     DefaultLitePullConsumer, LitePullConsumerConfig,
 };
-use rocketmq_client_remoting::common::message::Message;
+use rocketmq_client_remoting::common::message::{Message, MessageExt};
 use rocketmq_client_remoting::common::sysflag::MessageSysFlag;
 use rocketmq_client_remoting::common::util_all::crc32;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
@@ -46,7 +52,8 @@ fn build_payload(size: usize) -> Vec<u8> {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: live_compression_matrix send <topic> <group> <size> [namesrv] [codec]\n\
-        \x20      live_compression_matrix recv <topic> <group> <size> [namesrv] [codec]"
+        \x20      live_compression_matrix recv <topic> <group> <size> [namesrv] [codec]\n\
+        \x20      live_compression_matrix reuse <topic> <group> <size> [namesrv] [codec]"
     );
     ExitCode::FAILURE
 }
@@ -107,6 +114,7 @@ async fn main() -> ExitCode {
     match mode {
         "send" => send(&namesrv, topic, group, &payload, crc, codec).await,
         "recv" => recv(&namesrv, topic, group, &payload, crc).await,
+        "reuse" => reuse(&namesrv, topic, group, &payload, crc, codec).await,
         other => {
             eprintln!("unknown mode: {other}");
             usage()
@@ -159,7 +167,13 @@ async fn send(
     }
 }
 
-async fn recv(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32) -> ExitCode {
+/// 起一个 lite 拉取消费者，尽量收满 `want` 条（60s 超时）；搭建失败返回 `None`。
+async fn collect(
+    namesrv: &str,
+    topic: &str,
+    group: &str,
+    want: usize,
+) -> Option<Vec<MessageExt>> {
     let cfg = LitePullConsumerConfig {
         consumer_group: group.to_string(),
         name_server_addrs: vec![namesrv.to_string()],
@@ -172,25 +186,33 @@ async fn recv(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32)
         Ok(c) => c,
         Err(e) => {
             eprintln!("RECV_FAIL build failed: {e}");
-            return ExitCode::FAILURE;
+            return None;
         }
     };
     consumer.subscribe(topic, "*");
     if let Err(e) = consumer.start().await {
         eprintln!("RECV_FAIL start failed: {e}");
-        return ExitCode::FAILURE;
+        return None;
     }
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut got = None;
-    while Instant::now() < deadline {
-        let batch = consumer.poll(Some(1000)).await;
-        if let Some(m) = batch.into_iter().find(|m| m.topic == *topic) {
-            got = Some(m);
-            break;
+    let mut got = Vec::new();
+    while Instant::now() < deadline && got.len() < want {
+        for m in consumer.poll(Some(1000)).await {
+            if m.topic == *topic {
+                got.push(m);
+            }
         }
     }
     consumer.shutdown();
-    match got {
+    Some(got)
+}
+
+async fn recv(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32) -> ExitCode {
+    let got = match collect(namesrv, topic, group, 1).await {
+        Some(got) => got,
+        None => return ExitCode::FAILURE,
+    };
+    match got.into_iter().next() {
         Some(m) => {
             let body = m.get_body();
             let matched = body == payload && crc32(body) == crc;
@@ -212,5 +234,79 @@ async fn recv(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32)
             println!("RECV_NONE len=0 crc32=0 storeSize=0 match=0");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// 同一条 `Message` 连发两次，再各收一条回来比对。
+///
+/// 第一项检查不依赖 broker：第一次 `send` 之后调用方手里的 body 必须还是原文
+/// （压缩是就地的，Java 靠 `finally` 里的 `prevBody` 换回来）。
+/// 第二项是真机端到端：第二条消息在 broker 里必须是**压缩体**、收回来必须是原文。
+async fn reuse(
+    namesrv: &str,
+    topic: &str,
+    group: &str,
+    payload: &[u8],
+    crc: u32,
+    codec: i32,
+) -> ExitCode {
+    let producer = match DefaultMQProducer::new(&format!("{group}_prod")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("REUSE_FAIL build failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    producer.set_namesrv_addr(namesrv);
+    producer.set_compress_type(codec);
+    if let Err(e) = producer.start().await {
+        eprintln!("REUSE_FAIL start failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut msg = Message::new(topic, Some(payload));
+    let first = producer.send(&mut msg, Some(10_000), None).await;
+    let after_first = msg.get_body().to_vec();
+    let second = producer.send(&mut msg, Some(10_000), None).await;
+    producer.shutdown();
+
+    let restored = after_first == payload && crc32(&after_first) == crc;
+    println!(
+        "REUSE_AFTER_FIRST_{} len={} crc32={}",
+        if restored { "OK" } else { "BAD" },
+        after_first.len(),
+        crc32(&after_first),
+    );
+    match (first, second) {
+        (Ok(a), Ok(b)) => println!(
+            "REUSE_SEND_OK codec={} msgId1={} msgId2={}",
+            codec_name(codec),
+            a.msg_id.clone().unwrap_or_default(),
+            b.msg_id.clone().unwrap_or_default(),
+        ),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("REUSE_FAIL send failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let got = match collect(namesrv, topic, group, 2).await {
+        Some(got) => got,
+        None => return ExitCode::FAILURE,
+    };
+    let matched = got.len() == 2
+        && got
+            .iter()
+            .all(|m| m.get_body() == payload && crc32(m.get_body()) == crc);
+    println!(
+        "REUSE_RECV_{} count={} storeSize={:?} len={:?}",
+        if matched { "OK" } else { "BAD" },
+        got.len(),
+        got.iter().map(|m| m.store_size).collect::<Vec<_>>(),
+        got.iter().map(|m| m.get_body().len()).collect::<Vec<_>>(),
+    );
+    if restored && matched {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

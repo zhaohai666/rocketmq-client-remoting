@@ -7110,8 +7110,10 @@ mod tests {
         // 默认关闭
         assert_eq!(pull_subscription_expression(&ConsumerConfig::default(), &s), None);
         // 打开
-        let mut cfg = ConsumerConfig::default();
-        cfg.post_subscription_when_pull = true;
+        let cfg = ConsumerConfig {
+            post_subscription_when_pull: true,
+            ..ConsumerConfig::default()
+        };
         assert_eq!(pull_subscription_expression(&cfg, &s).as_deref(), Some("TagA"));
         // 类过滤模式：即使打开也不上送（表达式是过滤类名，broker 侧 TAG 过滤会误判）
         let mut class_mode = sub(P5_TOPIC, "com.example.MyFilter");

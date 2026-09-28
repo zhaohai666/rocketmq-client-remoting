@@ -436,8 +436,8 @@ impl<'a> PublishMessage<'a> {
     /// `msg` 直接就是一个可复用的引用。
     pub fn reborrow(&mut self) -> PublishMessage<'_> {
         match self {
-            PublishMessage::Single(m) => PublishMessage::Single(&mut **m),
-            PublishMessage::Batch(b) => PublishMessage::Batch(&mut **b),
+            PublishMessage::Single(m) => PublishMessage::Single(m),
+            PublishMessage::Batch(b) => PublishMessage::Batch(b),
         }
     }
 }
@@ -4365,6 +4365,9 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// 脚本里排队的应答 extFields 表。
+    type ExtFieldsQueue = Arc<Mutex<VecDeque<Vec<(String, String)>>>>;
+
     /// 进程内假 broker：只说 remoting 协议，逐笔按脚本应答。
     struct MockBroker {
         addr: String,
@@ -4374,7 +4377,7 @@ mod tests {
         remarks: Arc<Mutex<VecDeque<String>>>,
         /// 脚本：下一笔应答的 extFields（用完为空表）。PULL_MESSAGE 的
         /// `suggestWhichBrokerId` / `nextBeginOffset` 之类都靠它上线。
-        resp_ext: Arc<Mutex<VecDeque<Vec<(String, String)>>>>,
+        resp_ext: ExtFieldsQueue,
     }
 
     impl MockBroker {

@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 989 条单元/协议测试（985 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 1061 条单元/协议测试（1057 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -27,7 +27,7 @@ ROCKETMQ_JAVA_SRC=<...>/remoting/src/main/java/org/apache/rocketmq/remoting/prot
 python verify_message_types.py    # 7 类消息能力，18 PASS/0 FAIL（异步 9 项：不阻塞返回、线程口径、并发、定点、失败只走回调）
 python verify_request_reply_live.py # request-reply 全链路（22 PASS/0 FAIL）：325 落地、REPLY_TO_CLIENT=真实 clientId、超时/并发/普通消费不受影响；**错误码口径**：等应答超时带 Java 的 10006 `REQUEST_TIMEOUT_EXCEPTION`，`create_reply_message` 拿不到 broker 写的 `CLUSTER`/请求为 None 时带 10007 `CREATE_REPLY_MESSAGE_EXCEPTION`（文案逐字对 Java）
 python verify_admin_live.py       # 管理端全链路 + sendMessageBack 重投（72 PASS/0 FAIL/1 SKIP）
-python verify_compression_live.py selftest   # 自动压缩自产自销 + broker 侧压缩体校验
+python verify_compression_live.py selftest   # 自动压缩自产自销 + broker 侧压缩体校验 + 同一条 Message 复用两次（11 PASS/0 FAIL/1 SKIP，2026-09-28 实测；SKIP 是本 venv 没装 zstandard）：zlib/lz4 真机往返 storeSize 317/339 ≪ 8192，复用的两条都落成压缩体（storeSize=[322,322]）且读回逐字节等于原文 —— 不还原 prevBody 时第二条送出的会是压缩流且无 COMPRESSED_FLAG、消费端不解压，静默乱码
 python verify_compression_live.py send|recv <topic> <group> <size>   # 与 Java 探针跨客户端互通
 python verify_trace_live.py       # 消息轨迹全链路（17 PASS/0 FAIL，需 broker traceTopicEnable=true）
 python verify_hook_live.py        # CheckForbidden/FilterMessage 钩子（13 PASS/0 FAIL）
