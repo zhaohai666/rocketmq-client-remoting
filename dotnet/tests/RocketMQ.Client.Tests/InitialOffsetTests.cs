@@ -242,7 +242,10 @@ public class InitialOffsetTests
                 return offsetResp;
             }
 
-            if (req.Code == RequestCode.PullMessage && !req.IsOnewayRpc())
+            // lite 消费者的拉取走 361，经典拉取走 11（#107）；断言只挑 11，
+            // 所以这里两种码都必须答，否则 lite 的游标根本推不动。
+            if (req.Code is RequestCode.PullMessage or RequestCode.LitePullMessage
+                && !req.IsOnewayRpc())
             {
                 // 立刻回"这轮没有新消息"：断言只看请求头里的 queueOffset，不看应答语义。
                 RemotingCommand pullResp = Echo(req, ResponseCode.PullNotFound, null);
@@ -343,9 +346,9 @@ public class InitialOffsetTests
         first.Start();
         try
         {
-            Assert.True(WaitFor(() => ep.Requests(RequestCode.PullMessage).Count > 0, TimeSpan.FromSeconds(5)),
-                "FIRST_OFFSET 的 lite-pull 必须真的发出第一笔拉取");
-            List<WireReq> pulls = ep.Requests(RequestCode.PullMessage);
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.LitePullMessage).Count > 0, TimeSpan.FromSeconds(5)),
+                "FIRST_OFFSET 的 lite-pull 必须真的发出第一笔拉取（LITE_PULL_MESSAGE=361）");
+            List<WireReq> pulls = ep.Requests(RequestCode.LitePullMessage);
             Assert.Equal("0", pulls[0].Ext["queueOffset"]);
             Assert.Empty(ep.Requests(RequestCode.GetMinOffset));
         }

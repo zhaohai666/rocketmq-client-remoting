@@ -533,8 +533,11 @@ public sealed class DefaultLitePullConsumer
 
         string sub = SubscriptionFor(mq.Topic);
         // 短轮询（suspend=false），位点由 auto-commit 单独提交（与 Java LitePull 一致）。
+        // litePull: true 置 FLAG_LITE_PULL_MESSAGE（Java `DefaultLitePullConsumerImpl
+        // #pullSyncImpl:1058` 的 buildSysFlag(false, block, true, false, true)），
+        // 下游 MqClient.PullMessage 据此把请求码切成 LITE_PULL_MESSAGE(361)。
         int sysFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
-            subscription: true, classFilter: false);
+            subscription: true, classFilter: false, litePull: true);
         PullResult result;
         try
         {

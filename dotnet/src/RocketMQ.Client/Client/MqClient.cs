@@ -1369,7 +1369,13 @@ public sealed class MQClientInstance : IDisposable
             RequestSource = requestSource,
         };
 
-        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.PullMessage, header);
+        // Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
+        // LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
+        // 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）。
+        int requestCode = PullSysFlag.HasLitePullFlag(sysFlag)
+            ? RequestCode.LitePullMessage
+            : RequestCode.PullMessage;
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(requestCode, header);
         RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
 
         PullStatus status;

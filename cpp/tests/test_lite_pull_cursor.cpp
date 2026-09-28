@@ -31,11 +31,13 @@
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/lite_pull_consumer.h"
+#include "rocketmq/client/pull_consumer.h"
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/net_compat.h"
+#include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/heartbeat.h"
@@ -230,6 +232,18 @@ public:
         return pullCodes_[i];
     }
 
+    /// 第 i 笔拉取请求的**请求码**（11=PULL_MESSAGE / 361=LITE_PULL_MESSAGE）。
+    int32_t pullRequestCode(size_t i) {
+        std::lock_guard<std::mutex> lk(state_);
+        if (i >= pullReqCodes_.size()) return -1;
+        return pullReqCodes_[i];
+    }
+
+    size_t pullReqCodeCount() {
+        std::lock_guard<std::mutex> lk(state_);
+        return pullReqCodes_.size();
+    }
+
     /// 有没有任何一笔 PULL_MESSAGE 是从 `offset` 起的。
     bool pullHasOffset(int64_t offset) {
         std::lock_guard<std::mutex> lk(state_);
@@ -299,7 +313,8 @@ private:
                 } else {
                     resp.code = ResponseCode::TOPIC_NOT_EXIST;
                 }
-            } else if (req.code == RequestCode::PULL_MESSAGE) {
+            } else if (req.code == RequestCode::PULL_MESSAGE ||
+                       req.code == RequestCode::LITE_PULL_MESSAGE) {
                 answerPull(req, resp);
             } else if (req.code == RequestCode::QUERY_CONSUMER_OFFSET) {
                 // 组从未提交过位点：真实 broker 回 QUERY_NOT_FOUND（21/22 号里的 22），
@@ -330,6 +345,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(state_);
             codes_.push_back(req.code);
+            pullReqCodes_.push_back(req.code);
             pulls_.push_back(req.extFields);
         }
         bool gated = false;
@@ -380,6 +396,7 @@ private:
     std::mutex state_;
     std::map<std::string, Bytes> routes_;
     std::vector<PropertyMap> pulls_;
+    std::vector<int32_t> pullReqCodes_;
     std::vector<int32_t> pullCodes_;
     std::vector<int32_t> codes_;
     std::deque<PullReply> pullScripts_;
@@ -516,12 +533,77 @@ void testInFlightSeekWinsOverThePullResult() {
     c->shutdown();
 }
 
+// ---------------------------------------------------------------- 4. lite 位 / 请求码（#107）
+
+// Java 把「置位」和「选码」拆在两处：DefaultLitePullConsumerImpl#pullSyncImpl:1058 以
+// buildSysFlag(false, block, true, false, /*litePull=*/true) 置 FLAG_LITE_PULL_MESSAGE
+// (0x10)；MQClientAPIImpl#pullMessage:816-820 随后据此把请求码切成
+// LITE_PULL_MESSAGE(361)。任一步漏掉，报文依然是一个完全合法的 pull（broker 照常回
+// 消息），但走普通 pull 线程池、且**不受 litePullMessageEnable 开关管辖**
+// （PullMessageProcessor:325 只拦 361）—— 假 broker 不看请求码也能测，所以要专门断言
+// 线上形状（请求码 + header.sysFlag），真机判别器见 examples/live_lite_pull_code.cpp。
+void testLitePullCarriesTheLiteCodeAndFlag() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+    auto c = startedLite("LitePG_LiteCode", cluster);
+
+    expect(waitFor([&] { return cluster.pullReqCodeCount() >= 1; }),
+           "至少一笔拉取到达 broker");
+    const size_t n = cluster.pullReqCodeCount();
+    bool all361 = true;
+    bool allFlag = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (cluster.pullRequestCode(i) != RequestCode::LITE_PULL_MESSAGE) all361 = false;
+        if (!PullSysFlag::hasLitePullFlag(
+                static_cast<int32_t>(MockEndpoint::extInt(cluster.pullExt(i), "sysFlag", -1)))) {
+            allFlag = false;
+        }
+    }
+    expect(n >= 1 && all361, "lite 拉取请求码全是 LITE_PULL_MESSAGE(361)");
+    expect(n >= 1 && allFlag, "每笔拉取的 header.sysFlag 都置了 FLAG_LITE_PULL_MESSAGE(0x10)");
+    // 反向对照：lite 位不能是多置的 —— 与 Java :1058 的 (false, false, true, false, true)
+    // 逐位对齐（无 commitOffset / suspend / classFilter 位）。
+    const PropertyMap ext0 = cluster.pullExt(0);
+    const int32_t flag0 = static_cast<int32_t>(MockEndpoint::extInt(ext0, "sysFlag", -1));
+    expect(!PullSysFlag::hasCommitOffsetFlag(flag0) && !PullSysFlag::hasSuspendFlag(flag0) &&
+               PullSysFlag::hasSubscriptionFlag(flag0) &&
+               !PullSysFlag::hasClassFilterFlag(flag0),
+           "lite 拉取的其余标志位与 Java pullSyncImpl:1058 逐位一致");
+    const size_t liteCount = cluster.pullReqCodeCount();
+    c->shutdown();
+    expect(liteCount >= 1, "lite 消费者至少发出过一笔拉取（下面 11 的对照才有意义）");
+
+    // 对照：经典拉取（DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参 build）必须仍是
+    // 11 且不带 lite 位 —— 少了这条腿，「361」可能只是所有 pull 都被改成了 361。
+    DefaultMQPullConsumer classic("LitePG_LiteCodeClassic");
+    classic.setNamesrvAddr(cluster.address());
+    classic.start();
+    classic.pull(queue0(), "*", 0, 32, 3000);
+    classic.shutdown();
+
+    int32_t classicIdx = -1;
+    for (size_t i = 0; i < cluster.pullReqCodeCount(); ++i) {
+        if (cluster.pullRequestCode(i) == RequestCode::PULL_MESSAGE) {
+            classicIdx = static_cast<int32_t>(i);
+            break;
+        }
+    }
+    expect(classicIdx >= 0, "经典拉取的请求码是 PULL_MESSAGE(11)");
+    if (classicIdx >= 0) {
+        const int32_t clFlag = static_cast<int32_t>(MockEndpoint::extInt(
+            cluster.pullExt(static_cast<size_t>(classicIdx)), "sysFlag", -1));
+        expect(!PullSysFlag::hasLitePullFlag(clFlag),
+               "经典拉取的 sysFlag 不带 lite 位（Java :248 的 4 参 build）");
+    }
+}
+
 }  // namespace
 
 int main() {
     testCursorFollowsNextBeginOffsetOnNoMatchedMsg();
     testCursorAdoptsTheBrokersOffsetCorrection();
     testInFlightSeekWinsOverThePullResult();
+    testLitePullCarriesTheLiteCodeAndFlag();
     std::printf("lite_pull_cursor: %d checks, %d failed\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

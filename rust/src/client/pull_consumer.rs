@@ -158,6 +158,18 @@ fn pull_sys_flag(block: bool) -> i32 {
     PullSysFlag::build_sys_flag_basic(false, block, true, false)
 }
 
+/// lite pull 的 sysFlag：Java `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 的
+/// `buildSysFlag(false, block, true, false, /*litePull=*/true)` —— 比经典拉取多一个
+/// `FLAG_LITE_PULL_MESSAGE(0x10)`，客户端 API 层（`MQClientAPIImpl#pullMessage:816-820`）
+/// 据此把请求码切成 `LITE_PULL_MESSAGE(361)`，broker 侧只对 361 施加
+/// `litePullMessageEnable` 开关（`PullMessageProcessor:325`）。
+///
+/// ⚠ 不要并进 [`pull_sys_flag`]：那条是经典拉取的（:795/:842），多这一位会让普通消费者
+/// 也撞上 lite 开关。
+fn lite_pull_sys_flag() -> i32 {
+    PullSysFlag::build_sys_flag(false, false, true, false, true)
+}
+
 // ================================================================ DefaultMQPullConsumer
 
 /// [`DefaultMQPullConsumer`] 的配置（Python `DefaultMQPullConsumer.__init__`
@@ -2492,8 +2504,9 @@ impl DefaultLitePullConsumer {
                 mq,
                 offset,
                 cfg.pull_batch_size,
-                // 短轮询（suspend=False），位点由 auto-commit 单独提交
-                pull_sys_flag(false),
+                // 短轮询（suspend=False），位点由 auto-commit 单独提交；
+                // lite 位见 lite_pull_sys_flag（#107）
+                lite_pull_sys_flag(),
                 0,
                 &expr,
                 0,
@@ -3404,11 +3417,14 @@ mod tests {
                                 _ => {}
                             }
                             if !request.is_oneway_rpc() {
-                                let mut response = if request.code == request_code::PULL_MESSAGE {
-                                    answer_pull(&request, &inner).await
-                                } else {
-                                    answer_for(&request, response_code::SUCCESS)
-                                };
+                                let mut response =
+                                    if request.code == request_code::PULL_MESSAGE
+                                        || request.code == request_code::LITE_PULL_MESSAGE
+                                    {
+                                        answer_pull(&request, &inner).await
+                                    } else {
+                                        answer_for(&request, response_code::SUCCESS)
+                                    };
                                 write_frame(&mut stream, &mut response).await;
                             }
                         }
@@ -3427,10 +3443,41 @@ mod tests {
         fn pull_offsets(&self) -> Vec<i64> {
             lock(&self.requests)
                 .iter()
-                .filter(|(code, _)| *code == request_code::PULL_MESSAGE)
+                .filter(|(code, _)| {
+                    *code == request_code::PULL_MESSAGE
+                        || *code == request_code::LITE_PULL_MESSAGE
+                })
                 .filter_map(|(_, ext)| {
                     ext.iter()
                         .find(|(k, _)| k == "queueOffset")
+                        .and_then(|(_, v)| v.parse().ok())
+                })
+                .collect()
+        }
+
+        /// 收到的拉取请求的**请求码**（11=PULL_MESSAGE / 361=LITE_PULL_MESSAGE），按到达顺序。
+        fn pull_request_codes(&self) -> Vec<i32> {
+            lock(&self.requests)
+                .iter()
+                .filter(|(code, _)| {
+                    *code == request_code::PULL_MESSAGE
+                        || *code == request_code::LITE_PULL_MESSAGE
+                })
+                .map(|(code, _)| *code)
+                .collect()
+        }
+
+        /// 收到的拉取请求的 `sysFlag`，按到达顺序。
+        fn pull_sys_flags(&self) -> Vec<i32> {
+            lock(&self.requests)
+                .iter()
+                .filter(|(code, _)| {
+                    *code == request_code::PULL_MESSAGE
+                        || *code == request_code::LITE_PULL_MESSAGE
+                })
+                .filter_map(|(_, ext)| {
+                    ext.iter()
+                        .find(|(k, _)| k == "sysFlag")
                         .and_then(|(_, v)| v.parse().ok())
                 })
                 .collect()
@@ -3813,6 +3860,68 @@ mod tests {
         );
         first.shutdown();
         last.shutdown();
+    }
+
+    // --------------------------------- 请求码 / lite 位（#107）
+
+    /// lite pull 必须带 `FLAG_LITE_PULL_MESSAGE(0x10)` 且线上请求码为
+    /// `LITE_PULL_MESSAGE(361)`。Java 把这两件事拆在两处：消费者侧
+    /// `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 置位，客户端 API 侧
+    /// `MQClientAPIImpl#pullMessage:816-820` 按位选码。少了任一步，报文仍是一个合法的
+    /// pull（假 broker 照常回消息），但走普通 pull 线程池、且**不受
+    /// `litePullMessageEnable` 开关管辖**（`PullMessageProcessor:325` 只拦 361）——
+    /// 假 broker 不看请求码也能测，所以必须对线形状单独设卡；真机判别器见
+    /// examples/live_lite_pull_code.rs。
+    #[tokio::test]
+    async fn lite_pull_uses_code_361_and_sets_the_lite_bit() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        let c = started_lite("lite_code", "LitePG_LiteCode", &cluster, &q).await;
+        wait_until(
+            || !cluster.master.pull_request_codes().is_empty(),
+            "lite 的第一笔拉取",
+        )
+        .await;
+
+        let codes = cluster.master.pull_request_codes();
+        assert!(
+            codes.iter().all(|x| *x == request_code::LITE_PULL_MESSAGE),
+            "lite 拉取请求码必须全是 LITE_PULL_MESSAGE(361)：{codes:?}"
+        );
+
+        let flags = cluster.master.pull_sys_flags();
+        assert!(!flags.is_empty(), "至少一笔带 sysFlag 的拉取");
+        for f in &flags {
+            // 与 Java pullSyncImpl:1058 的 (false, block, true, false, true) 逐位对齐
+            assert!(
+                PullSysFlag::has_lite_pull_flag(*f),
+                "lite 位必须置上：{f:#x}"
+            );
+            assert!(!PullSysFlag::has_commit_offset_flag(*f), "{f:#x}");
+            assert!(!PullSysFlag::has_suspend_flag(*f), "{f:#x}");
+            assert!(PullSysFlag::has_subscription_flag(*f), "{f:#x}");
+            assert!(!PullSysFlag::has_class_filter_flag(*f), "{f:#x}");
+        }
+
+        // 负控：经典拉取（DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本）必须是
+        // 11 且**不带** lite 位 —— 多这一位会让普通消费者也撞上 lite 开关。
+        let classic = started_pull("lite_code_classic", "PG_ClassicCode", &cluster, "T").await;
+        classic
+            .pull(&q, "*", 0, 32, Some(5000))
+            .await
+            .expect("假集群里经典拉取应当成功");
+        let ccodes = cluster.master.pull_request_codes();
+        assert!(
+            ccodes.contains(&request_code::PULL_MESSAGE),
+            "经典拉取必须是 PULL_MESSAGE(11)：{ccodes:?}"
+        );
+        let cflags = cluster.master.pull_sys_flags();
+        assert!(
+            cflags.iter().any(|f| !PullSysFlag::has_lite_pull_flag(*f)),
+            "经典拉取不该带 lite 位：{cflags:?}"
+        );
+        c.shutdown();
+        classic.shutdown();
     }
 
     // ---------------------- 拉取游标跟住 nextBeginOffset（#105）

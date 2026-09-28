@@ -17,6 +17,7 @@
 // 「下一笔 PULL_MESSAGE 是不是从新位点起的」—— 游标真的上了线，而不只是内存表里改了个数。
 // 与 cpp/tests/test_lite_pull_cursor.cpp、rust/src/client/pull_consumer.rs、
 // python/tests/test_lite_pull_consumer.py 的同名用例同题。
+using System.Linq;
 using System.Text;
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -191,6 +192,61 @@ public class LitePullCursorTests
         {
             gate.Set();
             c.Shutdown();
+        }
+    }
+
+    // ---------------------------------------------------------------- 4. 线上报文契约（#107）
+
+    /// <summary>
+    /// lite-pull 的每一笔拉取都必须走 LITE_PULL_MESSAGE(361) 且 sysFlag 与 Java
+    /// `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 的 buildSysFlag(false, block,
+    /// true, false, litePull=true) 逐位一致（MQClientAPIImpl#pullMessage:816-820 就是
+    /// 按这个位切码）。对照组：经典拉取（4 参 build，:248）仍是 11 且 lite 位为 0 ——
+    /// 少了它，「361」可能只是所有 pull 都变成了 361。
+    /// </summary>
+    [Fact]
+    public void LitePullCarriesCode361AndTheLiteBit()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultLitePullConsumer c = StartedLite(GroupPrefix + "Code361", cluster);
+        DefaultMQPullConsumer? classic = null;
+        try
+        {
+            MessageQueue mq = Queue0();
+            Assert.True(WaitFor(() => cluster.CountRequests(RequestCode.LitePullMessage) >= 1),
+                "lite 消费者的拉取用 LITE_PULL_MESSAGE(361)");
+            Assert.Equal(0, cluster.CountRequests(RequestCode.PullMessage));
+
+            int expectedFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
+                subscription: true, classFilter: false, litePull: true);
+            foreach (WireRecord rec in cluster.Records().Where(r => r.Code == RequestCode.LitePullMessage))
+            {
+                int flag = int.Parse(rec.Ext["sysFlag"],
+                    System.Globalization.CultureInfo.InvariantCulture);
+                Assert.True(PullSysFlag.HasLitePullFlag(flag), "lite 位必须置起");
+                Assert.False(PullSysFlag.HasSuspendFlag(flag), "lite 是短轮询，suspend 位为 0");
+                Assert.Equal(expectedFlag, flag);
+                // SUBSCRIPTION 位置起时表达式进报文（Java 的 makeCustomHeaderToNet 口径）
+                Assert.Equal("*", rec.Ext["subscription"]);
+            }
+
+            // 对照：经典拉取消费者（DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本）
+            classic = new DefaultMQPullConsumer(GroupPrefix + "Classic");
+            classic.SetNamesrvAddr(cluster.NamesrvAddr);
+            classic.Start();
+            classic.Pull(mq, "*", 0, 32, 3000);
+            Assert.True(WaitFor(() => cluster.CountRequests(RequestCode.PullMessage) >= 1),
+                "经典拉取用 PULL_MESSAGE(11)");
+            WireRecord classicRec = cluster.Records().Last(r => r.Code == RequestCode.PullMessage);
+            int classicFlag = int.Parse(classicRec.Ext["sysFlag"],
+                System.Globalization.CultureInfo.InvariantCulture);
+            Assert.False(PullSysFlag.HasLitePullFlag(classicFlag), "经典 pull 不带 lite 位");
+            Assert.Equal(PullSysFlag.BuildSysFlag(false, false, true, false), classicFlag);
+        }
+        finally
+        {
+            c.Shutdown();
+            classic?.Shutdown();
         }
     }
 }

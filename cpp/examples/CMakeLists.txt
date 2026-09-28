@@ -41,6 +41,10 @@ target_link_libraries(rmq_live_lite_pull PRIVATE rocketmq::remoting)
 add_executable(rmq_live_lite_pull_cursor live_lite_pull_cursor.cpp)
 target_link_libraries(rmq_live_lite_pull_cursor PRIVATE rocketmq::remoting)
 
+# lite-pull 请求码/broker 开关真机验证（#107：361 + LITE_PULL_MESSAGE 位 + litePullMessageEnable）
+add_executable(rmq_live_lite_pull_code live_lite_pull_code.cpp)
+target_link_libraries(rmq_live_lite_pull_code PRIVATE rocketmq::remoting)
+
 # Request-Reply（5.x）真机联调（请求 → 应答 → 326 推回；不打进 ctest）
 add_executable(rmq_live_request_reply live_rr.cpp)
 target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)

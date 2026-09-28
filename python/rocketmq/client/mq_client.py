@@ -1028,7 +1028,13 @@ class MQClientInstance:
         header.expression_type = expression_type
         header.max_msg_bytes = max_msg_bytes
         header.request_source = request_source
-        request = RemotingCommand.create_request_command(RequestCode.PULL_MESSAGE, header)
+        # Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
+        # LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
+        # 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）
+        code = (RequestCode.LITE_PULL_MESSAGE
+                if PullSysFlag.has_lite_pull_flag(sys_flag)
+                else RequestCode.PULL_MESSAGE)
+        request = RemotingCommand.create_request_command(code, header)
         response = self._invoke_sync(addr, request, timeout_millis)
 
         status = PullStatus.NO_NEW_MSG

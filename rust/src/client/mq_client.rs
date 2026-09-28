@@ -2016,8 +2016,15 @@ impl MQClientInstance {
             request_source: Some(request_source),
             proxy_froward_client_id: None,
         };
-        let mut request =
-            RemotingCommand::create_request_command(request_code::PULL_MESSAGE, Some(Box::new(header)));
+        // Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
+        // LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
+        // 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）。
+        let code = if PullSysFlag::has_lite_pull_flag(sys_flag) {
+            request_code::LITE_PULL_MESSAGE
+        } else {
+            request_code::PULL_MESSAGE
+        };
+        let mut request = RemotingCommand::create_request_command(code, Some(Box::new(header)));
         let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
         let status = match response.code {
             response_code::SUCCESS => PullStatus::Found,

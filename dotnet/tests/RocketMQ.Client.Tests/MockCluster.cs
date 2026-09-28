@@ -432,7 +432,9 @@ internal sealed class MockCluster : IDisposable
     private RemotingCommand? BrokerRespond(int index, RemotingCommand req)
     {
         Record(req);
-        if (req.Code == RequestCode.PullMessage)
+        // 361 与 11 都按拉取应答：客户端是否切码由离线用例单独断言（#107），
+        // 这里只管「码换对了也得能通」。
+        if (req.Code == RequestCode.PullMessage || req.Code == RequestCode.LitePullMessage)
         {
             return req.IsOnewayRpc() ? null : PullRespond(req);
         }

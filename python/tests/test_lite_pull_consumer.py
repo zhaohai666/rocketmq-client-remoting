@@ -18,9 +18,13 @@ import pytest
 
 from rocketmq.client.consumer import DefaultLitePullConsumer
 from rocketmq.client.consumer_result import PullResult, PullStatus
+from rocketmq.client.exception import MQBrokerException, MQClientException
+from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.client.exception import MQClientException
+from rocketmq.common.sysflag import PullSysFlag
+from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
 from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType
+from rocketmq.remoting.protocol.remoting_command import RemotingCommand
 
 
 def _make_msg(topic: str, broker: str, qid: int, offset: int, body: str) -> MessageExt:
@@ -54,6 +58,8 @@ class MockClient:
         # 每次拉取请求的 queue_offset —— 「游标跟没跟上」这事只有请求偏移能证明。
         self.scripted: List = []
         self.pull_requests: List[int] = []
+        # #107：每次拉取的 sysFlag —— lite 位（0x10）在不在只有请求本身能证明。
+        self.pull_sys_flags: List[int] = []
 
     def start(self) -> None:
         pass
@@ -114,6 +120,7 @@ class MockClient:
                      timeout_millis=30000, max_msg_bytes=-1, suspend_timeout_millis=15000,
                      addr=None, request_source=0) -> PullResult:
         self.pull_requests.append(queue_offset)
+        self.pull_sys_flags.append(sys_flag)
         if self.scripted:
             entry = self.scripted.pop(0)
             # 可调用项在「请求途中」执行：模拟并发 seek / 撤队列这类中途改动
@@ -730,4 +737,96 @@ class TestPullCursorFollowsNextBeginOffset:
             assert c.poll(timeout=100) == [], "缓冲里不许有 seek 前窗口的消息"
         finally:
             c.shutdown()
+
+
+class TestLitePullWireContract:
+    """#107：lite pull 必须带 FLAG_LITE_PULL_MESSAGE(0x10) 且请求码走 361。
+
+    Java 把这两件事拆在两处：消费者侧 `DefaultLitePullConsumerImpl#pullSyncImpl:1058`
+    以 `buildSysFlag(false, block, true, false, /*litePull*/ true)` 置位；客户端 API 侧
+    `MQClientAPIImpl#pullMessage:816-820` 按位选码 —— 有 lite 位用
+    `LITE_PULL_MESSAGE(361)`，否则 `PULL_MESSAGE(11)`。任一处漏掉，请求在线上依然
+    完全合法（broker 照常回消息），但走的是普通 pull 线程池、且**不受
+    `litePullMessageEnable` 开关管辖**（`PullMessageProcessor:325` 只拦 361）——
+    离线 mock 不会自己喊，只有真机把开关翻掉才露馅（对照组：push/classic pull 照常）。
+    """
+
+    def test_lite_pull_sets_the_lite_flag_and_only_that(self):
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.set_auto_commit(False)
+        q0 = MessageQueue("T", "broker-a", 0)
+        c.assign([q0])
+        c.start()
+        try:
+            c._pull_one(q0)
+            flag = c._mock.pull_sys_flags[-1]
+            assert PullSysFlag.has_lite_pull_flag(flag) is True, \
+                "lite pull 必须置 FLAG_LITE_PULL_MESSAGE(0x10)：flag=%#x" % flag
+            # 与 Java pullSyncImpl:1058 的 (false, block, true, false, true) 对齐：
+            # 短轮询（suspend=False）+ 带订阅 + 不提交位点 + 非类过滤
+            assert PullSysFlag.has_commit_offset_flag(flag) is False
+            assert PullSysFlag.has_suspend_flag(flag) is False
+            assert PullSysFlag.has_subscription_flag(flag) is True
+            assert PullSysFlag.has_class_filter_flag(flag) is False
+        finally:
+            c.shutdown()
+
+    def test_classic_pull_flag_has_no_lite_bit(self):
+        # 反向对照：经典拉取（DefaultMQPullConsumerImpl.pullSyncImpl:248）用 4 参
+        # buildSysFlag，lite 位必须为 0 —— 否则普通消费者也会被 361 的开关误伤。
+        classic = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
+                                             subscription=True, class_filter=False)
+        assert PullSysFlag.has_lite_pull_flag(classic) is False
+
+    def _wire_pull(self, sys_flag, response=None):
+        """直接驱动 MQClient.pull_message（给出 addr 省掉路由查询），捕获出站请求。"""
+        client = MQClientInstance("DEFAULT@wiretest", ["127.0.0.1:9876"])
+        captured = {}
+
+        def fake_invoke(addr, request, timeout_millis=None):
+            captured["code"] = request.code
+            captured["sys_flag"] = request.custom_header.sys_flag
+            if response is not None:
+                return response
+            resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS)
+            resp.ext_fields = {"nextBeginOffset": "1", "minOffset": "0", "maxOffset": "5"}
+            return resp
+
+        client._invoke_sync = fake_invoke
+        mq = MessageQueue("T", "broker-a", 0)
+        client.pull_message("LitePG_UT", mq, 0, 32, sys_flag, 0, "*", 0, "TAG",
+                            addr="127.0.0.1:10911")
+        return captured
+
+    def test_client_api_switches_to_361_on_the_lite_bit(self):
+        # Java MQClientAPIImpl#pullMessage:816-820 的选码逻辑。
+        lite = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
+                                          subscription=True, class_filter=False,
+                                          lite_pull=True)
+        captured = self._wire_pull(lite)
+        assert captured["code"] == RequestCode.LITE_PULL_MESSAGE == 361
+        # 位必须真的上到线上（header.sysFlag），broker 侧还有一道 hasLitePullFlag 判位
+        assert PullSysFlag.has_lite_pull_flag(captured["sys_flag"]) is True
+
+    def test_client_api_keeps_11_without_the_lite_bit(self):
+        classic = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
+                                             subscription=True, class_filter=False)
+        captured = self._wire_pull(classic)
+        assert captured["code"] == RequestCode.PULL_MESSAGE == 11
+        assert PullSysFlag.has_lite_pull_flag(captured["sys_flag"]) is False
+
+    def test_lite_361_no_permission_surfaces_as_broker_exception(self):
+        # 开关关闭时 broker 回 NO_PERMISSION + 固定 remark（PullMessageProcessor:325-331）。
+        # 真机判别器靠这条 remark 断言"确实是被 lite 开关拦的"，别把它吞成通用错误。
+        lite = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
+                                          subscription=True, class_filter=False,
+                                          lite_pull=True)
+        denial = RemotingCommand.create_response_command(
+            ResponseCode.NO_PERMISSION,
+            "the broker[127.0.0.1:10911] for lite pull consumer is forbidden")
+        with pytest.raises(MQBrokerException) as ei:
+            self._wire_pull(lite, response=denial)
+        assert "for lite pull consumer is forbidden" in str(ei.value)
+
 

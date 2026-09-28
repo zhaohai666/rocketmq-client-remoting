@@ -4158,8 +4158,12 @@ class DefaultLitePullConsumer:
             self._next_offset[mq] = offset
         sub = self._subscription_for(mq.topic) or "*"
         # 短轮询（suspend=False），位点由 auto-commit 单独提交（与 Java LitePull 一致）
+        # lite_pull=True 置 FLAG_LITE_PULL_MESSAGE（Java `DefaultLitePullConsumerImpl
+        # #pullSyncImpl:1058` 的 buildSysFlag(false, block, true, false, true)），
+        # 下游 MQClientAPIImpl#pullMessage:816 据此把请求码切成 LITE_PULL_MESSAGE(361)
         sys_flag = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
-                                              subscription=True, class_filter=False)
+                                              subscription=True, class_filter=False,
+                                              lite_pull=True)
         try:
             result = self._mq_client.pull_message(
                 self.consumer_group, mq, offset, self.pull_batch_size,

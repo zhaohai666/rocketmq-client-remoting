@@ -1006,8 +1006,12 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     header->maxMsgBytes = maxMsgBytes;
     header->requestSource = requestSource;
 
-    RemotingCommand request =
-        RemotingCommand::createRequestCommand(RequestCode::PULL_MESSAGE, header);
+    // Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
+    // LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
+    // 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）
+    const int32_t code = PullSysFlag::hasLitePullFlag(sysFlag) ? RequestCode::LITE_PULL_MESSAGE
+                                                               : RequestCode::PULL_MESSAGE;
+    RemotingCommand request = RemotingCommand::createRequestCommand(code, header);
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
 
     PullStatus status = PullStatus::NO_NEW_MSG;
