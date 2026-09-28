@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，669 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，677 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -103,7 +103,7 @@ dotnet $PROG pinned-guard 127.0.0.1:9876  # 定点发送 topic 守卫：真路�
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
-其它子命令：`redelivery`（63 PASS / 0 FAIL，2026-09-24 实测；重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈/顺序死信 十二段）/ `acl` / `pull` / `rr`（request-reply 全链路，22 PASS / 0 FAIL：325 应答链路 + 10006 超时码 + 10007 造应答失败码）/ `latency` / `pop` / `popc`（POP 消费循环，11 PASS / 0 FAIL，见下）。
+其它子命令：`redelivery`（86 PASS / 0 FAIL，2026-09-28 实测；重投/死信/重启/顺序/广播/流控/rebalance/namespace/部分 ack/停摆自愈/顺序死信/显式 ack 回滚/空应答位点修正 十四段）/ `acl` / `pull` / `rr`（request-reply 全链路，22 PASS / 0 FAIL：325 应答链路 + 10006 超时码 + 10007 造应答失败码）/ `latency` / `pop` / `popc`（POP 消费循环，11 PASS / 0 FAIL，见下）。
 
 `redelivery` 的 S9 是**死信终态**，也是「用尽」这条判据唯一能验的地方——客户端只把
 `maxReconsumeTimes` 通过 `sendMessageBack` 的 header 递上去，真正决定第几次转死信的是 broker
@@ -163,6 +163,31 @@ context 上给了值就以它为准、context 保持 `-1` 才回落消费者配�
 会掉到闸门以下）；context 保持 `-1`、配置 400ms ⇒ `n=6 median=0.531s`（回落写丢就沿用 70ms 那一档）。
 判据取**区间**不取定值：间隔 = 挂起时长 + 派发轮询（本端口 200ms），定值比较会被轮询周期坑。
 
+`redelivery` 的 S13 是**顺序侧的显式批量 ack / 显式回滚**（Java `ConsumeMessageOrderlyService#processConsumeResult:246-296`，
+与 Python `verify_orderly_reconsume_live.py` 的 O5~O7、C++ `rmq_live_redelivery` 的 S13、Rust
+`live_consumer` 的 C13 同场景；两者都只在 `autoCommit=false` 时合法）。S13a `COMMIT` 把整批一次认可：
+1 队列 topic、批量上限 3、**先发 3 条再起消费者** ⇒ 首批就是完整三元素批次，6s 反证窗口里只出现这一批、
+3 条各只投一次、broker 位点从 0 直接到 **3**（不是卡在 0）。S13b `ROLLBACK` 把这一批退回 `ProcessQueue`
+后在**本地**立即重投、不过 broker：head 恰好投 7 次 = 6 次回滚 + 第 7 次提交，相邻间隔中位数实测
+`0.251s`（挂起配 200ms + 200ms 派发轮询）—— 而真走 `%RETRY%` 最快也只能等 broker 的第一个延迟档
+（`delayLevel=3` 即 10s），两者差一个量级；重投期间 `ReconsumeTimes` 保持 0 且 listener 看到的仍是业务
+topic（这就是「没过 broker」的直接证据），后面的消息不越位（`next` 首次出现在第 7 次投递之后，`idx7=6
+idxNext=7`），显式提交后 head/next 各一次、broker 位点到 2。S13c `autoCommit=true`（默认）时两者都是
+**非法用法**，Java `:246-250` 只 warn 然后顺势落进 SUCCESS 分支按 ack 处理 —— head 只投一次、next
+立刻被消费、位点到 2；真按回滚办的话 2.5s 反证窗口里 head 会被重投 ~10 次。
+
+`redelivery` 的 S14 是 **correctTagsOffset**（Java `DefaultMQPushConsumerImpl:713-717`，调用点 `:394-401`，
+与 Python `verify_correct_tags_offset_live.py`、C++ `rmq_live_correct_tags_offset`、Rust
+`live_correct_tags_offset` 同场景）：拉取应答是 `NO_NEW_MSG` / `NO_MATCHED_MSG` 时，这条队列的已消费
+位点必须跟着拉取游标 `nextBeginOffset` 走（只升不降，闸门要求 ProcessQueue 上既没有待消费也没有在途
+批次），否则没人 ack 的消息（broker 按订阅表达式过滤掉的不在应答里、客户端二次过滤摘掉的明确不 ack）
+会让位点永久卡死。三腿：S14a 对照组（`TagA`、4 队列）收齐 5 条且已提交位点 == 各队列 `maxOffset`
+（`q0:2/2 q1:1/1 q2:1/1 q3:1/1`）—— 先把「这个数值口径本身就是常规消费的落点」钉死，顺带证明消息确实
+在队列里；S14b 换永不匹配的 `TagB`：broker 过滤后应答 `NO_MATCHED_MSG`，listener **零投递**而每条队列的
+已提交位点仍等于该队列 `maxOffset`（不修正就永远停在未提交状态、broker 上查无此记录，位点总和与对照组
+同为 5）；S14c 同一消费者启动时自动补的 `%RETRY%<group>` 空队列（`PULL_NOT_FOUND` ⇒ `NO_NEW_MSG`）
+也留下值 == `maxOffset`(0) 的位点记录，且整轮 listener 依旧是 0 条 —— 修正只抬位点、不会凭空投递。
+
 `popc` 的 S5 是**POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage`
 的 `PopCallback.onSuccess:556-563`：`case FOUND:` 先 `IncPullRT`，这一格打在**空列表判定之前**，
 `MsgFoundList` 非空才 `IncPullTPS`；`POLLING_NOT_FOUND` 两格都不动 —— 空手而归是长轮询的常态，
@@ -211,7 +236,7 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | pinned-guard | 22 PASS / 0 FAIL（2026-09-28 实测） | S0~S6 定点发送的 topic 守卫真机（与 Python `verify_pinned_guard_live.py`、C++ `rmq_live_pinned_guard`、Rust `live_pinned_guard` 同场景。Java 全树只有两处守卫：同步 `DefaultMQProducerImpl:1234-1236` 抛 `message's topic not equal mq's topic`、异步 `:1277-1278` 抛 `Topic of the message does not match its target message queue`）：离线抓帧能证明「一笔请求都没上线」，但证明不了「**真路由取来的队列**不会被误伤」——守卫写宽一点、把 `mq.Topic` 与 `msg.Topic` 比错一边，离线预置的队列照样是绿的，线上第一条消息就发不出去。S0 两条 topic 都先建出真路由（反腿拒的必须是 topic，不是地址）→ S1 真路由队列上的放行腿：同步单条/批量都 SEND_OK 且落在指定队列、三笔子消息**真落库**（`maxOffset` = 单条 1 + 批量子消息 2，只信 broker 的队尾位点）→ S2 反腿：同步单条与批量都拒、文案逐字对 Java、**亚毫秒**返回且响应码是客户端默认值（不是超时、不是 broker 的 remark），wire 反证 A 的 `maxOffset` 一动没动、B 上一条都没有（「守卫只是抛错、消息其实已经发出去了」这种坏法只在 broker 侧看得出来）→ S3 命名空间按 Java 的包装后资源名比：队列 topic 已带 `ns1%` 前缀（真路由返回的就是这个形状）不误拒、消息 topic 自己已带前缀同样放行、换成 `ns2%` 才拒（对照腿：拒的是名字，不是「有前缀」），两条放行腿真落进 `ns1%topic` → S4 异步单条/批量：拒的时候走回调、用的是**异步那句**文案、拒后 `maxOffset` 仍不动；放行的两条腿 SEND_OK 且真落库（单条 1 + 子消息 2）→ S5 单向定点**故意没有**守卫（Java `sendOneway(msg, mq)` 直接进 `sendKernelImpl`）：报文按 **msg 自己的** topic 落进 A、目标队列所在的 B 一条都没有 —— 这不是漏发，是 Java 的口子，写在这里是为了让守卫的位置若被「顺手补齐」当场红 → S6 push 消费者把正腿消息一条不少地收齐（放行腿真的可消费，不只是 `SendOk`） |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **669 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **677 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`ConsumeThreadPoolTests`（23 项，消费线程弹性）锁住
 Java 5.x 的**默认值两侧同为 20**（`DefaultMQPushConsumer:162/:169`；4.x 才是 min=20/max=64，早年照抄了 4.x）
 以及 `UpdateCorePoolSize` 的三道守卫：无界队列下真实并发度 == `CorePoolSize`，默认配置里 core 只能往**下**调，

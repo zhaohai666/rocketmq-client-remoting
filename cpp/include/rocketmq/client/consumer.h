@@ -451,6 +451,18 @@ public:
     // maxReconsumeTimes 的口径不同（Java 两处各调各的 getMaxReconsumeTimes），所以显式传。
     Message buildRetryMessage(const MessageExt& msg, int32_t maxReconsumeTimes) const;
 
+    // ---- correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）----
+    // 拉取应答是 NO_NEW_MSG / NO_MATCHED_MSG（一条可投递的都没有）时，把"已消费位点"
+    // 抬到应答的 nextBeginOffset。背景与判据见 .cpp 里的函数注释；「哪些状态要修正 +
+    // 何时允许修正」都收在这一处，离线单测因此能一次锁死（真机上漏了它只表现为：
+    // tag 长期不匹配的队列位点原地不动，重启后把这批没人要的消息反复重扫）。
+    void correctTagsOffset(const std::string& key, PullStatus status, int64_t nextOffset);
+    // 「取走一批 + 登记在途」/「消费收尾 + 注销在途」：dispatchLoop 的生产路径用的就是
+    // 这两个（取走时与 pending_ 同一把锁登记）。漏登记 = 闸门看不见在途批次，崩溃恢复
+    // 时会静默跳过消息；漏注销 = 闸门永远关着，correctTagsOffset 一次都不生效。
+    std::vector<MessageExt> takeBatchForConsume(const std::string& key);
+    void finishBatchConsume(const std::string& key);
+
     // ---- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）----
     // 上游 5.5.0：请求去重入队后 run() 拿到队列锁就返回（POPTODO，
     // DefaultMQPushConsumerImpl:533）——消息**不消费、不 ack**，invisibleTime 到期由
@@ -524,6 +536,11 @@ private:
     //  提交位点只能是 firstKey，否则会静默丢掉那条）。空批次直接返回。
     void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch,
                               const std::optional<int64_t>& floor = std::nullopt);
+    // 以下三个要求调用方已持 lock_（生产路径就在既有临界区里调；公开的三个同名
+    // 函数只是加锁包装，供单测直接驱动）。
+    void correctTagsOffsetLocked(const std::string& key, PullStatus status, int64_t nextOffset);
+    std::vector<MessageExt> takeBatchLocked(const std::string& key);
+    void finishBatchLocked(const std::string& key);
     // 回投兜底（Java sendMessageBackAsNormalMessage）
     void sendMessageBackAsNormalMessage(const MessageExt& msg);
     // 顺序消费的重投闸门（Java ConsumeMessageOrderlyService#checkReconsumeTimes /
@@ -707,6 +724,10 @@ private:
     std::map<std::string, MessageQueue> mqMap_;
     // 已拉未消费缓冲（Java ProcessQueue 的简化版）
     std::map<std::string, std::deque<MessageExt>> pending_;
+    // 在途批次计数（Java ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
+    // dispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。pending_ 与它合起来才是
+    // Java 的 ProcessQueue.getMsgCount()，correctTagsOffsetLocked 的闸门两个都要看。
+    std::map<std::string, int> inflightCount_;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
     std::set<std::string> lockOk_;
 

@@ -488,6 +488,10 @@ public sealed class DefaultMQPushConsumer
     private readonly Dictionary<string, long> _consumeOffsetTable = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MessageQueue> _mqMap = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Queue<MessageExt>> _pending = new(StringComparer.Ordinal);
+    // 在途批次计数（Java ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
+    // DispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。_pending 与它合起来才是
+    // Java 的 ProcessQueue.GetMsgCount()，CorrectTagsOffsetLocked 的闸门两个都要看。
+    private readonly Dictionary<string, int> _inFlight = new(StringComparer.Ordinal);
     // Start() 时刻（307 应答 PROP_CONSUMER_START_TIMESTAMP，对应 Java consumerStartTimestamp）
     private long _startTimestamp;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
@@ -2741,6 +2745,9 @@ public sealed class DefaultMQPushConsumer
                 lock (_lock)
                 {
                     _offsetTable[key] = result.NextBeginOffset;
+                    // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+                    // NO_MATCHED_MSG）时修正"已消费位点"，见 CorrectTagsOffsetLocked
+                    CorrectTagsOffsetLocked(key, result.Status, result.NextBeginOffset);
                 }
             }
         }
@@ -3294,19 +3301,7 @@ public sealed class DefaultMQPushConsumer
                     }
                 }
 
-                List<MessageExt> batch = new();
-                lock (_lock)
-                {
-                    if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
-                    {
-                        int n = Math.Min(q.Count, Math.Max(1, _consumeMessageBatchMaxSize));
-                        for (int i = 0; i < n; ++i)
-                        {
-                            batch.Add(q.Dequeue());
-                        }
-                    }
-                }
-
+                List<MessageExt> batch = TakeBatchForConsume(key);
                 if (batch.Count == 0) continue;
                 try
                 {
@@ -3329,6 +3324,10 @@ public sealed class DefaultMQPushConsumer
                     }
 
                     _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
+                }
+                finally
+                {
+                    FinishBatchConsume(key);
                 }
             }
 
@@ -3984,6 +3983,125 @@ public sealed class DefaultMQPushConsumer
             {
                 _consumeOffsetTable[key] = nextOffset;
             }
+        }
+    }
+
+    /// <summary>
+    /// Java <c>DefaultMQPushConsumerImpl#correctTagsOffset:713-717</c>（调用点 <c>:394-401</c>）。
+    /// 调用方须持 <c>_lock</c>。
+    /// <para>
+    /// 拉取应答是 <c>NoNewMsg</c>（队列里真没消息）或 <c>NoMatchedMsg</c>（broker 侧按订阅
+    /// 表达式过完一轮、一条都没匹配上，见 <c>MQClientAPIImpl:1095-1097</c> 把
+    /// <c>PULL_RETRY_IMMEDIATELY</c> 映射成它）时，这条队列的"已消费位点"必须跟着拉取游标
+    /// 走，否则会<b>永久卡死</b>：没人 ack 的消息不属于任何人（broker 侧被过滤掉的不在应答里，
+    /// 客户端二次 tag 过滤摘掉的又明确不 ack），位点不动就永远停在原地，重投/重启后再把这批
+    /// 没人要的消息从头扫一遍。
+    /// </para>
+    /// <para>
+    /// Java 的更新是 <c>offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)</c>
+    /// （只前进不回退），且有一道闸：<c>0L == processQueue.getMsgCount()</c>。<c>msgCount</c>
+    /// 数的是<b>仍在 ProcessQueue 里</b>的消息 —— 并发消费的 <c>removeMessage</c> 要等
+    /// listener 返回之后才调（<c>ConsumeMessageConcurrentlyService:266</c>），所以在途批次
+    /// 也算数；不等它落定就抬位点，进程崩溃时这批消息会被静默跳过。本端口把 <c>_pending</c>
+    /// 为空与 <c>_inFlight</c> 为 0 合成同一判据，后者的登记与"取走批次"在
+    /// <see cref="TakeBatchForConsume"/> 的同一把锁里完成。
+    /// </para>
+    /// <para>
+    /// 与 Java 的唯一有意偏差是把状态判据也收进了本函数（Java 在回调的 switch 里），这样
+    /// 离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
+    /// </para>
+    /// </summary>
+    private void CorrectTagsOffsetLocked(string key, PullStatus status, long nextOffset)
+    {
+        if (status != PullStatus.NoNewMsg && status != PullStatus.NoMatchedMsg)
+        {
+            return;
+        }
+
+        if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
+        {
+            return;
+        }
+
+        if (_inFlight.TryGetValue(key, out int inFlight) && inFlight > 0)
+        {
+            return;
+        }
+
+        // Java RemoteBrokerOffsetStore.updateOffset:61-64：表里没有这条记录时
+        // putIfAbsent(mq, new ControllableOffset(offset)) —— 无条件建条目，哪怕 offset == 0。
+        // 用 TryGetValue 的默认值 0 会把「没有记录」与「记录是 0」混同：空队列
+        // （nextBeginOffset == 0）的首次修正变成静默 no-op，broker 上永远查不到记录。
+        if (!_consumeOffsetTable.TryGetValue(key, out long cur) || cur < nextOffset)
+        {
+            _consumeOffsetTable[key] = nextOffset;
+        }
+    }
+
+    /// <summary>
+    /// 「取走一批 + 登记在途」：DispatchLoop 的生产路径用的就是这里（取走与登记同一把锁）。
+    /// 漏登记 = <see cref="CorrectTagsOffsetLocked"/> 的闸门看不见在途批次，崩溃恢复时会静默
+    /// 跳过消息；漏调用 <see cref="FinishBatchConsume"/> = 闸门永远关着，correctTagsOffset
+    /// 一次都不生效。所以这两个与 <c>ConsumeBatchForTest</c> 同一理由开放给单测。
+    /// </summary>
+    public List<MessageExt> TakeBatchForConsume(string key)
+    {
+        List<MessageExt> batch = new();
+        lock (_lock)
+        {
+            if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
+            {
+                int n = Math.Min(q.Count, Math.Max(1, _consumeMessageBatchMaxSize));
+                for (int i = 0; i < n; ++i)
+                {
+                    batch.Add(q.Dequeue());
+                }
+            }
+
+            if (batch.Count > 0)
+            {
+                _inFlight.TryGetValue(key, out int cur);
+                _inFlight[key] = cur + 1;
+            }
+        }
+
+        return batch;
+    }
+
+    /// <summary>「消费收尾 + 注销在途」：异常回塞路径同样要调，否则闸门永远关着。</summary>
+    public void FinishBatchConsume(string key)
+    {
+        lock (_lock)
+        {
+            if (_inFlight.TryGetValue(key, out int cur))
+            {
+                if (cur <= 1)
+                {
+                    _inFlight.Remove(key);
+                }
+                else
+                {
+                    _inFlight[key] = cur - 1;
+                }
+            }
+        }
+    }
+
+    /// <summary>供单测直接驱动 <see cref="CorrectTagsOffsetLocked"/>（加锁包装）。</summary>
+    public void CorrectTagsOffsetForTest(string key, PullStatus status, long nextOffset)
+    {
+        lock (_lock)
+        {
+            CorrectTagsOffsetLocked(key, status, nextOffset);
+        }
+    }
+
+    /// <summary>在途批次计数（Java <c>ProcessQueue.msgCount</c> 里"listener 手里"那部分），供单测观察登记/注销。</summary>
+    public int InFlightForTest(string key)
+    {
+        lock (_lock)
+        {
+            return _inFlight.TryGetValue(key, out int cur) ? cur : 0;
         }
     }
 

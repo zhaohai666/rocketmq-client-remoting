@@ -1203,6 +1203,9 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
         if (result.nextBeginOffset >= 0) {
             std::lock_guard<std::mutex> lk(lock_);
             offsetTable_[key] = result.nextBeginOffset;
+            // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+            // NO_MATCHED_MSG）时修正"已消费位点"，见 correctTagsOffsetLocked
+            correctTagsOffsetLocked(key, result.status, result.nextBeginOffset);
         }
     }
 }
@@ -1609,19 +1612,8 @@ void DefaultMQPushConsumer::dispatchLoop() {
                 if (it == mqMap_.end()) continue;
                 mq = it->second;
             }
-            std::vector<MessageExt> batch;
-            {
-                std::lock_guard<std::mutex> lk(lock_);
-                auto it = pending_.find(key);
-                if (it == pending_.end() || it->second.empty()) continue;
-                const size_t n = static_cast<size_t>(
-                    std::min<size_t>(it->second.size(),
-                                     static_cast<size_t>(std::max(1, consumeMessageBatchMaxSize_))));
-                for (size_t i = 0; i < n; ++i) {
-                    batch.push_back(it->second.front());
-                    it->second.pop_front();
-                }
-            }
+            std::vector<MessageExt> batch = takeBatchForConsume(key);
+            if (batch.empty()) continue;
             try {
                 bool done = consumeBatch(key, mq, batch);
                 progressed = progressed || done;
@@ -1637,6 +1629,7 @@ void DefaultMQPushConsumer::dispatchLoop() {
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
+            finishBatchConsume(key);
         }
         if (!progressed) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2279,6 +2272,88 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
     if (it == consumeOffsetTable_.end() || it->second < nextOffset) {
         consumeOffsetTable_[key] = nextOffset;
     }
+}
+
+// Java DefaultMQPushConsumerImpl#correctTagsOffset:713-717（调用点 :394-401）。须持 lock_。
+//
+// 拉取应答是 NO_NEW_MSG（队列里真没消息）或 NO_MATCHED_MSG（broker 侧按订阅表达式过完
+// 一轮、一条都没匹配上，见 MQClientAPIImpl:1095-1097 把 PULL_RETRY_IMMEDIATELY 映射成
+// 它）时，这条队列的"已消费位点"必须跟着拉取游标走，否则会**永久卡死**：没人 ack 的消息
+// 不属于任何人（broker 侧被过滤掉的不在应答里，客户端二次 tag 过滤摘掉的又明确不 ack），
+// 位点不动就永远停在原地，重投/重启后再把这批没人要的消息从头扫一遍。
+//
+// Java 的更新是 offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)（只前进不回退），
+// 且有一道闸：0L == processQueue.getMsgCount()。msgCount 数的是**仍在 ProcessQueue 里**的
+// 消息 —— 并发消费的 removeMessage 要等 listener 返回之后才调
+//（ConsumeMessageConcurrentlyService:266），所以在途批次也算数；不等它落定就抬位点，
+// 进程崩溃时这批消息会被静默跳过。本端口把 pending_ 为空与 inflightCount_ 为 0 合成同一
+// 判据，后者的登记与"取走批次"在 dispatchLoop 的同一把锁里完成（见 takeBatchLocked）。
+//
+// 与 Java 的唯一有意偏差是把状态判据也收进了本函数（Java 在回调的 switch 里），这样离线
+// 单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
+void DefaultMQPushConsumer::correctTagsOffsetLocked(const std::string& key, PullStatus status,
+                                                    int64_t nextOffset) {
+    if (status != PullStatus::NO_NEW_MSG && status != PullStatus::NO_MATCHED_MSG) {
+        return;
+    }
+    auto pendingIt = pending_.find(key);
+    if (pendingIt != pending_.end() && !pendingIt->second.empty()) {
+        return;
+    }
+    auto inflightIt = inflightCount_.find(key);
+    if (inflightIt != inflightCount_.end() && inflightIt->second > 0) {
+        return;
+    }
+    auto it = consumeOffsetTable_.find(key);
+    if (it == consumeOffsetTable_.end() || it->second < nextOffset) {
+        consumeOffsetTable_[key] = nextOffset;
+    }
+}
+
+void DefaultMQPushConsumer::correctTagsOffset(const std::string& key, PullStatus status,
+                                              int64_t nextOffset) {
+    std::lock_guard<std::mutex> lk(lock_);
+    correctTagsOffsetLocked(key, status, nextOffset);
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::takeBatchLocked(const std::string& key) {
+    auto it = pending_.find(key);
+    if (it == pending_.end() || it->second.empty()) {
+        return {};
+    }
+    const size_t n = static_cast<size_t>(
+        std::min<size_t>(it->second.size(),
+                         static_cast<size_t>(std::max(1, consumeMessageBatchMaxSize_))));
+    std::vector<MessageExt> batch;
+    batch.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        batch.push_back(it->second.front());
+        it->second.pop_front();
+    }
+    // 与"取走批次"同一临界区登记在途：correctTagsOffsetLocked 的闸门靠它区分
+    // "消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
+    ++inflightCount_[key];
+    return batch;
+}
+
+void DefaultMQPushConsumer::finishBatchLocked(const std::string& key) {
+    auto it = inflightCount_.find(key);
+    if (it == inflightCount_.end()) {
+        return;
+    }
+    if (--it->second <= 0) {
+        inflightCount_.erase(it);
+    }
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::takeBatchForConsume(const std::string& key) {
+    std::lock_guard<std::mutex> lk(lock_);
+    return takeBatchLocked(key);
+}
+
+void DefaultMQPushConsumer::finishBatchConsume(const std::string& key) {
+    std::lock_guard<std::mutex> lk(lock_);
+    finishBatchLocked(key);
 }
 
 // ---------------------------------------------------------------- 位点持久化

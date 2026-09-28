@@ -247,3 +247,12 @@ add_test(NAME pull_post_subscription COMMAND rmq_test_pull_post_subscription)
 add_executable(rmq_test_produce_accumulator test_produce_accumulator.cpp)
 target_link_libraries(rmq_test_produce_accumulator PRIVATE rocketmq::remoting)
 add_test(NAME produce_accumulator COMMAND rmq_test_produce_accumulator)
+
+# correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）：
+# 空应答（NO_NEW_MSG / NO_MATCHED_MSG）且 ProcessQueue 为空时把"已消费位点"抬到
+# 应答的 nextBeginOffset（increaseOnly）；闸门 = pending 为空 **且** 在途批次为 0
+#（Java msgCount 要等 listener 返回才减）。漏了它位点永久落后、闸门写松则崩溃时静默跳消息。
+# 与 python/tests/test_correct_tags_offset.py、rust/src/client/consumer.rs 同名测试同题。
+add_executable(rmq_test_correct_tags_offset test_correct_tags_offset.cpp)
+target_link_libraries(rmq_test_correct_tags_offset PRIVATE rocketmq::remoting)
+add_test(NAME correct_tags_offset COMMAND rmq_test_correct_tags_offset)

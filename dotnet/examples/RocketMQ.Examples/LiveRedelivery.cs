@@ -21,6 +21,16 @@
 // S12b 顺序侧的 -1 是**不设上限**（投过 >=18 次、%DLQ% 空），不是并发侧的 16
 // S12c context.SuspendCurrentQueueTimeMillis 优先于消费者配置（配置 900/context 70 ⇒ 相邻投递
 //    中位间隔贴着 70ms+50ms 节拍；context -1 ⇒ 回落配置 400ms；1ms/0 两个非法值钳到下限不忙等）
+// S13 顺序侧显式批量 ack（COMMIT，autoCommit=false）/ 显式回滚（ROLLBACK 当场重投）：
+//    Java ConsumeMessageOrderlyService#processConsumeResult:270-300 —— a) COMMIT 一批 3 条一次
+//    认可（位点直接到 3）；b) ROLLBACK 把这条退回**本地**重投（间隔贴着 200ms 挂起，reconsumeTimes
+//    不动、topic 不变、后面的消息不越位；回滚 6 次后提交，位点到 2）；c) autoCommit=true 时
+//    ROLLBACK 是非法用法，只 warn 并按成功 ack（head 只投一次、next 立刻被消费、位点到 2）
+// S14 correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）：空应答
+//    （NO_NEW_MSG / NO_MATCHED_MSG）时把"已消费位点"抬到拉取游标（只前进不回退，且闸门要求
+//    ProcessQueue 里既没有待消费也没有在途批次）。三腿：a) 对照组 TagA 正常收齐 5 条且
+//    committed == 各队列 maxOffset（数值口径）；b) TagB 永不匹配 ⇒ listener 零投递但每条队列的
+//    committed 仍 == maxOffset（不修正就永远查无记录）；c) %RETRY%<group> 空队列出现 0 位点记录
 //
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
 //   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
@@ -123,6 +133,8 @@ public static class LiveRedelivery
         ScenarioOrderlyDlq(producer);
         ScenarioOrderlyNoCap(producer);
         ScenarioOrderlySuspendMillis(producer);
+        ScenarioOrderlyAckRollback(producer);
+        ScenarioCorrectTagsOffset(producer);
 
         producer.Shutdown();
         Console.WriteLine();
@@ -1299,6 +1311,508 @@ public static class LiveRedelivery
         consumer.Shutdown();
     }
 
+    // ---------------- S13 顺序侧显式批量 ack（COMMIT）/ 显式回滚（ROLLBACK）----------------
+
+    private enum ManualMode
+    {
+        CommitOnce,          // autoCommit=false + COMMIT：显式整批认可
+        RollbackThenCommit,  // autoCommit=false + ROLLBACK：退回本地重投若干次，再整批认可
+        IllegalRollback,     // autoCommit 保持 true 却返回 ROLLBACK：非法用法，按 ack 处理
+    }
+
+    private sealed class ManualOrderlyListener : IMessageListenerOrderly
+    {
+        private readonly ManualMode _mode;
+        private readonly string _head;
+        private readonly int _rollbackCalls;
+        private readonly object _gate = new();
+        private readonly List<List<string>> _batches = new();
+        private readonly List<(string Body, int ReconsumeTimes, string Topic, long Ts)> _seen = new();
+        private int _headCalls;
+
+        public ManualOrderlyListener(ManualMode mode, string head, int rollbackCalls)
+        {
+            _mode = mode;
+            _head = head;
+            _rollbackCalls = rollbackCalls;
+        }
+
+        public bool Orderly() => true;
+
+        public List<List<string>> Batches()
+        {
+            lock (_gate) return new List<List<string>>(_batches);
+        }
+
+        public List<(string Body, int ReconsumeTimes, string Topic, long Ts)> Snapshot()
+        {
+            lock (_gate) return new List<(string Body, int ReconsumeTimes, string Topic, long Ts)>(_seen);
+        }
+
+        public int Count(string body)
+        {
+            lock (_gate) return _seen.Count(r => r.Body == body);
+        }
+
+        public int FirstIndex(string body)
+        {
+            lock (_gate)
+            {
+                for (int i = 0; i < _seen.Count; ++i)
+                {
+                    if (_seen[i].Body == body) return i;
+                }
+
+                return -1;
+            }
+        }
+
+        public List<double> HeadGaps(string body)
+        {
+            lock (_gate)
+            {
+                var stamps = _seen.Where(r => r.Body == body).Select(r => r.Ts).ToList();
+                var gaps = new List<double>();
+                for (int i = 1; i < stamps.Count; ++i)
+                {
+                    gaps.Add((stamps[i] - stamps[i - 1]) / 1000.0);
+                }
+
+                return gaps;
+            }
+        }
+
+        public ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext ctx)
+        {
+            bool hit = msgs.Any(m => Body(m) == _head);
+            int n;
+            lock (_gate)
+            {
+                _batches.Add(msgs.Select(Body).ToList());
+                foreach (MessageExt m in msgs)
+                {
+                    _seen.Add((Body(m), m.ReconsumeTimes, m.Topic, NowMs()));
+                }
+
+                if (hit) ++_headCalls;
+                n = _headCalls;
+            }
+
+            if (_mode == ManualMode.CommitOnce)
+            {
+                ctx.AutoCommit = false;
+                return ConsumeOrderlyStatus.Commit;
+            }
+
+            if (_mode == ManualMode.RollbackThenCommit)
+            {
+                ctx.AutoCommit = false;
+                return hit && n <= _rollbackCalls
+                    ? ConsumeOrderlyStatus.Rollback
+                    : ConsumeOrderlyStatus.Commit;
+            }
+
+            // 非法用法：不碰 AutoCommit（保持默认 true），只改返回值
+            return ConsumeOrderlyStatus.Rollback;
+        }
+    }
+
+    /// <summary>
+    /// S13：Java 顺序消费 processConsumeResult 的显式分支（ConsumeMessageOrderlyService:270-300）。
+    /// 三条探针的判别力都在"本地 vs broker"上：真回滚是 ProcessQueue 本地重投（间隔贴着挂起
+    /// 时长、reconsumeTimes 不动），任何"交给 broker 走 %RETRY%"的实现最快也是 delayLevel=3
+    /// 的 10s 档 —— 间隔量级差 40 倍以上，真机完全可分。
+    /// </summary>
+    private static void ScenarioOrderlyAckRollback(DefaultMQProducer producer)
+    {
+        ManualAckCommitProbe(producer);
+        ManualRollbackProbe(producer);
+        ManualIllegalRollbackProbe(producer);
+    }
+
+    private static long ReadCommitted(DefaultMQAdminExt admin, MessageQueue mq, string group)
+    {
+        try
+        {
+            return admin.ExamineConsumerOffset(group, mq, out long off) ? off : -1;
+        }
+        catch (Exception)
+        {
+            return -1;
+        }
+    }
+
+    /// <summary>S13a autoCommit=false + COMMIT：整批 3 条一次认可（Java:275-277）。</summary>
+    private static void ManualAckCommitProbe(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_OrdCommit";
+        string group = _gPrefix + "_g13a";
+        PrepareTopic(producer, topic, 1);
+
+        var listener = new ManualOrderlyListener(ManualMode.CommitOnce, "cm-none", 0);
+        var c = NewConsumer(group);
+        c.ConsumeMessageBatchMaxSize = 3;
+        // 新组 LAST_OFFSET 会从分配时刻起算，先放 3 条再起消费者 + 显式从 0 起消，
+        // 首次拉取才正好是「一整批 3 条」（同 S10 的口径）
+        c.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
+        c.SetMessageListener(listener);
+        c.Subscribe(topic, "*");
+        for (int i = 0; i < 3; ++i)
+        {
+            producer.Send(new Message(topic, Str2Bytes("cm-" + i.ToString(CultureInfo.InvariantCulture))));
+        }
+
+        c.Start();
+        WaitUntil(() => listener.Batches().Count >= 1, 30000);
+        Thread.Sleep(6000);  // 反证窗口：COMMIT 若被当成"不提交"，200ms 挂起节奏下 6s 会重投 ~30 次
+        List<List<string>> batches = listener.Batches();
+        bool firstBatch3 = batches.Count > 0 && batches[0].Count == 3;
+        Check("S13a-首批就是整批 3 条（COMMIT 一次认可整批）",
+            firstBatch3,
+            "firstBatch=" + (batches.Count > 0 ? batches[0].Count.ToString(CultureInfo.InvariantCulture) : "none"));
+        Check("S13a-6 秒里只投了这一批（COMMIT 不是被当成 SUCCESS 的不提交）",
+            batches.Count == 1,
+            "batches=" + batches.Count.ToString(CultureInfo.InvariantCulture));
+        Check("S13a-3 条各只投一次（整批 ack 未回投）",
+            listener.Count("cm-0") == 1 && listener.Count("cm-1") == 1 && listener.Count("cm-2") == 1,
+            "deliveries=" + (listener.Count("cm-0") + listener.Count("cm-1") + listener.Count("cm-2"))
+                .ToString(CultureInfo.InvariantCulture));
+
+        List<MessageQueue> queues = c.FetchSubscribeMessageQueues(topic);
+        c.Shutdown();
+        var admin = new DefaultMQAdminExt();
+        admin.SetNamesrvAddr(_namesrv);
+        admin.SetTimeoutMillis(10000);
+        try
+        {
+            admin.Start();
+            if (queues.Count > 0)
+            {
+                MessageQueue mq = queues[0];
+                WaitUntil(() => ReadCommitted(admin, mq, group) == 3, 30000);
+                Check("S13a-broker 位点一次前进到批尾 3（整批 ack，不是卡在 0）",
+                    ReadCommitted(admin, mq, group) == 3,
+                    "committed=" + ReadCommitted(admin, mq, group).ToString(CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                Check("S13a-业务 topic 有队列可查位点", false, "queues=0");
+            }
+        }
+        catch (Exception e)
+        {
+            Check("S13a-位点查询可用", false, e.Message);
+        }
+
+        admin.Shutdown();
+    }
+
+    /// <summary>S13b autoCommit=false + ROLLBACK：显式回滚、本地立即重投（Java:278-285）。</summary>
+    private static void ManualRollbackProbe(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_OrdRollback";
+        string group = _gPrefix + "_g13b";
+        PrepareTopic(producer, topic, 1);
+
+        var listener = new ManualOrderlyListener(ManualMode.RollbackThenCommit, "rb-head", 6);
+        var c = NewConsumer(group);
+        c.ConsumeMessageBatchMaxSize = 1;
+        c.MaxReconsumeTimes = -1;  // 顺序侧不设上限，免得本地重投被判成毒消息
+        c.SuspendCurrentQueueTimeMillis = 200;
+        c.SetMessageListener(listener);
+        c.Subscribe(topic, "*");
+        c.Start();
+        // 等首轮 LOCK_BATCH_MQ：没拿到队列锁时 broker 会把顺序重投直接改投死信
+        Thread.Sleep(4000);
+        producer.Send(new Message(topic, Str2Bytes("rb-head")));
+        producer.Send(new Message(topic, Str2Bytes("rb-next")));
+
+        bool arrived = WaitUntil(() => listener.Count("rb-head") >= 7 && listener.FirstIndex("rb-next") >= 0, 45000);
+        Thread.Sleep(2000);  // 反证窗口：退回重投只该按提交次数收尾，多余的投递会露出来
+        List<double> gaps = listener.HeadGaps("rb-head");
+        double med = Median(gaps);
+        double worst = gaps.Count > 0 ? gaps.Max() : 0;
+        var headRecords = listener.Snapshot().Where(r => r.Body == "rb-head").ToList();
+        // 第 7 次投递在整条序列里的下标（idx7 之前的 head 投递都不算数）
+        int idx7 = -1;
+        int seenHead = 0;
+        List<(string Body, int ReconsumeTimes, string Topic, long Ts)> all = listener.Snapshot();
+        for (int i = 0; i < all.Count; ++i)
+        {
+            if (all[i].Body == "rb-head" && ++seenHead == 7)
+            {
+                idx7 = i;
+                break;
+            }
+        }
+
+        int idxNext = listener.FirstIndex("rb-next");
+
+        Check("S13b-显式回滚把同一批退回重投（head 投递 7 次 = 6 次回滚 + 1 次提交）",
+            arrived && listener.Count("rb-head") == 7,
+            "deliveries=" + listener.Count("rb-head").ToString(CultureInfo.InvariantCulture));
+        Check("S13b-本地重投不过 broker：相邻间隔贴着 200ms 挂起（%RETRY% 最快 10s 档）",
+            gaps.Count >= 5 && med < 1.0 && worst < 5.0,
+            "n=" + gaps.Count.ToString(CultureInfo.InvariantCulture)
+            + " median=" + med.ToString("F3", CultureInfo.InvariantCulture)
+            + "s max=" + worst.ToString("F3", CultureInfo.InvariantCulture) + "s");
+        Check("S13b-本地重投不动 reconsumeTimes、不换 topic（没有走 %RETRY%）",
+            headRecords.Count > 0 && headRecords.All(r => r.ReconsumeTimes == 0 && r.Topic == topic),
+            "times=" + string.Join(",",
+                headRecords.Select(r => r.ReconsumeTimes.ToString(CultureInfo.InvariantCulture))));
+        Check("S13b-已提交前 next 不越位（回滚期间后面的消息不放行）",
+            idx7 >= 0 && idxNext > idx7,
+            "idx7=" + idx7.ToString(CultureInfo.InvariantCulture)
+            + " idxNext=" + idxNext.ToString(CultureInfo.InvariantCulture));
+        Check("S13b-收尾后 head 恰好 7 次、next 恰好 1 次",
+            listener.Count("rb-head") == 7 && listener.Count("rb-next") == 1,
+            "head=" + listener.Count("rb-head").ToString(CultureInfo.InvariantCulture)
+            + " next=" + listener.Count("rb-next").ToString(CultureInfo.InvariantCulture));
+
+        List<MessageQueue> queues = c.FetchSubscribeMessageQueues(topic);
+        c.Shutdown();
+        var admin = new DefaultMQAdminExt();
+        admin.SetNamesrvAddr(_namesrv);
+        admin.SetTimeoutMillis(10000);
+        try
+        {
+            admin.Start();
+            if (queues.Count > 0)
+            {
+                MessageQueue mq = queues[0];
+                WaitUntil(() => ReadCommitted(admin, mq, group) == 2, 30000);
+                Check("S13b-回滚不提前提交位点，提交后位点到 2",
+                    ReadCommitted(admin, mq, group) == 2,
+                    "committed=" + ReadCommitted(admin, mq, group).ToString(CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                Check("S13b-业务 topic 有队列可查位点", false, "queues=0");
+            }
+        }
+        catch (Exception e)
+        {
+            Check("S13b-位点查询可用", false, e.Message);
+        }
+
+        admin.Shutdown();
+    }
+
+    /// <summary>
+    /// S13c autoCommit=true + ROLLBACK = 非法用法（Java:246-250 只 warn）⇒ 顺势落进 SUCCESS 分支
+    /// 按 ack 处理。真按回滚办的话 head 会被挂起节奏反复投递、next 永远不放行 —— 两种行为完全可分。
+    /// </summary>
+    private static void ManualIllegalRollbackProbe(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_OrdIllegal";
+        string group = _gPrefix + "_g13c";
+        PrepareTopic(producer, topic, 1);
+
+        var listener = new ManualOrderlyListener(ManualMode.IllegalRollback, "il-none", 0);
+        var c = NewConsumer(group);
+        c.ConsumeMessageBatchMaxSize = 1;
+        c.SuspendCurrentQueueTimeMillis = 200;
+        c.SetMessageListener(listener);
+        c.Subscribe(topic, "*");
+        c.Start();
+        Thread.Sleep(4000);
+        producer.Send(new Message(topic, Str2Bytes("il-head")));
+        producer.Send(new Message(topic, Str2Bytes("il-next")));
+
+        WaitUntil(() => listener.FirstIndex("il-next") >= 0, 30000);
+        Thread.Sleep(2500);  // 反证窗口：真按回滚办的话这 2.5s 里 head 会被重投 ~10 次
+        Check("S13c-autoCommit=true 时 ROLLBACK 按 ack 处理：head 只投一次",
+            listener.Count("il-head") == 1,
+            "head=" + listener.Count("il-head").ToString(CultureInfo.InvariantCulture));
+        Check("S13c-非法 ROLLBACK 不阻塞队列：next 立刻被消费",
+            listener.FirstIndex("il-next") >= 0,
+            "idxNext=" + listener.FirstIndex("il-next").ToString(CultureInfo.InvariantCulture)
+            + " next=" + listener.Count("il-next").ToString(CultureInfo.InvariantCulture));
+
+        List<MessageQueue> queues = c.FetchSubscribeMessageQueues(topic);
+        c.Shutdown();
+        var admin = new DefaultMQAdminExt();
+        admin.SetNamesrvAddr(_namesrv);
+        admin.SetTimeoutMillis(10000);
+        try
+        {
+            admin.Start();
+            if (queues.Count > 0)
+            {
+                MessageQueue mq = queues[0];
+                WaitUntil(() => ReadCommitted(admin, mq, group) == 2, 30000);
+                Check("S13c-broker 位点前进到 2（非法用法按成功 ack）",
+                    ReadCommitted(admin, mq, group) == 2,
+                    "committed=" + ReadCommitted(admin, mq, group).ToString(CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                Check("S13c-业务 topic 有队列可查位点", false, "queues=0");
+            }
+        }
+        catch (Exception e)
+        {
+            Check("S13c-位点查询可用", false, e.Message);
+        }
+
+        admin.Shutdown();
+    }
+
+    // ---------------- S14 correctTagsOffset（空应答修正已消费位点）----------------
+
+    /// <summary>
+    /// Java <c>DefaultMQPushConsumerImpl#correctTagsOffset:713-717</c>（调用点 <c>:394-401</c>）：
+    /// 拉取应答是 NO_NEW_MSG / NO_MATCHED_MSG 时，这条队列的"已消费位点"必须跟着拉取游标走，
+    /// 否则没人 ack 的消息（broker 过滤掉的不在应答里、客户端二次过滤摘掉的明确不 ack）
+    /// 会让位点永久卡死。离线单测锁得住「哪些状态要修正 + 闸门何时放行」，锁不住
+    /// 「这条修正真的走到了 broker」—— 位点最终由 UPDATE_CONSUMER_OFFSET 落盘，只有真集群
+    /// 能证明 broker 上的已提交位点前移了、而且是在**一条消息都没投递**的前提下前移的。
+    /// </summary>
+    private static void ScenarioCorrectTagsOffset(DefaultMQProducer producer)
+    {
+        string topic = _gPrefix + "_Cto";
+        string ctrlGroup = _gPrefix + "_g14ctrl";
+        string testGroup = _gPrefix + "_g14";
+        PrepareTopic(producer, topic, 4);
+
+        var admin = new DefaultMQAdminExt();
+        admin.SetNamesrvAddr(_namesrv);
+        admin.SetTimeoutMillis(10000);
+        admin.Start();
+
+        // ---------- S14a 对照组：消息确实在，且常规消费的落点就是各队列 maxOffset ----------
+        var ctrlListener = new CollectingListenerConcurrently();
+        var ctrl = NewConsumer(ctrlGroup);
+        ctrl.ConsumeMessageBatchMaxSize = 3;
+        ctrl.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
+        ctrl.SetMessageListener(ctrlListener);
+        ctrl.Subscribe(topic, "TagA");
+        ctrl.Start();
+        List<MessageQueue> mainQueues = ctrl.FetchSubscribeMessageQueues(topic);
+        Check("S14a-业务 topic 有 4 个队列可查位点", mainQueues.Count == 4,
+            "queues=" + mainQueues.Count.ToString(CultureInfo.InvariantCulture));
+        Thread.Sleep(2000);
+        for (int i = 0; i < 5; ++i)
+        {
+            producer.Send(new Message(topic, "TagA", string.Empty,
+                Str2Bytes("cto-" + i.ToString(CultureInfo.InvariantCulture))));
+        }
+
+        bool ctrlOk = WaitUntil(() => ctrlListener.Snapshot().Count >= 5, 30000);
+        Check("S14a-对照组（TagA）收齐 5 条 —— 消息确实在队列里",
+            ctrlOk && ctrlListener.Snapshot().Count == 5,
+            "arrivals=" + ctrlListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
+
+        // committed 用 -1 表示 broker 查无记录（QUERY_NOT_FOUND），0 是合法位点，两者不能混同
+        List<(int QueueId, long Max, long Committed)> Snap(List<MessageQueue> qs, string group)
+        {
+            var rows = new List<(int, long, long)>();
+            foreach (MessageQueue mq in qs)
+            {
+                long maxOf = -1;
+                try
+                {
+                    maxOf = admin.MaxOffset(mq);
+                }
+                catch (Exception)
+                {
+                    maxOf = -1;
+                }
+
+                long off = -1;
+                try
+                {
+                    if (admin.ExamineConsumerOffset(group, mq, out long o)) off = o;
+                }
+                catch (Exception)
+                {
+                    off = -1;
+                }
+
+                rows.Add((mq.QueueId, maxOf, off));
+            }
+
+            return rows;
+        }
+
+        string Text(List<(int QueueId, long Max, long Committed)> rows) =>
+            string.Join(" ", rows.Select(r => "q" + r.QueueId.ToString(CultureInfo.InvariantCulture)
+                + ":" + r.Committed.ToString(CultureInfo.InvariantCulture)
+                + "/" + r.Max.ToString(CultureInfo.InvariantCulture)));
+
+        bool Matches(List<MessageQueue> qs, string group) =>
+            Snap(qs, group).All(r => r.Committed >= 0 && r.Committed == r.Max);
+
+        WaitUntil(() => Matches(mainQueues, ctrlGroup), 25000);
+        List<(int QueueId, long Max, long Committed)> ctrlRows = Snap(mainQueues, ctrlGroup);
+        Check("S14a-对照组的已提交位点 == 各队列 maxOffset（数值口径）",
+            Matches(mainQueues, ctrlGroup), Text(ctrlRows));
+        Check("S14a-对照组确实把消息推进了队列（maxOffset 总和 > 0）",
+            ctrlRows.Sum(r => r.Max) > 0,
+            "maxSum=" + ctrlRows.Sum(r => r.Max).ToString(CultureInfo.InvariantCulture));
+        ctrl.Shutdown();
+
+        // ---------- S14b NO_MATCHED_MSG：永不匹配的订阅，零投递但位点要走 ----------
+        var testListener = new CollectingListenerConcurrently();
+        var test = NewConsumer(testGroup);
+        test.ConsumeMessageBatchMaxSize = 3;
+        test.SetMessageListener(testListener);
+        test.Subscribe(topic, "TagB");
+        test.Start();
+        // 首跳 10s + 周期 5s 的位点持久化节拍，窗口给足
+        WaitUntil(() => Matches(mainQueues, testGroup), 40000);
+        List<(int QueueId, long Max, long Committed)> testRows = Snap(mainQueues, testGroup);
+        Check("S14b-零投递（listener 一条都没收到）",
+            testListener.Snapshot().Count == 0,
+            "arrivals=" + testListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
+        Check("S14b-每条队列的已提交位点都 == 该队列 maxOffset（空应答修正生效）",
+            Matches(mainQueues, testGroup), Text(testRows));
+        Check("S14b-修正后的位点总和 == 对照组（同一条队列的最大位点）",
+            testRows.Sum(r => r.Committed) == ctrlRows.Sum(r => r.Max),
+            "test=" + testRows.Sum(r => r.Committed).ToString(CultureInfo.InvariantCulture)
+            + " ctrl=" + ctrlRows.Sum(r => r.Max).ToString(CultureInfo.InvariantCulture));
+
+        // ---------- S14c NO_NEW_MSG：%RETRY%<group> 空队列也要留下位点记录 ----------
+        string retryTopic = MixAll.GetRetryTopic(testGroup);
+        var probe = new MQClientInstance("ctoprobe-" + NowMs().ToString(CultureInfo.InvariantCulture),
+            new List<string> { _namesrv });
+        probe.Start();
+        List<MessageQueue> retryQueues = new();
+        TopicRouteData? retryRoute = null;
+        WaitUntil(() =>
+        {
+            retryRoute = probe.GetTopicRouteData(retryTopic);
+            if (retryRoute == null || retryRoute.QueueDatas.Count == 0) return false;
+            retryQueues.Clear();
+            foreach (QueueData q in retryRoute.QueueDatas)
+            {
+                for (int i = 0; i < q.ReadQueueNums; ++i)
+                {
+                    retryQueues.Add(new MessageQueue(retryTopic, q.BrokerName, i));
+                }
+            }
+
+            return retryQueues.Count > 0 && Matches(retryQueues, testGroup);
+        }, 40000);
+        List<(int QueueId, long Max, long Committed)> retryRows = Snap(retryQueues, testGroup);
+        Check("S14c-" + retryTopic + " 上出现位点记录且等于 maxOffset",
+            retryQueues.Count > 0 && Matches(retryQueues, testGroup), Text(retryRows));
+        Check("S14c-该位点确实是 0（空队列的 nextBeginOffset）",
+            retryRows.Count > 0 && retryRows.All(r => r.Committed == 0),
+            "offsets=" + string.Join(",",
+                retryRows.Select(r => r.Committed.ToString(CultureInfo.InvariantCulture))));
+
+        // 再等一个静默窗口：修正只抬位点、不该投递任何东西
+        Thread.Sleep(6000);
+        Check("S14c-整轮下来 listener 依旧是 0 条（修正不会凭空投递）",
+            testListener.Snapshot().Count == 0,
+            "arrivals=" + testListener.Snapshot().Count.ToString(CultureInfo.InvariantCulture));
+
+        probe.Shutdown();
+        test.Shutdown();
+        admin.Shutdown();
+    }
+
     private static bool LadderOf(PoisonOrderlyListener listener, string body)
     {
         List<int> times = listener.Snapshot()
@@ -1353,15 +1867,28 @@ public static class LiveRedelivery
         reader.Assign(queues);
         reader.Start();
         foreach (MessageQueue mq in queues) reader.SeekToBegin(mq);
+        // SeekToBegin 必须在 Start 之后（未 Start 会抛），它把拉取游标拨回最小位点；
+        // 若拉取循环抢先把同一格拉进了本地缓冲，Seek 只丢「offset 之前」的副本，同一个
+        // 消息会以同一 (QueueId, QueueOffset) 交付两次。按存储位置去重：真有一式两份
+        // 入死信，副本落在不同的 QueueOffset 上，不会被吃掉。
+        var seenAt = new HashSet<(int QueueId, long QueueOffset)>();
+        void Collect(IEnumerable<MessageExt> batch)
+        {
+            foreach (MessageExt m in batch)
+            {
+                if (seenAt.Add((m.QueueId, m.QueueOffset))) msgs.Add(m);
+            }
+        }
+
         long pollDeadline = NowMs() + timeoutMs;
         while (NowMs() < pollDeadline)
         {
-            msgs.AddRange(reader.Poll(1000));
+            Collect(reader.Poll(1000));
             if (msgs.Count == 0) continue;
             // 收到后再排空几趟：断言「死信里只有这一条」要求把后面的也看见，
             // 但总窗口必须有界，否则正向用例每次都要白等满 timeoutMs。
             long drainTo = NowMs() + 3000;
-            while (NowMs() < drainTo) msgs.AddRange(reader.Poll(500));
+            while (NowMs() < drainTo) Collect(reader.Poll(500));
             break;
         }
         reader.Shutdown();

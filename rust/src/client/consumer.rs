@@ -646,6 +646,11 @@ struct State {
     consume_offsets: BTreeMap<String, i64>,
     /// Python `_pending`：已拉未消费缓冲（Java `ProcessQueue`）。
     pending: BTreeMap<String, VecDeque<MessageExt>>,
+    /// Python `_msg_queue_inflight`：在途批次计数（Java `ProcessQueue.msgCount` 里
+    /// **正在被 listener 消费**的那部分）。`dispatch_loop` 取走批次时 +1、消费收尾
+    /// （含异常回塞）时 -1。`pending` 与它合起来才是 `ProcessQueue.getMsgCount()`，
+    /// [`correct_tags_offset_locked`] 的闸门两个都要看。
+    inflight: BTreeMap<String, usize>,
     /// Python `_mq_map`：队列 key -> MessageQueue。
     mq_map: BTreeMap<String, MessageQueue>,
     /// Python `_lock_ok`：顺序消费下 broker 已确认锁定的队列。
@@ -2275,6 +2280,9 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             state
                 .offset_table
                 .insert(key.clone(), result.next_begin_offset);
+            // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+            // NO_MATCHED_MSG）时修正"已消费位点"，见 correct_tags_offset_locked
+            correct_tags_offset_locked(&mut state, &key, result.status, result.next_begin_offset);
         }
         // update_msg_acc_cnt 自己取同一把锁，必须在上面释放之后调用。
         update_msg_acc_cnt(&inner, &key, &msgs);
@@ -2491,21 +2499,41 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
                 let Some(mq) = state.mq_map.get(&key).cloned() else {
                     continue;
                 };
-                let Some(dq) = state.pending.get_mut(&key) else {
-                    continue;
+                let batch = {
+                    let Some(dq) = state.pending.get_mut(&key) else {
+                        continue;
+                    };
+                    if dq.is_empty() {
+                        continue;
+                    }
+                    let cfg = read_cfg(&inner);
+                    let n = dq.len().min(cfg.consume_message_batch_max_size.max(1) as usize);
+                    let batch: Vec<MessageExt> = dq.drain(..n).collect();
+                    batch
                 };
-                if dq.is_empty() {
-                    continue;
-                }
-                let cfg = read_cfg(&inner);
-                let n = dq.len().min(cfg.consume_message_batch_max_size.max(1) as usize);
-                let batch: Vec<MessageExt> = dq.drain(..n).collect();
-                (mq.clone(), batch)
+                // 与"取走批次"同一临界区登记在途：correct_tags_offset_locked 的闸门靠它
+                // 区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
+                *state.inflight.entry(key.clone()).or_insert(0) += 1;
+                (mq, batch)
             };
             if batch.is_empty() {
                 continue;
             }
-            match consume_batch(&inner, &key, &mq, batch.clone()).await {
+            let outcome = consume_batch(&inner, &key, &mq, batch.clone()).await;
+            {
+                let mut state = lock(&inner.state);
+                let left = match state.inflight.get_mut(&key) {
+                    Some(v) => {
+                        *v = v.saturating_sub(1);
+                        *v
+                    }
+                    None => 0,
+                };
+                if left == 0 {
+                    state.inflight.remove(&key);
+                }
+            }
+            match outcome {
                 Ok(done) => progressed = progressed || done,
                 Err(e) => {
                     // 分发路径意外异常：批次塞回队首，稍后重试（不能杀死分发任务）
@@ -3944,6 +3972,50 @@ fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
         for m in batch.iter().rev() {
             dq.push_front(m.clone());
         }
+    }
+}
+
+/// Java `DefaultMQPushConsumerImpl#correctTagsOffset:713-717`（调用点在 `:394-401`）。
+/// 须持 `state` 锁调用。
+///
+/// 拉取应答是 `NO_NEW_MSG`（队列里真没消息）或 `NO_MATCHED_MSG`（broker 侧按订阅表达式
+/// 过完一轮、一条都没匹配上，见 `MQClientAPIImpl:1095-1097` 把 `PULL_RETRY_IMMEDIATELY`
+/// 映射成它）时，这条队列的「已消费位点」必须跟着拉取游标走，否则会**永久卡死**：
+/// 没人 ack 的消息不属于任何人（broker 侧被过滤掉的不在应答里，客户端二次 tag 过滤摘掉的
+/// 又明确不 ack），位点不动就永远停在原地，重投/重启后再把这批没人要的消息从头扫一遍。
+///
+/// Java 的更新是 `offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)`（只前进
+/// 不回退），且有一道闸：`0L == processQueue.getMsgCount()`。`msgCount` 数的是**仍在
+/// ProcessQueue 里**的消息 —— 并发消费的 `removeMessage` 要等 listener 返回之后才调
+/// （`ConsumeMessageConcurrentlyService:266`），所以在途批次也算数；不等它落定就抬位点，
+/// 进程崩溃时这批消息会被静默跳过。本端口把 `pending` 为空与 `inflight` 为 0 合成同一
+/// 判据，后者的登记与「取走批次」在 `dispatch_loop` 的同一把锁里完成。
+///
+/// 与 Java 的唯一有意偏差是把状态判据也收进了本函数（Java 在回调的 switch 里），
+/// 这样离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
+fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, next_off: i64) {
+    if !matches!(status, PullStatus::NoNewMsg | PullStatus::NoMatchedMsg) {
+        return;
+    }
+    if !state.pending.get(key).is_none_or(|dq| dq.is_empty()) {
+        return;
+    }
+    if state.inflight.get(key).copied().unwrap_or(0) != 0 {
+        return;
+    }
+    // Java `RemoteBrokerOffsetStore.updateOffset:61-64`：表里没有这条记录时
+    // `putIfAbsent(mq, new ControllableOffset(offset))` —— **无条件建条目**，哪怕
+    // offset == 0。把「没有记录」与「记录是 0」合并成一个 0 会让空队列
+    // （nextBeginOffset == 0）的首次修正变成静默 no-op：broker 上永远查不到这条队列
+    // 的位点记录（Java/Python/C++ 都会留下 0）。
+    match state.consume_offsets.get(key).copied() {
+        None => {
+            state.consume_offsets.insert(key.to_string(), next_off);
+        }
+        Some(cur) if next_off > cur => {
+            state.consume_offsets.insert(key.to_string(), next_off);
+        }
+        Some(_) => {}
     }
 }
 
@@ -7143,5 +7215,235 @@ mod tests {
         update_pull_from_which_node(&mut state, &mq, Some(2));
         assert_eq!(recalc_pull_from_which_node(&state, &mq), 2);
         assert_eq!(recalc_pull_from_which_node(&state, &other), master);
+    }
+
+    // ---------------- correctTagsOffset（Java `DefaultMQPushConsumerImpl:713-717`） ----------------
+
+    const CTO_TOPIC: &str = "P6CorrectTagsOffsetTopic";
+
+    fn cto_mq() -> MessageQueue {
+        queue(CTO_TOPIC, "broker-a", 0)
+    }
+
+    /// 直接种状态、直接调[`correct_tags_offset_locked`]：状态判据也收在函数里，
+    /// 于是一次调用就能同时锁死"哪些状态要修正"和"何时允许修正"。
+    struct CtoHarness {
+        state: State,
+        key: String,
+    }
+
+    impl CtoHarness {
+        fn new() -> CtoHarness {
+            let key = mq_key(&cto_mq());
+            let mut state = State::default();
+            state.pending.insert(key.clone(), VecDeque::new());
+            CtoHarness { state, key }
+        }
+
+        fn correct(&mut self, status: PullStatus, next_off: i64) {
+            correct_tags_offset_locked(&mut self.state, &self.key, status, next_off);
+        }
+
+        fn offset(&self) -> Option<i64> {
+            self.state.consume_offsets.get(&self.key).copied()
+        }
+    }
+
+    /// 空应答的两个状态（NO_NEW_MSG / NO_MATCHED_MSG）都推进；其余状态一律不碰位点。
+    ///
+    /// NO_MATCHED_MSG 在本端口来自 broker 的 `PULL_RETRY_IMMEDIATELY`
+    /// （`MQClientAPIImpl:1095-1097` 的映射）：这一段的每一条都被 tags/表达式滤掉时，
+    /// 客户端既收不到消息、`msgCount` 又恒为 0 —— 不修正就永远不会前进。
+    #[test]
+    fn correct_tags_offset_advances_only_on_empty_pull_statuses() {
+        for status in [PullStatus::NoNewMsg, PullStatus::NoMatchedMsg] {
+            let mut h = CtoHarness::new();
+            h.correct(status, 42);
+            assert_eq!(h.offset(), Some(42), "{status:?} 要从 0 抬到应答位点");
+            h.correct(status, 43);
+            assert_eq!(h.offset(), Some(43), "已有记录时继续按应答前进");
+        }
+        for status in [PullStatus::Found, PullStatus::OffsetIllegal] {
+            let mut h = CtoHarness::new();
+            h.correct(status, 42);
+            assert_eq!(h.offset(), None, "{status:?} 不是空应答，不许碰位点");
+        }
+    }
+
+    /// 表里没有记录时**无条件建条目**（Java `RemoteBrokerOffsetStore.updateOffset:61-64`
+    /// 的 `putIfAbsent`），哪怕应答位点就是 0。
+    ///
+    /// 把「没有记录」和「记录是 0」合并成一个 `unwrap_or(0)` 会让空队列
+    /// （`nextBeginOffset == 0`）的首次修正变成静默 no-op：broker 上永远查不到这条队列的
+    /// 位点记录（真机 S3 就是这么抓出来的），重启后 `consumerProgress` 也一直显示
+    /// 从未消费。Java/Python/C++ 三边都会留下这条 0。
+    #[test]
+    fn correct_tags_offset_creates_the_record_even_for_a_zero_offset() {
+        let mut h = CtoHarness::new();
+        h.correct(PullStatus::NoNewMsg, 0);
+        assert_eq!(h.offset(), Some(0), "空队列的 0 也要建记录");
+        h.correct(PullStatus::NoNewMsg, 0);
+        assert_eq!(h.offset(), Some(0), "建完再修正：不前进也不回退");
+    }
+
+    /// `increaseOnly=true`：只前进不回退。
+    #[test]
+    fn correct_tags_offset_never_regresses() {
+        let mut h = CtoHarness::new();
+        h.state.consume_offsets.insert(h.key.clone(), 100);
+        h.correct(PullStatus::NoNewMsg, 50);
+        assert_eq!(h.offset(), Some(100), "应答位点更小：原地不动");
+        h.correct(PullStatus::NoNewMsg, 100);
+        assert_eq!(h.offset(), Some(100), "相等：不动");
+        h.correct(PullStatus::NoNewMsg, 101);
+        assert_eq!(h.offset(), Some(101));
+    }
+
+    /// 闸门：`ProcessQueue` 里还有消息（缓冲里的 + listener 手里的）就一律不动位点。
+    ///
+    /// 在途也算数是因为 Java 的 `msgCount` 要等 listener 返回才减
+    /// （`ConsumeMessageConcurrentlyService:266` 的 `removeMessage`）；
+    /// 不等它落定就抬位点，进程崩溃时这批消息会被静默跳过。
+    #[test]
+    fn correct_tags_offset_respects_the_process_queue_guard() {
+        // 缓冲里还有一条没消费
+        let mut h = CtoHarness::new();
+        h.state
+            .pending
+            .get_mut(&h.key)
+            .unwrap()
+            .push_back(ext(CTO_TOPIC, None));
+        h.correct(PullStatus::NoNewMsg, 42);
+        assert_eq!(h.offset(), None, "pending 非空");
+
+        // 缓冲空了，但有一条在 listener 手里
+        let mut h = CtoHarness::new();
+        h.state.inflight.insert(h.key.clone(), 1);
+        h.correct(PullStatus::NoMatchedMsg, 42);
+        assert_eq!(h.offset(), None, "在途也算 msgCount != 0");
+
+        // 显式的 0（收尾时短暂可能出现）不挡路
+        h.state.inflight.insert(h.key.clone(), 0);
+        h.correct(PullStatus::NoNewMsg, 42);
+        assert_eq!(h.offset(), Some(42), "inflight 归零后可以修正");
+
+        // 连 pending 表项都没有（从未拉过该队列）按空处理，不能因为缺项就漏掉修正
+        let mut fresh = CtoHarness {
+            state: State::default(),
+            key: mq_key(&cto_mq()),
+        };
+        fresh.correct(PullStatus::NoNewMsg, 7);
+        assert_eq!(fresh.offset(), Some(7));
+    }
+
+    /// listener 侧的门闩：
+    /// - 进来先记下"在途期间调一次修正"的结果（**不能**在这里断言：listener 跑在
+    ///   `spawn_blocking` 线程上，panic 会被 `call_concurrently_listener` 吞成
+    ///   `RECONSUME_LATER`，测试反而"通过"了）；
+    /// - 然后一直阻塞到主线程放开 —— 正好把"批次在途"那一瞬定住。
+    ///
+    /// 门闩用 tokio 通道而不是 `std::sync::mpsc`：后者的 `Sender` 不是 `Sync`，
+    /// 进不了 `Send + Sync` 的监听器 trait。
+    struct GatedListener {
+        inner: Arc<Inner>,
+        key: String,
+        entered: tokio::sync::mpsc::UnboundedSender<Option<i64>>,
+        release: Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    }
+
+    impl MessageListenerConcurrently for GatedListener {
+        fn consume_message(
+            &self,
+            _msgs: &[MessageExt],
+            _context: &mut ConsumeConcurrentlyContext,
+        ) -> ConsumeConcurrentlyStatus {
+            let observed = {
+                let mut state = lock(&self.inner.state);
+                correct_tags_offset_locked(&mut state, &self.key, PullStatus::NoNewMsg, 110);
+                state.consume_offsets.get(&self.key).copied()
+            };
+            let _ = self.entered.send(observed);
+            let _ = self
+                .release
+                .lock()
+                .expect("release lock")
+                .blocking_recv();
+            ConsumeConcurrentlyStatus::ConsumeSuccess
+        }
+    }
+
+    /// 接线取证：`dispatch_loop` 必须把"取走批次"与"登记 inflight"放在同一临界区，
+    /// 否则 listener 还没返回时修正就能抬位点（Java 那边 `msgCount` 此刻还 > 0）。
+    ///
+    /// 真机链路（broker 过滤 → NO_MATCHED_MSG → broker 侧位点前移）见
+    /// `examples/live_correct_tags_offset.rs`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_loop_keeps_the_correction_out_until_the_listener_returns() {
+        let cfg = ConsumerConfig {
+            consume_message_batch_max_size: 2,
+            ..Default::default()
+        };
+        let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
+        let mq = cto_mq();
+        let key = mq_key(&mq);
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        c.set_message_listener_concurrently(Arc::new(GatedListener {
+            inner: c.inner.clone(),
+            key: key.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+
+        {
+            let mut state = lock(&c.inner.state);
+            state.mq_map.insert(key.clone(), mq.clone());
+            let mut batch = offset_batch(2);
+            for m in batch.iter_mut() {
+                m.topic = CTO_TOPIC.to_string();
+            }
+            state.pending.insert(key.clone(), batch.into_iter().collect());
+        }
+        c.inner.started.store(true, Ordering::Release);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(dispatch_loop(c.inner.clone(), stop_rx));
+
+        // listener 已进入：批次在途
+        let observed = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("listener 未被调用（5s）")
+            .expect("entered 通道意外关闭");
+        assert_eq!(observed, None, "在途期间位点必须原地不动");
+        assert_eq!(
+            lock(&c.inner.state).inflight.get(&key).copied(),
+            Some(1),
+            "批次在途时 inflight 必须是 1"
+        );
+
+        release_tx.send(()).expect("release 通道已关闭");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if lock(&c.inner.state).inflight.get(&key).copied().unwrap_or(0) == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "批次未在 5s 内结清");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // 成功消费已把位点推到 max(queueOffset)+1；此时空应答的修正才允许生效
+        assert_eq!(
+            lock(&c.inner.state).consume_offsets.get(&key).copied(),
+            Some(2)
+        );
+        {
+            let mut state = lock(&c.inner.state);
+            correct_tags_offset_locked(&mut state, &key, PullStatus::NoMatchedMsg, 110);
+            assert_eq!(state.consume_offsets.get(&key).copied(), Some(110));
+        }
+        // 计数归零后表项就该删掉（与 Python dict.pop 对齐），别堆无主的 key
+        assert!(!lock(&c.inner.state).inflight.contains_key(&key));
+
+        drop(stop_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 }

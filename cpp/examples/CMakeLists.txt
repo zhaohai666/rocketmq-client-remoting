@@ -113,3 +113,7 @@ target_link_libraries(rmq_live_subscribe PRIVATE rocketmq::remoting)
 # 定点发送 topic 一致性守卫真机联调：拒在本端（broker 上 maxOffset 不动），放行腿照常收齐（不打进 ctest）
 add_executable(rmq_live_pinned_guard live_pinned_guard.cpp)
 target_link_libraries(rmq_live_pinned_guard PRIVATE rocketmq::remoting)
+
+# 空应答（NO_NEW_MSG/NO_MATCHED_MSG）位点修正真机联调：零投递但 broker 侧位点前移（不打进 ctest）
+add_executable(rmq_live_correct_tags_offset live_correct_tags_offset.cpp)
+target_link_libraries(rmq_live_correct_tags_offset PRIVATE rocketmq::remoting)

@@ -818,6 +818,9 @@ class DefaultMQPushConsumer:
         self._pulling = False
         self._lock = threading.RLock()
         self._consume_threads: List[threading.Thread] = []
+        # 在途批次计数（Java ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
+        # _dispatch_loop 取走批次时 +1、消费收尾（含异常回塞）时 -1。_pending 与它合起来
+        # 才是 Java 的 ProcessQueue.getMsgCount()，correctTagsOffset 的闸门两个都要看。
         self._msg_queue_inflight: Dict[str, int] = {}
         self._offset_table: Dict[str, int] = {}
         self._stop = threading.Event()
@@ -1994,6 +1997,10 @@ class DefaultMQPushConsumer:
                 # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
                 if result.next_begin_offset is not None:
                     self._offset_table[key] = result.next_begin_offset
+                # Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+                # NO_MATCHED_MSG）时修正"已消费位点"，见 _correct_tags_offset_locked
+                self._correct_tags_offset_locked(key, result.status,
+                                                 result.next_begin_offset)
 
     def _update_msg_acc_cnt(self, key: str, msgs: List[MessageExt]) -> None:
         """对应 Java ``ProcessQueue.putMessage`` 里的 ``msgAccCnt`` 计算。
@@ -2479,6 +2486,9 @@ class DefaultMQPushConsumer:
                         continue
                     n = min(len(dq), max(1, self.consume_message_batch_max_size))
                     batch = [dq.popleft() for _ in range(n)]
+                    # 与"取走批次"同一临界区登记在途：_correct_tags_offset_locked 的闸门
+                    # 靠它区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
+                    self._msg_queue_inflight[key] = self._msg_queue_inflight.get(key, 0) + 1
                 if not batch:
                     continue
                 try:
@@ -2493,6 +2503,13 @@ class DefaultMQPushConsumer:
                             for m in reversed(batch):
                                 dq2.appendleft(m)
                     time.sleep(0.1)
+                finally:
+                    with self._lock:
+                        left = self._msg_queue_inflight.get(key, 0) - 1
+                        if left > 0:
+                            self._msg_queue_inflight[key] = left
+                        else:
+                            self._msg_queue_inflight.pop(key, None)
             if not progressed:
                 time.sleep(0.05)
 
@@ -2986,6 +3003,38 @@ class DefaultMQPushConsumer:
         with self._lock:
             cur = self._consume_offsets.get(key)
             self._consume_offsets[key] = max(cur or 0, next_off)
+
+    def _correct_tags_offset_locked(self, key: str, status: PullStatus,
+                                    next_off: Optional[int]) -> None:
+        """Java ``DefaultMQPushConsumerImpl#correctTagsOffset``（:713-717）。须持锁调用。
+
+        拉取应答是 ``NO_NEW_MSG``（队列里真没消息）或 ``NO_MATCHED_MSG``（broker 侧按订阅
+        表达式过完一轮、一条都没匹配上，见 ``MQClientAPIImpl:1095-1097`` 把
+        ``PULL_RETRY_IMMEDIATELY`` 映射成它）时，这条队列的"已消费位点"必须跟着拉取游标
+        走，否则会**永久卡死**：没人 ack 的消息不属于任何人（broker 侧被过滤掉的不在应答里，
+        客户端二次 tag 过滤摘掉的又明确不 ack），位点不动就永远停在原地，重投/重启后
+        再把这批没人要的消息从头扫一遍。
+
+        Java 的更新是 ``offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)``
+        （只前进不回退），且有一道闸：``0L == processQueue.getMsgCount()``。``msgCount``
+        数的是**仍在 ProcessQueue 里**的消息 —— 并发消费的 ``removeMessage`` 要等
+        listener 返回之后才调（``ConsumeMessageConcurrentlyService:266``），所以在途批次
+        也算数；不等它落定就抬位点，进程崩溃时这批消息会被静默跳过。本端口把
+        ``_pending`` 为空与 ``_msg_queue_inflight`` 为 0 合成同一判据，后者的登记与
+        "取走批次"在 ``_dispatch_loop`` 的同一把锁里完成。
+
+        与 Java 的唯一有意偏差是把状态判据也收进了本函数（Java 在回调的 switch 里），
+        这样离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
+        """
+        if status not in (PullStatus.NO_NEW_MSG, PullStatus.NO_MATCHED_MSG):
+            return
+        if next_off is None:
+            return
+        if self._pending.get(key) or self._msg_queue_inflight.get(key):
+            return
+        cur = self._consume_offsets.get(key)
+        if cur is None or next_off > cur:
+            self._consume_offsets[key] = next_off
 
     # ---------------- 位点持久化 ----------------
     def _start_offset_persist_loop(self) -> None:
