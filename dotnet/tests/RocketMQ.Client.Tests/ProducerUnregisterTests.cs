@@ -47,8 +47,8 @@ public class ProducerUnregisterTests
 
     // ---------------- master + slave 假集群 ----------------
 
-    /// <summary>一笔 35（或任意请求）的取证：落在哪台 broker、什么码、extFields 长什么样。</summary>
-    private sealed record Frame(string Addr, int Code, PropertyMap Ext);
+    /// <summary>一笔请求的取证：落在哪台 broker、什么码、extFields / body 长什么样。</summary>
+    private sealed record Frame(string Addr, int Code, PropertyMap Ext, byte[] Body);
 
     /// <summary>
     /// 一个只说 remoting 协议的假集群：1 个 namesrv + 同一 brokerName 下的 master(0) 与
@@ -161,7 +161,8 @@ public class ProducerUnregisterTests
         {
             lock (_gate)
             {
-                _frames.Add(new Frame(addr, req.Code, new PropertyMap(req.ExtFields)));
+                _frames.Add(new Frame(addr, req.Code, new PropertyMap(req.ExtFields),
+                    req.Body ?? Array.Empty<byte>()));
             }
         }
 
@@ -409,9 +410,53 @@ public class ProducerUnregisterTests
         }
     }
 
+    // ---------------- 4b：消费者心跳也覆盖从节点 ----------------
+    //
+    // Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历 brokerAddrTable 的每个
+    // brokerId，只有 `consumerEmpty && MixAll.MASTER_ID != id` 才跳过 —— 带 ConsumerData 的
+    // 心跳因此**会打到从节点**。从节点必须在自己的 ConsumerManager 里认识这个消费组，否则
+    // 指向它的拉取会被 `PullMessageProcessor`:420-427 回 SUBSCRIPTION_NOT_EXIST
+    // （默认 PostSubscriptionWhenPull=false 的拉取不带订阅标志，走的正是那条）。
+    // 生产者心跳相反（只带 ProducerData ⇒ consumerEmpty），仍只打主 —— 见上面的 helper 断言。
     [Fact]
-    public void OneBrokerFailingDoesNotAbortTheFanOut()
+    public void ConsumerHeartbeatReachesSlaveToo()
     {
+        using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
+        cluster.ClearFrames();
+
+        var consumer = new DefaultMQPushConsumer(Group);
+        consumer.SetNamesrvAddr(cluster.NamesrvAddr);
+        consumer.Subscribe(Topic, "*");
+        consumer.SetMessageListener(new NoopListener());
+        consumer.Start();
+        try
+        {
+            Assert.Equal(1, cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat));
+            // 本用例的存在意义：扇出只打 master 的实现这里必然 0
+            Assert.Equal(1, cluster.CountAt(cluster.SlaveAddr, RequestCode.HeartBeat));
+            Frame onSlave = Assert.Single(cluster.Frames(RequestCode.HeartBeat),
+                f => f.Addr == cluster.SlaveAddr);
+            // 从节点拿到的必须是**带消费组**的那份报文（它据此建自己的 ConsumerGroupInfo）
+            Assert.True(HeartbeatData.Decode(onSlave.Body, out HeartbeatData hb));
+            Assert.Contains(Group, hb.ConsumerDataSet.Select(cd => cd.GroupName));
+        }
+        finally
+        {
+            consumer.Shutdown();
+        }
+    }
+
+    /// <summary>什么都不做的监听器：本用例只关心 start() 那几发心跳。</summary>
+    private sealed class NoopListener : IMessageListenerConcurrently
+    {
+        public bool Orderly() => false;
+
+        public ConsumeConcurrentlyStatus ConsumeMessage(List<MessageExt> msgs,
+            ConsumeConcurrentlyContext context) => ConsumeConcurrentlyStatus.ConsumeSuccess;
+    }
+
+    [Fact]
+    public void OneBrokerFailingDoesNotAbortTheFanOut()    {
         using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
         using MQClientInstance inst = StartedInstance(cluster);
         cluster.FailFrom(cluster.SlaveAddr, ResponseCode.SystemError);

@@ -1221,7 +1221,9 @@ public sealed class DefaultLitePullConsumer
         if (_mqClient is null) return 0;
         HeartbeatData hb = BuildHeartbeat();
         int ok = 0;
-        foreach (string addr in _mqClient.GetRouteOfAllBrokers())
+        // 每台都发（主 + 从）：与推送消费者 `DefaultMQPushConsumer.SendHeartbeatToAllBroker`
+        // 同一条 Java 依据（sendHeartbeatToAllBroker:732-750，consumerEmpty 才跳从节点）。
+        foreach (string addr in _mqClient.GetAllBrokerAddrs())
         {
             try
             {

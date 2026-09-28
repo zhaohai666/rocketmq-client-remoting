@@ -61,6 +61,12 @@ class MockClient:
         self.events.append("brokers")
         return []  # 无真实 broker，心跳发往空集合（no-op）
 
+    def get_all_broker_addrs(self):
+        # 心跳（含消费者心跳）走的是「每个 brokerId 一台」的那份地址表；
+        # 本 Mock 没有真实 broker，两份都返回空。
+        self.events.append("brokers")
+        return []
+
     def register_topic_in_use(self, topic):
         self.events.append("register:%s" % topic)
 

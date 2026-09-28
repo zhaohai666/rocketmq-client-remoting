@@ -3163,7 +3163,14 @@ int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
     }
     std::vector<std::string> addrs;
     try {
-        addrs = mqClient_->knownBrokerAddrs();
+        // 每台都发（主 + 从）：Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历
+        // `brokerAddrTable` 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID` 才跳过；
+        // 消费者心跳必带 ConsumerData，故从节点不跳。broker 的 ConsumerManager 每台各自一份，
+        // 从节点收不到心跳就会对指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`
+        // （`PullMessageProcessor`:420-427；默认 postSubscriptionWhenPull=false 的拉取不带
+        // 订阅标志，走的正是那条）。生产者心跳相反：只带 ProducerData（consumerEmpty），
+        // 见 `DefaultMQProducer::sendHeartbeatToAllBroker` 用的 `knownBrokerAddrs`。
+        addrs = mqClient_->getAllBrokerAddrs();
     } catch (const std::exception& e) {
         logger_warn("heartbeat: gather brokers failed: " + std::string(e.what()));
         return 0;

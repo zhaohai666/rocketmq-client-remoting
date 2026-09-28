@@ -2356,15 +2356,20 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     hb
 }
 
-/// Python `_send_heartbeat_to_all_broker`：路由里的每个 broker 发一份。
+/// Python `_send_heartbeat_to_all_broker`：路由里的每个 broker（**含从节点**）发一份。
 /// 没有 client（未 start / 已 shutdown）就发 0 份而不是退出循环 —— Python 同。
+///
+/// 从节点也要发：Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历
+/// `brokerAddrTable` 的每个 brokerId，仅在 `consumerEmpty && id != MASTER_ID` 时跳过；
+/// 本心跳带 ConsumerData，故不跳。broker 的 ConsumerManager 每台各自一份，从节点收不到
+/// 心跳就会对指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`（`PullMessageProcessor`:420-427）。
 async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
         return 0;
     };
     let hb = build_lite_heartbeat(inner);
     let mut ok = 0;
-    for addr in client.get_route_of_all_brokers() {
+    for addr in client.get_all_broker_addrs() {
         match client.send_heartbeat(&addr, &hb, LITE_HEARTBEAT_TIMEOUT_MILLIS).await {
             Ok(()) => ok += 1,
             Err(e) => rmq_debug!("lite heartbeat to {addr} failed: {e}"),

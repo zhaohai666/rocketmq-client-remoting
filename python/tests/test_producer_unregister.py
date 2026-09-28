@@ -171,6 +171,57 @@ def test_unregister_failure_on_one_broker_does_not_stop_the_fanout():
     assert seen == ["127.0.0.1:10911", "127.0.0.1:10912"], seen
 
 
+def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only():
+    """心跳的扇出面按「带不带 ConsumerData」分：消费者**每台都打**（主 + 从），
+    生产者只打 master —— 同一条 Java 规则（``sendHeartbeatToAllBroker``:732-750 仅在
+    ``consumerEmpty && id != MASTER_ID`` 时跳从节点）。
+
+    消费者侧漏掉从节点不是"少一发冗余"：broker 的 ``ConsumerManager`` 每台各自一份，
+    从节点收不到心跳时会给指向自己的拉取回 ``SUBSCRIPTION_NOT_EXIST``
+    （``PullMessageProcessor``:420-427；默认 ``postSubscriptionWhenPull=false`` 的拉取
+    不带订阅标志，走的正是那条）。生产者的心跳相反，仍走 master 优先的
+    ``get_route_of_all_brokers``——两个 helper 的分工在这里一起锁住。
+    """
+    from rocketmq.client.consumer import DefaultMQPushConsumer
+    from rocketmq.client.producer import DefaultMQProducer
+    from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+
+    master, slave = "127.0.0.1:10911", "127.0.0.1:10912"
+
+    def instance(tag):
+        inst = MQClientInstance(tag, ["127.0.0.1:9876"])
+        route = TopicRouteData()
+        route.broker_datas = [BrokerData("DefaultCluster", "broker-hb",
+                                         {0: master, 1: slave})]
+        inst.topic_route_table["HbTopic"] = route
+        return inst
+
+    cinst = instance("hb-consumer")
+    sent = []
+    cinst.send_heartbeat = lambda addr, hb, timeout=5000: sent.append((addr, hb))  # noqa: E731
+    c = DefaultMQPushConsumer("GID_hb_fanout")
+    c.client_id = "30.0.0.1@hb-offline"
+    c._mq_client = cinst
+    c._started = True
+    assert c._send_heartbeat_to_all_broker() == 2
+    assert [addr for addr, _ in sent] == [master, slave], sent
+    # 从节点拿到的那份必须**带消费组**，否则它的 ConsumerManager 建不出组信息
+    for _addr, hb in sent:
+        assert [cd.group_name for cd in hb.consumer_data_set] == ["GID_hb_fanout"]
+        assert hb.client_id == "30.0.0.1@hb-offline"
+
+    # 生产者负向对照：同样的路由、同样的地址表，只准打 master 那一台
+    pinst = instance("hb-producer")
+    psent = []
+    pinst.send_heartbeat = lambda addr, hb, timeout=5000: psent.append(addr)  # noqa: E731
+    p = DefaultMQProducer("GID_hb_producer")
+    p.client_id = "30.0.0.1@hb-offline"
+    p._mq_client = pinst
+    p._started = True
+    assert p._send_heartbeat_to_all_broker() == 1
+    assert psent == [master], psent
+
+
 def test_unregister_budget_is_javas_mq_client_api_timeout():
     """默认超时必须是 Java 的 ``getMqClientApiTimeout()`` = 3000ms（``ClientConfig.java:81``；
     ``MQClientInstance#unregisterClient``:1170 传的就是它）。

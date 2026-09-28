@@ -1617,11 +1617,22 @@ class DefaultMQPushConsumer:
         本实现此前从未发消费者心跳（订阅靠 pull 请求里的 subscription 属性带过去），
         因为当时队列分配是"全给自己"所以没暴露；一旦做真实 rebalance，
         消费者列表为空就分不到任何队列。返回成功台数，供真机验证断言。
+
+        收件人取路由里的**每一台**（主 + 从，`get_all_broker_addrs`），对齐 Java
+        `MQClientInstance#sendHeartbeatToAllBroker`:732-750 —— 那里遍历的是
+        `brokerAddrTable` 的每个 brokerId，仅当 `id != MASTER_ID && consumerEmpty`
+        才跳过；本心跳必带 ConsumerData，故从节点不跳。从节点漏发不是"少一发冗余"：
+        broker 的 `ConsumerManager` 是**每台各自一份**状态，而从节点收不到心跳时，
+        它会给指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`
+        （`PullMessageProcessor`:420-427 的 else 分支要求该 broker 自己认识这个消费组；
+        默认 `postSubscriptionWhenPull=false` 的拉取不带订阅标志，走的正是这条）。
+        生产者侧相反：`producer.py::_send_heartbeat_to_all_broker` 只带 ProducerData，
+        对应 `consumerEmpty=true`，Java 同样只发 master。
         """
         client = self._require_client()
         hb = self._build_heartbeat()
         ok = 0
-        for addr in client.get_route_of_all_brokers():
+        for addr in client.get_all_broker_addrs():
             try:
                 client.send_heartbeat(addr, hb, 5000)
                 ok += 1
@@ -3931,7 +3942,9 @@ class DefaultLitePullConsumer:
             return 0
         hb = self._build_heartbeat()
         ok = 0
-        for addr in self._mq_client.get_route_of_all_brokers():
+        # 每台都发（主 + 从）：与推送消费者 `DefaultMQPushConsumer._send_heartbeat_to_all_broker`
+        # 同一条 Java 依据（`sendHeartbeatToAllBroker`:732-750，consumerEmpty 才跳从节点）。
+        for addr in self._mq_client.get_all_broker_addrs():
             try:
                 self._mq_client.send_heartbeat(addr, hb, 5000)
                 ok += 1

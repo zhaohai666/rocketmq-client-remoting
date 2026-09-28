@@ -35,6 +35,12 @@ class FakeClient:
     def get_route_of_all_brokers(self) -> List[str]:
         return ["127.0.0.1:10911"]
 
+    def get_all_broker_addrs(self) -> List[str]:
+        # 消费者心跳取的是「每个 brokerId 一台」的地址表（主 + 从）。这个替身只有一台，
+        # 两份地址表内容相同；扇出是否真的覆盖从节点由
+        # test_producer_unregister.test_consumer_heartbeat_fans_out_to_slaves_... 锁。
+        return self.get_route_of_all_brokers()
+
     def send_heartbeat(self, addr: str, hb: HeartbeatData, timeout_millis: int) -> None:
         self.heartbeats.append(hb)
 

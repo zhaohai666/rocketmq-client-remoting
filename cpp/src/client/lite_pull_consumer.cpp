@@ -884,7 +884,9 @@ int32_t DefaultLitePullConsumer::sendHeartbeatToAllBroker() {
     if (mqClient_ == nullptr) return 0;
     HeartbeatData hb = buildHeartbeat();
     int32_t ok = 0;
-    for (const std::string& addr : mqClient_->getRouteOfAllBrokers()) {
+    // 每台都发（主 + 从）：与推送消费者 `DefaultMQPushConsumer::sendHeartbeatToAllBroker`
+    // 同一条 Java 依据（`sendHeartbeatToAllBroker`:732-750，consumerEmpty 才跳从节点）。
+    for (const std::string& addr : mqClient_->getAllBrokerAddrs()) {
         try {
             mqClient_->sendHeartbeat(addr, hb, 5000);
             ++ok;

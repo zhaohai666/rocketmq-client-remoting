@@ -17,8 +17,11 @@
 //   * `MQClientAPIImpl#unregisterClient`:1615-1639 —— 头是
 //     `UnregisterClientRequestHeader{clientID, producerGroup, consumerGroup}`，
 //     注意键名是大写 ID 的 `clientID`。
-//   * 心跳一侧仍只打「主优先」的那台：`getRouteOfAllBrokers`（`selectBrokerAddr`）与
-//     `getAllBrokerAddrs` 的分工必须守住，这里一起锁。
+//   * 心跳的收件人分流（Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750）：
+//     遍历 `brokerAddrTable` 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID`
+//     才跳过 —— 带消费数据的心跳**覆盖从节点**，只带生产数据的心跳只打 master。
+//     C++ 侧两个 helper 的分工必须守住：`getRouteOfAllBrokers`（`selectBrokerAddr`，
+//     生产者心跳用）与 `getAllBrokerAddrs`（消费者心跳、注销用）。
 //
 // 覆盖：
 //   1. 生产者侧头形状：只有 clientID + producerGroup，consumerGroup 整个字段不上线
@@ -26,7 +29,8 @@
 //   3. 两侧都有时三个键都在
 //   4. 扇出含从节点（改回只打 master 的用例必然失败），且每台各一发
 //   5. 单台 broker 回 SYSTEM_ERROR：`unregisterClient` 抛、`unregisterClientAllBrokers` 吞
-//   6. 心跳用的 `getRouteOfAllBrokers` 依然只返回 master 那一台
+//   6. 心跳的收件人分流：helper 层面（`getRouteOfAllBrokers` 只给 master /
+//      `getAllBrokerAddrs` 主从都给）+ 行为层面（真起一个消费者，主从各收一发心跳）
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -39,8 +43,11 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/mq_client.h"
+#include "rocketmq/client/result.h"
+#include "rocketmq/common/message.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
@@ -145,6 +152,8 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
 struct Record {
     int32_t code = 0;
     PropertyMap ext;
+    /// 请求体原样（心跳的消费组只在 body 里，extFields 是空的）。
+    Bytes body;
 };
 
 // 扮演 broker：按请求码回脚本化的响应码，并把每一帧的 extFields 留证。
@@ -256,7 +265,7 @@ private:
                 const int idx = unregCount_.fetch_add(1);
                 {
                     std::lock_guard<std::mutex> lk(state_);
-                    records_.push_back({req.code, req.extFields});
+                    records_.push_back({req.code, req.extFields, req.body});
                 }
                 std::lock_guard<std::mutex> lk(state_);
                 if (idx < static_cast<int>(unregCodes_.size())
@@ -267,6 +276,11 @@ private:
                 } else {
                     resp.code = ResponseCode::SUCCESS;
                 }
+            } else if (req.code == RequestCode::HEART_BEAT) {
+                // 心跳只留证不脚本化：收件人是谁由计数与 body 断言。
+                std::lock_guard<std::mutex> lk(state_);
+                records_.push_back({req.code, req.extFields, req.body});
+                resp.code = ResponseCode::SUCCESS;
             } else {
                 resp.code = ResponseCode::SUCCESS;
             }
@@ -296,6 +310,14 @@ private:
 const char* kClientId = "127.0.0.1@1234";
 const char* kGroup = "PID_Unregister";
 const char* kTopic = "UnregisterTopic";
+
+class NoopListener : public MessageListenerConcurrently {
+public:
+    ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>&,
+                                             ConsumeConcurrentlyContext&) override {
+        return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+    }
+};
 
 // 一台 brokerName 下两个 brokerId：0 是 master、1 是 slave（Java 的 brokerAddrTable 形状）
 std::unique_ptr<MQClientInstance> seeded(MockBroker& namesrv, MockBroker& master,
@@ -406,16 +428,40 @@ void testFailureIsSwallowed(MockBroker& namesrv, MockBroker& master, MockBroker&
     expectInt(code, ResponseCode::SYSTEM_ERROR, "unregisterClient 把非 SUCCESS 抛成 MQBrokerException");
 }
 
-// 6. 心跳那侧仍只挑 master：两个 helper 的分工不能被合并
-void testHeartbeatHelperStillMasterOnly(MockBroker& namesrv, MockBroker& master,
-                                        MockBroker& slave) {
-    auto instance = seeded(namesrv, master, slave);
-    std::vector<std::string> masterOnly = instance->getRouteOfAllBrokers();
-    expectInt(static_cast<long long>(masterOnly.size()), 1, "getRouteOfAllBrokers 只给 master");
-    if (!masterOnly.empty()) expect(masterOnly[0] == master.address(), "那台就是 master");
-    std::vector<std::string> all = instance->getAllBrokerAddrs();
-    expectInt(static_cast<long long>(all.size()), 2, "getAllBrokerAddrs 主从都给");
-    expect(std::find(all.begin(), all.end(), slave.address()) != all.end(), "从节点在表里");
+// 6. 心跳的收件人分流：helper 层面 + 行为层面
+//
+// helper：`getRouteOfAllBrokers` 每个 brokerName 只挑一台（生产者心跳用），
+//         `getAllBrokerAddrs` 主从都给（消费者心跳、注销用）。
+// 行为：真起一个消费者（订阅一个在假 nameserver 上有路由的 topic），start() 里的首轮心跳
+//       必须主、从各落一发；从节点拿到的 body 里带消费组（它据此建自己的 ConsumerGroupInfo，
+//       否则指向它的拉取会被 `PullMessageProcessor`:420-427 回 SUBSCRIPTION_NOT_EXIST）。
+void testHeartbeatFanOut(MockBroker& namesrv, MockBroker& master, MockBroker& slave) {
+    {
+        auto instance = seeded(namesrv, master, slave);
+        std::vector<std::string> masterOnly = instance->getRouteOfAllBrokers();
+        expectInt(static_cast<long long>(masterOnly.size()), 1, "getRouteOfAllBrokers 只给 master");
+        if (!masterOnly.empty()) expect(masterOnly[0] == master.address(), "那台就是 master");
+        std::vector<std::string> all = instance->getAllBrokerAddrs();
+        expectInt(static_cast<long long>(all.size()), 2, "getAllBrokerAddrs 主从都给");
+        expect(std::find(all.begin(), all.end(), slave.address()) != all.end(), "从节点在表里");
+    }
+
+    master.scriptUnregisters({});
+    slave.scriptUnregisters({});
+    DefaultMQPushConsumer consumer(kGroup);
+    consumer.setNamesrvAddr(namesrv.address());
+    consumer.subscribe(kTopic, "*");
+    consumer.setMessageListener(std::make_shared<NoopListener>());
+    consumer.start();
+    expectInt(master.countOf(RequestCode::HEART_BEAT) >= 1 ? 1 : 0, 1, "master 收到心跳");
+    // 这条就是本用例的存在意义：扇出只打 master 的实现这里必然 0
+    expectInt(slave.countOf(RequestCode::HEART_BEAT) >= 1 ? 1 : 0, 1, "slave 也收到心跳");
+    std::vector<Record> onSlave = slave.recordsOf(RequestCode::HEART_BEAT);
+    if (!onSlave.empty()) {
+        const std::string body(onSlave[0].body.begin(), onSlave[0].body.end());
+        expect(body.find(kGroup) != std::string::npos, "从节点拿到的 body 带消费组", body);
+    }
+    consumer.shutdown();
 }
 
 }  // namespace
@@ -438,7 +484,7 @@ int main() {
         MockBroker namesrv(true);
         MockBroker master;
         MockBroker slave;
-        testHeartbeatHelperStillMasterOnly(namesrv, master, slave);
+        testHeartbeatFanOut(namesrv, master, slave);
     }
     std::printf("%d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;

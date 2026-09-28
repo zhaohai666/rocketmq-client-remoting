@@ -3014,18 +3014,28 @@ impl MQClientInstance {
         hb
     }
 
-    /// 向所有已知 broker 发心跳，返回成功的台数。
+    /// 向所有已知 broker 发心跳（**含从节点**），返回成功的台数。
     ///
     /// Java `MQClientInstance#sendHeartbeatToAllBrokerWithLock` 的周期任务
     /// （Python 的心跳循环在 `consumer.py::_send_heartbeat_to_all_broker`，见模块头差异 4）；
     /// 单台失败只记 debug，不抛（Python 同）。
+    ///
+    /// 收件人用 [`get_all_broker_addrs`]：Java `sendHeartbeatToAllBroker`:732-750 遍历
+    /// `brokerAddrTable` 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID` 才跳过；
+    /// 本方法在上面已按 consumer_table 空表短路（consumerEmpty==true 直接返回 0），
+    /// 走到这里必定带 ConsumerData，所以从节点也发。从节点漏发不是"少一发冗余"：broker 的
+    /// `ConsumerManager` 是每台各自一份状态，从节点收不到心跳就会对指向自己的拉取回
+    /// `SUBSCRIPTION_NOT_EXIST`（`PullMessageProcessor`:420-427，默认
+    /// `postSubscriptionWhenPull=false` 的拉取不带订阅标志，走的正是那条）。
+    /// 生产者侧相反：`producer.rs::send_heartbeat_to_all_broker` 只带 ProducerData
+    /// （consumerEmpty==true），故只发 master，与 Java 同。
     pub async fn send_heartbeat_to_all_broker(&self, timeout_millis: i64) -> usize {
         if self.inner.consumer_table.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             return 0;
         }
         let heartbeat_data = self.prepare_heartbeat_data();
         let mut ok = 0usize;
-        for addr in self.get_route_of_all_brokers() {
+        for addr in self.get_all_broker_addrs() {
             match self.send_heartbeat(&addr, &heartbeat_data, timeout_millis).await {
                 Ok(()) => ok += 1,
                 Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
@@ -4851,7 +4861,8 @@ mod tests {
     /// 注销的扇出必须覆盖**每一台** broker（主 + 从）：Java
     /// `MQClientInstance#unregisterClient`:1158-1182 遍历的是 `brokerAddrTable` 的每个
     /// brokerId，而 `ProducerManager` / `ConsumerManager` 是每台各自一份状态 —— 漏掉从节点
-    /// 就等于那台的注册要等通道扫描（默认 120s）才回收。心跳那侧相反，只打 master。
+    /// 就等于那台的注册要等通道扫描（默认 120s）才回收。心跳那侧见
+    /// [`consumer_heartbeat_reaches_slaves_too`]（带消费数据时也覆盖每台，只带生产数据时只打主）。
     #[tokio::test]
     async fn unregister_reaches_slaves_too() {
         let master = MockBroker::start().await;
@@ -4877,7 +4888,8 @@ mod tests {
             ..Default::default()
         };
         guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
-        // 两个 helper 的分工：心跳一台、注销每台
+        // 两个 helper 的分工：`get_route_of_all_brokers` 每个 brokerName 只挑一台
+        // （生产者心跳用它），`get_all_broker_addrs` 每台都算（注销、消费者心跳用它）
         assert_eq!(instance.get_route_of_all_brokers(), vec![master.addr.clone()]);
         let mut want = vec![master.addr.clone(), slave.addr.clone()];
         want.sort();
@@ -4893,6 +4905,71 @@ mod tests {
             let keys: Vec<&str> = rec.ext_fields.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(keys, vec!["clientID", "producerGroup"], "空白槽位不上线");
         }
+        instance.shutdown();
+    }
+
+    /// 消费者心跳必须覆盖**每一台** broker（主 + 从），只带生产数据的心跳只打主。
+    ///
+    /// Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历 `brokerAddrTable` 的每个
+    /// brokerId，仅当 `consumerEmpty && MixAll.MASTER_ID != id` 才跳过。本实例级心跳
+    /// （`prepare_heartbeat_data` 只汇总 consumer_table）在空表时直接返回 0，所以走到发送
+    /// 一定带 ConsumerData ⇒ 从节点也要发。从节点漏发不是"少一发冗余"：broker 的
+    /// `ConsumerManager` 每台各自一份，从节点收不到心跳就会对指向自己的拉取回
+    /// `SUBSCRIPTION_NOT_EXIST`（`PullMessageProcessor`:420-427；默认
+    /// `postSubscriptionWhenPull=false` 的拉取不带订阅标志，走的正是那条）。
+    /// 生产者侧相反（`producer.rs` 只带 ProducerData ⇒ consumerEmpty==true ⇒ 只打主），
+    /// 那条路径用 `get_route_of_all_brokers()`，见 [`unregister_reaches_slaves_too`] 的 helper 断言。
+    #[tokio::test]
+    async fn consumer_heartbeat_reaches_slaves_too() {
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        let instance = new_instance();
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                BROKER,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                BROKER,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master.addr.clone()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave.addr.clone()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
+
+        // 负向对照：没有注册消费者时一台都不发（Java `producerEmpty && consumerEmpty` 短路，
+        // 本实例级心跳只服务消费者）。
+        assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 0);
+        assert!(master.recorded(request_code::HEART_BEAT).is_empty());
+        assert!(slave.recorded(request_code::HEART_BEAT).is_empty());
+
+        instance.register_consumer(GROUP, StubConsumer::new());
+        assert_eq!(
+            instance.send_heartbeat_to_all_broker(3000).await,
+            2,
+            "主 + 从各一发"
+        );
+        assert_eq!(master.recorded(request_code::HEART_BEAT).len(), 1);
+        let on_slave = slave.recorded(request_code::HEART_BEAT);
+        assert_eq!(on_slave.len(), 1, "从节点也要收到心跳");
+        // 从节点拿到的必须是**带消费组**的那份报文（它据此建自己的 ConsumerGroupInfo）；
+        // clientId 用实例的（Java `prepareHeartbeatData` 同），不是消费者替身自己的。
+        let hb = HeartbeatData::decode(&on_slave[0].body).expect("heartbeat body is a HeartbeatData");
+        assert_eq!(hb.client_id, instance.client_id());
+        let groups: Vec<&str> = hb
+            .consumer_data_set
+            .iter()
+            .map(|cd| cd.group_name.as_str())
+            .collect();
+        assert_eq!(groups, vec![GROUP]);
         instance.shutdown();
     }
 
