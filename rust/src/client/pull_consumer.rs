@@ -2513,21 +2513,37 @@ impl DefaultLitePullConsumer {
                 return false;
             }
         };
-        if result.status != PullStatus::Found || result.msg_found_list.is_empty() {
+        // Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
+        // 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
+        // broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的已越过本轮扫过的整段不匹配区间
+        // （不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的是 broker 的纠正位点
+        // （越界自愈也靠这一步）。
+        // 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
+        // （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 seek() 直接
+        // 改写 next_offset、撤队列直接 remove 掉条目，用「游标还是不是我发请求时的那个值」
+        // 做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
+        let intact = {
+            let mut state = lock(&self.inner.state);
+            if state.next_offset.get(&key).copied() == Some(offset) {
+                state.next_offset.insert(key.clone(), result.next_begin_offset);
+                true
+            } else {
+                false
+            }
+        };
+        if !intact || result.status != PullStatus::Found || result.msg_found_list.is_empty() {
             return false;
         }
         // Python `_filter_tags`：按表达式现算 tagsSet 再筛（无集合 = 不筛）
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(&expr)).ok();
         let msgs = client_side_tag_filter(sub.as_ref(), result.msg_found_list);
-        let Some(last) = msgs.last() else {
-            // 全被 tag 过滤掉：游标不推进，下一轮重拉同一窗口（Python 同行为，
-            // 由 pull_interval_millis 退避兜住不空转）
+        if msgs.is_empty() {
+            // 全被 tag 过滤掉：窗口在 broker 眼里已经读过（游标上面推过了），
+            // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
             return false;
-        };
-        let next = last.queue_offset + 1;
+        }
         // 只推进**拉取游标**。「已消费游标」是 poll() 交付时才写的，两条线不是一条：
         // 缓冲里压着没交出去的消息不能算已消费（Java `processQueue.removeMessage` 同口径）。
-        lock(&self.inner.state).next_offset.insert(key, next);
         self.enqueue(msgs);
         true
     }
@@ -2701,6 +2717,7 @@ mod tests {
     use super::*;
     // 心跳真机外的最小闭环（假 namesrv + 假 broker）：帧读写与 producer 的
     // `send_retry_tests` 同款，但只关心 34/35 两号报文。
+    use crate::common::message_decoder::encode_message_ext;
     use crate::common::sysflag::PermName;
     use crate::remoting::protocol::codes::{request_code, response_code};
     use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
@@ -3317,6 +3334,17 @@ mod tests {
     /// 一笔收到的请求：请求码 + extFields 快照。
     type RecordedRequest = (i32, Vec<(String, String)>);
 
+    /// 一笔脚本化的 PULL_MESSAGE 应答。
+    struct ScriptedPull {
+        code: i32,
+        ext: Vec<(&'static str, String)>,
+        /// 回包 body（FOUND 的消息流；其余形态为空）。
+        body: Option<Vec<u8>>,
+        /// 发车闸：`Some` 时先等闸放行再回包 —— 「应答还在路上，客户端先 seek 了」
+        /// 这类在途竞态靠它定序。
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
     /// 假 broker：记录 34（心跳 body）与 35（注销 extFields）两号报文，其余一律 SUCCESS。
     struct FakeBroker {
         addr: String,
@@ -3327,6 +3355,9 @@ mod tests {
         /// 收到的**每一笔**请求（code + extFields 快照），按到达顺序 —— 「这个 RPC
         /// 到底发没发」型断言（如 FIRST_OFFSET 不该发 minOffset）靠它。
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        /// 预排的 PULL_MESSAGE 应答脚本（FIFO）：先到先得，排空了按 [`answer_pull`]
+        /// 的「空 broker」形态应答。
+        pull_scripts: Arc<Mutex<VecDeque<ScriptedPull>>>,
     }
 
     impl FakeBroker {
@@ -3338,6 +3369,7 @@ mod tests {
                 heartbeat_bodies: Arc::new(Mutex::new(Vec::new())),
                 unregisters: Arc::new(Mutex::new(Vec::new())),
                 requests: Arc::new(Mutex::new(Vec::new())),
+                pull_scripts: Arc::new(Mutex::new(VecDeque::new())),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -3372,7 +3404,11 @@ mod tests {
                                 _ => {}
                             }
                             if !request.is_oneway_rpc() {
-                                let mut response = answer_for(&request, response_code::SUCCESS);
+                                let mut response = if request.code == request_code::PULL_MESSAGE {
+                                    answer_pull(&request, &inner).await
+                                } else {
+                                    answer_for(&request, response_code::SUCCESS)
+                                };
                                 write_frame(&mut stream, &mut response).await;
                             }
                         }
@@ -3411,6 +3447,54 @@ mod tests {
         fn unregisters(&self) -> Vec<UnregisterExt> {
             lock(&self.unregisters).clone()
         }
+
+        /// 排一笔脚本化 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。
+        fn script_pull(
+            &self,
+            code: i32,
+            ext: &[(&'static str, &str)],
+            body: Option<Vec<u8>>,
+            gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        ) {
+            lock(&self.pull_scripts).push_back(ScriptedPull {
+                code,
+                ext: ext.iter().map(|(k, v)| (*k, (*v).to_string())).collect(),
+                body,
+                gate,
+            });
+        }
+    }
+
+    /// PULL_MESSAGE 的应答：排了脚本就按脚本回（有闸先等闸），否则按**空 broker**
+    /// 的忠实形态回 `PULL_NOT_FOUND` + `nextBeginOffset = 请求 queueOffset`
+    /// （Java `PullMessageProcessor#composeResponseHeader` 对 NO_NEW_MSG 同样回填
+    /// nextBeginOffset；min/max 为 0）。客户端从 #105 起每轮都信 nextBeginOffset，
+    /// 这里不忠实（如裸 SUCCESS 缺 ext）就会把拉取游标推到 0。
+    async fn answer_pull(request: &RemotingCommand, broker: &FakeBroker) -> RemotingCommand {
+        let script = lock(&broker.pull_scripts).pop_front();
+        if let Some(script) = script {
+            if let Some(gate) = script.gate {
+                let _ = gate.await;
+            }
+            let mut response = answer_for(request, script.code);
+            for (key, value) in script.ext {
+                response.add_ext_field(key, &value);
+            }
+            if script.body.is_some() {
+                response.set_body(script.body);
+            }
+            return response;
+        }
+        let requested = request
+            .ext_fields()
+            .get("queueOffset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut response = answer_for(request, response_code::PULL_NOT_FOUND);
+        response.add_ext_field("nextBeginOffset", &requested.to_string());
+        response.add_ext_field("minOffset", "0");
+        response.add_ext_field("maxOffset", "0");
+        response
     }
 
     /// 一台主 + 一台从（同一 brokerName）的假集群。
@@ -3729,5 +3813,119 @@ mod tests {
         );
         first.shutdown();
         last.shutdown();
+    }
+
+    // ---------------------- 拉取游标跟住 nextBeginOffset（#105）
+
+    /// 起一个指向假集群的 lite-pull（assign + FIRST_OFFSET：起点是字面量 0，不做
+    /// 起点位点查询 RPC，第一笔 PULL_MESSAGE 确定落在 `queueOffset=0`）。
+    async fn started_lite(
+        instance: &str,
+        group: &str,
+        cluster: &FakePullCluster,
+        mq: &MessageQueue,
+    ) -> DefaultLitePullConsumer {
+        let c = DefaultLitePullConsumer::new(group).expect("组名合法");
+        c.set_instance_name(instance);
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c.assign(std::slice::from_ref(mq));
+        c.start().await.expect("假集群里 start 应当成功");
+        c
+    }
+
+    /// Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：NO_MATCHED_MSG 的
+    /// nextBeginOffset 已越过本轮扫过的整段不匹配区间，拉取游标必须跟过去 ——
+    /// 旧实现只在 FOUND 时用 `last.queue_offset + 1` 推进，游标会永远卡在 0，
+    /// 每轮把同一段不匹配区间重扫一遍。
+    #[tokio::test]
+    async fn lite_cursor_follows_next_begin_offset_on_no_matched_msg() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        cluster.master.script_pull(
+            response_code::PULL_RETRY_IMMEDIATELY,
+            &[("nextBeginOffset", "5"), ("minOffset", "0"), ("maxOffset", "9")],
+            None,
+            None,
+        );
+        let c = started_lite("lite_cursor_no_match", "LitePG_NoMatch", &cluster, &q).await;
+
+        wait_until(
+            || c.pull_cursor_of(&q) == 5,
+            "NO_MATCHED_MSG 后拉取游标跟到 nextBeginOffset=5",
+        )
+        .await;
+        // 不是内存表里改了个数：下一笔 PULL_MESSAGE 真的从 5 起
+        wait_until(
+            || cluster.master.pull_offsets().contains(&5),
+            "下一笔 PULL_MESSAGE 从 5 开始",
+        )
+        .await;
+        assert_eq!(c.buffered_message_count(), 0, "NO_MATCHED_MSG 没有可交付的消息");
+        c.shutdown();
+    }
+
+    /// OFFSET_ILLEGAL 的 nextBeginOffset 是 broker 对越界位点的纠正值：跟过去才算
+    /// 「越界自愈」，停在旧位点会每轮收到同一个纠正、原地打转。
+    #[tokio::test]
+    async fn lite_cursor_adopts_the_brokers_offset_correction() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        cluster.master.script_pull(
+            response_code::PULL_OFFSET_MOVED,
+            &[("nextBeginOffset", "42"), ("minOffset", "40"), ("maxOffset", "100")],
+            None,
+            None,
+        );
+        let c = started_lite("lite_cursor_illegal", "LitePG_Illegal", &cluster, &q).await;
+
+        wait_until(
+            || c.pull_cursor_of(&q) == 42,
+            "OFFSET_ILLEGAL 后拉取游标采纳 broker 纠正",
+        )
+        .await;
+        wait_until(
+            || cluster.master.pull_offsets().contains(&42),
+            "下一笔 PULL_MESSAGE 从 42 开始",
+        )
+        .await;
+        c.shutdown();
+    }
+
+    /// 唯一一只刹车（Java :808 的 seekOffset == -1 + :979 的 isDropped）：在途应答
+    /// 回来时，这轮里刚 seek 过的位点不许被盖掉，也不许把应答里的消息塞进缓冲
+    /// （seek 的语义就是「游标钉在这里、旧位点的消息全丢」）。
+    /// 发车闸把在途窗口拉成确定性的：请求已到 broker → seek → 放闸。
+    /// 旧实现没有刹车：FOUND + 一条 offset=2 的消息会把游标改成 3 并把消息入缓冲。
+    #[tokio::test]
+    async fn lite_in_flight_seek_wins_over_the_pull_result() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        let body = encode_message_ext(&msg("T", "broker-a", 0, 2, "late"), false)
+            .expect("消息可编码");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        cluster.master.script_pull(
+            response_code::SUCCESS,
+            &[("nextBeginOffset", "3"), ("minOffset", "0"), ("maxOffset", "9")],
+            Some(body),
+            Some(gate_rx),
+        );
+        let c = started_lite("lite_cursor_seek_race", "LitePG_SeekRace", &cluster, &q).await;
+
+        wait_until(
+            || !cluster.master.pull_offsets().is_empty(),
+            "第一笔拉取到达 broker",
+        )
+        .await;
+        c.seek(&q, 99);
+        gate_tx.send(()).expect("放闸");
+        wait_until(
+            || cluster.master.pull_offsets().contains(&99),
+            "seek 之后下一笔 PULL_MESSAGE 从 99 起",
+        )
+        .await;
+        assert_eq!(c.pull_cursor_of(&q), 99, "在途应答不得盖掉 seek 写下的位点");
+        assert_eq!(c.buffered_message_count(), 0, "被刹车的一轮不许入缓冲");
+        c.shutdown();
     }
 }

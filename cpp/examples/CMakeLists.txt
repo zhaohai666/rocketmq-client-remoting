@@ -37,6 +37,10 @@ target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
 add_executable(rmq_live_lite_pull live_lite_pull.cpp)
 target_link_libraries(rmq_live_lite_pull PRIVATE rocketmq::remoting)
 
+# lite-pull 拉取游标真机验证（#105：NO_MATCHED_MSG 跟过整段 + OFFSET_ILLEGAL 越界自愈）
+add_executable(rmq_live_lite_pull_cursor live_lite_pull_cursor.cpp)
+target_link_libraries(rmq_live_lite_pull_cursor PRIVATE rocketmq::remoting)
+
 # Request-Reply（5.x）真机联调（请求 → 应答 → 326 推回；不打进 ctest）
 add_executable(rmq_live_request_reply live_rr.cpp)
 target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)

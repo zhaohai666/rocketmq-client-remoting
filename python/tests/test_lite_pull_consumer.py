@@ -50,6 +50,10 @@ class MockClient:
         # start() 必须先把 topic 登记为「在用」并拉一次路由，再发首轮心跳（心跳目标
         # 只来自路由表）。顺序用事件流水记录，便于断言而不是只断言发生过。
         self.events: List[str] = []
+        # #105：脚本化的应答（pull_message 先弹脚本，弹空了才走内存 store），以及
+        # 每次拉取请求的 queue_offset —— 「游标跟没跟上」这事只有请求偏移能证明。
+        self.scripted: List = []
+        self.pull_requests: List[int] = []
 
     def start(self) -> None:
         pass
@@ -109,6 +113,11 @@ class MockClient:
                      commit_offset, subscription, sub_version, expression_type,
                      timeout_millis=30000, max_msg_bytes=-1, suspend_timeout_millis=15000,
                      addr=None, request_source=0) -> PullResult:
+        self.pull_requests.append(queue_offset)
+        if self.scripted:
+            entry = self.scripted.pop(0)
+            # 可调用项在「请求途中」执行：模拟并发 seek / 撤队列这类中途改动
+            return entry() if callable(entry) else entry
         msgs = self._store.get((mq.broker_name, mq.queue_id), [])
         window = msgs[queue_offset:queue_offset + max_msg_nums]
         found = []
@@ -651,3 +660,74 @@ class TestCommitOffsetTable:
             assert c.committed(q0) == 1024
         finally:
             c.shutdown()
+
+
+class TestPullCursorFollowsNextBeginOffset:
+    """拉取游标跟的是 broker 的 nextBeginOffset，不是「最后一条消息 + 1」。
+    Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取成功回来之后
+    无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都执行
+    `updatePullOffset(mq, pullResult.getNextBeginOffset(), pq)`；:808 的唯一刹车是
+    「这轮没人 seek 过」（:986 的入缓冲同样只在 seekOffset == -1 时发生）。
+    """
+
+    def _paused_consumer(self, store=None, batch=2):
+        """start() 之后把队列 pause 住：后台循环不碰它，游标只由用例自己驱动。"""
+        c = _Lite("LitePG_UT", _store=store if store is not None else STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.set_pull_batch_size(batch)
+        c.set_auto_commit(False)
+        q0 = MessageQueue("T", "broker-a", 0)
+        c.assign([q0])
+        c.start()
+        c.pause([q0])
+        return c, q0
+
+    def test_no_matched_msg_jumps_the_cursor_past_the_scanned_window(self):
+        # 真实 broker 对「整段都不匹配 tag」的回包是 NO_MATCHED_MSG（PULL_RETRY_IMMEDIATELY），
+        # nextBeginOffset 已越过本轮扫过的全部消息。旧实现只在 FOUND 时推游标，这条路上会
+        # 一轮一轮把同一段重扫（长区间上每轮 O(n)，且永远推不动）。
+        c, q0 = self._paused_consumer()
+        try:
+            c._mock.scripted.append(PullResult(PullStatus.NO_MATCHED_MSG, 5, 0, 5, []))
+            assert c._pull_one(q0) is False, "一条都没交付"
+            assert c.pull_cursor_of(q0) == 5, "游标必须跟 nextBeginOffset 跳过整段"
+            assert c._pull_one(q0) is False
+            assert c._mock.pull_requests[-1] == 5, \
+                "下一轮从 5 起拉，不再重扫 0..4：%s" % c._mock.pull_requests
+        finally:
+            c.shutdown()
+
+    def test_offset_illegal_adopts_the_brokers_correction(self):
+        # 越界（位点表里存着比 maxOffset 还大/比 minOffset 还小的值）时 broker 回
+        # OFFSET_ILLEGAL，nextBeginOffset 就是它给的纠正位点（PullMessageProcessor
+        # composeResponseHeader:631 + :664-676 的三条 OFFSET_* 分支）。跟上游标即自愈；
+        # 旧实现在这条路上不动游标，下一轮拿同一个越界值再撞一次。
+        c, q0 = self._paused_consumer()
+        try:
+            c._mock.scripted.append(PullResult(PullStatus.OFFSET_ILLEGAL, 5, 0, 5, []))
+            assert c._pull_one(q0) is False
+            assert c.pull_cursor_of(q0) == 5, "自愈到 broker 纠正后的位点"
+            assert c._pull_one(q0) is False
+            assert c._mock.pull_requests[-1] == 5
+        finally:
+            c.shutdown()
+
+    def test_in_flight_seek_wins_over_the_pull_result(self):
+        # Java :986/:808 的 seekOffset == -1 检查：在途请求的结果不许盖掉这轮里刚 seek
+        # 出来的位点、也不许把旧窗口的消息灌进缓冲（seek 刚把它们清掉）。
+        c, q0 = self._paused_consumer()
+        try:
+            def seek_mid_flight():
+                c.seek(q0, 99)
+                return PullResult(PullStatus.FOUND, 2, 0, 5, [
+                    _make_msg("T", "broker-a", 0, 0, "A0"),
+                    _make_msg("T", "broker-a", 0, 1, "B1"),
+                ])
+
+            c._mock.scripted.append(seek_mid_flight)
+            assert c._pull_one(q0) is False, "seek 已把窗口作废，不许交付"
+            assert c.pull_cursor_of(q0) == 99, "游标停在 seek 钉的值上"
+            assert c.poll(timeout=100) == [], "缓冲里不许有 seek 前窗口的消息"
+        finally:
+            c.shutdown()
+

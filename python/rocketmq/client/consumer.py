@@ -4169,12 +4169,22 @@ class DefaultLitePullConsumer:
         except Exception as e:  # noqa: BLE001
             logger.debug("lite pull_one failed for %s@%d: %s", mq.topic, mq.queue_id, e)
             return False
-        if result.status == PullStatus.FOUND and result.msg_found_list:
+        # Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
+        # 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
+        # broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的 nextBeginOffset 已越过本轮扫过
+        # 的整段不匹配区间（不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的
+        # nextBeginOffset 是 broker 的纠正位点（越界自愈也靠这一步）。
+        # 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
+        # （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 seek()
+        # 直接改写 _next_offset、撤队列直接 pop 掉条目，用「游标还是不是我发请求时的
+        # 那个值」做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
+        intact = self._next_offset.get(mq) == offset
+        if intact:
+            self._next_offset[mq] = result.next_begin_offset
+        if intact and result.status == PullStatus.FOUND and result.msg_found_list:
             msgs = self._filter_tags(mq.topic, result.msg_found_list, sub)
             if msgs:
                 self._enqueue(msgs)
-                last = msgs[-1]
-                self._next_offset[mq] = last.queue_offset + 1
                 return True
         return False
 

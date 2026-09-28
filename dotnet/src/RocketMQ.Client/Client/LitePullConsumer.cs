@@ -548,25 +548,43 @@ public sealed class DefaultLitePullConsumer
             return false;
         }
 
-        if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
+        // Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
+        // 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
+        // broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的已越过本轮扫过的整段不匹配区间
+        // （不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的是 broker 的纠正位点
+        // （越界自愈也靠这一步）。
+        // 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
+        // （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 Seek() 直接
+        // 改写 _nextOffset、撤队列直接 Remove 掉条目，用「游标还是不是我发请求时的那个值」
+        // 做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
+        bool intact = false;
+        lock (_lock)
         {
-            var msgs = new List<MessageExt>(result.MsgFoundList);
-            FilterTags(mq.Topic, msgs, sub);
-            if (msgs.Count > 0)
+            if (_nextOffset.TryGetValue(mq, out long current) && current == offset)
             {
-                Enqueue(msgs);
-                lock (_lock)
-                {
-                    // 只推进**拉取游标**。「已消费游标」是 Poll() 交付时才写的，两条线不是一条：
-                    // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
-                    _nextOffset[mq] = msgs[msgs.Count - 1].QueueOffset + 1;
-                }
-
-                return true;
+                _nextOffset[mq] = result.NextBeginOffset;
+                intact = true;
             }
         }
 
-        return false;
+        if (!intact || result.Status != PullStatus.Found || result.MsgFoundList.Count == 0)
+        {
+            return false;
+        }
+
+        var msgs = new List<MessageExt>(result.MsgFoundList);
+        FilterTags(mq.Topic, msgs, sub);
+        if (msgs.Count == 0)
+        {
+            // 全被 tag 过滤掉：窗口在 broker 眼里已经读过（游标上面推过了），
+            // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
+            return false;
+        }
+
+        // 只推进**拉取游标**。「已消费游标」是 Poll() 交付时才写的，两条线不是一条：
+        // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
+        Enqueue(msgs);
+        return true;
     }
 
     private static void FilterTags(string topic, List<MessageExt> msgs, string sub)

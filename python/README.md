@@ -11,7 +11,7 @@ NameServer、Broker 通信。
 
 ```bash
 pip install -e .
-pytest -q                     # 1137 条单元/协议测试（1133 passed + 4 skip，skip 为可选依赖相关）
+pytest -q                     # 1140 条单元/协议测试（1136 passed + 4 skip，skip 为可选依赖相关）
 python -m rocketmq selfcheck  # 协议编解码回环自检（7 项）
 ```
 
@@ -35,6 +35,7 @@ python verify_validators_live.py  # 名字校验（28 PASS/0 FAIL）：非法 to
 python verify_recall_live.py      # 定时消息撤回 recallMessage(370)（15 PASS/0 FAIL，脚本会打开并在退出时还原 broker 的 recallMessageEnable）
 python verify_unit_config_live.py # unitName/unitMode/stream（13 PASS/0 FAIL）：clientId 后缀、broker 侧 topic 的 UNIT/UNIT_SUB 位、每笔请求的 ReqT
 python verify_lite_pull_live.py   # lite pull 全链路（61 PASS/0 FAIL）：rebalance/收 12 条/assign+seek/tag/时间戳起点/pause+resume + 队列分配策略（默认 AVG、null 被 start() 拒、AVG_BY_CIRCLE 两实例交叉、CONFIG 两半不重叠、CONSISTENT_HASH 用真实 clientId 建环并收敛到离线预测、MACHINE_ROOM_NEARBY 单机房透传内层策略且 resolver 被真实 brokerName/clientId 问过、MACHINE_ROOM 白名单不匹配 broker-a 时安静饿死）+ S3 **没人调 commit**、只继续 poll 过一整个自动提交周期（闸门只在 poll() 开头查）后 committed() 自己 >0 + **S8 三张位点表在真机各自数出来**（1 条队列的 topic 灌 1200 条：拉取游标 1200 / 已消费游标 -1 / broker 侧还查无提交（committed 回 -1）三个数互不相等 ⇒ 一次都没交付时把拉取游标提交上去就是静默丢消息；单次 poll 交 1024 ⇒ 落到 broker 的正是 1024 而不是 1200；commit(map) 改点位到 5 而两格游标都不动、退回的 176 条照旧交付、全程 1200 条不重不漏；persist=False 时 committed() 读到内存那格 777 而 broker 仍是 5；新实例的起点取 broker 上的 5 而不是另一个实例内存里的 777；seek 同时改两格游标；点名提交抹掉没点名的内存行（Java persistAll 的 remove unused mq）且清理不写 broker）
+python verify_lite_pull_cursor_live.py # lite-pull **拉取游标**（8 PASS/0 FAIL，2026-09-29 实测；Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`，与 C++ `rmq_live_lite_pull_cursor`、Rust `live_lite_pull_cursor`、.NET `lite-pull-cursor` 同场景）：一轮拉取**成功返回**之后，无论 `FOUND`/`NO_NEW_MSG`/`NO_MATCHED_MSG`/`OFFSET_ILLEGAL`，拉取游标都要推进到 broker 给的 `nextBeginOffset`（唯一的刹车是「在途请求的结果不许盖掉这轮里刚 seek 的位点」）。旧实现只在 `FOUND` 时用「最后一条.queueOffset + 1」推游标，坏法是**静默**的：S2 把 assign 表达式换成永不匹配的 Tag 再 seek(0) —— broker 按表达式把整段滤掉后回的 `nextBeginOffset` 已越过整段（== maxOffset），旧实现的游标永远停在 0、每轮重扫同一段（断言每条队列游标 == maxOffset=1 且零投递）→ S3 对每条队列 seek(maxOffset + 1000)：broker 回 `OFFSET_ILLEGAL` 的纠正值，游标必须跟回去（越界自愈），随后每条队列再钉 1 条必须**全部收到** —— 旧实现的游标永远卡在 1001 上，每轮收到同一个「越界纠正」，新消息一条也看不到。S1 对照组先证明链路本身通、`maxOffset == 1` 这个标尺成立。离线三个用例（`tests/test_lite_pull_consumer.py` 的 `test_no_matched_msg_jumps_the_cursor_past_the_scanned_window` / `test_offset_illegal_adopts_the_brokers_correction` / `test_in_flight_seek_wins_over_the_pull_result`）锁的是判据与刹车
 python verify_sql92_live.py       # SQL92 过滤 + CHECK_CLIENT_CONFIG(46)（20 PASS/0 FAIL）：SQL92 订阅启动时正好一笔 46、纯 TAG 订阅一笔不发；broker 真按属性过滤（red 只收 3 条、blue 不漏、'*' 对照组收 6 条、永不匹配收 0 条）；语法错的表达式让 start() 秒回 SUBSCRIPTION_PARSE_FAILED(23) 并就地回滚。需 broker 开 enablePropertyFilter=true
 python verify_tls_live.py         # 整条客户端链路跑 TLS（8 PASS/0 FAIL）：30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没退回明文、shutdown 不留读线程
 python verify_async_send_live.py  # 异步发送内核 A1~A6（39 PASS/0 FAIL）：不阻塞返回 + 线程口径（AsyncSenderExecutor_1 跑准备段、NettyClientPublicExecutor_1 跑回调）+ 用 offsetMsgId 读回原文、30 笔并发各恰好一个终态且槽位/UNIQ_KEY 不重复、定点发送、CheckForbiddenHook 拒绝不留痕、批量走同步批量内核（一次回调、broker 逐条回 3 个 commitLog 偏移、读回的子消息带客户端 32 位 UNIQ_KEY）、shutdown 不等在途（36 笔全报错、一条都没落）

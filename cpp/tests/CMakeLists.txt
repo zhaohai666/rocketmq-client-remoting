@@ -146,6 +146,12 @@ add_executable(rmq_test_lite_pull test_lite_pull.cpp)
 target_link_libraries(rmq_test_lite_pull PRIVATE rocketmq::remoting)
 add_test(NAME lite_pull COMMAND rmq_test_lite_pull)
 
+# 轻量拉取游标（Java updatePullOffset:982-998）：每轮成功拉取都跟随 nextBeginOffset，
+# 不只在 FOUND；顺带锁死 FIRST_OFFSET 不发 GET_MIN_OFFSET（帧内假集群，非 mock）
+add_executable(rmq_test_lite_pull_cursor test_lite_pull_cursor.cpp)
+target_link_libraries(rmq_test_lite_pull_cursor PRIVATE rocketmq::remoting)
+add_test(NAME lite_pull_cursor COMMAND rmq_test_lite_pull_cursor)
+
 # 队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
 # MACHINE_ROOM_NEARBY）：Java 单测对拍 + 守卫 + 消费者可替换
 add_executable(rmq_test_allocate_strategy test_allocate_strategy.cpp)

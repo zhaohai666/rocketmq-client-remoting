@@ -397,21 +397,38 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         logger_debug("lite pull_one failed for " + mq.topic + "@" + std::to_string(mq.queueId));
         return false;
     }
-    if (result.status == PullStatus::FOUND && !result.msgFoundList.empty()) {
-        std::vector<MessageExt> msgs = std::move(result.msgFoundList);
-        filterTags(mq.topic, msgs, sub);
-        if (!msgs.empty()) {
-            enqueue(msgs);
-            {
-                // 只推进拉取游标。「已消费游标」是 poll() 交付时才写的，两者不是一条线：
-                // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
-                std::lock_guard<std::mutex> lk(stateMutex_);
-                nextOffset_[mq] = msgs.back().queueOffset + 1;
-            }
-            return true;
+    // Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
+    // 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
+    // broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的已越过本轮扫过的整段不匹配区间
+    // （不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的是 broker 的纠正位点
+    // （越界自愈也靠这一步）。
+    // 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
+    // （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 seek() 直接
+    // 改写 nextOffset_、撤队列直接 erase 掉条目，用「游标还是不是我发请求时的那个值」
+    // 做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
+    bool intact = false;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        auto it = nextOffset_.find(mq);
+        if (it != nextOffset_.end() && it->second == offset) {
+            it->second = result.nextBeginOffset;
+            intact = true;
         }
     }
-    return false;
+    if (!intact || result.status != PullStatus::FOUND || result.msgFoundList.empty()) {
+        return false;
+    }
+    std::vector<MessageExt> msgs = std::move(result.msgFoundList);
+    filterTags(mq.topic, msgs, sub);
+    if (msgs.empty()) {
+        // 全被 tag 过滤掉：窗口在 broker 眼里已经读过（游标上面推过了），
+        // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
+        return false;
+    }
+    // 只推进**拉取游标**。「已消费游标」是 poll() 交付时才写的，两条线不是一条：
+    // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
+    enqueue(msgs);
+    return true;
 }
 
 bool DefaultLitePullConsumer::filterTags(const std::string& topic, std::vector<MessageExt>& msgs,

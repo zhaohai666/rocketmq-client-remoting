@@ -209,6 +209,78 @@ internal sealed class MockCluster : IDisposable
 
     private readonly Dictionary<int, Func<RemotingCommand, byte[]>> _replyBodies = new();
 
+    /// <summary>
+    /// 一笔脚本化的 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。<see cref="Gate" /> 非空时
+    /// 应答先等它 —— 用来把「请求已到 broker、应答还在路上」的窗口拉成确定性的。
+    /// </summary>
+    internal sealed class ScriptedPull
+    {
+        public int Code { get; init; } = ResponseCode.PullNotFound;
+        public Dictionary<string, string> Ext { get; init; } = new();
+        public byte[]? Body { get; init; }
+        public ManualResetEventSlim? Gate { get; init; }
+    }
+
+    private readonly Queue<ScriptedPull> _pullScripts = new();
+
+    public void ScriptPull(int code, Dictionary<string, string>? ext = null, byte[]? body = null,
+        ManualResetEventSlim? gate = null)
+    {
+        lock (_gate)
+        {
+            _pullScripts.Enqueue(new ScriptedPull
+            {
+                Code = code,
+                Ext = ext ?? new Dictionary<string, string>(),
+                Body = body,
+                Gate = gate,
+            });
+        }
+    }
+
+    /// <summary>
+    /// PULL_MESSAGE 的应答：排了脚本就按脚本回（挂了闸先等闸），否则按**空 broker** 的忠实
+    /// 形态回 PULL_NOT_FOUND + nextBeginOffset = 请求 queueOffset（Java
+    /// PullMessageProcessor#composeResponseHeader 对 NO_NEW_MSG 同样回填 nextBeginOffset；
+    /// min/max 为 0）。lite-pull 每轮都信 nextBeginOffset，这里不忠实就会把游标推到 0。
+    /// </summary>
+    private RemotingCommand PullRespond(RemotingCommand req)
+    {
+        ScriptedPull? script;
+        lock (_gate)
+        {
+            script = _pullScripts.Count > 0 ? _pullScripts.Dequeue() : null;
+        }
+
+        // 5s 兜底：用例失败时也不能把连接线程永久卡住（Dispose 会等它）。
+        script?.Gate?.Wait(TimeSpan.FromSeconds(5));
+
+        if (script is null)
+        {
+            string offset = req.ExtFields.TryGetValue("queueOffset", out string? q) ? q : "0";
+            RemotingCommand empty = Respond(req, ResponseCode.PullNotFound, null);
+            empty.AddExtField("nextBeginOffset", offset);
+            empty.AddExtField("minOffset", "0");
+            empty.AddExtField("maxOffset", "0");
+            return empty;
+        }
+
+        RemotingCommand resp = Respond(req, script.Code,
+            script.Code == ResponseCode.Success ? null : "mock pull");
+        foreach (KeyValuePair<string, string> kv in script.Ext)
+        {
+            resp.AddExtField(kv.Key, kv.Value);
+        }
+
+        if (script.Body is { Length: > 0 })
+        {
+            resp.Body = script.Body;
+            resp.HasBody = true;
+        }
+
+        return resp;
+    }
+
     /// <summary>第 index 个 broker 收到的 SEND 请求数。</summary>
     public int Requests(int index)
     {
@@ -360,6 +432,11 @@ internal sealed class MockCluster : IDisposable
     private RemotingCommand? BrokerRespond(int index, RemotingCommand req)
     {
         Record(req);
+        if (req.Code == RequestCode.PullMessage)
+        {
+            return req.IsOnewayRpc() ? null : PullRespond(req);
+        }
+
         if (!IsSendCode(req.Code))
         {
             Func<RemotingCommand, byte[]>? bodyFor;
