@@ -1553,8 +1553,12 @@ void DefaultMQPushConsumer::ackPopMsg(const MessageExt& msg) {
     auto target = popCkTarget(msg);
     if (!target) return;
     try {
-        client().ackMessage(consumerGroup_, target->topic, target->queueId, target->extraInfo,
-                            target->offset, 3000, target->brokerName);
+        // Java ackAsync 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
+        // **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
+        MQClientInstance& c = client();
+        c.ackMessage(consumerGroup_, target->topic, target->queueId, target->extraInfo,
+                     target->offset, 3000, target->brokerName,
+                     c.publishAddrFor(target->brokerName, target->topic));
     } catch (const std::exception& e) {
         // ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
         logger_debug(std::string("ack failed for ") + msg.msgId + ": " + e.what());
@@ -1577,10 +1581,13 @@ void DefaultMQPushConsumer::changePopInvisibleTime(const MessageExt& msg, int32_
         delaySecond = table[static_cast<size_t>(std::max(0, delayLevel))];
     }
     try {
-        client().changeInvisibleTime(consumerGroup_, target->topic, target->queueId,
-                                     target->extraInfo, target->offset,
-                                     static_cast<int64_t>(delaySecond) * 1000, 3000,
-                                     target->brokerName);
+        // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由
+        MQClientInstance& c = client();
+        c.changeInvisibleTime(consumerGroup_, target->topic, target->queueId,
+                              target->extraInfo, target->offset,
+                              static_cast<int64_t>(delaySecond) * 1000, 3000,
+                              target->brokerName,
+                              c.publishAddrFor(target->brokerName, target->topic));
     } catch (const std::exception& e) {
         logger_debug(std::string("change invisible time failed for ") + msg.msgId + ": "
                      + e.what());
@@ -3120,7 +3127,10 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
             return it->second;
         }
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            return c.getMinOffset(mq);
+            // Java RebalancePushImpl:197-208：FIRST_OFFSET 且本地没有位点时直接给 0
+            // （本地文件与 broker 两条路径同一个分支），真正的起点由 OFFSET_ILLEGAL
+            // 纠错按 broker 回的 nextBeginOffset 落定。
+            return 0;
         }
         return c.getMaxOffset(mq);
     }
@@ -3136,7 +3146,12 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
     }
     try {
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            return c.getMinOffset(mq);
+            // Java RebalancePushImpl:197-208（`//the offset will be fixed by the OFFSET_ILLEGAL
+            // process` → `result = 0L`）：**不**发 minOffset 查询。多打这一枪的代价不只是慢：
+            // minOffset 是 MQAdminImpl 口径（只认 master），主掉线期间恰好是「新起的消费者
+            // 一条都拉不到」——而从节点本来就能按 0 起拉、越界时由 broker 用
+            // PULL_OFFSET_MOVED 把位点纠回来（见 handleOffsetIllegal）。
+            return 0;
         }
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
             int64_t ts = UtilAll::currentTimeMillis() - 30 * 60 * 1000LL;
@@ -3368,7 +3383,9 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
     // 表成败」，调用方（sendBackBatch）已经不再看异常了。
     try {
         MQClientInstance& c = client();
-        std::string addr = c.brokerAddrOf(brokerName);
+        // Java DefaultMQPushConsumerImpl:768 用的是 findBrokerAddressInPublish（只认 master），
+        // 拿不到就报「Broker[X] master node does not exist」；从节点不接 CONSUMER_SEND_MSG_BACK。
+        std::string addr = c.findBrokerAddressInPublish(brokerName);
         if (addr.empty()) {
             throw MQClientException("Broker[" + brokerName + "] master node does not exist");
         }

@@ -144,6 +144,12 @@ class MQClientInstance:
             self.remoting_client.register_rpc_hook(StreamTypeRPCHook())
         self.topic_route_table: Dict[str, TopicRouteData] = {}
         self.topic_publish_info_table: Dict[str, TopicPublishInfo] = {}
+        # 对应 Java `MQClientInstance.brokerAddrTable`：**按 brokerName 平的**一张表，
+        # 每次刷到任一条路由就整批覆盖（`updateTopicRouteInfoFromNameServer:962-964`）。
+        # 别改用「扫 topic_route_table 找第一台」的写法：路由是**按 topic** 刷的，
+        # master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，扫出来是谁
+        # 全看字典顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
+        self.broker_addr_table: Dict[str, Dict[int, str]] = {}
         self.topic_route_lock = threading.RLock()
         self._started = False
         self._last_route_fetch = 0.0
@@ -618,6 +624,12 @@ class MQClientInstance:
             return False
         with self.topic_route_lock:
             self.topic_route_table[topic] = route
+            # Java 只在路由"变了"时覆盖（`if (changed)`），但 route 是刚解码出来的新对象，
+            # 这里一律覆盖 —— Java 的 brokerAddrTable 条目本身就是**共享引用**
+            # （`put(bd.getBrokerName(), bd.getBrokerAddrs())` 存的是 route 里那张 map），
+            # 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
+            for bd in route.get_broker_datas():
+                self.broker_addr_table[bd.broker_name] = dict(bd.broker_addrs)
             publish = self.topic_publish_info_table.setdefault(topic, TopicPublishInfo())
             publish.order_topic = route.order_topic_conf is not None
             publish.topic_route_data = route
@@ -688,23 +700,42 @@ class MQClientInstance:
         return random.choice(brokers).select_broker_addr()
 
     # ---------------- 消息发送 ----------------
+    def publish_addr_for(self, broker_name: str, topic: str) -> str:
+        """Java 侧「**只要主**」的地址解析，出现处都是同一个形状。
+
+        对应 ``DefaultMQProducerImpl.sendKernelImpl:919-924``（发送）、
+        ``DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876`` /
+        ``ackAsync``（POP 的 ack 与延长不可见时间走
+        ``findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)``，只要主），
+        以及 ``MQAdminImpl`` 的 offset 查询（见 ``_publish_addr_in_admin``）。
+        形状一致：查发布地址（**只认 brokerId=0**）→ 查不到按 topic 刷一次路由 →
+        重查 → 仍查不到照 ``sendKernelImpl:1100`` 抛
+        ``MQClientException("The broker[X] not exist", null)``。（Java 的双参构造器把
+        ``responseCode`` 置 -1；本端口用 ``response_code=None`` 表示「不是 broker 回的
+        码」，Rust/C++/.NET 三端同一个口径。）
+
+        定点发送不会在 ``sendDefaultImpl`` 里取发布信息，这里是它唯一的路由来源；
+        主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮
+        SYSTEM_BUSY(2)」的分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK /
+        CHANGE_INVISIBLE_TIME 这些写请求。
+        """
+        addr = self.find_broker_address_in_publish(broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(topic)
+            addr = self.find_broker_address_in_publish(broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % broker_name)
+        return addr
+
     def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
                      timeout_millis: int = 3000, sys_flag: int = 0,
                      unit_mode: bool = False,
                      default_topic: Optional[str] = None,
                      default_topic_queue_nums: Optional[int] = None) -> SendResult:
-        addr = self.find_broker_addr_in_route(self.get_topic_route_data(mq.topic), mq.broker_name) if self.get_topic_route_data(mq.topic) else None
-        if addr is None:
-            route = self.get_topic_route_data(mq.topic)
-            if route is None:
-                raise MQClientException("No route info of this topic: %s" % mq.topic)
-            addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
-            if addr is None:
-                raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
-        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
-                                           unit_mode, default_topic, default_topic_queue_nums)
-        response = self._invoke_sync(addr, request, timeout_millis)
-        return self._parse_send_response(response, msg, mq)
+        return self.send_message_to_addr(producer_group, msg, mq,
+                                         self.publish_addr_for(mq.broker_name, mq.topic),
+                                         timeout_millis, sys_flag, unit_mode, default_topic,
+                                         default_topic_queue_nums)
 
     def send_message_to_addr(self, producer_group: str, msg: Message, mq: MessageQueue,
                              addr: str, timeout_millis: int = 3000,
@@ -1347,7 +1378,7 @@ class MQClientInstance:
 
     def get_max_offset(self, mq: MessageQueue, timeout_millis: int = 5000, addr: Optional[str] = None) -> int:
         if addr is None:
-            addr = self._broker_addr(mq)
+            addr = self._publish_addr_in_admin(mq)
         header = GetMaxOffsetRequestHeader()
         header.topic = mq.topic
         header.queue_id = mq.queue_id
@@ -1360,7 +1391,7 @@ class MQClientInstance:
 
     def get_min_offset(self, mq: MessageQueue, timeout_millis: int = 5000, addr: Optional[str] = None) -> int:
         if addr is None:
-            addr = self._broker_addr(mq)
+            addr = self._publish_addr_in_admin(mq)
         header = GetMinOffsetRequestHeader()
         header.topic = mq.topic
         header.queue_id = mq.queue_id
@@ -1381,7 +1412,7 @@ class MQClientInstance:
         5 参重载（只 set topic/queueId/timestamp，“边界”由 broker 的默认值兜底）。
         """
         if addr is None:
-            addr = self._broker_addr(mq)
+            addr = self._publish_addr_in_admin(mq)
         header = SearchOffsetRequestHeader()
         header.topic = mq.topic
         header.queue_id = mq.queue_id
@@ -1716,6 +1747,11 @@ class MQClientInstance:
 
     # ---------------- 工具 ----------------
     def _broker_addr(self, mq: MessageQueue) -> str:
+        """Java ``findBrokerAddressInAdmin`` 口径：主优先、没主退一台从节点。
+
+        位点查询/提交（``query_consumer_offset`` / ``update_consumer_offset``）用它 ——
+        Java 那边就是 ``findBrokerAddressInAdmin``（从节点上报的位点是同一份，允许）。
+        """
         route = self.get_topic_route_data(mq.topic)
         if route is None:
             raise MQClientException("No route info of this topic: %s" % mq.topic)
@@ -1724,12 +1760,46 @@ class MQClientInstance:
             raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
         return addr
 
+    def _publish_addr_in_admin(self, mq: MessageQueue) -> str:
+        """Java ``MQAdminImpl`` 的 offset 查询口径（``:195/214/232/250``）。
+
+        四步与 Java 逐条对齐：查**发布地址**（只认 master）→ 刷一次该 topic 的路由 →
+        重查 → 仍拿不到就抛 ``MQClientException("The broker[X] not exist", null)``。
+        从节点上的 store 是 HA 复制来的同一份数据，但 Java 的管理类 API 一律打主，
+        本端不"顺手"退到从节点 —— 主掉线期间这里就该报错，让调用方看见。
+        """
+        addr = self.find_broker_address_in_publish(mq.broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(mq.topic)
+            addr = self.find_broker_address_in_publish(mq.broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % mq.broker_name)
+        return addr
+
     def broker_addr_of(self, broker_name: str) -> Optional[str]:
         for route in self.topic_route_table.values():
             addr = MQClientInstance.find_broker_addr_in_route(route, broker_name)
             if addr:
                 return addr
         return None
+
+    def find_broker_address_in_publish(self, broker_name: str) -> Optional[str]:
+        """对应 Java ``MQClientInstance#findBrokerAddressInPublish:1295-1305``。
+
+        **只**从 ``broker_addr_table`` 取 ``brokerId=0`` 的地址，没有就返回 ``None``
+        （Java 的 ``map.get(MixAll.MASTER_ID)``）。与 ``broker_addr_of`` 是两码事：
+        后者走 ``select_broker_addr()``（主优先、没主退任意一台），给「问到一台就行」
+        的心跳/拉取用；**发送**不行 —— 主没了还发到从节点上，broker 回 SYSTEM_BUSY(2)，
+        白烧一整轮重试，错误类型也和 Java 不一样（Java 是本端直接报「broker 不存在」）。
+
+        返回 ``None`` 是正常结果（master 掉线就是这个形状），报什么错由调用方决定
+        （``sendKernelImpl`` 报 MQClientException、``endTransaction`` 什么都不报）。
+        """
+        with self.topic_route_lock:
+            addrs = self.broker_addr_table.get(broker_name)
+            if not addrs:
+                return None
+            return addrs.get(0)
 
     def get_route_of_all_brokers(self) -> List[str]:
         addrs = []

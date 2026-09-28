@@ -1074,15 +1074,10 @@ public class DefaultMQProducer
                 _createTopicKey, _defaultTopicQueueNums);
         }
 
-        string brokerAddr = string.Empty;
-        try
-        {
-            brokerAddr = c.BrokerAddrForMq(mq) ?? string.Empty;
-        }
-        catch (Exception)
-        {
-            // 路由表里查不到 broker 时不影响发送本身，钩子照常跑（brokerAddr 为空）
-        }
+        // 地址解析在钩子**之前**、且失败不吞：Java sendKernelImpl:919-924 的地址两步就在
+        // 钩子块外，拿不到照 :1100 抛「The broker[X] not exist」。旧行为（宽容查地址 + 吞异常）
+        // 会让主掉线时的第一次定点发送把请求打到从节点上白挨一轮 SYSTEM_BUSY(2)。
+        string brokerAddr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
 
         RunCheckForbidden(msg, mq, brokerAddr, arg, mode);
 
@@ -1892,32 +1887,19 @@ public class DefaultMQProducer
         int sysFlag)
     {
         double began = UtilAll.MonotonicMillis();
-        // 地址解析两步，与 Java sendKernelImpl:919-924 一致：先查已缓存的发布地址，查不到再按
-        // topic 刷一次路由重查。定点发送（调用方给了 mq）不会在 sendDefaultImpl 里取发布信息，
-        // 这一步是它唯一的路由来源 —— 少了第一次定点发送必然拿到空地址。
-        string addr = c.BrokerAddrOf(mq.BrokerName);
-        if (addr.Length == 0)
+        // 地址解析两步，与 Java sendKernelImpl:919-924 一致：先查已缓存的**发布**地址（只认
+        // master），查不到再按 topic 刷一次路由重查，仍查不到照 :1100 报「The broker[X] not exist」。
+        // 定点发送（调用方给了 mq）不会在 sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源。
+        // 从节点不接 SEND_MESSAGE，所以这里不退回从节点地址（PublishAddrFor 失败即抛，
+        // 由 CompleteAsync 交给回调）。
+        string addr;
+        try
         {
-            try
-            {
-                TopicRouteData? route = c.GetTopicRouteData(mq.Topic);
-                if (route is not null)
-                {
-                    addr = MQClientInstance.FindBrokerAddrInRoute(route, mq.BrokerName);
-                }
-            }
-            catch (Exception)
-            {
-                // 刷路由失败交给下面统一报「broker 不存在」
-            }
+            addr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
         }
-
-        if (addr.Length == 0)
+        catch (Exception e)
         {
-            // Java sendKernelImpl:1100
-            CompleteAsync(callback, null,
-                new MQClientException("The broker[" + mq.BrokerName + "] not exist"), null, permits,
-                onCallbackPool: false);
+            CompleteAsync(callback, null, e, null, permits, onCallbackPool: false);
             return;
         }
 
@@ -2225,9 +2207,9 @@ public class DefaultMQProducer
                 }
             }
 
-            // Java onExceptionImpl:725 只查发布地址表、**不刷路由**；查不到就带着 null 撞进
-            // invokeAsync。这里就地终止，别让空地址传进传输层。
-            string addr = _client.BrokerAddrOf(brokerName);
+            // Java onExceptionImpl:725 只查发布地址表（findBrokerAddressInPublish，只认 master）、
+            // **不刷路由**；查不到就带着 null 撞进 invokeAsync。这里就地终止，别让空地址传进传输层。
+            string addr = _client.FindBrokerAddressInPublish(brokerName);
             if (addr.Length == 0)
             {
                 Finish(null, new MQClientException("The broker[" + brokerName + "] not exist"));
@@ -2292,16 +2274,9 @@ public class DefaultMQProducer
         TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
         MessageQueue selected = publish.SelectOneMessageQueue();
         int sysFlag = PrepareForSend(outbound);
-        // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效
-        string brokerAddr = string.Empty;
-        try
-        {
-            brokerAddr = c.BrokerAddrForMq(selected) ?? string.Empty;
-        }
-        catch (Exception)
-        {
-            // 查不到 broker 地址不影响拦截判定，brokerAddr 留空
-        }
+        // 单向发送在 Java 里同样走 sendKernelImpl：地址先解析（只认 master，失败即抛，
+        // 不会打到从节点上），再跑 CheckForbiddenHook。
+        string brokerAddr = c.PublishAddrFor(selected.BrokerName, selected.Topic);
 
         RunCheckForbidden(outbound, selected, brokerAddr, null, CommunicationMode.Oneway);
         // W3C traceparent 透传（opt-in）：单向发送同样注入
@@ -2327,15 +2302,8 @@ public class DefaultMQProducer
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
-        string brokerAddr = string.Empty;
-        try
-        {
-            brokerAddr = c.BrokerAddrForMq(mq) ?? string.Empty;
-        }
-        catch (Exception)
-        {
-            // 查不到 broker 地址不影响拦截判定，brokerAddr 留空
-        }
+        // 同 SendOneway(msg)：地址只认 master，拿不到就抛（从节点不接 SEND_MESSAGE）。
+        string brokerAddr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
 
         RunCheckForbidden(outbound, mq, brokerAddr, null, CommunicationMode.Oneway);
         if (_enableTraceContext)
@@ -2810,7 +2778,10 @@ public class DefaultMQProducer
             header.TransactionId = sendResult.TransactionId;
             header.Bname = sendResult.MessageQueue?.BrokerName;
             header.MsgId = sendResult.MsgId;
-            addr = c.BrokerAddrForMq(sendResult.MessageQueue!);
+            // Java endTransaction:1541 用的也是 findBrokerAddressInPublish（只认 master），
+            // 且**不做 null 检查**就直接 oneway；这里保留本端提前报错的守卫（比 Java 的 NPE 干净），
+            // 但地址来源必须同样是 master-only —— 从节点不接 END_TRANSACTION。
+            addr = c.FindBrokerAddressInPublish(sendResult.MessageQueue?.BrokerName ?? string.Empty);
         }
 
         RemotingCommand request =
@@ -2818,6 +2789,11 @@ public class DefaultMQProducer
         if (localExceptionText is not null)
         {
             request.Remark = "executeLocalTransactionBranch exception: " + localExceptionText;
+        }
+
+        if (addr.Length == 0)
+        {
+            throw new MQClientException("no broker address for end transaction");
         }
 
         c.RemotingClient.InvokeOneway(addr, request);
@@ -2978,8 +2954,9 @@ public class DefaultMQProducer
         // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
         TryToFindTopicPublishInfo(c, realTopic);
 
-        // Java findBrokerAddressInPublish(brokerName) → 退化到 findBrokerAddrByTopic(topic)
-        string addr = c.BrokerAddrOf(handle.BrokerName);
+        // Java findBrokerAddressInPublish(brokerName)（只认 master，不刷路由）→ 退化到
+        // findBrokerAddrByTopic(topic) —— 那条路走 SelectBrokerAddr()，**允许**落到从节点上。
+        string addr = c.FindBrokerAddressInPublish(handle.BrokerName);
         if (addr.Length == 0)
         {
             TopicRouteData? route = c.GetTopicRouteData(realTopic);

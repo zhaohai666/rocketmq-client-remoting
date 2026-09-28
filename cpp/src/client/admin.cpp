@@ -1062,7 +1062,10 @@ int64_t DefaultMQAdminExt::searchUpperBoundaryOffset(const MessageQueue& mq, int
 
 int64_t DefaultMQAdminExt::earliestMsgStoreTime(const MessageQueue& mq) {
     MQClientInstance& client = requireClient();
-    std::string addr = brokerAddrForMq(client, mq);
+    // Java MQAdminImpl:250 的 earliestMsgStoreTime 与 max/min/search 同一个形状：
+    // 只认 master，刷一次路由重查，仍拿不到照 :264 抛「The broker[X] not exist」。
+    // （publishAddrInAdmin 是实例私有，这里用同形状的 publishAddrFor。）
+    std::string addr = client.publishAddrFor(mq.brokerName, mq.topic);
     PropertyMap ext;
     ext["topic"] = mq.topic;
     ext["queueId"] = i64str(mq.queueId);

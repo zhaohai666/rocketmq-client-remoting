@@ -570,12 +570,16 @@ impl std::fmt::Debug for MQClientInstanceConfig {
 
 // ================================================================ MQClientInstance
 
-/// 路由两张表（Python `topic_route_table` + `topic_publish_info_table`，
-/// 共用一把 `topic_route_lock`）。
+/// 路由三张表（Python `topic_route_table` + `topic_publish_info_table` +
+/// `broker_addr_table`，共用一把 `topic_route_lock`）。
 #[derive(Default)]
 struct RouteTables {
     topic_route_table: HashMap<String, TopicRouteData>,
     topic_publish_info_table: HashMap<String, Arc<TopicPublishInfo>>,
+    /// Python `broker_addr_table` / Java `MQClientInstance#brokerAddrTable`：
+    /// `brokerName -> {brokerId: addr}` 的**平表**。发布地址解析（只认 0）读的就是它，
+    /// 而它只在路由落库那一处整批刷新 —— 与 Java `:962-964` 同点。
+    broker_addr_table: HashMap<String, HashMap<i64, String>>,
 }
 
 struct Inner {
@@ -1454,6 +1458,15 @@ impl MQClientInstance {
         let publish = {
             let mut tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
             tables.topic_route_table.insert(topic.to_string(), route.clone());
+            // Java 只在路由"变了"时覆盖（`if (changed)`），但 route 是刚解码出来的新对象，
+            // 这里一律覆盖 —— Java 的 brokerAddrTable 条目本身就是**共享引用**
+            // （`put(bd.getBrokerName(), bd.getBrokerAddrs())` 存的是 route 里那张 map），
+            // 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
+            for bd in route.get_broker_datas() {
+                tables
+                    .broker_addr_table
+                    .insert(bd.broker_name.clone(), bd.broker_addrs.iter().cloned().collect());
+            }
             tables
                 .topic_publish_info_table
                 .entry(topic.to_string())
@@ -1614,18 +1627,11 @@ impl MQClientInstance {
         create_topic_key: &str,
         default_topic_queue_nums: i32,
     ) -> Result<SendResult> {
-        // Python 先 `... if self.get_topic_route_data(mq.topic) else None` 再取一次，
-        // 两次调用读的是同一份缓存（第二次必然命中），语义等价于「取一次路由」。
-        let route = self
-            .get_topic_route_data(&mq.topic)
-            .await
-            .ok_or_else(|| Error::client(format!("No route info of this topic: {}", mq.topic)))?;
-        let addr = Self::find_broker_addr_in_route(&route, &mq.broker_name).ok_or_else(|| {
-            Error::client(format!(
-                "Broker {} not found in route of topic {}",
-                mq.broker_name, mq.topic
-            ))
-        })?;
+        // Python `publish_addr_for(mq.broker_name, mq.topic)`：查发布地址（只认 master）
+        // → 查不到刷一次路由 → 仍查不到照 `sendKernelImpl:1100` 报
+        // 「The broker[X] not exist」。**不是** `broker_addr_in_route`（那个允许落到从节点，
+        // 主从切换期间会白挨一轮 SYSTEM_BUSY(2)）。
+        let addr = self.publish_addr_for(&mq.broker_name, &mq.topic).await?;
         self.send_message_to_addr(
             producer_group,
             msg,
@@ -2497,6 +2503,79 @@ impl MQClientInstance {
             .find_map(|route| Self::find_broker_addr_in_route(&route, broker_name))
     }
 
+    /// Python `find_broker_address_in_publish` / Java
+    /// `MQClientInstance#findBrokerAddressInPublish:1295-1305`。
+    ///
+    /// **只**从 `broker_addr_table` 取 `brokerId=0` 的地址，没有就返回 `None`
+    /// （Java 的 `map.get(MixAll.MASTER_ID)`）。与 [`Self::broker_addr_of`] 是两码事：
+    /// 后者走 `select_broker_addr()`（主优先、没主退任意一台），给「问到一台就行」的
+    /// 心跳/拉取用；**发送**不行 —— 主没了还发到从节点上，broker 回 SYSTEM_BUSY(2)，
+    /// 白烧一整轮重试，错误类型也和 Java 不一样（Java 是本端直接报「broker 不存在」）。
+    ///
+    /// 返回 `None` 是正常结果（master 掉线就是这个形状），报什么错由调用方决定
+    /// （`sendKernelImpl` 报 MQClientException、`endTransaction` 什么都不报）。
+    pub fn find_broker_address_in_publish(&self, broker_name: &str) -> Option<String> {
+        let tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
+        tables
+            .broker_addr_table
+            .get(broker_name)
+            .and_then(|addrs| addrs.get(&(MixAll::MASTER_ID as i64)))
+            .cloned()
+    }
+
+    /// 测试专用：把发布地址直接写进平表（等价于路由落库那一处做的一次刷新）。
+    /// 离线用例没有名字服务，种不上这张表的话地址解析会在钩子之前就失败。
+    #[cfg(test)]
+    pub(crate) fn seed_publish_addr_for_test(&self, broker_name: &str, addr: &str) {
+        let mut tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
+        tables.broker_addr_table.insert(
+            broker_name.to_string(),
+            HashMap::from([(MixAll::MASTER_ID as i64, addr.to_string())]),
+        );
+    }
+
+    /// Python `publish_addr_for`：Java 侧「**只要主**」的地址解析，出现处都是同一个形状。
+    ///
+    /// 对应 `DefaultMQProducerImpl.sendKernelImpl:919-924`（发送）、
+    /// `DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876` /
+    /// `ackAsync`（POP 的 ack 与延长不可见时间走
+    /// `findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)`，只要主），
+    /// 以及 `MQAdminImpl` 的 offset 查询（见 [`Self::publish_addr_in_admin`]）。
+    /// 形状一致：查发布地址（**只认 brokerId=0**）→ 查不到按 topic 刷一次路由 →
+    /// 重查 → 仍查不到照 `sendKernelImpl:1100` 抛
+    /// `MQClientException("The broker[X] not exist", null)`。
+    ///
+    /// 定点发送不会在 `sendDefaultImpl` 里取发布信息，这里是它唯一的路由来源；
+    /// 主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮
+    /// SYSTEM_BUSY(2)」的分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK /
+    /// CHANGE_INVISIBLE_TIME 这些写请求。
+    pub async fn publish_addr_for(&self, broker_name: &str, topic: &str) -> Result<String> {
+        let mut addr = self.find_broker_address_in_publish(broker_name);
+        if addr.is_none() {
+            self.update_topic_route_info_from_name_server(topic, 5000, false)
+                .await?;
+            addr = self.find_broker_address_in_publish(broker_name);
+        }
+        addr.ok_or_else(|| Error::client(format!("The broker[{broker_name}] not exist")))
+    }
+
+    /// Python `_publish_addr_in_admin`：Java `MQAdminImpl` 的 offset 查询口径
+    /// （`:195/214/232/250`）。
+    ///
+    /// 四步与 Java 逐条对齐：查**发布地址**（只认 master）→ 刷一次该 topic 的路由 →
+    /// 重查 → 仍拿不到就抛 `MQClientException("The broker[X] not exist", null)`。
+    /// 从节点上的 store 是 HA 复制来的同一份数据，但 Java 的管理类 API 一律打主，
+    /// 本端不"顺手"退到从节点 —— 主掉线期间这里就该报错，让调用方看见。
+    async fn publish_addr_in_admin(&self, mq: &MessageQueue) -> Result<String> {
+        let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
+        if addr.is_none() {
+            self.update_topic_route_info_from_name_server(&mq.topic, 5000, false)
+                .await?;
+            addr = self.find_broker_address_in_publish(&mq.broker_name);
+        }
+        addr.ok_or_else(|| Error::client(format!("The broker[{}] not exist", mq.broker_name)))
+    }
+
     /// Python `get_route_of_all_brokers`：所有已缓存路由里的 broker 地址（去重）。
     ///
     /// Python 按 dict 插入序返回；Rust 的 HashMap 无序，这里按地址字典序排序，
@@ -2614,7 +2693,7 @@ impl MQClientInstance {
         Ok(())
     }
 
-    /// Python `get_max_offset`。
+    /// Python `get_max_offset`（Java `MQAdminImpl.maxOffset:214` 口径：地址只认 master）。
     pub async fn get_max_offset(
         &self,
         mq: &MessageQueue,
@@ -2623,7 +2702,7 @@ impl MQClientInstance {
     ) -> Result<i64> {
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.broker_addr(mq).await?,
+            None => self.publish_addr_in_admin(mq).await?,
         };
         let header = GetMaxOffsetRequestHeader {
             topic: Some(mq.topic.clone()),
@@ -2638,7 +2717,7 @@ impl MQClientInstance {
         Ok(resp_header.offset.unwrap_or(0))
     }
 
-    /// Python `get_min_offset`。
+    /// Python `get_min_offset`（Java `MQAdminImpl.minOffset:232` 口径：地址只认 master）。
     pub async fn get_min_offset(
         &self,
         mq: &MessageQueue,
@@ -2647,7 +2726,7 @@ impl MQClientInstance {
     ) -> Result<i64> {
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.broker_addr(mq).await?,
+            None => self.publish_addr_in_admin(mq).await?,
         };
         let header = GetMinOffsetRequestHeader {
             topic: Some(mq.topic.clone()),
@@ -2681,6 +2760,9 @@ impl MQClientInstance {
     ///
     /// `boundary` 为 `None` 时不写 `boundaryType` 字段，对应 Java 那个已废弃的
     /// 5 参重载（只 set topic/queueId/timestamp，"边界"由 broker 的默认值兜底）。
+    ///
+    /// 地址口径同 `MQAdminImpl.searchOffset:195`：只认 master（见
+    /// [`Self::publish_addr_in_admin`]）。
     pub async fn search_offset_by_boundary(
         &self,
         mq: &MessageQueue,
@@ -2691,7 +2773,7 @@ impl MQClientInstance {
     ) -> Result<i64> {
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.broker_addr(mq).await?,
+            None => self.publish_addr_in_admin(mq).await?,
         };
         let header = SearchOffsetRequestHeader {
             topic: Some(mq.topic.clone()),
@@ -2714,6 +2796,9 @@ impl MQClientInstance {
     /// （`consumer.py:2217`）里，Rust 与其它 offset RPC 一并收在实例层
     /// （Java `MQClientAPIImpl#getEarliestMsgStoretime`）。
     /// 响应头缺 `timestamp` ⇒ `0`（Python `resp_header.timestamp or 0`）。
+    ///
+    /// 地址与 max/min/search 同一个口径（Java `MQAdminImpl:250`）：只认 master，
+    /// 见 [`Self::publish_addr_in_admin`]。
     pub async fn get_earliest_msg_store_time(
         &self,
         mq: &MessageQueue,
@@ -2722,7 +2807,7 @@ impl MQClientInstance {
     ) -> Result<i64> {
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.broker_addr(mq).await?,
+            None => self.publish_addr_in_admin(mq).await?,
         };
         let header = GetEarliestMsgStoretimeRequestHeader {
             topic: Some(mq.topic.clone()),
@@ -5223,6 +5308,266 @@ mod tests {
         // 老 broker 不带 suggestWhichBrokerId：调用方按 master=0 记账（None 传出去）
         assert_eq!(result.suggest_which_broker_id, None);
         assert_eq!(result.next_begin_offset, 7);
+        instance.shutdown();
+    }
+
+    // -------------------------------------------- 发布地址（Java findBrokerAddressInPublish）
+
+    /// 假 namesrv：`GET_ROUTEINFO_BY_TOPIC` 回 `holder` 里那份路由 body
+    /// （`None` ⇒ TOPIC_NOT_EXIST），其余一律 SUCCESS；把收到的请求码记下来。
+    ///
+    /// 路由一律走**真的** `update_topic_route_info_from_name_server` 落库：发布地址
+    /// 平表的写入点就在它里面，绕过去直接往 `broker_addr_table` 塞值等于这条路径没测
+    /// （Python `test_publish_route_master.py::_serving` 同理）。
+    struct RouteNamesrv {
+        addr: String,
+        holder: Arc<Mutex<Option<Vec<u8>>>>,
+        codes: Arc<Mutex<Vec<i32>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RouteNamesrv {
+        async fn start() -> RouteNamesrv {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                Ok(l) => l,
+                Err(e) => panic!("bind 假 namesrv: {e}"),
+            };
+            let addr = match listener.local_addr() {
+                Ok(a) => a.to_string(),
+                Err(e) => panic!("假 namesrv 地址: {e}"),
+            };
+            let holder: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+            let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+            let served = Arc::clone(&holder);
+            let seen = Arc::clone(&codes);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let served = Arc::clone(&served);
+                    let seen = Arc::clone(&seen);
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt as _;
+                        while let Some(request) = read_request(&mut stream).await {
+                            guard(&seen).push(request.code);
+                            let body = guard(&served).clone();
+                            let (code, body) = match body {
+                                Some(body) => (response_code::SUCCESS, Some(body)),
+                                None => (response_code::TOPIC_NOT_EXIST, None),
+                            };
+                            let mut response = RemotingCommand::create_response(code, None);
+                            // 客户端按 opaque 配对响应，串了就当噪声丢掉。
+                            response.opaque = request.opaque;
+                            response.serialize_type_current_rpc =
+                                request.serialize_type_current_rpc;
+                            response.set_body(body);
+                            let bytes = response.encode();
+                            if stream.write_all(&bytes).await.is_err() {
+                                return;
+                            }
+                            let _ = stream.flush().await;
+                        }
+                    });
+                }
+            });
+            RouteNamesrv { addr, holder, codes, task }
+        }
+
+        /// 换一份路由 body（`None` = namesrv 说这个 topic 不存在）。
+        fn serve(&self, body: Option<Vec<u8>>) {
+            *guard(&self.holder) = body;
+        }
+
+        fn codes(&self) -> Vec<i32> {
+            guard(&self.codes).clone()
+        }
+
+        /// 刷了几次路由（发布地址解析里那次「查不到就刷一遍」）。
+        fn route_requests(&self) -> usize {
+            self.codes()
+                .iter()
+                .filter(|c| **c == request_code::GET_ROUTEINFO_BY_TOPIC)
+                .count()
+        }
+    }
+
+    impl Drop for RouteNamesrv {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// 一份 topic 路由的 body：`broker_name` 一台机器，`addrs` 是它的 brokerId → 地址。
+    fn route_body(broker_name: &str, addrs: &[(i64, &str)]) -> Vec<u8> {
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                broker_name,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                broker_name,
+                addrs.iter().map(|(id, a)| (*id, (*a).to_string())).collect(),
+                "",
+            )],
+            ..Default::default()
+        };
+        serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+    }
+
+    /// 指向给定 namesrv 的实例（`new_instance` 固定用 NAMESRV 常量，这里要假服务器地址）。
+    fn instance_against(namesrv: &str) -> MQClientInstance {
+        let id = format!("{GROUP}@rs{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        MQClientInstance::new(&id, vec![namesrv.to_string()])
+    }
+
+    /// `find_broker_address_in_publish` 只认 brokerId=0；同一份路由上管理口径要退到从节点。
+    #[tokio::test]
+    async fn publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back() {
+        let namesrv = RouteNamesrv::start().await;
+        // 主掉线：路由里只剩 brokerId=1（从节点自己也会注册进 namesrv）
+        namesrv.serve(Some(route_body(BROKER, &[(MixAll::MASTER_ID as i64 + 1, "127.0.0.1:10931")])));
+        let instance = instance_against(&namesrv.addr);
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+
+        assert_eq!(instance.find_broker_address_in_publish(BROKER), None);
+        // 负控：退让口径（心跳/拉取/位点查询用）在**同一张路由**上必须拿得到从节点地址
+        assert_eq!(
+            instance.broker_addr_of(BROKER).as_deref(),
+            Some("127.0.0.1:10931")
+        );
+
+        // 主重新注册：同一个名字立刻解析得出（跳的是「没有 master」，不是 broker-a）
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[
+                (MixAll::MASTER_ID as i64, "127.0.0.1:10911"),
+                (MixAll::MASTER_ID as i64 + 1, "127.0.0.1:10931"),
+            ],
+        )));
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+        assert_eq!(
+            instance.find_broker_address_in_publish(BROKER).as_deref(),
+            Some("127.0.0.1:10911")
+        );
+        instance.shutdown();
+    }
+
+    /// Java `sendKernelImpl:919-924`：发布地址查不到，按 topic 刷一次路由再查。
+    #[tokio::test]
+    async fn publish_addr_for_refreshes_the_route_then_rechecks() {
+        let namesrv = RouteNamesrv::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64, "127.0.0.1:10911")],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        assert_eq!(
+            instance.publish_addr_for(BROKER, TOPIC).await.expect("刷路由之后解析得出"),
+            "127.0.0.1:10911"
+        );
+        assert_eq!(namesrv.route_requests(), 1, "查不到才刷，且只刷一次");
+        instance.shutdown();
+    }
+
+    /// 解析失败一律是 `MQClientException("The broker[X] not exist", null)`
+    /// （Java `sendKernelImpl:1100` / `MQAdminImpl`），文案与空错误码都要对上。
+    fn assert_broker_not_exist(err: &Error) {
+        match err {
+            Error::Client { response_code, message } => {
+                assert_eq!(message, &format!("The broker[{BROKER}] not exist"));
+                // 本端报的错，没有 broker 侧错误码（Java 的双参构造器给 -1）
+                assert_eq!(*response_code, None);
+            }
+            other => panic!("应当是本端的 MQClientException，得到 {other:?}"),
+        }
+    }
+
+    /// 主掉线（路由里只剩 brokerId=1）：本端报「broker 不存在」，一次请求都不发。
+    #[tokio::test]
+    async fn publish_addr_for_reports_not_exist_when_the_master_is_gone() {
+        let namesrv = RouteNamesrv::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64 + 1, "127.0.0.1:10931")],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        let err = instance
+            .publish_addr_for(BROKER, TOPIC)
+            .await
+            .expect_err("没有主就没有发布地址");
+        assert_broker_not_exist(&err);
+        // 报错前必须先刷一次路由（Java 的 tryToFindTopicPublishInfo），不能直接拿旧结论结账
+        assert_eq!(namesrv.route_requests(), 1);
+
+        // 负控：主一注册立刻解析得出（刷的是「没有 master」，不是这个 brokerName）
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64, "127.0.0.1:10911")],
+        )));
+        assert_eq!(
+            instance.publish_addr_for(BROKER, TOPIC).await.expect("主回来了"),
+            "127.0.0.1:10911"
+        );
+        instance.shutdown();
+    }
+
+    /// 路由里压根没有这个 brokerName（拼错/已下线）：同样报 not exist，不退到别的 broker。
+    #[tokio::test]
+    async fn publish_addr_for_reports_not_exist_for_an_unknown_broker() {
+        let namesrv = RouteNamesrv::start().await;
+        namesrv.serve(Some(route_body(
+            "broker-b",
+            &[(MixAll::MASTER_ID as i64, "127.0.0.1:10912")],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        let err = instance
+            .publish_addr_for(BROKER, TOPIC)
+            .await
+            .expect_err("路由里没有这个名字");
+        assert_broker_not_exist(&err);
+        instance.shutdown();
+    }
+
+    /// `MQAdminImpl:195-264` 的四个 offset 查询同一口径：只打主，主没了就报 not exist。
+    #[tokio::test]
+    async fn admin_offset_queries_are_master_only_too() {
+        let namesrv = RouteNamesrv::start().await;
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        // 只登记从节点 ⇒ 管理口径也不该拿它凑合
+        namesrv.serve(Some(route_body(BROKER, &[(MixAll::MASTER_ID as i64 + 1, &slave.addr)])));
+        let instance = instance_against(&namesrv.addr);
+        let mq = MessageQueue::new(TOPIC, BROKER, 0);
+        let err = instance
+            .get_max_offset(&mq, 5000, None)
+            .await
+            .expect_err("没有主就没有可查的 store");
+        assert_broker_not_exist(&err);
+        assert!(slave.recorded(request_code::GET_MAX_OFFSET).is_empty(), "报错前一次请求都不发");
+
+        // 负控：主回来之后查得到，且请求落在**主**地址上（不是路由里那台从节点）
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[
+                (MixAll::MASTER_ID as i64, &master.addr),
+                (MixAll::MASTER_ID as i64 + 1, &slave.addr),
+            ],
+        )));
+        master.script_resp_ext(vec![vec![("offset".to_string(), "7".to_string())]]);
+        assert_eq!(instance.get_max_offset(&mq, 5000, None).await.expect("主回来了"), 7);
+        assert_eq!(master.recorded(request_code::GET_MAX_OFFSET).len(), 1);
+        assert!(slave.recorded(request_code::GET_MAX_OFFSET).is_empty());
         instance.shutdown();
     }
 }

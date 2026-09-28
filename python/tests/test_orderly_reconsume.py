@@ -212,7 +212,7 @@ def test_orderly_cap_does_not_reuse_the_concurrent_16_default():
     captured = {}
 
     class FakeClient:
-        def broker_addr_of(self, broker_name):
+        def find_broker_address_in_publish(self, broker_name):
             return "127.0.0.1:10911"
 
         def _invoke_sync(self, addr, request, timeout):

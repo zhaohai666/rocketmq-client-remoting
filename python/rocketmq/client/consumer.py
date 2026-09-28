@@ -2402,9 +2402,11 @@ class DefaultMQPushConsumer:
         topic, broker_name, queue_id, offset, ck = target
         try:
             client = self._require_client()
+            # Java ackAsync 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
+            # **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
             client.ack_message(self.consumer_group, topic, queue_id, ck, offset,
                                broker_name=broker_name,
-                               addr=client.broker_addr_of(broker_name))
+                               addr=client.publish_addr_for(broker_name, topic))
         except Exception as e:  # noqa: BLE001
             # ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
             logger.debug("ack failed for %s: %s", msg.msg_id, e)
@@ -2424,10 +2426,11 @@ class DefaultMQPushConsumer:
         delay_second = table[-1] if delay_level >= len(table) else table[max(0, delay_level)]
         try:
             client = self._require_client()
+            # Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由
             client.change_invisible_time(self.consumer_group, topic, queue_id, ck, offset,
                                          delay_second * 1000,
                                          broker_name=broker_name,
-                                         addr=client.broker_addr_of(broker_name))
+                                         addr=client.publish_addr_for(broker_name, topic))
         except Exception as e:  # noqa: BLE001
             logger.debug("change invisible time failed for %s: %s", msg.msg_id, e)
 
@@ -2487,7 +2490,10 @@ class DefaultMQPushConsumer:
             if key in stored:
                 return stored[key]
             if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-                return client.get_min_offset(mq)
+                # Java RebalancePushImpl:197-208：FIRST_OFFSET 且本地没有位点时直接给 0
+                # （本地文件与 broker 两条路径同一个分支），真正的起点由 OFFSET_ILLEGAL
+                # 纠错按 broker 回的 nextBeginOffset 落定。
+                return 0
             return client.get_max_offset(mq)
         # 集群模式：先查 broker 上已提交的位点（对齐 Java RemoteBrokerOffsetStore.readOffset）
         try:
@@ -2497,7 +2503,12 @@ class DefaultMQPushConsumer:
         except Exception as e:  # noqa: BLE001
             logger.debug("query consumer offset for %s not found: %s", mq, e)
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-            return client.get_min_offset(mq)
+            # Java RebalancePushImpl:197-208（`//the offset will be fixed by the OFFSET_ILLEGAL
+            # process` → `result = 0L`）：**不**发 minOffset 查询。多打这一枪的代价不只是慢：
+            # minOffset 是 MQAdminImpl 口径（只认 master），主掉线期间恰好是「新起的消费者
+            # 一条都拉不到」——而从节点本来就能按 0 起拉、越界时由 broker 用
+            # PULL_OFFSET_MOVED 把位点纠回来（_offset_illegal_recover）。
+            return 0
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
             return client.search_offset_by_timestamp(mq, self._consume_timestamp_millis())
         if NamespaceUtil.is_retry_topic(mq.topic):
@@ -3293,9 +3304,11 @@ class DefaultMQPushConsumer:
         from ..remoting.protocol.remoting_command import RemotingCommand
         if broker_name is None:
             broker_name = msg.broker_name
-        addr = client.broker_addr_of(broker_name)
+        # Java DefaultMQPushConsumerImpl:768 用的是 findBrokerAddressInPublish（只认 master），
+        # 拿不到就报「Broker[X] master node does not exist」；从节点不接 CONSUMER_SEND_MSG_BACK。
+        addr = client.find_broker_address_in_publish(broker_name)
         if addr is None:
-            raise MQClientException("broker %s not found" % broker_name)
+            raise MQClientException("Broker[%s] master node does not exist" % broker_name)
         # Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
         max_reconsume = 16 if self.max_reconsume_times == -1 else self.max_reconsume_times
         header = ConsumerSendMsgBackRequestHeader()
@@ -3671,7 +3684,9 @@ class DefaultMQPullConsumer:
         from ..remoting.protocol.headers import (GetEarliestMsgStoretimeRequestHeader,
                                                  GetEarliestMsgStoretimeResponseHeader)
         from ..remoting.protocol.remoting_command import RemotingCommand
-        addr = client._broker_addr(mq)
+        # Java MQAdminImpl:250（DefaultMQPullConsumer.earliestMsgStoreTime 最终也落到这里）：
+        # 与 max/min/search 同一个形状 —— 只认 master，刷一次路由重查，仍拿不到抛「The broker[X] not exist」。
+        addr = client._publish_addr_in_admin(mq)
         header = GetEarliestMsgStoretimeRequestHeader()
         header.topic = mq.topic
         header.queue_id = mq.queue_id
@@ -3686,8 +3701,9 @@ class DefaultMQPullConsumer:
         """消息回投（对应 Java DefaultMQPullConsumer.sendMessageBack）。
 
         注意两点（真机踩过）：
-        1. 地址靠 `broker_addr_of(msg.broker_name)` 反查**路由表**，所以调用方必须先用本
-           consumer 访问过该 topic（Java 同理，走 findBrokerAddressInPublish 读 brokerAddrTable）。
+        1. 地址靠 `find_broker_address_in_publish(msg.broker_name)` 反查**发布地址表**
+           （只认 master），所以调用方必须先用本 consumer 访问过该 topic
+           （Java DefaultMQPullConsumerImpl:654 走的也是 findBrokerAddressInPublish）。
         2. 与 Java 的**有意差异**：Java 在失败时会吞掉异常、改用内部默认生产者把消息直接发到
            `%RETRY%group`（见 DefaultMQPullConsumerImpl:666 的 catch 分支）。本实现不做这个
            兜底 —— 回投失败就抛，让调用方看见，而不是换一条路径静默重发。
@@ -3696,9 +3712,10 @@ class DefaultMQPullConsumer:
         from ..remoting.protocol.codes import RequestCode
         from ..remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
         from ..remoting.protocol.remoting_command import RemotingCommand
-        addr = client.broker_addr_of(msg.broker_name or "")
+        # 从节点不接 CONSUMER_SEND_MSG_BACK（master 专属），所以这里只认 brokerId=0
+        addr = client.find_broker_address_in_publish(msg.broker_name or "")
         if addr is None:
-            raise MQClientException("broker %s not found" % msg.broker_name)
+            raise MQClientException("Broker[%s] master node does not exist" % msg.broker_name)
         header = ConsumerSendMsgBackRequestHeader()
         header.offset = msg.commit_log_offset
         header.group = self.consumer_group
@@ -4205,6 +4222,12 @@ class DefaultLitePullConsumer:
     def _resolve_initial_offset(self, mq: MessageQueue) -> int:
         if mq in self._seek_offset:
             return self._seek_offset[mq]
+        if self._mq_client is None:
+            # Java 的 assign/seek 都先 checkServiceState()，没启动就拒绝。本端口允许先 assign
+            # 再 start，但**不能**在没问过 broker 的情况下给出 0 —— assign 会把结果存进
+            # _next_offset，存进去就不会再解析（拉取循环只在缺值时补解析），起点会被永久
+            # 钉死在 0。抛出去让调用方记一笔，真正的解析留给 start 后的拉取循环。
+            raise MQClientException("The lite pull consumer is not running")
         # 有已提交位点则沿用（保证重启续消费）
         try:
             off = self._mq_client.query_consumer_offset(self.consumer_group, mq)
@@ -4213,7 +4236,11 @@ class DefaultLitePullConsumer:
         except Exception:
             pass
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
-            return self._mq_client.get_min_offset(mq)
+            # Java RebalanceLitePullImpl:FIRST_OFFSET 分支与 push 同形（`result = 0L`），
+            # 不发 minOffset 查询 —— minOffset 属于 MQAdminImpl 口径（只认 master），
+            # 主掉线期间会让新起的 lite-pull 一条都拉不到；越界由 broker 的
+            # PULL_OFFSET_MOVED 纠正（_offset_illegal_recover）。
+            return 0
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_TIMESTAMP:
             ts = self._parse_consume_timestamp(self.consume_timestamp)
             return self._mq_client.search_offset_by_timestamp(mq, ts)

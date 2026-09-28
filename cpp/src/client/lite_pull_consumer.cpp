@@ -485,7 +485,12 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
     } catch (...) {
     }
     if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-        return mqClient_->getMinOffset(mq);
+        // Java RebalanceLitePullImpl 的 FIRST_OFFSET 分支与 push 同形（`result = 0L`），
+        // **不**发 minOffset 查询 —— minOffset 属于 MQAdminImpl 口径（只认 master），
+        // 主掉线期间会让新起的 lite-pull 一条都拉不到。位点非法时 broker 会在
+        // PULL_OFFSET_MOVED 里回 nextBeginOffset（Java 的 pull 循环每轮都拨，
+        // 见 DefaultLitePullConsumerImpl:998 updatePullOffset）。
+        return 0;
     }
     if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
         return mqClient_->searchOffsetByTimestamp(mq, parseConsumeTimestamp(consumeTimestamp_));

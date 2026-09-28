@@ -694,9 +694,16 @@ public sealed class DefaultLitePullConsumer
             if (_seekOffset.TryGetValue(mq, out long s)) return s;
         }
 
+        // Java 的 assign/seek 都先 checkServiceState()（没启动直接拒）。本端口允许先
+        // Assign 再 Start()，但不能在没问过 broker 的情况下给出起点 —— Assign 会把结果
+        // 存进 _nextOffset，存进去就不再解析（拉取循环只在缺值时补解析），起点会被永久
+        // 钉死在 0。状态检查必须排在下面的 try 之外：RequireClient() 那句「没启动」落进
+        // catch 就被吞了。真正的解析留给 Start() 之后的拉取循环。
+        MQClientInstance client = RequireClient();
+
         try
         {
-            if (RequireClient().QueryConsumerOffset(_consumerGroup, mq, out long off))
+            if (client.QueryConsumerOffset(_consumerGroup, mq, out long off))
             {
                 return off;
             }
@@ -707,15 +714,19 @@ public sealed class DefaultLitePullConsumer
 
         if (_consumeFromWhere == ConsumeFromWhere.ConsumeFromFirstOffset)
         {
-            return RequireClient().GetMinOffset(mq);
+            // Java RebalanceLitePullImpl:114-124：FIRST_OFFSET 且没有已提交位点时直接给 0
+            // （`result = 0L`），**不**发 minOffset 查询 —— minOffset 属 MQAdminImpl 口径
+            // （只认 master），主掉线期间会让新起的 lite-pull 一条都拉不到；起点越界时由
+            // broker 的 PULL_OFFSET_MOVED 纠正。
+            return 0;
         }
 
         if (_consumeFromWhere == ConsumeFromWhere.ConsumeFromTimestamp)
         {
-            return RequireClient().SearchOffsetByTimestamp(mq, ParseConsumeTimestamp(_consumeTimestamp));
+            return client.SearchOffsetByTimestamp(mq, ParseConsumeTimestamp(_consumeTimestamp));
         }
 
-        return RequireClient().GetMaxOffset(mq);
+        return client.GetMaxOffset(mq);
     }
 
     // ---------------- rebalance ----------------

@@ -205,6 +205,14 @@ public sealed class MQClientInstance : IDisposable
 
     private readonly object _routeLock = new();
     private readonly Dictionary<string, TopicRouteData> _topicRouteTable = new(StringComparer.Ordinal);
+
+    // 对应 Java MQClientInstance.brokerAddrTable：**按 brokerName 平的**一张表，每次刷到任一条
+    // 路由就整批覆盖（updateTopicRouteInfoFromNameServer:962-964，存的是 route 里那张 map 的
+    // 引用，这里同样存 bd.BrokerAddrs 本身）。别改用「扫 _topicRouteTable 找第一台」的写法：
+    // 路由是**按 topic** 刷的，master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，
+    // 扫出来是谁全看字典顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
+    private readonly Dictionary<string, SortedDictionary<long, string>> _brokerAddrTable = new(StringComparer.Ordinal);
+
     private readonly Dictionary<string, TopicPublishInfo> _topicPublishInfoTable = new(StringComparer.Ordinal);
     private volatile bool _started;
 
@@ -641,6 +649,15 @@ public sealed class MQClientInstance : IDisposable
         lock (_routeLock)
         {
             _topicRouteTable[topic] = route;
+
+            // Java MQClientInstance:962-964：每次刷到路由就把 route 里的 broker 整批写进平表，
+            // 值存的是 bd.BrokerAddrs **本身**（Java 同理，存引用），所以后续路由刷新整段替换
+            // 时平表里的旧地址也会跟着失效 —— 这正是「master 掉线后所有 topic 一律无主」的来源。
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                _brokerAddrTable[bd.BrokerName] = bd.BrokerAddrs;
+            }
+
             if (!_topicPublishInfoTable.TryGetValue(topic, out TopicPublishInfo? publish) || publish is null)
             {
                 publish = new TopicPublishInfo();
@@ -836,6 +853,76 @@ public sealed class MQClientInstance : IDisposable
         return addrs;
     }
 
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#findBrokerAddressInPublish:1295-1305</c>：
+    /// <strong>只</strong>从平表 <c>_brokerAddrTable</c> 里取 brokerId=0 的地址（Java 的
+    /// <c>brokerAddrTable.get(brokerName).get(MixAll.MASTER_ID)</c>），任何一步拿不到就返回空串。
+    /// 与 <see cref="BrokerAddrOf"/> 是两码事：后者扫各 topic 的路由、走 <c>SelectBrokerAddr()</c>
+    /// （主优先、没主随机退一台），给「问到一台就行」的心跳/拉取用；<strong>发送不行</strong> ——
+    /// 主没了还把写请求打到从节点上，broker 回 SYSTEM_BUSY(2)，白烧一整轮重试，
+    /// 错误类型也和 Java 不一样（Java 是本端直接报「broker 不存在」）。
+    ///
+    /// 返回空串是正常结果（master 掉线就是这个形状），报什么错由调用方决定
+    /// （<c>sendKernelImpl</c> 报 MQClientException、<c>endTransaction</c> 什么都不报）。
+    /// </summary>
+    public string FindBrokerAddressInPublish(string brokerName)
+    {
+        lock (_routeLock)
+        {
+            if (_brokerAddrTable.TryGetValue(brokerName, out SortedDictionary<long, string>? addrs)
+                && addrs is not null
+                && addrs.TryGetValue(MixAll.MasterId, out string? master))
+            {
+                return master ?? string.Empty;
+            }
+
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Java 侧「<strong>只要主</strong>」的地址解析，出现处都是同一个形状。
+    ///
+    /// 对应 <c>DefaultMQProducerImpl.sendKernelImpl:919-924</c>（发送）、
+    /// <c>DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876</c> / <c>ackAsync</c>
+    /// （POP 的 ack 与延长不可见时间走 <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>，
+    /// 只要主），以及 <c>MQAdminImpl</c> 的 offset 查询（见 <see cref="PublishAddrInAdmin"/>）。
+    /// 形状一致：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由 → 重查 →
+    /// 仍查不到照 <c>sendKernelImpl:1100</c> 抛
+    /// <c>MQClientException("The broker[X] not exist")</c>（本端口码为 -1，表示
+    /// 「不是 broker 回的码」，与 Python/C++/Rust 三端同一个口径）。
+    ///
+    /// 定点发送不会在 <c>sendDefaultImpl</c> 里取发布信息，这里是它唯一的路由来源；
+    /// 主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮 SYSTEM_BUSY(2)」的
+    /// 分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK / CHANGE_INVISIBLE_TIME
+    /// 这些写请求。
+    /// </summary>
+    public string PublishAddrFor(string brokerName, string topic)
+    {
+        string addr = FindBrokerAddressInPublish(brokerName);
+        if (addr.Length == 0)
+        {
+            UpdateTopicRouteInfoFromNameServer(topic);
+            addr = FindBrokerAddressInPublish(brokerName);
+        }
+
+        if (addr.Length == 0)
+        {
+            throw new MQClientException("The broker[" + brokerName + "] not exist", -1);
+        }
+
+        return addr;
+    }
+
+    /// <summary>
+    /// Java <c>MQAdminImpl</c> 的 offset 查询口径（<c>:195/214/232/250</c>）。
+    /// 与 <see cref="PublishAddrFor"/> 同形（Python <c>_publish_addr_in_admin</c> 亦然），
+    /// 单独一层只是给调用点一个自证「这里打主」的名字。从节点上的 store 是 HA 复制来的
+    /// 同一份数据，但 Java 的管理类 API 一律打主，本端不「顺手」退到从节点 ——
+    /// 主掉线期间这里就该报错，让调用方看见。
+    /// </summary>
+    public string PublishAddrInAdmin(MessageQueue mq) => PublishAddrFor(mq.BrokerName, mq.Topic);
+
     public List<string> KnownBrokerAddrs() => GetRouteOfAllBrokers();
 
     /// <summary>
@@ -983,7 +1070,9 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
         string? createTopicKey = null, int? defaultTopicQueueNums = null)
     {
-        string addr = BrokerAddr(mq);
+        // Java sendKernelImpl 的发送地址只认 master（PublishAddrFor 里含一次路由刷新）；
+        // 主掉线时本端立刻报「The broker[X] not exist」，而不是把请求打到从节点上。
+        string addr = PublishAddrFor(mq.BrokerName, mq.Topic);
         // 对应 Java DefaultMQProducerImpl.sendKernelImpl：非批量消息在**发请求之前**
         // 补一个客户端唯一 ID（UNIQ_KEY）。它决定 SendResult.MsgId，也是消息轨迹
         // 里 msgId 的来源（控制台按它把发送轨迹与消费轨迹串起来）。
@@ -1077,7 +1166,8 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
         string? createTopicKey = null, int? defaultTopicQueueNums = null)
     {
-        string addr = BrokerAddr(mq);
+        // 单向发送同样是写请求，地址口径与同步发送一致（只认 master）。
+        string addr = PublishAddrFor(mq.BrokerName, mq.Topic);
         // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
         if (!msg.IsBatch)
         {
@@ -1562,13 +1652,10 @@ public sealed class MQClientInstance : IDisposable
         string addr = addrIn ?? string.Empty;
         if (addr.Length == 0)
         {
-            TopicRouteData? route = GetTopicRouteData(topic);
-            if (route is null)
-            {
-                throw new MQClientNoRouteException(topic);
-            }
-
-            ResolveBrokerFromRoute(route, topic, ref brokerName, ref addr);
+            // Java ackAsync:820-825 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
+            // **只要主**，查不到刷一次路由重查，仍查不到抛「The broker[X] not exist」。
+            // 从节点不接 ACK_MESSAGE，所以这里不能退到从节点地址（PublishAddrFor 即该形状）。
+            addr = PublishAddrFor(brokerName, topic);
         }
 
         var header = new AckMessageRequestHeader
@@ -1605,13 +1692,9 @@ public sealed class MQClientInstance : IDisposable
         string addr = addrIn ?? string.Empty;
         if (addr.Length == 0)
         {
-            TopicRouteData? route = GetTopicRouteData(topic);
-            if (route is null)
-            {
-                throw new MQClientNoRouteException(topic);
-            }
-
-            ResolveBrokerFromRoute(route, topic, ref brokerName, ref addr);
+            // Java changePopInvisibleTimeAsync:869-876 同样是
+            // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) + 刷一次路由重查。
+            addr = PublishAddrFor(brokerName, topic);
         }
 
         var header = new ChangeInvisibleTimeRequestHeader
@@ -1855,7 +1938,9 @@ public sealed class MQClientInstance : IDisposable
 
     public long GetMaxOffset(MessageQueue mq, int timeoutMillis = 5000, string? addrIn = null)
     {
-        string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);
+        // Java MQAdminImpl:214 的 maxOffset：findBrokerAddressInPublish（只认 master）→
+        // 刷一次路由 → 重查 → 抛 "The broker[X] not exist"。见 PublishAddrInAdmin。
+        string addr = addrIn is { Length: > 0 } ? addrIn : PublishAddrInAdmin(mq);
         var header = new GetMaxOffsetRequestHeader
         {
             Topic = mq.Topic,
@@ -1871,7 +1956,8 @@ public sealed class MQClientInstance : IDisposable
 
     public long GetMinOffset(MessageQueue mq, int timeoutMillis = 5000, string? addrIn = null)
     {
-        string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);
+        // 同 GetMaxOffset：Java 的管理类 offset 查询只认主（MQAdminImpl:232）。
+        string addr = addrIn is { Length: > 0 } ? addrIn : PublishAddrInAdmin(mq);
         var header = new GetMinOffsetRequestHeader
         {
             Topic = mq.Topic,
@@ -1901,7 +1987,8 @@ public sealed class MQClientInstance : IDisposable
     public long SearchOffsetByBoundary(MessageQueue mq, long timestamp, BoundaryType? boundaryType,
         int timeoutMillis = 5000, string? addrIn = null)
     {
-        string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);
+        // 同 GetMaxOffset：Java 的管理类 offset 查询只认主（MQAdminImpl:195）。
+        string addr = addrIn is { Length: > 0 } ? addrIn : PublishAddrInAdmin(mq);
         var header = new SearchOffsetRequestHeader
         {
             Topic = mq.Topic,
@@ -2519,7 +2606,4 @@ public sealed class MQClientInstance : IDisposable
     }
 
     // ---------------- 工具 ----------------
-
-    /// <summary>解析 mq 对应 broker 地址（找不到抛 MQClientException）。</summary>
-    public string BrokerAddrForMq(MessageQueue mq) => BrokerAddr(mq);
 }

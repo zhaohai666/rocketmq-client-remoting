@@ -547,17 +547,16 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
     if (enableTraceContext_) {
         injectTraceContext(const_cast<Message*>(&msg));
     }
-    // 没有任何拦截/钩子时零开销透传
+    // Java sendKernelImpl:918-924 + :1100：发布地址在**钩子之前**解析，解析不到时整段
+    // 直接抛，连 CheckForbiddenHook 都不跑（`if (brokerAddr != null) { ...hooks... }`
+    // 把钩子和发送圈在同一个分支里，异常在分支外抛）。所以这里不能像从前那样
+    // try/catch 降级成空串再把钩子跑下去 —— 那会凭空多发一对 before/after。
     if (!hasSendInterceptors()) {
+        // 无钩子时零开销透传；client.sendMessage 内部同样走发布地址，失败抛同一句。
         return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
                                     createTopicKey_, defaultTopicQueueNums_);
     }
-    std::string brokerAddr;
-    try {
-        brokerAddr = client.brokerAddrOf(mq.brokerName);
-    } catch (...) {
-        brokerAddr.clear();
-    }
+    const std::string brokerAddr = client.publishAddrFor(mq.brokerName, mq.topic);
     // 顺序严格照抄 Java sendKernelImpl:956-990：
     //   1. CheckForbiddenHook（每次尝试都跑；异常不吞）  2. SendMessageHook.before
     //   3. 发请求  4. SendMessageHook.after
@@ -1403,29 +1402,11 @@ void DefaultMQProducer::sendKernelAsync(const std::shared_ptr<AsyncSendState>& s
     const std::chrono::steady_clock::time_point beginKernel = std::chrono::steady_clock::now();
     state->brokerName = state->mq.brokerName;
 
-    // 地址解析两步，与 Java sendKernelImpl:919-924 一致：先查已缓存的发布地址，
-    // 查不到再按 topic 刷一次路由然后重查。定点发送（pinned）不会在
-    // sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，
-    // 第一次定点发送必然拿到空地址。
-    std::string brokerAddr;
-    try {
-        brokerAddr = c.brokerAddrOf(state->mq.brokerName);
-    } catch (const std::exception& e) {
-        // 查缓存不该抛，真抛了也只是降级成"没查到"，交给下一步刷路由
-        logger_debug("async send: cached address lookup failed: " + std::string(e.what()));
-    }
-    if (brokerAddr.empty()) {
-        try {
-            brokerAddr = c.brokerAddrForMq(state->mq);
-        } catch (const std::exception& e) {
-            logger_debug("async send: address unresolved after route refresh: "
-                         + std::string(e.what()));
-        }
-    }
-    if (brokerAddr.empty()) {
-        // Java sendKernelImpl:1100
-        throw MQClientException("The broker[" + state->brokerName + "] not exist");
-    }
+    // 地址解析，与 Java sendKernelImpl:919-924 + :1100 逐字对齐：查发布地址（**只认主**）
+    // → 查不到按 topic 刷一次路由 → 重查 → 仍查不到抛 "The broker[X] not exist"。
+    // 定点发送（pinned）不会在 sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源 ——
+    // 少了这一步，第一次定点发送必然拿到空地址。异常由 enqueueAsync 的 catch 转给回调。
+    const std::string brokerAddr = c.publishAddrFor(state->mq.brokerName, state->mq.topic);
     if (hasCheckForbiddenHook()) {
         runCheckForbidden(state->msg, state->mq, brokerAddr, nullptr, CommunicationMode::ASYNC);
     }
@@ -1533,16 +1514,14 @@ void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& s
                 retryBroker = selected.brokerName;
             }
         }
-        std::string addr;
-        try {
-            addr = client().brokerAddrOf(retryBroker);
-        } catch (const std::exception& e) {
-            logger_debug("async send retry: broker address unresolved: "
-                         + std::string(e.what()));
-        }
+        // Java onExceptionImpl:725 只查发布地址表（同样只认 master）、**不刷路由**；
+        // 查不到就带着 null 撞进 sendMessageAsync。这里就地终止，别让空地址传进传输层。
+        const std::string addr = client().findBrokerAddressInPublish(retryBroker);
         if (addr.empty()) {
-            // 路由里连这台 broker 的地址都没了，再试也没有意义
-            completeAsync(state, nullptr, &error);
+            // 路由里连这台 broker 的主地址都没了，再试也没有意义
+            const InvokeError noBroker(InvokeError::Kind::OTHER,
+                                       "The broker[" + retryBroker + "] not exist");
+            completeAsync(state, nullptr, &noBroker);
             return;
         }
         logger_warn("async send msg by retry " + std::to_string(state->times) + " times. topic="
@@ -1613,13 +1592,9 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
     const int32_t sysFlag = prepareForSend(outbound);
-    // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效
-    std::string brokerAddr;
-    try {
-        brokerAddr = c.brokerAddrOf(selected.brokerName);
-    } catch (...) {
-        brokerAddr.clear();
-    }
+    // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效，
+    // 且地址解析同样**只认 master**（publishAddrFor 拿不到就抛，钩子不跑）。
+    const std::string brokerAddr = c.publishAddrFor(selected.brokerName, selected.topic);
     runCheckForbidden(outbound, selected, brokerAddr, nullptr, CommunicationMode::ONEWAY);
     // W3C traceparent 透传（opt-in）：单向发送同样注入
     if (enableTraceContext_) {
@@ -1634,15 +1609,10 @@ void DefaultMQProducer::sendOneway(const Message& msg, const MessageQueue& mq) {
     checkMessage(msg);
     Message outbound = withNamespace(msg);
     const int32_t sysFlag = prepareForSend(outbound);
-    // 地址只读缓存（Java sendKernelImpl 的 findBrokerAddressInPublish）：单向没有应答，
-    // 路由拉取失败也无从反馈，所以这里不兜底查名字服务。取不到就交给 sendMessageOneway
-    // 自己按空地址报错（与上面无 mq 那条路径同口径）。
-    std::string brokerAddr;
-    try {
-        brokerAddr = c.brokerAddrOf(mq.brokerName);
-    } catch (...) {
-        brokerAddr.clear();
-    }
+    // 地址与 Java sendKernelImpl 同口径：findBrokerAddressInPublish（**只认 master**）→
+    // 查不到按 topic 刷一次路由 → 仍查不到抛「The broker[X] not exist」（钩子不跑）。
+    // 别退回"单向没有应答所以不兜底"的宽容写法：那会拿到从节点地址把写请求打过去。
+    const std::string brokerAddr = c.publishAddrFor(mq.brokerName, mq.topic);
     runCheckForbidden(outbound, mq, brokerAddr, nullptr, CommunicationMode::ONEWAY);
     if (enableTraceContext_) {
         injectTraceContext(&outbound);
@@ -1913,13 +1883,19 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
         header.transactionId = sendResult.transactionId;
         header.bname = sendResult.messageQueue.brokerName;
         header.msgId = sendResult.msgId;
-        addr = c.brokerAddrForMq(sendResult.messageQueue);
+        // Java endTransaction:1541 用的也是 findBrokerAddressInPublish（只认 master），
+        // 且**不做 null 检查**就直接 oneway；这里保留本端提前报错的守卫（比 Java 的
+        // NPE 干净），但地址来源必须同样是 master-only。
+        addr = c.findBrokerAddressInPublish(sendResult.messageQueue.brokerName);
     }
 
     RemotingCommand request = RemotingCommand::createRequestCommand(
         RequestCode::END_TRANSACTION, std::make_shared<EndTransactionRequestHeader>(header));
     if (hasLocalException) {
         request.remark = "executeLocalTransactionBranch exception: " + localExceptionText;
+    }
+    if (addr.empty()) {
+        throw MQClientException("no broker address for end transaction");
     }
     // Java 走 endTransactionOneway：单向发送，不等 broker 响应
     c.remotingClient().invokeOneway(addr, request);
@@ -2126,16 +2102,11 @@ std::string DefaultMQProducer::recallMessage(const std::string& topic,
     c.registerTopicInUse(realTopic);
     (void)topicPublishInfo(c, realTopic);
 
-    // Java findBrokerAddressInPublish(brokerName) → 退化到 findBrokerAddrByTopic(topic)。
-    std::string addr = c.brokerAddrOf(handle.brokerName);
+    // Java:1586-1594：优先按 handle 里的 brokerName 查**发布地址**（只认 master）；拿不到
+    // 再退到 `findBrokerAddrByTopic` —— 后者走 select_broker_addr()，**允许**落到从节点上。
+    std::string addr = c.findBrokerAddressInPublish(handle.brokerName);
     if (addr.empty()) {
-        std::shared_ptr<TopicRouteData> route = c.getTopicRouteData(realTopic);
-        if (route) {
-            for (const auto& bd : route->getBrokerDatas()) {
-                addr = bd.selectBrokerAddr();
-                if (!addr.empty()) break;
-            }
-        }
+        addr = c.findBrokerAddrByTopic(realTopic);
     }
     if (addr.empty()) {
         logger_warn(std::string("can't find broker service address. ") + handle.brokerName);

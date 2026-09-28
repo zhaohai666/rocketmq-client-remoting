@@ -1000,11 +1000,12 @@ async fn p2_send_paths(
         .send(&mut big, Some(5000), Some(&big_mq))
         .await
         .map_err(|e| format!("compressed send failed: {e}"))?;
-    // tryToCompressMessage 就地改写调用方的 body：压完必然更短，且仍是 zlib 流
-    // （zlib 头 0x78）。这是「客户端侧压缩过一次」的直接证据。
+    // Java `sendKernelImpl:930/1095-1096`：压缩只改核内那份 body（`prevBody` 先记下原件），
+    // send 返回前 finally 把**调用方**的 Message 换回原始正文 —— 所以这里读到的仍是 8 KiB。
+    // 「客户端确实压过」的证据改由 broker 侧给：storeSize 远小于原文 + 解压闭环
+    // （同一对象连发两次的复用场景在 live_compression_matrix 里单列）。
     let client_body = big.get_body().to_vec();
-    let compressed_in_client =
-        client_body.len() < COMPRESSIBLE_BODY_LEN && client_body.starts_with(&[0x78]);
+    let body_restored = client_body == raw;
     let back = wait_async(
         || async {
             let r = pull_from(instance, &big_mq, rb2.queue_offset, broker_addr)
@@ -1038,7 +1039,7 @@ async fn p2_send_paths(
         .unwrap_or(false);
     ck.check(
         "P2 an over-threshold body is zlib'd on the wire and transparently restored for the reader",
-        compressed_in_client
+        body_restored
             && back
             && went_compressed
             && flag_ok
@@ -1107,27 +1108,54 @@ async fn p3_hooks(
     );
 
     // 失败也要跑 after（Java sendKernelImpl 的 finally 语义）。
-    // 注意不能拿「不存在的 topic」当失败手段：本集群开着 autoCreateTopicEnable，
-    // 新 topic 会经 TBW102 兜底真发成功。这里改成把消息定点到一个路由里
-    // 根本不存在的 brokerName —— send_message 必然找不到地址。
+    // 失败必须发生在**核内**（地址解析之后）：Java 的钩子只在 `brokerAddr != null` 的
+    // try 里跑，所以这里用一个 broker 一定拒收的 queueId —— `AbstractSendMessageProcessor
+    // .msgCheck` 对 `queueId >= max(writeQueueNums, readQueueNums)` 回
+    // INVALID_PARAMETER(29)（地址解析照样成功，钩子 before/after 各跑一次，after 带着
+    // broker 的异常）。也不能拿「不存在的 topic」当失败手段：本集群开着
+    // autoCreateTopicEnable，新 topic 会经 TBW102 兜底真发成功。
     let before_len = hook.lines().len();
     let mut bad = msg(topic, b"hook-fails", "TagAllowed", "");
-    let bogus = MessageQueue::new(topic, "RustNoSuchBroker_zzz", 0);
-    let err = p
-        .send(&mut bad, Some(5000), Some(&bogus))
+    let bad_mq = MessageQueue::new(topic, broker_name, QUEUE_NUMS * 256);
+    let bad_err = p.send(&mut bad, Some(5000), Some(&bad_mq)).await.err();
+    let err = bad_err.as_ref().map(|e| e.to_string()).unwrap_or_default();
+    let tail = hook.lines()[before_len..].to_vec();
+    let absent = !read_all_bodies(instance, topic, broker_name, broker_addr, QUEUE_NUMS)
+        .await
+        .iter()
+        .any(|b| b == "hook-fails");
+    ck.check(
+        "P3 a failing send still runs the after hook, with the exception on the context",
+        bad_err
+            .as_ref()
+            .and_then(|e| e.response_code())
+            == Some(response_code::INVALID_PARAMETER)
+            && err.contains("is illegal")
+            && tail.len() == 2
+            && tail[0].starts_with("before ")
+            && tail[1].starts_with("after err ")
+            && absent,
+        &format!("err={err} tail={tail:?}"),
+    );
+
+    // 地址解析失败是**另一条**路：Java `:1100` 的抛点在钩子之外（`if (brokerAddr != null)`
+    // 之后），before/after 都不跑。旧版本这里会拿「路由里没有的 brokerName」当失败手段，
+    // 因为地址解析当时发生在核内；#100 起解析先于钩子（`sendKernelImpl:919-924`），
+    // 于是同一条腿变成「本端 not exist、钩子零调用、一条 wire 都不发」。
+    let before_len = hook.lines().len();
+    let mut bogus_msg = msg(topic, b"must-not-land-bogus", "TagAllowed", "");
+    let bogus_mq = MessageQueue::new(topic, "RustNoSuchBroker_zzz", 0);
+    let bogus = p
+        .send(&mut bogus_msg, Some(5000), Some(&bogus_mq))
         .await
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
     let tail = hook.lines()[before_len..].to_vec();
     ck.check(
-        "P3 a failing send still runs the after hook, with the exception on the context",
-        !err.is_empty()
-            && err.contains("RustNoSuchBroker_zzz")
-            && tail.len() == 2
-            && tail[0].starts_with("before ")
-            && tail[1].starts_with("after err "),
-        &format!("err={err} tail={tail:?}"),
+        "P3b 定点到不存在的 broker：本端报 not exist，一个钩子都不跑（Java :1100 在 try 之外）",
+        bogus.contains("The broker[RustNoSuchBroker_zzz] not exist") && tail.is_empty(),
+        &format!("err={bogus} tail={tail:?}"),
     );
     Ok(())
 }

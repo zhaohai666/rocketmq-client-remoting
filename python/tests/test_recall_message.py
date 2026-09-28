@@ -206,8 +206,12 @@ class _NoIoClient:
         self.touched.append("route")
         return None
 
-    def broker_addr_of(self, broker_name):
+    def find_broker_address_in_publish(self, broker_name):
         self.touched.append("addr")
+        return None
+
+    def find_broker_addr_by_topic(self, topic):
+        self.touched.append("addr-by-topic")
         return None
 
     def recall_message(self, addr, header, timeout):
@@ -274,7 +278,7 @@ def test_publish_info_failure_propagates_like_java():
 def test_recall_goes_out_to_the_broker_named_in_the_handle():
     client = _NoIoClient()
     client.no_publish_error = True
-    client.broker_addr_of = lambda broker_name: ADDR      # type: ignore[assignment]
+    client.find_broker_address_in_publish = lambda broker_name: ADDR      # type: ignore[assignment]
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
     assert _started(client).recall_message(TOPIC, handle) == UNIQ_KEY
     assert client.touched[-1] == "rpc"

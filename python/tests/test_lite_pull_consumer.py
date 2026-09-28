@@ -250,6 +250,34 @@ class TestAssignMode:
         c.assign([mq])
         assert c.assignment() == [mq]
 
+    def test_assign_before_start_leaves_the_start_point_to_start(self):
+        """assign 早于 start 时不许落一个「没问过 broker 的 0」。
+
+        Java 的 assign/seek 都先 checkServiceState()（没启动直接拒）；本端口允许先 assign
+        再 start，但解析起点必须真的问过 broker —— FIRST_OFFSET 那一支现在返回字面量 0
+        （Java RebalanceLitePullImpl 同），若在 assign 时就写进 _next_offset 就再也不会重算
+        （拉取循环只在缺值时补解析），起点会被永久钉死在 0。
+        """
+        c = _Lite("LitePG_UT", _store=STORE)
+        mq = MessageQueue("T", "broker-a", 0)
+        c.assign([mq])
+        assert mq not in c._next_offset
+        assert c._mock.queries == []                     # 没启动，一个 RPC 都不发
+        with pytest.raises(MQClientException, match="not running"):
+            c._resolve_initial_offset(mq)
+        # start() 里补解析，起点是 broker 上已提交的位点（不是 0）
+        c._mock.committed[(mq.broker_name, mq.queue_id)] = 3
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.start()
+        try:
+            assert ("broker-a", 0) in c._mock.queries      # 真的问了 broker
+            # 交出来的第一条是 B3：起点 3。若起点被钉死成 0（未问 broker 的 FIRST_OFFSET
+            # 字面量）这里会是 A0；若回落成 max offset（5）则一条都没有。
+            got = c.poll(timeout=2000)
+            assert [m.body.decode() for m in got] == ["B3", "A4"]
+        finally:
+            c.shutdown()
+
     def test_seek_resets_next_offset_and_drops_buffered(self):
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")

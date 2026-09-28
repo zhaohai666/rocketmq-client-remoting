@@ -18,6 +18,12 @@ SYSTEM_BUSY(2)，**还是可重试码**），白烧重试。
 消费侧是另一份口径（``topicRouteData2TopicSubscribeInfo:318-332``：读位 + readQueueNums、
 **不要求有 master**），停窗口内消费者仍要看得见队列、还得能从从节点拉。
 
+**地址侧**也是同一条分界线（``MQClientInstance.findBrokerAddressInPublish:1295-1305``：
+``brokerAddrTable.get(brokerName).get(MASTER_ID)``，只要 brokerId=0）。Java 的发送路径
+（``DefaultMQProducerImpl.sendKernelImpl:919-924``）拿不到主地址时按 topic 刷一次路由再查，
+仍拿不到就本端抛 ``MQClientException("The broker[X] not exist")`` —— 定点发送（调用方给了
+mq）走的正是这条：**不会**退到从节点地址上让 broker 回 SYSTEM_BUSY(2) 白烧一轮。
+
 场景（同一停窗口里做完）：
   S0 控制腿（master 在）：路由 {0: master, 1: slave}；发布队列 4、订阅队列 4
   S1 预埋：每队列定点一条共 4 条，等从节点 store 追上（HA 复制确认，不然 S6 无从消费）
@@ -27,8 +33,9 @@ SYSTEM_BUSY(2)，**还是可重试码**），白烧重试。
   S5 发送快速失败、报错里没有从节点地址（旧缓存腿打的是死掉的 master；周期刷新恰好
      已跑过则是本端 10005）；再显式把发送实例刷成停后形状：(A) 生效 —— 发布队列为空、
      发送本端 10005 且**一条 wire 都不发**
-  S5d 对照：定点发到该队列 → 从节点回 SYSTEM_BUSY(2)（可重试）—— S5c 若漏做，
-      不指定队列的发送就是 3 次 wire 全被拒的下场（一条也落不了库，S7b 用 maxOffset 钉死）
+  S5d (B) 地址侧对照：定点发到该队列 → 本端报「The broker[broker-a] not exist」，也无 wire
+      （漏掉 (B) 这条对照时的旧行为：请求打到从节点上，broker 回 SYSTEM_BUSY(2)，
+      一个可重试码 —— 白烧一整轮重试，错误类型也和 Java 不一样）
   S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐
   S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK
 """
@@ -50,7 +57,6 @@ from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.client.send_result import SendStatus
 from rocketmq.common.message import Message, MessageQueue
-from rocketmq.remoting.protocol.codes import ResponseCode
 from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
@@ -275,17 +281,25 @@ def main() -> int:
               and fresh_ms < LOCAL_BUDGET_MS,
               "%.0fms code=%s: %s" % (fresh_ms, getattr(exc2, "response_code", None), exc2))
 
-        # ---------- S5d 对照：定点发送的下场 ----------
-        print("\nS5d 对照：定点发到该队列 → 从节点拒收（SYSTEM_BUSY=2，可重试码）")
+        # ---------- S5d (B) 对照：定点发送的地址解析 ----------
+        # 定点发送不经过发布信息（调用方直接给了 mq），地址侧若还按「主优先、没主退一台」
+        # 去解析，请求就会落到从节点上换来一个 SYSTEM_BUSY(2)。Java 的
+        # findBrokerAddressInPublish 只认 brokerId=0，本端应当直接报「broker 不存在」。
+        print("\nS5d (B) 对照：定点发到该队列 → 本端报 broker 不存在（不发 wire）")
         pinned_exc = None
+        began = time.monotonic()
         try:
             producer.send(Message(TOPIC, b"pinned-to-slave"),
                           mq=MessageQueue(TOPIC, BROKER_NAME, 0))
         except Exception as e:  # noqa: BLE001
             pinned_exc = e
-        check("S5d 从节点回 SYSTEM_BUSY(2)（S5c 若漏做，不指定队列的发送就是这个下场）",
-              getattr(pinned_exc, "response_code", None) == ResponseCode.SYSTEM_BUSY,
-              "%s: %s" % (type(pinned_exc).__name__, pinned_exc))
+        pinned_ms = (time.monotonic() - began) * 1000
+        check("S5d 定点发送本端报「The broker[broker-a] not exist」，无 wire"
+              "（不是从节点回的 SYSTEM_BUSY(2)）",
+              isinstance(pinned_exc, MQClientException)
+              and str(pinned_exc) == "The broker[%s] not exist" % BROKER_NAME
+              and pinned_ms < LOCAL_BUDGET_MS,
+              "%.0fms %s: %s" % (pinned_ms, type(pinned_exc).__name__, pinned_exc))
 
         # ---------- S6 (C 端到端) 停窗口内消费 ----------
         print("\nS6 停窗口内新起的 push 消费者：4 条队列 + 从从节点收齐预埋的 4 条")

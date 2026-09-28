@@ -467,6 +467,35 @@ public:
     std::string brokerAddrOf(const std::string& brokerName);
     // 解析 mq 对应 broker 地址（公开版；找不到抛 MQClientException）
     std::string brokerAddrForMq(const MessageQueue& mq);
+
+    // 对应 Java `MQClientInstance#findBrokerAddressInPublish:1295-1305`：
+    // **只**从 brokerAddrTable_ 取 brokerId=0 的地址，没有就返回空串（Java 的
+    // `map.get(MixAll.MASTER_ID)`）。
+    // 与 brokerAddrOf 是两码事：后者扫 topicRouteTable_ 走 `selectBrokerAddr()`
+    // （主优先、没主退任意一台），给「问到一台就行」的心跳/拉取用；**发送**不行 ——
+    // 主没了还发到从节点上，broker 回 SYSTEM_BUSY(2)，白烧一整轮重试，错误类型也和
+    // Java 不一样（Java 是本端直接报「broker 不存在」）。
+    // 返回空串是正常结果（master 掉线就是这个形状），报什么错由调用方决定
+    // （sendKernelImpl 报 MQClientException、endTransaction 什么都不报）。
+    std::string findBrokerAddressInPublish(const std::string& brokerName);
+
+    // Java 侧「**只要主**」的地址解析，出现处都是同一个形状。
+    //
+    // 对应 `DefaultMQProducerImpl.sendKernelImpl:919-924`（发送）、
+    // `DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876` / `ackAsync`
+    // （POP 的 ack 与延长不可见时间走
+    // `findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)`，只要主），
+    // 以及 `MQAdminImpl` 的 offset 查询（见 publishAddrInAdmin）。
+    // 形状一致：查发布地址（**只认 brokerId=0**）→ 查不到按 topic 刷一次路由 →
+    // 重查 → 仍查不到照 `sendKernelImpl:1100` 抛
+    // `MQClientException("The broker[X] not exist", null)`（Java 双参构造器把
+    // responseCode 置 -1，这里同口径传 -1）。
+    //
+    // 定点发送不会在 sendDefaultImpl 里取发布信息，这里是它唯一的路由来源；
+    // 主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮
+    // SYSTEM_BUSY(2)」的分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK /
+    // CHANGE_INVISIBLE_TIME 这些写请求。
+    std::string publishAddrFor(const std::string& brokerName, const std::string& topic);
     std::vector<std::string> getRouteOfAllBrokers();
     // 列出已知路由里所有 broker 地址（用于探活）
     std::vector<std::string> knownBrokerAddrs();
@@ -480,6 +509,12 @@ public:
 private:
     // 解析 mq 对应 broker 地址；找不到抛 MQClientException
     std::string brokerAddr(const MessageQueue& mq);
+    // Java `MQAdminImpl` 的 offset 查询口径（`:195/214/232/250`）：四步与 Java 逐条对齐
+    // —— 查**发布地址**（只认 master）→ 刷一次该 topic 的路由 → 重查 → 仍拿不到就抛
+    // `MQClientException("The broker[X] not exist", null)`。从节点上的 store 是 HA
+    // 复制来的同一份数据，但 Java 的管理类 API 一律打主，本端不"顺手"退到从节点 ——
+    // 主掉线期间这里就该报错，让调用方看见。
+    std::string publishAddrInAdmin(const MessageQueue& mq);
     RemotingCommand invokeSyncOnAddr(const std::string& addr, RemotingCommand& request,
                                      int32_t timeoutMillis);
     // 后台路由刷新循环（对应 Java startScheduledTask 的 updateTopicRouteInfoFromNameServer 周期任务）
@@ -493,6 +528,12 @@ private:
 
     mutable std::recursive_mutex routeLock_;
     std::map<std::string, TopicRouteData> topicRouteTable_;
+    // 对应 Java `MQClientInstance.brokerAddrTable`：**按 brokerName 平的**一张表，
+    // 每次刷到任一条路由就整批覆盖（`updateTopicRouteInfoFromNameServer:962-964`）。
+    // 别改用「扫 topicRouteTable_ 找第一台」的写法：路由是**按 topic** 刷的，
+    // master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，扫出来是谁
+    // 全看 map 顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
+    std::map<std::string, std::map<int64_t, std::string>> brokerAddrTable_;
     std::map<std::string, std::shared_ptr<TopicPublishInfo>> topicPublishInfoTable_;
     // 在用 topic（消费者订阅 + 生产者发送过的），由周期任务刷新路由
     std::set<std::string> topicsInUse_;

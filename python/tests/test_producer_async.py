@@ -118,8 +118,11 @@ class _FakeAsyncClient:
         self.name_server_addrs = (["127.0.0.1:9876"] if namesrv_addrs is None
                                   else list(namesrv_addrs))
         self.block = block
-        # 路由表里查不到发布地址的 broker（对应 Java findBrokerAddressInPublish 返回 null）
-        self.cold_brokers = set(cold_brokers)
+        # 发布地址**平表**（Java brokerAddrTable）：brokerName -> master 地址。
+        # 冷名单里的 broker 就是「没主」，压根不进表 —— findBrokerAddressInPublish 查不到。
+        self.publish_addr_table = {"broker-a": ADDR_A, "broker-b": ADDR_B}
+        for name in cold_brokers:
+            self.publish_addr_table.pop(name, None)
         # get_topic_route_data 的返回值（Java sendKernelImpl 里那次按 topic 刷路由）
         self.route = route
         self.attempts: List[tuple] = []   # (addr, broker_name, opaque, timeout)
@@ -139,14 +142,32 @@ class _FakeAsyncClient:
             raise MQClientException("Can not find Message Queue for topic: %s" % topic)
         return self.publish
 
-    def broker_addr_of(self, broker_name):
-        if broker_name in self.cold_brokers:
-            return None
-        if broker_name == "broker-a":
-            return ADDR_A
-        if broker_name == "broker-b":
-            return ADDR_B
-        raise MQClientException("no broker service info for %s" % broker_name)
+    def find_broker_address_in_publish(self, broker_name):
+        return self.publish_addr_table.get(broker_name)
+
+    def publish_addr_for(self, broker_name, topic):
+        """与真身同一形状：查（只认主）→ 按 topic 刷一次路由 → 重查 → 报 not exist。
+
+        替身必须**照抄**这一步而不能简化：``test_pinned_send_refreshes_the_route_...``
+        测的就是「刷完路由地址才出现」，替身把两步塌成一步那条用例就失去意义了。
+        """
+        addr = self.find_broker_address_in_publish(broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(topic)
+            addr = self.find_broker_address_in_publish(broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % broker_name)
+        return addr
+
+    def update_topic_route_info_from_name_server(self, topic, is_default=False):
+        """按 topic 刷一次路由：把 route 里**有主**的 broker 覆盖进发布地址平表。
+
+        真身这一步写的就是平表 ``broker_addr_table``；没主的 broker 不写，等于刷完仍
+        查不到（Java 那边 master 掉线后表里那条会变成空 map）。
+        """
+        for broker_data in (getattr(self.route, "broker_datas", None) or []):
+            if broker_data.broker_addrs.get(0):
+                self.publish_addr_table[broker_data.broker_name] = broker_data.broker_addrs[0]
 
     def get_topic_route_data(self, topic):
         return self.route

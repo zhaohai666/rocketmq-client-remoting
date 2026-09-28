@@ -272,16 +272,6 @@ class DefaultMQAdminExt:
     def _find_first_broker_addr(self, client: MQClientInstance) -> str:
         return DefaultMQAdminExt._first_broker_addr(client)
 
-    def _broker_addr_for_mq(self, client: MQClientInstance, mq: MessageQueue) -> str:
-        route = client.get_topic_route_data(mq.topic)
-        if route is None:
-            raise MQClientException("No route info of this topic: %s" % mq.topic)
-        addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
-        if addr is None:
-            raise MQClientException("Broker %s not found in route of topic %s"
-                                    % (mq.broker_name, mq.topic))
-        return addr
-
     # ---------------- Topic 管理 ----------------
     def create_topic(self, key: str, new_topic: str, queue_num: int = 4,
                      topic_sys_flag: int = 0) -> None:
@@ -954,7 +944,9 @@ class DefaultMQAdminExt:
 
     def earliest_msg_store_time(self, mq: MessageQueue) -> int:
         client = self._require_client()
-        addr = self._broker_addr_for_mq(client, mq)
+        # Java MQAdminImpl:250 的 earliestMsgStoreTime 与 max/min/search 同一个形状：
+        # 只认 master，刷一次路由重查，仍拿不到照 :264 抛「The broker[X] not exist」。
+        addr = client._publish_addr_in_admin(mq)
         response = self._invoke_broker(addr, RequestCode.GET_EARLIEST_MSG_STORETIME,
                                        {"topic": mq.topic, "queueId": mq.queue_id,
                                         "brokerName": mq.broker_name})

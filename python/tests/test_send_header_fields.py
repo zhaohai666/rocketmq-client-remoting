@@ -135,8 +135,11 @@ class _Recorder:
     def get_topic_publish_info(self, topic, is_default=False):
         return self.publish
 
-    def broker_addr_of(self, broker_name):
+    def find_broker_address_in_publish(self, broker_name):
         return ADDR
+
+    def publish_addr_for(self, broker_name, topic):
+        return self.find_broker_address_in_publish(broker_name)
 
     def get_topic_route_data(self, topic):
         return None

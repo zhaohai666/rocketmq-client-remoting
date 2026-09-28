@@ -474,6 +474,13 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
 
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     topicRouteTable_[topic] = route;
+    // Java 只在路由"变了"时覆盖（`if (changed)`），但 route 是刚解码出来的新对象，
+    // 这里一律覆盖 —— Java 的 brokerAddrTable 条目本身就是**共享引用**
+    // （`put(bd.getBrokerName(), bd.getBrokerAddrs())` 存的是 route 里那张 map），
+    // 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
+    for (const BrokerData& bd : route.brokerDatas) {
+        brokerAddrTable_[bd.brokerName] = bd.brokerAddrs;
+    }
     auto it = topicPublishInfoTable_.find(topic);
     if (it == topicPublishInfoTable_.end() || it->second == nullptr) {
         it = topicPublishInfoTable_.emplace(topic, std::make_shared<TopicPublishInfo>()).first;
@@ -596,6 +603,43 @@ std::string MQClientInstance::brokerAddrOf(const std::string& brokerName) {
         }
     }
     return std::string();
+}
+
+std::string MQClientInstance::findBrokerAddressInPublish(const std::string& brokerName) {
+    // Java `MQClientInstance#findBrokerAddressInPublish:1295-1305`：
+    // `brokerAddrTable.get(brokerName).get(MixAll.MASTER_ID)`，任何一步拿不到就 null。
+    std::lock_guard<std::recursive_mutex> lk(routeLock_);
+    auto it = brokerAddrTable_.find(brokerName);
+    if (it == brokerAddrTable_.end()) {
+        return std::string();
+    }
+    auto master = it->second.find(MixAll::MASTER_ID);
+    if (master == it->second.end()) {
+        return std::string();
+    }
+    return master->second;
+}
+
+std::string MQClientInstance::publishAddrFor(const std::string& brokerName,
+                                             const std::string& topic) {
+    std::string addr = findBrokerAddressInPublish(brokerName);
+    if (addr.empty()) {
+        // Java `sendKernelImpl:919-924`：缓存里没有就按 topic 补一次路由再查。
+        updateTopicRouteInfoFromNameServer(topic, 5000, false);
+        addr = findBrokerAddressInPublish(brokerName);
+    }
+    if (addr.empty()) {
+        // Java `sendKernelImpl:1100` 抛在 try 之外 → 拦截器不跑；码用 Java 双参构造器的 -1
+        // （「不是 broker 回的码」）。
+        throw MQClientException("The broker[" + brokerName + "] not exist", -1);
+    }
+    return addr;
+}
+
+std::string MQClientInstance::publishAddrInAdmin(const MessageQueue& mq) {
+    // 与 publishAddrFor 同形（Python `_publish_addr_in_admin` 亦然），单独一层只是
+    // 让 offset 查询的调用点读起来是「按 mq 解析」。
+    return publishAddrFor(mq.brokerName, mq.topic);
 }
 
 std::vector<std::string> MQClientInstance::getRouteOfAllBrokers() {
@@ -769,7 +813,9 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
                                         int32_t sysFlag, bool unitMode,
                                         const std::optional<std::string>& createTopicKey,
                                         const std::optional<int32_t>& defaultTopicQueueNums) {
-    const std::string addr = brokerAddr(mq);
+    // Java `sendKernelImpl:919-924`：发送走**发布地址**（只认 master），不是
+    // brokerAddr(mq) 那条「主优先、没主退任意一台」的宽容口径。
+    const std::string addr = publishAddrFor(mq.brokerName, mq.topic);
     RemotingCommand request =
         buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
                          defaultTopicQueueNums);
@@ -836,7 +882,9 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
                                         int32_t sysFlag, bool unitMode,
                                         const std::optional<std::string>& createTopicKey,
                                         const std::optional<int32_t>& defaultTopicQueueNums) {
-    const std::string addr = brokerAddr(mq);
+    // Java `sendKernelImpl:919-924`：发送走**发布地址**（只认 master），不是
+    // brokerAddr(mq) 那条「主优先、没主退任意一台」的宽容口径。
+    const std::string addr = publishAddrFor(mq.brokerName, mq.topic);
     (void)timeoutMillis;
 
     // 请求码选择（reply / batch / 普通）见 sendRequestCode；建头细节与同步/异步共用一份
@@ -1356,7 +1404,8 @@ void MQClientInstance::unlockBatchMq(const std::string& consumerGroup,
 
 int64_t MQClientInstance::getMaxOffset(const MessageQueue& mq, int32_t timeoutMillis,
                                       const std::string& addrIn) {
-    std::string addr = addrIn.empty() ? brokerAddr(mq) : addrIn;
+    // Java MQAdminImpl:195/214/232/250 的 offset 查询一律打主（见 publishAddrInAdmin）。
+    std::string addr = addrIn.empty() ? publishAddrInAdmin(mq) : addrIn;
     auto header = std::make_shared<GetMaxOffsetRequestHeader>();
     header->topic = mq.topic;
     header->queueId = mq.queueId;
@@ -1371,7 +1420,8 @@ int64_t MQClientInstance::getMaxOffset(const MessageQueue& mq, int32_t timeoutMi
 
 int64_t MQClientInstance::getMinOffset(const MessageQueue& mq, int32_t timeoutMillis,
                                       const std::string& addrIn) {
-    std::string addr = addrIn.empty() ? brokerAddr(mq) : addrIn;
+    // 同 getMaxOffset：Java 的管理类 offset 查询只认主。
+    std::string addr = addrIn.empty() ? publishAddrInAdmin(mq) : addrIn;
     auto header = std::make_shared<GetMinOffsetRequestHeader>();
     header->topic = mq.topic;
     header->queueId = mq.queueId;
@@ -1395,7 +1445,8 @@ int64_t MQClientInstance::searchOffsetByBoundary(const MessageQueue& mq, int64_t
                                                 const std::optional<BoundaryType>& boundaryType,
                                                 int32_t timeoutMillis,
                                                 const std::string& addrIn) {
-    std::string addr = addrIn.empty() ? brokerAddr(mq) : addrIn;
+    // 同 getMaxOffset：Java 的管理类 offset 查询只认主。
+    std::string addr = addrIn.empty() ? publishAddrInAdmin(mq) : addrIn;
     auto header = std::make_shared<SearchOffsetRequestHeader>();
     header->topic = mq.topic;
     header->queueId = mq.queueId;

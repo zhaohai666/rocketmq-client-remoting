@@ -924,8 +924,9 @@ impl DefaultMQPullConsumer {
     /// 消息回投（Python `send_message_back`，Java `sendMessageBack`）。
     ///
     /// 两个真机踩过的点，照 Python 的注释：
-    /// 1. 地址靠 `broker_addr_of(msg.broker_name)` 反查**路由表**，所以调用方必须
-    ///    先用本 consumer 访问过该 topic（Java 同理，走 `findBrokerAddressInPublish`）。
+    /// 1. 地址靠 `find_broker_address_in_publish(msg.broker_name)` 反查**发布地址表**
+    ///    （只认 master），所以调用方必须先用本 consumer 访问过该 topic
+    ///    （Java DefaultMQPullConsumerImpl:654 走的也是 findBrokerAddressInPublish）。
     /// 2. 与 Java 的有意差异：Java 失败时吞异常、改由内部生产者把消息直接发进
     ///    `%RETRY%group`；这里直接返回错误，不换路径静默重发（模块头偏离 4）。
     ///
@@ -937,9 +938,10 @@ impl DefaultMQPullConsumer {
         let client = self.require_client()?;
         let group = self.consumer_group();
         let broker = msg.broker_name.clone().unwrap_or_default();
+        // 从节点不接 CONSUMER_SEND_MSG_BACK（master 专属），所以这里只认 brokerId=0
         let addr = client
-            .broker_addr_of(&broker)
-            .ok_or_else(|| Error::client(format!("broker {broker} not found")))?;
+            .find_broker_address_in_publish(&broker)
+            .ok_or_else(|| Error::client(format!("Broker[{broker}] master node does not exist")))?;
         client
             .consumer_send_msg_back(&group, msg, delay_level, None, 5_000, &addr, self.unit_mode())
             .await
@@ -2562,7 +2564,11 @@ async fn resolve_initial_offset(
         Err(e) => rmq_debug!("lite query offset failed for {mq:?}: {e}"),
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-        return client.get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None).await;
+        // Java RebalanceLitePullImpl:FIRST_OFFSET 分支与 push 同形（`result = 0L`），
+        // 不发 minOffset 查询 —— minOffset 属于 MQAdminImpl 口径（只认 master），
+        // 主掉线期间会让新起的 lite-pull 一条都拉不到；越界由 broker 的
+        // PULL_OFFSET_MOVED 纠正（见 `handle_offset_illegal`）。
+        return Ok(0);
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
         // 与推送消费者共用解析器：两种消费者的 consumeTimestamp 语义必须一致
@@ -3308,6 +3314,9 @@ mod tests {
     /// 一份 35（UNREGISTER_CLIENT）的 extFields 快照。
     type UnregisterExt = Vec<(String, String)>;
 
+    /// 一笔收到的请求：请求码 + extFields 快照。
+    type RecordedRequest = (i32, Vec<(String, String)>);
+
     /// 假 broker：记录 34（心跳 body）与 35（注销 extFields）两号报文，其余一律 SUCCESS。
     struct FakeBroker {
         addr: String,
@@ -3315,6 +3324,9 @@ mod tests {
         heartbeat_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
         /// 收到的 UNREGISTER_CLIENT extFields，按到达顺序。
         unregisters: Arc<Mutex<Vec<UnregisterExt>>>,
+        /// 收到的**每一笔**请求（code + extFields 快照），按到达顺序 —— 「这个 RPC
+        /// 到底发没发」型断言（如 FIRST_OFFSET 不该发 minOffset）靠它。
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
     }
 
     impl FakeBroker {
@@ -3325,6 +3337,7 @@ mod tests {
                 addr,
                 heartbeat_bodies: Arc::new(Mutex::new(Vec::new())),
                 unregisters: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -3338,6 +3351,14 @@ mod tests {
                             let Ok(request) = RemotingCommand::decode(&frame) else {
                                 return;
                             };
+                            lock(&inner.requests).push((
+                                request.code,
+                                request
+                                    .ext_fields()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            ));
                             match request.code {
                                 request_code::HEART_BEAT => lock(&inner.heartbeat_bodies)
                                     .push(request.body().unwrap_or_default().to_vec()),
@@ -3359,6 +3380,24 @@ mod tests {
                 }
             });
             broker
+        }
+
+        /// 收到的请求码，按到达顺序。
+        fn codes(&self) -> Vec<i32> {
+            lock(&self.requests).iter().map(|(code, _)| *code).collect()
+        }
+
+        /// 收到的 PULL_MESSAGE 的 `queueOffset`，按到达顺序。
+        fn pull_offsets(&self) -> Vec<i64> {
+            lock(&self.requests)
+                .iter()
+                .filter(|(code, _)| *code == request_code::PULL_MESSAGE)
+                .filter_map(|(_, ext)| {
+                    ext.iter()
+                        .find(|(k, _)| k == "queueOffset")
+                        .and_then(|(_, v)| v.parse().ok())
+                })
+                .collect()
         }
 
         /// 收到的每份心跳解成 `HeartbeatData`（解不开就炸在断言线程上）。
@@ -3644,5 +3683,51 @@ mod tests {
             vec![3],
             "CONFIG 策略无视 mqAll/cidAll 返回配置队列"
         );
+    }
+
+    // --------------------------------- FIRST_OFFSET 的起点是字面量 0（#100 附带）
+
+    /// Java `RebalanceLitePullImpl` 的 FIRST_OFFSET 分支（与 `RebalancePushImpl:197-208`
+    /// 同形）：起点是字面量 0，**不**发 minOffset 查询。
+    ///
+    /// minOffset 属 MQAdminImpl 口径（只认 master），主掉线期间会让新起的 lite-pull
+    /// 一条都拉不到；起点 0 越界时由 broker 用 `PULL_OFFSET_MOVED` 纠正
+    /// （`handle_offset_illegal`）。
+    #[tokio::test]
+    async fn lite_first_offset_starts_at_zero_without_a_min_offset_rpc() {
+        let cluster = FakePullCluster::start().await;
+
+        let first = DefaultLitePullConsumer::new("LitePG_First").unwrap();
+        first.set_instance_name("lite_first_offset");
+        first.set_namesrv_addr(&cluster.namesrv_addr);
+        first.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        first.assign(&[queue("T", "broker-a", 0)]);
+        first.start().await.expect("假集群里 start 应当成功");
+        wait_until(
+            || !cluster.master.pull_offsets().is_empty(),
+            "FIRST_OFFSET 消费者的第一次拉取",
+        )
+        .await;
+        assert_eq!(cluster.master.pull_offsets()[0], 0, "起点就是 0，直接上拉取请求");
+
+        // 负控：LAST_OFFSET 那一支该发 maxOffset —— 先证明这份请求日志不是哑的
+        let last = DefaultLitePullConsumer::new("LitePG_Last").unwrap();
+        last.set_instance_name("lite_last_offset");
+        last.set_namesrv_addr(&cluster.namesrv_addr);
+        last.assign(&[queue("T", "broker-a", 0)]);
+        last.start().await.expect("假集群里 start 应当成功");
+        wait_until(
+            || cluster.master.codes().contains(&request_code::GET_MAX_OFFSET),
+            "LAST_OFFSET 消费者的 maxOffset 查询",
+        )
+        .await;
+
+        let codes = cluster.master.codes();
+        assert!(
+            !codes.contains(&request_code::GET_MIN_OFFSET),
+            "FIRST_OFFSET 是字面量 0（Java RebalanceLitePullImpl），一次 minOffset 都不该发：{codes:?}"
+        );
+        first.shutdown();
+        last.shutdown();
     }
 }

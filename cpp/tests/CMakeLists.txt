@@ -285,3 +285,14 @@ add_test(NAME reset_offset COMMAND rmq_test_reset_offset)
 add_executable(rmq_test_pull_consumer_heartbeat test_pull_consumer_heartbeat.cpp)
 target_link_libraries(rmq_test_pull_consumer_heartbeat PRIVATE rocketmq::remoting)
 add_test(NAME pull_consumer_heartbeat COMMAND rmq_test_pull_consumer_heartbeat)
+
+# 发布地址「只要 master」（#100，Java MQClientInstance#findBrokerAddressInPublish:1295-1305）：
+# 平表由真的 updateTopicRouteInfoFromNameServer 写入（:962-964）、查不到先刷路由再查
+# （sendKernelImpl:919-924）、仍拿不到抛 "The broker[X] not exist" 且码为 -1，以及
+# 管理 offset 查询同口径（MQAdminImpl:195/214/232/250）。
+# 队列集的筛选（:301-303）在 test_route_heartbeat.cpp 里；这条边界是
+# 「本端立刻报错」与「把写请求打到从节点上白挨一轮 SYSTEM_BUSY(2)」的分水岭。
+# 与 python/tests/test_publish_route_master.py 的地址侧同题。
+add_executable(rmq_test_publish_route_master test_publish_route_master.cpp)
+target_link_libraries(rmq_test_publish_route_master PRIVATE rocketmq::remoting)
+add_test(NAME publish_route_master COMMAND rmq_test_publish_route_master)

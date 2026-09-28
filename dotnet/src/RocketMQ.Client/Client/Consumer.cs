@@ -5161,7 +5161,11 @@ public sealed class DefaultMQPushConsumer
 
             if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
             {
-                return c.GetMinOffset(mq);
+                // Java RebalancePushImpl:197-208：FIRST_OFFSET 且本地没有位点时直接给 0
+                // （广播模式读的是 LocalFileOffsetStore，同一个分支），**不**发 minOffset
+                // 查询 —— minOffset 属 MQAdminImpl 口径（只认 master），主掉线期间会让
+                // 新起的消费者一条都拉不到；起点越界时由 broker 的 PULL_OFFSET_MOVED 纠正。
+                return 0;
             }
 
             return c.GetMaxOffset(mq);
@@ -5185,7 +5189,8 @@ public sealed class DefaultMQPushConsumer
         {
             if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
             {
-                return c.GetMinOffset(mq);
+                // 同上（Java 的本地文件与 broker 两条路径是同一个分支）：起点是字面量 0。
+                return 0;
             }
 
             if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromTimestamp)
@@ -5341,10 +5346,13 @@ public sealed class DefaultMQPushConsumer
     {
         MQClientInstance c = Client();
         string brokerName = string.IsNullOrEmpty(brokerNameIn) ? msg.BrokerName : brokerNameIn!;
-        string addr = c.BrokerAddrOf(brokerName);
+        // Java DefaultMQPushConsumerImpl:768 用的是 findBrokerAddressInPublish（只认 master，
+        // 不刷路由），拿不到就报「Broker[X] master node does not exist」；
+        // 从节点不接 CONSUMER_SEND_MSG_BACK。
+        string addr = c.FindBrokerAddressInPublish(brokerName);
         if (addr.Length == 0)
         {
-            throw new MQClientException("broker " + brokerName + " not found");
+            throw new MQClientException("Broker[" + brokerName + "] master node does not exist");
         }
 
         var header = new ConsumerSendMsgBackRequestHeader

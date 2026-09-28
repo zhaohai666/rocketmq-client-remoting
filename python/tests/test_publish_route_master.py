@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""发布路由只收「有 master」的 broker，订阅信息不受这条约束（Java MQClientInstance:294-332）。
+"""发布侧「只要 master」的两条口径，订阅信息不受这条约束（Java MQClientInstance:294-332）。
 
 Java 把「上游路由 → 客户端队列集」分成两条口径，同一个 topic 会得到两份不同的答案：
 
@@ -16,11 +16,22 @@ master 那一条不是冗余判断：从节点自己也会注册进 namesrv，�
 
 反过来，消费侧**必须**保留这些队列（主挂后仍要从从节点拉取），所以两条口径不能合成一条 ——
 本文件最后两个用例就是这条边界的守卫。
+
+文件的第二半是**地址**侧的同一条分界线：``topicRouteData2TopicPublishInfo`` 挑出了队列，发送时
+还要把 brokerName 解析成地址，Java 那边是 ``findBrokerAddressInPublish:1295-1305``
+（``brokerAddrTable.get(brokerName).get(MASTER_ID)``，**只认主**、拿不到返回 null），
+而不是 ``findBrokerAddressInAdmin``（主优先、没主退一台从节点）。从「队列集」到「地址」
+两处都用发布口径，主从切换期间才会是本端立刻报错，而不是把请求打到从节点上再被拒。
 """
 from __future__ import annotations
 
+import pytest
+
+from rocketmq.client.exception import MQClientException
 from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.common.message import MessageQueue
+from rocketmq.remoting.protocol.codes import ResponseCode
+from rocketmq.remoting.protocol.remoting_command import RemotingCommand
 from rocketmq.remoting.protocol.route import BrokerData, QueueData, TopicRouteData
 
 MASTER = 0
@@ -94,3 +105,120 @@ def test_instance_subscribe_info_is_served_from_the_route_table():
     )
     assert inst.get_topic_subscribe_info("T") == [
         MessageQueue("T", "broker-a", i) for i in range(2)]
+
+
+# ---------------------------------------------- 地址侧：findBrokerAddressInPublish
+def _route_of(addrs_by_broker) -> TopicRouteData:
+    return _route(
+        [QueueData(name, 2, 2, 6, 0) for name in addrs_by_broker],
+        [BrokerData("c", name, addrs) for name, addrs in addrs_by_broker.items()],
+    )
+
+
+def _serving(route_holder):
+    """离线实例：``_invoke_sync`` 一律回 ``route_holder[0]`` 那份路由（None = namesrv 说没有）。
+
+    刷路由走的是**真的** ``update_topic_route_info_from_name_server`` —— 发布地址平表的
+    写入点就在它里面，绕过它直接往 ``broker_addr_table`` 塞值等于这条路径没测。
+    """
+    inst = MQClientInstance("route-test@unit", ["127.0.0.1:9876"])
+    calls = []
+
+    def fake_invoke(addr, request, timeout_millis=None):
+        calls.append(addr)
+        response = RemotingCommand()
+        response.code = ResponseCode.SUCCESS
+        response.ext_fields = {"offset": "7"}
+        route = route_holder[0]
+        response.body = route.encode() if route is not None else None
+        return response
+
+    inst._invoke_sync = fake_invoke     # type: ignore[method-assign]
+    return inst, calls
+
+
+def test_publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back():
+    """``findBrokerAddressInPublish`` 只认 brokerId=0；同一份路由上管理口径要退到从节点。"""
+    holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
+    inst, _ = _serving(holder)
+    assert inst.update_topic_route_info_from_name_server("T") is True
+    assert inst.find_broker_address_in_publish("broker-a") is None
+    # 负控：退让口径（心跳/拉取/位点查询用）在**同一张路由**上必须拿得到从节点地址
+    assert inst.broker_addr_of("broker-a") == "127.0.0.1:10931"
+
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
+                                        SLAVE: "127.0.0.1:10931"}})
+    inst.update_topic_route_info_from_name_server("T")
+    assert inst.find_broker_address_in_publish("broker-a") == "127.0.0.1:10911"
+
+
+def test_publish_addr_for_refreshes_the_route_then_rechecks():
+    """Java ``sendKernelImpl:919-924``：发布地址查不到，按 topic 刷一次路由再查。"""
+    holder = [None]      # 还没见过这个 topic
+    inst, calls = _serving(holder)
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911"}})
+    assert inst.publish_addr_for("broker-a", "T") == "127.0.0.1:10911"
+    assert calls == ["127.0.0.1:9876"]
+
+
+def test_publish_addr_for_reports_not_exist_when_the_master_is_gone():
+    """主掉线（路由里只剩 brokerId=1）：本端报「broker 不存在」，一次请求都不发。"""
+    holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
+    inst, calls = _serving(holder)
+    with pytest.raises(MQClientException) as exc:
+        inst.publish_addr_for("broker-a", "T")
+    assert str(exc.value) == "The broker[broker-a] not exist"
+    # 本端报的错，没有 broker 侧错误码（Java 的双参构造器给 -1）
+    assert exc.value.response_code is None
+    # 报错前必须先刷一次路由（Java 的 tryToFindTopicPublishInfo），不能直接拿旧结论结账
+    assert calls == ["127.0.0.1:9876"]
+    # 负控：跳的是「没有 master」，不是 broker-a 这个名字 —— master 一注册立刻解析得出
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
+                                        SLAVE: "127.0.0.1:10931"}})
+    assert inst.publish_addr_for("broker-a", "T") == "127.0.0.1:10911"
+
+
+def test_publish_addr_for_reports_not_exist_for_an_unknown_broker():
+    """路由里压根没有这个 brokerName（拼错/已下线）：同样报 not exist，不退到别的 broker。"""
+    holder = [_route_of({"broker-b": {MASTER: "127.0.0.1:10912"}})]
+    inst, _ = _serving(holder)
+    with pytest.raises(MQClientException) as exc:
+        inst.publish_addr_for("broker-a", "T")
+    assert str(exc.value) == "The broker[broker-a] not exist"
+
+
+def test_admin_offset_queries_are_master_only_too():
+    """``MQAdminImpl:195-264`` 的四个 offset 查询同一口径：只打主，主没了就报 not exist。
+
+    四个查询在主端点名的地址解析是同一个入口：``earliest_msg_store_time`` 没有客户端层方法，
+    本端落在 ``_publish_addr_in_admin`` 上（admin.py:949 / producer.py:2045 / consumer.py:3689
+    三个门面都只填地址、不各自解析），所以这里连它一起钉住。
+    """
+    holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
+    inst, calls = _serving(holder)
+    mq = MessageQueue("T", "broker-a", 0)
+
+    # 主没了：四个查询一律本端报错，一次 broker 请求都不发（旧行为是退到从节点上把查询做完）
+    queries = {
+        "maxOffset": lambda: inst.get_max_offset(mq),
+        "minOffset": lambda: inst.get_min_offset(mq),
+        "searchOffset": lambda: inst.search_offset_by_timestamp(mq, 1700000000000),
+        "earliestMsgStoreTime": lambda: inst._publish_addr_in_admin(mq),
+    }
+    for name, call in queries.items():
+        with pytest.raises(MQClientException) as exc:
+            call()
+        assert str(exc.value) == "The broker[broker-a] not exist", name
+        # 本端报的错，没有 broker 侧错误码（Java 的双参构造器给 -1）
+        assert exc.value.response_code is None, name
+
+    # 负控：主回来之后四路都解析得出，且请求落在**主**地址上（不是路由里那台从节点）
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
+                                        SLAVE: "127.0.0.1:10931"}})
+    assert inst.get_max_offset(mq) == 7
+    assert inst.get_min_offset(mq) == 7
+    assert inst.search_offset_by_timestamp(mq, 1700000000000) == 7
+    assert inst._publish_addr_in_admin(mq) == "127.0.0.1:10911"
+    # 从节点地址一次都没被打过（三条查询各一次 master，转接解析不打 broker）
+    assert calls[-3:] == ["127.0.0.1:10911"] * 3
+    assert "127.0.0.1:10931" not in calls

@@ -28,8 +28,10 @@
 //   S5 发送快速失败、报错里没有从节点地址（旧缓存腿打的是死掉的 master；周期刷新恰好已跑过
 //      则是本端 10005）；再显式把发送实例刷成停后形状：(A) 生效 —— 发送本端 10005 且
 //      一条 broker wire 都不发（无 BrokersSent）。
-//   S5d 对照：定点发到该队列 → 从节点回 SYSTEM_BUSY(2)（可重试）—— S5c 若漏做，不指定队列的
-//      发送就是 3 次 wire 全被拒的下场（一条也落不了库，S7b 用 maxOffset 钉死）。
+//   S5d (B) 对照：定点发到该队列 → 地址侧只认 master（Java findBrokerAddressInPublish:1295-1305），
+//      本端同样立刻报「The broker[broker-a] not exist」，也无 wire（漏掉 (B) 这条对照时的旧行为：
+//      请求打到从节点上，broker 回 SYSTEM_BUSY(2)，一个可重试码 —— 白烧一整轮重试，错误类型也和
+//      Java 不一样）。两条腿合起来是「无 wire」，落库与否由 S7b 钉死。
 //   S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐。
 //   S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK。
 //
@@ -549,29 +551,45 @@ public static class LivePublishRouteMaster
             && freshMs < LocalBudgetMs,
             freshMs.ToString("F0", CultureInfo.InvariantCulture) + "ms code=" + freshCode + ": " + freshText);
 
-        // ---------- S5d 对照：定点发送的下场 ----------
+        // ---------- S5d (B) 对照：定点发送的地址解析 ----------
+        // 定点发送不经过发布信息（调用方直接给了 mq），地址侧若还按「主优先、没主退一台」去解析，
+        // 请求就会落到从节点上换来一个 SYSTEM_BUSY(2)。Java 的 findBrokerAddressInPublish
+        // 只认 brokerId=0，本端应当直接报「broker 不存在」，一条 wire 都不发。
         Console.WriteLine();
-        Console.WriteLine("S5d 对照：定点发到该队列 → 从节点拒收（SYSTEM_BUSY=2，可重试码）");
+        Console.WriteLine("S5d (B) 对照：定点发到该队列 → 本端报 broker 不存在（不发 wire）");
         var mq0 = new MessageQueue(topic, BrokerName, 0);
         int pinnedCode = -1;
+        bool pinnedFailed = false;
+        bool pinnedIsClientError = false;
         string pinnedText;
+        sw.Restart();
         try
         {
             SendResult r = fx.Producer.Send(new Message(topic, Bytes("pinned-to-slave")), mq0, 20000);
             pinnedText = "SendResult(status=" + r.SendStatus + ")";
         }
-        catch (MQBrokerException e)
+        catch (MQClientException e)
         {
+            // MQBrokerException 不继承 MQClientException：这里能进来说明不是 broker 回的码
+            pinnedFailed = true;
+            pinnedIsClientError = true;
             pinnedCode = e.ResponseCode;
             pinnedText = e.Message;
         }
         catch (Exception e)
         {
+            pinnedFailed = true;
             pinnedText = e.GetType().Name + ": " + e.Message;
         }
 
-        Check("S5d 从节点回 SYSTEM_BUSY(2)（S5c 若漏做，不指定队列的发送就是这个下场）",
-            pinnedCode == ResponseCode.SystemBusy, "code=" + pinnedCode + ": " + pinnedText);
+        double pinnedMs = sw.Elapsed.TotalMilliseconds;
+        Check("S5d 定点发送本端报「The broker[" + BrokerName + "] not exist」，无 wire"
+              + "（不是从节点回的 SYSTEM_BUSY(2)）",
+            pinnedFailed && pinnedIsClientError && pinnedCode == -1
+            && pinnedText == "The broker[" + BrokerName + "] not exist"
+            && pinnedMs < LocalBudgetMs,
+            pinnedMs.ToString("F0", CultureInfo.InvariantCulture) + "ms code=" + pinnedCode
+            + ": " + pinnedText);
 
         // ---------- S6 (C 端到端) 停窗口内消费 ----------
         Console.WriteLine();

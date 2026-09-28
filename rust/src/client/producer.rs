@@ -2044,11 +2044,9 @@ impl DefaultMQProducer {
     }
 
     /// Python `_need_addr`：broker 地址缺失时报错（oneway 路径没有「拿不到就不填」
-    /// 的余地）。
-    fn need_addr(&self, client: &MQClientInstance, mq: &MessageQueue) -> Result<String> {
-        client
-            .broker_addr_of(&mq.broker_name)
-            .ok_or_else(|| Error::client(format!("broker address not found for {}", mq.broker_name)))
+    /// 的余地）。口径同 Java `sendKernelImpl`（只认 master）。
+    async fn need_addr(&self, client: &MQClientInstance, mq: &MessageQueue) -> Result<String> {
+        client.publish_addr_for(&mq.broker_name, &mq.topic).await
     }
 
     // ---------------- 钩子上下文 ----------------
@@ -2152,10 +2150,13 @@ impl DefaultMQProducer {
             .enable_trace_context
             .unwrap_or(false);
         let unit_mode = self.inner.unit_mode();
-        // Python `try: ... except Exception: pass` —— 拿不到地址就按空串继续
+        // Python `broker_addr = client.publish_addr_for(mq_sel.broker_name, mq_sel.topic)`：
+        // 地址解析两步（查发布地址只认 master → 刷一次路由 → 仍查不到照 `:1100` 报
+        // 「The broker[X] not exist」），失败直接抛给重试链。这个地址只喂钩子上下文，
+        // 但**解析异常照抛** —— 与 Java `sendKernelImpl:919-924` 的次序一致。
         let broker_addr = client
-            .broker_addr_of(&mq_sel.broker_name)
-            .unwrap_or_default();
+            .publish_addr_for(&mq_sel.broker_name, &mq_sel.topic)
+            .await?;
         if self.has_check_forbidden_hook() {
             self.execute_check_forbidden(msg.as_message(), mq_sel, &broker_addr, arg, mode)?;
         }
@@ -2929,7 +2930,7 @@ impl DefaultMQProducer {
                 MessageQueue::new(&wrapped, &selected.broker_name, selected.queue_id)
             }
         };
-        let addr = self.need_addr(&client, &mq_sel)?;
+        let addr = self.need_addr(&client, &mq_sel).await?;
         let (sys_flag, prev_body) = self.try_to_compress_message(msg);
         // 一段与 Java `sendKernelImpl` 的 try 同域的代码：拦截钩子抛错也要还原，
         // 所以它和发送一起进这个作用域。
@@ -3368,26 +3369,13 @@ impl DefaultMQProducer {
         timeout: i64,
     ) {
         let began = monotonic_millis();
-        // 地址解析两步，与 Java `sendKernelImpl:919-924` 一致：先查已缓存的发布地址，查不到
-        // 再按 topic 刷一次路由重查。定点发送（调用方给了 mq）不会在 sendDefaultImpl 里取
-        // 发布信息，这一步是它唯一的路由来源。
-        let addr = match client.broker_addr_of(&mq.broker_name) {
-            Some(addr) => Some(addr),
-            None => client
-                .get_topic_route_data(&mq.topic)
-                .await
-                .and_then(|route| MQClientInstance::find_broker_addr_in_route(&route, &mq.broker_name)),
-        };
-        let addr = match addr {
-            Some(addr) => addr,
-            // Java `sendKernelImpl:1100`
-            None => {
-                return self.fail_async(
-                    &callback,
-                    Error::client(format!("The broker[{}] not exist", mq.broker_name)),
-                    permits,
-                )
-            }
+        // 地址解析两步，与 Java `sendKernelImpl:919-924` 一致：先查已缓存的**发布**地址
+        // （只认 master），查不到再按 topic 刷一次路由重查，仍查不到照 `:1100` 报
+        // 「The broker[X] not exist」。定点发送（调用方给了 mq）不会在 sendDefaultImpl
+        // 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，第一次定点发送必然拿到空地址。
+        let addr = match client.publish_addr_for(&mq.broker_name, &mq.topic).await {
+            Ok(addr) => addr,
+            Err(e) => return self.fail_async(&callback, e, permits),
         };
         if self.has_check_forbidden_hook() {
             // Java sendKernelImpl 的 ASYNC 分支同样先过拦截钩子（communicationMode=ASYNC）
@@ -3672,9 +3660,9 @@ impl AsyncSendChain {
                 Err(_) => (self.broker_name.clone(), self.mq.clone()),
             },
         };
-        // Java `onExceptionImpl:725` 只查发布地址表、**不刷路由**；查不到就带着 null 撞进
-        // invokeAsync。这里就地终止，别让空地址传进传输层。
-        let addr = match self.client.broker_addr_of(&broker_name) {
+        // Java `onExceptionImpl:725` 只查**发布地址表**（同样只认 master）、不刷路由；
+        // 查不到就带着 null 撞进 invokeAsync。这里就地终止，别让空地址传进传输层。
+        let addr = match self.client.find_broker_address_in_publish(&broker_name) {
             Some(addr) => addr,
             None => {
                 return self.finish(Err(Error::client(format!(
@@ -3975,8 +3963,11 @@ impl DefaultMQProducer {
                 header.bname = Some(broker_name.clone());
                 header.topic = Some(msg.topic.clone());
                 header.msg_id = send_result.msg_id.clone();
+                // Java endTransaction:1541 用的也是 findBrokerAddressInPublish（只认 master），
+                // 且**不做 null 检查**就直接 oneway；这里保留本端提前报错的守卫（比 Java 的
+                // NPE 干净），但地址来源必须同样是 master-only。
                 client
-                    .broker_addr_of(&broker_name)
+                    .find_broker_address_in_publish(&broker_name)
                     .ok_or_else(|| Error::client("no broker address for end transaction"))?
             }
         };
@@ -4238,20 +4229,12 @@ impl DefaultMQProducer {
         // Java `tryToFindTopicPublishInfo(topic)`：返回值不使用，但**异常照抛**
         // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
         self.topic_publish_info(&client, &topic).await?;
-        // 优先按 handle 里的 brokerName 定位；拿不到再退到该 topic 路由里的任一 broker
-        // （Java `findBrokerAddressInPublish` / `findBrokerAddrByTopic`）。
+        // 优先按 handle 里的 brokerName 查**发布地址**（只认 master）；拿不到再退到该
+        // topic 路由里的任一 broker —— 后者走 select_broker_addr()，**允许**落到从节点上
+        // （Java :1586-1594 `findBrokerAddressInPublish` / `findBrokerAddrByTopic`）。
         let addr = client
-            .broker_addr_of(&handle.broker_name)
-            .or_else(|| {
-                client
-                    .route_of(&topic)
-                    .and_then(|route| {
-                        route
-                            .get_broker_datas()
-                            .iter()
-                            .find_map(|bd| bd.select_broker_addr())
-                    })
-            })
+            .find_broker_address_in_publish(&handle.broker_name)
+            .or_else(|| client.find_broker_addr_by_topic(&topic))
             .ok_or_else(|| {
                 // Java 先 log.warn 再抛，文案照抄。
                 rmq_warn!(
@@ -4485,6 +4468,13 @@ mod tests {
     /// （`name server address list is empty`），适合跑发送内核的离线用例。
     fn bare_client() -> MQClientInstance {
         MQClientInstance::new("offline-producer-test", Vec::new())
+    }
+
+    /// 种上发布地址（Java `brokerAddrTable`）：发送内核的地址解析只认这张表
+    /// （`find_broker_address_in_publish`），种不上就会**先于钩子**报「broker 不存在」。
+    /// 地址指向一个必然拒连的端口：这几条用例要的是「解析成功、发送失败」。
+    fn seed_publish_addr(client: &MQClientInstance) {
+        client.seed_publish_addr_for_test("broker-a", "127.0.0.1:1");
     }
 
     // ---------------- 构造 / 配置默认值 ----------------
@@ -4874,6 +4864,7 @@ mod tests {
         let hook = Arc::new(RecordingHook::default());
         p.register_send_message_hook(hook.clone());
         let client = bare_client();
+        seed_publish_addr(&client);
 
         let mut msg = Message::new("T1", Some(b"body"));
         let mut publish = PublishMessage::Single(&mut msg);
@@ -4916,6 +4907,7 @@ mod tests {
         p.register_send_message_hook(hook.clone());
         p.register_check_forbidden_hook(Arc::new(ForbidAll));
         let client = bare_client();
+        seed_publish_addr(&client);
 
         let mut msg = Message::new("T1", Some(b"body"));
         let mut publish = PublishMessage::Single(&mut msg);
@@ -4940,6 +4932,7 @@ mod tests {
     async fn traceparent_is_injected_only_when_enabled() {
         let p = producer("GID_trace");
         let client = bare_client();
+        seed_publish_addr(&client);
         let m = mq("broker-a", 0);
 
         p.set_enable_trace_context(Some(false));

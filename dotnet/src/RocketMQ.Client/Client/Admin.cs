@@ -257,8 +257,11 @@ public sealed class DefaultMQAdminExt
 
     private static string FindFirstBrokerAddr(MQClientInstance client) => FirstBrokerAddr(client);
 
-    private static string BrokerAddrForMq(MQClientInstance client, MessageQueue mq) =>
-        client.BrokerAddrForMq(mq);
+    /// <summary>Java MQAdminImpl 的 offset 查询口径（:195/214/232/250）：只认 master，
+    /// 拿不到照 :210 抛「The broker[X] not exist」—— 从节点上的 store 是 HA 复制来的同一份
+    /// 数据，但管理类 API 一律打主，本端不「顺手」退到从节点。</summary>
+    private static string PublishAddrForMq(MQClientInstance client, MessageQueue mq) =>
+        client.PublishAddrFor(mq.BrokerName, mq.Topic);
 
     private static List<string> BrokerAddrsOfCluster(MQClientInstance client, string clusterName)
     {
@@ -1315,7 +1318,7 @@ public sealed class DefaultMQAdminExt
     public long EarliestMsgStoreTime(MessageQueue mq)
     {
         MQClientInstance client = RequireClient();
-        string addr = BrokerAddrForMq(client, mq);
+        string addr = PublishAddrForMq(client, mq);
         PropertyMap ext = new()
         {
             ["topic"] = mq.Topic,

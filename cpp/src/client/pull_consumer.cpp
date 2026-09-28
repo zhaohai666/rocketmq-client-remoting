@@ -301,10 +301,9 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    const std::string addr = mqClient_->brokerAddrForMq(mq);
-    if (addr.empty()) {
-        throw MQClientException("broker " + mq.brokerName + " not found");
-    }
+    // Java `MQAdminImpl.earliestMsgStoreTime:250-264` 同样先用 findBrokerAddressInPublish
+    // （只认 master）+ 刷一次路由，拿不到就抛 "The broker[X] not exist"。
+    const std::string addr = mqClient_->publishAddrFor(mq.brokerName, mq.topic);
     PropertyMap ext;
     ext["topic"] = mq.topic;
     ext["queueId"] = std::to_string(mq.queueId);
@@ -317,8 +316,9 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
 // ---------------------------------------------------------------- 回投 / 建 topic
 // 消息回投（对应 Java DefaultMQPullConsumer.sendMessageBack）。
 // 注意两点（真机踩过）：
-//   1. 地址靠 brokerAddrOf(msg.brokerName) 反查**路由表**，所以调用方必须先用本 consumer
-//      访问过该 topic（Java 同理，走 findBrokerAddressInPublish 读 brokerAddrTable）。
+//   1. 地址靠 findBrokerAddressInPublish(msg.brokerName) 反查**发布地址表**（只认 master），
+//      所以调用方必须先用本 consumer 访问过该 topic（Java DefaultMQPullConsumerImpl:654
+//      走的也是 findBrokerAddressInPublish）。从节点不接 CONSUMER_SEND_MSG_BACK。
 //   2. 与 Java 的**有意差异**：Java 在失败时会吞掉异常、改用内部默认生产者把消息直接发到
 //      %RETRY%group（DefaultMQPullConsumerImpl:666 的 catch 分支）。本实现不做这个兜底 ——
 //      回投失败就抛，让调用方看见，而不是换一条路径静默重发。
@@ -326,9 +326,9 @@ void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    const std::string addr = mqClient_->brokerAddrOf(msg.brokerName);
+    const std::string addr = mqClient_->findBrokerAddressInPublish(msg.brokerName);
     if (addr.empty()) {
-        throw MQClientException("broker " + msg.brokerName + " not found");
+        throw MQClientException("Broker[" + msg.brokerName + "] master node does not exist");
     }
     auto header = std::make_shared<ConsumerSendMsgBackRequestHeader>();
     header->offset = msg.commitLogOffset;

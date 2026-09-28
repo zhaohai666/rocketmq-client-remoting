@@ -70,8 +70,11 @@ class _FakeClient:
             raise MQClientException("Can not find Message Queue for topic: %s" % topic)
         return self.publish
 
-    def broker_addr_of(self, broker_name):
+    def find_broker_address_in_publish(self, broker_name):
         return ADDR
+
+    def publish_addr_for(self, broker_name, topic):
+        return self.find_broker_address_in_publish(broker_name)
 
     def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False,
                      default_topic=None, default_topic_queue_nums=None):

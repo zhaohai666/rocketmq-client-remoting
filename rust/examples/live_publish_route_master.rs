@@ -29,8 +29,11 @@
 //! - S5 发送快速失败、报错里没有从节点地址（旧缓存腿打的是死掉的 master；周期刷新恰好
 //!   已跑过则是本端 10005）；再显式把发送实例刷成停后形状：(A) 生效 —— 发送本端 10005
 //!   且**一条 wire 都不发**。
-//! - S5d 对照：定点发到该队列 → 从节点回 `SYSTEM_BUSY(2)`（可重试）—— S5c 若漏做，
-//!   不指定队列的发送就是 3 次 wire 全被拒的下场（一条也落不了库，S7b 用 maxOffset 钉死）。
+//! - S5d 对照：定点发到该队列 → 地址解析两步都只认 master，主没了 ⇒ 本端
+//!   `MQClientException("The broker[broker-a] not exist")`、**一条 wire 都不发**
+//!   （Java `sendKernelImpl:919-924` + `findBrokerAddressInPublish:1295-1305`）——
+//!   从节点因此根本收不到写请求（旧版本会打到从节点换一个可重试的 SYSTEM_BUSY(2)，
+//!   白烧一轮重试）；S5c 若漏做，不指定队列的发送就是 3 次 wire 全被拒的下场。
 //! - S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐。
 //! - S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK。
 //!
@@ -56,7 +59,6 @@ use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueu
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PERM};
 use rocketmq_client_remoting::error::{client_error_code, Error};
-use rocketmq_client_remoting::remoting::protocol::codes::response_code;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
 const QUEUES: i32 = 4;
@@ -609,25 +611,34 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     );
 
     // ---------- S5d 对照：定点发送的下场 ----------
-    println!("\nS5d 对照：定点发到该队列 → 从节点拒收（SYSTEM_BUSY=2，可重试码）");
+    println!("\nS5d 对照：定点发到该队列 → 本端报「broker 不存在」，一条 wire 都不发");
     let mq0 = MessageQueue::new(&topic, BROKER_NAME, 0);
     let mut msg3 = Message::new(&topic, Some(b"pinned-to-slave"));
+    let began = Instant::now();
     let pinned = fx.producer.send(&mut msg3, Some(20000), Some(&mq0)).await;
+    let pinned_ms = began.elapsed().as_secs_f64() * 1000.0;
     let pinned_text = match &pinned {
         Ok(r) => format!("Ok(status={:?})", r.status),
         Err(e) => e.to_string(),
     };
+    // 定点发送不走 `sendDefaultImpl` 的队列选择，地址解析是它唯一的路由来源：
+    // 发布地址平表里只有 brokerId=1 ⇒ 刷一次路由仍拿不到 ⇒ 本端立刻报错
+    // （Java `sendKernelImpl:919-924/:1100`），**不像旧版本那样打到从节点**换一个
+    // 可重试的 SYSTEM_BUSY(2)。没有 BrokersSent 后缀 = 一次 send 都没发出去。
     ck.check(
-        "S5d 从节点回 SYSTEM_BUSY(2)（S5c 若漏做，不指定队列的发送就是这个下场）",
+        "S5d 定点发送本端报「The broker[broker-a] not exist」，无 wire 调用（无 BrokersSent）",
         pinned
             .as_ref()
             .err()
-            .and_then(|e| e.response_code())
-            == Some(response_code::SYSTEM_BUSY),
-        &format!(
-            "code={:?}: {pinned_text}",
-            pinned.as_ref().err().and_then(|e| e.response_code())
-        ),
+            .map(|e| {
+                e.to_string().contains(&format!("The broker[{BROKER_NAME}] not exist"))
+                    && e.response_code().is_none()
+                    && !e.to_string().contains("BrokersSent")
+                    && !e.to_string().contains(&fx.slave)
+            })
+            .unwrap_or(false)
+            && pinned_ms < LOCAL_BUDGET_MS,
+        &format!("{pinned_ms:.0}ms {pinned_text}"),
     );
 
     // ---------- S6 (C 端到端) 停窗口内消费 ----------

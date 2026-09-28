@@ -773,11 +773,7 @@ class DefaultMQProducer:
           4. SendMessageHook.after（成功带 sendResult / 失败带 exception）
         重试时每轮都会重建 context，所以钩子会被调用多次 —— 与 Java 一致。
         """
-        broker_addr = ""
-        try:
-            broker_addr = client.broker_addr_of(mq_sel.broker_name) or ""
-        except Exception:  # noqa: BLE001
-            pass
+        broker_addr = client.publish_addr_for(mq_sel.broker_name, mq_sel.topic)
         if self.has_check_forbidden_hook():
             self._execute_check_forbidden(msg, mq_sel, broker_addr, arg, communication_mode)
         # W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖
@@ -1464,26 +1460,11 @@ class DefaultMQProducer:
                            publish) -> None:
         """Java ``sendKernelImpl`` 的 ASYNC 分支：钩子 + 建请求 + 交给 sendMessageAsync。"""
         began = time.monotonic()
-        # 地址解析两步，与 Java ``sendKernelImpl:919-924`` 一致：先查已缓存的发布地址，
-        # 查不到再按 topic 刷一次路由重查。定点发送（调用方给了 mq）不会在
-        # sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，
-        # 第一次定点发送必然拿到空地址。
-        broker_addr = None
-        try:
-            broker_addr = client.broker_addr_of(mq.broker_name)
-        except Exception:  # noqa: BLE001 — 查缓存不该抛，抛了也只是降级成"没查到"
-            pass
-        if not broker_addr:
-            try:
-                route = client.get_topic_route_data(mq.topic)
-                if route is not None:
-                    broker_addr = MQClientInstance.find_broker_addr_in_route(route,
-                                                                            mq.broker_name)
-            except Exception:  # noqa: BLE001 — 刷路由失败交给下面统一报"broker 不存在"
-                pass
-        if not broker_addr:
-            # Java ``sendKernelImpl:1100``
-            raise MQClientException("The broker[%s] not exist" % mq.broker_name)
+        # 地址解析两步，与 Java ``sendKernelImpl:919-924`` 一致：先查已缓存的**发布**地址
+        # （只认 master），查不到再按 topic 刷一次路由重查，仍查不到照 ``:1100`` 报
+        # 「The broker[X] not exist」。定点发送（调用方给了 mq）不会在 sendDefaultImpl
+        # 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，第一次定点发送必然拿到空地址。
+        broker_addr = client.publish_addr_for(mq.broker_name, mq.topic)
         if self.has_check_forbidden_hook():
             self._execute_check_forbidden(msg, mq, broker_addr, None, CommunicationMode.ASYNC)
         if self.enable_trace_context:
@@ -1559,10 +1540,10 @@ class DefaultMQProducer:
                 if selected is not None:
                     retry_mq = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
                     retry_broker = selected.broker_name
-            addr = client.broker_addr_of(retry_broker)
+            addr = client.find_broker_address_in_publish(retry_broker)
             if not addr:
-                # Java onExceptionImpl:725 只查发布地址表、不刷路由；查不到就带着
-                # null 撞进 invokeAsync。这里就地终止，别让 None 传进传输层。
+                # Java onExceptionImpl:725 只查发布地址表（同样只认 master）、不刷路由；
+                # 查不到就带着 null 撞进 invokeAsync。这里就地终止，别让 None 传进传输层。
                 self._complete(callback, None,
                                MQClientException("The broker[%s] not exist" % retry_broker),
                                context)
@@ -1677,13 +1658,11 @@ class DefaultMQProducer:
         # Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
         # （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
         self._topic_publish_info(topic)
-        addr = client.broker_addr_of(handle.broker_name)
+        addr = client.find_broker_address_in_publish(handle.broker_name)
         if addr is None:
-            route = client.get_topic_route_data(topic)
-            for broker_data in route.get_broker_datas() if route else []:
-                addr = broker_data.select_broker_addr()
-                if addr:
-                    break
+            # Java :1586-1594：发布地址表里没有（主掉了 / 是多 proxy 端点）时退到
+            # findBrokerAddrByTopic —— 那条路走 select_broker_addr()，**允许**落到从节点上。
+            addr = client.find_broker_addr_by_topic(topic)
         if addr is None:
             logger.warning("can't find broker service address. %s", handle.broker_name)
             raise MQClientException("The broker service address not found")
@@ -1950,7 +1929,10 @@ class DefaultMQProducer:
             header.bname = broker_name
             header.topic = msg.topic
             header.msg_id = send_result.msg_id
-            broker_addr = client.broker_addr_of(broker_name)
+            # Java endTransaction:1541 用的也是 findBrokerAddressInPublish（只认 master），
+            # 且**不做 null 检查**就直接 oneway；这里保留本端提前报错的守卫（比 Java 的
+            # NPE 干净），但地址来源必须同样是 master-only。
+            broker_addr = client.find_broker_address_in_publish(broker_name)
 
         header.producer_group = self.producer_group
         header.commit_or_rollback = self._transaction_flag(state)
@@ -2059,7 +2041,8 @@ class DefaultMQProducer:
         from ..remoting.protocol.codes import RequestCode
         from ..remoting.protocol.remoting_command import RemotingCommand
         client = self._require_client()
-        addr = client._broker_addr(mq)
+        # Java MQAdminImpl:250：earliestMsgStoreTime 与 max/min/search 同一个形状 —— 只认 master。
+        addr = client._publish_addr_in_admin(mq)
         header = GetEarliestMsgStoretimeRequestHeader()
         header.topic = mq.topic
         header.queue_id = mq.queue_id
@@ -2094,10 +2077,8 @@ class DefaultMQProducer:
 
     @staticmethod
     def _need_addr(client: MQClientInstance, mq: MessageQueue) -> str:
-        addr = client.broker_addr_of(mq.broker_name)
-        if addr is None:
-            raise MQClientException("broker address not found for %s" % mq.broker_name)
-        return addr
+        # 单向发送没有应答，地址只能提前解析；口径同 Java sendKernelImpl（只认 master）
+        return client.publish_addr_for(mq.broker_name, mq.topic)
 
 
 class TransactionMQProducer(DefaultMQProducer):

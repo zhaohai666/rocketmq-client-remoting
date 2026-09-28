@@ -300,7 +300,8 @@ class FakeClient:
         self.invisible_ms = []
         self.acks = []
 
-    def broker_addr_of(self, broker_name):
+    def publish_addr_for(self, broker_name, topic):
+        """POP 的 ack/改不可见时间也走「按 brokerName 只查主」那条（Java ackAsync）。"""
         return "127.0.0.1:10911"
 
     def change_invisible_time(self, group, topic, queue_id, extra_info, offset,

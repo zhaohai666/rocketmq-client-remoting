@@ -585,11 +585,9 @@ public sealed class DefaultMQPullConsumer
     public long EarliestMsgStoreTime(MessageQueue mq)
     {
         MQClientInstance c = RequireClient();
-        string addr = c.BrokerAddrForMq(mq);
-        if (addr.Length == 0)
-        {
-            throw new MQClientException("broker " + mq.BrokerName + " not found");
-        }
+        // Java MQAdminImpl:250（earliestMsgStoreTime）与 max/min/search 同一个形状：
+        // 只认 master，刷一次路由重查，仍拿不到照 :264 抛「The broker[X] not exist」。
+        string addr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
 
         PropertyMap ext = new()
         {
@@ -606,8 +604,9 @@ public sealed class DefaultMQPullConsumer
     /// <summary>
     /// 消息回投（对应 Java DefaultMQPullConsumer.sendMessageBack）。
     /// 注意两点（真机踩过）：
-    /// 1. 地址靠 BrokerAddrOf(msg.BrokerName) 反查**路由表**，所以调用方必须先用本 consumer
-    ///    访问过该 topic（Java 同理，走 findBrokerAddressInPublish 读 brokerAddrTable）。
+    /// 1. 地址靠 FindBrokerAddressInPublish(msg.BrokerName) 反查**发布地址表**（只认 master），
+    ///    所以调用方必须先用本 consumer 访问过该 topic（Java DefaultMQPullConsumerImpl:654
+    ///    走的也是 findBrokerAddressInPublish）。从节点不接 CONSUMER_SEND_MSG_BACK。
     /// 2. 与 Java 的**有意差异**：Java 在失败时会吞掉异常、改用内部默认生产者把消息直接发到
     ///    %RETRY%group（DefaultMQPullConsumerImpl:666 的 catch 分支）。本实现不做这个兜底 ——
     ///    回投失败就抛，让调用方看见，而不是换一条路径静默重发。
@@ -615,10 +614,12 @@ public sealed class DefaultMQPullConsumer
     public void SendMessageBack(MessageExt msg, int delayLevel)
     {
         MQClientInstance c = RequireClient();
-        string addr = c.BrokerAddrOf(msg.BrokerName);
+        // Java DefaultMQPullConsumerImpl:657-658：拿不到发布地址就报
+        // 「Broker[X] master node does not exist」（只认 brokerId=0）。
+        string addr = c.FindBrokerAddressInPublish(msg.BrokerName);
         if (addr.Length == 0)
         {
-            throw new MQClientException("broker " + msg.BrokerName + " not found");
+            throw new MQClientException("Broker[" + msg.BrokerName + "] master node does not exist");
         }
 
         var header = new ConsumerSendMsgBackRequestHeader
