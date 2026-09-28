@@ -16,6 +16,13 @@
 // 报文层面不走捷径：客户端缓存里的平表由**真的** updateTopicRouteInfoFromNameServer 写入
 // （Java :962-964，那是 brokerAddrTable 唯一的写点）。换路由一律改假 name server 的应答再让
 // 客户端自己刷，不往客户端内存里塞值 —— 直接塞等于这条路径没测。
+//
+// 第六到第八组是**订阅口径**的另一半（#104）：`findBrokerAddressInSubscribe(brokerName,
+// MASTER_ID, true)` 的三处调用面 —— 顺序消费的锁（RebalanceImpl#lock:153/lockAll:195，
+// 只认主、**不刷路由**、拿不到整台跳过）、POP 拉取（PullAPIWrapper#popAsync:369-373，
+// 刷一次路由后仍只认主）、消费位点读取（RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241，
+// 刷一次路由后**放宽**到从节点）。三条口径在同一份「只剩从节点」的路由上的表现各不相同，
+// 这正是它们必须分开测的原因。
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +39,7 @@
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "rocketmq/remoting/protocol/json.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/protocol/route.h"
 
@@ -181,6 +189,11 @@ public:
         offset_ = offset;
     }
 
+    void scriptQueryOffset(int64_t offset) {
+        std::lock_guard<std::mutex> lk(state_);
+        queryOffset_ = offset;
+    }
+
     size_t countCode(int32_t code) {
         std::lock_guard<std::mutex> lk(state_);
         size_t n = 0;
@@ -242,6 +255,33 @@ private:
                 std::lock_guard<std::mutex> lk(state_);
                 resp.code = ResponseCode::SUCCESS;
                 resp.extFields["offset"] = std::to_string(offset_);
+            } else if (req.code == RequestCode::QUERY_CONSUMER_OFFSET) {
+                std::lock_guard<std::mutex> lk(state_);
+                resp.code = ResponseCode::SUCCESS;
+                resp.extFields["offset"] = std::to_string(queryOffset_);
+            } else if (req.code == RequestCode::LOCK_BATCH_MQ) {
+                // 回的是请求里点名的队列集（Java LockBatchResponseBody.lockOKMQSet）：
+                // 「锁上了」与「锁请求根本没发」在报文层面可区分，断言才敢说请求到过 master。
+                if (req.hasBody) {
+                    const std::string text(req.body.begin(), req.body.end());
+                    JsonValue root;
+                    std::string err;
+                    if (jsonParse(text, root, &err)) {
+                        const JsonValue* mqSet = root.find("mqSet");
+                        if (mqSet != nullptr) {
+                            JsonValue out = JsonValue::makeObject();
+                            out.set("lockOKMQSet", *mqSet);
+                            const std::string dumped = out.dump();
+                            resp.body = Bytes(dumped.begin(), dumped.end());
+                            resp.hasBody = true;
+                        }
+                    }
+                }
+                resp.code = ResponseCode::SUCCESS;
+            } else if (req.code == RequestCode::POP_MESSAGE) {
+                // 假 broker 对 POP 一律回 POLLING_TIMEOUT(210)：既能证明请求打在主地址上，
+                // 又顺带证明客户端把 210 翻成 PollingNotFound。
+                resp.code = ResponseCode::POLLING_TIMEOUT;
             } else {
                 resp.code = ResponseCode::SUCCESS;
             }
@@ -258,6 +298,7 @@ private:
     std::mutex state_;
     std::map<std::string, Bytes> routes_;
     int64_t offset_ = 0;
+    int64_t queryOffset_ = 0;
     std::vector<ReqRecord> reqs_;
     std::mutex workersM_;
     std::vector<std::thread> workers_;
@@ -403,6 +444,129 @@ void testAdminOffsetQueriesAreMasterOnlyToo() {
     expect(master.lastExt().at("topic") == kTopic, "offset 查询带 topic");
 }
 
+// ------------------------------------------------- 6. 订阅口径（#104 的分界线）
+// Java `findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)` 的三处调用面：
+// 顺序消费的锁（RebalanceImpl#lock/unlock:74-195）、POP 的拉取（PullAPIWrapper#popAsync:369-373）
+// 与消费位点读取（RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）。
+
+void testOrderlyLocksSkipTheBrokerWhenTheMasterIsGone() {
+    MockEndpoint namesrv, master, slave;
+    namesrv.addRoute(kTopic, routeOf(kBroker, onlySlave(slave.address())));
+    auto instance = seeded(namesrv);
+    const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
+    std::vector<MessageQueue> mqs{MessageQueue(kTopic, kBroker, 0),
+                                  MessageQueue(kTopic, kBroker, 1)};
+
+    // Java RebalanceImpl#lock:153 / lockAll:195：发布地址拿不到 => 整台跳过，**不刷路由**。
+    // 退到从节点上锁等于锁在从节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。
+    expect(instance->lockBatchMq("G", kClientId, mqs).empty(),
+           "只剩从节点时一台队列都锁不上");
+    expectInt(static_cast<long long>(
+                  namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
+              0, "锁/解锁不刷路由（与 publishAddrFor 的分界）");
+    instance->unlockBatchMq("G", kClientId, mqs);
+    expectInt(static_cast<long long>(master.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
+              "LOCK_BATCH_MQ 一台没发");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
+              "从节点也不该被锁");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::UNLOCK_BATCH_MQ)), 0,
+              "UNLOCK 同样一台没发");
+
+    // 负控：master 一注册立刻锁上，请求落在**主**地址、返回集来自响应的 lockOKMQSet
+    namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
+    instance->updateTopicRouteInfoFromNameServer(kTopic);
+    std::vector<MessageQueue> locked = instance->lockBatchMq("G", kClientId, mqs);
+    expectInt(static_cast<long long>(locked.size()), 2, "两台队列都锁上了");
+    expect(locked.size() == 2 && locked[0].brokerName == kBroker && locked[0].queueId == 0 &&
+               locked[1].queueId == 1,
+           "返回集是响应里的 lockOKMQSet 原样");
+    expectInt(static_cast<long long>(master.countCode(RequestCode::LOCK_BATCH_MQ)), 1,
+              "LOCK_BATCH_MQ 落在主地址上");
+    instance->unlockBatchMq("G", kClientId, mqs);
+    expectInt(static_cast<long long>(master.countCode(RequestCode::UNLOCK_BATCH_MQ)), 1,
+              "UNLOCK_BATCH_MQ 也落在主地址上");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
+              "从节点始终没被打过");
+}
+
+void testPopMessageIsMasterOnlyAndReportsNotExist() {
+    MockEndpoint namesrv, master, slave;
+    namesrv.addRoute(kTopic, routeOf(kBroker, onlySlave(slave.address())));
+    auto instance = seeded(namesrv);
+    const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
+
+    // Java PullAPIWrapper#popAsync:369-373：只认主 → 刷一次路由 → 仍没有就抛。
+    bool threw = false;
+    try {
+        instance->popMessage("G", kTopic, 0, 32, 30000, 0, 0);
+    } catch (const MQClientException& e) {
+        threw = std::string(e.what()) == "The broker[broker-a] not exist";
+        expectInt(e.getResponseCode(), -1, "not exist 的 responseCode == -1");
+    }
+    expect(threw, "只剩从节点时 POP 报 not exist");
+    expectInt(static_cast<long long>(
+                  namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
+              1, "报错前恰好刷一次路由");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::POP_MESSAGE)), 0,
+              "从节点一台都没收到 POP —— 写请求打到从节点只会换一个 SYSTEM_BUSY(2)");
+
+    // 负控：master 回来之后 POP 打得出去，210 翻成 PollingNotFound
+    namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
+    PopResult result = instance->popMessage("G", kTopic, 0, 32, 30000, 0, 0);
+    expect(result.status == PopStatus::POLLING_NOT_FOUND,
+           "假 broker 回 210 翻成 PollingNotFound");
+    expectInt(static_cast<long long>(master.countCode(RequestCode::POP_MESSAGE)), 1,
+              "POP 落在主地址上");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::POP_MESSAGE)), 0,
+              "从节点始终没被打过");
+}
+
+void testConsumerOffsetFallsBackToTheSlaveAfterARefresh() {
+    MockEndpoint namesrv, master, slave, other;
+    namesrv.addRoute(kTopic, routeOf(kBroker, onlySlave(slave.address())));
+    auto instance = seeded(namesrv);
+    slave.scriptQueryOffset(424242);
+    master.scriptQueryOffset(111);
+    MessageQueue mq(kTopic, kBroker, 0);
+    const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
+
+    // Java RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241：只认主 → 刷一次
+    // 路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制的同一份数据，可以从从节点读）。
+    int64_t offset = 0;
+    expect(instance->queryConsumerOffset("G", mq, offset), "只剩从节点时位点查得到");
+    expectInt(offset, 424242, "刷一次路由后放宽到从节点");
+    expectInt(static_cast<long long>(
+                  namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
+              1, "放宽前恰好刷一次路由");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::QUERY_CONSUMER_OFFSET)), 1,
+              "QUERY_CONSUMER_OFFSET 落在从节点上");
+
+    // 负控：master 在时先打主（主分支不进刷新逻辑，从节点计数冻住）
+    namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
+    instance->updateTopicRouteInfoFromNameServer(kTopic);
+    int64_t masterOffset = 0;
+    expect(instance->queryConsumerOffset("G", mq, masterOffset), "master 在时查得到");
+    expectInt(masterOffset, 111, "位点读主的");
+    expectInt(static_cast<long long>(slave.countCode(RequestCode::QUERY_CONSUMER_OFFSET)), 1,
+              "从节点的计数冻住");
+
+    // 路由里压根没有这个 brokerName：报 not exist，不退到别的 broker 上，也不静默返回 0
+    MockEndpoint ns2;
+    ns2.addRoute(kTopic, routeOf("broker-b", {{MixAll::MASTER_ID, other.address()}}));
+    auto instance2 = seeded(ns2);
+    bool threw = false;
+    int64_t unused = 0;
+    try {
+        instance2->queryConsumerOffset("G", MessageQueue(kTopic, kBroker, 0), unused);
+    } catch (const MQClientException& e) {
+        threw = std::string(e.what()) == "The broker[broker-a] not exist";
+        expectInt(e.getResponseCode(), -1, "not exist 的 responseCode == -1");
+    }
+    expect(threw, "未知 brokerName 同样报 not exist");
+    expectInt(static_cast<long long>(other.countCode(RequestCode::QUERY_CONSUMER_OFFSET)), 0,
+              "别的 broker 一次没被打");
+}
+
 }  // namespace
 
 int main() {
@@ -411,6 +575,9 @@ int main() {
     testPublishAddrForReportsNotExistWhenTheMasterIsGone();
     testPublishAddrForReportsNotExistForAnUnknownBroker();
     testAdminOffsetQueriesAreMasterOnlyToo();
+    testOrderlyLocksSkipTheBrokerWhenTheMasterIsGone();
+    testPopMessageIsMasterOnlyAndReportsNotExist();
+    testConsumerOffsetFallsBackToTheSlaveAfterARefresh();
     std::printf("%d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

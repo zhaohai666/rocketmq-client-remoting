@@ -34,6 +34,11 @@
 //!   （Java `sendKernelImpl:919-924` + `findBrokerAddressInPublish:1295-1305`）——
 //!   从节点因此根本收不到写请求（旧版本会打到从节点换一个可重试的 SYSTEM_BUSY(2)，
 //!   白烧一轮重试）；S5c 若漏做，不指定队列的发送就是 3 次 wire 全被拒的下场。
+//! - S5e (D) 订阅口径：顺序锁整台跳过（`RebalanceImpl#lock:153/lockAll:195` 只认主、
+//!   不刷路由；对照腿证明同一窗口内从节点对该队列照常服务 —— 空锁集不是"从节点不可达"）。
+//! - S5f (E) 订阅口径：POP 本端报「broker 不存在」（`PullAPIWrapper#popAsync:369-373`）。
+//! - S5g (F) 位点读取：冷实例（缓存里没这个 topic）刷一次路由后**放宽**到从节点
+//!   （`RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`）。
 //! - S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐。
 //! - S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK。
 //!
@@ -641,10 +646,109 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &format!("{pinned_ms:.0}ms {pinned_text}"),
     );
 
+    // ---------- S5e (D) 订阅口径：顺序锁只认主 ----------
+    // Java `RebalanceImpl#lock:153 / lockAll:195` 走 findBrokerAddressInSubscribe(brokerName,
+    // MASTER_ID, true)：只认主、**不刷路由**，拿不到就整台跳过。退到从节点上锁等于锁在从
+    // 节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。此刻 admin 实例的路由缓存
+    // 已被 S2 刷成 masterless 形状，任何"退让"口径都会落到从节点上并拿回非空锁集。
+    println!("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）");
+    let group = format!("GID_PrMasterRs_{}", fx.stamp);
+    let client_id = format!("pr_master_rs_lock_{}", fx.stamp);
+    let lock_mqs = vec![MessageQueue::new(&topic, BROKER_NAME, 0)];
+    let began = Instant::now();
+    let locks = match fx.admin.lock_batch_mq(&group, &client_id, &lock_mqs, 3000).await {
+        Ok(l) => l,
+        Err(e) => {
+            println!("    (lock_batch_mq 失败: {e})");
+            Vec::new()
+        }
+    };
+    let lock_ms = began.elapsed().as_secs_f64() * 1000.0;
+    ck.check(
+        "S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+        locks.is_empty() && lock_ms < LOCAL_BUDGET_MS,
+        &format!(
+            "{lock_ms:.0}ms locked={:?}",
+            locks.iter().map(|q| (&q.broker_name, q.queue_id)).collect::<Vec<_>>()
+        ),
+    );
+    // 对照腿：同一窗口内从节点对该队列照常服务（本端口的 invoke_sync 不开放给 example，
+    // 打不出"点名从节点锁一把"的原始报文；用从节点仍在服务同一条队列来排除
+    // "空锁集是因为从节点不可达"这一解释）。
+    let slave_serving = fx
+        .admin
+        .get_max_offset(&lock_mqs[0], 5000, Some(&fx.slave))
+        .await;
+    ck.check(
+        "S5e2 对照：窗口内从节点对该队列照常服务（空集不是从节点不可达）",
+        matches!(slave_serving, Ok(v) if v >= 1),
+        &format!("slave maxOffset={slave_serving:?}"),
+    );
+    let began = Instant::now();
+    let _ = fx.admin.unlock_batch_mq(&group, &client_id, &lock_mqs, 3000).await;
+    let unlock_ms = began.elapsed().as_secs_f64() * 1000.0;
+    ck.check(
+        "S5e3 解锁同样安静跳过（不抛、不发）",
+        unlock_ms < LOCAL_BUDGET_MS,
+        &format!("{unlock_ms:.0}ms"),
+    );
+
+    // ---------- S5f (E) 订阅口径：POP 只认主 ----------
+    println!("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）");
+    let began = Instant::now();
+    let pop = fx
+        .admin
+        .pop_message(
+            &group, &topic, 0, 1, 30000, 100, 0, None, None, false, None, 5000, None,
+        )
+        .await;
+    let pop_ms = began.elapsed().as_secs_f64() * 1000.0;
+    let pop_text = match &pop {
+        Ok(r) => format!("Ok(status={:?})", r.status),
+        Err(e) => e.to_string(),
+    };
+    ck.check(
+        "S5f 停窗口内 POP 本端报「The broker[broker-a] not exist」（不是从节点回的错）",
+        pop.as_ref()
+            .err()
+            .map(|e| {
+                e.to_string().contains(&format!("The broker[{BROKER_NAME}] not exist"))
+                    && e.response_code().is_none()
+            })
+            .unwrap_or(false)
+            && pop_ms < LOCAL_BUDGET_MS,
+        &format!("{pop_ms:.0}ms {pop_text}"),
+    );
+
+    // ---------- S5g (F) 位点读取：刷一次路由后放宽到从节点 ----------
+    // Java `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`：只认主 → 刷一次
+    // 路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制来的同一份数据，可以从从节点
+    // 读）。冷实例（路由缓存里没有这个 topic）是这条路径最纯的形状：旧的 `_broker_addr`
+    // 口径在此直接报「No route info of this topic」，连刷新都没有。
+    println!("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点");
+    let cold = MQClientInstance::new(
+        &format!("pr_master_rs_cold_{}", fx.stamp),
+        vec![fx.namesrv.clone()],
+    );
+    let began = Instant::now();
+    let off = cold
+        .query_consumer_offset(&group, &lock_mqs[0], 5000, None, false)
+        .await;
+    let cold_ms = began.elapsed().as_secs_f64() * 1000.0;
+    let cold_text = match &off {
+        Ok(v) => format!("offset={v:?}"),
+        Err(e) => e.to_string(),
+    };
+    ck.check(
+        "S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复",
+        off.is_ok(),
+        &format!("{cold_ms:.0}ms {cold_text}"),
+    );
+    cold.shutdown();
+
     // ---------- S6 (C 端到端) 停窗口内消费 ----------
     println!("\nS6 停窗口内新起的 push 消费者：{QUEUES} 条队列 + 从从节点收齐预埋的 {QUEUES} 条");
     let sink = Sink::new();
-    let group = format!("GID_PrMasterRs_{}", fx.stamp);
     let consumer = match fx.build_consumer(&group, sink.clone()) {
         Ok(c) => c,
         Err(e) => {

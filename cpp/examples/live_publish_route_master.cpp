@@ -38,6 +38,11 @@
 //       「The broker[broker-a] not exist」，也无 wire（漏掉 (B) 这条对照时的旧行为：
 //       请求打到从节点上，broker 回 SYSTEM_BUSY(2)，一个可重试码 —— 白烧一整轮重试，
 //       错误类型也和 Java 不一样）。两条腿合起来是「无 wire」，落库与否由 S7b 钉死。
+//   S5e (D) 订阅口径：顺序锁整台跳过（RebalanceImpl#lock:153/lockAll:195 只认主、不刷路由；
+//       对照腿直接点名从节点，证明从节点**本来**发得出锁 —— 空集是客户端没去，不是 broker 拒绝）。
+//   S5f (E) 订阅口径：POP 本端报「broker 不存在」（PullAPIWrapper#popAsync:369-373），不发 wire。
+//   S5g (F) 位点读取：冷实例（缓存里没这个 topic）刷一次路由后**放宽**到从节点
+//       （RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）。
 //   S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐。
 //   S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK。
 //
@@ -66,7 +71,10 @@
 #include "rocketmq/client/result.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/mix_all.h"
+#include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/heartbeat.h"
+#include "rocketmq/remoting/protocol/json.h"
+#include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/protocol/route.h"
 
 using namespace rocketmq;
@@ -500,9 +508,128 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
               pinnedMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(pinnedMs)) + "ms " + pinnedText);
 
+    // ---------------- S5e (D) 订阅口径：顺序锁只认主 ----------------
+    // Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(brokerName,
+    // MASTER_ID, true)：只认主、**不刷路由**，拿不到就整台跳过。退到从节点上锁等于锁在
+    // 从节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。此刻 admin 实例的路由
+    // 缓存已被 S2 刷成 masterless 形状，任何"退让"口径都会落到从节点上并拿回非空锁集，
+    // 所以空集 + S5e2 对照腿足以说明客户端压根没去。
+    std::printf("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）\n");
+    const std::string group = "GID_PrMasterCpp_" + fx.stamp;
+    const std::string clientId = "pr_master_cpp_lock_" + fx.stamp;
+    const std::vector<MessageQueue> lockMqs{MessageQueue(topic, kBrokerName, 0)};
+    const double lockBegin = monotonicSeconds();
+    std::vector<MessageQueue> locks;
+    try {
+        locks = fx.admin.client().lockBatchMq(group, clientId, lockMqs, 3000);
+    } catch (const std::exception& e) {
+        std::printf("    (lockBatchMq 抛异常: %s)\n", e.what());
+    }
+    const double lockMs = (monotonicSeconds() - lockBegin) * 1000.0;
+    check("S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+          locks.empty() && lockMs < kLocalBudgetMs,
+          std::to_string(static_cast<int>(lockMs)) + "ms locked=[" + fmtQueues(locks) + "]");
+
+    // 对照腿：同一份报文直接点名从节点 —— 从节点**本来**就会把锁发出来
+    JsonValue lockBody = JsonValue::makeObject();
+    lockBody.set("consumerGroup", JsonValue::makeString(group));
+    lockBody.set("clientId", JsonValue::makeString(clientId));
+    JsonValue mqArr = JsonValue::makeArray();
+    JsonValue mqObj = JsonValue::makeObject();
+    mqObj.set("topic", JsonValue::makeString(topic));
+    mqObj.set("brokerName", JsonValue::makeString(kBrokerName));
+    mqObj.set("queueId", JsonValue::makeInt(0));
+    mqArr.pushArray(mqObj);
+    lockBody.set("mqSet", mqArr);
+    const std::string lockBodyText = lockBody.dump();
+    const Bytes lockPayload(lockBodyText.begin(), lockBodyText.end());
+    int64_t slaveOk = -1;
+    try {
+        RemotingCommand resp = fx.admin.client().invokeSyncRaw(
+            fx.slave, RequestCode::LOCK_BATCH_MQ, PropertyMap(), lockPayload, true, 3000);
+        if (resp.hasBody) {
+            JsonValue root;
+            std::string err;
+            if (jsonParse(std::string(resp.body.begin(), resp.body.end()), root, &err)) {
+                const JsonValue* okSet = root.find("lockOKMQSet");
+                if (okSet != nullptr && okSet->isArray()) {
+                    slaveOk = static_cast<int64_t>(okSet->size());
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::printf("    (从节点锁请求抛异常: %s)\n", e.what());
+    }
+    check("S5e2 对照：点名从节点时锁发得出来（空集不是 broker 拒绝）", slaveOk == 1,
+          "slave lockOKMQSet=" + std::to_string(slaveOk));
+    // 对照腿锁上的那把要还回去（从节点的锁管理器不会有人来解）
+    try {
+        fx.admin.client().invokeSyncRaw(fx.slave, RequestCode::UNLOCK_BATCH_MQ, PropertyMap(),
+                                        lockPayload, true, 3000);
+    } catch (const std::exception&) {
+    }
+
+    const double unlockBegin = monotonicSeconds();
+    try {
+        fx.admin.client().unlockBatchMq(group, clientId, lockMqs, 3000);
+    } catch (const std::exception& e) {
+        std::printf("    (unlockBatchMq 抛异常: %s)\n", e.what());
+    }
+    const double unlockMs = (monotonicSeconds() - unlockBegin) * 1000.0;
+    check("S5e3 解锁同样安静跳过（不抛、不发）", unlockMs < kLocalBudgetMs,
+          std::to_string(static_cast<int>(unlockMs)) + "ms");
+
+    // ---------------- S5f (E) 订阅口径：POP 只认主 ----------------
+    // Java PullAPIWrapper#popAsync:369-373：只认主 → 刷一次路由 → 仍没有就本端抛。从节点
+    // 不接 POP 这族写请求（ack / 延长不可见时间要落在 broker 侧 revive 表上），退过去只会
+    // 换一个可重试的 SYSTEM_BUSY(2)，白烧一轮。
+    std::printf("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）\n");
+    const double popBegin = monotonicSeconds();
+    std::string popText;
+    bool popFailed = false;
+    bool popIsClientError = false;
+    try {
+        PopResult popResult = fx.admin.client().popMessage(group, topic, 0, 1, 30000, 100, 0);
+        popText = std::string("Ok(status=") + popStatusName(popResult.status) + ")";
+    } catch (const MQClientException& e) {
+        popFailed = true;
+        popIsClientError = true;
+        popText = e.what();
+    } catch (const std::exception& e) {
+        popFailed = true;
+        popText = e.what();
+    }
+    const double popMs = (monotonicSeconds() - popBegin) * 1000.0;
+    check("S5f 停窗口内 POP 本端报「The broker[broker-a] not exist」（不是从节点回的错）",
+          popFailed && popIsClientError &&
+              popText == "The broker[" + std::string(kBrokerName) + "] not exist" &&
+              popMs < kLocalBudgetMs,
+          std::to_string(static_cast<int>(popMs)) + "ms " + popText);
+
+    // ---------------- S5g (F) 位点读取：刷一次路由后放宽到从节点 ----------------
+    // Java RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241：只认主 → 刷一次
+    // 路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制来的同一份数据，可以从从
+    // 节点读）。冷实例（路由缓存里没有这个 topic）是这条路径最纯的形状：旧口径在此直接报
+    // 「No route info of this topic」，连刷新都没有。
+    std::printf("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点\n");
+    {
+        MQClientInstance cold("pr_master_cpp_cold_" + fx.stamp,
+                              std::vector<std::string>{fx.namesrv});
+        std::string coldDetail;
+        bool coldOk = false;
+        try {
+            int64_t off = 0;
+            const bool found = cold.queryConsumerOffset(group, MessageQueue(topic, kBrokerName, 0), off);
+            coldOk = true;
+            coldDetail = found ? ("offset=" + std::to_string(off)) : "offset=None(QUERY_NOT_FOUND)";
+        } catch (const std::exception& e) {
+            coldDetail = e.what();
+        }
+        check("S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复", coldOk, coldDetail);
+    }
+
     // ---------------- S6 (C 端到端) 停窗口内消费 ----------------
     std::printf("\nS6 停窗口内新起的 push 消费者：4 条队列 + 从从节点收齐预埋的 4 条\n");
-    const std::string group = "GID_PrMasterCpp_" + fx.stamp;
     BodySink sink;
     consumer = std::make_shared<DefaultMQPushConsumer>(group);
     consumer->setNamesrvAddr(fx.namesrv);

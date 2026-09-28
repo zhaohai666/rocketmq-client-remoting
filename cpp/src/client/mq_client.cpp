@@ -642,6 +642,52 @@ std::string MQClientInstance::publishAddrInAdmin(const MessageQueue& mq) {
     return publishAddrFor(mq.brokerName, mq.topic);
 }
 
+std::string MQClientInstance::resolvePopAddr(const std::string& topic, std::string& brokerName,
+                                             const std::string& addrIn) {
+    // Java 的 POP 三兄弟共用同一条地址口径：`PullAPIWrapper#popAsync:369-373`、
+    // `DefaultMQPushConsumerImpl#ackAsync:820-825` / `changePopInvisibleTimeAsync:869-876`
+    // 全是 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— **只认主**，
+    // 查不到按 topic 刷一次路由再查，仍查不到抛「The broker[X] not exist」。
+    // 不能退到从节点：从节点不接 POP 这族写请求（ack / 延长不可见时间都要落在 broker
+    // 侧的 revive 表上），退过去只会换一个可重试的 SYSTEM_BUSY(2)。
+    if (brokerName.empty()) {
+        // 调用方连 brokerName 都没给（admin 式的「认该 topic 的任意队列」）：先按路由挑
+        // 一台，挑完照样只认它的 master。Java 那边 ack 的 brokerName 来自 CK 串第 6 段，
+        // POP 的来自调用方给的队列，都有值；只有本端这个便利口径会走到这里。
+        auto route = getTopicRouteData(topic);
+        if (route == nullptr) {
+            throw MQClientNoRouteException(topic);
+        }
+        if (route->brokerDatas.empty()) {
+            throw MQClientException("No broker in route of topic: " + topic);
+        }
+        brokerName = route->brokerDatas.front().brokerName;
+    }
+    if (!addrIn.empty()) {
+        return addrIn;  // 调用方点名了地址：只借路由把 brokerName 补上，不动地址
+    }
+    return publishAddrFor(brokerName, topic);
+}
+
+std::string MQClientInstance::consumerOffsetAddr(const MessageQueue& mq) {
+    // Java `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241` 的地址口径：
+    // 先**只认主**（findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)）→ 查不到
+    // 按 topic 刷一次路由 → 重查时**放宽**（onlyThisBroker=false，可以落到从节点：位点是
+    // HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛「The broker[X] not exist」。
+    //
+    // 与 publishAddrInAdmin 的差别只在最后那一步：管理侧的 offset 查询一律打主、主没了就
+    // 报错；位点读取允许退到从节点。
+    std::string addr = findBrokerAddressInPublish(mq.brokerName);
+    if (addr.empty()) {
+        updateTopicRouteInfoFromNameServer(mq.topic, 5000, false);
+        addr = brokerAddrOf(mq.brokerName);
+    }
+    if (addr.empty()) {
+        throw MQClientException("The broker[" + mq.brokerName + "] not exist", -1);
+    }
+    return addr;
+}
+
 std::vector<std::string> MQClientInstance::getRouteOfAllBrokers() {
     std::vector<std::string> addrs;
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
@@ -990,30 +1036,6 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
 
 // ---------------------------------------------------------------- POP 模式
 
-namespace {
-
-// 从 topic 路由解析出 (brokerName, addr)。调用方可能已给定其中之一。
-void resolveBrokerFromRoute(const TopicRouteData& route, const std::string& topic,
-                            std::string& brokerName, std::string& addr) {
-    if (brokerName.empty()) {
-        if (route.brokerDatas.empty()) {
-            throw MQClientException("No broker in route of topic: " + topic);
-        }
-        brokerName = route.brokerDatas.front().brokerName;
-    }
-    if (addr.empty()) {
-        addr = MQClientInstance::findBrokerAddrInRoute(route, brokerName);
-        if (addr.empty() && !route.brokerDatas.empty()) {
-            addr = route.brokerDatas.front().selectBrokerAddr();
-        }
-        if (addr.empty()) {
-            throw MQClientException("No available broker addr for topic: " + topic);
-        }
-    }
-}
-
-}  // namespace
-
 // 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME。
 //
 // **这是 POP 最容易踩的坑**：普通 topic 直连 POP 时 broker **不写** POP_CK 属性
@@ -1121,14 +1143,7 @@ PopResult MQClientInstance::popMessage(const std::string& consumerGroup, const s
                                        int32_t timeoutMillis, const std::string& brokerNameIn,
                                        const std::string& addrIn) {
     std::string brokerName = brokerNameIn;
-    std::string addr = addrIn;
-    if (brokerName.empty() || addr.empty()) {
-        auto route = getTopicRouteData(topic);
-        if (route == nullptr) {
-            throw MQClientNoRouteException(topic);
-        }
-        resolveBrokerFromRoute(*route, topic, brokerName, addr);
-    }
+    const std::string addr = resolvePopAddr(topic, brokerName, addrIn);
 
     auto header = std::make_shared<PopMessageRequestHeader>();
     header->consumerGroup = consumerGroup;
@@ -1196,14 +1211,7 @@ int32_t MQClientInstance::ackMessage(const std::string& consumerGroup, const std
         // 与 Java 一致：从 CK 串第 6 段取 brokerName（ACK 是靠它找地址的）
         brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
     }
-    std::string addr = addrIn;
-    if (addr.empty()) {
-        auto route = getTopicRouteData(topic);
-        if (route == nullptr) {
-            throw MQClientNoRouteException(topic);
-        }
-        resolveBrokerFromRoute(*route, topic, brokerName, addr);
-    }
+    const std::string addr = resolvePopAddr(topic, brokerName, addrIn);
 
     auto header = std::make_shared<AckMessageRequestHeader>();
     header->consumerGroup = consumerGroup;
@@ -1226,14 +1234,7 @@ ChangeInvisibleTimeResult MQClientInstance::changeInvisibleTime(
     if (brokerName.empty() && !extraInfo.empty()) {
         brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
     }
-    std::string addr = addrIn;
-    if (addr.empty()) {
-        auto route = getTopicRouteData(topic);
-        if (route == nullptr) {
-            throw MQClientNoRouteException(topic);
-        }
-        resolveBrokerFromRoute(*route, topic, brokerName, addr);
-    }
+    const std::string addr = resolvePopAddr(topic, brokerName, addrIn);
 
     auto header = std::make_shared<ChangeInvisibleTimeRequestHeader>();
     header->consumerGroup = consumerGroup;
@@ -1270,7 +1271,7 @@ bool MQClientInstance::queryConsumerOffset(const std::string& consumerGroup,
                                           const MessageQueue& mq, int64_t& outOffset,
                                           int32_t timeoutMillis, const std::string& addrIn,
                                           bool setZeroIfNotFound) {
-    std::string addr = addrIn.empty() ? brokerAddr(mq) : addrIn;
+    std::string addr = addrIn.empty() ? consumerOffsetAddr(mq) : addrIn;
     auto header = std::make_shared<QueryConsumerOffsetRequestHeader>();
     header->consumerGroup = consumerGroup;
     header->topic = mq.topic;
@@ -1337,7 +1338,11 @@ std::vector<MessageQueue> MQClientInstance::lockBatchMq(const std::string& consu
         byBroker[mq.brokerName].push_back(mq);
     }
     for (const auto& kv : byBroker) {
-        std::string addr = brokerAddrOf(kv.first);
+        // Java RebalanceImpl#lock:153 / lockAll:195 走
+        // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— 只认主、**不刷路由**，
+        // 拿不到就整台跳过（队列这一轮锁不上，等下一次重投）。退到从节点上锁等于锁在
+        // broker 侧的锁管理器里，master 不知情，顺序消费的互斥保证静默失效。
+        std::string addr = findBrokerAddressInPublish(kv.first);
         if (addr.empty()) {
             continue;
         }
@@ -1385,7 +1390,8 @@ void MQClientInstance::unlockBatchMq(const std::string& consumerGroup,
         byBroker[mq.brokerName].push_back(mq);
     }
     for (const auto& kv : byBroker) {
-        std::string addr = brokerAddrOf(kv.first);
+        // 同 lockBatchMq：Java RebalanceImpl#unlock:74 / unlockAll:104 只认主、不刷路由。
+        std::string addr = findBrokerAddressInPublish(kv.first);
         if (addr.empty()) {
             continue;
         }

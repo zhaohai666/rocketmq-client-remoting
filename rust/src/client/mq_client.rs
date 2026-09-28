@@ -2081,8 +2081,14 @@ impl MQClientInstance {
 // ================================================================ POP / ACK / 不可见时间
 
 impl MQClientInstance {
-    /// Python `pop_message` 的 addr / brokerName 解析段：任一缺失就查路由，
-    /// 取路由里的**第一台** broker。
+    /// Python `pop_message` 的 addr / brokerName 解析段。
+    ///
+    /// 调用方没给 brokerName 时（「弹该 topic 的任意队列」）按路由挑**第一台**；
+    /// 地址本身走 Java `PullAPIWrapper#popAsync:369-373` 的订阅口径：
+    /// `findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)` —— **只认主**，
+    /// 查不到按 topic 刷一次路由再查，仍查不到抛「The broker[X] not exist」。
+    /// 不能退到从节点：从节点不接 POP 这族写请求（ack / 延长不可见时间都要落在 broker
+    /// 侧的 revive 表上），退过去只会换一个可重试的 SYSTEM_BUSY(2)。见 [`Self::publish_addr_for`]。
     async fn pop_target(
         &self,
         topic: &str,
@@ -2090,23 +2096,22 @@ impl MQClientInstance {
         addr: Option<&str>,
     ) -> Result<(String, String)> {
         let broker_name = broker_name.filter(|s| !s.is_empty());
-        if let (Some(a), Some(b)) = (addr, broker_name) {
-            return Ok((a.to_string(), b.to_string()));
-        }
-        let route = self
-            .get_topic_route_data(topic)
-            .await
-            .ok_or_else(|| Error::client(format!("No route info of this topic: {topic}")))?;
-        let brokers = route.get_broker_datas();
-        let Some(bd) = brokers.first() else {
-            bail!("No broker in route of topic: {topic}");
+        let broker_name = match broker_name {
+            Some(b) => b.to_string(),
+            None => {
+                let route = self.get_topic_route_data(topic).await.ok_or_else(|| {
+                    Error::client(format!("No route info of this topic: {topic}"))
+                })?;
+                let Some(bd) = route.get_broker_datas().first() else {
+                    bail!("No broker in route of topic: {topic}");
+                };
+                // 先按路由挑一台，挑完照样只认它的 master
+                bd.broker_name.clone()
+            }
         };
-        let broker_name = broker_name.unwrap_or(&bd.broker_name).to_string();
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => bd
-                .select_broker_addr()
-                .ok_or_else(|| Error::client(format!("No available broker addr for topic: {topic}")))?,
+            None => self.publish_addr_for(&broker_name, topic).await?,
         };
         Ok((addr, broker_name))
     }
@@ -2629,6 +2634,26 @@ impl MQClientInstance {
             .collect()
     }
 
+    /// Python `_consumer_offset_addr`：Java
+    /// `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241` 的地址口径。
+    ///
+    /// 先**只认主**（`findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)`）→
+    /// 查不到按 topic 刷一次路由 → 重查时**放宽**（`onlyThisBroker=false`，可以落到从
+    /// 节点：位点是 HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛
+    /// `MQClientException("The broker[X] not exist", null)`。
+    ///
+    /// 与 [`Self::publish_addr_in_admin`] 的差别只在最后那一步：管理侧的 offset 查询
+    /// 一律打主、主没了就报错；位点读取允许退到从节点。
+    async fn consumer_offset_addr(&self, mq: &MessageQueue) -> Result<String> {
+        let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
+        if addr.is_none() {
+            self.update_topic_route_info_from_name_server(&mq.topic, 5000, false)
+                .await?;
+            addr = self.broker_addr_of(&mq.broker_name);
+        }
+        addr.ok_or_else(|| Error::client(format!("The broker[{}] not exist", mq.broker_name)))
+    }
+
     // ---------------- Offset 查询 / 更新 ----------------
 
     /// Python `query_consumer_offset`：`QUERY_NOT_FOUND(22)` ⇒ `None`（Python 直接 return，
@@ -2643,7 +2668,7 @@ impl MQClientInstance {
     ) -> Result<Option<i64>> {
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.broker_addr(mq).await?,
+            None => self.consumer_offset_addr(mq).await?,
         };
         let header = QueryConsumerOffsetRequestHeader {
             consumer_group: Some(consumer_group.to_string()),
@@ -3010,7 +3035,12 @@ impl MQClientInstance {
     ) -> Result<Vec<MessageQueue>> {
         let mut lock_ok: Vec<MessageQueue> = Vec::new();
         for (broker_name, broker_mqs) in Self::group_by_broker(mqs) {
-            let Some(addr) = self.broker_addr_of(&broker_name) else {
+            // Java `RebalanceImpl#lock:153 / lockAll:195` 走
+            // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— 只认主、
+            // **不刷路由**，拿不到就整台跳过（队列这一轮锁不上，等下一次重投）。
+            // 退到从节点上锁等于锁在 broker 侧的锁管理器里，master 不知情，
+            // 顺序消费的互斥保证静默失效。
+            let Some(addr) = self.find_broker_address_in_publish(&broker_name) else {
                 continue;
             };
             let body = LockBatchRequestBody {
@@ -3054,7 +3084,9 @@ impl MQClientInstance {
         timeout_millis: i64,
     ) -> Result<()> {
         for (broker_name, broker_mqs) in Self::group_by_broker(mqs) {
-            let Some(addr) = self.broker_addr_of(&broker_name) else {
+            // 同 `lock_batch_mq`：Java `RebalanceImpl#unlock:74 / unlockAll:104`
+            // 只认主、不刷路由。
+            let Some(addr) = self.find_broker_address_in_publish(&broker_name) else {
                 continue;
             };
             let body = UnlockBatchRequestBody {
@@ -4601,6 +4633,8 @@ mod tests {
         /// 脚本：下一笔应答的 extFields（用完为空表）。PULL_MESSAGE 的
         /// `suggestWhichBrokerId` / `nextBeginOffset` 之类都靠它上线。
         resp_ext: ExtFieldsQueue,
+        /// 脚本：下一笔应答的 body（用完不回 body）。锁集之类的回包靠它上线。
+        resp_body: Arc<Mutex<VecDeque<Vec<u8>>>>,
     }
 
     impl MockBroker {
@@ -4619,6 +4653,7 @@ mod tests {
                 codes: Arc::new(Mutex::new(VecDeque::new())),
                 remarks: Arc::new(Mutex::new(VecDeque::new())),
                 resp_ext: Arc::new(Mutex::new(VecDeque::new())),
+                resp_body: Arc::new(Mutex::new(VecDeque::new())),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -4634,6 +4669,7 @@ mod tests {
                             let code = guard(&broker.codes).pop_front();
                             let remark = guard(&broker.remarks).pop_front();
                             let ext = guard(&broker.resp_ext).pop_front().unwrap_or_default();
+                            let body = guard(&broker.resp_body).pop_front();
                             guard(&broker.state).push(Recorded {
                                 code: request.code,
                                 ext_fields: request
@@ -4649,6 +4685,7 @@ mod tests {
                                 code.unwrap_or(response_code::SUCCESS),
                                 remark,
                                 ext,
+                                body,
                             )
                             .await;
                         }
@@ -4666,6 +4703,11 @@ mod tests {
         /// 脚本化后续应答的 extFields（缺省空表，与改造前行为一致）。
         fn script_resp_ext(&self, exts: Vec<Vec<(String, String)>>) {
             *guard(&self.resp_ext) = exts.into();
+        }
+
+        /// 脚本化后续应答的 body（缺省不回 body）。
+        fn script_resp_body(&self, bodies: Vec<Vec<u8>>) {
+            *guard(&self.resp_body) = bodies.into();
         }
 
         /// 只保留 46 号请求：路由刷新等副作用不该混进断言。
@@ -4715,6 +4757,7 @@ mod tests {
         code: i32,
         remark: Option<String>,
         ext_fields: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
     ) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt as _;
         let mut response = RemotingCommand::create_response(code, remark);
@@ -4724,6 +4767,7 @@ mod tests {
         for (k, v) in ext_fields {
             response.ext_fields_mut().insert(&k, v);
         }
+        response.set_body(body);
         let bytes = response.encode();
         stream.write_all(&bytes).await?;
         stream.flush().await
@@ -5569,5 +5613,216 @@ mod tests {
         assert_eq!(master.recorded(request_code::GET_MAX_OFFSET).len(), 1);
         assert!(slave.recorded(request_code::GET_MAX_OFFSET).is_empty());
         instance.shutdown();
+    }
+
+    // ------------------------------------ 订阅口径（Java findBrokerAddressInSubscribe(MASTER_ID, true)）
+    //
+    // Java 的四处调用点形状一致（RebalanceImpl#unlock:74 / unlockAll:104 / #lock:153 /
+    // #lockAll:195、PullAPIWrapper#popAsync:369-373、RemoteBrokerOffsetStore#
+    // fetchConsumeOffsetFromBroker:237-241）：只认主、**不刷路由**；只有 POP 与位点查询在
+    // 查不到时补一次 updateTopicRouteInfoFromNameServer(topic)，且位点查询的**重查**放宽到
+    // 从节点（onlyThisBroker=false），POP 的重查仍只认主。
+
+    /// Java `RebalanceImpl#lock:153 / lockAll:195`（解锁 `:74/:104`）：只认主、不刷路由。
+    ///
+    /// 路由里只剩从节点时 LOCK/UNLOCK 一条都不该上线：从节点上锁等于锁在它自己的锁管理器里，
+    /// master 不知情，顺序消费的互斥保证静默失效。
+    #[tokio::test]
+    async fn orderly_locks_skip_the_broker_when_the_master_is_gone() {
+        let namesrv = RouteNamesrv::start().await;
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64 + 1, &slave.addr)],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+        let before = namesrv.route_requests();
+        let mqs = vec![
+            MessageQueue::new(TOPIC, BROKER, 0),
+            MessageQueue::new(TOPIC, BROKER, 1),
+        ];
+
+        assert!(instance
+            .lock_batch_mq(GROUP, "cid", &mqs, 3000)
+            .await
+            .expect("整台跳过不算错")
+            .is_empty());
+        instance
+            .unlock_batch_mq(GROUP, "cid", &mqs, 3000)
+            .await
+            .expect("整台跳过不算错");
+        assert!(slave.recorded(request_code::LOCK_BATCH_MQ).is_empty());
+        assert!(slave.recorded(request_code::UNLOCK_BATCH_MQ).is_empty());
+        // 也不许刷路由：Java 的 lock/unlock 直接 findBrokerAddressInSubscribe(false) 收场，
+        // 没有发送路径上的那一次 tryToFindTopicPublishInfo
+        assert_eq!(namesrv.route_requests(), before);
+
+        // 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[
+                (MixAll::MASTER_ID as i64, &master.addr),
+                (MixAll::MASTER_ID as i64 + 1, &slave.addr),
+            ],
+        )));
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+        master.script_resp_body(vec![LockBatchResponseBody {
+            lock_ok_mq_set: vec![
+                MessageQueueKey::new(TOPIC, BROKER, 0),
+                MessageQueueKey::new(TOPIC, BROKER, 1),
+            ],
+        }
+        .encode()]);
+        let locked = instance
+            .lock_batch_mq(GROUP, "cid", &mqs, 3000)
+            .await
+            .expect("主回来就锁得上");
+        assert_eq!(
+            locked
+                .iter()
+                .map(|m| (m.topic.as_str(), m.broker_name.as_str(), m.queue_id))
+                .collect::<Vec<_>>(),
+            vec![(TOPIC, BROKER, 0), (TOPIC, BROKER, 1)]
+        );
+        instance
+            .unlock_batch_mq(GROUP, "cid", &mqs, 3000)
+            .await
+            .expect("主回来就解得开");
+        assert_eq!(master.recorded(request_code::LOCK_BATCH_MQ).len(), 1);
+        assert_eq!(master.recorded(request_code::UNLOCK_BATCH_MQ).len(), 1);
+        assert!(slave.recorded(request_code::LOCK_BATCH_MQ).is_empty());
+        assert!(slave.recorded(request_code::UNLOCK_BATCH_MQ).is_empty());
+        instance.shutdown();
+    }
+
+    /// Java `PullAPIWrapper#popAsync:369-373`：POP 只认主，查不到刷一次路由再查，仍抛 not exist。
+    #[tokio::test]
+    async fn pop_message_is_master_only_and_reports_not_exist() {
+        let namesrv = RouteNamesrv::start().await;
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64 + 1, &slave.addr)],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+        let before = namesrv.route_requests();
+
+        let err = instance
+            .pop_message(
+                GROUP, TOPIC, 0, 1, 30000, 1000, 0, None, None, false, Some(BROKER), 3000, None,
+            )
+            .await
+            .expect_err("没有主就没有可弹的 broker");
+        assert_broker_not_exist(&err);
+        // 报错前必须刷过一次路由（popAsync 的 findBrokerAddressInSubscribe + 重查）
+        assert_eq!(namesrv.route_requests(), before + 1);
+        assert!(slave.recorded(request_code::POP_MESSAGE).is_empty());
+
+        // 负控：主注册后（这一发顺带触发一次路由刷新）请求落在主地址上，从节点一条没有
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[
+                (MixAll::MASTER_ID as i64, &master.addr),
+                (MixAll::MASTER_ID as i64 + 1, &slave.addr),
+            ],
+        )));
+        master.script(vec![response_code::POLLING_TIMEOUT], vec![String::new()]);
+        let result = instance
+            .pop_message(
+                GROUP, TOPIC, 0, 1, 30000, 1000, 0, None, None, false, Some(BROKER), 3000, None,
+            )
+            .await
+            .expect("主回来就弹得动");
+        assert_eq!(result.status, PopStatus::PollingNotFound);
+        assert_eq!(master.recorded(request_code::POP_MESSAGE).len(), 1);
+        assert!(slave.recorded(request_code::POP_MESSAGE).is_empty());
+        instance.shutdown();
+    }
+
+    /// Java `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`：主没了退到从节点。
+    ///
+    /// 与管理侧 offset 查询（一律打主、主没了报错）的差别只在这最后一步：位点是 HA 复制来的
+    /// 同一份数据，Java 允许从从节点读。
+    #[tokio::test]
+    async fn consumer_offset_falls_back_to_the_slave_after_a_refresh() {
+        let namesrv = RouteNamesrv::start().await;
+        let master = MockBroker::start().await;
+        let slave = MockBroker::start().await;
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64 + 1, &slave.addr)],
+        )));
+        let instance = instance_against(&namesrv.addr);
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+        let mq = MessageQueue::new(TOPIC, BROKER, 0);
+        let before = namesrv.route_requests();
+
+        // 主没了：退到从节点上把查询做完，取回的是**从节点**那份值
+        slave.script_resp_ext(vec![vec![("offset".to_string(), "424242".to_string())]]);
+        assert_eq!(
+            instance
+                .query_consumer_offset(GROUP, &mq, 5000, None, false)
+                .await
+                .expect("从节点上查得到"),
+            Some(424242)
+        );
+        assert_eq!(slave.recorded(request_code::QUERY_CONSUMER_OFFSET).len(), 1);
+        assert_eq!(namesrv.route_requests(), before + 1);
+
+        // 负控：主回来之后只打主（从节点计数不再增长）
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[
+                (MixAll::MASTER_ID as i64, &master.addr),
+                (MixAll::MASTER_ID as i64 + 1, &slave.addr),
+            ],
+        )));
+        assert!(instance
+            .update_topic_route_info_from_name_server(TOPIC, 5000, false)
+            .await
+            .expect("假 namesrv 答得好好的"));
+        master.script_resp_ext(vec![vec![("offset".to_string(), "111".to_string())]]);
+        assert_eq!(
+            instance
+                .query_consumer_offset(GROUP, &mq, 5000, None, false)
+                .await
+                .expect("主上有位点"),
+            Some(111)
+        );
+        assert_eq!(master.recorded(request_code::QUERY_CONSUMER_OFFSET).len(), 1);
+        assert_eq!(slave.recorded(request_code::QUERY_CONSUMER_OFFSET).len(), 1);
+        instance.shutdown();
+
+        // 路由里压根没有 broker-a（连从节点都没有）：刷一次路由后仍查不到 ⇒ 本端报 not exist
+        let namesrv2 = RouteNamesrv::start().await;
+        let other = MockBroker::start().await;
+        namesrv2.serve(Some(route_body(
+            "broker-b",
+            &[(MixAll::MASTER_ID as i64, &other.addr)],
+        )));
+        let instance2 = instance_against(&namesrv2.addr);
+        let err = instance2
+            .query_consumer_offset(GROUP, &mq, 5000, None, false)
+            .await
+            .expect_err("路由里没有这个名字");
+        assert_broker_not_exist(&err);
+        assert!(other.recorded(request_code::QUERY_CONSUMER_OFFSET).is_empty());
+        instance2.shutdown();
     }
 }

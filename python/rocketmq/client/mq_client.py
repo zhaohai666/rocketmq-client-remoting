@@ -1102,19 +1102,23 @@ class MQClientInstance:
         from ..remoting.protocol.headers import (PopMessageRequestHeader,
                                                  PopMessageResponseHeader)
 
-        if addr is None or broker_name is None:
+        if not broker_name:
             route = self.get_topic_route_data(topic)
             if route is None:
                 raise MQClientException("No route info of this topic: %s" % topic)
             brokers = route.get_broker_datas()
             if not brokers:
                 raise MQClientException("No broker in route of topic: %s" % topic)
-            bd = brokers[0]
-            broker_name = broker_name or bd.broker_name
-            if addr is None:
-                addr = bd.select_broker_addr()
-                if addr is None:
-                    raise MQClientException("No available broker addr for topic: %s" % topic)
+            # 调用方连 brokerName 都没给（「弹该 topic 的任意队列」）：先按路由挑一台，
+            # 挑完照样只认它的 master。
+            broker_name = brokers[0].broker_name
+        if addr is None:
+            # Java PullAPIWrapper#popAsync:369-373：findBrokerAddressInSubscribe(brokerName,
+            # MASTER_ID, true) —— **只认主**，查不到按 topic 刷一次路由再查，仍查不到抛
+            # 「The broker[X] not exist」。不能退到从节点：从节点不接 POP 这族写请求
+            # （ack / 延长不可见时间都要落在 broker 侧的 revive 表上），退过去只会换一个
+            # 可重试的 SYSTEM_BUSY(2)。见 publish_addr_for。
+            addr = self.publish_addr_for(broker_name, topic)
 
         header = PopMessageRequestHeader()
         header.consumer_group = consumer_group
@@ -1348,7 +1352,7 @@ class MQClientInstance:
                               timeout_millis: int = 5000, addr: Optional[str] = None,
                               set_zero_if_not_found: bool = False) -> Optional[int]:
         if addr is None:
-            addr = self._broker_addr(mq)
+            addr = self._consumer_offset_addr(mq)
         header = QueryConsumerOffsetRequestHeader()
         header.consumer_group = consumer_group
         header.topic = mq.topic
@@ -1526,7 +1530,11 @@ class MQClientInstance:
         for mq in mqs:
             by_broker.setdefault(mq.broker_name, []).append(mq)
         for broker_name, broker_mqs in by_broker.items():
-            addr = self.broker_addr_of(broker_name)
+            # Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(brokerName,
+            # MASTER_ID, true) —— 只认主、**不刷路由**，拿不到就整台跳过（队列这一轮锁不上，
+            # 等下一次重投）。退到从节点上锁等于锁在 broker 侧的锁管理器里，master 不知情，
+            # 顺序消费的互斥保证静默失效。
+            addr = self.find_broker_address_in_publish(broker_name)
             if addr is None:
                 continue
             body = LockBatchRequestBody()
@@ -1556,7 +1564,8 @@ class MQClientInstance:
         for mq in mqs:
             by_broker.setdefault(mq.broker_name, []).append(mq)
         for broker_name, broker_mqs in by_broker.items():
-            addr = self.broker_addr_of(broker_name)
+            # 同 lock_batch_mq：Java RebalanceImpl#unlock:74 / unlockAll:104 只认主、不刷路由。
+            addr = self.find_broker_address_in_publish(broker_name)
             if addr is None:
                 continue
             body = UnlockBatchRequestBody()
@@ -1746,6 +1755,25 @@ class MQClientInstance:
         return GetConsumerListByGroupResponseBody()
 
     # ---------------- 工具 ----------------
+    def _consumer_offset_addr(self, mq: MessageQueue) -> str:
+        """Java ``RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`` 的地址口径。
+
+        先**只认主**（``findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)``）→
+        查不到按 topic 刷一次路由 → 重查时**放宽**（``onlyThisBroker=false``，可以落到从
+        节点：位点是 HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛
+        ``MQClientException("The broker[X] not exist")``。
+
+        与 ``_publish_addr_in_admin`` 的差别只在最后那一步：管理侧的 offset 查询一律打主、
+        主没了就报错；位点读取允许退到从节点。
+        """
+        addr = self.find_broker_address_in_publish(mq.broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(mq.topic)
+            addr = self.broker_addr_of(mq.broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % mq.broker_name)
+        return addr
+
     def _broker_addr(self, mq: MessageQueue) -> str:
         """Java ``findBrokerAddressInAdmin`` 口径：主优先、没主退一台从节点。
 

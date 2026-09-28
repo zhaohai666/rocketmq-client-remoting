@@ -19,6 +19,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
@@ -55,6 +56,9 @@ public class PublishRouteMasterTests
         private readonly Socket _listener;
 
         public string Addr { get; }
+
+        /// <summary>QUERY_CONSUMER_OFFSET(14) 的应答位点（主/从各设一个互不相同的值）。</summary>
+        public long OffsetReply { get; set; }
 
         private RouteEndpoint(Socket listener)
         {
@@ -245,6 +249,42 @@ public class PublishRouteMasterTests
                 earliestResp.AddExtField("timestamp",
                     EarliestReply.ToString(CultureInfo.InvariantCulture));
                 return earliestResp;
+            }
+
+            if (req.Code == RequestCode.QueryConsumerOffset)
+            {
+                RemotingCommand offsetResp = Echo(req, ResponseCode.Success, null);
+                offsetResp.AddExtField("offset", OffsetReply.ToString(CultureInfo.InvariantCulture));
+                return offsetResp;
+            }
+
+            if (req.Code == RequestCode.LockBatchMq)
+            {
+                // 把请求体的 mqSet 原样回成 lockOKMQSet：返回的锁集非空即证明「这一发真的落地了」
+                var okSet = JsonValue.MakeArray();
+                if (req.Body is { Length: > 0 }
+                    && Json.TryParse(Encoding.UTF8.GetString(req.Body), out JsonValue body, out _)
+                    && body is not null)
+                {
+                    JsonValue mqSet = body.Get("mqSet");
+                    for (int i = 0; mqSet.IsArray && i < mqSet.Size(); ++i)
+                    {
+                        okSet.PushArray(mqSet.At(i));
+                    }
+                }
+
+                var lockBody = JsonValue.MakeObject();
+                lockBody.Set("lockOKMQSet", okSet);
+                RemotingCommand lockResp = Echo(req, ResponseCode.Success, null);
+                lockResp.Body = Encoding.UTF8.GetBytes(lockBody.Dump());
+                lockResp.HasBody = true;
+                return lockResp;
+            }
+
+            if (req.Code == RequestCode.PopMessage)
+            {
+                // 长轮询空手而归是常态：回 210 POLLING_TIMEOUT，客户端按 PollingNotFound 收
+                return Echo(req, ResponseCode.PollingTimeout, "mock: no message");
             }
 
             // 心跳之类一律成功，别让后台线程卡在错误上
@@ -466,6 +506,148 @@ public class PublishRouteMasterTests
         finally
         {
             admin.Shutdown();
+        }
+    }
+
+    // ---------------------------------------------------------------- 订阅口径（#104）
+
+    /// <summary>
+    /// Java <c>RebalanceImpl#lock:153 / lockAll:195</c>（解锁 <c>#unlock:74 / unlockAll:104</c>）：
+    /// 队列锁的地址是 <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c> ——
+    /// 只认主、**不刷路由**，拿不到就整台跳过。路由里只剩从节点时 LOCK/UNLOCK 一条都不该上线：
+    /// 从节点上锁等于锁在它自己的锁管理器里，master 不知情，顺序消费的互斥保证静默失效。
+    /// </summary>
+    [Fact]
+    public void OrderlyLocksSkipTheBrokerWhenTheMasterIsGone()
+    {
+        using RouteEndpoint namesrv = RouteEndpoint.Start();
+        using RouteEndpoint slave = RouteEndpoint.Start();
+        using RouteEndpoint master = RouteEndpoint.Start();
+        namesrv.AddRoute(Topic, RouteOf(Broker, (SlaveId, slave.Addr)));
+
+        MQClientInstance instance = NewInstanceWithRoute(namesrv, "prm-lock@1");
+        try
+        {
+            var mqs = new List<MessageQueue> { new(Topic, Broker, 0), new(Topic, Broker, 1) };
+            int before = namesrv.CountRequests(RequestCode.GetRouteinfoByTopic);
+
+            Assert.Empty(instance.LockBatchMq("GID_prm_lock", "prm-lock@1", mqs));
+            instance.UnlockBatchMq("GID_prm_lock", "prm-lock@1", mqs);
+            Assert.Equal(0, slave.CountRequests(RequestCode.LockBatchMq));
+            Assert.Equal(0, slave.CountRequests(RequestCode.UnlockBatchMq));
+            // 也不许刷路由：Java 的 lock/unlock 直接 findBrokerAddressInSubscribe(false) 收场，
+            // 没有发送路径上的那一次 tryToFindTopicPublishInfo
+            Assert.Equal(before, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
+
+            // 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
+            namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
+            instance.UpdateTopicRouteInfoFromNameServer(Topic);
+            Assert.Equal(2, instance.LockBatchMq("GID_prm_lock", "prm-lock@1", mqs).Count);
+            instance.UnlockBatchMq("GID_prm_lock", "prm-lock@1", mqs);
+            Assert.Equal(1, master.CountRequests(RequestCode.LockBatchMq));
+            Assert.Equal(1, master.CountRequests(RequestCode.UnlockBatchMq));
+            Assert.Equal(0, slave.CountRequests(RequestCode.LockBatchMq));
+            Assert.Equal(0, slave.CountRequests(RequestCode.UnlockBatchMq));
+        }
+        finally
+        {
+            instance.Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// Java <c>PullAPIWrapper#popAsync:369-373</c>：POP 的地址同一条订阅口径（只认主）——
+    /// 查不到按 topic 刷一次路由再查，仍查不到在本端报「The broker[X] not exist」，
+    /// 一条 POP wire 都不发（从节点收 POP 只会换回一个可重试的 SYSTEM_BUSY）。
+    /// </summary>
+    [Fact]
+    public void PopMessageIsMasterOnlyAndReportsNotExist()
+    {
+        using RouteEndpoint namesrv = RouteEndpoint.Start();
+        using RouteEndpoint slave = RouteEndpoint.Start();
+        using RouteEndpoint master = RouteEndpoint.Start();
+        namesrv.AddRoute(Topic, RouteOf(Broker, (SlaveId, slave.Addr)));
+
+        MQClientInstance instance = NewInstanceWithRoute(namesrv, "prm-pop@1");
+        try
+        {
+            int before = namesrv.CountRequests(RequestCode.GetRouteinfoByTopic);
+            AssertNotExist(Assert.Throws<MQClientException>(() => instance.PopMessage(
+                "GID_prm_pop", Topic, 0, 1, 30000L, 1000L, 0, brokerNameIn: Broker)));
+            // 报错前必须刷过一次路由（popAsync 的 findBrokerAddressInSubscribe + 重查）
+            Assert.Equal(before + 1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
+            Assert.Equal(0, slave.CountRequests(RequestCode.PopMessage));
+
+            // 负控：主注册后（这一发会顺带触发一次路由刷新）请求落在主地址上，从节点一条没有
+            namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
+            PopResult result = instance.PopMessage(
+                "GID_prm_pop", Topic, 0, 1, 30000L, 1000L, 0, brokerNameIn: Broker);
+            Assert.Equal(PopStatus.PollingNotFound, result.Status);
+            Assert.Equal(1, master.CountRequests(RequestCode.PopMessage));
+            Assert.Equal(0, slave.CountRequests(RequestCode.PopMessage));
+        }
+        finally
+        {
+            instance.Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// Java <c>RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241</c>：位点查询先只认主，
+    /// 查不到按 topic 刷一次路由，重查时**放宽到从节点**（位点是 HA 复制来的同一份数据，Java 允许
+    /// 从从节点读），仍没有才抛「The broker[X] not exist」。与管理侧 offset 查询（一律打主）
+    /// 的差别只在这最后一步。
+    /// </summary>
+    [Fact]
+    public void ConsumerOffsetFallsBackToTheSlaveAfterARefresh()
+    {
+        using RouteEndpoint namesrv = RouteEndpoint.Start();
+        using RouteEndpoint slave = RouteEndpoint.Start();
+        using RouteEndpoint master = RouteEndpoint.Start();
+        slave.OffsetReply = 424242;
+        master.OffsetReply = 111;
+        namesrv.AddRoute(Topic, RouteOf(Broker, (SlaveId, slave.Addr)));
+
+        MQClientInstance instance = NewInstanceWithRoute(namesrv, "prm-offset@1");
+        try
+        {
+            var mq = new MessageQueue(Topic, Broker, 0);
+            int before = namesrv.CountRequests(RequestCode.GetRouteinfoByTopic);
+
+            // 主没了：退到从节点上把查询做完，取回的是**从节点**那份值
+            Assert.True(instance.QueryConsumerOffset("GID_prm_offset", mq, out long offset));
+            Assert.Equal(424242L, offset);
+            Assert.Equal(1, slave.CountRequests(RequestCode.QueryConsumerOffset));
+            Assert.Equal(before + 1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
+
+            // 负控：主回来之后只打主（从节点计数不再增长）
+            namesrv.AddRoute(Topic, RouteOf(Broker, (MixAll.MasterId, master.Addr), (SlaveId, slave.Addr)));
+            instance.UpdateTopicRouteInfoFromNameServer(Topic);
+            Assert.True(instance.QueryConsumerOffset("GID_prm_offset", mq, out offset));
+            Assert.Equal(111L, offset);
+            Assert.Equal(1, master.CountRequests(RequestCode.QueryConsumerOffset));
+            Assert.Equal(1, slave.CountRequests(RequestCode.QueryConsumerOffset));
+        }
+        finally
+        {
+            instance.Shutdown();
+        }
+
+        // 路由里压根没有 broker-a（连从节点都没有）：刷一次路由后仍查不到 ⇒ 本端报 not exist
+        using RouteEndpoint namesrv2 = RouteEndpoint.Start();
+        using RouteEndpoint other = RouteEndpoint.Start();
+        namesrv2.AddRoute(Topic, RouteOf("broker-b", (MixAll.MasterId, other.Addr)));
+        MQClientInstance instance2 = NewInstanceWithRoute(namesrv2, "prm-offset@2");
+        try
+        {
+            var mq = new MessageQueue(Topic, Broker, 0);
+            AssertNotExist(Assert.Throws<MQClientException>(
+                () => instance2.QueryConsumerOffset("GID_prm_offset", mq, out _)));
+            Assert.Equal(0, other.CountRequests(RequestCode.QueryConsumerOffset));
+        }
+        finally
+        {
+            instance2.Shutdown();
         }
     }
 }

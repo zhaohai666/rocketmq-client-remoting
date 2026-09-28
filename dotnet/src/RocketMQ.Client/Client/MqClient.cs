@@ -1548,15 +1548,27 @@ public sealed class MQClientInstance : IDisposable
     {
         string brokerName = brokerNameIn ?? string.Empty;
         string addr = addrIn ?? string.Empty;
-        if (brokerName.Length == 0 || addr.Length == 0)
+        if (addr.Length == 0)
         {
-            TopicRouteData? route = GetTopicRouteData(topic);
-            if (route is null)
+            // Java PullAPIWrapper#popAsync:369-373：POP 的地址解析是
+            // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— **只认主**，
+            // 查不到按 topic 刷一次路由再查，仍查不到抛「The broker[X] not exist」。
+            // 不能退到从节点：从节点不接 POP 这族写请求（ack / 延长不可见时间都要落在
+            // broker 侧的 revive 表上），退过去只会换一个可重试的 SYSTEM_BUSY(2)。
+            // 只有调用方连 brokerName 都没给（admin 式的「弹该 topic 的任意队列」）时，
+            // 才先按路由挑一台，挑完照样只认它的 master。
+            if (brokerName.Length == 0)
             {
-                throw new MQClientNoRouteException(topic);
+                TopicRouteData? route = GetTopicRouteData(topic);
+                if (route is null || route.BrokerDatas.Count == 0)
+                {
+                    throw new MQClientNoRouteException(topic);
+                }
+
+                brokerName = route.BrokerDatas[0].BrokerName;
             }
 
-            ResolveBrokerFromRoute(route, topic, ref brokerName, ref addr);
+            addr = PublishAddrFor(brokerName, topic);
         }
 
         var header = new PopMessageRequestHeader
@@ -1732,39 +1744,34 @@ public sealed class MQClientInstance : IDisposable
         return result;
     }
 
-    /// <summary>
-    /// 由路由补齐 brokerName / addr（缺哪个补哪个）。Java 侧对应
-    /// MQClientAPIImpl.getBrokerName/getBrokerAddr 的组合语义。
-    /// </summary>
-    private static void ResolveBrokerFromRoute(TopicRouteData route, string topic,
-        ref string brokerName, ref string addr)
-    {
-        if (brokerName.Length == 0)
-        {
-            if (route.BrokerDatas.Count == 0)
-            {
-                throw new MQClientException("No broker in route of topic: " + topic);
-            }
+    // ---------------- 消费位点 ----------------
 
-            brokerName = route.BrokerDatas[0].BrokerName;
+    /// <summary>
+    /// Java <c>RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241</c> 的地址口径：
+    /// 先**只认主**（<c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>）→ 查不到
+    /// 按 topic 刷一次路由 → 重查时**放宽**（<c>onlyThisBroker=false</c>，可以落到从节点：
+    /// 位点是 HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛
+    /// <c>"The broker[X] not exist"</c>。
+    ///
+    /// 与管理侧 offset 查询（<see cref="PublishAddrInAdmin"/>）的差别只在最后那一步：
+    /// 管理 API 一律打主、主没了就报错；位点读取允许退到从节点。
+    /// </summary>
+    private string ConsumerOffsetAddrFor(MessageQueue mq)
+    {
+        string addr = FindBrokerAddressInPublish(mq.BrokerName);
+        if (addr.Length == 0)
+        {
+            UpdateTopicRouteInfoFromNameServer(mq.Topic);
+            addr = BrokerAddrOf(mq.BrokerName);
         }
 
         if (addr.Length == 0)
         {
-            addr = FindBrokerAddrInRoute(route, brokerName);
-            if (addr.Length == 0 && route.BrokerDatas.Count > 0)
-            {
-                addr = route.BrokerDatas[0].SelectBrokerAddr();
-            }
-
-            if (addr.Length == 0)
-            {
-                throw new MQClientException("No available broker addr for topic: " + topic);
-            }
+            throw new MQClientException("The broker[" + mq.BrokerName + "] not exist", -1);
         }
-    }
 
-    // ---------------- 消费位点 ----------------
+        return addr;
+    }
 
     /// <summary>返回 false 表示 broker 回 QUERY_NOT_FOUND（消费组尚无位点）。</summary>
     /// <remarks>
@@ -1778,7 +1785,7 @@ public sealed class MQClientInstance : IDisposable
         bool setZeroIfNotFound = false)
     {
         outOffset = 0;
-        string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);
+        string addr = addrIn is { Length: > 0 } ? addrIn : ConsumerOffsetAddrFor(mq);
         var header = new QueryConsumerOffsetRequestHeader
         {
             ConsumerGroup = consumerGroup,
@@ -1860,7 +1867,11 @@ public sealed class MQClientInstance : IDisposable
 
         foreach (KeyValuePair<string, List<MessageQueue>> kv in byBroker)
         {
-            string addr = BrokerAddrOf(kv.Key);
+            // Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(brokerName,
+            // MASTER_ID, true) —— 只认主、**不刷路由**，拿不到就整台跳过（队列这一轮锁不上，
+            // 等下一次重投）。退到从节点上锁等于锁在 broker 侧的锁管理器里，master 不知情，
+            // 顺序消费的互斥保证静默失效。
+            string addr = FindBrokerAddressInPublish(kv.Key);
             if (addr.Length == 0)
             {
                 continue;
@@ -1919,7 +1930,8 @@ public sealed class MQClientInstance : IDisposable
 
         foreach (KeyValuePair<string, List<MessageQueue>> kv in byBroker)
         {
-            string addr = BrokerAddrOf(kv.Key);
+            // 同 LockBatchMq：Java RebalanceImpl#unlock:74 / unlockAll:104 只认主、不刷路由。
+            string addr = FindBrokerAddressInPublish(kv.Key);
             if (addr.Length == 0)
             {
                 continue;

@@ -222,3 +222,136 @@ def test_admin_offset_queries_are_master_only_too():
     # 从节点地址一次都没被打过（三条查询各一次 master，转接解析不打 broker）
     assert calls[-3:] == ["127.0.0.1:10911"] * 3
     assert "127.0.0.1:10931" not in calls
+
+
+# -------------------------------------- 订阅口径：findBrokerAddressInSubscribe(MASTER_ID, true)
+#
+# Java 的四处调用点形状一致（RebalanceImpl#unlock:74 / unlockAll:104 / #lock:153 / #lockAll:195、
+# PullAPIWrapper#popAsync:369-373、RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）：
+# ``findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)`` —— 只认主、**不刷路由**；
+# 只有 POP 与位点查询在查不到时补一次 ``updateTopicRouteInfoFromNameServer(topic)``，
+# 且位点查询的**重查**放宽到从节点（``onlyThisBroker=false``），POP 的重查仍只认主。
+def _invoking(route_holder):
+    """离线实例：namesrv 回 ``route_holder[0]``；broker 请求按码回包并逐个记 ``(addr, code)``。"""
+    from rocketmq.remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+    from rocketmq.remoting.protocol.codes import RequestCode
+
+    inst = MQClientInstance("route-test@unit", ["127.0.0.1:9876"])
+    calls = []
+
+    def fake_invoke(addr, request, timeout_millis=None):
+        calls.append((addr, request.code))
+        response = RemotingCommand()
+        response.code = ResponseCode.SUCCESS
+        response.ext_fields = {}
+        if request.code == RequestCode.GET_ROUTEINFO_BY_TOPIC:
+            route = route_holder[0]
+            response.body = route.encode() if route is not None else None
+        elif request.code == RequestCode.LOCK_BATCH_MQ:
+            # 把请求体的 mqSet 原样回成 lockOKMQSet：锁集非空即证明「这一发真的落地了」
+            rb = LockBatchResponseBody()
+            rb.lock_ok_mq_set = list(LockBatchRequestBody.decode(request.body).mq_set)
+            response.body = rb.encode()
+        elif request.code == RequestCode.QUERY_CONSUMER_OFFSET:
+            response.ext_fields = {"offset": "424242" if addr.endswith("10931") else "111"}
+        elif request.code == RequestCode.POP_MESSAGE:
+            response.code = ResponseCode.POLLING_TIMEOUT     # 长轮询空手而归是常态
+        return response
+
+    inst._invoke_sync = fake_invoke     # type: ignore[method-assign]
+    return inst, calls
+
+
+def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
+    """Java ``RebalanceImpl#lock:153 / lockAll:195``（解锁 ``:74/:104``）：只认主、不刷路由。
+
+    路由里只剩从节点时 LOCK/UNLOCK 一条都不该上线：从节点上锁等于锁在它自己的锁管理器里，
+    master 不知情，顺序消费的互斥保证静默失效。
+    """
+    from rocketmq.remoting.protocol.codes import RequestCode
+
+    holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
+    inst, calls = _invoking(holder)
+    inst.update_topic_route_info_from_name_server("T")
+    calls.clear()
+    mqs = [MessageQueue("T", "broker-a", 0), MessageQueue("T", "broker-a", 1)]
+
+    assert inst.lock_batch_mq("GID", "cid", mqs) == []
+    inst.unlock_batch_mq("GID", "cid", mqs)
+    # 也不许刷路由：Java 的 lock/unlock 直接 findBrokerAddressInSubscribe(false) 收场，
+    # 没有发送路径上的那一次 tryToFindTopicPublishInfo
+    assert calls == []
+
+    # 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
+                                        SLAVE: "127.0.0.1:10931"}})
+    inst.update_topic_route_info_from_name_server("T")
+    calls.clear()
+    locked = inst.lock_batch_mq("GID", "cid", mqs)
+    inst.unlock_batch_mq("GID", "cid", mqs)
+    assert [(m.topic, m.broker_name, m.queue_id) for m in locked] == [
+        ("T", "broker-a", 0), ("T", "broker-a", 1)]
+    assert calls == [("127.0.0.1:10911", RequestCode.LOCK_BATCH_MQ),
+                     ("127.0.0.1:10911", RequestCode.UNLOCK_BATCH_MQ)]
+
+
+def test_pop_message_is_master_only_and_reports_not_exist():
+    """Java ``PullAPIWrapper#popAsync:369-373``：POP 只认主，查不到刷一次路由再查，仍抛 not exist。"""
+    from rocketmq.client.consumer_result import PopStatus
+    from rocketmq.remoting.protocol.codes import RequestCode
+
+    holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
+    inst, calls = _invoking(holder)
+    inst.update_topic_route_info_from_name_server("T")
+    calls.clear()
+
+    with pytest.raises(MQClientException) as exc:
+        inst.pop_message("GID", "T", broker_name="broker-a")
+    assert str(exc.value) == "The broker[broker-a] not exist"
+    assert exc.value.response_code is None
+    # 报错前必须刷过一次路由（popAsync 的 findBrokerAddressInSubscribe + 重查）
+    assert calls == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC)]
+
+    # 负控：主注册后（这一发顺带触发一次路由刷新）请求落在主地址上，从节点一条都没有
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
+                                        SLAVE: "127.0.0.1:10931"}})
+    calls.clear()
+    result = inst.pop_message("GID", "T", broker_name="broker-a")
+    assert result.status == PopStatus.POLLING_NOT_FOUND
+    assert (("127.0.0.1:10911", RequestCode.POP_MESSAGE) in calls)
+    assert all(addr != "127.0.0.1:10931" for addr, _ in calls)
+
+
+def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
+    """Java ``RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241``：主没了退到从节点。
+
+    与管理侧 offset 查询（一律打主、主没了报错）的差别只在这最后一步：位点是 HA 复制来的
+    同一份数据，Java 允许从从节点读。
+    """
+    from rocketmq.remoting.protocol.codes import RequestCode
+
+    holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
+    inst, calls = _invoking(holder)
+    inst.update_topic_route_info_from_name_server("T")
+    calls.clear()
+    mq = MessageQueue("T", "broker-a", 0)
+
+    assert inst.query_consumer_offset("GID", mq) == 424242      # 从节点那份
+    assert calls == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC),
+                     ("127.0.0.1:10931", RequestCode.QUERY_CONSUMER_OFFSET)]
+
+    # 负控：主回来之后只打主（从节点计数不再增长）
+    holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
+                                        SLAVE: "127.0.0.1:10931"}})
+    inst.update_topic_route_info_from_name_server("T")
+    calls.clear()
+    assert inst.query_consumer_offset("GID", mq) == 111
+    assert calls == [("127.0.0.1:10911", RequestCode.QUERY_CONSUMER_OFFSET)]
+
+    # 路由里压根没有 broker-a（连从节点都没有）：刷一次路由后仍查不到 ⇒ 本端报 not exist
+    holder2 = [_route_of({"broker-b": {MASTER: "127.0.0.1:10912"}})]
+    inst2, calls2 = _invoking(holder2)
+    with pytest.raises(MQClientException) as exc:
+        inst2.query_consumer_offset("GID", mq)
+    assert str(exc.value) == "The broker[broker-a] not exist"
+    assert calls2 == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC)]

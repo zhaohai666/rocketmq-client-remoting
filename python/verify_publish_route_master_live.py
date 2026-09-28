@@ -36,6 +36,11 @@ mq）走的正是这条：**不会**退到从节点地址上让 broker 回 SYSTE
   S5d (B) 地址侧对照：定点发到该队列 → 本端报「The broker[broker-a] not exist」，也无 wire
       （漏掉 (B) 这条对照时的旧行为：请求打到从节点上，broker 回 SYSTEM_BUSY(2)，
       一个可重试码 —— 白烧一整轮重试，错误类型也和 Java 不一样）
+  S5e (D) 订阅口径：顺序锁整台跳过（RebalanceImpl#lock:153/lockAll:195 只认主、不刷路由；
+      对照腿直接点名从节点，证明从节点**本来**发得出锁 —— 空集是客户端没去，不是 broker 拒绝）
+  S5f (E) 订阅口径：POP 本端报「broker 不存在」（PullAPIWrapper#popAsync:369-373），不发 wire
+  S5g (F) 位点读取：冷实例（缓存里没这个 topic）刷一次路由后**放宽**到从节点
+      （RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）
   S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐
   S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK
 """
@@ -57,7 +62,10 @@ from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.client.producer import DefaultMQProducer
 from rocketmq.client.send_result import SendStatus
 from rocketmq.common.message import Message, MessageQueue
+from rocketmq.remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+from rocketmq.remoting.protocol.codes import RequestCode
 from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq.remoting.protocol.remoting_command import RemotingCommand
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 MASTER_ARG = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:10911"
@@ -300,6 +308,78 @@ def main() -> int:
               and str(pinned_exc) == "The broker[%s] not exist" % BROKER_NAME
               and pinned_ms < LOCAL_BUDGET_MS,
               "%.0fms %s: %s" % (pinned_ms, type(pinned_exc).__name__, pinned_exc))
+
+        # ---------- S5e (D) 订阅口径：顺序锁只认主 ----------
+        # Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(
+        # brokerName, MASTER_ID, true)：只认主、**不刷路由**，拿不到就整台跳过。退到从节点
+        # 上锁等于锁在从节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。
+        # 此刻 inst 的路由缓存已被 S2 刷成 masterless 形状，任何"退让"口径都会落到从节点上
+        # 并拿回非空锁集，所以空集 + S5e2 对照腿足以说明客户端压根没去。
+        print("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）")
+        client_id = "pr-master-live-%d" % STAMP
+        mqs = [MessageQueue(TOPIC, BROKER_NAME, 0)]
+        began = time.monotonic()
+        locks = inst.lock_batch_mq(GROUP, client_id, mqs)
+        lock_ms = (time.monotonic() - began) * 1000
+        check("S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+              locks == [] and lock_ms < LOCAL_BUDGET_MS, "%.0fms locked=%s" % (lock_ms, locks))
+
+        # 对照腿：同一份报文直接点名从节点 —— 从节点**本来**就会把锁发出来
+        req = RemotingCommand.create_request_command(RequestCode.LOCK_BATCH_MQ, None)
+        body = LockBatchRequestBody()
+        body.consumer_group = GROUP
+        body.client_id = client_id
+        body.mq_set = [{"topic": TOPIC, "brokerName": BROKER_NAME, "queueId": 0}]
+        req.body = body.encode()
+        slave_ok = len(LockBatchResponseBody.decode(
+            inst._invoke_sync(SLAVE_ARG, req, 3000).body).lock_ok_mq_set)
+        check("S5e2 对照：点名从节点时锁发得出来（空集不是 broker 拒绝）", slave_ok == 1,
+              "slave lockOKMQSet=%d" % slave_ok)
+
+        began = time.monotonic()
+        inst.unlock_batch_mq(GROUP, client_id, mqs)
+        unlock_ms = (time.monotonic() - began) * 1000
+        check("S5e3 解锁同样安静跳过（不抛、不发）", unlock_ms < LOCAL_BUDGET_MS,
+              "%.0fms" % unlock_ms)
+
+        # ---------- S5f (E) 订阅口径：POP 只认主 ----------
+        # Java PullAPIWrapper#popAsync:369-373：只认主 → 刷一次路由 → 仍没有就本端抛。
+        # 从节点不接 POP 这族写请求（ack / 延长不可见时间要落在 broker 侧 revive 表上），
+        # 退过去只会换一个可重试的 SYSTEM_BUSY(2)，白烧一轮。
+        print("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）")
+        pop_exc = None
+        began = time.monotonic()
+        try:
+            inst.pop_message(GROUP, TOPIC, queue_id=0, max_msg_nums=1,
+                             invisible_time=30000, poll_time=100)
+        except Exception as e:  # noqa: BLE001
+            pop_exc = e
+        pop_ms = (time.monotonic() - began) * 1000
+        check("S5f 停窗口内 POP 本端报「The broker[broker-a] not exist」（不是从节点回的错）",
+              isinstance(pop_exc, MQClientException)
+              and str(pop_exc) == "The broker[%s] not exist" % BROKER_NAME
+              and pop_ms < LOCAL_BUDGET_MS,
+              "%.0fms %s: %s" % (pop_ms, type(pop_exc).__name__, pop_exc))
+
+        # ---------- S5g (F) 位点读取：刷一次路由后放宽到从节点 ----------
+        # Java RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241：只认主 →
+        # 刷一次路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制来的同一份数据，
+        # 可以从从节点读）。冷实例（路由缓存里没有这个 topic）是这条路径最纯的形状：
+        # 老代码的 _broker_addr 在此直接报「No route info of this topic」，连刷新都没有。
+        print("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点")
+        cold = MQClientInstance("pr-master-live-cold-%d" % STAMP, [NAMESRV])
+        cold_exc = None
+        off = None
+        try:
+            off = cold.query_consumer_offset(GROUP, MessageQueue(TOPIC, BROKER_NAME, 0))
+        except Exception as e:  # noqa: BLE001
+            cold_exc = e
+        finally:
+            cold.shutdown()
+        check("S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复",
+              cold_exc is None and (off is None or isinstance(off, int)),
+              "%s: %s" % (type(cold_exc).__name__ if cold_exc else "ok",
+                          cold_exc if cold_exc else "offset=%s" % off))
 
         # ---------- S6 (C 端到端) 停窗口内消费 ----------
         print("\nS6 停窗口内新起的 push 消费者：4 条队列 + 从从节点收齐预埋的 4 条")

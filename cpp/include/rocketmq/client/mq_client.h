@@ -496,6 +496,18 @@ public:
     // SYSTEM_BUSY(2)」的分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK /
     // CHANGE_INVISIBLE_TIME 这些写请求。
     std::string publishAddrFor(const std::string& brokerName, const std::string& topic);
+    // POP 三兄弟（popMessage / ackMessage / changeInvisibleTime）的地址解析。
+    //
+    // Java 那边三处同一条订阅口径：`PullAPIWrapper#popAsync:369-373`、
+    // `DefaultMQPushConsumerImpl#ackAsync:820-825` / `changePopInvisibleTimeAsync:869-876`
+    // 全是 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— 只认主、查不到刷
+    // 一次路由再查、仍查不到抛「The broker[X] not exist」。不能退到从节点：从节点不接
+    // POP 这族写请求（ack / 延长不可见时间都要落在 broker 侧的 revive 表上）。
+    //
+    // brokerName 传引用：调用方没给时按路由挑第一台的 brokerName 会被就地补上
+    // （brokerName 为空时用它去反构 POP_CK，retryFlag 会算错）；addrIn 非空则原样返回。
+    std::string resolvePopAddr(const std::string& topic, std::string& brokerName,
+                               const std::string& addrIn);
     std::vector<std::string> getRouteOfAllBrokers();
     // 列出已知路由里所有 broker 地址（用于探活）
     std::vector<std::string> knownBrokerAddrs();
@@ -515,6 +527,11 @@ private:
     // 复制来的同一份数据，但 Java 的管理类 API 一律打主，本端不"顺手"退到从节点 ——
     // 主掉线期间这里就该报错，让调用方看见。
     std::string publishAddrInAdmin(const MessageQueue& mq);
+    // Java `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241` 的地址口径：
+    // 先**只认主** → 查不到按 topic 刷一次路由 → 重查时**放宽**到从节点（位点是 HA 复制来
+    // 的同一份数据，Java 允许从从节点读）→ 仍没有才抛「The broker[X] not exist」。
+    // 与 publishAddrInAdmin 的差别只在最后那一步。
+    std::string consumerOffsetAddr(const MessageQueue& mq);
     RemotingCommand invokeSyncOnAddr(const std::string& addr, RemotingCommand& request,
                                      int32_t timeoutMillis);
     // 后台路由刷新循环（对应 Java startScheduledTask 的 updateTopicRouteInfoFromNameServer 周期任务）
