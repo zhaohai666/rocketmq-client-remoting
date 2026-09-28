@@ -407,6 +407,27 @@ Message DefaultMQProducer::withNamespace(const Message& msg) const {
     return out;
 }
 
+// 定点发送守卫的两处 Java 文案（同步 DefaultMQProducerImpl:1235、异步 :1278），逐字保留：
+// 两处文案不同是 Java 的原样，按入口取用。
+namespace {
+constexpr const char* kPinnedTopicMismatchSync = "message's topic not equal mq's topic";
+constexpr const char* kPinnedTopicMismatchAsync =
+    "Topic of the message does not match its target message queue";
+}  // namespace
+
+// Java 的守卫比的是**各自拼过命名空间之后**的名字：公开入口先
+// `msg.setTopic(withNamespace(...))`、再把 mq 过 `ClientConfig.queueWithNamespace`，所以两边
+// 是同一命名空间下的两个资源名（`wrapNamespace` 幂等，已经带前缀的入参不会套两层）。少了这
+// 道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的队列名写入，
+// SendResult 一切正常，消息却落进了**另一个 topic** 的分区，无人消费也无人报错。
+void DefaultMQProducer::checkPinnedTopic(const std::string& msgTopic, const MessageQueue& mq,
+                                         const std::string& message) const {
+    if (NamespaceUtil::wrapNamespace(namespace_, msgTopic) !=
+        NamespaceUtil::wrapNamespace(namespace_, mq.topic)) {
+        throw MQClientException(message);
+    }
+}
+
 // 对应 Java DefaultMQProducerImpl.tryToCompressMessage + sendKernelImpl 的 sysFlag 组装。
 //
 // 语义逐条对齐 Java：
@@ -812,6 +833,9 @@ SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const
     }
     MessageQueue target;
     if (pinned != nullptr) {
+        // Java `sendDirect(batch, mq, null)`：回调为 null 时落到**同步**入口
+        // `impl.send(msg, mq, timeout)`，所以文案是同步那一处。
+        checkPinnedTopic(outbound.topic, *pinned, kPinnedTopicMismatchSync);
         target = *pinned;
     } else {
         std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
@@ -988,6 +1012,8 @@ SendResult DefaultMQProducer::sendToMqImpl(const Message& msg, const MessageQueu
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
+    // Java 的顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
+    checkPinnedTopic(msg.topic, mq, kPinnedTopicMismatchSync);
     Message outbound = withNamespace(msg);
     ensureUniqId(outbound);
     const int32_t sysFlag = prepareForSend(outbound);
@@ -1312,7 +1338,8 @@ void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState
     // 校验、组批、拼 namespace、选队列、钩子全在内核里，这里不重复做。
     const int32_t timeout = state->timeout;
     try {
-        const SendResult result = sendBatchKernel(state->batchMsgs, pinned, timeout);
+        const SendResult result = sendBatchKernel(state->batchMsgs, pinned, timeout,
+                                                  kPinnedTopicMismatchAsync);
         executeOnCallbackThread([this, state, result]() { completeAsync(state, &result, nullptr); });
     } catch (const MQBrokerException& e) {
         // broker 明确回错：Java 的批量异步同样走 processSendResponse 的 catch，交给回调的是
@@ -1334,6 +1361,11 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
                                        const MessageQueue* pinned) {
     MQClientInstance& c = client();
     checkMessage(state->msg);
+    if (pinned != nullptr) {
+        // Java `:1277-1278`：异步分支在同一位置用另一处文案抛，异常由 runnable 的 catch
+        // 转给 `newCallBack.onException`（这里由 enqueueAsync 的 catch 收口）。
+        checkPinnedTopic(state->msg.topic, *pinned, kPinnedTopicMismatchAsync);
+    }
     state->msg = withNamespace(state->msg);
     ensureUniqId(state->msg);
     // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
@@ -1597,6 +1629,28 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
                           unitMode_, createTopicKey_, defaultTopicQueueNums_);
 }
 
+void DefaultMQProducer::sendOneway(const Message& msg, const MessageQueue& mq) {
+    MQClientInstance& c = client();
+    checkMessage(msg);
+    Message outbound = withNamespace(msg);
+    const int32_t sysFlag = prepareForSend(outbound);
+    // 地址只读缓存（Java sendKernelImpl 的 findBrokerAddressInPublish）：单向没有应答，
+    // 路由拉取失败也无从反馈，所以这里不兜底查名字服务。取不到就交给 sendMessageOneway
+    // 自己按空地址报错（与上面无 mq 那条路径同口径）。
+    std::string brokerAddr;
+    try {
+        brokerAddr = c.brokerAddrOf(mq.brokerName);
+    } catch (...) {
+        brokerAddr.clear();
+    }
+    runCheckForbidden(outbound, mq, brokerAddr, nullptr, CommunicationMode::ONEWAY);
+    if (enableTraceContext_) {
+        injectTraceContext(&outbound);
+    }
+    c.sendMessageOneway(producerGroup_, outbound, mq, sendMsgTimeout_, sysFlag,
+                        unitMode_, createTopicKey_, defaultTopicQueueNums_);
+}
+
 // ---------------------------------------------------------------- Request-Reply
 
 namespace {
@@ -1700,19 +1754,20 @@ Message DefaultMQProducer::waitRequestResponse(const Message& outbound, int32_t 
 
 // ---------------------------------------------------------------- 批量
 SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis) {
-    return sendBatchKernel(msgs, nullptr, timeoutMillis);
+    return sendBatchKernel(msgs, nullptr, timeoutMillis, kPinnedTopicMismatchSync);
 }
 
 SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, const MessageQueue& mq,
                                         int32_t timeoutMillis) {
-    return sendBatchKernel(msgs, &mq, timeoutMillis);
+    return sendBatchKernel(msgs, &mq, timeoutMillis, kPinnedTopicMismatchSync);
 }
 
 // 两个公开重载 + 批量异步共用的内核。pinned 非空时整批定点落到该队列（Java
 // send(Collection, MessageQueue, timeout)），不查路由、不换 broker。
 SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
                                               const MessageQueue* pinned,
-                                              int32_t timeoutMillis) {
+                                              int32_t timeoutMillis,
+                                              const std::string& pinnedGuardMessage) {
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     if (msgs.empty()) {
@@ -1741,6 +1796,11 @@ SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
     checkMessage(batch);
     if (!namespace_.empty()) {
         batch.topic = NamespaceUtil::wrapNamespace(namespace_, batch.topic);
+    }
+    if (pinned != nullptr) {
+        // Java：`impl.send(batch(msgs), mq, timeout)` 与单条共用同一处同步守卫
+        // （MessageBatch extends Message）；批量异步入口是另一处文案，由调用方传入。
+        checkPinnedTopic(batch.topic, *pinned, pinnedGuardMessage);
     }
     MessageQueue target;
     if (pinned != nullptr) {

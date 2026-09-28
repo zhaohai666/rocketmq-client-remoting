@@ -116,6 +116,12 @@ pub const DEFAULT_COMPRESS_LEVEL: i32 = 5;
 /// `asyncSenderQueueCapacity` 同值）。
 pub const DEFAULT_ASYNC_SENDER_QUEUE_CAPACITY: i32 = 50_000;
 
+/// 定点发送守卫的两处 Java 文案（同步 `DefaultMQProducerImpl:1235`、异步 `:1278`），
+/// 逐字保留：两处文案不同是 Java 的原样，按入口取用。
+const PINNED_TOPIC_MISMATCH_SYNC: &str = "message's topic not equal mq's topic";
+const PINNED_TOPIC_MISMATCH_ASYNC: &str =
+    "Topic of the message does not match its target message queue";
+
 /// Java `DefaultMQProducer#retryResponseCodes` 的默认集合（Python 构造函数同款）。
 ///
 /// 判据是「换一台 broker 有可能不一样」：这些码都代表 broker 侧的临时状态
@@ -1973,6 +1979,21 @@ impl DefaultMQProducer {
         NamespaceUtil::wrap_namespace(&namespace, topic)
     }
 
+    /// 定点发送的 topic 一致性守卫（Java `DefaultMQProducerImpl:1234-1236` 同步 /
+    /// `:1277-1278` 异步，两处文案不同，由调用方给）。
+    ///
+    /// 比的是**各自拼过命名空间之后**的名字 —— Java 的公开入口先
+    /// `msg.setTopic(withNamespace(...))`、再把 mq 过 `ClientConfig.queueWithNamespace`，
+    /// 所以比的是同一命名空间下的两个资源名（`wrapNamespace` 幂等，已经带前缀的入参不会
+    /// 套两层）。少了这道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的
+    /// 队列名写入，SendResult 一切正常，消息却落进了**另一个 topic** 的分区，无人消费也无人报错。
+    fn check_pinned_topic(&self, msg_topic: &str, mq: &MessageQueue, message: &str) -> Result<()> {
+        if self.with_namespace(msg_topic) != self.with_namespace(&mq.topic) {
+            return Err(Error::client(message));
+        }
+        Ok(())
+    }
+
     /// Python `_topic_publish_info`（对应 Java
     /// `DefaultMQProducerImpl.tryToFindTopicPublishInfo`）。
     ///
@@ -2422,6 +2443,11 @@ impl DefaultMQProducer {
         let topic = self.with_namespace(&msg.topic);
         msg.topic = topic;
         self.check_message(msg)?;
+        if let Some(mq) = mq {
+            // Java 的顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
+            // 排在压缩之前，拒绝时调用方那条消息连还原都不用。
+            self.check_pinned_topic(&msg.topic, mq, PINNED_TOPIC_MISMATCH_SYNC)?;
+        }
         // 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
         // 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
         // 消费端只解一层就拿到压缩流。这里避免该问题。
@@ -2734,7 +2760,12 @@ impl DefaultMQProducer {
         // 累加器那条路（[`send_prepared_batch`](Self::send_prepared_batch)）走的是带重试的
         // [`send_with_retry`](Self::send_with_retry)，与 Java `sendDirect` 对齐。
         let mq_sel = match mq {
-            Some(mq) => mq.clone(),
+            Some(mq) => {
+                // Java：`send(Collection, MessageQueue, timeout)` → `impl.send(batch(msgs), mq, timeout)`，
+                // 与单条共用同一处同步守卫（MessageBatch extends Message）。
+                self.check_pinned_topic(&topic, mq, PINNED_TOPIC_MISMATCH_SYNC)?;
+                mq.clone()
+            }
             None => {
                 let route = self.topic_publish_info(&client, &topic).await?;
                 // Python 用 batch.topic 建 mq_sel；Rust 的批量外层 topic 已等于 topic
@@ -2781,6 +2812,10 @@ impl DefaultMQProducer {
         let mut publish = PublishMessage::Batch(batch);
         let sys_flag = self.sys_flag_for(&mut publish);
         if let Some(mq) = mq {
+            // Java：攒批直发走 `sendDirect(batch, mq, null)`；回调为 null 时它落到**同步**
+            // 入口 `impl.send(msg, mq, timeout)`，所以文案是同步那一处。
+            let batch_topic = publish.as_message().topic.clone();
+            self.check_pinned_topic(&batch_topic, mq, PINNED_TOPIC_MISMATCH_SYNC)?;
             return self.send_pinned(&client, &mut publish, mq, timeout, sys_flag).await;
         }
         self.send_with_retry(&client, &mut publish, timeout, retry_times, sys_flag)
@@ -2854,6 +2889,15 @@ impl DefaultMQProducer {
                 Error::TooMuchRequest("DEFAULT ASYNC send call timeout".to_string()),
                 permits,
             );
+        }
+        if let Some(mq) = mq.as_ref() {
+            // Java：攒批异步直发走 `sendDirect(batch, mq, cb)` → **异步**入口（另一处文案）；
+            // 下面 `send_prepared_batch` 里的同步文案只服务 null 回调那条路。
+            if let Err(e) =
+                self.check_pinned_topic(&batch.message.topic, mq, PINNED_TOPIC_MISMATCH_ASYNC)
+            {
+                return self.fail_async(&callback, e, permits);
+            }
         }
         let outcome = self
             .send_prepared_batch(&mut batch, mq.as_ref(), Some(timeout - cost))
@@ -3200,10 +3244,17 @@ impl DefaultMQProducer {
                 permits,
             );
         }
+        // Java 的批量异步定点走 `impl.send(batch(msgs), mq, cb, timeout)`，守卫文案是**异步**
+        // 那一处；下面 `send_batch` 自己还会用同步文案再判一次（同步入口共用同一个内核），
+        // 这里先判是为了让异步入口的报错与 Java 逐字一致。
+        if let (Some(mq), Some(first)) = (mq.as_ref(), msgs.first()) {
+            if let Err(e) = self.check_pinned_topic(&first.topic, mq, PINNED_TOPIC_MISMATCH_ASYNC) {
+                return self.fail_async(&callback, e, permits);
+            }
+        }
         // 批量内核自己校验每条子消息、拼命名空间、查同质性；这里的错误原样交付回调。
         let outcome = self.send_batch(msgs, mq.as_ref(), Some(timeout - cost)).await;
-        self.complete_async(&callback, outcome, None, Some(permits));
-    }
+        self.complete_async(&callback, outcome, None, Some(permits));    }
 
     /// 一个「不发请求就终止」的出口：归还许可 + 交付错误。
     fn fail_async(
@@ -3239,6 +3290,13 @@ impl DefaultMQProducer {
         msg.topic = topic.clone();
         if let Err(e) = self.check_message(msg) {
             return self.fail_async(&callback, e, permits);
+        }
+        if let Some(mq) = mq {
+            // Java `:1277-1278`：异步分支在同一位置用另一处文案抛，异常由 runnable 的
+            // catch 转给 `newCallBack.onException`（这里交给 `fail_async`）。
+            if let Err(e) = self.check_pinned_topic(&msg.topic, mq, PINNED_TOPIC_MISMATCH_ASYNC) {
+                return self.fail_async(&callback, e, permits);
+            }
         }
         // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍。
         // 这里**不需要**还原句柄：异步入口把 `Message` 按值收走（调用方已经拿不到它），

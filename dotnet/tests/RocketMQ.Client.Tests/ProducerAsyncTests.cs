@@ -1195,6 +1195,49 @@ public class ProducerAsyncTests : IDisposable
     }
 
     /// <summary>
+    /// 定点发送的守卫在异步入口上是**另一句文案**（Java <c>DefaultMQProducerImpl:1277-1278</c>），
+    /// 异常走回调；拒绝发生在任何请求之前（假集群一笔 SEND 都收不到）。批量异步共用同一处。
+    /// </summary>
+    [Fact]
+    public void PinnedAsyncSendUsesTheAsyncWording_AndStopsBeforeTheWire()
+    {
+        using var cluster = MockCluster.Start(1);
+        cluster.Script(0, new List<(int, int)>(), (ResponseCode.Success, 0));
+        DefaultMQProducer producer = Started(cluster, "GID_pinned_guard_async");
+        var pinned = new MessageQueue("T2", MockCluster.BrokerName(0), 0);
+
+        // ① 单条异步 topic 不符：异步文案，零请求
+        var cb = new Recorder();
+        producer.SendAsync(Msg(), cb, 5000, pinned);
+        Assert.True(cb.WaitDone(1, 5000), "拒绝也要有终态回调");
+        Assert.Contains("Topic of the message does not match its target message queue",
+            string.Join(" / ", cb.Errors()));
+        Assert.Null(cluster.FirstSendRequest());
+
+        // ② 同 topic 照发（守卫不能宽到误伤）
+        var ok = new Recorder();
+        producer.SendAsync(Msg(), ok, 5000, new MessageQueue(Topic, MockCluster.BrokerName(0), 0));
+        Assert.True(ok.WaitDone(1, 5000), string.Join(" / ", ok.Errors()));
+        Assert.Equal(SendStatus.SendOk, ok.Results()[0]!.SendStatus);
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendMessageV2));
+
+        // ③ 批量异步共用同一处守卫与同一句文案
+        var batch = new Recorder();
+        producer.SendBatchAsync(new List<Message> { Msg(), Msg() }, batch, 5000, pinned);
+        Assert.True(batch.WaitDone(1, 5000), "批量拒绝也要有终态回调");
+        Assert.Contains("Topic of the message does not match its target message queue",
+            string.Join(" / ", batch.Errors()));
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendMessageV2));
+
+        var good = new Recorder();
+        producer.SendBatchAsync(new List<Message> { Msg(), Msg() }, good, 5000,
+            new MessageQueue(Topic, MockCluster.BrokerName(0), 0));
+        Assert.True(good.WaitDone(1, 5000), string.Join(" / ", good.Errors()));
+        Assert.Equal(1, cluster.CountRequests(RequestCode.SendBatchMessage));
+        producer.Shutdown();
+    }
+
+    /// <summary>
     /// 异步内核自己建请求（<c>BuildSendRequest</c> 在 sendKernelAsync 里，不走
     /// <c>MqClient.SendMessage</c>），所以 Java <c>sendKernelImpl:996-997</c> / <c>:1007</c>
     /// 写进发送头的三个值要在这里再取证一遍：V2 的 <c>n</c>（brokerName）、

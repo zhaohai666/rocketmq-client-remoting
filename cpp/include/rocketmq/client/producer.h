@@ -301,6 +301,13 @@ public:
     void sendAsync(const Message& msg, const MessageQueue& mq, std::shared_ptr<SendCallback> callback,
                    int32_t timeoutMillis = -1);
     void sendOneway(const Message& msg);
+    // 定点单向（Java `DefaultMQProducer.sendOneway(Message, MessageQueue):660-663`）。
+    // **没有** topic 一致性守卫 —— Java 的 sendOneway 有意不判（`:1303-1310`）：报文头里的
+    // topic 取 `msg.getTopic()`、只有 queueId 来自 mq，所以 topic 写错时会落进另一条 topic
+    // 的同号队列，且没有任何反馈。本端口照搬这条语义（真机判据见
+    // `examples/live_pinned_guard.cpp` 的 S5）。地址只读缓存（Java
+    // `findBrokerAddressInPublish`），所以必须先有过一次成功发送把地址表喂上。
+    void sendOneway(const Message& msg, const MessageQueue& mq);
 
     // ---------------- Request-Reply（5.x）----------------
     // 同步 request：给请求消息写 CORRELATION_ID（随机 UUID）/ REPLY_TO_CLIENT（本客户端
@@ -386,6 +393,10 @@ protected:
                            std::shared_ptr<SendCallback> callback, int32_t timeoutMillis);
     // 发送前给 topic 套上 namespace 前缀（对应 Java withNamespace）；namespace 为空原样返回。
     Message withNamespace(const Message& msg) const;
+    // 定点发送（显式给了 mq）的 topic 一致性守卫（Java `DefaultMQProducerImpl:1234-1236`
+    // 同步 / `:1277-1278` 异步，两处文案不同，由调用方按入口传入）。
+    void checkPinnedTopic(const std::string& msgTopic, const MessageQueue& mq,
+                          const std::string& message) const;
     // request() 的公共收尾（两个公开重载都会走到这里；outbound 已过 withNamespace/checkMessage）
     Message requestWithQueue(Message& outbound, const MessageQueue& mq, int32_t timeout);
     // 对应 Java waitResponse：超时/发送失败分别抛 RequestTimeoutException / MQClientException
@@ -409,8 +420,10 @@ protected:
     // ---------------- 轨迹 / 钩子内部实现 ----------------
     // 批量同步内核（sendBatch 两个重载与批量异步共用）：校验每条子消息 → 组批 → 压缩位 →
     // 选队列（pinned 非空则定点）→ sendWithHooks。
+    // `pinnedGuardMessage`：pinned 非空时的定点守卫文案 —— Java 的同步批量入口与批量异步
+    // 是两个入口、两处文案，由调用方按入口给。
     SendResult sendBatchKernel(const std::vector<Message>& msgs, const MessageQueue* pinned,
-                               int32_t timeoutMillis);
+                               int32_t timeoutMillis, const std::string& pinnedGuardMessage);
     // 发送一个**已经编码好**的批量（Java `sendDirect(MessageBatch, mq, callback)` 落到
     // `defaultMQProducerImpl.send(batch)`）。
     //

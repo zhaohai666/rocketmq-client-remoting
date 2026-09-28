@@ -109,3 +109,7 @@ target_link_libraries(rmq_live_scheduled_intervals PRIVATE rocketmq::remoting)
 # 后置订阅立即生效真机联调：subscribe 之后 broker 的 topic→group 表立刻登记本组（不打进 ctest）
 add_executable(rmq_live_subscribe live_subscribe.cpp)
 target_link_libraries(rmq_live_subscribe PRIVATE rocketmq::remoting)
+
+# 定点发送 topic 一致性守卫真机联调：拒在本端（broker 上 maxOffset 不动），放行腿照常收齐（不打进 ctest）
+add_executable(rmq_live_pinned_guard live_pinned_guard.cpp)
+target_link_libraries(rmq_live_pinned_guard PRIVATE rocketmq::remoting)

@@ -60,6 +60,11 @@ from . import validators
 
 logger = get_logger()
 
+# 定点发送守卫的两处 Java 文案（同步 DefaultMQProducerImpl:1235、异步 :1278），
+# 逐字保留：两处文案不同是 Java 的原样，跨语言对齐时按入口取。
+_PINNED_TOPIC_MISMATCH_SYNC = "message's topic not equal mq's topic"
+_PINNED_TOPIC_MISMATCH_ASYNC = "Topic of the message does not match its target message queue"
+
 
 def _restores_caller_message(fn):
     """发送结束后还原**调用方**那条 Message（Java ``sendKernelImpl:1095-1096`` 的 finally）：
@@ -1014,6 +1019,19 @@ class DefaultMQProducer:
             return topic
         return NamespaceUtil.wrap_namespace(self.namespace, topic)
 
+    def _check_pinned_topic(self, topic: str, mq: MessageQueue, message: str) -> None:
+        """定点发送的 topic 一致性守卫（Java ``DefaultMQProducerImpl:1234-1236`` 同步 /
+        ``:1277-1278`` 异步，两处文案不同，由调用方给）。
+
+        比较的是**各自拼过命名空间之后**的名字 —— Java 的公开入口先
+        ``msg.setTopic(withNamespace(...))``、再把 mq 过 ``ClientConfig.queueWithNamespace``，
+        所以比的是同一命名空间下的两个资源名（``wrapNamespace`` 幂等，已经带前缀的入参不会
+        套两层）。少了这道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的
+        队列名写入，SendResult 一切正常，而消息落进了**另一个 topic** 的分区，谁也消费不到。
+        """
+        if self._with_namespace(mq.topic) != topic:
+            raise MQClientException(message)
+
     def _topic_publish_info(self, topic: str) -> "TopicPublishInfo":
         """对应 Java DefaultMQProducerImpl.tryToFindTopicPublishInfo。
 
@@ -1079,6 +1097,10 @@ class DefaultMQProducer:
             return self._send_batch(list(msg), mq, timeout)
         msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
+        if mq is not None:
+            # Java 的顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
+            # 排在压缩之前，拒绝时调用方那条消息连次数都不用还原。
+            self._check_pinned_topic(msg.topic, mq, _PINNED_TOPIC_MISMATCH_SYNC)
         # 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
         # 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
         # 消费端只解一层就拿到压缩流。这里避免该问题。
@@ -1399,12 +1421,21 @@ class DefaultMQProducer:
             # 批量异步：Java 走 SEND_BATCH_MESSAGE + invokeAsync，本实现的批量发送只有同步内核，
             # 所以这里是「在 AsyncSenderExecutor 线程里同步发一批」。对调用方语义没差别 ——
             # 不阻塞发送方、回调照样在 callbackExecutor 上跑。
-            result = self._send_batch(list(msg), mq, timeout)
+            # 定点时带上异步那处文案（Java ``:1277-1278``）；没有队列就无从比较，
+            # 沿用内核默认的三参调用（同步文案也用不上）。
+            if mq is None:
+                result = self._send_batch(list(msg), mq, timeout)
+            else:
+                result = self._send_batch(list(msg), mq, timeout, _PINNED_TOPIC_MISMATCH_ASYNC)
             self._execute_on_callback_thread(
                 lambda: self._complete(callback, result, None, None))
             return
         msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
+        if mq is not None:
+            # Java ``:1277-1278``：异步分支在同一位置用另一处文案抛，异常由 runnable 的
+            # catch 转给 ``newCallBack.onException``（这里由 ``send_async`` 的 `_run` 收口）。
+            self._check_pinned_topic(msg.topic, mq, _PINNED_TOPIC_MISMATCH_ASYNC)
         # 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
         sys_flag = self.try_to_compress_message(msg)
         if mq is not None:
@@ -1733,7 +1764,8 @@ class DefaultMQProducer:
 
     # ---------------- 批量发送 ----------------
     def _send_batch(self, msgs: List[Message], mq: Optional[MessageQueue] = None,
-                    timeout_millis: Optional[int] = None) -> SendResult:
+                    timeout_millis: Optional[int] = None,
+                    pinned_guard_message: str = _PINNED_TOPIC_MISMATCH_SYNC) -> SendResult:
         client = self._require_client()
         timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
         if not msgs:
@@ -1751,6 +1783,11 @@ class DefaultMQProducer:
         batch = MessageBatch.generate_from_list(msgs)
         set_uniq_id(batch)
         batch.set_body(batch.encode())
+        if mq is not None:
+            # Java：`impl.send(batch(msgs), queueWithNamespace(mq), timeout)` 与单条共用同一处
+            # 同步守卫（MessageBatch extends Message），异步入口则是另一处文案。
+            # ``pinned_guard_message`` 由调用方按入口选：同步默认，异步传 ASYNC。
+            self._check_pinned_topic(batch.topic, mq, pinned_guard_message)
         # MessageBatch 会被 try_to_compress_message 直接跳过（返回 0），批量消息永不压缩
         sys_flag = self.try_to_compress_message(batch)
         if mq is not None:

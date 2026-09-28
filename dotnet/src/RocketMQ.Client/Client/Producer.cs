@@ -1252,6 +1252,28 @@ public class DefaultMQProducer
         return outMsg;
     }
 
+    // 定点发送守卫的两处 Java 文案（同步 DefaultMQProducerImpl:1235、异步 :1278），逐字保留：
+    // 两处文案不同是 Java 的原样，按入口取用。
+    private const string PinnedTopicMismatchSync = "message's topic not equal mq's topic";
+    private const string PinnedTopicMismatchAsync =
+        "Topic of the message does not match its target message queue";
+
+    /// <summary>定点发送（显式给了 mq）的 topic 一致性守卫（Java
+    /// <c>DefaultMQProducerImpl:1234-1236</c> 同步 / <c>:1277-1278</c> 异步，两处文案不同，
+    /// 由调用方按入口传）。比的是<b>各自拼过命名空间之后</b>的名字 —— Java 的公开入口先
+    /// <c>msg.setTopic(withNamespace(...))</c>、再把 mq 过 <c>ClientConfig.queueWithNamespace</c>，
+    /// 所以比的是同一命名空间下的两个资源名（WrapNamespace 幂等，已经带前缀的入参不会套两层）。
+    /// 少了这道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的队列名写入，
+    /// SendResult 一切正常，消息却落进了<b>另一个 topic</b> 的分区，无人消费也无人报错。</summary>
+    private void CheckPinnedTopic(string msgTopic, MessageQueue mq, string message)
+    {
+        if (NamespaceUtil.WrapNamespace(_namespace, msgTopic)
+            != NamespaceUtil.WrapNamespace(_namespace, mq.Topic))
+        {
+            throw new MQClientException(message);
+        }
+    }
+
     // ---------------- 同步发送 ----------------
 
     /// <summary>重试耗尽后给最后一次失败定性，决定最终 MQClientException 的错误码。
@@ -1596,6 +1618,8 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         CheckMessage(msg);
+        // Java 的顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
+        CheckPinnedTopic(msg.Topic, mq, PinnedTopicMismatchSync);
         Message outbound = WithNamespace(msg);
         int sysFlag = PrepareForSend(outbound);
         return SendWithHooks(c, outbound, mq, timeout, sysFlag);
@@ -1793,6 +1817,13 @@ public class DefaultMQProducer
             // 批量没有异步内核（Java 有，本端口的批量只有同步内核）：在池线程里同步发一批，
             // 结果照样从 CompleteAsync 走回调池转交。与 Python/Rust/C++ 同一处理。
             // mq 非空时必须把它传下去，否则「定点批量异步」会退化成轮询选队列。
+            // Java 的批量异步定点走 `impl.send(batch, mq, cb, timeout)`，守卫文案是**异步**
+            // 那一处（下面 Send→SendToMqImpl 里的同步文案只服务同步入口）。
+            if (mq is not null)
+            {
+                CheckPinnedTopic(msg.Topic, mq, PinnedTopicMismatchAsync);
+            }
+
             SendResult sent = mq is null ? Send(msg, timeout) : Send(msg, mq, timeout);
             CompleteAsync(callback, sent, null, null, permits);
             return;
@@ -1804,6 +1835,13 @@ public class DefaultMQProducer
         }
 
         CheckMessage(msg);
+        if (mq is not null)
+        {
+            // Java `:1277-1278`：异步分支在同一位置用另一处文案抛，异常由 runnable 的 catch
+            // 转给 `newCallBack.onException`（这里由 ExecuteAsyncSend 的 Run 收口）。
+            CheckPinnedTopic(msg.Topic, mq, PinnedTopicMismatchAsync);
+        }
+
         int sysFlag = PrepareForSend(msg);
         if (mq is not null)
         {
@@ -2276,6 +2314,39 @@ public class DefaultMQProducer
             _createTopicKey, _defaultTopicQueueNums);
     }
 
+    /// <summary>
+    /// 定点单向（Java <c>DefaultMQProducer.sendOneway(Message, MessageQueue):660-663</c>）。
+    /// <b>没有</b> topic 一致性守卫 —— Java 的 sendOneway 有意不判（<c>:1303-1310</c>）：
+    /// 报文头里的 topic 取 <c>msg.getTopic()</c>、只有 queueId 来自 mq，所以 topic 写错时
+    /// 会落进另一条 topic 的同号队列且没有任何反馈。地址走客户端的路由缓存
+    /// （Java <c>findBrokerAddressInPublish</c>），所以必须先有过一次成功发送把缓存喂上。
+    /// </summary>
+    public void SendOneway(Message msg, MessageQueue mq)
+    {
+        MQClientInstance c = GetClient();
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        int sysFlag = PrepareForSend(outbound);
+        string brokerAddr = string.Empty;
+        try
+        {
+            brokerAddr = c.BrokerAddrForMq(mq) ?? string.Empty;
+        }
+        catch (Exception)
+        {
+            // 查不到 broker 地址不影响拦截判定，brokerAddr 留空
+        }
+
+        RunCheckForbidden(outbound, mq, brokerAddr, null, CommunicationMode.Oneway);
+        if (_enableTraceContext)
+        {
+            TraceParentContext.Inject(outbound);
+        }
+
+        c.SendMessageOneway(_producerGroup, outbound, mq, _sendMsgTimeout, sysFlag, _unitMode,
+            _createTopicKey, _defaultTopicQueueNums);
+    }
+
     // ---------------- 批量 ----------------
 
     public SendResult SendBatch(List<Message> msgs, int timeoutMillis = -1)
@@ -2299,6 +2370,9 @@ public class DefaultMQProducer
         MQClientInstance c = GetClient();
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _sendMsgTimeout;
         Message outbound = BuildBatchOutbound(msgs);
+        // Java：`send(Collection, MessageQueue, timeout)` → `impl.send(batch(msgs), mq, timeout)`，
+        // 与单条共用同一处同步守卫（MessageBatch extends Message）。
+        CheckPinnedTopic(outbound.Topic, mq, PinnedTopicMismatchSync);
         int sysFlag = PrepareForSend(outbound);
         return SendWithHooks(c, outbound, mq, timeout, sysFlag);
     }

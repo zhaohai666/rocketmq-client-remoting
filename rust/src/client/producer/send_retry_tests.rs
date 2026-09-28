@@ -2175,3 +2175,200 @@ fn send_async_before_start_raises_without_calling_back() {
     assert_eq!(cb.done.load(Ordering::SeqCst), 0);
 }
 
+// ------------------------------------------------- 定点发送的 topic 一致性守卫
+//
+// Java 全客户端树只有两处守卫（同步 `DefaultMQProducerImpl:1234-1236`、异步 `:1277-1278`），
+// 两处文案不同。假集群在这里的价值是 `requests(0) == 0`：守卫必须在**任何请求上线之前**
+// 拒绝，真集群只能看到「结果不对」，看不到「一个字节都没出去」。
+
+/// 定点同步发送在 `sendKernelImpl` **之前**比 topic，不符就拒 —— 假 broker 一笔请求都收不到。
+#[tokio::test]
+async fn pinned_sync_send_refuses_a_mismatched_topic_before_any_request() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("pinned_guard_sync", &cluster).await;
+    let mq = MessageQueue::new("T2", "broker-0", 0);
+    let mut msg = body_of(8);
+
+    let err = producer
+        .send(&mut msg, Some(3_000), Some(&mq))
+        .await
+        .expect_err("topic 不符必须拒");
+    let (code, message) = expect_client_code(err);
+    assert_eq!(code, None);
+    assert_eq!(message, PINNED_TOPIC_MISMATCH_SYNC);
+    assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
+    assert_eq!(msg.topic, "T1", "守卫在压缩之前，调用方的消息不该被动过");
+    producer.shutdown();
+}
+
+/// 同 topic 的定点发送照常上线，且线上带的就是那个 topic（守卫不能宽到误伤）。
+#[tokio::test]
+async fn pinned_sync_send_with_a_matching_topic_reaches_the_broker() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("pinned_guard_ok", &cluster).await;
+    let mq = MessageQueue::new("T1", "broker-0", 0);
+    let mut msg = body_of(8);
+
+    let result = producer
+        .send(&mut msg, Some(3_000), Some(&mq))
+        .await
+        .expect("同 topic 定点发送应当成功");
+    assert_eq!(result.status, SendStatus::SendOk);
+    assert_eq!(cluster.requests(0), 1);
+    assert_eq!(ext_value(&cluster.send_ext(0, 0), "b"), Some("T1"));
+    assert_eq!(ext_value(&cluster.send_ext(0, 0), "n"), Some("broker-0"));
+    producer.shutdown();
+}
+
+/// 命名空间下比的是**各自包装之后**的资源名（Java 公开入口先 `withNamespace(msg topic)`、
+/// 队列再过 `queueWithNamespace`，`wrapNamespace` 幂等）——已带前缀的队列 topic 不能被误拒，
+/// 跨命名空间的同名 topic 仍然是不同资源。三条与 Python
+/// `test_pinned_send_topic_guard.py` 的命名空间用例同题。
+#[tokio::test]
+async fn pinned_sync_send_compares_topics_after_namespace_wrapping() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("pinned_guard_ns", &cluster).await;
+    producer.set_namespace("ns1");
+
+    // ① 队列 topic 已经带前缀（路由表返回的就是这个形状）
+    let mq = MessageQueue::new("ns1%T1", "broker-0", 0);
+    let mut msg = body_of(8);
+    producer
+        .send(&mut msg, Some(3_000), Some(&mq))
+        .await
+        .expect("已带前缀的队列 topic 不该被误拒");
+    assert_eq!(
+        ext_value(&cluster.send_ext(0, 0), "b"),
+        Some("ns1%T1"),
+        "上线的是带前缀的资源名"
+    );
+
+    // ② 队列 topic 是裸名：两边都包装后相等，同样放行
+    let mq = MessageQueue::new("T1", "broker-0", 0);
+    let mut msg = body_of(8);
+    producer
+        .send(&mut msg, Some(3_000), Some(&mq))
+        .await
+        .expect("裸名队列同样应当放行");
+    assert_eq!(ext_value(&cluster.send_ext(0, 1), "b"), Some("ns1%T1"));
+
+    // ③ 另一个命名空间下的同名 topic —— 是另一个资源，要拒
+    let mq = MessageQueue::new("ns2%T1", "broker-0", 0);
+    let mut msg = body_of(8);
+    let err = producer
+        .send(&mut msg, Some(3_000), Some(&mq))
+        .await
+        .expect_err("跨命名空间要说 no");
+    assert_eq!(expect_client_code(err).1, PINNED_TOPIC_MISMATCH_SYNC);
+    assert_eq!(cluster.requests(0), 2, "前两条上线、第三条不上线");
+    producer.shutdown();
+}
+
+/// 批量是 `MessageBatch extends Message`，落在**同一处同步守卫**上（Java
+/// `send(Collection, MessageQueue, timeout)` → `impl.send(batch, mq, timeout)`）。
+#[tokio::test]
+async fn pinned_batch_send_shares_the_sync_guard() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("pinned_guard_batch", &cluster).await;
+
+    let mq = MessageQueue::new("T2", "broker-0", 0);
+    let err = producer
+        .send_batch(vec![body_of(8), body_of(9)], Some(&mq), Some(3_000))
+        .await
+        .expect_err("批量 topic 不符同样要拒");
+    assert_eq!(expect_client_code(err).1, PINNED_TOPIC_MISMATCH_SYNC);
+    assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
+
+    let mq = MessageQueue::new("T1", "broker-0", 0);
+    producer
+        .send_batch(vec![body_of(8), body_of(9)], Some(&mq), Some(3_000))
+        .await
+        .expect("同 topic 的定点批量应当成功");
+    assert_eq!(cluster.requests(0), 1);
+    assert_eq!(cluster.send_code(0, 0), request_code::SEND_BATCH_MESSAGE);
+    assert_eq!(ext_value(&cluster.send_ext(0, 0), "b"), Some("T1"));
+    producer.shutdown();
+}
+
+/// 异步入口用**另一句**文案（Java `:1277-1278`），并且只从回调交一次出去 ——
+/// 守卫被放在 `run_async_send` 里，回调侧的 `onException` 由 `fail_async` 交付。
+#[tokio::test]
+async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("pinned_guard_async", &cluster).await;
+    let mq = MessageQueue::new("T2", "broker-0", 0);
+    let cb = Arc::new(Recorder::default());
+
+    producer
+        .send_async(body_of(8), cb.clone(), Some(3_000), Some(mq))
+        .expect("运行时内可派发");
+    assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
+    assert_eq!(cb.ok.load(Ordering::SeqCst), 0);
+    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "失败只能交一次");
+    let errors = cb.errors();
+    assert!(
+        errors.first().is_some_and(|e| e.contains(PINNED_TOPIC_MISMATCH_ASYNC)),
+        "异步文案要逐字对上 Java: {errors:?}"
+    );
+    assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
+    producer.shutdown();
+}
+
+/// Java 刻意**没有**给 `sendOneway(msg, mq)` 加守卫（`:1303-1310` 直接进 `sendKernelImpl`），
+/// 本端口照抄 —— 守卫的位置若被改动（挪进 `send_pinned` 之类），这一条会红。
+///
+/// 先来一笔普通发送把 broker 地址表喂上：单向定点发送自己不做路由查询
+/// （`need_addr` 只读缓存），这一步与守卫无关。
+#[tokio::test]
+async fn oneway_pinned_send_has_no_topic_guard_like_java() {
+    let cluster = MockCluster::start(1, true).await;
+    cluster.script(0, vec![], (response_code::SUCCESS, 0));
+    let producer = started("pinned_guard_oneway", &cluster).await;
+    let mut warmup = body_of(8);
+    producer
+        .send(&mut warmup, Some(3_000), None)
+        .await
+        .expect("先让地址表里出现 broker-0");
+
+    let mq = MessageQueue::new("T2", "broker-0", 0);
+    let mut msg = body_of(8);
+    producer
+        .send_oneway(&mut msg, Some(&mq))
+        .await
+        .expect("Java 的 sendOneway 没有守卫");
+    // 单向发送不等应答，客户端返回时假 broker 可能还没读完这一帧 —— 轮询等它落地。
+    assert!(
+        wait_until(|| cluster.requests(0) == 2).await,
+        "topic 不符的单向消息照发（假 broker 实际收到 {} 笔）",
+        cluster.requests(0)
+    );
+    assert_eq!(
+        ext_value(&cluster.send_ext(0, 1), "b"),
+        Some("T1"),
+        "Java 的头里 topic 取 msg.getTopic()，只有 queueId 来自 mq —— 没有守卫时就会这样错位上线"
+    );
+    producer.shutdown();
+}
+
+/// 顺序与 Java 一致：`makeSureStateOK()` 在最前，未启动的生产者先报「没启动」，
+/// 守卫根本轮不到（同步路径）。
+#[tokio::test]
+async fn state_check_precedes_the_pinned_guard() {
+    let producer = DefaultMQProducer::new("GID_pinned_unstarted").expect("组名合法");
+    let mq = MessageQueue::new("T2", "broker-0", 0);
+    let mut msg = body_of(8);
+    let err = producer
+        .send(&mut msg, Some(1_000), Some(&mq))
+        .await
+        .expect_err("未启动就该报错");
+    assert!(
+        err.to_string().contains("producer not started"),
+        "状态检查要先于守卫: {err}"
+    );
+}
+

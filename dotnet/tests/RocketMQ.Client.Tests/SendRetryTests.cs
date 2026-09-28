@@ -554,6 +554,99 @@ public class SendRetryTests
     }
 
     /// <summary>
+    /// 定点发送的 topic 一致性守卫（Java <c>DefaultMQProducerImpl:1234-1236</c> 同步一处）：
+    /// 不符就拒、一个 SEND 都不上线；命名空间下比的是各自包装后的资源名（WrapNamespace
+    /// 幂等，已带前缀的队列 topic 不能被误拒）；批量走的是同一处守卫
+    /// （Java 的 MessageBatch extends Message）。
+    /// </summary>
+    [Fact]
+    public void PinnedSendRefusesAMismatchedTopic_BeforeAnyRequest()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQProducer producer = Started(cluster, "GID_PinnedGuard");
+        cluster.ClearRequests();
+
+        MQClientException e = Assert.Throws<MQClientException>(() =>
+            producer.Send(Msg(), new MessageQueue("T2", MockCluster.BrokerName(0), 0)));
+        Assert.Equal("message's topic not equal mq's topic", e.Message);
+        Assert.Equal(0, cluster.Requests(0));
+        Assert.Null(cluster.FirstSendRequest());
+
+        // 同 topic 照发（守卫不能宽到误伤）
+        Assert.Equal(SendStatus.SendOk, producer
+            .Send(Msg(), new MessageQueue(Topic, MockCluster.BrokerName(0), 0)).SendStatus);
+        Assert.Equal(Topic, cluster.FirstSendRequest()!.Ext["b"]);
+
+        // 批量共用同一处守卫：不符即拒、零上线；同 topic 的批量照发
+        int sent = cluster.Records().Count(r => IsSend(r.Code));
+        Assert.Throws<MQClientException>(() => producer.SendBatch(
+            new List<Message> { Msg(), Msg() }, new MessageQueue("T2", MockCluster.BrokerName(0), 0)));
+        Assert.Equal(sent, cluster.Records().Count(r => IsSend(r.Code)));
+        Assert.Equal(SendStatus.SendOk, producer.SendBatch(
+            new List<Message> { Msg(), Msg() },
+            new MessageQueue(Topic, MockCluster.BrokerName(0), 0)).SendStatus);
+        Assert.Equal(RequestCode.SendBatchMessage, cluster.SendRequestAt(sent)!.Code);
+        producer.Shutdown();
+    }
+
+    private static bool IsSend(int code) =>
+        code is RequestCode.SendMessage or RequestCode.SendMessageV2
+            or RequestCode.SendBatchMessage or RequestCode.SendReplyMessageV2;
+
+    /// <summary>
+    /// 定点单向（Java <c>DefaultMQProducer.sendOneway(Message, MessageQueue):660-663</c>）：
+    /// 有意**没有**守卫（<c>:1303-1310</c> 的 sendOneway 不判）—— topic 不符照样发。
+    /// 报文头里的 topic 取 msg 自己的（b）、只有 queueId 来自 mq（e），这正是「topic 写错
+    /// 会静默落进另一条 topic 的同号队列」的机制，所以三个字段都要取证。
+    /// </summary>
+    [Fact]
+    public void PinnedOnewayHasNoTopicGuard_AndTakesOnlyTheQueueIdFromTheMq()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQProducer producer = Started(cluster, "GID_OnewayPinned");
+        cluster.ClearRequests();
+
+        producer.SendOneway(Msg(), new MessageQueue("T2", MockCluster.BrokerName(0), 3));
+        Assert.True(WaitUntil(() => cluster.FirstSendRequest() != null, 3000), "单向请求要被抓到");
+        WireRecord oneway = cluster.FirstSendRequest()!;
+        // 守卫若存在，这一笔会抛；发出来了且 b 是 msg 自己的 topic（不是队列的 T2）
+        Assert.Equal(Topic, oneway.Ext["b"]);
+        Assert.Equal("3", oneway.Ext["e"]);
+        Assert.Equal(MockCluster.BrokerName(0), oneway.Ext["n"]);
+        producer.Shutdown();
+    }
+
+    /// <summary>
+    /// 命名空间下定点守卫比的是**各自包装之后**的资源名：队列 topic 已带前缀（真集群路由
+    /// 返回的就是这个形状）不能被误拒，裸名同样放行，跨命名空间的同名 topic 仍是不同资源。
+    /// </summary>
+    [Fact]
+    public void PinnedSendComparesTopicsAfterNamespaceWrapping()
+    {
+        using var cluster = MockCluster.Start(1);
+        DefaultMQProducer producer = Started(cluster, "GID_PinnedGuardNs");
+        producer.Namespace = "ns1";
+        cluster.ClearRequests();
+
+        // ① 队列 topic 已带前缀
+        Assert.Equal(SendStatus.SendOk, producer
+            .Send(Msg(), new MessageQueue("ns1%T1", MockCluster.BrokerName(0), 0)).SendStatus);
+        Assert.Equal("ns1%T1", cluster.FirstSendRequest()!.Ext["b"]);
+
+        // ② 队列 topic 是裸名：两边包装后相等，同样放行
+        Assert.Equal(SendStatus.SendOk, producer
+            .Send(Msg(), new MessageQueue(Topic, MockCluster.BrokerName(0), 0)).SendStatus);
+        Assert.Equal("ns1%T1", cluster.SendRequestAt(1)!.Ext["b"]);
+
+        // ③ 另一个命名空间下的同名 topic：要拒，且不多上线一笔
+        MQClientException e = Assert.Throws<MQClientException>(() => producer
+            .Send(Msg(), new MessageQueue("ns2%T1", MockCluster.BrokerName(0), 0)));
+        Assert.Equal("message's topic not equal mq's topic", e.Message);
+        Assert.Null(cluster.SendRequestAt(2));
+        producer.Shutdown();
+    }
+
+    /// <summary>
     /// 队列没有 broker 名（手工指定的 MessageQueue）时，<c>n</c> 整条不上线，而不是写
     /// 一个空串 —— Java 那个字段是 <c>@CFNullable</c>，<c>writeIfNotNull</c> 会跳过 null。
     /// 纯离线：只建请求、不发出去（Encode 前要把头展开成 extFields，同 broker 侧口径）。

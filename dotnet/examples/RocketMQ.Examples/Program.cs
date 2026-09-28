@@ -56,6 +56,7 @@ internal static class Program
                 "fail-fast" => LiveFailFast.Run(rest),
                 "scheduled-intervals" => LiveScheduledIntervals.Run(rest),
                 "subscribe" => LiveSubscribe.Run(rest),
+                "pinned-guard" => LivePinnedGuard.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -105,6 +106,7 @@ internal static class Program
               fail-fast  [namesrv]        broker 真死时在途请求立刻判死（Java failFast）联调（会重启 broker）
               scheduled-intervals [namesrv] 真实集群周期任务联调（路由刷新周期 1s/30s、位点落盘周期 1s/60s 真机计时）
               subscribe  [namesrv]        真实集群后置订阅联调（start() 之后 subscribe 立即推心跳、新 topic 真被消费）
+              pinned-guard [namesrv]      真实集群定点发送 topic 守卫联调（真路由不误拒、拒在本端且 broker 无痕、单向无守卫）
             """);
     }
 }

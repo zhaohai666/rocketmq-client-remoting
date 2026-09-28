@@ -1499,6 +1499,58 @@ void testAsyncSendHeaderCarriesBrokerNameAndTopicKeys() {
     p.shutdown();
 }
 
+// 23. 定点发送的守卫在异步入口上是**另一句文案**（Java `DefaultMQProducerImpl:1277-1278`），
+//     异常走回调；拒绝发生在任何请求之前（mock 的 SEND 计数不动）。批量异步共用同一处。
+void testPinnedTopicGuardAsync() {
+    AsyncFixture fx("AsyncPinnedGuard");
+    DefaultMQProducer p("PG_async_pinned_guard");
+    p.setNamesrvAddr(fx.ns.address());
+    p.start();
+    const MessageQueue pinned(fx.topic, fx.topic + "-broker", 0);
+
+    {
+        // ① 单条异步 topic 不符：异步文案，零请求
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendAsync(plainMessage("AsyncPinnedGuardOther"), pinned, cb, 3000);
+        expect(cb->waitDone(5000), "a refused async send still calls back");
+        auto s = cb->snapshot();
+        expectInt(s.exceptionCount, 1, "the mismatch surfaces through onException");
+        expectInt(s.successCount, 0, "no success on the mismatch");
+        expect(s.message == "Topic of the message does not match its target message queue",
+               "the async guard keeps Java's (different) wording verbatim", s.message);
+        expectInt(fx.broker.sendCount(), 0, "nothing reached the broker");
+    }
+    {
+        // ② 同 topic 照发（守卫不能宽到误伤）
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendAsync(plainMessage(fx.topic), pinned, cb, 3000);
+        expect(cb->waitDone(5000), "a matching pinned async send settles");
+        expectInt(cb->snapshot().successCount, 1, "onSuccess on the matching path");
+        expectInt(fx.broker.sendCount(), 1, "exactly one request on the wire");
+    }
+    {
+        // ③ 批量异步共用同一处守卫与同一句文案
+        std::vector<Message> bad{plainMessage("AsyncPinnedGuardOther"),
+                                 plainMessage("AsyncPinnedGuardOther")};
+        auto cb = std::make_shared<RecordingCallback>();
+        p.sendBatchAsync(bad, pinned, cb, 3000);
+        expect(cb->waitDone(5000), "a refused async batch still calls back");
+        auto s = cb->snapshot();
+        expectInt(s.exceptionCount, 1, "the batch mismatch surfaces through onException");
+        expect(s.message == "Topic of the message does not match its target message queue",
+               "the async batch shares the async wording", s.message);
+        expectInt(fx.broker.sendCount(), 1, "the refused batch adds no request");
+
+        std::vector<Message> good{plainMessage(fx.topic), plainMessage(fx.topic)};
+        auto cb2 = std::make_shared<RecordingCallback>();
+        p.sendBatchAsync(good, pinned, cb2, 3000);
+        expect(cb2->waitDone(5000), "a matching pinned async batch settles");
+        expectInt(cb2->snapshot().successCount, 1, "onSuccess on the matching batch");
+        expectInt(fx.broker.sendCount(), 2, "one batch request more");
+    }
+    p.shutdown();
+}
+
 // 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
 void runCase(const char* name, void (*fn)()) {
     const auto began = std::chrono::steady_clock::now();
@@ -1547,6 +1599,7 @@ int main() {
             testBatchAsyncWritesClientIdsBeforeEncodingTheBody);
     runCase("asyncSendHeaderCarriesBrokerNameAndTopicKeys",
             testAsyncSendHeaderCarriesBrokerNameAndTopicKeys);
+    runCase("pinnedTopicGuardAsync", testPinnedTopicGuardAsync);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

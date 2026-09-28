@@ -1105,6 +1105,167 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
     }
 }
 
+// 10. 定点发送的 topic 一致性守卫（Java `DefaultMQProducerImpl:1234-1236` 同步一处）：
+//     不符就拒、**一个 SEND 都不上线**；命名空间下比的是各自包装后的资源名（`wrapNamespace`
+//     幂等，已带前缀的队列 topic 不能被误拒）；跨命名空间的同名 topic 仍是不同资源。
+//     批量走的是同一处守卫（MessageBatch extends Message）；定点单向**故意没有**守卫
+//     （Java `DefaultMQProducer.sendOneway(Message, MessageQueue):660-663` → `:1303-1310`
+//     不判），报文按 msg 自己的 topic 落库 —— 这里把这条差异也钉在用例里。
+void testPinnedTopicGuard(MockEndpoint& mock) {
+    const std::string topic = "PinnedGuardOk";
+    mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
+
+    DefaultMQProducer p("PG_pinned_guard");
+    p.setNamesrvAddr(mock.address());
+    p.start();
+
+    {
+        // ① 同步单条 topic 不符：同步文案，零 SEND
+        const int before = mock.sendCount();
+        int threw = 0;
+        try {
+            p.send(plainMessage("PinnedGuardOther"), MessageQueue(topic, "broker-a", 0), 3000);
+        } catch (const MQClientException& e) {
+            threw = 1;
+            expect(std::string(e.what()) == "message's topic not equal mq's topic",
+                   "the sync guard keeps Java's wording verbatim", e.what());
+        } catch (const std::exception& e) {
+            std::printf("  wrong exception: %s\n", e.what());
+        }
+        expectInt(threw, 1, "a mismatched pinned send is refused");
+        expectInt(mock.sendCount() - before, 0, "the guard refuses before any SEND reaches the wire");
+    }
+    {
+        // ② 同 topic：照常上线（守卫不能宽到误伤）
+        const int before = mock.sendCount();
+        SendResult r = p.send(plainMessage(topic), MessageQueue(topic, "broker-a", 0), 3000);
+        expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
+                  "a matching pinned send still goes out");
+        expectInt(mock.sendCount() - before, 1, "exactly one SEND on the wire");
+        WireRecord rec = mock.sendRecord(static_cast<size_t>(mock.sendCount() - 1));
+        const auto topicField = rec.ext.find("b");  // V2 单字母键：topic
+        expect(topicField != rec.ext.end() && topicField->second == topic,
+               "the wire carries the message topic");
+    }
+    {
+        // ③ 批量（同步内核）走同一处守卫：不符即拒、零 SEND
+        std::vector<Message> msgs{plainMessage("PinnedGuardOther"), plainMessage("PinnedGuardOther")};
+        const int before = mock.sendCount();
+        int threw = 0;
+        try {
+            p.sendBatch(msgs, MessageQueue(topic, "broker-a", 0), 3000);
+        } catch (const MQClientException& e) {
+            threw = 1;
+            expect(std::string(e.what()) == "message's topic not equal mq's topic",
+                   "the batch kernel shares the sync guard", e.what());
+        } catch (const std::exception& e) {
+            std::printf("  wrong exception: %s\n", e.what());
+        }
+        expectInt(threw, 1, "a mismatched pinned batch is refused");
+        expectInt(mock.sendCount() - before, 0, "no SEND leaves for a refused batch");
+    }
+    {
+        // ④ 同 topic 的批量照发，请求码是批量那条
+        std::vector<Message> msgs{plainMessage(topic), plainMessage(topic)};
+        const int before = mock.sendCount();
+        SendResult r = p.sendBatch(msgs, MessageQueue(topic, "broker-a", 0), 3000);
+        expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
+                  "a matching pinned batch still goes out");
+        expectInt(mock.sendCount() - before, 1, "one batch SEND on the wire");
+        WireRecord rec = mock.sendRecord(static_cast<size_t>(mock.sendCount() - 1));
+        expectInt(rec.code, RequestCode::SEND_BATCH_MESSAGE, "the batch request code is used");
+    }
+    {
+        // ⑤ 定点单向（Java DefaultMQProducer.sendOneway(Message, MessageQueue):660-663）：
+        //    有意**没有**守卫（:1303-1310 的 sendOneway 不判）—— topic 不符照样发。
+        //    报文头里的 topic 取 msg 自己的（b）、只有 queueId 来自 mq（e），这正是「topic
+        //    写错会静默落进另一条 topic 的同号队列」的机制，所以两个字段都要取证。
+        const std::string owTarget = "PinnedGuardOnewayTarget";
+        mock.addRoute(owTarget, makeRoute(mock.address(), 4, 4));
+        const int before = mock.sendCount();
+        int threw = 0;
+        try {
+            p.sendOneway(plainMessage("PinnedGuardOther"), MessageQueue(owTarget, "broker-a", 3));
+        } catch (const std::exception& e) {
+            threw = 1;
+            std::printf("  wrong exception: %s\n", e.what());
+        }
+        expectInt(threw, 0, "the pinned oneway has no guard: a mismatched topic still leaves");
+        // 单向没有应答，客户端写完就走：mock 的收包线程可能还没记账，必须轮询等它落地
+        bool arrived = false;
+        for (int i = 0; i < 60 && !arrived; ++i) {
+            arrived = mock.sendCount() - before == 1;
+            if (!arrived) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        expectInt(mock.sendCount() - before, 1, "the mismatched oneway reaches the wire");
+        if (mock.sendCount() > before) {
+            const WireRecord rec = mock.sendRecord(static_cast<size_t>(mock.sendCount() - 1));
+            const auto b = rec.ext.find("b");
+            const auto e = rec.ext.find("e");
+            expect(b != rec.ext.end() && b->second == "PinnedGuardOther",
+                   "the wire topic is the message's own, not the queue's");
+            expect(e != rec.ext.end() && e->second == "3",
+                   "the queueId still comes from the pinned queue");
+        }
+    }
+    p.shutdown();
+
+    // ⑤ 命名空间：比的是各自包装后的资源名
+    const std::string nsTopic = "PinnedGuardNs";
+    const std::string nsWrapped = "ns1%PinnedGuardNs";
+    mock.addRoute(nsWrapped, makeRoute(mock.address(), 1, 1));
+    DefaultMQProducer ns("PG_pinned_guard_ns");
+    ns.setNamesrvAddr(mock.address());
+    ns.setNamespace("ns1");
+    ns.start();
+    {
+        // 队列 topic 已带前缀（路由返回的就是这个形状）——不能误拒
+        const int before = mock.sendCount();
+        SendResult r = ns.send(plainMessage(nsTopic), MessageQueue(nsWrapped, "broker-a", 0), 3000);
+        expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
+                  "an already-prefixed queue topic is not falsely rejected");
+        expectInt(mock.sendCount() - before, 1, "the namespaced send goes out once");
+        WireRecord rec = mock.sendRecord(static_cast<size_t>(mock.sendCount() - 1));
+        const auto topicField = rec.ext.find("b");
+        expect(topicField != rec.ext.end() && topicField->second == nsWrapped,
+               "the wire carries the namespaced resource name");
+    }
+    {
+        // 裸名队列 topic 同样放行（两边包装后相等）
+        const int before = mock.sendCount();
+        int threw = 0;
+        try {
+            // 路由按客户端实际查询的名字（mq.topic）注册：这里补一份裸名路由
+            mock.addRoute(nsTopic, makeRoute(mock.address(), 1, 1));
+            SendResult r = ns.send(plainMessage(nsTopic), MessageQueue(nsTopic, "broker-a", 0), 3000);
+            expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
+                      "a raw queue topic is accepted under a namespace");
+        } catch (const std::exception& e) {
+            threw = 1;
+            std::printf("  unexpected exception: %s\n", e.what());
+        }
+        expectInt(threw, 0, "no exception for a raw queue topic");
+        expectInt(mock.sendCount() - before, 1, "it was really sent");
+    }
+    {
+        // 另一个命名空间下的同名 topic：是另一个资源，要拒
+        const int before = mock.sendCount();
+        int threw = 0;
+        try {
+            ns.send(plainMessage(nsTopic), MessageQueue("ns2%PinnedGuardNs", "broker-a", 0), 3000);
+        } catch (const MQClientException& e) {
+            threw = 1;
+            expect(std::string(e.what()) == "message's topic not equal mq's topic",
+                   "a cross-namespace topic is a mismatch", e.what());
+        } catch (const std::exception& e) {
+            std::printf("  wrong exception: %s\n", e.what());
+        }
+        expectInt(threw, 1, "cross-namespace pinned send is refused");
+        expectInt(mock.sendCount() - before, 0, "no SEND leaves for the cross-namespace mismatch");
+    }
+    ns.shutdown();
+}
+
 }  // namespace
 
 namespace {
@@ -1148,6 +1309,7 @@ int main() {
     runCase("sendHeaderFieldsReachWire", mock, testSendHeaderFieldsReachWire);
     runCase("sendRequestCodeFollowsJava", mock, testSendRequestCodeFollowsJava);
     runCase("requestHooksReachWire", mock, testRequestHooksReachWire);
+    runCase("pinnedTopicGuard", mock, testPinnedTopicGuard);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;
