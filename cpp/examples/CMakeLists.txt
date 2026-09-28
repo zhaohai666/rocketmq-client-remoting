@@ -117,3 +117,7 @@ target_link_libraries(rmq_live_pinned_guard PRIVATE rocketmq::remoting)
 # 空应答（NO_NEW_MSG/NO_MATCHED_MSG）位点修正真机联调：零投递但 broker 侧位点前移（不打进 ctest）
 add_executable(rmq_live_correct_tags_offset live_correct_tags_offset.cpp)
 target_link_libraries(rmq_live_correct_tags_offset PRIVATE rocketmq::remoting)
+
+# OFFSET_ILLEGAL 纠错真机联调：整批作废在途/缓冲消息 + 按修正位点重建 + 立即落盘（不打进 ctest）
+add_executable(rmq_live_offset_illegal live_offset_illegal.cpp)
+target_link_libraries(rmq_live_offset_illegal PRIVATE rocketmq::remoting)

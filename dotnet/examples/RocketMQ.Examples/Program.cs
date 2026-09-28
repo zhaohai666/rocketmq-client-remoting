@@ -57,6 +57,7 @@ internal static class Program
                 "scheduled-intervals" => LiveScheduledIntervals.Run(rest),
                 "subscribe" => LiveSubscribe.Run(rest),
                 "pinned-guard" => LivePinnedGuard.Run(rest),
+                "offset-illegal" => LiveOffsetIllegal.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -107,6 +108,7 @@ internal static class Program
               scheduled-intervals [namesrv] 真实集群周期任务联调（路由刷新周期 1s/30s、位点落盘周期 1s/60s 真机计时）
               subscribe  [namesrv]        真实集群后置订阅联调（start() 之后 subscribe 立即推心跳、新 topic 真被消费）
               pinned-guard [namesrv]      真实集群定点发送 topic 守卫联调（真路由不误拒、拒在本端且 broker 无痕、单向无守卫）
+              offset-illegal [namesrv]    真实集群 OFFSET_ILLEGAL 纠错联调（整批作废在途/缓冲消息并按修正位点重建；修正位点立刻落盘）
             """);
     }
 }

@@ -772,14 +772,16 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
         // 1. 撤：被分走的 + **拉取停摆**的（Java 的 !mqSet.contains(mq) 与
         //    pq.isPullExpired() 两个分支，RebalanceImpl:438-461）。停摆这一支防的是
         //    "循环线程死了/卡住了但队列还归本实例"——不撤就永久静默，且没有任何异常。
-        for (auto it = pullThreads_.begin(); it != pullThreads_.end();) {
-            const std::string key = it->first;
+        //    先收 key 再逐个撤：retireQueueLocked 会擦 pullThreads_ 的条目，
+        //    在迭代器上直接擦会跟 std::map 的 erase 语义纠缠。
+        std::vector<std::string> toRetire;
+        for (auto it = pullThreads_.begin(); it != pullThreads_.end(); ++it) {
+            const std::string& key = it->first;
             const bool revoked = current.find(key) == current.end();
             // 停机期间线程本来就陆续退出，这时不判停摆（否则会刷一堆假 [BUG] 日志）
             const bool stalled = !revoked && started_.load() && !stop_.load()
                 && pullStalledLocked(key);
             if (!revoked && !stalled) {
-                ++it;
                 continue;
             }
             if (stalled) {
@@ -788,34 +790,13 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
                              + ", try remove unnecessary mq, " + key
                              + ", because pull is pause, so try to fixed it");
             }
-            MessageQueue mq;
-            auto mit = mqMap_.find(key);
-            if (mit != mqMap_.end()) mq = mit->second;
-            else {
-                auto cit = current.find(key);
-                if (cit != current.end()) mq = cit->second;   // 停摆队列可能一条都没拉过
-            }
-            int64_t off = -1;
-            auto oit = consumeOffsetTable_.find(key);
-            if (oit != consumeOffsetTable_.end()) off = oit->second;
-            if (!mq.topic.empty()) retired.emplace_back(mq, off);
-            retiredThreads_.push_back(std::move(it->second));
-            // 撤走归属：旧线程下一轮 ownsQueue 即失效并退出，即便同一队列马上
-            // 重新分配给本实例，也会拿到一份**新**凭据、起一条新线程。
-            pullOwners_.erase(key);
-            lastPullAt_.erase(key);
-            mqMap_.erase(key);
-            pending_.erase(key);
-            lockOk_.erase(key);
-            offsetTable_.erase(key);
-            consumeOffsetTable_.erase(key);
-            // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
-            auto pqit = popQueues_.find(key);
-            if (pqit != popQueues_.end()) {
-                pqit->second->setDropped(true);
-                popQueues_.erase(pqit);
-            }
-            it = pullThreads_.erase(it);
+            toRetire.push_back(key);
+        }
+        for (const std::string& key : toRetire) {
+            MessageQueue fallback;
+            auto cit = current.find(key);
+            if (cit != current.end()) fallback = cit->second;   // 停摆队列可能一条都没拉过
+            retireQueueLocked(key, fallback, retired);
         }
     }
     // 撤的收尾（持久化位点 / UNLOCK）必须在起新线程**之前**做完：反过来会让新循环
@@ -846,6 +827,10 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
             if (popMode_ && popQueues_.find(kv.first) == popQueues_.end()) {
                 popQueues_[kv.first] = std::make_shared<PopProcessQueue>();
             }
+            // 新 ProcessQueue 就位 ⇒ 解冻（Java removeProcessQueue 里的 removeOffset
+            // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让
+            // 队列从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
+            frozenOffsets_.erase(kv.first);
             const uint64_t token = ++nextPullToken_;
             pullOwners_[kv.first] = token;
             // 队列一旦分配就进 mqMap_（Java ProcessQueueTable 的键集即"已分配"），不等
@@ -1201,11 +1186,24 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
         }
         // 拉取游标推进到 nextBeginOffset；"已消费位点"由 consumeOffsetTable_ 跟踪并持久化
         if (result.nextBeginOffset >= 0) {
-            std::lock_guard<std::mutex> lk(lock_);
-            offsetTable_[key] = result.nextBeginOffset;
-            // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
-            // NO_MATCHED_MSG）时修正"已消费位点"，见 correctTagsOffsetLocked
-            correctTagsOffsetLocked(key, result.status, result.nextBeginOffset);
+            bool illegal = false;
+            {
+                std::lock_guard<std::mutex> lk(lock_);
+                offsetTable_[key] = result.nextBeginOffset;
+                if (result.status == PullStatus::OFFSET_ILLEGAL) {
+                    // Java DefaultMQPushConsumerImpl:402-427 —— 位点被 broker 纠正，
+                    // 纠错 + 撤队列 + 落盘的整条链路见 handleOffsetIllegal。
+                    // 冻结位点要在锁内先落地，纠错的其余步骤（网络 RPC）放锁外。
+                    illegal = true;
+                } else {
+                    // Java :394-401 —— 空应答（NO_NEW_MSG / NO_MATCHED_MSG）时修正
+                    // "已消费位点"，见 correctTagsOffsetLocked
+                    correctTagsOffsetLocked(key, result.status, result.nextBeginOffset);
+                }
+            }
+            if (illegal) {
+                handleOffsetIllegal(key, result.nextBeginOffset);
+            }
         }
     }
 }
@@ -1612,10 +1610,13 @@ void DefaultMQPushConsumer::dispatchLoop() {
                 if (it == mqMap_.end()) continue;
                 mq = it->second;
             }
-            std::vector<MessageExt> batch = takeBatchForConsume(key);
+            // 连同这批消息所属的 ProcessQueue 代号一起取走：消费/ack 前比对，
+            // 不一致整批作废（Java ConsumeMessageConcurrentlyService:339）。
+            uint64_t epoch = 0;
+            std::vector<MessageExt> batch = takeBatchForConsume(key, &epoch);
             if (batch.empty()) continue;
             try {
-                bool done = consumeBatch(key, mq, batch);
+                bool done = consumeBatch(key, mq, batch, epoch);
                 progressed = progressed || done;
             } catch (const std::exception& e) {
                 // 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死分发线程）
@@ -2017,7 +2018,18 @@ void DefaultMQPushConsumer::startTraceDispatcher() {
 }
 
 bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQueue& mq,
-                                         const std::vector<MessageExt>& batch) {
+                                         const std::vector<MessageExt>& batch,
+                                         const std::optional<uint64_t>& epoch) {
+    // 队列在本批次排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）：
+    // 这批消息不能再消费也不能 ack —— 它们属于已被丢弃的旧 ProcessQueue，直接作废。
+    // 与 Java ConsumeMessageConcurrentlyService:339 / ConsumeMessageOrderlyService:391
+    // 的 isDropped() 短路同构：**不塞回缓冲**（塞回去只会被新属主重复消费）。
+    if (epoch.has_value() && *epoch != queueEpoch(key)) {
+        logger_warn("the message queue not be able to consume, because it's dropped. group="
+                    + consumerGroup_ + " mq=" + key
+                    + " msgs=" + std::to_string(batch.size()));
+        return false;
+    }
     // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）：
     // broker 回投的消息实际写在 %RETRY%group，原始 topic 在 RETRY_TOPIC 属性里，不还原
     // 用户按 topic 分支的代码会走错。
@@ -2088,7 +2100,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             } else {
                 recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, false);
             }
-            advanceConsumeOffset(key, restored);
+            advanceConsumeOffset(key, restored, std::nullopt, epoch);
             consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
             return true;
         }
@@ -2096,7 +2108,7 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         if (status == ConsumeOrderlyStatus::COMMIT) {
             // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
             recordConsumeRt(mq.topic, hookBeginMs);
-            advanceConsumeOffset(key, restored);
+            advanceConsumeOffset(key, restored, std::nullopt, epoch);
             consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
             return true;
         }
@@ -2178,13 +2190,13 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             logger_warn("BROADCASTING, the message consume failed, drop it: "
                         + std::to_string(dropped) + " msgs in " + mq.toString());
         }
-        advanceConsumeOffset(key, restored);
+        advanceConsumeOffset(key, restored, std::nullopt, epoch);
         consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
     if (acked >= restored.size()) {
         // 整批认可（默认路径）：一条都不用回投，位点直接前进
-        advanceConsumeOffset(key, restored);
+        advanceConsumeOffset(key, restored, std::nullopt, epoch);
         consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
@@ -2222,7 +2234,8 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             handled.push_back(restored[i]);
         }
     }
-    advanceConsumeOffset(key, handled, hasFloor ? std::optional<int64_t>(floorVal) : std::nullopt);
+    advanceConsumeOffset(key, handled, hasFloor ? std::optional<int64_t>(floorVal) : std::nullopt,
+                         epoch);
     consumedCount_.fetch_add(static_cast<int64_t>(handled.size()));
     return msgBackFailed.empty();
 }
@@ -2253,7 +2266,8 @@ std::vector<std::pair<size_t, MessageExt>> DefaultMQPushConsumer::sendBackBatch(
 
 void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
                                                  const std::vector<MessageExt>& batch,
-                                                 const std::optional<int64_t>& floor) {
+                                                 const std::optional<int64_t>& floor,
+                                                 const std::optional<uint64_t>& epoch) {
     if (batch.empty()) {
         // 整批回投都失败时没有任何条目被认可，位点原地不动
         return;
@@ -2268,6 +2282,19 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
         nextOffset = *floor;
     }
     std::lock_guard<std::mutex> lk(lock_);
+    // 代号不一致 ⇒ 这批消息属于已被撤销/重建的旧 ProcessQueue，ack 整批作废
+    //（Java ConsumeMessageConcurrentlyService:267 的 !processQueue.isDropped() 闸门）。
+    // 少了它，旧批次的 ack 会把 broker 刚纠正过的位点又推回非法值，客户端与 broker
+    // 之间来回弹跳。
+    if (epoch.has_value() && *epoch != queueEpochLocked(key)) {
+        logger_debug("drop ack for " + key + ": process queue was dropped");
+        return;
+    }
+    // 被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset allowToUpdate=false）：
+    // 直到队列按修正位点重建前，ack 一律不许再改它。
+    if (frozenOffsets_.count(key) > 0) {
+        return;
+    }
     auto it = consumeOffsetTable_.find(key);
     if (it == consumeOffsetTable_.end() || it->second < nextOffset) {
         consumeOffsetTable_[key] = nextOffset;
@@ -2294,6 +2321,11 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
 void DefaultMQPushConsumer::correctTagsOffsetLocked(const std::string& key, PullStatus status,
                                                     int64_t nextOffset) {
     if (status != PullStatus::NO_NEW_MSG && status != PullStatus::NO_MATCHED_MSG) {
+        return;
+    }
+    if (frozenOffsets_.count(key) > 0) {
+        // 位点已被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset.update 在
+        // allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
         return;
     }
     auto pendingIt = pending_.find(key);
@@ -2346,8 +2378,14 @@ void DefaultMQPushConsumer::finishBatchLocked(const std::string& key) {
     }
 }
 
-std::vector<MessageExt> DefaultMQPushConsumer::takeBatchForConsume(const std::string& key) {
+std::vector<MessageExt> DefaultMQPushConsumer::takeBatchForConsume(const std::string& key,
+                                                                  uint64_t* epochOut) {
     std::lock_guard<std::mutex> lk(lock_);
+    // 代号与批次必须同一临界区读走：分开读会出现「先取批次、后读代号」的窗口，
+    // 期间队列被撤走重建的话，旧批次会被贴上**新**代号，ack 反而被放行。
+    if (epochOut != nullptr) {
+        *epochOut = queueEpochLocked(key);
+    }
     return takeBatchLocked(key);
 }
 
@@ -2906,6 +2944,105 @@ void DefaultMQPushConsumer::onQueuesRevoked(
     }
     logger_info("queues revoked, group=" + consumerGroup_
                 + " count=" + std::to_string(revoked.size()));
+}
+
+// 丢弃一个队列的全部本地状态（调用方须持 lock_），已消费位点经 retired 交给调用方在锁外
+// 持久化。两处调用：rebalance 撤队列（含停摆自愈，RebalanceImpl:438-461）与 OFFSET_ILLEGAL
+// 纠错（DefaultMQPushConsumerImpl:407-420 的 setDropped + removeProcessQueue）。
+//
+// 「撤走归属」这一步是后者的关键：pullOwners_ 里没有该 key 后，旧拉取线程下一轮 ownsQueue
+// 即失效并退出，即便同一队列马上被重新分配给本实例，也会拿到一份**新**凭据、起一条新线程
+// ——旧循环不可能再往这条队列里塞它用旧位点拉回来的消息。
+void DefaultMQPushConsumer::retireQueueLocked(
+    const std::string& key, const MessageQueue& fallbackMq,
+    std::vector<std::pair<MessageQueue, int64_t>>& retired) {
+    MessageQueue mq;
+    auto mit = mqMap_.find(key);
+    if (mit != mqMap_.end()) {
+        mq = mit->second;
+    } else if (!fallbackMq.topic.empty()) {
+        // 停摆队列可能一条都没拉过（mqMap_ 里还没有条目），但它的已消费位点是真实的，
+        // 漏 persist 就会让新属主从头重投。
+        mq = fallbackMq;
+    }
+    int64_t off = -1;
+    auto oit = consumeOffsetTable_.find(key);
+    if (oit != consumeOffsetTable_.end()) off = oit->second;
+    if (!mq.topic.empty()) retired.emplace_back(mq, off);
+    auto tit = pullThreads_.find(key);
+    if (tit != pullThreads_.end()) {
+        retiredThreads_.push_back(std::move(tit->second));
+        pullThreads_.erase(tit);
+    }
+    pullOwners_.erase(key);
+    lastPullAt_.erase(key);
+    mqMap_.erase(key);
+    pending_.erase(key);
+    lockOk_.erase(key);
+    offsetTable_.erase(key);
+    consumeOffsetTable_.erase(key);
+    // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java ProcessQueue.setDropped(true)，
+    // ConsumeMessageConcurrentlyService:267 靠 isDropped 把 ack 挡掉）。冻结标记**保留**
+    // 到队列重建为止（见 rebalancePullThreads 的解冻分支），否则纠错后的位点会被旧 ack 覆盖。
+    ++queueEpoch_[key];
+    // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+    auto pqit = popQueues_.find(key);
+    if (pqit != popQueues_.end()) {
+        pqit->second->setDropped(true);
+        popQueues_.erase(pqit);
+    }
+}
+
+uint64_t DefaultMQPushConsumer::queueEpochLocked(const std::string& key) const {
+    auto it = queueEpoch_.find(key);
+    return it == queueEpoch_.end() ? 0 : it->second;
+}
+
+uint64_t DefaultMQPushConsumer::queueEpoch(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return queueEpochLocked(key);
+}
+
+bool DefaultMQPushConsumer::offsetFrozen(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(lock_);
+    return frozenOffsets_.count(key) > 0;
+}
+
+// Java DefaultMQPushConsumerImpl 的 OFFSET_ILLEGAL 分支（:402-427）。须在**不持 lock_** 的
+// 路径上调用（内部要做网络 RPC）。
+//
+// broker 说"你请求的位点非法"（队列被截断 / commitlog 过期 / 服务端一次性重置，见
+// PullMessageProcessor 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET 一律回
+// PULL_OFFSET_MOVED，客户端在 MQClientAPIImpl:1099 映射成本状态），并把修正值放在
+// nextBeginOffset 里。纠错不只是把游标拨过去：这条队列上**已经取回、还没消费/没 ack** 的
+// 消息全部作废 —— 它们落在被跳过的区间里，ack 它们会把位点推回非法值，不 ack 又会让位点
+// 卡死；两者都错，只能整批丢掉，由新循环按修正位点重来。
+//
+// Java 四步：setNextOffset → ProcessQueue.setDropped(true) →
+// { updateAndFreezeOffset; persist; removeProcessQueue } → rebalanceImmediately。
+// 本端口：改位点 + 冻结（等价 updateAndFreezeOffset：覆盖写，且此后 ack 与空应答修正
+// 一律作废）→ retireQueueLocked（等价 setDropped，代号 +1）→ onQueuesRevoked 锁外落盘
+// （等价 persist；removeProcessQueue → removeUnnecessaryMessageQueue 也会 persist 一次）
+// → 叫醒 rebalance 按修正位点重建（Java 的 removeProcessQueue 之后同样由分配结果重建）。
+void DefaultMQPushConsumer::handleOffsetIllegal(const std::string& key, int64_t nextOffset) {
+    std::vector<std::pair<MessageQueue, int64_t>> retired;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        // updateAndFreezeOffset：位点**覆盖写**成 broker 给的修正值（不是 increaseOnly），
+        // 并冻结（ControllableOffset.allowToUpdate=false）。冻结要赶在撤队列之前，
+        // 否则旧 ack 可能在两者之间把位点改回去。
+        if (nextOffset >= 0) {
+            consumeOffsetTable_[key] = nextOffset;
+        }
+        frozenOffsets_.insert(key);
+        retireQueueLocked(key, MessageQueue(), retired);
+    }
+    // persist：把修正位点立刻推给 broker（Java 显式的一次 persist，不等周期落盘）。
+    // 这也是本分支唯一能观测到的「立即落盘」证据：来不及落盘的实现会让 broker 上的
+    // 位点停在被纠正的非法值上，直到队列重建后的首次周期持久化。
+    onQueuesRevoked(retired);
+    wakeRebalanceLoop();
+    logger_warn("the pull request offset illegal, fix it, queue=" + key);
 }
 
 void DefaultMQPushConsumer::wakeRebalanceLoop() {

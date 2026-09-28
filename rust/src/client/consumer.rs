@@ -651,6 +651,18 @@ struct State {
     /// （含异常回塞）时 -1。`pending` 与它合起来才是 `ProcessQueue.getMsgCount()`，
     /// [`correct_tags_offset_locked`] 的闸门两个都要看。
     inflight: BTreeMap<String, usize>,
+    /// Python `_frozen_offsets`：被 `OFFSET_ILLEGAL` 纠错冻结的位点（Java
+    /// `ControllableOffset.allowToUpdate=false`）。冻结期间在途 ack 与空应答修正都不许改它，
+    /// 直到这条队列按修正位点重建（`rebalance_pull_threads` 的建分支解冻）。
+    frozen_offsets: BTreeSet<String>,
+    /// Python `_queue_epoch`：每条队列「ProcessQueue 的代号」，撤销（Java
+    /// `ProcessQueue.setDropped(true)`）时 +1。
+    ///
+    /// `dispatch_loop` 取批次时连同代号一起取走，消费/ack 前比对 —— 不一致说明这批消息
+    /// 属于已被丢弃的旧 ProcessQueue，必须整批作废（Java
+    /// `ConsumeMessageConcurrentlyService:267` 的 `!processQueue.isDropped()` 闸门；
+    /// 少了它，旧批次的 ack 会把刚被 broker 纠正的位点又推回非法值，两边来回弹跳）。
+    queue_epoch: BTreeMap<String, u64>,
     /// Python `_mq_map`：队列 key -> MessageQueue。
     mq_map: BTreeMap<String, MessageQueue>,
     /// Python `_lock_ok`：顺序消费下 broker 已确认锁定的队列。
@@ -1637,6 +1649,37 @@ impl DefaultMQPushConsumer {
             .insert(key.to_string(), millis);
     }
 
+    // ---------------- OFFSET_ILLEGAL 纠错的可观测接缝 ----------------
+    //
+    // 与 C++/Python/.NET 三版一致地公开：真机验证脚本要能断言「队列被丢弃（代号 +1）、
+    // 位点被冻结、缓冲里的旧消息整批作废」，这些都是内部状态，没有接缝就只能靠
+    // 「消息有没有投过来」间接猜。
+
+    /// 该队列 ProcessQueue 的代号（Java `ProcessQueue.isDropped()` 的等价物）。
+    /// 撤销（rebalance 撤走 / OFFSET_ILLEGAL / 停摆自愈）时 +1。
+    pub fn queue_epoch(&self, key: &str) -> u64 {
+        lock(&self.inner.state)
+            .queue_epoch
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 该队列的位点是否正被 OFFSET_ILLEGAL 纠错冻结（Java
+    /// `ControllableOffset.allowToUpdate == false`）。
+    pub fn offset_frozen(&self, key: &str) -> bool {
+        lock(&self.inner.state).frozen_offsets.contains(key)
+    }
+
+    /// 该队列缓冲里「已取回、还没交给 listener」的消息条数
+    /// （Java `ProcessQueue.getMsgCount()` 的一半，另一半在途批次见 `inflight`）。
+    pub fn cached_message_count(&self, key: &str) -> usize {
+        lock(&self.inner.state)
+            .pending
+            .get(key)
+            .map_or(0, VecDeque::len)
+    }
+
     /// 立刻执行一次循环集合同步（等价于 rebalance 的那一步，验证用）。
     ///
     /// 刻意做成 `async`：收尾要发 RPC，在已经是 async 上下文的调用方里再 `block_on`
@@ -1831,6 +1874,10 @@ impl DefaultMQPushConsumer {
                 if pop && !state.pop_queues.contains_key(key) {
                     state.pop_queues.insert(key.clone(), PopProcessQueue::new());
                 }
+                // 新 ProcessQueue 就位 ⇒ 解冻（Java `removeProcessQueue` 里的 `removeOffset`
+                // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让队列
+                // 从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
+                state.frozen_offsets.remove(key);
                 let token = self
                     .inner
                     .next_token
@@ -1888,6 +1935,10 @@ impl DefaultMQPushConsumer {
         state.pending.remove(key);
         state.lock_ok.remove(key);
         state.last_pull_at.remove(key); // 同名队列复用时不能继承旧时刻
+        // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java `ProcessQueue.setDropped(true)`）。
+        // 冻结标记**保留**到队列重建为止（见 `rebalance_pull_threads` 的解冻分支），
+        // 否则纠错后的位点会被旧 ack 覆盖。
+        *state.queue_epoch.entry(key.to_string()).or_insert(0) += 1;
         let off = state.consume_offsets.remove(key);
         state.offset_table.remove(key);
         let mq = state.mq_map.remove(key).or_else(|| fallback_mq.cloned());
@@ -1903,44 +1954,7 @@ impl DefaultMQPushConsumer {
 
     /// Python `_on_queues_revoked`（Java `RebalanceImpl.removeUnnecessaryMessageQueue`）。
     async fn on_queues_revoked(&self, revoked: &[(MessageQueue, Option<i64>)]) {
-        if revoked.is_empty() {
-            return;
-        }
-        let cfg = self.config();
-        if cfg.message_model == MessageModel::BROADCASTING {
-            // 广播模式位点只存本地
-            let inner = &self.inner;
-            if let Err(e) = save_local_offsets(inner) {
-                rmq_debug!("save local offsets failed: {e}");
-            }
-            return;
-        }
-        let Ok(client) = require_client(&self.inner) else {
-            return;
-        };
-        let group = cfg.consumer_group.clone();
-        let orderly = lock(&self.inner.listener)
-            .as_ref()
-            .is_some_and(MessageListener::is_orderly);
-        for (mq, off) in revoked {
-            if let Some(off) = off {
-                if let Err(e) = client.update_consumer_offset(&group, mq, *off, 5000, None).await {
-                    rmq_debug!("persist offset on revoke failed for {mq:?}: {e}");
-                }
-            }
-            // 顺序消费：释放 broker 队列锁，新属主才能立刻接上。POP 顺序例外：
-            // Java RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 的撤销解锁
-            // 同样只看见 processQueueTable —— POP 队列不在里面 ⇒ UNLOCK 一发不出。
-            if orderly && !cfg.pop_mode {
-                let _ = client
-                    .unlock_batch_mq(&group, &self.client_id(), std::slice::from_ref(mq), 1000)
-                    .await;
-            }
-        }
-        rmq_info!(
-            "queues revoked, group={group} count={}",
-            revoked.len()
-        );
+        revoke_queues(&self.inner, revoked).await;
     }
 
     /// Python `_on_consumer_ids_changed`（40 的处理）。
@@ -2001,6 +2015,84 @@ async fn resolve_initial_offset(
         return Ok(0);
     }
     client.get_max_offset(mq, 5000, None).await
+}
+
+// ---------------- 队列撤销与位点纠错 ----------------
+
+/// Python `_on_queues_revoked`（Java `RebalanceImpl.removeUnnecessaryMessageQueue`）：把
+/// 被撤销队列的已消费位点推到 broker（集群）/本地文件（广播），顺序消费再释放 broker 锁。
+///
+/// 自由函数（与下面的 `handle_offset_illegal` 同一理由）：拉取循环只持有 `Arc<Inner>`。
+async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>)]) {
+    if revoked.is_empty() {
+        return;
+    }
+    let cfg = read_cfg(inner);
+    if cfg.message_model == MessageModel::BROADCASTING {
+        // 广播模式位点只存本地
+        if let Err(e) = save_local_offsets(inner) {
+            rmq_debug!("save local offsets failed: {e}");
+        }
+        return;
+    }
+    let Ok(client) = require_client(inner) else {
+        return;
+    };
+    let group = cfg.consumer_group.clone();
+    let orderly = lock(&inner.listener)
+        .as_ref()
+        .is_some_and(MessageListener::is_orderly);
+    let client_id = cfg.client_id.clone().unwrap_or_default();
+    for (mq, off) in revoked {
+        if let Some(off) = off {
+            if let Err(e) = client.update_consumer_offset(&group, mq, *off, 5000, None).await {
+                rmq_debug!("persist offset on revoke failed for {mq:?}: {e}");
+            }
+        }
+        // 顺序消费：释放 broker 队列锁，新属主才能立刻接上。POP 顺序例外：
+        // Java RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 的撤销解锁
+        // 同样只看见 processQueueTable —— POP 队列不在里面 ⇒ UNLOCK 一发不出。
+        if orderly && !cfg.pop_mode {
+            let _ = client
+                .unlock_batch_mq(&group, &client_id, std::slice::from_ref(mq), 1000)
+                .await;
+        }
+    }
+    rmq_info!("queues revoked, group={group} count={}", revoked.len());
+}
+
+/// Python `_offset_illegal_recover`（Java `DefaultMQPushConsumerImpl:402-427`）。
+///
+/// broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置，见
+/// `PullMessageProcessor` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE / OFFSET_RESET
+/// 一律回 `PULL_OFFSET_MOVED`），并把修正值放在 `nextBeginOffset` 里。纠错不只是把游标
+/// 拨过去：这条队列上**已经取回、还没消费/没 ack 的消息全部作废**（它们落在被跳过的区间
+/// 里，ack 它们会把位点推回非法值），然后按修正位点把队列重建。
+///
+/// Java 的四步：`setNextOffset` → `ProcessQueue.setDropped(true)` →
+/// `{ updateAndFreezeOffset; persist; removeProcessQueue }` → `rebalanceImmediately`。
+/// 本端口：置位点 + 冻结（在拉取回调的临界区里，等价 updateAndFreezeOffset）→ 撤队列
+/// （`retire_queue_locked` 清缓冲/线程表并**代号 +1**，等价 setDropped）→ 锁外把修正位点
+/// 推给 broker（等价 persist）→ 叫醒 rebalance 重建（removeProcessQueue 之后由分配结果重建）。
+///
+/// 须在锁外调用：里面要做网络 RPC。调用点在拉取回调持锁块之后。
+async fn handle_offset_illegal(inner: &Arc<Inner>, key: &str) {
+    let mut revoked: Vec<(MessageQueue, Option<i64>)> = Vec::new();
+    {
+        let mut state = lock(&inner.state);
+        DefaultMQPushConsumer::retire_queue_locked(
+            &mut state,
+            key,
+            None,
+            &mut revoked,
+            read_cfg(inner).pop_mode,
+        );
+    }
+    // persist：把修正后的位点立刻写回 broker（Java 显式的一次 persist，不等周期落盘）
+    revoke_queues(inner, &revoked).await;
+    inner.rebalance_now.store(true, Ordering::SeqCst);
+    inner.rebalance_signal.notify_waiters();
+    rmq_warn!("the pull request offset illegal, fix it, queue={key}");
 }
 
 // ================================================================ 后台循环
@@ -2256,6 +2348,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         // 入队与「是否仍持有该队列」必须同一把锁内完成：挂起期间被撤走的队列，
         // 这批消息按 Java ProcessQueue.isDropped() 语义**直接丢弃**——不消费、不推进
         // 位点，由新属主从最后持久化的位点重投，否则两实例重复消费。
+        let mut illegal = false;
         {
             let mut state = lock(&inner.state);
             if state
@@ -2280,12 +2373,34 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             state
                 .offset_table
                 .insert(key.clone(), result.next_begin_offset);
-            // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
-            // NO_MATCHED_MSG）时修正"已消费位点"，见 correct_tags_offset_locked
-            correct_tags_offset_locked(&mut state, &key, result.status, result.next_begin_offset);
+            if result.status == PullStatus::OffsetIllegal {
+                // Java DefaultMQPushConsumerImpl:402-427 —— 位点被 broker 纠正，纠错 +
+                // 撤队列 + 落盘的整条链路见 handle_offset_illegal。
+                // 冻结位点要在锁内先落地（等价 updateAndFreezeOffset），
+                // 撤队列与落盘（要发 RPC）放锁外。
+                if result.next_begin_offset >= 0 {
+                    state
+                        .consume_offsets
+                        .insert(key.clone(), result.next_begin_offset);
+                }
+                state.frozen_offsets.insert(key.clone());
+                illegal = true;
+            } else {
+                // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+                // NO_MATCHED_MSG）时修正"已消费位点"，见 correct_tags_offset_locked
+                correct_tags_offset_locked(
+                    &mut state,
+                    &key,
+                    result.status,
+                    result.next_begin_offset,
+                );
+            }
         }
         // update_msg_acc_cnt 自己取同一把锁，必须在上面释放之后调用。
         update_msg_acc_cnt(&inner, &key, &msgs);
+        if illegal {
+            handle_offset_illegal(&inner, &key).await;
+        }
     }
 }
 
@@ -2494,7 +2609,7 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
             if stopped(&rx) || !inner.started.load(Ordering::Acquire) {
                 return;
             }
-            let (mq, batch) = {
+            let (mq, batch, epoch) = {
                 let mut state = lock(&inner.state);
                 let Some(mq) = state.mq_map.get(&key).cloned() else {
                     continue;
@@ -2514,12 +2629,15 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
                 // 与"取走批次"同一临界区登记在途：correct_tags_offset_locked 的闸门靠它
                 // 区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
                 *state.inflight.entry(key.clone()).or_insert(0) += 1;
-                (mq, batch)
+                // 连同这批消息所属的 ProcessQueue 代号一起取走：消费/ack 前比对，
+                // 不一致整批作废（Java ConsumeMessageConcurrentlyService:339）
+                let epoch = state.queue_epoch.get(&key).copied().unwrap_or(0);
+                (mq, batch, epoch)
             };
             if batch.is_empty() {
                 continue;
             }
-            let outcome = consume_batch(&inner, &key, &mq, batch.clone()).await;
+            let outcome = consume_batch(&inner, &key, &mq, batch.clone(), Some(epoch)).await;
             {
                 let mut state = lock(&inner.state);
                 let left = match state.inflight.get_mut(&key) {
@@ -3671,12 +3789,31 @@ async fn call_orderly_listener(
 }
 
 /// Python `_consume_batch`：消费一个批次并处理回投/挂起，返回位点是否前进。
+///
+/// `epoch`：这批消息所属的 ProcessQueue 代号（见 `State::queue_epoch`）。队列在本批次
+/// 排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）时，这批消息
+/// **不能再消费也不能 ack** —— 符合 Java `ConsumeMessageConcurrentlyService:339`
+/// / `ConsumeMessageOrderlyService:391` 的 `isDropped()` 短路。
 async fn consume_batch(
     inner: &Arc<Inner>,
     key: &str,
     mq: &MessageQueue,
     batch: Vec<MessageExt>,
+    epoch: Option<u64>,
 ) -> Result<bool> {
+    {
+        let state = lock(&inner.state);
+        let dropped = state.queue_epoch.get(key).copied().unwrap_or(0);
+        if epoch.is_some_and(|e| e != dropped) {
+            rmq_warn!(
+                "the message queue not be able to consume, because it's dropped. \
+                 group={} mq={mq:?} msgs={} epoch={epoch:?}->{dropped}",
+                read_cfg(inner).consumer_group,
+                batch.len()
+            );
+            return Ok(false);
+        }
+    }
     let cfg = read_cfg(inner);
     let broadcast = cfg.message_model == MessageModel::BROADCASTING;
     let mut batch = batch;
@@ -3762,7 +3899,7 @@ async fn consume_batch(
             } else {
                 record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, false, None);
             }
-            advance_consume_offset(inner, key, &batch, None);
+            advance_consume_offset(inner, key, &batch, None, epoch);
             return Ok(true);
         }
         // ---- autoCommit=false（Java:270-300，binlog 消费场景）----
@@ -3770,7 +3907,7 @@ async fn consume_batch(
             ConsumeOrderlyStatus::Commit => {
                 // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
                 record_consume_rt(inner, &mq.topic, begin_ms);
-                advance_consume_offset(inner, key, &batch, None);
+                advance_consume_offset(inner, key, &batch, None, epoch);
                 return Ok(true);
             }
             ConsumeOrderlyStatus::Rollback => {
@@ -3874,12 +4011,12 @@ async fn consume_batch(
                 "BROADCASTING, the message consume failed, drop it: {dropped} msgs in {mq:?}"
             );
         }
-        advance_consume_offset(inner, key, &batch, None);
+        advance_consume_offset(inner, key, &batch, None, epoch);
         return Ok(true);
     }
     if acked >= batch.len() {
         // 整批认可（默认路径）：什么都不用回投，位点直接前进
-        advance_consume_offset(inner, key, &batch, None);
+        advance_consume_offset(inner, key, &batch, None, epoch);
         return Ok(true);
     }
     // 集群模式：未认可的 [acked..) 逐条回投 %RETRY%topic（延迟档位 3+reconsumeTimes；
@@ -3909,7 +4046,7 @@ async fn consume_batch(
         .filter(|(i, _)| !msg_back_failed.iter().any(|(fi, _)| fi == i))
         .map(|(_, m)| m.clone())
         .collect();
-    advance_consume_offset(inner, key, &handled, floor);
+    advance_consume_offset(inner, key, &handled, floor, epoch);
     Ok(msg_back_failed.is_empty())
 }
 
@@ -3945,7 +4082,25 @@ async fn send_back_batch(
 
 /// Python `_advance_consume_offset`：取本批最大 queueOffset + 1，且**不回退**。
 /// `floor` 是「不能越过的位点」（回投失败被塞回队首的那几条里最小的 offset）。
-fn advance_consume_offset(inner: &Inner, key: &str, batch: &[MessageExt], floor: Option<i64>) {
+///
+/// `epoch` 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被
+/// 撤销/重建（Java `ConsumeMessageConcurrentlyService:267` 的 `!processQueue.isDropped()`），
+/// **整批 ack 作废**。`frozen_offsets` 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
+fn advance_consume_offset(
+    inner: &Inner,
+    key: &str,
+    batch: &[MessageExt],
+    floor: Option<i64>,
+    epoch: Option<u64>,
+) {
+    let mut state = lock(&inner.state);
+    if epoch.is_some_and(|e| e != state.queue_epoch.get(key).copied().unwrap_or(0)) {
+        rmq_debug!("drop ack for {key}: process queue was dropped");
+        return;
+    }
+    if state.frozen_offsets.contains(key) {
+        return;
+    }
     if batch.is_empty() {
         // 整批回投都失败时没有任何条目被认可，位点原地不动
         return;
@@ -3954,7 +4109,6 @@ fn advance_consume_offset(inner: &Inner, key: &str, batch: &[MessageExt], floor:
     if let Some(floor) = floor {
         next_off = next_off.min(floor);
     }
-    let mut state = lock(&inner.state);
     let cur = state.consume_offsets.get(key).copied().unwrap_or(0);
     state.consume_offsets.insert(key.to_string(), cur.max(next_off));
 }
@@ -3995,6 +4149,11 @@ fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
 /// 这样离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
 fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, next_off: i64) {
     if !matches!(status, PullStatus::NoNewMsg | PullStatus::NoMatchedMsg) {
+        return;
+    }
+    if state.frozen_offsets.contains(key) {
+        // 位点已被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset.update 在
+        // allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
         return;
     }
     if !state.pending.get(key).is_none_or(|dq| dq.is_empty()) {
@@ -5709,7 +5868,7 @@ mod tests {
         }
 
         async fn run(&self, n: i64) -> bool {
-            consume_batch(&self.c.inner, &self.key, &self.mq, offset_batch(n))
+            consume_batch(&self.c.inner, &self.key, &self.mq, offset_batch(n), None)
                 .await
                 .expect("consume_batch must not error")
         }
@@ -5875,7 +6034,7 @@ mod tests {
         }
 
         async fn run(&self, batch: Vec<MessageExt>) -> bool {
-            consume_batch(&self.c.inner, &self.key, &self.mq, batch)
+            consume_batch(&self.c.inner, &self.key, &self.mq, batch, None)
                 .await
                 .expect("consume_batch must not error")
         }
@@ -7445,5 +7604,299 @@ mod tests {
 
         drop(stop_tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ---------------- OFFSET_ILLEGAL 纠错（Java `DefaultMQPushConsumerImpl:402-427`） ----------------
+    //
+    // 这条路径错了是**静默**的两种极端 ——
+    //
+    //   * 只把拉取游标拨到 `nextBeginOffset` 而不丢队列/不冻结：broker 刚把位点纠正到合法
+    //     区间，这条队列上**已经取回还没 ack** 的旧批次一 ack 又把位点推回非法值，下一轮
+    //     拉取再被 broker 拒一次 —— 客户端与 broker 之间来回弹跳，永不停歇；
+    //   * 纠错后的位点没立刻落盘：进程在下一轮周期落盘（默认 5s）之前崩掉，broker 上留着的
+    //     还是非法位点，重启后从非法位点起拉 —— 这条纠错等于没做。
+    //
+    // 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹/一次崩溃才暴露），
+    // 所以断言全部放离线；真机另有一条链路证明（见 `examples/live_offset_illegal.rs`）。
+    //
+    // 判据来源：`PullMessageProcessor` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
+    // OFFSET_RESET / OFFSET_TOO_SMALL 一律回 `PULL_OFFSET_MOVED`，`MQClientAPIImpl:1099`
+    // 把它映射成 `PullStatus::OffsetIllegal`，修正值在应答头 `nextBeginOffset`。Java 的处理
+    // 是 `setNextOffset` → `ProcessQueue.setDropped(true)` → 异步
+    // `{ updateAndFreezeOffset; persist; removeProcessQueue; rebalanceImmediately }`。
+
+    struct IllegalHarness {
+        c: DefaultMQPushConsumer,
+        key: String,
+        mq: MessageQueue,
+    }
+
+    impl IllegalHarness {
+        /// `assigned=false` 模拟「队列已经不在本实例名下」；`epoch` 非 0 时预置代号。
+        fn new(assigned: bool, epoch: u64) -> IllegalHarness {
+            let cfg = ConsumerConfig {
+                consumer_group: "G".to_string(),
+                message_model: MessageModel::CLUSTERING.to_string(),
+                ..Default::default()
+            };
+            let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
+            let mq = queue("T", "broker-a", 0);
+            let key = mq_key(&mq);
+            if assigned {
+                let mut state = lock(&c.inner.state);
+                state.mq_map.insert(key.clone(), mq.clone());
+                state.queue_owners.insert(key.clone(), 1);
+                state.offset_table.insert(key.clone(), 3);
+                state.consume_offsets.insert(key.clone(), 3);
+                state.last_pull_at.insert(key.clone(), 1_700_000_000_000);
+                if epoch != 0 {
+                    state.queue_epoch.insert(key.clone(), epoch);
+                }
+            }
+            IllegalHarness { c, key, mq }
+        }
+
+        /// 模拟拉取回调里 `OFFSET_ILLEGAL` 的锁内动作（游标 + 冻结 + 修正值）。
+        fn freeze(&self, off: i64) {
+            let mut state = lock(&self.c.inner.state);
+            state.offset_table.insert(self.key.clone(), off);
+            state.frozen_offsets.insert(self.key.clone());
+            state.consume_offsets.insert(self.key.clone(), off);
+        }
+
+        /// `handle_offset_illegal` 里的撤队列那一半（锁内），返回要落盘的对象。
+        fn retire(&self) -> Vec<(MessageQueue, Option<i64>)> {
+            let mut revoked = Vec::new();
+            let mut state = lock(&self.c.inner.state);
+            DefaultMQPushConsumer::retire_queue_locked(
+                &mut state,
+                &self.key,
+                None,
+                &mut revoked,
+                false,
+            );
+            revoked
+        }
+
+        fn offset(&self) -> Option<i64> {
+            lock(&self.c.inner.state)
+                .consume_offsets
+                .get(&self.key)
+                .copied()
+        }
+
+        fn epoch(&self) -> u64 {
+            lock(&self.c.inner.state)
+                .queue_epoch
+                .get(&self.key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn frozen(&self) -> bool {
+            lock(&self.c.inner.state).frozen_offsets.contains(&self.key)
+        }
+
+        fn ack(&self, offsets: &[i64], epoch: u64) {
+            let batch: Vec<MessageExt> = offsets
+                .iter()
+                .map(|o| {
+                    let mut m = ext("T", None);
+                    m.broker_name = Some("broker-a".to_string());
+                    m.queue_offset = *o;
+                    m
+                })
+                .collect();
+            advance_consume_offset(&self.c.inner, &self.key, &batch, None, Some(epoch));
+        }
+    }
+
+    /// 数 listener 被调了几次（被丢弃的批次连 listener 都不该进）。
+    struct CountingListener {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MessageListenerConcurrently for CountingListener {
+        fn consume_message(
+            &self,
+            _msgs: &[MessageExt],
+            _context: &mut ConsumeConcurrentlyContext,
+        ) -> ConsumeConcurrentlyStatus {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ConsumeConcurrentlyStatus::ConsumeSuccess
+        }
+    }
+
+    #[test]
+    fn retire_drops_every_local_trace_and_hands_the_offset_to_persist() {
+        let h = IllegalHarness::new(true, 0);
+        lock(&h.c.inner.state)
+            .pending
+            .insert(h.key.clone(), VecDeque::from(offset_batch(2)));
+        h.freeze(0);
+        let revoked = h.retire();
+
+        // 已消费位点交给调用方去落盘（`handle_offset_illegal` 里就是 `revoke_queues`）
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].0, h.mq);
+        assert_eq!(revoked[0].1, Some(0), "落盘的是纠错后的冻结位点");
+
+        let state = lock(&h.c.inner.state);
+        assert!(!state.pending.contains_key(&h.key), "缓冲整批作废");
+        assert!(!state.offset_table.contains_key(&h.key));
+        assert!(!state.consume_offsets.contains_key(&h.key));
+        assert!(!state.mq_map.contains_key(&h.key));
+        assert!(!state.queue_owners.contains_key(&h.key));
+        assert!(!state.last_pull_at.contains_key(&h.key), "同名队列复用时不能继承旧时刻");
+        assert_eq!(state.queue_epoch.get(&h.key).copied(), Some(1), "代号 +1（setDropped）");
+        assert!(state.frozen_offsets.contains(&h.key), "冻结要留到队列重建");
+    }
+
+    #[test]
+    fn retire_without_a_queue_is_a_noop() {
+        // 队列已经不在本实例名下（并发撤销）：没有 mq 就没有可落盘的对象，不能凭空造一条
+        let h = IllegalHarness::new(false, 0);
+        assert!(h.retire().is_empty());
+        assert_eq!(h.epoch(), 1, "撤队列照样清状态 + 代号前进（重建是调用方的下一步）");
+    }
+
+    #[test]
+    fn retire_twice_keeps_the_epoch_monotonic() {
+        let h = IllegalHarness::new(true, 0);
+        h.retire();
+        assert_eq!(h.epoch(), 1);
+        h.retire();
+        assert_eq!(h.epoch(), 2, "重建前又出一次非法：代号继续前进，旧批次依旧作废");
+    }
+
+    #[tokio::test]
+    async fn handle_offset_illegal_retires_and_wakes_the_rebalance_loop() {
+        let h = IllegalHarness::new(true, 0);
+        h.freeze(0);
+        assert!(!h.c.inner.rebalance_now.load(Ordering::SeqCst));
+        // 未 start()：persist 那步没有 client 可发，静默跳过（与 Java 落盘失败同一后果——
+        // 本地状态已经纠对，broker 侧的修正由周期落盘兜底）
+        handle_offset_illegal(&h.c.inner, &h.key).await;
+        assert_eq!(h.epoch(), 1);
+        assert!(!lock(&h.c.inner.state).mq_map.contains_key(&h.key));
+        assert!(
+            h.c.inner.rebalance_now.load(Ordering::SeqCst),
+            "removeProcessQueue 之后要靠 rebalanceImmediately 重建这条队列"
+        );
+    }
+
+    #[test]
+    fn frozen_offset_ignores_ack() {
+        let h = IllegalHarness::new(true, 0);
+        h.freeze(0);
+        // 旧批次（offset 0..2 已消费）迟到的 ack：把位点推回 3 就是 Java 的弹跳现场
+        h.ack(&[0, 1, 2], 0);
+        assert_eq!(h.offset(), Some(0));
+    }
+
+    #[test]
+    fn frozen_offset_ignores_correct_tags_offset() {
+        let h = IllegalHarness::new(true, 0);
+        h.freeze(0);
+        {
+            let mut state = lock(&h.c.inner.state);
+            correct_tags_offset_locked(&mut state, &h.key, PullStatus::NoNewMsg, 110);
+        }
+        assert_eq!(h.offset(), Some(0));
+    }
+
+    #[test]
+    fn freeze_survives_the_retire_until_the_queue_is_rebuilt() {
+        // 有意偏差：Java 在 removeOffset 时解冻、靠 ProcessQueue.isDropped() 兜底；
+        // 本端口没有 per-batch 的 ProcessQueue 对象，冻结一直留到队列重建（更严）
+        let h = IllegalHarness::new(true, 0);
+        h.freeze(0);
+        h.retire();
+        assert!(h.frozen());
+    }
+
+    #[tokio::test]
+    async fn rebuild_clears_the_freeze() {
+        let h = IllegalHarness::new(true, 0);
+        h.freeze(0);
+        h.retire();
+        // 重建：把队列重新划给自己（`rebalance_pull_threads` 的建分支）
+        lock(&h.c.inner.state).assigned = vec![h.mq.clone()];
+        h.c.rebalance_pull_threads().await;
+        assert!(!h.frozen(), "新 ProcessQueue 就位就该解冻，否则队列从此只拉不 ack");
+        // 重建后 ack 恢复正常：只有**新代号**的批次算数，旧代号的依旧作废
+        h.ack(&[0, 1], 0);
+        assert_eq!(h.offset(), None, "旧代号的 ack 还是不许动位点");
+        h.ack(&[0, 1], h.epoch());
+        assert_eq!(h.offset(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn stale_epoch_batch_is_not_consumed() {
+        // 队列被撤销/重建（代号 0 → 1）后，排队期间被丢弃的批次不能再消费
+        let h = IllegalHarness::new(true, 1);
+        let listener = Arc::new(CountingListener {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        h.c.set_message_listener_concurrently(listener.clone());
+        let done = consume_batch(&h.c.inner, &h.key, &h.mq, offset_batch(2), Some(0))
+            .await
+            .expect("consume_batch must not error");
+        assert!(!done);
+        assert_eq!(listener.calls.load(Ordering::SeqCst), 0, "连 listener 都不该进");
+        assert_eq!(h.offset(), Some(3), "旧批次不动位点");
+    }
+
+    #[tokio::test]
+    async fn current_epoch_batch_is_consumed() {
+        let h = IllegalHarness::new(true, 1);
+        let listener = Arc::new(CountingListener {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        h.c.set_message_listener_concurrently(listener.clone());
+        lock(&h.c.inner.state).consume_offsets.insert(h.key.clone(), 0);
+        let done = consume_batch(&h.c.inner, &h.key, &h.mq, offset_batch(2), Some(1))
+            .await
+            .expect("consume_batch must not error");
+        assert!(done);
+        assert_eq!(listener.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(h.offset(), Some(2));
+    }
+
+    #[test]
+    fn stale_epoch_ack_is_dropped_and_current_epoch_advances() {
+        let h = IllegalHarness::new(true, 1);
+        lock(&h.c.inner.state).consume_offsets.insert(h.key.clone(), 0);
+        h.ack(&[0, 1, 2], 0);
+        assert_eq!(h.offset(), Some(0), "旧代号的 ack 不能动位点");
+        h.ack(&[0, 1, 2], 1);
+        assert_eq!(h.offset(), Some(3));
+    }
+
+    #[test]
+    fn illegal_recovery_does_not_touch_sibling_queues() {
+        // 同实例的另一条队列不受牵连：撤队列/冻结必须按 key 隔离
+        let h = IllegalHarness::new(true, 0);
+        let other = queue("T", "broker-a", 1);
+        let other_key = mq_key(&other);
+        {
+            let mut state = lock(&h.c.inner.state);
+            state.mq_map.insert(other_key.clone(), other.clone());
+            state.queue_owners.insert(other_key.clone(), 2);
+            state.consume_offsets.insert(other_key.clone(), 7);
+            state.last_pull_at.insert(other_key.clone(), 1_700_000_000_000);
+        }
+        h.freeze(0);
+        h.retire();
+        let state = lock(&h.c.inner.state);
+        assert!(state.mq_map.contains_key(&other_key));
+        assert!(state.consume_offsets.contains_key(&other_key));
+        assert!(state.queue_owners.contains_key(&other_key));
+        assert_eq!(
+            state.last_pull_at.get(&other_key).copied(),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(state.queue_epoch.get(&other_key).copied().unwrap_or(0), 0);
+        assert!(!state.frozen_offsets.contains(&other_key));
     }
 }

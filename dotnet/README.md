@@ -8,7 +8,7 @@
 ```bash
 cd dotnet
 dotnet build                        # 全解决方案，0 warning（TreatWarningsAsErrors 已全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，677 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，690 项测试
 ```
 
 要求 .NET 10 SDK。**零外部 NuGet 依赖**（仅 BCL）；zlib 走 `System.IO.Compression.ZLibStream`，
@@ -100,6 +100,7 @@ dotnet $PROG sql92 127.0.0.1:9876         # SQL92 过滤 + CHECK_CLIENT_CONFIG(4
 dotnet $PROG scheduled-intervals 127.0.0.1:9876   # 周期任务的 initialDelay/固定速率（20 PASS / 0 FAIL，含位点落盘 10s 首跳）
 dotnet $PROG subscribe 127.0.0.1:9876     # 后置订阅：start() 之后 Subscribe 立即推心跳、新 topic 真被消费（8 PASS / 0 FAIL）
 dotnet $PROG pinned-guard 127.0.0.1:9876  # 定点发送 topic 守卫：真路由不误拒、拒在本端且 broker 无痕、单向无守卫（22 PASS / 0 FAIL）
+dotnet $PROG offset-illegal 127.0.0.1:9876  # OFFSET_ILLEGAL：整批作废在途/缓冲消息并按修正位点重建；修正位点立刻落盘（15 PASS / 0 FAIL）
 dotnet $PROG tls 127.0.0.1:9876 <topic> <group>   # TLS 传输层压测 + TLS 全链路收发（见「TLS」）
 ```
 
@@ -188,6 +189,21 @@ idxNext=7`），显式提交后 head/next 各一次、broker 位点到 2。S13c 
 同为 5）；S14c 同一消费者启动时自动补的 `%RETRY%<group>` 空队列（`PULL_NOT_FOUND` ⇒ `NO_NEW_MSG`）
 也留下值 == `maxOffset`(0) 的位点记录，且整轮 listener 依旧是 0 条 —— 修正只抬位点、不会凭空投递。
 
+`offset-illegal` 是 **OFFSET_ILLEGAL 纠错分支**（Java `DefaultMQPushConsumerImpl:402-427`，与 Python
+`verify_offset_illegal_live.py`、C++ `rmq_live_offset_illegal`、Rust `live_offset_illegal` 同场景）：
+broker 回 `PULL_OFFSET_MOVED`（`PullMessageProcessor` 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL /
+OFFSET_RESET 一律如此；`MqClient.cs` 的 `case ResponseCode.PullOffsetMoved:` 映射成
+`PullStatus.OffsetIllegal`，修正值在应答头 `nextBeginOffset`）时，这条队列上**已取回还没 ack** 的
+消息必须整批作废——只把拉取游标拨到修正值而不丢队列的话，旧批次一 ack 又把位点推回非法值，
+客户端与 broker 之间来回弹跳永不停歇；且修正位点必须**立刻**落盘，不能等周期落盘（进程在下一轮
+周期前崩掉，broker 上留着的还是非法位点，等于没纠）。离线由 `OffsetIllegalRecoverTests`（13 项）锁住
+本地状态怎么清、哪个 ack 被作废、冻结何时解除；真机 S1 让 listener 卡住第一条（在途 1 条、缓冲
+2 条）后用 `ResetOffsetByQueueId` 把服务端位点重置到 3，断言队列身份（`QueueEpoch`）被抬、broker
+上的位点停在修正值 3、索引 1/2 永不投递、再发第 4 条从修正位点续跑且新 ack 让位点前进到 4
+（冻结随重建解除）；S2 把 broker 已提交位点做成非法值 103（借用两笔 RPC 非原子），消费者落盘周期
+配 60s，断言窗口内 103 自己变回 3（maxOffset）且全程零投递。⚠ 发现延迟 ~24s 是 Java 同构的长轮询
+语义（下发 `suspendTimeoutMillis=20000`、broker `PullRequestHoldService` 每 5s 巡检），S1 窗口给 45s。
+
 `popc` 的 S5 是**POP 循环把拉取统计写进 307 状态表**（Java `DefaultMQPushConsumerImpl.popMessage`
 的 `PopCallback.onSuccess:556-563`：`case FOUND:` 先 `IncPullRT`，这一格打在**空列表判定之前**，
 `MsgFoundList` 非空才 `IncPullTPS`；`POLLING_NOT_FOUND` 两格都不动 —— 空手而归是长轮询的常态，
@@ -234,9 +250,10 @@ blank→长度(127/120)→字符表三步都走纯客户端错误码（Java 是 
 | scheduled-intervals | 20 PASS / 0 FAIL（2026-09-24 实测） | I1~I3（与 Python `verify_interval_live.py`、C++ `rmq_live_scheduled_intervals`、Rust `live_scheduled_intervals` 同场景）：I3 门面配的周期真的落到实例（`PollNameServerIntervalMillis` → 路由刷新周期，1s 组与不配的 30s 对照组各断言一次）→ I1 两个生产者各把一个**还没建出来**的 topic 登记进在用集合，先等 1.5s 让两边首跳（`scheduleAtFixedRate` 的 initialDelay=10ms）都落空一次、再建 topic ⇒ 缓存里何时出现它只由周期决定：1s 组 0.53s 拿到，那一刻 30s 组**还没有**，最终 28.76s 拿到（固定速率锚定，逐跳对着同一时间轴算、误差不累积）→ I2 两个消费者（落盘周期 1s / 60s）各消费 3 条后 broker 位点仍是 0，首个落盘落在 **10.49s**（≈ Java `:417-423` 的 initialDelay 10s，60s 组同样是 10.81s —— 这一步由 initialDelay 驱动、不是周期），第二批后 1s 组 0.68s 内把 6 推上去、60s 组**仍是 3**（下一跳在 60s 后），`Shutdown()` 收尾补一笔把 6 落盘。⚠ 修之前这里必然红：macOS 上 `ManualResetEventSlim.Wait(100ms)` 实测 131ms（系统定时器多给一个 tick），「按 100ms 切片睡满 30s」实际要 39.2s，全部周期被拉长 ~31% —— 现在统一走 `Schedules.WaitUntil(...)`（`ManualResetEventSlim.Wait` 一次睡到绝对计划时刻，整段又能被 `Shutdown` 的 `Set` 立刻唤醒；落后于计划时不等待、立刻补跑，与 Java 的 catch-up 一致），另有一组离线用例证明首跳落在 initialDelay 而不是 initialDelay+period |
 | subscribe | 8 PASS / 0 FAIL（2026-09-24 实测，S2 登记耗时 21ms） | 后置订阅 + 立即心跳真机（与 Python `verify_subscribe_live.py`、C++ `rmq_live_subscribe`、Rust `live_subscribe` 同场景；Java `DefaultMQPushConsumerImpl#subscribe:1265-1275` 就是 put 完直接 `sendHeartbeatToAllBrokerWithLock()`，**没有** started 闸门）：S0 正腿对照 —— 起消费者时订阅的 topic B 在 `QUERY_TOPIC_CONSUME_BY_WHO(300)` 里查得到本组（先证明"心跳路径 + 300 号查询"这条观测链本身有效）→ S1 反腿对照 —— **没订阅**的 topic L 查不到本组（排掉"300 恒回本组"的假阳性）→ **S2 本条**：`Start()` 之后才 `Subscribe(L)`，紧接着查 300 立刻就有本组，耗时 **21ms** ≪ 30s 周期（`ClientConfig.HeartbeatBrokerInterval`）—— 这个时间差就是"心跳是订阅路径推的、不是下一次定期心跳顺带发的"唯一证据；同时 `SubscribedTopics()` 里立刻能看到 L（活订阅表 = 心跳与 rebalance 读的同一张表）→ S3 订阅真生效：L 的队列进分配集合、发进去的消息被消费到（不是只把名字记进表）→ S4 `Unsubscribe(L)` 后本地订阅集合里 L 消失（broker 侧不退组：`ConsumerManager#clearTopicGroupTable` 只在整组消失时才摘，Java 同样，所以这条只能在本地断言）。⚠ 时间判据取 `elapsed < 30s/6`：写"0ms 断言"会在真机抖一下变红，放宽到 30s 又等于什么都没证。离线半边由 `SubscribeAfterStartTests` 锁死（消费者对着连不上的 name server 启动 ⇒ 心跳一台都发不出去，只能验"表进对了、不再抛 already started"） |
 | pinned-guard | 22 PASS / 0 FAIL（2026-09-28 实测） | S0~S6 定点发送的 topic 守卫真机（与 Python `verify_pinned_guard_live.py`、C++ `rmq_live_pinned_guard`、Rust `live_pinned_guard` 同场景。Java 全树只有两处守卫：同步 `DefaultMQProducerImpl:1234-1236` 抛 `message's topic not equal mq's topic`、异步 `:1277-1278` 抛 `Topic of the message does not match its target message queue`）：离线抓帧能证明「一笔请求都没上线」，但证明不了「**真路由取来的队列**不会被误伤」——守卫写宽一点、把 `mq.Topic` 与 `msg.Topic` 比错一边，离线预置的队列照样是绿的，线上第一条消息就发不出去。S0 两条 topic 都先建出真路由（反腿拒的必须是 topic，不是地址）→ S1 真路由队列上的放行腿：同步单条/批量都 SEND_OK 且落在指定队列、三笔子消息**真落库**（`maxOffset` = 单条 1 + 批量子消息 2，只信 broker 的队尾位点）→ S2 反腿：同步单条与批量都拒、文案逐字对 Java、**亚毫秒**返回且响应码是客户端默认值（不是超时、不是 broker 的 remark），wire 反证 A 的 `maxOffset` 一动没动、B 上一条都没有（「守卫只是抛错、消息其实已经发出去了」这种坏法只在 broker 侧看得出来）→ S3 命名空间按 Java 的包装后资源名比：队列 topic 已带 `ns1%` 前缀（真路由返回的就是这个形状）不误拒、消息 topic 自己已带前缀同样放行、换成 `ns2%` 才拒（对照腿：拒的是名字，不是「有前缀」），两条放行腿真落进 `ns1%topic` → S4 异步单条/批量：拒的时候走回调、用的是**异步那句**文案、拒后 `maxOffset` 仍不动；放行的两条腿 SEND_OK 且真落库（单条 1 + 子消息 2）→ S5 单向定点**故意没有**守卫（Java `sendOneway(msg, mq)` 直接进 `sendKernelImpl`）：报文按 **msg 自己的** topic 落进 A、目标队列所在的 B 一条都没有 —— 这不是漏发，是 Java 的口子，写在这里是为了让守卫的位置若被「顺手补齐」当场红 → S6 push 消费者把正腿消息一条不少地收齐（放行腿真的可消费，不只是 `SendOk`） |
+| offset-illegal | 15 PASS / 0 FAIL（2026-09-28 实测） | OFFSET_ILLEGAL 纠错分支真机（与 Python `verify_offset_illegal_live.py`、C++ `rmq_live_offset_illegal`、Rust `live_offset_illegal` 同场景，Java `DefaultMQPushConsumerImpl:402-427`）：这条分支做四件事 —— 位点改用 broker 给的修正值（`setNextOffset`）→ 丢掉这条队列上已取回未消费的消息（`ProcessQueue.setDropped(true)`）→ 把修正位点**立刻**落盘（`updateAndFreezeOffset` + `persist`）→ 撤掉队列让 rebalance 按修正位点重建（`removeProcessQueue` + `rebalanceImmediately`）。**S1 丢队列**：listener 卡住第一条（在途 1 条、缓冲里 2 条）后用 `ResetOffsetByQueueId` 把位点重置到 3 ⇒ 下一笔 pull 被 broker 短路成 OFFSET_RESET ⇒ 客户端 `PullStatus.OffsetIllegal`。修复前缓冲里的第 1、2 条照常投递（listener 实收 3 条），修复后队列身份代号被抬、broker 位点停在修正值 3、索引 1/2 永不投递、再发第 4 条验证重建后的队列从修正位点续跑、冻结随重建解除（新消息的 ack 让 broker 位点前进到 4）→ **S2 立刻落盘**：利用 `ResetOffsetByQueueId` 两笔 RPC 非原子（第 1 笔 commitOffset 无区间校验先落库、第 2 笔被 `resetOffsetInner` 以 `Target offset 103 not in consume queue range` 拒绝）把 broker 已提交位点做成非法值 103，再让 `PersistConsumerOffsetIntervalMillis=60000` 的新消费者从 103 起拉：窗口内唯一能把 103 写回 3（maxOffset）的路径就是纠错分支自带的那次 persist，且全程零投递（6s 静默后仍是 3）。⚠ 发现延迟 ~24s 是 Java 同构的长轮询语义（下发 `suspendTimeoutMillis=20000`、broker `PullRequestHoldService` 每 5s 巡检，命中前那笔 pull 不会重读 resetOffsetTable），S1 等待窗口给 45s。⚠ 这个用例**会删掉它自己建的 topic**。离线半边由 `OffsetIllegalRecoverTests`（13 项）锁死；开发中另做过真机负向对照：把这条分支整体关掉（只拨游标、不丢队列/不落盘）重跑同一脚本，恰好 5 个断言变红（`epoch=0`、缓冲索引 1/2 照投、S2 的 103 停在 20s），另外 10 个不变量断言仍绿 —— 证明那 5 条确实依赖这条新分支 |
 | tls | PASS（TLS 全链路 + 传输层压测，见下节「TLS」） |
 
-单测：`dotnet test tests/RocketMQ.Client.Tests` → **677 passed / 0 failed**，零 warning
+单测：`dotnet test tests/RocketMQ.Client.Tests` → **690 passed / 0 failed**，零 warning
 （`Directory.Build.props` 开了 `TreatWarningsAsErrors`）。`ConsumeThreadPoolTests`（23 项，消费线程弹性）锁住
 Java 5.x 的**默认值两侧同为 20**（`DefaultMQPushConsumer:162/:169`；4.x 才是 min=20/max=64，早年照抄了 4.x）
 以及 `UpdateCorePoolSize` 的三道守卫：无界队列下真实并发度 == `CorePoolSize`，默认配置里 core 只能往**下**调，

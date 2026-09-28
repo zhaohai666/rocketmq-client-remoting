@@ -831,6 +831,16 @@ class DefaultMQPushConsumer:
         self._pending: Dict[str, Deque[MessageExt]] = {}
         self._mq_map: Dict[str, MessageQueue] = {}
         self._consume_offsets: Dict[str, int] = {}
+        # 被冻结的位点（Java ControllableOffset.allowToUpdate=false）：OFFSET_ILLEGAL 纠错把
+        # 修正值写进 _consume_offsets 后，在途 ack / correctTagsOffset 都不得再改动它，
+        # 直到这条队列按修正位点重建（_rebalance_pull_threads 建新循环时解冻）。
+        self._frozen_offsets: Set[str] = set()
+        # 每条队列「ProcessQueue 的代号」：撤销（Java ProcessQueue.setDropped(true)）时 +1。
+        # _dispatch_loop 取批次时连同代号一起取走，ack 前比对——不一致说明这批消息属于
+        # 已被丢弃的旧 ProcessQueue，必须整批作废（Java ConsumeMessageConcurrentlyService:267
+        # 的 `!processQueue.isDropped()` 闸门；少了它，旧批次的 ack 会把刚被 broker 纠正的
+        # 位点又推回非法值，客户端与 broker 之间来回弹跳）。
+        self._queue_epoch: Dict[str, int] = {}
         # 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集（Java ConsumeMessageOrderlyService）
         self._lock_ok: Set[str] = set()
         self._flow_control_triggered = 0
@@ -1698,6 +1708,9 @@ class DefaultMQPushConsumer:
                     continue
                 if pop and key not in self._pop_queues:
                     self._pop_queues[key] = PopProcessQueue()
+                # 新 ProcessQueue 就位 ⇒ 解冻（Java removeProcessQueue 里的
+                # removeOffset 取消冻结状态）：重建后的队列按修正位点重新开始推进
+                self._frozen_offsets.discard(key)
                 # 线程刚建、循环还没跑到盖章处，先用当前时刻占位，避免下一趟误判停摆
                 self._last_pull_table[key] = time.time()
                 # 队列一旦分配就进 _mq_map（Java ProcessQueueTable 的键集即"已分配"），
@@ -1725,6 +1738,9 @@ class DefaultMQPushConsumer:
         mq = self._mq_map.pop(key, fallback_mq)
         self._pending.pop(key, None)
         self._lock_ok.discard(key)
+        # 代号 +1 ⇒ 在途批次的 ack 全部失效（Java setDropped(true)）；冻结标记**保留**到
+        # 队列重建为止（_rebalance_pull_threads 解冻），避免纠错后的位点被旧 ack 覆盖。
+        self._queue_epoch[key] = self._queue_epoch.get(key, 0) + 1
         off = self._consume_offsets.pop(key, None)
         self._offset_table.pop(key, None)
         # POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
@@ -1983,6 +1999,7 @@ class DefaultMQPushConsumer:
             # 入队与"是否仍持有该队列"的判断必须原子：长轮询期间被 rebalance 撤走的队列，
             # 这批消息按 Java 语义（ProcessQueue.isDropped()）**直接丢弃**——不消费、不推进位点，
             # 由新属主从我们最后持久化的位点重投，否则两实例会重复消费同一条消息。
+            illegal = False
             with self._lock:
                 if self._queue_threads.get(key) is not threading.current_thread():
                     logger.debug("queue %s revoked during pull, discard %d fetched messages",
@@ -1997,10 +2014,21 @@ class DefaultMQPushConsumer:
                 # 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consume_offsets 单独跟踪并持久化
                 if result.next_begin_offset is not None:
                     self._offset_table[key] = result.next_begin_offset
-                # Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
-                # NO_MATCHED_MSG）时修正"已消费位点"，见 _correct_tags_offset_locked
-                self._correct_tags_offset_locked(key, result.status,
-                                                 result.next_begin_offset)
+                    if result.status == PullStatus.OFFSET_ILLEGAL:
+                        # Java DefaultMQPushConsumerImpl:402-427 —— 位点被 broker 纠正
+                        # 时必须连纠错带重建一起做，见 _offset_illegal_recover。
+                        # 冻结在锁内先行（等价回调里同步执行的 updateAndFreezeOffset），
+                        # 撤队列与落盘的 RPC 放锁外。
+                        self._frozen_offsets.add(key)
+                        self._consume_offsets[key] = int(result.next_begin_offset)
+                        illegal = True
+                    else:
+                        # Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+                        # NO_MATCHED_MSG）时修正"已消费位点"，见 _correct_tags_offset_locked
+                        self._correct_tags_offset_locked(key, result.status,
+                                                         result.next_begin_offset)
+            if illegal:
+                self._offset_illegal_recover(key)
 
     def _update_msg_acc_cnt(self, key: str, msgs: List[MessageExt]) -> None:
         """对应 Java ``ProcessQueue.putMessage`` 里的 ``msgAccCnt`` 计算。
@@ -2489,10 +2517,13 @@ class DefaultMQPushConsumer:
                     # 与"取走批次"同一临界区登记在途：_correct_tags_offset_locked 的闸门
                     # 靠它区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
                     self._msg_queue_inflight[key] = self._msg_queue_inflight.get(key, 0) + 1
+                    # 连同这批消息所属的 ProcessQueue 代号一起取走：消费/ack 前比对，
+                    # 不一致整批作废（Java ConsumeMessageConcurrentlyService:339）
+                    epoch = self._queue_epoch.get(key, 0)
                 if not batch:
                     continue
                 try:
-                    done = self._consume_batch(key, mq, batch)
+                    done = self._consume_batch(key, mq, batch, epoch)
                     progressed = progressed or done
                 except Exception as e:  # noqa: BLE001
                     # 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死分发线程）
@@ -2699,8 +2730,21 @@ class DefaultMQPushConsumer:
                 for m in reversed(batch):
                     dq.appendleft(m)
 
-    def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt]) -> bool:
-        """消费一个批次并处理回投/挂起。返回消费位点是否前进。"""
+    def _consume_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
+                       epoch: Optional[int] = None) -> bool:
+        """消费一个批次并处理回投/挂起。返回消费位点是否前进。
+
+        ``epoch``：这批消息所属的 ProcessQueue 代号（见 ``_queue_epoch``）。队列在本批次
+        排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）时，这批消息
+        **不能再消费也不能 ack** —— 符合 Java ``ConsumeMessageConcurrentlyService:339``
+        / ``ConsumeMessageOrderlyService:391`` 的 ``isDropped()`` 短路。
+        """
+        if epoch is not None and epoch != self._queue_epoch.get(key, 0):
+            dropped = self._queue_epoch.get(key, 0)
+            logger.warning("the message queue not be able to consume, because it's dropped. "
+                           "group=%s mq=%s msgs=%d epoch=%s->%s",
+                           self.consumer_group, mq, len(batch), epoch, dropped)
+            return False
         listener = self.message_listener
         broadcast = self.message_model == MessageModel.BROADCASTING
         self._reset_retry_topic_and_namespace(batch)
@@ -2759,13 +2803,13 @@ class DefaultMQPushConsumer:
                         return False
                 else:
                     self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=False)
-                self._advance_consume_offset(key, batch)
+                self._advance_consume_offset(key, batch, epoch=epoch)
                 return True
             # ---- autoCommit=False（Java:270-300，binlog 消费场景）----
             if status == ConsumeOrderlyStatus.COMMIT:
                 # Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
                 self._record_consume_rt(mq.topic, obegin_ms)
-                self._advance_consume_offset(key, batch)
+                self._advance_consume_offset(key, batch, epoch=epoch)
                 return True
             if status == ConsumeOrderlyStatus.ROLLBACK:
                 # Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
@@ -2841,11 +2885,11 @@ class DefaultMQPushConsumer:
             if dropped > 0:
                 logger.warning("BROADCASTING, the message consume failed, drop it: %d msgs in %s",
                                dropped, mq)
-            self._advance_consume_offset(key, batch)
+            self._advance_consume_offset(key, batch, epoch=epoch)
             return True
         if ack_index + 1 >= len(batch):
             # 整批认可（默认路径）：什么都不用回投，位点直接前进
-            self._advance_consume_offset(key, batch)
+            self._advance_consume_offset(key, batch, epoch=epoch)
             return True
         # 集群模式：未认可的 [ack_index+1, size) 逐条回投 %RETRY%topic（延迟梯度
         # 3+reconsumeTimes；超过 maxReconsumeTimes 由 broker 自动转 %DLQ%）
@@ -2864,7 +2908,8 @@ class DefaultMQPushConsumer:
         # 仍留在 ProcessQueue 里的那几条（removeMessage 这时返回它们的最小 offset）
         self._advance_consume_offset(
             key, [m for m in batch if id(m) not in failed_ids],
-            floor=min((m.queue_offset or 0) for m in msg_back_failed) if msg_back_failed else None)
+            floor=min((m.queue_offset or 0) for m in msg_back_failed) if msg_back_failed else None,
+            epoch=epoch)
         return not msg_back_failed
 
     def _send_back_batch(self, batch: List[MessageExt],
@@ -2993,7 +3038,20 @@ class DefaultMQPushConsumer:
             return False
 
     def _advance_consume_offset(self, key: str, batch: List[MessageExt],
-                                floor: Optional[int] = None) -> None:
+                                floor: Optional[int] = None,
+                                epoch: Optional[int] = None) -> None:
+        """推进"已消费位点"（Java ``ConsumeMessageConcurrentlyService:266`` 的 updateOffset）。
+
+        ``epoch`` 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被
+        撤销/重建（Java ``:267`` 的 ``!processQueue.isDropped()``），**整批 ack 作废**。
+        ``_frozen_offsets`` 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
+        """
+        if epoch is not None and epoch != self._queue_epoch.get(key, 0):
+            logger.debug("drop ack for %s: process queue was dropped (epoch %s -> %s)",
+                         key, epoch, self._queue_epoch.get(key, 0))
+            return
+        if key in self._frozen_offsets:
+            return
         if not batch:
             # 整批回投都失败时没有任何条目被认可，位点原地不动
             return
@@ -3030,11 +3088,42 @@ class DefaultMQPushConsumer:
             return
         if next_off is None:
             return
+        if key in self._frozen_offsets:
+            # 位点已被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset.update 在
+            # allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
+            return
         if self._pending.get(key) or self._msg_queue_inflight.get(key):
             return
         cur = self._consume_offsets.get(key)
         if cur is None or next_off > cur:
             self._consume_offsets[key] = next_off
+
+    def _offset_illegal_recover(self, key: str) -> None:
+        """Java ``DefaultMQPushConsumerImpl`` 的 OFFSET_ILLEGAL 分支（:402-427）。
+
+        broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置，见
+        ``PullMessageProcessor`` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
+        OFFSET_RESET 一律回 ``PULL_OFFSET_MOVED``，客户端在 ``MQClientAPIImpl:1099``
+        映射成本状态），并把修正值放在 ``nextBeginOffset`` 里。纠错不只是把游标拨过去：
+        这条队列上**已经取回、还没消费/没 ack 的消息全部作废**（它们落在被跳过的区间里，
+        ack 它们会把位点推回非法值），然后按修正位点把这条队列重建。
+
+        Java 的四步：``setNextOffset`` → ``ProcessQueue.setDropped(true)`` →
+        ``{ updateAndFreezeOffset; persist; removeProcessQueue }`` →
+        ``rebalanceImmediately``。本端口：置位点 + 冻结（在回调的临界区里，等价
+        updateAndFreezeOffset）→ 撤队列（``_retire_queue_locked`` 清缓冲/线程表并
+        **代号 +1**，等价 setDropped）→ 锁外把修正位点推给 broker（等价 persist）→
+        叫醒 rebalance 重建（removeProcessQueue 之后由分配结果重建）。
+
+        须在锁外调用：里面要做网络 RPC。
+        """
+        with self._lock:
+            retired: List[Tuple[MessageQueue, Optional[int]]] = []
+            self._retire_queue_locked(key, None, retired)
+        # persist：把修正后的位点立刻写回 broker（Java 显式的一次 persist，不等周期落盘）
+        self._on_queues_revoked(retired)
+        self.rebalance_immediately()
+        logger.warning("the pull request offset illegal, fix it, queue=%s", key)
 
     # ---------------- 位点持久化 ----------------
     def _start_offset_persist_loop(self) -> None:

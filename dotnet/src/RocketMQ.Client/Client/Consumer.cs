@@ -533,6 +533,14 @@ public sealed class DefaultMQPushConsumer
     // 撤销标记（对齐 Java ProcessQueue.isDropped）：rebalance 把某队列从本实例分配中去掉后，
     // 置 _dropped，pull 线程长轮询返回后看到该标记即丢弃批次并退出（不再为该队列服务）。
     private readonly HashSet<string> _dropped = new(StringComparer.Ordinal);
+    // 队列「代号」（Python _queue_epoch，相当 Java ProcessQueue 的对象身份）：每次撤队列 +1。
+    // DispatchLoop 取批次时把代号一起取走，ack 前比对 —— 不一致说明这条队列在消费期间被
+    // 撤销/重建过，整批作废（Java ConsumeMessageConcurrentlyService:339 的 isDropped 短路）。
+    private readonly Dictionary<string, long> _queueEpoch = new(StringComparer.Ordinal);
+    // 被 broker 纠正过位点、正等重建的队列（Python _frozen_offsets，Java
+    // RemoteBrokerOffsetStore.updateAndFreezeOffset 的 ControllableOffset.allowToUpdate=false）：
+    // 冻结期间 ack 与 correctTagsOffset 都不许动位点，直到队列重建才解冻。
+    private readonly HashSet<string> _frozenOffsets = new(StringComparer.Ordinal);
 
     private MQClientInstance? _mqClient;
     private volatile bool _started;
@@ -1658,6 +1666,10 @@ public sealed class DefaultMQPushConsumer
         _offsetTable.Remove(key);
         _lockOk.Remove(key);
         _mqMap.Remove(key);
+        // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java setDropped(true)）；冻结标记**保留**到
+        // 队列重建为止（RebalancePullThreads 解冻），避免纠错后的位点被旧 ack 覆盖。
+        _queueEpoch.TryGetValue(key, out long epoch);
+        _queueEpoch[key] = epoch + 1;
         if (_popQueues.TryGetValue(key, out PopProcessQueue? pq))
         {
             pq.SetDropped(true);
@@ -1804,6 +1816,19 @@ public sealed class DefaultMQPushConsumer
         _started = started;
     }
 
+    /// <summary>单测入口：把"当前分给本实例的队列集"置成给定值并跑一次拉取线程重建 ——
+    /// 用来锁「重建即解冻」（OFFSET_ILLEGAL 纠错后的队列靠它恢复 ack）。不起集群：
+    /// 新循环因本端没有 MQClientInstance 会立刻自行退出。</summary>
+    public void RebuildPullThreadsForTest(List<MessageQueue> assigned)
+    {
+        lock (_lock)
+        {
+            _assigned = new List<MessageQueue>(assigned);
+        }
+
+        RebalancePullThreads();
+    }
+
     /// <summary>给某把队列登记一条占位循环线程（单测用）：<paramref name="alive"/>=false 时
     /// 是一条"从未启动/已退出"的线程，正好触发 Java 侧 <c>isAlive</c> 那一半判据。
     /// 活着的占位线程由 <see cref="ReleaseTestLoops"/> 统一放行。</summary>
@@ -1854,6 +1879,10 @@ public sealed class DefaultMQPushConsumer
                     // 307/220 里看到、位点也能持久化；不种时刻的话下一轮 rebalance 无从判断。
                     _mqMap[kv.Key] = kv.Value;
                     _lastPullAt[kv.Key] = beganAt;
+                    // 新 ProcessQueue 就位 ⇒ 解冻（Java removeProcessQueue 里的 removeOffset
+                    // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让
+                    // 这条队列从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
+                    _frozenOffsets.Remove(kv.Key);
                 }
             }
         }
@@ -1908,6 +1937,9 @@ public sealed class DefaultMQPushConsumer
     {
         WakeRebalanceLoop();
     }
+
+    /// <summary>单测入口：重平衡请求是否已置位（OFFSET_ILLEGAL 纠错后要靠它重建队列）。</summary>
+    public bool RebalancePendingForTest() => _rebalanceNow.IsSet;
 
     private RemotingCommand? OnGetConsumerRunningInfo(RemotingCommand cmd, string addr)
     {
@@ -2742,12 +2774,29 @@ public sealed class DefaultMQPushConsumer
             // 拉取游标推进到 nextBeginOffset；"已消费位点"由 _consumeOffsetTable 跟踪并持久化
             if (result.NextBeginOffset >= 0)
             {
+                bool illegal = false;
                 lock (_lock)
                 {
                     _offsetTable[key] = result.NextBeginOffset;
-                    // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
-                    // NO_MATCHED_MSG）时修正"已消费位点"，见 CorrectTagsOffsetLocked
-                    CorrectTagsOffsetLocked(key, result.Status, result.NextBeginOffset);
+                    if (result.Status == PullStatus.OffsetIllegal)
+                    {
+                        // Java DefaultMQPushConsumerImpl:402-427 —— 位点被 broker 纠正时必须连
+                        // 纠错带重建一起做，见 OffsetIllegalRecover。冻结在锁内先行（等价回调里
+                        // 同步执行的 updateAndFreezeOffset），撤队列与落盘的 RPC 放锁外。
+                        FreezeOffsetForIllegalLocked(key, result.NextBeginOffset);
+                        illegal = true;
+                    }
+                    else
+                    {
+                        // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+                        // NO_MATCHED_MSG）时修正"已消费位点"，见 CorrectTagsOffsetLocked
+                        CorrectTagsOffsetLocked(key, result.Status, result.NextBeginOffset);
+                    }
+                }
+
+                if (illegal)
+                {
+                    OffsetIllegalRecover(key, mq);
                 }
             }
         }
@@ -3301,11 +3350,13 @@ public sealed class DefaultMQPushConsumer
                     }
                 }
 
-                List<MessageExt> batch = TakeBatchForConsume(key);
+                // 代号与批次在**同一把锁**里取走（Java 取消息与 isDropped 判定同在
+                // ConsumeRequest.run 的临界区）：取走后又撤销/重建的队列，ack 全部作废
+                List<MessageExt> batch = TakeBatchForConsume(key, out long epoch);
                 if (batch.Count == 0) continue;
                 try
                 {
-                    bool done = ConsumeBatch(key, mq, batch);
+                    bool done = ConsumeBatch(key, mq, batch, epoch);
                     progressed = progressed || done;
                 }
                 catch (Exception e)
@@ -3357,8 +3408,9 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 仅供单测/联调：不经过网络直接驱动 classic 消费分发 ----------------
     // classic 路径的 ackIndex 语义错得很安静（尾巴静默丢失、位点越过未消费完的消息），
     // 必须能离线锁死再上真机，所以开这几个口子。
-    public bool ConsumeBatchForTest(string key, MessageQueue mq, List<MessageExt> batch)
-        => ConsumeBatch(key, mq, batch);
+    public bool ConsumeBatchForTest(string key, MessageQueue mq, List<MessageExt> batch,
+                                    long? epoch = null)
+        => ConsumeBatch(key, mq, batch, epoch);
 
     /// <summary>顺序回投的 newMsg 构造体（Java 两条链路共用），供单测直接查属性。</summary>
     public Message BuildRetryMessageForTest(MessageExt msg, int maxReconsumeTimes)
@@ -3397,6 +3449,15 @@ public sealed class DefaultMQPushConsumer
         lock (_lock)
         {
             _mqMap[key] = mq;
+        }
+    }
+
+    /// <summary>单测入口：该 key 是否还在「已分配队列」登记表里（撤队列必须连它一起摘掉）。</summary>
+    public bool MqMapContainsForTest(string key)
+    {
+        lock (_lock)
+        {
+            return _mqMap.ContainsKey(key);
         }
     }
 
@@ -3463,9 +3524,36 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>消费一个批次并处理回投/挂起。返回消费位点是否前进。</summary>
-    private bool ConsumeBatch(string key, MessageQueue mq, List<MessageExt> batch)
+    /// <summary>消费一个批次并处理回投/挂起。返回消费位点是否前进。
+    /// <para>
+    /// <paramref name="epoch"/>：这批消息所属的 ProcessQueue 代号（见 <see cref="_queueEpoch"/>）。
+    /// 队列在本批次排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）时，这批
+    /// 消息<b>不能再消费也不能 ack</b> —— 符合 Java <c>ConsumeMessageConcurrentlyService:339</c>
+    /// / <c>ConsumeMessageOrderlyService:391</c> 的 <c>isDropped()</c> 短路。
+    /// </para>
+    /// </summary>
+    private bool ConsumeBatch(string key, MessageQueue mq, List<MessageExt> batch,
+                              long? epoch = null)
     {
+        if (epoch.HasValue)
+        {
+            long nowEpoch;
+            lock (_lock)
+            {
+                nowEpoch = QueueEpochLocked(key);
+            }
+
+            if (epoch.Value != nowEpoch)
+            {
+                ClientLog.Warn("the message queue not be able to consume, because it's dropped. group="
+                    + ConsumerGroup + " mq=" + mq + " msgs="
+                    + batch.Count.ToString(CultureInfo.InvariantCulture) + " epoch="
+                    + epoch.Value.ToString(CultureInfo.InvariantCulture) + "->"
+                    + nowEpoch.ToString(CultureInfo.InvariantCulture));
+                return false;
+            }
+        }
+
         bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
         // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
         if (IsOrderly())
@@ -3545,7 +3633,7 @@ public sealed class DefaultMQPushConsumer
                     RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: false);
                 }
 
-                AdvanceConsumeOffset(key, batch);
+                AdvanceConsumeOffset(key, batch, null, epoch);
                 Interlocked.Add(ref _consumedCount, batch.Count);
                 return true;
             }
@@ -3555,7 +3643,7 @@ public sealed class DefaultMQPushConsumer
             {
                 // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
                 RecordConsumeRt(mq.Topic, obegin);
-                AdvanceConsumeOffset(key, batch);
+                AdvanceConsumeOffset(key, batch, null, epoch);
                 Interlocked.Add(ref _consumedCount, batch.Count);
                 return true;
             }
@@ -3656,7 +3744,7 @@ public sealed class DefaultMQPushConsumer
                     + dropped.ToString(CultureInfo.InvariantCulture) + " msgs in " + mq);
             }
 
-            AdvanceConsumeOffset(key, batch);
+            AdvanceConsumeOffset(key, batch, null, epoch);
             Interlocked.Add(ref _consumedCount, batch.Count);
             return true;
         }
@@ -3664,7 +3752,7 @@ public sealed class DefaultMQPushConsumer
         if (acked >= batch.Count)
         {
             // 整批认可（默认路径）：一条都不用回投，位点直接前进
-            AdvanceConsumeOffset(key, batch);
+            AdvanceConsumeOffset(key, batch, null, epoch);
             Interlocked.Add(ref _consumedCount, batch.Count);
             return true;
         }
@@ -3714,7 +3802,7 @@ public sealed class DefaultMQPushConsumer
             }
         }
 
-        AdvanceConsumeOffset(key, handled, hasFloor ? floor : null);
+        AdvanceConsumeOffset(key, handled, hasFloor ? floor : null, epoch);
         Interlocked.Add(ref _consumedCount, handled.Count);
         return msgBackFailed.Count == 0;
     }
@@ -3953,31 +4041,51 @@ public sealed class DefaultMQPushConsumer
     /// 推进位点到 batch 中最大 queueOffset+1；<paramref name="floor"/> 非空时不越过它
     /// （对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时提交位点只能是
     /// firstKey，否则会静默丢掉那条）。空批次直接返回。
+    /// <para>
+    /// <paramref name="epoch"/> 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明
+    /// 队列已被撤销/重建（Java <c>ConsumeMessageConcurrentlyService:267</c> 的
+    /// <c>!processQueue.isDropped()</c>），<b>整批 ack 作废</b>。<see cref="_frozenOffsets"/>
+    /// 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
+    /// </para>
     /// </summary>
-    private void AdvanceConsumeOffset(string key, List<MessageExt> batch, long? floor = null)
+    private void AdvanceConsumeOffset(string key, List<MessageExt> batch, long? floor = null,
+                                      long? epoch = null)
     {
-        if (batch.Count == 0)
-        {
-            // 整批回投都失败时没有任何条目被认可，位点原地不动
-            return;
-        }
-
-        long nextOffset = 0;
-        foreach (MessageExt m in batch)
-        {
-            if (m.QueueOffset + 1 > nextOffset)
-            {
-                nextOffset = m.QueueOffset + 1;
-            }
-        }
-
-        if (floor.HasValue && floor.Value < nextOffset)
-        {
-            nextOffset = floor.Value;
-        }
-
         lock (_lock)
         {
+            if (epoch.HasValue && epoch.Value != QueueEpochLocked(key))
+            {
+                ClientLog.Debug("drop ack for " + key + ": process queue was dropped (epoch "
+                    + epoch.Value.ToString(CultureInfo.InvariantCulture) + " -> "
+                    + QueueEpochLocked(key).ToString(CultureInfo.InvariantCulture) + ")");
+                return;
+            }
+
+            if (_frozenOffsets.Contains(key))
+            {
+                return;
+            }
+
+            if (batch.Count == 0)
+            {
+                // 整批回投都失败时没有任何条目被认可，位点原地不动
+                return;
+            }
+
+            long nextOffset = 0;
+            foreach (MessageExt m in batch)
+            {
+                if (m.QueueOffset + 1 > nextOffset)
+                {
+                    nextOffset = m.QueueOffset + 1;
+                }
+            }
+
+            if (floor.HasValue && floor.Value < nextOffset)
+            {
+                nextOffset = floor.Value;
+            }
+
             _consumeOffsetTable.TryGetValue(key, out long cur);
             if (cur < nextOffset)
             {
@@ -4018,6 +4126,13 @@ public sealed class DefaultMQPushConsumer
             return;
         }
 
+        if (_frozenOffsets.Contains(key))
+        {
+            // 位点已被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset.update 在
+            // allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
+            return;
+        }
+
         if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
         {
             return;
@@ -4039,16 +4154,112 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
+    /// 拉取应答 OFFSET_ILLEGAL 的锁内动作（Java <c>RemoteBrokerOffsetStore.updateAndFreezeOffset</c>）：
+    /// 位点**无条件**写成本次纠正值并冻结（ControllableOffset.allowToUpdate=false）。照
+    /// <see cref="CorrectTagsOffsetLocked"/> 的 increaseOnly 写会让"broker 把位点往回调"这种
+    /// 纠正永远生效不了。调用方须持 <c>_lock</c>。
+    /// </summary>
+    private void FreezeOffsetForIllegalLocked(string key, long nextOffset)
+    {
+        _frozenOffsets.Add(key);
+        _consumeOffsetTable[key] = nextOffset;
+    }
+
+    /// <summary>单测入口：见 <see cref="FreezeOffsetForIllegalLocked"/>（加锁包装）。</summary>
+    public void FreezeOffsetForIllegalForTest(string key, long nextOffset)
+    {
+        lock (_lock)
+        {
+            FreezeOffsetForIllegalLocked(key, nextOffset);
+        }
+    }
+
+    /// <summary>
+    /// Java <c>DefaultMQPushConsumerImpl</c> 的 OFFSET_ILLEGAL 分支（<c>:402-427</c>）。
+    /// <para>
+    /// broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置，见
+    /// <c>PullMessageProcessor</c> 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET
+    /// 一律回 <c>PULL_OFFSET_MOVED</c>，客户端在 <c>MQClientAPIImpl:1099</c> 映射成本状态），
+    /// 并把修正值放在 <c>nextBeginOffset</c> 里。纠错不只是把游标拨过去：这条队列上
+    /// <b>已经取回、还没消费/没 ack 的消息全部作废</b>（它们落在被跳过的区间里，ack 它们会把
+    /// 位点推回非法值），然后按修正位点把这条队列重建。
+    /// </para>
+    /// <para>
+    /// Java 的四步：<c>setNextOffset</c> → <c>ProcessQueue.setDropped(true)</c> →
+    /// <c>{ updateAndFreezeOffset; persist; removeProcessQueue }</c> → <c>rebalanceImmediately</c>。
+    /// 本端口：置位点 + 冻结（在回调的临界区里，等价 updateAndFreezeOffset）→ 撤队列
+    /// （<see cref="RetireQueueLocked"/> 清缓冲/线程表并<b>代号 +1</b>，等价 setDropped）→
+    /// 锁外把修正位点推给 broker（等价 persist）→ 叫醒 rebalance 重建。
+    /// </para>
+    /// <para>须在锁外调用：里面要做网络 RPC。</para>
+    /// </summary>
+    private void OffsetIllegalRecover(string key, MessageQueue mq)
+    {
+        var retired = new List<RetiredQueue>();
+        lock (_lock)
+        {
+            RetireQueueLocked(key, mq, retired);
+        }
+
+        // persist：把修正后的位点立刻写回 broker（Java 显式的一次 persist，不等周期落盘）；
+        // 顺序消费还要解锁（Java 走 removeProcessQueue → removeUnnecessaryMessageQueue）
+        bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
+        if (!broadcast && _mqClient is not null)
+        {
+            foreach (RetiredQueue r in retired)
+            {
+                if (r.HadOffset)
+                {
+                    try
+                    {
+                        _mqClient.UpdateConsumerOffset(ConsumerGroup, r.Mq, r.ConsumeOffset);
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Debug("persist offset on offset-illegal recover failed for "
+                            + r.Mq + ": " + e.Message);
+                    }
+                }
+
+                if (IsOrderly() && !PopMode)
+                {
+                    try
+                    {
+                        _mqClient.UnlockBatchMq(ConsumerGroup, _clientId, new List<MessageQueue> { r.Mq });
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Debug("unlock on offset-illegal recover failed for " + r.Mq + ": " + e.Message);
+                    }
+                }
+            }
+        }
+
+        _rebalanceNow.Set();
+        ClientLog.Warn("the pull request offset illegal, fix it, queue=" + key);
+    }
+
+    /// <summary>单测入口：见 <see cref="OffsetIllegalRecover"/>（不起集群，网络段自动跳过）。</summary>
+    public void OffsetIllegalRecoverForTest(string key, MessageQueue mq) =>
+        OffsetIllegalRecover(key, mq);
+
+    /// <summary>
     /// 「取走一批 + 登记在途」：DispatchLoop 的生产路径用的就是这里（取走与登记同一把锁）。
     /// 漏登记 = <see cref="CorrectTagsOffsetLocked"/> 的闸门看不见在途批次，崩溃恢复时会静默
     /// 跳过消息；漏调用 <see cref="FinishBatchConsume"/> = 闸门永远关着，correctTagsOffset
     /// 一次都不生效。所以这两个与 <c>ConsumeBatchForTest</c> 同一理由开放给单测。
     /// </summary>
-    public List<MessageExt> TakeBatchForConsume(string key)
+    public List<MessageExt> TakeBatchForConsume(string key) => TakeBatchForConsume(key, out _);
+
+    /// <summary>见 <see cref="TakeBatchForConsume(string)"/>；<paramref name="epoch"/> 是本批
+    /// 所属 ProcessQueue 的代号，与批次在**同一把锁**里取走（Java 取消息与 isDropped 判定
+    /// 同在 ConsumeRequest.run 的临界区）。</summary>
+    public List<MessageExt> TakeBatchForConsume(string key, out long epoch)
     {
         List<MessageExt> batch = new();
         lock (_lock)
         {
+            epoch = QueueEpochLocked(key);
             if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
             {
                 int n = Math.Min(q.Count, Math.Max(1, _consumeMessageBatchMaxSize));
@@ -4067,6 +4278,10 @@ public sealed class DefaultMQPushConsumer
 
         return batch;
     }
+
+    /// <summary>该队列当前的 ProcessQueue 代号（无记录按 0）。须持锁调用。</summary>
+    private long QueueEpochLocked(string key) =>
+        _queueEpoch.TryGetValue(key, out long epoch) ? epoch : 0;
 
     /// <summary>「消费收尾 + 注销在途」：异常回塞路径同样要调，否则闸门永远关着。</summary>
     public void FinishBatchConsume(string key)
@@ -4102,6 +4317,40 @@ public sealed class DefaultMQPushConsumer
         lock (_lock)
         {
             return _inFlight.TryGetValue(key, out int cur) ? cur : 0;
+        }
+    }
+
+    /// <summary>该队列当前的 ProcessQueue 代号（撤销/重建会 +1），见 <see cref="_queueEpoch"/>。</summary>
+    public long QueueEpochForTest(string key)
+    {
+        lock (_lock)
+        {
+            return QueueEpochLocked(key);
+        }
+    }
+
+    /// <summary>单测入口：直接把某队列的代号置成给定值（真实路径由 RetireQueueLocked +1）。</summary>
+    public void SetQueueEpochForTest(string key, long epoch)
+    {
+        lock (_lock)
+        {
+            _queueEpoch[key] = epoch;
+        }
+    }
+
+    /// <summary>单测入口：见 <see cref="AdvanceConsumeOffset"/>（加锁包装）。</summary>
+    public void AdvanceConsumeOffsetForTest(string key, List<MessageExt> batch,
+                                            long? floor = null, long? epoch = null)
+    {
+        AdvanceConsumeOffset(key, batch, floor, epoch);
+    }
+
+    /// <summary>该队列的位点是否处于 OFFSET_ILLEGAL 纠错冻结期，见 <see cref="_frozenOffsets"/>。</summary>
+    public bool OffsetFrozenForTest(string key)
+    {
+        lock (_lock)
+        {
+            return _frozenOffsets.Contains(key);
         }
     }
 
@@ -4738,6 +4987,7 @@ public sealed class DefaultMQPushConsumer
 
         // 重新分配给本实例的队列清除撤销标记（可能上轮被撤销、本轮又分回），否则 pull 线程
         // 会误判 isDropped 直接退出。_pullThreads 的键存在性会阻止同一队列起两个线程。
+        // （OFFSET_ILLEGAL 的位点冻结不在这里解，见 RebalancePullThreads 的重建分支。）
         lock (_lock)
         {
             foreach (string k in assignedKeys)

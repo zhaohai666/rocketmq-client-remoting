@@ -406,8 +406,12 @@ public:
     // classic 消费路径的 ackIndex 语义错得很安静（尾巴静默丢失、位点越过未消费完的
     // 消息），必须能离线锁死再上真机，所以这一小段是 public。
     // 消费一个批次，处理回投/挂起；返回消费位点是否前进。key 用 offsetKey(mq)。
+    // epoch 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被撤销/
+    // 重建（rebalance 撤走、OFFSET_ILLEGAL 纠错、停摆自愈），这批消息**不消费也不 ack**
+    // ——直接作废（Java ConsumeMessageConcurrentlyService:339 的 isDropped() 短路）。
     bool consumeBatch(const std::string& key, const MessageQueue& mq,
-                      const std::vector<MessageExt>& batch);
+                      const std::vector<MessageExt>& batch,
+                      const std::optional<uint64_t>& epoch = std::nullopt);
     // 队列在缓冲/位点表里的 key（topic + brokerName + queueId）。
     static std::string offsetKey(const MessageQueue& mq);
     // 广播本地位点文件（Java LocalFileOffsetStore）的纯函数部件，开放给单测。
@@ -457,11 +461,30 @@ public:
     // 何时允许修正」都收在这一处，离线单测因此能一次锁死（真机上漏了它只表现为：
     // tag 长期不匹配的队列位点原地不动，重启后把这批没人要的消息反复重扫）。
     void correctTagsOffset(const std::string& key, PullStatus status, int64_t nextOffset);
+    // ---- OFFSET_ILLEGAL 纠错（Java DefaultMQPushConsumerImpl:402-427）----
+    // broker 说"你请求的位点非法"（队列被截断 / commitlog 过期 / 服务端一次性重置，一律回
+    // PULL_OFFSET_MOVED，见 MQClientAPIImpl:1099 映射成 OFFSET_ILLEGAL）并把修正值放在
+    // nextBeginOffset 里。纠错不只是把游标拨过去：这条队列上**已取回、还没消费/没 ack**
+    // 的消息全部作废（它们落在被跳过的区间里，ack 会把位点推回非法值），然后按修正位点重建。
+    // 四步对应 Java：setNextOffset → setDropped(true) → { updateAndFreezeOffset + persist
+    // + removeProcessQueue } → rebalanceImmediately。整条链路都在这里；内部要做网络 RPC，
+    // 须在**不持 lock_** 的路径上调用。
+    void handleOffsetIllegal(const std::string& key, int64_t nextOffset);
     // 「取走一批 + 登记在途」/「消费收尾 + 注销在途」：dispatchLoop 的生产路径用的就是
     // 这两个（取走时与 pending_ 同一把锁登记）。漏登记 = 闸门看不见在途批次，崩溃恢复
     // 时会静默跳过消息；漏注销 = 闸门永远关着，correctTagsOffset 一次都不生效。
-    std::vector<MessageExt> takeBatchForConsume(const std::string& key);
+    // epochOut 非空时回填这批消息所属的 ProcessQueue 代号（与取走同一临界区读，见
+    // queueEpoch）：ack 前比对不上就整批作废（Java :267 的 isDropped）。
+    std::vector<MessageExt> takeBatchForConsume(const std::string& key,
+                                                uint64_t* epochOut = nullptr);
     void finishBatchConsume(const std::string& key);
+    // 该队列的「ProcessQueue 代号」（Java ProcessQueue 的实例身份）：撤销/重建时 +1，在途
+    // 批次靠它判定自己是否已作废。判错是**静默**的（静默重复消费或静默丢 ack），所以与
+    // requestOffset 那套一起开放给单测。
+    uint64_t queueEpoch(const std::string& key) const;
+    // 该队列的已消费位点是否被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset 的
+    // allowToUpdate=false）：冻结期间 ack 与空应答修正都不许改它。
+    bool offsetFrozen(const std::string& key) const;
 
     // ---- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）----
     // 上游 5.5.0：请求去重入队后 run() 拿到队列锁就返回（POPTODO，
@@ -534,13 +557,23 @@ private:
     // 推进位点到 batch 中最大 queueOffset+1；floor 非空时不越过它
     //（对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时，
     //  提交位点只能是 firstKey，否则会静默丢掉那条）。空批次直接返回。
+    // epoch 非空时先比对批次所属代号，不一致或位点已被冻结则整批 ack 作废（Java :267）。
     void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch,
-                              const std::optional<int64_t>& floor = std::nullopt);
+                              const std::optional<int64_t>& floor = std::nullopt,
+                              const std::optional<uint64_t>& epoch = std::nullopt);
     // 以下三个要求调用方已持 lock_（生产路径就在既有临界区里调；公开的三个同名
     // 函数只是加锁包装，供单测直接驱动）。
     void correctTagsOffsetLocked(const std::string& key, PullStatus status, int64_t nextOffset);
     std::vector<MessageExt> takeBatchLocked(const std::string& key);
     void finishBatchLocked(const std::string& key);
+    // 丢弃一个队列的全部本地状态（调用方须持 lock_），已消费位点经 retired 交给调用方在
+    // 锁外持久化。撤线程表/缓冲/游标/位点，代号 +1（在途批次的 ack 全部作废），冻结标记
+    // 保留到队列重建（rebalancePullThreads 的解冻分支）——否则纠错后的位点会被旧 ack 覆盖。
+    // 两处调用：rebalance 撤队列（含停摆自愈）与 OFFSET_ILLEGAL 纠错。
+    void retireQueueLocked(const std::string& key, const MessageQueue& fallbackMq,
+                           std::vector<std::pair<MessageQueue, int64_t>>& retired);
+    // 该队列当前的 ProcessQueue 代号；没有记录按 0（与 takeBatchLocked 的缺省回填一致）
+    uint64_t queueEpochLocked(const std::string& key) const;
     // 回投兜底（Java sendMessageBackAsNormalMessage）
     void sendMessageBackAsNormalMessage(const MessageExt& msg);
     // 顺序消费的重投闸门（Java ConsumeMessageOrderlyService#checkReconsumeTimes /
@@ -728,6 +761,13 @@ private:
     // dispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。pending_ 与它合起来才是
     // Java 的 ProcessQueue.getMsgCount()，correctTagsOffsetLocked 的闸门两个都要看。
     std::map<std::string, int> inflightCount_;
+    // 队列当前的 ProcessQueue 代号（Java ProcessQueue 的实例身份）。撤销/重建时 +1：
+    // 在途批次带着取走时的代号，ack 前比对不上就整批作废
+    //（Java ConsumeMessageConcurrentlyService:267 的 !processQueue.isDropped()）。
+    std::map<std::string, uint64_t> queueEpoch_;
+    // 被 OFFSET_ILLEGAL 纠错冻结的位点（Java ControllableOffset.allowToUpdate=false）：
+    // 冻结期间 ack 与空应答修正都不许改它；队列重建时解冻。
+    std::set<std::string> frozenOffsets_;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
     std::set<std::string> lockOk_;
 

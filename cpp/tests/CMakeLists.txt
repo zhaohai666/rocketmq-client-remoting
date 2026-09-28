@@ -256,3 +256,12 @@ add_test(NAME produce_accumulator COMMAND rmq_test_produce_accumulator)
 add_executable(rmq_test_correct_tags_offset test_correct_tags_offset.cpp)
 target_link_libraries(rmq_test_correct_tags_offset PRIVATE rocketmq::remoting)
 add_test(NAME correct_tags_offset COMMAND rmq_test_correct_tags_offset)
+
+# OFFSET_ILLEGAL 纠错（Java DefaultMQPushConsumerImpl:402-427）：位点被 broker 纠正时
+# 覆盖写修正值并冻结（ControllableOffset allowToUpdate=false）、撤队列（setDropped）、
+# 立刻落盘（persist）、叫醒 rebalance 重建。冻结/代号写错是静默的两种极端：位点与 broker
+# 来回弹跳，或崩溃后从非法位点重启、纠错白做。
+# 与 python/tests/test_offset_illegal_recover.py、rust/src/client/consumer.rs 同名测试同题。
+add_executable(rmq_test_offset_illegal_recover test_offset_illegal_recover.cpp)
+target_link_libraries(rmq_test_offset_illegal_recover PRIVATE rocketmq::remoting)
+add_test(NAME offset_illegal_recover COMMAND rmq_test_offset_illegal_recover)
