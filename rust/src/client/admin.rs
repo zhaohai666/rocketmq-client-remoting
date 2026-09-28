@@ -191,6 +191,37 @@ fn ext_pairs(pairs: &[(&str, String)]) -> StringMap {
     ext
 }
 
+/// 222 `INVOKE_BROKER_TO_RESET_OFFSET` 的 extFields。
+///
+/// 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
+/// 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
+/// `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
+/// isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
+/// 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
+/// 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
+///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+fn reset_offset_ext_pairs(
+    topic: &str,
+    group: &str,
+    timestamp: i64,
+    is_force: bool,
+    queue_id: Option<i32>,
+    offset: Option<i64>,
+) -> StringMap {
+    let mut pairs = vec![
+        ("topic", topic.to_string()),
+        ("group", group.to_string()),
+        ("timestamp", timestamp.to_string()),
+        ("isForce", bool_flag(is_force).to_string()),
+        // Java：offset=-1 表示 offset 为空
+        ("offset", offset.unwrap_or(-1).to_string()),
+    ];
+    if let Some(queue_id) = queue_id {
+        pairs.push(("queueId", queue_id.to_string()));
+    }
+    ext_pairs(&pairs)
+}
+
 /// Python `response.ext_fields.get(k, 0) or 0`：缺字段/非数字都当 0。
 fn ext_int(response: &RemotingCommand, key: &str) -> i64 {
     response
@@ -2110,6 +2141,12 @@ impl DefaultMQAdminExt {
     /// 逐 broker 下发 `INVOKE_BROKER_TO_RESET_OFFSET`(222)，由 broker 端按 timestamp
     /// 算新位点、同步在线消费者并写 offset 表，汇总 `Map<MessageQueue, Long>`。
     ///
+    /// `is_cpp` 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方（也就是
+    /// 本请求）的 language 判 `isC`，仅 CPP 置真（`AdminBrokerProcessor:2263-2270`），CPP 时
+    /// 推 `ResetOffsetBodyForC`（JSON 数组）、其余推 `ResetOffsetBody`（对象即键的 map）。
+    /// Java 管理端两个重载传的都是 `false`（`MQClientAPIImpl:2405/2408`）；222 的**响应**体
+    /// 恒为 map 形状（`Broker2Client:232`），与本参数无关。
+    ///
     /// 这里**不再**走「逐队列 searchOffset + updateConsumerOffset」的旧本地实现 ——
     /// 那不会同步在线消费者，也不会做 broker 端一致性校验（旧实现保留在
     /// [`DefaultMQAdminExt::reset_offset_by_timestamp_old`]，只服务于 Java 的 old 分支）。
@@ -2178,20 +2215,10 @@ impl DefaultMQAdminExt {
         offset: Option<i64>,
     ) -> Result<Vec<(MessageQueueKey, i64)>> {
         let client = self.require_client()?;
-        let mut pairs = vec![
-            ("topic", topic.to_string()),
-            ("group", group.to_string()),
-            ("timestamp", timestamp.to_string()),
-            ("force", bool_flag(is_force).to_string()),
-            // Java：offset=-1 表示 offset 为空
-            ("offset", offset.unwrap_or(-1).to_string()),
-        ];
-        if let Some(queue_id) = queue_id {
-            pairs.push(("queueId", queue_id.to_string()));
-        }
+        let ext = reset_offset_ext_pairs(topic, group, timestamp, is_force, queue_id, offset);
         let mut request = build_request(
             request_code::INVOKE_BROKER_TO_RESET_OFFSET,
-            &ext_pairs(&pairs),
+            &ext,
             None,
         );
         if is_cpp {
@@ -2273,7 +2300,7 @@ impl DefaultMQAdminExt {
         timestamp: i64,
     ) -> Result<()> {
         match self
-            .reset_offset_by_timestamp(topic, consumer_group, timestamp, true, None, true)
+            .reset_offset_by_timestamp(topic, consumer_group, timestamp, true, None, false)
             .await
         {
             Ok(_) => Ok(()),
@@ -2622,6 +2649,32 @@ mod tests {
             admin.get_name_server_addr(),
             "127.0.0.1:9876;127.0.0.1:9877"
         );
+    }
+
+    /// 222 的 force 标志在 wire 上叫 **isForce**：Java 拿字段名做 ext key
+    /// （`RemotingCommand.makeCustomHeaderToNet:437-450`），而 `ResetOffsetRequestHeader`
+    /// 声明的是 `private boolean isForce`。写成 force 时 broker 视 isForce=false，
+    /// 前重（timestamp=-1）会回显 consumerOffset 而不是跳到 maxOffset。
+    /// 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
+    ///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+    /// 与 python/tests/test_admin_reset_offset.py 的同名断言、.NET ResetOffsetTests 的
+    /// wire 取证同题。
+    #[test]
+    fn reset_offset_ext_key_is_isforce() {
+        let ext = reset_offset_ext_pairs("T", "G", -1, true, None, None);
+        assert_eq!(ext.get("isForce"), Some("true"));
+        assert!(!ext.contains_key("force"), "force 不是 Java 的字段名");
+        assert_eq!(ext.get("timestamp"), Some("-1"));
+        assert_eq!(ext.get("offset"), Some("-1"));
+        assert!(!ext.contains_key("queueId"), "整个 topic 的重载不带 queueId");
+
+        // 负向对照：isForce=false 也必须下发（不能"假值省略"），单队列重载带上 queueId
+        let single = reset_offset_ext_pairs("T", "G", 0, false, Some(3), Some(7));
+        assert_eq!(single.get("isForce"), Some("false"));
+        assert!(!single.contains_key("force"));
+        assert_eq!(single.get("queueId"), Some("3"));
+        assert_eq!(single.get("offset"), Some("7"));
+        assert_eq!(single.get("timestamp"), Some("0"));
     }
 
     /// Python `start()` 在没有 name server 时抛、且**不**留在 started。

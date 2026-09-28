@@ -974,11 +974,16 @@ class DefaultMQAdminExt:
     def reset_offset_by_timestamp(self, topic: str, group: str, timestamp: int,
                                   is_force: bool = True,
                                   cluster_name: Optional[str] = None,
-                                  is_cpp: bool = True) -> Dict[MessageQueue, int]:
+                                  is_cpp: bool = False) -> Dict[MessageQueue, int]:
         """对应 Java resetOffsetByTimestamp：
 
         逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET（broker 端按 timestamp 计算新位点，
         并同步在线消费者 + 更新 offset 表），汇总 ``Map<MessageQueue, Long>``。
+
+        ``is_cpp`` 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方
+        （也就是本请求）的 language 判断，CPP 回 ``ResetOffsetBodyForC``（JSON 数组），
+        其余回 ``ResetOffsetBody``（对象即键的 map）。Java 的管理端两个重载传的都是
+        ``false``（``MQClientAPIImpl:2408``），本端口同样默认 ``false``。
 
         注意：这里**不再**走「逐队列 searchOffset + updateConsumerOffset」的旧本地实现——
         那不会同步在线消费者，也不会做 broker 端一致性校验。
@@ -1017,7 +1022,14 @@ class DefaultMQAdminExt:
             "topic": topic,
             "group": group,
             "timestamp": timestamp,
-            "force": "true" if is_force else "false",
+            # 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
+            # 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
+            # `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
+            # isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
+            # 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
+            # 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
+            #               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+            "isForce": "true" if is_force else "false",
             # Java：offset=-1 表示 offset 为空
             "offset": -1 if offset is None else offset,
         }

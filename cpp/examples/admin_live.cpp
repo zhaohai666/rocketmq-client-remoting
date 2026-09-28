@@ -12,7 +12,8 @@
 //      queryMessage（可达性）/ viewMessage(msgId)
 //   9. maxOffset / minOffset / searchOffset / earliestMsgStoreTime / examineConsumerOffset
 //  10. sendMessageBack：消费 1 条后重投 → 轮询 %RETRY%<group> 出现该消息
-//  11. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，language=CPP）
+//  11. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，language=JAVA：broker 只在
+//      发起方 language=CPP 时才推 ResetOffsetBodyForC，Java 客户端默认不启用）
 //  12. resetOffsetByQueueId（25 + 带 queueId/offset 的 222）：拉回 min ⇒ 首笔 pull 被
 //      OFFSET_RESET 短路成 PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒
 //      ⇒ 位点停在第 1 笔写入的非法值（两笔 RPC 非原子，与 Java 同构）

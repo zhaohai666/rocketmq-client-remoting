@@ -520,6 +520,61 @@ class ResetOffsetBody:
         return ResetOffsetBody.from_dict(fastjson_loads(data.decode("utf-8")))
 
 
+class MessageQueueForC:
+    """对应 org.apache.rocketmq.common.message.MessageQueueForC（ForC 数组的元素）。"""
+
+    def __init__(self, topic: str = "", broker_name: str = "", queue_id: int = 0,
+                 offset: int = 0):
+        self.topic = topic
+        self.broker_name = broker_name
+        self.queue_id = queue_id
+        self.offset = offset
+
+    def to_dict(self) -> dict:
+        return {"topic": self.topic, "brokerName": self.broker_name,
+                "queueId": self.queue_id, "offset": self.offset}
+
+    @staticmethod
+    def from_dict(d: dict) -> "MessageQueueForC":
+        return MessageQueueForC(
+            topic=d.get("topic") or "",
+            broker_name=d.get("brokerName") or "",
+            queue_id=int(d.get("queueId") or 0),
+            offset=int(d.get("offset") or 0),
+        )
+
+
+class ResetOffsetBodyForC:
+    """对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：``offsetTable`` 是
+    **数组**（每条自带 offset），不是 map。
+
+    只有 222 发起方的 language=CPP 时 broker 才推这种体（``Broker2Client.resetOffset:158-163``），
+    Java 管理端恒发 JAVA，所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
+    旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
+    """
+
+    def __init__(self):
+        self.offset_table: List[MessageQueueForC] = []
+
+    def to_dict(self) -> dict:
+        return {"offsetTable": [e.to_dict() for e in self.offset_table]}
+
+    @staticmethod
+    def from_dict(d: dict) -> "ResetOffsetBodyForC":
+        b = ResetOffsetBodyForC()
+        for item in d.get("offsetTable") or []:
+            if isinstance(item, dict):
+                b.offset_table.append(MessageQueueForC.from_dict(item))
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "ResetOffsetBodyForC":
+        return ResetOffsetBodyForC.from_dict(fastjson_loads(data.decode("utf-8")))
+
+
 # ---------------------------------------------------------------- 42 GET_CONSUMER_STATUS_FROM_CLIENT
 class GetConsumerStatusBody:
     """对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody。

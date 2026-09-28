@@ -494,11 +494,7 @@ void DefaultMQPushConsumer::start() {
             std::string topic;
             auto tit = cmd.extFields.find("topic");
             if (tit != cmd.extFields.end()) topic = tit->second;
-            std::map<MessageQueue, int64_t> table;
-            if (!cmd.body.empty()) {
-                ResetOffsetBody body;
-                if (ResetOffsetBody::decode(cmd.body, body)) table = std::move(body.offsetTable);
-            }
+            std::map<MessageQueue, int64_t> table = parseResetOffsetBody(cmd.body);
             auto tablePtr = std::make_shared<std::map<MessageQueue, int64_t>>(std::move(table));
             std::thread([this, topic, tablePtr]() {
                 try {
@@ -1885,38 +1881,63 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
 
 void DefaultMQPushConsumer::resetOffset(const std::string& topic,
                                         const std::map<MessageQueue, int64_t>& offsetTable) {
-    // 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）：
-    // suspend → 命中的队列 drop+clear → 等一会儿让在途消费跑完 → 写新位点 →
-    // 撤销该队列（触发 rebalance 重新分配并从新位点开始）。
+    // 对应 Java MQClientInstance.resetOffset:1403-1450：命中的队列 `pq.setDropped(true);
+    // pq.clear()`（在途批次作废）→ 等并发消费结束 → `updateConsumeOffset(mq, offset)` ＋
+    // `removeUnnecessaryMessageQueue`（先 persist 再 removeOffset）→ 从 processQueueTable
+    // 摘掉，rebalance 按新位点重建。
+    //
+    // 只把新位点写进内存表的做法是**静默**失效的：重置前取回、重置后才返回的批次一 ack
+    // 就把位点推回原处，broker 上刚写下的新位点被盖掉，消费从重置前的位置继续 —— 而 222
+    // 的响应里那一组 offsetTable 看着完全正常。故这里必须走 retireQueueLocked（代号 +1
+    // 即 setDropped，顺带摘掉拉取线程/归属）。
     if (topic.empty() || offsetTable.empty()) return;
-    std::vector<std::pair<MessageQueue, int64_t>> hit;
+    std::vector<std::pair<MessageQueue, int64_t>> retired;
     {
         std::lock_guard<std::mutex> lk(lock_);
+        // 先收 key 再逐个撤：retireQueueLocked 会擦 mqMap_ 的条目
+        std::vector<std::pair<std::string, MessageQueue>> hits;
         for (const auto& kv : mqMap_) {
-            const MessageQueue& mq = kv.second;
-            if (mq.topic != topic) continue;
-            auto it = offsetTable.find(mq);
+            if (kv.second.topic != topic) continue;
+            auto it = offsetTable.find(kv.second);
             if (it == offsetTable.end()) continue;
-            pending_.erase(kv.first);        // 等价 ProcessQueue.clear()
-            offsetTable_.erase(kv.first);    // 拉取游标一并清掉
+            // 新位点先落表：撤销会把**它**交给 onQueuesRevoked 落盘
+            //（Java updateConsumeOffset 之后紧接着的那次 persist）
             consumeOffsetTable_[kv.first] = it->second;
-            hit.emplace_back(mq, it->second);
+            hits.emplace_back(kv.first, kv.second);
+        }
+        for (const auto& hit : hits) {
+            retireQueueLocked(hit.first, hit.second, retired);
         }
     }
-    if (hit.empty()) return;
-    // Java 用 RESET_OFFSET_MAX_WAIT（5 秒）等并发消费跑完；这里缩短以免阻塞太久
-    // （220 是 oneway，broker 不等响应，但仍应尽快返回）。
+    if (retired.empty()) return;
+    // Java 用 RESET_OFFSET_MAX_WAIT（10 秒）等并发消费跑完再写位点；这里缩短以免阻塞太久
+    // （220 是 oneway，broker 不等响应）。代号已让在途 ack 全部失效，不靠"等"避竞争。
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    // 撤销队列：onQueuesRevoked 会把 hit 里带的（新）已消费位点持久化到 broker，
-    // 并对顺序消费解锁——与 Java resetOffset 写位点后走 revoke 收尾一致。
-    onQueuesRevoked(hit);
+    onQueuesRevoked(retired);
     try {
         doRebalance();
     } catch (const std::exception& e) {
         logger_debug(std::string("rebalance after reset offset failed: ") + e.what());
     }
     logger_info("reset offset applied, group=" + consumerGroup_ + " topic=" + topic
-                + " queues=" + std::to_string(hit.size()));
+                + " queues=" + std::to_string(retired.size()));
+}
+
+std::map<MessageQueue, int64_t> DefaultMQPushConsumer::parseResetOffsetBody(const Bytes& body) {
+    std::map<MessageQueue, int64_t> table;
+    if (body.empty()) return table;
+    ResetOffsetBody mapForm;
+    if (ResetOffsetBody::decode(body, mapForm)) table = std::move(mapForm.offsetTable);
+    if (!table.empty()) return table;
+    // 数组形状（ResetOffsetBodyForC）：map 形状解析器对数组只会得到空表，不兜底就等于
+    // 整笔重置静默丢弃。
+    ResetOffsetBodyForC forC;
+    if (ResetOffsetBodyForC::decode(body, forC)) {
+        for (const MessageQueueForC& e : forC.offsetTable) {
+            table[MessageQueue(e.topic, e.brokerName, e.queueId)] = e.offset;
+        }
+    }
+    return table;
 }
 
 std::map<MessageQueue, int64_t> DefaultMQPushConsumer::getConsumerStatus(const std::string& topic) {
@@ -2698,6 +2719,27 @@ void DefaultMQPushConsumer::saveLocalOffsets() {
     saveLocalOffsetsAt(localOffsetPath(), items, mqMap);
 }
 
+void DefaultMQPushConsumer::saveLocalOffsets(
+    const std::vector<std::pair<MessageQueue, int64_t>>& extra) {
+    std::map<std::string, int64_t> items;
+    std::map<std::string, MessageQueue> mqMap;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        items = consumeOffsetTable_;
+        mqMap = mqMap_;
+    }
+    for (const auto& kv : extra) {
+        // 没有位点（撤销时表里就没有，本端口用 -1 表达 null）：不凭空造条目
+        if (kv.second < 0) continue;
+        const std::string key = offsetKey(kv.first);
+        items[key] = kv.second;
+        // 队列信息也要补上：buildLocalOffsetsJson 在 mqMap 里查不到队列就**跳过**该条目，
+        // 只并位点等于没并。
+        mqMap.emplace(key, kv.first);
+    }
+    saveLocalOffsetsAt(localOffsetPath(), items, mqMap);
+}
+
 std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsets() const {
     return loadLocalOffsetsAt(localOffsetPath());
 }
@@ -2910,8 +2952,9 @@ void DefaultMQPushConsumer::onQueuesRevoked(
     const std::vector<std::pair<MessageQueue, int64_t>>& revoked) {
     // 对齐 Java RebalanceImpl.removeUnnecessaryMessageQueue
     if (messageModel_ == MessageModel::BROADCASTING) {
-        // 广播模式位点只存本地
-        saveLocalOffsets();
+        // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件（Java persist 在前、
+        // removeOffset 在后），否则重建时读不到旧位点、按 consumeFromWhere 重扫。
+        saveLocalOffsets(revoked);
         return;
     }
     if (mqClient_ == nullptr) return;

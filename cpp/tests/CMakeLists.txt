@@ -265,3 +265,14 @@ add_test(NAME correct_tags_offset COMMAND rmq_test_correct_tags_offset)
 add_executable(rmq_test_offset_illegal_recover test_offset_illegal_recover.cpp)
 target_link_libraries(rmq_test_offset_illegal_recover PRIVATE rocketmq::remoting)
 add_test(NAME offset_illegal_recover COMMAND rmq_test_offset_illegal_recover)
+
+# 220 RESET_CONSUMER_CLIENT_OFFSET（Java MQClientInstance.resetOffset:1403-1450）：
+# map/ForC 两种请求体形状（Java 发起方恒为 JAVA ⇒ 只推 map；language=CPP 的旧 C++ SDK
+# 管理端让 broker 推数组，本端口两种都认）+ 重置 = 撤队列（代号 +1 丢掉在途批次）+
+# 新位点经撤销尾巴落盘（广播本地位点文件里必须是新值、且与兄弟队列 merge）。
+# 只写内存表的实现在真机上是静默失效的（旧批次 ack 把位点推回原处），必须离线锁死。
+# 与 python/tests/test_reset_offset_handler.py、rust/src/client/consumer.rs 的同名测试、
+# dotnet/tests/RocketMQ.Client.Tests/ResetOffsetTests.cs 同题。
+add_executable(rmq_test_reset_offset test_reset_offset.cpp)
+target_link_libraries(rmq_test_reset_offset PRIVATE rocketmq::remoting)
+add_test(NAME reset_offset COMMAND rmq_test_reset_offset)

@@ -2029,8 +2029,9 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
     }
     let cfg = read_cfg(inner);
     if cfg.message_model == MessageModel::BROADCASTING {
-        // 广播模式位点只存本地
-        if let Err(e) = save_local_offsets(inner) {
+        // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件（Java persist 在前、
+        // removeOffset 在后），否则重建时读不到旧位点、按 consume_from_where 重扫。
+        if let Err(e) = save_local_offsets_with(inner, revoked) {
             rmq_debug!("save local offsets failed: {e}");
         }
         return;
@@ -2962,14 +2963,41 @@ fn scan_java_offset_entries(text: &str) -> Option<Vec<(String, String, i32, i64)
 /// Python `_save_local_offsets`：先写 `.tmp` 再 `os.replace`，避免半截文件；
 /// 旧内容先滚到 `.bak`（Java `MixAll.string2File` 语义）。
 fn save_local_offsets(inner: &Inner) -> Result<()> {
+    save_local_offsets_with(inner, &[])
+}
+
+/// `save_local_offsets` 加"刚被撤下来、已不在 `consume_offsets`/`mq_map` 里的队列位点"。
+///
+/// Java 的广播撤销是 `persist(mq)` 在前、`removeOffset(mq)` 在后 —— 文件里的值要留着，
+/// 同名队列下次分回来才能从它续上（`load_local_offsets`）。少了 `extra`，撤销一笔就把
+/// 这条队列的本地位点从文件里抹掉，重建后会按 `consume_from_where` 从头/从尾重扫。
+fn save_local_offsets_with(inner: &Inner, extra: &[(MessageQueue, Option<i64>)]) -> Result<()> {
     let Some(path) = local_offset_path(inner) else {
         return Err(Error::client("HOME is not set, cannot store local offsets"));
     };
-    let (items, mq_map) = {
+    let (mut items, mut mq_map) = {
         let st = lock(&inner.state);
         (st.consume_offsets.clone(), st.mq_map.clone())
     };
+    merge_retired_offsets(&mut items, &mut mq_map, extra);
     save_local_offsets_at(&path, &items, &mq_map)
+}
+
+/// 把刚撤下来（已不在 `consume_offsets`/`mq_map` 里）的队列位点并进要落盘的快照。
+///
+/// 队列信息也要补进 `mq_map`：`build_local_offsets_json` 查不到队列就跳过该条目，
+/// 只并位点等于没并。
+fn merge_retired_offsets(
+    items: &mut BTreeMap<String, i64>,
+    mq_map: &mut BTreeMap<String, MessageQueue>,
+    extra: &[(MessageQueue, Option<i64>)],
+) {
+    for (mq, off) in extra {
+        let Some(off) = off else { continue };
+        let key = mq_key(mq);
+        items.insert(key.clone(), *off);
+        mq_map.entry(key).or_insert_with(|| mq.clone());
+    }
 }
 
 fn save_local_offsets_at(
@@ -4443,37 +4471,41 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             if topic.is_empty() || offset_table.is_empty() {
                 return Ok(());
             }
-            let mut hit: Vec<(MessageQueue, String)> = Vec::new();
-            let mut new_offsets: Vec<(String, i64)> = Vec::new();
+            let pop = self.config().pop_mode;
+            let mut revoked: Vec<(MessageQueue, Option<i64>)> = Vec::new();
             {
-                let state = lock(&self.inner.state);
-                for (key, mq) in &state.mq_map {
-                    if mq.topic != topic {
-                        continue;
-                    }
-                    let Some(off) = offset_table.iter().find(|(m, _)| m == mq).map(|(_, o)| *o)
-                    else {
-                        continue;
-                    };
-                    hit.push((mq.clone(), key.clone()));
-                    new_offsets.push((key.clone(), off));
-                }
-            }
-            {
+                // 先收 key 再逐个撤：`retire_queue_locked` 会擦 `mq_map` 的条目
                 let mut state = lock(&self.inner.state);
-                for (key, off) in new_offsets {
-                    state.pending.remove(&key); // 等价 ProcessQueue.clear()
-                    state.offset_table.remove(&key);
-                    state.consume_offsets.insert(key, off);
+                let hits: Vec<(String, MessageQueue, i64)> = state
+                    .mq_map
+                    .iter()
+                    .filter(|(_, mq)| mq.topic == topic)
+                    .filter_map(|(key, mq)| {
+                        offset_table
+                            .iter()
+                            .find(|(m, _)| m == mq)
+                            .map(|(_, off)| (key.clone(), mq.clone(), *off))
+                    })
+                    .collect();
+                for (key, mq, off) in hits {
+                    // 新位点先落进表：撤销会把**它**交给 `revoke_queues` 落盘
+                    //（Java `updateConsumeOffset` 之后紧接着的那次 persist）
+                    state.consume_offsets.insert(key.clone(), off);
+                    DefaultMQPushConsumer::retire_queue_locked(
+                        &mut state,
+                        &key,
+                        Some(&mq),
+                        &mut revoked,
+                        pop,
+                    );
                 }
             }
-            if hit.is_empty() {
+            if revoked.is_empty() {
                 return Ok(());
             }
-            // Java 用 5s 等并发消费跑完；这里缩短以免阻塞读线程（220 是 oneway）。
+            // Java 用 `RESET_OFFSET_MAX_WAIT`（10 秒）等并发消费跑完再写位点；这里缩短以免
+            // 阻塞读线程（220 是 oneway）。代号已让在途 ack 全部失效，不靠"等"避竞争。
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let revoked: Vec<(MessageQueue, Option<i64>)> =
-                hit.iter().map(|(mq, _)| (mq.clone(), None)).collect();
             self.on_queues_revoked(&revoked).await;
             if let Err(e) = self.do_rebalance().await {
                 rmq_debug!("rebalance after reset offset failed: {e}");
@@ -4481,7 +4513,7 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             rmq_info!(
                 "reset offset applied, group={} topic={topic} queues={}",
                 self.consumer_group(),
-                hit.len()
+                revoked.len()
             );
             Ok(())
         })
@@ -7625,6 +7657,20 @@ mod tests {
     // 是 `setNextOffset` → `ProcessQueue.setDropped(true)` → 异步
     // `{ updateAndFreezeOffset; persist; removeProcessQueue; rebalanceImmediately }`。
 
+    /// 模拟 listener 返回后的位点推进（`consume_batch` 收尾调的就是它）。
+    fn ack_batch(c: &DefaultMQPushConsumer, key: &str, offsets: &[i64], epoch: u64) {
+        let batch: Vec<MessageExt> = offsets
+            .iter()
+            .map(|o| {
+                let mut m = ext("T", None);
+                m.broker_name = Some("broker-a".to_string());
+                m.queue_offset = *o;
+                m
+            })
+            .collect();
+        advance_consume_offset(&c.inner, key, &batch, None, Some(epoch));
+    }
+
     struct IllegalHarness {
         c: DefaultMQPushConsumer,
         key: String,
@@ -7698,16 +7744,7 @@ mod tests {
         }
 
         fn ack(&self, offsets: &[i64], epoch: u64) {
-            let batch: Vec<MessageExt> = offsets
-                .iter()
-                .map(|o| {
-                    let mut m = ext("T", None);
-                    m.broker_name = Some("broker-a".to_string());
-                    m.queue_offset = *o;
-                    m
-                })
-                .collect();
-            advance_consume_offset(&self.c.inner, &self.key, &batch, None, Some(epoch));
+            ack_batch(&self.c, &self.key, offsets, epoch);
         }
     }
 
@@ -7898,5 +7935,158 @@ mod tests {
         );
         assert_eq!(state.queue_epoch.get(&other_key).copied().unwrap_or(0), 0);
         assert!(!state.frozen_offsets.contains(&other_key));
+    }
+
+    // ---------------- 220 RESET_CONSUMER_CLIENT_OFFSET 的处理 ----------------
+    //
+    // Java `MQClientInstance.resetOffset:1403-1450`：命中的队列 `pq.setDropped(true);
+    // pq.clear()`（在途批次作废）→ 等并发消费结束 → `updateConsumeOffset(mq, offset)` ＋
+    // `removeUnnecessaryMessageQueue`（**先 persist 再 removeOffset**）→ 从
+    // processQueueTable 摘掉，rebalance 按新位点重建。
+    //
+    // 只把新位点写进内存表的做法是**静默**失效的：重置前取回、重置后才返回的批次一 ack
+    // 就把位点推回原处，broker 上刚写下的新位点被盖掉，消费从重置前的位置继续 —— 而
+    // 222 的响应里那一组 offsetTable 看着完全正常。撤销 + 代号（setDropped）才是判据。
+    // 真机链路见 `examples/live_reset_offset.rs`（含 broker 端位点的回读）。
+
+    struct ResetHarness {
+        c: Arc<DefaultMQPushConsumer>,
+        key: String,
+        mq: MessageQueue,
+    }
+
+    impl ResetHarness {
+        fn new(model: &str) -> ResetHarness {
+            let cfg = ConsumerConfig {
+                consumer_group: "G".to_string(),
+                message_model: model.to_string(),
+                ..Default::default()
+            };
+            let c = Arc::new(DefaultMQPushConsumer::with_config(cfg).unwrap());
+            let mq = queue("T", "broker-a", 0);
+            let key = mq_key(&mq);
+            {
+                let mut state = lock(&c.inner.state);
+                state.mq_map.insert(key.clone(), mq.clone());
+                state.queue_owners.insert(key.clone(), 1);
+                state.offset_table.insert(key.clone(), 7);
+                state.consume_offsets.insert(key.clone(), 7);
+                state.pending.insert(key.clone(), VecDeque::from(offset_batch(2)));
+                state.last_pull_at.insert(key.clone(), 1_700_000_000_000);
+            }
+            ResetHarness { c, key, mq }
+        }
+
+        async fn reset(&self, off: i64) {
+            self.c
+                .clone()
+                .reset_offset("T".to_string(), vec![(self.mq.clone(), off)])
+                .await
+                .expect("reset_offset must not error");
+        }
+
+        fn offset(&self) -> Option<i64> {
+            lock(&self.c.inner.state)
+                .consume_offsets
+                .get(&self.key)
+                .copied()
+        }
+
+        fn epoch(&self) -> u64 {
+            lock(&self.c.inner.state)
+                .queue_epoch
+                .get(&self.key)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    /// 未 start() 的实例上，落盘与 rebalance 都没有 client 可发（与
+    /// `handle_offset_illegal` 的离线测试同一约束），所以这里锁的是**状态迁移**：
+    /// 队列被撤（代号 +1）、表项清空、旧代号的 ack 不再生效。
+    #[tokio::test]
+    async fn reset_offset_retires_the_queue_and_drops_the_pre_reset_batch() {
+        let h = ResetHarness::new(MessageModel::CLUSTERING);
+        h.reset(0).await;
+        assert_eq!(h.epoch(), 1, "代号 +1（Java setDropped(true)）");
+        assert_eq!(h.offset(), None, "位点交给落盘（Java removeOffset）");
+        {
+            let state = lock(&h.c.inner.state);
+            assert!(!state.mq_map.contains_key(&h.key));
+            assert!(!state.pending.contains_key(&h.key), "缓冲整批作废");
+            assert!(!state.offset_table.contains_key(&h.key));
+            assert!(!state.queue_owners.contains_key(&h.key));
+        }
+        // 重置前取回、重置后才返回的批次（代号 0）：ack 必须被丢弃，位点不能复活
+        ack_batch(&h.c, &h.key, &[0, 1], 0);
+        assert_eq!(h.offset(), None, "旧批次的 ack 已被代号挡住");
+        // 重建后的队列（代号 1）ack 照常
+        ack_batch(&h.c, &h.key, &[4, 5], 1);
+        assert_eq!(h.offset(), Some(6));
+    }
+
+    #[tokio::test]
+    async fn reset_offset_only_touches_the_matching_topic_and_table_entries() {
+        let h = ResetHarness::new(MessageModel::CLUSTERING);
+        let other = queue("T", "broker-a", 1);
+        let other_key = mq_key(&other);
+        {
+            let mut state = lock(&h.c.inner.state);
+            state.mq_map.insert(other_key.clone(), other.clone());
+            state.queue_owners.insert(other_key.clone(), 2);
+            state.offset_table.insert(other_key.clone(), 9);
+            state.consume_offsets.insert(other_key.clone(), 9);
+            state.last_pull_at.insert(other_key.clone(), 1_700_000_000_000);
+        }
+        // offsetTable 只含 0 号队列：同 topic 的 1 号队列不受牵连
+        h.reset(0).await;
+        {
+            let state = lock(&h.c.inner.state);
+            assert!(state.mq_map.contains_key(&other_key));
+            assert!(!state.pending.contains_key(&other_key), "1 号队列本来就没有缓冲");
+            assert_eq!(state.consume_offsets.get(&other_key).copied(), Some(9));
+            assert_eq!(state.queue_epoch.get(&other_key).copied().unwrap_or(0), 0);
+            assert_eq!(state.queue_owners.get(&other_key).copied(), Some(2));
+        }
+        // 表里没有本实例持有的队列（别的实例/别的 broker）：不动任何状态
+        h.c.clone()
+            .reset_offset("T".to_string(), vec![(queue("T", "broker-b", 0), 0)])
+            .await
+            .expect("reset_offset must not error");
+        assert_eq!(h.epoch(), 1, "上一笔的代号不回退");
+        assert_eq!(h.offset(), None);
+        assert_eq!(
+            lock(&h.c.inner.state).consume_offsets.get(&other_key).copied(),
+            Some(9)
+        );
+    }
+
+    /// 广播撤销要把撤下来的位点连同队列一起并进本地点位文件：只并位点不够，
+    /// `build_local_offsets_json` 在 `mq_map` 里查不到队列会**静默跳过**该条目。
+    #[test]
+    fn retired_offsets_are_merged_into_the_local_snapshot() {
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        let mut items = BTreeMap::new();
+        let mut mq_map = BTreeMap::new();
+        merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), Some(3))]);
+        assert_eq!(items.get(&key), Some(&3));
+        assert_eq!(mq_map.get(&key), Some(&mq));
+        // 真的能读回来（对照：只并 items 不并 mq_map，构建器会把这条跳过）
+        let text = build_local_offsets_json(&items, &mq_map);
+        assert_eq!(parse_local_offsets_text(&text).unwrap().get(&key), Some(&3));
+
+        // 从未消费过（撤销时位点是 None）的队列不能凭空造条目
+        let mut items = BTreeMap::new();
+        let mut mq_map = BTreeMap::new();
+        merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), None)]);
+        assert!(items.is_empty() && mq_map.is_empty());
+
+        // 快照里已有该队列（同一批撤多把/残留）时按撤销值覆盖
+        let mut items = BTreeMap::from([(key.clone(), 1)]);
+        let mut mq_map = BTreeMap::from([(key.clone(), mq.clone())]);
+        merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), Some(9))]);
+        assert_eq!(items.get(&key), Some(&9));
     }
 }

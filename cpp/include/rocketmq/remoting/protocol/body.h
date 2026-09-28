@@ -210,6 +210,29 @@ struct ResetOffsetBody {
     static bool decode(const Bytes& data, ResetOffsetBody& out);
 };
 
+// 对应 org.apache.rocketmq.remoting.protocol.body.MessageQueueForC。
+// 字段名保持 Java 的驼峰（brokerName / queueId），与 MessageQueue 的序列化形状不同。
+struct MessageQueueForC {
+    std::string topic;
+    std::string brokerName;
+    int32_t queueId = 0;
+    int64_t offset = 0;
+};
+
+// 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：offsetTable 是
+// **数组**（每条自带 offset），不是 map。只有 222 发起方的 language=CPP 时 broker 才推
+// 这种体（Broker2Client.resetOffset:158-163），Java 客户端永远收不到；本端口解析它是为了
+// 与 language=CPP 的旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
+struct ResetOffsetBodyForC {
+    std::vector<MessageQueueForC> offsetTable;
+
+    JsonValue toJson() const;
+    static ResetOffsetBodyForC fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, ResetOffsetBodyForC& out);
+};
+
 // 对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
 // （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。messageQueueTable 的键是
 // MessageQueue（fastjson2 内联对象键）；consumerTable 是 Java 保留的废弃字段

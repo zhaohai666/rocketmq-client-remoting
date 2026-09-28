@@ -30,7 +30,8 @@ from rocketmq.common.message import MessageExt, MessageQueue
 from rocketmq.common.message_decoder import decode_message, encode_message_ext
 from rocketmq.remoting.protocol.body import (CMResult, ConsumeMessageDirectlyResult,
                                              ConsumerRunningInfo, GetConsumerStatusBody,
-                                             ProcessQueueInfo, ResetOffsetBody)
+                                             MessageQueueForC, ProcessQueueInfo,
+                                             ResetOffsetBody, ResetOffsetBodyForC)
 from rocketmq.remoting.protocol.codes import (RequestCode, ResponseCode)
 
 GET_CONSUMER_RUNNING_INFO = RequestCode.GET_CONSUMER_RUNNING_INFO
@@ -94,6 +95,15 @@ class TestBodyRoundTrip:
         assert len(d.offset_table) == 1
         m = next(iter(d.offset_table))
         assert m.topic == TOPIC and m.queue_id == 0 and d.offset_table[m] == 7
+
+    def test_reset_offset_body_for_c_round_trip(self):
+        """数组形状（ResetOffsetBodyForC）：Java 侧只有发起方 language=CPP 才会收到。"""
+        b = ResetOffsetBodyForC()
+        b.offset_table = [MessageQueueForC(topic=TOPIC, broker_name=BROKER,
+                                           queue_id=1, offset=9)]
+        d = ResetOffsetBodyForC.decode(b.encode())
+        assert [(e.topic, e.broker_name, e.queue_id, e.offset) for e in d.offset_table] \
+            == [(TOPIC, BROKER, 1, 9)]
 
     def test_get_consumer_status_body(self):
         b = GetConsumerStatusBody()
@@ -219,14 +229,26 @@ class TestConsumerHandlers:
         assert r.consume_result == CMResult.CR_RETURN_NULL
 
     def test_reset_offset_writes_position(self):
-        """220 的处理逻辑：命中的队列写新位点并触发 rebalance。"""
+        """220 的处理逻辑：新位点进撤销尾部落盘（不是留在内存表里）并触发 rebalance。
+
+        Java ``MQClientInstance.resetOffset:1414-1442``：``pq.setDropped(true); pq.clear()``
+        后在途批次全部作废，随后 ``updateConsumeOffset`` ＋
+        ``removeUnnecessaryMessageQueue``（**先 persist 再 removeOffset**）。所以重置后
+        ``_consume_offsets`` 里不能再有这条 —— 位点若留在表里，旧批次迟到的 ack 会把它
+        推回原处、盖掉 broker 上的新位点（这正是旧实现静默失效的地方）。新位点只经
+        ``_on_queues_revoked`` 的持久化参数出去，重建后按它重新解析。
+        """
         c = consumer_with_state()
         events = []
-        c._do_rebalance = lambda: events.append("rebalance")  # type: ignore[method-assign]
-        c._on_queues_revoked = lambda qs: events.append(("revoked", len(qs)))  # type: ignore[method-assign]
-        c.reset_offset(TOPIC, {mq(): 100})
         key = "%s@%s@%d" % (TOPIC, BROKER, 0)
-        assert c._consume_offsets[key] == 100
+        assert c._queue_epoch.get(key, 0) == 0
+        c._do_rebalance = lambda: events.append("rebalance")  # type: ignore[method-assign]
+        c._on_queues_revoked = lambda qs: events.append(("revoked", qs))  # type: ignore[method-assign]
+        c.reset_offset(TOPIC, {mq(): 100})
+        assert key not in c._consume_offsets          # Java 的 removeOffset
+        assert key not in c._mq_map
+        assert c._queue_epoch[key] == 1               # Java setDropped(true)
+        assert ("revoked", [(mq(), 100)]) in events   # persist 带上的是新位点
         assert "rebalance" in events
 
 
@@ -301,6 +323,85 @@ class TestMqClientDispatch:
         # 后台线程应已（或即将）调用到 reset_offset
         recorded["event"].wait(timeout=2.0)
         assert recorded["called"] is True
+
+    def test_220_array_body_for_c_is_not_dropped(self):
+        """发起方 language=CPP 时 broker 推**数组**形状（ResetOffsetBodyForC）：必须解析出来。
+
+        Java 处理器（``ClientRemotingProcessor.resetOffset:153``）只认 map 形状 ——
+        Java 管理端恒发 JAVA，故 Java 侧碰不到该形状；本端口兜底是为了与 language=CPP 的
+        旧 C++ SDK 管理端互通，不兜底等于整笔重置**静默**丢弃（map 解析器对数组只得空表）。
+        """
+        seen = {}
+        done = threading.Event()
+        c = consumer_with_state()
+
+        def reset(topic, offset_table):
+            seen["topic"] = topic
+            seen["table"] = dict(offset_table)
+            done.set()
+
+        c.reset_offset = reset  # type: ignore[method-assign]
+        mqc = self._client_with_consumer(c)
+        raw = b'{"offsetTable":[{"topic":"' + TOPIC.encode() + b'","brokerName":"' \
+            + BROKER.encode() + b'","queueId":1,"offset":9}]}'
+        cmd = fake_cmd(RESET_CONSUMER_CLIENT_OFFSET,
+                       {"topic": TOPIC, "group": GROUP, "timestamp": 0, "isForce": True},
+                       body=raw)
+        assert mqc._process_reset_offset(cmd, "127.0.0.1:10911") is None
+        assert done.wait(timeout=2.0), "数组形状的 220 被静默丢弃了"
+        assert seen["topic"] == TOPIC
+        assert seen["table"] == {mq(queue_id=1): 9}
+
+    def test_220_map_body_is_not_double_counted(self):
+        """负向对照：map 形状仍按原样解析（不能被兜底路径改写/翻倍）。"""
+        seen = {}
+        done = threading.Event()
+        c = consumer_with_state()
+
+        def reset(topic, offset_table):
+            seen["table"] = dict(offset_table)
+            done.set()
+
+        c.reset_offset = reset  # type: ignore[method-assign]
+        mqc = self._client_with_consumer(c)
+        body = ResetOffsetBody()
+        body.offset_table = {mq(queue_id=2): 4}
+        cmd = fake_cmd(RESET_CONSUMER_CLIENT_OFFSET,
+                       {"topic": TOPIC, "group": GROUP}, body=body.encode())
+        assert mqc._process_reset_offset(cmd, "127.0.0.1:10911") is None
+        assert done.wait(timeout=2.0)
+        assert seen["table"] == {mq(queue_id=2): 4}
+
+    def test_220_garbage_body_is_still_an_empty_noop(self):
+        """负向对照：合法 JSON 但两种形状都不是 → 空表继续走下（Java 也是解出空表后照常调用，
+        由 reset_offset 内部判空），不能抛异常把读线程带崩。"""
+        seen = {}
+        done = threading.Event()
+        c = consumer_with_state()
+
+        def reset(topic, offset_table):
+            seen["table"] = dict(offset_table)
+            done.set()
+
+        c.reset_offset = reset  # type: ignore[method-assign]
+        mqc = self._client_with_consumer(c)
+        cmd = fake_cmd(RESET_CONSUMER_CLIENT_OFFSET,
+                       {"topic": TOPIC, "group": GROUP}, body=b'{"unrelated":1}')
+        assert mqc._process_reset_offset(cmd, "127.0.0.1:10911") is None
+        assert done.wait(timeout=2.0)
+        assert seen["table"] == {}
+
+    def test_220_undecodable_body_never_reaches_reset_offset(self):
+        """负向对照：连 JSON 都不是 → 与 Java 一致地整笔丢弃（Java 的解码异常从处理器里
+        抛出、由 netty 侧吞掉），本地位点一根手指都不许碰。"""
+        called = []
+        c = consumer_with_state()
+        c.reset_offset = lambda topic, table: called.append((topic, table))  # type: ignore[method-assign]
+        mqc = self._client_with_consumer(c)
+        cmd = fake_cmd(RESET_CONSUMER_CLIENT_OFFSET,
+                       {"topic": TOPIC, "group": GROUP}, body=b'not json at all')
+        assert mqc._process_reset_offset(cmd, "127.0.0.1:10911") is None
+        assert called == []
 
     def test_40_is_instance_level_and_wakes_every_consumer(self):
         """40 注册在 **实例**上（Java MQClientAPIImpl 构造函数），扇给全组消费者。

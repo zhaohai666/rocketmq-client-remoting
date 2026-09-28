@@ -127,15 +127,24 @@ def test_reset_offset_by_queue_id_sends_update_then_222_with_queue_id():
     assert request.ext_fields["queueId"] == "3"
     assert request.ext_fields["offset"] == "7"
     assert request.ext_fields["timestamp"] == "0"
-    assert request.ext_fields["force"] == "false"
+    # 键名必须是 isForce（Java 字段名），不是 force——负向对照见下面的 isForce 断言组
+    assert request.ext_fields["isForce"] == "false"
+    assert "force" not in request.ext_fields
     assert request.ext_fields["topic"] == TOPIC
     assert request.ext_fields["group"] == GROUP
     assert result == {MessageQueue(TOPIC, "broker-a", 3): 7}
 
 
-def test_reset_offset_by_timestamp_omits_queue_id_and_forces_cpp_language():
+def test_reset_offset_by_timestamp_omits_queue_id_and_keeps_map_body_language():
     """按 timestamp 的那笔必须**不带** queueId、offset 写成 -1（Java 的 null 口径），
-    并把 language 覆盖成 CPP——broker 只对 CPP/PYTHON 回可解析的 offsetTable。
+    且 language 不能是 CPP。
+
+    broker 的 ``AdminBrokerProcessor.resetOffset:2263`` 只看**发起方** language 判 ``isC``
+    （仅 CPP 置真），CPP 时 220 推给在线消费者的是 ``ResetOffsetBodyForC``（JSON 数组），
+    而本端口消费者解析的是 map 形状的 ``ResetOffsetBody`` —— 用 CPP 重发会让自己的
+    消费者收不到重置。Java 管理端两个重载传的 isC 都是 false
+    （``MQClientAPIImpl:2405/2408``），且 222 的**响应**体恒为 map 形状（``Broker2Client:232``），
+    与 isC 无关。
     """
     client = _FakeClient([_ok(_reset_body(MessageQueue(TOPIC, "broker-a", 0), 9))],
                          route=_route(("broker-a", ADDR_A)))
@@ -148,11 +157,30 @@ def test_reset_offset_by_timestamp_omits_queue_id_and_forces_cpp_language():
     assert "queueId" not in request.ext_fields
     assert request.ext_fields["offset"] == "-1"
     assert request.ext_fields["timestamp"] == "1234567890"
-    assert request.ext_fields["force"] == "true"
-    assert request.language == LanguageCode.CPP
+    # ext key 用 Java 的**字段名**（RemotingCommand.makeCustomHeaderToNet:437-450）：
+    # ResetOffsetRequestHeader 声明的是 `private boolean isForce` ⇒ "isForce"。
+    # 5.5.1 真机探针：发 "force" 时 broker 视 isForce=false，前重（timestamp=-1）
+    # 会把 consumerOffset 原样回显（3）而不是跳到 maxOffset（10）。
+    assert request.ext_fields["isForce"] == "true"
+    assert "force" not in request.ext_fields
+    assert request.language == LanguageCode.PYTHON
+    assert request.language != LanguageCode.CPP
     assert offsets and list(offsets.values()) == [9]
     # 路由按业务 topic 查（LMQ/wheel_timer 才换成 clusterName）
     assert client.route_lookups == [TOPIC]
+
+
+def test_reset_offset_by_timestamp_can_opt_into_the_cpp_body():
+    """``is_cpp=True`` 仍要把 language 覆盖成 CPP（纯 C++ 消费组才需要 ForC 数组体）；
+    这是对上面「默认不覆盖」的负向对照，防止哪天顺手把开关删了。"""
+    client = _FakeClient([_ok(_reset_body(MessageQueue(TOPIC, "broker-a", 0), 9))],
+                         route=_route(("broker-a", ADDR_A)))
+    admin = _admin(client)
+
+    admin.reset_offset_by_timestamp(TOPIC, GROUP, 1234567890, True, is_cpp=True)
+
+    _, request = client.requests[0]
+    assert request.language == LanguageCode.CPP
 
 
 def test_reset_offset_by_queue_id_propagates_broker_remark():

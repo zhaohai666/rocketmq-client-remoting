@@ -1964,6 +1964,12 @@ public sealed class DefaultMQPushConsumer
         return resp;
     }
 
+    /// <summary>单测入口：220 入站处理（真实路径由 <c>RegisterProcessor</c> 直接挂
+    /// <see cref="OnResetConsumerOffset"/>；测试工程与本程序集没有 InternalsVisibleTo 关系，
+    /// 故用 public，勿用于业务代码）。</summary>
+    public RemotingCommand? ProcessResetConsumerOffset(RemotingCommand cmd) =>
+        OnResetConsumerOffset(cmd, string.Empty);
+
     private RemotingCommand? OnResetConsumerOffset(RemotingCommand cmd, string addr)
     {
         // 对应 Java ClientRemotingProcessor RESET_CONSUMER_CLIENT_OFFSET 分支：
@@ -1988,12 +1994,29 @@ public sealed class DefaultMQPushConsumer
             return null;   // oneway，不回响应
         }
 
+        // 222 的 body 有两种形状：map（ResetOffsetBody，Java 管理端恒用这种）与数组
+        // （ResetOffsetBodyForC，只有 222 发起方 language=CPP 时 broker 才推，见
+        // Broker2Client.resetOffset:158-163）。Java 处理器只认 map
+        // （ClientRemotingProcessor.resetOffset:153）—— Java 管理端恒发 JAVA 故碰不到数组；
+        // 本端口为与 language=CPP 的旧 C++ SDK 管理端互通而兜底它：map 解析器对数组只会
+        // 抛错/得空表，不兜底等于整笔重置静默丢弃（与 C++ parseResetOffsetBody 同口径）。
         var table = new Dictionary<MessageQueue, long>();
-        if (cmd.Body is { Length: > 0 } && ResetOffsetBody.Decode(cmd.Body, out ResetOffsetBody body))
+        if (cmd.Body is { Length: > 0 })
         {
-            foreach (var kv in body.OffsetTable)
+            if (ResetOffsetBody.Decode(cmd.Body, out ResetOffsetBody body))
             {
-                table[kv.Key] = kv.Value;
+                foreach (var kv in body.OffsetTable)
+                {
+                    table[kv.Key] = kv.Value;
+                }
+            }
+
+            if (table.Count == 0 && ResetOffsetBodyForC.Decode(cmd.Body, out ResetOffsetBodyForC forC))
+            {
+                foreach (MessageQueueForC e in forC.OffsetTable)
+                {
+                    table[new MessageQueue(e.Topic, e.BrokerName, e.QueueId)] = e.Offset;
+                }
             }
         }
 
@@ -2173,9 +2196,18 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）：
-    /// 命中本 topic 分配队列的 → 清在途缓冲与拉取游标 → 写新已消费位点 →
-    /// 撤销该队列（持久化新位点 + 顺序解锁）→ 立即 rebalance 从新位点重拉。
+    /// 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）。
+    /// <para>
+    /// Java 的四步：<c>pq.setDropped(true); pq.clear()</c>（在途批次的 ack 与缓冲一起作废）
+    /// → 非顺序消费时等 <c>RESET_OFFSET_MAX_WAIT</c>＝10 秒让并发消费跑完 →
+    /// <c>updateConsumeOffset(mq, offset)</c> ＋ <c>removeUnnecessaryMessageQueue</c>
+    /// （立刻落盘、顺序解锁）→ 把队列从 processQueueTable 摘掉，rebalance 按新位点重建。
+    /// </para>
+    /// <para>
+    /// 本端口：新位点先落进表，再走统一撤销路径（<see cref="RetireQueueLocked"/> 代号 +1
+    /// 即 setDropped，清缓冲、摘拉取线程），撤销收尾把<b>新位点</b>持久化，最后 rebalance
+    /// 重建。等待从 10 秒缩到 0.2 秒是有意偏差：代号已让在途 ack 全部失效，不靠"等"避竞争。
+    /// </para>
     /// </summary>
     public void ResetOffset(string topic, IReadOnlyDictionary<MessageQueue, long> offsetTable)
     {
@@ -2184,7 +2216,7 @@ public sealed class DefaultMQPushConsumer
             return;
         }
 
-        var hit = new List<MessageQueue>();
+        var retired = new List<RetiredQueue>();
         lock (_lock)
         {
             foreach (var kv in _mqMap)
@@ -2200,65 +2232,22 @@ public sealed class DefaultMQPushConsumer
                     continue;
                 }
 
-                _pending.Remove(kv.Key);        // 等价 ProcessQueue.clear()
-                _offsetTable.Remove(kv.Key);    // 拉取游标一并清掉
+                // 新位点先写进表：撤销会把**它**交给 OnQueuesRevoked 落盘
+                //（Java updateConsumeOffset 之后紧接着的那次 persist）
                 _consumeOffsetTable[kv.Key] = off;
-                hit.Add(mq);
+                RetireQueueLocked(kv.Key, mq, retired);
             }
         }
 
-        if (hit.Count == 0)
+        if (retired.Count == 0)
         {
             return;
         }
 
-        // Java 用 RESET_OFFSET_MAX_WAIT（5 秒）等并发消费跑完；这里缩短以免阻塞太久
+        // Java 用 RESET_OFFSET_MAX_WAIT 等并发消费跑完；这里缩短以免阻塞太久
         // （220 是 oneway，broker 不等响应，但仍应尽快返回）。
         Thread.Sleep(200);
-        bool orderly = IsOrderly();
-        bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
-        var unlockList = new List<MessageQueue>();
-        foreach (MessageQueue mq in hit)
-        {
-            string key = OffsetKey(mq);
-            lock (_lock)
-            {
-                _dropped.Add(key);   // 拉取线程见到 dropped 自行退出并从 _pullThreads 摘除
-                _pending.Remove(key);
-                _mqMap.Remove(key);
-                _offsetTable.Remove(key);
-            }
-
-            // 新位点已在 _consumeOffsetTable：撤销收尾时持久化（对齐 Java resetOffset）
-            if (!broadcast && _mqClient is not null)
-            {
-                try
-                {
-                    _mqClient.UpdateConsumerOffset(ConsumerGroup, mq, offsetTable[mq]);
-                }
-                catch (Exception e)
-                {
-                    ClientLog.Debug("persist offset on reset failed for " + mq + ": " + e.Message);
-                }
-
-                if (orderly)
-                {
-                    unlockList.Add(mq);
-                }
-            }
-        }
-
-        if (unlockList.Count > 0 && _mqClient is not null)
-        {
-            try
-            {
-                _mqClient.UnlockBatchMq(ConsumerGroup, _clientId, unlockList);
-            }
-            catch (Exception e)
-            {
-                ClientLog.Debug("unlock on reset failed: " + e.Message);
-            }
-        }
+        OnQueuesRevoked(retired);
 
         try
         {
@@ -2270,7 +2259,68 @@ public sealed class DefaultMQPushConsumer
         }
 
         ClientLog.Info("reset offset applied, group=" + ConsumerGroup + " topic=" + topic
-            + " queues=" + hit.Count.ToString(CultureInfo.InvariantCulture));
+            + " queues=" + retired.Count.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// 被撤销队列的收尾（对应 Java <c>RebalanceImpl.removeUnnecessaryMessageQueue</c>）：
+    /// 聚类模式把位点推给 broker + 顺序消费解锁；广播模式位点只存本地，连同队列信息写盘。
+    /// </summary>
+    private void OnQueuesRevoked(List<RetiredQueue> revoked)
+    {
+        if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
+        {
+            // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件：Java 是
+            // persist(mq) 在前、removeOffset(mq) 在后（只摘内存条目，文件里的值留着），
+            // 少了这一步，队列重建时读不到旧位点，会按 consumeFromWhere 从头/从尾重扫。
+            SaveLocalOffsets(revoked);
+            return;
+        }
+
+        MQClientInstance? client = _mqClient;
+        if (client is null)
+        {
+            return;
+        }
+
+        bool orderly = IsOrderly();
+        var unlockList = new List<MessageQueue>();
+        foreach (RetiredQueue r in revoked)
+        {
+            // 位点未知就什么都不写：拿默认 0 去 UPDATE_CONSUMER_OFFSET 会把 broker 的位点
+            // 倒拨（Python _on_queues_revoked 同样是"有才写"）。
+            if (r.HadOffset)
+            {
+                try
+                {
+                    client.UpdateConsumerOffset(ConsumerGroup, r.Mq, r.ConsumeOffset);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("persist offset on revoke failed for " + r.Mq + ": " + e.Message);
+                }
+            }
+
+            // 撤队列时的单队列解锁只属于 classic 顺序（Java
+            // RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 拿的是 processQueueTable
+            // 里的 ProcessQueue —— POP 模式下那张表是空的，这条路径根本不会跑）。
+            if (orderly && !PopMode)
+            {
+                unlockList.Add(r.Mq);
+            }
+        }
+
+        if (unlockList.Count > 0)
+        {
+            try
+            {
+                client.UnlockBatchMq(ConsumerGroup, _clientId, unlockList);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unlock on revoke failed: " + e.Message);
+            }
+        }
     }
 
     /// <summary>
@@ -4426,7 +4476,12 @@ public sealed class DefaultMQPushConsumer
             + "/" + ConsumerGroup + "/offsets.json";
     }
 
-    private void SaveLocalOffsets()
+    /// <param name="extra">
+    /// 刚被撤下来、已经不在 <c>_consumeOffsetTable</c>/<c>_mqMap</c> 里的队列位点：
+    /// Java 的 <c>persist(mq)</c> 先写文件、<c>removeOffset(mq)</c> 后摘内存条目，文件里的
+    /// 值要留着，重建后的队列才能从它续上（见 <see cref="OnQueuesRevoked"/> 广播分支）。
+    /// </param>
+    private void SaveLocalOffsets(List<RetiredQueue>? extra = null)
     {
         Dictionary<string, long> items;
         Dictionary<string, MessageQueue> mqMap;
@@ -4434,6 +4489,20 @@ public sealed class DefaultMQPushConsumer
         {
             items = new Dictionary<string, long>(_consumeOffsetTable, StringComparer.Ordinal);
             mqMap = new Dictionary<string, MessageQueue>(_mqMap, StringComparer.Ordinal);
+        }
+
+        foreach (RetiredQueue r in extra ?? new List<RetiredQueue>())
+        {
+            if (!r.HadOffset)
+            {
+                continue;
+            }
+
+            items[r.Key] = r.ConsumeOffset;
+            if (!mqMap.ContainsKey(r.Key))
+            {
+                mqMap[r.Key] = r.Mq;
+            }
         }
 
         SaveLocalOffsetsAt(LocalOffsetPath(), items, mqMap);
@@ -5007,64 +5076,18 @@ public sealed class DefaultMQPushConsumer
 
         if (revoked.Count > 0)
         {
-            bool orderly = IsOrderly();
-            bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
-            var unlockList = new List<MessageQueue>();
-            foreach (MessageQueue mq in revoked)
+            // 与 220 重置、自愈走**同一条**撤销路径（RetireQueueLocked 代号 +1 即等价
+            // setDropped）：位点在重建之前落盘、顺序消费解锁，在途批次的 ack 一并作废。
+            var retireList = new List<RetiredQueue>();
+            lock (_lock)
             {
-                string key = OffsetKey(mq);
-                long consumeOffset;
-                lock (_lock)
+                foreach (MessageQueue mq in revoked)
                 {
-                    _dropped.Add(key);
-                    _pending.Remove(key);
-                    _mqMap.Remove(key);
-                    _offsetTable.Remove(key);
-                    _consumeOffsetTable.TryGetValue(key, out consumeOffset);
-                    _consumeOffsetTable.Remove(key);
-                    // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活重投）
-                    if (_popQueues.TryGetValue(key, out PopProcessQueue? pq))
-                    {
-                        pq.SetDropped(true);
-                        _popQueues.Remove(key);
-                    }
-                }
-
-                // 1) 先持久化已消费位点（UPDATE_CONSUMER_OFFSET=15），再清缓冲/解锁
-                if (!broadcast && _mqClient is not null)
-                {
-                    try
-                    {
-                        _mqClient.UpdateConsumerOffset(ConsumerGroup, mq, consumeOffset);
-                    }
-                    catch (Exception e)
-                    {
-                        ClientLog.Debug("update consumer offset on revoke failed for " + mq + ": " + e.Message);
-                    }
-
-                    // 2) 顺序消费（orderly + clustering）撤销队列需主动解锁（UNLOCK_BATCH_MQ=42），
-                    //    否则 broker 侧锁长期不释放，新 owner 抢不到锁会在原地空转。
-                    //    仅 classic 顺序：Java removeUnnecessaryMessageQueue:94-108 拿的是
-                    //    processQueueTable 里的 ProcessQueue —— POP 模式下那张表是空的，
-                    //    这条路径根本不会跑。
-                    if (orderly && !PopMode)
-                    {
-                        unlockList.Add(mq);
-                    }
+                    RetireQueueLocked(OffsetKey(mq), mq, retireList);
                 }
             }
 
-            if (unlockList.Count > 0 && _mqClient is not null)
-            {
-                try
-                {
-                    _mqClient.UnlockBatchMq(ConsumerGroup, _clientId, unlockList);
-                }
-                catch (Exception e)
-                {
-                    ClientLog.Debug("unlock on revoke failed: " + e.Message);
-                }
-            }
+            OnQueuesRevoked(retireList);
 
             ClientLog.Info("rebalance: revoked " + revoked.Count.ToString(CultureInfo.InvariantCulture)
                 + " queue(s), current assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture));
@@ -5074,47 +5097,7 @@ public sealed class DefaultMQPushConsumer
         // 会从更早的游标重拉，把已消费的消息再投一遍。顺序消费还要解锁，不然新属主抢不到锁。
         if (healed.Count > 0)
         {
-            bool healOrderly = IsOrderly();
-            bool healBroadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
-            MQClientInstance? healClient = _mqClient;
-            var healUnlockList = new List<MessageQueue>();
-            foreach (RetiredQueue r in healed)
-            {
-                if (healBroadcast || healClient is null)
-                {
-                    continue;
-                }
-
-                if (r.HadOffset)
-                {
-                    try
-                    {
-                        healClient.UpdateConsumerOffset(ConsumerGroup, r.Mq, r.ConsumeOffset);
-                    }
-                    catch (Exception e)
-                    {
-                        ClientLog.Debug("persist offset on self-heal failed for " + r.Mq + ": " + e.Message);
-                    }
-                }
-
-                // 自愈解锁同样仅 classic 顺序（POP 模式下 Java 侧零网络）
-                if (healOrderly && !PopMode)
-                {
-                    healUnlockList.Add(r.Mq);
-                }
-            }
-
-            if (healUnlockList.Count > 0 && healClient is not null)
-            {
-                try
-                {
-                    healClient.UnlockBatchMq(ConsumerGroup, _clientId, healUnlockList);
-                }
-                catch (Exception e)
-                {
-                    ClientLog.Debug("unlock on self-heal failed: " + e.Message);
-                }
-            }
+            OnQueuesRevoked(healed);
         }
 
         // 新分配的队列**立刻**解析初始位点写入 offset 表（对齐 Java

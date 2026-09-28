@@ -1088,18 +1088,32 @@ void DefaultMQAdminExt::updateConsumerOffsetToBroker(const std::string& brokerAd
     requireClient().updateConsumerOffset(consumerGroup, mq, offset, 5000, brokerAddr);
 }
 
-std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffset(
-    const std::string& brokerAddr, const std::string& topic, const std::string& group,
-    int64_t timestamp, bool isForce, bool isCpp, int32_t queueId, int64_t offset) {
-    MQClientInstance& client = requireClient();
+PropertyMap DefaultMQAdminExt::buildResetOffsetExtFields(
+    const std::string& topic, const std::string& group, int64_t timestamp, bool isForce,
+    int32_t queueId, int64_t offset) {
     PropertyMap ext;
     ext["topic"] = topic;
     ext["group"] = group;
     ext["timestamp"] = i64str(timestamp);
-    ext["force"] = isForce ? "true" : "false";
+    // 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
+    // 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
+    // `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
+    // isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
+    // 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
+    // 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
+    //               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+    ext["isForce"] = isForce ? "true" : "false";
     // Java：offset=-1 表示 offset 为空
     ext["offset"] = i64str(offset);
     if (queueId >= 0) ext["queueId"] = i64str(queueId);
+    return ext;
+}
+
+std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffset(
+    const std::string& brokerAddr, const std::string& topic, const std::string& group,
+    int64_t timestamp, bool isForce, bool isCpp, int32_t queueId, int64_t offset) {
+    MQClientInstance& client = requireClient();
+    PropertyMap ext = buildResetOffsetExtFields(topic, group, timestamp, isForce, queueId, offset);
     RemotingCommand response = client.invokeSyncRaw(
         vipAddr(brokerAddr), RequestCode::INVOKE_BROKER_TO_RESET_OFFSET, ext, Bytes(), false,
         timeoutMillis_,

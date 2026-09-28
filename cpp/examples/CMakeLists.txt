@@ -121,3 +121,7 @@ target_link_libraries(rmq_live_correct_tags_offset PRIVATE rocketmq::remoting)
 # OFFSET_ILLEGAL 纠错真机联调：整批作废在途/缓冲消息 + 按修正位点重建 + 立即落盘（不打进 ctest）
 add_executable(rmq_live_offset_illegal live_offset_illegal.cpp)
 target_link_libraries(rmq_live_offset_illegal PRIVATE rocketmq::remoting)
+
+# 220 重置消费位点真机联调：broker 推 220 后立刻落盘 + 在途批次作废 + 队列按新位点重建（不打进 ctest）
+add_executable(rmq_live_reset_offset live_reset_offset.cpp)
+target_link_libraries(rmq_live_reset_offset PRIVATE rocketmq::remoting)

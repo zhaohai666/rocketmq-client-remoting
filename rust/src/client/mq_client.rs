@@ -81,7 +81,7 @@ use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
     CheckClientRequestBody, ClusterInfo, ConsumeMessageDirectlyResult, ConsumerRunningInfo,
     GetConsumerListByGroupResponseBody, GetConsumerStatusBody, LockBatchRequestBody,
-    LockBatchResponseBody, ResetOffsetBody, TopicList, UnlockBatchRequestBody,
+    LockBatchResponseBody, ResetOffsetBody, ResetOffsetBodyForC, TopicList, UnlockBatchRequestBody,
 };
 use crate::remoting::protocol::codes::{request_code, response_code};
 use crate::remoting::protocol::ext_fields::CustomHeader;
@@ -613,6 +613,31 @@ struct Inner {
     consumer_ids_changed_count: AtomicUsize,
 }
 
+/// 220 的 body 有两种形状：`ResetOffsetBody`（对象即键的 map，Java 管理端恒用这种）
+/// 与 `ResetOffsetBodyForC`（数组，每条自带 offset）。只有 222 发起方的 `language=CPP`
+/// 时 broker 才推数组体（`Broker2Client.resetOffset:158-163`）—— Java 管理端恒发 JAVA，
+/// 所以 Java 处理器只认 map（`ClientRemotingProcessor.resetOffset:153`）也碰不到数组。
+/// 本端口解析数组体是为与 language=CPP 的旧 C++ SDK 管理端互通：map 解析器拿到数组只会
+/// 报错，不兜底等于整笔重置静默丢弃（与 C++ `DefaultMQPushConsumer::parseResetOffsetBody`、
+/// Python `_process_reset_offset` 同口径）。
+fn parse_reset_offset_table(data: &[u8]) -> Result<Vec<(MessageQueue, i64)>> {
+    match ResetOffsetBody::decode(data) {
+        Ok(body) => Ok(body
+            .offset_table
+            .into_iter()
+            .map(|(k, v)| (MessageQueue::new(&k.topic, &k.broker_name, k.queue_id), v))
+            .collect()),
+        Err(map_err) => {
+            let for_c = ResetOffsetBodyForC::decode(data).map_err(|_| map_err)?;
+            Ok(for_c
+                .offset_table
+                .into_iter()
+                .map(|e| (MessageQueue::new(&e.topic, &e.broker_name, e.queue_id), e.offset))
+                .collect())
+        }
+    }
+}
+
 /// Python `MQClientInstance`（类级 `INSTANCE_MAP` 在 Rust 里是
 /// [`MQClientInstance::INSTANCE_MAP`]，存弱引用）。
 #[derive(Clone)]
@@ -907,22 +932,17 @@ impl MQClientInstance {
             rmq_warn!("RESET_CONSUMER_CLIENT_OFFSET: no consumer for group={group:?}");
             return;
         };
-        let body = match cmd.body() {
-            Some(bytes) if !bytes.is_empty() => match ResetOffsetBody::decode(bytes) {
-                Ok(body) => body,
+        let offset_table = match cmd.body() {
+            Some(bytes) if !bytes.is_empty() => match parse_reset_offset_table(bytes) {
+                Ok(table) => table,
                 Err(e) => {
                     rmq_warn!("RESET_CONSUMER_CLIENT_OFFSET: bad body: {e}");
                     return;
                 }
             },
-            _ => ResetOffsetBody::default(),
+            _ => Vec::new(),
         };
         let topic = header.topic.unwrap_or_default();
-        let offset_table: Vec<(MessageQueue, i64)> = body
-            .offset_table
-            .into_iter()
-            .map(|(k, v)| (MessageQueue::new(&k.topic, &k.broker_name, k.queue_id), v))
-            .collect();
         // Python 丢后台线程（220 的 rebalance 会 invokeSync，不能卡在 remoting 读线程）；
         // 这里丢 tokio 任务，立即回 None（oneway）。
         let task = consumer.reset_offset(topic.clone(), offset_table);
@@ -3614,6 +3634,7 @@ mod tests {
 
     use super::*;
     use crate::common::sysflag::PermName;
+    use crate::remoting::protocol::body::MessageQueueForC;
     use crate::remoting::protocol::route::{BrokerData, QueueData};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
@@ -3664,12 +3685,15 @@ mod tests {
         msg
     }
 
+    /// 每次 220 的入参原样留档（topic + 位点表），两种 body 形状都靠它断言。
+    type ResetCall = (String, Vec<(MessageQueue, i64)>);
+
     /// 只记录调用、不做任何 RPC 的消费者替身。
     struct StubConsumer {
         group: String,
         /// 220 落位点前的耗时，用来证明「处理没有卡在调用线程上」。
         reset_delay: Duration,
-        resets: Arc<Mutex<Vec<(String, usize)>>>,
+        resets: Arc<Mutex<Vec<ResetCall>>>,
         status_topics: Arc<Mutex<Vec<Option<String>>>>,
         persisted: Arc<AtomicUsize>,
         /// 40 通知叫醒了几次重平衡。
@@ -3747,7 +3771,7 @@ mod tests {
                 // 真实实现在这里面会做 rebalance / lock / batch（全是 invokeSync），
                 // 所以整段必须在后台跑。
                 tokio::time::sleep(self.reset_delay).await;
-                guard(&self.resets).push((topic, offset_table.len()));
+                guard(&self.resets).push((topic, offset_table));
                 Ok(())
             })
         }
@@ -3819,7 +3843,88 @@ mod tests {
         assert!(guard(&consumer.resets).is_empty(), "220 ran inline on the calling thread");
 
         assert!(wait_until(|| !guard(&consumer.resets).is_empty()).await);
-        assert_eq!(guard(&consumer.resets).clone(), vec![(TOPIC.to_string(), 2)]);
+        assert_eq!(
+            guard(&consumer.resets).clone(),
+            vec![(
+                TOPIC.to_string(),
+                vec![
+                    (MessageQueue::new(TOPIC, BROKER, 0), 11i64),
+                    (MessageQueue::new(TOPIC, BROKER, 1), 22i64),
+                ],
+            )]
+        );
+        instance.shutdown();
+    }
+
+    /// 222 发起方 language=CPP 时 broker 推的是**数组**体（`ResetOffsetBodyForC`）；
+    /// map 形状解析器对它只会报错，若不做兜底整笔重置会被静默丢掉。
+    #[tokio::test]
+    async fn reset_offset_array_body_for_c_is_not_dropped() {
+        let instance = new_instance();
+        let consumer = StubConsumer::new();
+        instance.register_consumer(GROUP, consumer.clone());
+
+        let mut header = ResetOffsetRequestHeader::default();
+        header.group = Some(GROUP.to_string());
+        header.topic = Some(TOPIC.to_string());
+        let mut cmd = request(request_code::RESET_CONSUMER_CLIENT_OFFSET, header);
+        // broker 真机报文形状：offsetTable 是数组，每条自带 offset
+        cmd.set_body(Some(ResetOffsetBodyForC {
+            offset_table: vec![
+                MessageQueueForC {
+                    topic: TOPIC.to_string(),
+                    broker_name: BROKER.to_string(),
+                    queue_id: 1,
+                    offset: 9,
+                },
+                MessageQueueForC {
+                    topic: TOPIC.to_string(),
+                    broker_name: BROKER.to_string(),
+                    queue_id: 3,
+                    offset: 77,
+                },
+            ],
+        }
+        .encode()));
+
+        instance.process_reset_offset(&cmd);
+        assert!(wait_until(|| !guard(&consumer.resets).is_empty()).await);
+        assert_eq!(
+            guard(&consumer.resets).clone(),
+            vec![(
+                TOPIC.to_string(),
+                vec![
+                    (MessageQueue::new(TOPIC, BROKER, 1), 9i64),
+                    (MessageQueue::new(TOPIC, BROKER, 3), 77i64),
+                ],
+            )]
+        );
+        instance.shutdown();
+    }
+
+    /// map 形状解析成功后不得再叠一次 ForC 解析（两条路各自建表），
+    /// 否则同一队列会被推两次。表里两条键不同，数量断言足够区分。
+    #[tokio::test]
+    async fn reset_offset_map_body_is_not_double_counted() {
+        let instance = new_instance();
+        let consumer = StubConsumer::new();
+        instance.register_consumer(GROUP, consumer.clone());
+
+        let mut header = ResetOffsetRequestHeader::default();
+        header.group = Some(GROUP.to_string());
+        header.topic = Some(TOPIC.to_string());
+        let mut cmd = request(request_code::RESET_CONSUMER_CLIENT_OFFSET, header);
+        cmd.set_body(Some(
+            ResetOffsetBody {
+                offset_table: vec![(MessageQueueKey::new(TOPIC, BROKER, 0), 11i64)],
+            }
+            .encode(),
+        ));
+
+        instance.process_reset_offset(&cmd);
+        assert!(wait_until(|| !guard(&consumer.resets).is_empty()).await);
+        assert_eq!(guard(&consumer.resets).len(), 1);
+        assert_eq!(guard(&consumer.resets)[0].1.len(), 1);
         instance.shutdown();
     }
 
@@ -3836,11 +3941,15 @@ mod tests {
         // 坏 body：解码失败也不该波及调用方。
         let consumer = StubConsumer::new();
         instance.register_consumer(GROUP, consumer.clone());
-        let mut header = ResetOffsetRequestHeader::default();
-        header.group = Some(GROUP.to_string());
-        let mut cmd = request(request_code::RESET_CONSUMER_CLIENT_OFFSET, header);
-        cmd.set_body(Some(b"{not a reset body".to_vec()));
-        instance.process_reset_offset(&cmd);
+        // 三种里两种形状都解不出：非法 JSON、offsetTable 是标量（map 侧非对象、
+        // ForC 侧非数组）、顶层就是数组 —— 一支手指都不许碰。
+        for body in [&b"{not a reset body"[..], br#"{"offsetTable":5}"#, b"[1,2]"] {
+            let mut header = ResetOffsetRequestHeader::default();
+            header.group = Some(GROUP.to_string());
+            let mut cmd = request(request_code::RESET_CONSUMER_CLIENT_OFFSET, header);
+            cmd.set_body(Some(body.to_vec()));
+            instance.process_reset_offset(&cmd);
+        }
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(guard(&consumer.resets).is_empty());
         instance.shutdown();

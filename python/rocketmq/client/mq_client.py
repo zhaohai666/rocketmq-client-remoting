@@ -31,7 +31,7 @@ from ..remoting.protocol.body import (CheckClientRequestBody, ClusterInfo,
                                       ConsumerRunningInfo, ConsumeMessageDirectlyResult,
                                       GetConsumerStatusBody,
                                       GetConsumerListByGroupResponseBody, ResetOffsetBody,
-                                      TopicList)
+                                      ResetOffsetBodyForC, TopicList)
 
 if TYPE_CHECKING:
     from .consumer import DefaultMQPushConsumer
@@ -344,13 +344,28 @@ class MQClientInstance:
         if consumer is None:
             logger.warning("RESET_CONSUMER_CLIENT_OFFSET: no consumer for group=%s", group)
             return None
-        try:
-            body = ResetOffsetBody.decode(cmd.body) if cmd.body else ResetOffsetBody()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("RESET_CONSUMER_CLIENT_OFFSET: bad body: %s", e)
-            return None
+        # 222 的 body 有两种形状：map（ResetOffsetBody，Java 管理端恒用这种）与数组
+        # （ResetOffsetBodyForC，只有 222 发起方 language=CPP 时 broker 才推，见
+        # Broker2Client.resetOffset:158-163）。Java 处理器只认 map
+        # （ClientRemotingProcessor.resetOffset:153）—— Java 管理端恒发 JAVA 故碰不到数组；
+        # 本端口为与 language=CPP 的旧 C++ SDK 管理端互通而兜底它：map 解析器对数组只会
+        # 抛错/得空表，不兜底等于整笔重置静默丢弃（与 C++ parseResetOffsetBody 同口径）。
         topic = header.topic
-        offset_table: Dict[MessageQueue, int] = body.offset_table
+        offset_table: Dict[MessageQueue, int] = {}
+        if cmd.body:
+            try:
+                offset_table = ResetOffsetBody.decode(cmd.body).offset_table
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RESET_CONSUMER_CLIENT_OFFSET: not map-form body: %s", e)
+            if not offset_table:
+                try:
+                    for e in ResetOffsetBodyForC.decode(cmd.body).offset_table:
+                        offset_table[MessageQueue(e.topic, e.broker_name, e.queue_id)] = e.offset
+                except Exception as e:  # noqa: BLE001
+                    # 连 JSON 都不是：与 Java 一致地整笔丢弃（Java 的解码异常从处理器里抛出、
+                    # 由 netty 侧吞掉），本地位点一根手指都不许碰。
+                    logger.warning("RESET_CONSUMER_CLIENT_OFFSET: bad body: %s", e)
+                    return None
 
         def _run() -> None:
             try:

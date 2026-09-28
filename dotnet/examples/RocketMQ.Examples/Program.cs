@@ -58,6 +58,7 @@ internal static class Program
                 "subscribe" => LiveSubscribe.Run(rest),
                 "pinned-guard" => LivePinnedGuard.Run(rest),
                 "offset-illegal" => LiveOffsetIllegal.Run(rest),
+                "reset-offset" => LiveResetOffset.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -109,6 +110,7 @@ internal static class Program
               subscribe  [namesrv]        真实集群后置订阅联调（start() 之后 subscribe 立即推心跳、新 topic 真被消费）
               pinned-guard [namesrv]      真实集群定点发送 topic 守卫联调（真路由不误拒、拒在本端且 broker 无痕、单向无守卫）
               offset-illegal [namesrv]    真实集群 OFFSET_ILLEGAL 纠错联调（整批作废在途/缓冲消息并按修正位点重建；修正位点立刻落盘）
+              reset-offset [namesrv]      真实集群 220 重置消费位点联调（broker 推 220 后立刻落盘 + 在途批次作废 + 队列按新位点重建）
             """);
     }
 }

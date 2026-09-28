@@ -257,9 +257,15 @@ public:
                                       const std::string& consumerGroup, const MessageQueue& mq,
                                       int64_t offset);
     // 对应 Java resetOffsetByTimestamp：逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET
+    //
+    // isCpp 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方（也就是本
+    // 请求）的 language 判 isC，仅 CPP 置真（AdminBrokerProcessor:2263-2270），CPP 时推
+    // ResetOffsetBodyForC（JSON 数组）、其余推 ResetOffsetBody（对象即键的 map）。Java
+    // 管理端两个重载传的都是 false（MQClientAPIImpl:2405/2408）；222 的**响应**体恒为
+    // map 形状（Broker2Client:232），与本参数无关。
     std::map<MessageQueue, int64_t> resetOffsetByTimestamp(
         const std::string& topic, const std::string& group, int64_t timestamp,
-        bool isForce = true, const std::string& clusterName = std::string(), bool isCpp = true);
+        bool isForce = true, const std::string& clusterName = std::string(), bool isCpp = false);
     void resetOffsetNew(const std::string& consumerGroup, const std::string& topic,
                         int64_t timestamp);
     std::map<MessageQueue, int64_t> resetOffsetByTimestampOld(
@@ -278,6 +284,17 @@ public:
     std::map<MessageQueue, int64_t> resetOffsetByQueueId(
         const std::string& brokerAddr, const std::string& consumerGroup,
         const std::string& topic, int32_t queueId, int64_t resetOffset);
+
+    // 222 请求体的 extFields 构造，开放给单测锁键名 —— 写错是**静默**的：Java
+    // `RemotingCommand.makeCustomHeaderToNet:437-450` 拿 requestHeader 的**字段名**做 ext
+    // key，而 `ResetOffsetRequestHeader` 声明的是 `private boolean isForce`（getter 不参与
+    // 命名）。写成 "force" 时 broker 侧 isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158`
+    // 的分支退化成「取时间戳位点」，前重（timestamp=-1）会把 consumerOffset 原样回显而不是
+    // 跳到 maxOffset（5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3=consumerOffset，
+    // {"isForce":"true", timestamp:-1} → 目标 10=maxOffset）。queueId < 0 表示不带该字段。
+    static PropertyMap buildResetOffsetExtFields(const std::string& topic,
+                                                 const std::string& group, int64_t timestamp,
+                                                 bool isForce, int32_t queueId, int64_t offset);
 
     // ---------------- 消息查询 ----------------
     std::vector<MessageExt> queryMessage(const std::string& topic, const std::string& key,

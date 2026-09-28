@@ -766,6 +766,96 @@ public sealed class ResetOffsetBody
 }
 
 /// <summary>
+/// org.apache.rocketmq.common.message.MessageQueueForC（ResetOffsetBodyForC 数组的元素）。
+/// </summary>
+public sealed class MessageQueueForC
+{
+    public string Topic { get; set; } = string.Empty;
+
+    public string BrokerName { get; set; } = string.Empty;
+
+    public int QueueId { get; set; }
+
+    public long Offset { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("topic", JsonValue.MakeString(Topic));
+        v.Set("brokerName", JsonValue.MakeString(BrokerName));
+        v.Set("queueId", JsonValue.MakeInt(QueueId));
+        v.Set("offset", JsonValue.MakeInt(Offset));
+        return v;
+    }
+
+    public static MessageQueueForC FromJson(JsonValue v) => new()
+    {
+        Topic = v.Get("topic").StringValue(),
+        BrokerName = v.Get("brokerName").StringValue(),
+        QueueId = (int)v.Get("queueId").IntValue(),
+        Offset = v.Get("offset").IntValue(),
+    };
+}
+
+/// <summary>
+/// org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：offsetTable 是**数组**
+/// （每条自带 offset），不是 map。
+///
+/// 只有 222 发起方的 language=CPP 时 broker 才推这种体（Broker2Client.resetOffset:158-163），
+/// Java 管理端恒发 JAVA，所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
+/// 旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
+/// </summary>
+public sealed class ResetOffsetBodyForC
+{
+    public List<MessageQueueForC> OffsetTable { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        var arr = JsonValue.MakeArray();
+        foreach (var e in OffsetTable)
+        {
+            arr.PushArray(e.ToJson());
+        }
+
+        v.Set("offsetTable", arr);
+        return v;
+    }
+
+    public static ResetOffsetBodyForC FromJson(JsonValue v)
+    {
+        var b = new ResetOffsetBodyForC();
+        var arr = v.Get("offsetTable");
+        if (arr.IsArray)
+        {
+            for (int i = 0; i < arr.Size(); i++)
+            {
+                if (arr.At(i).IsObject)
+                {
+                    b.OffsetTable.Add(MessageQueueForC.FromJson(arr.At(i)));
+                }
+            }
+        }
+
+        return b;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out ResetOffsetBodyForC @out)
+    {
+        @out = new ResetOffsetBodyForC();
+        if (!RemotingSerializable.Decode(data, out JsonValue v))
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
+/// <summary>
 /// org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
 /// （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。MessageQueueTable 的键是
 /// MessageQueue（fastjson2 内联对象键）；ConsumerTable 是 Java 保留的废弃字段

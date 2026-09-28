@@ -224,6 +224,11 @@ public:
     // 命中本 topic 分配队列的 → 清在途缓冲与拉取游标 → 写新已消费位点 →
     // 撤销该队列（持久化新位点 + 顺序解锁）→ 立即 rebalance 从新位点重拉。
     void resetOffset(const std::string& topic, const std::map<MessageQueue, int64_t>& offsetTable);
+    // 解析 220 的 offsetTable（两种形状都认）。Java 的发起方恒为 JAVA ⇒ 只会收到 map 形状的
+    // ResetOffsetBody；language=CPP 的发起方（旧 C++ SDK 管理端）会让 broker 推数组形状的
+    // ResetOffsetBodyForC（Broker2Client.resetOffset:158-163）。漏了数组那一支，这类重置在
+    // 本消费者上就是**静默丢弃**：位点表没动，消息继续从老位点流。
+    static std::map<MessageQueue, int64_t> parseResetOffsetBody(const Bytes& body);
     // 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）：
     // 返回**已消费位点**表（不是拉取游标），topic 为空则返回全部。
     std::map<MessageQueue, int64_t> getConsumerStatus(const std::string& topic);
@@ -585,6 +590,10 @@ private:
     // 广播模式本地位点文件（Java LocalFileOffsetStore）
     std::string localOffsetPath() const;
     void saveLocalOffsets();
+    // 撤销收尾带下来的位点（已不在 consumeOffsetTable_/mqMap_ 里）并进同一次落盘：
+    // Java 广播撤销是 persist(mq) 在前、removeOffset(mq) 在后，文件里的值必须留着，
+    // 否则同名队列下次分回来读不到位点、按 consumeFromWhere 重扫。
+    void saveLocalOffsets(const std::vector<std::pair<MessageQueue, int64_t>>& extra);
     std::map<std::string, int64_t> loadLocalOffsets() const;
     // 顺序消费 broker 队列锁（Java ConsumeMessageOrderlyService.lockMQ，每 20s）
     void lockLoop();

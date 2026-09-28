@@ -34,6 +34,10 @@ internal sealed class WireRecord
     public byte[] Body { get; init; } = Array.Empty<byte>();
     public bool HasBody { get; init; }
 
+    /// <summary>发起方言（Java 0 / CPP 1 / DOTNET 2…）。broker 只拿它判"是不是 C 系"
+    /// （如 222 是否回数组形状的 ResetOffsetBodyForC），所以它必须从报文头上取证。</summary>
+    public byte Language { get; init; }
+
     /// <summary>到达时刻（ms，相对 <see cref="MockCluster.ClockOrigin" />）。
     /// 定时任务的节奏断言只能靠它：报文内容完全正常，只有到达时刻能证明周期对不对。</summary>
     public long ArrivalMs { get; init; }
@@ -45,6 +49,7 @@ internal sealed class WireRecord
         Ext = new PropertyMap(req.ExtFields),
         Body = req.Body,
         HasBody = req.HasBody,
+        Language = req.Language,
         ArrivalMs = arrivalMs,
     };
 
@@ -189,6 +194,20 @@ internal sealed class MockCluster : IDisposable
     /// <summary>让第 index 个 broker 从此**收而不答**（把客户端逼到响应超时）。</summary>
     public void MakeSilent(int index) =>
         Script(index, new List<(int, int)>(), (NoReply, 0));
+
+    /// <summary>
+    /// 给某个请求码挂应答体（按 broker 生效）。用于那些"没有 body 就等于失败"的管理类调用 ——
+    /// 比如 222 的调用方要求至少一台 broker 回了非空 ResetOffsetBody。
+    /// </summary>
+    public void SetReplyBody(int code, Func<RemotingCommand, byte[]> bodyFor)
+    {
+        lock (_gate)
+        {
+            _replyBodies[code] = bodyFor;
+        }
+    }
+
+    private readonly Dictionary<int, Func<RemotingCommand, byte[]>> _replyBodies = new();
 
     /// <summary>第 index 个 broker 收到的 SEND 请求数。</summary>
     public int Requests(int index)
@@ -343,6 +362,20 @@ internal sealed class MockCluster : IDisposable
         Record(req);
         if (!IsSendCode(req.Code))
         {
+            Func<RemotingCommand, byte[]>? bodyFor;
+            lock (_gate)
+            {
+                _replyBodies.TryGetValue(req.Code, out bodyFor);
+            }
+
+            if (bodyFor is not null && !req.IsOnewayRpc())
+            {
+                RemotingCommand withBody = Respond(req, ResponseCode.Success, null);
+                withBody.Body = bodyFor(req);
+                withBody.HasBody = true;
+                return withBody;
+            }
+
             // 心跳等非发送请求一律应答成功，别让后台线程卡在错误上
             return req.IsOnewayRpc() ? null : Respond(req, ResponseCode.Success, null);
         }

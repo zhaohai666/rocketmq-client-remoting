@@ -1629,7 +1629,7 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     // 未来时间 ⇒ 位点应被推到该队列 maxOffset（222 由 broker 端算，不是本地 searchOffset）。
     let ts = now_millis() + 60_000;
     match admin
-        .reset_offset_by_timestamp(&topic, &group, ts, true, None, true)
+        .reset_offset_by_timestamp(&topic, &group, ts, true, None, false)
         .await
     {
         Ok(offsets) => {

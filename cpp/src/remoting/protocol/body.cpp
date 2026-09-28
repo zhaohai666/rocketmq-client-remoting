@@ -470,6 +470,52 @@ bool ResetOffsetBody::decode(const Bytes& data, ResetOffsetBody& out) {
     return true;
 }
 
+// ---------------------------------------------------------------- ResetOffsetBodyForC
+JsonValue ResetOffsetBodyForC::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    JsonValue arr = JsonValue::makeArray();
+    for (const MessageQueueForC& mq : offsetTable) {
+        JsonValue e = JsonValue::makeObject();
+        e.set("topic", JsonValue::makeString(mq.topic));
+        e.set("brokerName", JsonValue::makeString(mq.brokerName));
+        e.set("queueId", JsonValue::makeInt(mq.queueId));
+        e.set("offset", JsonValue::makeInt(mq.offset));
+        arr.pushArray(e);
+    }
+    v.set("offsetTable", arr);
+    return v;
+}
+
+ResetOffsetBodyForC ResetOffsetBodyForC::fromJson(const JsonValue& v) {
+    ResetOffsetBodyForC b;
+    const JsonValue* arr = v.find("offsetTable");
+    if (arr == nullptr || !arr->isArray()) return b;
+    for (size_t i = 0; i < arr->size(); ++i) {
+        const JsonValue& e = arr->at(i);
+        if (!e.isObject()) continue;
+        MessageQueueForC mq;
+        std::string topic;
+        std::string brokerName;
+        int64_t queueId = 0;
+        if (e.tryGetString("topic", topic)) mq.topic = topic;
+        if (e.tryGetString("brokerName", brokerName)) mq.brokerName = brokerName;
+        if (e.tryGetInt("queueId", queueId)) mq.queueId = static_cast<int32_t>(queueId);
+        int64_t offset = 0;
+        if (e.tryGetInt("offset", offset)) mq.offset = offset;
+        b.offsetTable.push_back(std::move(mq));
+    }
+    return b;
+}
+
+Bytes ResetOffsetBodyForC::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool ResetOffsetBodyForC::decode(const Bytes& data, ResetOffsetBodyForC& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v)) return false;
+    out = fromJson(v);
+    return true;
+}
+
 JsonValue GetConsumerStatusBody::toJson() const {
     JsonValue v = JsonValue::makeObject();
     JsonValue table = JsonValue::makeObject();

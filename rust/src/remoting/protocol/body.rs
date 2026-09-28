@@ -933,6 +933,84 @@ impl ResetOffsetBody {
     }
 }
 
+// ---------------------------------------------------------------- ResetOffsetBodyForC
+
+/// 对应 `org.apache.rocketmq.common.message.MessageQueueForC`（`ResetOffsetBodyForC`
+/// 数组的元素）。字段声明序即 Java 的 `topic,brokerName,queueId,offset`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageQueueForC {
+    pub topic: String,
+    pub broker_name: String,
+    pub queue_id: i32,
+    pub offset: i64,
+}
+
+impl MessageQueueForC {
+    pub fn to_json_value(&self) -> Value {
+        json_object(vec![
+            ("topic", Value::String(self.topic.clone())),
+            ("brokerName", Value::String(self.broker_name.clone())),
+            ("queueId", Value::from(self.queue_id)),
+            ("offset", Value::from(self.offset)),
+        ])
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<MessageQueueForC> {
+        expect_object(value, "MessageQueueForC")?;
+        Ok(MessageQueueForC {
+            topic: jstring(value, "topic").unwrap_or_default(),
+            broker_name: jstring(value, "brokerName").unwrap_or_default(),
+            queue_id: jint(value, "queueId", 0),
+            offset: jlong(value, "offset", 0),
+        })
+    }
+}
+
+/// 对应 `org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC`：`offsetTable` 是
+/// **数组**（每条自带 offset），不是 map。
+///
+/// 只有 222 发起方的 `language=CPP` 时 broker 才推这种体（`Broker2Client.resetOffset:158-163`）
+/// —— Java 管理端恒发 JAVA，所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
+/// 旧 C++ SDK 管理端互通：收到却解析不出等于整笔重置静默丢弃（与 C++
+/// `DefaultMQPushConsumer::parseResetOffsetBody` 同口径）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResetOffsetBodyForC {
+    pub offset_table: Vec<MessageQueueForC>,
+}
+
+impl ResetOffsetBodyForC {
+    pub fn to_json_value(&self) -> Value {
+        json_object(vec![(
+            "offsetTable",
+            Value::Array(
+                self.offset_table
+                    .iter()
+                    .map(MessageQueueForC::to_json_value)
+                    .collect(),
+            ),
+        )])
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<ResetOffsetBodyForC> {
+        expect_object(value, "ResetOffsetBodyForC")?;
+        let mut offset_table = Vec::new();
+        for item in jarray(value, "offsetTable")? {
+            if item.is_object() {
+                offset_table.push(MessageQueueForC::from_json_value(item)?);
+            }
+        }
+        Ok(ResetOffsetBodyForC { offset_table })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        RemotingSerializable::encode(&self.to_json_value())
+    }
+
+    pub fn decode(data: &[u8]) -> Result<ResetOffsetBodyForC> {
+        ResetOffsetBodyForC::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
 /// 对应 `org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody`（42）。
 ///
 /// 两个 map 的**内层**键都是 `MessageQueue`（fastjson2 内联对象）；外层
@@ -1615,6 +1693,44 @@ mod tests {
     }
 
     #[test]
+    fn reset_offset_body_for_c_array_round_trips_and_java_wire() {
+        let body = ResetOffsetBodyForC {
+            offset_table: vec![
+                MessageQueueForC {
+                    topic: "BodyGoldenTopic".to_string(),
+                    broker_name: "broker-a".to_string(),
+                    queue_id: 0,
+                    offset: 10,
+                },
+                MessageQueueForC {
+                    topic: "BodyGoldenTopic".to_string(),
+                    broker_name: "broker-a".to_string(),
+                    queue_id: 1,
+                    offset: 20,
+                },
+            ],
+        };
+        // 字段按 Java 声明序写（`MessageQueueForC` 的 topic,brokerName,queueId,offset）
+        assert_eq!(
+            json_of(&body.to_json_value()),
+            r#"{"offsetTable":[{"topic":"BodyGoldenTopic","brokerName":"broker-a","queueId":0,"offset":10},{"topic":"BodyGoldenTopic","brokerName":"broker-a","queueId":1,"offset":20}]}"#
+        );
+        assert_eq!(ResetOffsetBodyForC::decode(&body.encode()).unwrap(), body);
+        // Java 真机报文：字段名 topic/brokerName/queueId/offset，位置与声明序无关
+        let java = concat!(
+            r#"{"offsetTable":[{"offset":10,"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"},"#,
+            r#"{"topic":"BodyGoldenTopic","queueId":1,"brokerName":"broker-a","offset":20}]}"#
+        );
+        assert_eq!(ResetOffsetBodyForC::decode(java.as_bytes()).unwrap(), body);
+        // 两条形状互不允许：map 体喂给 ForC 只会报错（反之亦然，见
+        // malformed_bodies_return_decode_errors）
+        assert!(matches!(
+            ResetOffsetBodyForC::decode(br#"{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"t"}:1}}"#),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    #[test]
     fn get_consumer_status_body_nested_maps() {
         let body = GetConsumerStatusBody {
             message_queue_table: vec![
@@ -1792,6 +1908,23 @@ mod tests {
         assert!(matches!(KVTable::decode(b"[1,2]"), Err(Error::Decode(_))));
         assert!(matches!(
             ResetOffsetBody::decode(br#"{"offsetTable":[1]}"#),
+            Err(Error::Decode(_))
+        ));
+        // ForC 数组体裁：非对象的元素跳过（Java 侧 List<MessageQueueForC> 反序列化
+        // 逐元素建对象，坏元素同样进不了表），但 offsetTable 本身必须是数组
+        assert_eq!(
+            ResetOffsetBodyForC::decode(br#"{"offsetTable":[1,{"topic":"t"}]}"#)
+                .unwrap()
+                .offset_table,
+            vec![MessageQueueForC {
+                topic: "t".to_string(),
+                broker_name: String::new(),
+                queue_id: 0,
+                offset: 0,
+            }]
+        );
+        assert!(matches!(
+            ResetOffsetBodyForC::decode(br#"{"offsetTable":{"a":1}}"#),
             Err(Error::Decode(_))
         ));
         assert!(matches!(

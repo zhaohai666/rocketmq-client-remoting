@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..common.message import Message, MessageExt, MessageQueue
 from ..common.message_accessor import MessageAccessor
@@ -1768,8 +1768,10 @@ class DefaultMQPushConsumer:
         """被撤销队列的收尾（对应 Java RebalanceImpl.removeUnnecessaryMessageQueue）。"""
         broadcast = self.message_model == MessageModel.BROADCASTING
         if broadcast:
-            # 广播模式位点只存本地
-            self._save_local_offsets()
+            # 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件：Java 是
+            # persist(mq) 在前、removeOffset(mq) 在后（只摘内存条目，文件里的值留着），
+            # 少了这一步，队列重建时读不到旧位点，会按 consumeFromWhere 从头/从尾重扫。
+            self._save_local_offsets(extra=revoked)
             return
         client = self._mq_client
         if client is None:
@@ -2568,35 +2570,39 @@ class DefaultMQPushConsumer:
     def reset_offset(self, topic: str, offset_table: Dict[MessageQueue, int]) -> None:
         """对应 Java MQClientInstance.resetOffset（220 的处理逻辑）。
 
-        顺序：suspend → 命中的队列 drop+clear → 等一会儿让在途消费跑完 →
-        写新位点 → 撤销该队列（触发 rebalance 重新分配并从新位点开始）。
+        Java 的四步：``pq.setDropped(true); pq.clear()``（在途批次的 ack 与缓冲一起作废）
+        → 非顺序消费时等 ``RESET_OFFSET_MAX_WAIT``＝10 秒让并发消费跑完 →
+        ``updateConsumeOffset(mq, offset)`` ＋ ``removeUnnecessaryMessageQueue``（立刻落盘、
+        顺序解锁）→ 把队列从 processQueueTable 摘掉，rebalance 按新位点重建。
+
+        本端口：新位点先落进表，再走统一撤销路径（``_retire_queue_locked`` 代号 +1 即
+        setDropped，清缓冲、摘拉取线程），撤销收尾把**新位点**持久化，最后 rebalance 重建。
+        等待从 10 秒缩到 0.2 秒是有意偏差：代号已让在途 ack 全部失效，不靠"等"避竞争。
         """
         if topic is None or not offset_table:
             return
+        retired: List[Tuple[MessageQueue, Optional[int]]] = []
         with self._lock:
-            hit: List[Tuple[MessageQueue, str]] = []
             for key, mq in list(self._mq_map.items()):
                 if mq.topic != topic:
                     continue
                 off = offset_table.get(mq)
                 if off is None:
                     continue
-                self._pending.pop(key, None)   # 等价 ProcessQueue.clear()
-                self._offset_table.pop(key, None)
+                # 新位点先写进表：撤销会把**它**交给 _on_queues_revoked 落盘
+                #（Java updateConsumeOffset 之后紧接着的那次 persist）
                 self._consume_offsets[key] = int(off)
-                hit.append((mq, key))
-        if not hit:
+                self._retire_queue_locked(key, mq, retired)
+        if not retired:
             return
-        # Java 用 RESET_OFFSET_MAX_WAIT（5 秒）等并发消费跑完；这里缩短以免阻塞
-        # 读线程太久（220 是 oneway，broker 不等响应，但仍应尽快返回）。
         time.sleep(0.2)
-        self._on_queues_revoked([(mq, None) for mq, _ in hit])
+        self._on_queues_revoked(retired)
         try:
             self._do_rebalance()
         except Exception as e:  # noqa: BLE001
             logger.debug("rebalance after reset offset failed: %s", e)
         logger.info("reset offset applied, group=%s topic=%s queues=%d",
-                    self.consumer_group, topic, len(hit))
+                    self.consumer_group, topic, len(retired))
 
     def get_consumer_status(self, topic: str) -> Dict[MessageQueue, int]:
         """对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）。
@@ -3045,13 +3051,10 @@ class DefaultMQPushConsumer:
         ``epoch`` 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被
         撤销/重建（Java ``:267`` 的 ``!processQueue.isDropped()``），**整批 ack 作废**。
         ``_frozen_offsets`` 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
+
+        两个判据与写入必须在**同一临界区**：撤销/重置（220）是在锁内把代号 +1 的，
+        若先在锁外读代号、再进锁写位点，在途批次的 ack 就能挤在中间把重置后的位点推回去。
         """
-        if epoch is not None and epoch != self._queue_epoch.get(key, 0):
-            logger.debug("drop ack for %s: process queue was dropped (epoch %s -> %s)",
-                         key, epoch, self._queue_epoch.get(key, 0))
-            return
-        if key in self._frozen_offsets:
-            return
         if not batch:
             # 整批回投都失败时没有任何条目被认可，位点原地不动
             return
@@ -3059,6 +3062,12 @@ class DefaultMQPushConsumer:
         if floor is not None:
             next_off = min(next_off, floor)
         with self._lock:
+            if epoch is not None and epoch != self._queue_epoch.get(key, 0):
+                logger.debug("drop ack for %s: process queue was dropped (epoch %s -> %s)",
+                             key, epoch, self._queue_epoch.get(key, 0))
+                return
+            if key in self._frozen_offsets:
+                return
             cur = self._consume_offsets.get(key)
             self._consume_offsets[key] = max(cur or 0, next_off)
 
@@ -3172,10 +3181,23 @@ class DefaultMQPushConsumer:
                             self.client_id or "DEFAULT", self.consumer_group)
         return os.path.join(base, "offsets.json")
 
-    def _save_local_offsets(self) -> None:
+    def _save_local_offsets(self,
+                            extra: Optional[Iterable[Tuple[MessageQueue, Optional[int]]]] = None) -> None:
+        """把本地位点表写盘（Java ``LocalFileOffsetStore.persist``）。
+
+        ``extra`` 是刚被撤下来、已经不在 ``_consume_offsets``/``_mq_map`` 里的队列位点：
+        Java 的 ``persist(mq)`` 先写文件、``removeOffset(mq)`` 后摘内存条目，文件里的值
+        要留着，重建后的队列才能从它续上（见 ``_on_queues_revoked`` 广播分支）。
+        """
         with self._lock:
             items = dict(self._consume_offsets)
             mq_map = dict(self._mq_map)
+        for mq, off in extra or ():
+            if off is None:
+                continue
+            key = self._mq_key(mq)
+            items[key] = int(off)
+            mq_map.setdefault(key, mq)
         path = self._local_offset_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         text = _build_local_offsets_json(items, mq_map)

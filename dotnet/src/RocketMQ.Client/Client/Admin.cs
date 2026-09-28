@@ -11,9 +11,11 @@
 //  - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP 的 body 是 SubscriptionGroupConfig JSON。
 //  - GET_TOPIC_CONFIG 请求头带 topic + lo，响应体是 TopicConfig JSON。
 //  - GET_ALL_SUBSCRIPTIONGROUP_CONFIG 是**分页**接口（groupSeq / maxGroupNum / dataVersion）。
-//  - ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>。
+//  - ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>（222 的响应体恒为此形状）。
 //  - KV 配置类请求打到 **NameServer**，且 PUT/DELETE 要广播到**每一个** NameServer。
-//  - INVOKE_BROKER_TO_RESET_OFFSET 必须覆盖 language 为 CPP，broker 才会回可解析的 offsetTable。
+//  - INVOKE_BROKER_TO_RESET_OFFSET 的 force 标志在 extFields 里叫 **isForce**（Java 用
+//    字段名做键，见 RemotingCommand.makeCustomHeaderToNet），language 默认**不**覆盖：
+//    只有 C++ 系的消费者才需要 CPP（broker 对 CPP 发起方推数组形状的 ResetOffsetBodyForC）。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -1342,11 +1344,15 @@ public sealed class DefaultMQAdminExt
     /// 注意：这里**不再**走"逐队列 searchOffset + updateConsumerOffset"的旧本地实现——
     /// 那不会同步在线消费者，也不会做 broker 端一致性校验。
     ///
-    /// language 必须覆盖为 CPP：broker 端只对 CPP/PYTHON（这里用 CPP）才回可解析的 offsetTable
-    /// 响应体；否则返回空体，调用方会拿到空 map 并抛错。
+    /// <paramref name="isCpp"/> 只影响 broker 推给<b>在线消费者</b>的 220 报文形状：
+    /// <c>AdminBrokerProcessor.resetOffset:2263</c> 按<b>发起方</b>（也就是本请求）的
+    /// language 判 <c>isC</c>（仅 CPP 置真），CPP 回 <c>ResetOffsetBodyForC</c>（JSON 数组），
+    /// 其余回 <c>ResetOffsetBody</c>（对象即键的 map）。Java 管理端两个重载传的都是 false
+    /// （<c>MQClientAPIImpl:2405/2408</c>），本端口同样默认 false。222 的<b>响应</b>体恒为
+    /// map 形状（<c>Broker2Client:232</c>），与 isC 无关。
     /// </summary>
     public SortedDictionary<MessageQueue, long> ResetOffsetByTimestamp(string topic, string group,
-        long timestamp, bool isForce = true, string clusterName = "", bool isCpp = true)
+        long timestamp, bool isForce = true, string clusterName = "", bool isCpp = false)
     {
         string routeTopic = topic;
         string wheelTimer = MixAll.SystemTopicPrefix + "wheel_timer";
@@ -1397,7 +1403,14 @@ public sealed class DefaultMQAdminExt
             ["topic"] = topic,
             ["group"] = group,
             ["timestamp"] = I64Str(timestamp),
-            ["force"] = isForce ? "true" : "false",
+            // 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
+            // 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
+            // `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
+            // isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
+            // 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
+            // 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
+            //               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+            ["isForce"] = isForce ? "true" : "false",
             // Java：offset=-1 表示 offset 为空
             ["offset"] = I64Str(offset),
         };
