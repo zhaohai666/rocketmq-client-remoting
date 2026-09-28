@@ -212,6 +212,43 @@ static void testTopicRouteData() {
     CHECK(fromJava.getAllMessageQueue("T").size() == 4, "route java-shaped writable queues");
     CHECK(fromJava.brokerDatas[0].selectBrokerAddr() == "127.0.0.1:10911",
           "route java-shaped select master");
+
+    // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
+    // 从节点也会注册进 namesrv 且默认写位还在，所以这条**不能**靠 perm 过滤替代。
+    TopicRouteData masterless;
+    masterless.queueDatas.push_back(
+        QueueData("broker-a", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
+    masterless.queueDatas.push_back(
+        QueueData("broker-b", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
+    std::map<int64_t, std::string> slaveOnly;
+    slaveOnly[1] = "127.0.0.1:10931";  // master 掉线后的形状：只剩 brokerId=1
+    masterless.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-a", slaveOnly));
+    masterless.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-b", addrs));
+    std::vector<MessageQueue> onlyB = masterless.getAllMessageQueue("T");
+    CHECK(onlyB.size() == 4, "route skips broker without master");
+    CHECK(onlyB[0].brokerName == "broker-b", "route keeps only the master-bearing broker");
+    // 负控：master 放回去，broker-a 的 4 条立刻回来（跳的是「没有 master」而不是名字）
+    masterless.brokerDatas[0].brokerAddrs[0] = "127.0.0.1:10911";
+    CHECK(masterless.getAllMessageQueue("T").size() == 8, "route keeps queue once master returns");
+
+    // Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332：消费侧只看读位与
+    // readQueueNums，**不查 brokerDatas、也不要求有 master**。
+    TopicRouteData subscribe;
+    subscribe.queueDatas.push_back(
+        QueueData("broker-a", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
+    subscribe.queueDatas.push_back(QueueData("broker-ro", 3, 1, PermName::PERM_READ, 0));
+    slaveOnly.clear();
+    slaveOnly[1] = "127.0.0.1:10931";  // 只剩从节点
+    subscribe.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-a", slaveOnly));
+    std::vector<MessageQueue> sub = subscribe.getAllSubscribeMessageQueue("T");
+    CHECK(sub.size() == 7, "subscribe keeps masterless broker + read-only topic queues");
+    CHECK(sub[0].brokerName == "broker-a" && sub[3].queueId == 3, "subscribe broker-a 4 queues");
+    CHECK(sub[4].brokerName == "broker-ro" && sub[6].queueId == 2, "subscribe broker-ro 3 queues");
+    // 负控：只写（perm=2）的 queueData 读不出队列，broker-a 不受影响
+    TopicRouteData writeOnly = subscribe;
+    writeOnly.queueDatas[1].perm = PermName::PERM_WRITE;
+    CHECK(writeOnly.getAllSubscribeMessageQueue("T").size() == 4,
+          "subscribe drops write-only queueData");
 }
 
 // ---------------------------------------------------------------- HeartbeatData

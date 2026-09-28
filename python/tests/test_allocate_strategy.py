@@ -274,6 +274,10 @@ def test_lite_rebalance_keeps_current_assignment_when_strategy_raises():
                 msg_queue_list = _queues(4)
             return _Info()
 
+        def get_topic_subscribe_info(self, topic):
+            # rebalance 取的是订阅信息（Java RebalanceImpl.topicSubscribeInfoTable）
+            return _queues(4)
+
         def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
             return ["CID_PREFIX0"]
 
@@ -641,6 +645,10 @@ def test_consistent_hash_drives_rebalance():
             class _Info(object):
                 msg_queue_list = _queues(4)
             return _Info()
+
+        def get_topic_subscribe_info(self, topic):
+            # rebalance 取的是订阅信息（Java RebalanceImpl.topicSubscribeInfoTable）
+            return _queues(4)
 
         def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
             return ["CID_PREFIX0"]

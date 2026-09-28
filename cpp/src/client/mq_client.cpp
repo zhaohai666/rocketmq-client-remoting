@@ -506,6 +506,14 @@ std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const st
     return it->second;
 }
 
+std::vector<MessageQueue> MQClientInstance::getTopicSubscribeInfo(const std::string& topic) {
+    std::shared_ptr<TopicRouteData> route = getTopicRouteData(topic);
+    if (route == nullptr) {
+        return {};
+    }
+    return route->getAllSubscribeMessageQueue(topic);
+}
+
 std::shared_ptr<TopicRouteData> MQClientInstance::getTopicRouteData(const std::string& topic) {
     {
         std::lock_guard<std::recursive_mutex> lk(routeLock_);

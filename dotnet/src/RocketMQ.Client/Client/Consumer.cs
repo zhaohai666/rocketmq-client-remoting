@@ -4935,28 +4935,18 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。消费侧
-    /// 用 isDefault=false，绝不兜底默认 topic。</summary>
+    /// <summary>topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
+    /// 取自**订阅信息**（topicRouteData2TopicSubscribeInfo：读位 + readQueueNums、不筛
+    /// master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩从节点」
+    /// 两种路由上答案不同，消费侧必须用宽的这一份（Java 的 rebalance 队列集从来就是订阅
+    /// 信息，发布信息只服务生产者选队）。</summary>
     private List<MessageQueue> AllQueuesOfTopic(string topic)
     {
-        var outList = new List<MessageQueue>();
-        try
-        {
-            TopicPublishInfo? publish = Client().GetTopicPublishInfo(topic);
-            if (publish is null || !publish.Ok())
-            {
-                return outList;
-            }
-
-            foreach (MessageQueue q in publish.MsgQueueList)
-            {
-                outList.Add(new MessageQueue(topic, q.BrokerName, q.QueueId));
-            }
-        }
-        catch (Exception e)
+        List<MessageQueue> outList = Client().GetTopicSubscribeInfo(topic);
+        if (outList.Count == 0)
         {
             // %RETRY%topic 在首次回投前无路由，属预期路径，debug 即可
-            ClientLog.Debug("rebalance: no route for topic " + topic + ": " + e.Message);
+            ClientLog.Debug("rebalance: no subscribe info for topic " + topic);
         }
 
         outList.Sort(); // MessageQueue IComparable：topic → brokerName → queueId
@@ -5308,15 +5298,10 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 管理 ----------------
     public List<MessageQueue> FetchSubscribeMessageQueues(string topic)
     {
-        MQClientInstance c = Client();
-        TopicPublishInfo publish = c.GetTopicPublishInfo(topic);
-        var outList = new List<MessageQueue>(publish.MsgQueueList.Count);
-        foreach (MessageQueue q in publish.MsgQueueList)
-        {
-            outList.Add(new MessageQueue(q.Topic, q.BrokerName, q.QueueId));
-        }
-
-        return outList;
+        // Java DefaultMQPushConsumerImpl.fetchSubscribeMessageQueues:198 读的是
+        // rebalanceImpl 的订阅信息链（读位、不筛 master），与 rebalance 共用同一份口径，
+        // 不是发布信息。
+        return Client().GetTopicSubscribeInfo(topic);
     }
 
     /// <summary>当前分给本实例的队列 key 列表（真机验证"同组两实例不重不漏"用）。

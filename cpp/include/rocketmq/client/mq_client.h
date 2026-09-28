@@ -178,6 +178,13 @@ public:
     // isDefault 透传给 updateTopicRouteInfoFromNameServer（仅生产者发送路径显式传 true）。
     std::shared_ptr<TopicPublishInfo> getTopicPublishInfo(const std::string& topic,
                                                          bool isDefault = false);
+    // 本实例订阅该 topic 时应看到的全部队列（Java RebalanceImpl.topicSubscribeInfoTable）。
+    // 取值口径是 topicRouteData2TopicSubscribeInfo（**读**位 + readQueueNums、不要求 broker
+    // 有 master），**不是**发布信息 —— 两者在 perm=4 的只读 topic 和「master 掉线只剩从
+    // 节点」两种路由上答案不同，消费侧（rebalance / fetchSubscribeMessageQueues）必须用
+    // 这一份。路由没缓存时补拉一次；仍然没有返回空列表（Java rebalanceByTopic 对空表只
+    // warn，不会因此撤走已有分配）。
+    std::vector<MessageQueue> getTopicSubscribeInfo(const std::string& topic);
     // 登记「在用」topic，交给后台周期任务刷新路由（对应 Java 的订阅/发布 topic 列表）。
     // 没有它，路由变化（新 topic 被 broker 创建、队列扩容）只能等下一次 rebalance
     // 或生产者下次发送才被发现。

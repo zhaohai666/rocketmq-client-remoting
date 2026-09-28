@@ -1691,21 +1691,20 @@ impl DefaultMQPushConsumer {
     // ---------------- 重平衡 ----------------
 
     /// Python `_all_queues_of_topic`（Java `RebalanceImpl.topicSubscribeInfoTable`）。
+    ///
+    /// 取自**订阅信息**（`topicRouteData2TopicSubscribeInfo`：读位 + readQueueNums、
+    /// 不筛 master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩
+    /// 从节点」两种路由上答案不同，消费侧必须用宽的这一份（Java 的 rebalance 队列集
+    /// 从来就是订阅信息，发布信息只服务生产者选队）。
     async fn all_queues_of_topic(&self, topic: &str) -> Vec<MessageQueue> {
         let Ok(client) = require_client(&self.inner) else {
             return Vec::new();
         };
-        match client.get_topic_publish_info(topic, false).await {
-            Ok(publish) => publish
-                .msg_queue_list()
-                .into_iter()
-                .map(|mq| MessageQueue::new(topic, &mq.broker_name, mq.queue_id))
-                .collect(),
-            Err(e) => {
-                rmq_debug!("rebalance: no route for topic {topic}: {e}");
-                Vec::new()
-            }
+        let queues = client.get_topic_subscribe_info(topic).await;
+        if queues.is_empty() {
+            rmq_debug!("rebalance: no subscribe info for topic {topic}");
         }
+        queues
     }
 
     /// Python `_do_rebalance`（Java `RebalanceImpl.rebalanceByTopic`）。
@@ -4713,14 +4712,13 @@ impl DefaultMQPushConsumer {
     }
 
     /// Python `fetch_subscribe_message_queues`。
+    ///
+    /// Java `DefaultMQPushConsumerImpl.fetchSubscribeMessageQueues:198` 读的是
+    /// `rebalanceImpl.getSubscriptionInner()` 那条订阅信息链（读位、不筛 master），
+    /// 不是发布信息；与 rebalance 共用同一份口径。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = require_client(&self.inner)?;
-        let publish = client.get_topic_publish_info(topic, false).await?;
-        Ok(publish
-            .msg_queue_list()
-            .into_iter()
-            .map(|q| MessageQueue::new(&q.topic, &q.broker_name, q.queue_id))
-            .collect())
+        Ok(client.get_topic_subscribe_info(topic).await)
     }
 
     /// Python `msg_acc_cnt(key=None)`：给 key 读单队列，不给则求和。

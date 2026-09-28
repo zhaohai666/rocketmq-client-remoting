@@ -154,6 +154,14 @@ public:
     // topic 会回填进每个 MessageQueue，否则后续按 mq.topic 回查路由会查不到。
     std::vector<MessageQueue> getAllMessageQueue(const std::string& topic) const;
 
+    // 按 queueDatas 组装全部**可读** MessageQueue（对应 Java
+    // MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332）。
+    // 只看读位与 readQueueNums，**不查 brokerDatas、也不要求 broker 有 master** ——
+    // 消费侧（rebalance / fetchSubscribeMessageQueues）必须用这一份，不能拿发布信息代替：
+    // ①perm=4 的只读 topic 在 Java 里可消费，发布信息里却是空表；
+    // ②master 掉线只剩从节点时 Java 的 rebalance 队列集不变（拉取可以走从节点）。
+    std::vector<MessageQueue> getAllSubscribeMessageQueue(const std::string& topic) const;
+
     TopicRouteData cloneTopicRouteData() const { return *this; }
 
     // 路由是否变化：先按 compareTo 排序再比较（与 Java topicRouteDataChanged 一致）

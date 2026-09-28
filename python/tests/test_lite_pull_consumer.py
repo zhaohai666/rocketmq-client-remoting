@@ -77,6 +77,11 @@ class MockClient:
             msg_queue_list = [MessageQueue(topic, b, q) for (b, q) in self._store.keys()]
         return _Info()
 
+    def get_topic_subscribe_info(self, topic):
+        # rebalance / fetch_message_queues 取的是订阅信息（Java RebalanceImpl.topicSubscribeInfoTable）
+        self.events.append("route:%s" % topic)
+        return [MessageQueue(topic, b, q) for (b, q) in self._store.keys()]
+
     def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
         return [self.client_id]
 

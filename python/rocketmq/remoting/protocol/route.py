@@ -6,6 +6,7 @@ import random
 from typing import Dict, List, Optional
 
 from ...common.message import MessageQueue
+from ...common.mix_all import MixAll
 from ...common.sysflag import PermName
 
 
@@ -139,6 +140,15 @@ class TopicRouteData:
 
         topic 用于回填到每个 MessageQueue（Java 用真实 topic，而不是空串），否则后续
         send/pull 用 mq.topic 回查路由时会查不到。
+
+        两条跳过条件逐字对应 Java ``MQClientInstance.topicRouteData2TopicPublishInfo:294-303``：
+        路由里查不到同名 broker，**或者**该 broker 的 brokerAddrs 里没有 ``MASTER_ID``。
+        后者不是冗余判断：从节点自己也会注册进 namesrv，且默认配置下它照样带写位
+        （``RouteInfoManager:344-346`` 只在「prime slave 且 enableActingMaster」时才抹掉
+        WRITE）——master 一旦掉线，路由里同一个 brokerName 就只剩 brokerId=1，写位还在。
+        漏判这条，生产者会挑中这台队列并把消息发到从节点上，而从节点对发送请求是
+        ``rejectRequest``（``SendMessageProcessor:131`` ⇒ SYSTEM_BUSY，还是个可重试码），
+        于是白烧一轮超时；Java 那边这种队列压根进不了发布信息，发送直接当无路由处理。
         """
         mqs: List["MessageQueue"] = []
         for qd in self.queue_datas:
@@ -151,7 +161,25 @@ class TopicRouteData:
                     break
             if broker_data is None:
                 continue
+            if MixAll.MASTER_ID not in broker_data.broker_addrs:
+                continue
             for i in range(qd.write_queue_nums):
+                mqs.append(MessageQueue(topic, qd.broker_name, i))
+        return mqs
+
+    def get_all_subscribe_message_queue(self, topic: str = "") -> List["MessageQueue"]:
+        """按 queueDatas 组装全部**可读** MessageQueue（对应 Java ``MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332``）。
+
+        与 :meth:`get_all_message_queue`（发布侧）有两处刻意的不同，都是 Java 的语义：
+        ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 在 Java 里照样能被消费）；
+        ②**不要求 broker 有 master** —— 主挂掉后从节点仍要能被拉取，客户端侧
+        ``findBrokerAddressInSubscribe`` 正是为此才带从节点回退。只有发布信息需要 master。
+        """
+        mqs: List["MessageQueue"] = []
+        for qd in self.queue_datas:
+            if not PermName.check_perm(qd.perm, PermName.PERM_READ):
+                continue
+            for i in range(qd.read_queue_nums):
                 mqs.append(MessageQueue(topic, qd.broker_name, i))
         return mqs
 

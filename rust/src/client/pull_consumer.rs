@@ -755,15 +755,17 @@ impl DefaultMQPullConsumer {
 
     // ---------------- 拉取 ----------------
 
-    /// Python `fetch_subscribe_message_queues`：按发布路由列队列。
+    /// Python `fetch_subscribe_message_queues`：按**订阅信息**列队列。
     ///
-    /// ⚠ 与 lite 版不同，这里**不拼命名空间**（`consumer.py:2154-2157` 直接把入参
+    /// Java `DefaultMQPullConsumerImpl:142` 与 push 同源，读的是订阅信息
+    /// （读位 + readQueueNums、不筛 master），不是发布信息。
+    ///
+    /// ⚠ 与 lite 版不同，这里**不拼命名空间**（`consumer.py` 直接把入参
     /// topic 传给路由查询），与 Python 保持逐字一致。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = self.require_client()?;
-        let publish = client.get_topic_publish_info(topic, false).await?;
-        // Python `list(publish.msg_queue_list)`：只是复制一份，不改队列身份。
-        Ok(publish.msg_queue_list())
+        // Python `list(publish.msg_queue_list)` 的口径：不改队列身份，直接返回。
+        Ok(client.get_topic_subscribe_info(topic).await)
     }
 
     /// Python `pull(mq, sub_expression="*", offset=0, max_nums=32, timeout=None)`：
@@ -2253,12 +2255,14 @@ impl DefaultLitePullConsumer {
         lock(&self.inner.state).assigned.values().cloned().collect()
     }
 
-    /// Python `fetch_message_queues`：拼命名空间后按发布路由列队列。
+    /// Python `fetch_message_queues`：拼命名空间后按**订阅信息**列队列。
+    ///
+    /// Java `DefaultLitePullConsumerImpl.fetchMessageQueues:1224` →
+    /// `MQAdminImpl.fetchSubscribeMessageQueues:169`（订阅信息：读位、不筛 master）。
     pub async fn fetch_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = Self::require_client(&self.inner)?;
         let topic = with_namespace(&self.config().namespace, topic);
-        let info = client.get_topic_publish_info(&topic, false).await?;
-        Ok(info.msg_queue_list())
+        Ok(client.get_topic_subscribe_info(&topic).await)
     }
 
     /// Python `fetch_subscribe_message_queues`（lite 版 = `fetch_message_queues`）。
@@ -2351,13 +2355,12 @@ impl DefaultLitePullConsumer {
         // topic -> (全部队列, 分到的队列)，用于 MessageQueueListener 回调
         let mut per_topic: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = Vec::new();
         for topic in topics {
-            let mut mq_all: Vec<MessageQueue> = match client.get_topic_publish_info(&topic, false).await {
-                Ok(info) => info.msg_queue_list(),
-                Err(e) => {
-                    rmq_debug!("lite rebalance: no route for topic {topic}: {e}");
-                    Vec::new()
-                }
-            };
+            // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
+            // RebalanceImpl，mqAll 来自订阅信息（读位、不筛 master），不是发布信息。
+            let mut mq_all: Vec<MessageQueue> = client.get_topic_subscribe_info(&topic).await;
+            if mq_all.is_empty() {
+                rmq_debug!("lite rebalance: no subscribe info for topic {topic}");
+            }
             sort_mqs(&mut mq_all);
             let mut cid_all = client
                 .get_consumer_id_list_by_group(&topic, &group, LITE_PULL_RPC_TIMEOUT_MILLIS)

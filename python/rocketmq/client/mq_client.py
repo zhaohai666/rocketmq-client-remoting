@@ -648,6 +648,21 @@ class MQClientInstance:
         with self.topic_route_lock:
             return self.topic_route_table.get(topic)
 
+    def get_topic_subscribe_info(self, topic: str) -> List[MessageQueue]:
+        """本实例订阅该 topic 时应看到的全部队列（Java ``RebalanceImpl.topicSubscribeInfoTable``）。
+
+        取值口径是 ``topicRouteData2TopicSubscribeInfo:318-332``（**读**位 + readQueueNums、
+        不要求 broker 有 master），**不是**发布信息 —— 两者在 perm=4 的只读 topic 和
+        「master 掉线只剩从节点」两种路由上会给出不同答案，消费侧必须用这一份
+        （消费比发布更宽：从节点也能服务拉取）。
+        路由没缓存时补拉一次；仍然没有返回空列表（Java ``rebalanceByTopic`` 对空表只 warn，
+        不会因此撤走已有分配）。
+        """
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            return []
+        return route.get_all_subscribe_message_queue(topic)
+
     @staticmethod
     def find_broker_addr_in_route(route: TopicRouteData, broker_name: str) -> Optional[str]:
         for broker_data in route.get_broker_datas():

@@ -129,3 +129,7 @@ target_link_libraries(rmq_live_reset_offset PRIVATE rocketmq::remoting)
 # 拉模式消费者心跳真机联调：203/38 可见性 + consumeType/consumeFromWhere/订阅表 + 35 立刻注销（不打进 ctest）
 add_executable(rmq_live_pull_heartbeat live_pull_heartbeat.cpp)
 target_link_libraries(rmq_live_pull_heartbeat PRIVATE rocketmq::remoting)
+
+# 发布路由跳过没有 master 的 broker 真机联调：停一次 master，发布队列归零/订阅不变/从节点收消息（不打进 ctest）
+add_executable(rmq_live_publish_route_master live_publish_route_master.cpp)
+target_link_libraries(rmq_live_publish_route_master PRIVATE rocketmq::remoting)

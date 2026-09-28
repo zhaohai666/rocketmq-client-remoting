@@ -185,17 +185,43 @@ std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& 
         if (!PermName::checkPerm(qd.perm, PermName::PERM_WRITE)) {
             continue;
         }
-        bool foundBroker = false;
+        const BrokerData* found = nullptr;
         for (const BrokerData& bd : brokerDatas) {
             if (bd.brokerName == qd.brokerName) {
-                foundBroker = true;
+                found = &bd;
                 break;
             }
         }
-        if (!foundBroker) {
+        if (found == nullptr) {
+            continue;
+        }
+        // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
+        // 从节点自己也会注册进 namesrv，且默认配置下照样带写位（RouteInfoManager:344-346
+        // 只在「prime slave 且 enableActingMaster」时才抹掉 WRITE）—— master 一旦掉线，
+        // 路由里同一个 brokerName 只剩 brokerId=1。漏判这条，生产者会把消息发到从节点上，
+        // 而从节点对发送请求一律 reject（SendMessageProcessor:131 ⇒ SYSTEM_BUSY，可重试码）。
+        if (found->brokerAddrs.find(0) == found->brokerAddrs.end()) {
             continue;
         }
         for (int32_t i = 0; i < qd.writeQueueNums; ++i) {
+            mqs.emplace_back(topic, qd.brokerName, i);
+        }
+    }
+    return mqs;
+}
+
+// 对应 Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332。
+// 与 getAllMessageQueue 是两条口径，不能合成一条：这里只看**读**位与 readQueueNums，
+// 不查 brokerDatas、也不要求 broker 有 master（master 掉线时从节点照样服务拉取；
+// perm=4 的只读 topic 在 Java 里可消费，发布信息里却为空）。
+std::vector<MessageQueue> TopicRouteData::getAllSubscribeMessageQueue(
+    const std::string& topic) const {
+    std::vector<MessageQueue> mqs;
+    for (const QueueData& qd : queueDatas) {
+        if (!PermName::checkPerm(qd.perm, PermName::PERM_READ)) {
+            continue;
+        }
+        for (int32_t i = 0; i < qd.readQueueNums; ++i) {
             mqs.emplace_back(topic, qd.brokerName, i);
         }
     }

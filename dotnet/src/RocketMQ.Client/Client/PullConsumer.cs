@@ -483,14 +483,17 @@ public sealed class DefaultMQPullConsumer
     {
         MQClientInstance c = RequireClient();
         string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
-        TopicPublishInfo publish = c.GetTopicPublishInfo(realTopic);
-        if (!publish.Ok())
+        // Java DefaultMQPullConsumerImpl.fetchSubscribeMessageQueues:142 与 push 同源：读的
+        // 是 rebalanceImpl 的订阅信息（topicRouteData2TopicSubscribeInfo：读位 +
+        // readQueueNums、不筛 master），不是发布信息。
+        TopicRouteData? route = c.GetTopicRouteData(realTopic);
+        if (route is null)
         {
             // 对齐 Java：topic 不存在（拿不到路由）时直接抛，而不是返回空列表。
             throw new MQClientException("the topic[" + topic + "] not exist");
         }
 
-        return publish.MsgQueueList;
+        return route.GetAllSubscribeMessageQueue(realTopic);
     }
 
     // ---------------- 拉取 ----------------

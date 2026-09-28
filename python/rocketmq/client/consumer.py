@@ -1814,14 +1814,18 @@ class DefaultMQPushConsumer:
         return "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
 
     def _all_queues_of_topic(self, topic: str) -> List[MessageQueue]:
-        """topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。"""
+        """topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
+
+        取自**订阅信息**（``topicRouteData2TopicSubscribeInfo``：读位 + readQueueNums、
+        不筛 master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩
+        从节点」两种路由上答案不同，消费侧必须用宽的这一份（Java 的 rebalance 队列集
+        从来就是订阅信息，发布信息只服务生产者选队）。
+        """
         client = self._require_client()
-        try:
-            publish = client.get_topic_publish_info(topic)
-        except MQClientException as e:  # noqa: BLE001
-            logger.debug("rebalance: no route for topic %s: %s", topic, e)
-            return []
-        return [MessageQueue(topic, mq.broker_name, mq.queue_id) for mq in publish.msg_queue_list]
+        queues = client.get_topic_subscribe_info(topic)
+        if not queues:
+            logger.debug("rebalance: no subscribe info for topic %s", topic)
+        return queues
 
     def _assigned_queues(self) -> List[MessageQueue]:
         """当前分给本实例的队列集（_do_rebalance 计算，对应 Java ProcessQueueTable 的键集）。"""
@@ -3275,8 +3279,10 @@ class DefaultMQPushConsumer:
     # ---------------- 管理能力 ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
         client = self._require_client()
-        publish = client.get_topic_publish_info(topic)
-        return [MessageQueue(q.topic, q.broker_name, q.queue_id) for q in publish.msg_queue_list]
+        # Java DefaultMQPushConsumerImpl#fetchSubscribeMessageQueues:198 / DefaultMQPullConsumerImpl:142
+        # 都是读 rebalanceImpl 的 topicSubscribeInfoTable（订阅信息，读位、不筛 master），
+        # 不是发布信息；两处共用同一份口径。
+        return client.get_topic_subscribe_info(topic)
 
     def send_message_back(self, msg: MessageExt, delay_level: int,
                           broker_name: Optional[str] = None) -> None:
@@ -3588,8 +3594,10 @@ class DefaultMQPullConsumer:
     # ---------------- 拉取 ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
         client = self._require_client()
-        publish = client.get_topic_publish_info(topic)
-        return [MessageQueue(q.topic, q.broker_name, q.queue_id) for q in publish.msg_queue_list]
+        # Java DefaultMQPushConsumerImpl#fetchSubscribeMessageQueues:198 / DefaultMQPullConsumerImpl:142
+        # 都是读 rebalanceImpl 的 topicSubscribeInfoTable（订阅信息，读位、不筛 master），
+        # 不是发布信息；两处共用同一份口径。
+        return client.get_topic_subscribe_info(topic)
 
     def pull(self, mq: MessageQueue, sub_expression: str = "*", offset: int = 0,
              max_nums: int = 32, timeout_millis: Optional[int] = None) -> PullResult:
@@ -4231,9 +4239,10 @@ class DefaultLitePullConsumer:
         new_set: Set[MessageQueue] = set()
         for topic in list(self.subscription.keys()):
             try:
-                info = self._mq_client.get_topic_publish_info(topic)
-                mq_all = sorted([MessageQueue(q.topic, q.broker_name, q.queue_id)
-                                 for q in info.msg_queue_list], key=_mq_sort_key)
+                # 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是
+                # 同一个 RebalanceImpl，mqAll 来自订阅信息（读位、不筛 master）。
+                mq_all = sorted(self._mq_client.get_topic_subscribe_info(topic),
+                                key=_mq_sort_key)
             except Exception:
                 mq_all = []
             cid_all = sorted(self._mq_client.get_consumer_id_list_by_group(topic, self.consumer_group) or [])
@@ -4436,8 +4445,9 @@ class DefaultLitePullConsumer:
         return list(self._assigned)
 
     def fetch_message_queues(self, topic: str) -> List[MessageQueue]:
-        info = self._mq_client.get_topic_publish_info(self._with_namespace(topic))
-        return [MessageQueue(q.topic, q.broker_name, q.queue_id) for q in info.msg_queue_list]
+        # Java DefaultLitePullConsumerImpl#fetchMessageQueues:1224 →
+        # MQAdminImpl#fetchSubscribeMessageQueues:169（订阅信息：读位、不筛 master）
+        return self._mq_client.get_topic_subscribe_info(self._with_namespace(topic))
 
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
         return self.fetch_message_queues(topic)

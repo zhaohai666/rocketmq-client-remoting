@@ -2924,19 +2924,16 @@ void DefaultMQPushConsumer::doRebalance() {
 }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::string& topic) {
-    // 对齐 Java RebalanceImpl.topicSubscribeInfoTable：topic 路由里的全部队列。
-    std::vector<MessageQueue> out;
-    if (mqClient_ == nullptr) return out;
-    try {
-        std::shared_ptr<TopicPublishInfo> publish = mqClient_->getTopicPublishInfo(topic);
-        out.reserve(publish->msgQueueList.size());
-        for (const MessageQueue& q : publish->msgQueueList) {
-            out.emplace_back(q.topic, q.brokerName, q.queueId);
-        }
-    } catch (const std::exception& e) {
-        logger_debug("rebalance: no route for topic " + topic + ": " + e.what());
+    // 取自**订阅信息**（topicRouteData2TopicSubscribeInfo：读位 + readQueueNums、不筛
+    // master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩从节点」
+    // 两种路由上答案不同，消费侧必须用宽的这一份（Java 的 rebalance 队列集从来就是订阅
+    // 信息，发布信息只服务生产者选队）。
+    if (mqClient_ == nullptr) return {};
+    std::vector<MessageQueue> queues = mqClient_->getTopicSubscribeInfo(topic);
+    if (queues.empty()) {
+        logger_debug("rebalance: no subscribe info for topic " + topic);
     }
-    return out;
+    return queues;
 }
 
 bool DefaultMQPushConsumer::ownsQueue(const std::string& key, uint64_t token) const {
@@ -3228,14 +3225,10 @@ void DefaultMQPushConsumer::maybeSendHeartbeat() {
 // ---------------------------------------------------------------- 管理
 std::vector<MessageQueue> DefaultMQPushConsumer::fetchSubscribeMessageQueues(
     const std::string& topic) {
+    // Java DefaultMQPushConsumerImpl.fetchSubscribeMessageQueues:198 读的是 rebalanceImpl
+    // 的订阅信息链（读位、不筛 master），与 rebalance 共用同一份口径，不是发布信息。
     MQClientInstance& c = client();
-    std::shared_ptr<TopicPublishInfo> publish = c.getTopicPublishInfo(topic);
-    std::vector<MessageQueue> out;
-    out.reserve(publish->msgQueueList.size());
-    for (const MessageQueue& q : publish->msgQueueList) {
-        out.emplace_back(q.topic, q.brokerName, q.queueId);
-    }
-    return out;
+    return c.getTopicSubscribeInfo(topic);
 }
 
 int32_t DefaultMQPushConsumer::maxReconsumeTimesOrDefault() const {

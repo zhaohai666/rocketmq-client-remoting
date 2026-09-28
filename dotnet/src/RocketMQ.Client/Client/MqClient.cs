@@ -686,6 +686,26 @@ public sealed class MQClientInstance : IDisposable
         throw new MQClientException("Can not find Message Queue for topic: " + topic);
     }
 
+    /// <summary>
+    /// 本实例订阅该 topic 时应看到的全部队列（Java RebalanceImpl.topicSubscribeInfoTable）。
+    ///
+    /// 取值口径是 topicRouteData2TopicSubscribeInfo（**读**位 + readQueueNums、不要求 broker
+    /// 有 master），**不是**发布信息 —— 两者在 perm=4 的只读 topic 和「master 掉线只剩从
+    /// 节点」两种路由上答案不同，消费侧（rebalance / fetchSubscribeMessageQueues）必须用
+    /// 这一份。路由没缓存时补拉一次；仍然没有返回空列表（Java rebalanceByTopic 对空表只
+    /// warn，不会因此撤走已有分配）。
+    /// </summary>
+    public List<MessageQueue> GetTopicSubscribeInfo(string topic)
+    {
+        TopicRouteData? route = GetTopicRouteData(topic);
+        if (route is null)
+        {
+            return new List<MessageQueue>();
+        }
+
+        return route.GetAllSubscribeMessageQueue(topic);
+    }
+
     /// <summary>取缓存路由；未命中会尝试刷新一次，仍没有返回 null。</summary>
     public TopicRouteData? GetTopicRouteData(string topic)
     {

@@ -84,6 +84,72 @@ public class RouteHeartbeatTests
     }
 
     [Fact]
+    public void TopicRouteData_GetAllMessageQueue_SkipsBrokerWithoutMaster()
+    {
+        // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
+        // 从节点也会注册进 namesrv 且默认写位还在，所以这条不能靠 perm 过滤替代。
+        var route = new TopicRouteData
+        {
+            QueueDatas = new List<QueueData>
+            {
+                new("broker-a", 4, 4, 6, 0),   // master 掉线 -> 只剩 brokerId=1
+                new("broker-b", 4, 4, 6, 0),   // 主从都在
+            },
+            BrokerDatas = new List<BrokerData>
+            {
+                new("c", "broker-a", new SortedDictionary<long, string> { [1] = "a:10931" }),
+                new("c", "broker-b", new SortedDictionary<long, string>
+                {
+                    [0] = "b:10911",
+                    [1] = "b:10931",
+                }),
+            },
+        };
+
+        List<MessageQueue> mqs = route.GetAllMessageQueue("T");
+        Assert.Equal(4, mqs.Count);
+        Assert.All(mqs, mq => Assert.Equal("broker-b", mq.BrokerName));
+
+        // 负控：master 放回去，broker-a 的 4 条立刻回来（跳的是「没有 master」而不是名字）
+        route.BrokerDatas[0].BrokerAddrs[0] = "a:10911";
+        Assert.Equal(8, route.GetAllMessageQueue("T").Count);
+    }
+
+    [Fact]
+    public void TopicRouteData_GetAllSubscribeMessageQueue_KeepsMasterlessBroker()
+    {
+        // Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332：消费侧只看读位与
+        // readQueueNums，**不查 brokerDatas、也不要求有 master**。
+        var route = new TopicRouteData
+        {
+            QueueDatas = new List<QueueData>
+            {
+                new("broker-a", 4, 4, 6, 0),   // master 掉线 -> 只剩 brokerId=1
+                new("broker-ro", 3, 1, 4, 0),  // 只读 topic（perm=4）
+            },
+            BrokerDatas = new List<BrokerData>
+            {
+                new("c", "broker-a", new SortedDictionary<long, string> { [1] = "a:10931" }),
+            },
+        };
+
+        // 发布侧：perm=6 但有 master 才进；broker-a 没有 master ⇒ 空
+        Assert.Empty(route.GetAllMessageQueue("T"));
+
+        // 订阅侧：broker-a 的 4 条 + broker-ro 的 3 条（即使 broker-ro 不在 BrokerDatas 里）
+        List<MessageQueue> sub = route.GetAllSubscribeMessageQueue("T");
+        Assert.Equal(7, sub.Count);
+        Assert.Equal("broker-a", sub[0].BrokerName);
+        Assert.Equal(3, sub[3].QueueId);
+        Assert.Equal("broker-ro", sub[4].BrokerName);
+        Assert.Equal(2, sub[6].QueueId);
+
+        // 负控：perm 抹掉读位（2 = 只写）后 broker-ro 消失，broker-a 不受影响。
+        route.QueueDatas[1].Perm = 2;
+        Assert.Equal(4, route.GetAllSubscribeMessageQueue("T").Count);
+    }
+
+    [Fact]
     public void TopicRouteData_EncodeDecode_RoundTrip()
     {
         var route = new TopicRouteData

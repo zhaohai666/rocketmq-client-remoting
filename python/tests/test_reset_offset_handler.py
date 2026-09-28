@@ -61,6 +61,10 @@ class FakeClient:
     def get_topic_publish_info(self, topic):
         return FakePublishInfo([mq for mq in self.mqs if mq.topic == topic])
 
+    def get_topic_subscribe_info(self, topic):
+        # rebalance 取的是订阅信息（Java RebalanceImpl.topicSubscribeInfoTable）
+        return [mq for mq in self.mqs if mq.topic == topic]
+
     def get_consumer_id_list_by_group(self, topic, group):
         return [CLIENT_ID]
 

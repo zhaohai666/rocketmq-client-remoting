@@ -1,9 +1,11 @@
 #!/bin/sh
-# 本地测试集群（RocketMQ 5.5.1）的 broker 开关：真机验证里"broker 重启 / 主备切换"
-# 这一类故障注入要用它，四个语言的 live 用例共用同一份口径，别在各自脚本里散落。
+# 本地测试集群（RocketMQ 5.5.1）的 **master** broker 开关：真机验证里 "broker 重启 /
+# 主备切换 / master 掉线" 这一类故障注入要用它，四个语言的 live 用例共用同一份口径，
+# 别在各自脚本里散落。**只碰 master（-c $BROKER_CONF 的那个进程）**，同机的从节点
+# 不归它管 —— 停 master 后路由里 broker-a 只剩 brokerId=1，正是要验的场景。
 #
-#   sh scripts/rmq_test_broker.sh status   # 10911 上有没有 broker
-#   sh scripts/rmq_test_broker.sh stop     # 优雅停掉，等进程真的消失
+#   sh scripts/rmq_test_broker.sh status   # master 在不在（从节点起了不算 UP）
+#   sh scripts/rmq_test_broker.sh stop     # 优雅停掉（SIGTERM → unregisterBrokerAll），等进程真的消失
 #   sh scripts/rmq_test_broker.sh start    # 后台拉起，等到日志出现 boot success
 #
 # 只碰 /tmp/rmq_rust_live 这套一次性测试 store，不会删数据：start 不清 store，
@@ -20,9 +22,11 @@ BROKER_PORT="${BROKER_PORT:-10911}"
 JAVA_OPT_EXT="${JAVA_OPT_EXT:--Xms4g -Xmx4g -Duser.home=$RMQ_TEST_HOME}"
 
 broker_pid() {
-    # 只认 broker 主类，别把 mqadmin / namesrv 也算进来
-    ps -eo pid=,command= | awk '
-        /org\.apache\.rocketmq\.broker\.BrokerStartup/ && !/awk/ { print $1; exit }'
+    # 只认 **master** 的 java 进程：同机还有从节点（brokerId=1）跑同一个主类，
+    # 用 -c 的配置文件区分；只匹配 java 本体（sh 外壳的 SIGTERM 传不到子进程）。
+    ps -eo pid=,command= | awk -v conf="$BROKER_CONF" '
+        /bin\/java/ && /org\.apache\.rocketmq\.broker\.BrokerStartup/ \
+            && index($0, "-c " conf) { print $1; exit }'
 }
 
 wait_down() {
@@ -47,7 +51,12 @@ case "${1:-status}" in
         fi
         ;;
     stop)
-        (cd "$MQ_HOME" && ROCKETMQ_HOME="$MQ_HOME" sh bin/mqshutdown broker >/dev/null 2>&1) || true
+        # 不用 mqshutdown：它按主类名抓**全部** BrokerStartup 进程，会把从节点一起杀掉
+        # （"主备切换 / master 掉线只剩从节点"这类验证必须只停 master）。SIGTERM 与
+        # mqshutdown 等价：broker 的 shutdown hook 里做 unregisterBrokerAll，名字服务里
+        # brokerId=0 立刻消失、从节点仍注册着 —— 正是要验的那条路由形状。
+        pid="$(broker_pid)"
+        [ -n "$pid" ] && kill -15 "$pid"
         wait_down
         echo "broker DOWN"
         ;;

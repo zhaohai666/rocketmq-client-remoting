@@ -332,20 +332,57 @@ impl TopicRouteData {
     ///
     /// `topic` 必须传真实 topic：send/pull 之后拿 `mq.topic` 回查路由表，
     /// 回填错了会出现「有路由却查不到」。
+    ///
+    /// 两条跳过条件逐字对应 Java `MQClientInstance:294-303`：路由里查不到同名
+    /// broker，**或者**它的 `brokerAddrs` 里没有 `MASTER_ID`。后者不是冗余判断：
+    /// 从节点自己也会注册进 namesrv，且默认配置下照样带写位
+    /// （`RouteInfoManager:344-346` 只在「prime slave 且 enableActingMaster」时才抹掉
+    /// WRITE）——master 一旦掉线，路由里同一个 brokerName 只剩 brokerId=1。漏判这条，
+    /// 生产者会挑中这台队列并把消息发到从节点，而 `SendMessageProcessor.rejectRequest:131`
+    /// 对从节点的发送请求一律拒（SYSTEM_BUSY，可重试码），白烧一轮超时。
     pub fn get_all_message_queue(&self, topic: &str) -> Vec<MessageQueueKey> {
         let mut mqs = Vec::new();
         for qd in &self.queue_datas {
             if !PermName::check_perm(qd.perm, PermName::PERM_WRITE) {
                 continue;
             }
-            if !self
+            let Some(bd) = self
                 .broker_datas
                 .iter()
-                .any(|bd| bd.broker_name == qd.broker_name)
+                .find(|bd| bd.broker_name == qd.broker_name)
+            else {
+                continue;
+            };
+            if !bd
+                .broker_addrs
+                .iter()
+                .any(|(id, _)| *id == MixAll::MASTER_ID as i64)
             {
                 continue;
             }
             for i in 0..qd.write_queue_nums {
+                mqs.push(MessageQueueKey::new(topic, &qd.broker_name, i));
+            }
+        }
+        mqs
+    }
+
+    /// 按 queueDatas 组装全部**可读**队列（对应 Java
+    /// `topicRouteData2TopicSubscribeInfo:318-332`）。
+    ///
+    /// 与 [`Self::get_all_message_queue`] 是两条口径，不能合成一条：这里只看**读**位与
+    /// `read_queue_nums`，**不查 brokerDatas、也不要求 broker 有 master**。
+    /// ①perm=4 的只读 topic 在 Java 里可消费，发布信息里却为空；
+    /// ②master 掉线只剩从节点时 Java 的 rebalance 队列集不变（拉取可以走从节点，
+    /// `findBrokerAddressInSubscribe` 有回退），只有发布侧会因没有 master 而选不出队列。
+    /// 消费侧（rebalance / fetch_subscribe_message_queues）必须用这一份。
+    pub fn get_all_subscribe_message_queue(&self, topic: &str) -> Vec<MessageQueueKey> {
+        let mut mqs = Vec::new();
+        for qd in &self.queue_datas {
+            if !PermName::check_perm(qd.perm, PermName::PERM_READ) {
+                continue;
+            }
+            for i in 0..qd.read_queue_nums {
                 mqs.push(MessageQueueKey::new(topic, &qd.broker_name, i));
             }
         }
@@ -611,6 +648,75 @@ mod tests {
                 MessageQueueKey::new("T", "broker-a", 1),
             ]
         );
+    }
+
+    #[test]
+    fn get_all_message_queue_skips_broker_without_master() {
+        // Java `MQClientInstance:301-303`：brokerAddrs 里没有 MASTER_ID(0) 的 broker，
+        // 它的队列整条不进发布信息（从节点也会注册，默认写位还在，光靠 perm 拦不住）。
+        let ro = TopicRouteData {
+            queue_datas: vec![
+                QueueData::new("broker-a", 4, 4, 6, 0),
+                QueueData::new("broker-b", 4, 4, 6, 0),
+            ],
+            broker_datas: vec![
+                // master 掉线后的形状：同一个 brokerName 只剩 brokerId=1
+                BrokerData::new("c", "broker-a", vec![(1, "slave".into())], ""),
+                BrokerData::new(
+                    "c",
+                    "broker-b",
+                    vec![(0, "master".into()), (1, "slave".into())],
+                    "",
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ro.get_all_message_queue("T"),
+            (0..4)
+                .map(|i| MessageQueueKey::new("T", "broker-b", i))
+                .collect::<Vec<_>>()
+        );
+
+        // 负控：把 master 放回去，broker-a 的 4 条立刻回来 —— 被跳过的是「没有 master」，
+        // 不是 broker-a 这个名字。
+        let mut with_master = ro.clone_topic_route_data();
+        with_master.broker_datas[0].broker_addrs =
+            vec![(0, "master".into()), (1, "slave".into())];
+        assert_eq!(with_master.get_all_message_queue("T").len(), 8);
+    }
+
+    #[test]
+    fn get_all_subscribe_message_queue_keeps_masterless_broker() {
+        // Java `MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332`：
+        // 消费侧只看读位与 readQueueNums，**不查 brokerDatas、也不要求有 master**。
+        let ro = TopicRouteData {
+            queue_datas: vec![
+                QueueData::new("broker-a", 4, 4, 6, 0),
+                // 只读 topic：perm=4（PERM_READ），readQueueNums=3、writeQueueNums=1
+                QueueData::new("broker-ro", 3, 1, 4, 0),
+            ],
+            broker_datas: vec![
+                // master 掉线后的形状：只剩 brokerId=1 —— 订阅信息照样保留它的队列
+                BrokerData::new("c", "broker-a", vec![(1, "slave".into())], ""),
+            ],
+            ..Default::default()
+        };
+        // 发布侧：perm=6 但有 master 才进；broker-a 没有 master ⇒ 空
+        assert!(ro.get_all_message_queue("T").is_empty());
+        // 订阅侧：broker-a 的 4 条 + broker-ro 的 3 条（即使 broker-ro 不在 brokerDatas 里）
+        assert_eq!(
+            ro.get_all_subscribe_message_queue("T"),
+            (0..4)
+                .map(|i| MessageQueueKey::new("T", "broker-a", i))
+                .chain((0..3).map(|i| MessageQueueKey::new("T", "broker-ro", i)))
+                .collect::<Vec<_>>()
+        );
+
+        // 负控：perm 抹掉读位（2 = 只写）后 broker-ro 消失，broker-a 不受影响。
+        let mut write_only = ro.clone_topic_route_data();
+        write_only.queue_datas[1].perm = 2;
+        assert_eq!(write_only.get_all_subscribe_message_queue("T").len(), 4);
     }
 
     #[test]

@@ -497,13 +497,10 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
 void DefaultLitePullConsumer::rebalance() {
     std::set<MessageQueue> newSet;
     for (const auto& kv : subscription_) {
-        std::vector<MessageQueue> mqAll;
-        try {
-            std::shared_ptr<TopicPublishInfo> info = mqClient_->getTopicPublishInfo(kv.first);
-            mqAll = info->msgQueueList;
-        } catch (...) {
-            mqAll.clear();
-        }
+        // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
+        // RebalanceImpl，mqAll 来自订阅信息（读位 + readQueueNums、不筛 master），
+        // 不是发布信息。
+        std::vector<MessageQueue> mqAll = mqClient_->getTopicSubscribeInfo(kv.first);
         // Java RebalanceImpl.rebalanceByTopic 在分配前 Collections.sort(mqAll) + sort(cidAll)：
         // 顺序不一致会让同组不同实例算出冲突的分配（同一队列被两个实例同时消费）。
         std::sort(mqAll.begin(), mqAll.end());
@@ -589,14 +586,12 @@ void DefaultLitePullConsumer::rebalance() {
     }
 }
 
-// 收集订阅的全部队列（listener 回调用）
+// 收集订阅的全部队列（listener 回调用）——与 rebalance 同口径：订阅信息。
 std::vector<MessageQueue> DefaultLitePullConsumer::mqAllOfSubscription() const {
     std::vector<MessageQueue> all;
     for (const auto& kv : subscription_) {
-        try {
-            std::shared_ptr<TopicPublishInfo> info = mqClient_->getTopicPublishInfo(kv.first);
-            for (const MessageQueue& mq : info->msgQueueList) all.push_back(mq);
-        } catch (...) {
+        for (const MessageQueue& mq : mqClient_->getTopicSubscribeInfo(kv.first)) {
+            all.push_back(mq);
         }
     }
     return all;
@@ -844,8 +839,9 @@ std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std:
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    std::shared_ptr<TopicPublishInfo> info = mqClient_->getTopicPublishInfo(withNamespace(topic));
-    return info->msgQueueList;
+    // Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
+    // MQAdminImpl.fetchSubscribeMessageQueues:169（订阅信息：读位、不筛 master）。
+    return mqClient_->getTopicSubscribeInfo(withNamespace(topic));
 }
 
 std::vector<MessageQueue> DefaultLitePullConsumer::assignment() {

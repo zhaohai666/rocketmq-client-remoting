@@ -1542,6 +1542,25 @@ impl MQClientInstance {
         self.route_of(topic)
     }
 
+    /// 本实例订阅该 topic 时应看到的全部队列（Java `RebalanceImpl.topicSubscribeInfoTable`）。
+    ///
+    /// 取值口径是 `topicRouteData2TopicSubscribeInfo:318-332`（**读**位 + `readQueueNums`、
+    /// 不要求 broker 有 master），**不是**发布信息 —— 两者在 perm=4 的只读 topic 和
+    /// 「master 掉线只剩从节点」两种路由上会给出不同答案，消费侧必须用这一份
+    /// （消费比发布更宽：从节点也能服务拉取）。
+    /// 路由没缓存时补拉一次；仍然没有返回空列表（Java `rebalanceByTopic` 对空表只 warn，
+    /// 不会因此撤走已有分配）。
+    pub async fn get_topic_subscribe_info(&self, topic: &str) -> Vec<MessageQueue> {
+        let Some(route) = self.get_topic_route_data(topic).await else {
+            return Vec::new();
+        };
+        route
+            .get_all_subscribe_message_queue(topic)
+            .into_iter()
+            .map(|q| MessageQueue::new(&q.topic, &q.broker_name, q.queue_id))
+            .collect()
+    }
+
     /// 只读缓存路由（不触发 RPC）；Python 直接读 `self.topic_route_table`。
     pub(crate) fn route_of(&self, topic: &str) -> Option<TopicRouteData> {
         self.inner

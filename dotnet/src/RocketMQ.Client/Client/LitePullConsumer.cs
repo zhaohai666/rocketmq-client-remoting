@@ -730,16 +730,10 @@ public sealed class DefaultLitePullConsumer
 
         foreach (string topic in topics)
         {
-            List<MessageQueue> mqAll;
-            try
-            {
-                TopicPublishInfo info = RequireClient().GetTopicPublishInfo(topic);
-                mqAll = info.MsgQueueList;
-            }
-            catch
-            {
-                mqAll = new List<MessageQueue>();
-            }
+            // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
+            // RebalanceImpl，mqAll 来自订阅信息（读位 + readQueueNums、不筛 master），
+            // 不是发布信息。
+            List<MessageQueue> mqAll = RequireClient().GetTopicSubscribeInfo(topic);
 
             List<string>? cidAll = RequireClient().GetConsumerIdListByGroup(topic, _consumerGroup);
             if (cidAll is null) cidAll = new List<string>();
@@ -854,14 +848,8 @@ public sealed class DefaultLitePullConsumer
 
         foreach (string topic in topics)
         {
-            try
-            {
-                TopicPublishInfo info = RequireClient().GetTopicPublishInfo(topic);
-                all.AddRange(info.MsgQueueList);
-            }
-            catch
-            {
-            }
+            // 与 rebalance 同口径：订阅信息。
+            all.AddRange(RequireClient().GetTopicSubscribeInfo(topic));
         }
 
         return all;
@@ -1132,8 +1120,10 @@ public sealed class DefaultLitePullConsumer
         RequireClient().SearchOffsetByTimestamp(mq, timestamp);
 
     // ---------------- 队列查询 / 控制 ----------------
+    /// <summary>Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
+    /// MQAdminImpl.fetchSubscribeMessageQueues:169（订阅信息：读位、不筛 master）。</summary>
     public List<MessageQueue> FetchMessageQueues(string topic) =>
-        RequireClient().GetTopicPublishInfo(WithNamespace(topic)).MsgQueueList;
+        RequireClient().GetTopicSubscribeInfo(WithNamespace(topic));
 
     public List<MessageQueue> Assignment()
     {

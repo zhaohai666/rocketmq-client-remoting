@@ -179,12 +179,15 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchSubscribeMessageQueues(
         throw MQClientException("consumer not started, call start() first");
     }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
-    std::shared_ptr<TopicPublishInfo> publish = mqClient_->getTopicPublishInfo(realTopic);
-    if (publish == nullptr || !publish->ok()) {
+    // Java DefaultMQPullConsumerImpl.fetchSubscribeMessageQueues:142 与 push 同源：读的是
+    // rebalanceImpl 的订阅信息（topicRouteData2TopicSubscribeInfo：读位 + readQueueNums、
+    // 不筛 master），不是发布信息。
+    std::shared_ptr<TopicRouteData> route = mqClient_->getTopicRouteData(realTopic);
+    if (route == nullptr) {
         // 对齐 Java：topic 不存在（拿不到路由）时直接抛，而不是返回空列表。
         throw MQClientException("the topic[" + topic + "] not exist");
     }
-    return publish->msgQueueList;
+    return route->getAllSubscribeMessageQueue(realTopic);
 }
 
 // ---------------------------------------------------------------- 拉取
