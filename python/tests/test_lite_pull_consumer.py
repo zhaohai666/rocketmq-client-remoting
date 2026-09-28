@@ -20,7 +20,7 @@ from rocketmq.client.consumer import DefaultLitePullConsumer
 from rocketmq.client.consumer_result import PullResult, PullStatus
 from rocketmq.common.message import MessageExt, MessageQueue
 from rocketmq.client.exception import MQClientException
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType
 
 
 def _make_msg(topic: str, broker: str, qid: int, offset: int, body: str) -> MessageExt:
@@ -183,6 +183,16 @@ class TestLifecycle:
             assert c._started is True
         finally:
             c.shutdown()
+
+    def test_heartbeat_declares_consume_actively_like_java(self):
+        # Java DefaultLitePullConsumerImpl.consumeType():1111-1112 返回 CONSUME_ACTIVELY
+        # —— 轻量拉取消费者同样是「拉模式」，与推送消费者的 PASSIVELY 不是一个口径。
+        # broker 按它分流：rejectPullConsumerEnabled 的 broker 跳过 ACTIVELY 心跳并把
+        # 未注册的拉取组拒掉（ClientManageProcessor:87-92、PullMessageProcessor:493-505）；
+        # :516-521 的冷数据流控也按 PASSIVELY/ACTIVELY 走两条不同分支。
+        c = _Lite("LitePG_UT", _store=STORE)
+        cd = list(c._build_heartbeat().consumer_data_set)[0]
+        assert cd.consume_type == ConsumeType.CONSUME_ACTIVELY
 
     def test_start_pulls_route_before_the_first_heartbeat(self):
         # 心跳只发给「路由表里已知的 broker」，所以刷路由必须排在那次同步心跳之前；

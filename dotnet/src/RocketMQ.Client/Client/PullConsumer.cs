@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading;
 
 using RocketMQ.Common;
 using RocketMQ.Remoting;
@@ -48,6 +49,14 @@ public sealed class DefaultMQPullConsumer
     private bool _enableStreamRequestType = true;
     // Java ClientConfig#pollNameServerInterval 的默认值（:58）
     private int _pollNameServerIntervalMillis = 30000;
+    // 心跳（对齐 Java ClientConfig:59 的 heartbeatBrokerInterval，默认 30000ms）。
+    // Java 侧心跳由实例级周期任务发出（DefaultMQPullConsumerImpl:746 把本组注册进实例的
+    // consumerTable），本端口没有实例级心跳，改由消费者自带线程发（与 push / lite 同款）。
+    private bool _heartbeatEnabled = true;
+    private int _heartbeatBrokerIntervalMillis = 30000;
+    private long _heartbeatCount;
+    private volatile bool _heartbeatStop;
+    private Thread? _heartbeatThread;
     private readonly SortedSet<string> _registerTopics = new(StringComparer.Ordinal);
     private readonly Dictionary<string, IMessageQueueListener> _messageQueueListeners =
         new(StringComparer.Ordinal);
@@ -164,6 +173,23 @@ public sealed class DefaultMQPullConsumer
         set => _pollNameServerIntervalMillis = value;
     }
 
+    /// <summary>是否周期性发心跳（对齐 push 消费者的开关；启动时那一轮不受影响）。</summary>
+    public bool HeartbeatEnabled
+    {
+        get => _heartbeatEnabled;
+        set => _heartbeatEnabled = value;
+    }
+
+    /// <summary>心跳周期，对应 Java <c>ClientConfig#heartbeatBrokerInterval</c>（:59，默认 30000ms）。</summary>
+    public int HeartbeatBrokerIntervalMillis
+    {
+        get => _heartbeatBrokerIntervalMillis;
+        set => _heartbeatBrokerIntervalMillis = value;
+    }
+
+    /// <summary>心跳成功轮数（真机验证用；对应 Python <c>heartbeat_count()</c>）。</summary>
+    public long HeartbeatCount => Interlocked.Read(ref _heartbeatCount);
+
     // ---------------- ACL 鉴权 ----------------
     /// <summary>必须在 Start() 之前调用：钩子在 Start() 里绑定到 MqClient。</summary>
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
@@ -242,12 +268,21 @@ public sealed class DefaultMQPullConsumer
             }
             _mqClient.Start();
             // 拉模式也要登记 topic，路由才会被周期刷新（对齐 Java registerTopicInUse）。
-            foreach (string t in _registerTopics)
-            {
-                _mqClient.RegisterTopicInUse(NamespaceUtil.WrapNamespace(_namespace, t));
-            }
-
+            // 心跳前的刷路由走同一个入口：brokerAddrTable 空着时心跳没有收件人。
+            RefreshRouteForHeartbeat();
             _started = true;
+            // 同步发一轮让 broker 立刻认识本组，然后交给常驻循环。顺序对齐 lite 拉取消费者
+            // Start（同一份理由），也贴合 Java 的 registerConsumer:746 → mQClientFactory.start():755
+            // （实例级心跳任务首个周期在 1s 内发出）。
+            try
+            {
+                SendHeartbeatToAllBroker();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("initial heartbeat failed: " + e.Message);
+            }
+            StartHeartbeatLoop();
         }
     }
 
@@ -261,8 +296,184 @@ public sealed class DefaultMQPullConsumer
             }
 
             _started = false;
-            _mqClient?.Shutdown();
-            _mqClient = null;
+            _heartbeatStop = true;
+            if (_heartbeatThread is { IsAlive: true })
+            {
+                _heartbeatThread.Join(2000);
+            }
+            // 优雅注销（对齐 Java DefaultMQPullConsumerImpl.shutdown:689-692：
+            // unregisterConsumer → mQClientFactory.shutdown）：立刻从各 broker 的
+            // ConsumerManager 摘除本组，不必等心跳超时（默认 ~120s）。本端口没有 Java 的
+            // 本地位点表，所以 persistConsumerOffset() 那一步无对应物（位点由调用方
+            // UpdateConsumeOffset 直接写给 broker）。
+            if (_mqClient is not null)
+            {
+                try
+                {
+                    _mqClient.UnregisterClientAllBrokers(_clientId, string.Empty, _consumerGroup);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("unregister on shutdown failed: " + e.Message);
+                }
+                _mqClient.Shutdown();
+                _mqClient = null;
+            }
+        }
+    }
+
+    // ---------------- 心跳（把消费组注册给 broker） ----------------
+    /// <summary>
+    /// 为什么拉模式也必须心跳：broker 的 <c>ConsumerManager.consumerTable</c> 是按台的，
+    /// 只有心跳（或带订阅标志的拉取）才会建表。没有心跳时 203 consumerConnection /
+    /// 38 GET_CONSUMER_LIST_BY_GROUP 都看不到本组，isRejectPullConsumerEnabled=true 的
+    /// broker 会给本组每次拉取都回 "the pull consumer is rejected by server"
+    /// （PullMessageProcessor:493-505）。而 ClientManageProcessor:87-92 **跳过** ACTIVELY
+    /// 类型心跳的订阅注册 —— 拉模式靠自带订阅标志的拉取走补偿分支（:397-412），
+    /// 所以缺心跳的失效是静默的：拉取照样成功，只是 broker 侧完全不知道本组存在。
+    /// </summary>
+    private void RefreshRouteForHeartbeat()
+    {
+        if (_mqClient is null)
+        {
+            return;
+        }
+
+        // Java 侧这条链路是间接的：DefaultMQPullConsumerImpl.subscriptions():357-385
+        // 返回 registerTopics 构出的订阅集，实例的 updateTopicRouteInfoFromNameServer
+        // 周期任务据此刷路由 → brokerAddrTable 有地址 → 心跳发得出去。本端口没有实例级
+        // 路由任务，所以显式刷一遍并按 registerTopics 登记「在用」。
+        foreach (string t in _registerTopics)
+        {
+            string real = NamespaceUtil.WrapNamespace(_namespace, t);
+            _mqClient.RegisterTopicInUse(real);
+            try
+            {
+                _mqClient.GetTopicPublishInfo(real);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("refresh route for " + real + " failed: " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Java <c>MQClientInstance#prepareHeartbeatData:1031-1045</c> 为拉模式消费者组出来的
+    /// 那一份：consumeType() 恒为 CONSUME_ACTIVELY（DefaultMQPullConsumerImpl:348）、
+    /// consumeFromWhere() 恒为 CONSUME_FROM_LAST_OFFSET（:353）。订阅集取
+    /// subscriptions():357-385：逐条 BuildSubscriptionData(topic, SUB_ALL) 并显式把
+    /// SubVersion 置 0（Java setSubVersion(0L)）—— 带默认的时间戳会让 broker 每轮心跳
+    /// 都认为订阅变了。⚠ 本端口没有 Java 的 registerSubscriptions 入口，订阅集只从
+    /// RegisterTopics 来。
+    /// </summary>
+    private HeartbeatData BuildHeartbeat()
+    {
+        var hb = new HeartbeatData(_clientId);
+        var cd = new ConsumerData(_consumerGroup, ConsumeType.ConsumeActively, _messageModel,
+            ConsumeFromWhere.ConsumeFromLastOffset)
+        {
+            // Java MQClientInstance:1039：consumerData.setUnitMode(tc.isUnitMode())，
+            // broker 据此给 %RETRY%group 打 UNIT_SUB(0x2)（ClientManageProcessor:113-118）。
+            UnitMode = _unitMode,
+        };
+        foreach (string t in _registerTopics)
+        {
+            SubscriptionData sub = FilterAPI.BuildSubscriptionData(t, "*");
+            sub.SubVersion = 0;
+            cd.AddSubscriptionData(sub);
+        }
+
+        hb.AddConsumerData(cd);
+        return hb;
+    }
+
+    /// <summary>
+    /// 向所有已知 broker（含从节点）发一次本组心跳，返回成功台数。收件人取
+    /// <c>GetAllBrokerAddrs</c>：Java sendHeartbeatToAllBroker:732-750 只对 consumerEmpty
+    /// 跳从节点，消费者心跳必带 ConsumerData，故从节点不跳（理由同 push 消费者同名方法）。
+    /// </summary>
+    public int SendHeartbeatToAllBroker()
+    {
+        if (_mqClient is null)
+        {
+            return 0;
+        }
+
+        List<string> addrs;
+        try
+        {
+            addrs = _mqClient.GetAllBrokerAddrs();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("heartbeat: gather brokers failed: " + e.Message);
+            return 0;
+        }
+
+        if (addrs.Count == 0)
+        {
+            return 0;
+        }
+
+        HeartbeatData hb = BuildHeartbeat();
+        int ok = 0;
+        foreach (string addr in addrs)
+        {
+            try
+            {
+                _mqClient.SendHeartbeat(addr, hb, 5000);
+                ++ok;
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("heartbeat to " + addr + " failed: " + e.Message);
+            }
+        }
+
+        if (ok > 0)
+        {
+            Interlocked.Increment(ref _heartbeatCount);
+        }
+
+        return ok;
+    }
+
+    private void StartHeartbeatLoop()
+    {
+        _heartbeatThread = new Thread(HeartbeatLoop)
+        {
+            IsBackground = true,
+            Name = "rmq-pull-hb-" + _consumerGroup,
+        };
+        _heartbeatThread.Start();
+    }
+
+    private void HeartbeatLoop()
+    {
+        while (!_heartbeatStop)
+        {
+            // 停机时由 Shutdown() 置位，最多等一个周期（分片睡，别一次睡满 30s）
+            for (int slept = 0; slept < _heartbeatBrokerIntervalMillis && !_heartbeatStop; slept += 100)
+            {
+                Thread.Sleep(Math.Min(100, _heartbeatBrokerIntervalMillis - slept));
+            }
+
+            if (_heartbeatStop || !_heartbeatEnabled)
+            {
+                continue;
+            }
+
+            // 常驻循环的边界：这里逃出的异常会杀掉心跳线程（后续心跳全没了），必须接住；
+            // 逐台失败已在 SendHeartbeatToAllBroker 内部处理。
+            try
+            {
+                SendHeartbeatToAllBroker();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("heartbeat loop error: " + e.Message);
+            }
         }
     }
 

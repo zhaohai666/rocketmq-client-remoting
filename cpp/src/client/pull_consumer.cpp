@@ -1,5 +1,6 @@
 #include "rocketmq/client/pull_consumer.h"
 
+#include <chrono>
 #include <exception>
 #include <utility>
 
@@ -135,16 +136,37 @@ void DefaultMQPullConsumer::start() {
     }
     mqClient_->start();
     // 拉模式也要登记 topic，路由才会被周期刷新（对齐 Java registerTopicInUse）。
-    for (const std::string& t : registerTopics_) {
-        mqClient_->registerTopicInUse(NamespaceUtil::wrapNamespace(namespace_, t));
-    }
+    // 心跳前的刷路由走同一个入口：`brokerAddrTable` 空着时心跳没有收件人。
+    refreshRouteForHeartbeat();
     started_ = true;
+    // 同步发一轮让 broker 立刻认识本组，然后交给常驻循环。顺序对齐 lite 拉取消费者
+    // start（同一份理由），也贴合 Java 的 registerConsumer:746 → mQClientFactory.start():755
+    // （实例级心跳任务首个周期在 1s 内发出）。
+    try {
+        sendHeartbeatToAllBroker();
+    } catch (const std::exception& e) {
+        logger_debug(std::string("initial heartbeat failed: ") + e.what());
+    }
+    startHeartbeatLoop();
 }
 
 void DefaultMQPullConsumer::shutdown() {
     if (!started_) return;
     started_ = false;
+    heartbeatStop_.store(true);
+    heartbeatCv_.notify_all();
+    if (heartbeatThread_.joinable()) heartbeatThread_.join();
     if (mqClient_ != nullptr) {
+        // 优雅注销（对齐 Java DefaultMQPullConsumerImpl.shutdown:689-692：
+        // unregisterConsumer → mQClientFactory.shutdown）：立刻从各 broker 的
+        // ConsumerManager 摘除本组，不必等心跳超时（默认 ~120s）。本端口没有 Java 的
+        // 本地位点表，所以 `persistConsumerOffset()` 那一步无对应物（位点由调用方
+        // updateConsumeOffset 直接写给 broker）。
+        try {
+            mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
+        } catch (const std::exception& e) {
+            logger_debug(std::string("unregister on shutdown failed: ") + e.what());
+        }
         mqClient_->shutdown();
         mqClient_.reset();
     }
@@ -340,6 +362,124 @@ void DefaultMQPullConsumer::createTopic(const std::string& key, const std::strin
     (void)key;
     const std::string real = NamespaceUtil::wrapNamespace(namespace_, newTopic);
     mqClient_->createTopicInRoute(real, queueNum, queueNum, /*perm=*/6);
+}
+
+// ---------------------------------------------------------------- 心跳
+// 为什么拉模式也必须心跳：broker 的 `ConsumerManager.consumerTable` 是**按台**的，
+// 只有心跳（或带订阅标志的拉取）才会建表。没有心跳时：
+//   1. `consumerConnection`/`mqadmin consumerConnection`（`AdminBrokerProcessor:1971`）
+//      看不到本组，`GET_CONSUMER_LIST_BY_GROUP(38)` 也是空的；
+//   2. `isRejectPullConsumerEnabled=true` 的 broker 会给本组每次拉取都回
+//      `the pull consumer is rejected by server`（`PullMessageProcessor:493-505`）。
+// 而 `ClientManageProcessor:87-92` **跳过** ACTIVELY 类型心跳的订阅注册 ——
+// 拉模式靠自带订阅标志的拉取走补偿分支（`PullMessageProcessor:397-412`），所以
+// 缺心跳的失效是静默的：拉取照样成功，只是 broker 侧完全不知道本组存在。
+void DefaultMQPullConsumer::refreshRouteForHeartbeat() {
+    if (mqClient_ == nullptr) return;
+    // Java 侧这条链路是间接的：`DefaultMQPullConsumerImpl.subscriptions():357-385`
+    // 返回 registerTopics 构出的订阅集，实例的 `updateTopicRouteInfoFromNameServer`
+    // 周期任务据此刷路由 → `brokerAddrTable` 有地址 → 心跳发得出去。本端口没有实例级
+    // 路由任务（心跳循环在消费者内，同 push / lite），所以显式刷一遍并按 registerTopics
+    // 登记「在用」，交给 MQClientInstance 的后台刷新任务保持新鲜。
+    for (const std::string& t : registerTopics_) {
+        const std::string real = NamespaceUtil::wrapNamespace(namespace_, t);
+        mqClient_->registerTopicInUse(real);
+        try {
+            mqClient_->getTopicPublishInfo(real);
+        } catch (const std::exception& e) {
+            logger_debug("refresh route for " + real + " failed: " + e.what());
+        }
+    }
+}
+
+// Java `MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式消费者组出来的那一份：
+// `consumeType()` 恒为 CONSUME_ACTIVELY（`DefaultMQPullConsumerImpl:348`）、
+// `consumeFromWhere()` 恒为 CONSUME_FROM_LAST_OFFSET（:353）—— 与 push 消费者的
+// PASSIVELY 是两个口径，broker 侧两项都不是摆设（见本节开头那段）。
+// 订阅集取 `subscriptions():357-385`：逐条 `buildSubscriptionData(topic, "*")` 并显式
+// `setSubVersion(0L)`（Java 源码如此）—— 拉模式没有"订阅版本"语义，带上 SubscriptionData
+// 构造函数默认的当前时间戳会让 broker 每次心跳都认为订阅变了。
+// ⚠ 本端口没有 Java 的 `registerSubscriptions` 入口，订阅集只从 registerTopics 来。
+HeartbeatData DefaultMQPullConsumer::buildHeartbeat() const {
+    HeartbeatData hb(clientId_);
+    ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_ACTIVELY, messageModel_,
+                    ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+    // Java `MQClientInstance:1039` 心跳里带 consumerData.setUnitMode(tc.isUnitMode())：
+    // broker 据此决定 %RETRY% topic 建出来带不带 UNIT_SUB 位。
+    cd.unitMode = unitMode_;
+    for (const std::string& t : registerTopics_) {
+        // Java 是 `FilterAPI.buildSubscriptionData(t, SubscriptionData.SUB_ALL)`（即 "*"）
+        SubscriptionData sub = FilterAPI::buildSubscriptionData(t, "*");
+        sub.subVersion = 0;
+        cd.addSubscriptionData(sub);
+    }
+    hb.addConsumerData(cd);
+    return hb;
+}
+
+int32_t DefaultMQPullConsumer::sendHeartbeatToAllBroker() {
+    if (mqClient_ == nullptr) {
+        return 0;
+    }
+    std::vector<std::string> addrs;
+    try {
+        // 每台都发（主 + 从）：Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750
+        // 遍历 `brokerAddrTable` 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID`
+        // 才跳过；消费者心跳必带 ConsumerData，故从节点不跳。broker 的 ConsumerManager
+        // 每台各自一份，从节点收不到心跳，指向自己的拉取就要走没有订阅表的补偿分支。
+        addrs = mqClient_->getAllBrokerAddrs();
+    } catch (const std::exception& e) {
+        logger_warn("heartbeat: gather brokers failed: " + std::string(e.what()));
+        return 0;
+    }
+    if (addrs.empty()) {
+        return 0;
+    }
+    const HeartbeatData hb = buildHeartbeat();
+    int32_t okCount = 0;
+    for (const std::string& addr : addrs) {
+        try {
+            mqClient_->sendHeartbeat(addr, hb, 5000);
+            ++okCount;
+        } catch (const std::exception& e) {
+            logger_warn("heartbeat to " + addr + " failed: " + e.what());
+        }
+    }
+    if (okCount > 0) {
+        heartbeatCount_.fetch_add(1);
+    }
+    return okCount;
+}
+
+void DefaultMQPullConsumer::startHeartbeatLoop() {
+    // std::thread 一构造就跑：先备好停机标志位（构造前已置 false），线程起来即可用。
+    heartbeatThread_ = std::thread([this]() {
+        setThreadName("PullConsumerHeartbeatThread");
+        heartbeatLoop();
+    });
+}
+
+void DefaultMQPullConsumer::heartbeatLoop() {
+    while (!heartbeatStop_.load()) {
+        {
+            std::unique_lock<std::mutex> lk(heartbeatLock_);
+            // 停机时由 shutdown() 置位并 notify，最多等一个周期就醒。
+            if (heartbeatCv_.wait_for(lk, std::chrono::milliseconds(heartbeatBrokerIntervalMillis_),
+                                      [this] { return heartbeatStop_.load(); })) {
+                break;
+            }
+        }
+        if (!heartbeatEnabled_) {
+            continue;
+        }
+        // 常驻循环的边界：线程里逃出异常 = std::terminate（整个进程陪葬）。心跳失败
+        // 已在 sendHeartbeatToAllBroker 内部逐台接住，这里再兜一层（比如拼心跳时的异常）。
+        try {
+            sendHeartbeatToAllBroker();
+        } catch (const std::exception& e) {
+            logger_warn(std::string("heartbeat loop error: ") + e.what());
+        }
+    }
 }
 
 }  // namespace rocketmq

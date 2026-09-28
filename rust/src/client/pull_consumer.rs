@@ -33,11 +33,16 @@
 //!    都只跑过滤钩子（`consumer.py:2095-2106` 的注释把这件事说成 Java 行为，其实
 //!    不成立）。差别只在 broker 侧 tag **哈希**碰撞时才会显现（碰撞消息 Java 丢、
 //!    本版留），这里保持与四门语言一致的口径，不改行为、只在此处记账。
-//! 2. **不做 Java 的 `subscriptionAutomatically` / 消费者注册**。Java 的拉取消费者
-//!    会 `registerConsumer` 进 `MQClientInstance` 并发心跳（
-//!    `DefaultMQPullConsumerImpl:301`、`:366`、`:821`），Python 版只是 RPC 门面，
-//!    因此 broker 上不会出现该消费组的实例 —— 拉模式不依赖 broker 侧注册，语义等价。
-//!    [`DefaultMQPullConsumer::register_topics`] 因此只是登记信息（Java 拿它算心跳订阅集）。
+//! 2. **不做 Java 的 `subscriptionAutomatically`**。Java 的拉取消费者会
+//!    `registerConsumer` 进 `MQClientInstance`（`DefaultMQPullConsumerImpl:746`），
+//!    由实例的心跳周期任务发出消费组心跳；本移植的实例心跳任务只遍历
+//!    `consumer_table`（推送消费者专属，拉模式消费者接不了 broker 的 220/221/307/309
+//!    反向请求），所以**改由消费者自己起心跳循环**（与 Python/C++/dotnet 四版同构，
+//!    #98 补的缺口）：`start()` 刷一遍 registerTopics 的路由，
+//!    同步发一轮 `consumeType=CONSUME_ACTIVELY` 的 ConsumerData，之后按
+//!    `heartbeat_broker_interval_millis` 周期重发；`shutdown()` 发 35 注销。
+//!    [`DefaultMQPullConsumer::register_topics`] 就是这份心跳的订阅集来源
+//!    （Java `subscriptions():357-385`）。
 //! 3. **`message_queue_lists` 字段不移植**：Python/cpp/dotnet 里都是纯声明、零读写的
 //!    死字段（Java 也只有配合 `AllocateMessageQueueByConfig` 才用），不搬进 Rust。
 //! 4. **消息回投失败会抛**：Java `DefaultMQPullConsumerImpl:666` 在回投失败时吞掉异常、
@@ -51,7 +56,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
@@ -75,7 +80,8 @@ use crate::common::sysflag::PullSysFlag;
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::heartbeat::{
-    ConsumeFromWhere, ConsumeType, FilterAPI, HeartbeatData, MessageModel, SubscriptionData,
+    ConsumeFromWhere, ConsumeType, ConsumerData, FilterAPI, HeartbeatData, MessageModel,
+    SubscriptionData,
 };
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::rpchook::RPCHook;
@@ -104,6 +110,13 @@ const LITE_REBALANCE_INTERVAL_MILLIS: i64 = 1_000;
 pub const MAX_POLL_BATCH_SIZE: usize = 1024;
 /// Python lite 心跳的 RPC 超时同上，此处仅为可读性命名。
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
+
+/// Python 经典拉模式消费者的心跳循环间隔（`consumer.heartbeat_interval_millis`，
+/// `consumer.py:870`，默认 30000ms；与 Java 实例级 `sendHeartbeatToAllBrokerWithLock`
+/// 的 30s 同量级）。
+pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
+/// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms、C++/dotnet 同口径）。
+const PULL_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
 
 /// 取锁（Python 的 `with self._lock`）；中毒时照用，理由同 `consumer::lock`。
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -188,6 +201,11 @@ pub struct PullConsumerConfig {
     pub consumer_pull_timeout_millis: i64,
     /// Python `consumer_timeout_millis_when_suspend` = 30000：长轮询请求超时。
     pub consumer_timeout_millis_when_suspend: i64,
+    /// Python `heartbeat_enabled`（`consumer.py:869`，默认 `True`）：置 false 后
+    /// start 的同步那轮与后台循环都不发心跳（C++/dotnet 同名开关）。
+    pub heartbeat_enabled: bool,
+    /// Python `heartbeat_interval_millis`（`consumer.py:870`，默认 30000ms）。
+    pub heartbeat_broker_interval_millis: u64,
 }
 
 impl Default for PullConsumerConfig {
@@ -208,6 +226,8 @@ impl Default for PullConsumerConfig {
             broker_suspend_max_time_millis: DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS,
             consumer_pull_timeout_millis: DEFAULT_CONSUMER_PULL_TIMEOUT_MILLIS,
             consumer_timeout_millis_when_suspend: DEFAULT_CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND,
+            heartbeat_enabled: true,
+            heartbeat_broker_interval_millis: DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS,
         }
     }
 }
@@ -216,6 +236,14 @@ struct PullInner {
     cfg: RwLock<PullConsumerConfig>,
     client: Mutex<Option<MQClientInstance>>,
     started: AtomicBool,
+    /// 心跳循环的存活标记（与 lite 的 `running` 同义）。
+    running: AtomicBool,
+    runtime: OnceLock<tokio::runtime::Handle>,
+    /// 后台循环的停止信号（true = 停）。
+    stop: watch::Sender<bool>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// 心跳成功轮数（一轮至少一台 broker 收到才算），真机/离线用例的断言落点。
+    heartbeat_count: AtomicUsize,
     filter_hooks: FilterMessageHookList,
     register_topics: Mutex<BTreeSet<String>>,
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
@@ -235,12 +263,28 @@ impl Default for PullInner {
             cfg: RwLock::new(PullConsumerConfig::default()),
             client: Mutex::new(None),
             started: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            runtime: OnceLock::new(),
+            stop: watch::channel(false).0,
+            tasks: Mutex::new(Vec::new()),
+            heartbeat_count: AtomicUsize::new(0),
             filter_hooks: FilterMessageHookList::new(),
             register_topics: Mutex::new(BTreeSet::new()),
             listener: Mutex::new(None),
             strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
             rpc_hook: RwLock::new(None),
             pull_from_which_node: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Drop for PullInner {
+    /// 忘记 `shutdown()` 也不能把心跳循环留着（同 lite / 推送消费者）。
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        let _ = self.stop.send(true);
+        for task in lock(&self.tasks).drain(..) {
+            task.abort();
         }
     }
 }
@@ -298,9 +342,12 @@ impl DefaultMQPullConsumer {
             bail!("consumerGroup is empty");
         }
         Ok(DefaultMQPullConsumer {
-            inner: Arc::new(PullInner {
-                cfg: RwLock::new(cfg),
-                ..Default::default()
+            inner: Arc::new({
+                // `PullInner` 有 `Drop`，不能走 `..Default::default()` 的结构体更新语法
+                // （同 lite），先整体默认构造再替换 cfg。
+                let mut inner = PullInner::default();
+                inner.cfg = RwLock::new(cfg);
+                inner
             }),
         })
     }
@@ -433,8 +480,8 @@ impl DefaultMQPullConsumer {
             .clone()
     }
 
-    /// Python `get_register_topics`（Java 用它拼心跳订阅集；本移植版只登记，
-    /// 不发心跳，见模块头偏离 2）。
+    /// Java `DefaultMQPullConsumer#registerTopic`：拼命名空间后登记
+    /// （也是心跳订阅集的来源，见模块头偏离 2）。
     pub fn register_topics(&self) -> Vec<String> {
         lock(&self.inner.register_topics).iter().cloned().collect()
     }
@@ -562,13 +609,31 @@ impl DefaultMQPullConsumer {
         }
         // Java `DefaultMQPullConsumerImpl#start`:746 `registerConsumer`：拉模式消费者
         // 接不了 broker 的反向请求（220/221/307/309），所以只登记组名给实例的关闭
-        // 守卫用，不进 `consumer_table`。
+        // 守卫用，不进 `consumer_table`（实例心跳任务因此看不见本组，心跳由本消费者
+        // 自己的循环发，见模块头偏离 2）。
         client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
+        // 心跳：先刷 registerTopics 的路由（心跳只发给路由表里已知的 broker，没有
+        // 地址就发 0 份），再同步发一轮让 broker 立刻认识本组，最后交给后台循环 ——
+        // 顺序对齐 Python/C++/dotnet 的拉模式消费者（也贴合 Java 的
+        // registerConsumer:746 → mQClientFactory.start():755 首个心跳周期在 1s 内）。
+        self.refresh_route_for_heartbeat().await;
+        self.inner.running.store(true, Ordering::Release);
+        let _ = self.inner.stop.send(false);
+        if cfg.heartbeat_enabled {
+            self.send_heartbeat_to_all_broker().await;
+        }
+        self.spawn_heartbeat_loop();
         Ok(())
     }
 
     /// Python `shutdown()`；未启动时是 no-op。
+    ///
+    /// 收尾三步（对齐 Java `DefaultMQPullConsumerImpl.shutdown:689-692`：
+    /// `unregisterConsumer` → `mQClientFactory.shutdown()`，中间补 Python/C++/dotnet
+    /// 都有的 35 号注销）：停心跳 → 逐台 broker 发 UNREGISTER_CLIENT(35) → 摘组 → 关实例。
+    /// 35 让 broker 的 ConsumerManager 立刻摘掉本组，不必等 ~120s 通道扫描
+    /// （Java `MQClientInstance#unregisterClient`，`DefaultMQPullConsumerImpl:691` 走同一入口）。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -578,11 +643,44 @@ impl DefaultMQPullConsumer {
         {
             return;
         }
-        if let Some(client) = lock(&self.inner.client).take() {
-            // 先摘自己再关实例（Java `unregisterConsumer`:691 → `shutdown()`:693）。
-            let group = self.consumer_group();
-            client.unregister_consumer_group(&group);
-            client.shutdown();
+        // 先停心跳：被 abort 的那一轮可能已经在线上，落回 broker 会把本 clientId
+        // 重新塞进 ConsumerManager（与推送消费者 shutdown 同一理由）。
+        self.inner.running.store(false, Ordering::Release);
+        let _ = self.inner.stop.send(true);
+        for task in lock(&self.inner.tasks).drain(..) {
+            task.abort();
+        }
+        let group = self.consumer_group();
+        let client_id = self.client_id();
+        // 注销要发 RPC，而 shutdown 是同步 API（不能在调用线程上等网络）——
+        // 与生产者/推送消费者同款：挂到运行时上执行，没有运行时则退化为只摘组 + 关实例。
+        match self.runtime_handle() {
+            Some(handle) => {
+                let this = self.clone();
+                handle.spawn(async move {
+                    // 锁不能跨 await（MutexGuard 不是 Send）：先把 client 取出来。
+                    let client = lock(&this.inner.client).take();
+                    if let Some(client) = client {
+                        client
+                            .unregister_client_all_brokers(
+                                &client_id,
+                                "",
+                                &group,
+                                crate::client::mq_client::MQ_CLIENT_API_TIMEOUT_MILLIS,
+                            )
+                            .await;
+                        client.unregister_consumer_group(&group);
+                        client.shutdown();
+                    }
+                });
+            }
+            None => {
+                if let Some(client) = lock(&self.inner.client).take() {
+                    client.unregister_consumer_group(&group);
+                    client.shutdown();
+                }
+                rmq_warn!("pull consumer shutdown: no tokio runtime, skip unregister(35)");
+            }
         }
     }
 
@@ -594,6 +692,65 @@ impl DefaultMQPullConsumer {
         lock(&self.inner.client)
             .clone()
             .ok_or_else(|| Error::client("consumer not started, call start() first"))
+    }
+
+    // ---------------- 心跳 ----------------
+
+    /// 心跳成功轮数（一轮至少一台 broker 收到才算；真机/离线用例的断言落点）。
+    pub fn heartbeat_count(&self) -> usize {
+        self.inner.heartbeat_count.load(Ordering::SeqCst)
+    }
+
+    /// Python `_refresh_route_for_heartbeat`（同 lite 版）：心跳只发给「路由表里已知的
+    /// broker」，自建实例刚 start 时路由表是空的。先把 registerTopics 的路由拉一遍并
+    /// 登记为在用，start() 里那次同步心跳才真正到达 broker。
+    ///
+    /// Java 侧这条链路是间接的：`DefaultMQPullConsumerImpl.subscriptions()` 返回
+    /// registerTopics 构的订阅集 → 实例的 `updateTopicRouteInfoFromNameServer` 周期任务
+    /// 据此刷路由 → `brokerAddrTable` 有地址 → 心跳发得出去。本移植的实例心跳任务
+    /// 不看拉模式组（见模块头偏离 2），所以这里显式刷一遍。
+    async fn refresh_route_for_heartbeat(&self) {
+        let Ok(client) = self.require_client() else {
+            return;
+        };
+        let topics: Vec<String> = lock(&self.inner.register_topics).iter().cloned().collect();
+        for topic in topics {
+            client.register_topic_in_use(&topic);
+            if let Err(e) = client.get_topic_publish_info(&topic, false).await {
+                rmq_debug!("pull start: refresh route for {topic} failed: {e}");
+            }
+        }
+    }
+
+    /// Python `_send_heartbeat_to_all_broker`（同 lite 版）：向路由里的每台 broker
+    /// （**含从节点**）发一份，返回成功台数。
+    pub async fn send_heartbeat_to_all_broker(&self) -> usize {
+        send_pull_heartbeat(&self.inner).await
+    }
+
+    fn spawn_heartbeat_loop(&self) {
+        let Some(handle) = self.runtime_handle() else {
+            rmq_warn!("pull consumer: no tokio runtime, heartbeat loop disabled");
+            return;
+        };
+        // 握 Weak 而不是 Arc（同 lite）：消费者被丢弃时 Drop 才有机会跑。
+        let weak = Arc::downgrade(&self.inner);
+        let rx = self.inner.stop.subscribe();
+        let task = handle.spawn(async move {
+            if let Some(inner) = weak.upgrade() {
+                pull_heartbeat_loop(inner, rx).await;
+            }
+        });
+        lock(&self.inner.tasks).push(task);
+    }
+
+    fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        if let Some(handle) = self.inner.runtime.get() {
+            return Some(handle.clone());
+        }
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let _ = self.inner.runtime.set(handle.clone());
+        Some(handle)
     }
 
     // ---------------- 拉取 ----------------
@@ -827,6 +984,82 @@ fn split_addrs(addr: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Python `DefaultMQPullConsumer._build_heartbeat`（`consumer.py:1649-1676`）：
+/// 拉模式消费者组的一份 ConsumerData。
+///
+/// Java 依据（`MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式组出来的那一份）：
+/// * `consumeType()` 恒为 `CONSUME_ACTIVELY`（`DefaultMQPullConsumerImpl:348`）、
+///   `consumeFromWhere()` 恒为 `CONSUME_FROM_LAST_OFFSET`（:353）—— 与推送消费者
+///   的 PASSIVELY 是两个口径，broker 侧两项都不是摆设：`consumerConnection`
+///   （`AdminBrokerProcessor:1971`）按 consumeType 显示消费类型；开了
+///   `rejectPullConsumerEnabled` 的 broker 会跳过非 ACTIVELY 的拉模式组
+///   （`PullMessageProcessor:493-505` 回 `SUBSCRIPTION_NOT_EXIST`）。
+/// * 订阅集取 `subscriptions():357-385`：逐条 `buildSubscriptionData(topic, "*")`，
+///   并显式把 **subVersion 置 0**（Java `ms.setSubVersion(0L)`）—— 拉模式没有
+///   "订阅版本"语义，带上当前时间戳会让 broker 每次心跳都认为订阅变了。
+fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
+    let cfg = read_cfg(&inner.cfg);
+    let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
+    let mut cd = ConsumerData::new(
+        cfg.consumer_group,
+        ConsumeType::CONSUME_ACTIVELY,
+        cfg.message_model,
+        ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
+    );
+    cd.unit_mode = cfg.unit_mode;
+    for topic in lock(&inner.register_topics).iter() {
+        if let Ok(mut sub) = FilterAPI::build_subscription_data(topic, Some(FilterAPI::SUB_ALL)) {
+            // ⚠ SubscriptionData::new 的 sub_version 是 now_millis()（推送/lite 口径），
+            // 拉模式这里必须显式清零，见上面 Java `ms.setSubVersion(0L)`。
+            sub.sub_version = 0;
+            cd.add_subscription_data(sub);
+        }
+    }
+    hb.add_consumer_data(cd);
+    hb
+}
+
+/// Python `_send_heartbeat_to_all_broker`：向所有已知 broker（含从节点）发一次本组
+/// 心跳，返回成功台数。
+///
+/// 收件人取 `get_all_broker_addrs`，理由与 lite 版一致（Java
+/// `sendHeartbeatToAllBroker`:732-750 只对 `consumerEmpty` 跳从节点；本心跳带
+/// ConsumerData，故不跳）。
+async fn send_pull_heartbeat(inner: &PullInner) -> usize {
+    let Some(client) = lock(&inner.client).clone() else {
+        return 0;
+    };
+    let hb = build_pull_heartbeat(inner);
+    let mut ok = 0;
+    for addr in client.get_all_broker_addrs() {
+        match client
+            .send_heartbeat(&addr, &hb, PULL_HEARTBEAT_TIMEOUT_MILLIS)
+            .await
+        {
+            Ok(()) => ok += 1,
+            Err(e) => rmq_debug!("pull heartbeat to {addr} failed: {e}"),
+        }
+    }
+    if ok > 0 {
+        inner.heartbeat_count.fetch_add(1, Ordering::SeqCst);
+    }
+    ok
+}
+
+/// Python `_heartbeat_loop`（`consumer.py:1663-1671`）：先等一个周期再发 ——
+/// start() 里已同步发过一轮，循环的第一次是"第二个心跳周期"。
+async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool>) {
+    while inner.running.load(Ordering::Acquire) {
+        if wait_or_stop(&mut rx, read_cfg(&inner.cfg).heartbeat_broker_interval_millis).await {
+            return;
+        }
+        if !read_cfg(&inner.cfg).heartbeat_enabled {
+            continue;
+        }
+        send_pull_heartbeat(&inner).await;
+    }
 }
 
 // ================================================================ DefaultLitePullConsumer
@@ -2340,12 +2573,20 @@ async fn resolve_initial_offset(
 
 /// Python `_heartbeat_loop` 里那份报文：只带**本消费者自己**的 ConsumerData
 /// （lite 不进实例注册表，报文由自己拼）。
+///
+/// ⚠ `consumeType` 用 **CONSUME_ACTIVELY**：Java
+/// `DefaultLitePullConsumerImpl.consumeType():1111-1112` 恒返回它（5.4.0 起；此前与
+/// 推送同用 PASSIVELY 是错的口径）。broker 侧有三个读者：
+/// `ClientManageProcessor:87-92` 对 ACTIVELY 的心跳跳过订阅注册（拉取靠自己带
+/// subscription 标志走补偿分支）、`PullMessageProcessor:493-505` 对开了
+/// `rejectPullConsumerEnabled` 的 broker 按它放行/拒绝拉取、`AdminBrokerProcessor:1971`
+/// 按它显示消费类型（mqadmin consumerConnection）。Python/C++/dotnet 三版同值。
 fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
     let mut cd = crate::remoting::protocol::heartbeat::ConsumerData::new(
         cfg.consumer_group,
-        ConsumeType::CONSUME_PASSIVELY,
+        ConsumeType::CONSUME_ACTIVELY,
         cfg.message_model,
         cfg.consume_from_where,
     );
@@ -2449,6 +2690,14 @@ fn _key_order_proof(mq: &MessageQueue) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 心跳真机外的最小闭环（假 namesrv + 假 broker）：帧读写与 producer 的
+    // `send_retry_tests` 同款，但只关心 34/35 两号报文。
+    use crate::common::sysflag::PermName;
+    use crate::remoting::protocol::codes::{request_code, response_code};
+    use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
+    use crate::remoting::protocol::RemotingCommand;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
 
     fn queue(topic: &str, broker: &str, id: i32) -> MessageQueue {
         MessageQueue::new(topic, broker, id)
@@ -2950,7 +3199,8 @@ mod tests {
         assert_eq!(hb.consumer_data_set.len(), 1);
         let cd = &hb.consumer_data_set[0];
         assert_eq!(cd.group_name, "LitePG");
-        assert_eq!(cd.consume_type, ConsumeType::CONSUME_PASSIVELY);
+        // Java DefaultLitePullConsumerImpl.consumeType():1111-1112 恒为 ACTIVELY
+        assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
         assert_eq!(cd.message_model, MessageModel::CLUSTERING);
         assert_eq!(
             cd.consume_from_where,
@@ -2964,6 +3214,349 @@ mod tests {
         assert!(build_lite_heartbeat(&c.inner).consumer_data_set[0]
             .subscription_data_set
             .is_empty());
+    }
+
+    // -------------------------------------------- 拉模式消费者心跳（#98）
+
+    /// 假 namesrv：只答 `GET_ROUTEINFO_BY_TOPIC`，回一份「一台主 + 一台从」的路由
+    /// （同一 brokerName，brokerId 0/1）；其余请求一律 SUCCESS。
+    fn spawn_fake_namesrv(
+        listener: TcpListener,
+        broker_name: String,
+        master_addr: String,
+        slave_addr: String,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let broker_name = broker_name.clone();
+                let master = master_addr.clone();
+                let slave = slave_addr.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
+                        let mut response = answer_for(&request, response_code::SUCCESS);
+                        if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
+                            response.set_body(Some(route_body(&broker_name, &master, &slave)));
+                        }
+                        write_frame(&mut stream, &mut response).await;
+                    }
+                });
+            }
+        })
+    }
+
+    /// 「一台主 + 一台从」的路由 body（`TopicRouteData` 的 JSON 形态）。
+    fn route_body(broker_name: &str, master_addr: &str, slave_addr: &str) -> Vec<u8> {
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                broker_name,
+                1,
+                1,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "DefaultCluster",
+                broker_name,
+                vec![
+                    (i64::from(MixAll::MASTER_ID), master_addr.to_string()),
+                    (i64::from(MixAll::MASTER_ID) + 1, slave_addr.to_string()),
+                ],
+                "",
+            )],
+            ..Default::default()
+        };
+        serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+    }
+
+    /// 读一整帧并解码（`decode` 从 totalLength 开始，所以帧要连长度前缀一起给）。
+    async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        let mut len_buf = [0_u8; 4];
+        stream.read_exact(&mut len_buf).await.ok()?;
+        let total = i32::from_be_bytes(len_buf);
+        if total <= 4 || total > 20 * 1024 * 1024 {
+            return None;
+        }
+        let mut frame = vec![0_u8; usize::try_from(total).ok()? + 4];
+        frame[..4].copy_from_slice(&len_buf);
+        stream.read_exact(&mut frame[4..]).await.ok()?;
+        Some(frame)
+    }
+
+    async fn write_frame(stream: &mut tokio::net::TcpStream, command: &mut RemotingCommand) {
+        let bytes = command.encode();
+        let _ = stream.write_all(&bytes).await;
+        let _ = stream.flush().await;
+    }
+
+    /// 带请求 `opaque` 的应答（客户端按 opaque 配对，串了就当噪声丢掉）。
+    fn answer_for(request: &RemotingCommand, code: i32) -> RemotingCommand {
+        let mut response = RemotingCommand::create_response(code, None);
+        response.opaque = request.opaque;
+        response.serialize_type_current_rpc = request.serialize_type_current_rpc;
+        response
+    }
+
+    /// 一份 35（UNREGISTER_CLIENT）的 extFields 快照。
+    type UnregisterExt = Vec<(String, String)>;
+
+    /// 假 broker：记录 34（心跳 body）与 35（注销 extFields）两号报文，其余一律 SUCCESS。
+    struct FakeBroker {
+        addr: String,
+        /// 收到的 HEART_BEAT 原始 body，按到达顺序。
+        heartbeat_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// 收到的 UNREGISTER_CLIENT extFields，按到达顺序。
+        unregisters: Arc<Mutex<Vec<UnregisterExt>>>,
+    }
+
+    impl FakeBroker {
+        async fn start() -> Arc<FakeBroker> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 假 broker");
+            let addr = listener.local_addr().expect("假 broker 地址").to_string();
+            let broker = Arc::new(FakeBroker {
+                addr,
+                heartbeat_bodies: Arc::new(Mutex::new(Vec::new())),
+                unregisters: Arc::new(Mutex::new(Vec::new())),
+            });
+            let inner = Arc::clone(&broker);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let inner = Arc::clone(&inner);
+                    tokio::spawn(async move {
+                        while let Some(frame) = read_frame(&mut stream).await {
+                            let Ok(request) = RemotingCommand::decode(&frame) else {
+                                return;
+                            };
+                            match request.code {
+                                request_code::HEART_BEAT => lock(&inner.heartbeat_bodies)
+                                    .push(request.body().unwrap_or_default().to_vec()),
+                                request_code::UNREGISTER_CLIENT => lock(&inner.unregisters).push(
+                                    request
+                                        .ext_fields()
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                        .collect(),
+                                ),
+                                _ => {}
+                            }
+                            if !request.is_oneway_rpc() {
+                                let mut response = answer_for(&request, response_code::SUCCESS);
+                                write_frame(&mut stream, &mut response).await;
+                            }
+                        }
+                    });
+                }
+            });
+            broker
+        }
+
+        /// 收到的每份心跳解成 `HeartbeatData`（解不开就炸在断言线程上）。
+        fn heartbeats(&self) -> Vec<HeartbeatData> {
+            lock(&self.heartbeat_bodies)
+                .iter()
+                .map(|b| HeartbeatData::decode(b).expect("34 的 body 必须是合法 HeartbeatData"))
+                .collect()
+        }
+
+        fn unregisters(&self) -> Vec<UnregisterExt> {
+            lock(&self.unregisters).clone()
+        }
+    }
+
+    /// 一台主 + 一台从（同一 brokerName）的假集群。
+    struct FakePullCluster {
+        namesrv_addr: String,
+        master: Arc<FakeBroker>,
+        slave: Arc<FakeBroker>,
+        tasks: Vec<JoinHandle<()>>,
+    }
+
+    impl FakePullCluster {
+        async fn start() -> FakePullCluster {
+            let master = FakeBroker::start().await;
+            let slave = FakeBroker::start().await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 假 namesrv");
+            let namesrv_addr = listener.local_addr().expect("假 namesrv 地址").to_string();
+            let broker_name = "broker-a".to_string();
+            let task = spawn_fake_namesrv(
+                listener,
+                broker_name,
+                master.addr.clone(),
+                slave.addr.clone(),
+            );
+            FakePullCluster { namesrv_addr, master, slave, tasks: vec![task] }
+        }
+    }
+
+    impl Drop for FakePullCluster {
+        fn drop(&mut self) {
+            for task in self.tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
+
+    /// 起一个指向假集群的拉模式消费者。`instance` 必须每个用例唯一：同 clientId 会共享
+    /// [`MQClientInstance`]（连带路由表与 namesrv 地址）。
+    async fn started_pull(
+        instance: &str,
+        group: &str,
+        cluster: &FakePullCluster,
+        topic: &str,
+    ) -> DefaultMQPullConsumer {
+        let c = DefaultMQPullConsumer::new(group).expect("组名合法");
+        c.set_instance_name(instance);
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.register_topic(topic);
+        c.start().await.expect("假集群里 start 应当成功");
+        c
+    }
+
+    /// 轮询等条件成立（最多 5s）；失败时 panic，避免用固定 sleep 掩盖竞态。
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("等待超时：{what}");
+    }
+
+    /// Java `MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式组出的那份
+    /// ConsumerData 的形状：`consumeType()` 恒 `CONSUME_ACTIVELY`（`DefaultMQPullConsumerImpl:348`）、
+    /// `consumeFromWhere()` 恒 `CONSUME_FROM_LAST_OFFSET`（:353），订阅集来自
+    /// `subscriptions():357-385` 的 registerTopics，每条 **subVersion 显式置 0**。
+    #[test]
+    fn pull_heartbeat_matches_the_java_shape() {
+        let c = DefaultMQPullConsumer::new("PG_PullHb").unwrap();
+        c.update_config(|cfg| cfg.client_id = Some("cid-1".to_string()));
+        c.register_topic("T2");
+        c.register_topic("T1");
+        let hb = build_pull_heartbeat(&c.inner);
+        assert_eq!(hb.client_id, "cid-1");
+        assert_eq!(hb.consumer_data_set.len(), 1, "拉模式组只发自己的一份");
+        let cd = &hb.consumer_data_set[0];
+        assert_eq!(cd.group_name, "PG_PullHb");
+        assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
+        assert_eq!(cd.consume_from_where, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        assert_eq!(cd.message_model, MessageModel::CLUSTERING);
+        assert!(!cd.unit_mode);
+        let topics: Vec<&str> = cd
+            .subscription_data_set
+            .iter()
+            .map(|s| s.topic.as_str())
+            .collect();
+        assert_eq!(topics, vec!["T1", "T2"], "订阅集来自 registerTopics");
+        for sub in &cd.subscription_data_set {
+            assert_eq!(sub.sub_string, "*");
+            assert_eq!(sub.sub_version, 0, "Java 显式 setSubVersion(0L)");
+        }
+
+        // 没有 registerTopics：照样一份 ConsumerData，订阅集为空
+        let bare = DefaultMQPullConsumer::new("PG_PullHbBare").unwrap();
+        let hb2 = build_pull_heartbeat(&bare.inner);
+        assert_eq!(hb2.consumer_data_set.len(), 1);
+        assert!(hb2.consumer_data_set[0].subscription_data_set.is_empty());
+    }
+
+    /// start() 的同步一轮必须**主从各一份**：broker 的 ConsumerManager 是每台各自一份
+    /// 状态，从节点收不到心跳就会对指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`。
+    #[tokio::test]
+    async fn pull_start_heartbeats_master_and_slave_with_the_java_shape() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_hb_start", "PG_PullHbStart", &cluster, "T").await;
+
+        let master = cluster.master.heartbeats();
+        let slave = cluster.slave.heartbeats();
+        assert_eq!(master.len(), 1, "start 的同步一轮先到主节点");
+        assert_eq!(slave.len(), 1, "从节点也要发");
+        for hb in [&master[0], &slave[0]] {
+            assert_eq!(hb.client_id, c.client_id());
+            let cd = &hb.consumer_data_set[0];
+            assert_eq!(cd.group_name, "PG_PullHbStart");
+            assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
+            assert_eq!(cd.consume_from_where, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+            assert_eq!(cd.subscription_data_set.len(), 1);
+            assert_eq!(cd.subscription_data_set[0].topic, "T");
+            assert_eq!(cd.subscription_data_set[0].sub_version, 0);
+        }
+        assert_eq!(c.heartbeat_count(), 1, "一轮两台都成功才算一轮");
+        c.shutdown();
+    }
+
+    /// 后台循环按 `heartbeat_broker_interval_millis` 重发；`heartbeat_enabled=false`
+    /// 只停发不退出（Python `_heartbeat_loop`：`continue` 而不是 `break`）。
+    #[tokio::test]
+    async fn pull_heartbeat_loop_repeats_and_honours_the_disable_switch() {
+        let cluster = FakePullCluster::start().await;
+        let c = DefaultMQPullConsumer::new("PG_PullHbLoop").unwrap();
+        c.set_instance_name("pull_hb_loop");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.register_topic("T");
+        c.update_config(|cfg| cfg.heartbeat_broker_interval_millis = 100);
+        c.start().await.expect("假集群里 start 应当成功");
+
+        // 首轮同步 + 至少两个周期轮
+        wait_until(
+            || cluster.master.heartbeats().len() >= 3 && cluster.slave.heartbeats().len() >= 3,
+            "心跳循环按 100ms 周期重发（主从同步涨）",
+        )
+        .await;
+
+        // 关掉开关：先静默一拍让在途的那轮落地，再看计数是否冻结
+        c.update_config(|cfg| cfg.heartbeat_enabled = false);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let frozen = c.heartbeat_count();
+        let master_seen = cluster.master.heartbeats().len();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(c.heartbeat_count(), frozen, "heartbeat_enabled=false 后不再发");
+        assert_eq!(
+            cluster.master.heartbeats().len(),
+            master_seen,
+            "线上也不能再有新的 34"
+        );
+        c.shutdown();
+    }
+
+    /// shutdown 的收尾（Java `DefaultMQPullConsumerImpl:689-692` 的 unregisterConsumer）
+    /// 要给**每一台**发 35：`consumerGroup` 有值、`producerGroup` 字段不上线（Java 传 null）。
+    #[tokio::test]
+    async fn pull_shutdown_unregisters_group_on_every_broker() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_hb_unreg", "PG_PullHbUnreg", &cluster, "T").await;
+        let client_id = c.client_id();
+        c.shutdown();
+        // 35 挂在运行时上异步发（shutdown 是同步 API）：等它落地
+        wait_until(
+            || !cluster.master.unregisters().is_empty() && !cluster.slave.unregisters().is_empty(),
+            "主从都收到 35",
+        )
+        .await;
+
+        for (name, broker) in [("master", &cluster.master), ("slave", &cluster.slave)] {
+            let unregs = broker.unregisters();
+            assert_eq!(unregs.len(), 1, "{name}: 一次 shutdown 只注销一次");
+            let field = |k: &str| -> Option<String> {
+                unregs[0].iter().find(|(f, _)| f == k).map(|(_, v)| v.clone())
+            };
+            assert_eq!(field("clientID").as_deref(), Some(client_id.as_str()), "{name}");
+            assert_eq!(field("consumerGroup").as_deref(), Some("PG_PullHbUnreg"), "{name}");
+            assert_eq!(field("producerGroup"), None, "{name}: 空槽位不上线");
+        }
+        // 注销之后心跳必须已经停了（循环先停、abort，再发 35）
+        let beats = cluster.master.heartbeats().len();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(cluster.master.heartbeats().len(), beats, "shutdown 后不再发心跳");
     }
 
     #[test]

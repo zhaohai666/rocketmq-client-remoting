@@ -35,6 +35,7 @@ internal static class Program
                 "redelivery" => LiveRedelivery.Run(rest),
                 "acl" => LiveAcl.Run(rest),
                 "pull" => LivePull.Run(rest),
+                "pull-heartbeat" => LivePullHeartbeat.Run(rest),
                 "lite-pull" => LiveLitePull.Run(rest),
                 "rr" => LiveRR.Run(rest),
                 "reqreply" => LiveRR.Run(rest),
@@ -90,6 +91,8 @@ internal static class Program
               redelivery    [namesrv]       真实集群消费侧能力联调（回投/位点/顺序/广播/流控）
               acl     [namesrv] [ak] [sk]   真实集群 ACL 鉴权联调（需 broker 开 authenticationEnabled）
               pull         [namesrv]       真实集群主动拉取消费者联调（手动拉取/手动位点/回投）
+              pull-heartbeat [namesrv] [master] [slave]
+                                            拉模式消费者心跳联调（203/38 主从可见、35 注销即摘、幽灵组对照）
               rr           [namesrv]        真实集群 Request-Reply（5.x）联调（请求/应答/并发/超时）
               latency      [namesrv]        真实集群发送延迟故障容错联调（默认关/开/隔离退化链/到期恢复）
               pop          [namesrv]        真实集群 POP 模式（5.x）联调（POP/ACK/延长不可见/复活重投）

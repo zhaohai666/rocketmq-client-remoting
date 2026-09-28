@@ -17,10 +17,14 @@
 #ifndef ROCKETMQ_CLIENT_PULL_CONSUMER_H
 #define ROCKETMQ_CLIENT_PULL_CONSUMER_H
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rocketmq/client/allocate_strategy.h"
@@ -75,6 +79,16 @@ public:
     // 路由刷新周期，start() 时透传给 MQClientInstance。
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
+    // Java `ClientConfig#heartbeatBrokerInterval`（:59，默认 30000ms）。Java 的心跳由
+    // 实例级周期任务发出（`DefaultMQPullConsumerImpl:746` 把本组注册进实例的
+    // consumerTable，`MQClientInstance#startScheduledTask` 再逐台发），本端口没有
+    // 实例级心跳，改由消费者自带线程发（与 push / lite 同款）。
+    void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
+    bool isHeartbeatEnabled() const { return heartbeatEnabled_; }
+    void setHeartbeatBrokerIntervalMillis(int32_t millis) {
+        heartbeatBrokerIntervalMillis_ = millis;
+    }
+    int32_t heartbeatBrokerIntervalMillis() const { return heartbeatBrokerIntervalMillis_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
@@ -113,10 +127,17 @@ public:
     const std::string& namespaceOf() const { return namespace_; }
     const std::set<std::string>& registerTopics() const { return registerTopics_; }
     bool isStarted() const { return started_; }
+    // 心跳成功轮数（真机验证用；对应 Python DefaultMQPullConsumer.heartbeat_count()）。
+    int32_t heartbeatCount() const { return heartbeatCount_.load(); }
 
     // ---------------- 生命周期 ----------------
     void start();
     void shutdown();
+
+    // 向所有已知 broker（含从节点）发一次本组心跳，返回成功台数。对应 Java
+    // `MQClientInstance#sendHeartbeatToAllBroker`，只是收件人从实例的 consumerTable
+    // 换成"就这一个拉模式组"。判据说明见 `.cpp` 里 buildHeartbeat/收件人两段注释。
+    int32_t sendHeartbeatToAllBroker();
 
     // ---------------- 队列 ----------------
     // 该 topic 的全部可消费队列（按 broker 路由取，Java fetchSubscribeMessageQueues）。
@@ -157,6 +178,12 @@ public:
     void createTopic(const std::string& key, const std::string& newTopic, int32_t queueNum = 4);
 
 private:
+    // 心跳三件套：刷路由（有地址才有人可发）、拼 ConsumerData、常驻循环。
+    void refreshRouteForHeartbeat();
+    HeartbeatData buildHeartbeat() const;
+    void startHeartbeatLoop();
+    void heartbeatLoop();
+
     std::string consumerGroup_;
     std::string namespace_;
     std::string instanceName_ = "DEFAULT";
@@ -188,6 +215,15 @@ private:
     // suggestWhichBrokerId 回写进来，下次拉取按它选主/从（缺省 MASTER_ID=0）。
     std::map<MessageQueue, int64_t> pullFromWhichNode_;
     bool started_ = false;
+
+    // 心跳（对齐 Java ClientConfig:59 的 heartbeatBrokerInterval，默认 30000ms）
+    bool heartbeatEnabled_ = true;
+    int32_t heartbeatBrokerIntervalMillis_ = 30000;
+    std::atomic<int32_t> heartbeatCount_{0};
+    std::atomic<bool> heartbeatStop_{false};
+    std::thread heartbeatThread_;
+    std::mutex heartbeatLock_;
+    std::condition_variable heartbeatCv_;
 };
 
 }  // namespace rocketmq

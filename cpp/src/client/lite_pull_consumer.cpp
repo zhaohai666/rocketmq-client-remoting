@@ -868,7 +868,13 @@ void DefaultLitePullConsumer::resume(const std::vector<MessageQueue>& messageQue
 // ---------------------------------------------------------------- 心跳
 HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     HeartbeatData hb(clientId_);
-    ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_PASSIVELY, messageModel_,
+    // consumeType 恒为 CONSUME_ACTIVELY：Java `DefaultLitePullConsumerImpl.consumeType():1111-1112`
+    // 直接 return CONSUME_ACTIVELY（**不是** PASSIVELY）。broker 侧读这个字段的地方：
+    // `ClientManageProcessor:87-92`（ACTIVELY 心跳不做订阅注册，订阅由自带标志的拉取补偿）、
+    // `PullMessageProcessor:493-505`（rejectPullConsumerEnabled 的 broker 据此拒拉）、
+    // `:516-521`（冷数据流控按 ACTIVELY 走另一支）、`AdminBrokerProcessor:1971`
+    // （consumerConnection 显示消费类型）。写成 PASSIVELY 会让 broker 把拉模式组当推送组看。
+    ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_ACTIVELY, messageModel_,
                     consumeFromWhere_);
     // Java `MQClientInstance:1039`：心跳里的 ConsumerData.unitMode 决定 broker 建
     // %RETRY% topic 时打不打 UNIT_SUB 位

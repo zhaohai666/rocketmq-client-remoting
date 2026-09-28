@@ -3349,6 +3349,15 @@ class DefaultMQPullConsumer:
         self.filter_message_hook_list: List[FilterMessageHook] = []
         # 对应 Java DefaultMQPullConsumerImpl.pullAPIWrapper.pullFromWhichNodeTable
         self._pull_from_which_node: Dict[MessageQueue, int] = {}
+        # ---- 消费者心跳（对齐 Java ClientConfig.heartbeatBrokerInterval 默认 30s）----
+        # Java 的拉模式消费者同样登记进 consumerTable（DefaultMQPullConsumerImpl.start:746），
+        # 由实例的 sendHeartbeatToAllBrokerWithLock 周期任务代发；本端口按既有分工
+        # （心跳循环在消费者内）自己发一份带 CONSUME_ACTIVELY 的 ConsumerData。
+        self.heartbeat_enabled = True
+        self.heartbeat_interval_millis = 30000
+        self._heartbeat_count = 0
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_stop = threading.Event()
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
 
@@ -3420,6 +3429,93 @@ class DefaultMQPullConsumer:
     def get_register_topics(self) -> Set[str]:
         return self.register_topics
 
+    # ---------------- 心跳（把消费组注册给 broker） ----------------
+    def _refresh_route_for_heartbeat(self) -> None:
+        """为心跳准备 broker 地址：把 registerTopics 的路由拉一遍并登记为「在用」。
+
+        Java 侧这条链路是间接的：`DefaultMQPullConsumerImpl.subscriptions():357-385`
+        返回的就是 `registerTopics` 构出来的订阅集，实例的
+        `updateTopicRouteInfoFromNameServer` 周期任务据此刷路由 → `brokerAddrTable`
+        有地址 → 心跳才发得出去。本端口没有实例级路由任务（心跳循环在消费者内，
+        同推送/轻量消费者），所以在 start 里显式刷一遍，并把 topic 交给
+        `MQClientInstance` 的后台刷新任务保持新鲜。
+        """
+        client = self._require_client()
+        for topic in sorted(self.register_topics):
+            client.register_topic_in_use(topic)
+            try:
+                client.get_topic_publish_info(topic)
+            except MQClientException as e:  # noqa: BLE001
+                logger.debug("refresh route for %s failed: %s", topic, e)
+
+    def _build_heartbeat(self) -> HeartbeatData:
+        """Java `MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式消费者组出来的那一份。
+
+        `consumeType()` 恒为 `CONSUME_ACTIVELY`（`DefaultMQPullConsumerImpl:348`）、
+        `consumeFromWhere()` 恒为 `CONSUME_FROM_LAST_OFFSET`（:353）—— 与推送消费者的
+        PASSIVELY 是两个口径，broker 侧两项都不是摆设：
+        `consumerConnection`（`AdminBrokerProcessor:1971`）按 consumeType 显示消费类型；
+        `rejectPullConsumerEnabled` 的 broker 会**跳过** ACTIVELY 心跳
+        （`ClientManageProcessor:87-92`）并在拉取时拒绝没注册过的拉模式组
+        （`PullMessageProcessor:493-505`）。
+
+        订阅集取 `subscriptions()`（`DefaultMQPullConsumerImpl:357-385`）：逐条
+        `buildSubscriptionData(topic, "*")`，并显式把 **subVersion 置 0**
+        （Java `ms.setSubVersion(0L)`）—— 拉模式没有"订阅版本"语义，带上当前时间戳
+        会让 broker 每次心跳都认为订阅变了。⚠ 本端口没有 Java 的
+        `registerSubscriptions` 入口，订阅集只从 `registerTopics` 来。
+        """
+        hb = HeartbeatData(self.client_id or "")
+        cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_ACTIVELY,
+                          self.message_model, ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET)
+        cd.unit_mode = self.unit_mode
+        for topic in sorted(self.register_topics):
+            sub = FilterAPI.build_subscription_data(topic, FilterAPI.SUB_ALL)
+            sub.sub_version = 0
+            cd.subscription_data_set.add(sub)
+        hb.consumer_data_set.add(cd)
+        return hb
+
+    def _send_heartbeat_to_all_broker(self) -> int:
+        """向所有已知 broker（含从节点）发一次本组心跳，返回成功台数。
+
+        收件人取 `get_all_broker_addrs`，理由与推送消费者同名方法一致
+        （Java `sendHeartbeatToAllBroker`:732-750 只对 `consumerEmpty` 跳从节点）。
+        """
+        client = self._require_client()
+        hb = self._build_heartbeat()
+        ok = 0
+        for addr in client.get_all_broker_addrs():
+            try:
+                client.send_heartbeat(addr, hb, 5000)
+                ok += 1
+            except Exception as e:  # noqa: BLE001
+                logger.debug("heartbeat to %s failed: %s", addr, e)
+        if ok > 0:
+            self._heartbeat_count += 1
+        return ok
+
+    def heartbeat_count(self) -> int:
+        """心跳成功轮数（真机验证用）。"""
+        return self._heartbeat_count
+
+    def _start_heartbeat_loop(self) -> None:
+        t = threading.Thread(target=self._heartbeat_loop, daemon=True,
+                             name="rmq-pull-heartbeat-%s" % self.consumer_group)
+        t.start()
+        self._heartbeat_thread = t
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.is_set():
+            if self._heartbeat_stop.wait(self.heartbeat_interval_millis / 1000.0):
+                break
+            if not self.heartbeat_enabled or not self._started:
+                continue
+            try:
+                self._send_heartbeat_to_all_broker()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("heartbeat loop error: %s", e)
+
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
         if self._started:
@@ -3452,13 +3548,37 @@ class DefaultMQPullConsumer:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
         self._mq_client.start()
         self._started = True
+        # 心跳：先刷 registerTopics 的路由（没地址就没人可发，Java 靠实例级路由任务做到
+        # 同一件事），再同步发一轮让 broker 立刻认识本组，然后交给后台循环。
+        # 顺序对齐轻量拉取消费者 start（同一份理由），也贴合 Java 的
+        # registerConsumer:746 → mQClientFactory.start():755（周期任务首个 1s 内发出）。
+        self._refresh_route_for_heartbeat()
+        try:
+            self._send_heartbeat_to_all_broker()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("initial heartbeat failed: %s", e)
+        self._start_heartbeat_loop()
 
     def shutdown(self) -> None:
         if not self._started:
             return
         self._started = False
-        if self._mq_client is not None:
-            self._mq_client.shutdown()
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=2.0)
+        # 优雅注销（对齐 Java DefaultMQPullConsumerImpl.shutdown:689-692：
+        # unregisterConsumer → mQClientFactory.shutdown）：立刻从各 broker 的
+        # ConsumerManager 摘除本组，不必等心跳超时（默认 ~120s）。本端口没有 Java 的
+        # 本地位点表，所以 `persistConsumerOffset()` 那一步无对应物（位点由调用方
+        # update_consume_offset 直接写给 broker）。
+        client = self._mq_client
+        if client is not None:
+            try:
+                client.unregister_client_all_brokers(self.client_id or "", "",
+                                                     self.consumer_group)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("unregister on shutdown failed: %s", e)
+            client.shutdown()
 
     def _require_client(self) -> MQClientInstance:
         if not self._started or self._mq_client is None:
@@ -3928,8 +4048,14 @@ class DefaultLitePullConsumer:
     # ---------------- 心跳（把 tag 订阅注册给 broker）----------------
     def _build_heartbeat(self) -> HeartbeatData:
         hb = HeartbeatData(self.client_id or "")
-        cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_PASSIVELY,
+        cd = ConsumerData(self.consumer_group, ConsumeType.CONSUME_ACTIVELY,
                           self.message_model, self.consume_from_where)
+        # consumeType 是 CONSUME_ACTIVELY 而**不是**推送消费者的 PASSIVELY：Java
+        # `DefaultLitePullConsumerImpl.consumeType():1111-1112` 明确返回 ACTIVELY。
+        # broker 侧按它分流：`rejectPullConsumerEnabled=true` 的 broker 跳过 ACTIVELY
+        # 心跳并拒绝未注册的拉取组（`ClientManageProcessor:87-92`、
+        # `PullMessageProcessor:493-505`）；`PullMessageProcessor:516-521` 的冷数据
+        # 流控也按 PASSIVELY/ACTIVELY 走两条不同的分支。写成 PASSIVELY 时两处全错位。
         # 见推送消费者 _build_heartbeat 的同名注释
         cd.unit_mode = self.unit_mode
         for sub in self.subscription_data.values():

@@ -125,3 +125,7 @@ target_link_libraries(rmq_live_offset_illegal PRIVATE rocketmq::remoting)
 # 220 重置消费位点真机联调：broker 推 220 后立刻落盘 + 在途批次作废 + 队列按新位点重建（不打进 ctest）
 add_executable(rmq_live_reset_offset live_reset_offset.cpp)
 target_link_libraries(rmq_live_reset_offset PRIVATE rocketmq::remoting)
+
+# 拉模式消费者心跳真机联调：203/38 可见性 + consumeType/consumeFromWhere/订阅表 + 35 立刻注销（不打进 ctest）
+add_executable(rmq_live_pull_heartbeat live_pull_heartbeat.cpp)
+target_link_libraries(rmq_live_pull_heartbeat PRIVATE rocketmq::remoting)

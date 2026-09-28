@@ -1163,7 +1163,13 @@ public sealed class DefaultLitePullConsumer
     private HeartbeatData BuildHeartbeat()
     {
         var hb = new HeartbeatData(_clientId);
-        var cd = new ConsumerData(_consumerGroup, ConsumeType.ConsumePassively, _messageModel, _consumeFromWhere)
+        // consumeType 恒为 CONSUME_ACTIVELY：Java DefaultLitePullConsumerImpl.consumeType():1111-1112
+        // 直接 return CONSUME_ACTIVELY（**不是** ConsumePassively）。broker 侧读这个字段的地方：
+        // ClientManageProcessor:87-92（ACTIVELY 心跳不做订阅注册，订阅由自带标志的拉取补偿）、
+        // PullMessageProcessor:493-505（isRejectPullConsumerEnabled 的 broker 据此拒拉）、
+        // :516-521（冷数据流控按 ACTIVELY 走另一支）、AdminBrokerProcessor:1971
+        // （consumerConnection 显示消费类型）。写成 Passively 会让 broker 把拉模式组当推送组看。
+        var cd = new ConsumerData(_consumerGroup, ConsumeType.ConsumeActively, _messageModel, _consumeFromWhere)
         {
             // Java MQClientInstance:1039：consumerData.setUnitMode(impl.isUnitMode())，
             // broker 据此给 %RETRY%group 打 UNIT_SUB(0x2)（ClientManageProcessor:113-118）。

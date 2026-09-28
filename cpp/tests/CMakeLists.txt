@@ -276,3 +276,12 @@ add_test(NAME offset_illegal_recover COMMAND rmq_test_offset_illegal_recover)
 add_executable(rmq_test_reset_offset test_reset_offset.cpp)
 target_link_libraries(rmq_test_reset_offset PRIVATE rocketmq::remoting)
 add_test(NAME reset_offset COMMAND rmq_test_reset_offset)
+
+# 拉模式消费者心跳（#98）：Java DefaultMQPullConsumerImpl 靠实例级周期任务把本组
+# 注册给 broker（consumeType=CONSUME_ACTIVELY :348、consumeFromWhere=CONSUME_FROM_LAST_OFFSET
+# :353、订阅集 setSubVersion(0L) :357-385）；轻量拉取同样 ACTIVELY（:1111-1112）。
+# 判据取线上报文：假端点收 HEART_BEAT 的 JSON body 与 UNREGISTER_CLIENT(35) 的 extFields。
+# 与 python/tests/test_pull_consumer.py、python/tests/test_lite_pull_consumer.py 同题。
+add_executable(rmq_test_pull_consumer_heartbeat test_pull_consumer_heartbeat.cpp)
+target_link_libraries(rmq_test_pull_consumer_heartbeat PRIVATE rocketmq::remoting)
+add_test(NAME pull_consumer_heartbeat COMMAND rmq_test_pull_consumer_heartbeat)
