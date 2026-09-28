@@ -48,7 +48,11 @@
 //!   消息因 rebalance 锁未过期被 broker 立刻改投 `%DLQ%<group>`（`reconsumeTimes=3`、
 //!   `RETRY_TOPIC` 保留业务 topic）。
 //! - C12b 顺序侧的 `-1` 是**不设上限**（投过 >=18 次、`%DLQ%` 空），不是并发侧的 16。
-//!
+//! - C13 顺序消费的显式提交/回滚（Java `ConsumeMessageOrderlyService:244-300`）：关掉
+//!   `autoCommit` 后回 `COMMIT` 就是一批三条一次认可的**批量 ack**（位点直接到 3）；回
+//!   `ROLLBACK` 则把这批退回队首**本地**重投（间隔贴着 200ms 挂起、`reconsumeTimes`
+//!   不动、topic 不变，后面的消息不越位）；开着 `autoCommit` 回 `ROLLBACK` 是非法用法，
+//!   只 warn 并按成功 ack（同一个返回值，开关只有 autoCommit 一位）。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -1367,10 +1371,18 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
             .map_err(|e| format!("seek_to_begin failed: {e}"))?;
     }
     let mut msgs: Vec<Delivered> = Vec::new();
+    // seek_to_begin 必须在 start 之后（未 start 会报错），它把拉取游标拨回最小位点；
+    // 若拉取循环抢先把同一格拉进了本地缓冲，seek 只丢「offset 之前」的副本，同一个消息
+    // 会以同一 (queue_id, queue_offset) 交付两次。按存储位置去重：真有一式两份入死信，
+    // 副本落在不同的 queue_offset 上，不会被吃掉。
+    let mut seen_at: BTreeSet<(i32, i64)> = BTreeSet::new();
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     while Instant::now() < deadline {
         for m in lite.poll(Some(1000)).await {
-            msgs.push(Delivered::from(&m));
+            let d = Delivered::from(&m);
+            if seen_at.insert((d.queue_id, d.queue_offset)) {
+                msgs.push(d);
+            }
         }
         if msgs.is_empty() {
             continue;
@@ -1380,7 +1392,10 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
         let drain_to = Instant::now() + Duration::from_secs(3);
         while Instant::now() < drain_to {
             for m in lite.poll(Some(500)).await {
-                msgs.push(Delivered::from(&m));
+                let d = Delivered::from(&m);
+                if seen_at.insert((d.queue_id, d.queue_offset)) {
+                    msgs.push(d);
+                }
             }
         }
         break;
@@ -2581,6 +2596,126 @@ impl MessageListenerOrderly for SuspendTimingListener {
     }
 }
 
+/// C13 用的顺序 listener：显式提交 / 显式回滚 / 非法回滚三种姿态。
+///
+/// 与 `LiveListener` 分开的原因：这里的判据是**返回值与 autoCommit 的交互本身**，
+/// 而不是消息内容；三档共用一份投递流水，比较「同一批投了几次、间隔多长、topic 变没变」。
+struct OrderlyManualListener {
+    mode: ManualMode,
+    head: String,
+    rollback_calls: usize,
+    head_calls: AtomicUsize,
+    /// [(body, reconsumeTimes, topic, at)]，按投递顺序累积。
+    records: Mutex<Vec<(String, i32, String, Instant)>>,
+    /// 每次 listener 调用记一条（元素 = 这一批的 body 列表）。
+    batches: Mutex<Vec<Vec<String>>>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ManualMode {
+    /// autoCommit=false + COMMIT：显式**批量 ack**（Java:275-277）。
+    CommitOnce,
+    /// autoCommit=false：head 头 N 次回 ROLLBACK、之后回 COMMIT（Java:278-285）。
+    RollbackThenCommit,
+    /// **不碰** autoCommit（保持默认 true）却回 ROLLBACK —— Java:246-250 的非法用法。
+    IllegalRollback,
+}
+
+impl OrderlyManualListener {
+    fn new(mode: ManualMode, head: &str, rollback_calls: usize) -> Arc<OrderlyManualListener> {
+        Arc::new(OrderlyManualListener {
+            mode,
+            head: head.to_string(),
+            rollback_calls,
+            head_calls: AtomicUsize::new(0),
+            records: Mutex::new(Vec::new()),
+            batches: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn count(&self, body: &str) -> usize {
+        lock(&self.records).iter().filter(|r| r.0 == body).count()
+    }
+
+    fn head_records(&self) -> Vec<(String, i32, String, Instant)> {
+        lock(&self.records)
+            .iter()
+            .filter(|r| r.0 == self.head)
+            .cloned()
+            .collect()
+    }
+
+    fn first_index(&self, body: &str) -> i64 {
+        lock(&self.records)
+            .iter()
+            .position(|r| r.0 == body)
+            .map(|i| i as i64)
+            .unwrap_or(-1)
+    }
+
+    fn nth_index(&self, body: &str, n: usize) -> i64 {
+        lock(&self.records)
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.0 == body)
+            .map(|(i, _)| i as i64)
+            .nth(n)
+            .unwrap_or(-1)
+    }
+
+    fn batches(&self) -> Vec<Vec<String>> {
+        lock(&self.batches).clone()
+    }
+
+    fn gaps(&self) -> Vec<f64> {
+        let head = self.head_records();
+        head.windows(2)
+            .map(|w| (w[1].3 - w[0].3).as_secs_f64())
+            .collect()
+    }
+}
+
+impl MessageListenerOrderly for OrderlyManualListener {
+    fn consume_message(
+        &self,
+        msgs: &[MessageExt],
+        context: &mut ConsumeOrderlyContext,
+    ) -> ConsumeOrderlyStatus {
+        let now = Instant::now();
+        let mut hit = false;
+        {
+            let mut recs = lock(&self.records);
+            let mut batch = Vec::with_capacity(msgs.len());
+            for m in msgs {
+                let d = Delivered::from(m);
+                if d.body == self.head {
+                    hit = true;
+                }
+                batch.push(d.body.clone());
+                recs.push((d.body, d.reconsume_times, d.topic, now));
+            }
+            lock(&self.batches).push(batch);
+        }
+        match self.mode {
+            ManualMode::CommitOnce => {
+                context.auto_commit = false;
+                ConsumeOrderlyStatus::Commit
+            }
+            ManualMode::RollbackThenCommit => {
+                context.auto_commit = false;
+                if hit {
+                    let n = self.head_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n <= self.rollback_calls {
+                        return ConsumeOrderlyStatus::Rollback;
+                    }
+                }
+                ConsumeOrderlyStatus::Commit
+            }
+            ManualMode::IllegalRollback => ConsumeOrderlyStatus::Rollback,
+        }
+    }
+}
+
 fn median(xs: &[f64]) -> f64 {
     let mut s = xs.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2680,6 +2815,201 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     cb.shutdown();
 }
 
+/// C13 顺序消费的显式批量 ack 与显式回滚（Java `ConsumeMessageOrderlyService:244-300`）。
+///
+/// 三条腿的差别只在**返回值**与 **autoCommit 这一个布尔位**，但真机行为完全可分：
+///
+/// - C13a `autoCommit=false` + `COMMIT` = 显式**批量 ack**（Java:275-277）：三条一批一次
+///   认可，broker 位点一次走到 3，同一批在观察窗口内不再投递。把 COMMIT 当"不提交"
+///   处理时这批会被挂起节奏重投几十次。
+/// - C13b `autoCommit=false` + `ROLLBACK` = 显式**回滚 + 立即重投**（Java:278-285）：
+///   这一批退回队首、按（钳过的）挂起时长在**本地**重投 —— 不过 broker、不换 topic、
+///   `reconsumeTimes` 不动。判据落在间隔量级上：挂起 200ms ⇒ 中位间隔百毫秒级；任何
+///   "交给 broker 走 %RETRY%"的实现最快也只能等第一个延迟档（delayLevel=3 即 10s）。
+///   同时验"回滚期间后面的消息不越位、显式提交后立刻放行"。
+/// - C13c `autoCommit=true`（默认）+ `ROLLBACK` 是**非法用法**：Java:246-250 只 warn、
+///   不写 break，顺势落进 SUCCESS 分支（消息照 ack）。同一个返回值在 C13b/C13c 行为
+///   相反，开关只有 autoCommit 一位 —— 任一边写反都必然在其中一条上红。
+async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
+    println!("-- C13 顺序消费的显式批量 ack / 显式回滚（立即重投）/ 非法用法");
+
+    // ---- C13a autoCommit=false + COMMIT：显式批量 ack ----
+    // 三条**先发后起**（新组显式从队首，与 C4c 的部分 ack 同约定）+ 批量上限 3：
+    // 首批必然是完整的三条，"整批一次认可"才有确定性的观察面。
+    let topic = fx.topic_name("OrdCommit");
+    let group = fx.group_name("ordcommit");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C13a create topic", &e);
+    }
+    let listener = OrderlyManualListener::new(ManualMode::CommitOnce, "", 0);
+    let mut cfg = fx.base_config(&group);
+    cfg.consume_message_batch_max_size = 3;
+    cfg.suspend_current_queue_time_millis = 200;
+    let c = match DefaultMQPushConsumer::with_config(cfg) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C13a build consumer", &format!("{e}")),
+    };
+    if let Err(e) = c.subscribe(&topic, "*") {
+        return ck.abort("C13a subscribe", &format!("{e}"));
+    }
+    c.set_message_listener_orderly(listener.clone());
+    let sent = fx.produce(&topic, "T13a", 3, Some(0)).await;
+    let want: Vec<String> = (0..3).map(|i| format!("{topic}-{i:03}")).collect();
+    if let Err(e) = c.start().await {
+        return ck.abort("C13a start", &format!("{e}"));
+    }
+    let arrived = poll_until(|| !listener.batches().is_empty(), 30).await;
+    tokio::time::sleep(Duration::from_secs(6)).await; // 反证窗口：当"不提交"办会被重投 ~30 次
+    c.shutdown();
+    let batches = listener.batches();
+    ck.check(
+        "C13a 首批是完整的三元素批次（先发后起 + 批量上限 3）",
+        arrived && batches.len() == 1 && batches[0].len() == 3,
+        &format!("batches={batches:?} sent={}", sent.len()),
+    );
+    ck.check(
+        "C13a 显式 COMMIT 整批认可：只投一次、三条都不重投",
+        batches == vec![want.clone()],
+        &format!("batches={batches:?}"),
+    );
+    let committed = fx.wait_committed(&group, &topic, 1, 3).await;
+    ck.check(
+        "C13a broker 位点一次前进到 3（整批 ack，不是卡在 0）",
+        committed == 3,
+        &format!("committed={committed}"),
+    );
+
+    // ---- C13b autoCommit=false + ROLLBACK：显式回滚、本地立即重投 ----
+    // 回滚 6 次后显式提交：前 6 次每次把这条退回来，且**不走 broker**。
+    let topic = fx.topic_name("OrdRollback");
+    let group = fx.group_name("ordrollback");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C13b create topic", &e);
+    }
+    let head = format!("{topic}-000");
+    let next = format!("{topic}-001");
+    let listener = OrderlyManualListener::new(ManualMode::RollbackThenCommit, &head, 6);
+    let mut cfg = fx.base_config(&group);
+    cfg.consume_message_batch_max_size = 1;
+    cfg.suspend_current_queue_time_millis = 200;
+    let c = match DefaultMQPushConsumer::with_config(cfg) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C13b build consumer", &format!("{e}")),
+    };
+    if let Err(e) = c.subscribe(&topic, "*") {
+        return ck.abort("C13b subscribe", &format!("{e}"));
+    }
+    c.set_message_listener_orderly(listener.clone());
+    if let Err(e) = c.start().await {
+        return ck.abort("C13b start", &format!("{e}"));
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await; // 等首轮 LOCK_BATCH_MQ
+    fx.produce(&topic, "T13b", 2, Some(0)).await;
+    let ok = poll_until(
+        || listener.first_index(&next) >= 0 && listener.head_calls.load(Ordering::SeqCst) >= 7,
+        45,
+    )
+    .await;
+    let head_at = listener.head_records();
+    let gaps = listener.gaps();
+    let med = median(&gaps);
+    let worst = gaps.iter().cloned().fold(0.0f64, f64::max);
+    let idx7 = listener.nth_index(&head, 6);
+    let idx_next = listener.first_index(&next);
+    ck.check(
+        "C13b 显式回滚把同一批退回重投（head 投递 7 次 = 6 次回滚 + 1 次提交）",
+        ok && head_at.len() >= 7,
+        &format!("deliveries={}", head_at.len()),
+    );
+    ck.check(
+        "C13b 本地重投不过 broker：相邻间隔贴着 200ms 挂起（%RETRY% 最快 10s 档）",
+        gaps.len() >= 5 && med < 1.0 && worst < 5.0,
+        &format!(
+            "n={} median={med:.3}s max={worst:.3}s gaps={:?}",
+            gaps.len(),
+            gaps.iter().take(6).map(|g| (g * 1000.0).round() / 1000.0).collect::<Vec<_>>()
+        ),
+    );
+    ck.check(
+        "C13b 本地重投不动 reconsumeTimes（全 0）且不换 topic",
+        !head_at.is_empty()
+            && head_at.iter().all(|r| r.1 == 0)
+            && head_at.iter().all(|r| r.2 == topic),
+        &format!(
+            "times={:?} topics={:?}",
+            head_at.iter().take(8).map(|r| r.1).collect::<Vec<_>>(),
+            head_at.iter().map(|r| r.2.clone()).collect::<BTreeSet<_>>()
+        ),
+    );
+    ck.check(
+        "C13b 回滚期间后面的消息不越位（next 首次出现在第 7 次投递之后）",
+        idx7 >= 0 && idx_next > idx7,
+        &format!("idx7={idx7} idxNext={idx_next}"),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await; // 反证窗口：提交后 head 不该再回来
+    ck.check(
+        "C13b 显式提交后各投一次（提交真的把 head 放掉了）",
+        listener.count(&head) == 7 && listener.count(&next) == 1,
+        &format!(
+            "head={} next={}",
+            listener.count(&head),
+            listener.count(&next)
+        ),
+    );
+    c.shutdown();
+    let committed = fx.wait_committed(&group, &topic, 1, 2).await;
+    ck.check(
+        "C13b broker 位点前进到 2（两条都 ack 完）",
+        committed == 2,
+        &format!("committed={committed}"),
+    );
+
+    // ---- C13c autoCommit=true（默认）+ ROLLBACK：非法用法，按 ack 处理 ----
+    let topic = fx.topic_name("OrdIllegal");
+    let group = fx.group_name("ordillegal");
+    if let Err(e) = fx.create_topic(&topic, 1).await {
+        return ck.abort("C13c create topic", &e);
+    }
+    let head = format!("{topic}-000");
+    let next = format!("{topic}-001");
+    let listener = OrderlyManualListener::new(ManualMode::IllegalRollback, &head, 0);
+    let mut cfg = fx.base_config(&group);
+    cfg.consume_message_batch_max_size = 1;
+    cfg.suspend_current_queue_time_millis = 200;
+    let c = match DefaultMQPushConsumer::with_config(cfg) {
+        Ok(v) => v,
+        Err(e) => return ck.abort("C13c build consumer", &format!("{e}")),
+    };
+    if let Err(e) = c.subscribe(&topic, "*") {
+        return ck.abort("C13c subscribe", &format!("{e}"));
+    }
+    c.set_message_listener_orderly(listener.clone());
+    if let Err(e) = c.start().await {
+        return ck.abort("C13c start", &format!("{e}"));
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    fx.produce(&topic, "T13c", 2, Some(0)).await;
+    let ok = poll_until(|| listener.first_index(&next) >= 0, 30).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await; // 反证窗口：真回滚的话会重投 ~10 次
+    ck.check(
+        "C13c autoCommit=true 时 ROLLBACK 按 ack 处理：head 只投一次",
+        listener.count(&head) == 1,
+        &format!("head={}", listener.count(&head)),
+    );
+    ck.check(
+        "C13c 非法 ROLLBACK 不阻塞队列：next 被消费",
+        ok && listener.count(&next) == 1,
+        &format!("next={}", listener.count(&next)),
+    );
+    c.shutdown();
+    let committed = fx.wait_committed(&group, &topic, 1, 2).await;
+    ck.check(
+        "C13c broker 位点前进到 2（非法用法按成功 ack）",
+        committed == 2,
+        &format!("committed={committed}"),
+    );
+}
+
 // ---------------------------------------------------------------- C10 清理
 async fn c10_cleanup(ck: &mut Checker, fx: &mut Fixture) {
     println!("-- C10 清理");
@@ -2768,6 +3098,7 @@ async fn run(namesrv: &str) -> Checker {
     c12_orderly_dlq(&mut ck, &fx).await;
     c12b_orderly_no_cap(&mut ck, &fx).await;
     c12c_orderly_suspend_millis(&mut ck, &fx).await;
+    c13_orderly_explicit_commit_rollback(&mut ck, &fx).await;
     c10_cleanup(&mut ck, &mut fx).await;
     ck
 }

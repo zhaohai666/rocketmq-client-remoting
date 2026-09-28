@@ -37,6 +37,17 @@
      本端口没有把 ProcessQueue 交给 listener，等价地塞回队首等一个挂起周期 —— 被持有的
      那条要投递多次，后一条在「放行」（listener 把 autoCommit 拨回 true）之前不出现。
      忽略 autoCommit 直接当成功 ack 的话，毒消息第一轮就被吞掉、后一条立刻被消费。
+  O5 autoCommit=false + COMMIT = 显式**批量 ack**（Java:275-277）：一批三条一次认可，
+     broker 位点从 0 直接跳到 3，同一批在整个观察窗口内不再投递。把 COMMIT 也当成
+     "不提交"（或漏掉这个分支）时这批会被按挂起节奏无限重投。
+  O6 autoCommit=false + ROLLBACK = 显式**回滚 + 立即重投**（Java:278-285）：这一批退回
+     队首、按（钳过的）挂起时长在**本地**重投 —— 不过 broker、不换 topic、reconsumeTimes
+     不动。判据落在间隔量级上：挂起 200ms ⇒ 相邻投递中位间隔百毫秒级；真走 %RETRY% 的
+     实现最快也只能等 broker 的第一个延迟档（delayLevel=3 即 10s），差一个量级。
+     同时验"回滚期间后面的消息不越位、显式提交后立刻放行"。
+  O7 autoCommit=true（默认）+ ROLLBACK 是**非法用法**：Java:246-250 只 warn、不写 break，
+     顺势落进 SUCCESS 分支（消息照 ack、不回滚）。同一个返回值在 O6/O7 行为相反，开关
+     只有 autoCommit 这一个布尔位 —— 任一边写反都必然在 O6 或 O7 上红。
 """
 from __future__ import annotations
 
@@ -163,6 +174,42 @@ def read_dlq(group: str, timeout: float = 25.0):
     return dlq, out
 
 
+def broker_offsets(group: str, topic: str):
+    """[(mq, committed or None)]：broker 侧该组在这条 topic 上各队列的已消费位点。
+
+    位点在客户端侧是异步刷的（消费者自己的持久化循环 / shutdown 各刷一次），所以调用方
+    要用有界轮询等它到位，不能查一次就断言（``committed=None`` = broker 上查无记录，
+    与记录本身是 0 不同）。"""
+    c = MQClientInstance("ord-off-%d" % int(time.time() * 1000), [NAMESRV])
+    c.start()
+    try:
+        pub = c.get_topic_publish_info(topic)
+        if pub is None or not pub.msg_queue_list:
+            return None
+        rows = []
+        for mq in pub.msg_queue_list:
+            try:
+                rows.append((mq, c.query_consumer_offset(
+                    group, mq, set_zero_if_not_found=False)))
+            except Exception:  # noqa: BLE001
+                rows.append((mq, None))
+        return rows
+    finally:
+        c.shutdown()
+
+
+def wait_offsets(group: str, topic: str, want, timeout: float = 20.0):
+    """有界轮询 broker 位点直到 ``want(rows)`` 成立，返回最后一次的观测。"""
+    deadline = time.time() + timeout
+    rows = None
+    while time.time() < deadline:
+        rows = broker_offsets(group, topic)
+        if rows and want(rows):
+            return rows
+        time.sleep(1)
+    return rows
+
+
 class PoisonListener(MessageListenerOrderly):
     """毒消息一直挂起（每次都返回 SUSPEND，永不「成功」），其余照常成功。
 
@@ -240,6 +287,106 @@ class ManualHoldListener(MessageListenerOrderly):
             if r[0] == body:
                 return i
         return -1
+
+
+class ExplicitCommitListener(MessageListenerOrderly):
+    """autoCommit=false + COMMIT：listener 拿提交权并**显式整批认可**（Java:275-277）。
+
+    与 O4 的差别只在返回值：O4 回 SUCCESS（不提交、反复投递），这里回 COMMIT（整批
+    ack、位点一次走到批尾）。把 COMMIT 当"不提交"处理时这批会被按挂起节奏无限重投，
+    ``batches`` 立刻不止一批。
+    """
+
+    def __init__(self):
+        self.batches = []          # [[(body, reconsumeTimes, topic), ...], ...]
+
+    def consume_message(self, msgs, context):
+        context.auto_commit = False
+        self.batches.append([(bytes(m.body), m.get_reconsume_times(), m.topic)
+                             for m in msgs])
+        return ConsumeOrderlyStatus.COMMIT
+
+
+class ExplicitRollbackListener(MessageListenerOrderly):
+    """autoCommit=false + ROLLBACK：头 ``rollback_calls`` 次显式回滚，之后显式提交。
+
+    Java:278-285 —— rollback() 把这一批退回 ProcessQueue，随后 submitConsumeRequestLater
+    按挂起时长重新派发：**本地重投**，不过 broker、不换 topic、reconsumeTimes 不动。
+    所以最硬的判据是**间隔量级**：挂起 200ms 时相邻投递应在一秒内，而任何"交给
+    broker 走 %RETRY%"的实现最快也要等 delayLevel=3 的 10s 档。
+    """
+
+    def __init__(self, rollback_calls: int, head: bytes):
+        self.rollback_calls = rollback_calls
+        self.head = head
+        self.records = []          # [(body, reconsumeTimes, topic, time)]
+        self.head_calls = 0
+        self._lock = threading.Lock()
+
+    def consume_message(self, msgs, context):
+        context.auto_commit = False
+        now = time.time()
+        hit = any(bytes(m.body) == self.head for m in msgs)
+        with self._lock:
+            for m in msgs:
+                self.records.append((bytes(m.body), m.get_reconsume_times(),
+                                     m.topic, now))
+            if hit:
+                self.head_calls += 1
+            n = self.head_calls
+        if hit and n <= self.rollback_calls:
+            return ConsumeOrderlyStatus.ROLLBACK
+        return ConsumeOrderlyStatus.COMMIT
+
+    def head_records(self):
+        with self._lock:
+            return [r for r in self.records if r[0] == self.head]
+
+    def first_index(self, body: bytes):
+        with self._lock:
+            for i, r in enumerate(self.records):
+                if r[0] == body:
+                    return i
+            return -1
+
+    def count(self, body: bytes):
+        with self._lock:
+            return len([r for r in self.records if r[0] == body])
+
+    def nth_index(self, body: bytes, n: int):
+        """第 n 次（0 基）投递在整条投递流水里的位置；不足 n+1 次时返回 -1。"""
+        with self._lock:
+            hits = [i for i, r in enumerate(self.records) if r[0] == body]
+        return hits[n] if len(hits) > n else -1
+
+
+class IllegalRollbackListener(MessageListenerOrderly):
+    """autoCommit 保持默认 true，却返回 ROLLBACK（Java:246-250 的非法用法）。
+
+    期望行为：只 warn，随后**按 SUCCESS 处理**（消息照 ack）。真按回滚办的话这条会被
+    按挂起节奏反复投递、后面的消息永远不放行 —— 两种行为在真机上完全可分。
+    """
+
+    def __init__(self):
+        self.records = []
+        self._lock = threading.Lock()
+
+    def consume_message(self, msgs, context):
+        with self._lock:
+            for m in msgs:
+                self.records.append((bytes(m.body), m.get_reconsume_times(), m.topic))
+        return ConsumeOrderlyStatus.ROLLBACK
+
+    def count(self, body: bytes):
+        with self._lock:
+            return len([r for r in self.records if r[0] == body])
+
+    def first_index(self, body: bytes):
+        with self._lock:
+            for i, r in enumerate(self.records):
+                if r[0] == body:
+                    return i
+            return -1
 
 
 def main() -> int:
@@ -446,6 +593,128 @@ def main() -> int:
           "afterIdx=%d auto=%s" % (after_idx,
                                    listener4.records[after_idx][1] if after_idx >= 0 else None))
     c4.shutdown()
+
+    # ---------- O5 autoCommit=false + COMMIT = 显式批量 ack ----------
+    # 三条**先发后起**（新组显式从队首，与 ackIndex 那套用例同约定）、批量上限 3：
+    # 首批必然是完整的三条，「整批一次认可」才有确定性的观察面。三条判据：首批就是
+    # 三元素、整个窗口只投一次（漏掉 COMMIT 分支时会被挂起节奏重投几十次）、broker
+    # 位点一次走到 3。
+    topic5 = PREFIX + "_OrdCommit"
+    group5 = PREFIX + "_g5"
+    prepare_topic(topic5)
+    listener5 = ExplicitCommitListener()
+    c5 = DefaultMQPushConsumer(group5)
+    c5.set_namesrv_addr(NAMESRV)
+    c5.set_message_listener(listener5)
+    c5.consume_message_batch_max_size = 3
+    c5.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
+    c5.suspend_current_queue_time_millis = 200
+    c5.subscribe(topic5, "*")
+    producer.send(Message(topic5, b"ack-1"))
+    producer.send(Message(topic5, b"ack-2"))
+    producer.send(Message(topic5, b"ack-3"))
+    c5.start()
+    deadline = time.time() + 30
+    while time.time() < deadline and len(listener5.batches) < 1:
+        time.sleep(0.5)
+    time.sleep(6)      # 反证窗口：把 COMMIT 当"不提交"的实现这 6s 里会重投 ~30 次
+    c5.shutdown()
+    offs5 = wait_offsets(group5, topic5, lambda rows: all(o == 3 for _, o in rows))
+    got5 = [[b[0] for b in batch] for batch in listener5.batches]
+    check("O5-首批就是一个完整的三元素批次（先发后起 + 批量上限 3）",
+          len(listener5.batches) == 1 and len(listener5.batches[0]) == 3,
+          "batches=%s" % got5)
+    check("O5-显式 COMMIT 整批认可：只投一次、三条都不重投",
+          got5 == [[b"ack-1", b"ack-2", b"ack-3"]], "batches=%s" % got5)
+    check("O5-broker 位点一次前进到 3（整批 ack，不是卡在 0）",
+          offs5 is not None and all(o == 3 for _, o in offs5),
+          "offsets=%s" % [o for _, o in offs5] if offs5 else "routes=none")
+
+    # ---------- O6 autoCommit=false + ROLLBACK = 显式回滚、本地立即重投 ----------
+    # 回滚 6 次后显式提交。前 6 次每次都把这条退回来，且**不走 broker**：相邻投递的间隔
+    # 贴着挂起的 200ms（走 %RETRY% 的实现最快也只能等 broker 的 10s 档）、reconsumeTimes
+    # 保持 0、topic 一直是业务 topic；第 7 次提交才放行后面那条（回滚期间它一次不越位）。
+    topic6 = PREFIX + "_OrdRollback"
+    group6 = PREFIX + "_g6"
+    prepare_topic(topic6)
+    listener6 = ExplicitRollbackListener(rollback_calls=6, head=b"rb-head")
+    c6 = DefaultMQPushConsumer(group6)
+    c6.set_namesrv_addr(NAMESRV)
+    c6.set_message_listener(listener6)
+    c6.consume_message_batch_max_size = 1
+    c6.suspend_current_queue_time_millis = 200
+    c6.subscribe(topic6, "*")
+    c6.start()
+    time.sleep(4)
+    producer.send(Message(topic6, b"rb-head"))
+    producer.send(Message(topic6, b"rb-next"))
+    deadline = time.time() + 45
+    while time.time() < deadline and (listener6.head_calls < 7
+                                      or listener6.first_index(b"rb-next") < 0):
+        time.sleep(0.5)
+    head6 = listener6.head_records()
+    gaps6 = [b[3] - a[3] for a, b in zip(head6, head6[1:])]
+    med6 = median(gaps6)
+    idx7 = listener6.nth_index(b"rb-head", 6)
+    idx_next = listener6.first_index(b"rb-next")
+    check("O6-显式回滚把同一批退回重投（head 投递 7 次 = 6 次回滚 + 1 次提交）",
+          len(head6) >= 7, "deliveries=%d" % len(head6))
+    check("O6-本地重投不过 broker：相邻间隔贴着 200ms 挂起（%RETRY% 最快 10s 档）",
+          len(gaps6) >= 5 and med6 < 1.0 and max(gaps6) < 5.0,
+          "n=%d median=%.3fs max=%.3fs gaps=%s"
+          % (len(gaps6), med6, max(gaps6) if gaps6 else -1.0,
+             [round(g, 3) for g in gaps6[:6]]))
+    check("O6-本地重投不动 reconsumeTimes（全 0）且不换 topic",
+          bool(head6) and all(r[1] == 0 for r in head6)
+          and all(r[2] == topic6 for r in head6),
+          "times=%s topics=%s" % ([r[1] for r in head6[:8]],
+                                  sorted({r[2] for r in head6})))
+    check("O6-回滚期间后面的消息不越位（next 首次出现在第 7 次投递之后）",
+          idx7 >= 0 and idx_next > idx7, "idx7=%d idxNext=%d" % (idx7, idx_next))
+    time.sleep(2)      # 反证窗口：提交之后 head 不该再回来
+    check("O6-显式提交后各投一次（提交真的把 head 放掉了）",
+          listener6.count(b"rb-head") == 7 and listener6.count(b"rb-next") == 1,
+          "head=%d next=%d" % (listener6.count(b"rb-head"),
+                               listener6.count(b"rb-next")))
+    c6.shutdown()
+    offs6 = wait_offsets(group6, topic6, lambda rows: all(o == 2 for _, o in rows))
+    check("O6-broker 位点前进到 2（两条都 ack 完）",
+          offs6 is not None and all(o == 2 for _, o in offs6),
+          "offsets=%s" % [o for _, o in offs6] if offs6 else "routes=none")
+
+    # ---------- O7 autoCommit=true + ROLLBACK = 非法用法，按 ack 处理 ----------
+    # 与 O6 只差 autoCommit 这一个布尔位：listener 不碰它（默认 true）却返回 ROLLBACK。
+    # Java:246-250 只 warn、不写 break ⇒ 顺势落进 SUCCESS 分支（消息照 ack）。真按回滚
+    # 办的话 head 会被挂起节奏反复投递、next 永远不放行 —— 两种行为在真机上完全可分。
+    topic7 = PREFIX + "_OrdIllegal"
+    group7 = PREFIX + "_g7"
+    prepare_topic(topic7)
+    listener7 = IllegalRollbackListener()
+    c7 = DefaultMQPushConsumer(group7)
+    c7.set_namesrv_addr(NAMESRV)
+    c7.set_message_listener(listener7)
+    c7.consume_message_batch_max_size = 1
+    c7.suspend_current_queue_time_millis = 200
+    c7.subscribe(topic7, "*")
+    c7.start()
+    time.sleep(4)
+    producer.send(Message(topic7, b"il-head"))
+    producer.send(Message(topic7, b"il-next"))
+    deadline = time.time() + 30
+    while time.time() < deadline and listener7.first_index(b"il-next") < 0:
+        time.sleep(0.5)
+    time.sleep(2.5)    # 反证窗口：真按回滚办的话这 2.5s 里 head 会被重投 ~10 次
+    check("O7-autoCommit=true 时 ROLLBACK 按 ack 处理：head 只投一次",
+          listener7.count(b"il-head") == 1, "head=%d" % listener7.count(b"il-head"))
+    check("O7-非法 ROLLBACK 不阻塞队列：next 立刻被消费",
+          listener7.first_index(b"il-next") >= 0,
+          "idxNext=%d next=%d" % (listener7.first_index(b"il-next"),
+                                  listener7.count(b"il-next")))
+    c7.shutdown()
+    offs7 = wait_offsets(group7, topic7, lambda rows: all(o == 2 for _, o in rows))
+    check("O7-broker 位点前进到 2（非法用法按成功 ack）",
+          offs7 is not None and all(o == 2 for _, o in offs7),
+          "offsets=%s" % [o for _, o in offs7] if offs7 else "routes=none")
 
     producer.shutdown()
     print("\nPASS=%d FAIL=%d" % (PASS, FAIL))

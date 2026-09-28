@@ -151,17 +151,26 @@ DlqSight readDlq(const std::string& nsAddr, const std::string& dlqTopic,
     reader.assign(queues);
     reader.start();
     for (const MessageQueue& mq : queues) reader.seekToBegin(mq);
+    // seekToBegin 必须在 start() 之后（未 start 会抛），它会把拉取游标拨回最小位点；
+    // 若拉取循环抢先把同一格拉进了本地缓冲，那次交付的副本不会被 seek 清掉（seek 只丢
+    // 「offset 之前」的），于是同一个消息会以同一 (queueId, queueOffset) 出现两次。
+    // 按存储位置去重：真有一式两份入死信，副本落在不同的 queueOffset 上，不会被吃掉。
+    std::set<std::pair<int32_t, int64_t>> seenAt;
+    auto collect = [&](const std::vector<MessageExt>& batch) {
+        for (const MessageExt& m : batch) {
+            if (seenAt.insert({m.queueId, m.queueOffset}).second) sight.msgs.push_back(m);
+        }
+    };
     const int64_t deadline = nowMs() + timeoutMs;
     while (nowMs() < deadline) {
         std::vector<MessageExt> batch = reader.poll(1000);
         if (batch.empty()) continue;
-        sight.msgs.insert(sight.msgs.end(), batch.begin(), batch.end());
+        collect(batch);
         // 收到后再多轮询几趟：断言「死信里只有这一条」要求把后面的也排空，
         // 但总窗口必须有界，否则正向用例每次都要白等满 timeoutMs。
         const int64_t drainTo = nowMs() + 3000;
         while (nowMs() < drainTo) {
-            std::vector<MessageExt> more = reader.poll(500);
-            sight.msgs.insert(sight.msgs.end(), more.begin(), more.end());
+            collect(reader.poll(500));
         }
         break;
     }
@@ -1382,6 +1391,356 @@ int main(int argc, char* argv[]) {
                   "n=" + std::to_string(sink.count()) + " median=" + std::to_string(med) + "s");
             consumer->shutdown();
         }
+    }
+
+    // ---------------- S13 顺序消费的显式批量 ack 与显式回滚（立即重投）----------------
+    // Java ConsumeMessageOrderlyService:244-300：autoCommit=false 时提交权在 listener 手里 ——
+    // COMMIT 走 processQueue.commit() 整批认可（:275-277）；ROLLBACK 走 processQueue.rollback()
+    // 把这批退回队首、再 submitConsumeRequestLater(context.getSuspendCurrentQueueTimeMillis())
+    // （:278-285）：**本地**重投，不过 broker、不换 topic、reconsumeTimes 不动。而
+    // autoCommit=true（默认）时 COMMIT/ROLLBACK 是非法用法：Java 只 warn、不写 break，
+    // 顺势落进 SUCCESS 分支（:246-250），消息照 ack。
+    // 三条腿的差别只在返回值与 autoCommit 这一个布尔位，而真机行为完全可分：本地重投的
+    // 相邻间隔贴着挂起时长（200ms 档 + 分发节拍），任何"交给 broker 走 %RETRY%"的实现
+    // 最快也只能等第一个延迟档（delayLevel=3 即 10s），差一个数量级。
+    {
+        enum class Manual { COMMIT_ONCE, ROLLBACK_THEN_COMMIT, ILLEGAL_ROLLBACK };
+
+        struct ManualSink {
+            std::mutex mtx;
+            std::vector<std::vector<std::string>> batches;
+            std::vector<std::string> bodies;
+            std::vector<int32_t> times;      // 每次投递的 reconsumeTimes
+            std::vector<std::string> topics;
+            std::vector<int64_t> at;         // 每次投递的时刻（毫秒）
+            int32_t headCalls = 0;
+
+            std::vector<std::vector<std::string>> batchSnapshot() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return batches;
+            }
+            std::vector<std::string> bodySnapshot() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return bodies;
+            }
+            size_t count(const std::string& body) {
+                std::lock_guard<std::mutex> lk(mtx);
+                size_t n = 0;
+                for (const std::string& b : bodies) {
+                    if (b == body) ++n;
+                }
+                return n;
+            }
+            int64_t firstIndex(const std::string& body) {
+                std::lock_guard<std::mutex> lk(mtx);
+                for (size_t i = 0; i < bodies.size(); ++i) {
+                    if (bodies[i] == body) return static_cast<int64_t>(i);
+                }
+                return -1;
+            }
+            int64_t nthIndex(const std::string& body, size_t n) {
+                std::lock_guard<std::mutex> lk(mtx);
+                size_t seen = 0;
+                for (size_t i = 0; i < bodies.size(); ++i) {
+                    if (bodies[i] == body && seen++ == n) return static_cast<int64_t>(i);
+                }
+                return -1;
+            }
+            int32_t headCount() {
+                std::lock_guard<std::mutex> lk(mtx);
+                return headCalls;
+            }
+            // 真机上 head 批批只含一条，投递时刻就是拍点；返回相邻间隔（秒）。
+            std::vector<double> headGaps(const std::string& head) {
+                std::lock_guard<std::mutex> lk(mtx);
+                std::vector<double> out;
+                int64_t prev = -1;
+                for (size_t i = 0; i < bodies.size(); ++i) {
+                    if (bodies[i] != head) continue;
+                    if (prev >= 0) out.push_back((at[i] - prev) / 1000.0);
+                    prev = at[i];
+                }
+                return out;
+            }
+            std::vector<int32_t> headTimes(const std::string& head) {
+                std::lock_guard<std::mutex> lk(mtx);
+                std::vector<int32_t> out;
+                for (size_t i = 0; i < bodies.size(); ++i) {
+                    if (bodies[i] == head) out.push_back(times[i]);
+                }
+                return out;
+            }
+            std::vector<std::string> headTopics(const std::string& head) {
+                std::lock_guard<std::mutex> lk(mtx);
+                std::vector<std::string> out;
+                for (size_t i = 0; i < bodies.size(); ++i) {
+                    if (bodies[i] == head) out.push_back(topics[i]);
+                }
+                return out;
+            }
+        };
+
+        class ManualListener : public MessageListenerOrderly {
+        public:
+            ManualListener(ManualSink& s, Manual mode, std::string head, int32_t rollbackCalls)
+                : sink_(s), mode_(mode), head_(std::move(head)), rollbackCalls_(rollbackCalls) {}
+
+            ConsumeOrderlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                                ConsumeOrderlyContext& ctx) override {
+                const int64_t at = nowMs();
+                bool hit = false;
+                int32_t n = 0;
+                {
+                    std::lock_guard<std::mutex> lk(sink_.mtx);
+                    std::vector<std::string> batch;
+                    batch.reserve(msgs.size());
+                    for (const MessageExt& m : msgs) {
+                        const std::string b = bodyOf(m);
+                        if (b == head_) hit = true;
+                        batch.push_back(b);
+                        sink_.bodies.push_back(b);
+                        sink_.times.push_back(m.getReconsumeTimes());
+                        sink_.topics.push_back(m.topic);
+                        sink_.at.push_back(at);
+                    }
+                    sink_.batches.push_back(std::move(batch));
+                    if (hit) ++sink_.headCalls;
+                    n = sink_.headCalls;
+                }
+                switch (mode_) {
+                    case Manual::COMMIT_ONCE:
+                        ctx.autoCommit = false;
+                        return ConsumeOrderlyStatus::COMMIT;
+                    case Manual::ROLLBACK_THEN_COMMIT:
+                        ctx.autoCommit = false;
+                        if (hit && n <= rollbackCalls_) {
+                            return ConsumeOrderlyStatus::ROLLBACK;
+                        }
+                        return ConsumeOrderlyStatus::COMMIT;
+                    case Manual::ILLEGAL_ROLLBACK:
+                    default:
+                        // 不碰 autoCommit（保持默认 true）却回 ROLLBACK —— Java:246-250 的非法用法
+                        return ConsumeOrderlyStatus::ROLLBACK;
+                }
+            }
+
+        private:
+            ManualSink& sink_;
+            Manual mode_;
+            std::string head_;
+            int32_t rollbackCalls_;
+        };
+
+        // 每段一个 topic，路由是各自刚建出来的，所以每段都重新取一次队列
+        // （不在建 topic 之前预取：那会把 fallback 路由塞进 producer 的发布缓存，
+        //  真正建出 1 队列的 topic 后仍可能挑到不存在的 queueId）
+        std::vector<MessageQueue> queues13;
+        DefaultMQAdminExt admin(gPrefix + "_admin13");
+        admin.setNamesrvAddr(nsAddr);
+
+        // ---- S13a autoCommit=false + COMMIT：显式批量 ack（Java:275-277）----
+        {
+            const std::string topic = gPrefix + "_OrdCommit";
+            const std::string group = gPrefix + "_g13a";
+            prepareTopic(producer, topic, 1);   // 1 队列：位点判据唯一
+
+            ManualSink sink;
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->setConsumeMessageBatchMaxSize(3);
+            consumer->setSuspendCurrentQueueTimeMillis(200);
+            consumer->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+            consumer->setMessageListener(std::make_shared<ManualListener>(
+                sink, Manual::COMMIT_ONCE, std::string(), 0));
+            consumer->subscribe(topic);
+            // 先发后起：首批必然是完整的三条（"整批一次认可"才有确定性的观察面）
+            producer.send(Message(topic, str2bytes("ack-1")));
+            producer.send(Message(topic, str2bytes("ack-2")));
+            producer.send(Message(topic, str2bytes("ack-3")));
+            consumer->start();
+            const bool firstBatch = waitUntil([&] { return !sink.batchSnapshot().empty(); }, 30000);
+            // 反证窗口：把 COMMIT 当"不提交"处理时这批会被挂起节奏重投 ~30 次
+            std::this_thread::sleep_for(std::chrono::seconds(6));
+            consumer->shutdown();
+
+            const std::vector<std::vector<std::string>> batches = sink.batchSnapshot();
+            std::string shape;
+            for (const auto& b : batches) {
+                shape += (shape.empty() ? "" : " | ");
+                for (const auto& s : b) shape += s + ",";
+            }
+            const bool oneThree =
+                firstBatch && batches.size() == 1 && batches.front().size() == 3;
+            check("S13a-首批是完整的三元素批次（先发后起 + 批量上限 3）", oneThree,
+                  "batches=" + std::to_string(batches.size()) + " shape=[" + shape + "]");
+            bool exact = batches.size() == 1 && batches.front().size() == 3
+                && batches.front()[0] == "ack-1" && batches.front()[1] == "ack-2"
+                && batches.front()[2] == "ack-3";
+            check("S13a-显式 COMMIT 整批认可：只投一次、三条都不重投", exact,
+                  "shape=[" + shape + "]");
+
+            queues13 = producer.fetchPublishMessageQueues(topic);
+            if (queues13.empty()) {
+                check("S13a-业务 topic 有队列可查位点", false, "queues=0");
+            } else {
+                admin.start();
+                int64_t committed = -1;
+                const MessageQueue mq = queues13.front();
+                auto readOffset = [&]() -> int64_t {
+                    int64_t off = -1;
+                    try {
+                        if (!admin.examineConsumerOffset(group, mq, off)) return -1;
+                    } catch (const std::exception&) {
+                        return -1;
+                    }
+                    return off;
+                };
+                const bool ok = waitUntil([&] { committed = readOffset(); return committed == 3; }, 30000);
+                check("S13a-broker 位点一次前进到 3（整批 ack，不是卡在 0）", ok,
+                      "committed=" + std::to_string(committed));
+                admin.shutdown();
+            }
+        }
+
+        // ---- S13b autoCommit=false + ROLLBACK：显式回滚、本地立即重投（Java:278-285）----
+        // 回滚 6 次后显式提交：前 6 次每次把这条退回来，且**不走 broker**。
+        {
+            const std::string topic = gPrefix + "_OrdRollback";
+            const std::string group = gPrefix + "_g13b";
+            const std::string head = "rb-head";
+            const std::string next = "rb-next";
+            prepareTopic(producer, topic, 1);
+
+            ManualSink sink;
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->setConsumeMessageBatchMaxSize(1);
+            consumer->setMaxReconsumeTimes(-1);
+            consumer->setSuspendCurrentQueueTimeMillis(200);
+            consumer->setMessageListener(std::make_shared<ManualListener>(
+                sink, Manual::ROLLBACK_THEN_COMMIT, head, 6));
+            consumer->subscribe(topic);
+            consumer->start();
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            producer.send(Message(topic, str2bytes(head)));
+            producer.send(Message(topic, str2bytes(next)));
+
+            const auto medianOf = [](std::vector<double> xs) {
+                std::sort(xs.begin(), xs.end());
+                const size_t n = xs.size();
+                if (n == 0) return 0.0;
+                return (n % 2 == 1) ? xs[n / 2] : (xs[n / 2 - 1] + xs[n / 2]) / 2.0;
+            };
+            const bool arrived = waitUntil([&] {
+                return sink.headCount() >= 7 && sink.firstIndex(next) >= 0;
+            }, 45000);
+            const std::vector<double> gaps = sink.headGaps(head);
+            const double med = medianOf(gaps);
+            double worst = 0;
+            for (double g : gaps) worst = std::max(worst, g);
+            const int64_t idx7 = sink.nthIndex(head, 6);
+            const int64_t idxNext = sink.firstIndex(next);
+            check("S13b-显式回滚把同一批退回重投（head 投递 7 次 = 6 次回滚 + 1 次提交）",
+                  arrived && sink.count(head) >= 7,
+                  "deliveries=" + std::to_string(sink.count(head)));
+            check("S13b-本地重投不过 broker：相邻间隔贴着 200ms 挂起（%RETRY% 最快 10s 档）",
+                  gaps.size() >= 5 && med < 1.0 && worst < 5.0,
+                  "n=" + std::to_string(gaps.size()) + " median=" + std::to_string(med)
+                      + "s max=" + std::to_string(worst) + "s");
+            const std::vector<int32_t> htimes = sink.headTimes(head);
+            const std::vector<std::string> htopics = sink.headTopics(head);
+            bool timesZero = !htimes.empty();
+            for (int32_t t : htimes) timesZero = timesZero && t == 0;
+            bool topicKept = !htopics.empty();
+            for (const std::string& t : htopics) topicKept = topicKept && t == topic;
+            check("S13b-本地重投不动 reconsumeTimes（全 0）且不换 topic",
+                  timesZero && topicKept,
+                  "times=" + std::to_string(htimes.empty() ? -1 : htimes.front())
+                      + " n=" + std::to_string(htimes.size()));
+            check("S13b-回滚期间后面的消息不越位（next 首次出现在第 7 次投递之后）",
+                  idx7 >= 0 && idxNext > idx7,
+                  "idx7=" + std::to_string(idx7) + " idxNext=" + std::to_string(idxNext));
+            // 反证窗口：提交之后 head 不该再回来
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            check("S13b-显式提交后各投一次（提交真的把 head 放掉了）",
+                  sink.count(head) == 7 && sink.count(next) == 1,
+                  "head=" + std::to_string(sink.count(head))
+                      + " next=" + std::to_string(sink.count(next)));
+            consumer->shutdown();
+
+            queues13 = producer.fetchPublishMessageQueues(topic);
+            if (!queues13.empty()) {
+                admin.start();
+                const MessageQueue mq = queues13.front();
+                int64_t committed = -1;
+                auto readOffset = [&]() -> int64_t {
+                    int64_t off = -1;
+                    try {
+                        if (!admin.examineConsumerOffset(group, mq, off)) return -1;
+                    } catch (const std::exception&) {
+                        return -1;
+                    }
+                    return off;
+                };
+                const bool ok = waitUntil([&] { committed = readOffset(); return committed == 2; }, 30000);
+                check("S13b-broker 位点前进到 2（两条都 ack 完）", ok,
+                      "committed=" + std::to_string(committed));
+                admin.shutdown();
+            }
+        }
+
+        // ---- S13c autoCommit=true（默认）+ ROLLBACK：非法用法，按 ack 处理（Java:246-250）----
+        {
+            const std::string topic = gPrefix + "_OrdIllegal";
+            const std::string group = gPrefix + "_g13c";
+            const std::string head = "il-head";
+            const std::string next = "il-next";
+            prepareTopic(producer, topic, 1);
+
+            ManualSink sink;
+            auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
+            consumer->setNamesrvAddr(nsAddr);
+            consumer->setConsumeMessageBatchMaxSize(1);
+            consumer->setSuspendCurrentQueueTimeMillis(200);
+            consumer->setMessageListener(std::make_shared<ManualListener>(
+                sink, Manual::ILLEGAL_ROLLBACK, head, 0));
+            consumer->subscribe(topic);
+            consumer->start();
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            producer.send(Message(topic, str2bytes(head)));
+            producer.send(Message(topic, str2bytes(next)));
+
+            const bool nextSeen = waitUntil([&] { return sink.count(next) >= 1; }, 30000);
+            // 反证窗口：真按回滚办的话这 2.5s 里 head 会被重投 ~10 次
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            check("S13c-autoCommit=true 时 ROLLBACK 按 ack 处理：head 只投一次",
+                  sink.count(head) == 1, "head=" + std::to_string(sink.count(head)));
+            check("S13c-非法 ROLLBACK 不阻塞队列：next 立刻被消费",
+                  nextSeen && sink.count(next) == 1,
+                  "next=" + std::to_string(sink.count(next)));
+            consumer->shutdown();
+
+            queues13 = producer.fetchPublishMessageQueues(topic);
+            if (!queues13.empty()) {
+                admin.start();
+                const MessageQueue mq = queues13.front();
+                int64_t committed = -1;
+                auto readOffset = [&]() -> int64_t {
+                    int64_t off = -1;
+                    try {
+                        if (!admin.examineConsumerOffset(group, mq, off)) return -1;
+                    } catch (const std::exception&) {
+                        return -1;
+                    }
+                    return off;
+                };
+                const bool ok = waitUntil([&] { committed = readOffset(); return committed == 2; }, 30000);
+                check("S13c-broker 位点前进到 2（非法用法按成功 ack）", ok,
+                      "committed=" + std::to_string(committed));
+                admin.shutdown();
+            }
+        }
+        (void)queues13;
     }
 
     producer.shutdown();

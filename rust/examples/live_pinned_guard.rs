@@ -243,7 +243,8 @@ impl Env {
     }
 
     async fn cleanup(&self, ck: &mut Checker) {
-        for topic in lock(&self.topics).clone() {
+        let topics = lock(&self.topics).clone();
+        for topic in topics {
             if let Err(e) = self.admin.delete_topic(&topic, None).await {
                 println!("  [WARN] delete_topic({topic}) failed: {e}");
             }
@@ -642,7 +643,7 @@ async fn run(namesrv: &str) -> Checker {
 
     // ---------------- S6 正腿收尾：消息一条不少 ----------------
     println!("\n-- S6 push 消费者收齐正腿消息 --");
-    let expected = vec![
+    let expected = [
         k_single.clone(),
         k_b1.clone(),
         k_b2.clone(),
