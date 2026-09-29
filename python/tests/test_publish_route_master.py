@@ -30,6 +30,8 @@ import pytest
 from rocketmq.client.exception import MQClientException
 from rocketmq.client.mq_client import MQClientInstance
 from rocketmq.common.message import MessageQueue
+from rocketmq.remoting.exception import (RemotingConnectException,
+                                         RemotingTimeoutException)
 from rocketmq.remoting.protocol.codes import ResponseCode
 from rocketmq.remoting.protocol.remoting_command import RemotingCommand
 from rocketmq.remoting.protocol.route import BrokerData, QueueData, TopicRouteData
@@ -355,3 +357,79 @@ def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
         inst2.query_consumer_offset("GID", mq)
     assert str(exc.value) == "The broker[broker-a] not exist"
     assert calls2 == [("127.0.0.1:9876", RequestCode.GET_ROUTEINFO_BY_TOPIC)]
+
+
+# ---------------------------------------------- NameServer 故障切换（_fetch 的语义）
+def _ns_instance(addrs):
+    """双 name server 的离线实例；返回 (inst, 脚本化应答列表)。
+
+    脚本列表按地址顺序取用：每项是一个 ``RemotingCommand`` 或一个异常实例。
+    这是「多 NameServer 下杀掉 ns[0]」的 mock 版 —— mock 层不建 TCP，
+    连接失败直接以 ``RemotingConnectException`` 表达，与真实行为一致。
+    """
+    inst = MQClientInstance("route-test@unit", list(addrs))
+    script = []
+
+    def fake_invoke(addr, request, timeout_millis=None):
+        outcome = script.pop(0) if script else None
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome if outcome is not None else RemotingCommand()
+
+    inst._invoke_sync = fake_invoke     # type: ignore[method-assign]
+    return inst, script
+
+
+def _route_ok(topic="T"):
+    response = RemotingCommand()
+    response.code = ResponseCode.SUCCESS
+    response.body = _route_of({"broker-a": {MASTER: "127.0.0.1:10911"}}).encode()
+    return response
+
+
+def _topic_not_exist():
+    response = RemotingCommand()
+    response.code = ResponseCode.TOPIC_NOT_EXIST
+    response.remark = "topic[T] not exist"
+    return response
+
+
+def test_route_fetch_fails_over_to_the_surviving_name_server():
+    """ns[0] 连不上 + ns[1] 正常应答 ⇒ 必须拿到路由（生产者侧的切换路径）。"""
+    inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:9876"])
+    script.append(RemotingConnectException("127.0.0.1:19876"))
+    script.append(_route_ok())
+    assert inst.update_topic_route_info_from_name_server("T") is True
+    assert inst.find_broker_address_in_publish("broker-a") == "127.0.0.1:10911"
+
+
+def test_route_fetch_never_reraises_a_stale_connect_error():
+    """本文件要守的缺陷：ns[0] 连不上 + ns[1] 给出**权威答复**（TOPIC_NOT_EXIST）。
+
+    %RETRY%group 对新组就是没有路由 —— ns[1] 的答复是终局，不能被 ns[0] 那次的
+    连接异常盖掉。真实场景：多 NameServer 下杀掉 ns[0]，消费者 start() 在
+    _refresh_routes() 直接抛 RemotingConnectException（生产者总拿得到 SUCCESS，
+    所以只有消费侧炸）。修复后必须是「False + 不抛」，让 _refresh_routes 的
+    MQClientException 兜底把它当『暂无路由』记掉。
+    """
+    inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:9876"])
+    script.append(RemotingConnectException("127.0.0.1:19876"))
+    script.append(_topic_not_exist())
+    assert inst.update_topic_route_info_from_name_server("%RETRY%GID_x") is False
+
+
+def test_route_fetch_raises_only_when_every_name_server_is_unreachable():
+    """全部 name server 都连不上：抛最后一次的传输异常（Java 同样往上抛）。"""
+    inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:19877"])
+    script.append(RemotingConnectException("127.0.0.1:19876"))
+    script.append(RemotingConnectException("127.0.0.1:19877"))
+    with pytest.raises(RemotingConnectException):
+        inst.update_topic_route_info_from_name_server("T")
+
+
+def test_route_fetch_timeout_also_moves_to_the_next_name_server():
+    """超时与连接失败同级：都是传输级失败，同样换下一台。"""
+    inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:9876"])
+    script.append(RemotingTimeoutException("127.0.0.1:19876", 5000))
+    script.append(_route_ok())
+    assert inst.update_topic_route_info_from_name_server("T") is True

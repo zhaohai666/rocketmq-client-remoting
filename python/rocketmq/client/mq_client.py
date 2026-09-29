@@ -598,11 +598,23 @@ class MQClientInstance:
             for ns_addr in self.name_server_addrs:
                 try:
                     response = self._invoke_sync(ns_addr, request, timeout_millis)
-                    if response.code == ResponseCode.SUCCESS and response.body:
-                        return TopicRouteData.decode(response.body)
-                    break
                 except Exception as e:  # noqa: BLE001
+                    # 连接/发送/超时级别的失败 → **换下一个** name server 再试（对齐
+                    # Java NettyRemotingClient#getAndCreateNameserverChannel 的语义：
+                    # 逐个试到建连成功为止）。⚠ 原实现只是记住异常继续循环，循环结束后
+                    # 又把 `last_exc` 原样重抛 —— 于是「ns[0] 已死 + ns[1] 活着并给出了
+                    # 权威答复（如 %RETRY%group 的 TOPIC_NOT_EXIST）」会被 ns[0] 那次的
+                    # RemotingConnectException 盖掉，表现为：多 NameServer 下杀掉
+                    # ns[0]，生产者能切到存活节点（它的路由查询总拿得到 SUCCESS），
+                    # 消费者 start() 却直接抛 connect to failed。
                     last_exc = e
+                    continue
+                # 拿到应答：无论 SUCCESS 还是 TOPIC_NOT_EXIST，这已经是选定 name
+                # server 的终局答复 —— 语义上等价于 Java 的单次应答（allowTopicNotExist），
+                # 不再轮询、也绝不能让更早的传输级异常盖过它。
+                if response.code == ResponseCode.SUCCESS and response.body:
+                    return TopicRouteData.decode(response.body)
+                return None
             if last_exc is not None and not isinstance(last_exc, MQBrokerException):
                 raise last_exc
             return None
