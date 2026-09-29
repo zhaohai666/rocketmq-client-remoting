@@ -90,6 +90,52 @@ const (
 	ReqPollingInfo                      = int32(200055)
 )
 
+// Request codes the admin / tooling surface needs, kept in a second block so
+// the client-runtime codes above stay readable. Values mirror
+// org.apache.rocketmq.remoting.protocol.RequestCode exactly — a wrong number
+// here shows up as "request code not supported" (3) from the broker, which is
+// at least loud, but the nameserver ones silently do nothing useful.
+const (
+	ReqUpdateAndCreateTopicList          = int32(18)
+	ReqGetBrokerRuntimeInfo              = int32(28)
+	ReqGetClientConfig                   = int32(47)
+	ReqGetTimerCheckPoint                = int32(60)
+	ReqGetTimerMetrics                   = int32(61)
+	ReqSuspendConsumer                   = int32(209)
+	ReqResumeConsumer                    = int32(210)
+	ReqResetConsumerOffsetInConsumer     = int32(211)
+	ReqResetConsumerOffsetInBroker       = int32(212)
+	ReqAdjustConsumerThreadPool          = int32(213)
+	ReqWhoConsumeTheMessage              = int32(214)
+	ReqDeleteTopicInBroker               = int32(215)
+	ReqDeleteTopicInNameSrv              = int32(216)
+	ReqRegisterTopicInNameSrv            = int32(217)
+	ReqGetKVListByNamespace              = int32(219)
+	ReqUpdateAndCreateSubscriptionGrpLst = int32(225)
+	ReqRegisterFilterServer              = int32(301)
+	ReqRegisterMessageFilterClass        = int32(302)
+	ReqQueryConsumeTimeSpan              = int32(303)
+	ReqGetSystemTopicListFromNS          = int32(304)
+	ReqQueryCorrectionOffset             = int32(308)
+	ReqGetUnitTopicList                  = int32(311)
+	ReqGetHasUnitSubTopicList            = int32(312)
+	ReqGetHasUnitSubUnUnitTopicList      = int32(313)
+	ReqViewBrokerStatsData               = int32(315)
+	ReqUpdateNameSrvConfig               = int32(318)
+	ReqGetNameSrvConfig                  = int32(319)
+	ReqResumeCheckHalfMessage            = int32(323)
+	ReqAddWritePermOfBroker              = int32(327)
+	ReqGetAllProducerInfo                = int32(328)
+	ReqDeleteExpiredCommitLog            = int32(329)
+	ReqUpdateAndGetGroupForbidden        = int32(353)
+	ReqCheckRocksdbCqWriteProgress       = int32(354)
+	ReqExportRocksdbConfigToJSON         = int32(355)
+	ReqUpdateAndCreateStaticTopic        = int32(513)
+	ReqAddBroker                         = int32(902)
+	ReqPeekMessage                       = int32(200052)
+	ReqPopRollback                       = int32(200056)
+)
+
 // ResponseCode mirrors RemotingSysResponseCode + ResponseCode.
 const (
 	RespSuccess                   = int32(0)

@@ -239,6 +239,41 @@ func DecodeMQOffsetTable(value any) (MQOffsetTable, error) {
 	return out, nil
 }
 
+// MQOffsetMap is the unordered MessageQueue -> offset map form, used by the
+// TopicStatsTable offset table. Java declares both `HashMap` and `TreeMap`
+// flavours of this shape; the map form is what the admin beans expose.
+type MQOffsetMap map[common.MessageQueue]int64
+
+// DecodeMQOffsetMap reads a MessageQueue-keyed map of integers. Keys that do
+// not re-parse as MessageQueue objects are skipped, matching the tolerance of
+// DecodeMQOffsetTable.
+func DecodeMQOffsetMap(value any) MQOffsetMap {
+	out := MQOffsetMap{}
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return out
+	}
+	for k, v := range obj {
+		inner, ok := DecodeMapKey(k)
+		if !ok {
+			continue
+		}
+		m, ok := inner.(map[string]any)
+		if !ok {
+			continue
+		}
+		q := common.NewMessageQueue(
+			jsonStringOr(m, "topic", ""),
+			jsonStringOr(m, "brokerName", ""),
+			jsonI32(m, "queueId", 0),
+		)
+		if n, ok := numberAsI64(v); ok {
+			out[q] = n
+		}
+	}
+	return out
+}
+
 // ---------------- ResetOffsetBody (220 push) ----------------
 
 // ResetOffsetBody carries Map<MessageQueue, Long> — NOT a nested
