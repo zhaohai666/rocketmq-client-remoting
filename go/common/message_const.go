@@ -67,6 +67,17 @@ const (
 	PropertyOriginQueueID   = "ORIGIN_QID"
 	PropertyOriginTopic     = "ORIGIN_TOPIC"
 
+	// PropertyStartDeliverTime (Java MessageConst.PROPERTY_STARTDELIVERTIME,
+	// "_" + "_STARTDELIVERTIME"). Distinct from PropertyStartTime
+	// ("START_TIME"), which is a trace-only field — substituting one for the
+	// other makes the delay-message classification silently miss every
+	// timer-scheduled message.
+	PropertyStartDeliverTime = "__STARTDELIVERTIME"
+	// Timer (5.x) delivery properties, the three aliases of DELAY.
+	PropertyTimerDeliverMs = "TIMER_DELIVER_MS"
+	PropertyTimerDelaySec  = "TIMER_DELAY_SEC"
+	PropertyTimerDelayMs   = "TIMER_DELAY_MS"
+
 	KeySeparator       = " "
 	CharacterMaxLength = 255
 	MessageIDPrefix    = "MSGID-"

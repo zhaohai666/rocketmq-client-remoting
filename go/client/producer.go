@@ -39,13 +39,28 @@ const (
 	pinnedTopicMismatchAsync = "Topic of the message does not match its target message queue"
 )
 
-// delayProperties are the delay/timer property keys a transactional message may
-// not carry (Java ensureNotDelayedForTransactional). Python reads the 5.x
-// TIMER_* keys through getattr with a sentinel, so they never match; Go has no
-// such constants either, which makes the two lists equivalent in practice.
+// delayProperties are the delay/timer property keys a transactional message
+// may not carry (Java DefaultMQProducerImpl.ensureNotDelayedForTransactional
+// :1511-1518, four keys). The 5.x TIMER_* aliases are real constants now, so
+// this list is Java's verbatim rather than a two-entry stand-in.
 var delayProperties = []string{
-	common.PropertyDelayTimeLevel,
-	common.PropertyDelayTime,
+	common.PropertyDelayTimeLevel, // "DELAY"
+	common.PropertyTimerDelayMs,   // "TIMER_DELAY_MS"
+	common.PropertyTimerDelaySec,  // "TIMER_DELAY_SEC"
+	common.PropertyTimerDeliverMs, // "TIMER_DELIVER_MS"
+}
+
+// delayClassProperties are the keys that make a SendMessageContext classify as
+// DelayMsg (Java sendKernelImpl:983-987). Deliberately a SUPERSET of
+// delayProperties: the literal "__STARTDELIVERTIME" is a delay marker for the
+// trace but not something ensureNotDelayedForTransactional rejects, and
+// foldering the two lists into one would silently change both behaviours.
+var delayClassProperties = []string{
+	common.PropertyStartDeliverTime, // "__STARTDELIVERTIME"
+	common.PropertyDelayTimeLevel,   // "DELAY"
+	common.PropertyTimerDeliverMs,   // "TIMER_DELIVER_MS"
+	common.PropertyTimerDelaySec,    // "TIMER_DELAY_SEC"
+	common.PropertyTimerDelayMs,     // "TIMER_DELAY_MS"
 }
 
 // ---------------------------------------------------------------- selectors
@@ -138,6 +153,188 @@ func (c SendCallbackFunc) OnException(err error) {
 	}
 }
 
+// ---------------------------------------------------------------- send hooks
+
+// RegisterSendMessageHook appends a send hook (Java
+// DefaultMQProducerImpl.registerSendMessageHook:225-231).
+func (p *DefaultMQProducer) RegisterSendMessageHook(hook SendMessageHook) {
+	if hook == nil {
+		return
+	}
+	p.mu.Lock()
+	p.sendMessageHooks = append(p.sendMessageHooks, hook)
+	p.mu.Unlock()
+}
+
+// HasSendMessageHook reports whether the before/after chain must run. It is the
+// fast path the send kernel checks before building a context.
+func (p *DefaultMQProducer) HasSendMessageHook() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.sendMessageHooks) > 0
+}
+
+// RegisterCheckForbiddenHook appends a pre-send interceptor (Java
+// registerCheckForbiddenHook:182-190).
+func (p *DefaultMQProducer) RegisterCheckForbiddenHook(hook CheckForbiddenHook) {
+	if hook == nil {
+		return
+	}
+	p.mu.Lock()
+	p.checkForbiddenHooks = append(p.checkForbiddenHooks, hook)
+	p.mu.Unlock()
+}
+
+// HasCheckForbiddenHook reports whether the interceptor chain must run.
+func (p *DefaultMQProducer) HasCheckForbiddenHook() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.checkForbiddenHooks) > 0
+}
+
+// RegisterEndTransactionHook appends an end-transaction hook (Java
+// registerEndTransactionHook:233-236).
+func (p *DefaultMQProducer) RegisterEndTransactionHook(hook EndTransactionHook) {
+	if hook == nil {
+		return
+	}
+	p.mu.Lock()
+	p.endTransactionHooks = append(p.endTransactionHooks, hook)
+	p.mu.Unlock()
+}
+
+// HasEndTransactionHook reports whether the end-transaction chain must run.
+func (p *DefaultMQProducer) HasEndTransactionHook() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.endTransactionHooks) > 0
+}
+
+// hasSendInterceptors is Java _hasSendInterceptors: either hook family forces
+// the send kernel down the "build a context" path.
+func (p *DefaultMQProducer) hasSendInterceptors() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.sendMessageHooks) > 0 || len(p.checkForbiddenHooks) > 0
+}
+
+// hookSnapshot copies the hook lists so a hook that registers another hook
+// while running cannot make the iteration grow, and so the send path does not
+// hold p.mu across user code.
+func (p *DefaultMQProducer) hookSnapshot() ([]SendMessageHook, []CheckForbiddenHook, []EndTransactionHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]SendMessageHook(nil), p.sendMessageHooks...),
+		append([]CheckForbiddenHook(nil), p.checkForbiddenHooks...),
+		append([]EndTransactionHook(nil), p.endTransactionHooks...)
+}
+
+// setCheckExecutor installs (or clears, with nil) the transaction check-back
+// pool. TransactionMQProducer owns the lifecycle; nothing else should call it.
+func (p *DefaultMQProducer) setCheckExecutor(svc ExecutorService) {
+	p.mu.Lock()
+	p.checkExecutor = svc
+	p.mu.Unlock()
+}
+
+// setCheckListenerFn installs the Java DefaultMQProducerImpl.getCheckListener
+// equivalent. TransactionMQProducer points it at its own TransactionListener
+// field so a wrapper's listener answers check-backs even before any send.
+func (p *DefaultMQProducer) setCheckListenerFn(fn func() TransactionListener) {
+	p.mu.Lock()
+	p.checkListenerFn = fn
+	p.mu.Unlock()
+}
+
+// CheckExecutor returns the current check-back pool, or nil.
+func (p *DefaultMQProducer) CheckExecutor() ExecutorService {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.checkExecutor
+}
+
+// buildSendContext mirrors Java DefaultMQProducerImpl.sendKernelImpl:968-991.
+//
+// The msgType derivation is deliberately a two-step override, not an
+// else-if: a transactional message that also carries a delay property ends up
+// as DelayMsg, because the delay branch is a separate `if` in Java.
+func (p *DefaultMQProducer) buildSendContext(msg *common.Message, mq common.MessageQueue,
+	brokerAddr string, mode CommunicationMode) *SendMessageContext {
+
+	ctx := &SendMessageContext{
+		Producer:          p,
+		ProducerGroup:     p.producerGroup,
+		CommunicationMode: mode,
+		BornHost:          common.LocalIP(),
+		BrokerAddr:        brokerAddr,
+		Message:           msg,
+		MQ:                mq,
+		MsgType:           common.NormalMsg,
+		Namespace:         p.namespace,
+	}
+	if v, ok := msg.GetProperty(common.PropertyTransactionPrepared); ok && v == "true" {
+		ctx.MsgType = common.TransMsgHalf
+	}
+	for _, key := range delayClassProperties {
+		if _, ok := msg.GetProperty(key); ok {
+			ctx.MsgType = common.DelayMsg
+			break
+		}
+	}
+	return ctx
+}
+
+// checkForbidden runs the pre-send interceptors. Java only populates the
+// context fields listed at sendKernelImpl:957-964, and — despite the field
+// existing on CheckForbiddenContext — it never sets `arg`, not even on the
+// selector path (sendSelectImpl passes it to select(), not to sendKernelImpl).
+// Arg therefore stays nil here too; the field is kept so an implementation can
+// read it if a caller ever wires it up.
+func (p *DefaultMQProducer) checkForbidden(hooks []CheckForbiddenHook,
+	msg *common.Message, mq common.MessageQueue, brokerAddr string,
+	mode CommunicationMode) error {
+
+	if len(hooks) == 0 {
+		return nil
+	}
+	ctx := &CheckForbiddenContext{
+		NameServerAddr:    p.NamesrvAddr(),
+		ProducerGroup:     p.producerGroup,
+		CommunicationMode: mode,
+		Message:           msg,
+		MQ:                mq,
+		BrokerAddr:        brokerAddr,
+		UnitMode:          p.unitMode,
+	}
+	return executeCheckForbiddenHooks(hooks, ctx)
+}
+
+// doExecuteEndTransactionHook mirrors Java doExecuteEndTransactionHook:1194 —
+// the hook fires whether the endTransaction came from the caller or from the
+// broker's check-back, and `fromTransactionCheck` is the only thing that tells
+// the two apart.
+func (p *DefaultMQProducer) doExecuteEndTransactionHook(hooks []EndTransactionHook,
+	msg *common.Message, msgID, brokerAddr string, state LocalTransactionState,
+	fromTransactionCheck bool) {
+
+	if len(hooks) == 0 {
+		return
+	}
+	ctx := &EndTransactionContext{
+		ProducerGroup:        p.producerGroup,
+		Message:              msg,
+		BrokerAddr:           brokerAddr,
+		MsgID:                msgID,
+		TransactionState:     state,
+		FromTransactionCheck: fromTransactionCheck,
+		Namespace:            p.namespace,
+	}
+	if msg != nil {
+		ctx.TransactionID = msg.TransactionID
+	}
+	executeEndTransactionHooks(hooks, ctx)
+}
+
 // ---------------------------------------------------------------- transaction
 
 // TransactionListener mirrors Java TransactionListener / Python
@@ -194,6 +391,26 @@ type DefaultMQProducer struct {
 	started  bool
 
 	transactionListener TransactionListener
+	// checkListenerFn supplies the check-back listener, mirroring Java
+	// DefaultMQProducerImpl.getCheckListener(). TransactionMQProducer points it
+	// at its own field (a wrapper's listener must be honoured even before any
+	// send); a plain producer leaves it nil and falls back to whatever
+	// SendMessageInTransaction stored.
+	checkListenerFn func() TransactionListener
+
+	// Send-side hook lists (Java DefaultMQProducerImpl:108-117). Registration
+	// is not documented as thread-safe in Java either, but the send paths read
+	// them from arbitrary goroutines, so they live behind p.mu like the rest of
+	// the mutable state.
+	sendMessageHooks    []SendMessageHook
+	checkForbiddenHooks []CheckForbiddenHook
+	endTransactionHooks []EndTransactionHook
+
+	// checkExecutor is the pool the broker's CHECK_TRANSACTION_STATE check-backs
+	// run on (Java DefaultMQProducerImpl.checkExecutor). Nil on a plain
+	// DefaultMQProducer — and on a TransactionMQProducer that has not started —
+	// in which case the check-back falls back to a bare goroutine.
+	checkExecutor ExecutorService
 
 	heartbeatIntervalMillis int64
 	heartbeatRunning        atomic.Bool
@@ -804,8 +1021,34 @@ func sendStatusOf(code int32) (SendStatus, bool) {
 // ---------------------------------------------------------------- send core
 
 // sendAttempt performs ONE attempt against a concrete queue: resolve the
-// master address, build the request, invoke, parse.
-func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq common.MessageQueue, sysFlag int32, timeoutMillis int64) (*SendResult, error) {
+// master address, run the pre-send interceptors, build the request, invoke,
+// parse — plus the SendMessageHook before/after pair around the RPC. It is the
+// exact analogue of Java DefaultMQProducerImpl.sendKernelImpl's body
+// (:919-1097), minus the compression/sysFlag work which the caller did once
+// outside the retry chain.
+//
+// Hook ordering, straight from Java:
+//
+//  1. resolve brokerAddr (findBrokerAddressInPublish, master only);
+//  2. CheckForbiddenHook — error PROPAGATES, no SendMessageHook.after runs;
+//  3. SendMessageHook.before (only if a send hook is registered; Java does not
+//     even allocate a context otherwise);
+//  4. build the request and send;
+//  5. SendMessageHook.after with either SendResult or Exception.
+//
+// One deliberate divergence: if a forbidden hook rejects the message AND a send
+// hook is registered, Java falls into
+//
+//	catch (...) { if (this.hasSendMessageHook()) { context.setException(e); ... } }
+//
+// with `context` still null — a NullPointerException that escapes sendDefaultImpl
+// entirely, because NPE is not one of the four caught types. This port skips
+// the after-hook when there is no context instead of reproducing the NPE; the
+// observable difference is that the caller gets the interceptor's error rather
+// than a NullPointerException.
+func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq common.MessageQueue,
+	sysFlag int32, timeoutMillis int64, mode CommunicationMode) (*SendResult, error) {
+
 	inst, err := p.requireClient()
 	if err != nil {
 		return nil, err
@@ -814,15 +1057,48 @@ func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq co
 	if err != nil {
 		return nil, err
 	}
+
+	sendHooks, forbiddenHooks, _ := p.hookSnapshot()
+	if err := p.checkForbidden(forbiddenHooks, msg, mq, addr, mode); err != nil {
+		return nil, err
+	}
+
+	var hookCtx *SendMessageContext
+	if len(sendHooks) > 0 {
+		hookCtx = p.buildSendContext(msg, mq, addr, mode)
+		executeSendMessageHooksBefore(sendHooks, hookCtx)
+	}
+
 	request := p.buildSendRequest(msg, isBatch, mq, sysFlag)
 	response, err := inst.Remoting().InvokeSync(addr, request, timeoutMillis)
 	if err != nil {
+		p.finishSendHook(sendHooks, hookCtx, nil, err)
 		return nil, err
 	}
-	return processSendResponse(response, msg, mq)
+	result, err := processSendResponse(response, msg, mq)
+	p.finishSendHook(sendHooks, hookCtx, result, err)
+	return result, err
 }
 
-// sendOnewayTo performs a oneway send to a concrete queue.
+// finishSendHook runs the after chain, if any. A nil context means no send hook
+// was registered when the attempt started; see sendAttempt's last paragraph.
+func (p *DefaultMQProducer) finishSendHook(hooks []SendMessageHook,
+	ctx *SendMessageContext, result *SendResult, err error) {
+
+	if ctx == nil {
+		return
+	}
+	if err != nil {
+		ctx.Exception = err
+	} else {
+		ctx.SendResult = result
+	}
+	executeSendMessageHooksAfter(hooks, ctx)
+}
+
+// sendOnewayTo performs a oneway send to a concrete queue. Java routes ONEWAY
+// through the same sendKernelImpl, so the interceptors and the send hooks run
+// exactly as for a sync send (with ONEWAY in the context).
 func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQueue, sysFlag int32) error {
 	inst, err := p.requireClient()
 	if err != nil {
@@ -834,9 +1110,25 @@ func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQ
 	if err != nil {
 		return err
 	}
+
+	sendHooks, forbiddenHooks, _ := p.hookSnapshot()
+	if err := p.checkForbidden(forbiddenHooks, msg, mq, addr, CommunicationModeOneway); err != nil {
+		return err
+	}
+
+	var hookCtx *SendMessageContext
+	if len(sendHooks) > 0 {
+		hookCtx = p.buildSendContext(msg, mq, addr, CommunicationModeOneway)
+		executeSendMessageHooksBefore(sendHooks, hookCtx)
+	}
+
 	request := p.buildSendRequest(msg, false, mq, sysFlag)
 	request.MarkOnewayRPC()
-	return inst.Remoting().InvokeOneway(addr, request)
+	sendErr := inst.Remoting().InvokeOneway(addr, request)
+	// A oneway send has no SendResult, so Java's `context.setSendResult(null)`
+	// is what the after-hook sees on success.
+	p.finishSendHook(sendHooks, hookCtx, nil, sendErr)
+	return sendErr
 }
 
 // updateFaultItem records one attempt's latency. The latency must be measured
@@ -905,7 +1197,7 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 		// sendResult outside the loop): a broker that answered with a
 		// non-retryable code returns the PREVIOUS attempt's result when there
 		// was one, instead of throwing the error away.
-		attemptResult, err := p.sendAttempt(msg, isBatch, selected, sysFlag, curTimeout)
+		attemptResult, err := p.sendAttempt(msg, isBatch, selected, sysFlag, curTimeout, CommunicationModeSync)
 		switch {
 		case err == nil:
 			result = attemptResult
@@ -1035,7 +1327,7 @@ func (p *DefaultMQProducer) sendToQueueWithTimeout(msg *common.Message, mq commo
 		return nil, err
 	}
 	sysFlag := p.tryToCompressMessage(msg, false)
-	return p.sendAttempt(msg, false, common.NewMessageQueue(mq.Topic, mq.BrokerName, mq.QueueID), sysFlag, timeoutMillis)
+	return p.sendAttempt(msg, false, common.NewMessageQueue(mq.Topic, mq.BrokerName, mq.QueueID), sysFlag, timeoutMillis, CommunicationModeSync)
 }
 
 // SendBatch mirrors Java DefaultMQProducer.batch (SEND_BATCH_MESSAGE = 320).
@@ -1091,7 +1383,7 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	// compressed.
 	sysFlag := p.tryToCompressMessage(batch.Message, true)
 	if pinned != nil {
-		return p.sendAttempt(batch.Message, true, *pinned, sysFlag, timeoutMillis)
+		return p.sendAttempt(batch.Message, true, *pinned, sysFlag, timeoutMillis, CommunicationModeSync)
 	}
 	publish, err := p.topicPublishInfo(batch.Message.Topic)
 	if err != nil {
@@ -1104,7 +1396,7 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	if !ok {
 		return nil, common.ClientError("no message queue for publish info")
 	}
-	return p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis)
+	return p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis, CommunicationModeSync)
 }
 
 // SendOneway fires and forgets (Java sendOneway). There is no response, so the
@@ -1186,7 +1478,7 @@ func (p *DefaultMQProducer) SendBySelectorWithTimeout(msg *common.Message, selec
 		return nil, err
 	}
 	sysFlag := p.tryToCompressMessage(msg, false)
-	return p.sendAttempt(msg, false, selected, sysFlag, timeoutMillis)
+	return p.sendAttempt(msg, false, selected, sysFlag, timeoutMillis, CommunicationModeSync)
 }
 
 // SendAsync sends without blocking; callback fires exactly once.
@@ -1230,6 +1522,20 @@ func (p *DefaultMQProducer) SendAsync(msg *common.Message, callback SendCallback
 //  4. on UNKNOW (or a failed local transaction) the broker checks back with
 //     CHECK_TRANSACTION_STATE(39), and handleCheckTransactionState calls
 //     listener.CheckLocalTransaction and then ends the transaction.
+//
+// Where the check-back's listener comes from is the one place this port is a
+// deliberate SUPERSET of Java. Java 5.x resolves it through
+// getCheckListener(), which returns null unless the producer is a
+// TransactionMQProducer — so a plain DefaultMQProducer's half messages are
+// recorded by the broker but can never be answered (it just logs "pick
+// transactionCheckListener by group[..] failed"). Here the listener handed to
+// this call is remembered and used for the check-back too, which makes the
+// standalone (non-TransactionMQProducer) path actually work.
+//
+// A TransactionMQProducer's own listener still takes precedence: the wrapper
+// installs a resolver that handleCheckTransactionState consults first, so
+// SetTransactionListener keeps controlling the check-back even if a 3-arg send
+// passed a different listener for its local transaction.
 func (p *DefaultMQProducer) SendMessageInTransaction(msg *common.Message, listener TransactionListener, arg any) (*TransactionSendResult, error) {
 	if listener == nil {
 		return nil, common.ClientError("tranExecutor is null")
@@ -1291,7 +1597,10 @@ func (p *DefaultMQProducer) SendMessageInTransaction(msg *common.Message, listen
 	sysFlag := p.tryToCompressMessage(msg, false)
 	sysFlag = common.ResetTransactionValue(sysFlag, common.MessageSysFlagTransactionPrepared)
 
-	sendResult, sendErr := p.sendAttempt(msg, false, selected, sysFlag, p.sendMsgTimeout)
+	// The half message is an ordinary SYNC send through sendKernelImpl, so the
+	// interceptors and the send hooks fire with CommunicationMode.SYNC and the
+	// context classified as TransMsgHalf (TRAN_MSG=="true" is set above).
+	sendResult, sendErr := p.sendAttempt(msg, false, selected, sysFlag, p.sendMsgTimeout, CommunicationModeSync)
 	// Same point as Java's finally (sendKernelImpl:1095-1096): restored as soon
 	// as the HALF message is out, so executeLocalTransaction and endTransaction
 	// below see the original body and the un-namespaced topic (Java 5.5.1's
@@ -1355,6 +1664,12 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	}
 	header := &remoting.EndTransactionRequestHeader{ProducerGroup: strPtr(p.producerGroup)}
 
+	// hookMsg / hookMsgID feed doExecuteEndTransactionHook. Java takes the id
+	// from sendResult.getMsgId() on the caller path and from the message's
+	// UNIQ_KEY (falling back to its msgId) on the check-back path.
+	var hookMsg *common.Message
+	var hookMsgID string
+
 	if fromTransactionCheck {
 		// The check request carries whatever the broker knew about the half
 		// message (compression and transaction bookkeeping included).
@@ -1364,6 +1679,7 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 		header.Bname = checkHeader.Bname
 		header.Topic = checkHeader.Topic
 		if msgExt != nil {
+			hookMsg = &msgExt.Message
 			uniq := ""
 			if v, ok := msgExt.GetProperty(common.PropertyUniqKey); ok {
 				uniq = v
@@ -1372,6 +1688,7 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 				uniq = msgExt.MsgID
 			}
 			header.MsgID = strPtr(uniq)
+			hookMsgID = uniq
 		}
 	} else {
 		// Java: id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
@@ -1393,6 +1710,8 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 		header.Bname = strPtr(brokerName)
 		header.Topic = strPtr(msg.Topic)
 		header.MsgID = strPtr(sendResult.MsgID)
+		hookMsg = msg
+		hookMsgID = sendResult.MsgID
 		// Java endTransaction:1541 also uses findBrokerAddressInPublish (master
 		// only) and does NOT null-check before the oneway send. This port keeps
 		// the explicit guard (cleaner than Java's NPE) but the address source
@@ -1407,6 +1726,13 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	header.CommitOrRollback = i32Ptr(transactionFlag(state))
 	b := fromTransactionCheck
 	header.FromTransactionCheck = &b
+
+	// Java runs the end-transaction hook immediately before the oneway send, on
+	// BOTH paths (endTransaction:1561 and processTransactionState:442) — so it
+	// fires even if the send below then fails, and the trace it emits is the
+	// only record that this transaction was finished at all.
+	_, _, endTxHooks := p.hookSnapshot()
+	p.doExecuteEndTransactionHook(endTxHooks, hookMsg, hookMsgID, brokerAddr, state, fromTransactionCheck)
 
 	request := remoting.CreateRequestCommand(remoting.ReqEndTransaction, header)
 	if localException != nil {
@@ -1435,12 +1761,16 @@ func transactionFlag(state LocalTransactionState) int32 {
 // .checkTransactionState + DefaultMQProducerImpl.checkTransactionState.
 //
 // The broker sends 39 as a ONEWAY request (body = the whole encoded MessageExt),
-// so the client must NOT reply. Instead a goroutine calls
-// listener.CheckLocalTransaction and then reports the verdict back with
-// END_TRANSACTION(fromTransactionCheck = true).
+// so the client must NOT reply. Instead the listener runs OFF the remoting
+// thread and the verdict goes back with END_TRANSACTION(fromTransactionCheck =
+// true).
 //
-// The listener must not be run on the remoting read goroutine: it is user code
-// and may block, which would stall every other response on that connection.
+// Where it runs: on a TransactionMQProducer that has started, the whole check
+// is submitted to the check executor (single worker by default — Java
+// DefaultMQProducerImpl:453), so check-backs are serialised. Everywhere else it
+// falls back to a bare goroutine. In neither case may it run on the remoting
+// read goroutine: it is user code and may block, which would stall every other
+// response on that connection.
 func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.RemotingCommand, addr string, _ *remoting.ResponseSink) {
 	header := &remoting.CheckTransactionStateRequestHeader{}
 	header.FromExtFields(request.ExtFields())
@@ -1458,14 +1788,27 @@ func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.Remoti
 		common.LogDebugf("checkTransactionState: group %s not mine (%s)", group, p.producerGroup)
 		return
 	}
+	// Resolve the listener OUTSIDE p.mu: the TransactionMQProducer hook takes
+	// its own lock, and initTransactionEnv takes that lock before p.mu, so
+	// calling it while holding p.mu would be a lock-order inversion.
 	p.mu.Lock()
-	listener := p.transactionListener
+	listenerFn := p.checkListenerFn
+	stored := p.transactionListener
+	executor := p.checkExecutor
 	p.mu.Unlock()
+
+	listener := stored
+	if listenerFn != nil {
+		if l := listenerFn(); l != nil {
+			listener = l
+		}
+	}
 	if listener == nil {
 		common.LogWarnf("checkTransactionState: no transaction listener for group %s", p.producerGroup)
 		return
 	}
-	go func() {
+
+	task := func() {
 		state := Unknow
 		var checkErr error
 		func() {
@@ -1481,7 +1824,26 @@ func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.Remoti
 		if err := p.endTransaction(nil, nil, state, checkErr, true, header, msgExt, addr); err != nil {
 			common.LogWarnf("checkTransactionState: end transaction failed: %v", err)
 		}
-	}()
+	}
+
+	// Java submits the whole check to checkExecutor (DefaultMQProducerImpl:453),
+	// whose default is a SINGLE worker with a 2000-slot queue: check-backs are
+	// serialised and a flood is rejected. Reproducing that ordering matters — a
+	// producer whose checkLocalTransaction is slow must not be able to run
+	// check-backs concurrently with itself.
+	//
+	// Java does not catch the rejection (RejectedExecutionException escapes
+	// checkTransactionState and lands on the remoting thread). This port logs it
+	// and drops the check: the broker will re-check after
+	// transactionCheckMax, whereas an escaping panic on the read goroutine would
+	// take the whole connection's dispatch loop with it.
+	if executor != nil {
+		if err := executor.Submit(task); err != nil {
+			common.LogErrorf("checkTransactionState: check executor rejected the request: %v", err)
+		}
+		return
+	}
+	go task()
 }
 
 // ---------------------------------------------------------------- misc
