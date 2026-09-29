@@ -34,3 +34,6 @@ Thumbs.db
 
 # 误留的重定向文件（nohup 等）
 nohup.out
+
+# 本地 agent 工作目录（项目记忆 / 临时脚本），不入库
+.workbuddy/
