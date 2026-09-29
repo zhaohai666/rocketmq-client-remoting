@@ -181,6 +181,7 @@ type DefaultMQProducer struct {
 	maxMessageSize          int
 
 	rpcHook            remoting.RPCHook
+	namespaceV2        string
 	topics             []string
 	nameServerAddrs    []string
 	tlsEnable          *bool
@@ -260,8 +261,14 @@ func (p *DefaultMQProducer) SetEnableStreamRequestType(e bool) {
 	p.enableStreamRequestType = e
 }
 func (p *DefaultMQProducer) SetRpcHook(hook remoting.RPCHook) { p.rpcHook = hook }
-func (p *DefaultMQProducer) SetTopics(topics []string)        { p.topics = append([]string(nil), topics...) }
-func (p *DefaultMQProducer) SetTLSEnable(enable bool)         { p.tlsEnable = &enable }
+
+// SetNamespaceV2 mirrors ClientConfig#setNamespaceV2: the SERVER-side namespace
+// (sent as the `ns`/`nsd` extFields by NamespaceRpcHook), as opposed to
+// SetNamespace, which mangles topic names client-side.
+func (p *DefaultMQProducer) SetNamespaceV2(ns string) { p.namespaceV2 = ns }
+
+func (p *DefaultMQProducer) SetTopics(topics []string) { p.topics = append([]string(nil), topics...) }
+func (p *DefaultMQProducer) SetTLSEnable(enable bool)  { p.tlsEnable = &enable }
 func (p *DefaultMQProducer) SetPollNameServerIntervalMillis(v int64) {
 	p.pollNameServerIntv = v
 }
@@ -375,9 +382,9 @@ func (p *DefaultMQProducer) Start() error {
 	}
 	cfg.PollNameServerIntervalMillis = p.pollNameServerIntv
 	inst := CreateOrGetInstance(p.clientID, p.nameServerAddrs, cfg)
-	if p.rpcHook != nil {
-		inst.Remoting().RegisterRPCHook(p.rpcHook)
-	}
+	// Namespace + stream + user(ACL) + zone, in Java's order and only once per
+	// instance — the signature has to cover exactly the fields Java signs.
+	inst.EnsureRPCHooks(p.namespaceV2, p.enableStreamRequestType, p.rpcHook)
 	if err := inst.Start(); err != nil {
 		return err
 	}
@@ -582,10 +589,18 @@ func responseCodeOf(err error) (int32, bool) {
 //   - the compressed size is NOT compared against the original (Java does not
 //     either).
 //
-// Callers must invoke this ONCE, outside the retry loop. Java calls it inside
-// the loop and its setBody is in place, so a retry would compress an
-// already-compressed body (zlib(zlib(x))) and the consumer, decompressing one
-// layer, would receive a compressed stream.
+// Callers must invoke this ONCE, outside the retry loop, and restore the body
+// afterwards (every call site keeps prevBody and defers the restore).
+//
+// Java calls it inside sendKernelImpl, i.e. once per ATTEMPT, not once per
+// send. That is NOT a behavioural difference: sendKernelImpl captures
+// `byte[] prevBody = msg.getBody()` at :930 and its `finally` does
+// `msg.setBody(prevBody)` at :1095, so every retry re-compresses the ORIGINAL
+// body. Compressing once here and restoring at the end yields byte-identical
+// payloads and sysFlag, and skips the redundant recompression of a body that
+// is already compressed. (An earlier version of this comment claimed Java
+// double-compressed into zlib(zlib(x)) on retry — it does not; the finally
+// block prevents it.)
 func (p *DefaultMQProducer) tryToCompressMessage(msg *common.Message, isBatch bool) int32 {
 	if isBatch {
 		return 0

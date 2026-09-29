@@ -164,6 +164,12 @@ type Instance struct {
 
 	consumerIDsChanged atomic.Int64
 
+	// hooksInstalled guards EnsureRPCHooks. The hook chain belongs to the
+	// INSTANCE (Java builds it once in MQClientAPIImpl's constructor), and
+	// Start() may be called more than once by the same or by a second tenant,
+	// so it must not be appended to twice.
+	hooksInstalled bool
+
 	stopOnce sync.Once
 	stop     chan struct{}
 	wg       sync.WaitGroup
@@ -196,6 +202,41 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 
 // ClientID returns the instance's client id.
 func (i *Instance) ClientID() string { return i.clientID }
+
+// EnsureRPCHooks installs the RPC hook chain exactly once, in Java's order
+// (MQClientAPIImpl's constructor, lines 329-335):
+//
+//	NamespaceRpcHook -> StreamTypeRPCHook (if enabled) -> user hook -> DynamicalExtFieldRPCHook
+//
+// The order decides what the ACL signature covers: the namespace and ReqT
+// fields must be present BEFORE the user's hook runs, while the zone fields
+// are added after it and stay unsigned. See remoting/rpchooks.go.
+//
+// Java ties the chain to the MQClientInstance, which is keyed by clientId and
+// created once; the first creator's hook wins and later tenants share it. This
+// port mirrors that: the first call installs, later calls are no-ops. A second
+// tenant therefore does NOT get its own user hook on a shared instance — that
+// is Java behaviour, and silently stacking a second ACL hook would corrupt
+// every signature instead.
+func (i *Instance) EnsureRPCHooks(namespaceV2 string, stream bool, userHook remoting.RPCHook) {
+	i.mu.Lock()
+	if i.hooksInstalled {
+		i.mu.Unlock()
+		return
+	}
+	i.hooksInstalled = true
+	i.mu.Unlock()
+
+	rc := i.remoting
+	rc.RegisterRPCHook(remoting.NewNamespaceRpcHook(namespaceV2))
+	if stream {
+		rc.RegisterRPCHook(remoting.StreamTypeRPCHook{})
+	}
+	if userHook != nil {
+		rc.RegisterRPCHook(userHook)
+	}
+	rc.RegisterRPCHook(remoting.DynamicalExtFieldRPCHook{})
+}
 
 // Remoting exposes the shared transport (producers register their RPC hooks
 // on it; the offset store rides its invoke path).

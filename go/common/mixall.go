@@ -42,6 +42,19 @@ const (
 	ReqT              = "ReqT"
 	StreamRequestType = "STREAM"
 
+	// Zone hooks (Java MixAll / DynamicalExtFieldRPCHook). The zone name comes
+	// from a system property first, then the environment variable — the same
+	// two-step lookup Java does.
+	ZoneNameEnv      = "ROCKETMQ_ZONE"
+	ZoneNameProperty = "rocketmq.zone"
+	ZoneModeEnv      = "ROCKETMQ_ZONE_MODE"
+	ZoneModeProperty = "rocketmq.zone.mode"
+	ZoneNameField    = "__ZONE_NAME"
+	ZoneModeField    = "__ZONE_MODE"
+	NamespaceV2Field = "ns"
+	NamespacedField  = "nsd"
+	NamespaceV2Env   = "ROCKETMQ_NAMESPACE_V2"
+
 	DefaultTopicQueueNums         int32 = 4
 	MaxTopicLength                      = 127
 	MaxGroupLength                      = 255

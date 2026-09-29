@@ -103,12 +103,14 @@ type DefaultMQPushConsumer struct {
 
 	consumerGroup string
 	namespace     string
+	namespaceV2   string
 	instanceName  string
 	clientID      string
 	unitName      string
 	unitMode      bool
 	streamRequest bool
 	tlsEnable     *bool
+	rpcHook       remoting.RPCHook
 
 	messageModel     string
 	consumeFromWhere string
@@ -312,6 +314,24 @@ func (c *DefaultMQPushConsumer) SetEnableStreamRequestType(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.streamRequest = enable
+}
+
+// SetRpcHook installs the user's RPC hook (typically an ACL hook built with
+// remoting.NewAclClientRPCHook). Without it a consumer cannot authenticate
+// against an ACL-enabled cluster.
+func (c *DefaultMQPushConsumer) SetRpcHook(hook remoting.RPCHook) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rpcHook = hook
+}
+
+// SetNamespaceV2 mirrors ClientConfig#setNamespaceV2: the SERVER-side namespace
+// sent as `ns`/`nsd` by NamespaceRpcHook, as opposed to SetNamespace, which
+// mangles topic names client-side.
+func (c *DefaultMQPushConsumer) SetNamespaceV2(ns string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.namespaceV2 = ns
 }
 
 // SetTLSEnable opts into TLS (nil falls back to ROCKETMQ_TLS_ENABLE).
@@ -915,7 +935,14 @@ func (c *DefaultMQPushConsumer) Start() error {
 	cfg := NewClientInstanceConfig()
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
 	c.instance = instance
+	namespaceV2 := c.namespaceV2
+	userHook := c.rpcHook
 	c.mu.Unlock()
+
+	// Namespace + stream + user(ACL) + zone, in Java's order, once per instance.
+	// Without the user hook a consumer cannot authenticate against an ACL
+	// cluster; with it in the wrong position every signature fails to verify.
+	instance.EnsureRPCHooks(namespaceV2, c.streamRequest, userHook)
 
 	if err := instance.Start(); err != nil {
 		c.mu.Lock()
