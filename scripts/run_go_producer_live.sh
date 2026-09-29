@@ -48,14 +48,26 @@ port_open 9876 || { echo "nameserver 9876 没监听，先起 namesrv"; exit 1; }
 echo ""
 echo "=== [1/2] Go producer live (topic=${TOPIC} group=${GROUP}) ==="
 cd "$ROOT/go" || exit 1
-"$GO" run ./examples/live_producer -ns "$NS" -topic "$TOPIC" -group "$GROUP"
+GO_LOG=$(mktemp -t go_live_producer.XXXXXX)
+# 回读的期望条数取自 Go 侧自己报的 `SENT=<n>`，不写死：往 live_producer 里加一个
+# 检查就会让写死的期望值悄悄失准（少要几条 → 假绿）。
+set -o pipefail
+"$GO" run ./examples/live_producer -ns "$NS" -topic "$TOPIC" -group "$GROUP" 2>&1 | tee "$GO_LOG"
 GO_RC=$?
+set +o pipefail
 echo "--- go exit=$GO_RC ---"
+EXPECT=$(sed -n 's/^PASS=[0-9]* FAIL=[0-9]* SENT=\([0-9][0-9]*\)$/\1/p' "$GO_LOG" | tail -1)
+if [ -n "$EXPECT" ]; then
+    echo "--- Go 报称已写入 $EXPECT 条，按此数目回读对拍 ---"
+else
+    EXPECT=8
+    echo "--- 没读到 SENT，回退到旧口径 8 条 ---"
+fi
 
 echo ""
 echo "=== [2/2] Python 客户端回读对拍 ==="
 cd "$ROOT/python" || exit 1
-"$PY" go_producer_consume_check.py "$TOPIC" 8 "GID_PyReadGo_$STAMP" 2>&1 | grep -E "^(PASS|FAIL|[0-9]+$|PASS=)"
+"$PY" go_producer_consume_check.py "$TOPIC" "$EXPECT" "GID_PyReadGo_$STAMP" 2>&1 | grep -E "^(PASS|FAIL|[0-9]+$|PASS=)"
 PY_RC=${PIPESTATUS[0]}
 echo "--- python exit=$PY_RC ---"
 

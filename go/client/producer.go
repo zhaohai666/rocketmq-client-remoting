@@ -412,6 +412,31 @@ type DefaultMQProducer struct {
 	// in which case the check-back falls back to a bare goroutine.
 	checkExecutor ExecutorService
 
+	// ---- async send (Java DefaultMQProducer:139-181, DefaultMQProducerImpl:132-153) ----
+	//
+	// These scalars are read from the sender and callback goroutines while a
+	// user may be retuning them — Java documents
+	// setBackPressureForAsyncSendNum as a RUNTIME knob — so they are atomics
+	// rather than p.mu-guarded fields.
+	enableBackpressureForAsyncMode atomic.Bool
+	backPressureForAsyncSendNum    atomic.Int64
+	backPressureForAsyncSendSize   atomic.Int64
+	retryTimesWhenSendAsyncFailed  atomic.Int64
+	asyncSenderQueueCapacity       atomic.Int64
+	callbackExecutorThreads        atomic.Int64
+
+	// The two back-pressure semaphores are built once by initAsyncConfig and
+	// never replaced: Java swaps the whole Semaphore object when resizing (which
+	// is why its setter sits behind a ReadWriteCASLock), whereas setTotalPermits
+	// shifts the total in place. Observably identical, no read-write lock needed.
+	semaphoreAsyncSendNum  *fairSemaphore
+	semaphoreAsyncSendSize *fairSemaphore
+
+	// The two async executors are created by Start and torn down by Shutdown, so
+	// a send can race with a shutdown; atomic.Pointer keeps that read lock-free.
+	asyncSenderPool atomic.Pointer[boundedPool]
+	callbackPool    atomic.Pointer[boundedPool]
+
 	heartbeatIntervalMillis int64
 	heartbeatRunning        atomic.Bool
 }
@@ -451,6 +476,10 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		},
 	}
 	p.faultStrategy = newMQFaultStrategy(false)
+	// Back-pressure semaphores and the async knobs. Java builds the semaphores
+	// in the DefaultMQProducerImpl constructor; the two async EXECUTORS are built
+	// later, in Start.
+	p.initAsyncConfig()
 	return p, nil
 }
 
@@ -625,6 +654,10 @@ func (p *DefaultMQProducer) Start() error {
 	for _, topic := range p.topics {
 		inst.RegisterTopicInUse(topic)
 	}
+	// Build the async executors. Done here rather than in the constructor so that
+	// a producer which never starts never owns two live goroutine pools; the
+	// mirror image is destroyAsyncExecutors in Shutdown.
+	p.initAsyncExecutors()
 	p.mqClient = inst
 	p.started = true
 	p.heartbeatRunning.Store(true)
@@ -634,6 +667,14 @@ func (p *DefaultMQProducer) Start() error {
 
 // Shutdown mirrors Java DefaultMQProducerImpl.shutdown.
 func (p *DefaultMQProducer) Shutdown() {
+	// Drain the async executors FIRST, and deliberately without p.mu held:
+	// draining waits for in-flight tasks, and those take p.mu themselves
+	// (requireClient, hookSnapshot), so holding it here would deadlock against
+	// them. When this returns, no async attempt of ours can still be running; a
+	// submit that arrives afterwards is rejected with "producer already
+	// shutdown".
+	p.destroyAsyncExecutors()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.started {
@@ -1332,15 +1373,20 @@ func (p *DefaultMQProducer) sendToQueueWithTimeout(msg *common.Message, mq commo
 
 // SendBatch mirrors Java DefaultMQProducer.batch (SEND_BATCH_MESSAGE = 320).
 func (p *DefaultMQProducer) SendBatch(messages []*common.Message) (*SendResult, error) {
-	return p.sendBatch(messages, nil, p.sendMsgTimeout)
+	return p.sendBatch(messages, nil, p.sendMsgTimeout, pinnedTopicMismatchSync)
 }
 
 // SendBatchToQueue sends a batch to a pinned queue.
 func (p *DefaultMQProducer) SendBatchToQueue(messages []*common.Message, mq common.MessageQueue) (*SendResult, error) {
-	return p.sendBatch(messages, &mq, p.sendMsgTimeout)
+	return p.sendBatch(messages, &mq, p.sendMsgTimeout, pinnedTopicMismatchSync)
 }
 
-func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common.MessageQueue, timeoutMillis int64) (*SendResult, error) {
+// sendBatch is the batch kernel. pinnedMismatch is the wording for the pinned
+// queue guard: the async caller passes pinnedTopicMismatchAsync, because Java's
+// async prologue uses its own text at :1277-1278 rather than the sync one at
+// :1234-1236.
+func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common.MessageQueue,
+	timeoutMillis int64, pinnedMismatch string) (*SendResult, error) {
 	if _, err := p.requireClient(); err != nil {
 		return nil, err
 	}
@@ -1375,7 +1421,7 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	if pinned != nil {
 		// Java routes the batch through the same sync guard as a single message
 		// (MessageBatch extends Message).
-		if err := p.checkPinnedTopic(batch.Message.Topic, *pinned, pinnedTopicMismatchSync); err != nil {
+		if err := p.checkPinnedTopic(batch.Message.Topic, *pinned, pinnedMismatch); err != nil {
 			return nil, err
 		}
 	}
@@ -1481,32 +1527,10 @@ func (p *DefaultMQProducer) SendBySelectorWithTimeout(msg *common.Message, selec
 	return p.sendAttempt(msg, false, selected, sysFlag, timeoutMillis, CommunicationModeSync)
 }
 
-// SendAsync sends without blocking; callback fires exactly once.
-//
-// Deliberate simplifications versus Java/Python, none of which change the wire
-// protocol:
-//   - there is no dedicated async sender thread pool, just a goroutine, so
-//     there is no bounded queue behind it;
-//   - the async back-pressure semaphores (semaphoreAsyncSendNum /
-//     ...SendSize) are not ported, so an unbounded number of sends may be in
-//     flight.
-//
-// The retry rules DO apply, because this reuses the sync implementation — and
-// they are the sync ones, which is what Java does too for the "broker answered
-// an error code" case (no other broker is tried).
-func (p *DefaultMQProducer) SendAsync(msg *common.Message, callback SendCallback) {
-	if callback == nil {
-		return
-	}
-	go func() {
-		result, err := p.SendWithTimeout(msg, p.sendMsgTimeout)
-		if err != nil {
-			callback.OnException(err)
-			return
-		}
-		callback.OnSuccess(result)
-	}()
-}
+// SendAsync and the rest of the asynchronous surface live in async.go — the
+// chain is long enough (back-pressure gate, bounded executors, per-attempt retry
+// with a reused request, callback executor) that keeping it here would bury the
+// six synchronous send paths it sits next to.
 
 // ---------------------------------------------------------------- transaction
 

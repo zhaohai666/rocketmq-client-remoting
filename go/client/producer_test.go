@@ -890,10 +890,12 @@ func TestSendAsyncInvokesCallbackOnce(t *testing.T) {
 
 	done := make(chan *SendResult, 1)
 	failed := make(chan error, 1)
-	p.SendAsync(common.NewMessage(topic, []byte("async")), SendCallbackFunc{
+	if err := p.SendAsync(common.NewMessage(topic, []byte("async")), SendCallbackFunc{
 		SuccessFn: func(r *SendResult) { done <- r },
 		ExceptFn:  func(e error) { failed <- e },
-	})
+	}); err != nil {
+		t.Fatalf("SendAsync submit: %v", err)
+	}
 	select {
 	case r := <-done:
 		if r.SendStatus != SendOK {
