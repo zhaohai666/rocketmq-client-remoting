@@ -114,6 +114,18 @@ func (c *RemotingCommand) setCmdVersion() {
 	c.Version = CurrentVersion
 }
 
+// Clone deep-copies the frame fields. The custom header is shared (headers
+// are treated as immutable once built); Body and extFields are copied so the
+// clone can be mutated independently (GO_AWAY retry assigns a fresh opaque).
+func (c *RemotingCommand) Clone() *RemotingCommand {
+	clone := *c
+	if c.Body != nil {
+		clone.Body = append([]byte(nil), c.Body...)
+	}
+	clone.extFields = c.extFields.Clone()
+	return &clone
+}
+
 // ---------------- flag bits ----------------
 
 func (c *RemotingCommand) MarkResponseType()    { c.Flag |= 1 << FlagRPCType }
