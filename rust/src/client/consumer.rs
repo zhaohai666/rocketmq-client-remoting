@@ -29,9 +29,11 @@
 //!    等）。
 //! 4. **后台任务持 `Weak<Inner>`**：与生产者一致，避免 实例 → 传输 → 任务 → 消费者
 //!    的强引用环；`Drop for Inner` 负责发停止信号并 abort 任务。
-//! 5. **轨迹分发器由调用方注入**：见
-//!    [`set_trace_dispatcher`](Self::set_trace_dispatcher)（生产者侧同一约定，
-//!    差异说明见 [`crate::client::producer`] 模块头 4）。
+//! 5. **轨迹分发器：注入或自动桥接**：见
+//!    [`set_trace_dispatcher`](Self::set_trace_dispatcher)（与生产者同一套约定，
+//!    见 [`crate::client::producer`] 模块头 4）。`enable_trace=true` 且未注入时，
+//!    `start()` 会自动建 `AsyncTraceDispatcher`（Type=CONSUME）+ 真实内部生产者，
+//!    与 Python `consumer._start_trace_dispatcher` 行为一致。
 //!
 //! # 模块划分
 //!
@@ -63,7 +65,9 @@ use crate::client::mq_client::{
     ConsumerFuture, MQClientInstance, MQClientInstanceConfig, PublishMessage, RegisteredConsumer,
     MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
-use crate::client::producer::{SinkAdapter, TraceDispatcherChannel};
+use crate::client::producer::{
+    auto_bridged_dispatcher, SinkAdapter, TraceDispatcherChannel,
+};
 use crate::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, ConsumeOrderlyContext,
     ConsumeOrderlyStatus, ConsumeReturnType, MessageListenerConcurrently, MessageListenerOrderly,
@@ -71,6 +75,7 @@ use crate::client::result::{
 };
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::AccessChannel;
+use crate::client::trace_dispatcher::{TraceDispatcherType, TraceHost};
 use crate::client::trace_hook::{ConsumeMessageTraceHook, TraceReportSink};
 use crate::client::validators;
 use crate::common::message::{Message, MessageExt, MessageQueue};
@@ -1032,6 +1037,15 @@ impl DefaultMQPushConsumer {
             .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
+    /// 当前注册的 rpc 钩子（自动桥接轨迹分发器时透传给内部生产者）。
+    pub(crate) fn rpc_hook(&self) -> Option<Arc<dyn RPCHook>> {
+        self.inner
+            .rpc_hook
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// 注入轨迹分发器（模块头差异 5）。
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
         *lock(&self.inner.trace) = dispatcher;
@@ -1532,18 +1546,39 @@ impl DefaultMQPushConsumer {
 
     /// Python `_start_trace_dispatcher`：`enable_trace` 时注册消费轨迹钩子并启动通道。
     ///
-    /// 与生产者一致（模块头差异 5）：`AsyncTraceDispatcher` 由
-    /// [`set_trace_dispatcher`](Self::set_trace_dispatcher) 注入，这里只挂钩子 + start。
+    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，模块头差异 5）；
+    /// `enable_trace=true` 且未注入时经 [`auto_bridged_dispatcher`] 自动建一套
+    /// （Type=CONSUME + 真实内部生产者）—— 与 Python
+    /// `consumer._start_trace_dispatcher`（`consumer.py:1502-1518`）行为一致。
     fn start_trace_dispatcher(&self) {
         let cfg = self.config();
-        let Some(dispatcher) = self.trace_dispatcher() else {
-            if cfg.enable_trace {
-                rmq_warn!(
-                    "system mqtrace hook init skipped: enableTrace is on but no trace dispatcher \
-                     was injected (see consumer.rs module header deviation 5)"
-                );
+        let dispatcher: Arc<dyn TraceDispatcherChannel> = match self.trace_dispatcher() {
+            Some(d) => d,
+            None if cfg.enable_trace => {
+                match auto_bridged_dispatcher(
+                    &cfg.consumer_group,
+                    TraceDispatcherType::Consume,
+                    self.rpc_hook(),
+                    cfg.trace_msg_batch_num,
+                    cfg.trace_topic.clone(),
+                ) {
+                    Ok(d) => {
+                        // Python `dispatcher.set_host_consumer(self)`（consumer.py:1509）
+                        d.set_host_consumer(Arc::new(self.clone()));
+                        let channel: Arc<dyn TraceDispatcherChannel> = d;
+                        self.set_trace_dispatcher(Some(channel.clone()));
+                        channel
+                    }
+                    Err(e) => {
+                        // 文案照抄 Python consumer.py:1513
+                        rmq_error!(
+                            "system mqtrace hook init failed ,maybe can't send msg trace data: {e}"
+                        );
+                        return;
+                    }
+                }
             }
-            return;
+            None => return,
         };
         if cfg.enable_trace
             && !self
@@ -4759,6 +4794,14 @@ fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -
 // 220/221/307/309 的处理入口注册在 MQClientInstance 上（它按 consumerGroup 找
 // **对应的**消费者），这里只实现被回调的那一侧。40 是唯一由消费者自己注册的，
 // 因为它的动作就是「叫醒本消费者的 rebalance 循环」。
+
+/// Python `set_host_consumer(self)`（`trace_dispatcher.py:117-118`）的宿主端：
+/// 分发器 `_client_id` 读的就是宿主 `_mq_client.client_id`，未启动时是空串。
+impl TraceHost for DefaultMQPushConsumer {
+    fn client_id(&self) -> String {
+        DefaultMQPushConsumer::client_id(self)
+    }
+}
 
 /// Python `_on_consumer_ids_changed`：broker 通知消费组实例变化 → 立即重算。
 impl RegisteredConsumer for DefaultMQPushConsumer {
@@ -8873,5 +8916,14 @@ mod tests {
         let mut mq_map = BTreeMap::from([(key.clone(), mq.clone())]);
         merge_retired_offsets(&mut items, &mut mq_map, &[(mq.clone(), Some(9))]);
         assert_eq!(items.get(&key), Some(&9));
+    }
+
+    // ---------------- 轨迹自动桥接 ----------------
+
+    #[test]
+    fn trace_host_reports_empty_client_id_before_start() {
+        let c = DefaultMQPushConsumer::new("GID_trace_host").expect("合法组名不该构造失败");
+        // Python `_client_id`：宿主没有 _mq_client 时返回空串
+        assert_eq!(TraceHost::client_id(&c), "");
     }
 }

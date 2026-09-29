@@ -21,16 +21,19 @@
 //!
 //! ## 与 Python 参考实现的有意差异（逐条在对应条目 doc 上再次标注）
 //!
-//! 1. **内部生产者靠注入**（[`TraceDispatcherConfig::producer`]）。Python 在
-//!    `__init__` 里直接 `DefaultMQProducer(self._gen_group_name_for_trace(), rpc_hook)`
-//!    （`trace_dispatcher.py:95` + `:98-105`）；本 crate 的统一约定是依赖注入
-//!    （见 `mq_client.rs` 模块头差异 2），且 `producer.rs` 尚未落地，构造点只能在调用方。
-//!    [`TraceProducer`] 的方法集 = Python 真正打到 `self.trace_producer` 上的方法集
+//! 1. **内部生产者：注入，或经 `auto_bridged_dispatcher` 自动建**（[`TraceDispatcherConfig::producer`]）。
+//!    Python 在 `__init__` 里直接 `DefaultMQProducer(self._gen_group_name_for_trace(), rpc_hook)`
+//!    （`trace_dispatcher.py:95` + `:98-105`）。本 crate 的接缝是 [`TraceProducer`]，
+//!    方法集 = Python 真正打到 `self.trace_producer` 上的方法集
 //!    （`set_send_msg_timeout` / `set_max_message_size` / `set_enable_trace` /
 //!    `set_namesrv_addr` / `set_instance_name` / `start` / `shutdown` / `send` /
-//!    `send_by_selector` / `_topic_publish_info`），`producer.rs` 落地后由
-//!    `DefaultMQProducer` 实现它即可。未注入时使用 [`DisabledTraceProducer`]
-//!    （只记日志、发送必失败）并在构造时打一条 WARN。组名字面量另拆了一个**纯**函数
+//!    `send_by_selector` / `_topic_publish_info`），由 `producer.rs` 的
+//!    `DefaultMQProducer` 实现；宿主（生产者/消费者）`enable_trace=true` 且未注入
+//!    分发器时，`start_trace_dispatcher` 会经 `crate::client::producer::auto_bridged_dispatcher`
+//!    自动建一套（内部生产者 + 分发器 + 宿主接线），与 Python 行为对齐。
+//!    注入了 `TraceDispatcherConfig { producer: None, .. }`（裸 `with_config`）时使用
+//!    [`DisabledTraceProducer`]（只记日志、发送必失败）并在构造时打一条 WARN。
+//!    组名字面量另拆了一个**纯**函数
 //!    [`format_trace_producer_group`]，`next_trace_producer_group` 只是「取号 + 调它」；
 //!    拆分动机是单测要能确定性地钉住格式（进程级计数器在并行用例下互相插号）。
 //! 2. **`send_by_selector` 的两步搬到分发器里**：Python

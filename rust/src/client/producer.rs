@@ -21,11 +21,13 @@
 //!    有界的 `AsyncSenderExecutor` 本身照 Java 形状移植（一条容量
 //!    `async_sender_queue_capacity` 的队列 + `available_parallelism()` 份并发额度，见
 //!    [`AsyncSenderExecutor`]），Java 的「线程」在这里是任务：没有名字，也不与核绑定。
-//! 4. **轨迹分发器由调用方注入**（[`DefaultMQProducer::set_trace_dispatcher`]）：
-//!    Python 在 `start()` 里 `new AsyncTraceDispatcher(...)`；本 crate 的统一约定是
-//!    依赖注入（见 `mq_client.rs` 模块头差异 2），构造 `AsyncTraceDispatcher` 需要
-//!    它自己的内部生产者与运行时，放进生产者锁里不合适。注入后 `start()` 仍会照
-//!    Python 的顺序注册 `SendMessageTraceHook` / `EndTransactionTraceHook` 并启动它。
+//! 4. **轨迹分发器：注入或自动桥接**（[`DefaultMQProducer::set_trace_dispatcher`]）：
+//!    Python 在 `start()` 里 `new AsyncTraceDispatcher(...)`（含真实内部生产者）。
+//!    本 crate 允许调用方注入现成分发器（见 `mq_client.rs` 模块头差异 2），但
+//!    `enable_trace=true` 且未注入时，`start()` 会经 [`auto_bridged_dispatcher`]
+//!    自动建一套（含真实内部生产者）—— 与 Python 行为对齐，轨迹开箱即用。
+//!    注入或桥接后 `start()` 都会照 Python 的顺序注册 `SendMessageTraceHook` /
+//!    `EndTransactionTraceHook` 并启动它。
 //! 5. `time.time()*1000` → [`current_time_millis`]；`threading.Lock` → `Mutex`。
 
 use std::collections::BTreeSet;
@@ -65,6 +67,10 @@ use crate::client::result::{
 };
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::TraceContext;
+use crate::client::trace_dispatcher::{
+    AsyncTraceDispatcher, TraceDispatcherConfig, TraceDispatcherType, TraceHost, TraceProducer,
+    TraceProducerFuture,
+};
 use crate::client::trace_hook::{
     EndTransactionTraceHook, SendMessageTraceHook, TraceReportSink,
 };
@@ -97,7 +103,7 @@ use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
 use crate::client::trace_context::{inject_trace_context, trace_context_enabled_from_env};
-use crate::{bail, rmq_debug, rmq_warn};
+use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 
 /// 发送重试内核的离线对拍（进程内假集群），见该模块文档。
 #[cfg(test)]
@@ -1227,6 +1233,15 @@ impl DefaultMQProducer {
             .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
+    /// 当前注册的 rpc 钩子（自动桥接轨迹分发器时透传给内部生产者）。
+    pub(crate) fn rpc_hook(&self) -> Option<Arc<dyn RPCHook>> {
+        self.inner
+            .rpc_hook
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     // ---------------- 钩子注册 ----------------
 
     /// Python `register_send_message_hook`。
@@ -1609,19 +1624,39 @@ impl DefaultMQProducer {
 
     /// Python `_start_trace_dispatcher`（对应 Java `DefaultMQProducer.start():380-405`）。
     ///
-    /// 差异 4：`AsyncTraceDispatcher` 由调用方
-    /// [`set_trace_dispatcher`](Self::set_trace_dispatcher) 注入，本函数只负责
-    /// 「注册两个轨迹钩子 + start」。任何失败都只记日志 —— 轨迹挂了不能影响正常发送。
+    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，原差异 4）；
+    /// `enable_trace=true` 且未注入时经 [`auto_bridged_dispatcher`] 自动建一套
+    /// —— 与 Python `producer._start_trace_dispatcher`（`producer.py:869-891`）
+    /// 行为一致。任何失败都只记日志 —— 轨迹挂了不能影响正常发送。
     fn start_trace_dispatcher(&self) {
         let cfg = self.config();
-        let Some(dispatcher) = self.inner.trace_dispatcher() else {
-            if cfg.enable_trace {
-                rmq_warn!(
-                    "system mqtrace hook init skipped: enableTrace is on but no trace dispatcher \
-                     was injected (see producer.rs module header deviation 4)"
-                );
+        let dispatcher: Arc<dyn TraceDispatcherChannel> = match self.inner.trace_dispatcher() {
+            Some(d) => d,
+            None if cfg.enable_trace => {
+                match auto_bridged_dispatcher(
+                    &self.inner.producer_group(),
+                    TraceDispatcherType::Produce,
+                    self.rpc_hook(),
+                    cfg.trace_msg_batch_num,
+                    cfg.trace_topic.clone(),
+                ) {
+                    Ok(d) => {
+                        // Python `dispatcher.set_host_producer(self)`（producer.py:881）
+                        d.set_host_producer(Arc::new(self.clone()));
+                        let channel: Arc<dyn TraceDispatcherChannel> = d;
+                        self.set_trace_dispatcher(Some(channel.clone()));
+                        channel
+                    }
+                    Err(e) => {
+                        // 文案照抄 Python producer.py:886
+                        rmq_error!(
+                            "system mqtrace hook init failed ,maybe can't send msg trace data: {e}"
+                        );
+                        return;
+                    }
+                }
             }
-            return;
+            None => return,
         };
         if cfg.enable_trace {
             // 重启不能把轨迹钩子注册第二遍（Python 每次 start 新建 dispatcher，
@@ -1647,6 +1682,118 @@ fn has_hook_named(hooks: &[Arc<dyn SendMessageHook>], name: &str) -> bool {
 
 fn has_end_hook_named(hooks: &[Arc<dyn EndTransactionHook>], name: &str) -> bool {
     hooks.iter().any(|h| h.hook_name() == name)
+}
+
+// ================================================================ 轨迹自动桥接
+
+/// Python `_get_and_create_trace_producer`（`trace_dispatcher.py:95-105`）的 Rust 版：
+/// 建一个**真的**内部生产者并连同分发器一起装配好。
+///
+/// `send_msg_timeout=5000` / `max_msg_size=128000` / `enable_trace=false` 三项
+/// 由 [`AsyncTraceDispatcher::with_config`] 按 Python 的顺序打在生产者上，这里不重复。
+///
+/// 与注入式用法的分工：调用方注入的 [`TraceDispatcherChannel`] 优先（原差异 4 约定）；
+/// `enable_trace=true` 且未注入时，`start_trace_dispatcher` 走这里自动建一套，
+/// 与 Python `producer._start_trace_dispatcher` / `consumer._start_trace_dispatcher`
+/// 的行为一致 —— 轨迹开箱即用，不再要求手写桥接。
+pub fn auto_bridged_dispatcher(
+    host_group: &str,
+    dispatcher_type: TraceDispatcherType,
+    rpc_hook: Option<Arc<dyn RPCHook>>,
+    batch_num: i32,
+    trace_topic: Option<String>,
+) -> Result<Arc<AsyncTraceDispatcher>> {
+    let producer_group =
+        AsyncTraceDispatcher::next_trace_producer_group(host_group, dispatcher_type);
+    let producer = DefaultMQProducer::with_rpc_hook(&producer_group, rpc_hook)?;
+    Ok(Arc::new(AsyncTraceDispatcher::with_config(
+        host_group,
+        dispatcher_type,
+        TraceDispatcherConfig {
+            producer: Some(Arc::new(producer)),
+            trace_producer_group: Some(producer_group),
+            // Python `:75`：`min(batch_num, 20)`；负数对 usize 无意义，钳到 0。
+            batch_num: batch_num.clamp(0, 20) as usize,
+            trace_topic_name: trace_topic,
+            ..Default::default()
+        },
+    )))
+}
+
+/// Python `set_host_producer(self)` / `set_host_consumer(self)`
+/// （`trace_dispatcher.py:114-118`）的宿主端：分发器的 `_client_id` 读的就是
+/// 宿主 `_mq_client.client_id`，未启动时是空串。
+impl TraceHost for DefaultMQProducer {
+    fn client_id(&self) -> String {
+        DefaultMQProducer::client_id(self).unwrap_or_default()
+    }
+}
+
+/// [`TraceProducer`] 接缝的真实现（Python 的 `trace_producer` 本来就是一个真的
+/// `DefaultMQProducer`，`trace_dispatcher.py:95-105`；此前本 crate 只有测试桩实现
+/// 该接缝，导致轨迹在未手写桥接时完全发不出去）。
+impl TraceProducer for DefaultMQProducer {
+    fn set_name_server_addr(&self, name_server_addr: &str) {
+        DefaultMQProducer::set_name_server_addresses(self, vec![name_server_addr.to_string()]);
+    }
+
+    fn set_instance_name(&self, instance_name: &str) {
+        DefaultMQProducer::set_instance_name(self, instance_name);
+    }
+
+    fn set_send_msg_timeout(&self, timeout_millis: i64) {
+        DefaultMQProducer::set_send_msg_timeout(self, timeout_millis);
+    }
+
+    fn set_max_message_size(&self, max_msg_size: usize) {
+        DefaultMQProducer::set_max_message_size(self, max_msg_size as i32);
+    }
+
+    fn set_enable_trace(&self, enable: bool) {
+        DefaultMQProducer::set_enable_trace(self, enable);
+    }
+
+    fn start(self: Arc<Self>) -> TraceProducerFuture<Result<()>> {
+        Box::pin(async move { DefaultMQProducer::start(&self).await })
+    }
+
+    fn shutdown(&self) {
+        DefaultMQProducer::shutdown(self);
+    }
+
+    fn send(
+        self: Arc<Self>,
+        mut message: Message,
+        timeout_millis: i64,
+    ) -> TraceProducerFuture<Result<()>> {
+        Box::pin(async move {
+            // 内部生产者 enable_trace=false（with_config 已关），send 不会再产出轨迹；
+            // Some(timeout) 绕过自动攒批，与 Python `send(msg, 5000)` 的同步直发一致。
+            DefaultMQProducer::send(&self, &mut message, Some(timeout_millis), None)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn send_to_queue(
+        self: Arc<Self>,
+        mut message: Message,
+        queue: MessageQueue,
+        timeout_millis: i64,
+    ) -> TraceProducerFuture<Result<()>> {
+        Box::pin(async move {
+            DefaultMQProducer::send(&self, &mut message, Some(timeout_millis), Some(&queue))
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn publish_queues(
+        self: Arc<Self>,
+        topic: String,
+    ) -> TraceProducerFuture<Result<Vec<MessageQueue>>> {
+        Box::pin(async move { DefaultMQProducer::fetch_publish_message_queues(&self, &topic).await })
+    }
 }
 
 /// Python `_send_heartbeat_to_all_broker`：向所有已知 broker 发心跳（含 ProducerData）。
@@ -5349,5 +5496,73 @@ mod tests {
         assert_eq!(snapshot.get_body(), b"body".as_slice());
         assert_eq!(ctx.namespace, "ns");
         assert_eq!(ctx.mq, Some(mq("broker-a", 2)));
+    }
+
+    // ---------------- 轨迹自动桥接 ----------------
+
+    #[test]
+    fn auto_bridged_dispatcher_builds_a_real_side_channel() {
+        let d = auto_bridged_dispatcher(
+            "GID_auto_produce",
+            TraceDispatcherType::Produce,
+            None,
+            25,
+            None,
+        )
+        .expect("自动桥接不该失败");
+        let g1 = d.trace_producer_group().to_string();
+        assert!(
+            g1.starts_with("_INNER_TRACE_PRODUCER-GID_auto_produce-PRODUCE-"),
+            "{g1}"
+        );
+        // Python `min(batch_num, 20)`
+        assert_eq!(d.batch_num(), 20);
+        // trace_topic 缺省回落系统轨迹 topic
+        assert_eq!(d.get_trace_topic_name(), "RMQ_SYS_TRACE_TOPIC");
+        assert_eq!(d.dispatcher_type(), TraceDispatcherType::Produce);
+        assert!(!d.is_started(), "还没 start，不该声称已启动");
+
+        let d2 = auto_bridged_dispatcher(
+            "GID_auto_produce",
+            TraceDispatcherType::Consume,
+            None,
+            3,
+            Some("CUSTOM_TRACE".to_string()),
+        )
+        .expect("自动桥接不该失败");
+        let g2 = d2.trace_producer_group().to_string();
+        assert!(
+            g2.starts_with("_INNER_TRACE_PRODUCER-GID_auto_produce-CONSUME-"),
+            "{g2}"
+        );
+        // 进程级计数器自增：同组两次取号必然不同
+        let n1: u64 = g1.rsplit('-').next().unwrap().parse().unwrap();
+        let n2: u64 = g2.rsplit('-').next().unwrap().parse().unwrap();
+        assert!(n2 > n1, "内部生产者组名计数器必须自增：{g1} -> {g2}");
+        assert_eq!(d2.batch_num(), 3);
+        assert_eq!(d2.get_trace_topic_name(), "CUSTOM_TRACE");
+    }
+
+    #[test]
+    fn trace_producer_seam_forwards_setters_to_the_facade() {
+        let p = producer("GID_seam");
+        TraceProducer::set_name_server_addr(&p, "127.0.0.1:19876");
+        TraceProducer::set_instance_name(&p, "TRACE_SEAM");
+        TraceProducer::set_send_msg_timeout(&p, 5000);
+        TraceProducer::set_max_message_size(&p, 128_000);
+        TraceProducer::set_enable_trace(&p, false);
+        let cfg = p.config();
+        assert_eq!(cfg.name_server_addrs, vec!["127.0.0.1:19876".to_string()]);
+        assert_eq!(cfg.instance_name, "TRACE_SEAM");
+        assert_eq!(cfg.send_msg_timeout, 5000);
+        assert_eq!(cfg.max_message_size, 128_000);
+        assert!(!cfg.enable_trace);
+    }
+
+    #[test]
+    fn trace_host_reports_empty_client_id_before_start() {
+        let p = producer("GID_trace_host");
+        // Python `_client_id`：宿主没有 _mq_client 时返回空串
+        assert_eq!(TraceHost::client_id(&p), "");
     }
 }
