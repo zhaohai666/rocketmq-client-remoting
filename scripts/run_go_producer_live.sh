@@ -37,7 +37,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! port_open "$BROKER_PORT"; then
-    echo "=== broker 未监听 $BROKER_PORT，拉起本地测试集群 ==="
+    echo "=== broker 未监听 ${BROKER_PORT}，拉起本地测试集群 ==="
     sh "$ROOT/scripts/rmq_test_broker.sh" start || { echo "broker 起不来"; exit 1; }
     STARTED_BROKER=1
     # 端口先于「向 namesrv 注册路由」就绪，不等就会拿不到 TBW102 路由而假失败。

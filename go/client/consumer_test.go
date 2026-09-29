@@ -65,6 +65,11 @@ type consumerBroker struct {
 	maxOffsetQ   []mqKey
 	minOffsetQ   []mqKey
 	reqOrder     []int32
+	// createTopicExt records the raw extFields of every UPDATE_AND_CREATE_TOPIC
+	// (17). The REAL broker parses `attributes` as `k=v;k=v` and answers
+	// "kv string format wrong" for anything else, so the field values — not just
+	// the round trip — are what the create-topic test asserts.
+	createTopicExt []*common.StringMap
 
 	// pullCode forces an answer code for PULL_MESSAGE(11); nextBegin and
 	// suggest override the response header.
@@ -221,6 +226,11 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	case remoting.ReqLockBatchMQ, remoting.ReqUnlockBatchMQ:
 		return b.answerBatchLock(req)
+	case remoting.ReqUpdateAndCreateTopic:
+		b.mu.Lock()
+		b.createTopicExt = append(b.createTopicExt, req.ExtFields().Clone())
+		b.mu.Unlock()
+		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	default:
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	}
@@ -421,6 +431,17 @@ func (b *consumerBroker) searchTimestamps() []int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]int64(nil), b.searchTS...)
+}
+
+// createTopicRequests snapshots the raw extFields of every UPDATE_AND_CREATE_TOPIC.
+func (b *consumerBroker) createTopicRequests() []*common.StringMap {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]*common.StringMap, 0, len(b.createTopicExt))
+	for _, ext := range b.createTopicExt {
+		out = append(out, ext.Clone())
+	}
+	return out
 }
 
 // setClientIDs replaces the group membership the broker reports.
