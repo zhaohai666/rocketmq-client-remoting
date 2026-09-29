@@ -87,15 +87,12 @@ use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
     CMResult, ConsumeMessageDirectlyResult, ConsumerRunningInfo, ProcessQueueInfo,
 };
-use crate::remoting::protocol::codes::request_code;
 use crate::remoting::protocol::ext_fields::StringMap;
 use crate::remoting::protocol::extra_info;
-use crate::remoting::protocol::headers::ConsumerSendMsgBackRequestHeader;
 use crate::remoting::protocol::heartbeat::{
     ConsumeFromWhere, ConsumeType, FilterAPI, MessageModel, SubscriptionData,
 };
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
-use crate::remoting::protocol::remoting_command::RemotingCommand;
 use crate::remoting::rpchook::RPCHook;
 use crate::{bail, rmq_debug, rmq_error, rmq_info, rmq_warn};
 
@@ -4238,7 +4235,7 @@ async fn send_back_batch(
             delay_level = 3 + msg.reconsume_times;
         }
         let mut msg = msg.clone();
-        if let Err(e) = send_message_back(inner, &msg, delay_level, None) {
+        if let Err(e) = send_message_back(inner, &msg, delay_level, None).await {
             rmq_debug!("send message back failed: {e}");
             // 与 Java 一样：次数在**要被重新消费的副本**上加，broker 没记成功
             msg.reconsume_times += 1;
@@ -4445,7 +4442,7 @@ fn clean_expire_period_millis(consume_timeout_minutes: i64) -> u64 {
 /// 次数（单测取证「队首才动、失败重试同一条、单轮上限 16」用）。
 ///
 /// 语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
-fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
+async fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
     // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
     if lock(&inner.listener)
         .as_ref()
@@ -4477,7 +4474,7 @@ fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
             break; // Java:97-99 —— 队首没过期，后面的更不可能过期
         }
         attempts += 1;
-        if let Err(e) = send_message_back(inner, &head, 3, None) {
+        if let Err(e) = send_message_back(inner, &head, 3, None).await {
             // Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
             // 再试；绝不摘除（摘了就真丢了）
             rmq_error!("send expired msg exception: {e}");
@@ -4503,11 +4500,11 @@ fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
 ///
 /// 任一条队列抛出异常（如时间戳坏值）与 Java 一样让整轮中止 —— 调度壳子的
 /// `catch (Throwable)`（:77-81）兜住它，下一轮照常。
-fn clean_expired_msg_once(inner: &Arc<Inner>) -> usize {
+async fn clean_expired_msg_once(inner: &Arc<Inner>) -> usize {
     let keys: Vec<String> = lock(&inner.state).mq_map.keys().cloned().collect();
     let mut attempts = 0;
     for key in keys {
-        attempts += clean_expired_queue(inner, &key);
+        attempts += clean_expired_queue(inner, &key).await;
     }
     attempts
 }
@@ -4524,7 +4521,7 @@ async fn clean_expire_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
         if stopped(&rx) || !inner.started.load(Ordering::Acquire) {
             return;
         }
-        clean_expired_msg_once(&inner);
+        clean_expired_msg_once(&inner).await;
         if wait_or_stop(&mut rx, period).await {
             return;
         }
@@ -4595,7 +4592,13 @@ fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> 
 }
 
 /// Python `send_message_back`（CONSUMER_SEND_MSG_BACK=36）。
-fn send_message_back(
+///
+/// ⚠ **同步等应答**，不是发后即忘。Java `DefaultMQPushConsumerImpl#sendMessageBack`
+/// 是一次同步 RPC，成功与否由调用方处置（`processConsumeResult` 把失败的那些
+/// `reconsumeTimes+1` 塞回本地重投；`cleanExpiredMsg` 失败时条目原地保留）。旧实现
+/// `handle.spawn` 发后即忘 —— broker 拒收只留一行 debug 日志，位点照常推进，
+/// 消息**静默丢失**，且 `send_back_batch` 的失败重投分支成了死代码。
+async fn send_message_back(
     inner: &Arc<Inner>,
     msg: &MessageExt,
     delay_level: i32,
@@ -4616,36 +4619,18 @@ fn send_message_back(
     } else {
         cfg.max_reconsume_times
     };
-    let header = ConsumerSendMsgBackRequestHeader {
-        offset: Some(msg.commit_log_offset),
-        group: Some(cfg.consumer_group.clone()),
-        delay_level: Some(delay_level),
-        origin_msg_id: msg.msg_id.clone(),
-        origin_topic: Some(msg.topic.clone()),
-        // Java `DefaultMQPushConsumerImpl#sendMessageBack` 的 unitMode
-        unit_mode: Some(cfg.unit_mode),
-        max_reconsume_times: Some(max_reconsume),
-    };
-    let mut request =
-        RemotingCommand::create_request_command(request_code::CONSUMER_SEND_MSG_BACK, Some(Box::new(header)));
-    let group = cfg.consumer_group.clone();
-    let handle = inner
-        .runtime
-        .get()
-        .cloned()
-        .or_else(|| tokio::runtime::Handle::try_current().ok())
-        .ok_or_else(|| Error::client("no tokio runtime to send message back"))?;
-    handle.spawn(async move {
-        match client.invoke_sync(&addr, &mut request, 5000).await {
-            Ok(response) => {
-                if let Err(e) = MQClientInstance::check_response(&response) {
-                    rmq_debug!("send message back rejected: {e}");
-                }
-            }
-            Err(e) => rmq_debug!("send message back failed, group={group}: {e}"),
-        }
-    });
-    Ok(())
+    // Java `DefaultMQPushConsumerImpl#sendMessageBack` 的 RPC 超时是 3000。
+    client
+        .consumer_send_msg_back(
+            &cfg.consumer_group,
+            msg,
+            delay_level,
+            Some(max_reconsume),
+            3_000,
+            &addr,
+            cfg.unit_mode,
+        )
+        .await
 }
 
 /// Java `ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320`。
@@ -8072,8 +8057,8 @@ mod tests {
     }
 
     /// 队首没过期 → 整条队列都不动（Java:97-99 的 break，不是 continue）。
-    #[test]
-    fn clean_expired_queue_stops_at_a_fresh_head() {
+    #[tokio::test]
+    async fn clean_expired_queue_stops_at_a_fresh_head() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         consumer.update_config(|c| c.consume_timeout = 1);
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8090,7 +8075,7 @@ mod tests {
                 .insert(key.clone(), VecDeque::from(vec![head, tail]));
         }
         assert_eq!(
-            clean_expired_queue(&consumer.inner, &key),
+            clean_expired_queue(&consumer.inner, &key).await,
             0,
             "队首没过期：后面的更不可能过期（Java break 语义）"
         );
@@ -8099,8 +8084,8 @@ mod tests {
     }
 
     /// 没有盖章的消息即便在队首也绝不回投（Java `StringUtils.isNotEmpty` 短路）。
-    #[test]
-    fn clean_expired_queue_leaves_unsigned_messages_alone() {
+    #[tokio::test]
+    async fn clean_expired_queue_leaves_unsigned_messages_alone() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         consumer.update_config(|c| c.consume_timeout = 1);
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8110,14 +8095,14 @@ mod tests {
             m.queue_offset = 0;
             state.pending.insert(key.clone(), VecDeque::from(vec![m]));
         }
-        assert_eq!(clean_expired_queue(&consumer.inner, &key), 0);
+        assert_eq!(clean_expired_queue(&consumer.inner, &key).await, 0);
         assert_eq!(lock(&consumer.inner.state).pending.get(&key).unwrap().len(), 1);
     }
 
     /// 回投失败（未 start 的消费者）→ 条目原地保留、下一轮还是它；单轮内 Java 会对
     /// **同一条队首**重试到 loop 用尽（:80 的 loop 与循环体里的 continue）。
-    #[test]
-    fn clean_expired_queue_keeps_the_entry_when_send_back_fails() {
+    #[tokio::test]
+    async fn clean_expired_queue_keeps_the_entry_when_send_back_fails() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         consumer.update_config(|c| c.consume_timeout = 1);
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8135,7 +8120,7 @@ mod tests {
                 .insert(key.clone(), VecDeque::from(vec![expired(0), expired(1)]));
         }
         assert_eq!(
-            clean_expired_queue(&consumer.inner, &key),
+            clean_expired_queue(&consumer.inner, &key).await,
             2,
             "loop=min(2,16)=2：回投失败后本轮仍会对同一条队首再试一次"
         );
@@ -8149,8 +8134,8 @@ mod tests {
     }
 
     /// 单轮上限 16：20 条过期条目一轮只发起 16 次回投（Java:80）。
-    #[test]
-    fn clean_expired_queue_caps_one_round_at_sixteen() {
+    #[tokio::test]
+    async fn clean_expired_queue_caps_one_round_at_sixteen() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         consumer.update_config(|c| c.consume_timeout = 1);
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8165,15 +8150,15 @@ mod tests {
             .collect();
         lock(&consumer.inner.state).pending.insert(key.clone(), batch.into());
         assert_eq!(
-            clean_expired_queue(&consumer.inner, &key),
+            clean_expired_queue(&consumer.inner, &key).await,
             16,
             "loop 在循环之前算一次：上限 16"
         );
     }
 
     /// 顺序消费没有这条路径（`ProcessQueue:76-78` 直接早退）。
-    #[test]
-    fn clean_expired_queue_skips_orderly_consumers() {
+    #[tokio::test]
+    async fn clean_expired_queue_skips_orderly_consumers() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         consumer.update_config(|c| c.consume_timeout = 1);
         consumer.set_message_listener_orderly(Arc::new(NoopOrderlyListener));
@@ -8187,7 +8172,7 @@ mod tests {
         lock(&consumer.inner.state)
             .pending
             .insert(key.clone(), VecDeque::from(vec![m]));
-        assert_eq!(clean_expired_queue(&consumer.inner, &key), 0);
+        assert_eq!(clean_expired_queue(&consumer.inner, &key).await, 0);
     }
 
     /// 「仍是队首才摘」的两种让位：正常收尾（条目已摘/已前进）与更小位点冒头。
@@ -8394,7 +8379,7 @@ mod tests {
             state.pending.insert(other.clone(), VecDeque::from(vec![expired]));
         }
         assert_eq!(
-            clean_expired_msg_once(&consumer.inner),
+            clean_expired_msg_once(&consumer.inner).await,
             1,
             "只有仍持有的那条队列被扫"
         );
