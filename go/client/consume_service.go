@@ -98,6 +98,9 @@ func (c *DefaultMQPushConsumer) consumeConcurrentlyBatch(mq common.MessageQueue,
 		common.LogDebugf("listener error, treat as RECONSUME_LATER: mq=%v", mq)
 		status = ReconsumeLater
 	}
+	// Java:380 — the RT is taken ONCE, immediately after the listener returns,
+	// and then feeds both the hook's returnType and the CONSUME_RT statistic.
+	consumeRT := common.CurrentTimeMillis() - begin
 	rawStatus := status
 	if status != ConsumeSuccess && status != ReconsumeLater {
 		// Java:399-405 — a null return behaves as RECONSUME_LATER. A Go listener
@@ -115,7 +118,16 @@ func (c *DefaultMQPushConsumer) consumeConcurrentlyBatch(mq common.MessageQueue,
 	} else {
 		ackIndex = -1
 	}
-	c.finishConsumeHook(hooks, hookCtx, rawStatus, panicked, begin, status, ackIndex, len(batch))
+	c.finishConsumeHook(hooks, hookCtx, rawStatus, panicked, consumeRT, status, ackIndex, len(batch))
+	// Java:414-418 — CONSUME_RT is bumped after the hook epilogue and BEFORE
+	// processConsumeResult's OK/Failed accounting; the accounting itself is the
+	// top of processConsumeResult (:212-229).
+	c.incConsumeRT(mq.Topic, consumeRT)
+	if status == ConsumeSuccess {
+		c.recordConsumeSuccessTPS(mq.Topic, ackIndex, len(batch))
+	} else {
+		c.incConsumeFailedTPS(mq.Topic, int64(len(batch)))
+	}
 
 	if c.messageModel == MessageModelBroadcasting {
 		// Java:232-237 — broadcasting never sends back: the unacked tail is
@@ -279,6 +291,8 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 	if status == OrderlyRollback || status == OrderlySuspendCurrentQueueAMoment {
 		common.LogWarnf("consumeMessage Orderly return not OK, Group: %s Msgs: %d MQ: %v", c.consumerGroup, len(batch), mq)
 	}
+	// Java:483 — same single measurement as the concurrent path.
+	consumeRT := common.CurrentTimeMillis() - begin
 	rawStatus := status
 	if status != OrderlySuccess && status != OrderlyRollback && status != OrderlyCommit &&
 		status != OrderlySuspendCurrentQueueAMoment {
@@ -287,7 +301,10 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 		// and silently ack messages that were never consumed.
 		status = OrderlySuspendCurrentQueueAMoment
 	}
-	c.finishOrderlyHook(hooks, hookCtx, rawStatus, panicked, begin, status)
+	c.finishOrderlyHook(hooks, hookCtx, rawStatus, panicked, consumeRT, status)
+	// Java:514-517 — CONSUME_RT first, then processConsumeResult's OK/Failed
+	// accounting.
+	c.incConsumeRT(mq.Topic, consumeRT)
 
 	if ctx.AutoCommit {
 		if status == OrderlyCommit || status == OrderlyRollback {
@@ -298,6 +315,9 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 			status = OrderlySuccess
 		}
 		if status == OrderlySuspendCurrentQueueAMoment {
+			// Java:254-255 — SUSPEND counts the WHOLE batch as failed, before
+			// the retry decision (a batch handed to the broker still failed).
+			c.incConsumeFailedTPS(mq.Topic, int64(len(batch)))
 			// Java:256-266 — checkReconsumeTimes runs first: only "still within
 			// the retry budget, or the send-back failed" suspends in place;
 			// once the message has been handed to the broker the offset moves
@@ -309,6 +329,10 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 				c.sleepOrderly(ctx)
 				return false
 			}
+		} else {
+			// Java:246-252 — SUCCESS, and with autoCommit on COMMIT/ROLLBACK
+			// fall through into it, count the whole batch as OK.
+			c.incConsumeOKTPS(mq.Topic, int64(len(batch)))
 		}
 		c.advanceConsumeOffset(mq, batch, batchEnd(batch), -1, epoch)
 		return true
@@ -325,6 +349,9 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 		c.sleepOrderly(ctx)
 		return false
 	case OrderlySuspendCurrentQueueAMoment:
+		// Java:287 — the whole batch counts as failed. COMMIT and ROLLBACK
+		// record nothing at all (:275-284), which is why they have no line here.
+		c.incConsumeFailedTPS(mq.Topic, int64(len(batch)))
 		if c.checkOrderlyReconsumeTimes(batch) {
 			if pq := c.processQueueOf(mq); pq != nil {
 				pq.RequeueBatch(batch)
@@ -335,6 +362,8 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 		// committed; whether to advance is the binlog consumer's call.
 		return false
 	default:
+		// Java:272-274 — SUCCESS with autoCommit off counts as OK.
+		c.incConsumeOKTPS(mq.Topic, int64(len(batch)))
 		// SUCCESS with autoCommit off: Java leaves the messages in
 		// consumingMsgOrderlyTreeMap waiting for an explicit commit(), and none
 		// of the four ports exposes that handle to a listener. Doing nothing
@@ -703,8 +732,11 @@ func (c *DefaultMQPushConsumer) buildConsumeHookContext(msgs []*common.MessageEx
 	}
 }
 
+// finishConsumeHook is Java's hook epilogue (ConsumeMessageConcurrentlyService
+// :395-412). consumeRT is the value the caller already measured and handed to
+// the statistics, so the trace's contextCode and CONSUME_RT cannot disagree.
 func (c *DefaultMQPushConsumer) finishConsumeHook(hooks []ConsumeMessageHook, ctx *ConsumeMessageContext,
-	rawStatus ConsumeConcurrentlyStatus, panicked bool, begin int64,
+	rawStatus ConsumeConcurrentlyStatus, panicked bool, consumeRT int64,
 	status ConsumeConcurrentlyStatus, ackIndex, msgCount int) {
 
 	if ctx == nil {
@@ -712,14 +744,16 @@ func (c *DefaultMQPushConsumer) finishConsumeHook(hooks []ConsumeMessageHook, ct
 	}
 	unknown := rawStatus != ConsumeSuccess && rawStatus != ReconsumeLater
 	ctx.Props[common.ConsumeContextType] = c.consumeReturnType(unknown, panicked,
-		status == ReconsumeLater, common.CurrentTimeMillis()-begin).String()
+		status == ReconsumeLater, consumeRT).String()
 	ctx.Success = status == ConsumeSuccess
 	ctx.Status = status.String()
 	executeConsumeHookAfter(hooks, ctx)
 }
 
+// finishOrderlyHook is the orderly flavour (ConsumeMessageOrderlyService:498-512),
+// again sharing the caller's single consumeRT measurement.
 func (c *DefaultMQPushConsumer) finishOrderlyHook(hooks []ConsumeMessageHook, ctx *ConsumeMessageContext,
-	rawStatus ConsumeOrderlyStatus, panicked bool, begin int64, status ConsumeOrderlyStatus) {
+	rawStatus ConsumeOrderlyStatus, panicked bool, consumeRT int64, status ConsumeOrderlyStatus) {
 
 	if ctx == nil {
 		return
@@ -727,7 +761,7 @@ func (c *DefaultMQPushConsumer) finishOrderlyHook(hooks []ConsumeMessageHook, ct
 	unknown := rawStatus != OrderlySuccess && rawStatus != OrderlyRollback &&
 		rawStatus != OrderlyCommit && rawStatus != OrderlySuspendCurrentQueueAMoment
 	ctx.Props[common.ConsumeContextType] = c.consumeReturnType(unknown, panicked,
-		status == OrderlySuspendCurrentQueueAMoment, common.CurrentTimeMillis()-begin).String()
+		status == OrderlySuspendCurrentQueueAMoment, consumeRT).String()
 	// Java:483-511 — the hook sees the NORMALISED status, while the returnType
 	// is derived from the raw one; success is SUCCESS||COMMIT.
 	ctx.Success = status == OrderlySuccess || status == OrderlyCommit

@@ -81,6 +81,10 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		batchBytes := c.pullBatchSizeInBytes
 		c.mu.Unlock()
 
+		// The pull RT is measured from just before the request (Java
+		// DefaultMQPushConsumerImpl:343 stamps beginTimestamp immediately before
+		// pullKernelImpl), so it covers the long-poll hold too.
+		begin := common.CurrentTimeMillis()
 		result, err := c.pullAPI.pullKernel(c.consumerGroup, mq, offset, sub, sysFlag, 0,
 			batchNums, batchBytes, suspend, timeout)
 		if err != nil {
@@ -136,6 +140,20 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		if illegal {
 			c.offsetIllegalRecover(mq)
 			return
+		}
+		// Java DefaultMQPushConsumerImpl:353-367 — both counters fire inside the
+		// FOUND arm: the RT even when the list came back empty (the broker did
+		// answer, the round trip happened), the TPS only for a non-empty one.
+		//
+		// Placed AFTER the revocation gate above, which Java does not have: a
+		// batch thrown away because its queue was revoked mid-poll was never
+		// consumed, so counting it would report throughput the consumer does not
+		// have.
+		if result.PullStatus == PullFound {
+			c.incPullRT(mq.Topic, common.CurrentTimeMillis()-begin)
+			if len(result.MsgFoundList) > 0 {
+				c.incPullTPS(mq.Topic, int64(len(result.MsgFoundList)))
+			}
 		}
 		interval := c.pullIntervalValue()
 		if interval > 0 && c.sleepOrStop(stop, time.Duration(interval)*time.Millisecond) {

@@ -162,6 +162,11 @@ type Instance struct {
 	consumerGroupTable map[string]struct{}
 	tablesMu           sync.Mutex
 
+	// consumerStats is the shared ConsumerStatsManager (Java
+	// MQClientInstance.consumerStatsManager). Registered consumers record into
+	// it; GET_CONSUMER_RUNNING_INFO(307) reads it back per subscribed topic.
+	consumerStats *consumerStatsManager
+
 	consumerIDsChanged atomic.Int64
 
 	// hooksInstalled guards EnsureRPCHooks. The hook chain belongs to the
@@ -187,6 +192,7 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 		consumerTable:         map[string]Consumer{},
 		producerTable:         map[string]struct{}{},
 		consumerGroupTable:    map[string]struct{}{},
+		consumerStats:         newConsumerStatsManager(),
 		stop:                  make(chan struct{}),
 	}
 	inst.remoting = remoting.NewRemotingClientWithConfig(remoting.ClientConfig{
@@ -552,6 +558,10 @@ func (i *Instance) Start() error {
 	i.spawnPeriodic(func() {
 		i.AdjustThreadPools()
 	}, 60_000, 60_000)
+	// The five consumer-stats sets (Java schedules these from the StatsItemSet
+	// constructor, i.e. at MQClientInstance construction; same cadences, tied
+	// here to the instance's stop channel).
+	i.consumerStats.schedule(i)
 	return nil
 }
 

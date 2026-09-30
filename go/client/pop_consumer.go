@@ -93,6 +93,9 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 		}
 
 		sub, _ := c.subscriptionFor(mq.Topic)
+		// Java:541 stamps beginTimestamp immediately before the POP request, so
+		// the POP round trip includes the broker's poll hold.
+		begin := common.CurrentTimeMillis()
 		result, err := c.popOnce(mq, sub)
 		if err != nil {
 			if e, ok := err.(*common.Error); ok && e.Kind == common.KindServer && e.Code == remoting.RespFlowControl {
@@ -120,10 +123,15 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 		}
 		switch result.PopStatus {
 		case PopFound:
+			// Java DefaultMQPushConsumerImpl:555-563 — the RT counter is bumped
+			// for a FOUND answer even when the list is empty; only the TPS
+			// counter is conditioned on a non-empty list.
+			c.incPullRT(mq.Topic, common.CurrentTimeMillis()-begin)
 			if len(result.MsgFoundList) == 0 {
 				// Java: FOUND with an empty list retries immediately.
 				continue
 			}
+			c.incPullTPS(mq.Topic, int64(len(result.MsgFoundList)))
 			pq.IncFoundMsg(len(result.MsgFoundList))
 			c.submitPopConsume(mq, result.MsgFoundList, pq)
 			if interval := c.pullIntervalValue(); interval > 0 {
@@ -290,6 +298,10 @@ func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []
 	}
 	invisibleTime := popInvisibleTimeOf(batch)
 	c.finishPopConsumeHook(hooks, hookCtx, rawStatus, panicked, status, consumeRT, invisibleTime)
+	// Java ConsumeMessagePopConcurrentlyService:424-425 — CONSUME_RT is bumped
+	// after the hook and before the validity re-check, so a batch that expired
+	// while the listener ran still contributes its RT (the listener DID run).
+	c.incConsumeRT(mq.Topic, consumeRT)
 
 	// Java checks the window AGAIN after the listener: a slow listener must not
 	// ACK messages the broker already owns.
@@ -356,6 +368,14 @@ func (c *DefaultMQPushConsumer) processPopConsumeResult(mq common.MessageQueue, 
 			ackIndex = len(batch) - 1
 		}
 	}
+	// Java ConsumeMessagePopConcurrentlyService:186-203 — the same OK/Failed
+	// accounting as the pull path, from the same clamped ackIndex the ACK loop
+	// below uses, and likewise before the loop.
+	if status == ConsumeSuccess {
+		c.recordConsumeSuccessTPS(mq.Topic, ackIndex, len(batch))
+	} else {
+		c.incConsumeFailedTPS(mq.Topic, int64(len(batch)))
+	}
 
 	for i := 0; i < len(batch); i++ {
 		msg := batch[i]
@@ -371,7 +391,6 @@ func (c *DefaultMQPushConsumer) processPopConsumeResult(mq common.MessageQueue, 
 		}
 		pq.Ack()
 	}
-	_ = mq
 }
 
 // ackIndexFor mirrors Java's pre-clamp, used only for the consume hook's ack
