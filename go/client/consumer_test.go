@@ -146,7 +146,7 @@ func (b *consumerBroker) handler() func(*mockServer, *remoting.RemotingCommand) 
 
 func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.RemotingCommand {
 	switch req.Code {
-	case remoting.ReqPullMessage:
+	case remoting.ReqPullMessage, remoting.ReqLitePullMessage:
 		return b.answerPull(req)
 	case remoting.ReqGetConsumerListByGroup:
 		b.mu.Lock()
@@ -396,6 +396,13 @@ func (b *consumerBroker) lastCommit(topic string, queueID int32) (consumerCommit
 		}
 	}
 	return out, found
+}
+
+// commitCount snapshots the number of UPDATE_CONSUMER_OFFSET requests.
+func (b *consumerBroker) commitCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.commits)
 }
 
 func (b *consumerBroker) sendBackSnapshot() []*remoting.ConsumerSendMsgBackRequestHeader {

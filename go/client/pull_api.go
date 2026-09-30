@@ -189,6 +189,26 @@ func (p *pullAPI) pullKernel(group string, mq common.MessageQueue, offset int64,
 	sub *remoting.SubscriptionData, sysFlag int32, commitOffset int64,
 	maxMsgNums int32, maxMsgBytes int32, suspendTimeoutMillis int64,
 	timeoutMillis int64) (*PullResult, error) {
+	return p.pullKernelWithCode(remoting.ReqPullMessage, group, mq, offset, sub,
+		sysFlag, commitOffset, maxMsgNums, maxMsgBytes, suspendTimeoutMillis, timeoutMillis)
+}
+
+// pullKernelLite is the LITE_PULL_MESSAGE(361) flavour the lite pull consumer
+// uses: identical header and response shape, and the caller has already set the
+// FLAG_LITE_PULL_MESSAGE bit in sysFlag. The pull is always a SHORT poll with
+// no inline offset commit (the lite consumer owns its own commit path), so
+// commitOffset is fixed at 0 and the broker hold budget at 15s.
+func (p *pullAPI) pullKernelLite(group string, mq common.MessageQueue, offset int64,
+	sub *remoting.SubscriptionData, sysFlag int32, maxMsgNums int32,
+	timeoutMillis int64) (*PullResult, error) {
+	return p.pullKernelWithCode(remoting.ReqLitePullMessage, group, mq, offset, sub,
+		sysFlag, 0, maxMsgNums, -1, 15000, timeoutMillis)
+}
+
+func (p *pullAPI) pullKernelWithCode(code int32, group string, mq common.MessageQueue,
+	offset int64, sub *remoting.SubscriptionData, sysFlag int32, commitOffset int64,
+	maxMsgNums int32, maxMsgBytes int32, suspendTimeoutMillis int64,
+	timeoutMillis int64) (*PullResult, error) {
 
 	addr, slave, found := p.instance.FindBrokerAddressInSubscribe(mq.BrokerName, p.recalculatePullFromWhichNode(mq), false)
 	if !found {
@@ -226,7 +246,7 @@ func (p *pullAPI) pullKernel(group string, mq common.MessageQueue, offset int64,
 		header.Subscription = remoting.StrPtr(sub.SubString)
 	}
 
-	request := remoting.CreateRequestCommand(remoting.ReqPullMessage, header)
+	request := remoting.CreateRequestCommand(code, header)
 	response, err := p.instance.invokeSync(addr, request, timeoutMillis)
 	if err != nil {
 		return nil, err
