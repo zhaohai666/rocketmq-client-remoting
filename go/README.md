@@ -2,8 +2,9 @@
 
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
 适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / .NET / Rust 实现逐项对齐。
-**真机联调工具目前 7 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
-重投与死信 / 停机竞态 / **管理端**；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
+**真机联调工具目前 9 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
+POP / 重投与死信 / 停机竞态 / **管理端** / **压缩矩阵**（后者由 `compression_matrix.sh` 驱动，
+收发两端都是它自己，不算一个独立入口）；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
 **不宣称「全部能力都已联调」**。另有一个**不依赖集群**的离线自检
 （`go run ./examples/selfcheck`，见「离线自检」）—— 它与 Python / C++ / .NET 三端的同名工具对齐，
 **不是** Java 的机制（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令）。
@@ -122,6 +123,7 @@ go run ./examples/live_redelivery     -ns 127.0.0.1:9876 [-legs s1,s2,s3,s4]
                                                           # S1 %RETRY% 二次投递 + delayLevel 3 延迟梯度 + topic 还原、S2 maxReconsumeTimes=2 ⇒ 3 次投递后 %DLQ% 且 recon=3、S3 顺序毒消息走「等 broker 回投」那条 DLQ 路径、S4 ackIndex 部分 ack（已 ack 的不回投 / 位点仍整批提交 / 对照组一条不回投）
 go run ./examples/live_shutdown_race  -ns 127.0.0.1:9876   # 立即关停 / 立即退进程的丢数据契约：并发回投两轮（%RETRY% → %DLQ%）、顺序挂起回投、短生命周期 trace 生产者冲尾批
 go run ./examples/live_admin          -ns 127.0.0.1:9876   # 管理端 29 项：集群探活与 master 选主、topic CRUD（路由/配置/列表一致）、broker 配置与运行时 KV、KV config 写读删、订阅组 CRUD、发 8 条验 topicStats、**四个位点查询**（Max/Min/LOWER/UPPER 边界/最早存储时间）、位点写 broker 再用另一个 RPC 读回、KEYS 索引查询 + viewMessage 取正文、删 topic 后确认消失
+go run ./examples/live_pop            -ns 127.0.0.1:9876   # POP 消费
 ```
 
 脚本（**起集群 + 等端口 + 跑验证 + 收工都在同一条命令内**，别拆开跑）：
@@ -132,7 +134,9 @@ bash scripts/run_go_consumer_live.sh        # Python 生产 → Go 消费 → Py
 bash scripts/run_go_pull_live.sh            # Go 拉取
 bash scripts/run_go_redelivery_live.sh      # 重投 / 死信终态 / 顺序死信 / ackIndex 部分 ack（全跑约 5~7 分钟）
 bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 live_shutdown_race）
+bash scripts/run_go_pop_live.sh             # POP 消费
 bash scripts/run_go_admin_live.sh           # 管理端（29 项，自断言；工具自己造/删 topic、订阅组、KV namespace）
+bash scripts/compression_matrix.sh zlib     # 跨语言压缩矩阵（五端互测，含 Go 9 个方向；非 zlib 会跳过 Go）
 ```
 
 **尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
@@ -176,7 +180,7 @@ go/
 │   ├── offset_store.go / route.go / broker_api.go / hooks.go
 │   ├── fault_strategy.go / semaphore.go / listener.go / send_result.go
 │   └── validators 走 common
-└── examples/                   selfcheck（不依赖集群）+ 7 个真机联调工具（见上）
+└── examples/                   selfcheck（不依赖集群）+ 9 个真机联调工具（见上）
 ```
 
 ## 几个必须知道的实现约定
