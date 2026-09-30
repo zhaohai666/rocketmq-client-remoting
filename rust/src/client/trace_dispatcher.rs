@@ -100,7 +100,8 @@
 //!     （`:230`）在 topic 真含 `\x01` 时抛 `ValueError`，异常被线程池吞掉；Rust 只按
 //!     **第一个** `\x01` 切一次（`split_once`），切不出两段则记 DEBUG 后跳过该组。
 //! 14. **`is_started` 在 `shutdown()` 后仍为 `true`** —— Python 原样（`:144-162` 没有复位
-//!     它），因此二次 `shutdown()` 仍会再调一次 `trace_producer.shutdown()`；保留。
+//!     它）。但二次 `shutdown()` 不再重复关内部生产者：收尾由游离任务在在途发送
+//!     收敛后执行一次，二次调用直接返回（重复关会把第一轮没等完的发送掐掉）。
 //! 15. **`namespace_v2`（`:86`）未移植**：Python 只在构造函数里赋了 `""`，全文从未读取
 //!     （Java `start()` 会 `traceProducer.setNamespaceV2(...)`，
 //!     `AsyncTraceDispatcher.java:155`），属死状态；等命名空间 2.0 的接缝真需要时再补。
@@ -510,6 +511,9 @@ struct Inner {
     discard_count: AtomicU64,
     /// Python `self.stopped`（`:82`）。
     stopped: AtomicBool,
+    /// 同步 [`Inner::shutdown`] 是否已挂出/执行过收尾：防止二次 `shutdown()`
+    /// 把还在等在途发送的游离收尾任务半路掐掉。
+    finalizing: AtomicBool,
     /// Python `self.is_started`（`:83`）。
     is_started: AtomicBool,
     /// Python `self._last_flush_time`（`:90`）。
@@ -632,6 +636,7 @@ impl AsyncTraceDispatcher {
                     queue_capacity: config.queue_capacity,
                     discard_count: AtomicU64::new(0),
                     stopped: AtomicBool::new(false),
+                    finalizing: AtomicBool::new(false),
                     is_started: AtomicBool::new(false),
                     last_flush_time: AtomicI64::new(current_time_millis()),
                     flush_trace_interval_millis: config.flush_trace_interval_millis,
@@ -812,7 +817,12 @@ impl AsyncTraceDispatcher {
     /// 最后一批轨迹与生产者关闭相互竞争）。
     pub async fn shutdown_gracefully(&self) {
         self.inner.flush_and_wait().await;
-        TraceDispatcher::shutdown(self);
+        if self.inner.finalizing.swap(true, Ordering::AcqRel) {
+            // 同步 shutdown() 已挂出游离收尾：它会在在途发送收敛后关生产者，
+            // 这里再就地关一次只会跟它抢。
+            return;
+        }
+        self.inner.finalize_now();
     }
 
     // ---------------- 入队 / 刷写 ----------------
@@ -1038,10 +1048,39 @@ impl Inner {
     }
 
     /// Python `shutdown()` 的同步部分（`:144-162`）。
+    ///
+    /// ⚠ 不能在这里就地关内部生产者：上面 `flush()` 刚把队列里剩的批次 spawn 成
+    /// 在途发送任务，紧接着 `trace_producer.shutdown()` 会让它们撞上
+    /// 「producer not started / 连接已关」—— 短生命周期客户端最后一批轨迹就是
+    /// 这样丢的。内部生产者的实例名独立于宿主（`TRACE_INSTANCE_NAME`），不与
+    /// 宿主客户端共用连接，所以把「等在途发送收敛 → 关生产者 → 停 worker」挂成
+    /// 游离任务：宿主进程只要不立刻退出，最后一批就能发完。要在关闭前**同步**
+    /// 等完的调用方用 [`AsyncTraceDispatcher::shutdown_gracefully`]。
     fn shutdown(&self) {
         self.flush();
-        // Python `:149-152` `_executor.shutdown(wait=False)`：在途任务不取消
-        // （Python 线程池会把已提交的任务跑完）；Rust 侧同样只丢句柄不 abort。
+        if self.finalizing.swap(true, Ordering::AcqRel) {
+            // 收尾已在跑/已完成：二次 shutdown 再关一次生产者是 Python :144-162
+            // 的原样行为（模块差异 14），但这里若重复挂收尾，会把第一轮还没等完
+            // 的在途发送从中间掐掉。
+            return;
+        }
+        match (self.this.upgrade(), self.handle.get().cloned()) {
+            (Some(me), Some(handle)) => {
+                handle.spawn(async move { me.finalize().await });
+            }
+            // 从未 start（无运行时/无 worker）：不存在在途发送，就地收尾。
+            _ => self.finalize_now(),
+        }
+    }
+
+    /// 游离收尾：等在途发送跑完（上限 `wait_for_shutdown_millis`）再关生产者。
+    async fn finalize(&self) {
+        self.flush_and_wait().await;
+        self.finalize_now();
+    }
+
+    /// 就地收尾（此时已无在途发送；对应 Python `:153-161`）。
+    fn finalize_now(&self) {
         // Python `:153-157`：只有启动过才关内部生产者
         if self.is_started.load(Ordering::Acquire) {
             self.trace_producer.shutdown();
@@ -1300,7 +1339,8 @@ impl TraceDispatcher for AsyncTraceDispatcher {
     }
 
     /// Python `shutdown()`（`:144-162`）：flush（不等待）+ 关内部生产者 + `stopped=True`。
-    /// 要等发完请用 [`AsyncTraceDispatcher::shutdown_gracefully`]。
+    /// 关生产者这步由游离收尾任务在在途发送收敛后执行（否则最后一批轨迹会撞上
+    /// 已关闭的生产者）；要**同步**等发完请用 [`AsyncTraceDispatcher::shutdown_gracefully`]。
     fn shutdown(&self) {
         self.inner.shutdown();
     }
@@ -2263,11 +2303,18 @@ mod tests {
         d.append(simple_pub());
         TraceDispatcher::shutdown(&d);
         assert_eq!(d.queue_size(), 0);
+        // 收尾（等在途发送 → 关内部生产者 → 停 worker）挂在游离任务上，
+        // 这里等它收敛：is_stopped 只在 finalize_now 之后才为真。
+        for _ in 0..500 {
+            if d.is_stopped() && recorder.shutdowns.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(d.is_stopped());
         assert_eq!(recorder.shutdowns.load(Ordering::Acquire), 1);
         // Python `:144-162` 不复位 is_started
         assert!(d.is_started());
-        d.flush_and_wait().await;
         assert!(!recorder.records().is_empty());
     }
 
@@ -2277,8 +2324,15 @@ mod tests {
         let (d, recorder) = dispatcher();
         d.append(simple_pub());
         TraceDispatcher::shutdown(&d);
-        assert_eq!(recorder.shutdowns.load(Ordering::Acquire), 0);
         assert_eq!(d.queue_size(), 0);
+        // is_started=false ⇒ finalize_now 不关内部生产者；stopped 由收尾置位
+        for _ in 0..500 {
+            if d.is_stopped() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(recorder.shutdowns.load(Ordering::Acquire), 0);
         assert!(d.is_stopped());
     }
 

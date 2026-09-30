@@ -119,6 +119,13 @@ pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 /// 主动撤掉并重建（`isPullExpired` 用严格 `>`）。
 pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
 
+/// 停机收尾给「在途批次收完（含回投 RPC）」的预算。
+///
+/// 覆盖一个批次的 listener + 逐条回投（每次 3000ms 超时）绰绰有余；顺序消费的
+/// 挂起重试最多钳到 30s，超了就放弃等待 —— 位点持久化按下限钳制（Java
+/// persistAllConsumerOffset 的「剩余最小 offset」口径），不会把没落定的消息跳过去。
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ================================================================ 队列与过滤工具
 
 /// 队列排序键，语义对齐 Java `MessageQueue.compareTo`：topic → brokerName → queueId。
@@ -726,6 +733,10 @@ struct Inner {
     runtime: OnceLock<tokio::runtime::Handle>,
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// 分发循环的句柄，**不在** [`Inner::tasks` 里]：停机时它可能正带着一批消息做
+    /// 回投 RPC，abort 会把在途回投从中间掐断。停机改走「有界等它跑完当前批次」
+    /// （见 [`DefaultMQPushConsumer::shutdown`] 的收尾任务）。
+    dispatch_task: Mutex<Option<JoinHandle<()>>>,
     listener: Mutex<Option<MessageListener>>,
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     consume_hooks: ConsumeMessageHookList,
@@ -861,6 +872,7 @@ impl DefaultMQPushConsumer {
             runtime: OnceLock::new(),
             stop: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
+            dispatch_task: Mutex::new(None),
             listener: Mutex::new(None),
             strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
             consume_hooks: ConsumeMessageHookList::new(),
@@ -1417,9 +1429,6 @@ impl DefaultMQPushConsumer {
             // start() 的自愈判定读到旧实例的盖章。
             state.last_pull_at.clear();
         }
-        if let Some(executor) = lock(&self.inner.pop_executor).take() {
-            executor.shutdown();
-        }
         for task in self
             .inner
             .tasks
@@ -1429,6 +1438,11 @@ impl DefaultMQPushConsumer {
         {
             task.abort();
         }
+        // 分发循环不在 tasks 里（见字段注释）：它可能正带着一批消息做回投 RPC，
+        // abort 会把在途回投从中间掐断。由下面的收尾任务有界等它跑完当前批次。
+        let dispatch_task = lock(&self.inner.dispatch_task).take();
+        // POP 执行器同样挪进收尾任务：先停接收，再有界等已提交任务跑完。
+        let pop_executor = lock(&self.inner.pop_executor).take();
         // 退出前把已消费位点持久化一次（Java MQClientInstance.shutdown →
         // persistAllConsumerOffset）。必须在 started=false 之后仍能取到 client，
         // 所以这里直接用 client 引用而不是 require_client()。
@@ -1440,14 +1454,9 @@ impl DefaultMQPushConsumer {
             let orderly = lock(&self.inner.listener)
                 .as_ref()
                 .is_some_and(MessageListener::is_orderly);
-            let items: Vec<(MessageQueue, i64)> = {
-                let state = lock(&self.inner.state);
-                state
-                    .consume_offsets
-                    .iter()
-                    .filter_map(|(k, off)| state.mq_map.get(k).map(|mq| (mq.clone(), *off)))
-                    .collect()
-            };
+            // 位点清单在收尾任务里排空之后现算（[`shutdown_persist_items`]）：
+            // 停机瞬间快照 consume_offsets 会把还没收尾的批次漏在旧值之外，
+            // 更重要的是要把位点钳到「仍未落定消息」之下。
             // POP 顺序同样没有队列锁可解：Java unlockAll() 只遍历 processQueueTable，
             // POP 的队列在 popProcessQueueTable 里，这张表是空的 ⇒ UNLOCK 一发不出。
             let locked_mqs: Vec<MessageQueue> =
@@ -1470,10 +1479,41 @@ impl DefaultMQPushConsumer {
             client.detach_from_registry_if_last_tenant();
             if let Some(handle) = self.runtime_handle() {
                 let client_id = self.client_id();
+                let inner = Arc::clone(&self.inner);
                 handle.spawn(async move {
-                    // 清退三步必须**串行**（刷位点 → 解锁 → 注销）：并发送的话注销可能
+                    // ① 有界排空在途批次：等分发循环把手里的这批消费/回投完（回投 RPC
+                    //    完整跑到应答），POP 执行器把已提交的消费任务跑完。超时则放弃
+                    //    —— 下面 ② 的位点下限钳制保证没落定的消息仍会被 broker 重投。
+                    if let Some(task) = dispatch_task {
+                        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, task)
+                            .await
+                            .is_err()
+                        {
+                            rmq_warn!(
+                                "push shutdown: dispatch loop still busy after \
+                                 {SHUTDOWN_DRAIN_TIMEOUT:?}; persisting floored offsets"
+                            );
+                        }
+                    }
+                    if let Some(executor) = pop_executor {
+                        executor.shutdown();
+                        if tokio::time::timeout(
+                            SHUTDOWN_DRAIN_TIMEOUT,
+                            executor.await_termination(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            rmq_warn!(
+                                "push shutdown: pop consume executor still busy after \
+                                 {SHUTDOWN_DRAIN_TIMEOUT:?}"
+                            );
+                        }
+                    }
+                    // ② 清退三步必须**串行**（刷位点 → 解锁 → 注销）：并发送的话注销可能
                     // 插在解锁之前，broker 已按 clientId 丢掉记录，位点和锁白刷。
                     if !broadcast {
+                        let items = shutdown_persist_items(&inner);
                         for (mq, off) in &items {
                             if let Err(e) =
                                 client.update_consumer_offset(&group, mq, *off, 5000, None).await
@@ -2774,11 +2814,13 @@ impl DefaultMQPushConsumer {
         let tasks = &mut *lock(&self.inner.tasks);
         tasks.push(spawn_loop!(heartbeat_loop));
         tasks.push(spawn_loop!(lock_loop));
-        // 分发与重平衡：重平衡需要句柄（要起每队列循环），单独用消费者克隆体
+        // 分发与重平衡：重平衡需要句柄（要起每队列循环），单独用消费者克隆体。
+        // 分发循环不进 tasks（停机不能 abort 它 —— 它可能正带着在途回投 RPC），
+        // 单独登记进 dispatch_task，停机时由收尾任务有界等待。
         let consumer = self.clone();
         let rx = self.inner.stop.subscribe();
         tasks.push(handle.spawn(async move { rebalance_loop(consumer, rx).await }));
-        tasks.push(spawn_loop!(dispatch_loop));
+        *lock(&self.inner.dispatch_task) = Some(spawn_loop!(dispatch_loop));
         // 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
         // ConsumeMessageConcurrentlyService 的构造/start 里（:68-88），顺序消费的
         // ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
@@ -2790,6 +2832,34 @@ impl DefaultMQPushConsumer {
             tasks.push(spawn_loop!(clean_expire_loop));
         }
     }
+}
+
+/// 停机位点持久化清单：`consume_offsets` 与「仍未落定消息的最小 queueOffset」取小。
+///
+/// 落定 = 已 ack / 已成功回投 %RETRY%。没落定的消息此刻压在 `pending`
+/// （回投失败等重试、顺序挂起重试）或 `inflight_msgs`（listener 手里、排空超时的
+/// 残余）里 —— broker 侧的位点绝不能越过它们，否则 broker 永远不会再投递这些
+/// 消息：立即关闭时回投还没跑完的那几条就是**真丢失**。Java 的
+/// `persistAllConsumerOffset` 拿的是 `ProcessQueue` 剩余消息的最小 offset，天然
+/// 不会跳过；本端口位点「只前进」推进，停机时刻必须显式做这道钳制。
+fn shutdown_persist_items(inner: &Inner) -> Vec<(MessageQueue, i64)> {
+    let state = lock(&inner.state);
+    state
+        .consume_offsets
+        .iter()
+        .filter_map(|(k, off)| {
+            let mq = state.mq_map.get(k)?;
+            let floor = state
+                .inflight_msgs
+                .get(k)
+                .into_iter()
+                .flatten()
+                .chain(state.pending.get(k).into_iter().flatten())
+                .map(|m| m.queue_offset)
+                .min();
+            Some((mq.clone(), floor.map_or(*off, |f| (*off).min(f))))
+        })
+        .collect()
 }
 
 /// Python `_persist_offsets_once`（集群模式刷 broker / 广播模式刷本地）。
@@ -7437,6 +7507,44 @@ mod tests {
         assert_eq!(revoked, vec![(mq, None)]);
         // 非 POP 模式不去碰 pop_queues（也不该凭空造一把）
         assert!(state.pop_queues.is_empty());
+    }
+
+    /// 停机位点下限钳制（[`shutdown_persist_items`]）：已推进位点若越过了仍未落定
+    /// 消息（回投失败压在 pending / 还在 listener 手里）的最小 offset，持久化清单
+    /// 必须钳回去 —— 否则 broker 永远不会重投这几条（立即关闭时的真丢失）。
+    #[test]
+    fn shutdown_persist_items_floors_offsets_below_unsettled_messages() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+        let mut m_low = ext("T", None);
+        m_low.queue_offset = 5;
+        let mut m_high = ext("T", None);
+        m_high.queue_offset = 9;
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.mq_map.insert(key.clone(), mq.clone());
+            // 位点已被推进到 10（例如同一批里回投成功的那几条先落定）
+            state.consume_offsets.insert(key.clone(), 10);
+            // 一条回投失败压在 pending，一条还在 listener 手里
+            state
+                .pending
+                .insert(key.clone(), VecDeque::from(vec![m_low]));
+            state.inflight_msgs.insert(key.clone(), vec![m_high]);
+        }
+        let items = shutdown_persist_items(&consumer.inner);
+        assert_eq!(items, vec![(mq, 5)]);
+
+        // 没有未落定消息的队列按已推进位点原样持久化
+        let other = queue("T", "broker-a", 1);
+        let okey = mq_key(&other);
+        {
+            let mut state = lock(&consumer.inner.state);
+            state.mq_map.insert(okey.clone(), other.clone());
+            state.consume_offsets.insert(okey, 7);
+        }
+        let items = shutdown_persist_items(&consumer.inner);
+        assert!(items.contains(&(other, 7)), "items={items:?}");
     }
 
     /// 停摆的队列在**同一趟** rebalance 里被撤掉并重建（Java
