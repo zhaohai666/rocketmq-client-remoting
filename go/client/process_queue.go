@@ -29,6 +29,7 @@ import (
 	"sync"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
+	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
 // processQueue is the per-queue state.
@@ -55,6 +56,25 @@ type processQueue struct {
 	lastPullTimestamp    int64 // unix millis
 	lastConsumeTimestamp int64 // unix millis of the last completion
 
+	// tryUnlockTimes / lastLockTimestamp are Java ProcessQueue's
+	// AtomicLong tryUnlockTimes + volatile lastLockTimestamp. Both ride inside
+	// ProcessQueueInfo in the 307 answer, which is the only reason they exist.
+	//
+	// lastLockTimestamp is stamped at construction and re-stamped every time the
+	// broker CONFIRMS the queue lock (Java: setLocked(true) is always paired with
+	// setLastLockTimestamp(now) in RebalanceImpl.lock/lockAll; the failure branch
+	// calls setLocked(false) WITHOUT touching the stamp, which is why the stamp
+	// lives in the true branch here too).
+	//
+	// tryUnlockTimes counts "the queue could not be released cleanly" — Java
+	// increments it when removeUnnecessaryMessageQueue fails to take the 500ms
+	// consume-lock tryLock, or throws. This port retires a queue under its own
+	// mutex with nothing to block on, so there is no failing branch to count and
+	// the value stays 0; the field is kept so the wire shape matches and so a
+	// future blocking release has somewhere to record it.
+	lastLockTimestamp int64
+	tryUnlockTimes    int64
+
 	// consumeOrderly mirrors the consumer's mode at creation time (Java reads
 	// the consumer's flag inside cleanExpiredMsg).
 	consumeOrderly bool
@@ -62,9 +82,10 @@ type processQueue struct {
 
 func newProcessQueue(consumeOrderly bool) *processQueue {
 	return &processQueue{
-		msgs:           map[int64]*common.MessageExt{},
-		dispatched:     map[int64]struct{}{},
-		consumeOrderly: consumeOrderly,
+		msgs:              map[int64]*common.MessageExt{},
+		dispatched:        map[int64]struct{}{},
+		consumeOrderly:    consumeOrderly,
+		lastLockTimestamp: common.CurrentTimeMillis(),
 	}
 }
 
@@ -365,11 +386,103 @@ func (pq *processQueue) IsDropped() bool {
 	return pq.dropped
 }
 
-// SetLocked records the LOCK_BATCH_MQ outcome for orderly consumption.
+// SetLocked records the LOCK_BATCH_MQ outcome for orderly consumption. A grant
+// also re-stamps lastLockTimestamp (Java's lock()/lockAll(), which pair
+// setLocked(true) with setLastLockTimestamp(now)); a refusal leaves the stamp
+// alone, again as Java does.
 func (pq *processQueue) SetLocked(locked bool) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	pq.locked = locked
+	if locked {
+		pq.lastLockTimestamp = common.CurrentTimeMillis()
+	}
+}
+
+// TryUnlockTimes is the failed-release counter (see the field comment).
+func (pq *processQueue) TryUnlockTimes() int64 {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return pq.tryUnlockTimes
+}
+
+// LastLockTimestamp is the last confirmed-lock stamp.
+func (pq *processQueue) LastLockTimestamp() int64 {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return pq.lastLockTimestamp
+}
+
+// LastConsumeTimestamp is the last handed-to-listener stamp.
+func (pq *processQueue) LastConsumeTimestamp() int64 {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return pq.lastConsumeTimestamp
+}
+
+// FillProcessQueueInfo mirrors Java ProcessQueue#fillProcessQueueInfo
+// (:432-465) for the 307 answer.
+//
+// Three of the fields are CONDITIONAL in Java and the difference is observable:
+// cachedMsgMinOffset/MaxOffset/Count are only written when the buffer is
+// non-empty (an empty queue reports 0/0/0 rather than a stale range), and the
+// transaction triple only when messages are actually in flight on the ORDERLY
+// path (Java's consumingMsgOrderlyTreeMap). cachedMsgSizeInMiB is written
+// unconditionally.
+func (pq *processQueue) FillProcessQueueInfo(info *remoting.ProcessQueueInfo) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	if len(pq.order) > 0 {
+		info.CachedMsgMinOffset = pq.order[0]
+		info.CachedMsgMaxOffset = pq.order[len(pq.order)-1]
+		info.CachedMsgCount = int32(len(pq.order))
+	}
+	var size int64
+	for _, msg := range pq.msgs {
+		size += int64(len(msg.GetBody()))
+	}
+	info.CachedMsgSizeInMiB = int32(size / (1024 * 1024))
+
+	// Java's consumingMsgOrderlyTreeMap only ever receives entries when
+	// consumeOrderly is set (takeMessages), so the concurrent path must leave
+	// the triple at zero.
+	if pq.consumeOrderly {
+		inflightMin, inflightMax, inflightCount := pq.inflightOrderlyRangeLocked()
+		if inflightCount > 0 {
+			info.TransactionMsgMinOffset = inflightMin
+			info.TransactionMsgMaxOffset = inflightMax
+			info.TransactionMsgCount = int32(inflightCount)
+		}
+	}
+
+	info.Locked = pq.locked
+	info.TryUnlockTimes = pq.tryUnlockTimes
+	info.LastLockTimestamp = pq.lastLockTimestamp
+
+	info.Droped = pq.dropped
+	info.LastPullTimestamp = pq.lastPullTimestamp
+	info.LastConsumeTimestamp = pq.lastConsumeTimestamp
+}
+
+// inflightOrderlyRangeLocked is the (min, max, count) of the entries currently
+// handed to an orderly listener. Caller must hold pq.mu.
+func (pq *processQueue) inflightOrderlyRangeLocked() (int64, int64, int) {
+	var minOff, maxOff int64
+	count := 0
+	for _, offset := range pq.order {
+		if _, inflight := pq.dispatched[offset]; !inflight {
+			continue
+		}
+		if count == 0 || offset < minOff {
+			minOff = offset
+		}
+		if count == 0 || offset > maxOff {
+			maxOff = offset
+		}
+		count++
+	}
+	return minOff, maxOff, count
 }
 
 // IsLocked reports the orderly lock state.

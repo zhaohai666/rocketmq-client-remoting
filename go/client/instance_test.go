@@ -329,6 +329,13 @@ func (c *stubConsumer) GetConsumerStatus(topic *string) remoting.MQOffsetTable {
 	return c.status
 }
 func (c *stubConsumer) PersistConsumerOffset() error { c.persists.Add(1); return nil }
+
+// ConsumerRunningInfo returns nil on purpose: the stub stands in for a consumer
+// that is not a push consumer, which is exactly the arm Java's
+// MQClientInstance.consumerRunningInfo answers with null (and therefore the arm
+// that makes both 307 and 309 reply "The Consumer Group <g> not exist in this
+// consumer" instead of a body).
+func (c *stubConsumer) ConsumerRunningInfo() *remoting.ConsumerRunningInfo { return nil }
 func (c *stubConsumer) resetCalls() []resetCall {
 	c.mu.Lock()
 	defer c.mu.Unlock()

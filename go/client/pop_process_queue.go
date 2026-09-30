@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
 // popProcessQueue mirrors Java
@@ -83,6 +85,16 @@ func (q *popProcessQueue) SetDropped(dropped bool) {
 // reviving its batch).
 func (q *popProcessQueue) IsPullExpired() bool {
 	return commonCurrentTimeMillis()-q.LastPopTimestamp() > popPullMaxIdleTime
+}
+
+// FillPopProcessQueueInfo mirrors Java PopProcessQueue#fillPopProcessQueueInfo
+// (:68-72). All three fields are written unconditionally — unlike
+// ProcessQueueInfo there is no "only when non-empty" branch, so an idle POP
+// queue still reports its debt and its last pop time.
+func (q *popProcessQueue) FillPopProcessQueueInfo(info *remoting.PopProcessQueueInfo) {
+	info.WaitAckCount = int32(q.WaitAckMsgCount())
+	info.Droped = q.IsDropped()
+	info.LastPopTimestamp = q.LastPopTimestamp()
 }
 
 // commonCurrentTimeMillis is a short local alias so this file does not need the

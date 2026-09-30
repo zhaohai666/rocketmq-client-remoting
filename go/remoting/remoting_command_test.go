@@ -2,6 +2,7 @@ package remoting
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -252,6 +253,54 @@ func TestCommandString(t *testing.T) {
 	for _, want := range []string{"code=34", "opaque=", "a=1"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("String() missing %q: %s", want, s)
+		}
+	}
+}
+
+// CurrentVersionDesc must stay paired with CurrentVersion. There is no
+// arithmetic relation to check (Java's Version ordinals are hand-maintained:
+// V5_5_0=513, V5_5_1=515, V5_5_2=517), so both values are pinned literals —
+// editing either one alone fails here, which is the whole point. A stale pair
+// would put a version in the 307 answer that this client does not speak.
+func TestCurrentVersionDescMatchesCurrentVersion(t *testing.T) {
+	// The 5.5.1 jars: CURRENT_VERSION = Version.V5_5_1.ordinal() = 515 and
+	// getVersionDesc(515) == "V5_5_1".
+	if CurrentVersion != 515 {
+		t.Errorf("CurrentVersion = %d, want 515", CurrentVersion)
+	}
+	if CurrentVersionDesc != "V5_5_1" {
+		t.Errorf("CurrentVersionDesc = %q, want V5_5_1", CurrentVersionDesc)
+	}
+	// It must be a real version name: the console parses the digits out of
+	// PROP_CLIENT_VERSION, so a placeholder reads as a much older (or newer)
+	// client. `HIGHER_VERSION` is what Java returns for an out-of-range ordinal,
+	// i.e. exactly the wrong answer to hardcode here.
+	if !versionDescPattern.MatchString(CurrentVersionDesc) {
+		t.Errorf("CurrentVersionDesc = %q, want a V<maj>_<min>_<patch> name", CurrentVersionDesc)
+	}
+	if CurrentVersionDesc == "HIGHER_VERSION" {
+		t.Error("HIGHER_VERSION is getVersionDesc's out-of-range fallback, not a version")
+	}
+}
+
+var versionDescPattern = regexp.MustCompile(`^V\d+_\d+_\d+$`)
+
+func TestVersionDescPattern(t *testing.T) {
+	for _, ok := range []string{"V5_5_1", "V5_5_0", "V5_9_9", "V3_0_0_SNAPSHOT"} {
+		// NOTE: a _SNAPSHOT suffix is a distinct constant and must NOT match.
+		if ok == "V3_0_0_SNAPSHOT" {
+			if versionDescPattern.MatchString(ok) {
+				t.Errorf("%q must not match — it is a different constant", ok)
+			}
+			continue
+		}
+		if !versionDescPattern.MatchString(ok) {
+			t.Errorf("%q must match", ok)
+		}
+	}
+	for _, bad := range []string{"", "V5", "V5_5", "5.5.1", "HIGHER_VERSION", "v5_5_1"} {
+		if versionDescPattern.MatchString(bad) {
+			t.Errorf("%q must not match", bad)
 		}
 	}
 }

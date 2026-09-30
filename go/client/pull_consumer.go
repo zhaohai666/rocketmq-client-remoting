@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
@@ -128,6 +129,13 @@ type DefaultMQPullConsumer struct {
 	offsetQueues map[common.MessageQueue]struct{}
 
 	started bool
+
+	// startTime is Java's consumerStartTimestamp, stamped in start() and
+	// reported as PROP_CONSUMER_START_TIMESTAMP in the 307 answer. Java's pull
+	// implementation writes that property and nothing else beyond the
+	// object2Properties dump, so it is the one per-consumer property this type
+	// contributes.
+	startTime time.Time
 }
 
 // NewDefaultMQPullConsumer mirrors Java's constructor: the group is mandatory
@@ -528,6 +536,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 	c.pullAPI.unitMode = c.unitMode
 	c.pullAPI.hooks = c.filterMessageHooks
 	store := c.offsetStore
+	c.startTime = time.Now()
 	c.started = true
 	topics := make([]string, 0, len(c.subscription))
 	for t := range c.subscription {

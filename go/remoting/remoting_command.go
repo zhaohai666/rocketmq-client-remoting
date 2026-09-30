@@ -27,6 +27,22 @@ import (
 // getConsumeStatus fail with code=1 "too low to finish".
 const CurrentVersion = int32(515)
 
+// CurrentVersionDesc is MQVersion.getVersionDesc(CURRENT_VERSION): the NAME of
+// the Version enum constant at that ordinal. Java defines
+// `CURRENT_VERSION = Version.V5_5_1.ordinal()` and the 5.5.1 jars confirm
+// `getVersionDesc(515) == "V5_5_1"`. It rides the 307 answer as
+// ConsumerRunningInfo.PROP_CLIENT_VERSION.
+//
+// The ordinal/number pairing is a hand-maintained enum, NOT an arithmetic rule:
+// measured ordinals are V5_5_0=513, V5_5_1=515, V5_5_2=517 (a `_SNAPSHOT`
+// constant sits between each pair), V5_9_9=611, and the enum ends with
+// HIGHER_VERSION=612 — the fallback `getVersionDesc` returns for an ordinal past
+// the end. Go has no equivalent table (613 constants to keep in sync for a
+// field that only ever carries OUR OWN version), so the one name is spelled out;
+// the guard in remoting_command_test.go pins both literals so they cannot drift
+// apart silently.
+const CurrentVersionDesc = "V5_5_1"
+
 // Env keys overriding the outbound protocol version (tests / debugging).
 const (
 	RemotingVersionKey   = "rocketmq.remoting.version"

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -94,6 +95,12 @@ type Consumer interface {
 	// GetConsumerStatus answers GET_CONSUMER_STATUS_FROM_CLIENT(221). A nil
 	// topic means the request header carried none.
 	GetConsumerStatus(topic *string) remoting.MQOffsetTable
+	// ConsumerRunningInfo answers GET_CONSUMER_RUNNING_INFO(307). The body's
+	// shape is per consumer TYPE (Java MQConsumerInner.consumerRunningInfo):
+	// push adds mqTable/mqPopTable/statusTable, pull stops at properties +
+	// subscriptionSet. The instance adds the three instance-level properties on
+	// top, which is why this method must NOT do that itself.
+	ConsumerRunningInfo() *remoting.ConsumerRunningInfo
 	// PersistConsumerOffset is the periodic offset flush.
 	PersistConsumerOffset() error
 }
@@ -390,12 +397,14 @@ func (i *Instance) RegisterTopicInUse(topic string) {
 
 // registerClientProcessors wires the instance-level processors (Python
 // registers 326/220/221/307/309/40 at construction — Java's
-// ClientRemotingProcessor). 307/309 arrive with the push consumer, which owns
-// the running-info beans; before then the transport logs the unmatched codes.
+// ClientRemotingProcessor, built once in MQClientAPIImpl's constructor and not
+// per consumer).
 func (i *Instance) registerClientProcessors() {
 	i.remoting.RegisterProcessor(remoting.ReqNotifyConsumerIDsChanged, i.processNotifyConsumerIDsChanged)
 	i.remoting.RegisterProcessor(remoting.ReqResetConsumerClientOffset, i.processResetOffset)
 	i.remoting.RegisterProcessor(remoting.ReqGetConsumerStatusFromClient, i.processGetConsumerStatus)
+	i.remoting.RegisterProcessor(remoting.ReqGetConsumerRunningInfo, i.processGetConsumerRunningInfo)
+	i.remoting.RegisterProcessor(remoting.ReqConsumeMessageDirectly, i.processConsumeMessageDirectly)
 	i.remoting.RegisterProcessor(remoting.ReqPushReplyMessageToClient, i.processReplyMessage)
 }
 
@@ -479,6 +488,129 @@ func (i *Instance) processGetConsumerStatus(request *remoting.RemotingCommand, _
 	response := remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	response.SetBody(body.Encode())
 	sink.Respond(response)
+}
+
+// processGetConsumerRunningInfo (307) answers with this client's
+// ConsumerRunningInfo. Java ClientRemotingProcessor#getConsumerRunningInfo.
+//
+// The reply shape is a three-way contract:
+//   - an unknown group is SYSTEM_ERROR with Java's exact remark text (the admin
+//     surfaces it verbatim, so it is not paraphrased);
+//   - a known group gets SUCCESS with the body from Instance.consumerRunningInfo;
+//   - jstack is only collected when the request asked for it, and its presence
+//     in the body is what tells the admin the dump is real — an absent key is
+//     how Java reports "not collected".
+//
+// The body must be encoded with EncodeFastJSON: mqTable/mqPopTable key their
+// entries by MessageQueue as a raw inline object, and encoding/json cannot emit
+// that (it validates Marshaler output). See remoting.mqKeyedJSON.
+func (i *Instance) processGetConsumerRunningInfo(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
+	var header remoting.GetConsumerRunningInfoRequestHeader
+	header.FromExtFields(request.ExtFields())
+	group := ""
+	if header.ConsumerGroup != nil {
+		group = *header.ConsumerGroup
+	}
+
+	info := i.consumerRunningInfo(group)
+	if info == nil {
+		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError,
+			fmt.Sprintf("The Consumer Group <%s> not exist in this consumer", group)))
+		return
+	}
+	if header.JstackEnable != nil && *header.JstackEnable {
+		// Java dumps every THREAD here; Go's analogue is every goroutine. The
+		// format differs (it is a goroutine stack, not a JVM one), but the field
+		// exists precisely so an operator can see where the client is stuck, and
+		// an empty string would say "not collected" instead.
+		info.Jstack = collectGoroutineStacks()
+		info.HasJstack = true
+	}
+
+	response := remoting.CreateResponseCommand(remoting.RespSuccess, "")
+	response.SetBody(info.Encode())
+	sink.Respond(response)
+}
+
+// processConsumeMessageDirectly (309) hands one broker-supplied message to the
+// local listener and returns its verdict.
+//
+// Java ClientRemotingProcessor#consumeMessageDirectly answers SYSTEM_ERROR with
+// the same "not exist" remark when MQClientInstance.consumerRunningInfo-style
+// lookup fails, and MQClientInstance#consumeMessageDirectly returns null for any
+// consumer that is not a DefaultMQPushConsumerImpl — so a pull or lite consumer
+// group produces that same error, not a silent success.
+//
+// The listener runs on its own goroutine. Java runs it on the Netty handler
+// thread, which this port must not copy: the remoting read loop is shared with
+// every other response on the connection, and a listener that makes a
+// synchronous request (sendMessageBack, a downstream call) would wait on a
+// response only that loop can deliver. The reply still goes out strictly after
+// the listener returns, so the wire ordering the broker sees is unchanged.
+func (i *Instance) processConsumeMessageDirectly(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
+	var header remoting.ConsumeMessageDirectlyResultRequestHeader
+	header.FromExtFields(request.ExtFields())
+	group := ""
+	if header.ConsumerGroup != nil {
+		group = *header.ConsumerGroup
+	}
+	brokerName := ""
+	if header.BrokerName != nil {
+		brokerName = *header.BrokerName
+	}
+
+	notExist := func() {
+		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError,
+			fmt.Sprintf("The Consumer Group <%s> not exist in this consumer", group)))
+	}
+
+	consumer, ok := i.FindConsumer(group)
+	if !ok {
+		notExist()
+		return
+	}
+	push, ok := consumer.(*DefaultMQPushConsumer)
+	if !ok {
+		notExist()
+		return
+	}
+	if len(request.Body) == 0 {
+		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError, "empty message body"))
+		return
+	}
+	// Java MessageDecoder.clientDecode(body, readBody=true): the body is one
+	// stored message with its body present.
+	msg, err := common.DecodeMessage(request.Body)
+	if err != nil {
+		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError,
+			fmt.Sprintf("decode message failed: %v", err)))
+		return
+	}
+
+	go func() {
+		result := push.consumeMessageDirectly(msg, brokerName)
+		response := remoting.CreateResponseCommand(remoting.RespSuccess, "")
+		response.SetBody(result.Encode())
+		sink.Respond(response)
+	}()
+}
+
+// collectGoroutineStacks returns all goroutine stacks, growing the buffer if the
+// first attempt was truncated (runtime.Stack reports the byte count written and
+// stops at the buffer size).
+func collectGoroutineStacks() string {
+	buf := make([]byte, 64*1024)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return string(buf[:n])
+		}
+		if len(buf) >= 16*1024*1024 {
+			// Pathological: stop growing rather than risk an unbounded alloc.
+			return string(buf[:n])
+		}
+		buf = make([]byte, len(buf)*2)
+	}
 }
 
 // processReplyMessage (326) routes a broker-pushed reply to the producer
