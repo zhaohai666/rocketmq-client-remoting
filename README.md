@@ -1,7 +1,7 @@
 # rocketmq-client-remoting
 
 Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套协议语义、同一套消息模型，
-在 **Python / C++ / .NET / Rust** 四种语言里各有一份完整实现。
+在 **Python / C++ / .NET / Rust / Go** 五种语言里各有一份完整实现。
 
 客户端直接与 **NameServer + Broker** 通信，不经过代理层：
 
@@ -10,13 +10,14 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 - 消息编解码是 **17 段存储格式 + 6 段批量格式**，与 RocketMQ 服务端落盘格式一致；
 - 适配 RocketMQ 4.x / 5.x 集群，全量联调基于 **5.5.1**（NameServer 9876 + Broker 10911）。
 
-四个实现之间的收发互通是**硬要求**：任一语言发出的消息（含 zlib / LZ4 / ZSTD 压缩体）
-其余语言都能解开，`scripts/compression_matrix.sh` 会在真实集群上把 4×2 语言的压缩矩阵
-整体跑一遍。
+五个实现之间的收发互通是**硬要求**：任一语言发出的消息（含 zlib / LZ4 / ZSTD 压缩体）
+其余语言都能解开，`scripts/compression_matrix.sh` 会在真实集群上把 Python/C++/.NET/Rust
+四端 4×2 的压缩矩阵整体跑一遍（Go 只实现 ZLIB，LZ4/ZSTD 刻意大声报错而不是透传，
+见 [`go/README.md`](go/README.md)）。
 
 ## 能力总览
 
-四个语言实现覆盖同一份能力面：
+五个语言实现覆盖同一份能力面：
 
 | 领域 | 内容 |
 | --- | --- |
@@ -38,13 +39,14 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 | C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | `ctest`：50 个用例 / 3986 项断言 |
 | .NET | [`dotnet/`](dotnet/README.md) | C# / .NET 10，零 NuGet 依赖 | `dotnet test`：740 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | `cargo test --lib`：891 条；`cargo clippy --all-targets` 零 warning |
+| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖，压缩 ZLIB-only | `go test ./...`：391 条；`go vet` / `gofmt` 零告警 |
 
 各语言 README 包含该实现的构建方式、快速上手、配置项（日志 / TLS / 压缩）、目录结构，
 以及真机联调工具清单。
 
 ## 快速上手
 
-四个语言都是同一套动作：建门面 → 设 NameServer 地址 → `start()` → 收发 → `shutdown()`。
+五个语言都是同一套动作：建门面 → 设 NameServer 地址 → `start()` → 收发 → `shutdown()`。
 集群要求：NameServer `9876` + Broker `10911`，`autoCreateTopicEnable=true` 时首次发送会
 自动建 topic。
 
@@ -177,12 +179,51 @@ async fn main() -> rocketmq_client_remoting::error::Result<()> {
 }
 ```
 
+### Go
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/zhaohai666/rocketmq-client-remoting/go/client"
+	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
+)
+
+type demoListener struct{}
+
+func (demoListener) ConsumeMessage(msgs []*common.MessageExt,
+	ctx *client.ConsumeConcurrentlyContext) client.ConsumeConcurrentlyStatus {
+	for _, msg := range msgs {
+		fmt.Println(string(msg.Body))
+	}
+	return client.ConsumeSuccess
+}
+
+func main() {
+	producer, _ := client.NewDefaultMQProducer("PID_DEMO")
+	producer.SetNameServerAddresses([]string{"127.0.0.1:9876"})
+	producer.Start()
+	producer.Send(common.NewMessage("TopicTest", []byte("hello rocketmq")))
+	producer.Shutdown()
+
+	consumer, _ := client.NewDefaultMQPushConsumer("GID_DEMO")
+	consumer.SetNameServerAddresses([]string{"127.0.0.1:9876"})
+	consumer.Subscribe("TopicTest", "*")
+	consumer.SetMessageListener(demoListener{})
+	consumer.Start()
+	// ... 收到退出信号后
+	consumer.Shutdown()
+}
+```
+
 ## 真实集群联调
 
 每个语言目录下都带一组**不进单元测试**的真机联调工具（`python/verify_*_live.py`、
-`cpp/examples/rmq_*_live`、`dotnet` 的 `rmq` 子命令、`rust/examples/live_*`），
-覆盖收发全链路、重投与死信、位点管理、流控、POP、TLS 等。全部工具自断言、失败以非 0
-退出码收口，具体清单见各语言 README。
+`cpp/examples/rmq_*_live`、`dotnet` 的 `rmq` 子命令、`rust/examples/live_*`、
+`go/examples/live_*`），覆盖收发全链路、重投与死信、位点管理、流控、POP、TLS 等。
+全部工具自断言、失败以非 0 退出码收口，具体清单见各语言 README。
 
 部分用例有额外要求（在脚本头注释里写明）：主从集群（Broker 从节点）、
 `traceTopicEnable=true`、`enablePropertyFilter=true`、`recallMessageEnable`、
@@ -195,6 +236,7 @@ ACL 鉴权等；停 broker 类用例会自行拉起并把配置还原。
 ├── cpp/       C++17 实现（CMake，ctest 单测 + examples 真机工具）
 ├── dotnet/    .NET 10 实现（xunit 单测 + rmq 子命令真机工具）
 ├── rust/      Rust/tokio 实现（内联单测 + live_* 示例真机工具）
+├── go/        Go 实现（同步 API 零依赖，go test 单测 + examples 真机工具）
 └── scripts/   集群启停与跨语言互测脚本（compression_matrix.sh 等）
 ```
 
