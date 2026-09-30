@@ -1,7 +1,8 @@
 # rocketmq-client-remoting
 
 Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套协议语义、同一套消息模型，
-在 **Python / C++ / .NET / Rust / Go** 五种语言里各有一份完整实现。
+在 **Python / C++ / .NET / Rust / Go** 五种语言里各有一份完整实现
+（Node.js / TypeScript 第六端已实现并真机验证，见 [`nodeJs/`](nodeJs/README.md)）。
 
 客户端直接与 **NameServer + Broker** 通信，不经过代理层：
 
@@ -41,6 +42,7 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 | .NET | [`dotnet/`](dotnet/README.md) | C# / .NET 10，零 NuGet 依赖 | `dotnet test`：740 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | `cargo test --lib`：891 条；`cargo clippy --all-targets` 零 warning |
 | Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖，压缩 ZLIB-only | `go test ./...`：529 条；`go vet` / `gofmt` 零告警 |
+| Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 直接运行（`node --experimental-strip-types`），零第三方依赖，压缩 ZLIB-only | `node selfcheck.ts`：53 模块加载 + 4 套冒烟全绿；真机 5/5 live 全绿（`scripts/run_node_live.sh producer\|consumer\|pull\|lite_pull\|admin`） |
 
 各语言 README 包含该实现的构建方式、快速上手、配置项（日志 / TLS / 压缩）、目录结构，
 以及真机联调工具清单。

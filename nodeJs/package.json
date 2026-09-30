@@ -1,0 +1,20 @@
+{
+  "name": "rocketmq-client-remoting-nodejs",
+  "version": "5.5.1",
+  "description": "Apache RocketMQ classic remoting protocol client for Node.js (ported from the Java 5.x reference, mirroring the python/cpp/dotnet/rust/go implementations).",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test",
+    "typecheck": "tsc --noEmit",
+    "live:producer": "node --experimental-strip-types examples/live_producer.ts",
+    "live:consumer": "node --experimental-strip-types examples/live_consumer.ts",
+    "live:pull": "node --experimental-strip-types examples/live_pull.ts",
+    "live:lite_pull": "node --experimental-strip-types examples/live_lite_pull.ts",
+    "live:admin": "node --experimental-strip-types examples/live_admin.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

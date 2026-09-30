@@ -1,0 +1,313 @@
+// -*- coding: utf-8 -*-
+// Request / response codes, language codes, serialize types.
+// Mirrors org.apache.rocketmq.remoting.protocol.RequestCode / ResponseCode / LanguageCode.
+
+export class RequestCode {
+  static SEND_MESSAGE = 10;
+  static PULL_MESSAGE = 11;
+  static QUERY_MESSAGE = 12;
+  static QUERY_BROKER_OFFSET = 13;
+  static QUERY_CONSUMER_OFFSET = 14;
+  static UPDATE_CONSUMER_OFFSET = 15;
+  static UPDATE_AND_CREATE_TOPIC = 17;
+  static UPDATE_AND_CREATE_TOPIC_LIST = 18;
+  static GET_ALL_TOPIC_CONFIG = 21;
+  static GET_TOPIC_CONFIG_LIST = 22;
+  static GET_TOPIC_NAME_LIST = 23;
+  static UPDATE_BROKER_CONFIG = 25;
+  static GET_BROKER_CONFIG = 26;
+  static TRIGGER_DELETE_FILES = 27;
+  static GET_BROKER_RUNTIME_INFO = 28;
+  static SEARCH_OFFSET_BY_TIMESTAMP = 29;
+  static GET_MAX_OFFSET = 30;
+  static GET_MIN_OFFSET = 31;
+  static GET_EARLIEST_MSG_STORETIME = 32;
+  static VIEW_MESSAGE_BY_ID = 33;
+  static HEART_BEAT = 34;
+  static UNREGISTER_CLIENT = 35;
+  static CONSUMER_SEND_MSG_BACK = 36;
+  static END_TRANSACTION = 37;
+  static GET_CONSUMER_LIST_BY_GROUP = 38;
+  static CHECK_TRANSACTION_STATE = 39;
+  static NOTIFY_CONSUMER_IDS_CHANGED = 40;
+  static LOCK_BATCH_MQ = 41;
+  static UNLOCK_BATCH_MQ = 42;
+  static GET_ALL_CONSUMER_OFFSET = 43;
+  static GET_ALL_DELAY_OFFSET = 45;
+  static CHECK_CLIENT_CONFIG = 46;
+  static GET_CLIENT_CONFIG = 47;
+  static GET_TIMER_CHECK_POINT = 60;
+  static GET_TIMER_METRICS = 61;
+  static POP_MESSAGE = 200050;
+  static ACK_MESSAGE = 200051;
+  static BATCH_ACK_MESSAGE = 200151;
+  static PEEK_MESSAGE = 200052;
+  static CHANGE_MESSAGE_INVISIBLETIME = 200053;
+  static NOTIFICATION = 200054;
+  static POLLING_INFO = 200055;
+  static POP_ROLLBACK = 200056;
+  static POP_LITE_MESSAGE = 200070;
+  static LITE_SUBSCRIPTION_CTL = 200071;
+  static ACK_LITE_MESSAGE = 200072;
+  static NOTIFY_UNSUBSCRIBE_LITE = 200073;
+  static GET_BROKER_LITE_INFO = 200074;
+  static GET_PARENT_TOPIC_INFO = 200075;
+  static GET_LITE_TOPIC_INFO = 200076;
+  static GET_LITE_CLIENT_INFO = 200077;
+  static GET_LITE_GROUP_INFO = 200078;
+  static TRIGGER_LITE_DISPATCH = 200079;
+  static PUT_KV_CONFIG = 100;
+  static GET_KV_CONFIG = 101;
+  static DELETE_KV_CONFIG = 102;
+  static REGISTER_BROKER = 103;
+  static UNREGISTER_BROKER = 104;
+  static GET_ROUTEINFO_BY_TOPIC = 105;
+  static GET_BROKER_CLUSTER_INFO = 106;
+  static UPDATE_AND_CREATE_SUBSCRIPTIONGROUP = 200;
+  static GET_ALL_SUBSCRIPTIONGROUP_CONFIG = 201;
+  static GET_TOPIC_STATS_INFO = 202;
+  static GET_CONSUMER_CONNECTION_LIST = 203;
+  static GET_PRODUCER_CONNECTION_LIST = 204;
+  static WIPE_WRITE_PERM_OF_BROKER = 205;
+  static GET_ALL_TOPIC_LIST_FROM_NAMESERVER = 206;
+  static DELETE_SUBSCRIPTIONGROUP = 207;
+  static GET_CONSUME_STATS = 208;
+  static SUSPEND_CONSUMER = 209;
+  static RESUME_CONSUMER = 210;
+  static RESET_CONSUMER_OFFSET_IN_CONSUMER = 211;
+  static RESET_CONSUMER_OFFSET_IN_BROKER = 212;
+  static ADJUST_CONSUMER_THREAD_POOL = 213;
+  static WHO_CONSUME_THE_MESSAGE = 214;
+  static DELETE_TOPIC_IN_BROKER = 215;
+  static DELETE_TOPIC_IN_NAMESRV = 216;
+  static REGISTER_TOPIC_IN_NAMESRV = 217;
+  static GET_KVLIST_BY_NAMESPACE = 219;
+  static RESET_CONSUMER_CLIENT_OFFSET = 220;
+  static GET_CONSUMER_STATUS_FROM_CLIENT = 221;
+  static INVOKE_BROKER_TO_RESET_OFFSET = 222;
+  static INVOKE_BROKER_TO_GET_CONSUMER_STATUS = 223;
+  static QUERY_TOPIC_CONSUME_BY_WHO = 300;
+  static GET_TOPICS_BY_CLUSTER = 224;
+  static UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST = 225;
+  static QUERY_TOPICS_BY_CONSUMER = 343;
+  static QUERY_SUBSCRIPTION_BY_CONSUMER = 345;
+  static REGISTER_FILTER_SERVER = 301;
+  static REGISTER_MESSAGE_FILTER_CLASS = 302;
+  static QUERY_CONSUME_TIME_SPAN = 303;
+  static GET_SYSTEM_TOPIC_LIST_FROM_NS = 304;
+  static GET_SYSTEM_TOPIC_LIST_FROM_BROKER = 305;
+  static CLEAN_EXPIRED_CONSUMEQUEUE = 306;
+  static GET_CONSUMER_RUNNING_INFO = 307;
+  static QUERY_CORRECTION_OFFSET = 308;
+  static CONSUME_MESSAGE_DIRECTLY = 309;
+  static SEND_MESSAGE_V2 = 310;
+  static GET_UNIT_TOPIC_LIST = 311;
+  static GET_HAS_UNIT_SUB_TOPIC_LIST = 312;
+  static GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST = 313;
+  static CLONE_GROUP_OFFSET = 314;
+  static VIEW_BROKER_STATS_DATA = 315;
+  static CLEAN_UNUSED_TOPIC = 316;
+  static GET_BROKER_CONSUME_STATS = 317;
+  static UPDATE_NAMESRV_CONFIG = 318;
+  static GET_NAMESRV_CONFIG = 319;
+  static SEND_BATCH_MESSAGE = 320;
+  static QUERY_CONSUME_QUEUE = 321;
+  static QUERY_DATA_VERSION = 322;
+  static RESUME_CHECK_HALF_MESSAGE = 323;
+  static SEND_REPLY_MESSAGE = 324;
+  static SEND_REPLY_MESSAGE_V2 = 325;
+  static PUSH_REPLY_MESSAGE_TO_CLIENT = 326;
+  static ADD_WRITE_PERM_OF_BROKER = 327;
+  static GET_ALL_PRODUCER_INFO = 328;
+  static DELETE_EXPIRED_COMMITLOG = 329;
+  static GET_TOPIC_CONFIG = 351;
+  static GET_SUBSCRIPTIONGROUP_CONFIG = 352;
+  static UPDATE_AND_GET_GROUP_FORBIDDEN = 353;
+  static GET_BROKER_MEMBER_GROUP = 901;
+  static BROKER_HEARTBEAT = 904;
+  static CHECK_ROCKSDB_CQ_WRITE_PROGRESS = 354;
+  static EXPORT_ROCKSDB_CONFIG_TO_JSON = 355;
+  static LITE_PULL_MESSAGE = 361;
+  static RECALL_MESSAGE = 370;
+  static QUERY_ASSIGNMENT = 400;
+  static SET_MESSAGE_REQUEST_MODE = 401;
+  static GET_ALL_MESSAGE_REQUEST_MODE = 402;
+  static UPDATE_AND_CREATE_STATIC_TOPIC = 513;
+  static ADD_BROKER = 902;
+  static REMOVE_BROKER = 903;
+  static NOTIFY_MIN_BROKER_ID_CHANGE = 905;
+  static EXCHANGE_BROKER_HA_INFO = 906;
+  static GET_BROKER_HA_STATUS = 907;
+  static RESET_MASTER_FLUSH_OFFSET = 908;
+  static CONTROLLER_ALTER_SYNC_STATE_SET = 1001;
+  static CONTROLLER_ELECT_MASTER = 1002;
+  static CONTROLLER_REGISTER_BROKER = 1003;
+  static CONTROLLER_GET_REPLICA_INFO = 1004;
+  static CONTROLLER_GET_METADATA_INFO = 1005;
+  static CONTROLLER_GET_SYNC_STATE_DATA = 1006;
+  static GET_BROKER_EPOCH_CACHE = 1007;
+  static NOTIFY_BROKER_ROLE_CHANGED = 1008;
+  static UPDATE_CONTROLLER_CONFIG = 1009;
+  static GET_CONTROLLER_CONFIG = 1010;
+  static CLEAN_BROKER_DATA = 1011;
+  static CONTROLLER_GET_NEXT_BROKER_ID = 1012;
+  static CONTROLLER_APPLY_BROKER_ID = 1013;
+  static UPDATE_COLD_DATA_FLOW_CTR_CONFIG = 2001;
+  static REMOVE_COLD_DATA_FLOW_CTR_CONFIG = 2002;
+  static GET_COLD_DATA_FLOW_CTR_INFO = 2003;
+  static SET_COMMITLOG_READ_MODE = 2004;
+  static AUTH_CREATE_USER = 3001;
+  static AUTH_UPDATE_USER = 3002;
+  static AUTH_DELETE_USER = 3003;
+  static AUTH_GET_USER = 3004;
+  static AUTH_LIST_USER = 3005;
+  static AUTH_CREATE_ACL = 3006;
+  static AUTH_UPDATE_ACL = 3007;
+  static AUTH_DELETE_ACL = 3008;
+  static AUTH_GET_ACL = 3009;
+  static AUTH_LIST_ACL = 3010;
+  static SWITCH_TIMER_ENGINE = 5001;
+  static DELETE_TOPIC_IN_BROKER_LIST = 5002;
+  static DELETE_SUBSCRIPTION_GROUP_LIST = 5003;
+}
+
+export class RemotingSysResponseCode {
+  static SUCCESS = 0;
+  static SYSTEM_ERROR = 1;
+  static SYSTEM_BUSY = 2;
+  static REQUEST_CODE_NOT_SUPPORTED = 3;
+  static TRANSACTION_FAILED = 4;
+}
+
+export class ResponseCode extends RemotingSysResponseCode {
+  static FLUSH_DISK_TIMEOUT = 10;
+  static SLAVE_NOT_AVAILABLE = 11;
+  static FLUSH_SLAVE_TIMEOUT = 12;
+  static MESSAGE_ILLEGAL = 13;
+  static SERVICE_NOT_AVAILABLE = 14;
+  static VERSION_NOT_SUPPORTED = 15;
+  static NO_PERMISSION = 16;
+  static TOPIC_NOT_EXIST = 17;
+  static TOPIC_EXIST_ALREADY = 18;
+  static PULL_NOT_FOUND = 19;
+  static PULL_RETRY_IMMEDIATELY = 20;
+  static PULL_OFFSET_MOVED = 21;
+  static QUERY_NOT_FOUND = 22;
+  static SUBSCRIPTION_PARSE_FAILED = 23;
+  static SUBSCRIPTION_NOT_EXIST = 24;
+  static SUBSCRIPTION_NOT_LATEST = 25;
+  static SUBSCRIPTION_GROUP_NOT_EXIST = 26;
+  static FILTER_DATA_NOT_EXIST = 27;
+  static FILTER_DATA_NOT_LATEST = 28;
+  static INVALID_PARAMETER = 29;
+  static TRANSACTION_SHOULD_COMMIT = 200;
+  static TRANSACTION_SHOULD_ROLLBACK = 201;
+  static TRANSACTION_STATE_UNKNOW = 202;
+  static TRANSACTION_STATE_GROUP_WRONG = 203;
+  static NO_BUYER_ID = 204;
+  static NOT_IN_CURRENT_UNIT = 205;
+  static CONSUMER_NOT_ONLINE = 206;
+  static CONSUME_MSG_TIMEOUT = 207;
+  static NO_MESSAGE = 208;
+  static POLLING_FULL = 209;
+  static POLLING_TIMEOUT = 210;
+  static BROKER_NOT_EXIST = 211;
+  static BROKER_DISPATCH_NOT_COMPLETE = 212;
+  static BROADCAST_CONSUMPTION = 213;
+  static FLOW_CONTROL = 215;
+  static NOT_LEADER_FOR_QUEUE = 501;
+  static ILLEGAL_OPERATION = 604;
+  static GO_AWAY = 1500;
+  static CONTROLLER_FENCED_MASTER_EPOCH = 2000;
+  static CONTROLLER_FENCED_SYNC_STATE_SET_EPOCH = 2001;
+  static CONTROLLER_INVALID_MASTER = 2002;
+  static CONTROLLER_INVALID_REPLICAS = 2003;
+  static CONTROLLER_MASTER_NOT_AVAILABLE = 2004;
+  static CONTROLLER_INVALID_REQUEST = 2005;
+  static CONTROLLER_BROKER_NOT_ALIVE = 2006;
+  static CONTROLLER_NOT_LEADER = 2007;
+  static CONTROLLER_BROKER_METADATA_NOT_EXIST = 2008;
+  static CONTROLLER_INVALID_CLEAN_BROKER_METADATA = 2009;
+  static CONTROLLER_BROKER_NEED_TO_BE_REGISTERED = 2010;
+  static CONTROLLER_MASTER_STILL_EXIST = 2011;
+  static CONTROLLER_ELECT_MASTER_FAILED = 2012;
+  static CONTROLLER_ALTER_SYNC_STATE_SET_FAILED = 2013;
+  static CONTROLLER_BROKER_ID_INVALID = 2014;
+  static CONTROLLER_JRAFT_INTERNAL_ERROR = 2015;
+  static CONTROLLER_BROKER_LIVE_INFO_NOT_EXISTS = 2016;
+  static LMQ_QUOTA_EXCEEDED = 2017;
+  static LITE_SUBSCRIPTION_QUOTA_EXCEEDED = 2018;
+  static USER_NOT_EXIST = 3001;
+  static POLICY_NOT_EXIST = 3002;
+  // client-side pseudo response codes
+  static RPC_UNKNOWN = -1000;
+  static RPC_ADDR_IS_NULL = -1002;
+  static RPC_SEND_TO_CHANNEL_FAILED = -1004;
+  static RPC_TIME_OUT = -1006;
+}
+
+export class LanguageCode {
+  static JAVA = 0;
+  static CPP = 1;
+  static DOTNET = 2;
+  static PYTHON = 3;
+  static DELPHI = 4;
+  static ERLANG = 5;
+  static RUBY = 6;
+  static OTHER = 7;
+  static HTTP = 8;
+  static GO = 9;
+  static PHP = 10;
+  static OMS = 11;
+  static RUST = 12;
+  static NODE_JS = 13;
+
+  static _byCode = null;
+  static _init() {
+    if (LanguageCode._byCode == null) {
+      LanguageCode._byCode = {};
+      for (const k of Object.getOwnPropertyNames(LanguageCode)) {
+        const v = LanguageCode[k];
+        if (typeof v === 'number') LanguageCode._byCode[v] = k;
+      }
+    }
+  }
+  static valueOf(code) {
+    LanguageCode._init();
+    return LanguageCode._byCode[code & 0xff] || null;
+  }
+  static nameToCode(name) {
+    return LanguageCode[name.toUpperCase()] != null ? LanguageCode[name.toUpperCase()] : LanguageCode.OTHER;
+  }
+}
+
+export class SerializeType {
+  static JSON = 0;
+  static ROCKETMQ = 1;
+  static valueOf(code) { return (code & 0xff) === 1 ? 'ROCKETMQ' : 'JSON'; }
+}
+
+export class RemotingCommandType {
+  static REQUEST_COMMAND = 'REQUEST_COMMAND';
+  static RESPONSE_COMMAND = 'RESPONSE_COMMAND';
+}
+
+export class ForbiddenType {
+  static BROKER_FORBIDDEN = 1;
+  static GROUP_FORBIDDEN = 2;
+  static TOPIC_FORBIDDEN = 3;
+  static BROADCASTING_DISABLE_FORBIDDEN = 4;
+  static SUBSCRIPTION_FORBIDDEN = 5;
+}
+
+export class RequestType {
+  static STREAM = 0;
+}
+export class RequestSource {
+  static SDK = -1;
+  static PROXY_FOR_ORDER = 0;
+  static PROXY_FOR_BROADCAST = 1;
+  static PROXY_FOR_STREAM = 2;
+}
+
+export default { RequestCode, ResponseCode, LanguageCode, SerializeType, RemotingCommandType, ForbiddenType, RequestType, RequestSource };
