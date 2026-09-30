@@ -991,6 +991,216 @@ func (h *CheckTransactionStateResponseHeader) FromExtFields(ext *common.StringMa
 	h.Offset = getI64(ext, "offset")
 }
 
+// ---------------- pop ----------------
+
+// PopMessageRequestHeader (POP_MESSAGE = 200050).
+//
+// Note which fields are primitives in Java: queueId/maxMsgNums/invisibleTime/
+// pollTime/bornTime/initMode are `int`/`long`, so RemotingCommand's
+// reflection-based extFields writer emits them even when they are 0, and
+// `order` is a `Boolean` initialised to FALSE so it is always emitted as
+// "false". Treating those as optional here would change the wire bytes.
+//
+// Bname is the inherited RpcRequestHeader.bname; Java's popAsync sets it from
+// the message queue's broker name. The broker ignores it for POP, but it is
+// part of what Java sends.
+type PopMessageRequestHeader struct {
+	Bname         *string
+	ConsumerGroup *string
+	Topic         *string
+	QueueID       *int32
+	MaxMsgNums    *int32
+	InvisibleTime *int64
+	PollTime      *int64
+	BornTime      *int64
+	InitMode      *int32
+	ExpType       *string
+	Exp           *string
+	Order         *bool
+	AttemptID     *string
+}
+
+func (h *PopMessageRequestHeader) ToExtFields(out *common.StringMap) {
+	putStr(out, "bname", h.Bname)
+	putStr(out, "consumerGroup", h.ConsumerGroup)
+	putStr(out, "topic", h.Topic)
+	putI32(out, "queueId", h.QueueID)
+	putI32(out, "maxMsgNums", h.MaxMsgNums)
+	putI64(out, "invisibleTime", h.InvisibleTime)
+	putI64(out, "pollTime", h.PollTime)
+	putI64(out, "bornTime", h.BornTime)
+	putI32(out, "initMode", h.InitMode)
+	putStr(out, "expType", h.ExpType)
+	putStr(out, "exp", h.Exp)
+	putBool(out, "order", h.Order)
+	putStr(out, "attemptId", h.AttemptID)
+}
+
+func (h *PopMessageRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.Bname = getStr(ext, "bname")
+	h.ConsumerGroup = getStr(ext, "consumerGroup")
+	h.Topic = getStr(ext, "topic")
+	h.QueueID = getI32(ext, "queueId")
+	h.MaxMsgNums = getI32(ext, "maxMsgNums")
+	h.InvisibleTime = getI64(ext, "invisibleTime")
+	h.PollTime = getI64(ext, "pollTime")
+	h.BornTime = getI64(ext, "bornTime")
+	h.InitMode = getI32(ext, "initMode")
+	h.ExpType = getStr(ext, "expType")
+	h.Exp = getStr(ext, "exp")
+	h.Order = getBool(ext, "order")
+	h.AttemptID = getStr(ext, "attemptId")
+}
+
+// IsOrder mirrors Java PopMessageRequestHeader#isOrder: a nil `order` is false,
+// never true-by-default.
+func (h *PopMessageRequestHeader) IsOrder() bool {
+	return h.Order != nil && *h.Order
+}
+
+// IsTimeoutTooMuch mirrors Java PopMessageRequestHeader#isTimeoutTooMuch.
+func (h *PopMessageRequestHeader) IsTimeoutTooMuch() bool {
+	poll, born := int64(0), int64(0)
+	if h.PollTime != nil {
+		poll = *h.PollTime
+	}
+	if h.BornTime != nil {
+		born = *h.BornTime
+	}
+	return common.CurrentTimeMillis()-born-poll > 500
+}
+
+// PopMessageResponseHeader.
+//
+// startOffsetInfo/msgOffsetInfo/orderCountInfo are the broker's per-queue
+// offset tables. They are what makes an ACK addressable at all: without them
+// the client falls back to building a checkpoint from the message's own queue
+// offset (see MQClientAPIImpl.processPopResponse).
+type PopMessageResponseHeader struct {
+	PopTime         *int64
+	InvisibleTime   *int64
+	ReviveQid       *int32
+	RestNum         *int64
+	StartOffsetInfo *string
+	MsgOffsetInfo   *string
+	OrderCountInfo  *string
+}
+
+func (h *PopMessageResponseHeader) ToExtFields(out *common.StringMap) {
+	putI64(out, "popTime", h.PopTime)
+	putI64(out, "invisibleTime", h.InvisibleTime)
+	putI32(out, "reviveQid", h.ReviveQid)
+	putI64(out, "restNum", h.RestNum)
+	putStr(out, "startOffsetInfo", h.StartOffsetInfo)
+	putStr(out, "msgOffsetInfo", h.MsgOffsetInfo)
+	putStr(out, "orderCountInfo", h.OrderCountInfo)
+}
+
+func (h *PopMessageResponseHeader) FromExtFields(ext *common.StringMap) {
+	h.PopTime = getI64(ext, "popTime")
+	h.InvisibleTime = getI64(ext, "invisibleTime")
+	h.ReviveQid = getI32(ext, "reviveQid")
+	h.RestNum = getI64(ext, "restNum")
+	h.StartOffsetInfo = getStr(ext, "startOffsetInfo")
+	h.MsgOffsetInfo = getStr(ext, "msgOffsetInfo")
+	h.OrderCountInfo = getStr(ext, "orderCountInfo")
+}
+
+// AckMessageRequestHeader (ACK_MESSAGE = 200051).
+//
+// `offset` here is the message's own queue offset (checkpoint segment 7), NOT
+// the batch's start offset — the broker looks the checkpoint up by it.
+type AckMessageRequestHeader struct {
+	Bname         *string
+	ConsumerGroup *string
+	Topic         *string
+	QueueID       *int32
+	ExtraInfo     *string
+	Offset        *int64
+	LiteTopic     *string
+}
+
+func (h *AckMessageRequestHeader) ToExtFields(out *common.StringMap) {
+	putStr(out, "bname", h.Bname)
+	putStr(out, "consumerGroup", h.ConsumerGroup)
+	putStr(out, "topic", h.Topic)
+	putI32(out, "queueId", h.QueueID)
+	putStr(out, "extraInfo", h.ExtraInfo)
+	putI64(out, "offset", h.Offset)
+	putStr(out, "liteTopic", h.LiteTopic)
+}
+
+func (h *AckMessageRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.Bname = getStr(ext, "bname")
+	h.ConsumerGroup = getStr(ext, "consumerGroup")
+	h.Topic = getStr(ext, "topic")
+	h.QueueID = getI32(ext, "queueId")
+	h.ExtraInfo = getStr(ext, "extraInfo")
+	h.Offset = getI64(ext, "offset")
+	h.LiteTopic = getStr(ext, "liteTopic")
+}
+
+// ChangeInvisibleTimeRequestHeader (CHANGE_MESSAGE_INVISIBLETIME = 200053).
+//
+// `suspend` is a Java primitive `boolean` defaulting to false, so it is always
+// on the wire.
+type ChangeInvisibleTimeRequestHeader struct {
+	Bname         *string
+	ConsumerGroup *string
+	Topic         *string
+	QueueID       *int32
+	ExtraInfo     *string
+	Offset        *int64
+	InvisibleTime *int64
+	LiteTopic     *string
+	Suspend       *bool
+}
+
+func (h *ChangeInvisibleTimeRequestHeader) ToExtFields(out *common.StringMap) {
+	putStr(out, "bname", h.Bname)
+	putStr(out, "consumerGroup", h.ConsumerGroup)
+	putStr(out, "topic", h.Topic)
+	putI32(out, "queueId", h.QueueID)
+	putStr(out, "extraInfo", h.ExtraInfo)
+	putI64(out, "offset", h.Offset)
+	putI64(out, "invisibleTime", h.InvisibleTime)
+	putStr(out, "liteTopic", h.LiteTopic)
+	putBool(out, "suspend", h.Suspend)
+}
+
+func (h *ChangeInvisibleTimeRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.Bname = getStr(ext, "bname")
+	h.ConsumerGroup = getStr(ext, "consumerGroup")
+	h.Topic = getStr(ext, "topic")
+	h.QueueID = getI32(ext, "queueId")
+	h.ExtraInfo = getStr(ext, "extraInfo")
+	h.Offset = getI64(ext, "offset")
+	h.InvisibleTime = getI64(ext, "invisibleTime")
+	h.LiteTopic = getStr(ext, "liteTopic")
+	h.Suspend = getBool(ext, "suspend")
+}
+
+// ChangeInvisibleTimeResponseHeader. The reply carries the NEW popTime and
+// invisibleTime; the client rebuilds its checkpoint from them (MQClientAPIImpl
+// .changeInvisibleTimeAsync).
+type ChangeInvisibleTimeResponseHeader struct {
+	PopTime       *int64
+	InvisibleTime *int64
+	ReviveQid     *int32
+}
+
+func (h *ChangeInvisibleTimeResponseHeader) ToExtFields(out *common.StringMap) {
+	putI64(out, "popTime", h.PopTime)
+	putI64(out, "invisibleTime", h.InvisibleTime)
+	putI32(out, "reviveQid", h.ReviveQid)
+}
+
+func (h *ChangeInvisibleTimeResponseHeader) FromExtFields(ext *common.StringMap) {
+	h.PopTime = getI64(ext, "popTime")
+	h.InvisibleTime = getI64(ext, "invisibleTime")
+	h.ReviveQid = getI32(ext, "reviveQid")
+}
+
 // ---------------- name server ----------------
 
 // GetRouteInfoRequestHeader (GET_ROUTEINFO_BY_TOPIC).

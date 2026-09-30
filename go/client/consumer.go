@@ -63,6 +63,15 @@ const (
 	defaultSuspendCurrentQueueTimeMs   = int64(1000)
 	defaultConsumeTimeout              = int64(15)
 	defaultConsumerPollNamesrvInterval = int64(30000)
+	// POP defaults (Java DefaultMQPushConsumer.popThresholdForQueue /
+	// popInvisibleTime / popBatchNums). The invisible time and batch size are
+	// range-checked at startup: [5000, 300000] ms and [1, 32].
+	defaultPopThresholdForQueue = 96
+	defaultPopInvisibleTime     = int64(60000)
+	defaultPopBatchNums         = int32(32)
+	minPopInvisibleTime         = int64(5000)
+	maxPopInvisibleTime         = int64(300000)
+	maxPopBatchNums             = int32(32)
 	// rebalanceInterval is Java RebalanceService's 20s.
 	rebalanceInterval = 20 * time.Second
 	// rebalanceIntervalDuringStartup is the Python/Rust fast retry: while the
@@ -139,6 +148,20 @@ type DefaultMQPushConsumer struct {
 	allocateStrategy           AllocateMessageQueueStrategy
 	messageQueueListener       MessageQueueListener
 
+	// POP mode (Java's broker-side MessageRequestMode). When popMode is on the
+	// consumer stops reading the topic with PULL_MESSAGE and pops it instead:
+	// no client offset, no processQueue — the queue is tracked by a
+	// popProcessQueue holding only the outstanding-ACK debt.
+	popMode              bool
+	popInvisibleTime     int64
+	popBatchNums         int32
+	popThresholdForQueue int
+	// popShareQueueNum is forwarded verbatim by SET_MESSAGE_REQUEST_MODE(401):
+	// it lets N following consumers in the cid list share this one's queues.
+	popShareQueueNum int32
+	// paused mirrors Java DefaultMQPushConsumerImpl.pause (SUSPEND_CONSUMER).
+	paused bool
+
 	nameServerAddrs []string
 	subscription    map[string]*remoting.SubscriptionData
 	listener        any
@@ -171,6 +194,13 @@ type DefaultMQPushConsumer struct {
 	processQueueTable map[common.MessageQueue]*processQueue
 	queueStop         map[common.MessageQueue]chan struct{}
 	assigned          []common.MessageQueue
+
+	// popQueueTable is the POP counterpart of processQueueTable. Only one of the
+	// two is ever non-empty, because the mode is fixed for the consumer's
+	// lifetime (Java's mode is per (group,topic) and read from the assignment,
+	// but a single consumer cannot be half-pulled and half-popped without a
+	// second offset store).
+	popQueueTable map[common.MessageQueue]*popProcessQueue
 
 	// offsetTable is the pull cursor (Java's PullRequest.nextOffset), distinct
 	// from the consumed offset the store holds.
@@ -231,9 +261,13 @@ func NewDefaultMQPushConsumer(consumerGroup string) (*DefaultMQPushConsumer, err
 		suspendCurrentQueueTimeMs:     defaultSuspendCurrentQueueTimeMs,
 		consumeTimeout:                defaultConsumeTimeout,
 		traceMsgBatchNum:              defaultTraceMsgBatchNum,
+		popThresholdForQueue:          defaultPopThresholdForQueue,
+		popInvisibleTime:              defaultPopInvisibleTime,
+		popBatchNums:                  defaultPopBatchNums,
 		allocateStrategy:              AllocateMessageQueueAveragely{},
 		subscription:                  map[string]*remoting.SubscriptionData{},
 		processQueueTable:             map[common.MessageQueue]*processQueue{},
+		popQueueTable:                 map[common.MessageQueue]*popProcessQueue{},
 		queueStop:                     map[common.MessageQueue]chan struct{}{},
 		offsetTable:                   map[common.MessageQueue]int64{},
 		frozenOffsets:                 map[common.MessageQueue]bool{},
@@ -492,6 +526,80 @@ func (c *DefaultMQPushConsumer) SetPostSubscriptionWhenPull(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.postSubscriptionWhenPull = enable
+}
+
+// ---------------------------------------------------------------- pop config
+
+// SetPopMode turns POP consumption on for this consumer.
+//
+// This is the CLIENT half of the switch. Java's mode lives on the broker
+// (MessageRequestMode per (group, topic)) and the client learns it from
+// MessageQueueAssignment.mode during rebalance; the classic client has no
+// setter for it. A consumer that only sets this flag keeps popping a broker
+// that still serves the group in PULL mode, which is why Start also sends
+// SET_MESSAGE_REQUEST_MODE(401) for every subscribed topic — see
+// enablePopModeOnBroker.
+//
+// A POP consumer must not be orderly: Java leaves orderly POP as a TODO stub and
+// mixing the two here would need a queue lock the POP protocol does not have.
+func (c *DefaultMQPushConsumer) SetPopMode(enable bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.popMode = enable
+}
+
+// IsPopMode reports whether POP mode is on.
+func (c *DefaultMQPushConsumer) IsPopMode() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.popMode
+}
+
+// SetPopInvisibleTime sets how long a popped batch stays invisible (ms). Java
+// requires [5000, 300000]; out of range fails at Start.
+func (c *DefaultMQPushConsumer) SetPopInvisibleTime(ms int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.popInvisibleTime = ms
+}
+
+// SetPopBatchNums sets the max messages per POP. Java requires [1, 32].
+func (c *DefaultMQPushConsumer) SetPopBatchNums(n int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.popBatchNums = n
+}
+
+// SetPopThresholdForQueue sets the outstanding-ACK debt that trips per-queue
+// flow control (Java default 96).
+func (c *DefaultMQPushConsumer) SetPopThresholdForQueue(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.popThresholdForQueue = n
+}
+
+// SetPopShareQueueNum sets how many following consumers in the cid list may
+// share this consumer's queues (forwarded by SET_MESSAGE_REQUEST_MODE).
+func (c *DefaultMQPushConsumer) SetPopShareQueueNum(n int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.popShareQueueNum = n
+}
+
+// SetPause mirrors Java DefaultMQPushConsumerImpl.setPause (driven by the
+// SUSPEND_CONSUMER admin request). A paused consumer keeps its assignment but
+// stops issuing requests.
+func (c *DefaultMQPushConsumer) SetPause(pause bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.paused = pause
+}
+
+// IsPaused reports the pause flag.
+func (c *DefaultMQPushConsumer) IsPaused() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.paused
 }
 
 // SetMaxReconsumeTimes sets the retry ceiling (-1 = Java default).
@@ -1076,6 +1184,27 @@ func (c *DefaultMQPushConsumer) Start() error {
 		common.LogWarnf("initial rebalance failed: %v", err)
 	}
 
+	// POP mode: tell the broker to serve this (group, topic) pair as POP. Java
+	// does this out of band (mqadmin / console); doing it here keeps the client
+	// self-contained. A failure is logged, not fatal — a broker that already
+	// has the group in POP mode answers SUCCESS anyway, and an old broker
+	// without POP support must not take the consumer down.
+	if c.IsPopMode() {
+		if err := c.SetMessageRequestModeOnBroker(3000); err != nil {
+			common.LogWarnf("enable POP on broker failed for group %s: %v", c.consumerGroup, err)
+		}
+	}
+
+	if c.IsPopMode() {
+		// POP has no processQueue to dispatch from: the pop loops hand each
+		// batch straight to the listener. It also has no expire sweep
+		// (cleanExpiredMsg reads a buffer POP does not keep) and no queue lock
+		// (orderly POP is rejected at config time).
+		c.goLoop(c.rebalanceLoop)
+		c.startTraceDispatcher()
+		return nil
+	}
+
 	c.goLoop(c.dispatchLoop)
 	// The suspend sweep only exists on the classic concurrent path: Java builds
 	// it in ConsumeMessageConcurrentlyService, ProcessQueue.cleanExpiredMsg
@@ -1363,6 +1492,16 @@ func (c *DefaultMQPushConsumer) checkConfigRangesLocked() error {
 		return common.ClientError("consumeMessageBatchMaxSize Out of range [1, 1024]")
 	case c.pullBatchSize < 1 || c.pullBatchSize > 1024:
 		return common.ClientError("pullBatchSize Out of range [1, 1024]")
+	case c.popInvisibleTime < minPopInvisibleTime || c.popInvisibleTime > maxPopInvisibleTime:
+		return common.ClientError(fmt.Sprintf("popInvisibleTime Out of range [%d, %d]",
+			minPopInvisibleTime, maxPopInvisibleTime))
+	case c.popBatchNums <= 0 || c.popBatchNums > maxPopBatchNums:
+		return common.ClientError(fmt.Sprintf("popBatchNums Out of range [1, %d]", maxPopBatchNums))
+	case c.popMode && c.orderly:
+		// Java: "POPTODO think of pop mode orderly implementation later." There
+		// is no queue lock in the POP protocol to serialise on, so an orderly
+		// POP consumer would silently lose ordering — refuse instead.
+		return common.ClientError("pop mode does not support orderly consumption")
 	}
 	return nil
 }
@@ -1440,33 +1579,40 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	}
 	// Resolve the initial offset for freshly assigned queues NOW, not lazily on
 	// the first pull (see the package comment).
-	for _, mq := range assigned {
-		if _, already := was[mq]; already {
-			continue
-		}
-		c.mu.Lock()
-		_, has := c.offsetTable[mq]
-		_, hasSub := c.subscription[mq.Topic]
-		store := c.offsetStore
-		c.mu.Unlock()
-		if has || !hasSub {
-			continue
-		}
-		next, err := c.computePullFromWhere(mq)
-		if err != nil {
-			common.LogDebugf("resolve initial offset for %v failed: %v", mq, err)
-			continue
-		}
-		if next < 0 {
-			continue
-		}
-		c.mu.Lock()
-		if _, ok := c.offsetTable[mq]; !ok {
-			c.offsetTable[mq] = next
-		}
-		c.mu.Unlock()
-		if store != nil {
-			store.UpdateOffset(mq, next, false)
+	//
+	// POP has no client-side offset at all — the broker's revive queue is the
+	// cursor — so this whole block only applies to the pull path. Resolving
+	// offsets in POP mode would also issue QUERY_CONSUMER_OFFSET for a group
+	// whose offsets are never committed, wasting a round trip per queue.
+	if !c.IsPopMode() {
+		for _, mq := range assigned {
+			if _, already := was[mq]; already {
+				continue
+			}
+			c.mu.Lock()
+			_, has := c.offsetTable[mq]
+			_, hasSub := c.subscription[mq.Topic]
+			store := c.offsetStore
+			c.mu.Unlock()
+			if has || !hasSub {
+				continue
+			}
+			next, err := c.computePullFromWhere(mq)
+			if err != nil {
+				common.LogDebugf("resolve initial offset for %v failed: %v", mq, err)
+				continue
+			}
+			if next < 0 {
+				continue
+			}
+			c.mu.Lock()
+			if _, ok := c.offsetTable[mq]; !ok {
+				c.offsetTable[mq] = next
+			}
+			c.mu.Unlock()
+			if store != nil {
+				store.UpdateOffset(mq, next, false)
+			}
 		}
 	}
 	c.syncPullLoops()
@@ -1551,6 +1697,10 @@ func (c *DefaultMQPushConsumer) FlowControlTriggered() int64 {
 // Order matters: retire -> settle -> add. Reversed, the new loop would start
 // from a stale offset and write the smaller value back.
 func (c *DefaultMQPushConsumer) syncPullLoops() {
+	if c.IsPopMode() {
+		c.syncPopLoops()
+		return
+	}
 	current := map[common.MessageQueue]common.MessageQueue{}
 	for _, mq := range c.assignedQueues() {
 		current[mq] = mq

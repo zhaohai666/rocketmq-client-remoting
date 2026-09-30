@@ -85,6 +85,16 @@ type consumerBroker struct {
 	lockOKMQSet []common.MessageQueue
 	// maxOffsetErr makes GET_MAX_OFFSET(30) answer QUERY_NOT_FOUND.
 	maxOffsetErr bool
+
+	// ---- POP bookkeeping (see pop_test.go) ----
+	// The POP branch keeps its own capture slices so the pull-path fixtures
+	// stay untouched; popFixture is the canned POP_MESSAGE answer.
+	popHeaders      []*remoting.PopMessageRequestHeader
+	acks            []*remoting.AckMessageRequestHeader
+	batchAcks       []*remoting.BatchAckMessageRequestBody
+	changeInvisible []*remoting.ChangeInvisibleTimeRequestHeader
+	requestModes    []*remoting.SetMessageRequestModeRequestBody
+	popFixture      *popFixture
 }
 
 func newConsumerBroker() *consumerBroker {
@@ -242,6 +252,16 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		b.createTopicExt = append(b.createTopicExt, req.ExtFields().Clone())
 		b.mu.Unlock()
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
+	case remoting.ReqPopMessage:
+		return b.answerPop(req)
+	case remoting.ReqAckMessage:
+		return b.answerAck(req)
+	case remoting.ReqBatchAckMessage:
+		return b.answerBatchAck(req)
+	case remoting.ReqChangeMessageInvisibleTime:
+		return b.answerChangeInvisible(req)
+	case remoting.ReqSetMessageRequestMode:
+		return b.answerSetMode(req)
 	case remoting.ReqSendMessageV2:
 		header := &remoting.SendMessageRequestHeaderV2{}
 		header.FromExtFields(req.ExtFields())
