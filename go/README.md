@@ -2,8 +2,8 @@
 
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
 适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / .NET / Rust 实现逐项对齐。
-**真机联调工具目前 6 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
-重投与死信 / 停机竞态；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
+**真机联调工具目前 7 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
+重投与死信 / 停机竞态 / **管理端**；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
 **不宣称「全部能力都已联调」**。另有一个**不依赖集群**的离线自检
 （`go run ./examples/selfcheck`，见「离线自检」）—— 它与 Python / C++ / .NET 三端的同名工具对齐，
 **不是** Java 的机制（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令）。
@@ -27,7 +27,7 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 消费侧应答 | `GET_CONSUMER_RUNNING_INFO(307)`（三层属性 + subscriptionSet + mqTable/mqPopTable 互斥 + statusTable）、`CONSUME_MESSAGE_DIRECTLY(309)`（并发/顺序两套判定 + panic → CR_THROW_EXCEPTION）、`CONSUMER_SEND_MSG_BACK(36)`、`GET_CONSUMER_STATUS_FROM_CLIENT(221)`、`RESET_CONSUMER_CLIENT_OFFSET(220)` |
 | 消费侧统计 | `ConsumerStatsManager`：五组 StatsItemSet（CONSUME_OK/FAILED_TPS、CONSUME_RT、PULL_TPS/RT），累计 + 两级采样链，快照是**差分窗口**；307 的 statusTable 就是它 |
 | 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动 |
-| 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询 |
+| 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询；**真机工具 `examples/live_admin` 29 项**（管理员端此前只有单测，没有真机工具 —— 第一次真机就抓到 `groupRetryPolicy` 为 nil 时序列化 panic） |
 | 消息轨迹 | 客户端轨迹生产：Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录，Java `TraceDataEncoder` **逐字节**对齐（真值向量见单测）；`AsyncTraceDispatcher`（2048 有界丢弃 + 批 20 + 128K 分片 + 5s 冲刷 + 关停冲尾批）、内部生产者与 topic 前缀两道防自噬、W3C `traceparent` 注入与透传（`ROCKETMQ_TRACE_CONTEXT_ENABLE`） |
 | 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、POP 消费（200050/200051/200052 + 检查点反构）、消费侧状态与运行信息应答（221 位点表 / 307 / 309）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
 | 离线自检 | `examples/selfcheck`：**不依赖集群**的协议层自检 10 项（JSON / 二进制双帧回环、`clientID` 键拼写、V2 单字母短键集、17 段消息回环含派生 msgId、magic-v2 超长 topic 手工夹具、6 段批量、Crc32 向量、ACL 签名注入） |
@@ -45,26 +45,26 @@ cd go
 go build ./...
 go vet ./...
 gofmt -l .        # 空输出才是过
-go test ./...     # 529 条，~9s
+go test ./...     # 535 条，~9s
 go test -race ./client/   # 并发回归（lite 消费者、异步发送、位点提交地板）
 ```
 
 ## 单元测试
 
-529 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
+535 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
 （`client/consumer_test.go` 里的 `clusterFixture`：真 socket 监听的假 broker + 假 name server，
 脚本化应答，能锁死请求码、ext 字段名与重试分类）：
 
 | 包 | 条数 | 覆盖 |
 | --- | --- | --- |
-| `client`（285） | producer 19 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、发送头守卫 |
+| `client`（287） | producer 19 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、发送头守卫 |
 | | hooks 14 | `CheckForbiddenHook` 每次尝试都调且不吞异常、`FilterMessageHook` 吞异常且后续照跑、ACL 签名拼串（key 排序、只拼 value、跳过 Signature） |
 | | async 27 | 真异步内核：换 broker 换 opaque、背压信号量、有界队满同步抛、回调恰好一次、预算共享 |
 | | transaction 6 | 两阶段 + 回查响应、单工 check 线程 |
 | | request_reply 13 | 326 holder、Request/AsyncRequest 超时 |
 | | consumer 29 | 长轮询、顺序重投闸门、流控、位点五 RPC、OFFSET_ILLEGAL、220、广播、关停在途消费 join + send-back 守卫、位点提交地板三条（部分 ack 整批提交 / 回投失败钉住位点 / 乱序批次不回跳） |
 | | consumer_stats 19 | 差分窗口口径、10s/10min 两级采样、`consumeRT` 独有的 hour 回退、`consumeFailedMsgs` 取 hour sum、key 是 topic@group、拉取与消费两条记录路径 |
-| | consumer_running_info 17 | **307** 空体六键与 `jstack` 未设即不出现、`mqTable`/`mqPopTable` **内联对象键按原始字节**断言、经典 vs POP 两表互斥、statusTable 含 `%RETRY%` 且取自统计管理器、processQueueInfo 14 键 / popProcessQueueInfo 3 键、**309** 并发与顺序两套判定 + `autoCommit` 在 listener 之后读 + panic→CR_THROW_EXCEPTION + 重投 topic 还原 + 两条错误臂端到端 |
+| | consumer_running_info 19 | **307** 空体六键与 `jstack` 未设即不出现、`mqTable`/`mqPopTable` **内联对象键按原始字节**断言、经典 vs POP 两表互斥、statusTable 含 `%RETRY%` 且取自统计管理器、processQueueInfo 14 键 / popProcessQueueInfo 3 键、**309** 并发与顺序两套判定 + `autoCommit` 在 listener 之后读 + panic→CR_THROW_EXCEPTION + 重投 topic 还原 + 两条错误臂端到端 |
 | | pop 15 | 检查点 8 段反构（含 `1ST_POP_TIME`）、ACK 用 checkpoint offset、失败改不可见时间、`checkNeedAckOrDelay` 两分支、401 请求模式、`order`/`suspend` 恒在报文里 |
 | | lite_pull 9 | **361 + LITE 位上线**、双游标（NO_NEW_MSG 也跟 nextBeginOffset）、Seek 丢缓冲、提交表是**清扫**不是过滤、暂停恢复闸门、订阅模式重平衡 + 关停落盘 |
 | | pull_consumer 18 | 短轮询不带 SUSPEND 位、长轮询真挂起、调用方游标、sendMessageBack |
@@ -74,7 +74,7 @@ go test -race ./client/   # 并发回归（lite 消费者、异步发送、位�
 | | offset_store 9 | 本地/broker 双表、persistAll 清扫语义 |
 | | trace 30 | Java 编码器**逐字节**真值向量、解码容错（无 keys 空段、坏记录只跳过自己）、SubBefore/SubAfter 共用 requestId + contextCode 五档、traceparent 注入与校验、分发器防自噬，以及两条**进程内真集群**端到端（Pub 落轨迹 topic 且不递归 / 消费对落盘并配对） |
 | `common`（111） | 111 | 17 段编解码（坏数据拒收、压缩段 crc32）、消息模型、clientId 口径、recall 句柄真值向量、namespace、sysflag 位表、ExtraInfo 8 段、校验器 |
-| `remoting`（133） | 133 | 真 socket 回环（同步/异步/oneway、半包、并发 opaque、静默超时）、TLS、ACL 签名、V2 短键名守卫（错一个字母就**静默丢字段**）、JSON 容错（裸数字键、对象 key、NaN）、**fastjson2 出站写入器**（MessageQueue 内联对象键 + Java double 格式）、`CurrentVersion`/`CurrentVersionDesc` 成对守卫、心跳装配、POP 与 ClientInfo body 形状 |
+| `remoting`（137） | 137 | 真 socket 回环（同步/异步/oneway、半包、并发 opaque、静默超时）、TLS、ACL 签名、V2 短键名守卫（错一个字母就**静默丢字段**）、JSON 容错（裸数字键、对象 key、NaN）、**fastjson2 出站写入器**（MessageQueue 内联对象键 + Java double 格式）、`CurrentVersion`/`CurrentVersionDesc` 成对守卫、心跳装配、POP 与 ClientInfo body 形状、订阅组配置（**nil `groupRetryPolicy` 必须丢键而不是 panic**） |
 
 ## 离线自检
 
@@ -89,7 +89,7 @@ go run ./examples/selfcheck
 `selfcheck: ALL PASS (PASS=10 FAIL=0)`。与 `python -m rocketmq selfcheck`（7 项）、
 `cpp/examples/selfcheck.cpp`（3 项）、`dotnet` 的 `selfcheck` 子命令（3 项）同名同用途，
 是**动真机之前**最便宜的一道门。**Rust 侧没有这个工具**（`rust/examples/` 全是需要集群的
-`live_*`），它的协议层离线覆盖由 `cargo test` 的 895 条单测承担 —— 所以这里是 4/5 端对齐。
+`live_*`），它的协议层离线覆盖由 `cargo test` 单测承担 —— 所以这里是 4/5 端对齐。
 
 覆盖：JSON 帧回环（含**不转义** `<>&`、中文 remark、extFields 全等）、ROCKETMQ 私有二进制帧回环
 （并断言协议类型确实走在打包头长度的高位）、`HEART_BEAT` 的 `clientID` **键拼写**、`SendMessageRequestHeaderV2`
@@ -119,6 +119,7 @@ go run ./examples/live_lite_pull      -ns 127.0.0.1:9876   # assign 模式（双
 go run ./examples/live_redelivery     -ns 127.0.0.1:9876 [-legs s1,s2,s3,s4]
                                                           # S1 %RETRY% 二次投递 + delayLevel 3 延迟梯度 + topic 还原、S2 maxReconsumeTimes=2 ⇒ 3 次投递后 %DLQ% 且 recon=3、S3 顺序毒消息走「等 broker 回投」那条 DLQ 路径、S4 ackIndex 部分 ack（已 ack 的不回投 / 位点仍整批提交 / 对照组一条不回投）
 go run ./examples/live_shutdown_race  -ns 127.0.0.1:9876   # 立即关停 / 立即退进程的丢数据契约：并发回投两轮（%RETRY% → %DLQ%）、顺序挂起回投、短生命周期 trace 生产者冲尾批
+go run ./examples/live_admin          -ns 127.0.0.1:9876   # 管理端 29 项：集群探活与 master 选主、topic CRUD（路由/配置/列表一致）、broker 配置与运行时 KV、KV config 写读删、订阅组 CRUD、发 8 条验 topicStats、**四个位点查询**（Max/Min/LOWER/UPPER 边界/最早存储时间）、位点写 broker 再用另一个 RPC 读回、KEYS 索引查询 + viewMessage 取正文、删 topic 后确认消失
 ```
 
 脚本（**起集群 + 等端口 + 跑验证 + 收工都在同一条命令内**，别拆开跑）：
@@ -129,12 +130,13 @@ bash scripts/run_go_consumer_live.sh        # Python 生产 → Go 消费 → Py
 bash scripts/run_go_pull_live.sh            # Go 拉取
 bash scripts/run_go_redelivery_live.sh      # 重投 / 死信终态 / 顺序死信 / ackIndex 部分 ack（全跑约 5~7 分钟）
 bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 live_shutdown_race）
+bash scripts/run_go_admin_live.sh           # 管理端（29 项，自断言；工具自己造/删 topic、订阅组、KV namespace）
 ```
 
 **尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
 重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
 `cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
-ACL、TLS、SQL92、管理员端（库已就位但无真机工具）、压缩跨语言矩阵的 Go 腿，
+ACL、TLS、SQL92、压缩跨语言矩阵的 Go 腿，
 以及 **307/309 的真实 broker 往返**（`mqadmin consumerStatus -s` 走的就是这两条；目前只在
 进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
 
@@ -172,7 +174,7 @@ go/
 │   ├── offset_store.go / route.go / broker_api.go / hooks.go
 │   ├── fault_strategy.go / semaphore.go / listener.go / send_result.go
 │   └── validators 走 common
-└── examples/                   selfcheck（不依赖集群）+ 6 个真机联调工具（见上）
+└── examples/                   selfcheck（不依赖集群）+ 7 个真机联调工具（见上）
 ```
 
 ## 几个必须知道的实现约定

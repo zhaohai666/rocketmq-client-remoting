@@ -140,12 +140,18 @@ func (c *SubscriptionGroupConfig) ToJSONValue() map[string]any {
 		"consumeMessageOrderly":          c.ConsumeMessageOrderly,
 		"retryQueueNums":                 c.RetryQueueNums,
 		"retryMaxTimes":                  c.RetryMaxTimes,
-		"groupRetryPolicy":               c.GroupRetryPolicy.ToJSONValue(),
 		"brokerId":                       c.BrokerID,
 		"whichBrokerWhenConsumeSlowly":   c.WhichBrokerWhenConsumeSlowly,
 		"notifyConsumerIdsChangedEnable": c.NotifyConsumerIdsChangedEnable,
 		"groupSysFlag":                   c.GroupSysFlag,
 		"consumeTimeoutMinute":           c.ConsumeTimeoutMinute,
+	}
+	// fastjson2 drops nulls: only emit the key when there IS a retry policy.
+	// Java's default constructor initialises it, but setGroupRetryPolicy(null)
+	// is legal and a hand-built config can simply leave it nil — dereferencing
+	// that used to panic the whole request (found by live_admin).
+	if c.GroupRetryPolicy != nil {
+		d["groupRetryPolicy"] = c.GroupRetryPolicy.ToJSONValue()
 	}
 	attrs := make(map[string]any, len(c.Attributes))
 	for k, v := range c.Attributes {
