@@ -21,7 +21,11 @@
 // deliberate and it is why the script skips every Go leg for those codecs.
 //
 // Exit codes follow the Python leg so the script can tell them apart:
-// send 0 ok / 2 bad codec + 3 recv timeout / 1 mismatch.
+// 0 ok / 1 generic failure (a failed send included — that is what Python's
+// uncaught MQClientException exits with) / 2 bad codec or bad usage / 3 recv
+// timeout. Keeping 2 strictly for "bad codec / bad usage" is the point: a plain
+// send failure must NOT report 2 or it becomes indistinguishable from an
+// unsupported codec.
 package main
 
 import (
@@ -88,8 +92,8 @@ const usage = `usage:
 
 // compressType maps the matrix codec name to the sysFlag type bits, using the
 // same values as Java CompressionType.findByValue (1=LZ4, 2=ZSTD, 3=ZLIB).
-// LZ4/ZSTD are accepted here on purpose: the whole point is that Go then FAILS
-// LOUDLY on compression rather than handing out a compressed stream as a body.
+// LZ4/ZSTD resolve to a type here (rather than being rejected as unknown) so
+// doSend can turn them into an explicit "unsupported codec" failure below.
 func compressType(codec string) (int32, bool) {
 	switch codec {
 	case "zlib":
@@ -109,11 +113,21 @@ func doSend(topic, group string, size int, ns, codec string) int {
 		return 2
 	}
 	payload := buildPayload(size)
+	// Pre-flight the codec — the producer must NOT be relied on to catch this.
+	// tryToCompressMessage swallows the error and sends the body UNCOMPRESSED
+	// (Go mirrors Java exactly; see client/producer.go), so a naive send reports
+	// SEND_OK for LZ4/ZSTD while nothing was compressed. A leg claiming "LZ4
+	// interop" would then pass vacuously, because the payload arrives intact and
+	// the CRC matches. Reject it here instead, as exit 2 = bad codec.
+	if _, err := common.Compress(payload, ctype, common.DefaultCompressLevel); err != nil {
+		fmt.Printf("SEND_FAIL unsupported codec=%s: %v\n", codec, err)
+		return 2
+	}
 
 	producer, err := client.NewDefaultMQProducer(group)
 	if err != nil {
 		fmt.Printf("SEND_FAIL producer=%v\n", err)
-		return 2
+		return 1
 	}
 	producer.SetNameServerAddr(ns)
 	producer.SetSendMsgTimeout(10_000)
@@ -123,13 +137,13 @@ func doSend(topic, group string, size int, ns, codec string) int {
 	producer.SetCompressType(ctype)
 	if err := producer.Start(); err != nil {
 		fmt.Printf("SEND_FAIL start=%v\n", err)
-		return 2
+		return 1
 	}
 	sr, err := producer.Send(common.NewMessage(topic, payload))
 	producer.Shutdown()
 	if err != nil {
 		fmt.Printf("SEND_FAIL send=%v\n", err)
-		return 2
+		return 1
 	}
 	fmt.Printf("SEND_OK codec=%s len=%d crc32=%d msgId=%s\n", codec, len(payload), crc(payload), sr.MsgID)
 	return 0

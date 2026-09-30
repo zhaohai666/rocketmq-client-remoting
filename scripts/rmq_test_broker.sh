@@ -10,6 +10,16 @@
 #
 # 只碰 /tmp/rmq_rust_live 这套一次性测试 store，不会删数据：start 不清 store，
 # 重启后消息和位点都还在（live 用例正是靠这一点验"断连后同一实例能恢复发送"）。
+# ⚠ **同一个 store 上绝不要起第二个 broker**：broker 的 JVM shutdown hook 会无条件向
+#   namesrv 发 unregisterBrokerAll，且**不检查自己到底有没有启动成功**。第二个进程哪怕
+#   只是因为 `MessageRocksDBStorage init error: ... LOCK: Resource temporarily
+#   unavailable` 启动失败、立刻退出，也会顺手把 broker-a 从 namesrv 上注销掉 —— 之后
+#   所有客户端查任何 topic 都拿不到路由（"Can not find Message Queue for topic"）约 30 秒，
+#   直到真 broker 的下一个 30s 注册周期把它补回来。五端 live 用例落在这个窗口里会**集体
+#   假失败**（与语言无关；2026-09-30 实测：压缩矩阵 22 条腿连挂 7 条，两个非 Go 发送端一起挂）。
+#   start 前的 `broker_pid` 判断依赖 `ps`，某些沙箱里 `ps` 被禁 → "已经在跑"会被误判成
+#   "没在跑"于是又拉一个 —— 所以别在沙箱里盲调 start。
+#
 # 不下载任何东西：MQ_HOME 指向本地已经构建好的发行包目录。
 set -eu
 
