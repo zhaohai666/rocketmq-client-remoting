@@ -21,6 +21,12 @@ import (
 // ---------------- extra tolerant readers (the int/string ones live in bodies.go) ----------------
 
 // jsonFloatOr reads a float field; tps / rt values arrive as JSON numbers.
+//
+// Accepts native Go numerics as well as the wire shapes: FromJSONValue is fed
+// both decoded JSON (JSONNumber / string) and, for in-process round-trips, the
+// output of a sibling ToJSONValue (plain float64 / int). Without the native
+// cases a value round-tripped through Go silently reads back as the default —
+// every field looks present but zero.
 func jsonFloatOr(value any, key string, def float64) float64 {
 	obj, ok := value.(map[string]any)
 	if !ok {
@@ -35,6 +41,24 @@ func jsonFloatOr(value any, key string, def float64) float64 {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
 			return f
 		}
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case JavaDouble:
+		return float64(t)
+	case int:
+		return float64(t)
+	case int32:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case uint:
+		return float64(t)
+	case uint32:
+		return float64(t)
+	case uint64:
+		return float64(t)
 	}
 	return def
 }
@@ -283,11 +307,8 @@ func NewTopicStatsTable() *TopicStatsTable {
 }
 
 func (t *TopicStatsTable) ToJSONValue() map[string]any {
-	table := make(map[string]any, len(t.OffsetTable))
-	for q, o := range t.OffsetTable {
-		table[messageQueueKeyJSON(q)] = o.ToJSONValue()
-	}
-	return map[string]any{"offsetTable": table, "topicPutTps": t.TopicPutTps}
+	table := newMQKeyedJSON(t.OffsetTable, func(o *TopicOffset) any { return o.ToJSONValue() })
+	return map[string]any{"offsetTable": table, "topicPutTps": JavaDouble(t.TopicPutTps)}
 }
 
 func (t *TopicStatsTable) FromJSONValue(value any) error {
@@ -322,7 +343,7 @@ func (t *TopicStatsTable) FromJSONValue(value any) error {
 	return nil
 }
 
-func (t *TopicStatsTable) Encode() []byte { return EncodeJSON(t.ToJSONValue()) }
+func (t *TopicStatsTable) Encode() []byte { return EncodeFastJSON(t.ToJSONValue()) }
 
 // DecodeTopicStatsTable parses the GET_TOPIC_STATS_INFO(202) body.
 func DecodeTopicStatsTable(data []byte) (*TopicStatsTable, error) {
@@ -399,11 +420,8 @@ func (c *ConsumeStats) TotalLag() int64 {
 }
 
 func (c *ConsumeStats) ToJSONValue() map[string]any {
-	table := make(map[string]any, len(c.OffsetTable))
-	for q, w := range c.OffsetTable {
-		table[messageQueueKeyJSON(q)] = w.ToJSONValue()
-	}
-	return map[string]any{"offsetTable": table, "consumeTps": c.ConsumeTps}
+	table := newMQKeyedJSON(c.OffsetTable, func(w *OffsetWrapper) any { return w.ToJSONValue() })
+	return map[string]any{"offsetTable": table, "consumeTps": JavaDouble(c.ConsumeTps)}
 }
 
 func (c *ConsumeStats) FromJSONValue(value any) error {
@@ -437,7 +455,7 @@ func (c *ConsumeStats) FromJSONValue(value any) error {
 	return nil
 }
 
-func (c *ConsumeStats) Encode() []byte { return EncodeJSON(c.ToJSONValue()) }
+func (c *ConsumeStats) Encode() []byte { return EncodeFastJSON(c.ToJSONValue()) }
 
 // DecodeConsumeStats parses the GET_CONSUME_STATS(208) body.
 func DecodeConsumeStats(data []byte) (*ConsumeStats, error) {
@@ -457,6 +475,11 @@ func DecodeConsumeStats(data []byte) (*ConsumeStats, error) {
 
 // ConsumeStatus mirrors org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
 // (the per-group consume snapshot the admin tools render).
+//
+// The five rate fields are Java `double` and go through JavaDouble so the body
+// reads `0.0` (not `0`) and a zero-span window reads `null` (not an empty
+// body) — this struct feeds the 307 answer's statusTable, so the broker's
+// console parses it directly.
 type ConsumeStatus struct {
 	PullRT            float64
 	PullTPS           float64
@@ -468,11 +491,11 @@ type ConsumeStatus struct {
 
 func (c *ConsumeStatus) ToJSONValue() map[string]any {
 	return map[string]any{
-		"pullRT":            c.PullRT,
-		"pullTPS":           c.PullTPS,
-		"consumeRT":         c.ConsumeRT,
-		"consumeOKTPS":      c.ConsumeOKTPS,
-		"consumeFailedTPS":  c.ConsumeFailedTPS,
+		"pullRT":            JavaDouble(c.PullRT),
+		"pullTPS":           JavaDouble(c.PullTPS),
+		"consumeRT":         JavaDouble(c.ConsumeRT),
+		"consumeOKTPS":      JavaDouble(c.ConsumeOKTPS),
+		"consumeFailedTPS":  JavaDouble(c.ConsumeFailedTPS),
 		"consumeFailedMsgs": c.ConsumeFailedMsgs,
 	}
 }

@@ -18,14 +18,25 @@ import (
 // EncodeJSON writes compact JSON without HTML escaping (Java does not escape
 // <, >, & either; the broker's fastjson2 accepts both).
 func EncodeJSON(v any) []byte {
+	raw, err := encodeJSONNoEscape(v)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// encodeJSONNoEscape is EncodeJSON with the error kept. The inline-object-keyed
+// table marshaler needs to propagate a failure rather than silently producing
+// an empty body the way EncodeJSON's nil return would.
+func encodeJSONNoEscape(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
-		return nil
+		return nil, err
 	}
 	// json.Encoder appends a newline; Java writes compact JSON without one.
-	return bytes.TrimRight(buf.Bytes(), "\n")
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // DecodeJSON parses tolerant JSON bytes; empty input yields nil.

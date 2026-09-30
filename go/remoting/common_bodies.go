@@ -419,12 +419,22 @@ func DecodeProducerConnection(data []byte) (*ProducerConnection, error) {
 
 // ConsumerRunningInfo property keys (Java ConsumerRunningInfo constants).
 //
-// Note PROP_CONSUME_ORDERLY: Java's constant NAME has no underscore in the
-// middle, but its VALUE does — `PROP_CONSUMEORDERLY = "PROP_CONSUME_ORDERLY"`.
+// Note PROP_CONSUME_ORDERLY: this is the ONE key where the Java constant NAME
+// and its VALUE disagree. The field name carries the underscores and the value
+// does not — `PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"`. Verified by JVM
+// reflection on 5.5.1 (`RemotingSerializable`-adjacent probe):
+//
+//	PROP_CONSUME_ORDERLY field name  = PROP_CONSUME_ORDERLY
+//	PROP_CONSUME_ORDERLY field value = PROP_CONSUMEORDERLY
+//
+// The broker/admin look the property up BY VALUE, so shipping the underscored
+// form makes the "is this consumer orderly" flag silently disappear from every
+// 307 answer. Python / Rust / C++ / .NET / Node all use the underscore-free
+// value; only Java's identifier keeps the underscores.
 const (
 	PropNameServerAddr         = "PROP_NAMESERVER_ADDR"
 	PropThreadPoolCoreSize     = "PROP_THREADPOOL_CORE_SIZE"
-	PropConsumeOrderly         = "PROP_CONSUME_ORDERLY"
+	PropConsumeOrderly         = "PROP_CONSUMEORDERLY"
 	PropConsumeType            = "PROP_CONSUME_TYPE"
 	PropClientVersion          = "PROP_CLIENT_VERSION"
 	PropConsumerStartTimestamp = "PROP_CONSUMER_START_TIMESTAMP"
@@ -463,14 +473,8 @@ func (r *ConsumerRunningInfo) ToJSONValue() map[string]any {
 	for _, sub := range r.SubscriptionSet {
 		subs = append(subs, sub)
 	}
-	mqTable := make(map[string]any, len(r.MQTable))
-	for q, info := range r.MQTable {
-		mqTable[messageQueueKeyJSON(q)] = info
-	}
-	mqPopTable := make(map[string]any, len(r.MQPopTable))
-	for q, info := range r.MQPopTable {
-		mqPopTable[messageQueueKeyJSON(q)] = info
-	}
+	mqTable := newMQKeyedJSON(r.MQTable, func(info map[string]any) any { return info })
+	mqPopTable := newMQKeyedJSON(r.MQPopTable, func(info map[string]any) any { return info })
 	statusTable := make(map[string]any, len(r.StatusTable))
 	for k, v := range r.StatusTable {
 		statusTable[k] = v
@@ -483,15 +487,23 @@ func (r *ConsumerRunningInfo) ToJSONValue() map[string]any {
 	for k, v := range r.UserConsumerInfo {
 		userInfo[k] = v
 	}
-	return map[string]any{
+	d := map[string]any{
 		"properties":       props,
 		"subscriptionSet":  subs,
 		"mqTable":          mqTable,
 		"mqPopTable":       mqPopTable,
 		"statusTable":      statusTable,
 		"userConsumerInfo": userInfo,
-		"jstack":           r.Jstack,
 	}
+	// Java's `jstack` is a null String unless someone called setJstack(), and
+	// fastjson2 drops null fields — so an un-set jstack is an ABSENT key, not
+	// an empty string. The empty body therefore has exactly six keys, and
+	// jstack is APPENDED last when present. Emitting "jstack":"" instead would
+	// make a strict admin see a stack trace of zero length.
+	if r.HasJstack {
+		d["jstack"] = r.Jstack
+	}
+	return d
 }
 
 func (r *ConsumerRunningInfo) FromJSONValue(value any) error {
@@ -524,7 +536,10 @@ func (r *ConsumerRunningInfo) FromJSONValue(value any) error {
 	return nil
 }
 
-func (r *ConsumerRunningInfo) Encode() []byte { return EncodeJSON(r.ToJSONValue()) }
+// Encode renders the running info with fastjson2's inline-object mqTable keys.
+// This MUST NOT go through EncodeJSON: encoding/json validates Marshaler output
+// and rejects the unquoted key (see mqKeyedJSON).
+func (r *ConsumerRunningInfo) Encode() []byte { return EncodeFastJSON(r.ToJSONValue()) }
 
 // DecodeConsumerRunningInfo parses a ConsumerRunningInfo body.
 func DecodeConsumerRunningInfo(data []byte) (*ConsumerRunningInfo, error) {

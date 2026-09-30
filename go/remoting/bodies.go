@@ -3,11 +3,15 @@
 // RESET_CONSUMER_CLIENT_OFFSET(220) / GET_CONSUMER_STATUS_FROM_CLIENT(221).
 //
 // MessageQueue-keyed maps travel as fastjson2 inline-object keys
-// (`{"brokerName":"b","queueId":1,"topic":"Tt"}:9`) — Java's field order is
-// alphabetical, which the stdlib encoder reproduces by sorting map keys.
+// (`{"brokerName":"b","queueId":1,"topic":"Tt"}:9`). That byte stream is not
+// valid JSON and the stdlib encoder cannot produce it, so bodies carrying one
+// are serialised by EncodeFastJSON — see mqKeyedJSON below for why, and for the
+// 5.5.1-jar evidence that the escaped alternative is rejected by fastjson2.
 package remoting
 
 import (
+	"errors"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -44,16 +48,51 @@ func jsonI64(value any, key string, def int64) int64 {
 	return def
 }
 
+// numberAsI64 reads an integer field. Besides the wire shapes (JSONNumber, a
+// numeric string) it accepts native Go numerics, because FromJSONValue is used
+// both for decoded JSON and for in-process round-trips of a sibling
+// ToJSONValue. Missing the native cases makes such a round-trip silently read
+// back the default — the field appears present but is zero.
 func numberAsI64(v any) (int64, bool) {
 	switch t := v.(type) {
 	case JSONNumber:
 		if n, err := t.Int64(); err == nil {
 			return n, true
 		}
+		// A wire literal such as `3.0` still denotes an integer field.
+		if f, err := t.Float64(); err == nil {
+			return int64(f), true
+		}
 	case string:
 		if n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 64); err == nil {
 			return n, true
 		}
+	case int:
+		return int64(t), true
+	case int8:
+		return int64(t), true
+	case int16:
+		return int64(t), true
+	case int32:
+		return int64(t), true
+	case int64:
+		return t, true
+	case uint:
+		return int64(t), true
+	case uint8:
+		return int64(t), true
+	case uint16:
+		return int64(t), true
+	case uint32:
+		return int64(t), true
+	case uint64:
+		return int64(t), true
+	case float32:
+		return int64(t), true
+	case float64:
+		return int64(t), true
+	case JavaDouble:
+		return int64(t), true
 	}
 	return 0, false
 }
@@ -194,11 +233,101 @@ func messageQueueKeyJSON(q common.MessageQueue) string {
 // (the local offset file uses the same MessageQueue-as-key shape).
 func MessageQueueKeyJSON(q common.MessageQueue) string { return messageQueueKeyJSON(q) }
 
+// ---------------- MessageQueue-keyed objects on the wire ----------------
+
+// mqKeyedJSON is a JSON object whose keys are fastjson2 INLINE OBJECTS:
+//
+//	{"brokerName":"broker-a","queueId":3,"topic":"TopicA"}:{...}
+//
+// A plain map[string]any CANNOT express that. encoding/json escapes the quotes
+// inside a map key, emitting
+//
+//	"{\"brokerName\":\"broker-a\",\"queueId\":3,\"topic\":\"TopicA\"}":{...}
+//
+// and fastjson2 rejects that spelling outright for a `Map<MessageQueue, X>`
+// field — to it the key is a Java MessageQueue, not a JSON string. Both forms
+// were fed to the 5.5.1 jars with the REAL Go bytes:
+//
+//	Go CRI -> Java ConsumerRunningInfo: REJECTED -> JSONException:
+//	    read field 'ConsumerRunningInfo.setMqTable, offset 477'
+//	Go TST -> Java TopicStatsTable:     REJECTED -> JSONException:
+//	    illegal fieldName input26, offset 156
+//
+// So an escaped key makes every MessageQueue-keyed body unreadable to a Java
+// admin or broker. The Go reader never noticed, because the local tolerant
+// parser unescapes the key and DecodeMapKey re-parses it afterwards: Go could
+// always read its own output, and only the Java direction was broken.
+//
+// Order: entries are sorted by (topic, brokerName, queueId) — Java's
+// MessageQueue.compareTo. Only ConsumerRunningInfo.mqTable/mqPopTable are
+// TreeMaps where Java's order is deterministic, but sorting everywhere keeps
+// the output stable and byte-comparable with fastjson2's. (TopicStatsTable and
+// ConsumeStats use ConcurrentHashMap, ResetOffsetBody/GetConsumerStatusBody
+// HashMap — order is not part of their contract.)
+type mqKeyedJSON []mqKeyedEntry
+
+type mqKeyedEntry struct {
+	key   string // rendered inline-object text, written UNQUOTED
+	value any
+}
+
+// newMQKeyedJSON builds a sorted inline-object-keyed table.
+func newMQKeyedJSON[V any](table map[common.MessageQueue]V, render func(V) any) mqKeyedJSON {
+	queues := make([]common.MessageQueue, 0, len(table))
+	for q := range table {
+		queues = append(queues, q)
+	}
+	sort.Slice(queues, func(i, j int) bool { return compareMessageQueue(queues[i], queues[j]) < 0 })
+	out := make(mqKeyedJSON, 0, len(queues))
+	for _, q := range queues {
+		out = append(out, mqKeyedEntry{key: messageQueueKeyJSON(q), value: render(table[q])})
+	}
+	return out
+}
+
+// compareMessageQueue mirrors Java MessageQueue.compareTo: topic, then
+// brokerName, then queueId.
+func compareMessageQueue(a, b common.MessageQueue) int {
+	if a.Topic != b.Topic {
+		if a.Topic < b.Topic {
+			return -1
+		}
+		return 1
+	}
+	if a.BrokerName != b.BrokerName {
+		if a.BrokerName < b.BrokerName {
+			return -1
+		}
+		return 1
+	}
+	switch {
+	case a.QueueID < b.QueueID:
+		return -1
+	case a.QueueID > b.QueueID:
+		return 1
+	}
+	return 0
+}
+
+// MarshalJSON deliberately FAILS. An inline-object key is not valid JSON, so
+// encoding/json can neither emit it nor pass it through — it validates the
+// output of every Marshaler it calls (and without this method the slice would
+// silently serialise as a JSON ARRAY, which is worse than an error). A body
+// carrying one of these must be encoded with EncodeFastJSON.
+func (mqKeyedJSON) MarshalJSON() ([]byte, error) {
+	return nil, errMQKeyedNeedsFastJSON
+}
+
+var errMQKeyedNeedsFastJSON = errors.New(
+	"remoting: a MessageQueue-keyed table cannot go through encoding/json " +
+		"(fastjson2 writes the queue as an unquoted inline-object key); " +
+		"encode this body with EncodeFastJSON instead of EncodeJSON")
+
 // EncodeMQOffsetTable writes an ordered map with MessageQueue object keys.
-func EncodeMQOffsetTable(table MQOffsetTable) map[string]any {
-	out := make(map[string]any, len(table))
+func EncodeMQOffsetTable(table MQOffsetTable) mqKeyedJSON {
+	out := make(mqKeyedJSON, 0, len(table))
 	for _, e := range table {
-		out[messageQueueKeyJSON(e.Queue)] = e.Offset
+		out = append(out, mqKeyedEntry{key: messageQueueKeyJSON(e.Queue), value: e.Offset})
 	}
 	return out
 }
@@ -299,7 +428,7 @@ func (b *ResetOffsetBody) FromJSONValue(value any) error {
 	return nil
 }
 
-func (b *ResetOffsetBody) Encode() []byte { return EncodeJSON(b.ToJSONValue()) }
+func (b *ResetOffsetBody) Encode() []byte { return EncodeFastJSON(b.ToJSONValue()) }
 
 // DecodeResetOffsetBody parses a ResetOffsetBody.
 func DecodeResetOffsetBody(data []byte) (*ResetOffsetBody, error) {
@@ -450,7 +579,7 @@ func (b *GetConsumerStatusBody) FromJSONValue(value any) error {
 	return nil
 }
 
-func (b *GetConsumerStatusBody) Encode() []byte { return EncodeJSON(b.ToJSONValue()) }
+func (b *GetConsumerStatusBody) Encode() []byte { return EncodeFastJSON(b.ToJSONValue()) }
 
 // DecodeGetConsumerStatusBody parses a GetConsumerStatusBody.
 func DecodeGetConsumerStatusBody(data []byte) (*GetConsumerStatusBody, error) {

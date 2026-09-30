@@ -301,14 +301,15 @@ func (c *RemotingCommand) ToJSONValue() map[string]any {
 	return m
 }
 
+// numberAsI32 accepts the same set of numeric shapes as numberAsI64 (wire
+// literals, numeric strings, AND native Go numerics so an in-process
+// ToJSONValue -> FromJSONValue round-trip does not silently read back 0).
 func numberAsI32(v any) (int32, bool) {
-	switch t := v.(type) {
-	case JSONNumber:
-		if n, err := t.Int64(); err == nil {
-			return int32(n), true
-		}
-	case string:
-		if n, err := strconv.ParseInt(strings.TrimSpace(t), 10, 32); err == nil {
+	if n, ok := numberAsI64(v); ok {
+		return int32(n), true
+	}
+	if s, ok := v.(string); ok {
+		if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 32); err == nil {
 			return int32(n), true
 		}
 	}
