@@ -46,6 +46,12 @@ type processQueue struct {
 
 	msgAccCnt int64
 
+	// queueOffsetMax is Java ProcessQueue#queueOffsetMax: the highest offset
+	// ever put into the buffer (cleared by clear()). Java's removeMessage falls
+	// back to it when the buffer drains, which is how a batch that completes out
+	// of order still lets the cursor reach the end of the queue.
+	queueOffsetMax int64
+
 	lastPullTimestamp    int64 // unix millis
 	lastConsumeTimestamp int64 // unix millis of the last completion
 
@@ -76,10 +82,23 @@ func (pq *processQueue) PutMessage(msgs []*common.MessageExt) bool {
 			pq.order = insertOffset(pq.order, offset)
 		}
 		pq.msgs[offset] = msg
+		if offset > pq.queueOffsetMax {
+			pq.queueOffsetMax = offset
+		}
 	}
 	_ = valid
 	pq.msgAccCnt = computeMsgAccCnt(pq.msgAccCnt, msgs)
 	return wasEmpty && len(pq.msgs) > 0
+}
+
+// QueueOffsetMax is Java ProcessQueue#queueOffsetMax, kept as a running max
+// rather than "the last offset of the last put": a re-pulled batch always moves
+// forwards on a consume queue, so the two agree there, and the running max
+// cannot be dragged backwards by an out-of-order put.
+func (pq *processQueue) QueueOffsetMax() int64 {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return pq.queueOffsetMax
 }
 
 // computeMsgAccCnt is Java ProcessQueue#putMessage's tail: backlog size taken
@@ -270,10 +289,13 @@ func (pq *processQueue) RequeueBatch(batch []*common.MessageExt) {
 	pq.lastConsumeTimestamp = common.CurrentTimeMillis()
 }
 
-// RemoveMessage mirrors Java ProcessQueue#removeMessage: drop the given
-// messages and return the smallest offset STILL buffered, or -1 when nothing is
-// left. The caller uses it as the commit floor — without it the offset would
-// jump past messages that are still pending.
+// RemoveMessage drops the given messages and returns the smallest offset still
+// buffered (-1 when nothing is left). It is cleanExpiredMsg's remover: that
+// caller throws the result away, because the sweep only runs when the entry
+// really is the head. The ACK path must NOT use it — it has to consult the
+// buffer BEFORE mutating it (the removal and the commit write have to stay on
+// opposite sides of the consumer's lock), which is what MinRemainingExcept is
+// for.
 func (pq *processQueue) RemoveMessage(batch []*common.MessageExt) int64 {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -288,8 +310,12 @@ func (pq *processQueue) RemoveMessage(batch []*common.MessageExt) int64 {
 	return pq.order[0]
 }
 
-// MinRemainingExcept is the smallest buffered offset that is NOT in `skip`; -1
-// when there is none. Used as the commit floor after a partly-failed send-back.
+// MinRemainingExcept is Java ProcessQueue#removeMessage's first half: the
+// smallest buffered offset that is NOT in `skip`, i.e. what the head of the
+// buffer WILL be once the entries about to be acked are gone; -1 when nothing
+// would be left. `skip` must therefore be the ACKED set. Passing the FAILED set
+// instead inverts the guard — the floor would step over exactly the entries that
+// have to hold the cursor.
 func (pq *processQueue) MinRemainingExcept(skip []*common.MessageExt) int64 {
 	skipSet := make(map[int64]struct{}, len(skip))
 	for _, msg := range skip {
@@ -306,13 +332,15 @@ func (pq *processQueue) MinRemainingExcept(skip []*common.MessageExt) int64 {
 	return -1
 }
 
-// Clear empties the buffer (Java ProcessQueue#clear).
+// Clear empties the buffer (Java ProcessQueue#clear, which also zeroes
+// queueOffsetMax).
 func (pq *processQueue) Clear() {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	pq.msgs = map[int64]*common.MessageExt{}
 	pq.dispatched = map[int64]struct{}{}
 	pq.order = nil
+	pq.queueOffsetMax = 0
 }
 
 func (pq *processQueue) rebuildOrderLocked() {

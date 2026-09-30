@@ -123,11 +123,11 @@ func (c *DefaultMQPushConsumer) consumeConcurrentlyBatch(mq common.MessageQueue,
 		if dropped := len(batch) - ackIndex - 1; dropped > 0 {
 			common.LogWarnf("BROADCASTING, the message consume failed, drop it: %d msgs in %v", dropped, mq)
 		}
-		c.advanceConsumeOffset(mq, batch, -1, epoch)
+		c.commitConcurrently(mq, batch, epoch)
 		return true
 	}
 	if ackIndex+1 >= len(batch) {
-		c.advanceConsumeOffset(mq, batch, -1, epoch)
+		c.commitConcurrently(mq, batch, epoch)
 		return true
 	}
 	// Cluster mode: redeliver the unacked tail one by one to %RETRY%<group>
@@ -155,14 +155,45 @@ func (c *DefaultMQPushConsumer) consumeConcurrentlyBatch(mq common.MessageQueue,
 			acked = append(acked, msg)
 		}
 	}
+	// Java:266-269 — the commit is what removeMessage(msgs) answers, and `msgs`
+	// is the ACKED list (consumeRequest.getMsgs() minus msgBackFailed).
+	c.commitConcurrently(mq, acked, epoch)
+	return len(failed) == 0
+}
+
+// commitConcurrently is Java ProcessQueue#removeMessage + updateOffset for the
+// concurrent paths (both the clean ack and the partly-failed one).
+//
+// The target is the queue's high-water mark + 1 — NOT the end of this batch.
+// Batches of one queue are consumed in parallel, so the batch that finishes
+// second is not necessarily the one with the higher offsets: when the higher
+// batch finishes FIRST the buffer still holds the lower one, and Java answers
+// the lower batch's head; when the lower one finishes second the buffer drains
+// and Java answers the queue's end. Using the batch's own end as the drained
+// value would leave the cursor one batch short in the second case, and using
+// the FAILED set as the floor would make the first case step over the very
+// entries that were never handed to the broker.
+func (c *DefaultMQPushConsumer) commitConcurrently(mq common.MessageQueue, acked []*common.MessageExt, epoch uint64) {
+	drained := batchEnd(acked)
 	floor := int64(-1)
 	if pq := c.processQueueOf(mq); pq != nil {
-		floor = pq.MinRemainingExcept(failed)
+		drained = pq.QueueOffsetMax() + 1
+		floor = pq.MinRemainingExcept(acked)
 	}
-	// Java:266-269 — the commit is "largest offset in the batch + 1", and it
-	// must not jump past the messages still sitting in the ProcessQueue.
-	c.advanceConsumeOffset(mq, acked, floor, epoch)
-	return len(failed) == 0
+	c.advanceConsumeOffset(mq, acked, drained, floor, epoch)
+}
+
+// batchEnd is "the largest offset in the batch + 1" — the orderly path's commit
+// target (Java ProcessQueue#commit is lastKey + 1 over the batch it consumed
+// inline), and the concurrent path's fallback when there is no buffer to ask.
+func batchEnd(batch []*common.MessageExt) int64 {
+	next := int64(-1)
+	for _, msg := range batch {
+		if msg.QueueOffset > next {
+			next = msg.QueueOffset
+		}
+	}
+	return next + 1
 }
 
 // callConcurrently runs the listener with the Java exception rule: a panic is
@@ -279,13 +310,13 @@ func (c *DefaultMQPushConsumer) consumeOrderlyBatch(mq common.MessageQueue, batc
 				return false
 			}
 		}
-		c.advanceConsumeOffset(mq, batch, -1, epoch)
+		c.advanceConsumeOffset(mq, batch, batchEnd(batch), -1, epoch)
 		return true
 	}
 	// autoCommit == false (Java:270-300, the binlog path).
 	switch status {
 	case OrderlyCommit:
-		c.advanceConsumeOffset(mq, batch, -1, epoch)
+		c.advanceConsumeOffset(mq, batch, batchEnd(batch), -1, epoch)
 		return true
 	case OrderlyRollback:
 		if pq := c.processQueueOf(mq); pq != nil {
@@ -447,28 +478,31 @@ func (c *DefaultMQPushConsumer) doOrderlySendMessageBack(msg *common.MessageExt)
 
 // ------------------------------------------------------------------ offsets
 
-// advanceConsumeOffset is Java ConsumeMessageConcurrentlyService:266's
-// updateOffset.
+// advanceConsumeOffset is Java's updateOffset: it writes `drained` — the offset
+// to commit once the buffer holds nothing else — and then lowers it to `floor`,
+// the smallest offset that WILL still be buffered, whenever that is lower.
 //
-// epoch is the process-queue generation captured with the batch; a mismatch
-// means the queue was revoked or rebuilt (Java's `!processQueue.isDropped()`)
-// and the ack is void. A frozen offset (OFFSET_ILLEGAL recovery) must not move
-// either.
+// `drained` differs per path because Java's two services derive it from
+// different places: ConsumeMessageConcurrentlyService goes through
+// removeMessage, whose fallback is queueOffsetMax + 1 (see commitConcurrently),
+// while ConsumeMessageOrderlyService uses ProcessQueue#commit, i.e. lastKey + 1
+// over the batch it took inline. Feeding the concurrent value to the orderly
+// path (or the other way round) either skips messages or parks the queue.
+//
+// `batch` is the set being dropped from the buffer (Java's
+// consumeRequest.getMsgs() minus msgBackFailed). epoch is the process-queue
+// generation captured with the batch; a mismatch means the queue was revoked or
+// rebuilt (Java's `!processQueue.isDropped()`) and the ack is void. A frozen
+// offset (OFFSET_ILLEGAL recovery) must not move either.
 //
 // The two guards and the write share ONE critical section: revoke/reset bumps
 // the epoch under the same lock, so an in-flight ack cannot slip in between a
 // lock-free epoch read and a later write and push the corrected offset back.
-func (c *DefaultMQPushConsumer) advanceConsumeOffset(mq common.MessageQueue, batch []*common.MessageExt, floor int64, epoch uint64) {
+func (c *DefaultMQPushConsumer) advanceConsumeOffset(mq common.MessageQueue, batch []*common.MessageExt, drained int64, floor int64, epoch uint64) {
 	if len(batch) == 0 {
 		return
 	}
-	nextOffset := int64(-1)
-	for _, msg := range batch {
-		if msg.QueueOffset > nextOffset {
-			nextOffset = msg.QueueOffset
-		}
-	}
-	nextOffset++
+	nextOffset := drained
 	if floor >= 0 && floor < nextOffset {
 		nextOffset = floor
 	}

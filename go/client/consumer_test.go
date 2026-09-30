@@ -1017,6 +1017,171 @@ func TestConsumerReconsumeLaterSendsBackAndHoldsOffset(t *testing.T) {
 	}
 }
 
+// ackIndex truncates the ack to a PREFIX of the batch: everything after it is
+// handed back to the broker, and the committed offset must still move past the
+// whole batch. Java's processConsumeResult calls
+// `removeMessage(consumeRequest.getMsgs())` — the ACKED list — so with all three
+// messages in one batch the buffer empties and the commit is
+// `queueOffsetMax + 1` = 3. Deriving the floor from the FAILED set instead
+// inverts the guard: offset 0 is still buffered and is not in that set, so the
+// floor clamps the commit to 0 and a restart replays messages that were already
+// acknowledged.
+//
+// The batch is taken by hand rather than by the dispatcher because the pull loop
+// would overwrite the answer: with the buffer empty the next pull is NO_NEW_MSG
+// and correctTagsOffset moves the offset onto the pull cursor within the same
+// millisecond, hiding the value the ack itself wrote. The consumer therefore
+// subscribes to a DIFFERENT topic — that still installs the b1 route the
+// send-back needs, while leaving this queue unpulled. Found live by
+// examples/live_redelivery S4 (the broker held 0; the client-side correction
+// does not run there because the group's retry traffic keeps the queue busy).
+func TestConsumerPartialAckCommitsWholeBatch(t *testing.T) {
+	topic := uniqueTopic("GoConsumerAckIndex", t)
+	unpulled := uniqueTopic("GoConsumerAckIndexIdle", t)
+	const group = "GID_go_ack_index"
+
+	f := newClusterFixture(t, map[string]int{topic: 1, unpulled: 1})
+	msgs := f.broker.add(topic, 0, "ack-0", "ack-1", "ack-2")
+	mq := common.NewMessageQueue(topic, "b1", 0)
+
+	listener := newRecordingListener()
+	listener.onCall = func(_ []*common.MessageExt, ctx *ConsumeConcurrentlyContext) {
+		ctx.AckIndex = 0
+	}
+	c := f.newConsumer(t, group, listener, withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, unpulled, "*")
+
+	pq := newProcessQueue(false)
+	pq.PutMessage(msgs)
+	batch := pq.TakeBatch(3)
+	if len(batch) != 3 {
+		t.Fatalf("buffered %d messages, want 3", len(batch))
+	}
+	for _, msg := range batch {
+		msg.BrokerName = "b1" // sendMessageBack resolves the broker by name
+	}
+	c.mu.Lock()
+	c.processQueueTable[mq] = pq
+	c.mu.Unlock()
+
+	c.consumeConcurrentlyBatch(mq, batch, c.queueEpochOf(mq))
+	if got := len(f.broker.sendBackSnapshot()); got != 2 {
+		t.Fatalf("broker saw %d send-backs, want the 2 unacked messages", got)
+	}
+	offset, err := c.offsetStore.ReadOffset(mq, ReadFromMemory)
+	if err != nil {
+		t.Fatalf("read offset: %v", err)
+	}
+	if offset != 3 {
+		t.Errorf("consumed offset = %d after ackIndex=0 on a 3-message batch, want 3 "+
+			"(the whole batch left the buffer even though the tail was sent back)", offset)
+	}
+}
+
+// The send-back itself failing means the entry stays buffered and is re-consumed
+// locally later — so the FAILED entries are exactly what the commit must stop
+// at. Excluding them from the floor (the inverted derivation) makes the floor
+// the acked prefix and the commit steps over messages that were never handed
+// over; a crash then loses them. No instance and no broker route here, so every
+// send-back fails deterministically.
+func TestConsumerAckFloorCountsFailedSendBack(t *testing.T) {
+	topic := uniqueTopic("GoConsumerAckFailedBack", t)
+	const group = "GID_go_ack_failed"
+
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	msgs := f.broker.add(topic, 0, "f0", "f1", "f2")
+	mq := common.NewMessageQueue(topic, "b1", 0)
+
+	pq := newProcessQueue(false)
+	pq.PutMessage(msgs)
+	batch := pq.TakeBatch(3)
+	if len(batch) != 3 {
+		t.Fatalf("buffered %d messages, want 3", len(batch))
+	}
+
+	listener := newRecordingListener()
+	listener.onCall = func(_ []*common.MessageExt, ctx *ConsumeConcurrentlyContext) {
+		ctx.AckIndex = 0
+	}
+	c := MustNewDefaultMQPushConsumer(group)
+	requireNoError(t, "listener", c.SetMessageListener(listener))
+	// nil instance: QueryConsumerOffset / sendMessageBack both stay off the wire.
+	c.offsetStore = NewRemoteBrokerOffsetStore(nil, group)
+	c.mu.Lock()
+	c.processQueueTable[mq] = pq
+	c.mu.Unlock()
+
+	if c.consumeConcurrentlyBatch(mq, batch, c.queueEpochOf(mq)) {
+		t.Errorf("consumeConcurrentlyBatch reported a clean ack with every send-back failing")
+	}
+	offset, err := c.offsetStore.ReadOffset(mq, ReadFromMemory)
+	if err != nil {
+		t.Fatalf("read offset: %v", err)
+	}
+	// Java: removeMessage([f0]) leaves {f1,f2} buffered -> commit 1, NOT 3.
+	if offset != 1 {
+		t.Errorf("consumed offset = %d, want 1 (the smallest FAILED offset still buffered pins the commit)", offset)
+	}
+}
+
+// Batches of one queue are consumed in parallel, so the batch that finishes
+// second is not necessarily the one with the higher offsets. Java's
+// removeMessage returns the smallest offset still buffered, which for the
+// higher batch that finishes FIRST is the lower batch's head (0) — NOT its own
+// end. Committing 6 there means a crash before the lower batch is done skips
+// offsets 0..2 for good.
+func TestConsumerAckFloorHoldsForOutOfOrderBatches(t *testing.T) {
+	topic := uniqueTopic("GoConsumerAckOrder", t)
+	const group = "GID_go_ack_order"
+
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	msgs := f.broker.add(topic, 0, "o0", "o1", "o2", "o3", "o4", "o5")
+	mq := common.NewMessageQueue(topic, "b1", 0)
+
+	pq := newProcessQueue(false)
+	pq.PutMessage(msgs)
+	// TakeBatch marks them dispatched, so a dispatcher would never hand them out
+	// again; this test drives the two batches itself to fix the completion order
+	// (the real dispatcher would decide it with a race).
+	all := pq.TakeBatch(6)
+	if len(all) != 6 {
+		t.Fatalf("buffered %d messages, want 6", len(all))
+	}
+
+	c := MustNewDefaultMQPushConsumer(group)
+	requireNoError(t, "listener", c.SetMessageListener(newRecordingListener()))
+	c.offsetStore = NewRemoteBrokerOffsetStore(nil, group)
+	c.mu.Lock()
+	c.processQueueTable[mq] = pq
+	c.mu.Unlock()
+	epoch := c.queueEpochOf(mq)
+
+	// The HIGHER batch completes first.
+	if !c.consumeConcurrentlyBatch(mq, all[3:], epoch) {
+		t.Fatalf("the higher batch reported a failed send-back; nothing should be re-sent here")
+	}
+	offset, err := c.offsetStore.ReadOffset(mq, ReadFromMemory)
+	if err != nil {
+		t.Fatalf("read offset: %v", err)
+	}
+	if offset != 0 {
+		t.Errorf("consumed offset = %d after the higher batch (3..5) finished first, want 0 "+
+			"(offsets 0..2 are still buffered)", offset)
+	}
+
+	// The lower batch now finishes; the queue is drained, so the commit jumps to 6.
+	if !c.consumeConcurrentlyBatch(mq, all[:3], epoch) {
+		t.Fatalf("the lower batch reported a failed send-back; nothing should be re-sent here")
+	}
+	offset, err = c.offsetStore.ReadOffset(mq, ReadFromMemory)
+	if err != nil {
+		t.Fatalf("read offset: %v", err)
+	}
+	if offset != 6 {
+		t.Errorf("consumed offset = %d after both batches, want 6", offset)
+	}
+}
+
 // NO_NEW_MSG with an empty buffer must move the consumed offset onto the pull
 // cursor (Java correctTagsOffset); otherwise a queue whose messages the broker
 // filtered parks forever with nobody to ack it.

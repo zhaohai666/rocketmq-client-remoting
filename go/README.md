@@ -2,8 +2,9 @@
 
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
 适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / .NET / Rust 实现逐项对齐。
-**真机联调工具目前 5 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 / 停机竞态；
-其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里**不宣称「全部能力都已联调」**。
+**真机联调工具目前 6 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
+重投与死信 / 停机竞态；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
+**不宣称「全部能力都已联调」**。
 
 分层：
 
@@ -40,23 +41,23 @@ cd go
 go build ./...
 go vet ./...
 gofmt -l .        # 空输出才是过
-go test ./...     # 424 条，~9s
-go test -race ./client/   # 并发回归（lite 消费者、异步发送）
+go test ./...     # 427 条，~9s
+go test -race ./client/   # 并发回归（lite 消费者、异步发送、位点提交地板）
 ```
 
 ## 单元测试
 
-424 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
+427 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
 （`client/consumer_test.go` 里的 `clusterFixture`：真 socket 监听的假 broker + 假 name server，
 脚本化应答，能锁死请求码、ext 字段名与重试分类）：
 
 | 包 | 条数 | 覆盖 |
 | --- | --- | --- |
-| `client`（231） | producer 33 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、钩子各跑一次、发送头守卫 |
+| `client`（234） | producer 33 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、钩子各跑一次、发送头守卫 |
 | | async 27 | 真异步内核：换 broker 换 opaque、背压信号量、有界队满同步抛、回调恰好一次、预算共享 |
 | | transaction 6 | 两阶段 + 回查响应、单工 check 线程 |
 | | request_reply 13 | 326 holder、Request/AsyncRequest 超时 |
-| | consumer 26 | 长轮询、顺序重投闸门、流控、位点五 RPC、OFFSET_ILLEGAL、220、广播、关停在途消费 join + send-back 守卫 |
+| | consumer 29 | 长轮询、顺序重投闸门、流控、位点五 RPC、OFFSET_ILLEGAL、220、广播、关停在途消费 join + send-back 守卫、位点提交地板三条（部分 ack 整批提交 / 回投失败钉住位点 / 乱序批次不回跳） |
 | | lite_pull 9 | **361 + LITE 位上线**、双游标（NO_NEW_MSG 也跟 nextBeginOffset）、Seek 丢缓冲、提交表是**清扫**不是过滤、暂停恢复闸门、订阅模式重平衡 + 关停落盘 |
 | | pull_consumer 18 | 短轮询不带 SUSPEND 位、长轮询真挂起、调用方游标、sendMessageBack |
 | | admin 35 | topic/组 CRUD、分页合并、222 的 `isForce` 键名、26 号 body 是 Properties 文本 |
@@ -81,6 +82,8 @@ go run ./examples/live_consumer       -ns 127.0.0.1:9876 -topic T -group G -expe
                                                           # S1 收全且不重不漏（数据由 Python 侧灌）、S2 同组第二实例收不到、S3 客户端二次 tag 过滤、S4 顺序消费、S5 双实例切分、S6 优雅注销
 go run ./examples/live_pull           -ns 127.0.0.1:9876   # 手动 pull：Min/Max/SearchOffset、队头短轮询不挂起、空队尾 NO_NEW_MSG 不挂起、长轮询唤醒、调用方游标、KEYS 保留
 go run ./examples/live_lite_pull      -ns 127.0.0.1:9876   # assign 模式（双游标推进 / Commit / 重启续读不重放 / Seek 重放）、subscribe 模式重平衡 + 自动提交在 broker 读回
+go run ./examples/live_redelivery     -ns 127.0.0.1:9876 [-legs s1,s2,s3,s4]
+                                                          # S1 %RETRY% 二次投递 + delayLevel 3 延迟梯度 + topic 还原、S2 maxReconsumeTimes=2 ⇒ 3 次投递后 %DLQ% 且 recon=3、S3 顺序毒消息走「等 broker 回投」那条 DLQ 路径、S4 ackIndex 部分 ack（已 ack 的不回投 / 位点仍整批提交 / 对照组一条不回投）
 go run ./examples/live_shutdown_race  -ns 127.0.0.1:9876   # 立即关停 / 立即退进程的丢数据契约：并发回投两轮（%RETRY% → %DLQ%）、顺序挂起回投、短生命周期 trace 生产者冲尾批
 ```
 
@@ -90,12 +93,12 @@ go run ./examples/live_shutdown_race  -ns 127.0.0.1:9876   # 立即关停 / 立�
 bash scripts/run_go_producer_live.sh        # Go 生产 → Python 回读
 bash scripts/run_go_consumer_live.sh        # Python 生产 → Go 消费 → Python 从 broker 回读位点/注销
 bash scripts/run_go_pull_live.sh            # Go 拉取
+bash scripts/run_go_redelivery_live.sh      # 重投 / 死信终态 / 顺序死信 / ackIndex 部分 ack（全跑约 5~7 分钟）
 bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 live_shutdown_race）
 ```
 
-**尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：重投与死信（`%RETRY%` 重投计数 /
-`%DLQ%` 终态 / 顺序死信）、`ackIndex` 部分 ack、`OFFSET_ILLEGAL` 冻结重建与 220 重置位点
-（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
+**尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
+重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
 `cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
 ACL、TLS、SQL92、管理员端（库已就位但无真机工具）、压缩跨语言矩阵的 Go 腿。
 
@@ -133,7 +136,7 @@ go/
 │   ├── offset_store.go / route.go / broker_api.go / hooks.go
 │   ├── fault_strategy.go / semaphore.go / listener.go / send_result.go
 │   └── validators 走 common
-└── examples/                   5 个真机联调工具（见上，不依赖集群的没有）
+└── examples/                   6 个真机联调工具（见上，不依赖集群的没有）
 ```
 
 ## 几个必须知道的实现约定
@@ -155,6 +158,23 @@ go/
 （Java RemoteBrokerOffsetStore："offset is not in mqs, remove it"）—— 游标持有者之外的
 陈旧位点会随这次提交一起蒸发，这是刻意的 Java 语义。空表整个跳过不碰网络，`-1` 游标
 不上线（"consumerOffset is -1"）。
+
+**位点提交地板按 Java `ProcessQueue#removeMessage` 算。** 并发 ack 的目标是「缓冲里**还剩下**的
+最小 offset」，缓冲被清空时退回 `queueOffsetMax + 1`；被清掉的是**已 ack 的那批**
+（`consumeRequest.getMsgs()` 减掉回投失败的），所以 `ackIndex` 部分 ack 时钉住位点的是
+「没被 ack、仍留在缓冲里」的那些，**不含**已经交回 broker 的尾巴。两个反例都实测过：
+把回投**失败**的那些从地板里排除，位点会跨过它们（崩溃即丢）；把目标当成「本批末位 + 1」，
+更高位那批先完成时位点会停在本批（真实 broker 上读回 0，而 Java 是 3）。顺序侧**不同**：
+Java 走 `commit()` = 本批 `lastKey + 1`（顺序是内联消费，同队列同时只有一批在跑）。
+两者混用要么漏消息要么把队列钉死。
+
+**两条死信上限用的不是同一个比较符。** `CONSUMER_SEND_MSG_BACK(36)` 走
+`AbstractSendMessageProcessor.consumerSendMsgBack`，判据是 `reconsumeTimes >= maxReconsumeTimes`；
+顺序侧的「普通发送到 `%RETRY%`」走 `SendMessageProcessor.handleRetryAndDLQ`，判据是
+`reconsumeTimes > maxReconsumeTimes`（**严格大于**），并且先看
+`RebalanceLockManager.isLockAllExpired` —— 组还持着队列锁就直接进 `%DLQ%`，根本不排队。
+另外 `RECONSUME_TIME` 的 `+1` 只有顺序侧在**客户端**加（`ConsumeMessageOrderlyService:350`），
+并发侧那个 `+1` 是 **broker** 加的，客户端写的是原值。
 
 **lite 是独立上线身份。** 请求码 361 + `FLAG_LITE_PULL_MESSAGE` sysFlag 位 + 心跳
 `ConsumerData` 的 LITE 位 + `CONSUME_ACTIVELY`；心跳是消费者自持循环（不进实例的
