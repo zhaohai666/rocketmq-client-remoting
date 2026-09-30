@@ -225,6 +225,10 @@ func main() {
 `go/examples/live_*`），覆盖收发全链路、重投与死信、位点管理、流控、POP、TLS 等。
 全部工具自断言、失败以非 0 退出码收口，具体清单见各语言 README。
 
+**覆盖面不是五端齐平的**：Python / C++ / .NET / Rust 四端各有 30 余个真机工具，
+Go 目前只有 5 个（发送 / 消费 / 拉取 / 轻量拉取 / 停机竞态），其余场景 Go 侧待补 ——
+`go/README.md` 的「真实集群联调」一节逐项列出未覆盖清单。
+
 部分用例有额外要求（在脚本头注释里写明）：主从集群（Broker 从节点）、
 `traceTopicEnable=true`、`enablePropertyFilter=true`、`recallMessageEnable`、
 ACL 鉴权等；停 broker 类用例会自行拉起并把配置还原。

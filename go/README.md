@@ -1,8 +1,9 @@
 # rocketmq-client-remoting (Go)
 
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
-适配 RocketMQ 4.x / 5.x 集群，全部能力在真实 5.5.1 集群上联调验证过；与本仓库的
-Python / C++ / .NET / Rust 实现逐项对齐。
+适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / .NET / Rust 实现逐项对齐。
+**真机联调工具目前 5 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 / 停机竞态；
+其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里**不宣称「全部能力都已联调」**。
 
 分层：
 
@@ -23,12 +24,14 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动 |
 | 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询 |
 | 消息轨迹 | 客户端轨迹生产：Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录，Java `TraceDataEncoder` **逐字节**对齐（真值向量见单测）；`AsyncTraceDispatcher`（2048 有界丢弃 + 批 20 + 128K 分片 + 5s 冲刷 + 关停冲尾批）、内部生产者与 topic 前缀两道防自噬、W3C `traceparent` 注入与透传（`ROCKETMQ_TRACE_CONTEXT_ENABLE`） |
-| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、消费侧统计、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
+| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、消费侧状态查询（221 位点表）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
+| 未实现（与其它四端的差距） | **POP 消费**（`ReqPopMessage` 等常量已声明但零引用）、**消费侧统计**（`ConsumerStatsManager` 的 RT/TPS；只有 221 位点表）、**消费侧 307 应答器**（307 仅管理端发起）、**selfcheck 工具** |
 | 校验门 | `Validators` / `TopicValidator`：组名 / topic 校验在 `start()` 建客户端实例**之前**本地跑完，失败不碰网络 |
 
 **与其它四个端口的刻意差异 —— 压缩只有 ZLIB**：标准库没有 LZ4/ZSTD，而本模块承诺零第三方
 依赖，所以这两种类型**大声报 `unsupported` 错误**，绝不把压缩流当正文透传（消费端解错就是
-静默垃圾）。zlib 段的线上格式与其它语言互通（`scripts/compression_matrix.sh` 的 Go 腿）。
+静默垃圾）。zlib 段的线上格式与其它语言互通；注意 `scripts/compression_matrix.sh`（跨语言
+压缩矩阵）目前只覆盖 python / cpp / dotnet / rust，**Go 腿还没接**。
 
 ## 构建与检查
 
@@ -66,17 +69,35 @@ go test -race ./client/   # 并发回归（lite 消费者、异步发送）
 
 ## 真实集群联调
 
-需要跑着 nameServer(9876) + broker(10911)、且 `autoCreateTopicEnable=true` 的集群。
+需要跑着 nameServer(9876) + broker(10911)、且 `autoCreateTopicEnable=true` 的集群
+（停机竞态那条另外要求 `traceTopicEnable=true`，否则 `RMQ_SYS_TRACE_TOPIC` 不预建）。
 这些工具**不进 `go test`**，依赖外部集群；全部自断言，任何一项失败进程以非 0 退出码结束，
 收口行 `PASS=<n> FAIL=<n>`：
 
 ```bash
 cd go
-go run ./examples/live_producer    -ns 127.0.0.1:9876   # 六条发送路径/事务两阶段+回查/批量/撤回 recallMessage/异步内核/Request-Reply
-go run ./examples/live_consumer    -ns 127.0.0.1:9876   # 长轮询/tag 过滤/%RETRY% 重投/%DLQ% 死信/顺序死信/位点五 RPC/OFFSET_ILLEGAL
-go run ./examples/live_pull        -ns 127.0.0.1:9876   # 手动 pull 不重不漏、空队尾短轮询不挂起、长轮询唤醒/到期、调用方游标、send-back
-go run ./examples/live_lite_pull   -ns 127.0.0.1:9876   # assign 模式端到端、重启续读不重放、Seek 重放、订阅模式自动提交在 broker 读回
+go run ./examples/live_producer       -ns 127.0.0.1:9876   # 六条发送路径、SendResult 形状（msgId==UNIQ_KEY / offsetMsgId / queueOffset / regionId）、事务两阶段 + broker 回查、异步内核（回调恰好一次 / 定点 / 选择器 / 批 / 背压许可归还）
+go run ./examples/live_consumer       -ns 127.0.0.1:9876 -topic T -group G -expect 12 -orderly-topic T2 -orderly-expect 6
+                                                          # S1 收全且不重不漏（数据由 Python 侧灌）、S2 同组第二实例收不到、S3 客户端二次 tag 过滤、S4 顺序消费、S5 双实例切分、S6 优雅注销
+go run ./examples/live_pull           -ns 127.0.0.1:9876   # 手动 pull：Min/Max/SearchOffset、队头短轮询不挂起、空队尾 NO_NEW_MSG 不挂起、长轮询唤醒、调用方游标、KEYS 保留
+go run ./examples/live_lite_pull      -ns 127.0.0.1:9876   # assign 模式（双游标推进 / Commit / 重启续读不重放 / Seek 重放）、subscribe 模式重平衡 + 自动提交在 broker 读回
+go run ./examples/live_shutdown_race  -ns 127.0.0.1:9876   # 立即关停 / 立即退进程的丢数据契约：并发回投两轮（%RETRY% → %DLQ%）、顺序挂起回投、短生命周期 trace 生产者冲尾批
 ```
+
+脚本（**起集群 + 等端口 + 跑验证 + 收工都在同一条命令内**，别拆开跑）：
+
+```bash
+bash scripts/run_go_producer_live.sh        # Go 生产 → Python 回读
+bash scripts/run_go_consumer_live.sh        # Python 生产 → Go 消费 → Python 从 broker 回读位点/注销
+bash scripts/run_go_pull_live.sh            # Go 拉取
+bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 live_shutdown_race）
+```
+
+**尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：重投与死信（`%RETRY%` 重投计数 /
+`%DLQ%` 终态 / 顺序死信）、`ackIndex` 部分 ack、`OFFSET_ILLEGAL` 冻结重建与 220 重置位点
+（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
+`cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
+ACL、TLS、SQL92、管理员端（库已就位但无真机工具）、压缩跨语言矩阵的 Go 腿。
 
 ## 目录结构
 
@@ -112,7 +133,7 @@ go/
 │   ├── offset_store.go / route.go / broker_api.go / hooks.go
 │   ├── fault_strategy.go / semaphore.go / listener.go / send_result.go
 │   └── validators 走 common
-└── examples/                   4 个真机联调工具（见上，不依赖集群的没有）
+└── examples/                   5 个真机联调工具（见上，不依赖集群的没有）
 ```
 
 ## 几个必须知道的实现约定
