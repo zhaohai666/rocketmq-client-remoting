@@ -11,8 +11,9 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 - 适配 RocketMQ 4.x / 5.x 集群，全量联调基于 **5.5.1**（NameServer 9876 + Broker 10911）。
 
 五个实现之间的收发互通是**硬要求**：任一语言发出的消息（含 zlib / LZ4 / ZSTD 压缩体）
-其余语言都能解开，`scripts/compression_matrix.sh` 会在真实集群上把 Python/C++/.NET/Rust
-四端 4×2 的压缩矩阵整体跑一遍（Go 只实现 ZLIB，LZ4/ZSTD 刻意大声报错而不是透传，
+其余语言都能解开，`scripts/compression_matrix.sh` 会在真实集群上把 Python/C++/.NET/Rust/Go
+**五端**的压缩矩阵整体跑一遍（Go 只实现 ZLIB —— LZ4/ZSTD 刻意大声报错而不是透传，
+所以非 zlib 的 codec 里含 Go 的腿会被跳过，那两种格式仍由另外四端互测覆盖，
 见 [`go/README.md`](go/README.md)）。
 
 ## 能力总览

@@ -5,7 +5,7 @@
 # **A 端压出来的字节 B 端能不能解开** —— 而压缩解错的失败模式是静默数据损坏
 # （拿到压缩字节当正文，不报错），只有真机 + 真跨客户端才暴露得出来。
 #
-# 四端（python / cpp / dotnet / rust）载荷由各自本地按同一配方重建（同一行文本重复后
+# 五端（python / cpp / dotnet / rust / go）载荷由各自本地按同一配方重建（同一行文本重复后
 # 截断），所以判定只看接收端打印的 `match=1`，**不要**比两边打印的 CRC 数字
 # （Java 口径的 UtilAll.crc32 会 & 0x7FFFFFFF，本仓库四端都用标准 CRC-32）。
 #
@@ -18,7 +18,12 @@
 #   cpp/build/examples/rmq_compression_live
 #   dotnet 示例已 build（用 dotnet run --no-build）
 #   rust example: cargo build --example live_compression_matrix
+#   go 端由本脚本自己 build（零第三方依赖，标准库编译即可）
 # 以及一个 autoCreateTopicEnable=true 的 nameServer(9876)+broker(10911)。
+#
+# ⚠ Go 端只有 zlib：标准库没有 LZ4/ZSTD，而本模块承诺零第三方依赖，所以这两种类型
+#   明确报 unsupported（绝不把压缩流当正文透传）。所以 codec != zlib 时**所有含 Go 的
+#   腿都 SKIP**，zstd / lz4 的跨语言互通仍由另外四端互测覆盖（python 端沿用原判断）。
 #
 # ⚠ python 端没有 zstandard 时**明确抛错**而不是静默透传（message_decoder._zstd），
 # 所以 zstd 矩阵里 python 必然失败 —— 那不是互通性问题，脚本直接 SKIP 掉，
@@ -76,6 +81,18 @@ cat > "$BIN/rs_recv" <<EOF
 #!/bin/bash
 exec $RSBIN recv "\$1" "\$2" $SIZE $NS
 EOF
+# go 端：现场 build 成二进制（和 rust 一样，避免每条腿都重新编译一次）。
+GO=${RMQ_GO:-go}
+(cd "$ROOT/go" && $GO build -o "$BIN/go_compression" ./examples/live_compression_matrix) \
+  || { echo "go 端 build 失败（需要 go 工具链）" >&2; exit 2; }
+cat > "$BIN/go_send" <<EOF
+#!/bin/bash
+exec $BIN/go_compression send "\$1" "\$2" $SIZE $NS $CODEC
+EOF
+cat > "$BIN/go_recv" <<EOF
+#!/bin/bash
+exec $BIN/go_compression recv "\$1" "\$2" $SIZE $NS
+EOF
 chmod +x "$BIN"/*
 
 fail=0
@@ -85,6 +102,10 @@ run_pair() { # label  sender  receiver
   echo "----- $1 [$CODEC]: $2 send -> $3 recv"
   if [[ $CODEC == zstd && ( $2 == py_* || $3 == py_* ) ]]; then
     echo "  RESULT=SKIPPED (python venv has no zstandard; see message_decoder._zstd)"
+    return
+  fi
+  if [[ $CODEC != zlib && ( $2 == go_* || $3 == go_* ) ]]; then
+    echo "  RESULT=SKIPPED (go port is zlib-only: stdlib has no LZ4/ZSTD, module takes no deps)"
     return
   fi
   local sout rout lout line
@@ -116,5 +137,15 @@ run_pair rs2cpp rs_send cpp_recv
 run_pair net2rs net_send rs_recv
 run_pair rs2net rs_send net_recv
 run_pair rs2rs rs_send rs_recv
+# Go 腿（每个方向都覆盖：发送与接收各一条）
+run_pair go2go go_send go_recv
+run_pair go2py go_send py_recv
+run_pair py2go py_send go_recv
+run_pair go2cpp go_send cpp_recv
+run_pair cpp2go cpp_send go_recv
+run_pair go2net go_send net_recv
+run_pair net2go net_send go_recv
+run_pair go2rs go_send rs_recv
+run_pair rs2go rs_send go_recv
 echo "MATRIX_DONE codec=$CODEC stamp=$STAMP fail=$fail"
 exit $fail

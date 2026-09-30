@@ -35,8 +35,10 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 
 **与其它四个端口的刻意差异 —— 压缩只有 ZLIB**：标准库没有 LZ4/ZSTD，而本模块承诺零第三方
 依赖，所以这两种类型**大声报 `unsupported` 错误**，绝不把压缩流当正文透传（消费端解错就是
-静默垃圾）。zlib 段的线上格式与其它语言互通；注意 `scripts/compression_matrix.sh`（跨语言
-压缩矩阵）目前只覆盖 python / cpp / dotnet / rust，**Go 腿还没接**。
+静默垃圾）。zlib 段的线上格式与其它语言互通，`scripts/compression_matrix.sh`（跨语言
+压缩矩阵）已接入 Go 腿（`examples/live_compression_matrix`，9 个方向：go↔go / go↔python /
+go↔cpp / go↔net / go↔rust）；**非 zlib 的 codec 会跳过 Go**（Go 压不出 lz4 / zstd，
+跳过后 lz4 / zstd 的互通仍由另外四端互测覆盖）。
 
 ## 构建与检查
 
@@ -136,7 +138,7 @@ bash scripts/run_go_admin_live.sh           # 管理端（29 项，自断言；�
 **尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
 重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
 `cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
-ACL、TLS、SQL92、压缩跨语言矩阵的 Go 腿，
+ACL、TLS、SQL92，
 以及 **307/309 的真实 broker 往返**（`mqadmin consumerStatus -s` 走的就是这两条；目前只在
 进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
 
