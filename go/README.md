@@ -4,7 +4,9 @@ Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 
 适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / .NET / Rust 实现逐项对齐。
 **真机联调工具目前 6 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
 重投与死信 / 停机竞态；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
-**不宣称「全部能力都已联调」**。
+**不宣称「全部能力都已联调」**。另有一个**不依赖集群**的离线自检
+（`go run ./examples/selfcheck`，见「离线自检」）—— 它与 Python / C++ / .NET 三端的同名工具对齐，
+**不是** Java 的机制（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令）。
 
 分层：
 
@@ -28,7 +30,7 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询 |
 | 消息轨迹 | 客户端轨迹生产：Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录，Java `TraceDataEncoder` **逐字节**对齐（真值向量见单测）；`AsyncTraceDispatcher`（2048 有界丢弃 + 批 20 + 128K 分片 + 5s 冲刷 + 关停冲尾批）、内部生产者与 topic 前缀两道防自噬、W3C `traceparent` 注入与透传（`ROCKETMQ_TRACE_CONTEXT_ENABLE`） |
 | 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、POP 消费（200050/200051/200052 + 检查点反构）、消费侧状态与运行信息应答（221 位点表 / 307 / 309）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
-| 未实现 | **selfcheck 工具** —— 但这不是与 Java 的差距：**Java 客户端根本没有这个机制**（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令），要做就是从零设计，见下方待办 |
+| 离线自检 | `examples/selfcheck`：**不依赖集群**的协议层自检 10 项（JSON / 二进制双帧回环、`clientID` 键拼写、V2 单字母短键集、17 段消息回环含派生 msgId、magic-v2 超长 topic 手工夹具、6 段批量、Crc32 向量、ACL 签名注入） |
 | 校验门 | `Validators` / `TopicValidator`：组名 / topic 校验在 `start()` 建客户端实例**之前**本地跑完，失败不碰网络 |
 
 **与其它四个端口的刻意差异 —— 压缩只有 ZLIB**：标准库没有 LZ4/ZSTD，而本模块承诺零第三方
@@ -73,6 +75,32 @@ go test -race ./client/   # 并发回归（lite 消费者、异步发送、位�
 | | trace 30 | Java 编码器**逐字节**真值向量、解码容错（无 keys 空段、坏记录只跳过自己）、SubBefore/SubAfter 共用 requestId + contextCode 五档、traceparent 注入与校验、分发器防自噬，以及两条**进程内真集群**端到端（Pub 落轨迹 topic 且不递归 / 消费对落盘并配对） |
 | `common`（111） | 111 | 17 段编解码（坏数据拒收、压缩段 crc32）、消息模型、clientId 口径、recall 句柄真值向量、namespace、sysflag 位表、ExtraInfo 8 段、校验器 |
 | `remoting`（133） | 133 | 真 socket 回环（同步/异步/oneway、半包、并发 opaque、静默超时）、TLS、ACL 签名、V2 短键名守卫（错一个字母就**静默丢字段**）、JSON 容错（裸数字键、对象 key、NaN）、**fastjson2 出站写入器**（MessageQueue 内联对象键 + Java double 格式）、`CurrentVersion`/`CurrentVersionDesc` 成对守卫、心跳装配、POP 与 ClientInfo body 形状 |
+
+## 离线自检
+
+不需要集群、也不需要跑整套单测的协议层冒烟：
+
+```bash
+cd go
+go run ./examples/selfcheck
+```
+
+10 项，逐条打印 `[PASS]` / `[FAIL]`，任一项失败进程以非 0 退出码结束，收口行
+`selfcheck: ALL PASS (PASS=10 FAIL=0)`。与 `python -m rocketmq selfcheck`（7 项）、
+`cpp/examples/selfcheck.cpp`（3 项）、`dotnet` 的 `selfcheck` 子命令（3 项）同名同用途，
+是**动真机之前**最便宜的一道门。**Rust 侧没有这个工具**（`rust/examples/` 全是需要集群的
+`live_*`），它的协议层离线覆盖由 `cargo test` 的 895 条单测承担 —— 所以这里是 4/5 端对齐。
+
+覆盖：JSON 帧回环（含**不转义** `<>&`、中文 remark、extFields 全等）、ROCKETMQ 私有二进制帧回环
+（并断言协议类型确实走在打包头长度的高位）、`HEART_BEAT` 的 `clientID` **键拼写**、`SendMessageRequestHeaderV2`
+**恰好**是单字母键 `a..n`（多写一个长名会被 broker 静默丢弃，且只验值的话查不出来）、17 段消息回环
+（含派生的 `msgId`/`offsetMsgId`）、magic-v2 超长 topic（>255B）解码、6 段批量回环、`msgId` 反解、
+Crc32 标准向量、ACL 签名注入（AccessKey/SecurityToken 必须在算签名**之前**进 extFields，SecretKey 不上线）。
+
+两处刻意做成**字节级**而非"回环一下"：magic-v2 那条是**手工拼**的 broker 帧且 properties 硬编码
+（编解码都是自己的话，对称 bug 会让回环照过）；Crc32 直接钉向量 —— 因为 Java 的 `UtilAll.crc32`
+返回 `(int)(value & 0x7FFFFFFF)`（砍最高位），与标准 CRC-32 差 2^31，跨语言**绝不能**直接比 crc
+（只比各自 `match` 字段；解码侧 `CheckCRC` 默认关，互通才成立）。
 
 ## 真实集群联调
 
@@ -144,7 +172,7 @@ go/
 │   ├── offset_store.go / route.go / broker_api.go / hooks.go
 │   ├── fault_strategy.go / semaphore.go / listener.go / send_result.go
 │   └── validators 走 common
-└── examples/                   6 个真机联调工具（见上，不依赖集群的没有）
+└── examples/                   selfcheck（不依赖集群）+ 6 个真机联调工具（见上）
 ```
 
 ## 几个必须知道的实现约定

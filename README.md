@@ -225,6 +225,11 @@ func main() {
 `go/examples/live_*`），覆盖收发全链路、重投与死信、位点管理、流控、POP、TLS 等。
 全部工具自断言、失败以非 0 退出码收口，具体清单见各语言 README。
 
+另有一个**不依赖集群**的协议层离线自检，Python / C++ / .NET / Go 四端各有一份
+（`python -m rocketmq selfcheck`、`cpp` 的 `rmq_selfcheck`、`dotnet` 的 `selfcheck` 子命令、
+`go run ./examples/selfcheck`）：跑编解码回环与关键常量 / 字段名，是动真机之前最便宜的一道门。
+Rust 侧没有这个工具（`rust/examples/` 全是需要集群的 `live_*`），其协议层离线覆盖由 `cargo test` 承担。
+
 **覆盖面不是五端齐平的**：Python / C++ / .NET / Rust 四端各有 30 余个真机工具，
 Go 目前只有 6 个（发送 / 消费 / 拉取 / 轻量拉取 / 重投与死信 / 停机竞态），其余场景 Go 侧待补 ——
 `go/README.md` 的「真实集群联调」一节逐项列出未覆盖清单。
