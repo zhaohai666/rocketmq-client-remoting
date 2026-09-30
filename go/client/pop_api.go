@@ -233,10 +233,26 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 				built[key] = checkpoint
 			}
 			msg.PutProperty(common.PropertyPopCk, checkpoint+common.KeySeparator+i64Text(msg.QueueOffset))
-		} else {
+		} else if propertyOf(msg, common.PropertyPopCk) == "" {
+			// Java guards this whole branch with `getProperty(POP_CK) == null`:
+			// when the broker already stamped a checkpoint, KEEP IT.
+			//
+			// That guard is load-bearing on the default retry path. With
+			// brokerConfig.popResponseReturnActualRetryTopic=false the broker
+			// builds the checkpoint from the PHYSICAL retry topic, so segment 4
+			// (the retry marker) is "1", stamps it with putIfAbsent, and only
+			// THEN rewrites msg.Topic to the business topic
+			// (PopMessageProcessor:849-853). By the time the client sees the
+			// message the topic has already been rewritten, so rebuilding from
+			// the message would resolve the marker to "0" and derive the ACK
+			// topic as the business topic — where the broker holds no such
+			// checkpoint. The ACK then becomes a silent no-op whose only
+			// symptom is "the message keeps coming back after popInvisibleTime".
+			//
 			// The lookup key is the message's OWN topic as decoded, which is
 			// still the physical topic at this point (the request topic is
-			// stamped on at the end of the loop). For a retried message that is
+			// stamped on at the end of the loop). For a retried message with
+			// popResponseReturnActualRetryTopic=true that is
 			// `%RETRY%<group>_<topic>`, so the marker resolves to "1" and the
 			// entry lines up with the one the broker emitted.
 			queueIDKey := common.GetStartOffsetInfoMapKey(msg.Topic, int64(msg.QueueID))

@@ -1674,6 +1674,22 @@ func (c *DefaultMQPushConsumer) ProcessQueueCount() int {
 	return len(c.processQueueTable)
 }
 
+// LocalOffsetCount is the number of queues this consumer holds a CLIENT-SIDE
+// offset for.
+//
+// It exists to pin the POP rule that has no broker-side observable: a POP
+// consumer keeps no cursor at all (the broker's revive queue is the cursor), so
+// this must stay 0 in POP mode. The broker's ConsumerOffsetManager DOES hold an
+// offset for a POP group, but the broker writes that itself
+// (PopMessageProcessor#getInitOffset commits with the label "getPopOffset"), so
+// reading it back proves nothing about the client. This is the client-side half
+// of the contract.
+func (c *DefaultMQPushConsumer) LocalOffsetCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.offsetTable)
+}
+
 // FlowControlTriggered counts flow-control pauses (live diagnostics).
 func (c *DefaultMQPushConsumer) FlowControlTriggered() int64 {
 	c.mu.Lock()

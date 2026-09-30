@@ -292,6 +292,55 @@ func TestPopRetryCheckpointResolvesToPopRetryTopic(t *testing.T) {
 	}
 }
 
+// On the DEFAULT retry path (brokerConfig.popResponseReturnActualRetryTopic =
+// false) the broker stamps the checkpoint itself and rewrites msg.Topic to the
+// business topic before the client ever sees it (PopMessageProcessor:849-853).
+// The client must then keep the broker's checkpoint verbatim.
+//
+// The fixture is built to be the trap: the tables are keyed by the BUSINESS
+// topic, so a client that blindly rebuilds would SUCCEED and silently change the
+// marker from "1" to "0" — sending the ACK to the business topic, where the
+// broker holds no checkpoint. Nothing would fail until the messages came back.
+func TestPopKeepsBrokerCheckpointOnRewrittenRetryTopic(t *testing.T) {
+	popTime := common.CurrentTimeMillis()
+	const group = "PopRewrittenGroup"
+	physical := common.BuildPopRetryTopicV1("TopicA", group)
+	// What the broker built (from the PHYSICAL topic, hence marker "1") and
+	// stamped with putIfAbsent.
+	brokerCk := "5 " + i64Text(popTime) + " 60000 3 1 b1 0 5"
+
+	inst := newTestInstanceForPop(t)
+	broker := inst.broker
+	broker.setPopFixture(popFixtureOf("TopicA", "b1", 0, 5, 1, popTime, 60000))
+	msg := popMessage("TopicA", 0, 5, "retried")
+	msg.PutProperty(common.PropertyPopCk, brokerCk)
+	broker.mu.Lock()
+	broker.popFixture.msgs = []*common.MessageExt{msg}
+	broker.mu.Unlock()
+
+	result, err := popOnceForTest(inst, "TopicA", 0)
+	if err != nil {
+		t.Fatalf("pop: %v", err)
+	}
+	if got := propertyOf(result.MsgFoundList[0], common.PropertyPopCk); got != brokerCk {
+		t.Fatalf("checkpoint was rebuilt\n got=%q\nwant=%q (the broker's)", got, brokerCk)
+	}
+	// The surviving marker still resolves the ACK to the POP retry topic, which
+	// is where the checkpoint actually lives.
+	parts := common.SplitExtraInfo(brokerCk)
+	if got := common.GetRealTopic(parts, "TopicA", group); got != physical {
+		t.Fatalf("ACK topic = %q, want %q", got, physical)
+	}
+	// 1ST_POP_TIME is computeIfAbsent in Java (MQClientAPIImpl:1224): absent
+	// here, so it is stamped; and the listener still sees the request topic.
+	if v := propertyOf(result.MsgFoundList[0], common.PropertyFirstPopTime); v != i64Text(popTime) {
+		t.Fatalf("1ST_POP_TIME = %q", v)
+	}
+	if result.MsgFoundList[0].Topic != "TopicA" {
+		t.Fatalf("listener topic = %q", result.MsgFoundList[0].Topic)
+	}
+}
+
 // ---------------------------------------------------------------- full consumer
 
 // popFixtureWithConsumer starts the mock cluster and a POP consumer on it.
