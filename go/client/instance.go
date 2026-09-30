@@ -406,6 +406,22 @@ func (i *Instance) registerClientProcessors() {
 	i.remoting.RegisterProcessor(remoting.ReqGetConsumerRunningInfo, i.processGetConsumerRunningInfo)
 	i.remoting.RegisterProcessor(remoting.ReqConsumeMessageDirectly, i.processConsumeMessageDirectly)
 	i.remoting.RegisterProcessor(remoting.ReqPushReplyMessageToClient, i.processReplyMessage)
+	i.remoting.RegisterProcessor(remoting.ReqNotifyUnsubscribeLite, i.processNotifyUnsubscribeLite)
+}
+
+// processNotifyUnsubscribeLite (200073) is registered for exactly one reason:
+// to keep it off the "no processor for request code" WARN path.
+//
+// Java's MQClientAPIImpl registers this code against the shared
+// ClientRemotingProcessor, and that processor's switch has NO case for it — so
+// Java falls through to `default: break; return null;` and answers nothing, and
+// the broker only ever sends it with invokeOneway (Broker2Client:66) so nothing
+// is waiting for an answer. In other words the whole feature is vestigial on the
+// classic-remoting path (only the gRPC proxy's ProxyClientRemotingProcessor acts
+// on it). Reproducing Java means doing nothing here — deliberately NOT even
+// calling sink.Respond, because Java would not reply to a sync sender either.
+func (i *Instance) processNotifyUnsubscribeLite(_ *remoting.RemotingCommand, addr string, _ *remoting.ResponseSink) {
+	common.LogDebugf("remoting: NOTIFY_UNSUBSCRIBE_LITE(200073) from %s; nothing to do on the classic path", addr)
 }
 
 // ackIfWanted answers the push. Java's processor returns null (no reply) for

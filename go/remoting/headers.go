@@ -765,6 +765,36 @@ type NotifyConsumerIdsChangedRequestHeader struct {
 	ConsumerGroup *string
 }
 
+// NotifyUnsubscribeLiteRequestHeader mirrors Java
+// org.apache.rocketmq.remoting.protocol.header.NotifyUnsubscribeLiteRequestHeader
+// (NOTIFY_UNSUBSCRIBE_LITE = 200073). All three fields are @CFNotNull there, but
+// they are pointers here because the classic client never reads them: Java's
+// registered ClientRemotingProcessor has no case for 200073, so the request is
+// answered with silence (see Instance.processNotifyUnsubscribeLite). The struct
+// exists so the shape is declared and the ext-field spellings are pinned.
+//
+// Its Java superclass RpcRequestHeader is an empty abstract marker, so these
+// three are the whole header.
+type NotifyUnsubscribeLiteRequestHeader struct {
+	LiteTopic     *string
+	ConsumerGroup *string
+	ClientID      *string
+}
+
+// FromExtFields reads the Java property names (clientId, not clientID).
+func (h *NotifyUnsubscribeLiteRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.LiteTopic = getStr(ext, "liteTopic")
+	h.ConsumerGroup = getStr(ext, "consumerGroup")
+	h.ClientID = getStr(ext, "clientId")
+}
+
+// ToExtFields writes the Java property names.
+func (h *NotifyUnsubscribeLiteRequestHeader) ToExtFields(out *common.StringMap) {
+	putStr(out, "liteTopic", h.LiteTopic)
+	putStr(out, "consumerGroup", h.ConsumerGroup)
+	putStr(out, "clientId", h.ClientID)
+}
+
 func (h *NotifyConsumerIdsChangedRequestHeader) ToExtFields(out *common.StringMap) {
 	putStr(out, "consumerGroup", h.ConsumerGroup)
 }

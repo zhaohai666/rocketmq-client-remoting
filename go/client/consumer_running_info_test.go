@@ -869,3 +869,96 @@ func TestConsumeMessageDirectlyErrorArms(t *testing.T) {
 			"The Consumer Group <"+pushGroup+"> not exist in this consumer")
 	})
 }
+
+// Java's MQClientAPIImpl registers exactly EIGHT broker->client processors on
+// its shared ClientRemotingProcessor (MQClientAPIImpl:336-350). Any of them
+// missing here means the broker's push logs "no processor for request code" and
+// gets no answer — which, for a ONEWAY push, is indistinguishable from a client
+// that silently ignored it.
+//
+// 39 (CHECK_TRANSACTION_STATE) is registered by the transaction producer rather
+// than the instance, because the handler has to match the check against ITS OWN
+// producer group (Java registers one shared processor and dispatches by group;
+// the Go transport keeps one handler per request code). That is a deliberate,
+// documented divergence — see the note at producer.go's RegisterProcessor call
+// — so it is asserted separately.
+func TestInstanceRegistersEveryJavaClientProcessor(t *testing.T) {
+	inst := CreateOrGetInstance(uniqueClientID(t), nil, testConfig())
+	t.Cleanup(inst.Shutdown)
+
+	want := []struct {
+		code int32
+		name string
+	}{
+		{remoting.ReqNotifyUnsubscribeLite, "NOTIFY_UNSUBSCRIBE_LITE(200073)"},
+		{remoting.ReqNotifyConsumerIDsChanged, "NOTIFY_CONSUMER_IDS_CHANGED(40)"},
+		{remoting.ReqResetConsumerClientOffset, "RESET_CONSUMER_CLIENT_OFFSET(220)"},
+		{remoting.ReqGetConsumerStatusFromClient, "GET_CONSUMER_STATUS_FROM_CLIENT(221)"},
+		{remoting.ReqGetConsumerRunningInfo, "GET_CONSUMER_RUNNING_INFO(307)"},
+		{remoting.ReqConsumeMessageDirectly, "CONSUME_MESSAGE_DIRECTLY(309)"},
+		{remoting.ReqPushReplyMessageToClient, "PUSH_REPLY_MESSAGE_TO_CLIENT(326)"},
+	}
+	for _, w := range want {
+		if !inst.remoting.HasProcessor(w.code) {
+			t.Errorf("%s is not registered; the broker's push would hit the "+
+				"\"no processor for request code\" WARN path and get no answer", w.name)
+		}
+	}
+
+	// Pinned values: a wrong number here is a code the broker never sends, so
+	// the registration would look present and be useless.
+	if remoting.ReqNotifyUnsubscribeLite != 200073 {
+		t.Errorf("ReqNotifyUnsubscribeLite = %d, want 200073", remoting.ReqNotifyUnsubscribeLite)
+	}
+	// 200073 must NOT be answered: Java's switch has no case for it, so its
+	// registered processor falls through and returns null. Replying SUCCESS
+	// would be inventing a protocol the broker does not expect (it sends
+	// oneway and is not waiting).
+	if inst.remoting.HasProcessor(remoting.ReqCheckTransactionState) {
+		t.Log("39 is registered (a transaction producer is live); expected only with one started")
+	}
+}
+
+// NOTIFY_UNSUBSCRIBE_LITE(200073) must be swallowed WITHOUT a reply, and must not
+// disturb the connection.
+//
+// The broker sends it with invokeOneway (Broker2Client:66) and Java answers
+// nothing at all — its registered ClientRemotingProcessor has no case for the
+// code, so it falls through to `return null`. The observable contract is
+// therefore "the client sends nothing back, and the next request on the same
+// connection still works". A future "fix" that replied SUCCESS would be
+// inventing a reply the broker does not expect; one that dropped the
+// registration would take the WARN path instead.
+func TestNotifyUnsubscribeLiteIsSwallowedWithoutAReply(t *testing.T) {
+	topic := uniqueTopic("Go200073", t)
+	const group = "GID_go_200073"
+
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	c := f.newConsumer(t, group, newRecordingListener(),
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+	waitFor(t, "warm connection to the broker", func() bool { return f.brokerSrv.connCount() > 0 })
+
+	// 200073 goes out ONEWAY, exactly as the broker sends it. pushOneway returns
+	// as soon as the bytes are written.
+	if err := f.brokerSrv.pushOneway(remoting.CreateRequestCommand(remoting.ReqNotifyUnsubscribeLite,
+		&remoting.NotifyUnsubscribeLiteRequestHeader{ConsumerGroup: remoting.StrPtr(group)})); err != nil {
+		t.Fatalf("push 200073: %v", err)
+	}
+
+	// The connection must still be usable: a 307 on the same connection answers
+	// normally. This is what proves the read loop was not disturbed (and, since
+	// the no-op handler runs inline, that it returned).
+	resp := pushRunningInfo(t, f.brokerSrv, group, f.clientID, false)
+	if resp.Code != remoting.RespSuccess {
+		t.Fatalf("307 after 200073 answered code=%d remark=%q", resp.Code, resp.Remark)
+	}
+
+	// And a SYNC 200073 must go unanswered — a timeout, not a
+	// REQUEST_CODE_NOT_SUPPORTED(3) and not a SUCCESS.
+	sync := remoting.CreateRequestCommand(remoting.ReqNotifyUnsubscribeLite,
+		&remoting.NotifyUnsubscribeLiteRequestHeader{ConsumerGroup: remoting.StrPtr(group)})
+	if got, err := f.brokerSrv.pushSync(sync, 500*time.Millisecond); err == nil {
+		t.Fatalf("a sync 200073 was answered with code=%d; Java answers nothing", got.Code)
+	}
+}

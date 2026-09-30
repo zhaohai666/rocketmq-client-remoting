@@ -404,3 +404,54 @@ func TestInheritedBrokerNameIsBnameNotBrokerName(t *testing.T) {
 		t.Fatal("CheckTransactionStateRequestHeader must use bname, not brokerName")
 	}
 }
+
+// NotifyUnsubscribeLiteRequestHeader: NOTIFY_UNSUBSCRIBE_LITE = 200073, the one
+// broker->client code the classic client swallows silently. The ext-field
+// spellings are pinned because a wrong letter silently drops the field (the
+// broker's fastjson2-side parser just leaves it null), and the code itself is
+// pinned because a wrong NUMBER is a request the broker never sends — the
+// registration would look present and be useless.
+func TestNotifyUnsubscribeLiteHeaderRoundTrip(t *testing.T) {
+	if ReqNotifyUnsubscribeLite != 200073 {
+		t.Fatalf("ReqNotifyUnsubscribeLite = %d, want 200073", ReqNotifyUnsubscribeLite)
+	}
+
+	h := &NotifyUnsubscribeLiteRequestHeader{
+		LiteTopic:     StrPtr("liteA"),
+		ConsumerGroup: StrPtr("GID_lite"),
+		ClientID:      StrPtr("10.0.0.1@1234"),
+	}
+	fields := common.NewStringMap()
+	h.ToExtFields(fields)
+
+	// `clientId`, not `clientID` — Java's field is `clientId` and the ext key
+	// follows the property name.
+	for k, want := range map[string]string{
+		"liteTopic":     "liteA",
+		"consumerGroup": "GID_lite",
+		"clientId":      "10.0.0.1@1234",
+	} {
+		if got, ok := fields.Get(k); !ok || got != want {
+			t.Errorf("extFields[%q] = %q (present=%v), want %q", k, got, ok, want)
+		}
+	}
+	if fields.Len() != 3 {
+		t.Errorf("extFields has %d keys, want exactly 3 (Java's header has 3; "+
+			"RpcRequestHeader is an empty marker): %v", fields.Len(), fields)
+	}
+
+	var back NotifyUnsubscribeLiteRequestHeader
+	back.FromExtFields(fields)
+	if back.LiteTopic == nil || *back.LiteTopic != "liteA" ||
+		back.ConsumerGroup == nil || *back.ConsumerGroup != "GID_lite" ||
+		back.ClientID == nil || *back.ClientID != "10.0.0.1@1234" {
+		t.Errorf("round trip lost a field: %+v", back)
+	}
+
+	// Absent fields stay nil rather than becoming empty strings.
+	var empty NotifyUnsubscribeLiteRequestHeader
+	empty.FromExtFields(common.NewStringMap())
+	if empty.LiteTopic != nil || empty.ConsumerGroup != nil || empty.ClientID != nil {
+		t.Errorf("absent fields must stay nil, got %+v", empty)
+	}
+}

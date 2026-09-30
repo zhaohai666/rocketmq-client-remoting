@@ -216,6 +216,18 @@ func (c *RemotingClient) UnregisterProcessor(requestCode int32) ProcessorFunc {
 	return proc
 }
 
+// HasProcessor reports whether a broker->client request code has a handler.
+//
+// A code with NO handler is not an error here, but the read loop logs a WARN and
+// sends no reply — so for a code the broker really pushes, silence is
+// indistinguishable from a broken client. Tests use this to pin the set.
+func (c *RemotingClient) HasProcessor(requestCode int32) bool {
+	c.procMu.RLock()
+	defer c.procMu.RUnlock()
+	_, ok := c.processors[requestCode]
+	return ok
+}
+
 // ---------------- RPC ----------------
 
 // InvokeSync performs one RPC; timeoutMillis <= 0 falls back to the config

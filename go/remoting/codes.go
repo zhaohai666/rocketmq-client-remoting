@@ -89,6 +89,7 @@ const (
 	ReqNotification                     = int32(200054)
 	ReqPollingInfo                      = int32(200055)
 	ReqPopLiteMessage                   = int32(200070)
+	ReqNotifyUnsubscribeLite            = int32(200073)
 )
 
 // Request codes the admin / tooling surface needs, kept in a second block so
