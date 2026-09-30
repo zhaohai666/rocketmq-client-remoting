@@ -73,6 +73,7 @@ use crate::client::result::{
     ConsumeOrderlyStatus, ConsumeReturnType, MessageListenerConcurrently, MessageListenerOrderly,
     PopResult, PopStatus, PullStatus,
 };
+use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::AccessChannel;
 use crate::client::trace_dispatcher::{TraceDispatcherType, TraceHost};
@@ -804,6 +805,21 @@ fn require_client(inner: &Inner) -> Result<MQClientInstance> {
         .ok_or_else(|| Error::client("consumer not started, call start() first"))
 }
 
+/// 停机排空窗口内的**内部回投**专用取实例：只看实例在不在，不看 `started`。
+///
+/// `shutdown()` 的第一步就把 `started` 置 false，然后才排空在途批次（等回投 RPC 跑到
+/// 应答）。回投若沿用 [`require_client`] 的 started 门，排空等到的全是
+/// 「consumer not started」快速失败 —— 回投一条也发不出去，消息只能靠位点下限从原
+/// topic 重投，`%RETRY%`/`%DLQ%` 永远进不去（真机立即退进程测试抓到，见
+/// `examples/live_shutdown_race.rs`）。Java 侧 `sendMessageBack` 直接走 `mQClientFactory`，
+/// 同样不看 consumer 的 serviceState；实例本体到 shutdown 收尾的最后一步才被摘掉，
+/// 这里也只要求它在。
+fn require_client_for_send_back(inner: &Inner) -> Result<MQClientInstance> {
+    lock(&inner.client)
+        .clone()
+        .ok_or_else(|| Error::client("consumer not started, call start() first"))
+}
+
 /// 队列 key：Python `_mq_key`（`"%s%s%d" % (topic, brokerName, queueId)`，无分隔符）。
 pub fn mq_key(mq: &MessageQueue) -> String {
     format!("{}{}{}", mq.topic, mq.broker_name, mq.queue_id)
@@ -1405,6 +1421,13 @@ impl DefaultMQPushConsumer {
     }
 
     /// Python `shutdown()`。
+    ///
+    /// ⚠ 与「spawn 后立即返回」的旧形态不同：清退（等在途批次 → 刷位点/解锁 →
+    /// 35 号注销 → 拆实例）挂在运行时上跑，但本方法**阻塞等它落地**（上限
+    /// [`SHUTDOWN_FINALIZE_BUDGET`]）。「shutdown() 返回后立刻退进程」不会再丢
+    /// 在途回投 —— 该进 `%DLQ%` 的消息在返回前已经发出。current_thread 运行时里
+    /// 无法阻塞（会 panic / 死锁），此时收尾仍是游离任务并告警（见
+    /// [`run_finalize_blocking`] 的情形 2/3）。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -1439,7 +1462,8 @@ impl DefaultMQPushConsumer {
             task.abort();
         }
         // 分发循环不在 tasks 里（见字段注释）：它可能正带着一批消息做回投 RPC，
-        // abort 会把在途回投从中间掐断。由下面的收尾任务有界等它跑完当前批次。
+        // abort 会把在途回投从中间掐断。由下面的收尾等待（`run_finalize_blocking`）
+        // 有界等它跑完当前批次。
         let dispatch_task = lock(&self.inner.dispatch_task).take();
         // POP 执行器同样挪进收尾任务：先停接收，再有界等已提交任务跑完。
         let pop_executor = lock(&self.inner.pop_executor).take();
@@ -1480,7 +1504,7 @@ impl DefaultMQPushConsumer {
             if let Some(handle) = self.runtime_handle() {
                 let client_id = self.client_id();
                 let inner = Arc::clone(&self.inner);
-                handle.spawn(async move {
+                let finalize = async move {
                     // ① 有界排空在途批次：等分发循环把手里的这批消费/回投完（回投 RPC
                     //    完整跑到应答），POP 执行器把已提交的消费任务跑完。超时则放弃
                     //    —— 下面 ② 的位点下限钳制保证没落定的消息仍会被 broker 重投。
@@ -1558,7 +1582,13 @@ impl DefaultMQPushConsumer {
                     // 的 `unregisterConsumer` → `mQClientFactory.shutdown()` 顺序）。
                     // 守卫保证同 clientId 还有别人时这一句是 no-op。
                     client.shutdown();
-                });
+                };
+                let _ = run_finalize_blocking(
+                    &handle,
+                    "push consumer shutdown",
+                    SHUTDOWN_FINALIZE_BUDGET,
+                    finalize,
+                );
             } else {
                 // 无运行时：末次持久化与注销都发不出去（Python 那里线程照起），
                 // 但至少把该还的还掉。
@@ -4709,7 +4739,7 @@ async fn send_message_back(
     delay_level: i32,
     broker_name: Option<&str>,
 ) -> Result<()> {
-    let client = require_client(inner)?;
+    let client = require_client_for_send_back(inner)?;
     let cfg = read_cfg(inner);
     let broker = broker_name
         .map(str::to_string)
@@ -4793,7 +4823,7 @@ async fn orderly_send_message_back(
     max_times: i32,
 ) -> bool {
     let outcome: Result<()> = async {
-        let client = require_client(inner)?;
+        let client = require_client_for_send_back(inner)?;
         let mut new_msg = build_retry_message(cfg, msg, max_times);
         let publish = client
             .get_topic_publish_info(&new_msg.topic, true)
@@ -8432,6 +8462,33 @@ mod tests {
         );
         assert_eq!(failed[0].1.reconsume_times, 1, "失败就地 +1（Java:251）");
         assert_eq!(batch[1].reconsume_times, 0, "被跳过的条目不许加次数");
+    }
+
+    /// 停机排空窗口：`shutdown()` 已把 `started` 置 false，在途批次仍必须能取到实例把
+    /// 回投发出去（Java `sendMessageBack` 直接走 `mQClientFactory`，不看 serviceState）。
+    /// 旧口径下回投全被「consumer not started」快速失败掐掉，真机立即退进程测试里
+    /// `%RETRY%` 一直是空的（见 `examples/live_shutdown_race.rs`）。
+    #[test]
+    fn send_back_lookup_ignores_started_flag_until_instance_is_taken() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        assert!(require_client(&consumer.inner).is_err(), "公开路径仍要 started 门");
+        assert!(
+            require_client_for_send_back(&consumer.inner).is_err(),
+            "没有实例谁都不放行"
+        );
+
+        *lock(&consumer.inner.client) = Some(MQClientInstance::new("gid-shutdown-sendback", vec![]));
+        // shutdown() 的第一步：先置 false 再排空在途批次。
+        consumer.inner.started.store(false, Ordering::Release);
+        assert!(require_client(&consumer.inner).is_err());
+        assert!(
+            require_client_for_send_back(&consumer.inner).is_ok(),
+            "排空窗口内回投必须还能取到实例"
+        );
+
+        // shutdown 收尾的最后一步才摘实例：从此回投失败（等价 Java 侧工厂已拆）。
+        lock(&consumer.inner.client).take();
+        assert!(require_client_for_send_back(&consumer.inner).is_err());
     }
 
     /// 接线取证：`dispatch_loop` 走并发路径时必须把**盖过章**的这批登记进清扫视图，

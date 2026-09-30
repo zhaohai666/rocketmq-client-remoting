@@ -100,8 +100,8 @@
 //!     （`:230`）在 topic 真含 `\x01` 时抛 `ValueError`，异常被线程池吞掉；Rust 只按
 //!     **第一个** `\x01` 切一次（`split_once`），切不出两段则记 DEBUG 后跳过该组。
 //! 14. **`is_started` 在 `shutdown()` 后仍为 `true`** —— Python 原样（`:144-162` 没有复位
-//!     它）。但二次 `shutdown()` 不再重复关内部生产者：收尾由游离任务在在途发送
-//!     收敛后执行一次，二次调用直接返回（重复关会把第一轮没等完的发送掐掉）。
+//!     它）。但二次 `shutdown()` 不再重复关内部生产者：收尾在在途发送收敛后执行一次，
+//!     二次调用直接返回（重复关会把第一轮没等完的发送掐掉）。
 //! 15. **`namespace_v2`（`:86`）未移植**：Python 只在构造函数里赋了 `""`，全文从未读取
 //!     （Java `start()` 会 `traceProducer.setNamespaceV2(...)`，
 //!     `AsyncTraceDispatcher.java:155`），属死状态；等命名空间 2.0 的接缝真需要时再补。
@@ -123,6 +123,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::client::mq_client::{MQClientInstance, TraceDispatcher};
+use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::trace::{
     AccessChannel, TraceConstants, TraceContext, TraceDataEncoder, TraceTransferBean,
 };
@@ -512,7 +513,7 @@ struct Inner {
     /// Python `self.stopped`（`:82`）。
     stopped: AtomicBool,
     /// 同步 [`Inner::shutdown`] 是否已挂出/执行过收尾：防止二次 `shutdown()`
-    /// 把还在等在途发送的游离收尾任务半路掐掉。
+    /// 把还在等在途发送的那轮收尾半路掐掉。
     finalizing: AtomicBool,
     /// Python `self.is_started`（`:83`）。
     is_started: AtomicBool,
@@ -818,8 +819,8 @@ impl AsyncTraceDispatcher {
     pub async fn shutdown_gracefully(&self) {
         self.inner.flush_and_wait().await;
         if self.inner.finalizing.swap(true, Ordering::AcqRel) {
-            // 同步 shutdown() 已挂出游离收尾：它会在在途发送收敛后关生产者，
-            // 这里再就地关一次只会跟它抢。
+            // 同步 shutdown() 已经在跑收尾（多线程运行时里它返回时通常已跑完）：
+            // 它会在在途发送收敛后关生产者，这里再就地关一次只会跟它抢。
             return;
         }
         self.inner.finalize_now();
@@ -1053,9 +1054,13 @@ impl Inner {
     /// 在途发送任务，紧接着 `trace_producer.shutdown()` 会让它们撞上
     /// 「producer not started / 连接已关」—— 短生命周期客户端最后一批轨迹就是
     /// 这样丢的。内部生产者的实例名独立于宿主（`TRACE_INSTANCE_NAME`），不与
-    /// 宿主客户端共用连接，所以把「等在途发送收敛 → 关生产者 → 停 worker」挂成
-    /// 游离任务：宿主进程只要不立刻退出，最后一批就能发完。要在关闭前**同步**
-    /// 等完的调用方用 [`AsyncTraceDispatcher::shutdown_gracefully`]。
+    /// 宿主客户端共用连接，所以把「等在途发送收敛 → 关生产者 → 停 worker」交给
+    /// [`run_finalize_blocking`]：挂到运行时上执行，并在调用线程上有界等它落地
+    /// —— 「shutdown 后立刻退进程」不会再丢最后一批轨迹。预算取
+    /// [`SHUTDOWN_FINALIZE_BUDGET`] 与「用户配置的等待 + 余量」的较大者（内部
+    /// 等发送的上限是 `wait_for_shutdown_millis`，可配）。current_thread 运行时里
+    /// 无法阻塞，收尾仍为游离任务并告警（见该函数的情形 2/3）。要在关闭前
+    /// **同步**等完的调用方用 [`AsyncTraceDispatcher::shutdown_gracefully`]。
     fn shutdown(&self) {
         self.flush();
         if self.finalizing.swap(true, Ordering::AcqRel) {
@@ -1066,14 +1071,22 @@ impl Inner {
         }
         match (self.this.upgrade(), self.handle.get().cloned()) {
             (Some(me), Some(handle)) => {
-                handle.spawn(async move { me.finalize().await });
+                let budget = SHUTDOWN_FINALIZE_BUDGET
+                    .max(Duration::from_millis(self.wait_for_shutdown_millis) + Duration::from_secs(5));
+                let _ = run_finalize_blocking(
+                    &handle,
+                    "trace dispatcher shutdown",
+                    budget,
+                    async move { me.finalize().await },
+                );
             }
             // 从未 start（无运行时/无 worker）：不存在在途发送，就地收尾。
             _ => self.finalize_now(),
         }
     }
 
-    /// 游离收尾：等在途发送跑完（上限 `wait_for_shutdown_millis`）再关生产者。
+    /// 完整收尾（由 `run_finalize_blocking` 挂出并等待）：等在途发送跑完
+    /// （上限 `wait_for_shutdown_millis`）再关生产者。
     async fn finalize(&self) {
         self.flush_and_wait().await;
         self.finalize_now();
@@ -1339,8 +1352,10 @@ impl TraceDispatcher for AsyncTraceDispatcher {
     }
 
     /// Python `shutdown()`（`:144-162`）：flush（不等待）+ 关内部生产者 + `stopped=True`。
-    /// 关生产者这步由游离收尾任务在在途发送收敛后执行（否则最后一批轨迹会撞上
-    /// 已关闭的生产者）；要**同步**等发完请用 [`AsyncTraceDispatcher::shutdown_gracefully`]。
+    /// 关生产者这步由收尾任务在在途发送收敛后执行（否则最后一批轨迹会撞上
+    /// 已关闭的生产者）；本方法会**有界等它落地**（多线程运行时；current_thread
+    /// 运行时下退化为游离任务并告警）。要**异步**等完请用
+    /// [`AsyncTraceDispatcher::shutdown_gracefully`]。
     fn shutdown(&self) {
         self.inner.shutdown();
     }
@@ -2303,8 +2318,9 @@ mod tests {
         d.append(simple_pub());
         TraceDispatcher::shutdown(&d);
         assert_eq!(d.queue_size(), 0);
-        // 收尾（等在途发送 → 关内部生产者 → 停 worker）挂在游离任务上，
-        // 这里等它收敛：is_stopped 只在 finalize_now 之后才为真。
+        // 收尾（等在途发送 → 关内部生产者 → 停 worker）挂到运行时上；本用例的
+        // current_thread 运行时不能阻塞（`run_finalize_blocking` 的情形 2），
+        // 所以这里等它收敛：is_stopped 只在 finalize_now 之后才为真。
         for _ in 0..500 {
             if d.is_stopped() && recorder.shutdowns.load(Ordering::Acquire) == 1 {
                 break;
@@ -2345,6 +2361,52 @@ mod tests {
         assert_eq!(recorder.records().len(), 1);
         assert_eq!(recorder.records()[0].keys, EXPECTED_PUB_KEYS);
         assert!(d.is_stopped());
+    }
+
+    /// 返回即落地：多线程运行时里 `shutdown()` 会等末批轨迹发完、内部生产者关掉
+    /// 才回来 —— 「shutdown 后立刻退进程」不再丢轨迹。断言在返回后**不 await、
+    /// 不等一拍**：旧实现（spawn 后立即返回）下收尾任务还没被调度，记录必然缺席。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_finishes_before_returning() {
+        let (d, recorder) = dispatcher_with(20, None);
+        d.start("127.0.0.1:9876", None).await.unwrap();
+        // start 之后 start_worker 会把队列里的东西带走，这里重新灌满再关
+        d.set_last_flush_time(current_time_millis());
+        d.append(simple_pub());
+        TraceDispatcher::shutdown(&d);
+        assert!(d.is_stopped(), "返回时 worker 已停");
+        assert_eq!(
+            recorder.shutdowns.load(Ordering::Acquire),
+            1,
+            "返回时内部生产者已关"
+        );
+        assert_eq!(recorder.records().len(), 1, "返回时末批轨迹已发出");
+        assert_eq!(d.queue_size(), 0);
+    }
+
+    /// 进程立刻退出也不丢：`shutdown()` 返回后马上拆掉整个运行时（等价于
+    /// 「shutdown 之后紧跟 `process::exit`」）。旧实现下收尾任务随运行时一起被
+    /// 取消，末批轨迹发不出去；现在它们在返回前已经落地，拆运行时只是收尸。
+    #[test]
+    fn shutdown_survives_immediate_runtime_drop() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("多线程运行时");
+        let (d, recorder) = runtime.block_on(async {
+            let (d, recorder) = dispatcher_with(20, None);
+            d.start("127.0.0.1:9876", None).await.unwrap();
+            (d, recorder)
+        });
+        d.set_last_flush_time(current_time_millis());
+        d.append(simple_pub());
+        // 运行时外（纯 std 线程）调用 shutdown —— 这正是 `main()` 收尾时的形态。
+        TraceDispatcher::shutdown(&d);
+        drop(runtime);
+        assert!(d.is_stopped());
+        assert_eq!(recorder.shutdowns.load(Ordering::Acquire), 1);
+        assert_eq!(recorder.records().len(), 1, "进程退出前末批轨迹必须已经发出");
     }
 
     #[tokio::test]

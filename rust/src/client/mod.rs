@@ -15,6 +15,7 @@ pub mod producer;
 pub mod pull_consumer;
 pub mod request_reply;
 pub mod result;
+pub(crate) mod shutdown;
 pub mod top_addressing;
 pub mod trace;
 pub mod trace_context;

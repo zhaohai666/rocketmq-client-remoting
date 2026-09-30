@@ -65,6 +65,7 @@ use crate::client::request_reply::{
 use crate::client::result::{
     LocalTransactionState, SendResult, SendStatus, TransactionSendResult,
 };
+use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::TraceContext;
 use crate::client::trace_dispatcher::{
@@ -1506,10 +1507,11 @@ impl DefaultMQProducer {
 
     /// Python `shutdown()`。
     ///
-    /// ⚠ 与 Python/C++/.NET 的同步 shutdown 不同：这里 35 号注销和实例拆解都挂在
-    /// `runtime_handle().spawn()` 上（`shutdown()` 本身是同步的，不能阻塞等 RPC 回来）。
-    /// 所以「shutdown 后立刻 `std::process::exit`」可能来不及把这帧发出去，需要注销
-    /// 真的落地就要给运行时一拍时间（等 `is_started()` 翻掉，或短 sleep）。
+    /// ⚠ 与「spawn 后立即返回」的旧形态不同：35 号注销与实例拆解挂在运行时上跑，
+    /// 但本方法**阻塞等它落地**（上限 [`SHUTDOWN_FINALIZE_BUDGET`]）。
+    /// 「shutdown 后立刻 `std::process::exit`」现在也能把这帧发出去；current_thread
+    /// 运行时里无法阻塞（会 panic / 死锁），此时收尾仍是游离任务并告警
+    /// （见 [`run_finalize_blocking`] 的情形 2/3）。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -1563,11 +1565,11 @@ impl DefaultMQProducer {
             // `getMqClientApiTimeout()`（3000ms），异常一律吞成 log.warn。少了这一发，
             // broker 侧 ProducerManager 要等通道断开（或 120s 扫描）才回收本组连接。
             // 35 必须走**还没关的那条连接**，所以 `client.shutdown()` 只能排在它之后
-            // （与 push 消费者 shutdown 同一套 spawn 形状）。
+            // （与 push 消费者 shutdown 同一套收尾等待）。
             match (self.runtime_handle(), self.client_id()) {
                 (Some(handle), Some(client_id)) => {
                     let group = self.inner.producer_group();
-                    handle.spawn(async move {
+                    let finalize = async move {
                         client
                             .unregister_client_all_brokers(
                                 &client_id,
@@ -1577,7 +1579,13 @@ impl DefaultMQProducer {
                             )
                             .await;
                         client.shutdown();
-                    });
+                    };
+                    let _ = run_finalize_blocking(
+                        &handle,
+                        "producer shutdown",
+                        SHUTDOWN_FINALIZE_BUDGET,
+                        finalize,
+                    );
                 }
                 // 无运行时：这一发注销发不出去（Python 那里线程照起），但至少把实例还掉。
                 _ => {

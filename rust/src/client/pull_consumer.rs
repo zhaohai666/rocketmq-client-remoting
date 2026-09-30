@@ -73,6 +73,7 @@ use crate::client::consumer::{
 use crate::client::hook::{FilterMessageHook, FilterMessageHookList};
 use crate::client::mq_client::{MQClientInstance, MQClientInstanceConfig};
 use crate::client::result::{PullResult, PullStatus};
+use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::common::message::{MessageExt, MessageQueue};
 use crate::common::mix_all::MixAll;
@@ -646,6 +647,9 @@ impl DefaultMQPullConsumer {
     /// 都有的 35 号注销）：停心跳 → 逐台 broker 发 UNREGISTER_CLIENT(35) → 摘组 → 关实例。
     /// 35 让 broker 的 ConsumerManager 立刻摘掉本组，不必等 ~120s 通道扫描
     /// （Java `MQClientInstance#unregisterClient`，`DefaultMQPullConsumerImpl:691` 走同一入口）。
+    /// 35 与关实例挂在运行时上跑，但本方法**阻塞等它落地**（上限
+    /// [`SHUTDOWN_FINALIZE_BUDGET`]）；current_thread 运行时里退化为游离任务并告警
+    /// （见 [`run_finalize_blocking`] 的情形 2/3）。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -664,12 +668,13 @@ impl DefaultMQPullConsumer {
         }
         let group = self.consumer_group();
         let client_id = self.client_id();
-        // 注销要发 RPC，而 shutdown 是同步 API（不能在调用线程上等网络）——
-        // 与生产者/推送消费者同款：挂到运行时上执行，没有运行时则退化为只摘组 + 关实例。
+        // 注销要发 RPC —— 与生产者/推送消费者同款：挂到运行时上执行并**有界等待**
+        // 落地（`run_finalize_blocking`，「shutdown 后立刻退进程」也发得出去）；
+        // 没有运行时则退化为只摘组 + 关实例。
         match self.runtime_handle() {
             Some(handle) => {
                 let this = self.clone();
-                handle.spawn(async move {
+                let finalize = async move {
                     // 锁不能跨 await（MutexGuard 不是 Send）：先把 client 取出来。
                     let client = lock(&this.inner.client).take();
                     if let Some(client) = client {
@@ -684,7 +689,13 @@ impl DefaultMQPullConsumer {
                         client.unregister_consumer_group(&group);
                         client.shutdown();
                     }
-                });
+                };
+                let _ = run_finalize_blocking(
+                    &handle,
+                    "pull consumer shutdown",
+                    SHUTDOWN_FINALIZE_BUDGET,
+                    finalize,
+                );
             }
             None => {
                 if let Some(client) = lock(&self.inner.client).take() {
@@ -1762,7 +1773,10 @@ impl DefaultLitePullConsumer {
     /// → 关实例。
     ///
     /// 差别见模块头差异 1：末次提交与 `client.shutdown()` 一起派发到运行时上**串行**
-    /// 执行（提交要发 RPC，必须发生在实例关闭之前）；没有运行时时退化为直接关闭。
+    /// 执行（提交要发 RPC，必须发生在实例关闭之前），且本方法**阻塞等它落地**
+    /// （上限 [`SHUTDOWN_FINALIZE_BUDGET`]，「shutdown 后立刻退进程」不会再丢末次
+    /// 提交）；current_thread 运行时里退化为游离任务并告警（见
+    /// [`run_finalize_blocking`] 的情形 2/3）；没有运行时时退化为直接关闭。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -1801,11 +1815,17 @@ impl DefaultLitePullConsumer {
         let this = self.clone();
         match self.runtime_handle() {
             Some(handle) => {
-                handle.spawn(async move {
+                let finalize = async move {
                     // 里面含 Java persistAll 的"remove unused mq"清理
                     let _ = this.persist_offset_table(&scope).await;
                     this.close_client();
-                });
+                };
+                let _ = run_finalize_blocking(
+                    &handle,
+                    "lite pull shutdown",
+                    SHUTDOWN_FINALIZE_BUDGET,
+                    finalize,
+                );
             }
             None => {
                 // 无运行时：提交不了，至少把连接关掉（与 Python 的
@@ -3730,6 +3750,61 @@ mod tests {
         let beats = cluster.master.heartbeats().len();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(cluster.master.heartbeats().len(), beats, "shutdown 后不再发心跳");
+    }
+
+    /// 「shutdown 后立刻退进程」也发得出去：多线程运行时里 `shutdown()` 会等 35
+    /// 落地才回来。断言在返回后**不 await、不等一拍** —— 旧实现（spawn 后立即返回）
+    /// 下收尾任务还没被调度过，35 必然缺席，本用例就是为了钉住这个回归。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_returns_only_after_unregister_landed() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_hb_unreg_wait", "PG_PullUnregWait", &cluster, "T").await;
+        let client_id = c.client_id();
+
+        c.shutdown();
+
+        // 到这里收尾必须已经完成：主从各一份 35。
+        for (name, broker) in [("master", &cluster.master), ("slave", &cluster.slave)] {
+            let unregs = broker.unregisters();
+            assert_eq!(unregs.len(), 1, "{name}: shutdown 返回时 35 必须已经落地");
+            let field = |k: &str| -> Option<String> {
+                unregs[0].iter().find(|(f, _)| f == k).map(|(_, v)| v.clone())
+            };
+            assert_eq!(field("clientID").as_deref(), Some(client_id.as_str()), "{name}");
+            assert_eq!(field("consumerGroup").as_deref(), Some("PG_PullUnregWait"), "{name}");
+        }
+    }
+
+    /// 进程立刻退出也不丢：`shutdown()` 返回后马上拆掉整个运行时（等价于
+    /// 「shutdown 之后紧跟 `process::exit`」）。旧实现下收尾任务随运行时一起被
+    /// 取消，主从一台都收不到 35；现在 35 在返回前已经落地，拆运行时只是收尸。
+    #[test]
+    fn shutdown_survives_immediate_runtime_drop() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("多线程运行时");
+        let (cluster, consumer, client_id) = runtime.block_on(async {
+            let cluster = FakePullCluster::start().await;
+            let c = started_pull("pull_unreg_exit", "PG_PullUnregExit", &cluster, "T").await;
+            let client_id = c.client_id();
+            (cluster, c, client_id)
+        });
+
+        // 运行时外（纯 std 线程）调用 shutdown —— 这正是 `main()` 收尾时的形态。
+        consumer.shutdown();
+        drop(runtime);
+
+        for (name, broker) in [("master", &cluster.master), ("slave", &cluster.slave)] {
+            let unregs = broker.unregisters();
+            assert_eq!(unregs.len(), 1, "{name}: 进程退出前 35 必须已经落地");
+            let field = |k: &str| -> Option<String> {
+                unregs[0].iter().find(|(f, _)| f == k).map(|(_, v)| v.clone())
+            };
+            assert_eq!(field("clientID").as_deref(), Some(client_id.as_str()), "{name}");
+            assert_eq!(field("consumerGroup").as_deref(), Some("PG_PullUnregExit"), "{name}");
+        }
     }
 
     #[test]
