@@ -65,6 +65,10 @@ type consumerBroker struct {
 	maxOffsetQ   []mqKey
 	minOffsetQ   []mqKey
 	reqOrder     []int32
+	// sends records SEND_MESSAGE_V2(310) requests. In these fixtures the only
+	// sender is a trace dispatcher's internal producer, so the topic of each
+	// send tells the test whether tracing fired.
+	sends []consumerSend
 	// createTopicExt records the raw extFields of every UPDATE_AND_CREATE_TOPIC
 	// (17). The REAL broker parses `attributes` as `k=v;k=v` and answers
 	// "kv string format wrong" for anything else, so the field values — not just
@@ -94,6 +98,13 @@ func newConsumerBroker() *consumerBroker {
 
 func commitKey(group, topic string, queueID int32) string {
 	return fmt.Sprintf("%s|%s|%d", group, topic, queueID)
+}
+
+// consumerSend is one SEND_MESSAGE_V2(310) the mock broker answered.
+type consumerSend struct {
+	topic string
+	body  string
+	props string
 }
 
 // add appends messages to one queue. Each message is a fresh ext with a
@@ -231,6 +242,21 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		b.createTopicExt = append(b.createTopicExt, req.ExtFields().Clone())
 		b.mu.Unlock()
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
+	case remoting.ReqSendMessageV2:
+		header := &remoting.SendMessageRequestHeaderV2{}
+		header.FromExtFields(req.ExtFields())
+		b.mu.Lock()
+		b.sends = append(b.sends, consumerSend{
+			topic: deref(header.Topic), body: string(req.Body), props: deref(header.Properties),
+		})
+		b.mu.Unlock()
+		resp := remoting.CreateResponseCommand(remoting.RespSuccess, "")
+		resp.SetCustomHeader(&remoting.SendMessageResponseHeader{
+			MsgID:       remoting.StrPtr("0A0B0C0D000000000000000000000002"),
+			QueueID:     header.QueueID,
+			QueueOffset: remoting.I64Ptr(0),
+		})
+		return resp
 	default:
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	}
@@ -447,6 +473,24 @@ func (b *consumerBroker) createTopicRequests() []*common.StringMap {
 	out := make([]*common.StringMap, 0, len(b.createTopicExt))
 	for _, ext := range b.createTopicExt {
 		out = append(out, ext.Clone())
+	}
+	return out
+}
+
+// sendSnapshot snapshots every SEND_MESSAGE_V2 the broker answered.
+func (b *consumerBroker) sendSnapshot() []consumerSend {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]consumerSend(nil), b.sends...)
+}
+
+// traceSends keeps the sends whose topic is the given trace topic.
+func (b *consumerBroker) traceSends(traceTopic string) []consumerSend {
+	var out []consumerSend
+	for _, s := range b.sendSnapshot() {
+		if strings.HasPrefix(s.topic, traceTopic) {
+			out = append(out, s)
+		}
 	}
 	return out
 }
@@ -1303,6 +1347,138 @@ func TestConsumerOrderlyLocksThenUnlocks(t *testing.T) {
 		_, unlocks := f.broker.lockCount()
 		return unlocks > 0
 	})
+}
+
+// Shutdown must WAIT for an in-flight batch: the listener call and the
+// send-back it produces have to land before the client instance goes away.
+// Without the drain an immediate process exit cuts the send-back short and the
+// message never reaches %RETRY%/%DLQ% (the same failure Python joins and Rust
+// finalizes to prevent).
+func TestShutdownWaitsForInFlightSendBack(t *testing.T) {
+	topic := uniqueTopic("GoConsumerDrain", t)
+	const group = "GID_go_drain"
+
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "d0")
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	listener := newRecordingListener()
+	listener.setStatus(ReconsumeLater)
+	listener.onCall = func(batch []*common.MessageExt, _ *ConsumeConcurrentlyContext) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	c := f.newConsumer(t, group, listener, withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener never received the batch")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.Shutdown()
+		close(done)
+	}()
+
+	// While the listener is still running, Shutdown must block, not return.
+	select {
+	case <-done:
+		t.Fatal("Shutdown returned while a batch was still in flight")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown did not return after the batch completed")
+	}
+
+	backs := f.broker.sendBackSnapshot()
+	if len(backs) != 1 {
+		t.Fatalf("broker saw %d send-backs, want 1 — the drain must let the in-flight send-back land", len(backs))
+	}
+	if got := derefI64(backs[0].Offset); got == 0 {
+		t.Errorf("send-back offset = %d, want the message's commitLogOffset", got)
+	}
+}
+
+// A listener that never returns must not hang Shutdown: the drain window is
+// bounded by shutdownDrainBudget.
+func TestShutdownDrainIsBounded(t *testing.T) {
+	prev := shutdownDrainBudget
+	shutdownDrainBudget = 100 * time.Millisecond
+	t.Cleanup(func() { shutdownDrainBudget = prev })
+
+	topic := uniqueTopic("GoConsumerDrainBudget", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.broker.add(topic, 0, "b0")
+
+	entered := make(chan struct{}, 1)
+	blockForever := make(chan struct{})
+	t.Cleanup(func() { close(blockForever) })
+	listener := newRecordingListener()
+	listener.onCall = func(batch []*common.MessageExt, _ *ConsumeConcurrentlyContext) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-blockForever
+	}
+	c := f.newConsumer(t, "GID_go_drain_budget", listener,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener never received the batch")
+	}
+
+	begin := time.Now()
+	c.Shutdown()
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("Shutdown took %s with a hung listener; want it bounded by the drain budget", elapsed)
+	}
+}
+
+// After the freeze, a batch already taken out of the buffer must be handed back
+// instead of consumed — its offset was never advanced, so it stays pending for
+// the next start rather than being consumed during shutdown.
+func TestShutdownRequeuesFrozenBatch(t *testing.T) {
+	topic := uniqueTopic("GoConsumerDrainRequeue", t)
+	f := newClusterFixture(t, map[string]int{topic: 1})
+
+	listener := newRecordingListener()
+	c := f.newConsumer(t, "GID_go_drain_requeue", listener,
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	// Freeze first, then let a message show up. The pull loop may still fill
+	// the buffer, but no batch may START being consumed.
+	c.freezeInFlight()
+	f.broker.add(topic, 0, "r0")
+
+	pq := c.processQueueOf(common.MessageQueue{Topic: topic, BrokerName: "b1", QueueID: 0})
+	if pq == nil {
+		t.Fatal("consumer never created a process queue for the topic")
+	}
+	waitFor(t, "message buffered", func() bool { return pq.MsgCount() > 0 })
+	time.Sleep(200 * time.Millisecond)
+
+	if got := pq.PendingCount(); got != 1 {
+		t.Errorf("pending = %d after the freeze, want 1 — the taken batch must be requeued, not held dispatched", got)
+	}
+	if got := listener.bodies(); len(got) != 0 {
+		t.Errorf("listener saw %v while frozen; nothing may be consumed during the drain", got)
+	}
 }
 
 // The pool size gate mirrors Java's guard:

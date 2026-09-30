@@ -147,6 +147,15 @@ type DefaultMQPushConsumer struct {
 	consumeMessageHookList []ConsumeMessageHook
 	filterMessageHookList  []FilterMessageHook
 
+	// Client-side trace (Java DefaultMQPushConsumer.enableTrace /
+	// DefaultMQPushConsumerImpl.traceDispatcher). Start builds a CONSUME
+	// dispatcher and registers its ConsumeMessageTraceHook; Shutdown flushes it
+	// last.
+	enableTrace      bool
+	traceMsgBatchNum int
+	traceTopic       string
+	traceDispatcher  *AsyncTraceDispatcher
+
 	instance    *Instance
 	pullAPI     *pullAPI
 	offsetStore OffsetStore
@@ -177,6 +186,14 @@ type DefaultMQPushConsumer struct {
 
 	rebalanceNow chan struct{}
 	dispatchSem  chan struct{}
+
+	// draining stops new batches from starting during shutdown; inFlight counts
+	// the registered batches (listener call + its send-back) that must land
+	// before the instance is torn down. Shutdown flips draining under drainMu —
+	// after that flip no new Add can race in — and then waits on inFlight.
+	drainMu  sync.Mutex
+	draining bool
+	inFlight sync.WaitGroup
 
 	innerProducerMu sync.Mutex
 	producer        *DefaultMQProducer
@@ -213,6 +230,7 @@ func NewDefaultMQPushConsumer(consumerGroup string) (*DefaultMQPushConsumer, err
 		maxReconsumeTimes:             defaultMaxReconsumeTimes,
 		suspendCurrentQueueTimeMs:     defaultSuspendCurrentQueueTimeMs,
 		consumeTimeout:                defaultConsumeTimeout,
+		traceMsgBatchNum:              defaultTraceMsgBatchNum,
 		allocateStrategy:              AllocateMessageQueueAveragely{},
 		subscription:                  map[string]*remoting.SubscriptionData{},
 		processQueueTable:             map[common.MessageQueue]*processQueue{},
@@ -554,6 +572,46 @@ func (c *DefaultMQPushConsumer) RegisterConsumeMessageHook(hook ConsumeMessageHo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.consumeMessageHookList = append(c.consumeMessageHookList, hook)
+}
+
+// ---------------------------------------------------------------- trace
+
+// SetEnableTrace turns on message tracing (Java setEnableTrace): Start then
+// brings up a CONSUME-mode AsyncTraceDispatcher whose ConsumeMessageTraceHook
+// records every delivered batch. Off by default.
+func (c *DefaultMQPushConsumer) SetEnableTrace(enable bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enableTrace = enable
+}
+
+// IsEnableTrace is Java isEnableTrace.
+func (c *DefaultMQPushConsumer) IsEnableTrace() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enableTrace
+}
+
+// SetTraceMsgBatchNum sets how many trace records are batched before a flush
+// (the dispatcher caps it at 20).
+func (c *DefaultMQPushConsumer) SetTraceMsgBatchNum(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.traceMsgBatchNum = n
+}
+
+// SetTraceTopic overrides the trace topic (default common.TraceTopic).
+func (c *DefaultMQPushConsumer) SetTraceTopic(topic string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.traceTopic = topic
+}
+
+// TraceDispatcher exposes the running dispatcher, or nil when tracing is off.
+func (c *DefaultMQPushConsumer) TraceDispatcher() *AsyncTraceDispatcher {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.traceDispatcher
 }
 
 // RegisterFilterMessageHook appends a pre-delivery filter hook.
@@ -979,6 +1037,9 @@ func (c *DefaultMQPushConsumer) Start() error {
 	c.dispatchSem = make(chan struct{}, maxInt(1, c.corePoolSize))
 	c.stopCh = make(chan struct{})
 	c.stopOnce = sync.Once{}
+	c.drainMu.Lock()
+	c.draining = false
+	c.drainMu.Unlock()
 	c.startTime = time.Now()
 	c.started = true
 	topics := make([]string, 0, len(c.subscription))
@@ -1026,7 +1087,53 @@ func (c *DefaultMQPushConsumer) Start() error {
 		c.goLoop(c.lockLoop)
 	}
 	c.goLoop(c.rebalanceLoop)
+	c.startTraceDispatcher()
 	return nil
+}
+
+// startTraceDispatcher is Java DefaultMQPushConsumer.start:180-190 (Python
+// consumer.py `_start_trace_dispatcher`): with enableTrace on, build a CONSUME
+// dispatcher, register its consume hook, then start it. Failures only log — a
+// broken trace stack must never take the consumer down.
+//
+// It runs OUTSIDE c.mu on purpose: registering the hook takes c.mu itself.
+func (c *DefaultMQPushConsumer) startTraceDispatcher() {
+	c.mu.Lock()
+	enable := c.enableTrace
+	batchNum := c.traceMsgBatchNum
+	topic := c.traceTopic
+	group := c.consumerGroup
+	nameSrv := strings.Join(c.nameServerAddrs, ";")
+	rpcHook := c.rpcHook
+	dispatcher := c.traceDispatcher
+	if enable && dispatcher == nil {
+		dispatcher = NewAsyncTraceDispatcher(group, TraceDispatcherConsume, batchNum, topic, rpcHook)
+		dispatcher.SetHostConsumer(c)
+		c.traceDispatcher = dispatcher
+	}
+	c.mu.Unlock()
+
+	if enable && group != "" {
+		c.RegisterConsumeMessageHook(NewConsumeMessageTraceHook(dispatcher))
+	}
+	if dispatcher != nil {
+		if err := dispatcher.Start(nameSrv, AccessChannelLocal); err != nil {
+			common.LogWarnf("trace dispatcher start failed: %v", err)
+		}
+	}
+}
+
+// shutdownTraceDispatcher flushes and joins the dispatcher. Called LAST from
+// Shutdown, outside c.mu: it must wait for the final SubBefore/SubAfter records
+// to land, and it sends through its own internal producer.
+func (c *DefaultMQPushConsumer) shutdownTraceDispatcher() {
+	c.mu.Lock()
+	dispatcher := c.traceDispatcher
+	c.traceDispatcher = nil
+	c.mu.Unlock()
+	if dispatcher != nil {
+		dispatcher.Shutdown()
+	}
 }
 
 // Shutdown unwinds in Java's order: persist offsets (while _started is still
@@ -1040,6 +1147,11 @@ func (c *DefaultMQPushConsumer) Shutdown() {
 	c.stopOnce.Do(func() { close(c.stopCh) })
 	instance := c.instance
 	c.mu.Unlock()
+
+	// Freeze new consume work right away: batches still in flight are waited
+	// for below, anything the dispatch loops would have started next is handed
+	// back instead (its offset was never advanced, so the broker redelivers).
+	c.freezeInFlight()
 
 	if err := c.PersistConsumerOffset(); err != nil {
 		common.LogDebugf("persist offsets on shutdown failed: %v", err)
@@ -1056,6 +1168,18 @@ func (c *DefaultMQPushConsumer) Shutdown() {
 	}
 	c.stopQueueLoops()
 
+	// Wait (bounded) for in-flight batches — the listener call and its
+	// send-back — while the instance is still alive. Without this window an
+	// immediate process exit can cut a CONSUMER_SEND_MSG_BACK(36) short and the
+	// message never reaches %RETRY%/%DLQ% (Python joins with 2s, Rust finalizes
+	// within a 30s budget; this is the same contract).
+	c.waitInFlightDrain()
+	// Java persists a second time from MQClientInstance.shutdown
+	// (persistAllConsumerOffset): offsets the drain just advanced must land too.
+	if err := c.PersistConsumerOffset(); err != nil {
+		common.LogDebugf("post-drain persist failed: %v", err)
+	}
+
 	c.mu.Lock()
 	c.started = false
 	producer := c.producer
@@ -1068,6 +1192,10 @@ func (c *DefaultMQPushConsumer) Shutdown() {
 		instance.Shutdown()
 		instance.DetachFromRegistryIfLastTenant()
 	}
+	// Trace last, mirroring Java's DefaultMQPushConsumer.shutdown ordering: the
+	// dispatcher flushes what the (now drained) consume loops queued and waits
+	// for those sends to land before returning.
+	c.shutdownTraceDispatcher()
 }
 
 func (c *DefaultMQPushConsumer) goLoop(fn func()) {
@@ -1091,6 +1219,55 @@ func (c *DefaultMQPushConsumer) stopQueueLoops() {
 	c.mu.Unlock()
 	for _, ch := range stops {
 		close(ch)
+	}
+}
+
+// freezeInFlight flips the draining flag: after it, no new consume batch or
+// expire sweep starts, and everything already running is accounted in inFlight.
+func (c *DefaultMQPushConsumer) freezeInFlight() {
+	c.drainMu.Lock()
+	c.draining = true
+	c.drainMu.Unlock()
+}
+
+// beginInFlight registers one unit of consume work. Once Shutdown has frozen
+// the consumer it returns false and the caller must hand the batch back
+// (RequeueBatch), never consume it.
+//
+// The Add happens under the same mutex as the draining flip, so no Add can
+// race in after Shutdown observed the freeze — waitInFlightDrain's Wait is
+// therefore not racy against a zero counter.
+func (c *DefaultMQPushConsumer) beginInFlight() bool {
+	c.drainMu.Lock()
+	defer c.drainMu.Unlock()
+	if c.draining {
+		return false
+	}
+	c.inFlight.Add(1)
+	return true
+}
+
+// shutdownDrainBudget bounds how long Shutdown waits for in-flight consume
+// work (the listener call plus its send-back). Bounded so a hung listener
+// cannot hang shutdown, generous enough for a send-back round trip.
+var shutdownDrainBudget = 30 * time.Second
+
+// waitInFlightDrain waits (bounded) for the batches registered by beginInFlight
+// to finish. Must be called after freezeInFlight, while the client instance is
+// still alive — that window is what lets their send-backs land.
+func (c *DefaultMQPushConsumer) waitInFlightDrain() {
+	drained := make(chan struct{})
+	go func() {
+		c.inFlight.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(shutdownDrainBudget)
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+		common.LogWarnf("consumer shutdown drain timed out after %s, group=%s; in-flight batches detached",
+			shutdownDrainBudget, c.consumerGroup)
 	}
 }
 

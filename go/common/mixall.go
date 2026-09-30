@@ -37,6 +37,10 @@ const (
 	TraceTopic         = "RMQ_SYS_TRACE_TOPIC"
 	// Region placeholder when the SEND response header carries no MSG_REGION.
 	DefaultTraceRegionID = "DefaultRegion"
+	// ConsumeContextType is the hook-context property carrying the NAME of the
+	// ConsumeReturnType (Java MixAll.CONSUME_CONTEXT_TYPE). The trace hook turns
+	// it back into the ordinal that goes into a SubAfter record.
+	ConsumeContextType = "ConsumeContextType"
 
 	// ReqT: the extFields key StreamTypeRPCHook writes.
 	ReqT              = "ReqT"

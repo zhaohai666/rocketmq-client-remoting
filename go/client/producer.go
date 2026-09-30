@@ -388,6 +388,18 @@ type DefaultMQProducer struct {
 	sendLatencyFaultEnable bool
 	faultStrategy          *mqFaultStrategy
 
+	// Client-side trace (Java DefaultMQProducer.enableTrace /
+	// DefaultMQProducerImpl.traceDispatcher). The dispatcher is built and
+	// started by Start and flushed by Shutdown.
+	enableTrace      bool
+	traceMsgBatchNum int
+	traceTopic       string
+	traceDispatcher  *AsyncTraceDispatcher
+	// enableTraceContext is the W3C traceparent passthrough switch; it is
+	// independent of enableTrace (Java delegates this to an external
+	// OTel/SkyWalking hook) and defaults from ROCKETMQ_TRACE_CONTEXT_ENABLE.
+	enableTraceContext bool
+
 	mqClient *Instance
 	started  bool
 
@@ -462,6 +474,8 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		maxMessageSize:          DefaultMaxMessageSize,
 		pollNameServerIntv:      defaultPollNameServerInterval,
 		heartbeatIntervalMillis: DefaultHeartbeatIntervalMillis,
+		traceMsgBatchNum:        defaultTraceMsgBatchNum,
+		enableTraceContext:      TraceContextEnabledFromEnv(),
 		retryResponseCodes: map[int32]struct{}{
 			// Java DefaultMQProducerImpl.RetryResponseCodes: only these codes
 			// are worth trying on another broker. Anything else (e.g.
@@ -551,6 +565,33 @@ func (p *DefaultMQProducer) IsSendLatencyFaultEnable() bool {
 	return p.faultStrategy.SendLatencyFaultEnable()
 }
 
+// ---------------------------------------------------------------- trace
+
+// SetEnableTrace turns on message tracing (Java setEnableTrace): Start then
+// brings up an AsyncTraceDispatcher in PRODUCE mode whose SendMessageTraceHook
+// records every send. Off by default.
+func (p *DefaultMQProducer) SetEnableTrace(enable bool) { p.enableTrace = enable }
+
+// IsEnableTrace is Java isEnableTrace.
+func (p *DefaultMQProducer) IsEnableTrace() bool { return p.enableTrace }
+
+// SetTraceMsgBatchNum sets how many trace records are batched before a flush
+// (Java setTraceMsgBatchNum; the dispatcher caps it at 20).
+func (p *DefaultMQProducer) SetTraceMsgBatchNum(n int) { p.traceMsgBatchNum = n }
+
+// SetTraceTopic overrides the trace topic (default common.TraceTopic).
+func (p *DefaultMQProducer) SetTraceTopic(topic string) { p.traceTopic = topic }
+
+// TraceDispatcher exposes the running dispatcher, or nil when tracing is off.
+func (p *DefaultMQProducer) TraceDispatcher() *AsyncTraceDispatcher { return p.traceDispatcher }
+
+// SetEnableTraceContext turns the W3C traceparent passthrough on or off. The
+// constructor seeds it from ROCKETMQ_TRACE_CONTEXT_ENABLE.
+func (p *DefaultMQProducer) SetEnableTraceContext(enable bool) { p.enableTraceContext = enable }
+
+// IsEnableTraceContext reports the current traceparent switch.
+func (p *DefaultMQProducer) IsEnableTraceContext() bool { return p.enableTraceContext }
+
 // AddRetryResponseCode extends the retryable broker-code set.
 func (p *DefaultMQProducer) AddRetryResponseCode(code int32) {
 	p.retryResponseCodes[code] = struct{}{}
@@ -595,10 +636,25 @@ func splitNamesrvAddr(addrs string) []string {
 // heartbeats. Without it COMMIT/ROLLBACK still work (the client pushes
 // END_TRANSACTION itself) but an UNKNOW half message is never checked back.
 func (p *DefaultMQProducer) Start() error {
+	started, err := p.startLocked()
+	if err != nil || !started {
+		return err
+	}
+	// The trace dispatcher starts outside the lock, the way Java's
+	// DefaultMQProducer.start:380-405 runs after impl.start(): it creates and
+	// starts an internal producer of its own (a network operation) and registers
+	// its hooks through RegisterSendMessageHook, which takes p.mu.
+	p.startTraceDispatcher()
+	return nil
+}
+
+// startLocked is Start's body; it reports whether THIS call brought the producer
+// up (a second Start is a no-op).
+func (p *DefaultMQProducer) startLocked() (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.started {
-		return nil
+		return false, nil
 	}
 	// Java DefaultMQProducer.start:375 setProducerGroup(withNamespace(group)) —
 	// the broker registers the PREFIXED group name. checkConfig runs after it.
@@ -606,17 +662,17 @@ func (p *DefaultMQProducer) Start() error {
 		p.producerGroup = common.WrapNamespace(p.namespace, p.producerGroup)
 	}
 	if err := common.CheckGroup(p.producerGroup); err != nil {
-		return err
+		return false, err
 	}
 	if p.producerGroup == common.DefaultProducerGroup {
-		return common.ClientError(fmt.Sprintf(
+		return false, common.ClientError(fmt.Sprintf(
 			"producerGroup can not equal %s, please specify another one.", common.DefaultProducerGroup))
 	}
 	if len(p.nameServerAddrs) == 0 {
 		// Java only reports this on the first send (as 10004); surfacing it
 		// here is more predictable, but must use the SAME code so callers do
 		// not have to handle two different values for one failure.
-		return common.ClientErrorCode(common.NoNameServerException, "name server address is not set")
+		return false, common.ClientErrorCode(common.NoNameServerException, "name server address is not set")
 	}
 	// Java defaultMQProducerImpl.start:250-252: changeInstanceNameToPID then
 	// buildMQClientId. The instance name is written back in place, so a second
@@ -635,7 +691,7 @@ func (p *DefaultMQProducer) Start() error {
 	// instance — the signature has to cover exactly the fields Java signs.
 	inst.EnsureRPCHooks(p.namespaceV2, p.enableStreamRequestType, p.rpcHook)
 	if err := inst.Start(); err != nil {
-		return err
+		return false, err
 	}
 	// A dynamic nameserver (TopAddressing) may have resolved addresses during
 	// instance start; copy them back so the producer reports them.
@@ -665,7 +721,38 @@ func (p *DefaultMQProducer) Start() error {
 	p.started = true
 	p.heartbeatRunning.Store(true)
 	go p.heartbeatLoop()
-	return nil
+	return true, nil
+}
+
+// startTraceDispatcher is Java DefaultMQProducer.start:380-405: with
+// enableTrace on, build a PRODUCE dispatcher, register its send and
+// end-transaction hooks, then start it. Failures only log — a broken trace
+// stack must never take the producer down.
+func (p *DefaultMQProducer) startTraceDispatcher() {
+	p.mu.Lock()
+	enable := p.enableTrace
+	batchNum := p.traceMsgBatchNum
+	topic := p.traceTopic
+	group := p.producerGroup
+	nameSrv := strings.Join(p.nameServerAddrs, ";")
+	rpcHook := p.rpcHook
+	dispatcher := p.traceDispatcher
+	if enable && dispatcher == nil {
+		dispatcher = NewAsyncTraceDispatcher(group, TraceDispatcherProduce, batchNum, topic, rpcHook)
+		dispatcher.SetHostProducer(p)
+		p.traceDispatcher = dispatcher
+	}
+	p.mu.Unlock()
+
+	if enable && group != "" {
+		p.RegisterSendMessageHook(NewSendMessageTraceHook(dispatcher))
+		p.RegisterEndTransactionHook(NewEndTransactionTraceHook(dispatcher))
+	}
+	if dispatcher != nil {
+		if err := dispatcher.Start(nameSrv, AccessChannelLocal); err != nil {
+			common.LogWarnf("trace dispatcher start failed: %v", err)
+		}
+	}
 }
 
 // Shutdown mirrors Java DefaultMQProducerImpl.shutdown.
@@ -679,8 +766,8 @@ func (p *DefaultMQProducer) Shutdown() {
 	p.destroyAsyncExecutors()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !p.started {
+		p.mu.Unlock()
 		return
 	}
 	p.heartbeatRunning.Store(false)
@@ -698,6 +785,17 @@ func (p *DefaultMQProducer) Shutdown() {
 	}
 	p.mqClient = nil
 	p.started = false
+	dispatcher := p.traceDispatcher
+	p.traceDispatcher = nil
+	p.mu.Unlock()
+
+	// The trace dispatcher goes last, outside the lock: it must flush what is
+	// still queued and wait for it, and it sends through its OWN internal
+	// producer (unaffected by the host instance having just shut down). Java
+	// orders it the same way — impl.shutdown(), then the dispatcher.
+	if dispatcher != nil {
+		dispatcher.Shutdown()
+	}
 }
 
 // heartbeatLoop periodically advertises this producer group to every broker
@@ -1106,6 +1204,14 @@ func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq co
 	if err := p.checkForbidden(forbiddenHooks, msg, mq, addr, mode); err != nil {
 		return nil, err
 	}
+	// W3C traceparent passthrough (opt-in): a message without one gets a root
+	// span; a caller-propagated value is never overwritten. Java leaves this to
+	// an external OpenTelemetry/SkyWalking hook — the ports build the equivalent
+	// in, and it runs in the same position (after the forbidden hooks, before
+	// the send context is built, so the trace hook sees the property).
+	if p.enableTraceContext {
+		InjectTraceContext(msg)
+	}
 
 	var hookCtx *SendMessageContext
 	if len(sendHooks) > 0 {
@@ -1158,6 +1264,10 @@ func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQ
 	sendHooks, forbiddenHooks, _ := p.hookSnapshot()
 	if err := p.checkForbidden(forbiddenHooks, msg, mq, addr, CommunicationModeOneway); err != nil {
 		return err
+	}
+	// W3C traceparent passthrough (opt-in), same position as the sync path.
+	if p.enableTraceContext {
+		InjectTraceContext(msg)
 	}
 
 	var hookCtx *SendMessageContext

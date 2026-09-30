@@ -275,13 +275,26 @@ func (c *DefaultMQPushConsumer) dispatchLoop() {
 				continue
 			}
 			progressed = true
+			if !c.beginInFlight() {
+				// Shutdown froze new work: hand the batch back instead of
+				// consuming it. Its offset was never advanced, so the broker
+				// redelivers it on the next start.
+				if pq := c.processQueueOf(mq); pq != nil {
+					pq.RequeueBatch(batch)
+				}
+				return
+			}
 			if c.isOrderly() {
-				c.consumeBatch(mq, batch, epoch)
+				func() {
+					defer c.inFlight.Done()
+					c.consumeBatch(mq, batch, epoch)
+				}()
 				continue
 			}
 			select {
 			case c.dispatchSem <- struct{}{}:
 			case <-c.stopCh:
+				c.inFlight.Done()
 				return
 			}
 			go func(mq common.MessageQueue, batch []*common.MessageExt, epoch uint64) {
@@ -293,6 +306,7 @@ func (c *DefaultMQPushConsumer) dispatchLoop() {
 							pq.RequeueBatch(batch)
 						}
 					}
+					c.inFlight.Done()
 				}()
 				c.consumeBatch(mq, batch, epoch)
 			}(mq, batch, epoch)
@@ -322,7 +336,13 @@ func (c *DefaultMQPushConsumer) cleanExpireLoop() {
 		if !c.IsStarted() {
 			return
 		}
+		if !c.beginInFlight() {
+			// Shutdown froze new work; a sweep started now would run its
+			// send-backs after the drain window.
+			return
+		}
 		func() {
+			defer c.inFlight.Done()
 			// Java's scheduler shell catches Throwable (:77-81): one bad round
 			// must not kill the schedule.
 			defer func() {

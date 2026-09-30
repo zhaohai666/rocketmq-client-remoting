@@ -49,6 +49,43 @@ func (s ConsumeOrderlyStatus) String() string {
 	}
 }
 
+// ConsumeReturnType mirrors Java
+// org.apache.rocketmq.client.consumer.listener.ConsumeReturnType.
+//
+// The ORDINAL is a wire-format value: a SubAfter trace record stores it as
+// contextCode (Java ConsumeMessageTraceHookImpl:113). Reordering the constants
+// would silently relabel every consume outcome in the console.
+type ConsumeReturnType int
+
+const (
+	ConsumeReturnSuccess ConsumeReturnType = iota
+	ConsumeReturnTimeout
+	ConsumeReturnException
+	ConsumeReturnNull
+	ConsumeReturnFailed
+)
+
+var consumeReturnTypeNames = [...]string{"SUCCESS", "TIME_OUT", "EXCEPTION", "RETURNNULL", "FAILED"}
+
+func (r ConsumeReturnType) String() string {
+	if r >= 0 && int(r) < len(consumeReturnTypeNames) {
+		return consumeReturnTypeNames[r]
+	}
+	return "SUCCESS"
+}
+
+// ConsumeReturnTypeByName is the reverse lookup the hook context performs: the
+// consumer stores the NAME under common.ConsumeContextType and the trace hook
+// maps it back to the ordinal (Java ConsumeReturnType.valueOf).
+func ConsumeReturnTypeByName(name string) (ConsumeReturnType, bool) {
+	for i, n := range consumeReturnTypeNames {
+		if n == name {
+			return ConsumeReturnType(i), true
+		}
+	}
+	return ConsumeReturnSuccess, false
+}
+
 // ConsumeConcurrentlyContext is handed to a concurrent listener and read back
 // afterwards (Java ConsumeConcurrentlyContext).
 type ConsumeConcurrentlyContext struct {

@@ -718,6 +718,13 @@ func (p *DefaultMQProducer) sendKernelAsync(chain *asyncChain) error {
 	if err := p.checkForbidden(forbiddenHooks, chain.msg, chain.mq, addr, CommunicationModeAsync); err != nil {
 		return err
 	}
+	// W3C traceparent passthrough (opt-in), same position as the sync path.
+	// ⚠ This runs on chain.msg, which restoreCallerMessage has not yet touched,
+	// and the property it writes survives every retry — the request is built
+	// once below and reused.
+	if p.enableTraceContext {
+		InjectTraceContext(chain.msg)
+	}
 	if len(sendHooks) > 0 {
 		chain.ctx = p.buildSendContext(chain.msg, chain.mq, addr, CommunicationModeAsync)
 		executeSendMessageHooksBefore(sendHooks, chain.ctx)

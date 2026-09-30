@@ -676,6 +676,9 @@ func (c *DefaultMQPushConsumer) finishConsumeHook(hooks []ConsumeMessageHook, ct
 	if ctx == nil {
 		return
 	}
+	unknown := rawStatus != ConsumeSuccess && rawStatus != ReconsumeLater
+	ctx.Props[common.ConsumeContextType] = c.consumeReturnType(unknown, panicked,
+		status == ReconsumeLater, common.CurrentTimeMillis()-begin).String()
 	ctx.Success = status == ConsumeSuccess
 	ctx.Status = status.String()
 	executeConsumeHookAfter(hooks, ctx)
@@ -687,11 +690,38 @@ func (c *DefaultMQPushConsumer) finishOrderlyHook(hooks []ConsumeMessageHook, ct
 	if ctx == nil {
 		return
 	}
+	unknown := rawStatus != OrderlySuccess && rawStatus != OrderlyRollback &&
+		rawStatus != OrderlyCommit && rawStatus != OrderlySuspendCurrentQueueAMoment
+	ctx.Props[common.ConsumeContextType] = c.consumeReturnType(unknown, panicked,
+		status == OrderlySuspendCurrentQueueAMoment, common.CurrentTimeMillis()-begin).String()
 	// Java:483-511 — the hook sees the NORMALISED status, while the returnType
 	// is derived from the raw one; success is SUCCESS||COMMIT.
 	ctx.Success = status == OrderlySuccess || status == OrderlyCommit
 	ctx.Status = status.String()
 	executeConsumeHookAfter(hooks, ctx)
+}
+
+// consumeReturnType is Python _consume_return_type (Rust consume_return_type) —
+// the value lands in the trace's SubAfter contextCode.
+//
+// unknown stands for Java's null listener return: a Go listener cannot return
+// null, so the out-of-range value the callers already normalise the same way
+// takes its place. Order of the checks is Java's (concurrent :381-393,
+// orderly :483-496): null, then the RT ceiling, then the outcome.
+func (c *DefaultMQPushConsumer) consumeReturnType(unknown, panicked, failed bool, rtMs int64) ConsumeReturnType {
+	if unknown {
+		if panicked {
+			return ConsumeReturnException
+		}
+		return ConsumeReturnNull
+	}
+	if rtMs >= c.consumeTimeout*60*1000 {
+		return ConsumeReturnTimeout
+	}
+	if failed {
+		return ConsumeReturnFailed
+	}
+	return ConsumeReturnSuccess
 }
 
 // AccessChannelLocal is Java AccessChannel.LOCAL.
