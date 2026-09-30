@@ -475,18 +475,26 @@ func (i *Instance) processGetConsumerStatus(request *remoting.RemotingCommand, _
 	sink.Respond(response)
 }
 
-// processReplyMessage (326) routes request-reply answers to the waiting
-// producer future table; the holder lands with the producer task. Until then
-// the unmatched branch logs what Java logs on a miss and answers SUCCESS
-// (both matched and unmatched paths answer SUCCESS in Java).
+// processReplyMessage (326) routes a broker-pushed reply to the producer
+// future waiting on its correlationId (Rust process_reply_message, Python
+// _process_reply_message). The holder removes the future first, so a late or
+// duplicate push lands in the unmatched branch — a normal race, warned about
+// exactly like Java. Decode success answers SUCCESS either way.
 func (i *Instance) processReplyMessage(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
 	var header remoting.ReplyMessageRequestHeader
 	header.FromExtFields(request.ExtFields())
-	bornHost := ""
-	if header.BornHost != nil {
-		bornHost = *header.BornHost
+	msg, err := buildReplyMessageExt(&header, request.Body)
+	if err != nil {
+		common.LogWarnf("unknown err when receiveReplyMsg: %v", err)
+		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError,
+			fmt.Sprintf("process reply message fail: %v", err)))
+		return
 	}
-	common.LogWarnf("receive reply message, but not matched any request, CorrelationId: %q, reply from host: %q", "", bornHost)
+	correlationID, _ := msg.GetProperty(common.PropertyCorrelationID)
+	if GetRequestFutureHolder().PutResponse(correlationID, msg) == nil {
+		common.LogWarnf("receive reply message, but not matched any request, CorrelationId: %q, reply from host: %q",
+			correlationID, strValue(header.BornHost))
+	}
 	sink.Respond(remoting.CreateResponseCommand(remoting.RespSuccess, ""))
 }
 

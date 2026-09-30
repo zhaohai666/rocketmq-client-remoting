@@ -368,6 +368,7 @@ type DefaultMQProducer struct {
 	createTopicKey          string
 	defaultTopicQueueNums   int32
 	sendMsgTimeout          int64
+	requestTimeout          int64
 	compressMsgBodyOverHow  int
 	compressLevel           int
 	compressType            int32
@@ -452,6 +453,7 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		createTopicKey:          common.DefaultTopic,
 		defaultTopicQueueNums:   common.DefaultTopicQueueNums,
 		sendMsgTimeout:          DefaultSendMsgTimeout,
+		requestTimeout:          DefaultRequestTimeoutMillis,
 		compressMsgBodyOverHow:  DefaultCompressMsgBodyOverHowmuch,
 		compressLevel:           DefaultCompressLevel,
 		compressType:            common.ZlibType,
@@ -520,6 +522,7 @@ func (p *DefaultMQProducer) SetPollNameServerIntervalMillis(v int64) {
 }
 func (p *DefaultMQProducer) SetHeartbeatIntervalMillis(v int64) { p.heartbeatIntervalMillis = v }
 func (p *DefaultMQProducer) SetSendMsgTimeout(v int64)          { p.sendMsgTimeout = v }
+func (p *DefaultMQProducer) SetRequestTimeout(v int64)          { p.requestTimeout = v }
 func (p *DefaultMQProducer) SetMaxMessageSize(v int)            { p.maxMessageSize = v }
 func (p *DefaultMQProducer) SetRetryTimesWhenSendFailed(n int)  { p.retryTimesWhenSendFail = n }
 func (p *DefaultMQProducer) SetSendMsgMaxTimeoutPerRequest(v int64) {
@@ -1868,6 +1871,69 @@ func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.Remoti
 		return
 	}
 	go task()
+}
+
+// RecallMessage mirrors Java DefaultMQProducer.recallMessage(topic, with the
+// namespace applied at the facade): delete a not-yet-delivered timer/delay
+// message identified by the recall handle the original send returned, and
+// return its uniqKey. Validation order is Java DefaultMQProducerImpl:1570-1601
+// — state, topic name, %RETRY%/%DLQ% rejection, handle decode, route refresh,
+// broker pinning. The broker side gates this behind recallMessageEnable
+// (default false), which surfaces as NO_PERMISSION.
+func (p *DefaultMQProducer) RecallMessage(topic, recallHandle string) (string, error) {
+	inst, err := p.requireClient()
+	if err != nil {
+		return "", err
+	}
+	topic = p.withNamespace(topic)
+	if err := common.CheckTopic(topic); err != nil {
+		return "", err
+	}
+	if common.IsRetryTopic(topic) || common.IsDLQTopic(topic) {
+		return "", common.ClientError("topic is not supported")
+	}
+	handle, err := common.DecodeRecallHandle(recallHandle)
+	if err != nil {
+		return "", err
+	}
+	// Java tryToFindTopicPublishInfo: the route itself is unused, but its error
+	// propagates (DefaultMQProducerImpl:1586).
+	if _, err := p.topicPublishInfo(topic); err != nil {
+		return "", err
+	}
+	// Master publish address first; any address of the topic's route (slave
+	// allowed) as the fallback, like Java findBrokerAddrByTopic.
+	addr, ok := inst.FindBrokerAddressInPublish(handle.BrokerName)
+	if !ok {
+		// Java findBrokerAddrByTopic returns null when the route has no
+		// address — the error is swallowed and the miss reported below.
+		if fallback, err := inst.BrokerAddrForTopic(topic); err == nil {
+			addr, ok = fallback, true
+		}
+	}
+	if !ok {
+		common.LogWarnf("can't find broker service address. %s", handle.BrokerName)
+		return "", common.ClientError("The broker service address not found")
+	}
+	request := remoting.CreateRequestCommand(remoting.ReqRecallMessage, &remoting.RecallMessageRequestHeader{
+		ProducerGroup: strPtr(p.producerGroup),
+		Topic:         strPtr(topic),
+		RecallHandle:  strPtr(recallHandle),
+		Bname:         strPtr(handle.BrokerName),
+	})
+	response, err := inst.Remoting().InvokeSync(addr, request, p.sendMsgTimeout)
+	if err != nil {
+		return "", err
+	}
+	if err := inst.checkResponse(response); err != nil {
+		return "", err
+	}
+	var header remoting.RecallMessageResponseHeader
+	header.FromExtFields(response.ExtFields())
+	if strValue(header.MsgID) == "" {
+		return "", common.ClientError(fmt.Sprintf("recall message response has no msgId, addr %s", addr))
+	}
+	return *header.MsgID, nil
 }
 
 // ---------------------------------------------------------------- misc
