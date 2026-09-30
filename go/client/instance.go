@@ -578,8 +578,14 @@ func (i *Instance) processConsumeMessageDirectly(request *remoting.RemotingComma
 		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError, "empty message body"))
 		return
 	}
-	// Java MessageDecoder.clientDecode(body, readBody=true): the body is one
-	// stored message with its body present.
+	// Java MessageDecoder.clientDecode(body, readBody=true), which is
+	// decode(bb, readBody=true, deCompressBody=true, isClient=true,
+	// isSetPropertiesString=false, checkCRC=false) — exactly
+	// common.DefaultDecodeOptions(). So the body is one stored message with its
+	// body present, DECOMPRESSED if the sysFlag says so, and with IsClient set
+	// (a MessageClientExt, i.e. MsgID also lands in OffsetMsgID).
+	// (Plain MessageDecoder.decode, by contrast, passes isClient=false; using it
+	// here would drop OffsetMsgID from every 309 delivery.)
 	msg, err := common.DecodeMessage(request.Body)
 	if err != nil {
 		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError,
