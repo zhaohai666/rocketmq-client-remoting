@@ -39,7 +39,7 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 | C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | `ctest`：50 个用例 / 3986 项断言 |
 | .NET | [`dotnet/`](dotnet/README.md) | C# / .NET 10，零 NuGet 依赖 | `dotnet test`：740 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | `cargo test --lib`：891 条；`cargo clippy --all-targets` 零 warning |
-| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖，压缩 ZLIB-only | `go test ./...`：427 条；`go vet` / `gofmt` 零告警 |
+| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖，压缩 ZLIB-only | `go test ./...`：529 条；`go vet` / `gofmt` 零告警 |
 
 各语言 README 包含该实现的构建方式、快速上手、配置项（日志 / TLS / 压缩）、目录结构，
 以及真机联调工具清单。

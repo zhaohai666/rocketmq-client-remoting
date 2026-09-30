@@ -21,12 +21,14 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 协议层 | `RemotingCommand` 帧编解码；`CommandCustomHeader` 家族（含 V2 单字母短键 a..n）；JSON 与 RocketMQ 二进制双序列化；17 段存储格式 + 6 段批量格式 |
 | 传输层 | 惰性建连 + 复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时、重连、GO_AWAY(1500)、连接断开时在途请求立即判死、broker 主动请求派发、TLS（`crypto/tls`） |
 | 发送 | 同步 / 定点 / 批量 / 单向 / 队列选择器 / 异步（真内核 + 背压信号量 + 有界队列）/ 事务消息（两阶段 + broker 回查 + 单工 check 线程）/ 定时消息撤回（recallMessage 370）/ Request-Reply |
-| 消费 | Push Consumer（长轮询 + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 + OFFSET_ILLEGAL 冻结重建 + 220 重置位点）、Pull Consumer（调用方持有游标 + 长轮询）、Lite Pull Consumer（**双游标引擎**：拉取游标 / 消费游标 / 内存提交表，361 + LITE 位） |
+| 消费 | Push Consumer（长轮询 + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 + OFFSET_ILLEGAL 冻结重建 + 220 重置位点 + **POP 模式**）、Pull Consumer（调用方持有游标 + 长轮询）、Lite Pull Consumer（**双游标引擎**：拉取游标 / 消费游标 / 内存提交表，361 + LITE 位） |
+| 消费侧应答 | `GET_CONSUMER_RUNNING_INFO(307)`（三层属性 + subscriptionSet + mqTable/mqPopTable 互斥 + statusTable）、`CONSUME_MESSAGE_DIRECTLY(309)`（并发/顺序两套判定 + panic → CR_THROW_EXCEPTION）、`CONSUMER_SEND_MSG_BACK(36)`、`GET_CONSUMER_STATUS_FROM_CLIENT(221)`、`RESET_CONSUMER_CLIENT_OFFSET(220)` |
+| 消费侧统计 | `ConsumerStatsManager`：五组 StatsItemSet（CONSUME_OK/FAILED_TPS、CONSUME_RT、PULL_TPS/RT），累计 + 两级采样链，快照是**差分窗口**；307 的 statusTable 就是它 |
 | 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动 |
 | 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询 |
 | 消息轨迹 | 客户端轨迹生产：Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录，Java `TraceDataEncoder` **逐字节**对齐（真值向量见单测）；`AsyncTraceDispatcher`（2048 有界丢弃 + 批 20 + 128K 分片 + 5s 冲刷 + 关停冲尾批）、内部生产者与 topic 前缀两道防自噬、W3C `traceparent` 注入与透传（`ROCKETMQ_TRACE_CONTEXT_ENABLE`） |
-| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、消费侧状态查询（221 位点表）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
-| 未实现（与其它四端的差距） | **POP 消费**（`ReqPopMessage` 等常量已声明但零引用）、**消费侧统计**（`ConsumerStatsManager` 的 RT/TPS；只有 221 位点表）、**消费侧 307 应答器**（307 仅管理端发起）、**selfcheck 工具** |
+| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、POP 消费（200050/200051/200052 + 检查点反构）、消费侧状态与运行信息应答（221 位点表 / 307 / 309）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
+| 未实现 | **selfcheck 工具** —— 但这不是与 Java 的差距：**Java 客户端根本没有这个机制**（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令），要做就是从零设计，见下方待办 |
 | 校验门 | `Validators` / `TopicValidator`：组名 / topic 校验在 `start()` 建客户端实例**之前**本地跑完，失败不碰网络 |
 
 **与其它四个端口的刻意差异 —— 压缩只有 ZLIB**：标准库没有 LZ4/ZSTD，而本模块承诺零第三方
@@ -41,32 +43,36 @@ cd go
 go build ./...
 go vet ./...
 gofmt -l .        # 空输出才是过
-go test ./...     # 427 条，~9s
+go test ./...     # 529 条，~9s
 go test -race ./client/   # 并发回归（lite 消费者、异步发送、位点提交地板）
 ```
 
 ## 单元测试
 
-427 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
+529 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
 （`client/consumer_test.go` 里的 `clusterFixture`：真 socket 监听的假 broker + 假 name server，
 脚本化应答，能锁死请求码、ext 字段名与重试分类）：
 
 | 包 | 条数 | 覆盖 |
 | --- | --- | --- |
-| `client`（234） | producer 33 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、钩子各跑一次、发送头守卫 |
+| `client`（285） | producer 19 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、发送头守卫 |
+| | hooks 14 | `CheckForbiddenHook` 每次尝试都调且不吞异常、`FilterMessageHook` 吞异常且后续照跑、ACL 签名拼串（key 排序、只拼 value、跳过 Signature） |
 | | async 27 | 真异步内核：换 broker 换 opaque、背压信号量、有界队满同步抛、回调恰好一次、预算共享 |
 | | transaction 6 | 两阶段 + 回查响应、单工 check 线程 |
 | | request_reply 13 | 326 holder、Request/AsyncRequest 超时 |
 | | consumer 29 | 长轮询、顺序重投闸门、流控、位点五 RPC、OFFSET_ILLEGAL、220、广播、关停在途消费 join + send-back 守卫、位点提交地板三条（部分 ack 整批提交 / 回投失败钉住位点 / 乱序批次不回跳） |
+| | consumer_stats 19 | 差分窗口口径、10s/10min 两级采样、`consumeRT` 独有的 hour 回退、`consumeFailedMsgs` 取 hour sum、key 是 topic@group、拉取与消费两条记录路径 |
+| | consumer_running_info 17 | **307** 空体六键与 `jstack` 未设即不出现、`mqTable`/`mqPopTable` **内联对象键按原始字节**断言、经典 vs POP 两表互斥、statusTable 含 `%RETRY%` 且取自统计管理器、processQueueInfo 14 键 / popProcessQueueInfo 3 键、**309** 并发与顺序两套判定 + `autoCommit` 在 listener 之后读 + panic→CR_THROW_EXCEPTION + 重投 topic 还原 + 两条错误臂端到端 |
+| | pop 15 | 检查点 8 段反构（含 `1ST_POP_TIME`）、ACK 用 checkpoint offset、失败改不可见时间、`checkNeedAckOrDelay` 两分支、401 请求模式、`order`/`suspend` 恒在报文里 |
 | | lite_pull 9 | **361 + LITE 位上线**、双游标（NO_NEW_MSG 也跟 nextBeginOffset）、Seek 丢缓冲、提交表是**清扫**不是过滤、暂停恢复闸门、订阅模式重平衡 + 关停落盘 |
 | | pull_consumer 18 | 短轮询不带 SUSPEND 位、长轮询真挂起、调用方游标、sendMessageBack |
 | | admin 35 | topic/组 CRUD、分页合并、222 的 `isForce` 键名、26 号 body 是 Properties 文本 |
-| | instance/route 25 | 实例表复用、路由刷新、发布地址只认 master、注销 35 遍历主从 |
+| | instance 15 | 实例表复用、路由刷新、发布地址只认 master、注销 35 遍历主从、220/221/40 的 broker 主动请求 |
+| | route 10 | 路由表发布槽位（`brokerAddrs` 裸数字键）、TBW102 兜底、unknown topic 重试窗口 |
 | | offset_store 9 | 本地/broker 双表、persistAll 清扫语义 |
-| | hooks 14 | 五类钩子时序、ACL 签名拼串 |
 | | trace 30 | Java 编码器**逐字节**真值向量、解码容错（无 keys 空段、坏记录只跳过自己）、SubBefore/SubAfter 共用 requestId + contextCode 五档、traceparent 注入与校验、分发器防自噬，以及两条**进程内真集群**端到端（Pub 落轨迹 topic 且不递归 / 消费对落盘并配对） |
-| `common`（101） | 101 | 17 段编解码（坏数据拒收、压缩段 crc32）、消息模型、clientId 口径、recall 句柄真值向量、namespace、sysflag 位表、校验器 |
-| `remoting`（92） | 92 | 真 socket 回环（同步/异步/oneway、半包、并发 opaque、静默超时）、TLS、ACL 签名、V2 短键名守卫（错一个字母就**静默丢字段**）、JSON 容错（裸数字键、对象 key、NaN）、心跳装配 |
+| `common`（111） | 111 | 17 段编解码（坏数据拒收、压缩段 crc32）、消息模型、clientId 口径、recall 句柄真值向量、namespace、sysflag 位表、ExtraInfo 8 段、校验器 |
+| `remoting`（133） | 133 | 真 socket 回环（同步/异步/oneway、半包、并发 opaque、静默超时）、TLS、ACL 签名、V2 短键名守卫（错一个字母就**静默丢字段**）、JSON 容错（裸数字键、对象 key、NaN）、**fastjson2 出站写入器**（MessageQueue 内联对象键 + Java double 格式）、`CurrentVersion`/`CurrentVersionDesc` 成对守卫、心跳装配、POP 与 ClientInfo body 形状 |
 
 ## 真实集群联调
 
@@ -100,7 +106,9 @@ bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 liv
 **尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
 重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
 `cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
-ACL、TLS、SQL92、管理员端（库已就位但无真机工具）、压缩跨语言矩阵的 Go 腿。
+ACL、TLS、SQL92、管理员端（库已就位但无真机工具）、压缩跨语言矩阵的 Go 腿，
+以及 **307/309 的真实 broker 往返**（`mqadmin consumerStatus -s` 走的就是这两条；目前只在
+进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
 
 ## 目录结构
 
