@@ -14,7 +14,8 @@ Apache RocketMQ **经典 remoting 协议**客户端的 Node.js 实现。与 `pyt
 node --experimental-strip-types selfcheck.ts
 ```
 
-加载 `src/` 全部模块并跑 4 套冒烟（协议层 / producer / consumer / 统计）。
+加载 `src/` 全部模块并跑 5 套冒烟（协议层 / producer / consumer / 统计 / Java 差距补齐面）。
+（注：本机沙箱若拦截 `spawnSync` 起子进程，可直接逐个运行 `test/*.ts` 验证。）
 
 ## 快速上手
 
@@ -59,11 +60,18 @@ await consumer.start();
 | 发送 | ✅ | 同步/批量/单向/队列选择器/异步/事务两阶段+回查/Request-Reply/recallMessage |
 | Push Consumer | ✅ | 长轮询、顺序、广播、位点持久化、流控阈值、307/220/221 应答、RETRY 还原 |
 | Pull / Lite Pull | ✅ | 短轮询（pull）与阻塞轮询（pullBlockIfNotFound）、Lite Pull 订阅+assign+seek+自动提交 |
-| 队列分配 | ✅ | AVG / AVG_BY_CIRCLE / CONFIG / MACHINE_ROOM / CONSISTENT_HASH（MD5 环 + 虚拟节点） |
+| 队列分配 | ✅ | AVG / AVG_BY_CIRCLE / CONFIG / MACHINE_ROOM / CONSISTENT_HASH（MD5 环 + 虚拟节点）/ **MACHINE_ROOM_NEARBY**（Java AllocateMachineRoomNearBy：机房内独占 + 无活消费者机房全局均摊；resolver 给出空机房抛错） |
 | 管理端 | ✅ | `DefaultMQAdminExt`：topic CRUD、集群/运行时信息、订阅组（**分页 201**）、消费统计、连接查询、位点重置、KV 配置（**广播**）、GET_BROKER_CONFIG（**Properties 文本体**） |
 | 消息轨迹 | ✅ | 编解码（`\x01`/`\x02` 分隔、无 keys SubBefore 7 段容错）、异步分发器、收发钩子 |
 | 消费统计 | ✅ | 差分窗口 StatsItem（10s/10min 采样链）、307 statusTable（consumeFailedMsgs 取 hour 窗口） |
 | 钩子/ACL | ✅ | CheckForbidden（不吞异常）/ FilterMessage（必须吞）、ACL 签名（HMAC-SHA1 + Base64） |
+| Request-Reply 接收侧 | ✅ | `PUSH_REPLY_MESSAGE_TO_CLIENT(326)` 处理器：按 Java `processReplyMsg` 从 ReplyMessageRequestHeader 重建 MessageExt、解压 body、按 CORRELATION_ID 原子移除 future 并唤醒（发送侧 `request()` 对齐 Java `prepareSendRequest`：REPLY_TO_CLIENT=clientId + TTL） |
+| 异步背压 | ✅ | 两个公平信号量（num/size）接入 `sendAsync`：许可不足同步抛、回调恰好一次归还；`setBackPressureForAsyncSendNum/Size` 运行时可调 |
+| W3C traceparent | ✅ | `src/client/traceparent.ts`：注入（调用方传播的上下文优先）/ 提取 / 校验 / 子 span，`ROCKETMQ_TRACE_CONTEXT_ENABLE` 开关，与 Go 端同款 |
+| VIP channel | ✅ | Producer 侧 `setSendMessageWithVIPChannel`：发送 RPC 走 broker VIP 端口（port-2） |
+| Name server 配置 | ✅ | `updateNameServerConfig`（318 广播，Properties 文本体）/ `getNameServerConfig`（319） |
+| 消息查询 | ✅ | `queryMessage`(12) / `queryMessageByUniqKey` / `viewMessage`(33，msgId 内嵌地址直连) / `consumeMessageDirectly`(309 admin 发起) / 边界位点 LOWER/UPPER / `examineConsumerOffset` |
+| 5.x 定时消息 | ✅ | `setDelayTimeSec/Ms` / `setDeliverTimeMs`（TIMER_DELAY_SEC / TIMER_DELAY_MS / TIMER_DELIVER_MS，Java Message 同名 setter） |
 | 压缩 | ⚠️ | zlib 闭环完成；**LZ4/ZSTD 未实现**（消费端遇到会大声报错丢弃，不做透传——与 Go 端同一取舍） |
 
 ## 真实集群联调
@@ -81,7 +89,12 @@ topic/组名默认带时间戳，残留状态不会让断言假绿。
 
 ## 已知与五端的差异
 
-- **POP 消费模式**未实现（5.5.1 单 broker 集群下其余端已验证；nodeJs 端列为后续项）。
+- **POP 消费模式**未实现（5.5.1 单 broker 集群下其余端已验证；nodeJs 端列为后续项，
+  请求码常量已备，参照 Go 端 pop_api/pop_consumer/pop_process_queue 三件套移植）。
+- **2026-10-01 对 Java 客户端（zhaohai666-rocketmq 5.x）补齐**：MACHINE_ROOM_NEARBY、
+  Request-Reply 326 接收侧闭环、异步背压接线、traceparent、VIP channel、
+  admin 消息查询/边界位点/307 位点读/name server 配置/309 admin 发起、5.x 定时 setter
+  —— 见 `test/java_gap_fill_smoke.ts`。
 - **2026-09-30 真机验证基线**：producer 8/8（sync×10 / batch / oneway / async / selector /
   事务 COMMIT / broker 回查）、consumer 2/2（20 条 exactly-once）、pull 3/3、lite_pull 3/3
   （poll / seek / commitSync）、admin 11/11 —— 全部对真实 5.5.1 集群（`scripts/run_node_live.sh`）。
@@ -89,6 +102,8 @@ topic/组名默认带时间戳，残留状态不会让断言假绿。
   回查窗口 ≥90s（broker 巡检周期 30s）。
 - **消息轨迹消费侧解码**已实现，但轨迹真机用例未跑通前不建议依赖。
 - 压缩仅 zlib（见上表）。
+- Java 5.x 已移除的 SUSPEND/RESUME_CONSUMER(209/210)、ADJUST_CONSUMER_THREAD_POOL(213)
+  只有请求码常量、无任何调用方（tools 模块同样未用），nodeJs 端与 Java 基线保持一致、不实现。
 
 ## 目录结构
 

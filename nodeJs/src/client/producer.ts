@@ -34,6 +34,8 @@ import {
 } from './hook.ts';
 import { MQFaultStrategy } from './latency.ts';
 import { getOrCreateProduceAccumulator, ProduceAccumulator } from './produce_accumulator.ts';
+import { FairSemaphore } from './backpressure.ts';
+import { injectTraceContext, traceContextEnabledFromEnv } from './traceparent.ts';
 import {
   createCorrelationId, createReplyMessage, isReplyMessage, RequestCallback,
   REQUEST_FUTURE_HOLDER, getReplyTopic, RequestResponseFuture,
@@ -98,11 +100,24 @@ export class DefaultMQProducer {
   heartbeatIntervalMillis: number;
   autoBatch: boolean;
   enableTrace: boolean;
+  // Java DefaultMQProducer.sendMessageWithVIPChannel (default false): send
+  // rpcs target the broker's VIP port (listen port - 2).
+  sendMessageWithVIPChannel: boolean;
+  // W3C traceparent passthrough switch (Java delegates this to an external
+  // OTel/SkyWalking hook); independent of enableTrace, seeded from
+  // ROCKETMQ_TRACE_CONTEXT_ENABLE like every other port.
+  enableTraceContext: boolean;
 
   client: MQClient | null;
   mqFaultStrategy: MQFaultStrategy;
   producerClientId: string;
   private _accumulator: ProduceAccumulator | null;
+  // Async-send backpressure (Java DefaultMQProducer backPressureForAsyncSendNum
+  // / Size + the two fair semaphores built in initAsyncConfig).
+  backPressureForAsyncSendNum: number;
+  backPressureForAsyncSendSize: number;
+  private _semaphoreAsyncSendNum: FairSemaphore;
+  private _semaphoreAsyncSendSize: FairSemaphore;
 
   constructor(producerGroup: string = MixAll.DEFAULT_PRODUCER_GROUP) {
     this.producerGroup = producerGroup;
@@ -122,11 +137,17 @@ export class DefaultMQProducer {
     this.heartbeatIntervalMillis = 30 * 1000;
     this.autoBatch = false;
     this.enableTrace = false;
+    this.sendMessageWithVIPChannel = false;
+    this.enableTraceContext = traceContextEnabledFromEnv();
 
     this.client = null;
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
     this.producerClientId = this._buildClientId();
     this._accumulator = null;
+    this.backPressureForAsyncSendNum = 1000;
+    this.backPressureForAsyncSendSize = 100 * 1024 * 1024;
+    this._semaphoreAsyncSendNum = new FairSemaphore(this.backPressureForAsyncSendNum);
+    this._semaphoreAsyncSendSize = new FairSemaphore(this.backPressureForAsyncSendSize);
   }
 
   private _buildClientId(): string {
@@ -160,6 +181,44 @@ export class DefaultMQProducer {
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
+  setSendMessageWithVIPChannel(enable: boolean): this { this.sendMessageWithVIPChannel = enable; return this; }
+  isSendMessageWithVIPChannel(): boolean { return this.sendMessageWithVIPChannel; }
+  setEnableTraceContext(enable: boolean): this { this.enableTraceContext = enable; return this; }
+  isEnableTraceContext(): boolean { return this.enableTraceContext; }
+
+  // Runtime backpressure knobs (Java documents them as RUNTIME tunables).
+  setBackPressureForAsyncSendNum(num: number): this {
+    this.backPressureForAsyncSendNum = num;
+    this._semaphoreAsyncSendNum.setTotalPermits(num);
+    return this;
+  }
+  setBackPressureForAsyncSendSize(size: number): this {
+    this.backPressureForAsyncSendSize = size;
+    this._semaphoreAsyncSendSize.setTotalPermits(size);
+    return this;
+  }
+
+  // Acquire both async-send permits or throw synchronously (Java's bounded
+  // async queue rejects with RemotingTooMuchRequestException when full). A
+  // partial acquisition is rolled back so permits never leak.
+  private _acquireAsyncPermits(msg: Message): void {
+    if (!this._semaphoreAsyncSendNum.tryAcquire()) {
+      throw new MQClientException(
+        `async send rejected: in-flight num over backPressureForAsyncSendNum(${this.backPressureForAsyncSendNum})`);
+    }
+    const bodyLen = msg.getBody() != null ? msg.getBody().length : 0;
+    if (!this._semaphoreAsyncSendSize.tryAcquireFor(bodyLen)) {
+      this._semaphoreAsyncSendNum.release();
+      throw new MQClientException(
+        `async send rejected: in-flight size over backPressureForAsyncSendSize(${this.backPressureForAsyncSendSize})`);
+    }
+  }
+
+  private _releaseAsyncPermits(msg: Message): void {
+    const bodyLen = msg.getBody() != null ? msg.getBody().length : 0;
+    this._semaphoreAsyncSendSize.releaseFor(bodyLen);
+    this._semaphoreAsyncSendNum.release();
+  }
 
   start(): void {
     if (this.producerGroup == null || !String(this.producerGroup).trim()) {
@@ -266,6 +325,14 @@ export class DefaultMQProducer {
     return this.client.buildSendRequest(msg, mq, this.producerGroup, this.namespace);
   }
 
+  // Java MQClientAPIImpl wraps every send invoke with
+  // MixAll.brokerVIPChannel(isVipChannelEnabled, addr).
+  private _sendAddr(addr: string | null): string | null {
+    if (addr == null) return null;
+    if (this.sendMessageWithVIPChannel) return MixAll.brokerVipChannel(true, addr);
+    return addr;
+  }
+
   // Send kernel: compress -> UNIQ_KEY -> CheckForbiddenHook (NOT swallowed) -> transport.
   async sendKernelImpl(
     msg: Message,
@@ -295,8 +362,17 @@ export class DefaultMQProducer {
     MessageAccessor.setCorrectionBeforePublish(msg, this.producerGroup);
     (msg as any)._sysFlag = sysFlag;
 
+    // W3C traceparent passthrough (opt-in): a message without one gets a root
+    // span; a caller-propagated value is never overwritten. Java leaves this
+    // to an external OTel hook — the ports build the equivalent in, and it
+    // runs in the same position (after the forbidden hooks, before the request
+    // is built, so the trace hook sees the property).
+    if (this.enableTraceContext) {
+      injectTraceContext(msg);
+    }
+
     const request = this.client.buildSendRequest(msg, mq, this.producerGroup, this.namespace);
-    const addr = this.client.publishAddrFor(mq);
+    const addr = this._sendAddr(this.client.publishAddrFor(mq));
     if (addr == null) {
       throw new MQClientException(`no broker address for mq ${mq.toString()}`);
     }
@@ -420,7 +496,28 @@ export class DefaultMQProducer {
   }
 
   async sendAsync(msg: Message, sendCallback: SendCallback, timeoutMillis: number = this.sendMsgTimeout): Promise<void> {
-    await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, sendCallback, timeoutMillis);
+    // Async-send backpressure (Java initAsyncConfig + onExceptionImpl): the
+    // two fair semaphores bound the in-flight async sends; a full semaphore
+    // throws synchronously. Permits return when the transport-level callback
+    // fires — exactly once — or when the send fails before reaching it.
+    this._acquireAsyncPermits(msg);
+    let permitsHeld = true;
+    const releaseOnce = () => {
+      if (permitsHeld) {
+        permitsHeld = false;
+        this._releaseAsyncPermits(msg);
+      }
+    };
+    const wrapped: SendCallback = (sr, err) => {
+      releaseOnce();
+      if (sendCallback) sendCallback(sr, err);
+    };
+    try {
+      await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, wrapped, timeoutMillis);
+    } catch (e) {
+      releaseOnce();
+      throw e;
+    }
   }
 
   async sendBySelector(
@@ -487,11 +584,16 @@ export class DefaultMQProducer {
   }
 
   // ---- request-reply ----
+  // Java prepareSendRequest: CORRELATION_ID + REPLY_TO_CLIENT (the requester's
+  // clientId — the broker uses it to route the reply back via 326) + TTL. The
+  // reply itself returns as a PUSH_REPLY_MESSAGE_TO_CLIENT(326) push handled by
+  // MQClient._registerReplyMessageProcessor.
   async request(msg: Message, timeoutMillis: number = 3000): Promise<Message> {
     const correlationId = createCorrelationId();
-    const replyTopicLocal = getReplyTopic('DEFAULT'); // cluster default; replaced by broker-populated
+    const requestClientId = this.client != null ? this.client.clientId : this.producerClientId;
     MessageAccessor.putProperty(msg, MessageConst.PROPERTY_CORRELATION_ID, correlationId);
-    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT, replyTopicLocal);
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT, requestClientId);
+    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MESSAGE_TTL, String(timeoutMillis));
     MessageAccessor.setMessageType(msg, MessageType.REQUEST_REPLY);
 
     const future = new RequestResponseFuture(correlationId, msg, timeoutMillis);

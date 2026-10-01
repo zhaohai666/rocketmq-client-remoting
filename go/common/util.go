@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -21,8 +22,24 @@ func MonotonicMillis() float64 {
 }
 
 // NanoTime mirrors Java System.nanoTime: arbitrary origin, comparisons only.
+//
+// Windows caveat: the Go monotonic clock's granularity can be coarser than the
+// gap between two consecutive calls, and a duplicated value would give two
+// same-process instances the SAME clientId (IP@pid#nanoTime, instance name
+// DEFAULT). A tiny mutex enforces strict monotonicity within the process —
+// Java's nanoTime has nanosecond resolution and never needed this.
+var nanoTimeMu sync.Mutex
+var lastNanoTime int64
+
 func NanoTime() int64 {
-	return time.Since(monotonicStart).Nanoseconds()
+	nanoTimeMu.Lock()
+	defer nanoTimeMu.Unlock()
+	v := time.Since(monotonicStart).Nanoseconds()
+	if v <= lastNanoTime {
+		v = lastNanoTime + 1
+	}
+	lastNanoTime = v
+	return v
 }
 
 func CurrentTimeMillis() int64 { return time.Now().UnixMilli() }

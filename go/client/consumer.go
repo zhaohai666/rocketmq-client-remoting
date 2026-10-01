@@ -1562,6 +1562,21 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 			strategy = AllocateMessageQueueAveragely{}
 		}
 		got := strategy.Allocate(c.consumerGroup, c.clientID, mqAll, cidAll)
+		if reporter, ok := strategy.(AllocateErrReporter); ok {
+			if err := reporter.AllocateErr(); err != nil {
+				// Java: the exception aborts this rebalance round and
+				// processQueueTable stays untouched — keep the previous
+				// assignment for this topic instead of revoking everything.
+				common.LogErrorf("allocate message queue failed, strategy=%s group=%s: %v, keep current",
+					strategyName(strategy), c.consumerGroup, err)
+				for mq := range was {
+					if mq.Topic == topic {
+						assigned = append(assigned, mq)
+					}
+				}
+				continue
+			}
+		}
 		if got == nil {
 			common.LogWarnf("allocate message queue returned nothing, strategy=%s group=%s",
 				strategyName(strategy), c.consumerGroup)

@@ -948,12 +948,18 @@ func (h *GetConsumerRunningInfoRequestHeader) FromExtFields(ext *common.StringMa
 	h.JstackEnable = getBool(ext, "jstackEnable")
 }
 
-// ConsumeMessageDirectlyResultRequestHeader (CONSUME_MESSAGE_DIRECTLY = 309 push).
+// ConsumeMessageDirectlyResultRequestHeader (CONSUME_MESSAGE_DIRECTLY = 309).
+// Java's header also carries topic/topicSysFlag/groupSysFlag; the admin side
+// sets topic when it initiates the request, the broker push path leaves it
+// unset.
 type ConsumeMessageDirectlyResultRequestHeader struct {
 	ConsumerGroup *string
 	ClientID      *string
 	MsgID         *string
 	BrokerName    *string
+	Topic         *string
+	TopicSysFlag  *int32
+	GroupSysFlag  *int32
 }
 
 func (h *ConsumeMessageDirectlyResultRequestHeader) ToExtFields(out *common.StringMap) {
@@ -961,6 +967,9 @@ func (h *ConsumeMessageDirectlyResultRequestHeader) ToExtFields(out *common.Stri
 	putStr(out, "clientId", h.ClientID)
 	putStr(out, "msgId", h.MsgID)
 	putStr(out, "brokerName", h.BrokerName)
+	putStr(out, "topic", h.Topic)
+	putI32(out, "topicSysFlag", h.TopicSysFlag)
+	putI32(out, "groupSysFlag", h.GroupSysFlag)
 }
 
 func (h *ConsumeMessageDirectlyResultRequestHeader) FromExtFields(ext *common.StringMap) {
@@ -968,6 +977,9 @@ func (h *ConsumeMessageDirectlyResultRequestHeader) FromExtFields(ext *common.St
 	h.ClientID = getStr(ext, "clientId")
 	h.MsgID = getStr(ext, "msgId")
 	h.BrokerName = getStr(ext, "brokerName")
+	h.Topic = getStr(ext, "topic")
+	h.TopicSysFlag = getI32(ext, "topicSysFlag")
+	h.GroupSysFlag = getI32(ext, "groupSysFlag")
 }
 
 // CheckTransactionStateRequestHeader (CHECK_TRANSACTION_STATE = 39 push).

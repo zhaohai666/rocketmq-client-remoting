@@ -38,11 +38,15 @@ import {
   GetConsumerListByGroupResponseBody, GroupList, KVTable, ProducerConnection,
   ResetOffsetBody, TopicConfig, TopicConfigSerializeWrapper, TopicList,
   TopicFilterType, DEFAULT_PERM, messageQueueKey,
+  QueryMsgResponseBody, ConsumeMessageDirectlyResult,
 } from '../remoting/bodies.ts';
 import { TopicStatsTable } from '../remoting/admin_body.ts';
 import { RemotingSerializable } from '../remoting/serialize.ts';
 import { MixAll } from '../common/mixAll.ts';
-import { MessageQueue } from '../common/message.ts';
+import { MessageQueue, MessageExt } from '../common/message.ts';
+import { MessageConst } from '../common/messageConst.ts';
+import { BoundaryType } from '../common/boundary_type.ts';
+import { decodeMessage, decodeMessageId } from '../common/messageDecoder.ts';
 import { getLogger } from '../logging.ts';
 import { MQClientException, MQBrokerException } from '../remoting/exception.ts';
 import { MQClient } from './mq_client.ts';
@@ -1180,6 +1184,174 @@ export class DefaultMQAdminExt {
   async updateConsumeOffset(brokerAddr: string, consumeGroup: string, mq: MessageQueue,
     offset: number): Promise<void> {
     await this._requireClient().updateConsumerOffset(brokerAddr, consumeGroup, mq, offset);
+  }
+
+  // Java examineConsumerOffset → QUERY_CONSUMER_OFFSET(14). Returns the
+  // committed offset; `hasOffset` is false when the broker answers
+  // QUERY_NOT_FOUND (no offset recorded yet).
+  async examineConsumerOffset(consumerGroup: string, mq: MessageQueue): Promise<{ offset: number; hasOffset: boolean }> {
+    const brokerAddr = this._masterAddrForMq(mq);
+    const r = await this._requireClient().queryConsumerOffset(brokerAddr, consumerGroup, mq);
+    return { offset: r.offset, hasOffset: r.found };
+  }
+
+  // Java searchOffsetByTimestamp(addr, topic, queueId, timestamp, boundaryType)
+  // → SEARCH_OFFSET_BY_TIMESTAMP(29) with the `boundaryType` ext field. The
+  // lower/upper helpers mirror Java DefaultMQAdminExt's convenience methods.
+  async searchBoundaryOffset(mq: MessageQueue, timestamp: number,
+    boundaryType: string = BoundaryType.LOWER): Promise<number> {
+    const brokerAddr = this._masterAddrForMq(mq);
+    const client = this._requireClient();
+    const request = this._request(RequestCode.SEARCH_OFFSET_BY_TIMESTAMP, adminExt({
+      topic: mq.getTopic(),
+      queueId: String(mq.getQueueId()),
+      timestamp: String(timestamp),
+      boundaryType: BoundaryType.get_type(boundaryType),
+    }));
+    const response = await client.remotingClient.invokeSync(brokerAddr, request, this._timeout());
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, brokerAddr);
+    }
+    const offset = response.extFields != null ? response.extFields['offset'] : null;
+    return offset != null ? parseInt(offset, 10) : 0;
+  }
+
+  async searchLowerBoundaryOffset(mq: MessageQueue, timestamp: number): Promise<number> {
+    return this.searchBoundaryOffset(mq, timestamp, BoundaryType.LOWER);
+  }
+
+  async searchUpperBoundaryOffset(mq: MessageQueue, timestamp: number): Promise<number> {
+    return this.searchBoundaryOffset(mq, timestamp, BoundaryType.UPPER);
+  }
+
+  // ---------------- Message query (QUERY_MESSAGE / VIEW_MESSAGE_BY_ID) ----------------
+
+  // Java queryMessage → QUERY_MESSAGE(12) against one broker's index. The body
+  // is a QueryMsgResponseBody: the matched ids (the broker answers ids only).
+  // indexType: K (default) / U (uniq key); mirrors Java QueryMessageRequestHeader.
+  async queryMessage(brokerAddr: string, topic: string, key: string,
+    maxNum: number = 32, beginTimestamp = 0, endTimestamp = 0,
+    indexType: string = 'K'): Promise<QueryMsgResponseBody> {
+    const response = await this._invokeBroker(brokerAddr, RequestCode.QUERY_MESSAGE, adminExt({
+      topic,
+      key,
+      maxNum: String(maxNum),
+      beginTimestamp: String(beginTimestamp),
+      endTimestamp: String(endTimestamp),
+      indexType,
+    }));
+    return QueryMsgResponseBody.decode(response.body);
+  }
+
+  async queryMessageByKey(brokerAddr: string, topic: string, key: string, maxNum = 32): Promise<QueryMsgResponseBody> {
+    return this.queryMessage(brokerAddr, topic, key, maxNum);
+  }
+
+  // Java queryMessage(topic, uniqKey): the U-index query, then each hit is
+  // fetched through viewMessage. Returns the decoded MessageExt list.
+  async queryMessageByUniqKey(brokerAddr: string, topic: string, uniqKey: string,
+    maxNum = 32): Promise<any[]> {
+    const ids = await this.queryMessage(brokerAddr, topic, uniqKey, maxNum, 0, 0, 'U');
+    const out: any[] = [];
+    for (const msgId of ids.msgIdList) {
+      try {
+        out.push(await this.viewMessage(topic, msgId));
+      } catch (e) { /* a pruned index hit is skipped, like Java's viewMessage loop */ }
+    }
+    return out;
+  }
+
+  // Java viewMessage → VIEW_MESSAGE_BY_ID(33) sent STRAIGHT to the broker
+  // address encoded inside the offset msgId (no route lookup). The body is one
+  // 17-segment stored message.
+  async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
+    const client = this._requireClient();
+    const { ip, port, offset } = decodeMessageId(msgId);
+    if (port <= 0 || port > 65535) {
+      throw new MQClientException(`not a valid offset msgId: ${msgId}`);
+    }
+    const addr = `${ip}:${port}`;
+    const request = this._request(RequestCode.VIEW_MESSAGE_BY_ID, adminExt({
+      offset: String(offset),
+      topic,
+    }));
+    const response = await client.remotingClient.invokeSync(addr, request, this._timeout());
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, addr);
+    }
+    if (response.body == null || response.body.length === 0) {
+      throw new MQClientException(`message not found: ${msgId}`);
+    }
+    return decodeMessage(response.body, true, true);
+  }
+
+  // Java DefaultMQAdminExt.consumeMessageDirectly → CONSUME_MESSAGE_DIRECTLY(309)
+  // sent to the broker that STORES the message; the broker relays it to the
+  // named client and answers with the client's verdict body. Java resolves the
+  // store host through viewMessage and substitutes the OFFSET msgId when the
+  // resolved message carries a client uniq key.
+  async consumeMessageDirectly(consumerGroup: string, clientId: string, topic: string,
+    msgId: string, brokerAddr?: string): Promise<ConsumeMessageDirectlyResult> {
+    let addr = brokerAddr;
+    let outMsgId = msgId;
+    if (addr == null || addr === '') {
+      const msg = await this.viewMessage(topic, msgId);
+      addr = msg.getStoreHostString();
+      if (msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) != null && msg.getOffsetMsgId() != null) {
+        outMsgId = msg.getOffsetMsgId();
+      }
+    }
+    const response = await this._invokeBroker(addr!, RequestCode.CONSUME_MESSAGE_DIRECTLY, adminExt({
+      consumerGroup,
+      clientId,
+      msgId: outMsgId,
+      topic,
+    }));
+    if (response.body == null || response.body.length === 0) {
+      throw new MQClientException(`no consume result for client ${clientId}`);
+    }
+    return ConsumeMessageDirectlyResult.decode(response.body);
+  }
+
+  // ---------------- Name-server config (Java updateNameServerConfig) ----------------
+
+  // UPDATE_NAMESRV_CONFIG(318) broadcast: the properties ride in the BODY as
+  // java.util.Properties TEXT; the first failing nameserver decides the error.
+  async updateNameServerConfig(properties: Record<string, string>, timeoutMillis?: number): Promise<void> {
+    const text = propertiesToString(properties);
+    if (!text) return;
+    const client = this._requireClient();
+    const request = this._request(RequestCode.UPDATE_NAMESRV_CONFIG, null, Buffer.from(text, 'utf8'));
+    let errResponse: RemotingCommand | null = null;
+    for (const nsAddr of client.getNameServerAddressList()) {
+      const response = await client.remotingClient.invokeSync(nsAddr, request, this._timeout(timeoutMillis));
+      if (response.code !== ResponseCode.SUCCESS) errResponse = response;
+    }
+    if (errResponse != null) {
+      throw new MQBrokerException(errResponse.code, errResponse.remark || 'update name server config failed');
+    }
+  }
+
+  // GET_NAMESRV_CONFIG(319), one request per nameserver (nil/empty = all,
+  // Java's default); the Properties-text body is parsed back per server.
+  async getNameServerConfig(nameServers: string[] | null, timeoutMillis?: number): Promise<Record<string, Record<string, string>>> {
+    const client = this._requireClient();
+    const targets = (nameServers != null && nameServers.length > 0)
+      ? nameServers
+      : client.getNameServerAddressList();
+    if (targets == null || targets.length === 0) {
+      throw new MQClientException('no name server address available');
+    }
+    const out: Record<string, Record<string, string>> = {};
+    for (const ns of targets) {
+      const response = await client.remotingClient.invokeSync(ns,
+        this._request(RequestCode.GET_NAMESRV_CONFIG, null), this._timeout(timeoutMillis));
+      if (response.code !== ResponseCode.SUCCESS) {
+        throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, ns);
+      }
+      out[ns] = string2Properties(response.body != null ? response.body.toString('utf8') : '');
+    }
+    return out;
   }
 
   // ---------------- POP assignment ----------------

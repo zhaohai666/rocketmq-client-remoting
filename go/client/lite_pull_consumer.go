@@ -1140,6 +1140,21 @@ func (c *DefaultLitePullConsumer) Rebalance() {
 		}
 		sort.Strings(cidAll)
 		got := strategy.Allocate(group, clientID, mqAll, cidAll)
+		if reporter, ok := strategy.(AllocateErrReporter); ok {
+			if err := reporter.AllocateErr(); err != nil {
+				// Same rule as the push consumer: a hard strategy failure
+				// aborts the round and keeps the current slice (Java lets the
+				// exception bubble out of the rebalance thread).
+				common.LogErrorf("lite rebalance: allocate failed, strategy=%s group=%s: %v, keep current",
+					strategyName(strategy), group, err)
+				for _, mq := range baseline {
+					if mq.Topic == topic {
+						newAssigned[mq] = struct{}{}
+					}
+				}
+				continue
+			}
+		}
 		for _, mq := range got {
 			newAssigned[mq] = struct{}{}
 		}

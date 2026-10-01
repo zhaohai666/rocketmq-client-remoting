@@ -292,12 +292,15 @@ func (a *DefaultMQAdminExt) invokeBroker(addr string, code int32, ext *common.St
 // invokeNameServerAll broadcasts to every nameserver (Java
 // putKVConfigValue / deleteKVConfigValue semantics) and raises if any of them
 // failed.
-func (a *DefaultMQAdminExt) invokeNameServerAll(code int32, ext *common.StringMap, timeoutMillis int64) error {
+func (a *DefaultMQAdminExt) invokeNameServerAll(code int32, ext *common.StringMap, body []byte, timeoutMillis int64) error {
 	instance, err := a.requireClient()
 	if err != nil {
 		return err
 	}
 	request := adminRequest(code, ext)
+	if body != nil {
+		request.SetBody(body)
+	}
 	var errResponse *remoting.RemotingCommand
 	for _, nsAddr := range instance.NameServerAddrs() {
 		response, err := instance.invokeSync(nsAddr, request, a.timeout(timeoutMillis))
@@ -819,7 +822,7 @@ func (a *DefaultMQAdminExt) ViewBrokerStatsData(brokerAddr, statsName, statsKey 
 // CreateAndUpdateKVConfig broadcasts PUT_KV_CONFIG(100) to every nameserver.
 func (a *DefaultMQAdminExt) CreateAndUpdateKVConfig(namespace, key, value string) error {
 	return a.invokeNameServerAll(remoting.ReqPutKVConfig,
-		adminExt("namespace", namespace, "key", key, "value", value), 0)
+		adminExt("namespace", namespace, "key", key, "value", value), nil, 0)
 }
 
 // PutKVConfig is Java's interface name (the impl delegates to
@@ -845,7 +848,50 @@ func (a *DefaultMQAdminExt) GetKVConfig(namespace, key string) (string, bool, er
 // DeleteKVConfig broadcasts DELETE_KV_CONFIG(102) to every nameserver.
 func (a *DefaultMQAdminExt) DeleteKVConfig(namespace, key string) error {
 	return a.invokeNameServerAll(remoting.ReqDeleteKVConfig,
-		adminExt("namespace", namespace, "key", key), 0)
+		adminExt("namespace", namespace, "key", key), nil, 0)
+}
+
+// ---------------- Nameserver config (Java updateNameServerConfig) ----------------
+
+// UpdateNameServerConfig broadcasts UPDATE_NAMESRV_CONFIG(318) to every
+// nameserver (Java DefaultMQAdminExt.updateNameServerConfig): the properties
+// ride in the BODY as java.util.Properties TEXT, and the first failing
+// nameserver decides the error (Java remembers errResponse and throws at the
+// end). Java returns silently for an empty property set — so does this.
+func (a *DefaultMQAdminExt) UpdateNameServerConfig(properties map[string]string, timeoutMillis int64) error {
+	text := propertiesToString(properties)
+	if text == "" {
+		return nil
+	}
+	return a.invokeNameServerAll(remoting.ReqUpdateNameSrvConfig, nil, []byte(text), timeoutMillis)
+}
+
+// GetNameServerConfig sends GET_NAMESRV_CONFIG(319) to every listed nameserver
+// (nil/empty means all of them, Java's default) and returns each server's
+// config parsed from the Properties-text body. Java throws on the first
+// failure; the loop does the same. No VIP-channel rewrite: nameservers have no
+// VIP listener.
+func (a *DefaultMQAdminExt) GetNameServerConfig(nameServers []string, timeoutMillis int64) (map[string]map[string]string, error) {
+	instance, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	targets := nameServers
+	if len(targets) == 0 {
+		targets = instance.NameServerAddrs()
+	}
+	if len(targets) == 0 {
+		return nil, common.ClientError("no name server address available")
+	}
+	out := make(map[string]map[string]string, len(targets))
+	for _, ns := range targets {
+		response, err := a.invokeNameServerAddr(ns, remoting.ReqGetNameSrvConfig, nil, timeoutMillis)
+		if err != nil {
+			return nil, err
+		}
+		out[ns] = String2Properties(string(response.Body))
+	}
+	return out, nil
 }
 
 // GetKVListByNamespace sends GET_KVLIST_BY_NAMESPACE(219).

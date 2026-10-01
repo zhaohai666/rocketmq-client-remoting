@@ -756,7 +756,7 @@ func (p *DefaultMQProducer) sendKernelAsync(chain *asyncChain) error {
 // onSendExceptionAsync from the completion handler.
 func (p *DefaultMQProducer) sendMessageAsyncOnce(chain *asyncChain, addr, brokerName string) {
 	began := time.Now()
-	chain.inst.Remoting().InvokeAsync(addr, chain.request,
+	chain.inst.Remoting().InvokeAsync(p.sendAddr(addr), chain.request,
 		func(response *remoting.RemotingCommand, err error) {
 			// Java runs the whole completion — hook.after, the fault record and
 			// any retry — on the remoting callback path, which Netty hands to

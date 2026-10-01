@@ -33,7 +33,7 @@ import { MessageAccessor } from '../common/message_accessor.ts';
 import { MessageType } from '../common/messageType.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { createUniqID } from '../common/messageClientIdSetter.ts';
-import { messageProperties2String, decodeMessage } from '../common/messageDecoder.ts';
+import { messageProperties2String, decodeMessage, string2MessageProperties } from '../common/messageDecoder.ts';
 import { RecallMessageHandle } from '../common/recall_message_handle.ts';
 import { getLogger } from '../logging.ts';
 import {
@@ -41,6 +41,8 @@ import {
 } from '../remoting/exception.ts';
 import { SendResult } from './send_result.ts';
 import { ConsumerStatsManager } from './consumer_stats.ts';
+import { REQUEST_FUTURE_HOLDER } from './request_reply.ts';
+import zlib from 'node:zlib';
 
 const logger = getLogger('mqclient');
 
@@ -592,6 +594,7 @@ export class MQClient {
   start(): void {
     this._running = true;
     this._registerTransactionCheckProcessor();
+    this._registerReplyMessageProcessor();
     this._startHeartbeatLoop();
     this._startRouteRefreshLoop();
     // Java ConsumerStatsManager.start() is empty (sampling hangs off each
@@ -714,6 +717,58 @@ export class MQClient {
           logger.warning('transaction check listener raised: %s', (e as Error).message);
         }
       });
+      return response;
+    });
+  }
+
+  // Java ClientRemotingProcessor.processReplyMsg: the broker pushes the REPLY
+  // message of a request(326) to the requesting client. The wire is NOT the 17
+  // segment stored format — the message fields ride in the
+  // ReplyMessageRequestHeader extFields and only the body is binary. The
+  // handler rebuilds the MessageExt, extracts the CORRELATION_ID and resolves
+  // the in-flight request future (atomically removed so the timeout-scan path
+  // cannot double-resolve).
+  private _registerReplyMessageProcessor(): void {
+    this.remotingClient.registerProcessor(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, (cmd: RemotingCommand, _addr: string) => {
+      const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, '');
+      try {
+        const ext = cmd.extFields || {};
+        const msg = new MessageExt();
+        if (ext['topic'] != null) msg.setTopic(String(ext['topic']));
+        msg.setProperties(string2MessageProperties(ext['properties'] != null ? String(ext['properties']) : null));
+        msg.setFlag(ext['flag'] != null ? parseInt(ext['flag'], 10) : 0);
+        msg.setSysFlag(ext['sysFlag'] != null ? parseInt(ext['sysFlag'], 10) : 0);
+        msg.setBornTimestamp(ext['bornTimestamp'] != null ? parseInt(ext['bornTimestamp'], 10) : 0);
+        msg.setReconsumeTimes(ext['reconsumeTimes'] != null ? parseInt(ext['reconsumeTimes'], 10) : 0);
+        if (ext['bornHost'] != null) { msg.setBornHost(String(ext['bornHost'])); }
+        if (ext['storeHost'] != null) { msg.setStoreHost(String(ext['storeHost'])); }
+        msg.putProperty(MessageConst.PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, String(Date.now()));
+        // The broker compresses a reply body exactly like a send: sysFlag says so.
+        let body = cmd.body != null ? cmd.body : Buffer.alloc(0);
+        if (MessageSysFlag.isCompressed(msg.getSysFlag()) && body.length > 0) {
+          body = zlib.inflateSync(body);
+        }
+        msg.setBody(body);
+        const correlationId = msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID);
+        if (correlationId == null) {
+          response.code = ResponseCode.SYSTEM_ERROR;
+          response.remark = 'reply message has no correlation id';
+          return response;
+        }
+        // Atomically remove so only one of the reply-arrival path and the
+        // timeout-scan path can take ownership (Java processReplyMessage).
+        const future = REQUEST_FUTURE_HOLDER.removeRequest(correlationId);
+        if (future == null) {
+          logger.warning('receive reply message, but not matched any request, CorrelationId: %s', correlationId);
+          return response;
+        }
+        // Java wakes the sync caller off the Netty thread — same hard rule here.
+        setImmediate(() => future.complete(msg));
+      } catch (e) {
+        logger.warning('process reply message failed: %s', (e as Error).message);
+        response.code = ResponseCode.SYSTEM_ERROR;
+        response.remark = 'process reply message fail';
+      }
       return response;
     });
   }

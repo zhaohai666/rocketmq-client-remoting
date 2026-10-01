@@ -27,10 +27,10 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 消费 | Push Consumer（长轮询 + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 + OFFSET_ILLEGAL 冻结重建 + 220 重置位点 + **POP 模式**）、Pull Consumer（调用方持有游标 + 长轮询）、Lite Pull Consumer（**双游标引擎**：拉取游标 / 消费游标 / 内存提交表，361 + LITE 位） |
 | 消费侧应答 | `GET_CONSUMER_RUNNING_INFO(307)`（三层属性 + subscriptionSet + mqTable/mqPopTable 互斥 + statusTable）、`CONSUME_MESSAGE_DIRECTLY(309)`（并发/顺序两套判定 + panic → CR_THROW_EXCEPTION）、`CONSUMER_SEND_MSG_BACK(36)`、`GET_CONSUMER_STATUS_FROM_CLIENT(221)`、`RESET_CONSUMER_CLIENT_OFFSET(220)` |
 | 消费侧统计 | `ConsumerStatsManager`：五组 StatsItemSet（CONSUME_OK/FAILED_TPS、CONSUME_RT、PULL_TPS/RT），累计 + 两级采样链，快照是**差分窗口**；307 的 statusTable 就是它 |
-| 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动 |
+| 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动；NEARBY 的 resolver 给出空机房时通过 `AllocateErrReporter` 上报，重平衡保留现有分配（对齐 Java 异常中止语义） |
 | 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询；**真机工具 `examples/live_admin` 29 项**（管理员端此前只有单测，没有真机工具 —— 第一次真机就抓到 `groupRetryPolicy` 为 nil 时序列化 panic） |
 | 消息轨迹 | 客户端轨迹生产：Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录，Java `TraceDataEncoder` **逐字节**对齐（真值向量见单测）；`AsyncTraceDispatcher`（2048 有界丢弃 + 批 20 + 128K 分片 + 5s 冲刷 + 关停冲尾批）、内部生产者与 topic 前缀两道防自噬、W3C `traceparent` 注入与透传（`ROCKETMQ_TRACE_CONTEXT_ENABLE`） |
-| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、POP 消费（200050/200051/200052 + 检查点反构）、消费侧状态与运行信息应答（221 位点表 / 307 / 309）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列 |
+| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、POP 消费（200050/200051/200052 + 检查点反构）、消费侧状态与运行信息应答（221 位点表 / 307 / 309）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列、定时消息三 setter（`SetDelayTimeSec/SetDelayTimeMs/SetDeliverTimeMs`）、admin 侧 `UpdateNameServerConfig(318)`/`GetNameServerConfig(319)`/`ConsumeMessageDirectly(309)`、producer 侧 `SendMessageWithVIPChannel`（发送 RPC 走 VIP 端口 port-2） |
 | 离线自检 | `examples/selfcheck`：**不依赖集群**的协议层自检 10 项（JSON / 二进制双帧回环、`clientID` 键拼写、V2 单字母短键集、17 段消息回环含派生 msgId、magic-v2 超长 topic 手工夹具、6 段批量、Crc32 向量、ACL 签名注入） |
 | 校验门 | `Validators` / `TopicValidator`：组名 / topic 校验在 `start()` 建客户端实例**之前**本地跑完，失败不碰网络 |
 
@@ -140,11 +140,16 @@ bash scripts/compression_matrix.sh zlib     # 跨语言压缩矩阵（五端互�
 ```
 
 **尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
-重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机、
+重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机
+（`MACHINE_ROOM_NEARBY` 2026-10-01 已补实现，见 `client/allocate_nearby_test.go`）、
 `cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
-ACL、TLS、SQL92，
+ACL、TLS、SQL92、`MACHINE_ROOM_NEARBY` 真机，
 以及 **307/309 的真实 broker 往返**（`mqadmin consumerStatus -s` 走的就是这两条；目前只在
 进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
+
+对照 Java 客户端（zhaohai666-rocketmq 5.x）仍有意的差异：LZ4/ZSTD 压缩（Java 客户端模块同样
+只有 zlib，本项只是与仓库内 Python/C++/.NET/Rust 四端的能力面差异）、批次消息 msgId 取批自身
+UNIQ_KEY（与 Rust/C++ 对齐）。
 
 ## 目录结构
 

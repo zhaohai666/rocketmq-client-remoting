@@ -71,6 +71,16 @@ export class Message {
   getKeys() { return this.properties['KEYS'] || null; }
   setDelayTimeLevel(level: number) { this.properties['DELAY'] = String(level); }
   getDelayTimeLevel() { return this.properties['DELAY'] || null; }
+  // Java Message#setDelayTimeSec (5.x timer wheel): delivered `sec` seconds
+  // from now, expressed through the TIMER_DELAY_SEC property alias of DELAY.
+  setDelayTimeSec(sec: number) { this.properties['TIMER_DELAY_SEC'] = String(sec); }
+  getDelayTimeSec() { return this.properties['TIMER_DELAY_SEC'] || null; }
+  // Java Message#setDelayTimeMs: delivered `ms` milliseconds from now.
+  setDelayTimeMs(ms: number) { this.properties['TIMER_DELAY_MS'] = String(ms); }
+  getDelayTimeMs() { return this.properties['TIMER_DELAY_MS'] || null; }
+  // Java Message#setDeliverTimeMs: delivered AT the given wall-clock timestamp.
+  setDeliverTimeMs(ms: number) { this.properties['TIMER_DELIVER_MS'] = String(ms); }
+  getDeliverTimeMs() { return this.properties['TIMER_DELIVER_MS'] || null; }
   setWaitStoreMsgOK(ok: boolean) { this.properties['WAIT'] = ok ? 'true' : 'false'; }
   getWaitStoreMsgOK() { return this.properties['WAIT'] || null; }
   setUserProperty(name: string, value: string) { this.properties[name] = value; }

@@ -548,3 +548,41 @@ func (a *DefaultMQAdminExt) QueryConsumeQueue(brokerAddr, topic string, queueID 
 	}
 	return remoting.DecodeQueryConsumeQueueResponseBody(response.Body)
 }
+
+// ConsumeMessageDirectly initiates CONSUME_MESSAGE_DIRECTLY(309) from the
+// admin side (Java DefaultMQAdminExt.consumeMessageDirectly): resolve the
+// message, send the request to the broker that STORES it, and the broker
+// relays the message to the named client, whose verdict comes back as the
+// ConsumeMessageDirectlyResult body.
+//
+// Java resolves the store host with viewMessage(topic, msgId) and substitutes
+// the OFFSET msgId when the resolved message carries a client uniq key (the
+// broker cannot look a client-side uniq id up by itself). brokerAddr overrides
+// the store-host resolution for callers that already know it.
+func (a *DefaultMQAdminExt) ConsumeMessageDirectly(consumerGroup, clientID, topic, msgID, brokerAddr string) (*remoting.ConsumeMessageDirectlyResult, error) {
+	addr := brokerAddr
+	outMsgID := msgID
+	if addr == "" {
+		msg, err := a.ViewMessage(topic, msgID)
+		if err != nil {
+			return nil, err
+		}
+		addr = msg.StoreHostString()
+		if _, uniq := msg.GetProperty(common.PropertyUniqKey); uniq && msg.OffsetMsgID != "" {
+			outMsgID = msg.OffsetMsgID
+		}
+	}
+	response, err := a.invokeBroker(addr, remoting.ReqConsumeMessageDirectly, adminExt(
+		"consumerGroup", consumerGroup,
+		"clientId", clientID,
+		"msgId", outMsgID,
+		"topic", topic,
+	), nil, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(response.Body) == 0 {
+		return nil, common.ClientError(fmt.Sprintf("no consume result for client %s", clientID))
+	}
+	return remoting.DecodeConsumeMessageDirectlyResult(response.Body)
+}

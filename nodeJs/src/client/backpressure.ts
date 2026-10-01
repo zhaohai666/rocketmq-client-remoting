@@ -26,10 +26,24 @@ export class FairSemaphore {
     return false;
   }
 
+  // Acquire `n` permits at once (byte-size backpressure). Single-threaded
+  // event loop: the check-and-decrement is effectively atomic.
+  tryAcquireFor(n: number): boolean {
+    if (this.availablePermits >= n) {
+      this.availablePermits -= n;
+      return true;
+    }
+    return false;
+  }
+
   release(): void {
     if (this.availablePermits < this.totalPermits) {
       this.availablePermits++;
     }
+  }
+
+  releaseFor(n: number): void {
+    this.availablePermits = Math.min(this.totalPermits, this.availablePermits + n);
   }
 
   setTotalPermits(permits: number): void {

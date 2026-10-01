@@ -385,6 +385,10 @@ type DefaultMQProducer struct {
 	tlsEnable          *bool
 	pollNameServerIntv int64
 
+	// sendMessageWithVIPChannel is Java DefaultMQProducer.sendMessageWithVIPChannel
+	// (default false): when set, the SEND rpcs go to the VIP port (broker port-2).
+	sendMessageWithVIPChannel bool
+
 	sendLatencyFaultEnable bool
 	faultStrategy          *mqFaultStrategy
 
@@ -554,6 +558,26 @@ func (p *DefaultMQProducer) SetCompressLevel(level int)          { p.compressLev
 func (p *DefaultMQProducer) SetCompressType(t int32)             { p.compressType = t }
 func (p *DefaultMQProducer) SetCreateTopicKey(key string)        { p.createTopicKey = key }
 func (p *DefaultMQProducer) SetDefaultTopicQueueNums(n int32)    { p.defaultTopicQueueNums = n }
+
+// SetSendMessageWithVIPChannel is Java DefaultMQProducer.setSendMessageWithVIPChannel:
+// when set, the send rpcs target the broker's VIP port (listen port - 2,
+// common.BrokerVIPChannel). Off by default — a cluster without the VIP listener
+// would make every send time out on a dead port.
+func (p *DefaultMQProducer) SetSendMessageWithVIPChannel(enable bool) {
+	p.sendMessageWithVIPChannel = enable
+}
+
+// IsSendMessageWithVIPChannel reports the current VIP-channel switch.
+func (p *DefaultMQProducer) IsSendMessageWithVIPChannel() bool { return p.sendMessageWithVIPChannel }
+
+// sendAddr applies the VIP-channel rewrite to a resolved publish address
+// (Java MQClientAPIImpl wraps every send invoke with MixAll.brokerVIPChannel).
+func (p *DefaultMQProducer) sendAddr(addr string) string {
+	if p.sendMessageWithVIPChannel {
+		return common.BrokerVIPChannel(true, addr)
+	}
+	return addr
+}
 
 // SetSendLatencyFaultEnable toggles the fault strategy. Java allows flipping it
 // at runtime, so it is not a start-time-only setting.
@@ -1220,7 +1244,7 @@ func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq co
 	}
 
 	request := p.buildSendRequest(msg, isBatch, mq, sysFlag)
-	response, err := inst.Remoting().InvokeSync(addr, request, timeoutMillis)
+	response, err := inst.Remoting().InvokeSync(p.sendAddr(addr), request, timeoutMillis)
 	if err != nil {
 		p.finishSendHook(sendHooks, hookCtx, nil, err)
 		return nil, err
@@ -1278,7 +1302,7 @@ func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQ
 
 	request := p.buildSendRequest(msg, false, mq, sysFlag)
 	request.MarkOnewayRPC()
-	sendErr := inst.Remoting().InvokeOneway(addr, request)
+	sendErr := inst.Remoting().InvokeOneway(p.sendAddr(addr), request)
 	// A oneway send has no SendResult, so Java's `context.setSendResult(null)`
 	// is what the after-hook sees on success.
 	p.finishSendHook(sendHooks, hookCtx, nil, sendErr)
@@ -1878,7 +1902,7 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	if brokerAddr == "" {
 		return common.ClientError("no broker address for end transaction")
 	}
-	return inst.Remoting().InvokeOneway(brokerAddr, request)
+	return inst.Remoting().InvokeOneway(p.sendAddr(brokerAddr), request)
 }
 
 // transactionFlag maps LocalTransactionState to Java MessageSysFlag's
@@ -2031,7 +2055,7 @@ func (p *DefaultMQProducer) RecallMessage(topic, recallHandle string) (string, e
 		RecallHandle:  strPtr(recallHandle),
 		Bname:         strPtr(handle.BrokerName),
 	})
-	response, err := inst.Remoting().InvokeSync(addr, request, p.sendMsgTimeout)
+	response, err := inst.Remoting().InvokeSync(p.sendAddr(addr), request, p.sendMsgTimeout)
 	if err != nil {
 		return "", err
 	}

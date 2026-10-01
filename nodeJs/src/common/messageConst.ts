@@ -58,6 +58,14 @@ export const MessageConst = {
   PROPERTY_ORIGIN_QUEUE_ID: 'ORIGIN_QID',
   PROPERTY_ORIGIN_TOPIC: 'ORIGIN_TOPIC',
 
+  // 5.x timer-wheel delivery aliases of DELAY (Java MessageConst).
+  PROPERTY_TIMER_DELIVER_MS: 'TIMER_DELIVER_MS',
+  PROPERTY_TIMER_DELAY_SEC: 'TIMER_DELAY_SEC',
+  PROPERTY_TIMER_DELAY_MS: 'TIMER_DELAY_MS',
+
+  // W3C trace context (Java stores it in a system property of the same name).
+  PROPERTY_TRACE_PARENT: 'traceparent',
+
   KEY_SEPARATOR: ' ',
   CHARACTER_MAX_LENGTH: 255,
   MESSAGE_ID_PREFIX: 'MSGID-',

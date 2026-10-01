@@ -155,6 +155,31 @@ func (m *Message) DelayTimeLevel() int32 {
 	return 0
 }
 
+// SetDelayTimeSec is Java Message#setDelayTimeSec (5.x timer wheel): the
+// message is delivered `sec` seconds from now, expressed through the
+// TIMER_DELAY_SEC property alias of DELAY.
+func (m *Message) SetDelayTimeSec(sec int64) {
+	m.PutProperty(PropertyTimerDelaySec, strconv.FormatInt(sec, 10))
+}
+
+func (m *Message) GetDelayTimeSec() (string, bool) { return m.GetProperty(PropertyTimerDelaySec) }
+
+// SetDelayTimeMs is Java Message#setDelayTimeMs: delivered `ms` milliseconds
+// from now (TIMER_DELAY_MS).
+func (m *Message) SetDelayTimeMs(ms int64) {
+	m.PutProperty(PropertyTimerDelayMs, strconv.FormatInt(ms, 10))
+}
+
+func (m *Message) GetDelayTimeMs() (string, bool) { return m.GetProperty(PropertyTimerDelayMs) }
+
+// SetDeliverTimeMs is Java Message#setDeliverTimeMs: delivered AT the given
+// wall-clock timestamp (TIMER_DELIVER_MS).
+func (m *Message) SetDeliverTimeMs(ms int64) {
+	m.PutProperty(PropertyTimerDeliverMs, strconv.FormatInt(ms, 10))
+}
+
+func (m *Message) GetDeliverTimeMs() (string, bool) { return m.GetProperty(PropertyTimerDeliverMs) }
+
 func (m *Message) SetWaitStoreMsgOK(ok bool) {
 	if ok {
 		m.PutProperty(PropertyWaitStoreMsgOK, "true")

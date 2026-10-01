@@ -309,3 +309,92 @@ export function createAllocateStrategy(name: string): AllocateMessageQueueStrate
   const f = ALLOCATE_STRATEGIES[name];
   return f ? f() : new AllocateMessageQueueAveragely();
 }
+
+// --------------------------------------------- MACHINE_ROOM_NEARBY
+
+// MachineRoomResolver is Java AllocateMachineRoomNearBy.MachineRoomResolver:
+// it tells the strategy which machine room a queue or a consumer lives in.
+// Java's javadoc is explicit that neither method may return null/empty — an
+// empty room aborts the allocation with an error, which the consumer surfaces
+// so the rebalance round can keep the current assignment.
+export interface MachineRoomResolver {
+  brokerDeployIn(messageQueue: MessageQueue): string;
+  consumerDeployIn(clientID: string): string;
+}
+
+// AllocateMachineRoomNearby is Java AllocateMachineRoomNearBy: a proxy around
+// another strategy. Queues and consumers are grouped by machine room, then
+//
+//  1. the queues in THIS consumer's room are split among the consumers of that
+//     room only (through the inner strategy);
+//  2. queues in a room with NO alive consumer at all are shared among ALL
+//     consumers (again through the inner strategy) — otherwise nobody would
+//     consume them.
+//
+// name() is "MACHINE_ROOM_NEARBY" + "-" + <inner name> (Java likewise), so
+// logs can tell which algorithm actually did the splitting.
+//
+// Java throws NullPointerException when either constructor argument is null
+// and IllegalArgumentException when the resolver returns an empty room; the
+// constructor mirrors that as an Error, and the per-allocate failure throws
+// out of allocate() — the rebalance loop catches it and keeps the existing
+// assignment, which is the Java semantics (an exception aborts the round).
+export class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy {
+  inner: AllocateMessageQueueStrategy;
+  resolver: MachineRoomResolver;
+
+  constructor(inner: AllocateMessageQueueStrategy, resolver: MachineRoomResolver) {
+    if (!inner) throw new Error('allocateMessageQueueStrategy is null');
+    if (!resolver) throw new Error('machineRoomResolver is null');
+    this.inner = inner;
+    this.resolver = resolver;
+  }
+
+  name(): string { return `MACHINE_ROOM_NEARBY-${this.inner.name()}`; }
+
+  allocate(consumerGroup: string, currentCID: string, mqAllRaw: MessageQueue[], cidAllRaw: string[]): MessageQueue[] {
+    const mqAll = sortMqAll(mqAllRaw);
+    const cidAll = sortCidAll(cidAllRaw);
+    if (checkCid(consumerGroup, currentCID, mqAll, cidAll) < 0) return [];
+
+    // Group queues by machine room. Java uses TreeMap, i.e. lexicographic room
+    // order — the sorted input and Map insertion order keep it deterministic.
+    const mr2Mq = new Map<string, MessageQueue[]>();
+    for (const mq of mqAll) {
+      const room = this.resolver.brokerDeployIn(mq);
+      if (!room) {
+        throw new Error(`Machine room is null for mq ${javaMessageQueueString(mq)}`);
+      }
+      let list = mr2Mq.get(room);
+      if (!list) mr2Mq.set(room, (list = []));
+      list.push(mq);
+    }
+    // Group consumers by machine room (same non-empty rule).
+    const mr2C = new Map<string, string[]>();
+    for (const cid of cidAll) {
+      const room = this.resolver.consumerDeployIn(cid);
+      if (!room) {
+        throw new Error(`Machine room is null for consumer id ${cid}`);
+      }
+      let list = mr2C.get(room);
+      if (!list) mr2C.set(room, (list = []));
+      list.push(cid);
+    }
+
+    const out: MessageQueue[] = [];
+    // 1. This consumer's room: queues split among same-room consumers only.
+    const currentRoom = this.resolver.consumerDeployIn(currentCID);
+    const mqHere = mr2Mq.get(currentRoom);
+    mr2Mq.delete(currentRoom);
+    if (mqHere && mqHere.length > 0) {
+      out.push(...this.inner.allocate(consumerGroup, currentCID, mqHere, mr2C.get(currentRoom) ?? []));
+    }
+    // 2. Rooms with no alive consumer: every consumer shares their queues.
+    for (const [room, roomMqs] of mr2Mq) {
+      if (!mr2C.has(room)) {
+        out.push(...this.inner.allocate(consumerGroup, currentCID, roomMqs, cidAll));
+      }
+    }
+    return out;
+  }
+}
