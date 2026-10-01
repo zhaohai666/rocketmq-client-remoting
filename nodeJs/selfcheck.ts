@@ -29,6 +29,8 @@ const modules = [
   'src/client/latency.ts', 'src/client/backpressure.ts', 'src/client/produce_accumulator.ts',
   'src/client/traceparent.ts', 'src/client/request_reply.ts', 'src/client/top_addressing.ts', 'src/client/send_result.ts',
   'src/client/consumer_result.ts', 'src/client/exception.ts',
+  'src/client/pop_process_queue.ts', 'src/client/pop_api.ts', 'src/client/pop_consumer.ts',
+  'src/remoting/pop_bodies.ts',
 ];
 
 let failures = 0;
@@ -43,7 +45,7 @@ for (const mod of modules) {
 
 // The offline smoke suites.
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
-  'test/java_gap_fill_smoke.ts'];
+  'test/java_gap_fill_smoke.ts', 'test/pop_smoke.ts'];
 console.log(`\n== smoke suites (${smokes.length}) ==`);
 for (const smoke of smokes) {
   const r = spawnSync(node, ['--experimental-strip-types', '--no-warnings', path.join(here, smoke)],

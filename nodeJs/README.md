@@ -89,8 +89,12 @@ topic/组名默认带时间戳，残留状态不会让断言假绿。
 
 ## 已知与五端的差异
 
-- **POP 消费模式**未实现（5.5.1 单 broker 集群下其余端已验证；nodeJs 端列为后续项，
-  请求码常量已备，参照 Go 端 pop_api/pop_consumer/pop_process_queue 三件套移植）。
+- **POP 消费模式已实现（2026-10-01）**：POP_MESSAGE(200050) / ACK(200051) /
+  CHANGE_MESSAGE_INVISIBLETIME(200053) / BATCH_ACK(200151) / SET_MESSAGE_REQUEST_MODE(401)、
+  POP_CK 检查点双路径重建（offset 表 / 消息自offset）、按应答欠账流控、超窗批次二次校验、
+  重试退避十六档（checkNeedAckOrDelay）、307 的 mqPopTable、setPopMode 时自动下发 401。
+  orderly POP 按 Java stub（"POPTODO"）在 checkConfig 拒绝。经典客户端按 Java 保真不路由
+  batch ack（仅暴露线上能力）。**真机用例未跑**——队列/断言见 `test/pop_smoke.ts`。
 - **2026-10-01 对 Java 客户端（zhaohai666-rocketmq 5.x）补齐**：MACHINE_ROOM_NEARBY、
   Request-Reply 326 接收侧闭环、异步背压接线、traceparent、VIP channel、
   admin 消息查询/边界位点/307 位点读/name server 配置/309 admin 发起、5.x 定时 setter

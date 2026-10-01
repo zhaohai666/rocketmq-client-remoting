@@ -1124,6 +1124,10 @@ export class QueryDataVersionResponseHeader extends CommandCustomHeader {
 }
 
 export class PopMessageRequestHeader extends CommandCustomHeader {
+  // bname is the inherited RpcRequestHeader.bname; Java's popAsync sets it from
+  // the message queue's broker name. The broker ignores it for POP, but it is
+  // part of what Java sends.
+  bname: string | null = null;
   consumerGroup: string | null = null;
   topic: string | null = null;
   queueId: number | null = null;
@@ -1139,6 +1143,7 @@ export class PopMessageRequestHeader extends CommandCustomHeader {
 
   toExtFields(): Record<string, any> {
     return _ext({
+      bname: this.bname,
       consumerGroup: this.consumerGroup, topic: this.topic, queueId: this.queueId,
       maxMsgNums: this.maxMsgNums, invisibleTime: this.invisibleTime, pollTime: this.pollTime,
       bornTime: this.bornTime, initMode: this.initMode, expType: this.expType, exp: this.exp,
@@ -1146,6 +1151,7 @@ export class PopMessageRequestHeader extends CommandCustomHeader {
     });
   }
   fromExtFields(ext: Record<string, any>): void {
+    this.bname = ext['bname'] != null ? ext['bname'] : null;
     this.consumerGroup = ext['consumerGroup'] != null ? ext['consumerGroup'] : null;
     this.topic = ext['topic'] != null ? ext['topic'] : null;
     this.queueId = _num(ext['queueId']);
@@ -1189,6 +1195,7 @@ export class PopMessageResponseHeader extends CommandCustomHeader {
 }
 
 export class AckMessageRequestHeader extends CommandCustomHeader {
+  bname: string | null = null;
   consumerGroup: string | null = null;
   topic: string | null = null;
   queueId: number | null = null;
@@ -1198,11 +1205,13 @@ export class AckMessageRequestHeader extends CommandCustomHeader {
 
   toExtFields(): Record<string, any> {
     return _ext({
+      bname: this.bname,
       consumerGroup: this.consumerGroup, topic: this.topic, queueId: this.queueId,
       extraInfo: this.extraInfo, offset: this.offset, liteTopic: this.liteTopic,
     });
   }
   fromExtFields(ext: Record<string, any>): void {
+    this.bname = ext['bname'] != null ? ext['bname'] : null;
     this.consumerGroup = ext['consumerGroup'] != null ? ext['consumerGroup'] : null;
     this.topic = ext['topic'] != null ? ext['topic'] : null;
     this.queueId = _num(ext['queueId']);
@@ -1213,6 +1222,7 @@ export class AckMessageRequestHeader extends CommandCustomHeader {
 }
 
 export class ChangeInvisibleTimeRequestHeader extends CommandCustomHeader {
+  bname: string | null = null;
   consumerGroup: string | null = null;
   topic: string | null = null;
   queueId: number | null = null;
@@ -1224,12 +1234,14 @@ export class ChangeInvisibleTimeRequestHeader extends CommandCustomHeader {
 
   toExtFields(): Record<string, any> {
     return _ext({
+      bname: this.bname,
       consumerGroup: this.consumerGroup, topic: this.topic, queueId: this.queueId,
       extraInfo: this.extraInfo, offset: this.offset, invisibleTime: this.invisibleTime,
       liteTopic: this.liteTopic, suspend: this.suspend,
     });
   }
   fromExtFields(ext: Record<string, any>): void {
+    this.bname = ext['bname'] != null ? ext['bname'] : null;
     this.consumerGroup = ext['consumerGroup'] != null ? ext['consumerGroup'] : null;
     this.topic = ext['topic'] != null ? ext['topic'] : null;
     this.queueId = _num(ext['queueId']);

@@ -19,7 +19,11 @@ import {
   UpdateConsumerOffsetRequestHeader,
   GetMaxOffsetRequestHeader, GetMinOffsetRequestHeader,
   SearchOffsetRequestHeader, GetEarliestMsgStoretimeRequestHeader,
+  PopMessageRequestHeader, PopMessageResponseHeader, AckMessageRequestHeader,
+  ChangeInvisibleTimeRequestHeader, ChangeInvisibleTimeResponseHeader,
 } from '../remoting/headers.ts';
+import { SetMessageRequestModeRequestBody, BatchAckMessageRequestBody } from '../remoting/pop_bodies.ts';
+import { PopResult, processPopResponse } from './pop_api.ts';
 import {
   HeartbeatData, ProducerData, ConsumerData, ConsumeType, MessageModel, ConsumeFromWhere,
 } from '../remoting/heartbeat.ts';
@@ -568,6 +572,92 @@ export class MQClient {
     }
     return (response.extFields && response.extFields['timestamp'] != null)
       ? parseInt(response.extFields['timestamp'], 10) : -1;
+  }
+
+  // ---------------------------------------------------------------- POP path
+  // (Java MQClientAPIImpl popAsync / ackMessageAsync / changeInvisibleTimeAsync
+  // / batchAckMessageAsync / setMessageRequestMode; port of go/client/pop_api.go.)
+
+  // popMessage sends POP_MESSAGE(200050) to one broker and turns the reply into
+  // a PopResult with a POP_CK stamped on every message.
+  //
+  // brokerName is the LOGICAL name the checkpoint must carry (segment 5) and
+  // must be the same name the ACK later addresses — sending the physical broker
+  // name here makes every ACK unresolvable.
+  async popMessage(brokerName: string, addr: string, header: PopMessageRequestHeader,
+    namespace: string, timeoutMillis: number): Promise<PopResult> {
+    const request = RemotingCommand.createRequestCommand(RequestCode.POP_MESSAGE, header);
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    const respHeader = new PopMessageResponseHeader();
+    respHeader.fromExtFields(response.extFields || {});
+    return processPopResponse(brokerName, response.code, response.remark || '',
+      response.body || null, respHeader, header.topic || '', namespace, header.order === true);
+  }
+
+  // ackMessage sends ACK_MESSAGE(200051) synchronously. `offset` must be the
+  // checkpoint's segment 7 (the message's own queue offset).
+  async ackMessage(addr: string, header: AckMessageRequestHeader, timeoutMillis: number): Promise<void> {
+    const request = RemotingCommand.createRequestCommand(RequestCode.ACK_MESSAGE, header);
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      // Java maps every non-SUCCESS code to AckStatus.NO_EXIST — the broker
+      // could not find the checkpoint, which is a warning, not a hard error.
+      throw new MQBrokerException(response.code, response.remark || '', addr);
+    }
+  }
+
+  // batchAckMessage sends BATCH_ACK_MESSAGE(200151) with a pre-built body.
+  //
+  // NOTE (Java fidelity): the CLASSIC Java client never calls this. Its POP
+  // path acks one message at a time through DefaultMQPushConsumerImpl#ackAsync.
+  // It is exported because the wire capability is real (the broker implements
+  // it and the next-gen/proxy clients use it). Do NOT "finish" the POP
+  // consumer by routing its acks through this — that would be inventing client
+  // behaviour.
+  async batchAckMessage(addr: string, body: BatchAckMessageRequestBody, timeoutMillis: number): Promise<void> {
+    // No custom header — Java passes null and rides the body only.
+    const request = RemotingCommand.createRequestCommand(RequestCode.BATCH_ACK_MESSAGE, null);
+    request.setBody(body.encode());
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || '', addr);
+    }
+  }
+
+  // changeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053) and returns
+  // the NEW popTime / invisibleTime the broker assigned.
+  //
+  // The returned values are not cosmetic: Java rebuilds the checkpoint from
+  // them so a later ACK still matches the (now longer) invisibility window.
+  async changeInvisibleTime(addr: string, header: ChangeInvisibleTimeRequestHeader,
+    timeoutMillis: number): Promise<ChangeInvisibleTimeResponseHeader> {
+    const request = RemotingCommand.createRequestCommand(RequestCode.CHANGE_MESSAGE_INVISIBLETIME, header);
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || '', addr);
+    }
+    const rh = new ChangeInvisibleTimeResponseHeader();
+    rh.fromExtFields(response.extFields || {});
+    return rh;
+  }
+
+  // setMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401) — the
+  // broker-side switch that decides whether a (group, topic) pair is served in
+  // POP or PULL mode.
+  async setMessageRequestMode(addr: string, topic: string, consumerGroup: string,
+    mode: string, popShareQueueNum: number, timeoutMillis: number): Promise<void> {
+    const body = new SetMessageRequestModeRequestBody();
+    body.topic = topic;
+    body.consumerGroup = consumerGroup;
+    body.mode = mode;
+    body.popShareQueueNum = popShareQueueNum;
+    const request = RemotingCommand.createRequestCommand(RequestCode.SET_MESSAGE_REQUEST_MODE, null);
+    request.setBody(body.encode());
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQClientException(
+        `setMessageRequestMode failed, code=${response.code} remark=${response.remark || ''}`);
+    }
   }
 
   // ---- producer / consumer registration (for the eventual consumer/admin agents) ----

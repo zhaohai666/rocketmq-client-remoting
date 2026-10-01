@@ -143,6 +143,80 @@ export const MixAll = {
   clientIdFor(instanceName, unitName = null, enableStreamRequestType = false) {
     return MixAll.buildMqClientId(MixAll.cachedIpStr(), instanceName, unitName, enableStreamRequestType);
   },
+
+  // ---- Namespace helpers (Java NamespaceUtil; port of go/common/namespace.go) ----
+  // Facts that are easy to get wrong — do not "simplify" these away:
+  //   - the separator is `%` (not `/`, not `:`);
+  //   - the %RETRY% / %DLQ% prefix sits OUTSIDE the namespace, so the fully
+  //     qualified retry topic is `%RETRY%NS%GID`. Both wrap and unwrap must
+  //     strip the retry/DLQ prefix, work on the remainder, then put it back;
+  //   - system resources (topics starting with `rmq_sys_`, groups starting
+  //     with `CID_RMQ_SYS_`) are NEVER namespaced.
+  NAMESPACE_SEPARATOR: '%',
+  SYSTEM_TOPIC_PREFIX_RMQ: 'rmq_sys_',
+  SYSTEM_CONSUMER_GROUP_PREFIX: 'CID_RMQ_SYS_',
+
+  isSysTopicStrict(topic) { return topic != null && topic.startsWith(MixAll.SYSTEM_TOPIC_PREFIX_RMQ); },
+  isSysConsumerGroupStrict(group) { return group != null && group.startsWith(MixAll.SYSTEM_CONSUMER_GROUP_PREFIX); },
+  // isSystemResource mirrors Java NamespaceUtil.isSystemResource.
+  isSystemResource(resource) {
+    if (!resource) return false;
+    return MixAll.isSysTopicStrict(resource) || MixAll.isSysConsumerGroupStrict(resource);
+  },
+  // withoutRetryAndDLQ strips the %RETRY% / %DLQ% prefix.
+  withoutRetryAndDLQ(resource) { return MixAll.resetRetryAndDlqTopic(resource); },
+  // isAlreadyWithNamespace mirrors Java NamespaceUtil.isAlreadyWithNamespace.
+  isAlreadyWithNamespace(resource, namespace) {
+    if (!namespace || !resource || MixAll.isSystemResource(resource)) return false;
+    return MixAll.withoutRetryAndDLQ(resource).startsWith(namespace + MixAll.NAMESPACE_SEPARATOR);
+  },
+  // withoutNamespace strips the namespace prefix. `MQ_INST_XX%Topic` ->
+  // `Topic`, `%RETRY%MQ_INST_XX%GID` -> `%RETRY%GID`. An empty namespace means
+  // "drop whatever namespace is there"; a non-empty one only strips when it
+  // actually matches.
+  withoutNamespace(resourceWithNamespace, namespace = '') {
+    if (!resourceWithNamespace) return resourceWithNamespace;
+    if (namespace) {
+      const plain = MixAll.withoutRetryAndDLQ(resourceWithNamespace);
+      if (!plain.startsWith(namespace + MixAll.NAMESPACE_SEPARATOR)) return resourceWithNamespace;
+    } else if (MixAll.isSystemResource(resourceWithNamespace)) {
+      return resourceWithNamespace;
+    }
+    let prefix = '';
+    if (MixAll.isRetryTopic(resourceWithNamespace)) prefix = MixAll.RETRY_GROUP_TOPIC_PREFIX;
+    if (MixAll.isDlqTopic(resourceWithNamespace)) prefix = MixAll.DLQ_GROUP_TOPIC_PREFIX;
+    const plain = MixAll.withoutRetryAndDLQ(resourceWithNamespace);
+    const index = plain.indexOf(MixAll.NAMESPACE_SEPARATOR);
+    if (index > 0) return prefix + plain.slice(index + 1);
+    return resourceWithNamespace;
+  },
+  // wrapNamespace prefixes a resource with the namespace. Idempotent: a
+  // resource that already carries the namespace, or any system resource, comes
+  // back unchanged.
+  wrapNamespace(namespace, resourceWithoutNamespace) {
+    if (!namespace || !resourceWithoutNamespace) return resourceWithoutNamespace;
+    if (MixAll.isSystemResource(resourceWithoutNamespace)) return resourceWithoutNamespace;
+    if (MixAll.isAlreadyWithNamespace(resourceWithoutNamespace, namespace)) return resourceWithoutNamespace;
+    let prefix = '';
+    if (MixAll.isRetryTopic(resourceWithoutNamespace)) prefix = MixAll.RETRY_GROUP_TOPIC_PREFIX;
+    if (MixAll.isDlqTopic(resourceWithoutNamespace)) prefix = MixAll.DLQ_GROUP_TOPIC_PREFIX;
+    const plain = MixAll.withoutRetryAndDLQ(resourceWithoutNamespace);
+    return prefix + namespace + MixAll.NAMESPACE_SEPARATOR + plain;
+  },
+  // wrapNamespaceAndRetry builds `%RETRY%<wrapNamespace(namespace, group)>`.
+  wrapNamespaceAndRetry(namespace, consumerGroup) {
+    if (!consumerGroup) return consumerGroup;
+    return MixAll.RETRY_GROUP_TOPIC_PREFIX + MixAll.wrapNamespace(namespace, consumerGroup);
+  },
+  // getNamespaceFromResource extracts the namespace out of a resource name;
+  // '' means "none".
+  getNamespaceFromResource(resource) {
+    if (!resource || MixAll.isSystemResource(resource)) return '';
+    const plain = MixAll.withoutRetryAndDLQ(resource);
+    const index = plain.indexOf(MixAll.NAMESPACE_SEPARATOR);
+    if (index > 0) return plain.slice(0, index);
+    return '';
+  },
 };
 
 const _PREDEFINE_GROUP_SET = new Set([

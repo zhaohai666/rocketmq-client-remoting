@@ -28,6 +28,10 @@
 import { Buffer } from 'node:buffer';
 import { MQClient, TopicPublishInfo } from './mq_client.ts';
 import { ProcessQueue } from './process_queue.ts';
+import { PopProcessQueue } from './pop_process_queue.ts';
+import {
+  syncPopLoops, retirePopQueue, setMessageRequestModeOnBroker,
+} from './pop_consumer.ts';
 import {
   LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey,
 } from './offset_store.ts';
@@ -205,6 +209,20 @@ export class DefaultMQPushConsumer {
 
   flowControlTriggered = 0;
 
+  // ---- POP mode (Java DefaultMQPushConsumer pop fields; port of
+  // go/client/pop_consumer.go). When popMode is on the broker serves this
+  // (group, topic) pair in POP mode: no client cursor, ACK per message.
+  popMode = false;
+  popInvisibleTime = 60000;
+  popBatchNums = 32;
+  popShareQueueNum = 0;
+  popThresholdForQueue = 1000;
+  // popQueueTable is the POP counterpart of processQueueTable. Only one of the
+  // two is populated at a time; POP has no offset cursor, so the only state is
+  // the outstanding-ACK debt per queue.
+  popQueueTable = new Map<string, PopProcessQueue>();
+  popQueueStopFlags = new Map<string, string>();
+
   // Consumer-side stats (Java ConsumerStatsManager, shared on the MQClient
   // instance; assigned in start()). Differential-window model — see
   // consumer_stats.ts.
@@ -239,6 +257,17 @@ export class DefaultMQPushConsumer {
   setSuspendCurrentQueueTimeMillis(ms: number): this { this.suspendCurrentQueueTimeMillis = ms; return this; }
   setConsumeTimeout(minutes: number): this { this.consumeTimeout = minutes; return this; }
   setConsumeConcurrentlyMaxSpan(v: number): this { this.consumeConcurrentlyMaxSpan = v; return this; }
+  // SetPopMode switches this consumer to POP mode (Java's broker-side
+  // MessageRequestMode). A POP consumer must not be orderly: Java leaves
+  // orderly POP as a TODO stub and there is no queue lock in the POP protocol
+  // to serialise on — checkConfig rejects the combination at start().
+  setPopMode(enable: boolean): this { this.popMode = enable; return this; }
+  get isPopMode(): boolean { return this.popMode; }
+  // SetPopInvisibleTime sets how long a popped batch stays invisible (ms).
+  setPopInvisibleTime(ms: number): this { this.popInvisibleTime = ms; return this; }
+  setPopBatchNums(n: number): this { this.popBatchNums = n; return this; }
+  setPopShareQueueNum(n: number): this { this.popShareQueueNum = n; return this; }
+  setPopThresholdForQueue(n: number): this { this.popThresholdForQueue = n; return this; }
   setPullThresholdForQueue(v: number): this { this.pullThresholdForQueue = v; return this; }
   setPullThresholdSizeForQueue(v: number): this { this.pullThresholdSizeForQueue = v; return this; }
   setPullThresholdForTopic(v: number): this { this.pullThresholdForTopic = v; return this; }
@@ -409,9 +438,19 @@ export class DefaultMQPushConsumer {
     // would spin on an empty assignment until the first timer tick.
     await this.doRebalance();
 
+    // POP mode: tell the broker to serve this (group, topic) pair as POP. Java
+    // does this out of band (mqadmin / console); doing it here keeps the client
+    // self-contained. A failure is logged, not fatal — a broker that already
+    // has the group in POP mode answers SUCCESS anyway, and an old broker
+    // without POP support must not take the consumer down.
+    if (this.popMode) {
+      const err = await setMessageRequestModeOnBroker(this, 3000);
+      if (err) logger.warning('enable POP on broker failed for group %s: %s', this.consumerGroup, err.message);
+    }
+
     this._goLoop(() => this._rebalanceLoop());
     this._goLoop(() => this._dispatchLoop());
-    if (!this.orderly) this._goLoop(() => this._cleanExpireLoop());
+    if (!this.orderly && !this.popMode) this._goLoop(() => this._cleanExpireLoop());
     if (this.orderly && this.messageModel !== MessageModel.BROADCASTING) {
       this._goLoop(() => this._lockLoop());
     }
@@ -441,6 +480,12 @@ export class DefaultMQPushConsumer {
       this._stopFlags.delete(flag); // delete = stop signal for sleepers
     }
     this._stopFlags.add('__stopped');
+    // POP loops ride the same stop-flag set; drop their queue state so an
+    // in-flight batch is marked dropped and never ACKs a batch the broker has
+    // taken back.
+    for (const key of Array.from(this.popQueueTable.keys())) {
+      retirePopQueue(this, key);
+    }
     for (const t of this._timers) clearTimeout(t);
     this._timers = [];
     // Wait (bounded) for in-flight batches — the listener call and its
@@ -707,6 +752,13 @@ export class DefaultMQPushConsumer {
   // Order matters: retire -> settle -> add. Reversed, the new loop would start
   // from a stale offset and write the smaller value back.
   syncPullLoops(): void {
+    // POP mode branches here too (Go does the same): the POP twin retires and
+    // adds pop loops instead of pull loops — no offset to settle, only the
+    // dropped marker so in-flight batches abort instead of ACKing.
+    if (this.popMode) {
+      syncPopLoops(this);
+      return;
+    }
     const current = new Set(this.assigned.map(mqKey));
     const revoked: Array<{ mq: MessageQueue; offset: number; hasOffset: boolean }> = [];
     for (const [key, pq] of Array.from(this.processQueueTable.entries())) {
@@ -2043,10 +2095,26 @@ export class DefaultMQPushConsumer {
       },
       subscriptionSet,
       mqTable,
-      mqPopTable: {},
+      mqPopTable: this._buildPopTable(),
       statusTable,
       userConsumerInfo: {},
     };
+  }
+
+  // _buildPopTable is the 307 mqPopTable (Java
+  // PopProcessQueue#fillPopProcessQueueInfo). All three fields are written
+  // unconditionally — unlike mqTable there is no "only when non-empty" branch,
+  // so an idle POP queue still reports its debt and its last pop time.
+  private _buildPopTable(): Record<string, any> {
+    const out: Record<string, any> = {};
+    for (const [key, pq] of this.popQueueTable) {
+      out[key] = {
+        waitAckCount: pq.waitAckMsgCount(),
+        droped: pq.isDropped(),
+        lastPopTimestamp: pq.getLastPopTimestamp(),
+      };
+    }
+    return out;
   }
 
   // _buildStatusTable is the 307 statusTable: per-topic ConsumeStatus from the
@@ -2133,14 +2201,36 @@ export class DefaultMQPushConsumer {
       throw new Error('pullThresholdSizeForTopic Out of range [1, 102400]');
     }
     if (this.pullInterval < 0 || this.pullInterval > 65535) {
-      throw new Error('pullInterval Out of range [0, 65535]');
-    }
+      throw new Error('pullInterval Out of range [0, 65535]');    }
     if (this.consumeMessageBatchMaxSize < 1 || this.consumeMessageBatchMaxSize > 1024) {
       throw new Error('consumeMessageBatchMaxSize Out of range [1, 1024]');
     }
     if (this.pullBatchSize < 1 || this.pullBatchSize > 1024) {
       throw new Error('pullBatchSize Out of range [1, 1024]');
     }
+    if (this.popInvisibleTime < 5000 || this.popInvisibleTime > 300000) {
+      throw new Error('popInvisibleTime Out of range [5000, 300000]');
+    }
+    if (this.popBatchNums <= 0 || this.popBatchNums > 32) {
+      throw new Error('popBatchNums Out of range [1, 32]');
+    }
+    if (this.popMode && this.orderly) {
+      // Java: "POPTODO think of pop mode orderly implementation later." There
+      // is no queue lock in the POP protocol to serialise on, so an orderly
+      // POP consumer would silently lose ordering — refuse instead.
+      throw new Error('pop mode does not support orderly consumption');
+    }
+  }
+
+  // ------------------------------------------------------------- pop surface
+
+  popProcessQueueCount(): number { return this.popQueueTable.size; }
+
+  // popWaitAckCount totals the outstanding ACK debt across every queue.
+  popWaitAckCount(): number {
+    let total = 0;
+    for (const pq of this.popQueueTable.values()) total += pq.waitAckMsgCount();
+    return total;
   }
 }
 
