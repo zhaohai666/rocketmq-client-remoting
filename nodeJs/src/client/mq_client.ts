@@ -652,7 +652,7 @@ export class MQClient {
     body.mode = mode;
     body.popShareQueueNum = popShareQueueNum;
     const request = RemotingCommand.createRequestCommand(RequestCode.SET_MESSAGE_REQUEST_MODE, null);
-    request.setBody(body.encode());
+    request.body = body.encode();
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
       throw new MQClientException(
