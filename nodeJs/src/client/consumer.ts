@@ -524,7 +524,7 @@ export class DefaultMQPushConsumer {
         this.traceDispatcher = dispatcher;
         if (this.consumerGroup) {
           import('./trace_hook.ts').then((th: any) => {
-            this.registerConsumeMessageHook(new th.ConsumeMessageTraceHook(dispatcher));
+            this.registerConsumeMessageHook(new th.ConsumeMessageTraceHookImpl(dispatcher));
           }).catch((e) => logger.warning('trace hook load failed: %s', (e as Error).message));
         }
         dispatcher.start(this.nameServerAddr).catch((e: Error) =>
