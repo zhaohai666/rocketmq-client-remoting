@@ -35,6 +35,11 @@ export class AclRPCHook {
     this.securityToken = securityToken;
   }
   doBeforeRequest(_addr: string, cmd: RemotingCommand) {
+    // Java AclClientRPCHook.doBeforeRequest calls parseRequestContent(request)
+    // BEFORE signing, which internally runs makeCustomHeaderToNet(). Our
+    // RemotingCommand materializes extFields lazily (only in headerEncode()),
+    // so we must do the same here or the signature covers an empty field set.
+    cmd.makeCustomHeaderToNet();
     signAcl(this.accessKey, this.secretKey, cmd.extFields, cmd.body, this.securityToken);
   }
   doAfterResponse(_addr: string, _request: RemotingCommand | null, _response: RemotingCommand | null) {

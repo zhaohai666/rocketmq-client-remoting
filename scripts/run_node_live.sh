@@ -15,16 +15,25 @@ BROKER_PORT=${ROCKETMQ_BROKER_PORT:-10911}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NODEJS_DIR="$ROOT/nodeJs"
 NODE_BIN=${NODE_BIN:-/Users/haizai/.workbuddy/binaries/node/versions/22.22.2-3/bin/node}
+# fall back to PATH node when the managed binary is missing (e.g. Windows)
+if ! [ -x "$NODE_BIN" ] && ! command -v "$NODE_BIN" >/dev/null 2>&1; then
+    NODE_BIN=node
+fi
 STAMP=$(date +%s)
 export ROCKETMQ_NAMESRV="$NS"
 
 case "$WHICH" in
-  producer)  EXAMPLE="examples/live_producer.ts"  ;;
-  consumer)  EXAMPLE="examples/live_consumer.ts"  ;;
-  pull)      EXAMPLE="examples/live_pull.ts"      ;;
-  lite_pull) EXAMPLE="examples/live_lite_pull.ts" ;;
-  admin)     EXAMPLE="examples/live_admin.ts"     ;;
-  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin)" >&2; exit 2 ;;
+  producer)      EXAMPLE="examples/live_producer.ts"       ;;
+  consumer)      EXAMPLE="examples/live_consumer.ts"       ;;
+  pull)          EXAMPLE="examples/live_pull.ts"           ;;
+  lite_pull)     EXAMPLE="examples/live_lite_pull.ts"      ;;
+  admin)         EXAMPLE="examples/live_admin.ts"          ;;
+  pop)           EXAMPLE="examples/live_pop.ts"            ;;
+  request_reply) EXAMPLE="examples/live_request_reply.ts"  ;;
+  admin_ns)      EXAMPLE="examples/live_admin_ns.ts"       ;;
+  acl)           EXAMPLE="examples/live_acl.ts"            ;;
+  tls)           EXAMPLE="examples/live_tls.ts"            ;;
+  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls)" >&2 ; exit 2 ;;
 esac
 
 port_open() {

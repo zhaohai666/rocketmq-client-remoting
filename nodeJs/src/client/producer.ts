@@ -624,6 +624,15 @@ export class DefaultMQProducer {
     if (future != null) future.complete(replyMsg);
   }
 
+  // Java DefaultMQProducer.reply: build the reply from the request (topic =
+  // <cluster>_REPLY_TOPIC, REPLY_TO_CLIENT = the requestor's clientId — the
+  // broker uses it to find the requestor's channel and push 326) and send it
+  // through the normal send path.
+  async reply(requestMsg: Message, body: Buffer | string, timeoutMillis: number = this.sendMsgTimeout): Promise<SendResult> {
+    const replyMsg = createReplyMessage(requestMsg, body);
+    return this.send(replyMsg, timeoutMillis);
+  }
+
   // ---- recall ----
   async recallMessage(recallHandle: string): Promise<SendResult> {
     if (this.client == null) throw new MQClientException('producer not started');

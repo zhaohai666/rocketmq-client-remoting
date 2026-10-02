@@ -284,9 +284,12 @@ export class MQClient {
   ): RemotingCommand {
     const topic = msg.getTopic();
     const isBatch = msg instanceof MessageBatch;
-    const isReply =
-      MessageAccessor.getMessageType(msg) === MessageType.REQUEST_REPLY ||
-      msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID) != null;
+    // Java buildSendRequest: only a REPLY (MSG_TYPE == "reply") goes out as
+    // SEND_REPLY_MESSAGE_V2. A REQUEST carries MSG_TYPE=Request_Reply_Msg and
+    // CORRELATION_ID but must go as a NORMAL send — the reply processor does
+    // not stamp CLUSTER and would push the "reply" straight back to the
+    // client named by REPLY_TO_CLIENT (i.e. the requestor itself).
+    const isReply = MessageAccessor.getMessageType(msg) === MessageType.REPLY;
     const properties = msg.getProperties();
     const propsStr = messageProperties2String(properties);
     const sysFlag = (msg as any)._sysFlag != null ? (msg as any)._sysFlag : 0;

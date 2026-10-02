@@ -9,6 +9,7 @@ import { Message } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MessageAccessor } from '../common/message_accessor.ts';
 import { MixAll } from '../common/mixAll.ts';
+import { MQClientException } from '../remoting/exception.ts';
 
 let _correlationSeq = 0;
 export function createCorrelationId(): string {
@@ -92,16 +93,29 @@ export class RequestFutureHolder {
 
 export const REQUEST_FUTURE_HOLDER = RequestFutureHolder.getInstance();
 
-// Build a reply message for the given request message, copying the correlation id and reply-to.
+// Build a reply message for the given request message — Java MessageUtil.
+// createReplyMessage: the reply's TOPIC is the 5.x REPLY topic
+// (`<cluster>_REPLY_TOPIC`, cluster read from the request's CLUSTER property,
+// which the broker stamps on receipt); the requester's clientId rides along as
+// the REPLY_TO_CLIENT property — the broker uses it to find the requestor's
+// channel and push 326 directly. Throws when the request carries no CLUSTER
+// property (Java does the same).
 export function createReplyMessage(requestMessage: Message, body: Buffer | string): Message {
+  const cluster = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_CLUSTER);
+  if (cluster == null || cluster === '') {
+    throw new MQClientException('create reply message fail, requestMessage error, property[CLUSTER] is null.');
+  }
+  const replyTo = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT);
+  const correlationId = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_CORRELATION_ID);
+  const ttl = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_MESSAGE_TTL);
   const reply = new Message();
   if (typeof body === 'string') reply.setBody(Buffer.from(body, 'utf8'));
   else reply.setBody(body);
-  const correlationId = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_CORRELATION_ID);
-  const replyTo = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT);
+  reply.setTopic(MixAll.getReplyTopic(cluster));
+  MessageAccessor.putProperty(reply, MessageConst.PROPERTY_MESSAGE_TYPE, MixAll.REPLY_MESSAGE_FLAG);
   if (correlationId != null) MessageAccessor.putProperty(reply, MessageConst.PROPERTY_CORRELATION_ID, correlationId);
-  if (replyTo != null) reply.setTopic(replyTo);
-  MessageAccessor.setMessageType(reply, 'Reply_Msg');
+  if (replyTo != null) MessageAccessor.putProperty(reply, MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT, replyTo);
+  if (ttl != null) MessageAccessor.putProperty(reply, MessageConst.PROPERTY_MESSAGE_TTL, ttl);
   return reply;
 }
 
