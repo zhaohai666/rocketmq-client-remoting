@@ -123,6 +123,19 @@ export class DefaultLitePullConsumer {
     for (const topic of this.subscription.keys()) {
       await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
     }
+    // Java DefaultLitePullConsumerImpl.start:410 — same 46 pre-flight as the
+    // push consumer, after the queues are resolved and before the group is
+    // registered at the broker.
+    try {
+      await client.checkClientInBroker();
+    } catch (e) {
+      logger.warning('Start the lite pull consumer %s fail: %s', this.consumerGroup, (e as Error).message);
+      // started is still false here, so shutdown() would no-op — unwind the
+      // registration this start() already did by hand.
+      client.unregisterConsumer(this.consumerGroup);
+      client.shutdown();
+      throw e;
+    }
     // Register the group at the broker NOW: the client heartbeat loop's first
     // beat may have run before any route was cached, and waiting for the 30s
     // cadence delays group registration — and therefore the first rebalance —

@@ -67,6 +67,21 @@ export class SelectMessageQueueByRandom extends MessageQueueSelector {
   }
 }
 
+// SelectMessageQueueByMachineRoom picks the first queue whose brokerName
+// starts with arg (broker names are expected to be "<idc>-<broker>"); with no
+// match it falls back to the first queue. Mirrors Go's
+// SelectMessageQueueByMachineRoom and Java's producer-side room routing.
+export class SelectMessageQueueByMachineRoom extends MessageQueueSelector {
+  select(_msgs: Message | Message[], mqList: MessageQueue[], arg: any): MessageQueue | null {
+    if (mqList == null || mqList.length === 0) return null;
+    const room = arg != null ? String(arg) : '';
+    for (const mq of mqList) {
+      if (mq.getBrokerName().startsWith(room)) return mq;
+    }
+    return mqList[0];
+  }
+}
+
 export type SendCallback = (sendResult: SendResult | null, err: Error | null) => void;
 
 export const LocalTransactionState = {

@@ -138,6 +138,80 @@ const (
 	ReqPopRollback                       = int32(200056)
 )
 
+// Broker-role / HA admin requests. Java declares these in RequestCode but the
+// 5.x reference client only consumes them from mqadmin; naming them here keeps
+// the numeric set identical to Java's, so a Go caller building a raw command
+// (broker_api.go) cannot pick a colliding value by accident.
+const (
+	ReqTriggerDeleteFiles       = int32(27)
+	ReqGetAllMessageRequestMode = int32(402)
+	ReqRemoveBroker             = int32(903)
+	ReqNotifyMinBrokerIDChange  = int32(905)
+	ReqExchangeBrokerHAInfo     = int32(906)
+	ReqGetBrokerHAStatus        = int32(907)
+	ReqResetMasterFlushOffset   = int32(908)
+	ReqGetBrokerEpochCache      = int32(1007)
+	ReqNotifyBrokerRoleChanged  = int32(1008)
+)
+
+// Controller (DLedger-less auto-failover) requests.
+const (
+	ReqControllerAlterSyncStateSet = int32(1001)
+	ReqControllerElectMaster       = int32(1002)
+	ReqControllerRegisterBroker    = int32(1003)
+	ReqControllerGetReplicaInfo    = int32(1004)
+	ReqControllerGetMetadataInfo   = int32(1005)
+	ReqControllerGetSyncStateData  = int32(1006)
+	ReqUpdateControllerConfig      = int32(1009)
+	ReqGetControllerConfig         = int32(1010)
+	ReqCleanBrokerData             = int32(1011)
+	ReqControllerGetNextBrokerID   = int32(1012)
+	ReqControllerApplyBrokerID     = int32(1013)
+)
+
+// Cold data flow control + commitlog read mode.
+const (
+	ReqUpdateColdDataFlowCtrConfig = int32(2001)
+	ReqRemoveColdDataFlowCtrConfig = int32(2002)
+	ReqGetColdDataFlowCtrInfo      = int32(2003)
+	ReqSetCommitLogReadMode        = int32(2004)
+)
+
+// Authentication / ACL management (5.5 auth framework). This fork dropped the
+// classic ACL module, so these mqadmin-side requests are the only way to manage
+// users and ACLs remotely.
+const (
+	ReqAuthCreateUser = int32(3001)
+	ReqAuthUpdateUser = int32(3002)
+	ReqAuthDeleteUser = int32(3003)
+	ReqAuthGetUser    = int32(3004)
+	ReqAuthListUser   = int32(3005)
+	ReqAuthCreateACL  = int32(3006)
+	ReqAuthUpdateACL  = int32(3007)
+	ReqAuthDeleteACL  = int32(3008)
+	ReqAuthGetACL     = int32(3009)
+	ReqAuthListACL    = int32(3010)
+)
+
+// Timer engine and batch maintenance.
+const (
+	ReqSwitchTimerEngine           = int32(5001)
+	ReqDeleteTopicInBrokerList     = int32(5002)
+	ReqDeleteSubscriptionGroupList = int32(5003)
+)
+
+// Lite (serverless / light topics).
+const (
+	ReqLiteSubscriptionCtl = int32(200071)
+	ReqAckLiteMessage      = int32(200072)
+	ReqGetBrokerLiteInfo   = int32(200074)
+	ReqGetParentTopicInfo  = int32(200075)
+	ReqGetLiteTopicInfo    = int32(200076)
+	ReqGetLiteClientInfo   = int32(200077)
+	ReqGetLiteGroupInfo    = int32(200078)
+	ReqTriggerLiteDispatch = int32(200079)
+)
+
 // ResponseCode mirrors RemotingSysResponseCode + ResponseCode.
 const (
 	RespSuccess                   = int32(0)

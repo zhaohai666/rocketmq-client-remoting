@@ -23,6 +23,7 @@ import {
   ChangeInvisibleTimeRequestHeader, ChangeInvisibleTimeResponseHeader,
 } from '../remoting/headers.ts';
 import { SetMessageRequestModeRequestBody, BatchAckMessageRequestBody } from '../remoting/pop_bodies.ts';
+import { CheckClientRequestBody } from '../remoting/bodies.ts';
 import { PopResult, processPopResponse } from './pop_api.ts';
 import {
   HeartbeatData, ProducerData, ConsumerData, ConsumeType, MessageModel, ConsumeFromWhere,
@@ -35,6 +36,7 @@ import { MessageSysFlag } from '../common/sysflag.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MessageAccessor } from '../common/message_accessor.ts';
 import { MessageType } from '../common/messageType.ts';
+import { ExpressionType } from '../common/subscriptionData.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { createUniqID } from '../common/messageClientIdSetter.ts';
 import { messageProperties2String, decodeMessage, string2MessageProperties } from '../common/messageDecoder.ts';
@@ -110,6 +112,9 @@ export class MQClient {
   consumerTable: Map<string, any>;
   producerTable: Map<string, any>;
   heartbeatIntervalMillis: number;
+  // Java ClientConfig.mqClientApiTimeout (default 3000): the timeout used by
+  // the instance-level admin calls, including CHECK_CLIENT_CONFIG(46).
+  mqClientApiTimeout: number;
   // Consumer stats (Java MQClientFactory.getConsumerStatsManager — shared at
   // the instance level; ONE sampler timer, 10s precision).
   consumerStatsManager: ConsumerStatsManager;
@@ -133,6 +138,7 @@ export class MQClient {
     this.consumerTable = new Map();
     this.producerTable = new Map();
     this.heartbeatIntervalMillis = 30 * 1000;
+    this.mqClientApiTimeout = 3000;
     this.consumerStatsManager = new ConsumerStatsManager();
     this._heartbeatTimer = null;
     this._routeTimer = null;
@@ -271,6 +277,79 @@ export class MQClient {
       if (addrs[MixAll.MASTER_ID] != null) out[name] = addrs[MixAll.MASTER_ID];
     }
     return out;
+  }
+
+  // ---- CHECK_CLIENT_CONFIG(46) ----
+  // Java MQClientInstance.checkClientInBroker. Only non-TAG subscriptions go
+  // on the wire: a broker that does not know 46 answers with a remoting error,
+  // and a silently-broken SQL92 filter would otherwise degrade into
+  // "subscribe to everything" (ExpressionMessageFilter admits all messages
+  // when the expression does not compile). Sending 46 turns that into a
+  // start-up failure.
+  async checkClientInBroker(): Promise<void> {
+    for (const [group, consumer] of this.consumerTable.entries()) {
+      const subs: Map<string, any> | undefined = consumer.subscription;
+      if (subs == null || subs.size === 0) {
+        // Java returns (does not `continue`) on a subscription-less consumer.
+        return;
+      }
+      await this.checkSubscriptionsInBroker(group, subs, this.mqClientApiTimeout);
+    }
+  }
+
+  // The inner loop, exposed for callers that keep consumers out of the table
+  // (mirrors Go's CheckSubscriptionsInBroker).
+  async checkSubscriptionsInBroker(
+    group: string,
+    subs: Map<string, any>,
+    timeoutMillis: number,
+  ): Promise<void> {
+    for (const sub of subs.values()) {
+      // Java ExpressionType.isTagType: null / "" / "TAG" all count as TAG.
+      const exprType = sub.expressionType;
+      if (exprType == null || exprType === '' || exprType === ExpressionType.TAG) continue;
+      // Java checks one broker per cluster and assumes the rest are identical.
+      const addr = this.findBrokerAddrByTopic(sub.topic);
+      if (addr == null) continue;
+      try {
+        await this.checkClientConfig(addr, group, sub, timeoutMillis);
+      } catch (e) {
+        if (e instanceof MQClientException) throw e;
+        // Transport-class failure (a broker too old to know 46) keeps Java's
+        // fixed wording, which also takes the consumer start down.
+        throw new MQClientException(
+          `Check client in broker error, maybe because you use ${exprType} to filter message, `
+          + 'but server has not been upgraded to support!'
+          + 'This error would not affect the launch of consumer, but may has impact on message '
+          + 'receiving if you have use the new features which are not supported by server, '
+          + 'please check the log!',
+          e as Error,
+        );
+      }
+    }
+  }
+
+  // One CHECK_CLIENT_CONFIG(46) round trip. The custom header is null and the
+  // body carries CheckClientRequestBody; any non-SUCCESS code becomes an
+  // MQClientException carrying the broker's own response code, as in Java.
+  async checkClientConfig(
+    addr: string,
+    consumerGroup: string,
+    sub: any,
+    timeoutMillis: number,
+  ): Promise<void> {
+    const request = RemotingCommand.createRequestCommand(RequestCode.CHECK_CLIENT_CONFIG, null);
+    const body = new CheckClientRequestBody();
+    body.clientId = this.clientId;
+    body.group = consumerGroup;
+    body.subscriptionData = sub.toDict ? sub.toDict() : sub;
+    request.body = body.encode();
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQClientException(
+        `CODE: ${response.code} exception message: ${response.remark ?? ''}`,
+      );
+    }
   }
 
   // ---- low-level send primitives ----

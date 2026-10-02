@@ -33,7 +33,8 @@ case "$WHICH" in
   admin_ns)      EXAMPLE="examples/live_admin_ns.ts"       ;;
   acl)           EXAMPLE="examples/live_acl.ts"            ;;
   tls)           EXAMPLE="examples/live_tls.ts"            ;;
-  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls)" >&2 ; exit 2 ;;
+  check_config)  EXAMPLE="examples/live_check_client_config.ts" ;;
+  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|request_reply|admin_ns|acl|tls|check_config)" >&2 ; exit 2 ;;
 esac
 
 port_open() {

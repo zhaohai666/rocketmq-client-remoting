@@ -303,6 +303,19 @@ export const ALLOCATE_STRATEGIES: Record<string, () => AllocateMessageQueueStrat
   CONFIG: () => new AllocateMessageQueueByConfig([]),
   MACHINE_ROOM: () => new AllocateMessageQueueByMachineRoom([]),
   CONSISTENT_HASH: () => new AllocateMessageQueueConsistentHash(),
+  // MACHINE_ROOM_NEARBY is a PROXY: it needs an inner strategy plus a
+  // MachineRoomResolver, neither of which the zero-arg factory signature can
+  // supply. It is registered with the same defaults a caller would pass
+  // explicitly (AVG inside, brokerName as the room) so a name-based lookup
+  // still resolves instead of silently degrading to AVG — which would
+  // distribute queues across machine rooms and defeat the whole point.
+  MACHINE_ROOM_NEARBY: () => new AllocateMachineRoomNearby(
+    new AllocateMessageQueueAveragely(),
+    {
+      brokerDeployIn: (mq) => mq.getBrokerName(),
+      consumerDeployIn: (cid) => cid,
+    },
+  ),
 };
 
 export function createAllocateStrategy(name: string): AllocateMessageQueueStrategy {

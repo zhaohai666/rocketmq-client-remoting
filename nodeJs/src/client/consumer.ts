@@ -302,8 +302,11 @@ export class DefaultMQPushConsumer {
       expr = subExpression.expression || '*';
       exprType = subExpression.type || ExpressionType.TAG;
     }
-    const sub = FilterAPI.buildSubscriptionData(topic, expr);
-    sub.expressionType = exprType;
+    // FilterAPI.build, NOT buildSubscriptionData: a SQL92/CLASS_FILTER
+    // subscription must go out with EMPTY tagsSet/codeSet (Java takes a
+    // separate branch for it). Filling them makes the broker intersect the
+    // pull against the hash of the expression text and deliver nothing.
+    const sub = FilterAPI.build(topic, expr, exprType);
     const existed = this.subscription.has(topic);
     this.subscription.set(topic, sub);
     if (existed && this.started) {
@@ -431,6 +434,16 @@ export class DefaultMQPushConsumer {
     }
     // Register broker-initiated request processors BEFORE the first heartbeat.
     this._registerProcessors();
+    // Java DefaultMQPushConsumerImpl.start:1013-1015 — subscription routes
+    // first, then the 46 pre-flight check, then the first heartbeat. A failure
+    // here is fatal: Java logs, shuts the consumer down and rethrows.
+    try {
+      await client.checkClientInBroker();
+    } catch (e) {
+      logger.warning('Start the consumer %s fail: %s', this.consumerGroup, (e as Error).message);
+      await this.shutdown().catch((e2) => { /* best effort */ });
+      throw e;
+    }
     // Heartbeat must precede rebalance: rebalance asks the broker for the
     // group's client list.
     await this.sendHeartbeatNow();

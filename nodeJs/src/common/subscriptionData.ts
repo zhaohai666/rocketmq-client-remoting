@@ -55,6 +55,25 @@ export const FilterAPI = {
     }
     return sub;
   },
+
+  // Java FilterAPI.build(topic, subString, type). The distinction from
+  // buildSubscriptionData matters on the wire: TAG goes through the
+  // tag/codeSet hash expansion above, while SQL92 / CLASS_FILTER take a
+  // SEPARATE branch that leaves tagsSet and codeSet EMPTY. Populating them for
+  // a SQL92 expression makes the broker hash "a = 'ok'" as if it were a tag
+  // and intersect the pull with that fake code, so the consumer receives
+  // nothing at all — the subscription looks registered and silently starves.
+  build(topic, subString, type) {
+    if (type == null || type === ExpressionType.TAG) {
+      return this.buildSubscriptionData(topic, subString);
+    }
+    if (subString == null || subString === '') {
+      throw new Error(`Expression can't be null! ${type}`);
+    }
+    const sub = new SubscriptionData(topic, subString);
+    sub.expressionType = type;
+    return sub;
+  },
 };
 
 export default { ExpressionType, SubscriptionData, FilterAPI };
