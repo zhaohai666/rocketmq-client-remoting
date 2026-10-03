@@ -25,7 +25,6 @@
 package client
 
 import (
-	"sort"
 	"strconv"
 	"strings"
 
@@ -242,8 +241,11 @@ func (a *DefaultMQAdminExt) UpdateAndGetGroupReadForbidden(brokerAddr, group, to
 
 // ResumeCheckHalfMessage sends RESUME_CHECK_HALF_MESSAGE(323) so the broker
 // re-runs the half-message check for one message. Java maps every non-SUCCESS
-// reply to `false` instead of raising (MQClientAPIImpl:3279), so this does too —
-// a failure is reported through the boolean, not an error.
+// reply to `false` instead of raising (MQClientAPIImpl:3279) — network errors
+// still raise, but a broker-level rejection (e.g. the msgId is not a half
+// message, which surfaces as SYSTEM_ERROR) is reported through the boolean.
+// invokeBroker's checkResponse would turn that rejection into an error, so
+// this inspects the raw reply.
 func (a *DefaultMQAdminExt) ResumeCheckHalfMessage(brokerAddr, topic, msgID string) (bool, error) {
 	if topic == "" {
 		return false, common.ClientError("resumeCheckHalfMessage: topic must not be empty")
@@ -252,8 +254,13 @@ func (a *DefaultMQAdminExt) ResumeCheckHalfMessage(brokerAddr, topic, msgID stri
 	if msgID != "" {
 		header.Put("msgId", msgID)
 	}
-	response, err := a.invokeBroker(brokerAddr, remoting.ReqResumeCheckHalfMessage,
-		header, nil, 0)
+	instance, err := a.requireClient()
+	if err != nil {
+		return false, err
+	}
+	target := common.BrokerVIPChannel(a.vipChannel(), brokerAddr)
+	request := adminRequest(remoting.ReqResumeCheckHalfMessage, header)
+	response, err := instance.invokeSync(target, request, a.timeout(0))
 	if err != nil {
 		return false, err
 	}
@@ -372,33 +379,16 @@ func (a *DefaultMQAdminExt) DeleteExpiredCommitLogByAddr(addrs []string, time in
 }
 
 // CleanUnusedTopicByAddr mirrors
-// DefaultMQAdminExtImpl.cleanUnusedTopicByAddr: it walks the broker's
-// GET_ALL_TOPIC_CONFIG(21) table and deletes every topic that has never been
-// used, i.e. its max offset is still 0.
+// DefaultMQAdminExtImpl.cleanUnusedTopicByAddr → MQClientAPIImpl:2696: ONE
+// CLEAN_UNUSED_TOPIC(316) request that tells the broker to drop its own unused
+// topics. The client does NOT walk the topic table and delete one by one —
+// that would race the broker's own bookkeeping and trip over the broker-created
+// topics (BenchmarkTest, retry/DLQ topics) the broker refuses to delete
+// (SYSTEM_ERROR "conflict with system topic"). Java raises on non-SUCCESS here,
+// which invokeBroker already does.
 func (a *DefaultMQAdminExt) CleanUnusedTopicByAddr(brokerAddr string) error {
-	wrapper, err := a.GetAllTopicConfig(brokerAddr, 0)
-	if err != nil {
-		return err
-	}
-	names := make([]string, 0, len(wrapper.TopicConfigTable))
-	for name := range wrapper.TopicConfigTable {
-		names = append(names, name)
-	}
-	// Deterministic order keeps the returned error stable across runs.
-	sort.Strings(names)
-	for _, name := range names {
-		stats, err := a.ExamineTopicStats(name)
-		if err != nil {
-			// A topic whose route is gone is exactly what this call cleans up.
-			continue
-		}
-		if topicOffsetMax(stats) == 0 {
-			if err := a.DeleteTopicInBroker(brokerAddr, name); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	_, err := a.invokeBroker(brokerAddr, remoting.ReqCleanUnusedTopic, nil, nil, 0)
+	return err
 }
 
 // SetMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401), switching a
@@ -417,18 +407,3 @@ func (a *DefaultMQAdminExt) SetMessageRequestMode(brokerAddr, topic, consumerGro
 // GetClusterList, the client-side derivation Java performs with
 // EXAMINE_BROKER_CLUSTER_INFO(25) + EXAMINE_TOPIC_ROUTE(105) — no request of
 // its own). Nothing to add here.
-
-// topicOffsetMax sums every queue's max offset, i.e. how much data the topic
-// actually holds. A topic that has never been written to reports 0.
-func topicOffsetMax(table *remoting.TopicStatsTable) int64 {
-	if table == nil {
-		return 0
-	}
-	var total int64
-	for _, offset := range table.OffsetTable {
-		if offset != nil && offset.MaxOffset > 0 {
-			total += offset.MaxOffset
-		}
-	}
-	return total
-}

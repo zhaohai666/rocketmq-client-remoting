@@ -48,21 +48,19 @@ wait_broker_registered() {
   # accumulates entries across runs, so an old line would satisfy the check
   # immediately.
   #
-  # $1 is an optional probe command; it must exit 0 once the cluster is usable.
-  local probe="${1:-}" i
-  for ((i = 0; i < 60; i++)); do
-    if grep -q "boot success" "$HOME_DIR/logs/broker.out" 2>/dev/null; then
-      if [ -z "$probe" ]; then
-        sleep 6
-        return 0
-      fi
-      if bash -c "$probe" >/dev/null 2>&1; then
-        return 0
-      fi
+  # $1 is the probe command; it must exit 0 once the cluster is usable. The
+  # probe's OWN timeout must stay small (-timeout 8): this loop calls it ~40
+  # times, so a probe that waits 45s per attempt turns the whole wait into
+  # half an hour.
+  local probe="$1" i
+  for ((i = 0; i < 40; i++)); do
+    if bash -c "$probe" >/dev/null 2>&1; then
+      return 0
     fi
     sleep 1
   done
   log "ERROR: broker never became visible to the nameserver"
+  bash -c "$probe" 2>&1 | tail -3
   return 1
 }
 
@@ -94,9 +92,16 @@ sed -e "s#^storePathRootDir .*#storePathRootDir = $(cygpath -m "$STORE_DIR")#" \
 log "using throwaway store $STORE_DIR"
 
 log "starting namesrv"
+# The distribution's own scripts pass the conf with `-c`, a PROGRAM ARGUMENT.
+# `-Drocketmq.broker.conf=...` is silently ignored by BrokerStartup/NamesrvStartup
+# (no code reads that property), which is exactly how a broker "boots success"
+# yet never registers: it never learns namesrvAddr from the conf. Symptom seen
+# before this fix: boot line prints the LAN address (192.168.x.x) instead of
+# brokerIP1=127.0.0.1, and the nameserver's cluster table stays empty.
+# The nameserver gets NO -c: the distribution ships no conf/namesrv.conf, and
+# parseCommandlineAndConfigFile dies on the missing file before binding.
 nohup java -Xms512m -Xmx512m -Xmn256m \
   -Drocketmq.home="$ROCKETMQ_HOME" \
-  -Drocketmq.namesrv.conf="$ROCKETMQ_HOME\\conf\\namesrv.conf" \
   -cp "$CP" org.apache.rocketmq.namesrv.NamesrvStartup \
   > logs/namesrv.out 2>&1 &
 NS_PID=$!
@@ -107,8 +112,8 @@ log "namesrv up on $NS_PORT"
 log "starting broker"
 nohup java -Xms512m -Xmx512m -Xmn256m \
   -Drocketmq.home="$ROCKETMQ_HOME" \
-  -Drocketmq.broker.conf="$(cygpath -m "$BROKER_CONF")" \
   -cp "$CP" org.apache.rocketmq.broker.BrokerStartup \
+  -c "$(cygpath -m "$BROKER_CONF")" \
   > logs/broker.out 2>&1 &
 BROKER_PID=$!
 
@@ -118,8 +123,8 @@ wait_port "$BROKER_PORT" broker 150 || { tail -30 logs/broker.out; exit 4; }
 # Prefer a prebuilt probe binary when one is present: `go run` recompiles the
 # whole client on every cluster start, which dominates the wait.
 PROBE="/tmp/wait_cluster.exe"
-[ -x "$PROBE" ] || PROBE="cd /d/project/rocketmq-client-remoting/go && go run ./examples/wait_cluster -ns 127.0.0.1:9876 -timeout 45"
-wait_broker_registered "${PROBE} -ns 127.0.0.1:9876 -timeout 45" \
+[ -x "$PROBE" ] || PROBE="cd /d/project/rocketmq-client-remoting/go && go run ./examples/wait_cluster -ns 127.0.0.1:9876"
+wait_broker_registered "${PROBE} -ns 127.0.0.1:9876 -timeout 8" \
   || { tail -30 logs/broker.out; exit 5; }
 log "broker up on $BROKER_PORT and registered"
 log "running: $*"

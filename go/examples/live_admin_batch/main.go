@@ -194,9 +194,9 @@ func main() {
 			fmt.Sprintf("resumed=%v，对非半消息消息竟返回 true", resumed))
 	}
 	if _, err := admin.ResumeCheckHalfMessage(masterAddr, "", "x"); err != nil {
-		check("恢复半消息(323) 缺 topic 被本地拒绝", false, err.Error())
-	} else {
 		check("恢复半消息(323) 缺 topic 被本地拒绝", true, "")
+	} else {
+		check("恢复半消息(323) 缺 topic 被本地拒绝", false, "空 topic 竟被放行发出")
 	}
 
 	// ---- 5. createOrUpdateOrderConf (nameserver KV) ---------------------------
@@ -269,13 +269,14 @@ func main() {
 		check("清理类 ByAddr 报告失败地址", true, "")
 	}
 
-	// ---- 7. cleanUnusedTopicByAddr -------------------------------------------
-	// Only topics that were never written to get deleted, so *topicB (created
-	// above but never written) must be gone afterwards.
+	// ---- 7. CLEAN_UNUSED_TOPIC(316) ------------------------------------------
+	// One request; the broker drops ITS OWN unused topics. What counts as
+	// unused is broker policy (it keeps BenchmarkTest and friends), so the
+	// only client-side invariant is that the broker accepts the request.
 	if err := admin.CleanUnusedTopicByAddr(masterAddr); err != nil {
-		check("清理未使用 topic ByAddr", false, err.Error())
+		check("清理未使用 topic(316)", false, err.Error())
 	} else {
-		check("清理未使用 topic ByAddr", true, "")
+		check("清理未使用 topic(316)", true, "")
 	}
 
 	// ---- cleanup -------------------------------------------------------------
