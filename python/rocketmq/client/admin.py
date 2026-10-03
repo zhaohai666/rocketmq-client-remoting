@@ -28,7 +28,8 @@ from ..common.topic_config import TopicConfig
 from ..logging import get_logger
 from ..remoting.protocol.body import (ClusterInfo, ConsumerConnection,
                                       ConsumerRunningInfo, KVTable,
-                                      ProducerConnection, ResetOffsetBody, TopicList)
+                                      ProducerConnection, QueryConsumeTimeSpanBody,
+                                      ResetOffsetBody, TopicList)
 from ..remoting.protocol.admin_body import (ConsumeStats, QueryConsumeQueueResponseBody,
                                             TopicConfigSerializeWrapper, TopicStatsTable)
 from ..remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
@@ -46,6 +47,9 @@ logger = get_logger()
 
 # 默认超时（对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3）
 DEFAULT_TIMEOUT = 5000 * 3
+
+# org.apache.rocketmq.common.namesrv.NamesrvUtil#NAMESPACE_ORDER_TOPIC_CONFIG
+NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG"
 
 
 # ---------------- 消息轨迹 DTO（org.apache.rocketmq.tools.admin.api） ----------------
@@ -1174,6 +1178,254 @@ class DefaultMQAdminExt:
         if not response.body:
             return QueryConsumeQueueResponseBody()
         return QueryConsumeQueueResponseBody.decode(response.body)
+
+    # ---------------- 批量配置（Java 有实现、此前 Python 侧缺失） ----------------
+    def create_and_update_topic_config_list(self, broker_addr: str,
+                                            configs: List[TopicConfig]) -> None:
+        """对应 Java createAndUpdateTopicConfigList → UPDATE_AND_CREATE_TOPIC_LIST(18)。
+
+        wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
+        body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList": [...]}。
+        """
+        if not configs:
+            raise MQClientException("createAndUpdateTopicConfigList: empty topicConfigList")
+        body = RemotingSerializable.encode(
+            {"topicConfigList": [c.to_dict() for c in configs]})
+        self._invoke_broker(broker_addr, RequestCode.UPDATE_AND_CREATE_TOPIC_LIST,
+                            body=body)
+
+    def create_and_update_subscription_group_config_list(
+            self, broker_addr: str, configs: List[SubscriptionGroupConfig]) -> None:
+        """对应 Java createAndUpdateSubscriptionGroupConfigList → 225。
+
+        与 topic-list 同形，但 body 的 key 是 ``groupConfigList``；
+        单组版（200）的 body 是裸 SubscriptionGroupConfig 对象，两处字段名不同。
+        """
+        if not configs:
+            raise MQClientException(
+                "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList")
+        body = RemotingSerializable.encode(
+            {"groupConfigList": [c.to_dict() for c in configs]})
+        self._invoke_broker(broker_addr, RequestCode.UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST,
+                            body=body)
+
+    def create_static_topic(self, broker_addr: str, default_topic: str,
+                            config: TopicConfig, mapping_detail: Dict,
+                            force: bool = False) -> None:
+        """对应 Java createStaticTopic → UPDATE_AND_CREATE_STATIC_TOPIC(513)。
+
+        header 复用 CreateTopicRequestHeader 字段（topic/defaultTopic/队列数/perm/
+        topicFilterType/topicSysFlag/order/force），body 是 TopicQueueMappingDetail
+        的 JSON 编码（单元化静态 topic 的映射文档）。
+        """
+        if config is None:
+            raise MQClientException("createStaticTopic: config must not be None")
+        if not mapping_detail:
+            raise MQClientException("createStaticTopic: mappingDetail must not be empty")
+        header = {
+            "topic": config.topic_name,
+            "defaultTopic": default_topic,
+            "readQueueNums": config.read_queue_nums,
+            "writeQueueNums": config.write_queue_nums,
+            "perm": config.perm,
+            "topicFilterType": config.topic_filter_type or "SINGLE_TAG",
+            "topicSysFlag": config.topic_sys_flag,
+            "order": str(config.order).lower(),
+            "force": str(force).lower(),
+        }
+        self._invoke_broker(broker_addr, RequestCode.UPDATE_AND_CREATE_STATIC_TOPIC,
+                            ext_fields=header,
+                            body=RemotingSerializable.encode(mapping_detail))
+
+    def update_and_get_group_read_forbidden(self, broker_addr: str, group: str,
+                                            topic: str,
+                                            readable: Optional[bool] = None) -> Dict:
+        """对应 Java updateAndGetGroupReadForbidden → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
+
+        readable=None 表示仅查询（Java 不设该字段）；响应体是 GroupForbidden JSON。
+        """
+        if not group or not topic:
+            raise MQClientException("updateAndGetGroupReadForbidden: group/topic required")
+        ext = {"group": group, "topic": topic}
+        if readable is not None:
+            ext["readable"] = str(readable).lower()
+        response = self._invoke_broker(broker_addr, RequestCode.UPDATE_AND_GET_GROUP_FORBIDDEN,
+                                       ext_fields=ext)
+        if not response.body:
+            raise MQClientException("updateAndGetGroupReadForbidden: empty response body")
+        return fastjson_loads(response.body.decode("utf-8"))
+
+    def resume_check_half_message(self, broker_addr: str, topic: str,
+                                  msg_id: str = "") -> bool:
+        """对应 Java resumeCheckHalfMessage → RESUME_CHECK_HALF_MESSAGE(323)。
+
+        Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 False 而不抛错**——
+        网络层异常才上抛；broker 拒绝（如 msgId 不是半消息，SYSTEM_ERROR）
+        通过返回值表达。
+        """
+        if not topic:
+            raise MQClientException("resumeCheckHalfMessage: topic required")
+        ext = {"topic": topic}
+        if msg_id:
+            ext["msgId"] = msg_id
+        client = self._require_client()
+        addr = MixAll.broker_vip_channel(self.vip_channel_enabled, broker_addr)
+        request = RemotingCommand.create_request_command(RequestCode.RESUME_CHECK_HALF_MESSAGE,
+                                                         None)
+        request.ext_fields.update({k: str(v) for k, v in ext.items()})
+        response = client._invoke_sync(addr, request, self.timeout_millis)
+        return response.code == ResponseCode.SUCCESS
+
+    def create_or_update_order_conf(self, key: str, value: str,
+                                    is_cluster: bool = False) -> None:
+        """对应 Java createOrUpdateOrderConf：**不是独立请求**，是 NameServer KV
+        namespace=ORDER_TOPIC_CONFIG 上的读改写。
+
+        集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的
+        "topic:conf" 列表，替换 key 匹配的条目后整体写回。
+        """
+        if not key or not value:
+            raise MQClientException("createOrUpdateOrderConf: key/value required")
+        if is_cluster:
+            self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, value)
+            return
+        try:
+            old_confs = self.get_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key) or ""
+        except Exception:  # noqa: BLE001 — Java 打印后按空表继续（首写是常态）
+            old_confs = ""
+        entries: Dict[str, str] = {}
+        for entry in old_confs.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            entry_key = entry.split(":", 1)[0]
+            entries[entry_key] = entry
+        new_key = value.split(":", 1)[0]
+        if not new_key:
+            raise MQClientException("createOrUpdateOrderConf: value must start with a key")
+        entries[new_key] = value
+        self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key,
+                           ";".join(entries.values()))
+
+    # ---------------- 运维清理类 ----------------
+    def clean_expired_consumer_queue(self, broker_addr: str, time_hours: int) -> None:
+        """对应 Java cleanExpiredConsumerQueue → CLEAN_EXPIRED_CONSUMEQUEUE(306)。"""
+        self._invoke_broker(broker_addr, RequestCode.CLEAN_EXPIRED_CONSUMEQUEUE,
+                            {"time": time_hours})
+
+    def clean_expired_consumer_queue_by_addr(self, addrs: List[str],
+                                             time_hours: int) -> List[str]:
+        """对应 Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表。"""
+        failed = []
+        for addr in addrs:
+            try:
+                self.clean_expired_consumer_queue(addr, time_hours)
+            except Exception:  # noqa: BLE001
+                failed.append(addr)
+        return failed
+
+    def delete_expired_commit_log(self, broker_addr: str, time_hours: int) -> None:
+        """对应 Java deleteExpiredCommitLog → DELETE_EXPIRED_COMMITLOG(329)。"""
+        self._invoke_broker(broker_addr, RequestCode.DELETE_EXPIRED_COMMITLOG,
+                            {"time": time_hours})
+
+    def delete_expired_commit_log_by_addr(self, addrs: List[str],
+                                          time_hours: int) -> List[str]:
+        """对应 Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表。"""
+        failed = []
+        for addr in addrs:
+            try:
+                self.delete_expired_commit_log(addr, time_hours)
+            except Exception:  # noqa: BLE001
+                failed.append(addr)
+        return failed
+
+    def clean_unused_topic_by_addr(self, broker_addr: str) -> None:
+        """对应 Java cleanUnusedTopicByAddr → MQClientAPIImpl:2696：**单请求**
+        CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。
+
+        客户端不要遍历 topic 表逐个删——broker 自建的 BenchmarkTest、
+        重试/死信 topic 会被 broker 以 SYSTEM_ERROR 拒绝。
+        """
+        self._invoke_broker(broker_addr, RequestCode.CLEAN_UNUSED_TOPIC)
+
+    def query_consume_time_span(self, topic: str, group: str) -> List[Dict]:
+        """对应 Java queryConsumeTimeSpan：按路由遍历 master，聚合各 broker 的
+        QUERY_CONSUME_TIME_SPAN(303) 结果（body 是 consumeTimeSpanSet JSON）。"""
+        route = self.examine_topic_route(topic)
+        spans: List[Dict] = []
+        for bd in route.broker_datas:
+            addr = bd.select_broker_addr()
+            if not addr:
+                continue
+            response = self._invoke_broker(addr, RequestCode.QUERY_CONSUME_TIME_SPAN,
+                                           {"topic": topic, "group": group})
+            if not response.body:
+                continue
+            body = QueryConsumeTimeSpanBody.decode(response.body)
+            spans.extend(body.consume_time_span_set)
+        return spans
+
+    # ---------------- NameServer 配置（318/319） ----------------
+    def update_name_server_config(self, properties: Dict[str, str],
+                                  timeout_millis: Optional[int] = None) -> None:
+        """对应 Java updateNameServerConfig → UPDATE_NAMESRV_CONFIG(318)：
+        properties 以 **k=v\\n 文本**进 body，广播到每个 NameServer，
+        任一失败即抛（Java 记 errResponse 最后统一抛）。"""
+        text = MixAll.properties2_string(properties or {})
+        if not text:
+            return
+        client = self._require_client()
+        request = RemotingCommand.create_request_command(RequestCode.UPDATE_NAMESRV_CONFIG,
+                                                         None)
+        request.body = text.encode("utf-8")
+        err_response = None
+        for ns_addr in client.name_server_addrs:
+            response = client._invoke_sync(ns_addr, request,
+                                           timeout_millis or self.timeout_millis)
+            if response.code != ResponseCode.SUCCESS:
+                err_response = response
+        if err_response is not None:
+            raise MQClientException(err_response.remark or "update name server config failed",
+                                    err_response.code)
+
+    def get_name_server_config(self, namesrv_addrs: Optional[List[str]] = None,
+                               timeout_millis: Optional[int] = None) -> Dict[str, Dict[str, str]]:
+        """对应 Java getNameServerConfig → GET_NAMESRV_CONFIG(319)：逐个 NameServer
+        查询，body 是 properties 文本；返回 {地址: properties 字典}。"""
+        client = self._require_client()
+        targets = namesrv_addrs or list(client.name_server_addrs)
+        result: Dict[str, Dict[str, str]] = {}
+        last_exc: Optional[Exception] = None
+        for ns_addr in targets:
+            request = RemotingCommand.create_request_command(RequestCode.GET_NAMESRV_CONFIG,
+                                                             None)
+            try:
+                response = client._invoke_sync(ns_addr, request,
+                                               timeout_millis or self.timeout_millis)
+            except Exception as e:  # noqa: BLE001 — Java 收集后统一抛
+                last_exc = e
+                continue
+            if response.code != ResponseCode.SUCCESS:
+                last_exc = MQClientException(response.remark or "get name server config failed",
+                                             response.code)
+                continue
+            result[ns_addr] = MixAll.string2_properties(
+                (response.body or b"").decode("utf-8"))
+        if not result and last_exc is not None:
+            raise last_exc
+        return result
+
+    def set_message_request_mode(self, broker_addr: str, topic: str,
+                                 consumer_group: str, mode: str,
+                                 pop_share_queue_num: int = 0) -> None:
+        """对应 Java setMessageRequestMode → SET_MESSAGE_REQUEST_MODE(401)：
+        在 POP 与 Pull 模式间切换消费组（单元化场景）。"""
+        ext = {"topic": topic, "consumerGroup": consumer_group, "mode": mode}
+        if pop_share_queue_num > 0:
+            ext["popShareQueueNum"] = pop_share_queue_num
+        self._invoke_broker(broker_addr, RequestCode.SET_MESSAGE_REQUEST_MODE,
+                            ext_fields=ext)
 
 
 # ---------------------------------------------------------------- 辅助

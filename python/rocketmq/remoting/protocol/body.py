@@ -412,6 +412,10 @@ class QueryConsumeTimeSpanBody:
         b.consume_time_span_set = list(d.get("consumeTimeSpanSet") or [])
         return b
 
+    @staticmethod
+    def decode(data: bytes) -> "QueryConsumeTimeSpanBody":
+        return QueryConsumeTimeSpanBody.from_dict(RemotingSerializable.decode_json(data))
+
     def encode(self) -> bytes:
         return RemotingSerializable.encode(self.to_dict())
 
