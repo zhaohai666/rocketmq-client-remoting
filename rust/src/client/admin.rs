@@ -84,6 +84,10 @@ pub const DEFAULT_INSTANCE_NAME: &str = "ADMIN";
 const ADMIN_OP_TIMEOUT_MILLIS: i64 = 5000;
 /// Python `query_message_by_key(max_num=32)` 与 `query_message_by_uniq_key` 写死的 32。
 pub const DEFAULT_QUERY_MESSAGE_MAX_NUM: i32 = 32;
+
+/// Python `NamesrvUtil.NAMESPACE_ORDER_TOPIC_CONFIG`：
+/// 顺序 topic 配置所在的 NameServer KV namespace。
+pub const NAMESPACE_ORDER_TOPIC_CONFIG: &str = "ORDER_TOPIC_CONFIG";
 /// Python `get_all_subscription_group` 的 `maxGroupNum`。
 const MAX_GROUP_NUM: i32 = 10_000;
 /// Python `query_message_by_uniq_key` 的查询窗口上界（`now + 60 * 60 * 1000`）。
@@ -2545,6 +2549,435 @@ impl DefaultMQAdminExt {
             Some(body) => QueryConsumeQueueResponseBody::decode(body),
             None => Ok(QueryConsumeQueueResponseBody::default()),
         }
+    }
+
+    // ---------------- 批量配置（Java 有实现、此前 Rust 侧缺失） ----------------
+
+    /// Python `create_and_update_topic_config_list` → UPDATE_AND_CREATE_TOPIC_LIST(18)。
+    ///
+    /// wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
+    /// body 是 CreateTopicListRequestBody JSON：{"topicConfigList": [...]}。
+    pub async fn create_and_update_topic_config_list(
+        &self,
+        broker_addr: &str,
+        configs: &[TopicConfig],
+    ) -> Result<()> {
+        if configs.is_empty() {
+            bail!("createAndUpdateTopicConfigList: empty topicConfigList");
+        }
+        let rows: Vec<Value> = configs.iter().map(|c| c.to_json_value()).collect();
+        let body = serde_json::to_vec(&json!({ "topicConfigList": rows }))
+            .map_err(|e| Error::client(format!("encode topicConfigList: {e}")))?;
+        self.invoke_broker(
+            broker_addr,
+            request_code::UPDATE_AND_CREATE_TOPIC_LIST,
+            &ExtFields::new(),
+            Some(body),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Python `create_and_update_subscription_group_config_list` → 225。
+    /// 与 topic-list 同形，但 body key 是 `groupConfigList`。
+    pub async fn create_and_update_subscription_group_config_list(
+        &self,
+        broker_addr: &str,
+        configs: &[SubscriptionGroupConfig],
+    ) -> Result<()> {
+        if configs.is_empty() {
+            bail!("createAndUpdateSubscriptionGroupConfigList: empty groupConfigList");
+        }
+        let rows: Vec<Value> = configs.iter().map(|c| c.to_json_value()).collect();
+        let body = serde_json::to_vec(&json!({ "groupConfigList": rows }))
+            .map_err(|e| Error::client(format!("encode groupConfigList: {e}")))?;
+        self.invoke_broker(
+            broker_addr,
+            request_code::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST,
+            &ExtFields::new(),
+            Some(body),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Python `create_static_topic` → UPDATE_AND_CREATE_STATIC_TOPIC(513)：
+    /// header 复用 CreateTopicRequestHeader 字段，body 是 TopicQueueMappingDetail JSON。
+    pub async fn create_static_topic(
+        &self,
+        broker_addr: &str,
+        default_topic: &str,
+        config: &TopicConfig,
+        mapping_detail: &Value,
+        force: bool,
+    ) -> Result<()> {
+        if mapping_detail.is_null() {
+            bail!("createStaticTopic: mappingDetail must not be null");
+        }
+        let ext = ext_pairs(&[
+            ("topic", config.topic_name.clone()),
+            ("defaultTopic", default_topic.to_string()),
+            ("readQueueNums", config.read_queue_nums.to_string()),
+            ("writeQueueNums", config.write_queue_nums.to_string()),
+            ("perm", config.perm.to_string()),
+            (
+                "topicFilterType",
+                if config.topic_filter_type.is_empty() {
+                    "SINGLE_TAG".to_string()
+                } else {
+                    config.topic_filter_type.clone()
+                },
+            ),
+            ("topicSysFlag", config.topic_sys_flag.to_string()),
+            ("order", config.order.to_string()),
+            ("force", force.to_string()),
+        ]);
+        let body = serde_json::to_vec(mapping_detail)
+            .map_err(|e| Error::client(format!("encode mappingDetail: {e}")))?;
+        self.invoke_broker(
+            broker_addr,
+            request_code::UPDATE_AND_CREATE_STATIC_TOPIC,
+            &ext,
+            Some(body),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Python `update_and_get_group_read_forbidden` → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
+    /// `readable=None` 表示仅查询；响应体是 GroupForbidden JSON。
+    pub async fn update_and_get_group_read_forbidden(
+        &self,
+        broker_addr: &str,
+        group: &str,
+        topic: &str,
+        readable: Option<bool>,
+    ) -> Result<Value> {
+        if group.is_empty() || topic.is_empty() {
+            bail!("updateAndGetGroupReadForbidden: group/topic required");
+        }
+        let mut pairs = vec![
+            ("group", group.to_string()),
+            ("topic", topic.to_string()),
+        ];
+        if let Some(flag) = readable {
+            pairs.push(("readable", flag.to_string()));
+        }
+        let ext = ext_pairs(&pairs);
+        let response = self
+            .invoke_broker(
+                broker_addr,
+                request_code::UPDATE_AND_GET_GROUP_FORBIDDEN,
+                &ext,
+                None,
+                None,
+            )
+            .await?;
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => serde_json::from_slice(body)
+                .map_err(|e| Error::client(format!("decode GroupForbidden: {e}"))),
+            None => bail!("updateAndGetGroupReadForbidden: empty response body"),
+        }
+    }
+
+    /// Python `resume_check_half_message` → RESUME_CHECK_HALF_MESSAGE(323)。
+    ///
+    /// Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 false 而不抛错**——broker
+    /// 拒绝（如 msgId 不是半消息，SYSTEM_ERROR）通过返回值表达，网络层异常才上抛；
+    /// `invoke_broker` 的 check_response 会把拒绝变成错误，所以这里走裸调用。
+    pub async fn resume_check_half_message(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+        msg_id: &str,
+    ) -> Result<bool> {
+        if topic.is_empty() {
+            bail!("resumeCheckHalfMessage: topic required");
+        }
+        let mut pairs = vec![("topic", topic.to_string())];
+        if !msg_id.is_empty() {
+            pairs.push(("msgId", msg_id.to_string()));
+        }
+        let ext = ext_pairs(&pairs);
+        let client = self.require_client()?;
+        let addr = MixAll::broker_vip_channel(
+            read_cfg(&self.inner.cfg).vip_channel_enabled,
+            broker_addr,
+        );
+        let mut request = build_request(request_code::RESUME_CHECK_HALF_MESSAGE, &ext, None);
+        let response = client
+            .invoke_sync(&addr, &mut request, self.timeout_millis())
+            .await?;
+        Ok(response.code == response_code::SUCCESS)
+    }
+
+    /// Python `create_or_update_order_conf`：**不是独立请求**，是 NameServer KV
+    /// namespace=ORDER_TOPIC_CONFIG 上的读改写。非集群模式把存储值当作 ";"
+    /// 分隔的 "topic:conf" 列表，替换匹配条目后整体写回。
+    pub async fn create_or_update_order_conf(
+        &self,
+        key: &str,
+        value: &str,
+        is_cluster: bool,
+    ) -> Result<()> {
+        if key.is_empty() || value.is_empty() {
+            bail!("createOrUpdateOrderConf: key/value required");
+        }
+        if is_cluster {
+            return self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, value).await;
+        }
+        // Java 打印异常后按空表继续：首写是常态，不是失败。
+        let old_confs = self
+            .get_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for entry in old_confs.split(';') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let entry_key = entry.split(':').next().unwrap_or(entry).to_string();
+            match entries.iter_mut().find(|(k, _)| *k == entry_key) {
+                Some(slot) => slot.1 = entry.to_string(),
+                None => entries.push((entry_key, entry.to_string())),
+            }
+        }
+        let new_key = value.split(':').next().unwrap_or("");
+        if new_key.is_empty() {
+            bail!("createOrUpdateOrderConf: value must start with a key");
+        }
+        match entries.iter_mut().find(|(k, _)| k == new_key) {
+            Some(slot) => slot.1 = value.to_string(),
+            None => entries.push((new_key.to_string(), value.to_string())),
+        }
+        let merged = entries
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, &merged).await
+    }
+
+    // ---------------- 运维清理类 ----------------
+
+    /// Python `clean_expired_consumer_queue` → CLEAN_EXPIRED_CONSUMEQUEUE(306)。
+    pub async fn clean_expired_consumer_queue(
+        &self,
+        broker_addr: &str,
+        time_hours: i32,
+    ) -> Result<()> {
+        let ext = ext_pairs(&[("time", time_hours.to_string())]);
+        self.invoke_broker(
+            broker_addr,
+            request_code::CLEAN_EXPIRED_CONSUMEQUEUE,
+            &ext,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Python `clean_expired_consumer_queue_by_addr`：逐个地址执行，返回**失败的地址**。
+    pub async fn clean_expired_consumer_queue_by_addr(
+        &self,
+        addrs: &[String],
+        time_hours: i32,
+    ) -> Vec<String> {
+        let mut failed = Vec::new();
+        for addr in addrs {
+            if self.clean_expired_consumer_queue(addr, time_hours).await.is_err() {
+                failed.push(addr.clone());
+            }
+        }
+        failed
+    }
+
+    /// Python `delete_expired_commit_log` → DELETE_EXPIRED_COMMITLOG(329)。
+    pub async fn delete_expired_commit_log(
+        &self,
+        broker_addr: &str,
+        time_hours: i32,
+    ) -> Result<()> {
+        let ext = ext_pairs(&[("time", time_hours.to_string())]);
+        self.invoke_broker(
+            broker_addr,
+            request_code::DELETE_EXPIRED_COMMITLOG,
+            &ext,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Python `delete_expired_commit_log_by_addr`：逐个地址执行，返回**失败的地址**。
+    pub async fn delete_expired_commit_log_by_addr(
+        &self,
+        addrs: &[String],
+        time_hours: i32,
+    ) -> Vec<String> {
+        let mut failed = Vec::new();
+        for addr in addrs {
+            if self.delete_expired_commit_log(addr, time_hours).await.is_err() {
+                failed.push(addr.clone());
+            }
+        }
+        failed
+    }
+
+    /// Python `clean_unused_topic_by_addr` → MQClientAPIImpl:2696：**单请求**
+    /// CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。
+    pub async fn clean_unused_topic_by_addr(&self, broker_addr: &str) -> Result<()> {
+        self.invoke_broker(
+            broker_addr,
+            request_code::CLEAN_UNUSED_TOPIC,
+            &ExtFields::new(),
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Python `query_consume_time_span` → QUERY_CONSUME_TIME_SPAN(303)：
+    /// 按路由遍历 master，聚合各 broker 的 consumeTimeSpanSet。
+    pub async fn query_consume_time_span(
+        &self,
+        topic: &str,
+        group: &str,
+    ) -> Result<Vec<Value>> {
+        let route = self.examine_topic_route(topic).await?;
+        let mut spans: Vec<Value> = Vec::new();
+        for bd in &route.broker_datas {
+            let Some(addr) = bd.select_broker_addr() else {
+                continue;
+            };
+            let ext = ext_pairs(&[
+                ("topic", topic.to_string()),
+                ("group", group.to_string()),
+            ]);
+            let response = self
+                .invoke_broker(&addr, request_code::QUERY_CONSUME_TIME_SPAN, &ext, None, None)
+                .await?;
+            if let Some(body) = response.body.as_deref().filter(|b| !b.is_empty()) {
+                let parsed: Value = serde_json::from_slice(body)
+                    .map_err(|e| Error::client(format!("decode QueryConsumeTimeSpanBody: {e}")))?;
+                if let Some(set) = parsed.get("consumeTimeSpanSet").and_then(Value::as_array) {
+                    spans.extend(set.iter().cloned());
+                }
+            }
+        }
+        Ok(spans)
+    }
+
+    // ---------------- NameServer 配置（318/319） ----------------
+
+    /// Python `update_name_server_config` → UPDATE_NAMESRV_CONFIG(318)：
+    /// properties 以 k=v\n 文本进 body，广播每个 NameServer，任一失败即抛。
+    pub async fn update_name_server_config(
+        &self,
+        properties: &StringMap,
+        timeout_millis: Option<i64>,
+    ) -> Result<()> {
+        let text = MixAll::properties_to_string(properties, false);
+        if text.is_empty() {
+            return Ok(());
+        }
+        let client = self.require_client()?;
+        let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        let mut err_response: Option<RemotingCommand> = None;
+        for ns_addr in client.name_server_addrs() {
+            let mut request =
+                build_request(request_code::UPDATE_NAMESRV_CONFIG, &ExtFields::new(), Some(text.as_bytes().to_vec()));
+            let response = client.invoke_sync(&ns_addr, &mut request, timeout).await?;
+            if response.code != response_code::SUCCESS {
+                err_response = Some(response);
+            }
+        }
+        if let Some(response) = err_response {
+            return Err(Error::client_with_code(
+                response.code,
+                response
+                    .remark
+                    .unwrap_or_else(|| "update name server config failed".to_string()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Python `get_name_server_config` → GET_NAMESRV_CONFIG(319)：逐个 NameServer
+    /// 查询，body 是 properties 文本；返回 {地址: properties}。
+    pub async fn get_name_server_config(
+        &self,
+        timeout_millis: Option<i64>,
+    ) -> Result<Vec<(String, StringMap)>> {
+        let client = self.require_client()?;
+        let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
+        let mut result: Vec<(String, StringMap)> = Vec::new();
+        let mut last_err: Option<Error> = None;
+        for ns_addr in client.name_server_addrs() {
+            let mut request =
+                build_request(request_code::GET_NAMESRV_CONFIG, &ExtFields::new(), None);
+            match client.invoke_sync(&ns_addr, &mut request, timeout).await {
+                Ok(response) if response.code == response_code::SUCCESS => {
+                    let text = response
+                        .body
+                        .as_deref()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .unwrap_or_default();
+                    result.push((ns_addr.clone(), MixAll::string_to_properties(&text)));
+                }
+                Ok(response) => {
+                    last_err = Some(Error::client_with_code(
+                        response.code,
+                        response.remark.unwrap_or_else(|| "get name server config failed".to_string()),
+                    ));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if result.is_empty() {
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Python `set_message_request_mode` → SET_MESSAGE_REQUEST_MODE(401)。
+    pub async fn set_message_request_mode(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+        consumer_group: &str,
+        mode: &str,
+        pop_share_queue_num: i32,
+    ) -> Result<()> {
+        let mut pairs = vec![
+            ("topic", topic.to_string()),
+            ("consumerGroup", consumer_group.to_string()),
+            ("mode", mode.to_string()),
+        ];
+        if pop_share_queue_num > 0 {
+            pairs.push(("popShareQueueNum", pop_share_queue_num.to_string()));
+        }
+        let ext = ext_pairs(&pairs);
+        self.invoke_broker(
+            broker_addr,
+            request_code::SET_MESSAGE_REQUEST_MODE,
+            &ext,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
     }
 }
 
