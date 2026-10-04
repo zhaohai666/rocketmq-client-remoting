@@ -31,6 +31,7 @@ internal static class Program
                 "interop" => InteropTool.Run(rest),
                 "message-types" => LiveMessageTypes.Run(rest),
                 "admin-live" => AdminLive.Run(rest),
+                "admin-batch-live" => AdminBatchLive.Run(rest),
                 "compression-live" => CompressionLive.Run(rest),
                 "redelivery" => LiveRedelivery.Run(rest),
                 "acl" => LiveAcl.Run(rest),
@@ -91,6 +92,7 @@ internal static class Program
               interop <mode> [args...]      跨语言互操作（与 Python 参考客户端对齐）
               message-types [namesrv]       真实集群 7 类消息能力联调
               admin-live   [namesrv]        真实集群管理端全链路联调
+              admin-batch-live [namesrv]    真实集群批量 admin 联调（对标 python verify_admin_batch_live）
               compression-live <mode> ...   压缩跨客户端矩阵
               redelivery    [namesrv]       真实集群消费侧能力联调（回投/位点/顺序/广播/流控）
               acl     [namesrv] [ak] [sk]   真实集群 ACL 鉴权联调（需 broker 开 authenticationEnabled）

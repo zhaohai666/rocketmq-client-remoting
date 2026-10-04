@@ -79,6 +79,10 @@ struct MixAll {
     static constexpr int32_t MASTER_ID = 0;
     static constexpr int32_t READ_PERM_BY_DEFAULT = 4 | 2;  // PERM_READ | PERM_WRITE
 
+    // org.apache.rocketmq.common.namesrv.NamesrvUtil#NAMESPACE_ORDER_TOPIC_CONFIG
+    // （顺序消息配置的 KV namespace，createOrUpdateOrderConf 读改写的落点）
+    static constexpr const char* NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG";
+
     static std::string getRetryTopic(const std::string& consumerGroup) {
         return std::string(RETRY_GROUP_TOPIC_PREFIX) + consumerGroup;
     }

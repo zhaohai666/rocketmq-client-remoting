@@ -56,6 +56,17 @@ struct MessageTrack {
     std::string exceptionDesc;
 };
 
+// 对应 org.apache.rocketmq.remoting.protocol.subscription.GroupForbidden：
+// UPDATE_AND_GET_GROUP_FORBIDDEN(353) 的响应体（topic/group/readable 三字段）。
+struct GroupForbidden {
+    std::string topic;
+    std::string group;
+    bool readable = false;
+
+    // 解析失败返回 false（不抛异常）
+    static bool decode(const Bytes& data, GroupForbidden& out);
+};
+
 class DefaultMQAdminExt {
 public:
     // 对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
@@ -141,6 +152,71 @@ public:
     TopicStatsTable examineTopicStats(const std::string& topic);
     TopicStatsTable examineTopicStatsByBroker(const std::string& brokerAddr,
                                              const std::string& topic);
+
+    // ---------------- 批量配置 / 单元化（Java 有实现，此前 cpp 缺失） ----------------
+    // UPDATE_AND_CREATE_TOPIC_LIST(18)：custom header 为空，body 是
+    // {"topicConfigList":[TopicConfig...]}（Java 驼峰字段名）。
+    void createAndUpdateTopicConfigList(const std::string& brokerAddr,
+                                        const std::vector<TopicConfig>& configs);
+    // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：同形，但 body key 是
+    // `groupConfigList`（注意与单组版 200 的裸对象不同）。
+    void createAndUpdateSubscriptionGroupConfigList(
+        const std::string& brokerAddr, const std::vector<SubscriptionGroupConfig>& configs);
+    // UPDATE_AND_CREATE_STATIC_TOPIC(513)：header 复用 CreateTopicRequestHeader 字段
+    // （bool 转 "true"/"false" 小写），body 是 TopicQueueMappingDetail 的 JSON 文档。
+    void createStaticTopic(const std::string& brokerAddr, const std::string& defaultTopic,
+                           const TopicConfig& config, const JsonValue& mappingDetail,
+                           bool force = false);
+    // UPDATE_AND_GET_GROUP_FORBIDDEN(353)：readable 仅在非 nullopt 时下发；
+    // 返回 broker 解码出的 GroupForbidden。
+    GroupForbidden updateAndGetGroupReadForbidden(
+        const std::string& brokerAddr, const std::string& group, const std::string& topic,
+        const std::optional<bool>& readable = std::nullopt);
+    // RESUME_CHECK_HALF_MESSAGE(323)：broker 拒绝（非 SUCCESS）返回 false 而不是抛错
+    // （Java MQClientAPIImpl:3279 的 switch-case 语义）；只有网络层异常才上抛。
+    bool resumeCheckHalfMessage(const std::string& brokerAddr, const std::string& topic,
+                                const std::string& msgId = std::string());
+    // **不是独立请求**：NameServer KV namespace=ORDER_TOPIC_CONFIG 上的读改写。
+    // isCluster 时 value 原样 putKVConfig；否则把存储值当 ";" 分隔的 "key:value"
+    // 条目列表，替换/追加 key 匹配的条目后整体写回。
+    void createOrUpdateOrderConf(const std::string& key, const std::string& value,
+                                 bool isCluster = false);
+
+    // ---------------- 运维清理（Java 有实现，此前 cpp 缺失） ----------------
+    // CLEAN_EXPIRED_CONSUMEQUEUE(306)：header `time`=<小时数>
+    void cleanExpiredConsumerQueue(const std::string& brokerAddr, int32_t timeHours);
+    // 逐地址调用 306，返回**失败的地址**列表（不 fail-fast）
+    std::vector<std::string> cleanExpiredConsumerQueueByAddr(
+        const std::vector<std::string>& addrs, int32_t timeHours);
+    // DELETE_EXPIRED_COMMITLOG(329)：header `time`
+    void deleteExpiredCommitLog(const std::string& brokerAddr, int32_t timeHours);
+    // 同 329 的多地址形态
+    std::vector<std::string> deleteExpiredCommitLogByAddr(
+        const std::vector<std::string>& addrs, int32_t timeHours);
+    // CLEAN_UNUSED_TOPIC(316)：**单请求**，由 broker 自行清理。绝不要在客户端遍历
+    // topic 表逐个删除（broker 自建 topic 会被拒）。
+    void cleanUnusedTopicByAddr(const std::string& brokerAddr);
+    // QUERY_CONSUME_TIME_SPAN(303)：按 topic 路由扇出到每个 master，聚合响应 body 里
+    // consumeTimeSpanSet JSON 数组（返回聚合后的数组）。
+    JsonValue queryConsumeTimeSpan(const std::string& topic, const std::string& group);
+    // **不发请求**：examineTopicRoute(topic) 取第一个 brokerName，再在
+    // EXAMINE_BROKER_CLUSTER_INFO(25) 的 clusterAddrTable 里找包含该 brokerName 的
+    // 所有 cluster 名返回（与 getClusterList 同语义，Java 有两个名字）。
+    std::set<std::string> getTopicClusterList(const std::string& topic);
+    // SET_MESSAGE_REQUEST_MODE(401)：popShareQueueNum 仅在 >0 时带。
+    void setMessageRequestMode(const std::string& brokerAddr, const std::string& topic,
+                               const std::string& consumerGroup, const std::string& mode,
+                               int32_t popShareQueueNum = 0);
+
+    // ---------------- NameServer 配置（318/319，Java 有实现，此前 cpp 缺失） ----------------
+    // body 是 properties **文本**（k=v\n，不是 JSON）；广播每个 nameserver，
+    // 任一失败即抛（Java 记 errResponse 最后统一抛）。
+    void updateNameServerConfig(const PropertyMap& properties, int32_t timeoutMillis = -1);
+    // 逐个查询（默认全部 NameServer），body 按 properties 文本解析；
+    // 返回 {地址: properties 字典}。
+    std::map<std::string, PropertyMap> getNameServerConfig(
+        const std::vector<std::string>& namesrvAddrs = std::vector<std::string>(),
+        int32_t timeoutMillis = -1);
 
     // ---------------- 集群 / Broker ----------------
     ClusterInfo fetchBrokerClusterInfo();

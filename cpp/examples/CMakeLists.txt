@@ -17,6 +17,10 @@ target_link_libraries(rmq_live_redelivery PRIVATE rocketmq::remoting)
 add_executable(rmq_admin_live admin_live.cpp)
 target_link_libraries(rmq_admin_live PRIVATE rocketmq::remoting)
 
+# 批量 admin 方法真机联调（对标 python/verify_admin_batch_live.py；不打进 ctest）
+add_executable(rmq_admin_batch_live admin_batch_live.cpp)
+target_link_libraries(rmq_admin_batch_live PRIVATE rocketmq::remoting)
+
 # 真实集群自动压缩联调（自产自销 + 与 Java 探针跨客户端互通；不打进 ctest）
 add_executable(rmq_compression_live compression_live.cpp)
 target_link_libraries(rmq_compression_live PRIVATE rocketmq::remoting)

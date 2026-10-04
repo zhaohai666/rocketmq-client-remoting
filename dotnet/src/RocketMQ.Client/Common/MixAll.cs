@@ -64,6 +64,12 @@ public static class MixAll
     public const string UnitPrefix = "unit_";
 
     /// <summary>
+    /// 对应 org.apache.rocketmq.common.namesrv.NamesrvUtil#NAMESPACE_ORDER_TOPIC_CONFIG
+    /// （顺序消息配置的 KV namespace，CreateOrUpdateOrderConf 读改写的落点）。
+    /// </summary>
+    public const string NamespaceOrderTopicConfig = "ORDER_TOPIC_CONFIG";
+
+    /// <summary>
     /// 对应 Java <c>MixAll.REQ_T</c>：请求类型标记的 ExtFields 键，由 stream 请求钩子
     /// （<c>StreamTypeRPCHook</c>）写入，取值是 <c>RequestType.STREAM.getCode()</c>
     /// 即 <c>"0"</c>（不是枚举名 —— clientId 的后缀才用枚举名 <c>@STREAM</c>）。

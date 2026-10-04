@@ -383,6 +383,323 @@ TopicStatsTable DefaultMQAdminExt::examineTopicStatsByBroker(const std::string& 
     return t;
 }
 
+// ---------------------------------------- 批量配置 / 单元化
+// GroupForbidden：UPDATE_AND_GET_GROUP_FORBIDDEN(353) 的响应体
+bool GroupForbidden::decode(const Bytes& data, GroupForbidden& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    v.tryGetString("topic", out.topic);
+    v.tryGetString("group", out.group);
+    v.tryGetBool("readable", out.readable);
+    return true;
+}
+
+void DefaultMQAdminExt::createAndUpdateTopicConfigList(const std::string& brokerAddr,
+                                                      const std::vector<TopicConfig>& configs) {
+    // UPDATE_AND_CREATE_TOPIC_LIST(18)：custom header 为**空**（topic 名在 body 里做
+    // 授权资源），body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList":[...]}。
+    if (configs.empty()) {
+        throw MQClientException("createAndUpdateTopicConfigList: empty topicConfigList");
+    }
+    JsonValue rows = JsonValue::makeArray();
+    for (const TopicConfig& config : configs) {
+        rows.pushArray(config.toJson());
+    }
+    JsonValue body = JsonValue::makeObject();
+    body.set("topicConfigList", rows);
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::UPDATE_AND_CREATE_TOPIC_LIST,
+                               PropertyMap(), RemotingSerializable::encode(body), true,
+                               timeoutMillis_);
+}
+
+void DefaultMQAdminExt::createAndUpdateSubscriptionGroupConfigList(
+    const std::string& brokerAddr, const std::vector<SubscriptionGroupConfig>& configs) {
+    // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：与 topic-list 同形，但 body key 是
+    // `groupConfigList`（单组版 200 的 body 是裸 SubscriptionGroupConfig 对象）。
+    if (configs.empty()) {
+        throw MQClientException(
+            "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList");
+    }
+    JsonValue rows = JsonValue::makeArray();
+    for (const SubscriptionGroupConfig& config : configs) {
+        rows.pushArray(config.toJson());
+    }
+    JsonValue body = JsonValue::makeObject();
+    body.set("groupConfigList", rows);
+    requireClient().invokeSync(vipAddr(brokerAddr),
+                               RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST,
+                               PropertyMap(), RemotingSerializable::encode(body), true,
+                               timeoutMillis_);
+}
+
+void DefaultMQAdminExt::createStaticTopic(const std::string& brokerAddr,
+                                         const std::string& defaultTopic,
+                                         const TopicConfig& config,
+                                         const JsonValue& mappingDetail, bool force) {
+    // UPDATE_AND_CREATE_STATIC_TOPIC(513)：header 复用 CreateTopicRequestHeader 字段
+    // （bool 转 "true"/"false" 小写字符串），body 是 TopicQueueMappingDetail 的 JSON 文档
+    // （单元化静态 topic 的映射信息）。
+    PropertyMap ext;
+    ext["topic"] = config.topicName;
+    ext["defaultTopic"] = defaultTopic;
+    ext["readQueueNums"] = i64str(config.readQueueNums);
+    ext["writeQueueNums"] = i64str(config.writeQueueNums);
+    ext["perm"] = i64str(config.perm);
+    ext["topicFilterType"] =
+        config.topicFilterType.empty() ? TopicFilterType::SINGLE_TAG : config.topicFilterType;
+    ext["topicSysFlag"] = i64str(config.topicSysFlag);
+    ext["order"] = config.order ? "true" : "false";
+    ext["force"] = force ? "true" : "false";
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::UPDATE_AND_CREATE_STATIC_TOPIC,
+                               ext, RemotingSerializable::encode(mappingDetail), true,
+                               timeoutMillis_);
+}
+
+GroupForbidden DefaultMQAdminExt::updateAndGetGroupReadForbidden(
+    const std::string& brokerAddr, const std::string& group, const std::string& topic,
+    const std::optional<bool>& readable) {
+    // UPDATE_AND_GET_GROUP_FORBIDDEN(353)：readable 仅在非 nullopt 时带（Java 不设该
+    // 字段即"仅查询"）；响应体是 GroupForbidden JSON，解码返回。
+    if (group.empty() || topic.empty()) {
+        throw MQClientException("updateAndGetGroupReadForbidden: group/topic required");
+    }
+    PropertyMap ext;
+    ext["group"] = group;
+    ext["topic"] = topic;
+    if (readable.has_value()) {
+        ext["readable"] = *readable ? "true" : "false";
+    }
+    RemotingCommand response = requireClient().invokeSync(
+        vipAddr(brokerAddr), RequestCode::UPDATE_AND_GET_GROUP_FORBIDDEN, ext, Bytes(), false,
+        timeoutMillis_);
+    if (response.body.empty()) {
+        throw MQClientException("updateAndGetGroupReadForbidden: empty response body");
+    }
+    GroupForbidden out;
+    if (!GroupForbidden::decode(response.body, out)) {
+        throw MQClientException("updateAndGetGroupReadForbidden: bad GroupForbidden body");
+    }
+    return out;
+}
+
+bool DefaultMQAdminExt::resumeCheckHalfMessage(const std::string& brokerAddr,
+                                              const std::string& topic,
+                                              const std::string& msgId) {
+    // RESUME_CHECK_HALF_MESSAGE(323)：Java（MQClientAPIImpl:3279）对非 SUCCESS **返回
+    // false 而不抛错**——网络层异常才上抛；broker 拒绝（如 msgId 不是半消息，表现为
+    // SYSTEM_ERROR）通过返回值表达。invokeSync 会把非 SUCCESS 转成异常，所以这里拿
+    // 原始响应自己判断 code。
+    if (topic.empty()) {
+        throw MQClientException("resumeCheckHalfMessage: topic required");
+    }
+    PropertyMap ext;
+    ext["topic"] = topic;
+    if (!msgId.empty()) ext["msgId"] = msgId;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::RESUME_CHECK_HALF_MESSAGE, ext, Bytes(), false,
+        timeoutMillis_);
+    return response.code == ResponseCode::SUCCESS;
+}
+
+void DefaultMQAdminExt::createOrUpdateOrderConf(const std::string& key,
+                                               const std::string& value, bool isCluster) {
+    // **不是独立请求**：NameServer KV namespace=ORDER_TOPIC_CONFIG 上的读改写。
+    // 集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的 "key:value" 列表，
+    // 替换 key 匹配的条目后整体写回（一次只动单个 topic，不动整个集群）。
+    if (key.empty() || value.empty()) {
+        throw MQClientException("createOrUpdateOrderConf: key/value required");
+    }
+    if (isCluster) {
+        putKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, key, value);
+        return;
+    }
+    std::string oldValue;
+    try {
+        getKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, key, oldValue);
+    } catch (const std::exception&) {
+        // Java 打印后按空表继续：key 缺失是首写的常态，不是失败。
+        oldValue.clear();
+    }
+    // 条目 key -> 完整 "key:value" 文本（Java HashMap 语义：重复 key 后写胜出）
+    std::map<std::string, std::string> entries;
+    size_t start = 0;
+    while (start <= oldValue.size()) {
+        size_t semi = oldValue.find(';', start);
+        std::string entry = (semi == std::string::npos) ? oldValue.substr(start)
+                                                        : oldValue.substr(start, semi - start);
+        // 去首尾空白
+        size_t b = 0, e = entry.size();
+        while (b < e && (entry[b] == ' ' || entry[b] == '\t')) ++b;
+        while (e > b && (entry[e - 1] == ' ' || entry[e - 1] == '\t')) --e;
+        entry = entry.substr(b, e - b);
+        if (!entry.empty()) {
+            std::string entryKey = entry;
+            size_t colon = entry.find(':');
+            if (colon != std::string::npos) entryKey = entry.substr(0, colon);
+            entries[entryKey] = entry;
+        }
+        if (semi == std::string::npos) break;
+        start = semi + 1;
+    }
+    std::string newKey = value;
+    size_t colon = value.find(':');
+    if (colon != std::string::npos) newKey = value.substr(0, colon);
+    if (newKey.empty()) {
+        throw MQClientException("createOrUpdateOrderConf: value must start with a key");
+    }
+    entries[newKey] = value;
+    std::string merged;
+    for (const auto& kv : entries) {
+        if (!merged.empty()) merged += ";";
+        merged += kv.second;
+    }
+    putKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, key, merged);
+}
+
+// ---------------------------------------- 运维清理
+void DefaultMQAdminExt::cleanExpiredConsumerQueue(const std::string& brokerAddr,
+                                                 int32_t timeHours) {
+    // CLEAN_EXPIRED_CONSUMEQUEUE(306)：broker 丢弃 `time` 小时前的 consume-queue 条目。
+    PropertyMap ext;
+    ext["time"] = i64str(timeHours);
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::CLEAN_EXPIRED_CONSUMEQUEUE, ext,
+                               Bytes(), false, timeoutMillis_);
+}
+
+std::vector<std::string> DefaultMQAdminExt::cleanExpiredConsumerQueueByAddr(
+    const std::vector<std::string>& addrs, int32_t timeHours) {
+    // Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表（不 fail-fast，
+    // 一台 broker 挂了不掩盖其他台的结果）。
+    std::vector<std::string> failed;
+    for (const std::string& addr : addrs) {
+        try {
+            cleanExpiredConsumerQueue(addr, timeHours);
+        } catch (const std::exception&) {
+            failed.push_back(addr);
+        }
+    }
+    return failed;
+}
+
+void DefaultMQAdminExt::deleteExpiredCommitLog(const std::string& brokerAddr, int32_t timeHours) {
+    // DELETE_EXPIRED_COMMITLOG(329)：broker 删除 `time` 小时前的 commit-log 文件。
+    PropertyMap ext;
+    ext["time"] = i64str(timeHours);
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::DELETE_EXPIRED_COMMITLOG, ext,
+                               Bytes(), false, timeoutMillis_);
+}
+
+std::vector<std::string> DefaultMQAdminExt::deleteExpiredCommitLogByAddr(
+    const std::vector<std::string>& addrs, int32_t timeHours) {
+    std::vector<std::string> failed;
+    for (const std::string& addr : addrs) {
+        try {
+            deleteExpiredCommitLog(addr, timeHours);
+        } catch (const std::exception&) {
+            failed.push_back(addr);
+        }
+    }
+    return failed;
+}
+
+void DefaultMQAdminExt::cleanUnusedTopicByAddr(const std::string& brokerAddr) {
+    // CLEAN_UNUSED_TOPIC(316)：**单请求**，由 broker 自行清理未使用 topic。客户端绝不
+    // 遍历 topic 表逐个删——broker 自建的 BenchmarkTest、重试/死信 topic 会被 broker
+    // 以 SYSTEM_ERROR 拒绝。
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::CLEAN_UNUSED_TOPIC, PropertyMap(),
+                               Bytes(), false, timeoutMillis_);
+}
+
+JsonValue DefaultMQAdminExt::queryConsumeTimeSpan(const std::string& topic,
+                                                 const std::string& group) {
+    // QUERY_CONSUME_TIME_SPAN(303)：按 topic 路由扇出到每个 master，聚合响应 body 里
+    // consumeTimeSpanSet JSON 数组。
+    TopicRouteData route = examineTopicRoute(topic);
+    JsonValue spans = JsonValue::makeArray();
+    for (const BrokerData& bd : route.brokerDatas) {
+        std::string addr = bd.selectBrokerAddr();
+        if (addr.empty()) continue;
+        PropertyMap ext;
+        ext["topic"] = topic;
+        ext["group"] = group;
+        RemotingCommand response = requireClient().invokeSync(
+            vipAddr(addr), RequestCode::QUERY_CONSUME_TIME_SPAN, ext, Bytes(), false,
+            timeoutMillis_);
+        if (response.body.empty()) continue;
+        JsonValue v;
+        if (!RemotingSerializable::decode(response.body, v)) continue;
+        const JsonValue* arr = v.find("consumeTimeSpanSet");
+        if (arr != nullptr && arr->isArray()) {
+            for (size_t i = 0; i < arr->size(); ++i) spans.pushArray(arr->at(i));
+        }
+    }
+    return spans;
+}
+
+std::set<std::string> DefaultMQAdminExt::getTopicClusterList(const std::string& topic) {
+    // Java 有 getClusterList / getTopicClusterList 两个名字、同一实现（Go 同口径做别名）。
+    return getClusterList(topic);
+}
+
+void DefaultMQAdminExt::setMessageRequestMode(const std::string& brokerAddr,
+                                             const std::string& topic,
+                                             const std::string& consumerGroup,
+                                             const std::string& mode, int32_t popShareQueueNum) {
+    // SET_MESSAGE_REQUEST_MODE(401)：在 POP 与 Pull 模式间切换消费组（单元化场景）。
+    PropertyMap ext;
+    ext["topic"] = topic;
+    ext["consumerGroup"] = consumerGroup;
+    ext["mode"] = mode;
+    if (popShareQueueNum > 0) ext["popShareQueueNum"] = i64str(popShareQueueNum);
+    requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::SET_MESSAGE_REQUEST_MODE, ext,
+                               Bytes(), false, timeoutMillis_);
+}
+
+// ---------------------------------------- NameServer 配置（318/319）
+void DefaultMQAdminExt::updateNameServerConfig(const PropertyMap& properties,
+                                              int32_t timeoutMillis) {
+    // UPDATE_NAMESRV_CONFIG(318)：body 是 properties **文本**（k=v\n，不是 JSON）；
+    // 广播到每个 NameServer，任一失败即抛（Java 记 errResponse 最后统一抛）。
+    std::string text = MixAll::properties2String(properties);
+    if (text.empty()) return;
+    MQClientInstance& client = requireClient();
+    int32_t timeout = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    bool anyFailed = false;
+    int32_t lastCode = 0;
+    std::string lastRemark;
+    for (const std::string& ns : client.nameServerAddrs()) {
+        RemotingCommand response = client.invokeSyncRaw(
+            ns, RequestCode::UPDATE_NAMESRV_CONFIG, PropertyMap(), text, true, timeout);
+        if (response.code != ResponseCode::SUCCESS) {
+            anyFailed = true;
+            lastCode = response.code;
+            lastRemark = response.remark;
+        }
+    }
+    if (anyFailed) {
+        throw MQClientException(
+            lastRemark.empty() ? "update name server config failed" : lastRemark, lastCode);
+    }
+}
+
+std::map<std::string, PropertyMap> DefaultMQAdminExt::getNameServerConfig(
+    const std::vector<std::string>& namesrvAddrs, int32_t timeoutMillis) {
+    // GET_NAMESRV_CONFIG(319)：逐个 NameServer 查询，body 是 properties 文本；
+    // 返回 {地址: properties 字典}。
+    MQClientInstance& client = requireClient();
+    std::vector<std::string> targets =
+        namesrvAddrs.empty() ? client.nameServerAddrs() : namesrvAddrs;
+    int32_t timeout = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    std::map<std::string, PropertyMap> result;
+    for (const std::string& ns : targets) {
+        RemotingCommand response =
+            client.invokeSync(ns, RequestCode::GET_NAMESRV_CONFIG, PropertyMap(), Bytes(), false,
+                              timeout);
+        result[ns] = MixAll::string2Properties(response.body);
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------- 集群 / Broker
 ClusterInfo DefaultMQAdminExt::fetchBrokerClusterInfo() {
     return requireClient().getBrokerClusterInfo();

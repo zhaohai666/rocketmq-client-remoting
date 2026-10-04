@@ -55,6 +55,28 @@ public sealed class MessageTrack
 }
 
 /// <summary>
+/// 对应 org.apache.rocketmq.remoting.protocol.subscription.GroupForbidden：
+/// UPDATE_AND_GET_GROUP_FORBIDDEN(353) 的响应体（topic/group/readable 三字段）。
+/// </summary>
+public sealed class GroupForbidden
+{
+    public string Topic { get; set; } = string.Empty;
+    public string Group { get; set; } = string.Empty;
+    public bool Readable { get; set; }
+
+    /// <summary>解析失败返回 false（不抛异常）。</summary>
+    public static bool Decode(byte[] data, out GroupForbidden outValue)
+    {
+        outValue = new GroupForbidden();
+        if (!RemotingSerializable.Decode(data, out JsonValue v) || !v.IsObject) return false;
+        if (v.TryGetString("topic", out string topic)) outValue.Topic = topic;
+        if (v.TryGetString("group", out string group)) outValue.Group = group;
+        if (v.TryGetBool("readable", out bool readable)) outValue.Readable = readable;
+        return true;
+    }
+}
+
+/// <summary>
 /// 对应 C++ DefaultMQAdminExt（org.apache.rocketmq.client.admin.DefaultMQAdminExt）。
 /// 管理端对外操作的统一入口：内部持有 <see cref="MQClientInstance"/> 复用其底层调用。
 /// </summary>
@@ -1640,5 +1662,355 @@ public sealed class DefaultMQAdminExt
         var body = new QueryConsumeQueueResponseBody();
         if (response.Body.Length > 0) QueryConsumeQueueResponseBody.Decode(response.Body, out body);
         return body;
+    }
+
+    // ------------------------------------------------- 批量配置 / 单元化（Java 有实现，此前 dotnet 缺失）
+
+    /// <summary>
+    /// 对应 Java createAndUpdateTopicConfigList → UPDATE_AND_CREATE_TOPIC_LIST(18)。
+    /// wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
+    /// body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList":[...]}。
+    /// </summary>
+    public void CreateAndUpdateTopicConfigList(string brokerAddr, List<TopicConfig> configs)
+    {
+        if (configs is not { Count: > 0 })
+        {
+            throw new MQClientException("createAndUpdateTopicConfigList: empty topicConfigList");
+        }
+
+        JsonValue rows = JsonValue.MakeArray();
+        foreach (TopicConfig config in configs) rows.PushArray(config.ToJson());
+        JsonValue body = JsonValue.MakeObject();
+        body.Set("topicConfigList", rows);
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.UpdateAndCreateTopicList,
+            new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
+    }
+
+    /// <summary>
+    /// 对应 Java createAndUpdateSubscriptionGroupConfigList → 225。
+    /// 与 topic-list 同形，但 body 的 key 是 <c>groupConfigList</c>；
+    /// 单组版（200）的 body 是裸 SubscriptionGroupConfig 对象，两处字段名不同。
+    /// </summary>
+    public void CreateAndUpdateSubscriptionGroupConfigList(string brokerAddr,
+        List<SubscriptionGroupConfig> configs)
+    {
+        if (configs is not { Count: > 0 })
+        {
+            throw new MQClientException(
+                "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList");
+        }
+
+        JsonValue rows = JsonValue.MakeArray();
+        foreach (SubscriptionGroupConfig config in configs) rows.PushArray(config.ToJson());
+        JsonValue body = JsonValue.MakeObject();
+        body.Set("groupConfigList", rows);
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr),
+            RequestCode.UpdateAndCreateSubscriptiongroupList,
+            new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
+    }
+
+    /// <summary>
+    /// 对应 Java createStaticTopic → UPDATE_AND_CREATE_STATIC_TOPIC(513)。
+    /// header 复用 CreateTopicRequestHeader 字段（topic/defaultTopic/队列数/perm/
+    /// topicFilterType/topicSysFlag/order/force，bool 转 "true"/"false" 小写），
+    /// body 是 TopicQueueMappingDetail 的 JSON 文档（单元化静态 topic 的映射信息）。
+    /// </summary>
+    public void CreateStaticTopic(string brokerAddr, string defaultTopic, TopicConfig config,
+        JsonValue mappingDetail, bool force = false)
+    {
+        PropertyMap ext = new()
+        {
+            ["topic"] = config.TopicName,
+            ["defaultTopic"] = defaultTopic,
+            ["readQueueNums"] = I64Str(config.ReadQueueNums),
+            ["writeQueueNums"] = I64Str(config.WriteQueueNums),
+            ["perm"] = I64Str(config.Perm),
+            ["topicFilterType"] = config.TopicFilterType.Length == 0
+                ? TopicFilterType.SingleTag
+                : config.TopicFilterType,
+            ["topicSysFlag"] = I64Str(config.TopicSysFlag),
+            ["order"] = config.Order ? "true" : "false",
+            ["force"] = force ? "true" : "false",
+        };
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.UpdateAndCreateStaticTopic,
+            ext, RemotingSerializable.Encode(mappingDetail), true, _timeoutMillis);
+    }
+
+    /// <summary>
+    /// 对应 Java updateAndGetGroupReadForbidden → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
+    /// readable=null 表示仅查询（Java 不设该字段）；返回 broker 解码出的 GroupForbidden。
+    /// </summary>
+    public GroupForbidden UpdateAndGetGroupReadForbidden(string brokerAddr, string group,
+        string topic, bool? readable = null)
+    {
+        if (group.Length == 0 || topic.Length == 0)
+        {
+            throw new MQClientException("updateAndGetGroupReadForbidden: group/topic required");
+        }
+
+        PropertyMap ext = new() { ["group"] = group, ["topic"] = topic };
+        if (readable is not null) ext["readable"] = readable.Value ? "true" : "false";
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(brokerAddr),
+            RequestCode.UpdateAndGetGroupForbidden, ext, null, false, _timeoutMillis);
+        if (response.Body.Length == 0)
+        {
+            throw new MQClientException("updateAndGetGroupReadForbidden: empty response body");
+        }
+
+        if (!GroupForbidden.Decode(response.Body, out GroupForbidden outValue))
+        {
+            throw new MQClientException("updateAndGetGroupReadForbidden: bad GroupForbidden body");
+        }
+
+        return outValue;
+    }
+
+    /// <summary>
+    /// 对应 Java resumeCheckHalfMessage → RESUME_CHECK_HALF_MESSAGE(323)。
+    /// Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 false 而不抛错**——网络层异常才上抛；
+    /// broker 拒绝（如 msgId 不是半消息，表现为 SYSTEM_ERROR）通过返回值表达。
+    /// InvokeSync 会把非 SUCCESS 转成异常，所以这里用 InvokeSyncRaw 拿原始响应自己判断。
+    /// </summary>
+    public bool ResumeCheckHalfMessage(string brokerAddr, string topic, string msgId = "")
+    {
+        if (topic.Length == 0)
+        {
+            throw new MQClientException("resumeCheckHalfMessage: topic required");
+        }
+
+        PropertyMap ext = new() { ["topic"] = topic };
+        if (msgId.Length > 0) ext["msgId"] = msgId;
+        RemotingCommand response = RequireClient().InvokeSyncRaw(AddrForRpc(brokerAddr),
+            RequestCode.ResumeCheckHalfMessage, ext, null, false, _timeoutMillis);
+        return response.Code == ResponseCode.Success;
+    }
+
+    /// <summary>
+    /// 对应 Java createOrUpdateOrderConf：**不是独立请求**，是 NameServer KV
+    /// namespace=ORDER_TOPIC_CONFIG 上的读改写。
+    /// 集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的 "topic:conf" 列表，
+    /// 替换 key 匹配的条目后整体写回（一次只动单个 topic，不动整个集群）。
+    /// </summary>
+    public void CreateOrUpdateOrderConf(string key, string value, bool isCluster = false)
+    {
+        if (key.Length == 0 || value.Length == 0)
+        {
+            throw new MQClientException("createOrUpdateOrderConf: key/value required");
+        }
+
+        if (isCluster)
+        {
+            PutKvConfig(MixAll.NamespaceOrderTopicConfig, key, value);
+            return;
+        }
+
+        string oldValue = string.Empty;
+        try
+        {
+            GetKvConfig(MixAll.NamespaceOrderTopicConfig, key, out oldValue);
+        }
+        catch (Exception)
+        {
+            // Java 打印后按空表继续：key 缺失是首写的常态，不是失败。
+            oldValue = string.Empty;
+        }
+
+        // 条目 key -> 完整 "key:value" 文本（Java HashMap 语义：重复 key 后写胜出）
+        var entries = new Dictionary<string, string>();
+        foreach (string raw in oldValue.Split(';'))
+        {
+            string entry = raw.Trim();
+            if (entry.Length == 0) continue;
+            int colon = entry.IndexOf(':');
+            string entryKey = colon >= 0 ? entry[..colon] : entry;
+            entries[entryKey] = entry;
+        }
+
+        int sep = value.IndexOf(':');
+        string newKey = sep >= 0 ? value[..sep] : value;
+        if (newKey.Length == 0)
+        {
+            throw new MQClientException("createOrUpdateOrderConf: value must start with a key");
+        }
+
+        entries[newKey] = value;
+        PutKvConfig(MixAll.NamespaceOrderTopicConfig, key, string.Join(";", entries.Values));
+    }
+
+    // ------------------------------------------------- 运维清理（Java 有实现，此前 dotnet 缺失）
+
+    /// <summary>CLEAN_EXPIRED_CONSUMEQUEUE(306)：broker 丢弃 <c>timeHours</c> 小时前的
+    /// consume-queue 条目。</summary>
+    public void CleanExpiredConsumerQueue(string brokerAddr, int timeHours)
+    {
+        PropertyMap ext = new() { ["time"] = I64Str(timeHours) };
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.CleanExpiredConsumequeue,
+            ext, null, false, _timeoutMillis);
+    }
+
+    /// <summary>Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表（不 fail-fast，
+    /// 一台 broker 挂了不掩盖其他台的结果）。</summary>
+    public List<string> CleanExpiredConsumerQueueByAddr(List<string> addrs, int timeHours)
+    {
+        var failed = new List<string>();
+        foreach (string addr in addrs)
+        {
+            try
+            {
+                CleanExpiredConsumerQueue(addr, timeHours);
+            }
+            catch (Exception)
+            {
+                failed.Add(addr);
+            }
+        }
+
+        return failed;
+    }
+
+    /// <summary>DELETE_EXPIRED_COMMITLOG(329)：broker 删除 <c>timeHours</c> 小时前的
+    /// commit-log 文件。</summary>
+    public void DeleteExpiredCommitLog(string brokerAddr, int timeHours)
+    {
+        PropertyMap ext = new() { ["time"] = I64Str(timeHours) };
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.DeleteExpiredCommitlog,
+            ext, null, false, _timeoutMillis);
+    }
+
+    /// <summary>同 DeleteExpiredCommitLog 的多地址形态。</summary>
+    public List<string> DeleteExpiredCommitLogByAddr(List<string> addrs, int timeHours)
+    {
+        var failed = new List<string>();
+        foreach (string addr in addrs)
+        {
+            try
+            {
+                DeleteExpiredCommitLog(addr, timeHours);
+            }
+            catch (Exception)
+            {
+                failed.Add(addr);
+            }
+        }
+
+        return failed;
+    }
+
+    /// <summary>
+    /// 对应 Java cleanUnusedTopicByAddr → MQClientAPIImpl:2696：**单请求**
+    /// CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。客户端绝不遍历 topic 表
+    /// 逐个删——broker 自建的 BenchmarkTest、重试/死信 topic 会被 broker 以 SYSTEM_ERROR 拒绝。
+    /// </summary>
+    public void CleanUnusedTopicByAddr(string brokerAddr)
+    {
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.CleanUnusedTopic,
+            new PropertyMap(), null, false, _timeoutMillis);
+    }
+
+    /// <summary>
+    /// 对应 Java queryConsumeTimeSpan：按 topic 路由扇出到每个 master，聚合响应 body 里
+    /// consumeTimeSpanSet JSON 数组（返回聚合后的数组）。
+    /// </summary>
+    public JsonValue QueryConsumeTimeSpan(string topic, string group)
+    {
+        TopicRouteData route = ExamineTopicRoute(topic);
+        JsonValue spans = JsonValue.MakeArray();
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length == 0) continue;
+            PropertyMap ext = new() { ["topic"] = topic, ["group"] = group };
+            RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(addr),
+                RequestCode.QueryConsumeTimeSpan, ext, null, false, _timeoutMillis);
+            if (response.Body.Length == 0) continue;
+            if (!RemotingSerializable.Decode(response.Body, out JsonValue v)) continue;
+            JsonValue? arr = v.Find("consumeTimeSpanSet");
+            if (arr is { IsArray: true })
+            {
+                for (int i = 0; i < arr.Size(); ++i) spans.PushArray(arr.At(i));
+            }
+        }
+
+        return spans;
+    }
+
+    /// <summary>
+    /// Java 有 GetClusterList / GetTopicClusterList 两个名字、同一实现（Go 同口径做别名）。
+    /// </summary>
+    public HashSet<string> GetTopicClusterList(string topic) => GetClusterList(topic);
+
+    /// <summary>对应 Java setMessageRequestMode → SET_MESSAGE_REQUEST_MODE(401)：
+    /// 在 POP 与 Pull 模式间切换消费组（单元化场景）。popShareQueueNum 仅在 &gt;0 时带。</summary>
+    public void SetMessageRequestMode(string brokerAddr, string topic, string consumerGroup,
+        string mode, int popShareQueueNum = 0)
+    {
+        PropertyMap ext = new()
+        {
+            ["topic"] = topic,
+            ["consumerGroup"] = consumerGroup,
+            ["mode"] = mode,
+        };
+        if (popShareQueueNum > 0) ext["popShareQueueNum"] = I64Str(popShareQueueNum);
+        RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.SetMessageRequestMode,
+            ext, null, false, _timeoutMillis);
+    }
+
+    // ------------------------------------------------- NameServer 配置（318/319，Java 有实现，此前 dotnet 缺失）
+
+    /// <summary>
+    /// 对应 Java updateNameServerConfig → UPDATE_NAMESRV_CONFIG(318)：
+    /// properties 以 **k=v\n 文本**进 body，广播到每个 NameServer，
+    /// 任一失败即抛（Java 记 errResponse 最后统一抛）。
+    /// </summary>
+    public void UpdateNameServerConfig(PropertyMap properties, int timeoutMillis = -1)
+    {
+        string text = MixAll.Properties2String(properties ?? new PropertyMap());
+        if (text.Length == 0) return;
+        MQClientInstance client = RequireClient();
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        bool anyFailed = false;
+        int lastCode = 0;
+        string lastRemark = string.Empty;
+        foreach (string nsAddr in client.NameServerAddrs)
+        {
+            RemotingCommand response = client.InvokeSyncRaw(
+                nsAddr, RequestCode.UpdateNamesrvConfig, new PropertyMap(),
+                Encoding.UTF8.GetBytes(text), true, to);
+            if (response.Code != ResponseCode.Success)
+            {
+                anyFailed = true;
+                lastCode = response.Code;
+                lastRemark = response.Remark;
+            }
+        }
+
+        if (anyFailed)
+        {
+            throw new MQClientException(
+                lastRemark.Length == 0 ? "update name server config failed" : lastRemark, lastCode);
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java getNameServerConfig → GET_NAMESRV_CONFIG(319)：逐个 NameServer 查询
+    /// （默认全部），body 是 properties 文本；返回 {地址: properties 字典}。
+    /// </summary>
+    public Dictionary<string, PropertyMap> GetNameServerConfig(List<string>? namesrvAddrs = null,
+        int timeoutMillis = -1)
+    {
+        MQClientInstance client = RequireClient();
+        List<string> targets = namesrvAddrs is { Count: > 0 }
+            ? namesrvAddrs
+            : new List<string>(client.NameServerAddrs);
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        var result = new Dictionary<string, PropertyMap>();
+        foreach (string nsAddr in targets)
+        {
+            RemotingCommand response = client.InvokeSync(
+                nsAddr, RequestCode.GetNamesrvConfig, new PropertyMap(), null, false, to);
+            result[nsAddr] = MixAll.String2Properties(Encoding.UTF8.GetString(response.Body));
+        }
+
+        return result;
     }
 }
