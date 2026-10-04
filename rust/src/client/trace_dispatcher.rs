@@ -123,6 +123,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::client::mq_client::{MQClientInstance, TraceDispatcher};
+use crate::client::producer::DefaultMQProducer;
 use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::trace::{
     AccessChannel, TraceConstants, TraceContext, TraceDataEncoder, TraceTransferBean,
@@ -601,9 +602,9 @@ impl AsyncTraceDispatcher {
         config: TraceDispatcherConfig,
     ) -> AsyncTraceDispatcher {
         if config.producer.is_none() {
-            rmq_warn!(
-                "trace dispatcher for group {group} has no internal trace producer: \
-                 trace data will be dropped (see module doc deviation 1)"
+            rmq_info!(
+                "trace dispatcher for group {group} builds its own internal trace producer \
+                 (Python `_get_and_create_trace_producer`, trace_dispatcher.py:95-105)"
             );
         }
         // Python `:95` + `:98-105`：组名自增一次（除非调用方已注入自己算好的名字），
@@ -611,10 +612,30 @@ impl AsyncTraceDispatcher {
         let trace_producer_group = config.trace_producer_group.clone().unwrap_or_else(|| {
             AsyncTraceDispatcher::next_trace_producer_group(group, dispatcher_type)
         });
-        let producer = config
-            .producer
-            .clone()
-            .unwrap_or_else(|| Arc::new(DisabledTraceProducer));
+        // Python 从不注入：`__init__` 末尾总是自建一个真的 DefaultMQProducer
+        // （组名 = _INNER_TRACE_PRODUCER-<group>-<type>-<seq>，send_msg_timeout=5000、
+        // max_message_size=同分发器、enable_trace=False 防递归）。Rust 此前未注入时
+        // 兜底 DisabledTraceProducer，轨迹链路默认静默断开，与其他端行为不一致；
+        // 现在与 Python 对齐——未注入就自建真实现，`TraceProducer` 接缝保留给
+        // 测试桩和显式定制。
+        let producer: Arc<dyn TraceProducer> = match config.producer.clone() {
+            Some(injected) => injected,
+            None => {
+                match DefaultMQProducer::new(&trace_producer_group) {
+                    Ok(inner) => {
+                        inner.set_enable_trace(false);
+                        Arc::new(inner)
+                    }
+                    Err(e) => {
+                        rmq_warn!(
+                            "trace dispatcher for group {group} failed to build its internal \
+                             trace producer ({e}); trace data will be dropped"
+                        );
+                        Arc::new(DisabledTraceProducer)
+                    }
+                }
+            }
+        };
         producer.set_send_msg_timeout(config.send_msg_timeout_millis);
         producer.set_max_message_size(config.max_msg_size);
         producer.set_enable_trace(false);
@@ -2466,11 +2487,13 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_producer_path_only_logs() {
-        // 模块差异 1：未注入生产者时整条链路只记日志，不影响业务
+        // 显式注入 [`DisabledTraceProducer`]：整条链路只记日志，不影响业务
+        // （注入接缝保留给测试桩与宿主定制）。
         let d = AsyncTraceDispatcher::with_config(
             "GID_test",
             TraceDispatcherType::Consume,
             TraceDispatcherConfig {
+                producer: Some(Arc::new(DisabledTraceProducer)),
                 batch_num: 1,
                 ..Default::default()
             },
@@ -2479,6 +2502,30 @@ mod tests {
         d.append(simple_pub());
         d.flush_and_wait().await;
         assert_eq!(d.queue_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_producer_builds_a_real_one() {
+        // 与 Python 对齐后：未注入时自建**真实** DefaultMQProducer
+        // （`_get_and_create_trace_producer`），不再默认静默丢弃。测试环境没有
+        // namesrv，内部生产者 start 失败 ⇒ dispatcher start 报错（与 Java/Python
+        // 「轨迹起不来但不影响业务发送」一致），但队列照常接收、flush 后清空。
+        let d = AsyncTraceDispatcher::with_config(
+            "GID_test",
+            TraceDispatcherType::Produce,
+            TraceDispatcherConfig {
+                batch_num: 1,
+                ..Default::default()
+            },
+        );
+        // 组名走 `_INNER_TRACE_PRODUCER-<group>-<type>-<seq>` 取号。真 producer 的
+        // start 不依赖 namesrv 可达（发送时才连），所以 start **成功**——对比
+        // DisabledTraceProducer 恒 Err，这里 Ok 即证明自建的是真实现。
+        assert!(d.start("127.0.0.1:1", None).await.is_ok());
+        assert!(d.append(simple_pub()));
+        d.flush_and_wait().await;
+        assert_eq!(d.queue_size(), 0);
+        d.shutdown_gracefully().await;
     }
 
     // ---------------- _client_id（探针第 16 节） ----------------
