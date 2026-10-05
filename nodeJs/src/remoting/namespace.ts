@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Namespace utilities (org.apache.rocketmq.remoting.protocol.NamespaceUtil).
-// Mirrors python/rocketmq/remoting/protocol/namespace_util.py.
+// Mirrors python/remoting/protocol/namespace_util.py.
 import { MixAll } from '../common/mixAll.ts';
 
 export const NAMESPACE_SEPARATOR = '%';

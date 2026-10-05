@@ -8,12 +8,12 @@
 //! 订阅路径不推心跳的话，表里要等下一个 30s 心跳周期才出现本组。
 //!
 //! 场景（与 `python/verify_subscribe_live.py` / `cpp/examples/live_subscribe.cpp` /
-//! `dotnet/examples/RocketMQ.Examples/LiveSubscribe.cs` 一一对应）：
+//! `csharp/examples/RocketMQ.Examples/LiveSubscribe.cs` 一一对应）：
 //! - S0 正对照：`start()` 之后基础 topic B 已登记本组（心跳链路与 300 查询本身是通的）。
 //! - S1 负对照：本轮**还没**订阅的 L，300 查不到本组。
 //! - S2 后置订阅立即生效：`subscribe(L)` 之后直接查 300(L) → 本组已在表里，
 //!   且耗时远小于心跳周期（默认 30s）⇒ 只可能来自订阅路径那一轮心跳
-//!   （Python/C++/.NET 是同步推，毫秒级；Rust 是 fire-and-forget，窗口给 5s）。
+//!   （Python/C++/C# 是同步推，毫秒级；Rust 是 fire-and-forget，窗口给 5s）。
 //! - S3 后置订阅真会被消费：L 进分配集 → 发一条消息 → listener 收到。
 //! - S4 活订阅表：`unsubscribe(L)` 后本组订阅集立刻少掉 L。
 //!   （Java:1317-1319 只删表项、**不**推心跳，且 broker 的 topicGroupTable 只在整组

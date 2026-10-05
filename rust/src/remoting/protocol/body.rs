@@ -1,6 +1,6 @@
 //! 公共响应体（对应 `org.apache.rocketmq.remoting.protocol.body.*` 常用部分）。
 //!
-//! 移植 `python/rocketmq/remoting/protocol/body.py`（609 行）里的全部类：
+//! 移植 `python/remoting/protocol/body.py`（609 行）里的全部类：
 //! `KVTable` / `TopicList` / `LockBatchRequestBody` / `LockBatchResponseBody` /
 //! `UnlockBatchRequestBody` / `GetConsumerListByGroupResponseBody` / `ClusterInfo` /
 //! `ConsumerRunningInfo` / `Connection` / `ConsumerConnection` / `ProducerConnection` /

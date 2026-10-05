@@ -7,7 +7,7 @@ import (
 
 // Name validation on the send / subscribe entry points (Java
 // org.apache.rocketmq.client.Validators). Texts and decision order follow
-// python/rocketmq/client/validators.py, which Rust and C# mirror.
+// python/client/validators.py, which Rust and C# mirror.
 //
 // WHY validate locally at all: an illegal topic (or group) is rejected by the
 // broker too, but only after the request is on the wire — and the reply is

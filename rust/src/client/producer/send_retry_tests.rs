@@ -1151,7 +1151,7 @@ async fn stream_request_type_is_off_by_default_for_producers() {
 //
 // 对端是 Java `DefaultMQProducerImpl:635-682`（两道闸、共享一份预算）与 `:577-633`
 // （`BackpressureSendCallBack` 的归还），与 `python/tests/test_producer_async.py`、
-// `cpp/tests/test_producer_async.cpp` 及 .NET 的同题用例一一对应。
+// `cpp/tests/test_producer_async.cpp` 及 C# 的同题用例一一对应。
 //
 // 字节闸的地板值是 1M（Java `:148-153`），所以只能拿「1M 少掉多少」来断言在途字节，
 // 不能把上限配成几百字节 —— 那会被夹回 1M。

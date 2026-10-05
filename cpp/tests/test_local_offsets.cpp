@@ -7,7 +7,7 @@
 // 与本端消费者共用同一份 ~/.rocketmq_offsets/<clientId>/<group>/offsets.json 时互认。
 //
 // 与 python/tests/test_local_offsets.py、rust/src/client/consumer.rs（mod tests）、
-// dotnet/tests/RocketMQ.Client.Tests/LocalOffsetsTests.cs 的同名测试同题。
+// csharp/tests/RocketMQ.Client.Tests/LocalOffsetsTests.cs 的同名测试同题。
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>

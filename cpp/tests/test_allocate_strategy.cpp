@@ -398,7 +398,7 @@ void runConsistentHashTable(const AllocateMessageQueueStrategy& strategy,
 }
 
 // 落点表（virtualNodeCnt = 3）。期望值来自**真实 Java 5.5.1 客户端**，与 Rust / Python /
-// .NET 的表逐值相同：四语言 + Java 必须算出同一个环，否则混跑时全体队列换主
+// C# 的表逐值相同：四语言 + Java 必须算出同一个环，否则混跑时全体队列换主
 // （重复 / 漏消费），而不是"分得稍有不均"。
 const std::vector<Case>& consistentHashCases() {
     static const std::vector<Case> kCases = {

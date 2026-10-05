@@ -1,6 +1,6 @@
 // selfcheck is the offline protocol self-test for the Go port — the counterpart
-// of python/rocketmq/selfcheck.py (7 checks), cpp/examples/selfcheck.cpp (3) and
-// dotnet/examples/RocketMQ.Examples/SelfCheck.cs (3).
+// of python/selfcheck.py (7 checks), cpp/examples/selfcheck.cpp (3) and
+// csharp/examples/RocketMQ.Examples/SelfCheck.cs (3).
 //
 //	go run ./examples/selfcheck
 //

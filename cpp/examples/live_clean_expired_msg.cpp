@@ -2,7 +2,7 @@
 // ＋ `ProcessQueue.cleanExpiredMsg:75-127`）。
 //
 // 与 `python/verify_clean_expired_msg_live.py`、`rust/examples/live_clean_expired_msg.rs`、
-// .NET 的对应场景同题、逐条对应（A0–A5）。
+// C# 的对应场景同题、逐条对应（A0–A5）。
 //
 // 离线单测（tests/test_clean_expired_msg.cpp）锁的是**判据**（选条/阈值/上限/摘除闸门）；
 // 这里锁真机上两件离线锁不住的事：

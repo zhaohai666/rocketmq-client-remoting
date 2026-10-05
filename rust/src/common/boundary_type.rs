@@ -1,5 +1,5 @@
 //! 时间戳查位点的边界语义（对应 Java `org.apache.rocketmq.common.BoundaryType`，
-//! 参考实现 `python/rocketmq/common/boundary_type.py`）。
+//! 参考实现 `python/common/boundary_type.py`）。
 //!
 //! Java 锚点：
 //!

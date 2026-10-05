@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // POP-mode "extraInfo" (a.k.a. CK string) codec.
-// Faithful port of python/rocketmq/remoting/protocol/extra_info.py, which in turn
+// Faithful port of python/remoting/protocol/extra_info.py, which in turn
 // mirrors org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil.
 //
 // The CK string is the core credential of POP mode: the broker does NOT write the

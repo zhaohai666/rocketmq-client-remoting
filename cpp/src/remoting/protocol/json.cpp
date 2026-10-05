@@ -1,6 +1,6 @@
 // 极简 JSON 解析 / 生成实现（零第三方依赖）。
 //
-// 与 python/rocketmq/remoting/protocol 的 JSON 行为对齐：
+// 与 python/remoting/protocol 的 JSON 行为对齐：
 //   - Object 保序：底层用 vector<pair>，set() 覆盖同名键时**保留原位置**（与 Python dict 一致）；
 //   - 数字区分 int64 / double：整数字段原样输出，避免 long 型 timestamp 被写成浮点；
 //   - 字符串按 UTF-8 原样输出（不解码为 \uXXXX），解析时兼容 \uXXXX 与代理对；

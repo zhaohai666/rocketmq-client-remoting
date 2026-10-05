@@ -1,5 +1,5 @@
 //! 消息类型（对应 Java `org.apache.rocketmq.common.message.MessageType`，
-//! 参考实现 `python/rocketmq/common/message_type.py`）。
+//! 参考实现 `python/common/message_type.py`）。
 //!
 //! Java 侧 `TraceBean.msgType` 编码轨迹时用的是 **`ordinal()`**（见
 //! `TraceDataEncoder` 的 Pub / EndTransaction 分支），所以判别值必须与 Java 的枚举

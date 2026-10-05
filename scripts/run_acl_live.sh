@@ -1,7 +1,7 @@
 #!/bin/bash
 # ACL 鉴权真机验证（起 namesrv + broker(authenticationEnabled=true) → 跑四端 → 收工）。
 #
-# 用法: bash scripts/run_acl_live.sh [python|rust|dotnet|cpp|all ...]   （默认 all）
+# 用法: bash scripts/run_acl_live.sh [python|rust|csharp|cpp|all ...]   （默认 all）
 #
 # 为什么要有这个脚本：ACL 的假通过太多了 —— broker 没开鉴权时**正向场景照样全绿**，
 # 只有反向场景（无凭据 / 错 secretKey）才戳得穿；而四端的「签名算错」与「没签名」在
@@ -46,7 +46,7 @@ CPP_ACL=${RMQ_CPP_ACL:-$ROOT/cpp/build/examples/rmq_live_acl.exe}
 
 ENDS=("$@")
 [ ${#ENDS[@]} -eq 0 ] && ENDS=(all)
-if [ "${ENDS[0]}" = "all" ]; then ENDS=(python rust dotnet cpp); fi
+if [ "${ENDS[0]}" = "all" ]; then ENDS=(python rust csharp cpp); fi
 
 mkdir -p "$LOGDIR"
 
@@ -131,11 +131,11 @@ run_rust() {
     cargo run --quiet --example live_acl -- "$NS" "$AK" "$SK" 2>&1 | tee "$LOGDIR/rust.log"
     return "${PIPESTATUS[0]}"
 }
-run_dotnet() {
-    cd "$ROOT/dotnet" || return 1
+run_csharp() {
+    cd "$ROOT/csharp" || return 1
     RMQ_NATIVE_COMPRESSION_DIR='C:\Users\zhaoh\rmqdeps\native-compression' \
         "$DOTNET" run --no-build --project examples/RocketMQ.Examples \
-        -- acl "$NS" "$AK" "$SK" 2>&1 | tee "$LOGDIR/dotnet.log"
+        -- acl "$NS" "$AK" "$SK" 2>&1 | tee "$LOGDIR/csharp.log"
     return "${PIPESTATUS[0]}"
 }
 run_cpp() {

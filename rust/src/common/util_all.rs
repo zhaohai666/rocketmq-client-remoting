@@ -11,7 +11,7 @@ const HEX_ARRAY: &[u8; 16] = b"0123456789ABCDEF";
 /// [`monotonic_millis`] 的原点，首次调用时锚定（对应 `time.monotonic()` 的进程起点）。
 static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
-/// 对应 Python `time.monotonic() * 1000` / dotnet `UtilAll.MonotonicMillis`：
+/// 对应 Python `time.monotonic() * 1000` / C# `UtilAll.MonotonicMillis`：
 /// **单调递增**的毫秒数，不受系统时间被回拨/NTP 校正影响。
 ///
 /// 为什么不能像 [`current_time_millis`] 那样用挂钟：发送重试预算和 broker 延迟

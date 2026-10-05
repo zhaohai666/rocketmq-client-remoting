@@ -1,6 +1,6 @@
 //! 消息体压缩（对应 Java `org.apache.rocketmq.common.compression.{Zlib,Lz4,Zstd}Compressor`
 //! 与 `CompressorFactory`，参考实现
-//! `python/rocketmq/common/message_decoder.py` 的 `_compress/_decompress`）。
+//! `python/common/message_decoder.py` 的 `_compress/_decompress`）。
 //!
 //! - ZLIB：Python `zlib.compress(data, level)` = RFC1950 zlib 流；Java 是
 //!   `new Deflater(level)` + `DeflaterOutputStream`，同一封装。

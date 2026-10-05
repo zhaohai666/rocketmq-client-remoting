@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // DefaultMQProducer — the default message producer (org.apache.rocketmq.client.producer.*).
-// Faithful port of python/rocketmq/client/producer.py built on top of MQClient.
+// Faithful port of python/client/producer.py built on top of MQClient.
 //
 // Send ordering (mirrors Java, enforced by the cross-port rules):
 //   send() -> _send_default_impl (retry loop) -> _send_with_hooks (SendMessageHook before/after)

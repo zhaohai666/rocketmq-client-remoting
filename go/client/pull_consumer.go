@@ -30,7 +30,7 @@
 //     `reconsumeTimes(0) >= -1` is true, so -1 would send EVERY bounced message
 //     straight to %DLQ%.
 //
-// Deliberate simplification, matching python/rocketmq/client/consumer.py: this
+// Deliberate simplification, matching python/client/consumer.py: this
 // port does not install a pull-side rebalance, so `AllocateMessageQueueStrategy`
 // exists as configuration and is validated at Start but is not used to compute
 // an assignment (there is no process-queue table on this path either). The
@@ -1104,7 +1104,7 @@ func (c *DefaultMQPullConsumer) PulledQueues() []common.MessageQueue {
 //  2. Java's catch falls back to re-sending the message to %RETRY%group through
 //     an internal producer. This port reports the failure instead of silently
 //     switching transports — a bounce that failed is something the caller needs
-//     to see. (python/rocketmq/client/consumer.py:3890 documents the same.)
+//     to see. (python/client/consumer.py:3890 documents the same.)
 func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLevel int32, brokerName string) error {
 	instance, err := c.requireClient()
 	if err != nil {

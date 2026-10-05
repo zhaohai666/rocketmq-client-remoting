@@ -1,7 +1,7 @@
 // correctTagsOffset（Java `DefaultMQPushConsumerImpl:713-717`，调用点 `:394-401`）真机验证。
 //
 // 与 `python/verify_correct_tags_offset_live.py`、`rust/examples/live_correct_tags_offset.rs`、
-// .NET 的对应场景同题、逐条对应（S1–S4）。
+// C# 的对应场景同题、逐条对应（S1–S4）。
 //
 // 离线单测（tests/test_correct_tags_offset.cpp）锁的是**判据**；这里锁真机上两件离线锁不住的事：
 //   A. **修正确实走到了 broker**：位点最终由 UPDATE_CONSUMER_OFFSET 落盘，只有真集群能证明

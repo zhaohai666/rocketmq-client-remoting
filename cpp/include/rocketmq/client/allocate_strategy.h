@@ -19,7 +19,7 @@
 //    `mqAll` 为空、`cidAll` 为空时抛 `IllegalArgumentException`。这里非法入参一律返回空列表：
 //    rebalance 是后台周期任务，一条脏入参不该把消费者打挂。
 //    唯一的例外是 `AllocateMachineRoomNearby`：resolver 给出空机房时 Java 抛
-//    `IllegalArgumentException`，Python/Rust/.NET 与本文件一律**照抛**（`MQClientException`），
+//    `IllegalArgumentException`，Python/Rust/C# 与本文件一律**照抛**（`MQClientException`），
 //    因为静默返回空列表等于把整个 topic 的队列撤走，而 rebalance 抓住异常时反而会保住现有分配。
 // 2. **`AllocateMessageQueueByConfig` 未配置态**：Java 直接 `return this.messageQueueList`
 //    （没配过就是 `null`），这里与 Python/Rust 一样规整成空列表，且 `allocate` 返回副本。

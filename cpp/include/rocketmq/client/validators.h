@@ -1,5 +1,5 @@
 // 发送/订阅入口上的名字校验（org.apache.rocketmq.client.Validators 的 C++ 对应，
-// 行为口径以 Python 参考实现 python/rocketmq/client/validators.py 为准）。
+// 行为口径以 Python 参考实现 python/client/validators.py 为准）。
 //
 // **为什么要在客户端就拦下来**：topic/group 名字非法时 broker 也会拒，但要等到请求
 // 真的打出去才拿到 TOPIC_NOT_EXIST / ILLEGAL_TOPIC，而 TOPIC_NOT_EXIST 在发送重试的

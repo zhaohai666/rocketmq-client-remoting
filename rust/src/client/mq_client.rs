@@ -1,7 +1,7 @@
 //! `MQClientInstance`：RocketMQ 客户端核心编排（对应
 //! `org.apache.rocketmq.client.impl.factory.MQClientInstance` 与
 //! `MQClientAPIImpl` 的核心调用面，逐条移植
-//! `python/rocketmq/client/mq_client.py`）。
+//! `python/client/mq_client.py`）。
 //!
 //! 职责：NameServer 地址管理、Topic 路由获取与缓存、Broker 地址解析、
 //! 消息发送（SEND_MESSAGE / SEND_MESSAGE_V2）、拉取（PULL_MESSAGE）、POP 弹取
@@ -1868,7 +1868,7 @@ impl MQClientInstance {
         // （= broker 的 offsetMsgId）。
         // ⚠ 有意偏离 Java processSendResponse:786-793：Java 在 broker **没**回 batchUniqId
         // （普通 topic 上的客户端批量）时把 msgId 换成「逐条子消息 UNIQ_KEY 的逗号串」。这里
-        // 只拿得到「发出去的那一条消息」，拿不到子消息列表（C++/.NET 同样如此），而且四语言
+        // 只拿得到「发出去的那一条消息」，拿不到子消息列表（C++/C# 同样如此），而且四语言
         // 要能互相对拍，所以统一用批量自身的 ID。要紧的那一半已对齐：每条子消息在编码前就
         // 写好了自己的 UNIQ_KEY（`DefaultMQProducer::send_batch`），broker 拆开后消费端与
         // 轨迹看到的逐条 ID 与 Java 一致。

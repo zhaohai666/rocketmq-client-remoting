@@ -1,5 +1,5 @@
 //! 客户端钩子（对应 Java `org.apache.rocketmq.client.hook` 包，
-//! 逐条对齐 `python/rocketmq/client/hook.py`）。
+//! 逐条对齐 `python/client/hook.py`）。
 //!
 //! Java 侧钩子是「业务无关的切面」：生产者在 `sendKernelImpl` 前后各调一次
 //! [`SendMessageHook`]，消费者在投递 listener 前后各调一次 [`ConsumeMessageHook`]。

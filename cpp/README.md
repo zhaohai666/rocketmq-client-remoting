@@ -1,7 +1,7 @@
 # rocketmq-client-remoting (C++)
 
 RocketMQ 经典 remoting 协议（对齐 5.x）的 C++17 实现，与本仓库的
-Python 参考实现（`../python/`）及 .NET / Rust 实现（`../dotnet/`、`../rust/`）逐项对齐。
+Python 参考实现（`../python/`）及 C# / Rust 实现（`../csharp/`、`../rust/`）逐项对齐。
 
 **无第三方运行时依赖**（只用 POSIX socket + 标准库 + 系统压缩库：zlib 必需，liblz4 /
 libzstd 可选，找不到就只关那一个后端），网络层手写，目的是把"字节到底长什么样"

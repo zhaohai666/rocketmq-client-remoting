@@ -1,7 +1,7 @@
 //! `Validators` / `TopicValidator` 对**真实 5.5.1 集群**的联调验证。
 //!
 //! 与 `python/verify_validators_live.py`、`cpp/examples/validators_live.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveValidators.cs` 同一套断言（四语言对拍）。
+//! `csharp/examples/RocketMQ.Examples/LiveValidators.cs` 同一套断言（四语言对拍）。
 //!
 //! 为什么要在真集群上跑：单测只能证明「函数会抛」，证明不了它**拦在网络之前**。
 //! 而这条链路的真实代价是可重试码 —— `TOPIC_NOT_EXIST`(17) 在发送重试的可重试集合里，

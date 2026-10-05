@@ -1,6 +1,6 @@
 //! `ProduceAccumulator`（自动攒批）单测 —— 与
 //! `python/tests/test_produce_accumulator.py`（18 例）、
-//! `dotnet/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs`（17 例）同题。
+//! `csharp/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs`（17 例）同题。
 //!
 //! 覆盖 Java `ProduceAccumulatorTest` 的三个场景（sync / async / 指定 MessageQueue），另补：
 //!

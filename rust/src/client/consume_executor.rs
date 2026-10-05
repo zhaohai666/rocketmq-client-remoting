@@ -1,5 +1,5 @@
 //! 消费执行器：Java `ThreadPoolExecutor` 的最小等价物
-//! （逐条对齐 `python/rocketmq/client/consume_executor.py`）。
+//! （逐条对齐 `python/client/consume_executor.py`）。
 //!
 //! 为什么不用「固定 N 个 worker 各领一份队列」：Java 的线程弹性语义全部挂在 **core** 上，
 //! 而只有 max 一个上限的池子（Python 标准库 `concurrent.futures.ThreadPoolExecutor` 就是）

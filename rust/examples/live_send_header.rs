@@ -1,7 +1,7 @@
 //! 发送头三个字段（`defaultTopic` / `defaultTopicQueueNums` / `brokerName`）真机验证。
 //!
 //! 与 `python/verify_send_header_live.py`（H0..H5）、`cpp/examples/live_send_header.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveSendHeader.cs` 同题。
+//! `csharp/examples/RocketMQ.Examples/LiveSendHeader.cs` 同题。
 //!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!

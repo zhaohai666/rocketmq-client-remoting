@@ -1,7 +1,7 @@
 # rocketmq-client-remoting
 
 Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套协议语义、同一套消息模型，
-在 **Python / C++ / .NET / Rust / Go** 五种语言里各有一份完整实现
+在 **Python / C++ / C# / Rust / Go** 五种语言里各有一份完整实现
 （Node.js / TypeScript 第六端已实现并真机验证，见 [`nodeJs/`](nodeJs/README.md)）。
 
 客户端直接与 **NameServer + Broker** 通信，不经过代理层：
@@ -12,7 +12,7 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 - 适配 RocketMQ 4.x / 5.x 集群，全量联调基于 **5.5.1**（NameServer 9876 + Broker 10911）。
 
 五个实现之间的收发互通是**硬要求**：任一语言发出的消息（含 zlib / LZ4 / ZSTD 压缩体）
-其余语言都能解开，`scripts/compression_matrix.sh` 会在真实集群上把 Python/C++/.NET/Rust/Go
+其余语言都能解开，`scripts/compression_matrix.sh` 会在真实集群上把 Python/C++/C#/Rust/Go
 **五端**的压缩矩阵整体跑一遍（Go 只实现 ZLIB —— LZ4/ZSTD 刻意大声报错而不是透传，
 所以非 zlib 的 codec 里含 Go 的腿会被跳过，那两种格式仍由另外四端互测覆盖，
 见 [`go/README.md`](go/README.md)）。
@@ -37,9 +37,9 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 
 | 语言 | 目录 | 运行形态 | 单元测试 |
 | --- | --- | --- | --- |
-| Python | [`python/`](python/README.md) | 同步 API（内部线程） | `pytest -q`：1156 passed + 4 skipped |
+| Python | [`python/`](python/README.md) | 同步 API（内部线程） | `pytest -q`：1160 passed + 4 skipped |
 | C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | `ctest`：50 个用例 / 3986 项断言 |
-| .NET | [`dotnet/`](dotnet/README.md) | C# / .NET 10，零 NuGet 依赖 | `dotnet test`：740 passed |
+| C# | [`csharp/`](csharp/README.md) | C# / .NET 10，零 NuGet 依赖 | `dotnet test`：740 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | `cargo test --lib`：891 条；`cargo clippy --all-targets` 零 warning |
 | Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖，压缩 ZLIB-only | `go test ./...`：529 条；`go vet` / `gofmt` 零告警 |
 | Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 直接运行（`node --experimental-strip-types`），零第三方依赖，压缩 ZLIB-only | `node selfcheck.ts`：53 模块加载 + 4 套冒烟全绿；真机 5/5 live 全绿（`scripts/run_node_live.sh producer\|consumer\|pull\|lite_pull\|admin`） |
@@ -56,10 +56,10 @@ Apache RocketMQ **经典 remoting 协议**的多语言客户端 SDK：同一套�
 ### Python
 
 ```python
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.common.message import Message
+from client.producer import DefaultMQProducer
+from client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
+from client.consumer_result import ConsumeConcurrentlyStatus
+from common.message import Message
 
 producer = DefaultMQProducer("PID_DEMO")
 producer.set_namesrv_addr("127.0.0.1:9876")
@@ -120,7 +120,7 @@ int main() {
 }
 ```
 
-### .NET
+### C#
 
 ```csharp
 using System.Text;
@@ -224,16 +224,16 @@ func main() {
 ## 真实集群联调
 
 每个语言目录下都带一组**不进单元测试**的真机联调工具（`python/verify_*_live.py`、
-`cpp/examples/rmq_*_live`、`dotnet` 的 `rmq` 子命令、`rust/examples/live_*`、
+`cpp/examples/rmq_*_live`、`csharp` 的 `rmq` 子命令、`rust/examples/live_*`、
 `go/examples/live_*`），覆盖收发全链路、重投与死信、位点管理、流控、POP、TLS 等。
 全部工具自断言、失败以非 0 退出码收口，具体清单见各语言 README。
 
-另有一个**不依赖集群**的协议层离线自检，Python / C++ / .NET / Go 四端各有一份
-（`python -m rocketmq selfcheck`、`cpp` 的 `rmq_selfcheck`、`dotnet` 的 `selfcheck` 子命令、
+另有一个**不依赖集群**的协议层离线自检，Python / C++ / C# / Go 四端各有一份
+（`python -m selfcheck`、`cpp` 的 `rmq_selfcheck`、`csharp` 的 `selfcheck` 子命令、
 `go run ./examples/selfcheck`）：跑编解码回环与关键常量 / 字段名，是动真机之前最便宜的一道门。
 Rust 侧没有这个工具（`rust/examples/` 全是需要集群的 `live_*`），其协议层离线覆盖由 `cargo test` 承担。
 
-**覆盖面不是五端齐平的**：Python / C++ / .NET / Rust 四端各有 30 余个真机工具，
+**覆盖面不是五端齐平的**：Python / C++ / C# / Rust 四端各有 30 余个真机工具，
 Go 目前只有 9 个（发送 / 消费 / 拉取 / 轻量拉取 / POP / 重投与死信 / 停机竞态 / **管理端** /
 压缩矩阵），其余场景 Go 侧待补 ——
 `go/README.md` 的「真实集群联调」一节逐项列出未覆盖清单。
@@ -247,7 +247,7 @@ ACL 鉴权等；停 broker 类用例会自行拉起并把配置还原。
 ```
 ├── python/    Python 实现（同步 API，pytest 单测 + verify_*_live.py 真机脚本）
 ├── cpp/       C++17 实现（CMake，ctest 单测 + examples 真机工具）
-├── dotnet/    .NET 10 实现（xunit 单测 + rmq 子命令真机工具）
+├── csharp/    C# / .NET 10 实现（xunit 单测 + rmq 子命令真机工具）
 ├── rust/      Rust/tokio 实现（内联单测 + live_* 示例真机工具）
 ├── go/        Go 实现（同步 API 零依赖，go test 单测 + examples 真机工具）
 └── scripts/   集群启停与跨语言互测脚本（compression_matrix.sh 等）

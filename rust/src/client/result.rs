@@ -1,7 +1,7 @@
 //! 发送 / 拉取 / 消费结果类型（对应 Java
 //! `org.apache.rocketmq.client.producer.{SendResult,SendStatus}`、
 //! `org.apache.rocketmq.client.consumer.*`、`...consumer.listener.*`，
-//! 参考实现 `python/rocketmq/client/send_result.py` 与 `consumer_result.py`）。
+//! 参考实现 `python/client/send_result.py` 与 `consumer_result.py`）。
 //!
 //! 两个容易踩的点：
 //! - `from_code` 对**未知 code 一律回落默认值**（`SendStatus::SEND_OK` /

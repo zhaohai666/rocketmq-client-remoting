@@ -1,4 +1,4 @@
-//! 客户端基础指标（对应 `python/rocketmq/client/metrics.py` 的 `ClientMetrics`，
+//! 客户端基础指标（对应 `python/client/metrics.py` 的 `ClientMetrics`，
 //! 口径同 Java `MQClientAPIImpl` / `DefaultMQPushConsumer` 内部的 sendRT / sendCount /
 //! sendFailureCount 与 consumeRT / consumeCount / consumeFailureCount 统计）。
 //!

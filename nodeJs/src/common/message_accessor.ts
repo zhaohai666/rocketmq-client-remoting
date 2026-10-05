@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // MessageAccessor (org.apache.rocketmq.common.message.MessageAccessor).
-// Faithful port of python/rocketmq/common/message_accessor.py, extended with the timer /
+// Faithful port of python/common/message_accessor.py, extended with the timer /
 // delivery / message-type helpers present in Java's MessageAccessor. Property keys reuse
 // MessageConst where available; timer/delivery keys not present in the foundation MessageConst
 // are declared locally with the exact Java MessageConst names.

@@ -1,7 +1,7 @@
 // 发送头三个字段（defaultTopic / defaultTopicQueueNums / brokerName）真机验证。
 // 用法：rmq_live_send_header 127.0.0.1:9876
 //
-// 与 Python 的 verify_send_header_live.py、Rust 的 live_send_header.rs、.NET 的
+// 与 Python 的 verify_send_header_live.py、Rust 的 live_send_header.rs、C# 的
 // LiveSendHeader.cs 对齐（H0–H5 一一对应）。
 //
 // 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。

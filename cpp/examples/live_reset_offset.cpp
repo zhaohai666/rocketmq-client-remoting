@@ -1,6 +1,6 @@
 // 220 RESET_CONSUMER_CLIENT_OFFSET（Java MQClientInstance.resetOffset:1403-1450）真机验证。
 //
-// 与 python/verify_reset_offset_live.py、rust/examples/live_reset_offset.rs、.NET 的对应
+// 与 python/verify_reset_offset_live.py、rust/examples/live_reset_offset.rs、C# 的对应
 // 场景同题、逐条对应。
 //
 // 220 是 broker 推给**消费端**的重置指令；管理端那笔 INVOKE_BROKER_TO_RESET_OFFSET(222)

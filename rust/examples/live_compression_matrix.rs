@@ -2,7 +2,7 @@
 //! [`DefaultLitePullConsumer`] 收回来并本地重建同一份载荷比 CRC32。
 //!
 //! 载荷配方与 `python/verify_compression_live.py`、`cpp/examples/compression_live.cpp`、
-//! `.NET CompressionLive` **逐字节相同**（同一行文本重复后截断），所以四端不需要交换
+//! `C# CompressionLive` **逐字节相同**（同一行文本重复后截断），所以四端不需要交换
 //! 文件就能互相判定：只看接收端打印的 `match=`，**不要**比两边打印的 CRC 数字
 //! （Java 口径的 `UtilAll.crc32` 会 `& 0x7FFFFFFF`，本仓库四端都用标准 CRC-32）。
 //!

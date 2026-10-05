@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Hook interfaces + default no-op implementations + a shared registry.
-// Faithful port of python/rocketmq/client/hook.py.
+// Faithful port of python/client/hook.py.
 //
 // Ordering contract (mirrors the Java client):
 //   * CheckForbiddenHook runs INSIDE sendKernelImpl, right after compression/sysflag, and a

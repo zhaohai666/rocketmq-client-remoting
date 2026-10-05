@@ -1,5 +1,5 @@
 //! 消息属性键常量（对应 Java `org.apache.rocketmq.common.message.MessageConst`，
-//! 参考实现 `python/rocketmq/common/message_const.py`）。
+//! 参考实现 `python/common/message_const.py`）。
 //!
 //! 这些字符串就是 broker 与客户端之间的**协议字面量**（写进 17 段消息的第 17 项
 //! 属性区，也被 broker 侧过滤/轨迹/事务逻辑按名字读取），所以取值一个字符都不能改；

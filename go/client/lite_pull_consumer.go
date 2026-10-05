@@ -66,7 +66,7 @@ import (
 )
 
 // Lite-pull timings and limits (Java DefaultLitePullConsumerImpl + the shared
-// port values the Rust/Python/C++/.NET consumers use).
+// port values the Rust/Python/C++/C# consumers use).
 const (
 	// DefaultLitePullBatchSize is pullBatchSize — messages per pull request.
 	DefaultLitePullBatchSize = int32(32)

@@ -8,9 +8,9 @@ dist/
 .venv/
 venv/
 
-# .NET
-dotnet/**/bin/
-dotnet/**/obj/
+# C# / .NET
+csharp/**/bin/
+csharp/**/obj/
 *.user
 
 # 测试 / 工具缓存

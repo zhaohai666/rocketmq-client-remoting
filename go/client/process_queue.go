@@ -7,7 +7,7 @@
 // single sorted map and marks dispatched entries with a flag instead: the
 // observables that matter (msgCount, msgSize, maxSpan, "is this message still
 // mine", removeMessage's floor) are identical, and the same model is used by
-// the Python/C++/.NET ports, which is what keeps cross-language behaviour
+// the Python/C++/C# ports, which is what keeps cross-language behaviour
 // comparable.
 //
 // Two flags carry the rebalance contract:
@@ -152,7 +152,7 @@ func (pq *processQueue) MsgAccCnt() int64 {
 //
 // Java measures msgCount/msgSize/maxSpan over the whole msgTreeMap, which also
 // holds messages a listener is currently chewing on. Measuring only the pending
-// buffer is what the Python/C++/.NET ports do, and it is the more useful signal:
+// buffer is what the Python/C++/C# ports do, and it is the more useful signal:
 // a slow listener must not look like a backlog and stall the pull. Kept
 // consistent across the four ports so the numbers are comparable.
 func (pq *processQueue) PendingStats() (int, float64, int64) {

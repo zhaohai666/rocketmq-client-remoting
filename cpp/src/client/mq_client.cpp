@@ -827,7 +827,7 @@ SendResult MQClientInstance::parseSendResponse(const RemotingCommand& response, 
     // ⚠ 有意偏离 Java：Java 在**非** inner-batch（普通 topic 上的客户端批量）时把 msgId 换成
     // 「逐条子消息 UNIQ_KEY 的逗号串」，本端口不跟随 —— Message 不是多态类型（见 message.h
     // 的 isBatch 注释：没有虚函数、RTTI 不可用），这里拿不到子消息列表；而且四种语言要能互相
-    // 比对，Python/Rust/.NET 同样取批量自身的 ID。真正要紧的那一半已经对齐：每条子消息的
+    // 比对，Python/Rust/C# 同样取批量自身的 ID。真正要紧的那一半已经对齐：每条子消息的
     // UNIQ_KEY 在编码前就写好（sendBatchKernel），broker 拆开后消费端与轨迹看到的逐条 ID
     // 和 Java 一致。
     const std::string clientUniqId =

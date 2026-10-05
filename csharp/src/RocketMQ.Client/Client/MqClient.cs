@@ -1,0 +1,2627 @@
+// MQClientInstance：客户端核心编排（对应 org.apache.rocketmq.client.impl.factory.MQClientInstance
+// 与 MQClientAPIImpl 的核心调用面）。
+//
+// 职责：NameServer 地址管理、Topic 路由获取与缓存、Broker 地址解析、
+// 消息发送（SEND_MESSAGE_V2）、拉取（PULL_MESSAGE）、offset 查询/更新、心跳、
+// 按 Key 查询消息、创建 Topic。
+//
+// 与 Python 参考实现（python/client/mq_client.py）逐项对齐。
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+using RocketMQ.Common;
+using RocketMQ.Remoting;
+using RocketMQ.Remoting.Protocol;
+
+namespace RocketMQ.Client;
+
+/// <summary>
+/// clientId 的口径（对应 Java <c>ClientConfig#buildMQClientId</c> 与
+/// <c>ClientConfig#changeInstanceNameToPID</c>）：<c>&lt;本机 IP&gt;@&lt;instanceName&gt;</c>，
+/// instanceName 还是默认值 "DEFAULT" 时在 start() 里就地改成 <c>&lt;pid&gt;#&lt;nanoTime&gt;</c>。
+///
+/// 旧的 <c>instanceName@时间戳@pid@seq</c> 已废弃。唯一性本身是必须的 —— broker 的消费组
+/// channel 表以 clientId 为键，同一进程内撞号等于两个客户端在 broker 侧互相顶掉；旧口径靠
+/// pid+序号确实不撞，但少了本机 IP，运维工具按 <c>&lt;ip&gt;@&lt;clientId&gt;</c> 查不到，
+/// 而且 Java 故意让同机广播消费者共用一个 clientId（BROADCASTING 不改写 instanceName），
+/// 旧口径把这份共享也拆散了。
+/// </summary>
+public static class ClientIds
+{
+    /// <summary>
+    /// 对应 Java <c>System.nanoTime()</c>：单调、原点任意，只用来保证同进程内不重复。
+    /// C# 的 <c>Stopwatch</c> 没有静态起点，这里以类型初始化时刻为原点。
+    /// </summary>
+    private static readonly Stopwatch NanoClock = Stopwatch.StartNew();
+
+    private static long NanoTime() => NanoClock.Elapsed.Ticks * 100L;
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#changeInstanceNameToPID</c>：默认名 "DEFAULT" 换成
+    /// <c>&lt;pid&gt;#&lt;nanoTime&gt;</c>，其余原样返回。
+    ///
+    /// Java 只在生产者（非 CLIENT_INNER_PRODUCER）和 CLUSTERING 消费者的 start() 里调用它，
+    /// 条件由各 facade 把，这里只做纯字符串变换。
+    /// </summary>
+    public static string ChangeInstanceNameToPID(string instanceName)
+    {
+        if (instanceName != MixAll.DefaultInstanceName) return instanceName;
+        return UtilAll.Pid().ToString(CultureInfo.InvariantCulture) + "#"
+            + NanoTime().ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// 对应 Java <c>ClientConfig#buildMQClientId</c>：
+    /// <c>ip@instanceName[@unitName][@STREAM]</c>。
+    /// 两处后缀口径不同，别抄反了：unitName 是**原值**、且 <c>UtilAll.isBlank</c> 时整段不拼；
+    /// stream 后缀是 <c>sb.append(RequestType.STREAM)</c>，走枚举 **name**（"STREAM"），
+    /// 而打到 ExtFields 的 <c>ReqT</c> 是 code（"0"，见 StreamTypeRPCHook）。
+    /// </summary>
+    public static string BuildMqClientId(string clientIp, string instanceName,
+        string? unitName = null, bool enableStreamRequestType = false)
+    {
+        var sb = new StringBuilder();
+        sb.Append(clientIp).Append('@').Append(instanceName);
+        if (!string.IsNullOrWhiteSpace(unitName)) sb.Append('@').Append(unitName);
+        if (enableStreamRequestType) sb.Append('@').Append("STREAM");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 未显式配置 clientId 时的默认口径：<c>&lt;本机 IP&gt;@&lt;instanceName&gt;[@unitName][@STREAM]</c>。
+    /// 调用方要按 Java 的条件先跑过 <see cref="ChangeInstanceNameToPID"/>。
+    /// </summary>
+    public static string Build(string instanceName, string? unitName = null,
+        bool enableStreamRequestType = false)
+        => BuildMqClientId(MixAll.CachedIpStr(), instanceName, unitName, enableStreamRequestType);
+}
+
+/// <summary>
+/// Java <c>ScheduledExecutorService#scheduleAtFixedRate</c> 的「固定速率」推进，各周期任务共用。
+///
+/// 速率锚定在**计划时刻**（start + initialDelay + n × period），不是「上一轮干完再睡一个周期」：
+/// 后者的耗时（以及下面这条坑）会一轮轮累加。真机量化过：macOS 上
+/// <c>ManualResetEventSlim.Wait(100ms)</c> 实测 131ms（系统定时器多给一个 tick），
+/// 于是「按 100ms 切片睡满 30s」实际要 39.2s —— 路由刷新、位点落盘的周期全被拉长 ~31%。
+/// 整段 wait 既能被 Shutdown 的 Set 立刻唤醒，又只有一次定时器误差（30s 实测 30.002s）。
+/// 落后于计划（上一轮超时）时不等待、立刻补跑，与 Java 的 catch-up 行为一致。
+/// </summary>
+internal static class Schedules
+{
+    /// <summary>睡到 <paramref name="deadlineTick"/>（Environment.TickCount64 口径），
+    /// <paramref name="stop"/> 被 Set 时立刻返回（提前返回由调用方的循环条件收尾）。</summary>
+    public static void WaitUntil(ManualResetEventSlim stop, long deadlineTick)
+    {
+        long remain = deadlineTick - Environment.TickCount64;
+        if (remain > 0)
+        {
+            stop.Wait(TimeSpan.FromMilliseconds(remain));
+        }
+    }
+
+    /// <summary>没有可等待事件的任务（生产者心跳线程）用 100ms 分段睡到计划时刻：
+    /// 每段都重新对着**绝对时刻**算，误差不累积，关停响应也在 100ms 内。</summary>
+    public static void WaitUntil(Func<bool> running, long deadlineTick)
+    {
+        long remain;
+        while ((remain = deadlineTick - Environment.TickCount64) > 0 && running())
+        {
+            Thread.Sleep((int)Math.Min(100, remain));
+        }
+    }
+}
+
+/// <summary>
+/// 对应 org.apache.rocketmq.client.impl.producer.TopicPublishInfo。
+///
+/// 注意：本类型的**轮询游标是共享状态**（Java 用 ThreadLocal，Python 用缓存的单例），
+/// 调用方一律通过 GetTopicPublishInfo() 返回的缓存实例使用它（引用共享），
+/// 这样多次发送才能在队列间真正轮转，而不是每次都从 0 号队列开始。
+/// </summary>
+public sealed class TopicPublishInfo
+{
+    private long _index;
+
+    public bool OrderTopic { get; set; }
+    public List<MessageQueue> MsgQueueList { get; set; } = new();
+    public TopicRouteData TopicRouteData { get; set; } = new();
+
+    public bool Ok() => MsgQueueList.Count > 0;
+
+    /// <summary>轮询选择（对应 Java selectOneMessageQueue）。</summary>
+    public MessageQueue SelectOneMessageQueue()
+    {
+        if (MsgQueueList.Count == 0)
+        {
+            throw new MQClientException("no message queue for publish info");
+        }
+
+        // 游标用原子自增：生产端可能被多线程并发调用，且游标是跨调用共享状态
+        long idx = Interlocked.Increment(ref _index) - 1;
+        return MsgQueueList[(int)(idx % MsgQueueList.Count)];
+    }
+
+    /// <summary>避开上一次失败的 broker（对应 Java selectOneMessageQueue(lastBrokerName)）。</summary>
+    public MessageQueue SelectOneMessageQueue(string lastBrokerName)
+    {
+        if (MsgQueueList.Count == 0)
+        {
+            throw new MQClientException("no message queue for publish info");
+        }
+
+        // 对应 Java：尽量避开上次失败的 broker；若全是同一 broker 则退化为轮询
+        for (int i = 0; i < MsgQueueList.Count; ++i)
+        {
+            long idx = Interlocked.Increment(ref _index) - 1;
+            MessageQueue mq = MsgQueueList[(int)(idx % MsgQueueList.Count)];
+            if (mq.BrokerName != lastBrokerName)
+            {
+                return mq;
+            }
+        }
+
+        long last = Interlocked.Increment(ref _index) - 1;
+        return MsgQueueList[(int)(last % MsgQueueList.Count)];
+    }
+
+    /// <summary>
+    /// 带过滤器的轮询（对应 Python select_one_message_queue(*filters)）：游标照常推进，
+    /// 一轮内全部不匹配返回 null，由调用方退化选择。filter 与 brokerFilter 都通过才选中。
+    /// </summary>
+    public MessageQueue? SelectOneMessageQueue(Func<MessageQueue, bool> filter,
+                                               Func<MessageQueue, bool> brokerFilter)
+    {
+        if (MsgQueueList.Count == 0)
+        {
+            throw new MQClientException("no message queue for publish info");
+        }
+
+        for (int i = 0; i < MsgQueueList.Count; ++i)
+        {
+            long idx = Interlocked.Increment(ref _index) - 1;
+            MessageQueue mq = MsgQueueList[(int)(idx % MsgQueueList.Count)];
+            if (filter(mq) && brokerFilter(mq))
+            {
+                return mq;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>重置轮询游标（对应 Python reset_index，故障规避 resetIndex 用）。</summary>
+    public void ResetIndex()
+    {
+        Interlocked.Exchange(ref _index, 0);
+    }
+}
+
+/// <summary>客户端核心编排实例。</summary>
+public sealed class MQClientInstance : IDisposable
+{
+    private readonly string _clientId;
+    private List<string> _nameServerAddrs;
+    private readonly RemotingClient _remotingClient;
+
+    private readonly object _routeLock = new();
+    private readonly Dictionary<string, TopicRouteData> _topicRouteTable = new(StringComparer.Ordinal);
+
+    // 对应 Java MQClientInstance.brokerAddrTable：**按 brokerName 平的**一张表，每次刷到任一条
+    // 路由就整批覆盖（updateTopicRouteInfoFromNameServer:962-964，存的是 route 里那张 map 的
+    // 引用，这里同样存 bd.BrokerAddrs 本身）。别改用「扫 _topicRouteTable 找第一台」的写法：
+    // 路由是**按 topic** 刷的，master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，
+    // 扫出来是谁全看字典顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
+    private readonly Dictionary<string, SortedDictionary<long, string>> _brokerAddrTable = new(StringComparer.Ordinal);
+
+    private readonly Dictionary<string, TopicPublishInfo> _topicPublishInfoTable = new(StringComparer.Ordinal);
+    private volatile bool _started;
+
+    /// <summary>本客户端「在用」的 topic（消费者订阅 + 生产者发过的），对应 Java 的
+    /// MQConsumerInner.subscriptions() / MQProducerInner.getPublishTopicList()，由周期任务
+    /// updateTopicRouteInfoFromNameServer() 逐个刷新路由。</summary>
+    private readonly HashSet<string> _topicsInUse = new(StringComparer.Ordinal);
+    private Thread? _routeRefreshThread;
+    private readonly ManualResetEventSlim _routeRefreshStop = new(false);
+
+    /// <summary>
+    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 路由刷新周期。与 Java 同：构造时定型，之后改门面上的字段不重排已启动的周期任务。
+    /// </summary>
+    private readonly int _pollNameServerIntervalMillis;
+
+    // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
+    // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 → fetch 是 no-op，行为不变。
+    // 非空白 unitName 会让 URL 多出 `-<unitName>?nofix=1`（Java `MQClientAPIImpl` 构造里
+    // `new DefaultTopAddressing(unitName)`），单元化环境取到的是本单元的 namesrv 列表。
+    public DefaultTopAddressing TopAddressing { get; }
+    private Thread? _namesrvRefreshThread;
+    private readonly ManualResetEventSlim _namesrvRefreshStop = new(false);
+
+    // ---- 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）----
+    public ConsumerStatsManager ConsumerStats { get; } = new();
+
+    // ---- broker 主动通知 40（实例级处理器 + 每个消费者的「叫醒」回调）----
+    private readonly object _wakeupLock = new();
+    private readonly Dictionary<string, Action> _rebalanceWakeups = new(StringComparer.Ordinal);
+    private long _consumerIdsChangedCount;
+
+    /// <summary>取一次地址；变化才应用到 _nameServerAddrs（Java 地址变化才 update）。</summary>
+    public void FetchNameServerAddr()
+    {
+        string? changed = TopAddressing.FetchAndApply();
+        if (string.IsNullOrEmpty(changed)) return;
+        var addrs = new List<string>();
+        foreach (string part in changed.Split(';'))
+        {
+            string t = part.Trim();
+            if (t.Length > 0) addrs.Add(t);
+        }
+        UpdateNameServerAddressList(addrs);
+    }
+
+    /// <summary>是否已 Start（诊断用）。</summary>
+    public bool Started => _started;
+
+    /// <summary>实例持有的路由刷新周期（离线用例断言门面透传结果用）。</summary>
+    public int PollNameServerIntervalMillis => _pollNameServerIntervalMillis;
+
+    /// <summary>Java 的 tls.enable 是 JVM 全局系统属性；这里等价为 env ROCKETMQ_TLS_ENABLE。</summary>
+    internal static bool TlsEnabledFromEnv() => RemotingClient.EnvTlsEnabled();
+
+    /// <summary>
+    /// <paramref name="unitName"/> 只为动态取址服务（对应 Java <c>MQClientAPIImpl</c> 构造里的
+    /// <c>new DefaultTopAddressing(unitName)</c>）；静态地址路径下它只影响 clientId。
+    /// </summary>
+    public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
+        int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
+        string? unitName = null, int pollNameServerIntervalMillis = 30000)
+    {
+        _clientId = clientId;
+        _nameServerAddrs = new List<string>(nameServerAddrs);
+        // Java `ClientConfig#pollNameServerInterval`（:58）的实例级副本：非正数回落到 Java
+        // 默认 30000（照抄 Java 的契约 —— scheduleAtFixedRate 收到非正周期会抛，
+        // 客户端应当拒绝，而不是退化成每 100ms 忙转一次路由拉取）。
+        _pollNameServerIntervalMillis = pollNameServerIntervalMillis > 0
+            ? pollNameServerIntervalMillis
+            : 30000;
+        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable);
+        // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 = 动态取址关闭（与 Java 默认
+        // jmenv.tbsite.net 不同：那是个依赖 /etc/hosts 的域名，照抄会让未配置的用户
+        // 每次 start 白等 3s 超时）。
+        TopAddressing = new DefaultTopAddressing(unitName: unitName);
+
+        // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
+        // 对应 Java MQClientAPIImpl 构造里
+        // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)——
+        // 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），所以在这里注册。
+        _remotingClient.RegisterProcessor(RequestCode.PushReplyMessageToClient, ProcessReplyMessage);
+
+        // NOTIFY_CONSUMER_IDS_CHANGED(40)：消费组成员变化时 broker 沿长连接反向推过来。
+        // 同样注册在**实例**上（Java 的 MQClientAPIImpl 构造函数里注册的
+        // clientRemotingProcessor），处理器只做 RebalanceImmediately()；broker 用的是
+        // invokeOneway ⇒ 返回 null 不回包。
+        _remotingClient.RegisterProcessor(RequestCode.NotifyConsumerIdsChanged,
+            ProcessNotifyConsumerIdsChanged);
+    }
+
+    // ---------------- broker 主动通知 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
+    // Java 把 40 注册在 MQClientAPIImpl（实例级），而处理器表是「一个 code 一个处理器」，
+    // 每个消费者各自注册会互相覆盖（后启动的把前一个顶掉）⇒ 组里只剩最后一个实例会被
+    // 叫醒。消费者改为向实例登记「叫醒」回调，由实例收到后逐个扇出。
+
+    /// <summary>收到过多少次 broker 的 40 通知。反向请求只有 broker 发得出来，用例
+    /// 注入不了，计数是真机断言的唯一落点。</summary>
+    public long ConsumerIdsChangedCount => Interlocked.Read(ref _consumerIdsChangedCount);
+
+    public void RegisterRebalanceWakeup(string group, Action wakeup)
+    {
+        lock (_wakeupLock)
+        {
+            _rebalanceWakeups[group] = wakeup;
+        }
+    }
+
+    public void UnregisterRebalanceWakeup(string group)
+    {
+        lock (_wakeupLock)
+        {
+            _rebalanceWakeups.Remove(group);
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#rebalanceImmediately</c>（一行 <c>rebalanceService.wakeup()</c>）。
+    /// 这里没有实例级重平衡线程，改成逐个叫醒已注册消费者自己那份循环
+    /// （等价于 Java doRebalance() 逐个 tryRebalance()）。
+    /// </summary>
+    public void RebalanceImmediately()
+    {
+        Action[] snapshot;
+        lock (_wakeupLock)
+        {
+            snapshot = _rebalanceWakeups.Values.ToArray();
+        }
+        foreach (Action wake in snapshot)
+        {
+            try
+            {
+                wake();
+            }
+            catch (Exception e)
+            {
+                // Java 整段包在 catch (Exception ignored)：一个消费者叫醒失败不影响其它
+                ClientLog.Warn("rebalanceImmediately failed: " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>ClientRemotingProcessor#notifyConsumerIdsChanged</c>：日志文案照抄，
+    /// 然后 rebalanceImmediately()。consumerGroup 只用于日志 —— Java 不读它来决定叫醒谁。
+    /// 运行在 remoting 读线程上：只置位 + 计数，不发任何 RPC。
+    /// 公开只为让离线用例能驱动这条反向路径（真连接上 broker 推不进来），勿用于业务代码。
+    /// </summary>
+    public RemotingCommand? ProcessNotifyConsumerIdsChanged(RemotingCommand cmd, string addr)
+    {
+        var header = new NotifyConsumerIdsChangedRequestHeader();
+        header.FromExtFields(cmd.ExtFields ?? new PropertyMap());
+        Interlocked.Increment(ref _consumerIdsChangedCount);
+        ClientLog.Info("receive broker's notification[" + addr + "], the consumer group: "
+                       + (header.ConsumerGroup ?? string.Empty) + " changed, rebalance immediately");
+        RebalanceImmediately();
+        return null; // broker 用 oneway 发的，Java 返回 null ⇒ 不回包
+    }
+
+    /// <summary>
+    /// 安装 RPC 钩子（ACL 鉴权）。对应 Java 在构造 MQClientInstance 时绑定 rpcHook。
+    /// **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
+    /// 此时返回 false。故钩子必须在 Start() 之前设置。
+    /// </summary>
+    public bool RegisterRpcHook(IRpcHook hook) => _remotingClient.RegisterRpcHook(hook);
+
+    // ---------------- 生命周期 ----------------
+
+    public void Start()
+    {
+        _started = true;
+        // 消费统计采样线程（Java 挂在每个 StatsItem 的调度器上，这里收敛为实例级一个）
+        ConsumerStats.Start();
+        // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
+        // 静态地址时先 fetch 一次；取不到直接报错（比 Java 更严格——Java 会让运行期
+        // 各处各自失败，这里在 Start 时给一个明确错误）。
+        if (_nameServerAddrs.Count == 0 && !string.IsNullOrEmpty(TopAddressing.WsAddr))
+        {
+            FetchNameServerAddr();
+            if (_nameServerAddrs.Count == 0)
+            {
+                // Java 在这一步不报错（MQClientInstance.start 只 fetch 一次，取不到照样启动），
+                // 故障要等第一次发送才以 validateNameServerSetting 的 10004 冒出来；本端口在
+                // Start 时就失败（更可预期），码值仍用同一条 10004。
+                throw new MQClientException("name server address is not set and address server ("
+                    + TopAddressing.WsAddr + ") returned none",
+                    ClientErrorCode.NoNameServerException);
+            }
+            // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
+            if (_namesrvRefreshThread is null)
+            {
+                _namesrvRefreshStop.Reset();
+                _namesrvRefreshThread = new Thread(NamesrvRefreshLoop)
+                {
+                    IsBackground = true,
+                    Name = "rmq-namesrv-refresh-" + _clientId,
+                };
+                _namesrvRefreshThread.Start();
+            }
+        }
+        string ns = string.Join(";", _nameServerAddrs);
+        ClientLog.Info("MQClientInstance[" + _clientId + "] started, namesrv=" + ns);
+        if (_routeRefreshThread is null)
+        {
+            _routeRefreshStop.Reset();
+            _routeRefreshThread = new Thread(RouteRefreshLoop)
+            {
+                IsBackground = true,
+                Name = "rmq-route-refresh-" + _clientId,
+            };
+            _routeRefreshThread.Start();
+        }
+    }
+
+    public void Shutdown()
+    {
+        _started = false;
+        _routeRefreshStop.Set();
+        _namesrvRefreshStop.Set();
+        if (_namesrvRefreshThread is { IsAlive: true })
+        {
+            _namesrvRefreshThread.Join(2000);
+        }
+        if (_routeRefreshThread is { IsAlive: true })
+        {
+            _routeRefreshThread.Join(2000);
+        }
+
+        ConsumerStats.Shutdown();
+        // 40 的回调是消费者登记的闭包（捕获了消费者状态）：关连接之前先摘掉处理器和
+        // 回调表，避免收尾期间 broker 的 40 还打进一个正在退出的消费者。
+        _remotingClient.UnregisterProcessor(RequestCode.NotifyConsumerIdsChanged);
+        lock (_wakeupLock)
+        {
+            _rebalanceWakeups.Clear();
+        }
+        _remotingClient.Shutdown();
+    }
+
+    /// <summary>动态 name server 周期刷新：Java 首次延迟 10s、周期 2 分钟。</summary>
+    private void NamesrvRefreshLoop()
+    {
+        // Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)：首跳 10s，之后固定速率 2min。
+        long next = Environment.TickCount64 + 10_000;
+        while (!_namesrvRefreshStop.IsSet)
+        {
+            if (!_started) return;
+            Schedules.WaitUntil(_namesrvRefreshStop, next);
+            next += 120_000;
+            try
+            {
+                FetchNameServerAddr();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("fetchNameServerAddr exception: " + e.Message);
+            }
+        }
+    }
+
+    /// <summary>登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。</summary>
+    public void RegisterTopicInUse(string topic)
+    {
+        if (topic.Length > 0)
+        {
+            lock (_routeLock)
+            {
+                _topicsInUse.Add(topic);
+            }
+        }
+    }
+
+    private void RouteRefreshLoop()
+    {
+        // 对齐 Java MQClientInstance.startScheduledTask:400-406 的
+        // scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)。
+        //
+        // Java 的 scheduleAtFixedRate：**首跳落在 initialDelay（10ms）这一刻**，不是
+        // initialDelay + 一个周期之后；之后的每跳锚定在 initialDelay + n*周期（固定速率）。
+        // 旧写法在循环头先整睡一个周期（30s），首跳要 30.03s，周期还写死 30s ——
+        // ClientConfig#pollNameServerInterval 形同虚设。这两个偏差真机上只表现为「慢」：
+        // 新 topic 的路由要等半分钟才刷出来，不报任何错。
+        // 固定速率：首跳在 initialDelay(10ms)，之后每 pollNameServerIntervalMillis 一跳，
+        // 计划时刻锚定（见 Schedules），不是"干完再睡一个周期"。
+        long next = Environment.TickCount64 + 10;
+        while (!_routeRefreshStop.IsSet)
+        {
+            if (!_started) return;
+
+            Schedules.WaitUntil(_routeRefreshStop, next);
+            next += _pollNameServerIntervalMillis;
+
+            List<string> topics;
+            lock (_routeLock)
+            {
+                topics = new List<string>(_topicsInUse);
+            }
+
+            foreach (string topic in topics)
+            {
+                try
+                {
+                    UpdateTopicRouteInfoFromNameServer(topic);
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Debug("route refresh failed for " + topic + ": " + e.Message);
+                }
+            }
+        }
+    }
+
+    public void Dispose() => Shutdown();
+
+    public string ClientId => _clientId;
+
+    public IReadOnlyList<string> NameServerAddrs => _nameServerAddrs;
+
+    public RemotingClient RemotingClient => _remotingClient;
+
+    public void UpdateNameServerAddressList(IReadOnlyList<string> addrs)
+    {
+        if (addrs.Count > 0)
+        {
+            _nameServerAddrs = new List<string>(addrs);
+        }
+    }
+
+    private RemotingCommand InvokeSyncOnAddr(string addr, RemotingCommand request, int timeoutMillis) =>
+        _remotingClient.InvokeSync(addr, request, timeoutMillis);
+
+    /// <summary>对应 Java <c>MQClientAPIImpl.sendMessage</c> 的 ASYNC 分支里那句
+    /// <c>invokeAsync(addr, request, callback, timeoutMillis)</c>：把**调用方持有的**请求交出去，
+    /// 结果由回调带回（回调在传输层的读线程 / 超时清理线程上跑，Java 同）。
+    ///
+    /// 与同步路径分开是有意的：异步重试链要跨尝试**复用同一个 request**（Java
+    /// <c>onExceptionImpl:728-730</c> 只换 opaque），所以请求不能在每次调用里现建。</summary>
+    public void InvokeAsyncOnAddr(string addr, RemotingCommand request, int timeoutMillis,
+        RemotingClient.InvokeCallback callback) =>
+        _remotingClient.InvokeAsync(addr, request, callback, timeoutMillis);
+
+    /// <summary>把响应码非 SUCCESS 转成 MQBrokerException。</summary>
+    public static void CheckResponseCode(RemotingCommand response)
+    {
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
+    // ---------------- 路由管理 ----------------
+
+    /// <summary>
+    /// 从 NameServer 拉取 topic 路由。未知 topic 会回退到 MixAll.DefaultTopic
+    /// （5.x nameserver 不为未知 topic 合成路由，返回 TOPIC_NOT_EXIST）。
+    /// </summary>
+    /// <summary>
+    /// 从 NameServer 拉取 topic 路由。未知 topic 的**默认 topic 兜底（TBW102 合成）只允许生产者
+    /// 在真实路由拉不到时走**（<paramref name="isDefault"/>=true，对齐 Java
+    /// DefaultMQProducerImpl.tryToFindTopicPublishInfo:898-905 先真实路由、失败才 isDefault=true）。
+    /// 消费者**绝不能**兜底：否则 %RETRY%group 这类尚未由 broker 创建的主题会被合成出一组假队列，
+    /// 两个实例在不同时间拉取会得到不同队列数，rebalance 视图不一致（真机重复消费根因之一）。
+    /// </summary>
+    public bool UpdateTopicRouteInfoFromNameServer(string topic, bool isDefault = false, int timeoutMillis = 5000)
+    {
+        if (_nameServerAddrs.Count == 0)
+        {
+            // Java 这里只 log.warn 并返回 false，故障最终由生产者的 validateNameServerSetting
+            // 以 10004 报出；本端口的路由拉取是拉不到就抛，所以直接把同一个码带上 ——
+            // 一个地址都没有时不能报成"这个 topic 没路由"(10005)。
+            throw new MQClientException("name server address list is empty",
+                ClientErrorCode.NoNameServerException);
+        }
+
+        bool Fetch(string t, out TopicRouteData @out)
+        {
+            @out = new TopicRouteData();
+            var request = RemotingCommand.CreateRequestCommand(RequestCode.GetRouteinfoByTopic, null);
+            request.ExtFields["topic"] = t;
+            foreach (string nsAddr in _nameServerAddrs)
+            {
+                try
+                {
+                    RemotingCommand response = InvokeSyncOnAddr(nsAddr, request, timeoutMillis);
+                    if (response.Code == ResponseCode.Success && response.Body.Length > 0)
+                    {
+                        return TopicRouteData.Decode(response.Body, out @out);
+                    }
+
+                    // 第一个可达的 NS 明确返回非 SUCCESS（如 TOPIC_NOT_EXIST）就停止轮询
+                    break;
+                }
+                catch (RemotingException)
+                {
+                    continue;
+                }
+            }
+
+            return false;
+        }
+
+        bool ok = Fetch(topic, out TopicRouteData route);
+        if (!ok && isDefault && topic != MixAll.DefaultTopic)
+        {
+            // 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
+            // 需像 Java 客户端那样回退到默认 topic（TBW102）来构造发布信息。
+            // 新 topic 由 broker 用 defaultTopicQueueNums 创建队列，而默认 topic 自身
+            // 可能配置了更多队列，这里按 broker 实际创建数裁剪，避免选中非法 queueId。
+            if (Fetch(MixAll.DefaultTopic, out TopicRouteData defaultRoute))
+            {
+                foreach (QueueData qd in defaultRoute.QueueDatas)
+                {
+                    if (qd.WriteQueueNums > MixAll.DefaultTopicQueueNums)
+                    {
+                        qd.WriteQueueNums = MixAll.DefaultTopicQueueNums;
+                    }
+
+                    if (qd.ReadQueueNums > MixAll.DefaultTopicQueueNums)
+                    {
+                        qd.ReadQueueNums = MixAll.DefaultTopicQueueNums;
+                    }
+                }
+
+                route = defaultRoute;
+                ok = true;
+            }
+        }
+
+        if (!ok)
+        {
+            return false;
+        }
+
+        lock (_routeLock)
+        {
+            _topicRouteTable[topic] = route;
+
+            // Java MQClientInstance:962-964：每次刷到路由就把 route 里的 broker 整批写进平表，
+            // 值存的是 bd.BrokerAddrs **本身**（Java 同理，存引用），所以后续路由刷新整段替换
+            // 时平表里的旧地址也会跟着失效 —— 这正是「master 掉线后所有 topic 一律无主」的来源。
+            foreach (BrokerData bd in route.BrokerDatas)
+            {
+                _brokerAddrTable[bd.BrokerName] = bd.BrokerAddrs;
+            }
+
+            if (!_topicPublishInfoTable.TryGetValue(topic, out TopicPublishInfo? publish) || publish is null)
+            {
+                publish = new TopicPublishInfo();
+                _topicPublishInfoTable[topic] = publish;
+            }
+
+            publish.OrderTopic = route.OrderTopicConf.Length > 0;
+            publish.TopicRouteData = route;
+            publish.MsgQueueList = route.GetAllMessageQueue(topic);
+            if (topic.Contains("ORDER", StringComparison.Ordinal))
+            {
+                publish.OrderTopic = true;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 取发布信息（**缓存实例共享**，轮询游标在实例内推进）；
+    /// 缓存未命中会触发一次路由刷新，仍拿不到则抛 MQClientException。
+    /// <paramref name="isDefault"/> 透传给路由刷新：仅生产者发真实路由拉不到时传 true。
+    /// </summary>
+    public TopicPublishInfo GetTopicPublishInfo(string topic, bool isDefault = false)
+    {
+        lock (_routeLock)
+        {
+            if (_topicPublishInfoTable.TryGetValue(topic, out TopicPublishInfo? hit) && hit is not null && hit.Ok())
+            {
+                return hit;
+            }
+        }
+
+        UpdateTopicRouteInfoFromNameServer(topic, isDefault);
+        lock (_routeLock)
+        {
+            if (_topicPublishInfoTable.TryGetValue(topic, out TopicPublishInfo? p) && p is not null && p.Ok())
+            {
+                return p;
+            }
+        }
+
+        throw new MQClientException("Can not find Message Queue for topic: " + topic);
+    }
+
+    /// <summary>
+    /// 本实例订阅该 topic 时应看到的全部队列（Java RebalanceImpl.topicSubscribeInfoTable）。
+    ///
+    /// 取值口径是 topicRouteData2TopicSubscribeInfo（**读**位 + readQueueNums、不要求 broker
+    /// 有 master），**不是**发布信息 —— 两者在 perm=4 的只读 topic 和「master 掉线只剩从
+    /// 节点」两种路由上答案不同，消费侧（rebalance / fetchSubscribeMessageQueues）必须用
+    /// 这一份。路由没缓存时补拉一次；仍然没有返回空列表（Java rebalanceByTopic 对空表只
+    /// warn，不会因此撤走已有分配）。
+    /// </summary>
+    public List<MessageQueue> GetTopicSubscribeInfo(string topic)
+    {
+        TopicRouteData? route = GetTopicRouteData(topic);
+        if (route is null)
+        {
+            return new List<MessageQueue>();
+        }
+
+        return route.GetAllSubscribeMessageQueue(topic);
+    }
+
+    /// <summary>取缓存路由；未命中会尝试刷新一次，仍没有返回 null。</summary>
+    public TopicRouteData? GetTopicRouteData(string topic)
+    {
+        lock (_routeLock)
+        {
+            if (_topicRouteTable.TryGetValue(topic, out TopicRouteData? hit))
+            {
+                return hit;
+            }
+        }
+
+        try
+        {
+            UpdateTopicRouteInfoFromNameServer(topic);
+        }
+        catch (Exception)
+        {
+            // 与 Python 一致：路由刷新失败不抛，交给下面的查表返回空
+        }
+
+        lock (_routeLock)
+        {
+            return _topicRouteTable.TryGetValue(topic, out TopicRouteData? route) ? route : null;
+        }
+    }
+
+    public static string FindBrokerAddrInRoute(TopicRouteData route, string brokerName)
+    {
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            if (bd.BrokerName == brokerName)
+            {
+                return bd.SelectBrokerAddr();
+            }
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#findBrokerAddressInSubscribe:1307-1336</c>：按 brokerId 取地址。
+    /// 命中 brokerId 直接用（<c>IsSlave = brokerId != MASTER_ID</c>）；brokerId 是从节点且没命中时
+    /// 按 brokerId+1 再试（Java 的从节点编号约定）；都没命中且不限定 brokerId 时取 id 最小的那台
+    /// （Java 取 map 首个 entry，这里取确定性形态）。返回 <c>(地址, 是否从节点)</c>；
+    /// 找不到时地址为空串。
+    /// </summary>
+    public static (string Addr, bool IsSlave) FindBrokerAddressInSubscribe(
+        IReadOnlyDictionary<long, string> brokerAddrs, long brokerId, bool onlyThisBroker = false)
+    {
+        if (brokerAddrs.Count == 0)
+        {
+            return (string.Empty, false);
+        }
+
+        if (brokerAddrs.TryGetValue(brokerId, out string? hit))
+        {
+            return (hit, brokerId != MixAll.MasterId);
+        }
+
+        if (brokerId != MixAll.MasterId
+            && brokerAddrs.TryGetValue(brokerId + 1, out string? next))
+        {
+            return (next, true);
+        }
+
+        if (!onlyThisBroker)
+        {
+            long minId = brokerAddrs.Keys.Min();
+            return (brokerAddrs[minId], minId != MixAll.MasterId);
+        }
+
+        return (string.Empty, false);
+    }
+
+    private string BrokerAddr(MessageQueue mq)
+    {
+        TopicRouteData? route = GetTopicRouteData(mq.Topic);
+        if (route is null)
+        {
+            throw new MQClientNoRouteException(mq.Topic);
+        }
+
+        string addr = FindBrokerAddrInRoute(route, mq.BrokerName);
+        if (addr.Length == 0)
+        {
+            throw new MQClientException("Broker " + mq.BrokerName + " not found in route of topic "
+                + mq.Topic);
+        }
+
+        return addr;
+    }
+
+    public string BrokerAddrOf(string brokerName)
+    {
+        lock (_routeLock)
+        {
+            foreach (var kv in _topicRouteTable)
+            {
+                string addr = FindBrokerAddrInRoute(kv.Value, brokerName);
+                if (addr.Length > 0)
+                {
+                    return addr;
+                }
+            }
+        }
+
+        return string.Empty;
+    }
+
+    public List<string> GetRouteOfAllBrokers()
+    {
+        var addrs = new List<string>();
+        lock (_routeLock)
+        {
+            foreach (var kv in _topicRouteTable)
+            {
+                foreach (BrokerData bd in kv.Value.BrokerDatas)
+                {
+                    string a = bd.SelectBrokerAddr();
+                    if (a.Length > 0 && !addrs.Contains(a))
+                    {
+                        addrs.Add(a);
+                    }
+                }
+            }
+        }
+
+        return addrs;
+    }
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#findBrokerAddressInPublish:1295-1305</c>：
+    /// <strong>只</strong>从平表 <c>_brokerAddrTable</c> 里取 brokerId=0 的地址（Java 的
+    /// <c>brokerAddrTable.get(brokerName).get(MixAll.MASTER_ID)</c>），任何一步拿不到就返回空串。
+    /// 与 <see cref="BrokerAddrOf"/> 是两码事：后者扫各 topic 的路由、走 <c>SelectBrokerAddr()</c>
+    /// （主优先、没主随机退一台），给「问到一台就行」的心跳/拉取用；<strong>发送不行</strong> ——
+    /// 主没了还把写请求打到从节点上，broker 回 SYSTEM_BUSY(2)，白烧一整轮重试，
+    /// 错误类型也和 Java 不一样（Java 是本端直接报「broker 不存在」）。
+    ///
+    /// 返回空串是正常结果（master 掉线就是这个形状），报什么错由调用方决定
+    /// （<c>sendKernelImpl</c> 报 MQClientException、<c>endTransaction</c> 什么都不报）。
+    /// </summary>
+    public string FindBrokerAddressInPublish(string brokerName)
+    {
+        lock (_routeLock)
+        {
+            if (_brokerAddrTable.TryGetValue(brokerName, out SortedDictionary<long, string>? addrs)
+                && addrs is not null
+                && addrs.TryGetValue(MixAll.MasterId, out string? master))
+            {
+                return master ?? string.Empty;
+            }
+
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Java 侧「<strong>只要主</strong>」的地址解析，出现处都是同一个形状。
+    ///
+    /// 对应 <c>DefaultMQProducerImpl.sendKernelImpl:919-924</c>（发送）、
+    /// <c>DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876</c> / <c>ackAsync</c>
+    /// （POP 的 ack 与延长不可见时间走 <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>，
+    /// 只要主），以及 <c>MQAdminImpl</c> 的 offset 查询（见 <see cref="PublishAddrInAdmin"/>）。
+    /// 形状一致：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由 → 重查 →
+    /// 仍查不到照 <c>sendKernelImpl:1100</c> 抛
+    /// <c>MQClientException("The broker[X] not exist")</c>（本端口码为 -1，表示
+    /// 「不是 broker 回的码」，与 Python/C++/Rust 三端同一个口径）。
+    ///
+    /// 定点发送不会在 <c>sendDefaultImpl</c> 里取发布信息，这里是它唯一的路由来源；
+    /// 主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮 SYSTEM_BUSY(2)」的
+    /// 分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK / CHANGE_INVISIBLE_TIME
+    /// 这些写请求。
+    /// </summary>
+    public string PublishAddrFor(string brokerName, string topic)
+    {
+        string addr = FindBrokerAddressInPublish(brokerName);
+        if (addr.Length == 0)
+        {
+            UpdateTopicRouteInfoFromNameServer(topic);
+            addr = FindBrokerAddressInPublish(brokerName);
+        }
+
+        if (addr.Length == 0)
+        {
+            throw new MQClientException("The broker[" + brokerName + "] not exist", -1);
+        }
+
+        return addr;
+    }
+
+    /// <summary>
+    /// Java <c>MQAdminImpl</c> 的 offset 查询口径（<c>:195/214/232/250</c>）。
+    /// 与 <see cref="PublishAddrFor"/> 同形（Python <c>_publish_addr_in_admin</c> 亦然），
+    /// 单独一层只是给调用点一个自证「这里打主」的名字。从节点上的 store 是 HA 复制来的
+    /// 同一份数据，但 Java 的管理类 API 一律打主，本端不「顺手」退到从节点 ——
+    /// 主掉线期间这里就该报错，让调用方看见。
+    /// </summary>
+    public string PublishAddrInAdmin(MessageQueue mq) => PublishAddrFor(mq.BrokerName, mq.Topic);
+
+    public List<string> KnownBrokerAddrs() => GetRouteOfAllBrokers();
+
+    /// <summary>
+    /// 路由里出现过的<strong>每一台</strong> broker（主 + 从）。
+    /// <see cref="GetRouteOfAllBrokers"/> 走 <c>SelectBrokerAddr()</c>（主优先、没主才随机），
+    /// 适合「问到一台就行」的心跳；注销(35) 必须用这个 —— Java
+    /// <c>MQClientInstance#unregisterClient</c>:1158-1182 遍历的是 <c>brokerAddrTable</c> 的
+    /// 每个 brokerId，而 Producer/ConsumerManager 是每台 broker 各自一份状态，漏掉从节点
+    /// 就等于那台的注册要等通道扫描（默认 ~120s）才回收。
+    /// </summary>
+    public List<string> GetAllBrokerAddrs()
+    {
+        var addrs = new List<string>();
+        lock (_routeLock)
+        {
+            foreach (var kv in _topicRouteTable)
+            {
+                foreach (BrokerData bd in kv.Value.BrokerDatas)
+                {
+                    foreach (string a in bd.BrokerAddrs.Values)
+                    {
+                        if (a.Length > 0 && !addrs.Contains(a))
+                        {
+                            addrs.Add(a);
+                        }
+                    }
+                }
+            }
+        }
+
+        return addrs;
+    }
+
+    // ---------------- 消息发送 ----------------
+
+    /// <summary>
+    /// Java 的属性值是字符串，抬进请求头时走 <c>Integer.valueOf</c>（非法值抛
+    /// <c>NumberFormatException</c>）。这里非法值按 0/「没带」处理而不是抛：建头在发送线程上，
+    /// 一个坏属性不该把整次发送打断。
+    /// </summary>
+    private static int ParseIntOrZero(string? value) =>
+        TryParseInt(value) ?? 0;
+
+    private static int? TryParseInt(string? value) =>
+        int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
+            ? parsed
+            : null;
+
+    /// <summary>
+    /// 组装发送请求（对应 Java MQClientAPIImpl.sendMessage 的头部拼装 + V2 选择）。
+    /// Request-Reply 的应答消息（MSG_TYPE == "reply"）会用 SEND_REPLY_MESSAGE_V2(325)
+    /// 而不是普通 SEND_MESSAGE_V2(310)——broker 只在 324/325 上注册了 ReplyMessageProcessor。
+    /// 批量消息（msg.IsBatch）用 SEND_BATCH_MESSAGE(320)，与 Java 的 msg instanceof MessageBatch 同判据。
+    /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
+    /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
+    /// createTopicKey / defaultTopicQueueNums 同样由调用方给（Java
+    /// <c>DefaultMQProducerImpl:996-997</c> 从 producer 取
+    /// <c>getCreateTopicKey()</c> / <c>getDefaultTopicQueueNums()</c>），留 null 才回落成
+    /// <c>TBW102</c>/4 —— 否则这两个 setter 是假的：broker 侧自动建 topic 时按这两个值
+    /// 决定队列数（<c>AbstractSendMessageProcessor.createTopicInSendMessageMethod</c>）。
+    /// </summary>
+    public RemotingCommand BuildSendRequest(string producerGroup, Message msg, MessageQueue mq,
+        int sysFlag = 0, bool unitMode = false, string? createTopicKey = null,
+        int? defaultTopicQueueNums = null)
+    {
+        // Java <c>DefaultMQProducerImpl#sendKernelImpl:1004-1018</c>：发往 <c>%RETRY%</c> 时把
+        // <c>RECONSUME_TIME</c> / <c>MAX_RECONSUME_TIMES</c> 两个属性「抬进」请求头。
+        // broker 判死信读的是 <c>requestHeader.reconsumeTimes</c> / <c>maxReconsumeTimes</c>
+        //（<c>SendMessageProcessor#handleRetryAndDLQ:197-210</c>），**不看报文属性**；不抬的话它
+        // 退回订阅组默认的 retryMaxTimes(16)，消费者配的阈值形同虚设 —— 真机上只表现为
+        //「死信来得慢」，抓一次报文才看得出来。
+        // ⚠ 属性本身仍然上线（<c>Properties</c> 在下面的头里照常整体序列化）：消费端要靠
+        //   <c>RECONSUME_TIME</c> 还原重试次数，Java 也是先 setProperties 再 clearProperty。
+        // 有意偏离 Java：Java 抬完 clearProperty 改本地对象；本端口不回写 —— 两个调用方
+        //（并发/顺序回投）发出去的都是一次性 newMsg，本地清不清都无人再读。
+        int reconsumeTimes = 0;
+        int? maxReconsumeTimes = null;
+        if (MixAll.IsRetryTopic(msg.Topic))
+        {
+            // Java 走 Integer.valueOf(属性)，非法值直接抛；这里按「没带这个属性」处理，
+            // 因为建头在发送线程上，一个坏属性不该把整次发送打断。
+            reconsumeTimes = ParseIntOrZero(msg.GetProperty(MessageConst.PropertyReconsumeTime));
+            maxReconsumeTimes = TryParseInt(msg.GetProperty(MessageConst.PropertyMaxReconsumeTimes));
+        }
+
+        var header = new SendMessageRequestHeaderV2
+        {
+            ProducerGroup = producerGroup,
+            Topic = msg.Topic,
+            DefaultTopic = string.IsNullOrEmpty(createTopicKey) ? MixAll.DefaultTopic : createTopicKey,
+            DefaultTopicQueueNums = defaultTopicQueueNums ?? MixAll.DefaultTopicQueueNums,
+            QueueId = mq.QueueId,
+            SysFlag = sysFlag,
+            BornTimestamp = UtilAll.CurrentTimeMillis(),
+            Flag = msg.Flag,
+            Properties = MessageDecoder.MessagePropertiesToString(msg.Properties),
+            ReconsumeTimes = reconsumeTimes,
+            // 对应 Java DefaultMQProducerImpl:1004 `requestHeader.setUnitMode(this.isUnitMode())`
+            // → V2 的单字母键 `k`（SendMessageRequestHeaderV2.java:62）。broker 据此给
+            // 自动创建的 topic 打 UNIT(0x1)/UNIT_SUB(0x2) 标记，单元化路由靠它。
+            UnitMode = unitMode,
+            // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
+            // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
+            // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
+            MaxReconsumeTimes = maxReconsumeTimes,
+            Batch = msg.IsBatch,
+            // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)`，V2 的键是
+            // 单字母 `n`（SendMessageRequestHeaderV2.java:69，`@CFNullable` 所以空值整条不上线）。
+            // 取的是**这一笔选中的**那个 broker 名，即 mq.BrokerName。经典 broker 按连接地址
+            // 寻址、不读它，但 proxy 与审计/轨迹侧读 —— 缺了它四个端口的线上报文就不等价。
+            BrokerName = string.IsNullOrEmpty(mq.BrokerName) ? null : mq.BrokerName,
+        };
+
+        // 对应 Java MQClientAPIImpl.sendMessage:550-563（sendSmartMsg 默认 true → V2）：
+        // 先判应答消息，再判批量 —— Java 的批量判据是 msg instanceof MessageBatch。
+        // 服务端对 310/320 的处理其实是同一条路：broker 两种码都解码成 V2 头
+        // （SendMessageRequestHeader.parseRequestHeader:185-202）、由 header.batch 决定
+        // 走 sendBatchMessage（SendMessageProcessor:117）；proxy 的 SendMessageActivity:49-52
+        // 与 auth 的 DefaultAuthorizationContextBuilder:230-240 都把两者列在同一个 case 里。
+        // 所以这里改成 320 不是修 bug，是为了在请求码这一层也和 Java 一致 ——
+        // 服务端按码做限流/统计/鉴权策略时不会把我们的批量当成单条发送。
+        int code;
+        if (RequestReply.IsReplyMessage(msg))
+        {
+            code = RequestCode.SendReplyMessageV2;
+        }
+        else
+        {
+            code = msg.IsBatch ? RequestCode.SendBatchMessage : RequestCode.SendMessageV2;
+        }
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(code, header);
+        request.Body = msg.Body;
+        request.HasBody = true;
+        return request;
+    }
+
+    /// <summary>
+    /// sysFlag 由调用方（Producer）算好：压缩标志与压缩类型位都在这里下发，
+    /// 且 msg.body 应已经是压缩后的字节（见 DefaultMQProducer.PrepareForSend）。
+    /// unitMode 同样由调用方给（Java 从 producer 的 ClientConfig 取，见 sendKernelImpl:1004），
+    /// createTopicKey / defaultTopicQueueNums 亦然（sendKernelImpl:996-997）。
+    /// </summary>
+    public SendResult SendMessage(string producerGroup, Message msg, MessageQueue mq,
+        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
+        string? createTopicKey = null, int? defaultTopicQueueNums = null)
+    {
+        // Java sendKernelImpl 的发送地址只认 master（PublishAddrFor 里含一次路由刷新）；
+        // 主掉线时本端立刻报「The broker[X] not exist」，而不是把请求打到从节点上。
+        string addr = PublishAddrFor(mq.BrokerName, mq.Topic);
+        // 对应 Java DefaultMQProducerImpl.sendKernelImpl：非批量消息在**发请求之前**
+        // 补一个客户端唯一 ID（UNIQ_KEY）。它决定 SendResult.MsgId，也是消息轨迹
+        // 里 msgId 的来源（控制台按它把发送轨迹与消费轨迹串起来）。
+        if (!msg.IsBatch)
+        {
+            MessageClientIDSetter.SetUniqId(msg);
+        }
+
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode,
+            createTopicKey, defaultTopicQueueNums);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        return ProcessSendResponse(response, msg, mq);
+    }
+
+    /// <summary>
+    /// 把发送应答解析成 <see cref="SendResult"/>；应答码非成功时抛
+    /// <see cref="MQBrokerException"/>。对应 Java MQClientAPIImpl.processSendResponse。
+    /// 同步与异步发送共用这一份解码逻辑（Python 同名 process_send_response）。
+    /// </summary>
+    public SendResult ProcessSendResponse(RemotingCommand response, Message msg, MessageQueue mq)
+    {
+        SendStatus status;
+        switch (response.Code)
+        {
+            case ResponseCode.Success:
+                status = SendStatus.SendOk;
+                break;
+            case ResponseCode.FlushDiskTimeout:
+                status = SendStatus.FlushDiskTimeout;
+                break;
+            case ResponseCode.FlushSlaveTimeout:
+                status = SendStatus.FlushSlaveTimeout;
+                break;
+            case ResponseCode.SlaveNotAvailable:
+                status = SendStatus.SlaveNotAvailable;
+                break;
+            default:
+                throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        var respHeader = new SendMessageResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        // 对应 Java MQClientAPIImpl.processSendResponse：
+        //   msgId         = 客户端唯一 ID（UNIQ_KEY）
+        //   offsetMsgId   = 响应头里的 msgId（broker 生成的 offset 消息 ID）
+        //   regionId      = 响应头 MSG_REGION，缺省回落 DefaultRegion
+        //   traceOn       = 响应头 TRACE_ON != "false"（broker 默认 true）
+        // 批量消息取的是**批量自身**那条消息的 ID（inner-batch 时 broker 会把它原样回在
+        // batchUniqId 里，客户端没带 ID 时用它兜底）。
+        // ⚠ 有意偏离 Java processSendResponse:786-793：Java 在 broker **没**回 batchUniqId
+        // （= 普通 topic 上的客户端批量）时把 msgId 换成「逐条子消息 UNIQ_KEY 的逗号串」，
+        // 本端口不跟随 —— 同步批量在 Producer.SendBatch 里会 CloneMessage（为了不把压缩后的
+        // body 写回调用方的原始消息），克隆出来的是普通 Message，子消息列表在这里已经拿不到了；
+        // 四种语言也要能互相比对，Python/Rust/C++ 同样取批量自身的 ID。要紧的那一半已经对齐：
+        // 每条子消息的 UNIQ_KEY 在编码前就写好（MessageBatch.GenerateFromList），broker 拆开后
+        // 消费端与轨迹看到的逐条 ID 和 Java 一致。
+        string clientUniqId = MessageClientIDSetter.GetUniqId(msg);
+        string msgId = !string.IsNullOrEmpty(clientUniqId)
+            ? clientUniqId
+            : respHeader.BatchUniqId ?? respHeader.MsgId ?? string.Empty;
+        string regionId = MixAll.DefaultTraceRegionId;
+        if (response.ExtFields.TryGetValue(MessageConst.PropertyMsgRegion, out string? rid)
+            && !string.IsNullOrEmpty(rid))
+        {
+            regionId = rid;
+        }
+
+        bool traceOn = true;
+        if (response.ExtFields.TryGetValue(MessageConst.PropertyTraceSwitch, out string? ts)
+            && ts == "false")
+        {
+            traceOn = false;
+        }
+
+        return new SendResult
+        {
+            SendStatus = status,
+            MsgId = msgId,
+            OffsetMsgId = respHeader.MsgId ?? string.Empty,
+            MessageQueue = new MessageQueue(mq.Topic, mq.BrokerName, respHeader.QueueId ?? mq.QueueId),
+            QueueOffset = respHeader.QueueOffset ?? 0,
+            TransactionId = respHeader.TransactionId ?? string.Empty,
+            RegionId = regionId,
+            TraceOn = traceOn,
+            // 定时/延迟消息才有；普通消息恒为 null（对齐 Java processSendResponse:798）。
+            RecallHandle = respHeader.RecallHandle,
+        };
+    }
+
+    public void SendMessageOneway(string producerGroup, Message msg, MessageQueue mq,
+        int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
+        string? createTopicKey = null, int? defaultTopicQueueNums = null)
+    {
+        // 单向发送同样是写请求，地址口径与同步发送一致（只认 master）。
+        string addr = PublishAddrFor(mq.BrokerName, mq.Topic);
+        // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
+        if (!msg.IsBatch)
+        {
+            MessageClientIDSetter.SetUniqId(msg);
+        }
+
+        RemotingCommand request = BuildSendRequest(producerGroup, msg, mq, sysFlag, unitMode,
+            createTopicKey, defaultTopicQueueNums);
+        request.MarkOnewayRpc();
+        _remotingClient.InvokeOneway(addr, request);
+    }
+
+    // ---------------- 定时消息撤回 ----------------
+
+    /// <summary>
+    /// RECALL_MESSAGE(370)，对应 Java MQClientAPIImpl#recallMessage(:3749-3767)。
+    ///
+    /// 与 Java 一样：只有 SUCCESS 才取响应头的 msgId（= 被撤回那条消息的 UNIQ_KEY，
+    /// broker 的 RecallMessageProcessor 直接把 handle.messageId 回填回来），
+    /// 其余码原样抛 MQBrokerException，让调用方看到 ILLEGAL_OPERATION 之类的真实原因。
+    /// SUCCESS 但没有 msgId 也判失败——拿到空串当成功会让上层以为撤回了别的东西。
+    /// </summary>
+    public string RecallMessage(string addr, RecallMessageRequestHeader header,
+        int timeoutMillis = 3000)
+    {
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.RecallMessage, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+        var respHeader = new RecallMessageResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        if (string.IsNullOrEmpty(respHeader.MsgId))
+        {
+            throw new MQBrokerException(response.Code, "recall message response has no msgId");
+        }
+        return respHeader.MsgId!;
+    }
+
+    // ---------------- Request-Reply：接收 broker 推回的应答（326）----------------
+
+    /// <summary>
+    /// 处理 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：把应答交给等待中的 Request()。
+    ///
+    /// 对应 Java ClientRemotingProcessor#receiveReplyMessage(:222-271)。
+    /// 与 Java 一样**必须回一个响应**：broker 侧 Broker2Client.callClient 是 invokeSync
+    /// （10s 超时），不回响应它那边就会超时并记 "push reply message to &lt;id&gt; fail"，
+    /// 应答虽然已经投递成功，broker 日志里却是失败。
+    ///
+    /// 该回调运行在**读线程**上：绝不能在这里做 invokeSync（会死锁读线程）；异常必须兜住
+    /// （解析失败回 SYSTEM_ERROR，绝不让读线程崩），对应 Java 的同处 try/catch。
+    /// </summary>
+    public RemotingCommand? ProcessReplyMessage(RemotingCommand cmd, string addr)
+    {
+        var header = new ReplyMessageRequestHeader();
+        try
+        {
+            header.FromExtFields(cmd.ExtFields ?? new PropertyMap());
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("processReplyMessage: decode header failed from " + addr + ": " + e.Message);
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError, "process reply message fail: " + e.Message);
+        }
+
+        try
+        {
+            byte[] body = cmd.Body ?? Array.Empty<byte>();
+            // sysFlag 里带压缩标志时要先解压：326 推的是**裸包**，不走消息解码路径
+            // （对齐 Java 同处的 Compressor 分支）。
+            int sysFlag = header.SysFlag ?? 0;
+            if (MessageSysFlag.IsCompressed(sysFlag))
+            {
+                body = CompressorFactory.Decompress(body, MessageSysFlag.GetCompressionType(sysFlag));
+            }
+
+            var msg = new MessageExt
+            {
+                Topic = header.Topic ?? string.Empty,
+                Body = body,
+                QueueId = header.QueueId ?? 0,
+                StoreTimestamp = header.StoreTimestamp ?? 0,
+                Flag = header.Flag ?? 0,
+                BornTimestamp = header.BornTimestamp ?? 0,
+                ReconsumeTimes = header.ReconsumeTimes ?? 0,
+            };
+            if (!string.IsNullOrEmpty(header.BornHost))
+            {
+                msg.BornHost = header.BornHost;
+            }
+
+            if (!string.IsNullOrEmpty(header.StoreHost))
+            {
+                msg.StoreHost = header.StoreHost;
+            }
+
+            PropertyMap props = MessageDecoder.StringToMessageProperties(header.Properties ?? string.Empty);
+            foreach (var kv in props)
+            {
+                msg.Properties[kv.Key] = kv.Value;
+            }
+
+            // 应答到达时间（Java 同处写入 REPLY_MESSAGE_ARRIVE_TIME）。
+            msg.PutProperty(MessageConst.PropertyReplyMessageArriveTime,
+                UtilAll.CurrentTimeMillis().ToString(CultureInfo.InvariantCulture));
+
+            string correlationId = msg.GetProperty(MessageConst.PropertyCorrelationId);
+            if (RequestFutureHolder.Instance.PutResponse(correlationId, msg) is null)
+            {
+                // 查不到是正常情况（请求已超时 / 应答重复），Java 此处也是 warn
+                ClientLog.Warn("receive reply message, but not matched any request, CorrelationId: "
+                    + correlationId + ", reply from host: " + (header.BornHost ?? addr));
+            }
+
+            return RemotingCommand.CreateResponseCommand(ResponseCode.Success, null);
+        }
+        catch (Exception e)
+        {
+            // 解析失败绝不能让读线程崩：回 SYSTEM_ERROR（broker 侧记 warn 但不丢连接）。
+            ClientLog.Warn("unknown err when receiveReplyMsg: " + e.Message);
+            return RemotingCommand.CreateResponseCommand(
+                ResponseCode.SystemError, "process reply message fail: " + e.Message);
+        }
+    }
+
+    // ---------------- 消息拉取 ----------------
+
+    public PullResult PullMessage(string consumerGroup, MessageQueue mq,
+        long queueOffset, int maxMsgNums, int sysFlag,
+        long commitOffset, string subscription,
+        long subVersion, string expressionType,
+        int timeoutMillis = 30000, int maxMsgBytes = -1,
+        int suspendTimeoutMillis = 15000,
+        string? addrIn = null,
+        int requestSource = 0,
+        long? brokerId = null)
+    {
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            if (brokerId is null)
+            {
+                addr = BrokerAddr(mq);
+            }
+            else
+            {
+                // 对应 Java pullKernelImpl:197-205 的
+                // findBrokerAddressInSubscribe(brokerName, recalculatePullFromWhichNode(mq), false)：
+                // 按 brokerId 选主/从，而不是 findBrokerAddrInRoute 的「有 master 就用 master」。
+                TopicRouteData? route = GetTopicRouteData(mq.Topic)
+                    ?? throw new MQClientNoRouteException(mq.Topic);
+                BrokerData? brokerData = null;
+                foreach (BrokerData bd in route.BrokerDatas)
+                {
+                    if (bd.BrokerName == mq.BrokerName)
+                    {
+                        brokerData = bd;
+                        break;
+                    }
+                }
+
+                if (brokerData is null)
+                {
+                    throw new MQClientException("Broker " + mq.BrokerName + " not exist");
+                }
+
+                (addr, bool isSlave) = FindBrokerAddressInSubscribe(
+                    brokerData.BrokerAddrs, brokerId.Value);
+                if (addr.Length == 0)
+                {
+                    throw new MQClientException("Broker " + mq.BrokerName + " not exist");
+                }
+
+                if (isSlave)
+                {
+                    // Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位
+                    sysFlag = PullSysFlag.ClearCommitOffsetFlag(sysFlag);
+                }
+            }
+        }
+
+        var header = new PullMessageRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = mq.Topic,
+            QueueId = mq.QueueId,
+            QueueOffset = queueOffset,
+            MaxMsgNums = maxMsgNums,
+            SysFlag = sysFlag,
+            CommitOffset = commitOffset,
+            SuspendTimeoutMillis = suspendTimeoutMillis,
+            // Java `pullKernelImpl` 写的是 subExpression，push 侧未开 postSubscriptionWhenPull
+            // （或类过滤模式）时它是 null，`makeCustomHeaderToNet` 跳过 null 字段 —— 于是
+            // `subscription` 键根本不进 extFields。这里按 SUBSCRIPTION 位还原该形状
+            // （broker 也只在该位置位时才读它）。
+            Subscription = PullSysFlag.HasSubscriptionFlag(sysFlag) ? subscription : null,
+            SubVersion = subVersion,
+            ExpressionType = expressionType,
+            MaxMsgBytes = maxMsgBytes,
+            RequestSource = requestSource,
+        };
+
+        // Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
+        // LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
+        // 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）。
+        int requestCode = PullSysFlag.HasLitePullFlag(sysFlag)
+            ? RequestCode.LitePullMessage
+            : RequestCode.PullMessage;
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(requestCode, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+
+        PullStatus status;
+        switch (response.Code)
+        {
+            case ResponseCode.Success:
+                status = PullStatus.Found;
+                break;
+            case ResponseCode.PullNotFound:
+                status = PullStatus.NoNewMsg;
+                break;
+            case ResponseCode.PullOffsetMoved:
+                status = PullStatus.OffsetIllegal;
+                break;
+            case ResponseCode.PullRetryImmediately:
+                status = PullStatus.NoMatchedMsg;
+                break;
+            default:
+                throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        var respHeader = new PullMessageResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+
+        var result = new PullResult
+        {
+            Status = status,
+            NextBeginOffset = respHeader.NextBeginOffset ?? 0,
+            MinOffset = respHeader.MinOffset ?? 0,
+            MaxOffset = respHeader.MaxOffset ?? 0,
+            // 透传给调用方，由它回写 pullFromWhichNodeTable（processPullResult:77）
+            SuggestWhichBrokerId = respHeader.SuggestWhichBrokerId,
+        };
+        if (response.Body.Length > 0)
+        {
+            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body);
+            foreach (MessageExt m in result.MsgFoundList)
+            {
+                m.BrokerName = mq.BrokerName;
+                m.QueueId = mq.QueueId;
+            }
+        }
+
+        return result;
+    }
+
+    // ---------------- POP（5.x 轻量消费） ----------------
+
+    /// <summary>
+    /// 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME（逐条对齐 Java
+    /// MQClientAPIImpl.processPopResponse:1150-1230）。
+    ///
+    /// ⚠ 这是 POP 最容易踩的坑：**普通 topic 直连 POP 时 broker 不在消息上写 POP_CK**
+    /// （只有 retry topic 的重编码路径才写），而 ACK 必须要这个串，所以只能由客户端用
+    /// 响应头的 startOffsetInfo / msgOffsetInfo 反构出来。
+    ///
+    /// 公开为 static 是为了单测能直接覆盖这段纯逻辑（不联网）。
+    /// </summary>
+    public static void StampPopCk(List<MessageExt> msgs, string brokerName,
+        PopMessageResponseHeader respHeader)
+    {
+        long popTime = respHeader.PopTime ?? 0;
+        long invisibleTime = respHeader.InvisibleTime ?? 0;
+        int reviveQid = respHeader.ReviveQid ?? 0;
+        string startOffsetInfo = respHeader.StartOffsetInfo ?? string.Empty;
+        string msgOffsetInfo = respHeader.MsgOffsetInfo ?? string.Empty;
+
+        if (startOffsetInfo.Length == 0)
+        {
+            // Java 的 startOffsetInfo == null 分支：用消息自身 queueOffset 当 ckQueueOffset
+            // 建 7 段，再手工补一段凑成 8 段。按 topic+queueId 缓存，同队列共用同一基准。
+            var perQueue = new Dictionary<string, string>();
+            foreach (MessageExt m in msgs)
+            {
+                string key = m.Topic + m.QueueId.ToString(CultureInfo.InvariantCulture);
+                if (!perQueue.TryGetValue(key, out string? built))
+                {
+                    built = ExtraInfoUtil.BuildExtraInfo(m.QueueOffset, popTime, invisibleTime,
+                        reviveQid, m.Topic, brokerName, m.QueueId);
+                    perQueue[key] = built;
+                }
+
+                m.Properties[MessageConst.PropertyPopCk] = built + ExtraInfoUtil.KeySeparator
+                    + m.QueueOffset.ToString(CultureInfo.InvariantCulture);
+            }
+        }
+        else
+        {
+            Dictionary<string, long>? startMap = ExtraInfoUtil.ParseStartOffsetInfo(startOffsetInfo);
+            Dictionary<string, List<long>>? msgMap = ExtraInfoUtil.ParseMsgOffsetInfo(msgOffsetInfo);
+
+            // Java 先按队列收集 queueOffset 并**排序**，再用 indexOf 求下标，
+            // 用这个下标去 msgOffsetInfo 里取该条消息真正对应的 msgQueueOffset。
+            var sortedOffsets = new Dictionary<string, List<long>>();
+            foreach (MessageExt m in msgs)
+            {
+                string sortKey = ExtraInfoUtil.GetStartOffsetInfoMapKey(
+                    m.Topic, m.Properties.TryGetValue(MessageConst.PropertyPopCk, out string? ck) ? ck : null,
+                    m.QueueId);
+                if (!sortedOffsets.TryGetValue(sortKey, out List<long>? list))
+                {
+                    list = new List<long>();
+                    sortedOffsets[sortKey] = list;
+                }
+
+                list.Add(m.QueueOffset);
+            }
+
+            foreach (List<long> list in sortedOffsets.Values)
+            {
+                list.Sort();
+            }
+
+            foreach (MessageExt m in msgs)
+            {
+                // retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+                if (m.Properties.ContainsKey(MessageConst.PropertyPopCk))
+                {
+                    continue;
+                }
+
+                if (startMap is null || msgMap is null)
+                {
+                    continue;
+                }
+
+                // 注意：查 startOffsetInfo/msgOffsetInfo 用的是**只看 topic** 的 key
+                // （Java :1200 的两参重载），与上面 sortMap 用的 POP_CK 感知 key 不同；
+                // 能走到这里说明 POP_CK 为空，两者恰好等价。
+                string key = ExtraInfoUtil.GetStartOffsetInfoMapKey(m.Topic, m.QueueId);
+                if (!startMap.TryGetValue(key, out long startOffset)
+                    || !msgMap.TryGetValue(key, out List<long>? offsets)
+                    || !sortedOffsets.TryGetValue(key, out List<long>? ordered))
+                {
+                    continue;
+                }
+
+                // ⚠ 下标是在**本批该队列的 queueOffset 排序表**里找，不是直接在
+                // msgOffsetInfo 列表里找 —— 后者是 broker 侧写入的 offset，可能与本条消息
+                // 自身的 queueOffset 不等（Java 正是用 sortMap.indexOf 再取值）。
+                int index = ordered.IndexOf(m.QueueOffset);
+                if (index < 0 || index >= offsets.Count)
+                {
+                    continue;
+                }
+
+                m.Properties[MessageConst.PropertyPopCk] = ExtraInfoUtil.BuildExtraInfo(
+                    startOffset, popTime, invisibleTime, reviveQid, m.Topic, brokerName,
+                    m.QueueId, offsets[index]);
+            }
+        }
+
+        // Java 用 computeIfAbsent：只在缺失时补。
+        foreach (MessageExt m in msgs)
+        {
+            if (!m.Properties.ContainsKey(MessageConst.PropertyFirstPopTime))
+            {
+                m.Properties[MessageConst.PropertyFirstPopTime] =
+                    popTime.ToString(CultureInfo.InvariantCulture);
+            }
+        }
+    }
+
+    /// <summary>
+    /// POP_MESSAGE（200050）：从 broker 直接弹出消息，**不提交位点** —— 消费成功后必须
+    /// 显式 ACK，否则 invisibleTime 到期后 broker 会把消息复活重投到
+    /// %RETRY%&lt;group&gt;_&lt;topic&gt;（至少一次语义）。
+    ///
+    /// queueId = -1 表示弹该 topic 的所有队列。
+    /// initMode：0=MIN（从最小位点开始，消费历史），1=MAX（只取新消息）。
+    /// </summary>
+    public PopResult PopMessage(string consumerGroup, string topic, int queueId,
+        int maxMsgNums, long invisibleTime, long pollTime, int initMode,
+        string expression = "*", string expressionType = "TAG", bool order = false,
+        int timeoutMillis = 10000, string? brokerNameIn = null, string? addrIn = null)
+    {
+        string brokerName = brokerNameIn ?? string.Empty;
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            // Java PullAPIWrapper#popAsync:369-373：POP 的地址解析是
+            // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— **只认主**，
+            // 查不到按 topic 刷一次路由再查，仍查不到抛「The broker[X] not exist」。
+            // 不能退到从节点：从节点不接 POP 这族写请求（ack / 延长不可见时间都要落在
+            // broker 侧的 revive 表上），退过去只会换一个可重试的 SYSTEM_BUSY(2)。
+            // 只有调用方连 brokerName 都没给（admin 式的「弹该 topic 的任意队列」）时，
+            // 才先按路由挑一台，挑完照样只认它的 master。
+            if (brokerName.Length == 0)
+            {
+                TopicRouteData? route = GetTopicRouteData(topic);
+                if (route is null || route.BrokerDatas.Count == 0)
+                {
+                    throw new MQClientNoRouteException(topic);
+                }
+
+                brokerName = route.BrokerDatas[0].BrokerName;
+            }
+
+            addr = PublishAddrFor(brokerName, topic);
+        }
+
+        var header = new PopMessageRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = topic,
+            QueueId = queueId,
+            MaxMsgNums = maxMsgNums,
+            InvisibleTime = invisibleTime,
+            PollTime = pollTime,
+
+            // ⚠ 必须填当前毫秒时间戳：broker 校验 now - bornTime - pollTime > 500 会直接回
+            // POLLING_TIMEOUT(210)（PopMessageRequestHeader.isTimeoutTooMuch），
+            // 填 0 等于必定超时。
+            BornTime = UtilAll.CurrentTimeMillis(),
+            InitMode = initMode,
+            Exp = expression,
+            ExpType = expressionType,
+            Order = order,
+        };
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.PopMessage, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+
+        PopStatus status;
+        switch (response.Code)
+        {
+            case ResponseCode.Success:
+                status = PopStatus.Found;
+                break;
+            case ResponseCode.PollingFull:
+                status = PopStatus.PollingFull;
+                break;
+            case ResponseCode.PollingTimeout:
+                status = PopStatus.PollingNotFound;
+                break;
+            case ResponseCode.PullNotFound:
+                status = PopStatus.PollingNotFound;
+                break;
+            default:
+                throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        var respHeader = new PopMessageResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+
+        var result = new PopResult
+        {
+            Status = status,
+            RestNum = respHeader.RestNum ?? 0,
+            PopTime = respHeader.PopTime ?? 0,
+            InvisibleTime = respHeader.InvisibleTime ?? 0,
+            ReviveQid = respHeader.ReviveQid ?? 0,
+            StartOffsetInfo = respHeader.StartOffsetInfo ?? string.Empty,
+            MsgOffsetInfo = respHeader.MsgOffsetInfo ?? string.Empty,
+            OrderCountInfo = respHeader.OrderCountInfo ?? string.Empty,
+        };
+
+        if (result.Status == PopStatus.Found && response.Body.Length > 0)
+        {
+            result.MsgFoundList = MessageDecoder.DecodeMessages(response.Body);
+            StampPopCk(result.MsgFoundList, brokerName, respHeader);
+        }
+
+        // Java processPopResponse 收尾：统一盖 brokerName，并把 topic 还原成请求的 topic
+        // （broker 可能把 retry topic 改写回原 topic）。
+        foreach (MessageExt m in result.MsgFoundList)
+        {
+            m.BrokerName = brokerName;
+            m.Topic = topic;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// ACK_MESSAGE（200051）：确认一条 POP 消息已消费完。
+    ///
+    /// ⚠ offset 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
+    /// 不是 commitlog offset。返回 broker 的响应码，SUCCESS 即成功。
+    /// </summary>
+    public int AckMessage(string consumerGroup, string topic, int queueId,
+        string extraInfo, long offset, int timeoutMillis = 3000,
+        string? brokerNameIn = null, string? addrIn = null)
+    {
+        string brokerName = brokerNameIn ?? string.Empty;
+        if (brokerName.Length == 0 && extraInfo.Length > 0)
+        {
+            // 与 Java 一致：从 CK 串第 6 段取 brokerName（ACK 靠它定位 broker）
+            brokerName = ExtraInfoUtil.GetBrokerName(ExtraInfoUtil.Split(extraInfo));
+        }
+
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            // Java ackAsync:820-825 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
+            // **只要主**，查不到刷一次路由重查，仍查不到抛「The broker[X] not exist」。
+            // 从节点不接 ACK_MESSAGE，所以这里不能退到从节点地址（PublishAddrFor 即该形状）。
+            addr = PublishAddrFor(brokerName, topic);
+        }
+
+        var header = new AckMessageRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = topic,
+            QueueId = queueId,
+            ExtraInfo = extraInfo,
+            Offset = offset,
+        };
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.AckMessage, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        return response.Code;
+    }
+
+    /// <summary>
+    /// CHANGE_MESSAGE_INVISIBLETIME（200053，注意不是 200052 —— 那是 PEEK）：
+    /// 延长一条 POP 消息的不可见时间。
+    ///
+    /// 响应给的是**新的** popTime/invisibleTime/reviveQid；成功时用它们 + 请求里的 offset
+    /// 重建一个 8 段 extraInfo（结果里的 ExtraInfo），**后续 ACK 必须用新串**。
+    /// </summary>
+    public ChangeInvisibleTimeResult ChangeInvisibleTime(string consumerGroup, string topic,
+        int queueId, string extraInfo, long offset, long invisibleTime,
+        int timeoutMillis = 3000, string? brokerNameIn = null, string? addrIn = null)
+    {
+        string brokerName = brokerNameIn ?? string.Empty;
+        if (brokerName.Length == 0 && extraInfo.Length > 0)
+        {
+            brokerName = ExtraInfoUtil.GetBrokerName(ExtraInfoUtil.Split(extraInfo));
+        }
+
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            // Java changePopInvisibleTimeAsync:869-876 同样是
+            // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) + 刷一次路由重查。
+            addr = PublishAddrFor(brokerName, topic);
+        }
+
+        var header = new ChangeInvisibleTimeRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = topic,
+            QueueId = queueId,
+            ExtraInfo = extraInfo,
+            Offset = offset,
+            InvisibleTime = invisibleTime,
+        };
+
+        RemotingCommand request =
+            RemotingCommand.CreateRequestCommand(RequestCode.ChangeMessageInvisibletime, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+
+        var respHeader = new ChangeInvisibleTimeResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+
+        var result = new ChangeInvisibleTimeResult
+        {
+            Code = response.Code,
+            PopTime = respHeader.PopTime ?? 0,
+            InvisibleTime = respHeader.InvisibleTime ?? 0,
+            ReviveQid = respHeader.ReviveQid ?? 0,
+        };
+
+        if (response.Code == ResponseCode.Success)
+        {
+            // 与 Java MQClientAPIImpl.changeInvisibleTimeAsync 一致：用**响应里的**新值重建。
+            result.ExtraInfo = ExtraInfoUtil.BuildExtraInfo(offset, result.PopTime,
+                result.InvisibleTime, result.ReviveQid, topic, brokerName, queueId, offset);
+        }
+
+        return result;
+    }
+
+    // ---------------- 消费位点 ----------------
+
+    /// <summary>
+    /// Java <c>RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241</c> 的地址口径：
+    /// 先**只认主**（<c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c>）→ 查不到
+    /// 按 topic 刷一次路由 → 重查时**放宽**（<c>onlyThisBroker=false</c>，可以落到从节点：
+    /// 位点是 HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛
+    /// <c>"The broker[X] not exist"</c>。
+    ///
+    /// 与管理侧 offset 查询（<see cref="PublishAddrInAdmin"/>）的差别只在最后那一步：
+    /// 管理 API 一律打主、主没了就报错；位点读取允许退到从节点。
+    /// </summary>
+    private string ConsumerOffsetAddrFor(MessageQueue mq)
+    {
+        string addr = FindBrokerAddressInPublish(mq.BrokerName);
+        if (addr.Length == 0)
+        {
+            UpdateTopicRouteInfoFromNameServer(mq.Topic);
+            addr = BrokerAddrOf(mq.BrokerName);
+        }
+
+        if (addr.Length == 0)
+        {
+            throw new MQClientException("The broker[" + mq.BrokerName + "] not exist", -1);
+        }
+
+        return addr;
+    }
+
+    /// <summary>返回 false 表示 broker 回 QUERY_NOT_FOUND（消费组尚无位点）。</summary>
+    /// <remarks>
+    /// setZeroIfNotFound 默认 false：Java 的 fetchConsumeOffsetFromBroker 从不设置该字段，
+    /// 新消费组因此拿到 QUERY_NOT_FOUND 而非 0，调用方才会按 ConsumeFromWhere 计算起点。
+    /// 默认 true 会把首次启动的消费者钉在队首重放历史消息，并让 LastOffset / Timestamp 形同虚设。
+    /// </remarks>
+    public bool QueryConsumerOffset(string consumerGroup, MessageQueue mq,
+        out long outOffset, int timeoutMillis = 5000,
+        string? addrIn = null,
+        bool setZeroIfNotFound = false)
+    {
+        outOffset = 0;
+        string addr = addrIn is { Length: > 0 } ? addrIn : ConsumerOffsetAddrFor(mq);
+        var header = new QueryConsumerOffsetRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = mq.Topic,
+            QueueId = mq.QueueId,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.QueryConsumerOffset, header);
+        // setZeroIfNotFound 在 Java 里是 header 字段；
+        // QueryConsumerOffsetRequestHeader 无该字段时，Java 会把未找到当错误；这里按需附加
+        if (setZeroIfNotFound)
+        {
+            request.ExtFields["setZeroIfNotFound"] = "true";
+        }
+
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        if (response.Code == ResponseCode.QueryNotFound)
+        {
+            return false;
+        }
+
+        CheckResponseCode(response);
+        var respHeader = new QueryConsumerOffsetResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        outOffset = respHeader.Offset ?? 0;
+        return true;
+    }
+
+    public void UpdateConsumerOffset(string consumerGroup, MessageQueue mq,
+        long commitOffset, int timeoutMillis = 5000,
+        string? addrIn = null)
+    {
+        string addr = addrIn is { Length: > 0 } ? addrIn : BrokerAddr(mq);
+        var header = new UpdateConsumerOffsetRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+            Topic = mq.Topic,
+            QueueId = mq.QueueId,
+            CommitOffset = commitOffset,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UpdateConsumerOffset, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+    }
+
+    // ---------------- 队列锁（顺序消费，Java MQClientAPIImpl.lockBatchMQ / unlockBatchMQ）----------------
+
+    private static JsonValue BuildMqSetJson(IEnumerable<MessageQueue> mqs)
+    {
+        var arr = JsonValue.MakeArray();
+        foreach (MessageQueue mq in mqs)
+        {
+            var o = JsonValue.MakeObject();
+            o.Set("topic", JsonValue.MakeString(mq.Topic));
+            o.Set("brokerName", JsonValue.MakeString(mq.BrokerName));
+            o.Set("queueId", JsonValue.MakeInt(mq.QueueId));
+            arr.PushArray(o);
+        }
+
+        return arr;
+    }
+
+    /// <summary>批量锁队列；返回 broker 确认锁定成功的队列集（lockOKMQSet）。</summary>
+    public List<MessageQueue> LockBatchMq(string consumerGroup, string clientId,
+        IReadOnlyList<MessageQueue> mqs, int timeoutMillis = 5000)
+    {
+        var lockOk = new List<MessageQueue>();
+        // 按 broker 分组（Java 按 brokerName 逐个发请求）
+        var byBroker = new Dictionary<string, List<MessageQueue>>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in mqs)
+        {
+            if (!byBroker.TryGetValue(mq.BrokerName, out List<MessageQueue>? list))
+            {
+                list = new List<MessageQueue>();
+                byBroker[mq.BrokerName] = list;
+            }
+
+            list.Add(mq);
+        }
+
+        foreach (KeyValuePair<string, List<MessageQueue>> kv in byBroker)
+        {
+            // Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(brokerName,
+            // MASTER_ID, true) —— 只认主、**不刷路由**，拿不到就整台跳过（队列这一轮锁不上，
+            // 等下一次重投）。退到从节点上锁等于锁在 broker 侧的锁管理器里，master 不知情，
+            // 顺序消费的互斥保证静默失效。
+            string addr = FindBrokerAddressInPublish(kv.Key);
+            if (addr.Length == 0)
+            {
+                continue;
+            }
+
+            var body = JsonValue.MakeObject();
+            body.Set("consumerGroup", JsonValue.MakeString(consumerGroup));
+            body.Set("clientId", JsonValue.MakeString(clientId));
+            body.Set("mqSet", BuildMqSetJson(kv.Value));
+            byte[] payload = Encoding.UTF8.GetBytes(body.Dump());
+            RemotingCommand response = InvokeSyncRaw(addr, RequestCode.LockBatchMq,
+                null, payload, true, timeoutMillis);
+            CheckResponseCode(response);
+            // LockBatchResponseBody：{"lockOKMQSet":[{topic,brokerName,queueId}]}
+            string text = Encoding.UTF8.GetString(response.Body ?? Array.Empty<byte>());
+            if (!Json.TryParse(text, out JsonValue root, out string? error) || root is null)
+            {
+                ClientLog.Warn("lockBatchMq: parse response failed: " + (error ?? "unknown"));
+                continue;
+            }
+
+            JsonValue okSet = root.Get("lockOKMQSet");
+            if (!okSet.IsArray)
+            {
+                continue;
+            }
+
+            for (int i = 0; i < okSet.Size(); ++i)
+            {
+                JsonValue o = okSet.At(i);
+                lockOk.Add(new MessageQueue(
+                    o.Get("topic").StringValue(),
+                    o.Get("brokerName").StringValue(),
+                    (int)o.Get("queueId").IntValue()));
+            }
+        }
+
+        return lockOk;
+    }
+
+    /// <summary>批量解锁队列（顺序消费清退时调用）。</summary>
+    public void UnlockBatchMq(string consumerGroup, string clientId,
+        IReadOnlyList<MessageQueue> mqs, int timeoutMillis = 5000)
+    {
+        var byBroker = new Dictionary<string, List<MessageQueue>>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in mqs)
+        {
+            if (!byBroker.TryGetValue(mq.BrokerName, out List<MessageQueue>? list))
+            {
+                list = new List<MessageQueue>();
+                byBroker[mq.BrokerName] = list;
+            }
+
+            list.Add(mq);
+        }
+
+        foreach (KeyValuePair<string, List<MessageQueue>> kv in byBroker)
+        {
+            // 同 LockBatchMq：Java RebalanceImpl#unlock:74 / unlockAll:104 只认主、不刷路由。
+            string addr = FindBrokerAddressInPublish(kv.Key);
+            if (addr.Length == 0)
+            {
+                continue;
+            }
+
+            var body = JsonValue.MakeObject();
+            body.Set("consumerGroup", JsonValue.MakeString(consumerGroup));
+            body.Set("clientId", JsonValue.MakeString(clientId));
+            body.Set("mqSet", BuildMqSetJson(kv.Value));
+            byte[] payload = Encoding.UTF8.GetBytes(body.Dump());
+            RemotingCommand response = InvokeSyncRaw(addr, RequestCode.UnlockBatchMq,
+                null, payload, true, timeoutMillis);
+            CheckResponseCode(response);
+        }
+    }
+
+    public long GetMaxOffset(MessageQueue mq, int timeoutMillis = 5000, string? addrIn = null)
+    {
+        // Java MQAdminImpl:214 的 maxOffset：findBrokerAddressInPublish（只认 master）→
+        // 刷一次路由 → 重查 → 抛 "The broker[X] not exist"。见 PublishAddrInAdmin。
+        string addr = addrIn is { Length: > 0 } ? addrIn : PublishAddrInAdmin(mq);
+        var header = new GetMaxOffsetRequestHeader
+        {
+            Topic = mq.Topic,
+            QueueId = mq.QueueId,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetMaxOffset, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+        var respHeader = new GetMaxOffsetResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        return respHeader.Offset ?? 0;
+    }
+
+    public long GetMinOffset(MessageQueue mq, int timeoutMillis = 5000, string? addrIn = null)
+    {
+        // 同 GetMaxOffset：Java 的管理类 offset 查询只认主（MQAdminImpl:232）。
+        string addr = addrIn is { Length: > 0 } ? addrIn : PublishAddrInAdmin(mq);
+        var header = new GetMinOffsetRequestHeader
+        {
+            Topic = mq.Topic,
+            QueueId = mq.QueueId,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetMinOffset, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+        var respHeader = new GetMinOffsetResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        return respHeader.Offset ?? 0;
+    }
+
+    /// <summary>
+    /// 对应 Java MQClientAPIImpl#searchOffset(addr, mq, ts, timeout):1377 —— 它只是把
+    /// BoundaryType.LOWER 转给带边界类型的重载（:1381）。
+    /// </summary>
+    public long SearchOffsetByTimestamp(MessageQueue mq, long timestamp,
+        int timeoutMillis = 5000, string? addrIn = null) =>
+        SearchOffsetByBoundary(mq, timestamp, BoundaryType.Lower, timeoutMillis, addrIn);
+
+    /// <summary>
+    /// 带边界类型的重载（Java MQClientAPIImpl#searchOffset(addr, mq, ts, boundaryType, timeout):1384）。
+    /// boundaryType 为 null 时不写 boundaryType 字段，对应 Java 那个已废弃的 5 参重载
+    /// （只 set topic/queueId/timestamp，"边界"由 broker 的默认值兜底）。
+    /// </summary>
+    public long SearchOffsetByBoundary(MessageQueue mq, long timestamp, BoundaryType? boundaryType,
+        int timeoutMillis = 5000, string? addrIn = null)
+    {
+        // 同 GetMaxOffset：Java 的管理类 offset 查询只认主（MQAdminImpl:195）。
+        string addr = addrIn is { Length: > 0 } ? addrIn : PublishAddrInAdmin(mq);
+        var header = new SearchOffsetRequestHeader
+        {
+            Topic = mq.Topic,
+            QueueId = mq.QueueId,
+            Timestamp = timestamp,
+            BoundaryType = boundaryType,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.SearchOffsetByTimestamp, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+        var respHeader = new SearchOffsetResponseHeader();
+        respHeader.FromExtFields(response.ExtFields);
+        return respHeader.Offset ?? 0;
+    }
+
+    // ---------------- 心跳 / 注销 ----------------
+
+    public void SendHeartbeat(string addr, HeartbeatData heartbeatData, int timeoutMillis = 5000)
+    {
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.HeartBeat, null);
+        request.Body = heartbeatData.Encode();
+        request.HasBody = true;
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+    }
+
+    public void UnregisterClient(string addr, string clientId,
+        string producerGroup, string consumerGroup,
+        int timeoutMillis = MqClientApiTimeoutMillis)
+    {
+        var header = new UnregisterClientRequestHeader
+        {
+            ClientId = clientId,
+            // 空着的那个槽位 Java 传的是 null（字段根本不上线），broker ClientManageProcessor:228/237
+            // 判的是 `group != null`，空串会被当成「真有个空组名」去查 "" 的订阅组配置。
+            ProducerGroup = string.IsNullOrWhiteSpace(producerGroup) ? null : producerGroup,
+            ConsumerGroup = string.IsNullOrWhiteSpace(consumerGroup) ? null : consumerGroup,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UnregisterClient, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+    }
+
+    // ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
+
+    /// <summary>
+    /// Java <c>ClientConfig#mqClientApiTimeout</c> 的默认值（<c>ClientConfig.java:81</c> =
+    /// 3 * 1000）：管理类短 RPC 走的就是它，与发送/拉取的超时预算无关。
+    /// </summary>
+    public const int MqClientApiTimeoutMillis = 3000;
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#findBrokerAddrByTopic:1390</c>：<b>只读缓存</b>路由，
+    /// 随机挑其中一个 broker（优先 master 地址）；没有缓存返回 null，由调用方决定跳过（不抛）。
+    /// 与 <see cref="GetTopicRouteData"/> 的分工照抄 Java：后者缓存空了会补拉一次路由。
+    /// </summary>
+    public string? FindBrokerAddrByTopic(string topic)
+    {
+        TopicRouteData? route;
+        lock (_routeLock)
+        {
+            _topicRouteTable.TryGetValue(topic, out route);
+        }
+
+        if (route == null)
+        {
+            return null;
+        }
+
+        List<BrokerData> brokers = route.BrokerDatas;
+        if (brokers.Count == 0)
+        {
+            return null;
+        }
+
+        return brokers[ThreadLocalRandom.Next(brokers.Count)].SelectBrokerAddr();
+    }
+
+    /// <summary>
+    /// 一笔 CHECK_CLIENT_CONFIG(46)（Java <c>MQClientAPIImpl#checkClientInBroker:3256</c>）。
+    ///
+    /// 请求头是 null、body 是 <see cref="CheckClientRequestBody"/> 的 JSON；broker 非 SUCCESS
+    /// 时用<b>响应码</b>抛 MQClientException（SUBSCRIPTION_PARSE_FAILED=23、未开
+    /// enablePropertyFilter 的 SYSTEM_ERROR=1 都走这里），调用方才分得出是哪种拒绝。
+    /// Java 的 brokerVIPChannel(vipChannelEnabled=false) 是恒等变换，本端口不实现。
+    /// </summary>
+    public void CheckClientConfig(string brokerAddr, string consumerGroup, string clientId,
+        SubscriptionData subscriptionData, int timeoutMillis = MqClientApiTimeoutMillis)
+    {
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.CheckClientConfig, null);
+        var body = new CheckClientRequestBody
+        {
+            ClientId = clientId,
+            Group = consumerGroup,
+            SubscriptionData = subscriptionData,
+        };
+        request.Body = body.Encode();
+        request.HasBody = true;
+        RemotingCommand response = InvokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQClientException(response.Remark, response.Code);
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java <c>MQClientInstance#checkClientInBroker:534</c> 的内层循环：只把<b>非 TAG</b>
+    /// （SQL92 / CLASS_FILTER）的订阅表达式发给 broker 校验，查不到路由的订阅跳过。
+    ///
+    /// 为什么必须发：SQL92 表达式写错时 broker 的 ExpressionMessageFilter 在 ConsumeQueue
+    /// 阶段拿不到编译好的过滤数据会<b>直接放行全部消息</b>（返回 true），静默变成「订阅全部
+    /// 消息」、启动也不报错；这一调用把「写错的表达式」变成启动期一次显式失败。
+    ///
+    /// 本端口的 MQClientInstance 没有 Java 的 consumerTable（消费者各自持有实例），所以由消费者
+    /// 在 Start() 里带着自己那份订阅调用 —— 分支语义与 Java 逐条一致。
+    /// </summary>
+    public void CheckSubscriptionsInBroker(string group, IEnumerable<SubscriptionData> subs)
+    {
+        foreach (SubscriptionData? sub in subs)
+        {
+            // Java ExpressionType.isTagType：null / "" / "TAG" 都算 TAG，一律跳过。
+            if (sub == null || string.IsNullOrEmpty(sub.ExpressionType)
+                || sub.ExpressionType == RocketMQ.Common.ExpressionType.TAG)
+            {
+                continue;
+            }
+
+            string? addr = FindBrokerAddrByTopic(sub.Topic);
+            if (string.IsNullOrEmpty(addr))
+            {
+                continue;
+            }
+
+            try
+            {
+                CheckClientConfig(addr, group, ClientId, sub);
+            }
+            catch (MQClientException)
+            {
+                throw;  // 已带 broker 响应码，原样上抛
+            }
+            catch (Exception e)
+            {
+                // 连不上/超时也当启动失败：Java 抛的是同一段文案的 MQClientException（cause
+                // 挂原异常），由调用方（consumer.Start）收拾。老 broker 不认 46 码时就落在这里。
+                throw new MQClientException(
+                    "Check client in broker error, maybe because you use " + sub.ExpressionType
+                    + " to filter message, but server has not been upgraded to support!This error"
+                    + " would not affect the launch of consumer, but may has impact on message "
+                    + "receiving if you have use the new features which are not supported by "
+                    + "server, please check the log!", e);
+            }
+        }
+    }
+
+    // ---------------- 通用同步调用（管理端复用）----------------
+
+    /// <summary>
+    /// 下发任意 requestCode + extFields + body。languageOverride &gt;= 0 时覆盖请求的
+    /// language 字段：个别 RPC 会按它改变行为（INVOKE_BROKER_TO_RESET_OFFSET 对
+    /// CPP/PYTHON 才返回可解析的 offsetTable 响应体）。
+    ///
+    /// 不做响应码校验，留给调用方自己判断（管理端很多接口的"未找到"
+    /// 是正常分支，例如 QUERY_NOT_FOUND）。
+    /// </summary>
+    public RemotingCommand InvokeSyncRaw(string addr, int code,
+        PropertyMap? extFields = null, byte[]? body = null, bool hasBody = false,
+        int timeoutMillis = 3000, int languageOverride = -1)
+    {
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(code, null);
+        if (extFields is not null)
+        {
+            foreach (var kv in extFields)
+            {
+                request.ExtFields[kv.Key] = kv.Value;
+            }
+        }
+
+        if (hasBody && body is not null)
+        {
+            request.Body = body;
+            request.HasBody = true;
+        }
+
+        if (languageOverride >= 0)
+        {
+            request.Language = unchecked((byte)languageOverride);
+        }
+
+        return _remotingClient.InvokeSync(addr, request, timeoutMillis);
+    }
+
+    /// <summary>invokeSyncRaw + 响应码校验（非 SUCCESS 抛 MQBrokerException）。</summary>
+    public RemotingCommand InvokeSync(string addr, int code,
+        PropertyMap? extFields = null, byte[]? body = null, bool hasBody = false,
+        int timeoutMillis = 3000, int languageOverride = -1)
+    {
+        RemotingCommand response = InvokeSyncRaw(addr, code, extFields, body, hasBody, timeoutMillis, languageOverride);
+        CheckResponseCode(response);
+        return response;
+    }
+
+    // ---------------- 管理类 ----------------
+
+    public void CreateTopicInBroker(string brokerAddr, string defaultTopic,
+        string topic, int readQueueNums = 4,
+        int writeQueueNums = 4, int perm = 6,
+        int topicSysFlag = 0,
+        string? topicFilterType = null,
+        string? attributes = null,
+        bool force = false, int timeoutMillis = 5000,
+        int retryTimes = 5)
+    {
+        var header = new CreateTopicRequestHeader
+        {
+            Topic = topic,
+            DefaultTopic = defaultTopic,
+            ReadQueueNums = readQueueNums,
+            WriteQueueNums = writeQueueNums,
+            Perm = perm,
+            // ⚠ 必须下发 topicFilterType：broker 的 CreateTopicRequestHeader.checkFields()
+            // 会把它转成枚举，为空直接报 "topicFilterType = [null] value invalid"。
+            // attributes 必须是 ""（Java AttributeParser.parseToString(空 map) 的结果）而非 null。
+            // 这两条都是先在 Python 侧被真实 broker 打回、再回填到 C++ 的。
+            TopicFilterType = topicFilterType ?? TopicFilterType.SingleTag,
+            TopicSysFlag = topicSysFlag,
+            Order = false,
+            Attributes = attributes ?? string.Empty,
+            Force = force,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.UpdateAndCreateTopic, header);
+
+        // Java MQAdminImpl.createTopic 对每个 broker 重试 5 次（连接抖动容忍）
+        string lastError = string.Empty;
+        int attempts = retryTimes > 0 ? retryTimes : 1;
+        for (int i = 0; i < attempts; ++i)
+        {
+            try
+            {
+                RemotingCommand response = InvokeSyncOnAddr(brokerAddr, request, timeoutMillis);
+                CheckResponseCode(response);
+                return;
+            }
+            catch (MQBrokerException)
+            {
+                // broker 明确拒绝（如 TOPIC_EXIST_ALREADY）不重试，直接上抛
+                throw;
+            }
+            catch (Exception e)
+            {
+                lastError = e.Message;
+            }
+        }
+
+        throw new MQClientException("create topic [" + topic + "] in broker " + brokerAddr
+            + " failed after " + attempts.ToString(CultureInfo.InvariantCulture)
+            + " attempts: " + lastError);
+    }
+
+    public void CreateTopicInRoute(string topic, int readQueueNums = 4,
+        int writeQueueNums = 4, int perm = 6,
+        int timeoutMillis = 5000)
+    {
+        TopicRouteData? route = GetTopicRouteData(MixAll.DefaultTopic);
+        if (route is null)
+        {
+            throw new MQClientException("No route info of default topic " + MixAll.DefaultTopic);
+        }
+
+        bool createdAtLeastOnce = false;
+        string lastError = string.Empty;
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length == 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                CreateTopicInBroker(addr, MixAll.DefaultTopic, topic, readQueueNums, writeQueueNums,
+                    perm, 0, TopicFilterType.SingleTag, string.Empty, false, timeoutMillis);
+                createdAtLeastOnce = true;
+            }
+            catch (Exception e)
+            {
+                lastError = e.Message;
+            }
+        }
+
+        if (!createdAtLeastOnce)
+        {
+            throw new MQClientException("create new topic failed: " + lastError);
+        }
+    }
+
+    public void DeleteTopicInBroker(string brokerAddr, string topic, int timeoutMillis = 5000)
+    {
+        var ext = new PropertyMap { ["topic"] = topic };
+        InvokeSync(brokerAddr, RequestCode.DeleteTopicInBroker, ext, null, false, timeoutMillis);
+    }
+
+    public void DeleteTopicInNamesrv(string topic, int timeoutMillis = 5000)
+    {
+        var ext = new PropertyMap { ["topic"] = topic };
+        string lastError = string.Empty;
+        foreach (string nsAddr in _nameServerAddrs)
+        {
+            try
+            {
+                InvokeSync(nsAddr, RequestCode.DeleteTopicInNamesrv, ext, null, false, timeoutMillis);
+                return;
+            }
+            catch (Exception e)
+            {
+                lastError = e.Message;
+            }
+        }
+
+        throw new MQClientException("Failed to delete topic " + topic + " in name server: " + lastError);
+    }
+
+    // ---------------- 集群 / Topic / 消费者列表 ----------------
+
+    public ClusterInfo GetBrokerClusterInfo(int timeoutMillis = 10000)
+    {
+        foreach (string nsAddr in _nameServerAddrs)
+        {
+            try
+            {
+                RemotingCommand response = InvokeSyncRaw(
+                    nsAddr, RequestCode.GetBrokerClusterInfo, null, null, false, timeoutMillis);
+                if (response.Code == ResponseCode.Success && response.Body.Length > 0)
+                {
+                    ClusterInfo.Decode(response.Body, out ClusterInfo ci);
+                    return ci;
+                }
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+        }
+
+        throw new MQClientException("Failed to get broker cluster info from name server");
+    }
+
+    public TopicList GetAllTopicListFromNameServer(int timeoutMillis = 10000)
+    {
+        foreach (string nsAddr in _nameServerAddrs)
+        {
+            try
+            {
+                RemotingCommand response = InvokeSyncRaw(
+                    nsAddr, RequestCode.GetAllTopicListFromNameserver, null, null, false, timeoutMillis);
+                if (response.Code == ResponseCode.Success && response.Body.Length > 0)
+                {
+                    TopicList.Decode(response.Body, out TopicList tl);
+                    return tl;
+                }
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+        }
+
+        throw new MQClientException("Failed to get all topic list from name server");
+    }
+
+    public GetConsumerListByGroupResponseBody GetConsumerListByGroup(
+        string consumerGroup, string addr, int timeoutMillis = 5000)
+    {
+        var header = new GetConsumerListByGroupRequestHeader
+        {
+            ConsumerGroup = consumerGroup,
+        };
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetConsumerListByGroup, header);
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        CheckResponseCode(response);
+        GetConsumerListByGroupResponseBody.Decode(response.Body, out GetConsumerListByGroupResponseBody @out);
+        return @out;
+    }
+
+    /// <summary>取 topic 路由里第一个 broker 地址（对应 Java MQClientInstance.findBrokerAddrByTopic）。
+    /// 所有 broker 都持有完整消费者列表，任取一台即可查 GET_CONSUMER_LIST_BY_GROUP。</summary>
+    public string BrokerAddrForTopic(string topic)
+    {
+        TopicRouteData? route = GetTopicRouteData(topic);
+        if (route is null)
+        {
+            return string.Empty;
+        }
+
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length > 0)
+            {
+                return addr;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// 查询消费组内所有 clientId（对应 Java MQClientInstance.findConsumerIdList）。
+    /// 取该 topic 路由里的 broker 发 GET_CONSUMER_LIST_BY_GROUP(38)。查不到（无路由 / 非
+    /// SUCCESS / 异常）返回 null；调用方按 Java 语义「保留当前分配」，不要回退成
+    /// "自己独占全部队列"（那会让多实例互相重复消费）。
+    /// </summary>
+    public List<string>? GetConsumerIdListByGroup(string topic, string consumerGroup, int timeoutMillis = 5000)
+    {
+        string addr = BrokerAddrForTopic(topic);
+        if (addr.Length == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            string brokerName = string.Empty;
+            TopicRouteData? route = GetTopicRouteData(topic);
+            if (route is not null && route.BrokerDatas.Count > 0)
+            {
+                brokerName = route.BrokerDatas[0].BrokerName;
+            }
+
+            var header = new GetConsumerListByGroupRequestHeader
+            {
+                ConsumerGroup = consumerGroup,
+                Bname = brokerName.Length > 0 ? brokerName : null,
+            };
+            RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.GetConsumerListByGroup, header);
+            RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+            if (response.Code != ResponseCode.Success || response.Body.Length == 0)
+            {
+                return null;
+            }
+
+            GetConsumerListByGroupResponseBody.Decode(response.Body, out GetConsumerListByGroupResponseBody body);
+            return body.ConsumerIdList;
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("get consumer id list failed, " + addr + " " + consumerGroup + ": " + e.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 向所有已知 broker（<b>主 + 从</b>，见 <see cref="GetAllBrokerAddrs"/>）注销本 clientId
+    /// （对应 Java MQClientInstance.unregisterClient:1158-1182）。
+    /// 对齐 Java 生产者/消费者 shutdown：逐台 broker 发 UNREGISTER_CLIENT(35)，
+    /// 超时用 Java 的 <see cref="MqClientApiTimeoutMillis"/>（:1170 传的正是它）。
+    /// 不发的话 broker 端 Consumer/ProducerManager 只能等心跳超时（默认 ~120s）清理。
+    /// 单台失败只记 debug —— shutdown 路径不应因网络抖动抛异常。
+    /// </summary>
+    public void UnregisterClientAllBrokers(string clientId, string producerGroup, string consumerGroup,
+        int timeoutMillis = MqClientApiTimeoutMillis)
+    {
+        foreach (string addr in GetAllBrokerAddrs())
+        {
+            try
+            {
+                UnregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("unregister_client failed, addr=" + addr + ": " + e.Message);
+            }
+        }
+    }
+
+    // ---------------- 按 Key / uniqKey 查消息 ----------------
+
+    /// <summary>
+    /// indexType 见 MessageConst.Index*Type；uniqKey 为 true 时额外下发
+    /// MixAll.UniqueMsgQueryFlag，命中后按 msgId == key 二次校验。
+    /// </summary>
+    public bool QueryMessage(string topic, string key, int maxNum,
+        long beginTimestamp, long endTimestamp, out byte[] outBody,
+        int timeoutMillis = 15000, string? addrIn = null,
+        string? indexType = null, bool uniqKey = false)
+    {
+        outBody = Array.Empty<byte>();
+        string addr = addrIn ?? string.Empty;
+        if (addr.Length == 0)
+        {
+            TopicRouteData? route = GetTopicRouteData(topic);
+            if (route is null)
+            {
+                throw new MQClientNoRouteException(topic);
+            }
+
+            if (route.BrokerDatas.Count == 0)
+            {
+                throw new MQClientException("no broker in route of topic " + topic);
+            }
+
+            addr = FindBrokerAddrInRoute(route, route.BrokerDatas[0].BrokerName);
+        }
+
+        var header = new QueryMessageRequestHeader
+        {
+            Topic = topic,
+            Key = key,
+            MaxNum = maxNum,
+            BeginTimestamp = beginTimestamp,
+            EndTimestamp = endTimestamp,
+        };
+        if (indexType is { Length: > 0 })
+        {
+            header.IndexType = indexType;
+        }
+
+        RemotingCommand request = RemotingCommand.CreateRequestCommand(RequestCode.QueryMessage, header);
+        if (uniqKey)
+        {
+            // Java MixAll.UNIQUE_MSG_QUERY_FLAG："_UNIQUE_KEY_QUERY"="true"。
+            // 注意它是 extFields 的**键名**，不是标志位（早期实现写成数字键是错的）。
+            request.ExtFields[MixAll.UniqueMsgQueryFlag] = "true";
+        }
+
+        RemotingCommand response = InvokeSyncOnAddr(addr, request, timeoutMillis);
+        if (response.Code == ResponseCode.QueryNotFound)
+        {
+            return false;
+        }
+
+        CheckResponseCode(response);
+        outBody = response.Body;
+        return true;
+    }
+
+    /// <summary>
+    /// 对应 Java MQAdminImpl.queryMessage：查该 topic 全部 broker 并做客户端侧二次校验。
+    /// </summary>
+    public List<MessageExt> QueryMessageAllBrokers(string topic,
+        string key, int maxNum,
+        long beginTimestamp, long endTimestamp,
+        string? indexType = null,
+        bool uniqKey = false,
+        int timeoutMillis = 15000)
+    {
+        var messages = new List<MessageExt>();
+        TopicRouteData? route = GetTopicRouteData(topic);
+        if (route is null)
+        {
+            return messages;
+        }
+
+        foreach (BrokerData bd in route.BrokerDatas)
+        {
+            string addr = bd.SelectBrokerAddr();
+            if (addr.Length == 0)
+            {
+                continue;
+            }
+
+            byte[] body;
+            try
+            {
+                if (!QueryMessage(topic, key, maxNum, beginTimestamp, endTimestamp, out body,
+                        timeoutMillis, addr, indexType, uniqKey))
+                {
+                    continue;
+                }
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            if (body.Length == 0)
+            {
+                continue;
+            }
+
+            List<MessageExt> decoded = MessageDecoder.DecodeMessages(body, true);
+            foreach (MessageExt m in decoded)
+            {
+                m.BrokerName = bd.BrokerName;
+                if (uniqKey)
+                {
+                    if (m.MsgId == key)
+                    {
+                        messages.Add(m);
+                    }
+                }
+                else
+                {
+                    string keys = m.Keys;
+                    if (keys.Length > 0)
+                    {
+                        // KEYS 以空格（MessageConst.KEY_SEPARATOR）分隔
+                        if (keys.Split(' ', StringSplitOptions.None).Any(piece => piece == key && m.Topic == topic))
+                        {
+                            messages.Add(m);
+                        }
+                    }
+                }
+            }
+        }
+
+        messages.Sort((a, b) => a.QueueOffset.CompareTo(b.QueueOffset));
+        if (maxNum > 0 && messages.Count > maxNum)
+        {
+            messages.RemoveRange(maxNum, messages.Count - maxNum);
+        }
+
+        return messages;
+    }
+
+    // ---------------- 工具 ----------------
+}

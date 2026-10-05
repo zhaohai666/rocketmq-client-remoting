@@ -1,7 +1,7 @@
 //! 拉取前流控（Java `ProcessQueue` 五个阈值）真机验证。
 //!
 //! 与 `python/verify_flow_control_live.py`（S0..S5）、`cpp/examples/live_flow_control.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveFlowControl.cs` 同题、逐条对应。
+//! `csharp/examples/RocketMQ.Examples/LiveFlowControl.cs` 同题、逐条对应。
 //!
 //! 离线单测（`src/client/consumer.rs` 的 `flow_control_hits_each_threshold`）锁的是**判据
 //! 本身**；这里锁真机上两件离线永远锁不住的事：

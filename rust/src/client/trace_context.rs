@@ -1,5 +1,5 @@
 //! W3C Trace Context（traceparent）透传（OpenTracing/OTel 场景的消息级上下文），
-//! 逐条对齐 `python/rocketmq/client/trace_context.py`。
+//! 逐条对齐 `python/client/trace_context.py`。
 //!
 //! 格式（W3C Trace Context，<https://www.w3.org/TR/trace-context/>）：
 //!
@@ -15,7 +15,7 @@
 //!   （调用方传播的上下文优先）；
 //! * 消费侧：从 `MessageExt.properties` 里取出，供业务做父子 span 关联。
 //!
-//! 与本仓库 Python / dotnet 端一致的**有意差异**：Python 用 `secrets.token_hex`
+//! 与本仓库 Python / C# 端一致的**有意差异**：Python 用 `secrets.token_hex`
 //! （CSPRNG），本 crate 不引第三方随机数依赖，改用「纳秒时间 + PID + 进程内自增
 //! 经 splitmix64 打散」——与 [`crate::common::mix_all::MixAll::create_uniq_name`]
 //! 同一口径。对 traceparent 而言要求的只是「唯一且不可预测性足够低的 32/16 hex」，
@@ -65,7 +65,7 @@ pub fn is_valid_traceparent(value: Option<&str>) -> bool {
         return false;
     }
     // ⚠ 大小写敏感：Python 参考实现只拦字面量 "ff"，"FF" 会放过。
-    // 保留该行为（三语言端口一致优先于「顺手修正」），改它会与 Python/dotnet 对不上。
+    // 保留该行为（三语言端口一致优先于「顺手修正」），改它会与 Python/C# 对不上。
     if version == "ff" {
         return false;
     }

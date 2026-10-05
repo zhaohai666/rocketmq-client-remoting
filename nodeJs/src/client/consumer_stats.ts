@@ -1,7 +1,7 @@
 // -*- coding: utf-8 -*-
 // Consumer-side statistics (org.apache.rocketmq.client.stat.ConsumerStatsManager
 // and org.apache.rocketmq.common.stats.{StatsItem, StatsItemSet, StatsSnapshot}).
-// Faithful port of python/rocketmq/client/consumer_stats.py, which was verified
+// Faithful port of python/client/consumer_stats.py, which was verified
 // against the Java 5.5.1 sources line by line.
 //
 // The REAL Java model (NOT "one bucket per minute" as the name suggests):

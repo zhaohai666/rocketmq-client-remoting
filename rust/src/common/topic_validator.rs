@@ -1,5 +1,5 @@
 //! topic / group 名字的合法性判定（对应 `org.apache.rocketmq.common.topic.TopicValidator`，
-//! 口径以 `python/rocketmq/common/topic_validator.py` 为准）。
+//! 口径以 `python/common/topic_validator.py` 为准）。
 //!
 //! Java 的字符表白名单是 `^[%|a-zA-Z0-9_-]+$`，实现方式是一张 128 长的
 //! `VALID_CHAR_BIT_MAP`：**码点 >= 128 一律非法**。这里逐字节照抄，因为 broker 侧

@@ -1,7 +1,7 @@
 // DefaultMQPushConsumer — the push consumer
 // (Java org.apache.rocketmq.client.consumer.DefaultMQPushConsumer +
 // DefaultMQPushConsumerImpl + RebalancePushImpl, merged the same way the
-// Python/Go/C++/.NET ports merge them).
+// Python/Go/C++/C# ports merge them).
 //
 // Shape of the thing, per client instance:
 //

@@ -814,7 +814,7 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
     {
         std::lock_guard<std::mutex> lk(lock_);
         // 2. 建：为缺失的队列起拉取线程。
-        //    std::thread 一构造就跑（不像 Python/.NET 能「先入表再 start」），所以
+        //    std::thread 一构造就跑（不像 Python/C# 能「先入表再 start」），所以
         //    「写 pullOwners_」必须在构造之前，而「写 pullThreads_」必须与它同批完成。
         //    错开一步就有两种坏结果：
         //      * 新线程先跑到 ownsQueue()，看到表里还没有自己 ⇒ 当场退出；而 key

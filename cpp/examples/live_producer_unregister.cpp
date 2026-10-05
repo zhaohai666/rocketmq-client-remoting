@@ -2,7 +2,7 @@
 // 用法：rmq_live_producer_unregister 127.0.0.1:9876
 //
 // 与 Python 的 verify_producer_unregister_live.py（U1~U6）、Rust 的
-// live_producer.rs P11、.NET 的 ProducerUnregisterLive.cs 对齐。
+// live_producer.rs P11、C# 的 ProducerUnregisterLive.cs 对齐。
 //
 // Java 的 `DefaultMQProducerImpl#shutdown`:313 调 `mQClientFactory.unregisterProducer(group)`
 // （`MQClientInstance`:1198-1201），后者进私有的 `unregisterClient(group, null)`:1158-1182：
@@ -25,7 +25,7 @@
 //       `the producer group[...] not exist`，Java 的 mqadmin 也这么判）。
 //   U6  对照组（另一个没退出的生产者组）仍在 —— 排掉「broker 把所有连接都清了」这种假阳性。
 //
-// ⚠ 判据强度：C++（和 Python/.NET）里每个生产者各自持有一份 `MQClientInstance`、各自一条
+// ⚠ 判据强度：C++（和 Python/C#）里每个生产者各自持有一份 `MQClientInstance`、各自一条
 // TCP 连接，退出时连接也会关掉，broker 的通道扫描同样会把组摘掉 —— 单看 U5 分不出是 35
 // 还是断连的功劳，所以这里必须由钩子抓帧（U3）直接证明「线上走了这一发」。行为级的判别式
 // 证明在 `rust/examples/live_producer.rs` 的 P11：Rust 按 clientId 复用实例，两个同

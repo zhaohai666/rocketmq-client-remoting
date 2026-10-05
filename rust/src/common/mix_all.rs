@@ -1,5 +1,5 @@
 //! `MixAll` 常量与工具（对应 Java `org.apache.rocketmq.common.MixAll`，
-//! 参考实现 `python/rocketmq/common/mix_all.py`）。
+//! 参考实现 `python/common/mix_all.py`）。
 //!
 //! `PermName` 在 Python 里放在 `sysflag.py`，Rust 沿用该位置（见
 //! [`crate::common::sysflag::PermName`），此处只做 re-export，避免两处定义漂移。

@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Subscription-group models (org.apache.rocketmq.remoting.protocol.subscription.*).
-// Mirrors python/rocketmq/remoting/protocol/subscription.py.
+// Mirrors python/remoting/protocol/subscription.py.
 // Field names and defaults are taken from a Java 5.x probe of
 // JSON.toJSONString(new SubscriptionGroupConfig()).
 import { RemotingSerializable } from './serialize.ts';

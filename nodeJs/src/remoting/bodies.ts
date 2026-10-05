@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Common response/request bodies (org.apache.rocketmq.remoting.protocol.body.*).
-// Mirrors python/rocketmq/remoting/protocol/body.py, admin_body.py (shared parts),
+// Mirrors python/remoting/protocol/body.py, admin_body.py (shared parts),
 // and the Java admin bodies. Many of these bodies contain Map<MessageQueue, X>
 // whose JSON keys are inline-object keys (fastjson2 non-string keys); we use the
 // fastjson-tolerant RemotingSerializable.decode and the messageQueueKey helpers to

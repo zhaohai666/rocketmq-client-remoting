@@ -1,7 +1,7 @@
 // P5：postSubscriptionWhenPull + pullFromWhichNode / findBrokerAddressInSubscribe 离线单测。
 //
 // 对齐基准（Java 5.5.0，逐行读过；与 python/tests/test_pull_post_subscription.py、
-// rust/src/client/consumer.rs + mq_client.rs、dotnet/Tests/PullPostSubscriptionTests.cs 同题）：
+// rust/src/client/consumer.rs + mq_client.rs、csharp/Tests/PullPostSubscriptionTests.cs 同题）：
 //   * DefaultMQPushConsumer#postSubscriptionWhenPull 默认 false；
 //     DefaultMQPushConsumerImpl.pullMessage:458-468 里
 //     `subExpression = (postSubscriptionWhenPull && !sd.isClassFilterMode()) ? sd.getSubString() : null`，

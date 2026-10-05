@@ -1,7 +1,7 @@
 //! `DefaultMQProducer`：消息发送入口（对应
 //! `org.apache.rocketmq.client.producer.DefaultMQProducer` +
 //! `impl.producer.DefaultMQProducerImpl`，逐条移植
-//! `python/rocketmq/client/producer.py`）。
+//! `python/client/producer.py`）。
 //!
 //! 职责：生产者配置、生命周期（与 [`MQClientInstance`] 共享实例 + 生产者心跳线程）、
 //! 同步/异步/单向/定点/选择器/批量发送、发送重试与延迟故障规避、发送前后钩子与
@@ -149,7 +149,7 @@ pub const DEFAULT_RETRY_RESPONSE_CODES: [i32; 8] = [
 
 /// 队列选择器（对应 Java `MessageQueueSelector`，Python `producer.MessageQueueSelector`）。
 ///
-/// `arg` 与 C++/dotnet 移植一致取 `&str`（Python 是任意对象，但三个内置选择器只用到
+/// `arg` 与 C++/C# 移植一致取 `&str`（Python 是任意对象，但三个内置选择器只用到
 /// 字符串/整数语义）。
 pub trait MessageQueueSelector: Send + Sync + 'static {
     /// 对应 Java `MessageQueueSelector#select`。
@@ -162,7 +162,7 @@ pub struct SelectMessageQueueByHash;
 
 impl MessageQueueSelector for SelectMessageQueueByHash {
     /// Python 用内建 `hash(arg)`，字符串的 `hash()` 随 `PYTHONHASHSEED` 变化、跨进程
-    /// 不可复现；这里与 C++/dotnet 移植相同，取 Java `String.hashCode()` 语义
+    /// 不可复现；这里与 C++/C# 移植相同，取 Java `String.hashCode()` 语义
     /// （确定性，适合当分片键）。
     fn select(&self, mqs: &[MessageQueue], _msg: &Message, arg: &str) -> Result<MessageQueue> {
         if mqs.is_empty() {
@@ -3203,7 +3203,7 @@ impl DefaultMQProducer {
     /// [`Error::TooMuchRequest`]，一次请求都不会发出去。
     ///
     /// ⚠ **与 Java/Python 的一处结构性差别：这道闸在池子里等，不在调用方线程上等。**
-    /// Java/Python/C++/.NET 都在调用方线程上阻塞式 `tryAcquire`，所以「异步」在背压打满时
+    /// Java/Python/C++/C# 都在调用方线程上阻塞式 `tryAcquire`，所以「异步」在背压打满时
     /// 会退化成「等满 timeout 再报错」。Rust 不能照做：生产者常常跑在唯一的 tokio 工作线程
     /// 上（`#[tokio::test]` 的单线程运行时、`RuntimeFlavor::CurrentThread`），把那个线程
     /// park 住就意味着**正要归还许可**的完成回调永远排不上队 —— 不是慢，是死锁。

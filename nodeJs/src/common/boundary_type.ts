@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // BoundaryType (org.apache.rocketmq.common.BoundaryType).
-// Faithful port of python/rocketmq/common/boundary_type.py.
+// Faithful port of python/common/boundary_type.py.
 //
 // The wire value is the upper-case enum name ("LOWER"/"UPPER"); getType() is lenient — only
 // "upper" (case-insensitive) maps to UPPER, everything else (null / blank / "lower") is LOWER.

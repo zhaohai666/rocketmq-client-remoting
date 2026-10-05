@@ -1,6 +1,6 @@
 //! POP 模式的 extraInfo（俗称 CK 串）编解码。
 //!
-//! 逐条移植 `python/rocketmq/remoting/protocol/extra_info.py`（257 行），即 Java
+//! 逐条移植 `python/remoting/protocol/extra_info.py`（257 行），即 Java
 //! `org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil`。
 //!
 //! CK 串是 POP 模式的核心凭据：broker 在 POP 响应里**不**给普通 topic 的消息写

@@ -847,7 +847,7 @@ private:
     std::atomic<bool> stop_{false};
     std::map<std::string, std::thread> pullThreads_;
     // 每个队列当前拉取线程的「归属凭据」：在**起线程之前**登记，线程每轮自查
-    // （见 ownsQueue）。std::thread 一构造就开跑，没法像 Python/.NET 那样「先入表
+    // （见 ownsQueue）。std::thread 一构造就开跑，没法像 Python/C# 那样「先入表
     // 再 start」，所以归属不能靠线程 id 反查，只能靠这张先写入的表。
     std::map<std::string, uint64_t> pullOwners_;
     uint64_t nextPullToken_ = 0;

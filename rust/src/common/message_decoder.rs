@@ -1,5 +1,5 @@
 //! 消息二进制编解码（对应 Java `org.apache.rocketmq.common.message.MessageDecoder`，
-//! 参考实现 `python/rocketmq/common/message_decoder.py`）。
+//! 参考实现 `python/common/message_decoder.py`）。
 //!
 //! 本模块严格对齐 Java 侧的两条编码路径，切勿混用：
 //!

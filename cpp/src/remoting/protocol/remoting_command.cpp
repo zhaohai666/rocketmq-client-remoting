@@ -1,6 +1,6 @@
 // RemotingCommand 实现（对应 org.apache.rocketmq.remoting.protocol.RemotingCommand）。
 //
-// 严格对齐 python/rocketmq/remoting/protocol/remoting_command.py（已对真实 5.5.1 集群验证）：
+// 严格对齐 python/remoting/protocol/remoting_command.py（已对真实 5.5.1 集群验证）：
 //   - 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
 //   - header(JSON)：RemotingSerializable JSON 编码；解码兼容 5.x 把 language 写成枚举名字符串
 //   - header(ROCKETMQ)：RocketMQSerializable 私有二进制编码

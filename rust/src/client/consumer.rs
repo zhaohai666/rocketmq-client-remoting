@@ -1740,7 +1740,7 @@ impl DefaultMQPushConsumer {
 
     // ---------------- 拉取停摆自愈的可观测接缝 ----------------
     //
-    // 与 C++/Python/.NET 三版一致地公开：真机验证脚本要能把时钟倒拨、触发一次
+    // 与 C++/Python/C# 三版一致地公开：真机验证脚本要能把时钟倒拨、触发一次
     // rebalance，再确认「停摆的队列被撤掉重建、消息一条不重不丢」。这些判据本身
     // 是内部状态，没有接缝就只能靠 sleep 120s 猜。
 
@@ -1764,7 +1764,7 @@ impl DefaultMQPushConsumer {
 
     // ---------------- OFFSET_ILLEGAL 纠错的可观测接缝 ----------------
     //
-    // 与 C++/Python/.NET 三版一致地公开：真机验证脚本要能断言「队列被丢弃（代号 +1）、
+    // 与 C++/Python/C# 三版一致地公开：真机验证脚本要能断言「队列被丢弃（代号 +1）、
     // 位点被冻结、缓冲里的旧消息整批作废」，这些都是内部状态，没有接缝就只能靠
     // 「消息有没有投过来」间接猜。
 
@@ -1795,7 +1795,7 @@ impl DefaultMQPushConsumer {
 
     // ---------------- cleanExpiredMsg 的可观测接缝 ----------------
     //
-    // 与 C++/Python/.NET 三版一致地公开：真机验证要能断言「挂住的批次登记在册（带
+    // 与 C++/Python/C# 三版一致地公开：真机验证要能断言「挂住的批次登记在册（带
     // CONSUME_START_TIME）、清扫把它从视图里收走、回投消息停在哪条队列的缓冲里」，
     // 判据全是内部状态，没有接缝就只能靠「消息有没有来第二次」间接猜。
 
@@ -5468,7 +5468,7 @@ mod tests {
 
     // ---------------- 配置与启动校验 ----------------
 
-    /// 默认值逐项对照 `python/rocketmq/client/consumer.py`（`DefaultMQPushConsumer.__init__`）。
+    /// 默认值逐项对照 `python/client/consumer.py`（`DefaultMQPushConsumer.__init__`）。
     #[test]
     fn config_defaults_match_the_python_reference() {
         let cfg = ConsumerConfig::default();
@@ -5587,7 +5587,7 @@ mod tests {
 
     /// Java `DefaultMQPushConsumer:89`（字段默认 `new AllocateMessageQueueAveragely()`）
     /// 与 `:196-202`（getter/setter）。
-    /// ⚠ Python/C++/.NET 那条「置 null 后 checkConfig 拒绝启动」在这里由
+    /// ⚠ Python/C++/C# 那条「置 null 后 checkConfig 拒绝启动」在这里由
     /// `Arc<dyn ...>` 表达成「类型上不可表示」，所以没有对应的拒绝分支。
     #[test]
     fn push_consumer_exposes_the_allocate_strategy() {

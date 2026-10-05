@@ -1,6 +1,6 @@
 //! 异步发送内核（非阻塞与线程口径、并发不串台、定点/拦截/批量/关池行为）真机验证，
 //! 与 `python/verify_async_send_live.py`（A1–A6）、`cpp/examples/live_async_send.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveAsyncSend.cs` 同套场景。
+//! `csharp/examples/RocketMQ.Examples/LiveAsyncSend.cs` 同套场景。
 //! 对端是 Java `DefaultMQProducerImpl` 的 ASYNC 链（`sendDefaultImpl` → `AsyncSenderExecutor`
 //! → `sendKernelImpl`）与 `MQClientAPIImpl.sendMessageAsync` / `onExceptionImpl`。
 //!
@@ -27,7 +27,7 @@
 //!       「客户端实例已拆」的状态上跑的 ⇒ 实测**一笔都没上线**（差异 ③）；
 //!       关停之后 `send_async` 同步被拒、不会再追加回调。
 //!
-//! ① **线程口径与 Java/C++/.NET 的差别**：本端口的发送任务跑在 tokio 工作线程上，没有
+//! ① **线程口径与 Java/C++/C# 的差别**：本端口的发送任务跑在 tokio 工作线程上，没有
 //!   `AsyncSenderExecutor_N` / `NettyClientPublicExecutor_N` 这种池线程名可查（见
 //!   `producer.rs` 里 `send_async` 的文档「差异 3」）。所以这里只能退一步证「准备段与回调
 //!   都不在**调用方线程**上」，且用 `ThreadId` 而不是线程名对位。为了让这条比对有意义，
@@ -38,13 +38,13 @@
 //!   在 `send(batch(msgs), sendCallback, timeout)` 之后走 SEND_BATCH + `invokeAsync`，
 //!   本端口（同 Python `_send_async_inner` 的批量分支）批量只有同步内核，于是「在异步池里
 //!   跑完 `send_batch`」。对调用方的四条语义（不阻塞、回调恰好一次、错误进回调、失败归还
-//!   许可）一致，差的只是「池内那一条任务会占住到网络回来为止」。Python/C++/.NET 三端口
+//!   许可）一致，差的只是「池内那一条任务会占住到网络回来为止」。Python/C++/C# 三端口
 //!   同一口径（见各自的批量异步入口）。
 //!
 //! ③ **关停语义按语言分两派，本端口与 Java/Python 同派**：Java `shutdown()` 与 Python
 //!   都「不等」——队列里的任务照样跑完准备段、照样回调，但实例已经拆掉，所以这一批基本
 //!   全部报错、broker 上一条都不落（本机实测 36 笔全报 `client already shutdown`、
-//!   `landed=-1` 即连路由都没建出来）。C++/.NET 那两版是 `shutdown(true)`/join 池线程，
+//!   `landed=-1` 即连路由都没建出来）。C++/C# 那两版是 `shutdown(true)`/join 池线程，
 //!   同一用例能落满 36 条 —— 那是它们相对 Java 的偏离，不是本端口的。这里锁死「不等待
 //!   真的会丢消息」这条，用户要保消息就得自己等回调再关。
 //!
@@ -836,7 +836,7 @@ async fn queues_landed(env: &Env, queues: &[MessageQueue]) -> i64 {
 // ------------------------------------------------- A5 批量异步（send_batch_async）
 
 /// 批量异步入口对位 Java `send(Collection<Message>, SendCallback, long)` /
-/// Python `send_async(list)` / C++ `sendAsync(MessageBatch,…)` / .NET
+/// Python `send_async(list)` / C++ `sendAsync(MessageBatch,…)` / C#
 /// `SendAsync(IEnumerable<Message>,…)`。
 ///
 /// 每条断言都刻意选在「只跑离线单测看不出来」的那一侧：回调有没有交付、批量内核的本地
@@ -1121,7 +1121,7 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
     );
     // ⚠ 但代价是真的会丢：客户端实例已经先一步拆掉了，这批任务是在「路由表/传输层已关」
     // 的状态上跑的，整轮以 `client already shutdown` 收场、broker 上一条都没落（实测连
-    // topic 都没建出来 ⇒ 路由都查不到）。C++/.NET 那个版本会 join 完池子才关客户端，
+    // topic 都没建出来 ⇒ 路由都查不到）。C++/C# 那个版本会 join 完池子才关客户端，
     // 同样用例能落满；这里照抄 Java 的 `shutdown()`，锁的就是「调用方必须自己等回调再关」。
     let errors = rec.errors().len();
     ck.check(

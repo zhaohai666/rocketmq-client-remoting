@@ -1,4 +1,4 @@
-//! 消费侧统计（对应 `python/rocketmq/client/consumer_stats.py`，即 Java
+//! 消费侧统计（对应 `python/client/consumer_stats.py`，即 Java
 //! `org.apache.rocketmq.client.stat.ConsumerStatsManager` 与
 //! `org.apache.rocketmq.common.stats.{StatsItem,StatsItemSet,StatsSnapshot}`）。
 //!

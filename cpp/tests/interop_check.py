@@ -21,8 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PY_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "python"))
 sys.path.insert(0, PY_ROOT)
 
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand  # noqa: E402
-from rocketmq.remoting.protocol.codes import SerializeType  # noqa: E402
+from remoting.protocol.remoting_command import RemotingCommand  # noqa: E402
+from remoting.protocol.codes import SerializeType  # noqa: E402
 
 TOOL = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "build", "examples", "rmq_interop")
 
@@ -230,9 +230,9 @@ def test_heartbeat():
     # ---- Python 参考客户端曾有两处会导致 broker **静默丢字段**的偏差，现已修复；
     #      这里改成回归守卫（不再是 WARN），防止将来退回 snake_case / 不可哈希。
     #      背景：broker 用 fastjson2 按 **Java 属性名** 反序列化，字段名错一个就静默丢字段。----
-    from rocketmq.common.subscription_data import SubscriptionData as PySub
-    from rocketmq.common.subscription_data import FilterAPI as PyFilterAPI
-    from rocketmq.remoting.protocol.heartbeat import ConsumerData as PyConsumerData
+    from common.subscription_data import SubscriptionData as PySub
+    from common.subscription_data import FilterAPI as PyFilterAPI
+    from remoting.protocol.heartbeat import ConsumerData as PyConsumerData
 
     # 守卫 1：SubscriptionData 必须可哈希
     # （它定义了 __eq__；若不同时定义 __hash__ 就不可哈希，

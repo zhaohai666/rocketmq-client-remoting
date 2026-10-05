@@ -1,12 +1,12 @@
 # rocketmq-client-remoting (Go)
 
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
-适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / .NET / Rust 实现逐项对齐。
+适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / C# / Rust 实现逐项对齐。
 **真机联调工具目前 9 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
 POP / 重投与死信 / 停机竞态 / **管理端** / **压缩矩阵**（后者由 `compression_matrix.sh` 驱动，
 收发两端都是它自己，不算一个独立入口）；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
 **不宣称「全部能力都已联调」**。另有一个**不依赖集群**的离线自检
-（`go run ./examples/selfcheck`，见「离线自检」）—— 它与 Python / C++ / .NET 三端的同名工具对齐，
+（`go run ./examples/selfcheck`，见「离线自检」）—— 它与 Python / C++ / C# 三端的同名工具对齐，
 **不是** Java 的机制（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令）。
 
 分层：
@@ -89,8 +89,8 @@ go run ./examples/selfcheck
 ```
 
 10 项，逐条打印 `[PASS]` / `[FAIL]`，任一项失败进程以非 0 退出码结束，收口行
-`selfcheck: ALL PASS (PASS=10 FAIL=0)`。与 `python -m rocketmq selfcheck`（7 项）、
-`cpp/examples/selfcheck.cpp`（3 项）、`dotnet` 的 `selfcheck` 子命令（3 项）同名同用途，
+`selfcheck: ALL PASS (PASS=10 FAIL=0)`。与 `python -m selfcheck`（7 项）、
+`cpp/examples/selfcheck.cpp`（3 项）、`csharp` 的 `selfcheck` 子命令（3 项）同名同用途，
 是**动真机之前**最便宜的一道门。**Rust 侧没有这个工具**（`rust/examples/` 全是需要集群的
 `live_*`），它的协议层离线覆盖由 `cargo test` 单测承担 —— 所以这里是 4/5 端对齐。
 
@@ -148,7 +148,7 @@ ACL、TLS、SQL92、`MACHINE_ROOM_NEARBY` 真机，
 进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
 
 对照 Java 客户端（zhaohai666-rocketmq 5.x）仍有意的差异：LZ4/ZSTD 压缩（Java 客户端模块同样
-只有 zlib，本项只是与仓库内 Python/C++/.NET/Rust 四端的能力面差异）、批次消息 msgId 取批自身
+只有 zlib，本项只是与仓库内 Python/C++/C#/Rust 四端的能力面差异）、批次消息 msgId 取批自身
 UNIQ_KEY（与 Rust/C++ 对齐）。
 
 ## 目录结构

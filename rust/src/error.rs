@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn request_timeout_text_matches_python() {
-        // python/rocketmq/client/producer.py::_wait_request_response 的字面量
+        // python/client/producer.py::_wait_request_response 的字面量
         let e = Error::request_timeout("TopicTest", 3000);
         assert_eq!(
             e.to_string(),

@@ -1,6 +1,6 @@
 // 协议序列化实现：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
 //
-// 严格对齐 python/rocketmq/remoting/protocol/serialize.py（已对真实 5.5.1 集群验证）：
+// 严格对齐 python/remoting/protocol/serialize.py（已对真实 5.5.1 集群验证）：
 //   - JSON：JsonValue -> UTF-8 字节串；
 //   - ROCKETMQ header 线格式：
 //       code(2) | language(1) | version(2) | opaque(4) | flag(4)

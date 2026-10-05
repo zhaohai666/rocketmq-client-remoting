@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Validators (org.apache.rocketmq.client.Validators).
-// Faithful port of python/rocketmq/client/validators.py.
+// Faithful port of python/client/validators.py.
 //
 // checkGroup mirrors Python check_group: blank -> length (GROUP_MAX_LENGTH) -> illegal chars,
 // throwing MQClientException. The character check reuses topic_validator's allow-set. The

@@ -3090,7 +3090,7 @@ mod tests {
     /// 前重（timestamp=-1）会回显 consumerOffset 而不是跳到 maxOffset。
     /// 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
     ///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
-    /// 与 python/tests/test_admin_reset_offset.py 的同名断言、.NET ResetOffsetTests 的
+    /// 与 python/tests/test_admin_reset_offset.py 的同名断言、C# ResetOffsetTests 的
     /// wire 取证同题。
     #[test]
     fn reset_offset_ext_key_is_isforce() {

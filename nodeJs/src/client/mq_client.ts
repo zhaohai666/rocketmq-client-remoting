@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // MQClient — the central client manager (org.apache.rocketmq.client.impl.MQClientInstance).
-// Faithful port of python/rocketmq/client/mq_client.py. It owns: the name-server address list,
+// Faithful port of python/client/mq_client.py. It owns: the name-server address list,
 // the topic-route cache, the per-topic publish-info table (with the SHARED round-robin cursor),
 // the broker-address table, and the low-level send / heartbeat / recall primitives.
 //

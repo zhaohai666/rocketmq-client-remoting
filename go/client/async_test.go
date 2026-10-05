@@ -363,7 +363,7 @@ func TestAsyncSendDeliversResultOffTheCallerGoroutine(t *testing.T) {
 // divergence: Java runs SendMessageHook.after TWICE for an async send — once with
 // a null SendResult straight after dispatch (sendKernelImpl:1087-1090, the ASYNC
 // branch never assigns sendResult) and once with the real outcome. This port, like
-// the Python/C++/.NET ones, fires it once with the real outcome.
+// the Python/C++/C# ones, fires it once with the real outcome.
 func TestAsyncSendHookPairFiresOnceWithTheRealResult(t *testing.T) {
 	const topic = "AsyncHookTopic"
 	p, _, _ := startAsyncFixture(t, topic, "GID_async_hook", 0, nil)

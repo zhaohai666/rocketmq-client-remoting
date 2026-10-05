@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Request/response headers (org.apache.rocketmq.remoting.protocol.header.*).
-// Mirrors python/rocketmq/remoting/protocol/headers.py.
+// Mirrors python/remoting/protocol/headers.py.
 //
 // Each header implements toExtFields() (return a plain object of string-coercible
 // fields; null is skipped) and fromExtFields(fields) (read from a

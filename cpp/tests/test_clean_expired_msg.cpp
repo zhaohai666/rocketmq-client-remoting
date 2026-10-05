@@ -23,7 +23,7 @@
 // %RETRY% 重投 → reconsumeTimes=1 的第二次投递」只能在真机取证
 //（examples/live_clean_expired_msg.cpp，与 python/verify_clean_expired_msg_live.py 同题）。
 // 与 python/tests/test_clean_expired_msg.py、rust/src/client/consumer.rs、
-// dotnet/tests/RocketMQ.Client.Tests/CleanExpiredMsgTests.cs 的同名测试一一对应。
+// csharp/tests/RocketMQ.Client.Tests/CleanExpiredMsgTests.cs 的同名测试一一对应。
 #include <cstdio>
 #include <memory>
 #include <stdexcept>

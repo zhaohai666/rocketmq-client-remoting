@@ -1,5 +1,5 @@
 //! 路由刷新周期 / 位点落盘周期 真机验证（Rust 对齐 `cpp/examples/live_scheduled_intervals.cpp`
-//! 与 `dotnet/examples/RocketMQ.Examples/LiveScheduledIntervals.cs` 的 I1–I3）。
+//! 与 `csharp/examples/RocketMQ.Examples/LiveScheduledIntervals.cs` 的 I1–I3）。
 //!
 //! 离线单测（`src/client/mq_client.rs` 的 `mod tests`）只能证明**首跳**落在 initialDelay；
 //! 周期本身必须用**真集群**才量得出来：路由刷新要用一个"先不存在、后由 admin 建出来"的

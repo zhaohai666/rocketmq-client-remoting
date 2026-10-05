@@ -2,7 +2,7 @@
 //! 对真实 5.5.1 集群的验证。
 //!
 //! 场景与 `python/verify_pull_consumer_heartbeat_live.py`、`cpp/examples/live_pull_heartbeat.cpp`
-//! 和 `dotnet/examples/RocketMQ.Examples/LivePullHeartbeat.cs` 一致（四语言同一套断言）：
+//! 和 `csharp/examples/RocketMQ.Examples/LivePullHeartbeat.cs` 一致（四语言同一套断言）：
 //!
 //! - A0 建 topic（主节点一份配置）。
 //! - A1 起拉模式消费者 + 拉一轮：拉取本身正常。

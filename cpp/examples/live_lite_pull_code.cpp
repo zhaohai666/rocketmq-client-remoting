@@ -1,5 +1,5 @@
 // lite-pull **请求码 / broker 开关**（#107）真机验证。
-// 与 `python/verify_lite_pull_code_live.py`、rust/dotnet 的对应场景同题、逐条对应。
+// 与 `python/verify_lite_pull_code_live.py`、rust/csharp 的对应场景同题、逐条对应。
 //
 // 为什么必须真机：`FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` 这条链在离线
 // 假 broker 上永远是绿的 —— 少了位、码还是 11 时，报文依然是一个完全合法的 pull，

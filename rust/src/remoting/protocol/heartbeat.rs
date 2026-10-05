@@ -1,6 +1,6 @@
 //! 心跳数据（对应 `org.apache.rocketmq.remoting.protocol.heartbeat.*`）。
 //!
-//! 移植 `python/rocketmq/remoting/protocol/heartbeat.py`：`ProducerData` /
+//! 移植 `python/remoting/protocol/heartbeat.py`：`ProducerData` /
 //! `ConsumerData` / `HeartbeatData`，以及 `ConsumerData.subscriptionDataSet` 需要的
 //! [`SubscriptionData`]。
 //!
@@ -666,7 +666,7 @@ mod tests {
     }
 
     /// 黄金向量取自**跑起来的 Python 参考实现**
-    /// （`python/rocketmq/common/subscription_data.FilterAPI`），不是手推的。
+    /// （`python/common/subscription_data.FilterAPI`），不是手推的。
     #[test]
     fn filter_api_matches_the_python_reference_vector_by_vector() {
         /// (用例名, 订阅表达式, 期望 subString, 期望 tagsSet, 期望 codeSet)

@@ -1,7 +1,7 @@
 //! 定点发送 topic 一致性守卫真机验证（Java `DefaultMQProducerImpl:1234-1236` / `:1277-1278`）。
 //!
 //! 与 `python/verify_pinned_guard_live.py`（S1..S6）、`cpp/examples/live_pinned_guard.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
+//! `csharp/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
 //!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!

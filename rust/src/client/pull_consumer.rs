@@ -29,7 +29,7 @@
 //! 1. **`pull()` 不做客户端二次 tag 过滤**。Java
 //!    `DefaultMQPullConsumerImpl#pullSyncImpl` 会把 `FilterAPI.buildSubscriptionData`
 //!    造出的 `subscriptionData` 交给 `PullAPIWrapper#processPullResult`，后者在
-//!    `!tagsSet.isEmpty()` 时按字符串再筛一遍（:112-121）。Python/cpp/dotnet 三版
+//!    `!tagsSet.isEmpty()` 时按字符串再筛一遍（:112-121）。Python/cpp/csharp 三版
 //!    都只跑过滤钩子（`consumer.py:2095-2106` 的注释把这件事说成 Java 行为，其实
 //!    不成立）。差别只在 broker 侧 tag **哈希**碰撞时才会显现（碰撞消息 Java 丢、
 //!    本版留），这里保持与四门语言一致的口径，不改行为、只在此处记账。
@@ -37,13 +37,13 @@
 //!    `registerConsumer` 进 `MQClientInstance`（`DefaultMQPullConsumerImpl:746`），
 //!    由实例的心跳周期任务发出消费组心跳；本移植的实例心跳任务只遍历
 //!    `consumer_table`（推送消费者专属，拉模式消费者接不了 broker 的 220/221/307/309
-//!    反向请求），所以**改由消费者自己起心跳循环**（与 Python/C++/dotnet 四版同构，
+//!    反向请求），所以**改由消费者自己起心跳循环**（与 Python/C++/C# 四版同构，
 //!    #98 补的缺口）：`start()` 刷一遍 registerTopics 的路由，
 //!    同步发一轮 `consumeType=CONSUME_ACTIVELY` 的 ConsumerData，之后按
 //!    `heartbeat_broker_interval_millis` 周期重发；`shutdown()` 发 35 注销。
 //!    [`DefaultMQPullConsumer::register_topics`] 就是这份心跳的订阅集来源
 //!    （Java `subscriptions():357-385`）。
-//! 3. **`message_queue_lists` 字段不移植**：Python/cpp/dotnet 里都是纯声明、零读写的
+//! 3. **`message_queue_lists` 字段不移植**：Python/cpp/csharp 里都是纯声明、零读写的
 //!    死字段（Java 也只有配合 `AllocateMessageQueueByConfig` 才用），不搬进 Rust。
 //! 4. **消息回投失败会抛**：Java `DefaultMQPullConsumerImpl:666` 在回投失败时吞掉异常、
 //!    改用内部生产者把消息直接发进 `%RETRY%group`；本实现按 Python 同口径直接返回错误
@@ -116,7 +116,7 @@ const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
 /// `consumer.py:870`，默认 30000ms；与 Java 实例级 `sendHeartbeatToAllBrokerWithLock`
 /// 的 30s 同量级）。
 pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
-/// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms、C++/dotnet 同口径）。
+/// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms、C++/C# 同口径）。
 const PULL_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
 
 /// 取锁（Python 的 `with self._lock`）；中毒时照用，理由同 `consumer::lock`。
@@ -215,7 +215,7 @@ pub struct PullConsumerConfig {
     /// Python `consumer_timeout_millis_when_suspend` = 30000：长轮询请求超时。
     pub consumer_timeout_millis_when_suspend: i64,
     /// Python `heartbeat_enabled`（`consumer.py:869`，默认 `True`）：置 false 后
-    /// start 的同步那轮与后台循环都不发心跳（C++/dotnet 同名开关）。
+    /// start 的同步那轮与后台循环都不发心跳（C++/C# 同名开关）。
     pub heartbeat_enabled: bool,
     /// Python `heartbeat_interval_millis`（`consumer.py:870`，默认 30000ms）。
     pub heartbeat_broker_interval_millis: u64,
@@ -262,7 +262,7 @@ struct PullInner {
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
     /// 对应 Java `DefaultMQPullConsumer.allocateMessageQueueStrategy` 的字段初值
     /// （`new AllocateMessageQueueAveragely()`:89）。本端口拉模式不做 rebalance
-    /// （见模块头偏离 2），所以它只是配置形状，与 Python/C++/dotnet 同口径。
+    /// （见模块头偏离 2），所以它只是配置形状，与 Python/C++/C# 同口径。
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
     /// Java `PullAPIWrapper.pullFromWhichNodeTable`：每次拉取回写响应头里的
@@ -628,7 +628,7 @@ impl DefaultMQPullConsumer {
         *lock(&self.inner.client) = Some(client);
         // 心跳：先刷 registerTopics 的路由（心跳只发给路由表里已知的 broker，没有
         // 地址就发 0 份），再同步发一轮让 broker 立刻认识本组，最后交给后台循环 ——
-        // 顺序对齐 Python/C++/dotnet 的拉模式消费者（也贴合 Java 的
+        // 顺序对齐 Python/C++/C# 的拉模式消费者（也贴合 Java 的
         // registerConsumer:746 → mQClientFactory.start():755 首个心跳周期在 1s 内）。
         self.refresh_route_for_heartbeat().await;
         self.inner.running.store(true, Ordering::Release);
@@ -643,7 +643,7 @@ impl DefaultMQPullConsumer {
     /// Python `shutdown()`；未启动时是 no-op。
     ///
     /// 收尾三步（对齐 Java `DefaultMQPullConsumerImpl.shutdown:689-692`：
-    /// `unregisterConsumer` → `mQClientFactory.shutdown()`，中间补 Python/C++/dotnet
+    /// `unregisterConsumer` → `mQClientFactory.shutdown()`，中间补 Python/C++/C#
     /// 都有的 35 号注销）：停心跳 → 逐台 broker 发 UNREGISTER_CLIENT(35) → 摘组 → 关实例。
     /// 35 让 broker 的 ConsumerManager 立刻摘掉本组，不必等 ~120s 通道扫描
     /// （Java `MQClientInstance#unregisterClient`，`DefaultMQPullConsumerImpl:691` 走同一入口）。
@@ -2638,7 +2638,7 @@ async fn resolve_initial_offset(
 /// `ClientManageProcessor:87-92` 对 ACTIVELY 的心跳跳过订阅注册（拉取靠自己带
 /// subscription 标志走补偿分支）、`PullMessageProcessor:493-505` 对开了
 /// `rejectPullConsumerEnabled` 的 broker 按它放行/拒绝拉取、`AdminBrokerProcessor:1971`
-/// 按它显示消费类型（mqadmin consumerConnection）。Python/C++/dotnet 三版同值。
+/// 按它显示消费类型（mqadmin consumerConnection）。Python/C++/C# 三版同值。
 fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
@@ -3835,7 +3835,7 @@ mod tests {
     /// 两个拉消费者的策略面（Java `DefaultMQPullConsumer:89` 字段默认 + `:196-202`
     /// getter/setter；`DefaultLitePullConsumer` 同款）。
     ///
-    /// ⚠ Python/C++/.NET 都有「置 null/None 后 `start()` 抛
+    /// ⚠ Python/C++/C# 都有「置 null/None 后 `start()` 抛
     /// `allocateMessageQueueStrategy is null`」（Java checkConfig:803）；Rust 用
     /// `Arc<dyn ...>` 把它压成「类型上不可表示」，所以这里只测默认值与替换。
     #[test]

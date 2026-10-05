@@ -280,7 +280,7 @@ void testDefaultConstructedIsDisabled() {
 
 // configureFromEnv：对应 Java MQClientAPIImpl 构造里的 `new DefaultTopAddressing(unitName)`
 // —— 那个构造函数自己读域名（Java 是系统属性，本端口统一用环境变量
-// ROCKETMQ_NAMESRV_DOMAIN，与 python/rust/dotnet 三端口一致）。
+// ROCKETMQ_NAMESRV_DOMAIN，与 python/rust/csharp 三端口一致）。
 // 这条链路此前只能靠调用方手工 setWsAddr 才通，实例自己装配是缺的。
 void testConfigureFromEnv(MockAddrServer& s) {
     const std::string key = "ROCKETMQ_NAMESRV_DOMAIN";

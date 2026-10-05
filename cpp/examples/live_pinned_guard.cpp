@@ -2,7 +2,7 @@
 // 用法：rmq_live_pinned_guard 127.0.0.1:9876
 //
 // 与 `python/verify_pinned_guard_live.py`（S1..S6）、`rust/examples/live_pinned_guard.rs`、
-// `dotnet/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
+// `csharp/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
 //
 // 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
 //

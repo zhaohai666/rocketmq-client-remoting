@@ -8,7 +8,7 @@
 //
 // ⚠ 与 Python 的一处**可达性**差异（不是实现差异）：本端口的 setConsumeThreadMin /
 // setConsumeThreadMax / setConsumeMessageBatchMaxSize 在 setter 里就 max(1,n) 夹了一道
-// （Python/Rust/.NET 的对应 setter 也夹，各自夹的字段集合不同）。Java 的 setter 是裸
+// （Python/Rust/C# 的对应 setter 也夹，各自夹的字段集合不同）。Java 的 setter 是裸
 // 赋值，所以下界在 Java 一定由闸门拒；在这里那三个字段**无法从公开 API 喂进 0**，
 // 于是本文件对它们锁的是"setter 夹到 1"这一行为 + 上界由闸门拒，闸门本身的下界比较
 // 仍按 Java 完整实现（参考实现 Python 的用例逐格锁死）。

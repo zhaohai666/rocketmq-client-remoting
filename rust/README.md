@@ -2,7 +2,7 @@
 
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Rust 实现（tokio 全异步），适配
 RocketMQ 4.x / 5.x 集群，全部能力在真实 5.5.1 集群上联调验证过；与本仓库的
-Python / C++ / .NET 实现逐项对齐。
+Python / C++ / C# 实现逐项对齐。
 
 分层：
 
@@ -243,7 +243,7 @@ pull/lite 开）。本机 IP 用 UDP「连」公网地址后读 sockname 探测�
 终点固定是：after 钩子 → 归还许可 → 用户回调**恰好一次**。`shutdown()` 先 unregister 再
 **排空**发送队列，⚠ 但实例同一时刻拆掉，关停时队列里的任务跑完链只会回调
 `client already shutdown`、broker 上一条都不落（真机 `live_async_send` A6 实测 36 笔全报错、
-`landed=-1`）—— **要保消息就得自己等回调再关**（C++/.NET 那两版会 join 完池子才关客户端，
+`landed=-1`）—— **要保消息就得自己等回调再关**（C++/C# 那两版会 join 完池子才关客户端，
 是它们与这里的结构性差异）。
 
 **发送池的形状是「永不阻塞的派发任务 + `Arc<Semaphore>`（核数份）+ 每笔任务 spawn 一次持

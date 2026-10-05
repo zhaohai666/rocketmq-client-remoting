@@ -118,7 +118,7 @@ int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
 //
 // ⚠ cpp 的 `MessageConst` 还没有这三个常量（timer 消息本端口只在
 // `recall_message_handle.h` 里以字面量出现），所以这里用字面量而不是常量 ——
-// 与 python `_TIMER_DELAY_PROPERTIES` / dotnet `TimerDelayProperties` 同一份清单。
+// 与 python `_TIMER_DELAY_PROPERTIES` / C# `TimerDelayProperties` 同一份清单。
 //
 // 取值口径：`getDelayTimeLevel()` 与 python 一致 —— 属性缺失返回 0；**值非法时不吞**
 // （python 的 `int(raw)` 会抛，Java 的 `Integer/Long.parseLong` 也会抛）。
@@ -395,7 +395,7 @@ MQClientInstance& DefaultMQProducer::client() {
 // ---------------------------------------------------------------- 校验
 // 对应 Java DefaultMQProducerImpl 发送前的 Validators.checkMessage(msg, this)：
 // 全部判定收敛到 Validators（topic blank/长度/字符表 → 禁发 topic → body 三档 →
-// INNER_MULTI_DISPATCH 分隔符），文案与顺序以 python/rocketmq/client/validators.py 为准。
+// INNER_MULTI_DISPATCH 分隔符），文案与顺序以 python/client/validators.py 为准。
 void DefaultMQProducer::checkMessage(const Message& msg) const {
     Validators::checkMessage(msg, maxMessageSize_);
 }
@@ -1089,7 +1089,7 @@ void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* w
 }
 
 // 交到用户回调手里的那个 Throwable（Java ``SendCallback#onException(Throwable)``）。
-// 与 Python ``_classify_async_failure`` / .NET ``ClassifyAsyncFailure`` 同口径：
+// 与 Python ``_classify_async_failure`` / C# ``ClassifyAsyncFailure`` 同口径：
 //   * 本地闸门（背压/预算）拒绝 → RemotingTooMuchRequestException（Java 直接抛的原类型）
 //   * broker 明确回错 → MQBrokerException(code, msg)（码随 InvokeError.responseCode 过来）
 //   * 响应到了但解析不出来 → RemotingCommandException（Java processSendResponse 那一支）

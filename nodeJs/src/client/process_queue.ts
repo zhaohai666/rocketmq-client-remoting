@@ -7,7 +7,7 @@
 // single sorted map and marks dispatched entries with a flag instead: the
 // observables that matter (msgCount, msgSize, maxSpan, "is this message still
 // mine", removeMessage's floor) are identical, and the same model is used by
-// the Python/C++/.NET/Go ports, which keeps cross-language behaviour
+// the Python/C++/C#/Go ports, which keeps cross-language behaviour
 // comparable.
 //
 // Two flags carry the rebalance contract:
@@ -89,7 +89,7 @@ export class ProcessQueue {
   //
   // Java measures msgCount/msgSize/maxSpan over the whole msgTreeMap, which
   // also holds messages a listener is currently chewing on. Measuring only the
-  // pending buffer is what the Python/C++/.NET/Go ports do, and it is the more
+  // pending buffer is what the Python/C++/C#/Go ports do, and it is the more
   // useful signal: a slow listener must not look like a backlog and stall the
   // pull. Kept consistent across the ports so the numbers are comparable.
   pendingStats(): [number, number, number] {

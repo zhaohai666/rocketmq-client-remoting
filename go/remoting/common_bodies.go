@@ -429,7 +429,7 @@ func DecodeProducerConnection(data []byte) (*ProducerConnection, error) {
 //
 // The broker/admin look the property up BY VALUE, so shipping the underscored
 // form makes the "is this consumer orderly" flag silently disappear from every
-// 307 answer. Python / Rust / C++ / .NET / Node all use the underscore-free
+// 307 answer. Python / Rust / C++ / C# / Node all use the underscore-free
 // value; only Java's identifier keeps the underscores.
 const (
 	PropNameServerAddr         = "PROP_NAMESERVER_ADDR"

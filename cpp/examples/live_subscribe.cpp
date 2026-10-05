@@ -1,6 +1,6 @@
 // 后置订阅真机验证（C++ 对齐 Java `subscribe` 之后的「立即推一轮心跳」，与
 // python/verify_subscribe_live.py、rust/examples/live_subscribe.rs、
-// dotnet/examples/RocketMQ.Examples/LiveSubscribe.cs 一一对应）。
+// csharp/examples/RocketMQ.Examples/LiveSubscribe.cs 一一对应）。
 //
 // Java `DefaultMQPushConsumerImpl.subscribe:1265-1275` 只做两件事：
 // `subscriptionInner.put(...)` + `if (this.mQClientFactory != null)

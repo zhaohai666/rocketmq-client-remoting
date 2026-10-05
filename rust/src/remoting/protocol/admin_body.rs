@@ -1,6 +1,6 @@
 //! 管理端响应体（对应 `org.apache.rocketmq.remoting.protocol.admin.*` 与 `body.*` 中的管理类）。
 //!
-//! 移植 `python/rocketmq/remoting/protocol/admin_body.py`：
+//! 移植 `python/remoting/protocol/admin_body.py`：
 //! `TopicStatsTable` / `TopicOffset` / `ConsumeStats` / `OffsetWrapper` /
 //! `TopicConfigSerializeWrapper` / `ConsumeQueueData` / `QueryConsumeQueueResponseBody`。
 //!

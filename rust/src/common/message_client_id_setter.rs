@@ -1,5 +1,5 @@
 //! 客户端消息唯一 ID（对应 `org.apache.rocketmq.common.message.MessageClientIDSetter`，
-//! 逐条对齐 `python/rocketmq/common/message_client_id_setter.py`）。
+//! 逐条对齐 `python/common/message_client_id_setter.py`）。
 //!
 //! 用途：
 //! * [`create_uniq_id`] 生成 32 位十六进制唯一 ID（IP + PID + 类哈希 + 当日毫秒 + 自增），

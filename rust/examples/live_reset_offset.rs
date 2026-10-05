@@ -1,6 +1,6 @@
 //! 220 `RESET_CONSUMER_CLIENT_OFFSET`（Java `MQClientInstance.resetOffset:1403-1450`）真机验证。
 //!
-//! 与 `python/verify_reset_offset_live.py` 同题逐条对应，另三端（cpp/dotnet）各有同名脚本。
+//! 与 `python/verify_reset_offset_live.py` 同题逐条对应，另三端（cpp/csharp）各有同名脚本。
 //!
 //! 220 是 broker 推给**消费端**的重置指令；管理端那笔 `INVOKE_BROKER_TO_RESET_OFFSET(222)`
 //! 的响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的

@@ -1,6 +1,6 @@
 //! [`DefaultMQAdminExt`] 对**真实 5.5.1 broker** 的联调验证。
 //!
-//! 与 `python/verify_admin_live.py`、cpp `examples/admin_live.cpp`、dotnet
+//! 与 `python/verify_admin_live.py`、cpp `examples/admin_live.cpp`、csharp
 //! `ValidatorsLive` 的管理端场景对齐。离线单测（`src/client/admin.rs` 的 `mod tests`）
 //! 只能覆盖纯逻辑（properties 文本解析、分页合并、集群地址挑选、码值口径），这里补上
 //! 必须真 broker 才能证明的部分：

@@ -1,6 +1,6 @@
 //! 异步发送背压（`enableBackpressureForAsyncMode` 那一套公平信号量）真机验证，
 //! 与 `python/verify_backpressure_live.py`（B1–B5）、`cpp/examples/live_backpressure.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveBackPressure.cs` 同套场景。
+//! `csharp/examples/RocketMQ.Examples/LiveBackPressure.cs` 同套场景。
 //! 对端是 Java `DefaultMQProducerImpl:635-682`（两道闸、共享一份预算）与 `:577-633`
 //! （`BackpressureSendCallBack` 的归还）。
 //!
@@ -23,7 +23,7 @@
 //!       且被拦下的那两笔也没漏还它们已经拿到的条数许可。
 //!   B5  关掉背压：同样的（夹到地板值的）容量配置**完全不限流**，30 笔并发全部落地。
 //!
-//! ⚠ **本端口与 Java/Python/C++/.NET 的唯一可观测量差别：闸门等许可发生在被 spawn
+//! ⚠ **本端口与 Java/Python/C++/C# 的唯一可观测量差别：闸门等许可发生在被 spawn
 //! 出去的发送任务里，不在调用方线程上**（调用方线程 park 住会让单线程运行时死锁，见
 //! [`DefaultMQProducer::send_async`] 的文档）。所以「等不到许可」的等待时间记在回调到达
 //! 之前，而不是记在 `send_async` 的返回上；被拒的文案、扣费与归还完全一致。

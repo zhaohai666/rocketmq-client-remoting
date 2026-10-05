@@ -1,7 +1,7 @@
 //! SQL92 过滤 + `CHECK_CLIENT_CONFIG(46)` 对**真实 5.5.1 集群**的联调验证。
 //!
 //! 与 `python/verify_sql92_live.py`、`cpp/examples/sql92_live.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveSql92.cs` 同一套断言（四语言对拍）。
+//! `csharp/examples/RocketMQ.Examples/LiveSql92.cs` 同一套断言（四语言对拍）。
 //!
 //! 为什么必须在真集群上跑：SQL92 这条链路最容易「静默失效」。broker 的
 //! `ExpressionMessageFilter` 在 ConsumeQueue 阶段拿不到编译好的过滤数据时**直接放行全部

@@ -5,7 +5,7 @@
 # **A 端压出来的字节 B 端能不能解开** —— 而压缩解错的失败模式是静默数据损坏
 # （拿到压缩字节当正文，不报错），只有真机 + 真跨客户端才暴露得出来。
 #
-# 五端（python / cpp / dotnet / rust / go）载荷由各自本地按同一配方重建（同一行文本重复后
+# 五端（python / cpp / csharp / rust / go）载荷由各自本地按同一配方重建（同一行文本重复后
 # 截断），所以判定只看接收端打印的 `match=1`，**不要**比两边打印的 CRC 数字
 # （Java 口径的 UtilAll.crc32 会 & 0x7FFFFFFF，本仓库四端都用标准 CRC-32）。
 #
@@ -16,7 +16,7 @@
 # 前置条件（先构建好四端，本脚本不触发构建）：
 #   python/.venv 已装 lz4（zstandard 可选，缺了 zstd 的 py 两只会打 SKIP）
 #   cpp/build/examples/rmq_compression_live
-#   dotnet 示例已 build（用 dotnet run --no-build）
+#   csharp 示例已 build（用 dotnet run --no-build）
 #   rust example: cargo build --example live_compression_matrix
 #   go 端由本脚本自己 build（零第三方依赖，标准库编译即可）
 # 以及一个 autoCreateTopicEnable=true 的 nameServer(9876)+broker(10911)。
@@ -27,7 +27,7 @@
 #
 # ⚠ python 端没有 zstandard 时**明确抛错**而不是静默透传（message_decoder._zstd），
 # 所以 zstd 矩阵里 python 必然失败 —— 那不是互通性问题，脚本直接 SKIP 掉，
-# zstd 的跨语言互通由 cpp / dotnet / rust 三端互测覆盖。
+# zstd 的跨语言互通由 cpp / csharp / rust 三端互测覆盖。
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NS=${ROCKETMQ_NAMESRV:-127.0.0.1:9876}
@@ -63,12 +63,12 @@ exec "$ROOT/cpp/build/examples/rmq_compression_live" recv $NS "\$1" "\$2" $SIZE
 EOF
 cat > "$BIN/net_send" <<EOF
 #!/bin/bash
-cd "$ROOT/dotnet" || exit 1
+cd "$ROOT/csharp" || exit 1
 exec dotnet run --no-build --project examples/RocketMQ.Examples -- compression-live send $NS "\$1" "\$2" $SIZE $CODEC
 EOF
 cat > "$BIN/net_recv" <<EOF
 #!/bin/bash
-cd "$ROOT/dotnet" || exit 1
+cd "$ROOT/csharp" || exit 1
 exec dotnet run --no-build --project examples/RocketMQ.Examples -- compression-live recv $NS "\$1" "\$2" $SIZE
 EOF
 # rust 端：cargo 造出来的 example 二进制（参数顺序 send|recv <topic> <group> <size> [namesrv] [codec]）

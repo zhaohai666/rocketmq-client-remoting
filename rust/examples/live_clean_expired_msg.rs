@@ -2,7 +2,7 @@
 //! ＋ `ProcessQueue.cleanExpiredMsg:75-127`）。
 //!
 //! 与 `python/verify_clean_expired_msg_live.py`、`cpp/examples/live_clean_expired_msg.cpp`、
-//! .NET 的对应场景同题、逐条对应（A0–A5）。
+//! C# 的对应场景同题、逐条对应（A0–A5）。
 //!
 //! 离线单测（`src/client/consumer.rs` 的 `clean_expired_queue_*` 与
 //! `send_back_batch_skips_entries_swept_away`）锁的是**判据**（选条/阈值/上限/摘除闸门/

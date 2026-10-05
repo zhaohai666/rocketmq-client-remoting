@@ -1,6 +1,6 @@
 //! 异步轨迹分发器（对应 Java
 //! `org.apache.rocketmq.client.trace.AsyncTraceDispatcher`，逐条移植
-//! `python/rocketmq/client/trace_dispatcher.py`）。
+//! `python/client/trace_dispatcher.py`）。
 //!
 //! 职责与 Python 模块头一致：钩子把 [`TraceContext`] 丢进内存队列（[`append`]，
 //! `trace_dispatcher.py:165`），后台任务按「攒够 `batch_num` 条 或 距上次发送超过 5s」
@@ -1431,7 +1431,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     // 金标准来源：`python/tests/test_trace.py` + 本机跑
-    // `python/rocketmq/client/trace_dispatcher.py` 的探针（/tmp/probe_td.py、
+    // `python/client/trace_dispatcher.py` 的探针（/tmp/probe_td.py、
     // /tmp/probe_td2.py，PYTHONPATH=. python3 执行），非手推。
     const SOH: char = TraceConstants::CONTENT_SPLITOR;
     const STX: char = TraceConstants::FIELD_SPLITOR;

@@ -1,7 +1,7 @@
 // org.apache.rocketmq.common.topic.TopicValidator 的 C++ 对应：
 // topic / group 名字的合法性判定（字符表、长度上限、系统 topic 名单）。
 //
-// 与 Python 参考实现（python/rocketmq/common/topic_validator.py）逐条对齐：
+// 与 Python 参考实现（python/common/topic_validator.py）逐条对齐：
 // Java 的字符表白名单是 ^[%|a-zA-Z0-9_-]+$，实现方式是一张 128 长的
 // VALID_CHAR_BIT_MAP——**码点 >= 128 一律非法**。这里按字节实现（UTF-8 的非 ASCII
 // 字节必然 >= 0x80，因此与 Java 按 char 判定在真实输入上等价）。客户端放行而

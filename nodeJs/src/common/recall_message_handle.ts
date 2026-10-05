@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // RecallMessageHandle (org.apache.rocketmq.common.producer.RecallMessageHandle).
-// Faithful port of python/rocketmq/common/recall_message_handle.py.
+// Faithful port of python/common/recall_message_handle.py.
 //
 // The handle is produced by the broker (SendMessageProcessor#attachRecallHandle) and returned
 // on the SEND response; the client only carries it back to recallMessage. Encoding matches Java

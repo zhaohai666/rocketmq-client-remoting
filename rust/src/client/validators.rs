@@ -1,5 +1,5 @@
 //! 发送/订阅入口上的名字校验（对应 `org.apache.rocketmq.client.Validators`，
-//! 文案与判定顺序以 `python/rocketmq/client/validators.py` 为准）。
+//! 文案与判定顺序以 `python/client/validators.py` 为准）。
 //!
 //! **为什么要在客户端就拦下来**：topic/group 名字非法时 broker 也会拒，但要等到请求
 //! 真的打出去才拿到 `TOPIC_NOT_EXIST` / `ILLEGAL_TOPIC`，而 `TOPIC_NOT_EXIST` 在发送
@@ -29,7 +29,7 @@ use crate::remoting::protocol::codes::response_code::MESSAGE_ILLEGAL;
 /// 对应 Java `Validators.CHARACTER_MAX_LENGTH`（本模块未用到，保留常量口径）。
 pub const CHARACTER_MAX_LENGTH: i32 = 255;
 
-/// 对应 Java `File.separator` / Python `os.sep` / .NET `Path.DirectorySeparatorChar`：
+/// 对应 Java `File.separator` / Python `os.sep` / C# `Path.DirectorySeparatorChar`：
 /// Windows 上是 `\`，其余是 `/`。
 pub const FILE_SEPARATOR: char = std::path::MAIN_SEPARATOR;
 

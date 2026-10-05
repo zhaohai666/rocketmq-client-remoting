@@ -1,7 +1,7 @@
 // 拉取前流控（Java ProcessQueue 五个阈值）真机验证。
 // 用法：rmq_live_flow_control 127.0.0.1:9876
 //
-// 与 Python 的 verify_flow_control_live.py、Rust 的 live_flow_control.rs、.NET 的
+// 与 Python 的 verify_flow_control_live.py、Rust 的 live_flow_control.rs、C# 的
 // LiveFlowControl.cs 一一对应（S0~S5）。
 //
 // 离线单测（tests/test_flow_control.cpp）锁的是**判据本身**；这里锁真机上两件离线

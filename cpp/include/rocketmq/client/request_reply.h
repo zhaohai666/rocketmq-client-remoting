@@ -4,7 +4,7 @@
 //   org.apache.rocketmq.client.utils.MessageUtil#createReplyMessage
 //   org.apache.rocketmq.client.impl.ClientRemotingProcessor#receiveReplyMessage
 //
-// 协议回顾（与 python/rocketmq/client/request_reply.py 同形）：
+// 协议回顾（与 python/client/request_reply.py 同形）：
 //
 //     请求方 (producer.request)                    应答方 (push consumer)
 //     ─────────────────────────                    ──────────────────────

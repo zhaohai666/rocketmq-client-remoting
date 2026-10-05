@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     // **当时的** maxOffset（RebalancePushImpl.java:174-190），所以"先发、后起消费者"
     // 会（正确地）一条都收不到；而 broker 的 consumequeue 是异步分发/刷盘的，
     // "刚发完立刻查 maxOffset"还可能读到 0 —— 同一时序在三种语言间结果不一致
-    // （实测 Python 收 0 条、C++/.NET 收 3 条）。先起消费者才是确定性的、只测 ACL 的顺序。
+    // （实测 Python 收 0 条、C++/C# 收 3 条）。先起消费者才是确定性的、只测 ACL 的顺序。
     int32_t sent = 0;
     std::printf("\nS4/S5 带正确凭据的生产者/消费者（先起消费者再发送）\n");
     {

@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Latency fault tolerance (org.apache.rocketmq.client.latency.*).
-// Faithful port of python/rocketmq/client/latency.py.
+// Faithful port of python/client/latency.py.
 //
 // MQFaultStrategy decides which broker queue to use next, avoiding brokers that have recently
 // shown high latency / were isolated after a failed send (when sendLatencyFaultEnable is on).

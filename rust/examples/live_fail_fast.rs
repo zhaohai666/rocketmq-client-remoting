@@ -1,7 +1,7 @@
 //! broker 真的死了：在途请求必须**立刻**有终态（Java `failFast` → `requestFail`）真机验证。
 //!
 //! 与 `python/verify_fail_fast_live.py`、`cpp/examples/live_fail_fast.cpp`、
-//! `dotnet/examples/RocketMQ.Examples/LiveFailFast.cs` 同场景、同断言。
+//! `csharp/examples/RocketMQ.Examples/LiveFailFast.cs` 同场景、同断言。
 //!
 //! 前置：NameServer + Broker 已起（脚本会**停一次 broker 再拉起**，不删 store）。
 //!

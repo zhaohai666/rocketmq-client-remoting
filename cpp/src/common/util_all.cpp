@@ -1,6 +1,6 @@
 // org.apache.rocketmq.common.UtilAll 的 C++ 实现。
 //
-// 对齐 python/rocketmq/common/util_all.py：
+// 对齐 python/common/util_all.py：
 //   - bytes2String 输出**大写**十六进制（msgId 依赖大小写）；
 //   - string2Bytes 是十六进制解码（非 UTF-8），非法字符返回空串；
 //   - crc32 为标准 CRC32（poly 0xEDB88320），与 Java/zlib 一致。

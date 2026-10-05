@@ -1,5 +1,5 @@
 //! 消息轨迹钩子（对应 Java `org.apache.rocketmq.client.trace.hook` 包，
-//! 逐条对齐 `python/rocketmq/client/trace_hook.py`）：
+//! 逐条对齐 `python/client/trace_hook.py`）：
 //!
 //! * [`SendMessageTraceHook`]    ← `trace.hook.SendMessageTraceHookImpl`
 //! * [`ConsumeMessageTraceHook`] ← `trace.hook.ConsumeMessageTraceHookImpl`

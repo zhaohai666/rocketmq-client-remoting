@@ -518,7 +518,7 @@ func (p *DefaultMQProducer) executeOnCallbackThread(task func()) {
 // assigns sendResult, so the unguarded block runs with null), and once here with
 // the real outcome. The trace hook happens to survive that only because
 // SendMessageTraceHookImpl:74-76 returns early on a null result. Firing it once
-// with the real outcome is what the Python, C++ and .NET ports do, and it is
+// with the real outcome is what the Python, C++ and C# ports do, and it is
 // what a hook can actually act on.
 func (p *DefaultMQProducer) completeAsync(chain *asyncChain, result *SendResult, err error) {
 	if chain.ctx != nil {

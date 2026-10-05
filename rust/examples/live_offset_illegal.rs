@@ -1,7 +1,7 @@
 //! `OFFSET_ILLEGAL` 纠错分支（Java `DefaultMQPushConsumerImpl:402-427`）真机验证。
 //!
 //! 与 `python/verify_offset_illegal_live.py`、`cpp/examples/live_offset_illegal.cpp`、
-//! dotnet 的对应场景同题、逐条对应。
+//! csharp 的对应场景同题、逐条对应。
 //!
 //! 这条分支做四件事：位点改用 broker 给的修正值（`setNextOffset`）→ 丢掉这条队列上
 //! 已取回未消费的消息（`ProcessQueue.setDropped(true)`）→ 把修正位点**立刻**落盘

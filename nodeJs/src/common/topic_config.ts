@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // TopicConfig (org.apache.rocketmq.common.TopicConfig).
-// Faithful port of python/rocketmq/common/topic_config.py.
+// Faithful port of python/common/topic_config.py.
 
 import { PermName } from './sysflag.ts';
 

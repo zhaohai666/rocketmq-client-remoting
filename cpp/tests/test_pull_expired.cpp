@@ -11,7 +11,7 @@
 //
 // 这里锁阈值算术与逐队列时刻表；「撤掉之后真能重新消费」要起真线程、还要真 broker
 // 认位点，只能在真机验（examples/live_redelivery.cpp 的 S11 停摆自愈场景）。
-// 与 Python(tests/test_pull_expired.py)/Rust/.NET 的同名测试一一对应。
+// 与 Python(tests/test_pull_expired.py)/Rust/C# 的同名测试一一对应。
 #include <cstdio>
 #include <string>
 

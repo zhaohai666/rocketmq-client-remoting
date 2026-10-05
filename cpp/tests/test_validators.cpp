@@ -1,7 +1,7 @@
 // Validators / TopicValidator 单测（任务 #32 "Validators fast-fail"）。
 //
 // 锁定三件事：
-//   1. **文案与判定顺序**以 python/rocketmq/client/validators.py 为准（逐字对拍）；
+//   1. **文案与判定顺序**以 python/client/validators.py 为准（逐字对拍）；
 //   2. body/大小/INNER_MULTI_DISPATCH 三档带 MESSAGE_ILLEGAL(13)，topic/group 三档
 //      用默认码（Python 的 UNKNOWN=1）；
 //   3. 生产者/消费者 start() 的组名守卫在**建客户端实例之前**跑完——非法/保留组

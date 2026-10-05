@@ -1,5 +1,5 @@
 //! 命名空间工具（对应 Java `org.apache.rocketmq.remoting.protocol.NamespaceUtil`，
-//! 参考实现 `python/rocketmq/remoting/protocol/namespace_util.py`）。
+//! 参考实现 `python/remoting/protocol/namespace_util.py`）。
 //!
 //! 命名空间用于多租户隔离：客户端把 `namespace` 以 `namespace%` 前缀拼到
 //! topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层之前再剥掉前缀。

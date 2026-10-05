@@ -75,7 +75,7 @@ type MessageQueueSelector interface {
 //
 // Python uses the builtin hash(arg), whose string hash changes with
 // PYTHONHASHSEED and is not reproducible across processes. Like the Rust, C++
-// and .NET ports this uses Java String.hashCode semantics instead —
+// and C# ports this uses Java String.hashCode semantics instead —
 // deterministic, which is the point of a sharding key.
 type SelectMessageQueueByHash struct{}
 

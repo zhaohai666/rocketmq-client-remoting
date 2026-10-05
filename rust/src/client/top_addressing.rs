@@ -1,5 +1,5 @@
 //! 动态 name server 取址（对应 `org.apache.rocketmq.common.namesrv.TopAddressing` /
-//! `DefaultTopAddressing` 与 `MixAll.getWSAddr`，逐条对齐 `python/rocketmq/client/top_addressing.py`）。
+//! `DefaultTopAddressing` 与 `MixAll.getWSAddr`，逐条对齐 `python/client/top_addressing.py`）。
 //!
 //! Java 语义锚点（5.5.1 源码）：
 //!

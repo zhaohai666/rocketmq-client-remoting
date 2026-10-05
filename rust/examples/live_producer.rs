@@ -34,7 +34,7 @@
 //!   broker」开关不影响真集群上的正常发送、没有路由时按错误码定性而非空转重试。
 //! - P11 **退出注销**：`shutdown()` 逐台 broker 发 `UNREGISTER_CLIENT`(35)。同 `instanceName`
 //!   的两个生产者共用一条连接，先退的那个组照样从 broker 消失、另一个的连接仍在 ——
-//!   这条判据把「35 生效」和「TCP 断了才被清掉」分开（Python/C++/.NET 一生产者一实例，
+//!   这条判据把「35 生效」和「TCP 断了才被清掉」分开（Python/C++/C# 一生产者一实例，
 //!   只能用抓帧证明，见那边的 `verify_producer_unregister_live.py` / `live_producer_unregister.cpp`
 //!   / `ProducerUnregisterLive.cs`）。
 //!
@@ -1877,7 +1877,7 @@ async fn producer_clients(admin: &DefaultMQAdminExt, group: &str) -> Vec<String>
 /// Java 链路：`DefaultMQProducerImpl#shutdown:313` → `MQClientInstance#unregisterProducer:1198-1201`
 /// → 私有 `unregisterClient(group, null):1158-1182`。判别式在**同一条连接**上：
 /// 同一个 `instanceName` ⇒ 同一个 clientId ⇒ 同一个 `MQClientInstance` ⇒ 每台 broker 一条
-/// TCP 连接（Python/C++/.NET 每个生产者各自一份实例，做不了这条判据，那边改用抓帧证明）。
+/// TCP 连接（Python/C++/C# 每个生产者各自一份实例，做不了这条判据，那边改用抓帧证明）。
 /// 于是先退场的 A 并不会把连接关掉（`MQClientInstance#shutdown` 的租户守卫让实例活着，
 /// broker 那条 channel 依旧为 B 服务），这种情况下 A 的组能从 `ProducerManager.groupChannelTable`
 /// 里消失，只有一发被 broker 接受的 35 解释得通 —— 不发的话只能等通道断开或 120s 扫描。

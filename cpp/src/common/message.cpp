@@ -1,6 +1,6 @@
 // 消息模型实现（对应 org.apache.rocketmq.common.message.*）。
 //
-// 对齐 python/rocketmq/common/message.py：
+// 对齐 python/common/message.py：
 //   - MessageQueue.hashCode 与 Java 逐位一致（32 位有符号回绕）；
 //   - 属性快捷方式（TAGS/KEYS/DELAY/WAIT）读写 properties；
 //   - MessageBatch.generateFromList 的约束：非空 / 同 topic / 同 waitStoreMsgOK / 禁延时 / 禁重试 topic。

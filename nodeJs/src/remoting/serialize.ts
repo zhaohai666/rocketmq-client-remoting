@@ -1,7 +1,7 @@
 // -*- coding: utf-8 -*-
 // Protocol serialization: JSON (RemotingSerializable) + fastjson2-tolerant parser
 // + RocketMQ private binary header (RocketMQSerializable).
-// Mirrors python/rocketmq/remoting/protocol/serialize.py.
+// Mirrors python/remoting/protocol/serialize.py.
 import { Buffer } from 'node:buffer';
 
 // ---------------------------------------------------------------------------

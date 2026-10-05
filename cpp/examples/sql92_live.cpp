@@ -1,6 +1,6 @@
 // C++ 客户端 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调
 // （对应 python/verify_sql92_live.py、cpp/tests/test_check_client_config.cpp、
-//   rust/examples/live_sql92.rs、dotnet/examples/.../LiveSql92.cs 的 S1–S4：四语言对拍）。
+//   rust/examples/live_sql92.rs、csharp/examples/.../LiveSql92.cs 的 S1–S4：四语言对拍）。
 //
 // 为什么必须在真集群上跑：SQL92 这条链路最容易「静默失效」。broker 的
 // ExpressionMessageFilter 在 ConsumeQueue 阶段拿不到编译好的过滤数据时**直接放行全部

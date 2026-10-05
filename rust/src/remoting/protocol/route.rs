@@ -1,6 +1,6 @@
 //! Topic 路由数据（对应 `org.apache.rocketmq.remoting.protocol.route.*`）。
 //!
-//! 移植 `python/rocketmq/remoting/protocol/route.py`：`QueueData` / `BrokerData` /
+//! 移植 `python/remoting/protocol/route.py`：`QueueData` / `BrokerData` /
 //! `TopicRouteData`。这三个类是 nameserver `GET_ROUTE_INFO_BY_TOPIC(105)` 应答的 body，
 //! 也是客户端路由表的全部数据结构。
 //!

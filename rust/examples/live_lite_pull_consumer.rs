@@ -852,7 +852,7 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         None => return,
     };
     // 心跳的目标是「实例路由表里已知的 broker」。lite 的 `start()` 已经同步刷过一次
-    // 订阅 topic 的路由（Python/C++/.NET 同口径），所以首轮心跳就能落到 broker 上；
+    // 订阅 topic 的路由（Python/C++/C# 同口径），所以首轮心跳就能落到 broker 上；
     // 这里仍然先等重平衡拿到分配，再验心跳真的到得了 broker
     // —— 没注册上订阅，broker 侧的 tag 过滤与 GET_CONSUMER_LIST_BY_GROUP 都会失真。
     let _ = wait_assignment(&c, QUEUE_NUMS as usize, 20).await;

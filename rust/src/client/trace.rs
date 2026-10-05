@@ -1,5 +1,5 @@
 //! 消息轨迹（对应 Java `org.apache.rocketmq.client.trace` 包 + `client.AccessChannel`），
-//! 逐条对齐 `python/rocketmq/client/trace.py`。
+//! 逐条对齐 `python/client/trace.py`。
 //!
 //! 包含：
 //! * [`TraceConstants`] —— 常量（`org.apache.rocketmq.client.trace.TraceConstants`）

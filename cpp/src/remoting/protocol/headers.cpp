@@ -1,6 +1,6 @@
 // 请求/响应自定义头 <-> extFields 的映射实现。
 //
-// 严格对齐 python/rocketmq/remoting/protocol/headers.py 与 Java header/*.java：
+// 严格对齐 python/remoting/protocol/headers.py 与 Java header/*.java：
 //   - toExtFields()：仅输出已设置（optional 有值）的字段，等价 Java makeCustomHeaderToNet 的"非空才写"；
 //   - fromExtFields()：从 extFields 读回，缺省保持 nullopt；
 //   - V2 用短字段名 a..n 缩减头部体积，并可无损与 V1 互转。

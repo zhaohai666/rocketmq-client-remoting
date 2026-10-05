@@ -1,5 +1,5 @@
 //! 发送延迟故障容错（对应 Java `org.apache.rocketmq.client.latency.*`，
-//! 逐条对齐 `python/rocketmq/client/latency.py`）。
+//! 逐条对齐 `python/client/latency.py`）。
 //!
 //! 实现 [`MQFaultStrategy`] + [`LatencyFaultToleranceImpl`]（带 [`FaultItem`]）：
 //! 追踪每个 broker 的发送延迟，延迟过高或发生异常时**隔离**一段时间

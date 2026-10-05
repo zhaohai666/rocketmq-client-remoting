@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Topic route data (org.apache.rocketmq.remoting.protocol.route.*).
-// Mirrors python/rocketmq/remoting/protocol/route.py.
+// Mirrors python/remoting/protocol/route.py.
 import { MessageQueue } from '../common/message.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { PermName } from '../common/sysflag.ts';

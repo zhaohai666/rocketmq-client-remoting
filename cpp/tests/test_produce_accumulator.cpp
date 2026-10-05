@@ -2,7 +2,7 @@
 // 526 行）—— 不需要集群，全部对着一个「只记账、按剧本回结果」的假生产者跑。
 //
 // 与 python/tests/test_produce_accumulator.py（18 例）、
-// dotnet/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs（17 例）、
+// csharp/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs（17 例）、
 // rust/src/client/produce_accumulator/tests.rs（16 例）同题。
 //
 // 覆盖 Java `ProduceAccumulatorTest` 的三个场景（同步 / 异步 / 指定 MessageQueue），另补：

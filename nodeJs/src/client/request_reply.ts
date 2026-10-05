@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Request-reply support (org.apache.rocketmq.client.producer.RequestReplyProducer).
-// Faithful port of python/rocketmq/client/request_reply.py.
+// Faithful port of python/client/request_reply.py.
 //
 // A request producer sends a message carrying a correlation id + reply-to topic; the replying
 // side creates a reply message and the future is resolved. This module holds the in-flight

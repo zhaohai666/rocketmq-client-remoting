@@ -1,5 +1,5 @@
 //! 消息模型（对应 Java `org.apache.rocketmq.common.message.{MessageQueue,Message,
-//! MessageExt,MessageBatch}`，参考实现 `python/rocketmq/common/message.py`）。
+//! MessageExt,MessageBatch}`，参考实现 `python/common/message.py`）。
 //!
 //! 属性容器一律用 [`StringMap`]（保序）：17 段格式第 17 项是按插入顺序拼出来的
 //! `k\x01v\x02` 字节串，换成 `HashMap` 会直接破坏逐字节对拍。

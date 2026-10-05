@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Produce accumulator for batching small messages before a single broker send.
-// Faithful port of python/rocketmq/client/produce_accumulator.py (threads replaced by an
+// Faithful port of python/client/produce_accumulator.py (threads replaced by an
 // async guard, since Node has no Python threads). The producer wires a real sender.
 import { Message } from '../common/message.ts';
 import { MessageQueue } from '../common/message.ts';

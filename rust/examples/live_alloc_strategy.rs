@@ -5,7 +5,7 @@
 //! broker 是否看得见同组第二个实例、分配结果是否真的驱动了收发。所以这里跑真集群。
 //!
 //! 场景与 cpp/examples/live_lite_pull.cpp、`verify_lite_pull_live.py`、
-//! .NET `LiveLitePull` 的 S7 同口径（同一套断言，跨语言对拍）：
+//! C# `LiveLitePull` 的 S7 同口径（同一套断言，跨语言对拍）：
 //! - A1 默认策略：`allocate_message_queue_strategy()` 回读 = AVG（Java 字段初值），
 //!   setter 换掉的策略能读回 AVG_BY_CIRCLE。
 //! - A2 同组两实例 + AVG_BY_CIRCLE：两边各自心跳注册，broker 的

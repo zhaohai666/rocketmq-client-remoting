@@ -2,7 +2,7 @@
 // 以及同一条分界线的**地址侧**（#100：findBrokerAddressInPublish:1295-1305，发送只认主）。
 //
 // 与 `python/verify_publish_route_master_live.py`、`rust/examples/live_publish_route_master.rs`、
-// `dotnet/examples/RocketMQ.Examples/LivePublishRouteMaster.cs` 同场景、逐条同断言。
+// `csharp/examples/RocketMQ.Examples/LivePublishRouteMaster.cs` 同场景、逐条同断言。
 //
 // 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
 // （scripts/rmq_test_broker.sh 只认 master 的 java 进程），收尾块保证 master 一定回来。

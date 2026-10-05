@@ -1,5 +1,5 @@
 //! 消息系统标志位（对应 Java `org.apache.rocketmq.common.sysflag.*`，
-//! 参考实现 `python/rocketmq/common/sysflag.py`）。
+//! 参考实现 `python/common/sysflag.py`）。
 //!
 //! `sysFlag` 是一个 32 位整数，随消息一起落盘（17 段格式的第 8 项）并在
 //! pull / send 请求头里透传，所以位含义必须与 Java 逐位一致。

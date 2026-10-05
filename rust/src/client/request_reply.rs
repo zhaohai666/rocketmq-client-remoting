@@ -1,4 +1,4 @@
-//! Request-Reply（5.x）客户端侧支撑，逐条对齐 `python/rocketmq/client/request_reply.py`。
+//! Request-Reply（5.x）客户端侧支撑，逐条对齐 `python/client/request_reply.py`。
 //!
 //! 对应 Java 的这几个类：
 //! * `org.apache.rocketmq.client.producer.RequestResponseFuture`

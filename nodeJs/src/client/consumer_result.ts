@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // Consumer-side result models (org.apache.rocketmq.client.consumer.*).
-// Faithful port of python/rocketmq/client/consumer_result.py.
+// Faithful port of python/client/consumer_result.py.
 import { MessageQueue } from '../common/message.ts';
 import { MessageExt } from '../common/message.ts';
 

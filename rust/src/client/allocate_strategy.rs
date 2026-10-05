@@ -6,7 +6,7 @@
 //! AllocateMessageQueueByConfig, AllocateMessageQueueConsistentHash,
 //! AllocateMessageQueueByMachineRoom, AllocateMachineRoomNearby}`
 //! （`#allocate` / `#getName` / `#check`）；
-//! 逐条对齐参考实现 `python/rocketmq/client/consumer.py:153-259`（机房/一致性哈希三个
+//! 逐条对齐参考实现 `python/client/consumer.py:153-259`（机房/一致性哈希三个
 //! 类在 `consumer.py:264-620`）。
 //!
 //! 注：本仓库的 Java 快照把这些实现类放在 `client.consumer.rebalance` 包下（部分上游版本
@@ -1304,7 +1304,7 @@ mod tests {
     ///
     /// 期望值是**真实 Java 5.5.1 客户端**跑出来的（`client/target/classes` 上的
     /// `AllocateMessageQueueConsistentHash`），与 Python
-    /// `tests/test_allocate_strategy.py::CONSISTENT_HASH_CASES`、C++/.NET 的表逐值相同：
+    /// `tests/test_allocate_strategy.py::CONSISTENT_HASH_CASES`、C++/C# 的表逐值相同：
     /// 四语言 + Java 必须算出同一个环，否则混跑时全体队列换主。
     const CONSISTENT_HASH_CASES: &[Case] = &[
         Case {

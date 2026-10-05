@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // HTTP namesrv addressing (org.apache.rocketmq.common.namesrv.TopAddressing).
-// Faithful port of python/rocketmq/client/top_addressing.py.
+// Faithful port of python/client/top_addressing.py.
 //
 // Resolves the namesrv address list from an HTTP "ws" endpoint. The domain must be supplied
 // explicitly via the constructor or the ROCKETMQ_NAMESRV_DOMAIN env var (there is intentionally

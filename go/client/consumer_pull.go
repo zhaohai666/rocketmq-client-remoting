@@ -4,7 +4,7 @@
 // Why one goroutine PER QUEUE rather than Java's shared PullMessageService
 // thread: the push consumer long-polls (suspend=true), so an idle queue parks
 // its request for up to ~15s. A shared thread would serialise those parks and
-// starve every other queue. The Python/C++/.NET ports made the same call.
+// starve every other queue. The Python/C++/C# ports made the same call.
 package client
 
 import (

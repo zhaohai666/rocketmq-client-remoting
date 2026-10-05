@@ -1,5 +1,5 @@
 // 生产者自动攒批（对应 org.apache.rocketmq.client.producer.ProduceAccumulator，Java 5.5.0）。
-// 与 `python/rocketmq/client/produce_accumulator.py`、`dotnet/.../ProduceAccumulator.cs`、
+// 与 `python/client/produce_accumulator.py`、`csharp/.../ProduceAccumulator.cs`、
 // `rust/src/client/produce_accumulator.rs` 同题。
 //
 // 打开 `autoBatch` 之后，`send(Message)` 不再一条一条直发，而是先按

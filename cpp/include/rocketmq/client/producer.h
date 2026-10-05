@@ -576,7 +576,7 @@ protected:
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
     // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释和
-    // Python/dotnet 一致；写死 false 会让这条 env 开关形同虚设。
+    // Python/C# 一致；写死 false 会让这条 env 开关形同虚设。
     bool enableTraceContext_ = traceContextEnabledFromEnv();
     int32_t sendMsgTimeout_ = 3000;
     // Request-Reply 默认超时（对应 Java DefaultMQProducer 的 request 兜底 3000ms）

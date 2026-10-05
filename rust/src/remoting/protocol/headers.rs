@@ -1,6 +1,6 @@
 //! 全部请求/响应头（对应 `org.apache.rocketmq.remoting.protocol.header.*`）。
 //!
-//! 移植 `python/rocketmq/remoting/protocol/headers.py` 的 79 个
+//! 移植 `python/remoting/protocol/headers.py` 的 79 个
 //! `CommandCustomHeader` 实现：每个结构体都提供
 //!
 //! * `to_ext_fields` —— 只写**非 `None`** 字段，与 Java

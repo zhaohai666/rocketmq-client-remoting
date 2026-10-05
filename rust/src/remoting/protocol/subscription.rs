@@ -1,6 +1,6 @@
 //! 订阅组模型（对应 `org.apache.rocketmq.remoting.protocol.subscription` 包）。
 //!
-//! 移植 `python/rocketmq/remoting/protocol/subscription.py`：
+//! 移植 `python/remoting/protocol/subscription.py`：
 //! [`SubscriptionGroupConfig`] / [`GroupRetryPolicy`] / [`SimpleSubscriptionData`] /
 //! [`SubscriptionGroupWrapper`]。admin（`examineSubscriptionGroupConfig` 等）与
 //! broker 侧返回体都走这里。

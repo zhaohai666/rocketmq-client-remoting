@@ -1,7 +1,7 @@
 //! 异步发送背压（对应 Java `DefaultMQProducer:169/175/181` 的三个配置、
 //! `DefaultMQProducerImpl:122-153` 的两个公平信号量、`:635-682` 的
 //! `executeAsyncMessageSend` 闸门和 `:577-633` 的 `BackpressureSendCallBack`，
-//! 逐条对齐 `python/rocketmq/client/backpressure.py`）。
+//! 逐条对齐 `python/client/backpressure.py`）。
 //!
 //! Java 的开关默认是**关**的。开了之后，异步发送在把任务投进 `AsyncSenderExecutor`
 //! **之前**先按两个维度限流：
@@ -15,10 +15,10 @@
 //! `Error::TooMuchRequest("send message tryAcquire semaphoreAsyncNum timeout")`
 //! （第二个是 `...semaphoreAsyncSize timeout`），一次请求都不会发出去。
 //!
-//! # 与 Python/C++/.NET 端口的两处结构差别
+//! # 与 Python/C++/C# 端口的两处结构差别
 //!
 //! 1. **等待是 async 的**：`try_acquire` 是 `async fn`，等不到许可时让出执行器而不是
-//!    占住线程。Java/Python/C++/.NET 都在调用方线程上阻塞等，这里不能照做 —— 生产者
+//!    占住线程。Java/Python/C++/C# 都在调用方线程上阻塞等，这里不能照做 —— 生产者
 //!    往往就跑在唯一的 tokio 工作线程上，把它 park 住会让**正要归还许可**的那个完成
 //!    永远得不到调度，单线程运行时直接锁死。闸门因此落在被 spawn 出去的发送任务里
 //!    （见 [`crate::client::producer::DefaultMQProducer::send_async`] 的文档）。

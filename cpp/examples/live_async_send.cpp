@@ -1,5 +1,5 @@
 // 异步发送内核（Java DefaultMQProducerImpl 的 ASYNC 分支 + MQClientAPIImpl.sendMessageAsync/
-// onExceptionImpl）真机验证（对齐 dotnet/examples/RocketMQ.Examples/LiveAsyncSend.cs 的 A1–A6）。
+// onExceptionImpl）真机验证（对齐 csharp/examples/RocketMQ.Examples/LiveAsyncSend.cs 的 A1–A6）。
 // 用法：rmq_live_async_send 127.0.0.1:9876
 //
 // 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。

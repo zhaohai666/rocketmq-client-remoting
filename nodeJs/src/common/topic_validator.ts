@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // TopicValidator (org.apache.rocketmq.common.topic.TopicValidator).
-// Faithful port of python/rocketmq/common/topic_validator.py.
+// Faithful port of python/common/topic_validator.py.
 //
 // The Java validator uses a 128-entry VALID_CHAR_BIT_MAP where code points >= 128 are
 // illegal; here we mirror that with a 7-bit ASCII allow-set (any char >= 128 is rejected).
