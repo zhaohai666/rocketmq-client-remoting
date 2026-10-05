@@ -8,11 +8,11 @@ import sys
 import time
 import threading
 
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
-from rocketmq.common.message import Message, MessageBatch
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
+from client.producer import DefaultMQProducer
+from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
+from common.message import Message, MessageBatch
+from remoting.protocol.heartbeat import ConsumeFromWhere
+from client.consumer_result import ConsumeConcurrentlyStatus
 
 NAMESRV = "127.0.0.1:9876"
 TOPIC = "PythonTestTopic"

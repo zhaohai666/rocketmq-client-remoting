@@ -37,14 +37,14 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import (ConsumeConcurrentlyStatus,
+from client.admin import DefaultMQAdminExt
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import (ConsumeConcurrentlyStatus,
                                              MessageListenerConcurrently)
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.producer import DefaultMQProducer
+from common.message import Message
+from common.mix_all import MixAll
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())

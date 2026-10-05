@@ -34,26 +34,26 @@ from typing import List, Optional
 
 import pytest
 
-from rocketmq.client import producer as producer_module
-from rocketmq.client.backpressure import MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE
-from rocketmq.client.consume_executor import ConsumeExecutor
-from rocketmq.client.exception import (ClientErrorCode, MQBrokerException,
+from client import producer as producer_module
+from client.backpressure import MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE
+from client.consume_executor import ConsumeExecutor
+from client.exception import (ClientErrorCode, MQBrokerException,
                                        MQClientException, RequestTimeoutException)
-from rocketmq.client.hook import CommunicationMode, SendMessageContext
-from rocketmq.client.mq_client import MQClientInstance, TopicPublishInfo
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageQueue
-from rocketmq.common.message_client_id_setter import get_uniq_id
-from rocketmq.common.message_const import MessageConst
-from rocketmq.common.message_decoder import decode_batch_messages
-from rocketmq.remoting.exception import (RemotingConnectException,
+from client.hook import CommunicationMode, SendMessageContext
+from client.mq_client import MQClientInstance, TopicPublishInfo
+from client.producer import DefaultMQProducer
+from client.send_result import SendResult, SendStatus
+from common.message import Message, MessageQueue
+from common.message_client_id_setter import get_uniq_id
+from common.message_const import MessageConst
+from common.message_decoder import decode_batch_messages
+from remoting.exception import (RemotingConnectException,
                                          RemotingSendRequestException,
                                          RemotingTimeoutException,
                                          RemotingTooMuchRequestException)
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.route import BrokerData, TopicRouteData
 
 ADDR_A = "127.0.0.1:10911"
 ADDR_B = "127.0.0.1:10912"
@@ -505,7 +505,7 @@ def test_fixed_mq_retry_stays_on_the_same_broker():
 
 
 def test_fixed_mq_runs_check_forbidden_hook_in_async_mode():
-    from rocketmq.client.hook import CheckForbiddenContext
+    from client.hook import CheckForbiddenContext
 
     seen = []
 
@@ -584,7 +584,7 @@ def test_async_kernel_timeout_gate_fails_before_the_request_goes_out():
 
 
 def test_check_forbidden_rejection_reaches_the_callback():
-    from rocketmq.client.exception import MQClientException as ClientExc
+    from client.exception import MQClientException as ClientExc
 
     class _Block:
         def hook_name(self):

@@ -23,9 +23,9 @@ from __future__ import annotations
 import threading
 from collections import deque
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus, PullStatus
-from rocketmq.common.message import MessageExt, MessageQueue
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import ConsumeConcurrentlyStatus, PullStatus
+from common.message import MessageExt, MessageQueue
 
 GROUP = "GID_CorrectTagsOffsetUnitTest"
 TOPIC = "CorrectTagsOffsetUnitTestTopic"

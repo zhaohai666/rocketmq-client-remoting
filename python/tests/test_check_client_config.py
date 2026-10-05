@@ -26,14 +26,14 @@ from typing import List, Optional
 
 import pytest
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.subscription_data import ExpressionType, SubscriptionData
-from rocketmq.remoting.exception import RemotingConnectException
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+from client.consumer import DefaultMQPushConsumer
+from client.exception import MQClientException
+from client.mq_client import MQClientInstance
+from common.subscription_data import ExpressionType, SubscriptionData
+from remoting.exception import RemotingConnectException
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_CheckCfg"
 TOPIC = "Sql92Topic"

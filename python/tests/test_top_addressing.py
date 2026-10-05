@@ -20,9 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.top_addressing import DefaultTopAddressing, clear_new_line
+from client.consumer import DefaultMQPushConsumer
+from client.mq_client import MQClientInstance
+from client.top_addressing import DefaultTopAddressing, clear_new_line
 
 
 # ------------------------------------------------------------------ mock server

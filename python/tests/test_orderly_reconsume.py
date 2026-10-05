@@ -34,16 +34,16 @@ from collections import deque
 
 import pytest
 
-from rocketmq.client import consumer
-from rocketmq.client.consumer import (_JAVA_INT_MAX, DefaultMQPushConsumer,
+from client import consumer
+from client.consumer import (_JAVA_INT_MAX, DefaultMQPushConsumer,
                                      MessageListenerOrderly)
-from rocketmq.client.consumer_result import (ConsumeConcurrentlyStatus,
+from client.consumer_result import (ConsumeConcurrentlyStatus,
                                              ConsumeOrderlyContext, ConsumeOrderlyStatus)
-from rocketmq.client.hook import ConsumeMessageHook
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.message_const import MessageConst
-from rocketmq.remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
+from client.hook import ConsumeMessageHook
+from client.mq_client import MQClientInstance
+from common.message import MessageExt, MessageQueue
+from common.message_const import MessageConst
+from remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
 
 GROUP = "GID_OrderlyReconsumeUnitTest"
 TOPIC = "OrderlyReconsumeUnitTestTopic"

@@ -8,22 +8,22 @@ SOH=\\x01 / STX=\\x02 做了可读化）。只要三语言的编码器与这些�
 """
 import time
 
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.hook import ConsumeMessageContext, SendMessageContext
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import LocalTransactionState
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.client.trace import (LOCAL_ADDRESS, AccessChannel, TraceBean, TraceConstants,
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.hook import ConsumeMessageContext, SendMessageContext
+from client.mq_client import MQClientInstance
+from client.producer import LocalTransactionState
+from client.send_result import SendResult, SendStatus
+from client.trace import (LOCAL_ADDRESS, AccessChannel, TraceBean, TraceConstants,
                                    TraceContext, TraceDataEncoder, TraceTransferBean,
                                    TraceType, java_split)
-from rocketmq.client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
-from rocketmq.client.trace_hook import ConsumeMessageTraceHook, SendMessageTraceHook
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.message_client_id_setter import (create_uniq_id, get_uniq_id, set_uniq_id)
-from rocketmq.common.message_const import MessageConst
-from rocketmq.common.message_type import MessageType
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
+from client.trace_hook import ConsumeMessageTraceHook, SendMessageTraceHook
+from common.message import MessageExt, MessageQueue
+from common.message_client_id_setter import (create_uniq_id, get_uniq_id, set_uniq_id)
+from common.message_const import MessageConst
+from common.message_type import MessageType
+from common.mix_all import MixAll
+from remoting.protocol.remoting_command import RemotingCommand
 
 SOH = "\u0001"
 STX = "\u0002"
@@ -622,7 +622,7 @@ def test_set_uniq_id_is_idempotent_and_32_hex():
 
 
 def test_parse_send_response_raises_on_error_code():
-    from rocketmq.client.exception import MQBrokerException
+    from client.exception import MQBrokerException
     msg = MessageExt("TopicTest", BODY)
     cmd = RemotingCommand.create_response_command(2)
     cmd.remark = "boom"

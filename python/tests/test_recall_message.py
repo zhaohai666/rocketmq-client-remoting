@@ -17,16 +17,16 @@ from typing import List, Optional
 
 import pytest
 
-from rocketmq.client.exception import MQBrokerException, MQClientException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.mq_client import TopicPublishInfo
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common import recall_message_handle
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.headers import (RecallMessageRequestHeader,
+from client.exception import MQBrokerException, MQClientException
+from client.mq_client import MQClientInstance
+from client.mq_client import TopicPublishInfo
+from client.producer import DefaultMQProducer
+from common import recall_message_handle
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.headers import (RecallMessageRequestHeader,
                                                 RecallMessageResponseHeader,
                                                 SendMessageResponseHeader)
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.remoting_command import RemotingCommand
 
 TOPIC = "TopicRecallUnit"
 BROKER = "broker-a"

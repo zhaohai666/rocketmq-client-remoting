@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from rocketmq.remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
+from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
 
 JAVA_SRC = os.environ.get("ROCKETMQ_JAVA_SRC")
 

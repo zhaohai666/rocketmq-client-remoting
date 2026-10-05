@@ -32,16 +32,16 @@ from typing import List, Optional, Tuple
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.consumer import (DefaultMQPushConsumer, MessageSelector,
+from client.consumer import (DefaultMQPushConsumer, MessageSelector,
                                       SimpleMessageListener)
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.rpchook import RPCHook
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.exception import MQClientException
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.rpchook import RPCHook
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

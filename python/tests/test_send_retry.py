@@ -24,16 +24,16 @@ from typing import List, Optional
 
 import pytest
 
-from rocketmq.client.exception import (ClientErrorCode, MQBrokerException,
+from client.exception import (ClientErrorCode, MQBrokerException,
                                        MQClientException)
-from rocketmq.client.mq_client import TopicPublishInfo
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageQueue
-from rocketmq.remoting.exception import (RemotingConnectException, RemotingException,
+from client.mq_client import TopicPublishInfo
+from client.producer import DefaultMQProducer
+from client.send_result import SendResult, SendStatus
+from common.message import Message, MessageQueue
+from remoting.exception import (RemotingConnectException, RemotingException,
                                          RemotingTimeoutException,
                                          RemotingTooMuchRequestException)
-from rocketmq.remoting.protocol.codes import ResponseCode
+from remoting.protocol.codes import ResponseCode
 
 ADDR = "127.0.0.1:10911"
 

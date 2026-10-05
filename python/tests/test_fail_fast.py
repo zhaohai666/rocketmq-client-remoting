@@ -25,11 +25,11 @@ import time
 
 import pytest
 
-from rocketmq.remoting.client import RemotingClient, _ResponseFuture
-from rocketmq.remoting.exception import (RemotingSendRequestException,
+from remoting.client import RemotingClient, _ResponseFuture
+from remoting.exception import (RemotingSendRequestException,
                                          RemotingTimeoutException)
-from rocketmq.remoting.protocol import remoting_command as rc_mod
-from rocketmq.remoting.protocol.codes import RequestCode
+from remoting.protocol import remoting_command as rc_mod
+from remoting.protocol.codes import RequestCode
 
 
 def _recv_exact(sock, n):

@@ -12,9 +12,9 @@ import struct
 
 import pytest
 
-from rocketmq.remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
-from rocketmq.remoting.protocol.headers import PullMessageRequestHeader, SendMessageRequestHeaderV2
-from rocketmq.remoting.protocol.remoting_command import CURRENT_VERSION, RemotingCommand
+from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
+from remoting.protocol.headers import PullMessageRequestHeader, SendMessageRequestHeaderV2
+from remoting.protocol.remoting_command import CURRENT_VERSION, RemotingCommand
 
 
 def make_request(code=RequestCode.SEND_MESSAGE_V2, opaque=9, **kwargs):
@@ -110,7 +110,7 @@ class TestRoundTrip:
     def test_bad_header_length_raises(self):
         data = bytearray(make_request().encode())
         struct.pack_into(">i", data, 4, 1 << 20)
-        from rocketmq.remoting.exception import RemotingCommandException
+        from remoting.exception import RemotingCommandException
         with pytest.raises(RemotingCommandException):
             RemotingCommand.decode(bytes(data))
 

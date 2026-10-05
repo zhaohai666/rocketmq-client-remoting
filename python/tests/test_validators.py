@@ -19,19 +19,19 @@ import re
 
 import pytest
 
-from rocketmq.client import validators
-from rocketmq.client.consumer import (
+from client import validators
+from client.consumer import (
     DefaultLitePullConsumer,
     DefaultMQPullConsumer,
     DefaultMQPushConsumer,
     SimpleMessageListener,
 )
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
-from rocketmq.common.message_const import MessageConst
-from rocketmq.common.topic_validator import (
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.exception import MQClientException
+from client.producer import DefaultMQProducer
+from common.message import Message
+from common.message_const import MessageConst
+from common.topic_validator import (
     GROUP_MAX_LENGTH,
     NOT_ALLOWED_SEND_TOPIC_SET,
     RETRY_OR_DLQ_TOPIC_MAX_LENGTH,
@@ -43,7 +43,7 @@ from rocketmq.common.topic_validator import (
     is_system_topic,
     is_topic_or_group_illegal,
 )
-from rocketmq.remoting.protocol.codes import ResponseCode
+from remoting.protocol.codes import ResponseCode
 
 # Java 用查表实现字符白名单，这里用注释里的那条正则当独立参照，防止两边一起写错。
 JAVA_PATTERN = re.compile(r"^[%|a-zA-Z0-9_-]+$")

@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import threading
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.boundary_type import BoundaryType
-from rocketmq.common.message import MessageQueue
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.headers import SearchOffsetRequestHeader
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from client.admin import DefaultMQAdminExt
+from client.mq_client import MQClientInstance
+from common.boundary_type import BoundaryType
+from common.message import MessageQueue
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.headers import SearchOffsetRequestHeader
+from remoting.protocol.remoting_command import RemotingCommand
 
 MQ = MessageQueue("T_Boundary", "broker-a", 2)
 ADDR = "127.0.0.1:10911"

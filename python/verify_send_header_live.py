@@ -32,12 +32,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.producer import DefaultMQProducer, SendCallback
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.common.mix_all import MixAll
-from rocketmq.common.sysflag import PermName
+from client.admin import DefaultMQAdminExt
+from client.producer import DefaultMQProducer, SendCallback
+from client.send_result import SendStatus
+from common.message import Message
+from common.mix_all import MixAll
+from common.sysflag import PermName
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())

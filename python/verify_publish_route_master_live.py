@@ -54,18 +54,18 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import ClientErrorCode, MQClientException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message, MessageQueue
-from rocketmq.remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
-from rocketmq.remoting.protocol.codes import RequestCode
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from client.admin import DefaultMQAdminExt
+from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.exception import ClientErrorCode, MQClientException
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message, MessageQueue
+from remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+from remoting.protocol.codes import RequestCode
+from remoting.protocol.heartbeat import ConsumeFromWhere
+from remoting.protocol.remoting_command import RemotingCommand
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 MASTER_ARG = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:10911"

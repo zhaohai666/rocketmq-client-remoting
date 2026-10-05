@@ -10,10 +10,10 @@ import os
 
 import pytest
 
-from rocketmq.client.consumer import (_build_local_offsets_json,
+from client.consumer import (_build_local_offsets_json,
                                        _parse_local_offsets_json,
                                        DefaultMQPushConsumer)
-from rocketmq.common.message import MessageQueue
+from common.message import MessageQueue
 
 # 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
 JAVA_COMPACT = ('{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,'

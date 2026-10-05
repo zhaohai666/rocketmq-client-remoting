@@ -27,14 +27,14 @@ from __future__ import annotations
 
 import pytest
 
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.message import MessageQueue
-from rocketmq.remoting.exception import (RemotingConnectException,
+from client.exception import MQClientException
+from client.mq_client import MQClientInstance
+from common.message import MessageQueue
+from remoting.exception import (RemotingConnectException,
                                          RemotingTimeoutException)
-from rocketmq.remoting.protocol.codes import ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.route import BrokerData, QueueData, TopicRouteData
+from remoting.protocol.codes import ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.route import BrokerData, QueueData, TopicRouteData
 
 MASTER = 0
 SLAVE = 1
@@ -235,8 +235,8 @@ def test_admin_offset_queries_are_master_only_too():
 # 且位点查询的**重查**放宽到从节点（``onlyThisBroker=false``），POP 的重查仍只认主。
 def _invoking(route_holder):
     """离线实例：namesrv 回 ``route_holder[0]``；broker 请求按码回包并逐个记 ``(addr, code)``。"""
-    from rocketmq.remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
-    from rocketmq.remoting.protocol.codes import RequestCode
+    from remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+    from remoting.protocol.codes import RequestCode
 
     inst = MQClientInstance("route-test@unit", ["127.0.0.1:9876"])
     calls = []
@@ -270,7 +270,7 @@ def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
     路由里只剩从节点时 LOCK/UNLOCK 一条都不该上线：从节点上锁等于锁在它自己的锁管理器里，
     master 不知情，顺序消费的互斥保证静默失效。
     """
-    from rocketmq.remoting.protocol.codes import RequestCode
+    from remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _invoking(holder)
@@ -299,8 +299,8 @@ def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
 
 def test_pop_message_is_master_only_and_reports_not_exist():
     """Java ``PullAPIWrapper#popAsync:369-373``：POP 只认主，查不到刷一次路由再查，仍抛 not exist。"""
-    from rocketmq.client.consumer_result import PopStatus
-    from rocketmq.remoting.protocol.codes import RequestCode
+    from client.consumer_result import PopStatus
+    from remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _invoking(holder)
@@ -330,7 +330,7 @@ def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
     与管理侧 offset 查询（一律打主、主没了报错）的差别只在这最后一步：位点是 HA 复制来的
     同一份数据，Java 允许从从节点读。
     """
-    from rocketmq.remoting.protocol.codes import RequestCode
+    from remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _invoking(holder)

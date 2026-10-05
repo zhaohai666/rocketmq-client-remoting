@@ -3,23 +3,27 @@
 RocketMQ 经典 remoting 协议的 Python 实现，Python 进程可以直接用
 **JSON / RocketMQ 二进制** 两种序列化方式与 NameServer、Broker 通信。
 兼容 4.x / 5.x 服务端，全部能力在真实 5.5.1 集群上联调验证过；
-与本仓库的 C++ / .NET / Rust 实现（`../cpp`、`../dotnet`、`../rust`）逐项对齐。
+与本仓库的 C++ / C# / Rust 实现（`../cpp`、`../csharp`、`../rust`）逐项对齐。
 
 ## 安装与测试
 
 ```bash
 pip install -e .
-pytest -q                     # 1156 passed + 4 skipped（skip 为可选压缩依赖相关）
-python -m rocketmq selfcheck  # 协议编解码回环自检（7 项，无需集群）
+pytest -q                     # 1160 passed + 4 skipped（skip 为可选压缩依赖相关）
+python selfcheck.py           # 协议编解码回环自检（7 项，无需集群；在 python/ 目录下执行）
 ```
+
+> ⚠ 包名与 import 名：PyPI 包名仍是 `rocketmq-client-remoting`，但源码树里
+> `client` / `common` / `remoting` 是三个**顶层包**（旧版嵌套包 `rocketmq.*` 已取消），
+> 因此导入写成 `from client.producer import DefaultMQProducer`。
 
 ## 快速上手
 
 发送：
 
 ```python
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
+from client.producer import DefaultMQProducer
+from common.message import Message
 
 producer = DefaultMQProducer("PID_DEMO")
 producer.set_namesrv_addr("127.0.0.1:9876")
@@ -32,8 +36,8 @@ producer.shutdown()
 消费（完整可运行片段见仓库根目录 `README.md`）：
 
 ```python
-from rocketmq.client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
+from client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
+from client.consumer_result import ConsumeConcurrentlyStatus
 
 consumer = DefaultMQPushConsumer("GID_DEMO")
 consumer.set_namesrv_addr("127.0.0.1:9876")
@@ -115,7 +119,7 @@ python verify_latency_live.py             # 故障规避（延迟窗口/隔离/�
 
 ## 客户端日志
 
-`rocketmq/logging.py` 把内部日志桥接到标准 `logging`：
+`rocketmq_logging.py` 把内部日志桥接到标准 `logging`：
 
 - 文件落在 `$HOME/logs/rocketmqlogs/rocketmq_py_client.log`，按天滚动，
   备份名 `rocketmq_py_client.log.YYYY-MM-DD`，保留 `ROCKETMQ_CLIENT_LOG_MAX_INDEX`（默认 10）份；
@@ -133,8 +137,12 @@ python verify_latency_live.py             # 故障规避（延迟窗口/隔离/�
 
 ## 目录结构
 
+`client/`、`common/`、`remoting/` 直接位于本目录（`python/`）下，是三个**顶层包** ——
+把 `python/` 放进 `sys.path` 即可 `from client.producer import DefaultMQProducer`
+（`tests/conftest.py` 已经做了这件事）。
+
 ```
-rocketmq/
+python/
 ├── common/                客户端共用的消息模型与常量
 │   ├── message.py             Message / MessageExt / MessageBatch / MessageQueue
 │   ├── message_decoder.py     17 段存储格式 + 6 段批量格式的编解码（含 zlib 解压）
@@ -160,6 +168,7 @@ rocketmq/
 │   │                          钩子接口（Send/Consume/EndTransaction/CheckForbidden/FilterMessage）
 │   │                          + 消息轨迹文本编解码 + 异步分发
 │   └── send_result.py / consumer_result.py / exception.py
+├── rocketmq_logging.py    日志桥接（原 logging.py，上移后改名以避开标准库 logging 的遮蔽）
 ├── __main__.py            命令行入口（selfcheck）
 └── selfcheck.py           无集群环境下的协议自检
 ```
@@ -325,7 +334,7 @@ bit0 = 响应类型（RPC_TYPE）      bit1 = oneway（RPC_ONEWAY）
 （30 轮新建 TLS 连接打首包、producer+push consumer 全程 TLS 收发、确认没有连接悄悄退回
 明文、shutdown 后不留读线程）。
 
-两条在 macOS loopback 上实测出来的约束，都写在 `rocketmq/remoting/client.py` 的对应
+两条在 macOS loopback 上实测出来的约束，都写在 `remoting/client.py` 的对应
 docstring 里，改动前先读它们：
 
 - **读线程要等第一个记录写出去再起。** 握手刚完成就让读线程进 OpenSSL（`pending()` /

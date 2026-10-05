@@ -17,17 +17,17 @@ from __future__ import annotations
 
 import pytest
 
-from rocketmq.client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
+from client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
                                       client_side_tag_filter, filter_messages_for_delivery)
-from rocketmq.client.hook import (CheckForbiddenContext, CheckForbiddenHook,
+from client.hook import (CheckForbiddenContext, CheckForbiddenHook,
                                   CommunicationMode, FilterMessageContext, FilterMessageHook)
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.mq_client import TopicPublishInfo
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageExt, MessageQueue
-from rocketmq.common.subscription_data import ExpressionType, FilterAPI
-from rocketmq.common.util_all import java_string_hash
+from client.exception import MQClientException
+from client.mq_client import TopicPublishInfo
+from client.producer import DefaultMQProducer
+from client.send_result import SendResult, SendStatus
+from common.message import Message, MessageExt, MessageQueue
+from common.subscription_data import ExpressionType, FilterAPI
+from common.util_all import java_string_hash
 
 MQ = MessageQueue("TopicTest", "broker-a", 0)
 

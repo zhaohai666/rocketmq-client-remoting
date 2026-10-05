@@ -18,7 +18,7 @@
       回调，而且 broker 上一条都没落（连请求都没发出去）。
   A5  批量异步没有异步内核，走同步批量内核（在 AsyncSender 线程里跑）：一次回调、
       三条都落地。
-  A6  Shutdown 的**不等待**语义（本实现照抄 Java 的 ``shutdown()``，不像 .NET 那样 join
+  A6  Shutdown 的**不等待**语义（本实现照抄 Java 的 ``shutdown()``，不像 C# 那样 join
       池线程）：交进来的每一笔仍然跑完准备段、仍然拿到终态回调，但客户端已经先一步
       关掉，所以这一整轮**一笔都没上线**（实测 36/36 报错、broker 上连 topic 都没建
       出来）。这条把「调用方必须自己等回调再关」锁成可观察的事实。
@@ -36,12 +36,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.hook import CheckForbiddenHook, SendMessageHook
-from rocketmq.client.producer import DefaultMQProducer, SendCallback
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
+from client.admin import DefaultMQAdminExt
+from client.exception import MQClientException
+from client.hook import CheckForbiddenHook, SendMessageHook
+from client.producer import DefaultMQProducer, SendCallback
+from client.send_result import SendStatus
+from common.message import Message
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())
@@ -455,7 +455,7 @@ def a6_shutdown_does_not_wait(admin, topic):
     try:
         for i in range(sends):
             p.send_async(Message(topic, ("async-a6-%d" % i).encode()), rec, 8000)
-        # 立刻关：Java/Python 在这里等的是**零**（.NET 才会 join 池线程）
+        # 立刻关：Java/Python 在这里等的是**零**（C# 才会 join 池线程）
         p.shutdown()
         returned_at = time.monotonic()
         # 每一笔仍然会跑完准备段、仍然拿到终态回调（不等待 ≠ 凭空丢任务）
@@ -469,7 +469,7 @@ def a6_shutdown_does_not_wait(admin, topic):
               % (sum(1 for t in rec.ats if t > returned_at), sends))
         # ⚠ 但代价是真的会丢：这些准备段是在「传输层已经关掉」的客户端上跑的，实测每一笔
         # 都撞死在路由刷新的超时上（wait response on the channel ... timeout），所以整轮
-        # 全部报错、broker 上一条都没落（连 topic 都没建出来）。.NET 那个版本 join 完池子
+        # 全部报错、broker 上一条都没落（连 topic 都没建出来）。C# 那个版本 join 完池子
         # 才关客户端，同样的用例能落满；这里照抄 Java 的 ``shutdown()``，锁的就是
         # 「调用方必须自己等回调再关」这条。
         check("A6 不等待的代价：客户端先关，在途发送基本全部报错",

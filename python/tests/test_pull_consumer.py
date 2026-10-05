@@ -12,11 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from rocketmq.client.consumer import DefaultMQPullConsumer
-from rocketmq.client.exception import MQClientException
-from rocketmq.common.message import MessageQueue
-from rocketmq.common.sysflag import PullSysFlag
-from rocketmq.remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
+from client.consumer import DefaultMQPullConsumer
+from client.exception import MQClientException
+from common.message import MessageQueue
+from common.sysflag import PullSysFlag
+from remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                                   MessageModel)
 
 
@@ -198,7 +198,7 @@ class TestConsumerHeartbeat:
         assert list(cd.subscription_data_set) == []
 
     def test_start_refreshes_routes_then_sends_the_first_heartbeat(self, monkeypatch):
-        import rocketmq.client.consumer as consumer_mod
+        import client.consumer as consumer_mod
 
         holder = {}
 
@@ -223,7 +223,7 @@ class TestConsumerHeartbeat:
             c.shutdown()
 
     def test_shutdown_stops_the_loop_and_unregisters_the_group(self, monkeypatch):
-        import rocketmq.client.consumer as consumer_mod
+        import client.consumer as consumer_mod
 
         holder = {}
 

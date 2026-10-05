@@ -57,15 +57,15 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.consumer import (ConsumeOrderlyStatus,
+from client.consumer import (ConsumeOrderlyStatus,
                                       DefaultLitePullConsumer,
                                       DefaultMQPushConsumer,
                                       MessageListenerOrderly)
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from common.message import Message
+from common.mix_all import MixAll
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "OrdPy_%d" % int(time.time() * 1000)

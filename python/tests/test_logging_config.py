@@ -27,12 +27,12 @@ _KEYS = (
 
 
 def _reload(monkeypatch, env=None):
-    """在干净的环境变量下重新加载 rocketmq.logging（其配置是 import 期求值的）。"""
+    """在干净的环境变量下重新加载 rocketmq_logging（其配置是 import 期求值的）。"""
     for k in _KEYS:
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
-    import rocketmq.logging as rl
+    import rocketmq_logging as rl
 
     return importlib.reload(rl)
 

@@ -21,11 +21,11 @@ from __future__ import annotations
 import threading
 from collections import deque
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.subscription_data import SubscriptionData
-from rocketmq.remoting.protocol.heartbeat import MessageModel
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import ConsumeConcurrentlyStatus
+from common.message import MessageExt, MessageQueue
+from common.subscription_data import SubscriptionData
+from remoting.protocol.heartbeat import MessageModel
 
 GROUP = "GID_ResetOffsetUnitTest"
 TOPIC = "ResetOffsetUnitTestTopic"
@@ -241,7 +241,7 @@ class TestPersistAndRebuild:
 
 class TestBroadcast:
     def _local_saved(self, h):
-        from rocketmq.client import consumer as consumer_mod
+        from client import consumer as consumer_mod
         with open(h.c._local_offset_path(), encoding="utf-8") as f:
             return consumer_mod._parse_local_offsets_json(f.read())
 

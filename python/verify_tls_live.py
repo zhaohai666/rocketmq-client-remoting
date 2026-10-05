@@ -29,15 +29,15 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener  # noqa: E402
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus  # noqa: E402
-from rocketmq.client.producer import DefaultMQProducer  # noqa: E402
-from rocketmq.client.send_result import SendStatus  # noqa: E402
-from rocketmq.common.message import Message  # noqa: E402
-from rocketmq.remoting.client import RemotingClient  # noqa: E402
-from rocketmq.remoting.protocol import headers as headers_mod  # noqa: E402
-from rocketmq.remoting.protocol import remoting_command as rc_mod  # noqa: E402
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode  # noqa: E402
+from client.consumer import DefaultMQPushConsumer, SimpleMessageListener  # noqa: E402
+from client.consumer_result import ConsumeConcurrentlyStatus  # noqa: E402
+from client.producer import DefaultMQProducer  # noqa: E402
+from client.send_result import SendStatus  # noqa: E402
+from common.message import Message  # noqa: E402
+from remoting.client import RemotingClient  # noqa: E402
+from remoting.protocol import headers as headers_mod  # noqa: E402
+from remoting.protocol import remoting_command as rc_mod  # noqa: E402
+from remoting.protocol.codes import RequestCode, ResponseCode  # noqa: E402
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

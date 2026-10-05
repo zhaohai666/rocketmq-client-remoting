@@ -16,15 +16,15 @@ from typing import Dict, List, Tuple
 
 import pytest
 
-from rocketmq.client.consumer import DefaultLitePullConsumer
-from rocketmq.client.consumer_result import PullResult, PullStatus
-from rocketmq.client.exception import MQBrokerException, MQClientException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.sysflag import PullSysFlag
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from client.consumer import DefaultLitePullConsumer
+from client.consumer_result import PullResult, PullStatus
+from client.exception import MQBrokerException, MQClientException
+from client.mq_client import MQClientInstance
+from common.message import MessageExt, MessageQueue
+from common.sysflag import PullSysFlag
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType
+from remoting.protocol.remoting_command import RemotingCommand
 
 
 def _make_msg(topic: str, broker: str, qid: int, offset: int, body: str) -> MessageExt:

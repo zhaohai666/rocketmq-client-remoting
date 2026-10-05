@@ -14,15 +14,15 @@
 """
 import threading
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import PullResult, PullStatus
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.message import MessageQueue
-from rocketmq.common.mix_all import MixAll
-from rocketmq.common.subscription_data import SubscriptionData
-from rocketmq.common.sysflag import PullSysFlag
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import PullResult, PullStatus
+from client.mq_client import MQClientInstance
+from common.message import MessageQueue
+from common.mix_all import MixAll
+from common.subscription_data import SubscriptionData
+from common.sysflag import PullSysFlag
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_P5Unit"
 TOPIC = "P5UnitTopic"

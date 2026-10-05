@@ -12,14 +12,14 @@ import json
 
 import pytest
 
-from rocketmq.common.message import MessageQueue
-from rocketmq.common.topic_config import TopicConfig, TopicFilterType
-from rocketmq.remoting.protocol.admin_body import (ConsumeStats, OffsetWrapper,
+from common.message import MessageQueue
+from common.topic_config import TopicConfig, TopicFilterType
+from remoting.protocol.admin_body import (ConsumeStats, OffsetWrapper,
                                                    TopicConfigSerializeWrapper,
                                                    TopicStatsTable, TopicOffset)
-from rocketmq.remoting.protocol.body import ResetOffsetBody
-from rocketmq.remoting.protocol.serialize import (FastJsonDecodeError, fastjson_loads)
-from rocketmq.remoting.protocol.subscription import (GroupRetryPolicy, SubscriptionGroupConfig,
+from remoting.protocol.body import ResetOffsetBody
+from remoting.protocol.serialize import (FastJsonDecodeError, fastjson_loads)
+from remoting.protocol.subscription import (GroupRetryPolicy, SubscriptionGroupConfig,
                                                      SubscriptionGroupWrapper)
 
 
@@ -143,7 +143,7 @@ def test_consume_stats_list_uses_java_field_name():
     `totalDiff` / `totalInflightDiff` 是 Java 的 long 原语字段，恒出现在 JSON 里；
     `brokerAddr` 是 String，走 NON_NULL 所以 None 时整键消失。
     """
-    from rocketmq.remoting.protocol.body import ConsumeStatsList
+    from remoting.protocol.body import ConsumeStatsList
 
     raw = (b'{"consumeStatsList":[{"G_BROKER":[{"offsetTable":{}}]}],'
            b'"brokerAddr":"127.0.0.1:10911","totalDiff":7,"totalInflightDiff":2}')
@@ -226,7 +226,7 @@ def test_subscription_group_round_trip():
 # ---------------------------------------------------------------- MixAll properties
 def test_properties_text_round_trip_matches_java():
     """Java Properties.load 语义：键去空白、值只去左空白、支持 \\ 续行。"""
-    from rocketmq.common.mix_all import MixAll
+    from common.mix_all import MixAll
     text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n"
     props = MixAll.string2_properties(text)
     assert props["a"] == "b"
@@ -246,7 +246,7 @@ def test_properties_whitespace_is_a_valid_separator():
     真实 broker 导出的配置永远是 "k=v"，所以这条不会在日常链路暴露；
     但语义必须对齐 Java，否则遇到 "k v" 这类行会解析出错键。
     """
-    from rocketmq.common.mix_all import MixAll
+    from common.mix_all import MixAll
     props = MixAll.string2_properties("a b\nonlykey\nk=v\n")
     assert props["a"] == "b", props
     assert props["onlykey"] == "", props
@@ -261,7 +261,7 @@ def test_properties_whitespace_is_a_valid_separator():
 
 def test_perm_name_is_valid_matches_java():
     """Java PermName.isValid(perm) = perm >= 0 && perm < PERM_PRIORITY(8)。"""
-    from rocketmq.common.sysflag import PermName
+    from common.sysflag import PermName
     assert PermName.is_valid(0) is True
     assert PermName.is_valid(7) is True
     assert PermName.is_valid(8) is False
@@ -269,7 +269,7 @@ def test_perm_name_is_valid_matches_java():
 
 
 def test_mix_all_group_helpers():
-    from rocketmq.common.mix_all import MixAll
+    from common.mix_all import MixAll
     assert MixAll.is_lmq("%LMQ%foo") is True
     assert MixAll.is_lmq("normal") is False
     assert MixAll.is_sys_consumer_group("CID_RMQ_SYS_x") is True
@@ -280,14 +280,14 @@ def test_mix_all_group_helpers():
 
 def test_unique_msg_query_flag_is_extfield_name():
     """Java MixAll.UNIQUE_MSG_QUERY_FLAG = "_UNIQUE_KEY_QUERY"（是键名，不是数字）。"""
-    from rocketmq.common.mix_all import MixAll, QueryMsgType
+    from common.mix_all import MixAll, QueryMsgType
     assert MixAll.UNIQUE_MSG_QUERY_FLAG == "_UNIQUE_KEY_QUERY"
     assert QueryMsgType.UNIQUE_KEY == 1
 
 
 def test_message_const_index_types():
     """broker 的 indexType 取值：K / U / T。"""
-    from rocketmq.common.message_const import MessageConst
+    from common.message_const import MessageConst
     assert MessageConst.INDEX_KEY_TYPE == "K"
     assert MessageConst.INDEX_UNIQUE_TYPE == "U"
     assert MessageConst.INDEX_TAG_TYPE == "T"
@@ -295,7 +295,7 @@ def test_message_const_index_types():
 
 def test_create_topic_header_sends_topic_filter_type():
     """broker 的 CreateTopicRequestHeader.checkFields 要求 topicFilterType 非空。"""
-    from rocketmq.remoting.protocol.headers import CreateTopicRequestHeader
+    from remoting.protocol.headers import CreateTopicRequestHeader
     h = CreateTopicRequestHeader()
     h.topic = "t"
     h.default_topic = "TBW102"
@@ -314,7 +314,7 @@ def test_create_topic_header_sends_topic_filter_type():
 
 
 def test_query_message_header_index_type():
-    from rocketmq.remoting.protocol.headers import QueryMessageRequestHeader
+    from remoting.protocol.headers import QueryMessageRequestHeader
     h = QueryMessageRequestHeader()
     h.topic = "t"
     h.key = "k"

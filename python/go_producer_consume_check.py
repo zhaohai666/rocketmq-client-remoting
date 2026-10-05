@@ -18,9 +18,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
+from client.consumer_result import ConsumeConcurrentlyStatus
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = os.environ.get("ROCKETMQ_NAMESRV", "127.0.0.1:9876")
 

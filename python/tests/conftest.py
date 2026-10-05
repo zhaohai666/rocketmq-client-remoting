@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""pytest 公共 fixture：把 python/ 根目录加入 sys.path，保证 ``import rocketmq`` 可用。"""
+"""pytest 公共 fixture：把 python/ 根目录加入 sys.path，
+保证 ``import client`` / ``import common`` / ``import remoting`` 可用。"""
 import os
 import sys
 

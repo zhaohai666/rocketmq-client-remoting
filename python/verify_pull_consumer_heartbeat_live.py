@@ -41,9 +41,9 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import DefaultMQPullConsumer
-from rocketmq.client.exception import MQBrokerException, MQClientException
+from client.admin import DefaultMQAdminExt
+from client.consumer import DefaultMQPullConsumer
+from client.exception import MQBrokerException, MQClientException
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 MASTER = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:10911"

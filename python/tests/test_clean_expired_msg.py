@@ -26,7 +26,7 @@ Java 锚点（5.5.1 逐条核对）：
 真机上只能靠"消息发了却永远不来第二次"这种间接现象暴露。清扫本身的窗口（分钟级）
 与 16 条上限也只有在离线用假时钟才能在秒级验证。
 
-与 C++/Rust/.NET 的同名用例一一对应；真机验证见 ../verify_clean_expired_msg_live.py。
+与 C++/Rust/C# 的同名用例一一对应；真机验证见 ../verify_clean_expired_msg_live.py。
 """
 from __future__ import annotations
 
@@ -34,11 +34,11 @@ import threading
 import time
 from collections import deque
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import (ConsumeConcurrentlyStatus,
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import (ConsumeConcurrentlyStatus,
                                               MessageListenerOrderly)
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.message_accessor import MessageAccessor
+from common.message import MessageExt, MessageQueue
+from common.message_accessor import MessageAccessor
 
 GROUP = "GID_CleanExpiredUnitTest"
 TOPIC = "CleanExpiredUnitTestTopic"
@@ -73,7 +73,7 @@ class RecordingStop:
 
 
 class Clock:
-    """可控时钟：替换 ``rocketmq.client.consumer`` 模块里的 ``time``。
+    """可控时钟：替换 ``client.consumer`` 模块里的 ``time``。
 
     清扫的过期判据（``time.time()*1000 - stamp > consumeTimeout*60*1000``）必须能被
     精确推到边界上，否则"严格大于"这条要么测不出来、要么靠 sleep 变得不稳定。
@@ -209,7 +209,7 @@ def test_sweep_thread_is_daemon_and_stops_with_the_flag():
 def test_expired_first_entry_is_sent_back_at_delay_3_then_removed(monkeypatch):
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("rocketmq.client.consumer.time", clock)
+    monkeypatch.setattr("client.consumer.time", clock)
     m = stamp(msg(0), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([m])
 
@@ -226,7 +226,7 @@ def test_unstamped_first_entry_blocks_the_whole_pass(monkeypatch):
     """只看队首：队首没盖过章（还没进过 listener）就停，后面过期也轮不到（Java:87-90）。"""
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("rocketmq.client.consumer.time", clock)
+    monkeypatch.setattr("client.consumer.time", clock)
     head = msg(0)                                   # 未盖章
     tail = stamp(msg(1), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([head, tail])
@@ -241,7 +241,7 @@ def test_expiry_is_strictly_greater_than_timeout(monkeypatch):
     """等于阈值不算过期，多 1ms 才算（Java:89 的 ``>``）。"""
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("rocketmq.client.consumer.time", clock)
+    monkeypatch.setattr("client.consumer.time", clock)
     boundary = stamp(msg(0), int(clock.now_ms) - h.timeout_ms)
     h.inflight([boundary])
 
@@ -302,7 +302,7 @@ def test_sweep_only_looks_at_messages_registered_for_held_queues(monkeypatch):
     """清扫范围 = 当前持有的队列（Java 遍历 processQueueTable）：撤销过的队列不再被扫。"""
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("rocketmq.client.consumer.time", clock)
+    monkeypatch.setattr("client.consumer.time", clock)
     m = stamp(msg(0), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([m])
 
@@ -316,7 +316,7 @@ def test_sweep_only_looks_at_messages_registered_for_held_queues(monkeypatch):
 def test_concurrent_batch_registers_inflight_and_send_back_proceeds(monkeypatch):
     """对照腿：消息还在登记里（没被清扫）时，未认可的回投照常发生。"""
     h = Harness()
-    monkeypatch.setattr("rocketmq.client.consumer.time", Clock())
+    monkeypatch.setattr("client.consumer.time", Clock())
 
     class Listener:
         def consume_message(self, msgs, context):
@@ -336,7 +336,7 @@ def test_send_back_skips_a_message_the_sweep_already_reclaimed(monkeypatch):
     listener 事后返回 RECONSUME_LATER 时**不能再回投一次**。"""
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("rocketmq.client.consumer.time", clock)
+    monkeypatch.setattr("client.consumer.time", clock)
     swept = []
 
     class Listener:
@@ -362,7 +362,7 @@ def test_sweep_can_reclaim_a_requeued_buffered_message(monkeypatch):
     队首又是它时清扫照样能回收，摘除要落到缓冲上。"""
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("rocketmq.client.consumer.time", clock)
+    monkeypatch.setattr("client.consumer.time", clock)
     m = stamp(msg(0), int(clock.now_ms) - h.timeout_ms - 1)
     h.buffered([m])
 

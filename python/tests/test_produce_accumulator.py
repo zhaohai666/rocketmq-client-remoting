@@ -27,12 +27,12 @@ from typing import List, Optional
 
 import pytest
 
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.produce_accumulator import (AggregateKey, ProduceAccumulator,
+from client.exception import MQClientException
+from client.produce_accumulator import (AggregateKey, ProduceAccumulator,
                                                 get_or_create_produce_accumulator)
-from rocketmq.client.producer import DefaultMQProducer, SendCallback
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageBatch, MessageQueue
+from client.producer import DefaultMQProducer, SendCallback
+from client.send_result import SendResult, SendStatus
+from common.message import Message, MessageBatch, MessageQueue
 
 TOPIC = "AccumTestTopic"
 
@@ -483,7 +483,7 @@ def test_guard_removes_empty_batch_without_sending():
     """没人真的加消息的空批次：守卫线程直接置 closed + 摘表，不发任何东西。"""
     producer = FakeProducer()
     acc = ProduceAccumulator("guard-empty")
-    from rocketmq.client.produce_accumulator import MessageAccumulation
+    from client.produce_accumulator import MessageAccumulation
     key = AggregateKey.of_message(Message(TOPIC, b"x"))
     empty = MessageAccumulation(key, producer, acc)
     with acc._table_lock:
@@ -542,7 +542,7 @@ class StubProducer(DefaultMQProducer):
 
 def test_send_by_accumulator_stamps_uniq_id_then_accumulates():
     """``send_by_accumulator`` 先过本地校验、补 UNIQ_KEY，再交给累加器（Java :778-793）。"""
-    from rocketmq.common.message_client_id_setter import get_uniq_id
+    from common.message_client_id_setter import get_uniq_id
 
     acc = ProduceAccumulator("send-by-accum")
     acc.batch_max_delay_ms(3000)

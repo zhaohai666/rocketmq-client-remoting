@@ -33,19 +33,19 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client import validators
-from rocketmq.client.consumer import (
+from client import validators
+from client.consumer import (
     DefaultLitePullConsumer,
     DefaultMQPullConsumer,
     DefaultMQPushConsumer,
     SimpleMessageListener,
 )
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import ClientErrorCode, MQClientException
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.remoting.protocol.codes import ResponseCode
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.exception import ClientErrorCode, MQClientException
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message
+from remoting.protocol.codes import ResponseCode
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

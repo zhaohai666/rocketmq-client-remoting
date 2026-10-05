@@ -8,11 +8,11 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
-from rocketmq.remoting.exception import RemotingException
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.consumer import DefaultMQPushConsumer
+from client.producer import DefaultMQProducer
+from common.message import Message
+from remoting.exception import RemotingException
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 # ns[0] 是一个没有监听的端口（等价"杀掉 nameServ[0]"），ns[1] 是真实在跑的 9876
 NS = "127.0.0.1:19876;127.0.0.1:9876"
@@ -62,7 +62,7 @@ def consume():
     class L:
         def consume_message(self, msgs, ctx):
             got.extend(msgs)
-            from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
+            from client.consumer_result import ConsumeConcurrentlyStatus
             return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
 
     c.set_message_listener(L())

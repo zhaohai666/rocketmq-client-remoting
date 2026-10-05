@@ -14,9 +14,9 @@ Rust 还有一套「同 clientId 共用一条连接」的判别式证明（``rus
 """
 from __future__ import annotations
 
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.remoting.protocol.codes import RequestCode
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from remoting.protocol.codes import RequestCode
 
 
 class _FakeClient:
@@ -130,7 +130,7 @@ def test_unregister_fans_out_to_every_broker_including_slaves():
     Producer/ConsumerManager 是每台 broker 各自一份状态，漏掉从节点就等于那台的注册要等
     通道扫描（默认 ~120s）才回收。心跳那侧仍只打 master —— 两个 helper 的分工一起锁住。
     """
-    from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+    from remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-fanout", ["127.0.0.1:9876"])
     route = TopicRouteData()
@@ -151,7 +151,7 @@ def test_unregister_fans_out_to_every_broker_including_slaves():
 
 def test_unregister_failure_on_one_broker_does_not_stop_the_fanout():
     """单台失败只 log.debug：Java 的 catch 是 log.warn，剩下那台照样要注销到。"""
-    from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+    from remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-fanout-fail", ["127.0.0.1:9876"])
     route = TopicRouteData()
@@ -182,9 +182,9 @@ def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only(
     不带订阅标志，走的正是那条）。生产者的心跳相反，仍走 master 优先的
     ``get_route_of_all_brokers``——两个 helper 的分工在这里一起锁住。
     """
-    from rocketmq.client.consumer import DefaultMQPushConsumer
-    from rocketmq.client.producer import DefaultMQProducer
-    from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+    from client.consumer import DefaultMQPushConsumer
+    from client.producer import DefaultMQProducer
+    from remoting.protocol.route import BrokerData, TopicRouteData
 
     master, slave = "127.0.0.1:10911", "127.0.0.1:10912"
 
@@ -233,7 +233,7 @@ def test_unregister_budget_is_javas_mq_client_api_timeout():
     MQClientInstance.unregister_client(spy, "127.0.0.1:10911", "cid-1", "GID_x", "")
     assert spy.timeouts == [3000], spy.timeouts
 
-    from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+    from remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-timeout", ["127.0.0.1:9876"])
     route = TopicRouteData()

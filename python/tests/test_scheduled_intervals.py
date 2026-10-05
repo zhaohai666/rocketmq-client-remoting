@@ -23,11 +23,11 @@ Java 锚点（5.5.1 逐条核对）：
 """
 from __future__ import annotations
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
+from client.admin import DefaultMQAdminExt
+from client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
                                       DefaultMQPushConsumer)
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
 
 POLL_DEFAULT = 30000
 PERSIST_DEFAULT = 5000
@@ -234,7 +234,7 @@ def test_admin_forwards_the_interval_to_the_client_instance(monkeypatch):
         def start(self):
             captured["started"] = True
 
-    monkeypatch.setattr("rocketmq.client.admin.MQClientInstance", _FakeClient)
+    monkeypatch.setattr("client.admin.MQClientInstance", _FakeClient)
     admin = DefaultMQAdminExt()
     admin.set_namesrv_addr("127.0.0.1:9876")
     admin.poll_name_server_interval = 1200

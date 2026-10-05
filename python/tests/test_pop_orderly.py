@@ -21,15 +21,15 @@ import time
 
 import pytest
 
-from rocketmq.client.consumer import DefaultMQPushConsumer, PopProcessQueue
-from rocketmq.client.consumer_result import (ConsumeConcurrentlyStatus,
+from client.consumer import DefaultMQPushConsumer, PopProcessQueue
+from client.consumer_result import (ConsumeConcurrentlyStatus,
                                              ConsumeConcurrentlyContext,
                                              ConsumeOrderlyStatus,
                                              MessageListenerConcurrently,
                                              MessageListenerOrderly)
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.message_const import MessageConst
-from rocketmq.remoting.protocol.extra_info import build_extra_info
+from common.message import MessageExt, MessageQueue
+from common.message_const import MessageConst
+from remoting.protocol.extra_info import build_extra_info
 
 GROUP = "GID_PopOrderlyUnitTest"
 TOPIC = "PopOrderlyUnitTestTopic"

@@ -12,8 +12,8 @@ import zlib
 
 import pytest
 
-from rocketmq.common.message import Message, MessageBatch, MessageExt
-from rocketmq.common.message_decoder import (
+from common.message import Message, MessageBatch, MessageExt
+from common.message_decoder import (
     BLANK_MAGIC_CODE, MESSAGE_MAGIC_CODE, MESSAGE_MAGIC_CODE_V2,
     _decompress,
     bytes_to_ip_and_port, bytes2string, count_inner_msg_num, crc32,
@@ -21,7 +21,7 @@ from rocketmq.common.message_decoder import (
     decode_message, decode_message_id, decode_messages,
     encode_message, encode_message_ext, encode_messages,
     ip_and_port_to_bytes, message_properties_2_string, string_2_message_properties)
-from rocketmq.common.sysflag import MessageSysFlag
+from common.sysflag import MessageSysFlag
 
 
 def build_ext(**overrides) -> MessageExt:

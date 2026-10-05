@@ -30,12 +30,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.backpressure import MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.remoting.exception import RemotingTooMuchRequestException
+from client.admin import DefaultMQAdminExt
+from client.backpressure import MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message
+from remoting.exception import RemotingTooMuchRequestException
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())

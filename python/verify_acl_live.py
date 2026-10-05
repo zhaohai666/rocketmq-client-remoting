@@ -34,18 +34,18 @@ from typing import Optional
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import (ConsumeConcurrentlyStatus,
+from client.admin import DefaultMQAdminExt
+from client.consumer import (ConsumeConcurrentlyStatus,
                                       DefaultMQPushConsumer,
                                       SimpleMessageListener)
-from rocketmq.client.exception import MQBrokerException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.rpchook import AclClientRPCHook, SessionCredentials
+from client.exception import MQBrokerException
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.rpchook import AclClientRPCHook, SessionCredentials
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 AK = sys.argv[2] if len(sys.argv) > 2 else "AK_TEST"
@@ -179,7 +179,7 @@ def scenario_consumer_then_producer() -> None:
     （RebalancePushImpl.java:174-190）。所以"先发 3 条、再起消费者"会（正确地）
     一条都收不到。更麻烦的是 broker 的 consumequeue 是异步分发/刷盘的，刚发完立刻
     查 maxOffset 可能读到 0 —— 于是同一场景在三种语言间**结果不确定**：
-    实测同一时序下 Python 收 0 条（读到 maxOffset=3），C++/.NET 收 3 条（读到 0）。
+    实测同一时序下 Python 收 0 条（读到 maxOffset=3），C++/C# 收 3 条（读到 0）。
     先把消费者起好、等 rebalance 分配完队列，再发送，才是确定性的、只测 ACL 的顺序。
     """
     print("\nS4/S5 带正确凭据的生产者/消费者（先起消费者再发送）")

@@ -20,7 +20,7 @@ from typing import List
 
 import pytest
 
-from rocketmq.client.consumer import (
+from client.consumer import (
     AllocateMessageQueueAveragely,
     AllocateMessageQueueAveragelyByCircle,
     AllocateMachineRoomNearby,
@@ -35,9 +35,9 @@ from rocketmq.client.consumer import (
     _java_split,
     _strategy_name,
 )
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import MQClientException
-from rocketmq.common.message import MessageQueue
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.exception import MQClientException
+from common.message import MessageQueue
 
 
 def _queues(size: int) -> List[MessageQueue]:

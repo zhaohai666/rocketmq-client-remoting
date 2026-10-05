@@ -25,10 +25,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import DefaultMQPullConsumer
-from rocketmq.client.consumer_result import PullStatus
-from rocketmq.remoting.exception import RemotingException
+from client.admin import DefaultMQAdminExt
+from client.consumer import DefaultMQPullConsumer
+from client.consumer_result import PullStatus
+from remoting.exception import RemotingException
 
 NAMESRV = os.environ.get("ROCKETMQ_NAMESRV", "127.0.0.1:9876")
 

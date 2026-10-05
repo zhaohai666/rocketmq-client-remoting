@@ -7,11 +7,11 @@
 #   - topic 级闸门失效 ⇒ 同 topic 多队列各自为政，单队列都"没超"但实例总量爆掉。
 # 单位也只有一个坑：size 阈值是 **MiB** 不是字节；跨度是**严格大于**而条数/字节是 **>=**。
 #
-# 本文件锁的是**参考实现**本身（Python 是四语言的对齐基准），C++/Rust/.NET 的
+# 本文件锁的是**参考实现**本身（Python 是四语言的对齐基准），C++/Rust/C# 的
 # test_flow_control 与这里逐条同构。真机侧"闸门命中之后消息一条都不丢"见
 # ../verify_flow_control_live.py。
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.common.message import MessageExt, MessageQueue
+from client.consumer import DefaultMQPushConsumer
+from common.message import MessageExt, MessageQueue
 
 TOPIC = "FlowControlPyUnitTopic"
 OTHER_TOPIC = "FlowControlPyUnitOther"

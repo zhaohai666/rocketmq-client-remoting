@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""``rocketmq.client.backpressure`` 的单测 —— 只测那个公平计数信号量本身。
+"""``client.backpressure`` 的单测 —— 只测那个公平计数信号量本身。
 
 对端是 Java ``new Semaphore(permits, true)``：异步发送背压整套语义都压在它身上，
 所以这里盯的是**公平**（只有队首能拿）与**运行时改容量**（在途份数原样保留）两件事，
@@ -13,7 +13,7 @@ from __future__ import annotations
 import threading
 import time
 
-from rocketmq.client.backpressure import (MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE,
+from client.backpressure import (MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE,
                                           FairSemaphore)
 
 

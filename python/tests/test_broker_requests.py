@@ -20,31 +20,31 @@ from __future__ import annotations
 import time
 import threading
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import (ConsumeConcurrentlyContext,
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import (ConsumeConcurrentlyContext,
                                              ConsumeConcurrentlyStatus,
                                              ConsumeOrderlyStatus,
                                              MessageListener, MessageListenerOrderly)
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.message_decoder import decode_message, encode_message_ext
-from rocketmq.remoting.protocol.body import (CMResult, ConsumeMessageDirectlyResult,
+from client.mq_client import MQClientInstance
+from common.message import MessageExt, MessageQueue
+from common.message_decoder import decode_message, encode_message_ext
+from remoting.protocol.body import (CMResult, ConsumeMessageDirectlyResult,
                                              ConsumerRunningInfo, GetConsumerStatusBody,
                                              MessageQueueForC, ProcessQueueInfo,
                                              ResetOffsetBody, ResetOffsetBodyForC)
-from rocketmq.remoting.protocol.codes import (RequestCode, ResponseCode)
+from remoting.protocol.codes import (RequestCode, ResponseCode)
 
 GET_CONSUMER_RUNNING_INFO = RequestCode.GET_CONSUMER_RUNNING_INFO
 GET_CONSUMER_STATUS_FROM_CLIENT = RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT
 RESET_CONSUMER_CLIENT_OFFSET = RequestCode.RESET_CONSUMER_CLIENT_OFFSET
 CONSUME_MESSAGE_DIRECTLY = RequestCode.CONSUME_MESSAGE_DIRECTLY
 NOTIFY_CONSUMER_IDS_CHANGED = RequestCode.NOTIFY_CONSUMER_IDS_CHANGED
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader,
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader,
                                                 GetConsumerRunningInfoRequestHeader,
                                                 GetConsumerStatusRequestHeader,
                                                 ResetOffsetRequestHeader)
-from rocketmq.common.subscription_data import SubscriptionData
+from common.subscription_data import SubscriptionData
 
 GROUP = "GID_BrokerReqUnit"
 TOPIC = "BrokerReqTopic"

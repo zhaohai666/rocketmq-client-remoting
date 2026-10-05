@@ -36,14 +36,14 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.consumer import DefaultMQPullConsumer
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.common.sysflag import PullSysFlag
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.headers import PullMessageRequestHeader
+from client.consumer import DefaultMQPullConsumer
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message
+from common.sysflag import PullSysFlag
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.headers import PullMessageRequestHeader
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

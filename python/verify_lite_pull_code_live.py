@@ -30,15 +30,15 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import (ConsumeConcurrentlyStatus, DefaultLitePullConsumer,
+from client.admin import DefaultMQAdminExt
+from client.consumer import (ConsumeConcurrentlyStatus, DefaultLitePullConsumer,
                                       DefaultMQPushConsumer, SimpleMessageListener)
-from rocketmq.client.exception import MQBrokerException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message, MessageQueue
-from rocketmq.common.sysflag import PullSysFlag
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.exception import MQBrokerException
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from common.message import Message, MessageQueue
+from common.sysflag import PullSysFlag
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

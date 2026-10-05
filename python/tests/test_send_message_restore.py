@@ -17,8 +17,8 @@
 长度掉到阈值以下、``tryToCompressMessage`` 这次返回 false、压缩标志也不置位，broker 照存、
 消费者照收，业务侧解出来的是 zlib 裸流 —— 发送、存储、消费全程零报错。
 
-C++ / .NET 是靠「发之前拷贝一份」达到同一效果的（``producer.cpp`` 里 ``Message out = msg``、
-dotnet ``CloneMessage``），Rust 见 ``src/client/producer.rs`` 的同名测试。
+C++ / C# 是靠「发之前拷贝一份」达到同一效果的（``producer.cpp`` 里 ``Message out = msg``、
+C# ``CloneMessage``），Rust 见 ``src/client/producer.rs`` 的同名测试。
 """
 from __future__ import annotations
 
@@ -29,19 +29,19 @@ from typing import List, Optional
 
 import pytest
 
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.mq_client import TopicPublishInfo
-from rocketmq.client.producer import (DefaultMQProducer, LocalTransactionState,
+from client.exception import MQClientException
+from client.mq_client import TopicPublishInfo
+from client.producer import (DefaultMQProducer, LocalTransactionState,
                                       TransactionListener)
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageQueue
-from rocketmq.common.message_client_id_setter import get_uniq_id
-from rocketmq.common.message_decoder import _compress
-from rocketmq.common.sysflag import MessageSysFlag
-from rocketmq.remoting.exception import RemotingSendRequestException
-from rocketmq.remoting.protocol.codes import RequestCode
-from rocketmq.remoting.protocol.headers import EndTransactionRequestHeader
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from client.send_result import SendResult, SendStatus
+from common.message import Message, MessageQueue
+from common.message_client_id_setter import get_uniq_id
+from common.message_decoder import _compress
+from common.sysflag import MessageSysFlag
+from remoting.exception import RemotingSendRequestException
+from remoting.protocol.codes import RequestCode
+from remoting.protocol.headers import EndTransactionRequestHeader
+from remoting.protocol.remoting_command import RemotingCommand
 
 ADDR = "127.0.0.1:10911"
 NS = "ns1"

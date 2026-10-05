@@ -24,7 +24,7 @@ Java 的 ``DefaultMQProducerImpl.shutdown():313`` 会调 ``mQClientFactory.unreg
   U6  对照组：另一个**没退出**的生产者组仍能被 204 看见 —— 排除「broker 把所有连接都清了」
       这种假阳性。
 
-⚠ 关于「这一发 35 到底有没有用」的判据强度：Python/C++/.NET 三套实现里每个生产者各自持有一份
+⚠ 关于「这一发 35 到底有没有用」的判据强度：Python/C++/C# 三套实现里每个生产者各自持有一份
 ``MQClientInstance``（各自一条 TCP 连接），所以退出时连接也会关掉，broker 的通道扫描同样会把
 组摘掉 —— 单看 U5 分不出是 35 的功劳还是断连的功劳。U3/U4 是直接证据（抓帧），而**行为级**的
 判别式证明在 ``rust/examples/live_producer.rs`` 的 P11：Rust 按 clientId 复用实例，两个同
@@ -43,13 +43,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.send_result import SendStatus
-from rocketmq.common.message import Message
-from rocketmq.remoting.protocol.codes import RemotingSysResponseCode, RequestCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.rpchook import RPCHook
+from client.admin import DefaultMQAdminExt
+from client.producer import DefaultMQProducer
+from client.send_result import SendStatus
+from common.message import Message
+from remoting.protocol.codes import RemotingSysResponseCode, RequestCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.rpchook import RPCHook
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())

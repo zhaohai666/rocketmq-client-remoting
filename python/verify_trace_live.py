@@ -15,15 +15,15 @@ import sys
 import threading
 import time
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus, MessageListenerConcurrently
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.trace import TraceConstants, TraceDataEncoder, TraceType
-from rocketmq.common.message import Message
-from rocketmq.common.message_client_id_setter import get_uniq_id
-from rocketmq.common.message_const import MessageConst
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import ConsumeConcurrentlyStatus, MessageListenerConcurrently
+from client.producer import DefaultMQProducer
+from client.trace import TraceConstants, TraceDataEncoder, TraceType
+from common.message import Message
+from common.message_client_id_setter import get_uniq_id
+from common.message_const import MessageConst
+from common.mix_all import MixAll
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)
@@ -165,7 +165,7 @@ def main() -> int:
     # ---------- S6/S7 消费到消息 ----------
     # ⚠ 只统计**本次发送的**消息：topic 上必然还留着 S1 的预热消息，且"组首次消费"的起始位点
     #   取的是当时的 maxOffset —— broker 的 consumequeue 是**异步分发**的，位点可能落在预热消息
-    #   之前，于是预热消息也会被投递过来（实测 C++/.NET 都在这里翻车）。断言的本意是"本次业务
+    #   之前，于是预热消息也会被投递过来（实测 C++/C# 都在这里翻车）。断言的本意是"本次业务
     #   消息被消费到"，所以按 body 过滤，而不是赌 topic 上只有一条消息。
     def _is_primary(m) -> bool:
         return bytes(m.body).startswith(b"trace-live-")

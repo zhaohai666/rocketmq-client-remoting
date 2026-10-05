@@ -35,13 +35,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
 
-from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message, MessageExt, MessageQueue
-from rocketmq.common.message_decoder import encode_message_ext, decode_message
-from rocketmq.common.sysflag import MessageSysFlag
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.producer import DefaultMQProducer
+from common.message import Message, MessageExt, MessageQueue
+from common.message_decoder import encode_message_ext, decode_message
+from common.sysflag import MessageSysFlag
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = os.environ.get("ROCKETMQ_NAMESRV", "127.0.0.1:9876")
 LINE = b"rocketmq-compress-interop-payload-line-0123456789\n"

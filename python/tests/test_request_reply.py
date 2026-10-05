@@ -16,20 +16,20 @@ import threading
 
 import pytest
 
-from rocketmq.client.exception import (ClientErrorCode, MQClientException,
+from client.exception import (ClientErrorCode, MQClientException,
                                         RequestTimeoutException)
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.request_reply import (REQUEST_FUTURE_HOLDER, RequestFutureHolder,
+from client.mq_client import MQClientInstance
+from client.request_reply import (REQUEST_FUTURE_HOLDER, RequestFutureHolder,
                                             RequestResponseFuture, create_correlation_id,
                                             create_reply_message, is_reply_message)
-from rocketmq.client.send_result import SendResult, SendStatus
-from rocketmq.common.message import Message, MessageBatch, MessageQueue
-from rocketmq.common.message_const import MessageConst
-from rocketmq.common.message_decoder import message_properties_2_string
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.codes import RequestCode, ResponseCode
-from rocketmq.remoting.protocol.headers import ReplyMessageRequestHeader
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
+from client.send_result import SendResult, SendStatus
+from common.message import Message, MessageBatch, MessageQueue
+from common.message_const import MessageConst
+from common.message_decoder import message_properties_2_string
+from common.mix_all import MixAll
+from remoting.protocol.codes import RequestCode, ResponseCode
+from remoting.protocol.headers import ReplyMessageRequestHeader
+from remoting.protocol.remoting_command import RemotingCommand
 
 BASE_TOPIC = "RRUnitTopic"
 

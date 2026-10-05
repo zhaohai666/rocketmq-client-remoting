@@ -17,14 +17,14 @@
 """
 from __future__ import annotations
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.exception import MQBrokerException, MQClientException
-from rocketmq.common.message import MessageQueue
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.body import ResetOffsetBody, TopicList
-from rocketmq.remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
-from rocketmq.remoting.protocol.remoting_command import RemotingCommand
-from rocketmq.remoting.protocol.route import BrokerData, TopicRouteData
+from client.admin import DefaultMQAdminExt
+from client.exception import MQBrokerException, MQClientException
+from common.message import MessageQueue
+from common.mix_all import MixAll
+from remoting.protocol.body import ResetOffsetBody, TopicList
+from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
+from remoting.protocol.remoting_command import RemotingCommand
+from remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_AdminResetUnit"
 TOPIC = "AdminResetUnitTopic"

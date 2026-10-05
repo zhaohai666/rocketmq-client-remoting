@@ -20,11 +20,11 @@ from __future__ import annotations
 
 from collections import deque
 
-from rocketmq.client.consumer import DefaultMQPushConsumer
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.hook import ConsumeMessageHook
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.remoting.protocol.heartbeat import MessageModel
+from client.consumer import DefaultMQPushConsumer
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.hook import ConsumeMessageHook
+from common.message import MessageExt, MessageQueue
+from remoting.protocol.heartbeat import MessageModel
 
 GROUP = "GID_AckIndexUnitTest"
 TOPIC = "AckIndexUnitTestTopic"
@@ -114,7 +114,7 @@ class Harness:
 
 class TestContextDefault:
     def test_default_is_java_max_value(self):
-        from rocketmq.client.consumer_result import ConsumeConcurrentlyContext
+        from client.consumer_result import ConsumeConcurrentlyContext
         # Java ConsumeConcurrentlyContext:33 —— 默认「整批认可」，不是「一条都不认可」
         assert ConsumeConcurrentlyContext().ack_index == (1 << 31) - 1
 

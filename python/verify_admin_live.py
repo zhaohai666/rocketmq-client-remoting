@@ -26,15 +26,15 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.consumer_result import ConsumeConcurrentlyStatus
-from rocketmq.client.exception import MQClientException
-from rocketmq.common.message import Message, MessageQueue
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
-from rocketmq.remoting.protocol.subscription import SubscriptionGroupConfig
+from client.admin import DefaultMQAdminExt
+from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
+from client.producer import DefaultMQProducer
+from client.consumer_result import ConsumeConcurrentlyStatus
+from client.exception import MQClientException
+from common.message import Message, MessageQueue
+from common.mix_all import MixAll
+from remoting.protocol.heartbeat import ConsumeFromWhere
+from remoting.protocol.subscription import SubscriptionGroupConfig
 
 NAMESRV = "127.0.0.1:9876"
 STAMP = int(time.time())

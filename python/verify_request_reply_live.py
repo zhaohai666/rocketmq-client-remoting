@@ -5,7 +5,7 @@
 用法（需本地 RocketMQ 5.5.1 集群）：
     .venv/bin/python verify_request_reply_live.py 127.0.0.1:9876
 
-链路（三侧 C++/.NET/Python 同一套场景）：
+链路（三侧 C++/C#/Python 同一套场景）：
 
     请求方 producer.request(msg, timeout)               应答方 push consumer
     ────────────────────────────────────              ─────────────────────
@@ -50,17 +50,17 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
+from client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
                                       SimpleMessageListener)
-from rocketmq.client.exception import (ClientErrorCode, MQClientException,
+from client.exception import (ClientErrorCode, MQClientException,
                                         RequestTimeoutException)
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.client.request_reply import create_reply_message
-from rocketmq.common.message import Message
-from rocketmq.common.message_const import MessageConst
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.protocol.codes import ResponseCode
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.producer import DefaultMQProducer
+from client.request_reply import create_reply_message
+from common.message import Message
+from common.message_const import MessageConst
+from common.mix_all import MixAll
+from remoting.protocol.codes import ResponseCode
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

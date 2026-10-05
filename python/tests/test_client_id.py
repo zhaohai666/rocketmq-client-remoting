@@ -12,13 +12,13 @@ import re
 
 import pytest
 
-from rocketmq.client import DefaultMQProducer
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
+from client import DefaultMQProducer
+from client.admin import DefaultMQAdminExt
+from client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
                                      DefaultMQPushConsumer)
-from rocketmq.common.mix_all import MixAll
-from rocketmq.remoting.exception import RemotingConnectException
-from rocketmq.remoting.protocol.heartbeat import MessageModel
+from common.mix_all import MixAll
+from remoting.exception import RemotingConnectException
+from remoting.protocol.heartbeat import MessageModel
 
 # <IP>@<pid>#<纳秒>
 JAVA_STYLE = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())

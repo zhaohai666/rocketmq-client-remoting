@@ -6,7 +6,7 @@
     .venv/bin/python verify_lite_pull_cursor_live.py 127.0.0.1:9876
 
 离线单测（python/tests/test_lite_pull_consumer.py 的 TestPullCursorFollowsNextBeginOffset、
-cpp/tests/test_lite_pull_cursor.cpp、rust/src/client/pull_consumer.rs、dotnet 的
+cpp/tests/test_lite_pull_cursor.cpp、rust/src/client/pull_consumer.rs、csharp 的
 LitePullCursorTests.cs）只能证明「脚本回的 nextBeginOffset 被跟了」；只有真 broker 能让
 下面两件事同时成立：nextBeginOffset 是**broker 算的**，而且跟过去以后**真的能收到消息**。
 
@@ -27,11 +27,11 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.consumer import DefaultLitePullConsumer
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.consumer import DefaultLitePullConsumer
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from common.message import Message
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

@@ -38,13 +38,13 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.consumer import (ConsumeConcurrentlyStatus,
+from client.consumer import (ConsumeConcurrentlyStatus,
                                       DefaultMQPushConsumer,
                                       MessageListenerConcurrently)
-from rocketmq.client.exception import MQBrokerException, MQClientException
-from rocketmq.client.mq_client import MQClientInstance
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common.message import Message
+from client.exception import MQBrokerException, MQClientException
+from client.mq_client import MQClientInstance
+from client.producer import DefaultMQProducer
+from common.message import Message
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "FcPy_%d" % int(time.time() * 1000)

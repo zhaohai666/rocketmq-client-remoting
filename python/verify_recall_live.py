@@ -31,14 +31,14 @@ import time
 
 sys.path.insert(0, ".")
 
-from rocketmq.client.admin import DefaultMQAdminExt
-from rocketmq.client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
+from client.admin import DefaultMQAdminExt
+from client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
                                       MessageListenerConcurrently)
-from rocketmq.client.exception import MQClientException
-from rocketmq.client.producer import DefaultMQProducer
-from rocketmq.common import recall_message_handle
-from rocketmq.common.message import Message
-from rocketmq.remoting.protocol.heartbeat import ConsumeFromWhere
+from client.exception import MQClientException
+from client.producer import DefaultMQProducer
+from common import recall_message_handle
+from common.message import Message
+from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "RecallPy_%d" % int(time.time() * 1000)

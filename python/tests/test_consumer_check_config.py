@@ -12,15 +12,15 @@
 # 区间**上下界都要测**：Java 全是 ``< lo || > hi`` 严格不等，把 ``>`` 写成 ``>=``
 # 只会让"边界值本身"这一格变红，而只测下界则完全看不出上界写歪。
 #
-# 本文件锁的是**参考实现**本身（Python 是四语言的对齐基准），C++/Rust/.NET 的
+# 本文件锁的是**参考实现**本身（Python 是四语言的对齐基准），C++/Rust/C# 的
 # 同名用例与这里逐条同构。文案也在这里钉住：排障时运维只看错误串，
 # Java 的字段名（camelCase）与区间必须一字不差，否则对照不上文档。
 import pytest
 
-from rocketmq.client.consumer import (MAX_POP_INVISIBLE_TIME,
+from client.consumer import (MAX_POP_INVISIBLE_TIME,
                                       MIN_POP_INVISIBLE_TIME,
                                       DefaultMQPushConsumer)
-from rocketmq.client.exception import MQClientException
+from client.exception import MQClientException
 
 GROUP = "CID_check_config_py"
 TOPIC = "CheckConfigPyTopic"

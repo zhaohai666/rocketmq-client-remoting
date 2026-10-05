@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from rocketmq.common.sysflag import MessageSysFlag, PermName, PullSysFlag
-from rocketmq.common.util_all import UtilAll
+from common.sysflag import MessageSysFlag, PermName, PullSysFlag
+from common.util_all import UtilAll
 
 
 class TestMessageSysFlag:
@@ -119,7 +119,7 @@ class TestUtilAll:
 
     def test_uniq_id_is_32_upper_hex_chars(self):
         uniq = UtilAll.InnerIdGenerator.create_uniq_id() if hasattr(UtilAll, "InnerIdGenerator") else None
-        from rocketmq.common.util_all import InnerIdGenerator
+        from common.util_all import InnerIdGenerator
         uniq = InnerIdGenerator.create_uniq_id()
         assert len(uniq) == 32
         assert uniq == uniq.upper()

@@ -10,16 +10,16 @@
 # 阈值本身也锁在这里：Java ProcessQueue:43 读 `rocketmq.client.pull.pullMaxIdleTime`，
 # 默认 **120000ms**（不是网传的 60s），POP 分支换成 lastPopTimestamp（PopProcessQueue:74）。
 #
-# 与 C++/Rust/.NET 的 test_pull_expired 一一对应；真机恢复场景见 ../verify_pull_expired_live.py
+# 与 C++/Rust/C# 的 test_pull_expired 一一对应；真机恢复场景见 ../verify_pull_expired_live.py
 #（注入停摆 → 走生产 rebalance 路径重建 → 同一队列继续消费、位点不回退）。
 import threading
 import time
 
-from rocketmq.client.consumer import (MIN_POP_INVISIBLE_TIME, DefaultMQPushConsumer,
+from client.consumer import (MIN_POP_INVISIBLE_TIME, DefaultMQPushConsumer,
                                       PopProcessQueue, PULL_MAX_IDLE_TIME)
-from rocketmq.common.message import MessageExt, MessageQueue
-from rocketmq.common.subscription_data import SubscriptionData
-from rocketmq.remoting.protocol.heartbeat import MessageModel
+from common.message import MessageExt, MessageQueue
+from common.subscription_data import SubscriptionData
+from remoting.protocol.heartbeat import MessageModel
 
 GROUP = "G_pull_expired"
 STALE = PULL_MAX_IDLE_TIME + 5.0
@@ -331,7 +331,7 @@ def test_running_info_reports_real_last_pull_timestamp():
 
 
 def test_running_info_pop_table_reports_last_pop_timestamp():
-    from rocketmq.client.consumer import MessageModel
+    from client.consumer import MessageModel
 
     c, mq, key = _consumer(pop_mode=True)
     _retire_log(c)
