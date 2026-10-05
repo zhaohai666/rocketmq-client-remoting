@@ -1,0 +1,21 @@
+{
+    "name": "zhaohai666/rocketmq-client-remoting-php",
+    "description": "RocketMQ 5.x remoting 协议客户端的 PHP 移植（对齐 Java，参考本仓库 Go/Python/Rust 移植）",
+    "type": "library",
+    "license": "Apache-2.0",
+    "require": {
+        "php": ">=8.1",
+        "ext-json": "*",
+        "ext-sockets": "*",
+        "ext-openssl": "*",
+        "ext-mbstring": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "RocketMQ\\": "src/"
+        },
+        "files": [
+            "bootstrap.php"
+        ]
+    }
+}
