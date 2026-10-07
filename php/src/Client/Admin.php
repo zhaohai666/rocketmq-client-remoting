@@ -37,6 +37,8 @@ use RocketMQ\Remoting\Protocol\TopicRouteData;
 use RocketMQ\Remoting\Protocol\TopicStatsTable;
 use RocketMQ\Remoting\Protocol\RemotingSerializable;
 use RocketMQ\Remoting\RPCHook;
+// 命名空间级函数（定义于 AdminBodies.php；该文件随其中任一类被 autoload 时一并生效）
+use function RocketMQ\Remoting\Protocol\message_queue_key;
 
 /**
  * 管理端（对应 org.apache.rocketmq.client.admin.DefaultMQAdminExt / MQAdminExt
@@ -131,19 +133,24 @@ class DefaultMQAdminExt
 
     public function setNamesrvAddr(string $addr): void
     {
-        $this->nameServerAddrs = [];
+        $addrs = [];
         foreach (explode(';', $addr) as $a) {
             $a = trim($a);
             if ($a !== '') {
-                $this->nameServerAddrs[] = $a;
+                $addrs[] = $a;
             }
         }
+        $this->setNameServerAddresses($addrs);
     }
 
     /** @param list<string> $addrs */
     public function setNameServerAddresses(array $addrs): void
     {
         $this->nameServerAddrs = array_values($addrs);
+        // Python：setter 在 start() 前调用，start() 用该列表构建 MQClientInstance。
+        // PHP 允许注入现成实例（setMqClientInstance），此时同步给 client，
+        // 避免 admin 与 client 两份地址列表漂移（invokeNamesrvOne/All 读 client 侧）。
+        $this->mqClient?->updateNameServerAddressList($this->nameServerAddrs);
     }
 
     public function setInstanceName(string $name): void
@@ -1130,10 +1137,10 @@ class DefaultMQAdminExt
             try {
                 $cc = $this->examineConsumerConnectionInfo($group);
             } catch (MQBrokerException $e) {
-                if ($e->getResponseCode() === ResponseCode::CONSUMER_NOT_ONLINE) {
+                if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
                     $mt->trackType = TrackType::NOT_ONLINE;
                 }
-                $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->getResponseCode(), $e->getMessage());
+                $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->responseCode, $e->getMessage());
                 $result[] = $mt;
                 continue;
             } catch (\Throwable $e) {
@@ -1148,10 +1155,10 @@ class DefaultMQAdminExt
                 try {
                     $ifConsumed = $this->consumed($msg, $group);
                 } catch (MQBrokerException|MQClientException $e) {
-                    if ($e->getResponseCode() === ResponseCode::CONSUMER_NOT_ONLINE) {
+                    if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
                         $mt->trackType = TrackType::NOT_ONLINE;
-                        $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->getResponseCode(), $e->getMessage());
-                    } elseif ($e->getResponseCode() === ResponseCode::BROADCAST_CONSUMPTION) {
+                        $mt->exceptionDesc = sprintf('CODE:%s DESC:%s', $e->responseCode, $e->getMessage());
+                    } elseif ($e->responseCode === ResponseCode::BROADCAST_CONSUMPTION) {
                         $mt->trackType = TrackType::CONSUME_BROADCASTING;
                     }
                     $result[] = $mt;
@@ -1478,7 +1485,7 @@ class DefaultMQAdminExt
         try {
             $this->resetOffsetByTimestamp($topic, $consumerGroup, $timestamp, true);
         } catch (MQClientException $e) {
-            if ($e->getResponseCode() === ResponseCode::CONSUMER_NOT_ONLINE) {
+            if ($e->responseCode === ResponseCode::CONSUMER_NOT_ONLINE) {
                 $this->resetOffsetByTimestampOld($consumerGroup, $topic, $timestamp, true);
                 return;
             }

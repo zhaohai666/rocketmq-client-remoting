@@ -29,6 +29,8 @@ use RocketMQ\Client\EndTransactionContext;
 use RocketMQ\Client\EndTransactionHook;
 use RocketMQ\Client\FairSemaphore;
 use RocketMQ\Client\LocalTransactionState;
+use RocketMQ\Client\CommunicationMode;
+use RocketMQ\Client\MessageQueueSelector;
 use RocketMQ\Client\MQClientInstance;
 use RocketMQ\Client\NullSendCallback;
 use RocketMQ\Client\RequestFutureHolder;
@@ -209,12 +211,10 @@ function producerBrokerSendResponse(RemotingCommand $cmd, string $selfAddr): arr
     return [$resp, $pushes];
 }
 
-function producerBrokerServeConn($conn, string $logFile, string $selfAddr): void
+function producerBrokerHandleFrame($conn, RemotingCommand $cmd, string $logFile, string $selfAddr): void
 {
-    stream_set_blocking($conn, true);
-    while (($cmd = producerBrokerReadFrame($conn)) !== null) {
-        producerBrokerLog($logFile, $cmd);
-        $resp = null;
+    producerBrokerLog($logFile, $cmd);
+    $resp = null;
         $pushes = [];
         switch ($cmd->code) {
             case RequestCode::GET_ROUTEINFO_BY_TOPIC: {
@@ -279,7 +279,31 @@ function producerBrokerServeConn($conn, string $logFile, string $selfAddr): void
         foreach ($pushes as $push) {
             @fwrite($conn, $push->encode());
         }
+}
+
+/**
+ * 从缓冲里取一条完整帧（ROCKETMQ 帧 = 4 字节总长 + body）。
+ * 返回 [raw 帧字节, 解码后的 RemotingCommand]；不完整返回 null。
+ *
+ * @return array{0: string, 1: RemotingCommand}|null
+ */
+function producerBrokerTakeFrame(string &$buf): ?array
+{
+    if (strlen($buf) < 4) {
+        return null;
     }
+    $total = RocketMQSerializable_unpackSignedInt(substr($buf, 0, 4));
+    if ($total <= 0) {
+        // 非法长度：清空缓冲，防止死循环
+        $buf = '';
+        return null;
+    }
+    if (strlen($buf) < 4 + $total) {
+        return null;
+    }
+    $raw = substr($buf, 0, 4 + $total);
+    $buf = substr($buf, 4 + $total);
+    return [$raw, RemotingCommand::decode($raw)];
 }
 
 function producerBrokerMain(string $logFile): void
@@ -292,13 +316,55 @@ function producerBrokerMain(string $logFile): void
     $addr = (string) stream_socket_get_name($server, false);
     fwrite(STDOUT, $addr . "\n");
     fflush(STDOUT);
+    fwrite(STDERR, json_encode(['event' => 'bound', 'addr' => $addr]) . "\n");
+
+    /**
+     * 多连接事件循环。老实现是「单连接阻塞式」：父进程的连接不关闭时，
+     * 子进程会永远卡在 fread 上回不到 accept()，Windows 上新连接直接被拒。
+     * 这里用 stream_select 同时监听 server + 全部已打开连接。
+     *
+     * @var array<int, resource> $conns
+     * @var array<int, string> $bufs
+     */
+    $conns = [];
+    $bufs = [];
+
     while (true) {
-        $conn = @stream_socket_accept($server, 60);
-        if ($conn === false) {
+        $read = array_values($conns);
+        $read[] = $server;
+        $w = null;
+        $e = null;
+        if (@stream_select($read, $w, $e, 5) === false) {
             break;
         }
-        producerBrokerServeConn($conn, $logFile, $addr);
-        @fclose($conn);
+        foreach ($read as $r) {
+            if ($r === $server) {
+                $conn = @stream_socket_accept($server, 0);
+                if ($conn !== false) {
+                    stream_set_blocking($conn, false);
+                    $conns[(int) $conn] = $conn;
+                    $bufs[(int) $conn] = '';
+                    fwrite(STDERR, json_encode(['event' => 'accepted']) . "\n");
+                }
+                continue;
+            }
+            $key = (int) $r;
+            $chunk = @fread($r, 65536);
+            if ($chunk === false || ($chunk === '' && feof($r))) {
+                unset($conns[$key], $bufs[$key]);
+                @fclose($r);
+                fwrite(STDERR, json_encode(['event' => 'eof']) . "\n");
+                continue;
+            }
+            $bufs[$key] .= $chunk;
+            while (true) {
+                $frame = producerBrokerTakeFrame($bufs[$key]);
+                if ($frame === null) {
+                    break;
+                }
+                producerBrokerHandleFrame($r, $frame[1], $logFile, $addr);
+            }
+        }
     }
     @fclose($server);
 }
@@ -327,8 +393,9 @@ final class ProducerFakeBroker
     public static function start(): self
     {
         $logFile = tempnam(sys_get_temp_dir(), 'rmq-producer-log-');
+        $errFile = $logFile . '.err';
         $cmd = [PHP_BINARY, __FILE__, '--broker', $logFile];
-        $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $errFile, 'a']];
         $proc = proc_open($cmd, $desc, $pipes);
         if (!is_resource($proc)) {
             throw new \RuntimeException('cannot spawn fake broker');
@@ -336,7 +403,7 @@ final class ProducerFakeBroker
         $line = fgets($pipes[1]);
         $addr = $line === false ? '' : trim($line);
         if ($addr === '') {
-            $err = stream_get_contents($pipes[2]) ?: '';
+            $err = (string) file_get_contents($errFile);
             proc_terminate($proc);
             proc_close($proc);
             throw new \RuntimeException('fake broker did not report address: ' . $err);
@@ -358,6 +425,10 @@ final class ProducerFakeBroker
     }
 
     /** 某个请求码的日志条数（可选按 topic 过滤）。 */
+    public function isAlive(): bool
+    {
+        return is_resource($this->proc) && proc_get_status($this->proc)['running'];
+    }
     public function logCount(int $code, ?string $topic = null, ?string $topicKey = 'b'): int
     {
         $n = 0;
@@ -716,7 +787,7 @@ final class RunClientProducer
         $b2 = new Message('T', 'ef');
         $batch = MessageBatch::generateFromList([$b1, $b2]);
         $this->checkSame(6, DefaultMQProducer::backPressureMsgLen($batch), 'msgLen: 批量按条累加');
-        $this->checkSame(9, DefaultMQProducer::backPressureMsgLen([$m3, $batch]), 'msgLen: 列表累加');
+        $this->checkSame(11, DefaultMQProducer::backPressureMsgLen([$m3, $batch]), 'msgLen: 列表累加（5 + 批量 6）');
         $emptyBatch = MessageBatch::generateFromList([new Message('T', null)]);
         $this->checkSame(1, DefaultMQProducer::backPressureMsgLen($emptyBatch), 'msgLen: 全空批 → 1');
 
