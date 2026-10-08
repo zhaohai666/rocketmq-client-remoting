@@ -123,6 +123,7 @@ class MQClientInstance:
     def __init__(self, client_id: str, name_server_addrs: List[str],
                  connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
                  tls_enable: Optional[bool] = None,
+                 tls_options: Optional[Dict[str, str]] = None,
                  enable_stream_request_type: bool = False,
                  unit_name: Optional[str] = None,
                  poll_name_server_interval: int = 30000):
@@ -135,7 +136,7 @@ class MQClientInstance:
         # scheduledExecutorService 同理）。
         self.poll_name_server_interval = poll_name_server_interval
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
-                                              tls_enable=tls_enable)
+                                              tls_enable=tls_enable, tls_options=tls_options)
         # 对应 Java `MQClientAPIImpl:329-332`：stream 钩子必须注册在用户 rpcHook 之前，
         # 这样 `ReqT` 才会被算进 ACL 签名内容（注释原文 "Inject stream rpc hook first
         # to make reserve field signature"）。各 facade 都是在构造完本实例之后才

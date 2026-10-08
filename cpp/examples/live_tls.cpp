@@ -99,7 +99,7 @@ int64_t elapsedMs(const std::chrono::steady_clock::time_point& began) {
         .count();
 }
 
-bool runTransportStress(const std::string& namesrv) {
+bool runTransportStress(const std::string& namesrv, const TlsOptions& tlsOptions) {
     bool ok = true;
 
     int lost = 0;
@@ -107,6 +107,7 @@ bool runTransportStress(const std::string& namesrv) {
     for (int i = 0; i < kFirstPacketRounds; ++i) {
         RemotingClient client;
         client.setTlsEnable(true);
+        if (!tlsOptions.empty()) client.setTlsOptions(tlsOptions);
         RemotingCommand req = routeRequest("TlsLiveFirstPacket_" + std::to_string(i));
         const auto began = std::chrono::steady_clock::now();
         try {
@@ -129,6 +130,7 @@ bool runTransportStress(const std::string& namesrv) {
 
     RemotingClient shared;
     shared.setTlsEnable(true);
+    if (!tlsOptions.empty()) shared.setTlsOptions(tlsOptions);
     std::atomic<int> failures{0};
     std::vector<std::thread> workers;
     workers.reserve(kConcurrentThreads);
@@ -173,15 +175,16 @@ bool runTransportStress(const std::string& namesrv) {
 }  // namespace
 
 static int runLive(const std::string& namesrv, const std::string& topic,
-                   const std::string& group) {
+                   const std::string& group, const TlsOptions& tlsOptions) {
     // 0) 传输层压力放在最前：它只要一个能建 TLS 连接的 nameServer 地址，不依赖 topic
     std::cout << "=== S0 TLS 传输层 ===\n";
-    const bool transportOk = runTransportStress(namesrv);
+    const bool transportOk = runTransportStress(namesrv, tlsOptions);
 
     // 1) 预建 topic（约定 5：先建 topic 再起消费者；消费者不做默认 topic 兜底）
     {
         DefaultMQProducer prep("GID_TLS_PREP");
         prep.setNamesrvAddr(namesrv);
+        if (!tlsOptions.empty()) prep.setTlsOptions(tlsOptions);
         prep.start();
         try {
             prep.createTopic("init", topic, 4);
@@ -197,6 +200,7 @@ static int runLive(const std::string& namesrv, const std::string& topic,
     DefaultMQPushConsumer cons(group);
     cons.setNamesrvAddr(namesrv);
     cons.setTlsEnable(true);
+    if (!tlsOptions.empty()) cons.setTlsOptions(tlsOptions);
     cons.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
     cons.subscribe(topic, "*");
     cons.setMessageListener(listener);
@@ -206,6 +210,7 @@ static int runLive(const std::string& namesrv, const std::string& topic,
     DefaultMQProducer prod("GID_TLS_PROD");
     prod.setNamesrvAddr(namesrv);
     prod.setTlsEnable(true);
+    if (!tlsOptions.empty()) prod.setTlsOptions(tlsOptions);
     prod.setEnableTraceContext(true);
     prod.start();
     int sent = 0;
@@ -236,8 +241,37 @@ static int runLive(const std::string& namesrv, const std::string& topic,
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "usage: rmq_tls_live <namesrv> <topic> <group>\n";
+    // 三腿（对齐 run_php_live.sh tls / run_node_live.sh tls / run_python_tls_live.sh）：
+    //   plain_tls  test-mode，信任自签（历史行为）
+    //   ca_verify  严格校验：证书链到 caCert + 主机名/SAN 匹配（serverName 覆盖）
+    //   mtls       严格校验 + 客户端证书双向认证
+    // 用法: rmq_tls_live <namesrv> <topic> <group> [leg] [caCert] [serverName] [clientCert] [clientKey]
+    if (argc < 4 || argc > 9) {
+        std::cerr << "usage: rmq_tls_live <namesrv> <topic> <group>"
+                     " [plain_tls|ca_verify|mtls] [caCert] [serverName] [clientCert] [clientKey]\n";
+        return 2;
+    }
+    const std::string leg = argc >= 5 ? argv[4] : "plain_tls";
+    TlsOptions tlsOptions;
+    if (leg == "plain_tls") {
+        // 不带任何选项：test-mode
+    } else if (leg == "ca_verify" || leg == "mtls") {
+        if (argc < 6) {
+            std::cerr << "leg " << leg << " requires caCert\n";
+            return 2;
+        }
+        tlsOptions.caCert = argv[5];
+        if (argc >= 7) tlsOptions.serverName = argv[6];
+        if (leg == "mtls") {
+            if (argc < 8) {
+                std::cerr << "leg mtls requires clientCert and clientKey\n";
+                return 2;
+            }
+            tlsOptions.clientCert = argv[7];
+            tlsOptions.clientKey = argv[8];
+        }
+    } else {
+        std::cerr << "unknown leg: " << leg << "\n";
         return 2;
     }
 #ifndef RMQ_HAS_TLS
@@ -247,7 +281,7 @@ int main(int argc, char** argv) {
     return 0;
 #else
     try {
-        return runLive(argv[1], argv[2], argv[3]);
+        return runLive(argv[1], argv[2], argv[3], tlsOptions);
     } catch (const std::exception& e) {
         std::cout << "  [FAIL] uncaught: " << e.what() << "\n";
         return 1;

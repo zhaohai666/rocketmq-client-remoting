@@ -231,6 +231,10 @@ void DefaultMQProducer::start() {
                                          /*invokeTimeoutMillis=*/15000,
                                          tlsEnable_, unitName_,
                                          pollNameServerIntervalMillis_));
+    // TLS 严格校验选项（caCert 非空 = 严格校验）：转发给实例与底层传输层
+    if (tlsOptionsSet_) {
+        mqClient_->setTlsOptions(tlsOptions_);
+    }
     // 请求钩子：必须在**任何请求发出之前**绑定（start() 里的路由拉取与心跳也要带签名，
     // 开了 stream 时还要带 `ReqT`）。Java 把钩子绑在 MQClientAPIImpl 构造函数里，
     // 这里同样先绑钩子再 start()。

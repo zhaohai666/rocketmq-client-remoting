@@ -163,6 +163,15 @@ public:
         return remotingClient_->registerRPCHook(std::move(hook));
     }
 
+    // ---- TLS 严格校验选项（四端口径统一：caCert 非空 = 证书链 + 主机名严格校验）----
+    // 必须在 start() 之前调用；调用后自动开启 TLS（等价 setTlsEnable(true)）并把选项
+    // 转发给底层 RemotingClient，首条连接建立时生效。
+    void setTlsOptions(const TlsOptions& options) {
+        tlsOptions_ = options;
+        tlsEnable_ = true;
+        remotingClient_->setTlsOptions(options);
+    }
+
     // ---------------- 路由管理 ----------------
     // 从 NameServer 拉取 topic 路由。未知 topic 会回退到 MixAll::DEFAULT_TOPIC
     // （5.x nameserver 不为未知 topic 合成路由，返回 TOPIC_NOT_EXIST）。
@@ -555,6 +564,7 @@ private:
     // 在用 topic（消费者订阅 + 生产者发送过的），由周期任务刷新路由
     std::set<std::string> topicsInUse_;
     bool tlsEnable_ = false;
+    TlsOptions tlsOptions_;
     bool started_ = false;
     std::atomic<bool> routeRefreshStop_{false};
     std::thread routeRefreshThread_;

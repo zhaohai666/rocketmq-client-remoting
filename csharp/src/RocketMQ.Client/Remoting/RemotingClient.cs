@@ -25,6 +25,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 
@@ -104,6 +105,7 @@ public sealed class RemotingClient : IDisposable
     private readonly int _connectTimeoutMillis;
     private readonly int _invokeTimeoutMillis;
     private readonly bool _tlsEnable;
+    private readonly TlsOptions? _tlsOptions;
 
     private readonly object _connMutex = new();
     private readonly Dictionary<string, Connection> _conns = new(StringComparer.Ordinal);
@@ -175,19 +177,67 @@ public sealed class RemotingClient : IDisposable
     }
 
     public RemotingClient(int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000,
-        bool? tlsEnable = null)
+        bool? tlsEnable = null, TlsOptions? tlsOptions = null)
     {
         _connectTimeoutMillis = connectTimeoutMillis;
         _invokeTimeoutMillis = invokeTimeoutMillis;
         // TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
         // 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
         _tlsEnable = tlsEnable ?? EnvTlsEnabled();
+        _tlsOptions = tlsOptions;
     }
 
     internal static bool EnvTlsEnabled()
     {
         string? v = Environment.GetEnvironmentVariable("ROCKETMQ_TLS_ENABLE");
         return v is not null && (v.Trim().ToLowerInvariant() is "1" or "true" or "yes");
+    }
+
+    /// <summary>
+    /// 严格校验的主机名/SAN 匹配：host 是 IP 时比对 IP SAN，否则比对 DNS SAN
+    /// （精确或 <c>*.example</c> 单层通配）。CustomRootTrust 链不查名字，所以
+    /// RemoteCertificateValidationCallback 里必须自己补这一步。
+    /// </summary>
+    internal static bool CertMatchesHostname(X509Certificate2 cert, string hostname)
+    {
+        if (string.IsNullOrEmpty(hostname)) return false;
+        bool hostIsIp = IPAddress.TryParse(hostname, out IPAddress? hostIp);
+        foreach (var ext in cert.Extensions)
+        {
+            if (ext is not X509SubjectAlternativeNameExtension san) continue;
+            if (hostIsIp)
+            {
+                foreach (var ip in san.EnumerateIPAddresses())
+                {
+                    if (ip.Equals(hostIp)) return true;
+                }
+            }
+            else
+            {
+                foreach (var dns in san.EnumerateDnsNames())
+                {
+                    if (dns.Equals(hostname, StringComparison.OrdinalIgnoreCase)) return true;
+                    // 单层通配：*.example.com 匹配 a.example.com，不匹配 a.b.example.com
+                    if (dns.StartsWith("*.", StringComparison.Ordinal))
+                    {
+                        var suffix = dns[1..]; // ".example.com"
+                        var idx = hostname.IndexOf('.', StringComparison.Ordinal);
+                        if (idx > 0 && hostname[idx..].Equals(suffix, StringComparison.OrdinalIgnoreCase)
+                            && !hostname[(idx + 1)..].Contains('.'))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        // 兜底：无 SAN 段时退回 CN（RFC 6125 已废弃，但对老证书仍有用）
+        if (!cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().Any())
+        {
+            var cn = cert.GetNameInfo(X509NameType.DnsName, false);
+            return cn is not null && cn.Equals(hostname, StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
     }
 
     /// <summary>
@@ -361,15 +411,68 @@ public sealed class RemotingClient : IDisposable
         var conn = new Connection { Addr = addr, Sock = sock };
 
         // TLS：在任何 RocketMQ 帧之前完成握手（对应 Java pipeline.addFirst(SslHandler)）。
-        // test mode 信任 broker 自签证书（Java tls.test.mode.enable 默认 true 的等价语义）。
+        // test mode（无 CaCert）信任 broker 自签证书（Java tls.test.mode.enable 默认 true
+        // 的等价语义）；CaCert 给出则**严格校验**：证书链必须到该 CA（CustomRootTrust）
+        // 且主机名/SAN 匹配（SslStream 按 TargetHost 校验，ServerName 显式覆盖）。
         if (_tlsEnable)
         {
             try
             {
                 var ns = new NetworkStream(sock, ownsSocket: false);
-                var ssl = new SslStream(ns, false,
-                    (sender, cert, chain, errors) => true);   // test mode：信任一切
-                ssl.AuthenticateAsClient(host);
+                var tlsOpts = _tlsOptions;
+                bool strict = tlsOpts?.CaCert is not null;
+                SslStream ssl;
+                if (strict)
+                {
+                    var caCert = X509CertificateLoader.LoadCertificateFromFile(tlsOpts!.CaCert!);
+                    var clientCerts = new X509CertificateCollection();
+                    if (tlsOpts!.ClientCert is not null)
+                    {
+                        // PEM(证书+私钥) → X509Certificate2。⚠ macOS 的 SslStream 不认
+                        // CreateFromPemFile 产出的**临时**私钥，必须先导出成 PFX 再用
+                        // X509CertificateLoader 加载（PKCS#12 容器），否则客户端证书无法出示。
+                        var withKey = string.IsNullOrEmpty(tlsOpts.ClientKey)
+                            ? X509CertificateLoader.LoadCertificateFromFile(tlsOpts.ClientCert)
+                            : X509Certificate2.CreateFromPemFile(tlsOpts.ClientCert, tlsOpts.ClientKey);
+                        var pfx = withKey.Export(X509ContentType.Pkcs12);
+                        clientCerts.Add(X509CertificateLoader.LoadPkcs12(pfx, null));
+                    }
+                    var chainPolicy = new X509ChainPolicy
+                    {
+                        TrustMode = X509ChainTrustMode.CustomRootTrust,
+                    };
+                    chainPolicy.CustomTrustStore.Add(caCert);
+                    var targetName = string.IsNullOrEmpty(tlsOpts.ServerName) ? host : tlsOpts.ServerName;
+                    var auth = new SslClientAuthenticationOptions
+                    {
+                        TargetHost = host,
+                        ClientCertificates = clientCerts,
+                        RemoteCertificateValidationCallback = (sender, cert, chain, errors) =>
+                        {
+                            if (cert is null) return false;
+                            var peer = (X509Certificate2)cert;
+                            var custom = new X509Chain
+                            {
+                                ChainPolicy = chainPolicy,
+                            };
+                            if (!custom.Build(peer))
+                            {
+                                return false;
+                            }
+                            // 主机名/SAN 校验（CustomRootTrust 链不含名字检查）：
+                            // host 是 IP 时比 IP SAN，否则比 DNS SAN（支持 *.example 通配）。
+                            return CertMatchesHostname(peer, targetName);
+                        },
+                    };
+                    ssl = new SslStream(ns, false);
+                    ssl.AuthenticateAsClient(auth);
+                }
+                else
+                {
+                    ssl = new SslStream(ns, false,
+                        (sender, cert, chain, errors) => true);   // test mode：信任一切
+                    ssl.AuthenticateAsClient(host);
+                }
                 conn.Tls = ssl;
             }
             catch (Exception e)

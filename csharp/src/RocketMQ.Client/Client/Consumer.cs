@@ -382,6 +382,18 @@ public sealed class DefaultMQPushConsumer
 
     private bool _tlsEnable = MQClientInstance.TlsEnabledFromEnv();
 
+    private TlsOptions? _tlsOptions;
+
+    /// <summary>
+    /// TLS 细项（CaCert=严格 CA 校验；ClientCert/ClientKey=mTLS；ServerName=主机名覆盖）。
+    /// 不设 CaCert = test-mode（信任自签）。
+    /// </summary>
+    public TlsOptions? TlsOptions
+    {
+        get => _tlsOptions;
+        set => _tlsOptions = value;
+    }
+
     /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
     public long PopInvisibleTime { get; set; } = 60000;
 
@@ -1147,7 +1159,7 @@ public sealed class DefaultMQPushConsumer
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
                 /*connectTimeoutMillis=*/3000,
                 /*invokeTimeoutMillis=*/_pullTimeoutMillis,
-                tlsEnable: TlsEnable, unitName: _unitName,
+                tlsEnable: TlsEnable, tlsOptions: TlsOptions, unitName: _unitName,
                 pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {

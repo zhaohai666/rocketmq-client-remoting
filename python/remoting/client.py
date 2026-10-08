@@ -183,6 +183,7 @@ class _ResponseFuture:
 class RemotingClient:
     def __init__(self, connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
                  tls_enable: Optional[bool] = None,
+                 tls_options: Optional[Dict[str, str]] = None,
                  enable_reconnect_for_go_away: bool = True):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
@@ -194,6 +195,13 @@ class RemotingClient:
         if tls_enable is None:
             tls_enable = os.environ.get("ROCKETMQ_TLS_ENABLE", "").strip().lower() in ("1", "true", "yes")
         self.tls_enable = bool(tls_enable)
+        # TLS 细项（对齐 PHP RemotingClient $tlsOptions / Java TlsSystemConfig certPath 族）。
+        #   caCert: CA 证书路径 —— 给出即**严格校验**（tls.test.mode.enable=false 口径）：
+        #           broker 证书必须链到该 CA 且主机名/SAN 匹配（默认用连接 host）；
+        #           不给 = test-mode（信任自签，CERT_NONE，历史行为）。
+        #   clientCert/clientKey: mTLS 客户端证书与私钥路径。
+        #   serverName: 主机名/SNI 覆盖（缺省用连接 host）。
+        self.tls_options: Dict[str, str] = dict(tls_options or {})
         self._lock = threading.RLock()
         self._conns: Dict[str, socket.socket] = {}
         self._sock_locks: Dict[str, threading.Lock] = {}
@@ -268,11 +276,24 @@ class RemotingClient:
             # 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ
             # 帧之前完成握手。test mode（Java tls.test.mode.enable 默认 true）= 信任
             # broker 的自签证书、不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
+            # tls_options['caCert'] 给出则走**严格校验**：证书链必须到该 CA、主机名/SAN
+            # 必须匹配（PROTOCOL_TLS_CLIENT 默认 check_hostname=True）。
             try:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                sock = ctx.wrap_socket(sock, server_hostname=host)
+                ca_cert = self.tls_options.get("caCert")
+                client_cert = self.tls_options.get("clientCert")
+                if client_cert:
+                    # mTLS：test-mode 也允许带客户端证书（服务端要求时必须能出示）
+                    ctx.load_cert_chain(certfile=client_cert,
+                                        keyfile=self.tls_options.get("clientKey"))
+                if ca_cert:
+                    ctx.load_verify_locations(cafile=ca_cert)
+                    server_name = self.tls_options.get("serverName") or host
+                else:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    server_name = host
+                sock = ctx.wrap_socket(sock, server_hostname=server_name)
             except (OSError, ssl.SSLError) as e:
                 try:
                     sock.close()

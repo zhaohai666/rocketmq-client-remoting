@@ -14,7 +14,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from common.message import Message, MessageBatch, MessageExt, MessageQueue
 from common.message_accessor import MessageAccessor
@@ -325,12 +325,15 @@ class DefaultMQProducer:
     def __init__(self, producer_group: str = MixAll.DEFAULT_PRODUCER_GROUP,
                  rpc_hook: Optional[RPCHook] = None, namespace: str = "",
                  topics: Optional[List[str]] = None, tls_enable: Optional[bool] = None,
+                 tls_options: Optional[Dict[str, str]] = None,
                  enable_trace_context: Optional[bool] = None):
         if producer_group is None or not str(producer_group).strip():
             raise MQClientException("producerGroup is empty")
         self.producer_group = str(producer_group)
         # TLS（Java 全局系统属性 tls.enable 的等价物；None = 交给 env ROCKETMQ_TLS_ENABLE）
         self.tls_enable: Optional[bool] = tls_enable
+        # TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）
+        self.tls_options: Optional[Dict[str, str]] = tls_options
         # W3C traceparent 透传（opt-in；None = 交给 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
         if enable_trace_context is None:
             enable_trace_context = trace_context_enabled_from_env()
@@ -831,6 +834,7 @@ class DefaultMQProducer:
                                                       self.enable_stream_request_type)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable,
+                                               tls_options=self.tls_options,
                                                enable_stream_request_type=self.enable_stream_request_type,
                                                unit_name=self.unit_name,
                                                poll_name_server_interval=self.poll_name_server_interval)

@@ -32,6 +32,21 @@
 
 namespace rocketmq {
 
+// 客户端 TLS 细化选项（四端口径统一，对齐 Java tls.client.* / PHP tlsOptions）：
+//   * caCert 为空 → test mode（信任 broker 自签，历史行为，Java tls.test.mode.enable=true）；
+//   * caCert 非空 → 严格校验：证书链必须到该 CA，且主机名/SAN 匹配（serverName 覆盖，
+//     缺省用连接 host）；校验失败按建连失败抛 RemotingConnectException；
+//   * clientCert/clientKey 非空 → mTLS 客户端证书（PEM）；
+//   * serverName → 主机名/SAN 校验目标覆盖（不影响 SNI，SNI 始终用连接 host）。
+struct TlsOptions {
+    std::string caCert;
+    std::string clientCert;
+    std::string clientKey;
+    std::string serverName;
+
+    bool empty() const { return caCert.empty() && clientCert.empty() && clientKey.empty() && serverName.empty(); }
+};
+
 // 异步回调的错误载体（对应 Java ``InvokeCallback`` 收到的那个 Throwable，
 // 也是 Python 版 ``invoke_async`` 回调里的 error 参数）。
 //
@@ -164,6 +179,10 @@ public:
     // MQClientException，明文路径零影响。
     void setTlsEnable(bool enable);
     bool tlsEnable() const;
+    // 设置 TLS 细化选项（caCert/clientCert/clientKey/serverName）。必须在首条连接建立前
+    // 调用；caCert 非空时 setTlsEnable(true) 会创建严格校验的 SSL_CTX（证书链 + 主机名）。
+    // 若 TLS 已开启则立即重建 ctx（options 变了 ctx 必须跟着变），失败抛 RemotingException。
+    void setTlsOptions(const TlsOptions& options);
 
     // ---- GO_AWAY（对应 Java NettyClientConfig.enableReconnectForGoAway，默认 true）----
     // broker / proxy 优雅下线时给在途请求回 ResponseCode.GO_AWAY(1500)，语义是

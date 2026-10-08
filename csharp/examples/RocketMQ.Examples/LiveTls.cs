@@ -40,7 +40,7 @@ internal static class LiveTls
     /// 直接用 RemotingClient 压 TLS 会话的读写线程口径：S0a 每轮新建连接打首包，
     /// S0b 一条连接上多线程并发（读线程与写线程彻底交叠）并要求 opaque 逐笔对上。
     /// </summary>
-    private static bool RunTransportStress(string namesrv)
+    private static bool RunTransportStress(string namesrv, TlsOptions? tlsOptions)
     {
         bool ok = true;
 
@@ -48,7 +48,7 @@ internal static class LiveTls
         long worstMs = 0;
         for (int i = 0; i < FirstPacketRounds; i++)
         {
-            var client = new RemotingClient(tlsEnable: true);
+            var client = new RemotingClient(tlsEnable: true, tlsOptions: tlsOptions);
             Stopwatch sw = Stopwatch.StartNew();
             try
             {
@@ -77,7 +77,7 @@ internal static class LiveTls
             + " 轮新建 TLS 连接首包全部落地  lost=" + lost + " worst=" + worstMs + "ms");
         ok &= lost == 0;
 
-        var shared = new RemotingClient(tlsEnable: true);
+        var shared = new RemotingClient(tlsEnable: true, tlsOptions: tlsOptions);
         int failures = 0;
         Stopwatch all = Stopwatch.StartNew();
         Task[] workers = new Task[ConcurrentThreads];
@@ -124,21 +124,46 @@ internal static class LiveTls
     {
         if (args.Length < 3)
         {
-            Console.WriteLine("usage: tls <namesrv> <topic> <group>");
+            Console.WriteLine("usage: tls <namesrv> <topic> <group> [leg] [caCert] [clientCert] [clientKey]");
             return 2;
         }
 
         string namesrv = args[0];
         string topic = args[1];
         string group = args[2];
+        // 三腿（对齐 live_tls.php / live_tls.ts）：
+        //   plain     tlsEnable=True，信任自签（test-mode）
+        //   ca_verify + CaCert —— 严格校验证书链 + 主机名 SAN
+        //   mtls      ca_verify + 客户端证书（broker -Dtls.server.authClient=true）
+        string leg = args.Length > 3 ? args[3] : "plain";
+        TlsOptions? tlsOptions = null;
+        if (leg is "ca_verify" or "mtls")
+        {
+            tlsOptions = new TlsOptions
+            {
+                CaCert = args.Length > 5 ? args[5] : "",
+                ServerName = "127.0.0.1",
+            };
+            if (leg == "mtls")
+            {
+                tlsOptions.ClientCert = args.Length > 6 ? args[6] : "";
+                tlsOptions.ClientKey = args.Length > 7 ? args[7] : "";
+            }
+        }
+        Console.WriteLine("=== C# TLS live: leg=" + leg + " topic=" + topic + " ===");
 
         // 0) 传输层压力放在最前：只要一个能建 TLS 连接的 nameServer 地址，不依赖 topic
         Console.WriteLine("=== S0 TLS 传输层 ===");
-        bool transportOk = RunTransportStress(namesrv);
+        bool transportOk = RunTransportStress(namesrv, tlsOptions);
 
-        // 1) 明文生产者预建 topic（约定：先建 topic 再起消费者）
-        var prep = new DefaultMQProducer("GID_TLS_PREP");
-        prep.NamesrvAddr = namesrv;
+        // 1) 明文生产者预建 topic（约定：先建 topic 再起消费者）。严格校验的集群是
+        //    namesrv+broker 全 TLS，这个 prep 生产者也走 TLS。
+        var prep = new DefaultMQProducer("GID_TLS_PREP")
+        {
+            NamesrvAddr = namesrv,
+            TlsEnable = true,
+            TlsOptions = tlsOptions,
+        };
         prep.Start();
         try
         {
@@ -156,6 +181,7 @@ internal static class LiveTls
         var consumer = new DefaultMQPushConsumer(group);
         consumer.SetNamesrvAddr(namesrv);
         consumer.TlsEnable = true;
+        consumer.TlsOptions = tlsOptions;
         consumer.ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset;
         consumer.SetMessageListener(listener);
         consumer.Subscribe(topic, "*");
@@ -165,6 +191,7 @@ internal static class LiveTls
         var producer = new DefaultMQProducer("GID_TLS_PROD");
         producer.NamesrvAddr = namesrv;
         producer.TlsEnable = true;
+        producer.TlsOptions = tlsOptions;
         producer.EnableTraceContext = true;
         producer.Start();
 

@@ -272,6 +272,13 @@ public:
     bool popMode() const { return popMode_; }
     // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
     void setTlsEnable(bool b) { tlsEnable_ = b; }
+    // TLS 严格校验选项（caCert 非空 = 证书链 + 主机名严格校验；clientCert/Key = mTLS）。
+    // 调用后自动开启 TLS；须在 start() 之前设置。
+    void setTlsOptions(const TlsOptions& opts) {
+        tlsOptions_ = opts;
+        tlsOptionsSet_ = true;
+        tlsEnable_ = true;
+    }
     // 弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）
     void setPopInvisibleTime(int64_t t) { popInvisibleTime_ = t; }
     int64_t popInvisibleTime() const { return popInvisibleTime_; }
@@ -801,6 +808,8 @@ private:
     // ---- POP 模式（5.x 轻量消费）----
     bool popMode_ = false;
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
+    TlsOptions tlsOptions_;
+    bool tlsOptionsSet_ = false;
     int64_t popInvisibleTime_ = 60000;
     int32_t popBatchNums_ = 32;
     int32_t popThresholdForQueue_ = 96;

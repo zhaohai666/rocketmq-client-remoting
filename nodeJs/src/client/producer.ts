@@ -114,6 +114,8 @@ export class DefaultMQProducer {
   namespace: string | null;
   namesrvAddr: string | null;
   tlsEnable: boolean;
+  // TLS 细项（见 setTlsOptions）；null = test-mode（信任自签）。
+  tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null;
   rpcHook: AclRPCHook | null;
   unitName: string | null;
   sendLatencyFaultEnable: boolean;
@@ -161,6 +163,7 @@ export class DefaultMQProducer {
     this.namespace = null;
     this.namesrvAddr = null;
     this.tlsEnable = false;
+    this.tlsOptions = null;
     this.rpcHook = null;
     this.unitName = null;
     this.sendLatencyFaultEnable = false;
@@ -212,6 +215,11 @@ export class DefaultMQProducer {
   setNamespace(ns: string): this { this.namespace = ns; return this; }
   setUnitName(name: string): this { this.unitName = name; return this; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
+  // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖），
+  // 对齐 PHP tlsOptions / Java TlsSystemConfig certPath 族。不设 caCert = test-mode。
+  setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
+    this.tlsOptions = opts; return this;
+  }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
@@ -273,7 +281,7 @@ export class DefaultMQProducer {
     const clientId = MixAll.clientIdFor(instanceName, this.unitName);
     this.producerClientId = clientId;
 
-    const remotingClient = new RemotingClient({ tlsEnable: this.tlsEnable });
+    const remotingClient = new RemotingClient({ tlsEnable: this.tlsEnable, tlsOptions: this.tlsOptions });
     this.client = new MQClient(clientId, this.namesrvAddr, remotingClient);
     if (this.rpcHook != null) {
       this.client.remotingClient.registerRpcHook(this.rpcHook);

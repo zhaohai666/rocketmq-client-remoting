@@ -176,9 +176,10 @@ struct RemotingClient::Impl {
     // 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）。
     bool enableReconnectForGoAway = true;
     // TLS（对应 Java NettyRemotingClient 的 isUseTLS + 构造期 buildSslContext）。
-    // tlsCtx 持有 SSL_CTX*；setTlsEnable(true) 时创建。
+    // tlsCtx 持有 SSL_CTX*；setTlsEnable(true) 时创建（caCert 非空 → 严格校验 ctx）。
     bool tlsEnable = false;
     std::shared_ptr<void> tlsCtx;
+    TlsOptions tlsOptions;
 
     mutable std::mutex connMutex;
     std::unordered_map<std::string, std::shared_ptr<Connection>> conns;
@@ -254,10 +255,10 @@ struct RemotingClient::Impl {
         conn->sock = sock;
 
         // TLS：在任何 RocketMQ 帧之前完成握手（对应 Java pipeline.addFirst(SslHandler)）。
-        // 失败按建连失败处理，异常信息带握手原因。
+        // 失败按建连失败处理，异常信息带握手原因（严格模式下含证书链/主机名校验失败原因）。
         if (tlsEnable) {
             std::string tlsErr;
-            auto session = std::make_unique<TlsSession>(tlsCtx);
+            auto session = std::make_unique<TlsSession>(tlsCtx, tlsOptions.serverName);
             if (!session->handshake(sock, host, connectTimeout, tlsErr)) {
                 closeSocket(sock);
                 throw RemotingConnectException(tlsErr);
@@ -1002,16 +1003,46 @@ void RemotingClient::setTlsEnable(bool enable) {
         impl_->tlsCtx.reset();
         return;
     }
-    // 只创建一次 SSL_CTX（对应 Java 构造期 buildSslContext(true)）
+    // 只创建一次 SSL_CTX（对应 Java 构造期 buildSslContext(true)）；caCert 非空走严格校验
     if (!impl_->tlsCtx) {
         std::string err;
-        auto ctx = createClientSslContext(err);
+        std::shared_ptr<void> ctx;
+        if (!impl_->tlsOptions.caCert.empty()) {
+            ctx = createStrictClientSslContext(impl_->tlsOptions.caCert,
+                                               impl_->tlsOptions.clientCert,
+                                               impl_->tlsOptions.clientKey, err);
+        } else {
+            // test mode：客户端证书仍可带（与 caCert 独立，Java tls.client.certPath 同）
+            ctx = createClientSslContext(err, impl_->tlsOptions.clientCert,
+                                         impl_->tlsOptions.clientKey);
+        }
         if (!ctx) {
             throw RemotingException("enable TLS failed: " + err);
         }
         impl_->tlsCtx = ctx;
     }
     impl_->tlsEnable = true;
+}
+
+void RemotingClient::setTlsOptions(const TlsOptions& options) {
+    impl_->tlsOptions = options;
+    if (impl_->tlsEnable) {
+        // 已开启：options 变了 ctx 必须重建（比如 ca_verify 换成 mtls）
+        std::string err;
+        std::shared_ptr<void> ctx;
+        if (!impl_->tlsOptions.caCert.empty()) {
+            ctx = createStrictClientSslContext(impl_->tlsOptions.caCert,
+                                               impl_->tlsOptions.clientCert,
+                                               impl_->tlsOptions.clientKey, err);
+        } else {
+            ctx = createClientSslContext(err, impl_->tlsOptions.clientCert,
+                                         impl_->tlsOptions.clientKey);
+        }
+        if (!ctx) {
+            throw RemotingException("setTlsOptions failed: " + err);
+        }
+        impl_->tlsCtx = ctx;
+    }
 }
 
 bool RemotingClient::tlsEnable() const { return impl_->tlsEnable; }

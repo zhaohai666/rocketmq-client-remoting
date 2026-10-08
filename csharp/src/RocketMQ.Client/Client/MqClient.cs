@@ -274,7 +274,7 @@ public sealed class MQClientInstance : IDisposable
     /// </summary>
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
         int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
-        string? unitName = null, int pollNameServerIntervalMillis = 30000)
+        TlsOptions? tlsOptions = null, string? unitName = null, int pollNameServerIntervalMillis = 30000)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
@@ -284,7 +284,7 @@ public sealed class MQClientInstance : IDisposable
         _pollNameServerIntervalMillis = pollNameServerIntervalMillis > 0
             ? pollNameServerIntervalMillis
             : 30000;
-        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable);
+        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable, tlsOptions);
         // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 = 动态取址关闭（与 Java 默认
         // jmenv.tbsite.net 不同：那是个依赖 /etc/hosts 的域名，照抄会让未配置的用户
         // 每次 start 白等 3s 超时）。

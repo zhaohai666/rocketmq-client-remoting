@@ -129,6 +129,8 @@ export class DefaultMQPushConsumer {
   clientID = '';
   unitMode = false;
   tlsEnable: boolean | null = null;
+  // TLS 细项（见 setTlsOptions）；null = test-mode。
+  tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null = null;
 
   messageModel: string = MessageModel.CLUSTERING;
   consumeFromWhere: string = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET;
@@ -238,6 +240,10 @@ export class DefaultMQPushConsumer {
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   setUnitMode(mode: boolean): this { this.unitMode = mode; return this; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
+  // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）。
+  setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
+    this.tlsOptions = opts; return this;
+  }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
   setConsumeTimestamp(ts: string): this { this.consumeTimestamp = ts; return this; }
@@ -396,6 +402,7 @@ export class DefaultMQPushConsumer {
 
     const client = new MQClient(this.clientID, this.nameServerAddr);
     if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
+    if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
     this.mqClient = client;
     // Java MQClientFactory.getConsumerStatsManager — instance-level shared.
     this._statsManager = client.consumerStatsManager;

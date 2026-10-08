@@ -5,6 +5,7 @@
 // and broker-initiated request processors.
 import net from 'node:net';
 import tls from 'node:tls';
+import fs from 'node:fs';
 import { once } from 'node:events';
 import { Buffer } from 'node:buffer';
 import { ResponseCode } from './codes.ts';
@@ -30,11 +31,24 @@ interface ResponseFuture {
   fired: boolean;
 }
 
+// TLS 细项（对齐 PHP RemotingClient $tlsOptions / Java TlsSystemConfig certPath 族）：
+//   - caCert 给出 → 严格校验（Java tls.test.mode.enable=false 口径）：broker 证书必须
+//     链到该 CA，且主机名/SAN 匹配（默认用连接 host 校验，serverName 可覆盖）；
+//     不给 → test-mode：信任自签（rejectUnauthorized=false，历史行为）。
+//   - clientCert/clientKey → mTLS 客户端证书（对应 tls.client.certPath/keyPath）。
+export interface TlsOptions {
+  caCert?: string;
+  clientCert?: string;
+  clientKey?: string;
+  serverName?: string;
+}
+
 export class RemotingClient {
   connectTimeoutMillis = 3000;
   invokeTimeoutMillis = 15000;
   enableReconnectForGoAway = true;
   tlsEnable = false;
+  tlsOptions: TlsOptions | null = null;
   private conns = new Map<string, any>();
   private buffers = new Map<string, Buffer>();
   private responseTable = new Map<number, ResponseFuture>();
@@ -43,7 +57,7 @@ export class RemotingClient {
   private running = true;
   private connectPromises = new Map<string, Promise<any>>();
 
-  constructor(opts: { connectTimeoutMillis?: number; invokeTimeoutMillis?: number; tlsEnable?: boolean } = {}) {
+  constructor(opts: { connectTimeoutMillis?: number; invokeTimeoutMillis?: number; tlsEnable?: boolean; tlsOptions?: TlsOptions | null } = {}) {
     if (opts.connectTimeoutMillis != null) this.connectTimeoutMillis = opts.connectTimeoutMillis;
     if (opts.invokeTimeoutMillis != null) this.invokeTimeoutMillis = opts.invokeTimeoutMillis;
     if (opts.tlsEnable != null) this.tlsEnable = opts.tlsEnable;
@@ -51,6 +65,7 @@ export class RemotingClient {
       const e = (process.env['ROCKETMQ_TLS_ENABLE'] || '').trim().toLowerCase();
       this.tlsEnable = e === '1' || e === 'true' || e === 'yes';
     }
+    if (opts.tlsOptions !== undefined) this.tlsOptions = opts.tlsOptions;
   }
 
   // ---------------- connection management ----------------
@@ -74,14 +89,30 @@ export class RemotingClient {
       const [host, port] = this._parseAddr(addr);
       let sock: any;
       if (this.tlsEnable) {
-        sock = tls.connect({ host, port, rejectUnauthorized: false });
+        // caCert 给出即走严格校验：握手（含证书链 + 主机名校验）完成前
+        // 'secureConnect' 不触发 —— CA 不对/主机名不符在 connect 阶段就报错，
+        // 而不是等首次写入时才炸。test-mode（无 caCert）保持 rejectUnauthorized:false。
+        const t = this.tlsOptions;
+        const strict = t?.caCert != null;
+        const tlsOpts: tls.ConnectionOptions = { host, port, rejectUnauthorized: strict };
+        if (strict) {
+          tlsOpts.ca = [await fs.promises.readFile(t!.caCert!)];
+          // servername 缺省即 host；仅当显式覆盖且不同才设（node 对 IP SNI 有
+          // DEP0123 弃用告警，但证书的 IP SAN 校验仍按 host 走）。
+          if (t!.serverName != null && t!.serverName !== '' && t!.serverName !== host) {
+            tlsOpts.servername = t!.serverName;
+          }
+          if (t!.clientCert != null) tlsOpts.cert = [await fs.promises.readFile(t!.clientCert)];
+          if (t!.clientKey != null) tlsOpts.key = [await fs.promises.readFile(t!.clientKey)];
+        }
+        sock = tls.connect(tlsOpts);
       } else {
         sock = net.connect({ host, port });
       }
       sock.setNoDelay(true);
       const timer = setTimeout(() => sock.destroy(new Error('connect timeout')), this.connectTimeoutMillis);
       try {
-        await once(sock, 'connect');
+        await once(sock, this.tlsEnable && this.tlsOptions?.caCert != null ? 'secureConnect' : 'connect');
       } finally {
         clearTimeout(timer);
       }

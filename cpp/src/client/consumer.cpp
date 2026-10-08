@@ -431,6 +431,10 @@ void DefaultMQPushConsumer::start() {
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_,
                                              tlsEnable_, unitName_,
                                              pollNameServerIntervalMillis_));
+        // TLS 严格校验选项（caCert 非空 = 严格校验）：转发给实例与底层传输层
+        if (tlsOptionsSet_) {
+            mqClient_->setTlsOptions(tlsOptions_);
+        }
         // 请求钩子（ACL 签名 / stream 的 `ReqT`）：绑定在 **start() 之前** ——
         // Java 的 rpcHook 在 MQClientAPIImpl 构造时传入，实例第一笔报文就带着它。
         std::shared_ptr<RPCHook> requestHook =

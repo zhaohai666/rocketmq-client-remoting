@@ -747,6 +747,8 @@ class DefaultMQPushConsumer:
         self.consumer_group = str(consumer_group)
         # TLS（Java 全局系统属性 tls.enable 的等价物；None = 交给 env ROCKETMQ_TLS_ENABLE）
         self.tls_enable: Optional[bool] = kwargs.pop("tls_enable", None)
+        # TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）
+        self.tls_options: Optional[Dict[str, str]] = kwargs.pop("tls_options", None)
         self.namespace = namespace
         self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
         self.client_id: Optional[str] = None
@@ -1418,6 +1420,7 @@ class DefaultMQPushConsumer:
                                                       self.enable_stream_request_type)
             self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                                tls_enable=self.tls_enable,
+                                               tls_options=self.tls_options,
                                                enable_stream_request_type=self.enable_stream_request_type,
                                                unit_name=self.unit_name,
                                                poll_name_server_interval=self.poll_name_server_interval)

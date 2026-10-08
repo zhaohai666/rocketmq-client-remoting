@@ -219,6 +219,18 @@ public class DefaultMQProducer
         set => _tlsEnable = value;
     }
 
+    private TlsOptions? _tlsOptions;
+
+    /// <summary>
+    /// TLS 细项（CaCert=严格 CA 校验；ClientCert/ClientKey=mTLS；ServerName=主机名覆盖）。
+    /// 不设 CaCert = test-mode（信任自签）。
+    /// </summary>
+    public TlsOptions? TlsOptions
+    {
+        get => _tlsOptions;
+        set => _tlsOptions = value;
+    }
+
     /// <summary>W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）。</summary>
     public bool EnableTraceContext
     {
@@ -709,7 +721,7 @@ public class DefaultMQProducer
             // composeRequestHooks 还原 Java 的 stream → 用户钩子顺序（单槽传输层）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
-                tlsEnable: _tlsEnable, unitName: _unitName,
+                tlsEnable: _tlsEnable, tlsOptions: _tlsOptions, unitName: _unitName,
                 pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {

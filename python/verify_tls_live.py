@@ -3,7 +3,14 @@
 """TLS 真机验证：整条客户端链路（取路由 → 发送 → 消费）都跑在 TLS 上。
 
 用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_tls_live.py 127.0.0.1:9876
+    .venv/bin/python verify_tls_live.py 127.0.0.1:9876 [--leg plain|ca_verify|mtls \
+        --caCert PATH --serverName 127.0.0.1 --clientCert PATH --clientKey PATH]
+
+三腿（对齐 php/examples/live_tls.php / nodeJs/examples/live_tls.ts）：
+  plain     tls_enable=True —— test mode（信任 broker 自签证书）
+  ca_verify + tls_options={'caCert':...} —— **严格 CA 校验**（证书链 + 主机名 SAN，
+             Java tls.test.mode.enable=false 口径），CA 不对/主机名不符直接握手失败
+  mtls      ca_verify + 客户端证书（broker -Dtls.server.authClient=true 双向认证）
 
 为什么要有这个脚本（以及它守的是哪一段）：
 5.5.1 的 broker/nameServer 在 ``tls.test.mode.enable``（默认 true）下按**首字节**嗅探
@@ -39,10 +46,32 @@ from remoting.protocol import headers as headers_mod  # noqa: E402
 from remoting.protocol import remoting_command as rc_mod  # noqa: E402
 from remoting.protocol.codes import RequestCode, ResponseCode  # noqa: E402
 
+
+def _cli_args(argv: list) -> dict:
+    opts = {"leg": "plain", "caCert": "", "serverName": "", "clientCert": "", "clientKey": ""}
+    it = iter(argv[2:])
+    for flag in it:
+        if flag.startswith("--"):
+            opts[flag[2:]] = next(it, "")
+    return opts
+
+
+CLI = _cli_args(sys.argv)
+LEG = CLI["leg"]
+if LEG not in ("plain", "ca_verify", "mtls"):
+    print("unknown leg: %s (plain|ca_verify|mtls)" % LEG, file=sys.stderr)
+    sys.exit(2)
+TLS_OPTIONS = None
+if LEG in ("ca_verify", "mtls"):
+    TLS_OPTIONS = {"caCert": CLI["caCert"], "serverName": CLI["serverName"]}
+    if LEG == "mtls":
+        TLS_OPTIONS["clientCert"] = CLI["clientCert"]
+        TLS_OPTIONS["clientKey"] = CLI["clientKey"]
+
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)
-TOPIC = "TlsLive_%d" % STAMP
-GROUP = "GID_TlsLive_%d" % STAMP
+TOPIC = "TlsLive_%s_%d" % (LEG, STAMP)
+GROUP = "GID_TlsLive_%s_%d" % (LEG, STAMP)
 MSG_NUM = 8
 # 首包预算：真机 loopback 上 TLS 往返是个位数毫秒，等满 invoke 超时（5s）就是要抓的故障
 FIRST_PACKET_BUDGET_MS = 1500.0
@@ -101,11 +130,11 @@ def main() -> int:
     observed = instrument_tls()
 
     # ---------------- S1 逐轮新建 TLS 连接打首包 ----------------
-    print("=== S1 nameServer TLS 首包（%d 轮，每轮新连接）===" % ROUNDS)
+    print("=== S1 nameServer TLS 首包（%d 轮，每轮新连接，leg=%s）===" % (ROUNDS, LEG))
     lost = 0
     worst_ms = 0.0
     for i in range(ROUNDS):
-        client = RemotingClient(tls_enable=True)
+        client = RemotingClient(tls_enable=True, tls_options=TLS_OPTIONS)
         began = time.monotonic()
         try:
             # 新 topic 不存在时 nameServer 回 TOPIC_NOT_EXIST(17) —— 那也是**真应答**，
@@ -126,7 +155,7 @@ def main() -> int:
 
     # ---------------- S2 端到端 TLS 收发 ----------------
     print("=== S2 producer + push consumer 全程 TLS ===")
-    prod = DefaultMQProducer(GROUP + "_P", tls_enable=True)
+    prod = DefaultMQProducer(GROUP + "_P", tls_enable=True, tls_options=TLS_OPTIONS)
     prod.set_namesrv_addr(NAMESRV)
     prod.start()
     consumer = None
@@ -135,7 +164,7 @@ def main() -> int:
         check("S2a TLS 下 topic 路由可用", wait_route(prod, TOPIC, 4), "topic=%s" % TOPIC)
 
         received = []
-        consumer = DefaultMQPushConsumer(GROUP, tls_enable=True)
+        consumer = DefaultMQPushConsumer(GROUP, tls_enable=True, tls_options=TLS_OPTIONS)
         consumer.set_namesrv_addr(NAMESRV)
         consumer.subscribe(TOPIC, "*")
 

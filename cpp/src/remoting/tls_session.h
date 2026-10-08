@@ -27,7 +27,20 @@ namespace rocketmq {
 
 // test-mode 客户端 SSL_CTX（verify=NONE、无客户端证书、默认 TLS1.2+）。
 // 返回的 shared_ptr 持有 SSL_CTX*（deleter 内 SSL_CTX_free）。
-std::shared_ptr<void> createClientSslContext(std::string& err);
+// certPath/keyPath 非空时也加载客户端证书（test-mode + mTLS 客户端证书可并存，
+// 对齐 Java tls.client.certPath 独立于 test.mode 的行为）。
+std::shared_ptr<void> createClientSslContext(std::string& err,
+                                             const std::string& certPath = std::string(),
+                                             const std::string& keyPath = std::string());
+
+// 严格校验客户端 SSL_CTX（对齐 Java tls.test.mode.enable=false + tls.client.trustCertPath）：
+//   * verify=SSL_VERIFY_PEER，CA 信任锚 = caPath（load_verify_locations）；
+//   * 主机名/SAN 校验在 handshake() 里按连接逐个做（OpenSSL 需显式 set1_host/IP param）；
+//   * certPath/keyPath 非空时加载客户端证书（mTLS，须 PEM；私钥 PKCS#1/PKCS#8 都吃）。
+std::shared_ptr<void> createStrictClientSslContext(const std::string& caPath,
+                                                   const std::string& certPath,
+                                                   const std::string& keyPath,
+                                                   std::string& err);
 
 // 一条连接的 TLS 会话。生命周期：connect 后 handshake()，之后 read/writeAll
 // 替代裸 recv/send，close 时析构（内部 best-effort SSL_shutdown）。
@@ -45,7 +58,9 @@ std::shared_ptr<void> createClientSslContext(std::string& err);
 //     （1s）到点，那是这条链路本就要付的代价。
 class TlsSession {
 public:
-    explicit TlsSession(std::shared_ptr<void> ctx);
+    // expectedName：严格模式下的主机名/SAN 校验目标（serverName 覆盖）；空 = 用连接 host。
+    // test-mode（ctx verify=NONE）下忽略。
+    explicit TlsSession(std::shared_ptr<void> ctx, const std::string& expectedName = std::string());
     ~TlsSession();
     TlsSession(const TlsSession&) = delete;
     TlsSession& operator=(const TlsSession&) = delete;
@@ -68,6 +83,7 @@ public:
 
 private:
     std::shared_ptr<void> ctx_;
+    std::string expectedName_;
     SSL* ssl_ = nullptr;
     // 会话级 io 锁：见类注释。只包 SSL_* 调用，不包任何睡眠/等待。
     std::mutex ioMutex_;
@@ -78,7 +94,9 @@ private:
 // 未编入 OpenSSL 的占位：握手永远失败并给出明确原因，其余 API 不可达。
 class TlsSession {
 public:
-    explicit TlsSession(std::shared_ptr<void> ctx) { (void)ctx; }
+    explicit TlsSession(std::shared_ptr<void> ctx, const std::string& expectedName = std::string()) {
+        (void)ctx; (void)expectedName;
+    }
     ~TlsSession() = default;
     bool handshake(netcompat::socket_t sock, const std::string& host, int timeoutMillis,
                    std::string& err) {
@@ -96,7 +114,19 @@ public:
     void shutdown() {}
 };
 
-inline std::shared_ptr<void> createClientSslContext(std::string& err) {
+inline std::shared_ptr<void> createClientSslContext(std::string& err,
+                                                    const std::string& certPath = std::string(),
+                                                    const std::string& keyPath = std::string()) {
+    (void)certPath; (void)keyPath;
+    err = "client built without TLS support (install OpenSSL or set RMQ_ENABLE_TLS=ON)";
+    return nullptr;
+}
+
+inline std::shared_ptr<void> createStrictClientSslContext(const std::string& caPath,
+                                                          const std::string& certPath,
+                                                          const std::string& keyPath,
+                                                          std::string& err) {
+    (void)caPath; (void)certPath; (void)keyPath;
     err = "client built without TLS support (install OpenSSL or set RMQ_ENABLE_TLS=ON)";
     return nullptr;
 }

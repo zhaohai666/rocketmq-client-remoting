@@ -47,6 +47,136 @@ port_open() {
     "$NODE_BIN" -e "const s=require('net').createConnection({host:'127.0.0.1',port:$1});s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),500)" 2>/dev/null
 }
 
+# ---------------------------------------------------------------- tls 分支（独占集群 + 自管证书/三轮 broker）
+# node 端 tlsEnable 与 Java -Dtls.enable 同为**进程级全局**：namesrv 连接也走 TLS，
+# 所以 namesrv+broker 都要 -Dtls.enable=true + 同一套 server 证书（permissive）。
+# 三腿：plain_tls（信任自签）/ ca_verify（严格 CA 校验）/ mtls（broker 要求客户端证书）。
+if [ "$WHICH" = "tls" ]; then
+    if port_open "$NS_PORT" || port_open "$BROKER_PORT"; then
+        echo "=== tls 分支需要 TLS 专用集群，但 ${NS_PORT}/${BROKER_PORT} 已有集群在跑（多半是明文）。请先停掉它。 ===" >&2
+        exit 2
+    fi
+    command -v openssl >/dev/null 2>&1 || { echo "openssl 不可用" >&2; exit 2; }
+    TWORK=/tmp/rmq_node_live_tls
+    rm -rf "$TWORK"
+    mkdir -p "$TWORK/store"
+    echo "=== 生成测试证书（CA / server(SAN: IP:127.0.0.1,DNS:localhost) / client） ==="
+    (cd "$TWORK" \
+        && openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 -subj "/CN=rmq-node-test-ca" >/dev/null 2>&1 \
+        && openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=127.0.0.1" >/dev/null 2>&1 \
+        && printf "subjectAltName=IP:127.0.0.1,DNS:localhost\n" > server.ext \
+        && openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 2 -extfile server.ext >/dev/null 2>&1 \
+        && openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=rmq-node-test-client" >/dev/null 2>&1 \
+        && openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 2 >/dev/null 2>&1) \
+        || { echo "证书生成失败" >&2; exit 2; }
+    # RocketMQ 的 PemReader 只吃 PKCS#8（"BEGIN PRIVATE KEY"）；老 LibreSSL 默认吐
+    # PKCS#1（"BEGIN RSA PRIVATE KEY"）时显式转一道。
+    srv_hdr=$(head -1 "$TWORK/server.key")
+    case "$srv_hdr" in
+        *"BEGIN PRIVATE KEY"*) : ;;
+        *) openssl pkcs8 -topk8 -nocrypt -in "$TWORK/server.key" -out "$TWORK/server.p8.key" \
+            && mv "$TWORK/server.p8.key" "$TWORK/server.key" ;;
+    esac
+    cat > "$TWORK/broker.conf" <<EOF
+brokerClusterName = DefaultCluster
+brokerName = broker-a
+brokerId = 0
+deleteWhen = 04
+fileReservedTime = 48
+brokerRole = ASYNC_MASTER
+flushDiskType = ASYNC_FLUSH
+namesrvAddr = 127.0.0.1:$NS_PORT
+listenPort = $BROKER_PORT
+storePathRootDir = $TWORK/store
+autoCreateTopicEnable = true
+EOF
+    export ROCKETMQ_HOME="$DIST"
+    export JAVA_OPT_EXT="-Xms1g -Xmx2g -Xmn768m -Dtls.enable=true -Dtls.test.mode.enable=false -Dtls.server.certPath=$TWORK/server.crt -Dtls.server.keyPath=$TWORK/server.key"
+    STARTED_BROKER=1
+    nohup "$DIST/bin/mqnamesrv" > "$TWORK/ns.log" 2>&1 &
+    nohup "$DIST/bin/mqbroker" -c "$TWORK/broker.conf" > "$TWORK/broker.log" 2>&1 &
+    for i in $(seq 1 60); do
+        if port_open "$NS_PORT" && port_open "$BROKER_PORT"; then sleep 2; break; fi
+        sleep 1
+        if [ "$i" = "60" ]; then
+            echo "=== TLS 集群 60s 未就绪（见 $TWORK/ns.log / $TWORK/broker.log） ===" >&2
+            exit 2
+        fi
+    done
+    # 等 broker 注册进 nameserver（路由查询在 permissive 服务端上走明文即可）。
+    for i in $(seq 1 60); do
+        if "$NODE_BIN" --experimental-strip-types --no-warnings -e "
+            const { MQClient } = await import('$NODEJS_DIR/src/client/mq_client.ts');
+            const { RemotingCommand } = await import('$NODEJS_DIR/src/remoting/remotingCommand.ts');
+            const { RequestCode, ResponseCode } = await import('$NODEJS_DIR/src/remoting/codes.ts');
+            const c = new MQClient('tls-route-wait', '127.0.0.1:$NS_PORT');
+            const req = RemotingCommand.createRequestCommand(RequestCode.GET_ROUTEINFO_BY_TOPIC, null);
+            req.addExtField('topic', 'TBW102');
+            try {
+              const resp = await c.remotingClient.invokeSync('127.0.0.1:$NS_PORT', req, 2000);
+              process.exit(resp.code === ResponseCode.SUCCESS ? 0 : 1);
+            } catch (e) { process.exit(1); }
+        " 2>/dev/null; then break; fi
+        sleep 1
+        if [ "$i" = "60" ]; then echo "=== broker 60s 未注册进 nameserver ===" >&2; exit 2; fi
+    done
+
+    cd "$NODEJS_DIR" || exit 1
+    RC=0
+    echo "=== [leg 1/3] plain_tls（test-mode：信任自签） ==="
+    "$NODE_BIN" --experimental-strip-types "$EXAMPLE" --ns "$NS" --stamp "$STAMP" --leg plain_tls --caCert "$TWORK/ca.crt" --serverName 127.0.0.1 || RC=1
+    echo "=== [leg 2/3] ca_verify（真校验证书链 + 主机名 SAN） ==="
+    "$NODE_BIN" --experimental-strip-types "$EXAMPLE" --ns "$NS" --stamp "$STAMP" --leg ca_verify --caCert "$TWORK/ca.crt" --serverName 127.0.0.1 || RC=1
+
+    echo "=== 重启 broker（追加 -Dtls.server.authClient=true → mTLS） ==="
+    pids=$(jps -l 2>/dev/null | awk '/BrokerStartup/ {print $1}')
+    # shellcheck disable=SC2086
+    [ -n "$pids" ] && kill $pids 2>/dev/null
+    for i in $(seq 1 15); do
+        port_open "$BROKER_PORT" || break
+        sleep 1
+        if [ "$i" = "15" ]; then
+            pids=$(jps -l 2>/dev/null | awk '/BrokerStartup/ {print $1}')
+            # shellcheck disable=SC2086
+            [ -n "$pids" ] && kill -9 $pids 2>/dev/null
+            sleep 2
+        fi
+    done
+    # 端口关了 ≠ store 文件锁（$WORK/store/lock）已释放：老 JVM 干净退出还要删锁文件，
+    # 抢跑会 "Lock failed, MQ already started"。给 3s 缓冲。
+    sleep 3
+    # mTLS：server 侧要求客户端证书的正确开关是 tls.server.authClient
+    # （tls.client.authServer 是「client 认证 server」，写它会毒到 broker→namesrv 通道）。
+    export JAVA_OPT_EXT="-Xms1g -Xmx2g -Xmn768m -Dtls.enable=true -Dtls.test.mode.enable=false -Dtls.server.certPath=$TWORK/server.crt -Dtls.server.keyPath=$TWORK/server.key -Dtls.server.authClient=true -Dtls.server.trustCertPath=$TWORK/ca.crt"
+    nohup "$DIST/bin/mqbroker" -c "$TWORK/broker.conf" > "$TWORK/broker2.log" 2>&1 &
+    for i in $(seq 1 60); do
+        if port_open "$BROKER_PORT"; then sleep 2; break; fi
+        sleep 1
+        if [ "$i" = "60" ]; then echo "=== mTLS broker 60s 未就绪（见 $TWORK/broker2.log） ===" >&2; exit 2; fi
+    done
+    # 等 broker 重新注册进 nameserver（createTopic 的 TBW102 路由就绪才算就绪）。
+    for i in $(seq 1 60); do
+        if "$NODE_BIN" --experimental-strip-types --no-warnings -e "
+            const { MQClient } = await import('$NODEJS_DIR/src/client/mq_client.ts');
+            const { RemotingCommand } = await import('$NODEJS_DIR/src/remoting/remotingCommand.ts');
+            const { RequestCode, ResponseCode } = await import('$NODEJS_DIR/src/remoting/codes.ts');
+            const c = new MQClient('tls-route-wait2', '127.0.0.1:$NS_PORT');
+            const req = RemotingCommand.createRequestCommand(RequestCode.GET_ROUTEINFO_BY_TOPIC, null);
+            req.addExtField('topic', 'TBW102');
+            try {
+              const resp = await c.remotingClient.invokeSync('127.0.0.1:$NS_PORT', req, 2000);
+              process.exit(resp.code === ResponseCode.SUCCESS ? 0 : 1);
+            } catch (e) { process.exit(1); }
+        " 2>/dev/null; then break; fi
+        sleep 1
+        if [ "$i" = "60" ]; then echo "=== mTLS broker 60s 未注册进 nameserver ===" >&2; exit 2; fi
+    done
+    echo "=== [leg 3/3] mtls（客户端证书双向认证） ==="
+    "$NODE_BIN" --experimental-strip-types "$EXAMPLE" --ns "$NS" --stamp "$STAMP" --leg mtls --caCert "$TWORK/ca.crt" --serverName 127.0.0.1 --clientCert "$TWORK/client.crt" --clientKey "$TWORK/client.key" || RC=1
+    echo "=== exit=$RC ==="
+    exit $RC
+fi
+
 STARTED_BROKER=0
 cleanup() {
     if [ "$STARTED_BROKER" = "1" ]; then

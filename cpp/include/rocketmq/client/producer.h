@@ -57,6 +57,13 @@ public:
     void setInstanceName(const std::string& name) { instanceName_ = name; }
     // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
     void setTlsEnable(bool b) { tlsEnable_ = b; }
+    // TLS 严格校验选项（caCert 非空 = 证书链 + 主机名严格校验；clientCert/Key = mTLS）。
+    // 调用后自动开启 TLS；须在 start() 之前设置。
+    void setTlsOptions(const TlsOptions& opts) {
+        tlsOptions_ = opts;
+        tlsOptionsSet_ = true;
+        tlsEnable_ = true;
+    }
     // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
     void setEnableTraceContext(bool b) { enableTraceContext_ = b; }
     void setSendMsgTimeout(int32_t millis) { sendMsgTimeout_ = millis; }
@@ -575,6 +582,8 @@ protected:
     std::string createTopicKey_ = MixAll::DEFAULT_TOPIC;
     int32_t defaultTopicQueueNums_ = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
+    TlsOptions tlsOptions_;
+    bool tlsOptionsSet_ = false;
     // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释和
     // Python/C# 一致；写死 false 会让这条 env 开关形同虚设。
     bool enableTraceContext_ = traceContextEnabledFromEnv();
