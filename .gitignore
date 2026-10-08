@@ -11,6 +11,8 @@ venv/
 # C# / .NET
 csharp/**/bin/
 csharp/**/obj/
+dotnet/**/bin/
+dotnet/**/obj/
 *.user
 
 # 测试 / 工具缓存
