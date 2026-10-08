@@ -93,6 +93,18 @@ cat > "$BIN/go_recv" <<EOF
 #!/bin/bash
 exec $BIN/go_compression recv "\$1" "\$2" $SIZE $NS
 EOF
+# php 端：PHP 8.1 直跑，零第三方依赖（脚本参数 send|recv <topic> <group>，size/ns/codec 内联）。
+PHP_BIN=${PHP_BIN:-php}
+cat > "$BIN/php_send" <<EOF
+#!/bin/bash
+cd "$ROOT/php" || exit 1
+exec $PHP_BIN examples/live_compression.php send "\$1" "\$2" $SIZE "$NS" $CODEC
+EOF
+cat > "$BIN/php_recv" <<EOF
+#!/bin/bash
+cd "$ROOT/php" || exit 1
+exec $PHP_BIN examples/live_compression.php recv "\$1" "\$2" $SIZE "$NS"
+EOF
 chmod +x "$BIN"/*
 
 fail=0
@@ -106,6 +118,10 @@ run_pair() { # label  sender  receiver
   fi
   if [[ $CODEC != zlib && ( $2 == go_* || $3 == go_* ) ]]; then
     echo "  RESULT=SKIPPED (go port is zlib-only: stdlib has no LZ4/ZSTD, module takes no deps)"
+    return
+  fi
+  if [[ $CODEC != zlib && ( $2 == php_* || $3 == php_* ) ]]; then
+    echo "  RESULT=SKIPPED (php port is zlib-only: gzcompress/gzinflate, no LZ4/ZSTD)"
     return
   fi
   local sout rout lout line
@@ -147,5 +163,11 @@ run_pair go2net go_send net_recv
 run_pair net2go net_send go_recv
 run_pair go2rs go_send rs_recv
 run_pair rs2go rs_send go_recv
+# PHP 腿（覆盖双向互通 + php 自环；lz4/zstd 时全部 SKIP）
+run_pair php2php php_send php_recv
+run_pair php2py php_send py_recv
+run_pair py2php py_send php_recv
+run_pair php2cpp php_send cpp_recv
+run_pair cpp2php cpp_send php_recv
 echo "MATRIX_DONE codec=$CODEC stamp=$STAMP fail=$fail"
 exit $fail

@@ -50,7 +50,9 @@ final class TopicConfig
             'topicFilterType' => $this->topicFilterType,
             'topicSysFlag' => $this->topicSysFlag,
             'order' => $this->order,
-            'attributes' => $this->attributes,
+            // Java 的 attributes 是 Map（默认 {}）：PHP 空 array 会编成 []，
+            // fastjson2 按 Map 反序列化报 "expect '{', but '['" —— 空表输出对象。
+            'attributes' => $this->attributes === [] ? new \stdClass() : $this->attributes,
         ];
     }
 

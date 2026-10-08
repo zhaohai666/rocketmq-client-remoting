@@ -383,6 +383,8 @@ class DefaultMQProducer
     public string $producerGroup;
     /** TLS（Java 全局系统属性 tls.enable 的等价物；null = 交给 env ROCKETMQ_TLS_ENABLE） */
     public ?bool $tlsEnable;
+    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    public ?array $tlsOptions = null;
     /** W3C traceparent 透传（opt-in） */
     public bool $enableTraceContext;
     public string $namespace = '';
@@ -1288,6 +1290,7 @@ class DefaultMQProducer
             enableStreamRequestType: $this->enableStreamRequestType,
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
+            tlsOptions: $this->tlsOptions,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

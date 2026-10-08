@@ -41,6 +41,18 @@ final class RemotingClient
      * 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。 */
     private bool $tlsEnable;
 
+    /**
+     * TLS 细项（对应 Java TlsSystemConfig 的 certPath 族属性；键均可选）：
+     *   - caCert:     CA 证书路径。给了就**真校验**服务端证书链 + 主机名
+     *                 （tls.test.mode.enable=false 口径）；不给则信任自签（test-mode，默认）。
+     *   - clientCert: 客户端证书路径（mTLS，对应 tls.client.certPath + authClient=true）。
+     *   - clientKey:  客户端私钥路径（对应 tls.client.keyPath；cert 内含私钥时可省）。
+     *   - serverName: SNI/主机名校验覆盖（默认用连接地址的 host）。
+     *
+     * @var array{caCert?:string, clientCert?:string, clientKey?:string, serverName?:string}
+     */
+    private array $tlsOptions;
+
     private bool $closed = false;
 
     /** @var array<string, resource> addr → 连接 */
@@ -71,6 +83,7 @@ final class RemotingClient
         ?bool $tlsEnable = null,
         bool $enableReconnectForGoAway = true,
         ?array $nameServers = null,
+        ?array $tlsOptions = null,
     ) {
         $this->connectTimeoutMillis = $connectTimeoutMillis;
         $this->invokeTimeoutMillis = $invokeTimeoutMillis;
@@ -79,6 +92,7 @@ final class RemotingClient
             $tlsEnable = in_array(strtolower(trim((string)getenv('ROCKETMQ_TLS_ENABLE'))), ['1', 'true', 'yes'], true);
         }
         $this->tlsEnable = (bool)$tlsEnable;
+        $this->tlsOptions = $tlsOptions ?? [];
         if ($nameServers !== null) {
             $this->nameServerList = array_values($nameServers);
         }
@@ -137,9 +151,34 @@ final class RemotingClient
         if ($this->tlsEnable) {
             // 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ
             // 帧之前完成握手。Python 侧是先建 plain socket 再 wrap_socket，等价路径。
-            stream_context_set_option($conn, 'ssl', 'verify_peer', false);
-            stream_context_set_option($conn, 'ssl', 'verify_peer_name', false);
-            stream_context_set_option($conn, 'ssl', 'allow_self_signed', true);
+            $caCert = $this->tlsOptions['caCert'] ?? null;
+            if ($caCert !== null && $caCert !== '') {
+                // 有 CA ⇒ 真校验（tls.test.mode.enable=false 口径）：证书链 + 主机名。
+                stream_context_set_option($conn, 'ssl', 'verify_peer', true);
+                stream_context_set_option($conn, 'ssl', 'verify_peer_name', true);
+                stream_context_set_option($conn, 'ssl', 'allow_self_signed', false);
+                stream_context_set_option($conn, 'ssl', 'cafile', $caCert);
+                $serverName = $this->tlsOptions['serverName'] ?? null;
+                if ($serverName !== null && $serverName !== '') {
+                    stream_context_set_option($conn, 'ssl', 'peer_name', $serverName);
+                }
+            } else {
+                // test-mode（Java tls.test.mode.enable 默认 true）：信任 broker 的自签证书、
+                // 不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
+                stream_context_set_option($conn, 'ssl', 'verify_peer', false);
+                stream_context_set_option($conn, 'ssl', 'verify_peer_name', false);
+                stream_context_set_option($conn, 'ssl', 'allow_self_signed', true);
+            }
+            $clientCert = $this->tlsOptions['clientCert'] ?? null;
+            if ($clientCert !== null && $clientCert !== '') {
+                // mTLS：对应 Java tls.client.certPath/keyPath（broker 端
+                // tls.client.authServer=true 时会要求出示）。
+                stream_context_set_option($conn, 'ssl', 'local_cert', $clientCert);
+                $clientKey = $this->tlsOptions['clientKey'] ?? null;
+                if ($clientKey !== null && $clientKey !== '') {
+                    stream_context_set_option($conn, 'ssl', 'local_pk', $clientKey);
+                }
+            }
             $crypto = @stream_socket_enable_crypto($conn, true, STREAM_CRYPTO_METHOD_TLS_CLIENT);
             if ($crypto !== true) {
                 $reason = error_get_last()['message'] ?? 'unknown error';

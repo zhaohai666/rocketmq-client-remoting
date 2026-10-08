@@ -162,7 +162,10 @@ final class SubscriptionGroupConfig
             'notifyConsumerIdsChangedEnable' => $this->notifyConsumerIdsChangedEnable,
             'groupSysFlag' => $this->groupSysFlag,
             'consumeTimeoutMinute' => $this->consumeTimeoutMinute,
-            'attributes' => $this->attributes,
+            // Java 的 attributes 是 Map（默认 {}）。PHP 空 array 会被 json_encode
+            // 编成 []，fastjson2 按 Map 反序列化时直接抛
+            // "expect '{', but '['" —— 空表必须显式输出对象。
+            'attributes' => $this->attributes === [] ? new \stdClass() : $this->attributes,
         ];
         // fastjson2 默认跳过 null
         if ($this->subscriptionDataSet !== null) {

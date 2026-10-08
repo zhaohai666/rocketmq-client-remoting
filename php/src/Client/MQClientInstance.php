@@ -260,11 +260,12 @@ class MQClientInstance
         bool $enableStreamRequestType = false,
         ?string $unitName = null,
         int $pollNameServerInterval = 30000,
+        ?array $tlsOptions = null,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
         $this->pollNameServerInterval = $pollNameServerInterval;
-        $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable);
+        $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions);
         // 对应 Java MQClientAPIImpl:329-332：stream 钩子必须注册在用户 rpcHook 之前，
         // 这样 ReqT 才会被算进 ACL 签名内容（"Inject stream rpc hook first to make
         // reserve field signature"）。facade 都是在构造完本实例之后才注册 rpcHook。
@@ -2315,6 +2316,16 @@ class MQClientInstance
             throw new MQClientException(sprintf('The broker[%s] not exist', $mq->brokerName));
         }
         return $addr;
+    }
+
+    /**
+     * ``publishAddrInAdmin`` 的公开出口：供拉模式消费者的 earliestMsgStoreTime 复用
+     * （Python 端 consumer.py 直接复用了实例的私有 ``_publish_addr_in_admin``，
+     * PHP 私有不可见，纯增量补这个公开壳子，逻辑不走样）。
+     */
+    public function adminAddrFor(MessageQueue $mq): string
+    {
+        return $this->publishAddrInAdmin($mq);
     }
 
     /** 从 topic_route_table 里找该 brokerName 的地址（主优先、没主退任意一台）。 */

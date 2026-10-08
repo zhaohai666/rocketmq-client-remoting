@@ -102,6 +102,12 @@ class DefaultMQAdminExt
     /** @var list<string> */
     public array $nameServerAddrs = [];
 
+    /** TLS（Java tls.enable 等价物；null = 交给 env ROCKETMQ_TLS_ENABLE）。 */
+    public ?bool $tlsEnable = null;
+
+    /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
+    public ?array $tlsOptions = null;
+
     /**
      * 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
      * 只在 start() 建 MQClientInstance 时透传一次。
@@ -222,9 +228,11 @@ class DefaultMQAdminExt
         $this->mqClient = new MQClientInstance(
             $this->clientId,
             $this->nameServerAddrs,
+            tlsEnable: $this->tlsEnable,
             enableStreamRequestType: $this->enableStreamRequestType,
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
+            tlsOptions: $this->tlsOptions,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
