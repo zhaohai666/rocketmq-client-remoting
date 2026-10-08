@@ -207,9 +207,12 @@ public sealed class RemotingClient : IDisposable
             if (ext is not X509SubjectAlternativeNameExtension san) continue;
             if (hostIsIp)
             {
-                foreach (var ip in san.EnumerateIPAddresses())
+                // EnumerateIPAddresses() 返回 IEnumerable<IPAddress>（.NET 10）。
+                // 归一比较：顺带处理 ::ffff:127.0.0.1 这类 IPv4-mapped 形态。
+                foreach (IPAddress ip in san.EnumerateIPAddresses())
                 {
                     if (ip.Equals(hostIp)) return true;
+                    if (ip.IsIPv4MappedToIPv6 && ip.MapToIPv4().Equals(hostIp)) return true;
                 }
             }
             else
@@ -238,6 +241,11 @@ public sealed class RemotingClient : IDisposable
             return cn is not null && cn.Equals(hostname, StringComparison.OrdinalIgnoreCase);
         }
         return false;
+    }
+
+    internal static bool CertHasSan(X509Certificate2 cert)
+    {
+        return cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().Any();
     }
 
     /// <summary>
@@ -440,6 +448,10 @@ public sealed class RemotingClient : IDisposable
                     var chainPolicy = new X509ChainPolicy
                     {
                         TrustMode = X509ChainTrustMode.CustomRootTrust,
+                        // 默认 RevocationMode=Online 会对没有 CRL/OCSP 分发点的证书回
+                        // RevocationStatusUnknown 直接判死（Java/OpenSSL 严格校验在未配
+                        // crlPath 时也不查吊销，对齐这个口径才不会把自家 CA 的证书全拒）。
+                        RevocationMode = X509RevocationMode.NoCheck,
                     };
                     chainPolicy.CustomTrustStore.Add(caCert);
                     var targetName = string.IsNullOrEmpty(tlsOpts.ServerName) ? host : tlsOpts.ServerName;
@@ -457,11 +469,22 @@ public sealed class RemotingClient : IDisposable
                             };
                             if (!custom.Build(peer))
                             {
+                                // 失败原因落到日志：链状态逐条打出来，否则只看到一句
+                                // "rejected by callback" 无法区分链败还是名字败。
+                                var statuses = string.Join(",", custom.ChainStatus.Select(s => s.Status));
+                                ClientLog.Warn("tls strict: chain build failed for " + peer.Subject
+                                               + " (SAN=" + CertHasSan(peer) + "), status=[" + statuses + "]");
                                 return false;
                             }
                             // 主机名/SAN 校验（CustomRootTrust 链不含名字检查）：
                             // host 是 IP 时比 IP SAN，否则比 DNS SAN（支持 *.example 通配）。
-                            return CertMatchesHostname(peer, targetName);
+                            if (!CertMatchesHostname(peer, targetName))
+                            {
+                                ClientLog.Warn("tls strict: hostname mismatch, target=" + targetName
+                                               + " subject=" + peer.Subject + " (SAN=" + CertHasSan(peer) + ")");
+                                return false;
+                            }
+                            return true;
                         },
                     };
                     ssl = new SslStream(ns, false);
