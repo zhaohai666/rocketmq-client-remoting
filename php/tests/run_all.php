@@ -19,6 +19,7 @@ $suites = [
     'Remoting 层' => __DIR__ . '/RunRemoting.php',
     'Client 叶子' => __DIR__ . '/RunClientLeaf.php',
     'Client 轨迹' => __DIR__ . '/RunClientTrace.php',
+    'Client OpenTracing' => __DIR__ . '/RunClientOpenTracing.php',
     'Client 聚合器' => __DIR__ . '/RunClientAccumulator.php',
     'Client 实例' => __DIR__ . '/RunClientInstance.php',
     'Client 消费者' => __DIR__ . '/RunClientConsumer.php',

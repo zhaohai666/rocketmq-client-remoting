@@ -63,16 +63,18 @@ Python 的 6 类后台线程全部收敛为调用方驱动的 `tick()`——心�
 
 - 单测：`php tests/run_all.php`（纯 PHP assert 风格 runner，禁依赖 phpunit）。
   当前：Common 205 + Remoting 196 + Client 叶子 478 + Client 轨迹 209 + Client 聚合器 149
-  + Client 实例 153 + **Client 消费者 133** = **1523 项全绿**，另含「类名冲突静态守卫」。
+  + Client 实例 153 + **Client 消费者 133** + **Client OpenTracing 18** = **1541 项全绿**，
+  另含「类名冲突静态守卫」。
 - 单套件直接跑：`php tests/RunXxx.php`（成功打印 `ALL TESTS PASSED (N checks)`，失败非零退出）。
   消费者套件（`RunClientConsumer.php`）用子进程假 broker（`--broker` 自拉起）承载有状态剧本：
   每队列拉取计数（首拉 FOUND / OFFSET_ILLEGAL，后续 NO_NEW_MSG）、PULL/UPDATE_OFFSET/SEND_BACK/
   LOCK_BATCH_MQ 请求写 JSONL 日志供父进程断言线上行为（sysFlag suspend 位、delayLevel、mqSet）。
 - 真机（macOS）：`scripts/with_cluster.sh` 是 Windows Git Bash 版，跑不了。统一入口
-  `bash scripts/run_php_live.sh redelivery|admin|compression`：自起 5.5.1 集群
-  （`/tmp/rmq_php_live`，ROCKETMQ_HOME + 2g 堆）→ 等端口 → **等 broker 路由注册进
-  nameserver**（`php examples/wait_broker_route.php`，否则一切 createTopic/send 死于
-  "No route info of default topic TBW102"）→ 跑 → jps 找 pid kill，全在同一条命令。
+  `bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls`：自起 5.5.1 集群
+  → 等端口 → **等 broker 路由注册进 nameserver**（`php examples/wait_broker_route.php`，
+  否则一切 createTopic/send 死于 "No route info of default topic TBW102"）→ 跑 →
+  jps 找 pid kill，全在同一条命令。pop/tls 分支**必须独占集群**（专用 broker.conf），
+  检测到已有集群在跑会直接拒绝。
   - `examples/live_redelivery.php`：S1 %RETRY% 回投梯度（level3≈10s）+ topic 还原 +
     正常消息恰好 1 次；S2 死信终态两半断言（maxReconsumeTimes=2 ⇒ 客户端恰好 3 次投递
     0/1/2 且 %DLQ% 里 recon=3）；S3 顺序毒消息（本地 3 次后普通 SEND 进 %DLQ%，严格 `>`
@@ -86,6 +88,19 @@ Python 的 6 类后台线程全部收敛为调用方驱动的 `tick()`——心�
     <ns> [codec]` / `recv ...`），载荷配方与 Java CompressProbe 逐字节一致，判定只看
     接收端 `match=1`（CRC-32 IEEE，`sprintf('%u', crc32(...))`），退出码 0/1/2/3。
     已在 `scripts/compression_matrix.sh` 注册 php_* 腿；PHP 仅 zlib，lz4/zstd → exit 2。
+  - `examples/live_pop.php`（POP 专用集群，四件 broker.conf：timerWheelEnable=true /
+    defaultMessageRequestMode=PULL / popResponseReturnActualRetryTopic=false /
+    enablePopBatchAck=false）：S1 ACK 真生效（6 条后盯 2.5x 不可见窗无重复投递 +
+    POP_CK 8 段形状 + 1ST_POP_TIME + ACK 债务归零 + `localOffsetCount()==0`）；
+    S2 失败退避（RECONSUME_LATER → changePopInvisibleTime → revive 搬进
+    `%RETRY%<group>_<topic>` → 重投 marker=1 + recon 递增 + 1ST_POP_TIME 保留）。
+    PHP 有意偏差：PushConsumer.start() **不自动发 401**，由工具经
+    `Admin::setMessageRequestMode(brokerAddr, topic, group, 'POP', 8)` 显式发
+    （Java 是 mqadmin 侧的事）。20/20。
+  - `examples/live_tls.php`（TLS 专用集群：namesrv+broker 都 `-Dtls.enable=true`——
+    PHP 端 tlsEnable 与 Java 一样是进程级全局，namesrv 连接也走 TLS）：三腿
+    plain_tls（test-mode 信任自签）/ ca_verify（caCert + serverName 真校验证书链 +
+    SAN）/ mtls（出示 client.crt，broker 端 tls.server.authClient=true）。9/9。
 
 ## 踩过的坑（移植时务必对照）
 
@@ -122,3 +137,30 @@ Python 的 6 类后台线程全部收敛为调用方驱动的 `tick()`——心�
   打出 "0" 极具迷惑性）；`TopicStatsTable->offsetTable` 是 list<{mq,value}>，发 N 条
   轮询散队列后**按 SUM 断言**，MAX 恒 1。
 - **本机 php 进程打 `[CQ_POLLER]` 噪声**：每个 `php` 进程（含 `php -r`）输出两行，看结果先过滤。
+- **401（SET_MESSAGE_REQUEST_MODE）没有 header，字段全走 body**：broker
+  `QueryAssignmentProcessor.setMessageRequestMode` 直接纳 body 里的
+  `SetMessageRequestModeRequestBody`（Java 属性名 `topic/consumerGroup/mode/
+  popShareQueueNum`，mode 缺省 PULL）。字段放 ext_fields 时 requestBody 反序列化为
+  null → broker NPE。PHP Admin::setMessageRequestMode 已修；**Go `admin_batch.go` 的
+  同名方法同病**（真机路径走 `Instance.SetMessageRequestMode` body 版，故 Go live 未暴露）。
+- **服务端 TLS 配置三件套（run_php_live.sh tls 分支）**：
+  1. `tls.test.mode.enable` 默认 **true**——此时服务端**无视 `tls.server.certPath`**，
+     现场生成临时自签证书。CA 校验腿必挂（客户端拿到的不是你签的证书）。必须显式
+     `-Dtls.test.mode.enable=false` 才会加载 certPath/keyPath（key 需 PKCS#8）。
+  2. mTLS 要求客户端证书的正确开关是 **`-Dtls.server.authClient=true`** +
+     `-Dtls.server.trustCertPath=<签发 client 证书的 CA>`。官方文档常见的
+     **`tls.client.authServer` 是「client 认证 server」**——写它会毒到 broker→namesrv
+     的注册通道（broker client 侧开始验证自签证书、cacerts 不信任 → 注册静默失败，
+     boot success 照打，表象是 "60s 未注册进 nameserver"）。
+  3. `tls.enable=true` 是**进程级全局**：broker/namesrv 自己作为 client（注册、路由）
+     的连接也受影响；PHP 端 tlsEnable 同语义（RemotingClient 连 namesrv 也走 TLS），
+     所以 TLS 真机拓扑必须 namesrv+broker 都开 TLS、共用同一套 server 证书。
+- **OpenTracingHook 的属性 API 是 `setUserProperty`**：Message 上没有 Java 风格的
+  `putUserProperty`（那是 MessageExt 解码后的内联习惯），写错会 fatal 而不是静默。
+- **全局命名空间脚本 `instanceof` 漏 use**：examples 里 `$m instanceof MessageExt`
+  少一行 `use RocketMQ\Common\MessageExt;` 会解析成不存在的 `\MessageExt`——**恒 false
+  且不报错**，断言走默认分支（POP S2 的 recon 断言因此假失败）。`php -l` 查不出。
+  排障手段：给疑似处插桩 `get_class($m)` + 属性直读 + getter 三路对照。
+- **取证工具**：`php/examples/dump_commitlog.py` 可离线解析 store/commitlog（4B 总长
+  帧 + 17 段布局，注意 totalLen **含自身 4B**），直接看 broker 写进 commitlog 的
+  reconsumeTimes / properties，是区分「broker 侧没写」还是「客户端解码丢失」的终审证据。

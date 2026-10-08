@@ -2012,14 +2012,21 @@ class DefaultMQAdminExt
     }
 
     /** 对应 Java setMessageRequestMode → SET_MESSAGE_REQUEST_MODE(401)：
-     * 在 POP 与 Pull 模式间切换消费组（单元化场景）。 */
+     * 在 POP 与 Pull 模式间切换消费组（单元化场景）。
+     *
+     * ⚠ wire 口径：broker 对 401 **没有 header**（QueryAssignmentProcessor 直接纳
+     * body 里的 SetMessageRequestModeRequestBody）——字段必须进 body JSON（Java 属性
+     * 名 topic/consumerGroup/mode/popShareQueueNum），放 ext_fields 时 broker 侧
+     * requestBody 反序列化为 null → NPE。mode 缺省按 Java 字段初始化值为 PULL。 */
     public function setMessageRequestMode(string $brokerAddr, string $topic, string $consumerGroup, string $mode, int $popShareQueueNum = 0): void
     {
-        $ext = ['topic' => $topic, 'consumerGroup' => $consumerGroup, 'mode' => $mode];
-        if ($popShareQueueNum > 0) {
-            $ext['popShareQueueNum'] = $popShareQueueNum;
-        }
-        $this->invokeBroker($brokerAddr, RequestCode::SET_MESSAGE_REQUEST_MODE, extFields: $ext);
+        $body = [
+            'topic' => $topic,
+            'consumerGroup' => $consumerGroup,
+            'mode' => $mode === '' ? 'PULL' : $mode,
+            'popShareQueueNum' => $popShareQueueNum,
+        ];
+        $this->invokeBroker($brokerAddr, RequestCode::SET_MESSAGE_REQUEST_MODE, body: json_encode($body));
     }
 
     // ---------------------------------------------------------------- 辅助
