@@ -71,7 +71,7 @@ use RocketMQ\Remoting\RPCHook;
  * 它只负责把「发送成功/失败」写回 RequestResponseFuture，应答本身由 broker 的
  * 326 推送投递，与这个回调无关。
  */
-final class NullSendCallback
+final class NullSendCallback implements SendCallback
 {
     public function __construct(private readonly ?RequestResponseFuture $future = null)
     {
@@ -108,7 +108,7 @@ final class NullSendCallback
  * 只归还**本次真正拿到**的许可（``numAcquired``/``sizeAcquired``）：字节信号量超时而
  * 条数信号量已到手时，必须把那条还回去，否则关一次背压就把容量永久吃掉一格。
  */
-final class BackPressureSendCallback
+final class BackPressureSendCallback implements SendCallback
 {
     /** PHP 单线程泵需要知道回调链是否已走完（Python 无此字段）。 */
     public bool $done = false;
@@ -1865,7 +1865,11 @@ class DefaultMQProducer
             }
             $client = $this->mqClient;
             if ($client !== null) {
-                $client->remotingClient->waitResponses(min(20, $deadline - $now));
+                // 必须用 pumpIncoming 而不是 waitResponses：等待期发送早已完成、
+                // pending 已清空，waitResponses 只盯有在途请求的连接会直接返回，
+                // 326 推回的应答压在内核缓冲区里永远读不到（真机实锤，见
+                // RemotingClient::pumpIncoming 注释）。
+                $client->remotingClient->pumpIncoming(min(20, $deadline - $now));
             }
             if ($this->wallMillis() < $deadline) {
                 usleep(1000);
@@ -1893,6 +1897,23 @@ class DefaultMQProducer
             null,
             $future->cause
         );
+    }
+
+    /**
+     * Request-Reply 应答侧：由收到的请求消息派生应答并**同步发送**。
+     *
+     * 对应 nodeJs ``producer.reply``（Java 范式 = ``MessageUtil.createReplyMessage``
+     * + ``producer.send``）。createReplyMessage 取请求里的 CLUSTER 派生
+     * topic=<CLUSTER>_REPLY_TOPIC、回填 CORRELATION_ID / REPLY_TO_CLIENT / TTL，
+     * 并打上 MSG_TYPE="reply" —— 发送路径据此换码 SEND_REPLY_MESSAGE_V2(325)，
+     * broker 才会把应答按 REPLY_TO_CLIENT 推回请求方（326）。
+     *
+     * 注意：请求消息必须来自 broker 投递（带 CLUSTER 属性）；对手工 new 的
+     * Message 直接调用会抛 MQClientException(CREATE_REPLY_MESSAGE_EXCEPTION)。
+     */
+    public function reply(Message $requestMessage, string $body, ?int $timeoutMillis = null): SendResult
+    {
+        return $this->send(MessageUtil::createReplyMessage($requestMessage, $body), $timeoutMillis);
     }
 
     /**

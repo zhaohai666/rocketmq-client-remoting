@@ -247,7 +247,7 @@ function producerBrokerHandleFrame($conn, RemotingCommand $cmd, string $logFile,
                 }
                 break;
             }
-            case RequestCode::HEARTBEAT:
+            case RequestCode::HEART_BEAT:
             case RequestCode::UNREGISTER_CLIENT:
             case RequestCode::CHECK_CLIENT_CONFIG:
                 $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
@@ -1602,7 +1602,7 @@ final class RunClientProducer
         }
         $this->check($saw, '请求消息带 CORRELATION_ID / REPLY_TO_CLIENT / TTL');
         // 心跳补发（REPLY_TO_CLIENT 依赖 broker 认识本客户端）
-        $this->check($broker->logCount(RequestCode::HEARTBEAT) >= 1, 'request 前 broker 收到心跳');
+        $this->check($broker->logCount(RequestCode::HEART_BEAT) >= 1, 'request 前 broker 收到心跳');
 
         // 发送本身失败 → MQClientException（不等满 timeout）
         $pFail = $this->makeProducer($broker, 'GID-request2', 'AsyncFailTopic', 'request2-inst-1');
@@ -1619,6 +1619,34 @@ final class RunClientProducer
         $this->check($elapsed < 4.5, '发送失败不等满 timeout（耗时 ' . round($elapsed, 2) . 's）');
         $pFail->shutdown();
         MQClientInstance::removeInstance('request2-inst-1-cid');
+
+        // reply()：createReplyMessage + 325 换码发送
+        $req = new Message('RequestTopic', 'req-for-reply');
+        $req->putProperty(MessageConst::PROPERTY_CLUSTER, 'DefaultCluster');
+        $req->putProperty(MessageConst::PROPERTY_CORRELATION_ID, 'corr-1');
+        $req->putProperty(MessageConst::PROPERTY_MESSAGE_REPLY_TO_CLIENT, 'client-1');
+        $req->putProperty(MessageConst::PROPERTY_MESSAGE_TTL, '5000');
+        $rr = $p->reply($req, 'offline-reply-body');
+        $this->check($rr->sendStatus === SendStatus::SEND_OK, 'reply 同步发送 SEND_OK');
+        $saw325 = false;
+        $props325 = [];
+        foreach ($broker->logEntries() as $e) {
+            if (($e['code'] ?? 0) === RequestCode::SEND_REPLY_MESSAGE_V2
+                && ($e['ext']['b'] ?? '') === MixAll::getReplyTopic('DefaultCluster')) {
+                $saw325 = true;
+                $props325 = MessageDecoder::string2MessageProperties((string) ($e['ext']['i'] ?? ''));
+            }
+        }
+        $this->check($saw325, 'reply 换码 SEND_REPLY_MESSAGE_V2(325) 且 topic=<CLUSTER>_REPLY_TOPIC');
+        $this->checkSame('reply', $props325[MessageConst::PROPERTY_MESSAGE_TYPE] ?? '', '应答带 MSG_TYPE=reply');
+        $this->checkSame('corr-1', $props325[MessageConst::PROPERTY_CORRELATION_ID] ?? '', '应答回填 CORRELATION_ID');
+        $this->checkSame('client-1', $props325[MessageConst::PROPERTY_MESSAGE_REPLY_TO_CLIENT] ?? '', '应答回填 REPLY_TO_CLIENT');
+        try {
+            $p->reply(new Message('RequestTopic', 'no-cluster'), 'x');
+            $this->check(false, '无 CLUSTER 的 reply 应抛');
+        } catch (MQClientException $e) {
+            $this->check(str_contains($e->getMessage(), 'property[CLUSTER] is null'), '无 CLUSTER 文案（CREATE_REPLY_MESSAGE_EXCEPTION 语义）');
+        }
 
         $p->shutdown();
         MQClientInstance::removeInstance('request-inst-1-cid');

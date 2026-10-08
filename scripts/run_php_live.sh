@@ -34,12 +34,13 @@ WORK=/tmp/rmq_php_live
 STAMP=$(date +%s)
 
 case "$WHICH" in
-  redelivery)  EXAMPLE="examples/live_redelivery.php"  ;;
-  admin)       EXAMPLE="examples/live_admin.php"       ;;
-  compression) EXAMPLE="examples/live_compression.php" ;;
-  pop)         EXAMPLE="examples/live_pop.php"         ;;
-  tls)         EXAMPLE="examples/live_tls.php"         ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls)" >&2; exit 2 ;;
+  redelivery)    EXAMPLE="examples/live_redelivery.php"     ;;
+  admin)         EXAMPLE="examples/live_admin.php"          ;;
+  compression)   EXAMPLE="examples/live_compression.php"    ;;
+  pop)           EXAMPLE="examples/live_pop.php"            ;;
+  tls)           EXAMPLE="examples/live_tls.php"            ;;
+  request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply)" >&2; exit 2 ;;
 esac
 
 port_open() {
@@ -255,6 +256,36 @@ echo "=== php live: $EXAMPLE (ns=$NS) ==="
 cd "$ROOT/php" || exit 1
 if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ]; then
     "$PHP_BIN" "$EXAMPLE" "$NS" "$LEGS"
+elif [ "$WHICH" = "request_reply" ]; then
+    # 双进程编排：responder（consumer + producer.reply）后台起，等 READY 后跑
+    # requester（producer.request）。responder 收满 expect 条自行退出。
+    RR_TOPIC="PhpReqRep_${STAMP}"
+    RR_EXPECT=${RR_EXPECT:-3}
+    "$PHP_BIN" "$EXAMPLE" responder "$NS" "$RR_TOPIC" "$RR_EXPECT" > "$WORK/rr_responder.log" 2>&1 &
+    RESPONDER_PID=$!
+    RESPONDER_OK=0
+    for i in $(seq 1 40); do
+        if ! kill -0 "$RESPONDER_PID" 2>/dev/null; then
+            break
+        fi
+        if /usr/bin/grep -q RESPONDER_READY "$WORK/rr_responder.log" 2>/dev/null; then
+            RESPONDER_OK=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$RESPONDER_OK" != "1" ]; then
+        echo "=== responder 40s 未就绪（见 $WORK/rr_responder.log） ===" >&2
+        kill "$RESPONDER_PID" 2>/dev/null || true
+        cat "$WORK/rr_responder.log"
+        exit 2
+    fi
+    "$PHP_BIN" "$EXAMPLE" requester "$NS" "$RR_TOPIC" "$RR_EXPECT"
+    RC=$?
+    wait "$RESPONDER_PID" || true
+    echo "--- responder 输出（$WORK/rr_responder.log） ---"
+    cat "$WORK/rr_responder.log"
+    exit $RC
 elif [ "$WHICH" = "compression" ]; then
     "$PHP_BIN" "$EXAMPLE" send "PhpCompressSmoke_$STAMP" "GID_PhpCompressSmoke_$STAMP" 8192 "$NS" zlib \
       && "$PHP_BIN" "$EXAMPLE" recv "PhpCompressSmoke_$STAMP" "GID_PhpCompressSmokeR_$STAMP" 8192 "$NS"

@@ -513,6 +513,49 @@ final class RemotingClient
         return $watch;
     }
 
+    /**
+     * 泵**所有**连接上的入站帧 —— 与 waitResponses 的区别：不要求连接上有在途请求。
+     *
+     * Request-Reply 的等待期正是这种场景：发送早已完成（pending 已清空），
+     * 但 broker 会经 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答**主动推**回来。
+     * 只盯 pending 连接的 waitResponses 在 pending 清空后立即返回，推回的应答
+     * 一直压在内核缓冲区里读不到 —— 实测 broker 侧 callClient 因此超时报
+     * "push reply message to ... fail"，请求方则要到下一次发送才顺带读出，
+     * 那时 future 早已超时摘槽（"not matched any request"）。
+     */
+    public function pumpIncoming(int $timeoutMillis): void
+    {
+        $deadline = self::monoMillis() + $timeoutMillis;
+        while (true) {
+            if (self::monoMillis() >= $deadline) {
+                break;
+            }
+            $watch = $this->conns;
+            if ($watch === []) {
+                usleep(5000);
+                continue;
+            }
+            $r = array_values($watch);
+            $w = [];
+            $e = [];
+            $remainingUs = (int)min(($deadline - self::monoMillis()) * 1000.0, 500000.0);
+            $n = @stream_select($r, $w, $e, 0, $remainingUs);
+            if ($n === false) {
+                break;
+            }
+            if ($n === 0) {
+                continue;
+            }
+            foreach ($r as $conn) {
+                $addr = $this->addrOfConn($conn);
+                if ($addr === null) {
+                    continue;
+                }
+                $this->readFrom($addr, $conn);
+            }
+        }
+    }
+
     private function addrOfConn($conn): ?string
     {
         foreach ($this->pending as $f) {
