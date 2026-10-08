@@ -15,7 +15,7 @@ import { MessageConst } from '../src/common/messageConst.ts';
 import { MessageAccessor } from '../src/common/message_accessor.ts';
 import { encodeMessageExt, decodeMessage, decodeMessages, decompressBody, createMessageId } from '../src/common/messageDecoder.ts';
 import { ipAndPortToBytes } from '../src/common/utilAll.ts';
-import { lz4CompressBlock, lz4DecompressBlock, zstdCompressRaw, zstdDecompressFrame } from '../src/common/compress.ts';
+import { lz4CompressFrame, lz4DecompressFrame, zstdCompressRaw, zstdDecompressFrame } from '../src/common/compress.ts';
 import { SendMessageTraceHookImpl } from '../src/client/trace_hook.ts';
 import { AsyncTraceDispatcher } from '../src/client/trace_dispatcher.ts';
 import { SendMessageContext } from '../src/client/hook.ts';
@@ -135,7 +135,7 @@ console.log('== producer compression selection ==');
   // decodeMessage integration: encode a MessageExt with LZ4-flagged compressed body.
   const me = new MessageExt();
   me.setTopic('T'); me.setSysFlag(MessageSysFlag.setCompressionType(MessageSysFlag.COMPRESSED_FLAG, 1));
-  me.setBody(lz4CompressBlock(payload));
+  me.setBody(lz4CompressFrame(payload));
   me.setQueueId(0); me.setQueueOffset(0); me.setCommitLogOffset(0);
   me.setBornTimestamp(0); me.setStoreTimestamp(0);
   me.setBornHost('127.0.0.1'); me.setStoreHost('127.0.0.1');

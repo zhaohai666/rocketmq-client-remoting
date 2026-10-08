@@ -13,6 +13,7 @@ use RocketMQ\Client\Exceptions\RemotingSendRequestException;
 use RocketMQ\Client\Exceptions\RemotingTimeoutException;
 use RocketMQ\Client\Exceptions\RemotingTooMuchRequestException;
 use RocketMQ\Client\Exceptions\RequestTimeoutException;
+use RocketMQ\Common\CompressionCodec;
 use RocketMQ\Common\HandleV1;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageBatch;
@@ -1504,17 +1505,25 @@ class DefaultMQProducer
     }
 
     /**
-     * 对应 Python message_decoder._compress（PHP 端只内置 ZLIB —— LZ4/ZSTD 需要的
-     * Frame 格式无内置实现，与 MessageDecoder 的口径一致，按失败降级处理）。
+     * 对应 Python message_decoder._compress：ZLIB 走 gzcompress，LZ4（Frame）/ZSTD
+     * （CLI 优先、Raw/RLE 兜底）由 CompressionCodec 承担，与 MessageDecoder 的
+     * 口径一致；未知类型抛出 → tryToCompressMessage 降级不压缩。
      */
     private function compressBody(string $data, int $compressionType, int $level): string
     {
-        if (MessageDecoder::normalizeCompressionType($compressionType) === MessageSysFlag::ZLIB_TYPE) {
+        $ctype = MessageDecoder::normalizeCompressionType($compressionType);
+        if ($ctype === MessageSysFlag::ZLIB_TYPE) {
             $out = @gzcompress($data, $level);
             if ($out === false) {
                 throw new \RuntimeException('zlib compress failed');
             }
             return $out;
+        }
+        if ($ctype === MessageSysFlag::LZ4_TYPE) {
+            return CompressionCodec::lz4CompressFrame($data);
+        }
+        if ($ctype === MessageSysFlag::ZSTD_TYPE) {
+            return CompressionCodec::zstdCompress($data);
         }
         throw new \RuntimeException(sprintf('unsupported compression type: %d', $compressionType));
     }

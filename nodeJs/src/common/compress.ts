@@ -141,6 +141,153 @@ export function lz4DecompressBlock(data: Buffer): Buffer {
   return out.subarray(0, o);
 }
 
+// ---------------------------------------------------------------- LZ4 frame
+
+// ⚠ Java wire 的 LZ4 是 **LZ4 Frame 格式**（Lz4Compressor 用 lz4-java 的
+// LZ4FrameOutputStream/LZ4FrameInputStream；Python lz4.frame 同规范互通）——
+// 裸 block 只能自环自解，跨端/Java 全部解不开。此前的 block 直发是隐藏缺陷
+//（node 不在跨端压缩矩阵里，直到 PHP 端补矩阵腿时才暴露）。
+// Frame = magic + FLG + BD + [C.Size(8B)] + HC + {BlockSize(4B) + block}*
+//         + EndMark(4B) + [C.Checksum(4B)]；block 就是上面的裸 block 层。
+
+const LZ4_MAGIC = 0x184d2204;
+const LZ4_FRAME_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，对齐 Java/Python 默认
+
+// xxhash32（Frame 的 HC 与 C.Checksum 用）。Math.imul 天然 mod 2^32。
+export function xxh32(data: Buffer, seed = 0): number {
+  const P1 = 2654435761, P2 = 2246822519, P3 = 3266489917, P4 = 668265263, P5 = 374761393;
+  const n = data.length;
+  let i = 0;
+  let h: number;
+  if (n >= 16) {
+    let v1 = (seed + P1 + P2) >>> 0;
+    let v2 = (seed + P2) >>> 0;
+    let v3 = seed >>> 0;
+    let v4 = (seed - P1) >>> 0;
+    const limit = n - 16;
+    do {
+      v1 = Math.imul(Math.imul(data.readUInt32LE(i), P2) + v1, P1);
+      v1 = ((v1 << 13) | (v1 >>> 19)) >>> 0;
+      v2 = Math.imul(Math.imul(data.readUInt32LE(i + 4), P2) + v2, P1);
+      v2 = ((v2 << 13) | (v2 >>> 19)) >>> 0;
+      v3 = Math.imul(Math.imul(data.readUInt32LE(i + 8), P2) + v3, P1);
+      v3 = ((v3 << 13) | (v3 >>> 19)) >>> 0;
+      v4 = Math.imul(Math.imul(data.readUInt32LE(i + 12), P2) + v4, P1);
+      v4 = ((v4 << 13) | (v4 >>> 19)) >>> 0;
+      i += 16;
+    } while (i <= limit);
+    h = (((v1 << 1) | (v1 >>> 31)) + ((v2 << 7) | (v2 >>> 25))
+      + ((v3 << 12) | (v3 >>> 20)) + ((v4 << 18) | (v4 >>> 14))) >>> 0;
+  } else {
+    h = (seed + P5) >>> 0;
+  }
+  h = (h + n) >>> 0;
+  // 尾部 4 字节轮用 P3/P4（XXH32_finalize 官方口径；不是 P5/P1）
+  while (i + 4 <= n) {
+    h = (h + Math.imul(data.readUInt32LE(i), P3)) >>> 0;
+    h = (((h << 17) | (h >>> 15)) >>> 0);
+    h = Math.imul(h, P4);
+    i += 4;
+  }
+  while (i < n) {
+    h = (h + Math.imul(data[i], P5)) >>> 0;
+    h = (((h << 11) | (h >>> 21)) >>> 0);
+    h = Math.imul(h, P1);
+    i++;
+  }
+  h ^= h >>> 15;
+  h = Math.imul(h, P2);
+  h ^= h >>> 13;
+  h = Math.imul(h, P3);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+// lz4CompressFrame 压成 LZ4 Frame（Java LZ4FrameOutputStream / Python
+// lz4.frame 同规范）。FLG = version01 | B.Indep | C.Size；无块/内容校验
+//（对齐两端默认）；块压不动时存 raw 块（bit31 置位）。
+export function lz4CompressFrame(data: Buffer): Buffer {
+  const flg = 0x40 | 0x20 | 0x08; // version=01, B.Indep=1, C.Size=1
+  const bd = 0x40; // BlockMaxSize=64KB
+  const header = Buffer.from([flg, bd]);
+  const cs = Buffer.alloc(8);
+  cs.writeBigUInt64LE(BigInt(data.length), 0);
+  const parts: Buffer[] = [Buffer.from([0x04, 0x22, 0x4d, 0x18]), header, cs];
+  // HC = xxh32(FLG+BD+C.Size, 0) 的第二字节
+  parts.push(Buffer.from([((xxh32(Buffer.concat([header, cs])) >>> 8) & 0xff)]));
+  const n = data.length;
+  let pos = 0;
+  do {
+    const chunk = data.subarray(pos, pos + LZ4_FRAME_BLOCK_SIZE);
+    pos += chunk.length;
+    const block = lz4CompressBlock(chunk);
+    const sizeField = Buffer.alloc(4);
+    if (block.length === 0 || block.length >= chunk.length) {
+      // 压不动：存 raw 块（bit31 置位）
+      sizeField.writeUInt32LE((0x80000000 | chunk.length) >>> 0, 0);
+      parts.push(sizeField, chunk);
+    } else {
+      sizeField.writeUInt32LE(block.length, 0);
+      parts.push(sizeField, block);
+    }
+  } while (pos < n);
+  parts.push(Buffer.from([0, 0, 0, 0])); // EndMark
+  return Buffer.concat(parts);
+}
+
+// lz4DecompressFrame 解 LZ4 Frame；坏 magic/坏 HC/坏块一律抛异常。
+export function lz4DecompressFrame(data: Buffer): Buffer {
+  if (data.length < 7) throw new Error('lz4 frame decompress: input too short');
+  if (data.readUInt32LE(0) !== LZ4_MAGIC) {
+    throw new Error(`lz4 frame decompress: bad magic 0x${data.readUInt32LE(0).toString(16)}`);
+  }
+  let p = 4;
+  const flg = data[p++];
+  if (flg >>> 6 !== 0x1) throw new Error(`lz4 frame decompress: unsupported version ${flg >>> 6}`);
+  const blockChecksum = (flg & 0x10) !== 0;
+  const contentSizeFlag = (flg & 0x08) !== 0;
+  const contentChecksum = (flg & 0x04) !== 0;
+  p += 1; // BD（解码按块头 size 走，BlockMaxSize 不需要）
+  let contentSize = 0;
+  if (contentSizeFlag) {
+    if (p + 8 > data.length) throw new Error('lz4 frame decompress: truncated content size');
+    contentSize = Number(data.readBigUInt64LE(p));
+    p += 8;
+  }
+  // HC = xxh32(FLG+BD+[C.Size]) 的第二字节（header checksum 存在于标准帧）
+  const headerEnd = p;
+  if (p >= data.length) throw new Error('lz4 frame decompress: truncated header checksum');
+  const hc = data[p++];
+  if ((((xxh32(data.subarray(4, headerEnd)) >>> 8) & 0xff)) !== hc) {
+    throw new Error('lz4 frame decompress: header checksum mismatch');
+  }
+  const parts: Buffer[] = [];
+  for (;;) {
+    if (p + 4 > data.length) throw new Error('lz4 frame decompress: truncated block size');
+    const sizeField = data.readUInt32LE(p);
+    p += 4;
+    if (sizeField === 0) break; // EndMark
+    const isRaw = (sizeField & 0x80000000) !== 0;
+    const blockLen = sizeField & 0x7fffffff;
+    if (p + blockLen > data.length) throw new Error('lz4 frame decompress: truncated block data');
+    const block = data.subarray(p, p + blockLen);
+    p += blockLen;
+    parts.push(isRaw ? block : lz4DecompressBlock(block));
+    if (blockChecksum) p += 4;
+  }
+  const out = Buffer.concat(parts);
+  if (contentChecksum) {
+    if (p + 4 > data.length) throw new Error('lz4 frame decompress: truncated content checksum');
+    if (xxh32(out) !== data.readUInt32LE(p)) {
+      throw new Error('lz4 frame decompress: content checksum mismatch');
+    }
+  }
+  if (contentSize !== 0 && out.length !== contentSize) {
+    throw new Error('lz4 frame decompress: content size mismatch');
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- ZSTD frame
 
 const ZSTD_MAGIC = 0xfd2fb528;
@@ -253,7 +400,7 @@ export { UnsupportedCompressionError };
 export function compressFor(data: Buffer, compressionType: number): Buffer {
   switch (compressionType) {
     case MessageSysFlag.ZLIB_TYPE: return zlib.deflateSync(data);
-    case MessageSysFlag.LZ4_TYPE: return lz4CompressBlock(data);
+    case MessageSysFlag.LZ4_TYPE: return lz4CompressFrame(data);
     case MessageSysFlag.ZSTD_TYPE: return zstdCompressRaw(data);
     default:
       throw new UnsupportedCompressionError(`unsupported compression type: ${compressionType}`);
@@ -264,7 +411,7 @@ export function compressFor(data: Buffer, compressionType: number): Buffer {
 export function decompressFor(data: Buffer, compressionType: number): Buffer {
   switch (compressionType) {
     case MessageSysFlag.ZLIB_TYPE: return zlib.inflateSync(data);
-    case MessageSysFlag.LZ4_TYPE: return lz4DecompressBlock(data);
+    case MessageSysFlag.LZ4_TYPE: return lz4DecompressFrame(data);
     case MessageSysFlag.ZSTD_TYPE: return zstdDecompressFrame(data);
     default:
       throw new UnsupportedCompressionError(`unsupported compression type: ${compressionType}`);

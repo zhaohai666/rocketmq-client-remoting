@@ -13,9 +13,9 @@ declare(strict_types=1);
 // PHP 的 crc32() 可能返回负数，用 sprintf('%u') 转无符号；**不是** Java
 // UtilAll.crc32 的 &0x7FFFFFFF 口径，两边数字本来就差 2^31，不比数字）。
 //
-// PHP 的 codec 面只有 zlib（gzcompress/gzinflate，阈值 4096）：LZ4/ZSTD 明确报
-// unsupported（exit 2），绝不把压缩流当正文透传——所以矩阵脚本里 codec != zlib
-// 时所有含 PHP 的腿 SKIP。
+// codec 面覆盖 zlib（gzcompress）+ lz4（CompressionCodec 纯 block-format 实现）
+// + zstd（CompressionCodec Raw/RLE 帧）——见 2026-10-08。接收端按 sysFlag 类型位
+// 自动解压，所以「B 能解 A 压的」正是矩阵要证明的部分。
 //
 // 退出码（对齐 Python/Go 腿，脚本据此区分）：0 ok / 1 普通失败（含发送失败，
 // 不能占用 2）/ 2 坏 codec 或坏用法 / 3 recv 超时。
@@ -26,6 +26,7 @@ use RocketMQ\Client\DefaultMQPullConsumer;
 use RocketMQ\Client\PullStatus;
 use RocketMQ\Client\SendStatus;
 use RocketMQ\Common\Message;
+use RocketMQ\Common\MessageSysFlag;
 
 // payloadLine 是矩阵的种子，任何端口都逐字节一致。
 const PAYLOAD_LINE = "rocketmq-compress-interop-payload-line-0123456789\n";
@@ -64,9 +65,10 @@ if ($argv0 === 'send') {
     $namesrv = $argv[5] ?? '127.0.0.1:9876';
     $codec = $argv[6] ?? 'zlib';
 
-    if ($codec !== 'zlib') {
+    $codecTypes = ['zlib' => MessageSysFlag::ZLIB_TYPE, 'lz4' => MessageSysFlag::LZ4_TYPE, 'zstd' => MessageSysFlag::ZSTD_TYPE];
+    if (!isset($codecTypes[$codec])) {
         // 2 严格留给"坏 codec / 坏用法"：普通发送失败绝不能报 2。
-        echo "SEND_UNSUPPORTED codec=$codec (php port is zlib-only: gzcompress/gzinflate, no LZ4/ZSTD)" . PHP_EOL;
+        echo "SEND_UNSUPPORTED codec=$codec (php port supports zlib|lz4|zstd)" . PHP_EOL;
         exit(2);
     }
 
@@ -75,6 +77,7 @@ if ($argv0 === 'send') {
         $p = new DefaultMQProducer($group);
         $p->setNamesrvAddr($namesrv);
         $p->sendMsgTimeout = 5000;
+        $p->setCompressType($codecTypes[$codec]);
         $p->start();
         // body >= compressMsgBodyOverHowmuch(4096) ⇒ 生产端自动压缩
         $r = $p->send(new Message($topic, $payload));

@@ -256,14 +256,13 @@ final class MessageDecoder
             return $out;
         }
         if ($ctype === MessageSysFlag::LZ4_TYPE) {
-            throw new \RuntimeException(
-                'lz4 compression requires the lz4 extension: PHP 无内置 LZ4 Frame 实现（Java lz4-java Frame 格式）'
-            );
+            // LZ4 Frame 格式（Java LZ4FrameOutputStream / Python lz4.frame 同规范），纯 PHP 实现
+            return CompressionCodec::lz4CompressFrame($data);
         }
         if ($ctype === MessageSysFlag::ZSTD_TYPE) {
-            throw new \RuntimeException(
-                'zstd compression requires the zstd extension: PHP 无内置 ZSTD 实现（Java zstd-jni 格式）'
-            );
+            // 合法 ZSTD 帧（CLI 优先真压缩；无 CLI 时 Raw/RLE 块），
+            // broker 的 zstd-jni 原样可解。
+            return CompressionCodec::zstdCompress($data);
         }
         throw self::unsupported($compressionType);
     }
@@ -281,14 +280,10 @@ final class MessageDecoder
             return $out;
         }
         if ($ctype === MessageSysFlag::LZ4_TYPE) {
-            throw new \RuntimeException(
-                'lz4 compression requires the lz4 extension: PHP 无内置 LZ4 Frame 实现（Java lz4-java Frame 格式）'
-            );
+            return CompressionCodec::lz4DecompressFrame($data);
         }
         if ($ctype === MessageSysFlag::ZSTD_TYPE) {
-            throw new \RuntimeException(
-                'zstd compression requires the zstd extension: PHP 无内置 ZSTD 实现（Java zstd-jni 格式）'
-            );
+            return CompressionCodec::zstdDecompress($data);
         }
         throw self::unsupported($compressionType);
     }

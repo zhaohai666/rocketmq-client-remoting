@@ -20,6 +20,7 @@ use RocketMQ\Common\MessageAccessor;
 use RocketMQ\Common\MessageBatch;
 use RocketMQ\Common\MessageClientIdSetter;
 use RocketMQ\Common\MessageConst;
+use RocketMQ\Common\CompressionCodec;
 use RocketMQ\Common\MessageDecoder;
 use RocketMQ\Common\MessageExt;
 use RocketMQ\Common\MessageQueue;
@@ -335,6 +336,124 @@ $cenc = MessageDecoder::encodeMessageExt($cext, true);
 $cdec = MessageDecoder::decodeMessage($cenc);
 $T->check($cdec !== null && $cdec->getBody() === 'plain', '压缩消息解码还原正文');
 $T->check($cdec !== null && MessageSysFlag::isCompressed($cdec->getSysFlag()) === false, '解码后清掉 COMPRESSED_FLAG');
+
+// LZ4 Frame（Java LZ4FrameOutputStream / Python lz4.frame 同规范；block 层是它的内部）：
+// xxhash32 官方向量锚定 + Python lz4.frame 产出的完整帧 + Frame 往返 + 重叠 match
+$T->checkSame(0x02CC5D05, CompressionCodec::xxh32(''), 'xxh32("") 官方向量');
+$T->checkSame(0x32D153FF, CompressionCodec::xxh32('abc'), 'xxh32("abc") 官方向量');
+// Python lz4.frame.compress 产出的帧（跨端解压锚点；HC=xxh32(header)>>8 的第二字节）：
+//   'abc' → magic|FLG=0x68|BD=0x40|C.Size=3|HC=0x87|raw块(0x80000003)|'abc'|EndMark
+$lz4framePy = hex2bin('04224d1868400300000000000000870300008061626300000000');
+$T->checkSame('abc', CompressionCodec::lz4DecompressFrame($lz4framePy), 'LZ4 Frame Python 产帧解压');
+// 'hello world '×40：compressed 块（裸 block 形状，node 版同输入产出一致）
+$lz4framePy2 = hex2bin('04224d186840e0010000000000009b17000000cf68656c6c6f20776f726c64200c00ffbd506f726c642000000000');
+$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressBlock(hex2bin('cf68656c6c6f20776f726c64200c00ffbd506f726c6420')), 'LZ4 裸 block 长串（node 同款）解压');
+$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressFrame($lz4framePy2), 'LZ4 Frame Python 长串帧解压');
+// Frame 往返（含 >64KB 多块、RLE、raw 块兜底）
+$lz4FrameSamples = [
+    '', 'a', 'abcabcabcabc',
+    str_repeat('hello world ', 40),
+    str_repeat('x', 300000),                       // RLE 型，块压缩得动
+    str_repeat('0123456789', 8192) . 'tail',       // 80KB+ → 多块
+];
+foreach ($lz4FrameSamples as $idx => $sample) {
+    $enc = CompressionCodec::lz4CompressFrame($sample);
+    $T->checkSame($sample, CompressionCodec::lz4DecompressFrame($enc), "LZ4 Frame 往返 #$idx (len=" . strlen($sample) . ')');
+}
+// 坏 HC 必须抛（防止把别的字节流误当 LZ4 Frame 解）
+$T->checkThrows(
+    static fn () => CompressionCodec::lz4DecompressFrame(hex2bin('04224d1868400300000000000000880300008061626300000000')),
+    \RuntimeException::class,
+    'LZ4 Frame 坏 HC 抛异常'
+);
+$lz4samples = [
+    '',
+    'a',
+    'ab',
+    str_repeat('hello world ', 40),
+    str_repeat('x', 300000),            // 长 RLE（跨多段字面量扩展）
+    str_repeat('0123456789', 8192) . uniqid('', true), // 高重复 + 唯一尾巴
+    random_bytes_wellknown(),
+];
+/** 确定性伪随机（避免 random_bytes 逐次变化） */
+function random_bytes_wellknown(): string
+{
+    $out = '';
+    $s = 12345;
+    for ($i = 0; $i < 100000; $i++) {
+        $s = ($s * 1103515245 + 12345) & 0x7FFFFFFF;
+        $out .= chr(0x20 + ($s % 96)); // 可打印域，制造可匹配的重复
+    }
+    return $out;
+}
+foreach ($lz4samples as $idx => $sample) {
+    $enc = CompressionCodec::lz4CompressBlock($sample);
+    $T->checkSame($sample, CompressionCodec::lz4DecompressBlock($enc), "LZ4 往返 #$idx (len=" . strlen($sample) . ')');
+}
+// 重叠 match（off < matchLen，LZ4 的经典 RLE 场景）：解压必须逐字节拷贝
+// token 0x1F: litLen=1 'A'，off=1，ml 位=15+扩展 0 → matchLen=19
+$overlap = CompressionCodec::lz4DecompressBlock(hex2bin('1F4101000'. '0'));
+$T->checkSame(str_repeat('A', 20), $overlap, 'LZ4 重叠 match 解压');
+$T->checkThrows(
+    static fn () => CompressionCodec::lz4DecompressBlock(hex2bin('306162630000')),
+    \RuntimeException::class,
+    'LZ4 零偏移抛异常'
+);
+
+// ZSTD Raw/RLE 帧：node 产出的完整小帧（magic/帧头/RAW 块跨端锚点）+ 往返 + RLE
+$zstdNode = hex2bin('28b52ffde01600000000000000b100007a7374642d7261772d6672616d652d7061796c6f6164');
+$T->checkSame('zstd-raw-frame-payload', CompressionCodec::zstdDecompressFrame($zstdNode), 'ZSTD node 帧解压');
+$T->checkSame($zstdNode, CompressionCodec::zstdCompressRaw('zstd-raw-frame-payload'), 'ZSTD 与 node 压缩逐字节一致');
+$zstdRle = CompressionCodec::zstdCompressRaw(str_repeat('Z', 500000)); // 500KB 全 Z → RLE 块
+$T->check(strlen($zstdRle) < 5000, 'ZSTD RLE 大跑长压缩有效');
+$T->checkSame(str_repeat('Z', 500000), CompressionCodec::zstdDecompressFrame($zstdRle), 'ZSTD RLE 往返');
+$zstdBig = CompressionCodec::zstdCompressRaw(str_repeat('chunk-', 60000)); // >128KB → 多 Raw 块
+$T->checkSame(str_repeat('chunk-', 60000), CompressionCodec::zstdDecompressFrame($zstdBig), 'ZSTD 多块帧往返');
+// Compressed 块（type=2）：显式抛，绝不把压缩流当正文透传
+// magic + 帧头(FCS=8B) + 块头 04 00 00（last=0, type=2=Compressed, size=0）
+$compFrame = pack('V', 0xFD2FB528) . chr(0xE0) . pack('P', 0) . chr(0x04) . chr(0x00) . chr(0x00) . "\x01\x02";
+$T->checkThrows(
+    static fn () => CompressionCodec::zstdDecompressFrame($compFrame),
+    \RuntimeException::class,
+    'ZSTD Compressed 块抛异常'
+);
+
+// MessageDecoder 接线：LZ4/ZSTD 经公开入口 decompressBody 可解；Producer 侧 compressBody 同源
+$T->checkSame('via-decoder', MessageDecoder::decompressBody(
+    CompressionCodec::lz4CompressFrame('via-decoder'),
+    MessageSysFlag::LZ4_TYPE
+), 'MessageDecoder LZ4 分支');
+$T->checkSame('via-decoder', MessageDecoder::decompressBody(
+    CompressionCodec::zstdCompressRaw('via-decoder'),
+    MessageSysFlag::ZSTD_TYPE
+), 'MessageDecoder ZSTD 分支');
+
+// ZSTD 统一入口（CLI 优先 / Raw 兜底）：有 zstd CLI 时验证真压缩路径——
+// 压缩率真实生效 + 能解回其他端（CLI）压出的 Compressed 帧。
+if (trim((string) @shell_exec('command -v zstd 2>/dev/null')) !== '') {
+    $payload = str_repeat('zstd-cli-roundtrip-payload-', 4000); // ~108KB 可压文本
+    $cliComp = CompressionCodec::zstdCompress($payload);
+    $T->check(strlen($cliComp) < strlen($payload) / 10, 'ZSTD CLI 真压缩率生效（<10% 原文）');
+    $T->checkSame($payload, CompressionCodec::zstdDecompress($cliComp), 'ZSTD CLI 往返');
+    // 真 CLI 压缩帧里是 Compressed 块 —— zstdDecompressFrame（纯实现）必须拒绝它，
+    // 证明「Compressed 块只经由 CLI 通道解，纯实现不静默透传」的分层成立。
+    $T->checkThrows(
+        static fn () => CompressionCodec::zstdDecompressFrame($cliComp),
+        \RuntimeException::class,
+        'ZSTD CLI 帧（Compressed 块）纯实现拒绝'
+    );
+    $T->checkSame('via-decoder', MessageDecoder::decompressBody(
+        CompressionCodec::zstdCompress('via-decoder'),
+        MessageSysFlag::ZSTD_TYPE
+    ), 'MessageDecoder ZSTD CLI 分支');
+} else {
+    // 无 CLI 兜底：zstdCompress 必须等于纯 Raw 实现
+    $T->checkSame(
+        CompressionCodec::zstdCompressRaw('no-cli'),
+        CompressionCodec::zstdCompress('no-cli'),
+        'ZSTD 无 CLI 时回退 Raw 帧'
+    );
+}
 
 // ============================================================ SysFlag 位运算
 $T->checkSame(3, MessageSysFlag::getCompressionType(MessageSysFlag::setCompressionType(0, 3)), 'get/setCompressionType');

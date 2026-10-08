@@ -120,10 +120,9 @@ run_pair() { # label  sender  receiver
     echo "  RESULT=SKIPPED (go port is zlib-only: stdlib has no LZ4/ZSTD, module takes no deps)"
     return
   fi
-  if [[ $CODEC != zlib && ( $2 == php_* || $3 == php_* ) ]]; then
-    echo "  RESULT=SKIPPED (php port is zlib-only: gzcompress/gzinflate, no LZ4/ZSTD)"
-    return
-  fi
+  # php 端 2026-10-08 起带纯实现 LZ4（Frame 格式，与 Java Lz4Compressor 的
+  # LZ4FrameOutputStream 同 wire）/ZSTD（Raw/RLE 帧），与其他端一起参与
+  # lz4/zstd 互通矩阵，不再 SKIP。
   local sout rout lout line
   sout=$(timeout 180 "$BIN/$2" "$topic" "$group" 2>&1); rout=$?
   echo "$sout" | grep -o "SEND_[A-Z]*.*" | head -1
@@ -163,7 +162,7 @@ run_pair go2net go_send net_recv
 run_pair net2go net_send go_recv
 run_pair go2rs go_send rs_recv
 run_pair rs2go rs_send go_recv
-# PHP 腿（覆盖双向互通 + php 自环；lz4/zstd 时全部 SKIP）
+# PHP 腿（覆盖双向互通 + php 自环；lz4/zstd 由 CompressionCodec 纯实现参与）
 run_pair php2php php_send php_recv
 run_pair php2py php_send py_recv
 run_pair py2php py_send php_recv
