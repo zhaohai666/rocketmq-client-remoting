@@ -9,7 +9,9 @@
 //  - The consumer-side msg_id is the OFFSET-based ID (aligns with
 //    SendResult.offsetMsgId); the Pub trace uses UNIQ_KEY (rule #14).
 //  - Hook exceptions must never break delivery: everything is caught.
-import { SendMessageContext, ConsumeMessageContext } from './hook.ts';
+import {
+  ConsumeMessageHook, SendMessageHook, SendMessageContext, ConsumeMessageContext,
+} from './hook.ts';
 import {
   TraceContext, TraceType, TraceBean, AccessChannelLocal, traceBeanFromMessageExt,
 } from './trace_context.ts';
@@ -20,17 +22,21 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.trace_hook');
 
-// SendMessageTraceHookImpl records the Pub event.
-export class SendMessageTraceHookImpl {
+// SendMessageTraceHookImpl records the Pub event. Extends SendMessageHook and
+// uses the EXACT contract method names (sendMessageBefore/sendMessageAfter,
+// as in Java) — the producer send path iterates hookRegistry.sendMessageHooks
+// and calls those names directly.
+export class SendMessageTraceHookImpl extends SendMessageHook {
   private dispatcher: AsyncTraceDispatcher;
 
   constructor(dispatcher: AsyncTraceDispatcher) {
+    super();
     this.dispatcher = dispatcher;
   }
 
-  hookName(): string { return 'SendMessageTraceHookImpl'; }
+  getHookName(): string { return 'SendMessageTraceHookImpl'; }
 
-  sendBefore(ctx: SendMessageContext): void {
+  sendMessageBefore(ctx: SendMessageContext): void {
     try {
       const context = new TraceContext();
       context.traceType = TraceType.PUB;
@@ -49,7 +55,7 @@ export class SendMessageTraceHookImpl {
         bean.clientHost = '';
         const body = msg.getBody();
         bean.bodyLength = body ? body.length : 0;
-        bean.msgId = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYARRAY) || '';
+        bean.msgId = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) || '';
       }
       context.traceBeans = [bean];
       (ctx as any).mqTraceContext = context;
@@ -58,7 +64,7 @@ export class SendMessageTraceHookImpl {
     }
   }
 
-  sendAfter(ctx: SendMessageContext): void {
+  sendMessageAfter(ctx: SendMessageContext): void {
     try {
       const context: TraceContext | undefined = (ctx as any).mqTraceContext;
       if (!context || context.traceBeans.length === 0) return;
@@ -83,14 +89,15 @@ export class SendMessageTraceHookImpl {
 // ConsumeMessageTraceHookImpl records the SubBefore + SubAfter events. One
 // batch consume produces one SubBefore record PER message (they share the
 // timestamp/region/group/requestId) and one SubAfter record per message.
-export class ConsumeMessageTraceHookImpl {
+export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
   private dispatcher: AsyncTraceDispatcher;
 
   constructor(dispatcher: AsyncTraceDispatcher) {
+    super();
     this.dispatcher = dispatcher;
   }
 
-  hookName(): string { return 'ConsumeMessageTraceHookImpl'; }
+  getHookName(): string { return 'ConsumeMessageTraceHookImpl'; }
 
   consumeMessageBefore(ctx: ConsumeMessageContext): void {
     try {
@@ -110,6 +117,10 @@ export class ConsumeMessageTraceHookImpl {
         return bean;
       });
       (ctx as any).mqTraceContext = context;
+      // Java ConsumeMessageTraceHookImpl.consumeMessageBefore:82 — the
+      // SubBefore context is appended HERE (consumeMessageAfter only appends
+      // the SubAfter halves). Missing this = SubBefore records never ship.
+      if (context.traceBeans.length > 0) this.dispatcher.append(context);
     } catch (e) {
       logger.debug('trace consumeBefore error: %s', (e as Error).message);
     }

@@ -66,8 +66,8 @@ console.log('== allocation ==');
     for (const q of chash.allocate('g', c, mqAll, cid3)) all.add(q.getTopic() + '@' + q.getQueueId());
   }
   check('CONSISTENT_HASH covers all 8 queues', all.size === 8);
-  check('ALLOCATE_STRATEGIES registry has 5 entries (Java factory set)',
-    Object.keys(ALLOCATE_STRATEGIES).length === 5);
+  check('ALLOCATE_STRATEGIES registry has 6 entries (Java factory set)',
+    Object.keys(ALLOCATE_STRATEGIES).length === 6);
 }
 
 console.log('== ProcessQueue ==');

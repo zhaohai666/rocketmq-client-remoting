@@ -193,7 +193,7 @@ export class PullAPI {
     }
     for (const msg of msgs) {
       if (msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED) === 'true') {
-        const uniq = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYARRAY);
+        const uniq = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
         if (uniq) msg.setTransactionId(uniq);
       }
       msg.putProperty(MessageConst.PROPERTY_MIN_OFFSET, String(result.minOffset));

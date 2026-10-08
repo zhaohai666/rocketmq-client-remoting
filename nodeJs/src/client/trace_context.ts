@@ -339,7 +339,7 @@ export function traceBeanFromMessageExt(msg: any, offsetBasedId: boolean): Trace
   bean.topic = msg.getTopic();
   bean.msgId = offsetBasedId
     ? (msg.getOffsetMsgId() || msg.getMsgId())
-    : (msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYARRAY) || msg.getMsgId());
+    : (msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) || msg.getMsgId());
   bean.tags = msg.getProperty(MessageConst.PROPERTY_TAGS) || '';
   bean.keys = msg.getProperty(MessageConst.PROPERTY_KEYS) || '';
   bean.storeHost = msg.getStoreHostString();

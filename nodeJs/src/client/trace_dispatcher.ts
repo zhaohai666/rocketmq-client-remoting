@@ -7,7 +7,10 @@
 // missing, producer failure — everything logs and drops; the data path keeps
 // running.
 import { Buffer } from 'node:buffer';
-import { TraceContext, TraceTransferBean, EncodeTraceContext, TraceGroupNamePrefix } from './trace_context.ts';
+import {
+  TraceContext, TraceBean, TraceType, TraceMsgType,
+  TraceTransferBean, EncodeTraceContext, TraceGroupNamePrefix,
+} from './trace_context.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.trace_dispatcher');
@@ -51,6 +54,12 @@ export class AsyncTraceDispatcher {
       // Java names the internal producer group <group>_INNER_TRACE_PRODUCER.
       const producer = new DefaultMQProducer(`${this.groupName}${TraceGroupNamePrefix}`);
       producer.setNamesrvAddr(this._nameSrvAddr);
+      // Java keeps hook lists PER PRODUCER — the inner trace producer's own
+      // list is empty, so its sends are NOT traced. node's SendMessageHook
+      // registry is global; this flag restores Java's semantics by exempting
+      // the inner producer from the shared hooks (otherwise every trace-topic
+      // write would itself emit a spurious Pub record).
+      (producer as any)._skipSendHooks = true;
       await producer.start();
       this._producer = producer;
     } catch (e) {
@@ -75,6 +84,38 @@ export class AsyncTraceDispatcher {
       this.flush().catch((e) => logger.debug('trace flush error: %s', (e as Error).message));
     }
     return true;
+  }
+
+  // appendEndTransaction builds the EndTransaction record of a transaction
+  // message (Java EndTransactionTraceHookImpl.endTransactionAfter). The
+  // transactionState is the LocalTransactionState enum NAME (wire literal).
+  appendEndTransaction(producerGroup: string, topic: string, msgId: string,
+    transactionId: string | null, localTransactionState: number,
+    fromTransactionCheck: boolean, brokerAddr: string): boolean {
+    try {
+      const ctx = new TraceContext();
+      ctx.traceType = TraceType.END_TRANSACTION;
+      ctx.timeStamp = Date.now();
+      ctx.isSuccess = true;
+      ctx.accessChannel = 'LOCAL';
+      ctx.regionId = brokerAddr || '';
+      ctx.groupName = producerGroup || '';
+      const bean = new TraceBean();
+      bean.topic = topic || '';
+      bean.msgId = msgId || '';
+      bean.msgType = TraceMsgType.TRANSACTION;
+      bean.transactionId = transactionId || '';
+      // LocalTransactionState ordinal -> Java enum name (TraceView lookups).
+      bean.transactionState =
+        localTransactionState === 0 ? 'COMMIT_MESSAGE'
+          : localTransactionState === 1 ? 'ROLLBACK_MESSAGE' : 'UNKNOW';
+      bean.fromTransactionCheck = fromTransactionCheck;
+      ctx.traceBeans = [bean];
+      return this.append(ctx);
+    } catch (e) {
+      logger.debug('append end-transaction trace failed: %s', (e as Error).message);
+      return false;
+    }
   }
 
   // flush encodes every buffered context and sends the joined payload. Each

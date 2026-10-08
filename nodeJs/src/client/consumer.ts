@@ -730,8 +730,14 @@ export class DefaultMQPushConsumer {
   }
 
   // _getConsumerIdListByGroup is Java MQClientInstance#findConsumerIdList: ask
-  // one master of the topic's route. Every client heartbeats to every broker,
+  // one broker of the topic's route. Every client heartbeats to every broker,
   // so any one broker holds the COMPLETE list for the group.
+  //
+  // The address is Java BrokerData.selectBrokerAddr: MASTER PREFERRED, else
+  // the lowest remaining id (a slave). Master-only resolution breaks a
+  // slave-only topology — the route then has no id=0 entry, the member list
+  // never resolves, and a freshly started consumer is assigned no queues at
+  // all (it silently consumes nothing).
   private async _getConsumerIdListByGroup(topic: string): Promise<{ cidAll: string[]; answered: boolean }> {
     if (!this.mqClient) return { cidAll: [], answered: false };
     const client = this.mqClient;
@@ -741,6 +747,10 @@ export class DefaultMQPushConsumer {
     for (const bd of route.brokerDatas || []) {
       const m = bd.brokerAddrs || {};
       if (MixAll.MASTER_ID in m) { addr = m[MixAll.MASTER_ID]; break; }
+      // selectBrokerAddr fallback: lowest id (JS integer-key objects iterate
+      // ascending), i.e. the primary slave when the master is gone.
+      const ids = Object.keys(m).map(Number).sort((a, b) => a - b);
+      if (ids.length > 0) { addr = m[String(ids[0])]; break; }
     }
     if (!addr) return { cidAll: [], answered: false };
     try {
@@ -1174,7 +1184,7 @@ export class DefaultMQPushConsumer {
       // A half message carries its transaction id in UNIQ_KEY; Java lifts it
       // so the listener can see it as MessageExt.getTransactionId().
       if (msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED) === 'true') {
-        const uniq = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYARRAY);
+        const uniq = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
         if (uniq) msg.setTransactionId(uniq);
       }
       msg.putProperty(MessageConst.PROPERTY_MIN_OFFSET, String(result.minOffset));

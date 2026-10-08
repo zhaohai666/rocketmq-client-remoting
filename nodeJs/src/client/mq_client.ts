@@ -48,7 +48,7 @@ import {
 import { SendResult } from './send_result.ts';
 import { ConsumerStatsManager } from './consumer_stats.ts';
 import { REQUEST_FUTURE_HOLDER } from './request_reply.ts';
-import zlib from 'node:zlib';
+import { decompressFor } from '../common/compress.ts';
 
 const logger = getLogger('mqclient');
 
@@ -267,6 +267,21 @@ export class MQClient {
 
   getBrokerAddrTable(): Map<string, Record<number, string>> { return this.brokerAddrTable; }
 
+  // Every (id, addr) pair of every broker we know — masters AND slaves.
+  // Java sendHeartbeatToAllBroker / unregisterClient iterate the whole
+  // brokerAddrTable; restricting to masters breaks slave-only topologies
+  // (a slave that never received a heartbeat answers pulls with
+  // "subscription not exist").
+  getAllBrokerAddrEntries(): Array<{ brokerName: string; id: number; addr: string }> {
+    const out: Array<{ brokerName: string; id: number; addr: string }> = [];
+    for (const [name, addrs] of this.brokerAddrTable.entries()) {
+      for (const [idStr, addr] of Object.entries(addrs)) {
+        out.push({ brokerName: name, id: parseInt(idStr, 10), addr });
+      }
+    }
+    return out;
+  }
+
   getRouteOfAllBrokers(): TopicRouteData[] {
     return Array.from(this.topicRouteTable.values());
   }
@@ -407,7 +422,11 @@ export class MQClient {
   }
 
   // Parse a send response into a SendResult (mirrors Java _parse_send_response).
-  parseSendResponse(response: RemotingCommand, mq: MessageQueue, brokerAddr: string): SendResult {
+  // Java MQClientAPIImpl.sendMessage: for a single (non-batch) message the
+  // SendResult.msgId is the UNIQ_KEY client id (offsetMsgId keeps the physical
+  // broker id). The trace Pub record and the console join on this.
+  parseSendResponse(response: RemotingCommand, mq: MessageQueue, brokerAddr: string,
+    msg: Message | null = null): SendResult {
     const code = response.code;
     const remark = response.remark;
     const ext = response.extFields || {};
@@ -423,12 +442,16 @@ export class MQClient {
         else if (code === ResponseCode.FLUSH_DISK_TIMEOUT) status = 1;
         else if (code === ResponseCode.FLUSH_SLAVE_TIMEOUT) status = 2;
         else status = 3;
-        const msgId = header.msgId != null ? header.msgId : '';
+        const offsetMsgId = header.msgId != null ? header.msgId : '';
+        const uniqKey = msg != null
+          ? msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+          : null;
+        const msgId = uniqKey != null && String(uniqKey).length > 0 ? String(uniqKey) : offsetMsgId;
         const regionId = ext['MSG_REGION'] != null ? ext['MSG_REGION'] : MixAll.DEFAULT_TRACE_REGION_ID;
         const traceOn = ext['TRACE_ON'] != null ? ext['TRACE_ON'] !== 'false' : true;
         return new SendResult(
           status, msgId, mq, header.queueOffset != null ? header.queueOffset : 0,
-          header.transactionId, msgId, regionId, traceOn, header.recallHandle,
+          header.transactionId, offsetMsgId, regionId, traceOn, header.recallHandle,
         );
       }
       default:
@@ -440,9 +463,10 @@ export class MQClient {
   // NOTE: invokeSync is async — this MUST await it, otherwise parseSendResponse
   // receives a Promise and `response.code` is undefined (surfaced as
   // "CODE: undefined" on every real send).
-  async sendMessage(addr: string, request: RemotingCommand, mq: MessageQueue, timeoutMillis: number): Promise<SendResult> {
+  async sendMessage(addr: string, request: RemotingCommand, mq: MessageQueue, timeoutMillis: number,
+    msg: Message | null = null): Promise<SendResult> {
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
-    return this.parseSendResponse(response, mq, addr);
+    return this.parseSendResponse(response, mq, addr, msg);
   }
 
   // Asynchronous send. sendCallback = (sendResult: SendResult|null, err: Error|null) => void.
@@ -452,6 +476,7 @@ export class MQClient {
     mq: MessageQueue,
     timeoutMillis: number,
     sendCallback: (sendResult: SendResult | null, err: Error | null) => void,
+    msg: Message | null = null,
   ): void {
     this.remotingClient.invokeAsync(addr, request, (response: RemotingCommand | null, err: Error | null) => {
       if (err != null || response == null) {
@@ -459,7 +484,7 @@ export class MQClient {
         return;
       }
       try {
-        sendCallback(this.parseSendResponse(response, mq, addr), null);
+        sendCallback(this.parseSendResponse(response, mq, addr, msg), null);
       } catch (e) {
         sendCallback(null, e as Error);
       }
@@ -522,7 +547,8 @@ export class MQClient {
   }
 
   async unregisterClientAllBrokers(producerGroup: string, consumerGroup: string): Promise<void> {
-    for (const addr of Object.values(this.getAllBrokerAddrs())) {
+    // Java unregisterClient also goes to every broker entry (incl. slaves).
+    for (const { addr } of this.getAllBrokerAddrEntries()) {
       try { await this.unregisterClient(addr, producerGroup, consumerGroup); } catch (e) { /* best effort */ }
     }
   }
@@ -830,9 +856,10 @@ export class MQClient {
   }
 
   private async sendHeartbeatToAllBrokers(): Promise<void> {
-    const addrs = Object.values(this.getAllBrokerAddrs());
-    logger.debug('heartbeat beat to %d broker(s): %j', addrs.length, addrs);
-    for (const addr of addrs) {
+    // Java sends the heartbeat to EVERY broker entry (masters and slaves).
+    const entries = this.getAllBrokerAddrEntries();
+    logger.debug('heartbeat beat to %d broker(s)', entries.length);
+    for (const { addr } of entries) {
       try { await this.sendHeartbeat(addr); } catch (e) { /* best effort */ }
     }
   }
@@ -915,10 +942,12 @@ export class MQClient {
         if (ext['bornHost'] != null) { msg.setBornHost(String(ext['bornHost'])); }
         if (ext['storeHost'] != null) { msg.setStoreHost(String(ext['storeHost'])); }
         msg.putProperty(MessageConst.PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, String(Date.now()));
-        // The broker compresses a reply body exactly like a send: sysFlag says so.
+        // The broker compresses a reply body exactly like a send: sysFlag says
+        // which algorithm — don't assume ZLIB (an LZ4-flagged reply would
+        // otherwise crash the inflate).
         let body = cmd.body != null ? cmd.body : Buffer.alloc(0);
         if (MessageSysFlag.isCompressed(msg.getSysFlag()) && body.length > 0) {
-          body = zlib.inflateSync(body);
+          body = decompressFor(body, MessageSysFlag.getCompressionType(msg.getSysFlag()));
         }
         msg.setBody(body);
         const correlationId = msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID);

@@ -21,6 +21,7 @@ const modules = [
   'src/common/mixAll.ts', 'src/common/sysflag.ts', 'src/common/utilAll.ts',
   'src/common/subscriptionData.ts', 'src/common/topic_config.ts', 'src/common/topic_validator.ts',
   'src/common/recall_message_handle.ts', 'src/common/boundary_type.ts', 'src/common/validators.ts',
+  'src/common/compress.ts',
   'src/client/mq_client.ts', 'src/client/producer.ts', 'src/client/consumer.ts',
   'src/client/pull_consumer.ts', 'src/client/lite_pull_consumer.ts', 'src/client/admin.ts',
   'src/client/allocate.ts', 'src/client/process_queue.ts', 'src/client/offset_store.ts',
@@ -45,7 +46,7 @@ for (const mod of modules) {
 
 // The offline smoke suites.
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
-  'test/java_gap_fill_smoke.ts', 'test/pop_smoke.ts'];
+  'test/java_gap_fill_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts'];
 console.log(`\n== smoke suites (${smokes.length}) ==`);
 for (const smoke of smokes) {
   const r = spawnSync(node, ['--experimental-strip-types', '--no-warnings', path.join(here, smoke)],

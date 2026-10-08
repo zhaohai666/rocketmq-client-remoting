@@ -5,6 +5,7 @@ import zlib from 'node:zlib';
 import { Buffer } from 'node:buffer';
 import { Message, MessageExt, MessageBatch } from './message.ts';
 import { MessageSysFlag } from './sysflag.ts';
+import { compressFor, decompressFor } from './compress.ts';
 import { crc32 } from './utilAll.ts';
 
 const CHARSET = 'utf8';
@@ -122,7 +123,7 @@ export function string2MessageProperties(propertiesStr?: string | null): Record<
   return result;
 }
 
-// ---- compression (ZLIB native; LZ4/ZSTD deliberately unsupported, per cross-port rule) ----
+// ---- compression (ZLIB native; LZ4/ZSTD via common/compress.ts) ----
 function normalizeCompressionType(ct: number): number {
   if (ct === 0) return MessageSysFlag.ZLIB_TYPE;
   return ct;
@@ -131,11 +132,17 @@ class UnsupportedCompressionError extends Error {}
 function _compress(data: Buffer, compressionType: number): Buffer {
   const ct = normalizeCompressionType(compressionType);
   if (ct === MessageSysFlag.ZLIB_TYPE) return zlib.deflateSync(data);
+  if (ct === MessageSysFlag.LZ4_TYPE || ct === MessageSysFlag.ZSTD_TYPE) {
+    return compressFor(data, ct);
+  }
   throw new UnsupportedCompressionError(`unsupported compression type: ${compressionType}`);
 }
 function _decompress(data: Buffer, compressionType: number): Buffer {
   const ct = normalizeCompressionType(compressionType);
   if (ct === MessageSysFlag.ZLIB_TYPE) return zlib.inflateSync(data);
+  if (ct === MessageSysFlag.LZ4_TYPE || ct === MessageSysFlag.ZSTD_TYPE) {
+    return decompressFor(data, ct);
+  }
   throw new UnsupportedCompressionError(`unsupported compression type: ${compressionType}`);
 }
 export function decompressBody(data: Buffer, compressionType: number): Buffer {

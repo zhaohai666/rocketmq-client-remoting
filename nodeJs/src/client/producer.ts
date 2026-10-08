@@ -6,13 +6,14 @@
 //   send() -> _send_default_impl (retry loop) -> _send_with_hooks (SendMessageHook before/after)
 //         -> sendKernelImpl (compress -> set UNIQ_KEY -> CheckForbiddenHook [NOT swallowed]
 //            -> build request -> resolve broker addr -> actual transport via MQClient).
-import zlib from 'node:zlib';
 import { RemotingClient } from '../remoting/client.ts';
 import { RemotingCommand } from '../remoting/remotingCommand.ts';
 import { RequestCode, ResponseCode } from '../remoting/codes.ts';
 import { EndTransactionRequestHeader } from '../remoting/headers.ts';
 import { Message, MessageQueue, MessageBatch, MessageExt } from '../common/message.ts';
 import { MessageSysFlag } from '../common/sysflag.ts';
+import { compressionTypeByName, compressFor } from '../common/compress.ts';
+import { decodeMessageId } from '../common/messageDecoder.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MessageAccessor } from '../common/message_accessor.ts';
 import { MessageType } from '../common/messageType.ts';
@@ -30,12 +31,16 @@ import {
 import { SendResult, TransactionSendResult, SendStatus } from './send_result.ts';
 import { MQClient, TopicPublishInfo } from './mq_client.ts';
 import {
-  CommunicationMode, SendMessageContext, CheckForbiddenContext, hookRegistry,
+  CommunicationMode, SendMessageContext, CheckForbiddenContext, SendMessageHook, hookRegistry,
 } from './hook.ts';
 import { MQFaultStrategy } from './latency.ts';
 import { getOrCreateProduceAccumulator, ProduceAccumulator } from './produce_accumulator.ts';
 import { FairSemaphore } from './backpressure.ts';
 import { injectTraceContext, traceContextEnabledFromEnv } from './traceparent.ts';
+import {
+  TraceContext, TraceBean, TraceType, TraceMsgType,
+} from './trace_context.ts';
+import type { AsyncTraceDispatcher } from './trace_dispatcher.ts';
 import {
   createCorrelationId, createReplyMessage, isReplyMessage, RequestCallback,
   REQUEST_FUTURE_HOLDER, getReplyTopic, RequestResponseFuture,
@@ -115,6 +120,12 @@ export class DefaultMQProducer {
   heartbeatIntervalMillis: number;
   autoBatch: boolean;
   enableTrace: boolean;
+  // Custom trace topic (Java setTraceTopicName); null = RMQ_SYS_TRACE_TOPIC.
+  traceTopic: string | null;
+  // Compression algorithm for oversized bodies: MessageSysFlag type value
+  // (1=LZ4, 2=ZSTD, 3=ZLIB). Default ZLIB for backward compatibility; Java 5.x
+  // defaults to LZ4. Select via setCompressType('ZLIB'|'LZ4'|'ZSTD').
+  compressType: number;
   // Java DefaultMQProducer.sendMessageWithVIPChannel (default false): send
   // rpcs target the broker's VIP port (listen port - 2).
   sendMessageWithVIPChannel: boolean;
@@ -126,6 +137,10 @@ export class DefaultMQProducer {
   client: MQClient | null;
   mqFaultStrategy: MQFaultStrategy;
   producerClientId: string;
+  // Message-trace dispatcher (Java AsyncTraceDispatcher) — created in start()
+  // only when enableTrace is on, torn down in shutdown().
+  _traceDispatcher: AsyncTraceDispatcher | null;
+  private _traceHook: SendMessageHook | null;
   private _accumulator: ProduceAccumulator | null;
   // Async-send backpressure (Java DefaultMQProducer backPressureForAsyncSendNum
   // / Size + the two fair semaphores built in initAsyncConfig).
@@ -152,13 +167,16 @@ export class DefaultMQProducer {
     this.heartbeatIntervalMillis = 30 * 1000;
     this.autoBatch = false;
     this.enableTrace = false;
+    this.traceTopic = null;
+    this.compressType = MessageSysFlag.ZLIB_TYPE;
     this.sendMessageWithVIPChannel = false;
     this.enableTraceContext = traceContextEnabledFromEnv();
 
     this.client = null;
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
     this.producerClientId = this._buildClientId();
-    this._accumulator = null;
+    this._traceDispatcher = null;
+    this._traceHook = null;    this._accumulator = null;
     this.backPressureForAsyncSendNum = 1000;
     this.backPressureForAsyncSendSize = 100 * 1024 * 1024;
     this._semaphoreAsyncSendNum = new FairSemaphore(this.backPressureForAsyncSendNum);
@@ -196,6 +214,14 @@ export class DefaultMQProducer {
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
+  setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
+  // compressType: 'ZLIB' | 'LZ4' | 'ZSTD' (Java DefaultMQProducer.setCompressType)
+  // or the raw MessageSysFlag type value (1/2/3).
+  setCompressType(compressType: string | number): this {
+    this.compressType = compressionTypeByName(compressType);
+    return this;
+  }
+  setCompressMsgBodyOverHowmuch(howmuch: number): this { this.compressMsgBodyOverHowmuch = howmuch; return this; }
   setSendMessageWithVIPChannel(enable: boolean): this { this.sendMessageWithVIPChannel = enable; return this; }
   isSendMessageWithVIPChannel(): boolean { return this.sendMessageWithVIPChannel; }
   setEnableTraceContext(enable: boolean): this { this.enableTraceContext = enable; return this; }
@@ -235,7 +261,7 @@ export class DefaultMQProducer {
     this._semaphoreAsyncSendNum.release();
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.producerGroup == null || !String(this.producerGroup).trim()) {
       throw new MQClientException('producer group is blank');
     }
@@ -263,11 +289,42 @@ export class DefaultMQProducer {
       });
       this._accumulator.start();
     }
+
+    // Message trace (Java DefaultMQProducerImpl.initTraceDispatcher + the
+    // DefaultMQProducer constructor registering SendMessageTraceHookImpl):
+    // without this wiring enableTrace is a silent no-op on the produce side.
+    if (this.enableTrace) {
+      try {
+        const { AsyncTraceDispatcher } = await import('./trace_dispatcher.ts');
+        const { SendMessageTraceHookImpl } = await import('./trace_hook.ts');
+        const dispatcher = new AsyncTraceDispatcher(
+          this.producerGroup, 'PRODUCER', 10, this.traceTopic || undefined);
+        dispatcher.setHostProducer(this);
+        this._traceDispatcher = dispatcher;
+        this._traceHook = new SendMessageTraceHookImpl(dispatcher);
+        hookRegistry.registerSendMessageHook(this._traceHook);
+        await dispatcher.start(this.namesrvAddr || undefined);
+      } catch (e) {
+        logger.warn('trace dispatcher start failed (trace disabled): %s', (e as Error).message);
+        this._traceDispatcher = null;
+        this._traceHook = null;
+      }
+    }
     logger.info(`producer ${this.producerGroup} started, clientId=${clientId}`);
   }
 
   shutdown(): void {
     if (this._accumulator != null) this._accumulator.stop();
+    if (this._traceHook != null) {
+      const idx = hookRegistry.sendMessageHooks.indexOf(this._traceHook);
+      if (idx >= 0) hookRegistry.sendMessageHooks.splice(idx, 1);
+      this._traceHook = null;
+    }
+    if (this._traceDispatcher != null) {
+      const d = this._traceDispatcher;
+      this._traceDispatcher = null;
+      void d.shutdown().catch(() => { /* best effort */ });
+    }
     if (this.client != null) {
       this.client.unregisterProducer(this.producerGroup);
       this.client.shutdown();
@@ -275,16 +332,16 @@ export class DefaultMQProducer {
     this.client = null;
   }
 
-  // ---- compression (ZLIB only; degrade on failure, never throw) ----
+  // ---- compression (algorithm selectable; degrade on failure, never throw) ----
   tryToCompressMessage(msg: Message): boolean {
     const body = msg.getBody();
     if (body == null || body.length < this.compressMsgBodyOverHowmuch) return false;
     if (MessageSysFlag.isCompressed((msg as any)._sysFlag != null ? (msg as any)._sysFlag : 0)) return false;
     try {
-      const compressed = zlib.deflateSync(body);
+      const compressed = compressFor(body, this.compressType);
       (msg as any)._sysFlag = MessageSysFlag.setCompressionType(
         ((msg as any)._sysFlag != null ? (msg as any)._sysFlag : 0) | MessageSysFlag.COMPRESSED_FLAG,
-        MessageSysFlag.ZLIB_TYPE,
+        this.compressType,
       );
       msg.setBody(compressed);
       return true;
@@ -393,11 +450,11 @@ export class DefaultMQProducer {
     }
 
     if (communicationMode === CommunicationMode.SYNC) {
-      return this.client.sendMessage(addr, request, mq, this.sendMsgTimeout);
+      return this.client.sendMessage(addr, request, mq, this.sendMsgTimeout, msg);
     } else if (communicationMode === CommunicationMode.ASYNC) {
       this.client.sendMessageAsync(addr, request, mq, this.sendMsgTimeout, (sr, err) => {
         if (sendCallback) sendCallback(sr, err);
-      });
+      }, msg);
       return null;
     } else {
       this.client.sendMessageOneway(addr, request);
@@ -414,7 +471,12 @@ export class DefaultMQProducer {
     tpInfo: TopicPublishInfo,
   ): Promise<SendResult | null> {
     const ctx = new SendMessageContext(this.producerGroup, msg, mq, communicationMode, this.client!.publishAddrFor(mq));
-    for (const hook of hookRegistry.sendMessageHooks) hook.sendMessageBefore(ctx);
+    // Java registers SendMessageHooks per producer; node's registry is global.
+    // The inner trace producer opts out (_skipSendHooks) so trace-topic writes
+    // are not themselves traced (Java parity).
+    const sendHooks: SendMessageHook[] = (this as any)._skipSendHooks
+      ? [] : hookRegistry.sendMessageHooks;
+    for (const hook of sendHooks) hook.sendMessageBefore(ctx);
     let sendResult: SendResult | null = null;
     try {
       sendResult = await this.sendKernelImpl(msg, mq, communicationMode, sendCallback, tpInfo);
@@ -423,10 +485,10 @@ export class DefaultMQProducer {
     } catch (e) {
       ctx.exception = e as Error;
       ctx.sendResult = null;
-      for (const hook of hookRegistry.sendMessageHooks) hook.sendMessageAfter(ctx);
+      for (const hook of sendHooks) hook.sendMessageAfter(ctx);
       throw e;
     }
-    for (const hook of hookRegistry.sendMessageHooks) hook.sendMessageAfter(ctx);
+    for (const hook of sendHooks) hook.sendMessageAfter(ctx);
     return sendResult;
   }
 
@@ -569,8 +631,17 @@ export class DefaultMQProducer {
     MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.producerGroup);
     const sendResult = await this._sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeoutMillis);
     if (sendResult == null) throw new MQClientException('send half message failed');
-    const localState = listener.executeLocalTransaction(msg, arg);
-    await this._endTransaction(sendResult, localState);
+    // Java DefaultMQProducerImpl.sendMessageInTransaction: a listener exception
+    // becomes ROLLBACK_MESSAGE (it never escapes); the half message must not
+    // be left for the broker's check thread on a local failure we already know.
+    let localState: number;
+    try {
+      localState = listener.executeLocalTransaction(msg, arg);
+    } catch (e) {
+      logger.warn('executeLocalTransaction raised, rolling back half message: %s', (e as Error).message);
+      localState = LocalTransactionState.ROLLBACK_MESSAGE;
+    }
+    await this._endTransaction(sendResult, localState, msg);
     const tsr = new TransactionSendResult(
       sendResult.sendStatus, sendResult.msgId, sendResult.messageQueue, sendResult.queueOffset,
       sendResult.transactionId, sendResult.offsetMsgId, sendResult.regionId, sendResult.traceOn, sendResult.recallHandle,
@@ -579,22 +650,68 @@ export class DefaultMQProducer {
     return tsr;
   }
 
-  private async _endTransaction(sendResult: SendResult, localTransactionState: number): Promise<void> {
+  private async _endTransaction(sendResult: SendResult, localTransactionState: number,
+    msg: Message | null = null): Promise<void> {
     if (this.client == null) return;
     const brokerAddr = this.client.publishAddrFor(sendResult.messageQueue!);
     if (brokerAddr == null) return;
     const header = new EndTransactionRequestHeader();
     header.producerGroup = this.producerGroup;
     header.transactionId = sendResult.transactionId != null ? sendResult.transactionId : sendResult.msgId;
-    header.commitOrRollback = localTransactionState;
+    // ⚠ commitOrRollback is a MessageSysFlag transaction TYPE on the wire
+    // (NOT=0 / COMMIT=8 / ROLLBACK=12), NOT the LocalTransactionState ordinal.
+    // Sending the raw ordinal (COMMIT_MESSAGE=0) makes the broker read
+    // TRANSACTION_NOT_TYPE — the half message is never committed and stays
+    // invisible until the (much later) check-back. Java maps the enum.
+    // ⚠ offset semantics (Java endTransaction, verified against 5.x):
+    //   - tranStateTableOffset = sendResult.queueOffset — the half message's
+    //     offset in RMQ_SYS_TRANS_HALF_TOPIC's queue. @CFNotNull on the wire;
+    //     the broker's checkPrepareMessage compares it to the half msg's
+    //     queueOffset and REJECTS the commit on mismatch/null.
+    //   - commitLogOffset = the PHYSICAL commitlog offset, decoded from the
+    //     offsetMsgId (falling back to msgId) — NOT queueOffset (the old code
+    //     sent the half-queue offset here, so every producer-side COMMIT was
+    //     rejected with "The commit log offset wrong" and the message stayed
+    //     invisible until the 30s check-back).
+    //   - topic is compared to PROPERTY_REAL_TOPIC in 5.x checkPrepareMessage.
+    if (localTransactionState === LocalTransactionState.COMMIT_MESSAGE) {
+      header.commitOrRollback = MessageSysFlag.TRANSACTION_COMMIT_TYPE;
+    } else if (localTransactionState === LocalTransactionState.ROLLBACK_MESSAGE) {
+      header.commitOrRollback = MessageSysFlag.TRANSACTION_ROLLBACK_TYPE;
+    } else {
+      header.commitOrRollback = MessageSysFlag.TRANSACTION_NOT_TYPE;
+    }
+    header.tranStateTableOffset = sendResult.queueOffset;
+    try {
+      const decoded = decodeMessageId(sendResult.offsetMsgId != null
+        ? sendResult.offsetMsgId : sendResult.msgId);
+      header.commitLogOffset = decoded.offset;
+    } catch (e) {
+      logger.warn(`decode offsetMsgId failed: ${(e as Error).message}`);
+      header.commitLogOffset = sendResult.queueOffset;
+    }
+    header.topic = msg != null ? msg.getTopic() : null;
     header.fromTransactionCheck = false;
-    header.msgId = sendResult.msgId;
+    const uniqKey = msg != null
+      ? msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+      : null;
+    header.msgId = uniqKey != null ? String(uniqKey) : sendResult.msgId;
     header.bname = sendResult.messageQueue != null ? sendResult.messageQueue.getBrokerName() : null;
     const request = RemotingCommand.createRequestCommand(RequestCode.END_TRANSACTION, header);
     try {
       this.client.remotingClient.invokeOneway(brokerAddr, request);
     } catch (e) {
       logger.warn(`end transaction failed: ${(e as Error).message}`);
+    }
+    // Trace: Java fires the EndTransactionTraceHook from endTransaction — the
+    // EndTransaction record of a transaction message.
+    if (this._traceDispatcher != null) {
+      try {
+        this._traceDispatcher.appendEndTransaction(
+          this.producerGroup, msg != null ? msg.getTopic() : '',
+          header.msgId || '', header.transactionId, localTransactionState,
+          false, brokerAddr);
+      } catch (e) { /* trace never breaks the data path */ }
     }
   }
 
@@ -669,11 +786,14 @@ export class DefaultMQProducer {
     const route = this.client.getTopicRouteData(key);
     const brokerDatas: any[] = (route as any)?.brokerDatas || [];
     let sent = false;
+    // Java DefaultMQAdminExtImpl.createAndUpdateTopicConfig sends the config
+    // to EVERY broker id in the route (master AND slaves) — a slave that never
+    // receives it answers pull with "topic not exist", which kills slave-only
+    // consumption. Sending master-only was a node-port gap.
     for (const bd of brokerDatas) {
       const addrs: Record<string, string> = bd.brokerAddrs || {};
-      // selectBrokerAddr: master (brokerId 0) preferred, else any.
-      const addr = addrs['0'] != null ? addrs['0'] : Object.values(addrs)[0];
-      if (addr != null) {
+      for (const addr of Object.values(addrs)) {
+        if (addr == null) continue;
         const resp = await this.client.createTopicInBroker(addr, topic, queueNums);
         if (resp.code !== ResponseCode.SUCCESS) {
           throw new MQClientException(`create topic ${topic} failed on ${addr}: code=${resp.code} remark=${resp.remark || ''}`);

@@ -38,7 +38,7 @@ import {
   GetConsumerListByGroupResponseBody, GroupList, KVTable, ProducerConnection,
   ResetOffsetBody, TopicConfig, TopicConfigSerializeWrapper, TopicList,
   TopicFilterType, DEFAULT_PERM, messageQueueKey,
-  QueryMsgResponseBody, ConsumeMessageDirectlyResult,
+  ConsumeMessageDirectlyResult,
 } from '../remoting/bodies.ts';
 import { TopicStatsTable } from '../remoting/admin_body.ts';
 import { RemotingSerializable } from '../remoting/serialize.ts';
@@ -46,7 +46,8 @@ import { MixAll } from '../common/mixAll.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { BoundaryType } from '../common/boundary_type.ts';
-import { decodeMessage, decodeMessageId } from '../common/messageDecoder.ts';
+import { decodeMessage, decodeMessageId, decodeMessages } from '../common/messageDecoder.ts';
+import { QueryResult } from '../remoting/bodies.ts';
 import { getLogger } from '../logging.ts';
 import { MQClientException, MQBrokerException } from '../remoting/exception.ts';
 import { MQClient } from './mq_client.ts';
@@ -1226,39 +1227,97 @@ export class DefaultMQAdminExt {
 
   // ---------------- Message query (QUERY_MESSAGE / VIEW_MESSAGE_BY_ID) ----------------
 
-  // Java queryMessage → QUERY_MESSAGE(12) against one broker's index. The body
-  // is a QueryMsgResponseBody: the matched ids (the broker answers ids only).
-  // indexType: K (default) / U (uniq key); mirrors Java QueryMessageRequestHeader.
+  // Java queryMessage → QUERY_MESSAGE(12) against one broker's index.
+  //
+  // ⚠ WIRE: the response body is NOT JSON — the broker streams the matched
+  // messages as CONCATENATED 17-segment stored records (Java decodes with
+  // MessageDecoder.decodes). Parsing it as RemotingSerializable JSON was the
+  // bug behind "query by key always fails". indexType: K (default) / U (uniq
+  // key); 'U' additionally sets MixAll.UNIQUE_MSG_QUERY_FLAG like Java's
+  // unique-key queries.
   async queryMessage(brokerAddr: string, topic: string, key: string,
     maxNum: number = 32, beginTimestamp = 0, endTimestamp = 0,
-    indexType: string = 'K'): Promise<QueryMsgResponseBody> {
-    const response = await this._invokeBroker(brokerAddr, RequestCode.QUERY_MESSAGE, adminExt({
+    indexType: string = 'K'): Promise<QueryResult> {
+    // Java passes begin=0 → Long.MAX as "unbounded" (DefaultMQAdminExtImpl /
+    // IndexFile.isTimeMatched). The broker matches index FILES against the
+    // [begin, end] time window — end=0 matches NOTHING (every real index file
+    // has a start timestamp > 0), which made every query answer
+    // QUERY_NOT_FOUND. Normalise: begin<0/0 → unbounded past, end<=0 → now.
+    const begin = beginTimestamp > 0 ? beginTimestamp : 0;
+    // Long.MAX_VALUE as a STRING — as a JS Number it rounds up to 2^63 and
+    // the broker's Long.parseLong rejects it, leaving the header field null
+    // (NPE inside QueryMessageProcessor).
+    const end = endTimestamp > 0 ? endTimestamp : '9223372036854775807';
+    const ext: Record<string, string> = {
       topic,
       key,
       maxNum: String(maxNum),
-      beginTimestamp: String(beginTimestamp),
-      endTimestamp: String(endTimestamp),
+      beginTimestamp: String(begin),
+      endTimestamp: String(end),
       indexType,
-    }));
-    return QueryMsgResponseBody.decode(response.body);
+    };
+    if (indexType === MessageConst.INDEX_UNIQUE_TYPE) {
+      // Java MixAll.UNIQUE_MSG_QUERY_FLAG — forces the U-index path and the
+      // broker's defaultQueryMaxNum on the server side.
+      ext['_UNIQUE_KEY_QUERY'] = 'true';
+    }
+    const response = await this._invokeBroker(brokerAddr, RequestCode.QUERY_MESSAGE, ext);
+    const result = new QueryResult();
+    // Java QueryMessageResponseHeader rides the extFields.
+    const extResp = response.extFields || {};
+    if (extResp['indexLastUpdateTimestamp'] != null) {
+      result.indexLastUpdateTimestamp = parseInt(extResp['indexLastUpdateTimestamp'], 10);
+    }
+    if (response.body != null && response.body.length > 0) {
+      result.messageList = decodeMessages(response.body, true);
+    }
+    return result;
   }
 
-  async queryMessageByKey(brokerAddr: string, topic: string, key: string, maxNum = 32): Promise<QueryMsgResponseBody> {
+  async queryMessageByKey(brokerAddr: string, topic: string, key: string, maxNum = 32): Promise<QueryResult> {
     return this.queryMessage(brokerAddr, topic, key, maxNum);
   }
 
-  // Java queryMessage(topic, uniqKey): the U-index query, then each hit is
-  // fetched through viewMessage. Returns the decoded MessageExt list.
+  // Java queryMessage(topic, uniqKey): the U-index query. The stored records
+  // are already in the response body, so no per-hit viewMessage round trip is
+  // needed; Java keeps only the first hit for this shape.
   async queryMessageByUniqKey(brokerAddr: string, topic: string, uniqKey: string,
-    maxNum = 32): Promise<any[]> {
-    const ids = await this.queryMessage(brokerAddr, topic, uniqKey, maxNum, 0, 0, 'U');
-    const out: any[] = [];
-    for (const msgId of ids.msgIdList) {
-      try {
-        out.push(await this.viewMessage(topic, msgId));
-      } catch (e) { /* a pruned index hit is skipped, like Java's viewMessage loop */ }
+    maxNum = 32): Promise<MessageExt | null> {
+    const result = await this.queryMessage(brokerAddr, topic, uniqKey, maxNum, 0, 0, 'U');
+    return result.messageList.length > 0 ? result.messageList[0] : null;
+  }
+
+  // Java MQAdminImpl.queryMessage resolves the topic route and queries EVERY
+  // broker (selectBrokerAddr of each BrokerData: master preferred, else the
+  // lowest id — a slave-only topology must still be queryable), merging the
+  // hits. QUERY_NOT_FOUND from one broker is not an error (Java logs and
+  // continues).
+  async queryMessageFromRoute(topic: string, key: string,
+    maxNum: number = 32, beginTimestamp = 0, endTimestamp = 0,
+    indexType: string = 'K'): Promise<QueryResult> {
+    const client = this._requireClient();
+    if (client.getTopicRouteData(topic) == null) {
+      await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
     }
-    return out;
+    const route = client.getTopicRouteData(topic);
+    const merged = new QueryResult();
+    if (route == null) return merged;
+    for (const bd of route.brokerDatas || []) {
+      const addrs: Record<string, string> = bd.brokerAddrs || {};
+      const addr = addrs['0'] != null ? addrs['0'] : Object.values(addrs)[0];
+      if (addr == null) continue;
+      try {
+        const one = await this.queryMessage(addr, topic, key, maxNum, beginTimestamp, endTimestamp, indexType);
+        merged.messageList.push(...one.messageList);
+        if (one.indexLastUpdateTimestamp > merged.indexLastUpdateTimestamp) {
+          merged.indexLastUpdateTimestamp = one.indexLastUpdateTimestamp;
+        }
+      } catch (e) {
+        if (e instanceof MQBrokerException && e.responseCode === ResponseCode.QUERY_NOT_FOUND) continue;
+        throw e;
+      }
+    }
+    return merged;
   }
 
   // Java viewMessage → VIEW_MESSAGE_BY_ID(33) sent STRAIGHT to the broker
