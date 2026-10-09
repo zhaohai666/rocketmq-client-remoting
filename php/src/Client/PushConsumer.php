@@ -32,6 +32,10 @@ use RocketMQ\Remoting\Protocol\ConsumerData;
 use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\Exceptions\MQBrokerException;
 use RocketMQ\Client\Exceptions\RemotingTimeoutException;
+// consumerRunningInfo（307）用 message_queue_key 拼 mqTable/mqPopTable 的键。
+// PHP 的函数调用不带前缀时先查**当前命名空间**，漏掉这行不是"写法不统一"而是
+// 运行到这里直接 Uncaught Error —— 整份运行信息取不出来，控制台/诊断链路全瞎。
+use function RocketMQ\Remoting\Protocol\message_queue_key;
 
 // 本文件用到的模块级辅助函数随 ConsumerSupport.php 的类一起被 autoload；
 // 为防"只调函数不碰类"的调用次序，这里显式保证文件已加载。
@@ -81,6 +85,13 @@ final class DefaultMQPushConsumer
     public ?string $unitName = null;
     public bool $unitMode = false;
     public bool $enableStreamRequestType = false;
+    /**
+     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
+     * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
+     * 这里**不**改任何资源名。见 NamespaceRpcHook。
+     */
+    public string $namespaceV2 = '';
     /** @var 'CLUSTERING'|'BROADCASTING' */
     public string $messageModel = MessageModel::CLUSTERING;
     public string $consumeFromWhere = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
@@ -151,6 +162,12 @@ final class DefaultMQPushConsumer
     private int $flowControlTriggered = 0;
     /** @var array<string,float> 每队列最近一次发起拉取/弹出的时刻（秒） */
     private array $lastPullTable = [];
+    /**
+     * 对应 Java DefaultMQPushConsumerImpl 的 `private volatile boolean pause = false`：
+     * **整个消费者**级别的挂起开关（suspend()/resume() 翻动），与逐队列的空闲退避
+     * （idleUntil）、顺序挂起重试（suspendedUntil）都不是同一回事。
+     */
+    private bool $paused = false;
     /** @var array<string,int> MessageQueue key → 下一轮拉取应选的 brokerId */
     private array $pullFromWhichNode = [];
     /** @var array<string,MessageQueue> 当前分给本实例的队列集（key => mq） */
@@ -252,6 +269,25 @@ final class DefaultMQPushConsumer
     public function setUnitMode(bool $unitMode): void
     {
         $this->unitMode = $unitMode;
+    }
+
+    /**
+     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
+     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
+     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     */
+    public function setNamespaceV2(string $namespaceV2): void
+    {
+        $this->namespaceV2 = $namespaceV2;
+        if ($this->mqClient !== null) {
+            $this->mqClient->namespaceV2 = $namespaceV2;
+        }
+    }
+
+    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    public function getNamespaceV2(): string
+    {
+        return $this->namespaceV2;
     }
 
     public function setMessageModel(string $model): void
@@ -522,6 +558,7 @@ final class DefaultMQPushConsumer
             $this->nameServerAddrs,
             tlsEnable: $this->tlsEnable,
             enableStreamRequestType: $this->enableStreamRequestType,
+            namespaceV2: $this->namespaceV2,
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
@@ -587,6 +624,8 @@ final class DefaultMQPushConsumer
                     $this->rpcHook,
                 );
                 $dispatcher->setHostConsumer($this);
+                // 对应 Java DefaultMQPushConsumer.start:769：轨迹 producer 也得带 namespaceV2。
+                $dispatcher->setNamespaceV2($this->namespaceV2);
                 $this->traceDispatcher = $dispatcher;
                 $this->registerConsumeMessageHook(new ConsumeMessageTraceHook($dispatcher));
             } catch (\Throwable $e) {
@@ -1148,6 +1187,39 @@ final class DefaultMQPushConsumer
         $this->rebalanceNow = true;
     }
 
+    /**
+     * 挂起本消费者（对应 Java DefaultMQPushConsumer#suspend:890 → Impl#suspend:1312-1315）。
+     *
+     * 只翻一个布尔：pullOnce/popOnce 在**盖完时刻**之后看到它就返回，不再发起报文，
+     * 但队列、缓冲、位点游标一律不动，所以挂起 ≠ 停摆（PULL_MAX_IDLE_TIME 判据不会命中），
+     * rebalance 也就不会把分配摘走。已拉到本地的消息照常消费。
+     *
+     * PHP 适配：Java 的循环线程在这里 sleep 1s（PULL_TIME_DELAY_WHEN_SUSPEND）后重试；
+     * PHP 没有常驻循环，节奏由调用方的 tick 决定 —— 下一次 tick 仍然会盖章并跳过拉取。
+     */
+    public function suspend(): void
+    {
+        $this->paused = true;
+        Logger::info("suspend this consumer, {$this->consumerGroup}");
+    }
+
+    /**
+     * 解除挂起（对应 Java Impl#resume:741-745：置回 false 并立刻 doRebalance）。
+     * 挂起期间可能有队列增减没被处理，所以 Java 主动叫醒一次重平衡。
+     */
+    public function resume(): void
+    {
+        $this->paused = false;
+        $this->rebalanceImmediately();
+        Logger::info("resume this consumer, {$this->consumerGroup}");
+    }
+
+    /** 当前是否处于挂起态（对应 Java DefaultMQPushConsumer#isPause:902）。 */
+    public function isPaused(): bool
+    {
+        return $this->paused;
+    }
+
     // ---------------- 拉取（PHP：tick 内的短轮询轮） ----------------
 
     /** 一轮拉取：对每条已分配队列执行至多 maxPullsPerQueuePerTick 次短轮询。 */
@@ -1182,6 +1254,16 @@ final class DefaultMQPushConsumer
         $client = $this->requireClient();
         // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖时刻。
         $this->lastPullTable[$key] = microtime(true);
+        // Java :263-266 的挂起闸门（suspend()/resume()）。
+        // ⚠ 顺序要紧：闸门必须落在**盖章之后**。放前面的话，一个只是被 suspend() 暂停、
+        // 并没有真死的消费者会因为超过 PULL_MAX_IDLE_TIME 没发起拉取，被停摆判据
+        // （pullStalled / Java ProcessQueue.isPullExpired）判成死循环，rebalance
+        // 于是把分配整个摘掉重建 —— 表现是"挂起两分钟，恢复后位点重投一遍"。
+        // PHP 适配：Java 在这里等 PULL_TIME_DELAY_WHEN_SUSPEND（1s）再重新入队，
+        // 这里直接返回 false，节奏交给调用方的 tick。
+        if ($this->paused) {
+            return false;
+        }
         $sub = $this->subscriptionData[$mq->topic] ?? null;
         if ($sub === null) {
             return false;
@@ -2661,6 +2743,12 @@ final class DefaultMQPushConsumer
         $now = microtime(true);
         $this->lastPullTable[$key] = $now;
         $pq->lastPopTimestamp = $now;
+        // Java popMessage:518-521：POP 模式读同一个挂起布尔，且同样落在盖章之后
+        // （理由见 pullOnce）。挂起期间继续盖章，队列才不会被撤、在途批次才不会被丢给
+        // broker 的 revive 重投。
+        if ($this->paused) {
+            return false;
+        }
         $sub = $this->subscriptionData[$mq->topic] ?? null;
         if ($sub === null) {
             return false;

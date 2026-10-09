@@ -271,6 +271,14 @@ def _wait_attempts(client: _FakeAsyncClient, n: int, timeout: float = 5.0) -> No
         time.sleep(0.005)
 
 
+def _wait_num_permits(p: DefaultMQProducer, want: int, timeout: float = 5.0) -> None:
+    """条数许可是回调线程里归还的：队列里那些没人等回调的笔得轮询到有界超时为止。"""
+    deadline = time.monotonic() + timeout
+    while p.get_semaphore_async_send_num_available_permits() != want and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert p.get_semaphore_async_send_num_available_permits() == want, "条数许可没还齐"
+
+
 # ---------------------------------------------------------------- 调用方不阻塞
 def test_send_async_returns_before_the_request_is_issued():
     """Java：任务只是 submit 到 asyncSenderExecutor，调用方立刻返回。"""
@@ -1014,7 +1022,8 @@ def test_queue_full_runs_inline_when_backpressure_is_on():
     _wait_done(running)
     _wait_done(inline)
     assert _client(p).attempts_count >= 3
-    assert p.get_semaphore_async_send_num_available_permits() == 10
+    # 第二笔的回调没人等，许可归还落在 worker 线程上：轮询而不是立刻断言
+    _wait_num_permits(p, 10)
 
 
 def test_batch_async_charges_the_sum_of_body_lengths():

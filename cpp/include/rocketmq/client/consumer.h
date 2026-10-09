@@ -187,6 +187,13 @@ public:
     }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
+    // Java DefaultMQPushConsumer.suspend/resume（:890/:898）→ Impl.suspend/resume
+    // （DefaultMQPushConsumerImpl:1312/:741）：suspend 置 pause 标志 —— pull/pop 循环
+    // 见暂停标志就延后 1s 再试（PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000），已拉到的
+    // 消息继续消费，位点不回退；resume 清标志并立即 doRebalance()。
+    void suspend() { paused_.store(true); }
+    void resume();
+    bool isPaused() const { return paused_.load(); }
     // 队列分配策略（对应 Java DefaultMQPushConsumer.setAllocateMessageQueueStrategy）。
     // 与 Java 同款：setter 允许传 nullptr，由 start() 的 checkConfig 拒绝
     //（Java DefaultMQPushConsumerImpl.checkConfig:1067 "allocateMessageQueueStrategy is null"）。
@@ -314,6 +321,13 @@ public:
     // 命名空间（对应 Java DefaultMQPushConsumer.setNamespace）：非空时把 topic / group
     // 套上 "ns%" 前缀再与 broker 交互（对齐 Java start() 里对 consumerGroup 的包装）。
     void setNamespace(const std::string& ns) { namespace_ = ns; }
+    const std::string& namespaceOf() const { return namespace_; }
+    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`）：非空时 NamespaceRpcHook 给
+    // **每笔请求**加 `nsd=true` / `ns=<namespaceV2>`，由 broker 侧解析实例 —— 与上面的
+    // setNamespace（客户端改写 "ns%topic"）是两套机制。链序照 Java `MQClientAPIImpl:329`：
+    // 装在 ACL 签名**之前**，`nsd`/`ns` 因此在签名内容之内（见 composeRequestHooks）。
+    void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
+    const std::string& namespaceV2() const { return namespaceV2_; }
 
     // ---------------- ACL 鉴权（对应 Java DefaultMQPushConsumer(rpcHook)）----------------
     // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance。
@@ -747,6 +761,8 @@ private:
     // （DefaultMQPushConsumer 构造时传入）。默认 AllocateMessageQueueAveragely。
     std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_;
     std::string namespace_;
+    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
+    std::string namespaceV2_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
     std::shared_ptr<RPCHook> rpcHook_;
     std::string instanceName_ = "DEFAULT";
@@ -854,6 +870,8 @@ private:
     std::unique_ptr<MQClientInstance> mqClient_;
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_{false};
+    // Java DefaultMQPushConsumerImpl.pause（volatile boolean，默认 false）
+    std::atomic<bool> paused_{false};
     std::map<std::string, std::thread> pullThreads_;
     // 每个队列当前拉取线程的「归属凭据」：在**起线程之前**登记，线程每轮自查
     // （见 ownsQueue）。std::thread 一构造就开跑，没法像 Python/C# 那样「先入表

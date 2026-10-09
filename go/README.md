@@ -1,5 +1,7 @@
 # rocketmq-client-remoting (Go)
 
+> 中文 ｜ [English](README.en.md)
+
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
 适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / C# / Rust 实现逐项对齐。
 **真机联调工具目前 9 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
@@ -24,7 +26,8 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 协议层 | `RemotingCommand` 帧编解码；`CommandCustomHeader` 家族（含 V2 单字母短键 a..n）；JSON 与 RocketMQ 二进制双序列化；17 段存储格式 + 6 段批量格式 |
 | 传输层 | 惰性建连 + 复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时、重连、GO_AWAY(1500)、连接断开时在途请求立即判死、broker 主动请求派发、TLS（`crypto/tls`） |
 | 发送 | 同步 / 定点 / 批量 / 单向 / 队列选择器 / 异步（真内核 + 背压信号量 + 有界队列）/ 事务消息（两阶段 + broker 回查 + 单工 check 线程）/ 定时消息撤回（recallMessage 370）/ Request-Reply |
-| 消费 | Push Consumer（长轮询 + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 + OFFSET_ILLEGAL 冻结重建 + 220 重置位点 + **POP 模式**）、Pull Consumer（调用方持有游标 + 长轮询）、Lite Pull Consumer（**双游标引擎**：拉取游标 / 消费游标 / 内存提交表，361 + LITE 位） |
+| 消费 | Push Consumer（长轮询 + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 + OFFSET_ILLEGAL 冻结重建 + 220 重置位点 + **POP 模式**）、Pull Consumer（调用方持有游标 + 长轮询；`FetchSubscribeMessageQueues` 给整个 topic，`FetchMessageQueuesInBalance` 只给本实例应得的那份）、Lite Pull Consumer（**双游标引擎**：拉取游标 / 消费游标 / 内存提交表，361 + LITE 位） |
+| 命名空间 | 两套彼此独立：`Namespace`（客户端本地资源名前缀 `%%ns%%res`，`common/namespace.go`，收发 / 心跳 / 位点全线包装与还原）与 `NamespaceV2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`；钩子顺序 Namespace → Stream → ACL，故 `ns`/`ReqT` 都在 ACL 签名内容里）。生产者 / 三种消费者 / 管理端都现读 `NamespaceV2` |
 | 消费侧应答 | `GET_CONSUMER_RUNNING_INFO(307)`（三层属性 + subscriptionSet + mqTable/mqPopTable 互斥 + statusTable）、`CONSUME_MESSAGE_DIRECTLY(309)`（并发/顺序两套判定 + panic → CR_THROW_EXCEPTION）、`CONSUMER_SEND_MSG_BACK(36)`、`GET_CONSUMER_STATUS_FROM_CLIENT(221)`、`RESET_CONSUMER_CLIENT_OFFSET(220)` |
 | 消费侧统计 | `ConsumerStatsManager`：五组 StatsItemSet（CONSUME_OK/FAILED_TPS、CONSUME_RT、PULL_TPS/RT），累计 + 两级采样链，快照是**差分窗口**；307 的 statusTable 就是它 |
 | 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动；NEARBY 的 resolver 给出空机房时通过 `AllocateErrReporter` 上报，重平衡保留现有分配（对齐 Java 异常中止语义） |
@@ -34,12 +37,18 @@ Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python �
 | 离线自检 | `examples/selfcheck`：**不依赖集群**的协议层自检 10 项（JSON / 二进制双帧回环、`clientID` 键拼写、V2 单字母短键集、17 段消息回环含派生 msgId、magic-v2 超长 topic 手工夹具、6 段批量、Crc32 向量、ACL 签名注入） |
 | 校验门 | `Validators` / `TopicValidator`：组名 / topic 校验在 `start()` 建客户端实例**之前**本地跑完，失败不碰网络 |
 
-**与其它四个端口的刻意差异 —— 压缩只有 ZLIB**：标准库没有 LZ4/ZSTD，而本模块承诺零第三方
-依赖，所以这两种类型**大声报 `unsupported` 错误**，绝不把压缩流当正文透传（消费端解错就是
-静默垃圾）。zlib 段的线上格式与其它语言互通，`scripts/compression_matrix.sh`（跨语言
-压缩矩阵）已接入 Go 腿（`examples/live_compression_matrix`，9 个方向：go↔go / go↔python /
-go↔cpp / go↔net / go↔rust）；**非 zlib 的 codec 会跳过 Go**（Go 压不出 lz4 / zstd，
-跳过后 lz4 / zstd 的互通仍由另外四端互测覆盖）。
+**压缩三型齐全（ZLIB / LZ4 / ZSTD），全部手写**：标准库只有 zlib，而本模块承诺零第三方依赖，
+所以 LZ4 与 ZSTD 都按规范自实现——`common/lz4.go` 是 LZ4 **Frame** 格式（块格式 + 帧头 +
+xxh32 HC/内容校验，与 Java `LZ4FrameOutputStream`、Python `lz4.frame`、lz4 CLI 同 wire），
+双向都完整（编码器有真实匹配器，压不动的块按 bit31 原样存）。
+`common/zstd.go` 的**解码器读完整 zstd 帧**（Raw/RLE/Compressed 三类块、Huffman 单/四流、
+FSE 序列、重复偏移、全部帧头字段、拼接帧/skippable 帧、xxh64 内容校验），能直接解 zstd-jni
+与 zstd CLI 压出来的字节；**编码器只产出合法的 store-only 帧（Raw/RLE 块）**——对端照读不误，
+只是 Go 发出的 ZSTD 正文不会变小（矩阵里 storeSize≈载荷大小就是这一条的证据）。补完整编码器
+要再写 FSE/Huffman 编码器，是有意的取舍而非遗漏（2026-10-09）。解不出来的一律**大声报 `unsupported` /
+解码错误**，绝不把压缩流当正文透传（消费端解错就是静默垃圾）。
+`scripts/compression_matrix.sh`（跨语言压缩矩阵）的 Go 腿在 zlib / lz4 / zstd 三档下都参与
+（`examples/live_compression_matrix`，9 个方向：go↔go / go↔python / go↔cpp / go↔net / go↔rust）。
 
 ## 构建与检查
 
@@ -48,7 +57,7 @@ cd go
 go build ./...
 go vet ./...
 gofmt -l .        # 空输出才是过
-go test ./...     # 535 条，~9s
+go test ./...     # 502 条（466 个用例 + 36 个子测试），~10s
 go test -race ./client/   # 并发回归（lite 消费者、异步发送、位点提交地板）
 ```
 
@@ -136,7 +145,7 @@ bash scripts/run_go_redelivery_live.sh      # 重投 / 死信终态 / 顺序死�
 bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 live_shutdown_race）
 bash scripts/run_go_pop_live.sh             # POP 消费
 bash scripts/run_go_admin_live.sh           # 管理端（29 项，自断言；工具自己造/删 topic、订阅组、KV namespace）
-bash scripts/compression_matrix.sh zlib     # 跨语言压缩矩阵（五端互测，含 Go 9 个方向；非 zlib 会跳过 Go）
+bash scripts/compression_matrix.sh zlib     # 跨语言压缩矩阵（七端互测，含 Go 9 个方向；lz4 / zstd 同脚本换 codec）
 ```
 
 **尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
@@ -147,8 +156,7 @@ ACL、TLS、SQL92、`MACHINE_ROOM_NEARBY` 真机，
 以及 **307/309 的真实 broker 往返**（`mqadmin consumerStatus -s` 走的就是这两条；目前只在
 进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
 
-对照 Java 客户端（zhaohai666-rocketmq 5.x）仍有意的差异：LZ4/ZSTD 压缩（Java 客户端模块同样
-只有 zlib，本项只是与仓库内 Python/C++/C#/Rust 四端的能力面差异）、批次消息 msgId 取批自身
+对照 Java 客户端（zhaohai666-rocketmq 5.x）仍有意的差异：批次消息 msgId 取批自身
 UNIQ_KEY（与 Rust/C++ 对齐）。
 
 ## 目录结构
@@ -159,7 +167,8 @@ go/
 ├── common/
 │   ├── message.go                  Message / MessageExt / MessageQueue
 │   ├── message_decoder.go          17 段存储格式 + 6 段批量格式
-│   ├── compression.go              zlib（LZ4/ZSTD 刻意 unsupported）
+│   ├── compression.go              ZLIB/LZ4/ZSTD 分派（Java CompressionFactory 同口径）
+│   ├── lz4.go / zstd.go          手写 LZ4 Frame 与 ZSTD 帧（零第三方依赖；zstd 解码全格式、编码 store-only）
 │   ├── recall_handle.go            定时消息撤回句柄 v1（base64url + 5 段）
 │   ├── buffer.go / sysflag.go / mixall.go / util.go
 │   ├── namespace.go / topic_validator.go / validators.go
@@ -197,6 +206,13 @@ go/
 **短轮询绝不能带 SUSPEND 位。** Go 拉消费的 `Pull()`（短轮询）不置 `FLAG_SUSPEND`：
 挂起位泄漏到短轮询上，broker 会把请求扣住整个 suspend 预算，而客户端早就超时了 ——
 空队列上这是**必然超时**，是这条路上最贵的坑。长轮询（`PullBlockIfNotFound`）才置位。
+
+**POP 的队列来自客户端 rebalance，不是 broker 分配。** Java 在 `clientRebalance=false` 时走
+`RebalanceImpl#getRebalanceResultFromBroker:345` → `MQClientAPIImpl#queryAssignment:405`
+（QUERY_ASSIGNMENT=400，回 `MessageQueueAssignment` mode=POP），由 broker 决定本实例拿哪些队列。
+本端口**刻意不实现那条路径**（python / C++ / C# / Rust / Node.js / PHP 六端同一决定）：队列仍由本地
+分配策略算出，然后每队列一个 POP 循环 + ack。语义等价，差别只在"谁决定队列集合"；要改先读
+`client/consumer.go` 里 `doRebalance` 的那段注释。
 
 **lite 消费者跑双游标。** 拉取游标（PULL cursor）在**每一次**应答后都跟
 `nextBeginOffset`（FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL 一视同仁，
@@ -250,8 +266,16 @@ consumer_table，实例级心跳只汇总那张表 ⇒ 没有自己的循环时 
 | --- | --- | --- |
 | `ROCKETMQ_CLIENT_LOG_LEVEL` | `INFO` | `TRACE` / `DEBUG` / `INFO` / `WARN` / `ERROR` |
 | `ROCKETMQ_CLIENT_LOG_DIR` | `$HOME/logs/rocketmqlogs` | 日志目录 |
-| `ROCKETMQ_CLIENT_LOG_FILE` | `rocketmq_client.log` | 日志文件名 |
-| `ROCKETMQ_CLIENT_LOG_USE_STDOUT` | 空 | 任意非空值 = 写标准输出而不是文件 |
+| `ROCKETMQ_CLIENT_LOG_FILE` | `rocketmq_go_client.log` | 日志文件名；空串 / `OFF` / `NONE` = 关闭文件落盘只留 stderr；含路径分隔符时按整路径处理 |
+| `ROCKETMQ_CLIENT_LOG_USE_STDOUT` | 空 | 任意非空值 = 写标准输出而不是文件（优先于上面两项） |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE` | `67108864`（64MB） | 单文件上限，按大小轮转（Java logback `<maxFileSize>64MB` 同值）；`0` = 不轮转 |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` | `10` | 备份份数（Java `rocketmq.log.file.maxIndex` 同值），备份名 `<file>.1` … `<file>.N`；`0` = 不留备份、原地截断 |
+
+**日志文件名刻意不叫 Java 的 `rocketmq_client.log`**（与 cpp / csharp / rust / nodeJs / php 同一取舍）：
+同机同时跑 Java 客户端时，两个进程会往同一个文件里插行，而且谁先轮转就把对方的文件改名了——
+JVM 仍持有旧 fd，之后它的日志会静默写进一个已经 unlink 的 inode。需要强行对齐时设
+`ROCKETMQ_CLIENT_LOG_FILE=rocketmq_client.log` 即可。落盘与轮转的单测在 `common/logging_test.go`
+（轮转窗口要用小上限才造得出来，真机脚本只能验「有没有文件」）。
 | `ROCKETMQ_SERIALIZE_TYPE` | `JSON` | 线协议序列化选择（JSON / ROCKETMQ） |
 | `ROCKETMQ_TLS_ENABLE` | `false` | 打开后所有出连接走 TLS |
 | `ROCKETMQ_TLS_TEST_MODE` | `true` | 信任自签证书、不校验主机名 |

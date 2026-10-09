@@ -85,6 +85,10 @@ _ORDERLY_STATUSES = (ConsumeOrderlyStatus.SUCCESS, ConsumeOrderlyStatus.ROLLBACK
 # Java RebalanceImpl.updateProcessQueueTableInRebalance:442 就按这个判据把它撤掉重建。
 PULL_MAX_IDLE_TIME = 120.0
 
+# Java DefaultMQPushConsumerImpl.PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（默认 1000ms）：
+# suspend() 之后，拉取/弹出循环不退出，只是每轮退避这么久再回头看闸门。
+PULL_TIME_DELAY_WHEN_SUSPEND = 1.0
+
 
 def _mq_sort_key(mq: MessageQueue):
     """队列排序键，语义对齐 Java MessageQueue.compareTo：topic → brokerName → queueId。
@@ -761,6 +765,9 @@ class DefaultMQPushConsumer:
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = False
+        # namespaceV2（Java ClientConfig.namespaceV2，5.x 服务端命名空间）：非空时
+        # 每笔请求带 nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        self.namespace_v2 = ""
         self.message_model = message_model
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         self.consume_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
@@ -860,6 +867,10 @@ class DefaultMQPushConsumer:
         # 每队列最近一次「发起拉取/弹出」的时刻（Java ProcessQueue.lastPullTimestamp /
         # PopProcessQueue.lastPopTimestamp）。rebalance 用它判 pull 是否停摆（PULL_MAX_IDLE_TIME）。
         self._last_pull_table: Dict[str, float] = {}
+        # 对应 Java DefaultMQPushConsumerImpl 的 `private volatile boolean pause = false`：
+        # **整个消费者**级别的挂起开关（suspend()/resume() 翻动），与逐队列的 _lock_ok/流控
+        # 无关。Java 用 volatile 保证循环线程立即可见，这里靠 CPython 的属性读写出原子性。
+        self._paused = False
         # 对应 Java PullAPIWrapper.pullFromWhichNodeTable：MessageQueue → 下一轮
         # 拉取应选的 brokerId（由应答头 suggestWhichBrokerId 驱动，默认主节点 0）
         self._pull_from_which_node: Dict[MessageQueue, int] = {}
@@ -947,6 +958,13 @@ class DefaultMQPushConsumer:
     def set_enable_stream_request_type(self, enable: bool) -> None:
         """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
         self.enable_stream_request_type = bool(enable)
+
+    def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setNamespaceV2`：非空时每笔请求带 nsd=true / ns=<值>。"""
+        self.namespace_v2 = namespace_v2
+
+    def get_namespace_v2(self) -> Optional[str]:
+        return self.namespace_v2
 
     def set_message_model(self, model: str) -> None:
         self.message_model = model
@@ -1423,6 +1441,7 @@ class DefaultMQPushConsumer:
                                                tls_options=self.tls_options,
                                                enable_stream_request_type=self.enable_stream_request_type,
                                                unit_name=self.unit_name,
+                                               namespace_v2=self.namespace_v2,
                                                poll_name_server_interval=self.poll_name_server_interval)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
@@ -1510,6 +1529,8 @@ class DefaultMQPushConsumer:
                     self.consumer_group, TraceDispatcherType.CONSUME,
                     self.trace_msg_batch_num, self.trace_topic, self.rpc_hook)
                 dispatcher.set_host_consumer(self)
+                # 对应 Java DefaultMQPushConsumer.start():769 `dispatcher.setNamespaceV2(...)`。
+                dispatcher.set_namespace_v2(self.namespace_v2)
                 self.trace_dispatcher = dispatcher
                 self.register_consume_message_hook(ConsumeMessageTraceHook(dispatcher))
             except Exception as e:  # noqa: BLE001
@@ -1585,6 +1606,28 @@ class DefaultMQPushConsumer:
                 self.trace_dispatcher.shutdown()
             except Exception as e:  # noqa: BLE001
                 logger.warning("trace dispatcher shutdown failed: %s", e)
+
+    def suspend(self) -> None:
+        """挂起本消费者（对应 Java DefaultMQPushConsumer#suspend:890 → Impl#suspend:1312-1315）。
+
+        只翻一个布尔：拉取/弹出循环每轮在挂起闸门处退避
+        ``PULL_TIME_DELAY_WHEN_SUSPEND``（Java 的 1000ms）后重试，**不会退出**，
+        也仍然继续为 lastPullTimestamp 盖章，所以挂起不等于停摆、分配不会被 rebalance 摘走。
+        已拉到本地的消息照常消费（Java 同理：闸门只管发起下一轮拉取）。
+        """
+        self._paused = True
+        logger.info("suspend this consumer, %s", self.consumer_group)
+
+    def resume(self) -> None:
+        """解除挂起（对应 Java Impl#resume:741-745：置回 false 并立刻 doRebalance）。"""
+        self._paused = False
+        # 挂起期间可能有队列变更没被处理：Java 在 resume 里主动触发一次重平衡。
+        self.rebalance_immediately()
+        logger.info("resume this consumer, %s", self.consumer_group)
+
+    def is_paused(self) -> bool:
+        """当前是否处于挂起态（对应 Java DefaultMQPushConsumer#isPause:902）。"""
+        return self._paused
 
     def _require_client(self) -> MQClientInstance:
         if not self._started or self._mq_client is None:
@@ -1954,6 +1997,14 @@ class DefaultMQPushConsumer:
             # 在流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
             with self._lock:
                 self._last_pull_table[key] = time.time()
+            # Java DefaultMQPushConsumerImpl.pullMessage:263-266 的挂起闸门。
+            # ⚠ 顺序要紧：闸门必须在**盖章之后**。放在盖章之前，一个只是被 suspend()
+            # 暂停的消费者会因为超过 PULL_MAX_IDLE_TIME 没发起拉取，被停摆判据
+            # （_pull_stalled_locked / Java ProcessQueue.isPullExpired）当成死循环，
+            # rebalance 会直接把分配摘掉重建 —— Java 特意把 pause 检查写在 :253 盖章之后。
+            if self._paused:
+                time.sleep(PULL_TIME_DELAY_WHEN_SUSPEND)
+                continue
             with self._lock:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
@@ -2130,6 +2181,11 @@ class DefaultMQPushConsumer:
                 now = time.time()
                 self._last_pull_table[key] = now
             pq.last_pop_timestamp = now
+            # Java DefaultMQPushConsumerImpl.popMessage:518-521：POP 模式受同一个挂起闸门约束，
+            # 且同样落在盖章之后（理由见 _queue_pull_loop 的注释）。
+            if self._paused:
+                time.sleep(PULL_TIME_DELAY_WHEN_SUSPEND)
+                continue
             with self._lock:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
@@ -3531,6 +3587,9 @@ class DefaultMQPullConsumer:
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = True
+        # namespaceV2（Java ClientConfig.namespaceV2，5.x 服务端命名空间）：非空时
+        # 每笔请求带 nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        self.namespace_v2 = ""
         self.message_model = message_model
         self.broker_suspend_max_time_millis = 20000
         self.consumer_pull_timeout_millis = 10000
@@ -3618,6 +3677,13 @@ class DefaultMQPullConsumer:
     def set_enable_stream_request_type(self, enable: bool) -> None:
         """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
         self.enable_stream_request_type = bool(enable)
+
+    def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setNamespaceV2`：非空时每笔请求带 nsd=true / ns=<值>。"""
+        self.namespace_v2 = namespace_v2
+
+    def get_namespace_v2(self) -> Optional[str]:
+        return self.namespace_v2
 
     def set_message_model(self, model: str) -> None:
         self.message_model = model
@@ -3748,6 +3814,7 @@ class DefaultMQPullConsumer:
         self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                            enable_stream_request_type=self.enable_stream_request_type,
                                            unit_name=self.unit_name,
+                                           namespace_v2=self.namespace_v2,
                                            poll_name_server_interval=self.poll_name_server_interval)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
@@ -3797,6 +3864,52 @@ class DefaultMQPullConsumer:
         # 都是读 rebalanceImpl 的 topicSubscribeInfoTable（订阅信息，读位、不筛 master），
         # 不是发布信息；两处共用同一份口径。
         return client.get_topic_subscribe_info(topic)
+
+    def fetch_message_queues_in_balance(self, topic: str) -> List[MessageQueue]:
+        """本实例「平衡后」应负责的队列（Java MQPullConsumer:187，官方
+        example/simple/PullConsumer.java:62 就靠它决定去拉哪些队列）。
+
+        Java `DefaultMQPullConsumerImpl#fetchMessageQueuesInBalance:120-135` 直接读
+        `rebalanceImpl.processQueueTable` 的键——那张表是后台 rebalance 的**产物**。本端口
+        的拉模式不装后台 rebalance（队列由调用方自己管，见类注释），所以这里按
+        `RebalanceImpl.rebalanceByTopic` 的**同一条分配公式**当场算一遍，结果与 Java
+        表里那份一致：BROADCASTING 全给；CLUSTERING 取订阅信息（读位口径，与
+        `fetch_subscribe_message_queues` 同源）作 mqAll、查 `GET_CONSUMER_LIST_BY_GROUP`
+        作 cidAll，再交给本实例配置的分配策略。公式与推送消费者的 `_rebalance` 共用一份
+        口径，两处若分叉就会导致同一队列被两个实例认领。
+
+        拿不到路由或消费组列表时（离线、broker 未答）**退回本地
+        `pullFromWhichNodeTable` 的键集**（Java 同名表，见 `pull`）——即"保留现有分配"：
+        本实例实际在拉的队列就是它事实上的分配。绝不能回退成"独占全部队列"，
+        否则同组多实例互相重复消费（与推送消费者同一条铁律）。返回值按 house 排序
+        口径给出，保证多次调用顺序稳定。
+        """
+        client = self._require_client()  # Java isRunning()：未启动直接抛 MQClientException
+        if topic is None:
+            # Java :122-124 的 `throw new IllegalArgumentException("topic is null")`。
+            raise ValueError("topic is null")
+        pulled = [mq for mq in self._pull_from_which_node if mq.topic == topic]
+        if self.message_model == MessageModel.BROADCASTING:
+            allocated = client.get_topic_subscribe_info(topic) or pulled
+        else:
+            allocated = None
+            try:
+                mq_all = sorted(client.get_topic_subscribe_info(topic), key=_mq_sort_key)
+                cid_all = client.get_consumer_id_list_by_group(topic, self.consumer_group)
+                if mq_all and cid_all:
+                    allocated = self.allocate_message_queue_strategy.allocate(
+                        self.consumer_group, self.client_id or "", mq_all, sorted(cid_all))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("fetchMessageQueuesInBalance rebalance view unavailable: %s", e)
+            if allocated is None:
+                logger.debug("fetchMessageQueuesInBalance: no route/consumer list for %s/%s, "
+                             "keep current assignment", self.consumer_group, topic)
+                allocated = pulled
+        # Java parseSubscribeMessageQueues：把带命名空间的 topic 还原成用户侧的裸名。
+        # 本端口拉模式全程不改写资源名（见 namespace 字段注释），这里等价于原样返回。
+        # 末尾再按 topic 收一次口——Java :128-131 就是拿表键逐个比 topic 的，
+        # 别让分配策略的意外返回值把别的 topic 混进调用方的拉取循环。
+        return sorted([mq for mq in (allocated or []) if mq.topic == topic], key=_mq_sort_key)
 
     def pull(self, mq: MessageQueue, sub_expression: str = "*", offset: int = 0,
              max_nums: int = 32, timeout_millis: Optional[int] = None) -> PullResult:
@@ -3964,6 +4077,9 @@ class DefaultLitePullConsumer:
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = True
+        # namespaceV2（Java ClientConfig.namespaceV2，5.x 服务端命名空间）：非空时
+        # 每笔请求带 nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        self.namespace_v2 = ""
         self.message_model = message_model
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
@@ -4062,6 +4178,13 @@ class DefaultLitePullConsumer:
         """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
         self.enable_stream_request_type = bool(enable)
 
+    def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setNamespaceV2`：非空时每笔请求带 nsd=true / ns=<值>。"""
+        self.namespace_v2 = namespace_v2
+
+    def get_namespace_v2(self) -> Optional[str]:
+        return self.namespace_v2
+
     def set_message_model(self, model: str) -> None:
         self.message_model = model
 
@@ -4159,6 +4282,7 @@ class DefaultLitePullConsumer:
         return MQClientInstance(self.client_id, self.name_server_addrs,
                                 enable_stream_request_type=self.enable_stream_request_type,
                                 unit_name=self.unit_name,
+                                namespace_v2=self.namespace_v2,
                                 poll_name_server_interval=self.poll_name_server_interval)
 
     def start(self) -> None:

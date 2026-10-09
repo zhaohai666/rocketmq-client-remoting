@@ -32,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "rocketmq/common/message.h"
@@ -53,9 +54,6 @@ public:
 };
 
 // 对应 Java RequestResponseFuture：一次 request 的等待槽。
-//
-// 与 Java 的差异（有意）：Java 额外起了一个 scanExpiredRequest 定时线程清理超时项；
-// 本实现由 request() 的收尾逻辑保证移除，故不需要后台扫描线程。
 class RequestResponseFuture {
 public:
     RequestResponseFuture(std::string correlationId, int32_t timeoutMillis,
@@ -123,10 +121,29 @@ public:
 
     size_t size();
 
+    // 对应 Java RequestFutureHolder#startScheduledTask / shutdown（:75-105）：
+    // 单线程守护扫描（线程名 RequestHouseKeepingService，启动后 3s 首扫，之后每 1s
+    // 一趟）——把已过 TTL 的等待槽**原子移除**后逐个按 RequestTimeoutException
+    // （"request timeout, no reply message."）触发回调。计数引用：第一个调用
+    // startScheduledTask 的生产者把线程拉起来，最后一个 shutdown 的把它收掉。
+    // 同步 request() 的 RAII 移除仍在（正常路径不等扫描）；这条守护兜的是
+    // 「发送方崩了/回调无人清理」时表项永久泄漏。
+    void startScheduledTask();
+    void shutdownScheduledTask();
+
 private:
+    void scanExpiredRequest();
+
     RequestFutureHolder() = default;
     std::mutex m_;
     std::unordered_map<std::string, std::shared_ptr<RequestResponseFuture>> table_;
+
+    int producerCount_ = 0;
+    bool sweepRunning_ = false;
+    bool sweepStopped_ = false;
+    std::thread sweepThread_;
+    std::mutex sweepMutex_;
+    std::condition_variable sweepCv_;
 };
 
 // 对应 Java CorrelationIdUtil.createCorrelationId（随机 UUID 字符串，36 字符小写）。

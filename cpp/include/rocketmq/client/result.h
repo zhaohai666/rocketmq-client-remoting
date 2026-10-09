@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -300,6 +301,26 @@ class SelectMessageQueueByRandom : public MessageQueueSelector {
 public:
     MessageQueue select(const std::vector<MessageQueue>& mqs, const Message& msg,
                         const std::string& arg) const override;
+};
+
+// 对应 Java SelectMessageQueueByMachineRoom（producer/selector/）。
+// ⚠ Java 的 select() 是个**未实现的桩**：直接 return null（实际发送时在
+// sendKernelImpl 里 NPE），consumeridcs 读写一对也从未被内部使用。这里按
+// Java 语义原样移植：select 不选队列 —— 但 MessageQueue 无法表达 null，
+// 所以在 select 时抛出（等价于 Java 用它发送必然失败的结局），并保留
+// consumeridcs 的读写对。
+class SelectMessageQueueByMachineRoom : public MessageQueueSelector {
+public:
+    MessageQueue select(const std::vector<MessageQueue>& mqs, const Message& msg,
+                        const std::string& arg) const override;
+
+    const std::set<std::string>& getConsumeridcs() const { return consumeridcs_; }
+    void setConsumeridcs(std::set<std::string> consumeridcs) {
+        consumeridcs_ = std::move(consumeridcs);
+    }
+
+private:
+    std::set<std::string> consumeridcs_;
 };
 
 }  // namespace rocketmq

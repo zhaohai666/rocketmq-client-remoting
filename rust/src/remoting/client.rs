@@ -30,10 +30,10 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
-use crate::{rmq_debug, rmq_warn};
 use crate::remoting::protocol::codes::response_code;
 use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
+use crate::{rmq_debug, rmq_warn};
 
 pub const MAX_FRAME_LENGTH: i32 = 16 * 1024 * 1024;
 
@@ -91,7 +91,12 @@ impl ResponseSink {
         let addr = self.addr.clone();
         self.inner.spawn("response write", async move {
             if let Err(e) = write_frame(&inner, &addr, &mut response).await {
-                rmq_warn!("remoting: failed to write response (code={}) to {}: {}", response.code, addr, e);
+                rmq_warn!(
+                    "remoting: failed to write response (code={}) to {}: {}",
+                    response.code,
+                    addr,
+                    e
+                );
             }
         });
     }
@@ -124,7 +129,10 @@ impl Default for RemotingClientConfig {
 
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => default,
     }
 }
@@ -248,7 +256,11 @@ impl RemotingClient {
 
     // ---------------- 钩子 / 处理器 ----------------
     pub fn register_rpc_hook(&self, hook: Arc<dyn RPCHook>) {
-        self.inner.hooks.write().unwrap_or_else(|e| e.into_inner()).push(hook);
+        self.inner
+            .hooks
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(hook);
     }
 
     pub fn unregister_rpc_hook(&self, hook: &Arc<dyn RPCHook>) {
@@ -261,7 +273,22 @@ impl RemotingClient {
     }
 
     pub fn rpc_hook_count(&self) -> usize {
-        self.inner.hooks.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.inner
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// 已注册钩子的**快照**（注册顺序 = 执行顺序）。
+    /// 供单测/诊断验证钩子链的顺序（Namespace → Stream → 用户钩子，见
+    /// `crate::remoting::rpchook`），发送路径本身不读它。
+    pub fn rpc_hooks(&self) -> Vec<Arc<dyn RPCHook>> {
+        self.inner
+            .hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn register_processor(&self, request_code: i32, processor: Arc<dyn RequestProcessor>) {
@@ -317,11 +344,7 @@ impl RemotingClient {
     // ---------------- 连接状态 ----------------
     pub fn is_channel_writable(&self, addr: &str) -> bool {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .conns
-            .get(addr)
-            .map(|c| c.is_alive())
-            .unwrap_or(false)
+        state.conns.get(addr).map(|c| c.is_alive()).unwrap_or(false)
     }
 
     pub fn close_channel(&self, addr: &str) {
@@ -398,9 +421,15 @@ impl Inner {
         addr: &str,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .pending
-            .insert(opaque, Pending { sender, request, addr: addr.to_string(), conn_id: None });
+        state.pending.insert(
+            opaque,
+            Pending {
+                sender,
+                request,
+                addr: addr.to_string(),
+                conn_id: None,
+            },
+        );
     }
 
     /// 请求真正写出去之后补上连接身份（对应 Java 在 `invokeAsync`/`invokeSync` 里
@@ -481,11 +510,17 @@ async fn invoke_with_timeout(
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => {
             inner.cancel(opaque);
-            Err(Error::SendRequest { addr: addr.to_string(), message: "connection closed".into() })
+            Err(Error::SendRequest {
+                addr: addr.to_string(),
+                message: "connection closed".into(),
+            })
         }
         Err(_) => {
             inner.cancel(opaque);
-            Err(Error::Timeout { addr: addr.to_string(), timeout_millis: timeout })
+            Err(Error::Timeout {
+                addr: addr.to_string(),
+                timeout_millis: timeout,
+            })
         }
     }
 }
@@ -493,7 +528,11 @@ async fn invoke_with_timeout(
 /// 对应 Java `doBeforeRpcHooks` + 写出：**必须在 encode 之前**跑钩子，
 /// ACL 签名覆盖的必须是真正上线的那份 extFields。返回所用连接的身份，供调用方
 /// 把请求绑到这条连接上（见 [`Inner::attach_pending_conn`]）。
-async fn send_request(inner: &Arc<Inner>, addr: &str, request: &mut RemotingCommand) -> Result<u64> {
+async fn send_request(
+    inner: &Arc<Inner>,
+    addr: &str,
+    request: &mut RemotingCommand,
+) -> Result<u64> {
     {
         let hooks = inner.hooks.read().unwrap_or_else(|e| e.into_inner());
         for hook in hooks.iter() {
@@ -511,7 +550,10 @@ async fn write_frame(inner: &Arc<Inner>, addr: &str, request: &mut RemotingComma
     } else {
         conn.mark_dead();
         close_channel(inner, &conn.addr);
-        Err(Error::SendRequest { addr: addr.to_string(), message: "connection closed".into() })
+        Err(Error::SendRequest {
+            addr: addr.to_string(),
+            message: "connection closed".into(),
+        })
     }
 }
 
@@ -546,7 +588,9 @@ fn fail_pending_for(inner: &Arc<Inner>, conn_id: u64) {
             .filter(|(_, p)| p.conn_id == Some(conn_id))
             .map(|(k, _)| *k)
             .collect();
-        keys.into_iter().filter_map(|k| state.pending.remove(&k)).collect()
+        keys.into_iter()
+            .filter_map(|k| state.pending.remove(&k))
+            .collect()
     };
     if dropped.is_empty() {
         return;
@@ -598,7 +642,9 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
         state.pending.remove(&opaque)
     };
     if let Some(pending) = pending {
-        let Pending { sender, request, .. } = pending;
+        let Pending {
+            sender, request, ..
+        } = pending;
         apply_after_response_hooks(inner, addr, request.as_ref(), Some(&cmd));
         let _ = sender.send(cmd);
         return;
@@ -614,7 +660,10 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
         .get(&cmd.code)
         .cloned();
     let Some(processor) = processor else {
-        rmq_warn!("remoting: no processor for request code {} (opaque {opaque}) from {addr}", cmd.code);
+        rmq_warn!(
+            "remoting: no processor for request code {} (opaque {opaque}) from {addr}",
+            cmd.code
+        );
         return;
     };
     let sink = ResponseSink {
@@ -682,7 +731,10 @@ async fn get_or_create(inner: &Arc<Inner>, addr: &str) -> Result<Arc<Connection>
 }
 
 fn connect_gate(inner: &Arc<Inner>, addr: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut gates = inner.connect_gates.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gates = inner
+        .connect_gates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     gates
         .entry(addr.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -704,14 +756,22 @@ async fn connect(inner: &Arc<Inner>, addr: &str) -> Result<Arc<Connection>> {
     }
 }
 
-async fn connect_plain(inner: &Arc<Inner>, socket_addr: SocketAddr, addr: &str) -> Result<Arc<Connection>> {
+async fn connect_plain(
+    inner: &Arc<Inner>,
+    socket_addr: SocketAddr,
+    addr: &str,
+) -> Result<Arc<Connection>> {
     let stream = tokio::time::timeout(
         Duration::from_millis(inner.config.connect_timeout_millis.max(1) as u64),
         TcpStream::connect(socket_addr),
     )
     .await
-    .map_err(|_| Error::Connect { addr: addr.to_string() })?
-    .map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    .map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?
+    .map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = tokio::io::split(stream);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -789,12 +849,16 @@ async fn connect_tls(
         TcpStream::connect(socket_addr),
     )
     .await
-    .map_err(|_| Error::Connect { addr: addr.to_string() })?
-    .map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    .map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?
+    .map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
     let _ = tcp.set_nodelay(true);
-    let std_stream = tcp
-        .into_std()
-        .map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    let std_stream = tcp.into_std().map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
     let _ = std_stream.set_nonblocking(false);
 
     let domain = host.to_string();
@@ -806,18 +870,22 @@ async fn connect_tls(
             builder.danger_accept_invalid_certs(true);
             builder.danger_accept_invalid_hostnames(true);
         }
-        let connector = builder.build().map_err(|e| {
-            Error::Connect { addr: format!("{handshake_addr} (tls connector: {e})") }
+        let connector = builder.build().map_err(|e| Error::Connect {
+            addr: format!("{handshake_addr} (tls connector: {e})"),
         })?;
-        let mut tls = connector.connect(&domain, std_stream).map_err(|e| Error::Connect {
-            addr: format!("{handshake_addr} (tls handshake: {e})"),
-        })?;
+        let mut tls = connector
+            .connect(&domain, std_stream)
+            .map_err(|e| Error::Connect {
+                addr: format!("{handshake_addr} (tls handshake: {e})"),
+            })?;
         // 非阻塞设在握手之后：握手期间必须允许完整阻塞。
         let _ = tls.get_mut().set_nonblocking(true);
         Ok::<_, Error>(tls)
     })
     .await
-    .map_err(|_| Error::Connect { addr: addr.to_string() })??;
+    .map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })??;
 
     let shared = Arc::new(Mutex::new(stream));
     let alive = Arc::new(AtomicBool::new(true));
@@ -837,7 +905,14 @@ async fn connect_tls(
     // 心跳应答）都在那条线程上同步处理，处理器要靠运行时派后台任务。本函数是 async，
     // 一定跑在运行时里，就在这里把句柄取出来（同时缓存进 Inner 供其它线程用）。
     let runtime = inner.runtime_handle();
-    spawn_tls_writer(inner.clone(), addr, shared.clone(), rx.clone(), alive.clone(), conn_id);
+    spawn_tls_writer(
+        inner.clone(),
+        addr,
+        shared.clone(),
+        rx.clone(),
+        alive.clone(),
+        conn_id,
+    );
     spawn_tls_reader(inner.clone(), addr, shared, alive, runtime, conn_id);
     Ok(conn)
 }
@@ -989,7 +1064,10 @@ fn tls_read_exact(shared: &SharedTls, buf: &mut [u8]) -> std::result::Result<boo
 }
 
 fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
 }
 
 pub fn split_host_port(addr: &str) -> Result<(String, u16)> {
@@ -999,7 +1077,10 @@ pub fn split_host_port(addr: &str) -> Result<(String, u16)> {
         message: format!("bad port in address {addr:?}"),
     })?;
     if host.is_empty() {
-        return Err(Error::SendRequest { addr: addr.to_string(), message: "empty host".into() });
+        return Err(Error::SendRequest {
+            addr: addr.to_string(),
+            message: "empty host".into(),
+        });
     }
     Ok((host, port))
 }
@@ -1015,12 +1096,15 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
             .to_socket_addrs()
             .ok()
             .and_then(|mut it| it.next())
-            .ok_or_else(|| Error::Connect { addr: format!("dns lookup failed for {host}:{port}") })
+            .ok_or_else(|| Error::Connect {
+                addr: format!("dns lookup failed for {host}:{port}"),
+            })
     })
     .await
-    .map_err(|_| Error::Connect { addr: "dns lookup task panicked".into() })?
+    .map_err(|_| Error::Connect {
+        addr: "dns lookup task panicked".into(),
+    })?
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1093,7 +1177,10 @@ mod tests {
         let (addr, _server) = echo_server().await;
         let client = RemotingClient::new();
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "hi");
-        let response = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
         assert_eq!(response.opaque, cmd.opaque, "响应必须带回请求的 opaque");
         assert_eq!(response.remark.as_deref(), Some("pong:hi"));
@@ -1120,7 +1207,10 @@ mod tests {
         });
         let client = RemotingClient::new();
         let mut cmd = request(request_code::PULL_MESSAGE, "x");
-        let response = client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut cmd, Some(5000))
+            .await
+            .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
         client.shutdown();
     }
@@ -1135,7 +1225,10 @@ mod tests {
             let addr = addr.clone();
             handles.push(tokio::spawn(async move {
                 let mut cmd = request(request_code::SEND_MESSAGE, &format!("n{i}"));
-                let response = client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap();
+                let response = client
+                    .invoke_sync(&addr, &mut cmd, Some(5000))
+                    .await
+                    .unwrap();
                 assert_eq!(response.opaque, cmd.opaque);
                 response.remark.unwrap()
             }));
@@ -1167,14 +1260,15 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    while read_frame(&mut stream).await.is_some() {}
-                });
+                tokio::spawn(async move { while read_frame(&mut stream).await.is_some() {} });
             }
         });
         let client = RemotingClient::new();
         let mut cmd = request(request_code::PULL_MESSAGE, "quiet");
-        let err = client.invoke_sync(&addr, &mut cmd, Some(200)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(200))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "got {err}");
         assert!(err.to_string().contains("200ms"));
         assert_eq!(client.in_flight_count(), 0, "超时后必须清掉在途表");
@@ -1214,7 +1308,10 @@ mod tests {
         let (addr, conns) = go_away_server(1).await;
         let client = RemotingClient::new();
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "goaway");
-        let response = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap();
         assert_eq!(response.code, response_code::SUCCESS, "重发必须拿到真应答");
         assert_eq!(conns.load(Ordering::SeqCst), 2, "GO_AWAY 后必须换新连接");
         assert_eq!(client.in_flight_count(), 0);
@@ -1226,7 +1323,10 @@ mod tests {
         let (addr, conns) = go_away_server(usize::MAX).await;
         let client = RemotingClient::new();
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "goaway");
-        let err = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(
             err.to_string().contains("GO_AWAY twice"),
@@ -1245,7 +1345,10 @@ mod tests {
             ..RemotingClientConfig::default()
         });
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "goaway");
-        let err = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(err.to_string().contains("Receive GO_AWAY from channel"));
         assert_eq!(conns.load(Ordering::SeqCst), 1, "关掉开关就不该重连");
@@ -1259,7 +1362,10 @@ mod tests {
         drop(listener);
         let client = RemotingClient::new();
         let mut cmd = request(request_code::HEART_BEAT, "dead");
-        let err = client.invoke_sync(&addr, &mut cmd, Some(1000)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(1000))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Connect { .. }), "got {err}");
         assert!(!client.is_channel_writable(&addr));
     }
@@ -1268,7 +1374,10 @@ mod tests {
     async fn bad_port_is_reported() {
         let client = RemotingClient::new();
         let mut cmd = request(request_code::HEART_BEAT, "x");
-        let err = client.invoke_sync("127.0.0.1:notaport", &mut cmd, Some(500)).await.unwrap_err();
+        let err = client
+            .invoke_sync("127.0.0.1:notaport", &mut cmd, Some(500))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
     }
 
@@ -1277,11 +1386,17 @@ mod tests {
         let (addr, _server) = echo_server().await;
         let client = RemotingClient::new();
         let mut cmd = request(request_code::SEND_MESSAGE, "first");
-        client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap();
+        client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap();
         client.close_channel(&addr);
         assert!(!client.is_channel_writable(&addr));
         let mut second = request(request_code::SEND_MESSAGE, "second");
-        let response = client.invoke_sync(&addr, &mut second, Some(3000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut second, Some(3000))
+            .await
+            .unwrap();
         assert_eq!(response.remark.as_deref(), Some("pong:second"));
         client.shutdown();
     }
@@ -1361,14 +1476,26 @@ mod tests {
         let client = RemotingClient::new();
         let started = Instant::now();
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "eof");
-        let err = client.invoke_sync(&addr, &mut cmd, Some(30_000)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(30_000))
+            .await
+            .unwrap_err();
         let cost = started.elapsed();
 
         // 类型必须是 SendRequest（Java 的 RemotingSendRequestException），异步发送的
         // 重试判定按错误类型分流，报成 Timeout 就是另一个决策。
-        assert!(matches!(err, Error::SendRequest { .. }), "必须是发送失败，got {err}");
-        assert!(err.to_string().contains("connection closed"), "文案对齐 Java requestFail: {err}");
-        assert!(cost < Duration::from_secs(5), "毫秒级判死，不能等满 30s 超时: {cost:?}");
+        assert!(
+            matches!(err, Error::SendRequest { .. }),
+            "必须是发送失败，got {err}"
+        );
+        assert!(
+            err.to_string().contains("connection closed"),
+            "文案对齐 Java requestFail: {err}"
+        );
+        assert!(
+            cost < Duration::from_secs(5),
+            "毫秒级判死，不能等满 30s 超时: {cost:?}"
+        );
         assert_eq!(client.in_flight_count(), 0, "判死之后在途表要清空");
         assert_eq!(conns.load(Ordering::SeqCst), 1);
         client.shutdown();
@@ -1391,7 +1518,10 @@ mod tests {
             Some(30_000),
         );
 
-        let result = tokio::time::timeout(Duration::from_secs(5), rx).await.expect("回调没触发").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("回调没触发")
+            .unwrap();
         let err = result.unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "回调只能投递一次");
@@ -1416,7 +1546,10 @@ mod tests {
         wait_until(|| frames.load(Ordering::SeqCst) >= 1, "活连接收到请求").await;
 
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "eof");
-        let err = client.invoke_sync(&doomed_addr, &mut cmd, Some(30_000)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&doomed_addr, &mut cmd, Some(30_000))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
 
         assert_eq!(client.in_flight_count(), 1, "只该判死自己那条连接上的请求");
@@ -1432,14 +1565,24 @@ mod tests {
         let client = RemotingClient::new();
 
         let mut first = request(request_code::SEND_MESSAGE_V2, "eof");
-        let err = client.invoke_sync(&addr, &mut first, Some(30_000)).await.unwrap_err();
+        let err = client
+            .invoke_sync(&addr, &mut first, Some(30_000))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(!client.is_channel_writable(&addr), "死连接要摘出连接表");
 
         let mut second = request(request_code::SEND_MESSAGE_V2, "ok");
-        let response = client.invoke_sync(&addr, &mut second, Some(5_000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut second, Some(5_000))
+            .await
+            .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(conns.load(Ordering::SeqCst), 2, "第二次请求走的是新建的连接");
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            2,
+            "第二次请求走的是新建的连接"
+        );
         client.shutdown();
     }
 
@@ -1459,10 +1602,15 @@ mod tests {
         wait_until(|| frames.load(Ordering::SeqCst) >= 1, "请求写出").await;
 
         client.shutdown();
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("调用方被挂住").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("调用方被挂住")
+            .unwrap();
         let err = result.unwrap_err();
-        assert!(matches!(err, Error::SendRequest { .. }), "shutdown 要立刻收口，got {err}");
+        assert!(
+            matches!(err, Error::SendRequest { .. }),
+            "shutdown 要立刻收口，got {err}"
+        );
         assert_eq!(client.in_flight_count(), 0);
     }
 
@@ -1484,8 +1632,10 @@ mod tests {
             stream.write_all(&bytes).await.unwrap();
             stream.flush().await.unwrap();
             // 上面那条 oneway 不应有响应；再发一条请求型的，要求回包
-            let mut need_reply =
-                RemotingCommand::create_request_command(request_code::CHECK_TRANSACTION_STATE, None);
+            let mut need_reply = RemotingCommand::create_request_command(
+                request_code::CHECK_TRANSACTION_STATE,
+                None,
+            );
             need_reply.opaque = 5_555;
             let bytes = need_reply.encode();
             stream.write_all(&bytes).await.unwrap();
@@ -1519,7 +1669,10 @@ mod tests {
             client.invoke_oneway(&client_addr, &mut warm).await.unwrap();
             client
         };
-        let response = tokio::time::timeout(Duration::from_secs(5), push_rx).await.unwrap().unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), push_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
         assert_eq!(response.opaque, 5_555, "响应必须回填 broker 请求的 opaque");
         assert!(response.is_response_type());
@@ -1550,9 +1703,16 @@ mod tests {
         client.register_rpc_hook(Arc::new(MarkingHook));
         assert_eq!(client.rpc_hook_count(), 1);
         let mut cmd = request(request_code::SEND_MESSAGE, "hook");
-        client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap();
+        client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap();
         let on_wire = rx.await.unwrap();
-        assert_eq!(on_wire.get_ext_field("Hooked"), Some("yes"), "钩子必须作用于上线报文");
+        assert_eq!(
+            on_wire.get_ext_field("Hooked"),
+            Some("yes"),
+            "钩子必须作用于上线报文"
+        );
         client.shutdown();
     }
 
@@ -1562,7 +1722,10 @@ mod tests {
         let client = RemotingClient::new();
         let mut cmd = request(request_code::SEND_MESSAGE, "binary");
         cmd.serialize_type_current_rpc = serialize_type::ROCKETMQ;
-        let response = client.invoke_sync(&addr, &mut cmd, Some(3000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap();
         assert_eq!(
             response.serialize_type_current_rpc,
             serialize_type::ROCKETMQ,
@@ -1574,7 +1737,10 @@ mod tests {
     #[test]
     fn address_splitting() {
         assert_eq!(split_host_port("127.0.0.1:10911").unwrap().1, 10911);
-        assert_eq!(split_host_port("[::1]:9876").unwrap(), ("::1".to_string(), 9876));
+        assert_eq!(
+            split_host_port("[::1]:9876").unwrap(),
+            ("::1".to_string(), 9876)
+        );
         assert!(split_host_port("host:").is_err());
         assert!(split_host_port(":10911").is_err());
     }
@@ -1627,9 +1793,19 @@ mod tests {
         let p12 = dir.join("identity.p12");
         let ok = std::process::Command::new(&openssl)
             .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-keyout",
-                key.to_str()?, "-out", cert.to_str()?, "-days", "1", "-nodes",
-                "-subj", "/CN=127.0.0.1",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key.to_str()?,
+                "-out",
+                cert.to_str()?,
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=127.0.0.1",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1642,9 +1818,22 @@ mod tests {
         let exported = ok
             && std::process::Command::new(&openssl)
                 .args([
-                    "pkcs12", "-export", "-inkey", key.to_str()?, "-in", cert.to_str()?,
-                    "-out", p12.to_str()?, "-passout", &format!("pass:{TLS_P12_PASSWORD}"),
-                    "-keypbe", "PBE-SHA1-3DES", "-certpbe", "PBE-SHA1-3DES", "-macalg", "sha1",
+                    "pkcs12",
+                    "-export",
+                    "-inkey",
+                    key.to_str()?,
+                    "-in",
+                    cert.to_str()?,
+                    "-out",
+                    p12.to_str()?,
+                    "-passout",
+                    &format!("pass:{TLS_P12_PASSWORD}"),
+                    "-keypbe",
+                    "PBE-SHA1-3DES",
+                    "-certpbe",
+                    "PBE-SHA1-3DES",
+                    "-macalg",
+                    "sha1",
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -1653,7 +1842,11 @@ mod tests {
                 .unwrap_or(false);
         let der = std::fs::read(&p12).ok();
         let _ = std::fs::remove_dir_all(&dir);
-        if exported { der } else { None }
+        if exported {
+            der
+        } else {
+            None
+        }
     }
 
     /// 进程内 TLS 帧服务端：收一帧 → 回一帧（同 opaque）。
@@ -1672,14 +1865,20 @@ mod tests {
     }
 
     impl TlsFrameServer {
-        fn start(identity_pkcs12: &[u8], write_chunk: Option<usize>) -> std::result::Result<Self, String> {
+        fn start(
+            identity_pkcs12: &[u8],
+            write_chunk: Option<usize>,
+        ) -> std::result::Result<Self, String> {
             use std::net::TcpListener;
             let identity = native_tls::Identity::from_pkcs12(identity_pkcs12, TLS_P12_PASSWORD)
                 .map_err(|e| format!("identity: {e}"))?;
             let acceptor =
                 native_tls::TlsAcceptor::new(identity).map_err(|e| format!("acceptor: {e}"))?;
             let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-            let addr = listener.local_addr().map_err(|e| e.to_string())?.to_string();
+            let addr = listener
+                .local_addr()
+                .map_err(|e| e.to_string())?
+                .to_string();
             listener.set_nonblocking(true).map_err(|e| e.to_string())?;
             let stop = Arc::new(AtomicBool::new(false));
             let accept_stop = stop.clone();
@@ -1734,7 +1933,9 @@ mod tests {
             if !read_block(tls, &mut frame[4..]) {
                 return;
             }
-            let Ok(cmd) = RemotingCommand::decode(&frame) else { return };
+            let Ok(cmd) = RemotingCommand::decode(&frame) else {
+                return;
+            };
             if cmd.is_oneway_rpc() {
                 continue;
             }
@@ -1863,10 +2064,13 @@ mod tests {
             remarks.push(handle.await.expect("并发任务 panic"));
         }
         remarks.sort();
-        let expected: Vec<String> =
-            (0..8).map(|i| format!("t{i}:len:4096")).collect();
+        let expected: Vec<String> = (0..8).map(|i| format!("t{i}:len:4096")).collect();
         assert_eq!(remarks, expected);
-        assert_eq!(client.connection_addrs().len(), 1, "8 个请求应复用同一条 TLS 连接");
+        assert_eq!(
+            client.connection_addrs().len(),
+            1,
+            "8 个请求应复用同一条 TLS 连接"
+        );
         client.shutdown();
     }
 
@@ -1880,17 +2084,27 @@ mod tests {
         const TLS_PUSH_OPAQUE: i32 = 4_242_424;
         let identity = native_tls::Identity::from_pkcs12(identity_pkcs12, TLS_P12_PASSWORD)
             .map_err(|e| format!("identity: {e}"))?;
-        let acceptor = native_tls::TlsAcceptor::new(identity).map_err(|e| format!("acceptor: {e}"))?;
+        let acceptor =
+            native_tls::TlsAcceptor::new(identity).map_err(|e| format!("acceptor: {e}"))?;
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let addr = listener.local_addr().map_err(|e| e.to_string())?.to_string();
+        let addr = listener
+            .local_addr()
+            .map_err(|e| e.to_string())?
+            .to_string();
         std::thread::spawn(move || {
-            let Ok((stream, _)) = listener.accept() else { return };
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
             // macOS/BSD 下 accept 出来的套接字继承监听口的非阻塞标志，握手要求阻塞语义
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-            let Ok(mut tls) = acceptor.accept(stream) else { return };
+            let Ok(mut tls) = acceptor.accept(stream) else {
+                return;
+            };
             // 1) 热身请求原样回一帧，客户端这才算连上
-            let Some(warm) = read_tls_frame(&mut tls) else { return };
+            let Some(warm) = read_tls_frame(&mut tls) else {
+                return;
+            };
             if warm.is_oneway_rpc() {
                 return;
             }
@@ -1920,7 +2134,9 @@ mod tests {
     }
 
     /// 读一整帧并解出命令；对端关掉或超长都返回 `None`。
-    fn read_tls_frame(tls: &mut native_tls::TlsStream<std::net::TcpStream>) -> Option<RemotingCommand> {
+    fn read_tls_frame(
+        tls: &mut native_tls::TlsStream<std::net::TcpStream>,
+    ) -> Option<RemotingCommand> {
         let mut head = [0u8; 4];
         if !read_block(tls, &mut head) {
             return None;
@@ -1969,7 +2185,9 @@ mod tests {
         let client = tls_client();
         client.register_processor(
             request_code::CHECK_TRANSACTION_STATE,
-            Arc::new(Probe { saw_runtime: saw_runtime.clone() }),
+            Arc::new(Probe {
+                saw_runtime: saw_runtime.clone(),
+            }),
         );
 
         // 先做一次正常往返：连接建起来，服务端才会推请求
@@ -2005,8 +2223,14 @@ mod tests {
         });
         let client = tls_client();
         let mut cmd = request(request_code::GET_ROUTEINFO_BY_TOPIC, "plain");
-        let err = client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap_err();
-        assert!(matches!(err, Error::Connect { .. }), "明文端口上的 TLS 握手应报 Connect，got {err}");
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(5000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Connect { .. }),
+            "明文端口上的 TLS 握手应报 Connect，got {err}"
+        );
         client.shutdown();
     }
 }

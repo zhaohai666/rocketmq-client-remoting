@@ -15,10 +15,13 @@
 // that wrong is SILENT data corruption — the compressed stream is handed out as
 // the body with no error at all — so it needs a real broker and two real clients.
 //
-// Go's side of the codec story: the standard library has zlib only, and this
-// module takes no third-party dependencies, so LZ4/ZSTD are reported as
-// unsupported instead of being passed through (common/compression.go). That is
-// deliberate and it is why the script skips every Go leg for those codecs.
+// Go's side of the codec story: the standard library has zlib only and this
+// module takes no third-party dependencies, so LZ4 and ZSTD are hand-rolled
+// (common/lz4.go, common/zstd.go). The ZSTD decoder reads what the real
+// encoders write — Huffman-coded literals and FSE-coded sequences — which is
+// what makes the cpp/rust/csharp -> Go legs of this matrix meaningful; the
+// ZSTD encoder emits legal store-only frames, so Go's own sends show a
+// storeSize near the payload size while still being readable by every port.
 //
 // Exit codes follow the Python leg so the script can tell them apart:
 // 0 ok / 1 generic failure (a failed send included — that is what Python's
@@ -92,8 +95,8 @@ const usage = `usage:
 
 // compressType maps the matrix codec name to the sysFlag type bits, using the
 // same values as Java CompressionType.findByValue (1=LZ4, 2=ZSTD, 3=ZLIB).
-// LZ4/ZSTD resolve to a type here (rather than being rejected as unknown) so
-// doSend can turn them into an explicit "unsupported codec" failure below.
+// An unknown name is the only case that exits 2; a codec the port cannot encode
+// is caught by the pre-flight below.
 func compressType(codec string) (int32, bool) {
 	switch codec {
 	case "zlib":
@@ -115,10 +118,10 @@ func doSend(topic, group string, size int, ns, codec string) int {
 	payload := buildPayload(size)
 	// Pre-flight the codec — the producer must NOT be relied on to catch this.
 	// tryToCompressMessage swallows the error and sends the body UNCOMPRESSED
-	// (Go mirrors Java exactly; see client/producer.go), so a naive send reports
-	// SEND_OK for LZ4/ZSTD while nothing was compressed. A leg claiming "LZ4
-	// interop" would then pass vacuously, because the payload arrives intact and
-	// the CRC matches. Reject it here instead, as exit 2 = bad codec.
+	// (Go mirrors Java exactly; see client/producer.go), so a codec that fails to
+	// encode would still report SEND_OK and the leg would pass vacuously: the
+	// payload arrives intact and the CRC matches without anything being
+	// compressed. Reject it here instead, as exit 2 = bad codec.
 	if _, err := common.Compress(payload, ctype, common.DefaultCompressLevel); err != nil {
 		fmt.Printf("SEND_FAIL unsupported codec=%s: %v\n", codec, err)
 		return 2

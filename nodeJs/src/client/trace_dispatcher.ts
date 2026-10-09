@@ -23,6 +23,14 @@ export class AsyncTraceDispatcher {
   batchNum: number;
   traceTopic: string;
   regionId = '';
+  // Java AsyncTraceDispatcher.namespaceV2 (+ get/set): propagated to the
+  // internal trace producer in start() (Java AsyncTraceDispatcher:155) so the
+  // trace rpcs carry the nsd/ns extFields too.
+  namespaceV2: string | null = null;
+  // Java AsyncTraceDispatcher.maxMsgSize (default 128000): the trace payload is
+  // split into messages no larger than this (the internal trace producer's
+  // maxMessageSize is set to the same value in Java).
+  maxMsgSize = 128000;
   // The internal producer is created lazily on start() (zero-cost when trace
   // is disabled).
   private _producer: any = null;
@@ -45,6 +53,10 @@ export class AsyncTraceDispatcher {
   setHostConsumer(_hostConsumer: any): void { /* reserved for future use */ }
   setHostProducer(_hostProducer: any): void { /* reserved for future use */ }
 
+  // Java AsyncTraceDispatcher#getNamespaceV2 / #setNamespaceV2.
+  setNamespaceV2(namespaceV2: string | null): void { this.namespaceV2 = namespaceV2; }
+  getNamespaceV2(): string | null { return this.namespaceV2; }
+
   async start(nameSrvAddr?: string): Promise<void> {
     if (nameSrvAddr) this._nameSrvAddr = nameSrvAddr;
     if (this._running) return;
@@ -54,6 +66,10 @@ export class AsyncTraceDispatcher {
       // Java names the internal producer group <group>_INNER_TRACE_PRODUCER.
       const producer = new DefaultMQProducer(`${this.groupName}${TraceGroupNamePrefix}`);
       producer.setNamesrvAddr(this._nameSrvAddr);
+      // Java start():155 — traceProducer.setNamespaceV2(namespaceV2): without
+      // this the trace writes of a namespaceV2 client are the only requests
+      // the broker cannot attribute to the instance.
+      producer.setNamespaceV2(this.namespaceV2);
       // Java keeps hook lists PER PRODUCER — the inner trace producer's own
       // list is empty, so its sends are NOT traced. node's SendMessageHook
       // registry is global; this flag restores Java's semantics by exempting
@@ -130,24 +146,37 @@ export class AsyncTraceDispatcher {
     // Drain the queue under a snapshot; appends during the send are kept for
     // the next round.
     const batch = this._queue.splice(0, this._queue.length);
-    let transData = '';
+    // Java AsyncDataSendTask.flushData: accumulate encoded records and send a
+    // chunk every time the buffer reaches maxMsgSize — one oversized batch
+    // would otherwise be rejected by the broker's max message size check.
+    let buffer = '';
     const keys = new Set<string>();
+    const sendChunk = async (data: string, chunkKeys: Set<string>): Promise<void> => {
+      if (!data) return;
+      const { Message } = await import('../common/message.ts');
+      const msg = new Message(this.traceTopic, Buffer.from(data, 'utf-8'));
+      if (chunkKeys.size > 0) msg.setKeys(Array.from(chunkKeys).slice(0, 100).join(' '));
+      await this._producer.send(msg);
+    };
     for (const ctx of batch) {
       const tb: TraceTransferBean | null = EncodeTraceContext(ctx);
       if (tb == null || !tb.transData) continue;
-      transData += tb.transData;
+      buffer += tb.transData;
       for (const k of tb.transKey) keys.add(k);
+      if (buffer.length >= this.maxMsgSize) {
+        const chunk = buffer;
+        const chunkKeys = keys;
+        buffer = '';
+        keys.clear();
+        try { await sendChunk(chunk, chunkKeys); } catch (e) {
+          logger.debug('trace send failed (records dropped): %s', (e as Error).message);
+        }
+      }
     }
-    if (!transData) return;
-    try {
-      const { Message } = await import('../common/message.ts');
-      const msg = new Message(this.traceTopic, Buffer.from(transData, 'utf-8'));
-      if (keys.size > 0) msg.setKeys(Array.from(keys).slice(0, 100).join(' '));
-      await this._producer.send(msg);
-    } catch (e) {
-      // Topic-not-exist and broker-down are EXPECTED on a fresh cluster: log
-      // at debug so the run log keeps ERROR=0.
-      logger.debug('trace send failed (records dropped): %s', (e as Error).message);
+    if (buffer) {
+      try { await sendChunk(buffer, keys); } catch (e) {
+        logger.debug('trace send failed (records dropped): %s', (e as Error).message);
+      }
     }
   }
 

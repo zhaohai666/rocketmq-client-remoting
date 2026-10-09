@@ -121,6 +121,18 @@ function brokerRespond(RemotingCommand $cmd): ?RemotingCommand
     $ext = $cmd->extFields;
 
     switch ($cmd->code) {
+        case RequestCode::SEND_MESSAGE: {
+            // namespaceV2 探针：把**收到的** ns/nsd 原样回在 remark 上。客户端自说自话不算
+            // 证据，只有对端读到的字段才能证明钩子真的挂在传输层、且值就是当前配置。
+            if (($ext['probe'] ?? '') === 'ns') {
+                $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
+                $resp->remark = 'ns=' . (string) ($ext['ns'] ?? '')
+                    . ';nsd=' . (string) ($ext['nsd'] ?? '');
+                return $resp;
+            }
+            return RemotingCommand::createResponseCommand(ResponseCode::SYSTEM_ERROR, 'unhandled send');
+        }
+
         case RequestCode::GET_ROUTEINFO_BY_TOPIC: {
             $topic = (string) ($ext['topic'] ?? '');
             if ($topic === 'RouteTopic') {
@@ -862,6 +874,60 @@ final class RunClientInstance
         $broker->stop();
     }
 
+    // ================================================================ 9. namespaceV2 上线取证
+
+    /**
+     * MQClientInstance 构造器里装的 NamespaceRpcHook 是否真的挂在传输层上 —— 从**对端**取证。
+     *
+     * 对齐基准（Java 5.5.1，逐行读过）：
+     *   * `MQClientAPIImpl:329-335` **无条件**注册 NamespaceRpcHook，值每笔请求现读
+     *     `clientConfig.getNamespaceV2()`；空值时 `doBeforeRequest` 直接 return，
+     *     extFields 一个字段都不加（`NamespaceRpcHookTest`）。
+     *   * 因此三条都得以报文证明：① 未配置时裸着上线；② 构造时配置 ⇒ 第一笔就带
+     *     `nsd=true`/`ns=<值>`；③ start 之后改值 ⇒ 下一笔立刻跟着变（持快照的写法在这条上
+     *     会静默失效，而静默正是最难查的：broker 只会把请求当成"没有命名空间"）。
+     *
+     * 假 broker 见到 `probe=ns` 的 SEND_MESSAGE 时，把**收到的** ns/nsd 原样回在 remark 上
+     * （见本文件 brokerRespond）。
+     */
+    private function testNamespaceRpcHookOnWire(): void
+    {
+        $broker = FakeBroker::start();
+
+        $unset = new MQClientInstance('ns-unset', [$broker->addr], 2000, 3000);
+        $this->checkSame('ns=;nsd=', $this->probeNamespace($unset, $broker->addr),
+            '未配 namespaceV2：ns/nsd 都不上线（钩子装了但 no-op）');
+        $unset->shutdown();
+        MQClientInstance::removeInstance('ns-unset');
+
+        $named = new MQClientInstance('ns-named', [$broker->addr], 2000, 3000,
+            namespaceV2: 'MQ_INST_ctor');
+        $this->checkSame('ns=MQ_INST_ctor;nsd=true', $this->probeNamespace($named, $broker->addr),
+            '构造时配置：第一笔请求就带 ns/nsd');
+
+        // 现读语义：改配置不等重启，下一笔就跟着走
+        $named->namespaceV2 = 'MQ_INST_late';
+        $this->checkSame('ns=MQ_INST_late;nsd=true', $this->probeNamespace($named, $broker->addr),
+            'start 之后改 namespaceV2：下一笔立刻生效');
+
+        $named->namespaceV2 = '';
+        $this->checkSame('ns=;nsd=', $this->probeNamespace($named, $broker->addr),
+            '清空之后又退回裸请求（钩子不残留上一次的 ns）');
+
+        $named->shutdown();
+        MQClientInstance::removeInstance('ns-named');
+        $broker->stop();
+    }
+
+    /** 发一笔 namespaceV2 探针，返回对端回显的 `ns=<值>;nsd=<值>`。 */
+    private function probeNamespace(MQClientInstance $inst, string $addr): string
+    {
+        $cmd = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, null);
+        $cmd->addExtField('probe', 'ns');
+        $resp = $inst->remotingClient->invokeSync($addr, $cmd, 3000);
+        return (string) ($resp->remark ?? '');
+    }
+
     // ================================================================ run
 
     public function run(): int
@@ -875,6 +941,7 @@ final class RunClientInstance
         $this->testPullMessage();
         $this->testPopMessage();
         $this->testQueryConsumerOffset();
+        $this->testNamespaceRpcHookOnWire();
         return $this->summary();
     }
 }

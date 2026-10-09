@@ -47,6 +47,14 @@ final class ConsumerDefaults
      * 一个仍归本实例的队列超过这么久没发起过任何拉取/弹出 ⇒ rebalance 撤掉重建。
      */
     public const PULL_MAX_IDLE_TIME = 120.0;
+
+    /**
+     * Java DefaultMQPushConsumerImpl.PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（1000ms）：
+     * suspend() 之后一条拉取循环每轮退避这么久。PHP 没有循环线程，退避由调用方的
+     * tick 节奏承担（见 PushConsumer::suspend() 的说明），这个常量锁的是语义差：
+     * 挂起**不撤队列**，而 PULL_MAX_IDLE_TIME 判的是"这条循环还活着吗"。
+     */
+    public const PULL_TIME_DELAY_WHEN_SUSPEND = 1.0;
 }
 
 /** 队列排序键，语义对齐 Java MessageQueue.compareTo：topic → brokerName → queueId。 */

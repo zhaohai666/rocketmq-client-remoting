@@ -247,3 +247,113 @@ class TestConsumerHeartbeat:
         # 幂等：再 shutdown 一次不再发报文
         c.shutdown()
         assert fake.shutdown_called == 1
+
+
+class _BalanceClient:
+    """替身 client：只提供 fetchMessageQueuesInBalance 需要的两个查询口。
+
+    subscribe / cidList 都可以设成 None 来模拟「路由拿不到」「broker 没答」，
+    这时方法必须退回本地记账（保留现有分配），绝不能独占全部队列。
+    """
+
+    def __init__(self, subscribe=None, cid_list=None, raise_on_route=False):
+        self._subscribe = subscribe or []
+        self._cid_list = cid_list
+        self.raise_on_route = raise_on_route
+        self.remoting_client = SimpleNamespace(register_rpc_hook=lambda *a, **k: None)
+
+    def get_topic_subscribe_info(self, topic):
+        if self.raise_on_route:
+            raise MQClientException("route failed")
+        # 真 client 按 topic 取订阅信息（Java topicSubscribeInfoTable[topic]），替身同口径。
+        return [q for q in self._subscribe if q.topic == topic]
+
+    def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
+        return None if self._cid_list is None else list(self._cid_list)
+
+
+def _balance_consumer(mq_all, cid_all, model=MessageModel.CLUSTERING, pulled=()):
+    c = DefaultMQPullConsumer("PG_BalUnit")
+    c.client_id = "cid-A"
+    c.message_model = model
+    c._mq_client = _BalanceClient(subscribe=mq_all, cid_list=cid_all)
+    c._started = True
+    for mq in pulled:
+        c._pull_from_which_node[mq] = 0
+    return c
+
+
+class TestFetchMessageQueuesInBalance:
+    """MQPullConsumer#fetchMessageQueuesInBalance(:187) 的本端口移植。
+
+    Java（DefaultMQPullConsumerImpl:120-135）读的是后台 rebalance 填出来的
+    processQueueTable；本端口拉模式没有那条后台线程，所以按 RebalanceImpl.rebalanceByTopic
+    的同一条公式当场算：mqAll=订阅信息(读位)、cidAll=GET_CONSUMER_LIST_BY_GROUP、
+    分配策略取本实例那一份。取不到就保留本地记账（绝不回退成独占全部队列）。
+    """
+
+    _TOPIC = "TopicBalUnit"
+
+    def _queues(self, n):
+        return [MessageQueue(self._TOPIC, "broker-a", i) for i in range(n)]
+
+    def test_not_started_raises(self):
+        c = DefaultMQPullConsumer("PG_BalUnit")
+        with pytest.raises(MQClientException):
+            c.fetch_message_queues_in_balance(self._TOPIC)
+
+    def test_null_topic_raises_illegal_argument(self):
+        # Java :122-124 是 IllegalArgumentException，本端口对应 ValueError。
+        c = _balance_consumer(self._queues(1), ["cid-A"])
+        with pytest.raises(ValueError):
+            c.fetch_message_queues_in_balance(None)
+
+    def test_returns_only_this_instance_share(self):
+        got = _balance_consumer(self._queues(4), ["cid-A", "cid-B"]) \
+            .fetch_message_queues_in_balance(self._TOPIC)
+        assert [q.queue_id for q in got] == [0, 1], "averagely 策略下 A 只拿前一半"
+
+    def test_single_instance_takes_all(self):
+        got = _balance_consumer(self._queues(3), ["cid-A"]) \
+            .fetch_message_queues_in_balance(self._TOPIC)
+        assert [q.queue_id for q in got] == [0, 1, 2]
+
+    def test_result_is_sorted_and_deterministic(self):
+        mq_all = [MessageQueue(self._TOPIC, "broker-b", 0),
+                  MessageQueue(self._TOPIC, "broker-a", 1),
+                  MessageQueue(self._TOPIC, "broker-a", 0)]
+        got = _balance_consumer(mq_all, ["cid-A"]).fetch_message_queues_in_balance(self._TOPIC)
+        assert [(q.broker_name, q.queue_id) for q in got] == [
+            ("broker-a", 0), ("broker-a", 1), ("broker-b", 0)]
+
+    def test_other_topics_are_not_leaked(self):
+        # 分配按 topic 隔离：别的 topic 的队列不能混进来（Java 按 topic 过滤表键）。
+        other = [MessageQueue("TopicOther", "broker-a", i) for i in range(2)]
+        got = _balance_consumer(other + self._queues(2), ["cid-A"]) \
+            .fetch_message_queues_in_balance(self._TOPIC)
+        assert all(q.topic == self._TOPIC for q in got)
+        assert [q.queue_id for q in got] == [0, 1]
+
+    def test_broadcasting_takes_every_queue(self):
+        # Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
+        got = _balance_consumer(self._queues(3), ["cid-A", "cid-B"],
+                                model=MessageModel.BROADCASTING) \
+            .fetch_message_queues_in_balance(self._TOPIC)
+        assert [q.queue_id for q in got] == [0, 1, 2]
+
+    def test_no_consumer_list_keeps_current_assignment(self):
+        # broker 没答消费者列表 → 保留本实例正在拉的队列，不独占全部（同组会重复消费）。
+        pulled = [MessageQueue(self._TOPIC, "broker-a", 2)]
+        got = _balance_consumer(self._queues(4), None, pulled=pulled) \
+            .fetch_message_queues_in_balance(self._TOPIC)
+        assert [q.queue_id for q in got] == [2]
+
+    def test_route_failure_falls_back_to_pulled_queues(self):
+        c = _balance_consumer([], None, pulled=[MessageQueue(self._TOPIC, "broker-a", 5)])
+        c._mq_client.raise_on_route = True
+        got = c.fetch_message_queues_in_balance(self._TOPIC)
+        assert [q.queue_id for q in got] == [5]
+
+    def test_fresh_consumer_without_broker_returns_empty(self):
+        # 没拉过、又查不到 → 空表。Java 在 rebalance 跑之前同样是空集，不是"全部"。
+        assert _balance_consumer([], None).fetch_message_queues_in_balance(self._TOPIC) == []

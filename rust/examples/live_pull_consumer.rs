@@ -8,6 +8,8 @@
 //! - P1 生命周期：未配 name server 时 `start()` 失败；未 start 就拉取报错；
 //!   `start()` 幂等、`shutdown()` 幂等；`shutdown()` 后再拉取又报错。
 //! - P2 `fetch_subscribe_message_queues` → 显式建的 4 队列 topic 拿到 4 个队列、队列号不重不漏。
+//! - P2b `fetch_message_queues_in_balance` → **没拉过任何队列**的实例靠「真实路由 +
+//!   GET_CONSUMER_LIST_BY_GROUP(38)」算出份额（前提是 `registerTopic` 过，心跳才带订阅集）。
 //! - P3 定向发 12 条（每队列 3 条）→ 逐队列 `max_offset - min_offset == 3`、总量 12。
 //! - P4 手动 `pull`：逐队列从 min 拉到 max → 12 条不重不漏、body 与发送集合一致，
 //!   且 `MessageExt.broker_name` 已回填（`send_message_back` 要靠它反查路由）。
@@ -371,6 +373,49 @@ async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQu
         "P2 队列号 0..3 不重不漏",
         ids == (0..QUEUE_NUMS).collect::<BTreeSet<i32>>(),
         &format!("{ids:?}"),
+    );
+
+    // P2b `fetch_message_queues_in_balance`（Java DefaultMQPullConsumerImpl:120-135）。
+    // 此刻本实例**一笔都没拉过**：算不动时的兜底是「保留现有分配」=空集，所以拿到
+    // 非空只可能来自真实路由 + broker 的 GET_CONSUMER_LIST_BY_GROUP(38) —— 也就是
+    // 心跳真的把本组注册进了 broker 的 consumerTable。
+    //
+    // 心跳的订阅集来自 `registerTopic`（Java `DefaultMQPullConsumerImpl.subscriptions()`
+    // :357-385 就是拿 registerTopics 建的），没登记过就没人收心跳、38 空列表是**正确**
+    // 行为（python 的 S8 早先就踩过同一件事）。这里显式登记 + 补发一次心跳，把「本组
+    // 在 broker 可见」这一前置条件准备好，再读视图。
+    c.register_topic(topic);
+    let hb_ok = c.send_heartbeat_to_all_broker().await;
+    ck.check("P2b 登记 topic 后心跳发出去了（38 可见的前提）", hb_ok > 0, &format!("heartbeat_ok={hb_ok}"));
+    let mut mine: Vec<MessageQueue> = Vec::new();
+    let balance_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match c.fetch_message_queues_in_balance(topic).await {
+            Ok(v) if v.len() == QUEUE_NUMS as usize => {
+                mine = v;
+                break;
+            }
+            Ok(v) => mine = v,
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= balance_deadline {
+            break;
+        }
+        // 38 的可见性依赖 broker 侧的注册，重试时把心跳再补一发。
+        c.send_heartbeat_to_all_broker().await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    ck.check(
+        &format!("P2b 平衡视图：独占分组拿到全部 {QUEUE_NUMS} 个队列（未拉取过⇒只可能是路由+38 算出来的）"),
+        mine.len() == QUEUE_NUMS as usize,
+        &format!("got {} of {}", mine.len(), QUEUE_NUMS),
+    );
+    ck.check(
+        "P2b 平衡视图是本 topic 订阅视图的子集",
+        mine
+            .iter()
+            .all(|m| m.topic == topic && m.broker_name == fx.broker_name),
+        &format!("{mine:?}"),
     );
     c.shutdown();
     mqs

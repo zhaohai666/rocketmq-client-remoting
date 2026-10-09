@@ -82,11 +82,9 @@ func TestCompressDispatchAndUnsupportedTypes(t *testing.T) {
 		typ  int32
 		want string
 	}{
-		{Lz4Type, "unsupported compression type: 1"},
-		{ZstdType, "unsupported compression type: 2"},
 		{SnappyType, "unsupported compression type: 4"},
 	} {
-		// 无第三方依赖：LZ4/ZSTD 必须显式报错，绝不能把压缩字节原样透传
+		// 无第三方依赖：Snappy 必须显式报错，绝不能把压缩字节原样透传
 		if _, err := Compress([]byte("data"), c.typ, DefaultCompressLevel); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Fatalf("Compress(%d): %v", c.typ, err)
 		}
@@ -94,11 +92,22 @@ func TestCompressDispatchAndUnsupportedTypes(t *testing.T) {
 			t.Fatalf("Decompress(%d): %v", c.typ, err)
 		}
 	}
-	if !IsKind(unsupported(Lz4Type), KindDecode) {
+	if !IsKind(unsupported(SnappyType), KindDecode) {
 		t.Fatal("unsupported compression must be a decode-kind error")
 	}
 	if _, err := DecompressBody([]byte("x"), ZlibType); err == nil {
 		t.Fatal("decompress of non-zlib bytes must fail")
+	}
+	// LZ4/ZSTD 现已支持（hand-rolled codec），走 Compress/Decompress 全链路
+	for _, c := range []int32{Lz4Type, ZstdType} {
+		enc, err := Compress(zlibPayload, c, DefaultCompressLevel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, err := Decompress(enc, c)
+		if err != nil || !bytes.Equal(back, zlibPayload) {
+			t.Fatalf("type %d round trip failed: %v", c, err)
+		}
 	}
 }
 

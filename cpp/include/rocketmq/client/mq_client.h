@@ -153,12 +153,12 @@ public:
     // 公开只为让离线用例能驱动这条反向路径（真连接上 broker 推不进来）。
     void processNotifyConsumerIdsChanged(const RemotingCommand& cmd, const std::string& addr);
 
-    // 安装 RPC 钩子（ACL 鉴权 + 可选的 stream 打标）。对应 Java 在 MQClientAPIImpl
-    // 构造时绑定 rpcHook。
+    // 安装 RPC 钩子（namespaceV2 打标 + ACL 鉴权 + 可选的 stream 打标）。对应 Java 在
+    // MQClientAPIImpl 构造时绑定 rpcHook。
     // ⚠ 与 Java 的差异：Java 的传输层持 RPCHook **列表**（后注册者追加在后面），本端口
-    // 只有一槽且 first-wins —— 第二个注册者被忽略并返回 false。因此各 facade 必须先把
-    // stream 钩子与用户钩子**合成一个**再注册（见 composeRequestHooks），否则顺序就丢了。
-    // 钩子必须在 start() 之前设置。
+    // 只有一槽且 first-wins —— 第二个注册者被忽略并返回 false。因此各 facade 必须把
+    // namespace / stream 钩子与用户钩子**合成一个**再注册（见 composeRequestHooks），
+    // 否则顺序就丢了。钩子必须在 start() 之前设置。
     bool registerRPCHook(std::shared_ptr<RPCHook> hook) {
         return remotingClient_->registerRPCHook(std::move(hook));
     }

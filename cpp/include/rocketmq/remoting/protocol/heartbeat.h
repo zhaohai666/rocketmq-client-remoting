@@ -49,8 +49,18 @@ struct MessageModel {
 };
 
 // org.apache.rocketmq.common.consumer.ConsumeFromWhere
+// ⚠ 带注释的三个是 Java 里的 @Deprecated 值（枚举序与 Java 一致）：
+// RebalancePushImpl.computePullFromWhere 的 switch 里它们与
+// CONSUME_FROM_LAST_OFFSET 落同一个分支 —— 即"按最后位点"的兜底语义。
+// 本端口用字符串常量，缺省分支（非 FIRST/TIMESTAMP）天然就是这个兜底。
 struct ConsumeFromWhere {
     static const char* const CONSUME_FROM_LAST_OFFSET;  // "CONSUME_FROM_LAST_OFFSET"
+    // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支
+    static const char* const CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST;  // "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST"
+    // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支
+    static const char* const CONSUME_FROM_MIN_OFFSET;  // "CONSUME_FROM_MIN_OFFSET"
+    // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支
+    static const char* const CONSUME_FROM_MAX_OFFSET;  // "CONSUME_FROM_MAX_OFFSET"
     static const char* const CONSUME_FROM_FIRST_OFFSET;  // "CONSUME_FROM_FIRST_OFFSET"
     static const char* const CONSUME_FROM_TIMESTAMP;     // "CONSUME_FROM_TIMESTAMP"
 };

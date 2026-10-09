@@ -17,6 +17,7 @@ declare(strict_types=1);
 $suites = [
     'Common 层' => __DIR__ . '/RunCommon.php',
     'Remoting 层' => __DIR__ . '/RunRemoting.php',
+    'Client 日志' => __DIR__ . '/RunClientLogger.php',
     'Client 叶子' => __DIR__ . '/RunClientLeaf.php',
     'Client 轨迹' => __DIR__ . '/RunClientTrace.php',
     'Client OpenTracing' => __DIR__ . '/RunClientOpenTracing.php',
@@ -27,6 +28,11 @@ $suites = [
 
 // 顶层先加载 autoloader，避免各子套件重复注册。
 require_once __DIR__ . '/../bootstrap.php';
+
+// 子套件一律把客户端日志钉到临时目录：本端口默认按 cwd 落盘（见 src/Client/Logger.php
+// 的取舍说明），从仓库根跑测试就会在仓库里长出 logs/。真机联调不经过本入口，不受影响。
+$suiteLogDir = sys_get_temp_dir() . '/rmq_php_suite_logs_' . getmypid();
+putenv('ROCKETMQ_CLIENT_LOG_DIR=' . $suiteLogDir);
 
 $failed = 0;
 $totalChecks = 0;

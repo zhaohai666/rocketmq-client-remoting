@@ -15,10 +15,22 @@ export function clearNewLine(s: string | null): string | null {
 export class DefaultTopAddressing {
   wsAddr: string | null;
   unitName: string | null;
+  // Java TopAddressing.registerChangeCallBack: fired when the HTTP endpoint
+  // returns an address list DIFFERENT from the previously seen one.
+  private changeCallBack: ((addrs: string) => string | null) | null = null;
+  private lastAddrs: string | null = null;
 
   constructor(wsAddr: string | null = null, unitName: string | null = null) {
     this.wsAddr = wsAddr;
     this.unitName = unitName;
+  }
+
+  registerChangeCallBack(cb: (addrs: string) => string | null): void {
+    this.changeCallBack = cb;
+  }
+
+  clearChangeCallBack(): void {
+    this.changeCallBack = null;
   }
 
   // Domain used to build the ws url. Falls back to the ROCKETMQ_NAMESRV_DOMAIN env var.
@@ -48,7 +60,18 @@ export class DefaultTopAddressing {
       const resp = await fetch(url);
       if (!resp.ok) return null;
       const text = await resp.text();
-      return clearNewLine(text);
+      const addrs = clearNewLine(text);
+      // Java DefaultTopAddressing.fetchNSAddr: only a CHANGED value reaches the
+      // change callback (MQClientAPIImpl.onNameServerAddressChange ->
+      // updateNameServerAddressList); an unchanged answer is silent.
+      if (addrs != null && addrs !== '' && addrs !== this.lastAddrs) {
+        const prev = this.lastAddrs;
+        this.lastAddrs = addrs;
+        if (this.changeCallBack != null) {
+          try { this.changeCallBack(addrs); } catch (e) { /* never break polling */ }
+        }
+      }
+      return addrs;
     } catch (e) {
       return null;
     }

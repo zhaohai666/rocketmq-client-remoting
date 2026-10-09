@@ -17,6 +17,8 @@
      （push 模式做不到这一点，这正是 pull 模式的存在意义）
   S6 search_offset(now) / earliest_msg_store_time → 均 > 0
   S7 send_message_back → 消息落到 %RETRY%group，可被拉取到（回投链路真实可用）
+  S8 fetch_message_queues_in_balance → 只给本实例那份，两实例不重叠且合起来覆盖全组
+     （判据是「从没拉取过的实例也拿到非空」：算不动时的兜底是保留现有分配=空集）
 """
 from __future__ import annotations
 
@@ -57,6 +59,11 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 def make_consumer() -> DefaultMQPullConsumer:
     c = DefaultMQPullConsumer(GROUP)
     c.set_namesrv_addr(NAMESRV)
+    # 登记 topic 是心跳的前提（Java DefaultMQPullConsumer.registerMessageQueueListener
+    # 同时往 registerTopics 里加）：拉模式消费者没有订阅集就不知道该把本组报给哪台
+    # broker，broker 的 consumerTable 里就没有这个组，GET_CONSUMER_LIST_BY_GROUP(38)
+    # 也就数不出任何成员 —— S8 的平衡视图正是靠 38 的。
+    c.register_topics.add(TOPIC)
     c.start()
     return c
 
@@ -274,6 +281,58 @@ def scenario_send_back(consumer: DefaultMQPullConsumer, sample: MessageExt,
     check("S7 %%RETRY%% 拉到了被回投的消息", found, detail)
 
 
+def scenario_balance_view(consumer: DefaultMQPullConsumer) -> None:
+    """S8 fetch_message_queues_in_balance（Java DefaultMQPullConsumerImpl:120-135）。
+
+    离线单测锁的是分配公式，这条真机腿锁的是**公式的两路输入是真的**：队列表来自
+    真实 name server 的路由，成员表来自 broker 的 GET_CONSUMER_LIST_BY_GROUP(38)
+    —— 只有本组真的注册进了 broker（心跳），38 才数得出第二个实例。
+
+    关键的判据是 B：**一个从没拉取过任何队列的新实例**。算不动时本端口的设计是
+    「保留现有分配」，而 B 的现有分配是空集，所以 B 拿到非空队列 ⇒ 走的必然是
+    路由 + 38 那条真算出来的路，不是兜底。
+
+    ⚠ 两个实例都上线之后**再**各自算：A 先算的话那一刻 38 里只有 A 一个人，
+    它会拿走全部队列，等 B 起来再比就成了「A 4 条 + B 2 条 = 重叠」——那是测
+    调用顺序，不是测分配。broker 侧的心跳可见性有延迟，所以先等到 38 数得出 2 个成员。
+    """
+    print("\nS8 fetch_message_queues_in_balance")
+    whole = consumer.fetch_subscribe_message_queues(TOPIC)
+    key = lambda qs: sorted((q.broker_name, q.queue_id) for q in qs)  # noqa: E731
+
+    b = make_consumer()
+    try:
+        cid_all: list = []
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                cid_all = b._mq_client.get_consumer_id_list_by_group(TOPIC, GROUP) or []
+            except BaseException:  # noqa: BLE001
+                cid_all = []
+            if len(cid_all) >= 2:
+                break
+            time.sleep(1)
+        check("S8 broker 的 38 数得出组里两个实例（心跳真的注册进了 consumerTable）",
+              len(cid_all) >= 2, "cid_all=%s" % sorted(cid_all))
+
+        mine_a = consumer.fetch_message_queues_in_balance(TOPIC)
+        mine_b = b.fetch_message_queues_in_balance(TOPIC)
+        check("S8 从未拉取过的实例也算出了自己那份（证明走的是路由+38，不是兜底）",
+              len(mine_b) > 0, "b pulled nothing, mine_b=%d" % len(mine_b))
+        check("S8 两个实例的份额都落在订阅视图里",
+              set(key(mine_a)) <= set(key(whole)) and set(key(mine_b)) <= set(key(whole)),
+              "a=%s b=%s" % (key(mine_a), key(mine_b)))
+        overlap = set(key(mine_a)) & set(key(mine_b))
+        check("S8 两个实例的份额不重叠（重叠=同一条消息被消费两次）",
+              len(overlap) == 0, "a=%s b=%s overlap=%s"
+              % (key(mine_a), key(mine_b), sorted(overlap)))
+        check("S8 两个实例合起来覆盖整个 topic",
+              set(key(mine_a)) | set(key(mine_b)) == set(key(whole)),
+              "a=%d b=%d whole=%d" % (len(mine_a), len(mine_b), len(whole)))
+    finally:
+        b.shutdown()
+
+
 def main() -> int:
     print("拉模式消费者真机验证 topic=%s group=%s" % (TOPIC, GROUP))
     prepare_topic()
@@ -312,6 +371,8 @@ def main() -> int:
             check("S7 取样本消息", False, "no message available")
         else:
             scenario_send_back(consumer, sample, bytes(sample.body))
+
+        scenario_balance_view(consumer)
     finally:
         consumer.shutdown()
 

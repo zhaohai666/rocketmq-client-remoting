@@ -69,6 +69,7 @@ import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscript
 import { decodeMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
 import { DefaultMQProducer } from './producer.ts';
+import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import { getLogger } from '../logging.ts';
 import { RemotingTimeoutException } from '../remoting/exception.ts';
 
@@ -100,6 +101,10 @@ const REBALANCE_INTERVAL_DURING_STARTUP = 2 * 1000;
 const REBALANCE_STARTUP_WINDOW = 60 * 1000;
 const PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL = 50;
 const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION = 3000;
+// Java DefaultMQPushConsumerImpl.PULL_TIME_DELAY_MILLS_WHEN_SUSPEND:113 (1000ms):
+// while suspend() is in effect the pull/pop loops do not exit — they wait this long
+// and re-check the gate.
+const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND = 1000;
 const JAVA_INT_MAX = 2147483647;
 const DEFAULT_CONSUMER_GROUP = 'DEFAULT_CONSUMER';
 
@@ -125,6 +130,9 @@ function consumeReturnTypeName(t: number): string {
 export class DefaultMQPushConsumer {
   consumerGroup: string;
   namespace = '';
+  // Java ClientConfig#namespaceV2 — the SERVER-side namespace (nsd/ns
+  // extFields stamped by NamespaceRpcHook), independent from `namespace`.
+  namespaceV2: string | null = null;
   instanceName = 'DEFAULT';
   clientID = '';
   unitMode = false;
@@ -184,6 +192,10 @@ export class DefaultMQPushConsumer {
   offsetStore: OffsetStore | null = null;
 
   started = false;
+  // Java DefaultMQPushConsumerImpl's `private volatile boolean pause = false`:
+  // a CONSUMER-WIDE switch flipped by suspend()/resume(). Distinct from the
+  // lite-pull consumer's per-queue paused set.
+  private _paused = false;
   private _stopFlags = new Set<string>();
   private _startTime = 0;
 
@@ -237,6 +249,9 @@ export class DefaultMQPushConsumer {
   // ------------------------------------------------------------- config
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
+  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
+  getNamespaceV2(): string | null { return this.namespaceV2; }
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   setUnitMode(mode: boolean): this { this.unitMode = mode; return this; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
@@ -391,18 +406,24 @@ export class DefaultMQPushConsumer {
     this._parseConsumeTimestamp(this.consumeTimestamp); // hard fail on bad format
     this._checkConfigRanges();
     if (this.messageModel === MessageModel.CLUSTERING) {
-      // Java start:934-936 — only CLUSTERING rewrites DEFAULT to pid#nanotime.
-      if (this.instanceName === 'DEFAULT') {
-        this.instanceName = `DEFAULT${process.pid}`;
-      }
+      // Java start:934-936 — only CLUSTERING rewrites DEFAULT, and
+      // ClientConfig#changeInstanceNameToPID:163-167 makes it `<pid>#<nanotime>`,
+      // i.e. unique PER INSTANCE. A pid-only name is shared by every push
+      // consumer in this process, so the broker sees one member and
+      // allocate() hands both instances the same slice — duplicate consumption.
+      this.instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     }
-    this.clientID = MixAll.buildMqClientId
-      ? MixAll.buildMqClientId(this.instanceName)
-      : `${this.instanceName}@${Date.now()}`;
+    // ClientConfig#buildMQClientId: `<ip>@<instanceName>[@<unitName>][@STREAM]`
+    // (the push consumer leaves the stream flag off, like Java).
+    this.clientID = MixAll.clientIdFor(this.instanceName);
 
     const client = new MQClient(this.clientID, this.nameServerAddr);
     if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
     if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
+    // Java MQClientAPIImpl:329 — NamespaceRpcHook is the FIRST hook on the
+    // remoting client; a configured namespaceV2 goes out as nsd/ns extFields
+    // on every rpc (route fetch, heartbeat, pull, send-back, offsets).
+    registerRpcHooks(client.remotingClient, { namespaceV2: () => this.namespaceV2 });
     this.mqClient = client;
     // Java MQClientFactory.getConsumerStatsManager — instance-level shared.
     this._statsManager = client.consumerStatsManager;
@@ -529,6 +550,33 @@ export class DefaultMQPushConsumer {
     }
   }
 
+  // suspend() is Java DefaultMQPushConsumer#suspend:890 → Impl#suspend:1312-1315.
+  // It flips ONE boolean: the pull/pop loops keep running, keep stamping their
+  // lastPull/lastPop timestamp, and just stop STARTING new requests, backing off
+  // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND each round.
+  //
+  // The gate must sit AFTER the stamp (Java stamps at :253, checks pause at :263).
+  // Gate first, stamp second, and a merely-suspended consumer goes silent for
+  // more than PULL_MAX_IDLE_TIME (120s), the stall detector calls it a dead loop,
+  // and rebalance tears the assignment down — i.e. pausing an operational
+  // consumer for two minutes silently re-delivers its whole backlog on resume.
+  suspend(): void {
+    this._paused = true;
+    logger.info(`suspend this consumer, ${this.consumerGroup}`);
+  }
+
+  // resume() is Java Impl#resume:741-745: clear the flag and rebalance at once,
+  // so queues that appeared while suspended start being pulled immediately
+  // instead of waiting out the 20s rebalance period.
+  resume(): void {
+    this._paused = false;
+    this.rebalanceImmediately();
+    logger.info(`resume this consumer, ${this.consumerGroup}`);
+  }
+
+  // isPaused() is Java DefaultMQPushConsumer#isPause:902.
+  isPaused(): boolean { return this._paused; }
+
   private _startTraceDispatcher(): void {
     // Java DefaultMQPushConsumer.start:180-190: failures only log — a broken
     // trace stack must never take the consumer down.
@@ -541,6 +589,9 @@ export class DefaultMQPushConsumer {
         const dispatcher = new m.AsyncTraceDispatcher(
           this.consumerGroup, 'CONSUME', this.traceMsgBatchNum, this.traceTopic || undefined);
         dispatcher.setHostConsumer(this);
+        // Java AsyncTraceDispatcher.start:155 — propagate the namespace to the
+        // internal trace producer.
+        dispatcher.setNamespaceV2(this.namespaceV2);
         this.traceDispatcher = dispatcher;
         if (this.consumerGroup) {
           import('./trace_hook.ts').then((th: any) => {
@@ -675,6 +726,13 @@ export class DefaultMQPushConsumer {
   //
   // A missing consumer list KEEPS the current assignment (Java warns). Never
   // degrade to "I own everything": co-instances would duplicate every message.
+  //
+  // POP takes its queues from THIS same client-side rebalance (one POP loop per
+  // assigned queue + ack). Java instead asks the broker when clientRebalance is
+  // off — RebalanceImpl#getRebalanceResultFromBroker:345 → MQClientAPIImpl#queryAssignment:405
+  // (QUERY_ASSIGNMENT=400, MessageQueueAssignment with mode=POP). That path is
+  // deliberately NOT implemented here (same decision as the python / rust / php
+  // ports): the semantics are equivalent, only WHO picks the queue set differs.
   async doRebalance(): Promise<void> {
     if (!this.mqClient || !this.started) return;
     const client = this.mqClient;
@@ -965,6 +1023,13 @@ export class DefaultMQPushConsumer {
       // stamped when a pull is STARTED, before the flow-control/lock
       // decisions: the stall detector asks "is this loop alive".
       pq.touchPull();
+
+      // Java pullMessage:263-266 — the suspend gate, deliberately AFTER the
+      // stamp above (see suspend() for why that order is the whole point).
+      if (this._paused) {
+        if (await this._sleepOrStop(PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, stopFlag)) return;
+        continue;
+      }
 
       const sub = this.subscription.get(mq.getTopic());
       if (!sub) return;
@@ -2118,7 +2183,10 @@ export class DefaultMQPushConsumer {
         'PROP_CONSUME_TYPE': this.consumeType,
         'PROP_START_TIMESTAMP': String(this._startTime),
         'PROP_CONSUMEORDERLY': String(this.orderly),
-        'PROP_THREADPOOL_CORE_SIZE': String(this.corePoolSize),
+        // Java DefaultMQPushConsumerImpl:1452 reads the SERVICE's getCorePoolSize(),
+        // not the config field — so the runtime value an operator pushed via
+        // updateCorePoolSize() is what shows up in 307.
+        'PROP_THREADPOOL_CORE_SIZE': String(this.getCorePoolSize()),
         'PROP_CONSUMER_START_TIMESTAMP': String(this._startTime),
         'PROP_CONSUME_SUSPEND': String(false),
         'PROP_CONSUMEFLOWCONTROL': String(this.pullThresholdForQueue),
@@ -2189,6 +2257,55 @@ export class DefaultMQPushConsumer {
   assignedQueues(): MessageQueue[] { return [...this.assigned]; }
   assignedQueueCount(): number { return this.assigned.length; }
   processQueueCount(): number { return this.processQueueTable.size; }
+
+  // ------------------------------------------------- thread elasticity (Java
+  // AbstractConsumeMessageService + DefaultMQPushConsumerImpl.computeAccumulationTotal)
+
+  // Java DefaultMQPushConsumerImpl#computeAccumulationTotal: sum of every
+  // ProcessQueue's msgAccCnt (the backlog estimate adjustThreadPool runs on).
+  computeAccumulationTotal(): number {
+    let total = 0;
+    for (const v of this._msgAccCnt.values()) total += v;
+    return total;
+  }
+
+  // updateCorePoolSize is Java AbstractConsumeMessageService#updateCorePoolSize:59-67.
+  // The guards are copied verbatim (ownsConsumeExecutor is always true here — this
+  // port has no user-injected executor — && 0 < n <= Short.MAX_VALUE &&
+  // n < consumeThreadMax) and a rejected value is SILENTLY ignored, exactly like
+  // Java. The boolean exists only so tests can assert whether it took effect.
+  //
+  // It is not cosmetic here: _dispatchLoop caps in-flight batches at corePoolSize,
+  // so this is the live concurrency knob.
+  updateCorePoolSize(corePoolSize: number): boolean {
+    if (!Number.isFinite(corePoolSize)) return false;
+    if (corePoolSize <= 0 || corePoolSize > 32767) return false; // Short.MAX_VALUE
+    if (corePoolSize >= this.consumeThreadMax) return false;
+    this.corePoolSize = corePoolSize;
+    return true;
+  }
+
+  // getCorePoolSize is Java AbstractConsumeMessageService#getCorePoolSize:78-79
+  // (which answers -1 when the executor was injected by the user).
+  getCorePoolSize(): number { return this.corePoolSize; }
+
+  // adjustThreadPool is Java DefaultMQPushConsumerImpl#adjustThreadPool — ⚠ a NO-OP
+  // in 5.5.1: the incCorePoolSize()/decCorePoolSize() it calls have EMPTY bodies
+  // (AbstractConsumeMessageService:70-75). Keep it a no-op; do not "fix" it. The
+  // effective knob is the explicit updateCorePoolSize(). Thresholds are computed and
+  // logged so msgAccCnt and the config stay observable.
+  adjustThreadPool(): void {
+    const accTotal = this.computeAccumulationTotal();
+    const threshold = this.adjustThreadPoolNumsThreshold;
+    if (accTotal >= threshold) {
+      logger.debug('adjustThreadPool: acc=%d >= incThreshold=%d (inc is a no-op upstream)',
+        accTotal, threshold);
+    }
+    if (accTotal < threshold * 0.8) {
+      logger.debug('adjustThreadPool: acc=%d < decThreshold=%d (dec is a no-op upstream)',
+        accTotal, Math.trunc(threshold * 0.8));
+    }
+  }
 
   private _parseConsumeTimestamp(raw: string): number {
     if (!raw || raw.length !== 14) {

@@ -70,6 +70,16 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
     if (!pq || pq.isDropped()) return;
     pq.setLastPopTimestamp(Date.now());
 
+    // Java DefaultMQPushConsumerImpl.popMessage:518-521 — POP reads the SAME
+    // consumer-wide pause flag, and the gate sits after the stamp for the same
+    // reason as the pull loop (a suspended-but-alive pop loop must not be
+    // judged expired, or rebalance retires the queue and in-flight batches get
+    // abandoned to the broker's revive).
+    if (c.isPaused()) {
+      if (await c._sleepOrStop(POP_DELAY_WHEN_SUSPEND, stopFlag)) return;
+      continue;
+    }
+
     const sub = c.subscription.get(mq.getTopic());
     if (!sub) return;
     // Flow control on the outstanding-ACK debt. Java uses a strict ">"

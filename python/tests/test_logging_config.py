@@ -54,6 +54,63 @@ def test_default_dir_is_rocketmqlogs(monkeypatch):
     assert rl._LOG_DIR.endswith("logs/rocketmqlogs")
 
 
+def test_default_dir_follows_cwd_not_home(monkeypatch, tmp_path):
+    """默认目录是 <cwd>/logs/rocketmqlogs，**刻意不写用户 HOME**。
+
+    Python 客户端常被当脚本嵌进别人的进程里跑，在 $HOME 下悄悄建目录写文件是越界
+    副作用（与 php/src/Client/Logger.php 同一取舍）；这里用 chdir 把两者分开验证。
+    """
+    home = tmp_path / "fakehome"
+    home.mkdir()
+    cwd = tmp_path / "deploy"
+    cwd.mkdir()
+    monkeypatch.delenv("ROCKETMQ_CLIENT_LOG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(cwd)
+    rl = _reload(monkeypatch)  # _reload 会先删掉 LOG_DIR，正是在测默认推导
+    assert rl._LOG_DIR == str(cwd / "logs" / "rocketmqlogs")
+    assert not (home / "logs").exists()
+
+
+def test_level_aliases(monkeypatch):
+    """go/nodeJs/php 口径的 WARN/TRACE 也必须认（Python 原生级别名是 WARNING）。"""
+    rl = _reload(monkeypatch)
+    assert rl._level_from_name("WARN") == rl._logging.WARNING
+    assert rl._level_from_name("WARNING") == rl._logging.WARNING
+    assert rl._level_from_name("TRACE") == rl._logging.DEBUG
+    assert rl._level_from_name("DEBUG") == rl._logging.DEBUG
+    assert rl._level_from_name("NOT-A-LEVEL") == rl._logging.INFO
+
+
+def test_env_level_reaches_logger(monkeypatch, tmp_path):
+    """ROCKETMQ_CLIENT_LOG_LEVEL=WARN 要真的作用到 logger 级别上，而不只是存进变量。"""
+    rl = _reload(monkeypatch, {
+        "ROCKETMQ_CLIENT_LOG_DIR": str(tmp_path),
+        "ROCKETMQ_CLIENT_LOG_LEVEL": "WARN",
+        "ROCKETMQ_CLIENT_LOG_USE_STDOUT": "false",
+    })
+    ours = rl._logging.getLogger(rl.LOGGER_NAME)
+    saved = list(ours.handlers)
+    saved_propagate = ours.propagate
+    root_saved = list(rl._logging.getLogger().handlers)
+    for h in saved:
+        h.close()
+    ours.handlers = []
+    rl._logging.getLogger().handlers = []
+    try:
+        lg = rl.get_logger()
+        assert lg.level == rl._logging.WARNING
+    finally:
+        # get_logger() 会挂自己的 handler 并把 propagate 关掉（caplog 依赖向 root 冒泡），
+        # 用例必须原样退回，否则污染后面的套件。
+        for h in list(lg.handlers):
+            h.close()
+        ours.handlers = saved
+        ours.propagate = saved_propagate
+        rl._logging.getLogger().handlers = root_saved
+
+
 def test_build_handlers_writes_py_client_log(monkeypatch, tmp_path):
     rl = _reload(monkeypatch, {"ROCKETMQ_CLIENT_LOG_DIR": str(tmp_path)})
     handlers = rl._build_handlers()

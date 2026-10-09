@@ -36,6 +36,24 @@ pub fn normalize_compression_type(compression_type: i32) -> i32 {
     }
 }
 
+/// 对应 Java `CompressionType.findByValue(int)`：未知值直接报错
+/// （Java 抛 `RuntimeException("Unknown compress type value: ...")`，这里以
+/// [`Error::Encode`] 表达同一语义），已知值归一成规范的算法号（0 → ZLIB）。
+///
+/// 给「配置落盘前」的入口用（如 [`crate::client::producer::DefaultMQProducer::set_compress_type`]）：
+/// 宁可在 set 时拒绝，也不要等到发送时才发现算法不认识（旧版是发送阶段静默降级不压缩，
+/// 用户拿不到任何信号）。
+pub fn validate_compression_type(compression_type: i32) -> Result<i32> {
+    match compression_type {
+        0 | MessageSysFlag::ZLIB_TYPE => Ok(MessageSysFlag::ZLIB_TYPE),
+        MessageSysFlag::LZ4_TYPE => Ok(MessageSysFlag::LZ4_TYPE),
+        MessageSysFlag::ZSTD_TYPE => Ok(MessageSysFlag::ZSTD_TYPE),
+        _ => Err(Error::Encode(format!(
+            "Unknown compress type value: {compression_type}"
+        ))),
+    }
+}
+
 /// 算法名，仅日志/报错用（对应 Java `CompressionType.name()`）。
 pub fn compression_type_name(compression_type: i32) -> Option<&'static str> {
     match normalize_compression_type(compression_type) {
@@ -196,6 +214,41 @@ mod tests {
         assert_eq!(ZSTD_DEFAULT_LEVEL, 3);
     }
 
+    /// Java `CompressionType.findByValue` 的 set 时校验：已知值归一，未知值报错。
+    #[test]
+    fn validate_compression_type_mirrors_find_by_value() {
+        assert_eq!(
+            validate_compression_type(0).unwrap(),
+            MessageSysFlag::ZLIB_TYPE
+        );
+        assert_eq!(
+            validate_compression_type(3).unwrap(),
+            MessageSysFlag::ZLIB_TYPE
+        );
+        assert_eq!(
+            validate_compression_type(1).unwrap(),
+            MessageSysFlag::LZ4_TYPE
+        );
+        assert_eq!(
+            validate_compression_type(2).unwrap(),
+            MessageSysFlag::ZSTD_TYPE
+        );
+        // Java 抛 RuntimeException("Unknown compress type value: 9")
+        let err = validate_compression_type(9).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "encode error: Unknown compress type value: 9"
+        );
+        assert!(matches!(
+            validate_compression_type(-1),
+            Err(Error::Encode(_))
+        ));
+        assert!(matches!(
+            validate_compression_type(4),
+            Err(Error::Encode(_))
+        ));
+    }
+
     #[test]
     fn zlib_round_trip_and_external_fixture() {
         let compressed = zlib_compress(&payload(), 5).unwrap();
@@ -208,7 +261,10 @@ mod tests {
         let external = unhex(ZLIB_L5_HEX);
         assert_eq!(external.len(), 47, "外部 fixture 长度");
         assert_eq!(zlib_decompress(&external).unwrap(), payload());
-        assert_eq!(decompress(&compressed, MessageSysFlag::ZLIB_TYPE).unwrap(), payload());
+        assert_eq!(
+            decompress(&compressed, MessageSysFlag::ZLIB_TYPE).unwrap(),
+            payload()
+        );
         // 类型位 0（老版本）按 ZLIB 解
         assert_eq!(decompress(&compressed, 0).unwrap(), payload());
     }
@@ -217,24 +273,49 @@ mod tests {
     fn lz4_round_trip_and_external_fixture() {
         let compressed = lz4_compress(&payload()).unwrap();
         assert!(compressed.len() < payload().len());
-        assert_eq!(&compressed[..4], &[0x04, 0x22, 0x4D, 0x18], "LZ4 Frame magic");
+        assert_eq!(
+            &compressed[..4],
+            &[0x04, 0x22, 0x4D, 0x18],
+            "LZ4 Frame magic"
+        );
         // 外部产出的 frame 必须能解
         assert_eq!(lz4_decompress(&unhex(LZ4_FRAME_HEX)).unwrap(), payload());
-        assert!(lz4_decompress(&unhex(LZ4_FRAME_EMPTY_HEX)).unwrap().is_empty());
-        assert_eq!(decompress(&compressed, MessageSysFlag::LZ4_TYPE).unwrap(), payload());
+        assert!(lz4_decompress(&unhex(LZ4_FRAME_EMPTY_HEX))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decompress(&compressed, MessageSysFlag::LZ4_TYPE).unwrap(),
+            payload()
+        );
         // 自己产出的 frame 也要能被「外部」路径解（同一实现，但至少自描述头一致）
         assert_eq!(decompress(&compressed, 1).unwrap(), payload());
-        assert_eq!(lz4_compress(&[]).unwrap().as_slice()[..4], [0x04, 0x22, 0x4D, 0x18]);
+        assert_eq!(
+            lz4_compress(&[]).unwrap().as_slice()[..4],
+            [0x04, 0x22, 0x4D, 0x18]
+        );
     }
 
     #[test]
     fn zstd_round_trip_and_external_fixtures() {
         let compressed = zstd_compress(&payload(), ZSTD_DEFAULT_LEVEL).unwrap();
         assert!(compressed.len() < payload().len());
-        assert_eq!(&compressed[..4], &[0x28, 0xB5, 0x2F, 0xFD], "zstd magic number");
-        assert_eq!(zstd_decompress(&unhex(ZSTD_WITH_SIZE_HEX)).unwrap(), payload());
-        assert_eq!(zstd_decompress(&unhex(ZSTD_NO_SIZE_HEX)).unwrap(), payload());
-        assert_eq!(decompress(&compressed, MessageSysFlag::ZSTD_TYPE).unwrap(), payload());
+        assert_eq!(
+            &compressed[..4],
+            &[0x28, 0xB5, 0x2F, 0xFD],
+            "zstd magic number"
+        );
+        assert_eq!(
+            zstd_decompress(&unhex(ZSTD_WITH_SIZE_HEX)).unwrap(),
+            payload()
+        );
+        assert_eq!(
+            zstd_decompress(&unhex(ZSTD_NO_SIZE_HEX)).unwrap(),
+            payload()
+        );
+        assert_eq!(
+            decompress(&compressed, MessageSysFlag::ZSTD_TYPE).unwrap(),
+            payload()
+        );
     }
 
     #[test]
@@ -260,22 +341,37 @@ mod tests {
                 matches!(err, Error::Decode(ref m) if m == &format!("unsupported compression type: {ctype}")),
                 "{err}"
             );
-            assert!(matches!(decompress(&payload(), ctype), Err(Error::Decode(_))));
+            assert!(matches!(
+                decompress(&payload(), ctype),
+                Err(Error::Decode(_))
+            ));
         }
     }
 
     #[test]
     fn garbage_input_is_an_error_not_a_panic() {
-        assert!(matches!(zlib_decompress(b"not-a-zlib-stream"), Err(Error::Decode(_))));
-        assert!(matches!(lz4_decompress(b"not-an-lz4-frame"), Err(Error::Decode(_))));
-        assert!(matches!(zstd_decompress(b"not-zstd"), Err(Error::Decode(_))));
+        assert!(matches!(
+            zlib_decompress(b"not-a-zlib-stream"),
+            Err(Error::Decode(_))
+        ));
+        assert!(matches!(
+            lz4_decompress(b"not-an-lz4-frame"),
+            Err(Error::Decode(_))
+        ));
+        assert!(matches!(
+            zstd_decompress(b"not-zstd"),
+            Err(Error::Decode(_))
+        ));
         // 截断的 zlib 流必须报错，而不是静默返回半截数据
         let compressed = zlib_compress(&payload(), 5).unwrap();
         let truncated = &compressed[..compressed.len() / 2];
         assert!(matches!(zlib_decompress(truncated), Err(Error::Decode(_))));
         // 截断的 lz4 frame 同理
         let lz = lz4_compress(&payload()).unwrap();
-        assert!(matches!(lz4_decompress(&lz[..lz.len() / 2]), Err(Error::Decode(_))));
+        assert!(matches!(
+            lz4_decompress(&lz[..lz.len() / 2]),
+            Err(Error::Decode(_))
+        ));
         assert!(matches!(zlib_compress(b"x", 10), Err(Error::Encode(_))));
     }
 }

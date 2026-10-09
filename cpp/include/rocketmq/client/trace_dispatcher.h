@@ -85,6 +85,12 @@ public:
     void setHostConsumer(DefaultMQPushConsumer* host) { hostConsumer_ = host; }
     void setHostClientId(const std::string& id) { clientId_ = id; }
     std::string clientId() const { return clientId_; }
+    // 对应 Java `AsyncTraceDispatcher#namespaceV2`（字段 :79，setter :147）：宿主门面
+    // （生产者 / 推送消费者）把自己那份 5.x 命名空间传进来，start() 时 `traceProducer`
+    // 同步（Java `start():155` `traceProducer.setNamespaceV2(namespaceV2)`）。不传则轨迹
+    // 生产者裸奔 —— broker 按实例命名空间解析轨迹 topic，写错实例就查不到轨迹。
+    void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
+    const std::string& namespaceV2() const { return namespaceV2_; }
     int64_t discardCount() const { return discardCount_.load(); }
     int32_t batchNum() const { return batchNum_; }
     bool isStarted() const { return started_.load(); }
@@ -113,6 +119,8 @@ private:
     int32_t batchNum_;
     int32_t maxMsgSize_ = MAX_MSG_SIZE;
     std::string traceTopicName_;
+    // Java AsyncTraceDispatcher#namespaceV2：宿主设置，start() 传导给内部轨迹生产者
+    std::string namespaceV2_;
     std::shared_ptr<void> rpcHook_;
     std::unique_ptr<DefaultMQProducer> traceProducer_;
 

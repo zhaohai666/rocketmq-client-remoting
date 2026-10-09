@@ -56,6 +56,12 @@ pub const PROPERTY_POP_TIME: &str = "POP_TIME";
 pub const PROPERTY_FIRST_POP_TIME: &str = "1ST_POP_TIME";
 pub const PROPERTY_INVISIBLE_TIME: &str = "INVISIBLE_TIME";
 pub const PROPERTY_DELAY_TIME: &str = "DELAY_TIME";
+/// Java `MessageConst.PROPERTY_TIMER_DELAY_SEC`：定时消息「延迟秒数」。
+pub const PROPERTY_TIMER_DELAY_SEC: &str = "TIMER_DELAY_SEC";
+/// Java `MessageConst.PROPERTY_TIMER_DELAY_MS`：定时消息「延迟毫秒数」。
+pub const PROPERTY_TIMER_DELAY_MS: &str = "TIMER_DELAY_MS";
+/// Java `MessageConst.PROPERTY_TIMER_DELIVER_MS`：定时消息「绝对投递时刻（毫秒）」。
+pub const PROPERTY_TIMER_DELIVER_MS: &str = "TIMER_DELIVER_MS";
 pub const PROPERTY_START_TIME: &str = "START_TIME";
 pub const PROPERTY_END_TIME: &str = "END_TIME";
 pub const PROPERTY_EXPIRE_TIME: &str = "EXPIRE_TIME";
@@ -157,11 +163,18 @@ mod tests {
         assert_eq!(PROPERTY_MSG_REGION, "MSG_REGION");
         assert_eq!(PROPERTY_TRACE_SWITCH, "TRACE_ON");
         assert_eq!(PROPERTY_FIRST_POP_TIME, "1ST_POP_TIME");
+        // 定时消息三个键：与 Java MessageConst 一字不差（写进消息属性区的协议字面量）
+        assert_eq!(PROPERTY_TIMER_DELAY_SEC, "TIMER_DELAY_SEC");
+        assert_eq!(PROPERTY_TIMER_DELAY_MS, "TIMER_DELAY_MS");
+        assert_eq!(PROPERTY_TIMER_DELIVER_MS, "TIMER_DELIVER_MS");
     }
 
     #[test]
     fn index_types_and_misc() {
-        assert_eq!((INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE, INDEX_TAG_TYPE), ("K", "U", "T"));
+        assert_eq!(
+            (INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE, INDEX_TAG_TYPE),
+            ("K", "U", "T")
+        );
         assert_eq!(message_id_prefix(), MESSAGE_ID_PREFIX);
         assert_eq!(CHARACTER_MAX_LENGTH, 255);
         assert_eq!(KEY_SEPARATOR, " ");

@@ -13,8 +13,9 @@ declare(strict_types=1);
 // PHP 的 crc32() 可能返回负数，用 sprintf('%u') 转无符号；**不是** Java
 // UtilAll.crc32 的 &0x7FFFFFFF 口径，两边数字本来就差 2^31，不比数字）。
 //
-// codec 面覆盖 zlib（gzcompress）+ lz4（CompressionCodec 纯 block-format 实现）
-// + zstd（CompressionCodec Raw/RLE 帧）——见 2026-10-08。接收端按 sysFlag 类型位
+// codec 面覆盖 zlib（gzcompress）+ lz4（CompressionCodec 的纯 PHP **LZ4 Frame**
+// 实现，frame 内部块就是 block-format）+ zstd（优先 `zstd` CLI，退回纯 PHP
+// Raw/RLE 帧）——见 2026-10-08。接收端按 sysFlag 类型位
 // 自动解压，所以「B 能解 A 压的」正是矩阵要证明的部分。
 //
 // 退出码（对齐 Python/Go 腿，脚本据此区分）：0 ok / 1 普通失败（含发送失败，

@@ -241,6 +241,18 @@ void StreamTypeRPCHook::doBeforeRequest(const std::string& remoteAddr,
     request.addExtField(MixAll::REQ_T, std::to_string(RequestType::STREAM));
 }
 
+void NamespaceRpcHook::doBeforeRequest(const std::string& remoteAddr,
+                                       RemotingCommand& request) {
+    (void)remoteAddr;
+    // Java: if (StringUtils.isNotEmpty(clientConfig.getNamespaceV2())) { ... }
+    // 空命名空间时**什么都不加**（不物化 nsd/ns，也不动 extFields 里已有的键）；
+    // doAfterResponse 与 Java 同为空，不覆写基类默认。
+    const std::string namespaceV2 = namespaceV2_ ? namespaceV2_() : std::string();
+    if (namespaceV2.empty()) return;
+    request.addExtField(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, "true");
+    request.addExtField(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, namespaceV2);
+}
+
 void ChainedRPCHook::doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) {
     // 严格按注册顺序执行 —— 顺序决定 ACL 签名覆盖的字段集（见头文件注释）。
     for (const std::shared_ptr<RPCHook>& hook : hooks_) {
@@ -256,13 +268,24 @@ void ChainedRPCHook::doAfterResponse(const std::string& remoteAddr, const Remoti
 }
 
 std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
-                                             const std::shared_ptr<RPCHook>& userHook) {
+                                             const std::shared_ptr<RPCHook>& userHook,
+                                             const std::function<std::string()>& namespaceV2Getter) {
     // Java MQClientAPIImpl:329-335 的注册顺序是 Namespace → Stream → 用户钩子 →
-    // DynamicalExtField；本端口没有前两者之外的钩子，只保留 Stream/用户这一对。
-    if (!enableStreamRequestType) return userHook;
+    // DynamicalExtField；本端口没有 DynamicalExtField 这一环（时区字段不写），其余三环
+    // 都在这里按同一顺序装链（见 rpchook.h 的链序说明）。
+    // 只要门面给了取值函数就**无条件**装 NamespaceRpcHook（Java 是无条件注册
+    // `new NamespaceRpcHook(clientConfig)`，命名空间在每笔请求的 doBeforeRequest 里现读）：
+    // 在这里按「装链那一刻 namespaceV2 为空」省掉它，会让 start() 之后再 setNamespaceV2
+    // 静默失效。getter 为空才代表「门面根本没接线」。
+    const bool hasNamespace = namespaceV2Getter != nullptr;
+    if (!hasNamespace && !enableStreamRequestType) return userHook;
     std::vector<std::shared_ptr<RPCHook>> hooks;
-    hooks.push_back(std::make_shared<StreamTypeRPCHook>());
+    // 取值函数直接透传：钩子每笔请求实时读配置，start() 之后再 setNamespaceV2 也生效
+    if (hasNamespace) hooks.push_back(std::make_shared<NamespaceRpcHook>(namespaceV2Getter));
+    if (enableStreamRequestType) hooks.push_back(std::make_shared<StreamTypeRPCHook>());
     if (userHook) hooks.push_back(userHook);
+    // 只剩一个钩子时原样返回（不套链壳）：门面「只配了 namespaceV2」的形态
+    if (hooks.size() == 1) return hooks.front();
     return std::make_shared<ChainedRPCHook>(std::move(hooks));
 }
 

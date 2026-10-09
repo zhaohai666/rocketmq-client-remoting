@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
 
     // 日志保持干净：默认 INFO，良性长轮询超时（DEBUG）被抑制
     // 日志保持干净：默认 INFO，良性长轮询超时（DEBUG）被抑制。
-    // 但若外部显式设置了 ROCKETMQ_CPP_LOG_LEVEL，则尊重它——真机排查时不改代码即可提级别。
+    // 但若外部显式设置了 ROCKETMQ_CLIENT_LOG_LEVEL，则尊重它——真机排查时不改代码即可提级别。
     if (!logLevelSetFromEnv()) {
         setLogLevel(LOG_INFO);
     }

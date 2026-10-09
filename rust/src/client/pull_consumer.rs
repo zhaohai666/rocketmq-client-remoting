@@ -188,6 +188,10 @@ pub struct PullConsumerConfig {
     /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
+    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
+    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
+    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
+    pub namespace_v2: Option<String>,
     /// Java `ClientConfig#unitMode`（默认 false）：随回投/鉴权/消息过滤上线。
     pub unit_mode: bool,
     /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
@@ -228,6 +232,7 @@ impl Default for PullConsumerConfig {
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
+            namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: true,
             // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
@@ -373,11 +378,7 @@ impl DefaultMQPullConsumer {
     /// 改配置（Python 的直接赋属性）。
     pub fn update_config(&self, f: impl FnOnce(&mut PullConsumerConfig)) {
         {
-            let mut w = self
-                .inner
-                .cfg
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
             f(&mut w);
         }
     }
@@ -426,6 +427,19 @@ impl DefaultMQPullConsumer {
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
+    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
+    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
+    pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
+        let namespace_v2 = namespace_v2.map(str::to_string);
+        self.update_config(|c| c.namespace_v2 = namespace_v2);
+    }
+
+    /// Java `ClientConfig#getNamespaceV2`。
+    pub fn get_namespace_v2(&self) -> Option<String> {
+        self.config().namespace_v2
     }
 
     /// Java `ClientConfig#setUnitMode`。
@@ -519,7 +533,11 @@ impl DefaultMQPullConsumer {
 
     /// Python `_filter_messages_for_delivery`：拉模式只跑钩子，不做客户端 tag
     /// 过滤（Java 会，见模块头偏离 1）。
-    fn filter_messages_for_delivery(&self, mq: &MessageQueue, msgs: Vec<MessageExt>) -> Vec<MessageExt> {
+    fn filter_messages_for_delivery(
+        &self,
+        mq: &MessageQueue,
+        msgs: Vec<MessageExt>,
+    ) -> Vec<MessageExt> {
         let group = self.consumer_group();
         crate::client::consumer::filter_messages_for_delivery(
             &group,
@@ -573,16 +591,13 @@ impl DefaultMQPullConsumer {
             &cfg.instance_name,
             cfg.message_model == MessageModel::CLUSTERING,
         );
-        let client_id = cfg
-            .client_id
-            .clone()
-            .unwrap_or_else(|| {
-                MixAll::build_default_client_id(
-                    &instance_name,
-                    cfg.unit_name.as_deref(),
-                    cfg.enable_stream_request_type,
-                )
-            });
+        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
+            MixAll::build_default_client_id(
+                &instance_name,
+                cfg.unit_name.as_deref(),
+                cfg.enable_stream_request_type,
+            )
+        });
         self.update_config(|c| {
             c.client_id = Some(client_id.clone());
             c.instance_name = instance_name;
@@ -591,6 +606,7 @@ impl DefaultMQPullConsumer {
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
+            namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             ..Default::default()
@@ -791,6 +807,85 @@ impl DefaultMQPullConsumer {
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
+    /// Python `fetch_message_queues_in_balance`：本实例「平衡后」应负责的队列
+    /// （Java `MQPullConsumer:187`，官方 `example/simple/PullConsumer.java:62` 就靠它
+    /// 决定去拉哪些队列）。
+    ///
+    /// Java（`DefaultMQPullConsumerImpl:120-135`）读的是后台 rebalance 填出来的
+    /// `processQueueTable`；本端口拉模式没有那条后台线程（见模块头偏离说明），所以按
+    /// `RebalanceImpl.rebalanceByTopic` 的**同一条公式**当场算：BROADCASTING 全量；
+    /// CLUSTERING 用订阅信息（读位口径，与 [`Self::fetch_subscribe_message_queues`] 同源）
+    /// 作 mqAll、GET_CONSUMER_LIST_BY_GROUP(38) 作 cidAll，再交给本实例配置的分配策略取
+    /// 自己那一份。公式与 push 消费者的 rebalance 共用一份口径，两处一旦分叉，同一队列
+    /// 会被两个实例同时认领。
+    ///
+    /// 查不到路由/消费者列表时**保留现有分配**：退回本地 `pull_from_which_node`
+    /// （Java 同名表 `pullFromWhichNodeTable`）的键集。绝不回退成「独占全部队列」——
+    /// 那会让同组多实例互相重复消费。注意「算出来确实是空」（队列全分给了同组别人）
+    /// 与「算不动」是两回事，前者如实返回空集（Java 的表里那时就是空的）。
+    pub async fn fetch_message_queues_in_balance(&self, topic: &str) -> Result<Vec<MessageQueue>> {
+        let client = self.require_client()?; // Java isRunning()：未启动直接报错
+        let cfg = self.config();
+        let mut pulled: Vec<MessageQueue> = lock(&self.inner.pull_from_which_node)
+            .keys()
+            .filter(|mq| mq.topic == topic)
+            .cloned()
+            .collect();
+        sort_mqs(&mut pulled);
+
+        if cfg.message_model == MessageModel::BROADCASTING {
+            // Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
+            let mut all = client.get_topic_subscribe_info(topic).await;
+            if all.is_empty() {
+                return Ok(pulled);
+            }
+            sort_mqs(&mut all);
+            return Ok(all);
+        }
+
+        let mut mq_all = client.get_topic_subscribe_info(topic).await;
+        // Java :128-131 逐个比对表键的 topic；别让策略的意外返回值把别的 topic
+        // 混进调用方的拉取循环。
+        mq_all.retain(|mq| mq.topic == topic);
+        sort_mqs(&mut mq_all);
+        let cid_all = client
+            .get_consumer_id_list_by_group(topic, &cfg.consumer_group, 5000)
+            .await;
+
+        let mut allocated: Option<Vec<MessageQueue>> = None;
+        if !mq_all.is_empty() {
+            if let Some(cids) = cid_all.filter(|c| !c.is_empty()) {
+                let mut sorted_cids = cids;
+                sorted_cids.sort();
+                // 对应 Java RebalanceImpl.rebalanceByTopic 的 catch (Throwable)：策略异常
+                // 只记日志、本轮保持现有分配，绝不能把队列撤走。
+                match self.allocate_message_queue_strategy().allocate(
+                    &cfg.consumer_group,
+                    cfg.client_id.as_deref().unwrap_or(""),
+                    &mq_all,
+                    &sorted_cids,
+                ) {
+                    Ok(got) => allocated = Some(got),
+                    Err(e) => rmq_debug!("fetchMessageQueuesInBalance allocate failed: {e}"),
+                }
+            }
+        }
+        let out = match allocated {
+            Some(v) => v,
+            None => {
+                rmq_debug!(
+                    "fetchMessageQueuesInBalance: no route/consumer list for {}/{}, keep current assignment",
+                    cfg.consumer_group,
+                    topic
+                );
+                pulled
+            }
+        };
+        let mut out: Vec<MessageQueue> = out.into_iter().filter(|mq| mq.topic == topic).collect();
+        sort_mqs(&mut out);
+        Ok(out)
+    }
+
     /// Python `pull(mq, sub_expression="*", offset=0, max_nums=32, timeout=None)`：
     /// **短轮询**（`suspend=False`），位点由调用方 `update_consume_offset` 提交。
     pub async fn pull(
@@ -831,7 +926,9 @@ impl DefaultMQPullConsumer {
             .await?;
         lock(&self.inner.pull_from_which_node).insert(
             mq.clone(),
-            result.suggest_which_broker_id.unwrap_or(MixAll::MASTER_ID as i64),
+            result
+                .suggest_which_broker_id
+                .unwrap_or(MixAll::MASTER_ID as i64),
         );
         Ok(self.apply_delivery_filter(mq, result))
     }
@@ -877,7 +974,9 @@ impl DefaultMQPullConsumer {
             .await?;
         lock(&self.inner.pull_from_which_node).insert(
             mq.clone(),
-            result.suggest_which_broker_id.unwrap_or(MixAll::MASTER_ID as i64),
+            result
+                .suggest_which_broker_id
+                .unwrap_or(MixAll::MASTER_ID as i64),
         );
         Ok(self.apply_delivery_filter(mq, result))
     }
@@ -923,13 +1022,17 @@ impl DefaultMQPullConsumer {
     /// Python `max_offset`。
     pub async fn max_offset(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
-        client.get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None).await
+        client
+            .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await
     }
 
     /// Python `min_offset`。
     pub async fn min_offset(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
-        client.get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None).await
+        client
+            .get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await
     }
 
     /// Python `earliest_msg_store_time`（GET_EARLIEST_MSG_STORETIME=32）。
@@ -966,7 +1069,15 @@ impl DefaultMQPullConsumer {
             .find_broker_address_in_publish(&broker)
             .ok_or_else(|| Error::client(format!("Broker[{broker}] master node does not exist")))?;
         client
-            .consumer_send_msg_back(&group, msg, delay_level, None, 5_000, &addr, self.unit_mode())
+            .consumer_send_msg_back(
+                &group,
+                msg,
+                delay_level,
+                None,
+                5_000,
+                &addr,
+                self.unit_mode(),
+            )
             .await
     }
 
@@ -1079,7 +1190,12 @@ async fn send_pull_heartbeat(inner: &PullInner) -> usize {
 /// start() 里已同步发过一轮，循环的第一次是"第二个心跳周期"。
 async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
-        if wait_or_stop(&mut rx, read_cfg(&inner.cfg).heartbeat_broker_interval_millis).await {
+        if wait_or_stop(
+            &mut rx,
+            read_cfg(&inner.cfg).heartbeat_broker_interval_millis,
+        )
+        .await
+        {
             return;
         }
         if !read_cfg(&inner.cfg).heartbeat_enabled {
@@ -1105,6 +1221,10 @@ pub struct LitePullConsumerConfig {
     /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
+    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
+    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
+    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
+    pub namespace_v2: Option<String>,
     /// Java `ClientConfig#unitMode`（默认 false）：随回投/鉴权/消息过滤上线。
     pub unit_mode: bool,
     /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
@@ -1156,6 +1276,7 @@ impl Default for LitePullConsumerConfig {
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
+            namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: true,
             // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
@@ -1362,11 +1483,7 @@ impl DefaultLitePullConsumer {
     /// 改配置（Python 的直接赋属性 + 一批 `set_*`；钳制规则照抄 setter）。
     pub fn update_config(&self, f: impl FnOnce(&mut LitePullConsumerConfig)) {
         {
-            let mut w = self
-                .inner
-                .cfg
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
             f(&mut w);
             w.pull_batch_size = w.pull_batch_size.max(1);
             w.poll_timeout_millis = w.poll_timeout_millis.max(0);
@@ -1434,6 +1551,19 @@ impl DefaultLitePullConsumer {
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
+    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
+    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
+    pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
+        let namespace_v2 = namespace_v2.map(str::to_string);
+        self.update_config(|c| c.namespace_v2 = namespace_v2);
+    }
+
+    /// Java `ClientConfig#getNamespaceV2`。
+    pub fn get_namespace_v2(&self) -> Option<String> {
+        self.config().namespace_v2
     }
 
     /// Java `ClientConfig#setUnitMode`。
@@ -1693,16 +1823,13 @@ impl DefaultLitePullConsumer {
             &cfg.instance_name,
             cfg.message_model == MessageModel::CLUSTERING,
         );
-        let client_id = cfg
-            .client_id
-            .clone()
-            .unwrap_or_else(|| {
-                MixAll::build_default_client_id(
-                    &instance_name,
-                    cfg.unit_name.as_deref(),
-                    cfg.enable_stream_request_type,
-                )
-            });
+        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
+            MixAll::build_default_client_id(
+                &instance_name,
+                cfg.unit_name.as_deref(),
+                cfg.enable_stream_request_type,
+            )
+        });
         self.update_config(|c| {
             c.client_id = Some(client_id.clone());
             c.instance_name = instance_name;
@@ -1711,6 +1838,7 @@ impl DefaultLitePullConsumer {
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
+            namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             ..Default::default()
@@ -1878,7 +2006,11 @@ impl DefaultLitePullConsumer {
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
         };
-        let mut topics: Vec<String> = lock(&self.inner.state).subscription.keys().cloned().collect();
+        let mut topics: Vec<String> = lock(&self.inner.state)
+            .subscription
+            .keys()
+            .cloned()
+            .collect();
         for mq in lock(&self.inner.state).assigned.values() {
             if !topics.contains(&mq.topic) {
                 topics.push(mq.topic.clone());
@@ -1919,11 +2051,8 @@ impl DefaultLitePullConsumer {
         )));
     }
 
-    async fn run_guarded<F, Fut>(
-        weak: Weak<LiteInner>,
-        stop: watch::Receiver<bool>,
-        make: F,
-    ) where
+    async fn run_guarded<F, Fut>(weak: Weak<LiteInner>, stop: watch::Receiver<bool>, make: F)
+    where
         F: FnOnce(Arc<LiteInner>, watch::Receiver<bool>) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
@@ -1989,7 +2118,12 @@ impl DefaultLitePullConsumer {
             .next_offset
             .keys()
             .filter_map(|k| state.assigned.get(k))
-            .map(|mq| ((mq.topic.clone(), mq.broker_name.clone(), mq.queue_id), mq_key(mq)))
+            .map(|mq| {
+                (
+                    (mq.topic.clone(), mq.broker_name.clone(), mq.queue_id),
+                    mq_key(mq),
+                )
+            })
             .collect();
         for m in msgs {
             let Some(key) = held.get(&(
@@ -2035,7 +2169,9 @@ impl DefaultLitePullConsumer {
     /// Python `seek_to_begin`。
     pub async fn seek_to_begin(&self, mq: &MessageQueue) -> Result<()> {
         let client = Self::require_client(&self.inner)?;
-        let offset = client.get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None).await?;
+        let offset = client
+            .get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await?;
         self.seek(mq, offset);
         Ok(())
     }
@@ -2043,7 +2179,9 @@ impl DefaultLitePullConsumer {
     /// Python `seek_to_end`。
     pub async fn seek_to_end(&self, mq: &MessageQueue) -> Result<()> {
         let client = Self::require_client(&self.inner)?;
-        let offset = client.get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None).await?;
+        let offset = client
+            .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await?;
         self.seek(mq, offset);
         Ok(())
     }
@@ -2099,7 +2237,12 @@ impl DefaultLitePullConsumer {
             let state = lock(&self.inner.state);
             scope
                 .iter()
-                .map(|k| (k.clone(), state.consume_offset.get(k).copied().unwrap_or(-1)))
+                .map(|k| {
+                    (
+                        k.clone(),
+                        state.consume_offset.get(k).copied().unwrap_or(-1),
+                    )
+                })
                 .collect()
         };
         self.commit_targets(targets, &scope, true).await
@@ -2136,7 +2279,12 @@ impl DefaultLitePullConsumer {
             let state = lock(&self.inner.state);
             scope
                 .iter()
-                .map(|k| (k.clone(), state.consume_offset.get(k).copied().unwrap_or(-1)))
+                .map(|k| {
+                    (
+                        k.clone(),
+                        state.consume_offset.get(k).copied().unwrap_or(-1),
+                    )
+                })
                 .collect()
         };
         self.commit_targets(targets, &scope, persist).await
@@ -2217,9 +2365,10 @@ impl DefaultLitePullConsumer {
                     state.offset_table.remove(&key);
                     continue;
                 }
-                if let (Some(mq), Some(offset)) =
-                    (state.assigned.get(&key), state.offset_table.get(&key).copied())
-                {
+                if let (Some(mq), Some(offset)) = (
+                    state.assigned.get(&key),
+                    state.offset_table.get(&key).copied(),
+                ) {
                     out.push((mq.clone(), offset));
                 }
             }
@@ -2385,7 +2534,8 @@ impl DefaultLitePullConsumer {
         // 本轮的分配起点：本 topic 当前的分配。策略抛错时以它兜底——
         // Java `RebalanceImpl#rebalanceByTopic` 在 `catch (Throwable)` 里直接 `return false`，
         // 位置在 `updateProcessQueueTableInRebalance` **之前**，所以一次分配异常不会把队列撤走。
-        let baseline: Vec<MessageQueue> = lock(&self.inner.state).assigned.values().cloned().collect();
+        let baseline: Vec<MessageQueue> =
+            lock(&self.inner.state).assigned.values().cloned().collect();
         // topic -> (全部队列, 分到的队列)，用于 MessageQueueListener 回调
         let mut per_topic: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = Vec::new();
         for topic in topics {
@@ -2404,15 +2554,18 @@ impl DefaultLitePullConsumer {
                 cid_all.push(client_id.clone());
             }
             cid_all.sort();
-            let allocated: Vec<MessageQueue> = match strategy
-                .allocate(&group, &client_id, &mq_all, &cid_all)
-            {
-                Ok(got) => got,
-                Err(e) => {
-                    rmq_warn!("lite rebalance: allocate failed for {topic}: {e}");
-                    baseline.iter().filter(|mq| mq.topic == topic).cloned().collect()
-                }
-            };
+            let allocated: Vec<MessageQueue> =
+                match strategy.allocate(&group, &client_id, &mq_all, &cid_all) {
+                    Ok(got) => got,
+                    Err(e) => {
+                        rmq_warn!("lite rebalance: allocate failed for {topic}: {e}");
+                        baseline
+                            .iter()
+                            .filter(|mq| mq.topic == topic)
+                            .cloned()
+                            .collect()
+                    }
+                };
             for mq in &allocated {
                 new_assigned.insert(mq_key(mq), mq.clone());
             }
@@ -2429,7 +2582,11 @@ impl DefaultLitePullConsumer {
                 .filter_map(|k| new_assigned.get(k))
                 .cloned()
                 .collect();
-            let removed: Vec<String> = old.keys().filter(|k| !new_assigned.contains_key(*k)).cloned().collect();
+            let removed: Vec<String> = old
+                .keys()
+                .filter(|k| !new_assigned.contains_key(*k))
+                .cloned()
+                .collect();
             let changed = !added.is_empty() || !removed.is_empty();
             // 撤销的队列要连着整份 MessageQueueState 一起丢（Java removeUnnecessaryMessageQueue
             // = persist(mq) 再 removeOffset(mq)）。persist 是 RPC，抱着锁做网络会把整条
@@ -2454,11 +2611,7 @@ impl DefaultLitePullConsumer {
                 per_topic
                     .into_iter()
                     .filter(|(t, _, divided)| {
-                        !divided.is_empty()
-                            || state
-                                .assigned
-                                .values()
-                                .any(|mq| &mq.topic == t)
+                        !divided.is_empty() || state.assigned.values().any(|mq| &mq.topic == t)
                     })
                     .collect()
             } else {
@@ -2507,7 +2660,9 @@ impl DefaultLitePullConsumer {
             Some(offset) => offset,
             None => match resolve_initial_offset(&self.inner, &client, mq).await {
                 Ok(offset) => {
-                    lock(&self.inner.state).next_offset.insert(key.clone(), offset);
+                    lock(&self.inner.state)
+                        .next_offset
+                        .insert(key.clone(), offset);
                     offset
                 }
                 Err(e) => {
@@ -2558,7 +2713,9 @@ impl DefaultLitePullConsumer {
         let intact = {
             let mut state = lock(&self.inner.state);
             if state.next_offset.get(&key).copied() == Some(offset) {
-                state.next_offset.insert(key.clone(), result.next_begin_offset);
+                state
+                    .next_offset
+                    .insert(key.clone(), result.next_begin_offset);
                 true
             } else {
                 false
@@ -2605,7 +2762,13 @@ async fn resolve_initial_offset(
         return Ok(offset);
     }
     match client
-        .query_consumer_offset(&cfg.consumer_group, mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None, false)
+        .query_consumer_offset(
+            &cfg.consumer_group,
+            mq,
+            LITE_PULL_RPC_TIMEOUT_MILLIS,
+            None,
+            false,
+        )
         .await
     {
         Ok(Some(offset)) => return Ok(offset),
@@ -2626,7 +2789,9 @@ async fn resolve_initial_offset(
             .search_offset_by_timestamp(mq, ts, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
             .await;
     }
-    client.get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None).await
+    client
+        .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+        .await
 }
 
 /// Python `_heartbeat_loop` 里那份报文：只带**本消费者自己**的 ConsumerData
@@ -2648,7 +2813,11 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
         cfg.message_model,
         cfg.consume_from_where,
     );
-    cd.subscription_data_set = lock(&inner.state).subscription_data.values().cloned().collect();
+    cd.subscription_data_set = lock(&inner.state)
+        .subscription_data
+        .values()
+        .cloned()
+        .collect();
     // Java `MQClientInstance:1039`：心跳里的 unitMode 来自消费者自己的 ClientConfig
     cd.unit_mode = cfg.unit_mode;
     hb.consumer_data_set.push(cd);
@@ -2669,7 +2838,10 @@ async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     let hb = build_lite_heartbeat(inner);
     let mut ok = 0;
     for addr in client.get_all_broker_addrs() {
-        match client.send_heartbeat(&addr, &hb, LITE_HEARTBEAT_TIMEOUT_MILLIS).await {
+        match client
+            .send_heartbeat(&addr, &hb, LITE_HEARTBEAT_TIMEOUT_MILLIS)
+            .await
+        {
             Ok(()) => ok += 1,
             Err(e) => rmq_debug!("lite heartbeat to {addr} failed: {e}"),
         }
@@ -2752,6 +2924,7 @@ mod tests {
     // `send_retry_tests` 同款，但只关心 34/35 两号报文。
     use crate::common::message_decoder::encode_message_ext;
     use crate::common::sysflag::PermName;
+    use crate::remoting::protocol::body::GetConsumerListByGroupResponseBody;
     use crate::remoting::protocol::codes::{request_code, response_code};
     use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
     use crate::remoting::protocol::RemotingCommand;
@@ -2802,14 +2975,20 @@ mod tests {
             pull.set_namesrv_addr("127.0.0.1:1");
             let err = pull.start().await.expect_err("pull: 非法组名必须本地失败");
             assert!(err.to_string().contains(needle), "pull {group}: {err}");
-            assert!(!pull.is_started(), "pull {group}: 失败的 start 必须回滚 started");
+            assert!(
+                !pull.is_started(),
+                "pull {group}: 失败的 start 必须回滚 started"
+            );
 
             let lite = DefaultLitePullConsumer::new(group).expect("构造不该提前拒绝");
             lite.set_namesrv_addr("127.0.0.1:1");
             lite.subscribe("T", "TagA");
             let err = lite.start().await.expect_err("lite: 非法组名必须本地失败");
             assert!(err.to_string().contains(needle), "lite {group}: {err}");
-            assert!(!lite.is_started(), "lite {group}: 失败的 start 必须回滚 started");
+            assert!(
+                !lite.is_started(),
+                "lite {group}: 失败的 start 必须回滚 started"
+            );
         }
     }
 
@@ -2827,7 +3006,11 @@ mod tests {
                     .map(|_| ())
                     .err()
                     .map(|e| e.to_string()),
-                _ => c.fetch_consume_offset(&mq).await.err().map(|e| e.to_string()),
+                _ => c
+                    .fetch_consume_offset(&mq)
+                    .await
+                    .err()
+                    .map(|e| e.to_string()),
             };
             assert_eq!(
                 r,
@@ -2842,7 +3025,8 @@ mod tests {
         assert!(c.create_topic("t2", 4, 0).await.is_err());
         assert!(c.update_consume_offset(&mq, 0).await.is_err());
         assert!(c.fetch_subscribe_message_queues("T").await.is_err());
-        assert!(c.send_message_back(&msg("T", "broker-a", 0, 0, "b"), 3)
+        assert!(c
+            .send_message_back(&msg("T", "broker-a", 0, 0, "b"), 3)
             .await
             .is_err());
         // 未 start 时 shutdown 是 no-op，不能抛
@@ -2854,7 +3038,12 @@ mod tests {
     async fn lite_consumer_requires_subscription_or_assign_before_start() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.set_namesrv_addr("127.0.0.1:9876");
-        let e = c.start().await.err().map(|e| e.to_string()).unwrap_or_default();
+        let e = c
+            .start()
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(
             e.contains("subscription is not set, call subscribe() or assign() first"),
             "{e}"
@@ -2862,7 +3051,12 @@ mod tests {
         // 缺 name server 的校验在前，且顺序与 Python 一致
         let c2 = DefaultLitePullConsumer::new("LitePG").unwrap();
         c2.subscribe("T", "*");
-        let e2 = c2.start().await.err().map(|e| e.to_string()).unwrap_or_default();
+        let e2 = c2
+            .start()
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(e2.contains("name server address is not set"), "{e2}");
         c2.shutdown();
     }
@@ -2887,7 +3081,10 @@ mod tests {
         assert_eq!(l.auto_commit_interval_millis, 5_000);
         assert_eq!(l.pull_interval_millis, 50);
         assert_eq!(l.pull_thread_nums, 1);
-        assert_eq!(l.consume_from_where, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        assert_eq!(
+            l.consume_from_where,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET
+        );
         // Java DefaultLitePullConsumer.java:168：默认 now-30min 的 14 位 yyyyMMddHHmmss
         assert_eq!(l.consume_timestamp.len(), 14);
         assert!(l.consume_timestamp.bytes().all(|b| b.is_ascii_digit()));
@@ -3006,9 +3203,17 @@ mod tests {
             state.next_offset.insert(mq_key(&q), 5);
         }
         assert_eq!(c.pull_cursor_of(&q), 5, "拉取游标 = 后台已经拉到的那一格");
-        assert_eq!(c.consume_cursor_of(&q), -1, "一条都没交付 ⇒ 已消费游标还是 -1");
+        assert_eq!(
+            c.consume_cursor_of(&q),
+            -1,
+            "一条都没交付 ⇒ 已消费游标还是 -1"
+        );
         // 缓冲里压着 3 条：交付之前不算已消费
-        c.enqueue((0..3).map(|i| msg("T", "broker-a", 0, i, &format!("m{i}"))).collect());
+        c.enqueue(
+            (0..3)
+                .map(|i| msg("T", "broker-a", 0, i, &format!("m{i}")))
+                .collect(),
+        );
         assert_eq!(c.consume_cursor_of(&q), -1, "没 poll 就不算已消费");
         let got = c.poll(Some(10)).await;
         assert_eq!(got.len(), 3);
@@ -3033,7 +3238,11 @@ mod tests {
         c.assign(&[q0.clone(), q1.clone()]);
         // commitAll 走的是已消费游标：一条都没交付 ⇒ 一格都不写
         c.commit().await.unwrap();
-        assert_eq!(c.pending_commit_of(&q0), -1, "commitAll 不提交没消费过的队列");
+        assert_eq!(
+            c.pending_commit_of(&q0),
+            -1,
+            "commitAll 不提交没消费过的队列"
+        );
 
         // 指定位点只写提交落点，两条游标一律不动
         let mut specified = BTreeMap::new();
@@ -3050,7 +3259,11 @@ mod tests {
         guarded.insert(mq_key(&q0), -1);
         guarded.insert(mq_key(&queue("T", "broker-a", 7)), 3);
         c.commit_offsets(&guarded, false).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q0), 5, "offset == -1 只记日志，不覆盖已有位点");
+        assert_eq!(
+            c.pending_commit_of(&q0),
+            5,
+            "offset == -1 只记日志，不覆盖已有位点"
+        );
         assert_eq!(
             c.pending_commit_of(&queue("T", "broker-a", 7)),
             -1,
@@ -3064,14 +3277,24 @@ mod tests {
         assert_eq!(c.pending_commit_of(&q0), 5, "空集合忽略这次提交");
 
         // commit(Set) 走的是已消费游标，不是任意指定值：未交付 ⇒ 守卫拦住
-        c.commit_queues(std::slice::from_ref(&q0), false).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q0), 5, "commit(Set) 在没有交付记录时不写 -1");
+        c.commit_queues(std::slice::from_ref(&q0), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.pending_commit_of(&q0),
+            5,
+            "commit(Set) 在没有交付记录时不写 -1"
+        );
 
         // assign 缩范围：撤掉的队列连着两条游标一起丢（Java updateAssignedMessageQueue），
         // 但内存位点表**不**清 —— 那份清理挂在 subscribe 模式的 rebalance 上（Java 同）。
         c.assign(std::slice::from_ref(&q0));
         assert_eq!(c.pull_cursor_of(&q1), -1, "assign 撤队列后拉取游标消失");
-        assert_eq!(c.consume_cursor_of(&q1), -1, "assign 撤队列后已消费游标消失");
+        assert_eq!(
+            c.consume_cursor_of(&q1),
+            -1,
+            "assign 撤队列后已消费游标消失"
+        );
         assert_eq!(c.pending_commit_of(&q1), 8, "assign 模式不碰 offsetStore");
         let mut late = BTreeMap::new();
         late.insert(mq_key(&q1), 99);
@@ -3081,8 +3304,14 @@ mod tests {
         // Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交只发被点名的
         // 队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、还没落盘的值就此
         // 丢掉。（这里没 start()，网络那半段自然跳过，验的是清理这半段。）
-        c.commit_queues(std::slice::from_ref(&q0), true).await.unwrap();
-        assert_eq!(c.pending_commit_of(&q1), -1, "persistAll 会把没点名的队列从内存表里丢掉");
+        c.commit_queues(std::slice::from_ref(&q0), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.pending_commit_of(&q1),
+            -1,
+            "persistAll 会把没点名的队列从内存表里丢掉"
+        );
         assert_eq!(c.pending_commit_of(&q0), 5, "点名的队列留在表里");
     }
 
@@ -3105,11 +3334,18 @@ mod tests {
         assert_eq!(lock(&c.inner.state).next_auto_commit_deadline, -1);
         // 没交付过：这次"到点提交"发不出任何东西，只把截止时刻推到下一个周期
         c.maybe_auto_commit().await;
-        assert!(lock(&c.inner.state).next_auto_commit_deadline > 0, "提交完要把截止时刻推到下一周期");
+        assert!(
+            lock(&c.inner.state).next_auto_commit_deadline > 0,
+            "提交完要把截止时刻推到下一周期"
+        );
         // 再查一次：还没到点，不该重复提交
         let before = lock(&c.inner.state).next_auto_commit_deadline;
         c.maybe_auto_commit().await;
-        assert_eq!(lock(&c.inner.state).next_auto_commit_deadline, before, "没到点就不该再提交");
+        assert_eq!(
+            lock(&c.inner.state).next_auto_commit_deadline,
+            before,
+            "没到点就不该再提交"
+        );
     }
 
     #[test]
@@ -3119,7 +3355,10 @@ mod tests {
         c.register_topic("b");
         c.register_topic("a");
         c.register_topic("a");
-        assert_eq!(c.register_topics(), vec!["NS%a".to_string(), "NS%b".to_string()]);
+        assert_eq!(
+            c.register_topics(),
+            vec!["NS%a".to_string(), "NS%b".to_string()]
+        );
     }
 
     // ---------------------------------------------------------- 缓冲 / poll / seek
@@ -3127,10 +3366,20 @@ mod tests {
     #[tokio::test]
     async fn poll_drains_buffer_and_times_out_when_empty() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.enqueue((0..3).map(|i| msg("T", "broker-a", 0, i, &format!("m{i}"))).collect());
+        c.enqueue(
+            (0..3)
+                .map(|i| msg("T", "broker-a", 0, i, &format!("m{i}")))
+                .collect(),
+        );
         let got = c.poll(Some(10)).await;
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0].body.as_ref().map(|b| String::from_utf8_lossy(b).to_string()), Some("m0".to_string()));
+        assert_eq!(
+            got[0]
+                .body
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).to_string()),
+            Some("m0".to_string())
+        );
         let started = std::time::Instant::now();
         assert!(c.poll(Some(30)).await.is_empty());
         assert!(started.elapsed() >= Duration::from_millis(30));
@@ -3153,22 +3402,27 @@ mod tests {
     fn seek_pins_offset_and_drops_earlier_buffered_messages() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.assign(&[queue("T", "broker-a", 0)]);
-        c.enqueue(
-            (0..5)
-                .map(|i| msg("T", "broker-a", 0, i, "b"))
-                .collect(),
-        );
+        c.enqueue((0..5).map(|i| msg("T", "broker-a", 0, i, "b")).collect());
         c.seek(&queue("T", "broker-a", 0), 3);
         assert_eq!(c.buffered_message_count(), 2);
         let state = lock(&c.inner.state);
-        assert_eq!(state.next_offset.get(&mq_key(&queue("T", "broker-a", 0))), Some(&3));
-        assert_eq!(state.seek_offset.get(&mq_key(&queue("T", "broker-a", 0))), Some(&3));
+        assert_eq!(
+            state.next_offset.get(&mq_key(&queue("T", "broker-a", 0))),
+            Some(&3)
+        );
+        assert_eq!(
+            state.seek_offset.get(&mq_key(&queue("T", "broker-a", 0))),
+            Some(&3)
+        );
     }
 
     #[test]
     fn seek_does_not_touch_other_queues_buffer() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.enqueue(vec![msg("T", "broker-a", 0, 0, "x"), msg("T", "broker-a", 1, 0, "y")]);
+        c.enqueue(vec![
+            msg("T", "broker-a", 0, 0, "x"),
+            msg("T", "broker-a", 1, 0, "y"),
+        ]);
         c.seek(&queue("T", "broker-a", 0), 5);
         assert_eq!(c.buffered_message_count(), 1);
     }
@@ -3236,13 +3490,94 @@ mod tests {
         });
         c.assign(&[queue("T", "broker-a", 0)]);
         let err = c.start().await.unwrap_err().to_string();
-        assert!(
-            err.contains("consumeTimestamp is invalid"),
-            "{err}"
-        );
+        assert!(err.contains("consumeTimestamp is invalid"), "{err}");
         // 合法墙钟不能被这条守卫误杀
         c.set_consume_timestamp("20230101000000");
         assert!(c.start().await.is_ok());
+        c.shutdown();
+    }
+
+    #[test]
+    fn namespace_v2_setter_getter_round_trip_on_both_pull_facades() {
+        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间
+        //（`NamespaceRpcHook` 的 `nsd`/`ns` 头），与 v1 `namespace` 互不影响。
+        let pull = DefaultMQPullConsumer::new("PullPG").expect("合法组名不该构造失败");
+        assert_eq!(pull.get_namespace_v2(), None, "默认不设");
+        pull.set_namespace_v2(Some("NS_V2"));
+        assert_eq!(pull.get_namespace_v2(), Some("NS_V2".to_string()));
+        assert_eq!(pull.config().namespace_v2, Some("NS_V2".to_string()));
+        pull.set_namespace_v2(None);
+        assert_eq!(
+            pull.get_namespace_v2(),
+            None,
+            "None = 清除（Java setNamespaceV2(null)）"
+        );
+
+        let lite = DefaultLitePullConsumer::new("LitePG").expect("合法组名不该构造失败");
+        assert_eq!(lite.get_namespace_v2(), None);
+        lite.set_namespace_v2(Some("NS_V2"));
+        assert_eq!(lite.get_namespace_v2(), Some("NS_V2".to_string()));
+        assert_eq!(lite.config().namespace_v2, Some("NS_V2".to_string()));
+        lite.set_namespace("ns1");
+        assert_eq!(
+            lite.get_namespace_v2(),
+            Some("NS_V2".to_string()),
+            "v1 namespace 不覆盖 v2"
+        );
+        lite.set_namespace_v2(None);
+        assert_eq!(lite.get_namespace_v2(), None);
+    }
+
+    #[tokio::test]
+    async fn lite_start_registers_namespace_hook_before_stream_and_user_acl() {
+        // 门面透传接缝：`LitePullConsumerConfig.namespace_v2` → `MQClientInstanceConfig`
+        // → 实例传输层。链序必须是 Namespace → Stream（拉模式默认开）→ 用户 ACL，
+        // 且 nsd/ns/ReqT 都在 ACL 签名之前写入（`MQClientAPIImpl:329-335`）。
+        use crate::remoting::protocol::RemotingCommand;
+        use crate::remoting::rpchook::{AclClientRPCHook, SessionCredentials};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = format!("LitePG-ns-order-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        c.update_config(|cfg| {
+            cfg.name_server_addrs = vec!["127.0.0.1:9876".to_string()];
+            cfg.client_id = Some(id.clone());
+            cfg.namespace_v2 = Some("NS_V2".to_string());
+        });
+        c.set_rpc_hook(Some(Arc::new(AclClientRPCHook::new(
+            SessionCredentials::new("AK", "SK"),
+        ))));
+        c.assign(&[queue("T", "broker-a", 0)]);
+        // 不可达 namesrv：start 仍成功（路由刷新软失败，同 `lite_start_rejects_epoch_millis_timestamp`）
+        c.start().await.expect("start 应成功");
+        let client = DefaultLitePullConsumer::require_client(&c.inner).unwrap();
+        let hooks = client.remoting_client().rpc_hooks();
+        assert_eq!(hooks.len(), 3, "Namespace → Stream → 用户 ACL");
+
+        let mut cmd = RemotingCommand::create_request_command(request_code::SEND_MESSAGE_V2, None);
+        hooks[0].do_before_request("127.0.0.1:9876", &mut cmd);
+        assert_eq!(
+            cmd.get_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD),
+            Some("true")
+        );
+        assert_eq!(
+            cmd.get_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD),
+            Some("NS_V2")
+        );
+        assert_eq!(
+            cmd.get_ext_field(MixAll::REQ_T),
+            None,
+            "第一位必须是 Namespace"
+        );
+        hooks[1].do_before_request("127.0.0.1:9876", &mut cmd);
+        // 轻量消费者默认 enable_stream_request_type=true ⇒ 第二位是 Stream
+        assert_eq!(cmd.get_ext_field(MixAll::REQ_T), Some("0"));
+        assert_eq!(cmd.get_ext_field(SessionCredentials::ACCESS_KEY), None);
+        hooks[2].do_before_request("127.0.0.1:9876", &mut cmd);
+        assert_eq!(
+            cmd.get_ext_field(SessionCredentials::ACCESS_KEY),
+            Some("AK")
+        );
+        assert!(cmd.get_ext_field(SessionCredentials::SIGNATURE).is_some());
         c.shutdown();
     }
 
@@ -3284,6 +3619,7 @@ mod tests {
         broker_name: String,
         master_addr: String,
         slave_addr: String,
+        read_queues: i32,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -3293,6 +3629,7 @@ mod tests {
                 let broker_name = broker_name.clone();
                 let master = master_addr.clone();
                 let slave = slave_addr.clone();
+                let read_queues = read_queues;
                 tokio::spawn(async move {
                     while let Some(frame) = read_frame(&mut stream).await {
                         let Ok(request) = RemotingCommand::decode(&frame) else {
@@ -3300,7 +3637,12 @@ mod tests {
                         };
                         let mut response = answer_for(&request, response_code::SUCCESS);
                         if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
-                            response.set_body(Some(route_body(&broker_name, &master, &slave)));
+                            response.set_body(Some(route_body(
+                                &broker_name,
+                                &master,
+                                &slave,
+                                read_queues,
+                            )));
                         }
                         write_frame(&mut stream, &mut response).await;
                     }
@@ -3310,12 +3652,15 @@ mod tests {
     }
 
     /// 「一台主 + 一台从」的路由 body（`TopicRouteData` 的 JSON 形态）。
-    fn route_body(broker_name: &str, master_addr: &str, slave_addr: &str) -> Vec<u8> {
+    /// `read_queues` 是读队列数：客户端按 `topicRouteData2TopicSubscribeInfo` 把它展开成
+    /// queueId 0..n-1，平衡视图的分片判据就靠它（1 个队列时「自己那一份」与「全部」同形，
+    /// 什么也证明不了）。
+    fn route_body(broker_name: &str, master_addr: &str, slave_addr: &str, read_queues: i32) -> Vec<u8> {
         let route = TopicRouteData {
             queue_datas: vec![QueueData::new(
                 broker_name,
-                1,
-                1,
+                read_queues,
+                read_queues,
                 PermName::PERM_READ | PermName::PERM_WRITE,
                 0,
             )],
@@ -3391,11 +3736,17 @@ mod tests {
         /// 预排的 PULL_MESSAGE 应答脚本（FIFO）：先到先得，排空了按 [`answer_pull`]
         /// 的「空 broker」形态应答。
         pull_scripts: Arc<Mutex<VecDeque<ScriptedPull>>>,
+        /// 38（GET_CONSUMER_LIST_BY_GROUP）的应答内容：本组当前有哪些 clientId。
+        /// 空 Vec 就是「broker 不认识这个组」（回空列表），与「查不到」在两端口
+        /// 是同一分支，够测平衡视图的兜底路径。
+        cid_list: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeBroker {
         async fn start() -> Arc<FakeBroker> {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 假 broker");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind 假 broker");
             let addr = listener.local_addr().expect("假 broker 地址").to_string();
             let broker = Arc::new(FakeBroker {
                 addr,
@@ -3403,6 +3754,7 @@ mod tests {
                 unregisters: Arc::new(Mutex::new(Vec::new())),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 pull_scripts: Arc::new(Mutex::new(VecDeque::new())),
+                cid_list: Arc::new(Mutex::new(Vec::new())),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -3437,14 +3789,15 @@ mod tests {
                                 _ => {}
                             }
                             if !request.is_oneway_rpc() {
-                                let mut response =
-                                    if request.code == request_code::PULL_MESSAGE
-                                        || request.code == request_code::LITE_PULL_MESSAGE
-                                    {
-                                        answer_pull(&request, &inner).await
-                                    } else {
-                                        answer_for(&request, response_code::SUCCESS)
-                                    };
+                                let mut response = if request.code == request_code::PULL_MESSAGE
+                                    || request.code == request_code::LITE_PULL_MESSAGE
+                                {
+                                    answer_pull(&request, &inner).await
+                                } else if request.code == request_code::GET_CONSUMER_LIST_BY_GROUP {
+                                    answer_consumer_list(&request, &inner)
+                                } else {
+                                    answer_for(&request, response_code::SUCCESS)
+                                };
                                 write_frame(&mut stream, &mut response).await;
                             }
                         }
@@ -3464,8 +3817,7 @@ mod tests {
             lock(&self.requests)
                 .iter()
                 .filter(|(code, _)| {
-                    *code == request_code::PULL_MESSAGE
-                        || *code == request_code::LITE_PULL_MESSAGE
+                    *code == request_code::PULL_MESSAGE || *code == request_code::LITE_PULL_MESSAGE
                 })
                 .filter_map(|(_, ext)| {
                     ext.iter()
@@ -3480,8 +3832,7 @@ mod tests {
             lock(&self.requests)
                 .iter()
                 .filter(|(code, _)| {
-                    *code == request_code::PULL_MESSAGE
-                        || *code == request_code::LITE_PULL_MESSAGE
+                    *code == request_code::PULL_MESSAGE || *code == request_code::LITE_PULL_MESSAGE
                 })
                 .map(|(code, _)| *code)
                 .collect()
@@ -3492,8 +3843,7 @@ mod tests {
             lock(&self.requests)
                 .iter()
                 .filter(|(code, _)| {
-                    *code == request_code::PULL_MESSAGE
-                        || *code == request_code::LITE_PULL_MESSAGE
+                    *code == request_code::PULL_MESSAGE || *code == request_code::LITE_PULL_MESSAGE
                 })
                 .filter_map(|(_, ext)| {
                     ext.iter()
@@ -3513,6 +3863,11 @@ mod tests {
 
         fn unregisters(&self) -> Vec<UnregisterExt> {
             lock(&self.unregisters).clone()
+        }
+
+        /// 设定 38（GET_CONSUMER_LIST_BY_GROUP）的应答内容：本组有哪些 clientId。
+        fn set_cid_list(&self, cids: &[&str]) {
+            *lock(&self.cid_list) = cids.iter().map(|s| s.to_string()).collect();
         }
 
         /// 排一笔脚本化 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。
@@ -3564,6 +3919,19 @@ mod tests {
         response
     }
 
+    /// GET_CONSUMER_LIST_BY_GROUP(38) 的应答：把 [`FakeBroker::cid_list`] 原样包成
+    /// Java 的 `GetConsumerListByGroupResponseBody`。空列表就是「broker 不认识这个组」——
+    /// 真实 broker 对没注册过的组也是这么回（不是报错），平衡视图据此走兜底分支。
+    fn answer_consumer_list(request: &RemotingCommand, broker: &FakeBroker) -> RemotingCommand {
+        let cids = lock(&broker.cid_list).clone();
+        let body = GetConsumerListByGroupResponseBody {
+            consumer_id_list: cids,
+        };
+        let mut response = answer_for(request, response_code::SUCCESS);
+        response.set_body(Some(body.encode()));
+        response
+    }
+
     /// 一台主 + 一台从（同一 brokerName）的假集群。
     struct FakePullCluster {
         namesrv_addr: String,
@@ -3574,9 +3942,22 @@ mod tests {
 
     impl FakePullCluster {
         async fn start() -> FakePullCluster {
+            FakePullCluster::start_queues(1).await
+        }
+
+        /// 主从两台的 38 应答内容一起设：查询打哪台由路由决定，用例不该关心这个细节。
+        fn set_cid_list(&self, cids: &[&str]) {
+            self.master.set_cid_list(cids);
+            self.slave.set_cid_list(cids);
+        }
+
+        /// `read_queues` 个读队列的那一台 broker（其余行为同 [`FakePullCluster::start`]）。
+        async fn start_queues(read_queues: i32) -> FakePullCluster {
             let master = FakeBroker::start().await;
             let slave = FakeBroker::start().await;
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 假 namesrv");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind 假 namesrv");
             let namesrv_addr = listener.local_addr().expect("假 namesrv 地址").to_string();
             let broker_name = "broker-a".to_string();
             let task = spawn_fake_namesrv(
@@ -3584,8 +3965,14 @@ mod tests {
                 broker_name,
                 master.addr.clone(),
                 slave.addr.clone(),
+                read_queues,
             );
-            FakePullCluster { namesrv_addr, master, slave, tasks: vec![task] }
+            FakePullCluster {
+                namesrv_addr,
+                master,
+                slave,
+                tasks: vec![task],
+            }
         }
     }
 
@@ -3641,7 +4028,10 @@ mod tests {
         let cd = &hb.consumer_data_set[0];
         assert_eq!(cd.group_name, "PG_PullHb");
         assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
-        assert_eq!(cd.consume_from_where, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        assert_eq!(
+            cd.consume_from_where,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET
+        );
         assert_eq!(cd.message_model, MessageModel::CLUSTERING);
         assert!(!cd.unit_mode);
         let topics: Vec<&str> = cd
@@ -3678,7 +4068,10 @@ mod tests {
             let cd = &hb.consumer_data_set[0];
             assert_eq!(cd.group_name, "PG_PullHbStart");
             assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
-            assert_eq!(cd.consume_from_where, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+            assert_eq!(
+                cd.consume_from_where,
+                ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET
+            );
             assert_eq!(cd.subscription_data_set.len(), 1);
             assert_eq!(cd.subscription_data_set[0].topic, "T");
             assert_eq!(cd.subscription_data_set[0].sub_version, 0);
@@ -3712,7 +4105,11 @@ mod tests {
         let frozen = c.heartbeat_count();
         let master_seen = cluster.master.heartbeats().len();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(c.heartbeat_count(), frozen, "heartbeat_enabled=false 后不再发");
+        assert_eq!(
+            c.heartbeat_count(),
+            frozen,
+            "heartbeat_enabled=false 后不再发"
+        );
         assert_eq!(
             cluster.master.heartbeats().len(),
             master_seen,
@@ -3740,16 +4137,31 @@ mod tests {
             let unregs = broker.unregisters();
             assert_eq!(unregs.len(), 1, "{name}: 一次 shutdown 只注销一次");
             let field = |k: &str| -> Option<String> {
-                unregs[0].iter().find(|(f, _)| f == k).map(|(_, v)| v.clone())
+                unregs[0]
+                    .iter()
+                    .find(|(f, _)| f == k)
+                    .map(|(_, v)| v.clone())
             };
-            assert_eq!(field("clientID").as_deref(), Some(client_id.as_str()), "{name}");
-            assert_eq!(field("consumerGroup").as_deref(), Some("PG_PullHbUnreg"), "{name}");
+            assert_eq!(
+                field("clientID").as_deref(),
+                Some(client_id.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                field("consumerGroup").as_deref(),
+                Some("PG_PullHbUnreg"),
+                "{name}"
+            );
             assert_eq!(field("producerGroup"), None, "{name}: 空槽位不上线");
         }
         // 注销之后心跳必须已经停了（循环先停、abort，再发 35）
         let beats = cluster.master.heartbeats().len();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(cluster.master.heartbeats().len(), beats, "shutdown 后不再发心跳");
+        assert_eq!(
+            cluster.master.heartbeats().len(),
+            beats,
+            "shutdown 后不再发心跳"
+        );
     }
 
     /// 「shutdown 后立刻退进程」也发得出去：多线程运行时里 `shutdown()` 会等 35
@@ -3768,10 +4180,21 @@ mod tests {
             let unregs = broker.unregisters();
             assert_eq!(unregs.len(), 1, "{name}: shutdown 返回时 35 必须已经落地");
             let field = |k: &str| -> Option<String> {
-                unregs[0].iter().find(|(f, _)| f == k).map(|(_, v)| v.clone())
+                unregs[0]
+                    .iter()
+                    .find(|(f, _)| f == k)
+                    .map(|(_, v)| v.clone())
             };
-            assert_eq!(field("clientID").as_deref(), Some(client_id.as_str()), "{name}");
-            assert_eq!(field("consumerGroup").as_deref(), Some("PG_PullUnregWait"), "{name}");
+            assert_eq!(
+                field("clientID").as_deref(),
+                Some(client_id.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                field("consumerGroup").as_deref(),
+                Some("PG_PullUnregWait"),
+                "{name}"
+            );
         }
     }
 
@@ -3800,10 +4223,21 @@ mod tests {
             let unregs = broker.unregisters();
             assert_eq!(unregs.len(), 1, "{name}: 进程退出前 35 必须已经落地");
             let field = |k: &str| -> Option<String> {
-                unregs[0].iter().find(|(f, _)| f == k).map(|(_, v)| v.clone())
+                unregs[0]
+                    .iter()
+                    .find(|(f, _)| f == k)
+                    .map(|(_, v)| v.clone())
             };
-            assert_eq!(field("clientID").as_deref(), Some(client_id.as_str()), "{name}");
-            assert_eq!(field("consumerGroup").as_deref(), Some("PG_PullUnregExit"), "{name}");
+            assert_eq!(
+                field("clientID").as_deref(),
+                Some(client_id.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                field("consumerGroup").as_deref(),
+                Some("PG_PullUnregExit"),
+                "{name}"
+            );
         }
     }
 
@@ -3914,7 +4348,11 @@ mod tests {
             "FIRST_OFFSET 消费者的第一次拉取",
         )
         .await;
-        assert_eq!(cluster.master.pull_offsets()[0], 0, "起点就是 0，直接上拉取请求");
+        assert_eq!(
+            cluster.master.pull_offsets()[0],
+            0,
+            "起点就是 0，直接上拉取请求"
+        );
 
         // 负控：LAST_OFFSET 那一支该发 maxOffset —— 先证明这份请求日志不是哑的
         let last = DefaultLitePullConsumer::new("LitePG_Last").unwrap();
@@ -3923,7 +4361,12 @@ mod tests {
         last.assign(&[queue("T", "broker-a", 0)]);
         last.start().await.expect("假集群里 start 应当成功");
         wait_until(
-            || cluster.master.codes().contains(&request_code::GET_MAX_OFFSET),
+            || {
+                cluster
+                    .master
+                    .codes()
+                    .contains(&request_code::GET_MAX_OFFSET)
+            },
             "LAST_OFFSET 消费者的 maxOffset 查询",
         )
         .await;
@@ -4028,7 +4471,11 @@ mod tests {
         let q = queue("T", "broker-a", 0);
         cluster.master.script_pull(
             response_code::PULL_RETRY_IMMEDIATELY,
-            &[("nextBeginOffset", "5"), ("minOffset", "0"), ("maxOffset", "9")],
+            &[
+                ("nextBeginOffset", "5"),
+                ("minOffset", "0"),
+                ("maxOffset", "9"),
+            ],
             None,
             None,
         );
@@ -4045,7 +4492,11 @@ mod tests {
             "下一笔 PULL_MESSAGE 从 5 开始",
         )
         .await;
-        assert_eq!(c.buffered_message_count(), 0, "NO_MATCHED_MSG 没有可交付的消息");
+        assert_eq!(
+            c.buffered_message_count(),
+            0,
+            "NO_MATCHED_MSG 没有可交付的消息"
+        );
         c.shutdown();
     }
 
@@ -4057,7 +4508,11 @@ mod tests {
         let q = queue("T", "broker-a", 0);
         cluster.master.script_pull(
             response_code::PULL_OFFSET_MOVED,
-            &[("nextBeginOffset", "42"), ("minOffset", "40"), ("maxOffset", "100")],
+            &[
+                ("nextBeginOffset", "42"),
+                ("minOffset", "40"),
+                ("maxOffset", "100"),
+            ],
             None,
             None,
         );
@@ -4085,12 +4540,16 @@ mod tests {
     async fn lite_in_flight_seek_wins_over_the_pull_result() {
         let cluster = FakePullCluster::start().await;
         let q = queue("T", "broker-a", 0);
-        let body = encode_message_ext(&msg("T", "broker-a", 0, 2, "late"), false)
-            .expect("消息可编码");
+        let body =
+            encode_message_ext(&msg("T", "broker-a", 0, 2, "late"), false).expect("消息可编码");
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         cluster.master.script_pull(
             response_code::SUCCESS,
-            &[("nextBeginOffset", "3"), ("minOffset", "0"), ("maxOffset", "9")],
+            &[
+                ("nextBeginOffset", "3"),
+                ("minOffset", "0"),
+                ("maxOffset", "9"),
+            ],
             Some(body),
             Some(gate_rx),
         );
@@ -4111,5 +4570,151 @@ mod tests {
         assert_eq!(c.pull_cursor_of(&q), 99, "在途应答不得盖掉 seek 写下的位点");
         assert_eq!(c.buffered_message_count(), 0, "被刹车的一轮不许入缓冲");
         c.shutdown();
+    }
+
+    // ------------------------------------------------------------ 平衡视图
+    //
+    // Java `MQPullConsumer:187` → `DefaultMQPullConsumerImpl:120-135`，官方
+    // `example/simple/PullConsumer.java:62` 就靠它决定这一轮去拉哪些队列。
+    // 本端口拉模式没有后台 rebalance 线程，视图按 `RebalanceImpl.rebalanceByTopic`
+    // 的同一条公式当场算，所以用例锁的是「算得对不对」而不是「表填没填上」。
+
+    /// 同组只有本实例：整份订阅信息都是自己的，且按 house 口径排好序。
+    #[tokio::test]
+    async fn balance_view_sole_instance_takes_every_queue() {
+        // 3 个队列：1 个队列时「自己那一份」与「全部」同形，什么也证明不了。
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = started_pull("bal_sole", "PG_BalSole", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+
+        let view = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("假集群里平衡视图应当算得出来");
+        assert_eq!(
+            view.iter().map(|q| q.queue_id).collect::<Vec<i32>>(),
+            vec![0, 1, 2],
+            "单实例认领全部队列，且按 queueId 升序"
+        );
+        assert!(view.iter().all(|q| q.topic == "T" && q.broker_name == "broker-a"));
+        c.shutdown();
+    }
+
+    /// 同组两实例：各自只拿到自己那一份；两份不重叠、合起来是全部。
+    /// 重叠就是重复消费，这条判据只能靠两个真实例互相对拍。
+    #[tokio::test]
+    async fn balance_view_returns_only_this_instances_share() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let a = started_pull("bal_pair_a", "PG_BalPair", &cluster, "T").await;
+        let b = started_pull("bal_pair_b", "PG_BalPair", &cluster, "T").await;
+
+        // 分配前 cidAll 必排序（Java `Collections.sort(cidAll)`）；真实 broker 的返回顺序
+        // 不定，用例先把两个 clientId 排好再登记，两边看到的才是同一份列表。
+        let mut ids = vec![a.client_id(), b.client_id()];
+        ids.sort();
+        cluster.set_cid_list(
+            &ids.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>(),
+        );
+
+        let va = a
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("a 的平衡视图");
+        let vb = b
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("b 的平衡视图");
+        assert_eq!(va.len(), 1, "两个实例分两个队列：每个只拿 1 个");
+        assert_eq!(vb.len(), 1);
+        assert_ne!(va[0], vb[0], "两份不得重叠（重叠即重复消费）");
+        let mut both = vec![va[0].clone(), vb[0].clone()];
+        sort_mqs(&mut both);
+        assert_eq!(
+            both.iter().map(|q| q.queue_id).collect::<Vec<i32>>(),
+            vec![0, 1],
+            "两份合起来必须覆盖全部队列，谁都不许漏"
+        );
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// broker 不认识本组（38 回空列表）：**算不动** ≠ 算出来是空，此时保持现有分配
+    /// （本地拉过的队列），绝不回退成「独占全部队列」。
+    #[tokio::test]
+    async fn balance_view_keeps_current_assignment_when_the_group_is_unknown() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = started_pull("bal_unknown", "PG_BalUnknown", &cluster, "T").await;
+        cluster.set_cid_list(&[]);
+
+        assert!(
+            c.fetch_message_queues_in_balance("T")
+                .await
+                .expect("兜底路径不该报错")
+                .is_empty(),
+            "还没拉过任何队列：现有分配就是空"
+        );
+
+        let mut all = c
+            .fetch_subscribe_message_queues("T")
+            .await
+            .expect("订阅信息可查");
+        sort_mqs(&mut all);
+        assert_eq!(all.len(), 3);
+        c.pull(&all[2], "*", 0, 32, Some(5000))
+            .await
+            .expect("假集群里拉取应当成功");
+
+        assert_eq!(
+            c.fetch_message_queues_in_balance("T").await.expect("兜底视图"),
+            vec![all[2].clone()],
+            "兜底只认领自己拉过的那一个，不是路由里的全部 3 个"
+        );
+        assert!(
+            c.fetch_message_queues_in_balance("OtherBalTopic")
+                .await
+                .expect("别的 topic 也走得通")
+                .is_empty(),
+            "兜底同样按 topic 收口，不许把 T 的队列漏给别的 topic"
+        );
+        c.shutdown();
+    }
+
+    /// BROADCASTING：Java `rebalanceByTopic` 对广播不查消费者列表、直接全量，
+    /// 所以列表里没有本实例也照样拿到全部队列。
+    #[tokio::test]
+    async fn balance_view_broadcasting_takes_all_without_the_consumer_list() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = DefaultMQPullConsumer::new("PG_BalBcast").expect("组名合法");
+        c.set_instance_name("bal_bcast");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_message_model(MessageModel::BROADCASTING);
+        c.register_topic("T");
+        c.start().await.expect("假集群里 start 应当成功");
+        cluster.set_cid_list(&["someone-else"]);
+
+        let view = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("广播视图");
+        assert_eq!(view.len(), 3, "广播不看消费者列表：全量认领");
+        c.shutdown();
+    }
+
+    /// 未 start：Java `isRunning()` 守卫直接报错，而不是静默返回空表
+    /// （空表会让调用方以为「没有我的队列」而停止拉取）。
+    #[tokio::test]
+    async fn balance_view_requires_a_started_consumer() {
+        let c = DefaultMQPullConsumer::new("PG_BalNotStarted").expect("组名合法");
+        let err = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect_err("未启动必须报错");
+        assert!(
+            err.to_string().contains("not started"),
+            "报的是未启动：{err}"
+        );
     }
 }

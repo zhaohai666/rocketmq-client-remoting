@@ -51,6 +51,7 @@ import { QueryResult } from '../remoting/bodies.ts';
 import { getLogger } from '../logging.ts';
 import { MQClientException, MQBrokerException } from '../remoting/exception.ts';
 import { MQClient } from './mq_client.ts';
+import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 
 const logger = getLogger('admin');
 
@@ -162,6 +163,11 @@ export class DefaultMQAdminExt {
   instanceName: string = 'ADMIN';
   unitName: string | null = null;
   enableStreamRequestType = false;
+  // Java ClientConfig#namespaceV2 — the SERVER-side namespace (Aliyun-style
+  // serverless instance id). When non-empty, NamespaceRpcHook (registered
+  // FIRST on the remoting client, MQClientAPIImpl:329) stamps every admin rpc
+  // with nsd=true / ns=<value>.
+  namespaceV2: string | null = null;
   // Java ClientConfig#vipChannelEnabled — false by default in 5.x. When true,
   // broker requests go to the VIP port (port - 2); NEVER applied to the
   // nameserver.
@@ -190,6 +196,9 @@ export class DefaultMQAdminExt {
   setInstanceName(name: string): void { this.instanceName = name; }
   setUnitName(unitName: string): void { this.unitName = unitName; }
   setVipChannelEnabled(enable: boolean): void { this.vipChannelEnabled = enable; }
+  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  setNamespaceV2(namespaceV2: string | null): void { this.namespaceV2 = namespaceV2; }
+  getNamespaceV2(): string | null { return this.namespaceV2; }
   setTimeoutMillis(timeoutMillis: number): void { this.timeoutMillis = timeoutMillis; }
   getNameServerAddressList(): string[] {
     return this.client != null ? this.client.getNameServerAddressList() : [];
@@ -214,9 +223,14 @@ export class DefaultMQAdminExt {
     const clientId = MixAll.clientIdFor(this.instanceName, this.unitName, this.enableStreamRequestType);
     const remotingClient = this.client != null ? this.client.remotingClient : null;
     this.client = new MQClient(clientId, this.namesrvAddr, remotingClient);
-    if (this.rpcHook != null) {
-      this.client.remotingClient.registerRpcHook(this.rpcHook);
-    }
+    // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream
+    // (only when enableStreamRequestType) -> user (ACL) hook. The namespace
+    // extFields must be present BEFORE the ACL hook signs the request.
+    registerRpcHooks(this.client.remotingClient, {
+      namespaceV2: () => this.namespaceV2,
+      enableStreamRequestType: this.enableStreamRequestType,
+      userHook: this.rpcHook,
+    });
     this.client.start();
     this._started = true;
     logger.info(`adminExt ${this.adminExtGroup} started, clientId=${clientId}`);

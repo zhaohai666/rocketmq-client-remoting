@@ -70,7 +70,10 @@ async fn main() -> ExitCode {
         eprintln!("admin start: {e}");
         return ExitCode::FAILURE;
     }
-    let mut ck = Checker { passed: 0, failed: Vec::new() };
+    let mut ck = Checker {
+        passed: 0,
+        failed: Vec::new(),
+    };
 
     let cluster = match admin.fetch_broker_cluster_info().await {
         Ok(c) => c,
@@ -146,7 +149,10 @@ async fn main() -> ExitCode {
         (&grp_a, "retry_queue_nums", 3i32),
         (&grp_b, "retry_max_times", 5i32),
     ] {
-        match admin.get_subscription_group_config(&master, &grp.group_name).await {
+        match admin
+            .get_subscription_group_config(&master, &grp.group_name)
+            .await
+        {
             Ok(Some(got)) => {
                 let actual = match field {
                     "retry_queue_nums" => got.retry_queue_nums,
@@ -198,14 +204,23 @@ async fn main() -> ExitCode {
     {
         Ok(fb) => {
             let readable = fb.get("readable").and_then(serde_json::Value::as_bool) == Some(true);
-            let fields_ok = fb.get("group").and_then(serde_json::Value::as_str) == Some(group_a.as_str())
+            let fields_ok = fb.get("group").and_then(serde_json::Value::as_str)
+                == Some(group_a.as_str())
                 && fb.get("topic").and_then(serde_json::Value::as_str) == Some(topic_a.as_str());
             ck.check("消费组读禁配(353) 恢复可读", readable, &format!("{fb}"));
-            ck.check("消费组读禁配(353) 回包含 group/topic", fields_ok, &format!("{fb}"));
+            ck.check(
+                "消费组读禁配(353) 回包含 group/topic",
+                fields_ok,
+                &format!("{fb}"),
+            );
         }
         Err(e) => {
             ck.check("消费组读禁配(353) 恢复可读", false, &e.to_string());
-            ck.check("消费组读禁配(353) 回包含 group/topic", false, &e.to_string());
+            ck.check(
+                "消费组读禁配(353) 回包含 group/topic",
+                false,
+                &e.to_string(),
+            );
         }
     }
 
@@ -216,8 +231,16 @@ async fn main() -> ExitCode {
     {
         // Java 语义：非半消息 → broker 拒绝（SYSTEM_ERROR）→ 返回 False 而非报错
         Ok(false) => ck.check("恢复半消息(323) 非半消息返回 false 而非报错", true, ""),
-        Ok(true) => ck.check("恢复半消息(323) 非半消息返回 false 而非报错", false, "对非半消息竟返回 true"),
-        Err(e) => ck.check("恢复半消息(323) 非半消息返回 false 而非报错", false, &e.to_string()),
+        Ok(true) => ck.check(
+            "恢复半消息(323) 非半消息返回 false 而非报错",
+            false,
+            "对非半消息竟返回 true",
+        ),
+        Err(e) => ck.check(
+            "恢复半消息(323) 非半消息返回 false 而非报错",
+            false,
+            &e.to_string(),
+        ),
     }
     match admin.resume_check_half_message(&master, "", "x").await {
         Err(e) => ck.check(
@@ -225,7 +248,11 @@ async fn main() -> ExitCode {
             e.to_string().contains("topic required"),
             &format!("应本地拒绝，实际 {e}"),
         ),
-        Ok(_) => ck.check("恢复半消息(323) 缺 topic 被本地拒绝", false, "空 topic 竟被放行发出"),
+        Ok(_) => ck.check(
+            "恢复半消息(323) 缺 topic 被本地拒绝",
+            false,
+            "空 topic 竟被放行发出",
+        ),
     }
 
     // ---- 5. 顺序 topic 配置（nameserver KV） -------------------------------
@@ -241,10 +268,16 @@ async fn main() -> ExitCode {
         .await
     {
         Ok(()) => {
-            let stored = admin.get_kv_config(order_ns_key, &order_key).await.ok().flatten().unwrap_or_default();
+            let stored = admin
+                .get_kv_config(order_ns_key, &order_key)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             ck.check(
                 "顺序 topic 配置 合并两条而非覆盖",
-                stored.contains(&format!("{topic_a}:5")) && stored.contains(&format!("{topic_b}:8")),
+                stored.contains(&format!("{topic_a}:5"))
+                    && stored.contains(&format!("{topic_b}:8")),
                 &format!("stored={stored:?}"),
             );
         }
@@ -255,10 +288,16 @@ async fn main() -> ExitCode {
         .await
     {
         Ok(()) => {
-            let stored = admin.get_kv_config(order_ns_key, &order_key).await.ok().flatten().unwrap_or_default();
+            let stored = admin
+                .get_kv_config(order_ns_key, &order_key)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             ck.check(
                 "顺序 topic 配置 同 key 覆盖旧值",
-                stored.contains(&format!("{topic_a}:6")) && !stored.contains(&format!("{topic_a}:5")),
+                stored.contains(&format!("{topic_a}:6"))
+                    && !stored.contains(&format!("{topic_a}:5")),
                 &format!("stored={stored:?}"),
             );
         }
@@ -271,18 +310,26 @@ async fn main() -> ExitCode {
         Err(e) => ck.check("清理过期消费队列(306)", false, &e.to_string()),
     }
     let failed = admin
-        .clean_expired_consumer_queue_by_addr(&[master.clone()], 24 * 365)
+        .clean_expired_consumer_queue_by_addr(std::slice::from_ref(&master), 24 * 365)
         .await;
-    ck.check("清理过期消费队列(306) ByAddr", failed.is_empty(), &format!("failed={failed:?}"));
+    ck.check(
+        "清理过期消费队列(306) ByAddr",
+        failed.is_empty(),
+        &format!("failed={failed:?}"),
+    );
 
     match admin.delete_expired_commit_log(&master, 24 * 365).await {
         Ok(()) => ck.check("删除过期 commitlog(329)", true, ""),
         Err(e) => ck.check("删除过期 commitlog(329)", false, &e.to_string()),
     }
     let failed = admin
-        .delete_expired_commit_log_by_addr(&[master.clone()], 24 * 365)
+        .delete_expired_commit_log_by_addr(std::slice::from_ref(&master), 24 * 365)
         .await;
-    ck.check("删除过期 commitlog(329) ByAddr", failed.is_empty(), &format!("failed={failed:?}"));
+    ck.check(
+        "删除过期 commitlog(329) ByAddr",
+        failed.is_empty(),
+        &format!("failed={failed:?}"),
+    );
 
     let failed = admin
         .delete_expired_commit_log_by_addr(&["127.0.0.1:1".to_string()], 1)
@@ -346,9 +393,10 @@ async fn main() -> ExitCode {
     }
 
     // ---- 清理 ---------------------------------------------------------------
-    let _ = admin.delete_topic_in_broker(&master, &topic_a);
-    let _ = admin.delete_topic_in_broker(&master, &topic_b);
-    let _ = admin.delete_kv_config(order_ns_key, &order_key);
+    // 注意要 `await`：这三笔是真正的清理 RPC，不等待就丢弃 future 等于没执行。
+    let _ = admin.delete_topic_in_broker(&master, &topic_a).await;
+    let _ = admin.delete_topic_in_broker(&master, &topic_b).await;
+    let _ = admin.delete_kv_config(order_ns_key, &order_key).await;
     admin.shutdown();
     report(&ck)
 }

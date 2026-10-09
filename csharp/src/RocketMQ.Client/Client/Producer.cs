@@ -36,6 +36,7 @@ public class DefaultMQProducer
     // 命名空间（多租户隔离）：非空前，发送时把 topic 拼成 "ns%topic" 发给 broker。
     // 默认空 = 不加命名空间（与裸集群兼容，不破坏现有行为）。
     private string _namespace = string.Empty;
+    private string _namespaceV2 = string.Empty;
     // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
     private IRpcHook? _rpcHook;
     // ClientConfig 的三个单元化/stream 开关（默认值与 Java DefaultMQProducer 一致）
@@ -337,6 +338,37 @@ public class DefaultMQProducer
         set => _mqFaultStrategy.SetSendLatencyFaultEnable(value);
     }
 
+    /// <summary>对应 Java <c>ClientConfig#startDetectorEnable</c>（默认 false，Java 同）：
+    /// 开启后 <see cref="Start"/> 会拉起 MQFaultStrategy 的可达性探测线程 —— 按每台 broker
+    /// 2s 一档的节奏做 TCP 连通探测（detectTimeout=200ms），故障 broker 恢复后可被提前
+    /// 拉回容错表（Java latency/LatencyFaultToleranceImpl.java）。</summary>
+    public bool StartDetectorEnable
+    {
+        get => _mqFaultStrategy.IsStartDetectorEnable();
+        set => _mqFaultStrategy.SetStartDetectorEnable(value);
+    }
+
+    /// <summary>对应 Java <c>DefaultMQProducer#sendMessageWithVIPChannel</c>（默认 false）：
+    /// 开启后发送/请求的 broker 端口换 VIP 口（普通口 -2，见 <c>MixAll.BrokerVipChannel</c>）。
+    /// 消费者一路对应 Java <c>ClientConfig#vipChannelEnabled</c>（DefaultMQPushConsumer
+    /// 经 <c>ClientConfig</c> 透传，默认同为 false）。</summary>
+    public bool SendMessageWithVIPChannel
+    {
+        get => _sendMessageWithVIPChannel;
+        set
+        {
+            _sendMessageWithVIPChannel = value;
+            // Java 是逐笔发送现读 isSendMessageWithVIPChannel()；本端口的改写点在
+            // MQClientInstance 的发送地址上，所以 Start() 之后再改开关也要立刻生效。
+            if (_mqClient is not null)
+            {
+                _mqClient.VipChannelEnabled = value;
+            }
+        }
+    }
+
+    private bool _sendMessageWithVIPChannel;
+
     public MQFaultStrategy MqFaultStrategy => _mqFaultStrategy;
 
     public int MaxMessageSize
@@ -363,6 +395,17 @@ public class DefaultMQProducer
     {
         get => _namespace;
         set => _namespace = value ?? string.Empty;
+    }
+
+    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
+    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
+    /// 扩展头，并随 <see cref="StartTraceDispatcher"/> 传导给轨迹分发器（Java
+    /// AsyncTraceDispatcher.start:155 setNamespaceV2(traceProducer)）。钩子每笔请求现读本属性，
+    /// 所以 Start() 之后设置也从下一笔请求起生效。</summary>
+    public string NamespaceV2
+    {
+        get => _namespaceV2;
+        set => _namespaceV2 = value ?? string.Empty;
     }
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
@@ -718,11 +761,12 @@ public class DefaultMQProducer
             // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定必须在 Start() 之前 ——
             // Java 的 rpcHook 是随 MQClientAPIImpl 构造进去的，实例第一笔报文就带着它；
             // 放在 Start() 之后，start 期间的动态取址/首包路由就是裸的。
-            // composeRequestHooks 还原 Java 的 stream → 用户钩子顺序（单槽传输层）。
-            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
+            // RequestHooks.Compose 还原 Java 的 Namespace → stream → 用户钩子顺序（单槽传输层）。
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
                 tlsEnable: _tlsEnable, tlsOptions: _tlsOptions, unitName: _unitName,
-                pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
+                pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
+                vipChannelEnabled: _sendMessageWithVIPChannel);
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
@@ -744,6 +788,23 @@ public class DefaultMQProducer
             // "没打开"，start 之后立刻 send 的第一笔会绕过攒批直发（Java 在 impl.start():256
             // 也是这个次序）。按 clientId 复用，所以 restart 拿到的是同一个累加器。
             InitProduceAccumulator();
+
+            // 对应 Java DefaultMQProducerImpl.start():291：请求-Reply 等待槽的 TTL 扫描
+            //（RequestHouseKeepingService 线程，3s 首扫 / 1s 周期）。单例按引用计数共享，
+            // Shutdown 时最后一个 producer 退场才停。
+            RequestFutureHolder.Instance.StartScheduledTask(this);
+
+            // 对应 Java MQFaultStrategy.startDetector（ClientConfig#startDetectorEnable，
+            // 默认 false）：地址解析器给探测线程查 broker 名 → 地址；探测器用 TCP 连通
+            // 探测（Java 默认的 ServiceDetector 是一发 getMaxOffset RPC，连通性等价，
+            // 但省一条协议栈路径；README 差异注已说明）。
+            _mqFaultStrategy.LatencyFaultTolerance.SetResolver(
+                name => _mqClient?.FindBrokerAddressInPublish(name));
+            _mqFaultStrategy.LatencyFaultTolerance.SetServiceDetector(new TcpServiceDetector());
+            if (_mqFaultStrategy.IsStartDetectorEnable())
+            {
+                _mqFaultStrategy.StartDetector();
+            }
 
             _started = true;
             // 允许 Shutdown 之后再 Start：Shutdown 的前半程里 _started 还是 true，靠 _shutdownRequested
@@ -824,6 +885,12 @@ public class DefaultMQProducer
             {
                 _heartbeatThread.Join(2000);
             }
+
+            // 对应 Java DefaultMQProducerImpl.shutdown():319（RequestFutureHolder.shutdown）
+            // 与 MQFaultStrategy 关停：请求等待槽的 TTL 扫描按引用计数停（最后一个
+            // producer 退场才停），探测线程一并关闭。
+            RequestFutureHolder.Instance.ShutdownScheduledTask(this);
+            _mqFaultStrategy.Shutdown();
 
             lock (_txThreadsLock)
             {
@@ -1157,9 +1224,30 @@ public class DefaultMQProducer
                 var dispatcher = new AsyncTraceDispatcher(_producerGroup,
                     TraceDispatcherType.Produce, _traceMsgBatchNum, _traceTopic, _rpcHook);
                 dispatcher.SetHostProducer(this);
+                // 对应 Java DefaultMQProducer.java:390：namespaceV2 传导给分发器，
+                // 再由分发器 Start 时落到内部轨迹生产者上。
+                dispatcher.NamespaceV2 = _namespaceV2;
                 _traceDispatcher = dispatcher;
                 RegisterSendMessageHook(new SendMessageTraceHook(dispatcher));
                 RegisterEndTransactionHook(new EndTransactionTraceHook(dispatcher));
+
+                // 对应 Java DefaultMQProducer.java:391：recall RPC 的轨迹钩子（IRpcHook，
+                // 在响应回来后记 TraceType.Recall）。本端口的钩子槽只有一个（first-wins），
+                // Start() 里已把 Namespace/Stream/ACL 组合钩子占住 —— 这里换成
+                // 「原钩子 + recall」的链重新注册；recall 追加在最后，与 Java 的注册顺序一致。
+                var recallHook = new DefaultRecallMessageTraceHook(dispatcher);
+                IRpcHook? existing = _mqClient?.RemotingClient.CurrentHook();
+                if (existing is not null)
+                {
+                    _mqClient!.RemotingClient.UnregisterRpcHook();
+                    _mqClient!.RemotingClient.RegisterRpcHook(existing is ChainedRpcHook chained
+                        ? new ChainedRpcHook(chained.Hooks.Append(recallHook).ToList())
+                        : new ChainedRpcHook(new[] { existing, recallHook }));
+                }
+                else if (_mqClient is not null)
+                {
+                    _mqClient.RemotingClient.RegisterRpcHook(recallHook);
+                }
             }
             catch (Exception e)
             {
@@ -1907,7 +1995,9 @@ public class DefaultMQProducer
         string addr;
         try
         {
-            addr = c.PublishAddrFor(mq.BrokerName, mq.Topic);
+            // 与同步内核同口径：只认 master 拿到地址后按 Java sendKernelImpl:928 做 VIP 改写
+            // （异步的请求由本处 addr 直接交给发送链，不再经 SendMessage 二次解析）。
+            addr = c.VipAddr(c.PublishAddrFor(mq.BrokerName, mq.Topic));
         }
         catch (Exception e)
         {
@@ -2450,65 +2540,115 @@ public class DefaultMQProducer
     }
 
     // ---------------- Request-Reply（5.x）----------------
+    // Java DefaultMQProducer facade 上的 6 个 request 重载（DefaultMQProducer.java:812-916），
+    // 实现在 DefaultMQProducerImpl.java:1621-1800：同步 3 形态（默认路由 / 选择器 / 指定队列，
+    // 发出后阻塞等应答）与异步 3 形态（同 3 种路由 × RequestCallback）。
+    // 请求方公共流程（prepareSendRequest）：
+    //   1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（本客户端 clientId）、
+    //      TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
+    //   2. 把等待槽按 correlationId 登记到进程级的 RequestFutureHolder。
+    //   3. 同步形态发送后阻塞等待；异步形态立即返回。应答由 broker 经
+    //      PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回，由 MQClientInstance.ProcessReplyMessage
+    //      投递进等待槽；超时由 RequestFutureHolder 的 TTL 扫描兜底。
+    //
+    // 同步形态超时抛 RequestTimeoutException（消息已发出但没等到应答）；发送本身失败则抛
+    // MQClientException（带着底层 cause），与 Java 一致。异步形态的失败走回调
+    // OnException —— 桥接回调只负责标记发送结果，用户回调必定恰好触发一次。
+    //
+    // REPLY_TO_CLIENT 是 clientId —— broker 要靠它反查 channel，所以本生产者必须先发过
+    // 心跳（start() 已起心跳线程；这里也会补一次，对齐 Java prepareSendRequest 的
+    // sendHeartbeatToAllBrokerWithLock）。
 
-    /// <summary>
-    /// Request-Reply（5.x）：发一条请求消息并**同步等应答**，返回应答消息。
-    ///
-    /// 对应 Java DefaultMQProducerImpl#request(msg, mq, timeout)（:1738-1767）。
-    /// 请求方做三件事：
-    ///   1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（本客户端 clientId）、
-    ///      TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
-    ///   2. 把等待槽按 correlationId 登记到进程级的 RequestFutureHolder。
-    ///   3. 发送后阻塞等待；应答由 broker 经 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回，
-    ///      由 MQClientInstance.ProcessReplyMessage 投递进等待槽。
-    ///
-    /// 超时抛 RequestTimeoutException（消息已发出但没等到应答）；发送本身失败则抛
-    /// MQClientException（带着底层 cause），与 Java 一致。
-    ///
-    /// REPLY_TO_CLIENT 是 clientId —— broker 要靠它反查 channel，所以本生产者必须先发过
-    /// 心跳（start() 已起心跳线程；这里也会补一次，对齐 Java prepareSendRequest 的
-    /// sendHeartbeatToAllBrokerWithLock）。
-    /// </summary>
+    /// <summary>同步：默认路由（Java request(msg, timeout):1624-1645）。</summary>
     public Message Request(Message msg, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
-        MQClientInstance c = GetClient();
         CheckMessage(msg);
         Message outbound = WithNamespace(msg);
-        int sysFlag = PrepareForSend(outbound);
+        return RequestSyncCore(outbound, null, timeout);
+    }
 
-        string correlationId = RequestReply.CreateCorrelationId();
-        outbound.PutProperty(MessageConst.PropertyCorrelationId, correlationId);
-        outbound.PutProperty(MessageConst.PropertyReplyToClient, c.ClientId);
-        outbound.PutProperty(MessageConst.PropertyMessageTTL,
-            timeout.ToString(CultureInfo.InvariantCulture));
+    /// <summary>同步：选择器定队列（Java request(msg, selector, arg, timeout):1681-1707）。
+    /// 选择器拿到的是**原始消息**（与顺序消息发送同一条规则），namespace 包装只发生在
+    /// 出站副本上。</summary>
+    public Message Request(Message msg, IMessageQueueSelector selector, string arg,
+        int timeoutMillis = -1)
+    {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        MQClientInstance c = GetClient();
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
+        MessageQueue selected = selector.Select(publish.MsgQueueList, msg, arg);
+        return RequestSyncCore(outbound, selected, timeout);
+    }
 
-        // 对齐 Java prepareSendRequest：确保路由已知，然后补一次心跳 ——
-        // 没在 broker 上登记为 producer，broker 就找不到 channel 把应答推回来。
-        long begin = UtilAll.CurrentTimeMillis();
+    /// <summary>同步：指定队列定点发送（Java request(msg, mq, timeout):1738-1767）。</summary>
+    public Message Request(Message msg, MessageQueue mq, int timeoutMillis = -1)
+    {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        return RequestSyncCore(outbound, mq, timeout);
+    }
+
+    /// <summary>异步：默认路由 + 回调（Java request(msg, callback, timeout):1647-1678）。
+    /// 回调恰好触发一次：应答到达（PutResponse）、发送失败（RequestFail）或 TTL 超时
+    ///（RequestFutureHolder.ScanExpiredRequest）三者之一，永不重复。</summary>
+    public void Request(Message msg, RequestCallback callback, int timeoutMillis = -1)
+    {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        RequestAsyncCore(outbound, null, timeout, callback);
+    }
+
+    /// <summary>异步：选择器定队列 + 回调（Java request(msg, selector, arg, callback, timeout):1709-1735）。</summary>
+    public void Request(Message msg, IMessageQueueSelector selector, string arg,
+        RequestCallback callback, int timeoutMillis = -1)
+    {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        MQClientInstance c = GetClient();
+        TopicPublishInfo publish = TryToFindTopicPublishInfo(c, outbound.Topic);
+        MessageQueue selected = selector.Select(publish.MsgQueueList, msg, arg);
+        RequestAsyncCore(outbound, selected, timeout, callback);
+    }
+
+    /// <summary>异步：指定队列定点发送 + 回调（Java request(msg, mq, callback, timeout):1771-1799）。</summary>
+    public void Request(Message msg, MessageQueue mq, RequestCallback callback,
+        int timeoutMillis = -1)
+    {
+        int timeout = timeoutMillis >= 0 ? timeoutMillis : _requestTimeout;
+        CheckMessage(msg);
+        Message outbound = WithNamespace(msg);
+        RequestAsyncCore(outbound, mq, timeout, callback);
+    }
+
+    /// <summary>同步核：登记等待槽 → 发送（失败标 !sendRequestOk 并就地唤醒）→ 等应答 →
+    /// finally 摘除。对应 Java 同步 request 的 try/finally 段。</summary>
+    private Message RequestSyncCore(Message outbound, MessageQueue? mq, int timeout)
+    {
+        MQClientInstance c = GetClient();
+        RequestResponseFuture future = PrepareRequest(c, outbound, timeout, callback: null);
         try
         {
-            c.GetTopicPublishInfo(outbound.Topic);
-            SendHeartbeatToAllBroker();
-        }
-        catch (Exception e)
-        {
-            ClientLog.Debug("request: prepare route/heartbeat failed: " + e.Message);
-        }
-
-        var future = new RequestResponseFuture(correlationId, timeout);
-        RequestFutureHolder.Instance.PutRequest(correlationId, future);
-
-        try
-        {
-            long elapsed = UtilAll.CurrentTimeMillis() - begin;
+            long elapsed = UtilAll.CurrentTimeMillis() - future.BeginTimestamp;
             int remaining = (int)(timeout > elapsed ? timeout - elapsed : 0);
 
-            // 发送失败时把等待槽标成 !sendRequestOk 并立即唤醒（让 _waitRequestResponse 走失败分支）；
+            // 发送失败时把等待槽标成 !sendRequestOk 并立即唤醒（让 WaitRequestResponse 走失败分支）；
             // 协议上无差别 —— 应答由 broker 经**另一条** 326 通道推回，与本次发送的 mode 无关。
             try
             {
-                Send(outbound, remaining);
+                if (mq is null)
+                {
+                    Send(outbound, remaining);
+                }
+                else
+                {
+                    Send(outbound, mq, remaining);
+                }
             }
             catch (Exception e)
             {
@@ -2521,7 +2661,100 @@ public class DefaultMQProducer
         }
         finally
         {
-            RequestFutureHolder.Instance.RemoveRequest(correlationId);
+            RequestFutureHolder.Instance.RemoveRequest(future.CorrelationId);
+        }
+    }
+
+    /// <summary>异步核：登记等待槽 → 交给异步发送链，立即返回。**没有** finally 摘除：
+    /// 异步形态的等待槽由应答到达 / 发送失败 / TTL 扫描三方竞争摘除（Java 同）。</summary>
+    private void RequestAsyncCore(Message outbound, MessageQueue? mq, int timeout,
+        RequestCallback callback)
+    {
+        MQClientInstance c = GetClient();
+        RequestResponseFuture future = PrepareRequest(c, outbound, timeout, callback);
+
+        long elapsed = UtilAll.CurrentTimeMillis() - future.BeginTimestamp;
+        int remaining = (int)(timeout > elapsed ? timeout - elapsed : 0);
+
+        // 异步发送（Java 的 request 系列在发送侧一律 ASYNC）：桥只标记发送结果，
+        // 用户回调交给应答到达（PutResponse）、超时扫描（ScanExpiredRequest）或
+        // 发送失败（RequestFail）触发 —— 在桥里直接调用户回调会提前 onSuccess(null)
+        // 并与后续回调重复（Java :1652-1660 的注释同款）。
+        SendAsync(outbound, new RequestSendBridge(future), remaining, mq);
+    }
+
+    /// <summary>对应 Java prepareSendRequest + 等待槽登记（request 系列重载的公共前段）：
+    /// 写 CORRELATION_ID / REPLY_TO_CLIENT / TTL，确保路由并补一次心跳，然后把 future
+    /// 按 correlationId 登记进进程级 RequestFutureHolder。</summary>
+    private RequestResponseFuture PrepareRequest(MQClientInstance c, Message outbound, int timeout,
+        RequestCallback? callback)
+    {
+        string correlationId = RequestReply.CreateCorrelationId();
+        outbound.PutProperty(MessageConst.PropertyCorrelationId, correlationId);
+        outbound.PutProperty(MessageConst.PropertyReplyToClient, c.ClientId);
+        outbound.PutProperty(MessageConst.PropertyMessageTTL,
+            timeout.ToString(CultureInfo.InvariantCulture));
+
+        // 对齐 Java prepareSendRequest：确保路由已知，然后补一次心跳 ——
+        // 没在 broker 上登记为 producer，broker 就找不到 channel 把应答推回来。
+        try
+        {
+            c.GetTopicPublishInfo(outbound.Topic);
+            SendHeartbeatToAllBroker();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("request: prepare route/heartbeat failed: " + e.Message);
+        }
+
+        var future = new RequestResponseFuture(correlationId, timeout, callback);
+        RequestFutureHolder.Instance.PutRequest(correlationId, future);
+        return future;
+    }
+
+    /// <summary>对应 Java requestFail(correlationId)：发送失败时摘除等待槽并以失败态触发
+    /// 回调（摘不到 = 应答/超时已抢先，直接忽略 —— remove-claims-ownership）。</summary>
+    private static void RequestFail(string correlationId)
+    {
+        RequestResponseFuture? future = RequestFutureHolder.Instance.RemoveRequest(correlationId);
+        if (future is null)
+        {
+            return;
+        }
+
+        future.SendRequestOk = false;
+        future.PutResponseMessage(null);
+        try
+        {
+            future.ExecuteRequestCallback();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("execute requestCallback in requestFail, and callback throw: "
+                           + e.Message);
+        }
+    }
+
+    /// <summary>异步 request 的发送桥（Java request(...) 内嵌 SendCallback）：成功只标记
+    /// sendRequestOk；失败记 cause 并走 <see cref="RequestFail"/>。用户回调不在这里触发。</summary>
+    private sealed class RequestSendBridge : ISendCallback
+    {
+        private readonly RequestResponseFuture _future;
+
+        public RequestSendBridge(RequestResponseFuture future)
+        {
+            _future = future;
+        }
+
+        public void OnSuccess(SendResult sendResult)
+        {
+            _future.SendRequestOk = true;
+        }
+
+        public void OnException(Exception error)
+        {
+            _future.Cause = error;
+            RequestFail(_future.CorrelationId);
         }
     }
 

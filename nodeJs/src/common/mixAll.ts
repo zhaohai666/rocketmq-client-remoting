@@ -51,6 +51,12 @@ export const MixAll = {
   UNIT_PREFIX: 'unit_',
   REQ_T: 'ReqT',
   STREAM_REQUEST_TYPE: 'STREAM',
+  // Java MixAll.java:122 — RPC_REQUEST_HEADER_NAMESPACED_FIELD /
+  // RPC_REQUEST_HEADER_NAMESPACE_FIELD. Written on every request by
+  // NamespaceRpcHook when ClientConfig.namespaceV2 is non-empty (the
+  // SERVER-side namespace mechanism of the Aliyun-style serverless instances).
+  RPC_REQUEST_HEADER_NAMESPACED_FIELD: 'nsd',
+  RPC_REQUEST_HEADER_NAMESPACE_FIELD: 'ns',
   LMQ_PREFIX: '%LMQ%',
   LMQ_QUEUE_ID: 0,
   DEFAULT_TOPIC_QUEUE_NUMS: 4,

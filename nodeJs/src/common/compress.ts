@@ -1,17 +1,23 @@
 // -*- coding: utf-8 -*-
-// LZ4 block-format codec + a minimal ZSTD frame codec — pure TypeScript,
+// LZ4 block + frame codec and a minimal ZSTD frame codec — pure TypeScript,
 // zero third-party dependencies (repo rule).
 //
-// LZ4: full block-format compressor/decompressor (the format Java's lz4-java
-// `safeDecompressor` reads — what the broker uses to decode a stored body).
+// LZ4: the RocketMQ wire carries the LZ4 **FRAME** format (Java's Lz4Compressor
+// wraps lz4-java's LZ4FrameOutputStream, Python uses lz4.frame, and the lz4 CLI
+// speaks the same spec), so `lz4CompressFrame`/`lz4DecompressFrame` are what the
+// compressor dispatch calls; the block layer below is what one frame block holds.
+// See the ⚠ note further down for why the bare-block reading was wrong.
 //
-// ZSTD: ENCODE = a legal zstd frame built from RAW blocks only (plus RLE for
-// long runs). Any standard decoder (zstd-jni on the broker, the zstd CLI)
-// accepts it; the payload is simply stored uncompressed inside the frame.
-// DECODE supports Raw/RLE blocks and the common frame-header shapes; a
-// Compressed block (produced by a real zstd encoder) is rejected with an
-// explicit error instead of silently handing back compressed bytes — the
-// cross-port "unsupported = throw, never passthrough" rule.
+// ZSTD: real (de)compression through `node:zlib`'s zstd binding — Node's own
+// stdlib, so still zero third-party dependencies. That matters because Java
+// (zstd-jni) writes *compressed* blocks: a decoder that only understands
+// Raw/RLE frames cannot read a message produced by a Java client.
+// On runtimes without the binding (< 23.8) the hand-rolled codec below takes
+// over: ENCODE = a legal zstd frame built from RAW blocks only (plus RLE for
+// long runs), which any standard decoder accepts, and DECODE = Raw/RLE frames.
+// A Compressed block on that fallback path is rejected with an explicit error
+// instead of silently handing back compressed bytes — the cross-port
+// "unsupported = throw, never passthrough" rule.
 import zlib from 'node:zlib';
 import { MessageSysFlag } from './sysflag.ts';
 
@@ -343,10 +349,10 @@ function isRunOfOneByte(data: Buffer, from: number, len: number): boolean {
   return true;
 }
 
-// zstdDecompressFrame decodes a ZSTD frame containing only Raw/RLE blocks
-// (what this client and the raw-frame compat mode produce). A Compressed
-// block throws — the caller turns that into "decode failed", never into
-// handing back compressed bytes.
+// zstdDecompressFrame is the dependency-free fallback: it decodes a ZSTD frame
+// containing only Raw/RLE blocks (what zstdCompressRaw produces, i.e. what
+// older Node runtimes write themselves). A Compressed block — what a real
+// encoder such as zstd-jni writes — throws; use zstdDecompress for that.
 export function zstdDecompressFrame(data: Buffer): Buffer {
   let p = 0;
   if (data.length < 4) throw new Error('zstd decompress: input too short');
@@ -395,13 +401,51 @@ export function zstdDecompressFrame(data: Buffer): Buffer {
 class UnsupportedCompressionError extends Error {}
 export { UnsupportedCompressionError };
 
+// node:zlib gained zstd bindings in Node 23.8. Feature-detected instead of
+// version-checked: the fallback path is a working codec, not a crash.
+const nodeZstd = (zlib as unknown as {
+  zstdCompressSync?: (data: Buffer, options?: { level?: number }) => Buffer;
+  zstdDecompressSync?: (data: Buffer) => Buffer;
+});
+
+const HAS_NODE_ZSTD = typeof nodeZstd.zstdCompressSync === 'function'
+  && typeof nodeZstd.zstdDecompressSync === 'function';
+
+// zstdCompress writes a real zstd frame (level 1..22; <=0 means the library
+// default, which is what Java's zstd-jni uses). Without the binding it degrades
+// to the store-only Raw/RLE frame — wire-legal, just no compression gain.
+export function zstdCompress(data: Buffer, level?: number): Buffer {
+  if (!HAS_NODE_ZSTD) return zstdCompressRaw(data);
+  return level && level >= 1
+    ? nodeZstd.zstdCompressSync!(data, { level })
+    : nodeZstd.zstdCompressSync!(data);
+}
+
+// zstdDecompress reads any standard frame, Compressed blocks included.
+export function zstdDecompress(data: Buffer): Buffer {
+  if (!HAS_NODE_ZSTD) return zstdDecompressFrame(data);
+  try {
+    return nodeZstd.zstdDecompressSync!(data);
+  } catch (e) {
+    throw new Error(`zstd decompress: ${(e as Error).message}`);
+  }
+}
+
 // compressFor encodes `data` for the given MessageSysFlag compression type
 // (the value at bit 8-10 of sysFlag: 1=LZ4, 2=ZSTD, 3=ZLIB).
-export function compressFor(data: Buffer, compressionType: number): Buffer {
+//
+// `level` is the producer's compressLevel (Java DefaultMQProducer, default 5,
+// range 0-9). ZLIB uses it as the deflate level; ZSTD maps it onto the zstd
+// level (1-9 is legal in both scales). LZ4's block format has no level.
+export function compressFor(data: Buffer, compressionType: number, level: number = 5): Buffer {
   switch (compressionType) {
-    case MessageSysFlag.ZLIB_TYPE: return zlib.deflateSync(data);
+    case MessageSysFlag.ZLIB_TYPE: {
+      // zlib accepts 0(-none)..9; anything outside maps to the library default.
+      const lv = Number.isFinite(level) && level >= 0 && level <= 9 ? Math.floor(level) : undefined;
+      return lv === undefined ? zlib.deflateSync(data) : zlib.deflateSync(data, { level: lv });
+    }
     case MessageSysFlag.LZ4_TYPE: return lz4CompressFrame(data);
-    case MessageSysFlag.ZSTD_TYPE: return zstdCompressRaw(data);
+    case MessageSysFlag.ZSTD_TYPE: return zstdCompress(data, level);
     default:
       throw new UnsupportedCompressionError(`unsupported compression type: ${compressionType}`);
   }
@@ -412,7 +456,7 @@ export function decompressFor(data: Buffer, compressionType: number): Buffer {
   switch (compressionType) {
     case MessageSysFlag.ZLIB_TYPE: return zlib.inflateSync(data);
     case MessageSysFlag.LZ4_TYPE: return lz4DecompressFrame(data);
-    case MessageSysFlag.ZSTD_TYPE: return zstdDecompressFrame(data);
+    case MessageSysFlag.ZSTD_TYPE: return zstdDecompress(data);
     default:
       throw new UnsupportedCompressionError(`unsupported compression type: ${compressionType}`);
   }
@@ -437,5 +481,6 @@ export function compressionTypeByName(name: string | number): number {
 
 export default {
   lz4CompressBlock, lz4DecompressBlock, zstdCompressRaw, zstdDecompressFrame,
+  zstdCompress, zstdDecompress,
   compressFor, decompressFor, compressionTypeByName, UnsupportedCompressionError,
 };

@@ -1,5 +1,7 @@
 # rocketmq-client-remoting (C++)
 
+> 中文 ｜ [English](README.en.md)
+
 RocketMQ 经典 remoting 协议（对齐 5.x）的 C++17 实现，与本仓库的
 Python 参考实现（`../python/`）及 C# / Rust 实现（`../csharp/`、`../rust/`）逐项对齐。
 
@@ -14,7 +16,8 @@ libzstd 可选，找不到就只关那一个后端），网络层手写，目的
 | 协议层 | JSON / RocketMQ 二进制两路序列化；`RemotingCommand` 帧编解码；CommandCustomHeader 家族（含 V2 短字段名）；17 段消息存储格式与 6 段批量格式 |
 | 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、**GO_AWAY(1500) 换连接重发一次**、连接判死、SIGPIPE 处理 |
 | 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData` |
-| 客户端 | `MQClientInstance`、`DefaultMQProducer`、`DefaultMQPushConsumer`、`DefaultMQPullConsumer`、`DefaultLitePullConsumer`、**`DefaultMQAdminExt`** |
+| 命名空间 | 两套彼此独立：`Namespace`（客户端本地资源名前缀 `%%ns%%res`，`common/namespace_util.h`，收发 / 心跳 / 位点全线包装与还原；注意本端口 `fetchSubscribeMessageQueues` 返回**带命名空间**的队列名，而 Java 的 `fetchMessageQueuesInBalance` 走 `parseSubscribeMessageQueues` 还原成**裸 topic**，两处口径照抄 Java）与 `namespaceV2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`；钩子顺序 Namespace → Stream → ACL，故 `ns`/`ReqT` 都在 ACL 签名内容里）。生产者 / 三种消费者 / 管理端都读 `namespaceV2`，每笔请求现读 |
+| 客户端 | `MQClientInstance`、`DefaultMQProducer`、`DefaultMQPushConsumer`、`DefaultMQPullConsumer`（`fetchSubscribeMessageQueues` 给整个 topic，`fetchMessageQueuesInBalance` 只给本实例应得的那份）、`DefaultLitePullConsumer`、**`DefaultMQAdminExt`** |
 | 异步发送 | `sendAsync`（含定点 `sendAsync(msg, mq, cb)`）跑在真实的 `AsyncSenderExecutor_1..N`（core==max==CPU 核数、有界队列 50000）上，调用方不阻塞；`retryTimesWhenSendAsyncFailed` 的换 broker 重试链只在 remoting 层失败时继续（已收到响应的错误码原样回调、不重试），重试**复用同一请求**只换 opaque，超时预算是整条链共享的剩余时间；用户回调与 `SendMessageHook.after` 在 `NettyClientPublicExecutor_N` 上跑，回调抛异常吞掉不带走 worker；`enableBackpressureForAsyncMode`（默认关）打开后，异步发送在**调用方线程上、投入 `AsyncSenderExecutor` 之前**过两个**公平**信号量的闸（在途 1024 条 / 100M 字节，地板 10 条 / 1M 字节），等不到许可就回调 `send message tryAcquire semaphoreAsyncNum|Size timeout`、一次请求都不发出，许可在链终点按「先 size 后 num」归还，队满时开着背压改为就地跑 |
 | 校验门 | `Validators` / `TopicValidator`：`checkTopic` / `checkGroup` / `isSystemTopic` / `isNotAllowedSendTopic` / `checkMessage`，四类 facade 的 `start()` 在建客户端实例**之前**跑完组名校验（纯本地判定，失败不碰网络） |
 | 压缩 | zlib / LZ4 Frame / ZSTD 三后端：生产端自动压缩 + 消费端自动解压（线上帧格式与各语言实现互通；`-DRMQ_WITH_ZLIB=OFF` 等可逐个关） |
@@ -67,7 +70,7 @@ SSL 会话上交叠，而 OpenSSL 不支持两个线程同时用一个 `SSL` 对
 ## 测试
 
 ```bash
-cd build && ctest --output-on-failure     # 50 个用例，3986 项断言（49 个测试二进制 3913 + interop 73），~64s
+cd build && ctest --output-on-failure     # 50 个用例，3993 项断言（49 个测试二进制 3920 + interop 73），~64s
 ```
 
 | 用例 | 断言 | 覆盖 |
@@ -119,10 +122,12 @@ cd build && ctest --output-on-failure     # 50 个用例，3986 项断言（49 �
 | `producer_unregister` | 21 | 退出注销 `UNREGISTER_CLIENT`(35) 的线上形状：生产者侧头只有 `clientID`+`producerGroup`、消费者侧只有 `clientID`+`consumerGroup`、两侧都有时三个键齐全；**空白组名整个字段不上线**（传的是 null 而不是 `""`，broker 按 `group != null` 分派）；扇出**含从节点**且每台各一发（改成只打 master 的用例必然红）；单台回 `SYSTEM_ERROR` 时 `unregisterClient` 抛 `MQBrokerException`、`unregisterClientAllBrokers` 吞掉且**下一台照样发**；`getRouteOfAllBrokers`（生产者心跳用的主优先那一台）与 `getAllBrokerAddrs`（35 与**消费者**心跳用的主+从）分工守住——消费者心跳必须到从节点（从节点漏发不是少一发冗余：它会给指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`）|
 | `subscribe_after_start` | 12 | 后置订阅与立即心跳：`start()` 之后 `subscribe` **不再**报 `already started`、新订阅立刻进活订阅表（`subscribedTopics()`，心跳与 rebalance 读的同一张表）且立刻推一次心跳；`unsubscribe` 只删表项、**不**发心跳；启动前订阅照旧、那时一笔心跳都不发。对着**连不上的** name server 启动（零 broker ⇒ 心跳一台都发不出去），所以离线只能锁到"表进对了、`already started` 不再抛"这一步——报文层面"broker 真收到带新订阅的心跳"由 `rmq_live_subscribe` 真机取证 |
 | `scheduled_intervals` | 21 | 周期任务的推进口径（`scheduleAtFixedRate`）：**首跳落在 initialDelay 这一刻**而不是 initialDelay+period（离线把路由刷新周期设成 1200ms，实测到达时刻 11 / 1212 / 2412ms —— 旧写法是 1211 / 2411 / 3611）；**固定速率**而非「干完再睡一个周期」（逐跳对着同一时间轴算，慢一拍的轮次不累积漂移）；落后于计划时不等待、立刻补跑（catch-up）；`pollNameServerIntervalMillis` 门面→构造→实例一路透传、非正数回落默认 30000；位点落盘循环的周期只在 `start()` 读一次，运行期改字段不重排已定型的节奏 |
+| `java_alignment` | 40 | `codes.h` 请求码的**两级守卫**：与内置权威取值表逐项比对（防 C++ 侧被误改），设了 `ROCKETMQ_JAVA_SRC` 再读 Java `RequestCode.java` 做同名常量回归（未设则跳过、不算失败） |
+| `clean_expired_msg` | 64 | `cleanExpireMsg` 挂起逃生口（listener 卡死时唯一的回收路径）：只看**队首**最小位点、过期判据**严格大于** `consumeTimeout`、单轮 `min(size,16)` 且上限在进循环前算一次、回投固定 `delayLevel=3`、回投成功后**仍是队首**才摘除、异常只记日志且消息留原地、`containsMessage` 复核防止被清扫摘除的消息再投一次、只扫当前持有的队列 |
+| `pull_consumer_heartbeat` | 29 | 拉模式 / 轻量拉消费者的**心跳形状**：`consumeType=CONSUME_ACTIVELY`、`subVersion` 为空、`consumeFromWhere` 口径、首轮主从各一发、循环按周期重发、`shutdown()` 各收一发 35 且 `producerGroup` 缺席（假主从集群） |
 
 `interop` 会输出 `WARN` 记录 **Python 参考客户端侧的已知缺陷**（不影响退出码）。
 出现新的 `WARN` 要读一下——它是跨语言偏差的显式台账。
-
 ## 真实集群联调
 
 需要在跑 nameServer(9876) + broker(10911)、`autoCreateTopicEnable=true` 的集群。
@@ -202,13 +207,20 @@ cpp/
 │       │                            FilterMessage）+ 消息轨迹文本编解码 + 异步分发
 ├── src/                        与 include 同构的 44 个 .cpp
 ├── examples/                   selfcheck / interop_tool + 33 个真机联调工具
-└── tests/                      48 个测试源文件、49 个 ctest 用例（含 interop_check.py）
+└── tests/                      49 个测试源文件 + interop_check.py = 50 个 ctest 用例
 ```
 
 ## 几个必须知道的实现约定
 
 **字段名错一个就静默丢字段。** broker 按官方协议的属性名做 JSON 反序列化，
 字段名对不上时不报错、字段直接消失（默认值顶上），所以入网键名是逐字段对拍出来的。
+
+**POP 的队列来自客户端 rebalance，不是 broker 分配。** Java 在 `clientRebalance=false` 时走
+`RebalanceImpl#getRebalanceResultFromBroker:345` → `MQClientAPIImpl#queryAssignment:405`
+（QUERY_ASSIGNMENT=400，回 `MessageQueueAssignment` mode=POP），由 broker 决定本实例拿哪些队列。
+本端口**刻意不实现那条路径**（与其余六端同一决定，见 `python/client/consumer.py` 的同名注释）：
+队列仍由本地分配策略算出，然后每队列一个 POP 循环 + ack。语义等价，差别只在「谁决定队列集合」；
+要改先读 `src/client/consumer.cpp` 里 `doRebalance` 的那段注释。
 
 **枚举字段入网是大写枚举名。** `SearchOffsetRequestHeader.boundaryType` 就是实例：
 线上是 `"LOWER"`/`"UPPER"`，`BoundaryType.getName()` 的 `"lower"`/`"upper"`
@@ -299,10 +311,10 @@ broker 需 `traceTopicEnable=true` 才预建。
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ROCKETMQ_CPP_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` / `OFF` |
-| `ROCKETMQ_CPP_LOG_FILE` | `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log` | 设为空串/`OFF`/`NONE` 则只留 stderr |
-| `ROCKETMQ_CPP_LOG_FILE_MAX_SIZE` | `67108864`（64MB） | 单文件上限；`0` = 不轮转 |
-| `ROCKETMQ_CPP_LOG_FILE_MAX_INDEX` | `10` | 备份份数；`0` = 不保留 |
+| `ROCKETMQ_CLIENT_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` / `OFF` |
+| `ROCKETMQ_CLIENT_LOG_FILE` | `$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log` | 设为空串/`OFF`/`NONE` 则只留 stderr |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE` | `67108864`（64MB） | 单文件上限；`0` = 不轮转 |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` | `10` | 备份份数；`0` = 不保留 |
 
 轮转语义是 **FixedWindow**：`<file>.N` 最旧先删，其余依次后移，最后 base → `.1`。
 

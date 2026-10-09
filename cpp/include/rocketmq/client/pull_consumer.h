@@ -3,7 +3,7 @@
 //
 // 与 push 消费者的区别：**由调用方自己拉、自己管位点**。
 // 没有后台拉取线程、没有 rebalance、没有消费监听器；只有：
-//   fetchSubscribeMessageQueues / pull / pullBlockIfNotFound /
+//   fetchSubscribeMessageQueues / fetchMessageQueuesInBalance / pull / pullBlockIfNotFound /
 //   fetchConsumeOffset / updateConsumeOffset / searchOffset / maxOffset / minOffset /
 //   earliestMsgStoreTime / sendMessageBack / createTopic。
 //
@@ -12,8 +12,10 @@
 //
 // ⚠ 与 Java 的一处有意差异：Java DefaultMQPullConsumer 内嵌 MQPullConsumerImpl，
 // 起了一个定时 rebalance 并在队列变更时回调 MessageQueueListener；本实现（同 Python
-// 参考实现）**不做 rebalance**——队列由 fetchSubscribeMessageQueues 显式取，监听器
-// 只作为 API 形状保留。需要自动分配队列请用 push 消费者。
+// 参考实现）**不做后台 rebalance**——全量队列由 fetchSubscribeMessageQueues 显式取，
+// 「本实例那一份」由 fetchMessageQueuesInBalance **当场按同一条分配公式算**（没有后台
+// 线程替它填 processQueueTable，见该方法的实现注释），监听器只作为 API 形状保留。
+// 要自动分配 + 自动拉取请用 push 消费者。
 #ifndef ROCKETMQ_CLIENT_PULL_CONSUMER_H
 #define ROCKETMQ_CLIENT_PULL_CONSUMER_H
 
@@ -111,6 +113,12 @@ public:
     // 命名空间（对应 Java DefaultMQPullConsumer.setNamespace）：非空时把 topic / group
     // 套上 "ns%" 前缀再与 broker 交互。
     void setNamespace(const std::string& ns) { namespace_ = ns; }
+    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`）：非空时 NamespaceRpcHook 给
+    // **每笔请求**加 `nsd=true` / `ns=<namespaceV2>`，由 broker 侧解析实例 —— 与上面的
+    // setNamespace（客户端改写 "ns%topic"）是两套机制。链序照 Java `MQClientAPIImpl:329`：
+    // 装在 ACL 签名**之前**（本消费者默认还开着 stream，链序为 Namespace → Stream → ACL）。
+    void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
+    const std::string& namespaceV2() const { return namespaceV2_; }
 
     // ---------------- ACL 鉴权（对应 Java DefaultMQPullConsumer(rpcHook)）----------------
     // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance。
@@ -142,6 +150,11 @@ public:
     // ---------------- 队列 ----------------
     // 该 topic 的全部可消费队列（按 broker 路由取，Java fetchSubscribeMessageQueues）。
     std::vector<MessageQueue> fetchSubscribeMessageQueues(const std::string& topic);
+
+    // 本实例「平衡后」应负责的队列（Java `MQPullConsumer#fetchMessageQueuesInBalance:187`，
+    // 官方 `example/simple/PullConsumer.java:62` 就靠它决定去拉哪些队列）。
+    // 判据与兜底口径见 `.cpp` 的实现注释。
+    std::vector<MessageQueue> fetchMessageQueuesInBalance(const std::string& topic);
 
     // ---------------- 拉取 ----------------
     // 一次短轮询拉取（Java pull）。timeoutMillis <= 0 表示用默认 consumerPullTimeoutMillis。
@@ -186,6 +199,8 @@ private:
 
     std::string consumerGroup_;
     std::string namespace_;
+    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
+    std::string namespaceV2_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
     std::string unitName_;

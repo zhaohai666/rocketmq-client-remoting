@@ -37,5 +37,10 @@ Thumbs.db
 # 误留的重定向文件（nohup 等）
 nohup.out
 
+# 客户端日志：python/php 端默认落在**当前工作目录**的 logs/rocketmqlogs 下
+# （刻意不写 $HOME，见 python/rocketmq_logging.py、php/src/Client/Logger.php），
+# 在仓库根或端口目录跑示例/单测就会长出这个目录。
+logs/
+
 # 本地 agent 工作目录（项目记忆 / 临时脚本），不入库
 .workbuddy/

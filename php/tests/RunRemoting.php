@@ -16,13 +16,16 @@ use RocketMQ\Client\Exceptions\RemotingSendRequestException;
 use RocketMQ\Client\Exceptions\RemotingTimeoutException;
 use RocketMQ\Client\Logger;
 use RocketMQ\Common\BoundaryType;
+use RocketMQ\Common\MixAll;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 use RocketMQ\Remoting\AclClientRPCHook;
 use RocketMQ\Remoting\AclRpcHook;
+use RocketMQ\Remoting\NamespaceRpcHook;
 use RocketMQ\Remoting\PendingResponse;
 use RocketMQ\Remoting\RemotingClient;
 use RocketMQ\Remoting\SessionCredentials;
+use RocketMQ\Remoting\StreamTypeRPCHook;
 use RocketMQ\Remoting\Protocol\BrokerData;
 use RocketMQ\Remoting\Protocol\CheckTransactionStateRequestHeader;
 use RocketMQ\Remoting\Protocol\ConsumerData;
@@ -379,6 +382,119 @@ final class RunRemoting
         // AclRpcHook 是 AclClientRPCHook 的兼容别名（对应 Python 的 AclRPCHook = AclClientRPCHook）
         $alias = new AclRpcHook(new SessionCredentials('a', 'b'));
         $this->check($alias instanceof AclClientRPCHook, 'AclRpcHook 兼容别名');
+    }
+
+    // ==================================================================== namespaceV2 钩子
+
+    /**
+     * 5.x 服务端命名空间钩子（org.apache.rocketmq.client.rpchook.NamespaceRpcHook）。
+     *
+     * 对齐基准（逐行读过 Java 5.5.1）：
+     *   * doBeforeRequest 只有一段：namespaceV2 非空时加 **两个** 扩展头
+     *     nsd="true" / ns=<namespaceV2>（MixAll.java:122-123）；doAfterResponse 空实现。
+     *   * 空命名空间必须 **完全不碰** extFields —— Java 的 NamespaceRpcHookTest 断言的
+     *     就是「未配置时请求原样」，把 extFields 初始化成空 map 都算错（上线会多一个空对象）。
+     *   * 值是**每笔请求现读**的（Java 读 clientConfig.getNamespaceV2()），所以 start() 之后
+     *     改配置也从下一笔请求生效；持字符串快照的写法会把这条路堵死。
+     *   * 注册顺序 Namespace → Stream → 用户钩子(ACL) 是语义不是风格（MQClientAPIImpl:329-335）：
+     *     nsd/ns 必须先进 extFields 才算得进签名，装反了签名「看着合法」但开鉴权的 broker
+     *     验签多出两个未签字段直接拒签。
+     *
+     * 与 python/tests/test_namespace_rpc_hook.py、csharp ClientParityTests、
+     * nodeJs test/namespace_rpc_smoke.ts、cpp tests/test_namespace_hook.cpp 同题。
+     */
+    private function testNamespaceRpcHook(): void
+    {
+        Logger::setHandler(static function (string $line): void {}); // 测试期间静音
+
+        // 字段名与 Java 常量逐字一致（拼错 = broker 认不出命名空间，静默失败）
+        $this->checkSame('nsd', MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, 'nsd 字段名');
+        $this->checkSame('ns', MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, 'ns 字段名');
+
+        $ns = 'MQ_INST_php_parity';
+        $hook = new NamespaceRpcHook($ns);
+        $cmd = new RemotingCommand(RequestCode::SEND_MESSAGE);
+        $hook->doBeforeRequest('127.0.0.1:10911', $cmd);
+        $this->checkSame('true', $cmd->getExtField('nsd') ?? '', 'nsd=true');
+        $this->checkSame($ns, $cmd->getExtField('ns') ?? '', 'ns=<namespaceV2>');
+
+        // doAfterResponse 是空实现（基类空方法，与 Java 的空方法体逐字一致）
+        $after = $cmd->extFields;
+        $hook->doAfterResponse('127.0.0.1:10911', $cmd, null);
+        $this->checkSame($after, $cmd->extFields, 'doAfterResponse 不动请求');
+
+        // 空命名空间 = no-op，而且连 extFields 都不碰（'' 与 null 两条腿）
+        foreach (['', null] as $unset) {
+            $bare = new RemotingCommand(RequestCode::SEND_MESSAGE);
+            $before = $bare->extFields;
+            (new NamespaceRpcHook($unset))->doBeforeRequest('a', $bare);
+            $this->checkSame($before, $bare->extFields,
+                '未配命名空间时 extFields 原样（' . var_export($unset, true) . '）');
+            $this->check(!array_key_exists('ns', $bare->extFields), 'ns 没被写成空串');
+            $this->check(!array_key_exists('nsd', $bare->extFields), 'nsd 没被写成空串');
+        }
+
+        // 取值函数每笔请求现读：先空后配，第二笔必须带上（Java 的 clientConfig 语义）
+        $current = '';
+        $live = new NamespaceRpcHook(function () use (&$current): string {
+            return $current;
+        });
+        $first = new RemotingCommand(RequestCode::SEND_MESSAGE);
+        $live->doBeforeRequest('a', $first);
+        $this->check(!array_key_exists('ns', $first->extFields), '现读：第一笔还没配命名空间');
+        $current = $ns;
+        $second = new RemotingCommand(RequestCode::SEND_MESSAGE);
+        $live->doBeforeRequest('a', $second);
+        $this->checkSame($ns, $second->getExtField('ns') ?? '', '现读：改完配置下一笔就生效');
+        $current = $ns . '_2';
+        $third = new RemotingCommand(RequestCode::SEND_MESSAGE);
+        $live->doBeforeRequest('a', $third);
+        $this->checkSame($ns . '_2', $third->getExtField('ns') ?? '', '现读：再改再跟');
+
+        // 顺序：Namespace 排在 ACL 之前 ⇒ ns/nsd 进了签名内容，broker 复算得同一份签名
+        $sk = 'sk-ns-123';
+        $acl = new AclClientRPCHook(new SessionCredentials('ak-ns', $sk));
+        $header = new SendMessageRequestHeader();
+        $header->producerGroup = 'GID-ns';
+        $header->topic = 'NsTopic';
+        $header->queueId = 0;
+
+        $signed = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
+        $signed->body = 'ns-payload';
+        $hook->doBeforeRequest('a', $signed);          // 先写 nsd/ns
+        $acl->doBeforeRequest('a', $signed);           // 再算签名（Java 的顺序）
+        $sigWithNs = $signed->getExtField('Signature') ?? '';
+        $this->check($sigWithNs !== '', '链式签名已生成');
+
+        // 独立复算 broker 视角：字典序 value（排除 Signature）+ body
+        $verify = $signed->extFields;
+        unset($verify[SessionCredentials::SIGNATURE]);
+        ksort($verify, SORT_STRING);
+        $content = implode('', array_map(strval(...), array_values($verify))) . 'ns-payload';
+        $this->checkSame(base64_encode(hash_hmac('sha1', $content, $sk, true)), $sigWithNs,
+            'nsd/ns 在签名内容里（broker 按上线字段复算能通过）');
+
+        // 反证：同一请求若不先装 Namespace 钩子，签名必然不同 —— 顺序写反就是验签失败
+        $noNs = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
+        $noNs->body = 'ns-payload';
+        $acl->doBeforeRequest('a', $noNs);
+        $this->check($sigWithNs !== ($noNs->getExtField('Signature') ?? ''),
+            '不先装 Namespace 就签不出同一份内容');
+
+        // Stream 也在 ACL 之前：ReqT 与 ns 同时进签名
+        $chain = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
+        $chain->body = 'ns-payload';
+        (new NamespaceRpcHook($ns))->doBeforeRequest('a', $chain);
+        (new StreamTypeRPCHook())->doBeforeRequest('a', $chain);
+        $acl->doBeforeRequest('a', $chain);
+        $this->checkSame('true', $chain->getExtField('nsd') ?? '', '链上 nsd 仍在');
+        $this->check(($chain->getExtField('ReqT') ?? '') !== '', '链上 ReqT 已写入');
+        $chainVerify = $chain->extFields;
+        unset($chainVerify[SessionCredentials::SIGNATURE]);
+        ksort($chainVerify, SORT_STRING);
+        $chainContent = implode('', array_map(strval(...), array_values($chainVerify))) . 'ns-payload';
+        $this->checkSame(base64_encode(hash_hmac('sha1', $chainContent, $sk, true)),
+            $chain->getExtField('Signature') ?? '', 'ns + ReqT 一并进签名（Java MQClientAPIImpl:329-335）');
     }
 
     // ==================================================================== 路由解码
@@ -859,6 +975,7 @@ final class RunRemoting
         $this->testRocketmqSerialization();
         $this->testHeaderSnapshot();
         $this->testAclSignature();
+        $this->testNamespaceRpcHook();
         $this->testRouteDecode();
         $this->testHeartbeat();
         $this->testExtraInfoAndNamespace();

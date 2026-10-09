@@ -48,6 +48,27 @@ int32_t Message::getDelayTimeLevel() const {
     }
 }
 
+// 5.x 定时消息 getter（Message.java:243-267）：属性缺失返回 0；值非法时与
+// Java Long.parseLong 一样**直接抛**，不静默吞成 0（否则批量/定时判定会拿到
+// 错误的"0 延时"）—— 与 canBatch 的 maxDelayValue 同一口径。
+int64_t Message::getDelayTimeSec() const {
+    auto it = properties.find(MessageConst::PROPERTY_TIMER_DELAY_SEC);
+    if (it == properties.end() || it->second.empty()) return 0;
+    return std::stoll(it->second);
+}
+
+int64_t Message::getDelayTimeMs() const {
+    auto it = properties.find(MessageConst::PROPERTY_TIMER_DELAY_MS);
+    if (it == properties.end() || it->second.empty()) return 0;
+    return std::stoll(it->second);
+}
+
+int64_t Message::getDeliverTimeMs() const {
+    auto it = properties.find(MessageConst::PROPERTY_TIMER_DELIVER_MS);
+    if (it == properties.end() || it->second.empty()) return 0;
+    return std::stoll(it->second);
+}
+
 bool Message::isWaitStoreMsgOk() const {
     // Java Message.isWaitStoreMsgOK()：属性**缺省即 true**，其余走 Boolean.parseBoolean
     // —— 只有忽略大小写的 "true" 为真。

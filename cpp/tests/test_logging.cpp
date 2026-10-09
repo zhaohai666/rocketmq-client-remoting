@@ -104,14 +104,14 @@ void setEnvVar(const char* name, const char* value) {
 
 int main() {
     // ---- 必须在第一次日志调用之前设置：logging.h 的静态缓存取首次读到的环境变量 ----
-    setEnvVar("ROCKETMQ_CPP_LOG_FILE_MAX_SIZE", "1200");
-    setEnvVar("ROCKETMQ_CPP_LOG_FILE_MAX_INDEX", "3");
-    setEnvVar("ROCKETMQ_CPP_LOG_LEVEL", "INFO");
+    setEnvVar("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE", "1200");
+    setEnvVar("ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX", "3");
+    setEnvVar("ROCKETMQ_CLIENT_LOG_LEVEL", "INFO");
 
     // 环境变量确实被解析到了（而不是静默回落默认值 64MB/10）
     CHECK(logFileMaxSize() == kTestMaxSize, "env max size honored");
     CHECK(logFileMaxIndex() == kTestMaxIndex, "env max index honored");
-    CHECK(envUmax("ROCKETMQ_CPP_LOG_FILE_MAX_SIZE") == kTestMaxSize, "env raw value");
+    CHECK(envUmax("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE") == kTestMaxSize, "env raw value");
 
     const fs::path dir =
         fs::temp_directory_path() /

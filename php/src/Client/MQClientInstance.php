@@ -72,6 +72,7 @@ use RocketMQ\Remoting\Protocol\UnlockBatchRequestBody;
 use RocketMQ\Remoting\Protocol\UnregisterClientRequestHeader;
 use RocketMQ\Remoting\Protocol\UpdateConsumerOffsetRequestHeader;
 use RocketMQ\Remoting\RemotingClient;
+use RocketMQ\Remoting\NamespaceRpcHook;
 use RocketMQ\Remoting\StreamTypeRPCHook;
 
 /**
@@ -204,6 +205,24 @@ class MQClientInstance
      */
     public int $pollNameServerInterval;
 
+    /**
+     * VIP 通道开关（对应 Java ClientConfig.vipChannelEnabled，默认 false）：true 时
+     * 发往 broker 的**发送 / 拉取 / POP / 指配**请求走 VIP 端口（端口 - 2）。
+     * Java 在 MQClientAPIImpl 的每个 invoke 点做 ``MixAll.brokerVIPChannel``，本端口
+     * 集中在 ``vipAddrFor()`` 一处套用（Admin 有自己独立的同名开关）。
+     */
+    public bool $vipChannelEnabled = false;
+
+    /**
+     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求都带
+     * `nsd=true` / `ns=<该值>` 两个扩展头（由 {@see NamespaceRpcHook} 写入），broker
+     * 据此把请求解析到对应的 serverless 实例。它和拼 topic 名的 `namespace` 是两套机制。
+     *
+     * ⚠ 钩子在构造时就装好、值在每笔请求里现读（Java 传的是 clientConfig 对象，同语义），
+     * 所以 start() 之后再改这个字段一样生效——别把「非空才注册」当成优化。
+     */
+    public string $namespaceV2 = '';
+
     public RemotingClient $remotingClient;
 
     /** @var array<string, TopicRouteData> */
@@ -247,6 +266,10 @@ class MQClientInstance
     private ?int $adjustPoolNextRunMillis = null;
     private ?int $routeRefreshNextRunMillis = null;
     private ?int $statsSampleNextRunMillis = null;
+    /** RequestFutureHolder TTL 清扫（Java RequestHouseKeepingService：initial 3s，period 1s）。 */
+    private ?int $requestScanNextRunMillis = null;
+    public const REQUEST_SCAN_INITIAL_DELAY_MILLIS = 3_000;
+    public const REQUEST_SCAN_INTERVAL_MILLIS = 1_000;
 
     /**
      * @param list<string> $nameServerAddrs
@@ -258,17 +281,27 @@ class MQClientInstance
         int $invokeTimeoutMillis = 15000,
         ?bool $tlsEnable = null,
         bool $enableStreamRequestType = false,
+        string $namespaceV2 = '',
         ?string $unitName = null,
         int $pollNameServerInterval = 30000,
         ?array $tlsOptions = null,
+        bool $vipChannelEnabled = false,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
         $this->pollNameServerInterval = $pollNameServerInterval;
+        $this->vipChannelEnabled = $vipChannelEnabled;
+        $this->namespaceV2 = $namespaceV2;
         $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions);
-        // 对应 Java MQClientAPIImpl:329-332：stream 钩子必须注册在用户 rpcHook 之前，
-        // 这样 ReqT 才会被算进 ACL 签名内容（"Inject stream rpc hook first to make
-        // reserve field signature"）。facade 都是在构造完本实例之后才注册 rpcHook。
+        // 对应 Java MQClientAPIImpl:329-335 的装链顺序：
+        //   Namespace → Stream → 用户 rpcHook（ACL 签名）→（本端口无 DynamicalExtField）
+        // namespace 钩子**无条件注册**且排在最前：nsd/ns 必须在算签名之前进 extFields，
+        // 否则开鉴权的 broker 验签会多出未签名字段而拒签；钩子自身在 namespaceV2 为空时
+        // 一个字段都不写（与 Java 同），所以空值注册没有代价。
+        $this->remotingClient->registerRpcHook(new NamespaceRpcHook(\Closure::fromCallable([$this, 'namespaceV2Value'])));
+        // stream 钩子同样必须注册在用户 rpcHook 之前，这样 ReqT 才会被算进 ACL 签名内容
+        // （"Inject stream rpc hook first to make reserve field signature"）。facade 都是在
+        // 构造完本实例之后才注册 rpcHook。
         if ($enableStreamRequestType) {
             $this->remotingClient->registerRpcHook(new StreamTypeRPCHook());
         }
@@ -319,6 +352,16 @@ class MQClientInstance
     public static function removeInstance(string $clientId): void
     {
         unset(self::$instanceMap[$clientId]);
+    }
+
+    /**
+     * 当前生效的 namespaceV2——{@see NamespaceRpcHook} 每笔请求回调本方法取值，
+     * 与 Java「钩子实时读 clientConfig.getNamespaceV2()」同语义：start() 之后改
+     * 本字段，后续请求立即跟着变（对照 Remoting/NamespaceRpcHook 的注释）。
+     */
+    public function namespaceV2Value(): string
+    {
+        return $this->namespaceV2;
     }
 
     // ---------------- 时间 ----------------
@@ -373,6 +416,7 @@ class MQClientInstance
             ? $now + self::NAMESRV_REFRESH_INITIAL_DELAY_MILLIS
             : null;
         $this->statsSampleNextRunMillis = $now + self::STATS_SAMPLE_INTERVAL_MILLIS;
+        $this->requestScanNextRunMillis = $now + self::REQUEST_SCAN_INITIAL_DELAY_MILLIS;
 
         $this->pumpStartupOnce();
     }
@@ -385,6 +429,7 @@ class MQClientInstance
         $this->adjustPoolNextRunMillis = null;
         $this->routeRefreshNextRunMillis = null;
         $this->statsSampleNextRunMillis = null;
+        $this->requestScanNextRunMillis = null;
         $this->pendingActions = [];
         $this->consumerStatsManager->shutdown();
         $this->remotingClient->shutdown();
@@ -435,6 +480,19 @@ class MQClientInstance
         if ($this->statsSampleNextRunMillis !== null && $now >= $this->statsSampleNextRunMillis) {
             $this->consumerStatsManager->sampleOnce();
             $this->statsSampleNextRunMillis = $now + self::STATS_SAMPLE_INTERVAL_MILLIS;
+        }
+
+        // ⑤RequestFutureHolder TTL 清扫（Java RequestHouseKeepingService 单线程
+        //   scheduleAtFixedRate(scanExpiredRequest, 3s, 1s)；PHP 单线程下没有并发，
+        //   只需保证同一请求的超时路径与应答路径只有一条生效 —— putResponse 用
+        //   「摘到才负责」的 remove 语义，天然互斥）。
+        if ($this->requestScanNextRunMillis !== null && $now >= $this->requestScanNextRunMillis) {
+            $this->requestScanNextRunMillis = $now + self::REQUEST_SCAN_INTERVAL_MILLIS;
+            try {
+                RequestFutureHolder::getInstance()->scanExpiredRequest();
+            } catch (\Throwable $e) {
+                Logger::warning('scan RequestFutureTable exception: ' . $e->getMessage());
+            }
         }
     }
 
@@ -961,6 +1019,16 @@ class MQClientInstance
     // ---------------- 消息发送 ----------------
 
     /**
+     * VIP 通道换算（Java 每个invoke 点的 ``MixAll.brokerVIPChannel(isVip, addr)``）。
+     * 关闭或端口不可解析时原样返回；**只在发请求前套用一次**（端口会 -2，重复套用会
+     * 连减多次 —— 调用方不得对同一地址二次换算）。
+     */
+    public function vipAddrFor(string $addr): string
+    {
+        return MixAll::brokerVipChannel($this->vipChannelEnabled, $addr);
+    }
+
+    /**
      * Java 侧「只要主」的地址解析：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由
      * → 重查 → 仍查不到抛 "The broker[X] not exist"。
      */
@@ -1021,7 +1089,8 @@ class MQClientInstance
             $defaultTopic,
             $defaultTopicQueueNums,
         );
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        // Java MQClientAPIImpl.sendMessage —— 发送路径走 VIP 通道换算
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         return $this->parseSendResponse($response, $msg, $mq);
     }
 
@@ -1047,7 +1116,7 @@ class MQClientInstance
             $defaultTopicQueueNums,
         );
         $request->markOnewayRPC();
-        $this->remotingClient->invokeOneway($addr, $request);
+        $this->remotingClient->invokeOneway($this->vipAddrFor($addr), $request);
     }
 
     /** 只**构建** SEND_MESSAGE 请求对象、不发送（异步发送链需要跨重试复用同一请求）。 */
@@ -1100,7 +1169,7 @@ class MQClientInstance
             $onComplete(null, $error);
         };
         $this->remotingClient->invokeAsync(
-            $addr,
+            $this->vipAddrFor($addr),
             $request,
             \Closure::fromCallable($onSuccess),
             \Closure::fromCallable($onFailure),
@@ -1357,7 +1426,8 @@ class MQClientInstance
             ? RequestCode::LITE_PULL_MESSAGE
             : RequestCode::PULL_MESSAGE;
         $request = RemotingCommand::createRequestCommand($code, $header);
-        $response = $this->invokeSync($addr, $request, $timeoutMillis);
+        // Java MQClientAPIImpl.pullMessage —— 拉取路径同样走 VIP 通道换算
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
 
         if ($response->code === ResponseCode::SUCCESS) {
             $status = PullStatus::FOUND;
@@ -1420,6 +1490,54 @@ class MQClientInstance
     }
 
     // ---------------- POP 模式（5.x 轻量消费） ----------------
+
+    /**
+     * QUERY_ASSIGNMENT(400)：向 broker 要本组的队列指配（Java MQClientAPIImpl
+     * #queryAssignment，body 是 QueryAssignmentRequestBody JSON）。
+     *
+     * 返回值语义与 Java 一致：SUCCESS 时返回指配列表（可为空表），**非 SUCCESS 抛
+     * MQBrokerException**。是否把空表当"无效结果"由调用方（RebalanceImpl）判定。
+     *
+     * @return list<array{mq: MessageQueue, mode: MessageRequestMode}>
+     */
+    public function queryAssignment(
+        string $topic,
+        string $consumerGroup,
+        string $clientId,
+        string $strategyName,
+        string $messageModel,
+        int $timeoutMillis = 3000,
+        ?string $addr = null,
+    ): array {
+        if ($addr === null) {
+            // Java RebalanceImpl 走 mQClientFactory.queryAssignment → 找本 topic 任一
+            // master；找不到直接抛 no route。
+            $addr = $this->findBrokerAddrByTopic($topic)
+                ?? throw new MQClientException(sprintf('No route info of this topic: %s', $topic));
+        }
+        $body = new QueryAssignmentRequestBody();
+        $body->topic = $topic;
+        $body->consumerGroup = $consumerGroup;
+        $body->clientId = $clientId;
+        $body->messageModel = $messageModel;
+        $body->strategyName = $strategyName;
+        $request = RemotingCommand::createRequestCommand(RequestCode::QUERY_ASSIGNMENT, null);
+        $request->body = $body->encode();
+        $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
+        if ($response->code !== ResponseCode::SUCCESS) {
+            throw new MQBrokerException($response->code, $response->remark ?? '');
+        }
+        $out = [];
+        if ($response->body !== null && $response->body !== '') {
+            foreach (QueryAssignmentResponseBody::decode($response->body)->messageQueueAssignments as $a) {
+                if ($a->messageQueue === null) {
+                    continue;
+                }
+                $out[] = ['mq' => $a->messageQueue, 'mode' => $a->mode];
+            }
+        }
+        return $out;
+    }
 
     /**
      * POP 弹取消息（RequestCode.POP_MESSAGE = 200050）。

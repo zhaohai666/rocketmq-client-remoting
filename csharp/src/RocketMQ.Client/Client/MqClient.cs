@@ -229,6 +229,23 @@ public sealed class MQClientInstance : IDisposable
     /// </summary>
     private readonly int _pollNameServerIntervalMillis;
 
+    /// <summary>
+    /// Java <c>ClientConfig#vipChannelEnabled</c> / <c>DefaultMQProducer#sendMessageWithVIPChannel</c>
+    /// 的实例级副本：只改写**发送**族 RPC 的 broker 地址（端口 -2）。与 Java 同口径 ——
+    /// <c>MQClientAPIImpl.pullMessage</c> 与 pop/ack 一路都不过 <c>brokerVIPChannel</c>，
+    /// 生产者侧的改写发生在 <c>sendKernelImpl:928</c>，本端口把它收在这里。
+    /// </summary>
+    public bool VipChannelEnabled
+    {
+        get => _vipChannelEnabled;
+        set => _vipChannelEnabled = value;
+    }
+
+    private bool _vipChannelEnabled;
+
+    /// <summary>发送族地址改写（Java <c>MixAll.brokerVIPChannel(flag, addr)</c>）。</summary>
+    internal string VipAddr(string addr) => MixAll.BrokerVipChannel(_vipChannelEnabled, addr);
+
     // ---- 动态 name server（对应 Java MQClientAPIImpl.topAddressing + fetchNameServerAddr）----
     // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 → fetch 是 no-op，行为不变。
     // 非空白 unitName 会让 URL 多出 `-<unitName>?nofix=1`（Java `MQClientAPIImpl` 构造里
@@ -274,7 +291,8 @@ public sealed class MQClientInstance : IDisposable
     /// </summary>
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
         int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
-        TlsOptions? tlsOptions = null, string? unitName = null, int pollNameServerIntervalMillis = 30000)
+        TlsOptions? tlsOptions = null, string? unitName = null, int pollNameServerIntervalMillis = 30000,
+        bool vipChannelEnabled = false)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
@@ -284,6 +302,9 @@ public sealed class MQClientInstance : IDisposable
         _pollNameServerIntervalMillis = pollNameServerIntervalMillis > 0
             ? pollNameServerIntervalMillis
             : 30000;
+        // VIP 通道开关（Java MQClientAPIImpl 持有 clientConfig，逐笔 RPC 里现读
+        // isVipChannelEnabled()；本端口的 facade 各自独占实例，构造时传入即可）。
+        _vipChannelEnabled = vipChannelEnabled;
         _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable, tlsOptions);
         // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 = 动态取址关闭（与 Java 默认
         // jmenv.tbsite.net 不同：那是个依赖 /etc/hosts 的域名，照抄会让未配置的用户
@@ -1072,7 +1093,8 @@ public sealed class MQClientInstance : IDisposable
     {
         // Java sendKernelImpl 的发送地址只认 master（PublishAddrFor 里含一次路由刷新）；
         // 主掉线时本端立刻报「The broker[X] not exist」，而不是把请求打到从节点上。
-        string addr = PublishAddrFor(mq.BrokerName, mq.Topic);
+        // 拿到地址后按 Java sendKernelImpl:928 补 VIP 改写（开关关闭时原样返回）。
+        string addr = VipAddr(PublishAddrFor(mq.BrokerName, mq.Topic));
         // 对应 Java DefaultMQProducerImpl.sendKernelImpl：非批量消息在**发请求之前**
         // 补一个客户端唯一 ID（UNIQ_KEY）。它决定 SendResult.MsgId，也是消息轨迹
         // 里 msgId 的来源（控制台按它把发送轨迹与消费轨迹串起来）。
@@ -1166,8 +1188,8 @@ public sealed class MQClientInstance : IDisposable
         int timeoutMillis = 3000, int sysFlag = 0, bool unitMode = false,
         string? createTopicKey = null, int? defaultTopicQueueNums = null)
     {
-        // 单向发送同样是写请求，地址口径与同步发送一致（只认 master）。
-        string addr = PublishAddrFor(mq.BrokerName, mq.Topic);
+        // 单向发送同样是写请求，地址口径与同步发送一致（只认 master + 同一处 VIP 改写）。
+        string addr = VipAddr(PublishAddrFor(mq.BrokerName, mq.Topic));
         // 单向发送同样补 UNIQ_KEY（与同步发送语义一致）
         if (!msg.IsBatch)
         {

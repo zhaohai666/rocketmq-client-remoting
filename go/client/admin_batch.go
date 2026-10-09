@@ -53,14 +53,14 @@ type TopicQueueMappingDetail struct {
 // LogicQueueMappingItem mirrors
 // org.apache.rocketmq.remoting.protocol.statictopic.LogicQueueMappingItem.
 type LogicQueueMappingItem struct {
-	Gen          int32
-	QueueID      int32
-	Bname        string
-	LogicOffset  int64
-	StartOffset  int64
-	EndOffset    int64
-	TimeOfStart  int64
-	TimeOfEnd    int64
+	Gen         int32
+	QueueID     int32
+	Bname       string
+	LogicOffset int64
+	StartOffset int64
+	EndOffset   int64
+	TimeOfStart int64
+	TimeOfEnd   int64
 }
 
 func (d *TopicQueueMappingDetail) toJSONValue() map[string]any {
@@ -393,13 +393,21 @@ func (a *DefaultMQAdminExt) CleanUnusedTopicByAddr(brokerAddr string) error {
 
 // SetMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401), switching a
 // POP consumer group between POP and pull mode (unitized deployments).
+//
+// Java `MQClientAPIImpl:3304-3311` builds the request with a **null header** and
+// puts all four fields in the body: the broker's `AdminBrokerProcessor` decodes a
+// `SetMessageRequestModeRequestBody` and never reads an ext field, so a header-only
+// request makes it NPE on a null body. Same wire shape as the consumer-side
+// `Instance.SetMessageRequestMode`.
 func (a *DefaultMQAdminExt) SetMessageRequestMode(brokerAddr, topic, consumerGroup string,
 	mode string, popShareQueueNum int32) error {
-	header := adminExt("topic", topic, "consumerGroup", consumerGroup, "mode", mode)
-	if popShareQueueNum > 0 {
-		header.Put("popShareQueueNum", strconv.Itoa(int(popShareQueueNum)))
-	}
-	_, err := a.invokeBroker(brokerAddr, remoting.ReqSetMessageRequestMode, header, nil, 0)
+	body := (&remoting.SetMessageRequestModeRequestBody{
+		Topic:            topic,
+		ConsumerGroup:    consumerGroup,
+		Mode:             mode,
+		PopShareQueueNum: popShareQueueNum,
+	}).Encode()
+	_, err := a.invokeBroker(brokerAddr, remoting.ReqSetMessageRequestMode, nil, body, 0)
 	return err
 }
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace RocketMQ\Remoting;
 
+use RocketMQ\Common\MixAll;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
 use RocketMQ\Remoting\Protocol\RequestType;
 
@@ -137,5 +138,76 @@ final class StreamTypeRPCHook extends RPCHook
     public function doBeforeRequest(string $remoteAddr, RemotingCommand $request): void
     {
         $request->addExtField(\RocketMQ\Common\MixAll::REQ_T, (string)RequestType::STREAM);
+    }
+}
+
+/**
+ * 5.x 新命名空间钩子（对应 org.apache.rocketmq.client.rpchook.NamespaceRpcHook）。
+ *
+ * Java 的 `doBeforeRequest` 只有一段：`namespaceV2` 非空时给请求加**两个**扩展头
+ *
+ *     nsd = "true"、ns = <namespaceV2>
+ *
+ * （常量见 `MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD` / `..._NAMESPACE_FIELD`，
+ * common/MixAll.java:122-123）。`doAfterResponse` 是空实现——基类 `RPCHook` 已是空方法，
+ * 这里不覆写即与 Java 逐字一致。
+ *
+ * 这是**服务端**命名空间机制：broker 按 `ns` 把请求解析到对应实例（阿里云系 serverless
+ * 实例 ID），客户端**不**改 topic/group 名；它和 `namespace` 字段（客户端拼 `namespace%`
+ * 前缀，见 `NamespaceUtil`）是两套互不相干的机制。
+ *
+ * ⚠ 注册顺序是语义而不是风格：Java `MQClientAPIImpl:329-335` 把它排在钩子链**最前**
+ * （Namespace → Stream → 用户钩子(ACL 签名) → DynamicalExtField），所以 `nsd`/`ns`
+ * 必然在算签名**之前**写进 extFields、被签名覆盖。装反了签名照样「看着合法」，但开鉴权的
+ * broker 验签时会多出两个没签过的字段直接拒掉请求，本端口在 `MQClientInstance` 构造器里
+ * 按同一顺序装链。
+ *
+ * 取值用「构造函数」而非「构造时快照」：Java 每笔请求实时读
+ * `clientConfig.getNamespaceV2()`，配置改了要能跟着走，故这里接受
+ * `string`（固定值，等价 Go 端）或 `callable`（每笔请求调一次，等价 C# 端的 Func）。
+ * 另外**空值也要注册**本钩子（与 Java 一致，注册无门槛），空判在钩子内部：
+ * `namespaceV2` 为空时一个字段都不写——尤其**不能**把 extFields 初始化成空 map，
+ * Java 的 NamespaceRpcHookTest 断言的就是「没配命名空间时 extFields 保持没被碰过」。
+ */
+final class NamespaceRpcHook extends RPCHook
+{
+    /** @var \Closure(): string 实时取 namespaceV2（对应 Java 的 clientConfig.getNamespaceV2()） */
+    private \Closure $namespaceV2;
+
+    public function __construct(string|callable|null $namespaceV2 = '')
+    {
+        // ⚠ 判序：字符串先于 callable。PHP 里 `is_callable('trim')` 为真，若先判 callable，
+        // 一个恰好与函数同名的命名空间值会被当成取值函数（每笔请求去 trim 一遍命名空间）。
+        if (is_string($namespaceV2)) {
+            $fixed = $namespaceV2;
+            $this->namespaceV2 = static function () use ($fixed): string {
+                return $fixed;
+            };
+        } elseif ($namespaceV2 === null) {
+            // null = Java 的 clientConfig.getNamespaceV2() 返回 null：未配置。
+            // 不能把 null 交给 Closure::fromCallable（'' 会被当函数名，直接 fatal）。
+            $this->namespaceV2 = static function (): string {
+                return '';
+            };
+        } else {
+            $this->namespaceV2 = \Closure::fromCallable($namespaceV2);
+        }
+    }
+
+    /** 本次请求实际生效的 namespaceV2（空串 = 未配命名空间）。 */
+    public function namespaceV2Value(): string
+    {
+        return (string) ($this->namespaceV2)();
+    }
+
+    public function doBeforeRequest(string $remoteAddr, RemotingCommand $request): void
+    {
+        // Java: StringUtils.isNotEmpty(clientConfig.getNamespaceV2())——只判空串，不 trim。
+        $namespaceV2 = (string) ($this->namespaceV2)();
+        if ($namespaceV2 === '') {
+            return;
+        }
+        $request->addExtField(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, 'true');
+        $request->addExtField(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, $namespaceV2);
     }
 }

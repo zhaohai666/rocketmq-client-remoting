@@ -8,10 +8,15 @@ import (
 )
 
 // Message body compression. ZLIB is the RFC1950 stream (Java DeflaterOutputStream,
-// Python zlib.compress). LZ4/ZSTD have no stdlib implementation in Go and this
-// module takes no third-party dependencies: both are reported as unsupported
-// instead of silently passing the compressed bytes through — a caller that
-// decodes would clear COMPRESSED_FLAG and hand out garbage as the body.
+// Python zlib.compress). LZ4 is the LZ4 frame format and ZSTD the zstd frame
+// format — both hand-implemented in this package (lz4.go / zstd.go) with zero
+// third-party dependencies, cross-compatible with Java's lz4-java / zstd-jni and
+// the lz4/zstd CLIs. See lz4.go/zstd.go for the format notes.
+//
+// Asymmetry to keep in mind: ZSTD DECODES the full format (Huffman + FSE blocks)
+// but only ENCODES store-only Raw/RLE blocks, so a Go-produced ZSTD body stays a
+// legal frame that every port reads — it just doesn't shrink. LZ4 is complete in
+// both directions (real match finder, store-as-raw fallback per block).
 const (
 	DefaultCompressLevel = 5
 	ZstdDefaultLevel     = 3
@@ -46,13 +51,15 @@ func unsupported(compressionType int32) error {
 }
 
 // Compress mirrors Java Compressor#compress(byte[], level). As in Python, level
-// only applies to ZLIB.
+// only applies to ZLIB; LZ4/ZSTD ignore it (their codecs here are level-free).
 func Compress(data []byte, compressionType int32, level int32) ([]byte, error) {
 	switch NormalizeCompressionType(compressionType) {
 	case ZlibType:
 		return ZlibCompress(data, level)
-	case Lz4Type, ZstdType:
-		return nil, unsupported(compressionType)
+	case Lz4Type:
+		return lz4CompressFrame(data), nil
+	case ZstdType:
+		return zstdCompressRaw(data), nil
 	default:
 		return nil, unsupported(compressionType)
 	}
@@ -63,8 +70,10 @@ func Decompress(data []byte, compressionType int32) ([]byte, error) {
 	switch NormalizeCompressionType(compressionType) {
 	case ZlibType:
 		return ZlibDecompress(data)
-	case Lz4Type, ZstdType:
-		return nil, unsupported(compressionType)
+	case Lz4Type:
+		return lz4DecompressFrame(data)
+	case ZstdType:
+		return zstdDecompressFrame(data)
 	default:
 		return nil, unsupported(compressionType)
 	}

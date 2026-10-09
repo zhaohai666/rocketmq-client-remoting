@@ -49,6 +49,10 @@ import { SendResult } from './send_result.ts';
 import { ConsumerStatsManager } from './consumer_stats.ts';
 import { REQUEST_FUTURE_HOLDER } from './request_reply.ts';
 import { decompressFor } from '../common/compress.ts';
+import { DefaultTopAddressing } from './top_addressing.ts';
+import {
+  QueryAssignmentRequestBody, QueryAssignmentResponseBody,
+} from '../remoting/pop_bodies.ts';
 
 const logger = getLogger('mqclient');
 
@@ -121,6 +125,15 @@ export class MQClient {
   _heartbeatTimer: NodeJS.Timeout | null;
   _routeTimer: NodeJS.Timeout | null;
   _routeInitialTimer: NodeJS.Timeout | null;
+  // Dynamic name-server addressing (Java MQClientInstance.startScheduledTask:
+  // fetchNameServerAddr via TopAddressing every 2min, initial delay 10s —
+  // ONLY when the name server address was not explicitly set).
+  _topAddressing: DefaultTopAddressing | null;
+  _namesrvTimer: NodeJS.Timeout | null;
+  _namesrvInitialTimer: NodeJS.Timeout | null;
+  // Java MQClientInstance's adjustThreadPool task: every 1 minute every
+  // consumer of this instance is offered a pool-size adjustment decision.
+  _adjustThreadPoolTimer: NodeJS.Timeout | null;
   _running: boolean;
 
   constructor(
@@ -143,6 +156,10 @@ export class MQClient {
     this._heartbeatTimer = null;
     this._routeTimer = null;
     this._routeInitialTimer = null;
+    this._topAddressing = null;
+    this._namesrvTimer = null;
+    this._namesrvInitialTimer = null;
+    this._adjustThreadPoolTimer = null;
     this._running = false;
   }
 
@@ -154,6 +171,29 @@ export class MQClient {
 
   getNameServerAddressList(): string[] {
     return this.nameServerAddrList;
+  }
+
+  // Java MQClientAPIImpl#onNameServerAddressChange: apply a TopAddressing
+  // push. Returns the accepted address (null/unchanged -> no-op).
+  onNameServerAddressChange(namesrvAddress: string | null): string | null {
+    if (namesrvAddress != null && namesrvAddress !== this.nameServerAddress) {
+      logger.info('name server address changed, old=%s, new=%s', this.nameServerAddress, namesrvAddress);
+      this.updateNameServerAddressList(namesrvAddress);
+      return this.nameServerAddress;
+    }
+    return this.nameServerAddress;
+  }
+
+  // Java MQClientAPIImpl#fetchNameServerAddr: poll the TopAddressing HTTP
+  // endpoint; a changed answer is pushed through the change callback.
+  async fetchNameServerAddr(): Promise<string | null> {
+    if (this._topAddressing == null) return this.nameServerAddress;
+    try {
+      return await this._topAddressing.fetchNsAddr();
+    } catch (e) {
+      logger.debug('fetchNameServerAddr exception: %s', (e as Error).message);
+      return this.nameServerAddress;
+    }
   }
 
   private _randomNameServer(): string | null {
@@ -768,6 +808,30 @@ export class MQClient {
     }
   }
 
+  // ---- QUERY_ASSIGNMENT(400) — broker-side 指配 (Java MQClientAPIImpl
+  // #queryAssignment, RebalanceImpl#getRebalanceResultFromBroker). Used by the
+  // push consumer's rebalance when clientRebalance is OFF: the broker decides
+  // which queues (and in which MessageRequestMode) this client consumes.
+  // Returns null when the broker answered with an invalid/empty result — Java
+  // treats null as "skip the update", never "I own nothing".
+  async queryAssignment(addr: string, topic: string, consumerGroup: string, clientId: string,
+    strategyName: string, messageModel: string, timeoutMillis = 3000,
+  ): Promise<Array<{ mq: MessageQueue; mode: string }> | null> {
+    const body = new QueryAssignmentRequestBody();
+    body.topic = topic;
+    body.consumerGroup = consumerGroup;
+    body.clientId = clientId;
+    body.messageModel = messageModel;
+    body.strategyName = strategyName;
+    const request = RemotingCommand.createRequestCommand(RequestCode.QUERY_ASSIGNMENT, null);
+    request.body = body.encode();
+    const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || 'queryAssignment failed', addr);
+    }
+    return QueryAssignmentResponseBody.decode(response.body as Buffer);
+  }
+
   // ---- producer / consumer registration (for the eventual consumer/admin agents) ----
   registerProducer(group: string, producer: any): void {
     this.producerTable.set(group, producer);
@@ -795,9 +859,42 @@ export class MQClient {
     this._registerReplyMessageProcessor();
     this._startHeartbeatLoop();
     this._startRouteRefreshLoop();
+    this._startNamesrvAddressingLoop();
+    this._startAdjustThreadPoolLoop();
     // Java ConsumerStatsManager.start() is empty (sampling hangs off each
     // StatsItem's scheduler); the unified sampler timer starts here.
     this.consumerStatsManager.start();
+  }
+
+  // Java MQClientInstance.startScheduledTask — the TopAddressing branch runs
+  // ONLY when no name server address was explicitly configured:
+  //   scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)
+  private _startNamesrvAddressingLoop(): void {
+    if (this.nameServerAddress != null) return; // explicitly set — Java skips the task
+    this._topAddressing = new DefaultTopAddressing(null, null);
+    this._topAddressing.registerChangeCallBack((addrs) => this.onNameServerAddressChange(addrs));
+    const beat = () => { void this.fetchNameServerAddr(); };
+    const initial = setTimeout(beat, 10_000);
+    if (typeof initial.unref === 'function') initial.unref();
+    this._namesrvTimer = setInterval(beat, 2 * 60_000);
+    if (typeof this._namesrvTimer.unref === 'function') this._namesrvTimer.unref();
+    this._namesrvInitialTimer = initial;
+  }
+
+  // Java MQClientInstance: scheduleAtFixedRate(adjustThreadPool, 1, 1, MINUTES).
+  // The consumer-side inc/dec is a faithful no-op (see DefaultMQPushConsumer
+  // .adjustThreadPool), so this only measures — exactly like Java.
+  private _startAdjustThreadPoolLoop(): void {
+    this._adjustThreadPoolTimer = setInterval(() => { this.adjustThreadPool(); }, 60_000);
+    if (typeof this._adjustThreadPoolTimer.unref === 'function') this._adjustThreadPoolTimer.unref();
+  }
+
+  adjustThreadPool(): void {
+    for (const consumer of this.consumerTable.values()) {
+      if (consumer != null && typeof consumer.adjustThreadPool === 'function') {
+        try { consumer.adjustThreadPool(); } catch (e) { /* best effort, like Java's catch-all */ }
+      }
+    }
   }
 
   // Java startScheduledTask: MQClientInstance.updateTopicRouteInfoFromNameServer()
@@ -979,6 +1076,10 @@ export class MQClient {
     if (this._heartbeatTimer != null) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
     if (this._routeTimer != null) { clearInterval(this._routeTimer); this._routeTimer = null; }
     if (this._routeInitialTimer != null) { clearTimeout(this._routeInitialTimer); this._routeInitialTimer = null; }
+    if (this._namesrvTimer != null) { clearInterval(this._namesrvTimer); this._namesrvTimer = null; }
+    if (this._namesrvInitialTimer != null) { clearTimeout(this._namesrvInitialTimer); this._namesrvInitialTimer = null; }
+    if (this._topAddressing != null) { this._topAddressing.clearChangeCallBack(); this._topAddressing = null; }
+    if (this._adjustThreadPoolTimer != null) { clearInterval(this._adjustThreadPoolTimer); this._adjustThreadPoolTimer = null; }
     this.consumerStatsManager.shutdown();
     try { this.remotingClient.shutdown(); } catch (e) { /* ignore */ }
     for (const acc of (this as any)._accumulators || []) { try { acc.stop(); } catch (e) {} }

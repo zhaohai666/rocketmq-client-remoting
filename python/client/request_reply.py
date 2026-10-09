@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -37,7 +38,9 @@ from typing import Callable, Dict, Optional
 from common.message import Message
 from common.message_const import MessageConst
 from common.mix_all import MixAll
-from .exception import ClientErrorCode, MQClientException
+from .exception import ClientErrorCode, MQClientException, RequestTimeoutException
+
+logger = logging.getLogger(__name__)
 
 # 应答消息的请求码：MSG_TYPE == "reply" 时用这两个（Java MQClientAPIImpl.sendMessage）
 # 我们统一用 V2 头，所以取 SEND_REPLY_MESSAGE_V2。
@@ -58,8 +61,9 @@ class RequestCallback:
 class RequestResponseFuture:
     """对应 Java ``RequestResponseFuture``：一次 request 的等待槽。
 
-    与 Java 的差异（有意）：Java 额外起了一个 ``scanExpiredRequest`` 定时线程清理超时项；
-    本实现由 ``request()`` 的 ``finally`` 保证移除，故不需要后台扫描线程。
+    正常路径由 ``request()`` 的 ``finally`` 保证移除；但「发送方进程里漏了 finally /
+    回调丢失」等异常场景下表项可能滞留，所以与 Java 一样再配一层
+    ``RequestFutureHolder.scanExpiredRequest`` 周期兜底清理（1s 一扫）。
     """
 
     def __init__(self, correlation_id: str, timeout_millis: int,
@@ -113,6 +117,10 @@ class RequestFutureHolder:
     def __init__(self) -> None:
         self.request_future_table: Dict[str, RequestResponseFuture] = {}
         self._lock = threading.Lock()
+        # 后台清理线程的引用计数（对齐 Java 的 producerSet）
+        self._producers: set = set()
+        self._sweep_thread: Optional[threading.Thread] = None
+        self._sweep_stop = threading.Event()
 
     def put_request(self, correlation_id: str, future: RequestResponseFuture) -> None:
         with self._lock:
@@ -143,6 +151,75 @@ class RequestFutureHolder:
         # 同步调用方（callback 为空）靠 put_response_message 唤醒。
         future.execute_request_callback()
         return future
+
+    # ------------------------------------------------------------------
+    # 超时兜底清理（对应 Java ``scanExpiredRequest`` + ``RequestHouseKeepingService``）
+    # ------------------------------------------------------------------
+    def scan_expired_request(self) -> int:
+        """对应 Java ``scanExpiredRequest``：摘除超时槽位并触发回调。
+
+        原子地 remove（保证超时路径与应答到达路径互斥），随后对每个摘下来的槽位
+        ``setCause(RequestTimeoutException)`` + ``executeRequestCallback()``。
+        注意与 Java 相同：**不**改 send_request_ok、**不** put_response_message ——
+        同步等待方仍由自己的超时分支收尾，这里只负责异步回调不悬挂。
+
+        返回本次清理的条数（供测试/日志）。
+        """
+        expired: list = []
+        with self._lock:
+            for key in list(self.request_future_table.keys()):
+                future = self.request_future_table.get(key)
+                if future is not None and future.is_timeout():
+                    # 原子摘除：谁摘到谁负责（Java 注释同款约束）
+                    removed = self.request_future_table.pop(key, None)
+                    if removed is not None:
+                        expired.append(removed)
+                        logger.warning("remove timeout request, CorrelationId=%s", removed.correlation_id)
+        for future in expired:
+            try:
+                future.cause = RequestTimeoutException(
+                    ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, "request timeout, no reply message.")
+                future.execute_request_callback()
+            except Exception:  # noqa: BLE001 - Java: log.warn("scanResponseTable, operationComplete Exception")
+                logger.warning("scanResponseTable, operationComplete Exception", exc_info=True)
+        return len(expired)
+
+    def start_scheduled_task(self, producer=None) -> None:
+        """对应 Java ``startScheduledTask(producer)``。
+
+        ``producer`` 进引用计数；首个请求方进来时拉起后台清理线程
+        （线程名对齐 Java：``RequestHouseKeepingService``；初始延迟 3s、周期 1s）。
+        线程只起一次，重复调用（同一 producer 或不同 producer）都安全。
+        """
+        with self._lock:
+            self._producers.add(producer)
+            if self._sweep_thread is not None and self._sweep_thread.is_alive():
+                return
+            self._sweep_stop.clear()
+
+            def _run() -> None:
+                # Java scheduleAtFixedRate(…, 3000, 1000, MS)
+                if self._sweep_stop.wait(3.0):
+                    return
+                while not self._sweep_stop.wait(1.0):
+                    try:
+                        self.scan_expired_request()
+                    except Exception:  # noqa: BLE001 - Java: log.error("scan RequestFutureTable exception")
+                        logger.error("scan RequestFutureTable exception", exc_info=True)
+
+            self._sweep_thread = threading.Thread(target=_run, name="RequestHouseKeepingService", daemon=True)
+            self._sweep_thread.start()
+
+    def shutdown_scheduled_task(self, producer=None) -> None:
+        """对应 Java ``shutdown(producer)``：减引用，归零时停掉清理线程。"""
+        with self._lock:
+            self._producers.discard(producer)
+            if self._producers or self._sweep_thread is None:
+                return
+            thread = self._sweep_thread
+            self._sweep_thread = None
+            stop = self._sweep_stop
+        stop.set()
 
 
 #: 进程内单例（对齐 Java 的 ``INSTANCE``）。应答方与请求方在同一进程时也共用它。

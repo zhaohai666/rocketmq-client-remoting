@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <random>
+#include <vector>
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/common/compression.h"
@@ -177,6 +178,77 @@ std::shared_ptr<RequestResponseFuture> RequestFutureHolder::putResponse(
 size_t RequestFutureHolder::size() {
     std::lock_guard<std::mutex> lk(m_);
     return table_.size();
+}
+
+// 对应 Java RequestFutureHolder#scanExpiredRequest（:36-60）：把已过 TTL 的表项
+// **在锁内原子移除**（让「超时清理」与「应答到达」两条路径只有一个能生效），
+// 再在锁外逐个触发回调 —— 回调是用户代码，绝不能持着表锁执行。
+void RequestFutureHolder::scanExpiredRequest() {
+    std::vector<std::shared_ptr<RequestResponseFuture>> expired;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        for (auto it = table_.begin(); it != table_.end();) {
+            if (it->second->isTimeout()) {
+                expired.push_back(it->second);
+                logger_warn("remove timeout request, CorrelationId=" + it->first);
+                it = table_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& rf : expired) {
+        try {
+            rf->setCause(std::make_exception_ptr(
+                RequestTimeoutException("request timeout, no reply message.")));
+            rf->executeRequestCallback();
+        } catch (const std::exception& e) {
+            logger_warn(std::string("scanResponseTable, operationComplete Exception: ") +
+                        e.what());
+        }
+    }
+}
+
+void RequestFutureHolder::startScheduledTask() {
+    std::lock_guard<std::mutex> lk(sweepMutex_);
+    ++producerCount_;
+    if (sweepRunning_) {
+        return;
+    }
+    sweepRunning_ = true;
+    sweepStopped_ = false;
+    // Java scheduleAtFixedRate(initialDelay=3000, period=1000)（:89-91）：
+    // 首扫在启动后 3s，之后每 1s 一趟（线程名 RequestHouseKeepingService）。
+    sweepThread_ = std::thread([this] {
+        setThreadName("RequestHouseKeepingService");
+        auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+        while (true) {
+            std::unique_lock<std::mutex> lk(sweepMutex_);
+            sweepCv_.wait_until(lk, next, [this] { return sweepStopped_; });
+            if (sweepStopped_) return;
+            lk.unlock();
+            try {
+                scanExpiredRequest();
+            } catch (const std::exception& e) {
+                logger_warn(std::string("scan RequestFutureTable exception: ") + e.what());
+            }
+            next += std::chrono::milliseconds(1000);
+        }
+    });
+}
+
+void RequestFutureHolder::shutdownScheduledTask() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lk(sweepMutex_);
+        if (producerCount_ > 0) --producerCount_;
+        if (producerCount_ > 0 || !sweepRunning_) return;
+        sweepStopped_ = true;
+        sweepRunning_ = false;
+        sweepCv_.notify_all();
+        worker = std::move(sweepThread_);
+    }
+    if (worker.joinable()) worker.join();
 }
 
 // ---------------------------------------------------------------- 便利函数

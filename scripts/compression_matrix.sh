@@ -5,29 +5,32 @@
 # **A 端压出来的字节 B 端能不能解开** —— 而压缩解错的失败模式是静默数据损坏
 # （拿到压缩字节当正文，不报错），只有真机 + 真跨客户端才暴露得出来。
 #
-# 五端（python / cpp / csharp / rust / go）载荷由各自本地按同一配方重建（同一行文本重复后
+# 七端（python / cpp / csharp / rust / go / php / nodeJs）载荷由各自本地按同一配方重建（同一行文本重复后
 # 截断），所以判定只看接收端打印的 `match=1`，**不要**比两边打印的 CRC 数字
-# （Java 口径的 UtilAll.crc32 会 & 0x7FFFFFFF，本仓库四端都用标准 CRC-32）。
+# （Java 口径的 UtilAll.crc32 会 & 0x7FFFFFFF，本仓库各端都用标准 CRC-32）。
 #
 # 用法：scripts/compression_matrix.sh [codec]      codec = zlib（默认）| lz4 | zstd
 # 只有**发送端**关心 codec；接收端按 sysFlag 的类型位自动解压，所以「B 能解 A 压的」
 # 正是矩阵要证明的部分。
 #
-# 前置条件（先构建好四端，本脚本不触发构建）：
+# 前置条件（先构建好各端，本脚本只自己 build go）：
 #   python/.venv 已装 lz4（zstandard 可选，缺了 zstd 的 py 两只会打 SKIP）
 #   cpp/build/examples/rmq_compression_live
 #   csharp 示例已 build（用 dotnet run --no-build）
 #   rust example: cargo build --example live_compression_matrix
+#   php 端无需构建（解释执行），但 zstd 若没装 `zstd` CLI 会退回纯 PHP Raw/RLE 腿
+#   nodeJs 端无需构建（node --experimental-strip-types 直接跑 .ts）
 #   go 端由本脚本自己 build（零第三方依赖，标准库编译即可）
 # 以及一个 autoCreateTopicEnable=true 的 nameServer(9876)+broker(10911)。
 #
-# ⚠ Go 端只有 zlib：标准库没有 LZ4/ZSTD，而本模块承诺零第三方依赖，所以这两种类型
-#   明确报 unsupported（绝不把压缩流当正文透传）。所以 codec != zlib 时**所有含 Go 的
-#   腿都 SKIP**，zstd / lz4 的跨语言互通仍由另外四端互测覆盖（python 端沿用原判断）。
+# ⚠ 各端的 LZ4/ZSTD 都不走第三方包（零第三方依赖是硬约束）：python/cpp/csharp/rust/go/php
+#   全部手写帧编解码，nodeJs 的 zlib/zstd 取自 node:zlib（Node 自带 stdlib）、LZ4 手写。
+#   所以矩阵同时是这套手写字节的互操作验收：任何一端的帧头、HC/校验位或块格式写错，
+#   表现都是**对端解出坏正文或明确报错**。
 #
 # ⚠ python 端没有 zstandard 时**明确抛错**而不是静默透传（message_decoder._zstd），
 # 所以 zstd 矩阵里 python 必然失败 —— 那不是互通性问题，脚本直接 SKIP 掉，
-# zstd 的跨语言互通由 cpp / csharp / rust 三端互测覆盖。
+# zstd 的跨语言互通由 cpp / csharp / rust / go / php / nodeJs 六端互测覆盖。
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NS=${ROCKETMQ_NAMESRV:-127.0.0.1:9876}
@@ -105,6 +108,23 @@ cat > "$BIN/php_recv" <<EOF
 cd "$ROOT/php" || exit 1
 exec $PHP_BIN examples/live_compression.php recv "\$1" "\$2" $SIZE "$NS"
 EOF
+# nodeJs 端：.ts 直跑（--experimental-strip-types，零构建）。zlib/zstd 走 node:zlib，
+# LZ4 是本项目手写的帧编解码（src/common/compress.ts）。
+NODE_BIN=${NODE_BIN:-node}
+# node:zlib 的 zstd 绑定是 Node 23.8 才有的；没有时本端只会解自写的 Raw/RLE 帧，
+# 对端的真实压缩块属于「本端能力缺失」，不是互通性失败 → 探测一次，zstd 腿据此 SKIP。
+NODE_ZSTD=1
+$NODE_BIN -e 'const z=require("node:zlib");process.exit(typeof z.zstdCompressSync==="function"&&typeof z.zstdDecompressSync==="function"?0:1)' || NODE_ZSTD=0
+cat > "$BIN/node_send" <<EOF
+#!/bin/bash
+cd "$ROOT/nodeJs" || exit 1
+exec $NODE_BIN --experimental-strip-types --no-warnings examples/live_compression.ts send "\$1" "\$2" $SIZE "$NS" $CODEC
+EOF
+cat > "$BIN/node_recv" <<EOF
+#!/bin/bash
+cd "$ROOT/nodeJs" || exit 1
+exec $NODE_BIN --experimental-strip-types --no-warnings examples/live_compression.ts recv "\$1" "\$2" $SIZE "$NS"
+EOF
 chmod +x "$BIN"/*
 
 fail=0
@@ -112,17 +132,21 @@ fail=0
 run_pair() { # label  sender  receiver
   local topic="XCompress_${CODEC}_${STAMP}_$1" group="XCompressG_${STAMP}_$1"
   echo "----- $1 [$CODEC]: $2 send -> $3 recv"
-  if [[ $CODEC == zstd && ( $2 == py_* || $3 == py_* ) ]]; then
-    echo "  RESULT=SKIPPED (python venv has no zstandard; see message_decoder._zstd)"
-    return
+  # 本端缺 codec 能力时 SKIP，别记成互通失败（详见各自 compress 实现的降级说明）。
+  if [[ $CODEC == zstd ]]; then
+    case "$2$3" in
+      *py_*)
+        echo "  RESULT=SKIPPED (python venv has no zstandard; see message_decoder._zstd)"
+        return ;;
+      *node_*)
+        if [[ $NODE_ZSTD == 0 ]]; then
+          echo "  RESULT=SKIPPED (node:zlib gained zstd bindings in Node 23.8)"
+          return
+        fi ;;
+    esac
   fi
-  if [[ $CODEC != zlib && ( $2 == go_* || $3 == go_* ) ]]; then
-    echo "  RESULT=SKIPPED (go port is zlib-only: stdlib has no LZ4/ZSTD, module takes no deps)"
-    return
-  fi
-  # php 端 2026-10-08 起带纯实现 LZ4（Frame 格式，与 Java Lz4Compressor 的
-  # LZ4FrameOutputStream 同 wire）/ZSTD（Raw/RLE 帧），与其他端一起参与
-  # lz4/zstd 互通矩阵，不再 SKIP。
+  # Go 端口 2026-10-09 起带手写 LZ4 Frame / ZSTD 编解码（common/lz4.go、
+  # common/zstd.go，零第三方依赖），因此 Go 腿在所有 codec 下正常参与矩阵。
   local sout rout lout line
   sout=$(timeout 180 "$BIN/$2" "$topic" "$group" 2>&1); rout=$?
   echo "$sout" | grep -o "SEND_[A-Z]*.*" | head -1
@@ -168,5 +192,20 @@ run_pair php2py php_send py_recv
 run_pair py2php py_send php_recv
 run_pair php2cpp php_send cpp_recv
 run_pair cpp2php cpp_send php_recv
+# nodeJs 腿（2026-10-09 起补齐：此前矩阵完全没有 node 端，手写 LZ4 帧从未被
+# 对端验证过）。双向各一条，覆盖 node 与六个端互通。
+run_pair node2node node_send node_recv
+run_pair node2py node_send py_recv
+run_pair py2node py_send node_recv
+run_pair node2cpp node_send cpp_recv
+run_pair cpp2node cpp_send node_recv
+run_pair node2net node_send net_recv
+run_pair net2node net_send node_recv
+run_pair node2rs node_send rs_recv
+run_pair rs2node rs_send node_recv
+run_pair node2go node_send go_recv
+run_pair go2node go_send node_recv
+run_pair node2php node_send php_recv
+run_pair php2node php_send node_recv
 echo "MATRIX_DONE codec=$CODEC stamp=$STAMP fail=$fail"
 exit $fail

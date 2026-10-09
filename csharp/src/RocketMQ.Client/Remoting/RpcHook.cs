@@ -195,18 +195,81 @@ public sealed class ChainedRpcHook : IRpcHook
 }
 
 /// <summary>
-/// 按 Java <c>MQClientAPIImpl:329-332</c> 的顺序装好请求钩子：StreamTypeRPCHook 在前、
-/// 用户钩子（ACL 签名）在后；只开了 stream 或只有用户钩子时直接返回那一个，
-/// 两者都没有时返回 null（不注册钩子 = 零开销）。
+/// 对应 org.apache.rocketmq.client.rpchook.NamespaceRpcHook：5.x 新命名空间（namespaceV2）
+/// 非空时给每笔请求加 <c>nsd=true</c> 与 <c>ns=&lt;namespaceV2&gt;</c> 两个扩展头。
+/// Java 里它由 <c>MQClientAPIImpl:329</c> 注册在钩子链**最前**（Namespace → Stream → 用户），
+/// 本端口的 <see cref="RequestHooks.Compose"/> 按同一顺序装链。
+/// 传入取值函数而非字符串：Java 每笔请求都实时读 <c>clientConfig.getNamespaceV2()</c>，
+/// 配置改了要能跟着走。
+/// </summary>
+public sealed class NamespaceRpcHook : IRpcHook
+{
+    private readonly Func<string?> _namespaceV2;
+
+    public NamespaceRpcHook(Func<string?> namespaceV2)
+    {
+        _namespaceV2 = namespaceV2;
+    }
+
+    public void DoBeforeRequest(string remoteAddr, RemotingCommand request)
+    {
+        _ = remoteAddr;
+        string ns = _namespaceV2() ?? string.Empty;
+        if (ns.Length == 0)
+        {
+            return;
+        }
+
+        request.AddExtField(MixAll.RpcNamespacedField, "true");
+        request.AddExtField(MixAll.RpcNamespaceField, ns);
+    }
+
+    public void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response)
+    {
+        _ = remoteAddr;
+        _ = request;
+        _ = response;
+    }
+}
+
+/// <summary>
+/// 按 Java <c>MQClientAPIImpl:329-332</c> 的顺序装好请求钩子：Namespace（namespaceV2）→
+/// Stream → 用户钩子（ACL）。
+///
+/// namespaceV2 传的是**取值函数**（与 Java 同构：MQClientAPIImpl 持 clientConfig，钩子每笔
+/// 请求现读 <c>getNamespaceV2()</c>）。给了取值函数就**无条件**装 NamespaceRpcHook ——
+/// Java 也是无条件注册，命名空间为空时由钩子自己在 <c>doBeforeRequest</c> 里直接返回。
+/// 传字符串快照就是把「start() 之后才配命名空间」这条路堵死：配了也不上线，且一声不响。
 ///
 /// 各 facade 在 Start() 里统一走这里，顺序就不会写反。
 /// </summary>
 public static class RequestHooks
 {
-    public static IRpcHook? Compose(bool enableStreamRequestType, IRpcHook? userHook)
+    public static IRpcHook? Compose(bool enableStreamRequestType, IRpcHook? userHook,
+        Func<string?>? namespaceV2Getter = null)
     {
-        if (!enableStreamRequestType) return userHook;
-        if (userHook is null) return new StreamTypeRPCHook();
-        return new ChainedRpcHook(new IRpcHook[] { new StreamTypeRPCHook(), userHook });
+        bool hasNamespace = namespaceV2Getter is not null;
+        if (!hasNamespace && !enableStreamRequestType)
+        {
+            return userHook;
+        }
+
+        var hooks = new List<IRpcHook>();
+        if (namespaceV2Getter is not null)
+        {
+            hooks.Add(new NamespaceRpcHook(namespaceV2Getter));
+        }
+
+        if (enableStreamRequestType)
+        {
+            hooks.Add(new StreamTypeRPCHook());
+        }
+
+        if (userHook is not null)
+        {
+            hooks.Add(userHook);
+        }
+
+        return hooks.Count == 1 ? hooks[0] : new ChainedRpcHook(hooks);
     }
 }

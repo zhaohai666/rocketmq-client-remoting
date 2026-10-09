@@ -70,7 +70,7 @@ impl Config {
         let level = Level::parse(
             &std::env::var("ROCKETMQ_CLIENT_LOG_LEVEL").unwrap_or_else(|_| "INFO".into()),
         );
-        let max_index = std::env::var("ROCKETMQ_CLIENT_LOG_MAX_INDEX")
+        let max_index = std::env::var("ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(10);
@@ -103,7 +103,11 @@ fn config() -> &'static Config {
 
 fn sink() -> &'static Mutex<Sink> {
     SINK.get_or_init(|| {
-        Mutex::new(Sink { file: None, date: String::new(), file_disabled: false })
+        Mutex::new(Sink {
+            file: None,
+            date: String::new(),
+            file_disabled: false,
+        })
     })
 }
 
@@ -118,7 +122,9 @@ pub fn is_enabled(level: Level) -> bool {
 /// 手动设置级别（只能在第一次写日志前生效，之后走环境变量）。
 pub fn set_console_output(enable: bool) {
     // Config 在 OnceLock 里不可变，因此这里只影响 stdout 分支的开关位。
-    STDOUT_OVERRIDE.set(if enable { Some(true) } else { Some(false) }).ok();
+    STDOUT_OVERRIDE
+        .set(if enable { Some(true) } else { Some(false) })
+        .ok();
 }
 
 static STDOUT_OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
@@ -141,7 +147,13 @@ pub fn log(level: Level, message: &str) {
     if !is_enabled(level) {
         return;
     }
-    let line = format!("{} [{}] {} - {}\n", timestamp(), level.as_str(), LOGGER_NAME, message);
+    let line = format!(
+        "{} [{}] {} - {}\n",
+        timestamp(),
+        level.as_str(),
+        LOGGER_NAME,
+        message
+    );
     let use_stdout = match STDOUT_OVERRIDE.get().and_then(|v| *v) {
         Some(v) => v,
         None => config().use_stdout,
@@ -190,7 +202,10 @@ fn write_to_file(bytes: &[u8]) {
 
 fn open_file(cfg: &Config) -> Result<std::fs::File> {
     create_dir_all(&cfg.log_dir)?;
-    let file = OpenOptions::new().create(true).append(true).open(&cfg.path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cfg.path)?;
     Ok(file)
 }
 
@@ -208,7 +223,9 @@ fn rotate(guard: &mut Sink, cfg: &Config, date: &str) {
 }
 
 fn prune_backups(cfg: &Config) {
-    let Ok(entries) = std::fs::read_dir(&cfg.log_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&cfg.log_dir) else {
+        return;
+    };
     let prefix = format!("{}.", cfg.file_name);
     let mut backups: Vec<String> = entries
         .flatten()

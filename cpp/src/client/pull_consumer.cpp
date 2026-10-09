@@ -1,5 +1,6 @@
 #include "rocketmq/client/pull_consumer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <utility>
@@ -78,11 +79,23 @@ void DefaultMQPullConsumer::setNameServerAddresses(const std::vector<std::string
     nameServerAddrs_ = addrs;
 }
 
+// Java `DefaultMQPullConsumer#registerMessageQueueListener:328-335`：topic **无条件**进
+// registerTopics，listener 为 null 也登记（`MQPullConsumerScheduleService:100` 就是
+// 传 null 只登记不监听）。registerTopics 同时是拉模式心跳订阅集的唯一来源
+// （`DefaultMQPullConsumerImpl.subscriptions():357-385`），漏登记=心跳不带订阅=
+// broker 侧 `GET_CONSUMER_LIST_BY_GROUP(38)` 数不出本组。
+//
+// ⚠ 与 Java 的**存储口径**不同：Java 在入表时就 `withNamespace(topic)`（:330），本端口
+// 沿用「集合里存裸 topic、用到时再 wrapNamespace」的约定（同 fetchSubscribeMessageQueues
+// 的入参口径），所以下面 buildHeartbeat / refreshRouteForHeartbeat 各自负责拼命名空间。
 void DefaultMQPullConsumer::registerMessageQueueListener(
     const std::string& topic, std::shared_ptr<MessageQueueListener> listener) {
-    if (listener == nullptr || topic.empty()) return;
+    if (topic.empty()) return;
     registerTopics_.insert(topic);
-    messageQueueListeners_[topic] = std::move(listener);
+    // Java :331-333 只在 listener 非 null 时覆盖，传 null 不清空既有监听器。
+    if (listener != nullptr) {
+        messageQueueListeners_[topic] = std::move(listener);
+    }
 }
 
 // ---------------------------------------------------------------- 生命周期
@@ -124,12 +137,14 @@ void DefaultMQPullConsumer::start() {
                                         consumerPullTimeoutMillis_,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
                                         pollNameServerIntervalMillis_));
-    // 请求钩子（ACL 签名 / stream 的 `ReqT`）：必须在**实例 start() 之前**绑定 ——
+    // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：必须在**实例
+    // start() 之前**绑定 ——
     // Java 的 rpcHook 是在 MQClientAPIImpl 构造时传进去的（MQClientInstance:214 附近），
     // 也就是实例发出的第一笔报文就带着它；放到 start() 之后，start 期间的动态取址、
-    // 首包路由就可能签不出 ReqT/AccessKey。
+    // 首包路由就可能签不出 ReqT/AccessKey。namespaceV2 传**取值函数**（每笔请求实时读）。
     std::shared_ptr<RPCHook> requestHook =
-        composeRequestHooks(enableStreamRequestType_, rpcHook_);
+        composeRequestHooks(enableStreamRequestType_, rpcHook_,
+                            [this] { return namespaceV2_; });
     if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
         logger_warn("pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
                     + clientId_ + ")");
@@ -188,6 +203,86 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchSubscribeMessageQueues(
         throw MQClientException("the topic[" + topic + "] not exist");
     }
     return route->getAllSubscribeMessageQueue(realTopic);
+}
+
+// ---------------------------------------------------------------- 平衡视图
+//
+// Java `MQPullConsumer#fetchMessageQueuesInBalance:187` →
+// `DefaultMQPullConsumerImpl:120-135`：读后台 rebalance 填出来的
+// `rebalanceImpl.getProcessQueueTable()` 键集，再经 `parseSubscribeMessageQueues:153-161`
+// 剥掉命名空间。本端口拉模式没有那条后台线程（见头文件的偏离说明），所以按
+// `RebalanceImpl#rebalanceByTopic` 的**同一条公式**当场算：
+//   * BROADCASTING：不查消费者列表，全量认领；
+//   * CLUSTERING：订阅信息（读位 + readQueueNums、不筛 master，与
+//     `fetchSubscribeMessageQueues` 同源）作 mqAll，GET_CONSUMER_LIST_BY_GROUP(38) 作
+//     cidAll，两边排序后交给本实例的分配策略取自己那一份。
+// 公式与 push 消费者的 `doRebalance`（`consumer.cpp`）共用同一条口径 —— 两处一旦分叉，
+// 同一队列会被两个实例同时认领。
+//
+// 拿不到路由/消费者列表时**保持现有分配**：退回本地 `pullFromWhichNode_`（Java 同名表
+// `pullFromWhichNodeTable`）的键集。绝不回退成「独占全部队列」——那会让同组多实例互相
+// 重复消费。「算出来确实是空」（队列全分给了同组别人）与「算不动」是两回事：前者如实
+// 返回空集（Java 的那张表当时也是空的），不走这条兜底。
+std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
+    const std::string& topic) {
+    if (mqClient_ == nullptr) {
+        // Java isRunning()：未启动直接抛。返回空表会让调用方以为「没我的队列」而停拉。
+        throw MQClientException("consumer not started, call start() first");
+    }
+    const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
+
+    // 现有分配：本地拉过的那个 topic 的队列（键由 pull() 写入，topic 已是 realTopic）。
+    std::vector<MessageQueue> pulled;
+    for (const auto& kv : pullFromWhichNode_) {
+        if (kv.first.topic == realTopic) pulled.push_back(kv.first);
+    }
+    std::sort(pulled.begin(), pulled.end());
+
+    std::vector<MessageQueue> allocated;
+    bool computed = false;
+    std::shared_ptr<TopicRouteData> route = mqClient_->getTopicRouteData(realTopic);
+    if (route != nullptr) {
+        std::vector<MessageQueue> mqAll = route->getAllSubscribeMessageQueue(realTopic);
+        // mqAll 与 cidAll 都必须先排序：不同实例见到的是同一次路由展开的同一份顺序，
+        // 排序后才分配（对齐 Java），否则两个实例算出的区间会错开。
+        std::sort(mqAll.begin(), mqAll.end());
+        if (messageModel_ == MessageModel::BROADCASTING) {
+            allocated = mqAll;
+            computed = true;
+        } else if (!mqAll.empty()) {
+            std::vector<std::string> cidAll =
+                mqClient_->getConsumerIdListByGroup(realTopic, consumerGroup_);
+            if (!cidAll.empty()) {
+                std::sort(cidAll.begin(), cidAll.end());
+                try {
+                    allocated = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
+                    computed = true;
+                } catch (const std::exception& e) {
+                    // 对应 Java rebalanceByTopic 的 catch (Throwable)：策略抛错只记日志，
+                    // 本轮保持现有分配，绝不能把已经分到的队列撤走。
+                    logger_error("allocate message queue exception. strategy name: "
+                                 + allocateStrategy_->getName() + ", ex: " + e.what());
+                }
+            }
+        }
+    }
+    if (!computed) {
+        logger_debug("fetchMessageQueuesInBalance: no route/consumer list for " + consumerGroup_
+                     + "/" + topic + ", keep current assignment");
+        return pulled;
+    }
+
+    // Java :128-131 逐个比对表键的 topic，:153-161 再剥命名空间：别让策略的意外返回值
+    // 把别的 topic 混进调用方的拉取循环。
+    std::vector<MessageQueue> result;
+    for (const MessageQueue& mq : allocated) {
+        if (mq.topic != realTopic) continue;
+        result.push_back(
+            MessageQueue(NamespaceUtil::withoutNamespace(mq.topic, namespace_), mq.brokerName,
+                         mq.queueId));
+    }
+    std::sort(result.begin(), result.end());
+    return result;
 }
 
 // ---------------------------------------------------------------- 拉取
@@ -412,7 +507,12 @@ HeartbeatData DefaultMQPullConsumer::buildHeartbeat() const {
     cd.unitMode = unitMode_;
     for (const std::string& t : registerTopics_) {
         // Java 是 `FilterAPI.buildSubscriptionData(t, SubscriptionData.SUB_ALL)`（即 "*"）
-        SubscriptionData sub = FilterAPI::buildSubscriptionData(t, "*");
+        // 这里的 t 在 Java 已含命名空间（入表时 withNamespace，:330）；本端口集合存裸名，
+        // 所以订阅必须拼上命名空间 —— 与 refreshRouteForHeartbeat 的收件人口径一致，
+        // 否则刷的是 "ns%topic" 的路由、报的却是 "topic" 的订阅，broker 建的订阅表
+        // 和实际拉取的 topic 对不上。
+        const std::string subTopic = NamespaceUtil::wrapNamespace(namespace_, t);
+        SubscriptionData sub = FilterAPI::buildSubscriptionData(subTopic, "*");
         sub.subVersion = 0;
         cd.addSubscriptionData(sub);
     }

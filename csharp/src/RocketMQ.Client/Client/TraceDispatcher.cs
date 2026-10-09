@@ -90,6 +90,11 @@ public sealed class AsyncTraceDispatcher
 
     public string GetTraceTopicName() => _traceTopicName;
 
+    /// <summary>对应 Java AsyncTraceDispatcher#namespaceV2（:79/:147）：宿主设置，Start 时
+    /// 传导给内部轨迹生产者（Java start():155 <c>traceProducer.setNamespaceV2(...)</c>），
+    /// 轨迹消息的发送同样要带 ns/nsd 扩展头。</summary>
+    public string NamespaceV2 { get; set; } = string.Empty;
+
     /// <summary>当前待发送的轨迹条数（对应 Python 的 trace_context_queue.qsize()）。
     /// 队列满时 Append 会返回 false 并丢弃，这里是唯一的观测点。</summary>
     public int QueueSize => _queue.Count;
@@ -124,6 +129,9 @@ public sealed class AsyncTraceDispatcher
                 _traceProducer.NamesrvAddr = string.Join(";", nameSrvAddr);
                 _traceProducer.InstanceName = TraceConstants.TraceInstanceName + "_"
                                               + string.Join(";", nameSrvAddr);
+                // 对应 Java AsyncTraceDispatcher.start():155：宿主的 namespaceV2 传导给
+                // 轨迹生产者（Start 在锁内、宿主 StartTraceDispatcher 设置之后执行，时序安全）。
+                _traceProducer.NamespaceV2 = NamespaceV2;
                 _traceProducer.EnableTrace = false;
                 _traceProducer.Start();
                 _started = true;

@@ -205,6 +205,17 @@ public sealed class DefaultLitePullConsumer
         set => _namespace = value ?? string.Empty;
     }
 
+    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
+    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
+    /// 扩展头。钩子每笔请求现读本属性（Java 同款），Start() 之后设置也从下一笔请求起生效。</summary>
+    public string NamespaceV2
+    {
+        get => _namespaceV2;
+        set => _namespaceV2 = value ?? string.Empty;
+    }
+
+    private string _namespaceV2 = string.Empty;
+
     public bool IsStarted => _started;
 
     public bool IsRunning => _running;
@@ -364,7 +375,7 @@ public sealed class DefaultLitePullConsumer
             // RequestHooks.Compose 把 StreamTypeRPCHook 排在用户钩子之前 —— 直接注册
             // _rpcHook 会让 ReqT 漏发，开 ACL 时签的内容也与上线字段不一致。
             // 绑定位置同样在 Start() **之前**（Java 的 rpcHook 随 MQClientAPIImpl 构造传入）。
-            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
                 /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000,
                 unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis);

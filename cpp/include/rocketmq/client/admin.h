@@ -117,6 +117,12 @@ public:
         rpcHook_ = std::make_shared<AclClientRPCHook>(
             SessionCredentials(accessKey, secretKey, securityToken));
     }
+    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`，管理端同样继承）：非空时
+    // NamespaceRpcHook 给**每笔请求**加 `nsd=true` / `ns=<namespaceV2>`，由 broker 侧解析
+    // 实例。链序照 Java `MQClientAPIImpl:329`：装在 ACL 签名**之前**，`nsd`/`ns` 因此在
+    // 签名内容之内（见 composeRequestHooks）。须在 start() 之前设置才有首包效果。
+    void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
+    const std::string& namespaceV2() const { return namespaceV2_; }
 
     void start();
     void shutdown();
@@ -409,6 +415,8 @@ private:
     std::string instanceName_;
     std::string clientId_;
     std::string unitName_;
+    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
+    std::string namespaceV2_;
     bool enableStreamRequestType_ = false;
     // Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）
     bool vipChannelEnabled_ = false;

@@ -8,7 +8,8 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use crate::common::message_const::{
-    PROPERTY_DELAY_TIME_LEVEL, PROPERTY_KEYS, PROPERTY_TAGS, PROPERTY_WAIT_STORE_MSG_OK,
+    PROPERTY_DELAY_TIME_LEVEL, PROPERTY_KEYS, PROPERTY_TAGS, PROPERTY_TIMER_DELAY_MS,
+    PROPERTY_TIMER_DELAY_SEC, PROPERTY_TIMER_DELIVER_MS, PROPERTY_WAIT_STORE_MSG_OK,
 };
 use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
@@ -38,7 +39,11 @@ pub struct MessageQueue {
 
 impl MessageQueue {
     pub fn new(topic: &str, broker_name: &str, queue_id: i32) -> MessageQueue {
-        MessageQueue { topic: topic.to_string(), broker_name: broker_name.to_string(), queue_id }
+        MessageQueue {
+            topic: topic.to_string(),
+            broker_name: broker_name.to_string(),
+            queue_id,
+        }
     }
 
     pub fn get_topic(&self) -> &str {
@@ -247,7 +252,8 @@ impl Message {
     }
 
     pub fn set_delay_time_level(&mut self, level: i32) {
-        self.properties.insert(PROPERTY_DELAY_TIME_LEVEL, level.to_string());
+        self.properties
+            .insert(PROPERTY_DELAY_TIME_LEVEL, level.to_string());
     }
 
     /// Python 返回原始字符串（可能是 `None`）。
@@ -264,11 +270,62 @@ impl Message {
     }
 
     pub fn set_wait_store_msg_ok(&mut self, ok: bool) {
-        self.properties.insert(PROPERTY_WAIT_STORE_MSG_OK, if ok { "true" } else { "false" });
+        self.properties.insert(
+            PROPERTY_WAIT_STORE_MSG_OK,
+            if ok { "true" } else { "false" },
+        );
     }
 
     pub fn get_wait_store_msg_ok(&self) -> Option<&str> {
         self.properties.get(PROPERTY_WAIT_STORE_MSG_OK)
+    }
+
+    // ---------------- 定时消息的三个类型化计时器（Java Message.java:238-267） ----------------
+    //
+    // Java 的三个 setter 都是「putProperty(键, String.valueOf(值))」、三个 getter 都是
+    // 「parse 属性，缺失返回 0」：没有正负校验、键之间互不清理（TIMER_DELAY_SEC 与
+    // TIMER_DELIVER_MS 同存时 broker 侧按自身优先级取舍），这里逐字段照搬。
+    // getter 遇到解析不了的值返回 0 —— Java 会抛 NumberFormatException，但属性区是
+    // 不可信输入，按「缺省 0」处理比让拉取路径 panic 合理（与 delay_time_level 同口径）。
+
+    /// Java `Message#setDelayTimeSec(long)`：延迟 `sec` 秒投递。
+    pub fn set_delay_time_sec(&mut self, sec: i64) {
+        self.properties
+            .insert(PROPERTY_TIMER_DELAY_SEC, sec.to_string());
+    }
+
+    /// Java `Message#getDelayTimeSec()`：缺属性 / 值非法时 0。
+    pub fn get_delay_time_sec(&self) -> i64 {
+        self.timer_property(PROPERTY_TIMER_DELAY_SEC)
+    }
+
+    /// Java `Message#setDelayTimeMs(long)`：延迟 `time_ms` 毫秒投递。
+    pub fn set_delay_time_ms(&mut self, time_ms: i64) {
+        self.properties
+            .insert(PROPERTY_TIMER_DELAY_MS, time_ms.to_string());
+    }
+
+    /// Java `Message#getDelayTimeMs()`：缺属性 / 值非法时 0。
+    pub fn get_delay_time_ms(&self) -> i64 {
+        self.timer_property(PROPERTY_TIMER_DELAY_MS)
+    }
+
+    /// Java `Message#setDeliverTimeMs(long)`：绝对投递时刻（毫秒时间戳）。
+    pub fn set_deliver_time_ms(&mut self, time_ms: i64) {
+        self.properties
+            .insert(PROPERTY_TIMER_DELIVER_MS, time_ms.to_string());
+    }
+
+    /// Java `Message#getDeliverTimeMs()`：缺属性 / 值非法时 0。
+    pub fn get_deliver_time_ms(&self) -> i64 {
+        self.timer_property(PROPERTY_TIMER_DELIVER_MS)
+    }
+
+    fn timer_property(&self, name: &str) -> i64 {
+        match self.properties.get(name) {
+            Some(v) => v.trim().parse::<i64>().unwrap_or(0),
+            None => 0,
+        }
     }
 
     pub fn set_user_property(&mut self, name: &str, value: &str) {
@@ -298,7 +355,12 @@ impl Message {
 
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Message(topic='{}', body={} bytes)", self.topic, self.get_body().len())
+        write!(
+            f,
+            "Message(topic='{}', body={} bytes)",
+            self.topic,
+            self.get_body().len()
+        )
     }
 }
 
@@ -422,7 +484,8 @@ impl MessageExt {
     }
 
     pub fn set_delay_time_level(&mut self, level: i32) {
-        self.properties.insert(PROPERTY_DELAY_TIME_LEVEL, level.to_string());
+        self.properties
+            .insert(PROPERTY_DELAY_TIME_LEVEL, level.to_string());
     }
 
     pub fn get_delay_time_level(&self) -> Option<&str> {
@@ -438,7 +501,10 @@ impl MessageExt {
     }
 
     pub fn set_wait_store_msg_ok(&mut self, ok: bool) {
-        self.properties.insert(PROPERTY_WAIT_STORE_MSG_OK, if ok { "true" } else { "false" });
+        self.properties.insert(
+            PROPERTY_WAIT_STORE_MSG_OK,
+            if ok { "true" } else { "false" },
+        );
     }
 
     pub fn get_wait_store_msg_ok(&self) -> Option<&str> {
@@ -634,7 +700,10 @@ pub struct MessageBatch {
 
 impl MessageBatch {
     pub fn new(messages: Vec<Message>) -> MessageBatch {
-        MessageBatch { message: Message::default(), messages }
+        MessageBatch {
+            message: Message::default(),
+            messages,
+        }
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -684,15 +753,22 @@ impl MessageBatch {
             let delay_level = message.get_delay_time_level().unwrap_or("");
             let parsed = delay_level.trim().parse::<i64>().unwrap_or(0);
             if !delay_level.is_empty() && parsed > 0 {
-                return Err(Error::client("Delayed messages are not supported for batching"));
+                return Err(Error::client(
+                    "Delayed messages are not supported for batching",
+                ));
             }
-            if message.get_topic().starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX) {
+            if message
+                .get_topic()
+                .starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX)
+            {
                 return Err(Error::client("Retry Group is not supported for batching"));
             }
         }
         for message in messages.iter().skip(1) {
             if first.get_topic() != message.get_topic() {
-                return Err(Error::client("The topic of the messages in one batch should be the same"));
+                return Err(Error::client(
+                    "The topic of the messages in one batch should be the same",
+                ));
             }
             if first.get_wait_store_msg_ok() != message.get_wait_store_msg_ok() {
                 return Err(Error::client(
@@ -707,7 +783,10 @@ impl MessageBatch {
         // 批量会以 `WAIT=false` 下发，broker 不等刷盘就回 SEND_OK。
         let wait_store_msg_ok = first.is_wait_store_msg_ok();
 
-        let mut batch = MessageBatch { message: Message::default(), messages };
+        let mut batch = MessageBatch {
+            message: Message::default(),
+            messages,
+        };
         batch.message.set_topic(&topic);
         batch.message.set_wait_store_msg_ok(wait_store_msg_ok);
         let body = batch.encode();
@@ -755,15 +834,24 @@ mod tests {
         assert_eq!(a.hashcode(), b.hashcode());
         assert_eq!(a.compare_to(&b), Ordering::Equal);
         assert_eq!(a.compare_to(&c), Ordering::Less);
-        assert_eq!(a.compare_to(&MessageQueue::new("TopicTest", "BrokerZ", 0)), Ordering::Less);
-        assert_eq!(a.compare_to(&MessageQueue::new("AAATopic", "BrokerA", 1)), Ordering::Greater);
+        assert_eq!(
+            a.compare_to(&MessageQueue::new("TopicTest", "BrokerZ", 0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            a.compare_to(&MessageQueue::new("AAATopic", "BrokerA", 1)),
+            Ordering::Greater
+        );
         assert!(c > a);
 
         let mut mq = MessageQueue::default();
         mq.set_topic("T");
         mq.set_broker_name("B");
         mq.set_queue_id(7);
-        assert_eq!((mq.get_topic(), mq.get_broker_name(), mq.get_queue_id()), ("T", "B", 7));
+        assert_eq!(
+            (mq.get_topic(), mq.get_broker_name(), mq.get_queue_id()),
+            ("T", "B", 7)
+        );
         assert_eq!(mq.get_queue_id_str(), "7");
         assert_eq!(mq.to_string(), "T B 7");
     }
@@ -781,12 +869,14 @@ mod tests {
 
     #[test]
     fn tags_and_keys_go_to_properties_in_declaration_order() {
-        let msg =
-            Message::with_tags_and_keys("T", Some(b"x"), Some("TagA"), Some("k1 k2"), 0);
+        let msg = Message::with_tags_and_keys("T", Some(b"x"), Some("TagA"), Some("k1 k2"), 0);
         assert_eq!(msg.get_tags(), Some("TagA"));
         assert_eq!(msg.get_keys(), Some("k1 k2"));
         assert_eq!(
-            msg.properties.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            msg.properties
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
             vec![PROPERTY_TAGS, PROPERTY_KEYS]
         );
     }
@@ -862,14 +952,27 @@ mod tests {
         ext.set_prepared_transaction_offset(7);
         ext.set_msg_type(Some("NORMAL"));
 
-        assert_eq!((ext.get_queue_id(), ext.get_store_size(), ext.get_queue_offset()), (2, 100, 9));
+        assert_eq!(
+            (
+                ext.get_queue_id(),
+                ext.get_store_size(),
+                ext.get_queue_offset()
+            ),
+            (2, 100, 9)
+        );
         assert_eq!(ext.get_body_crc(), 12345);
         assert_eq!(ext.get_commit_log_offset(), 512);
         assert_eq!(ext.get_reconsume_times(), 2);
         assert_eq!(ext.get_prepared_transaction_offset(), 7);
         assert_eq!(ext.get_msg_type(), Some("NORMAL"));
-        assert_eq!(ext.get_born_host_string().as_deref(), Some("127.0.0.1:10000"));
-        assert_eq!(ext.get_store_host_string().as_deref(), Some("127.0.0.1:10911"));
+        assert_eq!(
+            ext.get_born_host_string().as_deref(),
+            Some("127.0.0.1:10000")
+        );
+        assert_eq!(
+            ext.get_store_host_string().as_deref(),
+            Some("127.0.0.1:10911")
+        );
     }
 
     #[test]
@@ -892,6 +995,40 @@ mod tests {
         assert_eq!(back, msg);
     }
 
+    /// Java Message.java:238-267 的三个定时器 setter/getter：写属性、缺省 0。
+    #[test]
+    fn timer_setters_write_typed_properties() {
+        let mut msg = Message::new("T", Some(b"x"));
+        assert_eq!(
+            (
+                msg.get_delay_time_sec(),
+                msg.get_delay_time_ms(),
+                msg.get_deliver_time_ms()
+            ),
+            (0, 0, 0),
+            "缺属性时三个 getter 都是 0（Java return 0）"
+        );
+        msg.set_delay_time_sec(10);
+        msg.set_delay_time_ms(10_000);
+        msg.set_deliver_time_ms(1_700_000_000_000);
+        // 属性值必须是字符串数字（broker 侧按字符串解析）
+        assert_eq!(msg.get_property(PROPERTY_TIMER_DELAY_SEC), Some("10"));
+        assert_eq!(msg.get_property(PROPERTY_TIMER_DELAY_MS), Some("10000"));
+        assert_eq!(
+            msg.get_property(PROPERTY_TIMER_DELIVER_MS),
+            Some("1700000000000")
+        );
+        assert_eq!(msg.get_delay_time_sec(), 10);
+        assert_eq!(msg.get_delay_time_ms(), 10_000);
+        assert_eq!(msg.get_deliver_time_ms(), 1_700_000_000_000);
+        // 重复 set 覆盖（putProperty 语义）
+        msg.set_deliver_time_ms(1);
+        assert_eq!(msg.get_deliver_time_ms(), 1);
+        // 非法值与 delay_time_level 同口径：0，不 panic
+        msg.put_property(PROPERTY_TIMER_DELAY_SEC, "not-a-number");
+        assert_eq!(msg.get_delay_time_sec(), 0);
+    }
+
     #[test]
     fn batch_generate_from_list() {
         let batch = MessageBatch::generate_from_list(vec![
@@ -904,10 +1041,14 @@ mod tests {
         assert_eq!(batch.messages()[0].get_body(), b"a");
         assert!(!batch.body().is_empty());
         assert_eq!(batch.body(), encode_messages(batch.messages()).as_slice());
-        assert_eq!(batch, MessageBatch::generate_from_list(vec![
-            Message::new("T", Some(b"a")),
-            Message::new("T", Some(b"b")),
-        ]).unwrap());
+        assert_eq!(
+            batch,
+            MessageBatch::generate_from_list(vec![
+                Message::new("T", Some(b"a")),
+                Message::new("T", Some(b"b")),
+            ])
+            .unwrap()
+        );
     }
 
     #[test]
@@ -931,7 +1072,9 @@ mod tests {
         w2.set_wait_store_msg_ok(false);
         assert!(MessageBatch::generate_from_list(vec![w1, w2]).is_err());
         // 错误消息与 Python 保持一致（上层按字符串匹配日志）
-        let err = MessageBatch::generate_from_list(vec![]).unwrap_err().to_string();
+        let err = MessageBatch::generate_from_list(vec![])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("messages must not be null or empty"), "{err}");
     }
 
@@ -950,7 +1093,10 @@ mod tests {
         let mut d = Message::new("T", Some(b"d"));
         d.set_wait_store_msg_ok(false);
         let batch = MessageBatch::generate_from_list(vec![c, d]).unwrap();
-        assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("false"));
+        assert_eq!(
+            batch.get_property(PROPERTY_WAIT_STORE_MSG_OK),
+            Some("false")
+        );
     }
 
     /// 回归：**没设过 `WAIT` 的普通消息**组成的批量必须是 `WAIT=true`。
@@ -960,10 +1106,7 @@ mod tests {
     /// 等刷盘就回 `SEND_OK`，持久性静默降级。Python 侧同款缺陷一起修掉了。
     #[test]
     fn batch_defaults_wait_store_msg_ok_to_true() {
-        let messages = vec![
-            Message::new("T", Some(b"a")),
-            Message::new("T", Some(b"b")),
-        ];
+        let messages = vec![Message::new("T", Some(b"a")), Message::new("T", Some(b"b"))];
         // 前提：Message::new（同 Python）不预写 WAIT
         assert_eq!(messages[0].get_wait_store_msg_ok(), None);
         let batch = MessageBatch::generate_from_list(messages).unwrap();
@@ -994,7 +1137,10 @@ mod tests {
 
     #[test]
     fn display_helpers() {
-        assert_eq!(Message::new("T", Some(b"abc")).to_string(), "Message(topic='T', body=3 bytes)");
+        assert_eq!(
+            Message::new("T", Some(b"abc")).to_string(),
+            "Message(topic='T', body=3 bytes)"
+        );
         let mut ext = MessageExt::new();
         ext.set_topic("T");
         ext.set_body(Some(b"xy"));

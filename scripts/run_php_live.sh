@@ -1,11 +1,15 @@
 #!/bin/bash
 # PHP 端的真机验证入口（对照 run_go_*_live.sh / run_node_live.sh 的口径）。
 #
-# 用法: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls [namesrv]
+# 用法: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull [namesrv]
 #   redelivery   php/examples/live_redelivery.php  （可选第三参 legs=all|s1,s2,s3,s4）
 #   admin        php/examples/live_admin.php
+#   pull         php/examples/live_pull.php        （可选第三参 legs=all|s1,s2,s3；
+#                 拉模式消费者：队列 / 平衡视图 fetchMessageQueuesInBalance / 手动拉取 /
+#                 位点提交回读）
 #   compression  php/examples/live_compression.php （仅 smoke：php→php 一条腿；
 #                 跨语言矩阵走 scripts/compression_matrix.sh 的 php_* 腿）
+#   request_reply php/examples/live_request_reply.php（326 请求-Reply：应答方 + 发起方往返）
 #   pop          php/examples/live_pop.php         （可选第三参 legs=all|s1,s2；
 #                 **必须独占集群**：要求 POP 专用 broker.conf 四件配置，见下）
 #   tls          php/examples/live_tls.php         （三腿 plain_tls/ca_verify/mtls；
@@ -36,11 +40,12 @@ STAMP=$(date +%s)
 case "$WHICH" in
   redelivery)    EXAMPLE="examples/live_redelivery.php"     ;;
   admin)         EXAMPLE="examples/live_admin.php"          ;;
+  pull)          EXAMPLE="examples/live_pull.php"           ;;
   compression)   EXAMPLE="examples/live_compression.php"    ;;
   pop)           EXAMPLE="examples/live_pop.php"            ;;
   tls)           EXAMPLE="examples/live_tls.php"            ;;
   request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply)" >&2; exit 2 ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull)" >&2; exit 2 ;;
 esac
 
 port_open() {
@@ -254,7 +259,7 @@ fi
 
 echo "=== php live: $EXAMPLE (ns=$NS) ==="
 cd "$ROOT/php" || exit 1
-if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ]; then
+if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ] || [ "$WHICH" = "pull" ]; then
     "$PHP_BIN" "$EXAMPLE" "$NS" "$LEGS"
 elif [ "$WHICH" = "request_reply" ]; then
     # 双进程编排：responder（consumer + producer.reply）后台起，等 READY 后跑

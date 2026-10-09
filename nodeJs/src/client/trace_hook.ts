@@ -18,6 +18,10 @@ import {
 import type { AsyncTraceDispatcher } from './trace_dispatcher.ts';
 import { createUniqID } from '../common/messageClientIdSetter.ts';
 import { MessageConst } from '../common/messageConst.ts';
+import { RequestCode, ResponseCode } from '../remoting/codes.ts';
+import { RecallMessageRequestHeader } from '../remoting/headers.ts';
+import { NamespaceUtil } from '../remoting/namespace.ts';
+import { RecallMessageHandle } from '../common/recall_message_handle.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.trace_hook');
@@ -163,5 +167,59 @@ function consumeReturnTypeCode(name?: string): number {
     case 'RETURNNULL': return 3;
     case 'FAILED': return 4;
     default: return 0; // SUCCESS
+  }
+}
+
+// DefaultRecallMessageTraceHook (Java
+// org.apache.rocketmq.client.trace.hook.DefaultRecallMessageTraceHook) — an
+// RPCHook registered on the remoting client alongside the trace dispatcher
+// (DefaultMQProducer constructor, enableTrace branch). It watches RECALL_MESSAGE
+// rpcs and appends a Recall trace record for each answered one.
+//
+// Gated on the system property com.rocketmq.recall.default.trace.enable
+// (default FALSE — Java leaves recall tracing off unless explicitly enabled);
+// node reads the same name from the environment.
+export class DefaultRecallMessageTraceHook {
+  private dispatcher: AsyncTraceDispatcher | null;
+  private enableDefaultTrace: boolean;
+
+  constructor(dispatcher: AsyncTraceDispatcher | null) {
+    this.dispatcher = dispatcher;
+    const raw = process.env['com.rocketmq.recall.default.trace.enable'];
+    this.enableDefaultTrace = raw != null && (raw === 'true' || raw === '1' || raw === 'True');
+  }
+
+  // RPCHook.doBeforeRequest — Java leaves it empty.
+  doBeforeRequest(_remoteAddr: string, _request: any): void { /* empty, as Java */ }
+
+  doAfterResponse(remoteAddr: string, request: any, response: any): void {
+    void remoteAddr;
+    try {
+      if (request == null || request.code !== RequestCode.RECALL_MESSAGE) return;
+      if (!this.enableDefaultTrace || response == null || this.dispatcher == null) return;
+      const ext = response.extFields || {};
+      const regionId = ext[MessageConst.PROPERTY_MSG_REGION];
+      if (regionId == null) return;
+
+      const header = new RecallMessageRequestHeader();
+      header.fromExtFields(request.extFields || {});
+      const topic = NamespaceUtil.withoutNamespace(header.topic != null ? header.topic : '');
+      const group = NamespaceUtil.withoutNamespace(header.producerGroup != null ? header.producerGroup : '');
+      const handleV1 = RecallMessageHandle.decodeHandle(header.recallHandle);
+
+      const bean = new TraceBean();
+      bean.topic = topic;
+      bean.msgId = handleV1.messageId != null ? handleV1.messageId : '';
+
+      const context = new TraceContext();
+      context.regionId = regionId;
+      context.traceBeans = [bean];
+      context.traceType = TraceType.RECALL;
+      context.groupName = group;
+      context.isSuccess = response.code === ResponseCode.SUCCESS;
+      this.dispatcher.append(context);
+    } catch (e) {
+      // Java swallows everything here too — trace never breaks the rpc path.
+    }
   }
 }

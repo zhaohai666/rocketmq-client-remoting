@@ -5,6 +5,8 @@
 package client
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -872,4 +874,153 @@ func TestPullConsumerConsumeTypeIsActive(t *testing.T) {
 		t.Errorf("default timing violates the long-poll invariant: %d < %d",
 			c.ConsumerTimeoutMillisWhenSuspend(), c.BrokerSuspendMaxTimeMillis())
 	}
+}
+
+// ---------------------------------------------------------------- balance view
+//
+// Java MQPullConsumer:187 → DefaultMQPullConsumerImpl:120-135 (plus
+// parseSubscribeMessageQueues:153-161). example/simple/PullConsumer.java:62 is the
+// official caller: it pulls ONLY its own share. This port runs no pull-side
+// rebalance thread, so FetchMessageQueuesInBalance computes that share on demand
+// with Java's rebalanceByTopic formula — these tests pin the formula, the
+// "cannot compute" fallback and the isRunning() guard.
+
+func queueIDs(mqs []common.MessageQueue) []int32 {
+	out := make([]int32, 0, len(mqs))
+	for _, mq := range mqs {
+		out = append(out, mq.QueueID)
+	}
+	return out
+}
+
+// One instance in the group owns every queue of the topic, in the house order.
+func TestPullConsumerBalanceViewSoleInstanceTakesEverything(t *testing.T) {
+	const topic = "PullBalSoleTopic"
+	f := newClusterFixture(t, map[string]int{topic: 3})
+	c := newPullConsumer(t, f, "GID_pull_bal_sole")
+	startPullConsumer(t, c)
+	f.broker.setClientIDs(c.ClientID())
+
+	got, err := c.FetchMessageQueuesInBalance(topic)
+	requireNoError(t, "FetchMessageQueuesInBalance", err)
+	if want := []int32{0, 1, 2}; !int32SliceEqual(queueIDs(got), want) {
+		t.Fatalf("balance view = %v, want %v (sole instance takes all)", queueIDs(got), want)
+	}
+	for _, mq := range got {
+		if mq.Topic != topic || mq.BrokerName != "b1" {
+			t.Errorf("queue identity rewritten: %s/%s", mq.Topic, mq.BrokerName)
+		}
+	}
+}
+
+// The reason the API exists: two instances in one group must not both take the
+// whole topic. Each gets 2 of 4, the shares are disjoint and cover everything.
+func TestPullConsumerBalanceViewSplitsBetweenInstances(t *testing.T) {
+	const topic = "PullBalSplitTopic"
+	f := newClusterFixture(t, map[string]int{topic: 4})
+	a := newPullConsumer(t, f, "GID_pull_bal_split")
+	startPullConsumer(t, a)
+	peerName := uniqueSuffix(t)
+	b := newPullConsumer(t, f, "GID_pull_bal_split")
+	b.SetInstanceName(peerName)
+	startPullConsumer(t, b)
+	// Sorted before allocating (Java Collections.sort(cidAll)); the broker's
+	// answer order is not defined, so the peer id is what it is. Both consumers
+	// report their own clientId — the pull default (enableStreamRequestType)
+	// puts a @STREAM suffix on it, so it must be read back, not re-derived.
+	f.broker.setClientIDs(a.ClientID(), b.ClientID())
+
+	mine, err := a.FetchMessageQueuesInBalance(topic)
+	requireNoError(t, "a view", err)
+	theirs, err := b.FetchMessageQueuesInBalance(topic)
+	requireNoError(t, "b view", err)
+	if len(mine) != 2 || len(theirs) != 2 {
+		t.Fatalf("shares = %v / %v, want 2 queues each", queueIDs(mine), queueIDs(theirs))
+	}
+	seen := map[string]bool{}
+	for _, mq := range append(append([]common.MessageQueue(nil), mine...), theirs...) {
+		key := fmt.Sprintf("%s/%d", mq.BrokerName, mq.QueueID)
+		if seen[key] {
+			t.Fatalf("queue %s claimed by both instances (duplicate consumption)", key)
+		}
+		seen[key] = true
+	}
+	if len(seen) != 4 {
+		t.Errorf("the two shares cover %d queues, want all 4", len(seen))
+	}
+}
+
+// No consumer list means "cannot compute", NOT "my share is empty": the current
+// assignment (Java's pullFromWhichNodeTable key set) is kept, and it must never
+// degrade into "I own every queue".
+func TestPullConsumerBalanceViewKeepsPulledQueuesWhenTheGroupIsUnknown(t *testing.T) {
+	const topic = "PullBalKeepTopic"
+	f := newClusterFixture(t, map[string]int{topic: 3})
+	c := newPullConsumer(t, f, "GID_pull_bal_keep")
+	startPullConsumer(t, c)
+	f.broker.setClientIDs()
+
+	got, err := c.FetchMessageQueuesInBalance(topic)
+	requireNoError(t, "empty assignment view", err)
+	if len(got) != 0 {
+		t.Fatalf("balance view = %v before pulling anything, want empty (not all 3)", queueIDs(got))
+	}
+
+	all, err := c.FetchSubscribeMessageQueues(topic)
+	requireNoError(t, "FetchSubscribeMessageQueues", err)
+	sort.Slice(all, func(i, j int) bool { return all[i].CompareTo(all[j]) < 0 })
+	if _, err := c.Pull(all[1], "*", 0, 32); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	got, err = c.FetchMessageQueuesInBalance(topic)
+	requireNoError(t, "fallback view", err)
+	if len(got) != 1 || got[0].CompareTo(all[1]) != 0 {
+		t.Fatalf("fallback view = %v, want exactly the pulled queue %v", queueIDs(got), queueIDs([]common.MessageQueue{all[1]}))
+	}
+	// The fallback is topic-scoped too: an unrouted topic gets an empty slice,
+	// not this topic's queues.
+	other, err := c.FetchMessageQueuesInBalance("NoSuchPullBalTopic")
+	requireNoError(t, "unrouted topic view", err)
+	if len(other) != 0 {
+		t.Errorf("unrouted topic view = %v, want empty", queueIDs(other))
+	}
+}
+
+// Java rebalanceByTopic never asks for the cid list under BROADCASTING.
+func TestPullConsumerBalanceViewBroadcastingIgnoresTheConsumerList(t *testing.T) {
+	const topic = "PullBalBcastTopic"
+	f := newClusterFixture(t, map[string]int{topic: 3})
+	c := newPullConsumer(t, f, "GID_pull_bal_bcast")
+	c.SetMessageModel(MessageModelBroadcasting)
+	startPullConsumer(t, c)
+	f.broker.setClientIDs("someone-else@other")
+
+	got, err := c.FetchMessageQueuesInBalance(topic)
+	requireNoError(t, "broadcast view", err)
+	if want := []int32{0, 1, 2}; !int32SliceEqual(queueIDs(got), want) {
+		t.Errorf("broadcast view = %v, want %v (the cid list is not consulted)", queueIDs(got), want)
+	}
+}
+
+// Java isRunning(): a consumer that never started reports the error instead of
+// an empty slice, which a caller would read as "no queues for me" and stop pulling.
+func TestPullConsumerBalanceViewRequiresAStartedConsumer(t *testing.T) {
+	c := MustNewDefaultMQPullConsumer("GID_pull_bal_not_started")
+	if _, err := c.FetchMessageQueuesInBalance("PullBalGuardTopic"); err == nil ||
+		!strings.Contains(err.Error(), "not started") {
+		t.Errorf("FetchMessageQueuesInBalance before Start = %v, want a not-started error", err)
+	}
+}
+
+func int32SliceEqual(a, b []int32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

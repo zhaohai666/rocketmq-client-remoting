@@ -310,7 +310,7 @@ struct RemotingClient::Impl {
                 if (sel < 0) {
                     // shutdown() 关闭 fd 后 select 必然失败，属正常退出路径。这里统一记 DEBUG：
                     // 默认 INFO 级别下不可见（不会出现"退出时的假异常"噪声），
-                    // 需要看连接生命周期时 ROCKETMQ_CPP_LOG_LEVEL=DEBUG 即可。
+                    // 需要看连接生命周期时 ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG 即可。
                     logger_debug("remoting reader: select failed on " + conn->addr + ", reader exiting");
                     break;
                 }

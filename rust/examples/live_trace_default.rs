@@ -23,9 +23,11 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|| "127.0.0.1:9876".to_string());
 
     // 业务生产者：打开轨迹（默认自建内部轨迹 producer，无需注入桥接）
-    let mut cfg = ProducerConfig::default();
-    cfg.producer_group = "GID_RsTraceDefault".to_string();
-    cfg.enable_trace = true;
+    let cfg = ProducerConfig {
+        producer_group: "GID_RsTraceDefault".to_string(),
+        enable_trace: true,
+        ..Default::default()
+    };
     let producer = match DefaultMQProducer::with_config(cfg) {
         Ok(p) => p,
         Err(e) => {
@@ -42,7 +44,10 @@ async fn main() -> ExitCode {
     const N: usize = 3;
     let mut sent = 0usize;
     for i in 0..N {
-        let mut msg = Message::new("RsTraceDefaultTopic", Some(format!("trace-default-{i}").as_bytes()));
+        let mut msg = Message::new(
+            "RsTraceDefaultTopic",
+            Some(format!("trace-default-{i}").as_bytes()),
+        );
         match producer.send(&mut msg, Some(5000), None).await {
             Ok(_) => sent += 1,
             Err(e) => eprintln!("send {i}: {e}"),

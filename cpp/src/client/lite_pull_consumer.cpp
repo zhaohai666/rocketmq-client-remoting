@@ -130,6 +130,101 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic, const std::str
     }
 }
 
+void DefaultLitePullConsumer::subscribe(const std::string& topic,
+                                        const std::string& subExpression,
+                                        std::shared_ptr<LiteMessageQueueListener> messageQueueListener) {
+    // 先做与两参版完全一致的登记（Java Impl:500 的前半段：buildSubscriptionData +
+    // subscriptionInner.put —— 本端口 rebalance 核心承担"分配更新"那一半）。
+    subscribe(topic, subExpression);
+    if (messageQueueListener != nullptr) {
+        std::lock_guard<std::mutex> lk(topicListenerMutex_);
+        topicListeners_[withNamespace(topic)] = std::move(messageQueueListener);
+    }
+}
+
+void DefaultLitePullConsumer::registerTopicMessageQueueChangeListener(
+    const std::string& topic, std::shared_ptr<TopicMessageQueueChangeListener> listener) {
+    // Java Impl:1268-1271：topic/listener 为 null 直接抛
+    // MQClientException("Topic or listener is null")。C++ 的 topic 用空串判。
+    if (topic.empty() || listener == nullptr) {
+        throw MQClientException("Topic or listener is null");
+    }
+    std::string ns = withNamespace(topic);
+    std::lock_guard<std::mutex> lk(topicListenerMutex_);
+    if (topicChangeListeners_.find(ns) != topicChangeListeners_.end()) {
+        // Java Impl:1272-1273：重复注册覆盖旧的，warn 一条
+        logger_warn("Topic " + ns + " had been registered, new listener will overwrite the old one");
+    }
+    topicChangeListeners_[ns] = std::move(listener);
+    if (started_.load()) {
+        // Java Impl:1275-1277：运行中注册立刻记一版快照，否则首轮比对会把"当前集合"
+        // 误判成"变化"。快照也用裸 topic 名（fetchMessageQueues 内部再套命名空间）。
+        try {
+            messageQueuesForTopic_[ns] = fetchMessageQueues(topic);
+        } catch (const std::exception& e) {
+            logger_debug("register listener: fetch queues for " + ns + " failed: " + e.what());
+        }
+    }
+}
+
+void DefaultLitePullConsumer::fetchTopicMessageQueuesAndCompare() {
+    // 快照监听器表后逐 topic 比对（Java Impl:1230-1245）。fetch 是 RPC，绝不能抱着
+    // topicListenerMutex_ 做 —— 表可能中途被改，逐个重查即可。
+    std::vector<std::pair<std::string, std::shared_ptr<TopicMessageQueueChangeListener>>> entries;
+    {
+        std::lock_guard<std::mutex> lk(topicListenerMutex_);
+        for (const auto& kv : topicChangeListeners_) {
+            entries.emplace_back(kv.first, kv.second);
+        }
+    }
+    for (auto& kv : entries) {
+        const std::string& topic = kv.first;
+        try {
+            std::vector<MessageQueue> newQueues = fetchMessageQueues(topic);
+            std::vector<MessageQueue> oldQueues;
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lk(topicListenerMutex_);
+                auto it = messageQueuesForTopic_.find(topic);
+                if (it != messageQueuesForTopic_.end()) {
+                    oldQueues = it->second;
+                }
+                // 集合相等判定（Java isSetEqual）：数量一致且每个元素都在旧集里。
+                std::set<MessageQueue> oldSet(oldQueues.begin(), oldQueues.end());
+                std::set<MessageQueue> newSet(newQueues.begin(), newQueues.end());
+                changed = !(oldSet == newSet);
+                if (changed) {
+                    messageQueuesForTopic_[topic] = newQueues;
+                }
+            }
+            if (changed) {
+                kv.second->onChanged(topic, newQueues);
+            }
+        } catch (const std::exception& e) {
+            // Java startScheduleTask 的 catch 只 log，不打断下一轮
+            logger_warn("ScheduledTask fetchMessageQueuesAndCompare exception: " +
+                        std::string(e.what()));
+        }
+    }
+}
+
+void DefaultLitePullConsumer::metadataLoop() {
+    // Java startScheduleTask（Impl:378-393）：启动后 10s 首查，此后每
+    // topicMetadataCheckIntervalMillis 一趟。
+    auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
+    while (running_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!running_.load()) return;
+        if (std::chrono::steady_clock::now() < next) continue;
+        next += std::chrono::milliseconds(topicMetadataCheckIntervalMillis_);
+        try {
+            fetchTopicMessageQueuesAndCompare();
+        } catch (const std::exception& e) {
+            logger_warn("metadata compare error: " + std::string(e.what()));
+        }
+    }
+}
+
 void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic,
                                                        const std::string& subExpression) {
     std::string ns = withNamespace(topic);
@@ -229,7 +324,8 @@ void DefaultLitePullConsumer::start() {
     // 第一笔报文（下面的 start() 动态取址、路由刷新）就带着它；放到 start() 之后，
     // 首包就是裸的。
     const std::shared_ptr<RPCHook> requestHook =
-        composeRequestHooks(enableStreamRequestType_, rpcHook_);
+        composeRequestHooks(enableStreamRequestType_, rpcHook_,
+                            [this] { return namespaceV2_; });
     if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
         logger_warn("lite pull consumer rpc hook ignored: MQClientInstance already has one (clientId="
                     + clientId_ + ")");
@@ -273,6 +369,9 @@ void DefaultLitePullConsumer::start() {
     heartbeatThread_ = std::thread(&DefaultLitePullConsumer::heartbeatLoop, this);
     started_ = true;
     pullThread_ = std::thread(&DefaultLitePullConsumer::pullServiceLoop, this);
+    // 队列集合比对任务（Java startScheduleTask）：无条件起，无注册监听器时是空转。
+    // ⚠ 必须在 started_ 置位之后：首查用 fetchMessageQueues（要求 mqClient_ 在位）。
+    metadataThread_ = std::thread(&DefaultLitePullConsumer::metadataLoop, this);
 }
 
 void DefaultLitePullConsumer::shutdown() {
@@ -303,6 +402,7 @@ void DefaultLitePullConsumer::shutdown() {
     }
     if (pullThread_.joinable()) pullThread_.join();
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
+    if (metadataThread_.joinable()) metadataThread_.join();
     if (mqClient_ != nullptr) {
         mqClient_->shutdown();
         mqClient_.reset();
@@ -522,11 +622,15 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
 // ---------------------------------------------------------------- rebalance
 void DefaultLitePullConsumer::rebalance() {
     std::set<MessageQueue> newSet;
+    // per-subscription 监听器回调要用的 mqAll（按 topic）；循环里顺手记下来，
+    // 免得回调阶段再打一轮订阅信息 RPC。
+    std::map<std::string, std::vector<MessageQueue>> mqAllByTopic;
     for (const auto& kv : subscription_) {
         // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
         // RebalanceImpl，mqAll 来自订阅信息（读位 + readQueueNums、不筛 master），
         // 不是发布信息。
         std::vector<MessageQueue> mqAll = mqClient_->getTopicSubscribeInfo(kv.first);
+        mqAllByTopic[kv.first] = mqAll;
         // Java RebalanceImpl.rebalanceByTopic 在分配前 Collections.sort(mqAll) + sort(cidAll)：
         // 顺序不一致会让同组不同实例算出冲突的分配（同一队列被两个实例同时消费）。
         std::sort(mqAll.begin(), mqAll.end());
@@ -607,6 +711,32 @@ void DefaultLitePullConsumer::rebalance() {
     if (messageQueueListener_ != nullptr) {
         try {
             messageQueueListener_->messageQueueChanged(mqAllOfSubscription(), newSetAsVector(newSet));
+        } catch (...) {
+        }
+    }
+    // per-subscription 监听器（subscribe 三参重载，Java Impl:504-514 的包装器语义）：
+    // 分配更新已在上面的核心里做过，这里只补"该 topic 分到的队列有变"这一条 ——
+    // 没变的 topic 不回调（Java 的分配更新回调也只在 changed 时走 messageQueueChanged）。
+    std::vector<std::pair<std::string, std::shared_ptr<LiteMessageQueueListener>>> topicListeners;
+    {
+        std::lock_guard<std::mutex> lk(topicListenerMutex_);
+        for (const auto& kv : topicListeners_) topicListeners.push_back(kv);
+    }
+    for (auto& kv : topicListeners) {
+        std::vector<MessageQueue> dividedNew;
+        std::vector<MessageQueue> dividedOld;
+        for (const MessageQueue& mq : newSet) {
+            if (mq.topic == kv.first) dividedNew.push_back(mq);
+        }
+        for (const MessageQueue& mq : old) {
+            if (mq.topic == kv.first) dividedOld.push_back(mq);
+        }
+        if (dividedNew == dividedOld) continue;
+        auto it = mqAllByTopic.find(kv.first);
+        try {
+            kv.second->messageQueueChanged(
+                it != mqAllByTopic.end() ? it->second : std::vector<MessageQueue>(),
+                dividedNew);
         } catch (...) {
         }
     }

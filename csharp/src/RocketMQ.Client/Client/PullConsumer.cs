@@ -12,8 +12,9 @@
 //
 // ⚠ 与 Java 的一处有意差异：Java DefaultMQPullConsumer 内嵌 MQPullConsumerImpl，起了
 // 一个定时 rebalance 并在队列变更时回调 MessageQueueListener；本实现（同 Python 参考
-// 实现）**不做 rebalance**——队列由 FetchSubscribeMessageQueues 显式取，监听器只作为
-// API 形状保留。需要自动分配队列请用 push 消费者。
+// 实现）**不做后台 rebalance**——队列由 FetchSubscribeMessageQueues（全部可消费队列）
+// 或 FetchMessageQueuesInBalance（本实例平衡后那一份：按 rebalanceByTopic 同一条公式
+// 当场算，不做后台线程）显式取，监听器只作为 API 形状保留。需要自动分配队列请用 push 消费者。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -115,16 +116,28 @@ public sealed class DefaultMQPullConsumer
     public IAllocateMessageQueueStrategy? AllocateMessageQueueStrategy =>
         _allocateMessageQueueStrategy;
 
-    /// <summary>对应 Java registerMessageQueueListener(topic, listener)：登记 topic + 该 topic 的监听器。</summary>
-    public void RegisterMessageQueueListener(string topic, IMessageQueueListener listener)
+    /// <summary>
+    /// 对应 Java registerMessageQueueListener(topic, listener)（DefaultMQPullConsumer:328-335）：
+    /// topic **无条件**进 RegisterTopics，listener 为 null 也登记 —— Java 的
+    /// MQPullConsumerScheduleService:100 就是传 null 只登记不监听。RegisterTopics 同时是
+    /// 拉模式心跳订阅集的唯一来源（DefaultMQPullConsumerImpl.subscriptions():357-385），
+    /// 漏登记 = 心跳不带订阅 = broker 侧 GET_CONSUMER_LIST_BY_GROUP(38) 数不出本组。
+    /// ⚠ 存储口径与 Java 不同：Java 入表时就 withNamespace(topic)（:330），本端口集合存
+    /// 裸名、用到时再 WrapNamespace（与 FetchSubscribeMessageQueues 的入参口径一致）。
+    /// </summary>
+    public void RegisterMessageQueueListener(string topic, IMessageQueueListener? listener)
     {
-        if (listener is null || string.IsNullOrEmpty(topic))
+        if (string.IsNullOrEmpty(topic))
         {
             return;
         }
 
         _registerTopics.Add(topic);
-        _messageQueueListeners[topic] = listener;
+        // Java :331-333：listener 为 null 时只登记，不清空既有监听器。
+        if (listener is not null)
+        {
+            _messageQueueListeners[topic] = listener;
+        }
     }
 
     /// <summary>命名空间（对应 Java DefaultMQPullConsumer.setNamespace）。</summary>
@@ -133,6 +146,17 @@ public sealed class DefaultMQPullConsumer
         get => _namespace;
         set => _namespace = value ?? string.Empty;
     }
+
+    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
+    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
+    /// 扩展头。钩子每笔请求现读本属性（Java 同款），Start() 之后设置也从下一笔请求起生效。</summary>
+    public string NamespaceV2
+    {
+        get => _namespaceV2;
+        set => _namespaceV2 = value ?? string.Empty;
+    }
+
+    private string _namespaceV2 = string.Empty;
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
     // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置。
@@ -257,7 +281,7 @@ public sealed class DefaultMQPullConsumer
             // Java 的 rpcHook 随 MQClientAPIImpl 构造传入，实例第一笔报文（路由拉取、
             // 位点查询）就该带着它。拉模式默认开 stream，所以这里必须走 Compose，
             // 直接注册 _rpcHook 会让 ReqT 漏发、且 ACL 签的内容与上线字段不一致。
-            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
             _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
                 /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/_consumerPullTimeoutMillis,
                 unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
@@ -379,7 +403,12 @@ public sealed class DefaultMQPullConsumer
         };
         foreach (string t in _registerTopics)
         {
-            SubscriptionData sub = FilterAPI.BuildSubscriptionData(t, "*");
+            // Java 这里拼的是入表时已带命名空间的 topic（DefaultMQPullConsumer:330）；
+            // 本端口集合存裸名，所以订阅必须在这里 WrapNamespace —— 与上面
+            // RefreshRouteForHeartbeat 的收件人口径一致，否则刷的是 "ns%topic" 的路由、
+            // 报的却是 "topic" 的订阅，broker 建的订阅表和实际拉取的 topic 对不上。
+            SubscriptionData sub =
+                FilterAPI.BuildSubscriptionData(NamespaceUtil.WrapNamespace(_namespace, t), "*");
             sub.SubVersion = 0;
             cd.AddSubscriptionData(sub);
         }
@@ -494,6 +523,139 @@ public sealed class DefaultMQPullConsumer
         }
 
         return route.GetAllSubscribeMessageQueue(realTopic);
+    }
+
+    /// <summary>本实例「平衡后」应负责的队列（对应 Java MQPullConsumer:187；官方
+    /// example/simple/PullConsumer.java:62 就靠它决定去拉哪些队列）。</summary>
+    /// <remarks>
+    /// Java（DefaultMQPullConsumerImpl:120-135）读的是后台 rebalance 填出来的
+    /// <c>processQueueTable</c>；本端口拉模式没有那条后台线程（见文件头说明），所以按
+    /// <c>RebalanceImpl.rebalanceByTopic</c> 的**同一条公式**当场算一遍，结果与 Java 表里
+    /// 那份一致：BROADCASTING 全量；CLUSTERING 用订阅信息（读位口径，与
+    /// <see cref="FetchSubscribeMessageQueues"/> 同源）作 mqAll、
+    /// GET_CONSUMER_LIST_BY_GROUP 作 cidAll，再交给本实例配置的分配策略取自己那一份。
+    /// 拿不到路由或消费者列表时**保留现有分配**——退回本实例实际拉过的队列
+    /// （Java 同名表 pullFromWhichNodeTable 的键集），绝不回退成「独占全部队列」，
+    /// 否则同组多实例会互相重复消费（与 push 的 DoRebalance 同一条铁律）。
+    /// 返回值已剥掉命名空间前缀（Java parseSubscribeMessageQueues），并按
+    /// topic → brokerName → queueId 排序，保证多次调用顺序稳定。
+    /// </remarks>
+    public List<MessageQueue> FetchMessageQueuesInBalance(string topic)
+    {
+        MQClientInstance c = RequireClient(); // Java isRunning()：未启动直接抛
+        if (topic is null)
+        {
+            // Java :122-124 的 throw new IllegalArgumentException("topic is null")。
+            throw new MQClientException("topic is null");
+        }
+
+        string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
+        List<MessageQueue> pulled = PulledQueues(realTopic);
+        List<MessageQueue>? allocated = null;
+        if (_messageModel == MessageModel.Broadcasting)
+        {
+            // Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
+            List<MessageQueue> all = SubscribeQueuesOfTopic(c, realTopic);
+            allocated = all.Count > 0 ? all : pulled;
+        }
+        else
+        {
+            try
+            {
+                List<MessageQueue> mqAll = SubscribeQueuesOfTopic(c, realTopic);
+                List<string>? cidAll = c.GetConsumerIdListByGroup(realTopic, _consumerGroup);
+                if (mqAll.Count > 0 && cidAll is { Count: > 0 })
+                {
+                    cidAll.Sort(StringComparer.Ordinal);
+                    IAllocateMessageQueueStrategy strategy = _allocateMessageQueueStrategy
+                        ?? throw new MQClientException("allocateMessageQueueStrategy is null");
+                    allocated = strategy.Allocate(_consumerGroup, _clientId, mqAll, cidAll)
+                        ?? new List<MessageQueue>();
+                }
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("fetchMessageQueuesInBalance rebalance view unavailable: " + e.Message);
+            }
+
+            if (allocated is null)
+            {
+                // 拿不到路由或消费者列表：**保留现有分配**（本实例实际拉过的队列，
+                // Java 同名表 pullFromWhichNodeTable 的键集）。注意「算出来确实是空」
+                // （队列都分给了同组别的实例）不走这条分支——那时返回空才是 Java 的表内容。
+                ClientLog.Debug("fetchMessageQueuesInBalance: no route/consumer list for "
+                    + _consumerGroup + "/" + realTopic + ", keep current assignment");
+                allocated = pulled;
+            }
+        }
+
+        // Java parseSubscribeMessageQueues：把带命名空间的 topic 还原成用户侧的裸名。
+        var outList = new List<MessageQueue>();
+        foreach (MessageQueue mq in allocated)
+        {
+            if (mq.Topic != realTopic)
+            {
+                // Java :128-131 逐个比对表键的 topic；别让策略的意外返回值把别的 topic
+                // 混进调用方的拉取循环。
+                continue;
+            }
+
+            string plain = NamespaceUtil.WithoutNamespace(mq.Topic, _namespace);
+            outList.Add(new MessageQueue(plain, mq.BrokerName, mq.QueueId));
+        }
+
+        outList.Sort();
+        return DedupeQueues(outList);
+    }
+
+    /// <summary>订阅信息口径的全部队列（读位、不筛 master），按 house 排序口径返回。</summary>
+    private static List<MessageQueue> SubscribeQueuesOfTopic(MQClientInstance c, string realTopic)
+    {
+        TopicRouteData? route = c.GetTopicRouteData(realTopic);
+        List<MessageQueue> outList = route is null
+            ? new List<MessageQueue>()
+            : route.GetAllSubscribeMessageQueue(realTopic);
+        outList.Sort();
+        return outList;
+    }
+
+    /// <summary>本实例实际拉过的队列（Java pullFromWhichNodeTable 的键集），按 topic 收口。</summary>
+    private List<MessageQueue> PulledQueues(string realTopic)
+    {
+        lock (_lock)
+        {
+            var outList = new List<MessageQueue>();
+            foreach (MessageQueue mq in _pullFromWhichNode.Keys)
+            {
+                if (mq.Topic == realTopic)
+                {
+                    outList.Add(mq);
+                }
+            }
+
+            outList.Sort();
+            return outList;
+        }
+    }
+
+    /// <summary>按 (topic, brokerName, queueId) 去重；入参必须已排序，重复项必相邻。</summary>
+    private static List<MessageQueue> DedupeQueues(List<MessageQueue> sorted)
+    {
+        var outList = new List<MessageQueue>(sorted.Count);
+        MessageQueue? prev = null;
+        foreach (MessageQueue mq in sorted)
+        {
+            if (prev is not null && prev.Topic == mq.Topic && prev.BrokerName == mq.BrokerName
+                && prev.QueueId == mq.QueueId)
+            {
+                continue;
+            }
+
+            outList.Add(mq);
+            prev = mq;
+        }
+
+        return outList;
     }
 
     // ---------------- 拉取 ----------------

@@ -1,5 +1,7 @@
 # RocketMQ C# 客户端（remoting 协议）
 
+> 中文 ｜ [English](README.en.md)
+
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 C# 实现，覆盖生产者 / 推送与拉取消费者 /
 管理端 / 消息轨迹 / 事务与定时消息全链路。适配 RocketMQ 4.x / 5.x 集群，全部能力在真实
 5.5.1 集群上联调验证过；与本仓库的 Python / C++ / Rust 实现逐项对齐。
@@ -13,7 +15,7 @@ Linux 上是 `liblz4.so.1` / `libzstd.so.1`）——装不到时该后端抛异�
 ```bash
 cd csharp
 dotnet build                              # 全解决方案，0 warning（TreatWarningsAsErrors 全局开启）
-dotnet test tests/RocketMQ.Client.Tests   # xunit，740 项测试
+dotnet test tests/RocketMQ.Client.Tests   # xunit，789 项测试
 ```
 
 要求 .NET 10 SDK。
@@ -60,8 +62,9 @@ class DemoListener : IMessageListenerConcurrently
 | 协议层 | `RemotingCommand` 帧编解码；JSON / RocketMQ 二进制双序列化；V2 单字母短键 header；fastjson2 非法输出容错解析；17 段 + 6 段消息编解码 |
 | 传输层 | Socket TCP 长连接惰性建连、每连接读线程、分帧、opaque→future 分发；同步 / 异步 / oneway；半包重组；超时与重连；连接断开时在途请求立即判死 |
 | 发送 | 同步 / 定点 / 队列选择器 / 批量 / 单向 / 异步（真异步发送池 + 两个公平背压信号量）/ 事务消息（两阶段 + broker 回查）/ 定时消息撤回（recallMessage） |
-| 消费 | Push Consumer（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控五阈值 + 挂起 listener 的清扫逃生口）、Pull Consumer（带消费者心跳）、Lite Pull Consumer（拉取/已消费/内存提交三张位点表） |
+| 消费 | Push Consumer（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控五阈值 + 挂起 listener 的清扫逃生口）、Pull Consumer（带消费者心跳，`FetchSubscribeMessageQueues` 给整个 topic、`FetchMessageQueuesInBalance` 只给本实例应得的那份）、Lite Pull Consumer（拉取/已消费/内存提交三张位点表） |
 | 队列分配 | 六个可插拔策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>` |
+| 命名空间 | 两套彼此独立：`Namespace`（客户端本地资源名前缀 `%%ns%%res`，Java `NamespaceUtil`）与 `NamespaceV2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`，钩子顺序 Namespace → Stream → ACL，故 `ns`/`ReqT` 都进 ACL 签名内容）；生产者 / 三种消费者 / 管理端 / 轨迹分发器都暴露 `NamespaceV2` |
 | 管理端 | `DefaultMQAdminExt`：topic / 订阅组 / 集群信息 / 各类统计 / 消息查询 / 位点重置 / `searchOffset` 边界语义 |
 | 观测与安全 | 消息轨迹（编码 + 异步分发 + 钩子）、消费统计、`ConsumerRunningInfo`(307)、发送/消费/事务/Forbidden/FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列 |
 
@@ -158,11 +161,14 @@ csharp/
 
 行格式 `2026-09-14 19:40:06.300 INFO  [pid] [线程名] [文件:行号] - msg`，
 按大小 FixedWindow 轮转（默认 64MB × maxIndex 10），同时写 stderr 与
-`$HOME/logs/rocketmqlogs/rocketmq_cpp_client.log`（与 C++ 端同名——各端口若共用
-这台机器的 `~/logs`，注意落到同一文件会互相插行）。
+`$HOME/logs/rocketmqlogs/rocketmq_csharp_client.log`。
 
-环境变量与 C++ 端一致：`ROCKETMQ_CPP_LOG_LEVEL` / `ROCKETMQ_CPP_LOG_FILE` /
-`ROCKETMQ_CPP_LOG_FILE_MAX_SIZE` / `ROCKETMQ_CPP_LOG_FILE_MAX_INDEX`；
+**文件名刻意与各端区分**（Java `rocketmq_client.log`、C++ `rocketmq_cpp_client.log`）：
+两端轮转策略不同，同机共用一个文件会互相插行，而且一端把文件改名后另一端仍持有旧 fd，
+之后的日志就静默写进已 unlink 的 inode。
+
+环境变量与其余端口同一套口径：`ROCKETMQ_CLIENT_LOG_LEVEL` / `ROCKETMQ_CLIENT_LOG_FILE` /
+`ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE` / `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX`；
 程序内可用 `ClientLog.SetLogLevel/SetLogFile/SetLogFileLimits/SetThreadName`。
 
 ## TLS
@@ -186,7 +192,7 @@ TLS push 消费者 3 发 3 收，生产侧注入的 `traceparent` 在消费侧�
 
 ## 单元测试覆盖
 
-`dotnet test tests/RocketMQ.Client.Tests` → **740 passed / 0 failed**，零 warning。
+`dotnet test tests/RocketMQ.Client.Tests` → **789 passed / 0 failed**，零 warning。
 主要套件（每个都是行为断言，不是快照测试）：
 
 - **协议与编解码**：`CodecTests` / `RouteHeartbeatTests` / `AdminBodyTests` / `LoggingTests` /
@@ -212,6 +218,12 @@ TLS push 消费者 3 发 3 收，生产侧注入的 `traceparent` 在消费侧�
 
 ## 几个必须知道的实现约定
 
+- **POP 的队列来自客户端 rebalance，不是 broker 分配**：Java 在 `clientRebalance=false` 时走
+  `RebalanceImpl#getRebalanceResultFromBroker:345` → `MQClientAPIImpl#queryAssignment:405`
+  （QUERY_ASSIGNMENT=400，回 `MessageQueueAssignment` mode=POP），由 broker 决定本实例拿哪些队列。
+  本端口**刻意不实现那条路径**（与其余六端同一决定）：队列仍由本地分配策略算出，然后每队列一个 POP
+  循环 + ack。语义等价，差别只在「谁决定队列集合」；要改先读 `Client/Consumer.cs` 里 `DoRebalance`
+  的那段注释。
 - **事务消息是完整两阶段**：半消息（TRAN_MSG/PGROUP + sysFlag `TRANSACTION_PREPARED`）→
   本地事务 → `END_TRANSACTION(37, oneway)` → broker 回查 `CHECK_TRANSACTION_STATE(39)` 时回调
   `CheckLocalTransaction` 并回发 END_TRANSACTION。生产者会周期性向 broker 发心跳（含

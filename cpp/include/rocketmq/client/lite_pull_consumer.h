@@ -56,6 +56,15 @@ public:
                                     const std::vector<MessageQueue>& mqDivided) = 0;
 };
 
+// 对应 Java TopicMessageQueueChangeListener：subscribe 的队列集合相对**上一次快照**
+// 发生变化时回调（后台按 topicMetadataCheckIntervalMillis 周期比对）。
+class TopicMessageQueueChangeListener {
+public:
+    virtual ~TopicMessageQueueChangeListener() = default;
+    virtual void onChanged(const std::string& topic,
+                           const std::vector<MessageQueue>& messageQueues) = 0;
+};
+
 class DefaultLitePullConsumer {
 public:
     explicit DefaultLitePullConsumer(
@@ -91,6 +100,12 @@ public:
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setNamespace(const std::string& ns) { namespace_ = ns; }
+    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`）：非空时 NamespaceRpcHook 给
+    // **每笔请求**加 `nsd=true` / `ns=<namespaceV2>`，由 broker 侧解析实例 —— 与上面的
+    // setNamespace（客户端改写 "ns%topic"）是两套机制。链序照 Java `MQClientAPIImpl:329`：
+    // 装在 ACL 签名**之前**（本消费者默认还开着 stream，链序为 Namespace → Stream → ACL）。
+    void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
+    const std::string& namespaceV2() const { return namespaceV2_; }
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
     void setCredentials(const std::string& accessKey, const std::string& secretKey,
                         const std::string& securityToken = std::string()) {
@@ -113,6 +128,14 @@ public:
     void setMessageQueueListener(std::shared_ptr<LiteMessageQueueListener> listener) {
         messageQueueListener_ = std::move(listener);
     }
+    // Java ClientConfig#topicMetadataCheckIntervalMillis（默认 30000ms）：后台比对
+    // registerTopicMessageQueueChangeListener 注册 topic 的队列集合的周期。
+    void setTopicMetadataCheckIntervalMillis(int32_t millis) {
+        topicMetadataCheckIntervalMillis_ = std::max(1000, millis);
+    }
+    int32_t topicMetadataCheckIntervalMillis() const {
+        return topicMetadataCheckIntervalMillis_;
+    }
     // 队列分配策略（对应 Java DefaultLitePullConsumer.setAllocateMessageQueueStrategy）。
     // 与 Java 同款：setter 允许传 nullptr，由 start() 的 checkConfig 拒绝
     //（Java DefaultLitePullConsumerImpl.checkConfig:435）。默认 AllocateMessageQueueAveragely。
@@ -130,6 +153,20 @@ public:
     // ---------------- 订阅 / 分配 ----------------
     // subscribe 模式：登记 topic 订阅（支持 tag 表达式），自动 rebalance 分配队列。
     void subscribe(const std::string& topic, const std::string& subExpression = "*");
+    // 对应 Java subscribe(topic, subExpression, MessageQueueListener)（DefaultLitePullConsumer
+    // :371 → Impl:500）：rebalance 的分配更新（本端口 rebalance 核心本来就在做）之后，
+    // 该 topic 分到的队列有变时**追加**调用这个 per-subscription 监听器 —— Java 的实现是
+    // 用"分配更新 + 自定义回调"的包装器替换全局监听器；本端口全局/按 topic 两个槽位独立
+    // 存放，对使用方可见的行为与 Java 一致：分配照常更新、自定义回调照常收到。
+    void subscribe(const std::string& topic, const std::string& subExpression,
+                   std::shared_ptr<LiteMessageQueueListener> messageQueueListener);
+    // 对应 Java registerTopicMessageQueueChangeListener（DefaultLitePullConsumer:325 →
+    // Impl:1267）：后台任务（启动后 10s 首查、此后每 topicMetadataCheckIntervalMillis 一趟）
+    // 拉取该 topic 的队列集合并与上次快照比对，**集合有变**才回调 onChanged —— 与 Java
+    // fetchTopicMessageQueuesAndCompare（:1230）同款。重复注册同一 topic 会覆盖旧监听器
+    //（Java 同款，warn 一条）；topic 为空或监听器为空抛 MQClientException("Topic or listener is null")。
+    void registerTopicMessageQueueChangeListener(
+        const std::string& topic, std::shared_ptr<TopicMessageQueueChangeListener> listener);
     // assign 模式：给某个 topic 的队列指定 tag 过滤表达式（Java setSubExpressionForAssign）。
     void setSubExpressionForAssign(const std::string& topic, const std::string& subExpression);
     // assign 模式：显式指定队列，不走 rebalance。
@@ -198,6 +235,10 @@ private:
     std::vector<MessageQueue> newSetAsVector(const std::set<MessageQueue>& s) const;
 
     void rebalance();
+    // 对应 Java DefaultLitePullConsumerImpl#fetchTopicMessageQueuesAndCompare（:1230）：
+    // 遍历已注册的 TopicMessageQueueChangeListener，逐 topic 拉队列集合与快照比对。
+    void fetchTopicMessageQueuesAndCompare();
+    void metadataLoop();
     bool pullOne(const MessageQueue& mq);
     std::string subscriptionFor(const std::string& topic) const;
     bool filterTags(const std::string& topic, std::vector<MessageExt>& msgs, const std::string& sub);
@@ -228,6 +269,8 @@ private:
     // （字段初值 new AllocateMessageQueueAveragely()）。
     std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_;
     std::string namespace_;
+    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
+    std::string namespaceV2_;
     std::string instanceName_ = "DEFAULT";
     std::string clientId_;
     std::string unitName_;
@@ -269,6 +312,17 @@ private:
     std::set<MessageQueue> assigned_;
 
     std::shared_ptr<LiteMessageQueueListener> messageQueueListener_;
+
+    // per-subscription 监听器（subscribe 的三参重载）与队列变化监听器，都按
+    // topic（已套命名空间）登记；各自的注册/遍历由 topicListenerMutex_ 保护。
+    mutable std::mutex topicListenerMutex_;
+    std::map<std::string, std::shared_ptr<LiteMessageQueueListener>> topicListeners_;
+    std::map<std::string, std::shared_ptr<TopicMessageQueueChangeListener>> topicChangeListeners_;
+    // TopicMessageQueueChangeListener 的上次快照（Java messageQueuesForTopic）
+    std::map<std::string, std::vector<MessageQueue>> messageQueuesForTopic_;
+    // Java DefaultLitePullConsumer.topicMetadataCheckIntervalMillis（默认 30000ms）
+    int32_t topicMetadataCheckIntervalMillis_ = 30000;
+    std::thread metadataThread_;
 
     std::unique_ptr<MQClientInstance> mqClient_;
     std::atomic<bool> started_{false};

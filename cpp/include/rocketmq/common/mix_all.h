@@ -68,6 +68,13 @@ struct MixAll {
     // Java 拼 clientId 用的是 `RequestType.STREAM.name()`，即字面量 "STREAM"
     // （⚠ 与 extFields 里那个**枚举 code** 不同，见 StreamTypeRPCHook）。
     static constexpr const char* STREAM_REQUEST_TYPE = "STREAM";
+    // 5.x 新命名空间（namespaceV2，阿里云实例 ID 形态）的两枚 extFields 键，
+    // 对应 Java MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD / _NAMESPACE_FIELD
+    // （`MixAll.java:122-123`），由 NamespaceRpcHook 写入。
+    // ⚠ 与上面的 setNamespace（老命名空间，客户端把 topic 改写成 "ns%topic"）是**两套
+    // 机制**：这一套不改 topic 名，broker 靠请求头把资源解析到实例下。
+    static constexpr const char* RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd";
+    static constexpr const char* RPC_REQUEST_HEADER_NAMESPACE_FIELD = "ns";
 
     static constexpr int32_t DEFAULT_TOPIC_QUEUE_NUMS = 4;
     static constexpr int32_t DEFAULT_TOPIC_READ_QUEUE_NUMS = 4;

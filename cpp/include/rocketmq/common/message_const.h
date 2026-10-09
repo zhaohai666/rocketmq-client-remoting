@@ -11,6 +11,12 @@ struct MessageConst {
     static constexpr const char* PROPERTY_TAGS = "TAGS";
     static constexpr const char* PROPERTY_WAIT_STORE_MSG_OK = "WAIT";
     static constexpr const char* PROPERTY_DELAY_TIME_LEVEL = "DELAY";
+    // 5.x 定时消息三属性（MessageConst.java:73-74/112）：setDelayTimeSec 写
+    // TIMER_DELAY_SEC、setDelayTimeMs 写 TIMER_DELAY_MS、setDeliverTimeMs 写
+    // TIMER_DELIVER_MS。canBatch 攒批判定用这四个（含 DELAY）的最大值。
+    static constexpr const char* PROPERTY_TIMER_DELAY_SEC = "TIMER_DELAY_SEC";
+    static constexpr const char* PROPERTY_TIMER_DELAY_MS = "TIMER_DELAY_MS";
+    static constexpr const char* PROPERTY_TIMER_DELIVER_MS = "TIMER_DELIVER_MS";
     static constexpr const char* PROPERTY_RETRY_TOPIC = "RETRY_TOPIC";
     static constexpr const char* PROPERTY_REAL_TOPIC = "REAL_TOPIC";
     static constexpr const char* PROPERTY_REAL_QUEUE_ID = "REAL_QID";

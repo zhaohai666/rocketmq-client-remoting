@@ -65,9 +65,7 @@ use crate::client::mq_client::{
     ConsumerFuture, MQClientInstance, MQClientInstanceConfig, PublishMessage, RegisteredConsumer,
     MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
-use crate::client::producer::{
-    auto_bridged_dispatcher, SinkAdapter, TraceDispatcherChannel,
-};
+use crate::client::producer::{auto_bridged_dispatcher, SinkAdapter, TraceDispatcherChannel};
 use crate::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, ConsumeOrderlyContext,
     ConsumeOrderlyStatus, ConsumeReturnType, MessageListenerConcurrently, MessageListenerOrderly,
@@ -99,6 +97,7 @@ use crate::remoting::protocol::heartbeat::{
     ConsumeFromWhere, ConsumeType, FilterAPI, MessageModel, SubscriptionData,
 };
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
+use crate::remoting::protocol::response_code;
 use crate::remoting::rpchook::RPCHook;
 use crate::{bail, rmq_debug, rmq_error, rmq_info, rmq_warn};
 
@@ -159,7 +158,10 @@ pub fn client_side_tag_filter(
         return msgs;
     }
     msgs.into_iter()
-        .filter(|m| m.get_tags().is_some_and(|t| sub.tags_set.iter().any(|s| s == t)))
+        .filter(|m| {
+            m.get_tags()
+                .is_some_and(|t| sub.tags_set.iter().any(|s| s == t))
+        })
         .collect()
 }
 
@@ -286,9 +288,7 @@ impl PopProcessQueue {
     /// Python `PopProcessQueue()`。
     pub fn new() -> Arc<PopProcessQueue> {
         Arc::new(PopProcessQueue {
-            last_pop_timestamp: AtomicI64::new(
-                crate::common::util_all::current_time_millis(),
-            ),
+            last_pop_timestamp: AtomicI64::new(crate::common::util_all::current_time_millis()),
             ..Default::default()
         })
     }
@@ -326,7 +326,8 @@ impl PopProcessQueue {
 
     /// 记一次弹出时间（毫秒），对齐 Python `pq.last_pop_timestamp = time.time()`。
     pub fn touch(&self, timestamp_millis: i64) {
-        self.last_pop_timestamp.store(timestamp_millis, Ordering::SeqCst);
+        self.last_pop_timestamp
+            .store(timestamp_millis, Ordering::SeqCst);
     }
 }
 
@@ -378,6 +379,10 @@ pub struct ConsumerConfig {
     /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
+    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
+    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
+    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
+    pub namespace_v2: Option<String>,
     /// Java `ClientConfig#unitMode`（默认 false）：随发送/回投/鉴权/消息过滤
     /// 一起上线，broker 据此给自动创建的 topic 打 UNIT / UNIT_SUB 位。
     pub unit_mode: bool,
@@ -476,6 +481,7 @@ impl Default for ConsumerConfig {
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
+            namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: false,
             // Java `ClientConfig:58` / `:66`：1000 * 30 与 1000 * 5
@@ -625,9 +631,7 @@ fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
     if cfg.pop_invisible_time < MIN_POP_INVISIBLE_TIME
         || cfg.pop_invisible_time > MAX_POP_INVISIBLE_TIME
     {
-        bail!(
-            "popInvisibleTime Out of range [{MIN_POP_INVISIBLE_TIME}, {MAX_POP_INVISIBLE_TIME}]"
-        );
+        bail!("popInvisibleTime Out of range [{MIN_POP_INVISIBLE_TIME}, {MAX_POP_INVISIBLE_TIME}]");
     }
     // popBatchNums（Java 写的就是 `<= 0`，不是 `< 1`）
     if cfg.pop_batch_nums <= 0 || cfg.pop_batch_nums > 32 {
@@ -766,7 +770,26 @@ struct Inner {
     rebalance_signal: Notify,
     /// [`State::queue_owners`] 的令牌发号器。
     next_token: AtomicU64,
+    /// Java `DefaultMQPushConsumerImpl#pause`：[`suspend`](DefaultMQPushConsumer::suspend)
+    /// 置 true，[`resume`](DefaultMQPushConsumer::resume) 置 false。
+    /// 拉取/弹出循环看到 true 时不发请求，按
+    /// [`PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`] 挂起后重试。
+    pause: AtomicBool,
 }
+
+// ================================================================ 流控常量
+// （Java `DefaultMQPushConsumerImpl.java:101-113`，数值一字不差）
+
+/// Java `pullTimeDelayMillsWhenException`：拉取/弹出 RPC 出错后的退避。
+pub const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION: u64 = 3000;
+/// Java `PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL`：本地缓存（待消费/待 ack）
+/// 打满流控时的退避。
+pub const PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL: u64 = 50;
+/// Java `PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL`：broker 回
+/// `FLOW_CONTROL(215)` 时的退避（远短于普通异常：broker 只是让客户端慢一点）。
+pub const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL: u64 = 20;
+/// Java `PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`：`suspend()` 后的轮询间隔。
+pub const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND: u64 = 1000;
 
 impl Drop for Inner {
     /// 忘记 `shutdown()` 也不能留下还在跑的循环（见生产者模块头同名差异）。
@@ -789,11 +812,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn read_cfg(inner: &Inner) -> ConsumerConfig {
-    inner
-        .cfg
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    inner.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn require_client(inner: &Inner) -> Result<MQClientInstance> {
@@ -849,7 +868,10 @@ impl std::fmt::Debug for DefaultMQPushConsumer {
             .field("message_model", &cfg.message_model)
             .field("pop_mode", &cfg.pop_mode)
             .field("started", &self.inner.started.load(Ordering::Acquire))
-            .field("subscriptions", &lock(&self.inner.state).subscription_data.len())
+            .field(
+                "subscriptions",
+                &lock(&self.inner.state).subscription_data.len(),
+            )
             .finish()
     }
 }
@@ -905,11 +927,15 @@ impl DefaultMQPushConsumer {
             rebalance_now: AtomicBool::new(false),
             rebalance_signal: Notify::new(),
             next_token: AtomicU64::new(1),
+            pause: AtomicBool::new(false),
         });
         let consumer = DefaultMQPushConsumer { inner };
         // Python `__init__` 里 `self._core_pool_size = self.consume_thread_min`
         let min = consumer.config().consume_thread_min;
-        consumer.inner.core_pool_size.store(min.max(1), Ordering::SeqCst);
+        consumer
+            .inner
+            .core_pool_size
+            .store(min.max(1), Ordering::SeqCst);
         Ok(consumer)
     }
 
@@ -921,11 +947,7 @@ impl DefaultMQPushConsumer {
     /// 改配置（Python 的直接赋属性）。`start()` 之后除少数运行期可调项外应拒绝。
     pub fn update_config(&self, f: impl FnOnce(&mut ConsumerConfig)) {
         {
-            let mut w = self
-                .inner
-                .cfg
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
             f(&mut w);
         }
         // Python 的 set_consume_thread_* 会顺带同步声明的 core size
@@ -982,6 +1004,19 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.unit_name = unit_name);
     }
 
+    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
+    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
+    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
+    pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
+        let namespace_v2 = namespace_v2.map(str::to_string);
+        self.update_config(|c| c.namespace_v2 = namespace_v2);
+    }
+
+    /// Java `ClientConfig#getNamespaceV2`。
+    pub fn get_namespace_v2(&self) -> Option<String> {
+        self.config().namespace_v2
+    }
+
     /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
@@ -1028,7 +1063,10 @@ impl DefaultMQPushConsumer {
     }
 
     /// Python `set_message_listener` 的并发消费便捷入口。
-    pub fn set_message_listener_concurrently(&self, listener: Arc<dyn MessageListenerConcurrently>) {
+    pub fn set_message_listener_concurrently(
+        &self,
+        listener: Arc<dyn MessageListenerConcurrently>,
+    ) {
         self.set_message_listener(MessageListener::Concurrently(listener));
     }
 
@@ -1194,7 +1232,11 @@ impl DefaultMQPushConsumer {
 
     fn put_subscription(&self, topic: String, sub: SubscriptionData) {
         let mut state = lock(&self.inner.state);
-        match state.subscription_data.iter_mut().find(|(k, _)| *k == topic) {
+        match state
+            .subscription_data
+            .iter_mut()
+            .find(|(k, _)| *k == topic)
+        {
             Some(slot) => slot.1 = sub,
             None => state.subscription_data.push((topic, sub)),
         }
@@ -1303,16 +1345,13 @@ impl DefaultMQPushConsumer {
             &cfg.instance_name,
             cfg.message_model == MessageModel::CLUSTERING,
         );
-        let client_id = cfg
-            .client_id
-            .clone()
-            .unwrap_or_else(|| {
-                MixAll::build_default_client_id(
-                    &instance_name,
-                    cfg.unit_name.as_deref(),
-                    cfg.enable_stream_request_type,
-                )
-            });
+        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
+            MixAll::build_default_client_id(
+                &instance_name,
+                cfg.unit_name.as_deref(),
+                cfg.enable_stream_request_type,
+            )
+        });
         self.update_config(|c| {
             c.consumer_group = group.clone();
             c.client_id = Some(client_id.clone());
@@ -1322,13 +1361,17 @@ impl DefaultMQPushConsumer {
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
+            namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             persist_offset_interval_millis: cfg.persist_consumer_offset_interval_millis,
             ..Default::default()
         };
-        let client =
-            MQClientInstance::create_mq_client_instance(&client_id, cfg.name_server_addrs.clone(), instance_cfg);
+        let client = MQClientInstance::create_mq_client_instance(
+            &client_id,
+            cfg.name_server_addrs.clone(),
+            instance_cfg,
+        );
         if let Some(hook) = self
             .inner
             .rpc_hook
@@ -1408,9 +1451,7 @@ impl DefaultMQPushConsumer {
         }
         let ok = client.send_heartbeat_to_all_broker(5000).await;
         if ok > 0 {
-            self.inner
-                .heartbeat_count
-                .fetch_add(1, Ordering::SeqCst);
+            self.inner.heartbeat_count.fetch_add(1, Ordering::SeqCst);
         }
         if let Err(e) = self.do_rebalance().await {
             rmq_warn!("initial rebalance failed: {e}");
@@ -1483,12 +1524,12 @@ impl DefaultMQPushConsumer {
             // 更重要的是要把位点钳到「仍未落定消息」之下。
             // POP 顺序同样没有队列锁可解：Java unlockAll() 只遍历 processQueueTable，
             // POP 的队列在 popProcessQueueTable 里，这张表是空的 ⇒ UNLOCK 一发不出。
-            let locked_mqs: Vec<MessageQueue> =
-                if orderly && !broadcast && !self.config().pop_mode {
-                    lock(&self.inner.state).assigned.clone()
-                } else {
-                    Vec::new()
-                };
+            let locked_mqs: Vec<MessageQueue> = if orderly && !broadcast && !self.config().pop_mode
+            {
+                lock(&self.inner.state).assigned.clone()
+            } else {
+                Vec::new()
+            };
             if broadcast {
                 if let Err(e) = save_local_offsets(&self.inner) {
                     rmq_debug!("persist local offsets on shutdown failed: {e}");
@@ -1539,8 +1580,9 @@ impl DefaultMQPushConsumer {
                     if !broadcast {
                         let items = shutdown_persist_items(&inner);
                         for (mq, off) in &items {
-                            if let Err(e) =
-                                client.update_consumer_offset(&group, mq, *off, 5000, None).await
+                            if let Err(e) = client
+                                .update_consumer_offset(&group, mq, *off, 5000, None)
+                                .await
                             {
                                 rmq_debug!("persist offset on shutdown failed for {mq:?}: {e}");
                             }
@@ -1592,8 +1634,10 @@ impl DefaultMQPushConsumer {
             } else {
                 // 无运行时：末次持久化与注销都发不出去（Python 那里线程照起），
                 // 但至少把该还的还掉。
-                rmq_warn!("push shutdown: no tokio runtime, skip final offset persist and \
-                           consumer unregister");
+                rmq_warn!(
+                    "push shutdown: no tokio runtime, skip final offset persist and \
+                           consumer unregister"
+                );
                 client.shutdown();
             }
         }
@@ -1878,9 +1922,7 @@ impl DefaultMQPushConsumer {
                     .get_consumer_id_list_by_group(topic, &group, 5000)
                     .await;
                 let Some(mut cid_all) = cid_all else {
-                    rmq_debug!(
-                        "rebalance: no consumer id list for {group}/{topic}, keep current"
-                    );
+                    rmq_debug!("rebalance: no consumer id list for {group}/{topic}, keep current");
                     let keep: Vec<MessageQueue> = lock(&self.inner.state)
                         .assigned
                         .iter()
@@ -1901,7 +1943,12 @@ impl DefaultMQPushConsumer {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                match strategy.allocate(&group, &cfg.client_id.clone().unwrap_or_default(), &mq_all, &cid_all) {
+                match strategy.allocate(
+                    &group,
+                    &cfg.client_id.clone().unwrap_or_default(),
+                    &mq_all,
+                    &cid_all,
+                ) {
                     Ok(got) => assigned.extend(got),
                     Err(e) => {
                         // Python 在这里直接 `return`：本轮分配结果整个作废，
@@ -2012,10 +2059,7 @@ impl DefaultMQPushConsumer {
                 // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让队列
                 // 从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
                 state.frozen_offsets.remove(key);
-                let token = self
-                    .inner
-                    .next_token
-                    .fetch_add(1, Ordering::SeqCst);
+                let token = self.inner.next_token.fetch_add(1, Ordering::SeqCst);
                 state.queue_owners.insert(key.clone(), token);
                 // Python 在分配那一刻就把 `_mq_map[key] = mq` 登记好：队列即使一条消息都没
                 // 拉到，也要能在 307/220 里看到、位点也能持久化。
@@ -2072,9 +2116,9 @@ impl DefaultMQPushConsumer {
         state.inflight_msgs.remove(key);
         state.lock_ok.remove(key);
         state.last_pull_at.remove(key); // 同名队列复用时不能继承旧时刻
-        // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java `ProcessQueue.setDropped(true)`）。
-        // 冻结标记**保留**到队列重建为止（见 `rebalance_pull_threads` 的解冻分支），
-        // 否则纠错后的位点会被旧 ack 覆盖。
+                                        // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java `ProcessQueue.setDropped(true)`）。
+                                        // 冻结标记**保留**到队列重建为止（见 `rebalance_pull_threads` 的解冻分支），
+                                        // 否则纠错后的位点会被旧 ack 覆盖。
         *state.queue_epoch.entry(key.to_string()).or_insert(0) += 1;
         let off = state.consume_offsets.remove(key);
         state.offset_table.remove(key);
@@ -2099,7 +2143,6 @@ impl DefaultMQPushConsumer {
         self.inner.rebalance_now.store(true, Ordering::SeqCst);
         self.inner.rebalance_signal.notify_waiters();
     }
-
 }
 
 // ---------------- 位点解析 ----------------
@@ -2191,7 +2234,10 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
     let client_id = cfg.client_id.clone().unwrap_or_default();
     for (mq, off) in revoked {
         if let Some(off) = off {
-            if let Err(e) = client.update_consumer_offset(&group, mq, *off, 5000, None).await {
+            if let Err(e) = client
+                .update_consumer_offset(&group, mq, *off, 5000, None)
+                .await
+            {
                 rmq_debug!("persist offset on revoke failed for {mq:?}: {e}");
             }
         }
@@ -2368,6 +2414,13 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖章，
         // 在流控/订阅判定之前：判据是「这条循环还在跑」，不是「这轮真的打了网络」。
         stamp_pull_at(&inner, &key, false);
+        // Java pullMessage:263-268 —— pause 时把拉取请求推后 1s（不打网络）。
+        if inner.pause.load(Ordering::SeqCst) {
+            if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_SUSPEND).await {
+                return;
+            }
+            continue;
+        }
         let sub = lock(&inner.state).subscription(&mq.topic).cloned();
         let Some(sub) = sub else { return };
         let cfg = read_cfg(&inner);
@@ -2382,7 +2435,8 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             continue;
         }
         if flow_control_hit(&inner, &mq, &key) {
-            if wait_or_stop(&mut rx, 100).await {
+            // Java pullMessage:273 —— 缓存打满：PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL
+            if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
                 return;
             }
             continue;
@@ -2407,12 +2461,8 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         // Java DefaultMQPushConsumerImpl.pullMessage:458-468 —— subscription 位置位
         // 与否完全由 subExpression 是否为 null 决定（见 helper 文档）。
         let sub_expression = pull_subscription_expression(&cfg, &sub);
-        let sys_flag = PullSysFlag::build_sys_flag_basic(
-            false,
-            true,
-            sub_expression.is_some(),
-            false,
-        );
+        let sys_flag =
+            PullSysFlag::build_sys_flag_basic(false, true, sub_expression.is_some(), false);
         // Java PullAPIWrapper#pullKernelImpl:197-205：按 pullFromWhichNodeTable 里的
         // brokerId 选主/从（缺省 MASTER_ID=0），应答后回写。
         let broker_id = {
@@ -2444,17 +2494,27 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             Err(e) => {
                 // 长轮询在 suspend 期间无新消息触发客户端超时属**正常行为**：broker 把
                 // 挂起时长钳制到自己的 brokerSuspendMaxTimeMillis，空闲队列会周期性超时。
-                let benign = matches!(
-                    e,
-                    Error::Timeout { .. } | Error::TooMuchRequest(_)
-                );
+                let benign = matches!(e, Error::Timeout { .. } | Error::TooMuchRequest(_));
                 if benign {
                     rmq_debug!("pull long-poll timeout for {mq:?} (benign, will retry): {e}");
                     continue;
                 }
+                // Java pullCallback.onException:446-450 —— broker 回 FLOW_CONTROL(215)
+                // 时只退 20ms（broker 只是让客户端慢一点），其余异常退 3s。
+                let delay = match &e {
+                    Error::Server {
+                        response_code: response_code::FLOW_CONTROL,
+                        ..
+                    }
+                    | Error::Broker {
+                        response_code: response_code::FLOW_CONTROL,
+                        ..
+                    } => PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
+                    _ => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
+                };
                 // 其余多为 topic 尚未创建等预期路径：debug + 短暂退避，避免热循环
                 rmq_debug!("pull error for {mq:?}: {e}");
-                if wait_or_stop(&mut rx, 500).await {
+                if wait_or_stop(&mut rx, delay).await {
                     return;
                 }
                 continue;
@@ -2468,7 +2528,11 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         }
         // 消费统计（Java PullCallback.onSuccess：RT 恒记，TPS 只在有消息时记）
         if let Some(stats) = lock(&inner.stats).clone() {
-            stats.inc_pull_rt(&cfg.consumer_group, &mq.topic, current_time_millis() - began);
+            stats.inc_pull_rt(
+                &cfg.consumer_group,
+                &mq.topic,
+                current_time_millis() - began,
+            );
             if result.status == PullStatus::Found && !result.msg_found_list.is_empty() {
                 stats.inc_pull_tps(
                     &cfg.consumer_group,
@@ -2497,11 +2561,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         let mut illegal = false;
         {
             let mut state = lock(&inner.state);
-            if state
-                .queue_owners
-                .get(&key)
-                .is_none_or(|t| *t != token)
-            {
+            if state.queue_owners.get(&key).is_none_or(|t| *t != token) {
                 rmq_debug!(
                     "queue {key} revoked during pull, discard {} fetched messages",
                     msgs.len()
@@ -2564,7 +2624,9 @@ fn update_msg_acc_cnt(inner: &Inner, key: &str, msgs: &[MessageExt]) {
     };
     let acc_total = max_offset - last.queue_offset;
     if acc_total > 0 {
-        lock(&inner.state).msg_acc_cnt.insert(key.to_string(), acc_total);
+        lock(&inner.state)
+            .msg_acc_cnt
+            .insert(key.to_string(), acc_total);
     }
 }
 
@@ -2575,8 +2637,8 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
         let state = lock(&inner.state);
         let dq: &VecDeque<MessageExt> = state.pending.get(key).unwrap_or(&EMPTY_DEQUE);
         let count = dq.len();
-        let size_mb = dq.iter().map(|m| i64::from(m.store_size)).sum::<i64>() as f64
-            / (1024.0 * 1024.0);
+        let size_mb =
+            dq.iter().map(|m| i64::from(m.store_size)).sum::<i64>() as f64 / (1024.0 * 1024.0);
         let span = if dq.is_empty() {
             0
         } else {
@@ -2591,9 +2653,7 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
         let topic_pending: Vec<(i32, i64)> = state
             .pending
             .iter()
-            .filter(|(k, _)| {
-                state.mq_map.get(*k).is_some_and(|m| m.topic == mq.topic)
-            })
+            .filter(|(k, _)| state.mq_map.get(*k).is_some_and(|m| m.topic == mq.topic))
             .flat_map(|(_, dq)| dq.iter())
             .map(|m| (m.store_size, m.queue_offset))
             .collect();
@@ -2605,9 +2665,7 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
         && size_mb >= f64::from(cfg.pull_threshold_size_for_queue)
     {
         Some(format!("size={size_mb:.1}MB"))
-    } else if cfg.consume_concurrently_max_span > 0
-        && span > cfg.consume_concurrently_max_span
-    {
+    } else if cfg.consume_concurrently_max_span > 0 && span > cfg.consume_concurrently_max_span {
         Some(format!("span={span}"))
     } else if cfg.pull_threshold_for_topic > 0 || cfg.pull_threshold_size_for_topic > 0 {
         if cfg.pull_threshold_for_topic > 0
@@ -2634,9 +2692,7 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
     match reason {
         None => false,
         Some(reason) => {
-            inner
-                .flow_control_triggered
-                .fetch_add(1, Ordering::SeqCst);
+            inner.flow_control_triggered.fetch_add(1, Ordering::SeqCst);
             rmq_debug!("flow control: queue {key} {reason}, pause pull");
             true
         }
@@ -2657,17 +2713,15 @@ async fn rebalance_loop(consumer: DefaultMQPushConsumer, rx: watch::Receiver<boo
         if stopped(&rx) || !consumer.is_started() {
             return;
         }
-        let starting_up =
-            current_time_millis() - consumer.inner.start_time_millis.load(Ordering::SeqCst) < 60_000;
+        let starting_up = current_time_millis()
+            - consumer.inner.start_time_millis.load(Ordering::SeqCst)
+            < 60_000;
         let interval = if starting_up && consumer.assigned_queue_count() == 0 {
             2_000
         } else {
             20_000
         };
-        let requested = consumer
-            .inner
-            .rebalance_now
-            .swap(false, Ordering::SeqCst);
+        let requested = consumer.inner.rebalance_now.swap(false, Ordering::SeqCst);
         if !requested && current_time_millis() < next_run {
             let _ = ticker.tick().await;
             continue;
@@ -2768,7 +2822,9 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
                         continue;
                     }
                     let cfg = read_cfg(&inner);
-                    let n = dq.len().min(cfg.consume_message_batch_max_size.max(1) as usize);
+                    let n = dq
+                        .len()
+                        .min(cfg.consume_message_batch_max_size.max(1) as usize);
                     let batch: Vec<MessageExt> = dq.drain(..n).collect();
                     batch
                 };
@@ -2983,7 +3039,9 @@ fn parse_local_offsets_text(text: &str) -> Option<BTreeMap<String, i64>> {
     Some(
         entries
             .into_iter()
-            .map(|(topic, broker, qid, off)| (mq_key(&MessageQueue::new(&topic, &broker, qid)), off))
+            .map(|(topic, broker, qid, off)| {
+                (mq_key(&MessageQueue::new(&topic, &broker, qid)), off)
+            })
             .collect(),
     )
 }
@@ -3043,8 +3101,8 @@ fn scan_java_offset_entries(text: &str) -> Option<Vec<(String, String, i32, i64)
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
-                            let hex = std::str::from_utf8(self.b.get(self.pos..self.pos + 4)?)
-                                .ok()?;
+                            let hex =
+                                std::str::from_utf8(self.b.get(self.pos..self.pos + 4)?).ok()?;
                             out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
                             self.pos += 4;
                         }
@@ -3069,11 +3127,17 @@ fn scan_java_offset_entries(text: &str) -> Option<Vec<(String, String, i32, i64)
             if self.pos == digits {
                 return None;
             }
-            std::str::from_utf8(&self.b[start..self.pos]).ok()?.parse().ok()
+            std::str::from_utf8(&self.b[start..self.pos])
+                .ok()?
+                .parse()
+                .ok()
         }
     }
 
-    let mut s = Scanner { b: text.as_bytes(), pos: 0 };
+    let mut s = Scanner {
+        b: text.as_bytes(),
+        pos: 0,
+    };
     if !s.eat(b'{') {
         return None;
     }
@@ -3297,20 +3361,32 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         }
         // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起弹出即盖章，在流控判定之前。
         stamp_pull_at(&inner, &key, true);
+        // Java popMessage:518-524 —— pause 时把弹出请求推后 1s（不打网络）。
+        if inner.pause.load(Ordering::SeqCst) {
+            if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_SUSPEND).await {
+                return;
+            }
+            continue;
+        }
         let sub = match lock(&inner.state).subscription(&mq.topic).cloned() {
             Some(sub) => sub,
             None => return,
         };
         let cfg = read_cfg(&inner);
-        // 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）
+        // 流控：已弹未 ack 太多就先缓一缓（Java popMessage:526-534，退避是
+        // PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL）
         if pq.wait_ack_count() > cfg.pop_threshold_for_queue {
-            if wait_or_stop(&mut rx, 50).await {
+            if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
                 return;
             }
             continue;
         }
         let began = current_time_millis();
-        let exp = if sub.sub_string.is_empty() { "*" } else { &sub.sub_string };
+        let exp = if sub.sub_string.is_empty() {
+            "*"
+        } else {
+            &sub.sub_string
+        };
         let result = match client
             .pop_message(
                 &cfg.consumer_group,
@@ -3335,8 +3411,20 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                     rmq_debug!("pop long-poll timeout for {mq:?} (benign, will retry)");
                     continue;
                 }
+                // Java popCallback.onException:514 —— FLOW_CONTROL 退 20ms，其余退 3s。
+                let delay = match &e {
+                    Error::Server {
+                        response_code: response_code::FLOW_CONTROL,
+                        ..
+                    }
+                    | Error::Broker {
+                        response_code: response_code::FLOW_CONTROL,
+                        ..
+                    } => PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
+                    _ => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
+                };
                 rmq_debug!("pop error for {mq:?}: {e}");
-                if wait_or_stop(&mut rx, 500).await {
+                if wait_or_stop(&mut rx, delay).await {
                     return;
                 }
                 continue;
@@ -3359,9 +3447,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             record_pop_pull_stats(&stats, &group, &mq.topic, &result, began);
         }
         if result.status == PopStatus::Found && !result.msg_found_list.is_empty() {
-            pq.inc_found_msg(
-                i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX),
-            );
+            pq.inc_found_msg(i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX));
             // 投递前过滤（Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
             // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为「过滤没生效」。
             let kept = filter_messages_for_delivery(
@@ -3528,7 +3614,9 @@ async fn consume_pop_batch(
     }
     if is_pop_timeout(&msgs, pop_time, invisible) {
         // 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
-        rmq_debug!("pop timeout, abort consume for {mq:?}: popTime={pop_time} invisible={invisible}");
+        rmq_debug!(
+            "pop timeout, abort consume for {mq:?}: popTime={pop_time} invisible={invisible}"
+        );
         pq.dec_found_msg(i32::try_from(msgs.len()).unwrap_or(i32::MAX));
         return;
     }
@@ -3714,7 +3802,11 @@ fn ack_pop_msg(inner: &Inner, msg: &MessageExt) {
         return;
     };
     let group = read_cfg(inner).consumer_group;
-    let Some(handle) = inner.runtime.get().cloned().or_else(|| tokio::runtime::Handle::try_current().ok())
+    let Some(handle) = inner
+        .runtime
+        .get()
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
     else {
         rmq_debug!("ack skipped: no runtime to run the RPC");
         return;
@@ -3777,7 +3869,11 @@ fn change_pop_invisible_time(
         return;
     };
     let group = cfg.consumer_group.clone();
-    let Some(handle) = inner.runtime.get().cloned().or_else(|| tokio::runtime::Handle::try_current().ok())
+    let Some(handle) = inner
+        .runtime
+        .get()
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
     else {
         rmq_debug!("change invisible time skipped: no runtime to run the RPC");
         return;
@@ -3943,8 +4039,7 @@ fn finish_consume_hook(
         cfg.consume_timeout,
         failed,
     );
-    ctx
-        .props
+    ctx.props
         .get_or_insert_with(Default::default)
         .insert("ConsumeContextType".to_string(), ret.name().to_string());
     ctx.status = Some(hook_status_name.to_string());
@@ -4410,7 +4505,9 @@ fn advance_consume_offset(
         next_off = next_off.min(floor);
     }
     let cur = state.consume_offsets.get(key).copied().unwrap_or(0);
-    state.consume_offsets.insert(key.to_string(), cur.max(next_off));
+    state
+        .consume_offsets
+        .insert(key.to_string(), cur.max(next_off));
 }
 
 /// Python `_requeue_pending`：把这一批按原顺序塞回本地队列队首，等价 Java
@@ -4825,9 +4922,7 @@ async fn orderly_send_message_back(
     let outcome: Result<()> = async {
         let client = require_client_for_send_back(inner)?;
         let mut new_msg = build_retry_message(cfg, msg, max_times);
-        let publish = client
-            .get_topic_publish_info(&new_msg.topic, true)
-            .await?;
+        let publish = client.get_topic_publish_info(&new_msg.topic, true).await?;
         let mq = publish
             .select_one_message_queue(&[])?
             .ok_or_else(|| Error::client(format!("no writable queue for {}", new_msg.topic)))?;
@@ -4881,7 +4976,10 @@ fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -
         new_msg.put_property(PROPERTY_ORIGIN_MESSAGE_ID, &origin_msg_id);
     }
     new_msg.put_property(PROPERTY_RETRY_TOPIC, &msg.topic);
-    new_msg.put_property(PROPERTY_RECONSUME_TIME, &(msg.reconsume_times + 1).to_string());
+    new_msg.put_property(
+        PROPERTY_RECONSUME_TIME,
+        &(msg.reconsume_times + 1).to_string(),
+    );
     new_msg.put_property(PROPERTY_MAX_RECONSUME_TIMES, &max_times.to_string());
     // 半消息标记必须清掉，否则 broker 会把它再当事务回查消息处理
     new_msg.properties.remove(PROPERTY_TRANSACTION_PREPARED);
@@ -4960,7 +5058,10 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             rmq_debug!("adjustThreadPool: acc={acc_total} >= incThreshold={threshold} (inc is a no-op upstream)");
         }
         if acc_total < threshold * 4 / 5 {
-            rmq_debug!("adjustThreadPool: acc={acc_total} < decThreshold={}/0.8 (dec is a no-op upstream)", threshold);
+            rmq_debug!(
+                "adjustThreadPool: acc={acc_total} < decThreshold={}/0.8 (dec is a no-op upstream)",
+                threshold
+            );
         }
     }
 
@@ -5065,7 +5166,10 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
         );
         properties.insert(
             ConsumerRunningInfo::PROP_CONSUMER_START_TIMESTAMP,
-            self.inner.start_time_millis.load(Ordering::SeqCst).to_string(),
+            self.inner
+                .start_time_millis
+                .load(Ordering::SeqCst)
+                .to_string(),
         );
         properties.insert(ConsumerRunningInfo::PROP_CLIENT_VERSION, "V5_5_1");
         let mut info = ConsumerRunningInfo {
@@ -5083,10 +5187,8 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             }
             let pqi = ProcessQueueInfo {
                 commit_offset: state.consume_offsets.get(key).copied().unwrap_or(0),
-                cached_msg_count: i32::try_from(
-                    state.pending.get(key).map_or(0, |dq| dq.len()),
-                )
-                .unwrap_or(i32::MAX),
+                cached_msg_count: i32::try_from(state.pending.get(key).map_or(0, |dq| dq.len()))
+                    .unwrap_or(i32::MAX),
                 droped: false,
                 // Java ProcessQueue.fillOutRunningInfo:456 —— 运维靠这个字段判断
                 // 「队列还在不在拉」，rebalance 的自愈判据用的就是同一个时刻。
@@ -5156,7 +5258,11 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
     ) -> Result<ConsumeMessageDirectlyResult> {
         // Default 已带上 Java 的初值（order=false、autoCommit=true）
         let mut result = ConsumeMessageDirectlyResult::default();
-        let mq = MessageQueue::new(&msg.topic, broker_name.as_deref().unwrap_or(""), msg.queue_id);
+        let mq = MessageQueue::new(
+            &msg.topic,
+            broker_name.as_deref().unwrap_or(""),
+            msg.queue_id,
+        );
         let mut msgs = vec![msg];
         reset_retry_topic_and_namespace(&self.inner, &mut msgs);
         let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
@@ -5238,6 +5344,54 @@ impl DefaultMQPushConsumer {
         self.msg_acc_cnt(None)
     }
 
+    // ---------------- 挂起 / 恢复（Java DefaultMQPushConsumer.java:890/898） ----------------
+
+    /// Java `DefaultMQPushConsumer#suspend()`（impl `DefaultMQPushConsumerImpl#suspend:1312`）：
+    /// 拉起暂停标志；两个拉取循环看到标志就不再发请求，按
+    /// [`PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`](1000ms) 轮询等待恢复。
+    /// 只记一条 info 日志，与 Java 一样不抛错、可重复调用。
+    pub fn suspend(&self) {
+        self.inner.pause.store(true, Ordering::SeqCst);
+        rmq_info!("suspend this consumer, {}", self.consumer_group());
+    }
+
+    /// Java `DefaultMQPushConsumer#resume()`（impl `:741`）：清掉暂停标志并触发一次
+    /// 重平衡（Java 是同步 `doRebalance()`；这里复用 [`Self::rebalance_immediately`]
+    /// 的「标志位 + 唤醒」——后台重平衡循环几十毫秒内会跑完，语义等价且不阻塞调用方）。
+    pub fn resume(&self) {
+        self.inner.pause.store(false, Ordering::SeqCst);
+        self.rebalance_immediately();
+        rmq_info!("resume this consumer, {}", self.consumer_group());
+    }
+
+    /// Java `DefaultMQPushConsumer#isPause()`。
+    pub fn is_pause(&self) -> bool {
+        self.inner.pause.load(Ordering::SeqCst)
+    }
+
+    // ---------------- 消息回投（Java DefaultMQPushConsumer.java:722/745） ----------------
+
+    /// Java `DefaultMQPushConsumer#sendMessageBack(msg, delayLevel)`：回投给
+    /// **消息来源 broker**（`msg.getBrokerName()`），broker 之后重投。
+    ///
+    /// 与 Java 同为 **@Deprecated** 的公开口子（Java 注释说某版本后会移除/改可见性，
+    /// 但 5.x 仍公开），正常消费链路应交给消费结果语义（`ReconsumeLater` 等），
+    /// 这里供管理/运维脚本用。失败直接抛（Java 同）。
+    pub async fn send_message_back(&self, msg: &MessageExt, delay_level: i32) -> Result<()> {
+        send_message_back(&self.inner, msg, delay_level, None).await
+    }
+
+    /// Java `DefaultMQPushConsumer#sendMessageBack(msg, delayLevel, brokerName)`：
+    /// 指定接收回投的 broker。
+    pub async fn send_message_back_to_broker(
+        &self,
+        msg: &MessageExt,
+        delay_level: i32,
+        broker_name: &str,
+    ) -> Result<()> {
+        send_message_back(&self.inner, msg, delay_level, Some(broker_name)).await
+    }
+
     /// Python `update_core_pool_size`（Java `AbstractConsumeMessageService:63-71`）。
     ///
     /// Java 的守卫逐条照抄：`ownsConsumeExecutor && 0 < core <= Short.MAX_VALUE
@@ -5253,7 +5407,9 @@ impl DefaultMQPushConsumer {
         if core_pool_size >= self.config().consume_thread_max {
             return false;
         }
-        self.inner.core_pool_size.store(core_pool_size, Ordering::SeqCst);
+        self.inner
+            .core_pool_size
+            .store(core_pool_size, Ordering::SeqCst);
         self.apply_core_pool_size();
         true
     }
@@ -5330,6 +5486,23 @@ mod tests {
     }
 
     #[test]
+    fn namespace_v2_setter_getter_round_trip() {
+        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间
+        //（`NamespaceRpcHook` 的 `nsd`/`ns` 头），与 v1 `namespace` 互不影响。
+        let c = DefaultMQPushConsumer::new("GID_nsv2").expect("合法组名不该构造失败");
+        assert_eq!(c.get_namespace_v2(), None, "默认不设");
+        c.set_namespace_v2(Some("NS_V2"));
+        assert_eq!(c.get_namespace_v2(), Some("NS_V2".to_string()));
+        assert_eq!(c.config().namespace_v2, Some("NS_V2".to_string()));
+        c.set_namespace_v2(None);
+        assert_eq!(
+            c.get_namespace_v2(),
+            None,
+            "None = 清除（Java setNamespaceV2(null)）"
+        );
+    }
+
+    #[test]
     fn sort_key_orders_topic_then_broker_then_queue() {
         let mut mqs = vec![
             MessageQueue::new("b", "broker-a", 1),
@@ -5352,18 +5525,28 @@ mod tests {
 
     #[test]
     fn tag_filter_keeps_only_string_matches() {
-        let msgs = vec![ext("T", Some("TagA")), ext("T", Some("TagB")), ext("T", None)];
+        let msgs = vec![
+            ext("T", Some("TagA")),
+            ext("T", Some("TagB")),
+            ext("T", None),
+        ];
         let kept = client_side_tag_filter(Some(&sub("T", "TagA")), msgs.clone());
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].get_tags(), Some("TagA"));
 
         // 订阅 "*"：tags_set 为空 ⇒ 不过滤（连无 tag 的消息也留着）。
-        assert_eq!(client_side_tag_filter(Some(&sub("T", "*")), msgs.clone()).len(), 3);
+        assert_eq!(
+            client_side_tag_filter(Some(&sub("T", "*")), msgs.clone()).len(),
+            3
+        );
 
         // classFilterMode：Java 的守卫同样跳过二次过滤。
         let mut class_sub = sub("T", "TagA");
         class_sub.class_filter_mode = true;
-        assert_eq!(client_side_tag_filter(Some(&class_sub), msgs.clone()).len(), 3);
+        assert_eq!(
+            client_side_tag_filter(Some(&class_sub), msgs.clone()).len(),
+            3
+        );
 
         // 没有订阅信息时原样返回。
         assert_eq!(client_side_tag_filter(None, msgs.clone()).len(), 3);
@@ -5423,7 +5606,10 @@ mod tests {
             .into_iter()
             .map(|s| s.topic)
             .collect();
-        assert!(topics.contains(&"T_A".to_string()), "后置 subscribe 要落进活订阅表");
+        assert!(
+            topics.contains(&"T_A".to_string()),
+            "后置 subscribe 要落进活订阅表"
+        );
         assert!(topics.contains(&"T_B".to_string()));
         assert!(topics.contains(&"T_C".to_string()));
 
@@ -5451,6 +5637,45 @@ mod tests {
 
         pq.touch(1234);
         assert_eq!(pq.last_pop_timestamp.load(Ordering::SeqCst), 1234);
+    }
+
+    /// Java DefaultMQPushConsumer.java:890/898 —— suspend/resume/is_pause。
+    #[test]
+    fn suspend_and_resume_toggle_pause_and_trigger_rebalance() {
+        let c = DefaultMQPushConsumer::new("G_suspend").unwrap();
+        assert!(!c.is_pause());
+        c.suspend();
+        assert!(c.is_pause());
+        c.suspend(); // 幂等（Java 同样只是 set 标志）
+        assert!(c.is_pause());
+        c.resume();
+        assert!(!c.is_pause());
+        // resume 会请求一次重平衡（Java resume() 里同步 doRebalance；这里走标志位）
+        assert!(c.inner.rebalance_now.load(Ordering::SeqCst));
+    }
+
+    /// Java DefaultMQPushConsumerImpl.java:101-113 的四个流控常量一字不差。
+    #[test]
+    fn flow_control_constants_match_java() {
+        assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION, 3000);
+        assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL, 50);
+        assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, 20);
+        assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, 1000);
+    }
+
+    /// 公开回投的参数接线：未启动时报错、broker 名来自消息 / 显式实参。
+    #[tokio::test]
+    async fn public_send_message_back_requires_started_client() {
+        let c = DefaultMQPushConsumer::new("G_send_back_pub").unwrap();
+        let msg = MessageExt::from_message(&Message::new("T", Some(b"x")));
+        // 未 start：require_client_for_send_back 拿不到实例
+        let err = c.send_message_back(&msg, 3).await.unwrap_err();
+        assert!(err.to_string().contains("not started"), "{err}");
+        let err = c
+            .send_message_back_to_broker(&msg, 3, "broker-a")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not started"), "{err}");
     }
 
     #[test]
@@ -5486,12 +5711,18 @@ mod tests {
         assert_eq!(cfg.adjust_thread_pool_nums_threshold, 100_000);
         assert_eq!(cfg.consume_concurrently_max_span, 2000);
         assert_eq!(
-            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (
+                cfg.pull_threshold_for_queue,
+                cfg.pull_threshold_size_for_queue
+            ),
             (1000, 100)
         );
         // 主题级阈值默认关闭（Java -1）
         assert_eq!(
-            (cfg.pull_threshold_for_topic, cfg.pull_threshold_size_for_topic),
+            (
+                cfg.pull_threshold_for_topic,
+                cfg.pull_threshold_size_for_topic
+            ),
             (-1, -1)
         );
         assert_eq!(cfg.pull_interval, 0);
@@ -5568,14 +5799,21 @@ mod tests {
     #[test]
     fn update_core_pool_size_guards_match_java() {
         let c = DefaultMQPushConsumer::new("G").unwrap();
-        assert_eq!(c.config().consume_thread_max, 20, "Java 5.x 默认两侧同为 20");
+        assert_eq!(
+            c.config().consume_thread_max,
+            20,
+            "Java 5.x 默认两侧同为 20"
+        );
         // 无界队列 ⇒ 真实并发度 == core；默认 max=20，故只能往**下**调
         assert!(c.update_core_pool_size(15));
         assert_eq!(c.get_core_pool_size(), 15);
         assert!(!c.update_core_pool_size(0));
         assert!(!c.update_core_pool_size(-1));
         assert!(!c.update_core_pool_size(20), "== consume_thread_max 也不行");
-        assert!(!c.update_core_pool_size(30), "回归：默认 max 不能是 4.x 的 64");
+        assert!(
+            !c.update_core_pool_size(30),
+            "回归：默认 max 不能是 4.x 的 64"
+        );
         assert!(c.update_core_pool_size(19), "刚好低于 max");
         assert_eq!(c.get_core_pool_size(), 19);
         // 抬 max 之后区间重新打开（update_config 是裸赋值，与 Java 的 setter 一致）
@@ -5602,7 +5840,8 @@ mod tests {
             "默认策略必须是 AVG"
         );
 
-        consumer.set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueAveragelyByCircle));
+        consumer
+            .set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueAveragelyByCircle));
         assert_eq!(
             consumer.allocate_message_queue_strategy().get_name(),
             "AVG_BY_CIRCLE",
@@ -5672,13 +5911,19 @@ mod tests {
         consumer.set_message_listener_concurrently(Arc::new(NoopListener));
         for _ in 0..2 {
             let listener = lock(&consumer.inner.listener).clone();
-            assert_eq!(listener.as_ref().map(MessageListener::is_orderly), Some(false));
+            assert_eq!(
+                listener.as_ref().map(MessageListener::is_orderly),
+                Some(false)
+            );
         }
 
         // 换成分区顺序 listener：覆盖而不是追加
         consumer.set_message_listener_orderly(Arc::new(NoopOrderlyListener));
         let listener = lock(&consumer.inner.listener).clone();
-        assert_eq!(listener.as_ref().map(MessageListener::is_orderly), Some(true));
+        assert_eq!(
+            listener.as_ref().map(MessageListener::is_orderly),
+            Some(true)
+        );
     }
 
     /// `start()` 的三道校验必须在任何网络动作之前（Python `start()` 开头同样先校验）。
@@ -5846,11 +6091,23 @@ mod tests {
     /// Java 的比较是 `value < lo || value > hi`，两端都是**闭**区间。
     fn expect_rejected(gate: &RangeGate, value: i64) {
         let want = format!("MQClientException: {}", gate.message);
-        assert_eq!(gate_error(&gate_cfg(gate, value)), want, "{}={}", gate.field, value);
+        assert_eq!(
+            gate_error(&gate_cfg(gate, value)),
+            want,
+            "{}={}",
+            gate.field,
+            value
+        );
     }
 
     fn expect_accepted(gate: &RangeGate, value: i64) {
-        assert_eq!(gate_error(&gate_cfg(gate, value)), "<accepted>", "{}={} 必须合法", gate.field, value);
+        assert_eq!(
+            gate_error(&gate_cfg(gate, value)),
+            "<accepted>",
+            "{}={} 必须合法",
+            gate.field,
+            value
+        );
     }
 
     #[test]
@@ -5901,7 +6158,11 @@ mod tests {
     #[test]
     fn thread_min_must_not_exceed_thread_max() {
         assert_eq!(
-            gate_error(&ConsumerConfig { consume_thread_min: 8, consume_thread_max: 4, ..Default::default() }),
+            gate_error(&ConsumerConfig {
+                consume_thread_min: 8,
+                consume_thread_max: 4,
+                ..Default::default()
+            }),
             "MQClientException: consumeThreadMin (8) is larger than consumeThreadMax (4)"
         );
 
@@ -5915,7 +6176,11 @@ mod tests {
 
         // 相对检查排在两条范围检查**之后**：min=0 时先报范围，不报 min>max
         assert_eq!(
-            gate_error(&ConsumerConfig { consume_thread_min: 0, consume_thread_max: 0, ..Default::default() }),
+            gate_error(&ConsumerConfig {
+                consume_thread_min: 0,
+                consume_thread_max: 0,
+                ..Default::default()
+            }),
             "MQClientException: consumeThreadMin Out of range [1, 1000]"
         );
     }
@@ -5942,7 +6207,10 @@ mod tests {
             "条数排在 pullBatchSize 之前"
         );
         assert_eq!(
-            gate_error(&ConsumerConfig { pull_batch_size: 0, ..Default::default() }),
+            gate_error(&ConsumerConfig {
+                pull_batch_size: 0,
+                ..Default::default()
+            }),
             "MQClientException: pullBatchSize Out of range [1, 1024]",
             "前面几道修好之后才轮到 pullBatchSize"
         );
@@ -5966,7 +6234,10 @@ mod tests {
             e.to_string(),
             "MQClientException: pullBatchSize Out of range [1, 1024]"
         );
-        assert!(!consumer.is_started(), "被拒的 start() 必须回滚 started 标志");
+        assert!(
+            !consumer.is_started(),
+            "被拒的 start() 必须回滚 started 标志"
+        );
         assert!(
             lock(&consumer.inner.client).is_none(),
             "数值闸门必须排在建 MQClientInstance 之前，否则后台任务泄漏"
@@ -6025,7 +6296,9 @@ mod tests {
         consumer.set_persist_consumer_offset_interval_millis(700);
 
         consumer.start().await.expect("静态地址下 start 不该失败");
-        let client = lock(&consumer.inner.client).clone().expect("start 之后必须已有实例");
+        let client = lock(&consumer.inner.client)
+            .clone()
+            .expect("start 之后必须已有实例");
         assert_eq!(client.config().route_refresh_interval_millis, 2_000);
         assert_eq!(client.config().persist_offset_interval_millis, 700);
         consumer.shutdown();
@@ -6043,7 +6316,10 @@ mod tests {
             c.consume_from_where = ConsumeFromWhere::CONSUME_FROM_TIMESTAMP.to_string();
             c.consume_timestamp = "2026-01-01 00:00:00".to_string();
         });
-        let e = consumer.start().await.expect_err("非 yyyyMMddHHmmss 必须被拒");
+        let e = consumer
+            .start()
+            .await
+            .expect_err("非 yyyyMMddHHmmss 必须被拒");
         assert!(
             e.to_string().contains("consumeTimestamp is invalid"),
             "unexpected error: {e}"
@@ -6064,7 +6340,10 @@ mod tests {
         clustering.set_namesrv_addr("127.0.0.1:1");
         clustering.subscribe("T", "TagA").unwrap();
         clustering.set_message_listener_concurrently(Arc::new(NoopListener));
-        clustering.start().await.expect("CLUSTERING 消费者应该能启动");
+        clustering
+            .start()
+            .await
+            .expect("CLUSTERING 消费者应该能启动");
 
         let id = clustering.client_id();
         let (ip, instance) = id
@@ -6113,8 +6392,12 @@ mod tests {
         assert_eq!(second.client_id(), first.client_id());
         let shared = MQClientInstance::find_instance(&first.client_id()).expect("实例必须已登记");
         assert!(
-            shared.find_consumer(&first.config().consumer_group).is_some()
-                && shared.find_consumer(&second.config().consumer_group).is_some(),
+            shared
+                .find_consumer(&first.config().consumer_group)
+                .is_some()
+                && shared
+                    .find_consumer(&second.config().consumer_group)
+                    .is_some(),
             "两个广播消费者没落在同一份实例上"
         );
         second.shutdown();
@@ -6151,7 +6434,10 @@ mod tests {
             consumer.set_message_listener_concurrently(Arc::new(NoopListener));
             let err = consumer.start().await.expect_err("非法组名必须本地失败");
             assert!(err.to_string().contains(needle), "{group}: {err}");
-            assert!(!consumer.is_started(), "{group}: 失败的 start 必须回滚 started");
+            assert!(
+                !consumer.is_started(),
+                "{group}: 失败的 start 必须回滚 started"
+            );
         }
     }
 
@@ -6179,14 +6465,14 @@ mod tests {
         // 命名空间在订阅时就拼进 topic（Python `_with_namespace`）
         consumer.update_config(|c| c.namespace = "Ns".to_string());
         consumer.subscribe("Other", "*").unwrap();
-        assert!(
-            lock(&consumer.inner.state)
-                .subscription("Ns%Other")
-                .is_some()
-        );
+        assert!(lock(&consumer.inner.state)
+            .subscription("Ns%Other")
+            .is_some());
 
         consumer.unsubscribe("Other");
-        assert!(lock(&consumer.inner.state).subscription("Ns%Other").is_none());
+        assert!(lock(&consumer.inner.state)
+            .subscription("Ns%Other")
+            .is_none());
     }
 
     // ---------------- 流控与统计 ----------------
@@ -6256,7 +6542,10 @@ mod tests {
         // 跨度：严格大于 consumeConcurrentlyMaxSpan（Java 同）
         only(&consumer, |c| c.consume_concurrently_max_span = 10);
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 100)]);
-        assert!(flow_control_hit(&consumer.inner, &mq, &key), "span 100 > 10");
+        assert!(
+            flow_control_hit(&consumer.inner, &mq, &key),
+            "span 100 > 10"
+        );
         only(&consumer, |c| c.consume_concurrently_max_span = 100);
         assert!(
             !flow_control_hit(&consumer.inner, &mq, &key),
@@ -6277,7 +6566,10 @@ mod tests {
             c.pull_threshold_size_for_topic = 1;
         });
         stage(&consumer, &mq, vec![sized_msg(1024 * 1024 / 2, 0)]);
-        assert!(!flow_control_hit(&consumer.inner, &mq, &key), "0.5MiB < 1MiB");
+        assert!(
+            !flow_control_hit(&consumer.inner, &mq, &key),
+            "0.5MiB < 1MiB"
+        );
         stage(&consumer, &mq, vec![sized_msg(2 * 1024 * 1024, 0)]);
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB >= 1MiB");
         only(&consumer, |c| {
@@ -6396,7 +6688,9 @@ mod tests {
             c.set_message_listener_concurrently(Arc::new(AckListener { ack_index, status }));
             let mq = queue("T", "broker-a", 0);
             let key = mq_key(&mq);
-            lock(&c.inner.state).pending.insert(key.clone(), VecDeque::new());
+            lock(&c.inner.state)
+                .pending
+                .insert(key.clone(), VecDeque::new());
             AckHarness { c, key, mq }
         }
 
@@ -6418,7 +6712,11 @@ mod tests {
             lock(&self.c.inner.state)
                 .pending
                 .get(&self.key)
-                .map(|dq| dq.iter().map(|m| (m.queue_offset, m.reconsume_times)).collect())
+                .map(|dq| {
+                    dq.iter()
+                        .map(|m| (m.queue_offset, m.reconsume_times))
+                        .collect()
+                })
                 .unwrap_or_default()
         }
     }
@@ -6554,10 +6852,15 @@ mod tests {
                 ..Default::default()
             };
             let c = DefaultMQPushConsumer::with_config(cfg).unwrap();
-            c.set_message_listener_orderly(Arc::new(OrderlyListener { status, auto_commit }));
+            c.set_message_listener_orderly(Arc::new(OrderlyListener {
+                status,
+                auto_commit,
+            }));
             let mq = queue("T", "broker-a", 0);
             let key = mq_key(&mq);
-            lock(&c.inner.state).pending.insert(key.clone(), VecDeque::new());
+            lock(&c.inner.state)
+                .pending
+                .insert(key.clone(), VecDeque::new());
             OrderlyHarness { c, key, mq }
         }
 
@@ -6584,7 +6887,11 @@ mod tests {
             lock(&self.c.inner.state)
                 .pending
                 .get(&self.key)
-                .map(|dq| dq.iter().map(|m| (m.queue_offset, m.reconsume_times)).collect())
+                .map(|dq| {
+                    dq.iter()
+                        .map(|m| (m.queue_offset, m.reconsume_times))
+                        .collect()
+                })
                 .unwrap_or_default()
         }
     }
@@ -6682,8 +6989,15 @@ mod tests {
         assert_eq!(new_msg.get_property(PROPERTY_KEYS), Some("k7"));
         assert_eq!(new_msg.get_property(PROPERTY_RETRY_TOPIC), Some("T"));
         assert_eq!(new_msg.get_property(PROPERTY_RECONSUME_TIME), Some("3"));
-        assert_eq!(new_msg.get_property(PROPERTY_MAX_RECONSUME_TIMES), Some("2"));
-        assert_eq!(new_msg.get_property("DELAY"), Some("5"), "delayLevel = 3 + 2");
+        assert_eq!(
+            new_msg.get_property(PROPERTY_MAX_RECONSUME_TIMES),
+            Some("2")
+        );
+        assert_eq!(
+            new_msg.get_property("DELAY"),
+            Some("5"),
+            "delayLevel = 3 + 2"
+        );
         assert_eq!(
             new_msg.get_property(PROPERTY_ORIGIN_MESSAGE_ID),
             Some("mid-7"),
@@ -6742,11 +7056,23 @@ mod tests {
             c.suspend_current_queue_time_millis = ms;
             c
         };
-        assert_eq!(orderly_suspend_millis(&cfg(1000), &ctx(-1)), 1000, "-1 = 用配置");
+        assert_eq!(
+            orderly_suspend_millis(&cfg(1000), &ctx(-1)),
+            1000,
+            "-1 = 用配置"
+        );
         assert_eq!(orderly_suspend_millis(&cfg(250), &ctx(-1)), 250);
-        assert_eq!(orderly_suspend_millis(&cfg(0), &ctx(-1)), 10, "配置侧也要过钳位");
+        assert_eq!(
+            orderly_suspend_millis(&cfg(0), &ctx(-1)),
+            10,
+            "配置侧也要过钳位"
+        );
         assert_eq!(orderly_suspend_millis(&cfg(60_000), &ctx(-1)), 30_000);
-        assert_eq!(orderly_suspend_millis(&cfg(900), &ctx(70)), 70, "给了值就忽略配置");
+        assert_eq!(
+            orderly_suspend_millis(&cfg(900), &ctx(70)),
+            70,
+            "给了值就忽略配置"
+        );
         for (asked, expect) in [
             (0i64, 10u64),
             (9, 10),
@@ -6773,7 +7099,10 @@ mod tests {
         // 照常 ack。真把它当回滚，一个「返回 COMMIT 的监听器」会让这条队列原地卡死。
         for status in [ConsumeOrderlyStatus::Commit, ConsumeOrderlyStatus::Rollback] {
             let h = OrderlyHarness::new(0, status);
-            assert!(h.run(orderly_batch(0, &[0])).await, "{status:?} 应按整批认可处理");
+            assert!(
+                h.run(orderly_batch(0, &[0])).await,
+                "{status:?} 应按整批认可处理"
+            );
             assert_eq!(h.offset(), 1, "{status:?} 位点必须前进");
             assert_eq!(h.pending(), vec![], "{status:?} 不该回投");
         }
@@ -6868,11 +7197,17 @@ mod tests {
         ];
         for (status, expect) in cases {
             let h = OrderlyHarness::new_manual(0, status);
-            let r = h
-                .c
-                .consume_message_directly(orderly_batch(0, &[0]).remove(0), Some("broker-a".to_string()))
+            let r =
+                h.c.consume_message_directly(
+                    orderly_batch(0, &[0]).remove(0),
+                    Some("broker-a".to_string()),
+                )
                 .expect("direct consume must not error");
-            assert_eq!(r.consume_result.as_deref(), Some(expect), "{status:?} 的映射");
+            assert_eq!(
+                r.consume_result.as_deref(),
+                Some(expect),
+                "{status:?} 的映射"
+            );
             assert!(r.order, "{status:?}: 顺序 listener 必须报 order=true");
             assert!(
                 !r.auto_commit,
@@ -7194,7 +7529,11 @@ mod tests {
         submit_pop_orderly_request(&inner, pq2.clone(), q0.clone(), false).await;
         assert_eq!(consumer.pop_orderly_request_count(), 3, "pq 不同算新请求");
         submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), true).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 3, "force 只放行投递，不加集合条目");
+        assert_eq!(
+            consumer.pop_orderly_request_count(),
+            3,
+            "force 只放行投递，不加集合条目"
+        );
     }
 
     /// Java :228-235：run 里发现队列已撤 → 记 warn 日志并把自己从集合里摘掉。
@@ -7209,7 +7548,11 @@ mod tests {
         assert_eq!(consumer.pop_orderly_request_count(), 1);
         pq.set_dropped(true);
         submit_pop_orderly_request(&inner, pq.clone(), mq.clone(), true).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 0, "已撤队列：出集，不滞留");
+        assert_eq!(
+            consumer.pop_orderly_request_count(),
+            0,
+            "已撤队列：出集，不滞留"
+        );
 
         // 先撤再提交：进得了集合，run 立刻又把它摘掉
         let pq2 = PopProcessQueue::new();
@@ -7356,7 +7699,10 @@ mod tests {
             .iter()
             .map(|(k, _)| format!("{}{}{}", k.topic, k.broker_name, k.queue_id))
             .collect();
-        assert_eq!(keys, vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]);
+        assert_eq!(
+            keys,
+            vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]
+        );
         assert!(
             info.mq_table.is_empty(),
             "pop 模式没有拉取队列，mqTable 必须为空（Java processQueueTable 同）"
@@ -7452,11 +7798,7 @@ mod tests {
         stamp_pull_at(&consumer.inner, &key, true);
         let popped = {
             let state = lock(&consumer.inner.state);
-            assert!(!pull_stalled_locked(
-                &state,
-                &key,
-                current_time_millis()
-            ));
+            assert!(!pull_stalled_locked(&state, &key, current_time_millis()));
             pq.last_pop_timestamp.load(Ordering::SeqCst)
         };
         assert!(current_time_millis() - popped < 5000);
@@ -7478,7 +7820,10 @@ mod tests {
             .insert(other.clone(), 7);
         mark_pull_loop_exited(&consumer.inner, &other, 999); // 令牌对不上
         assert_eq!(
-            lock(&consumer.inner.state).last_pull_at.get(&other).copied(),
+            lock(&consumer.inner.state)
+                .last_pull_at
+                .get(&other)
+                .copied(),
             Some(555)
         );
     }
@@ -7502,7 +7847,9 @@ mod tests {
             state.pop_queues.insert(key.clone(), pq.clone());
             // 在途批次的清扫视图：撤销后旧批次的引用不能留着（
             // Java cleanExpireMsg 只遍历 processQueueTable，摘掉的队列扫不到）
-            state.inflight_msgs.insert(key.clone(), vec![ext("T", None)]);
+            state
+                .inflight_msgs
+                .insert(key.clone(), vec![ext("T", None)]);
         }
         let mut revoked = Vec::new();
         let mut state = lock(&consumer.inner.state);
@@ -7593,7 +7940,9 @@ mod tests {
             state.queue_owners.insert(key.clone(), 999);
             state.mq_map.insert(key.clone(), mq.clone());
             state.consume_offsets.insert(key.clone(), 42);
-            state.pending.insert(key.clone(), VecDeque::from(vec![ext("T", None)]));
+            state
+                .pending
+                .insert(key.clone(), VecDeque::from(vec![ext("T", None)]));
             state.offset_table.insert(key.clone(), 7);
             state
                 .last_pull_at
@@ -7631,7 +7980,9 @@ mod tests {
             state.queue_owners.insert(key.clone(), 5);
             state.mq_map.insert(key.clone(), mq.clone());
             state.consume_offsets.insert(key.clone(), 42);
-            state.pending.insert(key.clone(), VecDeque::from(vec![ext("T", None)]));
+            state
+                .pending
+                .insert(key.clone(), VecDeque::from(vec![ext("T", None)]));
             state
                 .last_pull_at
                 .insert(key.clone(), current_time_millis());
@@ -7681,15 +8032,15 @@ mod tests {
             state.mq_map.insert(key.clone(), mq.clone());
             state.pop_queues.insert(key.clone(), old.clone());
         }
-        stamp_at(&consumer, &key, current_time_millis() - PULL_MAX_IDLE_TIME - 1);
+        stamp_at(
+            &consumer,
+            &key,
+            current_time_millis() - PULL_MAX_IDLE_TIME - 1,
+        );
         consumer.rebalance_pull_threads().await;
         let state = lock(&consumer.inner.state);
         assert!(old.is_dropped());
-        let fresh = state
-            .pop_queues
-            .get(&key)
-            .cloned()
-            .expect("rebuilt");
+        let fresh = state.pop_queues.get(&key).cloned().expect("rebuilt");
         assert!(!Arc::ptr_eq(&old, &fresh));
         assert!(!fresh.is_dropped());
         assert_ne!(state.queue_owners.get(&key).copied(), Some(999));
@@ -7720,7 +8071,10 @@ mod tests {
             .insert(mq_key(&other), other.clone());
         let info = consumer.consumer_running_info();
         let pqi = &info.mq_table[1].1;
-        assert_eq!(pqi.get("lastPullTimestamp"), Some(&serde_json::Value::from(0)));
+        assert_eq!(
+            pqi.get("lastPullTimestamp"),
+            Some(&serde_json::Value::from(0))
+        );
     }
 
     /// POP 的运维视图暴露 `lastPopTimestamp`（Java 的 pop 视图本没有这个字段，
@@ -7780,7 +8134,10 @@ mod tests {
     #[test]
     fn local_offsets_build_uses_java_object_as_key_format() {
         let text = build_local_offsets_json(
-            &BTreeMap::from([("Ttbroker-a0".to_string(), 7), ("Ttbroker-a1".to_string(), 9)]),
+            &BTreeMap::from([
+                ("Ttbroker-a0".to_string(), 7),
+                ("Ttbroker-a1".to_string(), 9),
+            ]),
             &test_mq_map(),
         );
         assert!(text.starts_with("{\"offsetTable\":{"));
@@ -7867,7 +8224,10 @@ mod tests {
         )
         .unwrap();
         // .bak = 上一代内容（Java MixAll.string2File 语义）
-        assert_eq!(std::fs::read_to_string(path.with_file_name("offsets.json.bak")).unwrap(), raw);
+        assert_eq!(
+            std::fs::read_to_string(path.with_file_name("offsets.json.bak")).unwrap(),
+            raw
+        );
 
         // 主文件在 → 读主文件；主文件缺失 → .bak（上一代）
         let loaded = load_local_offsets_at(&path);
@@ -7917,13 +8277,19 @@ mod tests {
     fn pull_subscription_expression_follows_java_default() {
         let s = sub(P5_TOPIC, "TagA");
         // 默认关闭
-        assert_eq!(pull_subscription_expression(&ConsumerConfig::default(), &s), None);
+        assert_eq!(
+            pull_subscription_expression(&ConsumerConfig::default(), &s),
+            None
+        );
         // 打开
         let cfg = ConsumerConfig {
             post_subscription_when_pull: true,
             ..ConsumerConfig::default()
         };
-        assert_eq!(pull_subscription_expression(&cfg, &s).as_deref(), Some("TagA"));
+        assert_eq!(
+            pull_subscription_expression(&cfg, &s).as_deref(),
+            Some("TagA")
+        );
         // 类过滤模式：即使打开也不上送（表达式是过滤类名，broker 侧 TAG 过滤会误判）
         let mut class_mode = sub(P5_TOPIC, "com.example.MyFilter");
         class_mode.class_filter_mode = true;
@@ -7940,7 +8306,11 @@ mod tests {
         let other = MessageQueue::new(P5_TOPIC, "broker-a", 1);
         let master = i64::from(MixAll::MASTER_ID);
 
-        assert_eq!(recalc_pull_from_which_node(&state, &mq), master, "首轮打主节点");
+        assert_eq!(
+            recalc_pull_from_which_node(&state, &mq),
+            master,
+            "首轮打主节点"
+        );
 
         // 老 broker 不带 suggest：按 master 记账，而不是保留旧值
         update_pull_from_which_node(&mut state, &mq, Some(master + 1));
@@ -8100,11 +8470,7 @@ mod tests {
                 state.consume_offsets.get(&self.key).copied()
             };
             let _ = self.entered.send(observed);
-            let _ = self
-                .release
-                .lock()
-                .expect("release lock")
-                .blocking_recv();
+            let _ = self.release.lock().expect("release lock").blocking_recv();
             ConsumeConcurrentlyStatus::ConsumeSuccess
         }
     }
@@ -8140,7 +8506,9 @@ mod tests {
             for m in batch.iter_mut() {
                 m.topic = CTO_TOPIC.to_string();
             }
-            state.pending.insert(key.clone(), batch.into_iter().collect());
+            state
+                .pending
+                .insert(key.clone(), batch.into_iter().collect());
         }
         c.inner.started.store(true, Ordering::Release);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -8161,7 +8529,13 @@ mod tests {
         release_tx.send(()).expect("release 通道已关闭");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if lock(&c.inner.state).inflight.get(&key).copied().unwrap_or(0) == 0 {
+            if lock(&c.inner.state)
+                .inflight
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                == 0
+            {
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline, "批次未在 5s 内结清");
@@ -8203,7 +8577,11 @@ mod tests {
     fn clean_expire_period_equals_consume_timeout_minutes() {
         assert_eq!(clean_expire_period_millis(15), 900_000, "默认 15 分钟");
         assert_eq!(clean_expire_period_millis(1), 60_000);
-        assert_eq!(clean_expire_period_millis(0), 60_000, "0 钳到 1 分钟，别忙等");
+        assert_eq!(
+            clean_expire_period_millis(0),
+            60_000,
+            "0 钳到 1 分钟，别忙等"
+        );
         assert_eq!(clean_expire_period_millis(-3), 60_000);
     }
 
@@ -8225,7 +8603,10 @@ mod tests {
     #[test]
     fn is_consume_expired_is_strict_and_ignores_missing_stamps() {
         let now = 10_000_000i64;
-        assert!(is_consume_expired(Some(now - 60_001), now, 1), "刚过阈值 1ms");
+        assert!(
+            is_consume_expired(Some(now - 60_001), now, 1),
+            "刚过阈值 1ms"
+        );
         assert!(
             !is_consume_expired(Some(now - 60_000), now, 1),
             "恰好等于阈值：严格大于才动手"
@@ -8250,7 +8631,10 @@ mod tests {
             head.queue_offset = 0;
             let mut tail = ext("T", None); // 尾巴过期了也不该动
             tail.queue_offset = 1;
-            tail.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+            tail.put_property(
+                PROPERTY_CONSUME_START_TIMESTAMP,
+                &(now - 120_000).to_string(),
+            );
             state
                 .pending
                 .insert(key.clone(), VecDeque::from(vec![head, tail]));
@@ -8277,7 +8661,10 @@ mod tests {
             state.pending.insert(key.clone(), VecDeque::from(vec![m]));
         }
         assert_eq!(clean_expired_queue(&consumer.inner, &key).await, 0);
-        assert_eq!(lock(&consumer.inner.state).pending.get(&key).unwrap().len(), 1);
+        assert_eq!(
+            lock(&consumer.inner.state).pending.get(&key).unwrap().len(),
+            1
+        );
     }
 
     /// 回投失败（未 start 的消费者）→ 条目原地保留、下一轮还是它；单轮内 Java 会对
@@ -8291,7 +8678,10 @@ mod tests {
         let expired = |off: i64| {
             let mut m = ext("T", None);
             m.queue_offset = off;
-            m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+            m.put_property(
+                PROPERTY_CONSUME_START_TIMESTAMP,
+                &(now - 120_000).to_string(),
+            );
             m
         };
         {
@@ -8325,11 +8715,16 @@ mod tests {
             .map(|i| {
                 let mut m = ext("T", None);
                 m.queue_offset = i;
-                m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+                m.put_property(
+                    PROPERTY_CONSUME_START_TIMESTAMP,
+                    &(now - 120_000).to_string(),
+                );
                 m
             })
             .collect();
-        lock(&consumer.inner.state).pending.insert(key.clone(), batch.into());
+        lock(&consumer.inner.state)
+            .pending
+            .insert(key.clone(), batch.into());
         assert_eq!(
             clean_expired_queue(&consumer.inner, &key).await,
             16,
@@ -8371,7 +8766,9 @@ mod tests {
         state
             .inflight_msgs
             .insert(key.clone(), vec![msg(0), msg(1)]);
-        state.pending.insert(key.clone(), VecDeque::from(vec![msg(0)]));
+        state
+            .pending
+            .insert(key.clone(), VecDeque::from(vec![msg(0)]));
         assert!(remove_expired_entry_if_still_head(&mut state, &key, 0));
         assert_eq!(
             state.inflight_msgs.get(&key).unwrap().len(),
@@ -8383,7 +8780,9 @@ mod tests {
         // 前面冒出了更小的位点：让位，不许抢摘
         let mut state = State::default();
         state.inflight_msgs.insert(key.clone(), vec![msg(5)]);
-        state.pending.insert(key.clone(), VecDeque::from(vec![msg(3)]));
+        state
+            .pending
+            .insert(key.clone(), VecDeque::from(vec![msg(3)]));
         assert!(!remove_expired_entry_if_still_head(&mut state, &key, 5));
         assert_eq!(state.inflight_msgs.get(&key).unwrap().len(), 1);
 
@@ -8405,7 +8804,9 @@ mod tests {
         {
             let mut state = lock(&consumer.inner.state);
             state.inflight_msgs.insert(key.clone(), vec![msg(1)]);
-            state.pending.insert(key.clone(), VecDeque::from(vec![msg(2), msg(1)]));
+            state
+                .pending
+                .insert(key.clone(), VecDeque::from(vec![msg(2), msg(1)]));
             assert_eq!(
                 process_queue_entries_locked(&state, &key).len(),
                 2,
@@ -8471,13 +8872,17 @@ mod tests {
     #[test]
     fn send_back_lookup_ignores_started_flag_until_instance_is_taken() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
-        assert!(require_client(&consumer.inner).is_err(), "公开路径仍要 started 门");
+        assert!(
+            require_client(&consumer.inner).is_err(),
+            "公开路径仍要 started 门"
+        );
         assert!(
             require_client_for_send_back(&consumer.inner).is_err(),
             "没有实例谁都不放行"
         );
 
-        *lock(&consumer.inner.client) = Some(MQClientInstance::new("gid-shutdown-sendback", vec![]));
+        *lock(&consumer.inner.client) =
+            Some(MQClientInstance::new("gid-shutdown-sendback", vec![]));
         // shutdown() 的第一步：先置 false 再排空在途批次。
         consumer.inner.started.store(false, Ordering::Release);
         assert!(require_client(&consumer.inner).is_err());
@@ -8531,9 +8936,7 @@ mod tests {
             let entries = process_queue_entries_locked(&state, &key);
             assert_eq!(entries.len(), 2, "在途批次要出现在清扫视图里");
             assert!(
-                entries
-                    .iter()
-                    .all(|m| consume_start_timestamp(m).is_some()),
+                entries.iter().all(|m| consume_start_timestamp(m).is_some()),
                 "登记进视图的副本必须已盖 CONSUME_START_TIME"
             );
             assert!(
@@ -8574,7 +8977,10 @@ mod tests {
         let expired = {
             let mut m = ext("T", None);
             m.queue_offset = 0;
-            m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &(now - 120_000).to_string());
+            m.put_property(
+                PROPERTY_CONSUME_START_TIMESTAMP,
+                &(now - 120_000).to_string(),
+            );
             m
         };
         {
@@ -8584,7 +8990,9 @@ mod tests {
                 .pending
                 .insert(held.clone(), VecDeque::from(vec![expired.clone()]));
             // 另一个队列不在 mq_map 里（已撤）：即便缓冲里还残留也不该被扫到
-            state.pending.insert(other.clone(), VecDeque::from(vec![expired]));
+            state
+                .pending
+                .insert(other.clone(), VecDeque::from(vec![expired]));
         }
         assert_eq!(
             clean_expired_msg_once(&consumer.inner).await,
@@ -8777,8 +9185,15 @@ mod tests {
         assert!(!state.consume_offsets.contains_key(&h.key));
         assert!(!state.mq_map.contains_key(&h.key));
         assert!(!state.queue_owners.contains_key(&h.key));
-        assert!(!state.last_pull_at.contains_key(&h.key), "同名队列复用时不能继承旧时刻");
-        assert_eq!(state.queue_epoch.get(&h.key).copied(), Some(1), "代号 +1（setDropped）");
+        assert!(
+            !state.last_pull_at.contains_key(&h.key),
+            "同名队列复用时不能继承旧时刻"
+        );
+        assert_eq!(
+            state.queue_epoch.get(&h.key).copied(),
+            Some(1),
+            "代号 +1（setDropped）"
+        );
         assert!(state.frozen_offsets.contains(&h.key), "冻结要留到队列重建");
     }
 
@@ -8787,7 +9202,11 @@ mod tests {
         // 队列已经不在本实例名下（并发撤销）：没有 mq 就没有可落盘的对象，不能凭空造一条
         let h = IllegalHarness::new(false, 0);
         assert!(h.retire().is_empty());
-        assert_eq!(h.epoch(), 1, "撤队列照样清状态 + 代号前进（重建是调用方的下一步）");
+        assert_eq!(
+            h.epoch(),
+            1,
+            "撤队列照样清状态 + 代号前进（重建是调用方的下一步）"
+        );
     }
 
     #[test]
@@ -8796,7 +9215,11 @@ mod tests {
         h.retire();
         assert_eq!(h.epoch(), 1);
         h.retire();
-        assert_eq!(h.epoch(), 2, "重建前又出一次非法：代号继续前进，旧批次依旧作废");
+        assert_eq!(
+            h.epoch(),
+            2,
+            "重建前又出一次非法：代号继续前进，旧批次依旧作废"
+        );
     }
 
     #[tokio::test]
@@ -8853,7 +9276,10 @@ mod tests {
         // 重建：把队列重新划给自己（`rebalance_pull_threads` 的建分支）
         lock(&h.c.inner.state).assigned = vec![h.mq.clone()];
         h.c.rebalance_pull_threads().await;
-        assert!(!h.frozen(), "新 ProcessQueue 就位就该解冻，否则队列从此只拉不 ack");
+        assert!(
+            !h.frozen(),
+            "新 ProcessQueue 就位就该解冻，否则队列从此只拉不 ack"
+        );
         // 重建后 ack 恢复正常：只有**新代号**的批次算数，旧代号的依旧作废
         h.ack(&[0, 1], 0);
         assert_eq!(h.offset(), None, "旧代号的 ack 还是不许动位点");
@@ -8873,7 +9299,11 @@ mod tests {
             .await
             .expect("consume_batch must not error");
         assert!(!done);
-        assert_eq!(listener.calls.load(Ordering::SeqCst), 0, "连 listener 都不该进");
+        assert_eq!(
+            listener.calls.load(Ordering::SeqCst),
+            0,
+            "连 listener 都不该进"
+        );
         assert_eq!(h.offset(), Some(3), "旧批次不动位点");
     }
 
@@ -8884,7 +9314,9 @@ mod tests {
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         h.c.set_message_listener_concurrently(listener.clone());
-        lock(&h.c.inner.state).consume_offsets.insert(h.key.clone(), 0);
+        lock(&h.c.inner.state)
+            .consume_offsets
+            .insert(h.key.clone(), 0);
         let done = consume_batch(&h.c.inner, &h.key, &h.mq, offset_batch(2), Some(1))
             .await
             .expect("consume_batch must not error");
@@ -8896,7 +9328,9 @@ mod tests {
     #[test]
     fn stale_epoch_ack_is_dropped_and_current_epoch_advances() {
         let h = IllegalHarness::new(true, 1);
-        lock(&h.c.inner.state).consume_offsets.insert(h.key.clone(), 0);
+        lock(&h.c.inner.state)
+            .consume_offsets
+            .insert(h.key.clone(), 0);
         h.ack(&[0, 1, 2], 0);
         assert_eq!(h.offset(), Some(0), "旧代号的 ack 不能动位点");
         h.ack(&[0, 1, 2], 1);
@@ -8914,7 +9348,9 @@ mod tests {
             state.mq_map.insert(other_key.clone(), other.clone());
             state.queue_owners.insert(other_key.clone(), 2);
             state.consume_offsets.insert(other_key.clone(), 7);
-            state.last_pull_at.insert(other_key.clone(), 1_700_000_000_000);
+            state
+                .last_pull_at
+                .insert(other_key.clone(), 1_700_000_000_000);
         }
         h.freeze(0);
         h.retire();
@@ -8964,7 +9400,9 @@ mod tests {
                 state.queue_owners.insert(key.clone(), 1);
                 state.offset_table.insert(key.clone(), 7);
                 state.consume_offsets.insert(key.clone(), 7);
-                state.pending.insert(key.clone(), VecDeque::from(offset_batch(2)));
+                state
+                    .pending
+                    .insert(key.clone(), VecDeque::from(offset_batch(2)));
                 state.last_pull_at.insert(key.clone(), 1_700_000_000_000);
             }
             ResetHarness { c, key, mq }
@@ -9029,14 +9467,19 @@ mod tests {
             state.queue_owners.insert(other_key.clone(), 2);
             state.offset_table.insert(other_key.clone(), 9);
             state.consume_offsets.insert(other_key.clone(), 9);
-            state.last_pull_at.insert(other_key.clone(), 1_700_000_000_000);
+            state
+                .last_pull_at
+                .insert(other_key.clone(), 1_700_000_000_000);
         }
         // offsetTable 只含 0 号队列：同 topic 的 1 号队列不受牵连
         h.reset(0).await;
         {
             let state = lock(&h.c.inner.state);
             assert!(state.mq_map.contains_key(&other_key));
-            assert!(!state.pending.contains_key(&other_key), "1 号队列本来就没有缓冲");
+            assert!(
+                !state.pending.contains_key(&other_key),
+                "1 号队列本来就没有缓冲"
+            );
             assert_eq!(state.consume_offsets.get(&other_key).copied(), Some(9));
             assert_eq!(state.queue_epoch.get(&other_key).copied().unwrap_or(0), 0);
             assert_eq!(state.queue_owners.get(&other_key).copied(), Some(2));
@@ -9049,7 +9492,10 @@ mod tests {
         assert_eq!(h.epoch(), 1, "上一笔的代号不回退");
         assert_eq!(h.offset(), None);
         assert_eq!(
-            lock(&h.c.inner.state).consume_offsets.get(&other_key).copied(),
+            lock(&h.c.inner.state)
+                .consume_offsets
+                .get(&other_key)
+                .copied(),
             Some(9)
         );
     }

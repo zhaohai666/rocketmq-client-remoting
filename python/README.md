@@ -1,5 +1,7 @@
 # rocketmq-client-remoting (Python)
 
+> 中文 ｜ [English](README.en.md)
+
 RocketMQ 经典 remoting 协议的 Python 实现，Python 进程可以直接用
 **JSON / RocketMQ 二进制** 两种序列化方式与 NameServer、Broker 通信。
 兼容 4.x / 5.x 服务端，全部能力在真实 5.5.1 集群上联调验证过；
@@ -9,7 +11,7 @@ RocketMQ 经典 remoting 协议的 Python 实现，Python 进程可以直接用
 
 ```bash
 pip install -e .
-pytest -q                     # 1160 passed + 4 skipped（skip 为可选压缩依赖相关）
+pytest -q                     # 1163 passed + 4 skipped（skip 为可选压缩依赖相关）
 python selfcheck.py           # 协议编解码回环自检（7 项，无需集群；在 python/ 目录下执行）
 ```
 
@@ -58,8 +60,9 @@ consumer.shutdown()
 | 传输层 | `RemotingClient`：同步 / 异步 / oneway、半包重组、opaque 匹配、重连、连接判死、TLS |
 | 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData`、动态 name server |
 | 生产者 | 同步 / 定点 / 选择器 / 异步（含批量异步与背压信号量）/ 单向 / 批量 / 事务两阶段 / `recallMessage`(370) |
-| 消费者 | `DefaultMQPushConsumer`（并发 / 顺序监听、流控五阈值、位点修正与重置、停摆自愈、挂起消息清扫）、`DefaultMQPullConsumer`、`DefaultLitePullConsumer`（三张位点表）、POP 消费循环 |
+| 消费者 | `DefaultMQPushConsumer`（并发 / 顺序监听、流控五阈值、位点修正与重置、停摆自愈、挂起消息清扫）、`DefaultMQPullConsumer`（`fetch_subscribe_message_queues` 给整个 topic，`fetch_message_queues_in_balance` 只给本实例应得的那份）、`DefaultLitePullConsumer`（三张位点表）、POP 消费循环 |
 | 队列分配 | AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY |
+| 命名空间 | 两套彼此独立：`namespace`（客户端本地资源名前缀 `%%ns%%res`，Java `NamespaceUtil`，收发/心跳/位点全线包装与还原）与 `namespace_v2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`；钩子顺序 Namespace → Stream → ACL，所以 `ns` 与 `ReqT` 都在 ACL 签名内容里）。生产者 / 三种消费者 / 管理端 / 轨迹分发器都读 `namespace_v2`（每笔请求现读，不是启动期快照） |
 | 管理端 | `DefaultMQAdminExt` 全套：topic/订阅组配置、位点查询与重置、消费组连接查询、消息查询 |
 | 观测与安全 | 消息轨迹（Pub/SubBefore/SubAfter/EndTransaction/Recall 编解码 + 异步分发）、Send/Consume/EndTransaction 钩子、ACL 签名 |
 | 压缩 | zlib（标准库）/ LZ4 / ZSTD；类型位 0/3 = ZLIB；未支持类型必须抛错（不透传压缩字节） |
@@ -117,19 +120,27 @@ python verify_latency_live.py             # 故障规避（延迟窗口/隔离/�
 任何脚本失败以非 0 退出码结束。部分脚本对集群有额外要求，已在上面逐条注明
 （停/启 broker、需要从节点、需要开关 broker 配置并在退出时还原等）。
 
+**POP 的队列来自客户端 rebalance，不是 broker 分配**：Java 在 `clientRebalance=false` 时问 broker
+（`RebalanceImpl#getRebalanceResultFromBroker:345` → `MQClientAPIImpl#queryAssignment:405`，
+QUERY_ASSIGNMENT=400，回 `MessageQueueAssignment` mode=POP）。本端口**刻意不实现那条路径**（七端
+同一决定，见 `client/consumer.py` 的类头注释）：队列由本地分配策略算出，再每队列一个 POP 循环 + ack。
+语义等价，差别只在"谁决定队列集合"。
+
 ## 客户端日志
 
 `rocketmq_logging.py` 把内部日志桥接到标准 `logging`：
 
-- 文件落在 `$HOME/logs/rocketmqlogs/rocketmq_py_client.log`，按天滚动，
-  备份名 `rocketmq_py_client.log.YYYY-MM-DD`，保留 `ROCKETMQ_CLIENT_LOG_MAX_INDEX`（默认 10）份；
+- 文件落在 **`<当前工作目录>/logs/rocketmqlogs/rocketmq_py_client.log`**（刻意不写用户 HOME：
+  Python 客户端常被当脚本嵌进别人的进程，在 `$HOME` 下悄悄建目录写文件是越界副作用；
+  要 Java 口径时显式设 `ROCKETMQ_CLIENT_LOG_DIR=$HOME/logs/rocketmqlogs`），按天滚动，
+  备份名 `rocketmq_py_client.log.YYYY-MM-DD`，保留 `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX`（默认 10）份；
 - 同时输出到 stderr（可用 `ROCKETMQ_CLIENT_LOG_USE_STDOUT=false` 关掉）；
 - 若宿主程序已配置过 Python logging（root 已有 handler），则**完全不插手**，
   把日志交给宿主的配置。
 
 环境变量：`ROCKETMQ_CLIENT_LOG_DIR` / `ROCKETMQ_CLIENT_LOG_FILE` /
-`ROCKETMQ_CLIENT_LOG_LEVEL` / `ROCKETMQ_CLIENT_LOG_MAX_INDEX` /
-`ROCKETMQ_CLIENT_LOG_USE_STDOUT`。
+`ROCKETMQ_CLIENT_LOG_LEVEL` / `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` /
+`ROCKETMQ_CLIENT_LOG_USE_STDOUT`（级别同时认 `WARN`/`WARNING`、`TRACE`/`DEBUG` 两种写法）。
 
 > 📌 默认文件名 `rocketmq_py_client.log` 与其它语言端口的文件名刻意不同：
 > 各端口轮转策略不同（Python 按天重命名），落到同一文件会互相插行。

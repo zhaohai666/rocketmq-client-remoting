@@ -87,6 +87,9 @@ void AsyncTraceDispatcher::start(const std::string& nameSrvAddr, AccessChannel a
             traceProducer_->setNamesrvAddr(nameSrvAddr);
             traceProducer_->setInstanceName(
                 std::string(TraceConstants::TRACE_INSTANCE_NAME) + "_" + nameSrvAddr);
+            // Java `AsyncTraceDispatcher.start():155`：轨迹生产者继承宿主的 5.x 命名空间，
+            // 必须在 traceProducer_->start()（钩子装链）之前设好，首包才带上 nsd/ns。
+            traceProducer_->setNamespaceV2(namespaceV2_);
             traceProducer_->start();
             started_.store(true);
         }

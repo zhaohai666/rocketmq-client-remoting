@@ -93,6 +93,14 @@ class DefaultMQAdminExt
     public bool $enableStreamRequestType = false;
 
     /**
+     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
+     * 与 `$namespace`（客户端给资源名拼 `namespace%` 前缀）是两套机制，这里**不**改
+     * 任何资源名。见 NamespaceRpcHook。
+     */
+    public string $namespaceV2 = '';
+
+    /**
      * Java ``ClientConfig#vipChannelEnabled``（5.x 默认 false）：true 时 broker 请求
      * 改走 VIP 端口（端口 - 2）。只对本 admin 的 broker 调用生效——admin 不发消息、
      * 不注册消费者。
@@ -181,6 +189,25 @@ class DefaultMQAdminExt
         $this->enableStreamRequestType = $enable;
     }
 
+    /**
+     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
+     * 不改资源名；与 `$namespace` 那套「客户端拼前缀」的机制互不相干。
+     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     */
+    public function setNamespaceV2(string $namespaceV2): void
+    {
+        $this->namespaceV2 = $namespaceV2;
+        if ($this->mqClient !== null) {
+            $this->mqClient->namespaceV2 = $namespaceV2;
+        }
+    }
+
+    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    public function getNamespaceV2(): string
+    {
+        return $this->namespaceV2;
+    }
+
     /** 对应 Java ``ClientConfig#setVipChannelEnabled``。 */
     public function setVipChannelEnabled(bool $enable): void
     {
@@ -230,6 +257,7 @@ class DefaultMQAdminExt
             $this->nameServerAddrs,
             tlsEnable: $this->tlsEnable,
             enableStreamRequestType: $this->enableStreamRequestType,
+            namespaceV2: $this->namespaceV2,
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,

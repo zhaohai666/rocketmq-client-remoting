@@ -108,6 +108,38 @@ class AclClientRPCHook(RPCHook):
 AclRPCHook = AclClientRPCHook
 
 
+class NamespaceRpcHook(RPCHook):
+    """namespaceV2 请求头钩子（对应 org.apache.rocketmq.client.rpchook.NamespaceRpcHook）。
+
+    Java 的 `doBeforeRequest` 只有一个 `StringUtils.isNotEmpty` 守卫：namespaceV2
+    非空时给每笔请求加两个扩展字段::
+
+        nsd = "true"            （MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD）
+        ns  = <namespaceV2>     （MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD）
+
+    这是 5.x 的**服务端**命名空间机制（阿里云 serverless 实例 id 之类，broker 据
+    请求头解析真实 topic），与旧 `namespace` 字段在客户端拼 topic 名的机制无关。
+
+    未配置时**什么都不做**：不得创建空的 extFields（Java 单测
+    `NamespaceRpcHookTest#testDoBeforeRequestWithoutNamespace` 断言 getExtFields()
+    仍为 null）。`doAfterResponse` 与 Java 一样是空实现。
+
+    ⚠ 注册顺序见 `client/mq_client.py` 的 `MQClientInstance.__init__`：本钩子必须
+    排在 Stream 钩子与用户钩子（ACL 签名）**之前**（Java `MQClientAPIImpl:329-335`），
+    这样 `nsd`/`ns` 才会被算进 ACL 签名内容。
+    """
+
+    def __init__(self, namespace_v2: Optional[str] = None):
+        self.namespace_v2 = namespace_v2 or ""
+
+    def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:
+        if not self.namespace_v2:
+            return
+        request.add_ext_field(MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD, "true")
+        request.add_ext_field(MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD,
+                              self.namespace_v2)
+
+
 class StreamTypeRPCHook(RPCHook):
     """给每个请求打上请求类型标记
     （对应 org.apache.rocketmq.remoting.rpchook.StreamTypeRPCHook）。
@@ -129,4 +161,4 @@ class StreamTypeRPCHook(RPCHook):
 
 
 __all__ = ["RPCHook", "SessionCredentials", "AclClientRPCHook", "AclRPCHook",
-           "StreamTypeRPCHook"]
+           "NamespaceRpcHook", "StreamTypeRPCHook"]

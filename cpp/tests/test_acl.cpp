@@ -283,12 +283,29 @@ static void testComposeRequestHooksShape() {
     CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyUser) == nullptr,
           "user only => not wrapped in a chain");
 
-    // stream 开关会改变包装形态
+    // stream + 用户钩子：两个钩子必须成链，顺序由上面的链序保证
     CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(composeRequestHooks(true, user)) != nullptr,
           "stream + user => chained");
+    // 只剩一个钩子时不套链壳（与上面「只有用户钩子」同一形态）：门面只开 stream 就是这样
     const std::shared_ptr<RPCHook> onlyStream = composeRequestHooks(true, nullptr);
-    CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyStream) != nullptr,
-          "stream only => still chained");
+    CHECK(std::dynamic_pointer_cast<StreamTypeRPCHook>(onlyStream) != nullptr,
+          "stream only => the single StreamTypeRPCHook, unwrapped");
+    CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyStream) == nullptr,
+          "stream only => no chain shell around a single hook");
+
+    // 给了 namespaceV2 取值函数就装 Namespace 钩子（Java 无条件注册），此时 stream +
+    // namespace 两个钩子必须成链，且 Namespace 在前（nsd/ns 要进 ACL 签名内容）。
+    const std::shared_ptr<RPCHook> streamAndNs =
+        composeRequestHooks(true, nullptr, [] { return std::string("MQINST_shape"); });
+    auto nsStreamChain = std::dynamic_pointer_cast<ChainedRPCHook>(streamAndNs);
+    CHECK(nsStreamChain != nullptr, "stream + namespace getter => chained");
+    {
+        RemotingCommand cmd = makeRequest({{"topic", "T"}}, Bytes());
+        streamAndNs->doBeforeRequest("127.0.0.1:10911", cmd);
+        CHECK(cmd.getExtField(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD) == "MQINST_shape",
+              "namespace getter is read per request");
+        CHECK(cmd.getExtField(MixAll::REQ_T) == "0", "the same hook tags ReqT too");
+    }
     {
         RemotingCommand cmd = makeRequest({{"topic", "T"}}, Bytes());
         onlyStream->doBeforeRequest("127.0.0.1:10911", cmd);

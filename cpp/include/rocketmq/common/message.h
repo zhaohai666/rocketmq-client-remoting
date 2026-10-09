@@ -90,6 +90,20 @@ struct Message {
         properties[MessageConst::PROPERTY_DELAY_TIME_LEVEL] = std::to_string(level);
     }
     int32_t getDelayTimeLevel() const;
+    // 5.x 定时消息（Message.java:238-267）：写对应 TIMER_* 属性；getter 属性缺失
+    // 返回 0，值非法时与 Java Long.parseLong 一样**直接抛**，不静默当 0。
+    void setDelayTimeSec(int64_t sec) {
+        properties[MessageConst::PROPERTY_TIMER_DELAY_SEC] = std::to_string(sec);
+    }
+    int64_t getDelayTimeSec() const;
+    void setDelayTimeMs(int64_t timeMs) {
+        properties[MessageConst::PROPERTY_TIMER_DELAY_MS] = std::to_string(timeMs);
+    }
+    int64_t getDelayTimeMs() const;
+    void setDeliverTimeMs(int64_t timeMs) {
+        properties[MessageConst::PROPERTY_TIMER_DELIVER_MS] = std::to_string(timeMs);
+    }
+    int64_t getDeliverTimeMs() const;
     void setWaitStoreMsgOk(bool ok) {
         properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK] = ok ? "true" : "false";
     }

@@ -116,16 +116,17 @@ int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
 //
 // 一个 `MessageBatch` 只能有一个延时属性，所以任何一个 > 0 都不攒批。
 //
-// ⚠ cpp 的 `MessageConst` 还没有这三个常量（timer 消息本端口只在
-// `recall_message_handle.h` 里以字面量出现），所以这里用字面量而不是常量 ——
-// 与 python `_TIMER_DELAY_PROPERTIES` / C# `TimerDelayProperties` 同一份清单。
+// ⚠ cpp 的 `MessageConst` 现已提供这三个常量（PROPERTY_TIMER_DELAY_SEC/MS/DELIVER_MS，
+// MessageConst.java:73-74/112），这里直接用常量 —— 与 python `_TIMER_DELAY_PROPERTIES` /
+// C# `TimerDelayProperties` 同一份清单。
 //
 // 取值口径：`getDelayTimeLevel()` 与 python 一致 —— 属性缺失返回 0；**值非法时不吞**
 // （python 的 `int(raw)` 会抛，Java 的 `Integer/Long.parseLong` 也会抛）。
 int64_t maxDelayValue(const Message& msg) {
     int64_t result = msg.getDelayTimeLevel();
-    static const char* kTimerDelayProperties[] = {"TIMER_DELAY_MS", "TIMER_DELAY_SEC",
-                                                 "TIMER_DELIVER_MS"};
+    static const char* kTimerDelayProperties[] = {
+        MessageConst::PROPERTY_TIMER_DELAY_MS, MessageConst::PROPERTY_TIMER_DELAY_SEC,
+        MessageConst::PROPERTY_TIMER_DELIVER_MS};
     for (const char* name : kTimerDelayProperties) {
         auto it = msg.properties.find(name);
         if (it == msg.properties.end() || it->second.empty()) {
@@ -236,10 +237,12 @@ void DefaultMQProducer::start() {
         mqClient_->setTlsOptions(tlsOptions_);
     }
     // 请求钩子：必须在**任何请求发出之前**绑定（start() 里的路由拉取与心跳也要带签名，
-    // 开了 stream 时还要带 `ReqT`）。Java 把钩子绑在 MQClientAPIImpl 构造函数里，
-    // 这里同样先绑钩子再 start()。
+    // 开了 namespaceV2 时还要带 `nsd`/`ns`、开了 stream 时还要带 `ReqT`）。Java 把钩子绑在
+    // MQClientAPIImpl 构造函数里，这里同样先绑钩子再 start()。
+    // 传**取值函数**而非字符串：Java 每笔请求实时读 clientConfig.getNamespaceV2()。
     if (std::shared_ptr<RPCHook> requestHook =
-            composeRequestHooks(enableStreamRequestType_, rpcHook_)) {
+            composeRequestHooks(enableStreamRequestType_, rpcHook_,
+                                [this] { return namespaceV2_; })) {
         if (!mqClient_->registerRPCHook(requestHook)) {
             logger_warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
                         + clientId_ + ")");
@@ -278,6 +281,10 @@ void DefaultMQProducer::start() {
     // 消息轨迹：enableTrace=true 时建 AsyncTraceDispatcher 并注册 Send/EndTransaction 钩子。
     // 必须在心跳线程之前完成 —— 分发器内部生产者要先把轨迹 topic 的路由拉起来。
     startTraceDispatcher();
+
+    // RequestFutureHolder 的守护扫描（Java DefaultMQProducerImpl.start():291 —— 计数
+    // 引用，最后一个 shutdown 的生产者把扫描线程收掉）。
+    RequestFutureHolder::getInstance().startScheduledTask();
 
     // 心跳线程：周期性向 broker 注册 ProducerData。没有它 broker 无法主动回查事务。
     heartbeatRunning_.store(true);
@@ -355,6 +362,9 @@ void DefaultMQProducer::shutdown() {
     if (heartbeatThread_.joinable()) {
         heartbeatThread_.join();
     }
+    // RequestFutureHolder 守护扫描的计数注销（Java shutdown():319）。这里不持
+    // producer 的任何锁：扫描线程不回摸生产者成员，只动自己的表。
+    RequestFutureHolder::getInstance().shutdownScheduledTask();
     {
         std::vector<std::thread> txThreads;
         {
@@ -622,6 +632,9 @@ void DefaultMQProducer::startTraceDispatcher() {
     try {
         auto dispatcher = std::make_shared<AsyncTraceDispatcher>(
             producerGroup_, TraceDispatcherType::PRODUCE, traceMsgBatchNum_, traceTopic_, rpcHook_);
+        // Java AsyncTraceDispatcher.start():155 `traceProducer.setNamespaceV2(namespaceV2)`：
+        // 轨迹的内部生产者也要带上实例命名空间，否则 broker 侧把轨迹写到别的实例下。
+        dispatcher->setNamespaceV2(namespaceV2_);
         dispatcher->setHostProducer(this);
         dispatcher->setHostClientId(clientId_);
         dispatcher->start(getNamesrvAddr());

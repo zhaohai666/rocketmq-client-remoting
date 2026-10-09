@@ -17,6 +17,7 @@
 #ifndef ROCKETMQ_REMOTING_RPCHOOK_H
 #define ROCKETMQ_REMOTING_RPCHOOK_H
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -98,14 +99,40 @@ public:
     void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) override;
 };
 
+// 对应 org.apache.rocketmq.client.rpchook.NamespaceRpcHook：5.x 新命名空间
+// （`ClientConfig#namespaceV2`，阿里云实例 ID 形态）非空时，给每笔请求加两个扩展头
+// `nsd = "true"`、`ns = <namespaceV2>`（Java 用 StringUtils.isNotEmpty 做闸门，空命名空间
+// 时 extFields 一个键都不加 —— 不物化任何字段）；doAfterResponse 与 Java 同为空。
+//
+// 传入**取值函数**而非字符串：Java 每笔请求都实时读 `clientConfig.getNamespaceV2()`，
+// 运行期改配置要能跟着走（门面传 `[this]{ return namespaceV2_; }`，钩子与被读成员
+// 同属一个门面对象，生命周期一致）。
+//
+// 这是 **broker 侧**的命名空间机制：topic 名在本端不改写，由 broker 按请求头把资源
+// 解析到实例下 —— 与老 `namespace`（客户端把 topic 包成 "ns%topic"）是两套机制。
+// Java `MQClientAPIImpl:329` 把它注册在钩子链**最前**（Namespace → Stream → 用户），
+// 所以 `nsd`/`ns` 落在 ACL 签名**之内**，链序由 composeRequestHooks 统一还原。
+class NamespaceRpcHook : public RPCHook {
+public:
+    explicit NamespaceRpcHook(std::function<std::string()> namespaceV2)
+        : namespaceV2_(std::move(namespaceV2)) {}
+
+    void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) override;
+
+    // 与 Java 一致：收到响应后什么都不做（基类默认即空实现，这里不覆写）。
+
+private:
+    std::function<std::string()> namespaceV2_;
+};
+
 // 按注册顺序依次执行的组合钩子。
 //
 // Java 的传输层持有的是 RPCHook **列表**（`NettyRemotingAbstract#rpcHooks`，按注册顺序
 // 执行），本端口的 RemotingClient 只有一个钩子槽（first-wins），所以顺序靠组合还原。
-// 顺序在这里是语义而不是风格：Java `MQClientAPIImpl:329-332` 的注册顺序是
-// Namespace → Stream → 用户钩子（ACL），注释写明 "Inject stream rpc hook first to make
-// reserve field signature" —— `ReqT` 必须在签名**之前**写入，否则签的内容与真正上线的
-// extFields 不一致，broker 侧验签必然失败。
+// 顺序在这里是语义而不是风格：Java `MQClientAPIImpl:329-335` 的注册顺序是
+// Namespace → Stream → 用户钩子（ACL）→ DynamicalExtField，注释写明 "Inject stream rpc
+// hook first to make reserve field signature" —— `nsd`/`ns` 与 `ReqT` 都必须在签名**之前**
+// 写入，否则签的内容与真正上线的 extFields 不一致，broker 侧验签必然失败。
 class ChainedRPCHook : public RPCHook {
 public:
     explicit ChainedRPCHook(std::vector<std::shared_ptr<RPCHook>> hooks)
@@ -115,18 +142,26 @@ public:
     void doAfterResponse(const std::string& remoteAddr, const RemotingCommand& request,
                          const RemotingCommand* response) override;
 
+    // 链上的钩子（注册顺序）。单测用它直接断言 composeRequestHooks 装出来的链序。
+    const std::vector<std::shared_ptr<RPCHook>>& hooks() const { return hooks_; }
+
 private:
     std::vector<std::shared_ptr<RPCHook>> hooks_;
 };
 
-// 按 Java `MQClientAPIImpl:329-332` 的顺序装好请求钩子：StreamTypeRPCHook 在前、
-// 用户钩子（ACL 签名）在后；只开了 stream 或只有用户钩子时直接返回那一个，
-// 两者都没有时返回空（不注册钩子 = 零开销）。
+// 按 Java `MQClientAPIImpl:329-335` 的顺序装好请求钩子：NamespaceRpcHook（namespaceV2）
+// 在前、StreamTypeRPCHook 居中、用户钩子（ACL 签名）在后；只装需要的那些，只剩一个时
+// 直接返回那一个，一个都不需要时返回空（不注册钩子 = 零开销）。
+// namespaceV2Getter 给了就**无条件**装 NamespaceRpcHook（Java 也是无条件注册，命名空间
+// 在钩子内每笔请求现读，start() 之后再 setNamespaceV2 照样生效）；未传（空函数）才代表
+// 调用方没接线。
 //
 // 各 facade 在 start() 里统一走这里，顺序就不会写反 —— 反了会让 ACL 签名的内容
-// 里缺 `ReqT`，开鉴权的 broker 直接验签失败。
+// 里缺 `nsd`/`ns`/`ReqT`，开鉴权的 broker 直接验签失败。
 std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
-                                             const std::shared_ptr<RPCHook>& userHook);
+                                             const std::shared_ptr<RPCHook>& userHook,
+                                             const std::function<std::string()>& namespaceV2Getter =
+                                                 std::function<std::string()>());
 
 // ------------------------------------------------------------------ 原语// SHA1 / HMAC-SHA1 / 标准 Base64（带 '=' 填充）。导出出来是为了让单测能直接
 // 用 Java（AclProbe）与 Python 产出的固定向量逐字节对拍。

@@ -110,6 +110,12 @@ final class AsyncTraceDispatcher
     /** PHP 无线程：恒为 null（保留字段只为逐字对照 Python）。 */
     public mixed $worker = null;
     public AccessChannel $accessChannel = AccessChannel::LOCAL;
+    /**
+     * 对应 Java `AsyncTraceDispatcher.namespaceV2`：轨迹内部 producer 也走服务端命名空间
+     * （`nsd`/`ns` 扩展头），否则 serverless 实例里轨迹会被 broker 当默认实例丢掉。
+     * {@see start()} 里在 setInstanceName 之后、setEnableTrace 之前透传给 traceProducer
+     * （Java `AsyncTraceDispatcher:155` 的同位置）。
+     */
     public string $namespaceV2 = '';
     public mixed $hostProducer = null;
     public mixed $hostConsumer = null;
@@ -189,6 +195,22 @@ final class AsyncTraceDispatcher
         $this->hostConsumer = $host;
     }
 
+    /**
+     * 对应 Java `AsyncTraceDispatcher#setNamespaceV2`：宿主 producer/consumer 在
+     * 建轨迹分发器时把自己的 namespaceV2 灌进来（Java `DefaultMQProducer.start:384`
+     * 同位置），本类只存不校验；真正生效靠 {@see start()} 透传给 traceProducer。
+     */
+    public function setNamespaceV2(string $namespaceV2): void
+    {
+        $this->namespaceV2 = $namespaceV2;
+    }
+
+    /** 对应 Java `AsyncTraceDispatcher#getNamespaceV2`。 */
+    public function getNamespaceV2(): string
+    {
+        return $this->namespaceV2;
+    }
+
     /** 宿主客户端的 clientId（EndTransaction 轨迹的 clientHost 用它）。 */
     public function clientId(): string
     {
@@ -232,6 +254,11 @@ final class AsyncTraceDispatcher
                 $this->traceProducer->setInstanceName(
                     sprintf('%s_%s', TraceConstants::TRACE_INSTANCE_NAME, $nameSrvAddr)
                 );
+            }
+            // Java AsyncTraceDispatcher:155：轨迹 producer 必须继承宿主的 namespaceV2，
+            // 否则 serverless 实例下轨迹请求不带 nsd/ns，broker 按默认实例丢弃。
+            if (method_exists($this->traceProducer, 'setNamespaceV2')) {
+                $this->traceProducer->setNamespaceV2($this->namespaceV2);
             }
             if (method_exists($this->traceProducer, 'setEnableTrace')) {
                 $this->traceProducer->setEnableTrace(false);

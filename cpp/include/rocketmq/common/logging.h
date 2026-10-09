@@ -7,13 +7,13 @@
 //     避免常驻进程把单个日志文件撑到无限大。
 //
 // 配置（环境变量）：
-//   ROCKETMQ_CPP_LOG_LEVEL          = DEBUG | INFO | WARN | ERROR | OFF      （默认 INFO）
-//   ROCKETMQ_CPP_LOG_FILE           = 日志文件绝对路径
+//   ROCKETMQ_CLIENT_LOG_LEVEL          = DEBUG | INFO | WARN | ERROR | OFF      （默认 INFO）
+//   ROCKETMQ_CLIENT_LOG_FILE           = 日志文件绝对路径
 //                                     （默认 $HOME/logs/rocketmqlogs/rocketmq_cpp_client.log；
 //                                      设为 "OFF"/"NONE"/空串可关闭文件输出，只留 stderr）
-//   ROCKETMQ_CPP_LOG_FILE_MAX_SIZE  = 单文件上限字节数（默认 67108864 = 64MB，对齐 Java
+//   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE  = 单文件上限字节数（默认 67108864 = 64MB，对齐 Java
 //                                     logback 的 <maxFileSize>64MB</maxFileSize>；0 = 不轮转）
-//   ROCKETMQ_CPP_LOG_FILE_MAX_INDEX = 保留的备份份数（默认 10，对齐 Java
+//   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX = 保留的备份份数（默认 10，对齐 Java
 //                                     rocketmq.log.file.maxIndex；0 = 不保留备份）
 //
 // ⚠ 级别与文件路径在**首次写日志时**求值并缓存，因此必须在第一次日志输出前设置环境变量。
@@ -71,7 +71,7 @@ enum LogLevel {
 
 // ---------------------------------------------------------------- 级别
 inline int resolveDefaultLogLevel() {
-    const char* env = std::getenv("ROCKETMQ_CPP_LOG_LEVEL");
+    const char* env = std::getenv("ROCKETMQ_CLIENT_LOG_LEVEL");
     if (env == nullptr) return LOG_INFO;
     std::string s(env);
     for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -93,14 +93,14 @@ inline int logLevel() { return logLevelRef().load(std::memory_order_relaxed); }
 
 // 环境变量是否**显式**指定了级别。宿主程序若要"默认 INFO、但尊重外部显式配置"，
 // 写成 `if (!logLevelSetFromEnv()) setLogLevel(LOG_INFO);`，这样真机排查时
-// 直接 `ROCKETMQ_CPP_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
-inline bool logLevelSetFromEnv() { return std::getenv("ROCKETMQ_CPP_LOG_LEVEL") != nullptr; }
+// 直接 `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
+inline bool logLevelSetFromEnv() { return std::getenv("ROCKETMQ_CLIENT_LOG_LEVEL") != nullptr; }
 
 // ---------------------------------------------------------------- 轮转参数
 // Java logback: <maxFileSize>64MB</maxFileSize> + maxIndex 默认 10
 inline std::uintmax_t resolveLogFileMaxSize() {
     const std::uintmax_t kDefault = 64ull * 1024 * 1024;
-    const char* env = std::getenv("ROCKETMQ_CPP_LOG_FILE_MAX_SIZE");
+    const char* env = std::getenv("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE");
     if (env == nullptr) return kDefault;
     try {
         long long v = std::stoll(std::string(env));
@@ -111,7 +111,7 @@ inline std::uintmax_t resolveLogFileMaxSize() {
 }
 
 inline int resolveLogFileMaxIndex() {
-    const char* env = std::getenv("ROCKETMQ_CPP_LOG_FILE_MAX_INDEX");
+    const char* env = std::getenv("ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX");
     if (env == nullptr) return 10;
     try {
         int v = std::stoi(std::string(env));
@@ -151,7 +151,7 @@ inline std::mutex& logMutex() {
 }
 
 inline std::string defaultLogFilePath() {
-    const char* env = std::getenv("ROCKETMQ_CPP_LOG_FILE");
+    const char* env = std::getenv("ROCKETMQ_CLIENT_LOG_FILE");
     if (env != nullptr) {
         std::string s(env);
         if (s.empty() || s == "OFF" || s == "NONE") return std::string();

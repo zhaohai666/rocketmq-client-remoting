@@ -31,14 +31,16 @@
 //     straight to %DLQ%.
 //
 // Deliberate simplification, matching python/client/consumer.py: this
-// port does not install a pull-side rebalance, so `AllocateMessageQueueStrategy`
-// exists as configuration and is validated at Start but is not used to compute
-// an assignment (there is no process-queue table on this path either). The
-// caller manages the queue set through FetchSubscribeMessageQueues and keeps the
-// offsets itself — which is exactly what the class is for. The extras Java hangs
-// off RebalancePullImpl (fetchMessageQueuesInBalance, the message-queue listener
-// fan-out, persistConsumerOffset over the process queue table) are therefore
-// reported as "this port has no such table" rather than faked.
+// port does not install a pull-side rebalance THREAD, so the queue set is not
+// pushed into a process-queue table behind the caller's back. `FetchSubscribeMessageQueues`
+// gives the whole topic and `FetchMessageQueuesInBalance` computes "my share"
+// on demand with the exact formula Java's RebalanceImpl#rebalanceByTopic uses
+// (same source as this port's push consumer doRebalance) — which is what
+// Java's own example/simple/PullConsumer.java:62 relies on. The strategy is
+// configuration for that computation and is validated at Start (Java :803).
+// The message-queue listener fan-out and persistConsumerOffset over the
+// process-queue table stay out of scope: there is no such table on this path.
+// The caller keeps the offsets itself — which is exactly what the class is for.
 package client
 
 import (
@@ -1078,9 +1080,94 @@ func (c *DefaultMQPullConsumer) ParseSubscribeMessageQueues(queues []common.Mess
 	return out
 }
 
+// FetchMessageQueuesInBalance is Java MQPullConsumer:187 →
+// DefaultMQPullConsumerImpl:120-135: the queues THIS instance owns once the
+// group is balanced — what example/simple/PullConsumer.java:62 iterates before
+// pulling, so pulling "all queues" instead is the classic duplicate-consumption
+// bug in a multi-instance group.
+//
+// Java reads rebalanceImpl.getProcessQueueTable(), a table its background
+// rebalance thread fills. This port runs no pull-side rebalance thread (see the
+// file header), so the view is computed on demand with the exact formula
+// RebalanceImpl#rebalanceByTopic uses — the same one this port's push consumer
+// doRebalance() runs. One formula, two call sites: if they ever disagree, a
+// single queue gets claimed by two instances.
+//   - BROADCASTING: every queue, without consulting the consumer list;
+//   - CLUSTERING: the subscribe info (read queues, no master filter — the very
+//     source FetchSubscribeMessageQueues uses) as mqAll, the group's clientIds
+//     from GET_CONSUMER_LIST_BY_GROUP(38) as cidAll, both sorted, then this
+//     consumer's allocate strategy slices out my share.
+//
+// "No route" or "no answered consumer list" means CANNOT compute, not "my share
+// is empty", so the current assignment is kept: the key set of Java's
+// pullFromWhichNodeTable, i.e. the queues already being pulled. Falling back to
+// "I own everything" would make every co-instance read the same messages twice.
+// A share that genuinely computes to empty (the queues all went to someone
+// else) returns an empty slice, exactly like Java's empty table at that moment.
+func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]common.MessageQueue, error) {
+	instance, err := c.requireClient() // Java isRunning()
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	model := c.messageModel
+	group := c.consumerGroup
+	clientID := c.clientID
+	strategy := c.allocateStrategy
+	c.mu.Unlock()
+	if strategy == nil {
+		strategy = AllocateMessageQueueAveragely{}
+	}
+
+	pulled := make([]common.MessageQueue, 0)
+	for _, mq := range c.PulledQueues() {
+		if mq.Topic == topic {
+			pulled = append(pulled, mq)
+		}
+	}
+
+	mqAll := append([]common.MessageQueue(nil), instance.GetTopicSubscribeInfo(topic)...)
+	sort.Slice(mqAll, func(i, j int) bool { return mqAll[i].CompareTo(mqAll[j]) < 0 })
+	if model == MessageModelBroadcasting {
+		// Java rebalanceByTopic: BROADCASTING never asks for the cid list.
+		if len(mqAll) == 0 {
+			return pulled, nil
+		}
+		return mqAll, nil
+	}
+
+	cidAll, answered := instance.GetConsumerIDListByGroup(topic, group, 5000)
+	if len(mqAll) == 0 || !answered || len(cidAll) == 0 {
+		common.LogDebugf("fetchMessageQueuesInBalance: no route/consumer list for %s/%s, keep current assignment",
+			group, topic)
+		return pulled, nil
+	}
+	sort.Strings(cidAll)
+	got := strategy.Allocate(group, clientID, mqAll, cidAll)
+	if reporter, ok := strategy.(AllocateErrReporter); ok {
+		if err := reporter.AllocateErr(); err != nil {
+			// Java rebalanceByTopic's catch (Throwable): log and keep the current
+			// assignment — a broken strategy must never revoke queues.
+			common.LogErrorf("allocate message queue failed, strategy=%s group=%s: %v, keep current",
+				strategyName(strategy), group, err)
+			return pulled, nil
+		}
+	}
+	// Java :128-131 compares every table key's topic: never let a strategy's
+	// surprising return value leak another topic into the caller's pull loop.
+	out := make([]common.MessageQueue, 0, len(got))
+	for _, mq := range got {
+		if mq.Topic == topic {
+			out = append(out, mq)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CompareTo(out[j]) < 0 })
+	return out, nil
+}
+
 // PulledQueues reports the queues this consumer has pulled at least once
-// (Java's pullFromWhichNodeTable key set) — the port's answer to
-// fetchMessageQueuesInBalance.
+// (Java's pullFromWhichNodeTable key set) — the assignment
+// FetchMessageQueuesInBalance falls back to when it cannot compute.
 func (c *DefaultMQPullConsumer) PulledQueues() []common.MessageQueue {
 	c.mu.Lock()
 	api := c.pullAPI

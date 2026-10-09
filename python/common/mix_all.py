@@ -61,6 +61,12 @@ class MixAll:
     # Java `MixAll.REQ_T`（common/MixAll.java:115）：extFields 的键名，值是
     # `RequestType` 的枚举 code。由 StreamTypeRPCHook 在发请求前写入。
     REQ_T = "ReqT"
+    # Java `MixAll`（common/MixAll.java:122-123）的 namespaceV2 请求头字段：
+    # `NamespaceRpcHook` 在 namespaceV2 非空时给每笔请求写 nsd="true" 与
+    # ns=<namespaceV2>，由 broker 侧据此解析真实资源（阿里云 serverless 实例 id）。
+    # 这是**服务端**命名空间机制，与旧 `namespace` 字段在客户端拼 topic 名的机制不同。
+    RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd"
+    RPC_REQUEST_HEADER_NAMESPACE_FIELD = "ns"
     # Java `ClientConfig#buildMQClientId` 拼的是 `sb.append(RequestType.STREAM)`，
     # 即枚举**名**（不是 code），所以 clientId 后缀为 "@STREAM"。
     STREAM_REQUEST_TYPE = "STREAM"

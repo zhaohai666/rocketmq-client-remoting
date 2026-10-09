@@ -167,6 +167,40 @@ func main() {
 			fmt.Sprintf("queue=%v", published[0]))
 	}
 
+	// ---- 1b. the balanced view, BEFORE pulling anything -----------------------------
+	// FetchMessageQueuesInBalance is Java DefaultMQPullConsumerImpl:120-135. Asking
+	// for it while the instance has pulled no queue is the whole point: when the
+	// route or GET_CONSUMER_LIST_BY_GROUP(38) cannot be had, this port keeps the
+	// CURRENT assignment — which here is the empty set. So a non-empty answer can
+	// only come from the real route + the real broker-side member list, i.e. the
+	// group actually landed in the broker's consumerTable via the heartbeat.
+	//
+	// The beat rides the instance's scheduled task, whose first tick is
+	// initialDelay=1s (Java MQClientInstance:260 — same anchor), so retry until the
+	// broker answers with this clientId instead of failing on a 0-cid first round.
+	var balanced []common.MessageQueue
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		balanced, err = c.FetchMessageQueuesInBalance(topicName)
+		if err == nil && len(balanced) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		check("FetchMessageQueuesInBalance 可用", false, err.Error())
+	} else {
+		check("FetchMessageQueuesInBalance 独占分组时拿到这 1 个队列",
+			len(balanced) == 1 && balanced[0].QueueID == 0,
+			fmt.Sprintf("got=%d queues=%v（没拉取过任何队列，非空只可能来自路由+38）", len(balanced), balanced))
+	}
+	emptyView, err := c.FetchMessageQueuesInBalance(topicName + "_NotCreated")
+	check("未建过的 topic 不抛、返回空份额而不是吞下全部队列",
+		err == nil && len(emptyView) == 0, fmt.Sprintf("err=%v got=%d", err, len(emptyView)))
+
 	// ---- 2. seed the topic --------------------------------------------------------
 	seeded := 0
 	for i := 1; i <= seedBodies; i++ {
@@ -183,7 +217,22 @@ func main() {
 		fmt.Sprintf("seeded=%d", seeded))
 
 	// ---- 3. min / max offset ------------------------------------------------------
-	maxOffset, err := c.MaxOffset(q0)
+	// MaxOffset is the ConsumeQueue's dispatch progress, and the broker dispatches
+	// the commitlog asynchronously — right after a burst of sends it can still be
+	// one behind. Poll instead of reading once: the same reason python's
+	// verify_pull_live.py has wait_offsets() and this script did not.
+	maxOffset := int64(-1)
+	seedDeadline := time.Now().Add(15 * time.Second)
+	for {
+		maxOffset, err = c.MaxOffset(q0)
+		if err == nil && maxOffset == int64(seedBodies) {
+			break
+		}
+		if time.Now().After(seedDeadline) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 	if err != nil {
 		check("MaxOffset 可用", false, err.Error())
 	} else {

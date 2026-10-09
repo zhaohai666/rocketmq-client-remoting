@@ -48,6 +48,13 @@ add_executable(rmq_test_acl test_acl.cpp)
 target_link_libraries(rmq_test_acl PRIVATE rocketmq::remoting)
 add_test(NAME acl COMMAND rmq_test_acl)
 
+# NamespaceRpcHook（5.x namespaceV2 → nsd/ns）：Java 语义对拍（空命名空间不加字段）、
+# 链序 Namespace → Stream → ACL（composeRequestHooks 的形态与探针取证）、
+# ACL 签名随 namespaceV2 变化（含 broker 侧算法重放验签），以及五个门面的上线取证。
+add_executable(rmq_test_namespace_hook test_namespace_hook.cpp)
+target_link_libraries(rmq_test_namespace_hook PRIVATE rocketmq::remoting)
+add_test(NAME namespace_hook COMMAND rmq_test_namespace_hook)
+
 # Request-Reply（5.x）：等待槽语义 + createReplyMessage 形状 + 326 回推入口（含迟到/坏包）
 add_executable(rmq_test_request_reply test_request_reply.cpp)
 target_link_libraries(rmq_test_request_reply PRIVATE rocketmq::remoting)
@@ -291,6 +298,17 @@ add_test(NAME reset_offset COMMAND rmq_test_reset_offset)
 add_executable(rmq_test_pull_consumer_heartbeat test_pull_consumer_heartbeat.cpp)
 target_link_libraries(rmq_test_pull_consumer_heartbeat PRIVATE rocketmq::remoting)
 add_test(NAME pull_consumer_heartbeat COMMAND rmq_test_pull_consumer_heartbeat)
+
+# 拉模式消费者的平衡视图（Java MQPullConsumer#fetchMessageQueuesInBalance:187 →
+# DefaultMQPullConsumerImpl:120-135 + parseSubscribeMessageQueues:153-161）：官方
+# example/simple/PullConsumer.java:62 靠它决定「只拉自己那一份」。本端口没有后台
+# rebalance 线程，视图按 rebalanceByTopic 的同一条公式当场算，故判据落在：单实例全量、
+# 两实例不重叠且合起来覆盖全部、算不动时保持现有分配（绝不独占全部）、广播不看 cidAll、
+# 未启动直接抛、返回已剥命名空间。
+# 与 python/tests/test_pull_consumer.py、csharp PullBalanceViewTests、rust 同名用例同题。
+add_executable(rmq_test_pull_consumer_balance_view test_pull_consumer_balance_view.cpp)
+target_link_libraries(rmq_test_pull_consumer_balance_view PRIVATE rocketmq::remoting)
+add_test(NAME pull_consumer_balance_view COMMAND rmq_test_pull_consumer_balance_view)
 
 # 发布地址「只要 master」（#100，Java MQClientInstance#findBrokerAddressInPublish:1295-1305）：
 # 平表由真的 updateTopicRouteInfoFromNameServer 写入（:962-964）、查不到先刷路由再查

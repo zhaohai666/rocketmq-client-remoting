@@ -15,6 +15,7 @@ const modules = [
   'src/remoting/headers.ts', 'src/remoting/bodies.ts', 'src/remoting/heartbeat.ts',
   'src/remoting/route.ts', 'src/remoting/namespace.ts', 'src/remoting/subscription.ts',
   'src/remoting/admin_body.ts', 'src/remoting/extra_info.ts', 'src/remoting/acl.ts',
+  'src/remoting/rpc_hooks.ts',
   'src/remoting/client.ts', 'src/remoting/exception.ts',
   'src/common/message.ts', 'src/common/messageConst.ts', 'src/common/messageDecoder.ts',
   'src/common/messageClientIdSetter.ts', 'src/common/message_accessor.ts', 'src/common/messageType.ts',
@@ -46,7 +47,7 @@ for (const mod of modules) {
 
 // The offline smoke suites.
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
-  'test/java_gap_fill_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts'];
+  'test/java_gap_fill_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts'];
 console.log(`\n== smoke suites (${smokes.length}) ==`);
 for (const smoke of smokes) {
   const r = spawnSync(node, ['--experimental-strip-types', '--no-warnings', path.join(here, smoke)],

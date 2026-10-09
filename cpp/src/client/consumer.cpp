@@ -435,10 +435,12 @@ void DefaultMQPushConsumer::start() {
         if (tlsOptionsSet_) {
             mqClient_->setTlsOptions(tlsOptions_);
         }
-        // 请求钩子（ACL 签名 / stream 的 `ReqT`）：绑定在 **start() 之前** ——
-        // Java 的 rpcHook 在 MQClientAPIImpl 构造时传入，实例第一笔报文就带着它。
+        // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：绑定在
+        // **start() 之前** —— Java 的 rpcHook 在 MQClientAPIImpl 构造时传入，实例第一笔
+        // 报文就带着它。namespaceV2 传**取值函数**（Java 每笔请求实时读 clientConfig）。
         std::shared_ptr<RPCHook> requestHook =
-            composeRequestHooks(enableStreamRequestType_, rpcHook_);
+            composeRequestHooks(enableStreamRequestType_, rpcHook_,
+                                [this] { return namespaceV2_; });
         if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
             logger_warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
                         + clientId_ + ")");
@@ -1041,6 +1043,13 @@ void DefaultMQPushConsumer::rebalanceLoop() {
     }
 }
 
+void DefaultMQPushConsumer::resume() {
+    // Java DefaultMQPushConsumerImpl.resume（:741-744）：清 pause 后立即 doRebalance，
+    // 让 suspend 期间错过的分配马上补上。
+    paused_.store(false);
+    doRebalance();
+}
+
 void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token) {
     // 停机路上被起来过一趟（见 rebalancePullThreads 的"只撤不建"守卫）：直接收工，
     // 别去碰 client()——shutdown 第一步就把 started_ 置了 false，那时它必抛。
@@ -1063,6 +1072,15 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             auto it = subscriptionData_.find(mq.topic);
             if (it == subscriptionData_.end()) return;
             sub = it->second;
+        }
+        // Java DefaultMQPushConsumerImpl.pullMessage:263-267 —— paused 时本队列拉取
+        // 延后 PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（1000ms）再试；已拉到的消息继续
+        // 消费，位点不回退。判点在流控/顺序锁之前（Java 也是 pause 先判）。
+        if (paused_.load()) {
+            logger_debug("consumer was paused, execute pull request later. group=" +
+                         consumerGroup_);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            continue;
         }
         // 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
         if (orderly) {
@@ -1257,6 +1275,14 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             auto it = subscriptionData_.find(mq.topic);
             if (it == subscriptionData_.end()) return;
             sub = it->second;
+        }
+        // Java DefaultMQPushConsumerImpl.popMessage:517-522 —— paused 时本队列弹出
+        // 延后 PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（1000ms）再试（与 pull 循环同款）。
+        if (paused_.load()) {
+            logger_debug("consumer was paused, execute pop request later. group=" +
+                         consumerGroup_);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            continue;
         }
         // 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）
         if (pq->waitAckCount() > popThresholdForQueue_) {
@@ -2052,6 +2078,9 @@ void DefaultMQPushConsumer::startTraceDispatcher() {
     try {
         auto dispatcher = std::make_shared<AsyncTraceDispatcher>(
             consumerGroup_, TraceDispatcherType::CONSUME, traceMsgBatchNum_, traceTopic_, rpcHook_);
+        // Java AsyncTraceDispatcher.start():155 `traceProducer.setNamespaceV2(namespaceV2)`：
+        // 轨迹的内部生产者也要带上实例命名空间，否则 broker 侧把轨迹写到别的实例下。
+        dispatcher->setNamespaceV2(namespaceV2_);
         dispatcher->setHostConsumer(this);
         dispatcher->setHostClientId(clientId_);
         std::string namesrv;
@@ -3139,6 +3168,12 @@ void DefaultMQPushConsumer::doRebalance() {
     // 对齐 Java RebalanceImpl.rebalanceByTopic：BROADCASTING 全给自己；CLUSTERING 查 broker
     // 消费者列表 → 排序 → AllocateMessageQueueAveragely → 取本实例那一份。查不到消费者列表时
     // 保留现有分配（Java 仅告警），绝不回退成"独占全部队列"（否则同组多实例互相重复消费）。
+    //
+    // ⚠ POP 的队列同样来自这条**客户端 rebalance**（每队列一个 POP 循环 + ack）。Java 在
+    // clientRebalance=false 时走的是 broker 侧分配：RebalanceImpl#getRebalanceResultFromBroker:345
+    // → MQClientAPIImpl#queryAssignment:405（QUERY_ASSIGNMENT=400，回 MessageQueueAssignment
+    // mode=POP）。本端口**刻意不实现那条路径**（与 python / rust / php 端口同一决定）：语义等价，
+    // 差别只在"谁决定队列集合"。动这里之前请先读这段。
     if (mqClient_ == nullptr) return;
     MQClientInstance& c = *mqClient_;
     std::vector<std::string> topics;

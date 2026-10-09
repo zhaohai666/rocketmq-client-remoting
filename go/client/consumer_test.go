@@ -855,6 +855,71 @@ func TestConsumerPullRequestShape(t *testing.T) {
 	}
 }
 
+// Suspend()/Resume() mirror Java DefaultMQPushConsumerImpl.suspend (:1312-1315,
+// just raise the flag) and .resume (:741-745, clear it and rebalance at once);
+// the pull loop honors the flag the way pullMessage:263-266 does — keep the
+// assignment, send nothing, re-check after 1000ms.
+func TestConsumerSuspendStopsPullsAndResumeRestartsThem(t *testing.T) {
+	topic := uniqueTopic("GoConsumerSuspend", t)
+	const group = "GID_go_suspend"
+
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	c := f.newConsumer(t, group, newRecordingListener(),
+		withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	waitFor(t, "first pull", func() bool { return f.broker.pullCount() > 0 })
+
+	c.Suspend()
+	if !c.IsPaused() {
+		t.Fatal("Suspend() must raise the pause flag")
+	}
+	c.Suspend() // idempotent and never fails, exactly like Java's setter
+
+	c.mu.Lock()
+	ownedBefore := len(c.processQueueTable)
+	var pq *processQueue
+	for _, q := range c.processQueueTable {
+		pq = q
+	}
+	c.mu.Unlock()
+	if ownedBefore == 0 || pq == nil {
+		t.Fatal("the consumer must hold at least one assigned queue before suspending")
+	}
+
+	// Let the pull already in flight land before taking the baseline: a suspend
+	// that only stops FUTURE rounds is still correct, and counting the in-flight
+	// one as a leak makes the test flake under load.
+	time.Sleep(300 * time.Millisecond)
+	before := f.broker.pullCount()
+	stampBefore := pq.LastPullTimestamp()
+	// Two 1000ms suspend backoffs plus slack: a paused loop must stay silent.
+	time.Sleep(2500 * time.Millisecond)
+	if got := f.broker.pullCount(); got != before {
+		t.Errorf("pull count moved %d -> %d while suspended, want the loops to stop sending", before, got)
+	}
+	// The ordering invariant: TouchPull happens BEFORE the pause gate (Java
+	// pullMessage:253 vs :263-266). Stamp after the gate and a merely-suspended
+	// consumer looks like a dead loop, so the 120s stall detector tears the
+	// assignment down — silent, and only visible after two minutes of pause.
+	if pq.LastPullTimestamp() <= stampBefore {
+		t.Errorf("lastPullTimestamp froze while suspended (%d -> %d), the pause gate must sit after the stamp",
+			stampBefore, pq.LastPullTimestamp())
+	}
+	c.mu.Lock()
+	ownedAfter := len(c.processQueueTable)
+	c.mu.Unlock()
+	if ownedAfter != ownedBefore || ownedAfter == 0 {
+		t.Errorf("suspend must keep the assignment: queues %d -> %d", ownedBefore, ownedAfter)
+	}
+
+	c.Resume()
+	if c.IsPaused() {
+		t.Fatal("Resume() must clear the pause flag")
+	}
+	waitFor(t, "pulls resume after Resume()", func() bool { return f.broker.pullCount() > before })
+}
+
 // With postSubscriptionWhenPull ON, the expression must ride along together
 // with the SUBSCRIPTION bit.
 func TestConsumerPullCarriesSubscriptionWhenEnabled(t *testing.T) {

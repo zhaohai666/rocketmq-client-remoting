@@ -37,6 +37,20 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		// this round make a network call".
 		pq.TouchPull()
 
+		// Java DefaultMQPushConsumerImpl.pullMessage:263-266 — a suspended consumer
+		// keeps its assignment and its ProcessQueues and simply sends nothing, then
+		// re-checks the flag after PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms). The
+		// gate sits AFTER TouchPull on purpose: stamp the liveness first, or a long
+		// suspend would make every queue look idle to the 120s stall detector and
+		// rebalance would tear the loops down under a consumer that is merely
+		// paused. It sits BEFORE the lock and flow-control gates, exactly like Java.
+		if c.IsPaused() {
+			if c.sleepOrStop(stop, pullTimeDelayMillsWhenSuspend) {
+				return
+			}
+			continue
+		}
+
 		sub, hasSub := c.subscriptionFor(mq.Topic)
 		if !hasSub {
 			return

@@ -173,6 +173,7 @@ func (c *adminCluster) onBroker(s *mockServer, req *remoting.RemotingCommand) *r
 		remoting.ReqDeleteSubscriptionGroup,
 		remoting.ReqUpdateAndCreateSubscriptionGroup,
 		remoting.ReqCleanUnusedTopic,
+		remoting.ReqSetMessageRequestMode,
 		remoting.ReqCloneGroupOffset,
 		remoting.ReqUpdateConsumerOffset:
 		return respOK(nil)
@@ -668,8 +669,52 @@ func TestAdminUpdateBrokerConfigSendsPropertiesText(t *testing.T) {
 	}
 }
 
-// ---------------- nameserver KV ----------------
+// 401 has NO request header at all: Java `MQClientAPIImpl:3304-3311` creates the
+// command with a null header and encodes all four fields into the body, which is
+// what `AdminBrokerProcessor` decodes. A header-only request leaves the broker
+// with a null body (NPE / silent no-op), so the shape is asserted both ways: the
+// body must carry everything, the ext fields must carry NOTHING.
+func TestAdminSetMessageRequestModeSendsBodyNotHeader(t *testing.T) {
+	c := newAdminCluster(t)
+	requireNoError(t, "setMessageRequestMode",
+		c.admin.SetMessageRequestMode(c.brokerSrv.addr, "MyTopic", "G1",
+			remoting.MessageRequestModePop, 3))
 
+	req := c.brokerLog.first(remoting.ReqSetMessageRequestMode)
+	if req == nil {
+		t.Fatal("no SET_MESSAGE_REQUEST_MODE request reached the broker")
+	}
+	body, err := remoting.DecodeSetMessageRequestModeRequestBody(req.Body)
+	if err != nil {
+		t.Fatalf("body %q does not decode: %v", string(req.Body), err)
+	}
+	if body.Topic != "MyTopic" || body.ConsumerGroup != "G1" ||
+		body.Mode != remoting.MessageRequestModePop || body.PopShareQueueNum != 3 {
+		t.Errorf("body = %+v, want MyTopic/G1/POP/3", body)
+	}
+	for _, key := range []string{"topic", "consumerGroup", "mode", "popShareQueueNum"} {
+		if v, ok := req.ExtFields().Get(key); ok {
+			t.Errorf("extField %q = %q must not be sent: the broker reads the body", key, v)
+		}
+	}
+
+	// popShareQueueNum=0 still goes on the wire (Java sets the field unconditionally):
+	// a body that omits it decodes to 0, which is what the broker needs to clear a
+	// previously configured share-queue count.
+	requireNoError(t, "setMessageRequestMode pull",
+		c.admin.SetMessageRequestMode(c.brokerSrv.addr, "MyTopic", "G1",
+			remoting.MessageRequestModePull, 0))
+	second := c.brokerLog.all(remoting.ReqSetMessageRequestMode)
+	if len(second) != 2 {
+		t.Fatalf("got %d requests, want 2", len(second))
+	}
+	if got := string(second[1].Body); !strings.Contains(got, "PULL") ||
+		!strings.Contains(got, "\"popShareQueueNum\":0") {
+		t.Errorf("body = %q, want mode PULL with an explicit popShareQueueNum=0", got)
+	}
+}
+
+// ---------------- nameserver KV ----------------
 // KV puts/deletes are BROADCAST: one rejecting nameserver must fail the whole
 // call (Java's putKVConfigValue/deleteKVConfigValue semantics).
 //

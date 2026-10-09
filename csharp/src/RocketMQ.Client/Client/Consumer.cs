@@ -144,6 +144,18 @@ public sealed class DefaultMQPushConsumer
         set => _namespace = value ?? string.Empty;
     }
 
+    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
+    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
+    /// 扩展头（Java NamespaceRpcHook 读 ClientConfig 同名属性）。钩子每笔请求现读本属性，
+    /// 所以 Start() 之后设置也从下一笔请求起生效。</summary>
+    public string NamespaceV2
+    {
+        get => _namespaceV2;
+        set => _namespaceV2 = value ?? string.Empty;
+    }
+
+    private string _namespaceV2 = string.Empty;
+
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
     // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置：unitName / @STREAM
     // 决定 clientId 形状，stream 决定请求钩子链（ReqT 要进 ACL 签名内容）。
@@ -565,6 +577,11 @@ public sealed class DefaultMQPushConsumer
     private MQClientInstance? _mqClient;
     private volatile bool _started;
     private volatile bool _stop;
+
+    // Java DefaultMQPushConsumerImpl.pause（:1313 / :742 读写）：Suspend()/Resume()
+    // 驱动的标志位。置位后两个拉取循环都不再发请求，按 1000ms
+    // （PULL_TIME_DELAY_MILLS_WHEN_SUSPEND，:113）轮询等它清掉。
+    private volatile bool _paused;
     private readonly ManualResetEventSlim _stopEvent = new(false);
     private long _consumedCount;
     private long _heartbeatCount;
@@ -1070,6 +1087,34 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    // ---------------- 挂起 / 恢复 ----------------
+
+    /// <summary>对应 Java <c>DefaultMQPushConsumer#suspend</c>（:890）→
+    /// <c>DefaultMQPushConsumerImpl#suspend</c>（:1312-1315）：置暂停标志并记一条 info。
+    /// 分配集、ProcessQueue、已提交位点**全部原地保留**，只是两个拉取循环不再发请求，
+    /// 每 1000ms（<c>PULL_TIME_DELAY_MILLS_WHEN_SUSPEND</c>，:113）回头看一次标志。
+    /// 幂等、不抛错，与 Java 一样。</summary>
+    public void Suspend()
+    {
+        _paused = true;
+        ClientLog.Info("suspend this consumer, " + ConsumerGroup);
+    }
+
+    /// <summary>对应 Java <c>DefaultMQPushConsumer#resume</c>（:898）→
+    /// <c>DefaultMQPushConsumerImpl#resume</c>（:741-745）：清标志并立刻重平衡一次，
+    /// 把挂起窗口里错过的分配马上补上，而不是等 20s 周期。
+    /// Java 是同步 <c>doRebalance()</c>；这里复用只置位的 <see cref="WakeRebalanceLoop"/>
+    /// （同步调 DoRebalance 会把调用线程的 RPC 卡在读线程自等上，见其注释）。</summary>
+    public void Resume()
+    {
+        _paused = false;
+        WakeRebalanceLoop();
+        ClientLog.Info("resume this consumer, " + ConsumerGroup);
+    }
+
+    /// <summary>对应 Java <c>DefaultMQPushConsumer#isPause</c>（:902）。</summary>
+    public bool IsPaused => _paused;
+
     // ---------------- 生命周期 ----------------
     public void Start()
     {
@@ -1154,8 +1199,8 @@ public sealed class DefaultMQPushConsumer
 
             // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定在 Start() **之前** ——
             // Java 的 rpcHook 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它。
-            // 顺序由 RequestHooks.Compose 还原（stream 在 ACL 前 ⇒ ReqT 落在签名内容里）。
-            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
+            // 顺序由 RequestHooks.Compose 还原（Namespace → stream → ACL ⇒ ns/nsd 先写、ReqT 落在签名内容里）。
+            IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
                 /*connectTimeoutMillis=*/3000,
                 /*invokeTimeoutMillis=*/_pullTimeoutMillis,
@@ -2667,6 +2712,16 @@ public sealed class DefaultMQPushConsumer
             // 流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
             StampPullAt(key, pop: false);
 
+            // Java DefaultMQPushConsumerImpl.pullMessage:263-266 —— 挂起（Suspend()）
+            // 的判定在**盖章之后、锁与流控之前**：盖章必须先行，否则整段挂起期间
+            // lastPullTimestamp 不更新，120s 停摆判死会把这条循环当成死循环拆掉，
+            // 而消费者只是被暂停、并没有故障。
+            if (_paused)
+            {
+                if (_stopEvent.Wait(TimeSpan.FromMilliseconds(1000)) || _stop) return;
+                continue;
+            }
+
             SubscriptionData sub;
             lock (_lock)
             {
@@ -2960,6 +3015,14 @@ public sealed class DefaultMQPushConsumer
             // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起弹出即盖章（在流控之前），
             // PopProcessQueue.lastPopTimestamp 与拉取时刻表一起写，Java 的停摆判据读的就是它。
             StampPullAt(key, pop: true);
+
+            // Java DefaultMQPushConsumerImpl.popMessage:518-521 —— POP 循环同样尊重
+            // 挂起标志，退避时长同为 1000ms（PULL_TIME_DELAY_MILLS_WHEN_SUSPEND）。
+            if (_paused)
+            {
+                if (_stopEvent.Wait(TimeSpan.FromMilliseconds(1000)) || _stop) return;
+                continue;
+            }
             PopProcessQueue? pq;
             SubscriptionData? sub;
             lock (_lock)
@@ -5334,7 +5397,14 @@ public sealed class DefaultMQPushConsumer
         return outList;
     }
 
-    /// <summary>按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步拉取线程集。</summary>
+    /// <summary>
+    /// 按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步拉取线程集。
+    /// ⚠ POP 的队列也来自这条**客户端 rebalance**（每队列一个 POP 循环 + ack）。Java 在
+    /// clientRebalance=false 时走 broker 侧分配（RebalanceImpl#getRebalanceResultFromBroker:345
+    /// → MQClientAPIImpl#queryAssignment:405，QUERY_ASSIGNMENT=400，回 MessageQueueAssignment
+    /// mode=POP）。本端口**刻意不实现那条路径**（与 python / rust / php 端口同一决定）：语义等价，
+    /// 差别只在"谁决定队列集合"。动这里之前请先读这段。
+    /// </summary>
     private void DoRebalance()
     {
         MQClientInstance c = Client();

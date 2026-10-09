@@ -76,6 +76,14 @@ public static class MixAll
     /// </summary>
     public const string ReqT = "ReqT";
 
+    /// <summary>对应 Java <c>MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD</c>：
+    /// namespaceV2 非空时由 <c>NamespaceRpcHook</c> 置 <c>"true"</c>。</summary>
+    public const string RpcNamespacedField = "nsd";
+
+    /// <summary>对应 Java <c>MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD</c>：
+    /// namespaceV2 的取值走这个键（5.x 新命名空间，与 topic 前缀式的 namespace 不同源）。</summary>
+    public const string RpcNamespaceField = "ns";
+
     public const int DefaultTopicQueueNums = 4;
     public const int DefaultTopicReadQueueNums = 4;
     public const int DefaultTopicWriteQueueNums = 4;

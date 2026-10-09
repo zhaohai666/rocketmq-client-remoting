@@ -12,6 +12,7 @@
 // subscription field).
 import { MQClient } from './mq_client.ts';
 import { PullAPI } from './pull_api.ts';
+import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import {
   LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey,
 } from './offset_store.ts';
@@ -33,12 +34,21 @@ const DEFAULT_POLL_TIMEOUT_MILLIS = 5000;
 
 export class DefaultLitePullConsumer {
   consumerGroup: string;
+  // Java ClientConfig#namespaceV2 — the SERVER-side namespace: when non-empty
+  // NamespaceRpcHook stamps every request with nsd=true / ns=<value>.
+  namespaceV2: string | null = null;
   nameServerAddr = '';
   messageModel: string = MessageModel.CLUSTERING;
   // wire fields read by MQClient.buildHeartbeatData:
   consumeType: string = ConsumeType.CONSUME_ACTIVELY;
   get subscriptionDataSet(): SubscriptionData[] { return [...this.subscription.values()]; }
   unitMode = false;
+  // Java ClientConfig#instanceName / #unitName / #enableStreamRequestType.
+  // DefaultLitePullConsumer sets the stream flag in every constructor
+  // (Java :213/:228): the clientId gets `@STREAM` and each request gets ReqT=0.
+  instanceName = 'DEFAULT';
+  unitName = '';
+  enableStreamRequestType = true;
 
   clientID = '';
   mqClient: MQClient | null = null;
@@ -69,7 +79,12 @@ export class DefaultLitePullConsumer {
   }
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
+  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
+  getNamespaceV2(): string | null { return this.namespaceV2; }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
+  setInstanceName(name: string): this { this.instanceName = name; return this; }
+  setUnitName(name: string): this { this.unitName = name; return this; }
   setPullBatchSize(n: number): this { this.pullBatchSize = n; return this; }
   setPollTimeoutMillis(ms: number): this { this.pollTimeoutMillis = ms; return this; }
   setAutoCommit(enable: boolean): this { this.autoCommit = enable; return this; }
@@ -107,8 +122,23 @@ export class DefaultLitePullConsumer {
     if (this.subscription.size === 0 && !this.assignedManual) {
       throw new Error('subscription is not set, call subscribe() or assign() first');
     }
-    this.clientID = `LITE${process.pid}`;
+    // Java DefaultLitePullConsumerImpl#start:287-291 — CLUSTERING rewrites the
+    // DEFAULT instance name, then ClientConfig#buildMQClientId makes
+    // `<ip>@<instanceName>[@<unitName>][@STREAM]`. ⚠ A pid-only name is shared
+    // by every lite pull consumer in this process, so allocate() hands two
+    // instances the SAME slice and both read the same messages.
+    if (this.messageModel === MessageModel.CLUSTERING) {
+      this.instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
+    }
+    this.clientID = MixAll.clientIdFor(
+      this.instanceName, this.unitName || null, this.enableStreamRequestType);
     const client = new MQClient(this.clientID, this.nameServerAddr);
+    // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
+    // client, then StreamTypeRPCHook, before any user hook (none today).
+    registerRpcHooks(client.remotingClient, {
+      namespaceV2: () => this.namespaceV2,
+      enableStreamRequestType: this.enableStreamRequestType,
+    });
     this.mqClient = client;
     client.registerConsumer(this.consumerGroup, this);
     client.start();
@@ -298,10 +328,11 @@ export class DefaultLitePullConsumer {
     return [...(this.assignedManual != null ? this.assignedManual : this.assignedAuto)];
   }
 
-  // CONSUME_FROM_LAST_OFFSET initial position: the queue's max offset on its
-  // master broker (-1 when the route/broker is unknown — the queue is skipped
-  // this round and retried on the next poll).
-  private async _maxOffsetFor(mq: MessageQueue): Promise<number> {
+  // The queue's min/max offset on its **master** broker (-1 when the route or
+  // the broker is unknown — the caller then skips the queue this round rather
+  // than seeking to a bogus cursor). Java resolves the address through
+  // MQAdminImpl, which only knows the master.
+  private async _boundaryOffset(mq: MessageQueue, kind: 'min' | 'max'): Promise<number> {
     if (!this.mqClient) return -1;
     await this.mqClient.updateTopicRouteInfoFromNameServer(mq.getTopic(), false).catch(() => {});
     const route = this.mqClient.getTopicRouteData(mq.getTopic());
@@ -310,11 +341,36 @@ export class DefaultLitePullConsumer {
       const addrs = bd.brokerAddrs || {};
       const addr = addrs['0'] != null ? addrs['0'] : Object.values(addrs)[0];
       if (addr != null && bd.brokerName === mq.getBrokerName()) {
-        try { return await this.mqClient.getMaxOffset(addr, mq.getTopic(), mq.getQueueId()); }
-        catch (e) { return -1; }
+        try {
+          return kind === 'min'
+            ? await this.mqClient.getMinOffset(addr, mq.getTopic(), mq.getQueueId())
+            : await this.mqClient.getMaxOffset(addr, mq.getTopic(), mq.getQueueId());
+        } catch (e) { return -1; }
       }
     }
     return -1;
+  }
+
+  private _maxOffsetFor(mq: MessageQueue): Promise<number> {
+    return this._boundaryOffset(mq, 'max');
+  }
+
+  // Java DefaultLitePullConsumer#seekToBegin → Impl:697-700 (minOffset then
+  // seek); seekToEnd → Impl:702-705 (maxOffset then seek). A boundary the
+  // broker could not answer throws instead of seeking to -1: a negative cursor
+  // would come back as OFFSET_ILLEGAL on the next poll and be silently wrong.
+  async seekToBegin(mq: MessageQueue): Promise<void> {
+    if (!this.started) throw new Error('consumer not started');
+    const begin = await this._boundaryOffset(mq, 'min');
+    if (begin < 0) throw new Error(`seekToBegin: minOffset unavailable for ${mqKey(mq)}`);
+    this.seek(mq, begin);
+  }
+
+  async seekToEnd(mq: MessageQueue): Promise<void> {
+    if (!this.started) throw new Error('consumer not started');
+    const end = await this._boundaryOffset(mq, 'max');
+    if (end < 0) throw new Error(`seekToEnd: maxOffset unavailable for ${mqKey(mq)}`);
+    this.seek(mq, end);
   }
 
   // Java DefaultLitePullConsumer.committed(mq): the last committed offset of

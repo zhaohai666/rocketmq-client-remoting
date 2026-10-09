@@ -75,6 +75,15 @@ public static class MessageConst
     public const string PropertyOriginQueueId = "ORIGIN_QID";
     public const string PropertyOriginTopic = "ORIGIN_TOPIC";
 
+    // 定时消息（5.x timer wheel）的三个毫秒/秒级属性键（对应 Java MessageConst 的
+    // PROPERTY_TIMER_DELAY_SEC / PROPERTY_TIMER_DELAY_MS / PROPERTY_TIMER_DELIVER_MS）。
+    // 键名是协议的一部分：broker 的 TimerMessageStore 按字面匹配，写错一个字母
+    // 消息就按普通消息立刻投递。Producer 发送链路（MaxDelayValue）与轨迹/回查路径
+    // 都读同一组键。
+    public const string PropertyTimerDelaySec = "TIMER_DELAY_SEC";
+    public const string PropertyTimerDelayMs = "TIMER_DELAY_MS";
+    public const string PropertyTimerDeliverMs = "TIMER_DELIVER_MS";
+
     public const int StringHashSet = 1;
 
     public const string KeySeparator = " ";

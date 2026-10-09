@@ -117,6 +117,17 @@ class AsyncTraceDispatcher:
     def set_host_consumer(self, host) -> None:
         self.host_consumer = host
 
+    def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
+        """对应 Java `AsyncTraceDispatcher#setNamespaceV2`。
+
+        宿主 facade 在 start 分发器**之前**调用（Java DefaultMQProducer:384 /
+        DefaultMQPushConsumer:769），值随内部生产者一起在下一次 start 时落地。
+        """
+        self.namespace_v2 = namespace_v2 or ""
+
+    def get_namespace_v2(self) -> Optional[str]:
+        return self.namespace_v2
+
     def _client_id(self) -> str:
         """宿主客户端的 clientId（EndTransaction 轨迹的 clientHost 用它）。"""
         host = self.host_producer if self.host_producer is not None else self.host_consumer
@@ -130,6 +141,9 @@ class AsyncTraceDispatcher:
                 self.trace_producer.set_namesrv_addr(name_srv_addr)
                 self.trace_producer.set_instance_name(
                     "%s_%s" % (TraceConstants.TRACE_INSTANCE_NAME, name_srv_addr))
+                # 对应 Java AsyncTraceDispatcher.start():155 `traceProducer.setNamespaceV2(...)`：
+                # 轨迹内部生产者发出去的请求也要带 nsd/ns，否则 broker 认不出实例。
+                self.trace_producer.set_namespace_v2(self.namespace_v2)
                 self.trace_producer.set_enable_trace(False)
                 self.trace_producer.start()
                 self.is_started = True

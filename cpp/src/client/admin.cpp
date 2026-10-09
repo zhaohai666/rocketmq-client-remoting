@@ -93,9 +93,11 @@ void DefaultMQAdminExt::start() {
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         3000, 15000, MQClientInstance::tlsEnabledFromEnv(),
                                         unitName_, pollNameServerIntervalMillis_));
-    // 请求钩子（ACL 签名 / stream 的 `ReqT`）：管理端所有请求同样要带上。
+    // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：管理端所有
+    // 请求同样要带上。namespaceV2 传**取值函数**（Java 每笔请求实时读 clientConfig）。
     std::shared_ptr<RPCHook> requestHook =
-        composeRequestHooks(enableStreamRequestType_, rpcHook_);
+        composeRequestHooks(enableStreamRequestType_, rpcHook_,
+                            [this] { return namespaceV2_; });
     if (requestHook && !mqClient_->registerRPCHook(requestHook)) {
         logger_warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
                     + clientId_ + ")");

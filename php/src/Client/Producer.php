@@ -400,6 +400,13 @@ class DefaultMQProducer
     public ?string $unitName = null;
     public bool $unitMode = false;
     public bool $enableStreamRequestType = false;
+    /**
+     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求都带
+     * `nsd=true` / `ns=<该值>` 两个扩展头，broker 据此把请求解析到对应的 serverless 实例。
+     * 与 {@see $namespace}（客户端把 `namespace%` 拼进 topic/group 名）是两套机制：
+     * namespaceV2 **不改**任何资源名，只改请求头。见 NamespaceRpcHook。
+     */
+    public string $namespaceV2 = '';
 
     public string $createTopicKey = MixAll::DEFAULT_TOPIC;
     public int $defaultTopicQueueNums = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
@@ -744,6 +751,25 @@ class DefaultMQProducer
     public function setEnableStreamRequestType(bool $enable): void
     {
         $this->enableStreamRequestType = $enable;
+    }
+
+    /**
+     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
+     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
+     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     */
+    public function setNamespaceV2(string $namespaceV2): void
+    {
+        $this->namespaceV2 = $namespaceV2;
+        if ($this->mqClient !== null) {
+            $this->mqClient->namespaceV2 = $namespaceV2;
+        }
+    }
+
+    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    public function getNamespaceV2(): string
+    {
+        return $this->namespaceV2;
     }
 
     public function setMaxMessageSize(int $size): void
@@ -1289,6 +1315,7 @@ class DefaultMQProducer
             $this->nameServerAddrs,
             tlsEnable: $this->tlsEnable,
             enableStreamRequestType: $this->enableStreamRequestType,
+            namespaceV2: $this->namespaceV2,
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
@@ -1348,6 +1375,9 @@ class DefaultMQProducer
                     $this->rpcHook
                 );
                 $dispatcher->setHostProducer($this);
+                // 对应 Java DefaultMQProducer.start:384：轨迹走的是分发器**自己的**内部生产者，
+                // 它也得带 namespaceV2，否则 serverless 实例里轨迹被 broker 当默认实例丢掉。
+                $dispatcher->setNamespaceV2($this->namespaceV2);
                 $this->traceDispatcher = $dispatcher;
                 $this->registerSendMessageHook(new SendMessageTraceHook($dispatcher));
                 $this->registerEndTransactionHook(new EndTransactionTraceHook($dispatcher));

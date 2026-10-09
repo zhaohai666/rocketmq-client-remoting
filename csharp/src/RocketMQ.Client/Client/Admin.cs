@@ -161,6 +161,17 @@ public sealed class DefaultMQAdminExt
         set => _enableStreamRequestType = value;
     }
 
+    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
+    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
+    /// 扩展头。钩子每笔请求现读本属性（Java 同款），Start() 之后设置也从下一笔请求起生效。</summary>
+    public string NamespaceV2
+    {
+        get => _namespaceV2;
+        set => _namespaceV2 = value ?? string.Empty;
+    }
+
+    private string _namespaceV2 = string.Empty;
+
     /// <summary>
     /// Java <c>ClientConfig#vipChannelEnabled</c>（5.x 默认 false）：true 时 broker 请求
     /// 改走 VIP 端口（端口 - 2，MixAll.BrokerVipChannel）。只对本 admin 的 broker 调用
@@ -226,7 +237,7 @@ public sealed class DefaultMQAdminExt
         // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定在 Start() **之前**（Java 的 rpcHook
         // 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它）。
         // admin 在 Java 里既不置 unitMode 也不置 stream，默认全关。
-        IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook);
+        IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
         _mqClient = new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
             pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
         if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))

@@ -161,3 +161,66 @@ function splitCk(extraInfo: string): string[] {
   while (parts.length && parts[parts.length - 1] === '') parts.pop();
   return parts;
 }
+
+// ---------------------------------------------------------------------------
+// QUERY_ASSIGNMENT(400) bodies — Java QueryAssignmentRequestBody /
+// QueryAssignmentResponseBody + MessageQueueAssignment. Plain JSON both ways.
+// ---------------------------------------------------------------------------
+
+export class QueryAssignmentRequestBody {
+  topic = '';
+  consumerGroup = '';
+  clientId = '';
+  messageModel = 'CLUSTERING';
+  strategyName = '';
+  // Java also carries the extraInfo (POP context) — always sent, may be empty.
+  extraInfo = '';
+
+  toDict(): Record<string, any> {
+    return {
+      topic: this.topic,
+      consumerGroup: this.consumerGroup,
+      clientId: this.clientId,
+      messageModel: this.messageModel,
+      strategyName: this.strategyName,
+      extraInfo: this.extraInfo,
+    };
+  }
+  encode(): Buffer { return RemotingSerializable.encode(this.toDict()); }
+}
+
+export class MessageQueueAssignment {
+  mq: { topic: string; brokerName: string; queueId: number };
+  mode: string;
+
+  constructor(topic: string, brokerName: string, queueId: number, mode: string) {
+    this.mq = { topic, brokerName, queueId };
+    this.mode = mode;
+  }
+}
+
+export class QueryAssignmentResponseBody {
+  // Java: null assignments mean "invalid result, skip the update". An EMPTY
+  // set (the broker deliberately assigned nothing) is a real answer.
+  static decode(body: Buffer | null): Array<MessageQueueAssignment> | null {
+    if (body == null || body.length === 0) return null;
+    let obj: any;
+    try { obj = JSON.parse(body.toString('utf-8')); } catch (e) { return null; }
+    const raw = obj != null && Array.isArray(obj['messageQueueAssignments'])
+      ? obj['messageQueueAssignments']
+      : (Array.isArray(obj) ? obj : null);
+    if (raw == null) return null;
+    const out: MessageQueueAssignment[] = [];
+    for (const a of raw) {
+      const mqa = a && a['messageQueue'] ? a['messageQueue'] : a;
+      if (mqa == null || mqa['topic'] == null) continue;
+      out.push(new MessageQueueAssignment(
+        String(mqa['topic']),
+        String(mqa['brokerName'] ?? ''),
+        Number(mqa['queueId'] ?? 0) | 0,
+        String(a && a['mode'] ? a['mode'] : 'PULL'),
+      ));
+    }
+    return out;
+  }
+}

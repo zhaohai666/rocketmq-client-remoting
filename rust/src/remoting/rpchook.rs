@@ -114,6 +114,61 @@ impl RPCHook for AclClientRPCHook {
 }
 
 /// 对应 `org.apache.rocketmq.client.impl.MQClientAPIImpl` 里注册的
+/// `NamespaceRpcHook`（`client/src/main/java/org/apache/rocketmq/client/rpchook/NamespaceRpcHook.java`）：
+/// 配置了 **namespaceV2**（5.x 服务端命名空间）时，给每个请求加两个扩展头
+/// `nsd=true`（[`MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD`]）与
+/// `ns=<namespaceV2>`（[`MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD`]），
+/// 由 broker 侧据此解析真实 topic。
+///
+/// 与 `namespace`（v1，客户端拼 `%` 前缀）是**两套机制**：这里只动扩展头，
+/// 不碰 topic / group 名。
+///
+/// ⚠ 注册顺序：Java `MQClientAPIImpl:329-335` 把它排在 Stream 与用户钩子
+/// （ACL 签名）**之前**，`nsd`/`ns` 才会进签名内容，否则 broker 以
+/// "reserve field signature" 拒收。
+///
+/// 空命名空间 = 完全 no-op（Java `StringUtils.isNotEmpty` 守卫），连
+/// extFields 都不摸一下，见 [`NamespaceRpcHook::do_before_request`]。
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceRpcHook {
+    namespace_v2: String,
+}
+
+impl NamespaceRpcHook {
+    /// `None` / 空串与 Java 的未配置等价（钩子退化为 no-op）。
+    pub fn new(namespace_v2: Option<&str>) -> NamespaceRpcHook {
+        NamespaceRpcHook {
+            namespace_v2: namespace_v2.unwrap_or_default().to_string(),
+        }
+    }
+
+    /// Java `ClientConfig#getNamespaceV2` 的本钩子视角。
+    pub fn namespace_v2(&self) -> &str {
+        &self.namespace_v2
+    }
+}
+
+impl RPCHook for NamespaceRpcHook {
+    /// 对应 Java `NamespaceRpcHook#doBeforeRequest`：非空才写两个头；
+    /// 空命名空间时**不碰** request 的 extFields（Java 单测
+    /// `NamespaceRpcHookTest` 断言未配置时请求原样）。
+    fn do_before_request(&self, _remote_addr: &str, request: &mut RemotingCommand) {
+        if self.namespace_v2.is_empty() {
+            return;
+        }
+        request.add_ext_field(
+            crate::common::mix_all::MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD,
+            "true",
+        );
+        request.add_ext_field(
+            crate::common::mix_all::MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD,
+            &self.namespace_v2,
+        );
+    }
+    // doAfterResponse 用 trait 默认空实现，与 Java 空方法体一致。
+}
+
+/// 对应 `org.apache.rocketmq.client.impl.MQClientAPIImpl` 里注册的
 /// `StreamTypeRPCHook`（匿名类）：给**每个**请求打上 `ReqT=<RequestType 的 code>`。
 ///
 /// 由 `ClientConfig#enableStreamRequestType` 开关，拉模式/轻量消费者默认开
@@ -228,6 +283,80 @@ mod tests {
         assert_ne!(
             before.get_ext_field(SessionCredentials::SIGNATURE),
             plain.get_ext_field(SessionCredentials::SIGNATURE)
+        );
+    }
+
+    #[test]
+    fn namespace_hook_adds_nsd_and_ns() {
+        // Java `NamespaceRpcHookTest`：配了 namespaceV2 恰好多这两个头，取值固定
+        let hook = NamespaceRpcHook::new(Some("NS_V2"));
+        assert_eq!(hook.namespace_v2(), "NS_V2");
+        let mut cmd = command();
+        hook.do_before_request("127.0.0.1:10911", &mut cmd);
+        assert_eq!(
+            cmd.get_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD),
+            Some("true")
+        );
+        assert_eq!(
+            cmd.get_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD),
+            Some("NS_V2")
+        );
+    }
+
+    #[test]
+    fn namespace_hook_without_namespace_leaves_request_untouched() {
+        // Java `NamespaceRpcHookTest`：`StringUtils.isNotEmpty` 守卫 —— 未配置时
+        // 一个头都不加，extFields 保持原样（不落地空写入）。
+        fn snapshot(cmd: &RemotingCommand) -> Vec<(String, String)> {
+            cmd.ext_fields()
+                .sorted()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        }
+        let before = snapshot(&command());
+        for empty in [
+            NamespaceRpcHook::new(None),
+            NamespaceRpcHook::new(Some("")),
+            NamespaceRpcHook::default(),
+        ] {
+            let mut cmd = command();
+            empty.do_before_request("127.0.0.1:10911", &mut cmd);
+            assert_eq!(cmd.get_ext_field("nsd"), None);
+            assert_eq!(cmd.get_ext_field("ns"), None);
+            assert_eq!(
+                snapshot(&cmd),
+                before,
+                "未配置 namespaceV2 时 extFields 必须逐键不变"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_fields_are_covered_by_the_acl_signature() {
+        // MQClientAPIImpl:329 把 Namespace 排在 ACL 之前：nsd/ns 先写入 ⇒ 进签名内容。
+        // 若顺序反过来（先签后写），签名与线上报文脱节，broker 报 reserve field signature。
+        let mut signed = command();
+        NamespaceRpcHook::new(Some("NS_V2")).do_before_request("a", &mut signed);
+        AclClientRPCHook::new(SessionCredentials::new("AK", "SK"))
+            .do_before_request("a", &mut signed);
+
+        let mut unsigned = command();
+        AclClientRPCHook::new(SessionCredentials::new("AK", "SK"))
+            .do_before_request("a", &mut unsigned);
+        assert_ne!(
+            signed.get_ext_field(SessionCredentials::SIGNATURE),
+            unsigned.get_ext_field(SessionCredentials::SIGNATURE),
+            "先 Namespace 后 ACL 时，nsd/ns 必须参与签名"
+        );
+
+        // 签名内容里确实带着 ns/nsd 的值（sorted: AccessKey < defaultTopic < ns <
+        // nsd < producerGroup < topic，Signature 自身跳过）
+        let content = AclClientRPCHook::build_request_content(&mut signed);
+        assert_eq!(
+            String::from_utf8_lossy(&content),
+            "AKTBW102NS_V2truepgThello body",
+            "nsd/ns 先写入时逐字节进签名内容"
         );
     }
 }

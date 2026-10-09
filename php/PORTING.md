@@ -87,7 +87,8 @@ Python 的 6 类后台线程全部收敛为调用方驱动的 `tick()`——心�
   - `examples/live_compression.php`：send/recv 双模式腿（`send <topic> <group> <size>
     <ns> [codec]` / `recv ...`），载荷配方与 Java CompressProbe 逐字节一致，判定只看
     接收端 `match=1`（CRC-32 IEEE，`sprintf('%u', crc32(...))`），退出码 0/1/2/3。
-    已在 `scripts/compression_matrix.sh` 注册 php_* 腿；PHP 仅 zlib，lz4/zstd → exit 2。
+    已在 `scripts/compression_matrix.sh` 注册 php_* 腿；LZ4（Frame 格式，与 Java
+    `LZ4FrameOutputStream` 同 wire）与 ZSTD（Raw/RLE 帧）由 `CompressionCodec` 纯实现承担。
   - `examples/live_pop.php`（POP 专用集群，四件 broker.conf：timerWheelEnable=true /
     defaultMessageRequestMode=PULL / popResponseReturnActualRetryTopic=false /
     enablePopBatchAck=false）：S1 ACK 真生效（6 条后盯 2.5x 不可见窗无重复投递 +

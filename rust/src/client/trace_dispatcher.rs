@@ -102,9 +102,13 @@
 //! 14. **`is_started` 在 `shutdown()` 后仍为 `true`** —— Python 原样（`:144-162` 没有复位
 //!     它）。但二次 `shutdown()` 不再重复关内部生产者：收尾在在途发送收敛后执行一次，
 //!     二次调用直接返回（重复关会把第一轮没等完的发送掐掉）。
-//! 15. **`namespace_v2`（`:86`）未移植**：Python 只在构造函数里赋了 `""`，全文从未读取
-//!     （Java `start()` 会 `traceProducer.setNamespaceV2(...)`，
-//!     `AsyncTraceDispatcher.java:155`），属死状态；等命名空间 2.0 的接缝真需要时再补。
+//! 15. **`namespace_v2`（`:86`）已接线**：Python 只在构造函数里赋了 `""`，全文
+//!     从未读取（死状态）；Rust 对齐 Java —— `AsyncTraceDispatcher.java:155` 在
+//!     `start()` 里 `traceProducer.setNamespaceV2(...)`，本移植同样在 `start()`
+//!     把 [`AsyncTraceDispatcher::set_namespace_v2`] 配好的值透到内部生产者，
+//!     内部生产者的实例据此注册 `NamespaceRpcHook`（`nsd`/`ns` 扩展头）。
+//!     差异：Java 无条件调用（字段可能为 null），Rust 在**未配置**（空串）时跳过
+//!     这一次 setter —— 空 namespaceV2 在 Java 侧同样不产生任何线上效果。
 //! 16. **`set_host_producer` / `set_host_consumer`（`:114-118`）走 [`TraceHost`] 接缝**：
 //!     Python 靠鸭子类型 `getattr(host, "_mq_client").client_id`（`:120-124`）拿 clientId，
 //!     Rust 声明一个只提供 `client_id()` 的小接缝，[`MQClientInstance`] 已实现它。
@@ -241,6 +245,12 @@ pub trait TraceProducer: Send + Sync {
     /// Python `producer.set_instance_name(...)`（`trace_dispatcher.py:131-132`）。
     fn set_instance_name(&self, instance_name: &str);
 
+    /// Java `AsyncTraceDispatcher#start` 的 `traceProducer.setNamespaceV2(namespaceV2)`
+    /// （`AsyncTraceDispatcher.java:155`）：Python 没有这一行（其 `namespace_v2`
+    /// 是死状态，见模块差异 15），值来自
+    /// [`AsyncTraceDispatcher::set_namespace_v2`]，只在**非空**时被调用。
+    fn set_namespace_v2(&self, namespace_v2: &str);
+
     /// Python `producer.set_send_msg_timeout(5000)`（`trace_dispatcher.py:101`）。
     fn set_send_msg_timeout(&self, timeout_millis: i64);
 
@@ -307,6 +317,10 @@ impl TraceProducer for DisabledTraceProducer {
 
     fn set_instance_name(&self, instance_name: &str) {
         rmq_debug!("trace producer not wired: ignore instanceName {instance_name}");
+    }
+
+    fn set_namespace_v2(&self, namespace_v2: &str) {
+        rmq_debug!("trace producer not wired: ignore namespaceV2 {namespace_v2}");
     }
 
     fn set_send_msg_timeout(&self, timeout_millis: i64) {
@@ -429,13 +443,23 @@ impl Default for TraceDispatcherConfig {
 impl std::fmt::Debug for TraceDispatcherConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TraceDispatcherConfig")
-            .field("producer", &if self.producer.is_some() { "injected" } else { "none" })
+            .field(
+                "producer",
+                &if self.producer.is_some() {
+                    "injected"
+                } else {
+                    "none"
+                },
+            )
             .field("trace_producer_group", &self.trace_producer_group)
             .field("batch_num", &self.batch_num)
             .field("trace_topic_name", &self.trace_topic_name)
             .field("max_msg_size", &self.max_msg_size)
             .field("send_msg_timeout_millis", &self.send_msg_timeout_millis)
-            .field("flush_trace_interval_millis", &self.flush_trace_interval_millis)
+            .field(
+                "flush_trace_interval_millis",
+                &self.flush_trace_interval_millis,
+            )
             .field("wait_for_shutdown_millis", &self.wait_for_shutdown_millis)
             .field("queue_capacity", &self.queue_capacity)
             .finish()
@@ -533,6 +557,10 @@ struct Inner {
     pending: Mutex<Vec<JoinHandle<()>>>,
     /// Python `self.trace_producer`（`:95`）。
     trace_producer: Arc<dyn TraceProducer>,
+    /// Java `AsyncTraceDispatcher#namespaceV2`（`AsyncTraceDispatcher.java:86`，
+    /// `start()` 里 `:155` 透给内部生产者；Python 的 `:86` 是死状态，见模块差异 15）。
+    /// 空串 = 未配置，`start()` 跳过透传。
+    namespace_v2: Mutex<String>,
     /// Python `self.host_producer` / `self.host_consumer`（`:87-88` + `:114-118`）。
     host_producer: Mutex<Option<Arc<dyn TraceHost>>>,
     host_consumer: Mutex<Option<Arc<dyn TraceHost>>>,
@@ -620,21 +648,19 @@ impl AsyncTraceDispatcher {
         // 测试桩和显式定制。
         let producer: Arc<dyn TraceProducer> = match config.producer.clone() {
             Some(injected) => injected,
-            None => {
-                match DefaultMQProducer::new(&trace_producer_group) {
-                    Ok(inner) => {
-                        inner.set_enable_trace(false);
-                        Arc::new(inner)
-                    }
-                    Err(e) => {
-                        rmq_warn!(
-                            "trace dispatcher for group {group} failed to build its internal \
-                             trace producer ({e}); trace data will be dropped"
-                        );
-                        Arc::new(DisabledTraceProducer)
-                    }
+            None => match DefaultMQProducer::new(&trace_producer_group) {
+                Ok(inner) => {
+                    inner.set_enable_trace(false);
+                    Arc::new(inner)
                 }
-            }
+                Err(e) => {
+                    rmq_warn!(
+                        "trace dispatcher for group {group} failed to build its internal \
+                             trace producer ({e}); trace data will be dropped"
+                    );
+                    Arc::new(DisabledTraceProducer)
+                }
+            },
         };
         producer.set_send_msg_timeout(config.send_msg_timeout_millis);
         producer.set_max_message_size(config.max_msg_size);
@@ -667,6 +693,7 @@ impl AsyncTraceDispatcher {
                     worker: Mutex::new(None),
                     pending: Mutex::new(Vec::new()),
                     trace_producer: producer,
+                    namespace_v2: Mutex::new(String::new()),
                     host_producer: Mutex::new(None),
                     host_consumer: Mutex::new(None),
                     send_msg_timeout_millis: config.send_msg_timeout_millis,
@@ -685,10 +712,7 @@ impl AsyncTraceDispatcher {
     /// 与实例方法版 [`Self::trace_producer_group`] 的区别：这里是**模块函数**，
     /// 让调用方能在构造内部生产者之前先把名字算出来（Python 是构造内部生产者时现算，
     /// 顺序无从外置 —— 见模块差异 1）。
-    pub fn next_trace_producer_group(
-        group: &str,
-        dispatcher_type: TraceDispatcherType,
-    ) -> String {
+    pub fn next_trace_producer_group(group: &str, dispatcher_type: TraceDispatcherType) -> String {
         format_trace_producer_group(group, dispatcher_type, next_group_counter())
     }
 
@@ -726,7 +750,30 @@ impl AsyncTraceDispatcher {
 
     /// Python `d.max_msg_size = ...`（直接改属性；单测 `test_trace.py:388` 就这么干）。
     pub fn set_max_msg_size(&self, max_msg_size: usize) {
-        self.inner.max_msg_size.store(max_msg_size, Ordering::Release);
+        self.inner
+            .max_msg_size
+            .store(max_msg_size, Ordering::Release);
+    }
+
+    /// Java `AsyncTraceDispatcher#setNamespaceV2`（`AsyncTraceDispatcher.java:147-149`）：
+    /// 配置分发器内部生产者的 5.x 服务端命名空间。`start()` 时按 Java `:155`
+    /// 透传给内部生产者（`NamespaceRpcHook` 据此给轨迹请求加 `nsd`/`ns` 头）；
+    /// 空串 = 未配置（Python `:86` 的默认值），透传被跳过。
+    pub fn set_namespace_v2(&self, namespace_v2: &str) {
+        *self
+            .inner
+            .namespace_v2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = namespace_v2.to_string();
+    }
+
+    /// Java `AsyncTraceDispatcher#getNamespaceV2`（`AsyncTraceDispatcher.java:143-145`）。
+    pub fn get_namespace_v2(&self) -> String {
+        self.inner
+            .namespace_v2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Python `self.trace_topic_name` 的读侧（`get_trace_topic_name`，`:111-112`）。
@@ -772,19 +819,29 @@ impl AsyncTraceDispatcher {
     /// `_async_send_trace_message` 里 `:210` 自己赋值，没有 setter ——
     /// 这里开放给单测：不起后台任务也能验证「超过 5s 触发刷写」那条分支）。
     pub fn set_last_flush_time(&self, last_flush_time: i64) {
-        self.inner.last_flush_time.store(last_flush_time, Ordering::Release);
+        self.inner
+            .last_flush_time
+            .store(last_flush_time, Ordering::Release);
     }
 
     // ---------------- 宿主 ----------------
 
     /// Python `set_host_producer`（`:114-115`）。
     pub fn set_host_producer(&self, host: Arc<dyn TraceHost>) {
-        *self.inner.host_producer.lock().unwrap_or_else(|e| e.into_inner()) = Some(host);
+        *self
+            .inner
+            .host_producer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(host);
     }
 
     /// Python `set_host_consumer`（`:117-118`）。
     pub fn set_host_consumer(&self, host: Arc<dyn TraceHost>) {
-        *self.inner.host_consumer.lock().unwrap_or_else(|e| e.into_inner()) = Some(host);
+        *self
+            .inner
+            .host_consumer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(host);
     }
 
     // ---------------- 生命周期 ----------------
@@ -818,6 +875,13 @@ impl AsyncTraceDispatcher {
                     "{}_{name_server_addr}",
                     TraceConstants::TRACE_INSTANCE_NAME
                 ));
+                // Java `:155`：`traceProducer.setNamespaceV2(namespaceV2)`。
+                // 未配置（空串）时跳过 —— Java 传 null 同样不产生任何线上效果
+                // （`NamespaceRpcHook` 的 isNotEmpty 守卫），见模块差异 15。
+                let namespace_v2 = self.get_namespace_v2();
+                if !namespace_v2.is_empty() {
+                    self.inner.trace_producer.set_namespace_v2(&namespace_v2);
+                }
                 // Python `:133`：⚠ 必须关闭自身的轨迹，否则轨迹消息会被再次追踪
                 self.inner.trace_producer.set_enable_trace(false);
                 Arc::clone(&self.inner.trace_producer).start().await?;
@@ -825,7 +889,8 @@ impl AsyncTraceDispatcher {
             }
         }
         // Python `:136`：`access_channel or AccessChannel.LOCAL`（None ⇒ LOCAL）
-        self.inner.set_access_channel(access_channel.unwrap_or_default());
+        self.inner
+            .set_access_channel(access_channel.unwrap_or_default());
         self.inner.start_worker();
         Ok(())
     }
@@ -1092,8 +1157,9 @@ impl Inner {
         }
         match (self.this.upgrade(), self.handle.get().cloned()) {
             (Some(me), Some(handle)) => {
-                let budget = SHUTDOWN_FINALIZE_BUDGET
-                    .max(Duration::from_millis(self.wait_for_shutdown_millis) + Duration::from_secs(5));
+                let budget = SHUTDOWN_FINALIZE_BUDGET.max(
+                    Duration::from_millis(self.wait_for_shutdown_millis) + Duration::from_secs(5),
+                );
                 let _ = run_finalize_blocking(
                     &handle,
                     "trace dispatcher shutdown",
@@ -1181,9 +1247,7 @@ impl Inner {
         }
         for (key, bean_list) in groups {
             // Python `:230` `topic, trace_topic = key.split(CONTENT_SPLITOR)`
-            let Some((topic, trace_topic)) =
-                key.split_once(TraceConstants::CONTENT_SPLITOR)
-            else {
+            let Some((topic, trace_topic)) = key.split_once(TraceConstants::CONTENT_SPLITOR) else {
                 rmq_debug!("trace group key {key:?} has no content splitor, skipped");
                 continue;
             };
@@ -1230,7 +1294,8 @@ impl Inner {
             }
         }
         if count > 0 {
-            self.send_trace_data_by_mq(key_set, buffer, trace_topic).await;
+            self.send_trace_data_by_mq(key_set, buffer, trace_topic)
+                .await;
         }
     }
 
@@ -1275,7 +1340,11 @@ impl Inner {
                 counter: Arc::clone(&self.send_which_queue),
             };
             match selector.select(&queues, &broker_set) {
-                Some(queue) => producer.send_to_queue(msg, queue, self.send_msg_timeout_millis).await,
+                Some(queue) => {
+                    producer
+                        .send_to_queue(msg, queue, self.send_msg_timeout_millis)
+                        .await
+                }
                 None => Err(Error::client(format!(
                     "no message queue of trace topic {trace_topic} for broker set {:?}",
                     sorted_broker_names(&broker_set)
@@ -1344,7 +1413,10 @@ impl Inner {
 
     /// 出队（对应 Python `get_nowait`，空队列返回 `None`）。
     fn pop_context(&self) -> Option<TraceContext> {
-        self.queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
     }
 
     fn queue_len(&self) -> usize {
@@ -1471,15 +1543,24 @@ mod tests {
 
     impl Recorder {
         fn push_setter(&self, text: String) {
-            self.setters.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+            self.setters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(text);
         }
 
         fn setters(&self) -> Vec<String> {
-            self.setters.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            self.setters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         fn records(&self) -> Vec<SentRecord> {
-            self.records.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            self.records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         fn set_queues(&self, queues: Vec<MessageQueue>) {
@@ -1487,7 +1568,10 @@ mod tests {
         }
 
         fn push(&self, record: SentRecord) {
-            self.records.lock().unwrap_or_else(|e| e.into_inner()).push(record);
+            self.records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(record);
         }
     }
 
@@ -1500,11 +1584,17 @@ mod tests {
 
     impl TraceProducer for FakeProducer {
         fn set_name_server_addr(&self, name_server_addr: &str) {
-            self.recorder.push_setter(format!("namesrv={name_server_addr}"));
+            self.recorder
+                .push_setter(format!("namesrv={name_server_addr}"));
         }
 
         fn set_instance_name(&self, instance_name: &str) {
-            self.recorder.push_setter(format!("instance={instance_name}"));
+            self.recorder
+                .push_setter(format!("instance={instance_name}"));
+        }
+
+        fn set_namespace_v2(&self, namespace_v2: &str) {
+            self.recorder.push_setter(format!("ns={namespace_v2}"));
         }
 
         fn set_send_msg_timeout(&self, timeout_millis: i64) {
@@ -1513,7 +1603,8 @@ mod tests {
         }
 
         fn set_max_message_size(&self, max_msg_size: usize) {
-            self.recorder.push_setter(format!("max_message_size={max_msg_size}"));
+            self.recorder
+                .push_setter(format!("max_message_size={max_msg_size}"));
         }
 
         fn set_enable_trace(&self, enable: bool) {
@@ -1539,7 +1630,8 @@ mod tests {
         ) -> TraceProducerFuture<Result<()>> {
             let fail_send = self.fail_send;
             Box::pin(async move {
-                self.recorder.push(record_of("send", &message, timeout_millis, None));
+                self.recorder
+                    .push(record_of("send", &message, timeout_millis, None));
                 if fail_send {
                     return Err(Error::client("fake trace send failure"));
                 }
@@ -1764,7 +1856,10 @@ mod tests {
             first.starts_with("_INNER_TRACE_PRODUCER-GID_test-PRODUCE-"),
             "{first}"
         );
-        assert!(group_seq(&second) > group_seq(&first), "{first} -> {second}");
+        assert!(
+            group_seq(&second) > group_seq(&first),
+            "{first} -> {second}"
+        );
         // 构造时也算一次（Python 在构造里给生产者起名，`:100`）
         let (d, _) = dispatcher();
         assert!(
@@ -1905,14 +2000,11 @@ mod tests {
         // 探针第 7 节：region 空串 / beans 为空 都不发
         let (d, recorder) = dispatcher();
         d.inner
-            .send_trace_data(vec![
-                pub_context("TopicTest", MSG_ID_1, ""),
-                {
-                    let mut ctx = simple_pub();
-                    ctx.trace_beans = Vec::new();
-                    ctx
-                },
-            ])
+            .send_trace_data(vec![pub_context("TopicTest", MSG_ID_1, ""), {
+                let mut ctx = simple_pub();
+                ctx.trace_beans = Vec::new();
+                ctx
+            }])
             .await;
         assert!(recorder.records().is_empty());
     }
@@ -1953,10 +2045,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         let expected_second = EXPECTED_PUB.replace(MSG_ID_1, MSG_ID_2);
         assert_eq!(records[0].body, format!("{EXPECTED_PUB}{expected_second}"));
-        assert_eq!(
-            records[0].keys,
-            format!("{MSG_ID_1} {MSG_ID_2} KeyA KeyB")
-        );
+        assert_eq!(records[0].keys, format!("{MSG_ID_1} {MSG_ID_2} KeyA KeyB"));
     }
 
     #[tokio::test]
@@ -1968,9 +2057,12 @@ mod tests {
         //   limit=1_000_000 / 4 条 ⇒ [4]
         let bean_len = EXPECTED_PUB.chars().count();
         assert_eq!(bean_len, 160, "Python 探针：len(trans_data)=160");
-        for (limit, n, expect_records) in [(160, 3, vec![1, 1, 1]), (320, 5, vec![2, 2, 1]),
-                                           (319, 5, vec![2, 2, 1]), (1_000_000, 4, vec![4])]
-        {
+        for (limit, n, expect_records) in [
+            (160, 3, vec![1, 1, 1]),
+            (320, 5, vec![2, 2, 1]),
+            (319, 5, vec![2, 2, 1]),
+            (1_000_000, 4, vec![4]),
+        ] {
             let (d, recorder) = dispatcher();
             d.set_max_msg_size(limit);
             let beans: Vec<TraceTransferBean> = (0..n)
@@ -1988,7 +2080,10 @@ mod tests {
                 .await;
             let records = recorder.records();
             assert_eq!(
-                records.iter().map(|r| record_count(&r.body)).collect::<Vec<_>>(),
+                records
+                    .iter()
+                    .map(|r| record_count(&r.body))
+                    .collect::<Vec<_>>(),
                 expect_records,
                 "limit={limit} n={n}"
             );
@@ -2025,7 +2120,9 @@ mod tests {
     #[tokio::test]
     async fn empty_bean_list_sends_nothing() {
         let (d, recorder) = dispatcher();
-        d.inner.flush_data(Vec::new(), "TopicTest", "RMQ_SYS_TRACE_TOPIC").await;
+        d.inner
+            .flush_data(Vec::new(), "TopicTest", "RMQ_SYS_TRACE_TOPIC")
+            .await;
         assert!(recorder.records().is_empty());
     }
 
@@ -2061,8 +2158,8 @@ mod tests {
         // 探针（max_msg_size=1 + send 抛异常）实测 2 条记录 ⇒ 2 次尝试、无异常外抛。
         let (d, recorder) = failing_dispatcher(10);
         d.set_max_msg_size(1); // 每条记录自成一块 ⇒ 两次发送
-        let bean_a = TraceDataEncoder::encoder_from_context_bean(Some(&simple_pub()))
-            .unwrap_or_default();
+        let bean_a =
+            TraceDataEncoder::encoder_from_context_bean(Some(&simple_pub())).unwrap_or_default();
         let bean_b = TraceDataEncoder::encoder_from_context_bean(Some(&pub_context(
             "TopicTest",
             MSG_ID_2,
@@ -2231,7 +2328,10 @@ mod tests {
         let records = recorder.records();
         assert_eq!(records.len(), 4, "2+2+2+1 四块");
         assert_eq!(
-            records.iter().map(|r| record_count(&r.body)).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|r| record_count(&r.body))
+                .collect::<Vec<_>>(),
             vec![2, 2, 2, 1]
         );
     }
@@ -2290,11 +2390,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_propagates_namespace_v2_to_inner_producer() {
+        // Java `AsyncTraceDispatcher#start`:155 `traceProducer.setNamespaceV2(...)`：
+        // 位置在 instanceName 之后、enable_trace 之前（模块差异 15）。
+        let (d, recorder) = dispatcher();
+        assert_eq!(
+            d.get_namespace_v2(),
+            "",
+            "默认未配置（Python `:86` 的空串）"
+        );
+        d.set_namespace_v2("NS_V2");
+        assert_eq!(d.get_namespace_v2(), "NS_V2");
+        d.start("127.0.0.1:9876", None).await.unwrap();
+        assert_eq!(
+            recorder.setters(),
+            vec![
+                "send_msg_timeout=5000",
+                "max_message_size=128000",
+                "enable_trace=false",
+                "namesrv=127.0.0.1:9876",
+                "instance=PID_CLIENT_INNER_TRACE_PRODUCER_127.0.0.1:9876",
+                "ns=NS_V2",
+                "enable_trace=false",
+            ]
+        );
+        TraceDispatcher::shutdown(&d);
+    }
+
+    #[tokio::test]
+    async fn start_without_namespace_v2_skips_the_setter() {
+        // 未配置 ⇒ 不打空 setter（模块差异 15 的空串跳过分支）
+        let (d, recorder) = dispatcher();
+        d.start("127.0.0.1:9876", None).await.unwrap();
+        assert!(
+            !recorder.setters().iter().any(|s| s.starts_with("ns=")),
+            "实际: {:?}",
+            recorder.setters()
+        );
+        TraceDispatcher::shutdown(&d);
+    }
+
+    #[tokio::test]
     async fn second_start_keeps_producer_but_resets_access_channel() {
         // 探针第 14 节：`is_started` 后不再设 namesrv/instance、不再 start；
         // `access_channel or LOCAL` ⇒ 传 None 会把通道退回 LOCAL
         let (d, recorder) = dispatcher();
-        d.start("127.0.0.1:9876", Some(AccessChannel::Cloud)).await.unwrap();
+        d.start("127.0.0.1:9876", Some(AccessChannel::Cloud))
+            .await
+            .unwrap();
         d.start("127.0.0.1:9876", None).await.unwrap();
         assert_eq!(recorder.started.load(Ordering::Acquire), 1);
         assert_eq!(
@@ -2427,7 +2570,11 @@ mod tests {
         drop(runtime);
         assert!(d.is_stopped());
         assert_eq!(recorder.shutdowns.load(Ordering::Acquire), 1);
-        assert_eq!(recorder.records().len(), 1, "进程退出前末批轨迹必须已经发出");
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "进程退出前末批轨迹必须已经发出"
+        );
     }
 
     #[tokio::test]
@@ -2453,6 +2600,7 @@ mod tests {
         impl TraceProducer for FailingProducer {
             fn set_name_server_addr(&self, _: &str) {}
             fn set_instance_name(&self, _: &str) {}
+            fn set_namespace_v2(&self, _: &str) {}
             fn set_send_msg_timeout(&self, _: i64) {}
             fn set_max_message_size(&self, _: usize) {}
             fn set_enable_trace(&self, _: bool) {}
@@ -2471,7 +2619,10 @@ mod tests {
             ) -> TraceProducerFuture<Result<()>> {
                 Box::pin(async { Ok(()) })
             }
-            fn publish_queues(self: Arc<Self>, _: String) -> TraceProducerFuture<Result<Vec<MessageQueue>>> {
+            fn publish_queues(
+                self: Arc<Self>,
+                _: String,
+            ) -> TraceProducerFuture<Result<Vec<MessageQueue>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
         }

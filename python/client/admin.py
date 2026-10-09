@@ -117,6 +117,9 @@ class DefaultMQAdminExt:
         # 也不注册消费者，Java 里它只是个继承来的字段。）
         self.unit_name: Optional[str] = None
         self.enable_stream_request_type = False
+        # namespaceV2（Java ClientConfig.namespaceV2，5.x 服务端命名空间）：非空时
+        # 每笔请求带 nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        self.namespace_v2 = ""
         # Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 请求
         # 改走 VIP 端口（端口 - 2）。只对本 admin 的 broker 调用生效——admin 不发消息、
         # 不注册消费者，Java 里普通收发路径的同一开关在本项目四端均未接线。
@@ -153,6 +156,13 @@ class DefaultMQAdminExt:
         """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
         self.enable_stream_request_type = bool(enable)
 
+    def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setNamespaceV2`：非空时每笔请求带 nsd=true / ns=<值>。"""
+        self.namespace_v2 = namespace_v2
+
+    def get_namespace_v2(self) -> Optional[str]:
+        return self.namespace_v2
+
     def set_vip_channel_enabled(self, enable: bool) -> None:
         """对应 Java `ClientConfig#setVipChannelEnabled`。"""
         self.vip_channel_enabled = bool(enable)
@@ -184,6 +194,7 @@ class DefaultMQAdminExt:
         self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
                                            enable_stream_request_type=self.enable_stream_request_type,
                                            unit_name=self.unit_name,
+                                           namespace_v2=self.namespace_v2,
                                            poll_name_server_interval=self.poll_name_server_interval)
         if self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)

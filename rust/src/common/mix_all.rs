@@ -67,12 +67,19 @@ impl MixAll {
     pub const TRANS_STAT_PROGRESS_TOPIC: &'static str = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
     pub const RMQ_SYS_TRANS_HALF_TOPIC: &'static str = "RMQ_SYS_TRANS_HALF_TOPIC";
     pub const RMQ_SYS_TRANS_OP_HALF_TOPIC: &'static str = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
-    pub const RMQ_SYS_TRANS_CHECK_MAX_TIME_TOPIC: &'static str = "RMQ_SYS_TRANS_CHECK_MAX_TIME_TOPIC";
+    pub const RMQ_SYS_TRANS_CHECK_MAX_TIME_TOPIC: &'static str =
+        "RMQ_SYS_TRANS_CHECK_MAX_TIME_TOPIC";
     pub const RMQ_SYS_TRANS_CHECK_MAX_TIME: i32 = 15;
     pub const TRANS_CHECK_MAX_TIME: i32 = 15;
     pub const UNIT_PREFIX: &'static str = "unit_";
     /// 对应 Java `MixAll.REQ_T`：`StreamTypeRPCHook` 写进 extFields 的键名。
     pub const REQ_T: &'static str = "ReqT";
+    /// 对应 Java `MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD`（`MixAll:122`）：
+    /// `NamespaceRpcHook` 用来告诉 broker「本请求带服务端命名空间」的 extFields 键名。
+    pub const RPC_REQUEST_HEADER_NAMESPACED_FIELD: &'static str = "nsd";
+    /// 对应 Java `MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD`（`MixAll:123`）：
+    /// `NamespaceRpcHook` 写 namespaceV2 取值用的 extFields 键名。
+    pub const RPC_REQUEST_HEADER_NAMESPACE_FIELD: &'static str = "ns";
     /// 对应 Java `ClientConfig#buildMQClientId` 末尾拼的 `RequestType.STREAM`
     /// **枚举名**（不是它的 code，code 只出现在 [`MixAll::REQ_T`] 的值里）。
     pub const STREAM_REQUEST_TYPE: &'static str = "STREAM";
@@ -415,10 +422,13 @@ impl MixAll {
                 parts.len()
             )));
         }
-        let queue_id = parts[2].trim().parse::<i32>().map_err(|e| {
-            crate::error::Error::Decode(format!("bad queueId in {queue:?}: {e}"))
-        })?;
-        Ok(crate::common::message::MessageQueue::new(parts[0], parts[1], queue_id))
+        let queue_id = parts[2]
+            .trim()
+            .parse::<i32>()
+            .map_err(|e| crate::error::Error::Decode(format!("bad queueId in {queue:?}: {e}")))?;
+        Ok(crate::common::message::MessageQueue::new(
+            parts[0], parts[1], queue_id,
+        ))
     }
 
     /// 对应 Java 4.x `MixAll.string2messageQueues`：换行分隔，**逐条容错**
@@ -439,8 +449,10 @@ impl MixAll {
 
     /// 对应 Java `MixAll.properties2String`：每条 `key=value\n`，null 值跳过。
     pub fn properties_to_string(properties: &StringMap, is_sort: bool) -> String {
-        let mut items: Vec<(&str, &str)> =
-            properties.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut items: Vec<(&str, &str)> = properties
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         if is_sort {
             items.sort_by(|a, b| a.0.cmp(b.0));
         }
@@ -548,7 +560,10 @@ mod tests {
         assert_eq!(MixAll::SYSTEM_TOPIC_PREFIX, "rmq_sys_");
         assert_eq!(MixAll::get_retry_topic("GroupA"), "%RETRY%GroupA");
         assert_eq!(MixAll::get_dlq_topic("GroupA"), "%DLQ%GroupA");
-        assert_eq!(MixAll::get_reply_topic("DefaultCluster"), "DefaultCluster_REPLY_TOPIC");
+        assert_eq!(
+            MixAll::get_reply_topic("DefaultCluster"),
+            "DefaultCluster_REPLY_TOPIC"
+        );
         assert!(MixAll::is_retry_topic(Some("%RETRY%G")));
         assert!(!MixAll::is_retry_topic(None));
         assert!(MixAll::is_dlq_topic(Some("%DLQ%G")));
@@ -610,7 +625,10 @@ mod tests {
             MixAll::reset_retry_and_dlq_topic(Some("%RETRY%TopicA")).as_deref(),
             Some("TopicA")
         );
-        assert_eq!(MixAll::reset_retry_and_dlq_topic(Some("%DLQ%G")).as_deref(), Some("G"));
+        assert_eq!(
+            MixAll::reset_retry_and_dlq_topic(Some("%DLQ%G")).as_deref(),
+            Some("G")
+        );
         assert_eq!(
             MixAll::reset_retry_and_dlq_topic(Some("plain")).as_deref(),
             Some("plain")
@@ -621,9 +639,18 @@ mod tests {
     #[test]
     fn namespace_helper() {
         assert_eq!(MixAll::compare_and_increase_namespace("inst", None), "inst");
-        assert_eq!(MixAll::compare_and_increase_namespace("inst", Some("")), "inst");
-        assert_eq!(MixAll::compare_and_increase_namespace("inst", Some("inst")), "inst");
-        assert_eq!(MixAll::compare_and_increase_namespace("%ns%inst", Some("ns")), "%ns%inst");
+        assert_eq!(
+            MixAll::compare_and_increase_namespace("inst", Some("")),
+            "inst"
+        );
+        assert_eq!(
+            MixAll::compare_and_increase_namespace("inst", Some("inst")),
+            "inst"
+        );
+        assert_eq!(
+            MixAll::compare_and_increase_namespace("%ns%inst", Some("ns")),
+            "%ns%inst"
+        );
         assert_eq!(
             MixAll::compare_and_increase_namespace("inst", Some("ns")),
             "%ns%%inst"
@@ -646,7 +673,10 @@ mod tests {
     #[test]
     fn cached_accessors_are_stable() {
         assert_eq!(MixAll::cached_ip_str(), MixAll::cached_ip_str());
-        assert!(util_all::is_ipv4(MixAll::cached_ip_str()) || util_all::is_ipv6(MixAll::cached_ip_str()));
+        assert!(
+            util_all::is_ipv4(MixAll::cached_ip_str())
+                || util_all::is_ipv6(MixAll::cached_ip_str())
+        );
         assert_eq!(MixAll::cached_pid(), MixAll::cached_pid());
         assert!(MixAll::cached_pid() > 0);
     }
@@ -695,7 +725,11 @@ mod tests {
         // 必须给出不同结果，否则两个客户端会共用一份 MQClientInstance。
         let first = MixAll::client_id_for("DEFAULT", None, false);
         assert!(first.contains(&format!("@{pid_prefix}")), "{first}");
-        assert_ne!(first, MixAll::client_id_for("DEFAULT", None, false), "{first}");
+        assert_ne!(
+            first,
+            MixAll::client_id_for("DEFAULT", None, false),
+            "{first}"
+        );
         assert_eq!(
             MixAll::client_id_for("inst", None, false),
             MixAll::build_default_client_id("inst", None, false)
@@ -705,9 +739,18 @@ mod tests {
 
     #[test]
     fn broker_vip_channel_subtracts_two_from_port() {
-        assert_eq!(MixAll::broker_vip_channel(true, "127.0.0.1:10911"), "127.0.0.1:10909");
-        assert_eq!(MixAll::broker_vip_channel(false, "127.0.0.1:10911"), "127.0.0.1:10911");
-        assert_eq!(MixAll::broker_vip_channel(true, "127.0.0.1:notaport"), "127.0.0.1:notaport");
+        assert_eq!(
+            MixAll::broker_vip_channel(true, "127.0.0.1:10911"),
+            "127.0.0.1:10909"
+        );
+        assert_eq!(
+            MixAll::broker_vip_channel(false, "127.0.0.1:10911"),
+            "127.0.0.1:10911"
+        );
+        assert_eq!(
+            MixAll::broker_vip_channel(true, "127.0.0.1:notaport"),
+            "127.0.0.1:notaport"
+        );
         assert_eq!(MixAll::broker_vip_channel(true, "no-colon"), "no-colon");
     }
 
@@ -769,7 +812,11 @@ mod tests {
     #[test]
     fn query_msg_type_values() {
         assert_eq!(
-            (QueryMsgType::ALL_MESSAGE, QueryMsgType::UNIQUE_KEY, QueryMsgType::NORMAL),
+            (
+                QueryMsgType::ALL_MESSAGE,
+                QueryMsgType::UNIQUE_KEY,
+                QueryMsgType::NORMAL
+            ),
             (0, 1, 2)
         );
     }

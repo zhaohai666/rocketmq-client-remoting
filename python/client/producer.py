@@ -49,7 +49,7 @@ from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
 from .top_addressing import DefaultTopAddressing
 from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
-                            RequestResponseFuture, create_correlation_id)
+                            RequestCallback, RequestResponseFuture, create_correlation_id)
 from .produce_accumulator import ProduceAccumulator, get_or_create_produce_accumulator
 from .send_result import SendResult, SendStatus
 from .trace_context import inject_trace_context, trace_context_enabled_from_env
@@ -116,6 +116,43 @@ class _NullSendCallback:
             self.future.send_request_ok = False
             self.future.put_response_message(None)
             self.future.cause = e
+
+
+class _RequestAsyncSendCallback:
+    """request_async() 专用的发送回调（对齐 Java DefaultMQProducerImpl:1700-1713 的匿名
+    SendCallback + requestFail）。
+
+    与同步版 `_NullSendCallback` 的差别：发送失败时按 Java ``requestFail(correlationId)``
+    **先从 REQUEST_FUTURE_HOLDER 摘掉槽位**再补发失败语义（send_request_ok=False、
+    put_response_message(None)、executeRequestCallback）。异步请求没有 finally 兜底，
+    「发送失败 = 本次请求终结」，槽位必须就此清掉，否则要等 TTL 兜底扫描才消失。
+    """
+
+    def __init__(self, future: RequestResponseFuture, correlation_id: str):
+        self.future = future
+        self.correlation_id = correlation_id
+
+    def on_success(self, send_result: SendResult) -> None:
+        # Java onSuccess 只有一句 setSendRequestOk(true)，应答仍走 326 推送
+        if self.future is not None:
+            self.future.send_request_ok = True
+
+    def on_exception(self, e: BaseException) -> None:
+        # 对齐 Java requestFail(correlationId)：谁摘到谁负责
+        future = REQUEST_FUTURE_HOLDER.remove_request(self.correlation_id)
+        if future is not None:
+            future.cause = e
+            future.send_request_ok = False
+            future.put_response_message(None)
+            future.execute_request_callback()
+
+
+def _check_request_send_args(mq: Optional[MessageQueue],
+                             selector: Optional[MessageQueueSelector]) -> None:
+    """Java 的 request/send 异步 select 走不同重载；Python 端合并成一个签名后，
+    ``mq`` 与 ``selector`` 同时给没有对应语义，直接抛（宁可早失败也别悄悄选错队列）。"""
+    if mq is not None and selector is not None:
+        raise ValueError("mq and selector are mutually exclusive; pass exactly one")
 
 
 def _back_pressure_permits(configured: int, floor: int, name: str) -> int:
@@ -349,6 +386,9 @@ class DefaultMQProducer:
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = False
+        # namespaceV2（Java ClientConfig.namespaceV2，5.x 服务端命名空间）：非空时
+        # 每笔请求带 nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
+        self.namespace_v2 = ""
         self.create_topic_key = MixAll.DEFAULT_TOPIC
         self.default_topic_queue_nums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
         self.send_msg_timeout = 3000
@@ -388,6 +428,14 @@ class DefaultMQProducer:
         # 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
         self.send_latency_fault_enable = False
         self._mq_fault_strategy = MQFaultStrategy(False)
+        # ---- 后台可达性探测（对应 Java ClientConfig.startDetectorEnable /
+        # detectTimeout / detectInterval + DefaultMQProducerImpl 构造器里的
+        # Resolver/ServiceDetector）----
+        # Java 默认 startDetectorEnable=false（sysprop com.rocketmq.startDetectorEnable），
+        # 探测线程虽被 startDetector() 拉起但空转；探测参数 200ms / 2000ms。
+        self.start_detector_enable = False
+        self.detect_timeout_millis = 200
+        self.detect_interval_millis = 2000
         # ---- 自动攒批（对应 Java DefaultMQProducer 的 autoBatch / batchMaxDelayMs /
         # batchMaxBytes / totalBatchMaxBytes）----
         # 四个配置在 Java 里都是"先记在 producer 上、start() 建累加器时再同步下去"，
@@ -465,6 +513,13 @@ class DefaultMQProducer:
     def set_enable_stream_request_type(self, enable: bool) -> None:
         """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
         self.enable_stream_request_type = bool(enable)
+
+    def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
+        """对应 Java `ClientConfig#setNamespaceV2`：非空时每笔请求带 nsd=true / ns=<值>。"""
+        self.namespace_v2 = namespace_v2
+
+    def get_namespace_v2(self) -> Optional[str]:
+        return self.namespace_v2
 
     def set_max_message_size(self, size: int) -> None:
         self.max_message_size = size
@@ -562,6 +617,18 @@ class DefaultMQProducer:
         """对应 Java DefaultMQProducer.setSendLatencyFaultEnable。默认关闭。"""
         self.send_latency_fault_enable = enable
         self._mq_fault_strategy.set_send_latency_fault_enable(enable)
+
+    def set_start_detector_enable(self, enable: bool) -> None:
+        """对应 Java DefaultMQProducer.setStartDetectorEnable:1449-1451。
+
+        打开后 start() 拉起的后台探测线程每轮真正去探测不可达 broker 的可达性
+        （探测成功即把 FaultItem.reachableFlag 翻回 True）。运行中随时可翻开关。
+        """
+        self.start_detector_enable = bool(enable)
+        self._mq_fault_strategy.set_start_detector_enable(bool(enable))
+
+    def is_start_detector_enable(self) -> bool:
+        return self._mq_fault_strategy.is_start_detector_enable()
 
     def set_request_timeout(self, timeout_millis: int) -> None:
         """设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。"""
@@ -837,6 +904,7 @@ class DefaultMQProducer:
                                                tls_options=self.tls_options,
                                                enable_stream_request_type=self.enable_stream_request_type,
                                                unit_name=self.unit_name,
+                                               namespace_v2=self.namespace_v2,
                                                poll_name_server_interval=self.poll_name_server_interval)
             if self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
@@ -850,6 +918,20 @@ class DefaultMQProducer:
                 RequestCode.CHECK_TRANSACTION_STATE, self._handle_check_transaction_state)
             # 异步发送的两个线程池（Java 在构造器里 new，线程本身按需创建）
             self._create_async_executors()
+            # 后台可达性探测线程（对齐 Java DefaultMQProducerImpl.start():272
+            # mqFaultStrategy.startDetector()）：线程无条件拉起，每轮是否真探测由
+            # startDetectorEnable 决定。Resolver / ServiceDetector 与 Java 同款：
+            # findBrokerAddressInPublish 解析地址，GET_MAX_OFFSET(30) 探活。
+            tolerance = self._mq_fault_strategy.latency_fault_tolerance
+            tolerance.set_detect_timeout(self.detect_timeout_millis)
+            tolerance.set_detect_interval(self.detect_interval_millis)
+            tolerance.resolver = self._detector_resolver
+            tolerance.service_detector = self._detector_probe
+            self._mq_fault_strategy.set_start_detector_enable(self.start_detector_enable)
+            self._mq_fault_strategy.start_detector()
+            # Request-Reply 等待槽的周期兜底清理（对齐 Java :291
+            # RequestFutureHolder.startScheduledTask(this)：初始 3s、周期 1s）
+            REQUEST_FUTURE_HOLDER.start_scheduled_task(self)
             # 自动攒批：按 clientId 复用累加器（Java DefaultMQProducerImpl:256 →
             # MQClientManager.getOrCreateProduceAccumulator），并把 producer 上先设好的
             # 三个阈值同步过去。放在 registerProducer 之前，与 Java 同序。
@@ -883,6 +965,9 @@ class DefaultMQProducer:
                     self.producer_group, TraceDispatcherType.PRODUCE,
                     self.trace_msg_batch_num, self.trace_topic, self.rpc_hook)
                 dispatcher.set_host_producer(self)
+                # 对应 Java DefaultMQProducer.start():384 `dispatcher.setNamespaceV2(...)`：
+                # 轨迹内部生产者发出的请求也要带 nsd/ns。
+                dispatcher.set_namespace_v2(self.namespace_v2)
                 self.trace_dispatcher = dispatcher
                 self.register_send_message_hook(SendMessageTraceHook(dispatcher))
                 self.register_end_transaction_hook(EndTransactionTraceHook(dispatcher))
@@ -894,6 +979,34 @@ class DefaultMQProducer:
             except Exception as e:  # noqa: BLE001
                 logger.warning("trace dispatcher start failed: %s", e)
 
+    # ---------------- 可达性探测（Java ServiceDetector / Resolver 同款）----------------
+    def _detector_resolver(self, broker_name: str) -> Optional[str]:
+        """对应 Java DefaultMQProducerImpl 构造器里的匿名 Resolver：
+        ``mQClientFactory.findBrokerAddressInPublish(name)``。"""
+        client = self._mq_client
+        if client is None:
+            return None
+        return client.find_broker_address_in_publish(broker_name)
+
+    def _detector_probe(self, addr: str, timeout_millis: float) -> bool:
+        """对应 Java DefaultMQProducerImpl:155-170 的匿名 ServiceDetector。
+
+        Java 的做法：``pickTopic()`` 任取一个已注册 topic，构造
+        ``MessageQueue(topic, null, 0)``，用 ``getMaxOffset(endpoint, mq, timeoutMillis)``
+        探活 —— 成功返回 True，任何异常按 False 处理（探测失败**不**清 reachableFlag）。
+        """
+        client = self._mq_client
+        if client is None:
+            return False
+        topic = next(iter(client.topic_route_table), None)
+        if topic is None:
+            return False
+        try:
+            client.get_max_offset(MessageQueue(topic, None, 0), int(timeout_millis), addr=addr)
+            return True
+        except Exception:  # noqa: BLE001 - 与 Java 一致：探测异常一律视为不可达
+            return False
+
     def shutdown(self) -> None:
         with self._lock:
             if not self._started:
@@ -903,6 +1016,8 @@ class DefaultMQProducer:
             # ⚠ Java 这里用的是不等待的 shutdown()，所以「send_async 完立刻 shutdown」会丢掉
             # 还没跑完的任务（回调里拿到 RemotingConnectException）。本实现照抄：不等。
             # 调用方要确保发完，自己等回调。
+            self._mq_fault_strategy.shutdown()
+            REQUEST_FUTURE_HOLDER.shutdown_scheduled_task(self)
             if self._async_sender_executor is not None:
                 self._async_sender_executor.shutdown()
                 self._async_sender_executor = None
@@ -1176,9 +1291,11 @@ class DefaultMQProducer:
                     return result
                 raise
             except RemotingException as e:
-                # 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测任务，
-                # 所以 Java 的 reachable = !isStartDetectorEnable() 恒为 True。
-                self._update_fault_item(selected, began, True, True)
+                # 连不上/超时/发不出去：隔离该 broker。Java :821 的 reachable =
+                # !isStartDetectorEnable() —— 开了后台探测时先标不可达，等探测线程
+                # 探到恢复再放行；没开探测（默认）时没人翻位，所以恒为 True。
+                self._update_fault_item(selected, began, True,
+                                        not self._mq_fault_strategy.is_start_detector_enable())
                 last_exc = e
             except MQClientException as e:
                 # 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离
@@ -1207,10 +1324,14 @@ class DefaultMQProducer:
         raise MQClientException(info, code, last_exc)
 
     def request(self, msg: Message, timeout_millis: Optional[int] = None,
-                mq: Optional[MessageQueue] = None) -> Message:
+                mq: Optional[MessageQueue] = None,
+                selector: Optional[MessageQueueSelector] = None, arg=None) -> Message:
         """Request-Reply（5.x）：发一条请求消息并**同步等应答**，返回应答消息。
 
-        对应 Java ``DefaultMQProducerImpl#request(msg, mq, timeout)``（:1738-1767）。
+        对应 Java ``DefaultMQProducerImpl#request`` 的三个同步重载（:1621-1767）：
+        ``request(msg, timeout)`` / ``request(msg, selector, arg, timeout)`` /
+        ``request(msg, mq, timeout)``。``mq`` 与 ``selector`` 对应后两个（互斥，
+        同时给抛 ValueError），都不给就是第一个重载 —— 走默认队列选择。
         请求方做三件事：
           1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（**本客户端 clientId**）、
              TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
@@ -1225,6 +1346,7 @@ class DefaultMQProducer:
         所以本生产者必须先发过心跳（``start()`` 已起心跳线程；这里也会补一次，
         对齐 Java ``prepareSendRequest`` 的 ``sendHeartbeatToAllBrokerWithLock``）。
         """
+        _check_request_send_args(mq, selector)
         timeout = timeout_millis if timeout_millis is not None else self.request_timeout
         msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
@@ -1255,7 +1377,8 @@ class DefaultMQProducer:
             # 发送失败时回调（在 NettyClientPublicExecutor 上）会把 future 标成
             # !send_request_ok 并主动唤醒等待方，所以发送失败不会等满 timeout。
             self.send_async(msg, _NullSendCallback(future),
-                            timeout - cost if timeout > cost else timeout, mq)
+                            timeout - cost if timeout > cost else timeout, mq,
+                            selector=selector, arg=arg)
             return self._wait_request_response(msg, timeout, future, cost)
         finally:
             REQUEST_FUTURE_HOLDER.remove_request(correlation_id)
@@ -1275,6 +1398,60 @@ class DefaultMQProducer:
             raise MQClientException(
                 "send request message to <%s> fail" % msg.topic, None, future.cause)
         return response
+
+    def request_async(self, msg: Message, callback: RequestCallback,
+                      timeout_millis: Optional[int] = None,
+                      mq: Optional[MessageQueue] = None,
+                      selector: Optional[MessageQueueSelector] = None, arg=None) -> None:
+        """Request-Reply 的**异步**形态（对应 Java ``request(msg, callback, timeout)`` /
+        ``request(msg, selector, arg, callback, timeout)`` / ``request(msg, mq, callback,
+        timeout)``，:1689-1813）。
+
+        与同步 ``request()`` 的关键差别：**调用方立即返回**，本方法不做任何等待 ——
+        应答到达（或发送失败、或 TTL 超时兜底扫描）时 ``callback`` 被触发且只触发一次。
+        槽位留在 REQUEST_FUTURE_HOLDER 里等应答/兜底清理（没有 finally 摘除 ——
+        摘早了应答就投不进来了）。
+
+        失败语义全部对齐 Java：
+          * 发送失败（本地抛出或发送回调里报错）→ ``requestFail``：摘槽、
+            send_request_ok=False、put_response_message(None)、executeRequestCallback；
+          * 应答不来 → REQUEST_FUTURE_HOLDER 的 TTL 兜底扫描按同样的路径回调
+            ``RequestTimeoutException``。
+
+        ``callback`` 是 ``client.request_reply.RequestCallback``（on_success/on_exception）。
+        """
+        _check_request_send_args(mq, selector)
+        timeout = timeout_millis if timeout_millis is not None else self.request_timeout
+        msg.topic = self._with_namespace(msg.topic)
+        self._check_message(msg)
+
+        correlation_id = create_correlation_id()
+        client = self._require_client()
+        msg.put_property(MessageConst.PROPERTY_CORRELATION_ID, correlation_id)
+        msg.put_property(MessageConst.PROPERTY_MESSAGE_REPLY_TO_CLIENT, client.client_id)
+        msg.put_property(MessageConst.PROPERTY_MESSAGE_TTL, str(timeout))
+
+        begin = time.time() * 1000.0
+        try:
+            self._topic_publish_info(msg.topic)
+            self._send_heartbeat_to_all_broker()
+        except Exception:  # noqa: BLE001 — 与同步 request 同款：让发送路径自己报错
+            logger.debug("request_async: prepare route/heartbeat failed", exc_info=True)
+
+        future = RequestResponseFuture(correlation_id, timeout, callback)
+        REQUEST_FUTURE_HOLDER.put_request(correlation_id, future)
+        cost = int(time.time() * 1000.0 - begin)
+        try:
+            self.send_async(msg, _RequestAsyncSendCallback(future, correlation_id),
+                            timeout - cost if timeout > cost else timeout, mq,
+                            selector=selector, arg=arg)
+        except BaseException as e:  # noqa: BLE001 — 对齐 Java :1715-1719 的 catch → requestFail
+            future.cause = e
+            removed = REQUEST_FUTURE_HOLDER.remove_request(correlation_id)
+            if removed is not None:
+                removed.send_request_ok = False
+                removed.put_response_message(None)
+                removed.execute_request_callback()
 
     def _create_async_executors(self) -> None:
         """建异步发送链的两个池（对应 Java DefaultMQProducerImpl:133-140 与
@@ -1303,8 +1480,14 @@ class DefaultMQProducer:
 
     def send_async(self, msg: Message, callback: SendCallback,
                    timeout_millis: Optional[int] = None,
-                   mq: Optional[MessageQueue] = None) -> None:
+                   mq: Optional[MessageQueue] = None,
+                   selector: Optional[MessageQueueSelector] = None, arg=None) -> None:
         """异步发送（对应 Java ``DefaultMQProducerImpl.send(msg, SendCallback, timeout)``）。
+
+        ``selector``+``arg`` 对应 Java ``send(msg, selector, arg, SendCallback, timeout)``
+        （sendSelectImpl 的 ASYNC 分支）：在工作线程上用选择器定好队列再进内核，
+        定点语义与 ``mq`` 相同（sendKernelImpl 的 topicPublishInfo=null，失败不换 broker）。
+        ``mq`` 与 ``selector`` 互斥（同给抛 ValueError）。
 
         **调用方立即返回**，整条链在后台跑，四段与 Java 逐段对齐：
 
@@ -1343,6 +1526,7 @@ class DefaultMQProducer:
                 callback.on_exception(e)
             return
         self._require_client()
+        _check_request_send_args(mq, selector)
         executor = self._async_sender_executor
         if executor is None:
             raise MQClientException("producer already shutdown")
@@ -1362,7 +1546,13 @@ class DefaultMQProducer:
                                None)
                 return
             try:
-                self._send_async_inner(msg, mq, gated, timeout - cost)
+                if selector is None:
+                    # 常规路径保持旧的调用形状（selector/arg 省略），不破坏按位置
+                    # 捕获 inner 的既有测试桩
+                    self._send_async_inner(msg, mq, gated, timeout - cost)
+                else:
+                    self._send_async_inner(msg, mq, gated, timeout - cost,
+                                           selector=selector, arg=arg)
             except Exception as e:  # noqa: BLE001 — Java：runnable 的 catch → newCallBack.onException(e)
                 self._complete(gated, None, e, None)
 
@@ -1408,8 +1598,13 @@ class DefaultMQProducer:
 
     @_restores_caller_message
     def _send_async_inner(self, msg: Message, mq: Optional[MessageQueue],
-                          callback: SendCallback, timeout: int) -> None:
+                          callback: SendCallback, timeout: int,
+                          selector: Optional[MessageQueueSelector] = None, arg=None) -> None:
         """出队后的准备工作（Java ``sendDefaultImpl(ASYNC)`` → ``sendKernelImpl``）。
+
+        ``selector``+``arg`` 非空时对应 Java ``sendSelectImpl`` 的 ASYNC 分支（:1329-1368）：
+        拉路由 → ``selector.select(mqs, msg, arg)`` 定队列 → 把 topicPublishInfo 置 null
+        进 sendKernelImpl（即**不在失败重试里换 broker**，与定点 mq 相同）。
 
         还原放在这一层而不是 ``send_async``：Java 5.5.1 的异步链把**调用方那条消息**
         交给 ``AsyncSenderExecutor`` 的 runnable，`finally` 是在**工作线程**上跑的
@@ -1418,6 +1613,10 @@ class DefaultMQProducer:
         """
         client = self._require_client()
         if isinstance(msg, (list, tuple)):
+            if selector is not None:
+                # Java 的批量 send 没有任何 selector 重载（:1091-1133 只有 mq 形态）；
+                # Python 端补的 send_batch_by_selector 也只做同步形态，异步选择器不开放。
+                raise MQClientException("selector is not supported for batch messages")
             # 批量异步：Java 走 SEND_BATCH_MESSAGE + invokeAsync，本实现的批量发送只有同步内核，
             # 所以这里是「在 AsyncSenderExecutor 线程里同步发一批」。对调用方语义没差别 ——
             # 不阻塞发送方、回调照样在 callbackExecutor 上跑。
@@ -1432,6 +1631,17 @@ class DefaultMQProducer:
             return
         msg.topic = self._with_namespace(msg.topic)
         self._check_message(msg)
+        if selector is not None:
+            # sendSelectImpl ASYNC：选择器拿到的是路由里的**原始**队列列表
+            publish = self._topic_publish_info(msg.topic)
+            selected = selector.select(publish.msg_queue_list, msg, arg)
+            if selected is None:
+                raise MQClientException("selector selected no queue for topic %s" % msg.topic)
+            mq_sel = MessageQueue(msg.topic, selected.broker_name, selected.queue_id)
+            self._check_pinned_topic(msg.topic, mq_sel, _PINNED_TOPIC_MISMATCH_ASYNC)
+            sys_flag = self.try_to_compress_message(msg)
+            self._send_kernel_async(client, msg, mq_sel, callback, timeout, sys_flag, None)
+            return
         if mq is not None:
             # Java ``:1277-1278``：异步分支在同一位置用另一处文案抛，异常由 runnable 的
             # catch 转给 ``newCallBack.onException``（这里由 ``send_async`` 的 `_run` 收口）。
@@ -1507,7 +1717,10 @@ class DefaultMQProducer:
                 self._update_fault_item(mq, began, False, True)
                 self._complete(callback, result, None, context)
                 return
-            self._update_fault_item(mq, began, True, True)
+            # 与 Java 同款：async 失败也按「隔离」记；reachable 同步路径的口径
+            # （!isStartDetectorEnable，开了探测才先标不可达）。
+            self._update_fault_item(mq, began, True,
+                                    not self._mq_fault_strategy.is_start_detector_enable())
             wrapped, need_retry = _classify_async_failure(error, cost)
             self._on_send_exception(client, broker_name, mq, msg, request, timeout - cost,
                                    callback, publish, context, times, wrapped, need_retry)
@@ -1639,6 +1852,38 @@ class DefaultMQProducer:
             return self._send_with_hooks(client, msg, mq_sel, timeout, sys_flag, arg=arg)
         return client.send_message(self.producer_group, msg, mq_sel, timeout, sys_flag,
                                        **self._send_header_args())
+
+    def send_batch_by_selector(self, msgs: List[Message], selector: MessageQueueSelector,
+                               arg, timeout_millis: Optional[int] = None) -> SendResult:
+        """批量 + 选择器：先用选择器定队列，再按定点批量发送。
+
+        Java 5.5.1 的批量 ``send`` 重载（:1091-1133）只有 ``mq`` 形态、**没有** selector
+        变体；本端口按任务要求补齐这一格（与 ``send_by_selector`` 同构）。选择器的
+        ``select(mqs, msg, arg)`` 收到的 ``msg`` 是**整批列表**（Java 没有参考实现，
+        这是本端口的显式约定；哈希/随机两个内置选择器都只依赖 ``arg``/随机数，不受影响）。
+
+        复用 ``_send_batch`` 的全部校验链（逐条 checkMessage/setUniqID/编码），
+        队列由选择器给出 —— 与 Java ``batch(msgs).send(mq, timeout)`` 的定点语义一致。
+        """
+        client = self._require_client()
+        msgs = list(msgs)
+        if not msgs:
+            raise MQClientException("message list is empty")
+        topic = msgs[0].topic
+        for m in msgs:
+            if m.topic != topic:
+                raise MQClientException(
+                    "all messages in one batch must have the same topic")
+        # 与 send_by_selector 同序：先拼命名空间再查发布信息（_send_batch 里每条消息
+        # 的 wrap_namespace 是幂等的，重复包装无害）
+        topic = self._with_namespace(topic)
+        publish = self._topic_publish_info(topic)
+        selected = selector.select(publish.msg_queue_list, msgs, arg)
+        if selected is None:
+            raise MQClientException("selector selected no queue for topic %s" % topic)
+        mq_sel = MessageQueue(topic, selected.broker_name, selected.queue_id)
+        timeout = timeout_millis if timeout_millis is not None else self.send_msg_timeout
+        return self._send_batch(msgs, mq_sel, timeout)
 
     # ---------------- 定时消息撤回（对应 Java recallMessage）----------------
     def recall_message(self, topic: str, recall_handle: str) -> str:

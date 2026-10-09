@@ -602,6 +602,26 @@ func (c *DefaultMQPushConsumer) IsPaused() bool {
 	return c.paused
 }
 
+// Suspend mirrors Java DefaultMQPushConsumer.suspend (:890) →
+// DefaultMQPushConsumerImpl.suspend (:1312-1315): raise the pause flag and log.
+// The assignment, the ProcessQueues and the committed offsets all stay as they
+// are — the pull and pop loops just stop sending requests and re-check after
+// pullTimeDelayMillsWhenSuspend. Idempotent, never fails.
+func (c *DefaultMQPushConsumer) Suspend() {
+	c.SetPause(true)
+	common.LogInfof("suspend this consumer, %s", c.consumerGroup)
+}
+
+// Resume mirrors Java DefaultMQPushConsumer.resume (:898) →
+// DefaultMQPushConsumerImpl.resume (:741-745): clear the flag and rebalance
+// right away, so whatever the suspend window missed is picked up immediately
+// instead of waiting for the next 20s tick.
+func (c *DefaultMQPushConsumer) Resume() {
+	c.SetPause(false)
+	c.RebalanceImmediately()
+	common.LogInfof("resume this consumer, %s", c.consumerGroup)
+}
+
 // SetMaxReconsumeTimes sets the retry ceiling (-1 = Java default).
 func (c *DefaultMQPushConsumer) SetMaxReconsumeTimes(n int32) {
 	c.mu.Lock()
@@ -1517,6 +1537,15 @@ func (c *DefaultMQPushConsumer) checkConfigRangesLocked() error {
 //
 // A missing consumer list KEEPS the current assignment (Java warns). Never
 // degrade to "I own everything": co-instances would duplicate every message.
+//
+// POP takes its queues from THIS same client-side rebalance, one POP loop per
+// assigned queue. Java instead asks the broker (RebalanceImpl#getRebalanceResultFromBroker:345
+// → MQClientAPIImpl#queryAssignment:405, QUERY_ASSIGNMENT=400, MessageQueueAssignment
+// with mode=POP) whenever clientRebalance is off. That path is deliberately NOT
+// implemented here (same decision as python/client/consumer.py and the rust port):
+// the semantics are equivalent — one per-queue POP loop plus ack either way — the
+// only difference is WHO decides the queue set. Do not "fix" this without reading
+// that note first.
 func (c *DefaultMQPushConsumer) doRebalance() error {
 	c.mu.Lock()
 	instance := c.instance

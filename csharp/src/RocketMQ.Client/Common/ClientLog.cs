@@ -7,13 +7,13 @@
 //     避免常驻进程把单个日志文件撑到无限大。
 //
 // 配置（环境变量）：
-//   ROCKETMQ_CPP_LOG_LEVEL          = DEBUG | INFO | WARN | ERROR | OFF      （默认 INFO）
-//   ROCKETMQ_CPP_LOG_FILE           = 日志文件绝对路径
-//                                     （默认 $HOME/logs/rocketmqlogs/rocketmq_cpp_client.log；
+//   ROCKETMQ_CLIENT_LOG_LEVEL          = DEBUG | INFO | WARN | ERROR | OFF      （默认 INFO）
+//   ROCKETMQ_CLIENT_LOG_FILE           = 日志文件绝对路径
+//                                     （默认 $HOME/logs/rocketmqlogs/rocketmq_csharp_client.log；
 //                                      设为 "OFF"/"NONE"/空串可关闭文件输出，只留 stderr）
-//   ROCKETMQ_CPP_LOG_FILE_MAX_SIZE  = 单文件上限字节数（默认 67108864 = 64MB，对齐 Java
+//   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE  = 单文件上限字节数（默认 67108864 = 64MB，对齐 Java
 //                                     logback 的 <maxFileSize>64MB</maxFileSize>；0 = 不轮转）
-//   ROCKETMQ_CPP_LOG_FILE_MAX_INDEX = 保留的备份份数（默认 10，对齐 Java
+//   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX = 保留的备份份数（默认 10，对齐 Java
 //                                     rocketmq.log.file.maxIndex；0 = 不保留备份）
 //
 // ⚠ 级别与文件路径在**首次写日志时**求值并缓存，因此必须在第一次日志输出前设置环境变量。
@@ -85,7 +85,7 @@ public static class ClientLog
     // ---------------------------------------------------------------- 级别
     // 环境变量原始值，首次访问时读取并缓存（之后不再读环境变量）。
     private static readonly Lazy<string?> RawLevelEnv =
-        new(() => Environment.GetEnvironmentVariable("ROCKETMQ_CPP_LOG_LEVEL"));
+        new(() => Environment.GetEnvironmentVariable("ROCKETMQ_CLIENT_LOG_LEVEL"));
 
     private static readonly Lazy<int> DefaultLevel =
         new(() => ParseLevel(RawLevelEnv.Value));
@@ -103,7 +103,7 @@ public static class ClientLog
 
     // 环境变量是否**显式**指定了级别。宿主程序若要"默认 INFO、但尊重外部显式配置"，
     // 写成 `if (!ClientLog.LogLevelSetFromEnv()) ClientLog.SetLogLevel(LogLevel.Info);`，
-    // 这样真机排查时直接 `ROCKETMQ_CPP_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
+    // 这样真机排查时直接 `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
     public static bool LogLevelSetFromEnv() => RawLevelEnv.Value is not null;
 
     public static LogLevel LogLevel
@@ -149,11 +149,12 @@ public static class ClientLog
     private static readonly Lazy<string> DefaultFilePath =
         new(() => ResolveDefaultFilePath());
 
-    // 文件名刻意与 Java 的 rocketmq_client.log 区分：同机同时跑 Java 客户端时
-    // 两边轮转策略不同，写同一文件会互相插行、互相截断。
+    // 文件名刻意与 Java 的 rocketmq_client.log **以及 C++ 端口的 rocketmq_cpp_client.log**
+    // 区分：同机同时跑两套客户端时轮转策略不同，写同一文件会互相插行、互相截断，
+    // 更糟的是一端把文件改名后另一端仍持有旧 fd（日志静默丢失）。
     private static string ResolveDefaultFilePath()
     {
-        string? env = Environment.GetEnvironmentVariable("ROCKETMQ_CPP_LOG_FILE");
+        string? env = Environment.GetEnvironmentVariable("ROCKETMQ_CLIENT_LOG_FILE");
         if (env is not null)
         {
             if (env.Length == 0 || env == "OFF" || env == "NONE") return "";
@@ -162,7 +163,7 @@ public static class ClientLog
 
         string home = UtilAll.UserHome();
         if (string.IsNullOrEmpty(home)) return "";
-        return Path.Combine(home, "logs", "rocketmqlogs", "rocketmq_cpp_client.log");
+        return Path.Combine(home, "logs", "rocketmqlogs", "rocketmq_csharp_client.log");
     }
 
     // 宿主程序可直接指定日志文件（空串 = 关闭文件输出）。
@@ -285,7 +286,7 @@ public static class ClientLog
     private static long ResolveMaxSize()
     {
         const long kDefault = 64L * 1024 * 1024; // 64MB
-        string? raw = Environment.GetEnvironmentVariable("ROCKETMQ_CPP_LOG_FILE_MAX_SIZE");
+        string? raw = Environment.GetEnvironmentVariable("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE");
         if (raw is null) return kDefault;
         return long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v) && v > 0
             ? v
@@ -294,7 +295,7 @@ public static class ClientLog
 
     private static int ResolveMaxIndex()
     {
-        string? raw = Environment.GetEnvironmentVariable("ROCKETMQ_CPP_LOG_FILE_MAX_INDEX");
+        string? raw = Environment.GetEnvironmentVariable("ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX");
         if (raw is null) return 10;
         return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0
             ? v

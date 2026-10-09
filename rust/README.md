@@ -1,5 +1,7 @@
 # rocketmq-client-remoting (Rust)
 
+> 中文 ｜ [English](README.en.md)
+
 Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Rust 实现（tokio 全异步），适配
 RocketMQ 4.x / 5.x 集群，全部能力在真实 5.5.1 集群上联调验证过；与本仓库的
 Python / C++ / C# 实现逐项对齐。
@@ -20,7 +22,8 @@ Python / C++ / C# 实现逐项对齐。
 | 协议层 | `RemotingCommand` 帧编解码；`CommandCustomHeader` 家族（含 V2 单字母短键 a..n）；JSON 与 RocketMQ 二进制双序列化；17 段存储格式 + 6 段批量格式 |
 | 传输层 | 惰性建连 + 复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时、重连、**GO_AWAY(1500) 换连接重发一次**、broker 主动请求派发、TLS（`native-tls`）、真实 `MQVersion`（5.5.1）请求头 |
 | 路由 / 心跳 | `TopicRouteData` / `QueueData` / `BrokerData`、`SubscriptionData`、`HeartbeatData`、`TopicPublishInfo` 队列轮询游标 |
-| 客户端 | `MQClientInstance`（进程级实例表复用）、`DefaultMQProducer`（同步/定点/批量/oneway/选择器/异步/事务/回查）、`DefaultMQPushConsumer`（长轮询 + **POP** + 顺序 + 广播 + 位点持久化）、`DefaultMQPullConsumer`、`DefaultLitePullConsumer`、`DefaultMQAdminExt` |
+| 客户端 | `MQClientInstance`（进程级实例表复用）、`DefaultMQProducer`（同步/定点/批量/oneway/选择器/异步/事务/回查）、`DefaultMQPushConsumer`（长轮询 + **POP** + 顺序 + 广播 + 位点持久化）、`DefaultMQPullConsumer`（`fetch_subscribe_message_queues` 给整个 topic，`fetch_message_queues_in_balance` 只给本实例应得的那份）、`DefaultLitePullConsumer`、`DefaultMQAdminExt` |
+| 命名空间 | 两套彼此独立：`namespace`（客户端本地资源名前缀 `%%ns%%res`，`common/namespace_util.rs`，收发 / 心跳 / 位点全线包装与还原）与 `namespace_v2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`；钩子顺序 Namespace → Stream → ACL，故 `ns`/`ReqT` 都在 ACL 签名内容里）。生产者 / 三种消费者 / 管理端都现读 `namespace_v2` |
 | 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动 |
 | 5.x 能力 | POP（`POP_CK` 8 段反构 / `ACK` / `CHANGE_MESSAGE_INVISIBLE`）、Request-Reply、消息轨迹（编码 + 异步分发 + 钩子）、消费侧统计、`ConsumerRunningInfo`(307)、指标、ACL 签名、动态 name server 取址、故障规避选队列 |
 | 校验门 | `Validators` / `TopicValidator`：`check_topic` / `check_group` / `is_system_topic` / `is_not_allowed_send_topic` / `check_message`，四类 facade 的 `start()` 在建客户端实例**之前**跑完组名校验（纯本地判定，失败不碰网络） |
@@ -48,12 +51,12 @@ Python / C++ / C# 实现逐项对齐。
 cd rust
 cargo build
 cargo clippy --all-targets     # 零 warning 是硬门槛（examples 一起查）
-cargo test --lib               # 891 条，~4s
+cargo test --lib               # 916 条，~4s
 ```
 
 ## 单元测试
 
-891 条按模块分布（`cargo test --lib -- --list` 可复算）：
+916 条按模块分布（`cargo test --lib -- --list` 可复算）：
 
 | 模块 | 条数 | 覆盖 |
 | --- | --- | --- |
@@ -62,16 +65,16 @@ cargo test --lib               # 891 条，~4s
 | `remoting::rpchook` | 6 | ACL 签名：extFields 按 key 字典序、只拼 value、跳过 `Signature`、再拼 body |
 | `common::message_decoder` | 38 | 17 段 / 6 段两条编码路径（切勿混用）、压缩段的 crc32（`& 0x7FFFFFFF`）、批量消息、坏数据必须拒收 |
 | `common::consistent_hash` | 8 | 环：MD5 摘要**只取前 4 字节大端**、虚拟节点 key 从 `existingReplicas` 起算、`tailMap` **含端点**、越过环末尾回绕、空环返回 `None`、负虚拟节点数只在构造处报错 |
-| `common::compression` | 7 | 三后端往返 + 类型解析（含 `0→ZLIB` 兼容映射）；未支持类型必须抛错而不是透传压缩字节 |
+| `common::compression` | 8 | 三后端往返 + 类型解析（含 `0→ZLIB` 兼容映射）；未支持类型必须抛错而不是透传压缩字节 |
 | `common::recall_message_handle` | 6 | 定时消息撤回句柄 v1 真值向量（带 `=` 填充）、无填充句柄也能解（跨客户端撤回）、6 段新版本忽略尾段、空串/坏 base64/非法 utf-8/`v2`/段数不足一律 `recall handle is invalid` |
 | `common::boundary_type` | 2 | 边界枚举的大写入网名与 `get_type` 宽松解析 |
-| `common` 其余 | 75 | `message` / `message_const` / `message_type` / `message_client_id_setter`、`mix_all`（含 `%NS%` 前缀与 clientId 口径）、`sysflag`、`util_all`（14 位墙钟、`nano_time`、`is_blank`）、`topic_config`、`topic_validator`、`buffer`、`logging` |
-| `client::producer`（含 `produce_accumulator` 16 条） | 117 | 配置与生命周期（clientId 口径 `<ip>@<pid>#<nanoTime>`、重启不换、同名 instanceName 共用一份实例；**`shutdown()` 返回的那一刻就腾空 `INSTANCE_MAP`** —— 注销(35) 与实例拆解都排在 `spawn` 的任务里，登记表晚一步腾空会让同 clientId 的重启复用回正被拆的实例）；`send_retry_tests` 用**进程内 mock 集群**锁死重试分类（可重试码换 broker、不可重试码立即抛、耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离；**寻址缺失报 10004 而不是 10005** 三条腿）；线上字段口径抓包（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 三级判据、批量发送的 ID 顺序：先给每条子消息 `setUniqID` → 再给整批补一个 → 最后才 `setBody(encode())`）；**27 项异步发送内核 + 背压闸门**：闸门侧（开关关掉不碰闸、条数/字节闸文案、拒了要还已拿到的条数许可、整条重试链只占**一份**许可、闸等到预算耗尽、扩容叫醒、空 body 按 1 字节算、排队吃光预算报 send kernel timeout）、有界队列侧（队满同步抛 `executor rejected` 一笔不发、开背压派发到队列之外照常跑完）、异步内核侧（换 broker 重试且同一请求换新 opaque、重试上限、**broker 业务码不进重试链**、定点重试留同一台、钩子各跑一次、未 `start()` 同步抛且不回调）、32 工作线程饱和回归；**发送头 c/d/n** 抓包（`d=0` 原样上线、`n` 取这一笔选中的 broker、空 brokerName 整键消失）；**7 项定点 topic 守卫**（不符就拒且一笔不上线、调用方 `Message` 一个字段没动、命名空间比包装后资源名、批量走同一处守卫、异步文案从回调交一次、未 `start()` 先报状态错、**定点单向故意没有守卫**） |
+| `common` 其余 | 76 | `message` / `message_const` / `message_type` / `message_client_id_setter`、`mix_all`（含 `%NS%` 前缀与 clientId 口径）、`sysflag`、`util_all`（14 位墙钟、`nano_time`、`is_blank`）、`topic_config`、`topic_validator`、`buffer`、`logging` |
+| `client::producer`（含 `produce_accumulator` 16 条） | 120 | 配置与生命周期（clientId 口径 `<ip>@<pid>#<nanoTime>`、重启不换、同名 instanceName 共用一份实例；**`shutdown()` 返回的那一刻就腾空 `INSTANCE_MAP`** —— 注销(35) 与实例拆解都排在 `spawn` 的任务里，登记表晚一步腾空会让同 clientId 的重启复用回正被拆的实例）；`send_retry_tests` 用**进程内 mock 集群**锁死重试分类（可重试码换 broker、不可重试码立即抛、耗尽报 `BrokersSent`、单次超时钳位、预算耗尽报 callTimeout、无路由快速失败、连接失败隔离；**寻址缺失报 10004 而不是 10005** 三条腿）；线上字段口径抓包（`k`=unitMode、`ReqT`、发送请求码 310/320/325 与 `m`=batch 三级判据、批量发送的 ID 顺序：先给每条子消息 `setUniqID` → 再给整批补一个 → 最后才 `setBody(encode())`）；**27 项异步发送内核 + 背压闸门**：闸门侧（开关关掉不碰闸、条数/字节闸文案、拒了要还已拿到的条数许可、整条重试链只占**一份**许可、闸等到预算耗尽、扩容叫醒、空 body 按 1 字节算、排队吃光预算报 send kernel timeout）、有界队列侧（队满同步抛 `executor rejected` 一笔不发、开背压派发到队列之外照常跑完）、异步内核侧（换 broker 重试且同一请求换新 opaque、重试上限、**broker 业务码不进重试链**、定点重试留同一台、钩子各跑一次、未 `start()` 同步抛且不回调）、32 工作线程饱和回归；**发送头 c/d/n** 抓包（`d=0` 原样上线、`n` 取这一笔选中的 broker、空 brokerName 整键消失）；**7 项定点 topic 守卫**（不符就拒且一笔不上线、调用方 `Message` 一个字段没动、命名空间比包装后资源名、批量走同一处守卫、异步文案从回调交一次、未 `start()` 先报状态错、**定点单向故意没有守卫**） |
 | `client::backpressure` | 12 | `FairSemaphore`：只有**队首**能拿许可、阻塞的队首把后面的人按 FIFO 排住、改总量保留在途份额、改容量叫醒等待者、队首成交/超时离开都要喂后面那个等待者（漏了就是真机 5 秒死等）、丢弃的等待方不留幽灵票据、空闲许可可为负再拉回正、两个地板值（10 条 / 1MiB） |
 | `client::allocate_strategy` | 30 | 六个策略：`AVG` / `AVG_BY_CIRCLE` 边界用例、四道 `check` 守卫返回**空结果**而非异常、`CONFIG` 返回副本、`CONSISTENT_HASH` 哈希环表逐格、`MACHINE_ROOM` 的机房名切分**裁尾空段**真值表、`MACHINE_ROOM_NEARBY` 同机房优先 + 无消费者机房全员共享 + resolver 空机房**抛错** |
-| `client::consumer` / `pull_consumer` / `consume_executor` / `consumer_stats` | 207 | 订阅与 `MessageSelector`、**后置 `subscribe`**（`start()` 之后照收，`unsubscribe` 只删表项）、clientId 的 CLUSTERING/BROADCASTING 分岔（广播保持 `DEFAULT` 共用实例）、pull/lite 状态机、**lite 三张位点表**（拉取游标 / 已消费游标 / 内存提交表各自独立，`commit()` 只走 `poll()` 交出去的那一格；`maybe_auto_commit` 只在 `poll()` 里查、全局一个 deadline；`persist_all(scope)` 抹掉 scope 外的内存行）；core/max 两档弹性与 **5.x 默认值两侧同为 20**；**顺序消费重投闸门**（`-1` 顺序侧读成不设上限 ≠ 并发侧 16、没用尽就地 +1 挂起、用尽才回投、**只有回投失败**才继续挂起）；**120s 拉取停摆自愈**（严格大于、新循环不算、线程已退出即刻算、健康队列不动、撤走时持久化位点、POP 分支读 `lastPopTimestamp`、停机不判停摆）；**POP 循环拉取统计**（`Found` 记 RT 且打在空列表判定之前、弹到消息才记 TPS、`PollingNotFound` 两格不动）；**启动期数值闸门**（12 条区间两端各测一次、`-1` 哨兵只给两个 topic 级闸门、`pullInterval` 下界 0、min>max 严格大于、多条越界按序报第一条、`consume_timestamp` 格式真会拒）；**空应答位点修正**（无待消费无在途 + `NoNewMsg`/`NoMatchedMsg` 才推到 `next_begin_offset`，只升不降）；**OFFSET_ILLEGAL 纠错**（换修正值 → 丢队列 + 冻结 → 立刻落盘 → 唤醒 rebalance，冻结覆盖两处且持续到重建）；**220 重置位点**（只动点名的队列、队列代号 +1 让旧 ack 作废）；**拉模式消费者心跳**（假主从集群：报文形状 `CONSUME_ACTIVELY`/`subVersion=0`、首轮主从各一发、循环按周期重发、`shutdown()` 各收一发 35 且 `producerGroup` 缺席）；**FIRST_OFFSET 起点是字面量 0**（整份请求日志 `GET_MIN_OFFSET(31)` 出现 0 次，负控腿 LAST_OFFSET 必须发 `GET_MAX_OFFSET`）；**拉取游标跟随 `nextBeginOffset`**（`NO_MATCHED_MSG` 跟过整段、`OFFSET_ILLEGAL` 采纳纠正值、在途 seek 刹车——负控用闸门拉出确定性窗口）；**lite 请求码 361 + lite 位**（从收到的请求取 `code` 与 `sysFlag`，经典对照腿 11 且无 lite 位）；**清扫逃生口 14 项**（只扫本实例持有的队列、单轮 `min(size,16)`、严格大于过期、只回投失败才放回、两道队首闸门、顺序队列整支跳过、回投时刻按 containsMessage 复核） |
-| 轨迹四件套 `trace` / `trace_hook` / `trace_dispatcher` / `trace_context` | 101 | Pub / SubBefore / SubAfter / EndTransaction / Recall 编解码双向、SOH/STX 文本格式、无 keys 空段容错、坏记录只跳过自己、分发器攒批/切块/防递归、W3C `traceparent` 生成与校验 |
-| `client` 其余 | 144 | `mq_client`（实例表复用、心跳装配、路由缓存、**共用实例的关闭守卫**：最后一个租户退场才真拆并摘 `INSTANCE_MAP`；**退出注销 35 遍历每个 brokerId——从节点也各收一发**，与心跳只打 master 的分工一起断言；**消费者心跳同样覆盖从节点**；空白组名整个字段不上线；**220 的收包口径**：数组与 map 两种 body 都能解、处理不在读线程上做、组不匹配安静丢弃）；**5 项发布地址只认 master**（只剩从节点时解析不到而退让口径拿得到、缓存为空先刷一次路由恰好一次、本端报 `The broker[X] not exist` 而不是打到从节点换可重试码、`get_max_offset` 同口径）；`admin`（properties 文本、分页合并、**222 请求体的 ext key 名 `isForce`**——写错时 broker 侧恒为 false 静默走错分支）；`latency`、`hook`、`request_reply`、`metrics`、`top_addressing`、`result`、`validators` |
+| `client::consumer` / `pull_consumer` / `consume_executor` / `consumer_stats` | 215 | 订阅与 `MessageSelector`、**后置 `subscribe`**（`start()` 之后照收，`unsubscribe` 只删表项）、clientId 的 CLUSTERING/BROADCASTING 分岔（广播保持 `DEFAULT` 共用实例）、pull/lite 状态机、**lite 三张位点表**（拉取游标 / 已消费游标 / 内存提交表各自独立，`commit()` 只走 `poll()` 交出去的那一格；`maybe_auto_commit` 只在 `poll()` 里查、全局一个 deadline；`persist_all(scope)` 抹掉 scope 外的内存行）；core/max 两档弹性与 **5.x 默认值两侧同为 20**；**顺序消费重投闸门**（`-1` 顺序侧读成不设上限 ≠ 并发侧 16、没用尽就地 +1 挂起、用尽才回投、**只有回投失败**才继续挂起）；**120s 拉取停摆自愈**（严格大于、新循环不算、线程已退出即刻算、健康队列不动、撤走时持久化位点、POP 分支读 `lastPopTimestamp`、停机不判停摆）；**POP 循环拉取统计**（`Found` 记 RT 且打在空列表判定之前、弹到消息才记 TPS、`PollingNotFound` 两格不动）；**启动期数值闸门**（12 条区间两端各测一次、`-1` 哨兵只给两个 topic 级闸门、`pullInterval` 下界 0、min>max 严格大于、多条越界按序报第一条、`consume_timestamp` 格式真会拒）；**空应答位点修正**（无待消费无在途 + `NoNewMsg`/`NoMatchedMsg` 才推到 `next_begin_offset`，只升不降）；**OFFSET_ILLEGAL 纠错**（换修正值 → 丢队列 + 冻结 → 立刻落盘 → 唤醒 rebalance，冻结覆盖两处且持续到重建）；**220 重置位点**（只动点名的队列、队列代号 +1 让旧 ack 作废）；**拉模式消费者心跳**（假主从集群：报文形状 `CONSUME_ACTIVELY`/`subVersion=0`、首轮主从各一发、循环按周期重发、`shutdown()` 各收一发 35 且 `producerGroup` 缺席）；**FIRST_OFFSET 起点是字面量 0**（整份请求日志 `GET_MIN_OFFSET(31)` 出现 0 次，负控腿 LAST_OFFSET 必须发 `GET_MAX_OFFSET`）；**拉取游标跟随 `nextBeginOffset`**（`NO_MATCHED_MSG` 跟过整段、`OFFSET_ILLEGAL` 采纳纠正值、在途 seek 刹车——负控用闸门拉出确定性窗口）；**lite 请求码 361 + lite 位**（从收到的请求取 `code` 与 `sysFlag`，经典对照腿 11 且无 lite 位）；**清扫逃生口 14 项**（只扫本实例持有的队列、单轮 `min(size,16)`、严格大于过期、只回投失败才放回、两道队首闸门、顺序队列整支跳过、回投时刻按 containsMessage 复核） |
+| 轨迹四件套 `trace` / `trace_hook` / `trace_dispatcher` / `trace_context` | 104 | Pub / SubBefore / SubAfter / EndTransaction / Recall 编解码双向、SOH/STX 文本格式、无 keys 空段容错、坏记录只跳过自己、分发器攒批/切块/防递归、W3C `traceparent` 生成与校验 |
+| `client` 其余 | 153 | `mq_client`（实例表复用、心跳装配、路由缓存、**共用实例的关闭守卫**：最后一个租户退场才真拆并摘 `INSTANCE_MAP`；**退出注销 35 遍历每个 brokerId——从节点也各收一发**，与心跳只打 master 的分工一起断言；**消费者心跳同样覆盖从节点**；空白组名整个字段不上线；**220 的收包口径**：数组与 map 两种 body 都能解、处理不在读线程上做、组不匹配安静丢弃）；**5 项发布地址只认 master**（只剩从节点时解析不到而退让口径拿得到、缓存为空先刷一次路由恰好一次、本端报 `The broker[X] not exist` 而不是打到从节点换可重试码、`get_max_offset` 同口径）；`admin`（properties 文本、分页合并、**222 请求体的 ext key 名 `isForce`**——写错时 broker 侧恒为 false 静默走错分支）；`latency`、`hook`、`request_reply`、`metrics`、`top_addressing`、`result`、`validators` |
 | `error` | 3 | 错误码 10001..10007（`REQUEST_TIMEOUT_EXCEPTION` 由 `Error::RequestTimeout` 带出、`CREATE_REPLY_MESSAGE_EXCEPTION` 由 `create_reply_message` 带出）与 `Display` |
 
 ## 真实集群联调
@@ -165,6 +168,12 @@ rust/
 `(类名, [字段名])` 表 + `serialize.rs` 的 JSON 容错就是为守住这件事而存在，
 别改成"看着更自然"的命名。
 
+**POP 的队列来自客户端 rebalance，不是 broker 分配。** Java 在 `clientRebalance=false` 时走
+`RebalanceImpl#getRebalanceResultFromBroker:345` → `MQClientAPIImpl#queryAssignment:405`
+（QUERY_ASSIGNMENT=400，回 `MessageQueueAssignment` mode=POP），由 broker 决定本实例拿哪些队列。
+本端口**刻意不实现那条路径**（七端同一决定），`client_rebalance` 字段恒为 `true`、只是对齐形状：
+队列由本地分配策略算出，然后每队列一个 POP 循环 + ack。语义等价，差别只在"谁决定队列集合"。
+
 **分配策略的守卫不抛异常。** `currentCID` 空串 / `mqAll` 空 / `cidAll` 空
 **返回空结果**。两个例外分得很清：`MACHINE_ROOM_NEARBY` 的 resolver 给出空机房会**抛错**
 （静默返回空等于把整个 topic 的队列撤走），缺参数在构造期由类型排除。
@@ -211,7 +220,7 @@ rust/
 | `ROCKETMQ_CLIENT_LOG_DIR` | `$HOME/logs/rocketmqlogs` | 取不到用户目录时退化为 `logs/rocketmqlogs` |
 | `ROCKETMQ_CLIENT_LOG_FILE` | `rocketmq_rs_client.log` | 轮转后的名字带日期后缀 |
 | `ROCKETMQ_CLIENT_LOG_LEVEL` | `INFO` | `DEBUG` / `WARN`(`WARNING`) / `ERROR` / `OFF`(`NONE`)，其余一律按 INFO |
-| `ROCKETMQ_CLIENT_LOG_MAX_INDEX` | `10` | 保留份数 |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` | `10` | 保留份数 |
 | `ROCKETMQ_CLIENT_LOG_USE_STDOUT` | 开 | 设为 `false` 只写文件 |
 | `ROCKETMQ_TLS_ENABLE` | `false` | 打开后所有出连接走 `native-tls` |
 | `ROCKETMQ_TLS_TEST_MODE` | `true` | 信任自签证书、不校验主机名 |

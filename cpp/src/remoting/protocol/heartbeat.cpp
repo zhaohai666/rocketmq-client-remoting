@@ -18,6 +18,10 @@ const char* const MessageModel::CLUSTERING = "CLUSTERING";
 const char* const MessageModel::LITE_SELECTIVE = "LITE_SELECTIVE";
 
 const char* const ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET = "CONSUME_FROM_LAST_OFFSET";
+const char* const ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST =
+    "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST";
+const char* const ConsumeFromWhere::CONSUME_FROM_MIN_OFFSET = "CONSUME_FROM_MIN_OFFSET";
+const char* const ConsumeFromWhere::CONSUME_FROM_MAX_OFFSET = "CONSUME_FROM_MAX_OFFSET";
 const char* const ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET = "CONSUME_FROM_FIRST_OFFSET";
 const char* const ConsumeFromWhere::CONSUME_FROM_TIMESTAMP = "CONSUME_FROM_TIMESTAMP";
 

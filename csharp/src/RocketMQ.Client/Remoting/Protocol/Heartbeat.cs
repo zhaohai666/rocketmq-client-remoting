@@ -42,11 +42,33 @@ public static class MessageModel
 }
 
 /// <summary>org.apache.rocketmq.common.consumer.ConsumeFromWhere。</summary>
+/// <remarks>
+/// 三个 @Deprecated 的历史值照 Java 枚举原样保留（心跳里上报什么字符串 broker 就收什么），
+/// 语义上的回落规则在消费起点计算处（Java RebalancePushImpl#computePullFromWhereWithException）：
+/// LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST / MIN_OFFSET / MAX_OFFSET 三者**都按
+/// CONSUME_FROM_LAST_OFFSET 处理**。
+/// </remarks>
 public static class ConsumeFromWhere
 {
     public const string ConsumeFromLastOffset = "CONSUME_FROM_LAST_OFFSET";
     public const string ConsumeFromFirstOffset = "CONSUME_FROM_FIRST_OFFSET";
     public const string ConsumeFromTimestamp = "CONSUME_FROM_TIMESTAMP";
+
+    // Java @Deprecated 的三个历史值（勿删：用户配置文件里还有人在用，集群按字面回显）
+    public const string ConsumeFromLastOffsetAndFromMinWhenBootFirst =
+        "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST";
+    public const string ConsumeFromMinOffset = "CONSUME_FROM_MIN_OFFSET";
+    public const string ConsumeFromMaxOffset = "CONSUME_FROM_MAX_OFFSET";
+
+    /// <summary>Java RebalancePushImpl 的回落口径：三个弃用值一律视作 LAST_OFFSET。</summary>
+    public static string NormalizeDeprecated(string where)
+    {
+        return where is ConsumeFromLastOffsetAndFromMinWhenBootFirst
+            or ConsumeFromMinOffset
+            or ConsumeFromMaxOffset
+            ? ConsumeFromLastOffset
+            : where;
+    }
 }
 
 /// <summary>org.apache.rocketmq.remoting.protocol.heartbeat.ProducerData。</summary>

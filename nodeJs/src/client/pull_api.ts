@@ -70,6 +70,22 @@ export class PullAPI {
     this.pullFromWhichNode.delete(mqKey(mq));
   }
 
+  // pulledQueues is the table's key set rebuilt as MessageQueues — Java's
+  // pullFromWhichNodeTable keys, i.e. "the assignment this consumer is actually
+  // working". mqKey is the canonical topic@brokerName@queueId triple and neither
+  // name may contain '@' (Validators), so the split is unambiguous.
+  pulledQueues(): MessageQueue[] {
+    const out: MessageQueue[] = [];
+    for (const key of this.pullFromWhichNode.keys()) {
+      const first = key.indexOf('@');
+      const last = key.lastIndexOf('@');
+      if (first <= 0 || last <= first) continue;
+      out.push(new MessageQueue(key.slice(0, first), key.slice(first + 1, last),
+        parseInt(key.slice(last + 1), 10) || 0));
+    }
+    return out;
+  }
+
   // findBrokerAddressInSubscribe mirrors Java MQClientInstance
   // #findBrokerAddressInSubscribe. Returns (addr, isSlave) or null. The
   // isSlave flag comes from the id that was ACTUALLY matched.

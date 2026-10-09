@@ -55,32 +55,28 @@ use crate::client::mq_client::{
     MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
 use crate::client::produce_accumulator::{
-    get_or_create_produce_accumulator, AccumulatorSender, ProduceAccumulator,
-    TIMER_DELAY_KEYS,
+    get_or_create_produce_accumulator, AccumulatorSender, ProduceAccumulator, TIMER_DELAY_KEYS,
 };
 use crate::client::request_reply::{
-    create_correlation_id, request_future_holder, RequestResponseFuture,
-    DEFAULT_REQUEST_TIMEOUT_MILLIS,
+    create_correlation_id, request_future_holder, start_expired_request_scan,
+    stop_expired_request_scan, RequestResponseFuture, DEFAULT_REQUEST_TIMEOUT_MILLIS,
 };
-use crate::client::result::{
-    LocalTransactionState, SendResult, SendStatus, TransactionSendResult,
-};
+use crate::client::result::{LocalTransactionState, SendResult, SendStatus, TransactionSendResult};
 use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
 use crate::client::trace::TraceContext;
+use crate::client::trace_context::{inject_trace_context, trace_context_enabled_from_env};
 use crate::client::trace_dispatcher::{
     AsyncTraceDispatcher, TraceDispatcherConfig, TraceDispatcherType, TraceHost, TraceProducer,
     TraceProducerFuture,
 };
-use crate::client::trace_hook::{
-    EndTransactionTraceHook, SendMessageTraceHook, TraceReportSink,
-};
+use crate::client::trace_hook::{EndTransactionTraceHook, SendMessageTraceHook, TraceReportSink};
 use crate::client::validators;
 use crate::common::compression;
-use crate::common::message_client_id_setter::set_uniq_id;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
+use crate::common::message_client_id_setter::set_uniq_id;
 use crate::common::message_const::{
-    PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME_LEVEL, PROPERTY_DELAY_TIME,
+    PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME, PROPERTY_DELAY_TIME_LEVEL,
     PROPERTY_MESSAGE_REPLY_TO_CLIENT, PROPERTY_MESSAGE_TTL, PROPERTY_PRODUCER_GROUP,
     PROPERTY_TRANSACTION_PREPARED, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
 };
@@ -103,7 +99,6 @@ use crate::remoting::protocol::heartbeat::{HeartbeatData, ProducerData};
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
-use crate::client::trace_context::{inject_trace_context, trace_context_enabled_from_env};
 use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 
 /// 发送重试内核的离线对拍（进程内假集群），见该模块文档。
@@ -251,11 +246,17 @@ impl ClosureSendCallback {
     }
 
     fn take_success(&self) -> Option<OnSuccessFn> {
-        self.success.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.success
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     fn take_failure(&self) -> Option<OnExceptionFn> {
-        self.failure.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 }
 
@@ -395,6 +396,10 @@ pub struct ProducerConfig {
     /// Java `ClientConfig#unitName`（默认 null）：非空时拼进 clientId，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
+    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
+    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
+    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
+    pub namespace_v2: Option<String>,
     /// Java `ClientConfig#unitMode`（默认 false）：随发送、回投、鉴权、消息过滤
     /// 等请求一起上线，broker 据此给自动创建的 topic 打 UNIT / UNIT_SUB 位。
     pub unit_mode: bool,
@@ -493,6 +498,7 @@ impl Default for ProducerConfig {
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
+            namespace_v2: None,
             unit_mode: false,
             // Java `DefaultMQProducer` 不碰这个开关（只有拉模式/轻量消费者构造函数里置 true）
             enable_stream_request_type: false,
@@ -620,11 +626,18 @@ impl Inner {
     /// 对位 Java `sendKernelImpl:996-997`（`producer.getCreateTopicKey()` /
     /// `producer.getDefaultTopicQueueNums()`）。
     fn create_topic_key(&self) -> String {
-        self.cfg.read().unwrap_or_else(|e| e.into_inner()).create_topic_key.clone()
+        self.cfg
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .create_topic_key
+            .clone()
     }
 
     fn default_topic_queue_nums(&self) -> i32 {
-        self.cfg.read().unwrap_or_else(|e| e.into_inner()).default_topic_queue_nums
+        self.cfg
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .default_topic_queue_nums
     }
 
     fn client(&self) -> Option<MQClientInstance> {
@@ -635,10 +648,7 @@ impl Inner {
     }
 
     fn trace_dispatcher(&self) -> Option<Arc<dyn TraceDispatcherChannel>> {
-        self.trace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.trace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -776,11 +786,7 @@ pub struct DefaultMQProducer {
 impl std::fmt::Debug for DefaultMQProducer {
     /// 只打印身份与状态：钩子/监听器是 `dyn Trait`，打不出内容。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cfg = self
-            .inner
-            .cfg
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let cfg = self.inner.cfg.read().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("DefaultMQProducer")
             .field("producer_group", &cfg.producer_group)
             .field("namespace", &cfg.namespace)
@@ -932,6 +938,18 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.unit_name = unit_name.map(str::to_string));
     }
 
+    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
+    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
+    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
+    pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
+        self.write_cfg(|c| c.namespace_v2 = namespace_v2.map(str::to_string));
+    }
+
+    /// Java `ClientConfig#getNamespaceV2`。
+    pub fn get_namespace_v2(&self) -> Option<String> {
+        self.config().namespace_v2
+    }
+
     /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.write_cfg(|c| c.unit_mode = unit_mode);
@@ -1072,8 +1090,17 @@ impl DefaultMQProducer {
     }
 
     /// Python `set_compress_type`（取 [`MessageSysFlag::ZLIB_TYPE`] 等**算法号**）。
-    pub fn set_compress_type(&self, compression_type: i32) {
-        self.write_cfg(|c| c.compress_type = compression_type);
+    ///
+    /// 对齐 Java `DefaultMQProducer.setCompressType`
+    /// → `CompressionType.of(...)`/`findByValue`：**未知值在 set 时就报错**
+    /// （Java 抛 `RuntimeException("Unknown compress type value: ...")`），而不是等
+    /// 发送阶段才发现算法不认识。已知值按 `findByValue` 的兼容映射归一
+    /// （`0` → ZLIB）后再落配置，保证后续发送侧的 `try_to_compress_message`
+    /// 拿到的必然是三种受支持算法之一。
+    pub fn set_compress_type(&self, compression_type: i32) -> Result<()> {
+        let normalized = compression::validate_compression_type(compression_type)?;
+        self.write_cfg(|c| c.compress_type = normalized);
+        Ok(())
     }
 
     /// Python `set_create_topic_key`。
@@ -1104,7 +1131,9 @@ impl DefaultMQProducer {
     /// （策略是 `Arc` 共享的，所以运行中切换也生效）。
     pub fn set_send_latency_fault_enable(&self, enable: bool) {
         self.write_cfg(|c| c.send_latency_fault_enable = enable);
-        self.inner.fault_strategy.set_send_latency_fault_enable(enable);
+        self.inner
+            .fault_strategy
+            .set_send_latency_fault_enable(enable);
     }
 
     /// Python `set_request_timeout`。
@@ -1213,11 +1242,7 @@ impl DefaultMQProducer {
 
     /// 注入轨迹分发器（差异 4）。传 `None` 撤销注入。
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
-        *self
-            .inner
-            .trace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = dispatcher;
+        *self.inner.trace.lock().unwrap_or_else(|e| e.into_inner()) = dispatcher;
     }
 
     /// 已注入的轨迹分发器（Python `trace_dispatcher` 属性）。
@@ -1295,20 +1320,12 @@ impl DefaultMQProducer {
 
     /// Python `self.xxx = value` 的统一入口。
     fn write_cfg(&self, f: impl FnOnce(&mut ProducerConfig)) {
-        f(&mut self
-            .inner
-            .cfg
-            .write()
-            .unwrap_or_else(|e| e.into_inner()));
+        f(&mut self.inner.cfg.write().unwrap_or_else(|e| e.into_inner()));
     }
 
     /// [`Self::write_cfg`] 的只读版：锁毒化时同样带着旧值继续，绝不在读配置上 panic。
     fn read_cfg<T>(&self, f: impl FnOnce(&ProducerConfig) -> T) -> T {
-        f(&self
-            .inner
-            .cfg
-            .read()
-            .unwrap_or_else(|e| e.into_inner()))
+        f(&self.inner.cfg.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     // ---------------- 生命周期 ----------------
@@ -1396,6 +1413,7 @@ impl DefaultMQProducer {
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
             unit_name: cfg.unit_name.clone(),
+            namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
             route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
             ..Default::default()
@@ -1418,11 +1436,7 @@ impl DefaultMQProducer {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        *self
-            .inner
-            .client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
+        *self.inner.client.lock().unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
         // Java `DefaultMQProducerImpl#start`:258 `mQClientFactory.registerProducer`：
         // 登记组名，实例的关闭守卫才知道还有生产者在用它（同 clientId 的别人先退，
         // 也不该把本生产者的心跳与路由刷新拆掉）。
@@ -1483,9 +1497,12 @@ impl DefaultMQProducer {
                     drop(inner);
                     // Python 以 1s 为粒度轮询 `_heartbeat_running`；watch 通道
                     // 直接等到点或被叫醒。
-                    if tokio::time::timeout(Duration::from_millis(interval_millis.max(1000)), rx.changed())
-                        .await
-                        .is_ok()
+                    if tokio::time::timeout(
+                        Duration::from_millis(interval_millis.max(1000)),
+                        rx.changed(),
+                    )
+                    .await
+                    .is_ok()
                     {
                         return; // 停止信号（或发送端已释放）
                     }
@@ -1495,13 +1512,20 @@ impl DefaultMQProducer {
         } else {
             // 没有运行时就没法跑心跳：发送本身仍可用（Python 的线程也一样会失败吗？
             // 不会，Python 总能起线程）。这里显式告警，避免用户静默丢掉事务回查能力。
-            rmq_warn!("producer: no tokio runtime, heartbeat disabled; broker transaction \
-                       check-back will not reach this producer");
+            rmq_warn!(
+                "producer: no tokio runtime, heartbeat disabled; broker transaction \
+                       check-back will not reach this producer"
+            );
         }
 
         // 轨迹分发器在锁外启动（Java 同样在 defaultMQProducerImpl.start() 之后做）：
         // 它要新建内部生产者并拉路由，属网络操作，不该占着生产者自己的锁。
         self.start_trace_dispatcher();
+
+        // Java `DefaultMQProducerImpl#start`:259 `RequestFutureHolder.getInstance()
+        // .startScheduledTask(this)`：请求-应答等待槽的超时清扫（首轮 3s、此后 1s 一轮，
+        // 引用计数与 shutdown 的 stop 成对）。
+        start_expired_request_scan();
         Ok(())
     }
 
@@ -1531,6 +1555,9 @@ impl DefaultMQProducer {
         {
             task.abort();
         }
+        // Java `DefaultMQProducerImpl#shutdown`:315 `RequestFutureHolder.getInstance()
+        // .shutdown(this)`：最后一个 producer 退出时停掉等待槽的清扫任务。
+        stop_expired_request_scan();
         // ⚠ 与 Python 的差别：Python 只把 `_mq_client` 留着（下次 start 会新建并覆盖
         // INSTANCE_MAP）；这里丢掉引用，好让 `create_mq_client_instance` 在重启时
         // 建出干净的新实例，而不是复用一个已被 shutdown 的。
@@ -1749,6 +1776,10 @@ impl TraceProducer for DefaultMQProducer {
         DefaultMQProducer::set_instance_name(self, instance_name);
     }
 
+    fn set_namespace_v2(&self, namespace_v2: &str) {
+        DefaultMQProducer::set_namespace_v2(self, Some(namespace_v2));
+    }
+
     fn set_send_msg_timeout(&self, timeout_millis: i64) {
         DefaultMQProducer::set_send_msg_timeout(self, timeout_millis);
     }
@@ -1800,7 +1831,9 @@ impl TraceProducer for DefaultMQProducer {
         self: Arc<Self>,
         topic: String,
     ) -> TraceProducerFuture<Result<Vec<MessageQueue>>> {
-        Box::pin(async move { DefaultMQProducer::fetch_publish_message_queues(&self, &topic).await })
+        Box::pin(
+            async move { DefaultMQProducer::fetch_publish_message_queues(&self, &topic).await },
+        )
     }
 }
 
@@ -2058,11 +2091,7 @@ impl DefaultMQProducer {
     /// `None`（body 未被改动，不需要还原）。
     fn try_to_compress_message(&self, msg: &mut Message) -> (i32, Option<Vec<u8>>) {
         let (threshold, compress_type, level) = {
-            let cfg = self
-                .inner
-                .cfg
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let cfg = self.inner.cfg.read().unwrap_or_else(|e| e.into_inner());
             (
                 cfg.compress_msg_body_over_howmuch,
                 cfg.compress_type,
@@ -2333,8 +2362,14 @@ impl DefaultMQProducer {
                 )
                 .await;
         }
-        let mut context =
-            self.build_send_context(msg.as_message(), &group, &namespace, mq_sel, &broker_addr, mode);
+        let mut context = self.build_send_context(
+            msg.as_message(),
+            &group,
+            &namespace,
+            mq_sel,
+            &broker_addr,
+            mode,
+        );
         crate::client::hook::execute_send_message_hook_before(&self.inner.send_hooks, &mut context);
         match client
             .send_message(
@@ -2395,7 +2430,11 @@ impl DefaultMQProducer {
         let sender: Arc<dyn AccumulatorSender> = Arc::new(self.clone());
         let accumulator = get_or_create_produce_accumulator(&client_id, sender);
         let (delay_ms, bytes, total) = self.read_cfg(|c| {
-            (c.batch_max_delay_ms, c.batch_max_bytes, c.total_batch_max_bytes)
+            (
+                c.batch_max_delay_ms,
+                c.batch_max_bytes,
+                c.total_batch_max_bytes,
+            )
         });
         if delay_ms > -1 {
             accumulator.batch_max_delay_ms(delay_ms)?;
@@ -2431,7 +2470,8 @@ impl DefaultMQProducer {
 
     /// Java `DefaultMQProducer.getBatchMaxDelayMs():1191-1194`：累加器为 `null` 时返回 0。
     pub fn get_batch_max_delay_ms(&self) -> i64 {
-        self.produce_accumulator().map_or(0, |a| a.get_batch_max_delay_ms())
+        self.produce_accumulator()
+            .map_or(0, |a| a.get_batch_max_delay_ms())
     }
 
     /// Java `batchMaxDelayMs(int)`：先记在配置上，已经是 start 过的生产者则立即同步给累加器。
@@ -2444,7 +2484,8 @@ impl DefaultMQProducer {
     }
 
     pub fn get_batch_max_bytes(&self) -> i64 {
-        self.produce_accumulator().map_or(0, |a| a.get_batch_max_bytes())
+        self.produce_accumulator()
+            .map_or(0, |a| a.get_batch_max_bytes())
     }
 
     pub fn set_batch_max_bytes(&self, hold_size: i64) -> Result<()> {
@@ -2456,7 +2497,8 @@ impl DefaultMQProducer {
     }
 
     pub fn get_total_batch_max_bytes(&self) -> i64 {
-        self.produce_accumulator().map_or(0, |a| a.get_total_batch_max_bytes())
+        self.produce_accumulator()
+            .map_or(0, |a| a.get_total_batch_max_bytes())
     }
 
     pub fn set_total_batch_max_bytes(&self, total_hold_size: i64) -> Result<()> {
@@ -2486,7 +2528,10 @@ impl DefaultMQProducer {
         if max_delay_value(msg) > 0 {
             return false;
         }
-        if msg.get_topic().starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX) {
+        if msg
+            .get_topic()
+            .starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX)
+        {
             return false;
         }
         if msg.get_property(PROPERTY_PRODUCER_GROUP).is_some() {
@@ -2833,7 +2878,9 @@ impl DefaultMQProducer {
             return Ok(result);
         }
         if call_timeout {
-            return Err(Error::TooMuchRequest("sendDefaultImpl call timeout".to_string()));
+            return Err(Error::TooMuchRequest(
+                "sendDefaultImpl call timeout".to_string(),
+            ));
         }
         // 文案与 Python `producer.py:734-741` 逐字一致（Java 同款拼接）。
         // 差别：Python 的 MQClientException 带 cause，本 crate 的 Error 没有 cause 字段，
@@ -2855,7 +2902,10 @@ impl DefaultMQProducer {
             }
             _ => None,
         };
-        Err(Error::Client { response_code: code, message: info })
+        Err(Error::Client {
+            response_code: code,
+            message: info,
+        })
     }
 
     /// Python `send` 的批量分支（`_send_batch`）。
@@ -2972,7 +3022,9 @@ impl DefaultMQProducer {
             // 入口 `impl.send(msg, mq, timeout)`，所以文案是同步那一处。
             let batch_topic = publish.as_message().topic.clone();
             self.check_pinned_topic(&batch_topic, mq, PINNED_TOPIC_MISMATCH_SYNC)?;
-            return self.send_pinned(&client, &mut publish, mq, timeout, sys_flag).await;
+            return self
+                .send_pinned(&client, &mut publish, mq, timeout, sys_flag)
+                .await;
         }
         self.send_with_retry(&client, &mut publish, timeout, retry_times, sys_flag)
             .await
@@ -3231,7 +3283,8 @@ impl DefaultMQProducer {
         if timeout_millis.is_none() && self.get_auto_batch() {
             let topic = self.with_namespace(msg.get_topic());
             msg.set_topic(&topic);
-            if let Err(e) = self.send_by_accumulator_async(msg, mq.as_ref(), Arc::clone(&callback)) {
+            if let Err(e) = self.send_by_accumulator_async(msg, mq.as_ref(), Arc::clone(&callback))
+            {
                 callback.on_exception(e);
             }
             return Ok(());
@@ -3250,9 +3303,9 @@ impl DefaultMQProducer {
     ) -> Result<()> {
         // Python `send_async:1098-1102`：未启动 / 池已关都同步抛，不走回调。
         let _ = self.require_client()?;
-        let handle = self.runtime_handle().ok_or_else(|| {
-            Error::client("send_async needs a tokio runtime; call start() first")
-        })?;
+        let handle = self
+            .runtime_handle()
+            .ok_or_else(|| Error::client("send_async needs a tokio runtime; call start() first"))?;
         let timeout = timeout_millis.unwrap_or_else(|| self.read_cfg(|c| c.send_msg_timeout));
         // Java `DefaultMQProducerImpl:548-556`：进链的是一位包了背压归还的用户回调；
         // 字节数在这里（**压缩之前**）就定下来，后面重试/压缩都不改口。
@@ -3272,11 +3325,7 @@ impl DefaultMQProducer {
     /// 开了背压就**就地跑完这一笔**，因为许可已经扣掉、不跑完就要白等超时归还。
     /// Rust 的「就地」不能像 Java 那样阻塞调用方线程（见 [`send_async`](Self::send_async)
     /// 文档里「闸在池子里等」那一段），所以派发到队列之外。
-    fn submit_async_job(
-        &self,
-        handle: tokio::runtime::Handle,
-        job: AsyncSendJob,
-    ) -> Result<()> {
+    fn submit_async_job(&self, handle: tokio::runtime::Handle, job: AsyncSendJob) -> Result<()> {
         let submitted = {
             let slot = self
                 .inner
@@ -3409,16 +3458,14 @@ impl DefaultMQProducer {
             }
         }
         // 批量内核自己校验每条子消息、拼命名空间、查同质性；这里的错误原样交付回调。
-        let outcome = self.send_batch(msgs, mq.as_ref(), Some(timeout - cost)).await;
-        self.complete_async(&callback, outcome, None, Some(permits));    }
+        let outcome = self
+            .send_batch(msgs, mq.as_ref(), Some(timeout - cost))
+            .await;
+        self.complete_async(&callback, outcome, None, Some(permits));
+    }
 
     /// 一个「不发请求就终止」的出口：归还许可 + 交付错误。
-    fn fail_async(
-        &self,
-        callback: &Arc<dyn SendCallback>,
-        error: Error,
-        permits: SendPermits,
-    ) {
+    fn fail_async(&self, callback: &Arc<dyn SendCallback>, error: Error, permits: SendPermits) {
         self.complete_async(callback, Err(error), None, Some(permits));
     }
 
@@ -3476,7 +3523,7 @@ impl DefaultMQProducer {
                                 e.to_string(),
                             ),
                             permits,
-                        )
+                        );
                     }
                     Err(e) => return self.fail_async(&callback, e, permits),
                 };
@@ -3500,13 +3547,15 @@ impl DefaultMQProducer {
                                  last error: {e}"
                             )),
                             permits,
-                        )
+                        );
                     }
                 }
             }
         };
-        self.send_kernel_async(&client, msg, &mq_sel, publish, sys_flag, callback, permits, timeout)
-            .await;
+        self.send_kernel_async(
+            &client, msg, &mq_sel, publish, sys_flag, callback, permits, timeout,
+        )
+        .await;
     }
 
     /// Python `_send_kernel_async`（Java `sendKernelImpl` 的 **ASYNC 分支**）：地址解析 →
@@ -3558,9 +3607,18 @@ impl DefaultMQProducer {
         let group = self.inner.producer_group();
         let namespace = self.inner.namespace();
         let context = if self.has_send_message_hook() {
-            let mut context =
-                self.build_send_context(msg, &group, &namespace, mq, &addr, CommunicationMode::Async);
-            crate::client::hook::execute_send_message_hook_before(&self.inner.send_hooks, &mut context);
+            let mut context = self.build_send_context(
+                msg,
+                &group,
+                &namespace,
+                mq,
+                &addr,
+                CommunicationMode::Async,
+            );
+            crate::client::hook::execute_send_message_hook_before(
+                &self.inner.send_hooks,
+                &mut context,
+            );
             Some(context)
         } else {
             None
@@ -3573,7 +3631,9 @@ impl DefaultMQProducer {
         if timeout < cost {
             return self.complete_async(
                 &callback,
-                Err(Error::TooMuchRequest("sendKernelImpl call timeout".to_string())),
+                Err(Error::TooMuchRequest(
+                    "sendKernelImpl call timeout".to_string(),
+                )),
                 context,
                 Some(permits),
             );
@@ -3802,12 +3862,11 @@ impl AsyncSendChain {
         // 选不到就沿用当前目标（Python 同）。
         let (broker_name, mq) = match &self.publish {
             None => (self.broker_name.clone(), self.mq.clone()),
-            Some(publish) => match self
-                .producer
-                .inner
-                .fault_strategy
-                .select_one_message_queue(&**publish, Some(&self.broker_name), false)
-            {
+            Some(publish) => match self.producer.inner.fault_strategy.select_one_message_queue(
+                &**publish,
+                Some(&self.broker_name),
+                false,
+            ) {
                 Ok(selected) => (
                     selected.broker_name.clone(),
                     MessageQueue::new(&self.mq.topic, &selected.broker_name, selected.queue_id),
@@ -3859,22 +3918,27 @@ impl AsyncSendChain {
 /// broker 明确回了错就不会换 broker 重试。别和同步发送的语义混为一谈。
 fn classify_async_failure(err: Error, cost: i64) -> (Error, bool) {
     match err {
-        e @ Error::SendRequest { .. } => {
-            (Error::client(format!("send request failed, last error: {e}")), true)
-        }
+        e @ Error::SendRequest { .. } => (
+            Error::client(format!("send request failed, last error: {e}")),
+            true,
+        ),
         e @ Error::Timeout { .. } => (
-            Error::client(format!("wait response timeout, cost={cost}, last error: {e}")),
+            Error::client(format!(
+                "wait response timeout, cost={cost}, last error: {e}"
+            )),
             true,
         ),
         // 其余 RemotingException 都是 `"unknown reason"`，但 `RemotingTooMuchRequestException`
         // 是「自己人太多」，换 broker 也没用（Python 同：`not isinstance(e, RemotingTooMuch…)`）。
-        e @ Error::TooMuchRequest(_) => {
-            (Error::client(format!("unknown reason, last error: {e}")), false)
-        }
+        e @ Error::TooMuchRequest(_) => (
+            Error::client(format!("unknown reason, last error: {e}")),
+            false,
+        ),
         // 连不上（Java 的 `RemotingConnectException`）也属 RemotingException：换一台有机会。
-        e @ (Error::Connect { .. } | Error::RemotingCommand(_) | Error::Io(_)) => {
-            (Error::client(format!("unknown reason, last error: {e}")), true)
-        }
+        e @ (Error::Connect { .. } | Error::RemotingCommand(_) | Error::Io(_)) => (
+            Error::client(format!("unknown reason, last error: {e}")),
+            true,
+        ),
         e => (e, false),
     }
 }
@@ -3970,10 +4034,7 @@ impl DefaultMQProducer {
 
         // 半消息标记（broker 侧据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC）
         msg.put_property(PROPERTY_TRANSACTION_PREPARED, "true");
-        msg.put_property(
-            PROPERTY_PRODUCER_GROUP,
-            &self.inner.producer_group(),
-        );
+        msg.put_property(PROPERTY_PRODUCER_GROUP, &self.inner.producer_group());
         // 回查时按此 listener 回调（broker 通过 PGROUP 属性定位到本生产者）
         self.set_transaction_listener(Some(listener.clone()));
 
@@ -4015,8 +4076,8 @@ impl DefaultMQProducer {
         // `end_transaction` 报的也是剥过的 topic —— Java 5.5.1 `endTransaction:1543` 用的
         // 正是 `msg.getTopic()`（`queueWithNamespace` 只管定位 brokerName）。
         self.restore_caller_message(msg, prev_body);
-        let send_result = half_sent
-            .map_err(|e| Error::client(format!("send message Exception: {e}")))?;
+        let send_result =
+            half_sent.map_err(|e| Error::client(format!("send message Exception: {e}")))?;
 
         let mut state = LocalTransactionState::Unknow;
         if send_result.status == SendStatus::SendOk {
@@ -4030,7 +4091,9 @@ impl DefaultMQProducer {
             state = listener.execute_local_transaction(msg, arg.as_ref());
         } else if matches!(
             send_result.status,
-            SendStatus::FlushDiskTimeout | SendStatus::FlushSlaveTimeout | SendStatus::SlaveNotAvailable
+            SendStatus::FlushDiskTimeout
+                | SendStatus::FlushSlaveTimeout
+                | SendStatus::SlaveNotAvailable
         ) {
             state = LocalTransactionState::RollbackMessage;
         }
@@ -4097,10 +4160,7 @@ impl DefaultMQProducer {
                 broker_addr.clone()
             }
             // Java：id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
-            TxnEnd::Normal {
-                send_result,
-                msg,
-            } => {
+            TxnEnd::Normal { send_result, msg } => {
                 let id = send_result
                     .offset_msg_id
                     .as_deref()
@@ -4133,7 +4193,10 @@ impl DefaultMQProducer {
         );
         cmd.remark = remark;
         cmd.make_custom_header_to_net();
-        client.remoting_client().invoke_oneway(&broker_addr, &mut cmd).await?;
+        client
+            .remoting_client()
+            .invoke_oneway(&broker_addr, &mut cmd)
+            .await?;
 
         // 对应 Java endTransaction 末尾的 executeEndTransactionHook
         if self.inner.end_txn_hooks.has_hooks() {
@@ -4164,11 +4227,7 @@ impl DefaultMQProducer {
     /// （body 为整条编码后的 `MessageExt`），因此**不回响应**，而是在新任务里调
     /// `listener.check_local_transaction`，再以
     /// `END_TRANSACTION(fromTransactionCheck=true)` 把最终状态告知 broker。
-    fn handle_check_transaction_state(
-        &self,
-        request: RemotingCommand,
-        addr: String,
-    ) -> Result<()> {
+    fn handle_check_transaction_state(&self, request: RemotingCommand, addr: String) -> Result<()> {
         let header: CheckTransactionStateRequestHeader =
             match request.decode_command_custom_header() {
                 Ok(h) => h,
@@ -4202,9 +4261,7 @@ impl DefaultMQProducer {
         let listener = match self.transaction_listener() {
             Some(l) => l,
             None => {
-                rmq_warn!(
-                    "checkTransactionState: no transaction listener for group {group}"
-                );
+                rmq_warn!("checkTransactionState: no transaction listener for group {group}");
                 return Ok(());
             }
         };
@@ -4324,11 +4381,17 @@ impl DefaultMQProducer {
         // 立即回调」的包装，所以这里等价于同步发。协议上无差别 —— 应答是 broker 通过
         // **另一条** 326 通道推回来的，与本次发送的 CommunicationMode 无关。
         // 发送失败时把 future 标成 !send_request_ok 并主动唤醒等待方。
-        let send_timeout = if timeout > cost { timeout - cost } else { timeout };
+        let send_timeout = if timeout > cost {
+            timeout - cost
+        } else {
+            timeout
+        };
         if let Err(e) = self.send(msg, Some(send_timeout), mq).await {
             future.set_failed(e);
         }
-        let result = self.wait_request_response(&topic, timeout, &future, cost).await;
+        let result = self
+            .wait_request_response(&topic, timeout, &future, cost)
+            .await;
         // Python 的 `finally: REQUEST_FUTURE_HOLDER.remove_request(...)`
         request_future_holder().remove_request(&correlation_id);
         result
@@ -4377,7 +4440,9 @@ impl DefaultMQProducer {
         let client = self.require_client()?;
         let topic = self.with_namespace(topic);
         validators::check_topic(&topic)?;
-        if MixAll::is_retry_topic(Some(topic.as_str())) || MixAll::is_dlq_topic(Some(topic.as_str())) {
+        if MixAll::is_retry_topic(Some(topic.as_str()))
+            || MixAll::is_dlq_topic(Some(topic.as_str()))
+        {
             return Err(Error::client("topic is not supported"));
         }
         let handle = recall_message_handle::decode_handle(recall_handle)?;
@@ -4392,10 +4457,7 @@ impl DefaultMQProducer {
             .or_else(|| client.find_broker_addr_by_topic(&topic))
             .ok_or_else(|| {
                 // Java 先 log.warn 再抛，文案照抄。
-                rmq_warn!(
-                    "can't find broker service address. {}",
-                    handle.broker_name
-                );
+                rmq_warn!("can't find broker service address. {}", handle.broker_name);
                 Error::client("The broker service address not found")
             })?;
         let header = RecallMessageRequestHeader {
@@ -4444,14 +4506,24 @@ impl DefaultMQProducer {
         validators::is_system_topic(new_topic)?;
         let perm = PermName::PERM_READ | PermName::PERM_WRITE;
         client
-            .create_topic_in_route(new_topic, queue_num, queue_num, perm, topic_sys_flag, None, 5000)
+            .create_topic_in_route(
+                new_topic,
+                queue_num,
+                queue_num,
+                perm,
+                topic_sys_flag,
+                None,
+                5000,
+            )
             .await
     }
 
     /// Python `search_offset`：按时间戳找队列上的位点。
     pub async fn search_offset(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
         let client = self.require_client()?;
-        client.search_offset_by_timestamp(mq, timestamp, 5000, None).await
+        client
+            .search_offset_by_timestamp(mq, timestamp, 5000, None)
+            .await
     }
 
     /// Python `max_offset`。
@@ -4641,7 +4713,10 @@ mod tests {
         assert_eq!(cfg.instance_name, DEFAULT_INSTANCE_NAME);
         assert_eq!(cfg.client_id, None);
         assert_eq!(cfg.create_topic_key, MixAll::DEFAULT_TOPIC);
-        assert_eq!(cfg.default_topic_queue_nums, MixAll::DEFAULT_TOPIC_QUEUE_NUMS);
+        assert_eq!(
+            cfg.default_topic_queue_nums,
+            MixAll::DEFAULT_TOPIC_QUEUE_NUMS
+        );
         assert_eq!(cfg.send_msg_timeout, 3000);
         assert_eq!(cfg.compress_msg_body_over_howmuch, 1024 * 4);
         assert_eq!(cfg.compress_level, 5);
@@ -4669,8 +4744,7 @@ mod tests {
     #[test]
     fn producer_group_setter_works_before_start() {
         let p = producer("GID_keep");
-        p.set_producer_group("GID_new")
-            .expect("未启动时允许改组名");
+        p.set_producer_group("GID_new").expect("未启动时允许改组名");
         assert_eq!(p.producer_group(), "GID_new");
         // 空组名只在构造期校验（Python 的 setter 同样不校验）
         assert!(DefaultMQProducer::new("").is_err());
@@ -4698,9 +4772,7 @@ mod tests {
         // Integer.MIN_VALUE 的 abs 仍是负数，这里必须收敛到 0 而不是 panic
         let extreme = java_string_hash("\u{0}");
         let _ = extreme;
-        assert!(SelectMessageQueueByHash
-            .select(&[], &msg, "any")
-            .is_err());
+        assert!(SelectMessageQueueByHash.select(&[], &msg, "any").is_err());
     }
 
     #[test]
@@ -4713,9 +4785,7 @@ mod tests {
                 .expect("非空队列可选");
             assert!(mqs.contains(&got));
         }
-        assert!(SelectMessageQueueByRandom
-            .select(&[], &msg, "")
-            .is_err());
+        assert!(SelectMessageQueueByRandom.select(&[], &msg, "").is_err());
     }
 
     #[test]
@@ -4799,7 +4869,9 @@ mod tests {
                 remark: "system busy".into(),
             },
             Error::RemotingCommand("bad command".into()),
-            Error::Connect { addr: "1.2.3.4:10911".into() },
+            Error::Connect {
+                addr: "1.2.3.4:10911".into(),
+            },
             Error::SendRequest {
                 addr: "1.2.3.4:10911".into(),
                 message: "io".into(),
@@ -4833,7 +4905,9 @@ mod tests {
         assert!(p.check_message(&Message::new("", Some(b"x"))).is_err());
 
         p.set_max_message_size(4);
-        assert!(p.check_message(&Message::new("T1", Some(b"12345"))).is_err());
+        assert!(p
+            .check_message(&Message::new("T1", Some(b"12345")))
+            .is_err());
         assert!(p.check_message(&Message::new("T1", Some(b"1234"))).is_ok());
         // 空正文按 zero-length 拒（Java 的 body length is zero 那一支；
         // Message::new(topic, None) 与 Some(b"") 在这里同口径）
@@ -4853,7 +4927,10 @@ mod tests {
 
         let mut big = Message::new("T1", Some(&[b'a'; 4096]));
         let (flag, prev) = p.try_to_compress_message(&mut big);
-        assert_eq!(flag & MessageSysFlag::COMPRESSED_FLAG, MessageSysFlag::COMPRESSED_FLAG);
+        assert_eq!(
+            flag & MessageSysFlag::COMPRESSED_FLAG,
+            MessageSysFlag::COMPRESSED_FLAG
+        );
         assert_eq!(
             MessageSysFlag::get_compression_type(flag),
             MessageSysFlag::ZLIB_TYPE
@@ -4881,7 +4958,11 @@ mod tests {
         assert_eq!(first_flag, compression_flag(&p));
         let first_wire_body = msg.get_body().to_vec();
         p.restore_caller_message(&mut msg, prev);
-        assert_eq!(msg.get_body(), &[b'a'; 4096][..], "还原后应等于发送前的正文");
+        assert_eq!(
+            msg.get_body(),
+            &[b'a'; 4096][..],
+            "还原后应等于发送前的正文"
+        );
 
         // 再发一次：上线的仍是「原文压出来的那一串」
         let (second_flag, prev) = p.try_to_compress_message(&mut msg);
@@ -4921,14 +5002,40 @@ mod tests {
         assert_eq!(flag, 0);
         assert!(prev.is_none());
 
-        // 不支持的算法：降级为不压缩，正文保持原样
-        p.set_compress_type(9);
+        // 不支持的算法：set 时直接报错（Java `CompressionType.findByValue` 的
+        // `RuntimeException("Unknown compress type value: 9")`），配置不被改写。
+        // 旧版是发送阶段静默降级不压缩，用户拿不到任何信号。
+        assert!(
+            p.set_compress_type(9).is_err(),
+            "未知算法号必须在 set 时报错"
+        );
+        assert_eq!(
+            p.read_cfg(|c| c.compress_type),
+            MessageSysFlag::ZLIB_TYPE,
+            "报错时配置保持原值"
+        );
+        // 配置保持 ZLIB，所以这一笔**照常压缩**（不是降级）：标志位是 COMPRESSED|ZLIB，
+        // 并且交出压缩前的正文供 sendKernelImpl 的 finally 还原。
         let mut msg = Message::new("T1", Some(b"payload payload payload"));
         let before = msg.get_body().to_vec();
         let (flag, prev) = p.try_to_compress_message(&mut msg);
-        assert_eq!(flag, 0);
-        assert!(prev.is_none(), "降级为不压缩时不应交出 prevBody");
-        assert_eq!(msg.get_body(), before.as_slice());
+        assert_eq!(
+            flag,
+            MessageSysFlag::set_compression_type(
+                MessageSysFlag::COMPRESSED_FLAG,
+                MessageSysFlag::ZLIB_TYPE
+            )
+        );
+        assert_eq!(prev.as_deref(), Some(before.as_slice()));
+        assert_ne!(msg.get_body(), before.as_slice(), "body 已被压缩字节替换");
+
+        // 合法值（含老版本兼容的 0）set 成功并归一
+        p.set_compress_type(0).unwrap();
+        assert_eq!(p.read_cfg(|c| c.compress_type), MessageSysFlag::ZLIB_TYPE);
+        p.set_compress_type(MessageSysFlag::LZ4_TYPE).unwrap();
+        assert_eq!(p.read_cfg(|c| c.compress_type), MessageSysFlag::LZ4_TYPE);
+        p.set_compress_type(MessageSysFlag::ZSTD_TYPE).unwrap();
+        assert_eq!(p.read_cfg(|c| c.compress_type), MessageSysFlag::ZSTD_TYPE);
     }
 
     #[test]
@@ -4951,6 +5058,25 @@ mod tests {
         assert_eq!(p.with_namespace(&p.with_namespace("T1")), "ns1%T1");
     }
 
+    #[test]
+    fn namespace_v2_setter_getter_round_trip() {
+        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间，
+        // 与 v1 `namespace`（客户端 `%` 前缀，见上条用例）互不影响。
+        let p = producer("GID_nsv2");
+        assert_eq!(p.get_namespace_v2(), None, "默认不设");
+        p.set_namespace_v2(Some("NS_V2"));
+        assert_eq!(p.get_namespace_v2(), Some("NS_V2".to_string()));
+        assert_eq!(p.config().namespace_v2, Some("NS_V2".to_string()));
+        p.set_namespace_v2(None);
+        assert_eq!(
+            p.get_namespace_v2(),
+            None,
+            "None = 清除（Java setNamespaceV2(null)）"
+        );
+        p.set_namespace("ns1");
+        assert_eq!(p.get_namespace_v2(), None, "v1 namespace 不写 v2 字段");
+    }
+
     // ---------------- 钩子上下文 ----------------
 
     #[test]
@@ -4959,7 +5085,14 @@ mod tests {
         let m = mq("broker-a", 0);
 
         let plain = Message::new("T1", Some(b"x"));
-        let ctx = p.build_send_context(&plain, "GID_ctx", "", &m, "127.0.0.1:10911", CommunicationMode::Sync);
+        let ctx = p.build_send_context(
+            &plain,
+            "GID_ctx",
+            "",
+            &m,
+            "127.0.0.1:10911",
+            CommunicationMode::Sync,
+        );
         assert_eq!(ctx.msg_type, MessageType::NormalMsg);
         assert_eq!(ctx.communication_mode, Some(CommunicationMode::Sync));
         assert_eq!(ctx.broker_addr, "127.0.0.1:10911");
@@ -5079,7 +5212,11 @@ mod tests {
             .await
             .expect_err("拦截钩子的异常不该被吞");
         assert!(err.to_string().contains("forbidden by policy"));
-        assert_eq!(hook.before.load(Ordering::SeqCst), 0, "被拦截时不该跑发送钩子");
+        assert_eq!(
+            hook.before.load(Ordering::SeqCst),
+            0,
+            "被拦截时不该跑发送钩子"
+        );
         assert_eq!(hook.after.load(Ordering::SeqCst), 0);
     }
 
@@ -5094,7 +5231,15 @@ mod tests {
         let mut off = Message::new("T1", Some(b"body"));
         let mut publish = PublishMessage::Single(&mut off);
         let _ = p
-            .send_with_hooks(&client, &mut publish, &m, 100, 0, None, CommunicationMode::Sync)
+            .send_with_hooks(
+                &client,
+                &mut publish,
+                &m,
+                100,
+                0,
+                None,
+                CommunicationMode::Sync,
+            )
             .await;
         assert!(off.get_property(TRACE_CONTEXT_PROPERTY).is_none());
 
@@ -5102,7 +5247,15 @@ mod tests {
         let mut on = Message::new("T1", Some(b"body"));
         let mut publish = PublishMessage::Single(&mut on);
         let _ = p
-            .send_with_hooks(&client, &mut publish, &m, 100, 0, None, CommunicationMode::Sync)
+            .send_with_hooks(
+                &client,
+                &mut publish,
+                &m,
+                100,
+                0,
+                None,
+                CommunicationMode::Sync,
+            )
             .await;
         let injected = on
             .get_property(TRACE_CONTEXT_PROPERTY)
@@ -5115,7 +5268,15 @@ mod tests {
         existing.put_property(TRACE_CONTEXT_PROPERTY, "00-deadbeef-deadbeef-01");
         let mut publish = PublishMessage::Single(&mut existing);
         let _ = p
-            .send_with_hooks(&client, &mut publish, &m, 100, 0, None, CommunicationMode::Sync)
+            .send_with_hooks(
+                &client,
+                &mut publish,
+                &m,
+                100,
+                0,
+                None,
+                CommunicationMode::Sync,
+            )
             .await;
         assert_eq!(
             existing.get_property(TRACE_CONTEXT_PROPERTY),
@@ -5148,7 +5309,10 @@ mod tests {
     async fn send_before_start_fails_fast() {
         let p = producer("GID_lifecycle");
         let mut msg = Message::new("T1", Some(b"x"));
-        let err = p.send(&mut msg, None, None).await.expect_err("未启动不可发送");
+        let err = p
+            .send(&mut msg, None, None)
+            .await
+            .expect_err("未启动不可发送");
         assert!(err.to_string().contains("not started"));
         assert!(p.fetch_publish_message_queues("T1").await.is_err());
         // 未启动时 shutdown 幂等且不 panic
@@ -5203,7 +5367,8 @@ mod tests {
         let shared = MQClientInstance::find_instance(&a.client_id().expect("clientId"))
             .expect("同 clientId 的两个生产者必须落在同一份实例上");
         assert!(
-            shared.has_producer(&a.config().producer_group) && shared.has_producer(&b.config().producer_group),
+            shared.has_producer(&a.config().producer_group)
+                && shared.has_producer(&b.config().producer_group),
             "生产者没有登记到共用实例的 producerTable"
         );
         // 守卫：先退的那个不能把还在用的实例拆掉
@@ -5269,7 +5434,10 @@ mod tests {
     async fn start_rejects_bad_producer_group_without_touching_network() {
         let long_group = std::iter::repeat_n('g', 121).collect::<String>();
         for (group, needle) in [
-            ("DEFAULT_PRODUCER", "producerGroup can not equal DEFAULT_PRODUCER"),
+            (
+                "DEFAULT_PRODUCER",
+                "producerGroup can not equal DEFAULT_PRODUCER",
+            ),
             ("bad group", "contains illegal characters"),
             (long_group.as_str(), "is longer than group max length"),
         ] {
@@ -5311,7 +5479,10 @@ mod tests {
         p.set_namespace("ns".repeat(30).as_str());
         // 包装后是 ns…ns%g，长度 90+1+110 > 120
         let err = p.start().await.expect_err("包装后超长必须报错");
-        assert!(err.to_string().contains("is longer than group max length"), "{err}");
+        assert!(
+            err.to_string().contains("is longer than group max length"),
+            "{err}"
+        );
         assert!(!p.is_started());
     }
 
@@ -5370,7 +5541,10 @@ mod tests {
         assert_eq!(batch_back_pressure_msg_len(&[one.clone(), one.clone()]), 10);
         // 空 body 也算 1（与单条口径一致：0 等于不限流）
         assert_eq!(batch_back_pressure_msg_len(std::slice::from_ref(&empty)), 1);
-        assert_eq!(batch_back_pressure_msg_len(&[empty.clone(), empty.clone()]), 2);
+        assert_eq!(
+            batch_back_pressure_msg_len(&[empty.clone(), empty.clone()]),
+            2
+        );
         assert_eq!(batch_back_pressure_msg_len(&[one, empty]), 6);
         assert_eq!(batch_back_pressure_msg_len(&[]), 1);
     }
@@ -5470,7 +5644,9 @@ mod tests {
         assert_eq!(back.commit_log_offset, Some(42));
         assert_eq!(back.from_transaction_check, Some(true));
 
-        let resp = GetEarliestMsgStoretimeResponseHeader { timestamp: Some(1234) };
+        let resp = GetEarliestMsgStoretimeResponseHeader {
+            timestamp: Some(1234),
+        };
         let ext = ExtFields::from_header(&resp);
         let mut back = GetEarliestMsgStoretimeResponseHeader::default();
         back.from_ext_fields(&ext);

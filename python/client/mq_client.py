@@ -59,7 +59,7 @@ from remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader
 from remoting.protocol.heartbeat import HeartbeatData
 from remoting.protocol.remoting_command import RemotingCommand
 from remoting.protocol.route import TopicRouteData
-from remoting.rpchook import StreamTypeRPCHook
+from remoting.rpchook import NamespaceRpcHook, StreamTypeRPCHook
 from .consumer_stats import ConsumerStatsManager
 from .exception import ClientErrorCode, MQBrokerException, MQClientException
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
@@ -126,6 +126,7 @@ class MQClientInstance:
                  tls_options: Optional[Dict[str, str]] = None,
                  enable_stream_request_type: bool = False,
                  unit_name: Optional[str] = None,
+                 namespace_v2: Optional[str] = None,
                  poll_name_server_interval: int = 30000):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
@@ -135,9 +136,18 @@ class MQClientInstance:
         # start() 时取一次**：循环起来之后改这个值不会改变已经排定的周期（Java 的
         # scheduledExecutorService 同理）。
         self.poll_name_server_interval = poll_name_server_interval
+        # namespaceV2（对应 Java ClientConfig.namespaceV2）：非空时 NamespaceRpcHook
+        # 给每笔请求加 nsd=true / ns=<值> 两个扩展头。与各 facade 的其余 ClientConfig
+        # 开关一样，**只在 start() 建实例时取一次快照**。
+        self.namespace_v2 = namespace_v2 or ""
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
                                               tls_enable=tls_enable, tls_options=tls_options)
-        # 对应 Java `MQClientAPIImpl:329-332`：stream 钩子必须注册在用户 rpcHook 之前，
+        # 对应 Java `MQClientAPIImpl:329-335` 的注册顺序：Namespace → Stream →
+        # 用户 rpcHook（ACL 签名）→ DynamicalExtField。Java 无条件注册 NamespaceRpcHook
+        # （未配置 namespaceV2 时它自己 no-op），这里照抄；本钩子必须排在最前，
+        # nsd/ns 才会被算进 ACL 签名内容。
+        self.remoting_client.register_rpc_hook(NamespaceRpcHook(self.namespace_v2))
+        # 对应 Java `MQClientAPIImpl:330-332`：stream 钩子必须注册在用户 rpcHook 之前，
         # 这样 `ReqT` 才会被算进 ACL 签名内容（注释原文 "Inject stream rpc hook first
         # to make reserve field signature"）。各 facade 都是在构造完本实例之后才
         # `register_rpc_hook(self.rpc_hook)`，所以在这里注册天然满足顺序。

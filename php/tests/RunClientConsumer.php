@@ -65,6 +65,7 @@ use function RocketMQ\Client\java_message_queue_string;
 use function RocketMQ\Client\java_split;
 use function RocketMQ\Client\parse_local_offsets_json;
 use function RocketMQ\Client\scan_offset_table_body;
+use function RocketMQ\Remoting\Protocol\message_queue_key;
 
 // ======================================================================
 // 子进程假 broker：`php RunClientConsumer.php --broker`
@@ -765,6 +766,97 @@ final class RunClientConsumer
         $this->cleanup($c);
     }
 
+    // ================================================================ 2b. Push 挂起/恢复（Java suspend/resume/isPause）
+
+    /**
+     * 对齐 Java DefaultMQPushConsumer#suspend:890 / #resume:898 / #isPause:902
+     *（Impl#suspend:1312-1315、Impl#resume:741-745；读闸门的只有 pullMessage:263-266
+     * 与 popMessage:518-521）。
+     *
+     * 这里锁的是**顺序**而不是"停没停"：闸门必须落在盖章之后。放前面的话挂起超过
+     * PULL_MAX_IDLE_TIME（120s）就会让停摆判据把这条循环判死，rebalance 撤队列重建，
+     * 运维"暂停两分钟再恢复"实际换来一次整队列重投。PHP 单线程没有"线程死了"分支，
+     * 所以只有超时判据，这条竞态更容易被写错。
+     */
+    private function testPushSuspendResume(ConsFakeBroker $broker): void
+    {
+        // 常量：Java 的 1000ms 退避与 120s 停摆阈值，二者相差两个数量级才有意义。
+        $this->checkSame(1.0, ConsumerDefaults::PULL_TIME_DELAY_WHEN_SUSPEND,
+            'PULL_TIME_DELAY_WHEN_SUSPEND = Java 默认 1000ms');
+        $this->checkSame(120.0, ConsumerDefaults::PULL_MAX_IDLE_TIME, 'PULL_MAX_IDLE_TIME = 120s');
+
+        // 未 start 也必须安全（Java 不校验服务状态），且翻转幂等。
+        $idle = new DefaultMQPushConsumer('GID-SUS-IDLE');
+        $idle->setInstanceName('CONS-SUS-IDLE');
+        $this->checkSame(false, $idle->isPaused(), '默认不挂起（Java pause = false）');
+        $idle->suspend();
+        $idle->suspend();
+        $this->checkSame(true, $idle->isPaused(), '重复 suspend 保持挂起');
+        $idle->resume();
+        $idle->resume();
+        $this->checkSame(false, $idle->isPaused(), '重复 resume 保持运行');
+
+        $GLOBALS['RECV'] = [];
+        $c = new DefaultMQPushConsumer('GID-SUS-CONS');
+        $c->setInstanceName('CONS-SUS');
+        $c->setNameServerAddresses([$broker->addr]);
+        $c->setMessageListener(new ConsTopicListener([]));
+        $c->subscribe('UTopic');
+        $c->start();
+        $this->checkSame(1, $c->assignedQueueCount(), '挂起用例分到 1 个队列');
+
+        try {
+            // 先把拉取跑起来：没有"原本在拉"这个前提，"停了"毫无意义。
+            // tick 次数不固定 —— 首轮 tick 可能花在 resolveInitialOffset 上而不是拉取上。
+            for ($i = 0; $i < 6; $i++) {
+                $c->tick();
+                usleep(200_000);
+                $this->loadLog(getenv('RMQ_LOG'));
+                if (count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS')) >= 2) {
+                    break;
+                }
+            }
+            $before = count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS'));
+            $this->check($before >= 2, "挂起前已有 PULL 请求（$before 笔）");
+
+            $key = message_queue_key(new MessageQueue('UTopic', 'b-cons', 0));
+            $stampBefore = $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0;
+
+            $c->suspend();
+            $this->checkSame(true, $c->isPaused(), 'suspend 后 isPaused 为真');
+
+            $baselinePulls = $before;
+            // 多个 tick、跨过 Java 的 1s 退避窗口：挂起期间一次网络都不许发。
+            for ($i = 0; $i < 4; $i++) {
+                $c->tick();
+                usleep(300_000);
+            }
+            $this->loadLog(getenv('RMQ_LOG'));
+            $this->checkSame($baselinePulls, count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS')),
+                '挂起期间不得再有 PULL_MESSAGE 上线（Java pullMessage:263-266）');
+
+            // 关键不变量：挂起 ≠ 停摆。时刻必须继续推进，否则 120s 判据会把队列撤掉。
+            $stampAfter = $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0;
+            $this->check($stampAfter > $stampBefore,
+                sprintf('挂起期间 lastPullTimestamp 必须继续推进（%d -> %d）：闸门在盖章之后',
+                    $stampBefore, $stampAfter));
+            $this->checkSame(1, $c->assignedQueueCount(), '挂起不撤队列、不改分配');
+            $this->checkSame($stampAfter,
+                $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0,
+                '挂起期间 307 运行信息读到的仍是推进中的时刻');
+
+            $c->resume();
+            $this->checkSame(false, $c->isPaused(), 'resume 后回到运行态');
+            $c->tick();
+            $this->loadLog(getenv('RMQ_LOG'));
+            $after = count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS'));
+            $this->check($after > $baselinePulls,
+                sprintf('resume 后自己重新发起拉取（%d -> %d）', $baselinePulls, $after));
+        } finally {
+            $this->cleanup($c);
+        }
+    }
+
     // ================================================================ 3. Push 顺序：锁队列 → 挂起重排 → 成功
 
     private function testPushOrderly(ConsFakeBroker $broker): void
@@ -875,6 +967,37 @@ final class RunClientConsumer
         $this->checkSame(2, (int) ($backs[0]['delayLevel'] ?? -1), '回投 delayLevel=2');
         $this->checkSame(null, $backs[0]['maxReconsumeTimes'] ?? null, 'pull 回投 maxReconsumeTimes 不下发');
 
+        // fetchMessageQueuesInBalance（Java MQPullConsumer:187 / Impl:120-135）：
+        // 本端口拉模式没有后台 rebalance，就按 rebalanceByTopic 同一条公式当场算。
+        // 组里只有本实例（RMQ_CONSUMER_MAP 只登记了 CONS-P 一个 clientId）→ 全份都是我的。
+        $balanced = $c->fetchMessageQueuesInBalance('DTopic');
+        $this->checkSame(1, count($balanced), '平衡视图给出本实例负责的 1 条队列');
+        $this->checkSame('DTopic', $balanced[0]->topic ?? '', '平衡视图队列 topic');
+        $this->checkSame('b-cons', $balanced[0]->brokerName ?? '', '平衡视图队列 brokerName');
+        $this->checkSame(0, $balanced[0]->queueId ?? -1, '平衡视图队列 queueId');
+        // 查不到消费者列表时**保留现有分配**：换成没登记的组，
+        // 实际拉过的 DTopic 还在（本地记账），没拉过的 ETopic 必须是空 ——
+        // 绝不能回退成"独占全部队列"，否则同组多实例互相重复消费。
+        $group = $c->consumerGroup;
+        $c->consumerGroup = 'GID-NO-MAP';
+        $this->checkSame(['DTopic@b-cons@0'],
+            array_map(static fn($mq) => "{$mq->topic}@{$mq->brokerName}@{$mq->queueId}",
+                $c->fetchMessageQueuesInBalance('DTopic')),
+            '列表查不到时退回本地 pullFromWhichNodeTable 键集');
+        $this->checkSame([], $c->fetchMessageQueuesInBalance('ETopic'),
+            '没拉过又查不到列表 → 空集（Java rebalance 前的空表同语义）');
+        $c->consumerGroup = $group;
+        // 未启动的消费者一律拒绝（Java isRunning()）：新实例直接调用要抛。
+        $idle = new DefaultMQPullConsumer('GID-P-CONS');
+        $idle->setNameServerAddresses([$broker->addr]);
+        $threw = false;
+        try {
+            $idle->fetchMessageQueuesInBalance('DTopic');
+        } catch (MQClientException) {
+            $threw = true;
+        }
+        $this->check($threw, '未启动就取平衡视图 → MQClientException');
+
         $this->cleanup($c);
     }
 
@@ -978,6 +1101,7 @@ final class RunClientConsumer
             'GID-S-CONS' => [MixAll::clientIdFor('CONS-S', null, false)],
             'GID-P-CONS' => [MixAll::clientIdFor('CONS-P', null, true)],
             'GID-L-CONS' => [MixAll::clientIdFor('CONS-L', null, true)],
+            'GID-SUS-CONS' => [MixAll::clientIdFor('CONS-SUS', null, false)],
         ];
         file_put_contents($groupMapPath, json_encode($groupMap));
         putenv("RMQ_CONSUMER_MAP={$groupMapPath}");
@@ -985,6 +1109,7 @@ final class RunClientConsumer
         $broker = ConsFakeBroker::start();
         try {
             $this->testPushConcurrent($broker);
+            $this->testPushSuspendResume($broker);
             $this->testPushOrderly($broker);
             $this->testPullConsumer($broker);
             $this->testLitePull($broker);

@@ -141,7 +141,10 @@ async fn send(
         }
     };
     producer.set_namesrv_addr(namesrv);
-    producer.set_compress_type(codec);
+    if let Err(e) = producer.set_compress_type(codec) {
+        eprintln!("SEND_FAIL bad codec {codec}: {e}");
+        return ExitCode::FAILURE;
+    }
     // 阈值以下不会压缩，矩阵要的是「真的压过」，所以调用方给够载荷尺寸（默认阈值 4 KiB）。
     if let Err(e) = producer.start().await {
         eprintln!("SEND_FAIL start failed: {e}");
@@ -168,12 +171,7 @@ async fn send(
 }
 
 /// 起一个 lite 拉取消费者，尽量收满 `want` 条（60s 超时）；搭建失败返回 `None`。
-async fn collect(
-    namesrv: &str,
-    topic: &str,
-    group: &str,
-    want: usize,
-) -> Option<Vec<MessageExt>> {
+async fn collect(namesrv: &str, topic: &str, group: &str, want: usize) -> Option<Vec<MessageExt>> {
     let cfg = LitePullConsumerConfig {
         consumer_group: group.to_string(),
         name_server_addrs: vec![namesrv.to_string()],
@@ -258,7 +256,10 @@ async fn reuse(
         }
     };
     producer.set_namesrv_addr(namesrv);
-    producer.set_compress_type(codec);
+    if let Err(e) = producer.set_compress_type(codec) {
+        eprintln!("REUSE_FAIL bad codec {codec}: {e}");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = producer.start().await {
         eprintln!("REUSE_FAIL start failed: {e}");
         return ExitCode::FAILURE;

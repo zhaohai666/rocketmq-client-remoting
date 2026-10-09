@@ -1,8 +1,9 @@
 // 消息轨迹钩子（对应 org.apache.rocketmq.client.trace.hook 包）。
 //
-//   * SendMessageTraceHook    ← SendMessageTraceHookImpl
-//   * ConsumeMessageTraceHook ← ConsumeMessageTraceHookImpl
-//   * EndTransactionTraceHook ← EndTransactionTraceHookImpl
+//   * SendMessageTraceHook        ← SendMessageTraceHookImpl
+//   * ConsumeMessageTraceHook     ← ConsumeMessageTraceHookImpl
+//   * EndTransactionTraceHook     ← EndTransactionTraceHookImpl
+//   * DefaultRecallMessageTraceHook ← 同名 Java 类（RPCHook 形态，见文件尾）
 //
 // 两条硬性约定：
 //   1. 轨迹消息本身不再被追踪：before/after 都先看 topic 是否以轨迹 topic 开头，是则直接
@@ -11,6 +12,8 @@
 //      的 MSG_REGION / TRACE_ON 解析而来，broker 默认 traceOn=true）；消费侧看消息属性
 //      TRACE_ON 是否为 "false"。
 using RocketMQ.Common;
+using RocketMQ.Remoting;
+using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
@@ -262,4 +265,91 @@ public sealed class EndTransactionTraceHook : IEndTransactionHook
         },
         _ => state.ToString() ?? string.Empty,
     };
+}
+
+/// <summary>
+/// 撤回消息的轨迹钩子（对应 org.apache.rocketmq.client.trace.hook.DefaultRecallMessageTraceHook）。
+///
+/// 与发送/消费钩子不同，Java 把它实现成 <b>RPCHook</b>：RECALL_MESSAGE(370) 没有发送上下文
+/// 可挂，轨迹只能在 RPC 的响应侧记 —— DoAfterResponse 里按请求码过滤出 recall 这一笔，
+/// 解出句柄里的 topic / msgId，组装 TraceType.Recall 的轨迹丢给分发器（编码器见
+/// TraceDataEncoder 的 "Recall" 分支：时间戳/region/group/topic/msgId/成功与否 六段）。
+///
+/// 三道闸（Java 逐条对应，缺一就直接返回）：
+///   1. 请求码必须是 RECALL_MESSAGE；
+///   2. <see cref="EnableDefaultTrace"/> 为真 —— Java 读系统属性
+///      <c>com.rocketmq.recall.default.trace.enable</c>（默认 false），本端口读同名环境变量
+///      （"true"/"1"，与 ROCKETMQ_TLS_ENABLE 同一口径），也允许实例上直接赋值打开；
+///   3. 响应 ExtFields 里带 MSG_REGION（broker 没回 region 就不落轨迹）且分发器非空。
+///
+/// 解句柄/建轨迹的**任何异常都吞掉**（Java 同处 catch Exception 空处理）：
+/// 轨迹是旁路观测，绝不能让一条格式坏的句柄把撤回 RPC 本身搞挂。
+/// </summary>
+public sealed class DefaultRecallMessageTraceHook : IRpcHook
+{
+    /// <summary>Java 的 RECALL_TRACE_ENABLE_KEY。</summary>
+    public const string RecallTraceEnableKey = "com.rocketmq.recall.default.trace.enable";
+
+    private static readonly string? EnvEnabled = Environment.GetEnvironmentVariable(RecallTraceEnableKey);
+
+    private readonly AsyncTraceDispatcher _traceDispatcher;
+
+    public DefaultRecallMessageTraceHook(AsyncTraceDispatcher traceDispatcher)
+    {
+        _traceDispatcher = traceDispatcher;
+    }
+
+    /// <summary>默认取环境变量（"true"/"1"，忽略大小写），实例上可显式覆盖。</summary>
+    public bool EnableDefaultTrace { get; set; } =
+        string.Equals(EnvEnabled, "true", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(EnvEnabled, "1", StringComparison.OrdinalIgnoreCase);
+
+    public void DoBeforeRequest(string remoteAddr, RemotingCommand request)
+    {
+        // Java 同款空实现：轨迹记在响应侧
+    }
+
+    public void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response)
+    {
+        if (request.Code != RequestCode.RecallMessage
+            || !EnableDefaultTrace
+            || response is null
+            || response.ExtFields is null
+            || !response.ExtFields.TryGetValue(MessageConst.PropertyMsgRegion, out string? regionId)
+            || string.IsNullOrEmpty(regionId)
+            || _traceDispatcher is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var header = new RecallMessageRequestHeader();
+            header.FromExtFields(request.ExtFields ?? new PropertyMap());
+            string topic = NamespaceUtil.WithoutNamespace(header.Topic ?? string.Empty);
+            string group = NamespaceUtil.WithoutNamespace(header.ProducerGroup ?? string.Empty);
+            HandleV1 handleV1 = RecallMessageHandle.DecodeHandle(header.RecallHandle);
+
+            var traceBean = new TraceBean
+            {
+                Topic = topic,
+                MsgId = handleV1.MessageId,
+            };
+
+            var traceContext = new TraceContext
+            {
+                RegionId = regionId,
+                TraceBeans = new List<TraceBean> { traceBean },
+                TraceType = RocketMQ.Client.TraceType.Recall,
+                GroupName = group,
+                IsSuccess = response.Code == ResponseCode.Success,
+            };
+
+            _traceDispatcher.Append(traceContext);
+        }
+        catch (Exception)
+        {
+            // Java 同处：吞掉一切异常（轨迹旁路，不影响撤回本身）
+        }
+    }
 }

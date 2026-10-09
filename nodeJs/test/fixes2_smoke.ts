@@ -6,6 +6,7 @@
 //   5. slave fallback: consumer-id list address selection + all-broker heartbeat enumeration
 // Run: node --experimental-strip-types test/fixes2_smoke.ts
 import assert from 'node:assert';
+import nodeZlib from 'node:zlib';
 import { DefaultMQProducer, LocalTransactionState } from '../src/client/producer.ts';
 import { DefaultMQPushConsumer } from '../src/client/consumer.ts';
 import { DefaultMQAdminExt } from '../src/client/admin.ts';
@@ -15,7 +16,7 @@ import { MessageConst } from '../src/common/messageConst.ts';
 import { MessageAccessor } from '../src/common/message_accessor.ts';
 import { encodeMessageExt, decodeMessage, decodeMessages, decompressBody, createMessageId } from '../src/common/messageDecoder.ts';
 import { ipAndPortToBytes } from '../src/common/utilAll.ts';
-import { lz4CompressFrame, lz4DecompressFrame, zstdCompressRaw, zstdDecompressFrame } from '../src/common/compress.ts';
+import { lz4CompressFrame, lz4DecompressFrame, zstdCompressRaw, zstdDecompressFrame, decompressFor } from '../src/common/compress.ts';
 import { SendMessageTraceHookImpl } from '../src/client/trace_hook.ts';
 import { AsyncTraceDispatcher } from '../src/client/trace_dispatcher.ts';
 import { SendMessageContext } from '../src/client/hook.ts';
@@ -123,8 +124,10 @@ console.log('== producer compression selection ==');
     const msg = new Message('T', payload);
     const ok = p.tryToCompressMessage(msg);
     const sysFlag = (msg as any)._sysFlag;
-    // ZSTD here is a legal Raw-block frame (no size gain, full interop) —
-    // assert "compressed flag set + body replaced", not smaller-than-input.
+    // On Node >= 23.8 ZSTD is node:zlib's real codec (compressed blocks, size
+    // gain); on older runtimes it degrades to a legal Raw-block frame, which is
+    // interop-correct but stores the body. Assert the invariant both paths
+    // share: compressed flag set, body replaced, and it round-trips.
     check(`${name} body compressed`, ok && (name === 'ZSTD' ? msg.getBody().length > 0
       : msg.getBody().length < payload.length));
     check(`${name} sysFlag COMPRESSED+type`, MessageSysFlag.isCompressed(sysFlag)
@@ -152,6 +155,24 @@ console.log('== producer compression selection ==');
   ze.setReconsumeTimes(0); ze.setFlag(0); ze.setBodyCrc(0);
   const zback = decodeMessage(encodeMessageExt(ze, false), true, true);
   check('decodeMessage inflates ZSTD-flagged body', zback != null && zback.getBody().equals(payload));
+
+  // External real-compressed frame: Java's zstd-jni (and this repo's cpp / rust
+  // / csharp ports) emit Compressed blocks, not Raw blocks. Failing to decode
+  // them means a cross-language consumer silently gets nothing, so this is the
+  // load-bearing interop assertion. Fixture = `zstd -3 --no-check` over the
+  // payload above.
+  const zstdCliFrame = Buffer.from(
+    '28b52ffd60480ccd000088726f636b65746d712d7061796c6f61642d0100694afe5c02', 'hex');
+  const hasNodeZstd = typeof (nodeZlib as unknown as {
+    zstdDecompressSync?: unknown;
+  }).zstdDecompressSync === 'function';
+  if (hasNodeZstd) {
+    check('zstd decodes an external Compressed-block frame', decompressFor(zstdCliFrame, 2).equals(payload));
+  } else {
+    let threw = false;
+    try { decompressFor(zstdCliFrame, 2); } catch { threw = true; }
+    check('zstd fallback rejects Compressed blocks instead of passing them through', threw);
+  }
 }
 
 // ---------------------------------------------------------------- 4. trace

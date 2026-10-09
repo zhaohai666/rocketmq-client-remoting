@@ -104,6 +104,10 @@ pub struct AdminConfig {
     /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
+    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
+    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
+    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
+    pub namespace_v2: Option<String>,
     /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
     /// clientId 末尾多一段 `@STREAM`。
     ///
@@ -130,6 +134,7 @@ impl Default for AdminConfig {
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
             unit_name: None,
+            namespace_v2: None,
             enable_stream_request_type: false,
             vip_channel_enabled: false,
             // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
@@ -495,6 +500,19 @@ impl DefaultMQAdminExt {
         self.update_config(|c| c.unit_name = unit_name);
     }
 
+    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
+    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
+    /// `start()` 时透传给私有 `MQClientInstance`，晚于 start 修改不影响已建实例。
+    pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
+        let namespace_v2 = namespace_v2.map(str::to_string);
+        self.update_config(|c| c.namespace_v2 = namespace_v2);
+    }
+
+    /// Java `ClientConfig#getNamespaceV2`。
+    pub fn get_namespace_v2(&self) -> Option<String> {
+        self.config().namespace_v2
+    }
+
     /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
@@ -572,16 +590,13 @@ impl DefaultMQAdminExt {
         // 差异 2：admin 用私有实例，不和其他客户端共用），所以改写只在调用方显式
         // 设成 "DEFAULT" 时才起作用。
         let instance_name = MixAll::change_instance_name_to_pid(&cfg.instance_name);
-        let client_id = cfg
-            .client_id
-            .clone()
-            .unwrap_or_else(|| {
-                MixAll::build_default_client_id(
-                    &instance_name,
-                    cfg.unit_name.as_deref(),
-                    cfg.enable_stream_request_type,
-                )
-            });
+        let client_id = cfg.client_id.clone().unwrap_or_else(|| {
+            MixAll::build_default_client_id(
+                &instance_name,
+                cfg.unit_name.as_deref(),
+                cfg.enable_stream_request_type,
+            )
+        });
         self.update_config(|c| {
             c.client_id = Some(client_id.clone());
             c.instance_name = instance_name;
@@ -593,6 +608,7 @@ impl DefaultMQAdminExt {
             cfg.name_server_addrs.clone(),
             MQClientInstanceConfig {
                 unit_name: cfg.unit_name.clone(),
+                namespace_v2: cfg.namespace_v2.clone(),
                 enable_stream_request_type: cfg.enable_stream_request_type,
                 route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
                 ..Default::default()
@@ -1210,7 +1226,12 @@ impl DefaultMQAdminExt {
     ) -> Result<i64> {
         let ext = ext_pairs(&[("brokerName", broker_name.to_string())]);
         let response = self
-            .invoke_namesrv_addr(namesrv_addr, request_code::WIPE_WRITE_PERM_OF_BROKER, &ext, None)
+            .invoke_namesrv_addr(
+                namesrv_addr,
+                request_code::WIPE_WRITE_PERM_OF_BROKER,
+                &ext,
+                None,
+            )
             .await?;
         Ok(ext_int(&response, "wipeTopicCount"))
     }
@@ -1223,7 +1244,12 @@ impl DefaultMQAdminExt {
     ) -> Result<i64> {
         let ext = ext_pairs(&[("brokerName", broker_name.to_string())]);
         let response = self
-            .invoke_namesrv_addr(namesrv_addr, request_code::ADD_WRITE_PERM_OF_BROKER, &ext, None)
+            .invoke_namesrv_addr(
+                namesrv_addr,
+                request_code::ADD_WRITE_PERM_OF_BROKER,
+                &ext,
+                None,
+            )
             .await?;
         Ok(ext_int(&response, "addTopicCount"))
     }
@@ -1424,12 +1450,16 @@ impl DefaultMQAdminExt {
             }
             let mut request =
                 build_request(request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG, &ext, None);
-            let response = client.invoke_sync(
-                &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, broker_addr),
-                &mut request,
-                left,
-            )
-            .await?;
+            let response = client
+                .invoke_sync(
+                    &MixAll::broker_vip_channel(
+                        read_cfg(&self.inner.cfg).vip_channel_enabled,
+                        broker_addr,
+                    ),
+                    &mut request,
+                    left,
+                )
+                .await?;
             if response.code != response_code::SUCCESS {
                 return Err(Error::Broker {
                     response_code: response.code,
@@ -1840,8 +1870,7 @@ impl DefaultMQAdminExt {
                             {
                                 if code == response_code::CONSUMER_NOT_ONLINE {
                                     mt.track_type = TrackType::NotOnline;
-                                    mt.exception_desc =
-                                        Some(format!("CODE:{code} DESC:{e}"));
+                                    mt.exception_desc = Some(format!("CODE:{code} DESC:{e}"));
                                 } else {
                                     mt.track_type = TrackType::ConsumeBroadcasting;
                                 }
@@ -2184,7 +2213,9 @@ impl DefaultMQAdminExt {
                 continue;
             };
             for (key, offset) in self
-                .invoke_broker_reset_offset(&addr, topic, group, timestamp, is_force, is_cpp, None, None)
+                .invoke_broker_reset_offset(
+                    &addr, topic, group, timestamp, is_force, is_cpp, None, None,
+                )
                 .await?
             {
                 match all_offsets.iter_mut().find(|(k, _)| *k == key) {
@@ -2220,17 +2251,16 @@ impl DefaultMQAdminExt {
     ) -> Result<Vec<(MessageQueueKey, i64)>> {
         let client = self.require_client()?;
         let ext = reset_offset_ext_pairs(topic, group, timestamp, is_force, queue_id, offset);
-        let mut request = build_request(
-            request_code::INVOKE_BROKER_TO_RESET_OFFSET,
-            &ext,
-            None,
-        );
+        let mut request = build_request(request_code::INVOKE_BROKER_TO_RESET_OFFSET, &ext, None);
         if is_cpp {
             request.language = language_code::CPP;
         }
         let response = client
             .invoke_sync(
-                &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, broker_addr),
+                &MixAll::broker_vip_channel(
+                    read_cfg(&self.inner.cfg).vip_channel_enabled,
+                    broker_addr,
+                ),
                 &mut request,
                 self.timeout_millis(),
             )
@@ -2659,10 +2689,7 @@ impl DefaultMQAdminExt {
         if group.is_empty() || topic.is_empty() {
             bail!("updateAndGetGroupReadForbidden: group/topic required");
         }
-        let mut pairs = vec![
-            ("group", group.to_string()),
-            ("topic", topic.to_string()),
-        ];
+        let mut pairs = vec![("group", group.to_string()), ("topic", topic.to_string())];
         if let Some(flag) = readable {
             pairs.push(("readable", flag.to_string()));
         }
@@ -2703,10 +2730,8 @@ impl DefaultMQAdminExt {
         }
         let ext = ext_pairs(&pairs);
         let client = self.require_client()?;
-        let addr = MixAll::broker_vip_channel(
-            read_cfg(&self.inner.cfg).vip_channel_enabled,
-            broker_addr,
-        );
+        let addr =
+            MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, broker_addr);
         let mut request = build_request(request_code::RESUME_CHECK_HALF_MESSAGE, &ext, None);
         let response = client
             .invoke_sync(&addr, &mut request, self.timeout_millis())
@@ -2727,7 +2752,9 @@ impl DefaultMQAdminExt {
             bail!("createOrUpdateOrderConf: key/value required");
         }
         if is_cluster {
-            return self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, value).await;
+            return self
+                .put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, value)
+                .await;
         }
         // Java 打印异常后按空表继续：首写是常态，不是失败。
         let old_confs = self
@@ -2761,7 +2788,8 @@ impl DefaultMQAdminExt {
             .map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(";");
-        self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, &merged).await
+        self.put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, &merged)
+            .await
     }
 
     // ---------------- 运维清理类 ----------------
@@ -2792,7 +2820,11 @@ impl DefaultMQAdminExt {
     ) -> Vec<String> {
         let mut failed = Vec::new();
         for addr in addrs {
-            if self.clean_expired_consumer_queue(addr, time_hours).await.is_err() {
+            if self
+                .clean_expired_consumer_queue(addr, time_hours)
+                .await
+                .is_err()
+            {
                 failed.push(addr.clone());
             }
         }
@@ -2825,7 +2857,11 @@ impl DefaultMQAdminExt {
     ) -> Vec<String> {
         let mut failed = Vec::new();
         for addr in addrs {
-            if self.delete_expired_commit_log(addr, time_hours).await.is_err() {
+            if self
+                .delete_expired_commit_log(addr, time_hours)
+                .await
+                .is_err()
+            {
                 failed.push(addr.clone());
             }
         }
@@ -2848,23 +2884,22 @@ impl DefaultMQAdminExt {
 
     /// Python `query_consume_time_span` → QUERY_CONSUME_TIME_SPAN(303)：
     /// 按路由遍历 master，聚合各 broker 的 consumeTimeSpanSet。
-    pub async fn query_consume_time_span(
-        &self,
-        topic: &str,
-        group: &str,
-    ) -> Result<Vec<Value>> {
+    pub async fn query_consume_time_span(&self, topic: &str, group: &str) -> Result<Vec<Value>> {
         let route = self.examine_topic_route(topic).await?;
         let mut spans: Vec<Value> = Vec::new();
         for bd in &route.broker_datas {
             let Some(addr) = bd.select_broker_addr() else {
                 continue;
             };
-            let ext = ext_pairs(&[
-                ("topic", topic.to_string()),
-                ("group", group.to_string()),
-            ]);
+            let ext = ext_pairs(&[("topic", topic.to_string()), ("group", group.to_string())]);
             let response = self
-                .invoke_broker(&addr, request_code::QUERY_CONSUME_TIME_SPAN, &ext, None, None)
+                .invoke_broker(
+                    &addr,
+                    request_code::QUERY_CONSUME_TIME_SPAN,
+                    &ext,
+                    None,
+                    None,
+                )
                 .await?;
             if let Some(body) = response.body.as_deref().filter(|b| !b.is_empty()) {
                 let parsed: Value = serde_json::from_slice(body)
@@ -2894,8 +2929,11 @@ impl DefaultMQAdminExt {
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
         let mut err_response: Option<RemotingCommand> = None;
         for ns_addr in client.name_server_addrs() {
-            let mut request =
-                build_request(request_code::UPDATE_NAMESRV_CONFIG, &ExtFields::new(), Some(text.as_bytes().to_vec()));
+            let mut request = build_request(
+                request_code::UPDATE_NAMESRV_CONFIG,
+                &ExtFields::new(),
+                Some(text.as_bytes().to_vec()),
+            );
             let response = client.invoke_sync(&ns_addr, &mut request, timeout).await?;
             if response.code != response_code::SUCCESS {
                 err_response = Some(response);
@@ -2937,7 +2975,9 @@ impl DefaultMQAdminExt {
                 Ok(response) => {
                     last_err = Some(Error::client_with_code(
                         response.code,
-                        response.remark.unwrap_or_else(|| "get name server config failed".to_string()),
+                        response
+                            .remark
+                            .unwrap_or_else(|| "get name server config failed".to_string()),
                     ));
                 }
                 Err(e) => last_err = Some(e),
@@ -3039,10 +3079,28 @@ mod tests {
         assert_eq!(DEFAULT_TIMEOUT_MILLIS, 15_000);
         assert!(cfg.name_server_addrs.is_empty());
         assert!(cfg.kv_namespace_to_delete_list.is_empty());
+        assert_eq!(cfg.namespace_v2, None, "namespaceV2 默认不设");
         assert!(!admin.is_started());
         assert_eq!(admin.client_id(), "");
         // Java ClientConfig#vipChannelEnabled 5.x 默认 false
         assert!(!cfg.vip_channel_enabled);
+    }
+
+    #[test]
+    fn namespace_v2_setter_getter_round_trip() {
+        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间
+        //（`NamespaceRpcHook` 的 `nsd`/`ns` 头），私有实例在 start() 时取用。
+        let admin = DefaultMQAdminExt::new();
+        assert_eq!(admin.get_namespace_v2(), None, "默认不设");
+        admin.set_namespace_v2(Some("NS_V2"));
+        assert_eq!(admin.get_namespace_v2(), Some("NS_V2".to_string()));
+        assert_eq!(admin.config().namespace_v2, Some("NS_V2".to_string()));
+        admin.set_namespace_v2(None);
+        assert_eq!(
+            admin.get_namespace_v2(),
+            None,
+            "None = 清除（Java setNamespaceV2(null)）"
+        );
     }
 
     /// VIP 通道开关：set 之后生效（默认 false，配合 mix_all 的
@@ -3061,11 +3119,17 @@ mod tests {
     #[test]
     fn track_type_names_match_java() {
         assert_eq!(TrackType::Consumed.as_str(), "CONSUMED");
-        assert_eq!(TrackType::ConsumedButFiltered.as_str(), "CONSUMED_BUT_FILTERED");
+        assert_eq!(
+            TrackType::ConsumedButFiltered.as_str(),
+            "CONSUMED_BUT_FILTERED"
+        );
         assert_eq!(TrackType::Pull.as_str(), "PULL");
         assert_eq!(TrackType::NotConsumeYet.as_str(), "NOT_CONSUME_YET");
         assert_eq!(TrackType::NotOnline.as_str(), "NOT_ONLINE");
-        assert_eq!(TrackType::ConsumeBroadcasting.as_str(), "CONSUME_BROADCASTING");
+        assert_eq!(
+            TrackType::ConsumeBroadcasting.as_str(),
+            "CONSUME_BROADCASTING"
+        );
         assert_eq!(TrackType::Unknown.as_str(), "UNKNOWN");
     }
 
@@ -3099,7 +3163,10 @@ mod tests {
         assert!(!ext.contains_key("force"), "force 不是 Java 的字段名");
         assert_eq!(ext.get("timestamp"), Some("-1"));
         assert_eq!(ext.get("offset"), Some("-1"));
-        assert!(!ext.contains_key("queueId"), "整个 topic 的重载不带 queueId");
+        assert!(
+            !ext.contains_key("queueId"),
+            "整个 topic 的重载不带 queueId"
+        );
 
         // 负向对照：isForce=false 也必须下发（不能"假值省略"），单队列重载带上 queueId
         let single = reset_offset_ext_pairs("T", "G", 0, false, Some(3), Some(7));

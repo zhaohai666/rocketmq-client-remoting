@@ -71,6 +71,19 @@ final class MixAll
      */
     public const REQ_T = 'ReqT';
     /**
+     * Java `MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD`（common/MixAll.java:122）：
+     * extFields 的键名，值恒为字符串 `"true"`，由 NamespaceRpcHook 写入，含义是
+     * 「这笔请求带 5.x 新命名空间」（serverless 实例）。
+     */
+    public const RPC_REQUEST_HEADER_NAMESPACED_FIELD = 'nsd';
+    /**
+     * Java `MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD`（common/MixAll.java:123）：
+     * extFields 的键名，值是 `ClientConfig#namespaceV2` 本体。与上面那个标记位成对出现，
+     * broker 侧据此把请求解析到对应实例——这是**服务端**命名空间机制，和 `namespace`
+     * 字段（客户端把 `namespace%` 拼进 topic 名）是两套东西，别混。
+     */
+    public const RPC_REQUEST_HEADER_NAMESPACE_FIELD = 'ns';
+    /**
      * Java `ClientConfig#buildMQClientId` 拼的是 `sb.append(RequestType.STREAM)`，
      * 即枚举**名**（不是 code），所以 clientId 后缀为 "@STREAM"。
      */

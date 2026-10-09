@@ -165,9 +165,16 @@ const (
 // dead or stuck loop, and rebalance tears it down and rebuilds it.
 const pullMaxIdleTime = 120 * time.Second
 
-// PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL / _WHEN_EXCEPTION are Java's
-// re-schedule delays.
+// Java's re-schedule delays for a pull request that is not sent this round:
+// 50ms when the local cache hits a flow-control gate
+// (DefaultMQPushConsumerImpl:105), 1000ms while the consumer is suspended
+// (:113, the flag Suspend()/Resume() drive). Java's third branch — 20ms when the
+// BROKER answers the pull with flow control (:109, applied at :446) — has no
+// dedicated delay here: the pull loop treats any broker rejection as the generic
+// 500ms error backoff, while the POP loop does single out RespFlowControl
+// (pop_consumer.go).
 const (
 	pullTimeDelayMillsWhenFlowControl = 50 * time.Millisecond
 	pullTimeDelayMillsWhenException   = 3000 * time.Millisecond
+	pullTimeDelayMillsWhenSuspend     = 1000 * time.Millisecond
 )

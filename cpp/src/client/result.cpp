@@ -37,4 +37,16 @@ MessageQueue SelectMessageQueueByRandom::select(const std::vector<MessageQueue>&
     return mqs[dist(rng)];
 }
 
+// Java SelectMessageQueueByMachineRoom.select() 是未实现的桩（return null），
+// 见 result.h 的说明：MessageQueue 无法表达 null，这里直接抛 —— 用它发送必然
+// 失败，与 Java 的结局（下游 NPE）一致，只是失败得更早、信息更明确。
+MessageQueue SelectMessageQueueByMachineRoom::select(const std::vector<MessageQueue>& mqs,
+                                                     const Message& /*msg*/,
+                                                     const std::string& /*arg*/) const {
+    (void)mqs;
+    throw MQClientException(
+        "SelectMessageQueueByMachineRoom.select() is not implemented: Java stub "
+        "returns null (send would fail with NPE)");
+}
+
 }  // namespace rocketmq

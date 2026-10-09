@@ -54,6 +54,13 @@ final class DefaultMQPullConsumer
      * （:113/:126）—— 与推送消费者默认 false 是两套初值，照抄。
      */
     public bool $enableStreamRequestType = true;
+    /**
+     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
+     * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
+     * 这里**不**改任何资源名。见 NamespaceRpcHook。
+     */
+    public string $namespaceV2 = '';
     public string $messageModel = MessageModel::CLUSTERING;
     public int $brokerSuspendMaxTimeMillis = 20000;
     public int $consumerPullTimeoutMillis = 10000;
@@ -79,6 +86,13 @@ final class DefaultMQPullConsumer
     public array $filterMessageHookList = [];
     /** 对应 Java pullAPIWrapper.pullFromWhichNodeTable：mqKey → brokerId */
     private array $pullFromWhichNode = [];
+    /**
+     * 同一张表的**键集**（mqKey → MessageQueue）。Java 的表键就是 MessageQueue，
+     * 本端口的表键是字符串，位点/节点决策用不到队列对象，但
+     * fetchMessageQueuesInBalance 要把「本实例实际拉过的队列」还给调用方，
+     * 所以顺手把对象留着（mqKey 是 topic+brokerName+queueId 直拼，反解不可靠）。
+     */
+    private array $pulledQueues = [];
     // ---- 消费者心跳（对齐 Java heartbeatBrokerInterval 默认 30s）----
     public bool $heartbeatEnabled = true;
     public int $heartbeatIntervalMillis = 30000;
@@ -129,6 +143,25 @@ final class DefaultMQPullConsumer
     public function setUnitMode(bool $unitMode): void
     {
         $this->unitMode = $unitMode;
+    }
+
+    /**
+     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
+     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
+     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     */
+    public function setNamespaceV2(string $namespaceV2): void
+    {
+        $this->namespaceV2 = $namespaceV2;
+        if ($this->mqClient !== null) {
+            $this->mqClient->namespaceV2 = $namespaceV2;
+        }
+    }
+
+    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    public function getNamespaceV2(): string
+    {
+        return $this->namespaceV2;
     }
 
     public function setMessageModel(string $model): void
@@ -306,6 +339,7 @@ final class DefaultMQPullConsumer
             $this->nameServerAddrs,
             tlsEnable: $this->tlsEnable,
             enableStreamRequestType: $this->enableStreamRequestType,
+            namespaceV2: $this->namespaceV2,
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
@@ -363,6 +397,68 @@ final class DefaultMQPullConsumer
     }
 
     /**
+     * 本实例「平衡后」应负责的队列（Java MQPullConsumer:187，官方
+     * example/simple/PullConsumer.java:62 就靠它决定去拉哪些队列）。
+     *
+     * Java（DefaultMQPullConsumerImpl:120-135）读的是后台 rebalance 填出来的
+     * processQueueTable；本端口拉模式没有那条后台线程，所以按 RebalanceImpl.rebalanceByTopic
+     * 的同一条公式当场算：mqAll=订阅信息（读位口径，与 fetchSubscribeMessageQueues 同源）、
+     * cidAll=GET_CONSUMER_LIST_BY_GROUP、分配策略取本实例那一份。公式与推送消费者的
+     * rebalance 共用一份口径，两处一旦分叉，同一队列会被两个实例同时认领。
+     *
+     * 拿不到路由/消费者列表时**保留现有分配**（退回本实例实际拉过的队列），
+     * 绝不回退成"独占全部队列"——那会让同组多实例互相重复消费（同 python 端口）。
+     *
+     * @return list<MessageQueue>
+     */
+    public function fetchMessageQueuesInBalance(string $topic): array
+    {
+        $client = $this->requireClient(); // Java isRunning()：未启动直接抛 MQClientException
+        $pulled = array_values(array_filter(
+            $this->pulledQueues,
+            static fn(MessageQueue $mq): bool => $mq->topic === $topic,
+        ));
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            // Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
+            $subscribe = $client->getTopicSubscribeInfo($topic);
+            $allocated = $subscribe !== [] ? $subscribe : $pulled;
+            return $this->sortedQueues($allocated, $topic);
+        }
+        $allocated = null;
+        try {
+            $mqAll = $this->sortedQueues($client->getTopicSubscribeInfo($topic), $topic);
+            $cidAll = $client->getConsumerIdListByGroup($topic, $this->consumerGroup);
+            if ($mqAll !== [] && $cidAll !== null && $cidAll !== []) {
+                sort($cidAll);
+                $allocated = $this->allocateMessageQueueStrategy
+                    ?->allocate($this->consumerGroup, $this->clientId ?? '', $mqAll, $cidAll);
+            }
+        } catch (\Throwable $e) {
+            Logger::debug(sprintf('fetchMessageQueuesInBalance rebalance view unavailable: %s', $e->getMessage()));
+        }
+        if ($allocated === null) {
+            Logger::debug(sprintf('fetchMessageQueuesInBalance: no route/consumer list for %s/%s, keep current assignment',
+                $this->consumerGroup, $topic));
+            $allocated = $pulled;
+        }
+        return $this->sortedQueues($allocated, $topic);
+    }
+
+    /** 按 topic 收口 + house 排序口径（topic → brokerName → queueId），保证多次调用稳定。 */
+    private function sortedQueues(array $mqs, string $topic): array
+    {
+        $out = [];
+        foreach ($mqs as $mq) {
+            // Java :128-131 逐个比对表键的 topic；别让策略的意外返回值把别的 topic 混进拉取循环。
+            if ($mq instanceof MessageQueue && $mq->topic === $topic) {
+                $out[implode("\0", AllocationHelper::mqSortKey($mq))] = $mq;
+            }
+        }
+        ksort($out);
+        return array_values($out);
+    }
+
+    /**
      * 短轮询拉取（对应 Java pullSyncImpl，block=false）。
      *
      * ⚠ sysFlag 的 suspend 位是 **false** —— 这是**短轮询**不挂起。曾在这里写成
@@ -399,6 +495,7 @@ final class DefaultMQPullConsumer
             brokerId: $this->pullFromWhichNode[$key] ?? MixAll::MASTER_ID,
         );
         $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
+        $this->pulledQueues[$key] = $mq;
         if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
             $result->msgFoundList = $this->filterMessagesForDelivery($mq, $result->msgFoundList);
         }
@@ -553,6 +650,13 @@ final class DefaultLitePullConsumer
     public bool $unitMode = false;
     /** Java 的 DefaultLitePullConsumer 每个构造函数都写 ``enableStreamRequestType = true``。 */
     public bool $enableStreamRequestType = true;
+    /**
+     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
+     * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
+     * 这里**不**改任何资源名。见 NamespaceRpcHook。
+     */
+    public string $namespaceV2 = '';
     public string $messageModel = MessageModel::CLUSTERING;
     /** @var list<string> */
     public array $nameServerAddrs = [];
@@ -668,6 +772,25 @@ final class DefaultLitePullConsumer
         $this->autoCommit = $auto;
     }
 
+    /**
+     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
+     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
+     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
+     */
+    public function setNamespaceV2(string $namespaceV2): void
+    {
+        $this->namespaceV2 = $namespaceV2;
+        if ($this->mqClient !== null) {
+            $this->mqClient->namespaceV2 = $namespaceV2;
+        }
+    }
+
+    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    public function getNamespaceV2(): string
+    {
+        return $this->namespaceV2;
+    }
+
     // ---------------- 订阅 / 分配 ----------------
 
     public function subscribe(string $topic, string $subExpression = '*'): void
@@ -771,6 +894,7 @@ final class DefaultLitePullConsumer
             $this->nameServerAddrs,
             tlsEnable: $this->tlsEnable,
             enableStreamRequestType: $this->enableStreamRequestType,
+            namespaceV2: $this->namespaceV2,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
         );

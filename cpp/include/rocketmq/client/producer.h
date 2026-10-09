@@ -146,6 +146,14 @@ public:
     // 包装成 "namespace%topic" 再发给 broker（系统资源 / retry / DLQ 前缀除外）。
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     const std::string& namespaceOf() const { return namespace_; }
+    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`，阿里云实例 ID 形态）：
+    // 非空时 NamespaceRpcHook 给**每笔请求**加 `nsd=true` / `ns=<namespaceV2>` 两个扩展头，
+    // 由 broker 侧把资源解析到该实例下 —— 与上面的 setNamespace（客户端改写 "ns%topic"）
+    // 是两套机制。开关在钩子链里的位置照 Java `MQClientAPIImpl:329`：装在 ACL 签名**之前**，
+    // 所以 `nsd`/`ns` 落在签名内容之内（见 composeRequestHooks）。
+    // ⚠ 开了 enableTrace 时还要同步传导给轨迹分发器（Java AsyncTraceDispatcher.start():155）。
+    void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
+    const std::string& namespaceV2() const { return namespaceV2_; }
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
     // 对应 Java `ClientConfig` 的三个同名开关（差异见 `cpp/README.md`）。
@@ -618,6 +626,8 @@ protected:
     int32_t compressType_ = CompressionType::ZLIB;
     std::vector<std::string> nameServerAddrs_;
     std::string namespace_;
+    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
+    std::string namespaceV2_;
     // 发送延迟故障规避（默认关闭，对应 Java MQFaultStrategy 的默认开关）
     MQFaultStrategy mqFaultStrategy_{false};
 

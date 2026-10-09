@@ -51,9 +51,8 @@ public abstract class RequestCallback
 /// <summary>
 /// 对应 Java RequestResponseFuture：一次 request 的等待槽。
 ///
-/// 与 Java 的差异（有意）：Java 额外起了一个 scanExpiredRequest 定时线程清理超时项；
-/// 本实现由 Request() 的 finally 保证移除（MqClient.ProcessReplyMessage 用
-/// 「remove 抢所有权」语义，二者只会有一个生效），故不需要后台扫描线程。
+/// 超时的**兜底清理**由 <see cref="RequestFutureHolder.ScanExpiredRequest"/> 的周期扫描负责
+/// （Java scanExpiredRequest 同款）：等待槽到期还没人投应答时被摘除并触发一次回调。
 /// </summary>
 public sealed class RequestResponseFuture
 {
@@ -200,6 +199,136 @@ public sealed class RequestFutureHolder
         // 同步调用方（callback 为空）靠 PutResponseMessage 唤醒。
         future.ExecuteRequestCallback();
         return future;
+    }
+
+    // ---------- 超时兜底扫描（Java scanExpiredRequest / startScheduledTask / shutdown） ----------
+
+    /// <summary>引用计数用的 producer 集合（对齐 Java producerSet：按实例去重）。</summary>
+    private readonly HashSet<object> _producers = new();
+
+    private readonly object _lifecycleLock = new();
+    private Thread? _scanThread;
+    private ManualResetEventSlim? _scanStop;
+
+    /// <summary>
+    /// 对应 Java scanExpiredRequest：摘除所有已到期的等待槽并触发一次回调。
+    ///
+    /// 两个要点照搬 Java：
+    /// 1. 先「摘除」再「回调」，两步分开 —— 回调里如果又发起 request（重试场景）不会死锁；
+    /// 2. remove-claims-ownership：只有真正从表里摘掉的那个线程有权触发回调，这样
+    ///    「应答到达（PutResponse）」与「超时清理」两条路径只有一条生效。
+    ///
+    /// 同步调用（callback 为 null）不在此唤醒：它在 WaitResponseMessage 的 latch 上
+    /// 自行超时，与 Java 行为一致。返回本轮摘除的 future（测试断言用）。
+    /// </summary>
+    public List<RequestResponseFuture> ScanExpiredRequest()
+    {
+        var expired = new List<RequestResponseFuture>();
+        lock (_lock)
+        {
+            foreach (KeyValuePair<string, RequestResponseFuture> kv in _table)
+            {
+                if (!kv.Value.IsTimeout())
+                {
+                    continue;
+                }
+
+                // 再次校验 isTimeout 后才摘（对齐 Java 的迭代器 remove：只摘扫到的那条，
+                // 防止同一 correlationId 被重新 put 后误伤新槽）。
+                if (_table.TryGetValue(kv.Key, out RequestResponseFuture? rf) && rf.IsTimeout())
+                {
+                    _table.Remove(kv.Key);
+                    expired.Add(rf);
+                    ClientLog.Warn("remove timeout request, CorrelationId=" + rf.CorrelationId);
+                }
+            }
+        }
+
+        foreach (RequestResponseFuture rf in expired)
+        {
+            try
+            {
+                rf.Cause = new RequestTimeoutException("request timeout, no reply message.");
+                rf.ExecuteRequestCallback();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("scanResponseTable, operationComplete Exception: " + e.Message);
+            }
+        }
+
+        return expired;
+    }
+
+    /// <summary>
+    /// 对应 Java startScheduledTask(producer)：把 producer 计入引用集合，并懒启动
+    /// 扫描线程（线程名 RequestHouseKeepingService；首扫延迟 3000ms、周期 1000ms，
+    /// scheduleAtFixedRate 语义 —— 计划时刻锚定，落后即刻补跑）。
+    /// 单例表被多个 producer 共享，任一存活就得继续扫。
+    /// </summary>
+    public void StartScheduledTask(object producer)
+    {
+        lock (_lifecycleLock)
+        {
+            _producers.Add(producer);
+            if (_scanThread is not null)
+            {
+                return;
+            }
+
+            var stop = new ManualResetEventSlim(false);
+            _scanStop = stop;
+            var thread = new Thread(() =>
+            {
+                long next = Environment.TickCount64 + 3000;
+                while (!stop.IsSet)
+                {
+                    Schedules.WaitUntil(stop, next);
+                    if (stop.IsSet)
+                    {
+                        break;
+                    }
+
+                    next += 1000;
+                    try
+                    {
+                        ScanExpiredRequest();
+                    }
+                    catch (Exception e)
+                    {
+                        ClientLog.Error("scan RequestFutureTable exception: " + e.Message);
+                    }
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "RequestHouseKeepingService",
+            };
+            _scanThread = thread;
+            thread.Start();
+        }
+    }
+
+    /// <summary>
+    /// 对应 Java shutdown(producer)：仅当最后一个 producer 退场时才停扫描线程。
+    /// </summary>
+    public void ShutdownScheduledTask(object producer)
+    {
+        lock (_lifecycleLock)
+        {
+            _producers.Remove(producer);
+            if (_producers.Count > 0 || _scanThread is null)
+            {
+                return;
+            }
+
+            Thread thread = _scanThread;
+            ManualResetEventSlim stop = _scanStop!;
+            _scanThread = null;
+            _scanStop = null;
+            stop.Set();
+            thread.Join(500);
+        }
     }
 }
 

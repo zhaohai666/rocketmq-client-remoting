@@ -6,6 +6,7 @@
 //
 // 场景（拉模式的核心是「调用方自己拉、自己管位点」，断言都围绕这一点）：
 //   S1 建 topic + FetchSubscribeMessageQueues → 拿到 4 个队列
+//   S1b FetchMessageQueuesInBalance → 没拉取过的实例靠真实路由 + 38 算出自己那份
 //   S2 生产 12 条 → 每队列 min/max offset 差值 = 3（消息均匀落到 4 队列）
 //   S3 手动拉取：逐队列从 min offset 拉到 max offset → 收全 12 条且 body 与发送集合一致
 //   S4 手动提交位点：UpdateConsumeOffset → FetchConsumeOffset 回读一致（broker 往返）
@@ -141,6 +142,53 @@ public static class LivePull
         {
             bool namesOk = routes.All(q => q.Topic == Topic && q.BrokerName.Length > 0);
             Check("S1 队列 topic 与 broker 名非空", namesOk, "sample=" + QKey(routes[0]));
+        }
+
+        // ---------------- S1b 平衡视图（FetchMessageQueuesInBalance）----------------
+        // 此刻本实例**一笔都没拉过**：算不动时的兜底是「保留现有分配」=空集，所以拿到非空
+        // 只可能来自真实路由 + broker 的 GET_CONSUMER_LIST_BY_GROUP(38) —— 也就是心跳真的把
+        // 本组注册进了 broker。心跳订阅集来自 RegisterTopics（Java
+        // DefaultMQPullConsumerImpl.subscriptions():357-385），所以先登记 topic（listener
+        // 传 null 也要登记，Java 的 MQPullConsumerScheduleService:100 就这么用）、再补一发
+        // 心跳，然后轮询读视图（38 的可见性有 1s 量级延迟）。
+        Console.WriteLine();
+        Console.WriteLine("S1b FetchMessageQueuesInBalance");
+        {
+            consumer.RegisterMessageQueueListener(Topic, null);
+            int hbOk = consumer.SendHeartbeatToAllBroker();
+            Check("S1b 登记 topic 后心跳发出去了（38 可见的前提）", hbOk > 0,
+                "heartbeat_ok=" + hbOk.ToString(CultureInfo.InvariantCulture));
+
+            var mine = new List<MessageQueue>();
+            long balanceDeadline = NowMs() + 20000;
+            while (NowMs() < balanceDeadline)
+            {
+                try
+                {
+                    mine = consumer.FetchMessageQueuesInBalance(Topic);
+                    if (mine.Count == QueueNum)
+                    {
+                        break;
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine("  [diag] FetchMessageQueuesInBalance: " + e.Message);
+                }
+
+                consumer.SendHeartbeatToAllBroker();
+                Thread.Sleep(500);
+            }
+
+            Check("S1b 平衡视图：独占分组拿到全部 "
+                  + QueueNum.ToString(CultureInfo.InvariantCulture) + " 个队列"
+                  + "（未拉取过⇒只可能是路由+38 算出来的）",
+                mine.Count == QueueNum,
+                "got=" + mine.Count.ToString(CultureInfo.InvariantCulture) + " of "
+                + QueueNum.ToString(CultureInfo.InvariantCulture));
+            var whole = new HashSet<string>(routes.Select(QKey), StringComparer.Ordinal);
+            Check("S1b 平衡视图是订阅视图的子集", mine.All(q => whole.Contains(QKey(q))),
+                "mine=" + string.Join(" ", mine.Select(QKey)));
         }
 
         // ---------------- S2 生产 ----------------

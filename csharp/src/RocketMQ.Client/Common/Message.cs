@@ -192,6 +192,41 @@ public class Message
 
     public void ClearProperty() => Properties.Clear();
 
+    // ---- 定时消息的三个类型化写入器（对齐 Java Message.setDelayTimeSec/setDelayTimeMs/
+    // setDeliverTimeMs，common/message/Message.java:238-267）----
+    // Java 侧就是 putProperty(键, String.valueOf(值)) —— 没有范围校验；真正的合法性
+    // （是否超过 maxDelayTime、三个键的优先级）由 broker 的 TimerMessageStore 与
+    // 客户端发送链路（DefaultMQProducerImpl 的 delayTimeForbid 检查）负责。这里保持
+    // 同一职责边界：写键、不拦截。键值同时至多一个生效是**调用方**的约定（Java 亦然）。
+    /// <summary>Java <c>setDelayTimeSec</c>：写 TIMER_DELAY_SEC（相对当前时刻的秒数）。</summary>
+    public void SetDelayTimeSec(long sec) =>
+        PutProperty(MessageConst.PropertyTimerDelaySec, sec.ToString(CultureInfo.InvariantCulture));
+
+    /// <summary>Java <c>getDelayTimeSec</c>：读 TIMER_DELAY_SEC，缺省 0；值非法时与 Java 的
+    /// <c>Long.parseLong</c> 一样直接抛（FormatException），不静默当 0。</summary>
+    public long GetDelayTimeSec() => GetTimerProperty(MessageConst.PropertyTimerDelaySec);
+
+    /// <summary>Java <c>setDelayTimeMs</c>：写 TIMER_DELAY_MS（绝对毫秒时刻）。</summary>
+    public void SetDelayTimeMs(long timeMs) =>
+        PutProperty(MessageConst.PropertyTimerDelayMs, timeMs.ToString(CultureInfo.InvariantCulture));
+
+    /// <summary>Java <c>getDelayTimeMs</c>：读 TIMER_DELAY_MS，缺省 0，非法值直接抛。</summary>
+    public long GetDelayTimeMs() => GetTimerProperty(MessageConst.PropertyTimerDelayMs);
+
+    /// <summary>Java <c>setDeliverTimeMs</c>：写 TIMER_DELIVER_MS（绝对毫秒时刻）。</summary>
+    public void SetDeliverTimeMs(long timeMs) =>
+        PutProperty(MessageConst.PropertyTimerDeliverMs, timeMs.ToString(CultureInfo.InvariantCulture));
+
+    /// <summary>Java <c>getDeliverTimeMs</c>：读 TIMER_DELIVER_MS，缺省 0，非法值直接抛。</summary>
+    public long GetDeliverTimeMs() => GetTimerProperty(MessageConst.PropertyTimerDeliverMs);
+
+    private long GetTimerProperty(string name)
+    {
+        return !Properties.TryGetValue(name, out string? t) || t is null
+            ? 0
+            : long.Parse(t, CultureInfo.InvariantCulture);
+    }
+
     public override string ToString()
     {
         var props = new StringBuilder();

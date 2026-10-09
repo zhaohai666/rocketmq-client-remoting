@@ -140,10 +140,10 @@ public sealed class RemotingClient : IDisposable
     /// <b>first-wins</b>：已有钩子时返回 false 且不覆盖，与 Java 在构造 MQClientInstance 时
     /// 绑定钩子的行为一致（同一 clientId 复用实例）。因此钩子必须在 Start() 之前设置。
     /// <para>
-    /// 注意（与 Java 的有意差异）：Java 还在响应完成回调里调用 DoAfterResponse，本实现
-    /// 没有该调用——响应在读线程里分发，此处不持有请求对象，为了不把每个请求的 Body
-    /// 都拷一份挂在在途表上，故省略。AclClientRPCHook.DoAfterResponse 本身是空实现，
-    /// 因此无功能影响。
+    /// 注意（与 Java 的差异）：Java 在响应完成回调里对 sync/async 都调 DoAfterResponse；
+    /// 本实现只在<b>同步</b>路径调用（请求对象在栈上，无需为在途表保留 Body）——异步路径
+    /// 请求挂在在途表上，为不拖累每个在途请求的内存占用而省略。AclClientRPCHook 的
+    /// DoAfterResponse 是空实现，目前唯一依赖它的是轨迹 recall 钩子（recall 是同步 RPC）。
     /// </para>
     /// </remarks>
     public bool RegisterRpcHook(IRpcHook hook)
@@ -167,6 +167,11 @@ public sealed class RemotingClient : IDisposable
             _rpcHook = null;
         }
     }
+
+    /// <summary>当前已注册的请求钩子（未注册返回 null）。供 trace 启动这类「往已有链上
+    /// 追加一段」的场景读取 —— 单槽传输层换钩子要拿着旧值才能组合（先 Unregister 再
+    /// Register 链，中间不留空窗的责任在调用方）。</summary>
+    public IRpcHook? CurrentHook() => CurrentRpcHook();
 
     private IRpcHook? CurrentRpcHook()
     {
@@ -1120,6 +1125,19 @@ public sealed class RemotingClient : IDisposable
                 ? new RemotingSendRequestException(future.Cause.Message)
                 : new RemotingSendRequestException(addr + " connection closed before response, opaque="
                     + opaque.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // 同步路径补上 DoAfterResponse（Java 在响应完成回调里对 sync/async 都调；本实现只在
+        // **持有请求对象**的同步路径调——异步路径请求挂在在途表上，按上面的差异说明不调）。
+        // 现有钩子（ACL/stream）的 DoAfterResponse 都是空实现，唯一用它的是轨迹的
+        // recall 钩子（RECALL_MESSAGE 是同步 RPC）。钩子的异常绝不改变 RPC 结果。
+        try
+        {
+            CurrentRpcHook()?.DoAfterResponse(addr, request, future.Response);
+        }
+        catch (Exception e)
+        {
+            ClientLog.Warn("rpc hook doAfterResponse failed: " + e.Message);
         }
 
         return future.Response;

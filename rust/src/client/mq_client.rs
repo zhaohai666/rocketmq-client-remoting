@@ -58,7 +58,6 @@ use crate::client::result::{
     ChangeInvisibleTimeResult, PopResult, PopStatus, PullResult, PullStatus, SendResult, SendStatus,
 };
 use crate::client::top_addressing::DefaultTopAddressing;
-use crate::remoting::rpchook::StreamTypeRPCHook;
 use crate::common::boundary_type::BoundaryType;
 use crate::common::compression::decompress_body;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
@@ -76,7 +75,9 @@ use crate::common::sysflag::{MessageSysFlag, PullSysFlag};
 use crate::common::topic_config::TopicFilterType;
 use crate::common::util_all::current_time_millis;
 use crate::error::{client_error_code, Error, Result};
-use crate::remoting::client::{RemotingClient, RemotingClientConfig, RequestProcessor, ResponseSink};
+use crate::remoting::client::{
+    RemotingClient, RemotingClientConfig, RequestProcessor, ResponseSink,
+};
 use crate::remoting::protocol::admin_body::MessageQueueKey;
 use crate::remoting::protocol::body::{
     CheckClientRequestBody, ClusterInfo, ConsumeMessageDirectlyResult, ConsumerRunningInfo,
@@ -92,22 +93,21 @@ use crate::remoting::protocol::headers::{
     CreateTopicRequestHeader, GetConsumerListByGroupRequestHeader,
     GetConsumerRunningInfoRequestHeader, GetConsumerStatusRequestHeader,
     GetEarliestMsgStoretimeRequestHeader, GetEarliestMsgStoretimeResponseHeader,
-    GetMaxOffsetRequestHeader, GetMaxOffsetResponseHeader,
-    GetMinOffsetRequestHeader, GetMinOffsetResponseHeader, LockBatchMqRequestHeader,
-    NotifyConsumerIdsChangedRequestHeader,
+    GetMaxOffsetRequestHeader, GetMaxOffsetResponseHeader, GetMinOffsetRequestHeader,
+    GetMinOffsetResponseHeader, LockBatchMqRequestHeader, NotifyConsumerIdsChangedRequestHeader,
     PopMessageRequestHeader, PopMessageResponseHeader, PullMessageRequestHeader,
-    PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
-    QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader, RecallMessageRequestHeader,
-    RecallMessageResponseHeader, ReplyMessageRequestHeader,
-    ResetOffsetRequestHeader, SearchOffsetRequestHeader, SearchOffsetResponseHeader,
-    SendMessageRequestHeaderV2, SendMessageResponseHeader, UnregisterClientRequestHeader,
-    UpdateConsumerOffsetRequestHeader, UnlockBatchMqRequestHeader,
+    PullMessageResponseHeader, QueryConsumerOffsetRequestHeader, QueryConsumerOffsetResponseHeader,
+    QueryMessageRequestHeader, RecallMessageRequestHeader, RecallMessageResponseHeader,
+    ReplyMessageRequestHeader, ResetOffsetRequestHeader, SearchOffsetRequestHeader,
+    SearchOffsetResponseHeader, SendMessageRequestHeaderV2, SendMessageResponseHeader,
+    UnlockBatchMqRequestHeader, UnregisterClientRequestHeader, UpdateConsumerOffsetRequestHeader,
 };
 use crate::remoting::protocol::heartbeat::{
     ConsumerData, ExpressionType, HeartbeatData, SubscriptionData,
 };
 use crate::remoting::protocol::remoting_command::RemotingCommand;
 use crate::remoting::protocol::route::{pseudo_random_index, TopicRouteData};
+use crate::remoting::rpchook::{NamespaceRpcHook, StreamTypeRPCHook};
 use crate::{bail, rmq_debug, rmq_info, rmq_warn};
 
 // ================================================================ seams
@@ -299,17 +299,28 @@ impl TopicPublishInfo {
 
     /// `order_topic` 读（Python 直接读属性）。
     pub fn order_topic(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).order_topic
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .order_topic
     }
 
     /// `msg_queue_list` 快照。
     pub fn msg_queue_list(&self) -> Vec<MessageQueue> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).msg_queue_list.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .msg_queue_list
+            .clone()
     }
 
     /// `topic_route_data` 快照。
     pub fn topic_route_data(&self) -> Option<TopicRouteData> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).topic_route_data.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .topic_route_data
+            .clone()
     }
 
     /// Python `to_dict`：`{"orderTopic":..., "messageQueueList":[{topic,brokerName,queueId}]}`。
@@ -317,7 +328,10 @@ impl TopicPublishInfo {
     pub fn to_dict(&self) -> serde_json::Value {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         serde_json::Value::Object(serde_json::Map::from_iter(vec![
-            ("orderTopic".to_string(), serde_json::Value::Bool(state.order_topic)),
+            (
+                "orderTopic".to_string(),
+                serde_json::Value::Bool(state.order_topic),
+            ),
             (
                 "messageQueueList".to_string(),
                 serde_json::Value::Array(
@@ -326,15 +340,15 @@ impl TopicPublishInfo {
                         .iter()
                         .map(|q| {
                             serde_json::Value::Object(serde_json::Map::from_iter(vec![
-                                ("topic".to_string(), serde_json::Value::String(q.topic.clone())),
+                                (
+                                    "topic".to_string(),
+                                    serde_json::Value::String(q.topic.clone()),
+                                ),
                                 (
                                     "brokerName".to_string(),
                                     serde_json::Value::String(q.broker_name.clone()),
                                 ),
-                                (
-                                    "queueId".to_string(),
-                                    serde_json::Value::from(q.queue_id),
-                                ),
+                                ("queueId".to_string(), serde_json::Value::from(q.queue_id)),
                             ]))
                         })
                         .collect(),
@@ -487,6 +501,12 @@ pub struct MQClientInstanceConfig {
     /// 的 `-<unitName>` 段（`MQClientAPIImpl:322`
     /// `new DefaultTopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName())`）。
     pub unit_name: Option<String>,
+    /// Java `ClientConfig#namespaceV2`：5.x **服务端**命名空间。非空时本实例的
+    /// 传输层注册 `NamespaceRpcHook`，每个请求带 `nsd=true` / `ns=<namespaceV2>`
+    /// 两个扩展头（`MQClientAPIImpl:329`，值常量见
+    /// [`crate::common::mix_all::MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD`]）。
+    /// 与 v1 `namespace`（客户端拼 `%` 前缀）是两套机制。
+    pub namespace_v2: Option<String>,
     /// Java `ClientConfig#enableStreamRequestType`：true 时**在本实例的传输层**注册
     /// `StreamTypeRPCHook`（每个请求带 `ReqT=0`）。
     ///
@@ -517,6 +537,7 @@ impl Default for MQClientInstanceConfig {
             trace_dispatcher: None,
             top_addressing: None,
             unit_name: None,
+            namespace_v2: None,
             enable_stream_request_type: false,
         }
     }
@@ -531,18 +552,30 @@ impl std::fmt::Debug for MQClientInstanceConfig {
             .field("connect_timeout_millis", &self.connect_timeout_millis)
             .field("invoke_timeout_millis", &self.invoke_timeout_millis)
             .field("tls_enable", &self.tls_enable)
-            .field("route_refresh_interval_millis", &self.route_refresh_interval_millis)
+            .field(
+                "route_refresh_interval_millis",
+                &self.route_refresh_interval_millis,
+            )
             .field(
                 "namesrv_refresh_initial_delay_millis",
                 &self.namesrv_refresh_initial_delay_millis,
             )
-            .field("namesrv_refresh_interval_millis", &self.namesrv_refresh_interval_millis)
+            .field(
+                "namesrv_refresh_interval_millis",
+                &self.namesrv_refresh_interval_millis,
+            )
             .field(
                 "adjust_pool_initial_delay_millis",
                 &self.adjust_pool_initial_delay_millis,
             )
-            .field("adjust_pool_interval_millis", &self.adjust_pool_interval_millis)
-            .field("heartbeat_initial_delay_millis", &self.heartbeat_initial_delay_millis)
+            .field(
+                "adjust_pool_interval_millis",
+                &self.adjust_pool_interval_millis,
+            )
+            .field(
+                "heartbeat_initial_delay_millis",
+                &self.heartbeat_initial_delay_millis,
+            )
             .field("heartbeat_interval_millis", &self.heartbeat_interval_millis)
             .field(
                 "persist_offset_initial_delay_millis",
@@ -560,10 +593,17 @@ impl std::fmt::Debug for MQClientInstanceConfig {
                 "latency_fault_tolerance",
                 &injected(self.latency_fault_tolerance.is_some()),
             )
-            .field("trace_dispatcher", &injected(self.trace_dispatcher.is_some()))
+            .field(
+                "trace_dispatcher",
+                &injected(self.trace_dispatcher.is_some()),
+            )
             .field("top_addressing", &injected(self.top_addressing.is_some()))
             .field("unit_name", &self.unit_name)
-            .field("enable_stream_request_type", &self.enable_stream_request_type)
+            .field("namespace_v2", &self.namespace_v2)
+            .field(
+                "enable_stream_request_type",
+                &self.enable_stream_request_type,
+            )
             .finish()
     }
 }
@@ -636,7 +676,12 @@ fn parse_reset_offset_table(data: &[u8]) -> Result<Vec<(MessageQueue, i64)>> {
             Ok(for_c
                 .offset_table
                 .into_iter()
-                .map(|e| (MessageQueue::new(&e.topic, &e.broker_name, e.queue_id), e.offset))
+                .map(|e| {
+                    (
+                        MessageQueue::new(&e.topic, &e.broker_name, e.queue_id),
+                        e.offset,
+                    )
+                })
                 .collect())
         }
     }
@@ -661,7 +706,11 @@ impl MQClientInstance {
 
     /// Python `MQClientInstance(client_id, name_server_addrs)`（其余参数取默认）。
     pub fn new(client_id: &str, name_server_addrs: Vec<String>) -> MQClientInstance {
-        MQClientInstance::with_config(client_id, name_server_addrs, MQClientInstanceConfig::default())
+        MQClientInstance::with_config(
+            client_id,
+            name_server_addrs,
+            MQClientInstanceConfig::default(),
+        )
     }
 
     /// Python `__init__` 的完整注入版本（差异见模块头第 2 条）。
@@ -708,11 +757,21 @@ impl MQClientInstance {
             tasks: Mutex::new(Vec::new()),
             consumer_ids_changed_count: AtomicUsize::new(0),
         });
-        let this = MQClientInstance { inner: inner.clone() };
-        // Java `MQClientAPIImpl:329-333` 的钩子顺序是
+        let this = MQClientInstance {
+            inner: inner.clone(),
+        };
+        // Java `MQClientAPIImpl:329-335` 的钩子顺序是
         // `NamespaceRpcHook → StreamTypeRPCHook → 用户 rpcHook → DynamicalExtFieldRPCHook`，
-        // 注释还特别写明 stream 要在 ACL 之前（"make reserve field signature"）。
-        // 各门面的用户钩子是**创建实例之后**才注册的，所以在这里注册天然靠前。
+        // 注释还特别写明 stream 要在 ACL 之前（"make reserve field signature"）——
+        // 同一条理由要求 Namespace 也在 ACL 之前（`nsd`/`ns` 必须进签名内容）。
+        // 各门面的用户钩子是**创建实例之后**才注册的，所以在这里注册天然靠前，
+        // 顺序 Namespace → Stream → 用户钩子对每个门面都成立。
+        // NamespaceRpcHook 无条件注册（Java 同款），namespaceV2 未配置时它是 no-op。
+        this.inner
+            .remoting_client
+            .register_rpc_hook(Arc::new(NamespaceRpcHook::new(
+                inner.config.namespace_v2.as_deref(),
+            )));
         if inner.config.enable_stream_request_type {
             this.inner
                 .remoting_client
@@ -735,7 +794,9 @@ impl MQClientInstance {
             request_code::CONSUME_MESSAGE_DIRECTLY,
             request_code::NOTIFY_CONSUMER_IDS_CHANGED,
         ] {
-            this.inner.remoting_client.register_processor(code, processor.clone());
+            this.inner
+                .remoting_client
+                .register_processor(code, processor.clone());
         }
         MQClientInstance::instance_map()
             .lock()
@@ -772,7 +833,11 @@ impl MQClientInstance {
     }
 
     pub fn name_server_addrs(&self) -> Vec<String> {
-        self.inner.name_server_addrs.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.inner
+            .name_server_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 实例持有的周期配置（Java `ClientConfig` 的实例级副本）：门面 `start()` 透传的
@@ -902,10 +967,24 @@ impl MQClientInstance {
 
     /// 还在用这份实例的门面数量（Java `shutdown` 前三行守卫读的就是这三张表）。
     fn tenant_count(&self) -> usize {
-        let consumers = self.inner.consumer_table.lock().unwrap_or_else(|e| e.into_inner()).len();
-        let groups =
-            self.inner.consumer_group_table.lock().unwrap_or_else(|e| e.into_inner()).len();
-        let producers = self.inner.producer_table.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let consumers = self
+            .inner
+            .consumer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let groups = self
+            .inner
+            .consumer_group_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let producers = self
+            .inner
+            .producer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         consumers + groups + producers
     }
 
@@ -999,7 +1078,12 @@ impl MQClientInstance {
         let body = GetConsumerStatusBody {
             message_queue_table: status
                 .into_iter()
-                .map(|(mq, off)| (MessageQueueKey::new(&mq.topic, &mq.broker_name, mq.queue_id), off))
+                .map(|(mq, off)| {
+                    (
+                        MessageQueueKey::new(&mq.topic, &mq.broker_name, mq.queue_id),
+                        off,
+                    )
+                })
                 .collect(),
             consumer_table: Vec::new(),
         };
@@ -1008,7 +1092,10 @@ impl MQClientInstance {
         resp
     }
 
-    pub(crate) fn process_get_consumer_running_info(&self, cmd: &RemotingCommand) -> RemotingCommand {
+    pub(crate) fn process_get_consumer_running_info(
+        &self,
+        cmd: &RemotingCommand,
+    ) -> RemotingCommand {
         let mut header = GetConsumerRunningInfoRequestHeader::default();
         header.from_ext_fields(cmd.ext_fields());
         let group = header.consumer_group.clone().unwrap_or_default();
@@ -1024,7 +1111,10 @@ impl MQClientInstance {
         resp
     }
 
-    pub(crate) fn process_consume_message_directly(&self, cmd: &RemotingCommand) -> RemotingCommand {
+    pub(crate) fn process_consume_message_directly(
+        &self,
+        cmd: &RemotingCommand,
+    ) -> RemotingCommand {
         let mut header = ConsumeMessageDirectlyResultRequestHeader::default();
         header.from_ext_fields(cmd.ext_fields());
         let group = header.consumer_group.clone().unwrap_or_default();
@@ -1077,7 +1167,9 @@ impl MQClientInstance {
         };
         match build_reply_message_ext(&header, cmd.body()) {
             Ok(msg) => {
-                let correlation_id = msg.get_property(PROPERTY_CORRELATION_ID).map(|s| s.to_string());
+                let correlation_id = msg
+                    .get_property(PROPERTY_CORRELATION_ID)
+                    .map(|s| s.to_string());
                 if request_future_holder()
                     .put_response(correlation_id.as_deref(), msg)
                     .is_none()
@@ -1254,7 +1346,9 @@ impl MQClientInstance {
     /// 之后同 clientId 会拿到干净的新实例。只摘**指向自己**的那一条 —— 同 key 可能
     /// 已被更晚构造的实例覆盖（`with_config` 是无条件 `insert`）。
     fn remove_from_instance_map(&self) {
-        let mut map = MQClientInstance::instance_map().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = MQClientInstance::instance_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let alive = map
             .get(self.inner.client_id.as_str())
             .and_then(|weak| weak.upgrade())
@@ -1265,7 +1359,11 @@ impl MQClientInstance {
     }
 
     fn push_task(&self, handle: JoinHandle<()>) {
-        self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
     }
 
     /// 通用周期任务：initial 延迟 → 循环（work → sleep ∥ stop 信号），每轮先查 started。
@@ -1274,8 +1372,13 @@ impl MQClientInstance {
     /// `ScheduledExecutorService#scheduleAtFixedRate`，任务在 initialDelay 后立刻跑第一次，
     /// **之后**才按周期重复。按「先睡 initial 再睡 period」写会让首跳晚一整个周期
     /// （真机实测：30s 周期组 30.19s 才刷新路由，而 Java 语义是 10ms + 立刻）。
-    fn spawn_periodic<F, Fut>(&self, _name: &str, work: F, initial_delay_millis: u64, period_millis: u64)
-    where
+    fn spawn_periodic<F, Fut>(
+        &self,
+        _name: &str,
+        work: F,
+        initial_delay_millis: u64,
+        period_millis: u64,
+    ) where
         F: Fn(MQClientInstance) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
@@ -1321,8 +1424,9 @@ impl MQClientInstance {
                 .cloned()
                 .collect();
             for topic in topics {
-                if let Err(e) =
-                    self.update_topic_route_info_from_name_server(&topic, 5000, false).await
+                if let Err(e) = self
+                    .update_topic_route_info_from_name_server(&topic, 5000, false)
+                    .await
                 {
                     rmq_debug!("route refresh failed for {topic}: {e}");
                 }
@@ -1347,7 +1451,11 @@ impl MQClientInstance {
     }
 
     fn apply_namesrv_change(&self, text: &str) {
-        let addrs: Vec<String> = text.split(';').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+        let addrs: Vec<String> = text
+            .split(';')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
         self.update_name_server_address_list(&addrs);
     }
 
@@ -1356,7 +1464,11 @@ impl MQClientInstance {
         if addrs.is_empty() {
             return;
         }
-        *self.inner.name_server_addrs.lock().unwrap_or_else(|e| e.into_inner()) = addrs.to_vec();
+        *self
+            .inner
+            .name_server_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = addrs.to_vec();
     }
 
     /// Python `adjust_thread_pool`（Java `MQClientInstance#adjustThreadPool`）：
@@ -1370,7 +1482,11 @@ impl MQClientInstance {
     /// Python `register_topic_in_use`：登记需要后台周期刷新路由的 topic。
     pub fn register_topic_in_use(&self, topic: &str) {
         if !topic.is_empty() {
-            self.inner.topics_in_use.lock().unwrap_or_else(|e| e.into_inner()).insert(topic.to_string());
+            self.inner
+                .topics_in_use
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(topic.to_string());
         }
     }
 }
@@ -1457,15 +1573,18 @@ impl MQClientInstance {
         };
         let publish = {
             let mut tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
-            tables.topic_route_table.insert(topic.to_string(), route.clone());
+            tables
+                .topic_route_table
+                .insert(topic.to_string(), route.clone());
             // Java 只在路由"变了"时覆盖（`if (changed)`），但 route 是刚解码出来的新对象，
             // 这里一律覆盖 —— Java 的 brokerAddrTable 条目本身就是**共享引用**
             // （`put(bd.getBrokerName(), bd.getBrokerAddrs())` 存的是 route 里那张 map），
             // 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
             for bd in route.get_broker_datas() {
-                tables
-                    .broker_addr_table
-                    .insert(bd.broker_name.clone(), bd.broker_addrs.iter().cloned().collect());
+                tables.broker_addr_table.insert(
+                    bd.broker_name.clone(),
+                    bd.broker_addrs.iter().cloned().collect(),
+                );
             }
             tables
                 .topic_publish_info_table
@@ -1496,7 +1615,10 @@ impl MQClientInstance {
             let mut request =
                 RemotingCommand::create_request_command(request_code::GET_ROUTEINFO_BY_TOPIC, None);
             request.add_ext_field("topic", topic);
-            match self.invoke_sync(ns_addr, &mut request, timeout_millis).await {
+            match self
+                .invoke_sync(ns_addr, &mut request, timeout_millis)
+                .await
+            {
                 Ok(response) => {
                     if response.code != response_code::SUCCESS {
                         break;
@@ -1548,7 +1670,10 @@ impl MQClientInstance {
         if let Some(route) = self.route_of(topic) {
             return Some(route);
         }
-        if let Err(e) = self.update_topic_route_info_from_name_server(topic, 5000, false).await {
+        if let Err(e) = self
+            .update_topic_route_info_from_name_server(topic, 5000, false)
+            .await
+        {
             // Python `except Exception: pass`
             rmq_debug!("get_topic_route_data refresh failed for {topic}: {e}");
         }
@@ -1699,7 +1824,10 @@ impl MQClientInstance {
             default_topic_queue_nums,
         );
         request.mark_oneway_rpc();
-        self.inner.remoting_client.invoke_oneway(addr, &mut request).await
+        self.inner
+            .remoting_client
+            .invoke_oneway(addr, &mut request)
+            .await
     }
 
     /// Python `send_message_async`（对应 Java `MQClientAPIImpl#sendMessageAsync`）：
@@ -1828,10 +1956,7 @@ impl MQClientInstance {
         } else {
             request_code::SEND_MESSAGE_V2
         };
-        let mut request = RemotingCommand::create_request_command(
-            code,
-            Some(Box::new(header)),
-        );
+        let mut request = RemotingCommand::create_request_command(code, Some(Box::new(header)));
         request.set_body(Some(Self::encode_body(outer)));
         request
     }
@@ -1923,7 +2048,9 @@ impl MQClientInstance {
         resp_header
             .msg_id
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| Error::client(format!("recall message response has no msgId, addr {addr}")))
+            .ok_or_else(|| {
+                Error::client(format!("recall message response has no msgId, addr {addr}"))
+            })
     }
 
     // ---------------- 拉取 ----------------
@@ -1956,10 +2083,9 @@ impl MQClientInstance {
         let addr = match addr {
             Some(a) => a.to_string(),
             None => {
-                let route = self
-                    .get_topic_route_data(&mq.topic)
-                    .await
-                    .ok_or_else(|| Error::client(format!("No route info of this topic: {}", mq.topic)))?;
+                let route = self.get_topic_route_data(&mq.topic).await.ok_or_else(|| {
+                    Error::client(format!("No route info of this topic: {}", mq.topic))
+                })?;
                 match broker_id {
                     // Java `PullAPIWrapper#pullKernelImpl:197-205`：按 pullFromWhichNode 选
                     // brokerId，`findBrokerAddressInSubscribe(brokerName, recalc, false)` 解析地址；
@@ -1969,24 +2095,30 @@ impl MQClientInstance {
                             .get_broker_datas()
                             .iter()
                             .find(|bd| bd.broker_name == mq.broker_name)
-                            .ok_or_else(|| Error::client(format!("Broker {} not exist", mq.broker_name)))?;
+                            .ok_or_else(|| {
+                                Error::client(format!("Broker {} not exist", mq.broker_name))
+                            })?;
                         let (chosen, slave) = Self::find_broker_addr_in_subscribe(
                             &broker_data.broker_addrs,
                             id,
                             false,
                         )
-                        .ok_or_else(|| Error::client(format!("Broker {} not exist", mq.broker_name)))?;
+                        .ok_or_else(|| {
+                            Error::client(format!("Broker {} not exist", mq.broker_name))
+                        })?;
                         if slave {
                             sys_flag = PullSysFlag::clear_commit_offset_flag(sys_flag);
                         }
                         chosen
                     }
-                    None => Self::find_broker_addr_in_route(&route, &mq.broker_name).ok_or_else(|| {
-                        Error::client(format!(
-                            "Broker {} not found in route of topic {}",
-                            mq.broker_name, mq.topic
-                        ))
-                    })?,
+                    None => Self::find_broker_addr_in_route(&route, &mq.broker_name).ok_or_else(
+                        || {
+                            Error::client(format!(
+                                "Broker {} not found in route of topic {}",
+                                mq.broker_name, mq.topic
+                            ))
+                        },
+                    )?,
                 }
             }
         };
@@ -2025,7 +2157,9 @@ impl MQClientInstance {
             request_code::PULL_MESSAGE
         };
         let mut request = RemotingCommand::create_request_command(code, Some(Box::new(header)));
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         let status = match response.code {
             response_code::SUCCESS => PullStatus::Found,
             response_code::PULL_NOT_FOUND => PullStatus::NoNewMsg,
@@ -2164,14 +2298,20 @@ impl MQClientInstance {
             order,
             attempt_id: None,
         };
-        let mut request =
-            RemotingCommand::create_request_command(request_code::POP_MESSAGE, Some(Box::new(header)));
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let mut request = RemotingCommand::create_request_command(
+            request_code::POP_MESSAGE,
+            Some(Box::new(header)),
+        );
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         // 响应码映射照 Java `MQClientAPIImpl#processPopResponse`
         let status = match response.code {
             response_code::SUCCESS => PopStatus::Found,
             response_code::POLLING_FULL => PopStatus::PollingFull,
-            response_code::POLLING_TIMEOUT | response_code::PULL_NOT_FOUND => PopStatus::PollingNotFound,
+            response_code::POLLING_TIMEOUT | response_code::PULL_NOT_FOUND => {
+                PopStatus::PollingNotFound
+            }
             _ => {
                 return Err(Error::Broker {
                     response_code: response.code,
@@ -2217,11 +2357,18 @@ impl MQClientInstance {
     /// （说明是从 retry topic 弹回来的）时 retryFlag 取自 POP_CK 第 5 段，
     /// 否则由消息 topic 推断 —— 因为 broker 可能改写 topic。
     pub fn pop_queue_map_key(msg: &MessageExt) -> Result<String> {
-        let ck = msg.properties.get(PROPERTY_POP_CK).filter(|ck| !ck.is_empty());
+        let ck = msg
+            .properties
+            .get(PROPERTY_POP_CK)
+            .filter(|ck| !ck.is_empty());
         match ck {
             Some(ck) => {
                 let segments = extra_info::split(ck)?;
-                Ok(format!("{}@{}", extra_info::get_retry(&segments)?, msg.queue_id))
+                Ok(format!(
+                    "{}@{}",
+                    extra_info::get_retry(&segments)?,
+                    msg.queue_id
+                ))
             }
             None => Ok(extra_info::get_start_offset_info_map_key(
                 &msg.topic,
@@ -2287,7 +2434,10 @@ impl MQClientInstance {
         let mut sorted_offsets: HashMap<String, Vec<i64>> = HashMap::new();
         for msg in found.iter() {
             let key = Self::pop_queue_map_key(msg)?;
-            sorted_offsets.entry(key).or_default().push(msg.queue_offset);
+            sorted_offsets
+                .entry(key)
+                .or_default()
+                .push(msg.queue_offset);
         }
         for offsets in sorted_offsets.values_mut() {
             offsets.sort_unstable();
@@ -2385,9 +2535,13 @@ impl MQClientInstance {
             offset: Some(offset),
             lite_topic: None,
         };
-        let mut request =
-            RemotingCommand::create_request_command(request_code::ACK_MESSAGE, Some(Box::new(header)));
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let mut request = RemotingCommand::create_request_command(
+            request_code::ACK_MESSAGE,
+            Some(Box::new(header)),
+        );
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         Ok(response.code)
     }
 
@@ -2432,7 +2586,9 @@ impl MQClientInstance {
             request_code::CHANGE_MESSAGE_INVISIBLETIME,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         let mut resp_header = ChangeInvisibleTimeResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
         let pop_time = resp_header.pop_time.unwrap_or(0);
@@ -2479,7 +2635,9 @@ impl MQClientInstance {
             .ok_or_else(|| Error::client(format!("No route info of this topic: {topic}")))?;
         if let Some(broker_name) = broker_name.filter(|name| !name.is_empty()) {
             return Self::find_broker_addr_in_route(&route, broker_name).ok_or_else(|| {
-                Error::client(format!("Broker {broker_name} not found in route of topic {topic}"))
+                Error::client(format!(
+                    "Broker {broker_name} not found in route of topic {topic}"
+                ))
             });
         }
         let Some(bd) = route.get_broker_datas().first() else {
@@ -2687,7 +2845,9 @@ impl MQClientInstance {
             request_code::QUERY_CONSUMER_OFFSET,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         if response.code == response_code::QUERY_NOT_FOUND {
             return Ok(None);
         }
@@ -2720,7 +2880,9 @@ impl MQClientInstance {
             request_code::UPDATE_CONSUMER_OFFSET,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         Ok(())
     }
@@ -2740,9 +2902,13 @@ impl MQClientInstance {
             topic: Some(mq.topic.clone()),
             queue_id: Some(mq.queue_id),
         };
-        let mut request =
-            RemotingCommand::create_request_command(request_code::GET_MAX_OFFSET, Some(Box::new(header)));
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let mut request = RemotingCommand::create_request_command(
+            request_code::GET_MAX_OFFSET,
+            Some(Box::new(header)),
+        );
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         let mut resp_header = GetMaxOffsetResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
@@ -2764,9 +2930,13 @@ impl MQClientInstance {
             topic: Some(mq.topic.clone()),
             queue_id: Some(mq.queue_id),
         };
-        let mut request =
-            RemotingCommand::create_request_command(request_code::GET_MIN_OFFSET, Some(Box::new(header)));
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let mut request = RemotingCommand::create_request_command(
+            request_code::GET_MIN_OFFSET,
+            Some(Box::new(header)),
+        );
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         let mut resp_header = GetMinOffsetResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
@@ -2784,8 +2954,14 @@ impl MQClientInstance {
         timeout_millis: i64,
         addr: Option<&str>,
     ) -> Result<i64> {
-        self.search_offset_by_boundary(mq, timestamp, Some(BoundaryType::Lower), timeout_millis, addr)
-            .await
+        self.search_offset_by_boundary(
+            mq,
+            timestamp,
+            Some(BoundaryType::Lower),
+            timeout_millis,
+            addr,
+        )
+        .await
     }
 
     /// 带边界类型的重载（Java `MQClientAPIImpl#searchOffset(addr, mq, ts, boundaryType, timeout)`:1384）。
@@ -2817,7 +2993,9 @@ impl MQClientInstance {
             request_code::SEARCH_OFFSET_BY_TIMESTAMP,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         let mut resp_header = SearchOffsetResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
@@ -2849,7 +3027,9 @@ impl MQClientInstance {
             request_code::GET_EARLIEST_MSG_STORETIME,
             Some(Box::new(header)),
         );
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         let mut resp_header = GetEarliestMsgStoretimeResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
@@ -2934,12 +3114,16 @@ impl MQClientInstance {
             index_type: index_type.map(str::to_string),
             last_key: None,
         };
-        let mut request =
-            RemotingCommand::create_request_command(request_code::QUERY_MESSAGE, Some(Box::new(header)));
+        let mut request = RemotingCommand::create_request_command(
+            request_code::QUERY_MESSAGE,
+            Some(Box::new(header)),
+        );
         if uniq_key {
             request.add_ext_field(MixAll::UNIQUE_MSG_QUERY_FLAG, "true");
         }
-        let response = self.invoke_sync(&addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(&addr, &mut request, timeout_millis)
+            .await?;
         if response.code == response_code::QUERY_NOT_FOUND {
             return Ok(None);
         }
@@ -3002,7 +3186,9 @@ impl MQClientInstance {
                 if keys.is_empty() {
                     continue;
                 }
-                let hit = keys.split(KEY_SEPARATOR).any(|k| k == key && msg.topic == topic);
+                let hit = keys
+                    .split(KEY_SEPARATOR)
+                    .any(|k| k == key && msg.topic == topic);
                 if hit {
                     messages.push(msg);
                 }
@@ -3173,13 +3359,22 @@ impl MQClientInstance {
     /// 生产者侧相反：`producer.rs::send_heartbeat_to_all_broker` 只带 ProducerData
     /// （consumerEmpty==true），故只发 master，与 Java 同。
     pub async fn send_heartbeat_to_all_broker(&self, timeout_millis: i64) -> usize {
-        if self.inner.consumer_table.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        if self
+            .inner
+            .consumer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
             return 0;
         }
         let heartbeat_data = self.prepare_heartbeat_data();
         let mut ok = 0usize;
         for addr in self.get_all_broker_addrs() {
-            match self.send_heartbeat(&addr, &heartbeat_data, timeout_millis).await {
+            match self
+                .send_heartbeat(&addr, &heartbeat_data, timeout_millis)
+                .await
+            {
                 Ok(()) => ok += 1,
                 Err(e) => rmq_debug!("heartbeat to {addr} failed: {e}"),
             }
@@ -3220,7 +3415,9 @@ impl MQClientInstance {
     pub fn find_broker_addr_by_topic(&self, topic: &str) -> Option<String> {
         let route = self.route_of(topic)?;
         let brokers = route.get_broker_datas();
-        brokers.get(pseudo_random_index(brokers.len()))?.select_broker_addr()
+        brokers
+            .get(pseudo_random_index(brokers.len()))?
+            .select_broker_addr()
     }
 
     /// Python `check_client_config`：一笔 `CHECK_CLIENT_CONFIG(46)`（Java
@@ -3351,7 +3548,10 @@ impl MQClientInstance {
         let mut request =
             RemotingCommand::create_request_command(request_code::GET_BROKER_CLUSTER_INFO, None);
         for ns_addr in self.name_server_addrs() {
-            let response = match self.invoke_sync(&ns_addr, &mut request, timeout_millis).await {
+            let response = match self
+                .invoke_sync(&ns_addr, &mut request, timeout_millis)
+                .await
+            {
                 Ok(response) => response,
                 Err(e) => {
                     rmq_debug!("get broker cluster info from {ns_addr} failed: {e}");
@@ -3387,7 +3587,10 @@ impl MQClientInstance {
             None,
         );
         for ns_addr in self.name_server_addrs() {
-            let response = match self.invoke_sync(&ns_addr, &mut request, timeout_millis).await {
+            let response = match self
+                .invoke_sync(&ns_addr, &mut request, timeout_millis)
+                .await
+            {
                 Ok(response) => response,
                 Err(e) => {
                     rmq_debug!("get all topic list from {ns_addr} failed: {e}");
@@ -3447,7 +3650,10 @@ impl MQClientInstance {
                 request_code::UPDATE_AND_CREATE_TOPIC,
                 Some(Box::new(header.clone())),
             );
-            match self.invoke_sync(broker_addr, &mut request, timeout_millis).await {
+            match self
+                .invoke_sync(broker_addr, &mut request, timeout_millis)
+                .await
+            {
                 Ok(response) => {
                     // Python: `except MQBrokerException: raise` —— 业务错不重试
                     Self::check_response(&response)?;
@@ -3460,7 +3666,9 @@ impl MQClientInstance {
                     if attempt == retry_times - 1 {
                         return Err(e);
                     }
-                    rmq_debug!("create topic {topic} on {broker_addr} failed (attempt {attempt}): {e}");
+                    rmq_debug!(
+                        "create topic {topic} on {broker_addr} failed (attempt {attempt}): {e}"
+                    );
                     last_exc = Some(e);
                 }
             }
@@ -3485,12 +3693,15 @@ impl MQClientInstance {
         attributes: Option<&str>,
         timeout_millis: i64,
     ) -> Result<()> {
-        let route = self.get_topic_route_data(MixAll::DEFAULT_TOPIC).await.ok_or_else(|| {
-            Error::client(format!(
-                "No route info of default topic {}",
-                MixAll::DEFAULT_TOPIC
-            ))
-        })?;
+        let route = self
+            .get_topic_route_data(MixAll::DEFAULT_TOPIC)
+            .await
+            .ok_or_else(|| {
+                Error::client(format!(
+                    "No route info of default topic {}",
+                    MixAll::DEFAULT_TOPIC
+                ))
+            })?;
         let mut created_at_least_once = false;
         let mut last_exc: Option<String> = None;
         for broker_data in route.get_broker_datas() {
@@ -3538,7 +3749,9 @@ impl MQClientInstance {
         let mut request =
             RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_BROKER, None);
         request.add_ext_field("topic", topic);
-        let response = self.invoke_sync(broker_addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_sync(broker_addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         Ok(())
     }
@@ -3652,7 +3865,13 @@ impl MQClientInstance {
         // 每台都发（含 slave）：见 [`get_all_broker_addrs`]，Java 遍历的是每个 brokerId。
         for addr in self.get_all_broker_addrs() {
             if let Err(e) = self
-                .unregister_client(&addr, client_id, producer_group, consumer_group, timeout_millis)
+                .unregister_client(
+                    &addr,
+                    client_id,
+                    producer_group,
+                    consumer_group,
+                    timeout_millis,
+                )
                 .await
             {
                 rmq_debug!("unregister_client failed, addr={addr}: {e}");
@@ -3690,13 +3909,20 @@ async fn wait_until_or_stop(stop: &watch::Sender<bool>, deadline: tokio::time::I
 /// Python 的 `tls_enable=None` 行为：读环境变量。
 fn default_tls_enable_from_env() -> bool {
     matches!(
-        std::env::var("ROCKETMQ_TLS_ENABLE").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        std::env::var("ROCKETMQ_TLS_ENABLE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "1" | "true" | "yes" | "on"
     )
 }
 
 /// 326 的报文 → MessageExt（Python `_process_reply_message` 的还原段，单独拆出以便单测）。
-fn build_reply_message_ext(header: &ReplyMessageRequestHeader, body: Option<&[u8]>) -> Result<MessageExt> {
+fn build_reply_message_ext(
+    header: &ReplyMessageRequestHeader,
+    body: Option<&[u8]>,
+) -> Result<MessageExt> {
     let mut bytes = body.unwrap_or_default().to_vec();
     let sys_flag = header.sys_flag.unwrap_or(0);
     // sysFlag 里带压缩标志时要先解压：326 推的是**裸包**，不走消息解码路径
@@ -3713,10 +3939,21 @@ fn build_reply_message_ext(header: &ReplyMessageRequestHeader, body: Option<&[u8
     msg.born_timestamp = header.born_timestamp.unwrap_or(0);
     msg.reconsume_times = header.reconsume_times.unwrap_or(0);
     // Python `if header.born_host:` —— 空串视为未提供，不能存成 Some("")。
-    msg.born_host = header.born_host.clone().filter(|h| !h.is_empty()).or(msg.born_host);
-    msg.store_host = header.store_host.clone().filter(|h| !h.is_empty()).or(msg.store_host);
+    msg.born_host = header
+        .born_host
+        .clone()
+        .filter(|h| !h.is_empty())
+        .or(msg.born_host);
+    msg.store_host = header
+        .store_host
+        .clone()
+        .filter(|h| !h.is_empty())
+        .or(msg.store_host);
     let mut properties = string_2_message_properties(header.properties.as_deref().unwrap_or(""));
-    properties.insert(PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, current_time_millis().to_string());
+    properties.insert(
+        PROPERTY_REPLY_MESSAGE_ARRIVE_TIME,
+        current_time_millis().to_string(),
+    );
     msg.properties = properties;
     Ok(msg)
 }
@@ -3786,13 +4023,13 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
 
     use super::*;
+    use crate::common::message_decoder::encode_message_ext;
     use crate::common::sysflag::PermName;
     use crate::remoting::protocol::body::MessageQueueForC;
     use crate::remoting::protocol::route::{BrokerData, QueueData};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
-    use crate::common::message_decoder::encode_message_ext;
 
     const GROUP: &str = "GID_MqClientUnit";
     const TOPIC: &str = "MqClientUnitTopic";
@@ -3857,12 +4094,18 @@ mod tests {
 
     impl StubConsumer {
         fn new() -> Arc<StubConsumer> {
-            Arc::new(StubConsumer { ..StubConsumer::bare() })
+            Arc::new(StubConsumer {
+                ..StubConsumer::bare()
+            })
         }
 
         /// 只带订阅表的替身：46 号检查只需要 `subscriptions()`。
         fn with_subs(group: &str, subs: Vec<SubscriptionData>) -> Arc<StubConsumer> {
-            Arc::new(StubConsumer { group: group.to_string(), subs, ..StubConsumer::bare() })
+            Arc::new(StubConsumer {
+                group: group.to_string(),
+                subs,
+                ..StubConsumer::bare()
+            })
         }
 
         fn bare() -> StubConsumer {
@@ -3936,8 +4179,10 @@ mod tests {
 
         fn consumer_running_info(&self) -> ConsumerRunningInfo {
             let mut info = ConsumerRunningInfo::default();
-            info.properties
-                .insert(ConsumerRunningInfo::PROP_NAMESERVER_ADDR.to_string(), format!("{NAMESRV};"));
+            info.properties.insert(
+                ConsumerRunningInfo::PROP_NAMESERVER_ADDR.to_string(),
+                format!("{NAMESRV};"),
+            );
             info.mq_table.push((
                 MessageQueueKey::new(TOPIC, BROKER, 0),
                 serde_json::json!({ "commitOffset": 42i64 }),
@@ -3993,7 +4238,10 @@ mod tests {
 
         instance.process_reset_offset(&cmd);
         // 调用线程立刻返回：此刻替身还在「RPC」里，位点表必须为空。
-        assert!(guard(&consumer.resets).is_empty(), "220 ran inline on the calling thread");
+        assert!(
+            guard(&consumer.resets).is_empty(),
+            "220 ran inline on the calling thread"
+        );
 
         assert!(wait_until(|| !guard(&consumer.resets).is_empty()).await);
         assert_eq!(
@@ -4022,23 +4270,25 @@ mod tests {
         header.topic = Some(TOPIC.to_string());
         let mut cmd = request(request_code::RESET_CONSUMER_CLIENT_OFFSET, header);
         // broker 真机报文形状：offsetTable 是数组，每条自带 offset
-        cmd.set_body(Some(ResetOffsetBodyForC {
-            offset_table: vec![
-                MessageQueueForC {
-                    topic: TOPIC.to_string(),
-                    broker_name: BROKER.to_string(),
-                    queue_id: 1,
-                    offset: 9,
-                },
-                MessageQueueForC {
-                    topic: TOPIC.to_string(),
-                    broker_name: BROKER.to_string(),
-                    queue_id: 3,
-                    offset: 77,
-                },
-            ],
-        }
-        .encode()));
+        cmd.set_body(Some(
+            ResetOffsetBodyForC {
+                offset_table: vec![
+                    MessageQueueForC {
+                        topic: TOPIC.to_string(),
+                        broker_name: BROKER.to_string(),
+                        queue_id: 1,
+                        offset: 9,
+                    },
+                    MessageQueueForC {
+                        topic: TOPIC.to_string(),
+                        broker_name: BROKER.to_string(),
+                        queue_id: 3,
+                        offset: 77,
+                    },
+                ],
+            }
+            .encode(),
+        ));
 
         instance.process_reset_offset(&cmd);
         assert!(wait_until(|| !guard(&consumer.resets).is_empty()).await);
@@ -4090,7 +4340,10 @@ mod tests {
         header.topic = Some(TOPIC.to_string());
         instance.process_reset_offset(&request(request_code::RESET_CONSUMER_CLIENT_OFFSET, header));
         // 连 group 都没有：同样直接返回。
-        instance.process_reset_offset(&request(request_code::RESET_CONSUMER_CLIENT_OFFSET, ResetOffsetRequestHeader::default()));
+        instance.process_reset_offset(&request(
+            request_code::RESET_CONSUMER_CLIENT_OFFSET,
+            ResetOffsetRequestHeader::default(),
+        ));
         // 坏 body：解码失败也不该波及调用方。
         let consumer = StubConsumer::new();
         instance.register_consumer(GROUP, consumer.clone());
@@ -4152,7 +4405,10 @@ mod tests {
             header,
         ));
         assert_eq!(resp.code, response_code::SYSTEM_ERROR);
-        assert_eq!(resp.remark.as_deref(), Some("no consumer for group=GID_Nobody"));
+        assert_eq!(
+            resp.remark.as_deref(),
+            Some("no consumer for group=GID_Nobody")
+        );
         instance.shutdown();
     }
 
@@ -4304,18 +4560,15 @@ mod tests {
         header.born_host = Some(String::new());
         header.store_host = Some("127.0.0.1:10911".to_string());
         header.properties = Some(wire_properties(PROPERTY_CORRELATION_ID, "corr-1"));
-        let msg = build_reply_message_ext(
-            &header,
-            Some(b"reply-payload".as_slice()),
-        )
-        .unwrap();
+        let msg = build_reply_message_ext(&header, Some(b"reply-payload".as_slice())).unwrap();
         assert_eq!(msg.born_host, None, "blank bornHost must stay absent");
         assert_eq!(msg.store_host.as_deref(), Some("127.0.0.1:10911"));
         assert_eq!(msg.topic, TOPIC);
         assert_eq!(msg.body.as_deref(), Some(b"reply-payload".as_slice()));
         assert_eq!(msg.get_property(PROPERTY_CORRELATION_ID), Some("corr-1"));
         assert!(
-            msg.get_property(PROPERTY_REPLY_MESSAGE_ARRIVE_TIME).is_some(),
+            msg.get_property(PROPERTY_REPLY_MESSAGE_ARRIVE_TIME)
+                .is_some(),
             "arrive time must be stamped like Python"
         );
     }
@@ -4327,10 +4580,8 @@ mod tests {
         let mut header = ReplyMessageRequestHeader::default();
         header.topic = Some(TOPIC.to_string());
         header.properties = Some(wire_properties(PROPERTY_CORRELATION_ID, "corr-unknown"));
-        let resp = instance.process_reply_message(&request(
-            request_code::PUSH_REPLY_MESSAGE_TO_CLIENT,
-            header,
-        ));
+        let resp = instance
+            .process_reply_message(&request(request_code::PUSH_REPLY_MESSAGE_TO_CLIENT, header));
         assert_eq!(resp.code, response_code::SUCCESS);
         instance.shutdown();
     }
@@ -4394,14 +4645,20 @@ mod tests {
         );
 
         let t0 = Instant::now();
-        assert!(wait_until(|| !guard(&ticks).is_empty()).await, "首跳压根没发生");
+        assert!(
+            wait_until(|| !guard(&ticks).is_empty()).await,
+            "首跳压根没发生"
+        );
         let first = guard(&ticks)[0].duration_since(t0);
         assert!(
             first < Duration::from_millis(250),
             "首跳晚了 {first:?}：initialDelay=30ms 时首跳就该发生（旧写法要等到 330ms）"
         );
 
-        assert!(wait_until(|| guard(&ticks).len() >= 2).await, "第二跳没发生");
+        assert!(
+            wait_until(|| guard(&ticks).len() >= 2).await,
+            "第二跳没发生"
+        );
         let second = guard(&ticks)[1].duration_since(t0);
         assert!(
             second >= Duration::from_millis(300) && second < Duration::from_millis(600),
@@ -4426,7 +4683,11 @@ mod tests {
 
         // 同一 clientId 的第二个 producer/consumer 也会调 start()：必须不再拉起第二份循环。
         instance.start().await.unwrap();
-        assert_eq!(task_count(&instance), started, "second start spawned duplicate loops");
+        assert_eq!(
+            task_count(&instance),
+            started,
+            "second start spawned duplicate loops"
+        );
 
         assert!(wait_until(|| consumer.persisted.load(Ordering::SeqCst) > 0).await);
 
@@ -4435,7 +4696,11 @@ mod tests {
         instance.unregister_consumer(GROUP);
         instance.shutdown();
         assert!(!instance.is_started());
-        assert_eq!(task_count(&instance), 0, "shutdown left task handles behind");
+        assert_eq!(
+            task_count(&instance),
+            0,
+            "shutdown left task handles behind"
+        );
         let after_stop = consumer.persisted.load(Ordering::SeqCst);
 
         // 重启必须真能跑：Python 靠把线程句柄置 None 重来，这里靠 stop 信号复位。
@@ -4475,7 +4740,10 @@ mod tests {
         instance.unregister_producer("PG_First");
         assert!(!instance.has_producer("PG_First"));
         instance.shutdown();
-        assert!(instance.is_started(), "shutdown tore down a shared instance");
+        assert!(
+            instance.is_started(),
+            "shutdown tore down a shared instance"
+        );
         assert_eq!(task_count(&instance), tasks);
         assert!(
             MQClientInstance::find_instance(&id).is_some(),
@@ -4495,7 +4763,11 @@ mod tests {
         instance.unregister_consumer(GROUP);
         instance.shutdown();
         assert!(!instance.is_started());
-        assert_eq!(task_count(&instance), 0, "shutdown left task handles behind");
+        assert_eq!(
+            task_count(&instance),
+            0,
+            "shutdown left task handles behind"
+        );
         assert!(
             MQClientInstance::find_instance(&id).is_none(),
             "the factory stayed in INSTANCE_MAP after real shutdown"
@@ -4532,7 +4804,11 @@ mod tests {
             .await
             .expect_err("an unreachable address server must fail start()");
         assert!(!instance.is_started());
-        assert_eq!(task_count(&instance), 0, "failed start left background loops behind");
+        assert_eq!(
+            task_count(&instance),
+            0,
+            "failed start left background loops behind"
+        );
         assert!(
             MQClientInstance::find_instance(&id).is_none(),
             "a factory that never reached RUNNING stayed in INSTANCE_MAP"
@@ -4609,6 +4885,132 @@ mod tests {
         );
         assert_eq!(fresh.name_server_addrs(), vec![NAMESRV.to_string()]);
         assert_eq!(fresh.client_id(), id);
+    }
+
+    #[tokio::test]
+    async fn rpc_hook_chain_is_namespace_then_stream_then_user_acl() {
+        // Java `MQClientAPIImpl:329-335`：Namespace → Stream → 用户钩子（ACL 签名）。
+        // 顺序决定签名内容 —— nsd/ns/ReqT 必须**先于** ACL 写入才进签名，否则
+        // broker 以 "reserve field signature" 拒收。
+        use crate::remoting::rpchook::{AclClientRPCHook, SessionCredentials};
+        fn cmd() -> RemotingCommand {
+            let mut cmd =
+                RemotingCommand::create_request_command(request_code::SEND_MESSAGE_V2, None);
+            cmd.add_ext_field("topic", "T");
+            cmd
+        }
+        let id = format!("{GROUP}@hook-order-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig {
+                namespace_v2: Some("NS_V2".to_string()),
+                enable_stream_request_type: true,
+                ..Default::default()
+            },
+        );
+        // 门面的用户钩子（ACL）是**实例创建之后**注册的，与五个门面的 start() 同构。
+        instance
+            .remoting_client()
+            .register_rpc_hook(Arc::new(AclClientRPCHook::new(SessionCredentials::new(
+                "AK", "SK",
+            ))));
+        let hooks = instance.remoting_client().rpc_hooks();
+        assert_eq!(
+            hooks.len(),
+            3,
+            "链上必须恰好是 Namespace → Stream → 用户 ACL"
+        );
+
+        // hooks[0] = Namespace：只写 nsd/ns，不碰 ReqT / AccessKey
+        let mut c0 = cmd();
+        hooks[0].do_before_request(NAMESRV, &mut c0);
+        assert_eq!(
+            c0.get_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD),
+            Some("true")
+        );
+        assert_eq!(
+            c0.get_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD),
+            Some("NS_V2")
+        );
+        assert_eq!(
+            c0.get_ext_field(MixAll::REQ_T),
+            None,
+            "第一位必须是 Namespace"
+        );
+        assert_eq!(c0.get_ext_field(SessionCredentials::ACCESS_KEY), None);
+
+        // hooks[1] = Stream：写 ReqT，仍轮不到 ACL
+        let mut c1 = cmd();
+        hooks[0].do_before_request(NAMESRV, &mut c1);
+        hooks[1].do_before_request(NAMESRV, &mut c1);
+        assert_eq!(c1.get_ext_field(MixAll::REQ_T), Some("0"));
+        assert_eq!(
+            c1.get_ext_field(SessionCredentials::ACCESS_KEY),
+            None,
+            "第二位必须是 Stream：ACL 还没跑"
+        );
+
+        // 全链跑完：Signature 逐字节等于「nsd/ns/ReqT 都在签名内容里」的期望值
+        let mut full = cmd();
+        for hook in hooks.iter() {
+            hook.do_before_request(NAMESRV, &mut full);
+        }
+        assert_eq!(
+            full.get_ext_field(SessionCredentials::ACCESS_KEY),
+            Some("AK")
+        );
+        let mut expected = cmd();
+        expected.add_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, "true");
+        expected.add_ext_field(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, "NS_V2");
+        expected.add_ext_field(MixAll::REQ_T, "0");
+        expected.add_ext_field(SessionCredentials::ACCESS_KEY, "AK");
+        assert_eq!(
+            full.get_ext_field(SessionCredentials::SIGNATURE),
+            Some(AclClientRPCHook::calc_signature("SK", &mut expected).as_str()),
+            "签名内容必须覆盖 nsd/ns/ReqT"
+        );
+
+        // 对照组：只跑用户 ACL（没有 Namespace/Stream 垫前）⇒ 签名不同，
+        // 即 namespace_v2 的配置会改变最终上线的签名。
+        let mut plain = cmd();
+        hooks[2].do_before_request(NAMESRV, &mut plain);
+        assert_ne!(
+            plain.get_ext_field(SessionCredentials::SIGNATURE),
+            full.get_ext_field(SessionCredentials::SIGNATURE)
+        );
+        instance.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rpc_hook_chain_without_namespace_v2_keeps_request_untouched() {
+        // 未配置 namespaceV2（Java `NamespaceRpcHookTest` 的缺省形态）：Namespace 钩子
+        // 照常注册但完全 no-op，用户 ACL 拿到的请求与旧行为逐字节一致。
+        let id = format!("{GROUP}@hook-none-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let instance = MQClientInstance::with_config(
+            &id,
+            vec![NAMESRV.to_string()],
+            MQClientInstanceConfig::default(),
+        );
+        let hooks = instance.remoting_client().rpc_hooks();
+        assert_eq!(
+            hooks.len(),
+            1,
+            "默认配置只有 Namespace 一个钩子（无 stream）"
+        );
+        let mut cmd = RemotingCommand::create_request_command(request_code::SEND_MESSAGE_V2, None);
+        cmd.add_ext_field("topic", "T");
+        let before = cmd.ext_fields().sorted().len();
+        hooks[0].do_before_request(NAMESRV, &mut cmd);
+        assert_eq!(cmd.get_ext_field("nsd"), None);
+        assert_eq!(cmd.get_ext_field("ns"), None);
+        assert_eq!(
+            cmd.ext_fields().sorted().len(),
+            before,
+            "no-op 钩子不许加头"
+        );
+        assert_eq!(cmd.get_ext_field(MixAll::REQ_T), None);
+        instance.shutdown();
     }
 
     // ---------------- 46 CHECK_CLIENT_CONFIG ----------------
@@ -4741,9 +5143,7 @@ mod tests {
     }
 
     /// 读一整帧并解码（`decode` 从 totalLength 开始，所以帧要连长度前缀一起给）。
-    async fn read_request(
-        stream: &mut tokio::net::TcpStream,
-    ) -> Option<RemotingCommand> {
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<RemotingCommand> {
         use tokio::io::AsyncReadExt as _;
         let mut len_buf = [0_u8; 4];
         stream.read_exact(&mut len_buf).await.ok()?;
@@ -4842,8 +5242,14 @@ mod tests {
                 tag_sub("NullTypeTopic", "*", ""),
             ],
         );
-        instance.check_client_in_broker().await.expect("TAG-only must not fail");
-        assert!(broker.checks().is_empty(), "TAG subscriptions must not reach the broker");
+        instance
+            .check_client_in_broker()
+            .await
+            .expect("TAG-only must not fail");
+        assert!(
+            broker.checks().is_empty(),
+            "TAG subscriptions must not reach the broker"
+        );
         instance.shutdown();
     }
 
@@ -4851,11 +5257,18 @@ mod tests {
     async fn sql92_request_shape_matches_java() {
         let broker = MockBroker::start().await;
         let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a > 10")]);
-        instance.check_client_in_broker().await.expect("SUCCESS reply");
+        instance
+            .check_client_in_broker()
+            .await
+            .expect("SUCCESS reply");
         let checks = broker.checks();
         assert_eq!(checks.len(), 1, "one SQL92 sub ⇒ exactly one 46");
         // 请求头是 null ⇒ 线上没有 extFields。
-        assert!(checks[0].ext_fields.is_empty(), "header must be null: {:?}", checks[0].ext_fields);
+        assert!(
+            checks[0].ext_fields.is_empty(),
+            "header must be null: {:?}",
+            checks[0].ext_fields
+        );
 
         let body = broker.body_of(0);
         assert_eq!(body["clientId"], instance.client_id());
@@ -4865,7 +5278,12 @@ mod tests {
         assert_eq!(sd["subString"], "a > 10");
         assert_eq!(sd["expressionType"], ExpressionType::SQL92);
         // Java SubscriptionData 的序列化字段名（`filterClassSource` 是 @JSONField(serialize=false)）
-        let mut keys: Vec<&str> = sd.as_object().expect("subscriptionData is an object").keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = sd
+            .as_object()
+            .expect("subscriptionData is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -4886,10 +5304,19 @@ mod tests {
     async fn broker_reject_code_becomes_client_error_with_that_code() {
         // SUBSCRIPTION_PARSE_FAILED(23) 要原样带上响应码 —— 这是启动失败的判据。
         let broker = MockBroker::start().await;
-        broker.script(vec![response_code::SUBSCRIPTION_PARSE_FAILED], vec!["bad sql92".to_string()]);
+        broker.script(
+            vec![response_code::SUBSCRIPTION_PARSE_FAILED],
+            vec!["bad sql92".to_string()],
+        );
         let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a >")]);
-        let err = instance.check_client_in_broker().await.expect_err("23 must fail the check");
-        assert_eq!(err.response_code(), Some(response_code::SUBSCRIPTION_PARSE_FAILED));
+        let err = instance
+            .check_client_in_broker()
+            .await
+            .expect_err("23 must fail the check");
+        assert_eq!(
+            err.response_code(),
+            Some(response_code::SUBSCRIPTION_PARSE_FAILED)
+        );
         // broker 的 remark 不能丢：Java 抛的就是 `MQClientException(响应码, remark)`。
         assert!(err.to_string().contains("bad sql92"), "remark lost: {err}");
         instance.shutdown();
@@ -4901,7 +5328,10 @@ mod tests {
         let broker = MockBroker::start().await;
         broker.script(vec![response_code::SYSTEM_ERROR], vec![]);
         let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a > 10")]);
-        let err = instance.check_client_in_broker().await.expect_err("SYSTEM_ERROR must fail");
+        let err = instance
+            .check_client_in_broker()
+            .await
+            .expect_err("SYSTEM_ERROR must fail");
         assert_eq!(err.response_code(), Some(response_code::SYSTEM_ERROR));
         instance.shutdown();
     }
@@ -4914,7 +5344,10 @@ mod tests {
             GROUP,
             StubConsumer::with_subs(GROUP, vec![sql92_sub(TOPIC, "a > 10")]),
         );
-        instance.check_client_in_broker().await.expect("no route must be skipped, not fatal");
+        instance
+            .check_client_in_broker()
+            .await
+            .expect("no route must be skipped, not fatal");
         instance.shutdown();
     }
 
@@ -4936,9 +5369,15 @@ mod tests {
             GROUP,
             StubConsumer::with_subs(GROUP, vec![sql92_sub(TOPIC, "a > 10")]),
         );
-        let err = instance.check_client_in_broker().await.expect_err("dead broker must fail");
+        let err = instance
+            .check_client_in_broker()
+            .await
+            .expect_err("dead broker must fail");
         let text = err.to_string();
-        assert!(text.contains(ExpressionType::SQL92), "expression type lost: {text}");
+        assert!(
+            text.contains(ExpressionType::SQL92),
+            "expression type lost: {text}"
+        );
         assert!(
             text.contains("server has not been upgraded to support"),
             "java wrap message missing: {text}"
@@ -4957,8 +5396,14 @@ mod tests {
         seed_route(&instance, TOPIC, BROKER, &broker.addr);
         instance.register_consumer("A_empty_group", empty);
         instance.register_consumer("B_sql_group", sql);
-        instance.check_client_in_broker().await.expect("the quirk is silent, not fatal");
-        assert!(broker.checks().is_empty(), "the check must stop at the first empty consumer");
+        instance
+            .check_client_in_broker()
+            .await
+            .expect("the quirk is silent, not fatal");
+        assert!(
+            broker.checks().is_empty(),
+            "the check must stop at the first empty consumer"
+        );
         instance.shutdown();
     }
 
@@ -5003,7 +5448,9 @@ mod tests {
             )],
             ..Default::default()
         };
-        guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
         assert_eq!(
             instance.find_broker_addr_by_topic(TOPIC).as_deref(),
             Some(broker.addr.as_str()),
@@ -5042,10 +5489,15 @@ mod tests {
             )],
             ..Default::default()
         };
-        guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
         // 两个 helper 的分工：`get_route_of_all_brokers` 每个 brokerName 只挑一台
         // （生产者心跳用它），`get_all_broker_addrs` 每台都算（注销、消费者心跳用它）
-        assert_eq!(instance.get_route_of_all_brokers(), vec![master.addr.clone()]);
+        assert_eq!(
+            instance.get_route_of_all_brokers(),
+            vec![master.addr.clone()]
+        );
         let mut want = vec![master.addr.clone(), slave.addr.clone()];
         want.sort();
         assert_eq!(instance.get_all_broker_addrs(), want);
@@ -5098,7 +5550,9 @@ mod tests {
             )],
             ..Default::default()
         };
-        guard(&instance.inner.tables).topic_route_table.insert(TOPIC.to_string(), route);
+        guard(&instance.inner.tables)
+            .topic_route_table
+            .insert(TOPIC.to_string(), route);
 
         // 负向对照：没有注册消费者时一台都不发（Java `producerEmpty && consumerEmpty` 短路，
         // 本实例级心跳只服务消费者）。
@@ -5117,7 +5571,8 @@ mod tests {
         assert_eq!(on_slave.len(), 1, "从节点也要收到心跳");
         // 从节点拿到的必须是**带消费组**的那份报文（它据此建自己的 ConsumerGroupInfo）；
         // clientId 用实例的（Java `prepareHeartbeatData` 同），不是消费者替身自己的。
-        let hb = HeartbeatData::decode(&on_slave[0].body).expect("heartbeat body is a HeartbeatData");
+        let hb =
+            HeartbeatData::decode(&on_slave[0].body).expect("heartbeat body is a HeartbeatData");
         assert_eq!(hb.client_id, instance.client_id());
         let groups: Vec<&str> = hb
             .consumer_data_set
@@ -5137,19 +5592,18 @@ mod tests {
         assert_eq!(blank_group_to_none("   "), None);
         assert_eq!(blank_group_to_none("GID_x").as_deref(), Some("GID_x"));
 
-        let header_ext =
-            |producer: &str, consumer: &str| -> Vec<String> {
-                crate::remoting::protocol::ext_fields::ExtFields::from_header(
-                    &UnregisterClientRequestHeader {
-                        client_id: Some("cid".to_string()),
-                        producer_group: blank_group_to_none(producer),
-                        consumer_group: blank_group_to_none(consumer),
-                    },
-                )
-                .iter()
-                .map(|(k, _)| k.clone())
-                .collect()
-            };
+        let header_ext = |producer: &str, consumer: &str| -> Vec<String> {
+            crate::remoting::protocol::ext_fields::ExtFields::from_header(
+                &UnregisterClientRequestHeader {
+                    client_id: Some("cid".to_string()),
+                    producer_group: blank_group_to_none(producer),
+                    consumer_group: blank_group_to_none(consumer),
+                },
+            )
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
+        };
         // 生产者退出：只有 clientID + producerGroup
         assert_eq!(
             header_ext("GID_p", ""),
@@ -5212,16 +5666,18 @@ mod tests {
             Some(("127.0.0.1:10921".to_string(), true))
         );
         // 只认这台（onlyThisBroker）时宁缺毋滥
-        assert_eq!(MQClientInstance::find_broker_addr_in_subscribe(&addrs, 9, true), None);
-        assert_eq!(MQClientInstance::find_broker_addr_in_subscribe(&[], 0, false), None);
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(&addrs, 9, true),
+            None
+        );
+        assert_eq!(
+            MQClientInstance::find_broker_addr_in_subscribe(&[], 0, false),
+            None
+        );
     }
 
     /// 建好「主 slave 各一台假 broker」的实例：返回 (instance, master, slave)。
-    async fn instance_with_master_slave() -> (
-        MQClientInstance,
-        Arc<MockBroker>,
-        Arc<MockBroker>,
-    ) {
+    async fn instance_with_master_slave() -> (MQClientInstance, Arc<MockBroker>, Arc<MockBroker>) {
         let master = MockBroker::start().await;
         let slave = MockBroker::start().await;
         let instance = new_instance();
@@ -5352,9 +5808,15 @@ mod tests {
         let recs = master.recorded(request_code::PULL_MESSAGE);
         assert_eq!(recs.len(), 1);
         let sent_flag: i32 = ext_of(&recs[0], "sysFlag").unwrap().parse().unwrap();
-        assert!(PullSysFlag::has_commit_offset_flag(sent_flag), "master 上位点照提交");
+        assert!(
+            PullSysFlag::has_commit_offset_flag(sent_flag),
+            "master 上位点照提交"
+        );
         assert!(PullSysFlag::has_subscription_flag(sent_flag));
-        assert_eq!(ext_of(&recs[0], "subscription").as_deref(), Some("TagA||TagB"));
+        assert_eq!(
+            ext_of(&recs[0], "subscription").as_deref(),
+            Some("TagA||TagB")
+        );
         assert_eq!(ext_of(&recs[0], "queueOffset").as_deref(), Some("3"));
         // 老 broker 不带 suggestWhichBrokerId：调用方按 master=0 记账（None 传出去）
         assert_eq!(result.suggest_which_broker_id, None);
@@ -5422,7 +5884,12 @@ mod tests {
                     });
                 }
             });
-            RouteNamesrv { addr, holder, codes, task }
+            RouteNamesrv {
+                addr,
+                holder,
+                codes,
+                task,
+            }
         }
 
         /// 换一份路由 body（`None` = namesrv 说这个 topic 不存在）。
@@ -5462,7 +5929,10 @@ mod tests {
             broker_datas: vec![BrokerData::new(
                 "DefaultCluster",
                 broker_name,
-                addrs.iter().map(|(id, a)| (*id, (*a).to_string())).collect(),
+                addrs
+                    .iter()
+                    .map(|(id, a)| (*id, (*a).to_string()))
+                    .collect(),
                 "",
             )],
             ..Default::default()
@@ -5481,7 +5951,10 @@ mod tests {
     async fn publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back() {
         let namesrv = RouteNamesrv::start().await;
         // 主掉线：路由里只剩 brokerId=1（从节点自己也会注册进 namesrv）
-        namesrv.serve(Some(route_body(BROKER, &[(MixAll::MASTER_ID as i64 + 1, "127.0.0.1:10931")])));
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64 + 1, "127.0.0.1:10931")],
+        )));
         let instance = instance_against(&namesrv.addr);
         assert!(instance
             .update_topic_route_info_from_name_server(TOPIC, 5000, false)
@@ -5524,7 +5997,10 @@ mod tests {
         )));
         let instance = instance_against(&namesrv.addr);
         assert_eq!(
-            instance.publish_addr_for(BROKER, TOPIC).await.expect("刷路由之后解析得出"),
+            instance
+                .publish_addr_for(BROKER, TOPIC)
+                .await
+                .expect("刷路由之后解析得出"),
             "127.0.0.1:10911"
         );
         assert_eq!(namesrv.route_requests(), 1, "查不到才刷，且只刷一次");
@@ -5535,7 +6011,10 @@ mod tests {
     /// （Java `sendKernelImpl:1100` / `MQAdminImpl`），文案与空错误码都要对上。
     fn assert_broker_not_exist(err: &Error) {
         match err {
-            Error::Client { response_code, message } => {
+            Error::Client {
+                response_code,
+                message,
+            } => {
                 assert_eq!(message, &format!("The broker[{BROKER}] not exist"));
                 // 本端报的错，没有 broker 侧错误码（Java 的双参构造器给 -1）
                 assert_eq!(*response_code, None);
@@ -5567,7 +6046,10 @@ mod tests {
             &[(MixAll::MASTER_ID as i64, "127.0.0.1:10911")],
         )));
         assert_eq!(
-            instance.publish_addr_for(BROKER, TOPIC).await.expect("主回来了"),
+            instance
+                .publish_addr_for(BROKER, TOPIC)
+                .await
+                .expect("主回来了"),
             "127.0.0.1:10911"
         );
         instance.shutdown();
@@ -5597,7 +6079,10 @@ mod tests {
         let master = MockBroker::start().await;
         let slave = MockBroker::start().await;
         // 只登记从节点 ⇒ 管理口径也不该拿它凑合
-        namesrv.serve(Some(route_body(BROKER, &[(MixAll::MASTER_ID as i64 + 1, &slave.addr)])));
+        namesrv.serve(Some(route_body(
+            BROKER,
+            &[(MixAll::MASTER_ID as i64 + 1, &slave.addr)],
+        )));
         let instance = instance_against(&namesrv.addr);
         let mq = MessageQueue::new(TOPIC, BROKER, 0);
         let err = instance
@@ -5605,7 +6090,10 @@ mod tests {
             .await
             .expect_err("没有主就没有可查的 store");
         assert_broker_not_exist(&err);
-        assert!(slave.recorded(request_code::GET_MAX_OFFSET).is_empty(), "报错前一次请求都不发");
+        assert!(
+            slave.recorded(request_code::GET_MAX_OFFSET).is_empty(),
+            "报错前一次请求都不发"
+        );
 
         // 负控：主回来之后查得到，且请求落在**主**地址上（不是路由里那台从节点）
         namesrv.serve(Some(route_body(
@@ -5616,7 +6104,13 @@ mod tests {
             ],
         )));
         master.script_resp_ext(vec![vec![("offset".to_string(), "7".to_string())]]);
-        assert_eq!(instance.get_max_offset(&mq, 5000, None).await.expect("主回来了"), 7);
+        assert_eq!(
+            instance
+                .get_max_offset(&mq, 5000, None)
+                .await
+                .expect("主回来了"),
+            7
+        );
         assert_eq!(master.recorded(request_code::GET_MAX_OFFSET).len(), 1);
         assert!(slave.recorded(request_code::GET_MAX_OFFSET).is_empty());
         instance.shutdown();
@@ -5729,7 +6223,19 @@ mod tests {
 
         let err = instance
             .pop_message(
-                GROUP, TOPIC, 0, 1, 30000, 1000, 0, None, None, false, Some(BROKER), 3000, None,
+                GROUP,
+                TOPIC,
+                0,
+                1,
+                30000,
+                1000,
+                0,
+                None,
+                None,
+                false,
+                Some(BROKER),
+                3000,
+                None,
             )
             .await
             .expect_err("没有主就没有可弹的 broker");
@@ -5749,7 +6255,19 @@ mod tests {
         master.script(vec![response_code::POLLING_TIMEOUT], vec![String::new()]);
         let result = instance
             .pop_message(
-                GROUP, TOPIC, 0, 1, 30000, 1000, 0, None, None, false, Some(BROKER), 3000, None,
+                GROUP,
+                TOPIC,
+                0,
+                1,
+                30000,
+                1000,
+                0,
+                None,
+                None,
+                false,
+                Some(BROKER),
+                3000,
+                None,
             )
             .await
             .expect("主回来就弹得动");
@@ -5812,7 +6330,10 @@ mod tests {
                 .expect("主上有位点"),
             Some(111)
         );
-        assert_eq!(master.recorded(request_code::QUERY_CONSUMER_OFFSET).len(), 1);
+        assert_eq!(
+            master.recorded(request_code::QUERY_CONSUMER_OFFSET).len(),
+            1
+        );
         assert_eq!(slave.recorded(request_code::QUERY_CONSUMER_OFFSET).len(), 1);
         instance.shutdown();
 
@@ -5829,7 +6350,9 @@ mod tests {
             .await
             .expect_err("路由里没有这个名字");
         assert_broker_not_exist(&err);
-        assert!(other.recorded(request_code::QUERY_CONSUMER_OFFSET).is_empty());
+        assert!(other
+            .recorded(request_code::QUERY_CONSUMER_OFFSET)
+            .is_empty());
         instance2.shutdown();
     }
 }

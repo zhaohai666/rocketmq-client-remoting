@@ -6,6 +6,7 @@ namespace RocketMQ\Client;
 
 use RocketMQ\Client\Exceptions\ClientErrorCode;
 use RocketMQ\Client\Exceptions\MQClientException;
+use RocketMQ\Client\Exceptions\RequestTimeoutException;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MixAll;
@@ -83,6 +84,12 @@ class RequestResponseFuture
         return (int) (microtime(true) * 1000.0) - $this->beginTimestamp > $this->timeoutMillis;
     }
 
+    /** 对应 Java ``setCause``。 */
+    public function setCause(?\Throwable $cause): void
+    {
+        $this->cause = $cause;
+    }
+
     /** 对应 Java ``executeRequestCallback``：回调只允许触发一次。 */
     public function executeRequestCallback(): void
     {
@@ -158,6 +165,40 @@ class RequestFutureHolder
         // 对齐 Java：成功路径也走 executeRequestCallback，让「只回调一次」的守卫生效
         $future->executeRequestCallback();
         return $future;
+    }
+
+    /**
+     * TTL 清扫（对应 Java ``RequestFutureHolder.scanExpiredRequest``，由
+     * RequestHouseKeepingService 线程按 1s 周期驱动；PHP 无线程，改由
+     * ``MQClientInstance.tick()`` 按同一节奏调用）。
+     *
+     * 超时的槽位摘除后逐个置 RequestTimeoutException 并触发回调 —— 「摘到才负责」
+     * 与 putResponse 的 remove 语义互斥，同一请求只会走两条路径之一。
+     *
+     * @return int 本轮清扫掉的槽位数
+     */
+    public function scanExpiredRequest(): int
+    {
+        $expired = [];
+        foreach ($this->requestFutureTable as $correlationId => $future) {
+            if ($future->isTimeout()) {
+                $expired[$correlationId] = $future;
+                unset($this->requestFutureTable[$correlationId]);
+            }
+        }
+        foreach ($expired as $future) {
+            Logger::warning(sprintf('remove timeout request, CorrelationId=%s', $future->correlationId));
+            try {
+                $future->setCause(new RequestTimeoutException(
+                    'request timeout, no reply message.',
+                    ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION,
+                ));
+                $future->executeRequestCallback();
+            } catch (\Throwable $e) {
+                Logger::warning('scanExpiredRequest operationCallback exception: ' . $e->getMessage());
+            }
+        }
+        return count($expired);
     }
 }
 
