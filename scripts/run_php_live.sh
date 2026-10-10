@@ -17,7 +17,7 @@
 #                 **必须独占集群**：要求 POP 专用 broker.conf 四件配置，见下）
 #   tls          php/examples/live_tls.php         （三腿 plain_tls/ca_verify/mtls；
 #                 **必须独占集群**：namesrv+broker 都要 -Dtls.enable=true——PHP 端
-#                 tlsEnable 与 Java tls.enable 同为进程级全局开关，namesrv 连接也走
+#                 PHP 的 tlsEnable 同样是进程级全局开关，namesrv 连接也走
 #                 TLS；脚本自带 openssl 生成 CA/server(SAN:IP:127.0.0.1,DNS:localhost)
 #                 /client 证书，leg1+2 一轮 broker，leg3 重启加 tls.client.authServer=true）
 #
@@ -77,7 +77,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------- tls 分支（自管两轮 broker）
-# PHP 端 tlsEnable 与 Java -Dtls.enable 同为**进程级全局**：namesrv 连接也走 TLS，
+# PHP 的 tlsEnable 是**进程级全局**开关：namesrv 连接也走 TLS，
 # 所以 namesrv+broker 都要 -Dtls.enable=true + 同一套 server 证书（permissive）。
 if [ "$WHICH" = "tls" ]; then
     if port_open x "$NS_PORT" || port_open x "$BROKER_PORT"; then
@@ -228,7 +228,7 @@ EOF
     if [ "$WHICH" = "pop" ]; then
         cat >> "$WORK/broker.conf" <<EOF
 
-# POP 硬前提（对齐 scripts/run_go_pop_live.sh 用的那套 conf）
+# POP 硬前提（broker.conf 需要这三项才能跑 POP 链路）
 timerWheelEnable = true
 defaultMessageRequestMode = PULL
 popResponseReturnActualRetryTopic = false

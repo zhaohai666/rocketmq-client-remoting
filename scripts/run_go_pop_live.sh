@@ -25,7 +25,7 @@
 #   popResponseReturnActualRetryTopic=false   —— 默认重试路径：broker 自己盖 POP_CK 并把
 #                                                msg.Topic 改回业务 topic，S2 正是钉这条
 #   enablePopBatchAck=false                   —— 所以本工具**不**跑 BATCH_ACK_MESSAGE(200151)；
-#                                                经典 Java 客户端本来也从不发它（逐条 ackAsync）
+#                                                正常链路本来就是逐条 ackAsync，从不发它
 #
 # 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
 # `rmq_test_broker.sh start`，收工时只停自己起来的那一次；已经在跑的不碰。

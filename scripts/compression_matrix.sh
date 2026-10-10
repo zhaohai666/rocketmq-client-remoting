@@ -5,9 +5,9 @@
 # **A 端压出来的字节 B 端能不能解开** —— 而压缩解错的失败模式是静默数据损坏
 # （拿到压缩字节当正文，不报错），只有真机 + 真跨客户端才暴露得出来。
 #
-# 七端（python / cpp / csharp / rust / go / php / nodeJs）载荷由各自本地按同一配方重建（同一行文本重复后
+# 各端（python / cpp / csharp / rust / go / php / nodeJs）载荷由各自本地按同一配方重建（同一行文本重复后
 # 截断），所以判定只看接收端打印的 `match=1`，**不要**比两边打印的 CRC 数字
-# （Java 口径的 UtilAll.crc32 会 & 0x7FFFFFFF，本仓库各端都用标准 CRC-32）。
+# （服务端统计口径的 crc32 会 & 0x7FFFFFFF，本仓库各端一律用标准 CRC-32）。
 #
 # 用法：scripts/compression_matrix.sh [codec]      codec = zlib（默认）| lz4 | zstd
 # 只有**发送端**关心 codec；接收端按 sysFlag 的类型位自动解压，所以「B 能解 A 压的」

@@ -22,8 +22,8 @@
 #   RMQ_ACL_AK / RMQ_ACL_SK  broker 里 initAuthenticationUser 建的 SUPER 用户凭据
 #   各端产物：RMQ_PY / RMQ_DOTNET / RMQ_CPP_ACL（默认指向本仓库构建产物）
 #
-# broker 侧鉴权失败一律是 NO_PERMISSION(16)（broker/auth/pipeline/AuthenticationPipeline.java:53），
-# 具体原因只能看 remark：签名不对 → "check signature failed."；凭据缺失 → "username cannot be null."。
+# broker 侧鉴权失败一律回 NO_PERMISSION(16)，具体原因只能看 remark：
+# 签名不对 → "check signature failed."；凭据缺失 → "username cannot be null."。
 set -u
 
 CYGWIN_ROOT=${RMQ_CYGWIN_ROOT:-/c/Users/zhaoh}

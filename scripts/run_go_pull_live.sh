@@ -8,8 +8,8 @@
 # 自己读回来，报文里 extFields 键名拼错（UPDATE_CONSUMER_OFFSET 的
 # consumerGroup/topic/queueId/commitOffset、CONSUMER_SEND_MSG_BACK 的
 # group/originTopic/offset/delayLevel/originMsgId/maxReconsumeTimes/unitMode）broker
-# 照样可能回 SUCCESS。判定标准是「另一个语言的实现能不能按同一套 Java 字段名问出同样的
-# 结果」，这也是四端一直用的口径（见 python/go_pull_consume_check.py 的 docstring）。
+# 照样可能回 SUCCESS。判定标准是「换一个独立实现、按同一套协议字段名去问，能不能问出同样的
+# 结果」（见 python/go_pull_consume_check.py 的 docstring）。
 #
 # 集群：默认假定已经在跑（scripts/rmq_test_broker.sh 那套）。端口探测失败会自动
 # `rmq_test_broker.sh start`，并在收工时只停自己起来的那一次；已经在跑的不碰。

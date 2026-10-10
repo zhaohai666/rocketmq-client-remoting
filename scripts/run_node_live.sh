@@ -48,7 +48,7 @@ port_open() {
 }
 
 # ---------------------------------------------------------------- tls 分支（独占集群 + 自管证书/三轮 broker）
-# node 端 tlsEnable 与 Java -Dtls.enable 同为**进程级全局**：namesrv 连接也走 TLS，
+# nodeJs 的 tlsEnable 是**进程级全局**开关：namesrv 连接也走 TLS，
 # 所以 namesrv+broker 都要 -Dtls.enable=true + 同一套 server 证书（permissive）。
 # 三腿：plain_tls（信任自签）/ ca_verify（严格 CA 校验）/ mtls（broker 要求客户端证书）。
 if [ "$WHICH" = "tls" ]; then
