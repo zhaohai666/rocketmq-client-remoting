@@ -424,6 +424,10 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
                                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
 
+    // lastRouteError：全部 NS 都不可达时的最后一个失败原因（TLS 握手 CA 校验失败、
+    // 连接拒绝…）。不透出去的话，getTopicPublishInfo 只能黑盒报
+    // "Can not find Message Queue"，用户会往"建 topic"方向查，而真正坏的是链路/证书。
+    std::string lastRouteError;
     auto fetch = [&](const std::string& t, TopicRouteData& out) -> bool {
         RemotingCommand request =
             RemotingCommand::createRequestCommand(RequestCode::GET_ROUTEINFO_BY_TOPIC, nullptr);
@@ -435,14 +439,20 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
                 if (response.code == ResponseCode::SUCCESS && !response.body.empty()) {
                     return TopicRouteData::decode(response.body, out);
                 }
-                // 第一个可达的 NS 明确返回非 SUCCESS（如 TOPIC_NOT_EXIST）就停止轮询
+                // 第一个可达的 NS 明确返回非 SUCCESS（如 TOPIC_NOT_EXIST）就停止轮询；
+                // 这是"真实回答"，不算链路故障，清掉遗留的错误串。
+                lastError.clear();
                 break;
             } catch (const RemotingException& e) {
                 lastError = e.what();
                 continue;
             }
         }
-        (void)lastError;
+        lastRouteError = lastError;
+        {
+            std::lock_guard<std::mutex> lk(lastRouteErrorMutex_);
+            lastRouteError_ = lastRouteError;
+        }
         return false;
     };
 
@@ -454,6 +464,9 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
         // 构造发布信息。isDefault=false 时（消费者路径）不做这个兜底。
         // 新 topic 由 broker 用 defaultTopicQueueNums 创建队列，而默认 topic 自身
         // 可能配置了更多队列，这里按 broker 实际创建数裁剪，避免选中非法 queueId。
+        // 注意：默认 topic 的兜底结果不覆盖 lastRouteError —— 真实 topic 拉取的
+        // 失败原因才是要透给上层的（fetch 成功时提前 return，不会写它；只有
+        // 默认 topic 也全 NS 不可达时才会覆盖成默认 topic 的失败原因）。
         TopicRouteData defaultRoute;
         if (fetch(MixAll::DEFAULT_TOPIC, defaultRoute)) {
             for (QueueData& qd : defaultRoute.queueDatas) {
@@ -508,7 +521,16 @@ std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const st
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = topicPublishInfoTable_.find(topic);
     if (it == topicPublishInfoTable_.end() || it->second == nullptr || !it->second->ok()) {
-        throw MQClientException("Can not find Message Queue for topic: " + topic);
+        // 带上路由拉取的真实失败原因（TLS/CA 校验失败、连接拒绝…）。没有失败记录
+        // （NS 可达且明确回答 topic 不存在）时保持原文案 —— 那才是"建 topic"语义。
+        std::string msg = "Can not find Message Queue for topic: " + topic;
+        {
+            std::lock_guard<std::mutex> lk(lastRouteErrorMutex_);
+            if (!lastRouteError_.empty()) {
+                msg += " (route fetch failed: " + lastRouteError_ + ")";
+            }
+        }
+        throw MQClientException(msg);
     }
     return it->second;
 }

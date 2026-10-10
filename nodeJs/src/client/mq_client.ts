@@ -134,6 +134,10 @@ export class MQClient {
   // Java MQClientInstance's adjustThreadPool task: every 1 minute every
   // consumer of this instance is offered a pool-size adjustment decision.
   _adjustThreadPoolTimer: NodeJS.Timeout | null;
+  // Java MQClientAPIImpl.namesrvAddrChoosed（:200）语义：上次应答过的 NS 粘住
+  // 优先复用；失效才从它后面一台轮换。没有这个粘性 + 轮换，多 NS 挂一台时
+  // 每次路由拉取都纯随机单挑 —— 撞上死的那台整个调用直接失败。
+  _namesrvChosen: string | null;
   _running: boolean;
 
   constructor(
@@ -160,6 +164,7 @@ export class MQClient {
     this._namesrvTimer = null;
     this._namesrvInitialTimer = null;
     this._adjustThreadPoolTimer = null;
+    this._namesrvChosen = null;
     this._running = false;
   }
 
@@ -200,6 +205,33 @@ export class MQClient {
     const list = this.nameServerAddrList;
     if (list.length === 0) return null;
     return list[Math.floor(Math.random() * list.length)];
+  }
+
+  // Java MQClientAPIImpl#getAndCreateNameserverChannel（:376-407）的调用侧等价物：
+  // 上次应答过的 NS（_namesrvChosen）粘住优先；它没被配置过/失效了，就从随机位
+  // 开始把**整张列表轮一遍**，谁先应答谁当选并粘住。多 NS 挂一台时，旧实现
+  // （纯随机单挑一次）撞上死的那台整个路由拉取直接失败 —— 3 台挂 1 台就是
+  // ~33% 的调用死，新进程首拉路由撞死即表现为 "no route info"/消费 0 超时。
+  private async _invokeSyncNameServer(request: RemotingCommand, timeoutMillis: number): Promise<RemotingCommand> {
+    const list = this.nameServerAddrList;
+    if (list.length === 0) throw new MQClientException('No name server address, please set it first.');
+    const chosenIdx = this._namesrvChosen != null ? list.indexOf(this._namesrvChosen) : -1;
+    const begin = chosenIdx >= 0 ? chosenIdx : Math.floor(Math.random() * list.length);
+    let lastErr: Error | null = null;
+    for (let i = 0; i < list.length; i++) {
+      const ns = list[(begin + i) % list.length];
+      try {
+        const resp = await this.remotingClient.invokeSync(ns, request, timeoutMillis);
+        this._namesrvChosen = ns;
+        return resp;
+      } catch (e) {
+        lastErr = e instanceof Error ? e : new Error(String(e));
+        // 当选的那台死了：摘掉粘性，下一轮从列表下一台重新开始
+        if (this._namesrvChosen === ns) this._namesrvChosen = null;
+        logger.warn('name server %s unreachable (%s), trying next', ns, lastErr.message);
+      }
+    }
+    throw lastErr != null ? lastErr : new MQClientException('all name servers failed');
   }
 
   // ---- route management ----
@@ -244,12 +276,15 @@ export class MQClient {
   // tag to refetch the exact route before sending (a stale fallback yields
   // "request queueId[N] is illegal" on every attempt otherwise).
   async updateTopicRouteInfoFromNameServer(topic: string, isDefault: boolean = false): Promise<boolean> {
-    const ns = this._randomNameServer();
-    if (ns == null) throw new MQClientException('No name server address, please set it first.');
     const realTopic = isDefault ? MixAll.DEFAULT_TOPIC : topic;
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_ROUTEINFO_BY_TOPIC, null);
     request.addExtField('topic', realTopic);
-    const response = await this.remotingClient.invokeSync(ns, request, 3000);
+    // NS 故障切换在 _invokeSyncNameServer 内做（轮换全部 NS，见其注释）；
+    // 这里只区分「可达的 NS 明确说 topic 不存在」与「全部 NS 不可达」：
+    // 前者返回 false（Java 语义，不自动兜底 TBW102），后者把异常抛给调用方 ——
+    // 抛出去的异常带着最后一个 NS 的失败原因（连接拒绝/TLS 握手失败…），
+    // 生产者/消费者把它挂在自己的路由错误上，不再黑盒成 "No route info"。
+    const response = await this._invokeSyncNameServer(request, 3000);
     const code = response.code;
     if (code === ResponseCode.SUCCESS) {
       const routeData = TopicRouteData.decode(response.body as Buffer);

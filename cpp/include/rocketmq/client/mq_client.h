@@ -554,6 +554,11 @@ private:
 
     mutable std::recursive_mutex routeLock_;
     std::map<std::string, TopicRouteData> topicRouteTable_;
+    // 最近一次「全部 NS 都不可达」的失败原因（updateTopicRouteInfoFromNameServer
+    // 里写入，getTopicPublishInfo 报 "Can not find Message Queue" 时带上 ——
+    // TLS 握手 CA 校验失败这类根因不能黑盒成路由缺失）。读多写少，独立小锁。
+    std::mutex lastRouteErrorMutex_;
+    std::string lastRouteError_;
     // 对应 Java `MQClientInstance.brokerAddrTable`：**按 brokerName 平的**一张表，
     // 每次刷到任一条路由就整批覆盖（`updateTopicRouteInfoFromNameServer:962-964`）。
     // 别改用「扫 topicRouteTable_ 找第一台」的写法：路由是**按 topic** 刷的，

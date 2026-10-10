@@ -33,6 +33,11 @@ target_link_libraries(rmq_live_acl PRIVATE rocketmq::remoting)
 add_executable(rmq_live_tls live_tls.cpp)
 target_link_libraries(rmq_live_tls PRIVATE rocketmq::remoting)
 
+# #25 负探针：严格 CA 校验下信任错误 CA，producer 报错必须带 CA/证书标记
+# （route fetch failed 穿线；不打进 ctest）
+add_executable(rmq_live_tls_negative live_tls_negative.cpp)
+target_link_libraries(rmq_live_tls_negative PRIVATE rocketmq::remoting)
+
 # 主动拉取消费者（DefaultMQPullConsumer）真机联调
 add_executable(rmq_live_pull live_pull.cpp)
 target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)

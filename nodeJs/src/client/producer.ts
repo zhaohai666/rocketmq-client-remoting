@@ -458,9 +458,14 @@ export class DefaultMQProducer {
     if (this.client == null) throw new MQClientException('producer not started');
     let info = this.client.getTopicPublishInfo(topic);
     if (info != null && info.ok() && !(info as any).fromDefaultTopic) return info;
+    this._lastRouteError = null;
     try {
       await this.client.updateTopicRouteInfoFromNameServer(topic, false);
     } catch (e) {
+      // 路由拉不到的原因要留着：TLS 握手 CA 校验失败这类错误若在这里被吞，
+      // 上层只会看到 "No route info of this topic"，黑盒（用户往"建 topic"方向查，
+      // 真正坏的是证书/CA）。挂到 _lastRouteError，由 No-route 抛出点带出。
+      this._lastRouteError = e instanceof Error ? e : new Error(String(e));
       logger.warn(`find topic publish info for ${topic} failed: ${(e as Error).message}`);
     }
     info = this.client.getTopicPublishInfo(topic);
@@ -469,11 +474,26 @@ export class DefaultMQProducer {
     try {
       await this.client.updateTopicRouteInfoFromNameServer(topic, true);
     } catch (e) {
+      if (this._lastRouteError == null) {
+        this._lastRouteError = e instanceof Error ? e : new Error(String(e));
+      }
       logger.warn(`find default-topic publish info for ${topic} failed: ${(e as Error).message}`);
     }
     info = this.client.getTopicPublishInfo(topic);
     if (info != null && info.ok()) return info;
     return info;
+  }
+
+  // 上面两步路由尝试中最后一次失败的原因（成功即清空）。用于把 TLS/CA、
+  // 连接拒绝这类真实根因带进 "No route info" 报错，而不是黑盒。
+  private _lastRouteError: Error | null = null;
+
+  private _routeFailureSuffix(): string {
+    const e = this._lastRouteError;
+    if (e == null) return '';
+    const chain: string[] = [];
+    for (let x: any = e; x != null; x = x.cause) chain.push(`${x.name ?? 'Error'}: ${x.message}`);
+    return ` (route fetch failed: ${chain.join(' <-- ')})`;
   }
 
   _selectOneMessageQueue(tpInfo: TopicPublishInfo, lastBrokerName: string | null): MessageQueue | null {
@@ -681,7 +701,12 @@ export class DefaultMQProducer {
     this._checkLegalTopic(msg.getTopic());
     let tpInfo = await this._tryToFindTopicPublishInfo(msg.getTopic());
     if (tpInfo == null || !tpInfo.ok()) {
-      throw new MQClientException(`No route info of this topic: ${msg.getTopic()}`);
+      // 带上路由拉取的真实失败原因（TLS/CA、连接拒绝…），没有失败记录时
+      // 保持原文案（topic 真不存在的语义）。
+      throw new MQClientException(
+        `No route info of this topic: ${msg.getTopic()}${this._routeFailureSuffix()}`,
+        this._lastRouteError ?? undefined,
+      );
     }
     // A publish info synthesized from the DEFAULT topic (TBW102) carries
     // TBW102's queue list — sending against it yields "request queueId[N] is
@@ -798,7 +823,10 @@ export class DefaultMQProducer {
     this._checkLegalTopic(msg.getTopic());
     const tpInfo = await this._tryToFindTopicPublishInfo(msg.getTopic());
     if (tpInfo == null || !tpInfo.ok()) {
-      throw new MQClientException(`No route info of this topic: ${msg.getTopic()}`);
+      throw new MQClientException(
+        `No route info of this topic: ${msg.getTopic()}${this._routeFailureSuffix()}`,
+        this._lastRouteError ?? undefined,
+      );
     }
     const mq = selector.select(msg, tpInfo.msgQueueList, arg);
     if (mq == null) throw new MQClientException('failed to select a message queue');
