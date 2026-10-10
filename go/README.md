@@ -1,291 +1,550 @@
-# rocketmq-client-remoting (Go)
+# RocketMQ Go 客户端
 
 > 中文 ｜ [English](README.en.md)
 
-Apache RocketMQ 经典 remoting 协议（对齐 5.x）的 Go 实现（标准库 + `net`，**零第三方依赖**），
-适配 RocketMQ 4.x / 5.x 集群；与本仓库的 Python / C++ / C# / Rust 实现逐项对齐。
-**真机联调工具目前 9 个**（见「真实集群联调」），覆盖发送 / 消费 / 拉取 / 轻量拉取 /
-POP / 重投与死信 / 停机竞态 / **管理端** / **压缩矩阵**（后者由 `compression_matrix.sh` 驱动，
-收发两端都是它自己，不算一个独立入口）；其余场景在另外四端有真机工具而 Go 侧尚未补，所以这里
-**不宣称「全部能力都已联调」**。另有一个**不依赖集群**的离线自检
-（`go run ./examples/selfcheck`，见「离线自检」）—— 它与 Python / C++ / C# 三端的同名工具对齐，
-**不是** Java 的机制（`rocketmq-client` 里没有任何自检入口，只有 `mqadmin` 侧的检查命令）。
+## 概述
 
-分层：
+RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路由、直连 Broker 收发，
+链路上没有任何代理、Sidecar 或网关。对外是同步风格的调用（`Send` / `Poll` / `Pull`），
+路由刷新、心跳、重平衡、消费拉取、位点提交都由客户端内部的 goroutine 周期任务承担。
 
-- `remoting`：线协议（帧编解码、header、JSON 与 RocketMQ 二进制两路序列化）与长连接传输
-- `common`：消息模型、17 段存储格式编解码、压缩、命名空间、常量、校验器
-- `client`：`MQClientInstance`、Producer、Push/Pull/LitePull Consumer、Admin、事务、Request-Reply、消息轨迹
+- 模块路径：`github.com/zhaohai666/rocketmq-client-remoting/go`
+- 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
+- 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
+  `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
+- 已在 **RocketMQ 5.5.1** 集群上跑通 13 个真机联调工具与 584 个单测
 
-Go 版是同步 API（阻塞调用 + 内部 goroutine），与本仓库 Python 实现同形态。
+## 先决条件
 
-已实现范围：
+- Go **1.24** 或更高（`go.mod` 声明 `go 1.24`；本仓库在 go1.24.13 上构建与测试）
+- 一台可用的 NameServer，默认端口 **9876**
+- 一台可用的 Broker，默认端口 **10911**
+- 想让工具自己建 topic / 订阅组，Broker 需 `autoCreateTopicEnable=true` 与
+  `autoCreateSubscriptionGroup=true`；跑定时消息撤回与消息轨迹另需
+  `recallMessageEnable=true`、`traceTopicEnable=true`
 
-| 层 | 内容 |
-| --- | --- |
-| 协议层 | `RemotingCommand` 帧编解码；`CommandCustomHeader` 家族（含 V2 单字母短键 a..n）；JSON 与 RocketMQ 二进制双序列化；17 段存储格式 + 6 段批量格式 |
-| 传输层 | 惰性建连 + 复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时、重连、GO_AWAY(1500)、连接断开时在途请求立即判死、broker 主动请求派发、TLS（`crypto/tls`） |
-| 发送 | 同步 / 定点 / 批量 / 单向 / 队列选择器 / 异步（真内核 + 背压信号量 + 有界队列）/ 事务消息（两阶段 + broker 回查 + 单工 check 线程）/ 定时消息撤回（recallMessage 370）/ Request-Reply |
-| 消费 | Push Consumer（长轮询 + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 + OFFSET_ILLEGAL 冻结重建 + 220 重置位点 + **POP 模式**）、Pull Consumer（调用方持有游标 + 长轮询；`FetchSubscribeMessageQueues` 给整个 topic，`FetchMessageQueuesInBalance` 只给本实例应得的那份）、Lite Pull Consumer（**双游标引擎**：拉取游标 / 消费游标 / 内存提交表，361 + LITE 位） |
-| 命名空间 | 两套彼此独立：`Namespace`（客户端本地资源名前缀 `%%ns%%res`，`common/namespace.go`，收发 / 心跳 / 位点全线包装与还原）与 `NamespaceV2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`；钩子顺序 Namespace → Stream → ACL，故 `ns`/`ReqT` 都在 ACL 签名内容里）。生产者 / 三种消费者 / 管理端都现读 `NamespaceV2` |
-| 消费侧应答 | `GET_CONSUMER_RUNNING_INFO(307)`（三层属性 + subscriptionSet + mqTable/mqPopTable 互斥 + statusTable）、`CONSUME_MESSAGE_DIRECTLY(309)`（并发/顺序两套判定 + panic → CR_THROW_EXCEPTION）、`CONSUMER_SEND_MSG_BACK(36)`、`GET_CONSUMER_STATUS_FROM_CLIENT(221)`、`RESET_CONSUMER_CLIENT_OFFSET(220)` |
-| 消费侧统计 | `ConsumerStatsManager`：五组 StatsItemSet（CONSUME_OK/FAILED_TPS、CONSUME_RT、PULL_TPS/RT），累计 + 两级采样链，快照是**差分窗口**；307 的 statusTable 就是它 |
-| 队列分配 | 六个策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`，可插拔、由真实重平衡驱动；NEARBY 的 resolver 给出空机房时通过 `AllocateErrReporter` 上报，重平衡保留现有分配（对齐 Java 异常中止语义） |
-| 管理端 | `DefaultMQAdminExt`：topic / 订阅组 CRUD、集群信息、消费统计、消息查询（key / uniqKey / msgId）、位点读取与 broker 侧重置、消息轨迹查询；**真机工具 `examples/live_admin` 29 项**（管理员端此前只有单测，没有真机工具 —— 第一次真机就抓到 `groupRetryPolicy` 为 nil 时序列化 panic） |
-| 消息轨迹 | 客户端轨迹生产：Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录，Java `TraceDataEncoder` **逐字节**对齐（真值向量见单测）；`AsyncTraceDispatcher`（2048 有界丢弃 + 批 20 + 128K 分片 + 5s 冲刷 + 关停冲尾批）、内部生产者与 topic 前缀两道防自噬、W3C `traceparent` 注入与透传（`ROCKETMQ_TRACE_CONTEXT_ENABLE`） |
-| 5.x 能力 | Request-Reply（326 holder）、撤回句柄 v1 编解码、POP 消费（200050/200051/200052 + 检查点反构）、消费侧状态与运行信息应答（221 位点表 / 307 / 309）、五类钩子、ACL 签名（`HmacSHA1`，标准库）、动态 name server 取址、故障规避选队列、定时消息三 setter（`SetDelayTimeSec/SetDelayTimeMs/SetDeliverTimeMs`）、admin 侧 `UpdateNameServerConfig(318)`/`GetNameServerConfig(319)`/`ConsumeMessageDirectly(309)`、producer 侧 `SendMessageWithVIPChannel`（发送 RPC 走 VIP 端口 port-2） |
-| 离线自检 | `examples/selfcheck`：**不依赖集群**的协议层自检 10 项（JSON / 二进制双帧回环、`clientID` 键拼写、V2 单字母短键集、17 段消息回环含派生 msgId、magic-v2 超长 topic 手工夹具、6 段批量、Crc32 向量、ACL 签名注入） |
-| 校验门 | `Validators` / `TopicValidator`：组名 / topic 校验在 `start()` 建客户端实例**之前**本地跑完，失败不碰网络 |
+## 安装与开发
 
-**压缩三型齐全（ZLIB / LZ4 / ZSTD），全部手写**：标准库只有 zlib，而本模块承诺零第三方依赖，
-所以 LZ4 与 ZSTD 都按规范自实现——`common/lz4.go` 是 LZ4 **Frame** 格式（块格式 + 帧头 +
-xxh32 HC/内容校验，与 Java `LZ4FrameOutputStream`、Python `lz4.frame`、lz4 CLI 同 wire），
-双向都完整（编码器有真实匹配器，压不动的块按 bit31 原样存）。
-`common/zstd.go` 的**解码器读完整 zstd 帧**（Raw/RLE/Compressed 三类块、Huffman 单/四流、
-FSE 序列、重复偏移、全部帧头字段、拼接帧/skippable 帧、xxh64 内容校验），能直接解 zstd-jni
-与 zstd CLI 压出来的字节；**编码器只产出合法的 store-only 帧（Raw/RLE 块）**——对端照读不误，
-只是 Go 发出的 ZSTD 正文不会变小（矩阵里 storeSize≈载荷大小就是这一条的证据）。补完整编码器
-要再写 FSE/Huffman 编码器，是有意的取舍而非遗漏（2026-10-09）。解不出来的一律**大声报 `unsupported` /
-解码错误**，绝不把压缩流当正文透传（消费端解错就是静默垃圾）。
-`scripts/compression_matrix.sh`（跨语言压缩矩阵）的 Go 腿在 zlib / lz4 / zstd 三档下都参与
-（`examples/live_compression_matrix`，9 个方向：go↔go / go↔python / go↔cpp / go↔net / go↔rust）。
-
-## 构建与检查
-
-```bash
-cd go
-go build ./...
-go vet ./...
-gofmt -l .        # 空输出才是过
-go test ./...     # 502 条（466 个用例 + 36 个子测试），~10s
-go test -race ./client/   # 并发回归（lite 消费者、异步发送、位点提交地板）
+```sh
+go get github.com/zhaohai666/rocketmq-client-remoting/go
 ```
 
-## 单元测试
+```go
+import (
+    "github.com/zhaohai666/rocketmq-client-remoting/go/client"
+    "github.com/zhaohai666/rocketmq-client-remoting/go/common"
+    "github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
+)
+```
 
-535 条测试函数全部与源码同目录（`*_test.go`），其中一部分跑在**进程内假集群**上
-（`client/consumer_test.go` 里的 `clusterFixture`：真 socket 监听的假 broker + 假 name server，
-脚本化应答，能锁死请求码、ext 字段名与重试分类）：
+构建、静态检查、格式化、单测：
 
-| 包 | 条数 | 覆盖 |
-| --- | --- | --- |
-| `client`（287） | producer 19 | 六条发送路径、重试分类（可重试码换 broker / 不可重试码立即抛 / 预算耗尽）、批量 ID 顺序、发送头 c/d/n、发送头守卫 |
-| | hooks 14 | `CheckForbiddenHook` 每次尝试都调且不吞异常、`FilterMessageHook` 吞异常且后续照跑、ACL 签名拼串（key 排序、只拼 value、跳过 Signature） |
-| | async 27 | 真异步内核：换 broker 换 opaque、背压信号量、有界队满同步抛、回调恰好一次、预算共享 |
-| | transaction 6 | 两阶段 + 回查响应、单工 check 线程 |
-| | request_reply 13 | 326 holder、Request/AsyncRequest 超时 |
-| | consumer 29 | 长轮询、顺序重投闸门、流控、位点五 RPC、OFFSET_ILLEGAL、220、广播、关停在途消费 join + send-back 守卫、位点提交地板三条（部分 ack 整批提交 / 回投失败钉住位点 / 乱序批次不回跳） |
-| | consumer_stats 19 | 差分窗口口径、10s/10min 两级采样、`consumeRT` 独有的 hour 回退、`consumeFailedMsgs` 取 hour sum、key 是 topic@group、拉取与消费两条记录路径 |
-| | consumer_running_info 19 | **307** 空体六键与 `jstack` 未设即不出现、`mqTable`/`mqPopTable` **内联对象键按原始字节**断言、经典 vs POP 两表互斥、statusTable 含 `%RETRY%` 且取自统计管理器、processQueueInfo 14 键 / popProcessQueueInfo 3 键、**309** 并发与顺序两套判定 + `autoCommit` 在 listener 之后读 + panic→CR_THROW_EXCEPTION + 重投 topic 还原 + 两条错误臂端到端 |
-| | pop 15 | 检查点 8 段反构（含 `1ST_POP_TIME`）、ACK 用 checkpoint offset、失败改不可见时间、`checkNeedAckOrDelay` 两分支、401 请求模式、`order`/`suspend` 恒在报文里 |
-| | lite_pull 9 | **361 + LITE 位上线**、双游标（NO_NEW_MSG 也跟 nextBeginOffset）、Seek 丢缓冲、提交表是**清扫**不是过滤、暂停恢复闸门、订阅模式重平衡 + 关停落盘 |
-| | pull_consumer 18 | 短轮询不带 SUSPEND 位、长轮询真挂起、调用方游标、sendMessageBack |
-| | admin 35 | topic/组 CRUD、分页合并、222 的 `isForce` 键名、26 号 body 是 Properties 文本 |
-| | instance 15 | 实例表复用、路由刷新、发布地址只认 master、注销 35 遍历主从、220/221/40 的 broker 主动请求 |
-| | route 10 | 路由表发布槽位（`brokerAddrs` 裸数字键）、TBW102 兜底、unknown topic 重试窗口 |
-| | offset_store 9 | 本地/broker 双表、persistAll 清扫语义 |
-| | trace 30 | Java 编码器**逐字节**真值向量、解码容错（无 keys 空段、坏记录只跳过自己）、SubBefore/SubAfter 共用 requestId + contextCode 五档、traceparent 注入与校验、分发器防自噬，以及两条**进程内真集群**端到端（Pub 落轨迹 topic 且不递归 / 消费对落盘并配对） |
-| `common`（111） | 111 | 17 段编解码（坏数据拒收、压缩段 crc32）、消息模型、clientId 口径、recall 句柄真值向量、namespace、sysflag 位表、ExtraInfo 8 段、校验器 |
-| `remoting`（137） | 137 | 真 socket 回环（同步/异步/oneway、半包、并发 opaque、静默超时）、TLS、ACL 签名、V2 短键名守卫（错一个字母就**静默丢字段**）、JSON 容错（裸数字键、对象 key、NaN）、**fastjson2 出站写入器**（MessageQueue 内联对象键 + Java double 格式）、`CurrentVersion`/`CurrentVersionDesc` 成对守卫、心跳装配、POP 与 ClientInfo body 形状、订阅组配置（**nil `groupRetryPolicy` 必须丢键而不是 panic**） |
-
-## 离线自检
-
-不需要集群、也不需要跑整套单测的协议层冒烟：
-
-```bash
+```sh
 cd go
+go build ./...                 # 通过，无输出
+go vet ./...                   # 通过，无输出
+gofmt -l .                     # 输出为空才是过
+go test ./... -count=1
+```
+
+`go test ./... -count=1` 的实测结果（3 个测试包全部 `ok`）：
+
+| 包 | 测试函数数 | 耗时 |
+| --- | --- | --- |
+| `client` | 313 | 12.9s |
+| `common` | 134 | 6.0s |
+| `remoting` | 137 | 1.6s |
+| **合计** | **584**（50 个 `*_test.go`） | ~20s |
+
+计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
+
+```sh
+go test -race ./client/
+```
+
+不连集群的协议冒烟（逐条 `[PASS]`，收口 `selfcheck: ALL PASS (PASS=10 FAIL=0)`）：
+
+```sh
 go run ./examples/selfcheck
 ```
 
-10 项，逐条打印 `[PASS]` / `[FAIL]`，任一项失败进程以非 0 退出码结束，收口行
-`selfcheck: ALL PASS (PASS=10 FAIL=0)`。与 `python -m selfcheck`（7 项）、
-`cpp/examples/selfcheck.cpp`（3 项）、`csharp` 的 `selfcheck` 子命令（3 项）同名同用途，
-是**动真机之前**最便宜的一道门。**Rust 侧没有这个工具**（`rust/examples/` 全是需要集群的
-`live_*`），它的协议层离线覆盖由 `cargo test` 单测承担 —— 所以这里是 4/5 端对齐。
+## 快速上手
 
-覆盖：JSON 帧回环（含**不转义** `<>&`、中文 remark、extFields 全等）、ROCKETMQ 私有二进制帧回环
-（并断言协议类型确实走在打包头长度的高位）、`HEART_BEAT` 的 `clientID` **键拼写**、`SendMessageRequestHeaderV2`
-**恰好**是单字母键 `a..n`（多写一个长名会被 broker 静默丢弃，且只验值的话查不出来）、17 段消息回环
-（含派生的 `msgId`/`offsetMsgId`）、magic-v2 超长 topic（>255B）解码、6 段批量回环、`msgId` 反解、
-Crc32 标准向量、ACL 签名注入（AccessKey/SecurityToken 必须在算签名**之前**进 extFields，SecretKey 不上线）。
+### Producer
 
-两处刻意做成**字节级**而非"回环一下"：magic-v2 那条是**手工拼**的 broker 帧且 properties 硬编码
-（编解码都是自己的话，对称 bug 会让回环照过）；Crc32 直接钉向量 —— 因为 Java 的 `UtilAll.crc32`
-返回 `(int)(value & 0x7FFFFFFF)`（砍最高位），与标准 CRC-32 差 2^31，跨语言**绝不能**直接比 crc
-（只比各自 `match` 字段；解码侧 `CheckCRC` 默认关，互通才成立）。
+普通消息：
+
+```go
+producer, err := client.NewDefaultMQProducer("GID_demo")
+if err != nil {
+    panic(err)
+}
+producer.SetNameServerAddr("127.0.0.1:9876")
+if err := producer.Start(); err != nil {
+    panic(err)
+}
+defer producer.Shutdown()
+
+result, err := producer.Send(common.NewMessage("TopicTest", []byte("hello")))
+if err != nil {
+    panic(err)
+}
+fmt.Println(result.SendStatus, result.MsgID, result.OffsetMsgID, result.QueueOffset)
+```
+
+带 Tag / Key / 自定义属性，并指定超时：
+
+```go
+msg := common.NewMessageWithTags("TopicTest", body, "TagA", "OrderID001", 0)
+msg.SetUserProperty("bizType", "trade")
+result, err = producer.SendWithTimeout(msg, 3000)
+```
+
+顺序消息（同一业务键固定落同一队列），以及定点队列：
+
+```go
+result, err = producer.SendBySelector(msg, client.SelectMessageQueueByHash{}, "shard-42")
+
+mq := common.NewMessageQueue("TopicTest", "broker-a", 0)
+result, err = producer.SendToQueue(msg, mq)
+```
+
+延迟与定时消息（经典档位与 5.x 定时属性都支持）：
+
+```go
+msg.SetDelayTimeLevel(3)        // 经典档位 3 = 10s
+msg.SetDelayTimeSec(30)         // 定时器：30 秒后投递
+msg.SetDelayTimeMs(5000)
+msg.SetDeliverTimeMs(deliverAt) // 绝对时间戳
+
+scheduled, err := producer.Send(msg)
+handle := scheduled.RecallHandle // 只有定时消息带撤回句柄
+```
+
+撤回定时消息：
+
+```go
+newHandle, err := producer.RecallMessage("TopicTest", handle)
+```
+
+批量发送与单向发送：
+
+```go
+result, err = producer.SendBatch([]*common.Message{msgA, msgB, msgC})
+
+err = producer.SendOneway(msg, &mq) // 不等 broker 应答，没有返回值
+```
+
+真异步发送（回调恰好触发一次，可开背压限流）：
+
+```go
+type callback struct{}
+
+func (callback) OnSuccess(r *client.SendResult) { fmt.Println("ok", r.MsgID) }
+func (callback) OnException(err error)          { fmt.Println("fail", err) }
+
+producer.SetEnableBackpressureForAsyncMode(true)
+producer.SetBackPressureForAsyncSendNum(1024)
+producer.SetBackPressureForAsyncSendSize(64 * 1024 * 1024)
+err = producer.SendAsync(msg, callback{})
+```
+
+Request-Reply：
+
+```go
+producer.SetRequestTimeout(3000)
+reply, err := producer.Request(msg) // 回包正文在 reply.Body
+```
+
+事务消息（两阶段 + broker 回查）：
+
+```go
+type txListener struct{}
+
+func (txListener) ExecuteLocalTransaction(msg *common.Message, arg any) client.LocalTransactionState {
+    return client.CommitMessage // 或 RollbackMessage；Unknow 表示挂起等回查
+}
+func (txListener) CheckLocalTransaction(msg *common.MessageExt) client.LocalTransactionState {
+    return client.CommitMessage
+}
+
+txProducer, _ := client.NewTransactionMQProducer("GID_demo_tx")
+txProducer.SetNameServerAddr("127.0.0.1:9876")
+txProducer.SetTransactionListener(txListener{})
+txProducer.Start()
+defer txProducer.Shutdown()
+
+res, err := txProducer.SendMessageInTransaction(msg, nil)
+fmt.Println(res.SendStatus, res.LocalTransactionState)
+```
+
+### PushConsumer
+
+并发消费：
+
+```go
+type listener struct{}
+
+func (listener) ConsumeMessage(msgs []*common.MessageExt,
+    ctx *client.ConsumeConcurrentlyContext) client.ConsumeConcurrentlyStatus {
+    for _, m := range msgs {
+        fmt.Println(m.MsgID, string(m.Body))
+    }
+    return client.ConsumeSuccess // 要重投就返回 client.ReconsumeLater
+}
+
+consumer, err := client.NewDefaultMQPushConsumer("GID_demo")
+if err != nil {
+    panic(err)
+}
+consumer.SetNameServerAddr("127.0.0.1:9876")
+consumer.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
+consumer.SetConsumeThreadNums(20)
+if err := consumer.Subscribe("TopicTest", "TagA || TagB"); err != nil {
+    panic(err)
+}
+if err := consumer.SetMessageListener(listener{}); err != nil {
+    panic(err) // 也可以用类型明确的 SetConcurrentlyListener / SetOrderlyListener
+}
+if err := consumer.Start(); err != nil {
+    panic(err)
+}
+select {} // 常驻
+```
+
+顺序消费（换一个监听器接口，返回值决定本队列的挂起与提交）：
+
+```go
+type orderlyListener struct{}
+
+func (orderlyListener) ConsumeMessage(msgs []*common.MessageExt,
+    ctx *client.ConsumeOrderlyContext) client.ConsumeOrderlyStatus {
+    return client.OrderlySuccess // 或 OrderlySuspendCurrentQueueAMoment
+}
+
+consumer.SetMessageListener(orderlyListener{})
+```
+
+广播消费（每个实例收全量，位点只落本地文件）：
+
+```go
+consumer.SetMessageModel(client.MessageModelBroadcasting) // 默认 client.MessageModelClustering
+```
+
+POP 模式（消息对所有实例可见，靠 ack 与不可见时间推进）：
+
+```go
+consumer.SetPopMode(true)
+```
+
+### PullConsumer
+
+调用方自己持有游标，短轮询与长轮询是两条不同的路：
+
+```go
+pullConsumer, _ := client.NewDefaultMQPullConsumer("GID_demo_pull")
+pullConsumer.SetNameServerAddr("127.0.0.1:9876")
+pullConsumer.Start()
+defer pullConsumer.Shutdown()
+
+mqs, _ := pullConsumer.FetchSubscribeMessageQueues("TopicTest")
+for _, mq := range mqs {
+    result, err := pullConsumer.Pull(mq, "*", 0, 32) // 短轮询：绝不挂起
+    if err != nil {
+        panic(err)
+    }
+    switch result.PullStatus {
+    case client.PullFound:
+        for _, m := range result.MsgFoundList {
+            fmt.Println(m.MsgID)
+        }
+    case client.PullNoNewMsg, client.PullNoMatchedMsg, client.PullOffsetIllegal:
+        // 四种状态都跟随 result.NextBeginOffset 推游标
+    }
+    _ = pullConsumer.UpdateConsumeOffset(mq, result.NextBeginOffset)
+}
+
+// 长轮询（挂起位只在这条路上置）：
+result, _ := pullConsumer.PullBlockIfNotFound(mqs[0], "*", result.NextBeginOffset, 32)
+
+// 位点与队列边界：
+lo, _ := pullConsumer.MinOffset(mq)
+hi, _ := pullConsumer.MaxOffset(mq)
+at, _ := pullConsumer.SearchOffset(mq, time.Now().Add(-time.Hour).UnixMilli())
+stored, _ := pullConsumer.FetchConsumeOffset(mq, true)
+```
+
+### LitePullConsumer
+
+内部跑后台短轮询填缓冲，由调用方 `Poll` 取；拉取游标与消费游标分开。
+
+```go
+lite, _ := client.NewDefaultLitePullConsumer("GID_demo_lite")
+lite.SetNameServerAddr("127.0.0.1:9876")
+lite.Subscribe("TopicTest", "*")
+lite.Start()
+defer lite.Shutdown()
+
+for {
+    for _, m := range lite.Poll() { // 只有真交付才推进消费游标
+        fmt.Println(m.MsgID)
+    }
+    if err := lite.Commit(); err != nil { // 提交的是消费游标
+        fmt.Println("commit:", err)
+    }
+    time.Sleep(time.Second)
+}
+```
+
+指定队列（`Assign`）+ 重放 + 按时间定位：
+
+```go
+mqs, _ := lite.FetchMessageQueues("TopicTest")
+lite.Assign(mqs)
+lite.SeekToBegin() // 或者 lite.Seek(mq, offset) 精确重放某个队列
+ts, _ := lite.OffsetForTimestamp(mqs[0], deliverTimestamp)
+```
+
+topic 队列变更监听（扩容 / 缩容都会回调）：
+
+```go
+type queueChange struct{}
+
+func (queueChange) OnChanged(topic string, messageQueues []common.MessageQueue) {
+    fmt.Println(topic, "现在", len(messageQueues), "个队列")
+}
+
+if err := lite.RegisterTopicMessageQueueChangeListener("TopicTest", queueChange{}); err != nil {
+    panic(err)
+}
+```
+
+### Admin
+
+```go
+admin := client.NewDefaultMQAdminExt(nil) // 要 ACL 就传一个 remoting.RPCHook
+admin.SetNameServerAddresses([]string{"127.0.0.1:9876"})
+if err := admin.Start(); err != nil {
+    panic(err)
+}
+defer admin.Shutdown()
+
+cluster, _ := admin.ExamineBrokerClusterInfo()
+list, _ := admin.FetchAllTopicList()
+route, _ := admin.ExamineTopicRoute("TopicTest")
+stats, _ := admin.ExamineTopicStats("TopicTest")
+
+_ = admin.CreateTopic(common.DefaultTopic, "TopicTest", 8, 0)
+_ = admin.DeleteTopic("TopicTest", "DefaultCluster")
+```
+
+### ACL
+
+```go
+credentials := remoting.NewSessionCredentials("YourAccessKey", "YourSecretKey")
+hook, err := remoting.NewAclClientRPCHook(credentials)
+if err != nil {
+    panic(err)
+}
+producer.SetRpcHook(hook)
+
+// 带 STS token：
+scoped := remoting.NewSessionCredentialsWithToken(accessKey, secretKey, securityToken)
+```
+
+### 命名空间
+
+两套彼此独立的机制，按部署形态选一种：
+
+```go
+// 一：客户端侧改写资源名，topic / group 上线时就带上命名空间前缀
+producer.SetNamespace("MyNamespace")
+
+// 二：服务端侧命名空间，资源名原样上线，命名空间随 `ns` / `nsd` 扩展字段下发
+producer.SetNamespaceV2("MyNamespace")
+```
+
+两个 setter 在 `DefaultMQProducer`、`TransactionMQProducer` 和三种消费者上都有。
+
+### 压缩
+
+```go
+producer.SetCompressType(common.ZstdType)        // common.ZlibType / common.Lz4Type / common.ZstdType
+producer.SetCompressLevel(5)
+producer.SetCompressMsgBodyOverHowmuch(4 * 1024) // 正文超过这个字节数才压
+```
+
+### TLS
+
+```go
+producer.SetTLSEnable(true)
+```
+
+也可以纯环境变量打开（`ROCKETMQ_TLS_ENABLE=1`）。握手固定 `MinVersion = TLS 1.2`；
+`ROCKETMQ_TLS_TEST_MODE` 默认 `true`，信任自签证书且不校验 CA，生产环境请显式设为
+`false` 走完整校验。
+
+## 特性与进度
+
+- ✅ 生产者：普通消息、Tag / Key / 自定义属性、顺序（选择器与定点队列）、延迟档位与 5.x
+  定时属性、批量、单向、真异步（回调 + 背压信号量 + 失败重试）、事务（两阶段 + broker 回查）、
+  Request-Reply、定时消息撤回（`RecallMessage`）
+- ✅ 消费者：Push（并发 / 顺序 / 广播 / POP、Tag 与 SQL92 过滤、拉取前流控、线程池在线调整、
+  `OFFSET_ILLEGAL` 冻结重建、优雅关停时 join 在途消费）、Pull（调用方游标、短轮询、长轮询、
+  位点读写、`sendMessageBack`）、LitePull（后台短轮询 + 双游标、`Seek`、自动提交、
+  队列变更监听、关停落盘）
+- ✅ 队列分配策略 6 个：平均、按圈平均、一致性哈希、机房、就近机房、按配置
+- ✅ 管理端：集群与路由探活、topic / 订阅组 / KV 配置增删改查、位点重置与四路位点查询、
+  消费统计与消费进度、运行信息与直投调试、消息查看与按 key 检索、批量配置、静态 topic、
+  顺序 topic 配置、半消息恢复、过期清理
+- ✅ 线协议：JSON 与私有二进制双序列化（`ROCKETMQ_SERIALIZE_TYPE`）、17 段存储格式与
+  6 段批量格式、V2 单字母短键 header、心跳与订阅关系、请求码 / 响应码 / 语言码常量
+- ✅ 传输：长连接复用、半包粘包重组、opaque 匹配、超时、连接断开即在途请求判死、
+  `GO_AWAY`、同步 / 异步 / 单向、TLS
+- ✅ 安全与多租：ACL 签名（`HmacSHA1`，标准库）、两套命名空间、单元化
+  （`SetUnitName` / `SetUnitMode`）、`CheckForbiddenHook`
+- ✅ 压缩：ZLIB、LZ4、ZSTD 三型可发可收；ZSTD 解码是完整格式（含 FSE + Huffman），
+  编码侧的范围见「真实集群联调」末尾
+- ✅ 可观测：消息轨迹（Pub / SubBefore / SubAfter / EndTransaction / Recall 五类记录 +
+  异步分发器 + 两道防自噬闸门）、消费统计（TPS / RT 差分窗口）、故障延迟规避选队列
+- ✅ 位点存储：本地文件与远端 Broker 两种，重启续读
+- ✅ 日志：环境变量配置的文件 / 标准输出日志，按大小轮转
+
+## 客户端日志
+
+日志默认写文件，落盘位置与轮转策略都由环境变量控制：
+
+| 环境变量 | 作用 | 默认值 |
+| --- | --- | --- |
+| `ROCKETMQ_CLIENT_LOG_LEVEL` | `TRACE` / `DEBUG` / `INFO` / `WARN` / `ERROR` | `INFO` |
+| `ROCKETMQ_CLIENT_LOG_DIR` | 日志目录 | `$HOME/logs/rocketmqlogs` |
+| `ROCKETMQ_CLIENT_LOG_FILE` | 文件名；含路径分隔符时按整条路径处理；空串 / `OFF` / `NONE` = 不写文件只留 stderr | `rocketmq_go_client.log` |
+| `ROCKETMQ_CLIENT_LOG_USE_STDOUT` | 任意非空值 = 改写标准输出（优先于上面两项） | 未设置 |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE` | 单文件上限（字节），`0` = 不轮转 | `67108864`（64MB） |
+| `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` | 轮转保留的备份份数，`0` = 不留备份、原地截断 | `10` |
+
+默认落盘位置是 **`$HOME/logs/rocketmqlogs/rocketmq_go_client.log`**。写到上限就滚进固定
+窗口的备份序列（`rocketmq_go_client.log.1` … `.10`），窗口里最老的一份被丢弃；文件被外部
+删掉时日志会重开一个新文件，不会静默停写。调试期想直接看标准输出就设
+`ROCKETMQ_CLIENT_LOG_USE_STDOUT=1`。换目录用 `ROCKETMQ_CLIENT_LOG_DIR`：
+
+```sh
+ROCKETMQ_CLIENT_LOG_DIR=/var/log/rmq-client \
+ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE=16777216 \
+go run ./examples/live_producer -ns 127.0.0.1:9876
+```
+
+其余可用开关：`ROCKETMQ_SERIALIZE_TYPE`（线协议序列化，默认 `JSON`）、
+`ROCKETMQ_TLS_ENABLE` / `ROCKETMQ_TLS_TEST_MODE`（见「TLS」）、
+`ROCKETMQ_TRACE_CONTEXT_ENABLE`（`1` / `true` / `yes` = 发送时注入 W3C `traceparent`）。
 
 ## 真实集群联调
 
-需要跑着 nameServer(9876) + broker(10911)、且 `autoCreateTopicEnable=true` 的集群
-（停机竞态那条另外要求 `traceTopicEnable=true`，否则 `RMQ_SYS_TRACE_TOPIC` 不预建）。
-这些工具**不进 `go test`**，依赖外部集群；全部自断言，任何一项失败进程以非 0 退出码结束，
-收口行 `PASS=<n> FAIL=<n>`：
+`examples/` 下 13 个可执行工具，**不进 `go test`**，全部自断言；除 `selfcheck` 外都要
+一个活着的集群。统一跑法：
 
-```bash
+```sh
 cd go
-go run ./examples/live_producer       -ns 127.0.0.1:9876   # 六条发送路径、SendResult 形状（msgId==UNIQ_KEY / offsetMsgId / queueOffset / regionId）、事务两阶段 + broker 回查、异步内核（回调恰好一次 / 定点 / 选择器 / 批 / 背压许可归还）
-go run ./examples/live_consumer       -ns 127.0.0.1:9876 -topic T -group G -expect 12 -orderly-topic T2 -orderly-expect 6
-                                                          # S1 收全且不重不漏（数据由 Python 侧灌）、S2 同组第二实例收不到、S3 客户端二次 tag 过滤、S4 顺序消费、S5 双实例切分、S6 优雅注销
-go run ./examples/live_pull           -ns 127.0.0.1:9876   # 手动 pull：Min/Max/SearchOffset、队头短轮询不挂起、空队尾 NO_NEW_MSG 不挂起、长轮询唤醒、调用方游标、KEYS 保留
-go run ./examples/live_lite_pull      -ns 127.0.0.1:9876   # assign 模式（双游标推进 / Commit / 重启续读不重放 / Seek 重放）、subscribe 模式重平衡 + 自动提交在 broker 读回
-go run ./examples/live_redelivery     -ns 127.0.0.1:9876 [-legs s1,s2,s3,s4]
-                                                          # S1 %RETRY% 二次投递 + delayLevel 3 延迟梯度 + topic 还原、S2 maxReconsumeTimes=2 ⇒ 3 次投递后 %DLQ% 且 recon=3、S3 顺序毒消息走「等 broker 回投」那条 DLQ 路径、S4 ackIndex 部分 ack（已 ack 的不回投 / 位点仍整批提交 / 对照组一条不回投）
-go run ./examples/live_shutdown_race  -ns 127.0.0.1:9876   # 立即关停 / 立即退进程的丢数据契约：并发回投两轮（%RETRY% → %DLQ%）、顺序挂起回投、短生命周期 trace 生产者冲尾批
-go run ./examples/live_admin          -ns 127.0.0.1:9876   # 管理端 29 项：集群探活与 master 选主、topic CRUD（路由/配置/列表一致）、broker 配置与运行时 KV、KV config 写读删、订阅组 CRUD、发 8 条验 topicStats、**四个位点查询**（Max/Min/LOWER/UPPER 边界/最早存储时间）、位点写 broker 再用另一个 RPC 读回、KEYS 索引查询 + viewMessage 取正文、删 topic 后确认消失
-go run ./examples/live_pop            -ns 127.0.0.1:9876   # POP 消费
+go run ./examples/<名字> -ns 127.0.0.1:9876
 ```
 
-脚本（**起集群 + 等端口 + 跑验证 + 收工都在同一条命令内**，别拆开跑）：
+退出码约定：**`0` 全部通过；`1` 至少一项 `FAIL`；`2` 环境不对**（参数缺失、连不上、
+集群没就绪）—— 环境问题直接中止，不计入失败。每项打印 `PASS` / `FAIL`，最后一行是收口
+计数（`PASS=<n> FAIL=<n>`）。
 
-```bash
-bash scripts/run_go_producer_live.sh        # Go 生产 → Python 回读
-bash scripts/run_go_consumer_live.sh        # Python 生产 → Go 消费 → Python 从 broker 回读位点/注销
-bash scripts/run_go_pull_live.sh            # Go 拉取
-bash scripts/run_go_redelivery_live.sh      # 重投 / 死信终态 / 顺序死信 / ackIndex 部分 ack（全跑约 5~7 分钟）
-bash scripts/run_go_shutdown_race_live.sh   # 停机竞态（对标 Rust 的 live_shutdown_race）
-bash scripts/run_go_pop_live.sh             # POP 消费
-bash scripts/run_go_admin_live.sh           # 管理端（29 项，自断言；工具自己造/删 topic、订阅组、KV namespace）
-bash scripts/compression_matrix.sh zlib     # 跨语言压缩矩阵（七端互测，含 Go 9 个方向；lz4 / zstd 同脚本换 codec）
+| 工具 | 验的是什么 |
+| --- | --- |
+| `selfcheck` | 不连集群的协议自检：双帧回环、header 键拼写、V2 短键集、17 段与 6 段消息格式、msgId 反解、Crc32 向量、ACL 签名注入（实测 `PASS=10 FAIL=0`） |
+| `wait_cluster` | 阻塞到 NameServer 报出 master broker 才退出。Broker 的「boot success」只代表本地 store 打开，注册是另一条线程、晚几秒，跑批前先过这道门 |
+| `live_producer` | 六条发送路径、`SendResult` 各字段形状、异步内核（回调恰好一次 / 定点 / 选择器 / 批量 / 背压许可归还）、事务两阶段与 broker 回查；收口行带 `SENT=<n>` |
+| `live_consumer` | Push 消费：`CONSUME_FROM_FIRST_OFFSET` 收全且不重不漏、同组第二实例收不到、客户端二次 tag 过滤、顺序消费、双实例切分、优雅注销 |
+| `live_pull` | Pull：min / max / 按时间搜位点、空队头短轮询不挂起、空队尾 `NO_NEW_MSG` 不挂起、长轮询提前唤醒与超时、调用方游标、`sendMessageBack` 进 `%RETRY%`；收口行带 `COMMITTED=<offset>` |
+| `live_lite_pull` | LitePull：`Assign` 双游标推进、`Commit` 与重启续读不重放、`Seek` 重放、`Subscribe` 重平衡 + 自动提交在 broker 读回、关停持久化 |
+| `live_lite_topic_queue_change` | 队列变更监听：真的把 topic 扩容与缩容，回调必须在一两个检查轮内落地，证明比对的是现查路由而不是 30s 路由缓存（实测 `PASS=11 FAIL=0`） |
+| `live_pop` | POP 消费：不可见时间、ack 与批量 ack、改超时、重投窗口。断言的是定时窗口与 broker 侧可见状态，不是返回码 —— POP 出错全是静默的 |
+| `live_redelivery` | `%RETRY%` 二次投递与延迟梯度、`maxReconsumeTimes` 到顶后进 `%DLQ%`、顺序毒消息的 DLQ 路径、`ackIndex` 部分 ack |
+| `live_shutdown_race` | 「关掉客户端就立刻退进程」的丢数据契约：并发回投两轮（`%RETRY%` → `%DLQ%`）、顺序挂起回投、短生命周期轨迹生产者的尾批 |
+| `live_admin` | 管理端 29 项：集群探活与 master 选主、topic CRUD、broker 配置与运行时 KV、订阅组 CRUD、发 8 条验 topic 统计、四路位点查询、KEYS 检索 + `viewMessage`、删 topic 后确认消失 |
+| `live_admin_batch` | 批量与运维类 RPC：批量 topic / 订阅组配置、静态 topic、禁写、半消息恢复、顺序 topic 配置、清理类调用 |
+| `live_compression_matrix` | 压缩矩阵的一腿，用位置参数而不是 flag：`send` 灌一个由固定配方本地重建的载荷，`recv` 读回并比对解压正文的 CRC |
+
+需要额外参数的两条：
+
+```sh
+go run ./examples/live_consumer -ns 127.0.0.1:9876 \
+    -topic T -group G -expect 12 -orderly-topic T_ord -orderly-expect 6
+
+go run ./examples/live_compression_matrix send <topic> <group> <size> 127.0.0.1:9876 zlib
+go run ./examples/live_compression_matrix recv <topic> <group> <size> 127.0.0.1:9876
 ```
 
-**尚未覆盖的真机场景**（另外四端已有对应工具，Go 侧待补）：`OFFSET_ILLEGAL` 冻结重建与 220
-重置位点（目前只有单测）、拉取流控五档、心跳全景（203/38、300、从节点扇出）、六个分配策略真机
-（`MACHINE_ROOM_NEARBY` 2026-10-01 已补实现，见 `client/allocate_nearby_test.go`）、
-`cleanExpiredMsg` 清扫、定时/延时消息与 key 查询、Request-Reply(326)、撤回 recallMessage(370)、
-ACL、TLS、SQL92、`MACHINE_ROOM_NEARBY` 真机，
-以及 **307/309 的真实 broker 往返**（`mqadmin consumerStatus -s` 走的就是这两条；目前只在
-进程内假集群上验证过线形与 Oracle 一致性，没有让真 broker 主动来问过）。
+`live_pop` 与 `live_redelivery` 支持 `-legs s1,s2` 只跑其中几个场景。仓库根目录 `scripts/`
+下还有一层封装好的脚本（起集群、等就绪、跑验证、收工在同一条命令里），与上表按名字对应，
+例如 `bash scripts/run_go_producer_live.sh`。
 
-对照 Java 客户端（zhaohai666-rocketmq 5.x）仍有意的差异：批次消息 msgId 取批自身
-UNIQ_KEY（与 Rust/C++ 对齐）。
+**先起消费者，再发消息。** 全新消费组第一次上线时 `ConsumeFromWhereLastOffset` 会把游标定
+在它启动那一刻的队列尾部，启动之前落盘的消息不在这个窗口里，看起来就像「一条都没收到」。
+所以跑 `live_consumer` / `live_pop` / `live_redelivery` 这类工具时，先确认消费者已经开始收，
+再让生产端灌消息；确实要读历史消息就显式
+`consumer.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)`。
+
+**本 SDK 当前的能力边界：**
+
+- ZSTD 编码只产出合法帧（RAW / RLE 块），**不做熵编码，压缩比≈1:1**：实测 9600 字节的高度
+  可压缩载荷编码成 9616 字节（帧头 + 块头），回环一致、对端照读不误；只是本客户端发出去的
+  ZSTD 正文不会变小。ZSTD 解码是完整实现，FSE + Huffman 都能解。
+- ZLIB 与 LZ4 编码是真压缩：同一份 9600 字节载荷，ZLIB 压到 80 字节、LZ4 压到 103 字节，
+  三个 codec 回环都一致。
+- POP 的队列集合由本地重平衡算出（每队列一个 POP 循环 + ack），不向 broker 申请分配。
+- `OFFSET_ILLEGAL` 冻结重建、拉取流控五档、心跳全景、六个分配策略目前只有单测与进程内假集群
+  覆盖，`examples/` 里还没有对应的真机工具。
 
 ## 目录结构
 
 ```
 go/
+├── README.md · README.en.md
 ├── go.mod                      module github.com/zhaohai666/rocketmq-client-remoting/go（go 1.24，零依赖）
-├── common/
-│   ├── message.go                  Message / MessageExt / MessageQueue
+├── common/                     与协议无关的基础层
+│   ├── message.go                  Message / MessageExt / MessageQueue（含队列的线上形态与哈希）
 │   ├── message_decoder.go          17 段存储格式 + 6 段批量格式
-│   ├── compression.go              ZLIB/LZ4/ZSTD 分派（Java CompressionFactory 同口径）
-│   ├── lz4.go / zstd.go          手写 LZ4 Frame 与 ZSTD 帧（零第三方依赖；zstd 解码全格式、编码 store-only）
-│   ├── recall_handle.go            定时消息撤回句柄 v1（base64url + 5 段）
-│   ├── buffer.go / sysflag.go / mixall.go / util.go
-│   ├── namespace.go / topic_validator.go / validators.go
-│   └── logging.go                  环境变量配置的文件/标准输出日志
-├── remoting/
+│   ├── message_const.go · message_type.go   属性键名与消息类型
+│   ├── message_client_id_setter.go clientId 口径
+│   ├── compression.go              ZLIB / LZ4 / ZSTD 分派
+│   ├── lz4.go · zstd.go · zstd_entropy.go   手写 LZ4 Frame 与 ZSTD 帧（编码 raw 块，解码全格式）
+│   ├── recall_handle.go            定时消息撤回句柄
+│   ├── namespace.go                两套命名空间的资源名包装与还原
+│   ├── logging.go                  环境变量驱动的日志 + 大小轮转
+│   ├── buffer.go · sysflag.go · mixall.go · util.go · errors.go
+│   ├── topic_validator.go · validators.go · stringmap.go
+│   └── pop_ack.go · extra_info.go
+├── remoting/                   线协议层
 │   ├── remoting_command.go         帧编解码
-│   ├── headers.go / codes.go       请求头家族（含 V2 短键）与常量
-│   ├── serialize.go                JSON 与 RocketMQ 二进制双序列化
-│   ├── client.go                   长连接传输：同步/异步/oneway + 半包 + TLS + 判死
-│   ├── heartbeat.go / subscription.go / bodies.go / admin_bodies.go
-│   ├── acl.go / rpchooks.go        ACL 签名与 RPC 钩子
-│   └── json_value.go               fastjson2 容错解析
-├── client/
-│   ├── instance.go                 MQClientInstance：路由发现 + 全部 RPC + 心跳 + 周期任务
-│   ├── producer.go / async.go / transaction_producer.go / request_reply.go
-│   ├── consumer.go / consume_service.go / process_queue.go / pool.go   push 消费者与执行器
-│   ├── pull_consumer.go            DefaultMQPullConsumer
-│   ├── lite_pull_consumer.go       DefaultLitePullConsumer（双游标）
-│   ├── pull_api.go                 pullKernel（经典 310/361 两路）
-│   ├── admin.go / admin_api.go / admin_offset.go / admin_track.go / admin_util.go
+│   ├── headers.go · codes.go       请求头家族（含 V2 短键）、请求码 / 响应码 / 语言码
+│   ├── serialize.go                JSON 与私有二进制双序列化
+│   ├── json_value.go               容错 JSON 解析
+│   ├── json_double.go              线协议要求的 double 字面量写法（0.0 / 1.0E20 / NaN→null）
+│   ├── inline_key_json_encode.go   允许内联对象做 map key 的出站 JSON 写器
+│   ├── bodies.go · common_bodies.go · consumer_bodies.go · admin_bodies.go · pop_bodies.go
+│   ├── client_info_bodies.go · subscription.go · heartbeat.go
+│   ├── client.go                   长连接传输：同步 / 异步 / 单向 + 半包 + TLS + 判死
+│   └── acl.go · rpchooks.go · errors.go
+├── client/                     SDK 层
+│   ├── instance.go                 客户端实例：路由发现、全部 RPC、心跳、周期任务
+│   ├── producer.go · async.go · transaction_producer.go · request_reply.go · send_result.go
+│   ├── consumer.go · consume_service.go · process_queue.go · pool.go · semaphore.go
+│   ├── pull_consumer.go · pull_api.go · lite_pull_consumer.go
+│   ├── pop_api.go · pop_consumer.go · pop_process_queue.go
 │   ├── allocate.go                 六个队列分配策略
-│   ├── trace.go / trace_hook.go / trace_dispatcher.go / trace_context.go   轨迹编解码 / 钩子 / 异步分发 / traceparent
-│   ├── offset_store.go / route.go / broker_api.go / hooks.go
-│   ├── fault_strategy.go / semaphore.go / listener.go / send_result.go
-│   └── validators 走 common
-└── examples/                   selfcheck（不依赖集群）+ 9 个真机联调工具（见上）
+│   ├── offset_store.go · route.go · broker_api.go · hooks.go · listener.go
+│   ├── admin.go · admin_api.go · admin_batch.go · admin_offset.go · admin_track.go · admin_util.go
+│   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
+│   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
+│   ├── consume_directly.go · jsonutil.go
+│   └── *_test.go                   50 个测试文件，584 个测试函数
+└── examples/                   13 个可执行工具（见「真实集群联调」）
 ```
-
-## 几个必须知道的实现约定
-
-**字段名与线上报文逐字一致。** broker 用 fastjson2 按属性名反序列化，字段名错一个就
-**静默丢字段**（不报错、没有错误码）。`remoting/headers.go` 与单测的 ext 键名守卫就是为
-守住这件事而存在，别改成"看着更自然"的命名。
-
-**短轮询绝不能带 SUSPEND 位。** Go 拉消费的 `Pull()`（短轮询）不置 `FLAG_SUSPEND`：
-挂起位泄漏到短轮询上，broker 会把请求扣住整个 suspend 预算，而客户端早就超时了 ——
-空队列上这是**必然超时**，是这条路上最贵的坑。长轮询（`PullBlockIfNotFound`）才置位。
-
-**POP 的队列来自客户端 rebalance，不是 broker 分配。** Java 在 `clientRebalance=false` 时走
-`RebalanceImpl#getRebalanceResultFromBroker:345` → `MQClientAPIImpl#queryAssignment:405`
-（QUERY_ASSIGNMENT=400，回 `MessageQueueAssignment` mode=POP），由 broker 决定本实例拿哪些队列。
-本端口**刻意不实现那条路径**（python / C++ / C# / Rust / Node.js / PHP 六端同一决定）：队列仍由本地
-分配策略算出，然后每队列一个 POP 循环 + ack。语义等价，差别只在"谁决定队列集合"；要改先读
-`client/consumer.go` 里 `doRebalance` 的那段注释。
-
-**lite 消费者跑双游标。** 拉取游标（PULL cursor）在**每一次**应答后都跟
-`nextBeginOffset`（FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL 一视同仁，
-"intact" 守卫兜住被撤走的队列）；消费游标（CONSUME cursor）只在 `Poll()` 真交付时前进，
-是提交的唯一来源。两游标混用就是重放或漏消费。
-
-**提交表是清扫，不是过滤。** `persistAll` / `commitAll` 把表里**范围之外**的单元整个删掉
-（Java RemoteBrokerOffsetStore："offset is not in mqs, remove it"）—— 游标持有者之外的
-陈旧位点会随这次提交一起蒸发，这是刻意的 Java 语义。空表整个跳过不碰网络，`-1` 游标
-不上线（"consumerOffset is -1"）。
-
-**位点提交地板按 Java `ProcessQueue#removeMessage` 算。** 并发 ack 的目标是「缓冲里**还剩下**的
-最小 offset」，缓冲被清空时退回 `queueOffsetMax + 1`；被清掉的是**已 ack 的那批**
-（`consumeRequest.getMsgs()` 减掉回投失败的），所以 `ackIndex` 部分 ack 时钉住位点的是
-「没被 ack、仍留在缓冲里」的那些，**不含**已经交回 broker 的尾巴。两个反例都实测过：
-把回投**失败**的那些从地板里排除，位点会跨过它们（崩溃即丢）；把目标当成「本批末位 + 1」，
-更高位那批先完成时位点会停在本批（真实 broker 上读回 0，而 Java 是 3）。顺序侧**不同**：
-Java 走 `commit()` = 本批 `lastKey + 1`（顺序是内联消费，同队列同时只有一批在跑）。
-两者混用要么漏消息要么把队列钉死。
-
-**两条死信上限用的不是同一个比较符。** `CONSUMER_SEND_MSG_BACK(36)` 走
-`AbstractSendMessageProcessor.consumerSendMsgBack`，判据是 `reconsumeTimes >= maxReconsumeTimes`；
-顺序侧的「普通发送到 `%RETRY%`」走 `SendMessageProcessor.handleRetryAndDLQ`，判据是
-`reconsumeTimes > maxReconsumeTimes`（**严格大于**），并且先看
-`RebalanceLockManager.isLockAllExpired` —— 组还持着队列锁就直接进 `%DLQ%`，根本不排队。
-另外 `RECONSUME_TIME` 的 `+1` 只有顺序侧在**客户端**加（`ConsumeMessageOrderlyService:350`），
-并发侧那个 `+1` 是 **broker** 加的，客户端写的是原值。
-
-**lite 是独立上线身份。** 请求码 361 + `FLAG_LITE_PULL_MESSAGE` sysFlag 位 + 心跳
-`ConsumerData` 的 LITE 位 + `CONSUME_ACTIVELY`；心跳是消费者自持循环（不进实例的
-consumer_table，实例级心跳只汇总那张表 ⇒ 没有自己的循环时 broker 上根本没有本组），
-扇出到主 + 从全部地址。
-
-**压缩在重试循环之外只做一次。** 重试循环内就地 `setBody` 的话，重试会把已压缩的 body
-再压一遍（`zlib(zlib(x))`），消费端只解一层就把压缩流当正文交出去。
-
-**分配策略的守卫返回空结果而非异常。** `currentCID` 空串 / `mqAll` 空 / `cidAll` 空
-**返回空分配**；`MACHINE_ROOM_NEARBY` 的 resolver 给出空机房会**报错**（静默返回空等于
-把整个 topic 的队列撤走）。
-
-**客户端本地校验的错误没有 response_code。** 只有 `check_message` 的 body 档位带
-`MESSAGE_ILLEGAL(13)`；"往 `SCHEDULE_TOPIC_XXXX` 发消息"报的是**无码**错误 —— 上层按
-`response_code` 分支时必须知道，五语言保持一致。
-
-**轨迹的防自噬有两道闸门，缺一不可。** 内部分发生产者自己的 `enableTrace=false`，
-且轨迹钩子跳过 topic 前缀是轨迹 topic 的消息 —— 只留一道，轨迹消息会给自己的轨迹再
-产生轨迹，流量指数放大。轨迹分发器在 `Shutdown()` 里**最后**关并且会冲掉尾批（队列里
-刚攒下的记录要等真的落 broker 才返回），否则短命客户端 / 立刻退出的进程丢最后一条。
-
-| 环境变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `ROCKETMQ_CLIENT_LOG_LEVEL` | `INFO` | `TRACE` / `DEBUG` / `INFO` / `WARN` / `ERROR` |
-| `ROCKETMQ_CLIENT_LOG_DIR` | `$HOME/logs/rocketmqlogs` | 日志目录 |
-| `ROCKETMQ_CLIENT_LOG_FILE` | `rocketmq_go_client.log` | 日志文件名；空串 / `OFF` / `NONE` = 关闭文件落盘只留 stderr；含路径分隔符时按整路径处理 |
-| `ROCKETMQ_CLIENT_LOG_USE_STDOUT` | 空 | 任意非空值 = 写标准输出而不是文件（优先于上面两项） |
-| `ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE` | `67108864`（64MB） | 单文件上限，按大小轮转（Java logback `<maxFileSize>64MB` 同值）；`0` = 不轮转 |
-| `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` | `10` | 备份份数（Java `rocketmq.log.file.maxIndex` 同值），备份名 `<file>.1` … `<file>.N`；`0` = 不留备份、原地截断 |
-
-**日志文件名刻意不叫 Java 的 `rocketmq_client.log`**（与 cpp / csharp / rust / nodeJs / php 同一取舍）：
-同机同时跑 Java 客户端时，两个进程会往同一个文件里插行，而且谁先轮转就把对方的文件改名了——
-JVM 仍持有旧 fd，之后它的日志会静默写进一个已经 unlink 的 inode。需要强行对齐时设
-`ROCKETMQ_CLIENT_LOG_FILE=rocketmq_client.log` 即可。落盘与轮转的单测在 `common/logging_test.go`
-（轮转窗口要用小上限才造得出来，真机脚本只能验「有没有文件」）。
-| `ROCKETMQ_SERIALIZE_TYPE` | `JSON` | 线协议序列化选择（JSON / ROCKETMQ） |
-| `ROCKETMQ_TLS_ENABLE` | `false` | 打开后所有出连接走 TLS |
-| `ROCKETMQ_TLS_TEST_MODE` | `true` | 信任自签证书、不校验主机名 |
-| `ROCKETMQ_TRACE_CONTEXT_ENABLE` | 空 | `1` / `true` / `yes` = 发送时注入 W3C `traceparent`（已有则透传给消费侧） |
-
-**clientId 口径**：`<本机 IP>@<instanceName>[@<unitName>][@STREAM]`，`instanceName` 为
-`DEFAULT` 时在 `start()` 里就地改写成 `<pid>#<nanoTime>`（生产者和 CLUSTERING 消费者；
-广播消费者保持 `DEFAULT`，同进程的广播消费者共用一份实例）。本机 IP 用 UDP「连」公网
-地址后读 sockname 探测（不发包），取不到退化成 `127.0.0.1`。
 
 ## License
 
-Apache-2.0。
+Apache-2.0，详见仓库根目录 `LICENSE`。
