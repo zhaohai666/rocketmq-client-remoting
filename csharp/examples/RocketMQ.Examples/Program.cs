@@ -40,6 +40,7 @@ internal static class Program
                 "lite-pull" => LiveLitePull.Run(rest),
                 "lite-pull-cursor" => LiveLitePullCursor.Run(rest),
                 "lite-pull-code" => LiveLitePullCode.Run(rest),
+                "lite-queue-change" => LiveLiteTopicQueueChange.Run(rest),
                 "rr" => LiveRR.Run(rest),
                 "reqreply" => LiveRR.Run(rest),
                 "latency" => LiveLatency.Run(rest),
@@ -102,6 +103,7 @@ internal static class Program
               lite-pull    [namesrv]       真实集群轻量拉取消费者联调（subscribe/assign 双模式 + poll）
               lite-pull-cursor [namesrv]   真实集群 lite-pull 拉取游标联调（NO_MATCHED_MSG 跟过整段 + 越界自愈）
               lite-pull-code [namesrv]     真实集群 lite-pull 请求码/开关联调（361 被 litePullMessageEnable 只拦 lite，11 与 push 对照）
+              lite-queue-change [namesrv]  真实集群 lite-pull topic 队列集合变更监听联调（1s 周期 + 真实扩缩容 ⇒ 证明比对趟次现查路由）
               rr           [namesrv]        真实集群 Request-Reply（5.x）联调（请求/应答/并发/超时）
               latency      [namesrv]        真实集群发送延迟故障容错联调（默认关/开/隔离退化链/到期恢复）
               pop          [namesrv]        真实集群 POP 模式（5.x）联调（POP/ACK/延长不可见/复活重投）

@@ -209,6 +209,20 @@ internal sealed class MockCluster : IDisposable
 
     private readonly Dictionary<int, Func<RemotingCommand, byte[]>> _replyBodies = new();
 
+    private Func<RemotingCommand, byte[]>? _routeBodyFor;
+
+    /// <summary>
+    /// 覆盖 name server 的路由应答体（每笔请求现算）。默认那台固定路由每台只有一个队列，
+    /// 而「消费者跑起来之后 topic 扩缩容」这类用例必须能改读队列数。
+    /// </summary>
+    public void SetRouteBody(Func<RemotingCommand, byte[]> bodyFor)
+    {
+        lock (_gate)
+        {
+            _routeBodyFor = bodyFor;
+        }
+    }
+
     /// <summary>
     /// 一笔脚本化的 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。<see cref="Gate" /> 非空时
     /// 应答先等它 —— 用来把「请求已到 broker、应答还在路上」的窗口拉成确定性的。
@@ -409,10 +423,12 @@ internal sealed class MockCluster : IDisposable
         {
             List<string> addrs;
             bool ok;
+            Func<RemotingCommand, byte[]>? routeBodyFor;
             lock (_gate)
             {
                 addrs = new List<string>(_brokerAddrs);
                 ok = _routeOk;
+                routeBodyFor = _routeBodyFor;
             }
 
             if (!ok)
@@ -421,7 +437,7 @@ internal sealed class MockCluster : IDisposable
             }
 
             RemotingCommand resp = Respond(req, ResponseCode.Success, null);
-            resp.Body = BuildRoute(addrs);
+            resp.Body = routeBodyFor?.Invoke(req) ?? BuildRoute(addrs);
             resp.HasBody = true;
             return resp;
         }

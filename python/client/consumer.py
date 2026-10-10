@@ -175,6 +175,18 @@ class MessageQueueListener:
         raise NotImplementedError
 
 
+class TopicMessageQueueChangeListener:
+    """topic 队列集合变更监听器（对应 Java TopicMessageQueueChangeListener）。
+
+    Java 的 ``onChanged(String topic, Set<MessageQueue>)``：队列数**扩/缩容**后
+    集合相对上一次快照有变化才回调，由后台周期比对触发
+    （``DefaultLitePullConsumerImpl#fetchTopicMessageQueuesAndCompare:1230``）。
+    """
+
+    def on_changed(self, topic: str, message_queues: Set[MessageQueue]) -> None:
+        raise NotImplementedError
+
+
 class AllocateMessageQueueStrategy:
     """队列分配策略接口（对应 Java AllocateMessageQueueStrategy）。
 
@@ -4113,6 +4125,9 @@ class DefaultLitePullConsumer:
         self.broker_suspend_max_time_millis = 20000
         self.pull_interval_millis = 50  # 队尾空轮询时的退避，避免空转打爆 broker
         self.pull_thread_nums = 1
+        # Java DefaultLitePullConsumer.topicMetadataCheckIntervalMillis（:160，默认 30s）：
+        # 后台比对 register_topic_message_queue_change_listener 注册 topic 的队列集合的周期。
+        self.topic_metadata_check_interval_millis = 30 * 1000
 
         # 运行状态
         self._mq_client: Optional[MQClientInstance] = None
@@ -4138,6 +4153,13 @@ class DefaultLitePullConsumer:
         # （Java 的 ReadOffsetType.MEMORY_FIRST_THEN_STORE）。
         self._offset_table: Dict[MessageQueue, int] = {}
         self._seek_offset: Dict[MessageQueue, int] = {}
+        # topic 队列集合变更监听器（Java Impl:144 topicMessageQueueChangeListenerMap +
+        # :146 messageQueuesForTopic）：键是**已套命名空间**的 topic，与 Java
+        # DefaultLitePullConsumer:327 的 withNamespace(topic) 一致，回调也收到这个键。
+        self._topic_change_listeners: Dict[str, TopicMessageQueueChangeListener] = {}
+        self._message_queues_for_topic: Dict[str, Set[MessageQueue]] = {}
+        self._topic_listener_lock = threading.Lock()
+        self._metadata_thread: Optional[threading.Thread] = None
         # Java DefaultLitePullConsumerImpl.nextAutoCommitDeadline：初值 -1 ⇒ 第一次 poll 就提交一次。
         self._next_auto_commit_deadline = -1
         self._paused: Set[MessageQueue] = set()
@@ -4220,6 +4242,14 @@ class DefaultLitePullConsumer:
 
     def set_pull_interval_millis(self, ms: int) -> None:
         self.pull_interval_millis = max(0, int(ms))
+
+    def set_topic_metadata_check_interval_millis(self, ms: int) -> None:
+        # 与 cpp 同款下限 1s：Java 没有下限，但 0/负数会让 scheduleAtFixedRate 直接抛
+        # IllegalArgumentException，这里退化成最快 1s 一趟。
+        self.topic_metadata_check_interval_millis = max(1000, int(ms))
+
+    def get_topic_metadata_check_interval_millis(self) -> int:
+        return self.topic_metadata_check_interval_millis
 
     def set_allocate_message_queue_strategy(self, strategy) -> None:
         self.allocate_message_queue_strategy = strategy
@@ -4339,6 +4369,12 @@ class DefaultLitePullConsumer:
             target=self._pull_service_loop, daemon=True,
             name="rmq-lite-pull-%s" % self.consumer_group)
         self._pull_thread.start()
+        # Java Impl.start() → startScheduleTask()：队列集合变更的周期比对线程，
+        # 与有没有注册监听器无关（Java 也照起）。
+        self._metadata_thread = threading.Thread(
+            target=self._metadata_loop, daemon=True,
+            name="rmq-lite-metadata-%s" % self.consumer_group)
+        self._metadata_thread.start()
 
     def _refresh_route_for_heartbeat(self) -> None:
         """为心跳准备 broker 地址：拉取并登记本实例关注的 topic 路由。"""
@@ -4372,6 +4408,8 @@ class DefaultLitePullConsumer:
             self._buffer_cond.notify_all()
         if self._pull_thread is not None:
             self._pull_thread.join(timeout=2.0)
+        if self._metadata_thread is not None:
+            self._metadata_thread.join(timeout=2.0)
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=2.0)
         if self._mq_client is not None:
@@ -4796,9 +4834,38 @@ class DefaultLitePullConsumer:
         return list(self._assigned)
 
     def fetch_message_queues(self, topic: str) -> List[MessageQueue]:
-        # Java DefaultLitePullConsumerImpl#fetchMessageQueues:1224 →
-        # MQAdminImpl#fetchSubscribeMessageQueues:169（订阅信息：读位、不筛 master）
-        return self._mq_client.get_topic_subscribe_info(self._with_namespace(topic))
+        # Java DefaultLitePullConsumer#fetchMessageQueues 的入口套命名空间（:325-327），
+        # Impl 这一层不再套 —— 见 _fetch_message_queues_by_full_name。
+        return self._fetch_message_queues_by_full_name(self._with_namespace(topic))
+
+    def _fetch_message_queues_by_full_name(self, full_topic: str) -> List[MessageQueue]:
+        """按**已套好命名空间**的 topic 全名取订阅队列集合。
+
+        对应 Java DefaultLitePullConsumerImpl#fetchMessageQueues:1224 →
+        MQAdminImpl#fetchSubscribeMessageQueues:169-183（订阅信息：读位、不筛 master）。
+        ⚠ 两件事必须在这里做对，否则队列变更监听会静默失真：
+        1. 入参已是全名。Java 的 withNamespace 发生在外层 DefaultLitePullConsumer:325-327，
+           Impl 这一层直接拿 map key 去查（:1234）；本端口的 ``NamespaceUtil`` 与 Java 一样
+           幂等（已带前缀原样返回），所以按全名取只是省掉一次无谓重拼，并把分层写清楚。
+        2. 每轮都直接问 nameserver，**不吃 30s 周期刷新的路由缓存**。
+           少了强制刷新，扩容最快也要等一次路由轮询才看得见，监听回调就滞后一个
+           周期（默认 30s+30s）。
+        3. 空队列集一律当"查不到"抛错，不返回空列表：返回空会被监听器读成"这个 topic
+           缩到 0 队列"，于是 nameserver 抖动 = 一次假缩容回调 + 快照被清空。
+        """
+        if self._mq_client is None:
+            raise MQClientException("consumer not started, call start() first")
+        try:
+            self._mq_client.update_topic_route_info_from_name_server(full_topic)
+        except Exception as e:  # noqa: BLE001
+            # 拉不到就用当下缓存再判一次：缓存里还有路由时不该把瞬时网络抖动报成
+            # "这个 topic 没队列"（Java 的 fetch 失败会被外层 catch 成一条 error 日志）。
+            logger.debug("fetch queues: route refresh for %s failed: %s", full_topic, e)
+        queues = self._mq_client.get_topic_subscribe_info(full_topic)
+        if not queues:
+            raise MQClientException("Can not find Message Queue for this topic, "
+                                    + full_topic + " Namesrv return empty")
+        return queues
 
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:
         return self.fetch_message_queues(topic)
@@ -4808,6 +4875,85 @@ class DefaultLitePullConsumer:
 
     def resume(self, message_queues) -> None:
         self._paused -= set(message_queues)
+
+    # ---------------- topic 队列集合变更监听 ----------------
+    def register_topic_message_queue_change_listener(
+            self, topic: str, listener: TopicMessageQueueChangeListener) -> None:
+        """对应 Java registerTopicMessageQueueChangeListener（DefaultLitePullConsumer:325 →
+        Impl:1267-1279）：后台任务按 ``topic_metadata_check_interval_millis`` 拉取该 topic 的
+        订阅队列集合，与上一次快照做集合相等比对，**有变化**才回调 ``on_changed``。
+
+        与 Java 逐条对齐：
+        * topic/listener 为空 → 抛 ``MQClientException("Topic or listener is null")``；
+        * 重复注册同一 topic → 覆盖旧监听器并 warn 一条（Java :1272）；
+        * 键取 ``withNamespace(topic)``（Java :327 在入口就套好），回调收到的也是它；
+        * 运行中注册立刻记一版快照（:1275-1277），否则首轮比对会把"当前集合"误报成变化。
+        """
+        if not topic or listener is None:
+            raise MQClientException("Topic or listener is null")
+        ns = self._with_namespace(topic)
+        with self._topic_listener_lock:
+            if ns in self._topic_change_listeners:
+                logger.warning("Topic %s had been registered, new listener will "
+                               "overwrite the old one", ns)
+            self._topic_change_listeners[ns] = listener
+            started = self._started
+        if started:
+            try:
+                self._message_queues_for_topic[ns] = set(
+                    self._fetch_message_queues_by_full_name(ns))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("register listener: fetch queues for %s failed: %s", ns, e)
+
+    def fetch_topic_message_queues_and_compare(self) -> int:
+        """对应 Java Impl#fetchTopicMessageQueuesAndCompare:1230-1244，返回回调次数。
+
+        ⚠ 与 Java 的一处**有意差别**：Java 的 catch 在 startScheduleTask 的包装层
+        （Impl:382-393），所以一个 topic 取路由失败会放弃**本轮其余 topic**；本端口把
+        catch 收进循环体，只跳过那一个 topic，避免一个长期无路由的 topic 把排在它后面的
+        监听器永久饿死（Java 里 HashMap 顺序决定谁被饿死）。快照仍只在"真的取到"之后推进。
+        """
+        with self._topic_listener_lock:
+            entries = list(self._topic_change_listeners.items())
+        fired = 0
+        for ns, listener in entries:
+            try:
+                new_queues = set(self._fetch_message_queues_by_full_name(ns))
+                old_queues = self._message_queues_for_topic.get(ns)
+                if self._is_set_equal(new_queues, old_queues):
+                    continue
+                self._message_queues_for_topic[ns] = new_queues
+                listener.on_changed(ns, new_queues)
+                fired += 1
+            except Exception as e:  # noqa: BLE001
+                logger.error("ScheduledTask fetchMessageQueuesAndCompare exception: %s", e)
+        return fired
+
+    @staticmethod
+    def _is_set_equal(set1: Optional[Set[MessageQueue]],
+                      set2: Optional[Set[MessageQueue]]) -> bool:
+        # Java Impl#isSetEqual:1246-1260 逐条照搬：双 None 才算相等，
+        # 单边 None 或数量不等直接不等，最后逐元素包含。
+        if set1 is None and set2 is None:
+            return True
+        if set1 is None or set2 is None or len(set1) != len(set2):
+            return False
+        return all(mq in set1 for mq in set2)
+
+    def _metadata_loop(self, first_delay_millis: float = 10000) -> None:
+        # Java startScheduleTask（Impl:382-393）：启动后 10s 首查，此后每
+        # topicMetadataCheckIntervalMillis 一趟。首查延迟做成入参只为单测能缩短等待，
+        # 默认值仍是 Java 的 10s。
+        deadline = time.monotonic() + first_delay_millis / 1000.0
+        while self._running:
+            time.sleep(0.2)
+            if not self._running:
+                return
+            now = time.monotonic()
+            if now < deadline:
+                continue
+            deadline = now + self.topic_metadata_check_interval_millis / 1000.0
+            self.fetch_topic_message_queues_and_compare()
 
 
 class SimpleMessageListener(MessageListenerConcurrently):
@@ -4823,7 +4969,8 @@ class SimpleMessageListener(MessageListenerConcurrently):
 
 __all__ = [
     "DefaultMQPushConsumer", "DefaultMQPullConsumer", "MessageSelector",
-    "MessageQueueListener", "AllocateMessageQueueStrategy",
+    "MessageQueueListener", "TopicMessageQueueChangeListener",
+    "AllocateMessageQueueStrategy",
     "AllocateMessageQueueAveragely", "AllocateMessageQueueAveragelyByCircle",
     "AllocateMessageQueueByConfig", "AllocateMessageQueueConsistentHash",
     "AllocateMessageQueueByMachineRoom", "AllocateMachineRoomNearby",

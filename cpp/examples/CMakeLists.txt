@@ -54,6 +54,10 @@ target_link_libraries(rmq_live_lite_pull_cursor PRIVATE rocketmq::remoting)
 add_executable(rmq_live_lite_pull_code live_lite_pull_code.cpp)
 target_link_libraries(rmq_live_lite_pull_code PRIVATE rocketmq::remoting)
 
+# lite-pull topic 队列集合变更监听真机验证（检查周期 1s + 真实扩缩容 ⇒ 证明比对趟次现查路由）
+add_executable(rmq_live_lite_topic_queue_change live_lite_topic_queue_change.cpp)
+target_link_libraries(rmq_live_lite_topic_queue_change PRIVATE rocketmq::remoting)
+
 # Request-Reply（5.x）真机联调（请求 → 应答 → 326 推回；不打进 ctest）
 add_executable(rmq_live_request_reply live_rr.cpp)
 target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)

@@ -111,6 +111,8 @@ const LITE_REBALANCE_INTERVAL_MILLIS: i64 = 1_000;
 pub const MAX_POLL_BATCH_SIZE: usize = 1024;
 /// Python lite 心跳的 RPC 超时同上，此处仅为可读性命名。
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
+/// Java `startScheduleTask` 的首查延迟（`scheduleAtFixedRate(.., 1000 * 10, period)`）。
+const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
 
 /// Python 经典拉模式消费者的心跳循环间隔（`consumer.heartbeat_interval_millis`，
 /// `consumer.py:870`，默认 30000ms；与 Java 实例级 `sendHeartbeatToAllBrokerWithLock`
@@ -147,6 +149,17 @@ fn with_namespace(namespace: &str, topic: &str) -> String {
     } else {
         NamespaceUtil::wrap_namespace(namespace, topic)
     }
+}
+
+/// 队列集合相等判定，对应 Java
+/// `DefaultLitePullConsumerImpl#isSetEqual:1246-1260`：先比数量，再逐个元素查旧集。
+/// 队列身份用 [`mq_key`]（`topic+brokerName+queueId`），与本文件其余表同口径。
+fn same_queue_set(old: &[MessageQueue], new: &[MessageQueue]) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    let old_set: BTreeSet<String> = old.iter().map(mq_key).collect();
+    new.iter().all(|mq| old_set.contains(&mq_key(mq)))
 }
 
 /// 拉取请求的 sysFlag（Python `pull` = `suspend=False`、`pull_block_if_not_found` =
@@ -1267,6 +1280,11 @@ pub struct LitePullConsumerConfig {
     /// Python `pull_thread_nums` = 1：**本实现恒为单拉取循环**（与四门语言一致），
     /// 字段只为配置形状保留。
     pub pull_thread_nums: i32,
+    /// Java `DefaultLitePullConsumer.topicMetadataCheckIntervalMillis`（:160，默认 30s）：
+    /// 后台比对 [`register_topic_message_queue_change_listener`] 注册 topic 的队列集合的周期。
+    ///
+    /// [`register_topic_message_queue_change_listener`]: DefaultLitePullConsumer::register_topic_message_queue_change_listener
+    pub topic_metadata_check_interval_millis: i64,
 }
 
 impl Default for LitePullConsumerConfig {
@@ -1295,6 +1313,7 @@ impl Default for LitePullConsumerConfig {
             broker_suspend_max_time_millis: DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS,
             pull_interval_millis: 50,
             pull_thread_nums: 1,
+            topic_metadata_check_interval_millis: 30_000,
         }
     }
 }
@@ -1368,6 +1387,11 @@ struct LiteInner {
     /// Python `_local_buffer` + `_buffer_cond`。
     buffer: Mutex<VecDeque<MessageExt>>,
     buffer_signal: Notify,
+    /// Java `DefaultLitePullConsumerImpl:144` topicMessageQueueChangeListenerMap +
+    /// `:146` messageQueuesForTopic：监听器按 topic 键存放，快照表记录上一轮报出去的
+    /// 队列集合（键集变化才回调）。
+    topic_listeners: Mutex<BTreeMap<String, Arc<dyn TopicMessageQueueChangeListener>>>,
+    queues_for_topic: Mutex<BTreeMap<String, Vec<MessageQueue>>>,
 }
 
 impl Default for LiteInner {
@@ -1386,6 +1410,8 @@ impl Default for LiteInner {
             rpc_hook: RwLock::new(None),
             buffer: Mutex::new(VecDeque::new()),
             buffer_signal: Notify::new(),
+            topic_listeners: Mutex::new(BTreeMap::new()),
+            queues_for_topic: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -1400,6 +1426,16 @@ impl Drop for LiteInner {
             task.abort();
         }
     }
+}
+
+/// 对应 Java `consumer.TopicMessageQueueChangeListener`：topic 的队列**集合**相对
+/// 上一次快照有变化时才回调（扩/缩容场景）。Java 的
+/// `DefaultLitePullConsumerImpl#fetchTopicMessageQueuesAndCompare:1230` 每
+/// `topicMetadataCheckIntervalMillis` 比对一次，本端口同款。
+pub trait TopicMessageQueueChangeListener: Send + Sync {
+    /// Java `onChanged(String topic, Set<MessageQueue>)`。`topic` 就是注册监听器时
+    /// 用的那个键（Java `DefaultLitePullConsumer:327` 在入口就 `withNamespace`）。
+    fn on_changed(&self, topic: &str, message_queues: &[MessageQueue]);
 }
 
 /// 轻量拉取消费者（对应 Java `DefaultLitePullConsumer`，移植自 Python
@@ -2049,6 +2085,11 @@ impl DefaultLitePullConsumer {
             self.inner.stop.subscribe(),
             pull_service_loop,
         )));
+        tasks.push(handle.spawn(Self::run_guarded(
+            Arc::downgrade(&self.inner),
+            self.inner.stop.subscribe(),
+            metadata_loop,
+        )));
     }
 
     async fn run_guarded<F, Fut>(weak: Weak<LiteInner>, stop: watch::Receiver<bool>, make: F)
@@ -2438,14 +2479,30 @@ impl DefaultLitePullConsumer {
         lock(&self.inner.state).assigned.values().cloned().collect()
     }
 
-    /// Python `fetch_message_queues`：拼命名空间后按**订阅信息**列队列。
+    /// 该 topic 的全部可消费队列（订阅口径：读位、不筛 master），topic 按命名空间拼好后查。
     ///
-    /// Java `DefaultLitePullConsumerImpl.fetchMessageQueues:1224` →
-    /// `MQAdminImpl.fetchSubscribeMessageQueues:169`（订阅信息：读位、不筛 master）。
+    /// 两件事必须一起做对，否则队列变更监听静默失真：
+    /// 1. **每轮现问 name server**，不吃周期刷新的路由缓存；少了这一步，扩容最快也要等
+    ///    一次路由轮询才看得见（监听回调比预期慢一个周期）。
+    /// 2. 空队列集是**报错**，不是返回空表 —— "查不到" ≠ "这个 topic 缩到 0 队列"，
+    ///    后者会让监听器收到一次假缩容回调并把快照刷成空集。
     pub async fn fetch_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = Self::require_client(&self.inner)?;
         let topic = with_namespace(&self.config().namespace, topic);
-        Ok(client.get_topic_subscribe_info(&topic).await)
+        if let Err(e) = client
+            .update_topic_route_info_from_name_server(&topic, LITE_PULL_RPC_TIMEOUT_MILLIS, false)
+            .await
+        {
+            rmq_debug!("fetch queues: route refresh for {} failed: {}", topic, e);
+        }
+        let queues = client.get_topic_subscribe_info(&topic).await;
+        if queues.is_empty() {
+            return Err(Error::client(format!(
+                "Can not find Message Queue for this topic, {} Namesrv return empty",
+                topic
+            )));
+        }
+        Ok(queues)
     }
 
     /// Python `fetch_subscribe_message_queues`（lite 版 = `fetch_message_queues`）。
@@ -2467,6 +2524,108 @@ impl DefaultLitePullConsumer {
         for mq in message_queues {
             state.paused.remove(&mq_key(mq));
         }
+    }
+
+    /// Java `DefaultLitePullConsumer.setTopicMetadataCheckIntervalMillis:563`。
+    /// Java 没有下限，但 0 会让 `scheduleAtFixedRate` 抛，本端口与 cpp/python 同款
+    /// 夹到 1s。
+    pub fn set_topic_metadata_check_interval_millis(&self, millis: i64) {
+        self.update_config(|c| c.topic_metadata_check_interval_millis = millis.max(1000));
+    }
+
+    /// 当前比对周期（毫秒）。
+    pub fn topic_metadata_check_interval_millis(&self) -> i64 {
+        self.config().topic_metadata_check_interval_millis
+    }
+
+    /// 对应 Java `registerTopicMessageQueueChangeListener`（`DefaultLitePullConsumer:325` →
+    /// `DefaultLitePullConsumerImpl:1267-1279`）：登记一个 topic 的队列集合变更监听器，
+    /// 后台循环（启动后 10s 首查、此后每 `topic_metadata_check_interval_millis` 一趟）
+    /// 比对队列**集合**，有变化才回调 [`TopicMessageQueueChangeListener::on_changed`]。
+    ///
+    /// 与 Java 逐条对齐：
+    /// * topic 为空或监听器为空 → 报错（Java 抛 `MQClientException("Topic or listener is null")`）；
+    /// * 重复注册同一 topic → 覆盖旧监听器并 warn 一条（`:1272`）；
+    /// * 键取套好命名空间的 topic（Java `:327` 在入口就 `withNamespace`），回调收到的也是它；
+    /// * 已启动时立刻记一版快照（`:1275-1277`），否则首轮会把"当前集合"误报成变化。
+    pub async fn register_topic_message_queue_change_listener(
+        &self,
+        topic: &str,
+        listener: Arc<dyn TopicMessageQueueChangeListener>,
+    ) -> Result<()> {
+        if topic.trim().is_empty() {
+            return Err(Error::client("Topic or listener is null"));
+        }
+        let key = with_namespace(&self.config().namespace, topic);
+        {
+            let mut listeners = lock(&self.inner.topic_listeners);
+            if listeners.insert(key.clone(), listener).is_some() {
+                rmq_warn!(
+                    "Topic {} had been registered, new listener will overwrite the old one",
+                    key
+                );
+            }
+        }
+        if !self.inner.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.fetch_message_queues(topic).await {
+            Ok(queues) => {
+                lock(&self.inner.queues_for_topic).insert(key, queues);
+            }
+            Err(e) => rmq_debug!(
+                "register listener: fetch queues for {} failed: {}",
+                key,
+                e
+            ),
+        }
+        Ok(())
+    }
+
+    /// 跑一轮比对（后台循环调它，测试与调用方也可以直接驱动），返回回调触发了几次。
+    ///
+    /// ⚠ 有意做法：单个 topic 失败只记日志、跳过它自己，同轮其余 topic 照常比对。
+    /// 一个长期查不到路由的 topic 不该把排在它后面的监听器永久饿死；下一轮照常，
+    /// 两种写法都不打断调度。
+    pub async fn fetch_topic_message_queues_and_compare(&self) -> usize {
+        let entries: Vec<(String, Arc<dyn TopicMessageQueueChangeListener>)> = lock(
+            &self.inner.topic_listeners,
+        )
+        .iter()
+        .map(|(t, l)| (t.clone(), l.clone()))
+        .collect();
+        let mut fired = 0usize;
+        for (key, listener) in entries {
+            let queues = match self.fetch_message_queues(&key).await {
+                Ok(q) => q,
+                Err(e) => {
+                    rmq_error!(
+                        "ScheduledTask fetchMessageQueuesAndCompare for {} failed: {}",
+                        key,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let changed = {
+                let mut snapshots = lock(&self.inner.queues_for_topic);
+                let changed = match snapshots.get(&key) {
+                    // 没有快照 = Java 的 `oldSet == null`：`fetchMessageQueues` 永远回
+                    // 一个非 null 集合，所以 isSetEqual 必判不等 ⇒ 首轮一定回调一次。
+                    None => true,
+                    Some(old) => !same_queue_set(old, &queues),
+                };
+                if changed {
+                    snapshots.insert(key.clone(), queues.clone());
+                }
+                changed
+            };
+            if changed {
+                listener.on_changed(&key, &queues);
+                fired += 1;
+            }
+        }
+        fired
     }
 
     /// 本地缓冲当前条数（Python 直接读 `len(_local_buffer)`；测试与观测用）。
@@ -2858,6 +3017,38 @@ async fn heartbeat_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
         }
         send_lite_heartbeat(&inner).await;
         if wait_or_stop(&mut rx, LITE_HEARTBEAT_INTERVAL_MILLIS).await {
+            return;
+        }
+    }
+}
+
+/// 启动后 10s 首查，此后每 `topic_metadata_check_interval_millis` 一趟比对队列集合变更。
+async fn metadata_loop(inner: Arc<LiteInner>, rx: watch::Receiver<bool>) {
+    metadata_loop_after(&inner, rx, LITE_METADATA_FIRST_DELAY_MILLIS).await;
+}
+
+/// `metadata_loop` 但首查延迟可注入，单测用它把 10s 缩成几十毫秒。
+///
+/// ⚠ 首查延迟只在**第一趟之前**生效。把它留在循环里，每趟都会先等满 10s，
+/// 1s 的检查周期会被拖成 11s —— 扩容后监听器要晚一个数量级才动。
+async fn metadata_loop_after(
+    inner: &Arc<LiteInner>,
+    mut rx: watch::Receiver<bool>,
+    first_delay_millis: u64,
+) {
+    let consumer = DefaultLitePullConsumer {
+        inner: inner.clone(),
+    };
+    if wait_or_stop(&mut rx, first_delay_millis).await {
+        return;
+    }
+    while inner.running.load(Ordering::Acquire) {
+        consumer.fetch_topic_message_queues_and_compare().await;
+        let period = consumer
+            .config()
+            .topic_metadata_check_interval_millis
+            .max(1000) as u64;
+        if wait_or_stop(&mut rx, period).await {
             return;
         }
     }
@@ -3619,7 +3810,8 @@ mod tests {
         broker_name: String,
         master_addr: String,
         slave_addr: String,
-        read_queues: i32,
+        read_queues: Arc<std::sync::atomic::AtomicI32>,
+        seen: Arc<Mutex<Vec<String>>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -3629,7 +3821,8 @@ mod tests {
                 let broker_name = broker_name.clone();
                 let master = master_addr.clone();
                 let slave = slave_addr.clone();
-                let read_queues = read_queues;
+                let read_queues = read_queues.clone();
+                let seen = seen.clone();
                 tokio::spawn(async move {
                     while let Some(frame) = read_frame(&mut stream).await {
                         let Ok(request) = RemotingCommand::decode(&frame) else {
@@ -3637,11 +3830,18 @@ mod tests {
                         };
                         let mut response = answer_for(&request, response_code::SUCCESS);
                         if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
+                            // 每笔请求现读：用例中途改队列数（扩缩容）必须能被下一轮
+                            // 路由刷新看到，否则测不到"集合变了"。
+                            let topic = request
+                                .get_ext_field("topic")
+                                .unwrap_or_default()
+                                .to_string();
+                            lock(&seen).push(topic);
                             response.set_body(Some(route_body(
                                 &broker_name,
                                 &master,
                                 &slave,
-                                read_queues,
+                                read_queues.load(std::sync::atomic::Ordering::Acquire),
                             )));
                         }
                         write_frame(&mut stream, &mut response).await;
@@ -3938,11 +4138,29 @@ mod tests {
         master: Arc<FakeBroker>,
         slave: Arc<FakeBroker>,
         tasks: Vec<JoinHandle<()>>,
+        /// 假 namesrv 现读这个值出路由：改它就是"topic 扩缩容"。
+        read_queues: Arc<std::sync::atomic::AtomicI32>,
+        /// 假 namesrv 收到过的每一笔路由查询（按到达顺序，含重复）。
+        ns_route_queries: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakePullCluster {
         async fn start() -> FakePullCluster {
             FakePullCluster::start_queues(1).await
+        }
+
+        /// 把路由里的读队列数改成 `n`（扩/缩容），下一次路由刷新即可见。
+        fn scale_to(&self, n: i32) {
+            self.read_queues.store(n, std::sync::atomic::Ordering::Release);
+        }
+
+        /// 丢弃已记录的路由查询，之后的断言只看着"这一趟"。
+        fn clear_route_queries(&self) {
+            lock(&self.ns_route_queries).clear();
+        }
+
+        fn route_queries(&self) -> Vec<String> {
+            lock(&self.ns_route_queries).clone()
         }
 
         /// 主从两台的 38 应答内容一起设：查询打哪台由路由决定，用例不该关心这个细节。
@@ -3960,18 +4178,23 @@ mod tests {
                 .expect("bind 假 namesrv");
             let namesrv_addr = listener.local_addr().expect("假 namesrv 地址").to_string();
             let broker_name = "broker-a".to_string();
+            let read_queues = Arc::new(std::sync::atomic::AtomicI32::new(read_queues));
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
             let task = spawn_fake_namesrv(
                 listener,
                 broker_name,
                 master.addr.clone(),
                 slave.addr.clone(),
-                read_queues,
+                read_queues.clone(),
+                seen.clone(),
             );
             FakePullCluster {
                 namesrv_addr,
                 master,
                 slave,
                 tasks: vec![task],
+                read_queues,
+                ns_route_queries: seen,
             }
         }
     }
@@ -4716,5 +4939,310 @@ mod tests {
             err.to_string().contains("not started"),
             "报的是未启动：{err}"
         );
+    }
+
+    // ---------------------- lite 的 topic 队列集合变更监听器
+    //
+    // Java `registerTopicMessageQueueChangeListener`（`DefaultLitePullConsumer:325` →
+    // `DefaultLitePullConsumerImpl:1267`）此前整个端口都没有。用例钉的是它的契约：
+    // 入参守卫、注册即快照（只在 RUNNING）、集合相等才判"没变"、重复注册覆盖、
+    // 后台循环真的在比对。
+
+    /// 收集 `on_changed` 的监听器（队列 id 排序后存下来，比对与顺序无关）。
+    struct RecordingQueueListener {
+        events: Arc<Mutex<Vec<(String, Vec<i32>)>>>,
+    }
+
+    impl RecordingQueueListener {
+        fn new() -> (Arc<Self>, Arc<Mutex<Vec<(String, Vec<i32>)>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(RecordingQueueListener {
+                    events: events.clone(),
+                }),
+                events,
+            )
+        }
+    }
+
+    impl TopicMessageQueueChangeListener for RecordingQueueListener {
+        fn on_changed(&self, topic: &str, message_queues: &[MessageQueue]) {
+            let mut ids: Vec<i32> = message_queues.iter().map(|q| q.queue_id).collect();
+            ids.sort_unstable();
+            lock(&self.events).push((topic.to_string(), ids));
+        }
+    }
+
+    /// 起一个 subscribe 模式的 lite 消费者（与 `started_lite` 的 assign 版不同：
+    /// 队列集合变更监听只在 subscribe 模式下有意义）。
+    async fn started_lite_subscribe(
+        instance: &str,
+        group: &str,
+        cluster: &FakePullCluster,
+        topic: &str,
+    ) -> DefaultLitePullConsumer {
+        let c = DefaultLitePullConsumer::new(group).expect("组名合法");
+        c.set_instance_name(instance);
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.subscribe(topic, "*");
+        c.start().await.expect("假集群里 start 应当成功");
+        c
+    }
+
+    /// 强制刷一次路由：`get_topic_subscribe_info` 读的是缓存，改完假 namesrv 的
+    /// 队列数必须刷一次才看得到。
+    async fn refresh_route(c: &DefaultLitePullConsumer, topic: &str) {
+        let client = DefaultLitePullConsumer::require_client(&c.inner).expect("已启动");
+        client
+            .update_topic_route_info_from_name_server(topic, 3000, false)
+            .await
+            .expect("路由刷新应当成功");
+    }
+
+    #[test]
+    fn same_queue_set_matches_java_is_set_equal() {
+        let q = |id: i32| queue("T", "broker-a", id);
+        assert!(!same_queue_set(&[], &[q(0)]), "数量不等即变化");
+        assert!(same_queue_set(&[q(0), q(1)], &[q(1), q(0)]), "集合与顺序无关");
+        assert!(!same_queue_set(&[q(0), q(1)], &[q(0), q(2)]), "同数量不同成员是变化");
+        assert!(same_queue_set(&[q(0)], &[q(0)]));
+    }
+
+    #[tokio::test]
+    async fn queue_change_listener_guards_and_interval() {
+        let c = DefaultLitePullConsumer::new("LiteQC_Guard").expect("组名合法");
+        let (listener, _) = RecordingQueueListener::new();
+        let err = c
+            .register_topic_message_queue_change_listener("  ", listener)
+            .await
+            .expect_err("空 topic 必须报错（Java 抛 MQClientException）");
+        assert!(
+            err.to_string().contains("Topic or listener is null"),
+            "报的是 Java 那句：{err}"
+        );
+        // Java DefaultLitePullConsumer:160 默认 30s
+        assert_eq!(c.topic_metadata_check_interval_millis(), 30_000);
+        c.set_topic_metadata_check_interval_millis(0);
+        assert_eq!(c.topic_metadata_check_interval_millis(), 1_000, "夹到 1s 下限");
+        c.set_topic_metadata_check_interval_millis(2_500);
+        assert_eq!(c.topic_metadata_check_interval_millis(), 2_500);
+    }
+
+    #[tokio::test]
+    async fn queue_change_listener_reports_scale_out_and_scale_in() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = started_lite_subscribe("lite_qc_scale", "LiteQC_Scale", &cluster, "T").await;
+
+        let (listener, events) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", listener)
+            .await
+            .expect("注册成功");
+        // 运行中注册立刻记快照 ⇒ 首轮不许把"现状"报成变化
+        assert_eq!(
+            c.fetch_topic_message_queues_and_compare().await,
+            0,
+            "注册即快照，未变化不该回调"
+        );
+        assert!(lock(&events).is_empty());
+
+        cluster.scale_to(4); // 扩容：比对那一趟自己会去问 nameserver
+        assert_eq!(
+            c.fetch_topic_message_queues_and_compare().await,
+            1,
+            "扩容必须回调一次"
+        );
+        assert_eq!(
+            c.fetch_topic_message_queues_and_compare().await,
+            0,
+            "同一集合不得重复回调"
+        );
+
+        cluster.scale_to(1); // 缩容
+        assert_eq!(
+            c.fetch_topic_message_queues_and_compare().await,
+            1,
+            "缩容同样要回调"
+        );
+        assert_eq!(
+            *lock(&events),
+            vec![("T".to_string(), vec![0, 1, 2, 3]), ("T".to_string(), vec![0])],
+            "回调收到的是变化后的完整队列集合"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queue_change_listener_before_start_defers_snapshot() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = DefaultLitePullConsumer::new("LiteQC_Pre").expect("组名合法");
+        c.set_instance_name("lite_qc_pre");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.subscribe("T", "*");
+        let (listener, events) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", listener)
+            .await
+            .expect("未启动也能注册");
+        assert!(
+            lock(&c.inner.queues_for_topic).is_empty(),
+            "未启动不记快照（Java 只在 RUNNING 记）"
+        );
+
+        c.start().await.expect("start 成功");
+        assert_eq!(
+            c.fetch_topic_message_queues_and_compare().await,
+            1,
+            "没有快照 ⇒ 首轮一定报一次"
+        );
+        assert_eq!(*lock(&events), vec![("T".to_string(), vec![0, 1])]);
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queue_change_listener_reregistration_overwrites() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_lite_subscribe("lite_qc_dup", "LiteQC_Dup", &cluster, "T").await;
+        let (first, first_events) = RecordingQueueListener::new();
+        let (second, second_events) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", first)
+            .await
+            .expect("首次注册");
+        c.register_topic_message_queue_change_listener("T", second)
+            .await
+            .expect("重复注册：覆盖旧监听器并 warn");
+        assert_eq!(lock(&c.inner.topic_listeners).len(), 1, "同一 topic 只留一个监听器");
+
+        cluster.scale_to(3);
+        assert_eq!(c.fetch_topic_message_queues_and_compare().await, 1);
+        assert!(lock(&first_events).is_empty(), "被覆盖的监听器不该再收");
+        assert_eq!(lock(&second_events).len(), 1, "现监听器收到回调");
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queue_change_metadata_loop_actually_compares() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_lite_subscribe("lite_qc_loop", "LiteQC_Loop", &cluster, "T").await;
+        let (listener, events) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", listener)
+            .await
+            .expect("注册");
+
+        cluster.scale_to(2);
+        // 首查延迟注入成 50ms（默认 10s），周期 100ms
+        let inner = c.inner.clone();
+        let stop = c.inner.stop.subscribe();
+        let task = tokio::spawn(async move {
+            metadata_loop_after(&inner, stop, 50).await;
+        });
+        wait_until(
+            || !lock(&events).is_empty(),
+            "后台循环应当自己跑出一轮比对",
+        )
+        .await;
+        assert_eq!(lock(&events)[0].1, vec![0, 1]);
+        c.inner.running.store(false, Ordering::Release);
+        let _ = c.inner.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        c.shutdown();
+    }
+
+    /// 首查延迟只该作用在**第一趟之前**：留在循环里就等于每趟都「首查 + 周期」，
+    /// 1s 的周期会被拖成 4s，扩容后的回调慢一个数量级。
+    #[tokio::test]
+    async fn queue_change_metadata_period_excludes_the_first_delay() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_lite_subscribe("lite_qc_period", "LiteQC_Period", &cluster, "T").await;
+        let (listener, events) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", listener)
+            .await
+            .expect("注册");
+        // 周期写 0 也会被夹到 1s 下限，所以这里的首查延迟取得比周期大得多
+        c.set_topic_metadata_check_interval_millis(0);
+        let inner = c.inner.clone();
+        let stop = c.inner.stop.subscribe();
+        let task = tokio::spawn(async move {
+            metadata_loop_after(&inner, stop, 3000).await;
+        });
+
+        cluster.scale_to(2);
+        wait_until(|| !lock(&events).is_empty(), "第一趟要抓到扩容").await;
+
+        cluster.scale_to(3);
+        let second = tokio::time::timeout(
+            Duration::from_millis(1500),
+            wait_until(|| lock(&events).len() >= 2, "第二趟要抓到再次扩容"),
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "检查周期里混进了首查延迟：每趟都多等 3s"
+        );
+        assert_eq!(lock(&events)[1].1, vec![0, 1, 2]);
+
+        c.inner.running.store(false, Ordering::Release);
+        let _ = c.inner.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        c.shutdown();
+    }
+
+    /// 比对那一趟必须**现问 name server**，而不是读周期刷新的路由缓存：
+    /// 少了这一步，扩容最快也要等一次路由轮询才看得见，监听回调整整慢一个周期。
+    #[tokio::test]
+    async fn queue_change_round_asks_the_nameserver_every_time() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_lite_subscribe("lite_qc_fresh", "LiteQC_Fresh", &cluster, "T").await;
+        let (listener, _) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", listener)
+            .await
+            .expect("注册");
+
+        cluster.clear_route_queries();
+        c.fetch_topic_message_queues_and_compare().await;
+        let first = cluster.route_queries();
+        assert!(!first.is_empty(), "一趟比对至少问一次路由：{first:?}");
+        assert!(
+            first.iter().all(|t| t == "T"),
+            "问的就是这个 topic：{first:?}"
+        );
+
+        cluster.clear_route_queries();
+        c.fetch_topic_message_queues_and_compare().await;
+        let second = cluster.route_queries();
+        assert!(
+            !second.is_empty(),
+            "下一趟还得再问一次（吃缓存就测不出变化）"
+        );
+        c.shutdown();
+    }
+
+    /// 查不到队列 ⇒ **报错**，不是回空表。空表会被比对那一趟读成"这个 topic 缩到 0
+    /// 队列"，于是回调一次假缩容、快照也被刷成空集。
+    #[tokio::test]
+    async fn fetch_message_queues_reports_instead_of_returning_empty() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_lite_subscribe("lite_qc_empty", "LiteQC_Empty", &cluster, "T").await;
+        cluster.scale_to(0); // 路由里一个读队列都不剩
+        let err = c
+            .fetch_message_queues("T")
+            .await
+            .expect_err("没有可用队列时必须报错");
+        assert!(
+            err.to_string()
+                .contains("Can not find Message Queue for this topic"),
+            "报的是「查不到队列」：{err}"
+        );
+        // 监听器那边也不能因为这一次查不到就收到假缩容回调。
+        let (listener, events) = RecordingQueueListener::new();
+        c.register_topic_message_queue_change_listener("T", listener)
+            .await
+            .expect("注册");
+        cluster.clear_route_queries();
+        assert_eq!(
+            c.fetch_topic_message_queues_and_compare().await,
+            0,
+            "查不到队列的那一趟不发回调"
+        );
+        assert!(lock(&events).is_empty(), "没有回调事件");
+        c.shutdown();
     }
 }

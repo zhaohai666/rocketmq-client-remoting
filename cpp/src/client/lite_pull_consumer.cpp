@@ -201,7 +201,10 @@ void DefaultLitePullConsumer::fetchTopicMessageQueuesAndCompare() {
                 kv.second->onChanged(topic, newQueues);
             }
         } catch (const std::exception& e) {
-            // Java startScheduleTask 的 catch 只 log，不打断下一轮
+            // ⚠ 与 Java 的**有意差别**：Java 的 catch 在 startScheduleTask 的包装层
+            // （Impl:382-393），一个 topic 失败会放弃**本轮其余 topic**；本端口把 catch 收进
+            // 循环体，只跳过那一个 —— 免得一个长期无路由的 topic 把排在它后面的监听器永久饿死
+            // （Java 里 HashMap 顺序决定谁被饿死）。下一轮照常，两版都不打断调度。
             logger_warn("ScheduledTask fetchMessageQueuesAndCompare exception: " +
                         std::string(e.what()));
         }
@@ -996,8 +999,25 @@ std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std:
         throw MQClientException("consumer not started, call start() first");
     }
     // Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
-    // MQAdminImpl.fetchSubscribeMessageQueues:169（订阅信息：读位、不筛 master）。
-    return mqClient_->getTopicSubscribeInfo(withNamespace(topic));
+    // MQAdminImpl.fetchSubscribeMessageQueues:169-183（订阅信息：读位、不筛 master）。
+    // 两件事必须一起做对，否则队列变更监听静默失真：
+    // 1. Java :171 **每轮现问 nameserver**，不吃 30s 周期刷新的路由缓存；少了这一步，
+    //    扩容最快也要等一次路由轮询才看得见（监听回调比 Java 慢一个周期）。
+    // 2. Java :177 对空队列集是**抛异常**，不是返回空表 —— "查不到"≠"这个 topic 缩到 0 队列"，
+    //    后者会让监听器收到一次假缩容回调并把快照刷成空集。
+    std::string fullTopic = withNamespace(topic);
+    try {
+        mqClient_->updateTopicRouteInfoFromNameServer(fullTopic);
+    } catch (const std::exception& e) {
+        // 抖动时退回当下缓存再判一次（外层 catch 会把"仍然没队列"报成一条 error 日志）。
+        logger_debug("fetch queues: route refresh for " + fullTopic + " failed: " + e.what());
+    }
+    std::vector<MessageQueue> queues = mqClient_->getTopicSubscribeInfo(fullTopic);
+    if (queues.empty()) {
+        throw MQClientException("Can not find Message Queue for this topic, " + fullTopic +
+                                " Namesrv return empty");
+    }
+    return queues;
 }
 
 std::vector<MessageQueue> DefaultLitePullConsumer::assignment() {

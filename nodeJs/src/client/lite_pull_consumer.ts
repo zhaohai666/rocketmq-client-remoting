@@ -31,6 +31,33 @@ const logger = getLogger('client.lite_pull_consumer');
 
 const DEFAULT_PULL_BATCH_SIZE = 10;
 const DEFAULT_POLL_TIMEOUT_MILLIS = 5000;
+// Java DefaultLitePullConsumer:160 — topicMetadataCheckIntervalMillis default.
+const DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS = 30 * 1000;
+// Java has no floor, but a 0 period makes scheduleAtFixedRate throw
+// IllegalArgumentException; every port that clamps uses 1s (cpp/python/go/rust).
+const MIN_TOPIC_METADATA_CHECK_INTERVAL_MILLIS = 1000;
+// Java DefaultLitePullConsumerImpl.startScheduleTask:382-393 — first check runs
+// 10s after start(), not immediately.
+const METADATA_CHECK_FIRST_DELAY_MILLIS = 1000 * 10;
+
+// Java org.apache.rocketmq.client.consumer.TopicMessageQueueChangeListener:
+// notified ONLY when a topic's queue SET changed (expanded or shrank), with the
+// new set. No change → no callback.
+export interface TopicMessageQueueChangeListener {
+  onChanged(topic: string, messageQueues: MessageQueue[]): void | Promise<void>;
+}
+
+// Java DefaultLitePullConsumerImpl#isSetEqual:1246-1260. "Never saw this topic"
+// (no snapshot) is NOT equal to anything, because fetchMessageQueues always
+// returns a non-null set — so the first round of a freshly registered listener
+// always fires once.
+function isQueueSetEqual(
+  oldQueues: MessageQueue[] | undefined, newQueues: MessageQueue[]): boolean {
+  if (oldQueues === undefined) return false;
+  if (oldQueues.length !== newQueues.length) return false;
+  const oldSet = new Set(oldQueues.map(mqKey));
+  return newQueues.every((mq) => oldSet.has(mqKey(mq)));
+}
 
 export class DefaultLitePullConsumer {
   consumerGroup: string;
@@ -62,6 +89,9 @@ export class DefaultLitePullConsumer {
   // Java DefaultLitePullConsumer default: CONSUME_FROM_LAST_OFFSET — a queue
   // with NO committed offset starts at the broker's max offset.
   consumeFromWhere: string = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET;
+  // Java DefaultLitePullConsumer:160 — how often the background task compares
+  // each watched topic's queue set.
+  topicMetadataCheckIntervalMillis = DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS;
 
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
 
@@ -70,9 +100,17 @@ export class DefaultLitePullConsumer {
   private assignedAuto: MessageQueue[] = [];            // subscribe() mode
   private paused = new Set<string>();
   private pullCursor = new Map<string, number>();       // mqKey -> next pull offset
+  // Java Impl:144/146 — listener per topic + the last queue set seen per topic.
+  // Keyed by the BARE topic like this port's other lite-pull state (subscribe /
+  // route cache / rebalance), because namespaceV2 is applied on the wire by
+  // NamespaceRpcHook rather than by prefixing topic names.
+  private topicChangeListeners = new Map<string, TopicMessageQueueChangeListener>();
+  private messageQueuesForTopic = new Map<string, MessageQueue[]>();
   private started = false;
   private _rebalanceTimer: NodeJS.Timeout | null = null;
   private _autoCommitTimer: NodeJS.Timeout | null = null;
+  private _metadataTimer: NodeJS.Timeout | null = null;
+  private _metadataInitialTimer: NodeJS.Timeout | null = null;
 
   constructor(consumerGroup = 'DEFAULT_CONSUMER') {
     this.consumerGroup = consumerGroup || 'DEFAULT_CONSUMER';
@@ -91,6 +129,15 @@ export class DefaultLitePullConsumer {
   setAutoCommitIntervalMillis(ms: number): this { this.autoCommitIntervalMillis = ms; return this; }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
+
+  // Java DefaultLitePullConsumer#setTopicMetadataCheckIntervalMillis (:160 field).
+  setTopicMetadataCheckIntervalMillis(ms: number): this {
+    this.topicMetadataCheckIntervalMillis =
+      Number.isFinite(ms) && ms >= MIN_TOPIC_METADATA_CHECK_INTERVAL_MILLIS
+        ? Math.floor(ms) : MIN_TOPIC_METADATA_CHECK_INTERVAL_MILLIS;
+    return this;
+  }
+  getTopicMetadataCheckIntervalMillis(): number { return this.topicMetadataCheckIntervalMillis; }
 
   subscribe(topic: string, subExpression = '*'): this {
     if (!topic || !topic.trim()) throw new Error('subscription topic is empty');
@@ -172,6 +219,8 @@ export class DefaultLitePullConsumer {
     // by half a minute. Java sends the heartbeat inside consumer start().
     await client.sendHeartbeatToAllBrokers().catch(() => {});
     this.started = true;
+    // Java startScheduleTask runs unconditionally, listeners or not.
+    this._startMetadataLoop();
     if (this.assignedManual == null) {
       await this._doRebalance();
       this._rebalanceTimer = setInterval(() => {
@@ -193,6 +242,8 @@ export class DefaultLitePullConsumer {
     if (!this.started) return;
     if (this._rebalanceTimer) { clearInterval(this._rebalanceTimer); this._rebalanceTimer = null; }
     if (this._autoCommitTimer) { clearInterval(this._autoCommitTimer); this._autoCommitTimer = null; }
+    if (this._metadataTimer) { clearInterval(this._metadataTimer); this._metadataTimer = null; }
+    if (this._metadataInitialTimer) { clearTimeout(this._metadataInitialTimer); this._metadataInitialTimer = null; }
     try { await this.commitSync(); } catch (e) { /* best effort */ }
     if (this.mqClient) {
       await this.mqClient.unregisterClientAllBrokers('', this.consumerGroup).catch(() => {});
@@ -243,6 +294,91 @@ export class DefaultLitePullConsumer {
     }
     assigned.sort((a, b) => a.compareTo(b));
     this.assignedAuto = assigned;
+  }
+
+  // fetchMessageQueues returns the SUBSCRIBE view (read perm, readQueueNums, NO
+  // master filter). An unroutable topic throws: handing back [] would read as
+  // "this topic has zero queues", so a nameserver blip would look like a
+  // scale-in and the queue-change listener would happily report it as one.
+  async fetchMessageQueues(topic: string): Promise<MessageQueue[]> {
+    if (!this.mqClient) throw new Error('consumer not started');
+    await this.mqClient.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
+    const route = this.mqClient.getTopicRouteData(topic);
+    if (!route) throw new Error(`Can not find MessageQueue for topic: ${topic}`);
+    const queues = route.getAllSubscribeMessageQueue(topic);
+    if (queues.length === 0) {
+      throw new Error(`Can not find Message Queue for this topic, ${topic} Namesrv return empty`);
+    }
+    return queues;
+  }
+
+  fetchSubscribeMessageQueues(topic: string): Promise<MessageQueue[]> {
+    return this.fetchMessageQueues(topic);
+  }
+
+  // Java DefaultLitePullConsumer:325 → Impl:1267-1279, point by point:
+  //  * empty topic / missing listener → "Topic or listener is null";
+  //  * re-registering a topic WARNs and overwrites the old listener;
+  //  * only a RUNNING consumer takes an immediate snapshot — otherwise the
+  //    first round would report "the set that was already there" as a change.
+  // Awaited because the snapshot is a route RPC; registering before start() is
+  // still fine, the compare loop just starts taking its snapshot at start().
+  async registerTopicMessageQueueChangeListener(
+    topic: string, listener: TopicMessageQueueChangeListener | null | undefined): Promise<void> {
+    if (!topic || !topic.trim() || listener == null) {
+      throw new Error('Topic or listener is null');
+    }
+    if (this.topicChangeListeners.has(topic)) {
+      logger.warning('Topic %s had been registered, new listener will overwrite the old one', topic);
+    }
+    this.topicChangeListeners.set(topic, listener);
+    if (!this.started) return;
+    try {
+      this.messageQueuesForTopic.set(topic, await this.fetchMessageQueues(topic));
+    } catch (e) {
+      logger.debug('register listener: fetch queues for %s failed: %s', topic, (e as Error).message);
+    }
+  }
+
+  // Java Impl:1230-1244: for every watched topic, compare the route's current
+  // queue set against the last one seen; fire onChanged only on a real change,
+  // and only for that topic — one topic's failed route query must not abort the
+  // round (Java's catch is inside the per-topic loop and logs only).
+  // Returns how many listeners were notified (0 when nothing changed).
+  async fetchTopicMessageQueuesAndCompare(): Promise<number> {
+    let fired = 0;
+    // Snapshot the entries: an onChanged implementation may register or drop
+    // listeners, and JS Map iteration would then see the mutation.
+    for (const [topic, listener] of [...this.topicChangeListeners.entries()]) {
+      try {
+        const newQueues = await this.fetchMessageQueues(topic);
+        if (isQueueSetEqual(this.messageQueuesForTopic.get(topic), newQueues)) continue;
+        this.messageQueuesForTopic.set(topic, newQueues);
+        await listener.onChanged(topic, newQueues);
+        fired++;
+      } catch (e) {
+        logger.error('ScheduledTask fetchMessageQueuesAndCompare exception: %s', (e as Error).message);
+      }
+    }
+    return fired;
+  }
+
+  // Java Impl:382-393: scheduleAtFixedRate(checkTask, 10s, interval). The period
+  // is read once at start(), exactly like Java's fixed-rate schedule; the 10s
+  // first delay keeps a just-started consumer from answering a route query
+  // before the broker has finished registering its queues.
+  private _startMetadataLoop(firstDelayMillis = METADATA_CHECK_FIRST_DELAY_MILLIS,
+    periodMillis = this.topicMetadataCheckIntervalMillis): void {
+    if (this._metadataTimer != null) return;
+    const beat = () => {
+      this.fetchTopicMessageQueuesAndCompare().catch((e) =>
+        logger.debug('lite pull topic queue change check error: %s', (e as Error).message));
+    };
+    const initial = setTimeout(beat, firstDelayMillis);
+    if (typeof initial.unref === 'function') initial.unref();
+    this._metadataInitialTimer = initial;
+    this._metadataTimer = setInterval(beat, periodMillis);
+    if (typeof this._metadataTimer.unref === 'function') this._metadataTimer.unref();
   }
 
   // poll fetches the next batch from any assigned, non-paused queue.

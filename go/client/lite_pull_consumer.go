@@ -93,7 +93,24 @@ const (
 	liteGotAnyBackoffMillis = int64(5)
 	// maxPollBatchSize caps one Poll's return (Java MAX_POLL_BATCH_SIZE).
 	maxPollBatchSize = 1024
+	// DefaultLiteTopicMetadataCheckIntervalMillis is Java
+	// DefaultLitePullConsumer.topicMetadataCheckIntervalMillis:160 (30s) — how
+	// often the background task re-lists the queues of every topic registered
+	// through RegisterTopicMessageQueueChangeListener.
+	DefaultLiteTopicMetadataCheckIntervalMillis = int64(30 * 1000)
+	// liteMetadataFirstDelayMillis is Java startScheduleTask's initial delay:
+	// scheduleAtFixedRate(..., 1000*10, topicMetadataCheckIntervalMillis).
+	liteMetadataFirstDelayMillis = int64(10 * 1000)
 )
+
+// TopicMessageQueueChangeListener is Java's consumer/TopicMessageQueueChangeListener:
+// OnChanged fires when a topic's queue SET differs from the snapshot the
+// background task took last round (the scale-out / scale-in case). Like Java,
+// the topic handed back is the key the listener was registered under, and an
+// unchanged set never re-fires.
+type TopicMessageQueueChangeListener interface {
+	OnChanged(topic string, messageQueues []common.MessageQueue)
+}
 
 // DefaultLitePullConsumer polls with a background SHORT-pull loop and hands
 // batches to the caller through Poll. Create one, configure it, Subscribe or
@@ -127,6 +144,14 @@ type DefaultLitePullConsumer struct {
 
 	allocateStrategy AllocateMessageQueueStrategy
 	queueListener    MessageQueueListener
+
+	// topicChangeListeners / messageQueuesForTopic back
+	// RegisterTopicMessageQueueChangeListener (Java Impl:144 + :146): the
+	// listener map keys the topic, the snapshot map holds the queue set the
+	// last round reported. Both guarded by mu.
+	topicChangeListeners       map[string]TopicMessageQueueChangeListener
+	messageQueuesForTopic      map[string][]common.MessageQueue
+	topicMetadataCheckInterval int64
 
 	// ---- consumer state, all guarded by mu ----
 	// subscription is topic -> raw expression (subscribe mode).
@@ -175,31 +200,34 @@ func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) 
 		return nil, err
 	}
 	return &DefaultLitePullConsumer{
-		consumerGroup:            group,
-		instanceName:             common.DefaultInstanceName,
-		messageModel:             MessageModelClustering,
-		consumeFromWhere:         ConsumeFromWhereLastOffset,
-		consumeTimestamp:         defaultConsumeTimestamp(),
-		pollNamesrvIntv:          defaultConsumerPollNamesrvInterval,
-		pullBatchSize:            DefaultLitePullBatchSize,
-		pollTimeoutMillis:        DefaultLitePollTimeoutMillis,
-		autoCommit:               true,
-		autoCommitIntervalMillis: DefaultLiteAutoCommitIntervalMillis,
-		pullIntervalMillis:       DefaultLitePullIntervalMillis,
-		streamRequest:            true,
-		allocateStrategy:         AllocateMessageQueueAveragely{},
-		subscription:             map[string]string{},
-		subscriptionData:         map[string]*remoting.SubscriptionData{},
-		assignSubExpr:            map[string]string{},
-		assigned:                 map[common.MessageQueue]struct{}{},
-		nextOffset:               map[common.MessageQueue]int64{},
-		consumeOffset:            map[common.MessageQueue]int64{},
-		offsetTable:              map[common.MessageQueue]int64{},
-		seekOffset:               map[common.MessageQueue]int64{},
-		paused:                   map[common.MessageQueue]struct{}{},
-		nextAutoCommitDeadline:   -1,
-		stopCh:                   make(chan struct{}),
-		bufNotify:                make(chan struct{}, 1),
+		consumerGroup:              group,
+		instanceName:               common.DefaultInstanceName,
+		messageModel:               MessageModelClustering,
+		consumeFromWhere:           ConsumeFromWhereLastOffset,
+		consumeTimestamp:           defaultConsumeTimestamp(),
+		pollNamesrvIntv:            defaultConsumerPollNamesrvInterval,
+		pullBatchSize:              DefaultLitePullBatchSize,
+		pollTimeoutMillis:          DefaultLitePollTimeoutMillis,
+		autoCommit:                 true,
+		autoCommitIntervalMillis:   DefaultLiteAutoCommitIntervalMillis,
+		pullIntervalMillis:         DefaultLitePullIntervalMillis,
+		streamRequest:              true,
+		allocateStrategy:           AllocateMessageQueueAveragely{},
+		subscription:               map[string]string{},
+		subscriptionData:           map[string]*remoting.SubscriptionData{},
+		assignSubExpr:              map[string]string{},
+		assigned:                   map[common.MessageQueue]struct{}{},
+		nextOffset:                 map[common.MessageQueue]int64{},
+		consumeOffset:              map[common.MessageQueue]int64{},
+		offsetTable:                map[common.MessageQueue]int64{},
+		seekOffset:                 map[common.MessageQueue]int64{},
+		paused:                     map[common.MessageQueue]struct{}{},
+		nextAutoCommitDeadline:     -1,
+		topicChangeListeners:       map[string]TopicMessageQueueChangeListener{},
+		messageQueuesForTopic:      map[string][]common.MessageQueue{},
+		topicMetadataCheckInterval: DefaultLiteTopicMetadataCheckIntervalMillis,
+		stopCh:                     make(chan struct{}),
+		bufNotify:                  make(chan struct{}, 1),
 	}, nil
 }
 
@@ -376,6 +404,155 @@ func (c *DefaultLitePullConsumer) SetMessageQueueListener(l MessageQueueListener
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.queueListener = l
+}
+
+// SetTopicMetadataCheckIntervalMillis sets how often the background task
+// re-lists the queues of every topic registered through
+// RegisterTopicMessageQueueChangeListener (Java
+// DefaultLitePullConsumer.setTopicMetadataCheckIntervalMillis:563, default 30s).
+// Java has no floor, but 0 would make scheduleAtFixedRate throw, so this port
+// clamps at 1s like the C++/Python ports.
+func (c *DefaultLitePullConsumer) SetTopicMetadataCheckIntervalMillis(ms int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ms < 1000 {
+		ms = 1000
+	}
+	c.topicMetadataCheckInterval = ms
+}
+
+// TopicMetadataCheckIntervalMillis reports the current period.
+func (c *DefaultLitePullConsumer) TopicMetadataCheckIntervalMillis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.topicMetadataCheckInterval
+}
+
+// RegisterTopicMessageQueueChangeListener registers a callback for topic
+// metadata changes (Java DefaultLitePullConsumer:325 →
+// DefaultLitePullConsumerImpl.registerTopicMessageQueueChangeListener:1267):
+// the background task (first round 10s after Start, then every
+// SetTopicMetadataCheckIntervalMillis) lists the topic's subscribe queues and
+// calls OnChanged only when that SET differs from the previous snapshot.
+//
+// Java-faithful details: re-registering a topic overwrites the old listener
+// with a warning (:1272); while running, the current set is snapshotted
+// immediately (:1275-1277) so "what exists right now" is not reported as a
+// change on the first round. Like every other topic key in this port's lite
+// consumer (Subscribe, route lookups, rebalance), the topic is stored exactly
+// as handed in — Java wraps it with the namespace at this entry point, this
+// port keeps bare keys throughout and applies the namespace on the wire.
+func (c *DefaultLitePullConsumer) RegisterTopicMessageQueueChangeListener(
+	topic string, listener TopicMessageQueueChangeListener) error {
+	if strings.TrimSpace(topic) == "" || listener == nil {
+		return common.ClientError("Topic or listener is null")
+	}
+	c.mu.Lock()
+	if _, dup := c.topicChangeListeners[topic]; dup {
+		common.LogWarnf("Topic %s had been registered, new listener will overwrite the old one", topic)
+	}
+	c.topicChangeListeners[topic] = listener
+	started := c.started
+	c.mu.Unlock()
+	if !started {
+		return nil
+	}
+	queues, err := c.FetchMessageQueues(topic)
+	if err != nil {
+		common.LogDebugf("register listener: fetch queues for %s failed: %v", topic, err)
+		return nil
+	}
+	c.mu.Lock()
+	c.messageQueuesForTopic[topic] = queues
+	c.mu.Unlock()
+	return nil
+}
+
+// FetchTopicMessageQueuesAndCompare is one round of Java's
+// DefaultLitePullConsumerImpl.fetchTopicMessageQueuesAndCompare:1230 — the
+// background task's body, exposed so tests and callers can drive a round
+// without waiting out the period. Returns how many listeners fired.
+func (c *DefaultLitePullConsumer) FetchTopicMessageQueuesAndCompare() int {
+	c.mu.Lock()
+	topics := make([]string, 0, len(c.topicChangeListeners))
+	for topic := range c.topicChangeListeners {
+		topics = append(topics, topic)
+	}
+	c.mu.Unlock()
+	sort.Strings(topics)
+
+	fired := 0
+	for _, topic := range topics {
+		c.mu.Lock()
+		listener := c.topicChangeListeners[topic]
+		c.mu.Unlock()
+		if listener == nil {
+			continue
+		}
+		newQueues, err := c.FetchMessageQueues(topic)
+		if err != nil {
+			// DELIBERATE divergence from Java: Java's catch sits in the
+			// startScheduleTask wrapper (Impl:382-393), so one failing topic
+			// drops the REST of that round. Skipping only that topic keeps a
+			// permanently unroutable topic from starving the listeners that
+			// happen to iterate after it.
+			common.LogErrorf("ScheduledTask fetchMessageQueuesAndCompare for %s failed: %v", topic, err)
+			continue
+		}
+		c.mu.Lock()
+		oldQueues, hadSnapshot := c.messageQueuesForTopic[topic]
+		changed := !isQueueSetEqual(oldQueues, hadSnapshot, newQueues)
+		if changed {
+			c.messageQueuesForTopic[topic] = newQueues
+		}
+		c.mu.Unlock()
+		if !changed {
+			continue
+		}
+		listener.OnChanged(topic, newQueues)
+		fired++
+	}
+	return fired
+}
+
+// isQueueSetEqual is Java's isSetEqual:1246-1260: a missing snapshot is the
+// `oldSet == null` branch (never equal — fetchMessageQueues hands back an
+// empty set, not null, so the both-null case cannot arise), then size, then
+// membership.
+func isQueueSetEqual(oldQueues []common.MessageQueue, hadSnapshot bool,
+	newQueues []common.MessageQueue) bool {
+	if !hadSnapshot {
+		return false
+	}
+	if len(oldQueues) != len(newQueues) {
+		return false
+	}
+	set := make(map[common.MessageQueue]struct{}, len(oldQueues))
+	for _, mq := range oldQueues {
+		set[mq] = struct{}{}
+	}
+	for _, mq := range newQueues {
+		if _, ok := set[mq]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// metadataLoop is Java's startScheduleTask: first round 10s after start, then
+// one every period.
+func (c *DefaultLitePullConsumer) metadataLoop(stop chan struct{}, firstDelay, period time.Duration) {
+	timer := time.NewTimer(firstDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-timer.C:
+		}
+		c.FetchTopicMessageQueuesAndCompare()
+		timer.Reset(period)
+	}
 }
 
 // IsStarted reports whether Start succeeded and Shutdown has not run.
@@ -597,9 +774,14 @@ func (c *DefaultLitePullConsumer) Start() error {
 	c.sendHeartbeatToAllBrokers()
 	c.mu.Lock()
 	stop := c.stopCh
+	period := c.topicMetadataCheckInterval
 	c.mu.Unlock()
 	go c.heartbeatLoop(stop)
 	go c.pullServiceLoop(stop)
+	// Java Impl.start() → startScheduleTask(): the queue-set comparison task
+	// runs whether or not any listener exists yet.
+	go c.metadataLoop(stop, time.Duration(liteMetadataFirstDelayMillis)*time.Millisecond,
+		time.Duration(period)*time.Millisecond)
 	return nil
 }
 
@@ -903,12 +1085,31 @@ func (c *DefaultLitePullConsumer) OffsetForTimestamp(mq common.MessageQueue, tim
 
 // FetchMessageQueues lists the topic's queues from the SUBSCRIBE info (read
 // queues, no master filtering — the set a caller Assigns from).
+//
+// Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
+// MQAdminImpl.fetchSubscribeMessageQueues:169-183 does two things this port must
+// keep: it asks the NAME SERVER for the route every single call (:171, it does
+// not read the 30s-polled cache), and it raises when the answer carries no
+// queue (:177 "Can not find Message Queue for this topic"). The second one is
+// what keeps the queue-change listener honest: an unanswered query is "no
+// information", not "the topic shrank to zero queues".
 func (c *DefaultLitePullConsumer) FetchMessageQueues(topic string) ([]common.MessageQueue, error) {
 	instance, err := c.requireInstance()
 	if err != nil {
 		return nil, err
 	}
-	return instance.GetTopicSubscribeInfo(topic), nil
+	if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic,
+		litePullRPCTimeoutMillis, false); err != nil {
+		// Keep answering from the cached route when the nameserver is briefly
+		// unreachable; the listener's per-topic catch still sees the empty case.
+		common.LogDebugf("fetch queues: route refresh for %s failed: %v", topic, err)
+	}
+	queues := instance.GetTopicSubscribeInfo(topic)
+	if len(queues) == 0 {
+		return nil, common.ClientError("Can not find Message Queue for this topic, " +
+			topic + " Namesrv return empty")
+	}
+	return queues, nil
 }
 
 func (c *DefaultLitePullConsumer) requireInstance() (*Instance, error) {

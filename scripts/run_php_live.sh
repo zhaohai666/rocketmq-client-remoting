@@ -1,12 +1,15 @@
 #!/bin/bash
 # PHP 端的真机验证入口（对照 run_go_*_live.sh / run_node_live.sh 的口径）。
 #
-# 用法: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull [namesrv]
+# 用法: bash scripts/run_php_live.sh redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc [namesrv]
 #   redelivery   php/examples/live_redelivery.php  （可选第三参 legs=all|s1,s2,s3,s4）
 #   admin        php/examples/live_admin.php
 #   pull         php/examples/live_pull.php        （可选第三参 legs=all|s1,s2,s3；
 #                 拉模式消费者：队列 / 平衡视图 fetchMessageQueuesInBalance / 手动拉取 /
 #                 位点提交回读）
+#   lite_qc      php/examples/live_lite_topic_queue_change.php
+#                 （LitePull topic 队列集合变更监听：检查周期压到 1s + 真实扩缩容 ⇒
+#                  证明比对趟次现查路由；PHP 无线程，主循环每轮 tick()+poll() 驱动）
 #   compression  php/examples/live_compression.php （仅 smoke：php→php 一条腿；
 #                 跨语言矩阵走 scripts/compression_matrix.sh 的 php_* 腿）
 #   request_reply php/examples/live_request_reply.php（326 请求-Reply：应答方 + 发起方往返）
@@ -41,11 +44,12 @@ case "$WHICH" in
   redelivery)    EXAMPLE="examples/live_redelivery.php"     ;;
   admin)         EXAMPLE="examples/live_admin.php"          ;;
   pull)          EXAMPLE="examples/live_pull.php"           ;;
+  lite_qc)       EXAMPLE="examples/live_lite_topic_queue_change.php" ;;
   compression)   EXAMPLE="examples/live_compression.php"    ;;
   pop)           EXAMPLE="examples/live_pop.php"            ;;
   tls)           EXAMPLE="examples/live_tls.php"            ;;
   request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull)" >&2; exit 2 ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc)" >&2; exit 2 ;;
 esac
 
 port_open() {

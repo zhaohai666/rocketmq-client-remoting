@@ -167,6 +167,10 @@ public:
     //（Java 同款，warn 一条）；topic 为空或监听器为空抛 MQClientException("Topic or listener is null")。
     void registerTopicMessageQueueChangeListener(
         const std::string& topic, std::shared_ptr<TopicMessageQueueChangeListener> listener);
+    // 后台比对的**一趟**：遍历已注册的队列变更监听器，逐 topic 现查队列集合，与上次快照
+    // 按集合相等比较，只有真的变了才更新快照并回调。公开是为了让单测能自己驱动这一趟，
+    // 不必等后台线程的首查延迟。
+    void fetchTopicMessageQueuesAndCompare();
     // assign 模式：给某个 topic 的队列指定 tag 过滤表达式（Java setSubExpressionForAssign）。
     void setSubExpressionForAssign(const std::string& topic, const std::string& subExpression);
     // assign 模式：显式指定队列，不走 rebalance。
@@ -235,9 +239,6 @@ private:
     std::vector<MessageQueue> newSetAsVector(const std::set<MessageQueue>& s) const;
 
     void rebalance();
-    // 对应 Java DefaultLitePullConsumerImpl#fetchTopicMessageQueuesAndCompare（:1230）：
-    // 遍历已注册的 TopicMessageQueueChangeListener，逐 topic 拉队列集合与快照比对。
-    void fetchTopicMessageQueuesAndCompare();
     void metadataLoop();
     bool pullOne(const MessageQueue& mq);
     std::string subscriptionFor(const std::string& topic) const;

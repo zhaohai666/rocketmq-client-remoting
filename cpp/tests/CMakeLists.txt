@@ -330,3 +330,10 @@ add_test(NAME publish_route_master COMMAND rmq_test_publish_route_master)
 add_executable(rmq_test_clean_expired_msg test_clean_expired_msg.cpp)
 target_link_libraries(rmq_test_clean_expired_msg PRIVATE rocketmq::remoting)
 add_test(NAME clean_expired_msg COMMAND rmq_test_clean_expired_msg)
+
+# 轻量拉取消费者的 topic 队列集合变更监听：离线锁「集合真的变了才回调一次」「运行中注册
+# 先记快照、当前状态不算变化」「每趟现问 name server」「查不到路由的 topic 只跳过自己」
+#「重复注册覆盖旧监听器」「命名空间口径」「未启动查队列报错」。
+add_executable(rmq_test_lite_topic_queue_change test_lite_topic_queue_change.cpp)
+target_link_libraries(rmq_test_lite_topic_queue_change PRIVATE rocketmq::remoting)
+add_test(NAME lite_topic_queue_change COMMAND rmq_test_lite_topic_queue_change)

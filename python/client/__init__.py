@@ -2,8 +2,10 @@
 """rocketmq.client - 客户端层（对应 org.apache.rocketmq.client）。"""
 from .producer import (DefaultMQProducer, TransactionMQProducer, LocalTransactionState,
                        MessageQueueSelector, SendCallback, TransactionListener)
-from .consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer, MessageSelector,
-                       MessageQueueListener, AllocateMessageQueueStrategy,
+from .consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer,
+                       DefaultLitePullConsumer, MessageSelector,
+                       MessageQueueListener, TopicMessageQueueChangeListener,
+                       AllocateMessageQueueStrategy,
                        AllocateMessageQueueAveragely, AllocateMessageQueueAveragelyByCircle,
                        AllocateMessageQueueByConfig,
                        AllocateMessageQueueConsistentHash,
@@ -29,8 +31,9 @@ from .hook import (CheckForbiddenContext, CheckForbiddenHook, ConsumeMessageCont
 __all__ = [
     "DefaultMQProducer", "TransactionMQProducer", "LocalTransactionState",
     "MessageQueueSelector", "SendCallback", "TransactionListener",
-    "DefaultMQPushConsumer", "DefaultMQPullConsumer", "MessageSelector",
-    "MessageQueueListener", "AllocateMessageQueueStrategy",
+    "DefaultMQPushConsumer", "DefaultMQPullConsumer", "DefaultLitePullConsumer",
+    "MessageSelector", "MessageQueueListener", "TopicMessageQueueChangeListener",
+    "AllocateMessageQueueStrategy",
     "AllocateMessageQueueAveragely", "AllocateMessageQueueAveragelyByCircle",
     "AllocateMessageQueueByConfig",
     "AllocateMessageQueueConsistentHash", "AllocateMessageQueueByMachineRoom",

@@ -38,6 +38,15 @@ public interface ILiteMessageQueueListener
     void MessageQueueChanged(IReadOnlyList<MessageQueue> mqAll, IReadOnlyList<MessageQueue> mqDivided);
 }
 
+/// <summary>topic 队列集合变更监听器（对应 Java TopicMessageQueueChangeListener）。
+/// 后台任务按 TopicMetadataCheckIntervalMillis 比对该 topic 的订阅队列集合，**只在集合真的
+/// 变了**（扩容/缩容）时回调 OnChanged(topic, 新集合)；没变不回调。
+/// 与 <see cref="ILiteMessageQueueListener"/>（本实例分到了哪些队列）是两回事。</summary>
+public interface ITopicMessageQueueChangeListener
+{
+    void OnChanged(string topic, IReadOnlyList<MessageQueue> messageQueues);
+}
+
 public sealed class DefaultLitePullConsumer
 {
     private readonly object _lock = new();
@@ -104,12 +113,21 @@ public sealed class DefaultLitePullConsumer
     private long _nextAutoCommitDeadline = -1;
     private readonly HashSet<MessageQueue> _paused = new();
     private ILiteMessageQueueListener? _messageQueueListener;
+    // Java DefaultLitePullConsumer:160 topicMetadataCheckIntervalMillis 默认 30s。
+    private int _topicMetadataCheckIntervalMillis = 30000;
+    // Java Impl:144/146：监听器表 + 每个 topic 上次看到的队列集合。
+    // 键取 withNamespace(topic)（Java :325-327 在入口就套好），回调收回来的也是它。
+    private readonly Dictionary<string, ITopicMessageQueueChangeListener> _topicChangeListeners =
+        new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<MessageQueue>> _messageQueuesForTopic =
+        new(StringComparer.Ordinal);
 
     private MQClientInstance? _mqClient;
     private bool _started;
     private bool _running;
     private Thread? _pullThread;
     private Thread? _heartbeatThread;
+    private Thread? _metadataThread;
 
     public DefaultLitePullConsumer(string consumerGroup = MixAll.DefaultConsumerGroup)
     {
@@ -242,6 +260,14 @@ public sealed class DefaultLitePullConsumer
     public void SetPullIntervalMillis(int ms) => _pullIntervalMillis = Math.Max(0, ms);
 
     public void SetMessageQueueListener(ILiteMessageQueueListener listener) => _messageQueueListener = listener;
+
+    /// <summary>Java DefaultLitePullConsumer#setTopicMetadataCheckIntervalMillis。
+    /// Java 本身不设下限，但 0 会让 scheduleAtFixedRate 直接抛 IllegalArgumentException，
+    /// 所以和 C++/Python/Go/Rust 一样夹到 1s。</summary>
+    public void SetTopicMetadataCheckIntervalMillis(int ms) =>
+        _topicMetadataCheckIntervalMillis = Math.Max(1000, ms);
+
+    public int TopicMetadataCheckIntervalMillis => _topicMetadataCheckIntervalMillis;
 
     // ---------------- 订阅 / 分配 ----------------
     public void Subscribe(string topic, string subExpression = "*")
@@ -431,6 +457,11 @@ public sealed class DefaultLitePullConsumer
             _heartbeatThread.Start();
             _pullThread = new Thread(PullServiceLoop) { IsBackground = true, Name = "rmq-lite-pull-" + _consumerId() };
             _pullThread.Start();
+            // Java startScheduleTask 无条件起这个定时任务（有没有注册监听器都起），
+            // 空表时一轮比对就是空转，成本可忽略。
+            _metadataThread = new Thread(MetadataLoop)
+                { IsBackground = true, Name = "rmq-lite-meta-" + _consumerId() };
+            _metadataThread.Start();
         }
     }
 
@@ -471,6 +502,7 @@ public sealed class DefaultLitePullConsumer
         {
             if (_pullThread is { IsAlive: true }) _pullThread.Join(2000);
             if (_heartbeatThread is { IsAlive: true }) _heartbeatThread.Join(2000);
+            if (_metadataThread is { IsAlive: true }) _metadataThread.Join(2000);
             _mqClient?.Shutdown();
             _mqClient = null;
         }
@@ -1164,9 +1196,43 @@ public sealed class DefaultLitePullConsumer
 
     // ---------------- 队列查询 / 控制 ----------------
     /// <summary>Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
-    /// MQAdminImpl.fetchSubscribeMessageQueues:169（订阅信息：读位、不筛 master）。</summary>
+    /// MQAdminImpl.fetchSubscribeMessageQueues:169-183（订阅信息：读位、不筛 master）。
+    /// ⚠ 入参是**已经套好命名空间**的 topic：Java 的 withNamespace 发生在外层
+    /// DefaultLitePullConsumer:325-327，Impl 这一层直接拿 map key 去查（:1234）。
+    /// 本端口的 WrapNamespace 与 Java 一样幂等（已带前缀原样返回），所以按全名取只是
+    /// 省掉一次无谓重拼，并把这层分工写清楚。
+    /// 调用方请用 <see cref="FetchMessageQueues"/>（裸 topic）或本方法（全名）。
+    /// 两条 Java 语义必须一起保住，否则队列变更监听静默失真：
+    /// 1. :171 **每轮现问 nameserver**，不吃 30s 周期刷新的路由缓存 —— 少了这一步，
+    ///    扩容最快也要等一次路由轮询才看得见，回调比 Java 滞后一个周期；
+    /// 2. :177 取到空队列集是**抛 MQClientException**，不是返回空表 —— "查不到"不等于
+    ///    "这个 topic 缩到 0 队列"，后者会让监听器收到一次假缩容回调并把快照刷成空集。</summary>
+    private List<MessageQueue> FetchMessageQueuesFull(string fullTopic)
+    {
+        MQClientInstance client = RequireClient();
+        try
+        {
+            client.UpdateTopicRouteInfoFromNameServer(fullTopic);
+        }
+        catch (Exception e)
+        {
+            // nameserver 抖动时退回当下缓存再判一次：缓存里还有队列就不该报成"没队列"。
+            ClientLog.Debug("fetch queues: route refresh for " + fullTopic + " failed: " + e.Message);
+        }
+
+        List<MessageQueue> queues = client.GetTopicSubscribeInfo(fullTopic);
+        if (queues.Count == 0)
+        {
+            throw new MQClientException("Can not find Message Queue for this topic, "
+                                        + fullTopic + " Namesrv return empty");
+        }
+
+        return queues;
+    }
+
+    /// <summary>Java DefaultLitePullConsumer#fetchMessageQueues：入口套命名空间。</summary>
     public List<MessageQueue> FetchMessageQueues(string topic) =>
-        RequireClient().GetTopicSubscribeInfo(WithNamespace(topic));
+        FetchMessageQueuesFull(WithNamespace(topic));
 
     public List<MessageQueue> Assignment()
     {
@@ -1191,6 +1257,166 @@ public sealed class DefaultLitePullConsumer
             foreach (MessageQueue mq in messageQueues) _paused.Remove(mq);
         }
     }
+
+    // ---------------- topic 队列集合变更监听 ----------------
+    /// <summary>对应 Java registerTopicMessageQueueChangeListener（DefaultLitePullConsumer:325 →
+    /// Impl:1267-1279），逐条对齐：
+    /// <list type="bullet">
+    /// <item>topic 为空 / listener 为 null → MQClientException("Topic or listener is null")；</item>
+    /// <item>同一 topic 重复注册 → warn 一条并覆盖旧监听器（Java :1272-1273）；</item>
+    /// <item>键取 withNamespace(topic)（Java :327 在入口就套好），回调收到的也是它；</item>
+    /// <item>只有**运行中**注册才立刻记一版快照，否则首轮会把"当下这套队列"当成变化。
+    /// 未启动时注册的调用方要记住：首轮一定回调一次，这是 Java 的语义，不是 bug。</item>
+    /// </list></summary>
+    public void RegisterTopicMessageQueueChangeListener(string topic,
+        ITopicMessageQueueChangeListener? listener)
+    {
+        if (string.IsNullOrEmpty(topic) || listener is null)
+        {
+            throw new MQClientException("Topic or listener is null");
+        }
+
+        string key = WithNamespace(topic);
+        bool started;
+        lock (_lock)
+        {
+            if (_topicChangeListeners.ContainsKey(key))
+            {
+                ClientLog.Warn("Topic " + key + " had been registered, "
+                               + "new listener will overwrite the old one");
+            }
+
+            _topicChangeListeners[key] = listener;
+            started = _started;
+        }
+
+        if (!started)
+        {
+            return;
+        }
+
+        try
+        {
+            List<MessageQueue> snapshot = FetchMessageQueuesFull(key);
+            lock (_lock)
+            {
+                _messageQueuesForTopic[key] = snapshot;
+            }
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("register listener: fetch queues for " + key + " failed: " + e.Message);
+        }
+    }
+
+    /// <summary>逐个 topic 把当前订阅队列集合与上次快照做集合比对，只有真的变了才回调
+    /// OnChanged 并推进快照。某个 topic 查询失败只 log、跳过它自己，**不影响本轮其余
+    /// topic**：一个长期查不到路由的 topic 不该把排在它后面的监听器永久饿死。
+    /// 返回本轮回调了几个监听器。</summary>
+    public int FetchTopicMessageQueuesAndCompare()
+    {
+        List<KeyValuePair<string, ITopicMessageQueueChangeListener>> entries;
+        lock (_lock)
+        {
+            entries = new List<KeyValuePair<string, ITopicMessageQueueChangeListener>>(
+                _topicChangeListeners);
+        }
+
+        int fired = 0;
+        foreach (KeyValuePair<string, ITopicMessageQueueChangeListener> entry in entries)
+        {
+            string key = entry.Key;
+            try
+            {
+                List<MessageQueue> newQueues = FetchMessageQueuesFull(key);
+                bool changed;
+                lock (_lock)
+                {
+                    // Java isSetEqual:1246-1260：没快照 ⇒ 永远不相等 ⇒ 首轮必回调。
+                    changed = !messageQueuesForTopicTryEqual(key, newQueues);
+                    if (changed)
+                    {
+                        _messageQueuesForTopic[key] = newQueues;
+                    }
+                }
+
+                if (!changed)
+                {
+                    continue;
+                }
+
+                entry.Value.OnChanged(key, newQueues);
+                fired++;
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("ScheduledTask fetchMessageQueuesAndCompare exception: " + e.Message);
+            }
+        }
+
+        return fired;
+    }
+
+    /// <summary>Java isSetEqual：两个都没快照视作相等（本端口取不到 null 快照，故只有
+    /// "从未记过快照"这一种不等）。抱着 _lock 调用。</summary>
+    private bool messageQueuesForTopicTryEqual(string key, List<MessageQueue> newQueues)
+    {
+        if (!_messageQueuesForTopic.TryGetValue(key, out List<MessageQueue>? oldQueues))
+        {
+            return false;
+        }
+
+        if (oldQueues.Count != newQueues.Count)
+        {
+            return false;
+        }
+
+        var oldSet = new HashSet<MessageQueue>(oldQueues);
+        foreach (MessageQueue mq in newQueues)
+        {
+            if (!oldSet.Contains(mq))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Java startScheduleTask（Impl:382-393）：启动后 10s 首查，此后每
+    /// TopicMetadataCheckIntervalMillis 一趟。周期在起线程时读一次，与 Java 的
+    /// scheduleAtFixedRate 同语义。</summary>
+    public void MetadataLoop(int firstDelayMillis, int periodMillis)
+    {
+        DateTime next = DateTime.UtcNow.AddMilliseconds(firstDelayMillis);
+        while (_running)
+        {
+            Thread.Sleep(200);
+            if (!_running)
+            {
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (now < next)
+            {
+                continue;
+            }
+
+            next = now.AddMilliseconds(Math.Max(1000, periodMillis));
+            try
+            {
+                FetchTopicMessageQueuesAndCompare();
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("lite metadata loop error: " + e.Message);
+            }
+        }
+    }
+
+    private void MetadataLoop() =>
+        MetadataLoop(10000, _topicMetadataCheckIntervalMillis);
 
     // ---------------- 心跳（把 tag 订阅注册给 broker）----------------
     private HeartbeatData BuildHeartbeat()

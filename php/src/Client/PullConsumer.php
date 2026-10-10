@@ -714,6 +714,21 @@ final class DefaultLitePullConsumer
     private ?object $messageQueueListener = null;
     private float $lastRebalanceTs = 0.0;
     private float $nextHeartbeatAt = 0.0;
+    /**
+     * 队列集合变更监听的比对周期（毫秒）。0 或负数夹到 1s 下限 —— 周期为 0 意味着
+     * 每次 tick 都全量查路由，比对照常跑但把 tick 变成 RPC 风暴。
+     */
+    public int $topicMetadataCheckIntervalMillis = 30000;
+    /** @var array<string,object|callable> 监听器，键 = 套好命名空间的 topic */
+    private array $topicChangeListeners = [];
+    /** @var array<string,array<string,bool>> 上次快照：topic => {mqKey => true} */
+    private array $messageQueuesForTopic = [];
+    /**
+     * 下一趟比对的时刻（秒，microtime 口径）。0 = 还没排期。
+     * start() 排到 now+10s（首查不抢启动路径的 RPC）；公开是为了让单测能把首查提前，
+     * 不必真等 10s。
+     */
+    public float $nextMetadataCheckAt = 0.0;
 
     public function __construct(
         string $consumerGroup = MixAll::DEFAULT_CONSUMER_GROUP,
@@ -920,6 +935,8 @@ final class DefaultLitePullConsumer
         $this->running = true;
         $this->sendHeartbeatToAllBroker();
         $this->nextHeartbeatAt = microtime(true) + 5.0;
+        // 队列集合变更比对：首查排在启动后 10s，不抢启动路径上的 RPC。
+        $this->nextMetadataCheckAt = microtime(true) + 10.0;
         $this->started = true;
     }
 
@@ -1046,6 +1063,16 @@ final class DefaultLitePullConsumer
         if (!$this->assignMode && ($this->lastRebalanceTs === 0.0 || ($now - $this->lastRebalanceTs) > 1.0)) {
             $this->rebalance();
             $this->lastRebalanceTs = $now;
+        }
+        // 队列集合变更比对：PHP 是 tick 驱动，没有 Java 的调度线程。首查在 start 后 10s，
+        // 之后每个 topicMetadataCheckIntervalMillis 一趟；没有注册监听器时这一趟是空转。
+        if ($this->nextMetadataCheckAt > 0.0 && $now >= $this->nextMetadataCheckAt) {
+            $this->nextMetadataCheckAt = $now + $this->topicMetadataCheckIntervalMillis / 1000.0;
+            try {
+                $this->fetchTopicMessageQueuesAndCompare();
+            } catch (\Throwable $e) {
+                Logger::debug('metadata compare error: ' . $e->getMessage());
+            }
         }
         foreach (array_keys($this->assigned) as $key) {
             if (!$this->running) {
@@ -1534,7 +1561,160 @@ final class DefaultLitePullConsumer
     /** @return list<MessageQueue> */
     public function fetchMessageQueues(string $topic): array
     {
-        return $this->requireClient()->getTopicSubscribeInfo($this->withNamespace($topic));
+        return $this->fetchMessageQueuesFull($this->withNamespace($topic));
+    }
+
+    /**
+     * 按**已套命名空间**的 topic 名列队列。队列变更监听内部走这一层：它持有的键
+     * 本来就是套好的，再套一次只会得到 ns%ns%topic 的查不到的名字。
+     *
+     * 两件事必须一起做对，否则队列变更监听静默失真：
+     * 1. **每轮现问 name server**，不吃周期刷新的路由缓存；少了这一步，扩容最快也要等
+     *    一次路由轮询才看得见（监听回调比预期慢一个周期）。
+     * 2. 空队列集是**抛异常**，不是返回空表 —— "查不到" ≠ "这个 topic 缩到 0 队列"，
+     *    后者会让监听器收到一次假缩容回调并把快照刷成空集。
+     *
+     * @return list<MessageQueue>
+     */
+    private function fetchMessageQueuesFull(string $fullTopic): array
+    {
+        $client = $this->requireClient();
+        try {
+            $client->updateTopicRouteInfoFromNameServer($fullTopic);
+        } catch (\Throwable $e) {
+            // 抖动时退回当下缓存再判一次（外层会把"仍然没队列"报成一条 warn）。
+            Logger::debug("fetch queues: route refresh for $fullTopic failed: " . $e->getMessage());
+        }
+        $queues = $client->getTopicSubscribeInfo($fullTopic);
+        if ($queues === []) {
+            throw new MQClientException(
+                'Can not find Message Queue for this topic, ' . $fullTopic . ' Namesrv return empty'
+            );
+        }
+        return $queues;
+    }
+
+    // ---------------- topic 队列集合变更监听 ----------------
+
+    public function setTopicMetadataCheckIntervalMillis(int $millis): void
+    {
+        $this->topicMetadataCheckIntervalMillis = max(1000, $millis);
+    }
+
+    public function topicMetadataCheckIntervalMillis(): int
+    {
+        return $this->topicMetadataCheckIntervalMillis;
+    }
+
+    /**
+     * 登记一个 topic 的队列集合变更监听：tick 按 topicMetadataCheckIntervalMillis 的
+     * 周期拉取该 topic 的订阅队列集合，与上一次快照做**集合**比对，只有真的变了才回调。
+     *
+     * 监听器可以是有 `onChanged(string $topic, array $mqs)` 方法的对象，也可以是
+     * 接收同样两个参数的可调用值。
+     *
+     * 口径：
+     * * topic 为空或监听器为 null → 抛 MQClientException('Topic or listener is null')；
+     * * 重复注册同一 topic → 覆盖旧监听器并 warn 一条；
+     * * 键取套好命名空间的 topic，回调收到的第一个参数也是它；
+     * * 运行中注册立刻记一版快照，否则下一轮会把"当前集合"当成变化误报一次；
+     *   未启动时没法查队列，就不记快照，由启动后的第一趟补上初始状态。
+     */
+    public function registerTopicMessageQueueChangeListener(string $topic, mixed $listener): void
+    {
+        if (trim($topic) === '' || $listener === null) {
+            throw new MQClientException('Topic or listener is null');
+        }
+        if (!is_object($listener) && !is_callable($listener)) {
+            throw new MQClientException('Topic or listener is null');
+        }
+        $key = $this->withNamespace($topic);
+        if (isset($this->topicChangeListeners[$key])) {
+            Logger::warning("Topic $key had been registered, new listener will overwrite the old one");
+        }
+        $this->topicChangeListeners[$key] = $listener;
+        if (!$this->started) {
+            return;
+        }
+        try {
+            $this->messageQueuesForTopic[$key] = self::queueKeySet($this->fetchMessageQueues($topic));
+        } catch (\Throwable $e) {
+            Logger::debug("register listener: fetch queues for $key failed: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * 跑一轮比对（tick 调它，调用方与单测也可以直接驱动），返回这一轮回调了几次。
+     *
+     * ⚠ 有意做法：单个 topic 失败只记日志、跳过它自己，同轮其余 topic 照常比对。
+     * 一个长期查不到路由的 topic 不该把排在它后面的监听器永久饿死；下一轮照常，
+     * 两种写法都不打断调度。
+     */
+    public function fetchTopicMessageQueuesAndCompare(): int
+    {
+        $fired = 0;
+        foreach ($this->topicChangeListeners as $key => $listener) {
+            try {
+                $queues = $this->fetchMessageQueuesFull($key);
+            } catch (\Throwable $e) {
+                Logger::warning('ScheduledTask fetchMessageQueuesAndCompare exception: ' . $e->getMessage());
+                continue;
+            }
+            $current = self::queueKeySet($queues);
+            $snapshot = $this->messageQueuesForTopic[$key] ?? null;
+            // 没有快照 ⇒ 视作变化：查队列永远回一个非空集合，所以第一趟必然把当前
+            // 状态交给调用方，之后只报增量。
+            if ($snapshot !== null && self::sameKeySet($snapshot, $current)) {
+                continue;
+            }
+            $this->messageQueuesForTopic[$key] = $current;
+            self::invokeQueueChangeListener($listener, $key, $queues);
+            $fired++;
+        }
+        return $fired;
+    }
+
+    /** @param list<MessageQueue> $queues @return array<string,bool> */
+    private static function queueKeySet(array $queues): array
+    {
+        $set = [];
+        foreach ($queues as $mq) {
+            $set[self::mqKey($mq)] = true;
+        }
+        return $set;
+    }
+
+    /**
+     * 集合相等：数量一致且每个成员都在对方里（顺序无关）。
+     *
+     * @param array<string,bool> $old
+     * @param array<string,bool> $new
+     */
+    private static function sameKeySet(array $old, array $new): bool
+    {
+        if (count($old) !== count($new)) {
+            return false;
+        }
+        return array_diff_key($old, $new) === [] && array_diff_key($new, $old) === [];
+    }
+
+    /** @param object|callable $listener @param list<MessageQueue> $queues */
+    private static function invokeQueueChangeListener(mixed $listener, string $topic, array $queues): void
+    {
+        try {
+            if (is_object($listener) && method_exists($listener, 'onChanged')) {
+                $listener->onChanged($topic, $queues);
+                return;
+            }
+            if (is_callable($listener)) {
+                $listener($topic, $queues);
+                return;
+            }
+            Logger::warning("Topic queue change listener for $topic is not callable");
+        } catch (\Throwable $e) {
+            // 回调是调用方的代码：它抛了不能把比对线程带下去，也不能吞得无声无息。
+            Logger::error("Topic queue change listener for $topic threw: " . $e->getMessage());
+        }
     }
 
     /** @param list<MessageQueue> $messageQueues */

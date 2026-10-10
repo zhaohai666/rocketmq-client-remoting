@@ -169,8 +169,9 @@ void testProducerValidation() {
     // "The broker service address not found"（后者要有路由、只是没有可用 broker 才会走到）。
     const std::string handle = buildRecallHandle(kTopic, kBroker, "1700000000000", kUniqKey);
     const std::string noRoute = catchMessage([&] { (void)p.recallMessage(kTopic, handle); });
-    expect(noRoute == "Can not find Message Queue for topic: " + std::string(kTopic),
-           "路由缺失时预热带异常照抛（Java 语义）", noRoute);
+    // 只断言前缀：路由拉取真的失败时，后面还会带上 "(route fetch failed: ...)" 明细。
+    expect(noRoute.rfind("Can not find Message Queue for topic: " + std::string(kTopic), 0) == 0,
+           "路由缺失时预热带异常照抛", noRoute);
 
     p.shutdown();
 }
