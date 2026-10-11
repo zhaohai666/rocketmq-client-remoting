@@ -207,7 +207,7 @@ type pullQueueTask struct {
 	cancelOnce sync.Once
 	cancelled  atomic.Bool
 	// cursor is the queue's pull position; -1 means "not resolved yet" and
-// 	the next round reads it from the offset store / broker.
+	// 	the next round reads it from the offset store / broker.
 	cursor atomic.Int64
 }
 
@@ -473,7 +473,9 @@ func (s *MQPullConsumerScheduleService) Start() error {
 // change for a registered topic kicks an expansion (the expansion itself
 // applies the BROADCASTING/CLUSTERING choice, same switch Java's listener
 // branches on).
-type pullScheduleQueueListener struct{ service *MQPullConsumerScheduleService }
+type pullScheduleQueueListener struct {
+	service *MQPullConsumerScheduleService
+}
 
 func (l *pullScheduleQueueListener) MessageQueueChanged(topic string, mqAll, mqDivided []common.MessageQueue) {
 	l.service.mu.Lock()
@@ -738,9 +740,10 @@ func (s *MQPullConsumerScheduleService) invokeCallback(callback PullTaskCallback
 //     steps over the filtered window instead of rescanning it forever, and
 //     OFFSET_ILLEGAL carries the broker's corrected position — this single
 //     line is the whole correction);
-   // - the cursor is parked into the offset store each round, so the periodic
+//   - the cursor is parked into the offset store each round, so the periodic
 //     persist/Shutdown flush carries it and a re-expansion of the queue
 //     resumes from the committed position instead of restarting at max.
+//
 // A failed pull touches neither.
 func (s *MQPullConsumerScheduleService) pullForTask(t *pullQueueTask) (*PullResult, error) {
 	s.mu.Lock()

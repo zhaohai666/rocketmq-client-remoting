@@ -642,6 +642,12 @@ final class DefaultMQPushConsumer
         } catch (\Throwable $e) {
             Logger::debug('initial heartbeat failed: ' . $e->getMessage());
         }
+        // POP broker 侧分配：先挂上轮询方（实例 tick 阶段⑦的驱动对象），再跑首轮同步分配。
+        // 顺序要紧 —— doRebalance() 在这条路径上就是"跑一轮 QUERY_ASSIGNMENT"，poller 没
+        // 注册就什么都不问。非该路径（默认 clientRebalance=true / 经典 pull）零开销。
+        if ($this->usesBrokerPopAssignment()) {
+            $this->registerPopAssignment();
+        }
         // 首轮分配必须同步完成：否则拉取会在空分配集上白转，直到第一轮 rebalance。
         try {
             $this->doRebalance();
@@ -687,6 +693,12 @@ final class DefaultMQPushConsumer
             return;
         }
         $this->started = false;
+        // POP broker 侧分配：立刻摘掉轮询方，之后的 tick 不再发 QUERY_ASSIGNMENT
+        // （对应 Java shutdown 停 RebalanceService 线程）。
+        if ($this->popAssignmentPoller !== null) {
+            $this->mqClient?->unregisterPopAssignmentPoller($this->popAssignmentPoller->key);
+            $this->popAssignmentPoller = null;
+        }
         // POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）。
         if ($this->popMode) {
             foreach ($this->popQueues as $pq) {
@@ -917,7 +929,10 @@ final class DefaultMQPushConsumer
         }
 
         // ③ 重平衡（启动阶段且无分配时快速重试，对齐 Python _rebalance_loop）。
-        if ($this->rebalanceNow || $now >= $this->nextRebalanceAt) {
+        // POP broker 侧分配路径不在这里跑：本地策略一格都不该执行，节奏由实例 tick 的
+        // 阶段⑦（QUERY_ASSIGNMENT 轮）决定，见 usesBrokerPopAssignment()。
+        if (!$this->usesBrokerPopAssignment()
+            && ($this->rebalanceNow || $now >= $this->nextRebalanceAt)) {
             $startingUp = ($now - $this->startTime) < 60.0;
             $interval = ($startingUp && $this->assigned === []) ? 2.0 : 20.0;
             $this->nextRebalanceAt = $now + $interval;

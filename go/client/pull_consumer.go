@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
@@ -121,6 +122,15 @@ type DefaultMQPullConsumer struct {
 	instance    *Instance
 	offsetStore OffsetStore
 	pullAPI     *pullAPI
+
+	// pullAsyncPool / pullCallbackPool back PullAsync (see pull_async.go):
+	// the first runs the RPC off the caller's goroutine, the second delivers
+	// the user callback. Built in Start, torn down in Shutdown — the same
+	// lifecycle the producer's async send executors have. Swapped to nil on
+	// shutdown, so a late submit is refused synchronously instead of queueing
+	// onto a dead consumer.
+	pullAsyncPool    atomic.Pointer[boundedPool]
+	pullCallbackPool atomic.Pointer[boundedPool]
 
 	// offsetQueues is the local-offset queue set: every queue whose offset the
 	// caller has parked in offsetStore. Java gets the equivalent set for free
@@ -550,6 +560,10 @@ func (c *DefaultMQPullConsumer) Start() error {
 	c.pullAPI.hooks = c.filterMessageHooks
 	store := c.offsetStore
 	c.startTime = time.Now()
+	// The async-pull executors are built here (not in the constructor) so a
+	// consumer that never starts owns no live goroutine pools; Shutdown's
+	// destroyPullAsyncExecutors is the mirror image.
+	c.initPullAsyncExecutors()
 	c.started = true
 	topics := make([]string, 0, len(c.subscription))
 	for t := range c.subscription {
@@ -616,6 +630,13 @@ func (c *DefaultMQPullConsumer) Shutdown() {
 		return
 	}
 	c.mu.Unlock()
+
+	// Drain the async-pull executors BEFORE leaving the RUNNING state (same
+	// ordering reason as the persist below): the in-flight pulls still pass
+	// requireClient, and when this returns no async attempt of ours can be
+	// running against the instance we are about to detach. Deliberately NOT
+	// under c.mu — the draining workers take it themselves.
+	c.destroyPullAsyncExecutors()
 
 	if err := c.PersistConsumerOffset(); err != nil {
 		common.LogDebugf("persist offsets on shutdown failed: %v", err)
@@ -787,9 +808,20 @@ func buildPullSelectorSubscription(mq common.MessageQueue, selector MessageSelec
 	return sub, nil
 }
 
-// pullSync is Java pullSyncImpl:229-285.
+// pullSync is Java pullSyncImpl:229-285. The sync facades never expose a byte
+// budget, so they run it with the unlimited default (-1 = "not set", which is
+// what pullKernel writes into the header when maxSizeInBytes is absent).
 func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.SubscriptionData,
 	offset int64, maxNums int32, block bool, timeoutMillis int64) (*PullResult, error) {
+	return c.pullSyncWithMaxBytes(mq, sub, offset, maxNums, -1, block, timeoutMillis)
+}
+
+// pullSyncWithMaxBytes is pullSync with Java's maxSizeInBytes argument made
+// explicit: pullAsyncImpl:517 checks it as `<= 0`, and the async entry points
+// pass the caller's value (Integer.MAX_VALUE for the variants without one,
+// which -1 and the header omission below model the same way).
+func (c *DefaultMQPullConsumer) pullSyncWithMaxBytes(mq common.MessageQueue, sub *remoting.SubscriptionData,
+	offset int64, maxNums int32, maxMsgBytes int32, block bool, timeoutMillis int64) (*PullResult, error) {
 
 	if _, err := c.requireClient(); err != nil {
 		return nil, err
@@ -832,7 +864,7 @@ func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.S
 		sub = &local
 	}
 	result, err := api.pullKernel(group, mq, offset, sub, sysFlag, 0, maxNums,
-		-1, brokerSuspend, timeoutMillis)
+		maxMsgBytes, brokerSuspend, timeoutMillis)
 	if err != nil {
 		return nil, err
 	}
