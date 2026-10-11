@@ -202,8 +202,11 @@ class MQClientInstance
 
     /**
      * POP broker 侧分配的默认轮询周期：Java 的 QUERY_ASSIGNMENT 挂在 RebalanceService 的
-     * rebalance 调度上（`rebalanceInterval` 默认 20s，且被 `Math.max(5000, …)` 钳过下界），
-     * 本端口的分配轮因此默认 20s —— 与 PushConsumer 本地 rebalance 的节奏一致。
+     * 调度线程上（``rocketmq.client.rebalance.waitInterval`` 默认 20000ms），本端口的分配轮
+     * 因此默认 20s —— 与 PushConsumer 本地 rebalance 的节奏一致。
+     * Java 另有一个 ``minInterval``（1000ms）：上一轮没收敛时把等待压到 1s；本端口的对应物
+     * 是 PushConsumer 启动窗口内"无分配就 2s 重试"的既有启发式，以及 {@see
+     * MQClientInstance::popAssignmentImmediately()}（Java 的 RebalanceService.wakeUp）。
      */
     public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
 
@@ -282,6 +285,16 @@ class MQClientInstance
      * 自带的调度线程；PHP 无线程，探测轮收敛到 tick() 里同步跑，见 tick ⑥）。
      */
     private ?MQFaultStrategy $faultStrategy = null;
+
+    /**
+     * POP broker 侧分配的注册表（clientId|consumerGroup → 轮询方）。
+     *
+     * Java 没有这张表：QUERY_ASSIGNMENT 挂在每个消费者自己的 Rebalance 调度上跑；PHP 无
+     * 线程，改由本实例 tick() 的阶段⑦统一按到期判定推进（注册方式照抄 {@see $faultStrategy}）。
+     *
+     * @var array<string, PopAssignmentPoller>
+     */
+    private array $popAssignmentPollers = [];
 
     private bool $namesrvRefreshEnabled = false;
     private ?int $namesrvRefreshNextRunMillis = null;
@@ -455,6 +468,9 @@ class MQClientInstance
         $this->requestScanNextRunMillis = null;
         // 主动探活随实例下线摘除（Java LatencyFaultToleranceImpl.shutdown 停探测线程的同位）
         $this->faultStrategy = null;
+        // POP broker 侧分配轮同理：实例停了就没有 tick，轮询方一律摘掉
+        // （Java 的 RebalanceService 随 MQClientInstance#shutdownStopAll 停线程的同位）。
+        $this->popAssignmentPollers = [];
         $this->pendingActions = [];
         $this->consumerStatsManager->shutdown();
         $this->remotingClient->shutdown();
@@ -535,6 +551,117 @@ class MQClientInstance
             } catch (\Throwable $e) {
                 Logger::warning('fault detector round exception: ' . $e->getMessage());
             }
+        }
+
+        // ⑦ POP broker 侧分配轮（Java 的 QUERY_ASSIGNMENT(400) 腿挂在 RebalanceService 线程
+        //   上；PHP 单线程，popMode && !clientRebalance 的 push 消费者把轮询方注册进来，
+        //   这里做到期判定 —— 未到期的注册方零开销，与阶段⑥同形）。到期即**按 topic 集合
+        //   现查**（订阅会运行中变化），每个 topic 一次 RPC。
+        //   失败语义见 runPopAssignmentRound：RPC 失败 / broker 没给指配集 = Java 的
+        //   "invalid result" → 跳过更新、保留上一次分配，**绝不**退化成"这个 topic 我全要"。
+        foreach ($this->popAssignmentPollers as $poller) {
+            if ($now < $poller->nextRunMillis) {
+                continue;
+            }
+            try {
+                $this->runPopAssignmentRound($poller, $now);
+            } catch (\Throwable $e) {
+                // 单轮炸掉不影响其它注册方，也不影响下一轮（nextRunMillis 已在轮首重排）。
+                Logger::warning('pop assignment round exception: ' . $e->getMessage());
+            }
+        }
+    }
+
+    // ---------------- POP broker 侧分配（QUERY_ASSIGNMENT 腿的调度面） ----------------
+
+    /**
+     * 注册/覆盖一个 POP broker 侧分配轮询方（Java 的 RebalanceService 线程在 PHP 端的替身）。
+     *
+     * 新注册方立刻算作到期：Java ``DefaultMQPushConsumerImpl.start`` 末尾的
+     * ``rebalanceImmediately()`` 就是"首轮不等 20s"。
+     */
+    public function registerPopAssignmentPoller(PopAssignmentPoller $poller): void
+    {
+        $poller->nextRunMillis = 0;
+        $this->popAssignmentPollers[$poller->key] = $poller;
+    }
+
+    /** 摘除一个轮询方（消费者 shutdown 的清理；对应 Java 停掉 RebalanceService）。 */
+    public function unregisterPopAssignmentPoller(string $key): void
+    {
+        unset($this->popAssignmentPollers[$key]);
+    }
+
+    /**
+     * 唤醒分配轮：下一个 tick 立刻重查（对应 Java ``RebalanceService#wakeUp()``，
+     * 即 ``MQClientInstance#rebalanceImmediately`` 的作用；传 key 只唤醒那一个）。
+     */
+    public function popAssignmentImmediately(?string $key = null): void
+    {
+        foreach ($this->popAssignmentPollers as $k => $poller) {
+            if ($key === null || $k === $key) {
+                $poller->nextRunMillis = 0;
+            }
+        }
+    }
+
+    /** 已注册的轮询方键集（测试/观测用）。 */
+    public function popAssignmentPollerKeys(): array
+    {
+        return array_keys($this->popAssignmentPollers);
+    }
+
+    /**
+     * 跑一轮 broker 侧分配：现查 topic 集合 → 每 topic 一次 QUERY_ASSIGNMENT(400) →
+     * 结果交回注册方的 apply 回调。
+     *
+     * 每个 topic 单独判定，与 Java RebalanceImpl#doRebalance:236-256 的逐 topic try/catch
+     * 同形：一个 topic 失败只影响它自己。三种"不更新"（{@see queryAssignment} 的 null
+     * 返回 / 抛异常）都保留该 topic 的上一次分配：
+     *
+     * - 传输失败、broker 回非 SUCCESS（Java MQClientAPIImpl:430 抛 MQBrokerException →
+     *   getRebalanceResultFromBroker:351 catch 后 return false）；
+     * - 路由里找不到 broker（Java MQClientInstance#queryAssignment:1387 return null）；
+     * - SUCCESS 但 body 没有指配集 = Java 的 null（topic 不存在 / 取不到 cid 列表 /
+     *   策略名不认识，QueryAssignmentProcessor#doLoadBalance 的三个 return null）。
+     *
+     * 只有 broker **明示空集**才撤销该 topic 的全部队列。
+     */
+    public function runPopAssignmentRound(PopAssignmentPoller $poller, ?int $nowMillis = null): void
+    {
+        $now = $nowMillis ?? $this->currentTimeMillis();
+        // 轮首就重排周期：本轮无论成败都不许把下一轮拖到过去（Java 的 realWaitInterval 同理）。
+        $poller->nextRunMillis = $now + $poller->intervalMillis;
+        $topics = ($poller->topicsFn)();
+        foreach ($topics as $topic) {
+            try {
+                $assignments = $this->queryAssignment(
+                    $topic,
+                    $poller->consumerGroup,
+                    $poller->clientId,
+                    $poller->strategyName,
+                    $poller->messageModel,
+                    self::QUERY_ASSIGNMENT_TIMEOUT_MILLIS,
+                );
+            } catch (\Throwable $e) {
+                // Java getRebalanceResultFromBroker:351-354 的同一条日志口径。
+                Logger::error(sprintf(
+                    'allocate message queue exception. strategy name: %s, topic %s: %s (keep current assignment)',
+                    $poller->strategyName,
+                    $topic,
+                    $e->getMessage(),
+                ));
+                continue;
+            }
+            if ($assignments === null) {
+                Logger::warning(sprintf(
+                    'queryAssignment: no assignment set for topic %s group %s, keep current assignment',
+                    $topic,
+                    $poller->consumerGroup,
+                ));
+                continue;
+            }
+            ($poller->applyFn)($topic, $assignments);
         }
     }
 
@@ -1571,12 +1698,26 @@ class MQClientInstance
 
     /**
      * QUERY_ASSIGNMENT(400)：向 broker 要本组的队列指配（Java MQClientAPIImpl
-     * #queryAssignment，body 是 QueryAssignmentRequestBody JSON）。
+     * #queryAssignment:405 + MQClientInstance#queryAssignment:1373）。
      *
-     * 返回值语义与 Java 一致：SUCCESS 时返回指配列表（可为空表），**非 SUCCESS 抛
-     * MQBrokerException**。是否把空表当"无效结果"由调用方（RebalanceImpl）判定。
+     * ⚠ wire 口径：这个 code **没有请求头**（Java :416 传的是 `null` header），
+     * topic / consumerGroup / clientId / strategyName / messageModel 五个字段全部进
+     * body JSON（{@see QueryAssignmentRequestBody}），broker 按 Java 属性名解析。
      *
-     * @return list<array{mq: MessageQueue, mode: MessageRequestMode}>
+     * 返回值把 Java 的三档语义原样分开：
+     *
+     * - `null`（"invalid result"，Java 的 null 集 / 找不到 broker）：调用方**必须跳过
+     *   更新**，保留上一次分配（RebalanceImpl#getRebalanceResultFromBroker:356-359）；
+     * - `[]`：broker 明示"这个 topic 没有队列归你"，撤销该 topic 的分配
+     *   （QueryAssignmentProcessor#doLoadBalance:149 的 empty set 分支）；
+     * - 非空 list：指配集本身，每条一个 (MessageQueue, MessageRequestMode)。
+     *
+     * 非 SUCCESS 一律抛 {@see MQBrokerException}（Java :430），**唯一**例外是
+     * TOPIC_NOT_EXIST(17)：本端口按"该 topic 无队列可指"回空集（真实 broker 对不存在的
+     * topic 走的是 SUCCESS + 无指配集 = 上面的 null 档，两者不冲突；Java 在这里会抛，
+     * 由调用方保留旧分配 —— 这是本端口的有意收紧，见 README 的差异表）。
+     *
+     * @return list<array{mq: MessageQueue, mode: MessageRequestMode}>|null
      */
     public function queryAssignment(
         string $topic,
@@ -1584,14 +1725,25 @@ class MQClientInstance
         string $clientId,
         string $strategyName,
         string $messageModel,
-        int $timeoutMillis = 3000,
+        int $timeoutMillis = self::QUERY_ASSIGNMENT_TIMEOUT_MILLIS,
         ?string $addr = null,
-    ): array {
+    ): ?array {
         if ($addr === null) {
-            // Java RebalanceImpl 走 mQClientFactory.queryAssignment → 找本 topic 任一
-            // master；找不到直接抛 no route。
-            $addr = $this->findBrokerAddrByTopic($topic)
-                ?? throw new MQClientException(sprintf('No route info of this topic: %s', $topic));
+            // Java MQClientInstance#queryAssignment:1376-1380：先查路由表，查不到按该 topic
+            // 刷一次 NameServer 再查；仍查不到 return null（**不抛** no route —— 那在本端
+            // 等于"无效结果"，消费者保留上一次分配）。
+            $addr = $this->findBrokerAddrByTopic($topic);
+            if ($addr === null) {
+                try {
+                    $this->updateTopicRouteInfoFromNameServer($topic);
+                } catch (\Throwable $e) {
+                    Logger::debug(sprintf('queryAssignment: route refresh for %s failed: %s', $topic, $e->getMessage()));
+                }
+                $addr = $this->findBrokerAddrByTopic($topic);
+            }
+            if ($addr === null) {
+                return null;
+            }
         }
         $body = new QueryAssignmentRequestBody();
         $body->topic = $topic;
@@ -1603,16 +1755,22 @@ class MQClientInstance
         $request->body = $body->encode();
         $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         if ($response->code !== ResponseCode::SUCCESS) {
+            if ($response->code === ResponseCode::TOPIC_NOT_EXIST) {
+                return [];
+            }
             throw new MQBrokerException($response->code, $response->remark ?? '');
         }
+        $set = QueryAssignmentResponseBody::decode($response->body)->messageQueueAssignments;
+        if ($set === null) {
+            // Java 的 null 集：不是"没队列"，是"这次答复无效"。
+            return null;
+        }
         $out = [];
-        if ($response->body !== null && $response->body !== '') {
-            foreach (QueryAssignmentResponseBody::decode($response->body)->messageQueueAssignments as $a) {
-                if ($a->messageQueue === null) {
-                    continue;
-                }
-                $out[] = ['mq' => $a->messageQueue, 'mode' => $a->mode];
+        foreach ($set as $a) {
+            if ($a->messageQueue === null) {
+                continue;
             }
+            $out[] = ['mq' => $a->messageQueue, 'mode' => $a->mode];
         }
         return $out;
     }

@@ -452,13 +452,15 @@ pub struct ConsumerConfig {
     pub suspend_current_queue_time_millis: i64,
     /// Java `consumeTimeout`（**分钟**）= 15，只用于 `ConsumeReturnType::TimeOut` 判定。
     pub consume_timeout: i64,
-    /// Java `clientRebalance` = true（本项目恒走客户端 rebalance，字段仅为对齐形状）。
+    /// Java `clientRebalance`：形状对齐字段，本实现不读取它决定是否走本地分配。
+    /// 分配来源由 `pop_mode` 门控：POP 恒走 broker 侧 QUERY_ASSIGNMENT，其余恒走本地 rebalance。
     pub client_rebalance: bool,
     /// Java `heartbeatBrokerInterval` = 30000。
     pub heartbeat_interval_millis: i64,
     /// Python `heartbeat_enabled`。
     pub heartbeat_enabled: bool,
-    /// Python `pop_mode`：true 走 POP + ack，false 走长轮询 + 位点。
+    /// Python `pop_mode`：true 走 POP + ack（且队列分配改走 broker 侧 QUERY_ASSIGNMENT），
+    /// false 走长轮询 + 位点（本地 rebalance 不变）。
     pub pop_mode: bool,
     /// Java `popInvisibleTime` = 60000。
     pub pop_invisible_time: i64,

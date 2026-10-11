@@ -26,6 +26,7 @@ use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
 use RocketMQ\Remoting\Protocol\HeartbeatData;
 use RocketMQ\Remoting\Protocol\ConsumeType;
 use RocketMQ\Remoting\Protocol\MessageModel;
+use RocketMQ\Remoting\Protocol\MessageRequestMode;
 use RocketMQ\Remoting\Protocol\ConsumeFromWhere;
 use RocketMQ\Remoting\Protocol\NamespaceUtil;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
@@ -69,11 +70,23 @@ final class DefaultMQPushConsumer
 {
     // ---------------- POP 模式（5.x 轻量消费）配置 ----------------
     //
-    // Java 的 push-consumer POP 走 **broker 侧分配**：QUERY_ASSIGNMENT(400) 拿
-    // MessageQueueAssignment(mode=POP)，客户端不做 rebalance。本项目**刻意不实现这条路径**，
-    // 而是复用已有的**客户端 rebalance**：队列由本地按分配策略算出，然后每队列独立 POP。
-    // 语义等价（都是"每队列一个 POP 循环 + ack 确认"），差别只在于"谁决定分哪些队列"
-    // —— 这是有意差异，改动前请先读 Python 蓝本同位置的注释。
+    // Java 的 push-consumer POP 走 **broker 侧分配**：rebalance 不在本地算队列，而是每个
+    // topic 发一次 QUERY_ASSIGNMENT(400)，返回的 (MessageQueue, mode) 集就是分配
+    // （RebalancePushImpl#clientRebalance:138-141 决定走哪条路：
+    // ``isClientRebalance() || 顺序消费 || BROADCASTING`` 才本地算，否则问 broker）。
+    //
+    // 本端口照此对齐，opt-in 字段就是 Java 同名的 ``clientRebalance``（默认 true = 本地
+    // rebalance，与 Java 一致）：``popMode = true`` **且** ``clientRebalance = false``
+    // 且非广播、非顺序时，队列分配改由 {@see MQClientInstance} 的 tick 阶段⑦周期发
+    // QUERY_ASSIGNMENT 决定（PHP 无 RebalanceService 线程，见该类注释）。
+    //
+    // 三条铁律（都是 Java 的口径，改动前先看）：
+    //  - **拿不到有效答复就保留上一次分配**：RPC 失败 / 找不到 broker / broker 回 null 集
+    //    一律不更新（getRebalanceResultFromBroker:351-359），绝不退化成"这个 topic 我全要"
+    //    —— 那样同组实例会把每条消息重复消费一遍；
+    //  - broker **明示空集**才撤销该 topic 的队列（doLoadBalance:149 的 empty 分支）；
+    //  - 分配里的 mode 只观测、不服从：本消费者的消费模式在 ``popMode`` 上已经定死，
+    //    rebalance 消费的是**队列集合**，谁决定队列集才是两档分配的差别。
 
     public string $consumerGroup;
     public ?bool $tlsEnable = null;
@@ -205,6 +218,14 @@ final class DefaultMQPushConsumer
     public int $popTimeoutMillis = 5000;
     public int $popIntervalMillis = 1000;
     public int $maxPopsPerQueuePerTick = 8;
+    /**
+     * broker 侧分配（{@see $clientRebalance} 为 false 时）的轮询周期，默认 20s ——
+     * Java 的 QUERY_ASSIGNMENT 就挂在这个 rebalance 调度周期上
+     * （``rocketmq.client.rebalance.waitInterval``）。
+     */
+    public int $popAssignmentIntervalMillis = MQClientInstance::POP_ASSIGNMENT_INTERVAL_MILLIS;
+    /** 向实例注册的分配轮询方（仅 broker 侧分配路径非空；tick 阶段⑦的驱动对象）。 */
+    private ?PopAssignmentPoller $popAssignmentPoller = null;
     /** @var array<string,PopProcessQueue> */
     private array $popQueues = [];
     /** @var array<string,bool> POP 顺序请求去重集（key = mqKey） */
@@ -1106,9 +1127,19 @@ final class DefaultMQPushConsumer
     /**
      * 按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步本地状态。
      * 查不到消费者列表时**保留现有分配**（Java 仅告警；绝不回退成"独占全部队列"）。
+     *
+     * POP + ``clientRebalance=false`` 时整个本地策略路径一格都不跑：队列集由 broker 说了算
+     * （Java RebalanceImpl#doRebalance:239 的 ``!clientRebalance(topic)`` 分支 →
+     * getRebalanceResultFromBroker）。周期性那一轮挂在 MQClientInstance::tick 的阶段⑦上，
+     * 这里只是**同步入口**：start() 的首轮分配、resume()/resetOffset() 之后的即时重平衡
+     * （Java start 末尾 rebalanceImmediately 的同位）。
      */
     public function doRebalance(): void
     {
+        if ($this->usesBrokerPopAssignment()) {
+            $this->runPopAssignmentRound();
+            return;
+        }
         $client = $this->requireClient();
         $was = [];
         foreach ($this->assigned as $key => $mq) {
@@ -1200,9 +1231,147 @@ final class DefaultMQPushConsumer
         $this->rebalancePullState();
     }
 
-    /** 实例收到 broker 的 40 通知后触发即时重平衡（对应 Java rebalanceImmediately）。 */
+    /**
+     * 本消费者是否走 broker 侧队列分配（POP 路径的 QUERY_ASSIGNMENT）。
+     *
+     * 判据就是 Java RebalancePushImpl#clientRebalance:138-141 的取反：
+     * ``isClientRebalance() || isConsumeOrderly() || BROADCASTING`` 任一成立 → 本地算。
+     * 顺序消费与广播在 Java 里被**强制**走本地路径，这里照办：broker 侧分配只服务于
+     * CLUSTERING 并发 POP，其余路径维持本端口原有的本地 rebalance。
+     */
+    public function usesBrokerPopAssignment(): bool
+    {
+        return $this->popMode
+            && !$this->clientRebalance
+            && $this->messageModel !== MessageModel::BROADCASTING
+            && !$this->isOrderly();
+    }
+
+    /**
+     * 建并注册分配轮询方（{@see MQClientInstance::registerPopAssignmentPoller()}，
+     * tick 阶段⑦的驱动对象）。start() 调用一次；重复调用只覆盖旧条目。
+     */
+    private function registerPopAssignment(): void
+    {
+        $client = $this->requireClient();
+        $this->popAssignmentPoller = new PopAssignmentPoller(
+            key: ($this->clientId ?? '') . '|' . $this->consumerGroup,
+            consumerGroup: $this->consumerGroup,
+            clientId: $this->clientId ?? '',
+            strategyName: $this->allocateStrategy->getName(),
+            messageModel: $this->messageModel,
+            // topic 集合**每轮现查**：运行中 subscribe/unsubscribe 都会改变它。
+            topicsFn: fn (): array => $this->popAssignmentTopics(),
+            applyFn: function (string $topic, array $assignments): void {
+                $this->applyPopAssignment($topic, $assignments);
+            },
+            intervalMillis: $this->popAssignmentIntervalMillis,
+        );
+        $client->registerPopAssignmentPoller($this->popAssignmentPoller);
+    }
+
+    /** 本轮要问 broker 的 topic 集合（与本地 rebalance 的输入同源：订阅表）。 */
+    public function popAssignmentTopics(): array
+    {
+        return array_keys($this->subscriptionData);
+    }
+
+    /**
+     * 同步跑一轮 broker 侧分配（start() 的首轮、rebalanceImmediately() 的即时重平衡
+     * 走这里；周期性由实例 tick 阶段⑦驱动）。
+     */
+    public function runPopAssignmentRound(): void
+    {
+        $poller = $this->popAssignmentPoller;
+        if ($poller === null) {
+            return;
+        }
+        $this->requireClient()->runPopAssignmentRound($poller);
+    }
+
+    /**
+     * 把 broker 对一个 topic 的指配并入本地分配（Java getRebalanceResultFromBroker:360-372
+     * → updateMessageQueueAssignment 的队列集语义）。
+     *
+     * 只替换**该 topic** 的条目，其它 topic 的分配一格不动；队列状态的对账
+     * （新队列建 PopProcessQueue、被撤队列 dropped、在途批次不再 ack）由
+     * {@see rebalancePullState()} 统一完成 —— 于是下一轮 tick 的 popRound 立刻按新队列集弹出。
+     *
+     * @param list<array{mq: MessageQueue, mode: MessageRequestMode}> $assignments
+     */
+    public function applyPopAssignment(string $topic, array $assignments): void
+    {
+        $was = [];
+        foreach ($this->assigned as $key => $mq) {
+            $was[$key] = true;
+        }
+        $newAssigned = [];
+        foreach ($this->assigned as $key => $mq) {
+            if ($mq->topic !== $topic) {
+                $newAssigned[$key] = $mq;
+            }
+        }
+        // Java updateMessageQueueAssignment:514-524 先把集分成 pop/pull 两档，本消费者
+        // 只消费队列集（消费模式由 popMode 定死），所以这里只做去重 + 记账。
+        $popCnt = 0;
+        $pullCnt = 0;
+        foreach ($assignments as $one) {
+            $mq = $one['mq'];
+            if ($mq->topic !== $topic) {
+                // broker 对单个 topic 的答复里混进别的 topic：Java 的按 topic 分表更新不会
+                // 出现这种输入，这里一律忽略，免得把未订阅的队列喂进弹出循环。
+                Logger::warning(sprintf(
+                    'queryAssignment for %s/%s returned a queue of foreign topic %s, ignored',
+                    $this->consumerGroup, $topic, (string) $mq,
+                ));
+                continue;
+            }
+            $newAssigned[self::mqKey($mq)] = $mq;
+            if ($one['mode'] === MessageRequestMode::POP) {
+                $popCnt++;
+            } else {
+                $pullCnt++;
+            }
+        }
+        if ($popCnt > 0 && $pullCnt > 0) {
+            Logger::warning(sprintf(
+                'queryAssignment for %s/%s returned mixed modes (pop=%d pull=%d): the queue set is taken as-is, each queue is popped per this consumer\'s popMode',
+                $this->consumerGroup, $topic, $popCnt, $pullCnt,
+            ));
+        }
+        $this->assigned = $newAssigned;
+        $now = [];
+        foreach ($newAssigned as $key => $mq) {
+            $now[$key] = true;
+        }
+        if ($now != $was) {
+            Logger::info(sprintf(
+                'broker rebalanced result changed. allocateMessageQueueStrategyName=%s, group=%s, topic=%s, clientId=%s, assignmentSet=%d',
+                $this->allocateStrategy->getName(),
+                $this->consumerGroup,
+                $topic,
+                (string) $this->clientId,
+                count($assignments),
+            ));
+        }
+        // POP 没有客户端位点（进度在 broker 的 revive 队列里），所以这里**不**像本地路径
+        // 那样给新队列解析初始位点 —— 对齐 Java PopProcessQueue 无 offset 的语义，
+        // 也省掉每队列一次 QUERY_CONSUMER_OFFSET/GET_MAX_OFFSET 空转。
+        $this->rebalancePullState();
+    }
+
+    /**
+     * 实例收到 broker 的 40 通知后触发即时重平衡（对应 Java rebalanceImmediately）。
+     *
+     * broker 侧分配路径没有 20s 的 rebalance 计时器可拨（阶段③被跳过），唤醒的是实例的
+     * 分配轮：下一个 tick 就重查（Java RebalanceService#wakeUp 的同位）。
+     */
     public function rebalanceImmediately(): void
     {
+        if ($this->usesBrokerPopAssignment()) {
+            $this->mqClient?->popAssignmentImmediately();
+            return;
+        }
         $this->rebalanceNow = true;
     }
 
