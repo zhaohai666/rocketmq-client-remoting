@@ -27,6 +27,8 @@
 //    business topic BEFORE the listener (resetRetryTopicAndNamespace).
 import { Buffer } from 'node:buffer';
 import { MQClient, TopicPublishInfo } from './mq_client.ts';
+import type { FacadeProcessor } from './mq_client.ts';
+import { MQClientManager } from './mq_client_manager.ts';
 import { ProcessQueue } from './process_queue.ts';
 import { PopProcessQueue } from './pop_process_queue.ts';
 import {
@@ -70,6 +72,7 @@ import { decodeMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
 import { DefaultMQProducer } from './producer.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
+import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
 import { getLogger } from '../logging.ts';
 import { RemotingTimeoutException } from '../remoting/exception.ts';
 
@@ -139,6 +142,8 @@ export class DefaultMQPushConsumer {
   tlsEnable: boolean | null = null;
   // TLS 细项（见 setTlsOptions）；null = test-mode。
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null = null;
+  // SOCKS 代理（Java ClientConfig#socksProxyConfig）；null = 直连。
+  socksProxyConfig: SocksProxyConfig | null = null;
 
   messageModel: string = MessageModel.CLUSTERING;
   consumeFromWhere: string = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET;
@@ -188,6 +193,9 @@ export class DefaultMQPushConsumer {
   traceDispatcher: any = null;
 
   mqClient: MQClient | null = null;
+  // 本门面登记到共享实例上的反向请求处理器（code -> handler）；shutdown 摘除，
+  // 避免退场的 consumer 继续吃多播扇出。
+  private _facadeHandlers: Map<number, FacadeProcessor> = new Map();
   pullFromWhichNode = new Map<string, number>(); // mqKey -> brokerId
   offsetStore: OffsetStore | null = null;
 
@@ -259,6 +267,10 @@ export class DefaultMQPushConsumer {
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
+  // SOCKS 代理（Java ClientConfig#setSocksProxyConfig）：addr='host:port'，
+  // username/password 可选，version 默认 5、可 4/'SOCKS4'。TCP 建连后、TLS 握手前
+  // 完成 CONNECT；TopAddressing 的 HTTP 寻址不走代理。
+  setSocksProxyConfig(config: SocksProxyConfig | null): this { this.socksProxyConfig = config; return this; }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
   setConsumeTimestamp(ts: string): this { this.consumeTimestamp = ts; return this; }
@@ -417,13 +429,22 @@ export class DefaultMQPushConsumer {
     // (the push consumer leaves the stream flag off, like Java).
     this.clientID = MixAll.clientIdFor(this.instanceName);
 
-    const client = new MQClient(this.clientID, this.nameServerAddr);
-    if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
-    if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
-    // Java MQClientAPIImpl:329 — NamespaceRpcHook is the FIRST hook on the
-    // remoting client; a configured namespaceV2 goes out as nsd/ns extFields
-    // on every rpc (route fetch, heartbeat, pull, send-back, offsets).
-    registerRpcHooks(client.remotingClient, { namespaceV2: () => this.namespaceV2 });
+    // 跨 facade 复用（Java MQClientManager.factoryTable）：同 clientId 的门面共享
+    // 一个实例；配置快照 first-wins（cloneClientConfig 口径），复用方不改写实例的
+    // tls/代理，也不重复注册 rpcHook 链。
+    const manager = MQClientManager.getInstance();
+    const { instance: client, created } = manager.getOrCreateMQClientInstance(
+      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
+    if (created) {
+      if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
+      if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
+      if (this.socksProxyConfig != null) client.remotingClient.socksProxyConfig = this.socksProxyConfig;
+      // Java MQClientAPIImpl:329 — NamespaceRpcHook is the FIRST hook on the
+      // remoting client; a configured namespaceV2 goes out as nsd/ns extFields
+      // on every rpc (route fetch, heartbeat, pull, send-back, offsets).
+      registerRpcHooks(client.remotingClient, { namespaceV2: () => this.namespaceV2 });
+    }
+    manager.registerClient(this.clientID, client);
     this.mqClient = client;
     // Java MQClientFactory.getConsumerStatsManager — instance-level shared.
     this._statsManager = client.consumerStatsManager;
@@ -542,8 +563,14 @@ export class DefaultMQPushConsumer {
       try { this._producer.shutdown(); } catch (e) { /* ignore */ }
       this._producer = null;
     }
-    if (client) client.shutdown();
-    this._statsManager = null; // manager timer stopped by client.shutdown()
+    // 摘掉本门面的反向请求处理器，然后把实例归还给 manager：计数 -1，**归零才
+    // 真正 shutdown**（停心跳/路由定时器、断 remoting）。同 clientId 还挂着别的
+    // 门面时时例与另一份 _statsManager 继续存活。
+    this._unregisterProcessors();
+    if (client) {
+      MQClientManager.getInstance().unregisterClient(client.clientId, client);
+    }
+    this._statsManager = null; // refcount 归零时 manager 关实例，统一采样定时器随之停下
     if (this.traceDispatcher) {
       try { this.traceDispatcher.shutdown(); } catch (e) { /* ignore */ }
       this.traceDispatcher = null;
@@ -2083,14 +2110,35 @@ export class DefaultMQPushConsumer {
   // _registerProcessors wires the broker-initiated requests. Handlers run on
   // the remoting read path: set flags / schedule work, NEVER send a synchronous
   // request inline (self-deadlock).
+  //
+  // 登记走实例级多播（registerFacadeProcessor）而不是 remotingClient 直连槽：
+  // 共享 clientId 的多个 consumer 各自往同一 remotingClient 上 registerProcessor
+  // 会互相顶掉（后启动的覆盖先启动的）。多播**广播**给所有登记者；Java
+  // ClientRemotingProcessor 的口径是处理器内部按请求里的组名决定谁干活 ——
+  // 组不匹配的登记者返回 null（oneway 类不触发、应答类不冒充），匹配者给出
+  // 第一个非 null 应答回传输层。
   private _registerProcessors(): void {
-    const rc = this.mqClient?.remotingClient;
-    if (!rc) return;
-    rc.registerProcessor(RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, () => {
+    const client = this.mqClient;
+    if (!client) return;
+    // 从 extFields 里取组名（两种字段名：consumerGroup / group，Java 各 header 的
+    // 线上字段不一样），与本门面的组（含 namespace 包装后的值）比对。
+    const groupOf = (cmd: RemotingCommand): string => {
+      const ext = cmd.extFields || {};
+      return String(ext['consumerGroup'] != null ? ext['consumerGroup'] : (ext['group'] != null ? ext['group'] : ''));
+    };
+    const mine = (cmd: RemotingCommand): boolean => {
+      const g = groupOf(cmd);
+      // 老 broker 可能不带组名：不带时按 Java 的兜法一样照单处理（单门面行为不变）。
+      return g === '' || g === this.consumerGroup;
+    };
+    const handlers = new Map<number, FacadeProcessor>();
+    handlers.set(RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, (cmd: RemotingCommand) => {
+      if (!mine(cmd)) return null;
       this.rebalanceImmediately();
       return null;
     });
-    rc.registerProcessor(RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT, (cmd: RemotingCommand) => {
+    handlers.set(RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT, (cmd: RemotingCommand) => {
+      if (!mine(cmd)) return null;
       const ext = cmd.extFields || {};
       const topic = ext['topic'] || undefined;
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, null);
@@ -2102,7 +2150,8 @@ export class DefaultMQPushConsumer {
         }))), 'utf-8');
       return response;
     });
-    rc.registerProcessor(RequestCode.RESET_CONSUMER_CLIENT_OFFSET, (cmd: RemotingCommand) => {
+    handlers.set(RequestCode.RESET_CONSUMER_CLIENT_OFFSET, (cmd: RemotingCommand) => {
+      if (!mine(cmd)) return null;
       try {
         const body = cmd.body && cmd.body.length ? RemotingSerializable.decode(cmd.body) : null;
         const table = Array.isArray(body) ? body
@@ -2121,14 +2170,16 @@ export class DefaultMQPushConsumer {
       }
       return RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, null);
     });
-    rc.registerProcessor(RequestCode.GET_CONSUMER_RUNNING_INFO, (cmd: RemotingCommand) => {
+    handlers.set(RequestCode.GET_CONSUMER_RUNNING_INFO, (cmd: RemotingCommand) => {
+      if (!mine(cmd)) return null;
       const h = new GetConsumerRunningInfoRequestHeader();
       try { h.fromExtFields(cmd.extFields || {}); } catch (e) { /* defaults */ }
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, null);
       response.body = Buffer.from(JSON.stringify(this.buildConsumerRunningInfo(h.jstack === true)), 'utf-8');
       return response;
     });
-    rc.registerProcessor(RequestCode.CONSUME_MESSAGE_DIRECTLY, (cmd: RemotingCommand) => {
+    handlers.set(RequestCode.CONSUME_MESSAGE_DIRECTLY, (cmd: RemotingCommand) => {
+      if (!mine(cmd)) return null;
       // Consume one message directly and report the result. The message body
       // rides the request body (MessageExt wire) when the broker pushes it;
       // otherwise report a failure remark.
@@ -2154,6 +2205,17 @@ export class DefaultMQPushConsumer {
       }
       return response;
     });
+    for (const [code, handler] of handlers) client.registerFacadeProcessor(code, handler);
+    this._facadeHandlers = handlers;
+  }
+
+  // 摘除本门面登记到共享实例上的反向请求处理器（shutdown 用）。
+  private _unregisterProcessors(): void {
+    const client = this.mqClient;
+    if (client != null) {
+      for (const [code, handler] of this._facadeHandlers) client.unregisterFacadeProcessor(code, handler);
+    }
+    this._facadeHandlers = new Map();
   }
 
   // buildConsumerRunningInfo assembles the 307 payload: properties,

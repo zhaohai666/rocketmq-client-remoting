@@ -349,6 +349,30 @@ producer = DefaultMQProducer("PID_DEMO", tls_enable=True,
 `ROCKETMQ_TLS_ENABLE=1` environment variable. Producer, all three consumers and the admin run on the
 same transport.
 
+### SOCKS proxy
+
+```python
+from remoting.socks_proxy import SocksProxyConfig
+
+producer = DefaultMQProducer("PID_DEMO",
+                             socks_proxy_config=SocksProxyConfig(
+                                 "proxy.corp.example:1080", username="u", password="p"))
+# All five facades (producer / three consumers / admin) expose the setter:
+# producer.set_socks_proxy_config(SocksProxyConfig(...))
+```
+
+`SocksProxyConfig` mirrors the Java `SocksProxyConfig` fields, plus proxy type, port and an
+enable switch: proxy type `SOCKS5` (default) / `SOCKS4` (domain targets use the 4a extension),
+proxy address (a Java-style `"host:port"` string also works), port, optional username/password
+(SOCKS5 uses the RFC 1929 username-password sub-negotiation), and `enable`
+(`None` by default = enabled whenever addr is set; explicit `False` = keep the config but bypass
+the proxy). Once configured, **all remoting connections** (NameServer + Broker, equivalent to Java
+CIDR `0.0.0.0/0`) run the SOCKS CONNECT handshake after the TCP connect and before the TLS
+handshake; the plain HTTP requests of dynamic NameServer addressing do not go through the proxy
+(same semantics as Java). Target hostnames are not resolved locally and are handed to the proxy
+(SOCKS5 atyp=3 / SOCKS4a). The handshake is hand-written on the standard-library `socket`, no
+third-party dependencies.
+
 ## Features and Status
 
 | Capability | Status |
@@ -368,6 +392,7 @@ same transport.
 | Client statistics (pull TPS and RT, consume RT, consume success/failure TPS) and `ConsumerRunningInfo` (307) | ✅ |
 | Three compression backends: zlib (standard library) / LZ4 / ZSTD | ✅ |
 | TLS (mTLS and strict CA verification) | ✅ |
+| SOCKS proxy (SOCKS4/5, username-password sub-negotiation, CONNECT tunnel, TLS stackable) | ✅ |
 | Dynamic NameServer discovery (`DefaultTopAddressing` + `ROCKETMQ_NAMESRV_DOMAIN`) | ✅ |
 | Send-latency fault avoidance (`set_send_latency_fault_enable`) and master/slave switching | ✅ |
 | Admin (`DefaultMQAdminExt`): topic and subscription-group config, offset query and reset, connection and runtime info, message lookup, broker config and cleanup | ✅ |
@@ -479,7 +504,8 @@ python/
 │   ├── topic_config.py / mix_all.py / util_all.py / message_accessor.py
 │   ├── message_type.py / message_client_id_setter.py / topic_validator.py
 ├── remoting/               transport layer (plain sockets + threads)
-│   ├── client.py               RemotingClient: sync / async / oneway, half-packet reassembly, TLS
+│   ├── client.py               RemotingClient: sync / async / oneway, half-packet reassembly, TLS, SOCKS proxy
+│   ├── socks_proxy.py          SocksProxyConfig + SOCKS4/5 CONNECT handshake (standard library only)
 │   ├── rpchook.py              RPCHook / AclClientRPCHook / NamespaceRpcHook / StreamTypeRPCHook
 │   ├── exception.py
 │   └── protocol/

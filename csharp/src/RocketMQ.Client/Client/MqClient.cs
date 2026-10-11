@@ -291,8 +291,8 @@ public sealed class MQClientInstance : IDisposable
     /// </summary>
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
         int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
-        TlsOptions? tlsOptions = null, string? unitName = null, int pollNameServerIntervalMillis = 30000,
-        bool vipChannelEnabled = false)
+        TlsOptions? tlsOptions = null, SocksProxyConfig? socksProxy = null, string? unitName = null,
+        int pollNameServerIntervalMillis = 30000, bool vipChannelEnabled = false)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
@@ -303,9 +303,11 @@ public sealed class MQClientInstance : IDisposable
             ? pollNameServerIntervalMillis
             : 30000;
         // VIP 通道开关（Java MQClientAPIImpl 持有 clientConfig，逐笔 RPC 里现读
-        // isVipChannelEnabled()；本端口的 facade 各自独占实例，构造时传入即可）。
+        // isVipChannelEnabled()；实例经 MQClientManager 按 clientId 跨门面复用，只有第一个
+        // 到达者的实例级参数生效 —— 与 Java 实例由首个 clientConfig 构造同口径）。
         _vipChannelEnabled = vipChannelEnabled;
-        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable, tlsOptions);
+        _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable, tlsOptions,
+            socksProxy);
         // 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 WsAddr 为空 = 动态取址关闭（与 Java 默认
         // jmenv.tbsite.net 不同：那是个依赖 /etc/hosts 的域名，照抄会让未配置的用户
         // 每次 start 白等 3s 超时）。
@@ -393,6 +395,102 @@ public sealed class MQClientInstance : IDisposable
         return null; // broker 用 oneway 发的，Java 返回 null ⇒ 不回包
     }
 
+    // ---------------- 门面级反向请求处理器（共享实例的多播） ----------------
+    // Java 把 CHECK_TRANSACTION_STATE(39)/GET_CONSUMER_RUNNING_INFO(307)/
+    // RESET_CONSUMER_CLIENT_OFFSET(220)/GET_CONSUMER_STATUS_FROM_CLIENT(221)/
+    // CONSUME_MESSAGE_DIRECTLY(309) 的处理器挂在**实例级**的 ClientRemotingProcessor 上，
+    // 由它按请求里的组名路由到对应的 producer/consumer。这些头在 remoting 的处理器表里
+    // 一个 code 只有一个槽 —— 门面各自往共享实例上 RegisterProcessor 会互相顶掉（后启动
+    // 的覆盖先启动的，先启动的那个门面从此收不到反向请求）。这里收拢成实例级多播：
+    // 同 code 有几个门面登记就扇出给几个，第一个非 null 的应答回给传输层（oneway 类
+    // 处理器一律返回 null，单登记时与直连行为完全一致）。
+    private readonly object _facadeProcessorLock = new();
+    private readonly Dictionary<int, List<RemotingClient.RequestProcessor>> _facadeProcessors = new();
+
+    /// <summary>门面把反向请求处理器登记到实例（共享实例下按登记人数扇出，不互相覆盖）。</summary>
+    public void RegisterFacadeProcessor(int requestCode, RemotingClient.RequestProcessor handler)
+    {
+        lock (_facadeProcessorLock)
+        {
+            if (!_facadeProcessors.TryGetValue(requestCode, out List<RemotingClient.RequestProcessor>? list))
+            {
+                list = new List<RemotingClient.RequestProcessor>();
+                _facadeProcessors[requestCode] = list;
+                _remotingClient.RegisterProcessor(requestCode, DispatchFacadeProcessor);
+            }
+
+            list.Add(handler);
+        }
+    }
+
+    /// <summary>门面退出时摘除自己的处理器；最后一个摘除者负责卸掉传输层的槽。</summary>
+    public void UnregisterFacadeProcessor(int requestCode, RemotingClient.RequestProcessor handler)
+    {
+        lock (_facadeProcessorLock)
+        {
+            if (!_facadeProcessors.TryGetValue(requestCode, out List<RemotingClient.RequestProcessor>? list))
+            {
+                return;
+            }
+
+            list.Remove(handler);
+            if (list.Count == 0)
+            {
+                _facadeProcessors.Remove(requestCode);
+                _remotingClient.UnregisterProcessor(requestCode);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 驱动一次门面处理器的多播分派。公开只为让离线用例能驱动这条反向路径
+    /// （真连接上 broker 推不进来，与 <see cref="ProcessNotifyConsumerIdsChanged"/> 同一理由），
+    /// 勿用于业务代码 —— 传输层自己会按注册表调它。
+    /// 返回第一个非 null 的应答；该 code 没有任何登记者时返回 null。
+    /// </summary>
+    public RemotingCommand? DispatchFacadeProcessor(RemotingCommand cmd, string addr)
+    {
+        RemotingClient.RequestProcessor[] snapshot;
+        lock (_facadeProcessorLock)
+        {
+            if (!_facadeProcessors.TryGetValue(cmd.Code, out List<RemotingClient.RequestProcessor>? list))
+            {
+                return null;
+            }
+
+            snapshot = list.ToArray();
+        }
+
+        foreach (RemotingClient.RequestProcessor handler in snapshot)
+        {
+            try
+            {
+                RemotingCommand? resp = handler(cmd, addr);
+                if (resp is not null)
+                {
+                    return resp;
+                }
+            }
+            catch (Exception e)
+            {
+                // 一个门面的处理器出错不影响其余登记者（对应 Java 整段 try-catch 的兜法）
+                ClientLog.Warn("facade processor for code " + cmd.Code + " failed: " + e.Message);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>某 code 当前登记了几个门面处理器（测试观测面：共享实例下互不覆盖的落点）。</summary>
+    public int FacadeProcessorCount(int requestCode)
+    {
+        lock (_facadeProcessorLock)
+        {
+            return _facadeProcessors.TryGetValue(requestCode,
+                out List<RemotingClient.RequestProcessor>? list) ? list.Count : 0;
+        }
+    }
+
     /// <summary>
     /// 安装 RPC 钩子（ACL 鉴权）。对应 Java 在构造 MQClientInstance 时绑定 rpcHook。
     /// **first-wins**：同一 clientId 的实例被复用，第二个注册者不会覆盖（与 Java 一致），
@@ -469,6 +567,10 @@ public sealed class MQClientInstance : IDisposable
         lock (_wakeupLock)
         {
             _rebalanceWakeups.Clear();
+        }
+        lock (_facadeProcessorLock)
+        {
+            _facadeProcessors.Clear();
         }
         _remotingClient.Shutdown();
     }

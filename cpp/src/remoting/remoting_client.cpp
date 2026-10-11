@@ -25,6 +25,7 @@
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
+#include "rocketmq/remoting/socks_proxy.h"
 #include "tls_session.h"
 
 #ifndef _WIN32
@@ -181,6 +182,10 @@ struct RemotingClient::Impl {
     std::shared_ptr<void> tlsCtx;
     TlsOptions tlsOptions;
 
+    // SOCKS 代理（对应 Java NettyRemotingClient 的 proxyMap；这里只保留一个全局配置，
+    // 不做 Java 的 CIDR -> proxy 映射 —— 本端口按地址串直连，CIDR 分流没有落点）。
+    SocksProxyConfig socksProxy;
+
     mutable std::mutex connMutex;
     std::unordered_map<std::string, std::shared_ptr<Connection>> conns;
 
@@ -245,9 +250,35 @@ struct RemotingClient::Impl {
         std::string port;
         RemotingClient::parseAddress(addr, host, port);
         std::string err;
-        socket_t sock = connectWithTimeout(host, port, connectTimeout, err);
+        // SOCKS 代理开启时 TCP 要连的是**代理**（对应 Java bootstrap.connect 前先挂
+        // Socks5ProxyHandler）；目标 host:port 留给握手阶段的 CONNECT 请求。host 原样
+        // 保留（TLS 的 SNI / 主机名校验仍按目标主机算）。
+        std::string proxyHost;
+        std::string proxyPort;
+        const bool viaProxy = !socksProxy.empty();
+        if (viaProxy) {
+            socksProxy.resolveHostPort(proxyHost, proxyPort);
+        }
+        socket_t sock = connectWithTimeout(viaProxy ? proxyHost : host,
+                                           viaProxy ? proxyPort : port,
+                                           connectTimeout, err);
         if (sock == kInvalidSocket) {
+            if (viaProxy) {
+                err = "connect to socks proxy " + proxyHost + ":" + proxyPort + " failed";
+            }
             throw RemotingConnectException(err);
+        }
+
+        // SOCKS 握手（CONNECT）：必须在任何 RocketMQ 帧 / TLS 握手之前把隧道建好
+        //（对应 Java pipeline.addFirst(Socks5ProxyHandler) —— proxy handler 排在
+        // sslHandler 之前）。失败按建连失败处理，异常信息带握手阶段原因。
+        if (viaProxy) {
+            std::string socksErr;
+            if (!socksConnect(sock, socksProxy, host, port, connectTimeout, socksErr)) {
+                closeSocket(sock);
+                throw RemotingConnectException("socks proxy " + proxyHost + ":" + proxyPort +
+                                               " to " + host + ":" + port + ": " + socksErr);
+            }
         }
 
         auto conn = std::make_shared<Connection>();
@@ -1046,6 +1077,14 @@ void RemotingClient::setTlsOptions(const TlsOptions& options) {
 }
 
 bool RemotingClient::tlsEnable() const { return impl_->tlsEnable; }
+
+void RemotingClient::setSocksProxy(const SocksProxyConfig& proxy) {
+    // 必须在首条连接建立前设置（与 TLS 同一口径）；这里不重建已有连接，
+    // 已建连接继续走原来的隧道，新建连接按新配置走。
+    impl_->socksProxy = proxy;
+}
+
+bool RemotingClient::socksProxyEnabled() const { return !impl_->socksProxy.empty(); }
 
 bool RemotingClient::isChannelWritable(const std::string& addr) const {
     std::lock_guard<std::mutex> lk(impl_->connMutex);

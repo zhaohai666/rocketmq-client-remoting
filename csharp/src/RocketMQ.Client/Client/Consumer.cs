@@ -406,6 +406,19 @@ public sealed class DefaultMQPushConsumer
         set => _tlsOptions = value;
     }
 
+    private SocksProxyConfig? _socksProxyConfig;
+
+    /// <summary>
+    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
+    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
+    /// remoting 长连接，NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
+    /// </summary>
+    public SocksProxyConfig? SocksProxyConfig
+    {
+        get => _socksProxyConfig;
+        set => _socksProxyConfig = value;
+    }
+
     /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
     public long PopInvisibleTime { get; set; } = 60000;
 
@@ -1201,17 +1214,32 @@ public sealed class DefaultMQPushConsumer
             // Java 的 rpcHook 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它。
             // 顺序由 RequestHooks.Compose 还原（Namespace → stream → ACL ⇒ ns/nsd 先写、ReqT 落在签名内容里）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
-                /*connectTimeoutMillis=*/3000,
-                /*invokeTimeoutMillis=*/_pullTimeoutMillis,
-                tlsEnable: TlsEnable, tlsOptions: TlsOptions, unitName: _unitName,
-                pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
+            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
+            // 即复用已有实例（与同进程的生产者/拉消费者共享连接与周期任务），只有第一个
+            // 到达者的实例级参数生效；Start 是幂等的，共享时这是一次空转。
+            _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
+                () => new MQClientInstance(_clientId, _nameServerAddrs,
+                    /*connectTimeoutMillis=*/3000,
+                    /*invokeTimeoutMillis=*/_pullTimeoutMillis,
+                    tlsEnable: TlsEnable, tlsOptions: TlsOptions, socksProxy: _socksProxyConfig,
+                    unitName: _unitName,
+                    pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("consumer rpc hook ignored: MQClientInstance already has one (clientId="
                     + _clientId + ")");
             }
-            _mqClient.Start();
+            try
+            {
+                _mqClient.Start();
+            }
+            catch
+            {
+                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+                _mqClient = null;
+                throw;
+            }
             // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
             // （Java 由共享的 ClientConfig 天然同步）
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
@@ -1245,20 +1273,21 @@ public sealed class DefaultMQPushConsumer
 
             // 对应 Java ClientRemotingProcessor GET_CONSUMER_RUNNING_INFO(307)：
             // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
-            _mqClient.RemotingClient.RegisterProcessor(RequestCode.GetConsumerRunningInfo,
+            // 反向请求处理器一律走实例级多播登记（共享实例下各消费者各登记各的，不互相顶掉）。
+            _mqClient.RegisterFacadeProcessor(RequestCode.GetConsumerRunningInfo,
                 OnGetConsumerRunningInfo);
 
             // RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发，无需应答。
             // 重置会触发 rebalance（invokeSync），不能在读线程上同步跑——丢后台线程。
-            _mqClient.RemotingClient.RegisterProcessor(RequestCode.ResetConsumerClientOffset,
+            _mqClient.RegisterFacadeProcessor(RequestCode.ResetConsumerClientOffset,
                 OnResetConsumerOffset);
 
             // GET_CONSUMER_STATUS_FROM_CLIENT(221)：admin 查询已消费位点表。
-            _mqClient.RemotingClient.RegisterProcessor(RequestCode.GetConsumerStatusFromClient,
+            _mqClient.RegisterFacadeProcessor(RequestCode.GetConsumerStatusFromClient,
                 OnGetConsumerStatus);
 
             // CONSUME_MESSAGE_DIRECTLY(309)：broker 推一条消息下来，本地真实消费一次。
-            _mqClient.RemotingClient.RegisterProcessor(RequestCode.ConsumeMessageDirectly,
+            _mqClient.RegisterFacadeProcessor(RequestCode.ConsumeMessageDirectly,
                 OnConsumeMessageDirectly);
         }
 
@@ -1429,9 +1458,23 @@ public sealed class DefaultMQPushConsumer
             {
                 ClientLog.Debug("unregister client on shutdown failed: " + e.Message);
             }
-        }
 
-        _mqClient?.Shutdown();
+            // 这四个处理器是本消费者登记在**共享实例**上的：先摘掉，避免实例被别的
+            // 门面继续复用时，broker 的反向请求还打向一个已退出的消费者。
+            _mqClient.UnregisterFacadeProcessor(RequestCode.GetConsumerRunningInfo,
+                OnGetConsumerRunningInfo);
+            _mqClient.UnregisterFacadeProcessor(RequestCode.ResetConsumerClientOffset,
+                OnResetConsumerOffset);
+            _mqClient.UnregisterFacadeProcessor(RequestCode.GetConsumerStatusFromClient,
+                OnGetConsumerStatus);
+            _mqClient.UnregisterFacadeProcessor(RequestCode.ConsumeMessageDirectly,
+                OnConsumeMessageDirectly);
+
+            // 归还引用（Java unregisterConsumer 之后那句 mQClientFactory.shutdown() 的等价物）：
+            // 计数归零才真正关停实例，先到的门面退出不能拖垮还在用的共享实例。
+            MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+            _mqClient = null;
+        }
 
         // 顺序对齐 Java DefaultMQPushConsumer.shutdown()：先关本消费者，再 flush 并关轨迹分发器
         //（分发器用的是**自己的**内部生产者，与本实例无关，所以关掉了照样能发完）

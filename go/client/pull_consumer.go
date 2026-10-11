@@ -88,6 +88,7 @@ type DefaultMQPullConsumer struct {
 	unitMode      bool
 	streamRequest bool
 	tlsEnable     *bool
+	socksProxy    *remoting.SocksProxyConfig
 	rpcHook       remoting.RPCHook
 
 	messageModel     string
@@ -261,6 +262,15 @@ func (c *DefaultMQPullConsumer) SetTlsEnable(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tlsEnable = &enable
+}
+
+// SetSocksProxy tunnels the consumer's remoting connections through a SOCKS
+// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
+// address-server HTTP fetch (TopAddressing) is not proxied.
+func (c *DefaultMQPullConsumer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.socksProxy = proxy
 }
 
 func (c *DefaultMQPullConsumer) SetMessageModel(model string) {
@@ -509,6 +519,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 	if c.tlsEnable != nil {
 		cfg.TLSEnable = *c.tlsEnable
 	}
+	cfg.SocksProxy = c.socksProxy
 	cfg.PollNameServerIntervalMillis = c.pollNamesrvIntv
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
 	c.instance = instance

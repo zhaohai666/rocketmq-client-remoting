@@ -1642,4 +1642,64 @@ QueryConsumeQueueResponseBody DefaultMQAdminExt::queryConsumeQueue(
     return body;
 }
 
+// ---------------------------------------- 直接消费探针（309）
+PropertyMap DefaultMQAdminExt::buildConsumeMessageDirectlyExtFields(
+    const std::string& topic, const std::string& consumerGroup, const std::string& clientId,
+    const std::string& msgId) {
+    // Java ConsumeMessageDirectlyResultRequestHeader 的字段名：topic / consumerGroup /
+    // clientId / msgId。MQClientAPIImpl:2747-2751 四个 set 全部显式下发（四个都非 null）。
+    PropertyMap ext;
+    ext["topic"] = topic;
+    ext["consumerGroup"] = consumerGroup;
+    ext["clientId"] = clientId;
+    ext["msgId"] = msgId;
+    return ext;
+}
+
+ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
+    const std::string& brokerAddr, const std::string& consumerGroup, const std::string& clientId,
+    const std::string& topic, const std::string& msgId, int32_t timeoutMillis) {
+    if (consumerGroup.empty()) {
+        throw MQClientException("consumeMessageDirectly: consumerGroup required");
+    }
+    PropertyMap ext = buildConsumeMessageDirectlyExtFields(topic, consumerGroup, clientId, msgId);
+    // invokeSyncRaw 不代抛非 SUCCESS：206（消费者不在线）这类响应码对调用方是有语义的
+    // （Java MQClientAPIImpl:2758-2770 的 switch 只认 SUCCESS，其余统一抛
+    // MQClientException(响应码, remark)），这里原样带上响应码抛出。
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::CONSUME_MESSAGE_DIRECTLY, ext, Bytes(), false,
+        timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQClientException(
+            response.remark.empty() ? "consume message directly failed" : response.remark,
+            response.code);
+    }
+    if (response.body.empty()) {
+        // Java :2761-2764 的 body == null 分支：broker 说成功但没带回消费者的判据
+        throw MQClientException("no consume result for client " + clientId);
+    }
+    ConsumeMessageDirectlyResult result;
+    if (!ConsumeMessageDirectlyResult::decode(response.body, result)) {
+        throw MQClientException("consumeMessageDirectly: bad ConsumeMessageDirectlyResult body");
+    }
+    return result;
+}
+
+ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
+    const std::string& consumerGroup, const std::string& clientId, const std::string& topic,
+    const std::string& msgId) {
+    // 对应 Java DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1347：先 viewMessage
+    // 把 msgId 解成消息本体 —— 目标 broker 取消息的**存储主机**（消息落在哪台 broker 就
+    // 打哪台；broker 收到 309 后按 clientId 找在线消费者转推），msgId 是 uniq key 时换成
+    // offset msgId（broker 侧把 msgId 原样记进回给 admin 的结果，用它对号入座）。
+    MessageExt msg = viewMessage(topic, msgId);
+    std::string outMsgId = msgId;
+    if (!msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).empty()
+        && !msg.getOffsetMsgId().empty()) {
+        outMsgId = msg.getOffsetMsgId();
+    }
+    return consumeMessageDirectly(msg.getStoreHostString(), consumerGroup, clientId, topic,
+                                  outMsgId);
+}
+
 }  // namespace rocketmq

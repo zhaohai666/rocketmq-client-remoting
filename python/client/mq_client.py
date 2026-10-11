@@ -62,6 +62,7 @@ from remoting.protocol.route import TopicRouteData
 from remoting.rpchook import NamespaceRpcHook, StreamTypeRPCHook
 from .consumer_stats import ConsumerStatsManager
 from .exception import ClientErrorCode, MQBrokerException, MQClientException
+from .mq_client_manager import MQClientManager
 from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
 from .send_result import SendResult, SendStatus
 from .top_addressing import DefaultTopAddressing
@@ -127,7 +128,8 @@ class MQClientInstance:
                  enable_stream_request_type: bool = False,
                  unit_name: Optional[str] = None,
                  namespace_v2: Optional[str] = None,
-                 poll_name_server_interval: int = 30000):
+                 poll_name_server_interval: int = 30000,
+                 socks_proxy_config=None):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
         # 在用 topic 的路由刷新周期（对应 Java ClientConfig.pollNameServerInterval，
@@ -140,8 +142,13 @@ class MQClientInstance:
         # 给每笔请求加 nsd=true / ns=<值> 两个扩展头。与各 facade 的其余 ClientConfig
         # 开关一样，**只在 start() 建实例时取一次快照**。
         self.namespace_v2 = namespace_v2 or ""
+        # SOCKS 代理（对应 Java NettyRemotingClient 的 socksProxyConfig）：透传给
+        # 传输层，在每条 remoting 连接建连时做 SOCKS 握手。NameServer HTTP 动态取址
+        # （DefaultTopAddressing 的普通 HTTP 请求）不经此配置，与 Java 口径一致。
+        self.socks_proxy_config = socks_proxy_config
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
-                                              tls_enable=tls_enable, tls_options=tls_options)
+                                              tls_enable=tls_enable, tls_options=tls_options,
+                                              socks_proxy_config=socks_proxy_config)
         # 对应 Java `MQClientAPIImpl:329-335` 的注册顺序：Namespace → Stream →
         # 用户 rpcHook（ACL 签名）→ DynamicalExtField。Java 无条件注册 NamespaceRpcHook
         # （未配置 namespaceV2 时它自己 no-op），这里照抄；本钩子必须排在最前，
@@ -199,7 +206,19 @@ class MQClientInstance:
         # 40 只能由 broker 发出，用例无法注入反向请求，所以计数是唯一能断言
         # 「本端确实收到并处理过」的落点（见 python/tests/test_broker_requests.py）。
         self._consumer_ids_changed_count = 0
+        # 事务回查 CHECK_TRANSACTION_STATE(39)：实例级注册一个**分派器**，按 PGROUP
+        # 扇给各门面生产者注册进来的处理器（见 register_transaction_check_handler）。
+        # 对应 Java MQClientAPIImpl 构造器里实例级注册的 ClientRemotingProcessor +
+        # MQClientInstance.producerTable 的按组查找——跨门面复用后同一实例上多个
+        # 生产者各自注册不会互相覆盖。
+        self.remoting_client.register_processor(
+            RequestCode.CHECK_TRANSACTION_STATE, self._dispatch_check_transaction_state)
         self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
+        # 事务回查 CHECK_TRANSACTION_STATE(39) 的**门面级**处理器列表。39 本身是
+        # 实例级注册（一个 code 只有一个处理器槽位），但处理要按 PGROUP 属性找到
+        # 对应的生产者——跨门面复用后同一实例上可能挂着多个不同组的生产者，
+        # 逐个调用让每个处理器自己按组过滤（对齐 Java 的 producerTable 分派）。
+        self._transaction_check_handlers: List[Callable] = []
         # 动态 name server（对应 Java MQClientAPIImpl.topAddressing）。
         # 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 ws_addr 为空串 → fetch 是 no-op，行为不变。
         # unitName 要透传（Java `new DefaultTopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName())`）：
@@ -213,6 +232,9 @@ class MQClientInstance:
         # scheduleAtFixedRate(adjustThreadPool, 1, 1, MINUTES)）
         self._adjust_pool_stop = threading.Event()
         self._adjust_pool_thread: Optional[threading.Thread] = None
+        # 生命周期锁：跨门面复用后 start()/shutdown() 可能来自不同门面的线程，
+        # 幂等性必须靠锁保证（对应 Java MQClientInstance 各服务的 synchronized start）。
+        self._lifecycle_lock = threading.RLock()
         MQClientInstance.INSTANCE_MAP[client_id] = self
 
     def fetch_name_server_addr(self) -> Optional[str]:
@@ -257,6 +279,37 @@ class MQClientInstance:
 
     def find_consumer(self, group: str) -> Optional["DefaultMQPushConsumer"]:
         return self._consumer_table.get(group)
+
+    # ---------------- 事务回查处理器登记（39 分派的门面侧） ----------------
+    def register_transaction_check_handler(self, handler: Callable) -> None:
+        """登记一个生产者的 ``_handle_check_transaction_state(cmd, addr)``。
+
+        处理器内部按消息 PGROUP 属性自过滤（见 producer 同名方法），分派器逐个
+        调用即可 —— 同一实例上多个不同组的生产者互不干扰（Java 的
+        ``DefaultMQProducerImpl.checkTransactionState`` 先按组查 producerTable）。
+        重复登记同一处理器是 no-op（幂等，防复用场景下重复注册）。
+        """
+        with self._lifecycle_lock:
+            if handler not in self._transaction_check_handlers:
+                self._transaction_check_handlers.append(handler)
+
+    def unregister_transaction_check_handler(self, handler: Callable) -> None:
+        with self._lifecycle_lock:
+            try:
+                self._transaction_check_handlers.remove(handler)
+            except ValueError:
+                pass
+
+    def _dispatch_check_transaction_state(self, cmd: RemotingCommand,
+                                          addr: str) -> Optional[RemotingCommand]:
+        """39 是 oneway，不回响应；把请求交给每个登记的生产者处理器。"""
+        for handler in list(self._transaction_check_handlers):
+            try:
+                handler(cmd, addr)
+            except Exception as e:  # noqa: BLE001 —— 单个生产者的异常不影响其他门面
+                logger.warning("checkTransactionState dispatch failed: %s", e)
+        return None
+
 
     # ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
     def check_client_in_broker(self) -> None:
@@ -449,7 +502,25 @@ class MQClientInstance:
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
-        self._started = True
+        """幂等启动：实例被多个门面共享时，重复 start 不重复拉起后台线程。
+
+        对应 Java ``MQClientInstance.start`` 的 ServiceState 守卫（CREATE_JUST 之外
+        直接 return）。启动失败时把实例从 MQClientManager 缓存摘掉（对应 Java
+        ``cleanupAfterStartFailure`` + ``removeClientFactory``），半启动实例不许
+        留在表里毒化后续的 ``getOrCreateMQClientInstance``。
+        """
+        with self._lifecycle_lock:
+            if self._started:
+                return
+            self._started = True
+            try:
+                self._start_locked()
+            except Exception:
+                self._started = False
+                MQClientManager.get_instance().remove_client_factory(self.client_id, self)
+                raise
+
+    def _start_locked(self) -> None:
         # 消费统计采样线程（Java ConsumerStatsManager.start 是空的——采样挂在
         # 各 StatsItem 的调度器上；这里收敛为一个统一线程，采样精度不变 10s）
         self.consumer_stats_manager.start()
@@ -490,12 +561,15 @@ class MQClientInstance:
             self._adjust_pool_thread = t
 
     def shutdown(self) -> None:
-        self._started = False
-        self._route_refresh_stop.set()
-        self._adjust_pool_stop.set()
-        self._namesrv_refresh_stop.set()
-        self.consumer_stats_manager.shutdown()
-        self.remoting_client.shutdown()
+        # 真正的关闭由 MQClientManager 在引用计数归零时触发（unregister_client）；
+        # 这里与 start() 共用一把锁，避免复用场景下与并发的 start 交错。
+        with self._lifecycle_lock:
+            self._started = False
+            self._route_refresh_stop.set()
+            self._adjust_pool_stop.set()
+            self._namesrv_refresh_stop.set()
+            self.consumer_stats_manager.shutdown()
+            self.remoting_client.shutdown()
 
     def _namesrv_refresh_loop(self) -> None:
         """动态 name server 周期刷新。

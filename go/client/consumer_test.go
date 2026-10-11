@@ -95,6 +95,13 @@ type consumerBroker struct {
 	changeInvisible []*remoting.ChangeInvisibleTimeRequestHeader
 	requestModes    []*remoting.SetMessageRequestModeRequestBody
 	popFixture      *popFixture
+
+	// ---- QUERY_ASSIGNMENT bookkeeping (see pop_assignment_test.go) ----
+	// assignmentsByTopic keys the canned 400 answer by requested topic; a
+	// topic with no entry gets the "success, no set" default (which the
+	// client reads as Java's null = keep current).
+	queryAssignments []*remoting.QueryAssignmentRequestBody
+	assignmentsByTopic map[string]*assignmentFixture
 }
 
 func newConsumerBroker() *consumerBroker {
@@ -103,6 +110,7 @@ func newConsumerBroker() *consumerBroker {
 		maxOffset: map[mqKey]int64{},
 		minOffset: map[mqKey]int64{},
 		committed: map[string]int64{},
+		assignmentsByTopic: map[string]*assignmentFixture{},
 	}
 }
 
@@ -262,6 +270,8 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		return b.answerChangeInvisible(req)
 	case remoting.ReqSetMessageRequestMode:
 		return b.answerSetMode(req)
+	case remoting.ReqQueryAssignment:
+		return b.answerQueryAssignment(req)
 	case remoting.ReqSendMessageV2:
 		header := &remoting.SendMessageRequestHeaderV2{}
 		header.FromExtFields(req.ExtFields())

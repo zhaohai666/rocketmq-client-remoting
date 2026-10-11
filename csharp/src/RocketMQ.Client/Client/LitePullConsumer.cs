@@ -208,6 +208,19 @@ public sealed class DefaultLitePullConsumer
         set => _pollNameServerIntervalMillis = value;
     }
 
+    private SocksProxyConfig? _socksProxyConfig;
+
+    /// <summary>
+    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
+    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
+    /// remoting 长连接，NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
+    /// </summary>
+    public SocksProxyConfig? SocksProxyConfig
+    {
+        get => _socksProxyConfig;
+        set => _socksProxyConfig = value;
+    }
+
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "") =>
@@ -402,15 +415,29 @@ public sealed class DefaultLitePullConsumer
             // _rpcHook 会让 ReqT 漏发，开 ACL 时签的内容也与上线字段不一致。
             // 绑定位置同样在 Start() **之前**（Java 的 rpcHook 随 MQClientAPIImpl 构造传入）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
-                /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000,
-                unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
+            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
+            // 即复用已有实例，只有第一个到达者的实例级参数生效；Start 是幂等的。
+            _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
+                () => new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
+                    /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000,
+                    socksProxy: _socksProxyConfig,
+                    unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("lite pull consumer rpc hook ignored: MqClient already has one (clientId="
                     + _clientId + ")");
             }
-            _mqClient.Start();
+            try
+            {
+                _mqClient.Start();
+            }
+            catch
+            {
+                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+                _mqClient = null;
+                throw;
+            }
 
             if (_assignMode)
             {
@@ -503,8 +530,13 @@ public sealed class DefaultLitePullConsumer
             if (_pullThread is { IsAlive: true }) _pullThread.Join(2000);
             if (_heartbeatThread is { IsAlive: true }) _heartbeatThread.Join(2000);
             if (_metadataThread is { IsAlive: true }) _metadataThread.Join(2000);
-            _mqClient?.Shutdown();
-            _mqClient = null;
+            // 归还引用（Java DefaultLitePullConsumerImpl.shutdown 末句 mQClientFactory.shutdown()
+            // 的等价物）：计数归零才真正关停实例，先到的门面退出不能拖垮还在用的共享实例。
+            if (_mqClient is not null)
+            {
+                MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+                _mqClient = null;
+            }
         }
     }
 

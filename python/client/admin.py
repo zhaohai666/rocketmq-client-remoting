@@ -26,10 +26,12 @@ from common.mix_all import MixAll
 from common.sysflag import PermName
 from common.topic_config import TopicConfig
 from rocketmq_logging import get_logger
-from remoting.protocol.body import (ClusterInfo, ConsumerConnection,
+from remoting.protocol.body import (ClusterInfo, ConsumeMessageDirectlyResult,
+                                      ConsumerConnection,
                                       ConsumerRunningInfo, KVTable,
                                       ProducerConnection, QueryConsumeTimeSpanBody,
                                       ResetOffsetBody, TopicList)
+from remoting.protocol.headers import ConsumeMessageDirectlyResultRequestHeader
 from remoting.protocol.admin_body import (ConsumeStats, QueryConsumeQueueResponseBody,
                                             TopicConfigSerializeWrapper, TopicStatsTable)
 from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
@@ -39,9 +41,11 @@ from remoting.protocol.serialize import RemotingSerializable, fastjson_loads
 from remoting.protocol.subscription import (SubscriptionGroupConfig,
                                               SubscriptionGroupWrapper)
 from remoting.rpchook import RPCHook
+from remoting.socks_proxy import SocksProxyConfig
 from .consumer_result import PullResult, PullStatus
 from .exception import MQBrokerException, MQClientException
 from .mq_client import MQClientInstance
+from .mq_client_manager import MQClientManager
 
 logger = get_logger()
 
@@ -124,6 +128,8 @@ class DefaultMQAdminExt:
         # 改走 VIP 端口（端口 - 2）。只对本 admin 的 broker 调用生效——admin 不发消息、
         # 不注册消费者，Java 里普通收发路径的同一开关在本项目四端均未接线。
         self.vip_channel_enabled = False
+        # SOCKS 代理（对应 Java SocksProxyConfig + NettyRemotingClient 的代理接入）
+        self.socks_proxy_config: Optional[SocksProxyConfig] = None
         self.name_server_addrs: List[str] = []
         # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
         # 只在 start() 建 MQClientInstance 时透传一次。
@@ -163,6 +169,17 @@ class DefaultMQAdminExt:
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
 
+    def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
+        """SOCKS 代理配置（对齐 Java SocksProxyConfig：类型/地址/端口/用户名/密码/enable）。
+
+        只在 ``start()`` 建 MQClientInstance 时取一次快照（与 unit_name 同口径）；
+        传 None 或 enable=False 即不走代理。
+        """
+        self.socks_proxy_config = socks_proxy_config
+
+    def get_socks_proxy_config(self) -> Optional[SocksProxyConfig]:
+        return self.socks_proxy_config
+
     def set_vip_channel_enabled(self, enable: bool) -> None:
         """对应 Java `ClientConfig#setVipChannelEnabled`。"""
         self.vip_channel_enabled = bool(enable)
@@ -191,14 +208,26 @@ class DefaultMQAdminExt:
         if self.client_id is None:
             self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
                                                   self.enable_stream_request_type)
-        self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
-                                           enable_stream_request_type=self.enable_stream_request_type,
-                                           unit_name=self.unit_name,
-                                           namespace_v2=self.namespace_v2,
-                                           poll_name_server_interval=self.poll_name_server_interval)
-        if self.rpc_hook is not None:
+        # 对应 Java DefaultMQAdminExtImpl.start:165 → MQClientManager
+        # .getOrCreateMQClientInstance：同 clientId 复用同一份实例。
+        def _create_instance() -> MQClientInstance:
+            return MQClientInstance(self.client_id, self.name_server_addrs,
+                                    socks_proxy_config=self.socks_proxy_config,
+                                    enable_stream_request_type=self.enable_stream_request_type,
+                                    unit_name=self.unit_name,
+                                    namespace_v2=self.namespace_v2,
+                                    poll_name_server_interval=self.poll_name_server_interval)
+        self._mq_client, created = MQClientManager.get_instance() \
+            .get_or_create_mq_client_instance(self.client_id, _create_instance)
+        if created and self.rpc_hook is not None:
             self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
-        self._mq_client.start()
+        manager = MQClientManager.get_instance()
+        manager.register_client(self.client_id, self._mq_client)
+        try:
+            self._mq_client.start()
+        except Exception:
+            manager.unregister_client(self.client_id, self._mq_client)
+            raise
         self._started = True
 
     def shutdown(self) -> None:
@@ -206,7 +235,10 @@ class DefaultMQAdminExt:
             return
         self._started = False
         if self._mq_client is not None:
-            self._mq_client.shutdown()
+            # 引用计数语义：同 clientId 还有别的门面在用时实例继续存活，
+            # 归零才真正 shutdown（对应 Java adminExtTable 判空后的实例关闭）。
+            MQClientManager.get_instance().unregister_client(
+                self.client_id or "", self._mq_client)
 
     def get_mq_client_instance(self) -> MQClientInstance:
         return self._require_client()
@@ -740,6 +772,64 @@ class DefaultMQAdminExt:
         client = self._require_client()
         addr = broker_addr or self._find_first_broker_addr(client)
         return client.get_consumer_list_by_group(consumer_group, addr=addr)
+
+    # ---------------- 直连消费（Java DefaultMQAdminExtImpl.consumeMessageDirectly） ----------------
+    def consume_message_directly(self, consumer_group: str, client_id: str, topic: str,
+                                 msg_id: str,
+                                 broker_addr: Optional[str] = None) -> ConsumeMessageDirectlyResult:
+        """对应 Java `DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1332` →
+        `MQClientAPIImpl.consumeMessageDirectly:2741`：向**存储这条消息**的 broker
+        下发 CONSUME_MESSAGE_DIRECTLY(309)，broker 把消息原文推给 ``client_id``
+        指定的消费者实例真实消费一次，应答 body 是 ConsumeMessageDirectlyResult
+        （ Consumption 判定在消费者端产生，broker 只做转发）。
+
+        msgId 解析对齐 Java：先 viewMessage——offset msgId 直解出 broker 地址 +
+        commitLog 偏移，uniqKey 走索引查询兜底。msgId 带客户端 UNIQ_KEY 属性时
+        改发 **offsetMsgId**：broker 端 `AdminBrokerProcessor:2629` 拿 msgId 当
+        commitLog 偏移 `selectOneMessageByOffset`，客户端生成的 uniqKey 必然查空。
+        ``broker_addr`` 可显式指定 broker（Java 的 Address 形态重载没有公开入口，
+        这里仿照 examine_consumer_running_info 留作覆盖参数）。
+
+        brokerName 是 Java 头里的可空字段（Java 发起端从不设置）；这里在路由能
+        对上地址时尽量带上（broker 名下找主节点的归属信息），供消费端构造
+        MessageQueue 使用——本仓库自己的 309 接收端就用它，查不到不阻塞主流程。
+        """
+        if not consumer_group or not client_id:
+            raise MQClientException("consumeMessageDirectly: consumerGroup/clientId required")
+        from common.message_const import MessageConst
+        msg = self.view_message(topic, msg_id)
+        addr = broker_addr or msg.get_store_host_string()
+        if not addr:
+            raise MQClientException(
+                "consumeMessageDirectly: cannot resolve broker address for message %s"
+                % msg_id)
+        out_msg_id = msg_id
+        if (msg.get_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) is not None
+                and msg.get_offset_msg_id()):
+            out_msg_id = msg.get_offset_msg_id()
+
+        broker_name = msg.get_broker_name()
+        if not broker_name:
+            try:
+                route = self._require_client().get_topic_route_data(topic)
+            except Exception:  # noqa: BLE001 — brokerName 只是补充信息，拿不到不阻塞
+                route = None
+            for bd in (route.get_broker_datas() if route else []):
+                if addr in (bd.broker_addrs or {}).values():
+                    broker_name = bd.broker_name
+                    break
+
+        header = ConsumeMessageDirectlyResultRequestHeader()
+        header.consumer_group = consumer_group
+        header.client_id = client_id
+        header.msg_id = out_msg_id
+        header.topic = topic
+        header.broker_name = broker_name
+        response = self._invoke_broker(addr, RequestCode.CONSUME_MESSAGE_DIRECTLY,
+                                       ext_fields=header.to_ext_fields())
+        if not response.body:
+            raise MQClientException("no consume result for client %s" % client_id)
+        return ConsumeMessageDirectlyResult.decode(response.body)
 
     # ---------------- 消费统计 ----------------
     def examine_consume_stats(self, broker_addr: str, consumer_group: str,

@@ -44,11 +44,14 @@ use RocketMQ\Remoting\Protocol\HeartbeatData;
 use RocketMQ\Remoting\Protocol\LockBatchMqRequestHeader;
 use RocketMQ\Remoting\Protocol\LockBatchRequestBody;
 use RocketMQ\Remoting\Protocol\LockBatchResponseBody;
+use RocketMQ\Remoting\Protocol\MessageRequestMode;
 use RocketMQ\Remoting\Protocol\NotifyConsumerIdsChangedRequestHeader;
 use RocketMQ\Remoting\Protocol\PopMessageRequestHeader;
 use RocketMQ\Remoting\Protocol\PopMessageResponseHeader;
 use RocketMQ\Remoting\Protocol\PullMessageRequestHeader;
 use RocketMQ\Remoting\Protocol\PullMessageResponseHeader;
+use RocketMQ\Remoting\Protocol\QueryAssignmentRequestBody;
+use RocketMQ\Remoting\Protocol\QueryAssignmentResponseBody;
 use RocketMQ\Remoting\Protocol\QueryConsumerOffsetRequestHeader;
 use RocketMQ\Remoting\Protocol\QueryConsumerOffsetResponseHeader;
 use RocketMQ\Remoting\Protocol\QueryMessageRequestHeader;
@@ -73,6 +76,7 @@ use RocketMQ\Remoting\Protocol\UnregisterClientRequestHeader;
 use RocketMQ\Remoting\Protocol\UpdateConsumerOffsetRequestHeader;
 use RocketMQ\Remoting\RemotingClient;
 use RocketMQ\Remoting\NamespaceRpcHook;
+use RocketMQ\Remoting\SocksProxyConfig;
 use RocketMQ\Remoting\StreamTypeRPCHook;
 
 /**
@@ -191,6 +195,18 @@ class MQClientInstance
     /** 路由刷新：Java initialDelay = 10ms。 */
     public const ROUTE_REFRESH_INITIAL_DELAY_MILLIS = 10;
 
+    /**
+     * POP broker 侧分配的 RPC 超时（Java RebalanceImpl#QUERY_ASSIGNMENT_TIMEOUT:62 = 3000）。
+     */
+    public const QUERY_ASSIGNMENT_TIMEOUT_MILLIS = 3000;
+
+    /**
+     * POP broker 侧分配的默认轮询周期：Java 的 QUERY_ASSIGNMENT 挂在 RebalanceService 的
+     * rebalance 调度上（`rebalanceInterval` 默认 20s，且被 `Math.max(5000, …)` 钳过下界），
+     * 本端口的分配轮因此默认 20s —— 与 PushConsumer 本地 rebalance 的节奏一致。
+     */
+    public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
+
     /** 对应 Python 的 INSTANCE_MAP（clientId → 实例）。 */
     public static array $instanceMap = [];
 
@@ -261,6 +277,12 @@ class MQClientInstance
     /** @var list<callable> 单线程下的「后台任务」延迟队列（原 Python 另起线程做的事） */
     private array $pendingActions = [];
 
+    /**
+     * producer start() 时注册进来的故障规避策略（Java 无此挂接——Java 的探测是策略
+     * 自带的调度线程；PHP 无线程，探测轮收敛到 tick() 里同步跑，见 tick ⑥）。
+     */
+    private ?MQFaultStrategy $faultStrategy = null;
+
     private bool $namesrvRefreshEnabled = false;
     private ?int $namesrvRefreshNextRunMillis = null;
     private ?int $adjustPoolNextRunMillis = null;
@@ -286,13 +308,14 @@ class MQClientInstance
         int $pollNameServerInterval = 30000,
         ?array $tlsOptions = null,
         bool $vipChannelEnabled = false,
+        ?SocksProxyConfig $socksProxy = null,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
         $this->pollNameServerInterval = $pollNameServerInterval;
         $this->vipChannelEnabled = $vipChannelEnabled;
         $this->namespaceV2 = $namespaceV2;
-        $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions);
+        $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions, socksProxy: $socksProxy);
         // 对应 Java MQClientAPIImpl:329-335 的装链顺序：
         //   Namespace → Stream → 用户 rpcHook（ACL 签名）→（本端口无 DynamicalExtField）
         // namespace 钩子**无条件注册**且排在最前：nsd/ns 必须在算签名之前进 extFields，
@@ -430,6 +453,8 @@ class MQClientInstance
         $this->routeRefreshNextRunMillis = null;
         $this->statsSampleNextRunMillis = null;
         $this->requestScanNextRunMillis = null;
+        // 主动探活随实例下线摘除（Java LatencyFaultToleranceImpl.shutdown 停探测线程的同位）
+        $this->faultStrategy = null;
         $this->pendingActions = [];
         $this->consumerStatsManager->shutdown();
         $this->remotingClient->shutdown();
@@ -493,6 +518,59 @@ class MQClientInstance
             } catch (\Throwable $e) {
                 Logger::warning('scan RequestFutureTable exception: ' . $e->getMessage());
             }
+        }
+
+        // ⑥故障规避主动探活（Java LatencyFaultToleranceImpl.startDetector 的
+        //   scheduleAtFixedRate(3s) 探测线程在这里收敛为 tick 的到期判定；每个 broker
+        //   的探测周期由 FaultItem.checkStamp / detectInterval 控制，与调度节奏无关）。
+        //   开关每轮现读（Java 的 runnable 同位判定），运行中翻转立即生效。探测是同步
+        //   RPC：单个到期 broker 最多阻塞 detectTimeout 毫秒，未到期的条目零开销。
+        if ($this->faultStrategy !== null && $this->faultStrategy->isStartDetectorEnable()) {
+            try {
+                $this->faultStrategy->detectByOneRound(
+                    $now,
+                    fn (string $brokerName): ?string => $this->findBrokerAddressInPublish($brokerName),
+                    $this->detectService(...)
+                );
+            } catch (\Throwable $e) {
+                Logger::warning('fault detector round exception: ' . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * producer start() 时注册故障规避策略（对应 Java DefaultMQProducerImpl.start:272 的
+     * ``mqFaultStrategy.startDetector()`` 挂接点；传 null 等价于 Java 的 shutdown 摘除）。
+     */
+    public function registerFaultStrategy(?MQFaultStrategy $strategy): void
+    {
+        $this->faultStrategy = $strategy;
+    }
+
+    /**
+     * ServiceDetector 等价物（Java DefaultMQProducerImpl 构造器 :155-169 的匿名
+     * ServiceDetector）：对 endpoint 发一个 GET_MAX_OFFSET(30)——探测 topic 的 queue 0，
+     * RPC 全链路（连接、路由、存储应答）走通即视为服务可达；任何异常（连接失败、
+     * 超时、broker 拒绝）都算仍不可达。没有在用 topic 时直接判失败
+     * （Java pickTopic 空表 → Optional.empty → false）。
+     */
+    private function detectService(string $brokerAddr, int $timeoutMillis): bool
+    {
+        $topics = array_keys($this->topicsInUse);
+        if ($topics === []) {
+            return false;
+        }
+        $mq = new MessageQueue($topics[0], '', 0);
+        try {
+            $this->getMaxOffset($mq, $timeoutMillis, $brokerAddr);
+            return true;
+        } catch (\Throwable $e) {
+            Logger::debug(sprintf(
+                'detect GET_MAX_OFFSET to %s failed: %s',
+                $brokerAddr,
+                $e->getMessage()
+            ));
+            return false;
         }
     }
 

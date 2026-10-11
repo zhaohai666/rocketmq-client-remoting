@@ -392,6 +392,39 @@ public:
                                                    int64_t index, int32_t count = 32,
                                                    const std::string& consumerGroup = std::string());
 
+    // ---------------- 直接消费探针（CONSUME_MESSAGE_DIRECTLY(309)）----------------
+    // 309 是 admin → broker 的请求：broker 收到后**转推**给 clientId 对应的在线消费者
+    // （见 DefaultMQPushConsumer 的客户端处理器），把该消费者本地真实消费一次的判据
+    // （ConsumeMessageDirectlyResult body）带回来。
+    //
+    // 对应 Java DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1347：先用 viewMessage
+    // 把 msgId 解成消息（offsetMsgId 直查 commitLog、失败退 uniqKey 检索两条路径），目标
+    // broker 取消息的**存储主机**（消息在哪台 broker 就打哪台，不是路由第一台）；消息带
+    // uniq key 时把请求里的 msgId 换成 **offsetMsgId**（Java MessageClientExt 同口径，
+    // nodeJs/src/client/admin.ts:1361-1387 同）。
+    ConsumeMessageDirectlyResult consumeMessageDirectly(const std::string& consumerGroup,
+                                                        const std::string& clientId,
+                                                        const std::string& topic,
+                                                        const std::string& msgId);
+    // 对应 Java MQClientAPIImpl#consumeMessageDirectly:2741-2771：单笔 309 RPC。
+    // 响应体是 ConsumeMessageDirectlyResult JSON；非 SUCCESS 或 SUCCESS 而 body 为空时
+    // 抛 MQClientException（典型非 SUCCESS：CONSUMER_NOT_ONLINE(206)，消费者不在线时
+    // broker 无处转推）。
+    ConsumeMessageDirectlyResult consumeMessageDirectly(const std::string& brokerAddr,
+                                                        const std::string& consumerGroup,
+                                                        const std::string& clientId,
+                                                        const std::string& topic,
+                                                        const std::string& msgId,
+                                                        int32_t timeoutMillis = -1);
+    // 309 的 extFields 构造，开放给单测锁键名（同 buildResetOffsetExtFields 的理由）：
+    // 键名是 Java ConsumeMessageDirectlyResultRequestHeader 的**字段名**。
+    // MQClientAPIImpl 只设 topic / consumerGroup / clientId / msgId 四个字段 ——
+    // brokerName / topicSysFlag / groupSysFlag 不下发；写成别的键名 broker 侧解析不到
+    // 是**静默**的（推给消费者的消息对不上号，admin 拿到的结果里 remark/msgId 全错）。
+    static PropertyMap buildConsumeMessageDirectlyExtFields(
+        const std::string& topic, const std::string& consumerGroup, const std::string& clientId,
+        const std::string& msgId);
+
 private:
     // ---------------- 底层调用助手 ----------------
     MQClientInstance& requireClient();

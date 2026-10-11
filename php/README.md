@@ -344,6 +344,24 @@ $producer->tlsOptions = [
 
 缺省不带 `caCert` 时信任自签证书；缺省严格校验主机名与证书链。
 
+### SOCKS 代理
+
+对齐 Java `ClientConfig` 的 `socksProxyConfig`（`SocksProxyConfig`：addr / username / password，
+缺省 SOCKS5，另支持 SOCKS4）：配置后 NameServer + Broker 的全部 remoting 连接改为
+`TCP 连代理 → SOCKS CONNECT 握手 → TLS 升级 → RocketMQ 帧`（动态取址的 HTTP 请求不走代理）。
+
+```php
+use RocketMQ\Remoting\SocksProxyConfig;
+
+$producer = new DefaultMQProducer('PID_DEMO');
+$producer->setSocksProxy(new SocksProxyConfig('127.0.0.1:1080'));                 // SOCKS5 无认证
+$producer->setSocksProxy(new SocksProxyConfig('127.0.0.1:1080', 'user', 'pass')); // SOCKS5 用户名/密码
+$producer->setSocksProxy(new SocksProxyConfig('127.0.0.1:1080', version: 'socks4'));
+```
+
+也可直接赋公开属性 `$client->socksProxy = ...`；五种客户端（Producer / Push / Pull /
+LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstance` 时透传一次）。
+
 ## 特性与进度
 
 - ✅ 协议 / 传输：`RemotingCommand` JSON + ROCKETMQ 二进制双序列化、17 段存储格式与
@@ -361,7 +379,7 @@ $producer->tlsOptions = [
 - ✅ 观测：消息轨迹（生产 / 消费 / 回查 + 异步分发器）、消费统计、`ConsumerRunningInfo`、
   五类钩子、`OpenTracingHook`、W3C `traceparent` 注入与透传
 - ✅ 安全与寻址：ACL 签名（HmacSHA1）、动态 NameServer 取址（HTTP 域 + `NsAddr` 文件）、
-  故障规避选队列、`Validators` 本地校验前置
+  SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
 - ✅ 离线自测：10 套件 1,674 项断言 + 重复类名静态守卫（实测全绿）

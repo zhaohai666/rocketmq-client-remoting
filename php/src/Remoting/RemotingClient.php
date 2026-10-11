@@ -53,6 +53,15 @@ final class RemotingClient
      */
     private array $tlsOptions;
 
+    /**
+     * SOCKS 代理（对应 Java NettyClientConfig.socksProxyConfig + SocksProxyConfig；
+     * Java 按 CIDR 匹配生效，本端口配了就对**全部**出向 remoting 连接生效）。
+     * 建连顺序：TCP 连代理 → SOCKS CONNECT 握手（SocksProxyConnector）→ TLS 升级 →
+     * RocketMQ 帧。对齐 Java pipeline 的 addFirst 顺序（Socks5ProxyHandler 在
+     * SslHandler 之前）。TopAddressing 的 HTTP 取址不经此路径（与 Java 同口径）。
+     */
+    private ?SocksProxyConfig $socksProxy = null;
+
     private bool $closed = false;
 
     /** @var array<string, resource> addr → 连接 */
@@ -84,6 +93,7 @@ final class RemotingClient
         bool $enableReconnectForGoAway = true,
         ?array $nameServers = null,
         ?array $tlsOptions = null,
+        ?SocksProxyConfig $socksProxy = null,
     ) {
         $this->connectTimeoutMillis = $connectTimeoutMillis;
         $this->invokeTimeoutMillis = $invokeTimeoutMillis;
@@ -93,6 +103,7 @@ final class RemotingClient
         }
         $this->tlsEnable = (bool)$tlsEnable;
         $this->tlsOptions = $tlsOptions ?? [];
+        $this->socksProxy = $socksProxy;
         if ($nameServers !== null) {
             $this->nameServerList = array_values($nameServers);
         }
@@ -105,6 +116,17 @@ final class RemotingClient
     }
 
     // ---------- 连接管理 ----------
+
+    /** 设置/清除 SOCKS 代理（null 清除）。只在**下一次建连**时生效，已建连接不受影响。 */
+    public function setSocksProxy(?SocksProxyConfig $proxy): void
+    {
+        $this->socksProxy = $proxy;
+    }
+
+    public function getSocksProxy(): ?SocksProxyConfig
+    {
+        return $this->socksProxy;
+    }
 
     /**
      * @return resource
@@ -137,16 +159,42 @@ final class RemotingClient
             ],
         ]);
         $timeoutSec = $this->connectTimeoutMillis / 1000.0;
-        $conn = @stream_socket_client(
-            sprintf('tcp://%s:%s', $host, $port),
-            $errno,
-            $errstr,
-            $timeoutSec,
-            STREAM_CLIENT_CONNECT,
-            $ctx
-        );
-        if ($conn === false) {
-            throw new RemotingConnectException($addr);
+        $proxy = $this->socksProxy;
+        if ($proxy !== null && $proxy->isConfigured()) {
+            // SOCKS 代理路径：先 TCP 连**代理**，再在其上做 CONNECT 握手隧道到目标。
+            // TLS（若开）在隧道之上升级，对齐 Java pipeline 的 addFirst 顺序。
+            [$pHost, $pPort] = self::parseAddr((string)$proxy->getAddr());
+            $conn = @stream_socket_client(
+                sprintf('tcp://%s:%s', $pHost, $pPort),
+                $errno,
+                $errstr,
+                $timeoutSec,
+                STREAM_CLIENT_CONNECT,
+                $ctx
+            );
+            if ($conn === false) {
+                throw new RemotingConnectException(sprintf('%s (socks proxy %s)', $addr, $proxy->getAddr()));
+            }
+            try {
+                SocksProxyConnector::handshake($conn, $host, (int)$port, $proxy, $timeoutSec);
+            } catch (\Throwable $e) {
+                if (is_resource($conn)) {
+                    @fclose($conn);
+                }
+                throw new RemotingConnectException(sprintf('%s (socks proxy %s: %s)', $addr, $proxy->getAddr(), $e->getMessage()));
+            }
+        } else {
+            $conn = @stream_socket_client(
+                sprintf('tcp://%s:%s', $host, $port),
+                $errno,
+                $errstr,
+                $timeoutSec,
+                STREAM_CLIENT_CONNECT,
+                $ctx
+            );
+            if ($conn === false) {
+                throw new RemotingConnectException($addr);
+            }
         }
         if ($this->tlsEnable) {
             // 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ

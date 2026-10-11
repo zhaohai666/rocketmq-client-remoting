@@ -38,6 +38,7 @@ use RocketMQ\Remoting\Protocol\RemotingCommand;
 use RocketMQ\Remoting\Protocol\RequestCode;
 use RocketMQ\Remoting\Protocol\ResponseCode;
 use RocketMQ\Remoting\RPCHook;
+use RocketMQ\Remoting\SocksProxyConfig;
 
 /**
  * 生产者（对应 org.apache.rocketmq.client.producer.* 及 impl.producer，
@@ -386,6 +387,12 @@ class DefaultMQProducer
     public ?bool $tlsEnable;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
+    /**
+     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
+     * 配了则 NameServer + Broker 的 remoting 连接都经代理（TCP→SOCKS CONNECT→TLS）。
+     * 动态取址的 HTTP 请求不走代理。只在 start() 建 MQClientInstance 时透传一次。
+     */
+    public ?SocksProxyConfig $socksProxy = null;
     /** W3C traceparent 透传（opt-in） */
     public bool $enableTraceContext;
     public string $namespace = '';
@@ -448,9 +455,17 @@ class DefaultMQProducer
     // 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效（Java 的
     // scheduledExecutorService 也是按启动时的周期排定）。
     public int $pollNameServerInterval = 30000;
-    // 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
+    // 发送延迟故障规避：默认关闭，与 Java sendLatencyFaultEnable 一致
     public bool $sendLatencyFaultEnable = false;
     public MQFaultStrategy $mqFaultStrategy;
+
+    // ---- 主动探活（对应 Java ClientConfig 的 startDetectorEnable / detectTimeout /
+    // detectInterval，默认值一致：关 / 200ms / 2000ms。Java 的 startDetectorEnable 还能从
+    // 系统属性 com.rocketmq.startDetectorEnable 读初始值，PHP 无此机制，一律默认关。）
+    // 探测轮收敛在 MQClientInstance::tick() 里同步跑（无线程），见 registerFaultStrategy。----
+    public bool $startDetectorEnable = false;
+    public int $detectTimeout = 200;
+    public int $detectInterval = 2000;
 
     // ---- 自动攒批（对应 Java DefaultMQProducer 的 autoBatch / batchMaxDelayMs /
     // batchMaxBytes / totalBatchMaxBytes）----
@@ -548,6 +563,11 @@ class DefaultMQProducer
         ];
         $this->metrics = new ClientMetrics();
         $this->mqFaultStrategy = new MQFaultStrategy(false);
+        // 对应 Java MQFaultStrategy 构造器把 ClientConfig 的探测配置同步进容错表
+        // （setStartDetectorEnable / setDetectInterval / setDetectTimeout）
+        $this->mqFaultStrategy->setStartDetectorEnable($this->startDetectorEnable);
+        $this->mqFaultStrategy->setDetectTimeout($this->detectTimeout);
+        $this->mqFaultStrategy->setDetectInterval($this->detectInterval);
         // Java 在建 impl 时按配置建两个公平信号量，并对越界的配置兜地板值
         $this->semaphoreAsyncSendNum = new FairSemaphore(
             self::backPressurePermits(
@@ -772,6 +792,17 @@ class DefaultMQProducer
         return $this->namespaceV2;
     }
 
+    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
+    public function setSocksProxy(?SocksProxyConfig $proxy): void
+    {
+        $this->socksProxy = $proxy;
+    }
+
+    public function getSocksProxy(): ?SocksProxyConfig
+    {
+        return $this->socksProxy;
+    }
+
     public function setMaxMessageSize(int $size): void
     {
         $this->maxMessageSize = $size;
@@ -920,6 +951,48 @@ class DefaultMQProducer
     {
         $this->sendLatencyFaultEnable = $enable;
         $this->mqFaultStrategy->setSendLatencyFaultEnable($enable);
+    }
+
+    // ---------------- 主动探活（对应 Java DefaultMQProducer.setStartDetectorEnable /
+    // setDetectTimeout / setDetectInterval：ClientConfig 与策略两处同时写，运行中可翻转）----------------
+
+    /**
+     * 对应 Java DefaultMQProducer.setStartDetectorEnable（DefaultMQProducer:1449-1452：
+     * super 写 ClientConfig，再写 impl 的 mqFaultStrategy）。默认关闭。
+     */
+    public function setStartDetectorEnable(bool $enable): void
+    {
+        $this->startDetectorEnable = $enable;
+        $this->mqFaultStrategy->setStartDetectorEnable($enable);
+    }
+
+    public function isStartDetectorEnable(): bool
+    {
+        return $this->startDetectorEnable;
+    }
+
+    /** 单次探测的超时预算（Java ClientConfig.detectTimeout，默认 200ms）。 */
+    public function setDetectTimeout(int $timeoutMillis): void
+    {
+        $this->detectTimeout = $timeoutMillis;
+        $this->mqFaultStrategy->setDetectTimeout($timeoutMillis);
+    }
+
+    public function getDetectTimeout(): int
+    {
+        return $this->detectTimeout;
+    }
+
+    /** 每个 broker 的探测周期（Java ClientConfig.detectInterval，默认 2000ms）。 */
+    public function setDetectInterval(int $intervalMillis): void
+    {
+        $this->detectInterval = $intervalMillis;
+        $this->mqFaultStrategy->setDetectInterval($intervalMillis);
+    }
+
+    public function getDetectInterval(): int
+    {
+        return $this->detectInterval;
     }
 
     /** 设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。 */
@@ -1319,6 +1392,7 @@ class DefaultMQProducer
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
+            socksProxy: $this->socksProxy,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -1343,6 +1417,27 @@ class DefaultMQProducer
         $this->initProduceAccumulator();
         $this->started = true;
         $this->heartbeatRunning = true;
+        // 对应 Java DefaultMQProducerImpl.start:266 的 initTopicRoute()：把构造时声明的
+        // topic 逐个 tryToFindTopicPublishInfo（拉路由并登记"在用"）。路由拉不到只记日志
+        // 不报错（Java 同）。紧随其后的主动探活挂接依赖这一步——Java 探测器的 pickTopic
+        // 就是从这里填充的 topicPublishInfoTable 取第一个 topic；PHP 的探测 topic 取自
+        // 实例的 topicsInUse（topicPublishInfo 登记时写入）。
+        foreach ($this->topics as $topic) {
+            $newTopic = $this->withNamespace($topic);
+            try {
+                $info = $this->topicPublishInfo($newTopic);
+                if ($info === null || !$info->ok()) {
+                    Logger::warning('No route info of this topic: ' . $newTopic);
+                }
+            } catch (\Throwable $e) {
+                Logger::warning(sprintf('initTopicRoute failed for %s: %s', $newTopic, $e->getMessage()));
+            }
+        }
+        // 主动探活挂接（Java DefaultMQProducerImpl.start:272 的 mqFaultStrategy.startDetector()，
+        // 即 LatencyFaultToleranceScheduledThread 的 scheduleAtFixedRate(3s)）：PHP 无线程，
+        // 把策略注册进客户端实例，探测轮由实例的 tick() 按到期判定驱动（开关每轮现读，
+        // 运行中 setStartDetectorEnable 照样生效）。
+        $this->mqClient->registerFaultStrategy($this->mqFaultStrategy);
         // 守卫线程要在生产者本体起来之后再拉（Java DefaultMQProducer.start:377-379：
         // impl.start() 返回后 accumulated.start()）。
         // ⚠ PHP 无线程：心跳线程（Python _heartbeat_loop）不启动，改由调用方显式
@@ -1782,9 +1877,10 @@ class DefaultMQProducer
                 }
                 throw $e;
             } catch (RemotingException $e) {
-                // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测任务，
-                // 所以 Java 的 reachable = !isStartDetectorEnable() 恒为 True。
-                $this->updateFaultItem($selected, $began, true, true);
+                // 连不上/超时/发不出去：隔离该 broker。reachable 按 Java 同分支
+                // （DefaultMQProducerImpl:821）取 !isStartDetectorEnable()：探测调度开着时
+                // 置不可达、交给探测轮验证恢复；没开探测就保持可达（仅隔离期生效）。
+                $this->updateFaultItem($selected, $began, true, !$this->mqFaultStrategy->isStartDetectorEnable());
                 $lastExc = $e;
             } catch (MQClientException $e) {
                 // 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离

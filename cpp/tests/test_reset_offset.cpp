@@ -58,6 +58,23 @@ const char* kGroup = "GID_ResetOffsetCppUnit";
 const char* kTopic = "ResetOffsetCppUnitTopic";
 const char* kBroker = "broker-a";
 
+// ::setenv / ::unsetenv 是 POSIX 专有，MSVC 下不存在（只有 _putenv_s，置空串即删除）
+void setEnvVar(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, 1);
+#endif
+}
+
+void unsetEnvVar(const char* name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    ::unsetenv(name);
+#endif
+}
+
 MessageQueue queue0() {
     return MessageQueue(kTopic, kBroker, 0);
 }
@@ -276,7 +293,7 @@ void testResetPersistsNewOffsetInBroadcast() {
     std::filesystem::create_directories(home);
     const char* oldHome = std::getenv("HOME");
     const std::string savedHome = oldHome == nullptr ? std::string() : std::string(oldHome);
-    ::setenv("HOME", home.c_str(), 1);
+    setEnvVar("HOME", home.c_str());
 
     {
         Harness h("GID_ResetOffsetCppUnitBroadcast");
@@ -314,9 +331,9 @@ void testResetPersistsNewOffsetInBroadcast() {
     }
 
     if (oldHome == nullptr) {
-        ::unsetenv("HOME");
+        unsetEnvVar("HOME");
     } else {
-        ::setenv("HOME", savedHome.c_str(), 1);
+        setEnvVar("HOME", savedHome.c_str());
     }
     std::filesystem::remove_all(home);
 }
@@ -330,7 +347,7 @@ void testSaveLocalOffsetsSkipsQueuesWithoutOffset() {
     std::filesystem::create_directories(home);
     const char* oldHome = std::getenv("HOME");
     const std::string savedHome = oldHome == nullptr ? std::string() : std::string(oldHome);
-    ::setenv("HOME", home.c_str(), 1);
+    setEnvVar("HOME", home.c_str());
 
     {
         const MessageQueue mq(kTopic, kBroker, 3);
@@ -346,9 +363,9 @@ void testSaveLocalOffsetsSkipsQueuesWithoutOffset() {
     }
 
     if (oldHome == nullptr) {
-        ::unsetenv("HOME");
+        unsetEnvVar("HOME");
     } else {
-        ::setenv("HOME", savedHome.c_str(), 1);
+        setEnvVar("HOME", savedHome.c_str());
     }
     std::filesystem::remove_all(home);
 }

@@ -435,6 +435,11 @@ void DefaultMQPushConsumer::start() {
         if (tlsOptionsSet_) {
             mqClient_->setTlsOptions(tlsOptions_);
         }
+        // SOCKS 代理（对齐 Java NettyRemotingClient#createBootstrap(SocksProxyConfig)）：
+        // 透传给传输层，首条连接建立时生效
+        if (socksProxySet_) {
+            mqClient_->setSocksProxy(socksProxy_);
+        }
         // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：绑定在
         // **start() 之前** —— Java 的 rpcHook 在 MQClientAPIImpl 构造时传入，实例第一笔
         // 报文就带着它。namespaceV2 传**取值函数**（Java 每笔请求实时读 clientConfig）。

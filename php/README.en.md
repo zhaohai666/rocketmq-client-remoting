@@ -368,6 +368,25 @@ $producer->tlsOptions = [
 Without `caCert` a self-signed server certificate is trusted; hostname and chain
 validation are strict by default.
 
+### SOCKS Proxy
+
+Mirrors the Java `ClientConfig` `socksProxyConfig` (`SocksProxyConfig`: addr / username /
+password; SOCKS5 by default, SOCKS4 also supported): once configured, every remoting
+connection (NameServer + Broker) goes `TCP to proxy → SOCKS CONNECT handshake → TLS
+upgrade → RocketMQ frames` (HTTP name-server addressing does not go through the proxy).
+
+```php
+use RocketMQ\Remoting\SocksProxyConfig;
+
+$producer = new DefaultMQProducer('PID_DEMO');
+$producer->setSocksProxy(new SocksProxyConfig('127.0.0.1:1080'));                 // SOCKS5, no auth
+$producer->setSocksProxy(new SocksProxyConfig('127.0.0.1:1080', 'user', 'pass')); // SOCKS5 user/pass
+$producer->setSocksProxy(new SocksProxyConfig('127.0.0.1:1080', version: 'socks4'));
+```
+
+Assigning the public `$client->socksProxy` property works too; all five client facades
+(Producer / Push / Pull / LitePull / Admin) expose the same API. Set it before `start()`.
+
 ## Features and Status
 
 - ✅ Protocol / transport: `RemotingCommand` dual serialization (JSON + ROCKETMQ binary),
@@ -391,7 +410,8 @@ validation are strict by default.
   asynchronous dispatcher), consume stats, `ConsumerRunningInfo`, the five kinds of hooks,
   `OpenTracingHook`, W3C `traceparent` injection and pass-through
 - ✅ Security and addressing: ACL signing (HmacSHA1), dynamic NameServer addressing (HTTP
-  domain + `NsAddr` file), fault-avoiding queue selection, `Validators` local pre-checks
+  domain + `NsAddr` file), SOCKS proxy (SOCKS4/5 + user/pass, TLS upgrades over the tunnel),
+  fault-avoiding queue selection, `Validators` local pre-checks
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI

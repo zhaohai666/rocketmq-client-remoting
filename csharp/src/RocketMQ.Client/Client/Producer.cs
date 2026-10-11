@@ -232,6 +232,20 @@ public class DefaultMQProducer
         set => _tlsOptions = value;
     }
 
+    private SocksProxyConfig? _socksProxyConfig;
+
+    /// <summary>
+    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
+    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
+    /// remoting 长连接：TCP 直连代理、SOCKS 握手（CONNECT）之后才做 TLS 与发帧。
+    /// NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
+    /// </summary>
+    public SocksProxyConfig? SocksProxyConfig
+    {
+        get => _socksProxyConfig;
+        set => _socksProxyConfig = value;
+    }
+
     /// <summary>W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）。</summary>
     public bool EnableTraceContext
     {
@@ -763,16 +777,30 @@ public class DefaultMQProducer
             // 放在 Start() 之后，start 期间的动态取址/首包路由就是裸的。
             // RequestHooks.Compose 还原 Java 的 Namespace → stream → 用户钩子顺序（单槽传输层）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
-                tlsEnable: _tlsEnable, tlsOptions: _tlsOptions, unitName: _unitName,
-                pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
-                vipChannelEnabled: _sendMessageWithVIPChannel);
+            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
+            // 即复用已有实例，Start 交给下面的幂等调用；只有第一个到达者的实例级参数生效。
+            _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
+                () => new MQClientInstance(_clientId, _nameServerAddrs,
+                    tlsEnable: _tlsEnable, tlsOptions: _tlsOptions, socksProxy: _socksProxyConfig,
+                    unitName: _unitName,
+                    pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
+                    vipChannelEnabled: _sendMessageWithVIPChannel));
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="
                     + _clientId + ")");
             }
-            _mqClient.Start();
+            try
+            {
+                _mqClient.Start();
+            }
+            catch
+            {
+                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+                _mqClient = null;
+                throw;
+            }
             // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
             {
@@ -781,8 +809,8 @@ public class DefaultMQProducer
 
             // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
             // 不注册的话回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 Unknown。
-            _mqClient.RemotingClient.RegisterProcessor(RequestCode.CheckTransactionState,
-                CheckTransactionState);
+            // 走实例级多播（共享实例下多个生产者各登记各的，不互相顶掉）。
+            _mqClient.RegisterFacadeProcessor(RequestCode.CheckTransactionState, CheckTransactionState);
 
             // 累加器必须在 _started=true **之前**建好：AutoBatch 的 getter 见不到累加器就报
             // "没打开"，start 之后立刻 send 的第一笔会绕过攒批直发（Java 在 impl.start():256
@@ -959,7 +987,14 @@ public class DefaultMQProducer
                 ClientLog.Debug("unregister producer on shutdown failed: " + e.Message);
             }
 
-            _mqClient.Shutdown();
+            // 事务回查处理器是本生产者登记在**共享实例**上的：先摘掉，避免实例被别的
+            // 门面继续复用时，broker 的回查还打向一个已退出的生产者。
+            _mqClient.UnregisterFacadeProcessor(RequestCode.CheckTransactionState, CheckTransactionState);
+
+            // 归还引用（Java unregisterClient 之后那句 mQClientFactory.shutdown() 的等价物）：
+            // 计数归零才真正关停实例，先到的门面退出不能拖垮还在用的共享实例。
+            MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+            _mqClient = null;
         }
 
         // 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器

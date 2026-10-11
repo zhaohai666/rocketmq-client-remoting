@@ -48,7 +48,7 @@ use crate::client::hook::{
     CommunicationMode, EndTransactionContext, EndTransactionHook, EndTransactionHookList,
     SendMessageContext, SendMessageHook, SendMessageHookList,
 };
-use crate::client::latency::MQFaultStrategy;
+use crate::client::latency::{MQFaultStrategy, Resolver, ServiceDetector};
 use crate::client::metrics::ClientMetrics;
 use crate::client::mq_client::{
     MQClientInstance, MQClientInstanceConfig, PublishMessage, TopicPublishInfo, TraceDispatcher,
@@ -99,11 +99,17 @@ use crate::remoting::protocol::heartbeat::{HeartbeatData, ProducerData};
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
+use crate::remoting::socks::SocksProxyConfig;
 use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 
 /// 发送重试内核的离线对拍（进程内假集群），见该模块文档。
 #[cfg(test)]
 mod send_retry_tests;
+
+/// 故障规避主动探测（Java 5.x `startDetector`）的离线对拍：假 broker 应答
+/// `GET_MAX_OFFSET(30)`，验证周期触发、超时置不可达、恢复放行，见该模块文档。
+#[cfg(test)]
+mod detector_tests;
 
 /// Python `DefaultMQProducer.instance_name` 的默认值。
 pub const DEFAULT_INSTANCE_NAME: &str = "DEFAULT";
@@ -386,6 +392,9 @@ pub struct ProducerConfig {
     pub producer_group: String,
     /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
     pub tls_enable: Option<bool>,
+    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig`：addr / username /
+    /// password 三字段，见 [`SocksProxyConfig`]）。`None` = 直连（默认）。
+    pub socks_proxy: Option<SocksProxyConfig>,
     /// Python `enable_trace_context`：`None` = 交给环境变量
     /// `ROCKETMQ_TRACE_CONTEXT_ENABLE`。
     pub enable_trace_context: Option<bool>,
@@ -467,6 +476,17 @@ pub struct ProducerConfig {
     pub heartbeat_interval_millis: u64,
     /// Python `send_latency_fault_enable`。
     pub send_latency_fault_enable: bool,
+    /// Java `ClientConfig.startDetectorEnable`（默认 **false**，系统属性
+    /// `com.rocketmq.startDetectorEnable` 可覆盖）：故障规避的**主动探活**开关。
+    /// 开启后发送异常（Remoting 一类）会把 broker 记成不可达，由后台探测任务
+    /// （[`DefaultMQProducer::start`] 里随生产者启停）周期用 `GET_MAX_OFFSET`
+    /// 验证可达性，恢复后放回故障表。
+    pub start_detector_enable: bool,
+    /// Java `ClientConfig.detectTimeout`（默认 200ms）：单次探测 RPC 的超时。
+    pub detect_timeout: i64,
+    /// Java `ClientConfig.detectInterval`（默认 2000ms）：同一 broker 两次探测的
+    /// 最小间隔（`FaultItem.checkStamp` 的去重窗口）。
+    pub detect_interval: i64,
     /// Python `enable_trace`。
     pub enable_trace: bool,
     /// Python `trace_topic`（`None` → 系统默认轨迹 topic）。
@@ -494,6 +514,7 @@ impl Default for ProducerConfig {
         ProducerConfig {
             producer_group: MixAll::DEFAULT_PRODUCER_GROUP.to_string(),
             tls_enable: None,
+            socks_proxy: None,
             enable_trace_context: None,
             namespace: String::new(),
             instance_name: DEFAULT_INSTANCE_NAME.to_string(),
@@ -531,6 +552,11 @@ impl Default for ProducerConfig {
             name_server_addrs: Vec::new(),
             heartbeat_interval_millis: 30_000,
             send_latency_fault_enable: false,
+            // Java `ClientConfig:82-83,100`：detectTimeout=200、detectInterval=2*1000、
+            // startDetectorEnable 默认 false（系统属性 com.rocketmq.startDetectorEnable）
+            start_detector_enable: false,
+            detect_timeout: 200,
+            detect_interval: 2 * 1000,
             enable_trace: false,
             trace_topic: None,
             trace_msg_batch_num: 10,
@@ -950,6 +976,19 @@ impl DefaultMQProducer {
         self.config().namespace_v2
     }
 
+    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
+    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
+    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
+    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
+    pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
+        self.write_cfg(|c| c.socks_proxy = socks_proxy);
+    }
+
+    /// Java `ClientConfig#getSocksProxyConfig`。
+    pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
+        self.config().socks_proxy
+    }
+
     /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.write_cfg(|c| c.unit_mode = unit_mode);
@@ -1134,6 +1173,38 @@ impl DefaultMQProducer {
         self.inner
             .fault_strategy
             .set_send_latency_fault_enable(enable);
+    }
+
+    /// Java `ClientConfig#setStartDetectorEnable`：故障规避主动探活的开关。
+    /// 探测任务**每轮现读**这个开关（Java 是调度体里的 `if (startDetectorEnable)`
+    /// 查 volatile），所以运行中切换立即生效。
+    pub fn set_start_detector_enable(&self, enable: bool) {
+        self.write_cfg(|c| c.start_detector_enable = enable);
+    }
+
+    /// Java `ClientConfig#isStartDetectorEnable`。
+    pub fn is_start_detector_enable(&self) -> bool {
+        self.read_cfg(|c| c.start_detector_enable)
+    }
+
+    /// Java `ClientConfig#setDetectTimeout`：单次探测 RPC 的超时（毫秒）。
+    pub fn set_detect_timeout(&self, timeout_millis: i64) {
+        self.write_cfg(|c| c.detect_timeout = timeout_millis);
+    }
+
+    /// Java `ClientConfig#getDetectTimeout`。
+    pub fn get_detect_timeout(&self) -> i64 {
+        self.read_cfg(|c| c.detect_timeout)
+    }
+
+    /// Java `ClientConfig#setDetectInterval`：同一 broker 两次探测的最小间隔（毫秒）。
+    pub fn set_detect_interval(&self, interval_millis: i64) {
+        self.write_cfg(|c| c.detect_interval = interval_millis);
+    }
+
+    /// Java `ClientConfig#getDetectInterval`。
+    pub fn get_detect_interval(&self) -> i64 {
+        self.read_cfg(|c| c.detect_interval)
     }
 
     /// Python `set_request_timeout`。
@@ -1412,6 +1483,7 @@ impl DefaultMQProducer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            socks_proxy: cfg.socks_proxy.clone(),
             unit_name: cfg.unit_name.clone(),
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
@@ -1516,6 +1588,36 @@ impl DefaultMQProducer {
                 "producer: no tokio runtime, heartbeat disabled; broker transaction \
                        check-back will not reach this producer"
             );
+        }
+
+        // 故障规避的主动探活任务（Java `DefaultMQProducerImpl#start`:272
+        // `mqFaultStrategy.startDetector()` → `LatencyFaultToleranceImpl#startDetector`：
+        // `scheduleAtFixedRate(3, 3, SECONDS)` 的调度线程）。这里是一个 tokio 任务：
+        // 3s 一轮，轮内对故障表跑 [`detect_by_one_round`]（`detect_interval` 的
+        // `check_stamp` 去重在轮里做）；`startDetectorEnable` 每轮现读（Java 是
+        // 调度体里的 volatile 检查）。随 `shutdown()` 的任务清单一起停。
+        if let Some(handle) = self.runtime_handle() {
+            let weak = Arc::downgrade(&self.inner);
+            let task = handle.spawn(async move {
+                loop {
+                    // Java 的首轮延迟就是 3s：先等再跑。
+                    tokio::time::sleep(DETECTOR_SCHEDULE_PERIOD).await;
+                    let Some(inner) = weak.upgrade() else {
+                        return; // 生产者已释放（没调 shutdown），没必要继续
+                    };
+                    let (enable, detect_timeout, detect_interval) = {
+                        let cfg = inner.cfg.read().unwrap_or_else(|e| e.into_inner());
+                        (cfg.start_detector_enable, cfg.detect_timeout, cfg.detect_interval)
+                    };
+                    if !enable {
+                        continue;
+                    }
+                    if let Some(client) = inner.client() {
+                        run_detect_round(&inner, &client, detect_timeout, detect_interval).await;
+                    }
+                }
+            });
+            self.push_task(task);
         }
 
         // 轨迹分发器在锁外启动（Java 同样在 defaultMQProducerImpl.start() 之后做）：
@@ -1717,6 +1819,77 @@ fn has_hook_named(hooks: &[Arc<dyn SendMessageHook>], name: &str) -> bool {
 
 fn has_end_hook_named(hooks: &[Arc<dyn EndTransactionHook>], name: &str) -> bool {
     hooks.iter().any(|h| h.hook_name() == name)
+}
+
+// ================================================================ 故障规避主动探活
+
+/// 探测调度周期（Java `LatencyFaultToleranceImpl#startDetector` 里写死的
+/// `scheduleAtFixedRate(..., 3, 3, TimeUnit.SECONDS)`；轮内按 `detect_interval`
+/// 的 `check_stamp` 去重，所以单 broker 的实际探测周期是 `max(3s, detectInterval)`）。
+const DETECTOR_SCHEDULE_PERIOD: Duration = Duration::from_secs(3);
+
+/// 对故障表跑一轮探活（Java `detectByOneRound` 的装配处：`Resolver` 用
+/// `findBrokerAddressInPublish`，`ServiceDetector` 用 `GET_MAX_OFFSET`）。
+async fn run_detect_round(
+    inner: &Inner,
+    client: &MQClientInstance,
+    detect_timeout: i64,
+    detect_interval: i64,
+) {
+    let resolver = PublishAddrResolver { client: client.clone() };
+    let detector = MaxOffsetServiceDetector { client: client.clone() };
+    inner
+        .fault_strategy
+        .latency_fault_tolerance()
+        .detect_by_one_round(&resolver, &detector, detect_timeout, detect_interval)
+        .await;
+}
+
+/// Java `DefaultMQProducerImpl` 构造器里的匿名 `Resolver`：
+/// `mQClientFactory.findBrokerAddressInPublish(name)`（只认 master）。
+struct PublishAddrResolver {
+    client: MQClientInstance,
+}
+
+impl Resolver for PublishAddrResolver {
+    fn resolve(&self, broker_name: &str) -> Option<String> {
+        self.client.find_broker_address_in_publish(broker_name)
+    }
+}
+
+/// Java `DefaultMQProducerImpl:155` 的匿名 `ServiceDetector`：用
+/// `GET_MAX_OFFSET(30)` RPC 验证 broker 全链路可达（连接 → 请求 → 应答）。
+///
+/// Java 的 `pickTopic()`：topicPublishInfoTable 为空 ⇒ 直接 false（没东西可探）；
+/// 这里等价地取客户端路由表里**含该 broker** 的第一个 topic —— broker 端一定
+/// 认识它，探测不会白挨 `TOPIC_NOT_EXIST`。探测 RPC 的任何失败（连不上/超时/
+/// 非 SUCCESS）都按 Java 口径返回 false。
+struct MaxOffsetServiceDetector {
+    client: MQClientInstance,
+}
+
+impl ServiceDetector for MaxOffsetServiceDetector {
+    fn detect(
+        &self,
+        broker_name: &str,
+        endpoint: &str,
+        timeout_millis: i64,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let client = self.client.clone();
+        let broker_name = broker_name.to_string();
+        let endpoint = endpoint.to_string();
+        Box::pin(async move {
+            let Some(topic) = client.pick_topic_for_broker(&broker_name) else {
+                return false; // Java：candidateTopic 不存在 ⇒ false
+            };
+            // Java：new MessageQueue(topic, null, 0) + getMaxOffset(endpoint, mq, timeout)
+            let mq = MessageQueue::new(&topic, &broker_name, 0);
+            client
+                .get_max_offset(&mq, timeout_millis, Some(&endpoint))
+                .await
+                .is_ok()
+        })
+    }
 }
 
 // ================================================================ 轨迹自动桥接
@@ -2848,13 +3021,16 @@ impl DefaultMQProducer {
                             return Err(e);
                         }
                         Some(SendErrorKind::Remoting) => {
-                            // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测
-                            // 任务，所以 Java 的 reachable = !isStartDetectorEnable() 恒真。
+                            // 连不上/超时/发不出去：隔离该 broker。Java 这里
+                            // `reachable = !isStartDetectorEnable()` —— 只有后台探活
+                            // 任务在跑时才敢把 broker 记成不可达（否则没人把它探回来，
+                            // 这个 broker 就永远回不来了）。
+                            let reachable = !self.read_cfg(|c| c.start_detector_enable);
                             self.inner.fault_strategy.update_fault_item(
                                 &broker_name,
                                 latency_since(began),
                                 true,
-                                true,
+                                reachable,
                             );
                             last_exc = Some(e);
                         }
@@ -5075,6 +5251,25 @@ mod tests {
         );
         p.set_namespace("ns1");
         assert_eq!(p.get_namespace_v2(), None, "v1 namespace 不写 v2 字段");
+    }
+
+    #[test]
+    fn socks_proxy_setter_getter_round_trip() {
+        // Java `ClientConfig#setSocksProxyConfig/getSocksProxyConfig`：SOCKS 代理
+        // 三字段（addr/username/password），`None` = 直连。
+        let p = producer("GID_socks");
+        assert_eq!(p.get_socks_proxy(), None, "默认直连");
+        p.set_socks_proxy(Some(SocksProxyConfig::with_auth("10.0.0.1:1080", "u", "w")));
+        assert_eq!(
+            p.get_socks_proxy(),
+            Some(SocksProxyConfig::with_auth("10.0.0.1:1080", "u", "w"))
+        );
+        p.set_socks_proxy(Some(SocksProxyConfig::new("socks4://10.0.0.2:1080")));
+        let proxy = p.get_socks_proxy().unwrap();
+        assert_eq!(proxy.addr, "socks4://10.0.0.2:1080");
+        assert_eq!(proxy.username, None);
+        p.set_socks_proxy(None);
+        assert_eq!(p.get_socks_proxy(), None, "None = 清除（直连）");
     }
 
     // ---------------- 钩子上下文 ----------------

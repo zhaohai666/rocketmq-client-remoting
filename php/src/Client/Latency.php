@@ -68,10 +68,13 @@ final class FaultItem
 }
 
 /**
- * 对应 Java client.latency.LatencyFaultToleranceImpl（简化为纯内存版，无探测线程）。
+ * 对应 Java client.latency.LatencyFaultToleranceImpl。
  *
- * 省略 Java 的"后台可达性探测线程"（startDetector）；本地保留 reachableFlag 语义：
- * updateFaultItem(..., reachable) 时写 reachableFlag。
+ * 主动探活（5.x startDetector）收敛进调用方的 ``tick()``：Java 用
+ * LatencyFaultToleranceScheduledThread 每 3s 跑一轮 ``detectByOneRound``，PHP 无线程，
+ * 由 MQClientInstance::tick() 按到期判定驱动同一循环体（见 {@see detectByOneRound()}）。
+ * 本地保留 reachableFlag 语义：updateFaultItem(..., reachable) 时写 reachableFlag；
+ * 探测成功把 false 翻回 true（Java 只翻回、从不置 false——置 false 是发送路径的职责）。
  *
  * PHP 单线程：Python 的 threading.RLock 只为保护 _faultItemTable 读写的一致性，
  * 单线程下无需加锁；这里保留"同一时刻只有一处读写该表"的注释性约束。
@@ -81,8 +84,29 @@ final class LatencyFaultToleranceImpl
     /** @var array<string, FaultItem> */
     private array $faultItemTable = [];
 
+    /** 对应 Java detectTimeout（ClientConfig，默认 200ms）：单次探测的超时预算。 */
+    public int $detectTimeout = 200;
+
+    /** 对应 Java detectInterval（ClientConfig，默认 2000ms）：**每个** broker 的探测周期。 */
+    public int $detectInterval = 2000;
+
+    private bool $startDetectorEnable = false;
+
+    public function isStartDetectorEnable(): bool
+    {
+        return $this->startDetectorEnable;
+    }
+
+    public function setStartDetectorEnable(bool $enable): void
+    {
+        $this->startDetectorEnable = $enable;
+    }
+
     public function updateFaultItem(string $name, float $currentLatency, float $notAvailableDuration, bool $reachable): void
     {
+        if (!$reachable) {
+            Logger::info($name . ' is unreachable, it will not be used until it\'s reachable');
+        }
         $item = $this->faultItemTable[$name] ?? null;
         if ($item === null) {
             $item = new FaultItem($name);
@@ -115,6 +139,48 @@ final class LatencyFaultToleranceImpl
         return true;
     }
 
+    /**
+     * 对应 Java ``LatencyFaultToleranceImpl.detectByOneRound``（后台探测线程的单轮循环体）。
+     *
+     * 逐项检查故障表：``$nowMillis - checkStamp >= 0`` 的 broker 视为到期——
+     *   1) 先把 checkStamp 推到 now + detectInterval（无论探测成败，周期照排）；
+     *   2) resolver 把 brokerName 解析成 master 发布地址；解析不到（broker 已离开路由）
+     *      直接**摘除**故障记录（Java 同：记录不能比路由活得久）；
+     *   3) serviceDetector 为 null 时跳过（Java 同：装了探测线程但没装探测器）；
+     *   4) 探测成功且当前不可达 → 翻回 reachable（打日志）。**失败不动 flag**——
+     *      置不可达永远是发送路径的职责，这里只负责恢复。
+     *
+     * `$resolver` 是 ``fn(string $brokerName): ?string``（Java Resolver.resolve）；
+     * `$serviceDetector` 是 ``fn(string $brokerAddr, int $timeoutMillis): bool``
+     * （Java ServiceDetector.detect），可为 null。探测是同步调用，单个到期 broker
+     * 最多阻塞 detectTimeout 毫秒——调用方（tick）按此预算安排节奏。
+     *
+     * 注意 Java 的开关判定（startDetectorEnable）在调度线程里做、不在本方法里，
+     * PHP 侧同理由 tick() 判定后再进来。
+     */
+    public function detectByOneRound(int $nowMillis, callable $resolver, ?callable $serviceDetector): void
+    {
+        foreach ($this->faultItemTable as $key => $item) {
+            if ($nowMillis - $item->checkStamp < 0) {
+                continue;
+            }
+            $item->checkStamp = $nowMillis + $this->detectInterval;
+            $brokerAddr = $resolver($item->name);
+            if ($brokerAddr === null) {
+                unset($this->faultItemTable[$key]);
+                continue;
+            }
+            if ($serviceDetector === null) {
+                continue;
+            }
+            $serviceOK = $serviceDetector($brokerAddr, $this->detectTimeout);
+            if ($serviceOK && !$item->reachableFlag) {
+                Logger::info($item->name . ' is reachable now, then it can be used.');
+                $item->reachableFlag = true;
+            }
+        }
+    }
+
     public function remove(string $name): void
     {
         unset($this->faultItemTable[$name]);
@@ -134,6 +200,9 @@ final class LatencyFaultToleranceImpl
  *   2) 否则选 reachable 的 broker；
  *   3) 否则退化为普通轮询。
  * 发送结果/异常会回调 ``updateFaultItem`` 写延迟与隔离信息。
+ *
+ * 主动探活（5.x）：``startDetectorEnable`` 打开后，探测轮由 MQClientInstance::tick()
+ * 泵 {@see MQFaultStrategy::detectByOneRound()}，探测成功把不可达 broker 放回。
  */
 final class MQFaultStrategy
 {
@@ -143,6 +212,7 @@ final class MQFaultStrategy
     public const NOT_AVAILABLE_DURATION = [0, 0, 2000, 5000, 6000, 10000, 30000];
 
     private bool $sendLatencyFaultEnable;
+    private bool $startDetectorEnable = false;
     private LatencyFaultToleranceImpl $latencyFaultTolerance;
 
     /** @var list<int> */
@@ -167,6 +237,53 @@ final class MQFaultStrategy
     public function setSendLatencyFaultEnable(bool $enable): void
     {
         $this->sendLatencyFaultEnable = $enable;
+    }
+
+    /** 对应 Java ClientConfig.startDetectorEnable（默认 false）。开关每轮探测现读，可运行中翻转。 */
+    public function isStartDetectorEnable(): bool
+    {
+        return $this->startDetectorEnable;
+    }
+
+    public function setStartDetectorEnable(bool $enable): void
+    {
+        $this->startDetectorEnable = $enable;
+        $this->latencyFaultTolerance->setStartDetectorEnable($enable);
+    }
+
+    /** 对应 Java ClientConfig.setDetectTimeout（默认 200ms）：单次探测超时预算。 */
+    public function setDetectTimeout(int $timeoutMillis): void
+    {
+        $this->latencyFaultTolerance->detectTimeout = $timeoutMillis;
+    }
+
+    public function getDetectTimeout(): int
+    {
+        return $this->latencyFaultTolerance->detectTimeout;
+    }
+
+    /** 对应 Java ClientConfig.setDetectInterval（默认 2000ms）：每个 broker 的探测周期。 */
+    public function setDetectInterval(int $intervalMillis): void
+    {
+        $this->latencyFaultTolerance->detectInterval = $intervalMillis;
+    }
+
+    public function getDetectInterval(): int
+    {
+        return $this->latencyFaultTolerance->detectInterval;
+    }
+
+    /**
+     * 探测轮转发（Java MQFaultStrategy.startDetector → 调度线程 → detectByOneRound；
+     * PHP 由 MQClientInstance::tick() 直接驱动，开关判定在 tick 侧，与 Java 的
+     * 「开关在调度线程体里判」同位）。
+     *
+     * @param callable(string): ?string $resolver
+     * @param (callable(string, int): bool)|null $serviceDetector
+     */
+    public function detectByOneRound(int $nowMillis, callable $resolver, ?callable $serviceDetector): void
+    {
+        $this->latencyFaultTolerance->detectByOneRound($nowMillis, $resolver, $serviceDetector);
     }
 
     // ---- 队列选择 ----

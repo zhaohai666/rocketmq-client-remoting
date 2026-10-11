@@ -8,9 +8,10 @@ add_executable(rmq_test_client_id test_client_id.cpp)
 target_link_libraries(rmq_test_client_id PRIVATE rocketmq::remoting)
 add_test(NAME client_id COMMAND rmq_test_client_id)
 
-add_executable(rmq_test_java_alignment test_java_alignment.cpp)
-target_link_libraries(rmq_test_java_alignment PRIVATE rocketmq::remoting)
-add_test(NAME java_alignment COMMAND rmq_test_java_alignment)
+# 协议对齐（59cac5f 由 test_java_alignment.cpp 更名而来，目标随之改名）
+add_executable(rmq_test_protocol_alignment test_protocol_alignment.cpp)
+target_link_libraries(rmq_test_protocol_alignment PRIVATE rocketmq::remoting)
+add_test(NAME protocol_alignment COMMAND rmq_test_protocol_alignment)
 
 # 路由 / 心跳 / 订阅数据：往返 + Java 字段名守卫
 add_executable(rmq_test_route_heartbeat test_route_heartbeat.cpp)
@@ -21,6 +22,14 @@ add_test(NAME route_heartbeat COMMAND rmq_test_route_heartbeat)
 add_executable(rmq_test_transport test_transport.cpp)
 target_link_libraries(rmq_test_transport PRIVATE rocketmq::remoting)
 add_test(NAME transport COMMAND rmq_test_transport)
+
+# SOCKS 代理（Java ClientConfig#socksProxyConfig / NettyRemotingClient 的
+# Socks5ProxyHandler 对位）：本地假 SOCKS5/SOCKS4 服务器锁死握手字节与 CONNECT 目标、
+# RFC 1929 用户名密码子协商的成功/拒绝两条路、隧道上真发一笔 remoting 请求。
+# 失败类断言按 loopback 怪癖给 ≥30s 建连预算。
+add_executable(rmq_test_socks_proxy test_socks_proxy.cpp)
+target_link_libraries(rmq_test_socks_proxy PRIVATE rocketmq::remoting)
+add_test(NAME socks_proxy COMMAND rmq_test_socks_proxy)
 
 # 断连立刻失败在途请求（Java failFast / requestFail）：真 socket 对端读完就关，
 # 断言"毫秒级判死 + 报 SEND_REQUEST 而不是超时 + 回调只一次 + 不牵连别人家的请求"
@@ -37,6 +46,14 @@ add_test(NAME compression COMMAND rmq_test_compression)
 add_executable(rmq_test_admin test_admin.cpp)
 target_link_libraries(rmq_test_admin PRIVATE rocketmq::remoting)
 add_test(NAME admin COMMAND rmq_test_admin)
+
+# Admin 发起端 CONSUME_MESSAGE_DIRECTLY(309)（Java DefaultMQAdminExtImpl:1323-1347 /
+# MQClientAPIImpl:2741-2771）：mock broker 锁死 viewMessage 两条 msgId 路径（offsetMsgId
+# 直查 + uniqKey 检索并替换 offsetMsgId）、309 头恰好四个字段、非 SUCCESS / 空 body 的
+# 报错语义，以及「消息解不出来 309 一笔不发」。消费侧处理器在 rmq_test_orderly_reconsume。
+add_executable(rmq_test_admin_consume_directly test_admin_consume_directly.cpp)
+target_link_libraries(rmq_test_admin_consume_directly PRIVATE rocketmq::remoting)
+add_test(NAME admin_consume_directly COMMAND rmq_test_admin_consume_directly)
 
 # 客户端日志：行格式（毫秒/pid/线程名/文件:行）+ 按大小轮转 + maxIndex 上限 + 级别过滤
 add_executable(rmq_test_logging test_logging.cpp)
@@ -64,6 +81,14 @@ add_test(NAME request_reply COMMAND rmq_test_request_reply)
 add_executable(rmq_test_latency test_latency.cpp)
 target_link_libraries(rmq_test_latency PRIVATE rocketmq::remoting)
 add_test(NAME latency COMMAND rmq_test_latency)
+
+# 故障规避主动探测（Java 5.x startDetectorEnable/detectTimeout/detectInterval + 匿名
+# ServiceDetector）：detectByOneRound 离线语义（翻回 reachable / 占坑限频 / 失败不动标志 /
+# resolver 摘除）+ 假 broker 上的周期触发、超时置不可用、恢复放行。失败类断言按 loopback
+# 怪癖给 ≥8s 预算。
+add_executable(rmq_test_fault_detector test_fault_detector.cpp)
+target_link_libraries(rmq_test_fault_detector PRIVATE rocketmq::remoting)
+add_test(NAME fault_detector COMMAND rmq_test_fault_detector)
 
 # 发送重试链路：mock name server + broker，锁死 sendDefaultImpl 的重试分类语义
 add_executable(rmq_test_send_retry test_send_retry.cpp)

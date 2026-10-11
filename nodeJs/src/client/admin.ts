@@ -42,6 +42,7 @@ import {
 } from '../remoting/bodies.ts';
 import { TopicStatsTable } from '../remoting/admin_body.ts';
 import { RemotingSerializable } from '../remoting/serialize.ts';
+import { MQClientManager } from './mq_client_manager.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
@@ -221,16 +222,26 @@ export class DefaultMQAdminExt {
     // which the clientId goes through ClientConfig#buildMQClientId.
     this._changeInstanceNameToPID();
     const clientId = MixAll.clientIdFor(this.instanceName, this.unitName, this.enableStreamRequestType);
-    const remotingClient = this.client != null ? this.client.remotingClient : null;
-    this.client = new MQClient(clientId, this.namesrvAddr, remotingClient);
+    const presetRC = this.client != null ? this.client.remotingClient : null;
+    // 跨 facade 复用（Java MQClientManager.factoryTable + adminExtTable 语义）：
+    // 同 clientId 的 admin 与 producer/consumer 共享一个实例 —— 一条到同 broker
+    // 的 RPC 通道、一份路由缓存与后台定时器；引用计数归零才真正 shutdown。
+    const manager = MQClientManager.getInstance();
+    const { instance: client, created } = manager.getOrCreateMQClientInstance(
+      clientId, () => new MQClient(clientId, this.namesrvAddr, presetRC));
+    this.client = client;
     // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream
     // (only when enableStreamRequestType) -> user (ACL) hook. The namespace
     // extFields must be present BEFORE the ACL hook signs the request.
-    registerRpcHooks(this.client.remotingClient, {
-      namespaceV2: () => this.namespaceV2,
-      enableStreamRequestType: this.enableStreamRequestType,
-      userHook: this.rpcHook,
-    });
+    // first-wins：hook 链只由创建者注册，复用方不重复挂链（Java 只认创建时那份）。
+    if (created) {
+      registerRpcHooks(this.client.remotingClient, {
+        namespaceV2: () => this.namespaceV2,
+        enableStreamRequestType: this.enableStreamRequestType,
+        userHook: this.rpcHook,
+      });
+    }
+    manager.registerClient(clientId, client);
     this.client.start();
     this._started = true;
     logger.info(`adminExt ${this.adminExtGroup} started, clientId=${clientId}`);
@@ -239,7 +250,10 @@ export class DefaultMQAdminExt {
   shutdown(): void {
     if (!this._started) return;
     this._started = false;
-    if (this.client != null) this.client.shutdown();
+    if (this.client != null) {
+      // 归还给 manager：计数 -1，归零才真正 shutdown（停定时器、断连接）。
+      MQClientManager.getInstance().unregisterClient(this.client.clientId, this.client);
+    }
     this.client = null;
     logger.info(`adminExt ${this.adminExtGroup} shutdown OK`);
   }

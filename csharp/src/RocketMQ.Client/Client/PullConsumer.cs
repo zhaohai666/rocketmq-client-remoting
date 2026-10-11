@@ -3,7 +3,7 @@
 //
 // 与 push 消费者（DefaultMQPushConsumer）的区别：**由调用方自己拉、自己管位点**。
 // 没有后台拉取线程、没有 rebalance、没有消费监听器；只有：
-//   FetchSubscribeMessageQueues / Pull / PullBlockIfNotFound /
+//   FetchSubscribeMessageQueues / Pull / PullAsync / PullBlockIfNotFound /
 //   FetchConsumeOffset / UpdateConsumeOffset / SearchOffset / MaxOffset / MinOffset /
 //   EarliestMsgStoreTime / SendMessageBack / CreateTopic。
 //
@@ -14,7 +14,10 @@
 // 一个定时 rebalance 并在队列变更时回调 MessageQueueListener；本实现（同 Python 参考
 // 实现）**不做后台 rebalance**——队列由 FetchSubscribeMessageQueues（全部可消费队列）
 // 或 FetchMessageQueuesInBalance（本实例平衡后那一份：按 rebalanceByTopic 同一条公式
-// 当场算，不做后台线程）显式取，监听器只作为 API 形状保留。需要自动分配队列请用 push 消费者。
+// 当场算，不做后台线程）显式取，监听器只作为 API 形状保留。需要自动分配队列可以做
+// 「按 topic 注册回调 + 服务自己轮询」的托管拉取，用 PullConsumerScheduleService
+// （对应 Java MQPullConsumerScheduleService，见同名文件）；纯 push 语义仍用
+// DefaultMQPushConsumer。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -197,6 +200,19 @@ public sealed class DefaultMQPullConsumer
         set => _pollNameServerIntervalMillis = value;
     }
 
+    private SocksProxyConfig? _socksProxyConfig;
+
+    /// <summary>
+    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
+    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
+    /// remoting 长连接，NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
+    /// </summary>
+    public SocksProxyConfig? SocksProxyConfig
+    {
+        get => _socksProxyConfig;
+        set => _socksProxyConfig = value;
+    }
+
     /// <summary>是否周期性发心跳（对齐 push 消费者的开关；启动时那一轮不受影响）。</summary>
     public bool HeartbeatEnabled
     {
@@ -282,15 +298,29 @@ public sealed class DefaultMQPullConsumer
             // 位点查询）就该带着它。拉模式默认开 stream，所以这里必须走 Compose，
             // 直接注册 _rpcHook 会让 ReqT 漏发、且 ACL 签的内容与上线字段不一致。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            _mqClient = new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
-                /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/_consumerPullTimeoutMillis,
-                unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
+            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
+            // 即复用已有实例，只有第一个到达者的实例级参数生效；Start 是幂等的。
+            _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
+                () => new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
+                    /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/_consumerPullTimeoutMillis,
+                    socksProxy: _socksProxyConfig,
+                    unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("pull consumer rpc hook ignored: MqClient already has one (clientId="
                     + _clientId + ")");
             }
-            _mqClient.Start();
+            try
+            {
+                _mqClient.Start();
+            }
+            catch
+            {
+                // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+                MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+                _mqClient = null;
+                throw;
+            }
             // 拉模式也要登记 topic，路由才会被周期刷新（对齐 Java registerTopicInUse）。
             // 心跳前的刷路由走同一个入口：brokerAddrTable 空着时心跳没有收件人。
             RefreshRouteForHeartbeat();
@@ -340,7 +370,9 @@ public sealed class DefaultMQPullConsumer
                 {
                     ClientLog.Debug("unregister on shutdown failed: " + e.Message);
                 }
-                _mqClient.Shutdown();
+                // 归还引用（Java DefaultMQPullConsumerImpl.shutdown:689-692 末句
+                // mQClientFactory.shutdown() 的等价物）：计数归零才真正关停实例。
+                MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
                 _mqClient = null;
             }
         }
@@ -706,6 +738,68 @@ public sealed class DefaultMQPullConsumer
         UpdatePullFromWhichNode(real, result);
         return result;
     }
+
+    /// <summary>
+    /// 异步拉取（对应 Java <c>DefaultMQPullConsumer.pull(mq, subExpression, offset, maxNums,
+    /// PullCallback[, timeoutMillis]):362-378</c>）：<b>调用线程立即返回</b>，结果经
+    /// <see cref="IPullCallback"/> 恰好一次转交（成功 / 异常二选一）。
+    ///
+    /// 实现口径：Java 的异步内核是 netty <c>invokeAsync</c>（真非阻塞 IO，见
+    /// DefaultMQPullConsumerImpl.pull:239 → MQClientAPIImpl.pullMessage →
+    /// pullKernelImpl 的 ASYNC 分支）；本端口拉取内核只有同步 <c>InvokeSync</c>，所以整笔
+    /// 拉取包进线程池任务（Task.Run）——对调用方的可观察语义与 Java 一致：不阻塞调用线程、
+    /// 超时用 <paramref name="timeoutMillis"/> 兜底（<= 0 用 consumerPullTimeoutMillis，
+    /// 同步 Pull 的同一条规则）。与生产者 <c>SendAsync</c> 的两处同款约定：
+    ///   * 未启动 / 已关停时<b>同步抛</b>给调用方（Java 走回调，本端口认为配置错误应该
+    ///     在调用栈上看见，口径从 SendAsync 沿用）；
+    ///   * 同一队列的并发在途不做串行守卫（Java 也不做；要 queue 维度串行的自动轮询，
+    ///     用 <see cref="PullConsumerScheduleService"/>）。
+    /// </summary>
+    public void PullAsync(MessageQueue mq, string subExpression, long offset, int maxNums,
+        IPullCallback callback, int timeoutMillis = -1)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        _ = RequireClient(); // 未启动：同步抛，语义与同步 Pull 对齐（线程池里再抛就太晚了）
+        _ = Task.Run(() =>
+        {
+            PullResult result;
+            try
+            {
+                result = Pull(mq, subExpression, offset, maxNums, timeoutMillis);
+            }
+            catch (Exception e)
+            {
+                // 拉取失败交给 onException；回调自己再抛就只留日志（Java 的回调异常同样
+                // 不会回到任何调用方）
+                try
+                {
+                    callback.OnException(e);
+                }
+                catch (Exception inner)
+                {
+                    ClientLog.Warn("pullAsync onException callback threw: " + inner.Message);
+                }
+
+                return;
+            }
+
+            try
+            {
+                callback.OnSuccess(result);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("pullAsync onSuccess callback threw: " + e.Message);
+            }
+        });
+    }
+
+    /// <summary>按 (topic, brokerName, queueId) 定位队列的重载（免拼 MessageQueue；语义与
+    /// <see cref="PullAsync(MessageQueue,string,long,int,IPullCallback,int)"/> 完全一致）。</summary>
+    public void PullAsync(string topic, string subExpression, string brokerName, int queueId,
+        long offset, int maxNums, IPullCallback callback, int timeoutMillis = -1) =>
+        PullAsync(new MessageQueue(topic, brokerName, queueId), subExpression, offset, maxNums,
+            callback, timeoutMillis);
 
     /// <summary>Java <c>PullAPIWrapper#recalculatePullFromWhichNode</c>：无记录按 master=0。</summary>
     private long TakePullFromWhichNode(MessageQueue mq)

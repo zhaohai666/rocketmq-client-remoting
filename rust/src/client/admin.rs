@@ -4,7 +4,8 @@
 //!
 //! 覆盖：Topic 增删查与配置、Broker 集群信息 / 运行时信息 / 配置、NameServer KV
 //! 配置、订阅组管理、消费者与生产者连接、消费统计、位点管理（含真实 broker 端
-//! 重置）、消息查询（key / uniqKey / msgId / ConsumeQueue）。
+//! 重置）、消息查询（key / uniqKey / msgId / ConsumeQueue）、单条消息试消费
+//! （CONSUME_MESSAGE_DIRECTLY(309) 发起端）。
 //!
 //! 对齐要点（与 `admin.py` 模块头同源，均为 Java 5.x 探针 + 源码核对结论）：
 //! - `GET_BROKER_CONFIG` 的 body 是 **properties 文本**（`k=v\n`），不是 JSON。
@@ -50,7 +51,9 @@ use serde_json::{json, Value};
 use crate::client::mq_client::{MQClientInstance, MQClientInstanceConfig};
 use crate::common::boundary_type::BoundaryType;
 use crate::common::message::{MessageExt, MessageQueue};
-use crate::common::message_const::{INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE};
+use crate::common::message_const::{
+    INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+};
 use crate::common::message_decoder::{decode_message, decode_message_id};
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::PermName;
@@ -62,8 +65,9 @@ use crate::remoting::protocol::admin_body::{
     TopicStatsTable,
 };
 use crate::remoting::protocol::body::{
-    ClusterInfo, ConsumeStatsList, ConsumerConnection, ConsumerRunningInfo,
-    GetConsumerListByGroupResponseBody, KVTable, ProducerConnection, ResetOffsetBody, TopicList,
+    ClusterInfo, ConsumeMessageDirectlyResult, ConsumeStatsList, ConsumerConnection,
+    ConsumerRunningInfo, GetConsumerListByGroupResponseBody, KVTable, ProducerConnection,
+    ResetOffsetBody, TopicList,
 };
 use crate::remoting::protocol::codes::{language_code, request_code, response_code};
 use crate::remoting::protocol::ext_fields::{ExtFields, StringMap};
@@ -2549,6 +2553,57 @@ impl DefaultMQAdminExt {
         ))
     }
 
+    /// Java `DefaultMQAdminExtImpl#consumeMessageDirectly(consumerGroup, clientId,
+    /// topic, msgId)`：让 broker 把 `msg_id` 那条消息**直接推给 `client_id` 的消费者**
+    /// 试消费（CONSUME_MESSAGE_DIRECTLY(309)），应答 body 是目标客户端的
+    /// [`ConsumeMessageDirectlyResult`]。
+    ///
+    /// Java 的取址口径（`viewMessage` → `msg.getStoreHost()`）：先解析 msgId 定位消息
+    /// —— 合法 offset msgId 走 `VIEW_MESSAGE_BY_ID`，解不动（uniqKey）退回 uniqKey
+    /// 索引查询 —— 309 打到**消息的 storeHost**；消息带客户端 uniq key（`UNIQ_KEY`
+    /// 属性）时头里的 msgId 要换成**消息本体的 offset msgId**（broker 靠它定位
+    /// commitLog 再转发给目标客户端），没有 uniq key 的（老客户端产的消息）原样透传。
+    /// 309 的 broker 端会把消息编码进 body 转发给目标客户端，把客户端的
+    /// [`ConsumeMessageDirectlyResult`] 原样带回。
+    pub async fn consume_message_directly(
+        &self,
+        consumer_group: &str,
+        client_id: &str,
+        topic: &str,
+        msg_id: &str,
+    ) -> Result<ConsumeMessageDirectlyResult> {
+        // Java 先 viewMessage：offsetMsgId / uniqKey 两条路径都会给出消息本体。
+        let msg = self.view_message(topic, msg_id).await?;
+        // Java `NetworkUtil.socketAddress2String(msg.getStoreHost())`。
+        let addr = msg.get_store_host_string().ok_or_else(|| {
+            Error::client(format!("message {msg_id} has no store host, cannot consume directly"))
+        })?;
+        // Java：`getProperty(UNIQ_KEY) == null` ⇒ 原样透传 msgId；否则用
+        // `MessageClientExt.getOffsetMsgId()`（即消息本体的 offset msgId）。
+        let direct_msg_id = match msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) {
+            Some(_) => msg.get_offset_msg_id().unwrap_or(msg_id),
+            None => msg_id,
+        };
+        let ext = ext_pairs(&[
+            ("consumerGroup", consumer_group.to_string()),
+            ("clientId", client_id.to_string()),
+            ("msgId", direct_msg_id.to_string()),
+            ("topic", topic.to_string()),
+        ]);
+        let response = self
+            .invoke_broker(&addr, request_code::CONSUME_MESSAGE_DIRECTLY, &ext, None, None)
+            .await?;
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => ConsumeMessageDirectlyResult::decode(body),
+            // Java 在 SUCCESS 且 body 为空时落到 default 分支抛
+            // `MQClientException(0, null)`；这里沿用 nodeJs 的可读文案（纯客户端错
+            // 不带 response_code，与 `admin` 既有口径一致）。
+            None => Err(Error::client(format!(
+                "no consume result for client {client_id}"
+            ))),
+        }
+    }
+
     /// Python `query_consume_queue`（321）。
     pub async fn query_consume_queue(
         &self,
@@ -3038,7 +3093,9 @@ fn string_list(value: &Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::message_decoder::{create_message_id, encode_message_ext, ip_and_port_to_bytes};
     use crate::remoting::protocol::admin_body::TopicOffset;
+    use crate::remoting::protocol::body::CMResult;
     use crate::remoting::protocol::route::QueueData;
 
     fn cluster() -> ClusterInfo {
@@ -3480,6 +3537,319 @@ mod tests {
         // 查不到消息时出现，那条断言放在 live_admin 示例里（需要真实 broker）。
         assert_eq!(view_err.response_code(), None);
         assert!(view_err
+            .to_string()
+            .starts_with("MQClientException: admin not started"));
+    }
+
+    // ---------------- 309 consume_message_directly（假 broker 对拍） ----------------
+
+    /// 假 broker 收到的请求流水：`(请求码, extFields 快照)`。
+    type DirectLog = Arc<Mutex<Vec<(i32, Vec<(String, String)>)>>>;
+
+    async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt as _;
+        let mut len_buf = [0_u8; 4];
+        stream.read_exact(&mut len_buf).await.ok()?;
+        let total = i32::from_be_bytes(len_buf);
+        if total <= 0 || total > 20 * 1024 * 1024 {
+            return None;
+        }
+        let mut frame = vec![0_u8; 4 + total as usize];
+        frame[..4].copy_from_slice(&len_buf);
+        stream.read_exact(&mut frame[4..]).await.ok()?;
+        Some(frame)
+    }
+
+    /// 带 `opaque` 的应答（客户端按 opaque 配对，串了就当噪声丢掉）。
+    fn reply_for(request: &RemotingCommand, code: i32, body: Option<Vec<u8>>) -> RemotingCommand {
+        let mut response = RemotingCommand::create_response(code, None);
+        response.opaque = request.opaque;
+        response.serialize_type_current_rpc = request.serialize_type_current_rpc;
+        if let Some(body) = body {
+            response.set_body(Some(body));
+        }
+        response
+    }
+
+    /// 起 309 对拍假 broker：`VIEW_MESSAGE_BY_ID(33)` 回 `view_body`，
+    /// `CONSUME_MESSAGE_DIRECTLY(309)` 按脚本 `(应答码, body)` 应答并记下 extFields，
+    /// 其余请求（admin 启动后的路由刷新等）一律 SUCCESS。
+    async fn spawn_direct_broker(
+        listener: tokio::net::TcpListener,
+        view_body: Vec<u8>,
+        direct: (i32, Vec<u8>),
+    ) -> DirectLog {
+        use tokio::io::AsyncWriteExt as _;
+        let log: DirectLog = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let log = Arc::clone(&inner);
+                let view_body = view_body.clone();
+                let direct = direct.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        if matches!(
+                            request.code,
+                            request_code::VIEW_MESSAGE_BY_ID | request_code::CONSUME_MESSAGE_DIRECTLY
+                        ) {
+                            lock(&log).push((
+                                request.code,
+                                request
+                                    .ext_fields()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            ));
+                        }
+                        let (code, body) = match request.code {
+                            request_code::VIEW_MESSAGE_BY_ID => {
+                                (response_code::SUCCESS, Some(view_body.clone()))
+                            }
+                            request_code::CONSUME_MESSAGE_DIRECTLY => {
+                                (direct.0, Some(direct.1.clone()))
+                            }
+                            _ => (response_code::SUCCESS, None),
+                        };
+                        if request.is_oneway_rpc() {
+                            continue;
+                        }
+                        let mut response = reply_for(&request, code, body);
+                        // Java 的业务错走 remark（`check_response` 原样透传）。
+                        if code != response_code::SUCCESS {
+                            response.remark = Some(String::from_utf8_lossy(&direct.1).into_owned());
+                            response.body = None;
+                        }
+                        let bytes = response.encode();
+                        let _ = stream.write_all(&bytes).await;
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        log
+    }
+
+    /// 编一条 `storeHost = 127.0.0.1:store_port`、commitLog 偏移 `offset` 的消息，
+    /// 返回 `(33 的应答 body, 该消息本体的 offset msgId)`。
+    fn directly_view_body(store_port: u16, offset: i64, with_uniq_key: bool) -> (Vec<u8>, String) {
+        let mut ext = MessageExt::new();
+        ext.set_topic("T");
+        ext.set_body(Some(b"directly consume me"));
+        ext.sys_flag = 0;
+        ext.born_timestamp = 1_700_000_000_000;
+        ext.store_timestamp = 1_700_000_000_123;
+        ext.set_born_host(Some("127.0.0.1"));
+        ext.born_host_port = 54321;
+        ext.set_store_host(Some("127.0.0.1"));
+        ext.store_host_port = u32::from(store_port);
+        ext.queue_id = 0;
+        ext.queue_offset = 7;
+        ext.commit_log_offset = offset;
+        let mut props = StringMap::new();
+        props.insert("TAGS", "TagA");
+        if with_uniq_key {
+            props.insert(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, "UNIQKEY-0001");
+        }
+        ext.set_properties(props);
+        (
+            encode_message_ext(&ext, false).expect("编码夹具消息"),
+            create_message_id(
+                &ip_and_port_to_bytes("127.0.0.1", u32::from(store_port), false).expect("夹具地址"),
+                offset,
+            ),
+        )
+    }
+
+    fn direct_result_body() -> Vec<u8> {
+        ConsumeMessageDirectlyResult {
+            consume_result: Some(CMResult::CR_SUCCESS.to_string()),
+            remark: Some("ok".to_string()),
+            spent_time_mills: 42,
+            ..Default::default()
+        }
+        .encode()
+    }
+
+    async fn started_direct_admin(addr: &str) -> DefaultMQAdminExt {
+        let admin = DefaultMQAdminExt::new();
+        admin.set_namesrv_addr(addr);
+        admin.start().await.expect("对着假 broker start 应当成功");
+        admin
+    }
+
+    fn direct_ext(log: &DirectLog, n: usize) -> Vec<(String, String)> {
+        lock(log)[n]
+            .1
+            .clone()
+    }
+
+    /// 全链路对拍：msgId 是合法 offset msgId → 33 拿到消息（带 UNIQ_KEY）→ 309 打到
+    /// 消息的 storeHost 且头里的 msgId 换成**消息本体**的 offset msgId → body 解码回
+    /// [`ConsumeMessageDirectlyResult`]。
+    ///
+    /// 夹具消息的 commitLog 偏移故意（4096）不同于调用方 msgId 里编的（1024）：
+    /// 309 若透传了调用方的 msgId，msgId 断言立刻能看出来。
+    #[tokio::test]
+    async fn consume_message_directly_sends_309_to_store_host_with_offset_msg_id() {
+        let (listener, addr, port) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock broker");
+            let addr = listener.local_addr().expect("mock broker addr").to_string();
+            let port = listener.local_addr().expect("mock broker port").port();
+            (listener, addr, port)
+        };
+        let (view_body, offset_msg_id) = directly_view_body(port, 4096, true);
+        let log = spawn_direct_broker(
+            listener,
+            view_body,
+            (response_code::SUCCESS, direct_result_body()),
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let input_msg_id = create_message_id(
+            &ip_and_port_to_bytes("127.0.0.1", u32::from(port), false).unwrap(),
+            1024,
+        );
+        let result = admin
+            .consume_message_directly("GID_A", "cid-1", "T", &input_msg_id)
+            .await
+            .expect("309 全链路应当成功");
+        assert_eq!(result.consume_result.as_deref(), Some(CMResult::CR_SUCCESS));
+        assert!(result.auto_commit, "Java 初值 autoCommit=true");
+        assert_eq!(result.spent_time_mills, 42);
+        assert_eq!(result.remark.as_deref(), Some("ok"));
+
+        let snapshot = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(snapshot.len(), 2, "先 33 后 309，各一笔");
+        assert_eq!(snapshot[0].0, request_code::VIEW_MESSAGE_BY_ID);
+        assert_eq!(snapshot[1].0, request_code::CONSUME_MESSAGE_DIRECTLY);
+        let ext = direct_ext(&log, 1);
+        let get = |key: &str| {
+            ext.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("consumerGroup"), Some("GID_A"));
+        assert_eq!(get("clientId"), Some("cid-1"));
+        assert_eq!(get("topic"), Some("T"));
+        assert_eq!(
+            get("msgId"),
+            Some(offset_msg_id.as_str()),
+            "带 UNIQ_KEY 的消息必须换成消息本体的 offset msgId"
+        );
+        drop(ext);
+        admin.shutdown();
+    }
+
+    /// Java 的另一条腿：消息没有 UNIQ_KEY 属性（老客户端产的消息）⇒ 309 头里的
+    /// msgId **原样透传**调用方给的那份。
+    #[tokio::test]
+    async fn consume_message_directly_without_uniq_key_passes_msg_id_through() {
+        let (listener, addr, port) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock broker");
+            let addr = listener.local_addr().expect("mock broker addr").to_string();
+            let port = listener.local_addr().expect("mock broker port").port();
+            (listener, addr, port)
+        };
+        let (view_body, msg_id) = directly_view_body(port, 1024, false);
+        let log = spawn_direct_broker(
+            listener,
+            view_body,
+            (response_code::SUCCESS, direct_result_body()),
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .consume_message_directly("GID_A", "cid-2", "T", &msg_id)
+            .await
+            .expect("无 UNIQ_KEY 同样应当成功");
+        let ext = direct_ext(&log, 1);
+        let get = |key: &str| ext.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        assert_eq!(
+            get("msgId"),
+            Some(msg_id.as_str()),
+            "没有 UNIQ_KEY 原样透传"
+        );
+        drop(ext);
+        admin.shutdown();
+    }
+
+    /// 309 的 broker 业务码不进任何重试链：原样带码抛出（`Error::Broker`）。
+    #[tokio::test]
+    async fn consume_message_directly_propagates_broker_error() {
+        let (listener, addr, port) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock broker");
+            let addr = listener.local_addr().expect("mock broker addr").to_string();
+            let port = listener.local_addr().expect("mock broker port").port();
+            (listener, addr, port)
+        };
+        let (view_body, msg_id) = directly_view_body(port, 1024, true);
+        let log = spawn_direct_broker(
+            listener,
+            view_body,
+            (response_code::SYSTEM_ERROR, b"no consumer".to_vec()),
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let err = admin
+            .consume_message_directly("GID_A", "cid-1", "T", &msg_id)
+            .await
+            .expect_err("broker 业务码必须原样抛");
+        assert_eq!(err.response_code(), Some(response_code::SYSTEM_ERROR));
+        assert!(err.to_string().contains("no consumer"), "{err}");
+        assert_eq!(lock(&log).len(), 2);
+        admin.shutdown();
+    }
+
+    /// SUCCESS 但 body 为空：Java 抛 `MQClientException(0, null)`，这里沿用 nodeJs
+    /// 的可读文案，且不带 response_code（纯客户端错口径）。
+    #[tokio::test]
+    async fn consume_message_directly_reports_missing_result_body() {
+        let (listener, addr, port) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock broker");
+            let addr = listener.local_addr().expect("mock broker addr").to_string();
+            let port = listener.local_addr().expect("mock broker port").port();
+            (listener, addr, port)
+        };
+        let (view_body, msg_id) = directly_view_body(port, 1024, true);
+        let log = spawn_direct_broker(listener, view_body, (response_code::SUCCESS, Vec::new()))
+            .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let err = admin
+            .consume_message_directly("GID_A", "cid-1", "T", &msg_id)
+            .await
+            .expect_err("空 body 必须报错");
+        assert_eq!(err.response_code(), None);
+        assert!(
+            err.to_string().contains("no consume result for client cid-1"),
+            "{err}"
+        );
+        assert_eq!(lock(&log).len(), 2);
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn consume_message_directly_requires_start() {
+        let admin = DefaultMQAdminExt::new();
+        let err = admin
+            .consume_message_directly("G", "c", "T", "0A00000100002A9F0000000000000400")
+            .await
+            .expect_err("not started");
+        assert!(err
             .to_string()
             .starts_with("MQClientException: admin not started"));
     }

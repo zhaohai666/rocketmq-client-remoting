@@ -21,6 +21,7 @@ use RocketMQ\Remoting\Protocol\ProcessQueueInfo;
 use RocketMQ\Remoting\Protocol\RequestCode;
 use RocketMQ\Remoting\Protocol\ResponseCode;
 use RocketMQ\Remoting\Protocol\ConsumerSendMsgBackRequestHeader;
+use RocketMQ\Remoting\SocksProxyConfig;
 use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
 use RocketMQ\Remoting\Protocol\HeartbeatData;
 use RocketMQ\Remoting\Protocol\ConsumeType;
@@ -78,6 +79,12 @@ final class DefaultMQPushConsumer
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
+    /**
+     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
+     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
+     * 只在 start() 建 MQClientInstance 时透传一次。
+     */
+    public ?SocksProxyConfig $socksProxy = null;
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
@@ -288,6 +295,17 @@ final class DefaultMQPushConsumer
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
+    }
+
+    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
+    public function setSocksProxy(?SocksProxyConfig $proxy): void
+    {
+        $this->socksProxy = $proxy;
+    }
+
+    public function getSocksProxy(): ?SocksProxyConfig
+    {
+        return $this->socksProxy;
     }
 
     public function setMessageModel(string $model): void
@@ -562,6 +580,7 @@ final class DefaultMQPushConsumer
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
+            socksProxy: $this->socksProxy,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

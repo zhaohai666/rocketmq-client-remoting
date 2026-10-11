@@ -549,33 +549,40 @@ func (a *DefaultMQAdminExt) QueryConsumeQueue(brokerAddr, topic string, queueID 
 	return remoting.DecodeQueryConsumeQueueResponseBody(response.Body)
 }
 
-// ConsumeMessageDirectly initiates CONSUME_MESSAGE_DIRECTLY(309) from the
-// admin side (Java DefaultMQAdminExt.consumeMessageDirectly): resolve the
-// message, send the request to the broker that STORES it, and the broker
-// relays the message to the named client, whose verdict comes back as the
-// ConsumeMessageDirectlyResult body.
+// ConsumeMessageDirectly mirrors Java DefaultMQAdminExtImpl#consumeMessageDirectly
+// (CONSUME_MESSAGE_DIRECTLY(309) sent from the admin side): resolve the message
+// with viewMessage, send the request to the broker that STORES it, and that
+// broker relays the message to the named client, whose listener verdict comes
+// back as the ConsumeMessageDirectlyResult body.
 //
-// Java resolves the store host with viewMessage(topic, msgId) and substitutes
-// the OFFSET msgId when the resolved message carries a client uniq key (the
-// broker cannot look a client-side uniq id up by itself). brokerAddr overrides
-// the store-host resolution for callers that already know it.
-func (a *DefaultMQAdminExt) ConsumeMessageDirectly(consumerGroup, clientID, topic, msgID, brokerAddr string) (*remoting.ConsumeMessageDirectlyResult, error) {
-	addr := brokerAddr
-	outMsgID := msgID
-	if addr == "" {
-		msg, err := a.ViewMessage(topic, msgID)
-		if err != nil {
-			return nil, err
-		}
-		addr = msg.StoreHostString()
-		if _, uniq := msg.GetProperty(common.PropertyUniqKey); uniq && msg.OffsetMsgID != "" {
-			outMsgID = msg.OffsetMsgID
-		}
+// The msgId has two shapes (Java's two branches): a client uniq key cannot be
+// looked up by the receiving broker on its own — it needs the physical
+// commitLog offset to find the message body it forwards — so when the resolved
+// message carries a UNIQ_KEY property the OFFSET msgId travels instead
+// (Java MessageClientExt#getOffsetMsgId). An offset msgId passes through
+// untouched.
+func (a *DefaultMQAdminExt) ConsumeMessageDirectly(consumerGroup, clientID, topic, msgID string) (*remoting.ConsumeMessageDirectlyResult, error) {
+	msg, err := a.ViewMessage(topic, msgID)
+	if err != nil {
+		return nil, err
 	}
-	response, err := a.invokeBroker(addr, remoting.ReqConsumeMessageDirectly, adminExt(
+	outMsgID := msgID
+	if _, uniq := msg.GetProperty(common.PropertyUniqKey); uniq && msg.OffsetMsgID != "" {
+		outMsgID = msg.OffsetMsgID
+	}
+	return a.consumeMessageDirectlyTo(msg.StoreHostString(), consumerGroup, clientID, topic, outMsgID)
+}
+
+// consumeMessageDirectlyTo is Java MQClientAPIImpl#consumeMessageDirectly(addr,
+// ...): the wire half. brokerAddr is the store host the msgId resolution
+// produced (the admin tests also drive it directly, mirroring Java's addr
+// overload); the ext fields and the verdict body follow the 309 header
+// ConsumeMessageDirectlyResultRequestHeader.
+func (a *DefaultMQAdminExt) consumeMessageDirectlyTo(brokerAddr, consumerGroup, clientID, topic, msgID string) (*remoting.ConsumeMessageDirectlyResult, error) {
+	response, err := a.invokeBroker(brokerAddr, remoting.ReqConsumeMessageDirectly, adminExt(
 		"consumerGroup", consumerGroup,
 		"clientId", clientID,
-		"msgId", outMsgID,
+		"msgId", msgID,
 		"topic", topic,
 	), nil, 0)
 	if err != nil {

@@ -12,6 +12,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../bootstrap.php';
 
 use RocketMQ\Client\Exceptions\RemotingCommandException;
+use RocketMQ\Client\Exceptions\RemotingConnectException;
 use RocketMQ\Client\Exceptions\RemotingSendRequestException;
 use RocketMQ\Client\Exceptions\RemotingTimeoutException;
 use RocketMQ\Client\Logger;
@@ -25,6 +26,7 @@ use RocketMQ\Remoting\NamespaceRpcHook;
 use RocketMQ\Remoting\PendingResponse;
 use RocketMQ\Remoting\RemotingClient;
 use RocketMQ\Remoting\SessionCredentials;
+use RocketMQ\Remoting\SocksProxyConfig;
 use RocketMQ\Remoting\StreamTypeRPCHook;
 use RocketMQ\Remoting\Protocol\BrokerData;
 use RocketMQ\Remoting\Protocol\CheckTransactionStateRequestHeader;
@@ -969,6 +971,184 @@ final class RunRemoting
         $client6->shutdown();
     }
 
+    // ==================================================================== SOCKS 代理
+
+    /**
+     * 起本地假 SOCKS 代理子进程（tests/_socks_child.php）：子进程同进程里还开着目标
+     * echo 服务，stdout 一行 ``READY <proxyPort> <targetPort>`` 回报端口后进入服务循环。
+     *
+     * @return array{0: resource, 1: string, 2: string, 3: array<int, resource>} [proc, proxyAddr, targetAddr, pipes]
+     */
+    private function startSocksChild(string $mode, string $user = '', string $pass = ''): array
+    {
+        $pipes = [];
+        $proc = proc_open(
+            [PHP_BINARY, __DIR__ . '/_socks_child.php', $mode, $user, $pass],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        if (!is_resource($proc)) {
+            throw new \RuntimeException('failed to spawn socks child');
+        }
+        stream_set_timeout($pipes[1], 15);
+        $line = fgets($pipes[1]);
+        $ports = $line === false ? null : sscanf(trim(substr((string)$line, 6)), '%d %d');
+        if (!is_array($ports) || count($ports) !== 2 || $ports[0] === null || $ports[1] === null) {
+            $err = stream_get_contents($pipes[2]);
+            $this->stopSocksChild($proc, $pipes);
+            throw new \RuntimeException('socks child did not report ports: ' . trim((string)$err));
+        }
+        return [$proc, sprintf('127.0.0.1:%d', $ports[0]), sprintf('127.0.0.1:%d', $ports[1]), $pipes];
+    }
+
+    /** 收尾子进程（成功路径里隧道 EOF 后子进程自然退出，这里兜底 reap + 断管道）。 */
+    private function stopSocksChild($proc, array $pipes): void
+    {
+        if (is_resource($proc)) {
+            @proc_terminate($proc);
+        }
+        foreach ($pipes as $p) {
+            if (is_resource($p)) {
+                @fclose($p);
+            }
+        }
+        if (is_resource($proc)) {
+            @proc_close($proc);
+        }
+    }
+
+    /**
+     * 经 SOCKS 代理完成一次 RocketMQ 请求往返：目标 echo 服务把请求帧原样回显，
+     * RemotingClient 的 dispatch 按 opaque 命中 pending，invokeSync 拿回请求帧本身。
+     */
+    private function socksRoundtrip(RemotingClient $client, string $targetAddr, string $body): RemotingCommand
+    {
+        $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
+        $req->body = $body;
+        return $client->invokeSync($targetAddr, $req, 10000);
+    }
+
+    private function testSocksProxy(): void
+    {
+        // ---- 1. SocksProxyConfig 配置面（字段对齐 Java SocksProxyConfig）----
+        $cfg = new SocksProxyConfig();
+        $this->check(!$cfg->isConfigured(), '缺省 SocksProxyConfig 未配置（addr=null）');
+        $cfg = new SocksProxyConfig('127.0.0.1:1080', 'u', 'p');
+        $this->check($cfg->isConfigured(), '带 addr 即配置');
+        $this->checkSame('127.0.0.1:1080', $cfg->getAddr(), 'getAddr');
+        $this->checkSame('u', $cfg->getUsername(), 'getUsername');
+        $this->checkSame('p', $cfg->getPassword(), 'getPassword');
+        $this->checkSame('socks5', $cfg->getVersion(), '缺省版本 socks5（对齐 Java Socks5ProxyHandler）');
+        $this->checkSame(
+            'SocksProxy address: 127.0.0.1:1080, username: u, password: p',
+            (string)$cfg,
+            'toString 对齐 Java SocksProxyConfig#toString'
+        );
+        $cfg->setAddr('10.0.0.1:1180');
+        $cfg->setUsername(null);
+        $cfg->setPassword(null);
+        $this->check($cfg->getUsername() === null && $cfg->getPassword() === null, 'setter 可置空认证字段');
+        $cfg->setVersion('4');
+        $this->checkSame('socks4', $cfg->normalizedVersion(), "version '4' 归一化为 socks4");
+        $cfg->setVersion('SOCKS5');
+        $this->checkSame('socks5', $cfg->normalizedVersion(), '版本归一化忽略大小写');
+        $cfg->setVersion('socks6');
+        $this->checkThrows(static fn() => $cfg->normalizedVersion(), \InvalidArgumentException::class, '未知版本启动期即抛');
+
+        // ---- 2. SOCKS5 无认证：经代理建连 + 一次请求往返 ----
+        [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_ok');
+        try {
+            $proxyCfg = new SocksProxyConfig($proxyAddr);
+            $client = new RemotingClient(30000, 10000, socksProxy: $proxyCfg);
+            $this->checkSame($proxyCfg, $client->getSocksProxy(), 'RemotingClient 构造器收下 socksProxy');
+            $got = $this->socksRoundtrip($client, $targetAddr, 'via-socks5');
+            $this->checkSame(RequestCode::HEART_BEAT, $got->code, 'socks5 无认证：请求经代理往返（echo 回请求帧）');
+            $this->checkSame('via-socks5', $got->body, 'socks5 无认证：body 完整穿过隧道');
+            $client->shutdown();
+        } finally {
+            $this->stopSocksChild($proc, $pipes);
+        }
+
+        // ---- 3. SOCKS5 用户名/密码子协商（RFC 1929）----
+        [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_auth', 'socks-user', 'socks-pass');
+        try {
+            $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, 'socks-user', 'socks-pass'));
+            $got = $this->socksRoundtrip($client, $targetAddr, 'via-socks5-auth');
+            $this->checkSame('via-socks5-auth', $got->body, 'socks5 用户名/密码子协商后请求往返');
+            $client->shutdown();
+        } finally {
+            $this->stopSocksChild($proc, $pipes);
+        }
+
+        // 密码错 → 子协商失败 → RemotingConnectException（代理端口存活，不走拒绝路径，
+        // 但按本机 loopback 怪癖给失败类断言 30s 级预算）
+        [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_auth', 'socks-user', 'socks-pass');
+        try {
+            $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, 'socks-user', 'wrong-pass'));
+            $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
+            try {
+                $client->invokeSync($targetAddr, $req, 10000);
+                $this->check(false, 'socks5 错误密码应建连失败');
+            } catch (RemotingConnectException $e) {
+                $this->check(
+                    str_contains($e->getMessage(), 'authentication failed'),
+                    sprintf('socks5 错误密码 → 认证失败文案（got: %s）', $e->getMessage())
+                );
+            }
+            $client->shutdown();
+        } finally {
+            $this->stopSocksChild($proc, $pipes);
+        }
+
+        // ---- 4. SOCKS5 CONNECT 被拒（REP=0x01 general failure）----
+        [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks5_reject_connect');
+        try {
+            $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr));
+            $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
+            try {
+                $client->invokeSync($targetAddr, $req, 10000);
+                $this->check(false, 'socks5 CONNECT 被拒应建连失败');
+            } catch (RemotingConnectException $e) {
+                $this->check(
+                    str_contains($e->getMessage(), 'general SOCKS server failure'),
+                    sprintf('socks5 CONNECT 被拒 → REP 文案透传（got: %s）', $e->getMessage())
+                );
+            }
+            $client->shutdown();
+        } finally {
+            $this->stopSocksChild($proc, $pipes);
+        }
+
+        // ---- 5. SOCKS4：往返 + 被拒（CD=91）----
+        [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks4_ok');
+        try {
+            $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, version: 'socks4'));
+            $got = $this->socksRoundtrip($client, $targetAddr, 'via-socks4');
+            $this->checkSame('via-socks4', $got->body, 'socks4 请求经代理往返');
+            $client->shutdown();
+        } finally {
+            $this->stopSocksChild($proc, $pipes);
+        }
+
+        [$proc, $proxyAddr, $targetAddr, $pipes] = $this->startSocksChild('socks4_reject');
+        try {
+            $client = new RemotingClient(30000, 10000, socksProxy: new SocksProxyConfig($proxyAddr, version: 'socks4'));
+            $req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
+            try {
+                $client->invokeSync($targetAddr, $req, 10000);
+                $this->check(false, 'socks4 被拒应建连失败');
+            } catch (RemotingConnectException $e) {
+                $this->check(
+                    str_contains($e->getMessage(), 'code 91'),
+                    sprintf('socks4 被拒 → CD 码透传（got: %s）', $e->getMessage())
+                );
+            }
+            $client->shutdown();
+        } finally {
+            $this->stopSocksChild($proc, $pipes);
+        }
+    }
+
     public function run(): int
     {
         $this->testJsonFrameRoundtrip();
@@ -981,6 +1161,7 @@ final class RunRemoting
         $this->testExtraInfoAndNamespace();
         $this->testFastjsonParser();
         $this->testTcpEndToEnd();
+        $this->testSocksProxy();
         return $this->summary();
     }
 }

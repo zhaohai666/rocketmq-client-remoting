@@ -25,6 +25,7 @@ from .exception import (RemotingConnectException, RemotingSendRequestException,
                         RemotingTimeoutException)
 from .protocol.codes import ResponseCode
 from .protocol.remoting_command import RemotingCommand
+from .socks_proxy import SocksProxyConfig, SocksProxyError, socks_handshake
 from rocketmq_logging import get_logger
 
 logger = get_logger()
@@ -184,7 +185,8 @@ class RemotingClient:
     def __init__(self, connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
                  tls_enable: Optional[bool] = None,
                  tls_options: Optional[Dict[str, str]] = None,
-                 enable_reconnect_for_go_away: bool = True):
+                 enable_reconnect_for_go_away: bool = True,
+                 socks_proxy_config: Optional[SocksProxyConfig] = None):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
         # 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）：
@@ -202,6 +204,12 @@ class RemotingClient:
         #   clientCert/clientKey: mTLS 客户端证书与私钥路径。
         #   serverName: 主机名/SNI 覆盖（缺省用连接 host）。
         self.tls_options: Dict[str, str] = dict(tls_options or {})
+        # SOCKS 代理（对应 Java NettyRemotingClient 的 proxyMap / Socks5ProxyHandler）。
+        # Java 按 CIDR 分流；本端口配置了（且 enable 语义判定开启）就是全部 remoting
+        # 连接统一走代理，等价 Java 的 CIDR 0.0.0.0/0。握手在 TCP 连上代理之后、
+        # TLS 包裹之前做（Java 的 pipeline.addFirst(Socks5ProxyHandler) 在
+        # sslHandler 之前，同一时序），见 _create_conn。
+        self.socks_proxy_config = socks_proxy_config
         self._lock = threading.RLock()
         self._conns: Dict[str, socket.socket] = {}
         self._sock_locks: Dict[str, threading.Lock] = {}
@@ -265,13 +273,28 @@ class RemotingClient:
 
     def _create_conn(self, addr: str) -> socket.socket:
         host, port = self._parse_addr(addr)
+        proxy = self.socks_proxy_config
+        use_proxy = proxy is not None and proxy.is_enabled()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self.connect_timeout_millis / 1000.0)
         try:
-            sock.connect((host, int(port)))
+            if use_proxy:
+                # 对应 Java fetchBootstrap → createBootstrap(proxy)：先连代理，
+                # 再由 Socks5ProxyHandler（此处为 socks_handshake，SOCKS4/5 皆可）
+                # 发 CONNECT 到真正的目标 host:port。目标域名不在本地解析，
+                # 交给代理（SOCKS5 atyp=3 / SOCKS4a），与 Java
+                # bootstrap.resolver(NoopAddressResolverGroup) 的口径一致。
+                proxy_host, proxy_port = proxy.endpoint()
+                sock.connect((proxy_host, int(proxy_port)))
+                socks_handshake(sock, host, int(port), proxy)
+            else:
+                sock.connect((host, int(port)))
         except OSError:
             sock.close()
             raise RemotingConnectException(addr)
+        except SocksProxyError as e:
+            sock.close()
+            raise RemotingConnectException("%s (socks proxy: %s)" % (addr, e))
         if self.tls_enable:
             # 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ
             # 帧之前完成握手。test mode（Java tls.test.mode.enable 默认 true）= 信任

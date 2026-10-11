@@ -26,6 +26,7 @@ use RocketMQ\Remoting\Protocol\RemotingCommand;
 use RocketMQ\Remoting\Protocol\ConsumerData;
 use RocketMQ\Client\Exceptions\MQClientException;
 use RocketMQ\Client\Exceptions\MQBrokerException;
+use RocketMQ\Remoting\SocksProxyConfig;
 
 // 模块级辅助函数随 ConsumerSupport.php 的类一起被 autoload（见 PushConsumer 同款保护）。
 if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
@@ -76,6 +77,12 @@ final class DefaultMQPullConsumer
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
+    /**
+     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
+     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
+     * 只在 start() 建 MQClientInstance 时透传一次。
+     */
+    public ?SocksProxyConfig $socksProxy = null;
     public ?MessageQueueListener $messageQueueListener = null;
     /**
      * 队列分配策略（Java :89 字段初值 AVG / getter/setter:196-202）。
@@ -162,6 +169,17 @@ final class DefaultMQPullConsumer
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
+    }
+
+    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
+    public function setSocksProxy(?SocksProxyConfig $proxy): void
+    {
+        $this->socksProxy = $proxy;
+    }
+
+    public function getSocksProxy(): ?SocksProxyConfig
+    {
+        return $this->socksProxy;
     }
 
     public function setMessageModel(string $model): void
@@ -343,6 +361,7 @@ final class DefaultMQPullConsumer
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
+            socksProxy: $this->socksProxy,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -665,6 +684,12 @@ final class DefaultLitePullConsumer
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
+    /**
+     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
+     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
+     * 只在 start() 建 MQClientInstance 时透传一次。
+     */
+    public ?SocksProxyConfig $socksProxy = null;
 
     /** subscribe 模式的订阅表（topic => sub_expression）。 */
     public array $subscription = [];
@@ -806,6 +831,17 @@ final class DefaultLitePullConsumer
         return $this->namespaceV2;
     }
 
+    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
+    public function setSocksProxy(?SocksProxyConfig $proxy): void
+    {
+        $this->socksProxy = $proxy;
+    }
+
+    public function getSocksProxy(): ?SocksProxyConfig
+    {
+        return $this->socksProxy;
+    }
+
     // ---------------- 订阅 / 分配 ----------------
 
     public function subscribe(string $topic, string $subExpression = '*'): void
@@ -912,6 +948,7 @@ final class DefaultLitePullConsumer
             namespaceV2: $this->namespaceV2,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
+            socksProxy: $this->socksProxy,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

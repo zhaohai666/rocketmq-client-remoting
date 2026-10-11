@@ -56,6 +56,10 @@ type ClientInstanceConfig struct {
 	HeartbeatIntervalMillis int64
 	// PersistConsumerOffsetIntervalMillis (Java default 5s).
 	PersistConsumerOffsetIntervalMillis int64
+	// SocksProxy tunnels every remoting TCP connection through a SOCKS proxy
+	// (Java ClientConfig#socksProxyConfig -> NettyClientConfig). The
+	// address-server HTTP fetch (TopAddressing) is NOT proxied.
+	SocksProxy *remoting.SocksProxyConfig
 }
 
 // NewClientInstanceConfig returns the Java defaults.
@@ -208,6 +212,7 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 		TLSEnable:                config.TLSEnable,
 		TLSTestMode:              true,
 		EnableReconnectForGoAway: true,
+		SocksProxy:               config.SocksProxy,
 	})
 	inst.registerClientProcessors()
 	return inst

@@ -24,12 +24,21 @@
 //!    否则会随真实时钟漂移；
 //! 3. [`LatencyFaultToleranceImpl::get_fault_item`] 返回**快照副本**：Python 返回表里的活对象
 //!    （改它就改表），Rust 里表由锁持有所有权，改动只能走 `update_fault_item`；
-//! 4. Java 的后台可达性探测线程（`startDetector` / `detectByOneRound` / `pickOneAtLeast` /
-//!    `FaultItem#compareTo`）Python 已省略，这里同样省略；`check_stamp` 字段保留但无人写；
-//!    Java `updateFaultItem` / `updateNotAvailableDuration` 里的两条 `log.info` 也未移植（Python 没有）。
+//! 4. Java 的后台可达性探测（`startDetector` / `detectByOneRound`）**本端口已补齐**：
+//!    [`LatencyFaultToleranceImpl::detect_by_one_round`] 逐条对拍 Java
+//!    `LatencyFaultToleranceImpl#detectByOneRound`（`check_stamp` 去重 → `Resolver` 解析
+//!    地址 → `ServiceDetector` 探活 → 恢复可达即放回）。注意 Java 语义里探测**只负责把
+//!    broker 探回来**：探活失败不写表，可达性只由发送链路 `updateFaultItem` 的
+//!    `reachable` 实参写坏。调度循环在 `client::producer` 的 tokio 任务里（Java 是
+//!    `scheduleAtFixedRate(3, 3, SECONDS)` 的调度线程）；`pickOneAtLeast` /
+//!    `FaultItem#compareTo` 仍省略（Python 也没有）；
+//!    Java `updateFaultItem` / `updateNotAvailableDuration` 里的两条 `log.info` 也未移植
+//!    （Python 没有）。
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -73,7 +82,9 @@ pub struct FaultItem {
     pub current_latency: i64,
     /// 隔离结束时间点（毫秒）；`now >= start_timestamp` 才算可用。
     pub start_timestamp: i64,
-    /// Java 探测线程的去重时间戳。Python 只留字段、不写它（见模块头差异 4）。
+    /// Java 探测线程的去重时间戳（`detectByOneRound` 里写：本轮开工时
+    /// `check_stamp = now + detect_interval`，`detect_interval` 内不重复探测）。
+    /// Python 只留字段、不写它（见模块头差异 4）。
     pub check_stamp: i64,
     /// 可达性标志（Java `reachableFlag`）。
     pub reachable_flag: bool,
@@ -143,10 +154,38 @@ impl fmt::Display for FaultItem {
     }
 }
 
+// ------------------------------------------------------------ 可达性探测
+
+/// Java `client.latency.Resolver`：把 broker 名解析成可发送地址
+/// （生产侧用 `findBrokerAddressInPublish`，只认 master；解析不到 = 路由里
+/// 已经没有这个 broker，故障项要一并清掉）。
+pub trait Resolver: Send + Sync {
+    fn resolve(&self, broker_name: &str) -> Option<String>;
+}
+
+/// Java `client.latency.ServiceDetector`：探测 endpoint 上的服务是否恢复正常
+/// （返回 `true` = back to normal）。Java 默认实现是 `GET_MAX_OFFSET` RPC。
+///
+/// 与 Java 的差异：Java 的 `detect(endpoint, timeoutMillis)` 只收地址；这里多传
+/// `broker_name`（探测轮里现成有的），实现方可以用它挑一个路由到该 broker 的
+/// topic 塞进探测请求 —— Java 的 `pickTopic()` 从生产者的 topicPublishInfoTable
+/// 里随便挑一个，topic 与被探 broker 之间本来就没有耦合。
+/// 返回值用 `Pin<Box<dyn Future>>` 是为了保持对象安全（`async_trait` 会引入新依赖）。
+pub trait ServiceDetector: Send + Sync {
+    fn detect(
+        &self,
+        broker_name: &str,
+        endpoint: &str,
+        timeout_millis: i64,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+}
+
 // -------------------------------------------------- LatencyFaultToleranceImpl
 
-/// 对应 Java `client.latency.LatencyFaultToleranceImpl`（与 Python 一样简化为纯内存版，
-/// 无探测线程），线程安全：内部 `RwLock<HashMap<..>>` 承担 Python 的 `RLock`。
+/// 对应 Java `client.latency.LatencyFaultToleranceImpl`（Python 简化为纯内存版；
+/// Java 5.x 的后台探测循环见 [`LatencyFaultToleranceImpl::detect_by_one_round`]，
+/// 调度在 `client::producer` 的 tokio 任务里），线程安全：内部 `RwLock<HashMap<..>>`
+/// 承担 Python 的 `RLock`。
 #[derive(Debug)]
 pub struct LatencyFaultToleranceImpl {
     /// Python `_fault_item_table`。
@@ -235,6 +274,65 @@ impl LatencyFaultToleranceImpl {
             .collect();
         names.sort();
         names
+    }
+
+    /// Java 5.x `LatencyFaultToleranceImpl#detectByOneRound`：对表里每个
+    /// `now >= check_stamp` 的故障项做一轮主动探活。由 `client::producer`
+    /// 的后台 tokio 任务周期调用（Java 是 3s 固定周期的调度线程；
+    /// `startDetectorEnable` 的开关判断由调用方负责，对应 Java 调度体里的
+    /// `if (startDetectorEnable)`）。
+    ///
+    /// 逐条对拍 Java：
+    /// 1. `check_stamp` 去重 —— 开工先把 `check_stamp = now + detect_interval`，
+    ///    同一 broker 在 `detect_interval` 内不会被重复探测；
+    /// 2. `Resolver::resolve` 返回空（路由里已经没有这个 broker）⇒ 故障项一并移除，
+    ///    且不再探测（Java `faultItemTable.remove(key); continue;`）；
+    /// 3. 探测成功且 `reachable_flag == false` ⇒ 置回可达（恢复放行）；
+    /// 4. 探测**失败什么都不写** —— 可达性只由发送链路 `updateFaultItem` 的
+    ///    `reachable` 实参写坏，探测只负责把 broker 探回来。
+    ///
+    /// 锁纪律：`RwLock` 的守卫绝不跨 `.await` 持有（写表的三段各自成对）。
+    pub async fn detect_by_one_round(
+        &self,
+        resolver: &dyn Resolver,
+        detector: &dyn ServiceDetector,
+        detect_timeout: i64,
+        detect_interval: i64,
+    ) {
+        let now = self.now_millis();
+        let due: Vec<String> = {
+            let table = read_guard(&self.fault_item_table);
+            table
+                .values()
+                .filter(|item| now >= item.check_stamp)
+                .map(|item| item.name.clone())
+                .collect()
+        };
+        for name in due {
+            // 先落 check_stamp 再探测（Java 同序）：探测再慢也不会把下一轮提前。
+            {
+                let mut table = write_guard(&self.fault_item_table);
+                match table.get_mut(&name) {
+                    Some(item) if now >= item.check_stamp => {
+                        item.check_stamp = now + detect_interval;
+                    }
+                    // 轮内已被移除/更新过：跳过（单任务轮里只是防御）。
+                    _ => continue,
+                }
+            }
+            let Some(endpoint) = resolver.resolve(&name) else {
+                self.remove(&name);
+                continue;
+            };
+            if detector.detect(&name, &endpoint, detect_timeout).await {
+                let mut table = write_guard(&self.fault_item_table);
+                if let Some(item) = table.get_mut(&name) {
+                    if !item.reachable_flag {
+                        item.reachable_flag = true;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -836,5 +934,131 @@ mod tests {
         assert_eq!(strategy.compute_not_available_duration(25), 200);
         assert_eq!(strategy.compute_not_available_duration(15), 100);
         assert_eq!(strategy.compute_not_available_duration(5), 0);
+    }
+
+    // ------------------------------------------------ detect_by_one_round
+
+    /// 查表式 `Resolver`：表里没有的 broker 名返回 `None`。
+    struct MapResolver(Vec<(String, String)>);
+
+    impl Resolver for MapResolver {
+        fn resolve(&self, broker_name: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| name == broker_name)
+                .map(|(_, addr)| addr.clone())
+        }
+    }
+
+    /// 计数的 `ServiceDetector`：每次探测计数 +1，按开关返回成功/失败。
+    struct ScriptedDetector {
+        ok: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedDetector {
+        fn new(ok: bool) -> ScriptedDetector {
+            ScriptedDetector { ok: AtomicBool::new(ok), calls: AtomicUsize::new(0) }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ServiceDetector for ScriptedDetector {
+        fn detect(
+            &self,
+            _broker_name: &str,
+            _endpoint: &str,
+            _timeout_millis: i64,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let ok = self.ok.load(Ordering::SeqCst);
+            Box::pin(async move { ok })
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_round_restores_reachable_and_stamps_check_stamp() {
+        let tolerance = LatencyFaultToleranceImpl::with_clock(fixed_now);
+        // 发送链路写坏的形状：不可达 + 10s 隔离窗
+        tolerance.update_fault_item("broker-a", 123, 10_000, false);
+        let detector = ScriptedDetector::new(true);
+        let resolver = MapResolver(vec![("broker-a".into(), "127.0.0.1:1".into())]);
+
+        tolerance
+            .detect_by_one_round(&resolver, &detector, 200, 2_000)
+            .await;
+
+        let item = tolerance.get_fault_item("broker-a").unwrap();
+        assert!(item.is_reachable(), "探测成功要把 broker 探回来");
+        assert_eq!(item.check_stamp, NOW + 2_000, "开工即落 check_stamp");
+        assert_eq!(detector.calls(), 1);
+        // 隔离窗口是发送链路的事，探测不动它
+        assert_eq!(item.start_timestamp, NOW + 10_000);
+
+        // check_stamp 去重：窗口内再跑一轮不会再探测
+        tolerance
+            .detect_by_one_round(&resolver, &detector, 200, 2_000)
+            .await;
+        assert_eq!(detector.calls(), 1, "detect_interval 内不得重复探测");
+    }
+
+    #[tokio::test]
+    async fn detect_failure_writes_nothing_and_keeps_reachable_items() {
+        let tolerance = LatencyFaultToleranceImpl::with_clock(fixed_now);
+        // broker-a：发送链路记成不可达；broker-b：可达的正常项
+        tolerance.update_fault_item("broker-a", 123, 10_000, false);
+        tolerance.update_fault_item("broker-b", 10, 0, true);
+        let detector = ScriptedDetector::new(false);
+        let resolver = MapResolver(vec![
+            ("broker-a".into(), "127.0.0.1:1".into()),
+            ("broker-b".into(), "127.0.0.1:2".into()),
+        ]);
+
+        tolerance
+            .detect_by_one_round(&resolver, &detector, 200, 2_000)
+            .await;
+
+        assert_eq!(detector.calls(), 2, "所有到期项都要探（与可达性无关）");
+        assert!(
+            !tolerance.is_reachable("broker-a"),
+            "探测失败不写表：broker-a 维持不可达"
+        );
+        assert!(
+            tolerance.is_reachable("broker-b"),
+            "探测失败不能把可达的 broker 探成不可达"
+        );
+        let item = tolerance.get_fault_item("broker-a").unwrap();
+        assert_eq!(item.check_stamp, NOW + 2_000);
+        assert_eq!(item.start_timestamp, NOW + 10_000, "隔离窗不受探测影响");
+        assert_eq!(item.current_latency, 123, "延迟字段不受探测影响");
+    }
+
+    #[tokio::test]
+    async fn detect_round_removes_item_when_broker_left_the_route() {
+        let tolerance = LatencyFaultToleranceImpl::with_clock(fixed_now);
+        tolerance.update_fault_item("broker-gone", 123, 10_000, false);
+        let detector = ScriptedDetector::new(true);
+        // resolver 里没有 broker-gone：路由已经不认识它了
+        let resolver = MapResolver(vec![("broker-a".into(), "127.0.0.1:1".into())]);
+
+        tolerance
+            .detect_by_one_round(&resolver, &detector, 200, 2_000)
+            .await;
+
+        assert!(
+            tolerance.get_fault_item("broker-gone").is_none(),
+            "路由里没有的 broker 要连故障项一起清掉（Java faultItemTable.remove）"
+        );
+        assert_eq!(detector.calls(), 0, "resolve 不到地址就直接 continue，不探测");
+        assert!(tolerance.fault_item_names().is_empty());
+
+        // 空表空转：不探测、不报错
+        tolerance
+            .detect_by_one_round(&resolver, &detector, 200, 2_000)
+            .await;
+        assert_eq!(detector.calls(), 0);
     }
 }

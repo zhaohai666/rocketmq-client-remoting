@@ -172,6 +172,13 @@ public:
         remotingClient_->setTlsOptions(options);
     }
 
+    // ---- SOCKS 代理（对齐 Java ClientConfig#socksProxyConfig）----
+    // 透传给底层 RemotingClient；必须在 start() 之前调用，首条连接建立时生效。
+    // TopAddressing 的动态取址 HTTP 不走代理（与 Java 口径一致）。
+    void setSocksProxy(const SocksProxyConfig& proxy) {
+        remotingClient_->setSocksProxy(proxy);
+    }
+
     // ---------------- 路由管理 ----------------
     // 从 NameServer 拉取 topic 路由。未知 topic 会回退到 MixAll::DEFAULT_TOPIC
     // （5.x nameserver 不为未知 topic 合成路由，返回 TOPIC_NOT_EXIST）。
