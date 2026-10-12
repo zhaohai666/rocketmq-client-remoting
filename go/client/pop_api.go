@@ -168,6 +168,37 @@ func (i *Instance) SetMessageRequestMode(addr, topic, consumerGroup, mode string
 	return nil
 }
 
+// QueryAssignment sends QUERY_ASSIGNMENT(400) — Java MQClientAPIImpl
+// #queryAssignment:405 + MQClientInstance#queryAssignment:1373. The broker runs
+// the load balance itself (strategyName + messageModel ride the body) and
+// answers the queue set this instance should own, each stamped with the request
+// mode (POP / PULL) the broker serves the (group, topic) pair in.
+//
+// Decoding keeps Java's null/empty distinction (see
+// remoting.DecodeQueryAssignmentResponseBody): a nil slice is "invalid result,
+// skip the update", an empty non-nil slice is "you own nothing now".
+func (i *Instance) QueryAssignment(addr, topic, consumerGroup, clientID, strategyName, messageModel string, timeoutMillis int64) ([]*remoting.MessageQueueAssignment, error) {
+	body := &remoting.QueryAssignmentRequestBody{
+		Topic:         topic,
+		ConsumerGroup: consumerGroup,
+		ClientID:      clientID,
+		StrategyName:  strategyName,
+		MessageModel:  messageModel,
+	}
+	// No custom header: QUERY_ASSIGNMENT carries everything in the body, like
+	// SET_MESSAGE_REQUEST_MODE.
+	request := remoting.CreateRequestCommand(remoting.ReqQueryAssignment, nil)
+	request.SetBody(body.Encode())
+	response, err := i.invokeSync(addr, request, timeoutMillis)
+	if err != nil {
+		return nil, err
+	}
+	if response.Code != remoting.RespSuccess {
+		return nil, common.BrokerError(response.Code, response.Remark)
+	}
+	return remoting.DecodeQueryAssignmentResponseBody(response.Body)
+}
+
 // ---------------------------------------------------------------- response
 
 func (i *Instance) processPopResponse(brokerName string, response *remoting.RemotingCommand,

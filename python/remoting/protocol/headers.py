@@ -778,16 +778,25 @@ class GetConsumerRunningInfoRequestHeader(CommandCustomHeader):
 
 
 class ConsumeMessageDirectlyResultRequestHeader(CommandCustomHeader):
+    """对应 Java `ConsumeMessageDirectlyResultRequestHeader`（309）。
+
+    Java 头里还有可空的 brokerName / topicSysFlag / groupSysFlag；Java 发起端
+    （DefaultMQAdminExtImpl → MQClientAPIImpl）从不设后两者，brokerName 也不设，
+    这里同样只在拿到 broker 名时才带上。
+    """
+
     def __init__(self):
         self.consumer_group: Optional[str] = None
         self.client_id: Optional[str] = None
         self.msg_id: Optional[str] = None
         self.broker_name: Optional[str] = None
+        self.topic: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
         return _ext({
             "consumerGroup": self.consumer_group, "clientId": self.client_id,
             "msgId": self.msg_id, "brokerName": self.broker_name,
+            "topic": self.topic,
         })
 
     def from_ext_fields(self, ext: dict) -> None:
@@ -795,6 +804,7 @@ class ConsumeMessageDirectlyResultRequestHeader(CommandCustomHeader):
         self.client_id = ext.get("clientId")
         self.msg_id = ext.get("msgId")
         self.broker_name = ext.get("brokerName")
+        self.topic = ext.get("topic")
 
 
 class ResetOffsetRequestHeader(CommandCustomHeader):

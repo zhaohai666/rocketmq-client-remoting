@@ -4,7 +4,8 @@
 // Scope of this file: lifecycle, the six send paths (sync, to-queue, batch,
 // oneway, selector, transaction) plus the retry/fault-avoidance loop, the send
 // header assembly, the SEND response mapping and the broker's transaction
-// check-back. Send latency fault tolerance lives in fault_strategy.go.
+// check-back. Send latency fault tolerance lives in fault_strategy.go, its
+// optional reachability detector in fault_detector.go.
 package client
 
 import (
@@ -377,6 +378,7 @@ type DefaultMQProducer struct {
 	topics             []string
 	nameServerAddrs    []string
 	tlsEnable          *bool
+	socksProxy         *remoting.SocksProxyConfig
 	pollNameServerIntv int64
 
 	// sendMessageWithVIPChannel
@@ -446,6 +448,9 @@ type DefaultMQProducer struct {
 
 	heartbeatIntervalMillis int64
 	heartbeatRunning        atomic.Bool
+	// detectorRunning drives the fault-avoidance reachability probe goroutine
+	// (fault_detector.go); started by Start, stopped by Shutdown.
+	detectorRunning atomic.Bool
 }
 
 // NewDefaultMQProducer validates the group and applies the SDK defaults.
@@ -525,6 +530,14 @@ func (p *DefaultMQProducer) SetNamespaceV2(ns string) { p.namespaceV2 = ns }
 
 func (p *DefaultMQProducer) SetTopics(topics []string) { p.topics = append([]string(nil), topics...) }
 func (p *DefaultMQProducer) SetTLSEnable(enable bool)  { p.tlsEnable = &enable }
+
+// SetSocksProxy tunnels the producer's remoting connections through a SOCKS
+// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
+// address-server HTTP fetch (TopAddressing) is not proxied.
+func (p *DefaultMQProducer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
+	p.socksProxy = proxy
+}
+
 func (p *DefaultMQProducer) SetPollNameServerIntervalMillis(v int64) {
 	p.pollNameServerIntv = v
 }
@@ -659,6 +672,11 @@ func (p *DefaultMQProducer) Start() error {
 	// starts an internal producer of its own (a network operation) and registers
 	// its hooks through RegisterSendMessageHook, which takes p.mu.
 	p.startTraceDispatcher()
+	// Java DefaultMQProducerImpl.start():272 starts the fault-avoidance
+	// detector after the impl is up (it needs the client instance to resolve
+	// broker names). Also outside the lock: it installs the Resolver +
+	// ServiceDetector and spawns detectLoop.
+	p.startDetector()
 	return nil
 }
 
@@ -700,6 +718,7 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	if p.tlsEnable != nil {
 		cfg.TLSEnable = *p.tlsEnable
 	}
+	cfg.SocksProxy = p.socksProxy
 	cfg.PollNameServerIntervalMillis = p.pollNameServerIntv
 	inst := CreateOrGetInstance(p.clientID, p.nameServerAddrs, cfg)
 	// Namespace + stream + user(ACL) + zone, composed in a fixed order and only
@@ -788,6 +807,9 @@ func (p *DefaultMQProducer) Shutdown() {
 		return
 	}
 	p.heartbeatRunning.Store(false)
+	// Java DefaultMQProducerImpl.shutdown():318 stops the detector executor
+	// alongside the heartbeat loop.
+	p.stopDetector()
 	if p.mqClient != nil {
 		// Graceful unregister (UNREGISTER_CLIENT = 35) per broker BEFORE the
 		// transport goes away: the broker's ProducerManager state is per broker,
@@ -1384,10 +1406,11 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 			return nil, err
 		case common.IsKind(err, common.KindConnect), common.IsKind(err, common.KindTimeout),
 			common.IsKind(err, common.KindSendRequest), common.IsKind(err, common.KindIO):
-			// Connection refused / timeout / write failure: isolate. This port
-			// has no background reachability detector, so the
-			// reachable flag is always true.
-			p.updateFaultItem(selected.BrokerName, began, true, true)
+			// Connection refused / timeout / write failure: isolate. Java's
+			// RemotingException branch (:821) marks the broker UNREACHABLE when
+			// the background detector is running — the detector probes it back
+			// to health — and merely isolates it otherwise.
+			p.updateFaultItem(selected.BrokerName, began, true, !p.faultStrategy.StartDetectorEnable())
 			lastErr = err
 		default:
 			// Client-side problems (no queue selectable, route gone, decode

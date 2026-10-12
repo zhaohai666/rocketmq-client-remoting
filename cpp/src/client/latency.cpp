@@ -1,6 +1,7 @@
 #include "rocketmq/client/latency.h"
 
 #include "rocketmq/client/mq_client.h"
+#include "rocketmq/common/logging.h"
 #include "rocketmq/common/util_all.h"
 
 namespace rocketmq {
@@ -68,6 +69,52 @@ const FaultItem* LatencyFaultToleranceImpl::getFaultItem(const std::string& name
     std::lock_guard<std::mutex> lk(m_);
     auto it = table_.find(name);
     return it == table_.end() ? nullptr : &it->second;
+}
+
+// ---------------------------------------------------------------- 主动探测
+
+// Java LatencyFaultToleranceImpl#detectByOneRound:59-79，逐行对齐：
+//   * 每项只在 checkStamp 到期时探测，占坑先于网络（checkStamp = now + detectInterval）；
+//   * resolver 解析不到地址 → 摘除故障项（broker 已离开路由，故障记录不能比它活得久）；
+//   * 探测成功且当前不可达 → 翻回 reachable（Java "is reachable now, then it can be used."）；
+//   * 探测失败**不动**标志 —— 置不可达是发送路径的职责。
+// 表锁只包内存操作：解析与探测（最坏 detectTimeout 毫秒的网络 IO）在锁外，发送路径的
+// isAvailable/isReachable 不会被一跳探测挡住。
+void LatencyFaultToleranceImpl::detectByOneRound() {
+    std::vector<std::string> due;
+    const int64_t now = nowMillis();
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        due.reserve(table_.size());
+        for (auto& kv : table_) {
+            if (now - kv.second.checkStamp() >= 0) {
+                kv.second.setCheckStamp(now + detectInterval_);
+                due.push_back(kv.first);
+            }
+        }
+    }
+    for (const std::string& name : due) {
+        if (!resolver_) {
+            // Java 没有这句（它的 resolver 恒在）；没有 resolver 就无从探测，整跳放弃。
+            return;
+        }
+        const std::string addr = resolver_(name);
+        if (addr.empty()) {
+            remove(name);
+            continue;
+        }
+        if (!serviceDetector_) {
+            continue;
+        }
+        if (serviceDetector_(addr, detectTimeout_)) {
+            std::lock_guard<std::mutex> lk(m_);
+            auto it = table_.find(name);
+            if (it != table_.end() && !it->second.isReachable()) {
+                logger_info(name + " is reachable now, then it can be used.");
+                it->second.setReachable(true);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- MQFaultStrategy

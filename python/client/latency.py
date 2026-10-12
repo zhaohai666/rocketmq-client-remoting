@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from typing import Callable, Dict, Optional
@@ -118,6 +119,21 @@ class LatencyFaultToleranceImpl:
         with self._lock:
             self._fault_item_table.pop(name, None)
 
+    def pick_one_at_least(self) -> Optional[str]:
+        """对应 Java ``LatencyFaultToleranceImpl.pickOneAtLeast:158-176``。
+
+        把故障表快照随机打乱，返回第一台 ``reachableFlag=True`` 的 broker 名；
+        全都不可达（或表空）返回 None。这就是主动探测的"候补集合"来源：
+        表里是哪些 broker，探测器就轮询哪些。
+        """
+        with self._lock:
+            items = list(self._fault_item_table.values())
+        random.shuffle(items)
+        for item in items:
+            if item.reachable_flag:
+                return item.name
+        return None
+
     def get_fault_item(self, name: str) -> Optional[FaultItem]:
         with self._lock:
             return self._fault_item_table.get(name)
@@ -167,11 +183,13 @@ class LatencyFaultToleranceImpl:
                 logger.info("%s is reachable now, then it can be used.", broker_item.name)
                 broker_item.reachable_flag = True
 
-    def start_detector(self) -> None:
+    def start_detector(self, initial_delay: float = 3.0, period: float = 3.0) -> None:
         """对应 Java ``startDetector``：3s 后开始、每 3s 一轮的守护线程。
 
         Java 里 start() 无条件启动 scheduled executor，跑不跑探测由
         startDetectorEnable 决定 —— 这里同样：线程只起一次，开关随时可翻。
+        ``initial_delay`` / ``period`` 仅给单测提速用，默认与 Java 的
+        ``scheduleAtFixedRate(..., 3, 3, TimeUnit.SECONDS)`` 完全一致。
         """
         with self._lock:
             if self._detector_thread is not None and self._detector_thread.is_alive():
@@ -179,7 +197,9 @@ class LatencyFaultToleranceImpl:
             self._detector_stop.clear()
 
             def _run() -> None:
-                while not self._detector_stop.wait(3.0):
+                if self._detector_stop.wait(initial_delay):
+                    return
+                while not self._detector_stop.wait(period):
                     try:
                         if self._start_detector_enable:
                             self.detect_by_one_round()

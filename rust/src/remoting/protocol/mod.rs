@@ -9,6 +9,7 @@ pub mod extra_info;
 pub mod headers;
 pub mod namespace_util;
 pub mod heartbeat;
+pub mod query_assignment_body;
 pub mod route;
 pub mod subscription;
 

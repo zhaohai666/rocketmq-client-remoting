@@ -113,6 +113,12 @@ pub struct RemotingClientConfig {
     /// 收到 `ResponseCode.GO_AWAY(1500)` 时换一条连接重发一次；关掉则直接抛
     /// `SendRequest`（Java 同口径）。
     pub enable_reconnect_for_go_away: bool,
+    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig` →
+    /// `NettyClientConfig#setSocksProxyConfig` → `NettyRemotingClient` 挂
+    /// `Socks5ProxyHandler` 的那条链）。`None` = 直连（默认）。
+    /// 建连顺序：TCP 连代理 → SOCKS 握手（CONNECT，SOCKS5 含无认证 / 用户名密码
+    /// 两种子协商）→（TLS 开启时）TLS 握手。TopAddressing 的动态取址 HTTP 不走它。
+    pub socks_proxy: Option<crate::remoting::socks::SocksProxyConfig>,
 }
 
 impl Default for RemotingClientConfig {
@@ -123,6 +129,7 @@ impl Default for RemotingClientConfig {
             tls_enable: env_bool("ROCKETMQ_TLS_ENABLE", false),
             tls_test_mode: env_bool("ROCKETMQ_TLS_TEST_MODE", true),
             enable_reconnect_for_go_away: true,
+            socks_proxy: None,
         }
     }
 }
@@ -748,31 +755,43 @@ fn existing(inner: &Arc<Inner>, addr: &str) -> Option<Arc<Connection>> {
 
 async fn connect(inner: &Arc<Inner>, addr: &str) -> Result<Arc<Connection>> {
     let (host, port) = split_host_port(addr)?;
-    let socket_addr = resolve(&host, port).await?;
+    let timeout = Duration::from_millis(inner.config.connect_timeout_millis.max(1) as u64);
+    // SOCKS 代理路径：TCP 连的是代理，域名不经本地解析（对齐 Java 走代理时换
+    // `NoopAddressResolverGroup` —— 目标主机名原样进 CONNECT，由代理解析）。
+    let stream = match inner.config.socks_proxy.as_ref() {
+        Some(proxy) => {
+            crate::remoting::socks::connect_via_proxy(proxy, &host, port, timeout).await?
+        }
+        None => {
+            let socket_addr = resolve(&host, port).await?;
+            tcp_connect(socket_addr, timeout, addr).await?
+        }
+    };
     if inner.config.tls_enable {
-        connect_tls(inner, addr, &host, socket_addr).await
+        connect_tls(inner, addr, &host, stream).await
     } else {
-        connect_plain(inner, socket_addr, addr).await
+        connect_plain(inner, stream, addr).await
     }
+}
+
+async fn tcp_connect(socket_addr: SocketAddr, timeout: Duration, addr: &str) -> Result<TcpStream> {
+    let stream = tokio::time::timeout(timeout, TcpStream::connect(socket_addr))
+        .await
+        .map_err(|_| Error::Connect {
+            addr: addr.to_string(),
+        })?
+        .map_err(|_| Error::Connect {
+            addr: addr.to_string(),
+        })?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 async fn connect_plain(
     inner: &Arc<Inner>,
-    socket_addr: SocketAddr,
+    stream: TcpStream,
     addr: &str,
 ) -> Result<Arc<Connection>> {
-    let stream = tokio::time::timeout(
-        Duration::from_millis(inner.config.connect_timeout_millis.max(1) as u64),
-        TcpStream::connect(socket_addr),
-    )
-    .await
-    .map_err(|_| Error::Connect {
-        addr: addr.to_string(),
-    })?
-    .map_err(|_| Error::Connect {
-        addr: addr.to_string(),
-    })?;
-    let _ = stream.set_nodelay(true);
     let (read_half, write_half) = tokio::io::split(stream);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -842,19 +861,8 @@ async fn connect_tls(
     inner: &Arc<Inner>,
     addr: &str,
     host: &str,
-    socket_addr: SocketAddr,
+    tcp: TcpStream,
 ) -> Result<Arc<Connection>> {
-    let tcp = tokio::time::timeout(
-        Duration::from_millis(inner.config.connect_timeout_millis.max(1) as u64),
-        TcpStream::connect(socket_addr),
-    )
-    .await
-    .map_err(|_| Error::Connect {
-        addr: addr.to_string(),
-    })?
-    .map_err(|_| Error::Connect {
-        addr: addr.to_string(),
-    })?;
     let _ = tcp.set_nodelay(true);
     let std_stream = tcp.into_std().map_err(|_| Error::Connect {
         addr: addr.to_string(),
@@ -1085,7 +1093,7 @@ pub fn split_host_port(addr: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
-async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+pub(crate) async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }

@@ -86,6 +86,7 @@ use crate::remoting::protocol::heartbeat::{
 };
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::rpchook::RPCHook;
+use crate::remoting::socks::SocksProxyConfig;
 use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 
 use crate::client::consumer::ExpressionType;
@@ -222,6 +223,9 @@ pub struct PullConsumerConfig {
     /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
     /// （Python 的拉取消费者没这个属性，这里与推送消费者统一）。
     pub tls_enable: Option<bool>,
+    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig`：addr / username /
+    /// password 三字段，见 [`SocksProxyConfig`]）。`None` = 直连（默认）。
+    pub socks_proxy: Option<SocksProxyConfig>,
     /// Python `message_model`；拉模式只影响 `subscriptionAutomatically`
     /// （本移植版不做注册，见模块头偏离 2），其余行为与它无关。
     pub message_model: String,
@@ -253,6 +257,7 @@ impl Default for PullConsumerConfig {
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
+            socks_proxy: None,
             message_model: MessageModel::CLUSTERING.to_string(),
             broker_suspend_max_time_millis: DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS,
             consumer_pull_timeout_millis: DEFAULT_CONSUMER_PULL_TIMEOUT_MILLIS,
@@ -455,6 +460,19 @@ impl DefaultMQPullConsumer {
         self.config().namespace_v2
     }
 
+    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
+    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
+    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
+    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
+    pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
+        self.update_config(|c| c.socks_proxy = socks_proxy);
+    }
+
+    /// Java `ClientConfig#getSocksProxyConfig`。
+    pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
+        self.config().socks_proxy
+    }
+
     /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
@@ -618,6 +636,7 @@ impl DefaultMQPullConsumer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            socks_proxy: cfg.socks_proxy.clone(),
             unit_name: cfg.unit_name.clone(),
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
@@ -1254,6 +1273,8 @@ pub struct LitePullConsumerConfig {
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`（同上，与推送消费者统一）。
     pub tls_enable: Option<bool>,
+    /// SOCKS 代理（同上，与推送消费者统一）。
+    pub socks_proxy: Option<SocksProxyConfig>,
     /// Python `message_model`。
     pub message_model: String,
     /// Python `consume_from_where`：仅影响**首次**位点解析。
@@ -1302,6 +1323,7 @@ impl Default for LitePullConsumerConfig {
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
+            socks_proxy: None,
             message_model: MessageModel::CLUSTERING.to_string(),
             consume_from_where: ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET.to_string(),
             consume_timestamp: default_consume_timestamp(),
@@ -1602,6 +1624,19 @@ impl DefaultLitePullConsumer {
         self.config().namespace_v2
     }
 
+    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
+    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
+    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
+    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
+    pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
+        self.update_config(|c| c.socks_proxy = socks_proxy);
+    }
+
+    /// Java `ClientConfig#getSocksProxyConfig`。
+    pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
+        self.config().socks_proxy
+    }
+
     /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
@@ -1873,6 +1908,7 @@ impl DefaultLitePullConsumer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            socks_proxy: cfg.socks_proxy.clone(),
             unit_name: cfg.unit_name.clone(),
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
@@ -4948,16 +4984,16 @@ mod tests {
     // 入参守卫、注册即快照（只在 RUNNING）、集合相等才判"没变"、重复注册覆盖、
     // 后台循环真的在比对。
 
-    /// 监听器收到的变更事件：`(topic, 排序后的队列 id 列表)`。
-    type QueueEvents = Arc<Mutex<Vec<(String, Vec<i32>)>>>;
+    /// 监听器事件的收纳形态：`(topic, 排序后的 queueId 列表)` 序列。
+    type QueueChangeEvents = Arc<Mutex<Vec<(String, Vec<i32>)>>>;
 
     /// 收集 `on_changed` 的监听器（队列 id 排序后存下来，比对与顺序无关）。
     struct RecordingQueueListener {
-        events: QueueEvents,
+        events: QueueChangeEvents,
     }
 
     impl RecordingQueueListener {
-        fn new() -> (Arc<Self>, QueueEvents) {
+        fn new() -> (Arc<Self>, QueueChangeEvents) {
             let events = Arc::new(Mutex::new(Vec::new()));
             (
                 Arc::new(RecordingQueueListener {

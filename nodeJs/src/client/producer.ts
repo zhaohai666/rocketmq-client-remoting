@@ -24,12 +24,14 @@ import { Validators } from '../common/validators.ts';
 import { RecallMessageHandle } from '../common/recall_message_handle.ts';
 import { AclRPCHook } from '../remoting/acl.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
+import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
 import { getLogger } from '../logging.ts';
 import {
   MQClientException, MQBrokerException,
 } from '../remoting/exception.ts';
 import { SendResult, TransactionSendResult, SendStatus } from './send_result.ts';
 import { MQClient, TopicPublishInfo } from './mq_client.ts';
+import { MQClientManager } from './mq_client_manager.ts';
 import {
   CommunicationMode, SendMessageContext, CheckForbiddenContext, SendMessageHook, hookRegistry,
 } from './hook.ts';
@@ -124,8 +126,17 @@ export class DefaultMQProducer {
   tlsEnable: boolean;
   // TLS 细项（见 setTlsOptions）；null = test-mode（信任自签）。
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null;
+  // SOCKS 代理（Java ClientConfig#socksProxyConfig）；null = 直连。对齐
+  // SocksProxyConfig 字段：addr/username/password + version(4|5，默认 5)。
+  socksProxyConfig: SocksProxyConfig | null;
   rpcHook: AclRPCHook | null;
   unitName: string | null;
+  // Java ClientConfig#instanceName — the clientId knob. Two facades in one
+  // process that set the SAME instanceName (+unitName) share one MQClient
+  // instance through MQClientManager (Java MQClientManager.factoryTable).
+  // The DEFAULT stays pid-unique per start (changeInstanceNameToPid), so the
+  // historical never-share behaviour is kept unless the user opts in.
+  instanceName: string;
   sendLatencyFaultEnable: boolean;
   heartbeatIntervalMillis: number;
   autoBatch: boolean;
@@ -185,8 +196,10 @@ export class DefaultMQProducer {
     this.namesrvAddr = null;
     this.tlsEnable = false;
     this.tlsOptions = null;
+    this.socksProxyConfig = null;
     this.rpcHook = null;
     this.unitName = null;
+    this.instanceName = MixAll.DEFAULT_INSTANCE_NAME;
     this.sendLatencyFaultEnable = false;
     this.heartbeatIntervalMillis = 30 * 1000;
     this.autoBatch = false;
@@ -213,7 +226,7 @@ export class DefaultMQProducer {
   }
 
   private _buildClientId(): string {
-    const instanceName = MixAll.changeInstanceNameToPid(MixAll.DEFAULT_INSTANCE_NAME);
+    const instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     return MixAll.clientIdFor(instanceName, this.unitName);
   }
 
@@ -245,12 +258,23 @@ export class DefaultMQProducer {
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setUnitName(name: string): this { this.unitName = name; return this; }
+  // Java ClientConfig#setInstanceName — 同进程内把 instanceName 设成同一个值的
+  // producer/consumer/admin 经 MQClientManager 共享一个 MQClient 实例。
+  setInstanceName(name: string): this { this.instanceName = name; return this; }
+  getInstanceName(): string { return this.instanceName; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
   // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）。
   // 不设 caCert = test-mode（信任自签）。
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
+  // SOCKS 代理（Java ClientConfig#setSocksProxyConfig）。addr 为代理 'host:port'，
+  // username/password 可选（SOCKS5 RFC 1929 子协商 / SOCKS4 userid），version 默认
+  // 5（'SOCKS5'），可 4 / 'SOCKS4'（域名目标自动 SOCKS4a）。TCP 建连后、TLS 握手前
+  // 完成 CONNECT；TopAddressing 的 HTTP 寻址不走代理。也可用环境变量
+  // ROCKETMQ_SOCKS_PROXY_CONFIG 传 JSON（Java 的 {"0.0.0.0/0": {...}} 形状或裸对象）。
+  setSocksProxyConfig(config: SocksProxyConfig | null): this { this.socksProxyConfig = config; return this; }
+  getSocksProxyConfig(): SocksProxyConfig | null { return this.socksProxyConfig; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
@@ -320,21 +344,35 @@ export class DefaultMQProducer {
     if (this.producerGroup === MixAll.DEFAULT_PRODUCER_GROUP) {
       throw new MQClientException('producer group can not equal DEFAULT_PRODUCER');
     }
-    const instanceName = MixAll.changeInstanceNameToPid(MixAll.DEFAULT_INSTANCE_NAME);
+    const instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     const clientId = MixAll.clientIdFor(instanceName, this.unitName);
     this.producerClientId = clientId;
 
-    const remotingClient = new RemotingClient({ tlsEnable: this.tlsEnable, tlsOptions: this.tlsOptions });
-    this.client = new MQClient(clientId, this.namesrvAddr, remotingClient);
-    // RPC-hook registration order: Namespace -> Stream ->
+    // 跨 facade 复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId
+    // 的 producer/consumer/admin 共享一个实例 —— 一份路由缓存/心跳/路由刷新定时器、
+    // 一条到同 broker 的 RPC 通道。引用计数 +1 由 registerClient 完成，归零才真关闭。
+    const manager = MQClientManager.getInstance();
+    const { instance: client, created } = manager.getOrCreateMQClientInstance(clientId, () => {
+      const remotingClient = new RemotingClient({
+        tlsEnable: this.tlsEnable, tlsOptions: this.tlsOptions, socksProxyConfig: this.socksProxyConfig,
+      });
+      return new MQClient(clientId, this.namesrvAddr, remotingClient);
+    });
+    this.client = client;
+    manager.registerClient(clientId, client);
+    // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream ->
     // user (ACL) hook -> DynamicalExtField. The namespace extFields must be
     // written BEFORE the ACL hook so the signature covers nsd/ns.
-    registerRpcHooks(this.client.remotingClient, {
-      namespaceV2: () => this.namespaceV2,
-      userHook: this.rpcHook,
-    });
-    this.client.start();
-    this.client.registerProducer(this.producerGroup, this);
+    // 配置快照 first-wins（Java cloneClientConfig 口径）：只有创建者注册 hook，
+    // 复用方（created=false）的 tls/代理/hook 不会改写已存在的实例。
+    if (created) {
+      registerRpcHooks(client.remotingClient, {
+        namespaceV2: () => this.namespaceV2,
+        userHook: this.rpcHook,
+      });
+    }
+    client.start();
+    client.registerProducer(this.producerGroup, this);
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
     // Fault-strategy probe thread: MQFaultStrategy carries a start/stop
     // detector; resolver maps broker name -> publish addr, detector is a plain
@@ -356,6 +394,11 @@ export class DefaultMQProducer {
         await this._flushAccumulation(acc);
       });
       this._accumulator.start();
+      // 累加器按 clientId 共享（实例级，Java MQClientInstance 持有 ProduceAccumulator
+      // 同口径）：挂到实例上，由实例真正 shutdown 时统一停表 —— 共享 clientId 的
+      // 单个 producer shutdown 不能停掉其他门面还在用的累加器。
+      const accs: ProduceAccumulator[] = ((client as any)._accumulators ||= []);
+      if (!accs.includes(this._accumulator)) accs.push(this._accumulator);
     }
 
     // Message trace wiring: without this, enableTrace is a silent no-op on the
@@ -398,7 +441,8 @@ export class DefaultMQProducer {
       if (idx >= 0) this.client.remotingClient.rpcHooks.splice(idx, 1);
       this._recallTraceHook = null;
     }
-    if (this._accumulator != null) this._accumulator.stop();
+    // NOTE: the accumulator is NOT stopped here — it is instance-level (keyed by
+    // clientId) and stops when the shared MQClient really shuts down (refcount 0).
     if (this._traceHook != null) {
       const idx = hookRegistry.sendMessageHooks.indexOf(this._traceHook);
       if (idx >= 0) hookRegistry.sendMessageHooks.splice(idx, 1);
@@ -411,7 +455,9 @@ export class DefaultMQProducer {
     }
     if (this.client != null) {
       this.client.unregisterProducer(this.producerGroup);
-      this.client.shutdown();
+      // 归还给 manager：引用计数 -1，**归零才真正 shutdown**（停心跳/路由定时器、
+      // 断连接）。同 clientId 还有其他门面在用时时例继续存活。
+      MQClientManager.getInstance().unregisterClient(this.client.clientId, this.client);
     }
     this.client = null;
   }

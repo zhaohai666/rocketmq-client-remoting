@@ -282,11 +282,11 @@ fn split_headers(raw: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn find_header_separator(raw: &[u8]) -> Option<(usize, usize)> {
-    const CRLF_CRLF: [u8; 4] = [b'\r', b'\n', b'\r', b'\n'];
+    const CRLF_CRLF: [u8; 4] = *b"\r\n\r\n";
     if let Some(i) = raw.windows(4).position(|w| w == CRLF_CRLF) {
         return Some((i, 4));
     }
-    let lf_lf = [b'\n', b'\n'];
+    let lf_lf = *b"\n\n";
     raw.windows(2).position(|w| w == lf_lf).map(|i| (i, 2))
 }
 

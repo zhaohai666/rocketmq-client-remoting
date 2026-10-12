@@ -93,8 +93,10 @@ use crate::remoting::protocol::heartbeat::{
     ConsumeFromWhere, ConsumeType, FilterAPI, MessageModel, SubscriptionData,
 };
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
+use crate::remoting::protocol::query_assignment_body::MESSAGE_REQUEST_MODE_POP;
 use crate::remoting::protocol::response_code;
 use crate::remoting::rpchook::RPCHook;
+use crate::remoting::socks::SocksProxyConfig;
 use crate::{bail, rmq_debug, rmq_error, rmq_info, rmq_warn};
 
 /// POP 消费失败的延迟梯度（**秒**），逐项对应经典 remoting 协议约定的
@@ -114,6 +116,10 @@ pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 /// 默认 120000ms）：一条拉取/POP 循环超过这个时长没**发起**过拉取，rebalance 就认定它停摆，
 /// 主动撤掉并重建（停摆判定用严格 `>`）。
 pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
+
+/// Java `RebalanceImpl.QUERY_ASSIGNMENT_TIMEOUT`（3000ms）：POP 模式下每 topic 一笔
+/// `QUERY_ASSIGNMENT(400)` 的 RPC 超时。
+pub const QUERY_ASSIGNMENT_TIMEOUT_MILLIS: i64 = 3000;
 
 /// 停机收尾给「在途批次收完（含回投 RPC）」的预算。
 ///
@@ -391,7 +397,10 @@ pub struct ConsumerConfig {
     pub name_server_addrs: Vec<String>,
     /// TLS 开关；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
     pub tls_enable: Option<bool>,
-    /// 消费模式（[`MessageModel`] 里的常量）。
+    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig`：addr / username /
+    /// password 三字段，见 [`SocksProxyConfig`]）。`None` = 直连（默认）。
+    pub socks_proxy: Option<SocksProxyConfig>,
+    /// Python `message_model`（[`MessageModel`] 里的常量）。
     pub message_model: String,
     /// 起始位点策略（[`ConsumeFromWhere`] 里的常量）。
     pub consume_from_where: String,
@@ -433,13 +442,15 @@ pub struct ConsumerConfig {
     pub suspend_current_queue_time_millis: i64,
     /// 消费超时（**分钟**，默认 15），只用于 `ConsumeReturnType::TimeOut` 判定。
     pub consume_timeout: i64,
-    /// 客户端重平衡开关（默认 true，本项目恒走客户端 rebalance，字段仅保留形状）。
+    /// Java `clientRebalance`：形状对齐字段，本实现不读取它决定是否走本地分配。
+    /// 分配来源由 `pop_mode` 门控：POP 恒走 broker 侧 QUERY_ASSIGNMENT，其余恒走本地 rebalance。
     pub client_rebalance: bool,
     /// broker 心跳周期（默认 30000ms）。
     pub heartbeat_interval_millis: i64,
     /// 是否发心跳。
     pub heartbeat_enabled: bool,
-    /// POP 模式开关：true 走 POP + ack，false 走长轮询 + 位点。
+    /// Python `pop_mode`：true 走 POP + ack（且队列分配改走 broker 侧 QUERY_ASSIGNMENT），
+    /// false 走长轮询 + 位点（本地 rebalance 不变）。
     pub pop_mode: bool,
     /// POP 不可见时间（默认 60000ms）。
     pub pop_invisible_time: i64,
@@ -480,6 +491,7 @@ impl Default for ConsumerConfig {
             client_id: None,
             name_server_addrs: Vec::new(),
             tls_enable: None,
+            socks_proxy: None,
             message_model: MessageModel::CLUSTERING.to_string(),
             consume_from_where: ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET.to_string(),
             consume_timestamp: default_consume_timestamp(),
@@ -993,7 +1005,20 @@ impl DefaultMQPushConsumer {
         self.config().namespace_v2
     }
 
-    /// 设置单元化模式（随发送/回投/鉴权/消息过滤一起上线）。
+    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
+    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
+    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
+    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
+    pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
+        self.update_config(|c| c.socks_proxy = socks_proxy);
+    }
+
+    /// Java `ClientConfig#getSocksProxyConfig`。
+    pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
+        self.config().socks_proxy
+    }
+
+    /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
     }
@@ -1332,6 +1357,7 @@ impl DefaultMQPushConsumer {
 
         let instance_cfg = MQClientInstanceConfig {
             tls_enable: cfg.tls_enable,
+            socks_proxy: cfg.socks_proxy.clone(),
             unit_name: cfg.unit_name.clone(),
             namespace_v2: cfg.namespace_v2.clone(),
             enable_stream_request_type: cfg.enable_stream_request_type,
@@ -1863,6 +1889,11 @@ impl DefaultMQPushConsumer {
     /// BROADCASTING 全部队列归自己；CLUSTERING 查 broker 上的消费者列表 → 排序 →
     /// 分配策略。**查不到消费者列表时保留现有分配**（绝不回退成「独占全部队列」，
     /// 否则同组多实例互相重复消费）。
+    ///
+    /// **POP 模式（集群 + 非顺序）改走 broker 侧分配**：每 topic 发一笔
+    /// `QUERY_ASSIGNMENT(400)`（Java `RebalanceImpl#getRebalanceResultFromBroker` →
+    /// `RebalancePushImpl#clientRebalance=false` 分支），返回的队列集**就是**分配，
+    /// 不再本地算 `cidAll`。失败/无效结果同样保留上一次分配，绝不退化成「全要」。
     pub async fn do_rebalance(&self) -> Result<()> {
         let client = require_client(&self.inner)?;
         let group = self.consumer_group();
@@ -1877,6 +1908,14 @@ impl DefaultMQPushConsumer {
             .iter()
             .map(|(k, _)| k.clone())
             .collect();
+        // Java `RebalancePushImpl#clientRebalance:138`：顺序消费与 BROADCASTING 恒走
+        // 本地路径；POP（并发、集群）改由 broker 决定队列集。
+        let orderly = lock(&self.inner.listener)
+            .as_ref()
+            .is_some_and(MessageListener::is_orderly);
+        let broker_assignment = cfg.pop_mode
+            && !orderly
+            && cfg.message_model == MessageModel::CLUSTERING;
 
         let mut assigned: Vec<MessageQueue> = Vec::new();
         if cfg.message_model == MessageModel::BROADCASTING {
@@ -1885,6 +1924,23 @@ impl DefaultMQPushConsumer {
             }
         } else {
             for topic in &topics {
+                if broker_assignment {
+                    match self.assigned_from_broker(&group, topic).await {
+                        Some(queues) => assigned.extend(queues),
+                        None => {
+                            // 「保留上一次分配」（Java 的 return false：processQueueTable
+                            // 本轮不动）。按 topic 摘出来，别的 topic 照常更新。
+                            let keep: Vec<MessageQueue> = lock(&self.inner.state)
+                                .assigned
+                                .iter()
+                                .filter(|mq| mq.topic == *topic)
+                                .cloned()
+                                .collect();
+                            assigned.extend(keep);
+                        }
+                    }
+                    continue;
+                }
                 let mut mq_all = self.all_queues_of_topic(topic).await;
                 sort_mqs(&mut mq_all);
                 if mq_all.is_empty() {
@@ -1967,6 +2023,110 @@ impl DefaultMQPushConsumer {
         }
         self.rebalance_pull_threads().await;
         Ok(())
+    }
+
+    /// Java `RebalanceImpl#getRebalanceResultFromBroker:345`（POP 模式的
+    /// `QUERY_ASSIGNMENT(400)` 路径），含 `MQClientInstance#queryAssignment:1373` 的
+    /// broker 选址：路由缓存没有就补拉一次，再找不到 = 无效结果。
+    ///
+    /// 返回值三态（Java 语义逐条对应）：
+    ///
+    /// - `None`：**保留上一次分配**（调用方本轮不动这个 topic 的队列）。触发条件：
+    ///   RPC 传输失败、broker 非 SUCCESS 应答、找不到 broker 地址、SUCCESS 但 body
+    ///   不带分配集（Java 的 null 集）—— Java 的 `catch (Exception)` 与
+    ///   `assignments == null` 都只 `return false`，`processQueueTable` 原样留着；
+    /// - `Some(queues)`：有效分配（**空 Vec = 显式清除**，broker 说「你之前拿到的
+    ///   负载全部收回」）。
+    ///
+    /// 本端口相对 Java 的**有意偏差**：`TOPIC_NOT_EXIST(17)` 应答回 `Some(vec![])`
+    /// 而不是保留 —— topic 在 broker 侧已经不存在时，继续抱着旧队列只会让 POP 循环
+    /// 永远撞墙；本仓库对「路由/topic 消失」的既定口径是回空集收敛（与
+    /// `topicSubscribeInfoTable` 缺 topic 的行为一致）。
+    ///
+    /// 分配项自带的 mode（POP / PULL）只**观察不服从**：本消费者的消费模式是启动前
+    /// 定死的（`pop_mode`），rebalance 消费的是队列**集合**；混合应答只告警不拆分
+    /// —— 那几乎总是 `SET_MESSAGE_REQUEST_MODE` 没有全量生效的形状。
+    async fn assigned_from_broker(
+        &self,
+        group: &str,
+        topic: &str,
+    ) -> Option<Vec<MessageQueue>> {
+        let client = self.client()?;
+        let cfg = self.config();
+        let strategy_name = self
+            .inner
+            .strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_name()
+            .to_string();
+        let assignments = match client
+            .query_assignment(
+                topic,
+                group,
+                &strategy_name,
+                &cfg.message_model,
+                QUERY_ASSIGNMENT_TIMEOUT_MILLIS,
+            )
+            .await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                if e.response_code() == Some(response_code::TOPIC_NOT_EXIST) {
+                    rmq_warn!(
+                        "queryAssignment: topic {topic} not exist on broker, clear assignment \
+                         for group {group}"
+                    );
+                    return Some(Vec::new());
+                }
+                rmq_error!(
+                    "allocate message queue exception. strategy name: {strategy_name}, \
+                     topic {topic}: {e} (keep current assignment)"
+                );
+                return None;
+            }
+        };
+        let assignments = match assignments {
+            Some(list) => list,
+            None => {
+                // Java: "null means invalid result, we should skip the update logic".
+                rmq_warn!(
+                    "queryAssignment: no assignment set for topic {topic} group {group}, \
+                     keep current assignment"
+                );
+                return None;
+            }
+        };
+        // Java 收进以 MessageQueue 为键的 HashSet（equals 只看 messageQueue）：
+        // 既去重又跳过 null 队列 —— 逐条照做。
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut out: Vec<MessageQueue> = Vec::with_capacity(assignments.len());
+        let mut pop_cnt = 0usize;
+        let mut pull_cnt = 0usize;
+        for a in assignments {
+            let Some(mq) = a.message_queue else { continue };
+            if mq.topic.is_empty() {
+                continue;
+            }
+            let mq = MessageQueue::new(&mq.topic, &mq.broker_name, mq.queue_id);
+            if !seen.insert(mq_key(&mq)) {
+                continue;
+            }
+            if a.mode == MESSAGE_REQUEST_MODE_POP {
+                pop_cnt += 1;
+            } else {
+                pull_cnt += 1;
+            }
+            out.push(mq);
+        }
+        if pop_cnt > 0 && pull_cnt > 0 {
+            rmq_warn!(
+                "queryAssignment for {group}/{topic} returned mixed modes \
+                 (pop={pop_cnt} pull={pull_cnt}): the queue set is taken as-is, \
+                 each queue is consumed per this client's own mode"
+            );
+        }
+        Some(out)
     }
 
     /// Python `_rebalance_pull_threads`：按当前分配同步循环任务集，并清理被撤销队列。
@@ -9508,5 +9668,463 @@ mod tests {
         let c = DefaultMQPushConsumer::new("GID_trace_host").expect("合法组名不该构造失败");
         // Python `_client_id`：宿主没有 _mq_client 时返回空串
         assert_eq!(TraceHost::client_id(&c), "");
+    }
+
+    // ================================================================
+    // POP 模式 broker 侧分配（QUERY_ASSIGNMENT(400)）—— 进程内假集群
+    // ================================================================
+    //
+    // 对齐 Java `RebalancePushImpl#clientRebalance`（POP 集群并发走
+    // `RebalanceImpl#getRebalanceResultFromBroker:345`）与 Go 端同款改造。判据全部
+    // 落在 `assigned_queue_keys()` 与假 broker **捕获到的 400 请求体**上：
+    // - 正常分配：400 回的队列集直接成为分配（不是路由里的全部队列）；
+    // - 空数组：显式清除；
+    // - TOPIC_NOT_EXIST(17)：回空（本端口对「topic 已消失」的既定口径）；
+    // - RPC 失败 / null 集：**保留上一次分配**，绝不退化成「全要」（仓库硬规则）；
+    // - 分配变更：下一轮 do_rebalance 感知并切换队列集。
+    // 测试不起 start()（`started=false` 会让每队列 POP 循环立刻退出），分配断言全部
+    // 由手动调用的 do_rebalance 驱动 —— 周期感知由既有的 rebalance_loop（20s/2s）
+    // 承担，这里不拿真实墙钟去赌它的节拍。
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::common::sysflag::PermName;
+    use crate::remoting::protocol::codes::request_code;
+    use crate::remoting::protocol::remoting_command::RemotingCommand;
+    use crate::remoting::protocol::route::{BrokerData, QueueData, TopicRouteData};
+
+    /// 400 应答的脚本：`(code, body)` 二值组合加一个「不答直接断连」档。
+    #[derive(Clone)]
+    struct AssignFixture {
+        /// 响应码（`response_code::SUCCESS` / `SYSTEM_ERROR` / `TOPIC_NOT_EXIST`…）。
+        code: i32,
+        /// 响应 body；`None` = 空 body（Java 的 null 集：无效结果，保留旧分配）。
+        body: Option<Vec<u8>>,
+        /// true = 收到请求后**不回话直接关闭连接**：客户端拿到传输层错误
+        /// （response_code 为 None 的 Err），走「保留上一次分配」分支。
+        silent_close: bool,
+    }
+
+    impl AssignFixture {
+        /// SUCCESS + 指定分配数组（空 Vec 编出显式 `[]` = 「清除全部分配」）。
+        fn with_assignments(items: &[(&str, i32, &str)]) -> AssignFixture {
+            AssignFixture {
+                code: response_code::SUCCESS,
+                body: Some(assignment_body(items)),
+                silent_close: false,
+            }
+        }
+        /// SUCCESS 但不带 body / 不带集：Java 的 null（跳过更新）。
+        fn null_set() -> AssignFixture {
+            AssignFixture {
+                code: response_code::SUCCESS,
+                body: None,
+                silent_close: false,
+            }
+        }
+        fn with_code(code: i32) -> AssignFixture {
+            AssignFixture {
+                code,
+                body: None,
+                silent_close: false,
+            }
+        }
+        fn drop_connection() -> AssignFixture {
+            AssignFixture {
+                code: response_code::SUCCESS,
+                body: None,
+                silent_close: true,
+            }
+        }
+    }
+
+    /// 编 400 响应 body（走真实编码器，保证测试与线上报文同一形状）。
+    fn assignment_body(items: &[(&str, i32, &str)]) -> Vec<u8> {
+        use crate::remoting::protocol::query_assignment_body::MessageQueueAssignment;
+        let list: Vec<MessageQueueAssignment> = items
+            .iter()
+            .map(|(broker, id, mode)| {
+                MessageQueueAssignment::new(MessageQueueKey::new("T", *broker, *id), mode)
+            })
+            .collect();
+        crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
+            Some(&list),
+        )
+    }
+
+    struct AssignState {
+        /// None = 默认剧本：SUCCESS，broker-a 的 0/1 两条 POP 队列。
+        fixture: Mutex<Option<AssignFixture>>,
+        /// 捕获到的 QUERY_ASSIGNMENT 请求体（断言 400 的 body 字段就看这里）。
+        bodies: Mutex<Vec<Vec<u8>>>,
+    }
+
+    /// 1 namesrv（任何 topic 都回同一份路由：broker-a，4 条读队列）
+    /// + 1 broker（QUERY_ASSIGNMENT 按脚本答，POP 回 POLLING 空转，其余 SUCCESS）。
+    struct AssignCluster {
+        namesrv_addr: String,
+        state: Arc<AssignState>,
+    }
+
+    const ASSIGN_MAX_FRAME: i32 = 20 * 1024 * 1024;
+
+    impl AssignCluster {
+        async fn start() -> AssignCluster {
+            let broker = TcpListener::bind("127.0.0.1:0").await.expect("bind mock broker");
+            let broker_addr = broker.local_addr().expect("mock broker addr").to_string();
+            let namesrv = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
+            let namesrv_addr = namesrv.local_addr().expect("mock namesrv addr").to_string();
+            let state = Arc::new(AssignState {
+                fixture: Mutex::new(None),
+                bodies: Mutex::new(Vec::new()),
+            });
+            let _namesrv_task = spawn_assign_namesrv(namesrv, broker_addr);
+            let _broker_task = spawn_assign_broker(broker, state.clone());
+            AssignCluster {
+                namesrv_addr,
+                state,
+            }
+        }
+
+        fn set(&self, fixture: Option<AssignFixture>) {
+            *lock(&self.state.fixture) = fixture;
+        }
+
+        /// 假 broker 收到过的全部 400 请求体（解码后）。
+        fn requests(&self) -> Vec<crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody> {
+            let raw = lock(&self.state.bodies).clone();
+            raw.iter()
+                .map(|b| {
+                    crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody::decode(b)
+                        .expect("请求体必须是合法 JSON")
+                })
+                .collect()
+        }
+    }
+
+    async fn read_assign_frame(stream: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut len_buf = [0_u8; 4];
+        stream.read_exact(&mut len_buf).await.ok()?;
+        let total = i32::from_be_bytes(len_buf);
+        if total <= 0 || total > ASSIGN_MAX_FRAME {
+            return None;
+        }
+        let mut frame = vec![0_u8; 4 + total as usize];
+        frame[..4].copy_from_slice(&len_buf);
+        stream.read_exact(&mut frame[4..]).await.ok()?;
+        Some(frame)
+    }
+
+    async fn write_assign_frame(stream: &mut TcpStream, response: &mut RemotingCommand) {
+        let bytes = response.encode();
+        let _ = stream.write_all(&bytes).await;
+        let _ = stream.flush().await;
+    }
+
+    fn assign_response_for(request: &RemotingCommand, code: i32) -> RemotingCommand {
+        let mut response = RemotingCommand::create_response(code, Some("mock".to_string()));
+        response.opaque = request.opaque;
+        response.serialize_type_current_rpc = request.serialize_type_current_rpc;
+        response
+    }
+
+    /// 路由：broker-a（假 broker 地址）上 4 条读队列 —— 分配只给其中 2 条时，
+    /// 「退化成全要」会立刻在断言里露出来。
+    fn assign_route_json(broker_addr: &str) -> Vec<u8> {
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                "broker-a".to_string(),
+                4,
+                4,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                "MockCluster",
+                "broker-a".to_string(),
+                vec![(i64::from(MixAll::MASTER_ID), broker_addr.to_string())],
+                "",
+            )],
+            ..Default::default()
+        };
+        serde_json::to_vec(&route.to_json_value()).expect("路由可序列化")
+    }
+
+    fn spawn_assign_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let addr = broker_addr.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = read_assign_frame(&mut stream).await {
+                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        let mut response =
+                            if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
+                                let mut r = assign_response_for(&request, response_code::SUCCESS);
+                                r.set_body(Some(assign_route_json(&addr)));
+                                r
+                            } else {
+                                assign_response_for(&request, response_code::SUCCESS)
+                            };
+                        write_assign_frame(&mut stream, &mut response).await;
+                    }
+                });
+            }
+        })
+    }
+
+    fn spawn_assign_broker(listener: TcpListener, state: Arc<AssignState>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    while let Some(frame) = read_assign_frame(&mut stream).await {
+                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        if request.code == request_code::QUERY_ASSIGNMENT {
+                            state.bodies.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                request.body().unwrap_or(&[]).to_vec(),
+                            );
+                            let fixture = lock(&state.fixture).clone();
+                            match fixture {
+                                Some(f) if f.silent_close => return, // 不回话，直接拆连接
+                                Some(f) => {
+                                    let mut response = assign_response_for(&request, f.code);
+                                    if let Some(body) = f.body {
+                                        response.set_body(Some(body));
+                                    }
+                                    write_assign_frame(&mut stream, &mut response).await;
+                                }
+                                None => {
+                                    // 默认剧本：broker-a 的 0/1 两条 POP 队列
+                                    let mut response = assign_response_for(
+                                        &request,
+                                        response_code::SUCCESS,
+                                    );
+                                    response.set_body(Some(assignment_body(&[
+                                        ("broker-a", 0, "POP"),
+                                        ("broker-a", 1, "POP"),
+                                    ])));
+                                    write_assign_frame(&mut stream, &mut response).await;
+                                }
+                            }
+                            continue;
+                        }
+                        if request.code == request_code::POP_MESSAGE {
+                            // 起环的 POP 循环在这里空转（started=false 时循环其实会立刻
+                            // 退出，这层延迟只是给「误起环」的形态兜底，不让它打满 CPU）。
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            let mut response =
+                                assign_response_for(&request, response_code::PULL_NOT_FOUND);
+                            write_assign_frame(&mut stream, &mut response).await;
+                            continue;
+                        }
+                        let mut response = assign_response_for(&request, response_code::SUCCESS);
+                        if request.code == request_code::QUERY_CONSUMER_OFFSET
+                            || request.code == request_code::GET_MAX_OFFSET
+                        {
+                            response.add_ext_field("offset", "0");
+                        }
+                        write_assign_frame(&mut stream, &mut response).await;
+                    }
+                });
+            }
+        })
+    }
+
+    /// 造一个「POP 模式 + 已挂上指向假集群的实例」的消费者（不起 start，
+    /// 不 spawn 后台循环，分配完全由手动 do_rebalance 驱动）。
+    fn pop_consumer_on_cluster(instance: &str, cluster: &AssignCluster) -> DefaultMQPushConsumer {
+        let c = DefaultMQPushConsumer::new("GID_pop_assign").expect("合法组名");
+        c.subscribe("T", "*").expect("订阅");
+        c.set_message_listener_concurrently(Arc::new(NoopListener));
+        c.update_config(|cfg| {
+            cfg.pop_mode = true;
+            cfg.name_server_addrs = vec![cluster.namesrv_addr.clone()];
+        });
+        let client = MQClientInstance::new(
+            &format!("cid-{instance}"),
+            vec![cluster.namesrv_addr.clone()],
+        );
+        *lock(&c.inner.client) = Some(client);
+        // require_client 认这个标志；后台循环任务（rebalance/heartbeat/lock/persist）
+        // 只有 start() 才 spawn，所以这里不会打乱手动驱动的节拍。
+        c.inner.started.store(true, Ordering::Release);
+        c
+    }
+
+    fn sorted_keys(c: &DefaultMQPushConsumer) -> Vec<String> {
+        let mut keys = c.assigned_queue_keys();
+        keys.sort();
+        keys
+    }
+
+    /// 正常分配：400 回的队列集**就是**分配；同时逐项核对 400 请求体的 Java 字段
+    /// （broker 按属性名负载均衡，clientId/strategyName/messageModel 错了分配就永远
+    /// 不是本实例的形状）。
+    #[tokio::test]
+    async fn pop_assignment_comes_from_broker_query_assignment() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-qa-ok", &cluster);
+
+        c.do_rebalance().await.expect("rebalance 不报错");
+
+        assert_eq!(
+            sorted_keys(&c),
+            vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()],
+            "分配 = broker 给的 0/1，而不是路由里的全部 0..3"
+        );
+        let reqs = cluster.requests();
+        assert_eq!(reqs.len(), 1, "每 topic 一笔 400");
+        assert_eq!(reqs[0].topic, "T");
+        assert_eq!(reqs[0].consumer_group, "GID_pop_assign");
+        assert_eq!(reqs[0].client_id, "cid-pop-qa-ok", "clientId 用实例的（Java MQClientInstance）");
+        assert_eq!(reqs[0].strategy_name, "AVG", "策略名随 body 上送，broker 按它选策略");
+        assert_eq!(reqs[0].message_model, "CLUSTERING");
+        // POP 模式不再发 GET_CONSUMER_LIST_BY_GROUP：队列集完全由 400 决定
+    }
+
+    /// 显式空数组 = broker 说「把你之前的负载全收走」：旧分配必须被清掉。
+    #[tokio::test]
+    async fn pop_empty_assignment_clears_previous_queues() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-qa-empty", &cluster);
+
+        c.do_rebalance().await.unwrap();
+        assert_eq!(sorted_keys(&c).len(), 2, "先拿到默认分配");
+
+        cluster.set(Some(AssignFixture::with_assignments(&[])));
+        c.do_rebalance().await.unwrap();
+        assert!(
+            sorted_keys(&c).is_empty(),
+            "空集是明确的清除指令，不是「保留」"
+        );
+    }
+
+    /// TOPIC_NOT_EXIST(17)：topic 在 broker 侧已消失 → 回空集收敛（本端口硬规则），
+    /// 不能让 POP 循环抱着注定撞墙的队列。
+    #[tokio::test]
+    async fn pop_topic_not_exist_clears_assignment() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-qa-gone", &cluster);
+
+        c.do_rebalance().await.unwrap();
+        assert_eq!(sorted_keys(&c).len(), 2);
+
+        cluster.set(Some(AssignFixture::with_code(
+            response_code::TOPIC_NOT_EXIST,
+        )));
+        c.do_rebalance().await.unwrap();
+        assert!(
+            sorted_keys(&c).is_empty(),
+            "17 = topic 没了，分配必须清空而不是抱着旧队列"
+        );
+    }
+
+    /// RPC 失败一律保留上一次分配，**绝不**退化成「路由里全要」：
+    /// - broker 业务错误码（SYSTEM_ERROR）；
+    /// - SUCCESS 但 body 不带集（Java 的 null = 无效结果）；
+    /// - 传输层失败（连接被对面直接掐掉）。
+    #[tokio::test]
+    async fn pop_assignment_failure_keeps_previous_never_all() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-qa-keep", &cluster);
+
+        c.do_rebalance().await.unwrap();
+        let before = sorted_keys(&c);
+        assert_eq!(before, vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]);
+
+        // ① broker 错误码
+        cluster.set(Some(AssignFixture::with_code(response_code::SYSTEM_ERROR)));
+        c.do_rebalance().await.unwrap();
+        assert_eq!(
+            sorted_keys(&c),
+            before,
+            "非 SUCCESS（除 17）= 保留上一次分配；路由里有 0..3，退化成全要即为回归"
+        );
+
+        // ② SUCCESS + null 集
+        cluster.set(Some(AssignFixture::null_set()));
+        c.do_rebalance().await.unwrap();
+        assert_eq!(sorted_keys(&c), before, "Java: null means invalid result, skip the update");
+
+        // ③ 传输层失败：400 收到请求后直接断连（3s RPC 超时预算内必然返回错误）
+        cluster.set(Some(AssignFixture::drop_connection()));
+        c.do_rebalance().await.unwrap();
+        assert_eq!(sorted_keys(&c), before, "RPC 打不出去同样只能保留");
+    }
+
+    /// 分配变更感知：下一轮 rebalance（周期循环每 tick 调的就是它）拿到不同的集就
+    /// 立即切换 —— 旧的撤、新的上。
+    #[tokio::test]
+    async fn pop_assignment_change_is_applied_on_next_rebalance_round() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-qa-change", &cluster);
+
+        c.do_rebalance().await.unwrap();
+        assert_eq!(sorted_keys(&c), vec!["Tbroker-a0", "Tbroker-a1"]);
+
+        // broker 侧把这条队列挪走/换掉（POP 重平衡的真实形态）
+        cluster.set(Some(AssignFixture::with_assignments(&[
+            ("broker-a", 2, "POP"),
+            ("broker-a", 3, "POP"),
+        ])));
+        c.do_rebalance().await.unwrap();
+        assert_eq!(
+            sorted_keys(&c),
+            vec!["Tbroker-a2", "Tbroker-a3"],
+            "第二轮 rebalance 必须感知到集合并切换"
+        );
+        assert_eq!(cluster.requests().len(), 2, "每轮 topic 各一笔 400");
+    }
+
+    /// 去重与容错：Java 的 HashSet 按 MessageQueue 去重、跳过 null 队列；
+    /// mode 混合（POP+PULL）只告警不拆分（本消费者模式由 pop_mode 定死）。
+    #[tokio::test]
+    async fn pop_assignment_dedups_and_survives_mixed_modes() {
+        let cluster = AssignCluster::start().await;
+        let c = pop_consumer_on_cluster("pop-qa-dedup", &cluster);
+        let body = crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
+            Some(&{
+                let mut items = assignment_items(&[("broker-a", 0, "POP")]);
+                items.extend(assignment_items(&[("broker-a", 0, "POP")])); // 重复项
+                items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
+                    message_queue: None, // null 队列：Java 跳过
+                    mode: "POP".to_string(),
+                });
+                items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
+                    message_queue: Some(MessageQueueKey::new("T", "broker-a", 1)),
+                    mode: "PULL".to_string(), // 混合模式：只观察
+                });
+                items
+            }),
+        );
+        cluster.set(Some(AssignFixture {
+            code: response_code::SUCCESS,
+            body: Some(body),
+            silent_close: false,
+        }));
+
+        c.do_rebalance().await.unwrap();
+        assert_eq!(
+            sorted_keys(&c),
+            vec!["Tbroker-a0", "Tbroker-a1"],
+            "重复的 (broker-a,0) 去重、null 队列被跳过、PULL 项照常进集合"
+        );
+    }
+
+    fn assignment_items(
+        items: &[(&str, i32, &str)],
+    ) -> Vec<crate::remoting::protocol::query_assignment_body::MessageQueueAssignment> {
+        items
+            .iter()
+            .map(|(broker, id, mode)| {
+                crate::remoting::protocol::query_assignment_body::MessageQueueAssignment::new(
+                    MessageQueueKey::new("T", *broker, *id),
+                    mode,
+                )
+            })
+            .collect()
     }
 }

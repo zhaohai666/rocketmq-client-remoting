@@ -11,6 +11,8 @@ import { Buffer } from 'node:buffer';
 import { ResponseCode } from './codes.ts';
 import { RemotingCommand } from './remotingCommand.ts';
 import { RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException } from './exception.ts';
+import { parseProxyAddr, parseSocksProxyConfig, socksHandshake } from './socks_proxy.ts';
+import type { SocksProxyConfig } from './socks_proxy.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('remoting.client');
@@ -49,6 +51,10 @@ export class RemotingClient {
   enableReconnectForGoAway = true;
   tlsEnable = false;
   tlsOptions: TlsOptions | null = null;
+  // SOCKS proxy (Java ClientConfig#socksProxyConfig / SocksProxyConfig). null =
+  // direct connection. Applied to ALL remoting connections (Java's 0.0.0.0/0
+  // entry); TopAddressing's HTTP route fetch never goes through it.
+  socksProxyConfig: SocksProxyConfig | null = null;
   private conns = new Map<string, any>();
   private buffers = new Map<string, Buffer>();
   private responseTable = new Map<number, ResponseFuture>();
@@ -57,7 +63,7 @@ export class RemotingClient {
   private running = true;
   private connectPromises = new Map<string, Promise<any>>();
 
-  constructor(opts: { connectTimeoutMillis?: number; invokeTimeoutMillis?: number; tlsEnable?: boolean; tlsOptions?: TlsOptions | null } = {}) {
+  constructor(opts: { connectTimeoutMillis?: number; invokeTimeoutMillis?: number; tlsEnable?: boolean; tlsOptions?: TlsOptions | null; socksProxyConfig?: SocksProxyConfig | null } = {}) {
     if (opts.connectTimeoutMillis != null) this.connectTimeoutMillis = opts.connectTimeoutMillis;
     if (opts.invokeTimeoutMillis != null) this.invokeTimeoutMillis = opts.invokeTimeoutMillis;
     if (opts.tlsEnable != null) this.tlsEnable = opts.tlsEnable;
@@ -66,6 +72,13 @@ export class RemotingClient {
       this.tlsEnable = e === '1' || e === 'true' || e === 'yes';
     }
     if (opts.tlsOptions !== undefined) this.tlsOptions = opts.tlsOptions;
+    if (opts.socksProxyConfig !== undefined) this.socksProxyConfig = opts.socksProxyConfig;
+    else {
+      // Java reads the JSON from system property com.rocketmq.socks.proxy.config;
+      // the env var is the Node surface for the same shape.
+      const env = (process.env['ROCKETMQ_SOCKS_PROXY_CONFIG'] || '').trim();
+      if (env) this.socksProxyConfig = parseSocksProxyConfig(env);
+    }
   }
 
   // ---------------- connection management ----------------
@@ -80,6 +93,25 @@ export class RemotingClient {
     return [addr.slice(0, idx), parseInt(addr.slice(idx + 1), 10)];
   }
 
+  // TLS ConnectionOptions WITHOUT host/port/socket — shared by the direct dial
+  // and the SOCKS-tunnel upgrade path (identical cert handling in both).
+  private async _tlsOptions(host: string): Promise<tls.ConnectionOptions> {
+    const t = this.tlsOptions;
+    const strict = t?.caCert != null;
+    const opts: tls.ConnectionOptions = { rejectUnauthorized: strict };
+    if (strict) {
+      opts.ca = [await fs.promises.readFile(t!.caCert!)];
+      // servername 缺省即 host；仅当显式覆盖且不同才设（node 对 IP SNI 有
+      // DEP0123 弃用告警，但证书的 IP SAN 校验仍按 host 走）。
+      if (t!.serverName != null && t!.serverName !== '' && t!.serverName !== host) {
+        opts.servername = t!.serverName;
+      }
+      if (t!.clientCert != null) opts.cert = [await fs.promises.readFile(t!.clientCert)];
+      if (t!.clientKey != null) opts.key = [await fs.promises.readFile(t!.clientKey)];
+    }
+    return opts;
+  }
+
   private async _connect(addr: string): Promise<any> {
     const existing = this.conns.get(addr);
     if (existing && !existing.destroyed) return existing;
@@ -87,32 +119,48 @@ export class RemotingClient {
     if (p) return p;
     p = (async () => {
       const [host, port] = this._parseAddr(addr);
+      const proxy = this.socksProxyConfig;
       let sock: any;
-      if (this.tlsEnable) {
+      if (proxy != null) {
+        // Java NettyRemotingClient#createBootstrap: the proxy bootstrap dials
+        // the SOCKS server itself and Socks5ProxyHandler sits BEFORE the SSL
+        // handler — wire order is TCP connect → SOCKS CONNECT → TLS upgrade.
+        const [phost, pport] = parseProxyAddr(proxy.addr);
+        sock = net.connect({ host: phost, port: pport });
+      } else if (this.tlsEnable) {
         // caCert 给出即走严格校验：握手（含证书链 + 主机名校验）完成前
         // 'secureConnect' 不触发 —— CA 不对/主机名不符在 connect 阶段就报错，
         // 而不是等首次写入时才炸。test-mode（无 caCert）保持 rejectUnauthorized:false。
-        const t = this.tlsOptions;
-        const strict = t?.caCert != null;
-        const tlsOpts: tls.ConnectionOptions = { host, port, rejectUnauthorized: strict };
-        if (strict) {
-          tlsOpts.ca = [await fs.promises.readFile(t!.caCert!)];
-          // servername 缺省即 host；仅当显式覆盖且不同才设（node 对 IP SNI 有
-          // DEP0123 弃用告警，但证书的 IP SAN 校验仍按 host 走）。
-          if (t!.serverName != null && t!.serverName !== '' && t!.serverName !== host) {
-            tlsOpts.servername = t!.serverName;
-          }
-          if (t!.clientCert != null) tlsOpts.cert = [await fs.promises.readFile(t!.clientCert)];
-          if (t!.clientKey != null) tlsOpts.key = [await fs.promises.readFile(t!.clientKey)];
-        }
-        sock = tls.connect(tlsOpts);
+        sock = tls.connect({ ...(await this._tlsOptions(host)), host, port });
       } else {
         sock = net.connect({ host, port });
       }
       sock.setNoDelay(true);
       const timer = setTimeout(() => sock.destroy(new Error('connect timeout')), this.connectTimeoutMillis);
       try {
-        await once(sock, this.tlsEnable && this.tlsOptions?.caCert != null ? 'secureConnect' : 'connect');
+        if (proxy != null) {
+          // TCP 到代理已建连 → SOCKS CONNECT 握手（TLS 握手之前）。
+          const rawSock = sock;
+          try {
+            await once(rawSock, 'connect');
+            await socksHandshake(rawSock, proxy, host, port, this.connectTimeoutMillis);
+            if (this.tlsEnable) {
+              // 隧道内做 TLS 升级：SNI 用目标 host（serverName 覆盖在 _tlsOptions 里已设）。
+              const opts = await this._tlsOptions(host);
+              if (opts.servername == null) opts.servername = host;
+              opts.socket = rawSock;
+              sock = tls.connect(opts);
+              sock.setNoDelay(true);
+              await once(sock, 'secureConnect');
+            }
+          } catch (e) {
+            // 握手失败：隧道不进连接池，必须拆掉，避免悬挂半开连接。
+            try { if (!rawSock.destroyed) rawSock.destroy(); } catch { /* ignore */ }
+            throw e;
+          }
+        } else {
+          await once(sock, this.tlsEnable && this.tlsOptions?.caCert != null ? 'secureConnect' : 'connect');
+        }
       } finally {
         clearTimeout(timer);
       }

@@ -16,14 +16,14 @@ const modules = [
   'src/remoting/route.ts', 'src/remoting/namespace.ts', 'src/remoting/subscription.ts',
   'src/remoting/admin_body.ts', 'src/remoting/extra_info.ts', 'src/remoting/acl.ts',
   'src/remoting/rpc_hooks.ts',
-  'src/remoting/client.ts', 'src/remoting/exception.ts',
+  'src/remoting/client.ts', 'src/remoting/exception.ts', 'src/remoting/socks_proxy.ts',
   'src/common/message.ts', 'src/common/messageConst.ts', 'src/common/messageDecoder.ts',
   'src/common/messageClientIdSetter.ts', 'src/common/message_accessor.ts', 'src/common/messageType.ts',
   'src/common/mixAll.ts', 'src/common/sysflag.ts', 'src/common/utilAll.ts',
   'src/common/subscriptionData.ts', 'src/common/topic_config.ts', 'src/common/topic_validator.ts',
   'src/common/recall_message_handle.ts', 'src/common/boundary_type.ts', 'src/common/validators.ts',
   'src/common/compress.ts',
-  'src/client/mq_client.ts', 'src/client/producer.ts', 'src/client/consumer.ts',
+  'src/client/mq_client.ts', 'src/client/mq_client_manager.ts', 'src/client/producer.ts', 'src/client/consumer.ts',
   'src/client/pull_consumer.ts', 'src/client/lite_pull_consumer.ts', 'src/client/admin.ts',
   'src/client/allocate.ts', 'src/client/process_queue.ts', 'src/client/offset_store.ts',
   'src/client/consumer_stats.ts', 'src/client/trace_context.ts', 'src/client/trace_dispatcher.ts',
@@ -45,10 +45,12 @@ for (const mod of modules) {
   else { failures++; console.log(`  FAIL ${mod}\n       ${(r.stderr || '').trim().split('\n')[0]}`); }
 }
 
-// The offline smoke suites.
+// The offline smoke suites. (test/java_gap_fill_smoke.ts was removed from the
+// repo in 59cac5f — the reference here went stale and failed the baseline.)
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
   'test/compat_contract_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts',
-  'test/ns_failover_smoke.ts', 'test/lite_topic_queue_change_smoke.ts', 'test/pull_balance_view_smoke.ts'];
+  'test/ns_failover_smoke.ts', 'test/lite_topic_queue_change_smoke.ts', 'test/pull_balance_view_smoke.ts',
+  'test/socks_smoke.ts', 'test/mq_client_manager_smoke.ts'];
 console.log(`\n== smoke suites (${smokes.length}) ==`);
 for (const smoke of smokes) {
   const r = spawnSync(node, ['--experimental-strip-types', '--no-warnings', path.join(here, smoke)],

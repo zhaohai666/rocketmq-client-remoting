@@ -9,6 +9,7 @@
 // offset commit (the consumer owns its own commit path), and the expression is
 // ALWAYS sent (this port never drops the subscription field on lite pull).
 import { MQClient } from './mq_client.ts';
+import { MQClientManager } from './mq_client_manager.ts';
 import { PullAPI } from './pull_api.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import {
@@ -169,13 +170,20 @@ export class DefaultLitePullConsumer {
     }
     this.clientID = MixAll.clientIdFor(
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
-    const client = new MQClient(this.clientID, this.nameServerAddr);
-    // 钩子注册顺序：NamespaceRpcHook 先挂在 remoting client 上，然后是
-    // StreamTypeRPCHook，最后才是用户钩子（当前没有）。
-    registerRpcHooks(client.remotingClient, {
-      namespaceV2: () => this.namespaceV2,
-      enableStreamRequestType: this.enableStreamRequestType,
-    });
+    // 跨 facade 复用（Java MQClientManager.factoryTable）：同 clientId 的门面共享
+    // 一个实例，引用计数归零才真关闭；hook 链只由创建者注册（first-wins 快照）。
+    const manager = MQClientManager.getInstance();
+    const { instance: client, created } = manager.getOrCreateMQClientInstance(
+      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
+    if (created) {
+      // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
+      // client, then StreamTypeRPCHook, before any user hook (none today).
+      registerRpcHooks(client.remotingClient, {
+        namespaceV2: () => this.namespaceV2,
+        enableStreamRequestType: this.enableStreamRequestType,
+      });
+    }
+    manager.registerClient(this.clientID, client);
     this.mqClient = client;
     client.registerConsumer(this.consumerGroup, this);
     client.start();
@@ -197,9 +205,10 @@ export class DefaultLitePullConsumer {
     } catch (e) {
       logger.warning('Start the lite pull consumer %s fail: %s', this.consumerGroup, (e as Error).message);
       // started is still false here, so shutdown() would no-op — unwind the
-      // registration this start() already did by hand.
+      // registration this start() already did by hand (registerClient 的平衡
+      // 归还：unregisterClient 计数 -1，归零才真 shutdown)。
       client.unregisterConsumer(this.consumerGroup);
-      client.shutdown();
+      manager.unregisterClient(client.clientId, client);
       throw e;
     }
     // 立即在 broker 注册消费组：客户端心跳循环的第一拍可能在任何路由被缓存之前
@@ -236,7 +245,8 @@ export class DefaultLitePullConsumer {
     if (this.mqClient) {
       await this.mqClient.unregisterClientAllBrokers('', this.consumerGroup).catch(() => {});
       this.mqClient.unregisterConsumer(this.consumerGroup);
-      this.mqClient.shutdown();
+      // 归还给 manager：计数 -1，归零才真正 shutdown。
+      MQClientManager.getInstance().unregisterClient(this.mqClient.clientId, this.mqClient);
     }
     this.started = false;
   }

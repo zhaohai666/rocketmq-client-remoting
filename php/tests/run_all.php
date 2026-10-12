@@ -23,6 +23,7 @@ $suites = [
     'Client OpenTracing' => __DIR__ . '/RunClientOpenTracing.php',
     'Client 聚合器' => __DIR__ . '/RunClientAccumulator.php',
     'Client 实例' => __DIR__ . '/RunClientInstance.php',
+    'Client 故障探活' => __DIR__ . '/RunClientFaultDetector.php',
     'Client 消费者' => __DIR__ . '/RunClientConsumer.php',
     'Client 队列变更监听' => __DIR__ . '/RunClientLiteTopicChange.php',
 ];

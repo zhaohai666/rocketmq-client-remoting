@@ -7,6 +7,7 @@
 import type { MQClient } from './mq_client.ts';
 import { PullAPI } from './pull_api.ts';
 import { MQClient } from './mq_client.ts';
+import { MQClientManager } from './mq_client_manager.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import {
   LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey,
@@ -109,13 +110,21 @@ export class DefaultMQPullConsumer {
     }
     this.clientID = MixAll.clientIdFor(
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
-    const client = new MQClient(this.clientID, this.nameServerAddr);
-    // 钩子注册顺序：NamespaceRpcHook 先挂在 remoting client 上，再挂
-    // StreamTypeRPCHook（pull 消费者默认开启），最后才是用户钩子（当前没有）。
-    registerRpcHooks(client.remotingClient, {
-      namespaceV2: () => this.namespaceV2,
-      enableStreamRequestType: this.enableStreamRequestType,
-    });
+    // 跨 facade 复用（Java MQClientManager.factoryTable）：同 clientId 的门面共享
+    // 一个实例，引用计数归零才真关闭；hook 链只由创建者注册（first-wins 快照）。
+    const manager = MQClientManager.getInstance();
+    const { instance: client, created } = manager.getOrCreateMQClientInstance(
+      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
+    if (created) {
+      // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
+      // client, then StreamTypeRPCHook (pull consumers enable it), before any
+      // user hook (this facade has none today).
+      registerRpcHooks(client.remotingClient, {
+        namespaceV2: () => this.namespaceV2,
+        enableStreamRequestType: this.enableStreamRequestType,
+      });
+    }
+    manager.registerClient(this.clientID, client);
     this.mqClient = client;
     client.registerConsumer(this.consumerGroup, this);
     client.start();
@@ -142,7 +151,9 @@ export class DefaultMQPullConsumer {
     if (this.mqClient) {
       await this.mqClient.unregisterClientAllBrokers('', this.consumerGroup).catch(() => {});
       this.mqClient.unregisterConsumer(this.consumerGroup);
-      this.mqClient.shutdown();
+      // 归还给 manager：计数 -1，归零才真正 shutdown（同 clientId 还有别的门面时
+      // 实例与其后台定时器继续存活）。
+      MQClientManager.getInstance().unregisterClient(this.mqClient.clientId, this.mqClient);
     }
     this.started = false;
   }

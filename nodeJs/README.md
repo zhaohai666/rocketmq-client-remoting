@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **59** 个模块并依次跑 **11** 套离线冒烟，2026-10-10 实测 **ALL GREEN**。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **60** 个模块并依次跑 **12** 套离线冒烟，2026-10-11 实测 **ALL GREEN**。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -39,6 +39,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
 | `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
+| `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
 
 真机示例直接对集群运行：
 
@@ -251,6 +252,19 @@ producer.setTlsOptions({ caCert, clientCert, clientKey, serverName }); // null =
 
 Producer / PushConsumer / LitePullConsumer 均支持；`tlsEnable` 是进程级开关，NameServer 连接同样走 TLS。
 
+### SOCKS 代理
+
+```ts
+// 对齐 Java ClientConfig#socksProxyConfig（SocksProxyConfig: addr/username/password）
+producer.setSocksProxyConfig({ addr: '127.0.0.1:1080' });                          // SOCKS5 无认证
+producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', username: 'u', password: 'p' }); // SOCKS5 RFC 1929 子协商
+producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });              // SOCKS4/4a
+```
+
+- TCP 建连后、TLS 握手前完成 CONNECT（Java 的 Socks5ProxyHandler 在 SSL handler 之前的管线序）；`version` 缺省 5，可 4 / `'SOCKS4'`（域名目标自动走 4a 的 0.0.0.1 哨兵）。
+- 作用于全部 remoting 连接（NameServer + Broker，Java `0.0.0.0/0` 口径）；**TopAddressing 的 HTTP 寻址不走代理**。
+- Producer / PushConsumer 均支持；也可用环境变量 `ROCKETMQ_SOCKS_PROXY_CONFIG` 传 JSON（Java 的 `{"0.0.0.0/0": {...}}` 形状或裸对象）。
+
 ## 特性与进度
 
 - ✅ 协议层：`RemotingCommand` 帧、JSON + RocketMQ 二进制双序列化、V2 短键 header、容错解析、消息 17/6 段编解码
@@ -264,7 +278,7 @@ Producer / PushConsumer / LitePullConsumer 均支持；`tlsEnable` 是进程级�
 - ✅ 命名空间两套：`namespace` 前缀 + `namespaceV2` 线上盖章；clientId `<ip>@<instanceName>[@<unitName>][@STREAM]`
 - ✅ 队列分配 6 策略：AVG / AVG_BY_CIRCLE / CONFIG / MACHINE_ROOM / MACHINE_ROOM_NEARBY / CONSISTENT_HASH
 - ✅ 消息轨迹（编解码 + 异步分发 + 收发钩子）、消费统计（差分窗口 + 307 statusTable）、W3C traceparent
-- ✅ 压缩三型：zlib / LZ4（Frame）/ ZSTD；TLS opt-in
+- ✅ 压缩三型：zlib / LZ4（Frame）/ ZSTD；TLS opt-in；SOCKS4/5 代理（对齐 ClientConfig#socksProxyConfig）
 - ✅ NameServer 故障转移（客户端侧地址切换与路由重取）
 
 ## 客户端日志
@@ -334,7 +348,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、分配、位点、轨迹、统计、命名空间、POP）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 11 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 12 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

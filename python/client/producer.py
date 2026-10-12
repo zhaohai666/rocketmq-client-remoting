@@ -37,6 +37,7 @@ from remoting.protocol.heartbeat import HeartbeatData, ProducerData
 from remoting.protocol.namespace_util import NamespaceUtil
 from remoting.protocol.remoting_command import RemotingCommand
 from remoting.rpchook import RPCHook
+from remoting.socks_proxy import SocksProxyConfig
 from .consume_executor import ConsumeExecutor, RejectedExecutionError
 from .backpressure import (MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE, FairSemaphore)
 from .exception import (ClientErrorCode, MQBrokerException, MQClientException,
@@ -47,6 +48,7 @@ from .hook import (CheckForbiddenContext, CheckForbiddenHook, CommunicationMode,
 from .latency import MQFaultStrategy
 from .metrics import ClientMetrics
 from .mq_client import MQClientInstance
+from .mq_client_manager import MQClientManager
 from .top_addressing import DefaultTopAddressing
 from .request_reply import (DEFAULT_REQUEST_TIMEOUT_MILLIS, REQUEST_FUTURE_HOLDER,
                             RequestCallback, RequestResponseFuture, create_correlation_id)
@@ -363,6 +365,7 @@ class DefaultMQProducer:
                  rpc_hook: Optional[RPCHook] = None, namespace: str = "",
                  topics: Optional[List[str]] = None, tls_enable: Optional[bool] = None,
                  tls_options: Optional[Dict[str, str]] = None,
+                 socks_proxy_config: Optional[SocksProxyConfig] = None,
                  enable_trace_context: Optional[bool] = None):
         if producer_group is None or not str(producer_group).strip():
             raise MQClientException("producerGroup is empty")
@@ -371,6 +374,9 @@ class DefaultMQProducer:
         self.tls_enable: Optional[bool] = tls_enable
         # TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）
         self.tls_options: Optional[Dict[str, str]] = tls_options
+        # SOCKS 代理（对应 Java SocksProxyConfig + NettyRemotingClient 的代理接入）：
+        # 配置了就全部 remoting 连接走代理；NameServer HTTP 动态取址不受影响。
+        self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
         # W3C traceparent 透传（opt-in；None = 交给 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
         if enable_trace_context is None:
             enable_trace_context = trace_context_enabled_from_env()
@@ -521,6 +527,17 @@ class DefaultMQProducer:
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
 
+    def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
+        """SOCKS 代理配置（对齐 Java SocksProxyConfig：类型/地址/端口/用户名/密码/enable）。
+
+        只在 ``start()`` 建 MQClientInstance 时取一次快照（与 tls_enable 等其余
+        ClientConfig 字段同口径）；传 None 或 enable=False 即不走代理。
+        """
+        self.socks_proxy_config = socks_proxy_config
+
+    def get_socks_proxy_config(self) -> Optional[SocksProxyConfig]:
+        return self.socks_proxy_config
+
     def set_max_message_size(self, size: int) -> None:
         self.max_message_size = size
 
@@ -629,6 +646,27 @@ class DefaultMQProducer:
 
     def is_start_detector_enable(self) -> bool:
         return self._mq_fault_strategy.is_start_detector_enable()
+
+    def set_detect_timeout(self, detect_timeout_millis: float) -> None:
+        """对应 Java ClientConfig.setDetectTimeout（默认 200ms）：单次探活的 RPC 超时。
+
+        与 Java 同口径：先记在 producer 上，``start()`` 建探测器配置时取一次快照
+        （之后修改不影响已在跑的探测线程，Java 的 MQFaultStrategy 构造时同样定格）。
+        """
+        self.detect_timeout_millis = detect_timeout_millis
+
+    def get_detect_timeout(self) -> float:
+        return self.detect_timeout_millis
+
+    def set_detect_interval(self, detect_interval_millis: float) -> None:
+        """对应 Java ClientConfig.setDetectInterval（默认 2000ms）：同一 broker 两次探测的最小间隔。
+
+        ``start()`` 时取一次快照（Java 同：detectInterval 定格在 LatencyFaultToleranceImpl）。
+        """
+        self.detect_interval_millis = detect_interval_millis
+
+    def get_detect_interval(self) -> float:
+        return self.detect_interval_millis
 
     def set_request_timeout(self, timeout_millis: int) -> None:
         """设置 Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。"""
@@ -899,36 +937,48 @@ class DefaultMQProducer:
             if self.client_id is None:
                 self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
                                                       self.enable_stream_request_type)
-            self._mq_client = MQClientInstance(self.client_id, self.name_server_addrs,
-                                               tls_enable=self.tls_enable,
-                                               tls_options=self.tls_options,
-                                               enable_stream_request_type=self.enable_stream_request_type,
-                                               unit_name=self.unit_name,
-                                               namespace_v2=self.namespace_v2,
-                                               poll_name_server_interval=self.poll_name_server_interval)
-            if self.rpc_hook is not None:
+            # 对应 Java DefaultMQProducerImpl.start:256 → MQClientManager
+            # .getOrCreateMQClientInstance：同 clientId 复用同一份实例（同进程内
+            # 多个生产者/消费者共享路由缓存与长连接）。rpcHook 与 Java 同口径：
+            # 只认创建实例时的那份（created=True），复用方不重复注册。
+            def _create_instance() -> MQClientInstance:
+                return MQClientInstance(
+                    self.client_id, self.name_server_addrs,
+                    tls_enable=self.tls_enable,
+                    tls_options=self.tls_options,
+                    socks_proxy_config=self.socks_proxy_config,
+                    enable_stream_request_type=self.enable_stream_request_type,
+                    unit_name=self.unit_name,
+                    namespace_v2=self.namespace_v2,
+                    poll_name_server_interval=self.poll_name_server_interval)
+
+            self._mq_client, created = MQClientManager.get_instance() \
+                .get_or_create_mq_client_instance(self.client_id, _create_instance)
+            if created and self.rpc_hook is not None:
                 self._mq_client.remoting_client.register_rpc_hook(self.rpc_hook)
-            self._mq_client.start()
+            manager = MQClientManager.get_instance()
+            manager.register_client(self.client_id, self._mq_client)
+            try:
+                self._mq_client.start()
+            except Exception:
+                # 启动失败不能留下悬空的引用计数（实例自己也会把自己从缓存摘掉）。
+                manager.unregister_client(self.client_id, self._mq_client)
+                raise
             # 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
             if not self.name_server_addrs and self._mq_client.name_server_addrs:
                 self.name_server_addrs = list(self._mq_client.name_server_addrs)
-            # 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
-            # 按 message_ext 的 PGROUP 属性匹配本生产者，不匹配则丢弃。
-            self._mq_client.remoting_client.register_processor(
-                RequestCode.CHECK_TRANSACTION_STATE, self._handle_check_transaction_state)
+            # 注册事务回查处理器：CHECK_TRANSACTION_STATE(39) 实例级只挂一个分派器
+            # （MQClientInstance.__init__），这里把自己的按组处理器登记进去；同实例
+            # 多生产者时互不覆盖（对齐 Java producerTable 按组分派）。
+            self._mq_client.register_transaction_check_handler(
+                self._handle_check_transaction_state)
             # 异步发送的两个线程池（Java 在构造器里 new，线程本身按需创建）
             self._create_async_executors()
             # 后台可达性探测线程（对齐 Java DefaultMQProducerImpl.start():272
             # mqFaultStrategy.startDetector()）：线程无条件拉起，每轮是否真探测由
             # startDetectorEnable 决定。Resolver / ServiceDetector 与 Java 同款：
             # findBrokerAddressInPublish 解析地址，GET_MAX_OFFSET(30) 探活。
-            tolerance = self._mq_fault_strategy.latency_fault_tolerance
-            tolerance.set_detect_timeout(self.detect_timeout_millis)
-            tolerance.set_detect_interval(self.detect_interval_millis)
-            tolerance.resolver = self._detector_resolver
-            tolerance.service_detector = self._detector_probe
-            self._mq_fault_strategy.set_start_detector_enable(self.start_detector_enable)
-            self._mq_fault_strategy.start_detector()
+            self._setup_reachability_detector()
             # Request-Reply 等待槽的周期兜底清理（对齐 Java :291
             # RequestFutureHolder.startScheduledTask(this)：初始 3s、周期 1s）
             REQUEST_FUTURE_HOLDER.start_scheduled_task(self)
@@ -951,6 +1001,20 @@ class DefaultMQProducer:
         # 轨迹分发器在锁外启动（Java 同样在 defaultMQProducerImpl.start() 之后做）：
         # 它要新建内部生产者并拉路由，属网络操作，不该占着生产者自己的锁。
         self._start_trace_dispatcher()
+
+    def _setup_reachability_detector(self) -> None:
+        """把探测配置与 Resolver/ServiceDetector 快照进容错器并拉起探测线程。
+
+        从 ``start()`` 抽出来单测可直接调用（Java 侧这四行散在 MQFaultStrategy
+        构造器与 DefaultMQProducerImpl.start():272 里）。
+        """
+        tolerance = self._mq_fault_strategy.latency_fault_tolerance
+        tolerance.set_detect_timeout(self.detect_timeout_millis)
+        tolerance.set_detect_interval(self.detect_interval_millis)
+        tolerance.resolver = self._detector_resolver
+        tolerance.service_detector = self._detector_probe
+        self._mq_fault_strategy.set_start_detector_enable(self.start_detector_enable)
+        self._mq_fault_strategy.start_detector()
 
     def _start_trace_dispatcher(self) -> None:
         """对应 Java DefaultMQProducer.start():380-405。
@@ -1030,7 +1094,7 @@ class DefaultMQProducer:
             # clientId 从 groupChannelTable 摘掉。不发的话只能等心跳超时（默认 ~120s）清理，
             # 这段时间 broker 仍认为该组有连接（`examineProducerConnectionInfo` 看得见、
             # 事务回查也会挑到这个已经退出的 channel）。
-            # ⚠ 必须在 _mq_client.shutdown() **之前**：35 只能走还开着的长连接，
+            # ⚠ 必须在实例真正关闭（引用计数归零时的 shutdown）**之前**：35 只能走还开着的长连接，
             #   broker 侧也只摘除「这条 frame 到达的那条 channel」（ClientManageProcessor:226-230）。
             # 与消费侧同一口径：任何异常只记 debug，shutdown 不因网络抖动抛异常。
             if self._mq_client is not None:
@@ -1039,7 +1103,17 @@ class DefaultMQProducer:
                         self.client_id or "", self.producer_group, "")
                 except Exception as e:  # noqa: BLE001
                     logger.debug("unregister on shutdown failed: %s", e)
-                self._mq_client.shutdown()
+                # 摘掉本生产者的 39 处理器（替身实例没有该接口时跳过）。
+                unregister_handler = getattr(self._mq_client,
+                                             "unregister_transaction_check_handler", None)
+                if unregister_handler is not None:
+                    unregister_handler(self._handle_check_transaction_state)
+                # 对应 Java DefaultMQProducerImpl.shutdown → impl.unregisterProducer →
+                # MQClientInstance.shutdown 的引用计数语义：只有最后一个持有者
+                # （计数归零）才真正关闭实例；同 clientId 还有别的门面在用时，
+                # 实例与其后台线程/长连接继续存活。
+                MQClientManager.get_instance().unregister_client(
+                    self.client_id or "", self._mq_client)
             self._started = False
             # Java DefaultMQProducer.shutdown():410-412：impl.shutdown() 之后关累加器的
             # 两个守卫线程。注意**只停线程**，不清表：在途批次没了守卫线程唤醒，同步

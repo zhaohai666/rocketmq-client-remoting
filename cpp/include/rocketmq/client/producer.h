@@ -64,6 +64,14 @@ public:
         tlsOptionsSet_ = true;
         tlsEnable_ = true;
     }
+    // SOCKS 代理（对齐 Java ClientConfig#socksProxyConfig：addr/username/password，
+    // 另加 type 区分 SOCKS4/SOCKS5，默认 SOCKS5）。须在 start() 之前设置；
+    // remoting 建连（name server + broker）经代理完成 SOCKS CONNECT 后再走 TLS/帧，
+    // 动态取址的 HTTP 请求不走代理。
+    void setSocksProxy(const SocksProxyConfig& proxy) {
+        socksProxy_ = proxy;
+        socksProxySet_ = true;
+    }
     // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
     void setEnableTraceContext(bool b) { enableTraceContext_ = b; }
     void setSendMsgTimeout(int32_t millis) { sendMsgTimeout_ = millis; }
@@ -177,6 +185,30 @@ public:
     void setSendLatencyFaultEnable(bool enable) { mqFaultStrategy_.setSendLatencyFaultEnable(enable); }
     bool isSendLatencyFaultEnable() const { return mqFaultStrategy_.isSendLatencyFaultEnable(); }
     MQFaultStrategy& mqFaultStrategy() { return mqFaultStrategy_; }
+
+    // ---------------- 故障规避主动探测（对应 Java ClientConfig 的三个探测配置）----------------
+    // startDetectorEnable：后台可达性探测开关（Java system property
+    // com.rocketmq.startDetectorEnable），默认 false 与 Java 一致。开启后 start() 会起
+    // 一根探测线程：固定 3s 一跳（Java scheduleAtFixedRate(3,3,SECONDS)），每跳对容错表里
+    // 到期的 broker 用 GET_MAX_OFFSET(30) 探活（ServiceDetector 等价物），探测恢复可达的
+    // broker 从隔离窗口放回（reachable 翻回 true）。开关每跳都读，运行期改也生效。
+    void setStartDetectorEnable(bool enable) { mqFaultStrategy_.setStartDetectorEnable(enable); }
+    bool isStartDetectorEnable() const { return mqFaultStrategy_.isStartDetectorEnable(); }
+    // 单次探测的超时预算（Java ClientConfig#detectTimeout，默认 200ms）
+    void setDetectTimeout(int32_t millis) {
+        mqFaultStrategy_.latencyFaultTolerance().setDetectTimeout(millis);
+    }
+    int32_t getDetectTimeout() const {
+        return mqFaultStrategy_.latencyFaultTolerance().detectTimeout();
+    }
+    // 故障表里每个 broker 的探测周期（Java ClientConfig#detectInterval，默认 2000ms）。
+    // 注意实际节奏取 max(3s 固定跳, detectInterval)。
+    void setDetectInterval(int32_t millis) {
+        mqFaultStrategy_.latencyFaultTolerance().setDetectInterval(millis);
+    }
+    int32_t getDetectInterval() const {
+        return mqFaultStrategy_.latencyFaultTolerance().detectInterval();
+    }
 
     // ---------------- ACL 鉴权（对应 Java DefaultMQProducer(rpcHook)）----------------
     // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance（同一 clientId
@@ -564,6 +596,18 @@ protected:
     // 会因为 broker 找不到客户端而**永远不被回查**。
     int32_t sendHeartbeatToAllBroker();
 
+    // ---------------- 故障规避主动探测（Java DefaultMQProducerImpl.start():272 起的
+    // LatencyFaultToleranceScheduledThread；与 Go 端 fault_detector.go 同口径）----------------
+    // 固定速率 3s 一跳，每跳先看 startDetectorEnable 再跑一 round（Java 的 runnable 同判）。
+    void detectorLoop();
+    // Java DefaultMQProducerImpl#pickTopic：发布信息表的第一个 key。cpp 用「发送过的
+    // topic」记账；为空返回空串（ServiceDetector 此时按不可达上报，与 Java 一致）。
+    std::string pickDetectTopic();
+    void rememberDetectTopic(const std::string& topic);
+    // ServiceDetector 等价物（Java 构造函数 :155-169 的匿名实现）：对 broker 发一笔
+    // GET_MAX_OFFSET(30)（queueId=0），传输/路由/存储任何一环不通都算不可达。
+    bool detectBrokerByMaxOffset(const std::string& addr, int32_t timeoutMillis);
+
     // 最近一次 sendMessageInTransaction 使用的监听器（broker 回查时回调它）。
     // 裸引用：调用方需保证其生命周期覆盖事务回查（与 Java 的 TransactionListener 引用语义一致）。
     TransactionListener* txListener_ = nullptr;    // 回查处理线程句柄，shutdown 时统一 join 回收
@@ -576,6 +620,18 @@ protected:
     std::atomic<int64_t> lastHeartbeatMs_{0};
     int32_t heartbeatIntervalMillis_ = 30000;
     std::atomic<int32_t> heartbeatCount_{0};
+
+    // ---------------- 故障规避主动探测线程（Java LatencyFaultToleranceImpl 的
+    // scheduled executor；Go 端同题在 fault_detector.go）----------------
+    // start() 尾部起、shutdown() 与心跳线程一起收。每跳先看 startDetectorEnable，
+    // 所以线程常驻与 Java 一样是"空转零开销"的形状，开关可以运行期翻。
+    std::thread detectorThread_;
+    std::atomic<bool> detectorRunning_{false};
+    // ServiceDetector 的候选 topic（Java DefaultMQProducerImpl#pickTopic：发布信息表的
+    // 第一个 key）。cpp 的发布信息缓存在 MQClientInstance 里，这里按"发送过的 topic"
+    // 记账（记账点在 sendDefaultImpl 的 tryToFindTopicPublishInfo 调用点，语义等价）。
+    std::mutex detectTopicsMutex_;
+    std::set<std::string> detectTopics_;
 
     std::string producerGroup_;
     std::string instanceName_ = "DEFAULT";
@@ -592,6 +648,9 @@ protected:
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
     TlsOptions tlsOptions_;
     bool tlsOptionsSet_ = false;
+    // SOCKS 代理（start() 时透传给 MQClientInstance -> RemotingClient）
+    SocksProxyConfig socksProxy_;
+    bool socksProxySet_ = false;
     // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释和
     // Python/C# 一致；写死 false 会让这条 env 开关形同虚设。
     bool enableTraceContext_ = traceContextEnabledFromEnv();

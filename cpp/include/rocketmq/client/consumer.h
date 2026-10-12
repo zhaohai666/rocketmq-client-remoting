@@ -284,7 +284,15 @@ public:
         tlsOptionsSet_ = true;
         tlsEnable_ = true;
     }
-    // 弹出后对其它实例不可见的时长（popInvisibleTime 默认 60000）
+    // SOCKS 代理（对齐 Java ClientConfig#socksProxyConfig：addr/username/password，
+    // 另加 type 区分 SOCKS4/SOCKS5，默认 SOCKS5）。须在 start() 之前设置；
+    // remoting 建连（name server + broker）经代理完成 SOCKS CONNECT 后再走 TLS/帧，
+    // 动态取址的 HTTP 请求不走代理。
+    void setSocksProxy(const SocksProxyConfig& proxy) {
+        socksProxy_ = proxy;
+        socksProxySet_ = true;
+    }
+    // 弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）
     void setPopInvisibleTime(int64_t t) { popInvisibleTime_ = t; }
     int64_t popInvisibleTime() const { return popInvisibleTime_; }
     // 单次 POP 的最大条数（popBatchNums 默认 32；broker 侧 >32 会回 INVALID_PARAMETER）
@@ -821,6 +829,9 @@ private:
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
     TlsOptions tlsOptions_;
     bool tlsOptionsSet_ = false;
+    // SOCKS 代理（start() 时透传给 MQClientInstance -> RemotingClient）
+    SocksProxyConfig socksProxy_;
+    bool socksProxySet_ = false;
     int64_t popInvisibleTime_ = 60000;
     int32_t popBatchNums_ = 32;
     int32_t popThresholdForQueue_ = 96;

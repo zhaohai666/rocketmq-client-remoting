@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **59** modules under `src/` and then runs the **11** offline smoke suites; measured **ALL GREEN** on 2026-10-10. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **60** modules under `src/` and then runs the **12** offline smoke suites; measured **ALL GREEN** on 2026-10-11. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -39,6 +39,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/ns_failover_smoke.ts` | 12 checks passed |
 | `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
 | `test/pull_balance_view_smoke.ts` | 14 passed / 0 failed |
+| `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
 
 Run an example against a live cluster:
 
@@ -252,6 +253,19 @@ producer.setTlsOptions({ caCert, clientCert, clientKey, serverName }); // null =
 
 Supported by Producer / PushConsumer / LitePullConsumer; `tlsEnable` is process-wide — the NameServer connection goes through TLS as well.
 
+### SOCKS proxy
+
+```ts
+// Mirrors Java ClientConfig#socksProxyConfig (SocksProxyConfig: addr/username/password)
+producer.setSocksProxyConfig({ addr: '127.0.0.1:1080' });                               // SOCKS5, no auth
+producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', username: 'u', password: 'p' }); // SOCKS5 RFC 1929 subnegotiation
+producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });                   // SOCKS4/4a
+```
+
+- The SOCKS CONNECT handshake runs after the TCP connect and BEFORE the TLS handshake (Java's Socks5ProxyHandler sits before the SSL handler in the pipeline); `version` defaults to 5, or 4 / `'SOCKS4'` (domain targets fall back to the SOCKS4a 0.0.0.1 sentinel).
+- Applies to all remoting connections (NameServer + Broker, Java's `0.0.0.0/0` behaviour); **TopAddressing's HTTP route fetch does NOT go through the proxy**.
+- Supported by Producer / PushConsumer; the environment variable `ROCKETMQ_SOCKS_PROXY_CONFIG` accepts the same JSON (Java's `{"0.0.0.0/0": {...}}` shape or a bare object).
+
 ## Features and Status
 
 - ✅ Protocol layer: `RemotingCommand` frame, dual JSON + RocketMQ binary serialization, V2 short-key headers, fault-tolerant parsing, 17-segment/6-segment message encode/decode
@@ -265,7 +279,7 @@ Supported by Producer / PushConsumer / LitePullConsumer; `tlsEnable` is process-
 - ✅ Two namespace mechanisms: `namespace` prefix + `namespaceV2` wire stamping; clientId `<ip>@<instanceName>[@<unitName>][@STREAM]`
 - ✅ Six queue allocation strategies: AVG / AVG_BY_CIRCLE / CONFIG / MACHINE_ROOM / MACHINE_ROOM_NEARBY / CONSISTENT_HASH
 - ✅ Message tracing (encode/decode + async dispatcher + send/receive hooks), consume statistics (differential window + 307 statusTable), W3C traceparent
-- ✅ Three compression types: zlib / LZ4 (Frame) / ZSTD; TLS opt-in
+- ✅ Three compression types: zlib / LZ4 (Frame) / ZSTD; TLS opt-in; SOCKS4/5 proxy (mirrors ClientConfig#socksProxyConfig)
 - ✅ NameServer failover (client-side address switching and route re-fetch)
 
 ## Client Logging
@@ -335,7 +349,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, allocation, offsets, tracing, stats, namespace, POP)
-├── selfcheck.ts         # one-shot offline check (module load + 11 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 12 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

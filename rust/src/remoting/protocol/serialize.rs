@@ -342,7 +342,7 @@ pub mod fastjson {
                 return Err(Error::Decode(format!(
                     "unexpected token at offset {}: {:?}",
                     self.pos,
-                    &rest.chars().take(20).collect::<String>()
+                    rest.chars().take(20).collect::<String>()
                 )));
             }
             let raw = &rest[..end];

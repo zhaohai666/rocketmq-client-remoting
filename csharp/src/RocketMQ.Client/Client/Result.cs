@@ -5,7 +5,7 @@
 //                                       MessageQueueSelector, LocalTransactionState,
 //                                       TransactionListener, SendCallback}
 //   org.apache.rocketmq.client.consumer.listener.{ConsumeConcurrentlyStatus, ...}
-//   org.apache.rocketmq.client.consumer.PullResult / PullStatus
+//   org.apache.rocketmq.client.consumer.PullResult / PullStatus / PullCallback
 using System.Globalization;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -153,6 +153,18 @@ public sealed class PullResult
     public bool IsFound => Status == PullStatus.Found;
 
     public bool IsNoNewMsg => Status == PullStatus.NoNewMsg;
+}
+
+/// <summary>org.apache.rocketmq.client.consumer.PullCallback（异步拉取的结果转交）。</summary>
+public interface IPullCallback
+{
+    void OnSuccess(PullResult pullResult);
+
+    /// <summary>对应 Java <c>onException(Throwable e)</c>：口径同
+    /// <see cref="ISendCallback.OnException"/> —— 交出异常对象本身（broker 回错是
+    /// <see cref="MQBrokerException"/>、传输超时是 RemotingTimeoutException、其余是
+    /// <see cref="MQClientException"/>），调用方按类型分流。</summary>
+    void OnException(Exception error);
 }
 
 // ---------------------------------------------------------------- POP 结果

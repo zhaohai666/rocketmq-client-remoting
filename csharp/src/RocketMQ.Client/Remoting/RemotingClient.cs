@@ -106,6 +106,9 @@ public sealed class RemotingClient : IDisposable
     private readonly int _invokeTimeoutMillis;
     private readonly bool _tlsEnable;
     private readonly TlsOptions? _tlsOptions;
+    // SOCKS 代理（对应 Java NettyRemotingClient 的 proxyMap / Socks5ProxyHandler）。
+    // 非 null 时 TCP 直连代理，目标地址只出现在 SOCKS CONNECT 里。
+    private readonly SocksProxyConfig? _socksProxy;
 
     private readonly object _connMutex = new();
     private readonly Dictionary<string, Connection> _conns = new(StringComparer.Ordinal);
@@ -182,7 +185,7 @@ public sealed class RemotingClient : IDisposable
     }
 
     public RemotingClient(int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000,
-        bool? tlsEnable = null, TlsOptions? tlsOptions = null)
+        bool? tlsEnable = null, TlsOptions? tlsOptions = null, SocksProxyConfig? socksProxy = null)
     {
         _connectTimeoutMillis = connectTimeoutMillis;
         _invokeTimeoutMillis = invokeTimeoutMillis;
@@ -190,6 +193,7 @@ public sealed class RemotingClient : IDisposable
         // 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
         _tlsEnable = tlsEnable ?? EnvTlsEnabled();
         _tlsOptions = tlsOptions;
+        _socksProxy = socksProxy;
     }
 
     internal static bool EnvTlsEnabled()
@@ -366,6 +370,43 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// 经 SOCKS 代理建连：TCP 直连<b>代理</b>，完成 SOCKS 握手（CONNECT 到目标）后
+    /// 返回的 socket 已经端到端打通（对应 Java fetchBootstrap/createBootstrap +
+    /// Socks5ProxyHandler 的管道位置 —— 代理握手先于 TLS 与任何 RocketMQ 帧）。
+    /// 目标为主机名时不在本端解析，交给代理解析（对应 Java NoopAddressResolverGroup）。
+    /// </summary>
+    private Socket ConnectViaSocks(string addr, string destHost, int destPort)
+    {
+        SocksProxyConfig proxy = _socksProxy!;
+        ParseAddress(proxy.Addr, out string proxyHost, out string proxyPortStr);
+        int proxyPort = int.TryParse(proxyPortStr, NumberStyles.Integer, CultureInfo.InvariantCulture,
+            out int pp) ? pp : 0;
+        if (proxyHost.Length == 0 || proxyPort is < 1 or > 65535)
+        {
+            throw new RemotingConnectException("invalid socks proxy addr: " + proxy.Addr);
+        }
+
+        Socket sock = ConnectWithTimeout(proxyHost, proxyPort, _connectTimeoutMillis, out string error);
+        if (sock is null)
+        {
+            throw new RemotingConnectException("socks proxy " + proxy.Addr + " connect failed: " + error);
+        }
+
+        try
+        {
+            // 握手预算复用 connectTimeoutMillis（对应 Java CONNECT_TIMEOUT_MILLIS 盖住整段建连）
+            SocksProxy.Handshake(sock, proxy, destHost, destPort, _connectTimeoutMillis);
+            return sock;
+        }
+        catch (Exception e)
+        {
+            try { sock.Dispose(); } catch { /* ignore */ }
+            throw new RemotingConnectException(addr + " (socks handshake via " + proxy.Addr
+                + ": " + e.Message + ")");
+        }
+    }
+
     /// <summary>"host:port" 拆分，支持 IPv6 的 [::1]:10911 形式。</summary>
     public static void ParseAddress(string addr, out string host, out string port)
     {
@@ -415,10 +456,19 @@ public sealed class RemotingClient : IDisposable
         // 建连放到锁外，避免慢 connect 阻塞其它地址
         ParseAddress(addr, out string host, out string portStr);
         int port = int.TryParse(portStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int p) ? p : 0;
-        Socket sock = ConnectWithTimeout(host, port, _connectTimeoutMillis, out string error);
-        if (sock is null)
+
+        Socket sock;
+        if (_socksProxy is not null)
         {
-            throw new RemotingConnectException(error);
+            sock = ConnectViaSocks(addr, host, port);
+        }
+        else
+        {
+            sock = ConnectWithTimeout(host, port, _connectTimeoutMillis, out string error);
+            if (sock is null)
+            {
+                throw new RemotingConnectException(error);
+            }
         }
 
         var conn = new Connection { Addr = addr, Sock = sock };

@@ -238,14 +238,27 @@ public sealed class DefaultMQAdminExt
         // 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它）。
         // admin 在 Java 里既不置 unitMode 也不置 stream，默认全关。
         IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-        _mqClient = new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
-            pollNameServerIntervalMillis: _pollNameServerIntervalMillis);
+        // 跨门面复用（Java DefaultMQAdminExtImpl 也走 getOrCreateMQClientInstance）：同
+        // clientId 命中即复用已有实例，只有第一个到达者的实例级参数生效；Start 是幂等的。
+        _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
+            () => new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
+                pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
         if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
         {
             ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="
                 + _clientId + ")");
         }
-        _mqClient.Start();
+        try
+        {
+            _mqClient.Start();
+        }
+        catch
+        {
+            // 起不来就把引用还回去：否则计数漏减，共享实例永远等不到归零收尾
+            MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+            _mqClient = null;
+            throw;
+        }
 
         _started = true;
     }
@@ -254,7 +267,13 @@ public sealed class DefaultMQAdminExt
     {
         if (!_started) return;
         _started = false;
-        _mqClient?.Shutdown();
+        // 归还引用（Java MQAdminExt 注销后那句 mQClientFactory.shutdown() 的等价物）：
+        // 计数归零才真正关停实例。
+        if (_mqClient is not null)
+        {
+            MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
+            _mqClient = null;
+        }
     }
 
     public bool IsStarted => _started;
@@ -1656,6 +1675,52 @@ public sealed class DefaultMQAdminExt
         throw new MQClientException(
             "viewMessage failed: neither offset msgId nor uniq key matched message " + msgId
             + " of " + topic, byIdError, ResponseCode.NoMessage);
+    }
+
+    /// <summary>
+    /// 对应 Java DefaultMQAdminExtImpl#consumeMessageDirectly:1323 →
+    /// CONSUME_MESSAGE_DIRECTLY(309)：先 <see cref="ViewMessage" /> 定位消息，再向
+    /// **存储该消息的 broker**（msg.storeHost）下发"直接消费"探针 —— broker 把消息转发给
+    /// 目标 clientId 的在线消费者，回传其监听器判定（ConsumeMessageDirectlyResult）。
+    /// msgId 解出 uniqKey 时改传 offset msgId（Java MessageClientExt.getOffsetMsgId 同口径；
+    /// broker 侧要用物理位点在 commitLog 找到消息体才能转发）。
+    /// 非 SUCCESS 响应由 <c>InvokeSync</c> 抛 MQBrokerException（Java 的
+    /// MQClientException(code, remark) 同语义）。
+    /// </summary>
+    public ConsumeMessageDirectlyResult ConsumeMessageDirectly(string consumerGroup, string clientId,
+        string topic, string msgId)
+    {
+        MessageExt msg = ViewMessage(topic, msgId);
+        // Java：消息带 UNIQ_KEY ⇒ (MessageClientExt).getOffsetMsgId()；nodeJs 端同样加了
+        // offsetMsgId 非空守卫 —— 解码侧没拿到物理 ID 时原样透传，宁可信调用方给的原始 msgId。
+        string outMsgId = msgId;
+        if (msg.Properties.TryGetValue(MessageConst.PropertyUniqClientMessageIdKeyidx, out string? uniq)
+            && !string.IsNullOrEmpty(uniq)
+            && !string.IsNullOrEmpty(msg.OffsetMsgId))
+        {
+            outMsgId = msg.OffsetMsgId;
+        }
+
+        PropertyMap ext = new()
+        {
+            ["consumerGroup"] = consumerGroup,
+            ["clientId"] = clientId,
+            ["msgId"] = outMsgId,
+            ["topic"] = topic,
+        };
+        RemotingCommand response = RequireClient().InvokeSync(AddrForRpc(msg.StoreHostString),
+            RequestCode.ConsumeMessageDirectly, ext, null, false, _timeoutMillis);
+        if (response.Body.Length == 0)
+        {
+            throw new MQClientException("no consume result for client " + clientId);
+        }
+
+        if (!ConsumeMessageDirectlyResult.Decode(response.Body, out ConsumeMessageDirectlyResult result))
+        {
+            throw new MQClientException("bad ConsumeMessageDirectlyResult body for client " + clientId);
+        }
+
+        return result;
     }
 
     public QueryConsumeQueueResponseBody QueryConsumeQueue(string brokerAddr, string topic,

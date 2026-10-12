@@ -29,6 +29,7 @@
 
 #include "rocketmq/remoting/protocol/remoting_command.h"
 #include "rocketmq/remoting/rpchook.h"
+#include "rocketmq/remoting/socks_proxy.h"
 
 namespace rocketmq {
 
@@ -183,6 +184,18 @@ public:
     // 调用；caCert 非空时 setTlsEnable(true) 会创建严格校验的 SSL_CTX（证书链 + 主机名）。
     // 若 TLS 已开启则立即重建 ctx（options 变了 ctx 必须跟着变），失败抛 RemotingException。
     void setTlsOptions(const TlsOptions& options);
+
+    // ---- SOCKS 代理（对齐 Java ClientConfig#socksProxyConfig + NettyRemotingClient 的
+    // createBootstrap(SocksProxyConfig)）----
+    // 必须在首条连接建立前设置。开启后所有 remoting 连接（name server 与 broker）先 TCP
+    // 连到代理、完成 SOCKS CONNECT 握手建立隧道，再做 TLS 握手与 RocketMQ 帧 —— 与 Java
+    // 把 Socks5ProxyHandler 加在 pipeline 最前（SSL handler 之前）的顺序一致。目标地址
+    // 不在本端解析（SOCKS5 域名 ATYP 直传，DNS 由代理侧完成）。
+    // 注意：TopAddressing 的动态取址 HTTP 请求**不走**代理（Java 的 proxy 也只挂在
+    // Netty bootstrap 上，wsAddr 取址路径不经过它）。
+    void setSocksProxy(const SocksProxyConfig& proxy);
+    // 是否已配置代理（测试/诊断用）
+    bool socksProxyEnabled() const;
 
     // ---- GO_AWAY（对应 Java NettyClientConfig.enableReconnectForGoAway，默认 true）----
     // broker / proxy 优雅下线时给在途请求回 ResponseCode.GO_AWAY(1500)，语义是

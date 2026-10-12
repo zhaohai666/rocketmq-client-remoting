@@ -79,6 +79,12 @@ type ClientConfig struct {
 	// On GO_AWAY(1500) retry once over a fresh connection; off -> the
 	// SendRequest error surfaces directly (enableReconnectForGoAway = false).
 	EnableReconnectForGoAway bool
+	// SocksProxy, when set, tunnels every remoting TCP connection through the
+	// SOCKS proxy (Java NettyClientConfig#socksProxyConfig -> SocksProxyConfig):
+	// TCP connect to the proxy, SOCKS CONNECT to the target host, TLS (if
+	// enabled) layered on top of the tunnel. The address-server HTTP fetch
+	// (TopAddressing) is client-layer and NOT proxied.
+	SocksProxy *SocksProxyConfig
 }
 
 func NewClientConfig() ClientConfig {
@@ -544,10 +550,18 @@ func (c *RemotingClient) connect(addr string) (*connection, error) {
 	if timeout <= 0 {
 		timeout = time.Second
 	}
-	dialer := &net.Dialer{Timeout: timeout}
-	raw, err := dialer.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
-	if err != nil {
-		return nil, common.ConnectError(addr)
+	var raw net.Conn
+	if c.config.SocksProxy != nil {
+		raw, err = dialSocksProxy(c.config.SocksProxy, host, port, timeout)
+		if err != nil {
+			return nil, common.ConnectError(fmt.Sprintf("%s (via socks proxy %s: %v)", addr, c.config.SocksProxy.Addr, err))
+		}
+	} else {
+		dialer := &net.Dialer{Timeout: timeout}
+		raw, err = dialer.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			return nil, common.ConnectError(addr)
+		}
 	}
 	if c.config.TLSEnable {
 		raw, err = c.wrapTLS(raw, host, addr)

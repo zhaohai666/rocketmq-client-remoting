@@ -15,6 +15,7 @@ use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PermName;
 use RocketMQ\Common\TopicConfig;
 use RocketMQ\Remoting\Protocol\ClusterInfo;
+use RocketMQ\Remoting\Protocol\ConsumeMessageDirectlyResult;
 use RocketMQ\Remoting\Protocol\ConsumeStats;
 use RocketMQ\Remoting\Protocol\ConsumeStatsList;
 use RocketMQ\Remoting\Protocol\ConsumerConnection;
@@ -37,6 +38,7 @@ use RocketMQ\Remoting\Protocol\TopicRouteData;
 use RocketMQ\Remoting\Protocol\TopicStatsTable;
 use RocketMQ\Remoting\Protocol\RemotingSerializable;
 use RocketMQ\Remoting\RPCHook;
+use RocketMQ\Remoting\SocksProxyConfig;
 // 命名空间级函数（定义于 AdminBodies.php；该文件随其中任一类被 autoload 时一并生效）
 use function RocketMQ\Remoting\Protocol\message_queue_key;
 
@@ -112,7 +114,14 @@ class DefaultMQAdminExt
     public ?array $tlsOptions = null;
 
     /**
-     * 路由刷新周期，默认 30000ms；
+     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
+     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
+     * 只在 start() 建 MQClientInstance 时透传一次。
+     */
+    public ?SocksProxyConfig $socksProxy = null;
+
+    /**
+     * 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
      * 只在 start() 建 MQClientInstance 时透传一次。
      */
     public int $pollNameServerInterval = 30000;
@@ -202,6 +211,18 @@ class DefaultMQAdminExt
         return $this->namespaceV2;
     }
 
+    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
+    public function setSocksProxy(?SocksProxyConfig $proxy): void
+    {
+        $this->socksProxy = $proxy;
+    }
+
+    public function getSocksProxy(): ?SocksProxyConfig
+    {
+        return $this->socksProxy;
+    }
+
+    /** 对应 Java ``ClientConfig#setVipChannelEnabled``。 */
     public function setVipChannelEnabled(bool $enable): void
     {
         $this->vipChannelEnabled = $enable;
@@ -252,6 +273,7 @@ class DefaultMQAdminExt
             unitName: $this->unitName,
             pollNameServerInterval: $this->pollNameServerInterval,
             tlsOptions: $this->tlsOptions,
+            socksProxy: $this->socksProxy,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);
@@ -1691,6 +1713,49 @@ class DefaultMQAdminExt
             ResponseCode::NO_MESSAGE,
             $byIdError,
         );
+    }
+
+    /**
+     * 对应 Java DefaultMQAdminExtImpl.consumeMessageDirectly（:1323-1334）→
+     * MQClientAPIImpl.consumeMessageDirectly（:2741）：向**存有这条消息**的 broker 发
+     * CONSUME_MESSAGE_DIRECTLY(309)，broker 把消息转发给 clientId 指定的客户端真实
+     * 消费一次，应答 body 是客户端回传的 ConsumeMessageDirectlyResult。
+     *
+     * msgId 两条路径对齐 Java：``viewMessage`` 解出的消息带 UNIQ_KEY（5.x 客户端
+     * msgId 的常态）时下发其 offsetMsgId，否则原样下发入参 msgId；寻址一律用消息
+     * 的 storeHost。$brokerAddr 显式给出时跳过 viewMessage 寻址直发（nodeJs 端
+     * 同款可选参数，便于调用方在已知 broker 时省一次查询）。
+     */
+    public function consumeMessageDirectly(
+        string $consumerGroup,
+        string $clientId,
+        string $topic,
+        string $msgId,
+        ?string $brokerAddr = null,
+    ): ConsumeMessageDirectlyResult {
+        $addr = $brokerAddr;
+        $outMsgId = $msgId;
+        if ($addr === null || $addr === '') {
+            $msg = $this->viewMessage($topic, $msgId);
+            $addr = $msg->getStoreHostString();
+            $uniqKey = $msg->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+            if ($uniqKey !== null && $msg->getOffsetMsgId() !== null) {
+                $outMsgId = (string) $msg->getOffsetMsgId();
+            }
+        }
+        if ($addr === null || $addr === '') {
+            throw new MQClientException(sprintf('no broker address for message %s of %s', $msgId, $topic));
+        }
+        $response = $this->invokeBroker($addr, RequestCode::CONSUME_MESSAGE_DIRECTLY, [
+            'consumerGroup' => $consumerGroup,
+            'clientId' => $clientId,
+            'msgId' => $outMsgId,
+            'topic' => $topic,
+        ]);
+        if ($response->body === null || $response->body === '') {
+            throw new MQClientException(sprintf('no consume result for client %s', $clientId));
+        }
+        return ConsumeMessageDirectlyResult::decode($response->body);
     }
 
     public function queryConsumeQueue(string $brokerAddr, string $topic, int $queueId, int $index, int $count = 32, string $consumerGroup = ''): QueryConsumeQueueResponseBody

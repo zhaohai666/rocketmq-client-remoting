@@ -1092,15 +1092,13 @@ mod tests {
                     vec![]
                 };
             }
-            let start_index;
-            let end_index;
-            if modulo > 0 && index < modulo {
-                start_index = index * (average_size + 1);
-                end_index = start_index + average_size + 1;
+            let (start_index, end_index) = if modulo > 0 && index < modulo {
+                let start = index * (average_size + 1);
+                (start, start + average_size + 1)
             } else {
-                start_index = modulo * (average_size + 1) + (index - modulo) * average_size;
-                end_index = start_index + average_size;
-            }
+                let start = modulo * (average_size + 1) + (index - modulo) * average_size;
+                (start, start + average_size)
+            };
             let end = end_index.min(mq_all.len());
             if start_index >= end {
                 return vec![];

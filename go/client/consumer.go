@@ -117,6 +117,7 @@ type DefaultMQPushConsumer struct {
 	unitMode      bool
 	streamRequest bool
 	tlsEnable     *bool
+	socksProxy    *remoting.SocksProxyConfig
 	rpcHook       remoting.RPCHook
 
 	messageModel     string
@@ -157,7 +158,15 @@ type DefaultMQPushConsumer struct {
 	// popShareQueueNum is forwarded verbatim by SET_MESSAGE_REQUEST_MODE(401):
 	// it lets N following consumers in the cid list share this one's queues.
 	popShareQueueNum int32
-	// paused is the SUSPEND_CONSUMER switch.
+	// clientRebalance mirrors Java DefaultMQPushConsumer.clientRebalance
+	// (default TRUE). When false, rebalance stops computing the queue set
+	// locally and asks the broker instead: QUERY_ASSIGNMENT(400) — Java
+	// RebalanceImpl#getRebalanceResultFromBroker. Orderly consumption and
+	// BROADCASTING always stay on the local path (RebalancePushImpl
+	// #clientRebalance), and so does this port: orderly POP is rejected at
+	// config time and broadcasting has nothing to coordinate.
+	clientRebalance bool
+	// paused mirrors Java DefaultMQPushConsumerImpl.pause (SUSPEND_CONSUMER).
 	paused bool
 
 	nameServerAddrs []string
@@ -261,6 +270,7 @@ func NewDefaultMQPushConsumer(consumerGroup string) (*DefaultMQPushConsumer, err
 		popThresholdForQueue:          defaultPopThresholdForQueue,
 		popInvisibleTime:              defaultPopInvisibleTime,
 		popBatchNums:                  defaultPopBatchNums,
+		clientRebalance:               true,
 		allocateStrategy:              AllocateMessageQueueAveragely{},
 		subscription:                  map[string]*remoting.SubscriptionData{},
 		processQueueTable:             map[common.MessageQueue]*processQueue{},
@@ -388,6 +398,15 @@ func (c *DefaultMQPushConsumer) SetTLSEnable(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tlsEnable = &enable
+}
+
+// SetSocksProxy tunnels the consumer's remoting connections through a SOCKS
+// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
+// address-server HTTP fetch (TopAddressing) is not proxied.
+func (c *DefaultMQPushConsumer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.socksProxy = proxy
 }
 
 // SetMessageModel selects CLUSTERING (default) or BROADCASTING.
@@ -554,8 +573,33 @@ func (c *DefaultMQPushConsumer) IsPopMode() bool {
 	return c.popMode
 }
 
-// SetPopInvisibleTime sets how long a popped batch stays invisible (ms).
-// Valid range [5000, 300000]; out of range fails at Start.
+// SetClientRebalance chooses WHO decides the queue set (Java
+// DefaultMQPushConsumer.setClientRebalance, default true).
+//
+//   - true (default): the client computes the assignment itself from the topic
+//     route + the group's client list, exactly as before this knob existed.
+//   - false: the client asks the broker instead — one QUERY_ASSIGNMENT(400)
+//     per subscribed topic per rebalance round, and the answer's queue set
+//     becomes the assignment (Java RebalanceImpl#getRebalanceResultFromBroker).
+//     This is what a Java 5.x push consumer does with clientRebalance=false,
+//     and what a group whose broker-side MessageRequestMode is POP expects:
+//     the broker then applies allocate4Pop, including the popShareQueueNum
+//     sharing and the queueID=-1 "pop every queue of this broker" form.
+func (c *DefaultMQPushConsumer) SetClientRebalance(enable bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clientRebalance = enable
+}
+
+// IsClientRebalance reports the current clientRebalance setting.
+func (c *DefaultMQPushConsumer) IsClientRebalance() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clientRebalance
+}
+
+// SetPopInvisibleTime sets how long a popped batch stays invisible (ms). Java
+// requires [5000, 300000]; out of range fails at Start.
 func (c *DefaultMQPushConsumer) SetPopInvisibleTime(ms int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1114,6 +1158,7 @@ func (c *DefaultMQPushConsumer) Start() error {
 	}
 	c.clientID = common.BuildMQClientID(common.CachedIPStr(), c.instanceName, c.unitName, c.streamRequest)
 	cfg := NewClientInstanceConfig()
+	cfg.SocksProxy = c.socksProxy
 	instance := CreateOrGetInstance(c.clientID, c.nameServerAddrs, cfg)
 	c.instance = instance
 	namespaceV2 := c.namespaceV2
@@ -1522,23 +1567,22 @@ func (c *DefaultMQPushConsumer) checkConfigRangesLocked() error {
 
 // ---------------------------------------------------------------- rebalance
 
-// doRebalance runs rebalanceByTopic for every subscribed topic, then
-// syncPullLoops.
+// doRebalance is Java RebalanceImpl#doRebalance for every subscribed topic,
+// then syncPullLoops.
 //
 // BROADCASTING: every queue is ours, no broker coordination.
-// CLUSTERING: ask the broker for the group's client list -> sort cidAll and
-// mqAll -> run the strategy -> take our slice.
+// CLUSTERING, clientRebalance=true (the default): ask the broker for the
+// group's client list -> sort cidAll and mqAll -> run the strategy -> take our
+// slice (Java rebalanceByTopic).
+// CLUSTERING, clientRebalance=false: the broker decides — one
+// QUERY_ASSIGNMENT(400) per topic (Java getRebalanceResultFromBroker ->
+// MQClientAPIImpl#queryAssignment:405), and the returned MessageQueueAssignment
+// set IS the assignment. POP takes its queues from whichever path produced
+// them, one POP loop per assigned queue either way; the only difference is WHO
+// decides the queue set.
 //
-// A missing consumer list KEEPS the current assignment (warn). Never degrade to
-// "I own everything": co-instances would duplicate every message.
-//
-// POP takes its queues from THIS same client-side rebalance, one POP loop per
-// assigned queue. The reference implementation instead asks the broker
-// (queryAssignment, QUERY_ASSIGNMENT=400, MessageQueueAssignment with mode=POP)
-// whenever clientRebalance is off. That path is deliberately NOT implemented
-// here: the semantics are equivalent — one per-queue POP loop plus ack either
-// way — the only difference is WHO decides the queue set. Do not "fix" this
-// without reading that note first.
+// A missing consumer list KEEPS the current assignment (Java warns). Never
+// degrade to "I own everything": co-instances would duplicate every message.
 func (c *DefaultMQPushConsumer) doRebalance() error {
 	c.mu.Lock()
 	instance := c.instance
@@ -1555,6 +1599,13 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	was := c.assignedSet()
 	var assigned []common.MessageQueue
 	for _, topic := range topics {
+		// Java RebalanceImpl#doRebalance branches on clientRebalance(topic);
+		// RebalancePushImpl forces the local path for orderly and (implicitly,
+		// via rebalanceByTopic) for BROADCASTING.
+		if c.messageModel != MessageModelBroadcasting && !c.isOrderly() && !c.clientRebalanceValue() {
+			assigned = append(assigned, c.assignedFromBroker(topic, was)...)
+			continue
+		}
 		info := instance.GetTopicSubscribeInfo(topic)
 		if len(info) == 0 {
 			common.LogDebugf("rebalance: no subscribe info for topic %s", topic)
@@ -1654,6 +1705,111 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	}
 	c.syncPullLoops()
 	return nil
+}
+
+// queryAssignmentTimeoutMillis is Java RebalanceImpl#QUERY_ASSIGNMENT_TIMEOUT.
+const queryAssignmentTimeoutMillis int64 = 3000
+
+// clientRebalanceValue snapshots the flag.
+func (c *DefaultMQPushConsumer) clientRebalanceValue() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clientRebalance
+}
+
+// assignedFromBroker is Java RebalanceImpl#getRebalanceResultFromBroker:345
+// (the clientRebalance==false branch of doRebalance), with the address lookup
+// of MQClientInstance#queryAssignment:1373: pick a broker by topic route,
+// refreshing the route once when there is none cached yet.
+//
+// The failure/empty semantics are Java's, per case:
+//
+//   - transport or broker error -> log and KEEP the current assignment (Java
+//     returns false; processQueueTable is not touched this round);
+//   - no broker address, even after the refresh -> same ("invalid result",
+//     Java's MQClientInstance answers null);
+//   - SUCCESS with no assignment set at all -> same (the Go decoder maps a
+//     missing set to nil, Java's null);
+//   - SUCCESS with an EMPTY set -> the topic's queues are all revoked: the
+//     broker's doLoadBalance javadoc says "empty set means the client should
+//     clear all load assigned to it before".
+//
+// The mode each assignment carries (POP vs PULL) is observed, not obeyed: this
+// consumer's consumption mode is fixed for its lifetime (popMode), and what the
+// rebalance consumes is the queue SET. A mixed answer is logged, not split —
+// broker serving part of the group's queues in PULL while this client pops is
+// almost always a SET_MESSAGE_REQUEST_MODE that did not land everywhere.
+func (c *DefaultMQPushConsumer) assignedFromBroker(topic string, was map[common.MessageQueue]struct{}) []common.MessageQueue {
+	c.mu.Lock()
+	inst := c.instance
+	group := c.consumerGroup
+	clientID := c.clientID
+	strategy := c.allocateStrategy
+	model := c.messageModel
+	c.mu.Unlock()
+	if inst == nil {
+		return nil
+	}
+	name := strategyName(strategy)
+	addr, err := inst.BrokerAddrForTopic(topic)
+	if err != nil {
+		if _, rerr := inst.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); rerr != nil {
+			common.LogDebugf("queryAssignment: route refresh for %s failed: %v", topic, rerr)
+		}
+		addr, err = inst.BrokerAddrForTopic(topic)
+	}
+	if err != nil {
+		common.LogWarnf("queryAssignment: no broker for topic %s group %s, keep current assignment", topic, group)
+		return keepQueuesOf(was, topic)
+	}
+	assignments, err := inst.QueryAssignment(addr, topic, group, clientID, name, model, queryAssignmentTimeoutMillis)
+	if err != nil {
+		common.LogErrorf("allocate message queue exception. strategy name: %s, topic %s: %v (keep current assignment)",
+			name, topic, err)
+		return keepQueuesOf(was, topic)
+	}
+	if assignments == nil {
+		// Java: "null means invalid result, we should skip the update logic".
+		common.LogWarnf("queryAssignment: no assignment set for topic %s group %s, keep current assignment", topic, group)
+		return keepQueuesOf(was, topic)
+	}
+	// Java collects into a HashSet keyed by MessageQueue (assignment equality
+	// is messageQueue-only), which both dedups and drops null queues.
+	seen := make(map[common.MessageQueue]struct{}, len(assignments))
+	out := make([]common.MessageQueue, 0, len(assignments))
+	popCnt, pullCnt := 0, 0
+	for _, a := range assignments {
+		if a == nil || a.MessageQueue.Topic == "" {
+			continue
+		}
+		if _, dup := seen[a.MessageQueue]; dup {
+			continue
+		}
+		seen[a.MessageQueue] = struct{}{}
+		out = append(out, a.MessageQueue)
+		if a.Mode == remoting.MessageRequestModePop {
+			popCnt++
+		} else {
+			pullCnt++
+		}
+	}
+	if popCnt > 0 && pullCnt > 0 {
+		common.LogWarnf("queryAssignment for %s/%s returned mixed modes (pop=%d pull=%d): the queue set is taken as-is, each queue is consumed per this client's own mode",
+			group, topic, popCnt, pullCnt)
+	}
+	return out
+}
+
+// keepQueuesOf snapshots the current assignment of one topic — the input of
+// every "keep current assignment" fallback above.
+func keepQueuesOf(was map[common.MessageQueue]struct{}, topic string) []common.MessageQueue {
+	var out []common.MessageQueue
+	for mq := range was {
+		if mq.Topic == topic {
+			out = append(out, mq)
+		}
+	}
+	return out
 }
 
 type revokedQueue struct {

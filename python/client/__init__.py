@@ -3,14 +3,16 @@
 from .producer import (DefaultMQProducer, TransactionMQProducer, LocalTransactionState,
                        MessageQueueSelector, SendCallback, TransactionListener)
 from .consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer,
-                       DefaultLitePullConsumer, MessageSelector,
-                       MessageQueueListener, TopicMessageQueueChangeListener,
-                       AllocateMessageQueueStrategy,
+                       DefaultLitePullConsumer, MessageSelector, MessageQueueListener,
+                       TopicMessageQueueChangeListener, AllocateMessageQueueStrategy,
                        AllocateMessageQueueAveragely, AllocateMessageQueueAveragelyByCircle,
                        AllocateMessageQueueByConfig,
                        AllocateMessageQueueConsistentHash,
                        AllocateMessageQueueByMachineRoom,
-                       AllocateMachineRoomNearby, MachineRoomResolver)
+                       AllocateMachineRoomNearby, MachineRoomResolver,
+                       PullCallback)
+from .pull_schedule_service import (PullConsumerScheduleService, PullTaskCallback,
+                                   PullTaskContext)
 from .admin import DefaultMQAdminExt
 from .exception import (MQClientException, MQBrokerException, MQTimeOutException, MQQueueException)
 from .send_result import SendStatus
@@ -38,6 +40,8 @@ __all__ = [
     "AllocateMessageQueueByConfig",
     "AllocateMessageQueueConsistentHash", "AllocateMessageQueueByMachineRoom",
     "AllocateMachineRoomNearby", "MachineRoomResolver",
+    "PullCallback",
+    "PullConsumerScheduleService", "PullTaskCallback", "PullTaskContext",
     "DefaultMQAdminExt",
     "MQClientException", "MQBrokerException", "MQTimeOutException", "MQQueueException",
     "SendStatus",

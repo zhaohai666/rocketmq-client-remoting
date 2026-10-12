@@ -58,6 +58,8 @@ const logger = getLogger('mqclient');
 // ---------------------------------------------------------------------------
 // TopicPublishInfo — holds the shared round-robin cursor used across calls.
 // ---------------------------------------------------------------------------
+export type FacadeProcessor = (cmd: RemotingCommand, addr: string) => RemotingCommand | null;
+
 export class TopicPublishInfo {
   orderTopic: boolean;
   msgQueueList: MessageQueue[];
@@ -138,6 +140,17 @@ export class MQClient {
   // 每次路由拉取都纯随机单挑 —— 撞上死的那台整个调用直接失败。
   _namesrvChosen: string | null;
   _running: boolean;
+  // 门面级反向请求处理器（共享实例的多播，对应 C# 端为此新加的
+  // RegisterFacadeProcessor）：Java 把 CHECK_TRANSACTION_STATE(39)/
+  // GET_CONSUMER_RUNNING_INFO(307)/RESET_CONSUMER_CLIENT_OFFSET(220)/
+  // GET_CONSUMER_STATUS_FROM_CLIENT(221)/CONSUME_MESSAGE_DIRECTLY(309)/
+  // NOTIFY_CONSUMER_IDS_CHANGED(36) 的处理器挂在**实例级**的
+  // ClientRemotingProcessor 上。remoting 的处理器表里一个 code 只有一个槽 ——
+  // 门面各自往共享实例的 remotingClient 上 registerProcessor 会互相顶掉
+  // （后启动的覆盖先启动的，先启动的门面从此收不到反向请求）。这里收拢成
+  // 实例级多播：同 code 有几个门面登记就扇出给几个，第一个非 null 的应答回给
+  // 传输层（oneway 类处理器一律返回 null，单登记时与直连行为完全一致）。
+  private _facadeProcessors: Map<number, FacadeProcessor[]>;
 
   constructor(
     clientId: string,
@@ -165,6 +178,7 @@ export class MQClient {
     this._adjustThreadPoolTimer = null;
     this._namesrvChosen = null;
     this._running = false;
+    this._facadeProcessors = new Map();
   }
 
   // ---- name server ----
@@ -884,8 +898,64 @@ export class MQClient {
   getRegisteredConsumers(): Map<string, any> { return this.consumerTable; }
   getRegisteredProducers(): Map<string, any> { return this.producerTable; }
 
+  // ---- 门面级反向请求处理器（共享实例的多播） ----
+  // 门面把反向请求处理器登记到实例（共享实例下按登记人数扇出，不互相覆盖）。
+  // 注意：同一个 code 不要混用 remotingClient.registerProcessor 直连槽 —— 直连
+  // 会顶掉这里的分发器。实例自带的 39/326 处理器同样经由这里登记。
+  registerFacadeProcessor(requestCode: number, handler: FacadeProcessor): void {
+    let list = this._facadeProcessors.get(requestCode);
+    if (list == null) {
+      list = [];
+      this._facadeProcessors.set(requestCode, list);
+      this.remotingClient.registerProcessor(requestCode, (cmd: RemotingCommand, addr: string) =>
+        this.dispatchFacadeProcessor(cmd, addr));
+    }
+    list.push(handler);
+  }
+
+  // 门面退出时摘除自己的处理器；最后一个摘除者负责卸掉传输层的槽。
+  unregisterFacadeProcessor(requestCode: number, handler: FacadeProcessor): void {
+    const list = this._facadeProcessors.get(requestCode);
+    if (list == null) return;
+    const idx = list.indexOf(handler);
+    if (idx >= 0) list.splice(idx, 1);
+    if (list.length === 0) {
+      this._facadeProcessors.delete(requestCode);
+      this.remotingClient.unregisterProcessor(requestCode);
+    }
+  }
+
+  // 驱动一次门面处理器的多播分派：**广播** —— 该 code 的每一个登记者都被唤起
+  // （共享实例上的 CHECK_TRANSACTION_STATE(39) 等反向请求要能分发到多个门面），
+  // 回给传输层的是第一个非 null 应答；一个门面的处理器出错不影响其余登记者
+  // （对应 Java ClientRemotingProcessor 整段 try-catch 的兜法）。oneway 类处理器
+  // 一律返回 null；单登记者时与直连行为完全一致。
+  dispatchFacadeProcessor(cmd: RemotingCommand, addr: string): RemotingCommand | null {
+    const list = this._facadeProcessors.get(cmd.code);
+    if (list == null || list.length === 0) return null;
+    let first: RemotingCommand | null = null;
+    for (const handler of list.slice()) {
+      try {
+        const resp = handler(cmd, addr);
+        if (resp != null && first == null) first = resp;
+      } catch (e) {
+        logger.warning('facade processor for code %s failed: %s', cmd.code, (e as Error).message);
+      }
+    }
+    return first;
+  }
+
+  // 某 code 当前登记了几个门面处理器（测试观测面：共享实例下互不覆盖的落点）。
+  facadeProcessorCount(requestCode: number): number {
+    const list = this._facadeProcessors.get(requestCode);
+    return list != null ? list.length : 0;
+  }
+
   // ---- lifecycle ----
+  // Java MQClientInstance.start 的 startOK.compareAndSet(false, true) 守卫：
+  // 共享实例下每个门面的 start() 都会调到这里，后台任务只允许拉起一次。
   start(): void {
+    if (this._running) return;
     this._running = true;
     this._registerTransactionCheckProcessor();
     this._registerReplyMessageProcessor();
@@ -982,8 +1052,9 @@ export class MQClient {
     if (typeof (this._heartbeatTimer as any).unref === 'function') this._heartbeatTimer.unref();
   }
 
-  private async sendHeartbeatToAllBrokers(): Promise<void> {
-    // Heartbeats go to EVERY broker entry (masters and slaves).
+  // 公开：门面的 start()（pull / lite-pull consumer）与路由刷新都直接用它。
+  async sendHeartbeatToAllBrokers(): Promise<void> {
+    // Java sends the heartbeat to EVERY broker entry (masters and slaves).
     const entries = this.getAllBrokerAddrEntries();
     logger.debug('heartbeat beat to %d broker(s)', entries.length);
     for (const { addr } of entries) {
@@ -991,13 +1062,16 @@ export class MQClient {
     }
   }
 
-  // Broker-initiated transaction check: the broker's transaction-poll thread
-  // sends CHECK_TRANSACTION_STATE to the client; the client replies SUCCESS at
-  // once, then runs the listener check OFF the read thread (hard rule: a
+  // Java ClientRemotingProcessor.checkTransactionState + DefaultMQPushConsumerImpl
+  // .checkTransactionState: the broker's transaction-poll thread sends
+  // CHECK_TRANSACTION_STATE to the client; the client replies SUCCESS at once,
+  // then runs the listener check OFF the read thread (hard rule: a
   // broker-initiated request handler must NEVER issue a synchronous request
   // inline — self deadlock) and finally fires END_TRANSACTION oneway.
+  // 经实例级多播登记（而非直连 registerProcessor 槽）：共享实例上多个 producer
+  // 的反向请求分发与门面自己的处理器扇出共存、互不覆盖。
   private _registerTransactionCheckProcessor(): void {
-    this.remotingClient.registerProcessor(RequestCode.CHECK_TRANSACTION_STATE, (cmd: RemotingCommand, addr: string) => {
+    this.registerFacadeProcessor(RequestCode.CHECK_TRANSACTION_STATE, (cmd: RemotingCommand, addr: string): RemotingCommand | null => {
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, '');
       let msg: MessageExt | null = null;
       try {
@@ -1055,7 +1129,7 @@ export class MQClient {
   // the in-flight request future (atomically removed so the timeout-scan path
   // cannot double-resolve).
   private _registerReplyMessageProcessor(): void {
-    this.remotingClient.registerProcessor(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, (cmd: RemotingCommand, _addr: string) => {
+    this.registerFacadeProcessor(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, (cmd: RemotingCommand, _addr: string): RemotingCommand | null => {
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, '');
       try {
         const ext = cmd.extFields || {};

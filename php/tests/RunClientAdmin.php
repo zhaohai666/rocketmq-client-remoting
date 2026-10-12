@@ -25,6 +25,7 @@ use RocketMQ\Client\Exceptions\RemotingConnectException;
 use RocketMQ\Client\MQClientInstance;
 use RocketMQ\Client\MessageTrack;
 use RocketMQ\Client\TrackType;
+use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MessageExt;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\MixAll;
@@ -32,6 +33,7 @@ use RocketMQ\Common\PermName;
 use RocketMQ\Common\TopicConfig;
 use RocketMQ\Remoting\Protocol\BrokerData;
 use RocketMQ\Remoting\Protocol\ClusterInfo;
+use RocketMQ\Remoting\Protocol\ConsumeMessageDirectlyResult;
 use RocketMQ\Remoting\Protocol\ConsumeStats;
 use RocketMQ\Remoting\Protocol\ConsumeStatsList;
 use RocketMQ\Remoting\Protocol\ConsumerConnection;
@@ -1641,6 +1643,69 @@ final class RunClientAdmin
             '321 ext'
         );
         $this->checkSame(88, $got18->maxQueueIndex, '321 解析');
+
+        // consumeMessageDirectly：offset msgId 全链路 → viewMessage 定位 storeHost + 309 下发
+        $admin19 = $this->newAdmin();
+        $stored = new MessageExt(topic: 'T', body: 'vb');
+        $stored->setStoreHost('10.0.0.9');
+        $stored->storeHostPort = 10911;
+        $admin19->handler = function (RemotingCommand $cmd) use ($stored) {
+            if ($cmd->code === RequestCode::VIEW_MESSAGE_BY_ID) {
+                return $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($stored));
+            }
+            return $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
+        };
+        $res19 = $admin19->consumeMessageDirectly('G1', 'cid-1', 'T', '7f00000100002a9f0000000000000064');
+        $byId = $admin19->requests[0]['cmd'];
+        $direct = $admin19->requests[1]['cmd'];
+        $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $byId->code, '309 前置 viewMessage 定位');
+        $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $direct->code, 'CONSUME_MESSAGE_DIRECTLY=309');
+        $this->checkSame('10.0.0.9:10911', $admin19->requests[1]['addr'], '309 发给消息 storeHost');
+        $this->checkSame(
+            ['consumerGroup' => 'G1', 'clientId' => 'cid-1', 'msgId' => '7f00000100002a9f0000000000000064', 'topic' => 'T'],
+            $direct->extFields,
+            '309 ext（无 UNIQ_KEY 时 msgId 原样下发）'
+        );
+        $this->check($res19 instanceof ConsumeMessageDirectlyResult, '309 body 解码为 ConsumeMessageDirectlyResult');
+
+        // consumeMessageDirectly：带 UNIQ_KEY 的消息 → 下发 offsetMsgId
+        $admin20 = $this->newAdmin();
+        $uniqMsg = new MessageExt(topic: 'T', body: 'vb');
+        $uniqMsg->setStoreHost('10.0.0.9');
+        $uniqMsg->storeHostPort = 10911;
+        $uniqMsg->putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, 'uniq-abc');
+        $uniqMsg->setOffsetMsgId('7f00000100002a9f0000000000000065');
+        // uniqKey 形态的 msgId 硬解必失败 → viewMessage 兜底走 uniq 查询，替身从这里回消息
+        $this->client->queryMessageResult = [$uniqMsg];
+        $admin20->handler = function (RemotingCommand $cmd) use ($uniqMsg) {
+            if ($cmd->code === RequestCode::VIEW_MESSAGE_BY_ID) {
+                return $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($uniqMsg));
+            }
+            return $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
+        };
+        $admin20->consumeMessageDirectly('G1', 'cid-1', 'T', 'uniq-abc');
+        $this->checkSame(1, count($admin20->requests), '309 uniqKey 硬解失败 → 不发 VIEW_MESSAGE_BY_ID');
+        $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $admin20->requests[0]['cmd']->code, '309 uniqKey 兜底直达');
+        $this->checkSame('10.0.0.9:10911', $admin20->requests[0]['addr'], '309 uniqKey 兜底仍发 storeHost');
+        $this->checkSame('7f00000100002a9f0000000000000065', $admin20->requests[0]['cmd']->extFields['msgId'] ?? null, '309 带 UNIQ_KEY → 下发 offsetMsgId（Java 两路径）');
+
+        // consumeMessageDirectly：显式 brokerAddr 跳过 viewMessage 直发
+        $admin21 = $this->newAdmin();
+        $admin21->handler = fn() => $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
+        $admin21->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1');
+        $this->checkSame(1, count($admin21->requests), '309 显式 brokerAddr 不做 viewMessage');
+        $this->checkSame('b:1', $this->lastAddr($admin21), '309 直发指定地址');
+        $this->checkSame('m-1', $this->lastCmd($admin21)->extFields['msgId'] ?? null, '309 显式地址 msgId 原样');
+
+        // consumeMessageDirectly：空 body → 抛；非 SUCCESS → MQBrokerException
+        $admin22 = $this->newAdmin();
+        $admin22->handler = fn() => $this->okResponse(null);
+        $this->checkThrows(fn() => $admin22->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1'), MQClientException::class, '309 空 body 抛');
+        $admin23 = $this->newAdmin();
+        $admin23->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'client offline');
+        $e23 = $this->capture(fn() => $admin23->consumeMessageDirectly('G1', 'cid-1', 'T', 'm-1', 'b:1'));
+        $this->check($e23 instanceof MQBrokerException, '309 非 SUCCESS → MQBrokerException');
+        $this->checkSame('client offline', $e23?->getMessage(), '309 非 SUCCESS 透传 remark');
     }
 
     // ================================================================ 批量 / 运维 / NameServer 配置

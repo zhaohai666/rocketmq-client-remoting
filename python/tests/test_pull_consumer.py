@@ -8,14 +8,20 @@
 from __future__ import annotations
 
 import inspect
+import threading
+import time
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
 
-from client.consumer import DefaultMQPullConsumer
-from client.exception import MQClientException
-from common.message import MessageQueue
+from client.consumer import DefaultMQPullConsumer, PullCallback
+from client.consumer_result import PullResult, PullStatus
+from client.consume_executor import ConsumeExecutor
+from client.exception import MQBrokerException, MQClientException
+from common.message import MessageExt, MessageQueue
 from common.sysflag import PullSysFlag
+from remoting.exception import RemotingTooMuchRequestException
 from remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                                   MessageModel)
 
@@ -357,3 +363,226 @@ class TestFetchMessageQueuesInBalance:
     def test_fresh_consumer_without_broker_returns_empty(self):
         # 没拉过、又查不到 → 空表。Java 在 rebalance 跑之前同样是空集，不是"全部"。
         assert _balance_consumer([], None).fetch_message_queues_in_balance(self._TOPIC) == []
+
+
+# ==================== pull_async（Java pull(K, subString, offset, maxNums,
+# PullCallback, timeout) 的本端移植）====================
+# 事件等待预算：Windows 回环端口有 ~2s 拒连延迟 + 线程调度抖动，一律给 30s。
+_WAIT_TIMEOUT = 30.0
+
+
+class _ScriptedPullClient:
+    """替身 client：pull_message 按脚本回放（值 / 异常），记录线程名与入参。"""
+
+    def __init__(self):
+        self.remoting_client = SimpleNamespace(register_rpc_hook=lambda *a, **k: None)
+        self.script = deque()
+        self.calls = []               # [(mq, offset, timeout_millis, worker_thread)]
+
+    def pull_message(self, consumer_group, mq, queue_offset, max_msg_nums, sys_flag,
+                     commit_offset, subscription, sub_version, expression_type,
+                     timeout_millis=30000, max_msg_bytes=-1,
+                     suspend_timeout_millis=15000, addr=None, request_source=0,
+                     broker_id=None):
+        self.calls.append((mq, queue_offset, timeout_millis,
+                           threading.current_thread().name))
+        if self.script:
+            item = self.script.popleft()
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        return PullResult(PullStatus.FOUND, queue_offset + 1, 0, queue_offset + 1, [])
+
+    def start(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+def _started_async_pull(client=None):
+    c = DefaultMQPullConsumer("PG_AsyncUnit")
+    c.client_id = "cid@fixed"
+    c._mq_client = client or _ScriptedPullClient()
+    c._started = True
+    return c
+
+
+class _CollectingCallback(PullCallback):
+    def __init__(self):
+        self.success = []
+        self.errors = []
+        self.thread_names = []
+        self.done = threading.Event()
+
+    def on_success(self, pull_result):
+        self.thread_names.append(threading.current_thread().name)
+        self.success.append(pull_result)
+        self.done.set()
+
+    def on_exception(self, e):
+        self.thread_names.append(threading.current_thread().name)
+        self.errors.append(e)
+        self.done.set()
+
+
+MQ = MessageQueue("TopicAsyncUnit", "broker-a", 0)
+
+
+class TestPullAsync:
+    def test_before_start_raises_synchronously(self):
+        c = DefaultMQPullConsumer("PG_AsyncUnit")
+        cb = _CollectingCallback()
+        # 与本端 send_async 的有意差别一致：没 start 直接同步抛，不走回调。
+        with pytest.raises(MQClientException):
+            c.pull_async(MQ, "*", 0, 32, cb, 1000)
+        assert cb.done.is_set() is False
+
+    def test_missing_callback_raises(self):
+        c = _started_async_pull()
+        try:
+            with pytest.raises(MQClientException):
+                c.pull_async(MQ)
+        finally:
+            c.shutdown()
+
+    def test_success_delivers_on_callback_thread(self):
+        m = MessageExt("TopicAsyncUnit", b"hi")
+        expected = PullResult(PullStatus.FOUND, 9, 0, 9, [m])
+        client = _ScriptedPullClient()
+        client.script.append(expected)
+        c = _started_async_pull(client)
+        cb = _CollectingCallback()
+        try:
+            begun = time.monotonic()
+            c.pull_async(MQ, "TagA", 4, 16, cb, 3000)
+            # 立即返回：调用方线程不被 RPC 阻塞。
+            assert time.monotonic() - begun < 1.0
+            assert cb.done.wait(_WAIT_TIMEOUT)
+            assert cb.errors == []
+            assert cb.success[0] is expected
+            assert cb.success[0].msg_found_list == [m]
+            # RPC 在 AsyncPullExecutor_、回调在 PullCallbackExecutor_（分工同 producer 双池）。
+            assert client.calls[0][3].startswith("AsyncPullExecutor_"), client.calls
+            assert cb.thread_names[0].startswith("PullCallbackExecutor_"), cb.thread_names
+            # 入参透传 + 预算不放大（timeout-cost ≤ 3000）
+            assert client.calls[0][1] == 4
+            assert client.calls[0][2] <= 3000
+        finally:
+            c.shutdown()
+
+    def test_rpc_failure_goes_to_on_exception(self):
+        client = _ScriptedPullClient()
+        client.script.append(MQBrokerException(11, "pull rejected"))
+        c = _started_async_pull(client)
+        cb = _CollectingCallback()
+        try:
+            c.pull_async(MQ, "*", 0, 32, cb, 3000)
+            assert cb.done.wait(_WAIT_TIMEOUT)
+            assert cb.success == []
+            assert isinstance(cb.errors[0], MQBrokerException)
+        finally:
+            c.shutdown()
+
+    def test_offset_illegal_status_is_a_success_callback(self):
+        # 四个 PullStatus 都是「RPC 成功」；OFFSET_ILLEGAL 不是异常（纠偏交给调用方）。
+        expected = PullResult(PullStatus.OFFSET_ILLEGAL, 42, 40, 90, [])
+        client = _ScriptedPullClient()
+        client.script.append(expected)
+        c = _started_async_pull(client)
+        cb = _CollectingCallback()
+        try:
+            c.pull_async(MQ, "*", 7, 32, cb, 3000)
+            assert cb.done.wait(_WAIT_TIMEOUT)
+            assert cb.errors == []
+            assert cb.success[0] is expected
+        finally:
+            c.shutdown()
+
+    def test_queue_wait_timeout_skips_rpc(self):
+        """排队吃光预算 → 不发请求，直接 on_exception(RemotingTooMuchRequestException)。
+
+        Windows 回环端口有 ~2s 拒连延迟、线程排程也有抖动，所以这里不真等网络超时：
+        预置一个**单线程**拉取池并先塞一个占位任务堵死 worker，再投 timeout=50ms 的
+        pull_async；等待 0.2s 后放行占位任务 —— 出队时 cost 必然 > 预算（只会更大不会
+        更小），走排队超时分支且 **client 没收到任何 RPC**，全程确定性的。
+        """
+        client = _ScriptedPullClient()
+        c = _started_async_pull(client)
+        pool = ConsumeExecutor(1, 1, thread_name_prefix="AsyncPullExecutor",
+                               thread_name_sep="_", thread_index_from=1)
+        c._async_pull_executor = pool
+        blocker_in = threading.Event()
+        hold = threading.Event()
+
+        def _blocker():
+            blocker_in.set()
+            assert hold.wait(_WAIT_TIMEOUT)
+
+        pool.submit(_blocker)
+        assert blocker_in.wait(_WAIT_TIMEOUT)
+        cb = _CollectingCallback()
+        try:
+            c.pull_async(MQ, "*", 1, 32, cb, 50)
+            time.sleep(0.2)  # 预算在队列里被吃光
+            hold.set()
+            assert cb.done.wait(_WAIT_TIMEOUT)
+            assert cb.success == []
+            assert isinstance(cb.errors[0], RemotingTooMuchRequestException), cb.errors
+            assert client.calls == [], "排队超时不得发出请求"
+        finally:
+            hold.set()
+            c.shutdown()
+
+    def test_rejected_when_pool_closed(self):
+        c = _started_async_pull()
+        pool = ConsumeExecutor(1, 1, thread_name_prefix="AsyncPullExecutor",
+                               thread_name_sep="_", thread_index_from=1)
+        c._async_pull_executor = pool
+        cb = _CollectingCallback()
+        pool.shutdown()
+        try:
+            # 队列满/池关 → 同步抛（与 send_async 的 "executor rejected" 同口径）。
+            with pytest.raises(MQClientException):
+                c.pull_async(MQ, "*", 0, 32, cb, 3000)
+            assert cb.done.is_set() is False
+        finally:
+            c.shutdown()
+
+    def test_callback_exception_does_not_break_later_rounds(self):
+        class _Boom(PullCallback):
+            def __init__(self):
+                self.done = threading.Event()
+
+            def on_success(self, pull_result):
+                self.done.set()
+                raise RuntimeError("user callback bug")
+
+            def on_exception(self, e):
+                self.done.set()
+
+        c = _started_async_pull()
+        try:
+            boom = _Boom()
+            c.pull_async(MQ, "*", 0, 32, boom, 3000)
+            assert boom.done.wait(_WAIT_TIMEOUT)
+            # 回调线程里的用户异常只被记日志，池保持存活：下一笔照常投递。
+            third = _CollectingCallback()
+            c.pull_async(MQ, "*", 0, 32, third, 3000)
+            assert third.done.wait(_WAIT_TIMEOUT)
+            assert third.success and third.errors == []
+        finally:
+            c.shutdown()
+
+    def test_shutdown_closes_pools_and_blocks_new_requests(self):
+        client = _ScriptedPullClient()
+        c = _started_async_pull(client)
+        cb = _CollectingCallback()
+        c.pull_async(MQ, "*", 0, 32, cb, 3000)
+        assert cb.done.wait(_WAIT_TIMEOUT)
+        assert c._async_pull_executor is not None
+        c.shutdown()
+        assert c._async_pull_executor is None and c._pull_callback_executor is None
+        # 已 shutdown：_require_client 先拦下（消费者未启动），同步抛。
+        with pytest.raises(MQClientException):
+            c.pull_async(MQ, "*", 0, 32, _CollectingCallback(), 3000)

@@ -232,6 +232,11 @@ void DefaultMQProducer::start() {
     if (tlsOptionsSet_) {
         mqClient_->setTlsOptions(tlsOptions_);
     }
+    // SOCKS 代理（对齐 Java NettyRemotingClient#createBootstrap(SocksProxyConfig)）：
+    // 透传给传输层，首条连接建立时生效
+    if (socksProxySet_) {
+        mqClient_->setSocksProxy(socksProxy_);
+    }
     // 请求钩子：必须在**任何请求发出之前**绑定（start() 里的路由拉取与心跳也要带签名，
     // 开了 namespaceV2 时还要带 `nsd`/`ns`、开了 stream 时还要带 `ReqT`）。Java 把钩子绑在
     // MQClientAPIImpl 构造函数里，这里同样先绑钩子再 start()。
@@ -300,6 +305,22 @@ void DefaultMQProducer::start() {
             }
         }
     });
+
+    // 故障规避主动探测（Java DefaultMQProducerImpl.start():272 的 mqFaultStrategy.startDetector()
+    // → LatencyFaultToleranceImpl 的单线程 scheduled executor，固定速率 3s 一跳）。与 Go 端
+    // fault_detector.go 同口径：线程随 start/shutdown 启停、每跳先看 startDetectorEnable
+    // （开关运行期可翻）；Resolver / ServiceDetector 需要客户端实例，在这里装（Java 在
+    // 构造函数里装，cpp 的 MQClientInstance 也是 start() 时才建）。
+    mqFaultStrategy_.latencyFaultTolerance().setResolver(
+        [this](const std::string& brokerName) -> std::string {
+            return mqClient_ ? mqClient_->findBrokerAddressInPublish(brokerName) : std::string();
+        });
+    mqFaultStrategy_.latencyFaultTolerance().setServiceDetector(
+        [this](const std::string& addr, int32_t timeoutMillis) {
+            return detectBrokerByMaxOffset(addr, timeoutMillis);
+        });
+    detectorRunning_.store(true);
+    detectorThread_ = std::thread([this]() { detectorLoop(); });
 }
 
 void DefaultMQProducer::shutdown() {
@@ -357,6 +378,13 @@ void DefaultMQProducer::shutdown() {
     heartbeatRunning_.store(false);
     if (heartbeatThread_.joinable()) {
         heartbeatThread_.join();
+    }
+    // 故障规避探测线程（Java LatencyFaultToleranceImpl.shutdown 的对位）：与心跳线程同一
+    // 约束 —— 内部持有 mqClient_ 引用，必须在 mqClient_->shutdown() 之前停掉。
+    // 探测最坏拖着一个 detectTimeout 毫秒的同步请求，join 会等到它收尾。
+    detectorRunning_.store(false);
+    if (detectorThread_.joinable()) {
+        detectorThread_.join();
     }
     // RequestFutureHolder 守护扫描的计数注销（Java shutdown():319）。这里不持
     // producer 的任何锁：扫描线程不回摸生产者成员，只动自己的表。
@@ -908,6 +936,9 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
     SendResult result;
     bool gotResult = false;
     bool callTimeout = false;
+    // Java DefaultMQProducerImpl#pickTopic 的记账点：tryToFindTopicPublishInfo 就在发送
+    // 路径上，cpp 把"发布信息拉过哪个 topic"记下来，主动探测用第一个候选发 GET_MAX_OFFSET。
+    rememberDetectTopic(outbound.topic);
     // 最后一次失败的原因，用于循环结束后的错误码映射
     enum class Cause { NONE, BROKER, CONNECT, TIMEOUT, CLIENT, OTHER };
     Cause cause = Cause::NONE;
@@ -964,11 +995,12 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
             if (gotResult) return result;
             throw;
         } catch (const RemotingException& e) {
-            // 连不上/超时/发不出去：隔离该 broker。本项目无后台可达性探测线程，
-            // 所以 Java 的 reachable=!isStartDetectorEnable() 恒为 true。
+            // 连不上/超时/发不出去：隔离该 broker。Java sendDefaultImpl:817-821 的语义：
+            // 探测线程在跑时 RemotingException 记 **unreachable**（等探测器把它放回）；
+            // 没跑时记 reachable（只隔离，否则故障规避会把 broker 永久拉黑）。
             if (!selected.brokerName.empty()) {
-                mqFaultStrategy_.updateFaultItem(selected.brokerName,
-                                                 elapsedMillis(attemptBegan), true, true);
+                mqFaultStrategy_.updateFaultItem(selected.brokerName, elapsedMillis(attemptBegan),
+                                                 true, !mqFaultStrategy_.isStartDetectorEnable());
             }
             lastError = e.what();
             if (dynamic_cast<const RemotingConnectException*>(&e) != nullptr) {
@@ -1832,6 +1864,75 @@ int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
         }
     }
     return okCount;
+}
+
+// ---------------------------------------------------------------- 故障规避主动探测
+//
+// Java DefaultMQProducerImpl.start():272 的 mqFaultStrategy.startDetector()：
+// LatencyFaultToleranceImpl 内部那根 "LatencyFaultToleranceScheduledThread" 按
+// scheduleAtFixedRate(3s, 3s) 跑 detectByOneRound，每跳先看 startDetectorEnable。
+// cpp 没有共享 scheduled executor，线程归生产者所有（与 Go 端 fault_detector.go 同口径），
+// 首跳立刻跑（与心跳线程同一口径；Java 的 initialDelay=3s 只是延迟首次探测，故障表
+// 未建立时探测本来就是空转）。
+void DefaultMQProducer::detectorLoop() {
+    setThreadName("FaultDetectorThread");
+    auto next = std::chrono::steady_clock::now();
+    while (detectorRunning_.load()) {
+        sleepUntilDeadline(detectorRunning_, next);
+        // Java startDetector 的固定速率：3s 一跳；每个 broker 自己再按 detectInterval 限频
+        //（见 LatencyFaultToleranceImpl::detectByOneRound 的 checkStamp 占坑）。
+        next += std::chrono::milliseconds(3000);
+        if (!mqFaultStrategy_.isStartDetectorEnable()) {
+            continue;
+        }
+        try {
+            mqFaultStrategy_.latencyFaultTolerance().detectByOneRound();
+        } catch (const std::exception& e) {
+            // Java 的 runnable 整段 try/catch：探测抖动绝不能带走调度线程
+            logger_debug(std::string("fault detector round failed: ") + e.what());
+        } catch (...) {
+            logger_debug("fault detector round failed: unknown exception");
+        }
+    }
+}
+
+// Java DefaultMQProducerImpl#pickTopic（:180-185）：topicPublishInfoTable 的第一个 key。
+// cpp 的发布信息缓存在 MQClientInstance 里，这里按「发送过的 topic」记账（记账点在
+// sendDefaultImpl 的 topicPublishInfo 调用点，与 Java 的表填充点是同一个）。
+std::string DefaultMQProducer::pickDetectTopic() {
+    std::lock_guard<std::mutex> lk(detectTopicsMutex_);
+    return detectTopics_.empty() ? std::string() : *detectTopics_.begin();
+}
+
+void DefaultMQProducer::rememberDetectTopic(const std::string& topic) {
+    if (topic.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(detectTopicsMutex_);
+    detectTopics_.insert(topic);
+}
+
+// ServiceDetector 等价物（Java DefaultMQProducerImpl 构造函数 :155-169 的匿名实现）：
+// 对 endpoint 发一笔 GET_MAX_OFFSET(30)（Java 用候选 topic 的 queueId=0），这是最便宜的
+// 能验证「传输 + 请求路由 + 存储」全链路都通的 RPC。任何失败 —— 传输错误、broker 拒绝、
+// 超时 —— 都算仍然不可达，并且（按 Java detectByOneRound 的语义）不动 reachable 标志。
+bool DefaultMQProducer::detectBrokerByMaxOffset(const std::string& addr, int32_t timeoutMillis) {
+    if (addr.empty()) {
+        return false;
+    }
+    const std::string topic = pickDetectTopic();
+    if (topic.empty()) {
+        // Java pickTopic：候选 topic 表为空 → Optional.empty → detect 返回 false
+        return false;
+    }
+    try {
+        MessageQueue mq(topic, /*brokerName=*/std::string(), /*queueId=*/0);
+        client().getMaxOffset(mq, timeoutMillis, addr);
+        return true;
+    } catch (const std::exception& e) {
+        logger_debug("detector: GET_MAX_OFFSET probe to " + addr + " failed: " + std::string(e.what()));
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------- 事务消息

@@ -337,6 +337,27 @@ producer = DefaultMQProducer("PID_DEMO", tls_enable=True,
 `tls_options` 另接受 `clientCert` / `clientKey`（mTLS）与 `serverName`（SNI/主机名覆盖）。
 不显式传 `tls_enable` 时读环境变量 `ROCKETMQ_TLS_ENABLE=1`。生产者、三种消费者与 admin 同一条链路都支持。
 
+### SOCKS 代理
+
+```python
+from remoting.socks_proxy import SocksProxyConfig
+
+producer = DefaultMQProducer("PID_DEMO",
+                             socks_proxy_config=SocksProxyConfig(
+                                 "proxy.corp.example:1080", username="u", password="p"))
+# 五个门面（生产者 / 三种消费者 / admin）都有 setter：
+# producer.set_socks_proxy_config(SocksProxyConfig(...))
+```
+
+`SocksProxyConfig` 字段对齐 Java `SocksProxyConfig` 并补齐类型/端口/enable：
+代理类型 `SOCKS5`（默认）/ `SOCKS4`（域名目标走 4a 扩展）、代理地址（也接受 Java 风格的
+`"host:port"` 合写）、端口、可选用户名密码（SOCKS5 走 RFC 1929 用户名密码子协商）、
+`enable`（缺省 `None` = addr 非空即启用；显式 `False` = 留着配置但不走代理）。
+配置后**全部 remoting 连接**（NameServer + Broker，等价 Java CIDR `0.0.0.0/0`）在
+TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址的普通 HTTP
+请求不经代理（与 Java 口径一致）。目标域名不在本地解析、原样交给代理
+（SOCKS5 atyp=3 / SOCKS4a）。纯标准库 `socket` 手写握手，无第三方依赖。
+
 ## 特性与进度
 
 | 能力 | 状态 |
@@ -356,6 +377,7 @@ producer = DefaultMQProducer("PID_DEMO", tls_enable=True,
 | 客户端统计（拉取 TPS/RT、消费 RT、消费成功/失败 TPS）与 `ConsumerRunningInfo`（307） | ✅ |
 | 压缩三后端：zlib（标准库）/ LZ4 / ZSTD | ✅ |
 | TLS（含 mTLS、严格 CA 校验） | ✅ |
+| SOCKS 代理（SOCKS4/5、用户名密码子协商、CONNECT 隧道，TLS 可叠加） | ✅ |
 | 动态 NameServer 取址（`DefaultTopAddressing` + `ROCKETMQ_NAMESRV_DOMAIN`） | ✅ |
 | 发送延迟故障规避（`set_send_latency_fault_enable`）与主从切换 | ✅ |
 | 管理端 `DefaultMQAdminExt`：topic / 订阅组配置、位点查询与重置、连接与运行信息、消息查询、broker 配置与清理 | ✅ |
@@ -463,7 +485,8 @@ python/
 │   ├── topic_config.py / mix_all.py / util_all.py / message_accessor.py
 │   ├── message_type.py / message_client_id_setter.py / topic_validator.py
 ├── remoting/               传输层（纯 socket + 线程）
-│   ├── client.py               RemotingClient：同步 / 异步 / oneway、半包重组、TLS
+│   ├── client.py               RemotingClient：同步 / 异步 / oneway、半包重组、TLS、SOCKS 代理
+│   ├── socks_proxy.py          SocksProxyConfig + SOCKS4/5 CONNECT 握手（纯标准库）
 │   ├── rpchook.py              RPCHook / AclClientRPCHook / NamespaceRpcHook / StreamTypeRPCHook
 │   ├── exception.py
 │   └── protocol/

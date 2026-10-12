@@ -2,6 +2,7 @@ package client
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
@@ -15,19 +16,24 @@ import (
 // messages stop being routed to it. Off by default (sendLatencyFaultEnable),
 // exactly like Java.
 //
-// Java's background reachability detector (startDetector) is deliberately not
-// ported: it opens real connections on a timer, and this port has no such
-// thread anywhere else. reachableFlag keeps its semantics — it is only written
-// by the explicit reachable argument of updateFaultItem — and the reachable
-// filter still behaves correctly because a broker with no entry is considered
-// reachable.
+// Java's background reachability detector (startDetector) is ported in
+// fault_detector.go: when startDetectorEnable is on, a producer-owned goroutine
+// periodically probes every broker in the fault table (GET_MAX_OFFSET, the
+// ServiceDetector Java wires in DefaultMQProducerImpl) and flips a broker that
+// answers back from unreachable to reachable. reachableFlag keeps its Java
+// semantics — send failures write it, the detector restores it — and the
+// reachable filter still behaves correctly without the detector because a
+// broker with no entry is considered reachable.
 
 // faultItem is one broker's fault record (Java
-// LatencyFaultToleranceImpl.FaultItem).
+// LatencyFaultToleranceImpl.FaultItem). checkStamp schedules the detector: the
+// broker is probed once its checkStamp has come due, then it is pushed
+// detectInterval into the future.
 type faultItem struct {
 	name           string
 	currentLatency float64
 	startTimestamp float64
+	checkStamp     float64
 	reachableFlag  bool
 }
 
@@ -52,14 +58,134 @@ func (f *faultItem) isAvailable() bool {
 func (f *faultItem) isReachable() bool { return f.reachableFlag }
 
 // latencyFaultToleranceImpl is the in-memory fault table (Java
-// LatencyFaultToleranceImpl, minus the detector thread).
+// LatencyFaultToleranceImpl). The detector half — detectTimeout/detectInterval/
+// startDetectorEnable, the Resolver and the ServiceDetector — is driven by the
+// producer's detectLoop in fault_detector.go.
 type latencyFaultToleranceImpl struct {
 	mu    sync.Mutex
 	items map[string]*faultItem
+
+	detectTimeout       float64 // ms, Java ClientConfig default 200
+	detectInterval      float64 // ms per broker, Java ClientConfig default 2000
+	startDetectorEnable bool
+	tickMillis          atomic.Int64 // scheduler tick, Java's fixed 3s scheduleAtFixedRate
+
+	// resolver maps a broker name to its master publish address (Java
+	// Resolver = DefaultMQProducerImpl::findBrokerAddressInPublish); detector
+	// is the ServiceDetector (GET_MAX_OFFSET). Both are installed by Start and
+	// nil until then.
+	resolver func(name string) (addr string, ok bool)
+	detector func(addr string, timeoutMillis int64) bool
 }
 
+// Java ClientConfig's detector defaults.
+const (
+	defaultDetectTimeout  = float64(200)
+	defaultDetectInterval = float64(2 * 1000)
+	detectorTickMillis    = int64(3 * 1000) // Java startDetector's fixed 3s tick
+)
+
 func newLatencyFaultToleranceImpl() *latencyFaultToleranceImpl {
-	return &latencyFaultToleranceImpl{items: map[string]*faultItem{}}
+	tol := &latencyFaultToleranceImpl{
+		items:          map[string]*faultItem{},
+		detectTimeout:  defaultDetectTimeout,
+		detectInterval: defaultDetectInterval,
+	}
+	tol.tickMillis.Store(detectorTickMillis)
+	return tol
+}
+
+// setDetector installs the Resolver + ServiceDetector pair. Called once by
+// producer Start, once the client instance exists to resolve against.
+func (l *latencyFaultToleranceImpl) setDetector(resolver func(string) (string, bool), detector func(string, int64) bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.resolver = resolver
+	l.detector = detector
+}
+
+func (l *latencyFaultToleranceImpl) setStartDetectorEnable(enable bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.startDetectorEnable = enable
+}
+
+func (l *latencyFaultToleranceImpl) isStartDetectorEnable() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.startDetectorEnable
+}
+
+func (l *latencyFaultToleranceImpl) setDetectTimeout(millis int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.detectTimeout = float64(millis)
+}
+
+func (l *latencyFaultToleranceImpl) setDetectInterval(millis int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.detectInterval = float64(millis)
+}
+
+// detectByOneRound is Java LatencyFaultToleranceImpl.detectByOneRound, line by
+// line: for every fault item whose checkStamp is due, advance the stamp by
+// detectInterval, resolve the broker's master address, and probe it. A broker
+// the route no longer knows loses its fault record (unknown = available); a
+// successful probe flips an unreachable broker back to reachable. A FAILED
+// probe changes nothing — Java only ever clears the flag here, it never sets
+// it; marking unreachable is the send path's job.
+//
+// The table lock is held only for the snapshot and the write-back, never
+// across the network call: one probe may block for detectTimeout.
+func (l *latencyFaultToleranceImpl) detectByOneRound() {
+	l.mu.Lock()
+	now := float64(time.Now().UnixMilli())
+	due := make([]*faultItem, 0, len(l.items))
+	for _, item := range l.items {
+		if now < item.checkStamp {
+			continue
+		}
+		item.checkStamp = now + l.detectInterval
+		due = append(due, item)
+	}
+	resolver := l.resolver
+	detector := l.detector
+	timeout := int64(l.detectTimeout)
+	l.mu.Unlock()
+
+	for _, item := range due {
+		if resolver == nil {
+			return
+		}
+		addr, ok := resolver(item.name)
+		if !ok {
+			// Java: the resolver returning null removes the item — the broker
+			// has left the route, so its fault record must not outlive it.
+			l.remove(item.name)
+			continue
+		}
+		if detector == nil {
+			continue
+		}
+		if detector(addr, timeout) {
+			l.mu.Lock()
+			if !item.reachableFlag {
+				common.LogInfof("%s is reachable now, then it can be used.", item.name)
+				item.reachableFlag = true
+			}
+			l.mu.Unlock()
+		}
+	}
+}
+
+// detectByOneRoundIfEnabled gates the round on startDetectorEnable, exactly the
+// check Java's scheduled runnable makes every tick.
+func (l *latencyFaultToleranceImpl) detectByOneRoundIfEnabled() {
+	if !l.isStartDetectorEnable() {
+		return
+	}
+	l.detectByOneRound()
 }
 
 func (l *latencyFaultToleranceImpl) updateFaultItem(name string, currentLatency, notAvailableDuration float64, reachable bool) {
@@ -119,6 +245,7 @@ func (l *latencyFaultToleranceImpl) faultItem(name string) *faultItem {
 type mqFaultStrategy struct {
 	mu                     sync.Mutex
 	sendLatencyFaultEnable bool
+	startDetectorEnable    bool
 	latencyFaultTolerance  *latencyFaultToleranceImpl
 	latencyMax             []float64
 	notAvailableDuration   []float64
@@ -149,6 +276,31 @@ func (s *mqFaultStrategy) SetSendLatencyFaultEnable(enable bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sendLatencyFaultEnable = enable
+}
+
+// StartDetectorEnable / SetStartDetectorEnable / SetDetectTimeout /
+// SetDetectInterval are the Java MQFaultStrategy passthroughs onto the fault
+// table (startDetectorEnable lives on both, like Java).
+func (s *mqFaultStrategy) StartDetectorEnable() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.startDetectorEnable
+}
+
+func (s *mqFaultStrategy) SetStartDetectorEnable(enable bool) {
+	s.mu.Lock()
+	s.startDetectorEnable = enable
+	tolerance := s.latencyFaultTolerance
+	s.mu.Unlock()
+	tolerance.setStartDetectorEnable(enable)
+}
+
+func (s *mqFaultStrategy) setDetectTimeout(millis int64) {
+	s.latencyFaultTolerance.setDetectTimeout(millis)
+}
+
+func (s *mqFaultStrategy) setDetectInterval(millis int64) {
+	s.latencyFaultTolerance.setDetectInterval(millis)
 }
 
 // selectOneMessageQueue picks a queue, optionally avoiding lastBrokerName.

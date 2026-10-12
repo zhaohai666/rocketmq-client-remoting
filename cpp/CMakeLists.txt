@@ -60,6 +60,7 @@ set(RMQ_SOURCES
     src/remoting/protocol/admin_body.cpp
     src/remoting/protocol/body.cpp
     src/remoting/remoting_client.cpp
+    src/remoting/socks_proxy.cpp
     src/remoting/rpchook.cpp
     src/client/result.cpp
     src/client/allocate_strategy.cpp

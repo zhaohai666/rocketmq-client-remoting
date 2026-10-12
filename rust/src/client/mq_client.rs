@@ -105,9 +105,13 @@ use crate::remoting::protocol::headers::{
 use crate::remoting::protocol::heartbeat::{
     ConsumerData, ExpressionType, HeartbeatData, SubscriptionData,
 };
+use crate::remoting::protocol::query_assignment_body::{
+    MessageQueueAssignment, QueryAssignmentRequestBody, QueryAssignmentResponseBody,
+};
 use crate::remoting::protocol::remoting_command::RemotingCommand;
 use crate::remoting::protocol::route::{pseudo_random_index, TopicRouteData};
 use crate::remoting::rpchook::{NamespaceRpcHook, StreamTypeRPCHook};
+use crate::remoting::socks::SocksProxyConfig;
 use crate::{bail, rmq_debug, rmq_info, rmq_warn};
 
 // ================================================================ seams
@@ -468,6 +472,11 @@ pub struct MQClientInstanceConfig {
     /// Python `tls_enable`：`None` 走环境变量 `ROCKETMQ_TLS_ENABLE`（与
     /// [`RemotingClientConfig::default`] 同口径），`Some(v)` 强制。
     pub tls_enable: Option<bool>,
+    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig`：addr / username /
+    /// password 三字段，见 [`SocksProxyConfig`]）。`None` = 直连（默认）。
+    /// 只作用于 remoting 传输层的出连接（TCP 建连后、TLS 握手前做 SOCKS 握手）；
+    /// TopAddressing 的动态取址 HTTP 不走它。
+    pub socks_proxy: Option<SocksProxyConfig>,
     /// 路由周期刷新（Java `ClientConfig#pollNameServerInterval`，默认 30000ms；
     /// initialDelay 10ms 见 `route_refresh_loop`）。
     pub route_refresh_interval_millis: u64,
@@ -521,6 +530,7 @@ impl Default for MQClientInstanceConfig {
             connect_timeout_millis: 3000,
             invoke_timeout_millis: 15000,
             tls_enable: None,
+            socks_proxy: None,
             route_refresh_interval_millis: 30_000,
             namesrv_refresh_initial_delay_millis: 10_000,
             namesrv_refresh_interval_millis: 120_000,
@@ -552,6 +562,7 @@ impl std::fmt::Debug for MQClientInstanceConfig {
             .field("connect_timeout_millis", &self.connect_timeout_millis)
             .field("invoke_timeout_millis", &self.invoke_timeout_millis)
             .field("tls_enable", &self.tls_enable)
+            .field("socks_proxy", &self.socks_proxy)
             .field(
                 "route_refresh_interval_millis",
                 &self.route_refresh_interval_millis,
@@ -725,6 +736,7 @@ impl MQClientInstance {
             tls_enable: config
                 .tls_enable
                 .unwrap_or_else(default_tls_enable_from_env),
+            socks_proxy: config.socks_proxy.clone(),
             ..RemotingClientConfig::default()
         };
         let inner = Arc::new(Inner {
@@ -2693,6 +2705,26 @@ impl MQClientInstance {
             .cloned()
     }
 
+    /// 探测用 topic 挑选（Java `DefaultMQProducerImpl#pickTopic` 的等价物：从
+    /// 生产者的 topicPublishInfoTable 里挑一个给 `ServiceDetector` 塞进
+    /// `GET_MAX_OFFSET`）。Java 对 broker 名不做过滤；这里挑路由表里
+    /// **含这个 broker** 的第一个 topic —— broker 端一定认识它，探测不会白挨
+    /// `TOPIC_NOT_EXIST`（topic 与被探 broker 在 Java 侧本来就无耦合）。
+    /// 没有任何缓存路由时返回 `None`（Java 是 `Optional.empty` ⇒ detect 直接 false）。
+    pub(crate) fn pick_topic_for_broker(&self, broker_name: &str) -> Option<String> {
+        let tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
+        tables
+            .topic_route_table
+            .iter()
+            .find(|(_, route)| {
+                route
+                    .get_broker_datas()
+                    .iter()
+                    .any(|bd| bd.broker_name == broker_name)
+            })
+            .map(|(topic, _)| topic.clone())
+    }
+
     /// 测试专用：把发布地址直接写进平表（等价于路由落库那一处做的一次刷新）。
     /// 离线用例没有名字服务，种不上这张表的话地址解析会在钩子之前就失败。
     #[cfg(test)]
@@ -3418,6 +3450,102 @@ impl MQClientInstance {
         brokers
             .get(pseudo_random_index(brokers.len()))?
             .select_broker_addr()
+    }
+
+    // ---------------- QUERY_ASSIGNMENT(400)：broker 侧队列分配 ----------------
+
+    /// Java `MQClientInstance#queryAssignment:1373`：按 topic 路由找一个 broker
+    /// （缓存没有就补拉一次路由再找），让它跑负载均衡、回本实例应持有的队列集。
+    ///
+    /// 三态返回值就是调用方要的三种结局（对齐 Java `RebalanceImpl
+    /// #getRebalanceResultFromBroker` 对 null / 异常的处理）：
+    ///
+    /// - `Ok(None)`：Java 回 null 的「无效结果」—— 找不到 broker 地址，或 broker 回了
+    ///   不带分配集的 body；调用方**保留上一次分配**；
+    /// - `Ok(Some(list))`：有效分配集（空集 = 「清除之前的全部分配」）；
+    /// - `Err`：传输失败或 broker 非 SUCCESS 应答（异常携带响应码，供调用方区分
+    ///   `TOPIC_NOT_EXIST` 与其他错误）。
+    pub async fn query_assignment(
+        &self,
+        topic: &str,
+        consumer_group: &str,
+        strategy_name: &str,
+        message_model: &str,
+        timeout_millis: i64,
+    ) -> Result<Option<Vec<MessageQueueAssignment>>> {
+        let client_id = self.client_id();
+        let addr = match self.find_broker_addr_by_topic(topic) {
+            Some(addr) => addr,
+            None => {
+                // Java：updateTopicRouteInfoFromNameServer(topic) 后重试一次；拉路由
+                // 失败在这里只 warn（异常不能让 rebalance 崩），再找不到就回 null。
+                if let Err(e) =
+                    self.update_topic_route_info_from_name_server(topic, 5000, false)
+                        .await
+                {
+                    rmq_debug!("queryAssignment: route refresh for {topic} failed: {e}");
+                }
+                match self.find_broker_addr_by_topic(topic) {
+                    Some(addr) => addr,
+                    None => return Ok(None),
+                }
+            }
+        };
+        self.query_assignment_from_broker(
+            &addr,
+            topic,
+            consumer_group,
+            client_id,
+            strategy_name,
+            message_model,
+            timeout_millis,
+        )
+        .await
+    }
+
+    /// Java `MQClientAPIImpl#queryAssignment:405`：向指定 broker 发一笔
+    /// `QUERY_ASSIGNMENT(400)`。
+    ///
+    /// **没有自定义头**，全部信息走 body（与 401 同款）；SUCCESS 才解 body，
+    /// 其余响应码 Java 用 `MQBrokerException(code, remark)` 抛出 —— 本端口
+    /// [`Error::Broker`] 同码同文带出。`serialize_type_current_rpc` 等请求整形由
+    /// [`Self::invoke_sync`] 统一负责。
+    // Java 原型 `MQClientAPIImpl#queryAssignment` 就是这 7 个实参，保持形状不夹带参数对象。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_assignment_from_broker(
+        &self,
+        addr: &str,
+        topic: &str,
+        consumer_group: &str,
+        client_id: &str,
+        strategy_name: &str,
+        message_model: &str,
+        timeout_millis: i64,
+    ) -> Result<Option<Vec<MessageQueueAssignment>>> {
+        let mut request =
+            RemotingCommand::create_request_command(request_code::QUERY_ASSIGNMENT, None);
+        request.set_body(Some(
+            QueryAssignmentRequestBody::new(
+                topic,
+                consumer_group,
+                client_id,
+                strategy_name,
+                message_model,
+            )
+            .encode(),
+        ));
+        let response = self.invoke_sync(addr, &mut request, timeout_millis).await?;
+        if response.code != response_code::SUCCESS {
+            return Err(Error::Broker {
+                response_code: response.code,
+                message: response.remark.clone().unwrap_or_default(),
+            });
+        }
+        // body 缺失 = Java 的 null 集（fastjson 对空 body decode 出 null）
+        match response.body() {
+            None | Some([]) => Ok(None),
+            Some(body) => QueryAssignmentResponseBody::decode(body),
+        }
     }
 
     /// Python `check_client_config`：一笔 `CHECK_CLIENT_CONFIG(46)`（Java
