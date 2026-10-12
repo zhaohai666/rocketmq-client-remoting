@@ -169,6 +169,13 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 		invisibleTime = popDefaultInvisibleTime
 	}
 
+	// Static topics: like Java's PullAPIWrapper.popAsync (5.5.1), the POP
+	// request resolves its address by mq.BrokerName and carries that name +
+	// queueId in the header — NO mock-broker-name rewrite exists on this path
+	// in Java either, so a logical queue fails here with "The broker
+	// [__syslo__...] not exist" on both implementations. Only the ACK /
+	// CHANGE_INVISIBLE_TIME paths rewrite the mock name (see popAckAddress).
+	// This parity is deliberate: do NOT invent a rewrite here.
 	addr, _, found := inst.FindBrokerAddressInSubscribe(mq.BrokerName, int64(common.MasterID), true)
 	if !found {
 		if _, err := inst.UpdateTopicRouteInfoFromNameServer(mq.Topic, 5000, false); err != nil {
@@ -448,7 +455,7 @@ func (c *DefaultMQPushConsumer) ackMessagePop(msg *common.MessageExt) {
 	// message's own topic has been rewritten to the request topic.
 	topic := common.GetRealTopic(parts, msg.Topic, c.consumerGroup)
 
-	addr, err := c.popAckAddress(brokerName, msg.Topic)
+	addr, err := c.popAckAddress(brokerName, msg.Topic, int32(queueID))
 	if err != nil {
 		common.LogWarnf("ack failed, broker %s not resolvable: %v", brokerName, err)
 		return
@@ -509,7 +516,7 @@ func (c *DefaultMQPushConsumer) changePopInvisibleTimeAtLevel(msg *common.Messag
 		return
 	}
 	topic := common.GetRealTopic(parts, msg.Topic, c.consumerGroup)
-	addr, err := c.popAckAddress(brokerName, msg.Topic)
+	addr, err := c.popAckAddress(brokerName, msg.Topic, int32(queueID))
 	if err != nil {
 		common.LogWarnf("changePopInvisibleTime failed, broker %s not resolvable: %v", brokerName, err)
 		return

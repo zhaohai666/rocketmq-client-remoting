@@ -398,34 +398,42 @@ func popDelayLevelForElapsed(elapsedMillis int64) int {
 
 // ---------------------------------------------------------------- helpers
 
-// popCommitAddress resolves the broker address an ACK/CHANGE_INVISIBLETIME
-// belongs to. Java finds it by the LOGICAL broker name from checkpoint segment
-// 5 against the master, refreshing the route once.
+// popAckAddress resolves the broker address an ACK/CHANGE_INVISIBLETIME
+// belongs to. Java finds it by the broker name from checkpoint segment 5
+// against the master, refreshing the route once.
 //
-// Deliberate divergence: Java's ackAsync/changePopInvisibleTimeAsync first map a
-// checkpoint broker name beginning with "__syslo__" (MixAll
-// .LOGICAL_QUEUE_MOCK_BROKER_PREFIX) through MQClientInstance
-// #getBrokerNameFromMessageQueue, i.e. through the topicEndPointsTable built
-// from TopicRouteData.topicQueueMapping. This port decodes
-// topicQueueMappingByBroker as an opaque MappingEntry list and keeps no
-// topicEndPointsTable, so there is no address to map to and the branch is not
-// taken. The static-topic / logical-queue routing feature is therefore a known
-// P3 gap, not a silent fallback: the header still carries the LOGICAL name Java
-// would send.
-func (c *DefaultMQPushConsumer) popAckAddress(brokerName, topic string) (string, error) {
+// Static topics (Java ackAsync/changePopInvisibleTimeAsync): a checkpoint from
+// a LOGICAL queue carries the MOCK broker name ("__syslo__<scope>"); the REAL
+// hosting broker is resolved through the instance's topicEndPointsTable with
+// the checkpoint's OWN queueId — globalIds of one static topic may map to
+// DIFFERENT real brokers, so queueId 0 would resolve the wrong host. The
+// request header keeps the ORIGINAL (mock) name either way; only the address
+// lookup goes through the real one.
+func (c *DefaultMQPushConsumer) popAckAddress(brokerName, topic string, queueID int32) (string, error) {
 	inst := c.instance
 	if inst == nil {
 		return "", common.ClientError("consumer not started")
 	}
-	addr, _, found := inst.FindBrokerAddressInSubscribe(brokerName, int64(common.MasterID), true)
+	desBrokerName := brokerName
+	if isLogicalQueueMockBrokerName(brokerName) {
+		desBrokerName = inst.GetBrokerNameFromMessageQueue(
+			common.NewMessageQueue(topic, brokerName, queueID))
+	}
+	addr, _, found := inst.FindBrokerAddressInSubscribe(desBrokerName, int64(common.MasterID), true)
 	if !found {
 		if _, err := inst.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
 			return "", err
 		}
-		addr, _, found = inst.FindBrokerAddressInSubscribe(brokerName, int64(common.MasterID), true)
+		// Java re-resolves desBrokerName after the route refresh — the
+		// refreshed mapping may host this logical queue on a new broker.
+		if isLogicalQueueMockBrokerName(brokerName) {
+			desBrokerName = inst.GetBrokerNameFromMessageQueue(
+				common.NewMessageQueue(topic, brokerName, queueID))
+		}
+		addr, _, found = inst.FindBrokerAddressInSubscribe(desBrokerName, int64(common.MasterID), true)
 	}
 	if !found {
-		return "", common.ClientError(fmt.Sprintf("The broker[%s] master node does not exist", brokerName))
+		return "", common.ClientError(fmt.Sprintf("The broker[%s] master node does not exist", desBrokerName))
 	}
 	return addr, nil
 }

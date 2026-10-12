@@ -162,8 +162,14 @@ type Instance struct {
 	nameServerAddrs       []string
 	topicRouteTable       map[string]*TopicRouteData
 	topicPublishInfoTable map[string]*TopicPublishInfo
-	brokerAddrTable       map[string]map[int64]string
-	topicsInUse           map[string]struct{}
+	// topicEndPointsTable — for STATIC topics only: MessageQueue(logical,
+	// mock-broker-name, globalId) -> real broker name. Java MQClientInstance
+	// keeps the same table (built from TopicRouteData.topicQueueMapping on
+	// every route refresh) and resolves mock names through
+	// getBrokerNameFromMessageQueue.
+	topicEndPointsTable map[string]map[common.MessageQueue]string
+	brokerAddrTable     map[string]map[int64]string
+	topicsInUse         map[string]struct{}
 
 	started atomic.Bool
 
@@ -197,6 +203,7 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 		nameServerAddrs:       append([]string(nil), nameServerAddrs...),
 		topicRouteTable:       map[string]*TopicRouteData{},
 		topicPublishInfoTable: map[string]*TopicPublishInfo{},
+		topicEndPointsTable:   map[string]map[common.MessageQueue]string{},
 		brokerAddrTable:       map[string]map[int64]string{},
 		topicsInUse:           map[string]struct{}{},
 		consumerTable:         map[string]Consumer{},
@@ -916,6 +923,14 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 	}
 	i.mu.Lock()
 	i.topicRouteTable[topic] = route
+	// Static topics: refresh the logical->real broker endpoints (Java builds
+	// topicEndPointsTable in the same route-refresh block). A non-static
+	// route clears a stale entry.
+	if endpoints := topicRouteData2EndpointsForStaticTopic(topic, route); endpoints != nil {
+		i.topicEndPointsTable[topic] = endpoints
+	} else {
+		delete(i.topicEndPointsTable, topic)
+	}
 	// The route's own brokerAddrs map is stored by shared reference, so the
 	// classic "only overwrite when changed" still refreshes; overwriting
 	// unconditionally here is the same end state.
@@ -1015,6 +1030,23 @@ func (i *Instance) RouteOf(topic string) *TopicRouteData {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.topicRouteTable[topic]
+}
+
+// GetBrokerNameFromMessageQueue resolves a static topic's LOGICAL queue
+// (mock broker name "__syslo__<scope>") to the REAL hosting broker name via
+// the topicEndPointsTable (Java MQClientInstance.getBrokerNameFromMessageQueue).
+// Non-static topics — or a queue the table does not know — pass their own
+// broker name through.
+func (i *Instance) GetBrokerNameFromMessageQueue(mq common.MessageQueue) string {
+	i.mu.Lock()
+	endpoints := i.topicEndPointsTable[mq.Topic]
+	i.mu.Unlock()
+	if len(endpoints) > 0 {
+		if real, ok := endpoints[mq]; ok {
+			return real
+		}
+	}
+	return mq.BrokerName
 }
 
 // PublishInfoOf reads the cached publish info without any RPC.

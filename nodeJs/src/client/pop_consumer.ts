@@ -140,6 +140,14 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
 }
 
 // popOnce issues one POP_MESSAGE and returns the processed result.
+//
+// Static topics: like Java's PullAPIWrapper.popAsync (5.5.1), the POP request
+// resolves its address by mq.getBrokerName() and carries that name + the
+// queueId in the header — NO mock-broker-name rewrite exists on this path in
+// Java either, so a logical queue fails address resolution with
+// "The broker[__syslo__...] not exist" on both implementations. Only the
+// ACK / CHANGE_INVISIBLE_TIME paths rewrite the mock name (see
+// popAckAddress). This parity is deliberate: do NOT invent a rewrite here.
 async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Promise<PopResult> {
   const client = c.mqClient;
   if (!client) throw new Error('consumer not started');
