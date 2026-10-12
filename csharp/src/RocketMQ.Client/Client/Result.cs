@@ -343,7 +343,7 @@ public sealed class SelectMessageQueueByHash : IMessageQueueSelector
         // 与 Java 一致：arg.hashCode() 取绝对值后对队列数取模。
         // 这里用 Java String.hashCode() 语义（Python 侧用的是 hash()，对字符串会随
         // PYTHONHASHSEED 变化，不可跨进程复现；Java 语义是确定性的，更适合做分片键）。
-        int hashCode = JavaHash.JavaStringHash(arg);
+        int hashCode = LegacyHash.StringHash(arg);
         if (hashCode < 0)
         {
             hashCode = hashCode == int.MinValue ? 0 : -hashCode; // 避免 int.MinValue 取负溢出

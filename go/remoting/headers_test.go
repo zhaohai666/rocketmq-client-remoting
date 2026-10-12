@@ -8,7 +8,7 @@ import (
 )
 
 // headerCase pins the exact extFields key sequence of a fully-populated
-// header; the order and spelling must match the Java header classes.
+// header; the order and spelling are the broker-side reflection contract.
 type headerCase struct {
 	name string
 	h    CustomHeader
@@ -234,7 +234,7 @@ func headerCases() []headerCase {
 	}
 }
 
-func TestHeaderExtKeysExactlyMatchJava(t *testing.T) {
+func TestHeaderExtKeysExactlyMatchWireContract(t *testing.T) {
 	for _, c := range headerCases() {
 		ext := common.NewStringMap()
 		c.h.ToExtFields(ext)
@@ -424,8 +424,8 @@ func TestNotifyUnsubscribeLiteHeaderRoundTrip(t *testing.T) {
 	fields := common.NewStringMap()
 	h.ToExtFields(fields)
 
-	// `clientId`, not `clientID` — Java's field is `clientId` and the ext key
-	// follows the property name.
+	// `clientId`, not `clientID` — the broker's field is `clientId` and the ext
+	// key follows the property name.
 	for k, want := range map[string]string{
 		"liteTopic":     "liteA",
 		"consumerGroup": "GID_lite",
@@ -436,7 +436,7 @@ func TestNotifyUnsubscribeLiteHeaderRoundTrip(t *testing.T) {
 		}
 	}
 	if fields.Len() != 3 {
-		t.Errorf("extFields has %d keys, want exactly 3 (Java's header has 3; "+
+		t.Errorf("extFields has %d keys, want exactly 3 (the header declares 3; "+
 			"RpcRequestHeader is an empty marker): %v", fields.Len(), fields)
 	}
 

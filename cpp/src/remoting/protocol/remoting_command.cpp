@@ -21,7 +21,7 @@ constexpr const char* SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type";
 constexpr const char* SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE";
 constexpr const char* REMOTING_VERSION_KEY = "rocketmq.remoting.version";
 
-// Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
+// 协议 `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
 // broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
 // `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
 // 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
@@ -197,7 +197,7 @@ Bytes RemotingCommand::encode() {
     int32_t length = 4;
     Bytes headerData = headerEncode();
     length += static_cast<int32_t>(headerData.size());
-    // body 存在判定：显式置 hasBody，或 body 非空（与 Java 的 body != null 语义对齐）
+    // body 存在判定：显式置 hasBody，或 body 非空（与协议 body 为 null 时不带的语义一致）
     bool withBody = hasBody || !body.empty();
     if (withBody) {
         length += static_cast<int32_t>(body.size());

@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquires_and_releases_in_the_java_units() {
+    async fn acquires_and_releases_in_contract_units() {
         let sem = semaphore(3);
         assert_eq!(sem.available_permits(), 3);
         assert!(sem.try_acquire(2, 100).await);
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_permit_requests_are_ignored_like_java() {
+    async fn zero_permit_requests_are_ignored() {
         let sem = semaphore(2);
         sem.release(0);
         sem.release(-1);
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_floor_values_match_java() {
+    async fn the_floor_values_match_contract() {
         assert_eq!(MIN_ASYNC_SEND_NUM, 10);
         assert_eq!(MIN_ASYNC_SEND_SIZE, 1024 * 1024);
         assert_eq!(back_pressure_permits(1, MIN_ASYNC_SEND_NUM, "num"), 10);

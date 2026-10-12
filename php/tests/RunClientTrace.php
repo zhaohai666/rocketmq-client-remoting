@@ -5,18 +5,17 @@ declare(strict_types=1);
 /*
  * =====================================================================================
  * 消息轨迹（trace）自测：纯 assert 风格（无 phpunit），成功打印
- * `ALL TESTS PASSED (N checks)`，失败非零退出（风格照抄 tests/RunRemoting.php）。
+ * `ALL TESTS PASSED (N checks)`，失败非零退出。
  * -------------------------------------------------------------------------------------
- * 依赖 php/src/Client/{Hook,SendResult,ConsumerResult}.php —— 均由并行的 PHP 移植
- * 子任务落地，本套件**直接使用真实实现**。下方 namespace RocketMQ\Client 里的
+ * 依赖 php/src/Client/{Hook,SendResult,ConsumerResult}.php，本套件**直接使用真实实现**。下方 namespace RocketMQ\Client 里的
  * 条件桩（stub）只在这些真实文件缺失时兜底：真机/全量回归时它们存在，class_exists /
  * interface_exists / enum_exists 命中真实定义即全部跳过。**不修改任何真实源文件**。
  * 注意：Hook.php 里 SendMessageHook/ConsumeMessageHook/EndTransactionHook 是
  * **interface**，其兜底判断必须用 interface_exists（用 class_exists 会对接口判 false
  * 并撞名重声明）。
  * -------------------------------------------------------------------------------------
- * 同名冲突（已解决）：php/src/Client/TraceContext.php（W3C traceparent 助手）原先与本
- * 模块 trace.py 移植出的 TraceContext（消息轨迹上下文）**同为 RocketMQ\Client\TraceContext**，
+ * 同名冲突（已解决）：php/src/Client/TraceContext.php（W3C traceparent 助手）原先与消息轨迹上下文
+ * TraceContext **同为 RocketMQ\Client\TraceContext**，
  * 且 PSR-4 直命中会让前者永远抢先。现已把 W3C 那个更名为
  * `RocketMQ\Client\TraceContextPropagator`（文件同步改名），本套件因此**不再需要**
  * 显式 require Trace.php，走真实 autoload 路径（更贴近生产）。
@@ -183,7 +182,7 @@ namespace {
     const OFFSET_MSG_ID = 'AC1400A1000027100000000000000001';
     const BODY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; // 42 字节
 
-    // ---- Java/Python 官方实现打印出来的编码结果（勿手改；改了就与 Java/控制台不兼容）----
+    // ---- 轨迹日志编码的固定向量（勿手改；改了就与轨迹控制台不兼容）----
     // 用 define() 落成全局常量：类方法内部看不到文件级 $变量，但能看到全局常量。
     define('EXPECTED_PUB', implode(SOH, [
         'Pub', '1700000000000', 'DefaultRegion', 'GID_test', 'TopicTest',
@@ -215,7 +214,7 @@ namespace {
 
     // ---- 测试替身（不依赖集群/线程）----
 
-    /** 只记录 send 调用，不发网络（对应 Python test_trace.py 的 _FakeTraceProducer）。 */
+    /** 替身：只记录 send 调用，不发网络。 */
     final class FakeTraceProducer
     {
         /** @var list<array{0:string,1:?string,2:?string}> */
@@ -245,7 +244,7 @@ namespace {
         }
     }
 
-    /** 只记录 append 调用（对应 Python test_trace.py 的 _CapturingDispatcher）。 */
+    /** 替身：只记录 append 调用。 */
     final class CapturingDispatcher
     {
         /** @var list<TraceContext> */
@@ -433,8 +432,8 @@ namespace {
             $this->checkSame('rocketmq.keys', TraceConstants::ROCKETMQ_KEYS, 'ROCKETMQ_KEYS');
             $this->checkSame('rocketmq.store_host', TraceConstants::ROCKETMQ_STORE_HOST, 'ROCKETMQ_STORE_HOST');
             $this->checkSame('rocketmq.body_length', TraceConstants::ROCKETMQ_BODY_LENGTH, 'ROCKETMQ_BODY_LENGTH');
-            $this->checkSame('rocketmq.mgs_id', TraceConstants::ROCKETMQ_MSG_ID, 'ROCKETMQ_MSG_ID(含 Java 拼写 mgs)');
-            $this->checkSame('rocketmq.mgs_type', TraceConstants::ROCKETMQ_MSG_TYPE, 'ROCKETMQ_MSG_TYPE(含 Java 拼写 mgs)');
+            $this->checkSame('rocketmq.mgs_id', TraceConstants::ROCKETMQ_MSG_ID, 'ROCKETMQ_MSG_ID(协议字段名含 mgs 拼写)');
+            $this->checkSame('rocketmq.mgs_type', TraceConstants::ROCKETMQ_MSG_TYPE, 'ROCKETMQ_MSG_TYPE(协议字段名含 mgs 拼写)');
             $this->checkSame('rocketmq.region_id', TraceConstants::ROCKETMQ_REGION_ID, 'ROCKETMQ_REGION_ID');
             $this->checkSame('rocketmq.transaction_id', TraceConstants::ROCKETMQ_TRANSACTION_ID, 'ROCKETMQ_TRANSACTION_ID');
             $this->checkSame('rocketmq.transaction_state', TraceConstants::ROCKETMQ_TRANSACTION_STATE, 'ROCKETMQ_TRANSACTION_STATE');
@@ -464,7 +463,7 @@ namespace {
                 MessageType::NORMAL_MSG->value, MessageType::TRANS_MSG_HALF->value,
                 MessageType::TRANS_MSG_COMMIT->value, MessageType::DELAY_MSG->value,
                 MessageType::ORDER_MSG->value,
-            ], 'MessageType 值序 = Java ordinal');
+            ], 'MessageType 值序 = 协议枚举序号');
             $this->checkSame('Normal', MessageType::NORMAL_MSG->shortName(), 'MessageType.NORMAL_MSG.shortName');
             $this->checkSame('Trans', MessageType::TRANS_MSG_HALF->shortName(), 'MessageType.TRANS_MSG_HALF.shortName');
             $this->checkSame('TransCommit', MessageType::TRANS_MSG_COMMIT->shortName(), 'MessageType.TRANS_MSG_COMMIT.shortName');
@@ -520,7 +519,7 @@ namespace {
             $ctx->traceBeans = [self::bean()];
 
             $tb = TraceDataEncoder::encoderFromContextBean($ctx);
-            $this->checkSame($expected, $tb->transData, 'PUB 编码逐字节 = Java 向量');
+            $this->checkSame($expected, $tb->transData, 'PUB 编码逐字节 = 固定向量');
             $keys = array_keys($tb->transKey);
             sort($keys, SORT_STRING);
             $this->checkSame([MSG_ID_1, 'KeyA', 'KeyB'], $keys, 'PUB transKey = {msgId, KeyA, KeyB}');
@@ -546,7 +545,7 @@ namespace {
             $ctx->traceBeans = [self::bean(), self::bean(msgId: MSG_ID_2, keys: 'KeyC', retryTimes: 0)];
 
             $tb = TraceDataEncoder::encoderFromContextBean($ctx);
-            $this->checkSame($expected, $tb->transData, 'SUB_BEFORE 多 context 逐字节 = Java 向量');
+            $this->checkSame($expected, $tb->transData, 'SUB_BEFORE 多 context 逐字节 = 固定向量');
             $keys = array_keys($tb->transKey);
             sort($keys, SORT_STRING);
             $this->checkSame([MSG_ID_1, MSG_ID_2, 'KeyA', 'KeyB', 'KeyC'], $keys, 'SUB_BEFORE transKey 合并两条');
@@ -572,12 +571,12 @@ namespace {
             $ctx->contextCode = 2;
             $ctx->accessChannel = AccessChannel::LOCAL;
             $ctx->traceBeans = [self::bean()];
-            $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(LOCAL) 逐字节 = Java 向量（含 timestamp+group）');
+            $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(LOCAL) 逐字节 = 固定向量（含 timestamp+group）');
 
             $ctx->accessChannel = AccessChannel::CLOUD;
             $this->checkSame($expectedCloud, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(CLOUD) 去掉 timestamp+group 两段');
 
-            // accessChannel 为 null → 按 LOCAL 处理（Java 会 NPE 的唯一有意健壮性偏离）
+            // accessChannel 为 null → 按 LOCAL 处理（有意的健壮性兜底：缺省按 LOCAL，不因空值抛错）
             $ctx->accessChannel = null;
             $this->checkSame($expectedLocal, TraceDataEncoder::encoderFromContextBean($ctx)->transData, 'SUB_AFTER(accessChannel=null) 按 LOCAL 处理');
         }
@@ -593,7 +592,7 @@ namespace {
             $this->checkSame(
                 EXPECTED_END_TRANSACTION,
                 TraceDataEncoder::encoderFromContextBean($endTx)->transData,
-                'END_TRANSACTION 编码逐字节 = Java 向量'
+                'END_TRANSACTION 编码逐字节 = 固定向量'
             );
 
             $recall = new TraceContext();
@@ -606,7 +605,7 @@ namespace {
             $this->checkSame(
                 EXPECTED_RECALL,
                 TraceDataEncoder::encoderFromContextBean($recall)->transData,
-                'RECALL 编码逐字节 = Java 向量'
+                'RECALL 编码逐字节 = 固定向量'
             );
 
             $this->checkSame(null, TraceDataEncoder::encoderFromContextBean(null), 'encoderFromContextBean(null) → null');
@@ -646,14 +645,14 @@ namespace {
             $this->checkSame('键一 键二', $back[0]->traceBeans[0]->keys, '中文 keys 往返');
         }
 
-        // ============================================================ java_split / 解码
+        // ============================================================ wire_split / 解码
 
-        private function testJavaSplitSemantics(): void
+        private function testWireSplitSemantics(): void
         {
-            $this->checkSame(['a'], TraceDataEncoder::javaSplit('a' . STX, STX), 'javaSplit 丢掉末尾空串');
-            $this->checkSame([], TraceDataEncoder::javaSplit(STX, STX), 'javaSplit(单分隔符) → []');
-            $this->checkSame(['a', 'b'], TraceDataEncoder::javaSplit('a' . STX . 'b' . STX, STX), 'javaSplit 多段去尾空');
-            $this->checkSame(['a', '', 'b'], TraceDataEncoder::javaSplit('a' . SOH . SOH . 'b', SOH), 'javaSplit 保留中间空串');
+            $this->checkSame(['a'], TraceDataEncoder::wireSplit('a' . STX, STX), 'wireSplit 丢掉末尾空串');
+            $this->checkSame([], TraceDataEncoder::wireSplit(STX, STX), 'wireSplit(单分隔符) → []');
+            $this->checkSame(['a', 'b'], TraceDataEncoder::wireSplit('a' . STX . 'b' . STX, STX), 'wireSplit 多段去尾空');
+            $this->checkSame(['a', '', 'b'], TraceDataEncoder::wireSplit('a' . SOH . SOH . 'b', SOH), 'wireSplit 保留中间空串');
             // PHP 原生 explode 保留末尾空串 —— 这正是不能直接用的原因
             $this->checkSame(['a', ''], explode(STX, 'a' . STX), 'explode 原生保留末尾空串（对照）');
         }
@@ -754,7 +753,7 @@ namespace {
             $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString('Bogus' . SOH . '1' . STX), '未知记录类型 → []');
             $this->checkSame([], TraceDataEncoder::decoderFromTraceDataString(STX . STX), '纯分隔符 → []');
 
-            // 无 keys 的 SubBefore：Java 会 ArrayIndexOutOfBounds，这里兜成空串
+            // 无 keys 的 SubBefore：缺字段兜成空串，不抛越界错误
             $raw = implode(SOH, ['SubBefore', '1700000000000', 'DefaultRegion', 'GID_trace_live',
                 'REQ-001', MSG_ID_1, '0', '']) . STX;
             $records = TraceDataEncoder::decoderFromTraceDataString($raw);
@@ -805,7 +804,7 @@ namespace {
 
             $d2 = new AsyncTraceDispatcher('GID_test', TraceDispatcherType::PRODUCE, 50, null, null);
             $d2->traceProducer = new FakeTraceProducer();
-            $this->checkSame(20, $d2->batchNum, 'Java：batchNum 上限 20');
+            $this->checkSame(20, $d2->batchNum, 'batchNum 上限 20');
 
             $this->check(str_contains($d->genGroupNameForTrace(), TraceConstants::GROUP_NAME_PREFIX), '内部生产者组名含 GROUP_NAME_PREFIX');
             $this->check(str_contains($d->genGroupNameForTrace(), '-PRODUCE-'), '内部生产者组名含 -PRODUCE-');
@@ -1128,7 +1127,7 @@ namespace {
             $this->testEncodeSubAfterByteExact();
             $this->testEncodeEndTransactionAndRecallByteExact();
             $this->testEncodeSpecialCharsAndChinese();
-            $this->testJavaSplitSemantics();
+            $this->testWireSplitSemantics();
             $this->testDecodeRoundTrips();
             $this->testDecodeRobustness();
             $this->testDispatcherDefaults();

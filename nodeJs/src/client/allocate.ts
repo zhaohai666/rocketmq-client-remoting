@@ -1,14 +1,11 @@
-// Queue allocation strategies (Java
-// org.apache.rocketmq.client.consumer.rebalance.AllocateMessageQueue*).
+// 队列分配策略（消费组内的队列切分算法）。
 //
-// Deliberate deviation from Java, shared by all ports: Java's
-// AbstractAllocateMessageQueueStrategy#check throws IllegalArgumentException
-// on bad input; here every strategy returns an empty list instead. Rebalance is
-// a background timer — one dirty input must not kill the consumer.
+// 统一的行为约定：入参非法（currentCID 不在 cidAll 里、mqAll/cidAll 为空）
+// 时不抛异常，策略一律返回空列表——rebalance 是后台定时器，一次脏输入不能
+// 把消费者弄死。
 //
-// Determinism is the whole point: every instance in a group sorts mqAll and
-// cidAll the same way and runs the same index math, otherwise two instances
-// compute overlapping assignments and duplicate every message.
+// 确定性才是关键：组内每个实例都以相同方式排序 mqAll 与 cidAll、跑同样的
+// 下标运算，否则两个实例算出重叠的分配，每条消息都被消费两遍。
 import { createHash } from 'node:crypto';
 import { MessageQueue } from '../common/message.ts';
 import { getLogger } from '../logging.ts';
@@ -20,8 +17,8 @@ export interface AllocateMessageQueueStrategy {
   name(): string;
 }
 
-// checkCid reproduces Java AbstractAllocateMessageQueueStrategy#check: the
-// currentCID must be IN cidAll, and Java logs the [BUG] line when it is not.
+// checkCid 是所有策略的前置校验：currentCID 必须在 cidAll 里，不在时打出
+// [BUG] 日志并让策略返回空分配。
 function checkCid(consumerGroup: string, currentCID: string, mqAll: MessageQueue[], cidAll: string[]): number {
   if (!currentCID || mqAll.length === 0 || cidAll.length === 0) return -1;
   const index = cidAll.indexOf(currentCID);
@@ -42,7 +39,7 @@ function sortCidAll(cidAll: string[]): string[] {
 
 // ------------------------------------------------------------- AVG
 
-// AllocateMessageQueueAveragely is Java AllocateMessageQueueAveragely.
+// AVG：把排序后的队列按连续区间平均分给组内消费者，余数分给前 mod 个。
 export class AllocateMessageQueueAveragely implements AllocateMessageQueueStrategy {
   name(): string { return 'AVG'; }
 
@@ -71,8 +68,7 @@ export class AllocateMessageQueueAveragely implements AllocateMessageQueueStrate
 
 // ------------------------------------------------ AVG_BY_CIRCLE
 
-// AllocateMessageQueueAveragelyByCircle is Java
-// AllocateMessageQueueAveragelyByCircle.
+// AVG_BY_CIRCLE：按排序后的 cidAll 环形轮流取队列。
 export class AllocateMessageQueueAveragelyByCircle implements AllocateMessageQueueStrategy {
   name(): string { return 'AVG_BY_CIRCLE'; }
 
@@ -91,9 +87,8 @@ export class AllocateMessageQueueAveragelyByCircle implements AllocateMessageQue
 
 // ------------------------------------------------------------- CONFIG
 
-// AllocateMessageQueueByConfig is Java AllocateMessageQueueByConfig: whatever
-// the caller configured. Note Java does NO check here — an empty group or
-// cidAll still returns the configured list.
+// CONFIG：直接返回调用方配置好的队列列表。注意这里【不做任何校验】——
+// 空的 group 或 cidAll 也照样返回配置列表。
 export class AllocateMessageQueueByConfig implements AllocateMessageQueueStrategy {
   messageQueueList: MessageQueue[];
 
@@ -103,7 +98,7 @@ export class AllocateMessageQueueByConfig implements AllocateMessageQueueStrateg
 
   name(): string { return 'CONFIG'; }
 
-  // Ignores every argument (Java does too — no check runs here).
+  // 忽略全部入参（这里不跑任何校验）。
   allocate(_consumerGroup: string, _currentCID: string, _mqAll: MessageQueue[], _cidAll: string[]): MessageQueue[] {
     return [...this.messageQueueList];
   }
@@ -115,9 +110,8 @@ export interface HashFunction {
   hash(key: string): number; // uint32
 }
 
-// md5Hash is Java ConsistentHashRouter.MD5Hash: the FIRST FOUR BYTES of the MD5
-// digest, big endian. Taking the full 128 bits (or a different slice) puts you
-// on a different ring than every Java client.
+// md5 哈希：取 MD5 摘要的【前四个字节】、大端序拼成 uint32。取整段 128 位
+// （或别的切片）会落在与既有客户端不同的哈希环上，队列归属就对不上了。
 class Md5Hash implements HashFunction {
   hash(key: string): number {
     const sum = createHash('md5').update(key, 'utf8').digest();
@@ -143,12 +137,12 @@ class ConsistentHashRouter {
   addNode(pNode: string, vNodeCount: number): void {
     const existing = this.existingReplicas(pNode);
     for (let i = 0; i < vNodeCount; i++) {
-      const v: VirtualNode = { key: javaVirtualNodeKey(pNode, i + existing), physicalKey: pNode };
+      const v: VirtualNode = { key: virtualNodeRingKey(pNode, i + existing), physicalKey: pNode };
       const key = this.hashFn.hash(v.key);
       if (!this.ring.has(key)) {
         this.keys = insertU32(this.keys, key);
       }
-      // Java TreeMap.put: a duplicate hash is overwritten in place.
+      // 哈希重复时直接在原键上覆盖旧节点（有序表 put 的语义）。
       this.ring.set(key, v);
     }
   }
@@ -165,9 +159,8 @@ class ConsistentHashRouter {
     this.keys = kept;
   }
 
-  // routeNode is Java ConsistentHashRouter#routeNode: tailMap(hash).firstKey(),
-  // and TreeMap's tailMap is INCLUSIVE of the endpoint, so the lookup is a
-  // "first key >= hash" search. Wrapping past the end returns the first key.
+  // routeNode：取环上第一个 >= hash 的键（尾区间是【闭】区间，即含端点），
+  // 越界则回绕到第一个键。
   routeNode(objectKey: string): string | null {
     if (this.keys.length === 0) return null;
     let idx = lowerBound(this.keys, this.hashFn.hash(objectKey));
@@ -184,7 +177,7 @@ class ConsistentHashRouter {
   }
 }
 
-function javaVirtualNodeKey(pNode: string, replicaIndex: number): string {
+function virtualNodeRingKey(pNode: string, replicaIndex: number): string {
   return `${pNode}-${replicaIndex}`;
 }
 
@@ -204,18 +197,16 @@ function lowerBound(sorted: number[], v: number): number {
   return lo;
 }
 
-// javaMessageQueueString is Java MessageQueue#toString — the string the ring
-// hashes. Must match character for character.
-function javaMessageQueueString(mq: MessageQueue): string {
+// 队列在哈希环上的键字符串：`MessageQueue [topic=..., brokerName=...,
+// queueId=...]`，必须与经典 remoting 协议的既有形态逐字符一致。
+function queueRingKeyString(mq: MessageQueue): string {
   return `MessageQueue [topic=${mq.getTopic()}, brokerName=${mq.getBrokerName()}, queueId=${mq.getQueueId()}]`;
 }
 
 // ------------------------------------------- CONSISTENT_HASH
 
-// AllocateMessageQueueConsistentHash is Java
-// AllocateMessageQueueConsistentHash. Its point is not evenness but STABILITY:
-// when the queue or consumer count changes, only the queues on the affected arc
-// switch owner, while AVG moves everybody's boundary.
+// CONSISTENT_HASH：一致性哈希策略。要点不是均匀而是【稳定】：队列数或消费者
+// 数变化时，只有受影响弧段上的队列会换主人，而 AVG 会移动所有人的边界。
 export class AllocateMessageQueueConsistentHash implements AllocateMessageQueueStrategy {
   virtualNodeCnt: number;
   customHashFunction?: HashFunction;
@@ -233,7 +224,7 @@ export class AllocateMessageQueueConsistentHash implements AllocateMessageQueueS
     const router = new ConsistentHashRouter(cidAll, this.virtualNodeCnt, this.customHashFunction);
     const out: MessageQueue[] = [];
     for (const mq of mqAll) {
-      const node = router.routeNode(javaMessageQueueString(mq));
+      const node = router.routeNode(queueRingKeyString(mq));
       if (node !== null && node === currentCID) out.push(mq);
     }
     return out;
@@ -242,22 +233,19 @@ export class AllocateMessageQueueConsistentHash implements AllocateMessageQueueS
 
 // ------------------------------------------------- MACHINE_ROOM
 
-// javaSplit mirrors Java String#split(sep) with limit 0: trailing empty
-// segments are DROPPED, but a string with no separator is returned whole
-// (Java's "if no match was found, return this" early return) — so "" stays [""]
-// and does not become empty.
-function javaSplit(text: string, sep: string): string[] {
+// splitTrimmingTrailingEmpty：按分隔符切分并丢掉【末尾】空段（limit=0 的
+// split 语义）；但串里没有分隔符时原样整段返回——所以 "" 仍是 [""]，不会
+// 变成空数组。
+function splitTrimmingTrailingEmpty(text: string, sep: string): string[] {
   const parts = text.split(sep);
   if (parts.length === 1) return parts;
   while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
   return parts;
 }
 
-// AllocateMessageQueueByMachineRoom is Java
-// AllocateMessageQueueByMachineRoom. Broker names are expected to look like
-// `<idc>@<brokerName>`; only queues whose idc prefix is in ConsumerIDCs take
-// part, and those are then split by an AVG-like rule whose remainder goes to
-// the FIRST `mod` consumers (java uses `rem > currentIndex`, not `>=`).
+// MACHINE_ROOM：broker 名约定为 `<idc>@<brokerName>`；只有 idc 前缀在
+// ConsumerIDCs 集合里的队列参与分配，然后按类 AVG 规则切分，余数分给前
+// `mod` 个消费者（比较用 `rem > index`，不是 `>=`）。
 export class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStrategy {
   consumerIDCs: Set<string>;
 
@@ -272,11 +260,11 @@ export class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueSt
     const cidAll = sortCidAll(cidAllRaw);
     const index = checkCid(consumerGroup, currentCID, mqAll, cidAll);
     if (index < 0) return [];
-    // Java's consumeridcs has no default (a nil field NPEs on contains); this
-    // port defaults to an empty set, i.e. "nothing is allocated".
+    // consumerIDCs 没有内建默认值（缺省会让 idc 匹配直接炸），这里默认空
+    // 集合，即"什么都不分"。
     const candidates: MessageQueue[] = [];
     for (const mq of mqAll) {
-      const parts = javaSplit(mq.getBrokerName(), '@');
+      const parts = splitTrimmingTrailingEmpty(mq.getBrokerName(), '@');
       if (parts.length !== 2) continue;
       if (!this.consumerIDCs.has(parts[0])) continue;
       if (parts[1] === '') continue;
@@ -295,8 +283,7 @@ export class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueSt
   }
 }
 
-// AllocateMessageQueueStrategyFactory: name -> instance (Java
-// AllocateMessageQueueStrategyFactory subset the other ports ship).
+// 策略工厂：名字 -> 实例（覆盖上面几个内置策略）。
 export const ALLOCATE_STRATEGIES: Record<string, () => AllocateMessageQueueStrategy> = {
   AVG: () => new AllocateMessageQueueAveragely(),
   AVG_BY_CIRCLE: () => new AllocateMessageQueueAveragelyByCircle(),
@@ -325,33 +312,26 @@ export function createAllocateStrategy(name: string): AllocateMessageQueueStrate
 
 // --------------------------------------------- MACHINE_ROOM_NEARBY
 
-// MachineRoomResolver is Java AllocateMachineRoomNearBy.MachineRoomResolver:
-// it tells the strategy which machine room a queue or a consumer lives in.
-// Java's javadoc is explicit that neither method may return null/empty — an
-// empty room aborts the allocation with an error, which the consumer surfaces
-// so the rebalance round can keep the current assignment.
+// MachineRoomResolver：告诉策略某个队列 / 某个消费者住在哪个机房。
+// 两个方法都不允许返回 null/空串——机房解析为空会让整轮分配带错终止，
+// 消费者把异常抛出去，rebalance 这一轮因而保留现有分配。
 export interface MachineRoomResolver {
   brokerDeployIn(messageQueue: MessageQueue): string;
   consumerDeployIn(clientID: string): string;
 }
 
-// AllocateMachineRoomNearby is Java AllocateMachineRoomNearBy: a proxy around
-// another strategy. Queues and consumers are grouped by machine room, then
+// AllocateMachineRoomNearby：代理在另一个策略外面的"就近机房"分配。队列与
+// 消费者先按机房分组，然后
 //
-//  1. the queues in THIS consumer's room are split among the consumers of that
-//     room only (through the inner strategy);
-//  2. queues in a room with NO alive consumer at all are shared among ALL
-//     consumers (again through the inner strategy) — otherwise nobody would
-//     consume them.
+//  1. 本消费者所在机房的队列，只分给该机房的消费者（走内层策略）；
+//  2. 没有任何存活消费者的机房，其队列由【全部】消费者分摊（同样走内层
+//     策略）——否则那些队列就没人消费了。
 //
-// name() is "MACHINE_ROOM_NEARBY" + "-" + <inner name> (Java likewise), so
-// logs can tell which algorithm actually did the splitting.
+// name() 是 "MACHINE_ROOM_NEARBY" + "-" + <内层名>，日志能看出实际做切分的
+// 是哪个算法。
 //
-// Java throws NullPointerException when either constructor argument is null
-// and IllegalArgumentException when the resolver returns an empty room; the
-// constructor mirrors that as an Error, and the per-allocate failure throws
-// out of allocate() — the rebalance loop catches it and keeps the existing
-// assignment, which is the Java semantics (an exception aborts the round).
+// 构造参数为空时抛错；resolver 返回空机房时也抛错。allocate 期间的失败会
+// 直接从 allocate() 抛出——rebalance 循环捕获后保留现有分配（异常终止本轮）。
 export class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy {
   inner: AllocateMessageQueueStrategy;
   resolver: MachineRoomResolver;
@@ -370,13 +350,13 @@ export class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy {
     const cidAll = sortCidAll(cidAllRaw);
     if (checkCid(consumerGroup, currentCID, mqAll, cidAll) < 0) return [];
 
-    // Group queues by machine room. Java uses TreeMap, i.e. lexicographic room
-    // order — the sorted input and Map insertion order keep it deterministic.
+    // 队列按机房分组：机房间按字典序处理——靠输入排序 + Map 的插入顺序保证
+    // 确定性。
     const mr2Mq = new Map<string, MessageQueue[]>();
     for (const mq of mqAll) {
       const room = this.resolver.brokerDeployIn(mq);
       if (!room) {
-        throw new Error(`Machine room is null for mq ${javaMessageQueueString(mq)}`);
+        throw new Error(`Machine room is null for mq ${queueRingKeyString(mq)}`);
       }
       let list = mr2Mq.get(room);
       if (!list) mr2Mq.set(room, (list = []));

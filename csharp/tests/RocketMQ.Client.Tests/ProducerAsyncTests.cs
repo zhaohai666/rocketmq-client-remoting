@@ -830,7 +830,7 @@ public class ProducerAsyncTests : IDisposable
 
     /// <summary>默认配置与 Java 一致，而且闸门默认**不拦路**。</summary>
     [Fact]
-    public void BackpressureDefaultsMatchJava()
+    public void BackpressureDefaultsMatchLegacy()
     {
         var producer = new DefaultMQProducer("GID_async_bp_default");
         Assert.False(producer.EnableBackpressureForAsyncMode);
@@ -844,7 +844,7 @@ public class ProducerAsyncTests : IDisposable
 
     /// <summary>条数闸地板值 10、字节闸地板值 1M（Java DefaultMQProducerImpl:141-153）。</summary>
     [Fact]
-    public void BackpressureFloorsAreJavaFloors()
+    public void BackpressureFloorsAreLegacyFloors()
     {
         var producer = new DefaultMQProducer("GID_async_bp_floor")
         {
@@ -866,7 +866,7 @@ public class ProducerAsyncTests : IDisposable
     /// 且一笔都不许上线（闸在 submit 之前）。
     /// </summary>
     [Fact]
-    public void NumGate_RejectsWithJavaMessageAndSendsNothing()
+    public void NumGate_RejectsWithLegacyMessageAndSendsNothing()
     {
         using var cluster = MockCluster.Start(1);
         cluster.MakeSilent(0);

@@ -104,8 +104,7 @@ export class TopicRouteData {
     this.filterServerTable = {};
     this.topicQueueMappingByBroker = null;
   }
-  // Assemble all writable MessageQueues (publish side). Mirrors Java
-  // MQClientInstance.topicRouteData2TopicPublishInfo.
+  // 组装发布侧全部可写 MessageQueue。
   getAllMessageQueue(topic = ''): MessageQueue[] {
     const mqs: MessageQueue[] = [];
     for (const qd of this.queueDatas) {
@@ -186,7 +185,7 @@ export class TopicRouteData {
 }
 
 // ---------------------------------------------------------------------------
-// TopicRouteData helper functions (Java TopicRouteData / MQHelper).
+// TopicRouteData 辅助函数。
 // ---------------------------------------------------------------------------
 
 // Map<brokerName, Map<brokerId, addr>>.

@@ -294,7 +294,7 @@ public class PullConsumerHeartbeatTests
     // ---------------------------------------------------------------- 1. 启动即注册
 
     [Fact]
-    public void Start_AnnouncesTheGroupWithTheJavaShape()
+    public void Start_AnnouncesTheGroupWithTheLegacyShape()
     {
         using var cluster = MasterSlaveCluster.Start();
         var consumer = new DefaultMQPullConsumer(Group);

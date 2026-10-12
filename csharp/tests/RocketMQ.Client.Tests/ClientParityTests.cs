@@ -96,7 +96,7 @@ public class ClientParityTests
     }
 
     [Fact]
-    public void RequestHooks_ComposeKeepsJavaOrder_NamespaceStreamUser()
+    public void RequestHooks_ComposeKeepsLegacyOrder_NamespaceStreamUser()
     {
         var user = new OrderProbeHook("user", new List<string>());
         IRpcHook? composed = RequestHooks.Compose(enableStreamRequestType: true, user, () => NsV2);
@@ -189,7 +189,7 @@ public class ClientParityTests
     }
 
     [Fact]
-    public void Producer_VipAndDetectorSwitchesDefaultOffLikeJava()
+    public void Producer_VipAndDetectorSwitchesDefaultOffLikeLegacy()
     {
         var p = new DefaultMQProducer("GID_ParityUnit");
         Assert.False(p.SendMessageWithVIPChannel);
@@ -211,7 +211,7 @@ public class ClientParityTests
     // ---------------------------------------------------------------- 定时消息 setter
 
     [Fact]
-    public void TimerSetters_WriteJavaPropertyNames()
+    public void TimerSetters_WriteLegacyPropertyNames()
     {
         var m = new Message("TopicTimer", System.Text.Encoding.UTF8.GetBytes("x"));
         Assert.Equal(0, m.GetDelayTimeSec());
@@ -231,7 +231,7 @@ public class ClientParityTests
     }
 
     [Fact]
-    public void TimerGetter_ParsesLikeJavaLongParseOrThrows()
+    public void TimerGetter_ParsesLikeLegacyLongParseOrThrows()
     {
         // Java 的 getter 就是 Long.parseLong：坏值直接抛，不能静默当 0
         var m = new Message("TopicTimer", System.Text.Encoding.UTF8.GetBytes("x"));
@@ -255,7 +255,7 @@ public class ClientParityTests
     }
 
     [Fact]
-    public void ConsumeFromWhere_DeprecatedStringsMatchJava()
+    public void ConsumeFromWhere_DeprecatedStringsMatchLegacy()
     {
         // 心跳里上报的是字面字符串，配置文件里还留着这些历史值，拼错就是换了一个枚举
         Assert.Equal("CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST",

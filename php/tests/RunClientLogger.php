@@ -3,14 +3,14 @@
 declare(strict_types=1);
 
 /**
- * 客户端日志落盘自测（对应 Java 客户端会生成 rocketmq_client.log 的能力）。
+ * 客户端日志落盘自测（rocketmq_client.log 的生成能力）。
  *
  * 运行：php tests/RunClientLogger.php
  *
  * **本端口默认目录是 <cwd>/logs/rocketmqlogs，刻意不写 $HOME**（见 src/Client/Logger.php
  * 类注释）；第 1 组用例因此把「临时 HOME」和「临时 cwd」分开准备，并断言 HOME 下什么都没生成。
  *
- * 为什么要用子进程：sink 与 Go 的 sync.Once、nodeJs 的模块级 sink 一样**每进程只解析
+ * 为什么要用子进程：sink 是模块级单例，**每进程只解析
  * 一次**，而环境变量口径（LOG_FILE / LOG_DIR / USE_STDOUT / MAX_SIZE）正是被测行为本身，
  * 同进程里改 putenv 不会影响已解析的 sink。
  */
@@ -88,7 +88,7 @@ function rmTree(string $dir): void
 }
 
 // ---------------------------------------------------------------------------
-// 1) 默认：不设置任何环境变量也必须落盘（对齐 Java）
+// 1) 默认：不设置任何环境变量也必须落盘
 // ---------------------------------------------------------------------------
 [$rc, $stdout, $logBody, $cwd, $logPath, $home] = runInTempCwd(
     "Logger::info('hello-default'); Logger::warning('hello-warn');",
@@ -101,7 +101,7 @@ assertTrue($logBody !== null && str_contains($logBody, 'hello-default'),
 assertTrue($logBody !== null && str_contains($logBody, 'hello-warn'), 'WARN 级别同样落盘');
 assertTrue(!str_contains($stdout, 'hello-default'),
     '默认落盘时不再重复输出到 stderr');
-// 用户要求：php 客户端不得在 $HOME 下写日志（Java 会，本端口刻意不同）
+// 约定：客户端不得在 $HOME 下写日志（默认目录固定为 <cwd>/logs/rocketmqlogs）
 assertTrue(!is_dir($home . '/logs'), '默认落盘不碰 $HOME');
 
 // ---------------------------------------------------------------------------

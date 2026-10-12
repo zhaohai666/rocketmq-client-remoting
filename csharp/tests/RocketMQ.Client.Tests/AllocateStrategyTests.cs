@@ -534,7 +534,7 @@ public class AllocateStrategyTests
         Assert.Single(strategy.GetConsumeridcs());
     }
 
-    public static IEnumerable<object[]> JavaSplitCases()
+    public static IEnumerable<object[]> LegacySplitCases()
     {
         // (broker 名, Java `String#split("@")` 的真实段数（JDK 17 实测）, 是否参与分配)
         yield return new object[] { "room1@broker-a", 2, true };
@@ -549,11 +549,11 @@ public class AllocateStrategyTests
 
     /// broker 名必须是 `机房@名字`（且切分按 Java 的裁尾口径）。
     [Theory]
-    [MemberData(nameof(JavaSplitCases))]
+    [MemberData(nameof(LegacySplitCases))]
     public void ByMachineRoom_uses_java_split_on_the_broker_name(string broker, int javaParts,
         bool allocated)
     {
-        Assert.Equal(javaParts, AllocateMessageQueueStrategyUtil.JavaSplit(broker, '@').Length);
+        Assert.Equal(javaParts, AllocateMessageQueueStrategyUtil.Split(broker, '@').Length);
         List<string> cidAll = CidsOf(1);
         var strategy = new AllocateMessageQueueByMachineRoom(new[] { "room1" });
         Assert.Equal(allocated,
@@ -754,9 +754,9 @@ public class AllocateStrategyTests
     [InlineData("@room1", 2)]
     [InlineData("room1@@b", 3)]
     [InlineData("broker-a", 1)]
-    public void Java_split_matches_jdk(string text, int parts)
+    public void Legacy_split_matches_jdk(string text, int parts)
     {
-        Assert.Equal(parts, AllocateMessageQueueStrategyUtil.JavaSplit(text, '@').Length);
+        Assert.Equal(parts, AllocateMessageQueueStrategyUtil.Split(text, '@').Length);
     }
 
     /// 三个新策略在 push / lite / pull 消费者上都能换上并读回（暴露面与旧策略一致）。

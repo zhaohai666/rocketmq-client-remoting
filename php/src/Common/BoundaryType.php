@@ -5,21 +5,17 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 时间戳查位点的边界语义（对应 org.apache.rocketmq.common.BoundaryType，
- * 移植自 boundary_type.py）。
+ * 时间戳查位点的边界语义：LOWER 取右边界，UPPER 取左边界。
  *
- * Java 锚点：
+ * 报文侧的关键事实（别按字面直觉改）：
  *
- *   * 枚举声明 ``LOWER("lower")`` / ``UPPER("upper")``（BoundaryType.java:23/:28），
- *     入网的值却是 ``Enum.toString()``（``RemotingCommand.makeCustomHeaderToNet``:430
- *     的 ``value.toString()``）—— 也就是**大写枚举名** ``LOWER`` / ``UPPER``。
- *     ``getName()`` 那个小写名只被 :41 的解析函数用，从不上报文。
- *   * ``getType(String)``:41 是 **宽松** 解析：只有 ``"upper".equalsIgnoreCase(name)``
- *     才回 UPPER，其余（null / 空串 / 未知值 / 小写 "lower"）一律 LOWER。broker 侧
- *     ``RemotingCommand`` 解 header 时就是拿它做 ``BoundaryType`` 字段的转换，所以
- *     客户端发什么大小写都能被认出来，但报文必须与 Java 客户端逐字节一致。
+ *   * 入网的是**大写枚举名** ``LOWER`` / ``UPPER``——header 序列化输出的是枚举名，
+ *     不是那个小写的显示名；小写名只用于本地比对与日志，从不上报文。
+ *   * broker 侧解 header 时的转换是**宽松**的：只有忽略大小写等于 ``"upper"`` 才认
+ *     UPPER，其余（null / 空串 / 未知值 / 小写 "lower"）一律落到 LOWER。
+ *     所以发什么大小写都能被认出来，但本端口固定发大写枚举名。
  *
- * broker 侧语义（ConsumeQueue.binarySearchInQueueByTime:261-270 / :392-404）：
+ * broker 侧语义（按 storeTime 在 ConsumeQueue 里二分）：
  *
  *   * 时间戳大于队列里最后一条的 storeTime ⇒ LOWER = maxOffset（下一个可写位点），
  *     UPPER = maxOffset - 1（最后一条自己的位点）；
@@ -29,12 +25,12 @@ namespace RocketMQ\Common;
  */
 enum BoundaryType: string
 {
-    /** 对应 Java ``BoundaryType``；``->value`` 就是 Java ``toString()`` 的入网文本。 */
+    /** backed value 就是入网文本：大写枚举名。 */
     case LOWER = 'LOWER';
     case UPPER = 'UPPER';
 
     /**
-     * Java ``BoundaryType.getName()``（"lower"/"upper"），只用于比对与日志。
+     * 小写显示名（"lower"/"upper"），只用于本地比对与日志，不上报文。
      */
     public function lowercaseName(): string
     {
@@ -42,7 +38,7 @@ enum BoundaryType: string
     }
 
     /**
-     * Java ``BoundaryType.getType(String)``：非 "upper"（大小写不敏感）一律 LOWER。
+     * 宽松解析：非 "upper"（大小写不敏感）一律落到 LOWER。
      */
     public static function getType(?string $name): self
     {

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 表达式类型（对应 org.apache.rocketmq.common.filter.ExpressionType，移植自 subscription_data.py）。
+ * 订阅表达式的类型：broker 按它选择 tag 过滤还是 SQL92 过滤。
  */
 final class ExpressionType
 {

@@ -1,23 +1,19 @@
 // -*- coding: utf-8 -*-
-// LZ4 block + frame codec and a minimal ZSTD frame codec — pure TypeScript,
-// zero third-party dependencies (repo rule).
+// LZ4 block + frame 编解码与一个最小可用的 ZSTD frame 编解码 —— 纯 TypeScript，
+// 零第三方依赖（仓库规则）。
 //
-// LZ4: the RocketMQ wire carries the LZ4 **FRAME** format (Java's Lz4Compressor
-// wraps lz4-java's LZ4FrameOutputStream, Python uses lz4.frame, and the lz4 CLI
-// speaks the same spec), so `lz4CompressFrame`/`lz4DecompressFrame` are what the
-// compressor dispatch calls; the block layer below is what one frame block holds.
-// See the ⚠ note further down for why the bare-block reading was wrong.
+// LZ4：经典 remoting 协议在 wire 上传的是 **LZ4 Frame 格式**（服务端按 Frame 规范
+// 落盘与下发，lz4 CLI 走的也是同一份规范），所以压缩分派调用的是
+// `lz4CompressFrame`/`lz4DecompressFrame`；下面的 block 层是每个 frame 块内部装的东西。
+// 为什么不能只发裸 block，见后文 ⚠ 说明。
 //
-// ZSTD: real (de)compression through `node:zlib`'s zstd binding — Node's own
-// stdlib, so still zero third-party dependencies. That matters because Java
-// (zstd-jni) writes *compressed* blocks: a decoder that only understands
-// Raw/RLE frames cannot read a message produced by a Java client.
-// On runtimes without the binding (< 23.8) the hand-rolled codec below takes
-// over: ENCODE = a legal zstd frame built from RAW blocks only (plus RLE for
-// long runs), which any standard decoder accepts, and DECODE = Raw/RLE frames.
-// A Compressed block on that fallback path is rejected with an explicit error
-// instead of silently handing back compressed bytes — the cross-port
-// "unsupported = throw, never passthrough" rule.
+// ZSTD：走 `node:zlib` 的 zstd 绑定做真压缩 —— Node 自带，仍然零第三方依赖。这一
+// 点很重要：broker 侧写的可能是**压缩过的** Compressed block，只会读 Raw/RLE 帧
+// 的解码器无法解出 broker 或其他 producer 写出的消息。
+// 在没有该绑定的运行环境（< 23.8）上，退化为下面手写的编解码：ENCODE 输出仅由
+// RAW block 组成的合法 zstd 帧（长重复段用 RLE），任何标准解码器都能接；DECODE 只
+// 认 Raw/RLE 帧。回退路径遇到 Compressed block 抛明确错误 ——
+// **不支持就抛，绝不静默 passthrough**。
 import zlib from 'node:zlib';
 import { MessageSysFlag } from './sysflag.ts';
 
@@ -33,8 +29,8 @@ function lz4Hash(u32: number): number {
   return Math.imul(u32, 2654435761) >>> (32 - LZ4_HASH_LOG);
 }
 
-// lz4CompressBlock encodes `data` as one LZ4 block (no frame header — the
-// RocketMQ wire stores the raw block, same as lz4-java's compress()).
+// lz4CompressBlock 把 data 编成一个 LZ4 block（不带 frame header）——
+// RocketMQ wire 上放的就是裸 block，作为 frame 的一块。
 export function lz4CompressBlock(data: Buffer): Buffer {
   const n = data.length;
   if (n === 0) return Buffer.alloc(0);
@@ -149,15 +145,14 @@ export function lz4DecompressBlock(data: Buffer): Buffer {
 
 // ---------------------------------------------------------------- LZ4 frame
 
-// ⚠ Java wire 的 LZ4 是 **LZ4 Frame 格式**（Lz4Compressor 用 lz4-java 的
-// LZ4FrameOutputStream/LZ4FrameInputStream；Python lz4.frame 同规范互通）——
-// 裸 block 只能自环自解，跨端/Java 全部解不开。此前的 block 直发是隐藏缺陷
-//（node 不在跨端压缩矩阵里，直到 PHP 端补矩阵腿时才暴露）。
+// ⚠ RocketMQ wire 上的 LZ4 是 **LZ4 Frame 格式**（服务端按 LZ4 Frame 规范读写）——
+// 裸 block 只能自环自解，跟 broker 或其他任何 writer 写出的消息都解不开。此前的
+// block 直发是隐藏缺陷（一直要到压缩互通验证时才暴露出来）。
 // Frame = magic + FLG + BD + [C.Size(8B)] + HC + {BlockSize(4B) + block}*
 //         + EndMark(4B) + [C.Checksum(4B)]；block 就是上面的裸 block 层。
 
 const LZ4_MAGIC = 0x184d2204;
-const LZ4_FRAME_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，对齐 Java/Python 默认
+const LZ4_FRAME_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，与 LZ4 Frame 常规默认一致
 
 // xxhash32（Frame 的 HC 与 C.Checksum 用）。Math.imul 天然 mod 2^32。
 export function xxh32(data: Buffer, seed = 0): number {
@@ -209,9 +204,8 @@ export function xxh32(data: Buffer, seed = 0): number {
   return h >>> 0;
 }
 
-// lz4CompressFrame 压成 LZ4 Frame（Java LZ4FrameOutputStream / Python
-// lz4.frame 同规范）。FLG = version01 | B.Indep | C.Size；无块/内容校验
-//（对齐两端默认）；块压不动时存 raw 块（bit31 置位）。
+// lz4CompressFrame 压成 LZ4 Frame（服务端约定的规范）。FLG = version01 | B.Indep |
+// C.Size；不带块校验/内容校验（沿用 Frame 常规默认）；块压不动时存 raw 块（bit31 置位）。
 export function lz4CompressFrame(data: Buffer): Buffer {
   const flg = 0x40 | 0x20 | 0x08; // version=01, B.Indep=1, C.Size=1
   const bd = 0x40; // BlockMaxSize=64KB
@@ -349,10 +343,9 @@ function isRunOfOneByte(data: Buffer, from: number, len: number): boolean {
   return true;
 }
 
-// zstdDecompressFrame is the dependency-free fallback: it decodes a ZSTD frame
-// containing only Raw/RLE blocks (what zstdCompressRaw produces, i.e. what
-// older Node runtimes write themselves). A Compressed block — what a real
-// encoder such as zstd-jni writes — throws; use zstdDecompress for that.
+// zstdDecompressFrame 是不依赖外部绑定的回退解码：只解由 Raw/RLE block 组成的 ZSTD
+// 帧（也就是 zstdCompressRaw 自己写出、以及旧版 Node 写出的那种）。Compressed block
+// ——真实 zstd 编码器（服务端 writer 用的那类）产出的块——会抛错；请用 zstdDecompress。
 export function zstdDecompressFrame(data: Buffer): Buffer {
   let p = 0;
   if (data.length < 4) throw new Error('zstd decompress: input too short');
@@ -411,9 +404,8 @@ const nodeZstd = (zlib as unknown as {
 const HAS_NODE_ZSTD = typeof nodeZstd.zstdCompressSync === 'function'
   && typeof nodeZstd.zstdDecompressSync === 'function';
 
-// zstdCompress writes a real zstd frame (level 1..22; <=0 means the library
-// default, which is what Java's zstd-jni uses). Without the binding it degrades
-// to the store-only Raw/RLE frame — wire-legal, just no compression gain.
+// zstdCompress 写真正的 zstd 帧（level 1..22；<=0 走库默认，broker 侧 writer 也走
+// 库默认）。没有绑定就退化为只写 Raw/RLE 的存帧——线上合法，只是没有压缩收益。
 export function zstdCompress(data: Buffer, level?: number): Buffer {
   if (!HAS_NODE_ZSTD) return zstdCompressRaw(data);
   return level && level >= 1
@@ -434,9 +426,9 @@ export function zstdDecompress(data: Buffer): Buffer {
 // compressFor encodes `data` for the given MessageSysFlag compression type
 // (the value at bit 8-10 of sysFlag: 1=LZ4, 2=ZSTD, 3=ZLIB).
 //
-// `level` is the producer's compressLevel (Java DefaultMQProducer, default 5,
-// range 0-9). ZLIB uses it as the deflate level; ZSTD maps it onto the zstd
-// level (1-9 is legal in both scales). LZ4's block format has no level.
+// `level` 是 producer 配的 compressLevel（默认 5，范围 0-9）。ZLIB 直接把它当 deflate
+// level 用；ZSTD 把它映射到 zstd level（1-9 两个刻度都合法）。LZ4 的 block 格式没有
+// level 概念。
 export function compressFor(data: Buffer, compressionType: number, level: number = 5): Buffer {
   switch (compressionType) {
     case MessageSysFlag.ZLIB_TYPE: {
@@ -462,8 +454,8 @@ export function decompressFor(data: Buffer, compressionType: number): Buffer {
   }
 }
 
-// compressionTypeByName maps the producer-facing names (Java CompressionType)
-// onto the sysFlag values. Accepts case-insensitive names or numeric strings.
+// compressionTypeByName 把 producer 面向用户的压缩名（"ZLIB"/"LZ4"/"ZSTD" 等）映到
+// sysFlag 里的数值。名字大小写不敏感，也接受数字字符串。
 export function compressionTypeByName(name: string | number): number {
   if (typeof name === 'number') {
     if (name === MessageSysFlag.LZ4_TYPE || name === MessageSysFlag.ZSTD_TYPE

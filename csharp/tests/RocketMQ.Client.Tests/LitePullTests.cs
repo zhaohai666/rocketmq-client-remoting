@@ -35,7 +35,7 @@ public class LitePullTests
     }
 
     [Fact]
-    public void ConsumeTimestamp_DefaultsToJavaWallClockFormat()
+    public void ConsumeTimestamp_DefaultsToLegacyWallClockFormat()
     {
         var c = new DefaultLitePullConsumer();
         // Java DefaultLitePullConsumer.java:168：默认 now-30min 的 14 位 yyyyMMddHHmmss

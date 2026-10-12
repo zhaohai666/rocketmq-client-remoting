@@ -191,7 +191,7 @@ void testResetOffsetBodyUsesMessageQueueKeys() {
 
 // ---------------------------------------------------------------- 4. TopicConfig
 
-void testTopicConfigJavaDefaultsAndAttributes() {
+void testTopicConfigDefaultsAndAttributes() {
     // Java: new TopicConfig("t") -> 16/16/6/SINGLE_TAG/0/false/{}，且 attributes 会被序列化
     TopicConfig c("t");
     CHECK_EQ(c.readQueueNums, 16, "TopicConfig 默认 readQueueNums=16");
@@ -396,7 +396,7 @@ void testPublicBodies() {
 
 // ---------------------------------------------------------------- 7. MixAll properties
 
-void testPropertiesJavaSemantics() {
+void testTopicConfigPropertiesWireSemantics() {
     // 与 Python test_properties_text_round_trip_matches_java 同一夹具
     const char* text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n";
     PropertyMap p = MixAll::string2Properties(text);
@@ -567,7 +567,7 @@ void testBrokerVipChannel() {
 }
 
 // 对应 Java org.apache.rocketmq.remoting.admin.track.TrackType 的枚举名集合。
-void testTrackTypeNamesMatchJava() {
+void testTrackTypeNamesMatchProtocol() {
     CHECK(std::string(trackTypeName(TrackType::CONSUMED)) == "CONSUMED", "CONSUMED");
     CHECK(std::string(trackTypeName(TrackType::CONSUMED_BUT_FILTERED)) == "CONSUMED_BUT_FILTERED",
           "CONSUMED_BUT_FILTERED");
@@ -601,19 +601,19 @@ int main() {
     testTopicStatsTableFromRealFixture();
     testConsumeStatsFromRealFixture();
     testResetOffsetBodyUsesMessageQueueKeys();
-    testTopicConfigJavaDefaultsAndAttributes();
+    testTopicConfigDefaultsAndAttributes();
     testSubscriptionGroupConfigProbeFixture();
     testSubscriptionGroupWrapperAndMerge();
     testTopicConfigSerializeWrapper();
     testQueryConsumeQueueResponseBody();
     testPublicBodies();
-    testPropertiesJavaSemantics();
+    testTopicConfigPropertiesWireSemantics();
     testPermAndGroupHelpers();
     testCreateTopicRequestHeaderSendsTopicFilterType();
     testQueryMessageRequestHeaderIndexType();
     testSearchOffsetRequestHeaderBoundaryType();
     testBrokerVipChannel();
-    testTrackTypeNamesMatchJava();
+    testTrackTypeNamesMatchProtocol();
     testAdminVipChannelKnobDefaultsOff();
 
     std::cout << "admin: " << g_pass << " passed, " << g_fail << " failed\n";

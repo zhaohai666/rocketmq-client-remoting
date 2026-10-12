@@ -33,10 +33,9 @@ if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
 }
 
 /**
- * 拉模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPullConsumer），
- * 移植自 python/client/consumer.py 的 DefaultMQPullConsumer。
+ * 拉模式消费者，走经典 remoting 协议的 PULL_MESSAGE 路径。
  *
- * 与 DefaultMQPushConsumer 的本质区别：调用方自己 ``pull($mq, $offset)`` 逐队列拉、
+ * 与推送消费者的本质区别：调用方自己 ``pull($mq, $offset)`` 逐队列拉、
  * 自己管位点；没有本地缓冲、没有后台拉取线程、不做 rebalance —— 无线程模型对它
  * 天然成立，PHP 适配零偏差。
  */
@@ -46,16 +45,16 @@ final class DefaultMQPullConsumer
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
-    /** unitName/unitMode/enableStreamRequestType：对应 Java ClientConfig 同名字段。 */
+    /** unitName/unitMode/enableStreamRequestType：参与 clientId 拼装、单元化标记与请求码选择的三个开关。 */
     public ?string $unitName = null;
     public bool $unitMode = false;
     /**
-     * Java 的 DefaultMQPullConsumer 每个构造函数都写 ``enableStreamRequestType = true``
-     * （:113/:126）—— 与推送消费者默认 false 是两套初值，照抄。
+     * 拉模式消费者把 ``enableStreamRequestType`` 固定初值为 true：它参与 clientId 拼装，
+     * 与推送消费者的默认 false 是两套初值，不能混用。
      */
     public bool $enableStreamRequestType = true;
     /**
-     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * 5.x 新命名空间：非空时**每笔**请求带
      * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
      * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
      * 这里**不**改任何资源名。见 NamespaceRpcHook。
@@ -72,28 +71,27 @@ final class DefaultMQPullConsumer
     public mixed $rpcHook = null;
     /** @var array<string,bool> */
     public array $registerTopics = [];
-    /** TLS（Java tls.enable 等价物；null = 交给 env ROCKETMQ_TLS_ENABLE）。 */
+    /** TLS 开关（null = 交给 env ROCKETMQ_TLS_ENABLE）。 */
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
     public ?MessageQueueListener $messageQueueListener = null;
     /**
-     * 队列分配策略（Java :89 字段初值 AVG / getter/setter:196-202）。
+     * 队列分配策略（默认 AVG，setters/getter 不校验取值）。
      * 本端口拉模式由调用方自己管队列，所以它只作为配置存在并被 start() 校验。
      */
     public ?AllocateMessageQueueStrategy $allocateMessageQueueStrategy;
-    /** @var list<object> 投递前过滤钩子（Java :80，start() 时注册进 PullAPIWrapper） */
+    /** @var list<object> 投递前过滤钩子，start() 时注册进拉取结果处理 */
     public array $filterMessageHookList = [];
-    /** 对应 Java pullAPIWrapper.pullFromWhichNodeTable：mqKey → brokerId */
+    /** mqKey → brokerId：broker 在拉取响应里回传的建议下一跳节点表 */
     private array $pullFromWhichNode = [];
     /**
-     * 同一张表的**键集**（mqKey → MessageQueue）。Java 的表键就是 MessageQueue，
-     * 本端口的表键是字符串，位点/节点决策用不到队列对象，但
-     * fetchMessageQueuesInBalance 要把「本实例实际拉过的队列」还给调用方，
+     * 同一张表的**键集**（mqKey → MessageQueue）。表键是字符串，位点/节点决策用不到队列对象，
+     * 但 fetchMessageQueuesInBalance 要把「本实例实际拉过的队列」还给调用方，
      * 所以顺手把对象留着（mqKey 是 topic+brokerName+queueId 直拼，反解不可靠）。
      */
     private array $pulledQueues = [];
-    // ---- 消费者心跳（对齐 Java heartbeatBrokerInterval 默认 30s）----
+    // ---- 消费者心跳（broker 侧订阅关系的注册周期，默认 30s）----
     public bool $heartbeatEnabled = true;
     public int $heartbeatIntervalMillis = 30000;
     private int $heartbeatCount = 0;
@@ -146,8 +144,8 @@ final class DefaultMQPullConsumer
     }
 
     /**
-     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
-     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
+     * 服务端命名空间（`nsd`/`ns` 扩展头），不改 topic/group 名；
+     * 与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
      * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
      */
     public function setNamespaceV2(string $namespaceV2): void
@@ -158,7 +156,7 @@ final class DefaultMQPullConsumer
         }
     }
 
-    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    /** 读取服务端命名空间（`nsd`/`ns` 扩展头用的那一份）。 */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
@@ -174,7 +172,7 @@ final class DefaultMQPullConsumer
         $this->messageQueueListener = $listener;
     }
 
-    /** 对应 Java DefaultMQPullConsumer.setAllocateMessageQueueStrategy(:200)：setter 不校验。 */
+    /** 设置队列分配策略：setter 不做校验，合法性统一由 start() 把关。 */
     public function setAllocateMessageQueueStrategy(?AllocateMessageQueueStrategy $strategy): void
     {
         $this->allocateMessageQueueStrategy = $strategy;
@@ -193,7 +191,7 @@ final class DefaultMQPullConsumer
     // ---------------- 投递前过滤钩子 ----------------
 
     /**
-     * 拉模式也要过过滤钩子（Java pullSyncImpl → pullAPIWrapper.processPullResult）。
+     * 拉模式也要过过滤钩子（拉取结果统一在投递前过一次钩子链）。
      * 拉模式的 tag 过滤交给调用方（不传 subscriptionData 时 tagsSet 为空 → 不筛），
      * 这里只跑钩子。
      *
@@ -648,10 +646,10 @@ final class DefaultLitePullConsumer
     public ?string $clientId = null;
     public ?string $unitName = null;
     public bool $unitMode = false;
-    /** Java 的 DefaultLitePullConsumer 每个构造函数都写 ``enableStreamRequestType = true``。 */
+    /** 轻量拉取消费者把 ``enableStreamRequestType`` 固定初值为 true（它参与 clientId 拼装）。 */
     public bool $enableStreamRequestType = true;
     /**
-     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * 5.x 新命名空间：非空时**每笔**请求带
      * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
      * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
      * 这里**不**改任何资源名。见 NamespaceRpcHook。
@@ -788,8 +786,8 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
-     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
+     * 服务端命名空间（`nsd`/`ns` 扩展头），不改 topic/group 名；
+     * 与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
      * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
      */
     public function setNamespaceV2(string $namespaceV2): void
@@ -800,7 +798,7 @@ final class DefaultLitePullConsumer
         }
     }
 
-    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
+    /** 读取服务端命名空间（`nsd`/`ns` 扩展头用的那一份）。 */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;

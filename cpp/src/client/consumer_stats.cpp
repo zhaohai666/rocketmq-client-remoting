@@ -125,8 +125,8 @@ ConsumerStatsManager::ConsumerStatsManager()
 ConsumerStatsManager::~ConsumerStatsManager() { shutdown(); }
 
 void ConsumerStatsManager::start() {
-    // Java 的 start() 是空实现（采样挂在每个 StatsItem 的调度器上）；这里收敛为
-    // 一个统一采样线程，精度不变（10s）。
+    // start() 收敛为一个统一采样线程（采样也可挂在每个 StatsItem 上，此处不做），
+    // 精度不变（10s）。
     std::lock_guard<std::mutex> lk(sampleMutex_);
     if (started_) return;
     stop_ = false;

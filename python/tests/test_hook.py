@@ -27,7 +27,7 @@ from client.producer import DefaultMQProducer
 from client.send_result import SendResult, SendStatus
 from common.message import Message, MessageExt, MessageQueue
 from common.subscription_data import ExpressionType, FilterAPI
-from common.util_all import java_string_hash
+from common.util_all import utf16_int32_hash
 
 MQ = MessageQueue("TopicTest", "broker-a", 0)
 
@@ -86,24 +86,24 @@ def test_multi_tag_split_trim_and_codes():
     assert spaced.code_set == {2598919, 2598920}
 
 
-def test_split_error_matches_java_exception():
+def test_split_error_raises_on_an_empty_tag_list():
     # Java：split 后无标签 → throw new Exception("subString split error")
     with pytest.raises(ValueError):
         FilterAPI.build_subscription_data("T", "||")
 
 
-def test_java_string_hash_vectors():
+def test_tag_hash_vectors():
     # 向量由探针 /tmp/subprobe/HashProbe.java + SubProbe.java 打印
-    assert java_string_hash("TagA") == 2598919
-    assert java_string_hash("TagB") == 2598920
-    assert java_string_hash("P") == 80
-    assert java_string_hash("PA") == 2545
-    assert java_string_hash("*") == 42
+    assert utf16_int32_hash("TagA") == 2598919
+    assert utf16_int32_hash("TagB") == 2598920
+    assert utf16_int32_hash("P") == 80
+    assert utf16_int32_hash("PA") == 2545
+    assert utf16_int32_hash("*") == 42
     # 负数回绕（Java int 语义，必须与 Python 的任意精度整数区分开）
-    assert java_string_hash("RocketMQClient") == -47506045
-    assert java_string_hash("polling") == -397904957
-    assert java_string_hash("PID_CLIENT_INNER_TRACE_PRODUCER") == -660858443
-    assert java_string_hash("a" * 20) == 1542361408
+    assert utf16_int32_hash("RocketMQClient") == -47506045
+    assert utf16_int32_hash("polling") == -397904957
+    assert utf16_int32_hash("PID_CLIENT_INNER_TRACE_PRODUCER") == -660858443
+    assert utf16_int32_hash("a" * 20) == 1542361408
 
 
 # ---------------------------------------------------------------- CheckForbiddenHook
@@ -170,7 +170,7 @@ def test_register_and_has():
     assert len(p.check_forbidden_hook_list) == 1
 
 
-def test_context_fields_match_java():
+def test_context_fields_match_the_rpc_contract():
     hook = _RecordingForbidden(forbid=False)
     p = _producer_with_fake_client([hook])
     p._execute_check_forbidden(Message("TopicTest", b"x"), MQ, "127.0.0.1:10911",

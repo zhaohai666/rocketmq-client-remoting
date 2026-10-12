@@ -7,8 +7,8 @@ import (
 	"strings"
 )
 
-// 17-segment storage format (Java MessageDecoder#encode/decode), used for the
-// broker's commitlog records and pull/get bodies:
+// 17-segment storage format used for the broker's commitlog records and
+// pull/get bodies:
 //
 //	 1 TOTALSIZE(4)          2 MAGICCODE(4, v1=-626843481 / v2=-626843477)
 //	 3 BODYCRC(4)            4 QUEUEID(4)            5 FLAG(4)
@@ -18,14 +18,13 @@ import (
 //	15 BODY(4+len)          16 TOPIC(1B v1|2B v2 + len)
 //	17 PROPERTIES(2+len, `k\x01v\x02` chain)
 //
-// 6-segment light format (Java MessageDecoder#encodeMessage/decodeMessage) is
-// for batch messages only:
+// 6-segment light format is for batch messages only:
 //
 //	TOTALSIZE(4) | MAGICCODE(4, 0) | BODYCRC(4, 0) | FLAG(4) | BODY(4+len) | PROPERTIES(2+len)
 const (
-	// NameValueSeparator (Java MessageDecoder.NAME_VALUE_SEPARATOR).
+	// NameValueSeparator separates a property key from its value in PROPERTIES.
 	NameValueSeparator = '\x01'
-	// PropertySeparator (Java MessageDecoder.PROPERTY_SEPARATOR).
+	// PropertySeparator separates one property pair from the next.
 	PropertySeparator = '\x02'
 
 	MessageMagicCode   int32 = -626843481
@@ -45,8 +44,7 @@ const (
 	headerWithoutBodyLen = 4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 4 + 8 // 68
 )
 
-// DecodeOptions carries the four switches of Java
-// MessageDecoder#decode(bb, readBody, deCompressBody, isClient, checkCRC).
+// DecodeOptions carries the four switches controlling DecodeMessageWith.
 type DecodeOptions struct {
 	// ReadBody=false skips the body bytes and leaves Body nil.
 	ReadBody bool
@@ -69,8 +67,8 @@ func hostLength(sysFlag, v6Flag int32) int {
 	return 8
 }
 
-// MessageBytesSize is the encoded size of a message (Java's storeSize
-// arithmetic) — avoids encoding just to measure.
+// MessageBytesSize is the encoded store size of a message — avoids encoding
+// just to measure.
 func MessageBytesSize(topic string, bodyLen int, properties *StringMap, sysFlag int32) int {
 	bornhostLength := hostLength(sysFlag, MessageSysFlagBornhostV6)
 	storehostLength := hostLength(sysFlag, MessageSysFlagStorehostV6)
@@ -90,9 +88,10 @@ func IPAndPortToBytes(ip string, port uint32, v6 bool) ([]byte, error) {
 	return binary.BigEndian.AppendUint32(out, port), nil
 }
 
-// IPToBytes mirrors Python socket.inet_pton with the Java cross-family rules:
-// a v4 address with v6=true becomes a v4-mapped v6; a v6 address with v6=false
-// decompresses only when it is v4-mapped, otherwise it is an error.
+// IPToBytes converts an IP literal to bytes with the storage-format
+// cross-family rules: a v4 address with v6=true becomes a v4-mapped v6; a v6
+// address with v6=false decompresses only when it is v4-mapped, otherwise it
+// is an error.
 func IPToBytes(ip string, v6 bool) ([]byte, error) {
 	addr := net.ParseIP(ip)
 	if addr == nil {
@@ -161,8 +160,7 @@ func CreateMessageID(addrBytes []byte, offset int64) string {
 	return Bytes2String(raw)
 }
 
-// DecodeMessageID mirrors Java MessageDecoder.decodeMessageId:
-// (ip, port, commitLogOffset).
+// DecodeMessageID splits a message ID into (ip, port, commitLogOffset).
 func DecodeMessageID(msgID string) (string, uint32, int64, error) {
 	raw := String2Bytes(msgID)
 	if raw == nil {
@@ -185,8 +183,7 @@ func DecodeMessageID(msgID string) (string, uint32, int64, error) {
 	return ip, port, offset, nil
 }
 
-// MessageProperties2String mirrors Java messageProperties2String: entries
-// joined as `k\x01v\x02` in insertion order.
+// MessageProperties2String joins entries as `k\x01v\x02` in insertion order.
 func MessageProperties2String(properties *StringMap) string {
 	var sb strings.Builder
 	properties.Range(func(name, value string) {
@@ -198,10 +195,10 @@ func MessageProperties2String(properties *StringMap) string {
 	return sb.String()
 }
 
-// String2MessageProperties mirrors Java string2messageProperties. Parsing is
+// String2MessageProperties parses the PROPERTIES string. Parsing is
 // CHARACTER-based and deliberately drops: fragments shorter than 3 chars, and
 // fragments without a kv separator strictly inside — including EMPTY values
-// (`k\x01\x02`). Copy this behavior, do not "fix" it.
+// (`k\x01\x02`). Keep this lenient behavior; do not "fix" it.
 func String2MessageProperties(propertiesStr string) *StringMap {
 	result := NewStringMap()
 	if propertiesStr == "" {
@@ -236,9 +233,9 @@ func findChar(chars []rune, from, length int, target rune) int {
 	return -1
 }
 
-// EncodeMessageExt mirrors Java MessageDecoder#encode(MessageExt, needCompress).
-// Java always writes a 1-byte topic length and the v1 magic; storeSize > 0
-// pre-sizes the buffer and zero-pads the tail.
+// EncodeMessageExt encodes the 17-segment storage frame: it always writes a
+// 1-byte topic length and the v1 magic; storeSize > 0 pre-sizes the buffer and
+// zero-pads the tail.
 func EncodeMessageExt(ext *MessageExt, needCompress bool) ([]byte, error) {
 	body := append([]byte(nil), ext.Body...)
 	sysFlag := ext.SysFlag
@@ -255,7 +252,8 @@ func EncodeMessageExt(ext *MessageExt, needCompress bool) ([]byte, error) {
 	topicBytes := []byte(ext.Topic)
 	topicLen := len(topicBytes)
 	if topicLen > 255 {
-		// Java silently truncates to (byte) len; report instead.
+		// a silent (byte) truncation of the 1-byte field would corrupt the
+		// frame; report instead.
 		return nil, EncodeError(fmt.Sprintf("topic length %d exceeds 1-byte field, needs magic code v2", topicLen))
 	}
 	propertiesBytes := []byte(MessageProperties2String(ext.Properties))
@@ -313,14 +311,13 @@ func EncodeMessageExt(ext *MessageExt, needCompress bool) ([]byte, error) {
 	return w.IntoInner(), nil
 }
 
-// DecodeMessage mirrors Java MessageDecoder#decode(ByteBuffer) defaults.
+// DecodeMessage decodes one storage frame with the default options.
 func DecodeMessage(raw []byte) (*MessageExt, error) {
 	return DecodeMessageWith(raw, DefaultDecodeOptions())
 }
 
-// DecodeMessageWith mirrors Java MessageDecoder#decode with the four switches.
-// Java wraps the whole body in try/catch and returns null on failure; here the
-// same semantics is a DecodeError.
+// DecodeMessageWith decodes one storage frame honoring the four switches;
+// decoding is all-or-nothing and any failure surfaces as a DecodeError.
 func DecodeMessageWith(raw []byte, options DecodeOptions) (*MessageExt, error) {
 	reader := NewReader(raw)
 	ext := NewMessageExt()
@@ -333,7 +330,8 @@ func DecodeMessageWith(raw []byte, options DecodeOptions) (*MessageExt, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Java MessageVersion.valueOfMagicCode throws on unknown magic -> null.
+	// Only the v1/v2 magic codes are valid message versions; anything else is
+	// not a message frame.
 	useV2 := false
 	switch magicCode {
 	case MessageMagicCode:
@@ -445,7 +443,7 @@ func DecodeMessageWith(raw []byte, options DecodeOptions) (*MessageExt, error) {
 			}
 			ext.Body = body
 		} else {
-			// Java/Python readBody=false: skip the bytes, body stays null.
+			// readBody=false: skip the bytes, body stays nil.
 			ext.Body = nil
 		}
 	} else {
@@ -499,8 +497,8 @@ func DecodeMessageWith(raw []byte, options DecodeOptions) (*MessageExt, error) {
 	return ext, nil
 }
 
-// DecodeMessages mirrors Java MessageDecoder.decodes: split a pull-result
-// message stream into a list, stopping at the first unparseable frame.
+// DecodeMessages splits a pull-result message stream into a list, stopping at
+// the first unparseable frame.
 func DecodeMessages(raw []byte) []*MessageExt {
 	return DecodeMessagesWith(raw, DefaultDecodeOptions())
 }
@@ -529,8 +527,7 @@ func DecodeMessagesWith(raw []byte, options DecodeOptions) []*MessageExt {
 	return result
 }
 
-// EncodeMessage mirrors Java MessageDecoder#encodeMessage(Message): the
-// per-message light frame of a batch.
+// EncodeMessage encodes the per-message 6-segment light frame of a batch.
 func EncodeMessage(message *Message) []byte {
 	body := message.GetBody()
 	propertiesBytes := []byte(MessageProperties2String(message.Properties))
@@ -549,7 +546,6 @@ func EncodeMessage(message *Message) []byte {
 	return w.IntoInner()
 }
 
-// EncodeMessages mirrors Java MessageDecoder.encodeMessages(List<Message>).
 func EncodeMessages(messages []*Message) []byte {
 	out := NewWriter()
 	for _, msg := range messages {
@@ -558,8 +554,7 @@ func EncodeMessages(messages []*Message) []byte {
 	return out.IntoInner()
 }
 
-// DecodeBatchMessage mirrors Java MessageDecoder.decodeMessage(ByteBuffer):
-// one batch unit -> Message.
+// DecodeBatchMessage decodes one batch unit (light frame) into a Message.
 func DecodeBatchMessage(raw []byte) (*Message, error) {
 	reader := NewReader(raw)
 	if _, err := reader.I32(); err != nil { // TOTALSIZE
@@ -601,7 +596,6 @@ func DecodeBatchMessage(raw []byte) (*Message, error) {
 	return msg, nil
 }
 
-// DecodeBatchMessages mirrors Java MessageDecoder.decodeMessages(ByteBuffer).
 func DecodeBatchMessages(raw []byte) []*Message {
 	var result []*Message
 	pos := 0
@@ -625,7 +619,6 @@ func DecodeBatchMessages(raw []byte) []*Message {
 	return result
 }
 
-// CountInnerMsgNum mirrors Java MessageDecoder.countInnerMsgNum.
 func CountInnerMsgNum(raw []byte) int32 {
 	count := int32(0)
 	pos := 0
@@ -644,8 +637,8 @@ func CountInnerMsgNum(raw []byte) int32 {
 	return count
 }
 
-// ParseTopicFilterBitmap decodes a binary string (Java BitsArray#toString,
-// high bit first) into per-bit flags.
+// ParseTopicFilterBitmap decodes a binary string (MSB first) into per-bit
+// flags.
 func ParseTopicFilterBitmap(bitmap string) ([]bool, error) {
 	out := make([]bool, 0, len(bitmap))
 	for _, ch := range bitmap {

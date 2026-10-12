@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 对应 org.apache.rocketmq.common.message.MessageQueue（移植自 message.py 的 MessageQueue）。
+ * 消息队列标识：topic + brokerName + queueId，路由与队列分配都以它为键。
  */
 final class MessageQueue
 {
@@ -16,7 +16,7 @@ final class MessageQueue
     ) {
     }
 
-    // ---- Java 风格 getter / setter（保证 JSON 字段名 camelCase）----
+    // ---- getter / setter（属性名就是协议字段名，必须 camelCase）----
 
     public function getTopic(): string
     {
@@ -54,7 +54,8 @@ final class MessageQueue
     }
 
     /**
-     * 与 Java hashCode 对齐：((31+bh)*31+qid)*31+th，结果按 32 位有符号回绕。
+     * 队列哈希：((31+brokerHash)*31+queueId)*31+topicHash，结果按 32 位有符号回绕。
+     * 队列的稳定排序和分配结果的均摊都依赖这个数值，换算法会静默改变分配。
      */
     public function hashcode(): int
     {
@@ -65,7 +66,7 @@ final class MessageQueue
 
     private static function strHash(string $s): int
     {
-        // Python 侧按 code point 累加；这里按 UTF-16 码元与 Java 一致（BMP 内等价），
+        // 按 UTF-16 码元累加（BMP 内与按码点累加等价），
         // 最后统一做 32 位有符号回绕
         $h = 0;
         $u16 = mb_convert_encoding($s, 'UTF-16BE', 'UTF-8');

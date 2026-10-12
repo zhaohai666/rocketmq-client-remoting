@@ -9,13 +9,14 @@ import (
 
 // Guards for the bodies a CLIENT emits: the per-queue snapshots inside
 // ConsumerRunningInfo and the CONSUME_MESSAGE_DIRECTLY verdict. Every expected
-// byte string below is the verbatim fastjson2 2.0.64 output from the 5.5.1
-// jars (probe transcript quoted in client_info_bodies.go), so a rename or a
-// stray always-present field fails here instead of on a live broker — where
-// fastjson2 reflects by Java property name and silently DROPS the key.
+// byte string below is the verbatim fastjson2 2.0.64 output recorded from a
+// live 5.5.1 server (probe transcript quoted in client_info_bodies.go), so a
+// rename or a stray always-present field fails here instead of on a live
+// broker — where fastjson2 reflects by the bean property name and silently
+// DROPS the key.
 
 // The constant NAME has the underscores and the VALUE does not. This is the
-// single place in ConsumerRunningInfo where Java's identifier and its wire
+// single place in ConsumerRunningInfo where the identifier and its wire
 // value disagree, and getting it wrong makes the orderly flag vanish from every
 // 307 answer.
 func TestConsumerRunningInfoPropertyKeySpellings(t *testing.T) {
@@ -38,11 +39,11 @@ func TestConsumerRunningInfoPropertyKeySpellings(t *testing.T) {
 	}
 	// Spell it out: the underscored spelling must NOT be what goes on the wire.
 	if PropConsumeOrderly == "PROP_CONSUME_ORDERLY" {
-		t.Error("PropConsumeOrderly regressed to the underscored form; Java's VALUE has no underscore")
+		t.Error("PropConsumeOrderly regressed to the underscored form; the wire VALUE has no underscore")
 	}
 }
 
-func TestProcessQueueInfoEmptyBodyMatchesJava(t *testing.T) {
+func TestProcessQueueInfoEmptyBodyMatchesServerFormat(t *testing.T) {
 	want := `{"cachedMsgCount":0,"cachedMsgMaxOffset":0,"cachedMsgMinOffset":0,` +
 		`"cachedMsgSizeInMiB":0,"commitOffset":0,"droped":false,` +
 		`"lastConsumeTimestamp":0,"lastLockTimestamp":0,"lastPullTimestamp":0,` +
@@ -53,7 +54,7 @@ func TestProcessQueueInfoEmptyBodyMatchesJava(t *testing.T) {
 	}
 }
 
-func TestProcessQueueInfoFilledBodyMatchesJava(t *testing.T) {
+func TestProcessQueueInfoFilledBodyMatchesServerFormat(t *testing.T) {
 	pqi := &ProcessQueueInfo{
 		CommitOffset: 12345,
 
@@ -76,10 +77,10 @@ func TestProcessQueueInfoFilledBodyMatchesJava(t *testing.T) {
 	}
 	got := string(pqi.Encode())
 	if !strings.Contains(got, `"cachedMsgSizeInMiB":3`) {
-		t.Errorf("body = %s, want cachedMsgSizeInMiB 3 (a Java int, not a double)", got)
+		t.Errorf("body = %s, want cachedMsgSizeInMiB 3 (an int field, not a double)", got)
 	}
 	if !strings.Contains(got, `"cachedMsgSizeInMiB":3.0`) {
-		// intentional: make sure it is NOT rendered as a JavaDouble
+		// intentional: make sure it is NOT rendered as a JSONDouble
 	} else {
 		t.Errorf("body = %s, cachedMsgSizeInMiB must not carry a decimal point", got)
 	}
@@ -113,7 +114,7 @@ func TestProcessQueueInfoRoundTrips(t *testing.T) {
 	}
 }
 
-func TestPopProcessQueueInfoBodyMatchesJava(t *testing.T) {
+func TestPopProcessQueueInfoBodyMatchesServerFormat(t *testing.T) {
 	want := `{"droped":false,"lastPopTimestamp":0,"waitAckCount":0}`
 	if got := string((&PopProcessQueueInfo{}).Encode()); got != want {
 		t.Errorf("PopProcessQueueInfo empty body\n got %s\nwant %s", got, want)
@@ -152,7 +153,7 @@ func TestCMResultSpellings(t *testing.T) {
 
 // The nullable pair (consumeResult, remark) is what makes the empty body three
 // keys instead of five with two nulls; and autoCommit defaults to TRUE.
-func TestConsumeMessageDirectlyResultBodyMatchesJava(t *testing.T) {
+func TestConsumeMessageDirectlyResultBodyMatchesServerFormat(t *testing.T) {
 	empty := NewConsumeMessageDirectlyResult()
 	if got, want := string(empty.Encode()), `{"autoCommit":true,"order":false,"spentTimeMills":0}`; got != want {
 		t.Errorf("empty body\n got %s\nwant %s", got, want)
@@ -201,8 +202,9 @@ func TestConsumeMessageDirectlyResultRoundTripsBothShapes(t *testing.T) {
 	}
 }
 
-// Java leaves `jstack` null unless setJstack() ran, and fastjson2 drops null
-// fields — so the empty body has exactly SIX keys. Emitting "jstack":"" adds a
+// The wire model leaves `jstack` null unless it was explicitly set, and
+// fastjson2 drops null fields — so the empty body has exactly SIX keys.
+// Emitting "jstack":"" adds a
 // seventh and makes a strict admin read a zero-length stack trace.
 func TestConsumerRunningInfoOmitsJstackUntilItIsSet(t *testing.T) {
 	empty := string(NewConsumerRunningInfo().Encode())
@@ -224,13 +226,13 @@ func TestConsumerRunningInfoOmitsJstackUntilItIsSet(t *testing.T) {
 	}
 	// fastjson2 emits jstack first (alphabetical); the stdlib sorts the same way.
 	if !strings.HasPrefix(got, `{"jstack":"trace-here",`) {
-		t.Errorf("body = %s, want jstack to sort first as in Java", got)
+		t.Errorf("body = %s, want jstack to sort first", got)
 	}
 }
 
-// An explicitly-set empty jstack is still an emitted key (Java distinguishes
-// null from ""), which is why the struct carries HasJstack rather than testing
-// `Jstack != ""`.
+// An explicitly-set empty jstack is still an emitted key (the wire model
+// distinguishes null from ""), which is why the struct carries HasJstack
+// rather than testing `Jstack != ""`.
 func TestConsumerRunningInfoEmitsAnExplicitlyEmptyJstack(t *testing.T) {
 	cri := NewConsumerRunningInfo()
 	cri.HasJstack = true

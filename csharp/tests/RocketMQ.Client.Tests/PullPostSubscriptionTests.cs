@@ -462,7 +462,7 @@ public class PullPostSubscriptionTests
     /// 模式才上送（空表达式归一成 "*"）。
     /// </summary>
     [Fact]
-    public void ConsumerSubscriptionGatingFollowsJavaDefault()
+    public void ConsumerSubscriptionGatingFollowsLegacyDefault()
     {
         var consumer = new DefaultMQPushConsumer(Group);
         var sub = new SubscriptionData(Topic, "TagA");

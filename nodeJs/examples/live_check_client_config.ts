@@ -1,7 +1,6 @@
-// live_check_client_config verifies CHECK_CLIENT_CONFIG(46) — the pre-flight
-// Java runs in DefaultMQPushConsumerImpl.start:1014 and
-// DefaultLitePullConsumerImpl.start:410, right after the subscription routes
-// are resolved and before the first heartbeat.
+// live_check_client_config verifies CHECK_CLIENT_CONFIG(4) — the pre-flight
+// 推送/轻量拉取消费者在 start() 里、订阅路由解析完成之后且首次心跳之前
+// 会向服务端做的一次校验。
 //
 // What 46 is for: a subscription whose expressionType is not TAG (SQL92 or
 // CLASS_FILTER) only compiles on the broker. A client that never asks gets no

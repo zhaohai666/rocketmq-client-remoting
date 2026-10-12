@@ -952,7 +952,7 @@ func TestAsyncSendBySelectorUsesTheSelectedQueue(t *testing.T) {
 	const topic = "AsyncSelectorTopic"
 	p, broker, _ := startAsyncFixture(t, topic, "GID_async_selector", 0, nil)
 
-	hash := common.JavaStringHash("shard-key")
+	hash := common.StringHash31("shard-key")
 	wantQueue := int32(hash % 4)
 	if wantQueue < 0 {
 		wantQueue += 4

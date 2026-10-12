@@ -1,9 +1,10 @@
-// Command headers (Java org.apache.rocketmq.remoting.protocol.header.*).
+// Command headers for the remoting protocol.
 //
-// Field names must match the Java reflection keys byte for byte — the wire
-// carries them as extFields keys. All fields are pointers: nil means the key
-// is not written (Java skips null fields). Bools serialize lowercase
-// ("true"/"false", Java Boolean.toString).
+// Field names are the broker-side reflection keys and must match byte for
+// byte — the wire carries them as extFields keys. All fields are pointers:
+// nil means the key is not written (absent keys are skipped on both sides).
+// Bools serialize lowercase ("true"/"false") because that is the exact
+// spelling the broker's boolean parsing accepts.
 package remoting
 
 import (
@@ -109,8 +110,8 @@ func getBool(ext *common.StringMap, key string) *bool {
 	return &out
 }
 
-// BoundaryType mirrors Java BoundaryType; the wire text is the uppercase enum
-// name.
+// BoundaryType is the SearchOffset boundary selector; the wire text is the
+// uppercase enum name.
 type BoundaryType string
 
 const (
@@ -170,7 +171,7 @@ func (h *SendMessageRequestHeader) FromExtFields(ext *common.StringMap) {
 }
 
 // CreateV2 converts to the V2 (SEND_MESSAGE_V2) header. The brokerName field
-// (key "n") is set by the producer, not here — Java's converter does the same.
+// (key "n") is set by the producer, not here.
 func (h *SendMessageRequestHeader) CreateV2() *SendMessageRequestHeaderV2 {
 	return &SendMessageRequestHeaderV2{
 		ProducerGroup:         h.ProducerGroup,
@@ -673,7 +674,7 @@ func (h *SearchOffsetRequestHeader) FromExtFields(ext *common.StringMap) {
 	h.QueueID = getI32(ext, "queueId")
 	h.Timestamp = getI64(ext, "timestamp")
 	if v, ok := ext.Get("boundaryType"); ok {
-		// Java BoundaryType.getType is lenient: anything but UPPER is LOWER.
+		// Lenient boundary parsing: anything but UPPER is LOWER.
 		if strings.EqualFold(v, string(BoundaryUpper)) {
 			upper := BoundaryUpper
 			h.BoundaryType = &upper
@@ -728,7 +729,7 @@ func (h *GetEarliestMsgStoretimeResponseHeader) FromExtFields(ext *common.String
 
 // ---------------- client lifecycle / heartbeat ----------------
 
-// HeartbeatRequestHeader. The Java field name is "clientID" (capital ID).
+// HeartbeatRequestHeader. The wire key is "clientID" (capital ID).
 type HeartbeatRequestHeader struct {
 	ClientID *string
 }
@@ -765,30 +766,30 @@ type NotifyConsumerIdsChangedRequestHeader struct {
 	ConsumerGroup *string
 }
 
-// NotifyUnsubscribeLiteRequestHeader mirrors Java
-// org.apache.rocketmq.remoting.protocol.header.NotifyUnsubscribeLiteRequestHeader
-// (NOTIFY_UNSUBSCRIBE_LITE = 200073). All three fields are @CFNotNull there, but
-// they are pointers here because the classic client never reads them: Java's
-// registered ClientRemotingProcessor has no case for 200073, so the request is
-// answered with silence (see Instance.processNotifyUnsubscribeLite). The struct
-// exists so the shape is declared and the ext-field spellings are pinned.
+// NotifyUnsubscribeLiteRequestHeader is the header of
+// NOTIFY_UNSUBSCRIBE_LITE = 200073. All three fields are declared
+// @CFNotNull in the protocol, but they are pointers here because the classic
+// client never reads them: this client's push processor has no case for
+// 200073, so the request is answered with silence (see
+// Instance.processNotifyUnsubscribeLite). The struct exists so the shape is
+// declared and the ext-field spellings are pinned.
 //
-// Its Java superclass RpcRequestHeader is an empty abstract marker, so these
-// three are the whole header.
+// Its superclass RpcRequestHeader is an empty abstract marker, so these three
+// are the whole header.
 type NotifyUnsubscribeLiteRequestHeader struct {
 	LiteTopic     *string
 	ConsumerGroup *string
 	ClientID      *string
 }
 
-// FromExtFields reads the Java property names (clientId, not clientID).
+// FromExtFields reads the wire keys (clientId, not clientID).
 func (h *NotifyUnsubscribeLiteRequestHeader) FromExtFields(ext *common.StringMap) {
 	h.LiteTopic = getStr(ext, "liteTopic")
 	h.ConsumerGroup = getStr(ext, "consumerGroup")
 	h.ClientID = getStr(ext, "clientId")
 }
 
-// ToExtFields writes the Java property names.
+// ToExtFields writes the wire keys.
 func (h *NotifyUnsubscribeLiteRequestHeader) ToExtFields(out *common.StringMap) {
 	putStr(out, "liteTopic", h.LiteTopic)
 	putStr(out, "consumerGroup", h.ConsumerGroup)
@@ -949,9 +950,9 @@ func (h *GetConsumerRunningInfoRequestHeader) FromExtFields(ext *common.StringMa
 }
 
 // ConsumeMessageDirectlyResultRequestHeader (CONSUME_MESSAGE_DIRECTLY = 309).
-// Java's header also carries topic/topicSysFlag/groupSysFlag; the admin side
-// sets topic when it initiates the request, the broker push path leaves it
-// unset.
+// The full protocol header also carries topic/topicSysFlag/groupSysFlag; the
+// admin side sets topic when it initiates the request, the broker push path
+// leaves it unset.
 type ConsumeMessageDirectlyResultRequestHeader struct {
 	ConsumerGroup *string
 	ClientID      *string
@@ -1037,15 +1038,14 @@ func (h *CheckTransactionStateResponseHeader) FromExtFields(ext *common.StringMa
 
 // PopMessageRequestHeader (POP_MESSAGE = 200050).
 //
-// Note which fields are primitives in Java: queueId/maxMsgNums/invisibleTime/
-// pollTime/bornTime/initMode are `int`/`long`, so RemotingCommand's
+// Note which fields are primitives on the broker's header class: queueId/
+// maxMsgNums/invisibleTime/pollTime/bornTime/initMode are `int`/`long`, so the
 // reflection-based extFields writer emits them even when they are 0, and
 // `order` is a `Boolean` initialised to FALSE so it is always emitted as
 // "false". Treating those as optional here would change the wire bytes.
 //
-// Bname is the inherited RpcRequestHeader.bname; Java's popAsync sets it from
-// the message queue's broker name. The broker ignores it for POP, but it is
-// part of what Java sends.
+// Bname is the inherited RpcRequestHeader.bname, set from the message queue's
+// broker name. The broker ignores it for POP, but it stays on the wire.
 type PopMessageRequestHeader struct {
 	Bname         *string
 	ConsumerGroup *string
@@ -1094,13 +1094,12 @@ func (h *PopMessageRequestHeader) FromExtFields(ext *common.StringMap) {
 	h.AttemptID = getStr(ext, "attemptId")
 }
 
-// IsOrder mirrors Java PopMessageRequestHeader#isOrder: a nil `order` is false,
-// never true-by-default.
+// IsOrder reports the order flag: a nil `order` is false, never
+// true-by-default.
 func (h *PopMessageRequestHeader) IsOrder() bool {
 	return h.Order != nil && *h.Order
 }
 
-// IsTimeoutTooMuch mirrors Java PopMessageRequestHeader#isTimeoutTooMuch.
 func (h *PopMessageRequestHeader) IsTimeoutTooMuch() bool {
 	poll, born := int64(0), int64(0)
 	if h.PollTime != nil {
@@ -1117,7 +1116,7 @@ func (h *PopMessageRequestHeader) IsTimeoutTooMuch() bool {
 // startOffsetInfo/msgOffsetInfo/orderCountInfo are the broker's per-queue
 // offset tables. They are what makes an ACK addressable at all: without them
 // the client falls back to building a checkpoint from the message's own queue
-// offset (see MQClientAPIImpl.processPopResponse).
+// offset.
 type PopMessageResponseHeader struct {
 	PopTime         *int64
 	InvisibleTime   *int64
@@ -1184,8 +1183,8 @@ func (h *AckMessageRequestHeader) FromExtFields(ext *common.StringMap) {
 
 // ChangeInvisibleTimeRequestHeader (CHANGE_MESSAGE_INVISIBLETIME = 200053).
 //
-// `suspend` is a Java primitive `boolean` defaulting to false, so it is always
-// on the wire.
+// `suspend` is a primitive `boolean` on the broker's header class, defaulting
+// to false, so it is always on the wire.
 type ChangeInvisibleTimeRequestHeader struct {
 	Bname         *string
 	ConsumerGroup *string
@@ -1223,8 +1222,7 @@ func (h *ChangeInvisibleTimeRequestHeader) FromExtFields(ext *common.StringMap) 
 }
 
 // ChangeInvisibleTimeResponseHeader. The reply carries the NEW popTime and
-// invisibleTime; the client rebuilds its checkpoint from them (MQClientAPIImpl
-// .changeInvisibleTimeAsync).
+// invisibleTime; the client rebuilds its checkpoint from them.
 type ChangeInvisibleTimeResponseHeader struct {
 	PopTime       *int64
 	InvisibleTime *int64

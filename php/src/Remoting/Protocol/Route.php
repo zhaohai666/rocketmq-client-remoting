@@ -9,7 +9,8 @@ use RocketMQ\Common\MixAll;
 use RocketMQ\Common\PermName;
 
 /**
- * Topic 路由数据（对应 org.apache.rocketmq.remoting.protocol.route.*，移植自 protocol/route.py）。
+ * Topic 路由数据：namesrv 回包里的 queueDatas / brokerDatas / filterServerTable 三张表，
+ * 发布侧与订阅侧的队列集合都从它组装。
  */
 
 final class QueueData
@@ -174,26 +175,25 @@ final class TopicRouteData
     /** @var array<string, mixed>|null */
     public ?array $topicQueueMappingByBroker = null;
 
-    /** 返回 broker 数据列表（与 Java topicRouteData.getBrokerDatas() 对齐）。 */
     public function getBrokerDatas(): array
     {
         return $this->brokerDatas;
     }
 
     /**
-     * 根据 queueDatas + brokerDatas 组装全部可写 MessageQueue（对应 Java 的 topicRouteData2TopicPublishInfo 组装逻辑）。
+     * 根据 queueDatas + brokerDatas 组装全部可写 MessageQueue。
      *
-     * topic 用于回填到每个 MessageQueue（Java 用真实 topic，而不是空串），否则后续
+     * topic 要回填到每个 MessageQueue（必须是真实 topic，不能留空串），否则后续
      * send/pull 用 mq.topic 回查路由时会查不到。
      *
-     * 两条跳过条件逐字对应 Java ``MQClientInstance.topicRouteData2TopicPublishInfo:294-303``：
-     * 路由里查不到同名 broker，**或者**该 broker 的 brokerAddrs 里没有 ``MASTER_ID``。
+     * 两条跳过条件是路由语义的硬要求：路由里查不到同名 broker，**或者**该 broker
+     * 的 brokerAddrs 里没有 ``MASTER_ID``，任一命中就整台跳过。
      * 后者不是冗余判断：从节点自己也会注册进 namesrv，且默认配置下它照样带写位
-     * （``RouteInfoManager:344-346`` 只在「prime slave 且 enableActingMaster」时才抹掉
-     * WRITE）——master 一旦掉线，路由里同一个 brokerName 就只剩 brokerId=1，写位还在。
+     * （namesrv 只在「prime slave 且 enableActingMaster」时才抹掉 WRITE）—— master
+     * 一旦掉线，路由里同一个 brokerName 就只剩 brokerId=1，写位还在。
      * 漏判这条，生产者会挑中这台队列并把消息发到从节点上，而从节点对发送请求是
-     * ``rejectRequest``（``SendMessageProcessor:131`` ⇒ SYSTEM_BUSY，还是个可重试码），
-     * 于是白烧一轮超时；Java 那边这种队列压根进不了发布信息，发送直接当无路由处理。
+     * ``rejectRequest`` ⇒ SYSTEM_BUSY，还是个可重试码，于是白烧一轮超时；
+     * 正确做法是让这种队列压根进不了发布信息，发送直接当无路由处理。
      *
      * @return list<MessageQueue>
      */
@@ -225,12 +225,12 @@ final class TopicRouteData
     }
 
     /**
-     * 按 queueDatas 组装全部**可读** MessageQueue（对应 Java ``MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332``）。
+     * 按 queueDatas 组装全部**可读** MessageQueue。
      *
-     * 与 getAllMessageQueue()（发布侧）有两处刻意的不同，都是 Java 的语义：
-     * ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 在 Java 里照样能被消费）；
-     * ②**不要求 broker 有 master** —— 主挂掉后从节点仍要能被拉取，客户端侧
-     * ``findBrokerAddressInSubscribe`` 正是为此才带从节点回退。只有发布信息需要 master。
+     * 与 getAllMessageQueue()（发布侧）有两处刻意的不同：
+     * ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 照样能被消费）；
+     * ②**不要求 broker 有 master** —— 主挂掉后从节点仍要能被拉取，订阅侧的 broker
+     * 地址选择正是为此才带从节点回退。只有发布信息需要 master。
      *
      * @return list<MessageQueue>
      */

@@ -218,7 +218,7 @@ class TestMessageId:
         assert len(msg_id) == 56
         assert decode_message_id(msg_id) == ("2001:db8::1", 10911, 4096)
 
-    def test_bytes2string_matches_java_hex(self):
+    def test_bytes2string_matches_the_hex_format(self):
         assert bytes2string(b"\x00\x0f\xab\xff") == "000FABFF"
 
 

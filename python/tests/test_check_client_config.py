@@ -120,7 +120,7 @@ def test_tag_only_subscription_sends_nothing():
     assert rec.requests == []
 
 
-def test_sql92_request_shape_matches_java():
+def test_sql92_request_shape_matches_the_wire_contract():
     inst, rec = _instance(_sub())
     inst.check_client_in_broker()
     assert rec.codes == [RequestCode.CHECK_CLIENT_CONFIG]
@@ -173,7 +173,7 @@ def test_no_route_skips_the_subscription():
     assert rec.check_requests == []
 
 
-def test_transport_error_is_wrapped_with_java_message():
+def test_transport_error_is_wrapped_with_the_protocol_message():
     """连不上 broker 时 Java 不吞异常，而是换成一段固定文案再抛。"""
     inst, rec = _instance(_sub())
     rec.responses = [RemotingConnectException(BROKER)]

@@ -218,7 +218,7 @@ def test_batch_pinned_send_accepts_a_matching_topic():
 
 
 # ---------------------------------------------------------------- 异步
-def test_async_pinned_send_reports_the_java_wording_through_the_callback():
+def test_async_pinned_send_reports_the_protocol_wording_through_the_callback():
     p = _producer()
     client = p._mq_client
     cb = _RecordingCallback()
@@ -265,7 +265,7 @@ def test_async_batch_pinned_send_uses_the_async_wording():
 
 
 # ---------------------------------------------------------------- 按 Java 不设守卫的入口
-def test_oneway_pinned_send_has_no_guard_like_java():
+def test_oneway_pinned_send_skips_the_guard():
     """Java ``sendOneway(Message, MessageQueue):1303-1310`` 只做 state + Validators，
     没有 topic 一致性检查；这里按原样钉住（免得后来的"顺手补上"造成与 Java 不一致）。"""
     p = _producer()
@@ -277,7 +277,7 @@ def test_oneway_pinned_send_has_no_guard_like_java():
     assert client.topics == ["TopicTest"]
 
 
-def test_selector_send_has_no_guard_like_java():
+def test_selector_send_skips_the_guard():
     """选择器入口由选择器自己挑队列（Java ``:729`` 的 ``queueWithNamespace`` 只补前缀），
     没有调用方指定的队列可比。"""
     p = _producer(NS)

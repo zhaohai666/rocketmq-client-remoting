@@ -26,7 +26,7 @@ public class ScheduledIntervalsTests
     /// pollNameServerInterval=30000、persistConsumerOffsetInterval=5000。
     /// </summary>
     [Fact]
-    public void FacadeDefaultsMatchJavaClientConfig()
+    public void FacadeDefaultsMatchLegacyClientConfig()
     {
         var producer = new DefaultMQProducer("PG_sched_default");
         Assert.Equal(30000, producer.PollNameServerIntervalMillis);

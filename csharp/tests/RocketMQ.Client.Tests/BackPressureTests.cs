@@ -225,7 +225,7 @@ public class BackPressureTests
     }
 
     [Fact]
-    public void FloorsMatchJava()
+    public void FloorsMatchLegacy()
     {
         Assert.Equal(10, FairSemaphore.MinAsyncSendNum);
         Assert.Equal(1024 * 1024, FairSemaphore.MinAsyncSendSize);

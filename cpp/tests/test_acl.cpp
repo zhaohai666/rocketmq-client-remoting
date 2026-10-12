@@ -156,7 +156,7 @@ static void testBase64Vectors() {
 //   RemotingCommand cmd = RemotingCommand.createRequestCommand(310, null);
 //   ... setExtFields / setBody ...
 //   new AclClientRPCHook(new SessionCredentials(ak, sk[, token])).doBeforeRequest(addr, cmd);
-static void testJavaSignatureVectors() {
+static void testAclSignatureVectors() {
     const std::string sk = "SK_TEST_SECRET_12345678";
     const std::vector<std::pair<std::string, std::string>> v1Ext = {
         {"topic", "MyTopic"}, {"producerGroup", "MyGroup"}, {"a", "1"},
@@ -381,7 +381,7 @@ int main() {
     testSha1Vectors();
     testHmacVectors();
     testBase64Vectors();
-    testJavaSignatureVectors();
+    testAclSignatureVectors();
     testSignatureExcluded();
     testNoHookNoMutation();
     testStreamHookWritesReqT();

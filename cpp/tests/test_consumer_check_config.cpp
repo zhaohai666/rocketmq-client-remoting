@@ -245,7 +245,7 @@ void testThreadMinNotLargerThanMax() {
 
 // ---------------- 闸门顺序 ----------------
 
-void testGateOrderIsJavaOrder() {
+void testGateCheckOrder() {
     // 同时写坏两道时报靠前的那道：一次只吐一个错才修得动。
     DefaultMQPushConsumer c = fresh();
     c.setConsumeThreadMax(1001);
@@ -337,7 +337,7 @@ int main() {
     testDefaultsClearEveryGate();
     testBoundsAndRejection();
     testThreadMinNotLargerThanMax();
-    testGateOrderIsJavaOrder();
+    testGateCheckOrder();
     testStartRejectsBeforeTouchingNetwork();
     std::printf("consumer_check_config: %d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;

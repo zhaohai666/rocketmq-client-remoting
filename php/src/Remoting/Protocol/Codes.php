@@ -5,13 +5,13 @@ declare(strict_types=1);
 namespace RocketMQ\Remoting\Protocol;
 
 /**
- * 请求码 / 响应码 / 语言码 / 序列化类型（对应 org.apache.rocketmq.remoting.protocol 枚举与常量，
- * 移植自 protocol/codes.py）。
+ * 请求码 / 响应码 / 语言码 / 序列化类型：数值与字面量都是协议常量，
+ * broker 按字面值匹配，改一个数就等于把那个功能关掉。
  *
- * RequestCode / ResponseCode 用 UPPER_SNAKE 常量名，与 Java/Python 一致。
+ * RequestCode / ResponseCode 的常量名一律 UPPER_SNAKE，和协议里的字段名同形。
  */
 
-/** 对应 org.apache.rocketmq.remoting.protocol.RequestCode（全量）。 */
+/** 请求码全集。 */
 final class RequestCode
 {
     public const SEND_MESSAGE = 10;
@@ -136,7 +136,7 @@ final class RequestCode
     public const UPDATE_AND_GET_GROUP_FORBIDDEN = 353;
     public const GET_BROKER_MEMBER_GROUP = 901;
     public const BROKER_HEARTBEAT = 904;
-    // ---- 以下由 rocketmq/remoting RequestCode.java 全量补齐（含 controller / acl / 冷数据 / 静态 topic）----
+    // ---- 以下是 broker 侧另有的管理码（controller / acl / 冷数据 / 静态 topic），本端只声明不主动调用 ----
     public const CHECK_ROCKSDB_CQ_WRITE_PROGRESS = 354;
     public const EXPORT_ROCKSDB_CONFIG_TO_JSON = 355;
     public const LITE_PULL_MESSAGE = 361;
@@ -183,7 +183,7 @@ final class RequestCode
     public const DELETE_SUBSCRIPTION_GROUP_LIST = 5003;
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.RemotingSysResponseCode。 */
+/** 系统级响应码：任何 broker 都会回的基线那五个。 */
 final class RemotingSysResponseCode
 {
     public const SUCCESS = 0;
@@ -194,8 +194,8 @@ final class RemotingSysResponseCode
 }
 
 /**
- * 对应 Java ResponseCode extends RemotingSysResponseCode。
- * PHP 常量不能继承，这里把父类五个系统码原样再声明一份。
+ * 业务响应码表：协议里它是「系统码 + 业务码」一张表，PHP 常量不能继承，
+ * 这里把系统级那五个原样再声明一份。
  */
 final class ResponseCode
 {
@@ -265,7 +265,7 @@ final class ResponseCode
     public const LITE_SUBSCRIPTION_QUOTA_EXCEEDED = 2018;
     public const USER_NOT_EXIST = 3001;
     public const POLICY_NOT_EXIST = 3002;
-    // 客户端侧伪响应码（Java ResponseCode 中的负值常量）
+    // 客户端侧伪响应码：负值只在本地产生，从不上报文
     public const RPC_UNKNOWN = -1000;
     public const RPC_ADDR_IS_NULL = -1002;
     public const RPC_SEND_TO_CHANNEL_FAILED = -1004;
@@ -273,9 +273,8 @@ final class ResponseCode
 }
 
 /**
- * 语言枚举（与 Java LanguageCode 的 byte 码一致）。
- * 对齐 Python：Python 自增了 PYTHON=3，PHP 端同样已有 PHP=10
- * （broker 只做展示，不校验枚举值）。
+ * 语言枚举：码值是协议里定死的字节取值，本端口上报 PHP=10。
+ * （broker 只用这个字段做展示，不校验枚举值，多出来的语言码不影响兼容。）
  */
 enum LanguageCode: int
 {
@@ -294,7 +293,7 @@ enum LanguageCode: int
     case RUST = 12;
     case NODE_JS = 13;
 
-    /** 对应 Python LanguageCode.value_of：码值（低 8 位）→ 枚举名。 */
+    /** 码值（取低 8 位）→ 枚举名；未知返回 null。 */
     public static function valueOf(int $code): ?string
     {
         $c = $code & 0xFF;
@@ -306,7 +305,7 @@ enum LanguageCode: int
         return null;
     }
 
-    /** 对应 Python LanguageCode.name_to_code：枚举名（大小写不敏感）→ 码值，未知回 OTHER。 */
+    /** 枚举名（大小写不敏感）→ 码值，未知回 OTHER。 */
     public static function nameToCode(string $name): int
     {
         $upper = strtoupper($name);
@@ -319,13 +318,13 @@ enum LanguageCode: int
     }
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.SerializeType。 */
+/** header 的序列化类型：JSON 还是紧凑的 ROCKETMQ 自研格式。 */
 enum SerializeType: int
 {
     case JSON = 0;
     case ROCKETMQ = 1;
 
-    /** 对应 Python SerializeType.value_of：码值（低 8 位）→ 名字。 */
+    /** 码值（取低 8 位）→ 名字；未知返回 null。 */
     public static function nameOf(int $code): ?string
     {
         return match ($code & 0xFF) {
@@ -336,14 +335,14 @@ enum SerializeType: int
     }
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.RemotingCommandType。 */
+/** 命令类型：请求还是应答。 */
 enum RemotingCommandType: string
 {
     case REQUEST_COMMAND = 'REQUEST_COMMAND';
     case RESPONSE_COMMAND = 'RESPONSE_COMMAND';
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.ForbiddenType。 */
+/** 被禁对象类型码（broker 返回禁写/禁读错误时区分是哪一类）。 */
 final class ForbiddenType
 {
     public const BROKER_FORBIDDEN = 1;
@@ -353,13 +352,13 @@ final class ForbiddenType
     public const SUBSCRIPTION_FORBIDDEN = 5;
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.RequestType。 */
+/** 请求类型：目前协议里只有 STREAM 一个取值，走 ReqT 头。 */
 final class RequestType
 {
     public const STREAM = 0;
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.RequestSource。 */
+/** 请求来源：SDK 还是各类 proxy 转发。 */
 final class RequestSource
 {
     public const SDK = -1;

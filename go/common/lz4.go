@@ -8,9 +8,8 @@ import (
 
 // LZ4 block-format codec plus the LZ4 frame wrapper — hand-implemented, zero
 // third-party dependencies (repo rule). The RocketMQ wire carries the LZ4
-// FRAME format (Java's lz4-java LZ4FrameOutputStream / Python lz4.frame /
-// the lz4 CLI all speak the same spec); the bare block layer below is what a
-// frame block holds.
+// FRAME format (the public lz4 frame spec, the same one the lz4 CLI speaks);
+// the bare block layer below is what a frame block holds.
 //
 // Frame layout: magic(4) + FLG(1) + BD(1) + [C.Size(8)] + HC(1)
 //   - { BlockSize(4) + block }* + EndMark(4) + [C.Checksum(4)].
@@ -19,7 +18,7 @@ import (
 // xxh32(FLG+BD+[C.Size]); a block that fails to shrink is stored raw (bit31).
 const (
 	lz4Magic         = 0x184d2204
-	lz4FrameBlockMax = 65536 // BD=0x40 -> 64KB, matching Java/Python defaults
+	lz4FrameBlockMax = 65536 // BD=0x40 -> 64KB max frame block
 
 	lz4MinMatch = 4
 	// The last 5 bytes of the input must stay literals (block-format rule);
@@ -241,9 +240,9 @@ func xxh32(data []byte, seed uint32) uint32 {
 	return h
 }
 
-// lz4CompressFrame produces the LZ4 frame format (Java LZ4FrameOutputStream /
-// Python lz4.frame compatible). No block/content checksum on write (the two
-// other ports' default); incompressible blocks are stored raw (bit31 set).
+// lz4CompressFrame produces the LZ4 frame format, decodable by any
+// spec-compliant frame reader. No block/content checksum on write (checksums
+// are optional per the spec); incompressible blocks are stored raw (bit31 set).
 func lz4CompressFrame(data []byte) []byte {
 	header := []byte{lz4FlgWrite, lz4BdWrite}
 	var cs [8]byte

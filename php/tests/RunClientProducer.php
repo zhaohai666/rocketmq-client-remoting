@@ -9,7 +9,7 @@ declare(strict_types=1);
  * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
  *
  * 网络相关用例以 `--broker` 参数二次拉起自身作为**子进程**假 broker（stream_socket_server，
- * 手法照抄 RunClientInstance.php）。broker 收到的每条命令追加写入一个 JSON 行日志文件，
+ * 手法与 RunClientInstance.php 相同）。broker 收到的每条命令追加写入一个 JSON 行日志文件，
  * 供父进程断言「broker 实际收到了什么」（发送码、sysFlag、END_TRANSACTION 的
  * commitOrRollback 等）。时钟通过 DefaultMQProducer::$monoClock / $wallClock 注入。
  */
@@ -627,8 +627,8 @@ final class RunClientProducer
     private function testConstantsAndDefaults(): void
     {
         $p = new DefaultMQProducer('GID-defs');
-        $this->checkSame("message's topic not equal mq's topic", DefaultMQProducer::PINNED_TOPIC_MISMATCH_SYNC, '定点守卫同步文案（Java :1235）');
-        $this->checkSame('Topic of the message does not match its target message queue', DefaultMQProducer::PINNED_TOPIC_MISMATCH_ASYNC, '定点守卫异步文案（Java :1278）');
+        $this->checkSame("message's topic not equal mq's topic", DefaultMQProducer::PINNED_TOPIC_MISMATCH_SYNC, '定点守卫同步文案');
+        $this->checkSame('Topic of the message does not match its target message queue', DefaultMQProducer::PINNED_TOPIC_MISMATCH_ASYNC, '定点守卫异步文案');
         $this->checkSame(3000, $p->sendMsgTimeout, '默认 sendMsgTimeout=3000');
         $this->checkSame(1024 * 4, $p->compressMsgBodyOverHowmuch, '默认 compressMsgBodyOverHowmuch=4096');
         $this->checkSame(5, $p->compressLevel, '默认 compressLevel=5');
@@ -726,7 +726,7 @@ final class RunClientProducer
         $p->setEnableTrace(true);
         $this->checkSame(true, $p->isEnableTrace(), 'set/isEnableTrace');
         $p->setAutoBatch(true);
-        $this->checkSame(false, $p->getAutoBatch(), '未 start 时 getAutoBatch 恒 false（Java 短路）');
+        $this->checkSame(false, $p->getAutoBatch(), '未 start 时 getAutoBatch 恒 false（未启动即短路）');
         $this->checkSame(0, $p->getBatchMaxDelayMs(), '累加器未建时 getBatchMaxDelayMs=0');
         $this->checkSame(0, $p->getBatchMaxBytes(), '累加器未建时 getBatchMaxBytes=0');
         $this->checkSame(0, $p->getTotalBatchMaxBytes(), '累加器未建时 getTotalBatchMaxBytes=0');
@@ -742,7 +742,7 @@ final class RunClientProducer
         $p->setBackPressureForAsyncSendNum(100);
         $this->checkSame(100, $p->getBackPressureForAsyncSendNum(), '正常条数上限直接生效');
 
-        // 运行时改容量的语义：总量平移、在途保留（Java DefaultMQProducerTest:593-595）
+        // 运行时改容量的语义：总量平移、在途保留
         $sem = $this->privateOf($p, 'semaphoreAsyncSendNum');
         $sem->tryAcquire(30, 0); // 30 份在途
         $p->setBackPressureForAsyncSendNum(80);
@@ -771,7 +771,7 @@ final class RunClientProducer
 
     private function testStaticHelpers(): void
     {
-        // backPressurePermits：>floor 透传；==floor / <floor 兜地板（Java :141-153）
+        // backPressurePermits：>floor 透传；==floor / <floor 兜地板（额度下限保护）
         $this->checkSame(20, DefaultMQProducer::backPressurePermits(20, 10, 'x'), 'permits: 20>10 → 20');
         $this->checkSame(10, DefaultMQProducer::backPressurePermits(10, 10, 'x'), 'permits: ==floor 也走 else → 10');
         $this->checkSame(10, DefaultMQProducer::backPressurePermits(3, 10, 'x'), 'permits: 3<10 → 10');
@@ -807,7 +807,7 @@ final class RunClientProducer
         $this->checkThrows(function () use ($d3) {
             $d3->putProperty('TIMER_DELAY_MS', 'abc');
             DefaultMQProducer::maxDelayValue($d3);
-        }, \InvalidArgumentException::class, 'maxDelay: 非法值直接抛（对齐 Long.parseLong）');
+        }, \InvalidArgumentException::class, 'maxDelay: 非法值直接抛（数字解析失败即抛）');
 
         // classifyAsyncFailure：三分支 + 非 remoting 原样
         $cost = 33;
@@ -930,7 +930,7 @@ final class RunClientProducer
         $gated->onException(new MQClientException('late'));
         $this->checkSame(10, $semNum->availablePermits(), '背压: 重复回调不虚增条数');
         $this->checkSame(1024, $semSize->availablePermits(), '背压: 重复回调不虚增字节');
-        $this->checkSame(2, $delegate->calls, '背压: 委托仍被再次调用（与 Java 直接转发一致）');
+        $this->checkSame(2, $delegate->calls, '背压: 委托仍被再次调用（额度不足时直接转发）');
 
         // 只拿到条数、字节没拿到：只还条数
         $semNum2 = new FairSemaphore(10);

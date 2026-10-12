@@ -30,7 +30,7 @@
 //    （Java 里 null 会在调用处抛 NPE 并被 rebalance 的 catch 记 error，这里直接挡在门口）。
 // 4. **broker 名的 `@` 切分**：Java `AllocateMessageQueueByMachineRoom` 用 `String#split("@")`，
 //    它会**丢掉末尾空段**（`"room1@"` → 1 段、`"room1@b@"` → 2 段），而 C# `String#Split` 不会。
-//    本文件用 `JavaSplit` 复刻 Java 口径，否则一条队列参不参与分配会与 Java 客户端不一致。
+//    本文件用 `LegacySplit` 复刻 Java 口径，否则一条队列参不参与分配会与 Java 客户端不一致。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -76,7 +76,7 @@ public static class AllocateMessageQueueStrategyUtil
     /// （哪怕它本身就是空串），所以不能无条件裁尾。JDK 17 实测：
     /// <c>""</c> → 1 段、<c>"@"</c> → 0 段、<c>"room1@"</c> → 1 段、<c>"room1@b@"</c> → 2 段。
     /// </remarks>
-    public static string[] JavaSplit(string text, char sep)
+    public static string[] Split(string text, char sep)
     {
         string[] parts = text.Split(sep);
         if (parts.Length == 1)
@@ -326,7 +326,7 @@ public sealed class AllocateMessageQueueConsistentHash : IAllocateMessageQueueSt
 /// "Computer room Hashing queue algorithm, such as Alipay logic room"）。
 /// </summary>
 /// <remarks>
-/// ⚠ broker 名用 <see cref="AllocateMessageQueueStrategyUtil.JavaSplit"/> 切，判据是 Java 的
+/// ⚠ broker 名用 <see cref="AllocateMessageQueueStrategyUtil.Split"/> 切，判据是 Java 的
 /// 「裁掉尾空段后正好 2 段」。
 /// ⚠ 分片算式与 <see cref="AllocateMessageQueueAveragely"/> **看着像但不同**：余数队列按
 /// <c>rem &gt; currentIndex</c> 分给**前 rem 个**消费者，且每人区间长度恒为 mod。
@@ -380,7 +380,7 @@ public sealed class AllocateMessageQueueByMachineRoom : IAllocateMessageQueueStr
         var premqAll = new List<MessageQueue>();
         foreach (MessageQueue mq in mqAll)
         {
-            string[] temp = AllocateMessageQueueStrategyUtil.JavaSplit(mq.BrokerName, '@');
+            string[] temp = AllocateMessageQueueStrategyUtil.Split(mq.BrokerName, '@');
             if (temp.Length == 2 && rooms.Contains(temp[0]))
             {
                 premqAll.Add(mq);

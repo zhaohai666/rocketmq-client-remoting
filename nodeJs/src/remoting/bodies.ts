@@ -1,10 +1,8 @@
 // -*- coding: utf-8 -*-
-// Common response/request bodies (org.apache.rocketmq.remoting.protocol.body.*).
-// Mirrors python/remoting/protocol/body.py, admin_body.py (shared parts),
-// and the Java admin bodies. Many of these bodies contain Map<MessageQueue, X>
-// whose JSON keys are inline-object keys (fastjson2 non-string keys); we use the
-// fastjson-tolerant RemotingSerializable.decode and the messageQueueKey helpers to
-// round-trip them. Field names match Java exactly.
+// 经典 remoting 协议的公共请求/响应 body。
+// 其中许多 body 含 Map<MessageQueue, X>，其 JSON 键是内联对象键（服务端 JSON
+// 序列化的非字符串键形态）；我们用 fastjson 兼容的 RemotingSerializable.decode
+// 和 messageQueueKey 辅助函数来往返解析它们。字段名与 wire 协议键完全一致。
 import { MessageQueue } from '../common/message.ts';
 import { RemotingSerializable, decodeMessageQueueKey } from './serialize.ts';
 import { BrokerData, QueueData, TopicRouteData, brokerData2Json, topicRouteData2TopicRouteDataJson } from './route.ts';
@@ -16,7 +14,7 @@ export { BrokerData, QueueData, TopicRouteData, brokerData2Json, topicRouteData2
 export { SubscriptionGroupWrapper };
 
 // ---------------------------------------------------------------------------
-// MessageQueue <-> inline JSON key helpers (mirror admin_body.py).
+// MessageQueue <-> 内联 JSON 键的辅助函数。
 // ---------------------------------------------------------------------------
 export function messageQueueKey(mq: MessageQueue): string {
   return `{"brokerName":"${mq.brokerName}","queueId":${mq.queueId},"topic":"${mq.topic}"}`;
@@ -617,9 +615,9 @@ export class ConsumerRunningInfo {
 }
 
 // ---------------------------------------------------------------------------
-// TopicConfig (shared by bodies + admin). Java defaults: readQueueNums=16,
+// TopicConfig（bodies 与 admin 共用）。默认值：readQueueNums=16,
 // writeQueueNums=16, perm=6, topicFilterType=SINGLE_TAG, topicSysFlag=0,
-// order=false, attributes={}.
+// order=false, attributes={}。
 // ---------------------------------------------------------------------------
 export const TopicFilterType = {
   SINGLE_TAG: 'SINGLE_TAG',
@@ -680,10 +678,10 @@ export class TopicConfig {
       d['order'] === true,
     );
   }
-  // NOTE: Java TopicConfig.readBody/writeBody are a proprietary binary KV codec
-  // (used by UPDATE_AND_CREATE_TOPIC bodies); that codec is not part of the
-  // foundation's RocketMQSerializable and is absent from the Python reference,
-  // so we omit it here (encode/decode use JSON, consistent with the rest).
+  // 注意：UPDATE_AND_CREATE_TOPIC 的 body 在服务端还有一套私有二进制 KV 编解码
+  // （TopicConfig readBody/writeBody），它不属于 RocketMQSerializable 的
+  // 通用序列化范围；这里不实现该编解码，encode/decode 统一走 JSON，与其余
+  // body 保持一致。
   encode(): Buffer { return RemotingSerializable.encode(this.toDict()); }
   static decode(data: Buffer): TopicConfig {
     return TopicConfig.fromDict(RemotingSerializable.decode(data) as Record<string, any>);

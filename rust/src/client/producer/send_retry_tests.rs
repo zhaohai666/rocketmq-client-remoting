@@ -358,7 +358,7 @@ fn expect_client_code(err: Error) -> (Option<i32>, String) {
 
 /// 默认集合与 Java `DefaultMQProducer#retryResponseCodes` 完全一致。
 #[test]
-fn default_retry_response_codes_match_java() {
+fn default_retry_response_codes_match_protocol() {
     let cfg = ProducerConfig::default();
     let expected: BTreeSet<i32> = [
         response_code::SYSTEM_ERROR,
@@ -972,7 +972,7 @@ async fn unit_name_only_changes_the_client_id() {
 /// `DefaultAuthorizationContextBuilder:230-240`）。所以两个都得断言 ——
 /// 只对齐码不对齐 `m`，批量 body 会被按单条解析。
 #[tokio::test]
-async fn send_request_code_follows_java_three_way_branch() {
+async fn send_request_code_follows_protocol_three_way_branch() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = started("send_code_branch", &cluster).await;
@@ -1446,7 +1446,7 @@ async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
 
 /// Java `DefaultMQProducer:169/175/181` —— 默认关，1024 条 / 100M 字节。
 #[test]
-fn backpressure_defaults_match_java() {
+fn backpressure_defaults_match_contract() {
     let producer = DefaultMQProducer::new("GID_bp_default").expect("组名合法");
     assert!(!producer.is_enable_backpressure_for_async_mode());
     assert_eq!(producer.get_back_pressure_for_async_send_num(), 1024);
@@ -1538,7 +1538,7 @@ async fn disabled_gate_stays_out_of_the_way() {
 
 /// Java `:654-658` —— 条数拿不到就回调，一次请求都不发（预算被闸自己花光）。
 #[tokio::test]
-async fn num_gate_rejects_with_java_message_and_sends_nothing() {
+async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = backpressure_producer("bp_num_gate", &cluster, MIN_ASYNC_SEND_NUM).await;
@@ -2325,7 +2325,7 @@ async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
 /// 先来一笔普通发送把 broker 地址表喂上：单向定点发送自己不做路由查询
 /// （`need_addr` 只读缓存），这一步与守卫无关。
 #[tokio::test]
-async fn oneway_pinned_send_has_no_topic_guard_like_java() {
+async fn oneway_pinned_send_has_no_topic_guard() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = started("pinned_guard_oneway", &cluster).await;

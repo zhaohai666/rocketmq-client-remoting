@@ -7,11 +7,11 @@ import (
 	"io"
 )
 
-// Message body compression. ZLIB is the RFC1950 stream (Java DeflaterOutputStream,
-// Python zlib.compress). LZ4 is the LZ4 frame format and ZSTD the zstd frame
+// Message body compression. ZLIB is the RFC1950 zlib stream. LZ4 is the LZ4
+// frame format and ZSTD the zstd frame
 // format — both hand-implemented in this package (lz4.go / zstd.go) with zero
-// third-party dependencies, cross-compatible with Java's lz4-java / zstd-jni and
-// the lz4/zstd CLIs. See lz4.go/zstd.go for the format notes.
+// third-party dependencies, cross-compatible with the lz4/zstd CLIs and any
+// spec-compliant reader. See lz4.go/zstd.go for the format notes.
 //
 // Asymmetry to keep in mind: ZSTD DECODES the full format (Huffman + FSE blocks)
 // but only ENCODES store-only Raw/RLE blocks, so a Go-produced ZSTD body stays a
@@ -22,8 +22,8 @@ const (
 	ZstdDefaultLevel     = 3
 )
 
-// NormalizeCompressionType mirrors Java CompressionType.findByValue's backward
-// compatibility: 1->LZ4, 2->ZSTD, and 0 (pre-type-bit clients) and 3 -> ZLIB.
+// NormalizeCompressionType keeps backward compatibility for the wire type
+// values: 1->LZ4, 2->ZSTD, and 0 (pre-type-bit clients) and 3 -> ZLIB.
 // 0 must map to ZLIB or old compressed messages fail to decompress while the
 // flag is cleared anyway — silent garbage.
 func NormalizeCompressionType(compressionType int32) int32 {
@@ -50,8 +50,8 @@ func unsupported(compressionType int32) error {
 	return DecodeError(fmt.Sprintf("unsupported compression type: %d", compressionType))
 }
 
-// Compress mirrors Java Compressor#compress(byte[], level). As in Python, level
-// only applies to ZLIB; LZ4/ZSTD ignore it (their codecs here are level-free).
+// Compress encodes a body with the given type. level only applies to ZLIB;
+// LZ4/ZSTD ignore it (their codecs here are level-free).
 func Compress(data []byte, compressionType int32, level int32) ([]byte, error) {
 	switch NormalizeCompressionType(compressionType) {
 	case ZlibType:
@@ -65,7 +65,8 @@ func Compress(data []byte, compressionType int32, level int32) ([]byte, error) {
 	}
 }
 
-// Decompress mirrors Java Compressor#decompress.
+// Decompress decodes a body produced by Compress; a decode failure is an
+// error, never a passthrough of the compressed bytes.
 func Decompress(data []byte, compressionType int32) ([]byte, error) {
 	switch NormalizeCompressionType(compressionType) {
 	case ZlibType:

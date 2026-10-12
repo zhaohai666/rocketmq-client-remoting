@@ -413,7 +413,7 @@ public static class InnerIdGenerator
         writer.WriteInt16(unchecked((short)(pidv & 0xFFFF)));
 
         // 类加载 hash（Java 为 abs(_classLoaderHash)）：用稳定的字符串哈希替代进程随机 hash
-        int classHash = JavaHash.JavaStringHash("RocketMQClient");
+        int classHash = LegacyHash.StringHash("RocketMQClient");
         if (classHash < 0)
         {
             classHash = -classHash;

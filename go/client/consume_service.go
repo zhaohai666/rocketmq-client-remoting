@@ -1,6 +1,5 @@
-// Consume services (Java
-// org.apache.rocketmq.client.impl.consumer.ConsumeMessageConcurrentlyService /
-// ConsumeMessageOrderlyService), plus the two periodic sweeps they own.
+// Consume services for the push consumer: the concurrently and the orderly
+// flavour, plus the two periodic sweeps they own.
 //
 // The two paths are NOT variants of one another — four differences must be kept:
 //
@@ -26,8 +25,8 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// javaIntMax is Java Integer.MAX_VALUE — the orderly "unlimited" sentinel.
-const javaIntMax = math.MaxInt32
+// unlimitedReconsumeTimes is the orderly "unlimited" reconsume-times sentinel.
+const unlimitedReconsumeTimes = math.MaxInt32
 
 // consumeBatch dispatches one batch and handles redelivery/suspension. Returns
 // whether the consumed offset advanced.
@@ -419,7 +418,7 @@ func (c *DefaultMQPushConsumer) sleepOrderly(ctx *ConsumeOrderlyContext) {
 // Integer.MAX_VALUE here (orderly retries in place, the broker never counts).
 func (c *DefaultMQPushConsumer) orderlyMaxReconsumeTimes() int32 {
 	if c.maxReconsumeTimes == -1 {
-		return javaIntMax
+		return unlimitedReconsumeTimes
 	}
 	return c.maxReconsumeTimes
 }

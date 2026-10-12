@@ -1,7 +1,6 @@
 // -*- coding: utf-8 -*-
-// Produce accumulator for batching small messages before a single broker send.
-// Faithful port of python/client/produce_accumulator.py (threads replaced by an
-// async guard, since Node has no Python threads). The producer wires a real sender.
+// 攒批累加器：把小消息在真正发送之前按聚合 key 攒成一批。node 端以异步守护代替线程。
+// 具体的 sender 由 producer 侧接进来。
 import { Message } from '../common/message.ts';
 import { MessageQueue } from '../common/message.ts';
 import { isWaitStoreMsgOK } from '../common/message.ts';
@@ -140,8 +139,8 @@ export function getOrCreateProduceAccumulator(clientId: string): ProduceAccumula
   return acc;
 }
 
-// Split a single batch SendResult into per-message SendResults (mirrors Java's handling of an
-// inner batch: each message shares the queue/offset but gets a distinct msgId slice when available).
+// 把一条批量 SendResult 拆成 per-message 的 SendResult：批内每条消息共享同一个
+// queue/offset，msgId 可用时各自切一段。
 export function splitSendResults(batchResult: SendResult, msgs: Message[]): SendResult[] {
   const out: SendResult[] = [];
   for (let i = 0; i < msgs.length; i++) {

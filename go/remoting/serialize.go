@@ -15,8 +15,8 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// EncodeJSON writes compact JSON without HTML escaping (Java does not escape
-// <, >, & either; the broker's fastjson2 accepts both).
+// EncodeJSON writes compact JSON without HTML escaping (the server does not
+// escape <, >, & either; the broker's fastjson2 accepts both).
 func EncodeJSON(v any) []byte {
 	raw, err := encodeJSONNoEscape(v)
 	if err != nil {
@@ -35,7 +35,7 @@ func encodeJSONNoEscape(v any) ([]byte, error) {
 	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
-	// json.Encoder appends a newline; Java writes compact JSON without one.
+	// json.Encoder appends a newline; the wire wants compact JSON without one.
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
@@ -61,8 +61,8 @@ func extFieldsToJSON(ext *common.StringMap) map[string]any {
 
 // extFieldsFromJSONValue converts a decoded JSON object into extFields:
 // strings stay, numbers keep their raw literal text, bools become
-// "true"/"false", null entries are dropped (Java fastjson reflection skips
-// them the same way).
+// "true"/"false", null entries are dropped (the broker's fastjson
+// reflection skips them the same way).
 func extFieldsFromJSONValue(v any) *common.StringMap {
 	out := common.NewStringMap()
 	obj, ok := v.(map[string]any)
@@ -103,7 +103,7 @@ type RocketMQHeader struct {
 	ExtFields *common.StringMap
 }
 
-// CalTotalLen mirrors Java's calTotalLen for the ROCKETMQ header (header only,
+// CalTotalLen computes the ROCKETMQ frame length (header only,
 // excluding the 8-byte frame prefix):
 // code(2) language(1) version(2) opaque(4) flag(4) remarkLen(4) remark extLen(4) ext.
 func CalTotalLen(remark []byte, ext []byte) int {
@@ -235,7 +235,7 @@ func RocketMQProtocolDecode(header []byte) (*RocketMQHeader, error) {
 }
 
 // MarkProtocolType packs the header length into the low 24 bits and the
-// serialize type into the high 8 bits (Java markProtocolType).
+// serialize type into the high 8 bits.
 func MarkProtocolType(source int32, stype int32) int32 {
 	return ((stype & 0xFF) << 24) | (source & 0x00FF_FFFF)
 }
@@ -251,7 +251,7 @@ func HeaderLengthOf(source int32) int32 {
 }
 
 // SerializeTypeFromEnv reads ROCKETMQ_SERIALIZE_TYPE / rocketmq.serialize.type;
-// "ROCKETMQ" selects the binary header, anything else JSON (Java default).
+// "ROCKETMQ" selects the binary header, anything else JSON (protocol default).
 func SerializeTypeFromEnv() int32 {
 	raw := os.Getenv("ROCKETMQ_SERIALIZE_TYPE")
 	if raw == "" {

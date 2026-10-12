@@ -966,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn bytes2string_matches_java_hex() {
+    fn bytes2string_matches_wire_hex() {
         assert_eq!(bytes2string(b"\x00\x0f\xab\xff"), "000FABFF");
         assert_eq!(string2bytes_hex("000FABFF"), Some(vec![0x00, 0x0F, 0xAB, 0xFF]));
         assert_eq!(string2bytes_hex(""), None);

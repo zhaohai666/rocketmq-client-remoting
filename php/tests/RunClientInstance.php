@@ -879,10 +879,10 @@ final class RunClientInstance
     /**
      * MQClientInstance 构造器里装的 NamespaceRpcHook 是否真的挂在传输层上 —— 从**对端**取证。
      *
-     * 对齐基准（Java 5.5.1，逐行读过）：
-     *   * `MQClientAPIImpl:329-335` **无条件**注册 NamespaceRpcHook，值每笔请求现读
+     * 判据（5.x 服务端的命名空间扩展头语义）：
+     *   * 传输层**无条件**注册 NamespaceRpcHook，值每笔请求现读
      *     `clientConfig.getNamespaceV2()`；空值时 `doBeforeRequest` 直接 return，
-     *     extFields 一个字段都不加（`NamespaceRpcHookTest`）。
+     *     extFields 一个字段都不加。
      *   * 因此三条都得以报文证明：① 未配置时裸着上线；② 构造时配置 ⇒ 第一笔就带
      *     `nsd=true`/`ns=<值>`；③ start 之后改值 ⇒ 下一笔立刻跟着变（持快照的写法在这条上
      *     会静默失效，而静默正是最难查的：broker 只会把请求当成"没有命名空间"）。

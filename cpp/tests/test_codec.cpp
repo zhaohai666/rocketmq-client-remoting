@@ -237,7 +237,7 @@ static void testBatchDefaultsWaitStoreMsgOkToTrue() {
 
 // 判据本身：Java Message.isWaitStoreMsgOK() = 缺省 true + Boolean.parseBoolean
 // （只有忽略大小写的 "true" 为真）。
-static void testWaitStoreMsgOkFollowsJavaParseBoolean() {
+static void testWaitStoreMsgOkParseBooleanContract() {
     Message msg("T_W", "x");
     CHECK(msg.isWaitStoreMsgOk(), "absent -> true");
     msg.setWaitStoreMsgOk(true);
@@ -291,7 +291,7 @@ int main() {
     testMessageCodec();
     testBatchCodec();
     testBatchDefaultsWaitStoreMsgOkToTrue();
-    testWaitStoreMsgOkFollowsJavaParseBoolean();
+    testWaitStoreMsgOkParseBooleanContract();
     testUtilAndHash();
 
     std::cout << "\n===== codec test summary =====\n";

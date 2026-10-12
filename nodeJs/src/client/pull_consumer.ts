@@ -1,12 +1,9 @@
-// DefaultMQPullConsumer — the pull consumer
-// (Java org.apache.rocketmq.client.consumer.DefaultMQPullConsumer +
-// DefaultMQPullConsumerImpl + PullAPIWrapper).
+// DefaultMQPullConsumer —— 拉取消费者。
 //
-// CRITICAL (cross-port rule #10): `pull()` is a SHORT poll — suspend=false in
-// the sysFlag and suspendTimeoutMillis=0 on the wire. Only `pullBlockIfNotFound`
-// sets suspend=true (and a broker that holds the request ~5s then answers
-// NO_NEW_MSG). Writing suspend=true unconditionally manifests as a 5s timeout
-// on every idle pull.
+// 关键约束：`pull()` 是 SHORT 拉取——sysFlag 里 suspend=false，线路上
+// suspendTimeoutMillis=0。只有 `pullBlockIfNotFound` 才置 suspend=true
+// （broker 挂起请求约 5s 后应答 NO_NEW_MSG）。无条件写 suspend=true 的表现
+// 是每次空闲 pull 都超时 5s。
 import type { MQClient } from './mq_client.ts';
 import { PullAPI } from './pull_api.ts';
 import { MQClient } from './mq_client.ts';
@@ -37,18 +34,16 @@ const DEFAULT_PULL_TIMEOUT_MILLIS = 20000;
 export class DefaultMQPullConsumer {
   consumerGroup: string;
   namespace = '';
-  // Java ClientConfig#namespaceV2 — the SERVER-side namespace (nsd/ns
-  // extFields stamped by NamespaceRpcHook), independent from `namespace`.
+  // namespaceV2：服务端侧命名空间（由 NamespaceRpcHook 打 nsd/ns 扩展字段），
+  // 与客户端侧的 `namespace` 相互独立。
   namespaceV2: string | null = null;
   nameServerAddr = '';
   messageModel: string = MessageModel.CLUSTERING;
   unitMode = false;
-  // Java ClientConfig#instanceName / #unitName / #enableStreamRequestType. The
-  // pull consumer turns the stream flag ON in every constructor
-  // (DefaultMQPullConsumer:113/:126), which both appends `@STREAM` to the
-  // clientId — Java's stated reason is to keep a pull consumer from silently
-  // sharing an MQClientInstance with a push consumer in the same process — and
-  // stamps ReqT=0 on every request inside the ACL signature.
+  // instanceName / unitName / enableStreamRequestType：pull 消费者默认打开
+  // stream 标记，一是让 clientId 追加 `@STREAM`——避免同进程里 pull 消费者和
+  // push 消费者悄悄共用同一个客户端实例——二是让每个请求在 ACL 签名里带
+  // ReqT=0。
   instanceName = 'DEFAULT';
   unitName = '';
   enableStreamRequestType = true;
@@ -66,9 +61,9 @@ export class DefaultMQPullConsumer {
   maxReconsumeTimes = -1;
 
   private subscription = new Map<string, SubscriptionData>();
-  // Last computed share per topic — this port's stand-in for Java's
-  // processQueueTable, and what fetchMessageQueuesInBalance keeps when the
-  // route or the consumer list cannot be had (see that method's comment).
+  // 每个 topic 最近一次算出的份额——本实现里充当 rebalance 结果表，
+  // fetchMessageQueuesInBalance 在拿不到路由或消费者列表时保留的就是它
+  // （见该方法的注释）。
   private balancedQueues = new Map<string, MessageQueue[]>();
   started = false;
 
@@ -78,7 +73,7 @@ export class DefaultMQPullConsumer {
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
-  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  // 设置/读取 namespaceV2（每个请求实时读取）。
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
@@ -104,21 +99,19 @@ export class DefaultMQPullConsumer {
     if (this.subscription.size === 0) {
       throw new Error('subscription is not set, call subscribe() first');
     }
-    // Java DefaultMQPullConsumerImpl#start:712-716 — only CLUSTERING rewrites
-    // the DEFAULT instance name (a BROADCASTING group keeps "DEFAULT" so same
-    // process instances share one client instance), and the clientId is
-    // ClientConfig#buildMQClientId's `<ip>@<instanceName>[@<unitName>][@STREAM]`.
-    // ⚠ A pid-only name collides between two pull consumers in one process, and
-    // allocate() then hands both the SAME slice — duplicate consumption.
+    // 只有 CLUSTERING 才把默认 instanceName 改写掉（BROADCASTING 保留
+    // "DEFAULT"，让同进程实例共享一个客户端实例），clientId 形如
+    // `<ip>@<instanceName>[@<unitName>][@STREAM]`。⚠ 只用 pid 作实例名会在
+    // 同进程两个 pull 消费者之间撞车，allocate() 把同一片队列分给两边——
+    // 重复消费。
     if (this.messageModel === MessageModel.CLUSTERING) {
       this.instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     }
     this.clientID = MixAll.clientIdFor(
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
     const client = new MQClient(this.clientID, this.nameServerAddr);
-    // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
-    // client, then StreamTypeRPCHook (pull consumers enable it), before any
-    // user hook (this facade has none today).
+    // 钩子注册顺序：NamespaceRpcHook 先挂在 remoting client 上，再挂
+    // StreamTypeRPCHook（pull 消费者默认开启），最后才是用户钩子（当前没有）。
     registerRpcHooks(client.remotingClient, {
       namespaceV2: () => this.namespaceV2,
       enableStreamRequestType: this.enableStreamRequestType,
@@ -154,18 +147,16 @@ export class DefaultMQPullConsumer {
     this.started = false;
   }
 
-  // fetchPublishMessageQueues is Java DefaultMQPullConsumerImpl:137 — the
-  // PUBLISH view (write perm, writeQueueNums, master required; MQClientInstance
-  // #topicRouteData2TopicPublishInfo). ⚠ It used to hand back the SUBSCRIBE
-  // view: with readQueueNums != writeQueueNums, or a broker with no master in
-  // the route, the two lists differ, and a caller sizing its shard by this list
-  // then reads queues it was never given (or misses ones it was).
+  // fetchPublishMessageQueues：PUBLISH 视图（写权限、writeQueueNums、必须有
+  // master）。⚠ 这里曾经错误地返回 SUBSCRIBE 视图：当 readQueueNums !=
+  // writeQueueNums、或路由里没有 master broker 时两个列表不同，按这个列表
+  // 定分片的调用方会读到没分给自己的队列（或漏掉分到的）。
   async fetchPublishMessageQueues(topic: string): Promise<MessageQueue[]> {
     return (await this.routeOf(topic, 'publish')).getAllMessageQueue(topic);
   }
 
-  // fetchSubscribeMessageQueues is Java :142 — the SUBSCRIBE view (read perm,
-  // readQueueNums, no master filter). This is the list a pull caller iterates.
+  // fetchSubscribeMessageQueues：SUBSCRIBE 视图（读权限、readQueueNums、不做
+  // master 过滤）。拉取方要遍历的就是这个列表。
   async fetchSubscribeMessageQueues(topic: string): Promise<MessageQueue[]> {
     return (await this.routeOf(topic, 'subscribe')).getAllSubscribeMessageQueue(topic);
   }

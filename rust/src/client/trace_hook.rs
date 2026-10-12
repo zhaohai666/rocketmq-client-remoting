@@ -729,7 +729,7 @@ mod tests {
          \u{1}42\u{1}{COST}\u{1}0\u{1}AC1400A1000027100000000000000001\u{1}true\u{2}";
 
     #[test]
-    fn hook_names_match_java_and_python() {
+    fn hook_names_are_canonical_trace_hook_names() {
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let send = SendMessageTraceHook::new(sink.clone());
         let consume = ConsumeMessageTraceHook::new(sink.clone());

@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn local_transaction_state_uses_java_ordinal() {
+    fn local_transaction_state_uses_wire_ordinal() {
         assert_eq!(LocalTransactionState::CommitMessage.code(), 0);
         assert_eq!(LocalTransactionState::RollbackMessage.code(), 1);
         assert_eq!(LocalTransactionState::Unknow.code(), 2);
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn consume_contexts_default_like_java() {
+    fn consume_contexts_use_contract_defaults() {
         let ctx = ConsumeConcurrentlyContext::new(None);
         assert_eq!(ctx.delay_level_when_next_consume, 0);
         // Java ConsumeConcurrentlyContext:33 —— 默认「整批认可」，不是「一条都不认可」

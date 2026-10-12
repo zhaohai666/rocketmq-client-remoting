@@ -7,11 +7,10 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\MessageExt;
 
 /**
- * 消费/拉取结果类型（对应 org.apache.rocketmq.client.consumer.* 及 pull.*），
- * 移植自 consumer_result.py。
+ * 消费/拉取结果类型：拉取状态、消费返回类型、POP 结果与消费上下文/监听器契约。
  */
 
-/** 对应 org.apache.rocketmq.client.consumer.PullStatus。 */
+/** 拉取状态，取值来自经典 remoting 协议 pull 响应的 status 字段。 */
 enum PullStatus: int
 {
     case FOUND = 0;
@@ -19,7 +18,7 @@ enum PullStatus: int
     case NO_MATCHED_MSG = 2;
     case OFFSET_ILLEGAL = 3;
 
-    /** 对应 ``PullStatus.from_code``：未知码兜底为 FOUND。 */
+    /** 由协议状态码构造：未知码兜底为 FOUND。 */
     public static function fromCode(int $code): self
     {
         return self::tryFrom($code) ?? self::FOUND;
@@ -27,10 +26,10 @@ enum PullStatus: int
 }
 
 /**
- * 消费返回类型（对应 Java client.consumer.listener.ConsumeReturnType）。
+ * 消费返回类型。
  *
- * ⚠ 顺序即 ordinal —— 轨迹 SubAfter 的 ``contextCode`` 用的正是 ordinal
- * （Java ConsumeMessageTraceHookImpl:113），改动顺序会让控制台显示错乱。
+ * ⚠ 顺序即 ordinal —— 轨迹 SubAfter 的 ``contextCode`` 用的正是 ordinal，
+ * 改动顺序会让控制台显示错乱。
  */
 enum ConsumeReturnType: int
 {
@@ -41,7 +40,7 @@ enum ConsumeReturnType: int
     case FAILED = 4;
 }
 
-/** 对应 Java ``org.apache.rocketmq.client.consumer.PopStatus``。 */
+/** POP 拉取状态，取值来自 broker pop 响应的 status 字段。 */
 enum PopStatus: int
 {
     case FOUND = 0;
@@ -50,7 +49,7 @@ enum PopStatus: int
     case POLLING_NOT_FOUND = 3;
 }
 
-/** 对应 Java ``ConsumeConcurrentlyStatus``。 */
+/** 并发消费返回状态。 */
 enum ConsumeConcurrentlyStatus: int
 {
     case CONSUME_SUCCESS = 0;
@@ -58,11 +57,10 @@ enum ConsumeConcurrentlyStatus: int
 }
 
 /**
- * 对应 Java ``ConsumeOrderlyStatus``。
+ * 顺序消费返回状态。
  *
- * 声明顺序与 Java 逐字对齐（ORDINAL 不是线上值，但两侧一致才不会在"按 ordinal
- * 写死"的调用方手里错位）；COMMIT/ROLLBACK 在 Java 侧标注为 已废弃 + "only for
- * binlog consumption"。
+ * ORDINAL 本身不是线上值，但「按 ordinal 写死」的调用方依赖声明顺序，改动会错位；
+ * COMMIT/ROLLBACK 属于已废弃分支，只服务于 binlog 消费场景。
  */
 enum ConsumeOrderlyStatus: int
 {
@@ -72,14 +70,13 @@ enum ConsumeOrderlyStatus: int
     case SUSPEND_CURRENT_QUEUE_A_MOMENT = 3;
 }
 
-/** 对应 Java ``PullResult``（含 Java ``PullResultExt`` 的 suggestWhichBrokerId 字段）。 */
+/** 拉取结果，含 broker 建议下次拉取的 brokerId 字段。 */
 final class PullResult
 {
     /**
      * @param list<MessageExt> $msgFoundList
-     * @param int|null $suggestWhichBrokerId 对应 Java PullResultExt.suggestWhichBrokerId：
-     *        broker 建议下次从哪个 brokerId 拉（主从部署时可能是从节点）。
-     *        null = 响应头没带（老 broker）。
+     * @param int|null $suggestWhichBrokerId broker 建议下次从哪个 brokerId 拉
+     *        （主从部署时可能是从节点）；null = 响应头没带（老 broker）。
      */
     public function __construct(
         public PullStatus $status,
@@ -105,10 +102,10 @@ final class PullResult
 }
 
 /**
- * POP 响应（对应 Java ``PopResult``）。
+ * POP 响应。
  *
  * ``startOffsetInfo`` / ``msgOffsetInfo`` / ``orderCountInfo`` 保留 broker 原样
- * 字符串，解析交给 remoting.protocol.extra_info；``msgFoundList`` 里的每条消息
+ * 字符串，解析交给 ExtraInfoUtil；``msgFoundList`` 里的每条消息
  * 都已盖好 ``POP_CK``（客户端反构）与 ``1ST_POP_TIME`` 属性。
  */
 final class PopResult
@@ -142,7 +139,7 @@ final class PopResult
 }
 
 /**
- * ``change_invisible_time`` 的结果。
+ * CHANGE_INVISIBLE_TIME 请求的结果。
  *
  * ``extraInfo`` 是用响应里**新的** popTime/invisibleTime/reviveQid 重建的 8 段 CK 串，
  * 后续 ACK 要用它（不是请求时传进去的那个旧串）。
@@ -173,19 +170,18 @@ final class ChangeInvisibleTimeResult
     }
 }
 
-/** 对应 Java ``ConsumeConcurrentlyContext``。 */
+/** 并发消费上下文。 */
 final class ConsumeConcurrentlyContext
 {
     /**
-     * 对应 Java ConsumeConcurrentlyContext.delayLevelWhenNextConsume（缺省 0）。
+     * 下次消费的延迟等级，缺省 0。
      * 为 0 时由 caller 改写为 3 + reconsumeTimes。
      */
     public int $delayLevelWhenNextConsume = 0;
 
     /**
-     * 对应 Java ConsumeConcurrentlyContext.ackIndex（默认 Integer.MAX_VALUE）：
-     * 「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
-     * 默认值是「全批认可」，只有 listener 主动调小才会部分 ack。
+     * ackIndex：「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
+     * 默认值是「全批认可」（2^31-1），只有 listener 主动调小才会部分 ack。
      */
     public int $ackIndex;
 
@@ -195,20 +191,19 @@ final class ConsumeConcurrentlyContext
     }
 }
 
-/** 对应 Java ``ConsumeOrderlyContext``。 */
+/** 顺序消费上下文。 */
 final class ConsumeOrderlyContext
 {
     /**
-     * 对应 Java ConsumeOrderlyContext.autoCommit：true 时由客户端按 listener 的
-     * 状态提交位点（正常路径）；listener 置 false 拿走提交权。
+     * autoCommit：true 时由客户端按 listener 的状态提交位点（正常路径）；
+     * listener 置 false 拿走提交权。
      */
     public bool $autoCommit = true;
 
     /**
-     * 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis，**默认 -1**
-     * （Java 就是这个默认值）：-1 表示"没指定"，挂起时长回落到消费者配置的
-     * ``suspendCurrentQueueTimeMillis``（默认 1000）；解析出的值再由调度侧钳到
-     * [10, 30000]。
+     * suspendCurrentQueueTimeMillis，**默认 -1**：-1 表示"没指定"，挂起时长回落到
+     * 消费者配置的 ``suspendCurrentQueueTimeMillis``（默认 1000）；解析出的值再由
+     * 调度侧钳到 [10, 30000]。
      */
     public int $suspendCurrentQueueTimeMillis = -1;
 
@@ -218,9 +213,7 @@ final class ConsumeOrderlyContext
 }
 
 /**
- * 并发消费监听器（对应 Java ``MessageListenerConcurrently`` 接口）。
- *
- * Java 侧是接口，Python 侧是不可实例化语义的契约类；PHP 用 interface 表达。
+ * 并发消费监听器：一次收到一批消息，返回整批的处置状态。
  */
 interface MessageListenerConcurrently
 {
@@ -228,14 +221,14 @@ interface MessageListenerConcurrently
     public function consumeMessage(array $msgs, ConsumeConcurrentlyContext $context): ConsumeConcurrentlyStatus;
 }
 
-/** 顺序消费监听器（对应 Java ``MessageListenerOrderly`` 接口）。 */
+/** 顺序消费监听器：同一队列内串行回调，返回状态决定挂起/提交。 */
 interface MessageListenerOrderly
 {
     /** @param list<MessageExt> $msgs */
     public function consumeMessage(array $msgs, ConsumeOrderlyContext $context): ConsumeOrderlyStatus;
 }
 
-/** 兼容别名：先按并发监听器对待（对应 Python ``MessageListener``）。 */
+/** 兼容别名：不区分顺序性，先按并发监听器对待。 */
 interface MessageListener
 {
     /** @param list<MessageExt> $msgs */
@@ -243,14 +236,13 @@ interface MessageListener
 }
 
 /**
- * 钩子上下文里的 ``status``：Java ``status.toString()`` 的形态，即**裸枚举成员名**。
+ * 钩子上下文里的 ``status``：约定形态是**裸枚举成员名**。
  *
- * Java 写进 ``ConsumeMessageContext.status`` 的是归一化后那个枚举的 ``toString()``
- * （并发 ConsumeMessageConcurrentlyService:408、顺序 ConsumeMessageOrderlyService:507），
- * 默认实现就是成员名：``CONSUME_SUCCESS`` / ``RECONSUME_LATER`` / ``SUCCESS`` /
- * ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` / ``COMMIT`` / ``ROLLBACK``。Python 的
- * ``str(Enum member)`` 给的是带类名的形态，不是 Java 的；钩子 status 是公开可见的，
- * 所以统一按 ``name`` 取。非枚举保持 ``str()`` 兜底，与 Python 归一致。
+ * 并发/顺序消费服务写进上下文 ``status`` 的都是归一化后那个枚举的成员名：
+ * ``CONSUME_SUCCESS`` / ``RECONSUME_LATER`` / ``SUCCESS`` /
+ * ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` / ``COMMIT`` / ``ROLLBACK``。
+ * status 对钩子和轨迹日志都是对外可见的，所以统一按 ``name`` 取，不带类名前缀。
+ * 非枚举值兜底：有 ``__toString`` 就用它，否则退到类名，标量直接转字符串。
  *
  * ⚠ 本文件里的类被 autoload 时该函数才会被定义（PHP 的 autoloader 不加载函数）；
  * 调用方通常先 `use` 了本文件的枚举，所以文件已被 require。

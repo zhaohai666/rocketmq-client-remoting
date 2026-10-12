@@ -1,14 +1,14 @@
-// 推模式消费者（对齐 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。
+// 推模式消费者。
 //
-// 架构（对齐 Java PushConsumer 的三层模型）：
-//   1. 拉取层：每个队列一个拉取线程（对应 Java PullMessageService 的并发长轮询——
+// 架构（三层模型）：
+//   1. 拉取层：每个队列一个拉取线程（并发长轮询——
 //      broker 为每个队列挂起长轮询请求、消息到达立即返回），拉到的消息进
-//      pending_ 缓冲（对应 ProcessQueue），拉取游标推进到 nextBeginOffset；
+//      pending_ 缓冲（队列级 ProcessQueue 状态），拉取游标推进到 nextBeginOffset；
 //   2. 分发层：单分发线程从缓冲按 consumeMessageBatchMaxSize 取批次交给
 //      MessageListener；RECONSUME_LATER/异常批次逐条回投 %RETRY%topic
 //      （延迟梯度 3+reconsumeTimes，超 maxReconsumeTimes 由 broker 转 %DLQ%）；
 //   3. 位点层：_consume_offsets 记录"已消费位点"，每 5s 用 UPDATE_CONSUMER_OFFSET
-//      提交 broker（Java persistAllConsumerOffset），启动先 QUERY_CONSUMER_OFFSET。
+//      提交 broker（persistAllConsumerOffset），启动先 QUERY_CONSUMER_OFFSET。
 //
 // 关键工程点（真机验证得出，勿删注释）：
 //   - 拉取必须按队列并行：单线程顺序长轮询下，空闲队列的 suspend 会阻塞
@@ -48,7 +48,7 @@
 
 namespace rocketmq {
 
-// 选择器（对应 Java MessageSelector / Python MessageSelector）
+// 订阅选择器（tag / SQL92 表达式）
 struct MessageSelector {
     std::string type = ExpressionType::TAG;
     std::string expression = "*";
@@ -61,7 +61,7 @@ struct MessageSelector {
     }
 };
 
-// Java DefaultMQPushConsumerImpl.popDelayLevel（单位**秒**）。
+// POP 重投延迟档位表（协议侧按**秒**解释）。
 // 与 send 的延迟档位（首档 1s）不是同一张表，别混。
 inline const std::vector<int32_t>& popDelayLevelTable() {
     static const std::vector<int32_t> kTable = {10, 30, 60, 120, 180, 240, 300, 360,
@@ -69,20 +69,20 @@ inline const std::vector<int32_t>& popDelayLevelTable() {
     return kTable;
 }
 
-// Java DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME：超出范围一律回落到 60000
+// POP invisibleTime 合法区间：超出范围一律回落到 60000
 constexpr int64_t kMinPopInvisibleTime = 5000;
 constexpr int64_t kMaxPopInvisibleTime = 300000;
 
-// Java ProcessQueue.PULL_MAX_IDLE_TIME（`rocketmq.client.pull.pullMaxIdleTime`，默认
-// 120000ms）：仍归本实例的队列如果超过这么久没发起过任何一次拉取/弹出，说明这条循环
-// 死了或卡住了，RebalanceImpl.updateProcessQueueTableInRebalance:442 就按这个判据把
+// 停摆判定阈值（配置键 `rocketmq.client.pull.pullMaxIdleTime`，默认 120000ms）：
+// 仍归本实例的队列如果超过这么久没发起过任何一次拉取/弹出，说明这条循环
+// 死了或卡住了，updateProcessQueueTableInRebalance 就按这个判据把
 // 它撤掉并重建（否则那个队列从此**静默**不再消费，客户端不报任何错）。
 constexpr int64_t kPullMaxIdleTime = 120000;
 
-// Java ConsumeInitMode
+// POP 初始位点模式（协议参数 ConsumeInitMode）
 enum class ConsumeInitMode : int32_t { MIN = 0, MAX = 1 };
 
-// POP 模式的队列状态（对应 org.apache.rocketmq.client.impl.consumer.PopProcessQueue）。
+// POP 模式的队列状态。
 //
 // 与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
 // 消费线程，确认靠 ack。这里只跟踪两件事：
@@ -95,7 +95,7 @@ public:
         std::lock_guard<std::mutex> lk(lock_);
         waitAckCounter_ += n;
     }
-    // Java 传的是负数（decFoundMsg(-msgs.size())），这里按"减多少"理解。
+    // 直接累加：调用方传负数表示减（decFoundMsg(-msgs.size())）。
     void decFoundMsg(int32_t n) {
         std::lock_guard<std::mutex> lk(lock_);
         waitAckCounter_ += n;
@@ -111,8 +111,8 @@ public:
     bool isDropped() const { return dropped_.load(); }
     void setDropped(bool v) { dropped_.store(v); }
 
-    // Java PopProcessQueue.lastPopTimestamp：在**发起**弹出时盖章（:508），
-    // isPullExpired 读的就是它（:74-76）——POP 模式没有"拉取"动作，靠这个时刻判停摆。
+    // lastPopTimestamp：在**发起**弹出时盖章，
+    // isPullExpired 读的就是它——POP 模式没有"拉取"动作，靠这个时刻判停摆。
     int64_t lastPopTimestamp() const { return lastPopTimestamp_.load(); }
     void setLastPopTimestamp(int64_t v) { lastPopTimestamp_.store(v); }
 
@@ -147,12 +147,12 @@ public:
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
-    // 对应 Java `ClientConfig` 的三个同名开关。⚠ 必须在 start() 之前设置：
+    // ClientConfig 的三个同名开关。⚠ 必须在 start() 之前设置：
     // unitName / @STREAM 决定 clientId 的形状，stream 决定请求钩子链（`ReqT` 要进 ACL 签名）。
     void setUnitName(const std::string& unitName) { unitName_ = unitName; }
     const std::string& unitName() const { return unitName_; }
-    // Java 在消息过滤上下文（`DefaultMQPushConsumerImpl:640`）、心跳里的
-    // `ConsumerData.unitMode`（`MQClientInstance:1039`）和回投请求头（`:927/948`）三处读它。
+    // unitMode 有三处消费点：消息过滤上下文、心跳里的协议字段 `ConsumerData.unitMode`、
+    // 回投请求头。
     void setUnitMode(bool unitMode) { unitMode_ = unitMode; }
     bool isUnitMode() const { return unitMode_; }
 
@@ -160,24 +160,24 @@ public:
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
 
-    // Java `DefaultMQPushConsumer#postSubscriptionWhenPull`（默认 false）：true 时每次
+    // postSubscriptionWhenPull（默认 false）：true 时每次
     // PULL_MESSAGE 把订阅表达式随请求上送（SUBSCRIPTION 位置位），让 broker 侧做过滤；
-    // 默认关闭 —— tag 过滤由客户端 filterMessagesForDelivery 兜底，与 Java 5.x 一致。
+    // 默认关闭 —— tag 过滤由客户端 filterMessagesForDelivery 兜底。
     void setPostSubscriptionWhenPull(bool enable) { postSubscriptionWhenPull_ = enable; }
     bool isPostSubscriptionWhenPull() const { return postSubscriptionWhenPull_; }
 
-    // Java DefaultMQPushConsumerImpl.pullMessage:458-468 的订阅门控：只有开关打开**且非**
+    // 拉取路径的订阅门控：只有开关打开**且非**
     // 类过滤模式时才把 subString 随拉取上送（SUBSCRIPTION 位 = subExpression != null）。
     // 抽成静态纯函数只为单测能覆盖拉取循环里这唯一一处判定。
     static bool shouldPostSubscriptionWhenPull(bool postSubscriptionWhenPull,
                                                bool classFilterMode) {
         return postSubscriptionWhenPull && !classFilterMode;
     }
-    // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：在用 topic 的
+    // pollNameServerInterval（默认 30000ms）：在用 topic 的
     // 路由刷新周期，start() 时透传给 MQClientInstance。
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
-    // Java `ClientConfig#persistConsumerOffsetInterval`（:66，默认 5000ms）：后台位点
+    // persistConsumerOffsetInterval（默认 5000ms）：后台位点
     // 落盘周期；shutdown() 的收尾落盘与该值无关（调大只推迟时机，不丢位点）。
     void setPersistConsumerOffsetIntervalMillis(int32_t millis) {
         persistConsumerOffsetIntervalMillis_ = millis;
@@ -187,59 +187,57 @@ public:
     }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
-    // Java DefaultMQPushConsumer.suspend/resume（:890/:898）→ Impl.suspend/resume
-    // （DefaultMQPushConsumerImpl:1312/:741）：suspend 置 pause 标志 —— pull/pop 循环
+    // suspend/resume：suspend 置 pause 标志 —— pull/pop 循环
     // 见暂停标志就延后 1s 再试（PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000），已拉到的
     // 消息继续消费，位点不回退；resume 清标志并立即 doRebalance()。
     void suspend() { paused_.store(true); }
     void resume();
     bool isPaused() const { return paused_.load(); }
-    // 队列分配策略（对应 Java DefaultMQPushConsumer.setAllocateMessageQueueStrategy）。
-    // 与 Java 同款：setter 允许传 nullptr，由 start() 的 checkConfig 拒绝
-    //（Java DefaultMQPushConsumerImpl.checkConfig:1067 "allocateMessageQueueStrategy is null"）。
+    // 队列分配策略。setter 允许传 nullptr，由 start() 的 checkConfig 拒绝
+    //（错误文案 "allocateMessageQueueStrategy is null" 是与调用方约定的合同）。
     // 默认 AllocateMessageQueueAveragely。
     void setAllocateMessageQueueStrategy(std::shared_ptr<AllocateMessageQueueStrategy> strategy);
-    // 对应 Java DefaultMQPushConsumer.getAllocateMessageQueueStrategy（RebalanceImpl 同名字段）。
+    // 读回当前分配策略（RebalanceImpl 同名字段口径）。
     std::shared_ptr<AllocateMessageQueueStrategy> allocateMessageQueueStrategy() const;
     void setConsumeThreadNums(int32_t n);
-    // ---- 消费线程弹性（对应 Java DefaultMQPushConsumer / AbstractConsumeMessageService）----
+    // ---- 消费线程弹性 ----
     void setConsumeThreadMin(int32_t n);
     void setConsumeThreadMax(int32_t n);
     int32_t getConsumeThreadMin() const { return consumeThreadMin_; }
     int32_t getConsumeThreadMax() const { return consumeThreadMax_; }
     void setAdjustThreadPoolNumsThreshold(int64_t v) { adjustThreadPoolNumsThreshold_ = v; }
     int64_t getAdjustThreadPoolNumsThreshold() const { return adjustThreadPoolNumsThreshold_; }
-    // Java AbstractConsumeMessageService.updateCorePoolSize：守卫不满足则**静默忽略**。
-    // 返回值只用于单测断言"是否真的生效"（Java 无返回值）。
+    // updateCorePoolSize：守卫不满足则**静默忽略**。
+    // 返回值只用于单测断言"是否真的生效"（该操作本身无返回值）。
     bool updateCorePoolSize(int32_t corePoolSize);
     int32_t getCorePoolSize() const;
-    // Java DefaultMQPushConsumerImpl.computeAccumulationTotal / adjustThreadPool。
-    // ⚠ adjustThreadPool 在 Java 5.5.1 是 no-op（inc/dec 空实现），本实现照抄。
+    // computeAccumulationTotal / adjustThreadPool。
+    // ⚠ adjustThreadPool 是 no-op（inc/dec 为空实现），真正的弹性调整走 updateCorePoolSize。
     int64_t computeAccumulationTotal() const;
     void adjustThreadPool();
     // 单队列（key 省略则求和）的 ProcessQueue.msgAccCnt。
     int64_t msgAccCnt(const std::string& key = std::string()) const;
-    // 按 Java ProcessQueue.putMessage 的规则更新某队列的 msgAccCnt
+    // 按 ProcessQueue.putMessage 的规则更新某队列的 msgAccCnt
     // （= 最后一条消息的 MAX_OFFSET 属性 - 它的 queueOffset，> 0 才更新）。
     void updateMsgAccCnt(const std::string& key, const std::vector<MessageExt>& msgs);
     // 观测：当前 POP 消费执行器的存活线程数 / 排队任务数（未建执行器时为 0）。
     int32_t consumeExecutorWorkers() const;
     int32_t consumeExecutorQueued() const;
-    // 对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。
+    // 307（GET_CONSUMER_RUNNING_INFO）的应答体 consumerRunningInfo。
     ConsumerRunningInfo consumerRunningInfo();
-    // 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）：
+    // 220（RESET_CONSUMER_CLIENT_OFFSET）的消费者侧逻辑：
     // 命中本 topic 分配队列的 → 清在途缓冲与拉取游标 → 写新已消费位点 →
     // 撤销该队列（持久化新位点 + 顺序解锁）→ 立即 rebalance 从新位点重拉。
     void resetOffset(const std::string& topic, const std::map<MessageQueue, int64_t>& offsetTable);
-    // 解析 220 的 offsetTable（两种形状都认）。Java 的发起方恒为 JAVA ⇒ 只会收到 map 形状的
-    // ResetOffsetBody；language=CPP 的发起方（旧 C++ SDK 管理端）会让 broker 推数组形状的
-    // ResetOffsetBodyForC（Broker2Client.resetOffset:158-163）。漏了数组那一支，这类重置在
+    // 解析 220 的 offsetTable（两种形状都认）。broker 侧按发起方 language 决定推送形状：
+    // language=JAVA 恒为 map 形状的 ResetOffsetBody；language=CPP 的发起方（管理端工具）
+    // 会收到数组形状的 ResetOffsetBodyForC。漏了数组那一支，这类重置在
     // 本消费者上就是**静默丢弃**：位点表没动，消息继续从老位点流。
     static std::map<MessageQueue, int64_t> parseResetOffsetBody(const Bytes& body);
-    // 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）：
+    // 221 的应答数据源：
     // 返回**已消费位点**表（不是拉取游标），topic 为空则返回全部。
     std::map<MessageQueue, int64_t> getConsumerStatus(const std::string& topic);
-    // 对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）：
+    // 309（CONSUME_MESSAGE_DIRECTLY）的本地实现：
     // 本地真实消费一条消息（还原重投 topic 后交给监听器），把结果回给 admin。
     ConsumeMessageDirectlyResult consumeMessageDirectly(const MessageExt& msg,
                                                         const std::string& brokerName);
@@ -247,27 +245,27 @@ public:
     void setPullBatchSize(int32_t n) { pullBatchSize_ = n; }
     void setPullBatchSizeInBytes(int32_t n) { pullBatchSizeInBytes_ = n; }
     void setConsumeMessageBatchMaxSize(int32_t n) { consumeMessageBatchMaxSize_ = std::max(1, n); }
-    // 对应 Java DefaultMQPushConsumer.getConsumeMessageBatchMaxSize（分发层按它切批）。
-    // setter 的 max(1,·) 与 Java 运行期的 Math.max(1, ...) 同侧，闸门另有分工（见 checkConfigRanges）。
+    // 分发层按它切批。
+    // setter 的 max(1,·) 是运行期钳制，闸门另有分工（见 checkConfigRanges）。
     int32_t consumeMessageBatchMaxSize() const { return consumeMessageBatchMaxSize_; }
     void setPullTimeoutMillis(int32_t t) { pullTimeoutMillis_ = t; }
     void setPullSuspendTimeoutMillis(int32_t t) { pullSuspendTimeoutMillis_ = t; }
     void setSuspendCurrentQueueTimeMillis(int32_t t) { suspendCurrentQueueTimeMillis_ = t; }
     void setMaxReconsumeTimes(int32_t n) { maxReconsumeTimes_ = n; }
     void setPullIntervalMillis(int32_t t) { pullIntervalMillis_ = t; }
-    // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（Java pullThresholdForQueue，默认 1000）
+    // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（pullThresholdForQueue，默认 1000）
     void setPullThresholdForQueue(int32_t n) { pullThresholdForQueue_ = n; }
     int32_t pullThresholdForQueue() const { return pullThresholdForQueue_; }
-    // 每队列"已拉未消费"**字节**阈值，单位 MiB（Java pullThresholdSizeForQueue，默认 100；<=0 关闭）
+    // 每队列"已拉未消费"**字节**阈值，单位 MiB（pullThresholdSizeForQueue，默认 100；<=0 关闭）
     void setPullThresholdSizeForQueue(int32_t n) { pullThresholdSizeForQueue_ = n; }
     int32_t pullThresholdSizeForQueue() const { return pullThresholdSizeForQueue_; }
-    // 已拉未消费消息 queueOffset 的**跨度**上限（Java consumeMessageMaxSpan，默认 2000；<=0 关闭）。
+    // 已拉未消费消息 queueOffset 的**跨度**上限（consumeMessageMaxSpan，默认 2000；<=0 关闭）。
     // 盯的是"队首那条一直消费失败、后面堆着"把位点跨度拉开的情况。
     void setConsumeConcurrentlyMaxSpan(int64_t n) { consumeConcurrentlyMaxSpan_ = n; }
     int64_t consumeConcurrentlyMaxSpan() const { return consumeConcurrentlyMaxSpan_; }
-    // topic 级累计阈值（本实例该 topic **所有**队列合起来算，Java pullThresholdForTopic /
-    // pullThresholdSizeForTopic；默认 -1 = 关闭）。Java 5.5.1 在 RebalancePushImpl:67-81 把
-    // 它按队列数摊到队列级，本端口与 Python/Rust 参考实现同一口径：直接跟累计值比。
+    // topic 级累计阈值（本实例该 topic **所有**队列合起来算，pullThresholdForTopic /
+    // pullThresholdSizeForTopic；默认 -1 = 关闭）。本端口不按队列数摊到队列级，
+    // 直接跟累计值比。
     void setPullThresholdForTopic(int32_t n) { pullThresholdForTopic_ = n; }
     int32_t pullThresholdForTopic() const { return pullThresholdForTopic_; }
     void setPullThresholdSizeForTopic(int32_t n) { pullThresholdSizeForTopic_ = n; }
@@ -277,7 +275,7 @@ public:
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
     void setPopMode(bool b) { popMode_ = b; }
     bool popMode() const { return popMode_; }
-    // TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
+    // TLS（开关 tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）
     void setTlsEnable(bool b) { tlsEnable_ = b; }
     // TLS 严格校验选项（caCert 非空 = 证书链 + 主机名严格校验；clientCert/Key = mTLS）。
     // 调用后自动开启 TLS；须在 start() 之前设置。
@@ -286,13 +284,13 @@ public:
         tlsOptionsSet_ = true;
         tlsEnable_ = true;
     }
-    // 弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）
+    // 弹出后对其它实例不可见的时长（popInvisibleTime 默认 60000）
     void setPopInvisibleTime(int64_t t) { popInvisibleTime_ = t; }
     int64_t popInvisibleTime() const { return popInvisibleTime_; }
-    // 单次 POP 的最大条数（Java popBatchNums 默认 32；broker 侧 >32 会回 INVALID_PARAMETER）
+    // 单次 POP 的最大条数（popBatchNums 默认 32；broker 侧 >32 会回 INVALID_PARAMETER）
     void setPopBatchNums(int32_t n) { popBatchNums_ = n; }
     int32_t popBatchNums() const { return popBatchNums_; }
-    // 本队列"已弹未 ack"计数器上限，超过就暂停 POP（Java popThresholdForQueue 默认 96）
+    // 本队列"已弹未 ack"计数器上限，超过就暂停 POP（popThresholdForQueue 默认 96）
     void setPopThresholdForQueue(int32_t n) { popThresholdForQueue_ = n; }
     int32_t popThresholdForQueue() const { return popThresholdForQueue_; }
     // POP 长轮询挂起时长。0 = 短轮询（broker 立即返回或 NO_NEW_MSG）。
@@ -304,32 +302,32 @@ public:
 
     // 以下三个是**纯逻辑**（不发请求），做成 public 是为了离线可测——popCkTarget 是 POP
     // 最容易错的一段（retry topic 还原），必须能单测而不是只能靠真机。
-    // 对应 Java DefaultMQPushConsumerImpl#checkConfig 的数值段（:1099-1209）：十三道
-    // 区间/大小闸门，**顺序、区间与文案逐条照抄 Java**（Java 每条拼
-    // FAQUrl.suggestTodo(...)，本仓库按约定不带后缀）。start() 在所有 null 检查之后、
+    // checkConfig 的数值段：十三道
+    // 区间/大小闸门，**顺序、区间与错误文案是与调用方匹配的合同，固定不改**（文案不带
+    // FAQUrl.suggestTodo(...) 后缀）。start() 在所有 null 检查之后、
     // 建 MQClientInstance 之前调用它；做成 public 同 popCkTarget：正向用例（边界值合法）
     // 离线没法走 start()，那会真去连 name server。
     void checkConfigRanges() const;
     // 从 POP_CK 还原 ack 目标；CK 缺失或段数不足返回 nullopt（放弃 ack，交给 broker 复活）。
     std::optional<PopCkTarget> popCkTarget(const MessageExt& msg);
-    // Java ConsumeRequest.isPopTimeout：解析不出 popTime/invisibleTime 时按超时处理
+    // 解析不出 popTime/invisibleTime 时按超时处理
     static bool isPopTimeout(int64_t popTime, int64_t invisible);
 
     void setHeartbeatEnabled(bool b) { heartbeatEnabled_ = b; }
     void setHeartbeatIntervalMillis(int32_t t) { heartbeatIntervalMillis_ = t; }
 
-    // 命名空间（对应 Java DefaultMQPushConsumer.setNamespace）：非空时把 topic / group
-    // 套上 "ns%" 前缀再与 broker 交互（对齐 Java start() 里对 consumerGroup 的包装）。
+    // 命名空间：非空时把 topic / group
+    // 套上 "ns%" 前缀再与 broker 交互（start() 里同样包装 consumerGroup）。
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     const std::string& namespaceOf() const { return namespace_; }
-    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`）：非空时 NamespaceRpcHook 给
+    // 5.x 新命名空间（协议字段 namespaceV2）：非空时 NamespaceRpcHook 给
     // **每笔请求**加 `nsd=true` / `ns=<namespaceV2>`，由 broker 侧解析实例 —— 与上面的
-    // setNamespace（客户端改写 "ns%topic"）是两套机制。链序照 Java `MQClientAPIImpl:329`：
+    // setNamespace（客户端改写 "ns%topic"）是两套机制。钩子链序固定：
     // 装在 ACL 签名**之前**，`nsd`/`ns` 因此在签名内容之内（见 composeRequestHooks）。
     void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
     const std::string& namespaceV2() const { return namespaceV2_; }
 
-    // ---------------- ACL 鉴权（对应 Java DefaultMQPushConsumer(rpcHook)）----------------
+    // ---------------- ACL 鉴权（rpcHook）----------------
     // 必须在 start() 之前调用：钩子在 start() 里绑定到 MQClientInstance。
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
     void setCredentials(const std::string& accessKey, const std::string& secretKey,
@@ -339,20 +337,20 @@ public:
     }
     const std::shared_ptr<RPCHook>& rpcHook() const { return rpcHook_; }
 
-    // ---------------- 消息轨迹（对应 Java DefaultMQPushConsumer.setEnableMsgTrace 等）----
+    // ---------------- 消息轨迹（enableMsgTrace 等）----
     // enableMsgTrace=true 时 start() 会建 AsyncTraceDispatcher（Type=CONSUME）并自动注册
     // ConsumeMessageTraceHook；三条消费路径（并发 / 顺序 / POP）都会产出 SubBefore/SubAfter。
     void setEnableMsgTrace(bool enable) { enableMsgTrace_ = enable; }
     bool isEnableMsgTrace() const { return enableMsgTrace_; }
-    // setEnableMsgTrace 的别名（对齐 Java 5.x 里的 setEnableTrace 写法）
+    // setEnableMsgTrace 的别名（两种写法都接受）
     void setEnableTrace(bool enable) { enableMsgTrace_ = enable; }
     void setTraceTopic(const std::string& t) { traceTopic_ = t; }
     void setTraceMsgBatchNum(int32_t n) { traceMsgBatchNum_ = n; }
-    // SubAfter 是否补 timestamp + groupName 两段由此决定（CLOUD 不补，Java 默认 LOCAL）
+    // SubAfter 是否补 timestamp + groupName 两段由此决定（CLOUD 不补；默认 LOCAL）
     void setAccessChannel(AccessChannel ch) { accessChannel_ = ch; }
     AccessChannel accessChannel() const { return accessChannel_; }
-    // 单批消费超时（分钟），用于 ConsumeReturnType.TIME_OUT 判定（Java 默认 15）；
-    // cleanExpiredMsg 的扫除阈值与周期也读它（Java 两处都调 getConsumeTimeout()）。
+    // 单批消费超时（分钟），用于 ConsumeReturnType.TIME_OUT 判定（默认 15）；
+    // cleanExpiredMsg 的扫除阈值与周期也读同一值（getConsumeTimeout()）。
     void setConsumeTimeout(int32_t minutes) { consumeTimeoutMinutes_ = minutes; }
     int32_t consumeTimeoutMinutes() const { return consumeTimeoutMinutes_; }
 
@@ -362,7 +360,7 @@ public:
     bool hasConsumeMessageHook() const { return !consumeMessageHookList_.empty(); }
     size_t consumeMessageHookCount() const { return consumeMessageHookList_.size(); }
 
-    // 投递前过滤钩子（对应 Java registerFilterMessageHook / hasFilterMessageHook）。
+    // 投递前过滤钩子（registerFilterMessageHook / hasFilterMessageHook）。
     // 钩子摘掉的消息：拉取路径静默跳过（位点照常推进），POP 路径立刻 ack。
     void registerFilterMessageHook(std::shared_ptr<FilterMessageHook> hook) {
         if (hook) filterMessageHookList_.push_back(std::move(hook));
@@ -372,9 +370,9 @@ public:
     // 已丢弃的条数（拉取 + POP 合计），供联调脚本与单测观测
     int64_t filteredMessageCount() const { return filteredMessageCount_.load(); }
 
-    // ---- 投递前过滤（对应 Java PullAPIWrapper.processPullResult 的 113-122 与 executeHook）----
+    // ---- 投递前过滤（processPullResult 的过滤段与 executeHook）----
     // 以下三个供单测/联调直接驱动（不经过网络）。
-    // 依次执行过滤钩子，**异常一律吞掉**（Java PullAPIWrapper.executeHook:171-178 记 error）；
+    // 依次执行过滤钩子，**异常一律吞掉**（钩子内部记 error）；
     // 与 CheckForbiddenHook 相反：过滤钩子挂了不能影响消费。
     void executeFilterMessageHook(FilterMessageContext& context);
     // 拉取 / POP 两条路径共用的投递前过滤：
@@ -385,7 +383,7 @@ public:
                                                       const SubscriptionData* sub,
                                                       const std::vector<MessageExt>& msgs);
     // 求 original \ kept 的差集（POP 路径要给被摘掉的消息补 ack）。
-    // Java 用 List.contains 的引用同一性；C++ 拷 vector 后无同一性，改按 msgId 求差（语义等价）。
+    // 引用同一性在 C++ 不可用（拷 vector 后没有同一性），改按 msgId 求差（语义等价）。
     static std::vector<MessageExt> droppedMessages(const std::vector<MessageExt>& original,
                                                    const std::vector<MessageExt>& kept);
 
@@ -406,7 +404,7 @@ public:
     // 当前分给本实例的队列 key 列表（真机验证"同组两实例不重不漏"用）。
     // key 格式与 offsetKey 一致：topic + brokerName + queueId。
     std::vector<std::string> assignedQueueKeys() const;
-    // 查消费组在某 topic 上的全部 clientId（对应 Java findConsumerIdList），用于验证多实例注册。
+    // 查消费组在某 topic 上的全部 clientId（findConsumerIdList），用于验证多实例注册。
     std::vector<std::string> consumerIdListOfGroup(const std::string& topic) const;
 
     // ---------------- 订阅 ----------------
@@ -423,11 +421,11 @@ public:
 
     // ---------------- 管理 ----------------
     std::vector<MessageQueue> fetchSubscribeMessageQueues(const std::string& topic);
-    // 消息重投（对应 Java sendMessageBack）：内部不抛异常。返回 false 表示
+    // 消息重投（sendMessageBack）：内部不抛异常。返回 false 表示
     // CONSUMER_SEND_MSG_BACK 与"普通消息重投"兜底都失败了。
     bool sendMessageBack(const MessageExt& msg, int32_t delayLevel,
                          const std::string& brokerName = std::string());
-    // 向所有已知 broker 发一次心跳（对应 Java sendHeartbeatToAllBrokerWithLock）
+    // 向所有已知 broker 发一次心跳（sendHeartbeatToAllBrokerWithLock）
     int32_t sendHeartbeatToAllBroker();
 
     // ---------------- 供单测/联调直接驱动消费分发（不经过网络）----------------
@@ -436,14 +434,14 @@ public:
     // 消费一个批次，处理回投/挂起；返回消费位点是否前进。key 用 offsetKey(mq)。
     // epoch 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被撤销/
     // 重建（rebalance 撤走、OFFSET_ILLEGAL 纠错、停摆自愈），这批消息**不消费也不 ack**
-    // ——直接作废（Java ConsumeMessageConcurrentlyService:339 的 isDropped() 短路）。
+    // ——直接作废（isDropped() 短路）。
     bool consumeBatch(const std::string& key, const MessageQueue& mq,
                       const std::vector<MessageExt>& batch,
                       const std::optional<uint64_t>& epoch = std::nullopt);
     // 队列在缓冲/位点表里的 key（topic + brokerName + queueId）。
     static std::string offsetKey(const MessageQueue& mq);
-    // 广播本地位点文件（Java LocalFileOffsetStore）的纯函数部件，开放给单测。
-    // 落盘格式是 fastjson2 的「MessageQueue 对象当 JSON key」（真实 5.5.0 jar 实测）：
+    // 广播本地位点文件（LocalFileOffsetStore）的纯函数部件，开放给单测。
+    // 落盘格式按「MessageQueue 对象当 JSON key」（与对端工具写的文件实测兼容）：
     // {"offsetTable":{{"brokerName":"b","queueId":0,"topic":"T"}:7,...}}
     static std::string buildLocalOffsetsJson(const std::map<std::string, int64_t>& items,
                                              const std::map<std::string, MessageQueue>& mqMap);
@@ -455,7 +453,7 @@ public:
                                    const std::map<std::string, int64_t>& items,
                                    const std::map<std::string, MessageQueue>& mqMap);
     static std::map<std::string, int64_t> loadLocalOffsetsAt(const std::string& path);
-    // 预置某队列的「已拉未消费」缓冲（Java ProcessQueue），用于断言回投失败后塞回队首的内容
+    // 预置某队列的「已拉未消费」缓冲（ProcessQueue），用于断言回投失败后塞回队首的内容
     void setPendingMessages(const std::string& key, const std::vector<MessageExt>& msgs);
     std::vector<MessageExt> pendingMessages(const std::string& key) const;
     // 读回某队列的已消费位点；nullopt = 还没有记录
@@ -467,34 +465,34 @@ public:
     int32_t orderlyMaxReconsumeTimes() const;
     // 本端口的待消费缓冲是 pending_ 双端队列，批次在分发给 listener **之前**就被弹出队首了；
     // 而拉取游标在拉取那一刻已经推到 nextBeginOffset，所以「位点不前进」并不会让 broker 把
-    // 这几条再发一遍 —— 想让它们原地重试就必须显式放回去（Java 那边消息始终留在 ProcessQueue
-    // 里，不需要这一步）。等价 Java makeMessageToConsumeAgain/rollback。
+    // 这几条再发一遍 —— 想让它们原地重试就必须显式放回去（ProcessQueue 口径下消息始终
+    // 留在队列状态里，不需要这一步）。等价 makeMessageToConsumeAgain/rollback。
     void requeuePending(const std::string& key, const std::vector<MessageExt>& msgs);
-    // 顺序消费的挂起时长（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234）：
-    // context 上的值优先、-1 回落到消费者配置，再钳到 [10, 30000]。listener 传 0 时 Java 仍然
+    // 顺序消费的挂起时长（submitConsumeRequestLater）：
+    // context 上的值优先、-1 回落到消费者配置，再钳到 [10, 30000]。listener 传 0 时仍然
     // 等 10ms（否则返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
     // 与上面两个一样「错了很安静」，所以开放给单测（真机上只表现为消费节奏不对）。
     int32_t orderlySuspendMillis(const ConsumeOrderlyContext& ctx) const;
-    // 并发侧的 -1 口径（Java DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890 的 16）。
-    // 与上面那个必须**并排**可见：两处 Java 各自调各自的 getMaxReconsumeTimes，
+    // 并发侧 maxReconsumeTimes=-1 时 getMaxReconsumeTimes 落到默认 16。
+    // 与上面那个必须**并排**可见：顺序/并发两条链路各自解析各自的 getMaxReconsumeTimes，
     // 合成一个常量就等于要么给顺序消费造死信、要么让并发消息无限重投。
     int32_t maxReconsumeTimesOrDefault() const;
     // 按消息现带的重试次数拼那条发往 %RETRY%group 的普通消息。两条回投链路共用，只有
-    // maxReconsumeTimes 的口径不同（Java 两处各调各的 getMaxReconsumeTimes），所以显式传。
+    // maxReconsumeTimes 的口径不同（两条链路各调各的 getMaxReconsumeTimes），所以显式传。
     Message buildRetryMessage(const MessageExt& msg, int32_t maxReconsumeTimes) const;
 
-    // ---- correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）----
+    // ---- correctTagsOffset ----
     // 拉取应答是 NO_NEW_MSG / NO_MATCHED_MSG（一条可投递的都没有）时，把"已消费位点"
     // 抬到应答的 nextBeginOffset。背景与判据见 .cpp 里的函数注释；「哪些状态要修正 +
     // 何时允许修正」都收在这一处，离线单测因此能一次锁死（真机上漏了它只表现为：
     // tag 长期不匹配的队列位点原地不动，重启后把这批没人要的消息反复重扫）。
     void correctTagsOffset(const std::string& key, PullStatus status, int64_t nextOffset);
-    // ---- OFFSET_ILLEGAL 纠错（Java DefaultMQPushConsumerImpl:402-427）----
+    // ---- OFFSET_ILLEGAL 纠错 ----
     // broker 说"你请求的位点非法"（队列被截断 / commitlog 过期 / 服务端一次性重置，一律回
-    // PULL_OFFSET_MOVED，见 MQClientAPIImpl:1099 映射成 OFFSET_ILLEGAL）并把修正值放在
+    // PULL_OFFSET_MOVED，remoting 层映射成 OFFSET_ILLEGAL）并把修正值放在
     // nextBeginOffset 里。纠错不只是把游标拨过去：这条队列上**已取回、还没消费/没 ack**
     // 的消息全部作废（它们落在被跳过的区间里，ack 会把位点推回非法值），然后按修正位点重建。
-    // 四步对应 Java：setNextOffset → setDropped(true) → { updateAndFreezeOffset + persist
+    // 四步：setNextOffset → setDropped(true) → { updateAndFreezeOffset + persist
     // + removeProcessQueue } → rebalanceImmediately。整条链路都在这里；内部要做网络 RPC，
     // 须在**不持 lock_** 的路径上调用。
     void handleOffsetIllegal(const std::string& key, int64_t nextOffset);
@@ -502,92 +500,91 @@ public:
     // 这两个（取走时与 pending_ 同一把锁登记）。漏登记 = 闸门看不见在途批次，崩溃恢复
     // 时会静默跳过消息；漏注销 = 闸门永远关着，correctTagsOffset 一次都不生效。
     // epochOut 非空时回填这批消息所属的 ProcessQueue 代号（与取走同一临界区读，见
-    // queueEpoch）：ack 前比对不上就整批作废（Java :267 的 isDropped）。
+    // queueEpoch）：ack 前比对不上就整批作废（isDropped 判据）。
     std::vector<MessageExt> takeBatchForConsume(const std::string& key,
                                                 uint64_t* epochOut = nullptr);
     void finishBatchConsume(const std::string& key);
-    // 该队列的「ProcessQueue 代号」（Java ProcessQueue 的实例身份）：撤销/重建时 +1，在途
+    // 该队列的「ProcessQueue 代号」（ProcessQueue 的实例身份）：撤销/重建时 +1，在途
     // 批次靠它判定自己是否已作废。判错是**静默**的（静默重复消费或静默丢 ack），所以与
     // requestOffset 那套一起开放给单测。
     uint64_t queueEpoch(const std::string& key) const;
-    // 该队列的已消费位点是否被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset 的
+    // 该队列的已消费位点是否被 OFFSET_ILLEGAL 纠错冻结（ControllableOffset 的
     // allowToUpdate=false）：冻结期间 ack 与空应答修正都不许改它。
     bool offsetFrozen(const std::string& key) const;
 
-    // ---- cleanExpiredMsg（Java ConsumeMessageConcurrentlyService:68-88/192-200
-    //      ＋ ProcessQueue.cleanExpiredMsg:75-127）----
+    // ---- cleanExpiredMsg（并发消费服务的过期清扫 ＋ ProcessQueue.cleanExpiredMsg）----
     // listener 卡死不返回时唯一的回收路径：把在手里超过 consumeTimeout 分钟的消息发回
     // broker（delayLevel 固定 3）走 %RETRY% 重投。少了它，一条卡住的消息让该队列位点
     // 永久停在原地，且没有任何异常、日志或超时可见 —— 真机上只能靠"消息发了却永远不来
     // 第二次"这种间接现象暴露。选条/摘除/上限三件事全都"错了很安静"，所以整体开放给
     // 离线单测（真机窗口是分钟级，秒级只能靠假时刻）。
-    // Java:87-90 的过期判据本体：没盖过 CONSUME_START_TIME（空串）→ 不算过期；否则
+    // 过期判据本体：没盖过 CONSUME_START_TIME（空串）→ 不算过期；否则
     // nowMs - 盖章时刻 > consumeTimeout*60*1000（**严格大于**）。nowMs 显式传入：真机
     // 路径传 currentTimeMillis()，离线用例用假时钟把边界钉死。
-    // ⚠ 盖章不是数字时 std::stoll 会抛（Java 是 NumberFormatException，由
-    // cleanExpireMsg 的调度壳子 catch(Throwable) 接住）——调用方不得吞掉这个语义。
+    // ⚠ 盖章不是数字时 std::stoll 会抛（NumberFormatException 语义），由
+    // cleanExpireMsg 的调度壳子 catch-all 接住——调用方不得吞掉这个语义。
     static bool isConsumeExpired(const MessageExt& msg, int32_t consumeTimeoutMinutes, int64_t nowMs);
-    // 一个队列的一轮清扫（Java ProcessQueue.cleanExpiredMsg）；顺序消费直接返回 0。
-    // 返回**本轮实际发起回投的条数**（Java 无返回值：与 updateCorePoolSize 同一口径，
+    // 一个队列的一轮清扫（ProcessQueue.cleanExpiredMsg）；顺序消费直接返回 0。
+    // 返回**本轮实际发起回投的条数**（与 updateCorePoolSize 同一口径：操作本身无返回值，
     // 只用于单测断言 16 条上限与选条顺序）。
     int32_t cleanExpiredQueue(const std::string& key, int64_t nowMs);
-    // 清扫一遍**当前持有**的队列（Java cleanExpireMsg():192-200 遍历 processQueueTable）。
+    // 清扫一遍**当前持有**的队列（遍历 processQueueTable）。
     int32_t cleanExpiredMsgOnce(int64_t nowMs);
-    // Java:106-115 —— 回投成功后，只有它**仍是**队首（最小 queueOffset 还是它）时才摘除：
+    // 回投成功后，只有它**仍是**队首（最小 queueOffset 还是它）时才摘除：
     // listener 恰好在此期间正常收尾（或前面冒出了更小的位点）就让位给正常路径。
     void removeExpiredEntryIfStillHead(const std::string& key, const MessageExt& msg);
-    // 「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java ProcessQueue.msgTreeMap。
+    // 「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 ProcessQueue.msgTreeMap。
     std::vector<MessageExt> processQueueEntries(const std::string& key) const;
-    // 队首 = 最小 queueOffset 的那条（Java msgTreeMap.firstEntry()）。
+    // 队首 = 最小 queueOffset 的那条（msgTreeMap.firstEntry()）。
     std::optional<MessageExt> processQueueHead(const std::string& key) const;
-    // Java ProcessQueue.containsMessage:341-357 —— **按 queueOffset**（不是对象身份）判断
+    // containsMessage 口径：**按 queueOffset**（不是对象身份）判断
     // 这条消息还挂在队列上：listener 返回后的回投要跳过已被清扫回投的条目，否则投两次。
     bool processQueueContains(const std::string& key, const MessageExt& msg) const;
-    // 预置某队列的「在途」登记（Java ProcessQueue 里已分发给 listener 的那部分），
+    // 预置某队列的「在途」登记（ProcessQueue 里已分发给 listener 的那部分），
     // 与 setPendingMessages 同一用途：离线驱动清扫而不用真起分发线程。
     void setInflightMessages(const std::string& key, const std::vector<MessageExt>& msgs);
-    // Java 的调度口径：initialDelay == period == consumeTimeout 分钟（默认 15 → 900000ms，
-    // ConsumeMessageConcurrentlyService:70-81 的 scheduleAtFixedRate 两个参数同源）。
+    // 调度口径：initialDelay == period == consumeTimeout 分钟（默认 15 → 900000ms，
+    // scheduleAtFixedRate 两个参数同源）。
     static int64_t cleanExpirePeriodMillis(int32_t consumeTimeoutMinutes);
 
-    // ---- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）----
-    // 上游 5.5.0：请求去重入队后 run() 拿到队列锁就返回（POPTODO，
-    // DefaultMQPushConsumerImpl:533）——消息**不消费、不 ack**，invisibleTime 到期由
+    // ---- POP 顺序消费（ConsumeMessagePopOrderlyService，未完成骨架）----
+    // 该链路是未完成骨架：请求去重入队后 run() 拿到队列锁就返回（POPTODO）——
+    // 消息**不消费、不 ack**，invisibleTime 到期由
     // broker 复活重投，宏观表现是「顺序 + POP 收不到消息、积压不消」。骨架里的
     // checkReconsumeTimes / sendMessageBack / submitConsumeRequestLater / processConsumeResult
-    // 随上游一起未被接通，等上游补齐时再移植。
-    // POP 弹出批次的统一入口（Java service 接口的公开方法）：顺序监听器分流进
+    // 暂未接通，等功能补齐时一并移植。
+    // POP 弹出批次的统一入口：顺序监听器分流进
     // submitPopOrderlyRequest 骨架，并发监听器走 ConsumeMessagePopConcurrentlyService。
     // 与 consumeBatch 一起开放给单测：分派错了很安静（顺序消息被消费 / 并发消息消失）。
     void submitPopConsumeRequest(std::vector<MessageExt> msgs,
                                  std::shared_ptr<PopProcessQueue> pq, const MessageQueue& mq);
-    // 提交一份 POP 顺序请求（Java submitConsumeRequest:178-191）：force=false 时按
+    // 提交一份 POP 顺序请求（submitConsumeRequest）：force=false 时按
     // (pq, mq) 去重，重复请求直接丢弃。
     void submitPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
                                  const MessageQueue& mq, bool force);
-    // 请求的执行体（Java ConsumeRequest.run:315-324）：pq 被撤销才摘请求；否则拿到
+    // 请求的执行体（ConsumeRequest.run）：pq 被撤销才摘请求；否则拿到
     // 队列锁就什么都不做 —— 不调 listener、不 ack。
     void runPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq, const MessageQueue& mq);
-    // 请求集条数（Java consumeRequestSet.size()；去重行为要能离线锁死）
+    // 请求集条数（consumeRequestSet.size()；去重行为要能离线锁死）
     size_t popOrderlyRequestCount() const;
 
-    // 登记「本实例已分配到这条队列」（Java ProcessQueueTable / Python `_mq_map`）。
+    // 登记「本实例已分配到这条队列」（ProcessQueueTable 的键集）。
     // topic 级流控阈值要靠它把同 topic 的兄弟队列聚起来。
     void setAssignedQueue(const std::string& key, const MessageQueue& mq);
-    // 拉取前的流控判定（Java ProcessQueue 的五个阈值，与 Python `_flow_control_hit` 同构）：
+    // 拉取前的流控判定（ProcessQueue 的五个阈值）：
     // 命中任一条就返回 true，并把命中次数记进 flowControlTriggered()。
     // 判据错了是"内存无上限堆消息 / 位点跨度失控"这类真机短期看不出的问题，必须能离线锁死，
     // 所以与 consumeBatch 同一理由放在 public。
     bool flowControlHit(const MessageQueue& mq, const std::string& key);
-    // 把一轮 POP 的结果记进拉取统计（Java `DefaultMQPushConsumerImpl.popMessage` 的
-    // PopCallback.onSuccess:556-563，与 pull 路径的 PullCallback 同一口径）：FOUND 就记
-    // pullRT（Java 在判空之前记），弹到消息才记 pullTPS。这两格是 307 应答 statusTable 的
+    // 把一轮 POP 的结果记进拉取统计（popMessage 的
+    // PopCallback.onSuccess，与 pull 路径的 PullCallback 同一口径）：FOUND 就记
+    // pullRT（在判空之前记），弹到消息才记 pullTPS。这两格是 307 应答 statusTable 的
     // 唯一来源，漏记了消费一切正常、只有看板上一片 0，而真机要跑满两个 10s 采样周期才看得
     // 出来 —— 所以判定本身要能离线直接喂 PopResult 锁死。
     void recordPopPullStats(ConsumerStatsManager& stats, const std::string& topic,
                             const PopResult& result, int64_t beganMs);
 
-    // ---- 停摆自愈（Java isPullExpired）的观测/注入面 ----
+    // ---- 停摆自愈（isPullExpired）的观测/注入面 ----
     // 停摆判据算错方向是**静默**故障：阈值写太小会把健康队列反复撤走重投（凭空造重复），
     // 写太大或干脆不判，则循环死掉的队列永久不再消费。真机窗口里两种错都看不出差别，
     // 所以阈值算术与时刻表要能在离线单测里直接读写。
@@ -596,11 +593,11 @@ public:
     int64_t lastPullAt(const std::string& key) const;
     // 注入时刻（真机故障注入用）：倒拨到阈值之外即等价于"这路卡住了"
     void setLastPullAt(const std::string& key, int64_t millis);
-    // 立刻按当前分配集撤/建一轮拉取线程（Java updateProcessQueueTableInRebalance）
+    // 立刻按当前分配集撤/建一轮拉取线程（updateProcessQueueTableInRebalance）
     void syncPullThreads();
 
 private:
-    // 拉取：每个队列一个线程（对齐 Java PullMessageService 的并发长轮询语义：
+    // 拉取：每个队列一个线程（并发长轮询语义：
     // broker 为每个队列挂起长轮询、消息到达立即返回；若单线程顺序轮询，
     // 一个空队列的 suspend 会阻塞其余队列的投递）。
     // 常驻循环线程的统一外壳：异常在边界上接住（逃出线程 = std::terminate，整进程陪葬），
@@ -611,23 +608,22 @@ private:
     void queuePullLoop(const MessageQueue& mq, uint64_t token);
     // 分发：单线程从各队列缓冲取批次交给监听器
     void dispatchLoop();
-    // 从 base 起把 batch[base, size) 逐条回投（Java processConsumeResult → sendMessageBack）：
+    // 从 base 起把 batch[base, size) 逐条回投（processConsumeResult → sendMessageBack）：
     // base 是尾巴在整批里的起始下标（部分 ack 时前缀已经认可，不能再回投）。
     // 返回回投**失败**的 (整批下标, 消息)，失败条目的 reconsumeTimes 已 +1
-    //（Java :251 —— broker 那边没记上这次数，客户端不补就永远进不了 DLQ）；
+    //（broker 那边没记上这次数，客户端不补就永远进不了 DLQ）；
     // 调用方据此把尾巴塞回队首并钳住位点。
     std::vector<std::pair<size_t, MessageExt>> sendBackBatch(
         const std::string& key, const std::vector<MessageExt>& batch,
         const ConsumeConcurrentlyContext& ctx, size_t base);
-    // 并发消费一个批次（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run 的
+    // 并发消费一个批次（ConsumeRequest.run 的
     // 监听器/回投/位点段）。抽出来只为在 consumeBatch 里用 RAII 把「登记在途 → 消费 →
     // 注销在途」围起来：中途任何一条 return 都必须注销，漏了登记表就再也摘不干净。
     // epoch 原样透传给位点推进（ack 作废判据，见 advanceConsumeOffset）。
     bool consumeConcurrentBatch(const std::string& key, const MessageQueue& mq,
                                 std::vector<MessageExt>& restored, bool broadcast,
                                 const std::optional<uint64_t>& epoch);
-    // cleanExpiredMsg 的调度循环（Java scheduleAtFixedRate(cleanExpireMsg,
-    // consumeTimeout, consumeTimeout, MINUTES)）。
+    // cleanExpiredMsg 的调度循环（fixed-rate：delay==period==consumeTimeout 分钟）。
     void cleanExpiredMsgLoop();
     // 「在途」登记的加/解锁（须与 pending_ 同一把 lock_：并集视图必须原子读）。
     void registerInflight(const std::string& key, const std::vector<MessageExt>& msgs);
@@ -639,9 +635,9 @@ private:
     // 两边都在，只摘一边会让下轮清扫再看见它）。
     void removeProcessQueueEntryLocked(const std::string& key, const MessageExt& msg);
     // 推进位点到 batch 中最大 queueOffset+1；floor 非空时不越过它
-    //（对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时，
+    //（ProcessQueue.removeMessage 口径：树里还留着未消费完的消息时，
     //  提交位点只能是 firstKey，否则会静默丢掉那条）。空批次直接返回。
-    // epoch 非空时先比对批次所属代号，不一致或位点已被冻结则整批 ack 作废（Java :267）。
+    // epoch 非空时先比对批次所属代号，不一致或位点已被冻结则整批 ack 作废（isDropped 判据）。
     void advanceConsumeOffset(const std::string& key, const std::vector<MessageExt>& batch,
                               const std::optional<int64_t>& floor = std::nullopt,
                               const std::optional<uint64_t>& epoch = std::nullopt);
@@ -658,63 +654,63 @@ private:
                            std::vector<std::pair<MessageQueue, int64_t>>& retired);
     // 该队列当前的 ProcessQueue 代号；没有记录按 0（与 takeBatchLocked 的缺省回填一致）
     uint64_t queueEpochLocked(const std::string& key) const;
-    // 回投兜底（Java sendMessageBackAsNormalMessage）
+    // 回投兜底（sendMessageBackAsNormalMessage）
     void sendMessageBackAsNormalMessage(const MessageExt& msg);
-    // 顺序消费的重投闸门（Java ConsumeMessageOrderlyService#checkReconsumeTimes /
-    // #sendMessageBack），与上面并发那一套不是同一条链路
+    // 顺序消费的重投闸门（orderly 链路的 checkReconsumeTimes /
+    // sendMessageBack），与上面并发那一套不是同一条链路
     bool orderlySendMessageBack(const MessageExt& msg);
-    // 位点持久化：每 5s 把"已消费位点"提交 broker（Java persistAllConsumerOffset）
+    // 位点持久化：每 5s 把"已消费位点"提交 broker（persistAllConsumerOffset）
     void offsetPersistLoop();
     void persistOffsetsOnce();
-    // 广播模式本地位点文件（Java LocalFileOffsetStore）
+    // 广播模式本地位点文件（LocalFileOffsetStore）
     std::string localOffsetPath() const;
     void saveLocalOffsets();
     // 撤销收尾带下来的位点（已不在 consumeOffsetTable_/mqMap_ 里）并进同一次落盘：
-    // Java 广播撤销是 persist(mq) 在前、removeOffset(mq) 在后，文件里的值必须留着，
+    // 广播撤销的收尾是 persist(mq) 在前、removeOffset(mq) 在后，文件里的值必须留着，
     // 否则同名队列下次分回来读不到位点、按 consumeFromWhere 重扫。
     void saveLocalOffsets(const std::vector<std::pair<MessageQueue, int64_t>>& extra);
     std::map<std::string, int64_t> loadLocalOffsets() const;
-    // 顺序消费 broker 队列锁（Java ConsumeMessageOrderlyService.lockMQ，每 20s）
+    // 顺序消费 broker 队列锁（lockMQ，每 20s）
     void lockLoop();
     bool isOrderly() const;
     void maybeSendHeartbeat();
-    // 订阅表新增/更新后的立即动作（Java DefaultMQPushConsumerImpl.subscribe 里的
+    // 订阅表新增/更新后的立即动作（subscribe 收尾的
     // sendHeartbeatToAllBrokerWithLock）：登记路由刷新 + 同步推一轮心跳。unsubscribe 不调。
     void notifySubscriptionChanged(const std::string& topic);
 
     std::vector<MessageQueue> assignedQueues();
     int64_t resolveInitialOffset(const MessageQueue& mq, const SubscriptionData& sub);
 
-    // ---- 真实 rebalance（对齐 Java RebalanceImpl.rebalanceByTopic）----
+    // ---- 真实 rebalance（rebalanceByTopic）----
     // 计算本实例应持有的队列集并写入 assignedQueues_，再同步拉取线程；
     // 新分配的队列**立刻**解析初始位点写入 offsetTable_。
     void doRebalance();
-    // 当前分配里「topic 的全部队列」（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
+    // 当前分配里「topic 的全部队列」（topicSubscribeInfoTable）。
     std::vector<MessageQueue> allQueuesOfTopic(const std::string& topic);
     // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
     // token 在**起线程之前**就写进 pullOwners_：std::thread 一构造就跑，如果等到
     // 建好再登记，新线程可能先跑到 ownsQueue() 看到「这张表里还没有我」而当场退出，
     // 队列却被登记成「已有拉取线程」⇒ 永远没人再拉它（真机少消费一批的根因）。
     bool ownsQueue(const std::string& key, uint64_t token) const;
-    // 每次**发起**拉取/弹出时盖时刻（Java DefaultMQPushConsumerImpl.pullMessage:253 /
-    // popMessage:508 的位置：在流控、锁判定之前——判据是"这条循环还在跑"，不是"这轮真打了网络"）。
+    // 每次**发起**拉取/弹出时盖时刻（pullMessage/popMessage 的盖章位置：在流控、锁判定
+    // 之前——判据是"这条循环还在跑"，不是"这轮真打了网络"）。
     void stampPullAt(const std::string& key);
-    // 该队列是否已停摆（Java ProcessQueue.isPullExpired）。调用方须持 lock_。
+    // 该队列是否已停摆（isPullExpired 判据）。调用方须持 lock_。
     bool pullStalledLocked(const std::string& key) const;
     // 循环函数返回了、却仍持有该队列（不是被 rebalance 撤走的）：标记为停摆，
-    // 让下一趟 rebalance 走撤走+重建。std::thread 死了没法像 Python 那样问 is_alive()
-    // （joinable() 仍是 true），所以由线程包装器自己报到。
+    // 让下一趟 rebalance 走撤走+重建。std::thread 结束后无法从外部探测（joinable()
+    // 仍是 true），所以由线程包装器自己报到。
     void markPullLoopExited(const std::string& key, uint64_t token);
-    // 队列被撤走时的收尾（对应 Java removeUnnecessaryMessageQueue）：持久化已消费位点、
+    // 队列被撤走时的收尾（removeUnnecessaryMessageQueue）：持久化已消费位点、
     // 丢弃在途缓冲、顺序消费集群模式解锁。revoked 为 (队列, 已消费位点) 列表。
     void onQueuesRevoked(const std::vector<std::pair<MessageQueue, int64_t>>& revoked);
-    // broker 通知消费组实例变化 → 立即重算（对齐 Java rebalanceImmediately）。
+    // broker 通知消费组实例变化 → 立即重算（rebalanceImmediately）。
     // 由 MQClientInstance 的 40 处理器逐个点名调用（实例级注册，见 start()）。
     void wakeRebalanceLoop();
-    // 分发前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）。
+    // 分发前把重投消息的 topic 还原成业务原始 topic（resetRetryAndNamespace）。
     void resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs);
 
-    // ---- POP 消费循环（5.x 轻量消费，对应 Java popMessage 回调 + ConsumeMessagePopConcurrentlyService）----
+    // ---- POP 消费循环（5.x 轻量消费：popMessage 回调 + POP 并发消费服务）----
     // 单队列 POP 循环。**不查、不提交消费位点**：进度由 broker 侧 checkpoint 跟踪，确认只靠 ack。
     void queuePopLoop(const MessageQueue& mq, uint64_t token);
     // 消费一个批次并按结果 ack / 延长不可见时间
@@ -724,7 +720,7 @@ private:
                                  const ConsumeConcurrentlyContext& ctx,
                                  std::vector<MessageExt>& msgs,
                                  const std::shared_ptr<PopProcessQueue>& pq);
-    // 重试次数用尽后的兜底（Java checkNeedAckOrDelay）
+    // 重试次数用尽后的兜底（checkNeedAckOrDelay）
     void checkNeedAckOrDelay(const MessageExt& msg);
     // 调用方必须已持有 lock_（pull 循环在入队临界区内直接调它）
     void updateMsgAccCntLocked(const std::string& key, const std::vector<MessageExt>& msgs);
@@ -732,24 +728,24 @@ private:
     void changePopInvisibleTime(const MessageExt& msg, int32_t delayLevel);
 
     // ---- 消费钩子 / 轨迹 ----
-    // 构造消费钩子上下文（Java 的初始值：success=false、props 空）
+    // 构造消费钩子上下文（初始值：success=false、props 空）
     ConsumeMessageContext buildConsumeHookContext(const std::vector<MessageExt>& msgs,
                                                   const MessageQueue& mq) const;
     void executeConsumeHookBefore(ConsumeMessageContext& context);
     void executeConsumeHookAfter(ConsumeMessageContext& context);
     // 消费结果 -> ConsumeReturnType 名字（写进 props，决定轨迹 SubAfter 的 contextCode）。
-    // 判定顺序与 Java ConsumeMessageConcurrentlyService:378-393 一致。
+    // 判定顺序是既定合同，不可重排。
     static const char* consumeReturnTypeOf(bool hasException, int64_t consumeRtMs,
                                            bool failed, bool succeeded);
-    // 收尾：写 props/status/success 后触发 after 钩子（对应 Java executeHookAfter 那一段）
+    // 收尾：写 props/status/success 后触发 after 钩子（executeHookAfter 那一段）
     void finishConsumeHook(ConsumeMessageContext* hookCtx, bool hasException, int64_t beginMs,
                            bool failed, bool succeeded, const std::string& statusText);
-    // 消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
-    // ackCount 只有**并发 classic** 路径传（Java 按 ackIndex+1 拆 ok/failed，
+    // 消费侧 RT/TPS 记数（ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
+    // ackCount 只有**并发 classic** 路径传（按 ackIndex+1 拆 ok/failed，
     // 部分 ack 的尾巴既记 FAILED 又会被重投）；POP 与顺序消费传 nullopt = 整批同一状态。
     void recordConsumeStats(const std::string& topic, int64_t msgCount, int64_t beginMs,
                             bool failed, const std::optional<int64_t>& ackCount = std::nullopt);
-    // 只记 RT（Java ConsumeMessageOrderlyService:515 的 incConsumeRT 在 processConsumeResult
+    // 只记 RT（incConsumeRT 在 processConsumeResult
     // **之外**、恒记）：顺序消费在 autoCommit=false 的 SUCCESS/COMMIT/ROLLBACK 三个分支上
     // 一条 TPS 都不记，但 RT 照记。
     void recordConsumeRt(const std::string& topic, int64_t beginMs);
@@ -757,11 +753,11 @@ private:
     void startTraceDispatcher();
 
     std::string consumerGroup_;
-    // 队列分配策略，对应 Java RebalanceImpl.allocateMessageQueueStrategy
-    // （DefaultMQPushConsumer 构造时传入）。默认 AllocateMessageQueueAveragely。
+    // 队列分配策略（RebalanceImpl.allocateMessageQueueStrategy 口径，构造时传入）。
+    // 默认 AllocateMessageQueueAveragely。
     std::shared_ptr<AllocateMessageQueueStrategy> allocateStrategy_;
     std::string namespace_;
-    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
+    // namespaceV2（协议字段）：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
     std::string namespaceV2_;
     // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
     std::shared_ptr<RPCHook> rpcHook_;
@@ -769,37 +765,36 @@ private:
     std::string clientId_;
     std::string unitName_;
     bool unitMode_ = false;
-    // Java 的 pull / lite 消费者在**每个构造函数**里置 true（DefaultMQPullConsumer:113/126、
-    // DefaultLitePullConsumer:213/228），生产者与推送消费者保持 false。
+    // 本 SDK 口径：pull / lite 消费者在**每个构造函数**里置 true，生产者与推送消费者保持 false。
     bool enableStreamRequestType_ = false;
 
-    // Java DefaultMQPushConsumer#postSubscriptionWhenPull（默认 false）。push 侧拉取门控：
+    // postSubscriptionWhenPull（默认 false）。push 侧拉取门控：
     // 只有它打开**且非**类过滤模式时才把 subString 随 PULL_MESSAGE 上送。
     bool postSubscriptionWhenPull_ = false;
-    // Java ClientConfig:58 / :66 的门面级副本（start() 时各透传/读取一次）
+    // ClientConfig 的门面级副本（start() 时各透传/读取一次）
     int32_t pollNameServerIntervalMillis_ = 30000;
     int32_t persistConsumerOffsetIntervalMillis_ = 5000;
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
 
-    // ---- 消费线程池（对齐 Java DefaultMQPushConsumer 的 consumeThreadMin/Max）----
-    // Java 5.x 的默认值是 min=20（:162）**且** max=20（:169）—— 两侧同为 20
-    // （4.x 时代才是 min=20/max=64，本端口早年照抄的是 4.x 那一组）。
-    // 本实现的**拉取**路径是"每队列一个拉取线程 + 单分发线程"，
-    // 只有 **POP** 路径用真正的线程池（对应 Java ConsumeMessagePopConcurrentlyService），
-    // 因此 corePoolSize 直接决定 POP 的消费并发度（Java 无界队列下 max 实际用不到）；
+    // ---- 消费线程池（consumeThreadMin/Max）----
+    // 当前默认值是 min=20 **且** max=20 —— 两侧同为 20
+    // （4.x 时代才是 min=20/max=64，本端口早年用的是 4.x 那一组）。
+    // **拉取**路径是"每队列一个拉取线程 + 单分发线程"，
+    // 只有 **POP** 路径用真正的线程池（POP 并发消费服务），
+    // 因此 corePoolSize 直接决定 POP 的消费并发度（无界队列语义下 max 实际用不到）；
     // 默认配置下 updateCorePoolSize 只能往**下**调（守卫 n < max = 20）。
     int32_t consumeThreadMin_ = 20;
     int32_t consumeThreadMax_ = 20;
-    // Java adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；上游 inc/dec 是空实现）
+    // adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；inc/dec 路径是空实现，不自动弹）
     int64_t adjustThreadPoolNumsThreshold_ = 100000;
-    // 声明式 core pool size（Java setCorePoolSize 的等价物），默认 = consumeThreadMin
+    // 声明式 core pool size（setCorePoolSize 的等价物），默认 = consumeThreadMin
     int32_t corePoolSize_ = 20;
     // key -> ProcessQueue.msgAccCnt（最近一次拉取算出的积压条数）
     mutable std::map<std::string, int64_t> msgAccCntTable_;
     // POP 消费执行器（start 且 popMode_ 时创建；stop 时 shutdown）
     std::shared_ptr<ConsumeExecutor> popConsumeExecutor_;
-    // POP 顺序请求去重集（Java ConcurrentSet<ConsumeRequest>，相等性 =
+    // POP 顺序请求去重集（ConcurrentSet<ConsumeRequest> 口径，相等性 =
     // (shardingKeyIndex, pq 引用, mq)；shardingKeyIndex 恒 0，pq 用指针身份 ——
     // rebalance 撤走队列换新 PopProcessQueue 后，新请求照常入队）
     std::set<std::pair<const PopProcessQueue*, MessageQueue>> popOrderlyRequests_;
@@ -813,11 +808,11 @@ private:
     int32_t maxReconsumeTimes_ = -1;
     int32_t pullIntervalMillis_ = 0;
     int32_t pullThresholdForQueue_ = 1000;
-    // 每队列已拉未消费的**字节**上限（MiB），Java pullThresholdSizeForQueue 默认 100
+    // 每队列已拉未消费的**字节**上限（MiB），pullThresholdSizeForQueue 默认 100
     int32_t pullThresholdSizeForQueue_ = 100;
-    // 每队列已拉未消费消息的 queueOffset 跨度上限，Java consumeMessageMaxSpan 默认 2000
+    // 每队列已拉未消费消息的 queueOffset 跨度上限，consumeMessageMaxSpan 默认 2000
     int64_t consumeConcurrentlyMaxSpan_ = 2000;
-    // topic 级累计阈值（条数 / MiB），Java 默认 -1 = 关闭
+    // topic 级累计阈值（条数 / MiB），默认 -1 = 关闭
     int32_t pullThresholdForTopic_ = -1;
     int32_t pullThresholdSizeForTopic_ = -1;
 
@@ -844,24 +839,24 @@ private:
     std::shared_ptr<MessageListener> messageListener_;
     // 拉取游标（nextBeginOffset）
     std::map<std::string, int64_t> offsetTable_;
-    // 已消费位点（周期持久化的对象；Java ProcessQueue.removeMessage 后的 commitOffset）
+    // 已消费位点（周期持久化的对象；ProcessQueue.removeMessage 后的 commitOffset）
     std::map<std::string, int64_t> consumeOffsetTable_;
     std::map<std::string, MessageQueue> mqMap_;
-    // 已拉未消费缓冲（Java ProcessQueue 的简化版）
+    // 已拉未消费缓冲（ProcessQueue 的简化版）
     std::map<std::string, std::deque<MessageExt>> pending_;
-    // 在途批次的**消息本体**（Java ProcessQueue.msgTreeMap 里已分发给 listener、还没 ack
-    // 的那部分）。pending_（已拉未分发）∪ 它 = Java 的 msgTreeMap：cleanExpiredMsg 的
+    // 在途批次的**消息本体**（ProcessQueue.msgTreeMap 里已分发给 listener、还没 ack
+    // 的那部分）。pending_（已拉未分发）∪ 它 = msgTreeMap 的完整视图：cleanExpiredMsg 的
     // 「只看队首」清扫与回投前的 containsMessage 判据都看这个并集。
     std::map<std::string, std::vector<MessageExt>> inflightMsgs_;
-    // 在途批次计数（Java ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
+    // 在途批次计数（ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
     // dispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。pending_ 与它合起来才是
-    // Java 的 ProcessQueue.getMsgCount()，correctTagsOffsetLocked 的闸门两个都要看。
+    // getMsgCount() 的完整口径，correctTagsOffsetLocked 的闸门两个都要看。
     std::map<std::string, int> inflightCount_;
-    // 队列当前的 ProcessQueue 代号（Java ProcessQueue 的实例身份）。撤销/重建时 +1：
+    // 队列当前的 ProcessQueue 代号（ProcessQueue 的实例身份）。撤销/重建时 +1：
     // 在途批次带着取走时的代号，ack 前比对不上就整批作废
-    //（Java ConsumeMessageConcurrentlyService:267 的 !processQueue.isDropped()）。
+    //（!processQueue.isDropped() 判据）。
     std::map<std::string, uint64_t> queueEpoch_;
-    // 被 OFFSET_ILLEGAL 纠错冻结的位点（Java ControllableOffset.allowToUpdate=false）：
+    // 被 OFFSET_ILLEGAL 纠错冻结的位点（ControllableOffset.allowToUpdate=false）：
     // 冻结期间 ack 与空应答修正都不许改它；队列重建时解冻。
     std::set<std::string> frozenOffsets_;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
@@ -870,19 +865,19 @@ private:
     std::unique_ptr<MQClientInstance> mqClient_;
     std::atomic<bool> started_{false};
     std::atomic<bool> stop_{false};
-    // Java DefaultMQPushConsumerImpl.pause（volatile boolean，默认 false）
+    // pause 标志（volatile boolean，默认 false）
     std::atomic<bool> paused_{false};
     std::map<std::string, std::thread> pullThreads_;
     // 每个队列当前拉取线程的「归属凭据」：在**起线程之前**登记，线程每轮自查
-    // （见 ownsQueue）。std::thread 一构造就开跑，没法像 Python/C# 那样「先入表
-    // 再 start」，所以归属不能靠线程 id 反查，只能靠这张先写入的表。
+    // （见 ownsQueue）。std::thread 一构造就开跑，做不到「先入表再启动」，
+    // 所以归属不能靠线程 id 反查，只能靠这张先写入的表。
     std::map<std::string, uint64_t> pullOwners_;
     uint64_t nextPullToken_ = 0;
-    // 每队列最近一次「发起拉取/弹出」的毫秒时刻（Java ProcessQueue.lastPullTimestamp /
+    // 每队列最近一次「发起拉取/弹出」的毫秒时刻（ProcessQueue.lastPullTimestamp /
     // PopProcessQueue.lastPopTimestamp）。rebalance 用它判 pull 是否停摆（kPullMaxIdleTime）。
     // 0 = 循环自己返回了却仍持有该队列（异常打穿），下一趟按停摆撤走重建。
     std::map<std::string, int64_t> lastPullAt_;
-    // Java PullAPIWrapper#pullFromWhichNodeTable（键 = 本端 offsetKey）：每次拉取应答头里的
+    // pullFromWhichNodeTable（键 = 本端 offsetKey）：每次拉取应答头里的
     // suggestWhichBrokerId 回写进来，下次拉取按它选主/从（缺省 MASTER_ID=0）。
     std::map<std::string, int64_t> pullFromWhichNode_;
     // 被撤销队列对应的旧拉取线程（已脱离 pullThreads_，等待其自然退出后回收）
@@ -891,10 +886,9 @@ private:
     std::thread persistThread_;
     std::thread lockThread_;
     std::thread rebalanceThread_;
-    // cleanExpiredMsg 的清扫线程（Java ConsumeMessageConcurrentlyService 的
-    // cleanExpireMsgExecutors 单线程调度；顺序/POP 不建）。
+    // cleanExpiredMsg 的清扫线程（cleanExpireMsgExecutors 单线程调度；顺序/POP 不建）。
     std::thread cleanExpireThread_;
-    // 真实 rebalance 计算出的本实例队列集（对应 Java ProcessQueueTable 的键集）。
+    // 真实 rebalance 计算出的本实例队列集（ProcessQueueTable 的键集）。
     // 取代旧实现里「订阅 topic 的全部队列」，避免同组多实例重复消费。
     std::vector<MessageQueue> assignedQueues_;
     std::condition_variable cv_;

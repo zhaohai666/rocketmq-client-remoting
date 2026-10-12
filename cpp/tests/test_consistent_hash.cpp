@@ -87,7 +87,7 @@ void testMd5MatchesReferenceVectors() {
 }
 
 // Java 只取摘要前 4 字节大端拼接，不是完整 128 bit
-void testJavaMd5HashTakesOnlyFourBytes() {
+void testMd5HashTakesOnlyFourBytes() {
     Md5Hash hash;
     CHECK_EQ(hash.hash(""), static_cast<int64_t>(0xD41D8CD9), "MD5Hash(\"\")");
     CHECK_EQ(hash.hash("abc"), static_cast<int64_t>(0x90015098), "MD5Hash(\"abc\")");
@@ -196,7 +196,7 @@ void testRingHashesAreSorted() {
 
 int main() {
     testMd5MatchesReferenceVectors();
-    testJavaMd5HashTakesOnlyFourBytes();
+    testMd5HashTakesOnlyFourBytes();
     testRingRoutesToClockwiseNeighbourAndWraps();
     testEmptyRingRoutesToNothing();
     testNegativeVirtualNodeCountIsRejected();

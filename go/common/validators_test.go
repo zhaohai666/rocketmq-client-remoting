@@ -24,7 +24,7 @@ func clientErrOf(t *testing.T, err error) (string, int32, bool) {
 	return e.Message, e.Code, e.HasCode
 }
 
-func TestCheckGroupRulesAndTextsMatchJava(t *testing.T) {
+func TestCheckGroupRulesAndTextsMatchServerValidation(t *testing.T) {
 	for _, blank := range []string{"", "   ", "\t "} {
 		text, code, hasCode := clientErrOf(t, CheckGroup(blank))
 		if text != "the specified group is blank" {
@@ -54,7 +54,7 @@ func TestCheckGroupRulesAndTextsMatchJava(t *testing.T) {
 	}
 }
 
-func TestCheckTopicRulesAndTextsMatchJava(t *testing.T) {
+func TestCheckTopicRulesAndTextsMatchServerValidation(t *testing.T) {
 	text, _, _ := clientErrOf(t, CheckTopic(""))
 	if text != "The specified topic is blank" {
 		t.Fatalf("blank topic: %q", text)

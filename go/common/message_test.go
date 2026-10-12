@@ -27,15 +27,15 @@ func TestMessageQueueHashCodeVectors(t *testing.T) {
 	}
 }
 
-func TestMessageQueueJavaStringIsTheHashTarget(t *testing.T) {
+func TestMessageQueueWireStringIsTheHashTarget(t *testing.T) {
 	q := NewMessageQueue("TopicTest", "BrokerA", 3)
 	want := "MessageQueue [topic=TopicTest, brokerName=BrokerA, queueId=3]"
-	if q.JavaString() != want {
-		t.Fatalf("JavaString = %q", q.JavaString())
+	if q.WireString() != want {
+		t.Fatalf("WireString = %q", q.WireString())
 	}
-	// String() 是日志形态，故意与 JavaString 不同：一致哈希路由吃的是 JavaString
-	if q.String() == q.JavaString() {
-		t.Fatal("String and JavaString must stay different")
+	// String() 是日志形态，故意与 WireString 不同：一致哈希路由吃的是 WireString
+	if q.String() == q.WireString() {
+		t.Fatal("String and WireString must stay different")
 	}
 }
 

@@ -64,7 +64,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinals_are_java_ordinals() {
+    fn ordinals_are_contract_ordinals() {
         assert_eq!(MessageType::NormalMsg.value(), 0);
         assert_eq!(MessageType::TransMsgHalf.value(), 1);
         assert_eq!(MessageType::TransMsgCommit.value(), 2);

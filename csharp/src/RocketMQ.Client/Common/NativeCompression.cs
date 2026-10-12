@@ -453,7 +453,7 @@ internal static class NativeLz4Codec
         [FieldOffset(52)] public uint Reserved2;
 
         /// <summary>等价于 C 的 LZ4F_INIT_PREFERENCES 后把 blockMode 改成 independent。</summary>
-        internal static Preferences Lz4JavaLike() => new()
+        internal static Preferences Lz4LegacyLike() => new()
         {
             BlockSizeID = BlockMax64KB,
             BlockMode = BlockIndependent,
@@ -512,7 +512,7 @@ internal static class NativeLz4Codec
     /// </summary>
     internal static byte[] Compress(byte[] src)
     {
-        Preferences prefs = Preferences.Lz4JavaLike();
+        Preferences prefs = Preferences.Lz4LegacyLike();
         nuint contextError = CreateCompressionContext(out IntPtr cctx, Lz4fVersion);
         FailIfError(contextError, "LZ4F_createCompressionContext");
 

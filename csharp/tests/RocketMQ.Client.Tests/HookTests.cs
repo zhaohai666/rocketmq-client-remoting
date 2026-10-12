@@ -220,7 +220,7 @@ public class HookTests
     }
 
     [Fact]
-    public void CheckForbiddenHook_DefaultsMatchJava()
+    public void CheckForbiddenHook_DefaultsMatchLegacy()
     {
         var ctx = new CheckForbiddenContext();
         Assert.Null(ctx.SendResult);
@@ -366,7 +366,7 @@ public class HookTests
     }
 
     [Fact]
-    public void FilterMessageContext_DefaultsMatchJava()
+    public void FilterMessageContext_DefaultsMatchLegacy()
     {
         var ctx = new FilterMessageContext();
         Assert.Empty(ctx.MsgList);

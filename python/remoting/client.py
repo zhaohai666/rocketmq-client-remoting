@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
-"""socket 长连接客户端（对应 org.apache.rocketmq.remoting.netty.NettyRemotingClient 的核心能力）。
+"""socket 长连接客户端。
 
 提供：连接管理（惰性建连 + 复用）、invokeSync/invokeAsync/invokeOneway、
 opaque 映射回调分发、超时控制、连接状态探活、GO_AWAY 换连接重发、
-连接断开时立刻失败该连接上的在途请求（对应 Java failFast）。
+连接断开时立刻失败该连接上的在途请求（fail-fast）。
 
-与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
-（channelNotActiveInterval=60s）在 Java 客户端里**从未被调度**——client + remoting 全树
-grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
-惰性清理已覆盖真实场景。
+不做空闲 name-server 连接的周期性回收（channelNotActiveInterval=60s 式扫描）：
+对端真断开时读线程立刻见到 EOF，惰性清理已覆盖真实场景。
 """
 from __future__ import annotations
 
@@ -39,14 +37,14 @@ _TLS_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 _SHUTDOWN_JOIN_SECONDS = 5.0
 
 
-# 超时判定专用单调时钟（Java 用 System.currentTimeMillis，这里刻意取更稳的口径：
-# 改系统时间不应让在途请求提前超时或永不超时）
+# 超时判定专用单调时钟：改系统时间（前进或回拨）都不应让在途请求提前超时或永不超时，
+# 因此超时账目一律走单调时钟而非墙上时钟。
 def _mono_millis() -> float:
     return time.monotonic() * 1000.0
 
 
 def _retry_request(request: RemotingCommand) -> RemotingCommand:
-    """GO_AWAY 重发用的请求副本（对应 Java 的 createRequestCommand + setBody + setExtFields）。
+    """GO_AWAY 重发用的请求副本（复制 code/自定义头/body/ext_fields，只换 opaque）。
 
     必须是**新** opaque：旧的那条已经在途表里摘掉了，复用会让响应错配到别的请求。
     ext_fields 按值复制——ACL 签名（AccessKey/Signature）就存在这里，重发要带原签名，
@@ -99,12 +97,12 @@ def _close_socket(sock: socket.socket) -> None:
 
 
 class _ResponseFuture:
-    """一次在途请求（对应 Java ``ResponseFuture``）。
+    """一次在途请求，记录回调、超时账目与实际写出的套接字。
 
-    回调契约（与 Java InvokeCallback 的 operationSucceed / operationFail 二分等价）：
+    回调契约（成功/失败二分）：
     ``callback(response, error)`` —— 成功时 error 为 None，超时/失败时 response 为 None。
     回调**恰好触发一次**：读线程与超时清理线程抢同一个 future，由 ``execute_invoke_callback``
-    里的 once 标志定胜负（Java 用 AtomicBoolean executeCallbackOnlyOnce 表达同一约束）。
+    里的 once 标志定胜负。
     """
 
     def __init__(self, opaque: int, timeout_millis: int, invoke_callback=None,
@@ -112,21 +110,21 @@ class _ResponseFuture:
         self.opaque = opaque
         self.timeout_millis = timeout_millis
         self.invoke_callback = invoke_callback
-        # 保留请求命令，供 do_after_response 钩子使用（对应 Java 的 request 形参）
+        # 保留请求命令，供 do_after_response 钩子使用
         self.request = request
-        # 超时账目（对应 Java 的 beginTimestamp + timeoutMillis）：单调时钟，不受改系统时间影响
+        # 超时账目（开始时间戳 + 超时预算）：单调时钟，不受改系统时间影响
         self.addr = addr
         self.begin_timestamp = _mono_millis()
         self.response: Optional[RemotingCommand] = None
         self.send_request_ok = False
-        # 请求真正写出去时所用的套接字（对应 Java ResponseFuture 里的 channel 字段）。
+        # 请求真正写出去时所用的套接字。
         # 连接断开时按**对象身份**认领在途请求：只比地址串会误伤——同地址可能已经换了一条
         # 新连接（close_channel/GO_AWAY 重发就是这个形状），旧连接的读线程收尾时不能把
         # 新连接上的请求一起判死。None 表示还没写出去，这条连接的 failFast 不该牵连它。
         self.conn: Optional[socket.socket] = None
-        # 失败原因（对应 Java 的 cause）。同步等待方靠它区分"发送失败"与"超时"：
-        # Java 的 invokeSyncImpl 把 ExecutionException 翻成 RemotingSendRequestException，
-        # TimeoutException 才翻成 RemotingTimeoutException。
+        # 失败原因。同步等待方靠它区分"发送失败"与"超时"：
+        # 连接断开（请求已确定发不出去或写失败）报 RemotingSendRequestException，
+        # 只有等满预算仍无响应才报 RemotingTimeoutException。
         self.cause: Optional[BaseException] = None
         self._done = threading.Event()
         self._lock = threading.Lock()
@@ -144,7 +142,7 @@ class _ResponseFuture:
         return self.response
 
     def is_timeout(self) -> bool:
-        # 与 Java 同式：严格大于，等于 deadline 那一刻还不算超时
+        # 严格大于才算超时：等于 deadline 那一刻还不算
         return _mono_millis() - self.begin_timestamp > self.timeout_millis
 
     def execute_invoke_callback(self, error: Optional[BaseException] = None) -> bool:
@@ -159,19 +157,19 @@ class _ResponseFuture:
         try:
             self.invoke_callback(response, error)
         except Exception as e:
-            # 回调里抛出的异常不能带走读线程/清理线程（对应 Java 的 try-catch + warn）
+            # 回调里抛出的异常不能带走读线程/清理线程，只记日志
             logger.warning("remoting: invoke callback raised: %s" % e)
         return True
 
     def fail_fast(self) -> bool:
-        """连接已断：把这条在途请求判为发送失败（对应 Java ``NettyRemotingAbstract#requestFail``）。
+        """连接已断：把这条在途请求判为发送失败。
 
-        Java 那四步一一对应：``setSendRequestOK(false)``、``putResponse(null)``、
-        ``executeInvokeCallback``、``release()``。第一步是**语义**关键——回调里
-        ``ResponseFuture#executeInvokeCallback`` 按 ``sendRequestOK=false`` 报
-        ``RemotingSendRequestException``（而不是超时），异步发送的重试分类就吃这个区别。
-        ``putResponse(null)`` 唤醒的是同步等待方：没有它，发送明明已经失败调用方还要等满
-        invoke 超时。``release()`` 在本端口不存在于传输层（反压许可由 producer 的回调链归还，
+        四步缺一不可：置 ``send_request_ok=false``、``put_response(None)``、
+        ``execute_invoke_callback``、归还资源。第一步是**语义**关键——按
+        ``send_request_ok=false`` 报 ``RemotingSendRequestException``（而不是超时），
+        异步发送的重试分类就吃这个区别。
+        ``put_response(None)`` 唤醒的是同步等待方：没有它，发送明明已经失败调用方还要等满
+        invoke 超时。资源归还不存在于传输层（反压许可由 producer 的回调链归还，
         见 ``client/producer.py`` 的 ``_release``），投递回调即触发归还。
         """
         self.send_request_ok = False
@@ -187,15 +185,14 @@ class RemotingClient:
                  enable_reconnect_for_go_away: bool = True):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
-        # 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）：
-        # 收到 ResponseCode.GO_AWAY(1500) 时换一条连接重发一次。
+        # 收到 ResponseCode.GO_AWAY(1500) 时是否换一条连接重发一次（默认 **true**）。
         self.enable_reconnect_for_go_away = enable_reconnect_for_go_away
-        # TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
-        # 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
+        # TLS 开关。显式参数优先，否则读环境变量 ROCKETMQ_TLS_ENABLE（等价于服务端的
+        # tls.enable 系统属性）。
         if tls_enable is None:
             tls_enable = os.environ.get("ROCKETMQ_TLS_ENABLE", "").strip().lower() in ("1", "true", "yes")
         self.tls_enable = bool(tls_enable)
-        # TLS 细项（对齐 PHP RemotingClient $tlsOptions / Java TlsSystemConfig certPath 族）。
+        # TLS 细项（证书路径族：caCert / clientCert / clientKey / serverName）。
         #   caCert: CA 证书路径 —— 给出即**严格校验**（tls.test.mode.enable=false 口径）：
         #           broker 证书必须链到该 CA 且主机名/SAN 匹配（默认用连接 host）；
         #           不给 = test-mode（信任自签，CERT_NONE，历史行为）。
@@ -207,7 +204,7 @@ class RemotingClient:
         self._sock_locks: Dict[str, threading.Lock] = {}
         self._response_table: Dict[int, _ResponseFuture] = {}
         self._response_lock = threading.Lock()
-        # 在途请求超时清理（对应 Java NettyRemotingAbstract.scanResponseTable 及其定时线程）。
+        # 在途请求超时清理：定时扫描在途表，回收已过期的请求并投递失败回调。
         # 缺了它，异步请求一旦收不到响应就永久悬挂：条目泄漏在表里，回调永不触发。
         # 首次 invoke_async 才起线程，纯同步用法不留线程。
         self._sweeper_lock = threading.Lock()
@@ -273,8 +270,8 @@ class RemotingClient:
             sock.close()
             raise RemotingConnectException(addr)
         if self.tls_enable:
-            # 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ
-            # 帧之前完成握手。test mode（Java tls.test.mode.enable 默认 true）= 信任
+            # TLS 包住整个流，在任何 RocketMQ 帧之前完成握手。test-mode（broker 侧
+            # tls.test.mode.enable 默认 true）= 信任
             # broker 的自签证书、不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
             # tls_options['caCert'] 给出则走**严格校验**：证书链必须到该 CA、主机名/SAN
             # 必须匹配（PROTOCOL_TLS_CLIENT 默认 check_hostname=True）。
@@ -329,7 +326,7 @@ class RemotingClient:
             return False
 
     def close_channel(self, addr: str) -> None:
-        """摘掉到 addr 的连接（对应 Java closeChannel 的 removeChannel + channel.close）。
+        """摘掉到 addr 的连接：先从连接表移除，再关闭。
 
         真正关套接字的是该连接的读线程：这里只置停止标志并等它退出。
         在调用方线程上直接关 SSLSocket 不安全——读线程可能正阻塞在同一条 socket 的
@@ -432,7 +429,7 @@ class RemotingClient:
                     self._reader_threads.pop(addr, None)
                     self._conn_stops.pop(addr, None)
             _close_socket(sock)
-            # 对端再也不会回这些请求了：立刻判死，别让调用方等满超时（Java 的 failFast）
+            # 对端再也不会回这些请求了：立刻判死，别让调用方等满超时（fail-fast）
             self._fail_fast(addr, sock)
 
     def _dispatch(self, frame: bytes, addr: str) -> None:
@@ -462,10 +459,9 @@ class RemotingClient:
             return
         handler = self._processors.get(cmd.code)
         if handler is not None:
-            # 处理器**可以**返回一个响应命令（对应 Java NettyRequestProcessor#processRequest
-            # 的返回值）。需要返回的典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：
+            # 处理器**可以**返回一个响应命令。需要返回的典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：
             # broker 用 invokeSync 推应答，客户端不回响应它那边就会等到超时。
-            # 事务回查 39 是 oneway（Java 里 broker 用 invokeOneway），处理器返回 None 即可。
+            # 事务回查 39 由 broker 用 oneway 发出，处理器返回 None 即可。
             response = None
             try:
                 response = handler(cmd, addr)
@@ -482,7 +478,7 @@ class RemotingClient:
 
     def register_processor(self, request_code: int,
                            handler: Callable[["RemotingCommand", str], Optional[RemotingCommand]]) -> None:
-        """注册 broker 主动请求处理器（对应 Java NettyRemotingServer 的 processor 表）。
+        """注册 broker 主动请求处理器（按 RequestCode 分发表）。
 
         handler 签名 ``handler(cmd, addr) -> Optional[RemotingCommand]``：``cmd`` 是解码后的
         RemotingCommand（含 ext_fields / body），``addr`` 是对端（broker）地址；
@@ -499,7 +495,7 @@ class RemotingClient:
 
     # ---------- RPC 钩子 ----------
     def _apply_before_request_hooks(self, addr: str, cmd: RemotingCommand) -> None:
-        """发送前依次执行 RPC 钩子（对应 Java NettyRemotingAbstract#doBeforeRpcHooks）。
+        """发送前依次执行 RPC 钩子。
 
         **必须在 cmd.encode() 之前调用**：ACL 钩子要把 AccessKey/Signature 写进
         ext_fields，而 Signature 覆盖的是 makeCustomHeaderToNet() 之后的完整
@@ -510,7 +506,7 @@ class RemotingClient:
 
     def _apply_after_response_hooks(self, addr: str, request: Optional[RemotingCommand],
                                     response: Optional[RemotingCommand]) -> None:
-        """收到响应后依次执行 RPC 钩子（对应 Java NettyRemotingAbstract#doAfterRpcHooks）。
+        """收到响应后依次执行 RPC 钩子。
 
         无钩子时零开销；request 缺失（理论上不会）则跳过，不影响响应分发。
         """
@@ -531,7 +527,7 @@ class RemotingClient:
         """把响应写回 broker。
 
         **不能**走 ``_send``：``_send`` 会执行 RPC 钩子（ACL 会给请求加签），
-        而响应报文不需要也不能带签名（对齐 Java：``doBeforeRpcHooks`` 只在
+        而响应报文不需要也不能带签名（RPC 钩子只在
         invokeSync/invokeAsync/invokeOneway 三条主动发起路径上调用）。
         写失败只记日志：这条响应对应 broker 侧的 ``Broker2Client.callClient`` 超时，
         不该让读线程因为这个异常退出（读线程一死，同连接上所有在途请求全丢）。
@@ -553,7 +549,7 @@ class RemotingClient:
         情况下，紧跟着的第一个请求记录有约 3~5% 根本没到对端 —— 对端的 TLS 读一直等到
         超时，调用方只能等满 invoke 超时（明文连接 0%）。改成「先写第一个记录、再起读
         线程」后同一场景 270 条新建 TLS 连接 0 次复现。对真集群（5.5.1 nameServer 与
-        broker 的 TLS 嗅探端口）各 60 轮两种时序都是 0 丢 —— Java 的 TLS 栈不把这个竞争
+        broker 的 TLS 嗅探端口）各 60 轮两种时序都是 0 丢 —— broker 的 TLS 栈不把这个竞争
         暴露出来，所以这条只能在本地 TLS 对端上守（``tests/test_tls_trace.py``），
         真机侧由 ``verify_tls_live.py`` 守整链路。明文连接没有这个问题，仍然立刻起读线程。
         """
@@ -573,7 +569,7 @@ class RemotingClient:
         return sock
 
     def invoke_sync(self, addr: str, request: RemotingCommand, timeout_millis: Optional[int] = None) -> RemotingCommand:
-        """同步 RPC，含 GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）。"""
+        """同步 RPC，含 GO_AWAY 换连接重发。"""
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
         started = _mono_millis()
         response = self._invoke_once(addr, request, timeout)
@@ -592,7 +588,7 @@ class RemotingClient:
             raise RemotingSendRequestException(addr, "Receive GO_AWAY from channel %s" % addr)
         logger.info("remoting: receive GO_AWAY from %s, reconnect and retry once", addr)
         self.close_channel(addr)
-        # 重发只花剩余预算：Java 用同一个 Stopwatch 的 elapsed 扣减 timeoutMillis。
+        # 重发只花剩余预算：从总 timeoutMillis 里扣掉已经耗用的时间。
         spent = int(_mono_millis() - started)
         retry_timeout = max(1, timeout - spent)
         retry = _retry_request(request)
@@ -617,7 +613,7 @@ class RemotingClient:
         if response is None:
             with self._response_lock:
                 self._response_table.pop(request.opaque, None)
-            # 连接断掉时 _fail_fast 已经置好 cause 并唤醒了我：按 Java 的口径报"发送失败"，
+            # 连接断掉时 _fail_fast 已经置好 cause 并唤醒了我：报"发送失败"，
             # 而不是等满 timeout 再报超时。两条路的可重试性不一样（见 producer 的重试分类）。
             if future.cause is not None:
                 raise future.cause
@@ -627,19 +623,19 @@ class RemotingClient:
     def invoke_async(self, addr: str, request: RemotingCommand,
                      callback: Callable[[Optional[RemotingCommand], Optional[BaseException]], None],
                      timeout_millis: Optional[int] = None) -> None:
-        """异步调用：立即返回。回调**恰好触发一次**（对应 Java invokeAsyncImpl）：
+        """异步调用：立即返回。回调**恰好触发一次**：
 
         - 正常收到响应 -> ``callback(response, None)``
         - 超过 timeout_millis 仍无响应 -> ``callback(None, RemotingTimeoutException)``
-          （由超时清理线程投递，等价于 Java scanResponseTable 里的 operationFail）
+          （由超时清理线程投递）
         - 连接在响应之前断开 -> ``callback(None, RemotingSendRequestException)``
-          （由读线程收尾时投递，等价于 Java failFast -> requestFail 的 operationFail；
+          （由读线程收尾时投递；
           不等超时清理线程，因为那一刻已经确定不会有任何响应了）
 
         timeout_millis 为 None 时使用 invoke_timeout_millis。
 
         GO_AWAY 与同步路径同口径：换连接重发一次，第二次仍是 GO_AWAY 则回调报错
-        （Java 的这段逻辑在 ``invokeImpl`` 里，同步与异步共用）。
+        （同步与异步共用这段重发逻辑）。
         """
         timeout = timeout_millis if timeout_millis is not None else self.invoke_timeout_millis
         self._invoke_async_once(addr, request, callback, timeout, _mono_millis())
@@ -680,7 +676,7 @@ class RemotingClient:
         except BaseException as retry_error:  # noqa: BLE001 - 回调契约：错误也只能走 error 参数
             callback(None, retry_error)
 
-    # ---------- 在途请求超时清理（对应 Java scanResponseTable） ----------
+    # ---------- 在途请求超时清理 ----------
     def _ensure_sweeper(self) -> None:
         with self._sweeper_lock:
             if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
@@ -706,7 +702,7 @@ class RemotingClient:
                 logger.warning("remoting: response sweep failed: %s" % e)
 
     def _sweep_expired(self) -> None:
-        # 与 Java 同式：beginTimestamp + timeoutMillis + 1000 <= now。这 1s 宽限是给
+        # 判定式：beginTimestamp + timeoutMillis + 1000 <= now。这 1s 宽限是给
         # "响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递。
         grace_millis = 1000.0
         now = _mono_millis()
@@ -728,17 +724,16 @@ class RemotingClient:
             # 持锁回调会和 shutdown 抢同一把锁，甚至自锁。
             f.execute_invoke_callback(error=error)
 
-    # ---------- 连接断开时立刻失败在途请求（对应 Java failFast / requestFail） ----------
+    # ---------- 连接断开时立刻失败在途请求（fail-fast） ----------
     def _fail_fast(self, addr: str, sock: socket.socket) -> int:
         """``sock`` 这条连接已经关了：把它名下还没响应的在途请求全部判为发送失败。
 
-        Java 的 ``NettyRemotingHandler#close`` 在 ``closeChannel`` 之后紧接着调
-        ``failFast(channel)``（``NettyRemotingClient.java:1191``），因为这条连接上的请求
+        关连接的收尾必须紧接着做一次 fail-fast 扫描，因为这条连接上的请求
         永远等不到响应了。少了这一步会错两件事，都不只是"慢一点"：
 
         1. 同步调用方要等满 invoke 超时才发现连接早断了；异步回调更糟，要等
            ``timeout + 1s``（那是清理线程的宽限口径）。
-        2. 报出来的是 ``RemotingTimeoutException``，Java 报的是
+        2. 报出来的是 ``RemotingTimeoutException``，而正确的应是
            ``RemotingSendRequestException``。异步发送的重试分类按这两个类型分流
            （``client/producer.py`` 的 ``_classify_async_failure``），错类型等于错语义。
 

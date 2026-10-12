@@ -39,7 +39,7 @@ public class RequestReplyTests
     // ---------------------------------------------------------------- 应答消息构造
 
     [Fact]
-    public void CreateReplyMessageMatchesJavaShape()
+    public void CreateReplyMessageMatchesLegacyShape()
     {
         Message reply = RequestReply.CreateReplyMessage(RequestMsg(), System.Text.Encoding.UTF8.GetBytes("pong"));
         // topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）

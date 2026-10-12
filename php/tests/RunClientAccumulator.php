@@ -12,7 +12,7 @@ namespace {
 // SendResult 兜底定义（仅当并行子任务尚未落地 php/src/Client/SendResult.php 时生效）。
 //
 // 按约定本文件**不**创建 php/src/Client/SendResult.php：那是并行子任务的产物。这里只是在
-// 自测运行时，若真实类缺席，补一个同形状（Java/Python 构造器顺序 + camelCase 公有属性）的
+// 自测运行时，若真实类缺席，补一个同形状（构造器参数顺序 + camelCase 公有属性）的
 // 替身，好让本套件在当前工作区也能独立跑通；真实类一旦落地，class_exists 命中，本替身自动失效。
 // ============================================================================================
 namespace RocketMQ\Client {
@@ -75,7 +75,7 @@ namespace {
      * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAccumulator.php
      * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
      *
-     * 单线程适配：蓝本的守卫线程 → 显式 pump（tick/flush/flushAll）；"当前时间"与发送函数都注入。
+     * 单线程适配：后台守卫线程 → 显式 pump（tick/flush/flushAll）；"当前时间"与发送函数都注入。
      */
     final class RunClientAccumulator
     {
@@ -218,7 +218,7 @@ namespace {
             $this->checkSame(10, $acc->getBatchMaxDelayMs(), '默认 holdMs=10');
             $this->checkSame(32 * 1024, $acc->getBatchMaxBytes(), '默认 holdSize=32KB');
             $this->checkSame(32 * 1024 * 1024, $acc->getTotalHoldSize(), '默认 totalHoldSize=32MB');
-            // Java 的 getTotalBatchMaxBytes 实际返回 holdSize（上游笔误，照抄）
+            // getTotalBatchMaxBytes 实际返回 holdSize（沿用这一已知行为，勿改）
             $this->checkSame(32 * 1024, $acc->getTotalBatchMaxBytes(), 'getTotalBatchMaxBytes 返回 holdSize');
             $this->checkSame(0, $acc->currentlyHoldSize(), '初始 currentlyHoldSize=0');
 
@@ -260,9 +260,9 @@ namespace {
         /**
          * 累积到 holdSize 阈值触发 flush。
          *
-         * ⚠ 蓝本（python/client/produce_accumulator.py）**没有** MaxMessageNum / 条数阈值，
-         * 只有两条判据：`messagesSize > holdSize`（本批字节）与 `now >= createTime + holdMs`。
-         * 任务书里的 "MaxMessageNum / MaxMessageSize" 在本文件对应 holdSize（字节闸门），此处按蓝本实现。
+         * ⚠ 累积器**没有** MaxMessageNum / 条数阈值，只有两条判据：
+         * `messagesSize > holdSize`（本批字节）与 `now >= createTime + holdMs`（时间闸门）。
+         * 因此本套件一律按 holdSize（字节闸门）设期望值，不按条数。
          */
         private function testAccumulateToHoldSizeThresholdTriggersFlush(): void
         {
@@ -481,7 +481,7 @@ namespace {
             $this->checkSame(3, count($errs), '拆条非法：3 个回调都被触发');
             $this->check(array_reduce($errs, static fn(bool $c, ?\Throwable $e): bool => $c && $e instanceof \InvalidArgumentException, true), '拆条非法：回调收到 InvalidArgumentException');
 
-            // 发送本身抛异常（发起阶段）→ 全体回调 onException，且**不归还**额度（Java 遗漏，照抄）
+            // 发送本身抛异常（发起阶段）→ 全体回调 onException，且**不归还**额度（沿用这一已知行为）
             $throwSender = new FakeSender('x', 'y', 0, 0, $this->sendOkStatus(), true);
             $acc3 = new ProduceAccumulator('async-throw', $throwSender, $this->clock());
             $msg3 = new Message('T', 'zzz');
@@ -493,7 +493,7 @@ namespace {
             });
             $acc3->flushAll();
             $this->check($err3 instanceof \Throwable, '发起阶段异常 → 回调 onException');
-            $this->checkSame($holdBefore, $acc3->currentlyHoldSize(), '发起阶段异常**不**归还额度（Java 遗漏，照抄）');
+            $this->checkSame($holdBefore, $acc3->currentlyHoldSize(), '发起阶段异常**不**归还额度（已知行为）');
         }
 
         // ==================================================================== 守卫防重入
@@ -693,7 +693,7 @@ namespace {
             $index = count($this->sent) - 1;
 
             if ($this->throwOnSend) {
-                // 模拟 sendDirect 在发起阶段就抛（还没回调）——Java 外层 catch 只通知回调、不归还额度
+                // 模拟 sendDirect 在发起阶段就抛（还没回调）——外层 catch 只通知回调、不归还额度
                 throw new \RuntimeException('fake sendDirect threw');
             }
             if ($this->failAt >= 0 && $index === $this->failAt) {

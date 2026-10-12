@@ -229,7 +229,7 @@ JsonValue ConsumeQueueData::toJson() const {
     v.set("eval", JsonValue::makeBool(eval));
     if (hasBitMap) v.set("bitMap", JsonValue::makeString(bitMap));
     else v.set("bitMap", JsonValue::makeNull());
-    // 同 Java：null 字段不序列化（这里用 has* 显式表达 null）
+    // broker 侧约定：null 字段不序列化（这里用 has* 显式表达 null）
     if (hasExtendDataJson) v.set("extendDataJson", JsonValue::makeString(extendDataJson));
     if (hasMsg) v.set("msg", JsonValue::makeString(msg));
     return v;

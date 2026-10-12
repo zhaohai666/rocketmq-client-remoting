@@ -366,7 +366,7 @@ public class CheckClientConfigTests
 
     /// <summary>SQL92 那一笔的形状：无 extFields、body 三段、SubscriptionData 只有 7 个键。</summary>
     [Fact]
-    public void Sql92RequestShapeMatchesJava()
+    public void Sql92RequestShapeMatchesLegacy()
     {
         using MockBroker mock = MockBroker.Start();
         mock.ScriptChecks(Array.Empty<(int, string)>());
@@ -450,7 +450,7 @@ public class CheckClientConfigTests
 
     /// <summary>连不上 broker 时 Java 不吞异常，而是换成一段固定文案再抛。</summary>
     [Fact]
-    public void TransportErrorIsWrappedWithJavaMessage()
+    public void TransportErrorIsWrappedWithLegacyMessage()
     {
         using MockBroker mock = MockBroker.Start();
         mock.ScriptChecks(Array.Empty<(int, string)>());
@@ -527,7 +527,7 @@ public class CheckClientConfigTests
 
     /// <summary>MQClientApiTimeoutMillis 就是 Java ClientConfig.mqClientApiTimeout 的默认值。</summary>
     [Fact]
-    public void MqClientApiTimeoutMatchesJava()
+    public void MqClientApiTimeoutMatchesLegacy()
     {
         Assert.Equal(3000, MQClientInstance.MqClientApiTimeoutMillis);
     }

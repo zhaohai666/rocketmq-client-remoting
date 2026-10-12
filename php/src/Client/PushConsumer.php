@@ -44,22 +44,21 @@ if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
 }
 
 /**
- * 推模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer），
- * 移植自 python/client/consumer.py 的 DefaultMQPushConsumer。
+ * 推模式消费者（经典 remoting 协议的 push 消费端）。
  *
- * ## PHP 单线程适配（PORTING.md「异步模型」，有意偏差，改动前先读）
+ * ## PHP 单线程适配（有意偏差，改动前先读）
  *
- * Python 用 6 类后台线程（心跳 / 重平衡 / 每队列拉取 / 分发 / 位点落盘 / 顺序锁）+
- * POP 线程池；PHP 无线程，全部收敛为调用方驱动的 ``tick()``：
+ * 后台任务共 6 类（心跳 / 重平衡 / 每队列拉取 / 分发 / 位点落盘 / 顺序锁）+ POP 弹取；
+ * PHP 无线程，全部收敛为调用方驱动的 ``tick()``：
  *
  * - **心跳 / 重平衡 / 位点落盘 / 顺序锁 / 过期清扫**：改为 tick 内的到点检查
- *   （周期与 Java 一致：30s / 20s / 10s+persistConsumerOffsetInterval / 20s / consumeTimeout 分钟）；
- * - **拉取循环**：Java 是每队列一个长轮询线程（suspend=true）；PHP 单线程下长轮询会
- *   饿死其它队列，改为**短轮询**（suspend=false）+ 空结果空闲退避
+ *   （周期 30s / 20s / 10s+persistConsumerOffsetInterval / 20s / consumeTimeout 分钟）；
+ * - **拉取循环**：每队列一个长轮询循环（suspend=true）在多线程模型里各跑各的；PHP 单线程下
+ *   长轮询会饿死其它队列，改为**短轮询**（suspend=false）+ 空结果空闲退避
  *   ``pullIntervalMillis``（默认 1000ms）。语义代价：空队列的位点修正
  *   （correctTagsOffset）从 ~15s 一次变 ~1s 一次，只会更勤不会更懒；
  *   吞吐代价：单队列单次 tick 至多 ``maxPullsPerQueuePerTick`` 轮短轮询；
- * - **消费**：Python 的分发线程即同步消费；PHP 在 tick 内分发同样同步执行，
+ * - **消费**：分发即同步消费；PHP 在 tick 内分发同样同步执行，
  *   顺序消费的"挂起重试"从 sleep 改为 ``suspendedUntil`` 表（tick 到点前跳过该队列）；
  * - **POP**：同上，pollTime=0 短轮询 + 空闲退避；消费批次内联执行（不再建
  *   ConsumeExecutor —— 单线程下"真实并发度==core"没有意义，保留声明值可观测）。
@@ -68,11 +67,11 @@ final class DefaultMQPushConsumer
 {
     // ---------------- POP 模式（5.x 轻量消费）配置 ----------------
     //
-    // Java 的 push-consumer POP 走 **broker 侧分配**：QUERY_ASSIGNMENT(400) 拿
-    // MessageQueueAssignment(mode=POP)，客户端不做 rebalance。本项目**刻意不实现这条路径**，
-    // 而是复用已有的**客户端 rebalance**：队列由本地按分配策略算出，然后每队列独立 POP。
-    // 语义等价（都是"每队列一个 POP 循环 + ack 确认"），差别只在于"谁决定分哪些队列"
-    // —— 这是有意差异，改动前请先读 Python 蓝本同位置的注释。
+    // 协议里 push-consumer 的 POP 另有一条 **broker 侧分配**路径：QUERY_ASSIGNMENT(400) 拿
+    // MessageQueueAssignment(mode=POP)，由服务端决定队列归属，客户端不做 rebalance。本项目
+    // **刻意不实现这条路径**，而是复用已有的**客户端 rebalance**：队列由本地按分配策略算出，
+    // 然后每队列独立 POP。语义等价（都是"每队列一个 POP 循环 + ack 确认"），差别只在于
+    // "谁决定分哪些队列" —— 这是有意差异。
 
     public string $consumerGroup;
     public ?bool $tlsEnable = null;
@@ -81,12 +80,12 @@ final class DefaultMQPushConsumer
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
-    /** unitName/unitMode/enableStreamRequestType：对应 Java ClientConfig 同名字段。 */
+    /** unitName/unitMode/enableStreamRequestType：单元化与流式请求开关，前者参与 clientId 构造、unitMode 进心跳与订阅过滤。 */
     public ?string $unitName = null;
     public bool $unitMode = false;
     public bool $enableStreamRequestType = false;
     /**
-     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求带
+     * 5.x 新命名空间（namespaceV2）：非空时**每笔**请求带
      * `nsd=true` / `ns=<该值>` 两个扩展头，由 broker 解析到对应 serverless 实例。
      * 与上面那个 `namespace`（客户端给 topic/group 拼 `namespace%` 前缀）是两套机制，
      * 这里**不**改任何资源名。见 NamespaceRpcHook。
@@ -98,12 +97,12 @@ final class DefaultMQPushConsumer
     /** CONSUME_FROM_TIMESTAMP 的起点（格式 yyyyMMddHHmmss），默认 30 分钟前。 */
     public string $consumeTimestamp;
 
-    // ---- 消费线程池（声明值；Java 5.x 默认 min=max=20）----
+    // ---- 消费并发度（声明值，默认 min=max=20；单线程模型下仅供观测与运行时调整）----
     public int $consumeThreadMin = 20;
     public int $consumeThreadMax = 20;
     public int $adjustThreadPoolNumsThreshold = 100000;
     private int $corePoolSize;
-    /** ProcessQueue.msgAccCnt（按队列 key）：最近一次拉取算出的"积压条数"。 */
+    /** msgAccCnt（按队列 key）：最近一次拉取算出的"积压条数"（队列最大位点 − 本批最后一条 queueOffset）。 */
     /** @var array<string,int> */
     private array $msgAccCntTable = [];
     public int $consumeConcurrentlyMaxSpan = 2000;
@@ -113,7 +112,7 @@ final class DefaultMQPushConsumer
     public int $pullThresholdSizeForTopic = -1;
     public int $pullInterval = 0;
     /**
-     * 拉取 RPC 超时。⚠ Java/Python 是 30000（长轮询挂起预算）；PHP 短轮询下
+     * 拉取 RPC 超时。⚠ 长轮询语义下应给到 30000（挂起预算）；PHP 短轮询下
      * broker 立即返回，默认压到 5000 —— 卡死的连接不必等 30s。
      */
     public int $pullTimeoutMillis = 5000;
@@ -2301,7 +2300,7 @@ final class DefaultMQPushConsumer
     private function orderlyMaxReconsumeTimes(): int
     {
         if ($this->maxReconsumeTimes === -1) {
-            return ConsumerDefaults::JAVA_INT_MAX;
+            return ConsumerDefaults::INT32_MAX;
         }
         return $this->maxReconsumeTimes;
     }

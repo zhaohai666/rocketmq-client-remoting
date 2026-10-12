@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息属性键常量（对应 org.apache.rocketmq.common.message.MessageConst，
- * 移植自 message_const.py）。
+ * 消息属性键常量：这些字符串就是协议里 properties 的键名，broker 与
+ * 控制台都按字面匹配，改一个字符就等于把该功能关掉。
  */
 final class MessageConst
 {
@@ -65,7 +65,7 @@ final class MessageConst
     public const PROPERTY_POP_CK_OFFSET = 'POP_CK_OFFSET';
     public const PROPERTY_POP_TIME = 'POP_TIME';
     /**
-     * Java 侧写的是 "1ST_POP_TIME"（MessageConst.PROPERTY_FIRST_POP_TIME），
+     * 键名字面是 "1ST_POP_TIME"（首位是数字 1，不是字母 I），写错就没人能读到；
      * 客户端在 POP 响应后处理时"仅在缺失时"补上，值为响应头的 popTime。
      */
     public const PROPERTY_FIRST_POP_TIME = '1ST_POP_TIME';

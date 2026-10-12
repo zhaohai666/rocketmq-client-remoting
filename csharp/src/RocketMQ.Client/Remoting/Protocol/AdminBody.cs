@@ -54,7 +54,7 @@ public static class MessageQueueKeys
 
         @out.Topic = v.Get("topic").StringValue();
         @out.BrokerName = v.Get("brokerName").StringValue();
-        @out.QueueId = JavaNumber.ToInt32(v.Get("queueId").IntValue(0));
+        @out.QueueId = LegacyNumber.ToInt32(v.Get("queueId").IntValue(0));
         return true;
     }
 

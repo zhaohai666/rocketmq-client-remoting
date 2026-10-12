@@ -652,21 +652,21 @@ mod tests {
     use super::*;
 
     /// Java fastjson2 真实输出（内联对象键 —— 非法 JSON），来自
-    /// `python/tests/test_admin_models.py::JAVA_TOPIC_STATS`。
-    pub const JAVA_TOPIC_STATS: &str = concat!(
+    /// `python/tests/test_admin_models.py::WIRE_TOPIC_STATS`。
+    pub const WIRE_TOPIC_STATS: &str = concat!(
         r#"{"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:"#,
         r#"{"lastUpdateTimestamp":1700000000000,"maxOffset":500,"minOffset":0}},"#,
         r#""topicPutTps":0.0}"#
     );
 
-    /// 来自 `python/tests/test_admin_models.py::JAVA_CONSUME_STATS`。
-    pub const JAVA_CONSUME_STATS: &str = concat!(
+    /// 来自 `python/tests/test_admin_models.py::WIRE_CONSUME_STATS`。
+    pub const WIRE_CONSUME_STATS: &str = concat!(
         r#"{"consumeTps":1.5,"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:"#,
         r#"{"brokerOffset":100,"consumerOffset":90,"lastTimestamp":1700000000000,"pullOffset":0}}}"#
     );
 
     #[test]
-    fn message_queue_key_matches_java_text() {
+    fn message_queue_key_matches_wire_text() {
         let mq = MessageQueueKey::new("MyTopic", "broker-a", 3);
         assert_eq!(
             message_queue_key(&mq),
@@ -686,8 +686,8 @@ mod tests {
     }
 
     #[test]
-    fn topic_stats_table_decodes_java_inline_object_keys() {
-        let table = TopicStatsTable::decode(JAVA_TOPIC_STATS.as_bytes()).unwrap();
+    fn topic_stats_table_decodes_server_inline_object_keys() {
+        let table = TopicStatsTable::decode(WIRE_TOPIC_STATS.as_bytes()).unwrap();
         assert_eq!(table.offset_table.len(), 1);
         assert_eq!(table.offset_table.len(), 1);
         let (mq, offset) = &table.offset_table[0];
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn consume_stats_lag_and_total_lag() {
-        let stats = ConsumeStats::decode(JAVA_CONSUME_STATS.as_bytes()).unwrap();
+        let stats = ConsumeStats::decode(WIRE_CONSUME_STATS.as_bytes()).unwrap();
         assert_eq!(stats.consume_tps, 1.5);
         assert_eq!(stats.offset_table.len(), 1);
         let ow = &stats.offset_table[0].1;

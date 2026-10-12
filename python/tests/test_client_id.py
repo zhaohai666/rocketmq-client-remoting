@@ -21,9 +21,9 @@ from remoting.exception import RemotingConnectException
 from remoting.protocol.heartbeat import MessageModel
 
 # <IP>@<pid>#<纳秒>
-JAVA_STYLE = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())
+CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())
 # 拉取/轻量消费者多一段 @STREAM（Java 的构造函数恒开 enableStreamRequestType）
-JAVA_STREAM_STYLE = re.compile(r"^[^@\s]+@%d#\d+@STREAM$" % MixAll.pid())
+STREAM_CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+@STREAM$" % MixAll.pid())
 
 
 def _split(client_id: str):
@@ -62,12 +62,12 @@ class TestMixAllClientId:
 
 
 class TestProducerClientId:
-    def test_start_stamps_a_java_style_client_id(self):
+    def test_start_stamps_the_documented_client_id_format(self):
         p = DefaultMQProducer("PID_clientid_shape")
         p.set_namesrv_addr("127.0.0.1:1")
         p.start()
         try:
-            assert JAVA_STYLE.match(p.client_id), p.client_id
+            assert CLIENT_ID_PATTERN.match(p.client_id), p.client_id
             ip, instance = _split(p.client_id)
             assert ip == MixAll.cached_ip_str()
             # instanceName 就地写回：重启不能再换一个 clientId
@@ -129,7 +129,7 @@ class TestConsumerClientId:
         with pytest.raises(RemotingConnectException):
             clustering.start()
         try:
-            assert JAVA_STYLE.match(clustering.client_id), clustering.client_id
+            assert CLIENT_ID_PATTERN.match(clustering.client_id), clustering.client_id
         finally:
             clustering.shutdown()
 
@@ -154,7 +154,7 @@ class TestConsumerClientId:
         pull.set_namesrv_addr("127.0.0.1:1")
         pull.start()
         try:
-            assert JAVA_STREAM_STYLE.match(pull.client_id), pull.client_id
+            assert STREAM_CLIENT_ID_PATTERN.match(pull.client_id), pull.client_id
         finally:
             pull.shutdown()
 
@@ -163,7 +163,7 @@ class TestConsumerClientId:
         lite.subscribe("T", "*")
         lite.start()
         try:
-            assert JAVA_STREAM_STYLE.match(lite.client_id), lite.client_id
+            assert STREAM_CLIENT_ID_PATTERN.match(lite.client_id), lite.client_id
         finally:
             lite.shutdown()
 
@@ -302,7 +302,7 @@ class TestAdminClientId:
         admin.set_namesrv_addr("127.0.0.1:1")
         admin.start()
         try:
-            assert JAVA_STYLE.match(admin.client_id), admin.client_id
+            assert CLIENT_ID_PATTERN.match(admin.client_id), admin.client_id
         finally:
             admin.shutdown()
 

@@ -1,8 +1,5 @@
 // -*- coding: utf-8 -*-
-// POP-mode consumption (Java
-// ConsumeMessagePopConcurrentlyService + DefaultMQPushConsumerImpl.popMessage /
-// ackAsync / changePopInvisibleTimeAsync / checkNeedAckOrDelay; port of
-// go/client/pop_consumer.go).
+// POP-mode consumption for this port's push consumer.
 //
 // POP differs from pull in ways that make a "just reuse the pull loop" port
 // wrong at every step:
@@ -14,14 +11,14 @@
 //     popThresholdForQueue), not on buffered messages.
 //  3. A batch can expire WHILE the listener runs (invisibleTime is wall
 //     clock). Such a batch must not be acked — the broker has already taken it
-//     back and someone else may own it. Java checks this twice: before the
-//     listener and again after.
+//     back and another consumer may own it. The window is checked twice: once
+//     before the listener and again after.
 //  4. Redelivery is "extend the invisibility window", never a send-back. The
 //     broker's revive logic re-pops the message once the window closes.
 //
-// Orderly POP exists in Java as a stub ("POPTODO think of pop mode orderly
-// implementation later") and is rejected here at config time rather than
-// half-implemented.
+// Orderly POP is rejected at config time on this port: the broker-side
+// protocol has no ack-order guarantee for the POP path we speak, and a
+// half-implemented mode would silently break ordering invariants.
 import type { DefaultMQPushConsumer } from './consumer.ts';
 import { MessageExt, MessageQueue } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
@@ -42,15 +39,15 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('pop');
 
-// POP timing constants (Java DefaultMQPushConsumerImpl:105-140).
+// POP timing constants.
 export const POP_BROKER_SUSPEND_MAX_TIME_MILLIS = 1000 * 15; // long-poll budget sent as pollTime
 export const POP_ASYNC_TIMEOUT_MILLIS = 3000;               // ACK and CHANGE_INVISIBLETIME
 export const POP_REQUEST_EXTRA_NETWORK_MILLIS = 10 * 1000;  // "+10s" on the long-poll timeout
 
 export const POP_MIN_INVISIBLE_TIME = 5000;
 export const POP_MAX_INVISIBLE_TIME = 300000;
-// Fallback Java applies when the configured value is out of range — NOT an
-// error at request time.
+// Fallback applied at request time when the configured value is out of range —
+// NOT an error.
 export const POP_DEFAULT_INVISIBLE_TIME = 60000;
 
 export const POP_DELAY_WHEN_CACHE_FLOW_CONTROL = 50;
@@ -70,11 +67,10 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
     if (!pq || pq.isDropped()) return;
     pq.setLastPopTimestamp(Date.now());
 
-    // Java DefaultMQPushConsumerImpl.popMessage:518-521 — POP reads the SAME
-    // consumer-wide pause flag, and the gate sits after the stamp for the same
-    // reason as the pull loop (a suspended-but-alive pop loop must not be
-    // judged expired, or rebalance retires the queue and in-flight batches get
-    // abandoned to the broker's revive).
+    // POP reads the SAME consumer-wide pause flag as the pull loop, and the
+    // gate sits after the stamp for the same reason (a suspended-but-alive pop
+    // loop must not be judged expired, or rebalance retires the queue and
+    // in-flight batches get abandoned to the broker's revive).
     if (c.isPaused()) {
       if (await c._sleepOrStop(POP_DELAY_WHEN_SUSPEND, stopFlag)) return;
       continue;
@@ -82,8 +78,7 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
 
     const sub = c.subscription.get(mq.getTopic());
     if (!sub) return;
-    // Flow control on the outstanding-ACK debt. Java uses a strict ">"
-    // against popThresholdForQueue.
+    // Flow control on the outstanding-ACK debt, against popThresholdForQueue.
     if (pq.waitAckMsgCount() > c.popThresholdForQueue) {
       logger.debug('pop flow control: queue %s waiting-ack=%d exceeds threshold %d',
         key, pq.waitAckMsgCount(), c.popThresholdForQueue);
@@ -91,8 +86,8 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
       continue;
     }
 
-    // Java:541 stamps beginTimestamp immediately before the POP request, so
-    // the POP round trip includes the broker's poll hold.
+    // beginTimestamp is stamped immediately before the POP request, so the
+    // POP round trip includes the broker's poll hold.
     const begin = Date.now();
     let result: PopResult;
     try {
@@ -118,12 +113,11 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
     if (c._isStopped(stopFlag)) return;
     switch (result.popStatus) {
       case PopStatus.FOUND: {
-        // Java DefaultMQPushConsumerImpl:555-563 — the RT counter is bumped
-        // for a FOUND answer even when the list is empty; only the TPS
-        // counter is conditioned on a non-empty list.
+        // The RT counter is bumped for a FOUND answer even when the list is
+        // empty; only the TPS counter is conditioned on a non-empty list.
         c._incPullRT(mq.getTopic(), Date.now() - begin);
         if (result.msgFoundList.length === 0) {
-          // Java: FOUND with an empty list retries immediately.
+          // FOUND with an empty list retries immediately.
           continue;
         }
         c._incPullTPS(mq.getTopic(), result.msgFoundList.length);
@@ -148,9 +142,9 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
 async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Promise<PopResult> {
   const client = c.mqClient;
   if (!client) throw new Error('consumer not started');
-  // Java DefaultMQPushConsumerImpl:608-611 — an out-of-range configured value
-  // is replaced by 60s at REQUEST time; checkConfig has already rejected the
-  // startup, so this only bites when the setter runs mid-flight.
+  // An out-of-range configured value is replaced by 60s at REQUEST time;
+  // checkConfig has already rejected the startup, so this only bites when the
+  // setter runs mid-flight.
   let invisibleTime = c.popInvisibleTime;
   if (invisibleTime < POP_MIN_INVISIBLE_TIME || invisibleTime > POP_MAX_INVISIBLE_TIME) {
     invisibleTime = POP_DEFAULT_INVISIBLE_TIME;
@@ -181,8 +175,8 @@ async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Pr
     header.expType = sub.expressionType;
     header.exp = sub.subString;
   }
-  // Java PullAPIWrapper.popAsync:386-392 — poll=true always here, and the
-  // network timeout gets +10s on top of the broker hold budget.
+  // Wire rule: poll=true always here, and the network timeout gets +10s on
+  // top of the broker hold budget.
   const timeout = POP_BROKER_SUSPEND_MAX_TIME_MILLIS + POP_REQUEST_EXTRA_NETWORK_MILLIS;
   return client.popMessage(mq.getBrokerName(), resolved.addr, header, c.namespace, timeout);
 }
@@ -192,8 +186,7 @@ async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Pr
 // ---------------------------------------------------------------------------
 
 // submitPopConsume splits one pop batch into consumeMessageBatchMaxSize chunks
-// and consumes them, mirroring
-// ConsumeMessagePopConcurrentlyService#submitPopConsumeRequest.
+// and dispatches them; mirrors the broker-facing submit semantics.
 function submitPopConsume(c: DefaultMQPushConsumer, mq: MessageQueue, msgs: MessageExt[], pq: PopProcessQueue): void {
   const batchSize = Math.max(1, c.consumeMessageBatchMaxSize);
   for (let total = 0; total < msgs.length;) {
@@ -215,8 +208,7 @@ function submitPopConsume(c: DefaultMQPushConsumer, mq: MessageQueue, msgs: Mess
   }
 }
 
-// consumePopBatch is Java ConsumeMessagePopConcurrentlyService$ConsumeRequest
-// .run + processConsumeResult.
+// consumePopBatch runs the listener on one pop batch and settles the result.
 async function consumePopBatch(c: DefaultMQPushConsumer, mq: MessageQueue, batch: MessageExt[], pq: PopProcessQueue): Promise<void> {
   if (batch.length === 0) return;
   const key = mqKey(mq);
@@ -225,8 +217,8 @@ async function consumePopBatch(c: DefaultMQPushConsumer, mq: MessageQueue, batch
     return;
   }
   // The window can already have closed while this batch sat in the dispatch
-  // queue. Java aborts here without acking — the broker has revived the
-  // messages and another consumer may hold them.
+  // queue. Abort here without acking — the broker has revived the messages and
+  // another consumer may hold them.
   if (popBatchTimedOut(batch)) {
     logger.debug('the pop message time out so abort consume, mq=%s', key);
     pq.decFoundMsg(-batch.length);
@@ -249,8 +241,7 @@ async function consumePopBatch(c: DefaultMQPushConsumer, mq: MessageQueue, batch
   }
 
   const begin = Date.now();
-  // ConsumeMessagePopConcurrentlyService:380-382 — same CONSUME_START_TIME
-  // stamping as the pull path.
+  // Same CONSUME_START_TIME stamping as the pull path.
   for (const msg of batch) {
     msg.putProperty('CONSUME_START_TIME', String(Date.now()));
   }
@@ -296,13 +287,13 @@ async function consumePopBatch(c: DefaultMQPushConsumer, mq: MessageQueue, batch
       try { hook.consumeMessageAfter(hookCtx); } catch (e) { /* hooks never break delivery */ }
     }
   }
-  // Java ConsumeMessagePopConcurrentlyService:424-425 — CONSUME_RT is bumped
-  // after the hook and before the validity re-check, so a batch that expired
-  // while the listener ran still contributes its RT (the listener DID run).
+  // CONSUME_RT is bumped after the hook and before the validity re-check, so
+  // a batch that expired while the listener ran still contributes its RT (the
+  // listener DID run).
   c._incConsumeRT(mq.getTopic(), consumeRT);
 
-  // Java checks the window AGAIN after the listener: a slow listener must not
-  // ACK messages the broker already owns.
+  // Check the window again after the listener: a slow listener must not ACK
+  // messages the broker already owns.
   if (pq.isDropped() || popBatchTimedOut(batch)) {
     logger.warning('processQueue invalid or popTimeout, mq=%s', key);
     pq.decFoundMsg(-batch.length);
@@ -311,8 +302,7 @@ async function consumePopBatch(c: DefaultMQPushConsumer, mq: MessageQueue, batch
   processPopConsumeResult(c, mq, batch, pq, status, ctx);
 }
 
-// processPopConsumeResult is Java
-// ConsumeMessagePopConcurrentlyService#processConsumeResult.
+// processPopConsumeResult settles one batch:
 //
 // Two loops, and EVERY message decrements the debt exactly once, so the
 // counter returns to zero whatever the outcome:
@@ -330,9 +320,8 @@ function processPopConsumeResult(c: DefaultMQPushConsumer, mq: MessageQueue, bat
     ackIndex = ctx.ackIndex;
     if (ackIndex >= batch.length) ackIndex = batch.length - 1;
   }
-  // Java ConsumeMessagePopConcurrentlyService:186-203 — the same OK/Failed
-  // accounting as the pull path, from the same clamped ackIndex the ACK loop
-  // below uses, and likewise before the loop.
+  // The same OK/Failed accounting as the pull path, from the same clamped
+  // ackIndex the ACK loop below uses, and likewise before the loop.
   if (status === ConsumeConcurrentlyStatus.CONSUME_SUCCESS) {
     c._incConsumeOKTPS(mq.getTopic(), ackIndex + 1);
     if (batch.length - ackIndex - 1 > 0) {
@@ -358,8 +347,8 @@ function processPopConsumeResult(c: DefaultMQPushConsumer, mq: MessageQueue, bat
   }
 }
 
-// popMaxReconsumeTimes is Java DefaultMQPushConsumerImpl.getMaxReconsumeTimes
-// for the POP service: -1 means 16 (the concurrent rule), NOT Number.MAX_VALUE.
+// popMaxReconsumeTimes returns the retry budget for the POP path: -1 means 16
+// (the concurrent rule), NOT Number.MAX_VALUE.
 function popMaxReconsumeTimes(c: DefaultMQPushConsumer): number {
   return c.maxReconsumeTimes === -1 ? 16 : c.maxReconsumeTimes;
 }
@@ -369,17 +358,17 @@ function popMaxReconsumeTimes(c: DefaultMQPushConsumer): number {
 // ---------------------------------------------------------------------------
 
 // popAckAddress resolves the broker address an ACK/CHANGE_INVISIBLETIME
-// belongs to. Java finds it by the LOGICAL broker name from checkpoint segment
-// 5 against the master, refreshing the route once.
+// belongs to: the LOGICAL broker name from checkpoint segment 5, looked up
+// against the master, refreshing the route once.
 //
-// Deliberate divergence: Java's ackAsync/changePopInvisibleTimeAsync first map
-// a checkpoint broker name beginning with "__syslo__" (MixAll
-// .LOGICAL_QUEUE_MOCK_BROKER_PREFIX) through the topicEndPointsTable built from
-// TopicRouteData.topicQueueMapping. This port decodes topicQueueMappingByBroker
-// as an opaque MappingEntry list and keeps no topicEndPointsTable, so there is
-// no address to map to and the branch is not taken. The static-topic /
-// logical-queue routing feature is therefore a known P3 gap, not a silent
-// fallback: the header still carries the LOGICAL name Java would send.
+// Note: a checkpoint broker name beginning with "__syslo__" (MixAll
+// .LOGICAL_QUEUE_MOCK_BROKER_PREFIX) is normally mapped through a
+// topicEndPointsTable built from TopicRouteData.topicQueueMapping. This port
+// decodes topicQueueMappingByBroker as an opaque MappingEntry list and keeps
+// no topicEndPointsTable, so there is no address to map to and the branch is
+// not taken. The static-topic / logical-queue routing feature is a known P3
+// gap, not a silent fallback: the header still carries the LOGICAL broker
+// name.
 async function popAckAddress(c: DefaultMQPushConsumer, brokerName: string, topic: string): Promise<string> {
   const client = c.mqClient;
   if (!client) throw new Error('consumer not started');
@@ -394,7 +383,7 @@ async function popAckAddress(c: DefaultMQPushConsumer, brokerName: string, topic
   return resolved.addr;
 }
 
-// ackMessagePop is Java DefaultMQPushConsumerImpl#ackAsync.
+// ackMessagePop sends ACK_MESSAGE(200051) for one popped message.
 //
 // The request fields are read back out of the checkpoint, with two exceptions:
 // the topic is re-derived through getRealTopic (so a retried message ACKs on
@@ -412,7 +401,7 @@ export async function ackMessagePop(c: DefaultMQPushConsumer, msg: MessageExt): 
     return;
   }
   const { brokerName, queueId, queueOffset } = parsed;
-  // Java resolves the topic through the checkpoint's retry marker because the
+  // The topic is resolved through the checkpoint's retry marker because the
   // message's own topic has been rewritten to the request topic.
   const topic = getRealTopicFromCk(extraInfo, msg.getTopic(), c.consumerGroup);
 
@@ -437,14 +426,13 @@ export async function ackMessagePop(c: DefaultMQPushConsumer, msg: MessageExt): 
   }
 }
 
-// changePopInvisibleTime is Java
-// ConsumeMessagePopConcurrentlyService#changePopInvisibleTime.
+// changePopInvisibleTime extends a message's invisibility window.
 //
 // delayLevel 0 means "not chosen": it is replaced by the message's own
 // reconsume count, which is what makes the back-off grow with each retry. The
 // value is then looked up in the SECONDS table and sent as MILLISECONDS — the
-// unit flip is Java's, and sending seconds here would hold messages for
-// milliseconds.
+// wire unit is milliseconds, so sending seconds here would hold messages for
+// only milliseconds.
 export function changePopInvisibleTime(c: DefaultMQPushConsumer, msg: MessageExt, delayLevel: number): void {
   if (delayLevel === 0) {
     delayLevel = msg.getReconsumeTimes();
@@ -497,24 +485,19 @@ function changePopInvisibleTimeAtLevel(c: DefaultMQPushConsumer, msg: MessageExt
   })();
 }
 
-// checkNeedAckOrDelay is Java
-// ConsumeMessagePopConcurrentlyService#checkNeedAckOrDelay.
+// checkNeedAckOrDelay: called once the retry budget is spent. If the message
+// has been bouncing for longer than twice the longest back-off there is no
+// point extending again — ACK it and let it go. Otherwise extend by the next
+// notch above the elapsed time.
 //
-// Called once the retry budget is spent. If the message has been bouncing for
-// longer than twice the longest back-off there is no point extending again —
-// ACK it and let it go. Otherwise extend by the next notch above the elapsed
-// time.
-//
-// The Java loop can exit with delayLevel == -1 (the elapsed time is below the
-// first notch, i.e. 10s) and then index the table with -1, which throws
-// ArrayIndexOutOfBoundsException. This port clamps to the first notch instead:
-// the same "wait at least 10s" intent, without the crash.
+// The elapsed-to-notch lookup can return -1 (elapsed below the first notch,
+// 10s). This port clamps to the first notch instead: the same "wait at least
+// 10s" intent, without a negative index.
 //
 // The clamp goes through changePopInvisibleTimeAtLevel rather than
 // changePopInvisibleTime on purpose: the latter treats 0 as "the caller did
 // not choose a level, use the reconsume count", which would turn this clamp
-// into a back-off of table[reconsumeTimes] seconds. Java never reaches that
-// substitution on this path (it crashes first), so 10s is the honest reading
+// into a back-off of table[reconsumeTimes] seconds. 10s is the honest reading
 // of the clamp.
 function checkNeedAckOrDelay(c: DefaultMQPushConsumer, msg: MessageExt): void {
   const last = POP_DELAY_LEVEL[POP_DELAY_LEVEL.length - 1];
@@ -584,11 +567,12 @@ export function retirePopQueue(c: DefaultMQPushConsumer, key: string): void {
 // subscribed business topic, telling each broker to serve this (group, topic)
 // pair in POP mode.
 //
-// This is an ADDITION to Java's client surface: there, the mode is set by the
-// operator (mqadmin / the console) and the client only reads it back from the
-// assignment. Without the call a client-side setPopMode(true) would pop a
-// broker that still answers PULL requests, which looks like "POP returns
-// nothing" rather than an error.
+// This is an ADDITION to the client surface this SDK speaks: the classic
+// remoting protocol expects the mode to be set by the operator (mqadmin /
+// the console) and clients only read it back from the assignment. Without
+// the call a client-side setPopMode(true) would pop a broker that still
+// answers PULL requests, which looks like "POP returns nothing" rather than
+// an error.
 //
 // The %RETRY% topics are skipped: the POP retry topic is
 // %RETRY%<group>_<topic>, created by the broker, and its request mode follows
@@ -605,7 +589,7 @@ export async function setMessageRequestModeOnBroker(c: DefaultMQPushConsumer, ti
 
   let firstErr: Error | null = null;
   for (const topic of topics) {
-    // Resolve the master address the way Java does: by the topic's route.
+    // Resolve the master address by the topic's route.
     const route = client.getTopicRouteData(topic);
     let masterAddr: string | null = null;
     if (route) {

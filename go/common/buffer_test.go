@@ -32,7 +32,7 @@ func TestBigEndianRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCodeAbove65535TruncatesLikeJavaShort(t *testing.T) {
+func TestCodeAbove65535TruncatesTo16Bits(t *testing.T) {
 	w := NewWriter()
 	w.I16(200050)
 	r := NewReader(w.Buffer())

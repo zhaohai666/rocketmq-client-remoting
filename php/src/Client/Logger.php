@@ -18,10 +18,10 @@ namespace RocketMQ\Client;
  *   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE   单文件上限，默认 64MB（Java logback 同值）
  *   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX  备份份数，默认 10
  *
- * **为什么不跟 Java 一样写 $HOME/logs/rocketmqlogs**：PHP 客户端常在别人的宿主进程/CLI
- * 脚本里跑，在用户 HOME 下悄悄建目录、写文件是**越界**副作用；落到当前工作目录则跟着部署走，
- * 容器里天然可预期（与 python/rocketmq_logging.py 同一取舍）。需要 Java 口径时显式设
- * ROCKETMQ_CLIENT_LOG_DIR=$HOME/logs/rocketmqlogs 即可。
+ * **默认落盘位置随项目工作目录走**：`<当前工作目录>/logs/rocketmqlogs`。
+ * PHP 客户端常在脚本 / CI / 别人的宿主进程里跑，把日志写进用户主目录会污染 `$HOME` 且
+ * 留下越界副作用；落在当前工作目录则跟着部署走，容器里天然可预期。需要其他目录时显式设
+ * `ROCKETMQ_CLIENT_LOG_DIR`（例如 `$HOME/logs/rocketmqlogs`）即可，这是官方逃生门。
  *
  * 轮转是**按大小**的固定备份窗（同 csharp ClientLog.RollLocked / nodeJs roll）：
  * 删除 .N，.N-1→.N … .1→.2，当前文件→.1，再开新文件。

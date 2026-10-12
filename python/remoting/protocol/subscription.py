@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""订阅组相关模型，对应 org.apache.rocketmq.remoting.protocol.subscription 包：
+"""订阅组相关模型，对应协议订阅包（subscription）：
 SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData。
 
-字段名与默认值以 Java 5.x 探针实测为准（``JSON.toJSONString(new SubscriptionGroupConfig())``）：
+字段名与默认值以 5.x broker 实测序列化输出为准（``JSON.toJSONString(new SubscriptionGroupConfig())``）：
 {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
  "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
  "groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},"groupSysFlag":0,
  "notifyConsumerIdsChangedEnable":true,"retryMaxTimes":16,"retryQueueNums":1,
  "whichBrokerWhenConsumeSlowly":1}
-注意 fastjson2 **跳过 null 字段**（``subscriptionDataSet`` 为 null 时整个键不出现），
+注意 broker 侧 fastjson **跳过 null 字段**（``subscriptionDataSet`` 为 null 时整个键不出现），
 所以 from_dict 一律用 ``.get(k, default)``。
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ class GroupRetryPolicyType:
 
 
 class GroupRetryPolicy:
-    """简化版：只保留 type 与两个子策略的原始 dict（Java 侧为 null 时不序列化）。"""
+    """简化版：只保留 type 与两个子策略的原始 dict（broker 侧为 null 时不序列化）。"""
 
     def __init__(self, policy_type: str = GroupRetryPolicyType.CUSTOMIZED,
                  exponential_retry_policy: Optional[dict] = None,
@@ -39,8 +39,8 @@ class GroupRetryPolicy:
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
-        # Java 默认 type=CUSTOMIZED 且 customizedRetryPolicy 为 null（字段有默认实例但
-        # fastjson2 只序列化非 null 的），探针输出里只有 type，故这里同样只在显式赋值时输出。
+        # 协议默认 type=CUSTOMIZED 且 customizedRetryPolicy 为 null（字段有默认实例但
+        # broker 侧 fastjson 只序列化非 null 的），实测输出里只有 type，故这里同样只在显式赋值时输出。
         if self.exponential_retry_policy is not None:
             d["exponentialRetryPolicy"] = self.exponential_retry_policy
         if self.customized_retry_policy is not None:
@@ -58,7 +58,7 @@ class GroupRetryPolicy:
 
 
 class SimpleSubscriptionData:
-    """对应 org.apache.rocketmq.remoting.protocol.subscription.SimpleSubscriptionData。"""
+    """协议模型 ``SimpleSubscriptionData``。"""
 
     def __init__(self, topic: str = "", expression_type: str = "TAG",
                  expression: str = "*", version: int = 0):
@@ -86,7 +86,7 @@ class SimpleSubscriptionData:
 
 
 class SubscriptionGroupConfig:
-    """对应 org.apache.rocketmq.remoting.protocol.subscription.SubscriptionGroupConfig。"""
+    """协议模型 ``SubscriptionGroupConfig``。"""
 
     def __init__(self, group_name: str = ""):
         self.group_name = group_name
@@ -161,9 +161,9 @@ class SubscriptionGroupConfig:
 
 
 class SubscriptionGroupWrapper:
-    """对应 org.apache.rocketmq.remoting.protocol.body.SubscriptionGroupWrapper。
+    """协议模型 ``SubscriptionGroupWrapper``。
 
-    探针输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
+    broker 实测输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
     """
 
     def __init__(self):

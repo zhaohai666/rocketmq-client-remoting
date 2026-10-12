@@ -406,7 +406,7 @@ public sealed class Connection
             ClientId = v.Get("clientId").StringValue(),
             ClientAddr = v.Get("clientAddr").StringValue(),
             Language = v.Get("language").StringValue(),
-            Version = JavaNumber.ToInt32(v.Get("version").IntValue(0)),
+            Version = LegacyNumber.ToInt32(v.Get("version").IntValue(0)),
         };
 }
 

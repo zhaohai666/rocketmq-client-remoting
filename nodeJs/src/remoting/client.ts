@@ -31,11 +31,11 @@ interface ResponseFuture {
   fired: boolean;
 }
 
-// TLS 细项（对齐 PHP RemotingClient $tlsOptions / Java TlsSystemConfig certPath 族）：
-//   - caCert 给出 → 严格校验（Java tls.test.mode.enable=false 口径）：broker 证书必须
+// TLS 细项：
+//   - caCert 给出 → 严格校验：broker 证书必须
 //     链到该 CA，且主机名/SAN 匹配（默认用连接 host 校验，serverName 可覆盖）；
 //     不给 → test-mode：信任自签（rejectUnauthorized=false，历史行为）。
-//   - clientCert/clientKey → mTLS 客户端证书（对应 tls.client.certPath/keyPath）。
+//   - clientCert/clientKey → mTLS 客户端证书。
 export interface TlsOptions {
   caCert?: string;
   clientCert?: string;

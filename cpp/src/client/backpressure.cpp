@@ -47,8 +47,8 @@ void FairSemaphore::release(int64_t permits) {
         std::lock_guard<std::mutex> lk(m_);
         free_ += permits;
     }
-    // 一次 notify 只叫醒一个，被叫醒的人可能因为「不是队头」而继续等 —— 那就白等一轮。
-    // 等待者本来就被队头挡住，全部叫醒让它们各自复核更快，Java 的 AQS 也是逐个放行的。
+    // 逐个 notify 会让被叫醒的人因"不是队头"继续等而白等一轮；等待者本来就被
+    // 队头挡住，全部叫醒让它们各自复核更快。
     cv_.notify_all();
 }
 

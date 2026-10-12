@@ -7,11 +7,10 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MixAll;
 
 /**
- * 订阅组相关模型（对应 org.apache.rocketmq.remoting.protocol.subscription 包，
- * 移植自 python/remoting/protocol/subscription.py）：
+ * 订阅组相关模型：
  * SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData。
  *
- * 字段名与默认值以 Java 5.x 探针实测为准（``JSON.toJSONString(new SubscriptionGroupConfig())``）：
+ * 字段名与默认值以真机探针实测为准（空 SubscriptionGroupConfig 的 JSON 回包）：
  * {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
  * "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
  * "groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},"groupSysFlag":0,
@@ -21,7 +20,7 @@ use RocketMQ\Common\MixAll;
  * 所以 fromDict 一律用 ``?? default``。
  */
 
-/** 对应 org.apache.rocketmq.remoting.protocol.subscription.GroupRetryPolicyType。 */
+/** 组级重试策略类型（协议字段 groupRetryPolicy.type 的枚举名）。 */
 final class GroupRetryPolicyType
 {
     public const EXPONENTIAL = 'EXPONENTIAL';
@@ -29,9 +28,9 @@ final class GroupRetryPolicyType
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.subscription.GroupRetryPolicy。
+ * 组级重试策略。
  *
- * 简化版：只保留 type 与两个子策略的原始 array（Java 侧为 null 时不序列化）。
+ * 简化版：只保留 type 与两个子策略的原始 array（子策略为 null 时线上不落键）。
  */
 final class GroupRetryPolicy
 {
@@ -58,8 +57,8 @@ final class GroupRetryPolicy
     public function toDict(): array
     {
         $d = ['type' => $this->type];
-        // Java 默认 type=CUSTOMIZED 且 customizedRetryPolicy 为 null（字段有默认实例但
-        // fastjson2 只序列化非 null 的），探针输出里只有 type，故这里同样只在显式赋值时输出。
+        // 探针实测回包里 groupRetryPolicy 只有 type（子策略为 null 时不落键），
+        // 所以这里也只在显式赋值时才输出两个子策略。
         if ($this->exponentialRetryPolicy !== null) {
             $d['exponentialRetryPolicy'] = $this->exponentialRetryPolicy;
         }
@@ -83,7 +82,7 @@ final class GroupRetryPolicy
     }
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.subscription.SimpleSubscriptionData。 */
+/** 精简订阅数据：协议字段 subscriptionDataSet 的元素形状。 */
 final class SimpleSubscriptionData
 {
     public function __construct(
@@ -117,7 +116,7 @@ final class SimpleSubscriptionData
     }
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.subscription.SubscriptionGroupConfig。 */
+/** 订阅组配置：Admin 读写 broker 上订阅组时的线格式。 */
 final class SubscriptionGroupConfig
 {
     public string $groupName = '';
@@ -128,7 +127,7 @@ final class SubscriptionGroupConfig
     public int $retryQueueNums = 1;
     public int $retryMaxTimes = 16;
     public GroupRetryPolicy $groupRetryPolicy;
-    /** MixAll.MASTER_ID（Python 模块级 MASTER_ID = 0）。 */
+    /** 默认 MixAll::MASTER_ID（0，即主 broker）。 */
     public int $brokerId = MixAll::MASTER_ID;
     public int $whichBrokerWhenConsumeSlowly = 1;
     public bool $notifyConsumerIdsChangedEnable = true;
@@ -162,12 +161,12 @@ final class SubscriptionGroupConfig
             'notifyConsumerIdsChangedEnable' => $this->notifyConsumerIdsChangedEnable,
             'groupSysFlag' => $this->groupSysFlag,
             'consumeTimeoutMinute' => $this->consumeTimeoutMinute,
-            // Java 的 attributes 是 Map（默认 {}）。PHP 空 array 会被 json_encode
-            // 编成 []，fastjson2 按 Map 反序列化时直接抛
+            // 协议里 attributes 是 Map（默认 {}）。PHP 空 array 会被 json_encode
+            // 编成 []，broker 按 Map 解析时直接抛
             // "expect '{', but '['" —— 空表必须显式输出对象。
             'attributes' => $this->attributes === [] ? new \stdClass() : $this->attributes,
         ];
-        // fastjson2 默认跳过 null
+        // null 字段不落键（broker 回包里同样见不到该键）
         if ($this->subscriptionDataSet !== null) {
             $d['subscriptionDataSet'] = array_map(
                 static fn(SimpleSubscriptionData $s): array => $s->toDict(),
@@ -226,7 +225,7 @@ final class SubscriptionGroupConfig
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.SubscriptionGroupWrapper。
+ * 订阅组全量包装：broker 一次性下发所有订阅组时的 body。
  *
  * 探针输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
  */

@@ -15,7 +15,7 @@ from logging.handlers import TimedRotatingFileHandler
 
 import pytest
 
-JAVA_CLIENT_LOG = "rocketmq_client.log"
+SHARED_ROCKETMQ_CLIENT_LOG = "rocketmq_client.log"
 PY_CLIENT_LOG = "rocketmq_py_client.log"
 
 _KEYS = (
@@ -37,16 +37,16 @@ def _reload(monkeypatch, env=None):
     return importlib.reload(rl)
 
 
-def test_default_filename_does_not_collide_with_java(monkeypatch):
+def test_default_filename_does_not_collide_with_the_shared_log(monkeypatch):
     rl = _reload(monkeypatch)
     assert rl._LOG_FILE == PY_CLIENT_LOG
-    assert rl._LOG_FILE != JAVA_CLIENT_LOG
+    assert rl._LOG_FILE != SHARED_ROCKETMQ_CLIENT_LOG
 
 
 def test_default_filename_env_override(monkeypatch):
-    rl = _reload(monkeypatch, {"ROCKETMQ_CLIENT_LOG_FILE": JAVA_CLIENT_LOG})
+    rl = _reload(monkeypatch, {"ROCKETMQ_CLIENT_LOG_FILE": SHARED_ROCKETMQ_CLIENT_LOG})
     # 显式要求与 Java 一致时必须生效（向后兼容：老用户就是靠这个变量改名的）
-    assert rl._LOG_FILE == JAVA_CLIENT_LOG
+    assert rl._LOG_FILE == SHARED_ROCKETMQ_CLIENT_LOG
 
 
 def test_default_dir_is_rocketmqlogs(monkeypatch):

@@ -3117,7 +3117,7 @@ mod tests {
 
     /// TrackType 字符串值必须与 Java 枚举名逐字一致（探针/控制台按名字展示）。
     #[test]
-    fn track_type_names_match_java() {
+    fn track_type_names_match_protocol_contract() {
         assert_eq!(TrackType::Consumed.as_str(), "CONSUMED");
         assert_eq!(
             TrackType::ConsumedButFiltered.as_str(),

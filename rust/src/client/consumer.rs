@@ -1,30 +1,26 @@
-//! 消费者层（对应 `org.apache.rocketmq.client.consumer.*` 与 Python
-//! `client/consumer.py`）。
+//! 推/拉消费者层：经典 remoting 协议下的消费端实现。
 //!
-//! 本模块按 Python 的文件切分收三件事：投递前的过滤工具、`MessageSelector`、
-//! `PopProcessQueue`，以及 [`DefaultMQPushConsumer`] —— 注册监听器 + 重平衡 +
+//! 本模块收三件事：投递前的过滤工具、`MessageSelector`、`PopProcessQueue`，
+//! 以及 [`DefaultMQPushConsumer`] —— 注册监听器 + 重平衡 +
 //! 拉取/POP 消费循环 + 位点持久化 + broker 主动请求的四条接缝。
 //! `DefaultMQPullConsumer` 与 `DefaultLitePullConsumer` 在
-//! [`crate::client::pull_consumer`]（Python 与它们同文件，Rust 里拆成两个模块，
-//! 见下「模块划分」）。
+//! [`crate::client::pull_consumer`]（见下「模块划分」）。
 //!
-//! # 与 Python 参考实现的对应关系
+//! # 并发模型的实现手段
 //!
-//! Python 用 `threading.Thread` 跑重平衡、每队列拉取、POP、消费分发、位点持久化、
-//! 队列锁六类循环；Rust 这边全部落在 tokio 上，用 `tokio::sync::mpsc` +
-//! 定时轮询替代 `queue.Queue` + `Condition`。行为口径不变，实现手段的差别如下。
+//! 重平衡、每队列拉取、POP、消费分发、位点持久化、队列锁这六类循环全部落在
+//! tokio 上，用 `tokio::sync::mpsc` + 定时轮询做任务间通信与唤醒。
 //!
-//! # 与 Java 5.5.1 的有意偏离
+//! # 若干有意的结构取舍
 //!
-//! 1. **一个消费者一个 `ProcessQueue`**：Java 的 `ProcessQueue` 带有序消费的红黑树
-//!    与 `msgTreeMap` 锁语义，`ConsumeMessageOrderlyService` 还依赖 broker 侧队列锁；
-//!    Python 侧只实现了并发消费的缓冲（`msg_found_list` 直接进 `deque`），这里
-//!    与 Python 同口径，不引入 Java 的树结构。
+//! 1. **一个消费者一个 `ProcessQueue`**：有序消费的红黑树与 `msgTreeMap` 锁语义
+//!    只在顺序消费场景才有价值，而顺序消费还额外依赖 broker 侧队列锁；本模块只
+//!    保留并发消费的缓冲（拉到的消息直接进 `deque`），不引入树结构。
 //! 2. **`Clone` 句柄 + `Arc<Inner>`**：与 [`crate::client::producer`] 同样的手法 ——
 //!    消费者要同时被心跳任务、拉取任务与 broker 请求处理器持有，故句柄可复制、
 //!    状态集中在 `Inner` 里用 `RwLock`/`Mutex` 保护。
-//! 3. **监听器/策略/钩子用 trait 对象**：Python 靠鸭子类型，Rust 用
-//!    `Arc<dyn ...>`（`MessageListenerConcurrently`、
+//! 3. **监听器/策略/钩子用 trait 对象**：消费者要在运行时接受用户提供的实现，
+//!    统一以 `Arc<dyn ...>` 持有（`MessageListenerConcurrently`、
 //!    [`AllocateMessageQueueStrategy`](crate::client::allocate_strategy::AllocateMessageQueueStrategy)
 //!    等）。
 //! 4. **后台任务持 `Weak<Inner>`**：与生产者一致，避免 实例 → 传输 → 任务 → 消费者
@@ -33,11 +29,11 @@
 //!    [`set_trace_dispatcher`](Self::set_trace_dispatcher)（与生产者同一套约定，
 //!    见 [`crate::client::producer`] 模块头 4）。`enable_trace=true` 且未注入时，
 //!    `start()` 会自动建 `AsyncTraceDispatcher`（Type=CONSUME）+ 真实内部生产者，
-//!    与 Python `consumer._start_trace_dispatcher` 行为一致。
+//!    轨迹按 CONSUME 类型上报到 trace 主题。
 //!
 //! # 模块划分
 //!
-//! Python 的 `consumer.py` 有 2700 行、四个消费者类。Rust 拆成
+//! 消费侧的四个消费者类分成两个模块：
 //! `consumer.rs`（过滤工具 + `MessageSelector` + `PopProcessQueue` +
 //! push 消费者）与 `pull_consumer.rs`（`DefaultMQPullConsumer` +
 //! `DefaultLitePullConsumer`），因为后两者只是 RPC 的门面组合，与 push 消费者的
@@ -101,50 +97,50 @@ use crate::remoting::protocol::response_code;
 use crate::remoting::rpchook::RPCHook;
 use crate::{bail, rmq_debug, rmq_error, rmq_info, rmq_warn};
 
-/// POP 消费失败的延迟梯度（**秒**），逐项对应 Java
-/// `DefaultMQPushConsumerImpl.popDelayLevel`。
+/// POP 消费失败的延迟梯度（**秒**），逐项对应经典 remoting 协议约定的
+/// `popDelayLevel` 默认序列。
 pub const POP_DELAY_LEVEL: [i32; 16] = [
     10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1200, 1800, 3600, 7200,
 ];
 
-/// Java `DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME`：超出范围一律回落到 60000。
+/// POP 不可见时间的允许下界：超出 `[MIN, MAX]` 一律回落到 60000。
 pub const MIN_POP_INVISIBLE_TIME: i64 = 5000;
 /// 见 [`MIN_POP_INVISIBLE_TIME`]。
 pub const MAX_POP_INVISIBLE_TIME: i64 = 300000;
-/// 不可见时间越界时的回落值（Java `POP_HIDDEN_TIME_MAX/DEFAULT`）。
+/// 不可见时间越界时的回落值（协议默认 60000ms）。
 pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 
-/// Java `ProcessQueue.PULL_MAX_IDLE_TIME`（系统属性 `rocketmq.client.pull.pullMaxIdleTime`，
+/// 拉取空闲上限（系统属性 `rocketmq.client.pull.pullMaxIdleTime`，
 /// 默认 120000ms）：一条拉取/POP 循环超过这个时长没**发起**过拉取，rebalance 就认定它停摆，
-/// 主动撤掉并重建（`isPullExpired` 用严格 `>`）。
+/// 主动撤掉并重建（停摆判定用严格 `>`）。
 pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
 
 /// 停机收尾给「在途批次收完（含回投 RPC）」的预算。
 ///
 /// 覆盖一个批次的 listener + 逐条回投（每次 3000ms 超时）绰绰有余；顺序消费的
-/// 挂起重试最多钳到 30s，超了就放弃等待 —— 位点持久化按下限钳制（Java
-/// persistAllConsumerOffset 的「剩余最小 offset」口径），不会把没落定的消息跳过去。
+/// 挂起重试最多钳到 30s，超了就放弃等待 —— 位点持久化按下限钳制（按「剩余最小
+/// offset」口径），不会把没落定的消息跳过去。
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ================================================================ 队列与过滤工具
 
-/// 队列排序键，语义对齐 Java `MessageQueue.compareTo`：topic → brokerName → queueId。
+/// 队列排序键：topic → brokerName → queueId。
 ///
-/// Java 的 rebalance 会先把 `mqAll`/`cidAll` 排序再分配；顺序不一致会让不同实例算出
+/// rebalance 会先把候选队列与消费组成员排序再分配；顺序不一致会让不同实例算出
 /// 不同的分配结果（同一队列被两个实例同时消费）。
 pub fn mq_sort_key(mq: &MessageQueue) -> (String, String, i32) {
     (mq.topic.clone(), mq.broker_name.clone(), mq.queue_id)
 }
 
-/// 把队列按 [`mq_sort_key`] 排序（Java `Collections.sort(candds)`）。
+/// 把队列按 [`mq_sort_key`] 排序。
 pub fn sort_mqs(mqs: &mut [MessageQueue]) {
     mqs.sort_by_key(mq_sort_key);
 }
 
-/// 客户端二次 tag 过滤（对应 Java `PullAPIWrapper.processPullResult:113-122`）。
+/// 客户端二次 tag 过滤。
 ///
-/// broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放；Java 因此让客户端
-/// 再按字符串核一遍。守卫 `!tagsSet.isEmpty() && !isClassFilterMode` 意味着：
+/// broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放；因此客户端
+/// 再按字符串核一遍。约束是「订阅集非空且不是 classFilterMode」才做二次过滤：
 /// 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 `SubscriptionData::new` 对 SUB_ALL
 /// 必须保持 `tags_set` 为空。
 pub fn client_side_tag_filter(
@@ -168,7 +164,7 @@ pub fn client_side_tag_filter(
 /// 投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
 ///
 /// 钩子拿到的是**可变的** `msg_list`；被摘掉的消息由调用方决定处置方式：
-/// 拉取路径 = 静默跳过（位点照常推进，不 ack，Java 亦然）；
+/// 拉取路径 = 静默跳过（位点照常推进，不 ack）；
 /// POP 路径 = 必须立刻 ack，否则 `invisibleTime` 到期后会复活重投。
 pub fn filter_messages_for_delivery(
     consumer_group: &str,
@@ -181,8 +177,7 @@ pub fn filter_messages_for_delivery(
     let mut out = client_side_tag_filter(sub, msgs);
     if !out.is_empty() && hooks.has_hooks() {
         let mut context = FilterMessageContext::new(consumer_group, Some(out), Some(mq.clone()));
-        // Java `DefaultMQPushConsumerImpl:640` / `PullAPIWrapper:126`：
-        // `context.setUnitMode(...)` 取消费者的 `ClientConfig#unitMode`。
+        // FilterMessageContext 的 `unitMode` 取消费者的 `ClientConfig#unitMode`。
         context.unit_mode = unit_mode;
         crate::client::hook::execute_filter_hooks(hooks, &mut context);
         out = context.msg_list;
@@ -190,8 +185,8 @@ pub fn filter_messages_for_delivery(
     out
 }
 
-/// 把位点表按「队列排序键」稳定地投进 `BTreeMap`（Python 用 dict 插入序，
-/// 这里显式排序，保证 `get_consumer_status`/221 响应在跨语言比对时可预测）。
+/// 把位点表按「队列排序键」稳定地投进 `BTreeMap`（这里显式排序，
+/// 保证 `get_consumer_status`/221 响应在跨语言比对时可预测）。
 pub fn offset_table_to_sorted(
     table: impl IntoIterator<Item = (MessageQueue, i64)>,
 ) -> BTreeMap<(String, String, i32), i64> {
@@ -207,20 +202,20 @@ pub fn offset_table_to_sorted(
 /// 表达式类型常量的来源（`TAG` / `SQL92` / `CLASS_FILTER`）。
 ///
 /// 与 [`SubscriptionData::expression_type`] 同口径：存的是**字符串**，不是枚举
-/// —— Java 的 `ExpressionType` 本身就是几个常量。
+/// —— 经典 remoting 协议里 `expressionType` 就是一个字符串字段。
 pub use crate::remoting::protocol::heartbeat::ExpressionType;
 
-/// 消息选择器（对应 Java `MessageSelector`）。
+/// 消息选择器：订阅表达式的类型 + 内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageSelector {
-    /// Java `type`（`ExpressionType::TAG` / `SQL92`）。
+    /// 表达式类型（`ExpressionType::TAG` / `SQL92`）。
     pub selector_type: String,
-    /// Java `expression`。
+    /// 表达式内容。
     pub expression: String,
 }
 
 impl MessageSelector {
-    /// Python `MessageSelector(selector_type, expression)`。
+    /// 用「类型 + 表达式」构造选择器。
     pub fn new(selector_type: &str, expression: &str) -> MessageSelector {
         MessageSelector {
             selector_type: selector_type.to_string(),
@@ -228,17 +223,17 @@ impl MessageSelector {
         }
     }
 
-    /// Python `MessageSelector.by_tag`。
+    /// 按 tag 选择。
     pub fn by_tag(tag: &str) -> MessageSelector {
         MessageSelector::new(ExpressionType::TAG, tag)
     }
 
-    /// Python `MessageSelector.by_sql`。
+    /// 按 SQL92 表达式选择。
     pub fn by_sql(sql: &str) -> MessageSelector {
         MessageSelector::new(ExpressionType::SQL92, sql)
     }
 
-    /// 订阅表达式（Python 直接把 `selector.expression` 传给 `subscribe`）。
+    /// 订阅表达式：直接作为 `subscribe` 的表达式参数上送。
     pub fn sub_expression(&self) -> &str {
         &self.expression
     }
@@ -246,13 +241,13 @@ impl MessageSelector {
 
 // ================================================================ MessageQueueListener
 
-/// 队列变更监听器（对应 Java `MessageQueueListener`）。
+/// 队列变更监听器。
 ///
-/// Python 只在 `DefaultMQPullConsumer` / `DefaultLitePullConsumer` 上持有该监听器
-/// 字段，且只有 LitePull 真的会回调（`consumer.py:2705`）；push 消费者没有这个接缝，
-/// 与 Python 一致。接缝实现见 [`crate::client::pull_consumer`]。
+/// 只有 `DefaultMQPullConsumer` / `DefaultLitePullConsumer` 持有该监听器字段，
+/// 且只有 LitePull 真的会回调；push 消费者没有这个接缝。
+/// 接缝实现见 [`crate::client::pull_consumer`]。
 pub trait MessageQueueListener: Send + Sync {
-    /// Java `messageQueueChanged`。`mq_all` 是该 topic 的全部队列，
+    /// 队列分配发生变化时回调。`mq_all` 是该 topic 的全部队列，
     /// `mq_divided` 是分给本实例的队列。
     fn message_queue_changed(
         &self,
@@ -264,8 +259,7 @@ pub trait MessageQueueListener: Send + Sync {
 
 // ================================================================ PopProcessQueue
 
-/// POP 模式的队列状态（对应
-/// `org.apache.rocketmq.client.impl.consumer.PopProcessQueue`）。
+/// POP 模式的队列状态。
 ///
 /// 与 pull 模式的过程队列不同，POP **没有「已拉未消费」缓冲**：消息一弹出就交给
 /// 消费线程，确认靠 ack。这里只跟踪两件事：
@@ -277,15 +271,14 @@ pub trait MessageQueueListener: Send + Sync {
 pub struct PopProcessQueue {
     wait_ack_counter: AtomicI32,
     dropped: AtomicBool,
-    /// Java `PopProcessQueue.lastPopTimestamp`：最近一次**发起**弹出的时刻（毫秒）。
-    /// Python 版只写不读（`consumer.py:276,1309`），这里补上了 Java 的两处读：
-    /// `isPopExpired`（超过 `PULL_MAX_IDLE_TIME` 判停摆，由 [`State::last_pull_at`] 承担）
-    /// 和 `ConsumerRunningInfo` 的运维视图。
+    /// 最近一次**发起**弹出的时刻（毫秒）。
+    /// 这个字段有两处读：停摆判定（超过 `PULL_MAX_IDLE_TIME` 判停摆，
+    /// 由 [`State::last_pull_at`] 承担）和 `ConsumerRunningInfo` 的运维视图。
     pub last_pop_timestamp: AtomicI64,
 }
 
 impl PopProcessQueue {
-    /// Python `PopProcessQueue()`。
+    /// 新建一个 POP 队列状态，弹出时间戳初始化为当前时刻。
     pub fn new() -> Arc<PopProcessQueue> {
         Arc::new(PopProcessQueue {
             last_pop_timestamp: AtomicI64::new(crate::common::util_all::current_time_millis()),
@@ -293,59 +286,57 @@ impl PopProcessQueue {
         })
     }
 
-    /// Java `incFoundMsg`。
+    /// 累加「等待 ack」的条数（本批弹出的消息数）。
     pub fn inc_found_msg(&self, count: i32) {
         self.wait_ack_counter.fetch_add(count, Ordering::SeqCst);
     }
 
-    /// Java `decFoundMsg(-msgs.size())`：Python 按「减多少」理解（同名方法直接
-    /// `+= count`），这里保持 Python 口径 —— 传正数即减少等待 ack 的条数。
+    /// 递减「等待 ack」的条数：传**正数**即减少等待 ack 的条数。
     pub fn dec_found_msg(&self, count: i32) {
         self.wait_ack_counter.fetch_add(-count, Ordering::SeqCst);
     }
 
-    /// Java `ack()`：递减并返回递减后的值。
+    /// ack 一条：递减并返回递减后的值。
     pub fn ack(&self) -> i32 {
         self.wait_ack_counter.fetch_add(-1, Ordering::SeqCst) - 1
     }
 
-    /// Java `getWaitAckCounter()`。
+    /// 当前等待 ack 的条数。
     pub fn wait_ack_count(&self) -> i32 {
         self.wait_ack_counter.load(Ordering::SeqCst)
     }
 
-    /// Java `isDropped()`。
+    /// 队列是否已被 rebalance 撤走。
     pub fn is_dropped(&self) -> bool {
         self.dropped.load(Ordering::SeqCst)
     }
 
-    /// Java `setDropped`。
+    /// 标记队列被撤走 / 恢复。
     pub fn set_dropped(&self, dropped: bool) {
         self.dropped.store(dropped, Ordering::SeqCst);
     }
 
-    /// 记一次弹出时间（毫秒），对齐 Python `pq.last_pop_timestamp = time.time()`。
+    /// 记一次弹出时间（毫秒）。
     pub fn touch(&self, timestamp_millis: i64) {
         self.last_pop_timestamp
             .store(timestamp_millis, Ordering::SeqCst);
     }
 }
 
-/// 监听器（对应 Java `MessageListener` 的两个实现）。
+/// 消息监听器：并发与顺序两种。
 ///
-/// Python 用 `isinstance(listener, MessageListenerOrderly)` 判定顺序/并发
-/// （`consumer.py:2020` 的 `_is_orderly`）；Rust 没有运行时类型探测，这里用枚举标签
-/// 表达同一件事 —— 只是**声明方式**不同，判定口径与 Python 完全一致。
+/// 顺序/并发的判定必须在运行时可查（拉取循环要按它选消费路径），而 Rust 没有
+/// 运行时类型探测，这里用枚举标签表达 —— 判定口径就是「监听器实现的是哪个 trait」。
 #[derive(Clone)]
 pub enum MessageListener {
-    /// Java `MessageListenerConcurrently`（Python 同名类）。
+    /// 并发监听器。
     Concurrently(Arc<dyn MessageListenerConcurrently>),
-    /// Java `MessageListenerOrderly`（Python 同名类）。
+    /// 顺序监听器。
     Orderly(Arc<dyn MessageListenerOrderly>),
 }
 
 impl MessageListener {
-    /// Python `_is_orderly`。
+    /// 是否顺序监听器。
     pub fn is_orderly(&self) -> bool {
         matches!(self, MessageListener::Orderly(_))
     }
@@ -361,116 +352,115 @@ impl std::fmt::Debug for MessageListener {
     }
 }
 
-/// 消费者配置（对应 Python `DefaultMQPushConsumer.__init__` 里那批平铺属性）。
+/// 消费者配置：所有可调参数的平铺集合。
 ///
-/// Python 的属性可以随时直接赋值，这里聚成一个 `pub` 字段的结构体，由
-/// [`DefaultMQPushConsumer::config`] / [`DefaultMQPushConsumer::update_config`] 读写，
-/// 语义等价（生产者侧同一手法）。默认值逐项照抄 `consumer.py:314-438`。
+/// 聚成一个 `pub` 字段的结构体，由 [`DefaultMQPushConsumer::config`] /
+/// [`DefaultMQPushConsumer::update_config`] 整体读写，可以随时替换（生产者侧同一手法）。
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
-    /// Python `consumer_group`。
+    /// 消费组名。
     pub consumer_group: String,
-    /// Python `namespace`（Java `ClientConfig#namespace`）。
+    /// 客户端命名空间（v1 机制：给 topic/组拼 `%` 前缀）。
     pub namespace: String,
-    /// Python `instance_name`，默认 `"DEFAULT"`。
+    /// 实例名，默认 `"DEFAULT"`。
     pub instance_name: String,
-    /// Python `client_id`；`None` 时 `start()` 里现造。
+    /// 显式指定的 clientId；`None` 时 `start()` 里现造。
     pub client_id: Option<String>,
-    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
+    /// 单元化名 `unitName`（默认无）：非空时进 clientId 后缀，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
-    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
+    /// 服务端命名空间 `namespaceV2`（默认无）：5.x **服务端**命名空间，
     /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
     /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
     pub namespace_v2: Option<String>,
-    /// Java `ClientConfig#unitMode`（默认 false）：随发送/回投/鉴权/消息过滤
+    /// 单元化模式 `unitMode`（默认 false）：随发送/回投/鉴权/消息过滤
     /// 一起上线，broker 据此给自动创建的 topic 打 UNIT / UNIT_SUB 位。
     pub unit_mode: bool,
-    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
+    /// 流式请求类型开关：true 时每个请求带 `ReqT=0`，
     /// clientId 末尾多一段 `@STREAM`。
     ///
-    /// Java `DefaultMQPushConsumer` 不碰这个开关，默认 false。
+    /// 推模式消费者不碰这个开关，默认 false。
     pub enable_stream_request_type: bool,
-    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
-    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
+    /// 路由周期刷新间隔（默认 30000ms）：在用 topic 的路由按这个周期刷新，
+    /// `start()` 时透传给 `MQClientInstance`。
     pub poll_name_server_interval_millis: u64,
-    /// Java `ClientConfig#persistConsumerOffsetInterval`（默认 5000ms）：后台位点
-    /// 落盘周期；`shutdown()` 的收尾落盘与该值无关。同样只在 `start()` 时读一次。
+    /// 位点落盘周期（默认 5000ms）：后台位点落盘周期；`shutdown()` 的收尾落盘
+    /// 与该值无关。同样只在 `start()` 时读一次。
     pub persist_consumer_offset_interval_millis: u64,
-    /// Python `name_server_addrs`。
+    /// 名字服务地址列表。
     pub name_server_addrs: Vec<String>,
-    /// Python `tls_enable`；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
+    /// TLS 开关；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
     pub tls_enable: Option<bool>,
-    /// Python `message_model`（[`MessageModel`] 里的常量）。
+    /// 消费模式（[`MessageModel`] 里的常量）。
     pub message_model: String,
-    /// Python `consume_from_where`（[`ConsumeFromWhere`] 里的常量）。
+    /// 起始位点策略（[`ConsumeFromWhere`] 里的常量）。
     pub consume_from_where: String,
-    /// Python `consume_timestamp`：`yyyyMMddHHmmss`，默认 30 分钟前。
+    /// 起始位点时间戳：`yyyyMMddHHmmss`，默认 30 分钟前。
     pub consume_timestamp: String,
-    /// Java `consumeThreadMin` = 20（`DefaultMQPushConsumer:162`）。
+    /// 并发消费线程池下界，默认 20。
     pub consume_thread_min: i32,
-    /// Java `consumeThreadMax` = 20（`DefaultMQPushConsumer:169`）—— 5.x 起与 min 同为 20，
-    /// 4.x 才是 64。它同时是 `update_core_pool_size` 的上界（守卫 `core < max`），
+    /// 并发消费线程池上界，默认 20 —— 与 min 同为 20 是刻意取值。
+    /// 它同时是 `update_core_pool_size` 的上界（守卫 `core < max`），
     /// 于是默认配置下只能把并发度往**下**调。
     pub consume_thread_max: i32,
-    /// Java `adjustThreadPoolNumsThreshold` = 100000。
+    /// 线程池动态扩容的堆积阈值，默认 100000。
     pub adjust_thread_pool_nums_threshold: i64,
-    /// Java `consumeConcurrentlyMaxSpan` = 2000。
+    /// 并发消费允许的位点跨度上限（**条**），默认 2000。
     pub consume_concurrently_max_span: i64,
-    /// Java `pullThresholdForQueue` = 1000（**条数**）。
+    /// 单队列缓存条数阈值，默认 1000（**条数**）。
     pub pull_threshold_for_queue: i32,
-    /// Java `pullThresholdSizeForQueue` = 100（**MiB**）。
+    /// 单队列缓存体积阈值，默认 100（**MiB**）。
     pub pull_threshold_size_for_queue: i32,
-    /// Java `pullThresholdForTopic` = -1（关闭）。
+    /// topic 级缓存条数阈值，默认 -1（关闭）。
     pub pull_threshold_for_topic: i32,
-    /// Java `pullThresholdSizeForTopic` = -1（关闭）。
+    /// topic 级缓存体积阈值，默认 -1（关闭）。
     pub pull_threshold_size_for_topic: i32,
-    /// Java `pullInterval` = 0（本项目拉取循环未使用，与 Python 一致）。
+    /// 两次拉取之间的间隔（默认 0，本项目拉取循环未使用，仅保留字段）。
     pub pull_interval: i64,
-    /// Python `pull_timeout_millis` = 30000。
+    /// 拉取 RPC 超时（默认 30000ms）。
     pub pull_timeout_millis: i64,
-    /// Python `pull_suspend_timeout_millis` = 20000（长轮询挂起时长）。
+    /// 长轮询挂起时长（默认 20000ms）。
     pub pull_suspend_timeout_millis: i64,
-    /// Java `consumeMessageBatchMaxSize` = 1。
+    /// 单次交给 listener 的最大条数，默认 1。
     pub consume_message_batch_max_size: i32,
-    /// Java `pullBatchSize` = 32。
+    /// 单次拉取的最大条数，默认 32。
     pub pull_batch_size: i32,
-    /// Java `pullBatchSizeInBytes`? Python 用 256 KiB 作为 `maxMsgBytes`。
+    /// 单次拉取的最大字节数，默认 256 KiB（对应请求里的 `maxMsgBytes`）。
     pub pull_batch_size_in_bytes: i32,
-    /// Java `maxReconsumeTimes` = -1（交给 broker，默认 16 次后转 `%DLQ%`）。
+    /// 最大重试次数，默认 -1（交给 broker，默认 16 次后转 `%DLQ%`）。
     pub max_reconsume_times: i32,
-    /// Java `suspendCurrentQueueTimeMillis` = 1000。
+    /// 顺序消费挂起时长（默认 1000ms）。
     pub suspend_current_queue_time_millis: i64,
-    /// Java `consumeTimeout`（**分钟**）= 15，只用于 `ConsumeReturnType::TimeOut` 判定。
+    /// 消费超时（**分钟**，默认 15），只用于 `ConsumeReturnType::TimeOut` 判定。
     pub consume_timeout: i64,
-    /// Java `clientRebalance` = true（本项目恒走客户端 rebalance，字段仅为对齐形状）。
+    /// 客户端重平衡开关（默认 true，本项目恒走客户端 rebalance，字段仅保留形状）。
     pub client_rebalance: bool,
-    /// Java `heartbeatBrokerInterval` = 30000。
+    /// broker 心跳周期（默认 30000ms）。
     pub heartbeat_interval_millis: i64,
-    /// Python `heartbeat_enabled`。
+    /// 是否发心跳。
     pub heartbeat_enabled: bool,
-    /// Python `pop_mode`：true 走 POP + ack，false 走长轮询 + 位点。
+    /// POP 模式开关：true 走 POP + ack，false 走长轮询 + 位点。
     pub pop_mode: bool,
-    /// Java `popInvisibleTime` = 60000。
+    /// POP 不可见时间（默认 60000ms）。
     pub pop_invisible_time: i64,
-    /// Java `popBatchNums` = 32（broker 侧 >32 会拒）。
+    /// 单次弹出条数，默认 32（broker 侧 >32 会拒）。
     pub pop_batch_nums: i32,
-    /// Java `popThresholdForQueue` = 96。
+    /// 单队列待 ack 条数阈值，默认 96。
     pub pop_threshold_for_queue: i32,
-    /// Java `popDelayLevel`（**秒**），见 [`POP_DELAY_LEVEL`]。
+    /// POP 失败重试的延迟梯度（**秒**），见 [`POP_DELAY_LEVEL`]。
     pub pop_delay_level: Vec<i32>,
     /// POP 长轮询挂起时长；0 = 短轮询。⚠ 非 0 时请求超时必须大于它。
     pub pop_poll_time_millis: i64,
     /// POP 请求超时。
     pub pop_timeout_millis: i64,
-    /// Java `enableTrace`（Python `enable_trace`）。
+    /// 是否上报消费轨迹。
     pub enable_trace: bool,
-    /// Java `customizedTraceTopic`；`None` → `RMQ_SYS_TRACE_TOPIC`。
+    /// 自定义轨迹主题；未设置 → `RMQ_SYS_TRACE_TOPIC`。
     pub trace_topic: Option<String>,
-    /// Python `trace_msg_batch_num` = 10。
+    /// 轨迹批量上报条数，默认 10。
     pub trace_msg_batch_num: i32,
-    /// Java `DefaultMQPushConsumer.postSubscriptionWhenPull` = false：true 时把订阅
-    /// 表达式随 PULL_MESSAGE 上送（SUBSCRIPTION 位）——仅类过滤模式的服务端场景需要。
+    /// 是否把订阅表达式随 PULL_MESSAGE 上送（SUBSCRIPTION 位），默认 false：
+    /// 仅类过滤模式的服务端场景需要。
     pub post_subscription_when_pull: bool,
 }
 
@@ -484,7 +474,7 @@ impl Default for ConsumerConfig {
             namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: false,
-            // Java `ClientConfig:58` / `:66`：1000 * 30 与 1000 * 5
+            // 路由刷新 1000 * 30，位点落盘 1000 * 5
             poll_name_server_interval_millis: 30_000,
             persist_consumer_offset_interval_millis: 5_000,
             client_id: None,
@@ -528,23 +518,23 @@ impl Default for ConsumerConfig {
     }
 }
 
-/// Python `instance_name` 默认值（与生产者同名常量，但两处各自持有，避免跨模块耦合）。
+/// `instance_name` 的默认值（与生产者同名常量，但两处各自持有，避免跨模块耦合）。
 pub const DEFAULT_INSTANCE_NAME: &str = "DEFAULT";
-/// Java `Short.MAX_VALUE`：`updateCorePoolSize` 的第二道守卫。
+/// 16 位有符号整数的上限（32767）：`update_core_pool_size` 的第二道守卫。
 pub const SHORT_MAX_VALUE: i32 = 32767;
 
-/// Python `time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30*60))`。
+/// 默认的起始位点时间：本地时区「当前时刻 - 30 分钟」，格式 `%Y%m%d%H%M%S`。
 pub(crate) fn default_consume_timestamp() -> String {
     let now = chrono::Local::now();
     let past = now - chrono::Duration::minutes(30);
     past.format("%Y%m%d%H%M%S").to_string()
 }
 
-/// Java `UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)`：该字段**只**是 14 位本地墙钟日期。
+/// 把 `consumeTimestamp` 解析成毫秒时间戳：该字段**只**是 14 位本地墙钟日期。
 ///
-/// 与 Python 同用**本地时区**（`time.mktime` / `chrono::Local`），否则
-/// `CONSUME_FROM_TIMESTAMP` 的起点会差一个时区。解析不了必须硬失败（Java 在 start 时抛
-/// `consumeTimestamp is invalid`）——静默回落到「现在 - 30 分钟」会让起点错位无人察觉。
+/// 必须按**本地时区**解析，否则 `CONSUME_FROM_TIMESTAMP` 的起点会差一个时区。
+/// 解析不了必须硬失败（服务端在启动时就会以 `consumeTimestamp is invalid` 拒绝）——
+/// 静默回落到「现在 - 30 分钟」会让起点错位无人察觉。
 pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
     use chrono::TimeZone;
     chrono::NaiveDateTime::parse_from_str(text, "%Y%m%d%H%M%S")
@@ -560,20 +550,19 @@ pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
 
 // ================================================================ 配置数值闸门
 
-/// 对应 Java `DefaultMQPushConsumerImpl#checkConfig` 的数值段（:1099-1209）：十三道
-/// 区间/大小闸门，**顺序、区间与文案逐条照抄 Java**（Java 每条拼
-/// `FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL)`，本仓库按约定不带后缀）。
+/// 启动期配置校验的数值段：十三道区间/大小闸门，**顺序与区间都是判据**
+/// （每条错误文案按约定不带 FAQUrl 后缀）。
 ///
 /// 为什么要在 `start()` 拦而不是各字段自己夹：这些值直接决定缓冲水位与线程池规模，
 /// 错法的方向都是**静默**的 —— `pull_threshold_*=0` 在运行期被 `max(1,n)` 兜底成
 /// "1 条就停"，队列永久停拉而消费者不报任何错；`pop_batch_nums>32` broker 直接回
-/// `INVALID_PARAMETER`，POP 循环退化成错误重试；巨值绕开流控判断直到 OOM。Java 把
+/// `INVALID_PARAMETER`，POP 循环退化成错误重试；巨值绕开流控判断直到 OOM。把
 /// 闸门放在启动期，就是要在**没建实例、没起任务**的时候一次性拒绝。
 ///
-/// 两处 Java 自己的"不对称"必须照抄，否则会把合法配置拒了：
+/// 两处容易写错的"不对称"必须注意，否则会把合法配置拒了：
 /// * `pull_threshold_for_topic` / `pull_threshold_size_for_topic` 的 `-1` 是
 ///   "未设置，用队列级阈值"的哨兵，`!= -1` 才进区间判断（`-2` 仍然要拒）；
-/// * `pull_interval` 的下界是 **0**（不是 1），`pop_batch_nums` Java 写的是 `<= 0`。
+/// * `pull_interval` 的下界是 **0**（不是 1），`pop_batch_nums` 的判据是 `<= 0`。
 fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
     // consumeThreadMin
     if cfg.consume_thread_min < 1 || cfg.consume_thread_min > 1000 {
@@ -642,82 +631,72 @@ fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
 
 // ================================================================ 内部可变状态
 
-/// Python 里那批以 `self._lock` 保护的字典（`_offset_table` / `_pending` /
-/// `_consume_offsets` / `_mq_map` / `_assigned` …）。
+/// 消费者内部那批需要互斥保护的表（位点、缓冲、队列归属 …）。
 ///
-/// 键一律是 [`DefaultMQPushConsumer::mq_key`] 那串 `topic+brokerName+queueId`，
-/// 与 Python 逐字一致；用 `BTreeMap` 只为让遍历顺序确定（Python 是 dict 插入序，
-/// 会影响 `consumerRunningInfo` 的报文顺序，见模块头差异说明）。
+/// 键一律是 [`DefaultMQPushConsumer::mq_key`] 那串 `topic+brokerName+queueId`；
+/// 用 `BTreeMap` 只为让遍历顺序确定 —— `consumerRunningInfo` 的报文顺序依赖它。
 #[derive(Default)]
 struct State {
-    /// Python `subscription_data: Dict[topic, SubscriptionData]`。
+    /// 订阅表：topic -> SubscriptionData。
     subscription_data: Vec<(String, SubscriptionData)>,
-    /// Python `_assigned`（Java `ProcessQueueTable` 的键集）。
+    /// 本实例当前被分配到的队列集合。
     assigned: Vec<MessageQueue>,
-    /// Python `_offset_table`：**拉取游标**（nextBeginOffset）。
+    /// **拉取游标**（nextBeginOffset）。
     offset_table: BTreeMap<String, i64>,
-    /// Python `_consume_offsets`：**已消费位点**，周期持久化到 broker 的是这张。
+    /// **已消费位点**，周期持久化到 broker 的是这张。
     consume_offsets: BTreeMap<String, i64>,
-    /// Python `_pending`：已拉未消费缓冲（Java `ProcessQueue`）。
+    /// 已拉未消费的缓冲（待分发消息）。
     pending: BTreeMap<String, VecDeque<MessageExt>>,
-    /// Python `_msg_queue_inflight`：在途批次计数（Java `ProcessQueue.msgCount` 里
-    /// **正在被 listener 消费**的那部分）。`dispatch_loop` 取走批次时 +1、消费收尾
-    /// （含异常回塞）时 -1。`pending` 与它合起来才是 `ProcessQueue.getMsgCount()`，
+    /// 在途批次计数：`pending` 里已被取走、正在被 listener 消费的那部分。
+    /// `dispatch_loop` 取走批次时 +1、消费收尾（含异常回塞）时 -1。
+    /// `pending` 与它合起来才是队列的完整消息数，
     /// [`correct_tags_offset_locked`] 的闸门两个都要看。
     inflight: BTreeMap<String, usize>,
-    /// Python `_inflight_msgs`：已分发给 listener、还没落定的消息本体
-    /// （Java `ProcessQueue.msgTreeMap` 里被 ConsumeRequest 持有、但 `removeMessage`
-    /// 之前仍留在树上的那部分）。
+    /// 已分发给 listener、还没落定的消息本体。
     ///
-    /// `pending`（已拉未分发）∪ 它 = `msgTreeMap` 的完整视图，cleanExpiredMsg 的
-    /// 「队首清扫」与 [`process_queue_contains_locked`]（Java `containsMessage:341-357`）
-    /// 都看这个并集。**只登记并发批次**：顺序消费在 Java 里消息被挪进
-    /// `consumingMsgOrderlyTreeMap`，而清扫对顺序直接早退（`ProcessQueue:76-78`）。
-    /// 身份用 `queue_offset`（Java 的树就是按位点建的；本端口的批次是值拷贝，
+    /// `pending`（已拉未分发）∪ 它 = 队列在册消息的完整视图，cleanExpiredMsg 的
+    /// 「队首清扫」与 [`process_queue_contains_locked`] 都看这个并集。
+    /// **只登记并发批次**：顺序消费的消息会被挪进单独的「消费中」集合，
+    /// 而清扫对顺序直接早退。
+    /// 身份用 `queue_offset`（同一队列内位点唯一；本端的批次是值拷贝，
     /// 拿引用身份对不上）。
     inflight_msgs: BTreeMap<String, Vec<MessageExt>>,
-    /// Python `_frozen_offsets`：被 `OFFSET_ILLEGAL` 纠错冻结的位点（Java
-    /// `ControllableOffset.allowToUpdate=false`）。冻结期间在途 ack 与空应答修正都不许改它，
+    /// 被 `OFFSET_ILLEGAL` 纠错冻结的位点。冻结期间在途 ack 与空应答修正都不许改它，
     /// 直到这条队列按修正位点重建（`rebalance_pull_threads` 的建分支解冻）。
     frozen_offsets: BTreeSet<String>,
-    /// Python `_queue_epoch`：每条队列「ProcessQueue 的代号」，撤销（Java
-    /// `ProcessQueue.setDropped(true)`）时 +1。
+    /// 每条队列「ProcessQueue 的代号」，撤销时 +1。
     ///
     /// `dispatch_loop` 取批次时连同代号一起取走，消费/ack 前比对 —— 不一致说明这批消息
-    /// 属于已被丢弃的旧 ProcessQueue，必须整批作废（Java
-    /// `ConsumeMessageConcurrentlyService:267` 的 `!processQueue.isDropped()` 闸门；
-    /// 少了它，旧批次的 ack 会把刚被 broker 纠正的位点又推回非法值，两边来回弹跳）。
+    /// 属于已被丢弃的旧 ProcessQueue，必须整批作废；少了它，旧批次的 ack 会把刚被
+    /// broker 纠正的位点又推回非法值，两边来回弹跳。
     queue_epoch: BTreeMap<String, u64>,
-    /// Python `_mq_map`：队列 key -> MessageQueue。
+    /// 队列 key -> MessageQueue。
     mq_map: BTreeMap<String, MessageQueue>,
-    /// Python `_lock_ok`：顺序消费下 broker 已确认锁定的队列。
+    /// 顺序消费下 broker 已确认锁定的队列。
     lock_ok: BTreeSet<String>,
-    /// Python `_msg_acc_cnt_table`：Java `ProcessQueue.msgAccCnt`。
+    /// 每队列本批的堆积增量（用于 topic 级流控的水位估算）。
     msg_acc_cnt: BTreeMap<String, i64>,
-    /// Python `_queue_threads`：每队列拉取/POP 循环的**归属令牌**。
+    /// 每队列拉取/POP 循环的**归属令牌**。
     ///
-    /// Python 存线程对象并用 `is threading.current_thread()` 判归属；Rust 的循环是
-    /// tokio 任务，一个任务可能在线程间迁移，故换成单调递增令牌，语义等价。
+    /// tokio 任务可能在线程间迁移，无法用线程对象判归属，故换成单调递增令牌。
     queue_owners: BTreeMap<String, u64>,
-    /// Python `_pop_queues`：队列 key -> [`PopProcessQueue`]。
+    /// 队列 key -> [`PopProcessQueue`]。
     pop_queues: BTreeMap<String, Arc<PopProcessQueue>>,
-    /// Python `_pop_orderly_requests`（Java `ConcurrentSet<ConsumeRequest>`）：POP 顺序
-    /// 消费的去重集。Java 的 ConsumeRequest 相等性 = shardingKeyIndex(0) + pq 引用 + mq，
-    /// 这里用 Arc 指针地址表达 pq 引用、[`mq_key`] 表达 mq。
+    /// POP 顺序消费的去重集：同一个 (弹出队列, 队列) 只挂一个消费请求。
+    /// 相等性由「弹出队列的引用 + 队列 key」决定，
+    /// 这里用 Arc 指针地址表达引用、[`mq_key`] 表达队列。
     pop_orderly_requests: BTreeSet<(usize, String)>,
-    /// Python `_last_pull_table`：每队列**最近一次发起**拉取/弹出的时刻（毫秒）。
+    /// 每队列**最近一次发起**拉取/弹出的时刻（毫秒）。
     ///
-    /// 对齐 Java `ProcessQueue.lastPullTimestamp` / `PopProcessQueue.lastPopTimestamp`：
-    /// 盖章发生在循环**发起**网络请求之前（`DefaultMQPushConsumerImpl.pullMessage:253` /
-    /// `popMessage:508`），所以长轮询挂起和流控等待都不会把还在跑的循环判成停摆。
-    /// 循环已退出但仍占着归属时写 `0`（Rust 任务没有 `is_alive()`，用这个哨兵表达「死了」）。
+    /// 盖章发生在循环**发起**网络请求之前，所以长轮询挂起和流控等待都不会把还在跑的
+    /// 循环判成停摆。循环已退出但仍占着归属时写 `0`（Rust 任务没有 `is_alive()`，
+    /// 用这个哨兵表达「死了」）。
     last_pull_at: BTreeMap<String, i64>,
-    /// Java `PullAPIWrapper.pullFromWhichNodeTable`：队列 → 下一轮拉取该选的 brokerId。
+    /// 队列 → 下一轮拉取该选的 brokerId。
     ///
-    /// 由拉取应答头里的 `suggestWhichBrokerId` 驱动（`processPullResult:77`），缺省
-    /// 按 master(=0) 记账；下次拉取据此走 `findBrokerAddressInSubscribe` 选主/从。
-    /// 用 `HashMap` 而不是 `BTreeMap`：与 Java 的 `ConcurrentMap` 同形，且 `MessageQueue`
-    /// 已实现 `Hash + Eq`；这张表不参与任何报文序列化，遍历顺序无影响。
+    /// 由拉取应答头里的 `suggestWhichBrokerId` 驱动，缺省按 master(=0) 记账；
+    /// 下次拉取据此选主/从节点。用 `HashMap` 而不是 `BTreeMap`：`MessageQueue`
+    /// 已实现 `Hash + Eq`，且这张表不参与任何报文序列化，遍历顺序无影响。
     pull_from_which_node: HashMap<MessageQueue, i64>,
 }
 
@@ -750,45 +729,43 @@ struct Inner {
     pop_executor: Mutex<Option<ConsumeExecutor>>,
     trace: Mutex<Option<Arc<dyn TraceDispatcherChannel>>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
-    /// Python `_heartbeat_count`。
+    /// 已发心跳次数（观测/单测用）。
     heartbeat_count: AtomicUsize,
-    /// Python `_flow_control_triggered`（普通属性，无锁自增）。
+    /// 本地流控触发次数（无锁自增）。
     flow_control_triggered: AtomicUsize,
-    /// Python `_core_pool_size`（声明值）。
+    /// 线程池核心数的声明值。
     core_pool_size: AtomicI32,
-    /// Python `_owns_consume_executor`：本实现不支持外部注入执行器，恒 true，
-    /// 保留字段是为了让 `update_core_pool_size` 的守卫形状与 Java 一致。
+    /// 本实现不支持外部注入执行器，恒 true；
+    /// 保留字段是为了让 `update_core_pool_size` 的守卫形状完整。
     owns_consume_executor: AtomicBool,
-    /// Python `_start_time`（毫秒）。
+    /// 启动时刻（毫秒）。
     start_time_millis: AtomicI64,
-    /// Python `_rebalance_now`（`threading.Event`）。
+    /// 「立刻重平衡」的请求标志。
     ///
     /// ⚠ 用「标志位 + `Notify`」而不是裸 `Notify::notify_waiters()`：后者只叫醒
-    /// **当下**在等的任务，通知落在两轮之间就会丢；`Event` 是持久的，
-    /// 标志位补上这个语义。
+    /// **当下**在等的任务，通知落在两轮之间就会丢；标志位是持久的，
+    /// 补上这个语义。
     rebalance_now: AtomicBool,
     rebalance_signal: Notify,
     /// [`State::queue_owners`] 的令牌发号器。
     next_token: AtomicU64,
-    /// Java `DefaultMQPushConsumerImpl#pause`：[`suspend`](DefaultMQPushConsumer::suspend)
-    /// 置 true，[`resume`](DefaultMQPushConsumer::resume) 置 false。
+    /// 暂停标志：[`suspend`](DefaultMQPushConsumer::suspend) 置 true，
+    /// [`resume`](DefaultMQPushConsumer::resume) 置 false。
     /// 拉取/弹出循环看到 true 时不发请求，按
     /// [`PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`] 挂起后重试。
     pause: AtomicBool,
 }
 
 // ================================================================ 流控常量
-// （Java `DefaultMQPushConsumerImpl.java:101-113`，数值一字不差）
 
-/// Java `pullTimeDelayMillsWhenException`：拉取/弹出 RPC 出错后的退避。
+/// 拉取/弹出 RPC 出错后的退避。
 pub const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION: u64 = 3000;
-/// Java `PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL`：本地缓存（待消费/待 ack）
-/// 打满流控时的退避。
+/// 本地缓存（待消费/待 ack）打满流控时的退避。
 pub const PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL: u64 = 50;
-/// Java `PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL`：broker 回
-/// `FLOW_CONTROL(215)` 时的退避（远短于普通异常：broker 只是让客户端慢一点）。
+/// broker 回 `FLOW_CONTROL(215)` 时的退避
+/// （远短于普通异常：broker 只是让客户端慢一点）。
 pub const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL: u64 = 20;
-/// Java `PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`：`suspend()` 后的轮询间隔。
+/// `suspend()` 后的轮询间隔。
 pub const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND: u64 = 1000;
 
 impl Drop for Inner {
@@ -830,8 +807,8 @@ fn require_client(inner: &Inner) -> Result<MQClientInstance> {
 /// 应答）。回投若沿用 [`require_client`] 的 started 门，排空等到的全是
 /// 「consumer not started」快速失败 —— 回投一条也发不出去，消息只能靠位点下限从原
 /// topic 重投，`%RETRY%`/`%DLQ%` 永远进不去（真机立即退进程测试抓到，见
-/// `examples/live_shutdown_race.rs`）。Java 侧 `sendMessageBack` 直接走 `mQClientFactory`，
-/// 同样不看 consumer 的 serviceState；实例本体到 shutdown 收尾的最后一步才被摘掉，
+/// `examples/live_shutdown_race.rs`）。回投 RPC 本身只依赖客户端实例，与消费者自身的
+/// serviceState 无关；实例本体到 shutdown 收尾的最后一步才被摘掉，
 /// 这里也只要求它在。
 fn require_client_for_send_back(inner: &Inner) -> Result<MQClientInstance> {
     lock(&inner.client)
@@ -839,15 +816,14 @@ fn require_client_for_send_back(inner: &Inner) -> Result<MQClientInstance> {
         .ok_or_else(|| Error::client("consumer not started, call start() first"))
 }
 
-/// 队列 key：Python `_mq_key`（`"%s%s%d" % (topic, brokerName, queueId)`，无分隔符）。
+/// topic + brokerName + queueId 拼成的队列 key（无分隔符）。
 pub fn mq_key(mq: &MessageQueue) -> String {
     format!("{}{}{}", mq.topic, mq.broker_name, mq.queue_id)
 }
 
 // ================================================================ DefaultMQPushConsumer
 
-/// 推模式消费者（对应 Java `DefaultMQPushConsumer` + `DefaultMQPushConsumerImpl`，
-/// 移植自 Python `consumer.DefaultMQPushConsumer`）。
+/// 推模式消费者：订阅 + 重平衡 + 拉取/POP 消费循环的门面句柄。
 ///
 /// 生命周期：`subscribe(..)` → [`start`](Self::start) → 后台重平衡 + 消费 →
 /// [`shutdown`](Self::shutdown)。克隆得到的副本共享同一份状态（模块头差异 2）。
@@ -998,13 +974,13 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.instance_name = name);
     }
 
-    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
+    /// 设置单元化名：`None`/空白等价于不设（拼 clientId 时按空白判）。
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
     }
 
-    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
+    /// 设置 5.x **服务端**命名空间（`ns`/`nsd`
     /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
     /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
     pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
@@ -1012,48 +988,48 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.namespace_v2 = namespace_v2);
     }
 
-    /// Java `ClientConfig#getNamespaceV2`。
+    /// 读当前服务端命名空间。
     pub fn get_namespace_v2(&self) -> Option<String> {
         self.config().namespace_v2
     }
 
-    /// Java `ClientConfig#setUnitMode`。
+    /// 设置单元化模式（随发送/回投/鉴权/消息过滤一起上线）。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
     }
 
-    /// Java `ClientConfig#setEnableStreamRequestType`。
+    /// 设置流式请求类型开关（true 时请求带 `ReqT=0`，clientId 末尾多 `@STREAM`）。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
-    /// Java `DefaultMQPushConsumer#setPostSubscriptionWhenPull`（默认 false）。
+    /// 设置是否把订阅表达式随 PULL_MESSAGE 上送（默认 false）。
     ///
     /// 打开后每次 PULL_MESSAGE 会把订阅表达式随请求上送（SUBSCRIPTION 位置位），
     /// 让 broker 侧做过滤；默认关闭 —— 过滤由客户端 `filter_messages_for_delivery`
-    /// 兜底，与 Java 5.x 的默认行为一致。
+    /// 兜底，只有 broker 侧需要订阅表达式做类过滤时才该打开。
     pub fn set_post_subscription_when_pull(&self, enable: bool) {
         self.update_config(|c| c.post_subscription_when_pull = enable);
     }
 
-    /// Python `set_consume_from_where`（取 [`ConsumeFromWhere`] 里的常量）。
+    /// 设置起始位点策略（取 [`ConsumeFromWhere`] 里的常量）。
     pub fn set_consume_from_where(&self, where_: &str) {
         let where_ = where_.to_string();
         self.update_config(|c| c.consume_from_where = where_);
     }
 
-    /// Python `set_consume_timestamp`：`CONSUME_FROM_TIMESTAMP` 的起点，格式 `yyyyMMddHHmmss`。
+    /// 设置 `CONSUME_FROM_TIMESTAMP` 的起点，格式 `yyyyMMddHHmmss`。
     pub fn set_consume_timestamp(&self, timestamp: &str) {
         let timestamp = timestamp.to_string();
         self.update_config(|c| c.consume_timestamp = timestamp);
     }
 
-    /// Java `ClientConfig#setPollNameServerInterval`。
+    /// 设置在用 topic 的路由刷新周期。
     pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
-    /// Java `ClientConfig#setPersistConsumerOffsetInterval`。
+    /// 设置后台位点落盘周期。
     pub fn set_persist_consumer_offset_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.persist_consumer_offset_interval_millis = millis);
     }
@@ -1062,7 +1038,7 @@ impl DefaultMQPushConsumer {
         *lock(&self.inner.listener) = Some(listener);
     }
 
-    /// Python `set_message_listener` 的并发消费便捷入口。
+    /// 注册并发消费监听器。
     pub fn set_message_listener_concurrently(
         &self,
         listener: Arc<dyn MessageListenerConcurrently>,
@@ -1070,7 +1046,7 @@ impl DefaultMQPushConsumer {
         self.set_message_listener(MessageListener::Concurrently(listener));
     }
 
-    /// Python `set_message_listener` 的顺序消费便捷入口。
+    /// 注册顺序消费监听器。
     pub fn set_message_listener_orderly(&self, listener: Arc<dyn MessageListenerOrderly>) {
         self.set_message_listener(MessageListener::Orderly(listener));
     }
@@ -1086,7 +1062,7 @@ impl DefaultMQPushConsumer {
             .unwrap_or_else(|e| e.into_inner()) = strategy;
     }
 
-    /// 当前队列分配策略（对应 Java `DefaultMQPushConsumer.getAllocateMessageQueueStrategy`）。
+    /// 当前队列分配策略。
     pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
         self.inner
             .strategy
@@ -1142,11 +1118,10 @@ impl DefaultMQPushConsumer {
 
     // ---------------- 订阅 ----------------
 
-    /// Python `subscribe(topic, sub_expression="*")`。
+    /// 订阅一个 topic，表达式默认 `"*"`。
     ///
-    /// 对齐 Java `DefaultMQPushConsumerImpl#subscribe:1265-1275`：`start()` 之后**仍可**调用，
-    /// 订阅表是活的（心跳与重平衡每轮都重读它），put 进去之后立即推一轮心跳
-    /// （见 [`Self::notify_subscription_changed`]）。
+    /// `start()` 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
+    /// put 进去之后立即推一轮心跳（见 [`Self::notify_subscription_changed`]）。
     pub fn subscribe(&self, topic: &str, sub_expression: &str) -> Result<()> {
         let topic = self.with_namespace(topic);
         let sub = FilterAPI::build_subscription_data(&topic, Some(sub_expression))?;
@@ -1155,14 +1130,14 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// Python `subscribe(topic, "*")`（订阅全部）。
+    /// 订阅一个 topic 的全部消息（等价 `subscribe(topic, "*")`）。
     pub fn subscribe_all(&self, topic: &str) -> Result<()> {
         self.subscribe(topic, "*")
     }
 
-    /// Python `subscribe_with_selector`。
+    /// 用 [`MessageSelector`] 订阅。
     ///
-    /// 对齐 Java `FilterAPI.build(topic, subString, type)`：
+    /// 按表达式类型分流：
     /// TAG（或 type 为空）走 `buildSubscriptionData` 填 `tagsSet`/`codeSet`；
     /// SQL92 / CLASS_FILTER 只设 topic/subString/expressionType，两个集合留空。
     /// 与 `subscribe` 相同：start() 之后可调用，并立即推一轮心跳。
@@ -1188,9 +1163,9 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// Python `unsubscribe`（对应 Java `DefaultMQPushConsumerImpl#unsubscribe:1317-1319`）。
+    /// 取消订阅一个 topic。
     ///
-    /// Java 这里**只删表项、不发心跳**（后一轮心跳自然带出新订阅集），所以刻意不调
+    /// 这里**只删表项、不发心跳**（后一轮心跳自然带出新订阅集），所以刻意不调
     /// `notify_subscription_changed`。
     pub fn unsubscribe(&self, topic: &str) {
         let topic = self.with_namespace(topic);
@@ -1198,18 +1173,17 @@ impl DefaultMQPushConsumer {
         state.subscription_data.retain(|(k, _)| *k != topic);
     }
 
-    /// 订阅表新增/更新后的立即动作，对齐 Java `subscribe` 里的第二句。
+    /// 订阅表新增/更新后的立即动作：同步推一轮心跳 + 把 topic 登记为「在用」。
     ///
-    /// Java `DefaultMQPushConsumerImpl:1265-1287` 三处 subscribe 都是：
-    /// `subscriptionInner.put(...)` 之后 `if (mQClientFactory != null)
-    /// mQClientFactory.sendHeartbeatToAllBrokerWithLock();` —— 同步推一轮心跳。为什么必须立即：
+    /// 为什么必须立即：
     /// broker 的 `ConsumerManager` 只在收到心跳时才把 topic→group 记进它自己那张
     /// topicGroupTable（ClientManageProcessor → registerConsumer），而
     /// `QUERY_TOPIC_CONSUME_BY_WHO(300)` 读的正是这张表；晚一轮就是默认 30s 的空窗。
     ///
-    /// 另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（对应 Java
-    /// `MQClientInstance:438-454` 直接遍历消费者的**当前**订阅表收集要刷的 topic）。
-    /// 未启动时没有 client（Java 的 `mQClientFactory == null`），只落订阅表。
+    /// 另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它 ——
+    /// 刷新任务收集「要刷哪些 topic」时读的是消费者的**当前**订阅表，
+    /// 新订阅必须当场可见才能被覆盖到。
+    /// 未启动时没有 client，只落订阅表。
     ///
     /// `subscribe` 是同步签名而心跳是异步 RPC：放到 runtime 上 fire-and-forget
     /// （与 `rebalance` 起每队列拉取循环同一套 `runtime_handle()` 手法）。
@@ -1242,7 +1216,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// 当前订阅表快照（Python 直接读 `subscription_data`）。
+    /// 当前订阅表快照。
     pub fn subscriptions(&self) -> Vec<SubscriptionData> {
         lock(&self.inner.state)
             .subscription_data
@@ -1251,7 +1225,7 @@ impl DefaultMQPushConsumer {
             .collect()
     }
 
-    /// Python `_with_namespace`（Java `DefaultMQPushConsumer.subscribe(withNamespace(topic))`）。
+    /// 给 topic 拼上客户端命名空间的 `%` 前缀（订阅入口统一先过这一步）。
     fn with_namespace(&self, topic: &str) -> String {
         let namespace = read_cfg(&self.inner).namespace;
         if namespace.is_empty() {
@@ -1263,19 +1237,17 @@ impl DefaultMQPushConsumer {
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start()`（对应 Java `DefaultMQPushConsumerImpl.start`）。
+    /// 启动消费者：建实例、注册、拉路由、首轮心跳与重平衡，再起后台循环。
     ///
-    /// 顺序与 Python 逐行对齐：校验 → 拼命名空间 → 建并启动实例 → 注册消费者 →
+    /// 顺序是判据：校验 → 拼命名空间 → 建并启动实例 → 注册消费者 →
     /// 自动订阅 `%RETRY%` → 注册 NOTIFY_CONSUMER_IDS_CHANGED(40) → 建 POP 执行器 →
     /// 拉路由 → **同步**首轮心跳 → **同步**首轮重平衡 → 起各循环 → 轨迹分发器。
     ///
-    /// 两处刻意的实现差别（行为不变）：
-    /// 1. Python 的心跳报文由消费者自己拼（`_build_heartbeat`）；这里用
-    ///    [`MQClientInstance::send_heartbeat_to_all_broker`]，它按 Java 的口径从
-    ///    注册表拼全量 `ConsumerData`。因为 `register_consumer` 在它之前，
-    ///    本消费者一定在报文里。
-    /// 2. Python 用 `threading.Thread`；这里是 tokio 任务，句柄缺失时（无运行时）
-    ///    只告警不报错，与生产者一致。
+    /// 两处刻意的实现选择（行为不变）：
+    /// 1. 心跳报文由 [`MQClientInstance::send_heartbeat_to_all_broker`] 从注册表拼
+    ///    全量 `ConsumerData`，而不是消费者自己拼一份。因为 `register_consumer` 在它
+    ///    之前，本消费者一定在报文里。
+    /// 2. 后台循环是 tokio 任务，句柄缺失时（无运行时）只告警不报错，与生产者一致。
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -3035,7 +3007,7 @@ fn parse_local_offsets_text(text: &str) -> Option<BTreeMap<String, i64>> {
     if let Ok(flat) = serde_json::from_str::<BTreeMap<String, i64>>(trimmed) {
         return Some(flat);
     }
-    let entries = scan_java_offset_entries(trimmed)?;
+    let entries = scan_offset_store_entries(trimmed)?;
     Some(
         entries
             .into_iter()
@@ -3048,7 +3020,7 @@ fn parse_local_offsets_text(text: &str) -> Option<BTreeMap<String, i64>> {
 
 /// 无 regex crate，手写扫描器：`{"offsetTable":{{...}:9,...}}`（容忍 fastjson2
 /// pretty 版的换行缩进）。返回 `(topic, brokerName, queueId, offset)` 列表。
-fn scan_java_offset_entries(text: &str) -> Option<Vec<(String, String, i32, i64)>> {
+fn scan_offset_store_entries(text: &str) -> Option<Vec<(String, String, i32, i64)>> {
     struct Scanner<'a> {
         b: &'a [u8],
         pos: usize,
@@ -5656,7 +5628,7 @@ mod tests {
 
     /// Java DefaultMQPushConsumerImpl.java:101-113 的四个流控常量一字不差。
     #[test]
-    fn flow_control_constants_match_java() {
+    fn flow_control_constants_match_contract() {
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION, 3000);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL, 50);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, 20);
@@ -5797,7 +5769,7 @@ mod tests {
     /// 差异不报错，只表现为「同一个 `update_core_pool_size(30)`，本端口真的改了并发度、
     /// Java 没改」，所以这五格必须钉住。
     #[test]
-    fn update_core_pool_size_guards_match_java() {
+    fn update_core_pool_size_guards_match_contract() {
         let c = DefaultMQPushConsumer::new("G").unwrap();
         assert_eq!(
             c.config().consume_thread_max,
@@ -6187,7 +6159,7 @@ mod tests {
 
     /// 命中顺序即 Java 的书写顺序：同时配坏两项时先报排在前面那道。
     #[test]
-    fn gates_are_checked_in_java_order() {
+    fn gates_are_checked_in_contract_order() {
         assert_eq!(
             gate_error(&ConsumerConfig {
                 consume_concurrently_max_span: 0,
@@ -6335,7 +6307,7 @@ mod tests {
     /// 后半段是有实际后果的那一条：广播模式保持 `DEFAULT`，于是同进程的两个广播消费者
     /// 算出同一个 clientId、共用一份 `MQClientInstance`（Java 就是这么跑的）。
     #[tokio::test]
-    async fn client_id_follows_java_buildmqclientid_rules() {
+    async fn client_id_follows_buildmqclientid_contract() {
         let clustering = DefaultMQPushConsumer::new("CID-clientid-parity-clustering").unwrap();
         clustering.set_namesrv_addr("127.0.0.1:1");
         clustering.subscribe("T", "TagA").unwrap();
@@ -6975,7 +6947,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_message_carries_exactly_javas_fields() {
+    fn retry_message_carries_exactly_the_contract_fields() {
         let cfg = cfg_with(2);
         let poison = {
             let mut m = orderly_batch(7, &[2]).remove(0);
@@ -7042,7 +7014,7 @@ mod tests {
     // ---------------- 挂起时长：context 优先 + 钳到 [10, 30000] ----------------
 
     #[test]
-    fn orderly_suspend_millis_resolves_then_clamps_like_java() {
+    fn orderly_suspend_millis_resolves_then_clamps() {
         // Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`：
         // 先解析 -1（`ConsumeOrderlyContext` 的默认值 = 「没指定」）→ 回落到消费者配置，
         // 再把结果钳到 [10, 30000]。钳位不是装饰：listener 传 0 时 Java 仍然等 10ms
@@ -7757,7 +7729,7 @@ mod tests {
 
     /// Java `ProcessQueue.PULL_MAX_IDLE_TIME` 默认值 + `isPullExpired` 的严格 `>` 边界。
     #[test]
-    fn pull_idle_threshold_matches_java_and_is_strictly_greater() {
+    fn pull_idle_threshold_matches_contract_and_is_strictly_greater() {
         assert_eq!(PULL_MAX_IDLE_TIME, 120_000);
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
         let key = mq_key(&queue("T", "broker-a", 0));
@@ -8115,11 +8087,11 @@ mod tests {
     // ---------------- 本地位点文件：对齐 Java LocalFileOffsetStore ----------------
 
     // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
-    const JAVA_COMPACT: &str = concat!(
+    const CONTRACT_OFFSETS_COMPACT: &str = concat!(
         r#"{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,"#,
         r#"{"brokerName":"broker-a","queueId":0,"topic":"Tt"}:7}}"#,
     );
-    const JAVA_PRETTY: &str =
+    const CONTRACT_OFFSETS_PRETTY: &str =
         "{\n\t\"offsetTable\":{\n\t\t{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7\n\t}\n}";
 
     fn test_mq_map() -> BTreeMap<String, MessageQueue> {
@@ -8132,7 +8104,7 @@ mod tests {
     }
 
     #[test]
-    fn local_offsets_build_uses_java_object_as_key_format() {
+    fn local_offsets_build_uses_contract_object_as_key_format() {
         let text = build_local_offsets_json(
             &BTreeMap::from([
                 ("Ttbroker-a0".to_string(), 7),
@@ -8156,11 +8128,11 @@ mod tests {
     }
 
     #[test]
-    fn local_offsets_parse_java_format_compact_and_pretty() {
-        let compact = parse_local_offsets_text(JAVA_COMPACT).unwrap();
+    fn local_offsets_parse_contract_format_compact_and_pretty() {
+        let compact = parse_local_offsets_text(CONTRACT_OFFSETS_COMPACT).unwrap();
         assert_eq!(compact.get("Ttbroker-a1"), Some(&9));
         assert_eq!(compact.get("Ttbroker-a0"), Some(&7));
-        let pretty = parse_local_offsets_text(JAVA_PRETTY).unwrap();
+        let pretty = parse_local_offsets_text(CONTRACT_OFFSETS_PRETTY).unwrap();
         assert_eq!(pretty.get("Ttbroker-a0"), Some(&7));
     }
 
@@ -8194,7 +8166,7 @@ mod tests {
     }
 
     #[test]
-    fn local_offsets_save_writes_java_format_and_rolls_bak() {
+    fn local_offsets_save_writes_contract_format_and_rolls_bak() {
         let dir = std::env::temp_dir().join(format!(
             "rmq_rust_offsets_test_{}_{}",
             std::process::id(),
@@ -8243,7 +8215,7 @@ mod tests {
     }
 
     #[test]
-    fn local_offsets_load_reads_java_written_file() {
+    fn local_offsets_load_reads_contract_written_file() {
         // Java 写出的文件本端要能读（跨端互认的核心）
         let dir = std::env::temp_dir().join(format!(
             "rmq_rust_offsets_java_{}_{}",
@@ -8255,7 +8227,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("offsets.json");
-        std::fs::write(&path, JAVA_COMPACT).unwrap();
+        std::fs::write(&path, CONTRACT_OFFSETS_COMPACT).unwrap();
         let loaded = load_local_offsets_at(&path);
         assert_eq!(loaded.get("Ttbroker-a1"), Some(&9));
         assert_eq!(loaded.get("Ttbroker-a0"), Some(&7));
@@ -8274,7 +8246,7 @@ mod tests {
     /// 订阅表达式（SUBSCRIPTION 位清零），tag 过滤靠客户端
     /// `filter_messages_for_delivery` 兜底；打开且非类过滤模式才上送。
     #[test]
-    fn pull_subscription_expression_follows_java_default() {
+    fn pull_subscription_expression_follows_contract_default() {
         let s = sub(P5_TOPIC, "TagA");
         // 默认关闭
         assert_eq!(

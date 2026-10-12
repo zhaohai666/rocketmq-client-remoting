@@ -35,14 +35,14 @@ ADDR = "127.0.0.1:10911"
 
 
 # ---------------- 句柄编解码 ----------------
-def test_build_handle_matches_java_vector():
+def test_build_handle_matches_the_wire_vector():
     """向量是拿 Java 的 Base64.getUrlEncoder() 实算出来的，改动即失配。"""
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
     assert handle == ("djEgVG9waWNSZWNhbGxVbml0IGJyb2tlci1hIDE3MDAwMDAwMDAwMDAg"
                       "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=")  # noqa: E501
 
 
-def test_build_handle_keeps_java_padding():
+def test_build_handle_keeps_the_field_padding():
     """Java 用带填充的 getUrlEncoder；无填充会让 broker 侧某些实现解不出来。"""
     handle = recall_message_handle.build_handle("a", "b", "1", "c")
     assert len(handle) % 4 == 0
@@ -56,7 +56,7 @@ def test_round_trip_and_padded_and_unpadded_both_decode():
         recall_message_handle.decode_handle(handle)
 
 
-def test_extra_segments_are_ignored_like_java_split():
+def test_extra_segments_are_ignored_by_the_split_rule():
     raw = " ".join(["v1", TOPIC, BROKER, "1700000000000", UNIQ_KEY, "whatever"])
     import base64
     handle = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
@@ -78,14 +78,14 @@ def _b64(text: str) -> str:
     _b64("v1 TopicA broker-a 1"),                   # 段数不足
     "__4gYmFkIHV0Zjg=",                             # 解出来不是合法 utf-8
 ])
-def test_bad_handles_fail_with_the_java_message(bad):
+def test_bad_handles_fail_with_the_protocol_message(bad):
     with pytest.raises(MQClientException) as exc:
         recall_message_handle.decode_handle(bad)
     assert str(exc.value) == "recall handle is invalid"
 
 
 # ---------------- 报文头 ----------------
-def test_recall_request_headers_use_java_keys():
+def test_recall_request_headers_use_the_wire_keys():
     header = RecallMessageRequestHeader()
     header.producer_group = "PG"
     header.topic = TOPIC
@@ -252,7 +252,7 @@ def test_corrupt_handle_fails_before_any_io():
     assert (time.monotonic() - began) < 0.2
 
 
-def test_missing_broker_address_uses_java_message():
+def test_missing_broker_address_uses_the_protocol_message():
     client = _NoIoClient()
     client.no_publish_error = True          # 路由预热成功，才轮到定位 broker 地址
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
@@ -264,7 +264,7 @@ def test_missing_broker_address_uses_java_message():
     assert "rpc" not in client.touched
 
 
-def test_publish_info_failure_propagates_like_java():
+def test_publish_info_failure_propagates_unchanged():
     """DefaultMQProducerImpl:1586 的 tryToFindTopicPublishInfo 没有 try/catch：
     路由拿不到就直接失败，不会继续往后拼请求。"""
     client = _NoIoClient()

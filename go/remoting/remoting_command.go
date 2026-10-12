@@ -18,7 +18,7 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// CurrentVersion mirrors Java MQVersion.CURRENT_VERSION (= Version.V5_5_1).
+// CurrentVersion is this client's protocol version (V5_5_1, ordinal 515).
 //
 // This value is not cosmetic: brokers gate admin-to-client forwarding on it —
 // AdminBrokerProcessor#callConsumer requires >= V3_1_8_SNAPSHOT (ordinal 62),
@@ -27,9 +27,8 @@ import (
 // getConsumeStatus fail with code=1 "too low to finish".
 const CurrentVersion = int32(515)
 
-// CurrentVersionDesc is MQVersion.getVersionDesc(CURRENT_VERSION): the NAME of
-// the Version enum constant at that ordinal. Java defines
-// `CURRENT_VERSION = Version.V5_5_1.ordinal()` and the 5.5.1 jars confirm
+// CurrentVersionDesc is getVersionDesc(CURRENT_VERSION): the NAME of the
+// protocol Version enum constant at that ordinal. A live 5.5.1 server renders
 // `getVersionDesc(515) == "V5_5_1"`. It rides the 307 answer as
 // ConsumerRunningInfo.PROP_CLIENT_VERSION.
 //
@@ -51,13 +50,13 @@ const (
 
 var opaqueCounter atomic.Int32
 
-// NextOpaque returns a monotonically increasing request id (Java requestId).
+// NextOpaque returns a monotonically increasing request id.
 func NextOpaque() int32 {
 	return opaqueCounter.Add(1) - 1
 }
 
-// CustomHeader mirrors Java CommandCustomHeader reflection: write non-nil
-// fields into extFields, read them back. Concrete header types live in
+// CustomHeader follows the broker's CommandCustomHeader reflection contract:
+// write non-nil fields into extFields, read them back. Concrete header types live in
 // headers.go; decoding is `h := &remoting.XxxHeader{}; h.FromExtFields(...)`.
 type CustomHeader interface {
 	ToExtFields(out *common.StringMap)
@@ -113,7 +112,7 @@ func CreateResponseCommand(code int32, remark string) *RemotingCommand {
 
 }
 
-// BuildErrorResponse is the Java createResponseCommand(code, remark) shortcut.
+// BuildErrorResponse is the createResponseCommand(code, remark) shortcut.
 func BuildErrorResponse(code int32, remark string) *RemotingCommand {
 	return CreateResponseCommand(code, remark)
 }
@@ -164,7 +163,7 @@ func (c *RemotingCommand) SetCustomHeader(header CustomHeader) { c.customHeader 
 func (c *RemotingCommand) CustomHeader() CustomHeader { return c.customHeader }
 
 // MakeCustomHeaderToNet merges the custom header's non-nil fields into
-// extFields (Java reflection write).
+// extFields (reflection write-back shape).
 func (c *RemotingCommand) MakeCustomHeaderToNet() {
 	if c.customHeader == nil {
 		return
@@ -201,8 +200,8 @@ func (c *RemotingCommand) Encode() []byte {
 	return out
 }
 
-// EncodeHeader writes the frame with a body placeholder of bodyLength bytes
-// (Java encodeHeader(int bodyLength)); the caller writes the body separately.
+// EncodeHeader writes the frame with a body placeholder of bodyLength bytes;
+// the caller writes the body separately.
 func (c *RemotingCommand) EncodeHeader(bodyLength int) []byte {
 	headerData := c.HeaderEncode()
 	totalLen := 4 + len(headerData) + bodyLength
@@ -345,7 +344,7 @@ func jsonI32(value any, key string, def int32) int32 {
 	return def
 }
 
-// String renders the command like Java's RemotingCommand.toString.
+// String renders the command for logs.
 func (c *RemotingCommand) String() string {
 	var pairs []string
 	c.extFields.Range(func(k, v string) {

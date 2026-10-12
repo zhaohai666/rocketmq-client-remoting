@@ -138,10 +138,11 @@ const (
 	ReqPopRollback                       = int32(200056)
 )
 
-// Broker-role / HA admin requests. Java declares these in RequestCode but the
-// 5.x reference client only consumes them from mqadmin; naming them here keeps
-// the numeric set identical to Java's, so a Go caller building a raw command
-// (broker_api.go) cannot pick a colliding value by accident.
+// Broker-role / HA admin requests. The broker declares these in its
+// RequestCode table but this client only consumes them through admin
+// operations; naming them here keeps the numeric set identical to the
+// broker's, so a Go caller building a raw command (broker_api.go) cannot pick
+// a colliding value by accident.
 const (
 	ReqTriggerDeleteFiles       = int32(27)
 	ReqGetAllMessageRequestMode = int32(402)
@@ -255,14 +256,14 @@ const (
 	RespIllegalOperation          = int32(604)
 	RespGoAway                    = int32(1500)
 
-	// Client-side pseudo response codes (Java RpcResponseCode).
+	// Client-side pseudo response codes (RpcResponseCode family).
 	RespRPCUnknown             = int32(-1000)
 	RespRPCAddrIsNull          = int32(-1002)
 	RespRPCSendToChannelFailed = int32(-1004)
 	RespRPCTimeOut             = int32(-1006)
 )
 
-// LanguageCode values (Java enum order).
+// LanguageCode values (protocol wire codes).
 const (
 	LangJava   = int32(0)
 	LangCPP    = int32(1)
@@ -274,7 +275,7 @@ const (
 	LangOther  = int32(7)
 )
 
-// LanguageCodeFromName maps a Java enum name back to the code; unknown -> OTHER.
+// LanguageCodeFromName maps a wire language name back to the code; unknown -> OTHER.
 // 5.x name servers serialize the language as the enum name string.
 func LanguageCodeFromName(name string) int32 {
 	switch strings.ToUpper(name) {
@@ -308,7 +309,7 @@ func LanguageCodeFromName(name string) int32 {
 	return LangOther
 }
 
-// LanguageName maps a language code to the Java enum name; unknown -> OTHER.
+// LanguageName maps a language code to its wire name; unknown -> OTHER.
 func LanguageName(code int32) string {
 	switch code & 0xFF {
 	case 0:
@@ -353,7 +354,7 @@ const (
 	FlagOnewayRPC = int32(1) // bit 1: oneway
 )
 
-// RequestSource mirrors Java RequestSource.
+// RequestSource marks who sent a pull/pop request.
 const (
 	RequestSourceSDK               = int32(-1)
 	RequestSourceProxyForOrder     = int32(0)
@@ -361,7 +362,8 @@ const (
 	RequestSourceProxyForStream    = int32(2)
 )
 
-// ForbiddenType mirrors Java ForbiddenType.
+// ForbiddenType is the broker's forbidden-reason code (e.g. the
+// PullMessageResponseHeader "forbiddenType" field).
 const (
 	ForbiddenBroker              = int32(1)
 	ForbiddenGroup               = int32(2)

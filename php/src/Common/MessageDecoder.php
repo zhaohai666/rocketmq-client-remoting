@@ -7,10 +7,9 @@ namespace RocketMQ\Common;
 use Throwable;
 
 /**
- * 消息二进制编解码（对应 org.apache.rocketmq.common.message.MessageDecoder，
- * 移植自 message_decoder.py）。
+ * 消息二进制编解码。
  *
- * 本类严格对齐 Java 侧的两条编码路径，切勿混用：
+ * broker 侧定义了两条编码路径，本类两条都实现，切勿混用：
  *
  * 1) 17 段存储格式 ``MessageDecoder::encodeMessageExt($msgExt, $needCompress)`` /
  *    ``decode($raw)``
@@ -51,7 +50,7 @@ final class MessageDecoder
     public const MESSAGE_MAGIC_CODE_V2 = -626843477;
     public const BLANK_MAGIC_CODE = -875286124;
 
-    // 字段固定偏移（与 Java MessageDecoder 常量一致）
+    // 字段固定偏移（17 段存储格式里的字节位置）
     public const MESSAGE_MAGIC_CODE_POSITION = 4;
     public const MESSAGE_FLAG_POSITION = 16;
     public const MESSAGE_PHYSIC_OFFSET_POSITION = 28;
@@ -65,7 +64,7 @@ final class MessageDecoder
     // ---------------------------------------------------------------- 基础工具
 
     /**
-     * Java MessageDecoder 内的私有工具：UTF-8 编码。
+     * 协议里的文本字段一律 UTF-8。
      * PHP 字符串本就是字节串，此处仅作语义标注（入参须为 UTF-8 文本）。
      */
     public static function string2bytes(string $s): string
@@ -74,7 +73,7 @@ final class MessageDecoder
     }
 
     /**
-     * Java UtilAll.bytes2string：逐字节转**大写**十六进制（msgId 依赖大小写）。
+     * 逐字节转**大写**十六进制：msgId 的大小写是硬要求，小写串解不出 host/port。
      */
     public static function bytes2string(string $bs): string
     {
@@ -82,7 +81,7 @@ final class MessageDecoder
     }
 
     /**
-     * Java UtilAll.string2bytes：十六进制字符串 -> 字节。
+     * 十六进制字符串 -> 字节（bytes2string 的逆运算）。
      */
     public static function string2bytesHex(?string $hexString): ?string
     {
@@ -126,7 +125,8 @@ final class MessageDecoder
     }
 
     /**
-     * Java UtilAll.crc32 使用标准 CRC32（poly 0xEDB88320），与 zlib.crc32 一致。
+     * BODYCRC 用标准 CRC32（poly 0xEDB88320），PHP 内置 crc32() 同参数，
+     * 可直接和 broker 写入的值比对。
      */
     public static function crc32(string $data): int
     {
@@ -136,7 +136,7 @@ final class MessageDecoder
     // ------------------------------------------------------- 属性串 <-> Map
 
     /**
-     * Java MessageDecoder.messageProperties2String：k\x01v\x02 逐项拼接。
+     * 属性 map -> 协议串：逐项 `name\x01value\x02` 拼接。
      *
      * @param array<string, string|null>|null $properties
      */
@@ -156,7 +156,7 @@ final class MessageDecoder
     }
 
     /**
-     * Java MessageDecoder.string2messageProperties。
+     * 协议串 -> 属性 map（messageProperties2String 的逆运算）。
      *
      * @return array<string, string>
      */
@@ -196,7 +196,7 @@ final class MessageDecoder
     }
 
     /**
-     * Java MessageDecoder.decodeMessageId -> [ip, port, offset]。
+     * 十六进制 msgId -> [ip, port, offset]（createMessageId 的逆运算）。
      *
      * @return array{0: string, 1: int, 2: int}
      */
@@ -225,12 +225,12 @@ final class MessageDecoder
     /**
      * 把 sysFlag 里解出的压缩类型归一化到"真实算法"。
      *
-     * 对齐 Java ``CompressionType.findByValue`` 的向后兼容映射::
+     * 压缩类型编号的向后兼容映射（协议里只有这几个取值）::
      *
-     *     case 1: return LZ4;
-     *     case 2: return ZSTD;
-     *     case 0: // To be compatible for older versions without compression type
-     *     case 3: return ZLIB;
+     *     1 -> LZ4
+     *     2 -> ZSTD
+     *     0 -> ZLIB   （没有类型位能力的老格式消息，类型位就是 0）
+     *     3 -> ZLIB
      *
      * 即**类型位为 0 的老版本压缩消息按 ZLIB 处理**。这是必需的：老版本客户端
      * （无类型位能力）产出的压缩消息类型位就是 0，若不映射到 ZLIB，解压会失败，
@@ -256,12 +256,12 @@ final class MessageDecoder
             return $out;
         }
         if ($ctype === MessageSysFlag::LZ4_TYPE) {
-            // LZ4 Frame 格式（Java LZ4FrameOutputStream / Python lz4.frame 同规范），纯 PHP 实现
+            // LZ4 Frame 格式（魔数 0x184D2204 的自描述帧），纯 PHP 实现
             return CompressionCodec::lz4CompressFrame($data);
         }
         if ($ctype === MessageSysFlag::ZSTD_TYPE) {
             // 合法 ZSTD 帧（CLI 优先真压缩；无 CLI 时 Raw/RLE 块），
-            // broker 的 zstd-jni 原样可解。
+            // broker 按标准 ZSTD 帧解析，两种都能解。
             return CompressionCodec::zstdCompress($data);
         }
         throw self::unsupported($compressionType);
@@ -271,7 +271,7 @@ final class MessageDecoder
     {
         $ctype = self::normalizeCompressionType($compressionType);
         if ($ctype === MessageSysFlag::ZLIB_TYPE) {
-            // gzcompress 产出 zlib 格式（RFC1950），对应 Python zlib.decompress 用 gzuncompress 还原；
+            // gzcompress 产出 zlib 格式（RFC1950），还原只能用 gzuncompress；
             // gzinflate 只吃裸 deflate，gzdecode 只吃 gzip 格式（RFC1952），都不能用
             $out = @gzuncompress($data);
             if ($out === false) {
@@ -289,13 +289,12 @@ final class MessageDecoder
     }
 
     /**
-     * 对应 Java ``CompressorFactory.getCompressor`` 在未知类型时抛的异常。
+     * 未知压缩类型必须抛错。
      *
-     * Java 的 ``CompressionType.findByValue`` 只认 0/3(ZLIB)、1(LZ4)、2(ZSTD)，
-     * 其余返回 null，``CompressorFactory`` 随即抛 ``IllegalArgumentException``。
+     * 类型位只有 0/3(ZLIB)、1(LZ4)、2(ZSTD) 四个合法取值，其余都是脏数据。
      * **绝不能原样透传**：调用方（``decodeMessage``）在解压后会清掉
      * ``COMPRESSED_FLAG``，透传等于把压缩字节流当正文交出去且事后无法识别，
-     * 属于静默数据损坏。C++ 侧同语义（``CompressorFactory::decompress`` 抛 runtime_error）。
+     * 属于静默数据损坏。
      */
     private static function unsupported(int $compressionType): \RuntimeException
     {
@@ -307,8 +306,7 @@ final class MessageDecoder
      *
      * 除 ``decodeMessage`` 之外还有第二个调用方：Request-Reply 的应答是从
      * ``PUSH_REPLY_MESSAGE_TO_CLIENT(326)`` 直接推过来的裸包，不走消息解码路径，
-     * 需要自己按 ``sysFlag`` 判断并解压（对齐 Java
-     * ``ClientRemotingProcessor#receiveReplyMessage`` 里的 Compressor 分支）。
+     * 需要自己按 ``sysFlag`` 判断并在这里解压。
      */
     public static function decompressBody(string $data, int $compressionType): string
     {
@@ -325,9 +323,9 @@ final class MessageDecoder
     public static function encodeMessageExt(MessageExt $messageExt, bool $needCompress = false): string
     {
         /**
-         * 对应 Java ``MessageDecoder.encode(MessageExt, boolean needCompress)``。
+         * 17 段存储格式编码：needCompress 为真且 sysFlag 标了 COMPRESSED 时先压 body。
          *
-         * 注意：Java 侧 topic 长度固定写 1 字节、魔数固定写 v1（-626843481），
+         * 注意：topic 长度固定写 1 字节、魔数固定写 v1（-626843481），
          * storeSize > 0 时直接按其分配缓冲（尾部不足会按需补齐）。
          */
         $body = $messageExt->getBody() ?? '';
@@ -407,7 +405,7 @@ final class MessageDecoder
             $storeSize = self::i32($raw, $offset);
             $magicCode = self::i32($raw, $offset);
             if ($magicCode !== self::MESSAGE_MAGIC_CODE && $magicCode !== self::MESSAGE_MAGIC_CODE_V2) {
-                // Java MessageVersion.valueOfMagicCode 对未知魔数抛异常 -> decode 返回 null
+                // 未知魔数说明版本判定失败 -> decode 返回 null，不当成消息解
                 return null;
             }
             $useV2 = $magicCode === self::MESSAGE_MAGIC_CODE_V2;
@@ -458,7 +456,7 @@ final class MessageDecoder
                     }
                     $msgExt->setBody($body);
                 } else {
-                    // Java readBody=false 时跳过 body 且不给 body 赋值 -> null
+                    // readBody=false：跳过 body 且不赋值 -> null（调用方靠 null 区分「没读」与「空 body」）
                     self::need($raw, $offset, $bodyLen);
                     $offset += $bodyLen;
                     $msgExt->setBody(null);
@@ -525,7 +523,7 @@ final class MessageDecoder
     // --------------------------------------- 2) 6 段轻量格式：批量消息 body
 
     /**
-     * 对应 Java ``MessageDecoder.encodeMessage(Message)``：批量消息的单条编码。
+     * 批量消息的单条编码（6 段轻量格式）。
      *
      * 只写 TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES。
      */
@@ -549,7 +547,7 @@ final class MessageDecoder
     }
 
     /**
-     * 对应 Java ``MessageDecoder.encodeMessages(List<Message>)``：拼接成批量消息 body。
+     * 多条消息逐条编码后串成一个批量消息 body。
      *
      * @param list<Message> $messages
      */
@@ -563,7 +561,7 @@ final class MessageDecoder
     }
 
     /**
-     * 对应 Java ``MessageDecoder.decodeMessage(ByteBuffer)``：单条批量单元 -> Message。
+     * 单条批量单元 -> Message（6 段轻量格式的逆解析）。
      */
     public static function decodeBatchMessage(string $raw): Message
     {
@@ -584,7 +582,7 @@ final class MessageDecoder
     }
 
     /**
-     * 对应 Java ``MessageDecoder.decodeMessages(ByteBuffer)``：批量消息 body -> Message 列表。
+     * 批量消息 body -> Message 列表（按每段 TOTALSIZE 前进）。
      *
      * @return list<Message>
      */
@@ -608,7 +606,7 @@ final class MessageDecoder
     }
 
     /**
-     * 对应 Java ``MessageDecoder.countInnerMsgNum``。
+     * 数一个批量 body 里内嵌了几条消息（按每段 TOTALSIZE 前进，长度非法即停）。
      */
     public static function countInnerMsgNum(string $raw): int
     {

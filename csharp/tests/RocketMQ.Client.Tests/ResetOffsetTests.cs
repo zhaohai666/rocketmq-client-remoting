@@ -362,7 +362,7 @@ public class ResetOffsetTests
     ///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
     /// </summary>
     [Fact]
-    public void AdminReset_SendsTheJavaIsForceKey()
+    public void AdminReset_SendsTheLegacyIsForceKey()
     {
         using var cluster = MockCluster.Start(1);
         DefaultMQAdminExt admin = StartedAdmin(cluster);

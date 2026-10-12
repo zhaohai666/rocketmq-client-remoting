@@ -32,7 +32,7 @@ export function crc32Match(buf) {
 }
 
 // Java String.hashCode (31*h + c), 32-bit signed wrap.
-export function javaStringHash(str) {
+export function serverStringHash(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) {
     h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
@@ -135,7 +135,7 @@ export function getHostIp() {
 }
 
 export default {
-  crc32, crc32Match, javaStringHash, bytes2string, string2bytesHex,
+  crc32, crc32Match, serverStringHash, bytes2string, string2bytesHex,
   ipAndPortToBytes, bytesToIpAndPort, createMessageId, decodeMessageId,
   currentTimeMillis, isBlank, getPid, getHostIp,
 };

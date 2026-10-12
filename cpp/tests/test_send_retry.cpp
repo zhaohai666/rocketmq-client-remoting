@@ -966,7 +966,7 @@ void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
 // 服务端按码归类（proxy `AbstractRemotingActivity:69` 与 auth
 // `DefaultAuthorizationContextBuilder:230-240` 都把 310/320 列在同一个 case 里）。
 // 所以两个都要取证：只对齐码不对齐 `m`，批量 body 会被按单条解析。
-void testSendRequestCodeFollowsJava(MockEndpoint& mock) {
+void testSendRequestCodeMatchesProtocol(MockEndpoint& mock) {
     const std::string topic = "SendRetryCodeBranch";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
 
@@ -1307,7 +1307,7 @@ int main() {
     runCase("faultItemFlags", mock, testFaultItemFlags);
     runCase("unitModeReachesWire", mock, testUnitModeReachesWire);
     runCase("sendHeaderFieldsReachWire", mock, testSendHeaderFieldsReachWire);
-    runCase("sendRequestCodeFollowsJava", mock, testSendRequestCodeFollowsJava);
+    runCase("sendRequestCodeMatchesProtocol", mock, testSendRequestCodeMatchesProtocol);
     runCase("requestHooksReachWire", mock, testRequestHooksReachWire);
     runCase("pinnedTopicGuard", mock, testPinnedTopicGuard);
 

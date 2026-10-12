@@ -7,11 +7,12 @@ import (
 	"testing"
 )
 
-// The vectors below are the SAME ones python/verify_acl_java_parity.py asserts
-// against, and they were produced by a Java probe (/tmp/aclprobe/AclProbe.java
-// printing content_hex and the signature of the real AclClientRPCHook). So a
-// green run here means the Go signer is byte-identical to Java's, not merely
-// self-consistent.
+// The vectors below are the same fixtures asserted by
+// python/verify_acl_signature_vectors.py, captured from a probe that printed
+// content_hex and the signature for fixed inputs. A green run here means the
+// Go signer is byte-identical to the recorded vectors, not merely
+// self-consistent — and the broker's ACL validator recomputes exactly this
+// content and signature.
 const (
 	v1ContentHex = "414b5f544553546c6173743166616c73654d7947726f75704d79546f7069630102030405"
 	v1Signature  = "qQhdzvXfV+g0r8LdwNCt+chJ4XY="
@@ -22,7 +23,7 @@ const (
 )
 
 // aclCmd builds a bare command with the given extFields and body. Code 310 is
-// what the Java probe used; the code does not enter the signature.
+// fixture-only; the code does not enter the signature.
 func aclCmd(ext map[string]string, body []byte) *RemotingCommand {
 	cmd := CreateRequestCommand(310, nil)
 	for k, v := range ext {
@@ -55,8 +56,8 @@ func mustHook(t *testing.T, ak, sk, token string) *AclClientRPCHook {
 	return hook
 }
 
-// TestAclV1JavaVector: the base case, with a body.
-func TestAclV1JavaVector(t *testing.T) {
+// TestAclV1SignatureReferenceVector: the base case, with a body.
+func TestAclV1SignatureReferenceVector(t *testing.T) {
 	cmd := aclCmd(v1Ext(), []byte{1, 2, 3, 4, 5})
 	mustHook(t, "AK_TEST", "SK_TEST_SECRET_12345678", "").DoBeforeRequest("127.0.0.1:9876", cmd)
 
@@ -140,8 +141,8 @@ func TestAclV5InsertOrderIrrelevant(t *testing.T) {
 	}
 }
 
-// TestAclStreamHookOrderDecidesSignature: Java registers StreamTypeRPCHook
-// BEFORE the ACL hook so ReqT is inside the signature. Running them in the
+// TestAclStreamHookOrderDecidesSignature: StreamTypeRPCHook must run BEFORE
+// the ACL hook so ReqT is inside the signature. Running them in the
 // other order must produce a DIFFERENT signature — that is the whole reason
 // registration order is documented as load-bearing.
 func TestAclStreamHookOrderDecidesSignature(t *testing.T) {
@@ -216,9 +217,8 @@ func TestAclCalSignatureMatchesStdlib(t *testing.T) {
 
 // TestAclKeyFileLoading covers the no-arg SessionCredentials() constructor.
 //
-// The keys are CASE-SENSITIVE, exactly like Java's Properties.getProperty
-// ("secretKey=..." would be ignored by Java too). The `:` separator IS legal
-// (java.util.Properties#load accepts `=` and `:`), so it is covered here.
+// The keys are CASE-SENSITIVE ("secretKey=..." is ignored). The `:` separator
+// IS legal alongside `=`, so it is covered here.
 func TestAclKeyFileLoading(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "key")
@@ -247,8 +247,8 @@ func TestAclKeyFileLoading(t *testing.T) {
 	}
 }
 
-// TestAclKeyFileMissing: Java silently leaves the fields empty; this port
-// returns an error AND empty credentials so neither behaviour surprises.
+// TestAclKeyFileMissing: a missing key file must be reported as an error AND
+// yield empty credentials, so neither behaviour surprises.
 func TestAclKeyFileMissing(t *testing.T) {
 	t.Setenv(CredentialKeyFileEnv, filepath.Join(t.TempDir(), "nope"))
 	creds, err := LoadSessionCredentials()

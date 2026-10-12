@@ -19,19 +19,19 @@ import (
 //	                                  '' / OFF / NONE disables the file sink; a value
 //	                                  containing a path separator is used as a full path)
 //	ROCKETMQ_CLIENT_LOG_USE_STDOUT    any non-empty value -> stdout instead of file
-//	ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE    per-file cap in bytes (default 64MB, Java's
-//	                                  logback <maxFileSize>64MB</maxFileSize>; 0 disables rotation)
-//	ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX  backups kept (default 10, Java's
-//	                                  rocketmq.log.file.maxIndex; 0 keeps none)
+//	ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE    per-file cap in bytes (default 64MB;
+//	                                  0 disables rotation)
+//	ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX  backups kept (default 10; 0 keeps none)
 //
-// Two deliberate choices, both shared with the C#/C++/Node/PHP ports:
-//   - the file name is NOT Java's `rocketmq_client.log`: a JVM client on the same
-//     machine would interleave its lines into the same file, and whichever side
-//     rolls first renames the file out from under the other's open fd, after which
-//     the other writes silently into an unlinked inode;
+// Two deliberate choices:
+//   - the file name is rocketmq_go_client.log, not the language-neutral
+//     rocketmq_client.log: any other client process on the same machine using
+//     the neutral name would interleave its lines into the same file, and
+//     whichever side rolls first renames the file out from under the other's
+//     open fd, after which the other writes silently into an unlinked inode;
 //   - rotation is SIZE based with a fixed backup window (`<file>.1` … `<file>.N`),
 //     because an unbounded single log file in a long-lived producer is a disk-full
-//     hazard. Backups are not gzipped (Java archives into other_days/*.gz).
+//     hazard. Backups are kept plain, not gzipped.
 type LogLevel int
 
 const (
@@ -62,8 +62,8 @@ const LoggerName = "rocketmq.client"
 
 const (
 	defaultLogFile     = "rocketmq_go_client.log"
-	defaultLogMaxSize  = 64 * 1024 * 1024 // Java logback <maxFileSize>64MB</maxFileSize>
-	defaultLogMaxIndex = 10               // Java rocketmq.log.file.maxIndex
+	defaultLogMaxSize  = 64 * 1024 * 1024 // per-file rotation cap
+	defaultLogMaxIndex = 10               // backups kept
 )
 
 var (

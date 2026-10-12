@@ -1,6 +1,5 @@
-// DefaultMQProducer — the client-side send API (Java
-// org.apache.rocketmq.client.producer.DefaultMQProducer /
-// Python rocketmq.client.producer.DefaultMQProducer).
+// DefaultMQProducer — the client-side send API over the classic remoting
+// protocol.
 //
 // Scope of this file: lifecycle, the six send paths (sync, to-queue, batch,
 // oneway, selector, transaction) plus the retry/fault-avoidance loop, the send
@@ -21,7 +20,7 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// Java DefaultMQProducer defaults.
+// Producer defaults.
 const (
 	DefaultSendMsgTimeout             = int64(3000)
 	DefaultCompressMsgBodyOverHowmuch = 1024 * 4
@@ -32,17 +31,16 @@ const (
 	defaultPollNameServerInterval     = int64(30_000)
 )
 
-// Pinned-send topic guards (Java DefaultMQProducerImpl:1234-1236 sync,
-// :1277-1278 async — deliberately two different texts).
+// Pinned-send topic guards — the sync and async paths reject the same mistake
+// with two different fixed texts; callers may match on them.
 const (
 	pinnedTopicMismatchSync  = "message's topic not equal mq's topic"
 	pinnedTopicMismatchAsync = "Topic of the message does not match its target message queue"
 )
 
 // delayProperties are the delay/timer property keys a transactional message
-// may not carry (Java DefaultMQProducerImpl.ensureNotDelayedForTransactional
-// :1511-1518, four keys). The 5.x TIMER_* aliases are real constants now, so
-// this list is Java's verbatim rather than a two-entry stand-in.
+// may not carry — four keys: DELAY plus the three 5.x TIMER_* aliases, which
+// are real protocol constants now, so the list covers them all.
 var delayProperties = []string{
 	common.PropertyDelayTimeLevel, // "DELAY"
 	common.PropertyTimerDelayMs,   // "TIMER_DELAY_MS"
@@ -51,7 +49,7 @@ var delayProperties = []string{
 }
 
 // delayClassProperties are the keys that make a SendMessageContext classify as
-// DelayMsg (Java sendKernelImpl:983-987). Deliberately a SUPERSET of
+// DelayMsg. Deliberately a SUPERSET of
 // delayProperties: the literal "__STARTDELIVERTIME" is a delay marker for the
 // trace but not something ensureNotDelayedForTransactional rejects, and
 // foldering the two lists into one would silently change both behaviours.
@@ -65,27 +63,26 @@ var delayClassProperties = []string{
 
 // ---------------------------------------------------------------- selectors
 
-// MessageQueueSelector mirrors Java MessageQueueSelector / Python
-// MessageQueueSelector.
+// MessageQueueSelector picks the queue a message is sent to.
 type MessageQueueSelector interface {
 	Select(mqs []common.MessageQueue, msg *common.Message, arg any) (common.MessageQueue, error)
 }
 
-// SelectMessageQueueByHash picks by arg's hash (Java SelectMessageQueueByHash).
+// SelectMessageQueueByHash picks by arg's hash (String.hashCode semantics:
+// polynomial-31 over the string's UTF-16 code units).
 //
-// Python uses the builtin hash(arg), whose string hash changes with
-// PYTHONHASHSEED and is not reproducible across processes. Like the Rust, C++
-// and C# ports this uses Java String.hashCode semantics instead —
-// deterministic, which is the point of a sharding key.
+// The hash must be reproducible across processes — that is the point of a
+// sharding key — so it is computed explicitly instead of relying on any
+// per-process randomised builtin hash.
 type SelectMessageQueueByHash struct{}
 
 func (SelectMessageQueueByHash) Select(mqs []common.MessageQueue, _ *common.Message, arg any) (common.MessageQueue, error) {
 	if len(mqs) == 0 {
 		return common.MessageQueue{}, common.ClientError("no message queue")
 	}
-	hash := common.JavaStringHash(fmt.Sprintf("%v", arg))
-	// Java's Math.abs(Integer.MIN_VALUE) is still negative; collapse it to 0
-	// explicitly (the C++ port does the same).
+	hash := common.StringHash31(fmt.Sprintf("%v", arg))
+	// Math.abs(Integer.MIN_VALUE) is still negative in 32-bit int arithmetic;
+	// collapse it to 0 explicitly.
 	var idx int
 	if hash < 0 {
 		if hash == -1<<31 {
@@ -128,8 +125,8 @@ func (SelectMessageQueueByMachineRoom) Select(mqs []common.MessageQueue, _ *comm
 
 // ---------------------------------------------------------------- callbacks
 
-// SendCallback mirrors Java SendCallback. OnSuccess and OnException are
-// mutually exclusive and each fires exactly once.
+// SendCallback receives the outcome of an async send. OnSuccess and OnException
+// are mutually exclusive and each fires exactly once.
 type SendCallback interface {
 	OnSuccess(result *SendResult)
 	OnException(err error)
@@ -155,8 +152,7 @@ func (c SendCallbackFunc) OnException(err error) {
 
 // ---------------------------------------------------------------- send hooks
 
-// RegisterSendMessageHook appends a send hook (Java
-// DefaultMQProducerImpl.registerSendMessageHook:225-231).
+// RegisterSendMessageHook appends a send hook, run before/after every send.
 func (p *DefaultMQProducer) RegisterSendMessageHook(hook SendMessageHook) {
 	if hook == nil {
 		return
@@ -174,8 +170,7 @@ func (p *DefaultMQProducer) HasSendMessageHook() bool {
 	return len(p.sendMessageHooks) > 0
 }
 
-// RegisterCheckForbiddenHook appends a pre-send interceptor (Java
-// registerCheckForbiddenHook:182-190).
+// RegisterCheckForbiddenHook appends a pre-send interceptor.
 func (p *DefaultMQProducer) RegisterCheckForbiddenHook(hook CheckForbiddenHook) {
 	if hook == nil {
 		return
@@ -192,8 +187,7 @@ func (p *DefaultMQProducer) HasCheckForbiddenHook() bool {
 	return len(p.checkForbiddenHooks) > 0
 }
 
-// RegisterEndTransactionHook appends an end-transaction hook (Java
-// registerEndTransactionHook:233-236).
+// RegisterEndTransactionHook appends an end-transaction hook.
 func (p *DefaultMQProducer) RegisterEndTransactionHook(hook EndTransactionHook) {
 	if hook == nil {
 		return
@@ -210,7 +204,7 @@ func (p *DefaultMQProducer) HasEndTransactionHook() bool {
 	return len(p.endTransactionHooks) > 0
 }
 
-// hasSendInterceptors is Java _hasSendInterceptors: either hook family forces
+// hasSendInterceptors reports whether either hook family forces
 // the send kernel down the "build a context" path.
 func (p *DefaultMQProducer) hasSendInterceptors() bool {
 	p.mu.Lock()
@@ -237,8 +231,8 @@ func (p *DefaultMQProducer) setCheckExecutor(svc ExecutorService) {
 	p.mu.Unlock()
 }
 
-// setCheckListenerFn installs the Java DefaultMQProducerImpl.getCheckListener
-// equivalent. TransactionMQProducer points it at its own TransactionListener
+// setCheckListenerFn installs the resolver for the check-back listener.
+// TransactionMQProducer points it at its own TransactionListener
 // field so a wrapper's listener answers check-backs even before any send.
 func (p *DefaultMQProducer) setCheckListenerFn(fn func() TransactionListener) {
 	p.mu.Lock()
@@ -253,11 +247,12 @@ func (p *DefaultMQProducer) CheckExecutor() ExecutorService {
 	return p.checkExecutor
 }
 
-// buildSendContext mirrors Java DefaultMQProducerImpl.sendKernelImpl:968-991.
+// buildSendContext assembles the SendMessageContext for one attempt.
 //
 // The msgType derivation is deliberately a two-step override, not an
 // else-if: a transactional message that also carries a delay property ends up
-// as DelayMsg, because the delay branch is a separate `if` in Java.
+// as DelayMsg, because the delay classification is a separate `if` that
+// overrides the transaction one.
 func (p *DefaultMQProducer) buildSendContext(msg *common.Message, mq common.MessageQueue,
 	brokerAddr string, mode CommunicationMode) *SendMessageContext {
 
@@ -284,10 +279,10 @@ func (p *DefaultMQProducer) buildSendContext(msg *common.Message, mq common.Mess
 	return ctx
 }
 
-// checkForbidden runs the pre-send interceptors. Java only populates the
-// context fields listed at sendKernelImpl:957-964, and — despite the field
-// existing on CheckForbiddenContext — it never sets `arg`, not even on the
-// selector path (sendSelectImpl passes it to select(), not to sendKernelImpl).
+// checkForbidden runs the pre-send interceptors. Only the fields above are
+// populated — and despite the field existing on CheckForbiddenContext, `arg`
+// is never set, not even on the
+// selector path (it is consumed by Select itself, not passed down).
 // Arg therefore stays nil here too; the field is kept so an implementation can
 // read it if a caller ever wires it up.
 func (p *DefaultMQProducer) checkForbidden(hooks []CheckForbiddenHook,
@@ -309,7 +304,7 @@ func (p *DefaultMQProducer) checkForbidden(hooks []CheckForbiddenHook,
 	return executeCheckForbiddenHooks(hooks, ctx)
 }
 
-// doExecuteEndTransactionHook mirrors Java doExecuteEndTransactionHook:1194 —
+// doExecuteEndTransactionHook fires the end-transaction hooks:
 // the hook fires whether the endTransaction came from the caller or from the
 // broker's check-back, and `fromTransactionCheck` is the only thing that tells
 // the two apart.
@@ -337,8 +332,7 @@ func (p *DefaultMQProducer) doExecuteEndTransactionHook(hooks []EndTransactionHo
 
 // ---------------------------------------------------------------- transaction
 
-// TransactionListener mirrors Java TransactionListener / Python
-// TransactionListener.
+// TransactionListener drives the two phases of a transactional message.
 //
 // ExecuteLocalTransaction runs once, right after the half message was accepted
 // (only on SEND_OK). CheckLocalTransaction runs whenever the broker checks the
@@ -352,7 +346,7 @@ type TransactionListener interface {
 
 // ---------------------------------------------------------------- producer
 
-// DefaultMQProducer mirrors Java DefaultMQProducer.
+// DefaultMQProducer is the producer facade: lifecycle plus all send paths.
 type DefaultMQProducer struct {
 	mu sync.Mutex
 
@@ -385,38 +379,34 @@ type DefaultMQProducer struct {
 	tlsEnable          *bool
 	pollNameServerIntv int64
 
-	// sendMessageWithVIPChannel is Java DefaultMQProducer.sendMessageWithVIPChannel
+	// sendMessageWithVIPChannel
 	// (default false): when set, the SEND rpcs go to the VIP port (broker port-2).
 	sendMessageWithVIPChannel bool
 
 	sendLatencyFaultEnable bool
 	faultStrategy          *mqFaultStrategy
 
-	// Client-side trace (Java DefaultMQProducer.enableTrace /
-	// DefaultMQProducerImpl.traceDispatcher). The dispatcher is built and
+	// Client-side trace. The dispatcher is built and
 	// started by Start and flushed by Shutdown.
 	enableTrace      bool
 	traceMsgBatchNum int
 	traceTopic       string
 	traceDispatcher  *AsyncTraceDispatcher
 	// enableTraceContext is the W3C traceparent passthrough switch; it is
-	// independent of enableTrace (Java delegates this to an external
-	// OTel/SkyWalking hook) and defaults from ROCKETMQ_TRACE_CONTEXT_ENABLE.
+	// independent of enableTrace and defaults from ROCKETMQ_TRACE_CONTEXT_ENABLE.
 	enableTraceContext bool
 
 	mqClient *Instance
 	started  bool
 
 	transactionListener TransactionListener
-	// checkListenerFn supplies the check-back listener, mirroring Java
-	// DefaultMQProducerImpl.getCheckListener(). TransactionMQProducer points it
+	// checkListenerFn supplies the check-back listener. TransactionMQProducer points it
 	// at its own field (a wrapper's listener must be honoured even before any
 	// send); a plain producer leaves it nil and falls back to whatever
 	// SendMessageInTransaction stored.
 	checkListenerFn func() TransactionListener
 
-	// Send-side hook lists (Java DefaultMQProducerImpl:108-117). Registration
-	// is not documented as thread-safe in Java either, but the send paths read
+	// Send-side hook lists. Registration is not documented as thread-safe, but the send paths read
 	// them from arbitrary goroutines, so they live behind p.mu like the rest of
 	// the mutable state.
 	sendMessageHooks    []SendMessageHook
@@ -424,16 +414,16 @@ type DefaultMQProducer struct {
 	endTransactionHooks []EndTransactionHook
 
 	// checkExecutor is the pool the broker's CHECK_TRANSACTION_STATE check-backs
-	// run on (Java DefaultMQProducerImpl.checkExecutor). Nil on a plain
+	// run on. Nil on a plain
 	// DefaultMQProducer — and on a TransactionMQProducer that has not started —
 	// in which case the check-back falls back to a bare goroutine.
 	checkExecutor ExecutorService
 
-	// ---- async send (Java DefaultMQProducer:139-181, DefaultMQProducerImpl:132-153) ----
+	// ---- async send ----
 	//
 	// These scalars are read from the sender and callback goroutines while a
-	// user may be retuning them — Java documents
-	// setBackPressureForAsyncSendNum as a RUNTIME knob — so they are atomics
+	// user may be retuning them — the back-pressure knobs are RUNTIME knobs —
+	// so they are atomics
 	// rather than p.mu-guarded fields.
 	enableBackpressureForAsyncMode atomic.Bool
 	backPressureForAsyncSendNum    atomic.Int64
@@ -443,9 +433,9 @@ type DefaultMQProducer struct {
 	callbackExecutorThreads        atomic.Int64
 
 	// The two back-pressure semaphores are built once by initAsyncConfig and
-	// never replaced: Java swaps the whole Semaphore object when resizing (which
-	// is why its setter sits behind a ReadWriteCASLock), whereas setTotalPermits
-	// shifts the total in place. Observably identical, no read-write lock needed.
+	// never replaced: resizing shifts the total permits IN PLACE (setTotalPermits
+	// semantics), which is observably identical to swapping the whole semaphore
+	// object — so no read-write lock is needed here.
 	semaphoreAsyncSendNum  *fairSemaphore
 	semaphoreAsyncSendSize *fairSemaphore
 
@@ -458,7 +448,7 @@ type DefaultMQProducer struct {
 	heartbeatRunning        atomic.Bool
 }
 
-// NewDefaultMQProducer validates the group and applies the Java defaults.
+// NewDefaultMQProducer validates the group and applies the SDK defaults.
 func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 	if common.IsBlank(producerGroup) {
 		return nil, common.ClientError("producerGroup is empty")
@@ -481,7 +471,7 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		traceMsgBatchNum:        defaultTraceMsgBatchNum,
 		enableTraceContext:      TraceContextEnabledFromEnv(),
 		retryResponseCodes: map[int32]struct{}{
-			// Java DefaultMQProducerImpl.RetryResponseCodes: only these codes
+			// RetryResponseCodes: only these codes
 			// are worth trying on another broker. Anything else (e.g.
 			// MESSAGE_ILLEGAL) would fail identically everywhere, so it must be
 			// surfaced as-is instead of burning the retry budget.
@@ -496,8 +486,8 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		},
 	}
 	p.faultStrategy = newMQFaultStrategy(false)
-	// Back-pressure semaphores and the async knobs. Java builds the semaphores
-	// in the DefaultMQProducerImpl constructor; the two async EXECUTORS are built
+	// Back-pressure semaphores and the async knobs: the semaphores are built
+	// right here, at construction; the two async EXECUTORS are built
 	// later, in Start.
 	p.initAsyncConfig()
 	return p, nil
@@ -559,7 +549,7 @@ func (p *DefaultMQProducer) SetCompressType(t int32)             { p.compressTyp
 func (p *DefaultMQProducer) SetCreateTopicKey(key string)        { p.createTopicKey = key }
 func (p *DefaultMQProducer) SetDefaultTopicQueueNums(n int32)    { p.defaultTopicQueueNums = n }
 
-// SetSendMessageWithVIPChannel is Java DefaultMQProducer.setSendMessageWithVIPChannel:
+// SetSendMessageWithVIPChannel:
 // when set, the send rpcs target the broker's VIP port (listen port - 2,
 // common.BrokerVIPChannel). Off by default — a cluster without the VIP listener
 // would make every send time out on a dead port.
@@ -570,8 +560,8 @@ func (p *DefaultMQProducer) SetSendMessageWithVIPChannel(enable bool) {
 // IsSendMessageWithVIPChannel reports the current VIP-channel switch.
 func (p *DefaultMQProducer) IsSendMessageWithVIPChannel() bool { return p.sendMessageWithVIPChannel }
 
-// sendAddr applies the VIP-channel rewrite to a resolved publish address
-// (Java MQClientAPIImpl wraps every send invoke with MixAll.brokerVIPChannel).
+// sendAddr applies the VIP-channel rewrite to a resolved publish address;
+// every send invoke goes through it.
 func (p *DefaultMQProducer) sendAddr(addr string) string {
 	if p.sendMessageWithVIPChannel {
 		return common.BrokerVIPChannel(true, addr)
@@ -579,8 +569,8 @@ func (p *DefaultMQProducer) sendAddr(addr string) string {
 	return addr
 }
 
-// SetSendLatencyFaultEnable toggles the fault strategy. Java allows flipping it
-// at runtime, so it is not a start-time-only setting.
+// SetSendLatencyFaultEnable toggles the fault strategy. It can be flipped at
+// runtime, so it is not a start-time-only setting.
 func (p *DefaultMQProducer) SetSendLatencyFaultEnable(enable bool) {
 	p.faultStrategy.SetSendLatencyFaultEnable(enable)
 }
@@ -591,16 +581,16 @@ func (p *DefaultMQProducer) IsSendLatencyFaultEnable() bool {
 
 // ---------------------------------------------------------------- trace
 
-// SetEnableTrace turns on message tracing (Java setEnableTrace): Start then
+// SetEnableTrace turns on message tracing: Start then
 // brings up an AsyncTraceDispatcher in PRODUCE mode whose SendMessageTraceHook
 // records every send. Off by default.
 func (p *DefaultMQProducer) SetEnableTrace(enable bool) { p.enableTrace = enable }
 
-// IsEnableTrace is Java isEnableTrace.
+// IsEnableTrace reports the tracing switch.
 func (p *DefaultMQProducer) IsEnableTrace() bool { return p.enableTrace }
 
-// SetTraceMsgBatchNum sets how many trace records are batched before a flush
-// (Java setTraceMsgBatchNum; the dispatcher caps it at 20).
+// SetTraceMsgBatchNum sets how many trace records are batched before a flush;
+// the dispatcher caps it at 20.
 func (p *DefaultMQProducer) SetTraceMsgBatchNum(n int) { p.traceMsgBatchNum = n }
 
 // SetTraceTopic overrides the trace topic (default common.TraceTopic).
@@ -626,7 +616,7 @@ func (p *DefaultMQProducer) IsRetryResponseCode(code int32) bool {
 	return ok
 }
 
-// SetNameServerAddr replaces the nameserver list. The Java form is a
+// SetNameServerAddr replaces the nameserver list. The address list is a
 // semicolon-separated string; empty entries are dropped.
 func (p *DefaultMQProducer) SetNameServerAddr(addrs string) {
 	p.nameServerAddrs = splitNamesrvAddr(addrs)
@@ -637,7 +627,7 @@ func (p *DefaultMQProducer) SetNameServerAddresses(addrs []string) {
 	p.nameServerAddrs = append([]string(nil), addrs...)
 }
 
-// splitNamesrvAddr mirrors Java's parsing: split on ';' and trim.
+// splitNamesrvAddr parses the address-list form: split on ';' and trim.
 func splitNamesrvAddr(addrs string) []string {
 	var out []string
 	for _, part := range strings.Split(addrs, ";") {
@@ -651,9 +641,9 @@ func splitNamesrvAddr(addrs string) []string {
 
 // ---------------------------------------------------------------- lifecycle
 
-// Start mirrors Java DefaultMQProducerImpl.start: validate the group (after
-// namespacing), build the clientId, bring up the shared client instance, then
-// register the producer group and start the heartbeat thread.
+// Start validates the group (after
+// namespacing), builds the clientId, brings up the shared client instance, then
+// registers the producer group and starts the heartbeat thread.
 //
 // The heartbeat is NOT cosmetic: the broker's transaction check-back looks the
 // producer group up in its channel table, which is filled from these
@@ -664,8 +654,8 @@ func (p *DefaultMQProducer) Start() error {
 	if err != nil || !started {
 		return err
 	}
-	// The trace dispatcher starts outside the lock, the way Java's
-	// DefaultMQProducer.start:380-405 runs after impl.start(): it creates and
+	// The trace dispatcher starts outside the lock, AFTER the producer core is
+	// up: it creates and
 	// starts an internal producer of its own (a network operation) and registers
 	// its hooks through RegisterSendMessageHook, which takes p.mu.
 	p.startTraceDispatcher()
@@ -680,8 +670,8 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	if p.started {
 		return false, nil
 	}
-	// Java DefaultMQProducer.start:375 setProducerGroup(withNamespace(group)) —
-	// the broker registers the PREFIXED group name. checkConfig runs after it.
+	// The broker registers the NAMESPACED (PREFIXED) producer group name —
+	// checkConfig runs after this rewrite.
 	if p.namespace != "" {
 		p.producerGroup = common.WrapNamespace(p.namespace, p.producerGroup)
 	}
@@ -693,13 +683,14 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 			"producerGroup can not equal %s, please specify another one.", common.DefaultProducerGroup))
 	}
 	if len(p.nameServerAddrs) == 0 {
-		// Java only reports this on the first send (as 10004); surfacing it
+		// The protocol surfaces a missing nameserver on the first send (as
+		// 10004); reporting it
 		// here is more predictable, but must use the SAME code so callers do
 		// not have to handle two different values for one failure.
 		return false, common.ClientErrorCode(common.NoNameServerException, "name server address is not set")
 	}
-	// Java defaultMQProducerImpl.start:250-252: changeInstanceNameToPID then
-	// buildMQClientId. The instance name is written back in place, so a second
+	// Start first converts the instance name to the PID, then builds the
+	// clientId. The instance name is written back in place, so a second
 	// Start() reuses the same clientId instead of minting a new one.
 	p.instanceName = common.ChangeInstanceNameToPID(p.instanceName)
 	if p.clientID == "" {
@@ -711,8 +702,8 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	}
 	cfg.PollNameServerIntervalMillis = p.pollNameServerIntv
 	inst := CreateOrGetInstance(p.clientID, p.nameServerAddrs, cfg)
-	// Namespace + stream + user(ACL) + zone, in Java's order and only once per
-	// instance — the signature has to cover exactly the fields Java signs.
+	// Namespace + stream + user(ACL) + zone, composed in a fixed order and only
+	// once per instance — the signature has to cover exactly these fields.
 	inst.EnsureRPCHooks(p.namespaceV2, p.enableStreamRequestType, p.rpcHook)
 	if err := inst.Start(); err != nil {
 		return false, err
@@ -727,12 +718,13 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	//
 	// NOTE: the transport keeps ONE processor per request code, so two producers
 	// sharing a clientId (same instanceName) would have the second one clobber
-	// the first. Java sidesteps this with a single ClientRemotingProcessor that
-	// dispatches by group; the Python port has the same limitation. Producers
+	// the first. (A single processor that dispatches by group would avoid this,
+	// but this port registers per producer.)
+	// Producers
 	// started without SetInstanceName get a unique clientId each, so the
 	// default configuration is unaffected.
 	inst.Remoting().RegisterProcessor(remoting.ReqCheckTransactionState, p.handleCheckTransactionState)
-	// Java start():257 registerProducer — the factory's shutdown guard needs it.
+	// Register with the client instance — the factory's shutdown guard needs it.
 	inst.RegisterProducer(p.producerGroup)
 	for _, topic := range p.topics {
 		inst.RegisterTopicInUse(topic)
@@ -748,7 +740,7 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	return true, nil
 }
 
-// startTraceDispatcher is Java DefaultMQProducer.start:380-405: with
+// startTraceDispatcher: with
 // enableTrace on, build a PRODUCE dispatcher, register its send and
 // end-transaction hooks, then start it. Failures only log — a broken trace
 // stack must never take the producer down.
@@ -779,7 +771,8 @@ func (p *DefaultMQProducer) startTraceDispatcher() {
 	}
 }
 
-// Shutdown mirrors Java DefaultMQProducerImpl.shutdown.
+// Shutdown stops the producer, unregisters the group and releases the client
+// instance.
 func (p *DefaultMQProducer) Shutdown() {
 	// Drain the async executors FIRST, and deliberately without p.mu held:
 	// draining waits for in-flight tasks, and those take p.mu themselves
@@ -802,7 +795,7 @@ func (p *DefaultMQProducer) Shutdown() {
 		// which the broker still considers the group connected — and would pick
 		// this dead channel for a transaction check-back.
 		p.mqClient.UnregisterClientAllBrokers(p.producerGroup, "")
-		// Ordering as in Java: unregisterProducer, then shutdown the factory.
+		// Order matters: unregisterProducer first, then shut the factory down.
 		p.mqClient.UnregisterProducer(p.producerGroup)
 		p.mqClient.Shutdown()
 		p.mqClient.DetachFromRegistryIfLastTenant()
@@ -815,15 +808,15 @@ func (p *DefaultMQProducer) Shutdown() {
 
 	// The trace dispatcher goes last, outside the lock: it must flush what is
 	// still queued and wait for it, and it sends through its OWN internal
-	// producer (unaffected by the host instance having just shut down). Java
-	// orders it the same way — impl.shutdown(), then the dispatcher.
+	// producer (unaffected by the host instance having just shut down) — so it
+	// is torn down only after the host producer is fully shut down.
 	if dispatcher != nil {
 		dispatcher.Shutdown()
 	}
 }
 
 // heartbeatLoop periodically advertises this producer group to every broker
-// (Java ProducerData registration).
+// via a ProducerData heartbeat.
 func (p *DefaultMQProducer) heartbeatLoop() {
 	interval := p.heartbeatIntervalMillis
 	if interval <= 0 {
@@ -877,13 +870,13 @@ func (p *DefaultMQProducer) requireClient() (*Instance, error) {
 	return p.mqClient, nil
 }
 
-// checkMessage mirrors Java Validators.checkMessage(msg, this) — purely local,
+// checkMessage runs the local message validation — purely local,
 // runs before any network I/O.
 func (p *DefaultMQProducer) checkMessage(msg *common.Message) error {
 	return common.CheckMessage(msg, p.maxMessageSize)
 }
 
-// withNamespace mirrors Java ClientConfig.withNamespace.
+// withNamespace prefixes the configured namespace onto a topic name.
 func (p *DefaultMQProducer) withNamespace(topic string) string {
 	if p.namespace == "" {
 		return topic
@@ -891,8 +884,8 @@ func (p *DefaultMQProducer) withNamespace(topic string) string {
 	return common.WrapNamespace(p.namespace, topic)
 }
 
-// validateNameServerSetting mirrors Java
-// DefaultMQProducerImpl.validateNameServerSetting. It only runs on the
+// validateNameServerSetting separates a missing nameserver from a missing
+// route. It only runs on the
 // "no route" branch, to separate two very different failures:
 //   - no nameserver address at all (including "address server configured but
 //     returned nothing") -> 10004;
@@ -909,8 +902,8 @@ func (p *DefaultMQProducer) validateNameServerSetting() error {
 	return nil
 }
 
-// topicPublishInfo mirrors Java DefaultMQProducerImpl.tryToFindTopicPublishInfo:
-// fetch the REAL route first, and only when that genuinely fails (a brand new
+// topicPublishInfo
+// fetches the REAL route first, and only when that genuinely fails (a brand new
 // topic not yet registered on the nameserver) fall back to the default topic
 // (TBW102) to synthesize publish info. Consumers deliberately do NOT do this
 // fallback.
@@ -934,10 +927,9 @@ func (p *DefaultMQProducer) topicPublishInfo(topic string) (*TopicPublishInfo, e
 	return nil, err
 }
 
-// checkPinnedTopic mirrors Java DefaultMQProducerImpl:1234-1236 (sync) /
-// :1277-1278 (async). It compares the two names AFTER namespacing each side
-// (Java wraps the message topic and then queues the mq through
-// ClientConfig.queueWithNamespace), because wrapNamespace is idempotent.
+// checkPinnedTopic guards a send to a pinned queue. It compares the two names
+// AFTER namespacing each side (the message topic and the queue's topic are both
+// wrapped), because wrapNamespace is idempotent.
 //
 // Without this guard a message whose topic does not match its target queue is
 // still accepted: the broker writes to the queue named in the request, the
@@ -963,27 +955,22 @@ func responseCodeOf(err error) (int32, bool) {
 // tryToCompressMessage compresses msg.Body IN PLACE when it is at/over the
 // threshold and returns the sysFlag to send. 0 means "not compressed".
 //
-// Aligned with Java DefaultMQProducerImpl.tryToCompressMessage line by line:
+// Behaviour, fixed by the send kernel contract:
 //   - batch messages are NEVER compressed;
 //   - the threshold is compressMsgBodyOverHowmuch (default 4096), compared with
-//     >= (Java: body.length >= ...);
+//     >=;
 //   - a compression failure degrades to "not compressed" with a log line, it
 //     does not fail the send;
-//   - the compressed size is NOT compared against the original (Java does not
-//     either).
+//   - the compressed size is NOT compared against the original.
 //
 // Callers must invoke this ONCE, outside the retry loop, and restore the body
 // afterwards (every call site keeps prevBody and defers the restore).
 //
-// Java calls it inside sendKernelImpl, i.e. once per ATTEMPT, not once per
-// send. That is NOT a behavioural difference: sendKernelImpl captures
-// `byte[] prevBody = msg.getBody()` at :930 and its `finally` does
-// `msg.setBody(prevBody)` at :1095, so every retry re-compresses the ORIGINAL
-// body. Compressing once here and restoring at the end yields byte-identical
-// payloads and sysFlag, and skips the redundant recompression of a body that
-// is already compressed. (An earlier version of this comment claimed Java
-// double-compressed into zlib(zlib(x)) on retry — it does not; the finally
-// block prevents it.)
+// The reference send kernel compresses once per ATTEMPT, capturing the original
+// body and restoring it in a `finally`, so every retry re-compresses the
+// ORIGINAL body. Compressing once here and restoring at the end yields
+// byte-identical payloads and sysFlag, and skips the redundant recompression of
+// a body that is already compressed.
 func (p *DefaultMQProducer) tryToCompressMessage(msg *common.Message, isBatch bool) int32 {
 	if isBatch {
 		return 0
@@ -1006,15 +993,15 @@ func (p *DefaultMQProducer) tryToCompressMessage(msg *common.Message, isBatch bo
 
 // ---------------------------------------------------------------- request
 
-// buildSendRequest mirrors Java MQClientAPIImpl.sendMessage +
-// DefaultMQProducerImpl.sendKernelImpl's header section.
+// buildSendRequest assembles the SEND request: the V2 compact header plus the
+// body.
 //
 // Rebuilt per attempt on purpose (broker name and queue id change on retry),
-// which is also how Java behaves — including its quirk that the %RETRY% header
+// including the quirk that the %RETRY% header
 // hoisting below only fires on the first attempt, because the source
 // properties were cleared in place.
 func (p *DefaultMQProducer) buildSendRequest(msg *common.Message, isBatch bool, mq common.MessageQueue, sysFlag int32) *remoting.RemotingCommand {
-	// Java sendKernelImpl:932-935: non-batch messages get a client-side unique
+	// Non-batch messages get a client-side unique
 	// id BEFORE the request is built. Batch messages already have per-message
 	// ids from GenerateFromList. This id becomes SendResult.msgId and is what
 	// the console uses to join the publish and consume traces.
@@ -1034,21 +1021,21 @@ func (p *DefaultMQProducer) buildSendRequest(msg *common.Message, isBatch bool, 
 		ReconsumeTimes:        i32Ptr(0),
 		UnitMode:              boolPtr(p.unitMode),
 		// maxReconsumeTimes is only sent for a %RETRY% topic carrying a
-		// MAX_RECONSUME_TIMES property (Java sendKernelImpl:1003-1018). With a
-		// client version >= V3_4_9 the broker honours this field
-		// unconditionally (AbstractSendMessageProcessor:172-179), so always
+		// MAX_RECONSUME_TIMES property. Since client version V3_4_9 the broker
+		// honours this field
+		// unconditionally, so always
 		// sending 0 makes a retry message land in %DLQ% on its very first
 		// delivery (reconsumeTimes(0) >= 0).
 		MaxReconsumeTimes: nil,
 		Batch:             boolPtr(isBatch),
-		// Java sendKernelImpl:1007 requestHeader.setBrokerName(brokerName) —
-		// the V2 extFields key is the single letter "n". Which broker this is
+		// The V2 extFields key for the broker name is the single letter "n"
+		// (compact wire header). Which broker this is
 		// comes from the selected route queue.
 		BrokerName: strPtr(mq.BrokerName),
 	}
-	// Java sendKernelImpl:1004-1018: for `%RETRY%<group>` two retry properties
+	// For `%RETRY%<group>` two retry properties
 	// must be HOISTED into the request header, because the broker's
-	// handleRetryAndDLQ (SendMessageProcessor:197-210) reads
+	// handleRetryAndDLQ reads
 	// requestHeader.reconsumeTimes / maxReconsumeTimes rather than the message
 	// properties. Missing the hoist is not an error but a SILENT misjudgement:
 	// the broker falls back to the subscription group's retryMaxTimes (16) and
@@ -1056,7 +1043,7 @@ func (p *DefaultMQProducer) buildSendRequest(msg *common.Message, isBatch bool, 
 	// circulating on the retry topic.
 	//
 	// The clear only affects this local message; the serialized properties
-	// above already captured RECONSUME_TIME. Java has the same ordering — do
+	// above already captured RECONSUME_TIME. Keep this ordering — do
 	// not "tidy" it by moving the clear earlier.
 	if strings.HasPrefix(msg.Topic, common.RetryGroupTopicPrefix) {
 		if raw, ok := msg.GetProperty(common.PropertyReconsumeTime); ok {
@@ -1076,8 +1063,8 @@ func (p *DefaultMQProducer) buildSendRequest(msg *common.Message, isBatch bool, 
 	// SEND_REPLY_MESSAGE_V2(325), not plain SEND_MESSAGE_V2(310) — the broker
 	// only registers ReplyMessageProcessor for 324/325, and that processor is
 	// what pushes the reply back to the requester by REPLY_TO_CLIENT.
-	// Batch messages go out as SEND_BATCH_MESSAGE(320); Java's test order is
-	// reply first, then batch (MQClientAPIImpl:562).
+	// Batch messages go out as SEND_BATCH_MESSAGE(320); the dispatch order is
+	// reply first, then batch.
 	var code int32
 	switch {
 	case isReplyMessage(msg):
@@ -1092,25 +1079,22 @@ func (p *DefaultMQProducer) buildSendRequest(msg *common.Message, isBatch bool, 
 	return request
 }
 
-// isReplyMessage mirrors Python is_reply_message: MSG_TYPE == "reply".
+// isReplyMessage reports MSG_TYPE == "reply".
 func isReplyMessage(msg *common.Message) bool {
 	v, ok := msg.GetProperty(common.PropertyMessageType)
 	return ok && v == common.ReplyMessageFlag
 }
 
-// processSendResponse mirrors Java MQClientAPIImpl.processSendResponse.
+// processSendResponse maps a SEND response onto a SendResult.
 //
 //   - msgId        = the client unique id (for a batch, the batch's own
-//     UNIQ_KEY; inner-batch echoes it back in batchUniqId). Deliberate
-//     divergence from Java: when the broker returns no batchUniqId (a client
-//     batch on an ordinary topic, not an inner-batch), Java substitutes the
-//     comma-joined per-message UNIQ_KEYs. This port's parsing layer only sees
-//     the one message that was sent, not the sub-message list (Rust and C++
-//     have the same limitation), and all four ports must be comparable — so
-//     the batch's own id is used uniformly. The half that matters IS aligned:
-//     every sub-message carries its own UNIQ_KEY before encoding, so the
-//     per-message ids the broker exposes to consumers and traces are identical
-//     to Java's.
+//     UNIQ_KEY; inner-batch echoes it back in batchUniqId). When the broker
+//     returns no batchUniqId (a client batch on an ordinary topic, not an
+//     inner-batch), the batch's own id is used uniformly — the send here is a
+//     single encoded batch message, so the parsing layer never sees the
+//     sub-message list to join their ids. What matters for consumers and
+//     traces: every sub-message carries its own UNIQ_KEY before encoding, so
+//     the per-message ids the broker exposes are the client's own ids.
 //   - offsetMsgId  = the header's msgId (the broker-generated offset id);
 //   - regionId     = header MSG_REGION, defaulting to DefaultRegion;
 //   - traceOn      = header TRACE_ON != "false" (the broker defaults to true).
@@ -1188,26 +1172,25 @@ func sendStatusOf(code int32) (SendStatus, bool) {
 
 // sendAttempt performs ONE attempt against a concrete queue: resolve the
 // master address, run the pre-send interceptors, build the request, invoke,
-// parse — plus the SendMessageHook before/after pair around the RPC. It is the
-// exact analogue of Java DefaultMQProducerImpl.sendKernelImpl's body
-// (:919-1097), minus the compression/sysFlag work which the caller did once
+// parse — plus the SendMessageHook before/after pair around the RPC. The
+// compression/sysFlag work is NOT here: the caller does it once
 // outside the retry chain.
 //
-// Hook ordering, straight from Java:
+// Hook ordering:
 //
 //  1. resolve brokerAddr (findBrokerAddressInPublish, master only);
 //  2. CheckForbiddenHook — error PROPAGATES, no SendMessageHook.after runs;
-//  3. SendMessageHook.before (only if a send hook is registered; Java does not
-//     even allocate a context otherwise);
+//  3. SendMessageHook.before (only if a send hook is registered; otherwise no
+//     context is even allocated);
 //  4. build the request and send;
 //  5. SendMessageHook.after with either SendResult or Exception.
 //
 // One deliberate divergence: if a forbidden hook rejects the message AND a send
-// hook is registered, Java falls into
+// hook is registered, the reference kernel would run
 //
-//	catch (...) { if (this.hasSendMessageHook()) { context.setException(e); ... } }
+//	catch (...) { if (hasSendMessageHook()) { context.setException(e); ... } }
 //
-// with `context` still null — a NullPointerException that escapes sendDefaultImpl
+// with `context` still null — a NullPointerException that escapes the send
 // entirely, because NPE is not one of the four caught types. This port skips
 // the after-hook when there is no context instead of reproducing the NPE; the
 // observable difference is that the caller gets the interceptor's error rather
@@ -1229,10 +1212,10 @@ func (p *DefaultMQProducer) sendAttempt(msg *common.Message, isBatch bool, mq co
 		return nil, err
 	}
 	// W3C traceparent passthrough (opt-in): a message without one gets a root
-	// span; a caller-propagated value is never overwritten. Java leaves this to
-	// an external OpenTelemetry/SkyWalking hook — the ports build the equivalent
-	// in, and it runs in the same position (after the forbidden hooks, before
-	// the send context is built, so the trace hook sees the property).
+	// span; a caller-propagated value is never overwritten. It runs in the same
+	// position as the external OTel/SkyWalking hooks do elsewhere (after the
+	// forbidden hooks, before the send context is built, so the trace hook sees
+	// the property).
 	if p.enableTraceContext {
 		InjectTraceContext(msg)
 	}
@@ -1270,8 +1253,8 @@ func (p *DefaultMQProducer) finishSendHook(hooks []SendMessageHook,
 	executeSendMessageHooksAfter(hooks, ctx)
 }
 
-// sendOnewayTo performs a oneway send to a concrete queue. Java routes ONEWAY
-// through the same sendKernelImpl, so the interceptors and the send hooks run
+// sendOnewayTo performs a oneway send to a concrete queue. ONEWAY shares the
+// send kernel with the sync path, so the interceptors and the send hooks run
 // exactly as for a sync send (with ONEWAY in the context).
 func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQueue, sysFlag int32) error {
 	inst, err := p.requireClient()
@@ -1279,7 +1262,7 @@ func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQ
 		return err
 	}
 	// Oneway has no response, so the address must be resolved up front; the
-	// discipline is Java sendKernelImpl's (master only).
+	// kernel resolves master only.
 	addr, err := inst.PublishAddrFor(mq.BrokerName, mq.Topic)
 	if err != nil {
 		return err
@@ -1303,8 +1286,8 @@ func (p *DefaultMQProducer) sendOnewayTo(msg *common.Message, mq common.MessageQ
 	request := p.buildSendRequest(msg, false, mq, sysFlag)
 	request.MarkOnewayRPC()
 	sendErr := inst.Remoting().InvokeOneway(p.sendAddr(addr), request)
-	// A oneway send has no SendResult, so Java's `context.setSendResult(null)`
-	// is what the after-hook sees on success.
+	// A oneway send has no SendResult, so the after-hook sees a nil result on
+	// success.
 	p.finishSendHook(sendHooks, hookCtx, nil, sendErr)
 	return sendErr
 }
@@ -1320,13 +1303,12 @@ func (p *DefaultMQProducer) updateFaultItem(brokerName string, began time.Time, 
 	p.faultStrategy.updateFaultItem(brokerName, float64(time.Since(began).Microseconds())/1000.0, isolation, reachable)
 }
 
-// sendDefaultImpl is the sync send with retry and fault avoidance (Java
-// DefaultMQProducerImpl.sendDefaultImpl). Errors are classified per type rather
-// than "retry everything".
+// sendDefaultImpl is the sync send with retry and fault avoidance.
+// Errors are classified per type rather than "retry everything".
 func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, timeoutMillis int64, sysFlag int32) (*SendResult, error) {
 	publish, err := p.topicPublishInfo(msg.Topic)
 	if err != nil {
-		// Java: an unreachable route is immediately typed as
+		// An unreachable route is immediately typed as
 		// NOT_FOUND_TOPIC_EXCEPTION rather than burning the retry budget. An
 		// error that ALREADY carries a code (10004 "no nameserver", decided in
 		// validateNameServerSetting) is passed through unchanged — rewriting it
@@ -1357,7 +1339,7 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 		lastBrokerName = selected.BrokerName
 		brokersSent = append(brokersSent, selected.BrokerName)
 
-		// Java resets beginTimestampPrev right AFTER the queue is chosen, so
+		// The attempt clock starts right AFTER the queue is chosen, so
 		// the queue-selection cost is not charged to the broker.
 		began := time.Now()
 		costTime := time.Since(beginFirst).Milliseconds()
@@ -1371,8 +1353,8 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 			curTimeout = p.sendMsgMaxTimeoutPerReq
 		}
 
-		// `result` deliberately survives a failed attempt (Java declares
-		// sendResult outside the loop): a broker that answered with a
+		// `result` deliberately survives a failed attempt: a broker that
+		// answered with a
 		// non-retryable code returns the PREVIOUS attempt's result when there
 		// was one, instead of throwing the error away.
 		attemptResult, err := p.sendAttempt(msg, isBatch, selected, sysFlag, curTimeout, CommunicationModeSync)
@@ -1380,7 +1362,7 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 		case err == nil:
 			result = attemptResult
 			p.updateFaultItem(selected.BrokerName, began, false, true)
-			// Java: only with retryAnotherBrokerWhenNotStoreOK does a non-SEND_OK
+			// Only with retryAnotherBrokerWhenNotStoreOK does a non-SEND_OK
 			// status move to another broker; otherwise the "stored, but not
 			// cleanly" result is returned as-is.
 			if result.SendStatus != SendOK && p.retryAnotherBrokerOK {
@@ -1403,13 +1385,13 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 		case common.IsKind(err, common.KindConnect), common.IsKind(err, common.KindTimeout),
 			common.IsKind(err, common.KindSendRequest), common.IsKind(err, common.KindIO):
 			// Connection refused / timeout / write failure: isolate. This port
-			// has no background reachability detector, so Java's
-			// reachable = !isStartDetectorEnable() is always true.
+			// has no background reachability detector, so the
+			// reachable flag is always true.
 			p.updateFaultItem(selected.BrokerName, began, true, true)
 			lastErr = err
 		default:
 			// Client-side problems (no queue selectable, route gone, decode
-			// failure): Java records latency only, no isolation.
+			// failure): record latency only, no isolation.
 			p.updateFaultItem(selected.BrokerName, began, false, true)
 			lastErr = err
 		}
@@ -1459,7 +1441,7 @@ func (p *DefaultMQProducer) SendWithTimeout(msg *common.Message, timeoutMillis i
 	if msg == nil {
 		return nil, common.ClientError("the message is null")
 	}
-	// Java's sendKernelImpl finally clause restores the caller's message: the
+	// The send kernel's finally semantics restore the caller's message: the
 	// body goes back to the pre-compression one and the topic loses the
 	// namespace prefix. Skipping it breaks callers that reuse the same Message:
 	// the in-place compression would compress an already-compressed stream on
@@ -1479,7 +1461,7 @@ func (p *DefaultMQProducer) SendWithTimeout(msg *common.Message, timeoutMillis i
 	return p.sendDefaultImpl(msg, false, timeoutMillis, sysFlag)
 }
 
-// SendToQueue sends a message to a PINNED queue (Java send(msg, mq, timeout)).
+// SendToQueue sends a message to a PINNED queue.
 func (p *DefaultMQProducer) SendToQueue(msg *common.Message, mq common.MessageQueue) (*SendResult, error) {
 	return p.sendToQueueWithTimeout(msg, mq, p.sendMsgTimeout)
 }
@@ -1498,7 +1480,7 @@ func (p *DefaultMQProducer) sendToQueueWithTimeout(msg *common.Message, mq commo
 	if err := p.checkMessage(msg); err != nil {
 		return nil, err
 	}
-	// Java's order: Validators -> pinned guard -> sendKernelImpl (compression
+	// Fixed order: local validation -> pinned guard -> send kernel (compression
 	// inside) -> timeout recheck. Placed before compression so a rejection
 	// leaves the caller's message untouched.
 	if err := p.checkPinnedTopic(msg.Topic, mq, pinnedTopicMismatchSync); err != nil {
@@ -1508,7 +1490,7 @@ func (p *DefaultMQProducer) sendToQueueWithTimeout(msg *common.Message, mq commo
 	return p.sendAttempt(msg, false, common.NewMessageQueue(mq.Topic, mq.BrokerName, mq.QueueID), sysFlag, timeoutMillis, CommunicationModeSync)
 }
 
-// SendBatch mirrors Java DefaultMQProducer.batch (SEND_BATCH_MESSAGE = 320).
+// SendBatch sends a batch as one SEND_BATCH_MESSAGE (request code 320) request.
 func (p *DefaultMQProducer) SendBatch(messages []*common.Message) (*SendResult, error) {
 	return p.sendBatch(messages, nil, p.sendMsgTimeout, pinnedTopicMismatchSync)
 }
@@ -1519,9 +1501,8 @@ func (p *DefaultMQProducer) SendBatchToQueue(messages []*common.Message, mq comm
 }
 
 // sendBatch is the batch kernel. pinnedMismatch is the wording for the pinned
-// queue guard: the async caller passes pinnedTopicMismatchAsync, because Java's
-// async prologue uses its own text at :1277-1278 rather than the sync one at
-// :1234-1236.
+// queue guard: the async caller passes pinnedTopicMismatchAsync, because the
+// async prologue uses its own text rather than the sync one.
 func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common.MessageQueue,
 	timeoutMillis int64, pinnedMismatch string) (*SendResult, error) {
 	if _, err := p.requireClient(); err != nil {
@@ -1530,11 +1511,11 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	if len(messages) == 0 {
 		return nil, common.ClientError("message list is empty")
 	}
-	// Java DefaultMQProducer.batch():1172-1184 — every sub-message runs
-	// Validators.checkMessage (before namespacing, on the raw topic), then gets
+	// Fixed order per the batch contract: every sub-message runs local
+	// validation (before namespacing, on the raw topic), then gets
 	// its own UNIQ_KEY, and only then is the namespace applied. The batch
-	// itself also needs a UNIQ_KEY (the broker uses it to detect an inner-batch
-	// at SendMessageProcessor:617), and encoding comes last: get the order
+	// itself also needs a UNIQ_KEY (the broker uses it to detect an inner-batch),
+	// and encoding comes last: get the order
 	// wrong and the sub-messages are serialized without ids, so every message
 	// the consumer sees lacks a client id.
 	//
@@ -1556,8 +1537,8 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	batch.Message.Body = batch.Encode()
 
 	if pinned != nil {
-		// Java routes the batch through the same sync guard as a single message
-		// (MessageBatch extends Message).
+		// The batch goes through the same sync guard as a single message (a
+		// batch IS a message for the pinned-topic check).
 		if err := p.checkPinnedTopic(batch.Message.Topic, *pinned, pinnedMismatch); err != nil {
 			return nil, err
 		}
@@ -1582,7 +1563,7 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	return p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis, CommunicationModeSync)
 }
 
-// SendOneway fires and forgets (Java sendOneway). There is no response, so the
+// SendOneway fires and forgets. There is no response, so the
 // broker address must be resolved up front; pass a nil mq to round-robin.
 func (p *DefaultMQProducer) SendOneway(msg *common.Message, mq *common.MessageQueue) error {
 	if msg == nil {
@@ -1624,18 +1605,18 @@ func (p *DefaultMQProducer) SendOneway(msg *common.Message, mq *common.MessageQu
 	return p.sendOnewayTo(msg, selected, sysFlag)
 }
 
-// SendBySelector sends via a MessageQueueSelector (Java send(msg, selector,
-// arg)). Java always sends this path through sendKernelImpl, so it retries.
+// SendBySelector sends via a MessageQueueSelector. This path always hands the
+// chosen queue straight to the send kernel.
 func (p *DefaultMQProducer) SendBySelector(msg *common.Message, selector MessageQueueSelector, arg any) (*SendResult, error) {
 	return p.SendBySelectorWithTimeout(msg, selector, arg, p.sendMsgTimeout)
 }
 
 // SendBySelectorWithTimeout is SendBySelector with an explicit timeout.
 //
-// Deliberately a SINGLE attempt to the selected queue: Java's sendSelectImpl
-// goes straight to sendKernelImpl rather than sendDefaultImpl, so the
-// round-robin/retry machinery never runs. Retrying would also defeat the point
-// of a selector (the caller chose the shard).
+// Deliberately a SINGLE attempt to the selected queue: the selector path goes
+// straight to the send kernel rather than the retry-capable default path, so
+// the round-robin/retry machinery never runs. Retrying would also defeat the
+// point of a selector (the caller chose the shard).
 func (p *DefaultMQProducer) SendBySelectorWithTimeout(msg *common.Message, selector MessageQueueSelector, arg any, timeoutMillis int64) (*SendResult, error) {
 	if msg == nil {
 		return nil, common.ClientError("the message is null")
@@ -1671,8 +1652,7 @@ func (p *DefaultMQProducer) SendBySelectorWithTimeout(msg *common.Message, selec
 
 // ---------------------------------------------------------------- transaction
 
-// SendMessageInTransaction sends a transactional (half) message. Java
-// DefaultMQProducerImpl.sendMessageInTransaction, the two phases:
+// SendMessageInTransaction sends a transactional (half) message, in phases:
 //
 //  1. half message: stamp TRAN_MSG / PGROUP, send with sysFlag
 //     TRANSACTION_PREPARED_TYPE. The broker records it in
@@ -1685,11 +1665,11 @@ func (p *DefaultMQProducer) SendBySelectorWithTimeout(msg *common.Message, selec
 //     listener.CheckLocalTransaction and then ends the transaction.
 //
 // Where the check-back's listener comes from is the one place this port is a
-// deliberate SUPERSET of Java. Java 5.x resolves it through
-// getCheckListener(), which returns null unless the producer is a
-// TransactionMQProducer — so a plain DefaultMQProducer's half messages are
-// recorded by the broker but can never be answered (it just logs "pick
-// transactionCheckListener by group[..] failed"). Here the listener handed to
+// deliberate SUPERSET of the reference behaviour. The reference API resolves
+// the check-back listener only for a TransactionMQProducer — a plain
+// DefaultMQProducer's half messages are recorded by the broker but can never
+// be answered (the check-back just logs "pick transactionCheckListener by
+// group[..] failed"). Here the listener handed to
 // this call is remembered and used for the check-back too, which makes the
 // standalone (non-TransactionMQProducer) path actually work.
 //
@@ -1707,15 +1687,15 @@ func (p *DefaultMQProducer) SendMessageInTransaction(msg *common.Message, listen
 	if _, err := p.requireClient(); err != nil {
 		return nil, err
 	}
-	// Java sendKernelImpl:930 keeps prevBody: the half message restores the
-	// caller's body as soon as it is sent, so executeLocalTransaction sees the
+	// The half message restores the caller's body as soon as it is sent, so
+	// executeLocalTransaction sees the
 	// ORIGINAL body (not the compressed stream). This cannot use a plain defer:
 	// that would restore only after the method returns, and both the listener
 	// and endTransaction would see the compressed message.
 	prevBody := msg.Body
 	msg.Topic = p.withNamespace(msg.Topic)
 
-	// Java ensureNotDelayedForTransactional: transactional messages support no
+	// Protocol constraint: transactional messages support no
 	// form of delayed delivery.
 	for _, key := range delayProperties {
 		if _, ok := msg.GetProperty(key); ok {
@@ -1753,20 +1733,20 @@ func (p *DefaultMQProducer) SendMessageInTransaction(msg *common.Message, listen
 	}
 
 	// Compression behaves as for a normal send (the transactional send goes
-	// through the same sendKernelImpl), then the transaction bits are layered
-	// on top (Java :951-953, after detecting TRAN_MSG).
+	// through the same send kernel), then the transaction bits are layered
+	// on top, once TRAN_MSG is detected.
 	sysFlag := p.tryToCompressMessage(msg, false)
 	sysFlag = common.ResetTransactionValue(sysFlag, common.MessageSysFlagTransactionPrepared)
 
-	// The half message is an ordinary SYNC send through sendKernelImpl, so the
+	// The half message is an ordinary SYNC send through the send kernel, so the
 	// interceptors and the send hooks fire with CommunicationMode.SYNC and the
 	// context classified as TransMsgHalf (TRAN_MSG=="true" is set above).
 	sendResult, sendErr := p.sendAttempt(msg, false, selected, sysFlag, p.sendMsgTimeout, CommunicationModeSync)
-	// Same point as Java's finally (sendKernelImpl:1095-1096): restored as soon
-	// as the HALF message is out, so executeLocalTransaction and endTransaction
-	// below see the original body and the un-namespaced topic (Java 5.5.1's
-	// endTransaction:1543 uses msg.getTopic()). Properties are NOT restored —
-	// Java does not restore UNIQ_KEY either.
+	// Restored as soon as the HALF message is out, so executeLocalTransaction
+	// and endTransaction below see the original body and the un-namespaced
+	// topic — endTransaction puts msg.Topic on the wire, so it must carry the
+	// caller's topic. Properties are NOT restored (the
+	// UNIQ_KEY stays on the message by design).
 	msg.Body = prevBody
 	msg.Topic = common.WithoutNamespace(msg.Topic, p.namespace)
 	if sendErr != nil {
@@ -1786,8 +1766,8 @@ func (p *DefaultMQProducer) SendMessageInTransaction(msg *common.Message, listen
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					// Java catches Exception here; a Go panic from user code is
-					// the analogue, and must not kill the process.
+					// User code here must not kill the process: a Go panic is
+					// the analogue of the caught exception, and is recovered.
 					common.LogErrorf("executeLocalTransactionBranch exception, topic=%s: %v", msg.Topic, r)
 					localException = fmt.Errorf("%v", r)
 				}
@@ -1798,7 +1778,7 @@ func (p *DefaultMQProducer) SendMessageInTransaction(msg *common.Message, listen
 		state = RollbackMessage
 	}
 
-	// Java: an endTransaction failure is only a warning; it does not change the
+	// An endTransaction failure is only a warning; it does not change the
 	// returned result.
 	if err := p.endTransaction(sendResult, msg, state, localException, false,
 		nil, nil, ""); err != nil {
@@ -1825,8 +1805,8 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	}
 	header := &remoting.EndTransactionRequestHeader{ProducerGroup: strPtr(p.producerGroup)}
 
-	// hookMsg / hookMsgID feed doExecuteEndTransactionHook. Java takes the id
-	// from sendResult.getMsgId() on the caller path and from the message's
+	// hookMsg / hookMsgID feed doExecuteEndTransactionHook: the id comes from
+	// sendResult.MsgID on the caller path and from the message's
 	// UNIQ_KEY (falling back to its msgId) on the check-back path.
 	var hookMsg *common.Message
 	var hookMsgID string
@@ -1852,7 +1832,8 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 			hookMsgID = uniq
 		}
 	} else {
-		// Java: id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
+		// The offset id carries the commitlog offset:
+		// id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId).
 		id := sendResult.OffsetMsgID
 		if id == "" {
 			id = sendResult.MsgID
@@ -1864,18 +1845,18 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 		brokerName := sendResult.MessageQueue.BrokerName
 		header.CommitLogOffset = i64Ptr(offset)
 		header.TranStateTableOffset = i64Ptr(sendResult.QueueOffset)
-		// An empty transaction id is left ABSENT, not written as "": Java's
-		// reflection writer skips null fields and Python passes None, so an
-		// empty string on the wire would be a third behaviour nobody expects.
+		// An empty transaction id is left ABSENT, not written as "": the wire
+		// writer skips nil fields, so an empty string on the wire would be a
+		// third behaviour nobody expects.
 		header.TransactionID = strPtrIfSet(sendResult.TransactionID)
 		header.Bname = strPtr(brokerName)
 		header.Topic = strPtr(msg.Topic)
 		header.MsgID = strPtr(sendResult.MsgID)
 		hookMsg = msg
 		hookMsgID = sendResult.MsgID
-		// Java endTransaction:1541 also uses findBrokerAddressInPublish (master
-		// only) and does NOT null-check before the oneway send. This port keeps
-		// the explicit guard (cleaner than Java's NPE) but the address source
+		// The address must come from findBrokerAddressInPublish (master
+		// only); the reference path sends oneway without a null check first —
+		// this port keeps the explicit guard instead, but the address source
 		// must be master-only all the same.
 		addr, ok := inst.FindBrokerAddressInPublish(brokerName)
 		if !ok {
@@ -1888,8 +1869,8 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	b := fromTransactionCheck
 	header.FromTransactionCheck = &b
 
-	// Java runs the end-transaction hook immediately before the oneway send, on
-	// BOTH paths (endTransaction:1561 and processTransactionState:442) — so it
+	// The end-transaction hook runs immediately before the oneway send, on
+	// BOTH paths (caller-initiated and check-back) — so it
 	// fires even if the send below then fails, and the trace it emits is the
 	// only record that this transaction was finished at all.
 	_, _, endTxHooks := p.hookSnapshot()
@@ -1905,7 +1886,7 @@ func (p *DefaultMQProducer) endTransaction(sendResult *SendResult, msg *common.M
 	return inst.Remoting().InvokeOneway(p.sendAddr(brokerAddr), request)
 }
 
-// transactionFlag maps LocalTransactionState to Java MessageSysFlag's
+// transactionFlag maps LocalTransactionState to the MessageSysFlag wire
 // commitOrRollback value.
 func transactionFlag(state LocalTransactionState) int32 {
 	switch state {
@@ -1918,8 +1899,7 @@ func transactionFlag(state LocalTransactionState) int32 {
 }
 
 // handleCheckTransactionState processes the broker's transaction check-back
-// (CHECK_TRANSACTION_STATE = 39), Java ClientRemotingProcessor
-// .checkTransactionState + DefaultMQProducerImpl.checkTransactionState.
+// (CHECK_TRANSACTION_STATE = 39).
 //
 // The broker sends 39 as a ONEWAY request (body = the whole encoded MessageExt),
 // so the client must NOT reply. Instead the listener runs OFF the remoting
@@ -1927,8 +1907,8 @@ func transactionFlag(state LocalTransactionState) int32 {
 // true).
 //
 // Where it runs: on a TransactionMQProducer that has started, the whole check
-// is submitted to the check executor (single worker by default — Java
-// DefaultMQProducerImpl:453), so check-backs are serialised. Everywhere else it
+// is submitted to the check executor (single worker by default), so check-backs
+// are serialised. Everywhere else it
 // falls back to a bare goroutine. In neither case may it run on the remoting
 // read goroutine: it is user code and may block, which would stall every other
 // response on that connection.
@@ -1987,14 +1967,14 @@ func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.Remoti
 		}
 	}
 
-	// Java submits the whole check to checkExecutor (DefaultMQProducerImpl:453),
+	// The whole check is submitted to the check executor,
 	// whose default is a SINGLE worker with a 2000-slot queue: check-backs are
 	// serialised and a flood is rejected. Reproducing that ordering matters — a
 	// producer whose checkLocalTransaction is slow must not be able to run
 	// check-backs concurrently with itself.
 	//
-	// Java does not catch the rejection (RejectedExecutionException escapes
-	// checkTransactionState and lands on the remoting thread). This port logs it
+	// The reference path lets the executor rejection escape checkTransactionState
+	// and land on the remoting thread. This port logs it
 	// and drops the check: the broker will re-check after
 	// transactionCheckMax, whereas an escaping panic on the read goroutine would
 	// take the whole connection's dispatch loop with it.
@@ -2007,11 +1987,10 @@ func (p *DefaultMQProducer) handleCheckTransactionState(request *remoting.Remoti
 	go task()
 }
 
-// RecallMessage mirrors Java DefaultMQProducer.recallMessage(topic, with the
-// namespace applied at the facade): delete a not-yet-delivered timer/delay
-// message identified by the recall handle the original send returned, and
-// return its uniqKey. Validation order is Java DefaultMQProducerImpl:1570-1601
-// — state, topic name, %RETRY%/%DLQ% rejection, handle decode, route refresh,
+// RecallMessage deletes a not-yet-delivered timer/delay message identified by
+// the recall handle the original send returned, and returns its uniqKey (the
+// namespace is applied at the facade). Fixed validation order:
+// state, topic name, %RETRY%/%DLQ% rejection, handle decode, route refresh,
 // broker pinning. The broker side gates this behind recallMessageEnable
 // (default false), which surfaces as NO_PERMISSION.
 func (p *DefaultMQProducer) RecallMessage(topic, recallHandle string) (string, error) {
@@ -2030,16 +2009,16 @@ func (p *DefaultMQProducer) RecallMessage(topic, recallHandle string) (string, e
 	if err != nil {
 		return "", err
 	}
-	// Java tryToFindTopicPublishInfo: the route itself is unused, but its error
-	// propagates (DefaultMQProducerImpl:1586).
+	// The route fetch itself is unused, but its error must propagate
+	// (a topic with no route must fail the recall here, not later).
 	if _, err := p.topicPublishInfo(topic); err != nil {
 		return "", err
 	}
 	// Master publish address first; any address of the topic's route (slave
-	// allowed) as the fallback, like Java findBrokerAddrByTopic.
+	// allowed) as the fallback.
 	addr, ok := inst.FindBrokerAddressInPublish(handle.BrokerName)
 	if !ok {
-		// Java findBrokerAddrByTopic returns null when the route has no
+		// The topic-route fallback yields nothing when the route has no
 		// address — the error is swallowed and the miss reported below.
 		if fallback, err := inst.BrokerAddrForTopic(topic); err == nil {
 			addr, ok = fallback, true
@@ -2072,7 +2051,7 @@ func (p *DefaultMQProducer) RecallMessage(topic, recallHandle string) (string, e
 
 // ---------------------------------------------------------------- misc
 
-// FetchPublishMessageQueues mirrors Java fetchPublishMessageQueues.
+// FetchPublishMessageQueues returns the topic's publish queues from the route.
 func (p *DefaultMQProducer) FetchPublishMessageQueues(topic string) ([]common.MessageQueue, error) {
 	inst, err := p.requireClient()
 	if err != nil {
@@ -2108,8 +2087,8 @@ func strValue(s *string) string {
 }
 
 // parseInt32 parses a message property into a header int32; a non-numeric value
-// leaves the header field unset (Java's Integer.parseInt would throw, but a
-// malformed property is not worth failing an otherwise valid send over).
+// leaves the header field unset — a malformed property is not worth failing an
+// otherwise valid send over.
 func parseInt32(raw string) (int32, error) {
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
 	if err != nil {

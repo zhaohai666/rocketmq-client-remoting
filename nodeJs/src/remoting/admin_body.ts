@@ -10,7 +10,7 @@
  *     {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
  * 所以必须用 RemotingSerializable.decode（fastjson 容错解析），再用 messageQueueKey /
  * decodeMessageQueueMap 把字符串键还原成 MessageQueue。
- * 字段名与结构均由 Java 探针实测确认。
+ * 字段名与结构均经服务端（broker）实际报文核对确认。
  *
  * 本模块复用 ./bodies.ts 中已实现的共享管理体（OffsetWrapper / ConsumeStats /
  * TopicConfigSerializeWrapper / TopicConfig / ConsumerRunningInfo 及其 MessageQueue 键助手），
@@ -159,7 +159,7 @@ export class ConsumeQueueData {
       eval: this.eval,
       bitMap: this.bitMap,
     };
-    // 同 Java：null 字段不序列化
+    // null 字段不序列化
     if (this.extendDataJson != null) d['extendDataJson'] = this.extendDataJson;
     if (this.msg != null) d['msg'] = this.msg;
     return d;

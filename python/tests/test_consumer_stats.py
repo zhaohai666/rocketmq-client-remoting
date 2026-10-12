@@ -25,7 +25,7 @@ class TestComputeStatsData:
         ss = compute_stats_data([])
         assert ss.sum == 0 and ss.tps == 0.0 and ss.avgpt == 0.0 and ss.times == 0
 
-    def test_java_formula(self):
+    def test_stats_snapshot_formula(self):
         # 两个累计点：10 秒内 value 增 30、times 增 3
         snaps = [(0, 100, 10), (10_000, 130, 13)]
         ss = compute_stats_data(snaps)
@@ -95,7 +95,7 @@ class TestStatsItemSet:
 
 
 class TestConsumerStatsManager:
-    def test_inc_semantics_match_java(self):
+    def test_inc_semantics_match_the_server_counters(self):
         # TPS 类：value=消息数、times=调用次数；RT 类：value=耗时、times=调用次数
         m = ConsumerStatsManager()
         m.inc_pull_tps(GROUP, TOPIC, 10)

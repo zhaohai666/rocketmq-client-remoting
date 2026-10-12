@@ -8,8 +8,7 @@ use RocketMQ\Client\Exceptions\RemotingCommandException;
 use RocketMQ\Client\Logger;
 
 /**
- * RemotingCommand：RocketMQ 远程命令（对应 org.apache.rocketmq.remoting.protocol.RemotingCommand，
- * 移植自 protocol/remoting_command.py）。
+ * RemotingCommand：一条远程命令——opaque 配对的请求/应答，含线格式编解码。
  *
  * 线格式：totalLength(4) | headerLength(带序列化类型高8位, 4) | header | body
  * header（JSON）：RemotingSerializable JSON 编码
@@ -22,12 +21,12 @@ final class RemotingCommand
     public const REMOTING_VERSION_KEY = 'rocketmq.remoting.version';
 
     /**
-     * Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
-     * broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
-     * `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
-     * 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
-     * （223→221）低于 `V3_0_7_SNAPSHOT`（ordinal 28）时回 "the client does not support this
-     * feature. version=..."，`resetOffset` 的在线分支同样按 28 跳过。发 0 等于自降为不可回调。
+     * 上报的协议版本号（Version 枚举的序号，本机那套 5.5.1 集群对应 515）。
+     * broker 按心跳/请求里记录的客户端版本决定能不能把管理请求回调到客户端：
+     * 低于 62（3.1.8 那一档）时，307 直接回
+     * "The Consumer <x> Version <0> too low to finish"；低于 28（3.0.7 那一档）时，
+     * 223→221 回 "the client does not support this feature. version=..."，
+     * resetOffset 的在线分支同样按 28 跳过。上报 0 等于自降为不可回调。
      */
     public const CURRENT_VERSION = 515;
 
@@ -78,11 +77,10 @@ final class RemotingCommand
     // ---------------- 工厂方法 ----------------
 
     /**
-     * 对应 Java ``RemotingCommand.createNewRequestId()``。
+     * 分配新的 opaque（请求 ID）。
      *
-     * 异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque
-     * （Java ``onExceptionImpl:728``）：旧请求还挂在 responseTable 里等超时，
-     * 复用 opaque 会让两次尝试的应答串台。
+     * 异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque：
+     * 旧请求还挂在 responseTable 里等超时，复用 opaque 会让两次尝试的应答串台。
      */
     public static function createNewRequestId(): int
     {
@@ -104,7 +102,7 @@ final class RemotingCommand
         return $cmd;
     }
 
-    /** 与 Java createResponseCommand(int code, String remark, Class classHeader) 对齐。 */
+    /** 造应答命令：置应答位、带上版本，可选地挂上 header 类。 */
     public static function createResponseCommand(int $code = 0, string $remark = 'not set any response code', ?string $classHeader = null): ?self
     {
         $cmd = new self(code: $code, remark: $remark);
@@ -125,7 +123,7 @@ final class RemotingCommand
         return self::createResponseCommand($code, $remark, null);
     }
 
-    /** 返回序列化类型数值（与 Java byte getProtocolType 对齐），供与 SerializeType 常量比较。 */
+    /** 从 headerLength 的高 8 位取出序列化类型码，供与 SerializeType 常量比较。 */
     public static function getProtocolType(int $source): int
     {
         return ($source >> 24) & 0xFF;
@@ -170,7 +168,7 @@ final class RemotingCommand
             : RemotingCommandType::REQUEST_COMMAND->value;
     }
 
-    /** 把 custom_header 的非 None 字段写入 ext_fields（对应 Java 反射行为）。 */
+    /** 把 custom_header 的非 null 字段写入 ext_fields（null 字段不落键）。 */
     public function makeCustomHeaderToNet(): void
     {
         if ($this->customHeader !== null) {
@@ -275,7 +273,7 @@ final class RemotingCommand
     }
 
     /**
-     * 把 ext_fields 映射到 header 对象（对应 Java decodeCommandCustomHeader）。
+     * 把 ext_fields 映射回 header 对象。
      *
      * 优先走 header 自带的 fromExtFields（短字段名等特殊映射），
      * 否则按属性名逐字段赋值并做基础类型转换。

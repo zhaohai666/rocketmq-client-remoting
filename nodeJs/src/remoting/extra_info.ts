@@ -23,7 +23,7 @@ export const RETRY_TOPIC = '1';
 export const RETRY_TOPIC_V2 = '2';
 export const QUEUE_OFFSET = 'qo';
 
-// Fixed revive queue number for ordered consumption (Java KeyBuilder.POP_ORDER_REVIVE_QUEUE).
+// 顺序消费固定使用的 revive 队列号。
 export const POP_ORDER_REVIVE_QUEUE = 999;
 
 const _POP_RETRY_SEPARATOR_V1 = '_';
@@ -46,7 +46,7 @@ export function isPopRetryTopicV2(retryTopic: string | null | undefined): boolea
   return retryTopic.startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX) && retryTopic.includes(_POP_RETRY_SEPARATOR_V2);
 }
 
-// Mimic Java String.split: drop trailing empty strings (Python's split keeps them).
+// 按分隔符 split 并丢弃尾部的空段（ck 串以空格分隔，末段可能为空）。
 function _splitDropTrailing(value: string, sep: string): string[] {
   const parts = value.split(sep);
   while (parts.length && parts[parts.length - 1] === '') parts.pop();
@@ -111,7 +111,7 @@ export function retryOfTopic(topic: string): string {
 }
 
 // Build the CK string. Pass msgQueueOffset to get 8 segments; omit for 7 segments.
-// Matches the two Java buildExtraInfo overloads. ACK uses the 8-segment form.
+// ACK 使用 8 段形式。
 export function buildExtraInfo(
   ckQueueOffset: number, popTime: number, invisibleTime: number, reviveQid: number,
   topic: string, brokerName: string, queueId: number, msgQueueOffset?: number | null,

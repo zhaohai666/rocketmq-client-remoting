@@ -72,7 +72,7 @@ ZERO_ILLEGAL = [f for f, lo, *_ in GATES if lo != 0 and f not in TOPIC_SENTINELS
 
 
 class TestDefaultsPass:
-    def test_java_defaults_clear_every_gate(self):
+    def test_default_config_clears_every_gate(self):
         """默认值必须过闸门：闸门收紧后最容易伤到的就是不改配置的正常使用方。
 
         这里**不**调 ``start()`` —— 离线环境连不上 name server，``start()`` 会在
@@ -121,7 +121,7 @@ class TestOutOfRangeRejected:
         assert str(ei.value) == msg
 
     @pytest.mark.parametrize("field", ZERO_ILLEGAL)
-    def test_zero_is_rejected_where_java_says_off_is_not_a_number(self, field):
+    def test_zero_is_rejected_as_not_a_number(self, field):
         """``0`` 不是"关闭"的写法：Java 只给两个 topic 级阈值留了 -1 哨兵，其余一律区间内。
 
         本仓库运行期另有 ``max(1, n)`` / ``> 0`` 兜底（Java 同样有），但那道兜底**不能**

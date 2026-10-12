@@ -56,7 +56,7 @@ def _drop(inst: MQClientInstance) -> None:
 
 
 # ---------------------------------------------------------------- 默认值（对齐 ClientConfig）
-def test_facade_defaults_match_java_client_config():
+def test_facade_defaults_match_the_client_config():
     producer = DefaultMQProducer("PG_interval_defaults")
     assert producer.poll_name_server_interval == POLL_DEFAULT
     assert producer.heartbeat_interval_millis == POLL_DEFAULT
@@ -71,7 +71,7 @@ def test_facade_defaults_match_java_client_config():
     assert DefaultMQAdminExt().poll_name_server_interval == POLL_DEFAULT
 
 
-def test_client_instance_defaults_match_java_client_config():
+def test_client_instance_defaults_match_the_client_config():
     inst = MQClientInstance("interval_defaults", ["127.0.0.1:9876"])
     try:
         assert inst.poll_name_server_interval == POLL_DEFAULT
@@ -172,7 +172,7 @@ def test_adjust_thread_pool_loop_first_run_is_after_one_minute():
 
 
 # ---------------------------------------------------------------- 位点落盘循环
-def test_offset_persist_loop_uses_java_initial_delay_and_default_period():
+def test_offset_persist_loop_uses_the_default_initial_delay_and_period():
     """Java：initialDelay 10s、周期 5s；首笔落盘就在 10s（不是 15s）。"""
     consumer = DefaultMQPushConsumer("CG_interval_persist_default")
     persisted = []

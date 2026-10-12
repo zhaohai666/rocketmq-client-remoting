@@ -509,7 +509,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscription_data_json_uses_java_names_and_drops_filter_class_source() {
+    fn subscription_data_json_uses_wire_field_names_and_drops_filter_class_source() {
         let mut sd = SubscriptionData::new("TopicProbe", "TagA||TagB");
         sd.set_tags(
             vec!["TagB".into(), "TagA".into(), "TagA".into()],
@@ -710,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_api_rejects_an_all_empty_split_like_java() {
+    fn filter_api_rejects_an_all_empty_split() {
         for raw in ["||", "||||"] {
             assert!(
                 matches!(

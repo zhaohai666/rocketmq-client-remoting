@@ -201,7 +201,7 @@ public class CompressionTests
     // ---------------------------------------------------------------- 类型与标志位
 
     [Fact]
-    public void Type_FindByValue_MatchesJava()
+    public void Type_FindByValue_MatchesLegacy()
     {
         // Java CompressionType.findByValue：0 与 3 都必须是 ZLIB（老客户端没有类型位）
         Assert.Equal(CompressionType.LZ4, CompressionType.FindByValue(1));
@@ -267,7 +267,7 @@ public class CompressionTests
     }
 
     [Fact]
-    public void Lz4_FrameMagicAndHeader_MatchLz4JavaDefaults()
+    public void Lz4_FrameMagicAndHeader_MatchLz4LegacyDefaults()
     {
         byte[] compressed = CompressorFactory.Compress(Payload(), CompressionType.LZ4);
 
@@ -408,7 +408,7 @@ public class CompressionTests
     }
 
     [Fact]
-    public void Zstd_ConcatenatedFrames_DecodeLikeJavaInputStream()
+    public void Zstd_ConcatenatedFrames_DecodeLikeLegacyInputStream()
     {
         // Java ZstdInputStream 会读串接的多帧（Zstd_decompress 文档同样要求 compressedSize 是整帧总长）：
         // 把两个帧拼起来必须解成两段明文的首尾相接。

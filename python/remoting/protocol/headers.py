@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""全部请求/响应头（对应 org.apache.rocketmq.remoting.protocol.header.*）。
+"""全部请求/响应头（对应协议 rocketmq.remoting.protocol.header.* 各头）。
 
-每个 header 提供 to_ext_fields()（仅输出非 None 字段，与 Java makeCustomHeaderToNet 行为一致）
+每个 header 提供 to_ext_fields()（仅输出非 None 字段，与 broker 侧
+makeCustomHeaderToNet 的序列化口径一致）
 和 from_ext_fields()（把 ext_fields 映射回字段）。
 """
 from __future__ import annotations
@@ -22,13 +23,12 @@ class CommandCustomHeader:
 
 
 def _ext(fields: dict) -> dict:
-    """过滤 None，并把 bool 规范成 Java ``Boolean.toString`` 的小写形式。
+    """过滤 None，并把 bool 规范成入网的小写形式 ``"false"``/``"true"``。
 
     为什么必须显式转换：``RemotingCommand`` 落 ext_fields 时统一走 ``str(v)``，
-    Python 的 ``str(False)`` 是 ``"False"``，而 Java 写的是 ``"false"``。
-    broker 侧 ``Boolean.parseBoolean`` 大小写不敏感，所以功能上不出错，但线上
-    报文会与 Java 客户端不一致（对比抓包/单测断言时很别扭）。
-    这里统一成小写，与 C++ 侧 ``putOptBool`` 完全一致。
+    Python 的 ``str(False)`` 是 ``"False"``，而 broker 侧 ``Boolean.parseBoolean``
+    期望的入网文本是小写的 ``"false"``。虽大小写不敏感、功能上不出错，但线上报文
+    口径必须统一成小写（对比抓包/单测断言时才不会别扭）。
     """
     out = {}
     for k, v in fields.items():
@@ -105,7 +105,7 @@ class SendMessageRequestHeader(CommandCustomHeader):
 
 
 class SendMessageRequestHeaderV2(CommandCustomHeader):
-    """短字段名编码（producerGroup->a ...），与 Java V2 严格一致。"""
+    """短字段名编码（producerGroup->a ...），入网键名必须与协议 V2 头逐字一致。"""
 
     def __init__(self):
         self.producer_group: Optional[str] = None
@@ -121,7 +121,7 @@ class SendMessageRequestHeaderV2(CommandCustomHeader):
         self.unit_mode: Optional[bool] = None
         self.max_reconsume_times: Optional[int] = None
         self.batch: Optional[bool] = None
-        # Java SendMessageRequestHeaderV2 还有 private String n; // brokerName
+        # 协议 V2 头里 brokerName 的短名就是 n
         self.broker_name: Optional[str] = None
 
     def to_ext_fields(self) -> dict:
@@ -162,7 +162,7 @@ class SendMessageRequestHeaderV2(CommandCustomHeader):
 class ReplyMessageRequestHeader(CommandCustomHeader):
     """broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
 
-    对应 Java ``org.apache.rocketmq.remoting.protocol.header.ReplyMessageRequestHeader``
+    对应协议头 ``ReplyMessageRequestHeader``
     （字段与 ``SendMessageRequestHeader`` 高度重合，但多了 bornHost/storeHost/storeTimestamp，
     broker 的 ``ReplyMessageProcessor#pushReplyMessage`` 就是用它拼出来的）。
     请求方收到后据此 + body 还原出真正的应答 MessageExt。
@@ -250,12 +250,12 @@ class SendMessageResponseHeader(CommandCustomHeader):
 
 
 class RecallMessageRequestHeader(CommandCustomHeader):
-    """对应 org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader。
+    """对应协议头 RecallMessageRequestHeader。
 
-    ⚠ Java 侧继承 ``TopicRequestHeader`` → ``RpcRequestHeader``，父类字段 ``bname`` 的
-    **反射名就是 bname**（不是 brokerName）：写成 ``brokerName`` 会被 broker 静默丢掉。
+    ⚠ 该头继承协议的 ``TopicRequestHeader`` → ``RpcRequestHeader``，父类字段 ``bname`` 的
+    **入网键名就是 bname**（不是 brokerName）：写成 ``brokerName`` 会被 broker 静默丢掉。
     broker 的 RecallMessageProcessor 其实只用 topic/producerGroup/recallHandle，
-    校验句柄里的 brokerName 也是从 handle 解出来的，但报文仍要与 Java 一致。
+    校验句柄里的 brokerName 也是从 handle 解出来的，但报文的键名仍须逐字用 bname。
     """
 
     def __init__(self):
@@ -280,7 +280,7 @@ class RecallMessageRequestHeader(CommandCustomHeader):
 
 
 class RecallMessageResponseHeader(CommandCustomHeader):
-    """对应 RecallMessageResponseHeader：Java 只有一个字段 ``msgId``。"""
+    """对应协议头 RecallMessageResponseHeader：只有一个字段 ``msgId``。"""
 
     def __init__(self):
         self.msg_id: Optional[str] = None
@@ -506,8 +506,8 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
         self.topic: Optional[str] = None
         self.queue_id: Optional[int] = None
         self.timestamp: Optional[int] = None
-        # Java 该字段是 @CFNullable：为 None 时**不写键**（Java 的
-        # MQClientAPIImpl 已废弃的 5 参 searchOffset 就是这种形状）。
+        # 协议里该字段是 @CFNullable：为 None 时**不写键**（已废弃的
+        # 5 参 searchOffset 形状就是不带 timestamp 键）。
         self.boundary_type: Optional[BoundaryType] = None
 
     def to_ext_fields(self) -> dict:
@@ -515,7 +515,7 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
             "topic": self.topic,
             "queueId": self.queue_id,
             "timestamp": self.timestamp,
-            # 入网文本是枚举名大写（Java makeCustomHeaderToNet 的 Enum.toString()），
+            # 入网文本是枚举名大写（broker 侧 makeCustomHeaderToNet 的 Enum.toString()），
             # 不是 BoundaryType.getName() 的小写名。
             "boundaryType": self.boundary_type.value if self.boundary_type is not None else None,
         })
@@ -525,8 +525,8 @@ class SearchOffsetRequestHeader(CommandCustomHeader):
         self.queue_id = _i(ext.get("queueId"))
         self.timestamp = _l(ext.get("timestamp"))
         value = ext.get("boundaryType")
-        # 缺键 ⇒ None（Java 端 getBoundaryType() 自行回落 LOWER）；
-        # 有键但值不认识 ⇒ Java BoundaryType.getType 的宽松语义，给 LOWER。
+        # 缺键 ⇒ None（broker 侧对缺省 boundaryType 自行回落 LOWER）；
+        # 有键但值不认识 ⇒ 按 BoundaryType.get_type 的宽松语义，给 LOWER。
         self.boundary_type = BoundaryType.get_type(value) if value is not None else None
 
 
@@ -850,11 +850,11 @@ class UnlockBatchMqRequestHeader(CommandCustomHeader):
 
 
 class EndTransactionRequestHeader(CommandCustomHeader):
-    """对应 org.apache.rocketmq.remoting.protocol.header.EndTransactionRequestHeader。
+    """对应协议头 EndTransactionRequestHeader。
 
-    ⚠ 继承 RpcRequestHeader 的 brokerName 字段在 Java 里**反射名是 ``bname``**
-    （setter 为 setBrokerName，但字段声明名是 bname）。写错键 broker 会静默丢字段。
-    字段名严格与 Java 一致：topic / producerGroup / tranStateTableOffset /
+    ⚠ 继承 RpcRequestHeader 的 brokerName 字段**入网键名是 ``bname``**
+    （setter 为 setBrokerName，但协议字段声明名是 bname）。写错键 broker 会静默丢字段。
+    字段名严格与协议一致：topic / producerGroup / tranStateTableOffset /
     commitLogOffset / commitOrRollback / fromTransactionCheck / msgId /
     transactionId / bname。
     """
@@ -909,9 +909,9 @@ class EndTransactionResponseHeader(CommandCustomHeader):
 
 
 class CheckTransactionStateRequestHeader(CommandCustomHeader):
-    """对应 org.apache.rocketmq.remoting.protocol.header.CheckTransactionStateRequestHeader。
+    """对应协议头 CheckTransactionStateRequestHeader。
 
-    ⚠ 同样继承 RpcRequestHeader：brokerName 反射名是 ``bname``。字段名严格与 Java
+    ⚠ 同样继承 RpcRequestHeader：brokerName 入网键名是 ``bname``。字段名严格与协议
     一致：topic / tranStateTableOffset / commitLogOffset / msgId / transactionId /
     offsetMsgId / bname。
     """
@@ -1487,17 +1487,17 @@ class QueryDataVersionResponseHeader(CommandCustomHeader):
 
 # ---------------- POP 模式（5.x 轻量消费） ----------------
 #
-# ext key 必须逐字等于 Java 侧的字段名：broker 用 fastjson2 按 Java 属性名反序列化，
+# ext key 必须逐字等于协议字段名：broker 用 fastjson 按协议属性名反序列化，
 # 错一个字母就**静默丢字段**（不报错、行为静默退化），所以下面每个 key 都对着
-# Java `remoting/.../protocol/header/Pop*Header.java` 抄。
+# 协议 `remoting/.../protocol/header/Pop*Header.java` 的字段声明逐字核对。
 #
-# 另外注意 `order` / `suspend` 这两个字段 Java 用的是**非空** Boolean/boolean
-# （`Boolean order = Boolean.FALSE`、`private boolean suspend = false`），
+# 另外注意 `order` / `suspend` 这两个字段协议里是**非空** Boolean/boolean
+# （`order = Boolean.FALSE`、`suspend = false`），
 # `encodeHeader` 只会跳过 null，所以它们**总是**出现在报文里 —— 这里也不做 None 过滤。
 
 
 class PopMessageRequestHeader(CommandCustomHeader):
-    """Java ``PopMessageRequestHeader``（RequestCode.POP_MESSAGE = 200050）。"""
+    """协议头 ``PopMessageRequestHeader``（RequestCode.POP_MESSAGE = 200050）。"""
 
     def __init__(self):
         self.consumer_group: Optional[str] = None
@@ -1534,7 +1534,7 @@ class PopMessageRequestHeader(CommandCustomHeader):
 
 
 class PopMessageResponseHeader(CommandCustomHeader):
-    """Java ``PopMessageResponseHeader``。
+    """协议头 ``PopMessageResponseHeader``。
 
     ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` 是编码过的
     字符串（空格做字段分隔、分号做队列分隔），用 ``extra_info`` 模块解析。
@@ -1571,7 +1571,7 @@ class PopMessageResponseHeader(CommandCustomHeader):
 
 
 class AckMessageRequestHeader(CommandCustomHeader):
-    """Java ``AckMessageRequestHeader``（RequestCode.ACK_MESSAGE = 200051）。
+    """协议头 ``AckMessageRequestHeader``（RequestCode.ACK_MESSAGE = 200051）。
 
     ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
     不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
@@ -1597,7 +1597,7 @@ class AckMessageRequestHeader(CommandCustomHeader):
 
 
 class ChangeInvisibleTimeRequestHeader(CommandCustomHeader):
-    """Java ``ChangeInvisibleTimeRequestHeader``（CHANGE_MESSAGE_INVISIBLETIME = 200053）。"""
+    """协议头 ``ChangeInvisibleTimeRequestHeader``（CHANGE_MESSAGE_INVISIBLETIME = 200053）。"""
 
     def __init__(self):
         self.consumer_group: Optional[str] = None
@@ -1623,7 +1623,7 @@ class ChangeInvisibleTimeRequestHeader(CommandCustomHeader):
 
 
 class ChangeInvisibleTimeResponseHeader(CommandCustomHeader):
-    """Java ``ChangeInvisibleTimeResponseHeader``。
+    """协议头 ``ChangeInvisibleTimeResponseHeader``。
 
     返回的是**新的** ``invisible_time`` / ``pop_time`` / ``revive_qid``；
     客户端要用它们重建 extraInfo 供后续 ACK 使用。

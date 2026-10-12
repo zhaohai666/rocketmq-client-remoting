@@ -12,7 +12,7 @@ namespace {
 constexpr char kRetrySepV1 = '_';
 constexpr char kRetrySepV2 = '+';
 
-// 复刻 Java String.split(sep) 的"丢弃末尾空串"行为。
+// 对齐 broker 侧 split 的"丢弃末尾空串"行为。
 std::vector<std::string> splitAndDropTrailing(const std::string& value, char sep) {
     std::vector<std::string> parts;
     std::size_t start = 0;

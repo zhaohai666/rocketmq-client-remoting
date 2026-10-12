@@ -1,4 +1,4 @@
-// 队列选择器实现（对应 Java SelectMessageQueueByHash / SelectMessageQueueByRandom）。
+// 队列选择器实现：按哈希选择 / 随机选择。
 #include "rocketmq/client/result.h"
 
 #include <cstdint>
@@ -15,9 +15,9 @@ MessageQueue SelectMessageQueueByHash::select(const std::vector<MessageQueue>& m
     if (mqs.empty()) {
         throw MQClientException("no message queue");
     }
-    // 与 Java 一致：arg.hashCode() 取绝对值后对队列数取模。
-    // 这里用 Java String.hashCode() 语义（Python 侧用的是 hash()，对字符串会随
-    // PYTHONHASHSEED 变化，不可跨进程复现；Java 语义是确定性的，更适合做分片键）。
+    // arg 的哈希取绝对值后对队列数取模。
+    // 哈希用 String.hashCode 多项式滚动语义（javaStringHash）：它是确定性的，
+    // 可跨进程复现，适合作分片键；不采用进程内随机化哈希。
     int32_t hashCode = javaStringHash(arg);
     if (hashCode < 0) {
         hashCode = hashCode == INT32_MIN ? 0 : -hashCode;  // 避免 INT32_MIN 取负溢出
@@ -37,9 +37,9 @@ MessageQueue SelectMessageQueueByRandom::select(const std::vector<MessageQueue>&
     return mqs[dist(rng)];
 }
 
-// Java SelectMessageQueueByMachineRoom.select() 是未实现的桩（return null），
-// 见 result.h 的说明：MessageQueue 无法表达 null，这里直接抛 —— 用它发送必然
-// 失败，与 Java 的结局（下游 NPE）一致，只是失败得更早、信息更明确。
+// SelectMessageQueueByMachineRoom 在本 SDK 中是未实现的桩：MessageQueue 是值类型、
+// 无法表达"返回 null 让下游空指针"，这里直接抛 —— 用它发送必然失败，只是失败得更早、
+// 信息更明确。异常文案里的 stub 说明是与调用方约定的匹配内容，保持不变。
 MessageQueue SelectMessageQueueByMachineRoom::select(const std::vector<MessageQueue>& mqs,
                                                      const Message& /*msg*/,
                                                      const std::string& /*arg*/) const {

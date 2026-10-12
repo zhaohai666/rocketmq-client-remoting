@@ -45,7 +45,7 @@ def _request_msg() -> Message:
 
 
 # ---------------------------------------------------------------- 应答消息构造
-def test_create_reply_message_matches_java_shape():
+def test_create_reply_message_matches_the_wire_shape():
     reply = create_reply_message(_request_msg(), b"pong")
     # topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）
     assert reply.topic == "DefaultCluster_REPLY_TOPIC"

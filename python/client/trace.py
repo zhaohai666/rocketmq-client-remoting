@@ -13,9 +13,9 @@
 ⚠ 两个必须保留的 Java 语义差异（否则编解码对不上）：
   1. ``TraceConstants.CONTENT_SPLITOR`` = \\x01、``FIELD_SPLITOR`` = \\x02，
      编码时**每条记录末尾补 FIELD_SPLITOR**；解码用 Java 的 ``String.split``
-     语义（**丢弃末尾空串**）切分 —— 见 ``java_split``。
+     语义（**丢弃末尾空串**）切分 —— 见 ``split_dropping_trailing_empty``。
   2. Python 的 ``str.split`` 保留末尾空串，直接用它切分会多出一个空段并把
-     字段整体错位。本模块一律走 ``java_split``。
+     字段整体错位。本模块一律走 ``split_dropping_trailing_empty``。
 """
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ class AccessChannel(Enum):
     CLOUD = "CLOUD"
 
 
-def java_split(value: str, sep: str) -> List[str]:
+def split_dropping_trailing_empty(value: str, sep: str) -> List[str]:
     """复刻 Java ``String.split``：**丢弃末尾的空串**。
 
     Python 的 ``str.split`` 会保留末尾空串，而编码结果末尾正好补了 FIELD_SPLITOR，
@@ -197,7 +197,7 @@ class TraceDataEncoder:
         res: List[TraceContext] = []
         if not trace_data:
             return res
-        for context in java_split(trace_data, TraceConstants.FIELD_SPLITOR):
+        for context in split_dropping_trailing_empty(trace_data, TraceConstants.FIELD_SPLITOR):
             if not context:
                 continue
             try:
@@ -214,7 +214,7 @@ class TraceDataEncoder:
     @staticmethod
     def _decode_context(context: str) -> Optional[TraceContext]:
         """解一条轨迹记录（一段 FIELD_SPLITOR 之内）。无法识别时返回 None。"""
-        line = java_split(context, TraceConstants.CONTENT_SPLITOR)
+        line = split_dropping_trailing_empty(context, TraceConstants.CONTENT_SPLITOR)
         if not line:
             return None
         kind = line[0]
@@ -364,5 +364,5 @@ class TraceDataEncoder:
 
 __all__ = [
     "TraceConstants", "TraceType", "AccessChannel", "TraceBean", "TraceContext",
-    "TraceTransferBean", "TraceDataEncoder", "java_split", "LOCAL_ADDRESS",
+    "TraceTransferBean", "TraceDataEncoder", "split_dropping_trailing_empty", "LOCAL_ADDRESS",
 ]

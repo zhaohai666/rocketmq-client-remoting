@@ -344,7 +344,7 @@ func TestConsumerRunningInfoClassicConsumerFillsOnlyMqTable(t *testing.T) {
 		t.Errorf("the field is spelled `droped` (one p), Java's typo: %v", pqi)
 	}
 	// A long field rendering matters: 14 keys means the int-typed
-	// cachedMsgSizeInMiB must not have smuggled a JavaDouble in.
+	// cachedMsgSizeInMiB must not have smuggled a JSONDouble in.
 	if _, ok := pqi["cachedMsgSizeInMiB"].(int32); !ok {
 		t.Errorf("cachedMsgSizeInMiB = %#v, want a plain int32 (Java `int`)", pqi["cachedMsgSizeInMiB"])
 	}
@@ -439,7 +439,7 @@ func sameJSONValue(a, b map[string]any) bool {
 		if !ok {
 			return false
 		}
-		if remoting.FormatJavaDouble(asFloat(va)) != remoting.FormatJavaDouble(asFloat(vb)) {
+		if remoting.FormatJSONDouble(asFloat(va)) != remoting.FormatJSONDouble(asFloat(vb)) {
 			return false
 		}
 	}
@@ -448,7 +448,7 @@ func sameJSONValue(a, b map[string]any) bool {
 
 func asFloat(v any) float64 {
 	switch n := v.(type) {
-	case remoting.JavaDouble:
+	case remoting.JSONDouble:
 		return float64(n)
 	case float64:
 		return n
@@ -882,7 +882,7 @@ func TestConsumeMessageDirectlyErrorArms(t *testing.T) {
 // the Go transport keeps one handler per request code). That is a deliberate,
 // documented divergence — see the note at producer.go's RegisterProcessor call
 // — so it is asserted separately.
-func TestInstanceRegistersEveryJavaClientProcessor(t *testing.T) {
+func TestInstanceRegistersEveryProtocolRequestCode(t *testing.T) {
 	inst := CreateOrGetInstance(uniqueClientID(t), nil, testConfig())
 	t.Cleanup(inst.Shutdown)
 

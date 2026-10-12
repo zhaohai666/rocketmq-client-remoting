@@ -1,8 +1,8 @@
 // 请求码 / 响应码 / 语言码 / 序列化类型（对应 org.apache.rocketmq.remoting.protocol 枚举与常量）。
 //
-// 本文件由工具脚本依据 Java 源码生成，并与 python/remoting/protocol/codes.py
-// 交叉校验，取值零漂移；tests/test_java_alignment.cpp 会在 ROCKETMQ_JAVA_SRC 指向
-// Java 源码树时做同样的回归守卫。
+// 本文件由工具脚本依据 ROCKETMQ_JAVA_SRC 指向的 RocketMQ 服务端源码树生成
+// （RequestCode.java / ResponseCode.java / LanguageCode.java）；
+// tests/test_protocol_alignment.cpp 在设置了该环境变量时会做同样的回归守卫。
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_CODES_H
 #define ROCKETMQ_REMOTING_PROTOCOL_CODES_H
 

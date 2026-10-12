@@ -2,12 +2,12 @@ package common
 
 import "strings"
 
-// Topic / group name legality (Java TopicValidator). The Java whitelist
+// Topic / group name legality. The broker-side whitelist
 // `^[%|a-zA-Z0-9_-]+$` is implemented as a byte check: code points >= 0x80 are
 // always illegal, and any non-ASCII UTF-8 leading byte is >= 0x80, so the
-// byte-wise walk agrees with Java's char-based check on real input. The broker
-// runs the same table; letting a bad name through here only moves the failure
-// to topic-creation time on a path that should have failed locally.
+// byte-wise walk agrees with the broker's char-based check on real input. The
+// broker runs the same table; letting a bad name through here only moves the
+// failure to topic-creation time on a path that should have failed locally.
 const (
 	TopicMaxLength           = 127
 	GroupMaxLength           = 120
@@ -29,7 +29,7 @@ const (
 	RmqSysRocksdbOffsetTopic      = "CHECKPOINT_TOPIC"
 )
 
-// systemTopicSet mirrors Java TopicValidator.getSystemTopicSet (12 entries).
+// systemTopicSet is the broker's system-topic whitelist (12 entries).
 var systemTopicSet = map[string]struct{}{
 	AutoCreateTopicKeyTopic:       {},
 	RmqSysScheduleTopic:           {},
@@ -73,7 +73,8 @@ func allowedChar(b byte) bool {
 }
 
 // IsTopicOrGroupIllegal walks the whitelist; the empty string is legal here
-// (blank names are rejected earlier by the is_blank step, same order as Java).
+// (blank names are rejected earlier by the is_blank step, and that check order
+// is fixed).
 func IsTopicOrGroupIllegal(name string) bool {
 	for i := 0; i < len(name); i++ {
 		b := name[i]

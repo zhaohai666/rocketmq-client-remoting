@@ -1,5 +1,4 @@
-// 队列分配策略实现，逐条对齐 Java
-// `client/consumer/rebalance/AllocateMessageQueue*.java`；差异见头文件说明。
+// 队列分配策略实现；行为口径见头文件「行为口径」一节。
 #include "rocketmq/client/allocate_strategy.h"
 
 #include <algorithm>
@@ -12,14 +11,14 @@ namespace rocketmq {
 
 namespace {
 
-// Java `cidAll.indexOf(currentCID)`：找不到返回 -1。
+// 在 cidAll 里找下标：找不到返回 -1（indexOf 口径）。
 int32_t indexOfCid(const std::vector<std::string>& cidAll, const std::string& currentCid) {
     auto it = std::find(cidAll.begin(), cidAll.end(), currentCid);
     if (it == cidAll.end()) return -1;
     return static_cast<int32_t>(it - cidAll.begin());
 }
 
-// 把 mqAll 的 [start, start+range) 拷进结果，越界一律截断（对应 Java 的 Math.min 削零）。
+// 把 mqAll 的 [start, start+range) 拷进结果，越界一律截断。
 std::vector<MessageQueue> slice(const std::vector<MessageQueue>& mqAll, int32_t start, int32_t range) {
     std::vector<MessageQueue> result;
     const int32_t total = static_cast<int32_t>(mqAll.size());
@@ -32,8 +31,8 @@ std::vector<MessageQueue> slice(const std::vector<MessageQueue>& mqAll, int32_t 
 }  // namespace
 
 std::vector<std::string> javaSplit(const std::string& text, char sep) {
-    // Java `Pattern#split`：先按分隔符全切，再裁掉末尾空段；
-    // 但**一次都没命中**时走 "If no match was found, return this" 早返回，不裁尾。
+    // 先按分隔符全切，再裁掉末尾空段；
+    // 但**一次都没命中**时整串原样早返回（哪怕它本身是空串），不裁尾。
     std::vector<std::string> parts;
     size_t pos = 0;
     bool matched = false;
@@ -60,7 +59,7 @@ int32_t checkAllocateConfig(const std::string& consumerGroup, const std::string&
     if (cidAll.empty()) return -1;
     int32_t index = indexOfCid(cidAll, currentCid);
     if (index < 0) {
-        // Java AbstractAllocateMessageQueueStrategy#check 的同名日志。
+        // 本客户端不在 cidAll 里的日志文案是运维侧匹配的固定条款，保持不变。
         std::string cids;
         for (size_t i = 0; i < cidAll.size(); ++i) {
             if (i) cids += ", ";
@@ -80,7 +79,6 @@ std::vector<MessageQueue> AllocateMessageQueueAveragely::allocate(
     int32_t index = checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll);
     if (index < 0) return {};
 
-    // 对齐 Java AllocateMessageQueueAveragely#allocate
     const int32_t mqSize = static_cast<int32_t>(mqAll.size());
     const int32_t cidSize = static_cast<int32_t>(cidAll.size());
     const int32_t mod = mqSize % cidSize;
@@ -99,8 +97,7 @@ std::vector<MessageQueue> AllocateMessageQueueAveragelyByCircle::allocate(
     int32_t index = checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll);
     if (index < 0) return {};
 
-    // 对齐 Java AllocateMessageQueueAveragelyByCircle#allocate：
-    // for (i = index; i < mqAll.size(); i++) if (i % cidAll.size() == index) add
+    // 从下标 index 起步进，步长 cidAll.size()：凡 `i % cidAll.size() == index` 的队列归本消费者。
     std::vector<MessageQueue> result;
     const int32_t step = static_cast<int32_t>(cidAll.size());  // 守卫保证 >= 1
     for (int32_t i = index; i < static_cast<int32_t>(mqAll.size()); i += step) {
@@ -127,8 +124,7 @@ std::vector<MessageQueue> AllocateMessageQueueByConfig::getMessageQueueList() co
 std::vector<MessageQueue> AllocateMessageQueueByConfig::allocate(
     const std::string& /*consumerGroup*/, const std::string& /*currentCid*/,
     const std::vector<MessageQueue>& /*mqAll*/, const std::vector<std::string>& /*cidAll*/) const {
-    // Java: return this.messageQueueList;（不做 check，未配置 = null）
-    // Python/Rust: 未配置 = 空列表 + 返回副本 → 这里跟它们。
+    // 不做 check；未配置时返回空列表（且是副本，不交出共享可变引用）。
     return getMessageQueueList();
 }
 
@@ -136,8 +132,8 @@ std::vector<MessageQueue> AllocateMessageQueueByConfig::allocate(
 AllocateMessageQueueConsistentHash::AllocateMessageQueueConsistentHash(
     int32_t virtualNodeCnt, const std::shared_ptr<const HashFunction>& customHashFunction)
     : virtualNodeCnt_(virtualNodeCnt), customHashFunction_(customHashFunction) {
-    // Java `AllocateMessageQueueConsistentHash#<init>(int, HashFunction)`：负数虚拟节点数
-    // 是**构造期**错误（不在 rebalance 后台路径上），头文件差异 1 的「守卫返回空」不适用。
+    // 负数虚拟节点数是**构造期**错误（不在 rebalance 后台路径上），头文件口径 1 的
+    // 「守卫返回空」不适用，直接抛。
     if (virtualNodeCnt < 0) {
         throw MQClientException("illegal virtualNodeCnt :" + std::to_string(virtualNodeCnt));
     }
@@ -148,7 +144,7 @@ std::vector<MessageQueue> AllocateMessageQueueConsistentHash::allocate(
     const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) const {
     if (checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll) < 0) return {};
 
-    // 对齐 Java：cidAll 逐个包成 ClientNode 建环；customHashFunction == null 时环自带 MD5Hash。
+    // cidAll 逐个包成 ClientNode 建环；customHashFunction == nullptr 时环自带 MD5Hash。
     std::vector<std::shared_ptr<Node>> cidNodes;
     cidNodes.reserve(cidAll.size());
     for (const std::string& cid : cidAll) {
@@ -158,7 +154,7 @@ std::vector<MessageQueue> AllocateMessageQueueConsistentHash::allocate(
 
     std::vector<MessageQueue> result;
     for (const MessageQueue& mq : mqAll) {
-        // Java：`routeNode(mq.toString())` 再比 `currentCID.equals(clientNode.getKey())`。
+        // 环的 key 是 MessageQueue 的全量串（toString），路由到节点后再比节点 key 与 currentCid。
         // nullptr 分支真的会走到：虚拟节点数可以是 0 ⇒ 环空 ⇒ 谁都拿不到队列。
         const std::shared_ptr<Node> node = router.routeNode(mq.toString());
         if (node != nullptr && node->getKey() == currentCid) result.push_back(mq);
@@ -188,9 +184,8 @@ std::vector<MessageQueue> AllocateMessageQueueByMachineRoom::allocate(
     if (currentIndex < 0) return {};
 
     const std::set<std::string> rooms = getConsumeridcs();
-    // Java: `String[] temp = mq.getBrokerName().split("@");`
-    //       `if (temp.length == 2 && consumeridcs.contains(temp[0])) premqAll.add(mq);`
-    // 必须是 javaSplit：`"room1@"` 在 Java 只有 1 段 ⇒ **不参与**分配，朴素切分则会给它。
+    // 判据：broker 名切分后**正好 2 段**且首段在配置机房集合里。
+    // 必须是 javaSplit：`"room1@"` 切出 1 段 ⇒ **不参与**分配，朴素切分则会给它。
     std::vector<MessageQueue> premqAll;
     for (const MessageQueue& mq : mqAll) {
         const std::vector<std::string> temp = javaSplit(mq.brokerName, '@');
@@ -217,11 +212,11 @@ AllocateMachineRoomNearby::AllocateMachineRoomNearby(
     const std::shared_ptr<MachineRoomResolver>& machineRoomResolver)
     : allocateMessageQueueStrategy_(allocateMessageQueueStrategy),
       machineRoomResolver_(machineRoomResolver) {
-    // Java 构造器抛 NullPointerException，文案照抄；本端口统一用 MQClientException
-    // 表达「非法配置」（头文件差异 2）。
+    // 参数缺失用 MQClientException 表达「非法配置」（头文件口径 2）；
+    // 文案保留 `... is null` 既有句式，调用方按原文匹配。
     if (allocateMessageQueueStrategy == nullptr) throw MQClientException("allocateMessageQueueStrategy is null");
     if (machineRoomResolver == nullptr) throw MQClientException("machineRoomResolver is null");
-    // Java `getName()` = "MACHINE_ROOM_NEARBY" + "-" + 内层.getName()；这里构造期算好。
+    // 名字 = "MACHINE_ROOM_NEARBY-" + 内层名；构造期算好。
     name_ = "MACHINE_ROOM_NEARBY-" + allocateMessageQueueStrategy->getName();
 }
 
@@ -230,12 +225,12 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
     const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) const {
     if (checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll) < 0) return {};
 
-    // 按机房分组。Java 用两个 TreeMap ⇒ 机房按**字典序**遍历，这里用 std::map 同序。
+    // 按机房分组：std::map ⇒ 机房按**字典序**遍历，分配结果与分组顺序口径一致。
     std::map<std::string, std::vector<MessageQueue>> mr2Mq;
     for (const MessageQueue& mq : mqAll) {
         const std::string brokerMachineRoom = machineRoomResolver_->brokerDeployIn(mq);
-        // Java `StringUtils.isNoneEmpty`：null 或空串都算「机房未知」→ 抛异常。
-        // 这里照抛而不返回空：静默返回等于把整个 topic 的队列撤走（头文件差异 1 的例外）。
+        // 机房串为空即「机房未知」→ 抛异常。
+        // 照抛而不返回空：静默返回等于把整个 topic 的队列撤走（头文件口径 1 的例外）。
         if (brokerMachineRoom.empty()) {
             throw MQClientException("Machine room is null for mq " + mq.toString());
         }
@@ -253,7 +248,7 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
     std::vector<MessageQueue> allocateResults;
 
     // 1. 与本消费者同机房的队列只分给同机房的消费者。
-    //    `mr2Mq.remove(...)`：Java 是 remove（顺手把该机房从待共享集合里摘掉），这里同。
+    //    先把本机房队列从 mr2Mq 摘走（remove），第 2 步共享遍历才不会重复分它。
     const std::string currentMachineRoom = machineRoomResolver_->consumerDeployIn(currentCid);
     std::vector<MessageQueue> mqInThisMachineRoom;
     auto mqIt = mr2Mq.find(currentMachineRoom);
@@ -261,7 +256,7 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
         mqInThisMachineRoom = std::move(mqIt->second);
         mr2Mq.erase(mqIt);
     }
-    // Java 这里查不到会传 null 给内层策略；守卫保证 currentCid ∈ cidAll，而上面的分组
+    // 查不到就给内层策略传空列表；守卫保证 currentCid ∈ cidAll，而上面的分组
     // 已把 cidAll 全部放进 mr2c ⇒ 必然命中，查不到是"空"而非"缺"。
     std::vector<std::string> consumerInThisMachineRoom;
     auto cidIt = mr2c.find(currentMachineRoom);

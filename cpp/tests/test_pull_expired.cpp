@@ -42,7 +42,7 @@ std::string queueKey(int32_t queueId) {
     return DefaultMQPushConsumer::offsetKey(MessageQueue(kTopic, kBroker, queueId));
 }
 
-void testThresholdMatchesJava() {
+void testStallThresholdDefault() {
     // Java ProcessQueue:43 的默认值。写成 60s 会把健康队列提前撤走（凭空重投），
     // 写成更大则停摆的队列要更久才复原。
     expect(kPullMaxIdleTime == 120000, "threshold.120s", std::to_string(kPullMaxIdleTime));
@@ -109,7 +109,7 @@ void testStampIsPerQueue() {
 }  // namespace
 
 int main() {
-    testThresholdMatchesJava();
+    testStallThresholdDefault();
     testNoStampIsNotStalled();
     testFreshStampIsNotStalled();
     testThresholdBoundaryIsStrict();

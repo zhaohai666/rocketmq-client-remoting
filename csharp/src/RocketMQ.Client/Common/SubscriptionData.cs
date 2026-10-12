@@ -158,10 +158,10 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
         long result = 1;
         result = 31 * result + (ClassFilterMode ? 1231 : 1237);
         result = 31 * result + SetHashCode(CodeSet);
-        result = 31 * result + JavaHash.JavaStringHash(SubString);
+        result = 31 * result + LegacyHash.StringHash(SubString);
         result = 31 * result + SetHashCode(TagsSet);
-        result = 31 * result + JavaHash.JavaStringHash(Topic);
-        result = 31 * result + JavaHash.JavaStringHash(ExpressionType);
+        result = 31 * result + LegacyHash.StringHash(Topic);
+        result = 31 * result + LegacyHash.StringHash(ExpressionType);
         result &= 0xFFFFFFFFL;
         return unchecked((int)result);
     }
@@ -195,7 +195,7 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
         long h = 0;
         foreach (string e in s)
         {
-            h += JavaHash.JavaStringHash(e);
+            h += LegacyHash.StringHash(e);
             h &= 0xFFFFFFFFL;
         }
 
@@ -302,7 +302,7 @@ public static class FilterAPI
             if (tag.Length > 0)
             {
                 sub.TagsSet.Add(tag);
-                sub.CodeSet.Add(JavaHash.JavaStringHash(tag));
+                sub.CodeSet.Add(LegacyHash.StringHash(tag));
             }
         }
 

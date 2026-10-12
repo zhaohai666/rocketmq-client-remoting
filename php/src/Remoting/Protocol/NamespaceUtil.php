@@ -7,7 +7,7 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MixAll;
 
 /**
- * 命名空间工具（对应 org.apache.rocketmq.remoting.protocol.NamespaceUtil，移植自 protocol/namespace_util.py）。
+ * 命名空间工具。
  *
  * 命名空间用于多租户隔离：客户端把 ``namespace`` 以 ``namespace%`` 前缀拼到
  * topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层（listener、
@@ -23,7 +23,7 @@ final class NamespaceUtil
 {
     public const NAMESPACE_SEPARATOR = '%';
 
-    /** 摘掉 retry/DLQ 前缀（对应 Java withOutRetryAndDLQ）。 */
+    /** 摘掉 ``%RETRY%`` / ``%DLQ%`` 前缀，只留命名空间 + 资源名。 */
     public static function withOutRetryAndDlq(string $resource): string
     {
         return (string)MixAll::resetRetryAndDlqTopic($resource);
@@ -57,7 +57,7 @@ final class NamespaceUtil
     }
 
     /**
-     * 剥掉命名空间前缀（对应 Java 两个重载的 withoutNamespace）。
+     * 剥掉命名空间前缀。
      *
      * ``MQ_INST_XX%Topic`` → ``Topic``；``%RETRY%MQ_INST_XX%GID`` → ``%RETRY%GID``。
      * 未带该命名空间时原样返回。
@@ -90,7 +90,7 @@ final class NamespaceUtil
         return $resourceWithNamespace;
     }
 
-    /** 拼上命名空间前缀（对应 Java wrapNamespace）。 */
+    /** 拼上命名空间前缀（幂等：已带前缀或系统资源原样返回）。 */
     public static function wrapNamespace(string $namespace, string $resourceWithoutNamespace): string
     {
         if ($namespace === '' || $resourceWithoutNamespace === '') {
@@ -113,7 +113,7 @@ final class NamespaceUtil
         return sprintf('%s%s%s%s', $prefix, $namespace, self::NAMESPACE_SEPARATOR, $plain);
     }
 
-    /** ``%RETRY%<wrapNamespace(namespace, group)>``（对应 Java wrapNamespaceAndRetry）。 */
+    /** retry 主题的资源名包装：``%RETRY%<namespace%group>``。 */
     public static function wrapNamespaceAndRetry(string $namespace, string $consumerGroup): string
     {
         if ($consumerGroup === '') {
@@ -122,7 +122,7 @@ final class NamespaceUtil
         return MixAll::RETRY_GROUP_TOPIC_PREFIX . self::wrapNamespace($namespace, $consumerGroup);
     }
 
-    /** 从资源名里取出命名空间（对应 Java getNamespaceFromResource）。 */
+    /** 从资源名里取出命名空间；取不到返回空串。 */
     public static function getNamespaceFromResource(string $resource): string
     {
         if ($resource === '' || self::isSystemResource($resource)) {

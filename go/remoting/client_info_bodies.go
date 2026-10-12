@@ -2,17 +2,17 @@
 // ride inside ConsumerRunningInfo, and the direct-consume verdict.
 //
 // These answer GET_CONSUMER_RUNNING_INFO(307) and CONSUME_MESSAGE_DIRECTLY(309).
-// Field NAMES and the always-present/omitted split are pinned to the 5.5.1
-// jars; the probe output is quoted per struct below because a wrong key here
-// is silently dropped by fastjson2 on the broker side (it reflects by Java
-// property name, so `cacheMsgCount` instead of `cachedMsgCount` would just
-// disappear from the console).
+// Field NAMES and the always-present/omitted split are pinned to recorded
+// 5.5.1-server output; the probe output is quoted per struct below because a
+// wrong key here is silently dropped by fastjson2 on the broker side (it
+// reflects by property name, so `cacheMsgCount` instead of `cachedMsgCount`
+// would just disappear from the console).
 package remoting
 
 // ProcessQueueInfo mirrors body.ProcessQueueInfo.
 //
-// Probe (fastjson2 2.0.64, all 14 keys always present because every field is a
-// Java primitive):
+// Probe (recorded 5.5.1-server output; fastjson2 2.0.64, all 14 keys always
+// present because every field is a primitive):
 //
 //	empty  : {"cachedMsgCount":0,"cachedMsgMaxOffset":0,"cachedMsgMinOffset":0,
 //	          "cachedMsgSizeInMiB":0,"commitOffset":0,"droped":false,
@@ -22,9 +22,9 @@ package remoting
 //	filled : {... "cachedMsgSizeInMiB":3, "commitOffset":12345, "droped":true,
 //	          "locked":true, "tryUnlockTimes":9 ...}
 //
-// Note `cachedMsgSizeInMiB` is a Java **int** (not a float): Java stores
-// `(int) (msgSize / (1024 * 1024))`, so it is NOT one of the JavaDouble fields.
-// Note the spelling: `droped`, one `p` — Java's field name, not a typo here.
+// Note `cachedMsgSizeInMiB` is an **int** (not a float): the server stores
+// `(int) (msgSize / (1024 * 1024))`, so it is NOT one of the JSONDouble fields.
+// Note the spelling: `droped`, one `p` — the server's field name, not a typo.
 type ProcessQueueInfo struct {
 	CommitOffset int64
 
@@ -46,7 +46,7 @@ type ProcessQueueInfo struct {
 	LastConsumeTimestamp int64
 }
 
-// ToJSONValue renders every field: Java primitives are never omitted.
+// ToJSONValue renders every field: primitive fields are never omitted.
 func (p *ProcessQueueInfo) ToJSONValue() map[string]any {
 	return map[string]any{
 		"commitOffset": p.CommitOffset,
@@ -132,14 +132,16 @@ func (p *PopProcessQueueInfo) FromJSONValue(value any) error {
 
 func (p *PopProcessQueueInfo) Encode() []byte { return EncodeJSON(p.ToJSONValue()) }
 
-// CMResult mirrors org.apache.rocketmq.remoting.protocol.body.CMResult.
+// CMResult is the consume-message-directly result enum.
 //
-// Java ordinals (probed): CR_SUCCESS=0, CR_LATER=1, CR_ROLLBACK=2, CR_COMMIT=3,
-// CR_THROW_EXCEPTION=4, CR_RETURN_NULL=5. fastjson2 serialises the enum by NAME
-// (`"CR_SUCCESS"`), so the wire form is the string, not the ordinal.
+// Ordinals (probed against a 5.5.1 server): CR_SUCCESS=0, CR_LATER=1,
+// CR_ROLLBACK=2, CR_COMMIT=3, CR_THROW_EXCEPTION=4, CR_RETURN_NULL=5.
+// fastjson2 serialises the enum by NAME (`"CR_SUCCESS"`), so the wire form is
+// the string, not the ordinal.
 type CMResult string
 
-// CMResult values, spelled exactly as Java's enum constants.
+// CMResult values, spelled exactly as the server's enum constants; the wire
+// form is this name.
 const (
 	CMResultSuccess        CMResult = "CR_SUCCESS"
 	CMResultLater          CMResult = "CR_LATER"
@@ -173,7 +175,7 @@ type ConsumeMessageDirectlyResult struct {
 	SpentTimeMills int64
 }
 
-// NewConsumeMessageDirectlyResult returns the Java-default (order=false,
+// NewConsumeMessageDirectlyResult returns the protocol default (order=false,
 // autoCommit=true) instance.
 func NewConsumeMessageDirectlyResult() *ConsumeMessageDirectlyResult {
 	return &ConsumeMessageDirectlyResult{AutoCommit: true}

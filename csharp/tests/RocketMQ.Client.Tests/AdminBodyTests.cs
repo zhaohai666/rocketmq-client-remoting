@@ -64,7 +64,7 @@ public class AdminBodyTests
     }
 
     [Fact]
-    public void ConsumeStatsList_DecodeUsesJavaFieldName()
+    public void ConsumeStatsList_DecodeUsesLegacyFieldName()
     {
         // ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机
         // 341 响应会解析成空集合，看着像「这个 broker 没有积压」
@@ -135,7 +135,7 @@ public class AdminBodyTests
     // ------------------------------------------------------------- 订阅组
 
     [Fact]
-    public void SubscriptionGroupConfig_Defaults_MatchJavaProbe()
+    public void SubscriptionGroupConfig_Defaults_MatchLegacyProbe()
     {
         var c = new SubscriptionGroupConfig("MyGroup");
         string json = c.ToJson().Dump();

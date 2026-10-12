@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""RemotingCommand：RocketMQ 远程命令（对应 org.apache.rocketmq.remoting.protocol.RemotingCommand）。
+"""RemotingCommand：RocketMQ 远程命令（协议 remoting 包的命令对象）。
 
 线格式：totalLength(4) | headerLength(带序列化类型高8位, 4) | header | body
 header（JSON）：RemotingSerializable JSON 编码
@@ -21,7 +21,7 @@ SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type"
 SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE"
 REMOTING_VERSION_KEY = "rocketmq.remoting.version"
 
-# Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
+# 上报的协议版本号，对齐 5.5.1 集群（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
 # broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
 # `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
 # 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
@@ -69,10 +69,10 @@ class RemotingCommand:
     # ---------------- 工厂方法 ----------------
     @staticmethod
     def create_new_request_id() -> int:
-        """对应 Java ``RemotingCommand.createNewRequestId()``。
+        """生成新的请求 opaque（自增序号）。
 
-        异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque
-        （Java ``onExceptionImpl:728``）：旧请求还挂在 responseTable 里等超时，
+        异步发送换 broker 重试时必须给**同一个请求对象**换一个新 opaque：
+        旧请求还挂在 responseTable 里等超时，
         复用 opaque 会让两次尝试的应答串台。
         """
         return next(_request_id)
@@ -93,7 +93,7 @@ class RemotingCommand:
     @staticmethod
     def create_response_command(code: int = 0, remark: str = "not set any response code",
                                 class_header: Optional[Type] = None) -> Optional["RemotingCommand"]:
-        """与 Java createResponseCommand(int code, String remark, Class classHeader) 对齐。"""
+        """按 code/remark/classHeader 造一个响应命令。"""
         cmd = RemotingCommand(code=code, remark=remark)
         cmd.mark_response_type()
         _set_cmd_version(cmd)
@@ -110,7 +110,7 @@ class RemotingCommand:
 
     @staticmethod
     def get_protocol_type(source: int) -> int:
-        """返回序列化类型数值（与 Java byte getProtocolType 对齐），供与 SerializeType 常量比较。"""
+        """返回序列化类型数值（协议 getProtocolType 的高 8 位语义），供与 SerializeType 常量比较。"""
         return (source >> 24) & 0xFF
 
     @staticmethod
@@ -138,7 +138,7 @@ class RemotingCommand:
         return RemotingCommandType.RESPONSE_COMMAND if self.is_response_type() else RemotingCommandType.REQUEST_COMMAND
 
     def make_custom_header_to_net(self) -> None:
-        """把 custom_header 的非 None 字段写入 ext_fields（对应 Java 反射行为）。"""
+        """把 custom_header 的非 None 字段写入 ext_fields（协议侧按反射落字段）。"""
         if self.custom_header is not None:
             for name, value in self.custom_header.to_ext_fields().items():
                 if value is not None:
@@ -217,7 +217,7 @@ class RemotingCommand:
         return cmd
 
     def decode_command_custom_header(self, header_cls: Type, use_fast_encode: bool = True):
-        """把 ext_fields 映射到 header 对象（对应 Java decodeCommandCustomHeader）。
+        """把 ext_fields 映射到 header 对象（协议 decodeCommandCustomHeader）。
 
         优先走 header 自带的 from_ext_fields（短字段名等特殊映射），
         否则按属性名逐字段赋值并做基础类型转换。

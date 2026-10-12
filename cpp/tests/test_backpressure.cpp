@@ -243,7 +243,7 @@ void testNonPositiveRequestsAreBenign() {
 }
 
 // 12. 地板值与 Java 逐字对齐（DefaultMQProducer:1386 / :1402）
-void testFloorsMatchJava() {
+void testFloorsMatchDefaults() {
     expectEq(kMinAsyncSendNum, 10, "backPressureForAsyncSendNum floor");
     expectEq(kMinAsyncSendSize, 1024 * 1024, "backPressureForAsyncSendSize floor");
 }
@@ -286,7 +286,7 @@ int main() {
             testGrowWakesSomeoneBlockedOnTheOldCapacity);
     runCase("releaseBeyondTotalIsAllowed", testReleaseBeyondTotalIsAllowed);
     runCase("nonPositiveRequestsAreBenign", testNonPositiveRequestsAreBenign);
-    runCase("floorsMatchJava", testFloorsMatchJava);
+    runCase("floorsMatchDefaults", testFloorsMatchDefaults);
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);
     return fails == 0 ? 0 : 1;

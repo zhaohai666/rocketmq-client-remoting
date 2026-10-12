@@ -11,7 +11,7 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-const javaRouteBody = `{"orderTopicConf":null,` +
+const recordedRouteBody = `{"orderTopicConf":null,` +
 	`"queueDatas":[{"brokerName":"b1","readQueueNums":4,"writeQueueNums":4,"perm":6,"topicSysFlag":0},` +
 	`{"brokerName":"b2","readQueueNums":2,"writeQueueNums":2,"perm":4,"topicSysFlag":0},` +
 	`{"brokerName":"b3","readQueueNums":3,"writeQueueNums":3,"perm":6,"topicSysFlag":0}],` +
@@ -29,8 +29,8 @@ func mustRoute(t *testing.T, body string) *TopicRouteData {
 	return route
 }
 
-func TestDecodeTopicRouteDataJavaShape(t *testing.T) {
-	route := mustRoute(t, javaRouteBody)
+func TestDecodeTopicRouteDataServerShape(t *testing.T) {
+	route := mustRoute(t, recordedRouteBody)
 	if len(route.QueueDatas) != 3 || len(route.BrokerDatas) != 3 {
 		t.Fatalf("route decode lost entries: %d queues %d brokers", len(route.QueueDatas), len(route.BrokerDatas))
 	}
@@ -57,7 +57,7 @@ func TestDecodeTopicRouteDataJavaShape(t *testing.T) {
 }
 
 func TestDecodeRouteMappingEmptyVsAbsent(t *testing.T) {
-	empty := mustRoute(t, strings.Replace(javaRouteBody, `"filterServerTable":{}`,
+	empty := mustRoute(t, strings.Replace(recordedRouteBody, `"filterServerTable":{}`,
 		`"filterServerTable":{},"topicQueueMappingByBroker":{}`, 1))
 	if empty.TopicQueueMappingByBroker == nil || len(empty.TopicQueueMappingByBroker) != 0 {
 		t.Errorf("explicit {} must decode to empty non-nil, got %+v", empty.TopicQueueMappingByBroker)
@@ -65,7 +65,7 @@ func TestDecodeRouteMappingEmptyVsAbsent(t *testing.T) {
 }
 
 func TestGetAllMessageQueueMasterRequirement(t *testing.T) {
-	route := mustRoute(t, javaRouteBody)
+	route := mustRoute(t, recordedRouteBody)
 	mqs := route.GetAllMessageQueue("Tt")
 	// b1 perm 6 + master: 4 queues; b2 perm 4 (no write): skipped;
 	// b3 brokerAddrs has only id 1 (masterless): skipped.
@@ -80,7 +80,7 @@ func TestGetAllMessageQueueMasterRequirement(t *testing.T) {
 }
 
 func TestGetAllSubscribeMessageQueueReadPermOnly(t *testing.T) {
-	route := mustRoute(t, javaRouteBody)
+	route := mustRoute(t, recordedRouteBody)
 	mqs := route.GetAllSubscribeMessageQueue("Tt")
 	// b1 read 4 + b2 read 2 (perm 4 IS readable) + b3 read 3, masterlessness
 	// irrelevant on the subscribe side.
@@ -109,7 +109,7 @@ func TestBrokerDataDirtyAddrKeysSkipped(t *testing.T) {
 }
 
 func TestSelectBrokerAddr(t *testing.T) {
-	route := mustRoute(t, javaRouteBody)
+	route := mustRoute(t, recordedRouteBody)
 	b1 := route.BrokerDatas[0]
 	for i := 0; i < 10; i++ {
 		if addr, ok := b1.SelectBrokerAddr(); !ok || addr != "10.0.0.1:10911" {
@@ -127,30 +127,30 @@ func TestSelectBrokerAddr(t *testing.T) {
 }
 
 func TestTopicRouteDataChanged(t *testing.T) {
-	old := mustRoute(t, javaRouteBody)
-	if old.TopicRouteDataChanged(mustRoute(t, javaRouteBody)) {
+	old := mustRoute(t, recordedRouteBody)
+	if old.TopicRouteDataChanged(mustRoute(t, recordedRouteBody)) {
 		t.Errorf("identical routes must compare unchanged")
 	}
 	// topicSysFlag is excluded from the comparison (broker-only flag flip).
-	sysFlip := mustRoute(t, javaRouteBody)
+	sysFlip := mustRoute(t, recordedRouteBody)
 	sysFlip.QueueDatas[0].TopicSysFlag = 1
 	if sysFlip.TopicRouteDataChanged(old) {
 		t.Errorf("topicSysFlag flip must not look like a route change")
 	}
 	// zoneName / enableActingMaster are excluded (Java BrokerData.equals).
-	zoneMove := mustRoute(t, javaRouteBody)
+	zoneMove := mustRoute(t, recordedRouteBody)
 	zoneMove.BrokerDatas[0].ZoneName = "zone-2"
 	if zoneMove.TopicRouteDataChanged(old) {
 		t.Errorf("zone move must not look like a route change")
 	}
 	// A real address change does fire.
-	addrMove := mustRoute(t, javaRouteBody)
+	addrMove := mustRoute(t, recordedRouteBody)
 	addrMove.BrokerDatas[0].BrokerAddrs[0].Addr = "10.0.9.9:10911"
 	if !addrMove.TopicRouteDataChanged(old) {
 		t.Errorf("address change must be detected")
 	}
 	// Queue count change fires even when list order differs.
-	grow := mustRoute(t, javaRouteBody)
+	grow := mustRoute(t, recordedRouteBody)
 	grow.QueueDatas[0].WriteQueueNums = 8
 	if !grow.TopicRouteDataChanged(old) {
 		t.Errorf("queue growth must be detected")
@@ -169,7 +169,7 @@ func TestTopicPublishInfoRing(t *testing.T) {
 	if info.OK() {
 		t.Errorf("empty publish info must not be OK")
 	}
-	route := mustRoute(t, javaRouteBody)
+	route := mustRoute(t, recordedRouteBody)
 	info.UpdateFromRoute(route, "Tt")
 	if !info.OK() {
 		t.Fatalf("publish info must be OK after update")
@@ -207,7 +207,7 @@ func TestTopicPublishInfoRing(t *testing.T) {
 }
 
 func TestSubscriptionRouteFilterViaFindBrokerAddrInRoute(t *testing.T) {
-	route := mustRoute(t, javaRouteBody)
+	route := mustRoute(t, recordedRouteBody)
 	if addr, ok := FindBrokerAddrInRoute(route, "b2"); !ok || addr != "10.0.0.3:10911" {
 		t.Errorf("b2 = %q ok=%v", addr, ok)
 	}

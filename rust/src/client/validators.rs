@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn check_group_rules_and_texts_match_java() {
+    fn check_group_rules_and_texts_match_broker_contract() {
         for blank in ["", "   ", "\t "] {
             let (m, code) = client_err(check_group(blank).unwrap_err());
             assert_eq!(m, "the specified group is blank");
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn check_topic_rules_and_texts_match_java() {
+    fn check_topic_rules_and_texts_match_broker_contract() {
         let (m, _) = client_err(check_topic("").unwrap_err());
         assert_eq!(m, "The specified topic is blank");
         check_topic(&repeated('a', 127)).expect("127 应当放行");

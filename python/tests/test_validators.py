@@ -46,7 +46,7 @@ from common.topic_validator import (
 from remoting.protocol.codes import ResponseCode
 
 # Java 用查表实现字符白名单，这里用注释里的那条正则当独立参照，防止两边一起写错。
-JAVA_PATTERN = re.compile(r"^[%|a-zA-Z0-9_-]+$")
+RESOURCE_NAME_PATTERN = re.compile(r"^[%|a-zA-Z0-9_-]+$")
 
 
 def msg(topic: str = "T1", body: bytes = b"x") -> Message:
@@ -59,7 +59,7 @@ class TestTopicOrGroupCharset:
     @pytest.mark.parametrize("ch", list("%-_|") + list("abcXYZ") + list("0189"))
     def test_allowed_chars(self, ch):
         assert is_topic_or_group_illegal("t%s1" % ch) is False
-        assert JAVA_PATTERN.match("t%s1" % ch)
+        assert RESOURCE_NAME_PATTERN.match("t%s1" % ch)
 
     @pytest.mark.parametrize(
         "ch",
@@ -67,7 +67,7 @@ class TestTopicOrGroupCharset:
     )
     def test_illegal_ascii(self, ch):
         assert is_topic_or_group_illegal("t%s1" % ch) is True
-        assert JAVA_PATTERN.match("t%s1" % ch) is None
+        assert RESOURCE_NAME_PATTERN.match("t%s1" % ch) is None
 
     @pytest.mark.parametrize("ch", ["\u0080", "中", "\u00e9", "\uff01", "\U0001f600"])
     def test_non_ascii_is_illegal(self, ch):
@@ -81,7 +81,7 @@ class TestTopicOrGroupCharset:
     def test_pipe_is_a_legal_char(self):
         assert is_topic_or_group_illegal("topic|1") is False
 
-    def test_pattern_constant_matches_java_regex(self):
+    def test_pattern_constant_is_the_resource_name_regex(self):
         assert VALID_CHAR_PATTERN == "^[%|a-zA-Z0-9_-]+$"
 
     def test_length_limits(self):

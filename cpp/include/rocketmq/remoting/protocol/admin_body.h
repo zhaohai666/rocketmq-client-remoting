@@ -3,12 +3,12 @@
 //   TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
 //   TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody
 //
-// ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，fastjson2 会把键直接内联成 JSON 对象，
+// ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧 fastjson 会把键直接内联成 JSON 对象，
 // 产出**非法 JSON**，例如：
 //   {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
 // 因此 json.cpp 的解析器必须容忍"对象作为键"（保留原始 JSON 文本作键名），
 // 再由 parseMessageQueueKey() 还原成 MessageQueue。
-// 字段名与结构均由 Java 探针实测确认。
+// 字段名与结构均由 broker 侧序列化探针实测确认。
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_ADMIN_BODY_H
 #define ROCKETMQ_REMOTING_PROTOCOL_ADMIN_BODY_H
 
@@ -71,7 +71,7 @@ struct OffsetWrapper {
     int64_t lastTimestamp = 0;
     int64_t pullOffset = 0;
 
-    // 与 Java OffsetWrapper.getLag() 一致：brokerOffset - consumerOffset
+    // lag 协议语义：brokerOffset - consumerOffset
     int64_t lag() const { return brokerOffset - consumerOffset; }
 
     JsonValue toJson() const;
@@ -122,7 +122,7 @@ struct ConsumeQueueData {
     std::string msg;
     bool hasMsg = false;
 
-    JsonValue toJson() const;  // null 字段不序列化（同 Java）
+    JsonValue toJson() const;  // null 字段不序列化（broker 侧约定）
     static ConsumeQueueData fromJson(const JsonValue& v);
 };
 

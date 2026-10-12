@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn java_formula_on_two_points() {
+    fn tps_formula_on_two_points() {
         // 两个累计点：10 秒内 value 增 30、times 增 3 -> tps 3/s、avgpt 10
         let ss = compute_stats_data(&[(0, 100, 10), (10_000, 130, 13)]);
         assert_eq!(ss.sum, 30);
@@ -880,7 +880,7 @@ mod tests {
     // ---------------- ConsumerStatsManager ----------------
 
     #[test]
-    fn inc_semantics_match_java() {
+    fn inc_semantics_match_contract() {
         // TPS 类：value=消息数、times=调用次数；RT 类：value=耗时、times=调用次数
         let m = ConsumerStatsManager::new();
         m.inc_pull_tps(GROUP, TOPIC, 10);
@@ -902,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn key_is_topic_at_group_and_set_names_follow_java() {
+    fn key_is_topic_at_group_and_set_names_follow_contract() {
         let m = ConsumerStatsManager::new();
         assert_eq!(ConsumerStatsManager::key(TOPIC, GROUP), KEY);
         m.inc_consume_ok_tps("myGroup", "myTopic", 1);

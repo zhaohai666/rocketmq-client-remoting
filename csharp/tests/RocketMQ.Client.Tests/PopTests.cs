@@ -92,7 +92,7 @@ public class PopTests
     }
 
     [Fact]
-    public void GettersEnforceJavaLengthFloors()
+    public void GettersEnforceLegacyLengthFloors()
     {
         string[] seg7 = ExtraInfoUtil.Split(ExtraInfoUtil.BuildExtraInfo(0, 1, 2, 3, Topic, Broker, 4));
         string[] seg6 = ExtraInfoUtil.Split("0 1 2 3 0 broker-a");
@@ -193,7 +193,7 @@ public class PopTests
     }
 
     [Fact]
-    public void MapKeysMatchJavaFormat()
+    public void MapKeysMatchLegacyFormat()
     {
         Assert.Equal("0@3", ExtraInfoUtil.GetStartOffsetInfoMapKey(Topic, 3));
         Assert.Equal("qo3%7", ExtraInfoUtil.GetQueueOffsetKeyValueKey(3, 7));
@@ -208,7 +208,7 @@ public class PopTests
     // ------------------------------------------------ 2. 请求/响应头 extFields 键名
 
     [Fact]
-    public void PopMessageRequestHeaderUsesJavaFieldNamesVerbatim()
+    public void PopMessageRequestHeaderUsesLegacyFieldNamesVerbatim()
     {
         var h = new PopMessageRequestHeader
         {
@@ -295,7 +295,7 @@ public class PopTests
     }
 
     [Fact]
-    public void AckMessageRequestHeaderUsesJavaFieldNames()
+    public void AckMessageRequestHeaderUsesLegacyFieldNames()
     {
         var h = new AckMessageRequestHeader
         {
@@ -316,7 +316,7 @@ public class PopTests
     }
 
     [Fact]
-    public void ChangeInvisibleTimeHeadersUseJavaFieldNames()
+    public void ChangeInvisibleTimeHeadersUseLegacyFieldNames()
     {
         var req = new ChangeInvisibleTimeRequestHeader
         {
@@ -460,7 +460,7 @@ public class PopTests
     // ------------------------------------------------ 4. 状态名
 
     [Fact]
-    public void PopStatusNamesMatchJava()
+    public void PopStatusNamesMatchLegacy()
     {
         Assert.Equal("FOUND", PopStatusNames.Name(PopStatus.Found));
         Assert.Equal("NO_NEW_MSG", PopStatusNames.Name(PopStatus.NoNewMsg));

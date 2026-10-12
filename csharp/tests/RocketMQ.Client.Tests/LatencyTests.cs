@@ -41,7 +41,7 @@ public class LatencyTests
     [InlineData(10000, 10000)]
     [InlineData(15000, 30000)]
     [InlineData(60000, 30000)]
-    public void ComputeNotAvailableDuration_MatchesJavaTable(double latency, long expected)
+    public void ComputeNotAvailableDuration_MatchesLegacyTable(double latency, long expected)
     {
         var s = new MQFaultStrategy(true);
         Assert.Equal(expected, s.ComputeNotAvailableDuration(latency));

@@ -1,11 +1,8 @@
-// AsyncTraceDispatcher (Java
-// org.apache.rocketmq.client.trace.AsyncTraceDispatcher) — batches TraceContext
-// records, encodes them with the wire codec and ships them to the trace topic
-// through an internal producer.
+// AsyncTraceDispatcher：批量攒 TraceContext 记录，用线上编解码拼好之后经内部
+// producer 送进轨迹 topic。
 //
-// Degrade-first policy: trace must NEVER break the client. Broker down, topic
-// missing, producer failure — everything logs and drops; the data path keeps
-// running.
+// 降级优先：轨迹绝不能拖垮客户端。broker 掉线、topic 缺失、producer 失败——
+// 全部记日志并丢弃，数据面继续跑。
 import { Buffer } from 'node:buffer';
 import {
   TraceContext, TraceBean, TraceType, TraceMsgType,
@@ -23,13 +20,11 @@ export class AsyncTraceDispatcher {
   batchNum: number;
   traceTopic: string;
   regionId = '';
-  // Java AsyncTraceDispatcher.namespaceV2 (+ get/set): propagated to the
-  // internal trace producer in start() (Java AsyncTraceDispatcher:155) so the
-  // trace rpcs carry the nsd/ns extFields too.
+  // namespaceV2 会随内部 trace producer 一起下发，让轨迹 rpcs 也带上 nsd/ns 扩展字段，
+  // 便于 broker 侧按实例区分。
   namespaceV2: string | null = null;
-  // Java AsyncTraceDispatcher.maxMsgSize (default 128000): the trace payload is
-  // split into messages no larger than this (the internal trace producer's
-  // maxMessageSize is set to the same value in Java).
+  // trace 载荷按不超过 maxMsgSize 的大小切片发送；内部 trace producer 的
+  // maxMessageSize 与这里取同值，默认 128000。
   maxMsgSize = 128000;
   // The internal producer is created lazily on start() (zero-cost when trace
   // is disabled).
@@ -45,15 +40,13 @@ export class AsyncTraceDispatcher {
     this.groupName = groupName;
     this.traceType = traceType;
     this.batchNum = Math.min(Math.max(1, batchNum), 20);
-    // Default trace topic is RMQ_SYS_TRACE_TOPIC; a custom topic overrides it
-    // (Java's behaviour when setTraceTopicName is used).
+    // 默认轨迹 topic 为 RMQ_SYS_TRACE_TOPIC；显式指定 traceTopic 时覆盖默认。
     this.traceTopic = traceTopic || 'RMQ_SYS_TRACE_TOPIC';
   }
 
   setHostConsumer(_hostConsumer: any): void { /* reserved for future use */ }
   setHostProducer(_hostProducer: any): void { /* reserved for future use */ }
 
-  // Java AsyncTraceDispatcher#getNamespaceV2 / #setNamespaceV2.
   setNamespaceV2(namespaceV2: string | null): void { this.namespaceV2 = namespaceV2; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
 
@@ -63,18 +56,16 @@ export class AsyncTraceDispatcher {
     this._running = true;
     try {
       const { DefaultMQProducer } = await import('./producer.ts');
-      // Java names the internal producer group <group>_INNER_TRACE_PRODUCER.
+      // 内部 producer group 走 <group>_INNER_TRACE_PRODUCER 命名。
       const producer = new DefaultMQProducer(`${this.groupName}${TraceGroupNamePrefix}`);
       producer.setNamesrvAddr(this._nameSrvAddr);
-      // Java start():155 — traceProducer.setNamespaceV2(namespaceV2): without
-      // this the trace writes of a namespaceV2 client are the only requests
-      // the broker cannot attribute to the instance.
+      // 若客户端配置了 namespaceV2，内部 trace producer 也必须带上，否则轨迹 rpcs
+      // 就成了 broker 唯一无法归属到实例的请求。
       producer.setNamespaceV2(this.namespaceV2);
-      // Java keeps hook lists PER PRODUCER — the inner trace producer's own
-      // list is empty, so its sends are NOT traced. node's SendMessageHook
-      // registry is global; this flag restores Java's semantics by exempting
-      // the inner producer from the shared hooks (otherwise every trace-topic
-      // write would itself emit a spurious Pub record).
+      // hook 列表本应挂在每个 producer 上——内部 trace producer 自己的 hook 列表是
+      // 空的，它发的消息不再被 trace。node 端 SendMessageHook 是全局注册表，
+      // 因此用一个 skip 标记把内部 producer 从共享 hook 里豁免掉；否则每一条写
+      // trace topic 的动作都会再多出一条伪 Pub 记录。
       (producer as any)._skipSendHooks = true;
       await producer.start();
       this._producer = producer;
@@ -102,9 +93,8 @@ export class AsyncTraceDispatcher {
     return true;
   }
 
-  // appendEndTransaction builds the EndTransaction record of a transaction
-  // message (Java EndTransactionTraceHookImpl.endTransactionAfter). The
-  // transactionState is the LocalTransactionState enum NAME (wire literal).
+  // appendEndTransaction 构造事务消息的 EndTransaction 记录。transactionState 使用
+  // LocalTransactionState 枚举名（线上字面量）。
   appendEndTransaction(producerGroup: string, topic: string, msgId: string,
     transactionId: string | null, localTransactionState: number,
     fromTransactionCheck: boolean, brokerAddr: string): boolean {
@@ -121,7 +111,7 @@ export class AsyncTraceDispatcher {
       bean.msgId = msgId || '';
       bean.msgType = TraceMsgType.TRANSACTION;
       bean.transactionId = transactionId || '';
-      // LocalTransactionState ordinal -> Java enum name (TraceView lookups).
+      // LocalTransactionState 序号 -> 状态名（供控制台查询使用）。
       bean.transactionState =
         localTransactionState === 0 ? 'COMMIT_MESSAGE'
           : localTransactionState === 1 ? 'ROLLBACK_MESSAGE' : 'UNKNOW';
@@ -146,9 +136,8 @@ export class AsyncTraceDispatcher {
     // Drain the queue under a snapshot; appends during the send are kept for
     // the next round.
     const batch = this._queue.splice(0, this._queue.length);
-    // Java AsyncDataSendTask.flushData: accumulate encoded records and send a
-    // chunk every time the buffer reaches maxMsgSize — one oversized batch
-    // would otherwise be rejected by the broker's max message size check.
+    // 累积编码记录，缓冲区每次触顶 maxMsgSize 就切片发出——一大块超过 broker
+    // maxMessageSize 的批量会被 broker 拒收。
     let buffer = '';
     const keys = new Set<string>();
     const sendChunk = async (data: string, chunkKeys: Set<string>): Promise<void> => {

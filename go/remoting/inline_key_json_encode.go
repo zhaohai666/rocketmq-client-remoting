@@ -20,10 +20,10 @@
 //
 // The writer deliberately mirrors encoding/json's decisions elsewhere so the
 // output stays byte-identical to the previous encoder apart from the keys:
-//   - object keys are sorted (Java's TreeMap order for the fields that care;
-//     the stdlib sorted them too, so nothing else changes)
+//   - object keys are sorted (the server's TreeMap order for the fields that
+//     care; the stdlib sorted them too, so nothing else changes)
 //   - strings use encodeJSONNoEscape, i.e. no HTML escaping of < > &
-//   - float64 is rendered by FormatJavaDouble (Java's Double.toString layout)
+//   - float64 is rendered by FormatJSONDouble (the server's fastjson2 layout)
 //   - anything unrecognised falls back to encodeJSONNoEscape
 package remoting
 
@@ -34,17 +34,17 @@ import (
 	"strconv"
 )
 
-// EncodeFastJSON renders a body value with fastjson2's inline-object map keys.
+// EncodeInlineKeyJSON renders a body value with fastjson2's inline-object map keys.
 // Returns nil on failure, matching EncodeJSON.
-func EncodeFastJSON(v any) []byte {
+func EncodeInlineKeyJSON(v any) []byte {
 	var buf bytes.Buffer
-	if err := writeFastJSON(&buf, v); err != nil {
+	if err := writeInlineKeyJSON(&buf, v); err != nil {
 		return nil
 	}
 	return buf.Bytes()
 }
 
-func writeFastJSON(buf *bytes.Buffer, v any) error {
+func writeInlineKeyJSON(buf *bytes.Buffer, v any) error {
 	switch t := v.(type) {
 	case nil:
 		buf.WriteString("null")
@@ -57,15 +57,15 @@ func writeFastJSON(buf *bytes.Buffer, v any) error {
 		}
 		return nil
 	case string:
-		return writeFastJSONString(buf, t)
-	case JavaDouble:
-		buf.WriteString(FormatJavaDouble(float64(t)))
+		return writeInlineKeyJSONString(buf, t)
+	case JSONDouble:
+		buf.WriteString(FormatJSONDouble(float64(t)))
 		return nil
 	case float64:
-		buf.WriteString(FormatJavaDouble(t))
+		buf.WriteString(FormatJSONDouble(t))
 		return nil
 	case float32:
-		buf.WriteString(FormatJavaDouble(float64(t)))
+		buf.WriteString(FormatJSONDouble(float64(t)))
 		return nil
 	case JSONNumber:
 		// A raw literal that came off the wire; re-emit it unchanged.
@@ -106,12 +106,12 @@ func writeFastJSON(buf *bytes.Buffer, v any) error {
 	}
 
 	rv := reflect.ValueOf(v)
-	return writeFastJSONReflect(buf, rv)
+	return writeInlineKeyJSONReflect(buf, rv)
 }
 
-// writeFastJSONReflect handles the container kinds by reflection, so slices of
+// writeInlineKeyJSONReflect handles the container kinds by reflection, so slices of
 // any element type ([]map[string]any, []any, …) work without enumeration.
-func writeFastJSONReflect(buf *bytes.Buffer, rv reflect.Value) error {
+func writeInlineKeyJSONReflect(buf *bytes.Buffer, rv reflect.Value) error {
 	if !rv.IsValid() {
 		buf.WriteString("null")
 		return nil
@@ -123,7 +123,7 @@ func writeFastJSONReflect(buf *bytes.Buffer, rv reflect.Value) error {
 			return nil
 		}
 		// Unwrap one level, then recurse through the concrete-type fast path.
-		return writeFastJSON(buf, rv.Elem().Interface())
+		return writeInlineKeyJSON(buf, rv.Elem().Interface())
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.IsNil() {
 			buf.WriteString("null")
@@ -134,7 +134,7 @@ func writeFastJSONReflect(buf *bytes.Buffer, rv reflect.Value) error {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			if err := writeFastJSONReflect(buf, rv.Index(i)); err != nil {
+			if err := writeInlineKeyJSONReflect(buf, rv.Index(i)); err != nil {
 				return err
 			}
 		}
@@ -158,11 +158,11 @@ func writeFastJSONReflect(buf *bytes.Buffer, rv reflect.Value) error {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			if err := writeFastJSONString(buf, k); err != nil {
+			if err := writeInlineKeyJSONString(buf, k); err != nil {
 				return err
 			}
 			buf.WriteByte(':')
-			if err := writeFastJSONReflect(buf, rv.MapIndex(reflect.ValueOf(k))); err != nil {
+			if err := writeInlineKeyJSONReflect(buf, rv.MapIndex(reflect.ValueOf(k))); err != nil {
 				return err
 			}
 		}
@@ -181,7 +181,7 @@ func writeStdlibFallback(buf *bytes.Buffer, v any) error {
 	return nil
 }
 
-func writeFastJSONString(buf *bytes.Buffer, s string) error {
+func writeInlineKeyJSONString(buf *bytes.Buffer, s string) error {
 	raw, err := encodeJSONNoEscape(s)
 	if err != nil {
 		return err
@@ -199,7 +199,7 @@ func writeMQKeyedJSON(buf *bytes.Buffer, table mqKeyedJSON) error {
 		// The key is written UNQUOTED: fastjson2 expects the queue as an object.
 		buf.WriteString(e.key)
 		buf.WriteByte(':')
-		if err := writeFastJSON(buf, e.value); err != nil {
+		if err := writeInlineKeyJSON(buf, e.value); err != nil {
 			return err
 		}
 	}

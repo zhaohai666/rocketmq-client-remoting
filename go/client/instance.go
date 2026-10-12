@@ -1,7 +1,7 @@
 // Instance: the shared client factory behind every producer and consumer on
-// one clientId (Java MQClientInstance / Python MQClientInstance).
+// one clientId.
 //
-// Responsibilities ported here:
+// Responsibilities:
 //   - the topic route cache (route table + publish info + flat broker address
 //     table) and its nameserver refresh;
 //   - the address lookup family, each with its own master/slave discipline:
@@ -11,11 +11,12 @@
 //   - consumer heartbeats (34) — including slaves: each broker keeps its own
 //     ConsumerManager, and a slave that never sees a heartbeat rejects pulls
 //     with SUBSCRIPTION_NOT_EXIST;
-//   - the broker->client handlers Java registers at factory construction
+//   - the broker->client handlers wired at factory construction
 //     (40/220/221/326; 307/309 land with the push consumer, whose running-info
 //     beans they need);
-//   - the Java scheduled tasks with scheduleAtFixedRate anchoring (task n
+//   - the scheduled tasks with scheduleAtFixedRate anchoring (task n
 //     fires at initialDelay + (n-1)*period, never initialDelay + period).
+package client
 package client
 
 import (
@@ -33,32 +34,32 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// DefaultMQClientAPITimeoutMillis is the instance-level API timeout (Rust
-// MQ_CLIENT_API_TIMEOUT_MILLIS, Java MQClientAPIImpl's 3s default).
+// DefaultMQClientAPITimeoutMillis is the instance-level API timeout
+// (the classic remoting protocol's 3s default).
 const DefaultMQClientAPITimeoutMillis = int64(3000)
 
-// ClientInstanceConfig carries the instance-scoped knobs (the Java
-// ClientConfig fields MQClientInstance actually reads).
+// ClientInstanceConfig carries the instance-scoped knobs (the client config
+// fields the instance actually reads).
 type ClientInstanceConfig struct {
 	ConnectTimeoutMillis int64
 	InvokeTimeoutMillis  int64
 	TLSEnable            bool
 	// NamesrvWsAddr is the address-server URL; when set and no nameserver is
-	// configured, start() fetches addresses from it (Java TopAddressing).
+	// configured, start() fetches addresses from it (TopAddressing).
 	NamesrvWsAddr string
-	// PollNameServerIntervalMillis drives the route-refresh period (Java
-	// getPollNameServerInterval, default 30s).
+	// PollNameServerIntervalMillis drives the route-refresh period
+	// (getPollNameServerInterval, default 30s).
 	PollNameServerIntervalMillis int64
-	// NamesrvRefreshIntervalMillis drives the address-server re-fetch (Java
-	// 2 minutes).
+	// NamesrvRefreshIntervalMillis drives the address-server re-fetch
+	// (2 minutes).
 	NamesrvRefreshIntervalMillis int64
-	// HeartbeatIntervalMillis (Java getHeartbeatBrokerInterval, default 30s).
+	// HeartbeatIntervalMillis (getHeartbeatBrokerInterval, default 30s).
 	HeartbeatIntervalMillis int64
-	// PersistConsumerOffsetIntervalMillis (Java default 5s).
+	// PersistConsumerOffsetIntervalMillis (default 5s).
 	PersistConsumerOffsetIntervalMillis int64
 }
 
-// NewClientInstanceConfig returns the Java defaults.
+// NewClientInstanceConfig returns the classic defaults.
 func NewClientInstanceConfig() ClientInstanceConfig {
 	return ClientInstanceConfig{
 		ConnectTimeoutMillis:                3000,
@@ -70,9 +71,9 @@ func NewClientInstanceConfig() ClientInstanceConfig {
 	}
 }
 
-// Consumer is the instance's view of one registered consumer (Java
-// MQConsumerInner / Rust RegisteredConsumer). Every method is driven by the
-// instance: heartbeat assembly, offset persistence, broker pushes.
+// Consumer is the instance's view of one registered consumer (MQConsumerInner).
+// Every method is driven by the instance: heartbeat assembly, offset
+// persistence, broker pushes.
 type Consumer interface {
 	// ConsumerGroup is ConsumerData.groupName.
 	ConsumerGroup() string
@@ -87,7 +88,7 @@ type Consumer interface {
 	// RebalanceImmediately is the fan-out of broker's
 	// NOTIFY_CONSUMER_IDS_CHANGED(40).
 	RebalanceImmediately()
-	// AdjustThreadPool is the periodic elasticity sweep (no-op in Java too).
+	// AdjustThreadPool is the periodic elasticity sweep (a no-op by design).
 	AdjustThreadPool()
 	// ResetOffset handles RESET_CONSUMER_CLIENT_OFFSET(220); the instance
 	// already runs it off the remoting read goroutine.
@@ -96,8 +97,8 @@ type Consumer interface {
 	// topic means the request header carried none.
 	GetConsumerStatus(topic *string) remoting.MQOffsetTable
 	// ConsumerRunningInfo answers GET_CONSUMER_RUNNING_INFO(307). The body's
-	// shape is per consumer TYPE (Java MQConsumerInner.consumerRunningInfo):
-	// push adds mqTable/mqPopTable/statusTable, pull stops at properties +
+	// shape is per consumer TYPE (consumerRunningInfo): push adds
+	// mqTable/mqPopTable/statusTable, pull stops at properties +
 	// subscriptionSet. The instance adds the three instance-level properties on
 	// top, which is why this method must NOT do that itself.
 	ConsumerRunningInfo() *remoting.ConsumerRunningInfo
@@ -112,9 +113,8 @@ var (
 	registry   = map[string]*Instance{}
 )
 
-// CreateOrGetInstance mirrors Java MQClientManager.getOrCreateMQClientInstance:
-// an existing live instance with the same clientId is REUSED (the first
-// caller's config wins).
+// CreateOrGetInstance is the classic instance registry lookup: an existing live instance
+// with the same clientId is REUSED (the first caller's config wins).
 func CreateOrGetInstance(clientID string, nameServerAddrs []string, config ClientInstanceConfig) *Instance {
 	registryMu.Lock()
 	defer registryMu.Unlock()
@@ -169,15 +169,15 @@ type Instance struct {
 	consumerGroupTable map[string]struct{}
 	tablesMu           sync.Mutex
 
-	// consumerStats is the shared ConsumerStatsManager (Java
-	// MQClientInstance.consumerStatsManager). Registered consumers record into
+	// consumerStats is the shared consumer stats manager
+	// (consumerStatsManager). Registered consumers record into
 	// it; GET_CONSUMER_RUNNING_INFO(307) reads it back per subscribed topic.
 	consumerStats *consumerStatsManager
 
 	consumerIDsChanged atomic.Int64
 
 	// hooksInstalled guards EnsureRPCHooks. The hook chain belongs to the
-	// INSTANCE (Java builds it once in MQClientAPIImpl's constructor), and
+	// INSTANCE (it is built once, at transport construction), and
 	// Start() may be called more than once by the same or by a second tenant,
 	// so it must not be appended to twice.
 	hooksInstalled bool
@@ -216,8 +216,8 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 // ClientID returns the instance's client id.
 func (i *Instance) ClientID() string { return i.clientID }
 
-// EnsureRPCHooks installs the RPC hook chain exactly once, in Java's order
-// (MQClientAPIImpl's constructor, lines 329-335):
+// EnsureRPCHooks installs the RPC hook chain exactly once, in the classic
+// order (built with the transport):
 //
 //	NamespaceRpcHook -> StreamTypeRPCHook (if enabled) -> user hook -> DynamicalExtFieldRPCHook
 //
@@ -225,12 +225,12 @@ func (i *Instance) ClientID() string { return i.clientID }
 // fields must be present BEFORE the user's hook runs, while the zone fields
 // are added after it and stay unsigned. See remoting/rpchooks.go.
 //
-// Java ties the chain to the MQClientInstance, which is keyed by clientId and
-// created once; the first creator's hook wins and later tenants share it. This
-// port mirrors that: the first call installs, later calls are no-ops. A second
-// tenant therefore does NOT get its own user hook on a shared instance — that
-// is Java behaviour, and silently stacking a second ACL hook would corrupt
-// every signature instead.
+// The classic remoting client ties the chain to the shared instance, which is
+// keyed by clientId and created once; the first creator's hook wins and later
+// tenants share it. This port mirrors that: the first call installs, later calls
+// are no-ops. A second tenant therefore does NOT get its own user hook on a
+// shared instance — that is the intended behaviour, and silently stacking a
+// second ACL hook would corrupt every signature instead.
 func (i *Instance) EnsureRPCHooks(namespaceV2 string, stream bool, userHook remoting.RPCHook) {
 	i.mu.Lock()
 	if i.hooksInstalled {
@@ -280,8 +280,8 @@ func (i *Instance) ConsumerIDsChangedCount() int64 { return i.consumerIDsChanged
 
 // ---------------- consumer / producer registration ----------------
 
-// RegisterConsumer installs a consumer under its group (no conflict check,
-// same as the plain dict/HashMap assignment in Python/Java).
+// RegisterConsumer installs a consumer under its group with a plain map
+// assignment — no conflict check.
 func (i *Instance) RegisterConsumer(group string, consumer Consumer) {
 	i.tablesMu.Lock()
 	defer i.tablesMu.Unlock()
@@ -326,8 +326,8 @@ func (i *Instance) RegisterProducer(group string) {
 	i.producerTable[group] = struct{}{}
 }
 
-// UnregisterProducer must run BEFORE Shutdown (Java shutdown ordering), so
-// the departing producer does not block the factory's teardown.
+// UnregisterProducer must run BEFORE Shutdown (the classic client shutdown
+// ordering), so the departing producer does not block the factory's teardown.
 func (i *Instance) UnregisterProducer(group string) {
 	i.tablesMu.Lock()
 	defer i.tablesMu.Unlock()
@@ -366,17 +366,17 @@ func (i *Instance) HasConsumerGroup(group string) bool {
 	return ok
 }
 
-// tenantCount is the shutdown guard's three tables (Java shutdown reads
-// producerTable / consumerTable / ... sizes).
+// tenantCount is the shutdown guard's three tables summed (the guard refuses
+// teardown while any producer/consumer is still registered).
 func (i *Instance) tenantCount() int {
 	i.tablesMu.Lock()
 	defer i.tablesMu.Unlock()
 	return len(i.consumerTable) + len(i.producerTable) + len(i.consumerGroupTable)
 }
 
-// RebalanceImmediately pokes every registered consumer (Java
-// rebalanceImmediately wakes the shared rebalance service; without such a
-// shared thread each consumer wakes its own loop).
+// RebalanceImmediately pokes every registered consumer (the classic design
+// wakes a shared rebalance service; without such a shared thread each
+// consumer wakes its own loop).
 func (i *Instance) RebalanceImmediately() {
 	for _, c := range i.consumersSnapshot() {
 		c.RebalanceImmediately()
@@ -395,10 +395,9 @@ func (i *Instance) RegisterTopicInUse(topic string) {
 
 // ---------------- broker -> client handlers ----------------
 
-// registerClientProcessors wires the instance-level processors (Python
-// registers 326/220/221/307/309/40 at construction — Java's
-// ClientRemotingProcessor, built once in MQClientAPIImpl's constructor and not
-// per consumer).
+// registerClientProcessors wires the instance-level processors — the classic
+// remoting client builds its client processor once at transport construction
+// (326/220/221/307/309/40), not per consumer.
 func (i *Instance) registerClientProcessors() {
 	i.remoting.RegisterProcessor(remoting.ReqNotifyConsumerIDsChanged, i.processNotifyConsumerIDsChanged)
 	i.remoting.RegisterProcessor(remoting.ReqResetConsumerClientOffset, i.processResetOffset)
@@ -412,27 +411,27 @@ func (i *Instance) registerClientProcessors() {
 // processNotifyUnsubscribeLite (200073) is registered for exactly one reason:
 // to keep it off the "no processor for request code" WARN path.
 //
-// Java's MQClientAPIImpl registers this code against the shared
-// ClientRemotingProcessor, and that processor's switch has NO case for it — so
-// Java falls through to `default: break; return null;` and answers nothing, and
-// the broker only ever sends it with invokeOneway (Broker2Client:66) so nothing
-// is waiting for an answer. In other words the whole feature is vestigial on the
-// classic-remoting path (only the gRPC proxy's ProxyClientRemotingProcessor acts
-// on it). Reproducing Java means doing nothing here — deliberately NOT even
-// calling sink.Respond, because Java would not reply to a sync sender either.
+// In the classic remoting protocol this code is registered against the shared
+// client processor, but that processor's switch has NO case for it — it falls
+// through to `default: break;` and answers nothing, and the broker only ever
+// sends it oneway, so nothing is waiting for an answer. In other words the
+// whole feature is vestigial on the classic-remoting path (only the gRPC
+// proxy's client processor acts on it). Following the protocol means doing
+// nothing here — deliberately NOT even calling sink.Respond, because the
+// classic processor would not reply to a sync sender either.
 func (i *Instance) processNotifyUnsubscribeLite(_ *remoting.RemotingCommand, addr string, _ *remoting.ResponseSink) {
 	common.LogDebugf("remoting: NOTIFY_UNSUBSCRIBE_LITE(200073) from %s; nothing to do on the classic path", addr)
 }
 
-// ackIfWanted answers the push. Java's processor returns null (no reply) for
+// ackIfWanted answers the push. The classic processor returns no reply for
 // 40/220 and the broker sends both oneway; Respond itself drops replies for
 // oneway pushes, so a hypothetical sync pusher still gets its SUCCESS.
 func (i *Instance) ackIfWanted(sink *remoting.ResponseSink) {
 	sink.Respond(remoting.CreateResponseCommand(remoting.RespSuccess, ""))
 }
 
-// processNotifyConsumerIdsChanged: one INFO line copied from Java
-// (ClientRemotingProcessor#notifyConsumerIdsChanged), then rebalance
+// processNotifyConsumerIdsChanged: logs the broker's notification with the
+// classic remoting protocol's fixed wording, then rebalance
 // immediately. Failures must not surface to the broker connection.
 func (i *Instance) processNotifyConsumerIDsChanged(request *remoting.RemotingCommand, addr string, sink *remoting.ResponseSink) {
 	var header remoting.NotifyConsumerIdsChangedRequestHeader
@@ -447,7 +446,8 @@ func (i *Instance) processNotifyConsumerIDsChanged(request *remoting.RemotingCom
 	i.ackIfWanted(sink)
 }
 
-// processResetOffset (220): no reply (Java returns null); the actual reset
+// processResetOffset (220): no reply (the classic processor answers none);
+// the actual reset
 // runs on its own goroutine because rebalance/lock/batch inside it make sync
 // calls that must not block the remoting read loop.
 func (i *Instance) processResetOffset(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
@@ -507,17 +507,17 @@ func (i *Instance) processGetConsumerStatus(request *remoting.RemotingCommand, _
 }
 
 // processGetConsumerRunningInfo (307) answers with this client's
-// ConsumerRunningInfo. Java ClientRemotingProcessor#getConsumerRunningInfo.
+// ConsumerRunningInfo, per the classic remoting protocol's processor contract.
 //
 // The reply shape is a three-way contract:
-//   - an unknown group is SYSTEM_ERROR with Java's exact remark text (the admin
-//     surfaces it verbatim, so it is not paraphrased);
+//   - an unknown group is SYSTEM_ERROR with the protocol's fixed remark text
+//     (the admin surfaces it verbatim, so it is not paraphrased);
 //   - a known group gets SUCCESS with the body from Instance.consumerRunningInfo;
 //   - jstack is only collected when the request asked for it, and its presence
 //     in the body is what tells the admin the dump is real — an absent key is
-//     how Java reports "not collected".
+//     how the protocol reports "not collected".
 //
-// The body must be encoded with EncodeFastJSON: mqTable/mqPopTable key their
+// The body must be encoded with EncodeInlineKeyJSON: mqTable/mqPopTable key their
 // entries by MessageQueue as a raw inline object, and encoding/json cannot emit
 // that (it validates Marshaler output). See remoting.mqKeyedJSON.
 func (i *Instance) processGetConsumerRunningInfo(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
@@ -535,10 +535,11 @@ func (i *Instance) processGetConsumerRunningInfo(request *remoting.RemotingComma
 		return
 	}
 	if header.JstackEnable != nil && *header.JstackEnable {
-		// Java dumps every THREAD here; Go's analogue is every goroutine. The
-		// format differs (it is a goroutine stack, not a JVM one), but the field
-		// exists precisely so an operator can see where the client is stuck, and
-		// an empty string would say "not collected" instead.
+		// The protocol's jstack field is a full thread dump; Go's analogue
+		// is every goroutine. The format differs (it is a goroutine stack, not
+		// a thread dump), but the field exists precisely so an operator can see
+		// where the client is stuck, and an empty string would say
+		// "not collected" instead.
 		info.Jstack = collectGoroutineStacks()
 		info.HasJstack = true
 	}
@@ -551,14 +552,16 @@ func (i *Instance) processGetConsumerRunningInfo(request *remoting.RemotingComma
 // processConsumeMessageDirectly (309) hands one broker-supplied message to the
 // local listener and returns its verdict.
 //
-// Java ClientRemotingProcessor#consumeMessageDirectly answers SYSTEM_ERROR with
-// the same "not exist" remark when MQClientInstance.consumerRunningInfo-style
-// lookup fails, and MQClientInstance#consumeMessageDirectly returns null for any
-// consumer that is not a DefaultMQPushConsumerImpl — so a pull or lite consumer
+// The classic processor answers SYSTEM_ERROR with
+// the same "not exist" remark when the instance-level running-info lookup
+// fails, and its consumeMessageDirectly dispatch returns nothing for any
+// consumer that is not a push consumer — so a pull or lite consumer
 // group produces that same error, not a silent success.
 //
-// The listener runs on its own goroutine. Java runs it on the Netty handler
-// thread, which this port must not copy: the remoting read loop is shared with
+// The listener runs on its own goroutine. The classic client runs it on the
+// Netty handler thread, which this port must not copy: the remoting read loop
+// is shared with every other response on the connection, and a listener that
+// makes a
 // every other response on the connection, and a listener that makes a
 // synchronous request (sendMessageBack, a downstream call) would wait on a
 // response only that loop can deliver. The reply still goes out strictly after
@@ -594,13 +597,14 @@ func (i *Instance) processConsumeMessageDirectly(request *remoting.RemotingComma
 		sink.Respond(remoting.CreateResponseCommand(remoting.RespSystemError, "empty message body"))
 		return
 	}
-	// Java MessageDecoder.clientDecode(body, readBody=true), which is
+	// The classic client decodes this body with its client-side message decoder,
+	// readBody=true, i.e.
 	// decode(bb, readBody=true, deCompressBody=true, isClient=true,
 	// isSetPropertiesString=false, checkCRC=false) — exactly
 	// common.DefaultDecodeOptions(). So the body is one stored message with its
 	// body present, DECOMPRESSED if the sysFlag says so, and with IsClient set
 	// (a MessageClientExt, i.e. MsgID also lands in OffsetMsgID).
-	// (Plain MessageDecoder.decode, by contrast, passes isClient=false; using it
+	// (Plain non-client decode, by contrast, passes isClient=false; using it
 	// here would drop OffsetMsgID from every 309 delivery.)
 	msg, err := common.DecodeMessage(request.Body)
 	if err != nil {
@@ -636,10 +640,10 @@ func collectGoroutineStacks() string {
 }
 
 // processReplyMessage (326) routes a broker-pushed reply to the producer
-// future waiting on its correlationId (Rust process_reply_message, Python
-// _process_reply_message). The holder removes the future first, so a late or
-// duplicate push lands in the unmatched branch — a normal race, warned about
-// exactly like Java. Decode success answers SUCCESS either way.
+// future waiting on its correlationId. The holder removes the future first, so
+// a late or duplicate push lands in the unmatched branch — a normal race,
+// warned about with the protocol's fixed wording. Decode success answers
+// SUCCESS either way.
 func (i *Instance) processReplyMessage(request *remoting.RemotingCommand, _ string, sink *remoting.ResponseSink) {
 	var header remoting.ReplyMessageRequestHeader
 	header.FromExtFields(request.ExtFields())
@@ -662,11 +666,11 @@ func (i *Instance) processReplyMessage(request *remoting.RemotingCommand, _ stri
 
 // Start flips started and spawns the scheduled tasks. Multiple
 // producers/consumers on one clientId all call it; only the first has effect
-// (Java started.compareAndSet).
+// (a compareAndSet on the started flag).
 //
 // When no nameserver is configured but the address-server URL is, the first
 // fetch happens synchronously; a failed or empty fetch tears the instance
-// down and reports Java's 10004 (NoNameServerException) rather than letting
+// down and reports error code 10004 (NoNameServerException) rather than letting
 // every later send fail with the misleading no-route (10005).
 func (i *Instance) Start() error {
 	if !i.started.CompareAndSwap(false, true) {
@@ -685,8 +689,8 @@ func (i *Instance) Start() error {
 			return common.ClientErrorCode(common.NoNameServerException,
 				fmt.Sprintf("name server address is not set and address server (%s) returned none", ws))
 		}
-		// scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min) — Java only
-		// schedules this task when the address server is in play.
+		// scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min): this task is
+		// only scheduled when the address server is in play.
 		i.spawnPeriodic(func() {
 			if err := i.FetchNameServerAddr(); err != nil {
 				common.LogDebugf("fetchNameServerAddr exception: %v", err)
@@ -701,7 +705,7 @@ func (i *Instance) Start() error {
 			}
 		}
 	}, 10, i.config.PollNameServerIntervalMillis)
-	// Java bundles cleanOfflineBroker INTO the heartbeat task.
+	// cleanOfflineBroker is bundled INTO the heartbeat task.
 	i.spawnPeriodic(func() {
 		i.cleanOfflineBroker()
 		i.SendHeartbeatToAllBroker(5000)
@@ -712,14 +716,14 @@ func (i *Instance) Start() error {
 	i.spawnPeriodic(func() {
 		i.AdjustThreadPools()
 	}, 60_000, 60_000)
-	// The five consumer-stats sets (Java schedules these from the StatsItemSet
-	// constructor, i.e. at MQClientInstance construction; same cadences, tied
+	// The five consumer-stats sets (scheduled per the classic protocol's stats
+	// reporting, i.e. from instance construction; same cadences, tied
 	// here to the instance's stop channel).
 	i.consumerStats.schedule(i)
 	return nil
 }
 
-// Shutdown applies Java's guard: while any producer/consumer is still
+// Shutdown applies the classic guard: while any producer/consumer is still
 // registered the factory stays alive (the departing client must not rip out
 // heartbeats, route refreshes and connections still in use).
 func (i *Instance) Shutdown() {
@@ -739,8 +743,8 @@ func (i *Instance) DetachFromRegistryIfLastTenant() {
 	}
 }
 
-// shutdownFactory is Java's RUNNING teardown, also used by a failed start
-// (Java cleanupAfterStartFailure + removeClientFactory).
+// shutdownFactory is the RUNNING-state teardown, also used by a failed start
+// (cleanup after start failure plus removal from the client factory).
 func (i *Instance) shutdownFactory() {
 	i.started.Store(false)
 	i.stopOnce.Do(func() { close(i.stop) })
@@ -797,7 +801,7 @@ func (i *Instance) topicsInUseSnapshot() []string {
 }
 
 // AdjustThreadPools runs the elasticity sweep per consumer, swallowing
-// failures (Java adjustThreadPool: catch Exception ignored).
+// failures (the classic sweep catches and ignores any exception).
 func (i *Instance) AdjustThreadPools() {
 	for _, c := range i.consumersSnapshot() {
 		c.AdjustThreadPool()
@@ -817,8 +821,8 @@ func (i *Instance) PersistConsumerOffsets() {
 // ---------------- nameserver address fetch ----------------
 
 // FetchNameServerAddr GETs the address-server URL and applies the response
-// only when it changed (Java MQClientAPIImpl.fetchNameServerAddr). The body's
-// first ';' field is the address list.
+// only when it changed (the classic remoting protocol's address-server fetch).
+// The body's first ';' field is the address list.
 func (i *Instance) FetchNameServerAddr() error {
 	wsAddr := i.config.NamesrvWsAddr
 	if wsAddr == "" {
@@ -882,7 +886,8 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 	}
 	// RocketMQ 5.x nameservers do not synthesize a default route for unknown
 	// topics (they answer TOPIC_NOT_EXIST); a PRODUCER must fall back to the
-	// default topic the way the Java client does to build its publish info.
+	// default topic, as the classic remoting protocol prescribes, to build its
+	// publish info.
 	if route == nil && isDefault && topic != common.DefaultTopic {
 		route, err = i.fetchTopicRouteFromNamesrv(common.DefaultTopic, timeoutMillis, addrs)
 		if err != nil {
@@ -907,9 +912,9 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 	}
 	i.mu.Lock()
 	i.topicRouteTable[topic] = route
-	// Java stores the route's own brokerAddrs map by shared reference, so its
-	// "only overwrite when changed" still refreshes; overwriting unconditionally
-	// here is the same end state.
+	// The route's own brokerAddrs map is stored by shared reference, so the
+	// classic "only overwrite when changed" still refreshes; overwriting
+	// unconditionally here is the same end state.
 	for _, bd := range route.BrokerDatas {
 		addrs := make(map[int64]string, len(bd.BrokerAddrs))
 		for _, pair := range bd.BrokerAddrs {
@@ -931,8 +936,7 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 // response that is NOT a route (non-SUCCESS, or SUCCESS without body) stops
 // the search — the remaining nameservers would answer the same; only
 // transport/decode errors move on to the next one. Afterwards the LAST such
-// error is rethrown unless it is a broker-business error (Python's exact
-// wording).
+// error is rethrown unless it is a broker-business error.
 func (i *Instance) fetchTopicRouteFromNamesrv(topic string, timeoutMillis int64, addrs []string) (*TopicRouteData, error) {
 	var lastErr error
 	for _, nsAddr := range addrs {
@@ -979,7 +983,7 @@ func (i *Instance) GetTopicPublishInfo(topic string, isDefault bool) (*TopicPubl
 }
 
 // GetTopicRouteData returns the cached route, fetching once when missing
-// (fetch errors are swallowed — Python's except Exception: pass).
+// (fetch errors are swallowed).
 func (i *Instance) GetTopicRouteData(topic string) *TopicRouteData {
 	if route := i.RouteOf(topic); route != nil {
 		return route
@@ -992,7 +996,8 @@ func (i *Instance) GetTopicRouteData(topic string) *TopicRouteData {
 
 // GetTopicSubscribeInfo returns every READABLE queue of the topic for the
 // consumer side (rebalance's topicSubscribeInfoTable). Empty list is fine —
-// Java's rebalanceByTopic only warns and keeps the existing assignment.
+// rebalancing on an empty subscription list only warns and keeps the existing
+// assignment.
 func (i *Instance) GetTopicSubscribeInfo(topic string) []common.MessageQueue {
 	route := i.GetTopicRouteData(topic)
 	if route == nil {
@@ -1015,8 +1020,8 @@ func (i *Instance) PublishInfoOf(topic string) *TopicPublishInfo {
 	return i.topicPublishInfoTable[topic]
 }
 
-// FindBrokerAddrInRoute picks an address for the broker inside one route
-// (Python find_broker_addr_in_route staticmethod): master preferred, else any.
+// FindBrokerAddrInRoute picks an address for the broker inside one route:
+// master preferred, else any.
 func FindBrokerAddrInRoute(route *TopicRouteData, brokerName string) (string, bool) {
 	for _, bd := range route.BrokerDatas {
 		if bd.BrokerName == brokerName {
@@ -1035,8 +1040,7 @@ func (i *Instance) BrokerAddrForTopic(topic string) (string, error) {
 }
 
 // AddrFor resolves an address by topic, optionally pinned to a broker name.
-// An empty brokerName degrades to "the first broker in the route" like
-// Python's _addr_for.
+// An empty brokerName degrades to "the first broker in the route".
 func (i *Instance) AddrFor(topic, brokerName string) (string, error) {
 	route := i.GetTopicRouteData(topic)
 	if route == nil {
@@ -1073,8 +1077,8 @@ func (i *Instance) BrokerAddr(mq common.MessageQueue) (string, error) {
 	return addr, nil
 }
 
-// BrokerAddrOf searches ALL cached routes for the broker name (Python
-// broker_addr_of) — "any one of its addrs will do" (master preferred, slave
+// BrokerAddrOf searches ALL cached routes for the broker name — "any one of
+// its addrs will do" (master preferred, slave
 // fallback).
 func (i *Instance) BrokerAddrOf(brokerName string) (string, bool) {
 	i.mu.Lock()
@@ -1092,7 +1096,8 @@ func (i *Instance) BrokerAddrOf(brokerName string) (string, bool) {
 }
 
 // FindBrokerAddressInPublish returns ONLY the master (brokerId 0) address from
-// the flat table (Java findBrokerAddressInPublish). This is the send path:
+// the flat table — the classic remoting protocol's publish lookup. This is the
+// send path:
 // when the master is gone the honest answer is "not exist" — sending to a
 // slave burns a whole retry round on SYSTEM_BUSY(2) with the wrong error
 // type. Not found is a normal outcome (that is exactly a downed master); the
@@ -1179,9 +1184,10 @@ func (i *Instance) cachedRoutes() []*TopicRouteData {
 	return out
 }
 
-// ConsumerOffsetAddr is RemoteBrokerOffsetStore's address discipline (Java
-// fetchConsumeOffsetFromBroker): master first; on a miss refresh the route,
-// then retry RELAXED — offsets are HA-replicated, Java reads them from slaves.
+// ConsumerOffsetAddr is the remote offset store's address discipline:
+// master first; on a miss refresh the route,
+// then retry RELAXED — offsets are HA-replicated, so the broker serves offset
+// reads from slaves too.
 func (i *Instance) ConsumerOffsetAddr(mq common.MessageQueue) (string, error) {
 	addr, ok := i.FindBrokerAddressInPublish(mq.BrokerName)
 	if !ok {
@@ -1197,8 +1203,8 @@ func (i *Instance) ConsumerOffsetAddr(mq common.MessageQueue) (string, error) {
 }
 
 // cleanOfflineBroker drops brokerAddrTable entries no cached route still
-// mentions (Java MQClientInstance#cleanOfflineBroker, which schedules this
-// inside the heartbeat task).
+// mentions, mirroring the classic heartbeat task which runs this sweep
+// alongside the send.
 func (i *Instance) cleanOfflineBroker() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -1233,7 +1239,7 @@ func (i *Instance) cleanOfflineBroker() {
 // ---------------- heartbeat ----------------
 
 // PrepareHeartbeatData assembles the heartbeat across all registered
-// consumers (Java prepareHeartbeatData; clientId is the instance's).
+// consumers (clientId is the instance's).
 func (i *Instance) PrepareHeartbeatData() *remoting.HeartbeatData {
 	hb := remoting.NewHeartbeatData(i.clientID)
 	for _, c := range i.consumersSnapshot() {
@@ -1308,7 +1314,8 @@ func (i *Instance) findBrokerAddrByTopic(topic string) (string, bool) {
 }
 
 // CheckClientInBroker validates every registered consumer's subscriptions at
-// the broker (Java checkClientInBroker). Only non-TAG expressions go on the
+// the broker (CHECK_CLIENT_CONFIG, the classic remoting protocol's
+// pre-flight check). Only non-TAG expressions go on the
 // wire: a broken SQL92 filter compiles to nothing on the broker and
 // ExpressionMessageFilter then admits ALL messages — a silent subscribe-all.
 // This call turns the broken expression into a startup-time failure.
@@ -1316,7 +1323,7 @@ func (i *Instance) CheckClientInBroker() error {
 	for _, c := range i.consumersSnapshot() {
 		subs := c.Subscriptions()
 		if len(subs) == 0 {
-			// Java returns (not continues) on a subscription-less consumer.
+			// The classic check returns (not continues) on a subscription-less consumer.
 			return nil
 		}
 		if err := i.CheckSubscriptionsInBroker(c.ConsumerGroup(), subs); err != nil {
@@ -1330,7 +1337,7 @@ func (i *Instance) CheckClientInBroker() error {
 // consumers outside the consumer table.
 func (i *Instance) CheckSubscriptionsInBroker(group string, subs []*remoting.SubscriptionData) error {
 	for _, sub := range subs {
-		// Java ExpressionType.isTagType: null / "" / "TAG" all count as TAG.
+		// Protocol tag-type check: null / "" / "TAG" all count as TAG.
 		if sub.ExpressionType == "" || sub.ExpressionType == remoting.ExpressionTypeTag {
 			continue
 		}
@@ -1343,7 +1350,7 @@ func (i *Instance) CheckSubscriptionsInBroker(group string, subs []*remoting.Sub
 				return err
 			}
 			// Transport-class failures (old brokers that do not know 46)
-			// surface with Java's fixed wording; consumer.start() fails too.
+			// surface with the protocol's fixed wording; consumer.start() fails too.
 			return common.ClientError(fmt.Sprintf(
 				"Check client in broker error, maybe because you use %s to filter message, but server has not been upgraded to support!This error would not affect the launch of consumer, but may has impact on message receiving if you have use the new features which are not supported by server, please check the log!",
 				sub.ExpressionType))
@@ -1354,8 +1361,8 @@ func (i *Instance) CheckSubscriptionsInBroker(group string, subs []*remoting.Sub
 
 // checkClientConfig sends one CHECK_CLIENT_CONFIG(46). The header is null and
 // the body carries CheckClientRequestBody as JSON; a non-SUCCESS response
-// raises a client error carrying the broker's response code (Java throws
-// MQClientException from the response code itself).
+// raises a client error carrying the broker's response code (the response code
+// itself is what the classic protocol's client error is built from).
 func (i *Instance) checkClientConfig(addr, consumerGroup string, sub *remoting.SubscriptionData, timeoutMillis int64) error {
 	request := remoting.CreateRequestCommand(remoting.ReqCheckClientConfig, nil)
 	body := &remoting.CheckClientRequestBody{

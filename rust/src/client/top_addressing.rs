@@ -308,7 +308,7 @@ mod tests {
     // ---------------- URL 构造 ----------------
 
     #[test]
-    fn get_ws_addr_matches_java_mixall() {
+    fn get_ws_addr_matches_nameserver_url_contract() {
         assert_eq!(
             DefaultTopAddressing::get_ws_addr("jmenv.tbsite.net", None),
             "http://jmenv.tbsite.net:8080/rocketmq/nsaddr"

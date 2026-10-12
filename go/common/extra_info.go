@@ -45,26 +45,26 @@ const (
 	ExtraInfoSegmentCount = 8
 )
 
-// SplitExtraInfo mirrors Java ExtraInfoUtil.split(String).
+// SplitExtraInfo splits the checkpoint on single spaces.
 //
-// Faithful to java.lang.String#split(regex) as used there: a single-space
-// separator, trailing empty segments dropped, leading/interior empties kept.
+// The wire rule is a single-space separator with trailing empty segments
+// dropped and leading/interior empties kept.
 // (Go's strings.Split keeps trailing empties too, which would turn
-// "a b " into 3 segments where Java yields 2 — that difference matters for the
-// length guards below, so split it by hand.)
+// "a b " into 3 segments where the checkpoint format yields 2 — that
+// difference matters for the length guards below, so split it by hand.)
 func SplitExtraInfo(extraInfo string) []string {
 	parts := strings.Split(extraInfo, KeySeparator)
-	// Java drops trailing empty strings. "".split(" ") is [""] in Java, not [],
-	// so a wholly empty input keeps its single empty segment.
+	// Drop trailing empty strings, but an empty input still yields one empty
+	// segment (not zero), which the length guards then report.
 	for len(parts) > 1 && parts[len(parts)-1] == "" {
 		parts = parts[:len(parts)-1]
 	}
 	return parts
 }
 
-// extraSegment fetches segment index, mirroring the Java length guards: every
-// accessor independently requires the array to be long enough and throws
-// IllegalArgumentException otherwise. Never silently default — a short
+// extraSegment fetches segment index with per-accessor length guards: every
+// accessor independently requires the array to be long enough and errors
+// otherwise. Never silently default — a short
 // checkpoint means the caller is acking something it cannot address.
 func extraSegment(extraInfoStrs []string, index int, what string) (string, error) {
 	if len(extraInfoStrs) <= index {
@@ -206,9 +206,9 @@ func RetryOfTopic(topic string) string {
 	return ExtraNormalTopic
 }
 
-// BuildExtraInfo mirrors the 7-argument ExtraInfoUtil.buildExtraInfo. The
-// result has no msgQueueOffset segment and is therefore NOT ackable — Java uses
-// it as the checkpoint *prefix* only.
+// BuildExtraInfo builds the 7-segment checkpoint string. The
+// result has no msgQueueOffset segment and is therefore NOT ackable — it is
+// used as the checkpoint *prefix* only.
 func BuildExtraInfo(ckQueueOffset, popTime, invisibleTime int64, reviveQid int,
 	topic, brokerName string, queueID int) string {
 	return strings.Join([]string{
@@ -328,8 +328,8 @@ func RetryOfPopCk(popCk, topic string) string {
 	return RetryOfTopic(topic)
 }
 
-// ParseMsgOffsetInfo mirrors ExtraInfoUtil.parseMsgOffsetInfo. A nil map means
-// "no info"; duplicate keys are an error, as in Java.
+// ParseMsgOffsetInfo parses the broker's msgOffsetInfo table. A nil map means
+// "no info"; duplicate keys are an error.
 func ParseMsgOffsetInfo(msgOffsetInfo string) (map[string][]int64, error) {
 	if msgOffsetInfo == "" {
 		return nil, nil
@@ -407,9 +407,9 @@ func ParseOrderCountInfo(orderCountInfo string) (map[string]int, error) {
 	return out, nil
 }
 
-// splitInfoEntries mirrors the Java "split on ';' unless there is none" dance:
-// a payload with no ';' is one entry, and Java would otherwise return a
-// single-element array anyway.
+// splitInfoEntries splits the broker's offset tables on ';': a payload with
+// no ';' is one entry, exactly what a plain delimiter split would also
+// return — the branch documents that intent.
 func splitInfoEntries(info string) []string {
 	if !strings.Contains(info, ";") {
 		return []string{info}

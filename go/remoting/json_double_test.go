@@ -8,14 +8,15 @@ import (
 )
 
 // Guards for Go-neutral number formatting. Every expected string below was
-// produced by running the 5.5.1 jars' fastjson2 2.0.64 (see java_float.go for
-// the probe transcript), so these are oracle values, not hand-guesses.
+// recorded from a live 5.5.1 server's fastjson2 2.0.64 output (see
+// json_double.go for the probe transcript), so these are oracle values, not
+// hand-guesses.
 
-func TestFormatJavaDoubleMatchesJavaDoubleToString(t *testing.T) {
+func TestFormatJSONDoubleMatchesWireDoubleRendering(t *testing.T) {
 	// Runtime variables, not constants: Go folds untyped constant arithmetic
 	// exactly, so a literal `0.1 + 0.2` is the compiler's rounding of the exact
-	// 0.3 and prints "0.3" — while Java (and Go) add two float64s at runtime and
-	// get 0.30000000000000004. The point of this row is the runtime value.
+	// 0.3 and prints "0.3" — while the runtime float64 addition gets
+	// 0.30000000000000004. The point of this row is the runtime value.
 	a, b := 0.1, 0.2
 
 	cases := []struct {
@@ -43,52 +44,53 @@ func TestFormatJavaDoubleMatchesJavaDoubleToString(t *testing.T) {
 		{math.MaxFloat64, "1.7976931348623157E308"},
 	}
 	for _, c := range cases {
-		if got := FormatJavaDouble(c.in); got != c.want {
-			t.Errorf("FormatJavaDouble(%v) = %q, want %q", c.in, got, c.want)
+		if got := FormatJSONDouble(c.in); got != c.want {
+			t.Errorf("FormatJSONDouble(%v) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
 // The one that is not cosmetic: Go's stdlib encoder ERRORS on NaN/Infinity,
-// which would make EncodeJSON return nil and ship an empty body. Java writes a
-// JSON null. A consumer whose stats window collapsed to a zero span produces
-// exactly this value.
-func TestFormatJavaDoubleTurnsNaNAndInfinityIntoJSONNull(t *testing.T) {
+// which would make EncodeJSON return nil and ship an empty body. fastjson2 on
+// the server writes a JSON null. A consumer whose stats window collapsed to a
+// zero span produces exactly this value.
+func TestFormatJSONDoubleTurnsNaNAndInfinityIntoNull(t *testing.T) {
 	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		if got := FormatJavaDouble(v); got != "null" {
-			t.Errorf("FormatJavaDouble(%v) = %q, want \"null\"", v, got)
+		if got := FormatJSONDouble(v); got != "null" {
+			t.Errorf("FormatJSONDouble(%v) = %q, want \"null\"", v, got)
 		}
 	}
 }
 
 // End-to-end through the real encoder: a NaN-bearing ConsumeStatus must still
-// produce a body, and that body must read `null` where Java reads `null`.
-func TestJavaDoubleSurvivesEncodeJSONWithNaN(t *testing.T) {
+// produce a body, and that body must read `null` where the server's fastjson2
+// output reads `null`.
+func TestJSONDoubleSurvivesEncodeJSONWithNaN(t *testing.T) {
 	cs := &ConsumeStatus{PullRT: math.NaN(), PullTPS: 0, ConsumeRT: 0, ConsumeOKTPS: 0, ConsumeFailedTPS: 0}
 	body := EncodeJSON(cs.ToJSONValue())
 	if body == nil {
-		t.Fatal("EncodeJSON returned nil for a NaN-bearing ConsumeStatus (Java emits a null field)")
+		t.Fatal("EncodeJSON returned nil for a NaN-bearing ConsumeStatus (the server-side emitter writes a null field)")
 	}
 	text := string(body)
 	if !strings.Contains(text, `"pullRT":null`) {
 		t.Errorf("body = %s, want pullRT rendered as null", text)
 	}
-	// And the sibling doubles must keep their Java `.0` spelling.
+	// And the sibling doubles must keep the fastjson2 `.0` spelling.
 	if !strings.Contains(text, `"pullTPS":0.0`) {
 		t.Errorf("body = %s, want pullTPS rendered as 0.0 (not 0)", text)
 	}
 }
 
-// Java's fastjson2 writes `0.0`, Go's stdlib writes `0` — an easy accidental
-// regression if someone unwraps JavaDouble back to a bare float64.
-func TestJavaDoubleKeepsTheTrailingPointOnIntegralValues(t *testing.T) {
+// fastjson2 writes `0.0`, Go's stdlib writes `0` — an easy accidental
+// regression if someone unwraps JSONDouble back to a bare float64.
+func TestJSONDoubleKeepsTrailingPointOnIntegralValues(t *testing.T) {
 	body := string(EncodeJSON((&ConsumeStatus{}).ToJSONValue()))
 	for _, field := range []string{"pullRT", "pullTPS", "consumeRT", "consumeOKTPS", "consumeFailedTPS"} {
 		if !strings.Contains(body, `"`+field+`":0.0`) {
 			t.Errorf("body = %s, want %q rendered as 0.0", body, field)
 		}
 	}
-	// consumeFailedMsgs is a Java long: plain `0`, no decimal point.
+	// consumeFailedMsgs is a long field, not a double: plain `0`, no decimal point.
 	if !strings.Contains(body, `"consumeFailedMsgs":0`) {
 		t.Errorf("body = %s, want consumeFailedMsgs rendered as 0", body)
 	}
@@ -97,9 +99,10 @@ func TestJavaDoubleKeepsTheTrailingPointOnIntegralValues(t *testing.T) {
 	}
 }
 
-// TopicStatsTable and ConsumeStats carry the other two Java doubles in this
-// package; both were recorded as diverging before JavaDouble existed.
-func TestOtherAdminBodiesAlsoUseJavaDouble(t *testing.T) {
+// TopicStatsTable and ConsumeStats carry the other two doubles rendered by
+// fastjson2 in this package; both were recorded as diverging from live 5.5.1
+// server output before JSONDouble existed.
+func TestOtherAdminBodiesAlsoUseJSONDouble(t *testing.T) {
 	if body := string(NewTopicStatsTable().Encode()); !strings.Contains(body, `"topicPutTps":0.0`) {
 		t.Errorf("TopicStatsTable body = %s, want topicPutTps 0.0", body)
 	}
@@ -108,20 +111,21 @@ func TestOtherAdminBodiesAlsoUseJavaDouble(t *testing.T) {
 	}
 }
 
-// The residual divergence with Java 17 is that its legacy FloatingDecimal is
-// greedy and prints ONE EXTRA digit (measured 26/20000 realistic stats values;
-// see java_float.go for the full differential). Each pair below is a real
+// The residual divergence is that the server's fastjson2 emitter runs a legacy
+// greedy FloatingDecimal and prints ONE EXTRA digit (measured 26/20000
+// realistic stats values;
+// see json_double.go for the full differential). Each pair below is a real
 // sample from that run, in both spellings.
 //
 // The assertion of interest is the second one: Go's shorter spelling parses
-// back to the SAME float64 as Java's longer one. That is what makes the
+// back to the SAME float64 as the server's longer one. That is what makes the
 // divergence cosmetic — the broker and the admin console parse these numbers,
 // they never diff the bytes. If a future change breaks the round-trip, this
 // fails loudly instead of quietly shipping a wrong rate.
-func TestJavaDoubleRoundTripsLikeJavaLegacy(t *testing.T) {
+func TestJSONDoubleShortestFormRoundTrips(t *testing.T) {
 	pairs := []struct {
-		java   string
-		goWant string
+		longestForm  string
+		shortestForm string
 	}{
 		{"104741.78599999999", "104741.786"},
 		{"78262.33900000001", "78262.339"},
@@ -137,20 +141,20 @@ func TestJavaDoubleRoundTripsLikeJavaLegacy(t *testing.T) {
 		{"1.6699629581838839E86", "1.669962958183884E86"},
 	}
 	for _, p := range pairs {
-		javaVal, err := strconv.ParseFloat(p.java, 64)
+		longestVal, err := strconv.ParseFloat(p.longestForm, 64)
 		if err != nil {
-			t.Fatalf("bad fixture %q: %v", p.java, err)
+			t.Fatalf("bad fixture %q: %v", p.longestForm, err)
 		}
-		if got := FormatJavaDouble(javaVal); got != p.goWant {
-			t.Errorf("FormatJavaDouble(%s) = %q, want the shortest form %q", p.java, got, p.goWant)
+		if got := FormatJSONDouble(longestVal); got != p.shortestForm {
+			t.Errorf("FormatJSONDouble(%s) = %q, want the shortest form %q", p.longestForm, got, p.shortestForm)
 		}
-		goVal, err := strconv.ParseFloat(p.goWant, 64)
+		shortestVal, err := strconv.ParseFloat(p.shortestForm, 64)
 		if err != nil {
-			t.Fatalf("bad fixture %q: %v", p.goWant, err)
+			t.Fatalf("bad fixture %q: %v", p.shortestForm, err)
 		}
-		if goVal != javaVal {
-			t.Errorf("Go %q -> %v but Java %q -> %v: the divergence is NOT cosmetic",
-				p.goWant, goVal, p.java, javaVal)
+		if shortestVal != longestVal {
+			t.Errorf("shortest %q -> %v but longest %q -> %v: the divergence is NOT cosmetic",
+				p.shortestForm, shortestVal, p.longestForm, longestVal)
 		}
 	}
 }

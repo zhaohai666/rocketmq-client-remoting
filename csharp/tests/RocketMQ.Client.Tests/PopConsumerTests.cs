@@ -81,7 +81,7 @@ public class PopConsumerTests
     }
 
     [Fact]
-    public void PopDefaultsMatchJava()
+    public void PopDefaultsMatchLegacy()
     {
         var c = new DefaultMQPushConsumer(Group);
         // Java popInvisibleTime=60000 / popBatchNums=32 / popThresholdForQueue=96

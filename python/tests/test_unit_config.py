@@ -98,7 +98,7 @@ def test_no_stream_hook_when_disabled():
     (lambda: DefaultMQPullConsumer("CID_stream_default"), True),
     (lambda: DefaultLitePullConsumer("CID_stream_default"), True),
 ])
-def test_enable_stream_request_type_defaults_match_java_builders(factory, expected):
+def test_enable_stream_request_type_defaults_match_the_request_builders(factory, expected):
     """Java 只在 pull/lite 的构造函数里打开这个开关，其余保持 ClientConfig 的 false。"""
     assert factory().enable_stream_request_type is expected
 

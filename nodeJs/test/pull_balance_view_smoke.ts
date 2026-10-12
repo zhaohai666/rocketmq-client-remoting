@@ -1,18 +1,13 @@
 // DefaultMQPullConsumer.fetchMessageQueuesInBalance — offline wire test.
 //
-// Baseline (Java 5.5.1, read line by line; the same judgements as
-// python/tests/test_pull_consumer.py, go/client/pull_consumer_test.go,
-// csharp PullBalanceViewTests, rust and cpp's test_pull_consumer_balance_view):
-//   * MQPullConsumer:187 → DefaultMQPullConsumerImpl:120-135 filters
-//     rebalanceImpl.getProcessQueueTable() by topic, then
-//     parseSubscribeMessageQueues:153-161 strips the namespace.
-//     example/simple/PullConsumer.java:62 is the official caller: it pulls ONLY
-//     its own share, so "returns every queue" is the duplicate-consumption bug.
-//   * This port runs no pull-side rebalance thread, so the view is computed on
-//     demand with RebalanceImpl#rebalanceByTopic's formula; the tests therefore
-//     pin the FORMULA, the "cannot compute" fallback and the isRunning() guard.
-//   ⚠ The fallback is deliberately NOT "all queues": a group of N instances must
-//     never all read the same messages because one query went unanswered.
+// 行为基线：
+//   * 该视图 = 按 topic 过滤消费者自己持有的 processQueueTable，再剥掉
+//     namespace 前缀；官方的拉取用法只消费自己那一份队列，所以"返回全部
+//     队列"就是重复消费的 bug。
+//   * 本实现不跑拉取侧 rebalance 线程，视图按需按 rebalanceByTopic 的公式
+//     计算；因此测试钉住的是公式、"算不出"时的回退和 isRunning() 守卫。
+//   ⚠ 回退刻意不是"全部队列"：N 个实例的分组绝不能因为一次查询没有应答
+//     就都去读同一批消息。
 //
 // Run: node --experimental-strip-types test/pull_balance_view_smoke.ts
 import net from 'node:net';
@@ -250,8 +245,8 @@ async function main() {
   }
 
   // -------------------------------------------- 6. fetchPublish vs fetchSubscribe
-  // Java :137 vs :142 are two DIFFERENT views; conflating them silently changes
-  // the queue set whenever readQueueNums != writeQueueNums.
+  // fetchPublish 与 fetchSubscribe 是两个不同的队列视图；把二者混为一谈，
+  // 会在 readQueueNums != writeQueueNums 时悄悄改变队列集合。
   {
     const cluster = new FakeCluster();
     await cluster.listen();

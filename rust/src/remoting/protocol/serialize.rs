@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn escapes_match_java_json() {
+    fn escapes_match_server_json() {
         let v = fastjson::from_str(r#"{"a":"A\u4e2dB\t\n\"\\\/"}"#).unwrap();
         assert_eq!(v["a"], "A\u{4e2d}B\t\n\"\\/");
         let v = fastjson::from_str(r#"{"a":"\ud83d\ude00"}"#).unwrap();

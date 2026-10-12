@@ -7,13 +7,13 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\BoundaryType;
 
 /**
- * 全部请求/响应头（对应 org.apache.rocketmq.remoting.protocol.header.*，移植自 protocol/headers.py）。
+ * 全部请求/响应头：一个 request code 一种 header 形状，键名即协议字段名。
  *
- * 每个 header 提供 toExtFields()（仅输出非 null 字段，与 Java makeCustomHeaderToNet 行为一致）
- * 和 fromExtFields()（把 ext_fields 映射回字段）。
+ * 每个 header 提供 toExtFields()（只输出非 null 字段——header 编码本来就是按 null
+ * 跳键）和 fromExtFields()（把 ext_fields 映射回字段）。
  *
- * ⚠ ext key 必须逐字等于 Java 侧的字段名：broker 用 fastjson2 按 Java 属性名反序列化，
- * 错一个字母就**静默丢字段**（不报错、行为静默退化）。
+ * ⚠ ext key 必须逐字等于协议字段名：broker 侧按属性名做容错反序列化，
+ * 认不出来的键不报错、直接当不存在，于是**静默丢字段**、行为静默退化。
  */
 abstract class CommandCustomHeader
 {
@@ -25,11 +25,11 @@ abstract class CommandCustomHeader
     }
 
     /**
-     * 过滤 null，并把 bool 规范成 Java ``Boolean.toString`` 的小写形式。
+     * 过滤 null，并把 bool 规范成小写的 ``"true"`` / ``"false"``。
      *
      * 为什么必须显式转换：``RemotingCommand`` 落 ext_fields 时统一走 ``str(v)``，
-     * Python 的 ``str(False)`` 是 ``"False"``，而 Java 写的是 ``"false"``。
-     * 这里统一成小写，与 C++ 侧 ``putOptBool`` 完全一致。
+     * PHP 的 ``str(false)`` 是空串、``str(true)`` 是 ``"1"``，而 broker 按忽略
+     * 大小写的 ``"true"`` 判真——不转换等于这个字段永远读不回来。
      *
      * @param array<string, mixed> $fields
      * @return array<string, mixed>
@@ -125,7 +125,7 @@ final class SendMessageRequestHeader extends CommandCustomHeader
     }
 }
 
-/** 短字段名编码（producerGroup->a ...），与 Java V2 严格一致。 */
+/** V2 短字段名编码（producerGroup->a ...）：短键名也是协议规定的，不能换成全名。 */
 final class SendMessageRequestHeaderV2 extends CommandCustomHeader
 {
     public function __construct(
@@ -142,7 +142,7 @@ final class SendMessageRequestHeaderV2 extends CommandCustomHeader
         public ?bool $unitMode = null,
         public ?int $maxReconsumeTimes = null,
         public ?bool $batch = null,
-        // Java SendMessageRequestHeaderV2 还有 private String n; // brokerName
+        // 协议里这个短形状还带一个 n 键，承载的就是 brokerName
         public ?string $brokerName = null,
     ) {
     }
@@ -191,8 +191,8 @@ final class SendMessageRequestHeaderV2 extends CommandCustomHeader
 /**
  * broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
  *
- * 对应 Java ``ReplyMessageRequestHeader``（字段与 ``SendMessageRequestHeader`` 高度重合，
- * 但多了 bornHost/storeHost/storeTimestamp）。请求方收到后据此 + body 还原出真正的应答 MessageExt。
+ * 字段与 SendMessageRequestHeader 高度重合，但多了 bornHost/storeHost/storeTimestamp。
+ * 请求方收到后据此 + body 还原出真正的应答 MessageExt。
  */
 final class ReplyMessageRequestHeader extends CommandCustomHeader
 {
@@ -295,10 +295,10 @@ final class SendMessageResponseHeader extends CommandCustomHeader
 }
 
 /**
- * 对应 RecallMessageRequestHeader。
+ * 撤回定时消息的请求头。
  *
- * ⚠ Java 侧继承 ``TopicRequestHeader`` → ``RpcRequestHeader``，父类字段 ``bname`` 的
- * **反射名就是 bname**（不是 brokerName）：写成 ``brokerName`` 会被 broker 静默丢掉。
+ * ⚠ 它走 TopicRequestHeader → RpcRequestHeader 那层继承，brokerName 的**协议键名
+ * 就是 ``bname``**：写成 ``brokerName`` 会被 broker 静默丢掉。
  */
 final class RecallMessageRequestHeader extends CommandCustomHeader
 {
@@ -331,7 +331,7 @@ final class RecallMessageRequestHeader extends CommandCustomHeader
     }
 }
 
-/** 对应 RecallMessageResponseHeader：Java 只有一个字段 ``msgId``。 */
+/** 撤回响应头：只有一个字段 ``msgId``。 */
 final class RecallMessageResponseHeader extends CommandCustomHeader
 {
     public function __construct(public ?string $msgId = null)
@@ -650,8 +650,8 @@ final class SearchOffsetRequestHeader extends CommandCustomHeader
         public ?string $topic = null,
         public ?int $queueId = null,
         public ?int $timestamp = null,
-        // Java 该字段是 @CFNullable：为 null 时**不写键**（Java 的
-        // MQClientAPIImpl 已废弃的 5 参 searchOffset 就是这种形状）。
+        // 该字段可空：为 null 时**不写键**（不带边界的老式 searchOffset 请求
+        // 就是这种形状，broker 必须能处理缺键的包）。
         public ?BoundaryType $boundaryType = null,
     ) {
     }
@@ -663,8 +663,8 @@ final class SearchOffsetRequestHeader extends CommandCustomHeader
             'topic' => $this->topic,
             'queueId' => $this->queueId,
             'timestamp' => $this->timestamp,
-            // 入网文本是枚举名大写（Java makeCustomHeaderToNet 的 Enum.toString()），
-            // 不是 BoundaryType.getName() 的小写名。
+            // 入网文本是枚举名大写（header 编码输出的是枚举名本身），
+            // 不是 lowercaseName() 的小写名。
             'boundaryType' => $this->boundaryType?->value,
         ]);
     }
@@ -676,8 +676,8 @@ final class SearchOffsetRequestHeader extends CommandCustomHeader
         $this->queueId = self::i($ext['queueId'] ?? null);
         $this->timestamp = self::l($ext['timestamp'] ?? null);
         $value = $ext['boundaryType'] ?? null;
-        // 缺键 ⇒ null（Java 端 getBoundaryType() 自行回落 LOWER）；
-        // 有键但值不认识 ⇒ Java BoundaryType.getType 的宽松语义，给 LOWER。
+        // 缺键 ⇒ null（由 broker 侧回落 LOWER）；
+        // 有键但值不认识 ⇒ 按 broker 的宽松语义给 LOWER。
         $this->boundaryType = $value !== null ? BoundaryType::getType((string)$value) : null;
     }
 }
@@ -745,7 +745,7 @@ final class GetEarliestMsgStoretimeResponseHeader extends CommandCustomHeader
 // ---------------- 查询消息 ----------------
 
 /**
- * 对应 QueryMessageRequestHeader。
+ * 按 key / uniqueKey / tag 查消息的请求头。
  *
  * ``indexType`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
  * INDEX_TAG_TYPE("T")；broker 侧为空时默认按 "K"（普通 key 索引）查。
@@ -1168,10 +1168,10 @@ final class UnlockBatchMqRequestHeader extends CommandCustomHeader
 // ---------------- 事务 ----------------
 
 /**
- * 对应 EndTransactionRequestHeader。
+ * 提交 / 回滚二阶段消息的请求头。
  *
- * ⚠ 继承 RpcRequestHeader 的 brokerName 字段在 Java 里**反射名是 ``bname``**
- * （setter 为 setBrokerName，但字段声明名是 bname）。写错键 broker 会静默丢字段。
+ * ⚠ 继承 RpcRequestHeader 的 brokerName 字段，**协议键名是 ``bname``**
+ * （属性名是 brokerName，上报的键是 bname）。写错键 broker 会静默丢字段。
  */
 final class EndTransactionRequestHeader extends CommandCustomHeader
 {
@@ -1242,9 +1242,9 @@ final class EndTransactionResponseHeader extends CommandCustomHeader
 }
 
 /**
- * 对应 CheckTransactionStateRequestHeader。
+ * broker 回查事务状态时下行的请求头。
  *
- * ⚠ 同样继承 RpcRequestHeader：brokerName 反射名是 ``bname``。
+ * ⚠ 同样继承 RpcRequestHeader：brokerName 的协议键名是 ``bname``。
  */
 final class CheckTransactionStateRequestHeader extends CommandCustomHeader
 {
@@ -1369,11 +1369,12 @@ final class GetTopicConfigRequestHeader extends CommandCustomHeader
 }
 
 /**
- * 对应 CreateTopicRequestHeader。
+ * 创建 topic 的请求头。
  *
- * ⚠ broker 的 checkFields() 会把 ``topicFilterType`` 解析成枚举，**为空直接抛
- * RemotingCommandException("topicFilterType = [null] value invalid")**，
- * 所以哪怕只想建普通 topic，也必须显式下发 topicFilterType。
+ * ⚠ broker 的字段校验会把 ``topicFilterType`` 解析成枚举，**为空直接回
+ * RemotingCommandException("topicFilterType = [null] value invalid")**
+ * （这条文案是 broker 返回的，调用方按字面匹配，别改写），所以哪怕只想建普通
+ * topic，也必须显式下发 topicFilterType。
  */
 final class CreateTopicRequestHeader extends CommandCustomHeader
 {
@@ -2115,11 +2116,11 @@ final class QueryDataVersionResponseHeader extends CommandCustomHeader
 
 // ---------------- POP 模式（5.x 轻量消费） ----------------
 //
-// 另外注意 `order` / `suspend` 这两个字段 Java 用的是**非空** Boolean/boolean
-// （`Boolean order = Boolean.FALSE`、`private boolean suspend = false`），
-// `encodeHeader` 只会跳过 null，所以它们**总是**出现在报文里 —— 这里也不做 null 过滤。
+// 另外注意 `order` / `suspend` 这两个字段协议里是**非空**布尔（默认 false），
+// 而 header 编码只跳过 null，所以它们**总是**出现在报文里 —— 这里也不做 null 过滤，
+// 省掉任何一个都会让 broker 用不上该字段。
 
-/** Java ``PopMessageRequestHeader``（RequestCode.POP_MESSAGE = 200050）。 */
+/** POP 拉消息请求头（RequestCode.POP_MESSAGE = 200050）。 */
 final class PopMessageRequestHeader extends CommandCustomHeader
 {
     public bool $order = false;
@@ -2163,7 +2164,7 @@ final class PopMessageRequestHeader extends CommandCustomHeader
 }
 
 /**
- * Java ``PopMessageResponseHeader``。
+ * POP 拉消息响应头。
  *
  * ``startOffsetInfo`` / ``msgOffsetInfo`` / ``orderCountInfo`` 是编码过的
  * 字符串（空格做字段分隔、分号做队列分隔），用 ExtraInfoUtil 解析。
@@ -2209,7 +2210,7 @@ final class PopMessageResponseHeader extends CommandCustomHeader
 }
 
 /**
- * Java ``AckMessageRequestHeader``（RequestCode.ACK_MESSAGE = 200051）。
+ * POP ACK 请求头（RequestCode.ACK_MESSAGE = 200051）。
  *
  * ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
  * 不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
@@ -2240,7 +2241,7 @@ final class AckMessageRequestHeader extends CommandCustomHeader
     }
 }
 
-/** Java ``ChangeInvisibleTimeRequestHeader``（CHANGE_MESSAGE_INVISIBLETIME = 200053）。 */
+/** 改不可见时长请求头（CHANGE_MESSAGE_INVISIBLETIME = 200053）。 */
 final class ChangeInvisibleTimeRequestHeader extends CommandCustomHeader
 {
     public bool $suspend = false;
@@ -2273,7 +2274,7 @@ final class ChangeInvisibleTimeRequestHeader extends CommandCustomHeader
 }
 
 /**
- * Java ``ChangeInvisibleTimeResponseHeader``。
+ * 改不可见时长响应头。
  *
  * 返回的是**新的** ``invisibleTime`` / ``popTime`` / ``reviveQid``；
  * 客户端要用它们重建 extraInfo 供后续 ACK 使用。

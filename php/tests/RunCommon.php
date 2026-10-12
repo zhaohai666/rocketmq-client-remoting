@@ -93,12 +93,12 @@ final class RunCommon
 $T = new RunCommon();
 
 // ============================================================ UtilAll
-$T->checkSame(2598919, UtilAll::javaStringHash('TagA'), 'javaStringHash TagA=2598919');
-$T->checkSame(2598920, UtilAll::javaStringHash('TagB'), 'javaStringHash TagB=2598920');
-$T->checkSame(80, UtilAll::javaStringHash('P'), 'javaStringHash P=80');
-$T->checkSame(2545, UtilAll::javaStringHash('PA'), 'javaStringHash PA=2545');
-$T->checkSame(42, UtilAll::javaStringHash('*'), 'javaStringHash *=42');
-$T->checkSame(0, UtilAll::javaStringHash(''), 'javaStringHash ""=0');
+$T->checkSame(2598919, UtilAll::wireStringHash('TagA'), 'wireStringHash TagA=2598919');
+$T->checkSame(2598920, UtilAll::wireStringHash('TagB'), 'wireStringHash TagB=2598920');
+$T->checkSame(80, UtilAll::wireStringHash('P'), 'wireStringHash P=80');
+$T->checkSame(2545, UtilAll::wireStringHash('PA'), 'wireStringHash PA=2545');
+$T->checkSame(42, UtilAll::wireStringHash('*'), 'wireStringHash *=42');
+$T->checkSame(0, UtilAll::wireStringHash(''), 'wireStringHash ""=0');
 
 $hex = UtilAll::bytes2String("\xde\xad\xbe\xef");
 $T->checkSame('DEADBEEF', $hex, 'bytes2String 大写十六进制');
@@ -144,7 +144,7 @@ $T->checkSame("b=2\na=1\n", MixAll::properties2String($props), 'properties2Strin
 $T->checkSame("a=1\nb=2\n", MixAll::properties2String($props, true), 'properties2String 排序');
 $roundtrip = MixAll::string2Properties(MixAll::properties2String(['k1' => 'v1', 'k2' => 'v 2', 'k3' => 'x=y']));
 $T->checkSame(['k1' => 'v1', 'k2' => 'v 2', 'k3' => 'x=y'], $roundtrip, 'properties 往返');
-// java.util.Properties.load 语义
+// properties 文本解析语义（注释行 / 分隔符 / 续行 / 空白）
 $T->checkSame(['a' => '1', 'b' => '2'], MixAll::string2Properties("# comment\n!bang\na=1\n\nb=2"), '注释行与空行跳过');
 $T->checkSame(['key' => 'va lue'], MixAll::string2Properties("key: va lue"), ': 分隔符');
 $T->checkSame(['key' => 'value'], MixAll::string2Properties("key value"), '空白分隔符');
@@ -337,18 +337,18 @@ $cdec = MessageDecoder::decodeMessage($cenc);
 $T->check($cdec !== null && $cdec->getBody() === 'plain', '压缩消息解码还原正文');
 $T->check($cdec !== null && MessageSysFlag::isCompressed($cdec->getSysFlag()) === false, '解码后清掉 COMPRESSED_FLAG');
 
-// LZ4 Frame（Java LZ4FrameOutputStream / Python lz4.frame 同规范；block 层是它的内部）：
-// xxhash32 官方向量锚定 + Python lz4.frame 产出的完整帧 + Frame 往返 + 重叠 match
+// LZ4 Frame（标准 LZ4 Frame 规范；block 层是它的内部）：
+// xxhash32 标准向量锚定 + 外部标准 LZ4 实现产出的完整帧 + Frame 往返 + 重叠 match
 $T->checkSame(0x02CC5D05, CompressionCodec::xxh32(''), 'xxh32("") 官方向量');
 $T->checkSame(0x32D153FF, CompressionCodec::xxh32('abc'), 'xxh32("abc") 官方向量');
-// Python lz4.frame.compress 产出的帧（跨端解压锚点；HC=xxh32(header)>>8 的第二字节）：
+// 外部标准 LZ4 Frame 实现产出的帧（解压锚点；HC=xxh32(header)>>8 的第二字节）：
 //   'abc' → magic|FLG=0x68|BD=0x40|C.Size=3|HC=0x87|raw块(0x80000003)|'abc'|EndMark
 $lz4framePy = hex2bin('04224d1868400300000000000000870300008061626300000000');
-$T->checkSame('abc', CompressionCodec::lz4DecompressFrame($lz4framePy), 'LZ4 Frame Python 产帧解压');
-// 'hello world '×40：compressed 块（裸 block 形状，node 版同输入产出一致）
+$T->checkSame('abc', CompressionCodec::lz4DecompressFrame($lz4framePy), 'LZ4 Frame 外部实现产帧解压');
+// 'hello world '×40：compressed 块（裸 block 形状，同输入的确定性编码）
 $lz4framePy2 = hex2bin('04224d186840e0010000000000009b17000000cf68656c6c6f20776f726c64200c00ffbd506f726c642000000000');
-$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressBlock(hex2bin('cf68656c6c6f20776f726c64200c00ffbd506f726c6420')), 'LZ4 裸 block 长串（node 同款）解压');
-$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressFrame($lz4framePy2), 'LZ4 Frame Python 长串帧解压');
+$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressBlock(hex2bin('cf68656c6c6f20776f726c64200c00ffbd506f726c6420')), 'LZ4 裸 block 长串解压');
+$T->checkSame(str_repeat('hello world ', 40), CompressionCodec::lz4DecompressFrame($lz4framePy2), 'LZ4 Frame 外部实现长串帧解压');
 // Frame 往返（含 >64KB 多块、RLE、raw 块兜底）
 $lz4FrameSamples = [
     '', 'a', 'abcabcabcabc',
@@ -429,7 +429,7 @@ $T->checkSame('via-decoder', MessageDecoder::decompressBody(
 ), 'MessageDecoder ZSTD 分支');
 
 // ZSTD 统一入口（CLI 优先 / Raw 兜底）：有 zstd CLI 时验证真压缩路径——
-// 压缩率真实生效 + 能解回其他端（CLI）压出的 Compressed 帧。
+// 压缩率真实生效 + 能解回外部 zstd CLI 压出的 Compressed 帧。
 if (trim((string) @shell_exec('command -v zstd 2>/dev/null')) !== '') {
     $payload = str_repeat('zstd-cli-roundtrip-payload-', 4000); // ~108KB 可压文本
     $cliComp = CompressionCodec::zstdCompress($payload);
@@ -534,7 +534,7 @@ $T->checkSame('TAG', $sd->getExpressionType(), 'expressionType 缺省 TAG');
 $T->check(!array_key_exists('filterClassSource', $sd->toDict()), 'toDict 不序列化 filterClassSource');
 
 // ============================================================ MessageType / BoundaryType
-$T->checkSame(0, MessageType::NORMAL_MSG->value, 'MessageType value=Java ordinal');
+$T->checkSame(0, MessageType::NORMAL_MSG->value, 'MessageType value=协议枚举序号');
 $T->checkSame('Normal', MessageType::NORMAL_MSG->shortName(), 'shortName Normal');
 $T->checkSame('TransCommit', MessageType::TRANS_MSG_COMMIT->shortName(), 'shortName TransCommit');
 $T->checkSame(MessageType::DELAY_MSG, MessageType::getByShortName('Delay'), 'getByShortName Delay');
@@ -552,7 +552,7 @@ $T->check(!str_contains($handle, '+') && !str_contains($handle, '/'), 'buildHand
 $h1 = RecallMessageHandle::decodeHandle($handle);
 $T->check($h1->equals(new HandleV1('topic1', 'broker-a', '1700000000000', 'MSGID-001')), 'build/decode 往返');
 $T->check($h1->timestampStr === '1700000000000', 'timestampStr 保留字符串');
-// 无填充句柄也能解（其他客户端移植版的无填充编码）
+// 无填充句柄也能解（base64 无填充编码变体）
 $T->check($h1->equals(RecallMessageHandle::decodeHandle(rtrim($handle, '='))), '无填充句柄兼容解码');
 $T->checkThrows(static fn () => RecallMessageHandle::decodeHandle(''), \RocketMQ\Client\Exceptions\MQClientException::class, '空句柄抛 MQClientException');
 $T->checkThrows(static fn () => RecallMessageHandle::decodeHandle('###'), \RocketMQ\Client\Exceptions\MQClientException::class, '非法 base64 抛 MQClientException');

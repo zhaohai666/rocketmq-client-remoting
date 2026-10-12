@@ -86,7 +86,7 @@ public class TraceTests
     // ---------------------------------------------------------------- 编码：与 Java 逐字节一致
 
     [Fact]
-    public void EncodePubMatchesJavaVector()
+    public void EncodePubMatchesLegacyVector()
     {
         var ctx = new TraceContext
         {
@@ -109,7 +109,7 @@ public class TraceTests
     }
 
     [Fact]
-    public void EncodeSubBeforeMatchesJavaVector()
+    public void EncodeSubBeforeMatchesLegacyVector()
     {
         var ctx = new TraceContext
         {
@@ -130,7 +130,7 @@ public class TraceTests
     }
 
     [Fact]
-    public void EncodeSubAfterMatchesJavaVector()
+    public void EncodeSubAfterMatchesLegacyVector()
     {
         var ctx = new TraceContext
         {
@@ -175,7 +175,7 @@ public class TraceTests
     }
 
     [Fact]
-    public void EncodeEndTransactionMatchesJavaVector()
+    public void EncodeEndTransactionMatchesLegacyVector()
     {
         var ctx = new TraceContext
         {
@@ -191,7 +191,7 @@ public class TraceTests
     }
 
     [Fact]
-    public void EncodeRecallMatchesJavaVector()
+    public void EncodeRecallMatchesLegacyVector()
     {
         var ctx = new TraceContext
         {
@@ -345,22 +345,22 @@ public class TraceTests
     public void DecodeEmptyOrNullReturnsEmpty(string? input) =>
         Assert.Empty(TraceDataEncoder.DecoderFromTraceDataString(input));
 
-    // ---------------------------------------------------------------- JavaSplit 语义
+    // ---------------------------------------------------------------- LegacySplit 语义
 
     [Fact]
-    public void JavaSplitDropsTrailingEmptyFields()
+    public void LegacySplitDropsTrailingEmptyFields()
     {
         // Java 的 split 丢掉末尾空串；C# 的 Split(char) 会保留 —— 这条差异是编码末尾补
         // FIELD_SPLITOR 的直接后果，写错会让解码整体错位。
-        Assert.Equal(new List<string> { "a", "b" }, JavaSplit.Split("a\u0001b\u0001", Soh));
-        Assert.Equal(new List<string> { "a", "", "b" }, JavaSplit.Split("a\u0001\u0001b", Soh));
-        Assert.Empty(JavaSplit.Split("\u0001\u0001", Soh));
+        Assert.Equal(new List<string> { "a", "b" }, LegacySplit.Split("a\u0001b\u0001", Soh));
+        Assert.Equal(new List<string> { "a", "", "b" }, LegacySplit.Split("a\u0001\u0001b", Soh));
+        Assert.Empty(LegacySplit.Split("\u0001\u0001", Soh));
     }
 
     // ---------------------------------------------------------------- 常量
 
     [Fact]
-    public void ConstantsMatchJava()
+    public void ConstantsMatchLegacy()
     {
         Assert.Equal("_INNER_TRACE_PRODUCER", TraceConstants.GroupNamePrefix);
         Assert.Equal("PID_CLIENT_INNER_TRACE_PRODUCER", TraceConstants.TraceInstanceName);
@@ -371,7 +371,7 @@ public class TraceTests
     }
 
     [Fact]
-    public void TraceTypeAndMessageTypeOrdinalsMatchJava()
+    public void TraceTypeAndMessageTypeOrdinalsMatchLegacy()
     {
         Assert.Equal(0, (int)RocketMQ.Client.TraceType.Pub);
         Assert.Equal(1, (int)RocketMQ.Client.TraceType.Recall);
@@ -599,7 +599,7 @@ public class TraceTests
     [InlineData("EXCEPTION", 2)]
     [InlineData("RETURNNULL", 3)]
     [InlineData("FAILED", 4)]
-    public void ConsumeHookMapsContextCodeFromJavaReturnTypeNames(string name, int expected)
+    public void ConsumeHookMapsContextCodeFromLegacyReturnTypeNames(string name, int expected)
     {
         var d = new AsyncTraceDispatcher("CID_test", TraceDispatcherType.Consume);
         var hook = new ConsumeMessageTraceHook(d);
@@ -621,7 +621,7 @@ public class TraceTests
 
         // 顺带锁住编码：contextCode 落在第 7 段（0-based 索引 6）
         string text = TraceDataEncoder.EncoderFromContextBean(subAfter)!.TransData;
-        string[] seg = JavaSplit.Split(text, Soh).ToArray();
+        string[] seg = LegacySplit.Split(text, Soh).ToArray();
         Assert.Equal(expected.ToString(CultureInfo.InvariantCulture), seg[6]);
     }
 
@@ -654,7 +654,7 @@ public class TraceTests
     // ---------------------------------------------------------------- 事务收尾钩子
 
     [Fact]
-    public void EndTransactionHookWritesJavaStateName()
+    public void EndTransactionHookWritesLegacyStateName()
     {
         var d = new AsyncTraceDispatcher("GID_test", TraceDispatcherType.Produce);
         var hook = new EndTransactionTraceHook(d);

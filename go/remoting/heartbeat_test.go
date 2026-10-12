@@ -36,7 +36,7 @@ func TestBuildSubscriptionDataTags(t *testing.T) {
 	if strings.Join(sd.TagsSet, ",") != "TagA,TagB" {
 		t.Errorf("tags = %v, want [TagA TagB]", sd.TagsSet)
 	}
-	if len(sd.CodeSet) != 2 || sd.CodeSet[0] != common.JavaStringHash("TagA") || sd.CodeSet[1] != common.JavaStringHash("TagB") {
+	if len(sd.CodeSet) != 2 || sd.CodeSet[0] != common.StringHash31("TagA") || sd.CodeSet[1] != common.StringHash31("TagB") {
 		t.Errorf("codes = %v", sd.CodeSet)
 	}
 }
@@ -46,7 +46,7 @@ func TestBuildSubscriptionDataWhitespaceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 纯空白走切分分支：两个集合空，但 subString 仍是原样（Java 只认 null/""）。
+	// 纯空白走切分分支：两个集合空，但 subString 仍是原样（服务端只认 null/""）。
 	if sd.SubString != "   " || len(sd.TagsSet) != 0 || len(sd.CodeSet) != 0 {
 		t.Errorf("whitespace-only: got %q %v %v", sd.SubString, sd.TagsSet, sd.CodeSet)
 	}
@@ -71,7 +71,7 @@ func TestBuildSubscriptionDataEdgeSplits(t *testing.T) {
 
 func TestSubscriptionDataJSONRoundTrip(t *testing.T) {
 	sd := NewSubscriptionData("Tt", "TagA || TagB")
-	sd.SetTags([]string{"TagB", "TagA", "TagA"}, []int32{common.JavaStringHash("TagB"), common.JavaStringHash("TagA")})
+	sd.SetTags([]string{"TagB", "TagA", "TagA"}, []int32{common.StringHash31("TagB"), common.StringHash31("TagA")})
 	enc := EncodeJSON(sd.ToJSONValue())
 	back := &SubscriptionData{}
 	if err := back.FromJSONValue(mustDecode(t, enc)); err != nil {
@@ -86,7 +86,7 @@ func TestSubscriptionDataJSONRoundTrip(t *testing.T) {
 }
 
 func TestSubscriptionDataDecodeTolerantItems(t *testing.T) {
-	// tagsSet 里的数字/布尔按文本收；codeSet 的数字字符串也能读（Python int(v)）。
+	// tagsSet 里的数字/布尔按文本收；codeSet 的数字字符串也能读成整数。
 	text := `{"topic":"Tt","subString":"*","tagsSet":["TagA",7,true],"codeSet":["11",22],"subVersion":1234567890,"expressionType":"TAG"}`
 	back := &SubscriptionData{}
 	if err := back.FromJSONValue(mustDecode(t, []byte(text))); err != nil {

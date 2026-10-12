@@ -58,7 +58,7 @@ func TestStatsSnapshotIsADifferenceWindow(t *testing.T) {
 // correct answer here is NaN — a guard would be a silent divergence AND would
 // hide the real bug (a caller that forgot to seed the list, whose snapshot
 // would then read as a plausible 0 TPS).
-func TestStatsSnapshotWithOnlyOneEntryIsNaNLikeJava(t *testing.T) {
+func TestStatsSnapshotWithOnlyOneEntryIsNaN(t *testing.T) {
 	snap := computeStatsData([]callSnapshot{{timestamp: 1_000}})
 	if snap.Sum != 0 || snap.Times != 0 || snap.Avgpt != 0 {
 		t.Errorf("snapshot = %+v, want all zeros", snap)

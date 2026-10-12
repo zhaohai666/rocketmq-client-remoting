@@ -288,7 +288,7 @@ public class CodecTests
     /// <summary>判据本身：Java <c>Message.isWaitStoreMsgOK()</c> =
     /// 缺省 true + <c>Boolean.parseBoolean</c>（只有忽略大小写的 "true" 为真）。</summary>
     [Fact]
-    public void WaitStoreMsgOkFollowsJavaParseBoolean()
+    public void WaitStoreMsgOkFollowsLegacyParseBoolean()
     {
         var msg = new Message("T_W", Encoding.UTF8.GetBytes("x"));
         Assert.True(msg.WaitStoreMsgOk);                                  // 缺省
@@ -309,7 +309,7 @@ public class CodecTests
     // ---------------------------------------------------------------- 工具与哈希
 
     [Fact]
-    public void MessageQueue_HashCode_JavaSemantics()
+    public void MessageQueue_HashCode_LegacySemantics()
     {
         // MessageQueue.hashCode 与 Java 语义一致（topic=A, broker=B, qid=0 -> 93282）
         var mq = new MessageQueue("A", "B", 0);

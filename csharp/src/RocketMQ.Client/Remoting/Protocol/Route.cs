@@ -62,22 +62,22 @@ public sealed class QueueData : IComparable<QueueData>
 
         if (v.TryGetInt("perm", out long n))
         {
-            q.Perm = JavaNumber.ToInt32(n);
+            q.Perm = LegacyNumber.ToInt32(n);
         }
 
         if (v.TryGetInt("readQueueNums", out n))
         {
-            q.ReadQueueNums = JavaNumber.ToInt32(n);
+            q.ReadQueueNums = LegacyNumber.ToInt32(n);
         }
 
         if (v.TryGetInt("writeQueueNums", out n))
         {
-            q.WriteQueueNums = JavaNumber.ToInt32(n);
+            q.WriteQueueNums = LegacyNumber.ToInt32(n);
         }
 
         if (v.TryGetInt("topicSysFlag", out n))
         {
-            q.TopicSysFlag = JavaNumber.ToInt32(n);
+            q.TopicSysFlag = LegacyNumber.ToInt32(n);
         }
 
         return q;
@@ -114,7 +114,7 @@ public sealed class QueueData : IComparable<QueueData>
     public override int GetHashCode()
     {
         long result = 1;
-        result = 31 * result + JavaHash.JavaStringHash(BrokerName);
+        result = 31 * result + LegacyHash.StringHash(BrokerName);
         result = 31 * result + Perm;
         result = 31 * result + ReadQueueNums;
         result = 31 * result + WriteQueueNums;
@@ -310,15 +310,15 @@ public sealed class BrokerData : IComparable<BrokerData>
     public override int GetHashCode()
     {
         long result = 1;
-        result = 31 * result + JavaHash.JavaStringHash(Cluster);
-        result = 31 * result + JavaHash.JavaStringHash(BrokerName);
+        result = 31 * result + LegacyHash.StringHash(Cluster);
+        result = 31 * result + LegacyHash.StringHash(BrokerName);
         // Map.hashCode = 各 entry 的 (keyHash ^ valueHash) 之和
         long mapHash = 0;
         foreach (var kv in BrokerAddrs)
         {
             long k = kv.Key; // Long.hashCode = (int)(v ^ (v>>>32))
             int kh = unchecked((int)(k ^ (long)((ulong)k >> 32)));
-            mapHash += kh ^ JavaHash.JavaStringHash(kv.Value);
+            mapHash += kh ^ LegacyHash.StringHash(kv.Value);
             mapHash &= 0xFFFFFFFFL;
         }
 
@@ -564,7 +564,7 @@ public sealed class TopicRouteData
 
     public override int GetHashCode() => BrokerNameHash();
 
-    private int BrokerNameHash() => JavaHash.JavaStringHash(OrderTopicConf);
+    private int BrokerNameHash() => LegacyHash.StringHash(OrderTopicConf);
 
     // RemotingSerializable.encode / decode 的等价物
     public byte[] Encode() => RemotingSerializable.Encode(ToJson());

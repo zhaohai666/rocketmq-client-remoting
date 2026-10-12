@@ -53,14 +53,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wire_name_is_the_java_enum_name() {
+    fn wire_name_is_the_server_enum_name() {
         assert_eq!(BoundaryType::Lower.name(), "LOWER");
         assert_eq!(BoundaryType::Upper.name(), "UPPER");
         assert_eq!(BoundaryType::default(), BoundaryType::Lower);
     }
 
     #[test]
-    fn get_type_is_lenient_like_java() {
+    fn get_type_is_lenient_per_contract() {
         assert_eq!(BoundaryType::get_type("UPPER"), BoundaryType::Upper);
         assert_eq!(BoundaryType::get_type("upper"), BoundaryType::Upper);
         assert_eq!(BoundaryType::get_type("Upper"), BoundaryType::Upper);

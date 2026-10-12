@@ -11,7 +11,7 @@ import zlib
 from typing import Optional
 
 
-def java_string_hash(s: str) -> int:
+def utf16_int32_hash(s: str) -> int:
     """Java `String.hashCode()`：h = 31*h + ch，按 32 位有符号回绕。
 
     必须显式实现：Python 的 `hash(str)` 带进程级随机盐（PYTHONHASHSEED），

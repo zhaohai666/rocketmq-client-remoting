@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn java_md5_hash_takes_only_the_first_four_bytes() {
+    fn ring_md5_hash_takes_only_the_first_four_bytes() {
         // Java 的 `h <<= 8; h |= digest[i] & 0xFF`（i<4）= 摘要前 4 字节大端拼接
         assert_eq!(Md5Hash.hash(""), 0xd41d_8cd9);
         assert_eq!(Md5Hash.hash("abc"), 0x9001_5098);

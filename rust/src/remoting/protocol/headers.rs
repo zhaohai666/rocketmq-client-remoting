@@ -1063,12 +1063,12 @@ header_struct! {
     }
 }
 
-/// 每个 header 的 extFields 键名快照，供 `test_java_alignment` 与 Java 源码对拍。
+/// 每个 header 的 extFields 键名快照，供 `test_header_field_names_match_protocol` 与 Java 源码对拍。
 ///
 /// 与 `org.apache.rocketmq.remoting.protocol.header.*` 的字段名逐字对齐；
 /// `SendMessageRequestHeaderV2` 是唯一的短名例外（Java 侧字段名本身就是 `a`…`n`）。
 #[cfg(test)]
-const JAVA_HEADER_FIELDS: &[(&str, &[&str])] = &[
+const PROTOCOL_HEADER_FIELDS: &[(&str, &[&str])] = &[
     ("SendMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "maxReconsumeTimes", "batch", ]),
     ("SendMessageRequestHeaderV2", &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", ]),
     ("ReplyMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "bornHost", "storeHost", "storeTimestamp", ]),
@@ -1160,7 +1160,7 @@ const JAVA_HEADER_FIELDS: &[(&str, &[&str])] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::JAVA_HEADER_FIELDS;
+    use super::PROTOCOL_HEADER_FIELDS;
     use crate::common::boundary_type::BoundaryType;
     use crate::remoting::protocol::codes::request_code;
     use crate::remoting::protocol::ext_fields::ExtFields;
@@ -1176,7 +1176,7 @@ mod tests {
     /// 逐字节守卫：POP 请求头的 12 个长字段名与顺序（`python/tests/test_pop.py`、
     /// `cpp/tests/test_pop.cpp` 同一组断言）。
     #[test]
-    fn pop_message_request_header_ext_keys_exactly_match_java() {
+    fn pop_message_request_header_ext_keys_exactly_match_protocol() {
         let h = PopMessageRequestHeader {
             consumer_group: Some(GROUP.into()),
             topic: Some(TOPIC.into()),
@@ -1455,7 +1455,7 @@ mod tests {
     /// ⚠ `bname` 是从 `RpcRequestHeader` 继承下来的，反射名不是 `brokerName`；
     /// 写成后者 broker 收不到值，而 Java 客户端会照写 `bname`。
     #[test]
-    fn recall_message_headers_use_java_keys() {
+    fn recall_message_headers_use_wire_keys() {
         let h = RecallMessageRequestHeader {
             producer_group: Some(GROUP.into()),
             topic: Some(TOPIC.into()),
@@ -1526,7 +1526,7 @@ mod tests {
     /// 入网文本是 `Enum.toString()` 的大写枚举名（不是 `getName()` 的小写名）；
     /// 未设置时整键不写（@CFNullable）；回解走 Java `BoundaryType.getType` 的宽松语义。
     #[test]
-    fn search_offset_request_header_carries_the_java_boundary_type() {
+    fn search_offset_request_header_carries_the_protocol_boundary_type() {
         let mut h = SearchOffsetRequestHeader {
             topic: Some(TOPIC.into()),
             queue_id: Some(2),
@@ -1670,7 +1670,7 @@ mod tests {
     ///
     /// 只有设置 `ROCKETMQ_JAVA_SRC` 时才跑（指向 RocketMQ Java 仓库根目录），否则静默跳过。
     #[test]
-    fn test_java_alignment() {
+    fn test_header_field_names_match_protocol() {
         let root = match std::env::var("ROCKETMQ_JAVA_SRC") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => {
@@ -1680,7 +1680,7 @@ mod tests {
         };
         let root = std::path::PathBuf::from(root);
         assert!(root.is_dir(), "ROCKETMQ_JAVA_SRC 不是目录: {root:?}");
-        for (class, fields) in JAVA_HEADER_FIELDS {
+        for (class, fields) in PROTOCOL_HEADER_FIELDS {
             let declared = java_declared_fields(&root, class, 0);
             if declared.is_empty() {
                 // Python 专有 header（Java 无对应类），不校验。

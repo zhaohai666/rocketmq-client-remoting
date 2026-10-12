@@ -113,7 +113,7 @@ class Harness:
 
 
 class TestContextDefault:
-    def test_default_is_java_max_value(self):
+    def test_default_is_the_int32_max_sentinel(self):
         from client.consumer_result import ConsumeConcurrentlyContext
         # Java ConsumeConcurrentlyContext:33 —— 默认「整批认可」，不是「一条都不认可」
         assert ConsumeConcurrentlyContext().ack_index == (1 << 31) - 1
@@ -153,7 +153,7 @@ class TestConsumeSuccess:
         assert h.backed_offsets == [0, 1]
         assert h.offset == 2
 
-    def test_send_back_uses_java_delay_gradient(self):
+    def test_send_back_uses_the_delay_level_gradient(self):
         # Java sendMessageBack:277-283 —— delayLevel 为 0 时取 3 + reconsumeTimes
         h = Harness()
         batch = [msg(0), msg(1, reconsume_times=2), msg(2)]
@@ -219,7 +219,7 @@ class TestReconsumeLater:
         assert hook.after == [("RECONSUME_LATER", False, "RETURNNULL")], (
             "status 的形态按 Java 的 Enum.toString()（裸成员名），不是 str(枚举) 那种带类名的")
 
-    def test_hook_status_is_java_enum_name_on_the_success_path_too(self):
+    def test_hook_status_is_the_uppercase_enum_name_on_the_success_path_too(self):
         """成功路径同样：``ConsumeConcurrentlyService:408`` 写的是 ``CONSUME_SUCCESS``。
 
         反证「没写错形态」得同时钉住两件事：等于 Java 的裸成员名，且**不等于** Python

@@ -6,10 +6,9 @@
 //   node --experimental-strip-types examples/live_compression.ts recv <topic> <group> <size> <namesrv>
 //
 // Every port rebuilds the payload locally from the SAME recipe (one fixed line
-// repeated, then truncated) — byte-identical to Java's CompressProbe.buildPayload
-// — so nothing has to be exchanged. Only `match` is compared across ports: the
-// printed CRC numbers differ by 2^31 on purpose, because Java's UtilAll.crc32
-// masks the top bit while this port uses the standard CRC-32.
+// repeated, then truncated) — so nothing has to be exchanged. Only `match` is
+// compared across ports: the printed CRC numbers differ by 2^31 on purpose,
+// 因为 wire 上的 CRC 字段按有符号 32 位整数上报，而本端打印的是无符号值。
 //
 // Why the matrix exists at all: a unit test proves "I decode what I encoded". It
 // cannot prove "port A's compressor produces bytes port B can inflate", and a
@@ -23,7 +22,7 @@
 // which is why the sender prints its own storeSize: a leg where nothing was
 // compressed still passes the CRC, so the number is evidence, not the verdict.
 //
-// Exit codes match the Python/Go/PHP legs: 0 ok / 1 ordinary failure (including
+// Exit codes 采用矩阵统一约定: 0 ok / 1 ordinary failure (including
 // a failed send) / 2 bad codec or bad usage / 3 recv timeout. 2 stays strictly
 // for "bad codec / bad usage" so a send failure is never mistaken for an
 // unsupported codec.

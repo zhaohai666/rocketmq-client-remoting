@@ -776,7 +776,7 @@ mod tests {
     // ---------------- 编码：与 Java 逐字节一致 ----------------
 
     #[test]
-    fn encode_pub_matches_java_vector() {
+    fn encode_pub_matches_wire_vector() {
         let mut ctx = ctx_of(TraceType::Pub, vec![bean(MSG_ID_1, "KeyA KeyB", 2)]);
         ctx.group_name = "GID_test".into();
         ctx.cost_time = 7;
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_sub_before_matches_java_vector() {
+    fn encode_sub_before_matches_wire_vector() {
         let ctx = ctx_of(
             TraceType::SubBefore,
             vec![bean(MSG_ID_1, "KeyA KeyB", 2), bean(MSG_ID_2, "KeyC", 0)],
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_sub_after_matches_java_vector() {
+    fn encode_sub_after_matches_wire_vector() {
         let mut ctx = ctx_of(TraceType::SubAfter, vec![bean(MSG_ID_1, "KeyA KeyB", 2)]);
         ctx.group_name = "CID_test".into();
         ctx.cost_time = 11;
@@ -904,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_end_transaction_matches_java_vector() {
+    fn encode_end_transaction_matches_wire_vector() {
         let ctx = ctx_of(
             TraceType::EndTransaction,
             vec![bean(MSG_ID_1, "KeyA KeyB", 2)],
@@ -931,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_recall_matches_java_vector() {
+    fn encode_recall_matches_wire_vector() {
         let ctx = ctx_of(TraceType::Recall, vec![bean(MSG_ID_1, "KeyA KeyB", 2)]);
         let tb = TraceDataEncoder::encoder_from_context_bean(Some(&ctx)).unwrap();
         assert_eq!(
@@ -968,7 +968,7 @@ mod tests {
     // ---------------- 解码 ----------------
 
     #[test]
-    fn java_split_drops_trailing_empty_like_java() {
+    fn trace_data_split_drops_trailing_empty() {
         assert_eq!(java_split("a\u{2}", STX), vec!["a"]);
         assert_eq!(java_split("\u{2}", STX), Vec::<&str>::new());
         assert_eq!(java_split("a\u{2}b\u{2}", STX), vec!["a", "b"]);
@@ -1224,7 +1224,7 @@ mod tests {
     // ---------------- 常量与辅助类型 ----------------
 
     #[test]
-    fn constants_match_java() {
+    fn trace_constants_match_wire_contract() {
         assert_eq!(TraceConstants::CONTENT_SPLITOR, '\u{1}');
         assert_eq!(TraceConstants::FIELD_SPLITOR, '\u{2}');
         assert_eq!(TraceConstants::GROUP_NAME_PREFIX, "_INNER_TRACE_PRODUCER");
@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_type_names_are_java_enum_names() {
+    fn trace_type_names_are_wire_enum_names() {
         assert_eq!(TraceType::Pub.name(), "Pub");
         assert_eq!(TraceType::Recall.name(), "Recall");
         assert_eq!(TraceType::SubBefore.name(), "SubBefore");
@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_context_defaults_like_java() {
+    fn trace_context_uses_contract_defaults() {
         let ctx = TraceContext::new();
         assert_eq!(ctx.trace_type, None);
         assert!(ctx.time_stamp > 0);

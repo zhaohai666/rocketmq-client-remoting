@@ -126,7 +126,7 @@ public:
 };
 
 // ---------------------------------------------------------------- 订阅语义（Java 对拍向量）
-void testSubscriptionJavaParity() {
+void testSubscriptionFieldParity() {
     // "*" / "" → SUB_ALL 且两集合都空（Java setSubString("*") 后直接 return）
     SubscriptionData all1 = FilterAPI::buildSubscriptionData("T", "*");
     expect(all1.subString == "*" && all1.tagsSet.empty() && all1.codeSet.empty(),
@@ -356,7 +356,7 @@ void testContextDefaults() {
 }  // namespace
 
 int main() {
-    testSubscriptionJavaParity();
+    testSubscriptionFieldParity();
     testCheckForbiddenHook();
     testFilterMessageHook();
     testContextDefaults();

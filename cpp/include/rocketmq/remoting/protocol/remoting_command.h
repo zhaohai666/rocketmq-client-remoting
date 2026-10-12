@@ -58,7 +58,7 @@ public:
     static uint8_t getSerializeTypeConfig();
 
     // ---------------- 帧工具 ----------------
-    // Java getProtocolType：取首字节（这里按整型高 8 位同理）
+    // 帧协议 getProtocolType：取首字节（这里按整型高 8 位同理）
     static uint8_t getProtocolType(int32_t source) {
         return static_cast<uint8_t>((static_cast<uint32_t>(source) >> 24) & 0xFF);
     }
@@ -79,7 +79,7 @@ public:
     }
 
     // ---------------- 编解码 ----------------
-    // 把 customHeader 的非空字段展开到 extFields（对应 Java 的反射行为）
+    // 把 customHeader 的非空字段展开到 extFields（与 broker 侧反射取字段的约定一致）
     void makeCustomHeaderToNet();
 
     JsonValue toJsonObject() const;

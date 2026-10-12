@@ -12,12 +12,12 @@ use RocketMQ\Common\SubscriptionData;
 require_once __DIR__ . '/AdminBodies.php';
 
 /**
- * 公共 body（对应 org.apache.rocketmq.remoting.protocol.body.* 常用部分，移植自 protocol/body.py）。
+ * 公共 body：请求/应答的 JSON body 结构，一个 request code 对应一种形状。
  *
- * ⚠ 以 MessageQueue 为键的 map：fastjson2 会把 MessageQueue 键内联成 JSON 对象
- * （``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这不是合法 JSON，
- * 但 Java 的 fastjson2 能读回来，所以必须用 messageQueueKey()/decodeMessageQueueMap()
- * 处理，不能当普通字符串键。PHP 侧统一存成 list<array{mq, value}>。
+ * ⚠ 以 MessageQueue 为键的 map：broker 侧序列化会把键**内联成 JSON 对象**
+ * （``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这形状不是合法 JSON，
+ * 但 broker 的解析器认它，所以必须用 messageQueueKey()/decodeMessageQueueMap()
+ * 处理，不能当普通字符串键。本端口统一存成 list<array{mq, value}>。
  */
 final class Bodies
 {
@@ -239,11 +239,11 @@ final class GetConsumerListByGroupResponseBody
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody。
+ * broker 回查客户端配置时下发的 body。
  *
  * 只被 ``CHECK_CLIENT_CONFIG(46)`` 用到：broker 拿 clientId/group 记日志，真正被校验的
- * 只有 ``subscriptionData`` 的 expressionType 与 subString。namespace 字段 Java 5.5.1 里
- * 存在但发送端不填，这里同样保留字段而不写值（fastjson 不序列化 null）。
+ * 只有 ``subscriptionData`` 的 expressionType 与 subString。namespace 字段在协议里
+ * 存在但发送端不填，这里同样保留字段而不写值（broker 侧不序列化 null）。
  */
 final class CheckClientRequestBody
 {
@@ -377,19 +377,19 @@ final class ClusterInfo
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo。
+ * 消费者运行信息：诊断与统计上报的主体结构。
  *
- * 两端都用得到：**admin 侧**解析 broker 汇总的运行信息；**客户端侧**在应答
+ * 两侧都用得到：**管理侧**解析 broker 汇总的运行信息；**本客户端**在应答
  * GET_CONSUMER_RUNNING_INFO(307) 时编码自己的运行信息。
  *
- * ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``（fastjson2 内联对象键），
- * PHP 侧用 message_queue_key() 字符串键存取。
+ * ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``（序列化后是内联对象键），
+ * 本端口用 message_queue_key() 字符串键存取。
  */
 final class ConsumerRunningInfo
 {
     public const PROP_NAMESERVER_ADDR = 'PROP_NAMESERVER_ADDR';
     public const PROP_THREADPOOL_CORE_SIZE = 'PROP_THREADPOOL_CORE_SIZE';
-    public const PROP_CONSUME_ORDERLY = 'PROP_CONSUMEORDERLY';   // 注意 Java 常量名没有下划线
+    public const PROP_CONSUME_ORDERLY = 'PROP_CONSUMEORDERLY';   // 协议键名就是 CONSUMEORDERLY，没有下划线
     public const PROP_CONSUME_TYPE = 'PROP_CONSUME_TYPE';
     public const PROP_CLIENT_VERSION = 'PROP_CLIENT_VERSION';
     public const PROP_CONSUMER_START_TIMESTAMP = 'PROP_CONSUMER_START_TIMESTAMP';
@@ -635,9 +635,9 @@ final class ConsumeStatus
 }
 
 /**
- * 对应 Java `body.ConsumeStatsList`（`GET_BROKER_CONSUME_STATS` 响应）。
+ * 聚合消费统计（`GET_BROKER_CONSUME_STATS` 的响应 body）。
  *
- * ⚠ JSON 键是 Java 字段名 `consumeStatsList`，不是 `statsList`：写错键名时
+ * ⚠ JSON 键是协议字段名 `consumeStatsList`，不是属性名 `statsList`：写错键名时
  * 真机响应会解析成空列表，看着像「这个 broker 没有积压」。
  */
 final class ConsumeStatsList
@@ -684,11 +684,11 @@ final class ConsumeStatsList
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody。
+ * 重置位点（222）的 map 形式 body。
  *
- * ⚠ Java 字段是 ``Map<MessageQueue, Long> offsetTable``，**不是** topic→queueId→offset
- * 的嵌套 map（早期 Python 实现写错了，真实 broker 响应解析不出来）。
- * fastjson2 会把 MessageQueue 键内联成 JSON 对象，故用 AdminBodies 的键工具解析。
+ * ⚠ 协议里 ``offsetTable`` 是 MessageQueue → Long 的一张平表，**不是** topic→queueId→offset
+ * 的嵌套 map（写成嵌套 map 就解析不出真实 broker 响应）。
+ * MessageQueue 键会被内联成 JSON 对象，故用 AdminBodies 的键工具解析。
  */
 final class ResetOffsetBody
 {
@@ -727,7 +727,7 @@ final class ResetOffsetBody
     }
 }
 
-/** 对应 org.apache.rocketmq.common.message.MessageQueueForC（ForC 数组的元素）。 */
+/** ForC 数组形式里的队列元素：队列三要素外加可选的 offset。 */
 final class MessageQueueForC
 {
     public function __construct(
@@ -757,12 +757,12 @@ final class MessageQueueForC
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：``offsetTable`` 是
- * **数组**（每条自带 offset），不是 map。
+ * 重置位点（222）的数组形式 body：``offsetTable`` 是**数组**（每条自带 offset），
+ * 不是 map。
  *
- * 只有 222 发起方的 language=CPP 时 broker 才推这种体，Java 管理端恒发 JAVA，
- * 所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
- * 旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
+ * broker 按发起方上报的 language 码选形状：只有 language=CPP 才推这种数组形式，
+ * 其余语言码一律推 map 形式。发起重置的完全可能是上报 CPP 的管理端，
+ * 所以两种都要能解——收到却解析不出等于整笔重置静默丢弃。
  */
 final class ResetOffsetBodyForC
 {
@@ -802,15 +802,15 @@ final class ResetOffsetBodyForC
 // ---------------------------------------------------------------- 42 GET_CONSUMER_STATUS_FROM_CLIENT
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody。
+ * 取客户端消费状态（42）的 body。
  *
- * 两个 map 的键都是 ``MessageQueue``（fastjson2 内联对象键）。
+ * 两个 map 的键都是 ``MessageQueue``（内联对象键）。
  */
 final class GetConsumerStatusBody
 {
     /** @var array<string, array{mq: MessageQueue, offset: int}> */
     public array $messageQueueTable = [];
-    // 已废弃的字段：Java 仍保留（consumerTable: clientId → 位点表）
+    // 协议里已废弃但结构仍在（consumerTable: clientId → 位点表），解析时照旧兼容
     /** @var array<string, list<array{mq: MessageQueue, offset: int}>> */
     public array $consumerTable = [];
 
@@ -866,7 +866,7 @@ final class GetConsumerStatusBody
 
 // ---------------------------------------------------------------- 307 / 309
 
-/** 对应 org.apache.rocketmq.remoting.protocol.body.ProcessQueueInfo。 */
+/** 单个处理队列的快照（应答 307 时逐队列上报）。 */
 final class ProcessQueueInfo
 {
     public int $commitOffset = 0;
@@ -880,7 +880,7 @@ final class ProcessQueueInfo
     public bool $locked = false;
     public int $tryUnlockTimes = 0;
     public int $lastLockTimestamp = 0;
-    public bool $droped = false;          // Java 字段名就是 droped（拼写如此）
+    public bool $droped = false;          // 协议字段名就是 droped（拼写如此，改了就丢字段）
     public int $lastPullTimestamp = 0;
     public int $lastConsumeTimestamp = 0;
 
@@ -927,7 +927,7 @@ final class ProcessQueueInfo
     }
 }
 
-/** 对应 org.apache.rocketmq.remoting.protocol.body.CMResult。 */
+/** 直接消费的应答结果码。 */
 final class CMResult
 {
     public const CR_SUCCESS = 'CR_SUCCESS';
@@ -939,10 +939,9 @@ final class CMResult
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult。
+ * 直接消费单条消息（309）的应答 body。
  *
- * 这是 309 的应答 body，字段全是标量 —— 是四个 body 里唯一不需要处理
- * MessageQueue 内联键的一个。
+ * 字段全是标量 —— 是这一组 body 里唯一不需要处理 MessageQueue 内联键的一个。
  */
 final class ConsumeMessageDirectlyResult
 {

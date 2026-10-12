@@ -62,15 +62,15 @@ struct GetConsumerListByGroupResponseBody {
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody
 //
-// 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 拿 clientId/group 记日志，真正被校验的只有
-// subscriptionData 的 expressionType 与 subString（Java
-// ClientManageProcessor#checkClientConfig）。namespace 字段 Java 5.5.1 里存在但发送端
-// 不填，这里同样保留字段而不写值（未置位时不参与 JSON，对齐 fastjson 不序列化 null）。
+// 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 侧 ClientManageProcessor#checkClientConfig
+// 拿 clientId/group 记日志，真正被校验的只有 subscriptionData 的 expressionType 与
+// subString。协议里定义了 namespace 字段但发送端不填，这里同样保留字段而不写值
+// （未置位时不参与 JSON，与 broker 侧不序列化 null 字段的约定一致）。
 struct CheckClientRequestBody {
     std::string clientId;
     std::string group;
     SubscriptionData subscriptionData;
-    std::string clientNamespace;  // Java 字段名 namespace（C++ 里 namespace 是关键字）
+    std::string clientNamespace;  // 协议字段名 namespace（C++ 里 namespace 是关键字）
     bool hasNamespace = false;
 
     JsonValue toJson() const;
@@ -81,7 +81,7 @@ struct CheckClientRequestBody {
 };
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.ClusterInfo
-// Java 的 brokerAddrTable 是 Map<String, BrokerData>，这里直接复用 route.h 的 BrokerData。
+// brokerAddrTable 序列化为 Map<String, BrokerData>，这里直接复用 route.h 的 BrokerData。
 struct ClusterInfo {
     std::map<std::string, BrokerData> brokerAddrTable;
     std::map<std::string, std::vector<std::string>> clusterAddrTable;
@@ -98,10 +98,10 @@ struct ClusterInfo {
     static bool decode(const Bytes& data, ClusterInfo& out);
 };
 
-// 对应 org.apache.rocketmq.client.common.Connection
+// ConsumerConnection.connectionSet 的单个连接元素
 struct Connection {
     std::string clientId;
-    std::string clientAddr;  // Java 字段名 clientAddr
+    std::string clientAddr;  // 协议字段名 clientAddr
     std::string language;
     int32_t version = 0;
 
@@ -151,10 +151,10 @@ struct ConsumeStatus {
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo
 struct ConsumerRunningInfo {
-    // Java ConsumerRunningInfo 里 properties 的固定键（常量名照抄 Java）
+    // ConsumerRunningInfo.properties 的固定键（键名由协议约定）
     static constexpr const char* PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR";
     static constexpr const char* PROP_THREADPOOL_CORE_SIZE = "PROP_THREADPOOL_CORE_SIZE";
-    static constexpr const char* PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY";  // Java 常量名无下划线
+    static constexpr const char* PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY";  // 协议键名无下划线
     static constexpr const char* PROP_CONSUME_TYPE = "PROP_CONSUME_TYPE";
     static constexpr const char* PROP_CLIENT_VERSION = "PROP_CLIENT_VERSION";
     static constexpr const char* PROP_CONSUMER_START_TIMESTAMP = "PROP_CONSUMER_START_TIMESTAMP";
@@ -179,7 +179,7 @@ struct ConsumerRunningInfo {
 // （GET_BROKER_CONSUME_STATS 的响应：consumeStatsList 为
 //   <groupName, List<ConsumeStats>> 的列表）
 //
-// ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错时真机响应会
+// ⚠ JSON 键是协议字段名 consumeStatsList，不是 statsList：写错时真机响应会
 // 解析成空列表，看着像「这个 broker 没有积压」。
 struct ConsumeStatsList {
     JsonValue statsList;  // 透传
@@ -197,9 +197,9 @@ struct ConsumeStatsList {
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody
 //
-// ⚠ Java 字段是 Map<MessageQueue, Long> offsetTable，**不是** topic->queueId->offset
-// 的嵌套 map（早期 Python 实现写错了，真实 broker 响应解析不出来）。
-// fastjson2 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
+// ⚠ 协议字段 offsetTable 是 Map<MessageQueue, Long>，**不是** topic->queueId->offset
+// 的嵌套 map；写错时真实 broker 响应解析不出来。
+// broker 侧 fastjson 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
 struct ResetOffsetBody {
     std::map<MessageQueue, int64_t> offsetTable;
 
@@ -211,7 +211,7 @@ struct ResetOffsetBody {
 };
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.MessageQueueForC。
-// 字段名保持 Java 的驼峰（brokerName / queueId），与 MessageQueue 的序列化形状不同。
+// 字段名沿用协议的驼峰写法（brokerName / queueId），与 MessageQueue 的序列化形状不同。
 struct MessageQueueForC {
     std::string topic;
     std::string brokerName;
@@ -220,9 +220,9 @@ struct MessageQueueForC {
 };
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：offsetTable 是
-// **数组**（每条自带 offset），不是 map。只有 222 发起方的 language=CPP 时 broker 才推
-// 这种体（Broker2Client.resetOffset:158-163），Java 客户端永远收不到；本端口解析它是为了
-// 与 language=CPP 的旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
+// **数组**（每条自带 offset），不是 map。broker 侧 Broker2Client#resetOffset 只有当 222
+// 发起方的 language=CPP 时才推这种体；本客户端声明的正是 language=CPP，收到后必须能解析，
+// 否则等于整笔重置静默丢弃。
 struct ResetOffsetBodyForC {
     std::vector<MessageQueueForC> offsetTable;
 
@@ -235,8 +235,8 @@ struct ResetOffsetBodyForC {
 
 // 对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
 // （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。messageQueueTable 的键是
-// MessageQueue（fastjson2 内联对象键）；consumerTable 是 Java 保留的废弃字段
-// （clientId -> 位点表），本客户端不填，序列化时按 Java 形状带空对象。
+// MessageQueue（broker 侧 fastjson 内联对象键）；consumerTable 是协议保留的废弃字段
+// （clientId -> 位点表），本客户端不填，序列化时按协议形状带空对象。
 struct GetConsumerStatusBody {
     std::map<MessageQueue, int64_t> messageQueueTable;
 

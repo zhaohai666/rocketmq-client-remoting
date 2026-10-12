@@ -4,7 +4,8 @@
 // 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
 // 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
 //
-// 与 Java 逐字节语义一致：队列 2048、batchNum=min(n,20)、maxMsgSize=128000、5s 刷新、
+// 上报协议语义（轨迹消费端按这些常量解析，不可改）：队列 2048、batchNum=min(n,20)、
+// maxMsgSize=128000、5s 刷新、
 // 按 (业务 topic, 轨迹 topic) 分组、累积 keys、按 maxMsgSize 切块异步发送、
 // 空 region / 空 bean 跳过、CLOUD 时轨迹 topic 用 "rmq_sys_TRACE_DATA_" + regionId。
 //
@@ -87,7 +88,7 @@ void AsyncTraceDispatcher::start(const std::string& nameSrvAddr, AccessChannel a
             traceProducer_->setNamesrvAddr(nameSrvAddr);
             traceProducer_->setInstanceName(
                 std::string(TraceConstants::TRACE_INSTANCE_NAME) + "_" + nameSrvAddr);
-            // Java `AsyncTraceDispatcher.start():155`：轨迹生产者继承宿主的 5.x 命名空间，
+            // 轨迹生产者继承宿主的 5.x 命名空间：
             // 必须在 traceProducer_->start()（钩子装链）之前设好，首包才带上 nsd/ns。
             traceProducer_->setNamespaceV2(namespaceV2_);
             traceProducer_->start();
@@ -161,7 +162,7 @@ void AsyncTraceDispatcher::asyncRun() {
         } catch (const std::exception& e) {
             logger_error("trace flushTraceContext error: " + std::string(e.what()));
         }
-        // 防止忙等（对齐 Java 的 Thread.sleep(5)）
+        // 防止忙等，5ms 轮询
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
@@ -197,14 +198,14 @@ void AsyncTraceDispatcher::asyncSendTraceMessage(
 
 void AsyncTraceDispatcher::sendTraceData(
     const std::vector<std::shared_ptr<TraceContext>>& contextList) {
-    // 按 (业务 topic, 轨迹 topic) 分组（对齐 Java sendTraceData）。
+    // 按 (业务 topic, 轨迹 topic) 分组。
     std::map<std::string, std::vector<TraceTransferBean>> beanMap;
     for (const auto& ctx : contextList) {
         if (ctx == nullptr) continue;
         AccessChannel ch = ctx->accessChannel.value_or(accessChannel_);
         const std::string& regionId = ctx->regionId;
         if (regionId.empty() || ctx->traceBeans.empty()) {
-            continue;  // 空 region / 空 bean 跳过（对齐 Java）
+            continue;  // 空 region / 空 bean 跳过
         }
         std::string traceTopic;
         if (ch == AccessChannel::CLOUD) {
@@ -230,8 +231,7 @@ void AsyncTraceDispatcher::sendTraceData(
 
 void AsyncTraceDispatcher::flushData(const std::vector<TraceTransferBean>& transBeanList,
                                     const std::string& topic, const std::string& traceTopic) {
-    // Java 签名里也带 topic（private void flushData(List, String topic, String traceTopic)），
-    // 但实现只用 traceTopic —— 保留参数以对齐签名，显式标注未使用。
+    // 签名带 topic 但实现只用 traceTopic —— 参数是接口合同的一部分，保留并显式标注未使用。
     (void)topic;
     if (transBeanList.empty()) return;
     std::string buffer;

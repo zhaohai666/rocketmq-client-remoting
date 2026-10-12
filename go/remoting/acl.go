@@ -1,8 +1,7 @@
-// ACL client-side authentication (Java
-// org.apache.rocketmq.acl.common.{SessionCredentials, AclClientRPCHook, AclUtils,
-// AclSigner} and org.apache.rocketmq.remoting.rpchook.StreamTypeRPCHook).
+// ACL client-side authentication.
 //
-// The signature is byte-for-byte the one Java produces:
+// The signature must be byte-for-byte what the broker's ACL validator
+// recomputes:
 //
 //	content  = values of every extField, in KEY-SORTED order, skipping the
 //	           "Signature" key itself (values only — no keys, no separators),
@@ -34,8 +33,9 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// SessionCredentials extField names (Java SessionCredentials constants). The
-// strings go on the wire, so they are part of the protocol, not decoration.
+// SessionCredentials extField names. The strings go on the wire and the
+// broker matches them verbatim, so they are part of the protocol, not
+// decoration.
 const (
 	CredentialAccessKey     = "AccessKey"
 	CredentialSecretKey     = "SecretKey"
@@ -43,31 +43,26 @@ const (
 	CredentialSecurityToken = "SecurityToken"
 )
 
-// CredentialKeyFileEnv overrides the key file path. Java reads the
-// `rocketmq.client.keyFile` system property; the Go analogue of a system
-// property is an environment variable.
+// CredentialKeyFileEnv overrides the key file path — the environment analogue
+// of the `rocketmq.client.keyFile` config key.
 const CredentialKeyFileEnv = "ROCKETMQ_CLIENT_KEY_FILE"
 
-// SessionCredentials mirrors org.apache.rocketmq.acl.common.SessionCredentials.
 type SessionCredentials struct {
 	AccessKey     string
 	SecretKey     string
 	SecurityToken string
 }
 
-// NewSessionCredentials mirrors SessionCredentials(accessKey, secretKey).
 func NewSessionCredentials(accessKey, secretKey string) *SessionCredentials {
 	return &SessionCredentials{AccessKey: accessKey, SecretKey: secretKey}
 }
 
-// NewSessionCredentialsWithToken mirrors
-// SessionCredentials(accessKey, secretKey, securityToken).
 func NewSessionCredentialsWithToken(accessKey, secretKey, securityToken string) *SessionCredentials {
 	return &SessionCredentials{AccessKey: accessKey, SecretKey: secretKey, SecurityToken: securityToken}
 }
 
-// KeyFilePath is Java SessionCredentials.KEY_FILE:
-// `rocketmq.client.keyFile` (here: $ROCKETMQ_CLIENT_KEY_FILE), else $HOME/key.
+// KeyFilePath resolves the key file: $ROCKETMQ_CLIENT_KEY_FILE if set, else
+// $HOME/key.
 func KeyFilePath() string {
 	if v := os.Getenv(CredentialKeyFileEnv); v != "" {
 		return v
@@ -79,10 +74,9 @@ func KeyFilePath() string {
 	return filepath.Join(home, "key")
 }
 
-// LoadSessionCredentials mirrors the no-arg SessionCredentials() constructor:
-// read the key file and take AccessKey / SecretKey / SecurityToken from it.
-// A missing or unreadable file is NOT an error in Java (the fields just stay
-// empty); this port reports it so a typo'd path is not silently ignored.
+// LoadSessionCredentials reads the key file and takes AccessKey / SecretKey /
+// SecurityToken from it. A missing or unreadable file is reported as an error
+// so a typo'd path is not silently ignored.
 func LoadSessionCredentials() (*SessionCredentials, error) {
 	path := KeyFilePath()
 	f, err := os.Open(path)
@@ -94,7 +88,7 @@ func LoadSessionCredentials() (*SessionCredentials, error) {
 	creds := &SessionCredentials{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		key, value, ok := parseJavaPropertyLine(sc.Text())
+		key, value, ok := parsePropertyLine(sc.Text())
 		if !ok {
 			continue
 		}
@@ -113,13 +107,13 @@ func LoadSessionCredentials() (*SessionCredentials, error) {
 	return creds, nil
 }
 
-// parseJavaPropertyLine handles the subset of java.util.Properties#load the
+// parsePropertyLine handles the subset of the .properties format the
 // key file actually uses: `key=value` / `key:value`, `#`/`!` comments, blank
 // lines. Line continuations and backslash escapes are NOT handled — the key
 // file is a two-line credentials file, and guessing at escapes would be worse
-// than refusing. Returns ok=false for lines with no separator (Properties
-// treats a bare key as an empty value; nobody means that here).
-func parseJavaPropertyLine(line string) (string, string, bool) {
+// than refusing. Returns ok=false for lines with no separator (the properties
+// format treats a bare key as an empty value; nobody means that here).
+func parsePropertyLine(line string) (string, string, bool) {
 	trimmed := strings.TrimLeft(line, " \t\f")
 	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "!") {
 		return "", "", false
@@ -133,14 +127,14 @@ func parseJavaPropertyLine(line string) (string, string, bool) {
 
 // ------------------------------------------------------------------ signer
 
-// CombineRequestContent mirrors Java AclUtils#combineRequestContent over
-// AclClientRPCHook#parseRequestContent: makeCustomHeaderToNet first (the custom
-// header's non-nil fields must be in extFields to be signed), then every
-// extField VALUE in key-sorted order except "Signature", then the raw body.
+// CombineRequestContent builds the signed content: makeCustomHeaderToNet
+// first (the custom header's non-nil fields must be in extFields to be
+// signed), then every extField VALUE in key-sorted order except "Signature",
+// then the raw body.
 //
-// Sorting is Go's byte-wise string order; Java uses TreeMap's natural order
-// (UTF-16 code units). The two agree for every ASCII field name, which is what
-// the protocol uses; they could disagree for names mixing BMP and
+// Sorting is Go's byte-wise string order; the broker sorts the same values
+// by UTF-16 code units. The two agree for every ASCII field name, which is
+// what the protocol uses; they could disagree for names mixing BMP and
 // supplementary-plane characters, which no RocketMQ field name does.
 func CombineRequestContent(request *RemotingCommand) []byte {
 	request.MakeCustomHeaderToNet()
@@ -161,9 +155,8 @@ func CombineRequestContent(request *RemotingCommand) []byte {
 	return buf
 }
 
-// CalcSignature mirrors Java AclSigner#calSignature:
-// Base64Std(HMAC-SHA1(secretKey, data)). The client always uses HMAC-SHA1
-// (AclSigner.DEFAULT_ALGORITHM); the broker-side choice among
+// CalcSignature returns Base64Std(HMAC-SHA1(secretKey, data)). The client
+// always uses HMAC-SHA1; the broker-side choice among
 // HmacSHA1/HmacMD5/HmacSHA256 is a server config the client never negotiates.
 func CalcSignature(content []byte, secretKey string) string {
 	mac := hmac.New(sha1.New, []byte(secretKey))
@@ -173,7 +166,6 @@ func CalcSignature(content []byte, secretKey string) string {
 
 // ------------------------------------------------------------------ hooks
 
-// AclClientRPCHook mirrors org.apache.rocketmq.acl.common.AclClientRPCHook.
 type AclClientRPCHook struct {
 	credentials *SessionCredentials
 }
@@ -195,11 +187,11 @@ func NewAclClientRPCHook(credentials *SessionCredentials) (*AclClientRPCHook, er
 // Credentials returns the hook's credentials.
 func (h *AclClientRPCHook) Credentials() *SessionCredentials { return h.credentials }
 
-// DoBeforeRequest mirrors Java AclClientRPCHook#doBeforeRequest, in the same
-// order: AccessKey, SecurityToken, then the signature over both.
+// DoBeforeRequest writes extFields in a fixed order: AccessKey,
+// SecurityToken, then the signature over both.
 func (h *AclClientRPCHook) DoBeforeRequest(_ string, request *RemotingCommand) {
 	request.AddExtField(CredentialAccessKey, h.credentials.AccessKey)
-	// Java: "The SecurityToken value is unnecessary, user can choose this one."
+	// SecurityToken is optional, but must be in extFields before signing.
 	if h.credentials.SecurityToken != "" {
 		request.AddExtField(CredentialSecurityToken, h.credentials.SecurityToken)
 	}
@@ -211,33 +203,30 @@ func (h *AclClientRPCHook) Sign(request *RemotingCommand) string {
 	return CalcSignature(CombineRequestContent(request), h.credentials.SecretKey)
 }
 
-// DoAfterResponse is a no-op, exactly like Java.
+// DoAfterResponse is a no-op.
 func (h *AclClientRPCHook) DoAfterResponse(_ string, _ *RemotingCommand, _ *RemotingCommand) {}
 
-// RequestType mirrors org.apache.rocketmq.remoting.protocol.RequestType, whose
-// only member is STREAM with code (byte) 0.
+// RequestType is the protocol request-type tag; its only member is STREAM
+// with code (byte) 0.
 type RequestType int8
 
 // RequestTypeStream is RequestType.STREAM.
 const RequestTypeStream RequestType = 0
 
-// StreamTypeRPCHook mirrors
-// org.apache.rocketmq.remoting.rpchook.StreamTypeRPCHook: one line writing
-// `ReqT = "0"`.
+// StreamTypeRPCHook is one line writing `ReqT = "0"`.
 //
-// Registration ORDER matters. Java MQClientAPIImpl:329-332 registers this hook
-// BEFORE the user's rpcHook ("Inject stream rpc hook first to make reserve
-// field signature"), so that ReqT is already in extFields when the ACL hook
-// builds its content — otherwise the broker would reject the request for
+// Registration ORDER matters: this hook must be registered BEFORE the user's
+// rpcHook (the ACL hook), so that ReqT is already in extFields when the ACL
+// hook builds its content — otherwise the broker would reject the request for
 // carrying an unsigned field.
 type StreamTypeRPCHook struct{}
 
-// DoBeforeRequest writes ReqT. Java uses String.valueOf((byte) 0) → "0".
+// DoBeforeRequest writes ReqT as "0" (the wire text of the byte value 0).
 func (StreamTypeRPCHook) DoBeforeRequest(_ string, request *RemotingCommand) {
 	request.AddExtField(common.ReqT, "0")
 }
 
-// DoAfterResponse is a no-op, exactly like Java.
+// DoAfterResponse is a no-op.
 func (StreamTypeRPCHook) DoAfterResponse(_ string, _ *RemotingCommand, _ *RemotingCommand) {}
 
 var (

@@ -5,8 +5,7 @@ import (
 	"fmt"
 )
 
-// Writer is a big-endian byte sink (Java ByteBuffer writes / Python
-// struct.pack(">...")).
+// Writer is a big-endian byte sink.
 type Writer struct {
 	buf []byte
 }
@@ -31,7 +30,7 @@ func (w *Writer) I8(v int8) *Writer {
 	return w
 }
 
-// I16 truncates to the low 16 bits, like writing a Java short.
+// I16 writes the low 16 bits of v, big-endian.
 func (w *Writer) I16(v int32) *Writer {
 	w.buf = binary.BigEndian.AppendUint16(w.buf, uint16(v))
 	return w
@@ -159,7 +158,7 @@ func (r *Reader) U16() (uint16, error) {
 	return binary.BigEndian.Uint16(b), nil
 }
 
-// I16 reads the unsigned interpretation of a Java short (Python `code & 0xFFFF`).
+// I16 reads 2 bytes big-endian and returns the unsigned value (0..65535).
 func (r *Reader) I16() (int32, error) {
 	v, err := r.U16()
 	return int32(v), err

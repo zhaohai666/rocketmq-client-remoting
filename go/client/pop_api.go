@@ -1,5 +1,6 @@
-// POP path, wire side (Java MQClientAPIImpl.processPopResponse + PullAPIWrapper
-// .popAsync + ExtraInfoUtil).
+// POP path, wire side: the client half of the broker's POP_MESSAGE(200050) /
+// ACK_MESSAGE(200051) / CHANGE_MESSAGE_INVISIBLETIME(200053) commands in the
+// classic remoting protocol.
 //
 // POP is not "another pull". A pull names a queue and an offset and the broker
 // answers with messages; a POP asks for a batch from one queue, and the broker
@@ -13,11 +14,11 @@
 //  3. never commit a consumer offset: POP leaves the offset to the broker's
 //     revive logic. The consumer offset table is NOT advanced by a POP at all.
 //
-// The two POP_CK construction paths here are both real. When the broker sent
-// startOffsetInfo/msgOffsetInfo the checkpoint is derived from those tables
-// (the batch-start offset comes from the table, not from the message). When it
-// did not, the checkpoint is built from the message's own queue offset. Java
-// checks `startOffsetInfo == null` to choose; so does this file.
+// The two POP_CK construction paths here are both real, and `startOffsetInfo
+// == nil` is the switch. When the broker sent startOffsetInfo/msgOffsetInfo the
+// checkpoint is derived from those tables (the batch-start offset comes from
+// the table, not from the message). When it did not, the checkpoint is built
+// from the message's own queue offset.
 package client
 
 import (
@@ -28,7 +29,7 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// PopStatus mirrors Java org.apache.rocketmq.client.consumer.PopStatus.
+// PopStatus classifies the broker's POP answer.
 type PopStatus int
 
 const (
@@ -37,7 +38,7 @@ const (
 	// PopNoNewMsg: nothing to hand out.
 	PopNoNewMsg
 	// PopPollingFull: the broker's polling pool is full — back off, do not
-	// retry immediately (Java treats this as the "later" branch).
+	// retry immediately; the broker is asking the client to come back later.
 	PopPollingFull
 	// PopPollingNotFound: the long poll expired with no message.
 	PopPollingNotFound
@@ -58,8 +59,8 @@ func (s PopStatus) String() string {
 	}
 }
 
-// PopResult is one POP response (Java PopResult, restricted to what the classic
-// push consumer reads).
+// PopResult is one POP response, restricted to what the classic push consumer
+// reads from it.
 type PopResult struct {
 	PopStatus    PopStatus
 	MsgFoundList []*common.MessageExt
@@ -98,8 +99,8 @@ func (i *Instance) AckMessage(addr string, header *remoting.AckMessageRequestHea
 		return err
 	}
 	if response.Code != remoting.RespSuccess {
-		// Java maps every non-SUCCESS code to AckStatus.NO_EXIST — the broker
-		// could not find the checkpoint, which is a warning, not a hard error.
+		// Any non-SUCCESS code means the broker could not find the checkpoint —
+		// a warning, not a hard error.
 		return common.BrokerError(response.Code, response.Remark)
 	}
 	return nil
@@ -107,15 +108,14 @@ func (i *Instance) AckMessage(addr string, header *remoting.AckMessageRequestHea
 
 // BatchAckMessage sends BATCH_ACK_MESSAGE(200151) with a pre-built body.
 //
-// NOTE (Java fidelity): the CLASSIC Java client never calls this. Its POP path
-// acks one message at a time through DefaultMQPushConsumerImpl#ackAsync ->
-// MQClientAPIImpl#ackMessageAsync, and BATCH_ACK_MESSAGE(200151) appears nowhere
-// in client/src/main/java. It is exported here because the wire capability is
-// real (the broker implements it and the next-gen/proxy clients use it) and the
-// live verifier exercises it directly. Do NOT "finish" the POP consumer by
-// routing its acks through this — that would be inventing client behaviour.
+// NOTE: the classic remoting push consumer never calls this. Its POP path acks
+// one message at a time, and BATCH_ACK_MESSAGE(200151) is not part of that
+// exchange. It is exported here because the wire capability is real — the broker
+// implements the batch ack handler — and the live verifier exercises it
+// directly. Do NOT "finish" the POP consumer by routing its acks through this;
+// that would be inventing client behaviour.
 func (i *Instance) BatchAckMessage(addr string, body *remoting.BatchAckMessageRequestBody, timeoutMillis int64) error {
-	// Note: no custom header — Java passes null and rides the body only.
+	// Note: no custom header — the batch ack rides the request body only.
 	request := remoting.CreateRequestCommand(remoting.ReqBatchAckMessage, nil)
 	request.SetBody(body.Encode())
 	response, err := i.invokeSync(addr, request, timeoutMillis)
@@ -131,8 +131,8 @@ func (i *Instance) BatchAckMessage(addr string, body *remoting.BatchAckMessageRe
 // ChangeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053) and returns the
 // NEW popTime / invisibleTime the broker assigned.
 //
-// The returned values are not cosmetic: Java rebuilds the checkpoint from them
-// so a later ACK still matches the (now longer) invisibility window.
+// The returned values are not cosmetic: the checkpoint must be rebuilt from
+// them so a later ACK still matches the (now longer) invisibility window.
 func (i *Instance) ChangeInvisibleTime(addr string, header *remoting.ChangeInvisibleTimeRequestHeader, timeoutMillis int64) (*remoting.ChangeInvisibleTimeResponseHeader, error) {
 	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqChangeMessageInvisibleTime, header), timeoutMillis)
 	if err != nil {
@@ -194,9 +194,8 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 	respHeader.FromExtFields(response.ExtFields())
 	result.RestNum = i64Or(respHeader.RestNum, 0)
 	if result.PopStatus != PopFound {
-		// Java returns early: an empty answer has no checkpoint tables to parse,
-		// and the header's popTime is meaningless for a message that does not
-		// exist.
+		// Return early: an empty answer has no checkpoint tables to parse, and
+		// the header's popTime is meaningless for a message that does not exist.
 		return result, nil
 	}
 	result.PopTime = i64Or(respHeader.PopTime, 0)
@@ -223,8 +222,8 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 	for _, msg := range result.MsgFoundList {
 		if startOffsetInfo == nil {
 			// No tables: the checkpoint is built from this message's own queue
-			// offset. Java caches it per (topic,queueId) and appends the
-			// message offset as segment 7.
+			// offset, cached per (topic,queueId) with the message offset
+			// appended as segment 7.
 			key := msg.Topic + i32Text(msg.QueueID)
 			checkpoint, ok := built[key]
 			if !ok {
@@ -234,20 +233,20 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 			}
 			msg.PutProperty(common.PropertyPopCk, checkpoint+common.KeySeparator+i64Text(msg.QueueOffset))
 		} else if propertyOf(msg, common.PropertyPopCk) == "" {
-			// Java guards this whole branch with `getProperty(POP_CK) == null`:
-			// when the broker already stamped a checkpoint, KEEP IT.
+			// This branch is guarded on `getProperty(POP_CK) == ""`: when the
+			// broker already stamped a checkpoint, KEEP IT.
 			//
 			// That guard is load-bearing on the default retry path. With
 			// brokerConfig.popResponseReturnActualRetryTopic=false the broker
 			// builds the checkpoint from the PHYSICAL retry topic, so segment 4
-			// (the retry marker) is "1", stamps it with putIfAbsent, and only
-			// THEN rewrites msg.Topic to the business topic
-			// (PopMessageProcessor:849-853). By the time the client sees the
-			// message the topic has already been rewritten, so rebuilding from
-			// the message would resolve the marker to "0" and derive the ACK
-			// topic as the business topic — where the broker holds no such
-			// checkpoint. The ACK then becomes a silent no-op whose only
-			// symptom is "the message keeps coming back after popInvisibleTime".
+			// (the retry marker) is "1", stamps it only if absent, and only
+			// THEN rewrites msg.Topic to the business topic. By the time the
+			// client sees the message the topic has already been rewritten, so
+			// rebuilding from the message would resolve the marker to "0" and
+			// derive the ACK topic as the business topic — where the broker
+			// holds no such checkpoint. The ACK then becomes a silent no-op
+			// whose only symptom is "the message keeps coming back after
+			// popInvisibleTime".
 			//
 			// The lookup key is the message's OWN topic as decoded, which is
 			// still the physical topic at this point (the request topic is

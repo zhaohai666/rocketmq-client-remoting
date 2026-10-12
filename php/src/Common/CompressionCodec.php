@@ -4,12 +4,11 @@ declare(strict_types=1);
 
 // LZ4 Frame codec + ZSTD frame codec — 纯 PHP 主体，零第三方扩展（repo rule）。
 //
-// LZ4: **LZ4 Frame 格式**（Java Lz4Compressor 用 lz4-java 的 LZ4FrameOutputStream/
-// LZ4FrameInputStream，Python lz4.frame 同规范互通）。Frame 内部块就是 LZ4
-// block-format —— 纯 PHP 编解码，见下方 block 层。
+// LZ4: **LZ4 Frame 格式**（magic 0x184D2204 的自描述帧，任何合规 LZ4 解码器可解）。
+// Frame 的内部块就是 LZ4 block-format —— 纯 PHP 编解码，见下方 block 层。
 //
 // ZSTD: 压缩/解压**优先走 zstd CLI**（proc_open，stdin→stdout，真压缩率 +
-// 能解 Compressed 块，与其他端真 zstd 全互通）；CLI 不可用时退回纯实现——
+// 能解标准 Compressed 块，与 broker 侧的真 zstd 互通）；CLI 不可用时退回纯实现——
 // 压缩 = 只用 RAW 块（长串跑 RLE）拼出的合法 zstd 帧（无压缩率但 wire 兼容），
 // 解压只认 Raw/RLE 块，遇到 Compressed 块显式报错而不是把压缩字节当正文交回
 // —— 跨端规则「unsupported = throw, never passthrough」。
@@ -44,8 +43,7 @@ final class CompressionCodec
     }
 
     /**
-     * 把 $data 编成一个 LZ4 block（无帧头 —— RocketMQ wire 存裸 block，
-     * 与 lz4-java 的 compress() 一致）。
+     * 把 $data 编成一个 LZ4 block（无帧头；Frame 层的每个内部块就是这一层）。
      */
     public static function lz4CompressBlock(string $data): string
     {
@@ -245,7 +243,7 @@ final class CompressionCodec
     }
 
     /**
-     * ZSTD 解压统一入口：CLI 可用 → 全帧型解压（含其他端真 zstd 压出的
+     * ZSTD 解压统一入口：CLI 可用 → 全帧型解压（含标准 zstd 压出的
      * Compressed 块）；CLI 缺失 → 纯实现（只认 Raw/RLE，Compressed 块仍显式抛，
      * 绝不把压缩字节当正文交回）。
      */
@@ -365,14 +363,14 @@ final class CompressionCodec
 
     // ---------------------------------------------------------------- LZ4 frame
 
-    // ⚠ Java wire 的 LZ4 是 **LZ4 Frame 格式**（Lz4Compressor 用 lz4-java 的
-    // LZ4FrameOutputStream/LZ4FrameInputStream；Python lz4.frame 同规范互通），
-    // 不是裸 block —— 裸 block 只能自环自解，跨端/Java 全部解不开（静默丢弃）。
+    // ⚠ 协议里的 LZ4 是 **LZ4 Frame 格式**（带 magic/FLG/BD/HC 的自描述帧），
+    // 不是裸 block —— 裸 block 只能自环自解，broker 与标准 LZ4 实现全部解不开；
+    // 而解压失败一旦被吞掉，交出去的就是压缩字节，等于静默丢数据。
     // Frame = magic + FLG + BD + [C.Size(8B)] + HC + {BlockSize(4B) + block}*
     //          + EndMark(4B) + [C.Checksum(4B)]；block 就是上面的裸 block 层。
 
     private const LZ4_MAGIC = 0x184D2204;
-    private const LZ4_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，对齐 Java/Python 默认
+    private const LZ4_BLOCK_SIZE = 65536; // BD=0x40 → 64KB，LZ4 frame 的惯例默认值
 
     // xxhash32（LZ4 frame 的 HC 与 C.Checksum 用；纯 int 拆半乘法 mod 2^32）
     private const XXH_P1 = 2654435761;
@@ -442,8 +440,8 @@ final class CompressionCodec
     }
 
     /**
-     * 压成 LZ4 Frame（Java LZ4FrameOutputStream / Python lz4.frame 同规范）。
-     * FLG = version01 | B.Indep | C.Size（无块校验、无内容校验 —— 对齐两端默认）；
+     * 压成 LZ4 Frame（标准帧，合规解码器都能解）。
+     * FLG = version01 | B.Indep | C.Size（无块校验、无内容校验 —— 帧格式允许的最简组合）；
      * HC = xxh32(FLG+BD+C.Size, 0) 的第二字节；块压不动时存 raw 块（bit31）。
      */
     public static function lz4CompressFrame(string $data): string
@@ -547,7 +545,7 @@ final class CompressionCodec
 
     /**
      * 按 MessageSysFlag 的压缩类型压缩（sysFlag bit8-10：1=LZ4、2=ZSTD、3=ZLIB）。
-     * ZLIB 走 gzcompress（带 level，Java Deflater 同款容器格式 RFC1950）。
+     * ZLIB 走 gzcompress（带 level，容器格式 RFC1950，broker 侧按 zlib 解压）。
      */
     public static function compressFor(string $data, int $compressionType, int $level = 5): string
     {

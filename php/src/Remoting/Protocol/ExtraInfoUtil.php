@@ -7,9 +7,9 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\MixAll;
 
 /**
- * POP 模式的 extraInfo（俗称 CK 串）编解码（移植自 protocol/extra_info.py）。
+ * POP 模式的 extraInfo（俗称 CK 串）编解码。
  *
- * 逐条移植 Java ``org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil``。
+ * 串的段序、分隔符与兼容规则都由 broker 侧的解析代码定死，本类逐条实现它认的形状。
  *
  * CK 串是 POP 模式的核心凭据：broker 在 POP 响应里**不**给普通 topic 的消息写
  * ``POP_CK`` 属性（只在 retry topic 重编码路径写），客户端必须自己用响应头的
@@ -22,7 +22,7 @@ use RocketMQ\Common\MixAll;
  */
 final class ExtraInfoUtil
 {
-    /** 段内分隔符；**必须**是空格，对应 Java ``MessageConst.KEY_SEPARATOR`` */
+    /** 段内分隔符；**必须**是空格——broker 按空格切，换任何字符整串都解不开 */
     public const KEY_SEPARATOR = ' ';
     /** 队列之间的分隔符 */
     public const QUEUE_SEPARATOR = ';';
@@ -34,31 +34,31 @@ final class ExtraInfoUtil
     public const RETRY_TOPIC_V2 = '2';
     public const QUEUE_OFFSET = 'qo';
 
-    /** 顺序消费用的固定 revive 队列号，对应 Java ``KeyBuilder.POP_ORDER_REVIVE_QUEUE`` */
+    /** 顺序消费用的固定 revive 队列号：999 是协议里的哨兵值 */
     public const POP_ORDER_REVIVE_QUEUE = 999;
 
     private const POP_RETRY_SEPARATOR_V1 = '_';
     private const POP_RETRY_SEPARATOR_V2 = '+';
 
-    /** ``%RETRY%<cid>_<topic>``（Java ``KeyBuilder.buildPopRetryTopicV1``）。 */
+    /** V1 形状的 POP 重试 topic 名：``%RETRY%<cid>_<topic>``。 */
     public static function buildPopRetryTopicV1(string $topic, string $cid): string
     {
         return MixAll::RETRY_GROUP_TOPIC_PREFIX . $cid . self::POP_RETRY_SEPARATOR_V1 . $topic;
     }
 
-    /** ``%RETRY%<cid>+<topic>``（Java ``KeyBuilder.buildPopRetryTopicV2``）。 */
+    /** V2 形状的 POP 重试 topic 名：``%RETRY%<cid>+<topic>``。 */
     public static function buildPopRetryTopicV2(string $topic, string $cid): string
     {
         return MixAll::RETRY_GROUP_TOPIC_PREFIX . $cid . self::POP_RETRY_SEPARATOR_V2 . $topic;
     }
 
-    /** Java ``buildPopRetryTopic``：``enableRetryTopicV2`` 关（默认）走 V1。 */
+    /** 按开关选形状：``enableRetryTopicV2`` 关（默认）走 V1。 */
     public static function buildPopRetryTopic(string $topic, string $cid, bool $enableRetryV2 = false): string
     {
         return $enableRetryV2 ? self::buildPopRetryTopicV2($topic, $cid) : self::buildPopRetryTopicV1($topic, $cid);
     }
 
-    /** Java ``KeyBuilder.isPopRetryTopicV2``：``%RETRY%`` 前缀且含 ``+``。 */
+    /** ``%RETRY%`` 前缀且含 ``+`` 即 V2 重试 topic。 */
     public static function isPopRetryTopicV2(?string $retryTopic): bool
     {
         if ($retryTopic === null || $retryTopic === '') {
@@ -69,8 +69,8 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 模拟 Java ``String.split``：**丢弃末尾空串**。
-     * 这个差异是真实的：Java ``"a b ".split(" ")`` 得到 ``["a","b"]``，段数校验依赖它。
+     * 按 broker 侧的切分语义拆段：**丢弃末尾空串**。
+     * 这不是吹毛求疵：``"a b "`` 切出来是 ``["a","b"]`` 两段，段数校验依赖它。
      *
      * @return list<string>
      */
@@ -83,7 +83,7 @@ final class ExtraInfoUtil
         return $parts;
     }
 
-    /** 按空格切分 CK 串（Java ``ExtraInfoUtil.split``）。 */
+    /** 按空格切分 CK 串。 */
     public static function split(?string $extraInfo): array
     {
         if ($extraInfo === null) {
@@ -148,7 +148,7 @@ final class ExtraInfoUtil
     }
 
     /**
-     * 由 topic 形状判定 retryFlag（Java ``ExtraInfoUtil.getRetry(topic)``）。
+     * 由 topic 形状判定 retryFlag。
      * 顺序很重要：先判 V2（含 ``+``），再判 ``%RETRY%`` 前缀（V1）。
      */
     public static function retryOfTopic(string $topic): string
@@ -164,7 +164,7 @@ final class ExtraInfoUtil
 
     /**
      * 拼 CK 串。传 ``$msgQueueOffset`` 得到 8 段，不传得到 7 段。
-     * 对应 Java 的两个 ``buildExtraInfo`` 重载。ACK 场景用 8 段版本。
+     * broker 两种长度都收：ACK 场景必须用 8 段版本，少一段就丢队列位点。
      */
     public static function buildExtraInfo(int $ckQueueOffset, int $popTime, int $invisibleTime, int $reviveQid, string $topic, string $brokerName, int $queueId, ?int $msgQueueOffset = null): string
     {
@@ -284,13 +284,13 @@ final class ExtraInfoUtil
         return self::retryOfTopic($topic) . '@' . self::getQueueOffsetKeyValueKey($queueId, $queueOffset);
     }
 
-    /** reviveQid 是 999 表示顺序消费（Java ``ExtraInfoUtil.isOrder``）。 */
+    /** reviveQid 是 999 表示顺序消费。 */
     public static function isOrder(array $segments): bool
     {
         return self::getReviveQid($segments) === self::POP_ORDER_REVIVE_QUEUE;
     }
 
-    /** 由 retryFlag 还原真实 topic（Java ``ExtraInfoUtil.getRealTopic``）。 */
+    /** 由 retryFlag 还原真实 topic（剥掉 %RETRY% 前缀和 cid 段）。 */
     public static function getRealTopic(string $topic, string $cid, string $retry): string
     {
         if ($retry === self::NORMAL_TOPIC) {

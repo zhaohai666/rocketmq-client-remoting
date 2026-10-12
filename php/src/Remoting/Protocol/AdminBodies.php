@@ -8,24 +8,23 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\TopicConfig;
 
 /**
- * 管理端专用响应体（对应 org.apache.rocketmq.remoting.protocol.admin.* 与 body.* 中的管理类，
- * 移植自 protocol/admin_body.py）：
+ * 管理端专用响应体（协议里的管理类结构）：
  *
  * TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
  * TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody。
  *
- * ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，fastjson2 会把键直接内联成 JSON 对象，
+ * ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧序列化会把键直接内联成 JSON 对象，
  * 产出**非法 JSON**，例如：
  *     {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
  * 所以必须用 RemotingSerializable::fastjsonLoads() 解析，再把字符串键还原成 MessageQueue。
- * 字段名与结构均由 Java 探针实测确认。
+ * 字段名与结构均按真机回包实测确认，别凭记忆改。
  *
  * PHP 无法用对象做数组键：以 MessageQueue 为键的 map 统一存成
  * ``list<array{mq: MessageQueue, value: mixed}>``，JSON 输出仍用 messageQueueKey() 内联对象键。
  */
 
 /**
- * 把 fastjson2 写出的 MessageQueue 内联对象键还原成 MessageQueue。
+ * 把 broker 写出的 MessageQueue 内联对象键还原成 MessageQueue。
  *
  * 返回 null 表示这个键不是内联对象（例如 ``"0"``、``"G1"`` 这类普通字符串键）。
  */
@@ -68,7 +67,7 @@ function decode_message_queue_map(?array $raw): array
 
 // ---------------------------------------------------------------- TopicStatsTable
 
-/** 对应 org.apache.rocketmq.remoting.protocol.admin.TopicOffset。 */
+/** 一个 topic 的最小 / 最大位点。 */
 final class TopicOffset
 {
     public function __construct(
@@ -100,7 +99,7 @@ final class TopicOffset
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable。
+ * topic 的逐队列收发统计表。
  *
  * 探针输出：{"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}
  */
@@ -149,7 +148,7 @@ final class TopicStatsTable
 
 // ---------------------------------------------------------------- ConsumeStats
 
-/** 对应 org.apache.rocketmq.remoting.protocol.admin.OffsetWrapper。 */
+/** 单队列的 broker / consumer 位点与最后更新时间。 */
 final class OffsetWrapper
 {
     public function __construct(
@@ -160,7 +159,7 @@ final class OffsetWrapper
     ) {
     }
 
-    /** 与 Java OffsetWrapper.getLag() 一致：brokerOffset - consumerOffset。 */
+    /** 滞后量：brokerOffset - consumerOffset。 */
     public function lag(): int
     {
         return $this->brokerOffset - $this->consumerOffset;
@@ -190,7 +189,7 @@ final class OffsetWrapper
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.admin.ConsumeStats。
+ * 消费组的整体消费统计。
  *
  * 探针输出：{"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}
  */
@@ -248,7 +247,7 @@ final class ConsumeStats
 // ---------------------------------------------------------------- TopicConfigSerializeWrapper
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper。
+ * broker 上的全量 topic 配置表 + 数据版本。
  *
  * 探针输出：{"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
  */
@@ -294,7 +293,7 @@ final class TopicConfigSerializeWrapper
 // ---------------------------------------------------------------- QueryConsumeQueue
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeQueueData。
+ * 一条 ConsumeQueue 记录的原始内容（排障时直接读出来的）。
  *
  * 探针/源码字段：physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
  */
@@ -321,7 +320,7 @@ final class ConsumeQueueData
             'eval' => $this->eval,
             'bitMap' => $this->bitMap,
         ];
-        // 同 Java：null 字段不序列化
+        // null 字段不序列化：写了 null 键会改变 broker 侧的缺省解释
         if ($this->extendDataJson !== null) {
             $d['extendDataJson'] = $this->extendDataJson;
         }
@@ -347,7 +346,7 @@ final class ConsumeQueueData
 }
 
 /**
- * 对应 org.apache.rocketmq.remoting.protocol.body.QueryConsumeQueueResponseBody。
+ * 直接查 ConsumeQueue 的应答内容。
  *
  * 探针输出：{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
  * （queueData 为 null 时不出现）

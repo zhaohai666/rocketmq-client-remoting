@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * SubscriptionData（对应 org.apache.rocketmq.common.filter.SubscriptionData，
- * 移植自 subscription_data.py）。
+ * 订阅数据：一次订阅解析出的 topic / subString / tagsSet / codeSet / 表达式类型，
+ * 心跳与拉取都按这份结构上报 broker。
  */
 class SubscriptionData
 {
@@ -16,10 +16,10 @@ class SubscriptionData
 
     public ?string $subString;
 
-    /** @var list<string> 唯一 tag 集合（对应 Python set） */
+    /** @var list<string> 唯一 tag 集合（数组当 set 用，addTag 负责去重） */
     public array $tagsSet = [];
 
-    /** @var list<int> 唯一 tag hash 集合（对应 Python set） */
+    /** @var list<int> 唯一 tag 哈希集合，与 tagsSet 一一对应 */
     public array $codeSet = [];
 
     public int $subVersion;
@@ -113,7 +113,7 @@ class SubscriptionData
         $this->classFilterMode = $mode;
     }
 
-    /** 集合语义：去重添加 tag（对应 Python set.add）。 */
+    /** 集合语义：去重添加 tag。 */
     public function addTag(string $tag): void
     {
         if (!in_array($tag, $this->tagsSet, true)) {
@@ -121,7 +121,7 @@ class SubscriptionData
         }
     }
 
-    /** 集合语义：去重添加 tag hash（对应 Python set.add）。 */
+    /** 集合语义：去重添加 tag 哈希。 */
     public function addCode(int $code): void
     {
         if (!in_array($code, $this->codeSet, true)) {
@@ -158,9 +158,11 @@ class SubscriptionData
     }
 
     /**
-     * Java 字段名（camelCase），tagsSet/codeSet 转 list 才能 JSON 序列化。
+     * 输出上报用的字段表：键名用协议字段名（camelCase），
+     * tagsSet/codeSet 要以 JSON 数组形式出现。
      *
-     * 注意 filterClassSource 在 Java 里是 @JSONField(serialize=false) —— **不序列化**。
+     * 注意 filterClassSource **不参与序列化**——协议里它是客户端内部字段，
+     * 带上会把整包心跳撑大。
      *
      * @return array<string, mixed>
      */

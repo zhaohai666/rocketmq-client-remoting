@@ -160,7 +160,7 @@ class TestConsumeExecutor:
 # ------------------------------------------------------------------ 消费者侧
 
 class TestConsumerDefaultsAndGuards:
-    def test_java_defaults(self):
+    def test_thread_pool_defaults(self):
         c = DefaultMQPushConsumer(GROUP)
         assert c.get_consume_thread_min() == 20          # Java consumeThreadMin 默认 20 (:162)
         assert c.get_consume_thread_max() == 20          # Java consumeThreadMax 默认 20 (:169)
@@ -198,7 +198,7 @@ class TestConsumerDefaultsAndGuards:
         assert c.update_core_pool_size(19) is True
         assert c.get_core_pool_size() == 19
 
-    def test_default_max_is_java_5x_twenty_not_four_x_sixty_four(self):
+    def test_default_max_is_5x20_not_4x64(self):
         """回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
 
         Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），

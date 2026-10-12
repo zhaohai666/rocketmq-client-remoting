@@ -1,25 +1,20 @@
 // -*- coding: utf-8 -*-
-// Latency fault tolerance (org.apache.rocketmq.client.latency.*).
-// Faithful port of python/client/latency.py, aligned with the Java 5.5.1
-// MQFaultStrategy / LatencyFaultToleranceImpl (incl. the startDetector probe).
+// 延迟故障容忍（latency fault tolerance）。
 //
-// MQFaultStrategy decides which broker queue to use next, avoiding brokers that have recently
-// shown high latency / were isolated after a failed send (when sendLatencyFaultEnable is on).
+// MQFaultStrategy 决定下一次挑选哪个 broker 队列，避开最近高延迟或发送失败后被
+// 隔离的 broker（前提是 sendLatencyFaultEnable 打开）。
 import { connect as netConnect } from 'node:net';
 import { MessageQueue } from '../common/message.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.latency');
 
-// Java LatencyFaultToleranceImpl.ServiceDetector — pluggable reachability probe.
-// May return a boolean directly or a Promise<boolean> (the node default probe).
+// 可插拔的可达性探测。可以直接返回布尔值，也可以返回 Promise<boolean>（node 默认探测器就是 promise 版本）。
 export type ServiceDetector = (addr: string, timeoutMillis: number) => boolean | Promise<boolean>;
-// Java LatencyFaultTolerance.Resolver — broker name -> a probeable address.
+// broker 名 -> 一个可探测地址的解析器。
 export type BrokerResolver = (brokerName: string) => string | null;
 
-// The node default detector: a plain TCP connect probe (Java plugs a
-// NettyRemoteServiceDetector doing the same connect check remotely). Runs on
-// the detector timer only — never on the data path.
+// node 默认探测器：一次纯 TCP 连接探测。只在 detector 定时器上跑，绝对不进数据面。
 export function tcpDetect(addr: string, timeoutMillis: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const sep = addr.lastIndexOf(':');
@@ -47,7 +42,7 @@ export class FaultItem {
   currentLatency: number;
   startTimestamp: number;
   reachableFlag: boolean;
-  // Java FaultItem.checkStamp: the next time the detector may probe this item.
+  // 探测器下一次允许重新探测该项的时刻。
   checkStamp: number;
 
   constructor(name: string) {
@@ -58,9 +53,8 @@ export class FaultItem {
     this.checkStamp = 0;
   }
 
-  // Mark the broker unavailable until (now + duration). Java only EXTENDS an
-  // existing isolation window (LatencyFaultToleranceImpl.FaultItem.
-  // updateNotAvailableDuration: `if (duration > 0 && now + duration > start)`).
+  // 把 broker 标为不可用直到 (now + duration)。**只会延长**已有的隔离窗口，
+  // 不会缩短（`duration > 0 && now + duration > start` 才更新）。
   updateNotAvailableDuration(duration: number): void {
     if (duration > 0 && Date.now() + duration > this.startTimestamp) {
       this.startTimestamp = Date.now() + duration;
@@ -79,8 +73,7 @@ export class FaultItem {
 
 export class LatencyFaultToleranceImpl {
   faultItemTable: Record<string, FaultItem> = {};
-  // Java defaults (LatencyFaultToleranceImpl fields): 200ms probe timeout,
-  // 2s per-item probe interval, detector off.
+  // 默认值：探测超时 200ms，单项探测间隔 2s，探测开关关。
   detectTimeout = 200;
   detectInterval = 2000;
   startDetectorEnable = false;
@@ -126,10 +119,9 @@ export class LatencyFaultToleranceImpl {
   setResolver(resolver: BrokerResolver | null): void { this.resolver = resolver; }
   setServiceDetector(detector: ServiceDetector | null): void { this.serviceDetector = detector; }
 
-  // Java detectByOneRound: probe every item whose checkStamp has come due,
-  // re-marking the stamp first so a slow probe cannot loop on the same item.
-  // The node default detector is promise-based, so the reachability flip lands
-  // in the probe's continuation (Java blocks its scheduled thread instead).
+  // detectByOneRound：遍历每个 checkStamp 到点的项，**先把 stamp 往后推**再发起探测，
+  // 这样一次慢探测不会在同一项上反复触发。node 默认探测器基于 promise，可达性翻转
+  // 落在 promise 回调里；同步 detector 会当场翻转。
   detectByOneRound(): void {
     for (const key of Object.keys(this.faultItemTable)) {
       const brokerItem = this.faultItemTable[key];
@@ -153,8 +145,7 @@ export class LatencyFaultToleranceImpl {
     }
   }
 
-  // Java startDetector: scheduleAtFixedRate(3s initial, 3s interval); each run
-  // only acts when startDetectorEnable is set.
+  // 启动 detector：固定 3s 首轮、3s 周期；每次 tick 只在 startDetectorEnable 为 true 时干活。
   startDetector(): void {
     if (this._detectorTimer != null) return;
     const tick = () => {
@@ -211,10 +202,9 @@ export class MQFaultStrategy {
     return tpInfo.selectOneMessageQueue(null, resetIndex);
   }
 
-  // Java updateFaultItem: only active when sendLatencyFaultEnable; the isolation
-  // window comes from the latency table over a FIXED 10000ms probe latency when
-  // isolating (NOT the 30s floor the old code used — Java
-  // MQFaultStrategy.updateFaultItem: `computeNotAvailableDuration(isolation ? 10000 : currentLatency)`).
+  // updateFaultItem：仅在 sendLatencyFaultEnable 打开时生效；隔离时长取自延迟表，
+  // 隔离态下把 currentLatency 视为**固定的 10000ms**（并非 30s 的下限）：
+  // `computeNotAvailableDuration(isolation ? 10000 : currentLatency)`。
   updateFaultItem(brokerName: string, currentLatency: number, isolation: boolean, reachable: boolean = true): void {
     if (!this.sendLatencyFaultEnable) return;
     const duration = this._computeNotAvailableDuration(isolation ? 10000 : currentLatency);
@@ -230,7 +220,7 @@ export class MQFaultStrategy {
     return 0;
   }
 
-  // ---- startDetector plumbing (Java MQFaultStrategy implements StartAndShutdown) ----
+  // ---- startDetector 相关的开关与注入 ----
   isStartDetectorEnable(): boolean {
     return this.latencyFaultTolerance.startDetectorEnable;
   }

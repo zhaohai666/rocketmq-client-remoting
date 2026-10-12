@@ -76,24 +76,24 @@ use RocketMQ\Remoting\NamespaceRpcHook;
 use RocketMQ\Remoting\StreamTypeRPCHook;
 
 /**
- * MQClientInstance：RocketMQ 客户端核心编排（对应
- * org.apache.rocketmq.client.impl.factory.MQClientInstance 与 MQClientAPIImpl 的核心调用面）。
+ * MQClientInstance：RocketMQ 客户端核心编排，集中承担与 name server / broker 的
+ * 协议调用面。
  *
  * 职责：NameServer 地址管理、Topic 路由获取与缓存、Broker 地址解析、
  * 消息发送（SEND_MESSAGE_V2 / SEND_BATCH_MESSAGE / SEND_REPLY_MESSAGE_V2）、拉取（PULL_MESSAGE）、
  * POP（POP_MESSAGE / ACK_MESSAGE / CHANGE_MESSAGE_INVISIBLETIME）、offset 查询/更新、心跳、
  * 管理类 API（创建/删除 Topic、集群信息等）。
  *
- * 本文件同时容纳 TopicPublishInfo 与 MQClientInstance 两个类（对应 Python 同模块）。
+ * 本文件同时容纳 TopicPublishInfo 与 MQClientInstance 两个类。
  *
- * 单线程适配：Python 版的 _namesrv_refresh_loop / _adjust_thread_pool_loop /
- * _route_refresh_loop 三个后台线程，以及 ConsumerStatsManager 的采样线程，全部收敛为
- * 调用方驱动的显式 ``tick()``（内部按时间戳判定到期，可外部注入当前时间）；原先
- * 「丢到后台线程」的 resetOffset 改为进入内部 pending 队列，由 ``tick()`` 执行。
+ * 单线程模型：本端口没有线程，动态 NameServer 刷新、线程池弹性巡检、路由刷新、
+ * 消费统计采样四类周期任务全部收敛为调用方驱动的显式 ``tick()``（内部按时间戳判定到期，
+ * 可外部注入当前时间）；原先「丢到后台线程」的 resetOffset 改为进入内部 pending 队列，
+ * 由 ``tick()`` 执行。
  */
 
 /**
- * 对应 org.apache.rocketmq.client.impl.producer.TopicPublishInfo。
+ * topic 的发布侧视图：路由队列列表 + 轮询游标。
  */
 final class TopicPublishInfo
 {
@@ -117,7 +117,7 @@ final class TopicPublishInfo
     }
 
     /**
-     * 轮询选队列（对应 Java TopicPublishInfo.selectOneMessageQueue）。
+     * 轮询选队列。
      *
      * ``$filters`` 为可调用 ``f(mq): bool``，全部通过才选中。无过滤器时固定返回一个
      * 轮询队列（永不返回 null）；带过滤器且一轮内无匹配时返回 null，由调用方退化选择。
@@ -126,7 +126,7 @@ final class TopicPublishInfo
      */
     public function selectOneMessageQueue(callable ...$filters): ?MessageQueue
     {
-        // Python: with self._lock（PHP 单线程顺序执行，临界区语义不变）
+        // PHP 单线程顺序执行：游标自增与读取之间不会被抢占，轮询序列保持连续。
         if ($this->msgQueueList === []) {
             throw new MQClientException('no message queue for publish info');
         }
@@ -171,27 +171,27 @@ final class TopicPublishInfo
 }
 
 /**
- * 对应 org.apache.rocketmq.client.impl.factory.MQClientInstance（含 MQClientAPIImpl 调用面）。
+ * 客户端实例：按 clientId 复用，托管路由缓存、broker 地址表、周期任务与协议调用面。
  */
 class MQClientInstance
 {
-    /** 采样周期（Java ConsumerStatsManager 的 scheduleAtFixedRate 参数，10s）。 */
+    /** 消费统计采样周期，10s。 */
     public const STATS_SAMPLE_INTERVAL_MILLIS = 10_000;
 
-    /** 动态 NameServer 刷新：Java initialDelay = 10s。 */
+    /** 动态 NameServer 刷新：首次延迟 10s。 */
     public const NAMESRV_REFRESH_INITIAL_DELAY_MILLIS = 10_000;
-    /** 动态 NameServer 刷新：Java 周期 = 2 分钟。 */
+    /** 动态 NameServer 刷新：周期 2 分钟。 */
     public const NAMESRV_REFRESH_INTERVAL_MILLIS = 120_000;
 
-    /** 线程弹性巡检：Java initialDelay = 1 分钟。 */
+    /** 线程弹性巡检：首次延迟 1 分钟。 */
     public const ADJUST_POOL_INITIAL_DELAY_MILLIS = 60_000;
-    /** 线程弹性巡检：Java 周期 = 1 分钟。 */
+    /** 线程弹性巡检：周期 1 分钟。 */
     public const ADJUST_POOL_INTERVAL_MILLIS = 60_000;
 
-    /** 路由刷新：Java initialDelay = 10ms。 */
+    /** 路由刷新：首次延迟 10ms。 */
     public const ROUTE_REFRESH_INITIAL_DELAY_MILLIS = 10;
 
-    /** 对应 Python 的 INSTANCE_MAP（clientId → 实例）。 */
+    /** clientId → 实例的进程内注册表。 */
     public static array $instanceMap = [];
 
     public string $clientId;
@@ -200,26 +200,25 @@ class MQClientInstance
     public array $nameServerAddrs;
 
     /**
-     * 在用 topic 的路由刷新周期（对应 Java ClientConfig.pollNameServerInterval，默认 30000ms）。
-     * 只在 start() 时取一次（Java scheduledExecutorService 同理）。
+     * 在用 topic 的路由刷新周期，默认 30000ms。
+     * 只在 start() 时取一次，运行期改这个字段不会改变刷新节奏。
      */
     public int $pollNameServerInterval;
 
     /**
-     * VIP 通道开关（对应 Java ClientConfig.vipChannelEnabled，默认 false）：true 时
-     * 发往 broker 的**发送 / 拉取 / POP / 指配**请求走 VIP 端口（端口 - 2）。
-     * Java 在 MQClientAPIImpl 的每个 invoke 点做 ``MixAll.brokerVIPChannel``，本端口
-     * 集中在 ``vipAddrFor()`` 一处套用（Admin 有自己独立的同名开关）。
+     * VIP 通道开关（默认 false）：true 时发往 broker 的**发送 / 拉取 / POP / 指配**请求
+     * 走 VIP 端口（端口 - 2）。本端口集中在 ``vipAddrFor()`` 一处套用，
+     * 不在每个调用点重复换算（Admin 有自己独立的同名开关）。
      */
     public bool $vipChannelEnabled = false;
 
     /**
-     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求都带
-     * `nsd=true` / `ns=<该值>` 两个扩展头（由 {@see NamespaceRpcHook} 写入），broker
-     * 据此把请求解析到对应的 serverless 实例。它和拼 topic 名的 `namespace` 是两套机制。
+     * 5.x 新命名空间：非空时**每笔**请求都带 `nsd=true` / `ns=<该值>` 两个扩展头
+     * （由 {@see NamespaceRpcHook} 写入），broker 据此把请求解析到对应的 serverless
+     * 实例。它和拼 topic 名的 `namespace` 是两套机制。
      *
-     * ⚠ 钩子在构造时就装好、值在每笔请求里现读（Java 传的是 clientConfig 对象，同语义），
-     * 所以 start() 之后再改这个字段一样生效——别把「非空才注册」当成优化。
+     * ⚠ 钩子在构造时就装好、值在每笔请求里现读，所以 start() 之后再改这个字段一样
+     * 生效——别把「非空才注册」当成优化。
      */
     public string $namespaceV2 = '';
 
@@ -232,13 +231,13 @@ class MQClientInstance
     public array $topicPublishInfoTable = [];
 
     /**
-     * 对应 Java brokerAddrTable：按 brokerName 平的一张贴表，每次刷到任一条路由就整批覆盖。
+     * 按 brokerName 平的一张贴表，每次刷到任一条路由就整批覆盖。
      *
      * @var array<string, array<int, string>>
      */
     public array $brokerAddrTable = [];
 
-    /** Python threading.RLock：PHP 单线程顺序执行，临界区语义保留（仅注释）。 */
+    /** PHP 单线程顺序执行：路由表读写不跨请求，这里只保留互斥语义的标记位。 */
     public bool $topicRouteLockHeld = false;
 
     public DefaultTopAddressing $topAddressing;
@@ -258,7 +257,7 @@ class MQClientInstance
 
     private int $consumerIdsChangedCount = 0;
 
-    /** @var list<callable> 单线程下的「后台任务」延迟队列（原 Python 另起线程做的事） */
+    /** @var list<callable> 单线程下的「后台任务」延迟队列（本不该阻塞调用方的动作） */
     private array $pendingActions = [];
 
     private bool $namesrvRefreshEnabled = false;
@@ -266,7 +265,7 @@ class MQClientInstance
     private ?int $adjustPoolNextRunMillis = null;
     private ?int $routeRefreshNextRunMillis = null;
     private ?int $statsSampleNextRunMillis = null;
-    /** RequestFutureHolder TTL 清扫（Java RequestHouseKeepingService：initial 3s，period 1s）。 */
+    /** RequestFutureHolder TTL 清扫：首次 3s，周期 1s。 */
     private ?int $requestScanNextRunMillis = null;
     public const REQUEST_SCAN_INITIAL_DELAY_MILLIS = 3_000;
     public const REQUEST_SCAN_INTERVAL_MILLIS = 1_000;
@@ -293,11 +292,11 @@ class MQClientInstance
         $this->vipChannelEnabled = $vipChannelEnabled;
         $this->namespaceV2 = $namespaceV2;
         $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions);
-        // 对应 Java MQClientAPIImpl:329-335 的装链顺序：
+        // rpcHook 装链顺序固定：
         //   Namespace → Stream → 用户 rpcHook（ACL 签名）→（本端口无 DynamicalExtField）
         // namespace 钩子**无条件注册**且排在最前：nsd/ns 必须在算签名之前进 extFields，
         // 否则开鉴权的 broker 验签会多出未签名字段而拒签；钩子自身在 namespaceV2 为空时
-        // 一个字段都不写（与 Java 同），所以空值注册没有代价。
+        // 一个字段都不写，所以空值注册没有代价。
         $this->remotingClient->registerRpcHook(new NamespaceRpcHook(\Closure::fromCallable([$this, 'namespaceV2Value'])));
         // stream 钩子同样必须注册在用户 rpcHook 之前，这样 ReqT 才会被算进 ACL 签名内容
         // （"Inject stream rpc hook first to make reserve field signature"）。facade 都是在
@@ -311,7 +310,7 @@ class MQClientInstance
             RequestCode::PUSH_REPLY_MESSAGE_TO_CLIENT,
             \Closure::fromCallable([$this, 'processReplyMessage']),
         );
-        // broker 主动请求 220/221/307/309（对应 Java ClientRemotingProcessor）：
+        // broker 主动请求 220/221/307/309：
         // 客户端实例级注册，处理时按 consumerGroup 找到对应消费者实例。
         $this->remotingClient->registerProcessor(
             RequestCode::RESET_CONSUMER_CLIENT_OFFSET,
@@ -335,10 +334,10 @@ class MQClientInstance
             \Closure::fromCallable([$this, 'processNotifyConsumerIdsChanged']),
         );
 
-        // 动态 name server（Java MQClientAPIImpl.topAddressing）。未配置
+        // 动态 name server（DefaultTopAddressing 按域名拉取地址列表）。未配置
         // ROCKETMQ_NAMESRV_DOMAIN 时 wsAddr 为空串 → fetch 是 no-op。
         $this->topAddressing = new DefaultTopAddressing(unitName: $unitName ?? '');
-        // 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）
+        // 消费统计：实例级共享，多个生产者/消费者共用同一份统计。
         $this->consumerStatsManager = new ConsumerStatsManager();
 
         self::$instanceMap[$clientId] = $this;
@@ -356,8 +355,8 @@ class MQClientInstance
 
     /**
      * 当前生效的 namespaceV2——{@see NamespaceRpcHook} 每笔请求回调本方法取值，
-     * 与 Java「钩子实时读 clientConfig.getNamespaceV2()」同语义：start() 之后改
-     * 本字段，后续请求立即跟着变（对照 Remoting/NamespaceRpcHook 的注释）。
+     * 即钩子实时读字段：start() 之后改本字段，后续请求立即跟着变
+     * （对照 Remoting/NamespaceRpcHook 的注释）。
      */
     public function namespaceV2Value(): string
     {
@@ -377,7 +376,7 @@ class MQClientInstance
     // ---------------- 生命周期 ----------------
 
     /**
-     * 同步初始化（对应 Java MQClientInstance.start 的同步部分；PHP 不启后台线程）。
+     * 同步初始化（PHP 不启后台线程，一切周期任务靠调用方泵）。
      *
      * ①置 started；②启动消费统计；③动态 NameServer 首次取址（取不到直接报 10004）；
      * ④排定各 pump 的首次到期时刻；⑤同步做一次初始化「泵」：首轮路由刷新 + 一次心跳 +
@@ -395,7 +394,7 @@ class MQClientInstance
         if ($dynamicNs) {
             $this->fetchNameServerAddr();
             if ($this->nameServerAddrs === []) {
-                // Java 此步不报错（取不到照样启动），本端口在 start 就失败（更可预期），
+                // 取不到地址在 start() 就失败（更可预期），
                 // 码值仍用 10004 NO_NAME_SERVER_EXCEPTION。
                 throw new MQClientException(
                     sprintf(
@@ -405,7 +404,7 @@ class MQClientInstance
                     ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
                 );
             }
-            // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
+            // 周期刷新：首次 10s 后，每 2 分钟一次
             $this->namesrvRefreshEnabled = true;
         }
 
@@ -441,7 +440,7 @@ class MQClientInstance
     }
 
     /**
-     * 显式事件泵（替换 Python 的后台线程）。调用方（通常是主循环 / 测试）周期调用。
+     * 显式事件泵：推进本端口的全部周期任务。调用方（通常是主循环 / 测试）周期调用。
      *
      * @param int|null $nowMillis 可注入的当前时间（毫秒），为空时用内部时钟。
      */
@@ -449,7 +448,7 @@ class MQClientInstance
     {
         $now = $nowMillis ?? $this->currentTimeMillis();
 
-        // 原「后台线程」延迟队列（如 resetOffset 触发的 rebalance）
+        // 延迟动作队列（如 resetOffset 触发的 rebalance）
         $this->runPendingActions();
 
         if (!$this->started) {
@@ -482,10 +481,9 @@ class MQClientInstance
             $this->statsSampleNextRunMillis = $now + self::STATS_SAMPLE_INTERVAL_MILLIS;
         }
 
-        // ⑤RequestFutureHolder TTL 清扫（Java RequestHouseKeepingService 单线程
-        //   scheduleAtFixedRate(scanExpiredRequest, 3s, 1s)；PHP 单线程下没有并发，
+        // ⑤RequestFutureHolder TTL 清扫（首次 3s，周期 1s）。PHP 单线程下没有并发，
         //   只需保证同一请求的超时路径与应答路径只有一条生效 —— putResponse 用
-        //   「摘到才负责」的 remove 语义，天然互斥）。
+        //   「摘到才负责」的 remove 语义，天然互斥。
         if ($this->requestScanNextRunMillis !== null && $now >= $this->requestScanNextRunMillis) {
             $this->requestScanNextRunMillis = $now + self::REQUEST_SCAN_INTERVAL_MILLIS;
             try {
@@ -502,7 +500,7 @@ class MQClientInstance
         $this->tick($nowMillis);
     }
 
-    /** 动态 NameServer 刷新一轮（对应 Python _namesrv_refresh_loop 循环体）。 */
+    /** 动态 NameServer 刷新一轮。 */
     public function namesrvRefreshOnce(): void
     {
         try {
@@ -512,7 +510,7 @@ class MQClientInstance
         }
     }
 
-    /** 路由刷新一轮（对应 Python _route_refresh_loop 循环体）。 */
+    /** 路由刷新一轮：对在用 topic 逐个补拉。 */
     public function routeRefreshOnce(): void
     {
         foreach (array_keys($this->topicsInUse) as $topic) {
@@ -551,7 +549,7 @@ class MQClientInstance
         }
     }
 
-    /** 执行并清空延迟动作队列（原 Python 的「丢到后台线程」）。 */
+    /** 执行并清空延迟动作队列（不该拖慢调用方的动作都在这里排队）。 */
     public function runPendingActions(): void
     {
         while ($this->pendingActions !== []) {
@@ -572,7 +570,7 @@ class MQClientInstance
     // ---------------- 动态 NameServer ----------------
 
     /**
-     * 对应 Java MQClientAPIImpl.fetchNameServerAddr：地址变化才应用。
+     * 从地址服务器取 name server 列表：地址变化才应用。
      */
     public function fetchNameServerAddr(): ?string
     {
@@ -635,17 +633,17 @@ class MQClientInstance
     // ---------------- CHECK_CLIENT_CONFIG(46) ----------------
 
     /**
-     * 对应 Java MQClientInstance#checkClientInBroker:534。
+     * CHECK_CLIENT_CONFIG(46)：让消费者组里的订阅表达式接受 broker 侧校验。
      *
      * 只把**非 TAG**（SQL92 / CLASS_FILTER）表达式发给 broker 校验。某消费者「无订阅」时是
-     * ``return`` 而不是 ``continue``（Java 源码如此）；查不到路由时跳过该订阅。
+     * ``return`` 而不是 ``continue``（协议上视为整轮校验到此结束）；查不到路由时跳过该订阅。
      */
     public function checkClientInBroker(): void
     {
         foreach ($this->consumerTable as $group => $consumer) {
             $subs = $consumer !== null ? $consumer->subscriptions() : null;
             if ($subs === null || $subs === [] || $subs === false) {
-                // 对齐 Java 的 return：不是 continue。
+                // return，不是 continue：后面消费者的订阅都不再校验。
                 return;
             }
             $this->checkSubscriptionsInBroker($group, $subs);
@@ -658,7 +656,7 @@ class MQClientInstance
     public function checkSubscriptionsInBroker(string $group, iterable $subs): void
     {
         foreach ($subs as $sub) {
-            // Java ExpressionType.isTagType：null / "" / "TAG" 都算 TAG，一律跳过。
+            // null / "" / "TAG" 都算 TAG 表达式，一律跳过（broker 侧不需要校验）。
             if ($sub === null) {
                 continue;
             }
@@ -720,8 +718,8 @@ class MQClientInstance
     }
 
     /**
-     * 对应 Java ClientRemotingProcessor#notifyConsumerIdsChanged。broker 用 invokeOneway 发，
-     * Java 返回 null ⇒ 不回包。group 只用于日志，整组一起唤醒。
+     * NOTIFY_CONSUMER_IDS_CHANGED(40)：broker 用 invokeOneway 发，返回 null ⇒ 不回包。
+     * group 只用于日志，整组一起唤醒。
      */
     public function processNotifyConsumerIdsChanged(RemotingCommand $cmd, string $addr): ?RemotingCommand
     {
@@ -737,13 +735,13 @@ class MQClientInstance
         return null;
     }
 
-    // ---------------- broker 主动请求处理（ClientRemotingProcessor） ----------------
+    // ---------------- broker 主动请求处理 ----------------
 
     /**
      * RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发，无需应答。
      *
      * 重置逻辑里会触发 rebalance（lock/unlock 等 invokeSync），不能在本轮同步跑
-     * —— 原 Python 丢后台线程，这里进 pending 队列由下次 tick() 执行。
+     * —— 这里进 pending 队列由下次 tick() 执行，避免在反向请求的处理线程里嵌套同步调用。
      */
     public function processResetOffset(RemotingCommand $cmd, string $addr): ?RemotingCommand
     {
@@ -882,13 +880,13 @@ class MQClientInstance
     /**
      * 拉取并落库 topic 路由。
      *
-     * ``isDefault`` 对应 Java updateTopicRouteInfoFromNameServer(topic, isDefault, producer)：
-     * **只有生产者**在真实路由拉不到时才回退到 TBW102 为新 topic 合成发布信息。
+     * ``isDefault`` 是「生产者新建 topic」的开关：**只有生产者**在真实路由拉不到时
+     * 才回退到 TBW102 为新 topic 合成发布信息。
      */
     public function updateTopicRouteInfoFromNameServer(string $topic, int $timeoutMillis = 5000, bool $isDefault = false): bool
     {
         if ($this->nameServerAddrs === []) {
-            // Java 这里只 log.warn 并返回 false；本端口路由拉取是拉不到就抛，直接把同一个码带上。
+            // 本端口路由拉不到就抛，这里直接把 10004（无 name server）的码带上。
             throw new MQClientException(
                 'name server address list is empty',
                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
@@ -935,7 +933,8 @@ class MQClientInstance
             return false;
         }
 
-        // Python: with self.topic_route_lock（PHP 单线程顺序执行）
+        // 路由表与 broker 地址表必须一起更新：单线程下这段是原子的，
+        // 不会出现「有新路由、旧地址表」的中间态。
         $this->topicRouteTable[$topic] = $route;
         foreach ($route->getBrokerDatas() as $bd) {
             $this->brokerAddrTable[$bd->brokerName] = $bd->brokerAddrs;
@@ -970,13 +969,13 @@ class MQClientInstance
         try {
             $this->updateTopicRouteInfoFromNameServer($topic);
         } catch (\Throwable) {
-            // 对齐 Python：补拉失败静默，返回缓存（此时为 null）
+            // 补拉失败静默，返回缓存（此时为 null）
         }
         return $this->topicRouteTable[$topic] ?? null;
     }
 
     /**
-     * 本实例订阅该 topic 时应看到的全部队列（Java RebalanceImpl.topicSubscribeInfoTable）。
+     * 本实例订阅该 topic 时应看到的全部队列（含只读队列，供重平衡取分配）。
      *
      * @return list<MessageQueue>
      */
@@ -1000,8 +999,7 @@ class MQClientInstance
     }
 
     /**
-     * 对应 Java MQClientInstance#findBrokerAddrByTopic:1390：从路由里随机挑一个 broker
-     * （优先 master 地址）；查不到返回 null（不抛）。
+     * 从路由里随机挑一个 broker（优先 master 地址）；查不到返回 null（不抛）。
      */
     public function findBrokerAddrByTopic(string $topic): ?string
     {
@@ -1019,7 +1017,7 @@ class MQClientInstance
     // ---------------- 消息发送 ----------------
 
     /**
-     * VIP 通道换算（Java 每个invoke 点的 ``MixAll.brokerVIPChannel(isVip, addr)``）。
+     * VIP 通道换算：开关打开时把 broker 端口 - 2。
      * 关闭或端口不可解析时原样返回；**只在发请求前套用一次**（端口会 -2，重复套用会
      * 连减多次 —— 调用方不得对同一地址二次换算）。
      */
@@ -1029,7 +1027,7 @@ class MQClientInstance
     }
 
     /**
-     * Java 侧「只要主」的地址解析：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由
+     * 「只要主」的地址解析：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由
      * → 重查 → 仍查不到抛 "The broker[X] not exist"。
      */
     public function publishAddrFor(string $brokerName, string $topic): string
@@ -1089,7 +1087,7 @@ class MQClientInstance
             $defaultTopic,
             $defaultTopicQueueNums,
         );
-        // Java MQClientAPIImpl.sendMessage —— 发送路径走 VIP 通道换算
+        // 发送路径走 VIP 通道换算
         $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
         return $this->parseSendResponse($response, $msg, $mq);
     }
@@ -1143,10 +1141,10 @@ class MQClientInstance
     }
 
     /**
-     * 异步发出一个已构建好的发送请求（对应 Java MQClientAPIImpl#sendMessageAsync）。
+     * 异步发出一个已构建好的发送请求。
      *
      * ``$onComplete`` 形如 ``function (?SendResult $result, ?\Throwable $error): void``，
-     * 恰好回调一次。响应解析也放在这一层做（Java processSendResponse 在 operationSucceed 里调）。
+     * 恰好回调一次。响应解析也放在这一层做（成功分支里解析，解析异常同样走回调）。
      *
      * @param callable(?SendResult, ?\Throwable): void $onComplete
      */
@@ -1222,7 +1220,7 @@ class MQClientInstance
         // V2 的 brokerName 键是单字母 `n`。
         $header->brokerName = $mq->brokerName !== '' ? $mq->brokerName : null;
 
-        // reply 优先于 batch（对齐 Java MQClientAPIImpl.sendMessage:550-563）。
+        // reply 优先于 batch：同一条消息既带 reply 标志又是批量时按 SEND_REPLY_MESSAGE_V2 发。
         if (MessageUtil::isReplyMessage($msg)) {
             $code = RequestCode::SEND_REPLY_MESSAGE_V2;
         } elseif ($header->batch) {
@@ -1235,7 +1233,7 @@ class MQClientInstance
         return $request;
     }
 
-    /** 对应 Java MQClientAPIImpl.sendMessage：request.setBody(msg.getBody())。 */
+    /** 消息体按原样上送（协议里 body 就是消息 payload，属性走请求头）。 */
     public static function encodeBody(Message $msg): string
     {
         return $msg->getBody() ?? '';
@@ -1281,7 +1279,7 @@ class MQClientInstance
 
     // ---------------- 定时消息撤回 ----------------
 
-    /** RECALL_MESSAGE(370)，对应 Java MQClientAPIImpl#recallMessage。 */
+    /** RECALL_MESSAGE(370)：撤回定时/延迟消息，返回 broker 给出的撤回 msgId。 */
     public function recallMessage(string $addr, RecallMessageRequestHeader $header, int $timeoutMillis): string
     {
         $request = RemotingCommand::createRequestCommand(RequestCode::RECALL_MESSAGE, $header);
@@ -1305,7 +1303,7 @@ class MQClientInstance
     /**
      * 处理 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：把应答交给等待中的 request()。
      *
-     * 与 Java 一样**必须回一个响应**（broker 侧是 invokeSync，不回会超时）。
+     * **必须回一个响应**（broker 侧是 invokeSync，不回会超时）。
      */
     public function processReplyMessage(RemotingCommand $cmd, string $addr): ?RemotingCommand
     {
@@ -1337,7 +1335,7 @@ class MQClientInstance
             $correlationId = $msg->properties[MessageConst::PROPERTY_CORRELATION_ID] ?? null;
             if ($correlationId === null
                 || RequestFutureHolder::getInstance()->putResponse($correlationId, $msg) === null) {
-                // 查不到是正常情况（请求已超时 / 应答重复），Java 此处也是 warn。
+                // 查不到是正常情况（请求已超时 / 应答重复），只记 warn。
                 Logger::warning(sprintf(
                     'receive reply message, but not matched any request, CorrelationId: %s, reply from host: %s',
                     (string) $correlationId,
@@ -1404,7 +1402,7 @@ class MQClientInstance
             }
         }
         if ($slave) {
-            // Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位。
+            // 从节点上位点提交没有意义，清 COMMIT_OFFSET 位。
             $sysFlag = PullSysFlag::clearCommitOffsetFlag($sysFlag);
         }
         $header = new PullMessageRequestHeader();
@@ -1426,7 +1424,7 @@ class MQClientInstance
             ? RequestCode::LITE_PULL_MESSAGE
             : RequestCode::PULL_MESSAGE;
         $request = RemotingCommand::createRequestCommand($code, $header);
-        // Java MQClientAPIImpl.pullMessage —— 拉取路径同样走 VIP 通道换算
+        // 拉取路径同样走 VIP 通道换算
         $response = $this->invokeSync($this->vipAddrFor($addr), $request, $timeoutMillis);
 
         if ($response->code === ResponseCode::SUCCESS) {
@@ -1462,7 +1460,7 @@ class MQClientInstance
     }
 
     /**
-     * 对应 Java MQClientInstance#findBrokerAddressInSubscribe：按 brokerId 选地址。
+     * 按 brokerId 选地址：精确命中该 id；从节点缺失时试相邻 id；都没有且不严格时退到第一台。
      *
      * @param array<int, string> $brokerAddrs
      * @return array{0: ?string, 1: bool} [addr, isSlave]
@@ -1492,10 +1490,10 @@ class MQClientInstance
     // ---------------- POP 模式（5.x 轻量消费） ----------------
 
     /**
-     * QUERY_ASSIGNMENT(400)：向 broker 要本组的队列指配（Java MQClientAPIImpl
-     * #queryAssignment，body 是 QueryAssignmentRequestBody JSON）。
+     * QUERY_ASSIGNMENT(400)：向 broker 要本组的队列指配（body 是
+     * QueryAssignmentRequestBody JSON）。
      *
-     * 返回值语义与 Java 一致：SUCCESS 时返回指配列表（可为空表），**非 SUCCESS 抛
+     * 返回值语义：SUCCESS 时返回指配列表（可为空表），**非 SUCCESS 抛
      * MQBrokerException**。是否把空表当"无效结果"由调用方（RebalanceImpl）判定。
      *
      * @return list<array{mq: MessageQueue, mode: MessageRequestMode}>
@@ -1510,8 +1508,7 @@ class MQClientInstance
         ?string $addr = null,
     ): array {
         if ($addr === null) {
-            // Java RebalanceImpl 走 mQClientFactory.queryAssignment → 找本 topic 任一
-            // master；找不到直接抛 no route。
+            // 找本 topic 任一 master；找不到直接抛 no route。
             $addr = $this->findBrokerAddrByTopic($topic)
                 ?? throw new MQClientException(sprintf('No route info of this topic: %s', $topic));
         }
@@ -1572,7 +1569,7 @@ class MQClientInstance
             $brokerName = $brokers[0]->brokerName;
         }
         if ($addr === null) {
-            // Java PullAPIWrapper#popAsync:369-373：只认主。
+            // POP 只认主。
             $addr = $this->publishAddrFor($brokerName, $topic);
         }
 
@@ -1591,7 +1588,7 @@ class MQClientInstance
         $request = RemotingCommand::createRequestCommand(RequestCode::POP_MESSAGE, $header);
         $response = $this->invokeSync($addr, $request, $timeoutMillis);
 
-        // 响应码映射照 Java MQClientAPIImpl.processPopResponse。
+        // 响应码映射：只有这四类是正常结果，其余一律按 broker 异常抛出。
         if ($response->code === ResponseCode::SUCCESS) {
             $status = PopStatus::FOUND;
         } elseif ($response->code === ResponseCode::POLLING_FULL) {
@@ -1633,7 +1630,7 @@ class MQClientInstance
         );
     }
 
-    /** startOffsetInfo / msgOffsetInfo / sortMap 的查表 key（对应 Java getStartOffsetInfoMapKey 规则）。 */
+    /** startOffsetInfo / msgOffsetInfo / sortMap 的查表 key：重试 topic 按 retry 标记 + queueId 归组。 */
     private static function popQueueMapKey(MessageExt $m): string
     {
         $ck = $m->getProperty(MessageConst::PROPERTY_POP_CK);
@@ -1644,8 +1641,7 @@ class MQClientInstance
     }
 
     /**
-     * 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME。逐条对齐 Java
-     * MQClientAPIImpl.processPopResponse。
+     * 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME。
      *
      * @param list<MessageExt> $found
      */
@@ -1656,7 +1652,7 @@ class MQClientInstance
         $reviveQid = $respHeader->reviveQid ?? 0;
 
         if ($respHeader->startOffsetInfo === null || $respHeader->startOffsetInfo === '') {
-            // Java startOffsetInfo == null 分支：用消息自身 queueOffset 当 ckQueueOffset 拼 7 段，
+            // broker 没给 startOffsetInfo 时：用消息自身 queueOffset 当 ckQueueOffset 拼 7 段，
             // 再手工补一段凑成 8 段。
             $perQueue = [];
             foreach ($found as $m) {
@@ -1725,7 +1721,7 @@ class MQClientInstance
             }
         }
 
-        // Java computeIfAbsent：只在缺失时补。
+        // 只在缺失时补，已有值（重试链上带来的首次弹取时间）不覆盖。
         foreach ($found as $m) {
             if (!array_key_exists(MessageConst::PROPERTY_FIRST_POP_TIME, $m->properties)) {
                 $m->putProperty(MessageConst::PROPERTY_FIRST_POP_TIME, (string) $popTime);
@@ -1848,7 +1844,7 @@ class MQClientInstance
     // ---------------- Offset 查询/更新 ----------------
 
     /**
-     * setZeroIfNotFound 默认 false：Java 的 fetchConsumeOffsetFromBroker 从不设置该字段，
+     * setZeroIfNotFound 默认 false：客户端查位点时从不设置该字段，
      * 新消费组因此回 QUERY_NOT_FOUND（null）而非 0。
      */
     public function queryConsumerOffset(
@@ -1930,7 +1926,7 @@ class MQClientInstance
     }
 
     /**
-     * boundaryType 默认 LOWER（Java 同签名重载直接传 BoundaryType.LOWER）；
+     * boundaryType 默认 LOWER（按时间戳找位点时取下界）；
      * 传 null 就不写 boundaryType 字段。
      */
     public function searchOffsetByTimestamp(
@@ -1957,7 +1953,7 @@ class MQClientInstance
     }
 
     /**
-     * 按 key 查消息（对应 Java MQClientAPIImpl.queryMessage）。
+     * 按 key 查消息（QUERY_MESSAGE，走 broker 索引）。
      *
      * uniqKey=true 时额外下发 extFields["_UNIQUE_KEY_QUERY"]="true"。
      */
@@ -1995,7 +1991,7 @@ class MQClientInstance
     }
 
     /**
-     * 对应 Java MQAdminImpl.queryMessage：查该 topic 所有 broker 并合并去重后的消息。
+     * 查该 topic 所有 broker 并按 key 合并去重后的消息。
      *
      * @return list<MessageExt>
      */
@@ -2080,7 +2076,7 @@ class MQClientInstance
     // ---------------- 队列锁（顺序消费） ----------------
 
     /**
-     * 批量锁队列（对应 Java MQClientAPIImpl.lockBatchMQ，RequestCode.LOCK_BATCH_MQ）。
+     * 批量锁队列（RequestCode.LOCK_BATCH_MQ）。
      *
      * @param list<MessageQueue> $mqs
      * @return list<MessageQueue>
@@ -2093,8 +2089,7 @@ class MQClientInstance
             $byBroker[$mq->brokerName][] = $mq;
         }
         foreach ($byBroker as $brokerName => $brokerMqs) {
-            // Java RebalanceImpl#lock 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)
-            // —— 只认主、不刷路由，拿不到就整台跳过。
+            // 只认主、不刷路由，拿不到就整台跳过。
             $addr = $this->findBrokerAddressInPublish($brokerName);
             if ($addr === null) {
                 continue;
@@ -2131,7 +2126,7 @@ class MQClientInstance
     }
 
     /**
-     * 批量解锁队列（对应 Java MQClientAPIImpl.unlockBatchMQ，RequestCode.UNLOCK_BATCH_MQ）。
+     * 批量解锁队列（RequestCode.UNLOCK_BATCH_MQ）。
      *
      * @param list<MessageQueue> $mqs
      */
@@ -2277,7 +2272,7 @@ class MQClientInstance
         $header->topicFilterType = $topicFilterType;
         $header->topicSysFlag = $topicSysFlag;
         $header->order = $order;
-        // Java: AttributeParser.parseToString(map) —— 空 map 输出 ""，不是 null
+        // 协议里 attributes 没有内容时下发空串 ""，不是缺省该字段。
         $header->attributes = $attributes ?? '';
         $header->force = false;
         $request = RemotingCommand::createRequestCommand(RequestCode::UPDATE_AND_CREATE_TOPIC, $header);
@@ -2406,7 +2401,7 @@ class MQClientInstance
         return $addr;
     }
 
-    /** Java findBrokerAddressInAdmin 口径：主优先、没主退一台从节点。 */
+    /** 主优先、没主退一台从节点。 */
     private function brokerAddr(MessageQueue $mq): string
     {
         $route = $this->getTopicRouteData($mq->topic);
@@ -2422,7 +2417,7 @@ class MQClientInstance
         return $addr;
     }
 
-    /** Java MQAdminImpl 的 offset 查询口径：只打主，主没了就报错。 */
+    /** offset 查询口径：只打主，主没了就报错。 */
     private function publishAddrInAdmin(MessageQueue $mq): string
     {
         $addr = $this->findBrokerAddressInPublish($mq->brokerName);
@@ -2438,8 +2433,7 @@ class MQClientInstance
 
     /**
      * ``publishAddrInAdmin`` 的公开出口：供拉模式消费者的 earliestMsgStoreTime 复用
-     * （Python 端 consumer.py 直接复用了实例的私有 ``_publish_addr_in_admin``，
-     * PHP 私有不可见，纯增量补这个公开壳子，逻辑不走样）。
+     * （纯增量补这个公开壳子，逻辑不走样）。
      */
     public function adminAddrFor(MessageQueue $mq): string
     {
@@ -2458,10 +2452,7 @@ class MQClientInstance
         return null;
     }
 
-    /**
-     * 对应 Java MQClientInstance#findBrokerAddressInPublish:1295-1305：**只**从
-     * brokerAddrTable 取 brokerId=0 的地址，没有返回 null。
-     */
+    /** **只**从 brokerAddrTable 取 brokerId=0 的地址，没有返回 null。 */
     public function findBrokerAddressInPublish(string $brokerName): ?string
     {
         $addrs = $this->brokerAddrTable[$brokerName] ?? null;
@@ -2507,7 +2498,7 @@ class MQClientInstance
     }
 
     /**
-     * 查询消费组内所有 clientId（对应 Java MQClientInstance.findConsumerIdList）。
+     * 查询消费组内所有 clientId（GET_CONSUMER_LIST_BY_GROUP）。
      *
      * @return list<string>|null
      */
@@ -2545,7 +2536,7 @@ class MQClientInstance
         return array_values($body->consumerIdList);
     }
 
-    /** 向所有已知 broker（主 + 从）注销本 clientId（对应 Java MQClientInstance.unregisterClient）。 */
+    /** 向所有已知 broker（主 + 从）注销本 clientId（UNREGISTER_CLIENT 逐台发，失败只记日志）。 */
     public function unregisterClientAllBrokers(
         string $clientId,
         ?string $producerGroup,
@@ -2563,7 +2554,7 @@ class MQClientInstance
 
     // ---------------- 在用 topic 登记 ----------------
 
-    /** 登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。 */
+    /** 登记需要在后台周期刷新路由的 topic（订阅/发布用到的都算）。 */
     public function registerTopicInUse(string $topic): void
     {
         if ($topic !== '') {

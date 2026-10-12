@@ -205,7 +205,7 @@ class TestLifecycle:
         finally:
             c.shutdown()
 
-    def test_heartbeat_declares_consume_actively_like_java(self):
+    def test_heartbeat_declares_consume_actively_per_the_wire_contract(self):
         # Java DefaultLitePullConsumerImpl.consumeType():1111-1112 返回 CONSUME_ACTIVELY
         # —— 轻量拉取消费者同样是「拉模式」，与推送消费者的 PASSIVELY 不是一个口径。
         # broker 按它分流：rejectPullConsumerEnabled 的 broker 跳过 ACTIVELY 心跳并把

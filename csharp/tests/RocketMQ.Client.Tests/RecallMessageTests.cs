@@ -23,22 +23,22 @@ public class RecallMessageTests
     private const string Timestamp = "1700000000000";
 
     /// <summary>Java RecallMessageHandle.buildHandle 的实际输出（带 '=' 填充）。</summary>
-    private const string JavaVector =
+    private const string LegacyVector =
         "djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgMDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=";
 
     // ---------------------------------------------------------------- 句柄编解码
 
     [Fact]
-    public void BuildHandleMatchesJavaVector()
+    public void BuildHandleMatchesLegacyVector()
     {
-        Assert.Equal(JavaVector,
+        Assert.Equal(LegacyVector,
             RecallMessageHandle.BuildHandle(Topic, Broker, Timestamp, UniqKey));
     }
 
     [Fact]
     public void DecodeHandleReadsBackEverySegment()
     {
-        HandleV1 h = RecallMessageHandle.DecodeHandle(JavaVector);
+        HandleV1 h = RecallMessageHandle.DecodeHandle(LegacyVector);
         Assert.Equal(Topic, h.Topic);
         Assert.Equal(Broker, h.BrokerName);
         Assert.Equal(Timestamp, h.TimestampStr);
@@ -50,7 +50,7 @@ public class RecallMessageTests
     {
         // Java 的 getUrlDecoder 只吃带填充的串；本端口四个移植版都放宽成两种通吃，
         // 否则别的客户端写下的无填充句柄就撤不回。
-        string unpadded = JavaVector.TrimEnd('=');
+        string unpadded = LegacyVector.TrimEnd('=');
         Assert.DoesNotContain('=', unpadded);
         HandleV1 h = RecallMessageHandle.DecodeHandle(unpadded);
         Assert.Equal(UniqKey, h.MessageId);
@@ -76,7 +76,7 @@ public class RecallMessageTests
     [InlineData("djEgVG9waWNBIGIgMQ==")]
     // 合法 base64、非法 utf-8
     [InlineData("__4gYmFkIHV0Zjg=")]
-    public void InvalidHandlesFailWithJavaMessage(string handle)
+    public void InvalidHandlesFailWithLegacyMessage(string handle)
     {
         MQClientException e = Assert.Throws<MQClientException>(
             () => RecallMessageHandle.DecodeHandle(handle));
@@ -86,13 +86,13 @@ public class RecallMessageTests
     // ---------------------------------------------------------------- 协议头字段名
 
     [Fact]
-    public void RecallRequestHeaderUsesJavaKeys()
+    public void RecallRequestHeaderUsesLegacyKeys()
     {
         var h = new RecallMessageRequestHeader
         {
             ProducerGroup = "PG_recall",
             Topic = Topic,
-            RecallHandle = JavaVector,
+            RecallHandle = LegacyVector,
             Bname = Broker,
         };
         PropertyMap ext = h.ToExtFields();
@@ -100,7 +100,7 @@ public class RecallMessageTests
         Assert.Equal(4, ext.Count);
         Assert.Equal("PG_recall", ext["producerGroup"]);
         Assert.Equal(Topic, ext["topic"]);
-        Assert.Equal(JavaVector, ext["recallHandle"]);
+        Assert.Equal(LegacyVector, ext["recallHandle"]);
         // 继承字段在 Java 里反射名就是 bname，写成 brokerName 会被 broker 静默丢掉
         Assert.Equal(Broker, ext["bname"]);
         Assert.False(ext.ContainsKey("brokerName"));
@@ -108,7 +108,7 @@ public class RecallMessageTests
         var back = new RecallMessageRequestHeader();
         back.FromExtFields(ext);
         Assert.Equal(Broker, back.Bname);
-        Assert.Equal(JavaVector, back.RecallHandle);
+        Assert.Equal(LegacyVector, back.RecallHandle);
     }
 
     [Fact]
@@ -131,11 +131,11 @@ public class RecallMessageTests
             ["queueId"] = "0",
             ["queueOffset"] = "42",
             ["transactionId"] = "tx-1",
-            ["recallHandle"] = JavaVector,
+            ["recallHandle"] = LegacyVector,
         };
         var h = new SendMessageResponseHeader();
         h.FromExtFields(ext);
-        Assert.Equal(JavaVector, h.RecallHandle);
+        Assert.Equal(LegacyVector, h.RecallHandle);
 
         var plain = new SendMessageResponseHeader();
         plain.FromExtFields(new PropertyMap { ["msgId"] = UniqKey });
@@ -143,7 +143,7 @@ public class RecallMessageTests
     }
 
     [Fact]
-    public void RecallMessageCodeMatchesJava()
+    public void RecallMessageCodeMatchesLegacy()
     {
         Assert.Equal(370, RequestCode.RecallMessage);
     }
@@ -155,7 +155,7 @@ public class RecallMessageTests
     {
         var p = new DefaultMQProducer("PG_recall_unit");
         MQClientException e = Assert.Throws<MQClientException>(
-            () => p.RecallMessage(Topic, JavaVector));
+            () => p.RecallMessage(Topic, LegacyVector));
         Assert.Equal("producer not started, call start() first", e.Message);
     }
 
@@ -169,10 +169,10 @@ public class RecallMessageTests
         try
         {
             Assert.Equal("topic is not supported",
-                RecallMessageThrows(p, "%RETRY%PG_recall_unit", JavaVector));
+                RecallMessageThrows(p, "%RETRY%PG_recall_unit", LegacyVector));
             Assert.Equal("topic is not supported",
-                RecallMessageThrows(p, "%DLQ%PG_recall_unit", JavaVector));
-            Assert.NotNull(RecallMessageThrows(p, "bad topic!", JavaVector));
+                RecallMessageThrows(p, "%DLQ%PG_recall_unit", LegacyVector));
+            Assert.NotNull(RecallMessageThrows(p, "bad topic!", LegacyVector));
 
             var began = Stopwatch.GetTimestamp();
             string corrupt = RecallMessageThrows(p, Topic, "not-a-handle") ?? string.Empty;
@@ -184,7 +184,7 @@ public class RecallMessageTests
             // （DefaultMQProducerImpl:1586），所以这里 surfacing 的是路由错误而不是
             // "The broker service address not found"。
             Assert.Equal("Can not find Message Queue for topic: " + Topic,
-                RecallMessageThrows(p, Topic, JavaVector));
+                RecallMessageThrows(p, Topic, LegacyVector));
         }
         finally
         {

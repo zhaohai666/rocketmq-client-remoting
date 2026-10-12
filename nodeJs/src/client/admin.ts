@@ -1,17 +1,14 @@
 // -*- coding: utf-8 -*-
-// DefaultMQAdminExt — the management client.
-// Ported from org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl (Java 5.x,
-// reference source: zhaohai666-rocketmq), with the Python/Go ports' live-5.5.1
-// verified wire facts folded in. Method names and semantics follow Java.
+// DefaultMQAdminExt — the management client: topic/group/offset/config/cluster
+// administration over the remoting protocol.
 //
-// Java structure: DefaultMQAdminExtImpl delegates to
-// MQClientInstance.getMQClientAPIImpl(); here the same RPCs are issued through
-// MQClient's RemotingClient directly (the TS client has no separate API layer).
+// This port issues the admin RPCs through MQClient's RemotingClient directly —
+// no separate admin API layer.
 //
 // Wire facts that were expensive to establish — do NOT "simplify" them:
 //
-//   - GET_BROKER_CONFIG(26)'s body is java.util.Properties TEXT (`k=v\n`), not
-//     JSON. Parsing it as a KVTable fails on every real broker.
+//   - GET_BROKER_CONFIG(26)'s body is Properties-format TEXT (`k=v\n`) on the
+//     broker side, not JSON. Parsing it as a KVTable fails on every real broker.
 //   - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP(200)'s body is a
 //     SubscriptionGroupConfig JSON object.
 //   - GET_TOPIC_CONFIG(351) sends `topic` + `lo`, and its body is a plain
@@ -24,11 +21,12 @@
 //     the wrong key the nameserver NPEs internally, swallows it, and answers
 //     SUCCESS with an empty list.
 //   - The KV-config PUT/DELETE requests go to the NAMESERVER and must be
-//     BROADCAST to every nameserver (Java putKVConfigValue / deleteKVConfigValue).
-//   - ResetOffsetBody.offsetTable is Map<MessageQueue, Long> (fastjson2 inline
-//     object keys — decoded via decodeMessageQueueMap).
+//     BROADCAST to every nameserver — one nameserver alone would not replicate.
+//   - ResetOffsetBody.offsetTable is keyed by MessageQueue; the broker's fastjson
+//     codec inlines the queue object as the map key, so decoding uses
+//     decodeMessageQueueMap.
 //   - UPDATE_AND_CREATE_TOPIC(17) MUST carry `topicFilterType`: the broker's
-//     CreateTopicRequestHeader.checkFields() rejects a null with
+//     create-topic header validation rejects a null with
 //     `topicFilterType = [null] value invalid`.
 import { RemotingCommand } from '../remoting/remotingCommand.ts';
 import { RequestCode, ResponseCode } from '../remoting/codes.ts';
@@ -55,22 +53,21 @@ import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 
 const logger = getLogger('admin');
 
-// Java DefaultMQAdminExtImpl field: `private long timeoutMillis = 20000;`
+// Default admin RPC timeout: 20000 ms.
 export const DefaultAdminTimeoutMillis = 20000;
-// Java DefaultMQAdminExt: `private String adminExtGroup = "admin_ext_group";`
+// Default admin consumer group: `admin_ext_group`.
 export const DefaultAdminExtGroup = 'admin_ext_group';
-// Java NamesrvUtil.NAMESPACE_ORDER_TOPIC_CONFIG (kvNamespaceToDeleteList).
+// KV namespace holding ordered-topic config — the one cleaned on shutdown.
 export const NAMESPACE_ORDER_TOPIC_CONFIG = 'ORDER_TOPIC_CONFIG';
-// Java KeyBuilder.POP_RETRY_SEPARATOR_V1
+// POP retry topic separator on the wire: `_`.
 const POP_RETRY_SEPARATOR_V1 = '_';
 
-// ---------------- java.util.Properties codec ----------------
-// Port of Java MixAll.string2Properties / propertiesToString (semantics of
-// java.util.Properties.load): blank lines and `#`/`!` comments are skipped, an
-// UNESCAPED trailing `\` continues onto the next line, the key ends at the
-// first `=`, `:` or whitespace, and the value's trailing whitespace is
-// preserved. Broker config exports never contain `\t`/`\n`/`\uXXXX` escapes,
-// so (like the Python/Go ports) they are deliberately not expanded.
+// ---------------- Properties-text codec ----------------
+// Parses/serialises the broker-side Properties TEXT format: blank lines and
+// `#`/`!` comments are skipped, an UNESCAPED trailing `\` continues onto the
+// next line, the key ends at the first `=`, `:` or whitespace, and the value's
+// trailing whitespace is preserved. Broker config exports never contain
+// `\t`/`\n`/`\uXXXX` escapes, so this codec deliberately does not expand them.
 function splitLines(text: string): string[] {
   return text.split(/\r\n|\n|\r/);
 }
@@ -131,10 +128,10 @@ function sameDataVersion(a: Record<string, any> | null, b: Record<string, any> |
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-// Renders ext values the way Java RemotingCommand.makeCustomHeaderToNet does:
-// String.valueOf for numbers, "true"/"false" for booleans. Keys written here
-// MUST be the Java FIELD names — the broker reads them back by reflection
-// (the `cluster`-not-`clusterName` trap lives exactly here).
+// Renders ext values the way the remoting header-to-wire encoding does:
+// plain string for numbers, "true"/"false" for booleans. Keys written here
+// MUST be the exact protocol field names — the broker reads them back by
+// reflection (the `cluster`-not-`clusterName` trap lives exactly here).
 function extValue(v: any): string {
   if (v == null) return '';
   if (typeof v === 'boolean') return v ? 'true' : 'false';
@@ -163,20 +160,18 @@ export class DefaultMQAdminExt {
   instanceName: string = 'ADMIN';
   unitName: string | null = null;
   enableStreamRequestType = false;
-  // Java ClientConfig#namespaceV2 — the SERVER-side namespace (Aliyun-style
-  // serverless instance id). When non-empty, NamespaceRpcHook (registered
-  // FIRST on the remoting client, MQClientAPIImpl:329) stamps every admin rpc
-  // with nsd=true / ns=<value>.
+  // Server-side namespaceV2 (Aliyun-style serverless instance id). When
+  // non-empty, NamespaceRpcHook (registered FIRST on the remoting client, so
+  // the ACL signature covers it) stamps every admin rpc with nsd=true /
+  // ns=<value>.
   namespaceV2: string | null = null;
-  // Java ClientConfig#vipChannelEnabled — false by default in 5.x. When true,
-  // broker requests go to the VIP port (port - 2); NEVER applied to the
-  // nameserver.
+  // VIP channel flag — false by default. When true, broker requests go to the
+  // VIP port (port - 2); NEVER applied to the nameserver.
   vipChannelEnabled = false;
   pollNameServerIntervalMillis = 30000;
   rpcHook: any;
   timeoutMillis: number;
-  // Java: kvNamespaceToDeleteList = [NAMESPACE_ORDER_TOPIC_CONFIG]; cleaned up
-  // when a topic is deleted.
+  // KV namespaces cleaned up when a topic is deleted: ORDER_TOPIC_CONFIG.
   kvNamespaceToDeleteList: string[] = [NAMESPACE_ORDER_TOPIC_CONFIG];
 
   client: MQClient | null;
@@ -196,7 +191,7 @@ export class DefaultMQAdminExt {
   setInstanceName(name: string): void { this.instanceName = name; }
   setUnitName(unitName: string): void { this.unitName = unitName; }
   setVipChannelEnabled(enable: boolean): void { this.vipChannelEnabled = enable; }
-  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  // Server-side namespace accessor, read live per request by NamespaceRpcHook.
   setNamespaceV2(namespaceV2: string | null): void { this.namespaceV2 = namespaceV2; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setTimeoutMillis(timeoutMillis: number): void { this.timeoutMillis = timeoutMillis; }
@@ -204,9 +199,9 @@ export class DefaultMQAdminExt {
     return this.client != null ? this.client.getNameServerAddressList() : [];
   }
 
-  // Java DefaultMQAdminExt#changeInstanceNameToPID: only the "ADMIN" default
-  // becomes pid-unique (instanceName = "ADMIN#<pid>").
-  private _changeInstanceNameToPID(): void {
+  // Only the "ADMIN" default instance name becomes pid-unique
+  // (instanceName = "ADMIN#<pid>"); a custom name is left alone.
+  private _makeAdminInstancePidUnique(): void {
     if (this.instanceName === 'ADMIN') {
       this.instanceName = `ADMIN#${process.pid}`;
     }
@@ -217,13 +212,13 @@ export class DefaultMQAdminExt {
     if (!this.namesrvAddr) {
       throw new MQClientException('name server address is not set, call setNamesrvAddr() first');
     }
-    // Java start():161 unconditionally calls changeInstanceNameToPID, after
-    // which the clientId goes through ClientConfig#buildMQClientId.
-    this._changeInstanceNameToPID();
+    // Unconditionally make the instance name pid-unique, then build the
+    // clientId as `<ip>@<instanceName>[@<unitName>][@STREAM]`.
+    this._makeAdminInstancePidUnique();
     const clientId = MixAll.clientIdFor(this.instanceName, this.unitName, this.enableStreamRequestType);
     const remotingClient = this.client != null ? this.client.remotingClient : null;
     this.client = new MQClient(clientId, this.namesrvAddr, remotingClient);
-    // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream
+    // RPC-hook registration order: Namespace -> Stream
     // (only when enableStreamRequestType) -> user (ACL) hook. The namespace
     // extFields must be present BEFORE the ACL hook signs the request.
     registerRpcHooks(this.client.remotingClient, {
@@ -284,8 +279,9 @@ export class DefaultMQAdminExt {
     return response;
   }
 
-  // Broadcasts to EVERY nameserver (Java putKVConfigValue / deleteKVConfigValue)
-  // and raises if any of them failed.
+  // Broadcasts to EVERY nameserver for KV-config PUT/DELETE and raises if any
+  // of them failed — a partial broadcast would leave one nameserver serving
+  // stale config.
   private async _invokeNameServerAll(code: number, ext: Record<string, string> | null,
     timeoutMillis?: number): Promise<void> {
     const client = this._requireClient();
@@ -301,8 +297,8 @@ export class DefaultMQAdminExt {
     }
   }
 
-  // Sends to the FIRST nameserver that answers (Java invokeSync(null, ...)
-  // semantics); the response is returned unchecked so callers can branch.
+  // Sends to the FIRST nameserver that answers; the response is returned
+  // unchecked so callers can branch.
   private async _invokeNameServerOne(code: number, ext: Record<string, string> | null,
     timeoutMillis?: number): Promise<RemotingCommand> {
     const client = this._requireClient();
@@ -318,7 +314,7 @@ export class DefaultMQAdminExt {
     throw new MQClientException(`all name servers unreachable: ${lastErr != null ? lastErr.message : ''}`);
   }
 
-  // Java examineTopicRouteInfo → MQClientAPIImpl.getTopicRouteInfoFromNameServer.
+  // Fetch a topic's route from the nameserver.
   // NOTE: NO default-topic fallback here — the admin must surface TOPIC_NOT_EXIST
   // (the client's updateTopicRouteInfoFromNameServer falls back to TBW102, which
   // would silently mask a missing topic).
@@ -335,15 +331,15 @@ export class DefaultMQAdminExt {
       throw e;
     }
     const routeData = TopicRouteData.decode(response.body as Buffer);
-    // Cache into the client's route/broker-addr tables (Java
-    // MQClientInstance.updateTopicRouteInfoFromNameServer does the same).
+    // Cache into the client's route/broker-addr tables so subsequent
+    // publish/subscribe paths see the fresh route.
     client.topicRouteData2TopicPublishInfo(topic, routeData);
     return routeData;
   }
 
   // ---------------- Topic management ----------------
 
-  // Java MQAdminImpl.createTopic: push the topic to every MASTER in the
+  // createTopic pushes the topic to every MASTER in the
   // createTopicKey (TBW102) route with READ|WRITE perm. Succeeding on at least
   // one broker is enough.
   async createTopic(key: string, newTopic: string, queueNum: number, topicSysFlag = 0,
@@ -379,11 +375,11 @@ export class DefaultMQAdminExt {
 
   // UPDATE_AND_CREATE_TOPIC(17) to one broker. `topicFilterType` MUST be sent
   // (broker rejects null); only transport errors are retried — a broker
-  // rejection is final (Java rethrows MQBrokerException out of the retry loop).
+  // rejection is final (MQBrokerException from the retry loop is not retried).
   private async _createTopicInBroker(brokerAddr: string, defaultTopic: string, topic: string,
     readQueueNums: number, writeQueueNums: number, perm: number, topicSysFlag: number,
     topicFilterType: string, order: boolean, attributes: string): Promise<void> {
-    const retryTimes = 5; // MQAdminImpl.createTopic's per-broker retry count
+    const retryTimes = 5; // per-broker retry count for createTopic
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt < retryTimes; attempt++) {
       try {
@@ -396,8 +392,7 @@ export class DefaultMQAdminExt {
           topicFilterType,
           topicSysFlag,
           order,
-          // Java AttributeParser.parseToString(map) — an empty map renders as
-          // "", not null.
+          // Attribute-map serialization: an empty map renders as "", not null.
           attributes,
           force: false,
         }));
@@ -410,8 +405,7 @@ export class DefaultMQAdminExt {
     if (lastErr != null) throw lastErr;
   }
 
-  // Java createAndUpdateTopicConfig → MQClientAPIImpl.createTopic(addr,
-  // createTopicKey, config, timeout).
+  // createAndUpdateTopicConfig sends UPDATE_AND_CREATE_TOPIC(17) to one addr.
   async createAndUpdateTopicConfig(addr: string, config: TopicConfig): Promise<void> {
     await this._createTopicInBroker(addr, this.createTopicKey, config.topicName,
       config.readQueueNums, config.writeQueueNums, config.perm,
@@ -426,8 +420,7 @@ export class DefaultMQAdminExt {
     }
   }
 
-  // DELETE_TOPIC_IN_NAMESRV(216) for each addr; addrs == null → all nameservers
-  // (Java fetchNameServerAddr).
+  // DELETE_TOPIC_IN_NAMESRV(216) for each addr; addrs == null → all nameservers.
   async deleteTopicInNameServer(addrs: string[] | null, topic: string): Promise<void> {
     const client = this._requireClient();
     const targets = addrs != null ? addrs : client.getNameServerAddressList();
@@ -436,9 +429,8 @@ export class DefaultMQAdminExt {
     }
   }
 
-  // Java deleteTopic: delete from ALL brokers (master AND slave, per
-  // CommandUtil.fetchMasterAndSlaveAddrByClusterName), then the nameserver
-  // route, then the KV namespaces (ORDER_TOPIC_CONFIG).
+  // deleteTopic removes from ALL brokers (master AND slave) of the cluster,
+  // then the nameserver route, then the KV namespaces (ORDER_TOPIC_CONFIG).
   async deleteTopic(topic: string, clusterName: string): Promise<void> {
     const client = this._requireClient();
     const clusterInfo = await this.examineBrokerClusterInfo();
@@ -446,7 +438,7 @@ export class DefaultMQAdminExt {
     if (names == null || names.length === 0) {
       throw new MQClientException(`The cluster [${clusterName}] not exist`);
     }
-    // master AND slave addrs (Java fetchMasterAndSlaveAddrByClusterName)
+    // Collect master AND slave addrs of the cluster.
     const addrs: string[] = [];
     for (const brokerName of names) {
       const inner = clusterInfo.brokerAddrTable[brokerName];
@@ -460,7 +452,7 @@ export class DefaultMQAdminExt {
     void client;
   }
 
-  // Java fetchAllTopicList → getTopicListFromNameServer(timeoutMillis).
+  // Fetch every topic from the nameserver: GET_ALL_TOPIC_LIST_FROM_NAMESERVER.
   async fetchAllTopicList(timeoutMillis?: number): Promise<TopicList> {
     const response = await this._invokeNameServerOne(RequestCode.GET_ALL_TOPIC_LIST_FROM_NAMESERVER, null,
       timeoutMillis);
@@ -471,7 +463,7 @@ export class DefaultMQAdminExt {
     return TopicList.decode(response.body as Buffer);
   }
 
-  // GET_TOPICS_BY_CLUSTER(224). The ext key MUST be Java's `cluster`; with
+  // GET_TOPICS_BY_CLUSTER(224). The ext key MUST be `cluster`; with
   // `clusterName` the nameserver NPEs internally, swallows it, and answers
   // SUCCESS with an empty list.
   async fetchTopicsByCluster(clusterName: string, timeoutMillis?: number): Promise<Set<string>> {
@@ -487,9 +479,9 @@ export class DefaultMQAdminExt {
     return topics;
   }
 
-  // Java examineTopicStats(topic): merge GET_TOPIC_STATS_INFO(202) across the
-  // topic's brokers. Java's sync version does NOT sum topicPutTps (only the
-  // *Concurrent variant does) — kept faithful.
+  // examineTopicStats(topic) merges GET_TOPIC_STATS_INFO(202) across the
+  // topic's brokers. The synchronous path does NOT sum topicPutTps (only the
+  // *Concurrent variant does).
   async examineTopicStats(topic: string): Promise<TopicStatsTable> {
     const route = await this.examineTopicRouteInfo(topic);
     const merged = new TopicStatsTable();
@@ -531,8 +523,9 @@ export class DefaultMQAdminExt {
     return KVTable.decode(response.body as Buffer);
   }
 
-  // GET_BROKER_CONFIG(26). The body is java.util.Properties TEXT, NOT JSON —
-  // a client that parses it as a KVTable fails on every real broker.
+  // GET_BROKER_CONFIG(26). The body is Properties-format TEXT on the broker
+  // side, NOT JSON — a client that parses it as a KVTable fails on every real
+  // broker.
   async getBrokerConfig(brokerAddr: string, timeoutMillis?: number): Promise<Record<string, string>> {
     const response = await this._invokeBroker(brokerAddr, RequestCode.GET_BROKER_CONFIG, null,
       null, timeoutMillis);
@@ -570,7 +563,7 @@ export class DefaultMQAdminExt {
     return true;
   }
 
-  // Java cleanUnusedTopic(cluster): every broker of the cluster; the last
+  // CLEAN_UNUSED_TOPIC(316) across every broker of the cluster; the last
   // result wins.
   async cleanUnusedTopic(cluster: string): Promise<boolean> {
     const clusterInfo = await this.examineBrokerClusterInfo();
@@ -605,8 +598,8 @@ export class DefaultMQAdminExt {
     return RemotingSerializable.decode(response.body as Buffer) as Record<string, any>;
   }
 
-  // Java getClusterList(topic): the clusters whose brokers appear in the
-  // topic's route.
+  // getClusterList(topic): the clusters whose brokers appear in the topic's
+  // route.
   async getClusterList(topic: string): Promise<Set<string>> {
     const clusterInfo = await this.examineBrokerClusterInfo();
     const route = await this.examineTopicRouteInfo(topic);
@@ -618,8 +611,8 @@ export class DefaultMQAdminExt {
     return clusters;
   }
 
-  // Java getTopicClusterList(topic): uses the FIRST BrokerData's brokerName
-  // only (faithful to the Java quirk).
+  // getTopicClusterList(topic): uses the FIRST BrokerData's brokerName only —
+  // the nameserver's cluster-per-topic convention keeps that shape.
   async getTopicClusterList(topic: string): Promise<Set<string>> {
     const clusterInfo = await this.examineBrokerClusterInfo();
     const route = await this.examineTopicRouteInfo(topic);
@@ -648,9 +641,9 @@ export class DefaultMQAdminExt {
     return TopicList.decode(response.body as Buffer);
   }
 
-  // Java getUserTopicConfig: drops system topics and (unless specialTopic) the
-  // %RETRY% / %DLQ% topics, and topics with an invalid perm (Java
-  // PermName.isValid: perm >= 0 && perm < PERM_PRIORITY=8).
+  // getUserTopicConfig drops system topics and (unless specialTopic) the
+  // %RETRY% / %DLQ% topics, and topics with an invalid perm (perm >= 0 &&
+  // perm < PERM_PRIORITY=8).
   async getUserTopicConfig(brokerAddr: string, specialTopic: boolean,
     timeoutMillis?: number): Promise<TopicConfigSerializeWrapper> {
     const wrapper = await this.getAllTopicConfig(brokerAddr, timeoutMillis);
@@ -680,7 +673,8 @@ export class DefaultMQAdminExt {
 
   // ---------------- Nameserver KV config ----------------
 
-  // PUT_KV_CONFIG(100), BROADCAST to every nameserver (Java putKVConfigValue).
+  // PUT_KV_CONFIG(100), BROADCAST to every nameserver so none serves stale
+  // config.
   async createAndUpdateKvConfig(namespace: string, key: string, value: string): Promise<void> {
     await this._invokeNameServerAll(RequestCode.PUT_KV_CONFIG,
       adminExt({ namespace, key, value }));
@@ -777,7 +771,7 @@ export class DefaultMQAdminExt {
     };
   }
 
-  // Drops system (CID_RMQ_SYS_) and predefined groups (Java MixAll filters).
+  // Drops system (CID_RMQ_SYS_) and predefined groups.
   async getUserSubscriptionGroup(brokerAddr: string, timeoutMillis?: number): Promise<Record<string, any>> {
     const wrapper = await this.getAllSubscriptionGroup(brokerAddr, timeoutMillis);
     const kept: Record<string, any> = {};
@@ -789,9 +783,8 @@ export class DefaultMQAdminExt {
     return wrapper;
   }
 
-  // Java examineSubscriptionGroupConfig: read the group out of the full
-  // wrapper (NOT the GET_SUBSCRIPTIONGROUP_CONFIG(352) call — that one is
-  // broker-version dependent).
+  // Read one group out of the full subscription-group wrapper (NOT
+  // GET_SUBSCRIPTIONGROUP_CONFIG(352) — that call is broker-version dependent).
   async examineSubscriptionGroupConfig(addr: string, group: string): Promise<Record<string, any> | null> {
     const wrapper = await this.getAllSubscriptionGroup(addr);
     return wrapper.subscriptionGroupTable[group] != null ? wrapper.subscriptionGroupTable[group] : null;
@@ -806,8 +799,7 @@ export class DefaultMQAdminExt {
   // ---------------- Consumer / producer connections ----------------
 
   // GET_CONSUMER_CONNECTION_LIST(203). brokerAddr == null → a RANDOM broker of
-  // the %RETRY%<group> route (Java: brokers.get(random.nextInt(size))).
-  // Empty connectionSet → CONSUMER_NOT_ONLINE.
+  // the %RETRY%<group> route. Empty connectionSet → CONSUMER_NOT_ONLINE.
   async examineConsumerConnectionInfo(consumerGroup: string, brokerAddr: string | null = null): Promise<ConsumerConnection> {
     let addr = brokerAddr;
     if (addr == null) {
@@ -857,7 +849,7 @@ export class DefaultMQAdminExt {
   }
 
   // GET_CONSUMER_RUNNING_INFO(307) — walks the %RETRY%<group> route IN ORDER
-  // and asks the first broker with a master addr (Java getConsumerRunningInfo).
+  // and asks the first broker with a master addr.
   async getConsumerRunningInfo(consumerGroup: string, clientId: string,
     jstack = false, metrics = false): Promise<any | null> {
     void metrics;
@@ -875,8 +867,8 @@ export class DefaultMQAdminExt {
     return null;
   }
 
-  // GET_CONSUMER_LIST_BY_GROUP(38) — brokerAddr is required (Java's
-  // MQAdminExt#examineConsumerListByGroup shape; pick one via the route).
+  // GET_CONSUMER_LIST_BY_GROUP(38) — brokerAddr is required (pick one via the
+  // %RETRY%<group> route).
   async getConsumerListByGroup(consumerGroup: string, brokerAddr: string): Promise<string[]> {
     const response = await this._invokeBroker(brokerAddr, RequestCode.GET_CONSUMER_LIST_BY_GROUP,
       adminExt({ consumerGroup }));
@@ -886,8 +878,8 @@ export class DefaultMQAdminExt {
 
   // ---------------- Consume stats ----------------
 
-  // GET_CONSUME_STATS(208) against ONE broker (Java examineConsumeStats
-  // overload with brokerAddr). timeout is *3 in Java's composite path.
+  // GET_CONSUME_STATS(208) against ONE broker. The composite path multiplies
+  // the timeout by 3 so a fan-out stays within one round-trip budget.
   async examineConsumeStatsByBroker(brokerAddr: string, consumerGroup: string,
     topic: string | null = null, timeoutMillis?: number): Promise<ConsumeStats> {
     const ext: Record<string, string> = { consumerGroup };
@@ -897,7 +889,7 @@ export class DefaultMQAdminExt {
     return ConsumeStats.decode(response.body as Buffer);
   }
 
-  // Java examineConsumeStats(group[, topic]): route candidates are the
+  // examineConsumeStats(group[, topic]): route candidates are the
   // %RETRY%<group> topic, then the topic itself, then the POP retry topic —
   // the first route that resolves wins. Fan out over all brokers, merge the
   // offset tables and sum the tps. An empty table raises CONSUMER_NOT_ONLINE
@@ -906,7 +898,7 @@ export class DefaultMQAdminExt {
     const routeTopics: string[] = [MixAll.getRetryTopic(consumerGroup)];
     if (topic != null) {
       routeTopics.push(topic);
-      // Java KeyBuilder.buildPopRetryTopic: %RETRY%<group>_<topic>
+      // POP retry topic name: %RETRY%<group>_<topic>
       routeTopics.push(`${MixAll.RETRY_GROUP_TOPIC_PREFIX}${consumerGroup}${POP_RETRY_SEPARATOR_V1}${topic}`);
     }
 
@@ -972,7 +964,7 @@ export class DefaultMQAdminExt {
   }
 
   // QUERY_TOPICS_BY_CONSUMER(343) — fan out over the %RETRY%<group> route and
-  // merge (Java's TopicList.topicList is a Set, hence de-duplication).
+  // merge; the response's topicList is a Set, hence de-duplication.
   async queryTopicsByConsumer(group: string): Promise<TopicList> {
     const retryTopic = MixAll.getRetryTopic(group);
     const route = await this.examineTopicRouteInfo(retryTopic);
@@ -1039,18 +1031,16 @@ export class DefaultMQAdminExt {
 
   // ---------------- Offset reset ----------------
 
-  // INVOKE_BROKER_TO_RESET_OFFSET(222) → ResetOffsetBody (Map<MessageQueue,
-  // Long> with fastjson2 inline object keys). isC selects the C-compatible
-  // response shape (Java's isC flag).
+  // INVOKE_BROKER_TO_RESET_OFFSET(222) → ResetOffsetBody (a MessageQueue-keyed
+  // map whose keys the broker's fastjson codec inlines). `isC` selects the
+  // C-compatible response shape via the `isC` ext field.
   async invokeBrokerToResetOffset(brokerAddr: string, topic: string, group: string,
     timestamp: number, isForce: boolean, isC = false): Promise<Map<MessageQueue, number> | null> {
     const ext = adminExt({ topic, consumerGroup: group, timestamp, isForce });
     let code: number = RequestCode.INVOKE_BROKER_TO_RESET_OFFSET;
     if (isC) {
-      // Java uses the same request code; the C shape is requested via the
-      // `isC` ext field on INVOKE_BROKER_TO_RESET_OFFSET... actually Java's
-      // MQClientAPIImpl.invokeBrokerToResetOffset(isC) reuses code 222 and
-      // decodes ResetOffsetBodyForC. The request itself is identical.
+      // Same request code for both shapes; the `isC` flag tells the broker to
+      // serialise the body in the C-compatible form.
       code = RequestCode.INVOKE_BROKER_TO_RESET_OFFSET;
       void isC;
     }
@@ -1060,10 +1050,10 @@ export class DefaultMQAdminExt {
     return body.offsetTable;
   }
 
-  // Java resetOffsetByTimestamp: fan out over the topic route and merge.
+  // resetOffsetByTimestamp fans out over the topic route and merges.
   async resetOffsetByTimestamp(topic: string, group: string, timestamp: number,
     isForce = true, clusterName: string | null = null): Promise<Map<MessageQueue, number>> {
-    void clusterName; // Java only reroutes via clusterName for LMQ topics
+    void clusterName; // clusterName is only consulted for LMQ topics; unused here
     const route = await this.examineTopicRouteInfo(topic);
     const allOffsetTable = new Map<MessageQueue, number>();
     for (const bd of route.brokerDatas) {
@@ -1077,7 +1067,7 @@ export class DefaultMQAdminExt {
     return allOffsetTable;
   }
 
-  // Java resetOffsetNew: prefer the broker-side reset; when the consumer is
+  // resetOffsetNew prefers the broker-side reset; when the consumer is
   // offline fall back to the old per-queue UPDATE_CONSUMER_OFFSET path.
   async resetOffsetNew(consumerGroup: string, topic: string, timestamp: number): Promise<void> {
     try {
@@ -1091,7 +1081,7 @@ export class DefaultMQAdminExt {
     }
   }
 
-  // Java resetOffsetByTimestampOld: per queue — when the group consumed the
+  // resetOffsetByTimestampOld: per queue — when the group consumed the
   // topic, reset each queue it touched; otherwise reset EVERY read queue.
   async resetOffsetByTimestampOld(consumerGroup: string, topic: string, timestamp: number,
     force: boolean): Promise<RollbackStats[]> {
@@ -1155,7 +1145,7 @@ export class DefaultMQAdminExt {
     return stats;
   }
 
-  // Java resetOffsetByQueueId: direct UPDATE_CONSUMER_OFFSET, then a
+  // resetOffsetByQueueId: direct UPDATE_CONSUMER_OFFSET, then a
   // broker-side reset of that single queue.
   async resetOffsetByQueueId(brokerAddr: string, consumeGroup: string, topicName: string,
     queueId: number, resetOffset: number): Promise<void> {
@@ -1195,13 +1185,14 @@ export class DefaultMQAdminExt {
       mq.getQueueId());
   }
 
-  // Java updateConsumeOffset(brokerAddr, group, mq, offset).
+  // updateConsumeOffset writes the committed offset for one queue at one
+  // broker via UPDATE_CONSUMER_OFFSET(15).
   async updateConsumeOffset(brokerAddr: string, consumeGroup: string, mq: MessageQueue,
     offset: number): Promise<void> {
     await this._requireClient().updateConsumerOffset(brokerAddr, consumeGroup, mq, offset);
   }
 
-  // Java examineConsumerOffset → QUERY_CONSUMER_OFFSET(14). Returns the
+  // examineConsumerOffset issues QUERY_CONSUMER_OFFSET(14). Returns the
   // committed offset; `hasOffset` is false when the broker answers
   // QUERY_NOT_FOUND (no offset recorded yet).
   async examineConsumerOffset(consumerGroup: string, mq: MessageQueue): Promise<{ offset: number; hasOffset: boolean }> {
@@ -1210,9 +1201,9 @@ export class DefaultMQAdminExt {
     return { offset: r.offset, hasOffset: r.found };
   }
 
-  // Java searchOffsetByTimestamp(addr, topic, queueId, timestamp, boundaryType)
-  // → SEARCH_OFFSET_BY_TIMESTAMP(29) with the `boundaryType` ext field. The
-  // lower/upper helpers mirror Java DefaultMQAdminExt's convenience methods.
+  // searchBoundaryOffset issues SEARCH_OFFSET_BY_TIMESTAMP(29) with the
+  // `boundaryType` ext field. The lower/upper wrappers pick
+  // BoundaryType.LOWER / UPPER.
   async searchBoundaryOffset(mq: MessageQueue, timestamp: number,
     boundaryType: string = BoundaryType.LOWER): Promise<number> {
     const brokerAddr = this._masterAddrForMq(mq);
@@ -1241,22 +1232,21 @@ export class DefaultMQAdminExt {
 
   // ---------------- Message query (QUERY_MESSAGE / VIEW_MESSAGE_BY_ID) ----------------
 
-  // Java queryMessage → QUERY_MESSAGE(12) against one broker's index.
+  // queryMessage issues QUERY_MESSAGE(12) against one broker's index.
   //
   // ⚠ WIRE: the response body is NOT JSON — the broker streams the matched
-  // messages as CONCATENATED 17-segment stored records (Java decodes with
-  // MessageDecoder.decodes). Parsing it as RemotingSerializable JSON was the
-  // bug behind "query by key always fails". indexType: K (default) / U (uniq
-  // key); 'U' additionally sets MixAll.UNIQUE_MSG_QUERY_FLAG like Java's
-  // unique-key queries.
+  // messages as CONCATENATED 17-segment stored records. Parsing it as
+  // RemotingSerializable JSON was the bug behind "query by key always fails".
+  // indexType: K (default) / U (uniq key); 'U' additionally sets
+  // MixAll.UNIQUE_MSG_QUERY_FLAG so the broker takes the unique-key path.
   async queryMessage(brokerAddr: string, topic: string, key: string,
     maxNum: number = 32, beginTimestamp = 0, endTimestamp = 0,
     indexType: string = 'K'): Promise<QueryResult> {
-    // Java passes begin=0 → Long.MAX as "unbounded" (DefaultMQAdminExtImpl /
-    // IndexFile.isTimeMatched). The broker matches index FILES against the
-    // [begin, end] time window — end=0 matches NOTHING (every real index file
-    // has a start timestamp > 0), which made every query answer
-    // QUERY_NOT_FOUND. Normalise: begin<0/0 → unbounded past, end<=0 → now.
+    // The time window is unbounded when begin/end are unset: the broker
+    // matches index FILES against [begin, end], so end=0 matches NOTHING
+    // (every real index file has a start timestamp > 0) and every query would
+    // answer QUERY_NOT_FOUND. Normalise: begin<0/0 → unbounded past,
+    // end<=0 → now.
     const begin = beginTimestamp > 0 ? beginTimestamp : 0;
     // Long.MAX_VALUE as a STRING — as a JS Number it rounds up to 2^63 and
     // the broker's Long.parseLong rejects it, leaving the header field null
@@ -1271,13 +1261,13 @@ export class DefaultMQAdminExt {
       indexType,
     };
     if (indexType === MessageConst.INDEX_UNIQUE_TYPE) {
-      // Java MixAll.UNIQUE_MSG_QUERY_FLAG — forces the U-index path and the
+      // MixAll.UNIQUE_MSG_QUERY_FLAG — forces the U-index path and the
       // broker's defaultQueryMaxNum on the server side.
       ext['_UNIQUE_KEY_QUERY'] = 'true';
     }
     const response = await this._invokeBroker(brokerAddr, RequestCode.QUERY_MESSAGE, ext);
     const result = new QueryResult();
-    // Java QueryMessageResponseHeader rides the extFields.
+    // The response's QueryMessageResponseHeader fields ride the extFields.
     const extResp = response.extFields || {};
     if (extResp['indexLastUpdateTimestamp'] != null) {
       result.indexLastUpdateTimestamp = parseInt(extResp['indexLastUpdateTimestamp'], 10);
@@ -1292,20 +1282,20 @@ export class DefaultMQAdminExt {
     return this.queryMessage(brokerAddr, topic, key, maxNum);
   }
 
-  // Java queryMessage(topic, uniqKey): the U-index query. The stored records
+  // queryMessageByUniqKey: the U-index query. The stored records
   // are already in the response body, so no per-hit viewMessage round trip is
-  // needed; Java keeps only the first hit for this shape.
+  // needed; only the first hit is returned for this shape.
   async queryMessageByUniqKey(brokerAddr: string, topic: string, uniqKey: string,
     maxNum = 32): Promise<MessageExt | null> {
     const result = await this.queryMessage(brokerAddr, topic, uniqKey, maxNum, 0, 0, 'U');
     return result.messageList.length > 0 ? result.messageList[0] : null;
   }
 
-  // Java MQAdminImpl.queryMessage resolves the topic route and queries EVERY
+  // queryMessageFromRoute resolves the topic route and queries EVERY
   // broker (selectBrokerAddr of each BrokerData: master preferred, else the
   // lowest id — a slave-only topology must still be queryable), merging the
-  // hits. QUERY_NOT_FOUND from one broker is not an error (Java logs and
-  // continues).
+  // hits. QUERY_NOT_FOUND from one broker is not an error (log and
+  // continue).
   async queryMessageFromRoute(topic: string, key: string,
     maxNum: number = 32, beginTimestamp = 0, endTimestamp = 0,
     indexType: string = 'K'): Promise<QueryResult> {
@@ -1334,7 +1324,7 @@ export class DefaultMQAdminExt {
     return merged;
   }
 
-  // Java viewMessage → VIEW_MESSAGE_BY_ID(33) sent STRAIGHT to the broker
+  // viewMessage sends VIEW_MESSAGE_BY_ID(33) STRAIGHT to the broker
   // address encoded inside the offset msgId (no route lookup). The body is one
   // 17-segment stored message.
   async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
@@ -1358,10 +1348,10 @@ export class DefaultMQAdminExt {
     return decodeMessage(response.body, true, true);
   }
 
-  // Java DefaultMQAdminExt.consumeMessageDirectly → CONSUME_MESSAGE_DIRECTLY(309)
-  // sent to the broker that STORES the message; the broker relays it to the
-  // named client and answers with the client's verdict body. Java resolves the
-  // store host through viewMessage and substitutes the OFFSET msgId when the
+  // consumeMessageDirectly sends CONSUME_MESSAGE_DIRECTLY(309)
+  // to the broker that STORES the message; the broker relays it to the
+  // named client and answers with the client's verdict body. The store host is
+  // resolved through viewMessage and the OFFSET msgId is substituted when the
   // resolved message carries a client uniq key.
   async consumeMessageDirectly(consumerGroup: string, clientId: string, topic: string,
     msgId: string, brokerAddr?: string): Promise<ConsumeMessageDirectlyResult> {
@@ -1386,10 +1376,10 @@ export class DefaultMQAdminExt {
     return ConsumeMessageDirectlyResult.decode(response.body);
   }
 
-  // ---------------- Name-server config (Java updateNameServerConfig) ----------------
+  // ---------------- Name-server config ----------------
 
   // UPDATE_NAMESRV_CONFIG(318) broadcast: the properties ride in the BODY as
-  // java.util.Properties TEXT; the first failing nameserver decides the error.
+  // Properties-format TEXT; the first failing nameserver decides the error.
   async updateNameServerConfig(properties: Record<string, string>, timeoutMillis?: number): Promise<void> {
     const text = propertiesToString(properties);
     if (!text) return;
@@ -1405,8 +1395,8 @@ export class DefaultMQAdminExt {
     }
   }
 
-  // GET_NAMESRV_CONFIG(319), one request per nameserver (nil/empty = all,
-  // Java's default); the Properties-text body is parsed back per server.
+  // GET_NAMESRV_CONFIG(319), one request per nameserver (null/empty = all
+  // known servers); the Properties-text body is parsed back per server.
   async getNameServerConfig(nameServers: string[] | null, timeoutMillis?: number): Promise<Record<string, Record<string, string>>> {
     const client = this._requireClient();
     const targets = (nameServers != null && nameServers.length > 0)

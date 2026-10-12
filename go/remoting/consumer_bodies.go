@@ -3,14 +3,14 @@
 //
 //   - LockBatchRequestBody / UnlockBatchRequestBody (LOCK_BATCH_MQ = 41 /
 //     UNLOCK_BATCH_MQ = 42): the *body* carries the queue set and the group,
-//     the header carries only group + clientId. Java sends both; the broker
+//     the header carries only group + clientId. Both are sent and the broker
 //     reads both, so leaving either out silently locks nothing.
 //   - LockBatchResponseBody (field lockOKMQSet): the queues the broker
 //     actually granted. Only these may be pulled by an orderly consumer.
 //   - GetConsumerListByGroupResponseBody (field consumerIdList): the rebalance
 //     input — "who else is in my group".
 //
-// JSON field names are Java property names (fastjson2 deserialises by them);
+// JSON field names are the broker's property names (fastjson2 deserialises by them);
 // MessageQueue elements serialise with the same alphabetical
 // brokerName/queueId/topic order the offset tables use.
 package remoting
@@ -114,7 +114,7 @@ func (b *UnlockBatchRequestBody) FromJSONValue(value any) error {
 // Encode produces the wire body (compact JSON).
 func (b *UnlockBatchRequestBody) Encode() []byte { return EncodeJSON(b.ToJSONValue()) }
 
-// LockBatchResponseBody is the reply of both 41 and 42 (Java reuses the bean);
+// LockBatchResponseBody is the reply of both 41 and 42 (one shared bean);
 // only lockOKMQSet matters to the client.
 type LockBatchResponseBody struct {
 	LockOKMQSet []common.MessageQueue
@@ -170,8 +170,8 @@ func decodeMQSet(raw any) []common.MessageQueue {
 
 // ---------------------------------------------------------------- consumer list
 
-// GetConsumerListByGroupResponseBody is the 38 reply. Java's real bean also has
-// a consumerIdList; it is the only field the client reads.
+// GetConsumerListByGroupResponseBody is the 38 reply. The server's real bean
+// also has a consumerIdList; it is the only field the client reads.
 type GetConsumerListByGroupResponseBody struct {
 	ConsumerIDList []string
 }
@@ -202,8 +202,8 @@ func (b *GetConsumerListByGroupResponseBody) FromJSONValue(value any) error {
 }
 
 // DecodeGetConsumerListByGroupResponseBody parses the 38 reply. An empty body
-// is an empty list (Java answers SUCCESS with no body when the group has no
-// online consumer; the client must not treat that as an error).
+// is an empty list (the broker answers SUCCESS with no body when the group
+// has no online consumer; the client must not treat that as an error).
 func DecodeGetConsumerListByGroupResponseBody(data []byte) (*GetConsumerListByGroupResponseBody, error) {
 	body := &GetConsumerListByGroupResponseBody{}
 	if len(data) == 0 {

@@ -222,7 +222,7 @@ def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only(
     assert psent == [master], psent
 
 
-def test_unregister_budget_is_javas_mq_client_api_timeout():
+def test_unregister_budget_is_the_client_api_timeout():
     """默认超时必须是 Java 的 ``getMqClientApiTimeout()`` = 3000ms（``ClientConfig.java:81``；
     ``MQClientInstance#unregisterClient``:1170 传的就是它）。
 

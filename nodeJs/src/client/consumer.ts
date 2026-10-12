@@ -1,7 +1,5 @@
-// DefaultMQPushConsumer — the push consumer
-// (Java org.apache.rocketmq.client.consumer.DefaultMQPushConsumer +
-// DefaultMQPushConsumerImpl + RebalancePushImpl, merged the same way the
-// Python/Go/C++/C# ports merge them).
+// DefaultMQPushConsumer — the push consumer: subscription and rebalance entry
+// points plus the per-queue pull loops, in one class.
 //
 // Shape of the thing, per client instance:
 //
@@ -75,7 +73,7 @@ import { RemotingTimeoutException } from '../remoting/exception.ts';
 
 const logger = getLogger('client.consumer');
 
-// Consumer defaults (Java DefaultMQPushConsumer 5.x).
+// Push-consumer defaults.
 const DEFAULT_PULL_BATCH_SIZE = 32;
 const DEFAULT_CONSUME_MESSAGE_BATCH_MAX_SIZE = 1;
 const DEFAULT_CONSUME_THREAD_MIN = 20;
@@ -93,7 +91,7 @@ const DEFAULT_PULL_BATCH_SIZE_IN_BYTES = 256 * 1024;
 const DEFAULT_MAX_RECONSUME_TIMES = -1;
 const DEFAULT_SUSPEND_CURRENT_QUEUE_TIME_MS = 1000;
 const DEFAULT_CONSUME_TIMEOUT = 15;
-// rebalanceInterval is Java RebalanceService's 20s. While the consumer is young
+// The rebalance period is 20s. While the consumer is young
 // (60s) and has NOTHING assigned, retry every 2s so a consumer that starts
 // before the topic exists is not stalled for a long time.
 const REBALANCE_INTERVAL = 20 * 1000;
@@ -101,11 +99,10 @@ const REBALANCE_INTERVAL_DURING_STARTUP = 2 * 1000;
 const REBALANCE_STARTUP_WINDOW = 60 * 1000;
 const PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL = 50;
 const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION = 3000;
-// Java DefaultMQPushConsumerImpl.PULL_TIME_DELAY_MILLS_WHEN_SUSPEND:113 (1000ms):
-// while suspend() is in effect the pull/pop loops do not exit — they wait this long
-// and re-check the gate.
+// PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms): while suspend() is in effect the
+// pull/pop loops do not exit — they wait this long and re-check the gate.
 const PULL_TIME_DELAY_MILLS_WHEN_SUSPEND = 1000;
-const JAVA_INT_MAX = 2147483647;
+const INT32_MAX = 2147483647;
 const DEFAULT_CONSUMER_GROUP = 'DEFAULT_CONSUMER';
 
 export { MessageSelector };
@@ -130,8 +127,8 @@ function consumeReturnTypeName(t: number): string {
 export class DefaultMQPushConsumer {
   consumerGroup: string;
   namespace = '';
-  // Java ClientConfig#namespaceV2 — the SERVER-side namespace (nsd/ns
-  // extFields stamped by NamespaceRpcHook), independent from `namespace`.
+  // Server-side namespaceV2 — the `nsd`/`ns` extFields stamped by
+  // NamespaceRpcHook, independent from `namespace`.
   namespaceV2: string | null = null;
   instanceName = 'DEFAULT';
   clientID = '';
@@ -192,9 +189,8 @@ export class DefaultMQPushConsumer {
   offsetStore: OffsetStore | null = null;
 
   started = false;
-  // Java DefaultMQPushConsumerImpl's `private volatile boolean pause = false`:
-  // a CONSUMER-WIDE switch flipped by suspend()/resume(). Distinct from the
-  // lite-pull consumer's per-queue paused set.
+  // `pause` is a CONSUMER-WIDE switch flipped by suspend()/resume(). Distinct
+  // from the lite-pull consumer's per-queue paused set.
   private _paused = false;
   private _stopFlags = new Set<string>();
   private _startTime = 0;
@@ -205,7 +201,7 @@ export class DefaultMQPushConsumer {
   private _queueStopFlags = new Map<string, string>();
   assigned: MessageQueue[] = [];
 
-  // offsetTable is the pull cursor (Java's PullRequest.nextOffset), distinct
+  // offsetTable is the pull cursor (the pull request's nextOffset), distinct
   // from the consumed offset the store holds.
   offsetTable = new Map<string, number>();
   private _frozenOffsets = new Set<string>();
@@ -223,8 +219,7 @@ export class DefaultMQPushConsumer {
 
   flowControlTriggered = 0;
 
-  // ---- POP mode (Java DefaultMQPushConsumer pop fields; port of
-  // go/client/pop_consumer.go). When popMode is on the broker serves this
+  // ---- POP mode. When popMode is on the broker serves this
   // (group, topic) pair in POP mode: no client cursor, ACK per message.
   popMode = false;
   popInvisibleTime = 60000;
@@ -237,7 +232,7 @@ export class DefaultMQPushConsumer {
   popQueueTable = new Map<string, PopProcessQueue>();
   popQueueStopFlags = new Map<string, string>();
 
-  // Consumer-side stats (Java ConsumerStatsManager, shared on the MQClient
+  // Consumer-side stats (ConsumerStatsManager, shared on the MQClient
   // instance; assigned in start()). Differential-window model — see
   // consumer_stats.ts.
   _statsManager: import('./consumer_stats.ts').ConsumerStatsManager | null = null;
@@ -249,7 +244,7 @@ export class DefaultMQPushConsumer {
   // ------------------------------------------------------------- config
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
-  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  // Server-side namespace accessor, read live per request by NamespaceRpcHook.
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setInstanceName(name: string): this { this.instanceName = name; return this; }
@@ -278,10 +273,10 @@ export class DefaultMQPushConsumer {
   setSuspendCurrentQueueTimeMillis(ms: number): this { this.suspendCurrentQueueTimeMillis = ms; return this; }
   setConsumeTimeout(minutes: number): this { this.consumeTimeout = minutes; return this; }
   setConsumeConcurrentlyMaxSpan(v: number): this { this.consumeConcurrentlyMaxSpan = v; return this; }
-  // SetPopMode switches this consumer to POP mode (Java's broker-side
-  // MessageRequestMode). A POP consumer must not be orderly: Java leaves
-  // orderly POP as a TODO stub and there is no queue lock in the POP protocol
-  // to serialise on — checkConfig rejects the combination at start().
+  // SetPopMode switches this consumer to POP mode (the broker-side
+  // MessageRequestMode). A POP consumer must not be orderly: the POP protocol
+  // has no queue lock to serialise on, so an orderly POP consumer would
+  // silently lose ordering — checkConfig rejects the combination at start().
   setPopMode(enable: boolean): this { this.popMode = enable; return this; }
   get isPopMode(): boolean { return this.popMode; }
   // SetPopInvisibleTime sets how long a popped batch stays invisible (ms).
@@ -324,15 +319,15 @@ export class DefaultMQPushConsumer {
       exprType = subExpression.type || ExpressionType.TAG;
     }
     // FilterAPI.build, NOT buildSubscriptionData: a SQL92/CLASS_FILTER
-    // subscription must go out with EMPTY tagsSet/codeSet (Java takes a
-    // separate branch for it). Filling them makes the broker intersect the
-    // pull against the hash of the expression text and deliver nothing.
+    // subscription must go out with EMPTY tagsSet/codeSet (a separate build
+    // branch). Filling them makes the broker intersect the pull against the
+    // hash of the expression text and deliver nothing.
     const sub = FilterAPI.build(topic, expr, exprType);
     const existed = this.subscription.has(topic);
     this.subscription.set(topic, sub);
     if (existed && this.started) {
-      // Java's RebalancePushImpl.messageQueueChanged: re-run immediately so a
-      // changed expression takes effect without waiting out the 20s timer.
+      // Subscription change: re-run rebalance immediately so a changed
+      // expression takes effect without waiting out the 20s timer.
       this.rebalanceImmediately();
     }
     return this;
@@ -366,7 +361,7 @@ export class DefaultMQPushConsumer {
     try {
       return { status: fn(msgs, ctx), threw: false };
     } catch (e) {
-      // Java's exception rule: a throw is RECONSUME_LATER (concurrent) or
+      // Listener exception rule: a throw is RECONSUME_LATER (concurrent) or
       // suspend-and-retry-in-place (orderly) — never a crash.
       logger.debug('listener error: %s', (e as Error).message);
       return { status: -1, threw: true };
@@ -384,7 +379,9 @@ export class DefaultMQPushConsumer {
 
   // ---------------------------------------------------------------- lifecycle
 
-  // Start brings the consumer up following Java DefaultMQPushConsumerImpl.start.
+  // Start brings the consumer up in a fixed order: validate config, make the
+  // instance name unique, register hooks, pre-flight check, first heartbeat,
+  // then the first rebalance.
   async start(): Promise<void> {
     if (this.started) return;
     if (this.namespace) {
@@ -406,26 +403,27 @@ export class DefaultMQPushConsumer {
     this._parseConsumeTimestamp(this.consumeTimestamp); // hard fail on bad format
     this._checkConfigRanges();
     if (this.messageModel === MessageModel.CLUSTERING) {
-      // Java start:934-936 — only CLUSTERING rewrites DEFAULT, and
-      // ClientConfig#changeInstanceNameToPID:163-167 makes it `<pid>#<nanotime>`,
+      // Only CLUSTERING rewrites the DEFAULT instance name, and
+      // changeInstanceNameToPid makes it `<pid>#<nanotime>`,
       // i.e. unique PER INSTANCE. A pid-only name is shared by every push
       // consumer in this process, so the broker sees one member and
       // allocate() hands both instances the same slice — duplicate consumption.
       this.instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     }
-    // ClientConfig#buildMQClientId: `<ip>@<instanceName>[@<unitName>][@STREAM]`
-    // (the push consumer leaves the stream flag off, like Java).
+    // buildMQClientId: `<ip>@<instanceName>[@<unitName>][@STREAM]`
+    // (the push consumer leaves the stream flag off).
     this.clientID = MixAll.clientIdFor(this.instanceName);
 
     const client = new MQClient(this.clientID, this.nameServerAddr);
     if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
     if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
-    // Java MQClientAPIImpl:329 — NamespaceRpcHook is the FIRST hook on the
-    // remoting client; a configured namespaceV2 goes out as nsd/ns extFields
+    // NamespaceRpcHook is the FIRST hook on the
+    // remoting client (so the ACL signature covers it); a configured
+    // namespaceV2 goes out as nsd/ns extFields
     // on every rpc (route fetch, heartbeat, pull, send-back, offsets).
     registerRpcHooks(client.remotingClient, { namespaceV2: () => this.namespaceV2 });
     this.mqClient = client;
-    // Java MQClientFactory.getConsumerStatsManager — instance-level shared.
+    // The consumer stats manager is instance-level shared on the MQClient.
     this._statsManager = client.consumerStatsManager;
     client.registerConsumer(this.consumerGroup, this);
     client.start();
@@ -462,9 +460,9 @@ export class DefaultMQPushConsumer {
     }
     // Register broker-initiated request processors BEFORE the first heartbeat.
     this._registerProcessors();
-    // Java DefaultMQPushConsumerImpl.start:1013-1015 — subscription routes
-    // first, then the 46 pre-flight check, then the first heartbeat. A failure
-    // here is fatal: Java logs, shuts the consumer down and rethrows.
+    // Pre-flight: subscription routes
+    // first, then the 46 check, then the first heartbeat. A failure
+    // here is fatal: log, shut the consumer down and rethrow.
     try {
       await client.checkClientInBroker();
     } catch (e) {
@@ -479,8 +477,9 @@ export class DefaultMQPushConsumer {
     // would spin on an empty assignment until the first timer tick.
     await this.doRebalance();
 
-    // POP mode: tell the broker to serve this (group, topic) pair as POP. Java
-    // does this out of band (mqadmin / console); doing it here keeps the client
+    // POP mode: tell the broker to serve this (group, topic) pair as POP — the
+    // broker normally does this out of band (mqadmin / console); doing it here
+    // keeps the client
     // self-contained. A failure is logged, not fatal — a broker that already
     // has the group in POP mode answers SUCCESS anyway, and an old broker
     // without POP support must not take the consumer down.
@@ -502,7 +501,7 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // Shutdown unwinds in Java's order: persist offsets (while started is still
+  // Shutdown unwinds in a fixed order: persist offsets (while started is still
   // true), unlock if orderly, unregister at every broker, then stop the loops.
   async shutdown(): Promise<void> {
     if (!this.started) return;
@@ -534,7 +533,8 @@ export class DefaultMQPushConsumer {
     // CONSUMER_SEND_MSG_BACK(36) short and the message never reaches
     // %RETRY%/%DLQ%.
     await this._waitInFlightDrain(30000);
-    // Java persists a second time from MQClientInstance.shutdown: offsets the
+    // Persist a second time at the end, mirroring the MQClientInstance-side
+    // flush on shutdown: offsets the
     // drain just advanced must land too.
     try { await this.persistConsumerOffset(); } catch (e) { /* best effort */ }
     this.started = false;
@@ -550,12 +550,11 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // suspend() is Java DefaultMQPushConsumer#suspend:890 → Impl#suspend:1312-1315.
-  // It flips ONE boolean: the pull/pop loops keep running, keep stamping their
-  // lastPull/lastPop timestamp, and just stop STARTING new requests, backing off
-  // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND each round.
+  // suspend() flips ONE boolean: the pull/pop loops keep running, keep stamping
+  // their lastPull/lastPop timestamp, and just stop STARTING new requests,
+  // backing off PULL_TIME_DELAY_MILLS_WHEN_SUSPEND each round.
   //
-  // The gate must sit AFTER the stamp (Java stamps at :253, checks pause at :263).
+  // The gate must sit AFTER the stamp (stamp first, check pause second).
   // Gate first, stamp second, and a merely-suspended consumer goes silent for
   // more than PULL_MAX_IDLE_TIME (120s), the stall detector calls it a dead loop,
   // and rebalance tears the assignment down — i.e. pausing an operational
@@ -565,7 +564,7 @@ export class DefaultMQPushConsumer {
     logger.info(`suspend this consumer, ${this.consumerGroup}`);
   }
 
-  // resume() is Java Impl#resume:741-745: clear the flag and rebalance at once,
+  // resume() clears the flag and rebalances at once,
   // so queues that appeared while suspended start being pulled immediately
   // instead of waiting out the 20s rebalance period.
   resume(): void {
@@ -574,11 +573,11 @@ export class DefaultMQPushConsumer {
     logger.info(`resume this consumer, ${this.consumerGroup}`);
   }
 
-  // isPaused() is Java DefaultMQPushConsumer#isPause:902.
+  // isPaused() reports whether the consumer-wide suspend flag is set.
   isPaused(): boolean { return this._paused; }
 
   private _startTraceDispatcher(): void {
-    // Java DefaultMQPushConsumer.start:180-190: failures only log — a broken
+    // Trace-stack failures only log — a broken
     // trace stack must never take the consumer down.
     try {
       // Lazy wiring; the trace dispatcher lives in trace_dispatcher.ts.
@@ -589,8 +588,8 @@ export class DefaultMQPushConsumer {
         const dispatcher = new m.AsyncTraceDispatcher(
           this.consumerGroup, 'CONSUME', this.traceMsgBatchNum, this.traceTopic || undefined);
         dispatcher.setHostConsumer(this);
-        // Java AsyncTraceDispatcher.start:155 — propagate the namespace to the
-        // internal trace producer.
+        // Propagate the namespace to the
+        // internal trace producer, so trace rows land in the same namespace.
         dispatcher.setNamespaceV2(this.namespaceV2);
         this.traceDispatcher = dispatcher;
         if (this.consumerGroup) {
@@ -674,7 +673,7 @@ export class DefaultMQPushConsumer {
     });
   }
 
-  // Immediate full-broker heartbeat (Java sendHeartbeatToAllBrokerWithLock).
+  // Immediate full-broker heartbeat (with the broker lock taken first).
   async sendHeartbeatNow(): Promise<void> {
     if (this.client == null) return;
     await this.client.sendHeartbeatToAllBrokers();
@@ -717,22 +716,22 @@ export class DefaultMQPushConsumer {
 
   // ------------------------------------------------------------- rebalance
 
-  // doRebalance is Java RebalanceImpl#rebalanceByTopic for every subscribed
+  // doRebalance resolves the queue set for every subscribed
   // topic, then syncPullLoops.
   //
   // BROADCASTING: every queue is ours, no broker coordination.
   // CLUSTERING: ask the broker for the group's client list -> sort cidAll and
   // mqAll -> run the strategy -> take our slice.
   //
-  // A missing consumer list KEEPS the current assignment (Java warns). Never
+  // A missing consumer list KEEPS the current assignment (warn). Never
   // degrade to "I own everything": co-instances would duplicate every message.
   //
   // POP takes its queues from THIS same client-side rebalance (one POP loop per
-  // assigned queue + ack). Java instead asks the broker when clientRebalance is
-  // off — RebalanceImpl#getRebalanceResultFromBroker:345 → MQClientAPIImpl#queryAssignment:405
-  // (QUERY_ASSIGNMENT=400, MessageQueueAssignment with mode=POP). That path is
-  // deliberately NOT implemented here (same decision as the python / rust / php
-  // ports): the semantics are equivalent, only WHO picks the queue set differs.
+  // assigned queue + ack). The alternative broker-side path — asking the broker
+  // with clientRebalance off via QUERY_ASSIGNMENT=400 (MessageQueueAssignment
+  // with mode=POP) — is a deliberate divergence: this port resolves queues
+  // client-side only. The semantics are equivalent; only WHO picks the queue
+  // set differs.
   async doRebalance(): Promise<void> {
     if (!this.mqClient || !this.started) return;
     const client = this.mqClient;
@@ -794,11 +793,11 @@ export class DefaultMQPushConsumer {
     this.syncPullLoops();
   }
 
-  // _getConsumerIdListByGroup is Java MQClientInstance#findConsumerIdList: ask
+  // _getConsumerIdListByGroup asks the broker for the group's consumer id list:
   // one broker of the topic's route. Every client heartbeats to every broker,
   // so any one broker holds the COMPLETE list for the group.
   //
-  // The address is Java BrokerData.selectBrokerAddr: MASTER PREFERRED, else
+  // Broker address selection prefers MASTER, else
   // the lowest remaining id (a slave). Master-only resolution breaks a
   // slave-only topology — the route then has no id=0 entry, the member list
   // never resolves, and a freshly started consumer is assigned no queues at
@@ -832,7 +831,7 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // syncPullLoops mirrors Java RebalanceImpl#updateProcessQueueTableInRebalance:
+  // syncPullLoops updates the process-queue table after a rebalance:
   // retire what we no longer own, then start a pull loop per new queue.
   //
   // Revocation has three mandatory steps — persist the CONSUMED offset, drop
@@ -868,8 +867,8 @@ export class DefaultMQPushConsumer {
       if (this.processQueueTable.has(key)) continue;
       const pq = new ProcessQueue(this.orderly);
       this.processQueueTable.set(key, pq);
-      // A fresh ProcessQueue lifts the freeze (Java removeProcessQueue's
-      // removeOffset): the rebuilt queue advances from the corrected offset.
+      // A fresh ProcessQueue lifts the freeze (as removeProcessQueue's
+      // removeOffset does): the rebuilt queue advances from the corrected offset.
       this._frozenOffsets.delete(key);
       pq.touchPull();
       // A rebuilt queue starts over from the master instead of the slave the
@@ -887,8 +886,8 @@ export class DefaultMQPushConsumer {
 
   // _retireQueue drops one queue's local state.
   //
-  // The epoch bump invalidates every in-flight batch's ack (Java's
-  // setDropped(true)); the freeze marker is KEPT until the queue is rebuilt, so
+  // The epoch bump invalidates every in-flight batch's ack (the queue is marked
+  // dropped); the freeze marker is KEPT until the queue is rebuilt, so
   // a corrected offset cannot be overwritten by an old ack.
   private _retireQueue(key: string): { mq: MessageQueue; offset: number; hasOffset: boolean } {
     const stopFlag = this._queueStopFlags.get(key);
@@ -918,11 +917,12 @@ export class DefaultMQPushConsumer {
     return { mq, offset, hasOffset };
   }
 
-  // _persistRevoked is Java RebalanceImpl#removeUnnecessaryMessageQueue.
+  // _persistRevoked persists the CONSUMED offset of queues we no longer own —
+  // removeUnnecessaryMessageQueue for revoked subscriptions.
   private _persistRevoked(revoked: Array<{ mq: MessageQueue; offset: number; hasOffset: boolean }>): void {
     if (!this.offsetStore) return;
     if (this.messageModel === MessageModel.BROADCASTING) {
-      // Broadcast offsets live in a local file. Java persists BEFORE
+      // Broadcast offsets live in a local file. Persist BEFORE
       // removeOffset so the value stays on disk and a rebuilt queue can
       // continue from it.
       this.offsetStore.persistAll([]).catch((e) =>
@@ -931,7 +931,7 @@ export class DefaultMQPushConsumer {
     }
     for (const q of revoked) {
       if (q.hasOffset) {
-        // Java persist(mq): write the value now, do not wait for the 5s
+        // Write the value now, do not wait for the 5s
         // periodic flush — the new owner may start pulling any moment.
         this.offsetStore.updateOffset(q.mq, q.offset, false);
         this.offsetStore.persist(q.mq).catch((e) =>
@@ -961,7 +961,7 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // computePullFromWhere is Java RebalancePushImpl#computePullFromWhere.
+  // computePullFromWhere decides where a newly assigned queue starts pulling.
   //
   // READ_FROM_STORE first, then the per-policy fallback. Two items are
   // deliberate: CONSUME_FROM_FIRST_OFFSET returns 0 WITHOUT querying minOffset
@@ -1010,7 +1010,7 @@ export class DefaultMQPushConsumer {
 
   // _queuePullLoop pulls one queue until it is retired or the consumer stops.
   //
-  // Why one loop PER QUEUE rather than Java's shared PullMessageService
+  // Why one loop PER QUEUE rather than a shared PullMessageService
   // thread: the push consumer long-polls (suspend=true), so an idle queue
   // parks its request for up to ~15s. A shared loop would serialise those
   // parks and starve every other queue.
@@ -1019,12 +1019,11 @@ export class DefaultMQPushConsumer {
     while (!this._isStopped(stopFlag)) {
       const pq = this.processQueueTable.get(key);
       if (!pq || pq.isDropped()) return;
-      // Java DefaultMQPushConsumerImpl.pullMessage:253 — the timestamp is
-      // stamped when a pull is STARTED, before the flow-control/lock
-      // decisions: the stall detector asks "is this loop alive".
+      // The timestamp is stamped when a pull is STARTED, before the
+      // flow-control/lock decisions: the stall detector asks "is this loop alive".
       pq.touchPull();
 
-      // Java pullMessage:263-266 — the suspend gate, deliberately AFTER the
+      // The suspend gate, deliberately AFTER the
       // stamp above (see suspend() for why that order is the whole point).
       if (this._paused) {
         if (await this._sleepOrStop(PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, stopFlag)) return;
@@ -1050,7 +1049,7 @@ export class DefaultMQPushConsumer {
         continue;
       }
 
-      // Java pullMessage:458-468 — the expression goes on the wire only when
+      // The subscription expression goes on the wire only when
       // postSubscriptionWhenPull is on AND the subscription is not a class
       // filter. Off by default: the broker then does not filter and the
       // client's second-stage tag check covers it.
@@ -1077,7 +1076,8 @@ export class DefaultMQPushConsumer {
       }
       let sysFlagFinal = sysFlag;
       if (resolved.isSlave) {
-        // Java pullKernelImpl:219-221 — a slave does not accept offset commits.
+        // A slave does not accept offset commits, so the commit-offset flag
+        // must be cleared before the pull goes out.
         sysFlagFinal = PullSysFlag.clearCommitOffsetFlag(sysFlag);
       }
 
@@ -1120,7 +1120,7 @@ export class DefaultMQPushConsumer {
       }
       this.offsetTable.set(key, result.nextBeginOffset);
       if (result.status === PullStatus.OFFSET_ILLEGAL) {
-        // Java DefaultMQPushConsumerImpl:402-427 — freeze the corrected offset
+        // On OFFSET_ILLEGAL freeze the corrected offset
         // here and do the revoke/persist outside the loop.
         this._frozenOffsets.add(key);
         if (this.offsetStore) this.offsetStore.updateOffset(mq, result.nextBeginOffset, false);
@@ -1143,8 +1143,8 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // _findBrokerAddressInSubscribe mirrors Java MQClientInstance
-  // #findBrokerAddressInSubscribe. Returns (addr, isSlave) or null.
+  // _findBrokerAddressInSubscribe resolves a broker address for a subscription
+  // target. Returns (addr, isSlave) or null.
   //
   // The isSlave flag comes from the id that was ACTUALLY matched, which is why
   // the fallback branch recomputes it: a request for slave id 3 that falls
@@ -1161,14 +1161,14 @@ export class DefaultMQPushConsumer {
     const hit = snapshot.get(brokerId);
     if (hit != null) return { addr: hit, isSlave: brokerId !== MixAll.MASTER_ID };
     if (brokerId !== MixAll.MASTER_ID) {
-      // Java's convention: a slave registers as <slaveId>, so +1 is the
+      // Broker convention: a slave registers as <slaveId>, so +1 is the
       // "primary slave" of the same group.
       const next = snapshot.get(brokerId + 1);
       if (next != null) return { addr: next, isSlave: true };
     }
     if (!onlyThisBroker) {
-      // Java takes `entrySet().iterator().next()` — map order. The ports agree
-      // on the deterministic form instead: the smallest id (the master when it
+      // Rather than taking an arbitrary map-order entry, resolve
+      // deterministically: the smallest id (the master when it
       // exists).
       let minID = 0;
       let first = true;
@@ -1180,7 +1180,7 @@ export class DefaultMQPushConsumer {
     return null;
   }
 
-  // _pullKernel mirrors Java PullAPIWrapper#pullKernelImpl. Issues PULL_MESSAGE(11).
+  // _pullKernel issues the pull at the wire layer: PULL_MESSAGE(11).
   private async _pullKernel(mq: MessageQueue, offset: number, sub: SubscriptionData,
     sysFlag: number, commitOffset: number, maxMsgNums: number, maxMsgBytes: number,
     suspendTimeoutMillis: number,     timeoutMillis: number, addr: string): Promise<PullResult> {
@@ -1229,7 +1229,7 @@ export class DefaultMQPushConsumer {
       num('maxOffset', 0), found, suggest);
   }
 
-  // _processPullResult mirrors Java PullAPIWrapper#processPullResult. It MUST
+  // _processPullResult post-processes a pull reply. It MUST
   // run for every response, not only FOUND ones — the node table is fed by
   // every reply, and absent means master.
   private _processPullResult(mq: MessageQueue, result: PullResult, sub: SubscriptionData): PullResult {
@@ -1253,7 +1253,7 @@ export class DefaultMQPushConsumer {
       msgs = ctx.msgList;
     }
     for (const msg of msgs) {
-      // A half message carries its transaction id in UNIQ_KEY; Java lifts it
+      // A half message carries its transaction id in UNIQ_KEY; lift it
       // so the listener can see it as MessageExt.getTransactionId().
       if (msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED) === 'true') {
         const uniq = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
@@ -1267,7 +1267,7 @@ export class DefaultMQPushConsumer {
     return result;
   }
 
-  // _flowControlHit is Java ProcessQueue.putMessage / pullMessage's threshold
+  // _flowControlHit applies the ProcessQueue put/pull threshold
   // checks. Any one of them pauses THIS queue's pulls.
   private _flowControlHit(mq: MessageQueue, pq: ProcessQueue): boolean {
     const [count, sizeMB, span] = pq.pendingStats();
@@ -1339,8 +1339,8 @@ export class DefaultMQPushConsumer {
           continue;
         }
         if (this._dispatchSem >= Math.max(1, this.corePoolSize)) {
-          // Pool full: wait a tick rather than unbounded queueing (Java's
-          // real concurrency is core too).
+          // Pool full: wait a tick rather than unbounded queueing (real
+          // concurrency is core-size bound too).
           pq.requeueBatch(batch);
           this._endInFlight();
           await this._sleepOrStop(5, stopFlag);
@@ -1378,8 +1378,8 @@ export class DefaultMQPushConsumer {
     else await this._consumeConcurrentlyBatch(mq, batch, epoch);
   }
 
-  // _resetRetryTopicAndNamespace is Java
-  // DefaultMQPushConsumerImpl#resetRetryAndNamespace, called BEFORE the
+  // _resetRetryTopicAndNamespace rewrites the %RETRY% topic back to the origin
+  // topic and strips the namespace prefix, called BEFORE the
   // listener.
   //
   // A retried message physically lives under %RETRY%<group>; the broker writes
@@ -1404,7 +1404,7 @@ export class DefaultMQPushConsumer {
 
   private async _consumeConcurrentlyBatch(mq: MessageQueue, batch: MessageExt[], epoch: number): Promise<void> {
     const ctx = new ConsumeConcurrentlyContext(mq);
-    // AckIndex defaults to "the whole batch" — Java MaxInt32 clamped to
+    // AckIndex defaults to "the whole batch" — INT32_MAX clamped to
     // len(batch)-1 on success. Getting it wrong in the other direction
     // silently acks only one message or none at all.
     (ctx as any).ackIndex = 2147483647;
@@ -1424,7 +1424,7 @@ export class DefaultMQPushConsumer {
       }
     }
     const begin = Date.now();
-    // Java ConsumeMessageConcurrentlyService:366-370 stamps CONSUME_START_TIME
+    // CONSUME_START_TIME is stamped
     // on every delivery BEFORE the listener; cleanExpiredMsg's escape hatch
     // reads it.
     for (const msg of batch) {
@@ -1436,7 +1436,7 @@ export class DefaultMQPushConsumer {
       logger.debug('listener error, treat as RECONSUME_LATER: mq=%s', mqKey(mq));
       status = ConsumeConcurrentlyStatus.RECONSUME_LATER;
     }
-    // Java:380 — the RT is taken ONCE, immediately after the listener returns.
+    // The RT is taken ONCE, immediately after the listener returns.
     const consumeRT = Date.now() - begin;
     if (status !== ConsumeConcurrentlyStatus.CONSUME_SUCCESS && status !== ConsumeConcurrentlyStatus.RECONSUME_LATER) {
       // An out-of-range return behaves as RECONSUME_LATER instead of silently
@@ -1507,8 +1507,8 @@ export class DefaultMQPushConsumer {
     this._commitConcurrently(mq, acked, epoch);
   }
 
-  // _commitConcurrently is Java ProcessQueue#removeMessage + updateOffset for
-  // the concurrent paths.
+  // _commitConcurrently removes acked messages from the ProcessQueue and
+  // updates the consume offset for the concurrent paths.
   //
   // The target is the queue's high-water mark + 1 — NOT the end of this batch.
   // Batches of one queue are consumed in parallel, so the batch that finishes
@@ -1642,7 +1642,7 @@ export class DefaultMQPushConsumer {
     if (autoCommit) {
       if (status === ConsumeOrderlyStatus.COMMIT || status === ConsumeOrderlyStatus.ROLLBACK) {
         // With autoCommit on, COMMIT/ROLLBACK are illegal (they belong to the
-        // binlog consumer). Java warns and does NOT break: the messages are
+        // binlog consumer). Warn and do NOT break: the messages are
         // acked.
         logger.warning('the message queue consume result is illegal, we think you want to ack these message %s', mqKey(mq));
         status = ConsumeOrderlyStatus.SUCCESS;
@@ -1700,8 +1700,7 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // _sleepOrderlyMillis is Java
-  // ConsumeMessageOrderlyService#submitConsumeRequestLater: -1 means "not set"
+  // _sleepOrderlyMillis resolves the orderly suspend delay: -1 means "not set"
   // and falls back to the consumer's configuration, then the result is clamped
   // to [10, 30000]. The clamp is not decoration: a listener returning 0 would
   // otherwise turn the consume loop into a busy loop.
@@ -1713,15 +1712,14 @@ export class DefaultMQPushConsumer {
     return ms;
   }
 
-  // _orderlyMaxReconsumeTimes is Java
-  // ConsumeMessageOrderlyService#getMaxReconsumeTimes — -1 is Integer.MAX_VALUE
+  // _orderlyMaxReconsumeTimes: -1 means INT32_MAX
   // here (orderly retries in place, the broker never counts).
   private _orderlyMaxReconsumeTimes(): number {
-    return this.maxReconsumeTimes === -1 ? JAVA_INT_MAX : this.maxReconsumeTimes;
+    return this.maxReconsumeTimes === -1 ? INT32_MAX : this.maxReconsumeTimes;
   }
 
-  // _checkOrderlyReconsumeTimes is Java
-  // ConsumeMessageOrderlyService#checkReconsumeTimes. Returns whether the
+  // _checkOrderlyReconsumeTimes compares the message's reconsume count against
+  // the orderly max. Returns whether the
   // batch still has to be suspended in place.
   private _checkOrderlyReconsumeTimes(msgs: MessageExt[]): boolean {
     let suspend = false;
@@ -1741,14 +1739,13 @@ export class DefaultMQPushConsumer {
     return suspend;
   }
 
-  // _orderlySendMessageBack is Java
-  // ConsumeMessageOrderlyService#sendMessageBack — a PLAIN send to
+  // _orderlySendMessageBack sends back for the orderly path — a PLAIN send to
   // %RETRY%<group>, not a CONSUMER_SEND_MSG_BACK.
   private _orderlySendMessageBackSync(msg: MessageExt): boolean {
     try {
       void this._doOrderlySendMessageBack(msg).catch(() => false);
-      // The async send is fire-and-forget here; Java is synchronous. For the
-      // JS port the caller treats a not-yet-confirmed send as failed (suspend)
+      // The async send is fire-and-forget here. For this port
+      // the caller treats a not-yet-confirmed send as failed (suspend)
       // which is the safe side: the message is requeued, not lost.
       return false;
     } catch (e) {
@@ -1785,7 +1782,7 @@ export class DefaultMQPushConsumer {
   }
 
   // _innerProducer lazily builds the CLIENT_INNER_PRODUCER used by the orderly
-  // send-back path (Java constructs it inside ConsumeMessageOrderlyService).
+  // send-back path.
   private async _innerProducer(): Promise<DefaultMQProducer | null> {
     if (this._producer) return this._producer;
     try {
@@ -1803,8 +1800,8 @@ export class DefaultMQPushConsumer {
 
   // ---------------------------------------------------------------- offsets
 
-  // _advanceConsumeOffset is Java's updateOffset: it writes `drained` — the
-  // offset to commit once the buffer holds nothing else — and then lowers it
+  // _advanceConsumeOffset advances the consumed offset: it writes `drained` —
+  // the offset to commit once the buffer holds nothing else — and then lowers it
   // to `floor`, the smallest offset that WILL still be buffered, whenever that
   // is lower.
   //
@@ -1827,11 +1824,11 @@ export class DefaultMQPushConsumer {
     if (pq) pq.completeBatch(batch);
   }
 
-  // _correctTagsOffset is Java DefaultMQPushConsumerImpl#correctTagsOffset.
+  // _correctTagsOffset catches up a consumed offset that would otherwise stall.
   //
   // When a pull answers NO_NEW_MSG or NO_MATCHED_MSG the CONSUMED offset must
-  // follow the pull cursor, otherwise it parks forever. Java gates it on
-  // `0L == processQueue.getMsgCount()`: a concurrent in-flight batch is still
+  // follow the pull cursor, otherwise it parks forever. Gate it on an empty
+  // buffer (msgCount == 0): a concurrent in-flight batch is still
   // in there until the listener returns — raising the offset before that would
   // silently skip the batch on a crash.
   private _correctTagsOffset(mq: MessageQueue, status: number, nextOffset: number): void {
@@ -1847,8 +1844,8 @@ export class DefaultMQPushConsumer {
     }).catch(() => {});
   }
 
-  // persistConsumerOffset is the periodic flush
-  // (Java MQClientInstance#persistAllConsumerOffset).
+  // persistConsumerOffset is the periodic flush of every assigned
+  // queue's consumed offset.
   async persistConsumerOffset(): Promise<void> {
     const store = this.offsetStore;
     if (!store || !this.started) return;
@@ -1862,7 +1859,7 @@ export class DefaultMQPushConsumer {
   }
 
   // getConsumerStatus answers GET_CONSUMER_STATUS_FROM_CLIENT(221): the
-  // CONSUMED offsets (Java returns offsetStore.cloneOffsetTable(topic)).
+  // CONSUMED offsets (a snapshot of the offset table for the topic).
   getConsumerStatus(topic?: string): Array<{ mq: MessageQueue; offset: number }> {
     const out: Array<{ mq: MessageQueue; offset: number }> = [];
     if (!this.offsetStore) return out;
@@ -1879,9 +1876,9 @@ export class DefaultMQPushConsumer {
 
   // resetOffset handles RESET_CONSUMER_CLIENT_OFFSET(220).
   //
-  // Java's four steps: pq.setDropped(true) + pq.clear() -> wait for concurrent
-  // consumption to finish -> updateConsumeOffset + removeUnnecessaryMessageQueue
-  // (persist now) -> drop the queue so rebalance rebuilds it at the new offset.
+  // Four steps: drop and clear the ProcessQueue -> wait for concurrent
+  // consumption to finish -> update the consumed offset and persist it now ->
+  // drop the queue so rebalance rebuilds it at the new offset.
   async resetOffset(topic: string, table: Array<{ mq: MessageQueue; offset: number }>): Promise<void> {
     if (!table || table.length === 0) return;
     const todo: Array<{ mq: MessageQueue; offset: number }> = [];
@@ -1908,9 +1905,8 @@ export class DefaultMQPushConsumer {
 
   // ------------------------------------------------------------- sweeps
 
-  // _cleanExpireLoop is Java's scheduleAtFixedRate(cleanExpireMsg,
-  // consumeTimeout, consumeTimeout, MINUTES): initialDelay and period are the
-  // SAME, so the first sweep also waits a full period.
+  // _cleanExpireLoop runs the expire sweep on a fixed schedule: initialDelay
+  // and period are the SAME, so the first sweep also waits a full period.
   private async _cleanExpireLoop(): Promise<void> {
     const flag = this._newStopFlag();
     const period = Math.max(1, this.consumeTimeout) * 60 * 1000;
@@ -1935,7 +1931,7 @@ export class DefaultMQPushConsumer {
     }
   }
 
-  // _cleanExpiredQueue is Java ProcessQueue#cleanExpiredMsg, line by line.
+  // _cleanExpiredQueue sweeps one queue's expired messages.
   // Three rules: only ever look at the HEAD (smallest offset), the message
   // must be STRICTLY older than consumeTimeout, and at most 16 per round.
   private _cleanExpiredQueue(mq: MessageQueue): void {
@@ -1973,7 +1969,7 @@ export class DefaultMQPushConsumer {
 
   // ------------------------------------------------------------- lock sweep
 
-  // _lockMQOnce is Java ConsumeMessageOrderlyService#lockMQ: LOCK_BATCH_MQ(41)
+  // _lockMQOnce issues LOCK_BATCH_MQ(41)
   // for every assigned queue.
   private async _lockMQOnce(): Promise<void> {
     const mqs = [...this.assigned];
@@ -2183,7 +2179,7 @@ export class DefaultMQPushConsumer {
         'PROP_CONSUME_TYPE': this.consumeType,
         'PROP_START_TIMESTAMP': String(this._startTime),
         'PROP_CONSUMEORDERLY': String(this.orderly),
-        // Java DefaultMQPushConsumerImpl:1452 reads the SERVICE's getCorePoolSize(),
+        // PROP_THREADPOOL_CORE_SIZE reads the SERVICE's getCorePoolSize(),
         // not the config field — so the runtime value an operator pushed via
         // updateCorePoolSize() is what shows up in 307.
         'PROP_THREADPOOL_CORE_SIZE': String(this.getCorePoolSize()),
@@ -2199,8 +2195,8 @@ export class DefaultMQPushConsumer {
     };
   }
 
-  // _buildPopTable is the 307 mqPopTable (Java
-  // PopProcessQueue#fillPopProcessQueueInfo). All three fields are written
+  // _buildPopTable is the 307 mqPopTable, one entry per POP process queue.
+  // All three fields are written
   // unconditionally — unlike mqTable there is no "only when non-empty" branch,
   // so an idle POP queue still reports its debt and its last pop time.
   private _buildPopTable(): Record<string, any> {
@@ -2216,8 +2212,8 @@ export class DefaultMQPushConsumer {
   }
 
   // _buildStatusTable is the 307 statusTable: per-topic ConsumeStatus from the
-  // consumer stats manager (Java consumerRunningInfo: consumeStatus(group,
-  // topic), MINUTE snapshots; consumeFailedMsgs comes from the HOUR window).
+  // consumer stats manager (consumeStatus(group, topic), MINUTE snapshots;
+  // consumeFailedMsgs comes from the HOUR window).
   // NOTE: real-clock TPS between two in-process samples is ~0; tests inject
   // timestamps via StatsItem sampling.
   private _buildStatusTable(): Record<string, any> {
@@ -2234,8 +2230,8 @@ export class DefaultMQPushConsumer {
 
   // ------------------------------------------------------------- stats
 
-  // Differential-window recording (Java ConsumerStatsManager same-named
-  // methods). No-op before start(): the manager lives on the MQClient.
+  // Differential-window recording via the stats manager's same-named
+  // methods. No-op before start(): the manager lives on the MQClient.
   private _incPullRT(topic: string, rt: number): void {
     if (this._statsManager != null) this._statsManager.incPullRT(this.consumerGroup, topic, rt);
   }
@@ -2258,10 +2254,9 @@ export class DefaultMQPushConsumer {
   assignedQueueCount(): number { return this.assigned.length; }
   processQueueCount(): number { return this.processQueueTable.size; }
 
-  // ------------------------------------------------- thread elasticity (Java
-  // AbstractConsumeMessageService + DefaultMQPushConsumerImpl.computeAccumulationTotal)
+  // ------------------------------------------------- thread elasticity
 
-  // Java DefaultMQPushConsumerImpl#computeAccumulationTotal: sum of every
+  // computeAccumulationTotal: sum of every
   // ProcessQueue's msgAccCnt (the backlog estimate adjustThreadPool runs on).
   computeAccumulationTotal(): number {
     let total = 0;
@@ -2269,11 +2264,10 @@ export class DefaultMQPushConsumer {
     return total;
   }
 
-  // updateCorePoolSize is Java AbstractConsumeMessageService#updateCorePoolSize:59-67.
-  // The guards are copied verbatim (ownsConsumeExecutor is always true here — this
-  // port has no user-injected executor — && 0 < n <= Short.MAX_VALUE &&
-  // n < consumeThreadMax) and a rejected value is SILENTLY ignored, exactly like
-  // Java. The boolean exists only so tests can assert whether it took effect.
+  // updateCorePoolSize guards a rejected value strictly:
+  // 0 < n <= Short.MAX_VALUE (32767) &&
+  // n < consumeThreadMax; a rejected value is SILENTLY ignored.
+  // The boolean exists only so tests can assert whether it took effect.
   //
   // It is not cosmetic here: _dispatchLoop caps in-flight batches at corePoolSize,
   // so this is the live concurrency knob.
@@ -2285,15 +2279,15 @@ export class DefaultMQPushConsumer {
     return true;
   }
 
-  // getCorePoolSize is Java AbstractConsumeMessageService#getCorePoolSize:78-79
-  // (which answers -1 when the executor was injected by the user).
+  // getCorePoolSize returns the live core size. There is no user-injected
+  // executor in this port, so it never answers -1.
   getCorePoolSize(): number { return this.corePoolSize; }
 
-  // adjustThreadPool is Java DefaultMQPushConsumerImpl#adjustThreadPool — ⚠ a NO-OP
-  // in 5.5.1: the incCorePoolSize()/decCorePoolSize() it calls have EMPTY bodies
-  // (AbstractConsumeMessageService:70-75). Keep it a no-op; do not "fix" it. The
-  // effective knob is the explicit updateCorePoolSize(). Thresholds are computed and
-  // logged so msgAccCnt and the config stay observable.
+  // adjustThreadPool is ⚠ a NO-OP on this port: the pool grow/shrink hooks it
+  // would call have empty bodies, so no auto-resize ever takes effect. Keep it
+  // a no-op; do not "fix" it. The effective knob is the explicit
+  // updateCorePoolSize(). Thresholds are computed and logged so msgAccCnt and
+  // the config stay observable.
   adjustThreadPool(): void {
     const accTotal = this.computeAccumulationTotal();
     const threshold = this.adjustThreadPoolNumsThreshold;
@@ -2319,8 +2313,8 @@ export class DefaultMQPushConsumer {
     return t.getTime();
   }
 
-  // _checkConfigRanges is Java DefaultMQPushConsumerImpl#checkConfig's numeric
-  // section — same order, same bounds, same wording.
+  // _checkConfigRanges validates the numeric consumer config — a fixed order,
+  // fixed bounds, and the exact error strings the broker and callers match.
   private _checkConfigRanges(): void {
     if (this.consumeThreadMin < 1 || this.consumeThreadMin > 1000) {
       throw new Error('consumeThreadMin Out of range [1, 1000]');
@@ -2362,8 +2356,7 @@ export class DefaultMQPushConsumer {
       throw new Error('popBatchNums Out of range [1, 32]');
     }
     if (this.popMode && this.orderly) {
-      // Java: "POPTODO think of pop mode orderly implementation later." There
-      // is no queue lock in the POP protocol to serialise on, so an orderly
+      // The POP protocol has no queue lock to serialise on, so an orderly
       // POP consumer would silently lose ordering — refuse instead.
       throw new Error('pop mode does not support orderly consumption');
     }
@@ -2393,8 +2386,8 @@ function batchEnd(batch: MessageExt[]): number {
   return next + 1;
 }
 
-// clientSideTagFilter is Java PullAPIWrapper.processPullResult:113-122 — the
-// second, string-level tag check. The broker filters by the hash of the tag
+// clientSideTagFilter is the second, string-level tag check applied to every
+// pull result. The broker filters by the hash of the tag
 // (codeSet), so a collision can let a non-matching message through; the client
 // re-checks by exact string.
 //
@@ -2402,7 +2395,7 @@ function batchEnd(batch: MessageExt[]): number {
 // SUB_ALL path must keep tagsSet EMPTY: subscribing to "*" turns the filter
 // off entirely rather than filtering everything out.
 function clientSideTagFilter(sub: SubscriptionData, msgs: MessageExt[]): MessageExt[] {
-  // tagsSet is a Set in this port (Java: HashSet) — use .size, NOT .length.
+  // tagsSet is a Set in this port — use .size, NOT .length.
   // A `.length === 0` guard on a Set is always false, which silently turns
   // the '*' subscription (empty tagsSet → filter OFF) into "filter everything".
   const tagsSet: any = sub ? (sub as any).tagsSet : null;

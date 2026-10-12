@@ -157,7 +157,7 @@ def _run_one_pull(c, client):
     assert not t.is_alive()
 
 
-def test_push_subscription_bit_off_by_default_like_java():
+def test_push_subscription_bit_off_by_default():
     c = _push_consumer()
     assert c.post_subscription_when_pull is False  # Java 5.x 默认 false
 

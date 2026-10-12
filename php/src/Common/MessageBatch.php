@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 批量消息（对应 org.apache.rocketmq.common.message.MessageBatch，移植自 message.py）。
+ * 批量消息：一组 Message 拼成一个 body 一次发送。
  *
  * 没有自己的序列化字段，body 由 ``encode()`` 生成：
  * ``MessageDecoder::encodeMessages($messages)`` 的拼接结果（每条为 6 段轻量格式）。
@@ -22,7 +22,7 @@ final class MessageBatch extends Message
         $this->messages = array_values($messages);
     }
 
-    /** 对应 Java MessageBatch.encode()。 */
+    /** 生成批量 body：逐条 6 段轻量格式串接。 */
     public function encode(): string
     {
         return MessageDecoder::encodeMessages($this->messages);
@@ -35,11 +35,10 @@ final class MessageBatch extends Message
     }
 
     /**
-     * 对应 Java MessageBatch.generateFromList。
+     * 从列表构造批量消息并校验约束。
      *
      * 约束：非空；同一 topic；同一 waitStoreMsgOK；不允许延时消息；不允许重试 topic。
-     * Java 抛 UnsupportedOperationException / IllegalArgumentException，
-     * 这里统一映射为 PHP 的 InvalidArgumentException（对应 Python 的 ValueError）。
+     * 任一条不满足就整批抛 InvalidArgumentException——不能只丢掉几条再发剩下的。
      *
      * @param list<Message> $messages
      */
@@ -74,10 +73,10 @@ final class MessageBatch extends Message
 
         $batch = new self($messageList);
         $batch->setTopic($first->getTopic());
-        // Java generateFromList:70 是 ``batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK())``：
-        // **属性缺省即 true**。曾经写成 ``first.get_wait_store_msg_ok() == "true"`` ——
-        // 缺省（None）被判成 False，于是普通消息（``Message.__init__`` 不写 WAIT）组成的
-        // 批量会以 ``WAIT=false`` 下发：broker 不等刷盘就回 SEND_OK，持久性静默降级。
+        // 批级 WAIT 跟随第一条消息的判定结果，且**属性缺省即 true**。曾经写成
+        // ``first.getWaitStoreMsgOk() == "true"`` —— 缺省（null）被判成 false，
+        // 于是普通消息（构造器不写 WAIT）组成的批量会以 ``WAIT=false`` 下发：
+        // broker 不等刷盘就回 SEND_OK，持久性静默降级。
         $batch->setWaitStoreMsgOk(self::isWaitStoreMsgOk($first));
         $batch->setBody($batch->encode());
         return $batch;

@@ -58,7 +58,7 @@ func IsCompressed(sysFlag int32) bool {
 }
 
 // ClearCompressedFlag only clears COMPRESSED_FLAG; the compression type bits
-// (bit8~10) are kept after decompression, matching Java.
+// (bit8~10) stay set after decompression so the used algorithm remains recorded.
 func ClearCompressedFlag(sysFlag int32) int32 { return sysFlag &^ MessageSysFlagCompressed }
 
 func GetTransactionValue(flag int32) int32 { return flag & MessageSysFlagTransactionRollback }
@@ -117,7 +117,7 @@ func BuildSysFlag(commitOffset, suspend, subscription, classFilter, litePull boo
 	return flag
 }
 
-// BuildSysFlagBasic is the four-arg Java overload (no litePull).
+// BuildSysFlagBasic builds the pull sysFlag without the litePull bit.
 func BuildSysFlagBasic(commitOffset, suspend, subscription, classFilter bool) int32 {
 	return BuildSysFlag(commitOffset, suspend, subscription, classFilter, false)
 }
@@ -155,7 +155,7 @@ func HasStartOffsetFlag(sysFlag int32) bool {
 	return sysFlag&PullSysFlagStartOffset == PullSysFlagStartOffset
 }
 
-// PermName (Java org.apache.rocketmq.common.sysflag.PermName).
+// Permission bits of the topic route `perm` field.
 const (
 	PermPriority int32 = 0x1 << 3
 	PermRead     int32 = 0x4
@@ -164,11 +164,11 @@ const (
 	PermOwner    int32 = 0x1 << 4
 )
 
-// PermIsValid mirrors Java PermName.isValid: perm >= 0 && perm < PERM_PRIORITY.
+// PermIsValid: perm >= 0 && perm < PERM_PRIORITY.
 func PermIsValid(perm int32) bool { return perm >= 0 && perm < PermPriority }
 
-// PermIsValidStr: non-numeric input is invalid (Java would throw
-// NumberFormatException; the ports agree on false).
+// PermIsValidStr: a perm string that is not a valid number is treated as
+// invalid (returns false, never throws).
 func PermIsValidStr(perm string) bool {
 	v, err := strconv.ParseInt(strings.TrimSpace(perm), 10, 32)
 	if err != nil {
@@ -200,7 +200,7 @@ func Perm2String(perm int32) string {
 
 func CheckPerm(perm, wantedPerm int32) bool { return perm&wantedPerm == wantedPerm }
 
-// SubscriptionMode (Python side; a subset of Java ConsumeMode).
+// SubscriptionMode: message model carried in subscription data.
 const (
 	SubscriptionModeGroup        int32 = 0
 	SubscriptionModeBroadcasting int32 = 1

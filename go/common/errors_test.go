@@ -64,7 +64,7 @@ func TestResponseCodeOnlyOnBusinessErrors(t *testing.T) {
 	}
 }
 
-func TestClientErrorCodeConstantsMatchJava(t *testing.T) {
+func TestClientErrorCodeConstantsMatchProtocol(t *testing.T) {
 	// org.apache.rocketmq.client.exception.ClientErrorCode
 	cases := []struct {
 		name string

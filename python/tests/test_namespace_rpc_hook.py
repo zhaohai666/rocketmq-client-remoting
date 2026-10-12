@@ -61,7 +61,7 @@ def _drop(inst: MQClientInstance) -> None:
 
 
 # ---------------------------------------------------------------- 常量与钩子本体
-def test_ext_field_names_match_java_mix_all():
+def test_ext_field_names_match_the_wire_keys():
     """Java MixAll.java:122-123 的两个键名，一字都不能差。"""
     assert MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD == "nsd"
     assert MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD == "ns"

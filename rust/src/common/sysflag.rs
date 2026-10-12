@@ -269,7 +269,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bit_positions_match_java() {
+    fn bit_positions_match_wire() {
         assert_eq!(MessageSysFlag::COMPRESSED_FLAG, 0x1);
         assert_eq!(MessageSysFlag::MULTI_TAGS_FLAG, 0x2);
         assert_eq!(MessageSysFlag::TRANSACTION_NOT_TYPE, 0);

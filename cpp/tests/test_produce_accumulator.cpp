@@ -332,7 +332,7 @@ std::shared_ptr<MessageAccumulation> waitForBatch(ProduceAccumulator& acc, int64
 
 // ================================================================ 参数
 
-void testDefaultParamsMatchJava() {
+void testDefaultParamsMatchContract() {
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-params", &sender);
     expectInt(acc.getBatchMaxDelayMs(), PRODUCE_ACCUMULATOR_DEFAULT_HOLD_MS, "default holdMs const");
@@ -349,7 +349,7 @@ void testDefaultParamsMatchJava() {
     expect(acc.instanceName() == "cpp-accum-params", "instanceName kept");
 }
 
-void testParamGuardsCopyJavaRanges() {
+void testParamGuardRanges() {
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-guards", &sender);
 
@@ -1081,7 +1081,7 @@ void testAsyncSendFailureReachesEveryCallback() {
     expectInt(static_cast<long long>(sender.sentCount()), 1, "one batch was attempted");
 }
 
-void testAsyncThrowLeaksHoldSizeLikeJava() {
+void testAsyncThrowLeaksHoldSize() {
     // ⚠ Java 的漏还路径：异步发送在**发起阶段**就抛异常时，外层 catch 只通知回调，
     // **不**执行 `currentlyHoldSize.addAndGet(-size)`。照抄（改掉就与 Java 对不上了）。
     FakeSender sender;
@@ -1188,7 +1188,7 @@ void testAttachSenderRebindsOnlyWhenDetached() {
 
 // ================================================================ 守卫线程的服务名
 
-void testGuardServiceNamesMatchJava() {
+void testGuardServiceNamesMatchContract() {
     // Java `String.format("Client_%s_GuardFor%sSend", clientInstanceName, "Sync"/"Async")`：
     // 名字只在日志里出现，但它是"这个线程是谁"的唯一线索，值不值得断言见仁见智 ——
     // 这里只断言 start/shutdown 可重复且不抛（上面的 restart 用例覆盖了功能面）。
@@ -1207,8 +1207,8 @@ struct TestCase {
 };
 
 const TestCase kTests[] = {
-    {"default_params", testDefaultParamsMatchJava},
-    {"param_guards", testParamGuardsCopyJavaRanges},
+    {"default_params", testDefaultParamsMatchContract},
+    {"param_guards", testParamGuardRanges},
     {"registry_reuse", testRegistryReusesAccumulatorByClientId},
     {"gate", testTryAddMessageGateAndRelease},
     {"aggregate_key", testAggregateKeyPartitionsByTopicMqWaitAndTag},
@@ -1225,11 +1225,11 @@ const TestCase kTests[] = {
     {"restart", testAccumulatorCanRestartAfterShutdown},
     {"sync_fail", testSyncSendFailureSurfacesAndReturnsHoldSize},
     {"async_fail", testAsyncSendFailureReachesEveryCallback},
-    {"async_throw", testAsyncThrowLeaksHoldSizeLikeJava},
+    {"async_throw", testAsyncThrowLeaksHoldSize},
     {"detach_sync", testDetachSenderBlocksSyncBatchSend},
     {"detach_async", testDetachSenderFailsAsyncBatchWithoutRefund},
     {"attach_rebind", testAttachSenderRebindsOnlyWhenDetached},
-    {"guard_thread_name", testGuardServiceNamesMatchJava},
+    {"guard_thread_name", testGuardServiceNamesMatchContract},
 };
 
 }  // namespace

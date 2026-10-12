@@ -224,7 +224,7 @@ final class RunRemoting
         $this->checkSame($cmd->body, $decoded->body, 'ROCKETMQ 往返 body');
         $this->checkSame($cmd->extFields, $decoded->extFields, 'ROCKETMQ 往返 extFields 全等');
 
-        // 与 Python serialize 的字段序一致性：手拼 Python 顺序的字节串应逐字节一致
+        // 序列化字段序：按协议头字段顺序手拼的字节串应逐字节一致
         $extBytes = (string)RocketMQSerializable::mapSerialize($cmd->extFields);
         $expectHeader = pack('n', $cmd->code & 0xFFFF)
             . pack('C', $cmd->language & 0xFF)
@@ -233,7 +233,7 @@ final class RunRemoting
             . pack('N', $cmd->flag)
             . pack('N', strlen('bin-remark')) . 'bin-remark'
             . pack('N', strlen($extBytes)) . $extBytes;
-        $this->checkSame($expectHeader, $headerData, 'ROCKETMQ header 与 Python 字段序逐字节一致');
+        $this->checkSame($expectHeader, $headerData, 'ROCKETMQ header 字段序逐字节一致');
 
         // writeDecimalLong 边界
         $buf = '';
@@ -253,10 +253,10 @@ final class RunRemoting
         $this->checkSame($map, $back, 'mapSerialize/mapDeserialize 往返');
         $this->checkSame(strlen($bin), $off, 'mapDeserialize 消费完全部字节');
         // 空串 value 编码成长度 0 → readStr 还原为 null → 该键被丢弃
-        //（Java RocketMQSerializable / Python serialize.py 同样有损，非移植缺陷）
+        //（经典 remoting 协议的 map 编码本身有损，非实现缺陷）
         $lossy = (string)RocketMQSerializable::mapSerialize(['empty' => '']);
         [$backLossy, $offLossy] = RocketMQSerializable::mapDeserialize($lossy, 0, strlen($lossy));
-        $this->checkSame([], $backLossy, '空串 value 往返有损（长度0→null，与 Java/Python 一致）');
+        $this->checkSame([], $backLossy, '空串 value 往返有损（长度0→null，协议编码本身有损）');
         $this->checkSame(strlen($lossy), $offLossy, '有损用例仍消费完全部字节');
         $this->checkSame(null, RocketMQSerializable::mapSerialize(null), 'mapSerialize(null) → null');
         $this->checkSame(null, RocketMQSerializable::mapSerialize([]), 'mapSerialize([]) → null');
@@ -320,7 +320,7 @@ final class RunRemoting
         $this->check(true === $h3->unitMode, 'fromExtFields bool(true)');
         $this->check(false === $h3->batch, 'fromExtFields bool(0=false)');
 
-        // PopMessageRequestHeader.order 总在报文里（Java 非空 Boolean）
+        // PopMessageRequestHeader.order 总在报文里（协议里是非空 Boolean）
         $pop = new PopMessageRequestHeader();
         $pop->topic = 't';
         $ext = $pop->toExtFields();
@@ -379,7 +379,7 @@ final class RunRemoting
         $hookTok->doBeforeRequest('addr', $cmd4);
         $this->checkSame('st-1', $cmd4->getExtField('SecurityToken') ?? '', 'SecurityToken 已注入');
 
-        // AclRpcHook 是 AclClientRPCHook 的兼容别名（对应 Python 的 AclRPCHook = AclClientRPCHook）
+        // AclRpcHook 是 AclClientRPCHook 的兼容别名
         $alias = new AclRpcHook(new SessionCredentials('a', 'b'));
         $this->check($alias instanceof AclClientRPCHook, 'AclRpcHook 兼容别名');
     }
@@ -387,27 +387,24 @@ final class RunRemoting
     // ==================================================================== namespaceV2 钩子
 
     /**
-     * 5.x 服务端命名空间钩子（org.apache.rocketmq.client.rpchook.NamespaceRpcHook）。
+     * 5.x 服务端命名空间钩子（NamespaceRpcHook）。
      *
-     * 对齐基准（逐行读过 Java 5.5.1）：
+     * 判据（5.x 服务端的命名空间扩展头语义）：
      *   * doBeforeRequest 只有一段：namespaceV2 非空时加 **两个** 扩展头
-     *     nsd="true" / ns=<namespaceV2>（MixAll.java:122-123）；doAfterResponse 空实现。
-     *   * 空命名空间必须 **完全不碰** extFields —— Java 的 NamespaceRpcHookTest 断言的
-     *     就是「未配置时请求原样」，把 extFields 初始化成空 map 都算错（上线会多一个空对象）。
-     *   * 值是**每笔请求现读**的（Java 读 clientConfig.getNamespaceV2()），所以 start() 之后
+     *     nsd="true" / ns=<namespaceV2>；doAfterResponse 空实现。
+     *   * 空命名空间必须 **完全不碰** extFields —— 判据就是「未配置时请求原样」，
+     *     把 extFields 初始化成空 map 都算错（上线会多一个空对象）。
+     *   * 值是**每笔请求现读**的（每笔取 clientConfig 当前的 namespaceV2），所以 start() 之后
      *     改配置也从下一笔请求生效；持字符串快照的写法会把这条路堵死。
-     *   * 注册顺序 Namespace → Stream → 用户钩子(ACL) 是语义不是风格（MQClientAPIImpl:329-335）：
+     *   * 注册顺序 Namespace → Stream → 用户钩子(ACL) 是语义不是风格：
      *     nsd/ns 必须先进 extFields 才算得进签名，装反了签名「看着合法」但开鉴权的 broker
      *     验签多出两个未签字段直接拒签。
-     *
-     * 与 python/tests/test_namespace_rpc_hook.py、csharp ClientParityTests、
-     * nodeJs test/namespace_rpc_smoke.ts、cpp tests/test_namespace_hook.cpp 同题。
      */
     private function testNamespaceRpcHook(): void
     {
         Logger::setHandler(static function (string $line): void {}); // 测试期间静音
 
-        // 字段名与 Java 常量逐字一致（拼错 = broker 认不出命名空间，静默失败）
+        // 字段名按协议约定逐字固定（拼错 = broker 认不出命名空间，静默失败）
         $this->checkSame('nsd', MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, 'nsd 字段名');
         $this->checkSame('ns', MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD, 'ns 字段名');
 
@@ -418,7 +415,7 @@ final class RunRemoting
         $this->checkSame('true', $cmd->getExtField('nsd') ?? '', 'nsd=true');
         $this->checkSame($ns, $cmd->getExtField('ns') ?? '', 'ns=<namespaceV2>');
 
-        // doAfterResponse 是空实现（基类空方法，与 Java 的空方法体逐字一致）
+        // doAfterResponse 是空实现（响应回来不改写任何字段）
         $after = $cmd->extFields;
         $hook->doAfterResponse('127.0.0.1:10911', $cmd, null);
         $this->checkSame($after, $cmd->extFields, 'doAfterResponse 不动请求');
@@ -434,7 +431,7 @@ final class RunRemoting
             $this->check(!array_key_exists('nsd', $bare->extFields), 'nsd 没被写成空串');
         }
 
-        // 取值函数每笔请求现读：先空后配，第二笔必须带上（Java 的 clientConfig 语义）
+        // 取值函数每笔请求现读：先空后配，第二笔必须带上（每笔现读 clientConfig 的当前值）
         $current = '';
         $live = new NamespaceRpcHook(function () use (&$current): string {
             return $current;
@@ -462,7 +459,7 @@ final class RunRemoting
         $signed = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE, $header);
         $signed->body = 'ns-payload';
         $hook->doBeforeRequest('a', $signed);          // 先写 nsd/ns
-        $acl->doBeforeRequest('a', $signed);           // 再算签名（Java 的顺序）
+        $acl->doBeforeRequest('a', $signed);           // 再算签名（命名空间头必须先进 extFields）
         $sigWithNs = $signed->getExtField('Signature') ?? '';
         $this->check($sigWithNs !== '', '链式签名已生成');
 
@@ -494,7 +491,7 @@ final class RunRemoting
         ksort($chainVerify, SORT_STRING);
         $chainContent = implode('', array_map(strval(...), array_values($chainVerify))) . 'ns-payload';
         $this->checkSame(base64_encode(hash_hmac('sha1', $chainContent, $sk, true)),
-            $chain->getExtField('Signature') ?? '', 'ns + ReqT 一并进签名（Java MQClientAPIImpl:329-335）');
+            $chain->getExtField('Signature') ?? '', 'ns + ReqT 一并进签名（命名空间头先于签名计算）');
     }
 
     // ==================================================================== 路由解码
@@ -719,7 +716,7 @@ final class RunRemoting
     /**
      * 建连并 accept。
      *
-     * 客户端建连是**惰性**的（与 Python 一致：首次 send 才 connect），而 PHP 单线程里
+     * 客户端建连是**惰性**的（首次 send 才 connect），而 PHP 单线程里
      * `invokeSync` 会一直阻塞在读响应上。所以测试先用一次 `invokeOneway` 把 TCP 连接
      * 建起来（oneway 只写不等响应），再从 server 侧 accept，并丢弃这帧握手请求。
      *

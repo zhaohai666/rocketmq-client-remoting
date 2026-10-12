@@ -1,8 +1,8 @@
-// Heartbeat payload beans (org.apache.rocketmq.remoting.protocol.heartbeat.*).
+// Heartbeat payload beans.
 //
 // These are the JSON bodies behind HEART_BEAT(34): one HeartbeatData carrying
 // the client id plus every registered consumer's subscription set. Field names
-// must match Java byte for byte — the broker's ConsumerManager looks them up by
+// must match byte for byte — the broker's ConsumerManager looks them up by
 // reflection.
 //
 // Edge cases that must not "simplify":
@@ -12,8 +12,8 @@
 //   - "a||b" keeps the raw spacing in subString while the tags are trimmed.
 //   - "|||" splits into tags {"|"} (split only drops TRAILING empty parts);
 //     "||" / "||||" are errors ("subString split error").
-//   - ConsumerData carries the Java 5.x field set: no 4.x consumeTimestamp /
-//     maxReconsumeTimes — extra keys trip fastjson2 on the broker.
+//   - ConsumerData carries the 5.x protocol field set: no 4.x consumeTimestamp
+//     / maxReconsumeTimes — extra keys trip fastjson2 on the broker.
 package remoting
 
 import (
@@ -24,7 +24,7 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// Enum values as on the wire (Java enums serialize by name).
+// Enum values as on the wire (the broker serializes enums by name).
 const (
 	ConsumeTypeConsumePassively = "CONSUME_PASSIVELY"
 	ConsumeTypeConsumeActively  = "CONSUME_ACTIVELY"
@@ -46,9 +46,9 @@ const (
 
 // SubscriptionData is one entry of ConsumerData.subscriptionDataSet.
 //
-// TagsSet/CodeSet are kept sorted and deduplicated (Java writes set members in
-// sorted order). CodeSet holds Java String.hashCode() per tag — the broker
-// filters by tag hash before the client's second-stage filter runs.
+// TagsSet/CodeSet are kept sorted and deduplicated (set members go on the
+// wire in sorted order). CodeSet holds the 31-based string hash per tag — the
+// broker filters by tag hash before the client's second-stage filter runs.
 type SubscriptionData struct {
 	ClassFilterMode bool
 	Topic           string
@@ -59,7 +59,7 @@ type SubscriptionData struct {
 	ExpressionType  string
 }
 
-// NewSubscriptionData mirrors the Java default: subVersion = now millis,
+// NewSubscriptionData applies the protocol defaults: subVersion = now millis,
 // expressionType = TAG.
 func NewSubscriptionData(topic, subString string) *SubscriptionData {
 	return &SubscriptionData{
@@ -70,8 +70,7 @@ func NewSubscriptionData(topic, subString string) *SubscriptionData {
 	}
 }
 
-// SetTags stores the tag set and its hash set, sorted and deduplicated
-// (equivalent to Python's sorted(set)).
+// SetTags stores the tag set and its hash set, sorted and deduplicated.
 func (s *SubscriptionData) SetTags(tags []string, codes []int32) {
 	s.TagsSet = sortedDedupStrings(tags)
 	s.CodeSet = sortedDedupI32(codes)
@@ -192,7 +191,7 @@ func (s *SubscriptionData) FromJSONValue(value any) error {
 			return decodeErrf("codeSet item %v is not an int", item)
 		}
 	}
-	// Wire order is preserved on decode (Java reads the lists as-is);
+	// Wire order is preserved on decode;
 	// sorting/dedup happens only at SetTags time.
 	s.TagsSet = tags
 	s.CodeSet = codes
@@ -203,30 +202,30 @@ func (s *SubscriptionData) FromJSONValue(value any) error {
 
 // ---------------------------------------------------------------- FilterAPI
 
-// FilterAPI builds SubscriptionData from a subscription expression
-// (Java FilterAPI.buildSubscriptionData / Python common.subscription_data.FilterAPI).
+// FilterAPI builds SubscriptionData from a subscription expression.
 type FilterAPI struct{}
 
-// FilterAPISubAll is Java FilterAPI.SUB_ALL.
+// FilterAPISubAll is the subscribe-all marker "*".
 const FilterAPISubAll = "*"
 
 // BuildSubscriptionData converts a subscription expression.
 //
-// An empty subString means "subscribe all" (callers pass "" for Java null):
+// An empty subString means "subscribe all" (callers pass "" when no expression
+// is given):
 // subString normalises to "*" with BOTH sets left empty — see the package
 // comment for why those sets must stay empty.
 //
 // " TagA || TagB " keeps the raw spacing in subString and trims each tag.
 // A whitespace-only expression goes through the split branch: tags end up
-// empty but subString keeps the original spacing (Java StringUtils.isEmpty
-// only treats null/"" as empty). "|||" yields tags {"|"}; "||"/"||||" error.
+// empty but subString keeps the original spacing (only null/"" count as
+// empty). "|||" yields tags {"|"}; "||"/"||||" error.
 func (FilterAPI) BuildSubscriptionData(topic, subString string) (*SubscriptionData, error) {
 	sub := NewSubscriptionData(topic, subString)
 	if subString == "" || subString == FilterAPISubAll {
 		return normaliseSubAll(sub), nil
 	}
 	parts := strings.Split(subString, "||")
-	// Java String.split("\\|\\|") drops TRAILING empty parts only.
+	// Splitting on "||" drops TRAILING empty parts only.
 	for len(parts) > 0 && parts[len(parts)-1] == "" {
 		parts = parts[:len(parts)-1]
 	}
@@ -239,7 +238,7 @@ func (FilterAPI) BuildSubscriptionData(topic, subString string) (*SubscriptionDa
 		tag := strings.TrimSpace(part)
 		if tag != "" {
 			tags = append(tags, tag)
-			codes = append(codes, common.JavaStringHash(tag))
+			codes = append(codes, common.StringHash31(tag))
 		}
 	}
 	sub.SetTags(tags, codes)
@@ -277,7 +276,7 @@ func (p *ProducerData) FromJSONValue(value any) error {
 
 // ---------------------------------------------------------------- ConsumerData
 
-// ConsumerData carries the Java 5.x field set. There is deliberately no
+// ConsumerData carries the 5.x protocol field set. There is deliberately no
 // consumeTimestamp / maxReconsumeTimes (4.x leftovers): the broker's fastjson2
 // rejects unknown fields.
 type ConsumerData struct {
@@ -289,8 +288,8 @@ type ConsumerData struct {
 	UnitMode            bool
 }
 
-// NewConsumerData fills the Java defaults (passive / clustering /
-// CONSUME_FROM_LAST_OFFSET).
+// NewConsumerData builds a ConsumerData; the protocol defaults are
+// passive / clustering / CONSUME_FROM_LAST_OFFSET.
 func NewConsumerData(groupName, consumeType, messageModel, consumeFromWhere string) *ConsumerData {
 	return &ConsumerData{
 		GroupName:           groupName,
@@ -301,8 +300,7 @@ func NewConsumerData(groupName, consumeType, messageModel, consumeFromWhere stri
 	}
 }
 
-// AddSubscriptionData appends unless an equal entry is already present
-// (Python models the set with a dict).
+// AddSubscriptionData appends unless an equal entry is already present.
 func (c *ConsumerData) AddSubscriptionData(data *SubscriptionData) {
 	for _, existing := range c.SubscriptionDataSet {
 		if existing.Equal(data) {
@@ -351,7 +349,7 @@ func (c *ConsumerData) FromJSONValue(value any) error {
 // ---------------------------------------------------------------- HeartbeatData
 
 // HeartbeatData is the HEART_BEAT(34) body. heartbeatFingerprint is always 0
-// and withoutSub always false (the fields exist for Java compatibility).
+// and withoutSub always false (the fields exist for protocol compatibility).
 type HeartbeatData struct {
 	ClientID             string
 	ProducerDataSet      []*ProducerData

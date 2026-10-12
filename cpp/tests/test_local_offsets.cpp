@@ -69,7 +69,7 @@ std::string tempDir(const char* tag) {
     return dir;
 }
 
-void testBuildUsesJavaObjectAsKeyFormat() {
+void testBuildUsesObjectAsKeyFormat() {
     std::string text = DefaultMQPushConsumer::buildLocalOffsetsJson(
         items({{"Ttbroker-a0", 7}, {"Ttbroker-a1", 9}}), mqMap());
     expect(text.rfind("{\"offsetTable\":{", 0) == 0, "build_format_prefix", text);
@@ -88,7 +88,7 @@ void testBuildSkipsEntriesWithoutQueueInfo() {
     expect(text.find("Orphan") == std::string::npos, "build_orphan_skipped", text);
 }
 
-void testParseJavaFormatCompactAndPretty() {
+void testParseCompatFormatCompactAndPretty() {
     auto compact = DefaultMQPushConsumer::parseLocalOffsetsText(kJavaCompact);
     expect(compact.has_value() && (*compact)["Ttbroker-a1"] == 9 && (*compact)["Ttbroker-a0"] == 7,
            "parse_java_compact");
@@ -118,7 +118,7 @@ void testRoundTripBuiltText() {
            "roundtrip");
 }
 
-void testSaveWritesJavaFormatAndRollsBak() {
+void testSaveWritesCompatFormatAndRollsBak() {
     std::string dir = tempDir("bak");
     std::string path = dir + "/offsets.json";
     std::map<std::string, MessageQueue> map = mqMap();
@@ -151,7 +151,7 @@ void testSaveWritesJavaFormatAndRollsBak() {
     std::filesystem::remove_all(dir, ec);
 }
 
-void testLoadReadsJavaWrittenFile() {
+void testLoadReadsCompatWrittenFile() {
     // Java 写出的文件本端要能读（跨端互认的核心）
     std::string dir = tempDir("java");
     std::string path = dir + "/offsets.json";
@@ -170,14 +170,14 @@ void testLoadReadsJavaWrittenFile() {
 }  // namespace
 
 int main() {
-    testBuildUsesJavaObjectAsKeyFormat();
+    testBuildUsesObjectAsKeyFormat();
     testBuildSkipsEntriesWithoutQueueInfo();
-    testParseJavaFormatCompactAndPretty();
+    testParseCompatFormatCompactAndPretty();
     testParseAcceptsLegacyFlatMap();
     testParseRejectsGarbage();
     testRoundTripBuiltText();
-    testSaveWritesJavaFormatAndRollsBak();
-    testLoadReadsJavaWrittenFile();
+    testSaveWritesCompatFormatAndRollsBak();
+    testLoadReadsCompatWrittenFile();
 
     std::printf("%s: %d checks, %d failures\n", "local_offsets", checks, fails);
     return fails == 0 ? 0 : 1;

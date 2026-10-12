@@ -33,7 +33,7 @@ void ConsumeExecutor::submit(std::function<void()> task) {
     if (shutdown_) {
         throw RejectedExecutionError("ConsumeExecutor has been shut down");
     }
-    // Java：入队失败（队列满）才考虑开一个非 core 线程，再不行就 reject
+    // 入队失败（队列满）才考虑开一个非 core 线程，再不行就 reject
     const bool queueFull = maxQueueSize_ > 0 && static_cast<int32_t>(queue_.size()) >= maxQueueSize_;
     const bool canGrow = workers_ < max_;
     if (queueFull && !canGrow) {
@@ -41,8 +41,8 @@ void ConsumeExecutor::submit(std::function<void()> task) {
                                      + std::to_string(maxQueueSize_) + ")");
     }
     queue_.push_back(std::move(task));
-    // Java 无界队列语义：只有 poolSize < corePoolSize 才新建线程；否则入队等待。
-    // workers == 0 是 core=0 配置下的兜底分支（Java execute 的同一处），
+    // 无界队列语义：只有 poolSize < corePoolSize 才新建线程；否则入队等待。
+    // workers == 0 是 core=0 配置下的兜底分支，
     // 队满且还能涨时也要补线程，否则任务永远排在一个已经不再干活的队列里。
     if (workers_ < core_ || (queueFull && canGrow) || workers_ == 0) {
         spawnLocked();
@@ -58,10 +58,10 @@ void ConsumeExecutor::setCorePoolSize(int32_t n) {
     const int32_t delta = n - core_;
     core_ = n;
     if (n > max_) {
-        max_ = n;  // Java 允许 core > max（等价于把 max 抬到 core）
+        max_ = n;  // 允许 core > max（等价于把 max 抬到 core）
     }
     if (delta > 0 && !shutdown_) {
-        // Java setCorePoolSize 的启发式：按 min(delta, 队列长度) 补线程，队列一空就停。
+        // 扩 core 的启发式：按 min(delta, 队列长度) 补线程，队列一空就停。
         int32_t k = std::min(delta, static_cast<int32_t>(queue_.size()));
         while (k > 0 && workers_ < max_) {
             spawnLocked();
@@ -135,7 +135,7 @@ void ConsumeExecutor::run() {
                 --idle_;
                 if (!queue_.empty() || shutdown_) break;
                 // 空闲超时：只有超编线程（> core）才退出；core 以内的线程永不退出
-                // （Java allowCoreThreadTimeOut 默认 false）。
+                // （等价于 allowCoreThreadTimeOut=false 的默认口径）。
                 if (workers_ > core_) {
                     --workers_;
                     return;
@@ -151,7 +151,7 @@ void ConsumeExecutor::run() {
         try {
             task();
         } catch (const std::exception& e) {
-            // 任务异常不能杀 worker（Java 会补一个新 worker，效果等价）。
+            // 任务异常不能杀 worker（worker 必须继续消费队列，效果等价于销毁后补新线程）。
             handlerExceptions_.fetch_add(1, std::memory_order_relaxed);
             logger_error(std::string("consume executor task raised: ") + e.what());
         } catch (...) {

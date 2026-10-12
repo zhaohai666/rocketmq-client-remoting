@@ -182,7 +182,7 @@ mod tests {
     );
 
     #[test]
-    fn java_defaults_match_probe() {
+    fn defaults_match_server_probe() {
         // Python test_topic_config_java_defaults
         let cfg = TopicConfig::new("t");
         assert_eq!(cfg.read_queue_nums, 16);
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_java_output_keeps_attributes() {
+    fn decode_server_output_keeps_attributes() {
         // Java 文本能读回来（键顺序无关），attributes 逐项保留
         let cfg = TopicConfig::decode(TOPIC_CONFIG_ATTRIBUTES_FIRST).unwrap();
         assert_eq!(cfg.topic_name, "attr-topic");

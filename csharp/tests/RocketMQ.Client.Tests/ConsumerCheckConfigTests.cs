@@ -230,7 +230,7 @@ public class ConsumerCheckConfigTests
     }
 
     [Fact]
-    public void GatesAreCheckedInJavaOrder()
+    public void GatesAreCheckedInLegacyOrder()
     {
         // 多条同时越界时报哪一条取决于顺序 —— 与 Java 逐条同序才能保证用户看到的
         // 第一句错一样。每段用"被测闸门 + 后面某条也越界"证明前者先命中。
@@ -266,7 +266,7 @@ public class ConsumerCheckConfigTests
     }
 
     [Fact]
-    public void PopBatchNumsFollowsJavaLiteralLessOrEqualZero()
+    public void PopBatchNumsFollowsLegacyLiteralLessOrEqualZero()
     {
         // Java 原文是 `popBatchNums <= 0`，不是 `< 1`；0 与负数都拒，文案仍写 [1, 32]。
         ExpectRejected(c => c.PopBatchNums = 0, "popBatchNums Out of range [1, 32]");

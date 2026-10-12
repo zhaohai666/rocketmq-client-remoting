@@ -161,7 +161,7 @@ public class ProduceAccumulatorTests
     // ---------------------------------------------------------------- 参数
 
     [Fact]
-    public void DefaultParams_MatchJava()
+    public void DefaultParams_MatchLegacy()
     {
         var acc = new ProduceAccumulator("params");
         Assert.Equal(10, acc.HoldMs);
@@ -173,7 +173,7 @@ public class ProduceAccumulatorTests
     }
 
     [Fact]
-    public void ParamGuards_CopyJavaRanges()
+    public void ParamGuards_CopyLegacyRanges()
     {
         var acc = new ProduceAccumulator("guards");
         acc.BatchMaxDelayMs(1);

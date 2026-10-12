@@ -2,8 +2,7 @@ package common
 
 import "strings"
 
-// Namespace helpers (Java org.apache.rocketmq.remoting.protocol.NamespaceUtil /
-// Python remoting/protocol/namespace_util.py).
+// Namespace helpers.
 //
 // A namespace gives multi-tenant isolation: the client prefixes resource names
 // with `namespace%` before talking to the broker, and strips the prefix again
@@ -17,27 +16,26 @@ import "strings"
 //   - system resources (topics starting with `rmq_sys_`, groups starting with
 //     `CID_RMQ_SYS_`) are NEVER namespaced.
 
-// NamespaceSeparator is Java NamespaceUtil.NAMESPACE_SEPARATOR.
+// NamespaceSeparator is the namespace delimiter "%" inside resource names.
 const NamespaceSeparator = "%"
 
-// SystemConsumerGroupPrefix is Java MixAll.SYSTEM_CONSUMER_GROUP_PREFIX.
+// SystemConsumerGroupPrefix marks broker-managed system consumer groups.
 const SystemConsumerGroupPrefix = "CID_RMQ_SYS_"
 
-// IsSysTopic mirrors Java MixAll.isSysTopic: the `rmq_sys_` prefix only (this
+// IsSysTopic matches the `rmq_sys_` prefix only (this
 // is deliberately weaker than IsSystemTopic, which also matches the fixed set
-// of broker topics — namespace_util uses this weaker form).
+// of broker topics — the namespace rules use this weaker form).
 func IsSysTopic(topic string) bool { return strings.HasPrefix(topic, SystemTopicPrefix) }
 
-// IsSysConsumerGroup mirrors Java MixAll.isSysConsumerGroup.
+// IsSysConsumerGroup matches the CID_RMQ_SYS_ prefix.
 func IsSysConsumerGroup(group string) bool {
 	return strings.HasPrefix(group, SystemConsumerGroupPrefix)
 }
 
-// WithoutRetryAndDLQ strips the %RETRY% / %DLQ% prefix (Java
-// NamespaceUtil.withOutRetryAndDLQ, i.e. MixAll.resetRetryAndDLQTopic).
+// WithoutRetryAndDLQ strips the %RETRY% / %DLQ% prefix.
 func WithoutRetryAndDLQ(resource string) string { return ResetRetryAndDLQTopic(resource) }
 
-// IsSystemResource mirrors Java NamespaceUtil.isSystemResource.
+// IsSystemResource reports whether the resource is exempt from namespacing.
 func IsSystemResource(resource string) bool {
 	if resource == "" {
 		return false
@@ -45,7 +43,8 @@ func IsSystemResource(resource string) bool {
 	return IsSysTopic(resource) || IsSysConsumerGroup(resource)
 }
 
-// IsAlreadyWithNamespace mirrors Java NamespaceUtil.isAlreadyWithNamespace.
+// IsAlreadyWithNamespace reports whether the resource already carries the
+// namespace prefix.
 func IsAlreadyWithNamespace(resource, namespace string) bool {
 	if namespace == "" || resource == "" || IsSystemResource(resource) {
 		return false
@@ -54,8 +53,7 @@ func IsAlreadyWithNamespace(resource, namespace string) bool {
 	return strings.HasPrefix(plain, namespace+NamespaceSeparator)
 }
 
-// WithoutNamespace strips the namespace prefix (Java's two withoutNamespace
-// overloads). `MQ_INST_XX%Topic` -> `Topic`, `%RETRY%MQ_INST_XX%GID` ->
+// WithoutNamespace strips the namespace prefix. `MQ_INST_XX%Topic` -> `Topic`, `%RETRY%MQ_INST_XX%GID` ->
 // `%RETRY%GID`. An empty namespace means "drop whatever namespace is there";
 // a non-empty one only strips when it actually matches.
 func WithoutNamespace(resourceWithNamespace, namespace string) string {
@@ -85,8 +83,7 @@ func WithoutNamespace(resourceWithNamespace, namespace string) string {
 	return resourceWithNamespace
 }
 
-// WrapNamespace prefixes a resource with the namespace (Java
-// NamespaceUtil.wrapNamespace). It is idempotent: a resource that already
+// WrapNamespace prefixes a resource with the namespace. It is idempotent: a resource that already
 // carries the namespace, or any system resource, comes back unchanged.
 func WrapNamespace(namespace, resourceWithoutNamespace string) string {
 	if namespace == "" || resourceWithoutNamespace == "" {
@@ -109,8 +106,7 @@ func WrapNamespace(namespace, resourceWithoutNamespace string) string {
 	return prefix + namespace + NamespaceSeparator + plain
 }
 
-// WrapNamespaceAndRetry builds `%RETRY%<wrapNamespace(namespace, group)>`
-// (Java NamespaceUtil.wrapNamespaceAndRetry).
+// WrapNamespaceAndRetry builds `%RETRY%<wrapNamespace(namespace, group)>`.
 func WrapNamespaceAndRetry(namespace, consumerGroup string) string {
 	if consumerGroup == "" {
 		return consumerGroup
@@ -118,8 +114,8 @@ func WrapNamespaceAndRetry(namespace, consumerGroup string) string {
 	return RetryGroupTopicPrefix + WrapNamespace(namespace, consumerGroup)
 }
 
-// GetNamespaceFromResource extracts the namespace out of a resource name
-// (Java NamespaceUtil.getNamespaceFromResource); "" means "none".
+// GetNamespaceFromResource extracts the namespace out of a resource name;
+// "" means "none".
 func GetNamespaceFromResource(resource string) string {
 	if resource == "" || IsSystemResource(resource) {
 		return ""

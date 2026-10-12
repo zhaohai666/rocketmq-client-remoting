@@ -5,13 +5,13 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 通用工具（对应 org.apache.rocketmq.common.UtilAll，移植自 python/common/util_all.py）。
+ * 通用工具：时间格式化、十六进制串互转、本机 IP 探测、协议侧字符串哈希。
  */
 final class UtilAll
 {
-    /** Java 相同的日期格式化（PHP date() 格式，输出与 Python "%Y-%m-%d %H:%M:%S" 一致） */
+    /** 日志/轨迹用的时间戳格式：年-月-日 时:分:秒 */
     public const DATE_FORMAT = 'Y-m-d H:i:s';
-    /** Python "%Y-%m-%d %H:%M:%S.%f"（毫秒部分用 PHP 'v' 占位，秒后带 3 位毫秒） */
+    /** 带毫秒的时间戳格式：秒后用 'v' 占位输出 3 位毫秒 */
     public const DATE_FORMAT_SSS = 'Y-m-d H:i:s.v';
 
     public const HEX_ARRAY = '0123456789ABCDEF';
@@ -41,7 +41,7 @@ final class UtilAll
         if ($ts <= 0) {
             return '-';
         }
-        // Python 侧从 ts/1000 构造 datetime 再 strftime，默认格式不含毫秒，秒以下本就截断。
+        // 毫秒先截掉再格式化：默认格式本就不含秒以下部分。
         return date($pattern, intdiv($ts, 1000));
     }
 
@@ -66,7 +66,7 @@ final class UtilAll
     }
 
     /**
-     * 对应 Java：取字符串与整数的异或混淆（保持接口兼容）。
+     * 协议侧这个索引不需要混淆，原样返回（保留接口是为了调用方不改）。
      */
     public static function string2UnicodeShift(?string $index, int $offset): ?string
     {
@@ -79,7 +79,7 @@ final class UtilAll
     }
 
     /**
-     * Java UtilAll.bytes2string：逐字节转大写十六进制。
+     * 逐字节转**大写**十六进制。
      */
     public static function bytes2String(string $bs): string
     {
@@ -87,8 +87,8 @@ final class UtilAll
     }
 
     /**
-     * Java UtilAll.string2bytes：十六进制字符串 -> 字节（非 UTF-8 编码）。
-     * 与 Python 一致：按 len//2 成对解析（奇数位尾字符丢弃），非法字符抛 ValueError。
+     * 十六进制字符串 -> 字节（不是 UTF-8 解码）。
+     * 按 len//2 成对解析（奇数位尾字符丢弃），非法字符抛 ValueError。
      */
     public static function string2Bytes(?string $hexString): ?string
     {
@@ -130,7 +130,7 @@ final class UtilAll
         if ($ip !== '127.0.0.1') {
             return $ip;
         }
-        // Python：UDP 探测失败时 gethostbyname(gethostname())，再失败给 127.0.0.1
+        // UDP 探测失败时退回 gethostbyname(gethostname())，再失败给 127.0.0.1
         $host = gethostname();
         if ($host !== false) {
             $resolved = gethostbyname($host);
@@ -142,18 +142,17 @@ final class UtilAll
     }
 
     /**
-     * Java `String.hashCode()`：h = 31*h + ch，按 32 位有符号回绕。
+     * 协议侧字符串哈希：h = 31*h + ch 逐码元累加，结果按 32 位有符号回绕。
      *
-     * 必须显式实现：PHP 的内置 hash 与 Java 完全不同。用途之一：
-     * `SubscriptionData.codeSet`（Java `FilterAPI.buildSubscriptionData` 写入
-     * `tag.hashCode()`，broker 侧 `ExpressionMessageFilter.isMatchedByConsumeQueue`
-     * 按它过滤）。
+     * 必须显式实现：PHP 内置 hash 算出的数值与协议要求的完全不同，用错会让
+     * broker 的 tag 过滤永远不命中——消息照发照存，消费端静默收不到。
+     * 用途：`SubscriptionData.codeSet`（订阅 tag 的哈希集合）。
      *
-     * 按 Java 语义遍历 UTF-16 码元（mb_convert_encoding 到 UTF-16BE 后逐 2 字节取值）；
-     * 对 BMP 内字符（含全部 ASCII tag）与 Java/Python 移植版逐 code point 完全一致。
+     * 按 UTF-16 码元遍历（mb_convert_encoding 到 UTF-16BE 后逐 2 字节取值）；
+     * BMP 内字符（含全部 ASCII tag）与逐码点遍历结果相同。
      * 对拍向量：TagA=2598919、TagB=2598920、P=80、PA=2545、"*"=42。
      */
-    public static function javaStringHash(string $s): int
+    public static function wireStringHash(string $s): int
     {
         $u16 = mb_convert_encoding($s, 'UTF-16BE', 'UTF-8');
         $h = 0;

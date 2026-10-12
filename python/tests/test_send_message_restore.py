@@ -235,7 +235,7 @@ def test_sync_send_restores_the_namespaced_topic():
 
 
 # ---------------------------------------------------------------- 批量
-def test_batch_send_keeps_sub_message_topic_namespaced_like_java():
+def test_batch_send_keeps_sub_message_topic_namespaced():
     """批量是例外：Java ``batch()`` 拼完命名空间**不**还原，子消息 body 也不压缩。
 
     这里把差别钉住，免得日后有人"顺手"把批量也一起还原了 —— 那会与 Java 分道扬镳。

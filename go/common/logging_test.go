@@ -11,13 +11,14 @@ import (
 
 // 日志落盘与轮转的离线单测。
 //
-// 为什么必须单测：Java 客户端会生成 rocketmq_client.log，本仓库的对齐口径是「每个端都
-// 要真的写出文件、并且按大小轮转」。这两条在真机脚本里最多验证「有没有文件」，轮转窗口
+// 为什么必须单测：文件必须真的写出、并按大小轮转。真机脚本里最多验证
+// 「有没有文件」，轮转窗口
 // 要写满 64MB 才看得见 —— 只能离线用小上限造出来。
 //
 // 三条判据：
-//  1. 默认文件名是本端专属的 rocketmq_go_client.log，**不是** Java 的 rocketmq_client.log
-//     （同机跑 Java 客户端时两边会互相插行、并把对方的文件轮走，之后各自写进已 unlink 的 inode）；
+//  1. 默认文件名是本端专属的 rocketmq_go_client.log，**不用**跨语言共享的
+//     rocketmq_client.log（同机两个客户端进程共用一个文件时会互相插行、并把
+//     对方的文件轮走，之后各自写进已 unlink 的 inode）；
 //  2. OFF / NONE / 空串关掉文件落盘（只剩 stderr），USE_STDOUT 优先；
 //  3. 到大小就轮转，备份是固定窗口 <file>.1 … <file>.N，最老的一份被丢掉。
 
@@ -65,7 +66,7 @@ func TestLogDefaultsToPortSpecificFileName(t *testing.T) {
 		t.Fatalf("default log file = %q, want %q", got, defaultLogFile)
 	}
 	if filepath.Base(got) == "rocketmq_client.log" {
-		t.Fatal("must not share Java's rocketmq_client.log")
+		t.Fatal("must not share the language-neutral rocketmq_client.log")
 	}
 	data, err := os.ReadFile(got)
 	if err != nil {

@@ -1,8 +1,7 @@
 // -*- coding: utf-8 -*-
-// DefaultMQProducer — the default message producer (org.apache.rocketmq.client.producer.*).
-// Faithful port of python/client/producer.py built on top of MQClient.
+// DefaultMQProducer — the default message producer, built on top of MQClient.
 //
-// Send ordering (mirrors Java, enforced by the cross-port rules):
+// Send ordering:
 //   send() -> _send_default_impl (retry loop) -> _send_with_hooks (SendMessageHook before/after)
 //         -> sendKernelImpl (compress -> set UNIQ_KEY -> CheckForbiddenHook [NOT swallowed]
 //            -> build request -> resolve broker addr -> actual transport via MQClient).
@@ -79,8 +78,7 @@ export class SelectMessageQueueByRandom extends MessageQueueSelector {
 
 // SelectMessageQueueByMachineRoom picks the first queue whose brokerName
 // starts with arg (broker names are expected to be "<idc>-<broker>"); with no
-// match it falls back to the first queue. Mirrors Go's
-// SelectMessageQueueByMachineRoom and Java's producer-side room routing.
+// match it falls back to the first queue.
 export class SelectMessageQueueByMachineRoom extends MessageQueueSelector {
   select(_msgs: Message | Message[], mqList: MessageQueue[], arg: any): MessageQueue | null {
     if (mqList == null || mqList.length === 0) return null;
@@ -117,10 +115,10 @@ export class DefaultMQProducer {
   retryTimesWhenSendFailed: number;
   retryAnotherBrokerWhenNotStoreOK: boolean;
   namespace: string | null;
-  // Java ClientConfig#namespaceV2 — the SERVER-side namespace (Aliyun-style
-  // serverless instance id). When non-empty, NamespaceRpcHook stamps every
-  // request with nsd=true / ns=<value> extFields. Independent from
-  // `namespace`, which rewrites resource names on the client side.
+  // Server-side namespaceV2 (Aliyun-style serverless instance id). When
+  // non-empty, NamespaceRpcHook stamps every request with nsd=true / ns=<value>
+  // extFields. Independent from `namespace`, which rewrites resource names on
+  // the client side.
   namespaceV2: string | null;
   namesrvAddr: string | null;
   tlsEnable: boolean;
@@ -132,44 +130,41 @@ export class DefaultMQProducer {
   heartbeatIntervalMillis: number;
   autoBatch: boolean;
   enableTrace: boolean;
-  // Custom trace topic (Java setTraceTopicName); null = RMQ_SYS_TRACE_TOPIC.
+  // Custom trace topic; null = RMQ_SYS_TRACE_TOPIC.
   traceTopic: string | null;
   // Compression algorithm for oversized bodies: MessageSysFlag type value
-  // (1=LZ4, 2=ZSTD, 3=ZLIB). Default ZLIB for backward compatibility; Java 5.x
-  // defaults to LZ4. Select via setCompressType('ZLIB'|'LZ4'|'ZSTD').
+  // (1=LZ4, 2=ZSTD, 3=ZLIB). Default ZLIB for backward compatibility with
+  // older brokers. Select via setCompressType('ZLIB'|'LZ4'|'ZSTD').
   compressType: number;
-  // Java DefaultMQProducer.sendMessageWithVIPChannel (default false): send
-  // rpcs target the broker's VIP port (listen port - 2).
+  // When true, send rpcs target the broker's VIP port (listen port - 2).
+  // Default false.
   sendMessageWithVIPChannel: boolean;
-  // ASYNC retry budget (DefaultMQProducer.retryTimesWhenSendAsyncFailed, default 2):
-  // the first attempt is NOT counted — a value of 2 means up to 3 total attempts.
-  // Deliberately a SEPARATE knob from retryTimesWhenSendFailed: the async chain
-  // never reads the sync one (Java MQClientAPIImpl.sendMessageAsync/onExceptionImpl).
+  // ASYNC retry budget (default 2): the first attempt is NOT counted — a value
+  // of 2 means up to 3 total attempts. Deliberately a SEPARATE knob from
+  // retryTimesWhenSendFailed: the async chain never reads the sync one.
   retryTimesWhenSendAsyncFailed: number;
-  // Java DefaultMQProducer.compressLevel (Deflater.BEST_SPEED+... default 5):
-  // ZLIB compression level for oversized bodies. LZ4/ZSTD ignore it.
+  // ZLIB compression level for oversized bodies, 0-9 (default 5).
+  // LZ4/ZSTD ignore it.
   compressLevel: number;
-  // Java DefaultMQProducer.startDetectorEnable (via ClientConfig, default false):
-  // arms the MQFaultStrategy probe thread that re-checks isolated brokers.
+  // Arms the MQFaultStrategy probe thread that re-checks isolated brokers.
+  // Default false.
   startDetectorEnable: boolean;
-  // W3C traceparent passthrough switch (Java delegates this to an external
-  // OTel/SkyWalking hook); independent of enableTrace, seeded from
-  // ROCKETMQ_TRACE_CONTEXT_ENABLE like every other port.
+  // W3C traceparent passthrough switch. Independent of enableTrace, seeded
+  // from ROCKETMQ_TRACE_CONTEXT_ENABLE.
   enableTraceContext: boolean;
 
   client: MQClient | null;
   mqFaultStrategy: MQFaultStrategy;
   producerClientId: string;
-  // Message-trace dispatcher (Java AsyncTraceDispatcher) — created in start()
+  // Message-trace dispatcher — created in start()
   // only when enableTrace is on, torn down in shutdown().
   _traceDispatcher: AsyncTraceDispatcher | null;
   private _traceHook: SendMessageHook | null;
   private _recallTraceHook: any | null;
   private _accumulator: ProduceAccumulator | null;
-  // Async-send backpressure (Java DefaultMQProducer backPressureForAsyncSendNum
-  // / Size + the two fair semaphores built in initAsyncConfig). The gate is
-  // enableBackpressureForAsyncMode (Java DefaultMQProducer, default false) —
-  // with the gate off the semaphores are never consulted.
+  // Async-send backpressure: two fair semaphores gate the pending byte and
+  // message counts. The gate is enableBackpressureForAsyncMode (default false)
+  // — with the gate off the semaphores are never consulted.
   enableBackpressureForAsyncMode: boolean;
   backPressureForAsyncSendNum: number;
   backPressureForAsyncSendSize: number;
@@ -244,22 +239,22 @@ export class DefaultMQProducer {
   // ---- fluent config (mirror the consumer) ----
   setNamesrvAddr(addr: string): this { this.namesrvAddr = addr; return this; }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
-  // Java ClientConfig#setNamespaceV2/getNamespaceV2. The value is read live by
-  // the NamespaceRpcHook on every request, so setting it after start() takes
-  // effect too — exactly like Java.
+  // Server-side namespace accessor. The value is read live by the
+  // NamespaceRpcHook on every request, so setting it after start() takes
+  // effect too.
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setUnitName(name: string): this { this.unitName = name; return this; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
-  // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖），
-  // 对齐 PHP tlsOptions / Java TlsSystemConfig certPath 族。不设 caCert = test-mode。
+  // TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）。
+  // 不设 caCert = test-mode（信任自签）。
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
   setTraceTopic(topic: string): this { this.traceTopic = topic; return this; }
-  // compressType: 'ZLIB' | 'LZ4' | 'ZSTD' (Java DefaultMQProducer.setCompressType)
+  // compressType: 'ZLIB' | 'LZ4' | 'ZSTD'
   // or the raw MessageSysFlag type value (1/2/3).
   setCompressType(compressType: string | number): this {
     this.compressType = compressionTypeByName(compressType);
@@ -271,19 +266,19 @@ export class DefaultMQProducer {
   // ASYNC retry budget (first attempt not counted). Only the async chain reads it.
   setRetryTimesWhenSendAsyncFailed(n: number): this { this.retryTimesWhenSendAsyncFailed = n; return this; }
   getRetryTimesWhenSendAsyncFailed(): number { return this.retryTimesWhenSendAsyncFailed; }
-  // ZLIB compression level 0-9 (Java DefaultMQProducer.setCompressLevel, default 5).
+  // ZLIB compression level 0-9 (default 5).
   setCompressLevel(level: number): this { this.compressLevel = level; return this; }
   getCompressLevel(): number { return this.compressLevel; }
-  // Arms the MQFaultStrategy reachability probe (Java ClientConfig.startDetectorEnable).
+  // Arms the MQFaultStrategy reachability probe. Default off.
   setStartDetectorEnable(enable: boolean): this { this.startDetectorEnable = enable; return this; }
-  // Async-send backpressure gate (Java DefaultMQProducer.setEnableBackpressureForAsyncMode,
-  // default false): when off, the in-flight num/size semaphores are not consulted.
+  // Async-send backpressure gate (default false): when off, the in-flight
+  // num/size semaphores are not consulted.
   setEnableBackpressureForAsyncMode(enable: boolean): this { this.enableBackpressureForAsyncMode = enable; return this; }
   isEnableBackpressureForAsyncMode(): boolean { return this.enableBackpressureForAsyncMode; }
   setEnableTraceContext(enable: boolean): this { this.enableTraceContext = enable; return this; }
   isEnableTraceContext(): boolean { return this.enableTraceContext; }
 
-  // Runtime backpressure knobs (Java documents them as RUNTIME tunables).
+  // Runtime backpressure knobs — take effect on the live semaphores.
   setBackPressureForAsyncSendNum(num: number): this {
     this.backPressureForAsyncSendNum = num;
     this._semaphoreAsyncSendNum.setTotalPermits(num);
@@ -295,8 +290,8 @@ export class DefaultMQProducer {
     return this;
   }
 
-  // Acquire both async-send permits or throw synchronously (Java's bounded
-  // async queue rejects with RemotingTooMuchRequestException when full). A
+  // Acquire both async-send permits or throw synchronously: a bounded
+  // async queue rejects with RemotingTooMuchRequestException when full. A
   // partial acquisition is rolled back so permits never leak.
   private _acquireAsyncPermits(msg: Message): void {
     if (!this._semaphoreAsyncSendNum.tryAcquire()) {
@@ -331,7 +326,7 @@ export class DefaultMQProducer {
 
     const remotingClient = new RemotingClient({ tlsEnable: this.tlsEnable, tlsOptions: this.tlsOptions });
     this.client = new MQClient(clientId, this.namesrvAddr, remotingClient);
-    // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream ->
+    // RPC-hook registration order: Namespace -> Stream ->
     // user (ACL) hook -> DynamicalExtField. The namespace extFields must be
     // written BEFORE the ACL hook so the signature covers nsd/ns.
     registerRpcHooks(this.client.remotingClient, {
@@ -341,10 +336,9 @@ export class DefaultMQProducer {
     this.client.start();
     this.client.registerProducer(this.producerGroup, this);
     this.mqFaultStrategy = new MQFaultStrategy(this.sendLatencyFaultEnable);
-    // Fault-strategy probe thread (Java MQFaultStrategy implements StartAndShutdown;
-    // DefaultMQProducerImpl.start() calls startDetector()): resolver maps broker
-    // name -> publish addr, detector is a plain TCP connect probe. Both no-ops
-    // unless startDetectorEnable is turned on.
+    // Fault-strategy probe thread: MQFaultStrategy carries a start/stop
+    // detector; resolver maps broker name -> publish addr, detector is a plain
+    // TCP connect probe. Both are no-ops unless startDetectorEnable is turned on.
     if (this.startDetectorEnable) {
       this.mqFaultStrategy.setResolver((brokerName: string): string | null =>
         this.client != null ? this.client.findBrokerAddressInPublish(brokerName) : null);
@@ -352,8 +346,7 @@ export class DefaultMQProducer {
       this.mqFaultStrategy.setStartDetectorEnable(true);
     }
     this.mqFaultStrategy.startDetector();
-    // RequestFutureHolder housekeeping (Java DefaultMQProducerImpl.start() ->
-    // RequestFutureHolder.startScheduledTask): the TTL sweep that fails
+    // RequestFutureHolder housekeeping: the TTL sweep that fails
     // request-reply futures nobody will ever answer.
     REQUEST_FUTURE_HOLDER.startScheduledTask(this);
 
@@ -365,9 +358,8 @@ export class DefaultMQProducer {
       this._accumulator.start();
     }
 
-    // Message trace (Java DefaultMQProducerImpl.initTraceDispatcher + the
-    // DefaultMQProducer constructor registering SendMessageTraceHookImpl):
-    // without this wiring enableTrace is a silent no-op on the produce side.
+    // Message trace wiring: without this, enableTrace is a silent no-op on the
+    // produce side (SendMessageHook fires before/after every send).
     if (this.enableTrace) {
       try {
         const { AsyncTraceDispatcher } = await import('./trace_dispatcher.ts');
@@ -375,16 +367,15 @@ export class DefaultMQProducer {
         const dispatcher = new AsyncTraceDispatcher(
           this.producerGroup, 'PRODUCER', 10, this.traceTopic || undefined);
         dispatcher.setHostProducer(this);
-        // Java AsyncTraceDispatcher.start:155 — the namespace is propagated to
-        // the internal trace producer so its rpcs carry nsd/ns as well.
+        // Propagate the namespace to the internal trace producer so its rpcs
+        // carry nsd/ns as well.
         dispatcher.setNamespaceV2(this.namespaceV2);
         this._traceDispatcher = dispatcher;
         this._traceHook = new SendMessageTraceHookImpl(dispatcher);
         hookRegistry.registerSendMessageHook(this._traceHook);
-        // Java DefaultMQProducer also registers DefaultRecallMessageTraceHook
-        // (an RPCHook on the remoting client) here — recall rpcs get their own
-        // Recall trace records; gated on the
-        // com.rocketmq.recall.default.trace.enable sysprop, default off.
+        // Default recall-message trace hook (an RPCHook on the remoting
+        // client) — recall rpcs get their own Recall trace records. Gated on
+        // com.rocketmq.recall.default.trace.enable, default off.
         const { DefaultRecallMessageTraceHook } = await import('./trace_hook.ts');
         this._recallTraceHook = new DefaultRecallMessageTraceHook(dispatcher);
         this.client.remotingClient.registerRpcHook(this._recallTraceHook);
@@ -427,8 +418,8 @@ export class DefaultMQProducer {
 
   // ---- compression (algorithm selectable; degrade on failure, never throw) ----
   tryToCompressMessage(msg: Message): boolean {
-    // Java sendKernelImpl guards with `!(msg instanceof MessageBatch)` before
-    // compressing: the batch body is the aggregate envelope the broker splits
+    // sendKernelImpl guards compression with `!(msg instanceof MessageBatch)`:
+    // the batch body is the aggregate envelope the broker splits
     // back apart — compressing it would corrupt that contract.
     if (msg instanceof MessageBatch) return false;
     const body = msg.getBody();
@@ -449,7 +440,7 @@ export class DefaultMQProducer {
   }
 
   // ---- core send path ----
-  // Java DefaultMQProducerImpl.tryToFindTopicPublishInfo: first fetch the
+  // tryToFindTopicPublishInfo: first fetch the
   // EXACT topic route; only when that yields no usable info, retry via the
   // DEFAULT topic (TBW102) so the broker auto-creates on first send. The
   // fallback-derived info is tagged (`fromDefaultTopic`) so _sendDefaultImpl
@@ -514,7 +505,7 @@ export class DefaultMQProducer {
     return this.client.buildSendRequest(msg, mq, this.producerGroup, this.namespace);
   }
 
-  // Java MQClientAPIImpl wraps every send invoke with
+  // Every send invoke wraps the address with
   // MixAll.brokerVIPChannel(isVipChannelEnabled, addr).
   private _sendAddr(addr: string | null): string | null {
     if (addr == null) return null;
@@ -552,8 +543,8 @@ export class DefaultMQProducer {
     (msg as any)._sysFlag = sysFlag;
 
     // W3C traceparent passthrough (opt-in): a message without one gets a root
-    // span; a caller-propagated value is never overwritten. Java leaves this
-    // to an external OTel hook — the ports build the equivalent in, and it
+    // span; a caller-propagated value is never overwritten. This port builds the
+    // equivalent of an OTel hook inline, and it
     // runs in the same position (after the forbidden hooks, before the request
     // is built, so the trace hook sees the property).
     if (this.enableTraceContext) {
@@ -569,8 +560,7 @@ export class DefaultMQProducer {
     if (communicationMode === CommunicationMode.SYNC) {
       return this.client.sendMessage(addr, request, mq, this.sendMsgTimeout, msg);
     } else if (communicationMode === CommunicationMode.ASYNC) {
-      // Java MQClientAPIImpl.sendMessage(ASYNC) -> sendMessageAsync/onExceptionImpl:
-      // the ASYNC path owns its own retry chain (retryTimesWhenSendAsyncFailed,
+      // The ASYNC path owns its own retry chain (retryTimesWhenSendAsyncFailed,
       // shared time budget, re-select a queue that avoids the failed broker).
       this._sendAsyncKernel(msg, mq, tpInfo, sendCallback, request, addr);
       return null;
@@ -580,16 +570,15 @@ export class DefaultMQProducer {
     }
   }
 
-  // Async send retry chain (Java MQClientAPIImpl.sendMessageAsync + onExceptionImpl,
-  // MQClientAPIImpl.java:614-740). One logical send may issue up to
+  // Async send retry chain. One logical send may issue up to
   // 1 + retryTimesWhenSendAsyncFailed attempts against the SAME shared budget:
   //   - transport-level failures (timeout / send failure / connection closed)
   //     retry on a queue chosen to avoid the failed broker (needRetry=true);
   //   - a broker answer that fails response parsing (MQBrokerException — error
-  //     code) does NOT retry (needRetry=false, Java operationSucceed catch);
-  //   - a parsed SendResult is delivered as-is. Java's async chain never consults
-  //     retryAnotherBrokerWhenNotStoreOK (DefaultMQProducerImpl.java:799 is
-  //     sync-only) — FLUSH_DISK_TIMEOUT etc. go to the caller's onSuccess.
+  //     code) does NOT retry (needRetry=false);
+  //   - a parsed SendResult is delivered as-is. The async chain never consults
+  //     retryAnotherBrokerWhenNotStoreOK (that flag is sync-only) —
+  //     FLUSH_DISK_TIMEOUT etc. go to the caller's onSuccess.
   // Every attempt updates the fault item; when the budget or the retry budget
   // runs out the user callback fires exactly once with the error.
   private _sendAsyncKernel(
@@ -610,7 +599,7 @@ export class DefaultMQProducer {
         : self._sendAddr(self.client!.publishAddrFor(attemptMq));
       const attemptBegin = Date.now();
       const onExceptionImpl = (err: Error, needRetry: boolean, reachable: boolean): void => {
-        // Java async chain: callback failures mark isolation with reachable=true;
+        // Async chain: callback failures mark isolation with reachable=true;
         // a synchronous throw (never reached the transport) sets reachable=false.
         if (self.sendLatencyFaultEnable) {
           self.mqFaultStrategy.updateFaultItem(attemptMq.getBrokerName(), Date.now() - attemptBegin, true, reachable);
@@ -625,8 +614,9 @@ export class DefaultMQProducer {
           }
           logger.warning('async send msg by retry %d times. topic=%s, brokerName=%s, err=%s',
             times, msg.getTopic(), retryBrokerName != null ? retryBrokerName : '', err.message);
-          // Java reuses the request with a fresh request id (setOpaque(createNewRequestId())):
-          // a retried request must not collide with the old opaque in the response table.
+          // A retried request must reuse the request body but with a FRESH
+          // opaque id: the retried request must not collide with the old
+          // opaque in the response table.
           request.opaque = RemotingCommand.createNewRequestId();
           attempt(retryBrokerName, attemptMq, remaining);
         } else {
@@ -640,7 +630,7 @@ export class DefaultMQProducer {
       try {
         self.client!.sendMessageAsync(attemptAddr, request, attemptMq, budgetMs, (sr, err) => {
           if (err != null) {
-            // Java distinguishes transport failure (retry) from a broker answer
+            // Distinguish transport failure (retry) from a broker answer
             // that failed response parsing (MQBrokerException — no retry).
             onExceptionImpl(err, !(err instanceof MQBrokerException), true);
             return;
@@ -666,9 +656,9 @@ export class DefaultMQProducer {
     tpInfo: TopicPublishInfo,
   ): Promise<SendResult | null> {
     const ctx = new SendMessageContext(this.producerGroup, msg, mq, communicationMode, this.client!.publishAddrFor(mq));
-    // Java registers SendMessageHooks per producer; node's registry is global.
+    // This port's SendMessageHook registry is global, not per producer.
     // The inner trace producer opts out (_skipSendHooks) so trace-topic writes
-    // are not themselves traced (Java parity).
+    // are not themselves traced.
     const sendHooks: SendMessageHook[] = (this as any)._skipSendHooks
       ? [] : hookRegistry.sendMessageHooks;
     for (const hook of sendHooks) hook.sendMessageBefore(ctx);
@@ -694,9 +684,9 @@ export class DefaultMQProducer {
     sendCallback: SendCallback | null,
     timeoutMillis: number,
   ): Promise<SendResult | null> {
-    // Java sendDefaultImpl entry: Validators.checkMessage(msg, this.defaultMQProducer)
-    // — topic legality plus body null/empty/maxMessageSize (and the LMQ
-    // INNER_MULTI_DISPATCH separator rule) before any route lookup.
+    // Entry: Validators.checkMessage — topic legality plus body
+    // null/empty/maxMessageSize (and the LMQ INNER_MULTI_DISPATCH separator
+    // rule) before any route lookup.
     Validators.checkMessage(msg, this.maxMessageSize);
     this._checkLegalTopic(msg.getTopic());
     let tpInfo = await this._tryToFindTopicPublishInfo(msg.getTopic());
@@ -721,8 +711,8 @@ export class DefaultMQProducer {
     }
     let lastBrokerName: string | null = null;
     let sendResult: SendResult | null = null;
-    // Java: `timesTotal = SYNC ? 1 + retryTimesWhenSendFailed : 1` — only the
-    // SYNC path retries inside this loop. ASYNC owns its own chain
+    // Contract: `timesTotal = SYNC ? 1 + retryTimesWhenSendFailed : 1` — only
+    // the SYNC path retries inside this loop. ASYNC owns its own chain
     // (_sendAsyncKernel, retryTimesWhenSendAsyncFailed); ONEWAY never retries.
     const maxTimes = communicationMode === CommunicationMode.SYNC
       ? this.retryTimesWhenSendFailed + 1 : 1;
@@ -733,7 +723,7 @@ export class DefaultMQProducer {
       try {
         this.tryToCompressMessage(msg);
         sendResult = await this._sendWithHooks(msg, mq, communicationMode, sendCallback, tpInfo);
-        // Java semantics: ASYNC / ONEWAY succeed as soon as no exception was
+        // ASYNC / ONEWAY succeed as soon as no exception was
         // thrown (sendKernelImpl returns null for both); only SYNC uses the
         // SendResult as the retry-driving value.
         if (communicationMode === CommunicationMode.ASYNC || communicationMode === CommunicationMode.ONEWAY) {
@@ -781,9 +771,9 @@ export class DefaultMQProducer {
   }
 
   async sendAsync(msg: Message, sendCallback: SendCallback, timeoutMillis: number = this.sendMsgTimeout): Promise<void> {
-    // Async-send backpressure (Java initAsyncConfig + executeAsyncMessageSend):
-    // the two fair semaphores bound the in-flight async sends, but ONLY while
-    // enableBackpressureForAsyncMode is on (Java default false). A full
+    // Async-send backpressure: the two fair semaphores bound the in-flight
+    // async sends, but ONLY while enableBackpressureForAsyncMode is on
+    // (default false). A full
     // semaphore throws synchronously. Permits return when the transport-level
     // callback fires — exactly once — or when the send fails before reaching it.
     if (this.enableBackpressureForAsyncMode) {
@@ -808,7 +798,7 @@ export class DefaultMQProducer {
     }
   }
 
-  // Java sendSelectImpl: route lookup + selector pick + kernel send, shared by
+  // sendSelectImpl: route lookup + selector pick + kernel send, shared by
   // sendBySelector and the two selector-shaped request forms.
   async _sendSelectImpl(
     msg: Message,
@@ -818,7 +808,8 @@ export class DefaultMQProducer {
     sendCallback: SendCallback | null,
     timeoutMillis: number,
   ): Promise<SendResult | null> {
-    // Java sendSelectImpl: Validators.checkMessage before the route lookup.
+    // sendSelectImpl validates via Validators.checkMessage before the route
+    // lookup.
     Validators.checkMessage(msg, this.maxMessageSize);
     this._checkLegalTopic(msg.getTopic());
     const tpInfo = await this._tryToFindTopicPublishInfo(msg.getTopic());
@@ -849,7 +840,7 @@ export class DefaultMQProducer {
   }
 
   // ---- transaction ----
-  // Java shape: sendMessageInTransaction(msg, arg) resolves the listener from
+  // sendMessageInTransaction(msg, arg) resolves the listener from
   // the producer's own field; also accept it explicitly as the 2nd parameter.
   async sendMessageInTransaction(
     msg: Message,
@@ -863,7 +854,7 @@ export class DefaultMQProducer {
     MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.producerGroup);
     const sendResult = await this._sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeoutMillis);
     if (sendResult == null) throw new MQClientException('send half message failed');
-    // Java DefaultMQProducerImpl.sendMessageInTransaction: a listener exception
+    // sendMessageInTransaction contract: a listener exception
     // becomes ROLLBACK_MESSAGE (it never escapes); the half message must not
     // be left for the broker's check thread on a local failure we already know.
     let localState: number;
@@ -894,8 +885,9 @@ export class DefaultMQProducer {
     // (NOT=0 / COMMIT=8 / ROLLBACK=12), NOT the LocalTransactionState ordinal.
     // Sending the raw ordinal (COMMIT_MESSAGE=0) makes the broker read
     // TRANSACTION_NOT_TYPE — the half message is never committed and stays
-    // invisible until the (much later) check-back. Java maps the enum.
-    // ⚠ offset semantics (Java endTransaction, verified against 5.x):
+    // invisible until the (much later) check-back. The wire protocol requires
+    // the enum be mapped to the sys-flag value.
+    // ⚠ offset semantics on the endTransaction wire contract:
     //   - tranStateTableOffset = sendResult.queueOffset — the half message's
     //     offset in RMQ_SYS_TRANS_HALF_TOPIC's queue. @CFNotNull on the wire;
     //     the broker's checkPrepareMessage compares it to the half msg's
@@ -935,7 +927,7 @@ export class DefaultMQProducer {
     } catch (e) {
       logger.warn(`end transaction failed: ${(e as Error).message}`);
     }
-    // Trace: Java fires the EndTransactionTraceHook from endTransaction — the
+    // Trace: fire the EndTransactionTraceHook from endTransaction — the
     // EndTransaction record of a transaction message.
     if (this._traceDispatcher != null) {
       try {
@@ -948,11 +940,11 @@ export class DefaultMQProducer {
   }
 
   // ---- request-reply ----
-  // Java DefaultMQProducer surface: 3 sync forms (msg / msg+selector / msg+mq)
+  // Public surface: 3 sync forms (msg / msg+selector / msg+mq)
   // and 3 async forms (msg+callback / msg+selector+callback / msg+mq+callback).
   // prepareSendRequest: CORRELATION_ID + REPLY_TO_CLIENT (the requester's
   // clientId — the broker uses it to route the reply back via 326) + TTL, then
-  // make sure the topic route exists (Java prepares it so the ASYNC send does
+  // make sure the topic route exists (prepared eagerly so the ASYNC send does
   // not race a cold cache). The reply returns as a
   // PUSH_REPLY_MESSAGE_TO_CLIENT(326) push handled by
   // MQClient._registerReplyMessageProcessor.
@@ -968,8 +960,8 @@ export class DefaultMQProducer {
     }
   }
 
-  // Java waitResponse: the reply must arrive within (timeout - cost); a null
-  // reply distinguishes send-OK-but-reply-timeout from send-failure.
+  // waitResponse contract: the reply must arrive within (timeout - cost); a
+  // null reply distinguishes send-OK-but-reply-timeout from send-failure.
   async _waitResponse(msg: Message, timeoutMillis: number, future: RequestResponseFuture,
     cost: number): Promise<Message> {
     let timer: NodeJS.Timeout | null = null;
@@ -991,7 +983,7 @@ export class DefaultMQProducer {
     }
   }
 
-  // Sync request (Java request(msg, timeout), sendDefaultImpl ASYNC + wait).
+  // Sync request: request(msg, timeout) — sendDefaultImpl ASYNC + wait.
   async request(msg: Message, timeoutMillis: number = 3000): Promise<Message> {
     await this._prepareSendRequest(msg, timeoutMillis);
     const correlationId = msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID) as string;
@@ -1000,7 +992,7 @@ export class DefaultMQProducer {
     const begin = Date.now();
     try {
       await this._sendDefaultImpl(msg, CommunicationMode.ASYNC, (sr, err) => {
-        // Java SendCallback: only mark the request as sent — the caller is
+        // SendCallback contract: only mark the request as sent — the caller is
         // unblocked by the reply arrival, the timeout scan, or requestFail.
         if (err != null) {
           future.setSendRequestOk(false);
@@ -1016,8 +1008,7 @@ export class DefaultMQProducer {
     }
   }
 
-  // Sync request through a selector (Java request(msg, selector, arg, timeout) —
-  // sendSelectImpl ASYNC + wait).
+  // Sync request through a selector — sendSelectImpl ASYNC + wait.
   async requestBySelector(
     msg: Message,
     selector: MessageQueueSelector,
@@ -1045,8 +1036,7 @@ export class DefaultMQProducer {
     }
   }
 
-  // Sync request to a pinned queue (Java request(msg, mq, timeout) —
-  // sendKernelImpl ASYNC + wait).
+  // Sync request to a pinned queue — sendKernelImpl ASYNC + wait.
   async requestByMq(msg: Message, mq: MessageQueue, timeoutMillis: number = 3000): Promise<Message> {
     if (this.client == null) throw new MQClientException('producer not started');
     await this._prepareSendRequest(msg, timeoutMillis);
@@ -1056,7 +1046,7 @@ export class DefaultMQProducer {
     const begin = Date.now();
     try {
       this.tryToCompressMessage(msg);
-      // Java passes topicPublishInfo=null here — a failed attempt can only be
+      // topicPublishInfo=null here: a failed attempt can only be
       // retried on the SAME broker (no route to pick another one from).
       await this.sendKernelImpl(msg, mq, CommunicationMode.ASYNC, (sr, err) => {
         if (err != null) {
@@ -1073,7 +1063,7 @@ export class DefaultMQProducer {
     }
   }
 
-  // Async request (Java request(msg, requestCallback, timeout)). The callback
+  // Async request: request(msg, requestCallback, timeout). The callback
   // fires exactly once: on reply arrival, on the TTL sweep, or on send failure.
   requestAsync(msg: Message, requestCallback: RequestCallbackLike, timeoutMillis: number = 3000): void {
     void this._requestAsyncDefault(msg, requestCallback, timeoutMillis);
@@ -1101,7 +1091,7 @@ export class DefaultMQProducer {
         }
       }, timeoutMillis);
     } catch (e) {
-      // Pre-dispatch failure (no route / validation): Java routes it to the callback.
+      // Pre-dispatch failure (no route / validation) routes to the callback.
       future.setCause(e as Error);
       this._requestFail(correlationId);
     }
@@ -1181,7 +1171,7 @@ export class DefaultMQProducer {
     }
   }
 
-  // Java requestFail: remove the future, mark send-not-ok, fire the callback
+  // requestFail: remove the future, mark send-not-ok, fire the callback
   // (once) with the recorded cause.
   _requestFail(correlationId: string): void {
     const future = REQUEST_FUTURE_HOLDER.removeRequest(correlationId);
@@ -1202,7 +1192,7 @@ export class DefaultMQProducer {
     if (future != null) future.complete(replyMsg);
   }
 
-  // Java DefaultMQProducer.reply: build the reply from the request (topic =
+  // reply(): build the reply from the request (topic =
   // <cluster>_REPLY_TOPIC, REPLY_TO_CLIENT = the requestor's clientId — the
   // broker uses it to find the requestor's channel and push 326) and send it
   // through the normal send path.
@@ -1222,7 +1212,7 @@ export class DefaultMQProducer {
   }
 
   // ---- topic / offset helpers ----
-  // Java DefaultMQProducerImpl.createTopic: fetch the route of `key` from the
+  // createTopic: fetch the route of `key` from the
   // nameserver FIRST, then issue UPDATE_AND_CREATE_TOPIC to every master broker
   // in that route. Never rely on the client-side broker cache here — right
   // after start() it is empty and would wrongly report "no broker available".
@@ -1232,10 +1222,10 @@ export class DefaultMQProducer {
     const route = this.client.getTopicRouteData(key);
     const brokerDatas: any[] = (route as any)?.brokerDatas || [];
     let sent = false;
-    // Java DefaultMQAdminExtImpl.createAndUpdateTopicConfig sends the config
+    // createAndUpdateTopicConfig must send the config
     // to EVERY broker id in the route (master AND slaves) — a slave that never
     // receives it answers pull with "topic not exist", which kills slave-only
-    // consumption. Sending master-only was a node-port gap.
+    // consumption.
     for (const bd of brokerDatas) {
       const addrs: Record<string, string> = bd.brokerAddrs || {};
       for (const addr of Object.values(addrs)) {

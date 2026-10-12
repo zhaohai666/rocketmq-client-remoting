@@ -12,9 +12,9 @@
 //
 // ⚠ 两个必须保留的 Java 语义差异（否则编解码对不上）：
 //   1. CONTENT_SPLITOR = \x01、FIELD_SPLITOR = \x02，编码时**每条记录末尾补 FIELD_SPLITOR**；
-//      解码用 Java 的 String.split 语义（**丢弃末尾空串**）切分 —— 见 JavaSplit。
+//      解码用 Java 的 String.split 语义（**丢弃末尾空串**）切分 —— 见 LegacySplit。
 //   2. C# 的 string.Split(char) 会保留末尾空串（与 Java 不同），直接用它切分会把字段整体
-//      错位；本模块一律走 JavaSplit。
+//      错位；本模块一律走 LegacySplit。
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -80,7 +80,7 @@ public enum TraceMessageType
 /// 多出一个空记录、把字段整体错位（编码结果末尾正好补了 FIELD_SPLITOR）。这条差异是真金
 /// 白银的对拍坑，勿改成 string.Split。
 /// </summary>
-public static class JavaSplit
+public static class LegacySplit
 {
     public static List<string> Split(string value, string sep)
     {
@@ -159,7 +159,7 @@ public static class TraceDataEncoder
             return res;
         }
 
-        foreach (string context in JavaSplit.Split(traceData!, TraceConstants.FieldSplitor))
+        foreach (string context in LegacySplit.Split(traceData!, TraceConstants.FieldSplitor))
         {
             if (context.Length == 0)
             {
@@ -191,7 +191,7 @@ public static class TraceDataEncoder
     /// <summary>解一条轨迹记录（一段 FIELD_SPLITOR 之内）。无法识别时返回 null。</summary>
     private static TraceContext? DecodeContext(string context)
     {
-        List<string> line = JavaSplit.Split(context, TraceConstants.ContentSplitor);
+        List<string> line = LegacySplit.Split(context, TraceConstants.ContentSplitor);
         if (line.Count == 0)
         {
             return null;

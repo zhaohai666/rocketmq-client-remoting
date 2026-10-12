@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""请求码 / 响应码 / 语言码 / 序列化类型（对应 org.apache.rocketmq.remoting.protocol 枚举与常量）。"""
+"""请求码 / 响应码 / 语言码 / 序列化类型（协议 rocketmq.remoting.protocol 枚举与常量）。"""
 from __future__ import annotations
 
 from typing import Optional
@@ -184,7 +184,7 @@ class RemotingSysResponseCode:
 
 
 class ResponseCode(RemotingSysResponseCode):
-    """与 Java 对齐：org.apache.rocketmq.remoting.protocol.ResponseCode extends RemotingSysResponseCode。"""
+    """协议继承结构：ResponseCode extends RemotingSysResponseCode。"""
     FLUSH_DISK_TIMEOUT = 10
     SLAVE_NOT_AVAILABLE = 11
     FLUSH_SLAVE_TIMEOUT = 12
@@ -244,7 +244,7 @@ class ResponseCode(RemotingSysResponseCode):
     LITE_SUBSCRIPTION_QUOTA_EXCEEDED = 2018
     USER_NOT_EXIST = 3001
     POLICY_NOT_EXIST = 3002
-    # 客户端侧伪响应码（Java ResponseCode 中的负值常量）
+    # 客户端侧伪响应码（协议 ResponseCode 中的负值常量）
     RPC_UNKNOWN = -1000
     RPC_ADDR_IS_NULL = -1002
     RPC_SEND_TO_CHANNEL_FAILED = -1004
@@ -252,7 +252,7 @@ class ResponseCode(RemotingSysResponseCode):
 
 
 class LanguageCode:
-    """语言枚举（与 Java LanguageCode 的 byte 码一致）。"""
+    """语言枚举（与协议 LanguageCode 的 byte 码一致）。"""
     JAVA = 0
     CPP = 1
     DOTNET = 2

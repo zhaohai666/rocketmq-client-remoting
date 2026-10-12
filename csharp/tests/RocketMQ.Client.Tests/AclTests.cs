@@ -51,7 +51,7 @@ public class AclTests
 
     // ---------------------------------------------------------------- V1: 多字段 + body，无 token
     [Fact]
-    public void V1_ContentAndSignatureMatchJava()
+    public void V1_ContentAndSignatureMatchLegacy()
     {
         RemotingCommand cmd = MakeRequest(V1Ext(), V1Body());
         new AclClientRPCHook(new SessionCredentials("AK_TEST", SecretKey))
@@ -84,7 +84,7 @@ public class AclTests
 
     // ---------------------------------------------------------------- V3: 无 body
     [Fact]
-    public void V3_WithoutBodyMatchesJava()
+    public void V3_WithoutBodyMatchesLegacy()
     {
         RemotingCommand cmd = MakeRequest(new[] { ("a", "1"), ("b", "2") });
         new AclClientRPCHook(new SessionCredentials("AK", "SK"))
@@ -193,7 +193,7 @@ public class AclTests
 
     /// 传输层只有一槽，顺序靠 RequestHooks.Compose 还原；这里锁住它返回的形状。
     [Fact]
-    public void ComposeFollowsJavaHookOrder()
+    public void ComposeFollowsLegacyHookOrder()
     {
         var acl = new AclClientRPCHook(new SessionCredentials("AK", "SK"));
 

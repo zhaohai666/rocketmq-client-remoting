@@ -143,7 +143,7 @@ public class ConsumeExecutorTests
     }
 
     [Fact]
-    public void ThreadNamesFollowJavaThreadFactoryImpl()
+    public void ThreadNamesFollowLegacyThreadFactoryImpl()
     {
         // Java ThreadFactoryImpl：序号从 **1** 开始、分隔符由调用方给（AsyncSenderExecutor_1…）
         var ex = new ConsumeExecutor(2, 2, keepAliveSeconds: 30, "AsyncSenderExecutor",
@@ -234,7 +234,7 @@ public class ConsumeExecutorTests
     // ------------------------------------------------ 消费者侧（不联网）
 
     [Fact]
-    public void JavaDefaults()
+    public void LegacyDefaults()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
         Assert.Equal(20, c.ConsumeThreadMin);       // Java consumeThreadMin 默认 20 (:162)
@@ -263,7 +263,7 @@ public class ConsumeExecutorTests
     }
 
     [Fact]
-    public void DefaultMaxIsJava5xTwentyNot4xSixtyFour()
+    public void DefaultMaxIsTwentyNotSixtyFour()
     {
         // 回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
         // Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），

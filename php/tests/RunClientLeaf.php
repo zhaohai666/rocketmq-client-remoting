@@ -384,7 +384,7 @@ final class RunClientLeaf
         $this->checkSame('RH', $r2->getRecallHandle(), 'setRecallHandle');
         $r2->setTraceOn(false);
         $this->check(false === $r2->isTraceOn(), 'setTraceOn(false)');
-        // 参数类型为 ?string，传 null 合法（Java 字段可空同此）：清空 transactionId
+        // 参数类型为 ?string，传 null 合法（协议字段可空）：清空 transactionId
         $this->check($this->capture(static fn() => $r2->setTransactionId(null)) === null, 'setTransactionId(null) 不抛（?string 合法）');
         $this->checkSame(null, $r2->getTransactionId(), 'setTransactionId(null) 清空字段');
         $this->check(str_contains((string) $r2, 'SendResult [sendStatus='), '__toString 形态');
@@ -466,7 +466,7 @@ final class RunClientLeaf
         $this->checkSame(-1, $oc->suspendCurrentQueueTimeMillis, 'ConsumeOrderlyContext 默认 suspend=-1');
         $this->checkSame(null, $oc->messageQueue, 'ConsumeOrderlyContext 默认 mq=null');
 
-        // consumeStatusName（Java status.toString() 形态 = 裸枚举成员名）
+        // consumeStatusName（形态 = 裸枚举成员名）
         $this->checkSame('CONSUME_SUCCESS', consumeStatusName(ConsumeConcurrentlyStatus::CONSUME_SUCCESS), 'consumeStatusName 并发成功');
         $this->checkSame('RECONSUME_LATER', consumeStatusName(ConsumeConcurrentlyStatus::RECONSUME_LATER), 'consumeStatusName 并发重投');
         $this->checkSame('SUSPEND_CURRENT_QUEUE_A_MOMENT', consumeStatusName(ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT), 'consumeStatusName 顺序挂起');
@@ -716,7 +716,7 @@ final class RunClientLeaf
         $this->checkClose(7.0, $snap['consumeRTMax'], 5.0, 'consumeRTMax≈7');
         $this->checkClose(3.0, $snap['consumeRTMin'], 5.0, 'consumeRTMin≈3');
         $this->checkClose(10.0, $snap['consumeRTSum'], 8.0, 'consumeRTSum≈10');
-        // 失败不计入 consumeCount（与 Python/Java 一致）：sum≈10 / count=1 → avg≈10
+        // 失败不计入 consumeCount（统计只算成功）：sum≈10 / count=1 → avg≈10
         $this->checkClose(10.0, $snap['consumeRTAvg'], 5.0, 'consumeRTAvg≈10');
 
         $this->check($m->recordConsumeStart() > 0, 'recordConsumeStart 返回毫秒时间戳');
@@ -767,7 +767,7 @@ final class RunClientLeaf
         $this->check(false === $s2->tryAcquire(2, 0), '缩容后额度不足拒绝');
         $this->check(true === $s2->tryAcquire(1, 0), '缩容后剩余额度可用');
 
-        // 负空闲额度（Java new Semaphore(负数) 同样接受）
+        // 负空闲额度（信号量接受负余量）
         $s3 = new FairSemaphore(2);
         $s3->tryAcquire(2, 0);              // free 0
         $s3->setTotalPermits(0);            // free += 0-2 = -2
@@ -876,7 +876,7 @@ final class RunClientLeaf
         $this->checkClientError(static fn() => Validators::checkTopic(str_repeat('a', 128)), null, 'longer than topic max length 127', 'checkTopic 超长(128)');
         $this->check($this->capture(static fn() => Validators::checkTopic(str_repeat('a', 127))) === null, 'checkTopic 长度 127 合法');
         $this->checkClientError(static fn() => Validators::checkTopic('topic$bad'), null, 'contains illegal characters', 'checkTopic 非法字符');
-        // 中文字符长度按 UTF-8 码点计数（Python len() 语义）：
+        // 中文字符长度按 UTF-8 码点计数：
         // 60 个中文 = 60 码点 ≤ 127 → 走字符表分支；若按字节(180)会误判超长
         $this->checkClientError(static fn() => Validators::checkTopic(str_repeat('中', 60)), null, 'contains illegal characters', 'checkTopic 60 中文按码点不超长');
         $this->checkClientError(static fn() => Validators::checkTopic(str_repeat('中', 130)), null, 'longer than topic max length 127', 'checkTopic 130 中文按码点超长');

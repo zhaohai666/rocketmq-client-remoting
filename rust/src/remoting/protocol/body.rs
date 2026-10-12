@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_and_unlock_batch_bodies_use_java_field_order() {
+    fn lock_and_unlock_batch_bodies_use_wire_field_order() {
         let body = LockBatchRequestBody {
             consumer_group: Some("GID_BodyGolden".into()),
             client_id: Some("client-1@127.0.0.1".into()),
@@ -1576,15 +1576,15 @@ mod tests {
     }
 
     #[test]
-    fn consumer_running_info_accepts_java_inline_object_keys() {
+    fn consumer_running_info_accepts_server_inline_object_keys() {
         // fastjson2 真机输出（非法 JSON），Python 的 _FastJsonParser 与 Rust 都能读
-        let java = concat!(
+        let wire = concat!(
             r#"{"properties":{"PROP_CONSUME_TYPE":"CONSUME_PASSIVELY"},"subscriptionSet":[],"#,
             r#""mqTable":{{"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"}:"#,
             r#"{"commitOffset":42,"cachedMsgCount":1,"droped":false}},"#,
             r#""statusTable":{"BodyGoldenTopic":{"pullRT":1.5,"consumeFailedMsgs":2}}}"#
         );
-        let info = ConsumerRunningInfo::decode(java.as_bytes()).unwrap();
+        let info = ConsumerRunningInfo::decode(wire.as_bytes()).unwrap();
         assert_eq!(info.mq_table.len(), 1);
         assert_eq!(
             info.mq_table[0].0,
@@ -1667,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_offset_body_round_trips_inline_keys_and_java_wire() {
+    fn reset_offset_body_round_trips_inline_keys_and_server_wire() {
         let body = ResetOffsetBody {
             offset_table: vec![
                 (MessageQueueKey::new("BodyGoldenTopic", "broker-a", 0), 10),
@@ -1681,11 +1681,11 @@ mod tests {
         );
         assert_eq!(ResetOffsetBody::decode(&body.encode()).unwrap(), body);
         // Java 真机报文（裸内联对象键；位点写成字符串也认，对齐 Python 的 int(v)）
-        let java = concat!(
+        let wire = concat!(
             r#"{"offsetTable":{{"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"}:10,"#,
             r#"{"brokerName":"broker-a","queueId":1,"topic":"BodyGoldenTopic"}:"20"}}"#
         );
-        assert_eq!(ResetOffsetBody::decode(java.as_bytes()).unwrap(), body);
+        assert_eq!(ResetOffsetBody::decode(wire.as_bytes()).unwrap(), body);
         assert_eq!(
             GetConsumerStatusBody::default().to_json_value(),
             py(r#"{"messageQueueTable":{},"consumerTable":{}}"#)
@@ -1693,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_offset_body_for_c_array_round_trips_and_java_wire() {
+    fn reset_offset_body_for_c_array_round_trips_and_server_wire() {
         let body = ResetOffsetBodyForC {
             offset_table: vec![
                 MessageQueueForC {
@@ -1717,11 +1717,11 @@ mod tests {
         );
         assert_eq!(ResetOffsetBodyForC::decode(&body.encode()).unwrap(), body);
         // Java 真机报文：字段名 topic/brokerName/queueId/offset，位置与声明序无关
-        let java = concat!(
+        let wire = concat!(
             r#"{"offsetTable":[{"offset":10,"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"},"#,
             r#"{"topic":"BodyGoldenTopic","queueId":1,"brokerName":"broker-a","offset":20}]}"#
         );
-        assert_eq!(ResetOffsetBodyForC::decode(java.as_bytes()).unwrap(), body);
+        assert_eq!(ResetOffsetBodyForC::decode(wire.as_bytes()).unwrap(), body);
         // 两条形状互不允许：map 体喂给 ForC 只会报错（反之亦然，见
         // malformed_bodies_return_decode_errors）
         assert!(matches!(
@@ -1751,11 +1751,11 @@ mod tests {
             GetConsumerStatusBody::decode(text.as_bytes()).unwrap(),
             body
         );
-        let java = concat!(
+        let wire = concat!(
             r#"{"messageQueueTable":{{"brokerName":"b","queueId":0,"topic":"T"}:7},"#,
             r#""consumerTable":{"c1":{{"brokerName":"b","queueId":1,"topic":"T"}:8}}}"#
         );
-        let back = GetConsumerStatusBody::decode(java.as_bytes()).unwrap();
+        let back = GetConsumerStatusBody::decode(wire.as_bytes()).unwrap();
         assert_eq!(back.message_queue_table[0].1, 7);
         assert_eq!(back.consumer_table[0].0, "c1");
         assert_eq!(back.consumer_table[0].1[0].0.queue_id, 1);
@@ -1885,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn message_queue_value_text_is_java_declaration_order() {
+    fn message_queue_value_text_is_server_declaration_order() {
         let mq = MessageQueueKey::new("BodyGoldenTopic", "broker-a", 3);
         assert_eq!(
             json_of(&message_queue_value(&mq)),

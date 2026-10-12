@@ -7,25 +7,21 @@ namespace RocketMQ\Common;
 use RocketMQ\Client\Exceptions\MQClientException;
 
 /**
- * 定时消息的撤回句柄（对应 org.apache.rocketmq.common.producer.RecallMessageHandle，
- * 移植自 recall_message_handle.py）。
+ * 定时消息的撤回句柄：broker 发回来的凭据，撤回时原样带回。
  *
  * 句柄不是客户端自己造的：发送带 ``TIMER_DELIVER_MS`` / ``TIMER_DELAY_MS`` / ``TIMER_DELAY_SEC``
  * 的定时消息时，broker 在 ``SendMessageProcessor#attachRecallHandle`` 里把这个句柄挂到
  * SEND 响应头的 ``recallHandle`` 字段上返回，客户端只负责原样带回去调用 ``recallMessage``。
  * 因此普通消息的响应里根本没有这个字段。
  *
- * 编码格式与 Java 完全一致：``base64url("v1 <topic> <brokerName> <timestampStr> <messageId>")``，
+ * 编码格式由服务端约定锁死：``base64url("v1 <topic> <brokerName> <timestampStr> <messageId>")``，
  * 5 段、空格分隔。
  *
- * 与 Java 的两处显式差异：
- *   * Java ``buildHandle`` 用 ``Base64.getUrlEncoder()``（**带** ``=`` 填充），
- *     ``decodeHandle`` 用 ``getUrlDecoder()``（严格，无填充串会抛错）。这里编码同样带填充，
- *     解码则两种都吃：其他客户端移植版用无填充解码器，只发无填充句柄的客户端写下的
- *     消息也要能撤回。
- *   * Java 解码失败抛 ``DecoderException``，``DefaultMQProducerImpl#recallMessage`` 再包成
- *     ``MQClientException(e.getMessage())``。PHP 侧直接抛 ``MQClientException``，
- *     文案仍是 Java 的 ``"recall handle is invalid"``。
+ * 两处刻意的处理：
+ *   * 编码带 ``=`` 填充（服务端回包里的句柄就是带填充的形式）；解码则带/不带填充
+ *     都吃——只发无填充句柄的写方留下的消息也要能撤回。
+ *   * 解码失败直接抛 ``MQClientException``，文案固定为
+ *     ``"recall handle is invalid"``：调用方按这条文案匹配错误，不能改。
  */
 final class RecallMessageHandle
 {
@@ -34,7 +30,7 @@ final class RecallMessageHandle
     public const INVALID_HANDLE = 'recall handle is invalid';
 
     /**
-     * 对应 Java ``RecallMessageHandle.buildHandle``（带 ``=`` 填充，与 Java 一致）。
+     * 拼句柄：5 段空格连接后 base64url 编码，**带** ``=`` 填充。
      */
     public static function buildHandle(string $topic, string $brokerName, string $timestampStr, string $messageId): string
     {
@@ -43,7 +39,7 @@ final class RecallMessageHandle
     }
 
     /**
-     * 对应 Java ``RecallMessageHandle.decodeHandle``，见类注释的容忍度差异。
+     * 解句柄：任何非法输入都抛 ``MQClientException``，见类注释的容忍度说明。
      */
     public static function decodeHandle(string $handle): HandleV1
     {
@@ -63,19 +59,18 @@ final class RecallMessageHandle
         if (count($items) < 5 || $items[0] !== self::VERSION_1) {
             throw new MQClientException(self::INVALID_HANDLE);
         }
-        // Java 取 items[1..4]，多余的分段直接忽略（"v1 t b ts id extra" 仍然合法）。
+        // 只取 1..4 段，多余的分段直接忽略（"v1 t b ts id extra" 仍然合法）。
         return new HandleV1($items[1], $items[2], $items[3], $items[4]);
     }
 
     private static function b64UrlEncode(string $raw): string
     {
-        // 保留 "=" 填充（Java Base64.getUrlEncoder() / Python urlsafe_b64encode 同样带填充）
+        // 保留 "=" 填充：服务端回包里的句柄就带填充
         return strtr(base64_encode($raw), '+/', '-_');
     }
 
     /**
-     * base64url 解码：编码侧带 ``=`` 填充（与 Java getUrlEncoder 一致），解码侧
-     * 兼容带/不带填充两种输入。
+     * base64url 解码：编码侧带 ``=`` 填充，解码侧兼容带/不带填充两种输入。
      */
     private static function b64UrlDecode(string $handle): ?string
     {

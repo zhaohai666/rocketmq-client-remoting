@@ -14,8 +14,8 @@ namespace rocketmq {
 
 namespace {
 
-// ConsumeReturnType 名字 -> ordinal（顺序即 Java ConsumeReturnType 的 ordinal，
-// 轨迹 SubAfter 的 contextCode 用的正是它）。未知名字退化为 SUCCESS(0)。
+// ConsumeReturnType 名字 -> ordinal（顺序即协议里 ConsumeReturnType 的枚举序号，
+// 轨迹 SubAfter 的 contextCode 用的正是它，不可重排）。未知名字退化为 SUCCESS(0)。
 int32_t consumeReturnTypeOrdinal(const std::string& name) {
     if (name == "SUCCESS") return 0;
     if (name == "TIME_OUT") return 1;
@@ -60,7 +60,7 @@ void SendMessageTraceHook::sendMessageAfter(SendMessageContext& context) {
     if (context.mqTraceContext == nullptr) return;
     if (context.sendResult == nullptr) return;
     const SendResult& result = *context.sendResult;
-    // broker 侧 traceOn=false 或没带回 region 时不落库（对齐 Java）
+    // broker 侧 traceOn=false 或没带回 region 时不落库
     if (result.regionId.empty() || !result.traceOn) return;
 
     TraceContext& traceContext = *context.mqTraceContext;
@@ -91,8 +91,7 @@ void ConsumeMessageTraceHook::consumeMessageBefore(ConsumeMessageContext& contex
 
     std::vector<TraceBean> beans;
     for (const MessageExt& msg : context.msgList) {
-        // Java 只跳过 null（C++ 的 vector 里没有 null，故不额外过滤），
-        // 也不按空 topic 跳过 —— 与 Python 参考实现保持一致。
+        // 只按消息级开关过滤：不按空 topic 跳过（C++ 的 vector 里没有 null 元素）。
         std::string traceOn = msg.getProperty(TraceConstants::PROPERTY_TRACE_SWITCH);
         if (traceOn == "false") continue;  // 消息级关闭轨迹
         TraceBean bean;
@@ -104,7 +103,7 @@ void ConsumeMessageTraceHook::consumeMessageBefore(ConsumeMessageContext& contex
         bean.bodyLength = msg.storeSize;
         bean.retryTimes = msg.reconsumeTimes;
         std::string region = msg.getProperty(MessageConst::PROPERTY_MSG_REGION);
-        traceContext->regionId = region;   // 逐条覆盖（最后一条生效，对齐 Python/Java）
+        traceContext->regionId = region;   // 逐条覆盖，最后一条生效
         beans.push_back(bean);
     }
     if (!beans.empty()) {
@@ -134,7 +133,7 @@ void ConsumeMessageTraceHook::consumeMessageAfter(ConsumeMessageContext& context
     subAfter->costTime = costTime;
     subAfter->traceBeans = subBefore.traceBeans;      // 同一批消息，msgId 沿用 offset 侧 ID
 
-    // props 里放的是 ConsumeReturnType 的**名字**（Java 按名查 ordinal），未知退化为 SUCCESS。
+    // props 里放的是 ConsumeReturnType 的**名字**（消费端按名查 ordinal），未知退化为 SUCCESS。
     subAfter->contextCode = consumeReturnTypeOrdinal(context.props);
 
     dispatcher_->append(subAfter);

@@ -7,7 +7,7 @@ declare(strict_types=1);
  *
  * 覆盖：AllocationHelper（mqSortKey / safeHookName / clientSideTagFilter /
  * executeFilterHooks / filterMessagesForDelivery / strategyName /
- * javaMessageQueueString / javaSplit）、MessageSelector、MessageQueueListener、
+ * wireQueueKeyString / wireSplit）、MessageSelector、MessageQueueListener、
  * AllocateMessageQueueStrategy 六种实现（AVG / AVG_BY_CIRCLE / CONFIG /
  * CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY）、一致性哈希环
  * （MD5Hash / ClientNode / VirtualNode / ConsistentHashRouter）。
@@ -308,7 +308,7 @@ final class RunClientAllocation
         $mq = new MessageQueue('T', 'b', 3);
         $this->checkSame(['T', 'b', 3], AllocationHelper::mqSortKey($mq), 'mqSortKey 返回 (topic, brokerName, queueId) 三元组');
 
-        // 打乱后按 key 排序 → topic → brokerName → queueId（Java compareTo 语义）
+        // 打乱后按 key 排序 → topic → brokerName → queueId（三级字典序比较）
         $list = [
             new MessageQueue('T2', 'b1', 0),
             new MessageQueue('T1', 'b2', 5),
@@ -431,7 +431,7 @@ final class RunClientAllocation
         $this->checkSame(1, $hook->calls, '有钩子且过滤后非空 → 钩子执行');
         $this->checkSame('G1', $hook->last->consumerGroup, 'FilterMessageContext.consumerGroup');
         $this->checkSame($mq, $hook->last->mq, 'FilterMessageContext.mq');
-        $this->check(true === $hook->last->unitMode, 'FilterMessageContext.unitMode 默认参数透传（Java:640）');
+        $this->check(true === $hook->last->unitMode, 'FilterMessageContext.unitMode 默认参数透传');
         $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $hook->last->msgList), '钩子拿到的是过滤后的列表');
         $this->checkSame(['TagA'], array_map(fn (MessageExt $m) => $m->getTags(), $out), '返回值 = 过滤结果');
 
@@ -514,7 +514,7 @@ final class RunClientAllocation
         $s = new AllocateMessageQueueAveragely();
         $this->checkSame('AVG', $s->getName(), 'AVG.getName');
 
-        // 守卫（Java check 抛 IllegalArgumentException → 这里返回 []）
+        // 守卫（入参非法时不抛异常，直接返回 []）
         $this->checkSame([], $s->allocate('G', '', $this->mqs(8), ['c0', 'c1']), 'AVG currentCID 为空 → []');
         $this->checkSame([], $s->allocate('G', 'c0', [], ['c0']), 'AVG mqAll 空 → []');
         $this->checkSame([], $s->allocate('G', 'c0', $this->mqs(8), []), 'AVG cidAll 空 → []');
@@ -634,7 +634,7 @@ final class RunClientAllocation
         // md5("hello") = 5d41402abc4b2a76b9719d911017c592 → 0x5D41402A
         $this->checkSame(0x5D41402A, $h->hash('hello'), 'MD5Hash("hello")=0x5D41402A');
         // md5("MessageQueue [topic=T, brokerName=b, queueId=0]") = 218a9c35... → 0x218A9C35
-        $this->checkSame(0x218A9C35, $h->hash('MessageQueue [topic=T, brokerName=b, queueId=0]'), 'MD5Hash(java toString 形态) 向量');
+        $this->checkSame(0x218A9C35, $h->hash('MessageQueue [topic=T, brokerName=b, queueId=0]'), 'MD5Hash(队列键串形态) 向量');
         $this->checkSame(2898073819, $h->hash('foo'), 'MD5Hash 结果是 32bit 无符号十进制（0xACBD18DB）');
         $this->check(true === $h->hash('foo') >= 0, 'MD5Hash 恒非负');
 
@@ -663,14 +663,14 @@ final class RunClientAllocation
         $this->checkSame(null, $router->routeNode('anything'), '空环 routeNode → null');
         $this->checkSame(null, (new ConsistentHashRouter())->routeNode('x'), '默认构造（无节点）routeNode → null');
 
-        // vNodeCount 负数 → ValueError（Python ValueError 语义）
+        // vNodeCount 负数 → ValueError（构造守卫拒绝负值）
         $router = new ConsistentHashRouter();
         $this->checkThrows(fn () => $router->addNode(new ClientNode('c'), -1), \ValueError::class, 'addNode vNodeCount<0 → ValueError');
 
         // 基本路由：hash 落在哪个物理节点的弧段
         $r = new ConsistentHashRouter([new ClientNode('a'), new ClientNode('b'), new ClientNode('c')], 5, new FirstCharHash());
-        $node = $r->routeNode('a-0'); // hash=ord('a')=97，环上有 a-0 的 hash=97 → 归 a（tailMap 含端点）
-        $this->checkSame('a', $node->getKey(), 'routeNode 端点相等归自己（tailMap 含端点）');
+        $node = $r->routeNode('a-0'); // hash=ord('a')=97，环上有 a-0 的 hash=97 → 归 a（有序环取首个 ≥ 目标，含端点）
+        $this->checkSame('a', $node->getKey(), 'routeNode 端点相等归自己（首个 ≥ 命中含端点）');
         $node = $r->routeNode('b-9'); // hash=ord('b')=98 → 归 b
         $this->checkSame('b', $node->getKey(), 'routeNode 命中 b 节点');
         $node = $r->routeNode('z-1'); // hash=ord('z')=122 > 全环 → 回绕到首节点
@@ -697,7 +697,7 @@ final class RunClientAllocation
         $r2->removeNode($a); // 再删一次 no-op
         $this->checkSame(3, $r2->getExistingReplicas(new ClientNode('b')), 'removeNode 幂等');
 
-        // 同 hash 覆盖（Java TreeMap.put：后来者覆盖，位置不变）
+        // 同 hash 覆盖（有序 map：后来者覆盖值，环上位置不变）
         $r3 = new ConsistentHashRouter([], 1, new ConstantHash(42));
         $r3->addNode(new ClientNode('p1'), 1);
         $r3->addNode(new ClientNode('p2'), 1);
@@ -719,36 +719,36 @@ final class RunClientAllocation
         $r5 = new ConsistentHashRouter([new ClientNode('only')], 1);
         $this->checkSame('only', $r5->routeNode('k')->getKey(), '单节点环任意 key 路由');
         $r5b = new ConsistentHashRouter([new ClientNode('only')], 0);
-        $this->checkSame(null, $r5b->routeNode('k'), 'vNodeCount=0 → 环空 → null（对齐 Python 语义）');
+        $this->checkSame(null, $r5b->routeNode('k'), 'vNodeCount=0 → 环空 → null');
     }
 
-    // ==================================================================== javaMessageQueueString / javaSplit
+    // ==================================================================== wireQueueKeyString / wireSplit
 
-    private function testJavaCompat(): void
+    private function testWireFormatCompat(): void
     {
-        // 逐字符对齐 Java MessageQueue#toString
+        // 队列键串格式 MessageQueue [topic=…, brokerName=…, queueId=…]，逐字符固定
         $this->checkSame(
             'MessageQueue [topic=TopicTest, brokerName=broker-a, queueId=3]',
-            AllocationHelper::javaMessageQueueString(new MessageQueue('TopicTest', 'broker-a', 3)),
-            'javaMessageQueueString 逐字符对齐 Java'
+            AllocationHelper::wireQueueKeyString(new MessageQueue('TopicTest', 'broker-a', 3)),
+            'wireQueueKeyString 逐字符固定'
         );
         $this->checkSame(
             'MessageQueue [topic=, brokerName=, queueId=0]',
-            AllocationHelper::javaMessageQueueString(new MessageQueue('', '', 0)),
-            'javaMessageQueueString 空字段'
+            AllocationHelper::wireQueueKeyString(new MessageQueue('', '', 0)),
+            'wireQueueKeyString 空字段'
         );
 
-        // javaSplit：JDK 17 实测语义表（见 docblock）
-        $this->checkSame(['room1'], AllocationHelper::javaSplit('room1@', '@'), 'javaSplit "room1@" → ["room1"]（剔尾空段）');
-        $this->checkSame(['room1', 'b'], AllocationHelper::javaSplit('room1@b@', '@'), 'javaSplit "room1@b@" → 2 段（剔尾空段）');
-        $this->checkSame([], AllocationHelper::javaSplit('@', '@'), 'javaSplit "@" → []');
-        $this->checkSame([''], AllocationHelper::javaSplit('', '@'), 'javaSplit "" 原样返回 [""]（Pattern#split 早返回）');
-        $this->checkSame(['broker-a'], AllocationHelper::javaSplit('broker-a', '@'), 'javaSplit 无分隔符命中 → 整串原样');
-        $this->checkSame(['a', '', 'b'], AllocationHelper::javaSplit('a@@b', '@'), 'javaSplit 中间空段保留');
-        $this->checkSame([], AllocationHelper::javaSplit('@@', '@'), 'javaSplit "@@" → []');
-        $this->checkSame(['a', 'b'], AllocationHelper::javaSplit('a@b', '@'), 'javaSplit 常规两段');
-        $this->checkSame(['a', 'b', 'c'], AllocationHelper::javaSplit('a@b@c', '@'), 'javaSplit 三段');
-        $this->checkSame(['', 'b'], AllocationHelper::javaSplit('@b', '@'), 'javaSplit 首空段保留');
+        // wireSplit：JDK 17 实测语义表（见 docblock）
+        $this->checkSame(['room1'], AllocationHelper::wireSplit('room1@', '@'), 'wireSplit "room1@" → ["room1"]（剔尾空段）');
+        $this->checkSame(['room1', 'b'], AllocationHelper::wireSplit('room1@b@', '@'), 'wireSplit "room1@b@" → 2 段（剔尾空段）');
+        $this->checkSame([], AllocationHelper::wireSplit('@', '@'), 'wireSplit "@" → []');
+        $this->checkSame([''], AllocationHelper::wireSplit('', '@'), 'wireSplit "" 原样返回 [""]（Pattern#split 早返回）');
+        $this->checkSame(['broker-a'], AllocationHelper::wireSplit('broker-a', '@'), 'wireSplit 无分隔符命中 → 整串原样');
+        $this->checkSame(['a', '', 'b'], AllocationHelper::wireSplit('a@@b', '@'), 'wireSplit 中间空段保留');
+        $this->checkSame([], AllocationHelper::wireSplit('@@', '@'), 'wireSplit "@@" → []');
+        $this->checkSame(['a', 'b'], AllocationHelper::wireSplit('a@b', '@'), 'wireSplit 常规两段');
+        $this->checkSame(['a', 'b', 'c'], AllocationHelper::wireSplit('a@b@c', '@'), 'wireSplit 三段');
+        $this->checkSame(['', 'b'], AllocationHelper::wireSplit('@b', '@'), 'wireSplit 首空段保留');
     }
 
     // ==================================================================== CONSISTENT_HASH
@@ -796,7 +796,7 @@ final class RunClientAllocation
             'CONSISTENT_HASH 确定性（同参重跑一致）'
         );
 
-        // 稳定性：新增消费者只会从原有分片里「拿走」，存量归属不变（Java 单测断言点）
+        // 稳定性：新增消费者只会从原有分片里「拿走」，存量归属不变（一致性哈希的稳定性判据）
         $mqAll = $this->mqs(20);
         $three = ['c0', 'c1', 'c2'];
         $four = ['c0', 'c1', 'c2', 'c3'];
@@ -817,7 +817,7 @@ final class RunClientAllocation
         $got = $this->qids($allConst->allocate('G', 'c1', $constMq, ['c0', 'c1']));
         $this->checkSame([0, 1, 2], $got, '自定义 ConstantHash：环上只有一个落点，全队列归后加者');
 
-        // 默认虚拟节点数 = 10（Java 默认链）
+        // 默认虚拟节点数 = 10（缺省配置）
         $ref = new \ReflectionClass(AllocateMessageQueueConsistentHash::class);
         $ctor = $ref->getMethod('__construct');
         $this->checkSame(10, $ctor->getParameters()[0]->getDefaultValue(), 'CONSISTENT_HASH 默认 virtualNodeCnt=10');
@@ -839,8 +839,8 @@ final class RunClientAllocation
             ['T', 'room1@broker-b', 1],
             ['T', 'room2@broker-c', 2],
             ['T', 'broker-x', 3],       // 无 @ → 不参与
-            ['T', 'room1@', 4],         // Java split 1 段 → 不参与
-            ['T', 'room1@b@', 5],       // Java split 2 段 → 参与
+            ['T', 'room1@', 4],         // consumeridcs 切出 1 段 → 不参与
+            ['T', 'room1@b@', 5],       // consumeridcs 切出 2 段 → 参与
             ['T', 'room3@broker-d', 6], // 机房不在 consumeridcs → 不参与
         ]);
 
@@ -850,7 +850,7 @@ final class RunClientAllocation
         $this->checkSame([5], $this->qids($s->allocate('G', 'c2', $mqAll, ['c0', 'c1', 'c2'])), 'MACHINE_ROOM c2');
 
         // 精确核对参与集合 = {0,1,5}：用 1 个消费者全量接
-        $this->checkSame([0, 1, 5], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0'])), 'MACHINE_ROOM 参与集合 = room1@ 且 javaSplit 后 2 段');
+        $this->checkSame([0, 1, 5], $this->qids($s->allocate('G', 'c0', $mqAll, ['c0'])), 'MACHINE_ROOM 参与集合 = room1@ 且 wireSplit 后 2 段');
 
         // rem 归属判据：rem > currentIndex（余数发给前 rem 个消费者）
         $s2 = new AllocateMessageQueueByMachineRoom(['r']);
@@ -868,7 +868,7 @@ final class RunClientAllocation
         $this->checkSame([], $s->allocate('G', 'c0', $mqAll, []), 'MACHINE_ROOM cidAll 空 → []');
         $this->checkSame([], $s->allocate('G', 'cX', $mqAll, ['c0']), 'MACHINE_ROOM currentCID 不在 cidAll → []');
 
-        // consumeridcs 空 → 一条都不分（Java 未 set 会 NPE，这里兜成空结果）
+        // consumeridcs 空 → 一条都不分（未设置时兜成空结果，不抛空指针）
         $sEmpty = new AllocateMessageQueueByMachineRoom();
         $this->checkSame([], $sEmpty->allocate('G', 'c0', $mqAll, ['c0']), 'MACHINE_ROOM 未配置 consumeridcs → []');
         $this->checkSame([], $sEmpty->getConsumeridcs(), 'MACHINE_ROOM 默认 consumeridcs 空');
@@ -887,18 +887,18 @@ final class RunClientAllocation
 
     private function testMachineRoomNearby(): void
     {
-        // 构造守卫：null 参数（PHP 非空类型 → TypeError，对应 Java NPE）
+        // 构造守卫：null 参数（非空类型声明 → TypeError）
         $inner = new AllocateMessageQueueAveragely();
         $resolver = new StaticRoomResolver(['c0' => 'A', 'c1' => 'B']);
         $this->checkThrows(
             fn () => new AllocateMachineRoomNearby(null, $resolver),
             \TypeError::class,
-            'NEARBY strategy=null → TypeError（Java NPE 对应）'
+            'NEARBY strategy=null → TypeError'
         );
         $this->checkThrows(
             fn () => new AllocateMachineRoomNearby($inner, null),
             \TypeError::class,
-            'NEARBY resolver=null → TypeError（Java NPE 对应）'
+            'NEARBY resolver=null → TypeError'
         );
 
         $s = new AllocateMachineRoomNearby($inner, $resolver);
@@ -976,7 +976,7 @@ final class RunClientAllocation
             $s5->allocate('G', 'c0', [new MessageQueue('T', 'X@b9', 0)], ['c0']);
         } catch (\ValueError $e) {
             $this->check(str_contains($e->getMessage(), 'Machine room is null for mq'), 'ValueError 文案 mq 侧');
-            $this->check(str_contains($e->getMessage(), 'MessageQueue [topic=T, brokerName=X@b9, queueId=0]'), 'ValueError 文案带 Java toString 形态');
+            $this->check(str_contains($e->getMessage(), 'MessageQueue [topic=T, brokerName=X@b9, queueId=0]'), 'ValueError 文案带队列键串形态');
         }
         $s6 = new AllocateMachineRoomNearby($inner, new StaticRoomResolver([]));
         $this->checkThrows(
@@ -1012,7 +1012,7 @@ final class RunClientAllocation
         $this->testByConfig();
         $this->testHashPrimitives();
         $this->testConsistentHashRouter();
-        $this->testJavaCompat();
+        $this->testWireFormatCompat();
         $this->testConsistentHash();
         $this->testByMachineRoom();
         $this->testMachineRoomNearby();

@@ -1,15 +1,13 @@
-// DefaultLitePullConsumer — the lite pull consumer
-// (Java org.apache.rocketmq.client.consumer.DefaultLitePullConsumer).
+// DefaultLitePullConsumer — the lite pull consumer.
 //
-// Two assignment modes, like Java:
+// Two assignment modes:
 //  - subscribe(topic, expr): the assignment is rebalance-driven (AVG over the
 //    group's consumer list).
 //  - assign(mqs): fully manual, no broker coordination.
 //
 // The pull is always a SHORT poll via LITE_PULL_MESSAGE(361) with no inline
 // offset commit (the consumer owns its own commit path), and the expression is
-// ALWAYS sent (cross-port rule #21: pull / lite pull consumers never drop the
-// subscription field).
+// ALWAYS sent (this port never drops the subscription field on lite pull).
 import { MQClient } from './mq_client.ts';
 import { PullAPI } from './pull_api.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
@@ -31,26 +29,21 @@ const logger = getLogger('client.lite_pull_consumer');
 
 const DEFAULT_PULL_BATCH_SIZE = 10;
 const DEFAULT_POLL_TIMEOUT_MILLIS = 5000;
-// Java DefaultLitePullConsumer:160 — topicMetadataCheckIntervalMillis default.
+// topicMetadataCheckIntervalMillis 的默认值：30s 比对一次被监听 topic 的队列集合。
 const DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS = 30 * 1000;
-// Java has no floor, but a 0 period makes scheduleAtFixedRate throw
-// IllegalArgumentException; every port that clamps uses 1s (cpp/python/go/rust).
+// 周期下限钳到 1s：0 周期的定时任务会让后台调度直接报错。
 const MIN_TOPIC_METADATA_CHECK_INTERVAL_MILLIS = 1000;
-// Java DefaultLitePullConsumerImpl.startScheduleTask:382-393 — first check runs
-// 10s after start(), not immediately.
+// 首轮比对在 start() 之后 10s 才跑，而不是立刻。
 const METADATA_CHECK_FIRST_DELAY_MILLIS = 1000 * 10;
 
-// Java org.apache.rocketmq.client.consumer.TopicMessageQueueChangeListener:
-// notified ONLY when a topic's queue SET changed (expanded or shrank), with the
-// new set. No change → no callback.
+// TopicMessageQueueChangeListener：仅当 topic 的队列【集合】发生变化（扩容
+// 或缩容）时才回调，并带上新集合；没有变化就不回调。
 export interface TopicMessageQueueChangeListener {
   onChanged(topic: string, messageQueues: MessageQueue[]): void | Promise<void>;
 }
 
-// Java DefaultLitePullConsumerImpl#isSetEqual:1246-1260. "Never saw this topic"
-// (no snapshot) is NOT equal to anything, because fetchMessageQueues always
-// returns a non-null set — so the first round of a freshly registered listener
-// always fires once.
+// 队列集合相等判断："从没见过这个 topic"（没有快照）不等于任何集合——
+// fetchMessageQueues 总是返回非空列表，所以刚注册监听器的第一轮必定触发一次。
 function isQueueSetEqual(
   oldQueues: MessageQueue[] | undefined, newQueues: MessageQueue[]): boolean {
   if (oldQueues === undefined) return false;
@@ -61,8 +54,8 @@ function isQueueSetEqual(
 
 export class DefaultLitePullConsumer {
   consumerGroup: string;
-  // Java ClientConfig#namespaceV2 — the SERVER-side namespace: when non-empty
-  // NamespaceRpcHook stamps every request with nsd=true / ns=<value>.
+  // namespaceV2：服务端侧命名空间；非空时 NamespaceRpcHook 给每个请求打上
+  // nsd=true / ns=<值>。
   namespaceV2: string | null = null;
   nameServerAddr = '';
   messageModel: string = MessageModel.CLUSTERING;
@@ -70,9 +63,8 @@ export class DefaultLitePullConsumer {
   consumeType: string = ConsumeType.CONSUME_ACTIVELY;
   get subscriptionDataSet(): SubscriptionData[] { return [...this.subscription.values()]; }
   unitMode = false;
-  // Java ClientConfig#instanceName / #unitName / #enableStreamRequestType.
-  // DefaultLitePullConsumer sets the stream flag in every constructor
-  // (Java :213/:228): the clientId gets `@STREAM` and each request gets ReqT=0.
+  // instanceName / unitName / enableStreamRequestType：lite pull 默认打开 stream
+  // 标记——clientId 追加 `@STREAM`，且每个请求带 ReqT=0。
   instanceName = 'DEFAULT';
   unitName = '';
   enableStreamRequestType = true;
@@ -86,11 +78,10 @@ export class DefaultLitePullConsumer {
   pollTimeoutMillis = DEFAULT_POLL_TIMEOUT_MILLIS;
   autoCommit = true;
   autoCommitIntervalMillis = 5000;
-  // Java DefaultLitePullConsumer default: CONSUME_FROM_LAST_OFFSET — a queue
-  // with NO committed offset starts at the broker's max offset.
+  // 默认 CONSUME_FROM_LAST_OFFSET：没有已提交位点的队列从 broker 的 maxOffset
+  // 起步。
   consumeFromWhere: string = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET;
-  // Java DefaultLitePullConsumer:160 — how often the background task compares
-  // each watched topic's queue set.
+  // 后台任务比对每个被监听 topic 的队列集合的周期。
   topicMetadataCheckIntervalMillis = DEFAULT_TOPIC_METADATA_CHECK_INTERVAL_MILLIS;
 
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
@@ -100,10 +91,10 @@ export class DefaultLitePullConsumer {
   private assignedAuto: MessageQueue[] = [];            // subscribe() mode
   private paused = new Set<string>();
   private pullCursor = new Map<string, number>();       // mqKey -> next pull offset
-  // Java Impl:144/146 — listener per topic + the last queue set seen per topic.
-  // Keyed by the BARE topic like this port's other lite-pull state (subscribe /
-  // route cache / rebalance), because namespaceV2 is applied on the wire by
-  // NamespaceRpcHook rather than by prefixing topic names.
+  // 每个 topic 的监听器 + 上次见到的队列集合。
+  // 键用【裸】topic，与本实现其他 lite pull 状态（subscribe / 路由缓存 /
+  // rebalance）一致——namespaceV2 由 NamespaceRpcHook 在线路层生效，不靠给
+  // topic 名加前缀。
   private topicChangeListeners = new Map<string, TopicMessageQueueChangeListener>();
   private messageQueuesForTopic = new Map<string, MessageQueue[]>();
   private started = false;
@@ -117,7 +108,7 @@ export class DefaultLitePullConsumer {
   }
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
-  // Java ClientConfig#setNamespaceV2/getNamespaceV2 (read live per request).
+  // 设置/读取 namespaceV2（每个请求实时读取）。
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
@@ -130,7 +121,7 @@ export class DefaultLitePullConsumer {
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
 
-  // Java DefaultLitePullConsumer#setTopicMetadataCheckIntervalMillis (:160 field).
+  // 设置 topic 元数据比对周期（低于下限或非法值一律钳到下限）。
   setTopicMetadataCheckIntervalMillis(ms: number): this {
     this.topicMetadataCheckIntervalMillis =
       Number.isFinite(ms) && ms >= MIN_TOPIC_METADATA_CHECK_INTERVAL_MILLIS
@@ -169,19 +160,18 @@ export class DefaultLitePullConsumer {
     if (this.subscription.size === 0 && !this.assignedManual) {
       throw new Error('subscription is not set, call subscribe() or assign() first');
     }
-    // Java DefaultLitePullConsumerImpl#start:287-291 — CLUSTERING rewrites the
-    // DEFAULT instance name, then ClientConfig#buildMQClientId makes
-    // `<ip>@<instanceName>[@<unitName>][@STREAM]`. ⚠ A pid-only name is shared
-    // by every lite pull consumer in this process, so allocate() hands two
-    // instances the SAME slice and both read the same messages.
+    // CLUSTERING 会把默认的 instanceName 改写掉，随后 clientId 形如
+    // `<ip>@<instanceName>[@<unitName>][@STREAM]`。⚠ 只用 pid 作实例名的话，
+    // 同进程内所有 lite pull 消费者共用一个 clientId，allocate() 会把同一片
+    // 队列分给两个实例，双方读到完全相同的消息。
     if (this.messageModel === MessageModel.CLUSTERING) {
       this.instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     }
     this.clientID = MixAll.clientIdFor(
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
     const client = new MQClient(this.clientID, this.nameServerAddr);
-    // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
-    // client, then StreamTypeRPCHook, before any user hook (none today).
+    // 钩子注册顺序：NamespaceRpcHook 先挂在 remoting client 上，然后是
+    // StreamTypeRPCHook，最后才是用户钩子（当前没有）。
     registerRpcHooks(client.remotingClient, {
       namespaceV2: () => this.namespaceV2,
       enableStreamRequestType: this.enableStreamRequestType,
@@ -200,9 +190,8 @@ export class DefaultLitePullConsumer {
     for (const topic of this.subscription.keys()) {
       await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
     }
-    // Java DefaultLitePullConsumerImpl.start:410 — same 46 pre-flight as the
-    // push consumer, after the queues are resolved and before the group is
-    // registered at the broker.
+    // 队列解析完、组还没在 broker 注册之前，先发一次 CHECK_CLIENT_IN_BROKER(46)
+    // 预检。
     try {
       await client.checkClientInBroker();
     } catch (e) {
@@ -213,13 +202,12 @@ export class DefaultLitePullConsumer {
       client.shutdown();
       throw e;
     }
-    // Register the group at the broker NOW: the client heartbeat loop's first
-    // beat may have run before any route was cached, and waiting for the 30s
-    // cadence delays group registration — and therefore the first rebalance —
-    // by half a minute. Java sends the heartbeat inside consumer start().
+    // 立即在 broker 注册消费组：客户端心跳循环的第一拍可能在任何路由被缓存之前
+    // 就跑完了，再等 30s 的周期会把组注册——进而把首轮 rebalance——拖后半分钟。
+    // 所以 start() 内主动补发一次心跳。
     await client.sendHeartbeatToAllBrokers().catch(() => {});
     this.started = true;
-    // Java startScheduleTask runs unconditionally, listeners or not.
+    // 元数据比对循环无条件启动，与是否注册了监听器无关。
     this._startMetadataLoop();
     if (this.assignedManual == null) {
       await this._doRebalance();
@@ -316,13 +304,13 @@ export class DefaultLitePullConsumer {
     return this.fetchMessageQueues(topic);
   }
 
-  // Java DefaultLitePullConsumer:325 → Impl:1267-1279, point by point:
-  //  * empty topic / missing listener → "Topic or listener is null";
-  //  * re-registering a topic WARNs and overwrites the old listener;
-  //  * only a RUNNING consumer takes an immediate snapshot — otherwise the
-  //    first round would report "the set that was already there" as a change.
-  // Awaited because the snapshot is a route RPC; registering before start() is
-  // still fine, the compare loop just starts taking its snapshot at start().
+  // 逐条约束：
+  //  * topic 为空 / 监听器缺失 → 报 "Topic or listener is null"；
+  //  * 重复注册同一 topic 时 WARN 并覆盖旧监听器；
+  //  * 只有 RUNNING 状态的消费者才立刻取快照——否则第一轮会把"本来就在那儿
+  //    的集合"当成一次变化上报。
+  // 快照是一次路由 RPC，所以这里要 await；start() 之前注册也没问题，比对循环
+  // 会在 start() 时开始取快照。
   async registerTopicMessageQueueChangeListener(
     topic: string, listener: TopicMessageQueueChangeListener | null | undefined): Promise<void> {
     if (!topic || !topic.trim() || listener == null) {
@@ -340,11 +328,10 @@ export class DefaultLitePullConsumer {
     }
   }
 
-  // Java Impl:1230-1244: for every watched topic, compare the route's current
-  // queue set against the last one seen; fire onChanged only on a real change,
-  // and only for that topic — one topic's failed route query must not abort the
-  // round (Java's catch is inside the per-topic loop and logs only).
-  // Returns how many listeners were notified (0 when nothing changed).
+  // 对每个被监听的 topic：把路由里的当前队列集合与上次见到的比对；只有真的
+  // 变了才触发 onChanged，且只针对该 topic——一个 topic 路由查询失败不能打断
+  // 整轮（异常捕获放在每个 topic 内部，只记日志）。
+  // 返回被通知的监听器数量（没变化时为 0）。
   async fetchTopicMessageQueuesAndCompare(): Promise<number> {
     let fired = 0;
     // Snapshot the entries: an onChanged implementation may register or drop
@@ -363,10 +350,9 @@ export class DefaultLitePullConsumer {
     return fired;
   }
 
-  // Java Impl:382-393: scheduleAtFixedRate(checkTask, 10s, interval). The period
-  // is read once at start(), exactly like Java's fixed-rate schedule; the 10s
-  // first delay keeps a just-started consumer from answering a route query
-  // before the broker has finished registering its queues.
+  // 固定速率调度：首轮延迟 10s，之后每 interval 一拍。周期在 start() 时读取
+  // 一次，之后不再变；10s 首轮延迟避免刚启动的消费者在 broker 还没登记完
+  // 队列时就去应答路由查询。
   private _startMetadataLoop(firstDelayMillis = METADATA_CHECK_FIRST_DELAY_MILLIS,
     periodMillis = this.topicMetadataCheckIntervalMillis): void {
     if (this._metadataTimer != null) return;
@@ -408,7 +394,7 @@ export class DefaultLitePullConsumer {
         else if (MixAll.isRetryTopic(mq.getTopic())) offset = 0;
         else if (this.consumeFromWhere === ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET) offset = 0;
         else {
-          // CONSUME_FROM_LAST_OFFSET (Java default): start at maxOffset.
+          // CONSUME_FROM_LAST_OFFSET（默认）：从 maxOffset 起步。
           offset = await this._maxOffsetFor(mq);
         }
         if (offset < 0) continue; // unknown offset; nothing to pull from
@@ -459,15 +445,14 @@ export class DefaultLitePullConsumer {
     if (this.offsetStore) this.offsetStore.updateOffset(mq, offset, false);
   }
 
-  // Java DefaultLitePullConsumer.assignment(): the currently assigned queues.
+  // assignment()：返回当前分配到的队列。
   assignment(): MessageQueue[] {
     return [...(this.assignedManual != null ? this.assignedManual : this.assignedAuto)];
   }
 
-  // The queue's min/max offset on its **master** broker (-1 when the route or
-  // the broker is unknown — the caller then skips the queue this round rather
-  // than seeking to a bogus cursor). Java resolves the address through
-  // MQAdminImpl, which only knows the master.
+  // 队列所在 **master** broker 上的 min/max 位点（路由或 broker 未知时返回
+  // -1——调用方本轮跳过该队列，而不是 seek 到一个假游标）。管控查询只认
+  // master 地址。
   private async _boundaryOffset(mq: MessageQueue, kind: 'min' | 'max'): Promise<number> {
     if (!this.mqClient) return -1;
     await this.mqClient.updateTopicRouteInfoFromNameServer(mq.getTopic(), false).catch(() => {});
@@ -491,10 +476,9 @@ export class DefaultLitePullConsumer {
     return this._boundaryOffset(mq, 'max');
   }
 
-  // Java DefaultLitePullConsumer#seekToBegin → Impl:697-700 (minOffset then
-  // seek); seekToEnd → Impl:702-705 (maxOffset then seek). A boundary the
-  // broker could not answer throws instead of seeking to -1: a negative cursor
-  // would come back as OFFSET_ILLEGAL on the next poll and be silently wrong.
+  // seekToBegin：先取 minOffset 再 seek；seekToEnd：先取 maxOffset 再 seek。
+  // broker 答不出边界值时直接抛错而不是 seek(-1)：负游标会在下一次 poll 时以
+  // OFFSET_ILLEGAL 弹回来，等于静默地错。
   async seekToBegin(mq: MessageQueue): Promise<void> {
     if (!this.started) throw new Error('consumer not started');
     const begin = await this._boundaryOffset(mq, 'min');
@@ -509,8 +493,7 @@ export class DefaultLitePullConsumer {
     this.seek(mq, end);
   }
 
-  // Java DefaultLitePullConsumer.committed(mq): the last committed offset of
-  // the queue (-1 when never committed).
+  // committed(mq)：该队列最后一次提交的位点（从未提交过时为 -1）。
   committed(mq: MessageQueue): number {
     if (!this.offsetStore) return -1;
     const snap = (this.offsetStore as any).tableSnapshot?.() as Map<string, number> | undefined;

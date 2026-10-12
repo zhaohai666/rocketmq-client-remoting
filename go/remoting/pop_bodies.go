@@ -5,11 +5,11 @@
 // Two encoding facts drive this file:
 //
 //   - BatchAck carries explicit short JSON names via @JSONField (c/t/r/so/q/rq/
-//     pt/it/b), so the wire body uses THOSE, not the Java property names. The
-//     decoder must still accept the long alternate names — fastjson2 writes the
-//     short ones and reads either.
-//   - A Java BitSet serialises through BitSetSerializerDeserializer as
-//     Base64(BitSet.toByteArray()). BitSet.toByteArray() is little-endian
+//     pt/it/b), so the wire body uses THOSE, not the long property names. The
+//     decoder must still accept the long alternate names — the broker's
+//     fastjson2 writes the short ones and reads either.
+//   - The broker serialises the ack BitSet as
+//     Base64(BitSet.toByteArray()): little-endian
 //     within each byte and trims trailing zero bytes, so bit N lives in byte
 //     N/8 at position N%8.
 package remoting
@@ -43,8 +43,8 @@ func popFirstI64(obj map[string]any, keys ...string) int64 {
 
 // ---------------------------------------------------------------- request mode
 
-// MessageRequestMode mirrors the Java enum (PULL / POP). The wire form is the
-// enum NAME, not the ordinal.
+// MessageRequestMode is the broker's PULL / POP switch. The wire form is
+// the enum NAME, not the ordinal.
 const (
 	MessageRequestModePull = "PULL"
 	MessageRequestModePop  = "POP"
@@ -62,7 +62,7 @@ type SetMessageRequestModeRequestBody struct {
 func (b *SetMessageRequestModeRequestBody) ToJSONValue() map[string]any {
 	mode := b.Mode
 	if mode == "" {
-		// Java's field default is MessageRequestMode.PULL, so a body that never
+		// The server-side field default is PULL, so a body that never
 		// set the mode asks the broker to switch the group back to pull.
 		mode = MessageRequestModePull
 	}
@@ -108,12 +108,11 @@ func DecodeSetMessageRequestModeRequestBody(data []byte) (*SetMessageRequestMode
 // ---------------------------------------------------------------- batch ack
 
 // BitSet is the POP acknowledge bitmap: bit N set means "message at
-// ckQueueOffset+N is acknowledged". Mirrors java.util.BitSet closely enough for
-// the wire: little-endian bit order inside each byte, trailing zero bytes
-// dropped, Base64 over the raw bytes.
+// ckQueueOffset+N is acknowledged". Wire layout: little-endian bit order
+// inside each byte, trailing zero bytes dropped, Base64 over the raw bytes.
 //
-// Index arithmetic is the whole point — the batch-ack builder in
-// MQClientAPIImpl sets bit (queueOffset - ckQueueOffset), so an off-by-one here
+// Index arithmetic is the whole point — the batch-ack builder sets bit
+// (queueOffset - ckQueueOffset), so an off-by-one here
 // acks the wrong message and leaves the intended one to be redelivered.
 type BitSet struct {
 	bytes []byte
@@ -131,7 +130,7 @@ func (b *BitSet) Set(index int) {
 	b.bytes[byteIndex] |= 1 << uint(index%8)
 }
 
-// Get reports whether bit index is on. Out-of-range reads are false, like Java.
+// Get reports whether bit index is on. Out-of-range reads are false.
 func (b *BitSet) Get(index int) bool {
 	if index < 0 {
 		return false
@@ -186,7 +185,7 @@ func (b *BitSet) PopCount() int {
 	return n
 }
 
-// BatchAck mirrors Java org.apache.rocketmq.remoting.protocol.body.BatchAck.
+// BatchAck is one BATCH_ACK_MESSAGE(200151) entry.
 // One entry covers every acknowledged message that shares the same
 // (retry, queueId, startOffset, popTime) group.
 type BatchAck struct {
@@ -365,7 +364,7 @@ func BuildBatchAckMessageRequestBody(topic, consumerGroup string, extraInfos []s
 
 // ---------------------------------------------------------------- assignment
 
-// MessageQueueAssignment mirrors Java MessageQueueAssignment: one queue plus the
+// MessageQueueAssignment is one queue plus the
 // mode the broker wants it consumed in. POP rebalance reads `mode` to decide
 // between the pop path and the pull path.
 type MessageQueueAssignment struct {
@@ -395,9 +394,9 @@ func (a *MessageQueueAssignment) modeOrDefault() string {
 	return a.Mode
 }
 
-// FromJSONValue parses one assignment. An absent mode means PULL, matching the
-// Java field initialiser — this is the branch that decides whether a queue is
-// popped or pulled, so the default must not be invented.
+// FromJSONValue parses one assignment. An absent mode means PULL, matching
+// the server-side field initialiser — this is the branch that decides whether
+// a queue is popped or pulled, so the default must not be invented.
 func (a *MessageQueueAssignment) FromJSONValue(value any) error {
 	obj, ok := value.(map[string]any)
 	if !ok {

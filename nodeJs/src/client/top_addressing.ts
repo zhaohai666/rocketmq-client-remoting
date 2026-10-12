@@ -1,10 +1,8 @@
 // -*- coding: utf-8 -*-
-// HTTP namesrv addressing (org.apache.rocketmq.common.namesrv.TopAddressing).
-// Faithful port of python/client/top_addressing.py.
+// HTTP namesrv 寻址：从 HTTP "ws" 端点解析 namesrv 地址列表。
 //
-// Resolves the namesrv address list from an HTTP "ws" endpoint. The domain must be supplied
-// explicitly via the constructor or the ROCKETMQ_NAMESRV_DOMAIN env var (there is intentionally
-// NO built-in default domain, mirroring the Python port).
+// 域名必须由构造函数或 ROCKETMQ_NAMESRV_DOMAIN 环境变量显式给出——**刻意不设**内建
+// 默认域名。
 import os from 'node:os';
 
 export function clearNewLine(s: string | null): string | null {
@@ -15,8 +13,7 @@ export function clearNewLine(s: string | null): string | null {
 export class DefaultTopAddressing {
   wsAddr: string | null;
   unitName: string | null;
-  // Java TopAddressing.registerChangeCallBack: fired when the HTTP endpoint
-  // returns an address list DIFFERENT from the previously seen one.
+  // 变更回调：HTTP 端点返回的地址列表与上次看到的**不一样**时触发。
   private changeCallBack: ((addrs: string) => string | null) | null = null;
   private lastAddrs: string | null = null;
 
@@ -61,9 +58,8 @@ export class DefaultTopAddressing {
       if (!resp.ok) return null;
       const text = await resp.text();
       const addrs = clearNewLine(text);
-      // Java DefaultTopAddressing.fetchNSAddr: only a CHANGED value reaches the
-      // change callback (MQClientAPIImpl.onNameServerAddressChange ->
-      // updateNameServerAddressList); an unchanged answer is silent.
+      // 只有变化值才走变更回调（onNameServerAddressChange -> updateNameServerAddressList），
+      // 未变的应答静默。
       if (addrs != null && addrs !== '' && addrs !== this.lastAddrs) {
         const prev = this.lastAddrs;
         this.lastAddrs = addrs;

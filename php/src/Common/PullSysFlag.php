@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * Pull 请求系统标志位（对应 org.apache.rocketmq.common.sysflag.PullSysFlag，移植自 sysflag.py）。
+ * Pull 请求的系统标志位：协议字段 sysFlag 在拉取请求里的位定义。
  */
 final class PullSysFlag
 {

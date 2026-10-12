@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 对应 org.apache.rocketmq.common.message.Message（移植自 message.py 的 Message）。
+ * 用户侧消息模型：topic / body / 有序属性表 / flag / 延迟等级。
  */
 class Message
 {
@@ -104,7 +104,7 @@ class Message
         $this->properties = [];
     }
 
-    // ---- Java 风格 ----
+    // ---- getter / setter（属性名即协议字段名）----
 
     public function getTopic(): string
     {
@@ -159,14 +159,13 @@ class Message
     }
 
     /**
-     * Java ``Message.isWaitStoreMsgOK()``：**属性缺省即 true**，其余走
-     * ``Boolean.parseBoolean`` —— 只有忽略大小写的 ``"true"`` 为真。
+     * WAIT 属性缺省即 true，其余值只有忽略大小写的 ``"true"`` 算真
+     * （broker 侧就按这个口径决定是否等刷盘再回包）。
      *
-     * ⚠ 别写成 ``getWaitStoreMsgOk() === "true"``。本类的构造器（与 Rust 的
-     * ``Message::new`` 一样）**不**预写 ``WAIT``，所以"属性缺省"是**常态而不是
-     * 边角**：按 ``=== "true"`` 判会让普通消息变成 ``WAIT=false``，``MessageBatch``
-     * 就会以 ``WAIT=false`` 下发 —— broker 不等刷盘就回 ``SEND_OK``。
-     * Rust / C# / C++ 三端同名函数用同一条判据。
+     * ⚠ 别写成 ``getWaitStoreMsgOk() === "true"``。本类构造器**不**预写 ``WAIT``，
+     * 所以"属性缺省"是**常态而不是边角**：按 ``=== "true"`` 判会让普通消息变成
+     * ``WAIT=false``，``MessageBatch`` 就会以 ``WAIT=false`` 下发 ——
+     * broker 不等刷盘就回 ``SEND_OK``，持久性静默降级。
      */
     public static function isWaitStoreMsgOk(Message $msg): bool
     {

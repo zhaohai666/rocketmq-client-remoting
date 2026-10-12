@@ -5,18 +5,18 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * TopicConfig（对应 org.apache.rocketmq.common.TopicConfig，移植自 topic_config.py）。
+ * TopicConfig：创建/更新 topic 时上报给 broker 的配置载体。
  *
- * 字段与默认值以 Java 5.x 为准（探针实测，勿凭记忆改）：
+ * 字段与默认值以 broker 5.x 的实际解析口径为准（实测确认，勿凭记忆改）：
  * ``new TopicConfig("t")`` → readQueueNums=16, writeQueueNums=16, perm=6,
  * topicFilterType=SINGLE_TAG, topicSysFlag=0, order=false, attributes={}。
- * ``attributes`` **会被序列化**（Java 的 ``getAttributes()`` 没有 serialize=false）。
+ * ``attributes`` **会被序列化**——协议里它是普通字段，不是内部字段。
  */
 final class TopicConfig
 {
-    /** org.apache.rocketmq.common.TopicConfig.defaultReadQueueNums */
+    /** broker 侧默认读队列数 */
     public const DEFAULT_READ_QUEUE_NUMS = 16;
-    /** org.apache.rocketmq.common.TopicConfig.defaultWriteQueueNums */
+    /** broker 侧默认写队列数 */
     public const DEFAULT_WRITE_QUEUE_NUMS = 16;
     /** PermName.PERM_READ | PermName.PERM_WRITE */
     public const DEFAULT_PERM = 6;
@@ -50,8 +50,8 @@ final class TopicConfig
             'topicFilterType' => $this->topicFilterType,
             'topicSysFlag' => $this->topicSysFlag,
             'order' => $this->order,
-            // Java 的 attributes 是 Map（默认 {}）：PHP 空 array 会编成 []，
-            // fastjson2 按 Map 反序列化报 "expect '{', but '['" —— 空表输出对象。
+            // 协议里 attributes 是 Map（默认 {}）：PHP 空 array 会编成 []，
+            // broker 按 Map 解析时报 "expect '{', but '['" —— 空表必须输出对象。
             'attributes' => $this->attributes === [] ? new \stdClass() : $this->attributes,
         ];
     }

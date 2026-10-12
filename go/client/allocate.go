@@ -185,7 +185,7 @@ func newConsistentHashRouter(pNodes []string, vNodeCount int, fn hashFunction) *
 func (r *consistentHashRouter) addNode(pNode string, vNodeCount int) {
 	existing := r.existingReplicas(pNode)
 	for i := 0; i < vNodeCount; i++ {
-		v := virtualNode{key: javaVirtualNodeKey(pNode, i+existing), physicalKey: pNode}
+		v := virtualNode{key: virtualNodeKey(pNode, i+existing), physicalKey: pNode}
 		key := r.hashFn.Hash(v.key)
 		if _, ok := r.ring[key]; !ok {
 			r.keys = insertU32(r.keys, key)
@@ -231,7 +231,7 @@ func (r *consistentHashRouter) existingReplicas(pNode string) int {
 	return n
 }
 
-func javaVirtualNodeKey(pNode string, replicaIndex int) string {
+func virtualNodeKey(pNode string, replicaIndex int) string {
 	return pNode + "-" + itoa(replicaIndex)
 }
 
@@ -265,9 +265,9 @@ func itoa(v int) string {
 	return string(buf[i:])
 }
 
-// javaMessageQueueString is Java MessageQueue#toString — the string the ring
+// queueWireString is Java MessageQueue#toString — the string the ring
 // hashes. Must match character for character.
-func javaMessageQueueString(mq common.MessageQueue) string { return mq.JavaString() }
+func queueWireString(mq common.MessageQueue) string { return mq.WireString() }
 
 // ------------------------------------------- CONSISTENT_HASH
 
@@ -295,7 +295,7 @@ func (s *AllocateMessageQueueConsistentHash) Allocate(consumerGroup, currentCID 
 	router := newConsistentHashRouter(cidAll, s.VirtualNodeCnt, s.CustomHashFunction)
 	var out []common.MessageQueue
 	for _, mq := range mqAll {
-		node, ok := router.routeNode(javaMessageQueueString(mq))
+		node, ok := router.routeNode(queueWireString(mq))
 		if ok && node == currentCID {
 			out = append(out, mq)
 		}
@@ -305,11 +305,11 @@ func (s *AllocateMessageQueueConsistentHash) Allocate(consumerGroup, currentCID 
 
 // ------------------------------------------------- MACHINE_ROOM
 
-// javaSplit mirrors Java String#split(sep) with limit 0: trailing empty
+// splitWithoutTrailingEmpty mirrors Java String#split(sep) with limit 0: trailing empty
 // segments are DROPPED, but a string with no separator is returned whole
 // (Java's "if no match was found, return this" early return) — so "" stays [""]
 // and does not become empty.
-func javaSplit(text, sep string) []string {
+func splitWithoutTrailingEmpty(text, sep string) []string {
 	parts := strings.Split(text, sep)
 	if len(parts) == 1 {
 		return parts
@@ -349,7 +349,7 @@ func (s *AllocateMessageQueueByMachineRoom) Allocate(consumerGroup, currentCID s
 	// port defaults to an empty set, i.e. "nothing is allocated".
 	var candidates []common.MessageQueue
 	for _, mq := range mqAll {
-		parts := javaSplit(mq.BrokerName, "@")
+		parts := splitWithoutTrailingEmpty(mq.BrokerName, "@")
 		if len(parts) != 2 {
 			continue
 		}
@@ -460,7 +460,7 @@ func (s *AllocateMachineRoomNearby) Allocate(consumerGroup, currentCID string, m
 	for _, mq := range mqAll {
 		room := s.Resolver.BrokerDeployIn(mq)
 		if room == "" {
-			err := fmt.Errorf("machine room is null for mq %s", mq.JavaString())
+			err := fmt.Errorf("machine room is null for mq %s", mq.WireString())
 			s.setErr(err)
 			common.LogErrorf("[MachineRoomNearby] %v", err)
 			return nil

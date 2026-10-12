@@ -17,11 +17,11 @@ namespace RocketMQ.Client.Tests;
 public class LocalOffsetsTests
 {
     // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
-    private const string JavaCompact =
+    private const string LegacyCompact =
         "{\"offsetTable\":{{\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"Tt\"}:9,"
         + "{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7}}";
 
-    private const string JavaPretty =
+    private const string LegacyPretty =
         "{\n\t\"offsetTable\":{\n\t\t{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7\n\t}\n}";
 
     private static Dictionary<string, MessageQueue> MqMap()
@@ -48,7 +48,7 @@ public class LocalOffsetsTests
     }
 
     [Fact]
-    public void Build_UsesJavaObjectAsKeyFormat()
+    public void Build_UsesLegacyObjectAsKeyFormat()
     {
         string text = DefaultMQPushConsumer.BuildLocalOffsetsJson(
             Items(("Ttbroker-a0", 7), ("Ttbroker-a1", 9)), MqMap());
@@ -67,14 +67,14 @@ public class LocalOffsetsTests
     }
 
     [Fact]
-    public void Parse_JavaFormatCompactAndPretty()
+    public void Parse_LegacyFormatCompactAndPretty()
     {
-        Dictionary<string, long>? compact = DefaultMQPushConsumer.ParseLocalOffsetsText(JavaCompact);
+        Dictionary<string, long>? compact = DefaultMQPushConsumer.ParseLocalOffsetsText(LegacyCompact);
         Assert.NotNull(compact);
         Assert.Equal(9L, compact!["Ttbroker-a1"]);
         Assert.Equal(7L, compact["Ttbroker-a0"]);
 
-        Dictionary<string, long>? pretty = DefaultMQPushConsumer.ParseLocalOffsetsText(JavaPretty);
+        Dictionary<string, long>? pretty = DefaultMQPushConsumer.ParseLocalOffsetsText(LegacyPretty);
         Assert.NotNull(pretty);
         Assert.Equal(7L, pretty!["Ttbroker-a0"]);
     }
@@ -109,7 +109,7 @@ public class LocalOffsetsTests
     }
 
     [Fact]
-    public void Save_WritesJavaFormatAndRollsBak()
+    public void Save_WritesLegacyFormatAndRollsBak()
     {
         string dir = Path.Combine(Path.GetTempPath(),
             "rmq_dotnet_offsets_" + Guid.NewGuid().ToString("N"));
@@ -152,7 +152,7 @@ public class LocalOffsetsTests
     }
 
     [Fact]
-    public void Load_ReadsJavaWrittenFile()
+    public void Load_ReadsLegacyWrittenFile()
     {
         // Java 写出的文件本端要能读（跨端互认的核心）
         string dir = Path.Combine(Path.GetTempPath(),
@@ -161,7 +161,7 @@ public class LocalOffsetsTests
         try
         {
             Directory.CreateDirectory(dir);
-            File.WriteAllText(path, JavaCompact);
+            File.WriteAllText(path, LegacyCompact);
             Dictionary<string, long> loaded = DefaultMQPushConsumer.LoadLocalOffsetsAt(path);
             Assert.Equal(9L, loaded["Ttbroker-a1"]);
             Assert.Equal(7L, loaded["Ttbroker-a0"]);

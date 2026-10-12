@@ -21,13 +21,12 @@ func MonotonicMillis() float64 {
 	return time.Since(monotonicStart).Seconds() * 1000
 }
 
-// NanoTime mirrors Java System.nanoTime: arbitrary origin, comparisons only.
+// NanoTime is a monotonic nanosecond clock: arbitrary origin, comparisons only.
 //
 // Windows caveat: the Go monotonic clock's granularity can be coarser than the
 // gap between two consecutive calls, and a duplicated value would give two
 // same-process instances the SAME clientId (IP@pid#nanoTime, instance name
-// DEFAULT). A tiny mutex enforces strict monotonicity within the process —
-// Java's nanoTime has nanosecond resolution and never needed this.
+// DEFAULT). A tiny mutex enforces strict monotonicity within the process.
 var nanoTimeMu sync.Mutex
 var lastNanoTime int64
 
@@ -48,10 +47,10 @@ func CurrentTimeSeconds() int64 { return CurrentTimeMillis() / 1000 }
 
 func ComputeElapseTimeMillis(lastTime int64) int64 { return CurrentTimeMillis() - lastTime }
 
-// JavaStringHash mirrors java.lang.String.hashCode: h = 31*h + ch with 32-bit
+// StringHash31 is the protocol's string hash: h = 31*h + ch with 32-bit
 // wrap (Go int32 arithmetic wraps silently). Reference vectors: TagA=2598919,
 // TagB=2598920, P=80, PA=2545, * = 42.
-func JavaStringHash(s string) int32 {
+func StringHash31(s string) int32 {
 	var h int32
 	for _, ch := range s {
 		h = h*31 + int32(ch)
@@ -62,14 +61,13 @@ func JavaStringHash(s string) int32 {
 // Crc32 is the standard IEEE CRC-32 (b"a"=0xE8B7BE43, b"abc"=0x352441C2).
 func Crc32(data []byte) uint32 { return crc32.ChecksumIEEE(data) }
 
-// Bytes2String mirrors Java UtilAll.bytes2string: per-byte UPPERCASE hex
-// (msgId casing depends on it).
+// Bytes2String renders per-byte UPPERCASE hex (msgId casing depends on it).
 func Bytes2String(bytes []byte) string {
 	return strings.ToUpper(fmt.Sprintf("%x", bytes))
 }
 
-// String2Bytes mirrors Java UtilAll.string2bytes: hex text -> bytes (not UTF-8
-// decoding). Invalid or odd-length input yields nil.
+// String2Bytes decodes hex text -> bytes (not UTF-8 decoding). Invalid or
+// odd-length input yields nil.
 func String2Bytes(hex string) []byte {
 	if hex == "" {
 		return nil
@@ -172,8 +170,8 @@ func ParseAddr(addr string) (string, string) {
 	return addr, ""
 }
 
-// CurrentDayMillis is the milliseconds elapsed in the local day (the 4-byte
-// segment of Java createUniqID: hour/min/sec + millis).
+// CurrentDayMillis is the milliseconds elapsed in the local day (the
+// day-millis segment of CreateUniqID: hour/min/sec + millis).
 func CurrentDayMillis() uint32 {
 	now := time.Now()
 	secs := now.Hour()*3600 + now.Minute()*60 + now.Second()
@@ -182,7 +180,7 @@ func CurrentDayMillis() uint32 {
 
 var uniqIDCounter uint32
 
-// CreateUniqID mirrors Java MessageClientIDSetter.createUniqID:
+// CreateUniqID builds the UNIQ_KEY property:
 // IP(4B; IPv6 16B) + PID(2B) + class-hash(4B) + day-millis(4B) + counter(2B),
 // rendered as UPPERCASE hex — exactly 32 chars under IPv4.
 func CreateUniqID() string {
@@ -199,7 +197,7 @@ func CreateUniqID() string {
 		b = append(b, ip...)
 	}
 	b = binary.BigEndian.AppendUint16(b, uint16(Pid()))
-	b = binary.BigEndian.AppendUint32(b, uint32(JavaStringHash("RocketMQClient")))
+	b = binary.BigEndian.AppendUint32(b, uint32(StringHash31("RocketMQClient")))
 	b = binary.BigEndian.AppendUint32(b, CurrentDayMillis())
 	b = binary.BigEndian.AppendUint16(b, uint16(counter))
 	return Bytes2String(b)

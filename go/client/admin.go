@@ -1,7 +1,4 @@
-// DefaultMQAdminExt: the management client, ported from
-// org.apache.rocketmq.client.admin.DefaultMQAdminExt /
-// org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl (and the Python port's
-// rocketmq/client/admin.py, which was verified against a live 5.5.1 cluster).
+// DefaultMQAdminExt: the management client of the classic remoting protocol.
 //
 // Coverage: topic CRUD + config, broker cluster info / runtime info / config,
 // nameserver KV config, subscription-group management, consumer & producer
@@ -10,7 +7,7 @@
 //
 // Wire facts that were expensive to establish — do NOT "simplify" them:
 //
-//   - GET_BROKER_CONFIG(26)'s body is java.util.Properties TEXT (`k=v\n`), not
+//   - GET_BROKER_CONFIG(26)'s body is Properties TEXT (`k=v\n`), not
 //     JSON. Parsing it as a KVTable fails on every real broker.
 //   - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP(200)'s body is a
 //     SubscriptionGroupConfig JSON object.
@@ -39,12 +36,11 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// DefaultAdminTimeoutMillis mirrors DefaultMQAdminExt.DEFAULT_TIMEOUT
-// (5000 * 3).
+// DefaultAdminTimeoutMillis is the classic admin default timeout (5000 * 3).
 const DefaultAdminTimeoutMillis = int64(5000 * 3)
 
-// adminReadPermByDefault is MixAll.READ_PERM_BY_DEFAULT
-// (PermName.PERM_READ | PermName.PERM_WRITE).
+// adminReadPermByDefault is the protocol's default topic permission
+// (READ | WRITE).
 const adminReadPermByDefault = int32(common.PermRead | common.PermWrite)
 
 // DefaultMQAdminExt is the admin client.
@@ -55,9 +51,9 @@ type DefaultMQAdminExt struct {
 	InstanceName    string
 	ClientID        string
 	UnitName        string
-	// EnableStreamRequestType is Java ClientConfig#enableStreamRequestType.
+	// EnableStreamRequestType is the classic enableStreamRequestType client knob.
 	EnableStreamRequestType bool
-	// VipChannelEnabled (Java ClientConfig#vipChannelEnabled, false by
+	// VipChannelEnabled (vipChannelEnabled, false by
 	// default in 5.x): when true, broker requests go to the VIP port
 	// (port - 2). Never applied to nameserver traffic.
 	VipChannelEnabled bool
@@ -66,8 +62,8 @@ type DefaultMQAdminExt struct {
 	PollNameServerIntervalMillis int64
 	// RpcHook is the user hook (ACL).
 	RpcHook remoting.RPCHook
-	// KVNamespaceToDeleteList is cleaned up when a topic is deleted (Java's
-	// kvNamespaceToDeleteList).
+	// KVNamespaceToDeleteList is cleaned up when a topic is deleted (the
+	// classic kvNamespaceToDeleteList).
 	KVNamespaceToDeleteList []string
 	TimeoutMillis           int64
 

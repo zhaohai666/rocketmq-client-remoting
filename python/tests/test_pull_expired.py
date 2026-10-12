@@ -78,7 +78,7 @@ def _retire_log(c):
 
 # ---------------- 常量与判据 ----------------
 
-def test_pull_max_idle_time_matches_java_default():
+def test_pull_max_idle_time_matches_the_long_polling_default():
     """Java ProcessQueue:43 的默认值是 120s；写错方向会静默误撤健康队列或永不自愈。"""
     assert PULL_MAX_IDLE_TIME == 120.0
 

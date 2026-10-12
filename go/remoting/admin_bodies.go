@@ -1,12 +1,11 @@
 // Admin/管理侧 wire beans: TopicConfig, the subscription-group models and the
 // response bodies of the DefaultMQAdminExt surface.
 //
-// Field names come from the Java 5.x probe (see the Python port's
-// remoting/protocol/{body,admin_body,subscription}.py and common/topic_config.py,
-// all of which were verified against a live 5.5.1 cluster). Do not "tidy" them:
+// Field names were captured from a live 5.5.1 server's serialized responses.
+// Do not "tidy" them:
 //   - message-queue-keyed maps travel as fastjson2 INLINE OBJECT keys, which is
 //     not legal JSON for a strict reader — ParseJSON/DecodeMapKey handle it;
-//   - `GetBrokerConfig`'s body is java.util.Properties TEXT, not JSON;
+//   - `GetBrokerConfig`'s body is .properties TEXT, not JSON;
 //   - fastjson2 skips nulls, so every reader falls back to a default.
 package remoting
 
@@ -45,7 +44,7 @@ func jsonFloatOr(value any, key string, def float64) float64 {
 		return t
 	case float32:
 		return float64(t)
-	case JavaDouble:
+	case JSONDouble:
 		return float64(t)
 	case int:
 		return float64(t)
@@ -102,7 +101,7 @@ func jsonStringListOr(value any, key string) []string {
 //	 "topicFilterType":"SINGLE_TAG","topicName":"t","topicSysFlag":0,
 //	 "writeQueueNums":16}
 //
-// `attributes` IS serialised — Java's getAttributes() carries no
+// `attributes` IS serialised — the server bean's getAttributes() carries no
 // serialize=false, unlike the subscription beans where fastjson2 drops nulls.
 const (
 	DefaultReadQueueNums  int32 = 16
@@ -126,7 +125,7 @@ type TopicConfig struct {
 	Attributes      map[string]string
 }
 
-// NewTopicConfig builds a TopicConfig with Java's constructor defaults.
+// NewTopicConfig builds a TopicConfig with the broker-side defaults.
 func NewTopicConfig(topicName string) *TopicConfig {
 	return &TopicConfig{
 		TopicName:       topicName,
@@ -138,7 +137,7 @@ func NewTopicConfig(topicName string) *TopicConfig {
 	}
 }
 
-// ToJSONValue renders the Java field names. `attributes` is always present.
+// ToJSONValue renders the broker-side field names. `attributes` is always present.
 func (t *TopicConfig) ToJSONValue() map[string]any {
 	attrs := make(map[string]any, len(t.Attributes))
 	for k, v := range t.Attributes {
@@ -156,8 +155,8 @@ func (t *TopicConfig) ToJSONValue() map[string]any {
 	}
 }
 
-// FromJSONValue reads a TopicConfig, falling back to Java's defaults for every
-// absent key.
+// FromJSONValue reads a TopicConfig, falling back to the broker-side defaults
+// for every absent key.
 func (t *TopicConfig) FromJSONValue(value any) error {
 	obj, ok := value.(map[string]any)
 	if !ok {
@@ -177,7 +176,7 @@ func (t *TopicConfig) FromJSONValue(value any) error {
 	return nil
 }
 
-// Encode renders the JSON body the broker expects (Java RemotingSerializable).
+// Encode renders the JSON body the broker expects.
 func (t *TopicConfig) Encode() []byte { return EncodeJSON(t.ToJSONValue()) }
 
 // DecodeTopicConfig parses a TopicConfig body.
@@ -308,7 +307,7 @@ func NewTopicStatsTable() *TopicStatsTable {
 
 func (t *TopicStatsTable) ToJSONValue() map[string]any {
 	table := newMQKeyedJSON(t.OffsetTable, func(o *TopicOffset) any { return o.ToJSONValue() })
-	return map[string]any{"offsetTable": table, "topicPutTps": JavaDouble(t.TopicPutTps)}
+	return map[string]any{"offsetTable": table, "topicPutTps": JSONDouble(t.TopicPutTps)}
 }
 
 func (t *TopicStatsTable) FromJSONValue(value any) error {
@@ -343,7 +342,7 @@ func (t *TopicStatsTable) FromJSONValue(value any) error {
 	return nil
 }
 
-func (t *TopicStatsTable) Encode() []byte { return EncodeFastJSON(t.ToJSONValue()) }
+func (t *TopicStatsTable) Encode() []byte { return EncodeInlineKeyJSON(t.ToJSONValue()) }
 
 // DecodeTopicStatsTable parses the GET_TOPIC_STATS_INFO(202) body.
 func DecodeTopicStatsTable(data []byte) (*TopicStatsTable, error) {
@@ -371,7 +370,7 @@ type OffsetWrapper struct {
 	PullOffset     int64
 }
 
-// Lag mirrors Java OffsetWrapper#getLag: brokerOffset - consumerOffset.
+// Lag is brokerOffset - consumerOffset.
 func (o *OffsetWrapper) Lag() int64 { return o.BrokerOffset - o.ConsumerOffset }
 
 func (o *OffsetWrapper) ToJSONValue() map[string]any {
@@ -421,7 +420,7 @@ func (c *ConsumeStats) TotalLag() int64 {
 
 func (c *ConsumeStats) ToJSONValue() map[string]any {
 	table := newMQKeyedJSON(c.OffsetTable, func(w *OffsetWrapper) any { return w.ToJSONValue() })
-	return map[string]any{"offsetTable": table, "consumeTps": JavaDouble(c.ConsumeTps)}
+	return map[string]any{"offsetTable": table, "consumeTps": JSONDouble(c.ConsumeTps)}
 }
 
 func (c *ConsumeStats) FromJSONValue(value any) error {
@@ -455,7 +454,7 @@ func (c *ConsumeStats) FromJSONValue(value any) error {
 	return nil
 }
 
-func (c *ConsumeStats) Encode() []byte { return EncodeFastJSON(c.ToJSONValue()) }
+func (c *ConsumeStats) Encode() []byte { return EncodeInlineKeyJSON(c.ToJSONValue()) }
 
 // DecodeConsumeStats parses the GET_CONSUME_STATS(208) body.
 func DecodeConsumeStats(data []byte) (*ConsumeStats, error) {
@@ -476,7 +475,7 @@ func DecodeConsumeStats(data []byte) (*ConsumeStats, error) {
 // ConsumeStatus mirrors org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
 // (the per-group consume snapshot the admin tools render).
 //
-// The five rate fields are Java `double` and go through JavaDouble so the body
+// The five rate fields are broker-side `double`s and go through JSONDouble so the body
 // reads `0.0` (not `0`) and a zero-span window reads `null` (not an empty
 // body) — this struct feeds the 307 answer's statusTable, so the broker's
 // console parses it directly.
@@ -491,11 +490,11 @@ type ConsumeStatus struct {
 
 func (c *ConsumeStatus) ToJSONValue() map[string]any {
 	return map[string]any{
-		"pullRT":            JavaDouble(c.PullRT),
-		"pullTPS":           JavaDouble(c.PullTPS),
-		"consumeRT":         JavaDouble(c.ConsumeRT),
-		"consumeOKTPS":      JavaDouble(c.ConsumeOKTPS),
-		"consumeFailedTPS":  JavaDouble(c.ConsumeFailedTPS),
+		"pullRT":            JSONDouble(c.PullRT),
+		"pullTPS":           JSONDouble(c.PullTPS),
+		"consumeRT":         JSONDouble(c.ConsumeRT),
+		"consumeOKTPS":      JSONDouble(c.ConsumeOKTPS),
+		"consumeFailedTPS":  JSONDouble(c.ConsumeFailedTPS),
 		"consumeFailedMsgs": c.ConsumeFailedMsgs,
 	}
 }
@@ -515,7 +514,7 @@ func (c *ConsumeStatus) FromJSONValue(value any) error {
 // ConsumeQueueData mirrors body.ConsumeQueueData.
 //
 // Probe/source fields: physicOffset, physicSize, tagsCode, extendDataJson,
-// bitMap, eval, msg. Like Java, `extendDataJson` and `msg` are omitted from
+// bitMap, eval, msg. `extendDataJson` and `msg` are omitted from
 // the JSON when nil.
 type ConsumeQueueData struct {
 	PhysicOffset   int64

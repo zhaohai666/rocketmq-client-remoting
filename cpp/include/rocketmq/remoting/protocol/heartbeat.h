@@ -49,9 +49,8 @@ struct MessageModel {
 };
 
 // org.apache.rocketmq.common.consumer.ConsumeFromWhere
-// ⚠ 带注释的三个是 Java 里的 @Deprecated 值（枚举序与 Java 一致）：
-// RebalancePushImpl.computePullFromWhere 的 switch 里它们与
-// CONSUME_FROM_LAST_OFFSET 落同一个分支 —— 即"按最后位点"的兜底语义。
+// ⚠ 带注释的三个是协议里的 @Deprecated 值（枚举序由协议定义约定）：
+// 它们与 CONSUME_FROM_LAST_OFFSET 落同一分支 —— 即"按最后位点"的兜底语义。
 // 本端口用字符串常量，缺省分支（非 FIRST/TIMESTAMP）天然就是这个兜底。
 struct ConsumeFromWhere {
     static const char* const CONSUME_FROM_LAST_OFFSET;  // "CONSUME_FROM_LAST_OFFSET"
@@ -115,7 +114,7 @@ public:
     void setSubscriptionDataSet(const std::vector<SubscriptionData>& s) {
         subscriptionDataSet = s;
     }
-    // 对应 Java subscriptionDataSet.add(...)
+    // 追加一个订阅数据
     void addSubscriptionData(const SubscriptionData& sd) { subscriptionDataSet.push_back(sd); }
     bool isUnitMode() const { return unitMode; }
     void setUnitMode(bool m) { unitMode = m; }

@@ -96,8 +96,8 @@ func (m *StringMap) Clone() *StringMap {
 	return out
 }
 
-// Equal compares as sets (order-insensitive), like the Rust IndexMap PartialEq
-// the other ports assert against.
+// Equal compares as sets (order-insensitive): same key set, same value per
+// key, insertion order ignored.
 func (m *StringMap) Equal(other *StringMap) bool {
 	if m.Len() != other.Len() {
 		return false

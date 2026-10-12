@@ -1,4 +1,4 @@
-// Long-lived remoting client (Java NettyRemotingClient).
+// Long-lived remoting client.
 //
 // One goroutine reads each connection; writes go straight through the socket
 // under a per-connection mutex. In-flight requests are keyed by opaque; when a
@@ -25,18 +25,17 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// MaxFrameLength caps one inbound frame, like Java RemotingCommand (16 MiB).
+// MaxFrameLength caps one inbound frame (16 MiB, the protocol limit).
 const MaxFrameLength = int32(16 * 1024 * 1024)
 
-// RPCHook mirrors org.apache.rocketmq.remoting.RPCHook. DoBeforeRequest must
+// RPCHook is a request/response interceptor. DoBeforeRequest must
 // run before encode so the signed bytes are the ones that hit the wire.
 type RPCHook interface {
 	DoBeforeRequest(remoteAddr string, request *RemotingCommand)
 	DoAfterResponse(remoteAddr string, request *RemotingCommand, response *RemotingCommand)
 }
 
-// ProcessorFunc handles a request pushed by the peer (Java
-// NettyRequestProcessor). Call ResponseSink.Respond when a reply is expected;
+// ProcessorFunc handles a request pushed by the peer. Call ResponseSink.Respond when a reply is expected;
 // oneway requests get no reply. Do not block for long — the read loop of the
 // connection runs processors inline.
 type ProcessorFunc func(request *RemotingCommand, addr string, sink *ResponseSink)
@@ -48,7 +47,7 @@ type ResponseSink struct {
 	addr   string
 	opaque int32
 	// Peer pushed the request with the oneway flag: no reply may go back
-	// (Java NettyRemotingServer#processRequest, same rule).
+	// (the same rule the server applies to oneway pushes).
 	wantsReply bool
 }
 
@@ -74,11 +73,11 @@ type ClientConfig struct {
 	ConnectTimeoutMillis int64
 	InvokeTimeoutMillis  int64
 	TLSEnable            bool
-	// TLS test mode (Java tls.test.mode.enable, default true): trust
+	// TLS test mode (tls.test.mode.enable, default true): trust
 	// self-signed certs, skip hostname checks.
 	TLSTestMode bool
 	// On GO_AWAY(1500) retry once over a fresh connection; off -> the
-	// SendRequest error surfaces directly (Java enableReconnectForGoAway).
+	// SendRequest error surfaces directly (enableReconnectForGoAway = false).
 	EnableReconnectForGoAway bool
 }
 
@@ -105,7 +104,7 @@ func envBool(key string, def bool) bool {
 }
 
 // pendingCall is one in-flight request. connID is the connection the request
-// is actually written onto (Java ResponseFuture.channel); address cannot be
+// is actually written onto; address cannot be
 // the identity because same-address reconnects (GO_AWAY retry, EOF) are
 // routine and would doom new-connection requests.
 type pendingCall struct {
@@ -233,7 +232,7 @@ func (c *RemotingClient) HasProcessor(requestCode int32) bool {
 // InvokeSync performs one RPC; timeoutMillis <= 0 falls back to the config
 // default. GO_AWAY(1500) is broker/proxy graceful-shutdown signalling for
 // in-flight requests: the semantics are "stop using this connection", so the
-// retry must run on a NEW connection. Java retries once; a second GO_AWAY
+// retry must run on a NEW connection. Retry exactly once; a second GO_AWAY
 // fails with SendRequest to avoid spinning on a dying cluster.
 func (c *RemotingClient) InvokeSync(addr string, request *RemotingCommand, timeoutMillis int64) (*RemotingCommand, error) {
 	if timeoutMillis <= 0 {
@@ -252,7 +251,7 @@ func (c *RemotingClient) InvokeSync(addr string, request *RemotingCommand, timeo
 	}
 	common.LogWarnf("remoting: receive GO_AWAY from %s, reconnect and retry once", addr)
 	c.CloseChannel(addr)
-	// Retry burns only the remaining budget (Java reuses one Stopwatch).
+	// Retry burns only the remaining budget (one stopwatch across attempts).
 	retryTimeout := timeoutMillis - time.Since(started).Milliseconds()
 	if retryTimeout < 1 {
 		retryTimeout = 1
@@ -330,8 +329,8 @@ func (c *RemotingClient) InFlightCount() int {
 	return len(c.pending)
 }
 
-// Start re-opens a transport closed by Shutdown (Java NettyRemotingClient#start,
-// called by MQClientInstance#start); connections are built lazily anyway.
+// Start re-opens a transport closed by Shutdown; connections are built lazily
+// anyway.
 func (c *RemotingClient) Start() { c.running.Store(true) }
 
 func (c *RemotingClient) Shutdown() {
@@ -412,7 +411,7 @@ func (c *RemotingClient) invokeWithTimeout(addr string, request *RemotingCommand
 
 // writeConn encodes and writes one frame. Write failure closes the channel:
 // the read loop would see EOF soon anyway, and failing now lets this caller
-// surface "connection closed" (Java RemotingSendRequestException).
+// surface "connection closed" as a SendRequest error.
 func (c *RemotingClient) writeConn(conn *connection, request *RemotingCommand) error {
 	data := request.Encode()
 	if err := conn.writeAll(data); err != nil {
@@ -437,7 +436,7 @@ func (c *RemotingClient) cancelPending(opaque int32) {
 	c.mu.Unlock()
 }
 
-// failPendingFor (Java NettyRemotingAbstract#failFast + #requestFail) fails
+// failPendingFor fails
 // every in-flight request written onto the connection that just died, waking
 // its waiter with nil -> "connection closed". Claims go by connID: when an
 // old read loop unwinds after a same-address reconnect, the requests on the
@@ -614,7 +613,7 @@ func (c *RemotingClient) readLoop(conn *connection) {
 
 // dispatch routes one decoded frame: responses pop the pending table by
 // opaque, requests go to the processor table. A processor panic must not kill
-// the read loop — answer SYSTEM_ERROR, same as Java's exception guard.
+// the read loop — answer SYSTEM_ERROR, the protocol's exception guard.
 func (c *RemotingClient) dispatch(addr string, frame []byte) {
 	cmd, err := Decode(frame)
 	if err != nil {

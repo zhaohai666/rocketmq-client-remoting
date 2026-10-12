@@ -10,14 +10,11 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 
 /**
- * 队列分配策略 + 消费前过滤（移植自 consumer.py 第 89-620 行，对应
- * org.apache.rocketmq.client.consumer 里的分配策略部分与 Java common 包的
- * consistenthash 一致性哈希环）。
+ * 队列分配策略 + 消费前过滤。
  *
  * 文件内含：
- *  - AllocationHelper：consumer.py 的模块级 helper（_mq_sort_key / _safe_hook_name /
- *    client_side_tag_filter / execute_filter_hooks / filter_messages_for_delivery /
- *    _strategy_name / _java_message_queue_string / _java_split）
+ *  - AllocationHelper：模块级辅助（队列排序键、钩子取名、客户端二次 tag 过滤、过滤钩子执行、
+ *    投递前过滤、策略取名、环上队列 key 字符串、broker 名切分）
  *  - MessageSelector / MessageQueueListener / AllocateMessageQueueStrategy 接口族
  *  - AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM / MACHINE_ROOM_NEARBY
  *  - 一致性哈希环（HashFunction / MD5Hash / Node / ClientNode / VirtualNode /
@@ -25,24 +22,24 @@ use RocketMQ\Common\SubscriptionData;
  */
 
 /**
- * consumer.py 模块级 helper 的静态收容所。
+ * 分配与过滤共用的一组模块级辅助函数。
  *
- * 对应关系：
- *  - mqSortKey()               ← _mq_sort_key
- *  - safeHookName()            ← _safe_hook_name
- *  - clientSideTagFilter()     ← client_side_tag_filter
- *  - executeFilterHooks()      ← execute_filter_hooks
- *  - filterMessagesForDelivery() ← filter_messages_for_delivery
- *  - strategyName()            ← _strategy_name
- *  - javaMessageQueueString()  ← _java_message_queue_string
- *  - javaSplit()               ← _java_split
+ * 分工：
+ *  - mqSortKey()                 队列排序键
+ *  - safeHookName()              钩子取名（取不到退化成类名）
+ *  - clientSideTagFilter()       客户端二次 tag 过滤
+ *  - executeFilterHooks()        依次执行过滤钩子
+ *  - filterMessagesForDelivery() 投递前过滤（tag 复核 + 钩子）
+ *  - strategyName()              策略取名（日志用）
+ *  - wireQueueKeyString()        一致性哈希环上代表队列的字符串
+ *  - wireSplit()                 按分隔符切分（裁掉末尾空段）
  */
 final class AllocationHelper
 {
     /**
-     * 队列排序键，语义对齐 Java MessageQueue.compareTo：topic → brokerName → queueId。
+     * 队列排序键：topic → brokerName → queueId 逐段比较。
      *
-     * Java rebalance 会先把 mqAll/cidAll 排序再分配；顺序不一致会让不同实例算出
+     * rebalance 必须先把 mqAll/cidAll 排序再做分配；顺序不一致会让同组实例算出
      * 不同的分配结果（同一队列被两个实例同时消费）。
      *
      * @return array{0: string, 1: string, 2: int}
@@ -53,7 +50,7 @@ final class AllocationHelper
     }
 
     /**
-     * 取钩子名；hookName() 抛异常时退化成类名（Python 侧同语义）。
+     * 取钩子名；hookName() 抛异常时退化成类名（取名绝不影响过滤本身）。
      */
     public static function safeHookName(FilterMessageHook $hook): string
     {
@@ -65,12 +62,12 @@ final class AllocationHelper
     }
 
     /**
-     * 客户端二次 tag 过滤（对应 Java PullAPIWrapper.processPullResult:113-122）。
+     * 客户端二次 tag 过滤。
      *
-     * broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放；Java 因此让客户端
-     * 再按字符串核一遍。守卫 `!tagsSet.isEmpty() && !isClassFilterMode` 意味着：
-     * 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 FilterAPI.build_subscription_data
-     * 对 SUB_ALL 必须保持 tags_set 为空（那里有详细注释）。
+     * broker 侧只按 tag 的**哈希（codeSet）**过滤，存在哈希碰撞误放，所以经典 remoting
+     * 协议的消费端要再按 tag 原文核一遍。守卫「tagsSet 非空 && !classFilterMode」意味着：
+     * 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 FilterAPI::buildSubscriptionData
+     * 对 SUB_ALL 必须保持 tagsSet 为空（那里有详细注释）。
      *
      * @param list<MessageExt>|null $msgs
      * @return list<MessageExt>
@@ -91,7 +88,7 @@ final class AllocationHelper
     }
 
     /**
-     * 依次执行过滤钩子，**异常一律吞掉**（Java PullAPIWrapper.executeHook:171-178 记 error）。
+     * 依次执行过滤钩子，**单个钩子的异常只记 error、一律吞掉**。
      *
      * 与 send/consume 钩子不同：过滤钩子失败不能影响消费，只是该次过滤不生效。
      *
@@ -112,7 +109,7 @@ final class AllocationHelper
      * 投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
      *
      * 钩子拿到的是**可变的** msgList；被摘掉的消息由调用方决定处置方式：
-     * 拉取路径 = 静默跳过（位点照常推进，不 ack，Java 亦然）；
+     * 拉取路径 = 静默跳过（位点照常推进，不 ack）；
      * POP 路径 = 必须立刻 ack，否则 invisibleTime 到期后会复活重投。
      *
      * @param list<FilterMessageHook> $hookList
@@ -130,7 +127,7 @@ final class AllocationHelper
         $out = self::clientSideTagFilter($sub, $msgs);
         if ($out !== [] && $hookList !== []) {
             $context = new FilterMessageContext($consumerGroup, $out, $mq);
-            $context->unitMode = $unitMode;    // Java DefaultMQPushConsumerImpl:640
+            $context->unitMode = $unitMode;    // 钩子上下文要带上单元化标记
             self::executeFilterHooks($hookList, $context);
             $out = $context->msgList;
         }
@@ -140,9 +137,8 @@ final class AllocationHelper
     /**
      * 取策略名用于日志。
      *
-     * Java 侧策略是接口实现、必有 getName()；Python 允许业务方鸭子类型地传一个只有
-     * allocate 的自定义对象，所以缺 getName 时退化成类名而不是抛 Error。
-     * （PHP 侧同样接受任意 object，接口实现之外还能喂鸭子类型对象。）
+     * 策略既可以传接口实现（一定有 getName()），也可以传只实现了 allocate 的鸭子类型对象，
+     * 所以缺 getName 或它抛异常时退化成类名，绝不因为取名字而打断 rebalance。
      */
     public static function strategyName(object $strategy): string
     {
@@ -157,40 +153,41 @@ final class AllocationHelper
     }
 
     /**
-     * 对应 Java `MessageQueue#toString`（一致性哈希要哈希**它**，不是 __toString）。
+     * 一致性哈希环上代表一条队列的 key（哈希的是这个字符串，不是 MessageQueue::__toString）。
      *
-     * ⚠ 必须逐字符等于 Java 的 "MessageQueue [topic=.., brokerName=.., queueId=..]"：
-     * PHP 的 MessageQueue::__toString 是另一种写法，拿它去哈希会得到完全不同的环。
+     * ⚠ 必须逐字符是 "MessageQueue [topic=.., brokerName=.., queueId=..]"：
+     * 本端口 MessageQueue::__toString 是另一种写法，拿它去哈希会得到完全不同的环，
+     * 同组实例之间也就算不出同一条环。
      */
-    public static function javaMessageQueueString(MessageQueue $mq): string
+    public static function wireQueueKeyString(MessageQueue $mq): string
     {
         return sprintf('MessageQueue [topic=%s, brokerName=%s, queueId=%d]', $mq->topic, $mq->brokerName, $mq->queueId);
     }
 
     /**
-     * 对应 Java `String#split(String)`（limit=0）：**丢掉末尾的空段**。
+     * 按「裁掉末尾空段」的语义切分字符串（等价于 limit=0 的 split）。
      *
-     * PHP 的 explode 保留尾空段，两边对 broker 名的切分结果因此不同，而
-     * AllocateMessageQueueByMachineRoom 恰好按 `length == 2` 判合法，差异会直接改变
+     * PHP 原生 explode 保留尾空段，两者对 broker 名的切分结果因此不同，而
+     * AllocateMessageQueueByMachineRoom 恰好按「段数 == 2」判合法，差异会直接改变
      * 一条队列参不参与分配：
      *
-     * | 输入 | Java | PHP 原生 explode |
+     * | 输入 | wireSplit | 原生 explode |
      * |---|---|---|
      * | `"room1@"` | `["room1"]`（1 段，剔除） | `["room1", ""]`（2 段，误收） |
      * | `"room1@b@"` | `["room1", "b"]`（2 段，收） | `["room1", "b", ""]`（3 段，误剔） |
      * | `"@"` | `[]` | `["", ""]` |
      * | `""` / `"broker-a"` | 无分隔符命中时**整串原样返回**，哪怕是空串 | 同 |
      *
-     * 最后一行是 Java `Pattern#split` 里 "If no match was found, return this" 那个早返回，
-     * 所以不能无条件裁尾（否则 `""` 会变成 `[]`）。以上取值用 JDK 17 实测核对过。
+     * 最后一行的早返回不能省：没命中分隔符时必须原样返回，所以不能无条件裁尾
+     * （否则 `""` 会变成 `[]`）。
      *
      * @return list<string>
      */
-    public static function javaSplit(string $text, string $sep): array
+    public static function wireSplit(string $text, string $sep): array
     {
         $parts = explode($sep, $text);
         if (count($parts) === 1) {
-            return $parts; // 没命中分隔符：Java 原样返回整串
+            return $parts; // 没命中分隔符：整串原样返回
         }
         while ($parts !== [] && end($parts) === '') {
             array_pop($parts);
@@ -612,7 +609,7 @@ final class AllocateMessageQueueConsistentHash implements AllocateMessageQueueSt
         }
         $result = [];
         foreach ($mqAll as $mq) {
-            $node = $router->routeNode(AllocationHelper::javaMessageQueueString($mq));
+            $node = $router->routeNode(AllocationHelper::wireQueueKeyString($mq));
             if ($node !== null && $node->getKey() === $currentCID) {
                 $result[] = $mq;
             }
@@ -634,7 +631,7 @@ final class AllocateMessageQueueConsistentHash implements AllocateMessageQueueSt
  * 分配，然后在这些队列内部再做一次"平均分配"（分片算法与 AVG 逐行相同，但 rem 的归属
  * 判据是 `rem > currentIndex`，即余数队列发给前 rem 个消费者）。
  *
- * ⚠ broker 名的切分走 AllocationHelper::javaSplit()，不是 PHP 原生 explode：Java 会丢掉
+ * ⚠ broker 名的切分走 AllocationHelper::wireSplit()，不是 PHP 原生 explode：Java 会丢掉
  * 末尾空段，`"room1@"` 在 Java 是 1 段（不参与分配）、`"room1@b@"` 是 2 段（参与）。
  *
  * ⚠ Java 的 `consumeridcs` 字段没有默认值，没 set 就 `contains` → NPE；这里默认空集合，
@@ -673,7 +670,7 @@ final class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStr
         $currentIndex = (int) $currentIndex;
         $premqAll = [];
         foreach ($mqAll as $mq) {
-            $temp = AllocationHelper::javaSplit($mq->brokerName, '@');
+            $temp = AllocationHelper::wireSplit($mq->brokerName, '@');
             if (count($temp) === 2 && isset($this->consumeridcs[$temp[0]])) {
                 $premqAll[] = $mq;
             }
@@ -772,7 +769,7 @@ final class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy
             } else {
                 throw new \ValueError(sprintf(
                     'Machine room is null for mq %s',
-                    AllocationHelper::javaMessageQueueString($mq)
+                    AllocationHelper::wireQueueKeyString($mq)
                 ));
             }
         }

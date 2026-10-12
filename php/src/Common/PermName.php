@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 权限位常量（对应 org.apache.rocketmq.common.PermName，移植自 sysflag.py 的 PermName）。
+ * 权限位常量：topic / 订阅组的 perm 字段按位解释（R=4、W=2、X=1）。
  */
 final class PermName
 {
@@ -16,10 +16,10 @@ final class PermName
     public const PERM_OWNER = 0x1 << 4;
 
     /**
-     * 对应 Java PermName.isValid：``perm >= 0 && perm < PERM_PRIORITY``。
+     * 合法权限值：``perm >= 0 && perm < PERM_PRIORITY``。
      *
-     * Java 的 ``isValid(String)`` 直接 ``Integer.parseInt``，非数字会抛
-     * NumberFormatException；这里保持一致（抛 ValueError），调用方需自行捕获。
+     * 字符串入参不是数字时抛 ValueError——perm 来自配置文本，把坏值静默当 0
+     * 会变成误放行；调用方需自行捕获。
      */
     public static function isValid(int|string $perm): bool
     {

@@ -32,7 +32,7 @@ static int g_fail = 0;
     } while (0)
 
 // 在 Java 文本中查找 `name = <int> ;`（允许空白），返回是否命中并输出取值
-static bool parseJavaConst(const std::string& text, const std::string& name, long long& out) {
+static bool parseProtocolConst(const std::string& text, const std::string& name, long long& out) {
     size_t from = 0;
     while (true) {
         size_t p = text.find(name, from);
@@ -127,7 +127,7 @@ static bool readFile(const std::string& path, std::string& out) {
     return true;
 }
 
-static void checkAgainstJavaSource() {
+static void checkAgainstProtocolSource() {
     const char* src = std::getenv("ROCKETMQ_JAVA_SRC");
     if (src == nullptr || *src == '\0') {
         std::cout << "[skip] ROCKETMQ_JAVA_SRC not set; Java source regression check skipped\n";
@@ -159,7 +159,7 @@ static void checkAgainstJavaSource() {
     };
     for (const auto& pr : pairs) {
         long long v = 0;
-        if (parseJavaConst(text, pr.name, v)) {
+        if (parseProtocolConst(text, pr.name, v)) {
             CHECK(v == pr.expect, std::string("java ") + pr.name + " matches codes.h");
         } else {
             std::cout << "[warn] java const " << pr.name << " not found; skipped\n";
@@ -169,7 +169,7 @@ static void checkAgainstJavaSource() {
 
 // ClientErrorCode.java 单独一趟：上面那个函数在 RequestCode.java 缺失时会提前 return，
 // 不能连带把这张表的回归检查也跳掉。
-static void checkClientErrorCodeAgainstJava() {
+static void checkClientErrorCodeAgainstProtocolSource() {
     const char* src = std::getenv("ROCKETMQ_JAVA_SRC");
     if (src == nullptr || *src == '\0') {
         return;
@@ -195,7 +195,7 @@ static void checkClientErrorCodeAgainstJava() {
     };
     for (const auto& pr : pairs) {
         long long v = 0;
-        if (parseJavaConst(text, pr.name, v)) {
+        if (parseProtocolConst(text, pr.name, v)) {
             CHECK(v == pr.expect, std::string("java ClientErrorCode.") + pr.name
                                       + " matches exception.h");
         } else {
@@ -207,10 +207,10 @@ static void checkClientErrorCodeAgainstJava() {
 
 int main() {
     checkBuiltinTable();
-    checkAgainstJavaSource();
-    checkClientErrorCodeAgainstJava();
+    checkAgainstProtocolSource();
+    checkClientErrorCodeAgainstProtocolSource();
 
-    std::cout << "\n===== java alignment summary =====\n";
+    std::cout << "\n===== protocol alignment summary =====\n";
     std::cout << "  PASS=" << g_pass << " FAIL=" << g_fail << "\n";
     if (g_fail == 0) return 0;
     return 1;

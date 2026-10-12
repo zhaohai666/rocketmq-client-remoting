@@ -1,12 +1,9 @@
 // -*- coding: utf-8 -*-
-// Request/response headers (org.apache.rocketmq.remoting.protocol.header.*).
-// Mirrors python/remoting/protocol/headers.py.
+// 经典 remoting 协议的请求/响应头。
 //
-// Each header implements toExtFields() (return a plain object of string-coercible
-// fields; null is skipped) and fromExtFields(fields) (read from a
-// Record<string,string>). Booleans are normalised to Java's lowercase
-// "true"/"false" so on-wire packets match the Java client byte-for-byte.
-// Field names are identical to the Java wire keys.
+// 每个 header 实现 toExtFields()（返回一个可转成字符串的字段普通对象，null
+// 会被跳过）和 fromExtFields(fields)（从 Record<string,string> 读取）。
+// 布尔值统一规范化为小写的 "true"/"false"，字段名与 wire 上的协议键完全一致。
 
 function _ext(fields: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = {};
@@ -97,8 +94,8 @@ export class SendMessageRequestHeader extends CommandCustomHeader {
   }
 }
 
-// Short field-name V2 encoding (producerGroup->a ... brokerName->n).
-// NOTE: Java SendMessageRequestHeaderV2 has 14 short keys (a..n), not 17.
+// 短字段名 V2 编码（producerGroup->a ... brokerName->n）。
+// 注意：SendMessageRequestHeaderV2 的短键是 14 个（a..n），不是 17 个。
 export class SendMessageRequestHeaderV2 extends CommandCustomHeader {
   producerGroup: string | null = null;
   topic: string | null = null;
@@ -1124,9 +1121,8 @@ export class QueryDataVersionResponseHeader extends CommandCustomHeader {
 }
 
 export class PopMessageRequestHeader extends CommandCustomHeader {
-  // bname is the inherited RpcRequestHeader.bname; Java's popAsync sets it from
-  // the message queue's broker name. The broker ignores it for POP, but it is
-  // part of what Java sends.
+  // bname 继承自 RpcRequestHeader.bname，POP 请求时用消息队列的 broker 名填充。
+  // broker 在 POP 处理中会忽略它，但协议要求照常发送。
   bname: string | null = null;
   consumerGroup: string | null = null;
   topic: string | null = null;

@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""异步发送链（对应 Java DefaultMQProducerImpl.send(msg, SendCallback, timeout) +
-MQClientAPIImpl.sendMessageAsync / onExceptionImpl）的单测。
+"""异步发送链（send_async(msg, callback, timeout) 及其底层的 remoting 异步请求/失败重试）
+的单测。
 
-对齐基准是 Java 5.5.1，盯的是这些真实行为（不是"异步 = 开个线程"）：
+盯的是这些真实行为（不是"异步 = 开个线程"）：
 
   * ``send_async`` **不阻塞调用方**：准备工作全部在 ``AsyncSenderExecutor_N`` 里做
     （池大小 = CPU 核数、队列有界 50000），队列满了才把 ``executor rejected`` 抛给调用方；
   * 出队之后才算耗时：预算被排队吃掉直接回调
     ``RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")``，一次请求都不发；
-  * ASYNC 在 ``sendDefaultImpl`` 里 ``timesTotal`` 固定为 1 —— 外层循环不换 broker，
-    换 broker 只发生在 ``onExceptionImpl``，上限是 ``retryTimesWhenSendAsyncFailed``；
+  * ASYNC 在默认发送循环里 ``timesTotal`` 固定为 1 —— 外层循环不换 broker，
+    换 broker 只发生在失败重试链上，上限是 ``retryTimesWhenSendAsyncFailed``；
   * 重试**复用同一个 RemotingCommand**（请求只建一次）并换新 opaque —— 旧 opaque 还挂在
     responseTable 里等超时，复用会让两次尝试的应答串台；
   * 超时预算是**共享**的剩余时间（``timeoutMillis - cost``），不是每次尝试各给一份；
@@ -19,10 +19,9 @@ MQClientAPIImpl.sendMessageAsync / onExceptionImpl）的单测。
     不重试；
   * ⚠ **已经收到响应**但 broker 回了错误码（``MQBrokerException``）**不重试、也不包装** ——
     异步发送不看 ``retryResponseCodes``，这点和同步发送完全不同；
-  * 定点发送（带 mq）时 Java 传的 topicPublishInfo 是 null，所以重试**回到同一台 broker**；
-  * 用户回调与 ``SendMessageHook.after`` 在 ``NettyClientPublicExecutor_N`` 上跑（Java 的
-    ``executeInvokeCallback`` 把回调 submit 到 publicExecutor，池不可用才就地跑），
-    用户回调抛异常被吞掉，不能带走 worker。
+  * 定点发送（带 mq）时下传的主题发布信息为 null，所以重试**回到同一台 broker**；
+  * 用户回调与 ``SendMessageHook.after`` 在 ``NettyClientPublicExecutor_N`` 上跑（回调统一
+    submit 到公共执行器，池不可用才就地跑），用户回调抛异常被吞掉，不能带走 worker。
 
 真机那段（消息真的落到 broker、回调里拿到 SEND_OK）在 ``verify_message_types.py`` 第 1 节。
 """
@@ -101,8 +100,8 @@ class _Callback:
 class _FakeAsyncClient:
     """MQClientInstance 替身，缝在异步发送用到的那三个接口上。
 
-    ``outcomes`` 每一项：BaseException -> 从 ``send_message_async`` **就地抛出**（对应 Java
-    ``sendMessageAsync`` 的 try-catch）；``_Deliver`` -> 走 ``on_complete`` 回调。
+    ``outcomes`` 每一项：BaseException -> 从 ``send_message_async`` **就地抛出**（同步失败）；
+    ``_Deliver`` -> 走 ``on_complete`` 回调。
     列表用完之后一律回 SEND_OK。
     """
 
@@ -118,12 +117,12 @@ class _FakeAsyncClient:
         self.name_server_addrs = (["127.0.0.1:9876"] if namesrv_addrs is None
                                   else list(namesrv_addrs))
         self.block = block
-        # 发布地址**平表**（Java brokerAddrTable）：brokerName -> master 地址。
-        # 冷名单里的 broker 就是「没主」，压根不进表 —— findBrokerAddressInPublish 查不到。
+        # 发布地址**平表**：brokerName -> master 地址。
+        # 冷名单里的 broker 就是「没主」，压根不进表 —— 发布地址表查不到。
         self.publish_addr_table = {"broker-a": ADDR_A, "broker-b": ADDR_B}
         for name in cold_brokers:
             self.publish_addr_table.pop(name, None)
-        # get_topic_route_data 的返回值（Java sendKernelImpl 里那次按 topic 刷路由）
+        # get_topic_route_data 的返回值（定点发送链里那次按 topic 刷路由用）
         self.route = route
         self.attempts: List[tuple] = []   # (addr, broker_name, opaque, timeout)
         self.built: List[int] = []        # build_send_request 收到的 mq 个数（用于计数）
@@ -163,7 +162,7 @@ class _FakeAsyncClient:
         """按 topic 刷一次路由：把 route 里**有主**的 broker 覆盖进发布地址平表。
 
         真身这一步写的就是平表 ``broker_addr_table``；没主的 broker 不写，等于刷完仍
-        查不到（Java 那边 master 掉线后表里那条会变成空 map）。
+        查不到。
         """
         for broker_data in (getattr(self.route, "broker_datas", None) or []):
             if broker_data.broker_addrs.get(0):
@@ -281,7 +280,7 @@ def _wait_num_permits(p: DefaultMQProducer, want: int, timeout: float = 5.0) -> 
 
 # ---------------------------------------------------------------- 调用方不阻塞
 def test_send_async_returns_before_the_request_is_issued():
-    """Java：任务只是 submit 到 asyncSenderExecutor，调用方立刻返回。"""
+    """任务只是 submit 到 asyncSenderExecutor，调用方立刻返回。"""
     gate = threading.Event()
     p = _producer(block=gate)
     cb = _Callback()
@@ -315,7 +314,7 @@ def test_send_work_happens_off_the_caller_thread():
             break
         time.sleep(0.005)
     assert "result" in seen, seen
-    # Java 的 ThreadFactoryImpl 名字形如 AsyncSenderExecutor_1 / NettyClientPublicExecutor_1
+    # worker 线程名形如 AsyncSenderExecutor_1 / NettyClientPublicExecutor_1
     assert seen["callback_thread"].startswith("NettyClientPublicExecutor_")
     assert seen["callback_thread"] != caller
     assert _client(p).attempts_count == 1
@@ -332,14 +331,14 @@ def test_async_success_callback_and_hook_after():
     assert len(cb.results) == 1 and cb.results[0].send_status == SendStatus.SEND_OK
     assert not cb.errors
     assert len(hook.before) == 1 and len(hook.after) == 1
-    # Java sendKernelImpl 的 ASYNC 分支：communicationMode 要标成 ASYNC
+    # ASYNC 分支的钩子上下文：communicationMode 要标成 ASYNC
     assert hook.before[0].communication_mode == CommunicationMode.ASYNC
     assert hook.after[0].send_result is cb.results[0]
     assert hook.after[0].exception is None
 
 
 def test_user_callback_exception_does_not_kill_the_pool():
-    """Java：onSuccess/onException 外面包着 catch(Throwable)，回调异常不能带走 worker。"""
+    """onSuccess/onException 外面包着兜底 catch：回调异常不能带走 worker。"""
     p = _producer()
     first = _Callback(raise_error=True)
     p.send_async(Message("TopicTest", b"x"), first, 3000)
@@ -356,7 +355,7 @@ def test_user_callback_exception_does_not_kill_the_pool():
 
 # ---------------------------------------------------------------- 排队与耗时
 def test_zero_timeout_fails_without_sending_anything():
-    """Java sendDefaultImpl 的 runnable：timeout <= costTime 直接 onException。"""
+    """异步任务出队执行的 runnable：timeout <= costTime 直接 onException。"""
     p = _producer()
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 0)
@@ -367,7 +366,7 @@ def test_zero_timeout_fails_without_sending_anything():
 
 
 def test_bounded_queue_rejects_the_caller_not_the_callback():
-    """Java：executor.submit 抛 RejectedExecutionException → MQClientException("executor rejected")。
+    """executor 拒收任务时直接把 ``MQClientException("executor rejected")`` 抛给调用方。
 
     这里把池压成 1 个 worker + 1 个队列位（真实池是 CPU 核数 + 50000），
     好让"占住 worker → 填满队列 → 第三个被拒"这条链跑得快且确定。
@@ -403,7 +402,7 @@ def test_not_started_producer_raises_synchronously():
 
 # ---------------------------------------------------------------- 换 broker 重试
 def test_connect_failure_retries_with_new_opaque_and_shrinking_budget():
-    """Java onExceptionImpl：times<=retryTimesWhenSendAsyncFailed 才重试，
+    """失败重试链：times<=retryTimesWhenSendAsyncFailed 才重试，
     每轮换 broker、换 opaque、复用同一个请求，超时用共享的剩余预算。"""
     outcomes = [RemotingConnectException(ADDR_A), RemotingConnectException(ADDR_B),
                 RemotingConnectException(ADDR_A)]
@@ -418,9 +417,9 @@ def test_connect_failure_retries_with_new_opaque_and_shrinking_budget():
     assert client.brokers[0] != client.brokers[1]   # 避开刚失败的那台
     assert client.timeouts[1] <= client.timeouts[0]
     assert len(cb.results) == 0 and len(cb.errors) == 1
-    # Java sendMessageAsync 的**外层 catch**：异常原样交给回调（不包 MQClientException），
+    # remoting 调用**就地抛异常**这条路：异常原样交给回调（不包 MQClientException），
     # 并且 needRetry=true。包装成 "send request failed"/"unknown reason" 的是
-    # operationFail 那条路（见下面两个用例）。
+    # 回调投递失败那条路（见下面两个用例）。
     assert isinstance(cb.errors[0], RemotingConnectException)
 
 
@@ -438,8 +437,8 @@ def test_retry_cap_zero_disables_failover():
 def test_broker_error_code_is_returned_as_is_without_retry():
     """⚠ 与同步发送不同：响应已收到 → needRetry=false，异常也**不包装**。
 
-    Java ``sendMessageAsync`` 的 ``operationSucceed`` 里 ``processSendResponse`` 抛
-    ``MQBrokerException`` 会进 ``catch (Exception e)`` → ``onExceptionImpl(..., false, ...)``。
+    正常收响应那条路上 ``processSendResponse`` 抛的 ``MQBrokerException`` 会进
+    ``catch (Exception e)`` → 按 ``needRetry=false`` 交给失败回调。
     """
     broker_error = MQBrokerException(ResponseCode.SYSTEM_BUSY, "broker busy")
     p = _producer(outcomes=[_Deliver(error=broker_error)], async_retry=2)
@@ -460,7 +459,7 @@ def test_retry_cap_is_read_from_config():
 
 
 def test_retry_budget_is_shared_not_per_attempt():
-    """Java onExceptionImpl 传的是 ``timeoutMillis - cost``：预算**共享**，
+    """重试传的是 ``timeoutMillis - cost``：预算**共享**，
     第二次尝试拿到的超时是剩下的那一点，而不是又一个完整 timeout。"""
     p = _producer(outcomes=[RemotingConnectException(ADDR_A),
                             RemotingConnectException(ADDR_B)], async_retry=2)
@@ -476,7 +475,7 @@ def test_retry_budget_is_shared_not_per_attempt():
 
 
 def test_operation_fail_errors_are_wrapped_by_type():
-    """Java operationFail 的三分支：按异常类型包装文案，TooMuchRequest 不重试。"""
+    """失败包装的三分支：按异常类型包装文案，TooMuchRequest 不重试。"""
     cases = [
         (RemotingSendRequestException(ADDR_A, "io fail"), "send request failed", True),
         (RemotingTimeoutException(ADDR_A, 3000), "wait response timeout", True),
@@ -498,7 +497,7 @@ def test_operation_fail_errors_are_wrapped_by_type():
 
 # ---------------------------------------------------------------- 定点发送
 def test_fixed_mq_retry_stays_on_the_same_broker():
-    """Java send(msg, mq, cb, timeout) 传下去的 topicPublishInfo 是 null → 原地重试。"""
+    """定点发送下传的 topicPublishInfo 是 null → 原地重试。"""
     p = _producer(queues=[_mq("broker-a", 0)],
                   outcomes=[RemotingConnectException(ADDR_A),
                             RemotingConnectException(ADDR_A)], async_retry=2)
@@ -533,9 +532,9 @@ def test_fixed_mq_runs_check_forbidden_hook_in_async_mode():
 
 
 def test_pinned_send_refreshes_the_route_to_resolve_the_address():
-    """Java ``sendKernelImpl:919-924``：发布地址表查不到时按 topic 刷一次路由再解析。
+    """发布地址表查不到时按 topic 刷一次路由再解析。
 
-    定点发送（调用方直接给 mq）不会在 sendDefaultImpl 里取发布信息，所以这一步是它
+    定点发送（调用方直接给 mq）不会在发送主流程里取发布信息，所以这一步是它
     唯一的路由来源 —— 少了这一步，第一次定点发送必然带着空地址去连。
     """
     route = TopicRouteData()
@@ -550,7 +549,7 @@ def test_pinned_send_refreshes_the_route_to_resolve_the_address():
 
 
 def test_unresolvable_broker_reports_not_exist_through_callback():
-    """刷完路由还是没有这台 broker：Java ``sendKernelImpl:1100`` 的 "The broker[..] not exist"。"""
+    """刷完路由还是没有这台 broker：回调里要收到 "The broker[..] not exist"。"""
     p = _producer(cold_brokers=["broker-cold"], route=TopicRouteData())
     cb = _Callback()
     p.send_async(Message("TopicTest", b"x"), cb, 3000, _mq("broker-cold", 0))
@@ -561,7 +560,7 @@ def test_unresolvable_broker_reports_not_exist_through_callback():
 
 
 def test_async_kernel_timeout_gate_fails_before_the_request_goes_out():
-    """Java ``sendKernelImpl:1043-1046``：ASYNC 分支自己的总闸。
+    """ASYNC 分支自己的发送内核总闸。
 
     钩子/压缩/路由都是这条链的耗时，预算被它们吃光时不再发起请求，回调拿到
     ``RemotingTooMuchRequestException("sendKernelImpl call timeout")`` 且**不重试**。
@@ -586,7 +585,7 @@ def test_async_kernel_timeout_gate_fails_before_the_request_goes_out():
     assert _client(p).attempts_count == 0, "预算用尽后不能再发请求"
     assert isinstance(cb.errors[0], RemotingTooMuchRequestException)
     assert "sendKernelImpl call timeout" in str(cb.errors[0])
-    # Java :1088 的 catch 先跑 hook.after 再抛，所以 after 一定拿到这个异常
+    # 这条链的 catch 先跑 hook.after 再抛，所以 after 一定拿到这个异常
     assert len(hook.after) == 1
     assert isinstance(hook.after[0].exception, RemotingTooMuchRequestException)
 
@@ -624,7 +623,7 @@ def test_missing_route_reports_not_found_topic_through_callback():
 def test_no_name_server_address_reaches_the_callback_as_10004():
     """异步链的定性不能和同步链分叉：没有 name server 地址时回调里拿到的也得是 10004。
 
-    Java 的 ASYNC 走的正是 sendDefaultImpl 那条分支（:888 先 validateNameServerSetting
+    异步链与同步链走的是同一个 no-route 分支（先 validateNameServerSetting
     再抛 no-route），所以两条链共用同一个判定；异步侧以前把异常包成新的 MQClientException
     时丢了码，10004 会被改写成 10005。
     """
@@ -639,7 +638,7 @@ def test_no_name_server_address_reaches_the_callback_as_10004():
 
 
 def test_batch_messages_fall_back_to_the_sync_batch_kernel():
-    """有意偏离 Java：本实现的批量发送只有同步内核，但同样不阻塞调用方、回调照样触发。"""
+    """批量发送只有同步内核是有意设计：不阻塞调用方、回调照样触发。"""
     p = _producer()
     calls = []
 
@@ -656,10 +655,10 @@ def test_batch_messages_fall_back_to_the_sync_batch_kernel():
 
 
 def test_send_batch_writes_client_ids_before_encoding_the_body():
-    """对应 Java DefaultMQProducer.batch():1172-1184 的**顺序**：逐条 checkMessage →
+    """批量发送必须遵守的**顺序**：逐条 checkMessage →
     逐条 setUniqID → 逐条拼命名空间 → 给批量本身 setUniqID → 才 encode()。
 
-    顺序错或干脆不写（本端口原先就是这样）会让批量 body 里的每条子消息都没有 UNIQ_KEY：
+    顺序错或干脆不写会让批量 body 里的每条子消息都没有 UNIQ_KEY：
     消费端拿到没有客户端 ID 的消息、轨迹控制台串不起发送侧与消费侧，而 SendResult.msgId
     只能退化成 broker 的 offsetMsgId —— 单看「发成功了没」完全看不出来。
     """
@@ -688,8 +687,8 @@ def test_send_batch_writes_client_ids_before_encoding_the_body():
     inner = decode_batch_messages(batch.get_body())
     assert [m.get_property(UNIQ) for m in inner] == sub_ids
     assert [m.topic for m in batch.messages] == [p._with_namespace("TopicTest")] * 2
-    # ③ 回调里的 msgId 是**批量自身**的 UNIQ_KEY（四语言统一口径；Java 在非 inner-batch
-    #    时拼逐条 ID，本端口解析层拿不到子消息列表，理由见 _parse_send_response 的注释）
+    # ③ 回调里的 msgId 是**批量自身**的 UNIQ_KEY（非 inner-batch 时本端口解析层
+    #    拿不到子消息列表，无法逐条拼 ID，理由见 _parse_send_response 的注释）
     response = RemotingCommand.create_response_command_with_header(ResponseCode.SUCCESS)
     response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0"}
     parsed = MQClientInstance._parse_send_response(None, response, batch, _mq("broker-a", 0))
@@ -704,12 +703,11 @@ def test_send_batch_writes_client_ids_before_encoding_the_body():
 
 
 # ---------------------------------------------------------------- 线程名 / 生命周期
-def test_executor_thread_names_follow_java(monkeypatch):
-    """Java 的 ThreadFactoryImpl 名字形如 ``AsyncSenderExecutor_1``，序号从 **1** 开始。
+def test_executor_thread_names_use_the_numbered_prefix(monkeypatch):
+    """worker 线程名形如 ``AsyncSenderExecutor_1``，序号从 **1** 开始。
 
-    这里把 ``cpu_count`` 钉成 1：池是 core==max==核数（Java
-    ``DefaultMQProducerImpl:134-140``），单核下两次投递才复用同一个 worker。
-    多核机器上不会复用 —— 那是 Java ``ThreadPoolExecutor`` 的真实行为，见
+    这里把 ``cpu_count`` 钉成 1：池是 core==max==核数，单核下两次投递才复用同一个 worker。
+    多核机器上不会复用 —— 那是池按 core 逐步建线程的真实行为，见
     ``test_workers_grow_one_thread_per_submit_until_core``。
     """
     monkeypatch.setattr(producer_module.os, "cpu_count", lambda: 1)
@@ -730,7 +728,7 @@ def test_executor_thread_names_follow_java(monkeypatch):
 
 
 def test_workers_grow_one_thread_per_submit_until_core(monkeypatch):
-    """core==max==4：Java ``ThreadPoolExecutor`` 在 ``poolSize < corePoolSize`` 时**每个任务
+    """core==max==4：池未达 core（``poolSize < corePoolSize``）时**每个任务
     新建一条线程**（哪怕别的 worker 正闲着），序号从 1 递增；到了 core 才不再建。
 
     断的是"建了几条、叫什么"，不是"任务落在哪条上"：``notify`` 叫醒的是先在等待的那个
@@ -768,7 +766,7 @@ def test_shutdown_stops_accepting_new_work():
 
 
 def test_callback_survives_after_callback_pool_is_gone():
-    """Java executeInvokeCallback：池不可用（关了/被拒）就 **runInThisThread**，回调不能丢。"""
+    """回调投递：池不可用（关了/被拒）就 **runInThisThread**，回调不能丢。"""
     p = _producer()
     pool = p._callback_executor
     pool.shutdown(wait=True)
@@ -780,9 +778,8 @@ def test_callback_survives_after_callback_pool_is_gone():
 
 
 # ---------------------------------------------------------------- 异步发送背压
-# 对端是 Java DefaultMQProducerImpl:635-682（executeAsyncMessageSend 的两道闸）与
-# :577-633（BackpressureSendCallBack 的归还）。默认关闭，所以上面那批用例一行都不用改。
-# 字节闸的地板值是 1M（Java :148-153），所以这里只能拿"1M 少掉多少"来断言，
+# 异步发送有两道闸：条数闸与字节闸，许可在回调里归还。默认关闭，所以上面那批用例一行都不用改。
+# 字节闸的地板值是 1M，所以这里只能拿"1M 少掉多少"来断言，
 # 不能把上限配成几百字节 —— 那会被夹回 1M。
 def _backpressure_producer(num: int = 10, size: int = MIN_ASYNC_SEND_SIZE,
                            **kwargs) -> DefaultMQProducer:
@@ -794,8 +791,8 @@ def _backpressure_producer(num: int = 10, size: int = MIN_ASYNC_SEND_SIZE,
     return p
 
 
-def test_backpressure_defaults_match_java_and_stay_out_of_the_way():
-    """Java DefaultMQProducer:169/175/181 —— 默认关，1024 条 / 100M 字节。"""
+def test_backpressure_defaults_are_effectively_open():
+    """背压默认关，条数 1024 / 字节 100M。"""
     p = DefaultMQProducer("GID_async_test")
     assert p.is_enable_backpressure_for_async_mode() is False
     assert p.get_back_pressure_for_async_send_num() == 1024
@@ -814,7 +811,7 @@ def test_backpressure_defaults_match_java_and_stay_out_of_the_way():
 
 
 def test_backpressure_num_floor_is_ten_and_size_floor_is_one_meg():
-    """Java DefaultMQProducerImpl:141-153 与 :1385/1402 —— 两个地板值都夹得住。"""
+    """条数地板 10、字节地板 1M —— 两个下限都夹得住。"""
     p = DefaultMQProducer("GID_async_test")
     p.set_back_pressure_for_async_send_num(1)
     p.set_back_pressure_for_async_send_size(1024)
@@ -824,8 +821,8 @@ def test_backpressure_num_floor_is_ten_and_size_floor_is_one_meg():
     assert p.get_semaphore_async_send_size_available_permits() == MIN_ASYNC_SEND_SIZE
 
 
-def test_num_gate_fails_with_java_message_and_sends_nothing():
-    """Java :654-658 —— 条数拿不到就回调，一次请求都不发（预算也被闸自己花光）。"""
+def test_num_gate_fails_with_the_protocol_message_and_sends_nothing():
+    """条数拿不到就回调，一次请求都不发（预算也被闸自己花光）。"""
     gate = threading.Event()
     p = _backpressure_producer(num=10, block=gate)
     assert p._semaphore_async_send_num.try_acquire(10, 0) is True   # 占满在途
@@ -843,7 +840,7 @@ def test_num_gate_fails_with_java_message_and_sends_nothing():
 
 
 def test_size_gate_fails_with_its_own_message_and_gives_the_num_permit_back():
-    """Java :667-671 —— 字节闸没过时，**已经拿到**的条数许可必须归还。"""
+    """字节闸没过时，**已经拿到**的条数许可必须归还。"""
     p = _backpressure_producer(num=10)
     assert p._semaphore_async_send_size.try_acquire(MIN_ASYNC_SEND_SIZE, 0) is True
     cb = _Callback()

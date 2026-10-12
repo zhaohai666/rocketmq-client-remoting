@@ -8,9 +8,9 @@ add_executable(rmq_test_client_id test_client_id.cpp)
 target_link_libraries(rmq_test_client_id PRIVATE rocketmq::remoting)
 add_test(NAME client_id COMMAND rmq_test_client_id)
 
-add_executable(rmq_test_java_alignment test_java_alignment.cpp)
-target_link_libraries(rmq_test_java_alignment PRIVATE rocketmq::remoting)
-add_test(NAME java_alignment COMMAND rmq_test_java_alignment)
+add_executable(rmq_test_protocol_alignment test_protocol_alignment.cpp)
+target_link_libraries(rmq_test_protocol_alignment PRIVATE rocketmq::remoting)
+add_test(NAME protocol_alignment COMMAND rmq_test_protocol_alignment)
 
 # 路由 / 心跳 / 订阅数据：往返 + Java 字段名守卫
 add_executable(rmq_test_route_heartbeat test_route_heartbeat.cpp)

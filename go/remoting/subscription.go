@@ -1,10 +1,9 @@
-// Subscription-group models, mirroring
-// org.apache.rocketmq.remoting.protocol.subscription.*:
+// Subscription-group models:
 // SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData and the
 // SubscriptionGroupWrapper body.
 //
-// Field names and defaults come from the Java 5.x probe
-// (`JSON.toJSONString(new SubscriptionGroupConfig())`):
+// Field names and defaults captured from a live 5.5.1 server's rendering of
+// a default SubscriptionGroupConfig:
 //
 //	{"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
 //	 "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
@@ -22,14 +21,14 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// GroupRetryPolicyType mirrors Java GroupRetryPolicyType.
+// GroupRetryPolicyType wire names.
 const (
 	GroupRetryPolicyExponential = "EXPONENTIAL"
 	GroupRetryPolicyCustomized  = "CUSTOMIZED"
 )
 
 // GroupRetryPolicy is the simplified form: `type` plus the two sub-policies
-// kept as raw maps (Java leaves them null by default, so they are only
+// kept as raw maps (the server leaves them null by default, so they are only
 // serialised once explicitly set).
 type GroupRetryPolicy struct {
 	Type                   string
@@ -37,7 +36,7 @@ type GroupRetryPolicy struct {
 	CustomizedRetryPolicy  map[string]any
 }
 
-// NewGroupRetryPolicy builds the Java default (type=CUSTOMIZED, both
+// NewGroupRetryPolicy builds the protocol default (type=CUSTOMIZED, both
 // sub-policies null).
 func NewGroupRetryPolicy() *GroupRetryPolicy {
 	return &GroupRetryPolicy{Type: GroupRetryPolicyCustomized}
@@ -111,7 +110,7 @@ type SubscriptionGroupConfig struct {
 	Attributes                     map[string]string
 }
 
-// NewSubscriptionGroupConfig builds a config with Java's defaults.
+// NewSubscriptionGroupConfig builds a config with the broker's defaults.
 func NewSubscriptionGroupConfig(groupName string) *SubscriptionGroupConfig {
 	return &SubscriptionGroupConfig{
 		GroupName:                      groupName,
@@ -147,8 +146,8 @@ func (c *SubscriptionGroupConfig) ToJSONValue() map[string]any {
 		"consumeTimeoutMinute":           c.ConsumeTimeoutMinute,
 	}
 	// fastjson2 drops nulls: only emit the key when there IS a retry policy.
-	// Java's default constructor initialises it, but setGroupRetryPolicy(null)
-	// is legal and a hand-built config can simply leave it nil — dereferencing
+	// The default broker-side config initialises it, but a null policy is
+	// legal and a hand-built config can simply leave it nil — dereferencing
 	// that used to panic the whole request (found by live_admin).
 	if c.GroupRetryPolicy != nil {
 		d["groupRetryPolicy"] = c.GroupRetryPolicy.ToJSONValue()
@@ -306,9 +305,9 @@ func DecodeSubscriptionGroupWrapper(data []byte) (*SubscriptionGroupWrapper, err
 	return w, nil
 }
 
-// PredefinedGroups mirrors Java MixAll.PREDEFINE_GROUP_SET.
+// PredefinedGroups is the broker's predefined group set.
 //
-// Keep this byte-for-byte with the Java/Python sets — getUserSubscriptionGroup
+// Keep it byte-for-byte with the server-side set — getUserSubscriptionGroup
 // filters with it, so an extra entry silently hides a real user group from the
 // admin tools.
 var PredefinedGroups = map[string]bool{
@@ -328,7 +327,7 @@ var PredefinedGroups = map[string]bool{
 	"CID_SYS_RMQ_TRANS":     true,
 }
 
-// IsPredefinedGroup mirrors Java MixAll.isPredefinedGroup.
+// IsPredefinedGroup reports whether the name is a predefined group.
 func IsPredefinedGroup(group string) bool { return PredefinedGroups[group] }
 
 // IsSysConsumerGroupAdmin is the admin-side view of "system group": the

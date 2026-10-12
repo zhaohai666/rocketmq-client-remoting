@@ -25,7 +25,7 @@ func TestSubscriptionGroupConfigNilRetryPolicyDoesNotPanic(t *testing.T) {
 	}
 }
 
-// The non-nil case keeps the key, with the Java field spelling.
+// The non-nil case keeps the key, with the broker-side field spelling.
 func TestSubscriptionGroupConfigRetryPolicyIsSerialisedWhenSet(t *testing.T) {
 	cfg := NewSubscriptionGroupConfig("G")
 
@@ -36,8 +36,8 @@ func TestSubscriptionGroupConfigRetryPolicyIsSerialisedWhenSet(t *testing.T) {
 }
 
 // Round trip: a nil policy encodes to an absent key, and decoding an absent key
-// restores the Java default (the field is initialised in Java's constructor, so
-// it is never null on the way back in).
+// restores the server-side default (the broker's field is initialised in the
+// constructor, so it is never null on the way back in).
 func TestSubscriptionGroupConfigNilRetryPolicyRoundTrip(t *testing.T) {
 	origin := &SubscriptionGroupConfig{GroupName: "G", RetryMaxTimes: 5, ConsumeEnable: true}
 
@@ -49,7 +49,7 @@ func TestSubscriptionGroupConfigNilRetryPolicyRoundTrip(t *testing.T) {
 		t.Fatalf("back = %s", back)
 	}
 	if back.GroupRetryPolicy == nil {
-		t.Fatal("decoded config must carry the Java default retry policy")
+		t.Fatal("decoded config must carry the default retry policy")
 	}
 	if back.GroupRetryPolicy.Type != GroupRetryPolicyCustomized {
 		t.Fatalf("retry policy type = %q", back.GroupRetryPolicy.Type)

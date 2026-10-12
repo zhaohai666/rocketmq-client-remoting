@@ -1,5 +1,5 @@
-// Transport tests: real in-process TCP/TLS servers, mirroring the Rust
-// client.rs regression net — round trips, half-packet reassembly, opaque
+// Transport tests: real in-process TCP/TLS servers over the regression net —
+// round trips, half-packet reassembly, opaque
 // matching, GO_AWAY retry, fail-fast on EOF, shutdown draining, processor
 // dispatch and hooks.
 package remoting
@@ -368,7 +368,7 @@ func TestSecondGoAwayFailsInsteadOfLooping(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	if !strings.Contains(err.Error(), "GO_AWAY twice") {
-		t.Fatalf("文案要对齐 Java RemotingSendRequestException: %v", err)
+		t.Fatalf("错误文案要固定 GO_AWAY twice: %v", err)
 	}
 	if conns.Load() != 2 {
 		t.Fatalf("只重发一次, 不能无限重连, conns = %d", conns.Load())
@@ -444,10 +444,10 @@ func TestCloseChannelForcesReconnect(t *testing.T) {
 	}
 }
 
-// ---------------- fail-fast on EOF (Java failFast) ----------------
+// ---------------- fail-fast on EOF ----------------
 //
 // Connection death must fail its in-flight requests immediately as send
-// failures (Java RemotingSendRequestException), not timeouts — the async send
+// failures (KindSendRequest), not timeouts — the async send
 // retry classifies by error kind, so the semantics matter as much as the
 // timing.
 
@@ -462,7 +462,7 @@ func TestConnectionEofFailsInFlightRequestFast(t *testing.T) {
 		t.Fatalf("必须是发送失败, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "connection closed") {
-		t.Fatalf("文案对齐 Java requestFail: %v", err)
+		t.Fatalf("错误文案要固定 connection closed: %v", err)
 	}
 	if cost >= 5*time.Second {
 		t.Fatalf("毫秒级判死, 不能等满 30s 超时: %v", cost)

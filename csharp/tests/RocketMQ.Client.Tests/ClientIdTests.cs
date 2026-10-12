@@ -19,7 +19,7 @@ namespace RocketMQ.Client.Tests;
 public class ClientIdTests
 {
     // <IP>@<pid>#<纳秒>
-    private static readonly Regex JavaStyle =
+    private static readonly Regex LegacyStyle =
         new Regex(@"^[^@\s]+@" + Environment.ProcessId + @"#\d+$");
 
     /// <summary>
@@ -116,11 +116,11 @@ public class ClientIdTests
     // ---------------------------------------------------------------- 生产者
 
     [Fact]
-    public void ProducerStartStampsAJavaStyleClientId()
+    public void ProducerStartStampsALegacyStyleClientId()
     {
         var p = new DefaultMQProducer("PID_clientid_shape") { NamesrvAddr = "127.0.0.1:1" };
         Stamped(p, p.Start, p.Shutdown);
-        Assert.Matches(JavaStyle, p.ClientId);
+        Assert.Matches(LegacyStyle, p.ClientId);
         (string ip, string instance) = Split(p.ClientId);
         Assert.Equal(Ip, ip);
         // instanceName 就地写回：重启不能再换一个 clientId
@@ -166,7 +166,7 @@ public class ClientIdTests
         clustering.Subscribe("T", "TagA");
         clustering.SetMessageListener(new EmptyListener());
         Stamped(clustering, clustering.Start, clustering.Shutdown);
-        Assert.Matches(JavaStyle, clustering.ClientId);
+        Assert.Matches(LegacyStyle, clustering.ClientId);
 
         var broadcast = new DefaultMQPushConsumer("CID_clientid_broadcast")
         {
@@ -190,14 +190,14 @@ public class ClientIdTests
         var pull = new DefaultMQPullConsumer("CID_clientid_pull");
         pull.SetNamesrvAddr("127.0.0.1:1");
         Stamped(pull, pull.Start, pull.Shutdown);
-        Assert.Matches(JavaStyle, WithoutStream(pull.ClientId));
+        Assert.Matches(LegacyStyle, WithoutStream(pull.ClientId));
         Assert.EndsWith(StreamSuffix, pull.ClientId);
 
         var lite = new DefaultLitePullConsumer("CID_clientid_lite");
         lite.SetNamesrvAddr("127.0.0.1:1");
         lite.Subscribe("T", "*");
         Stamped(lite, lite.Start, lite.Shutdown);
-        Assert.Matches(JavaStyle, WithoutStream(lite.ClientId));
+        Assert.Matches(LegacyStyle, WithoutStream(lite.ClientId));
         Assert.EndsWith(StreamSuffix, lite.ClientId);
 
         var liteBroadcast = new DefaultLitePullConsumer("CID_clientid_lite_broadcast");
@@ -221,7 +221,7 @@ public class ClientIdTests
         lite.Subscribe("T", "*");
         Stamped(lite, lite.Start, lite.Shutdown);
         Assert.DoesNotContain(StreamSuffix, lite.ClientId);
-        Assert.Matches(JavaStyle, lite.ClientId);
+        Assert.Matches(LegacyStyle, lite.ClientId);
     }
 
     // ---------------------------------------------------------------- unitName / stream 后缀
@@ -240,7 +240,7 @@ public class ClientIdTests
 
     /// 各 facade 的默认值：生产者/推送消费者/管理端不开 stream，pull/lite 开。
     [Fact]
-    public void FacadeStreamDefaultsMatchJava()
+    public void FacadeStreamDefaultsMatchLegacy()
     {
         Assert.False(new DefaultMQProducer("PID_stream_default").EnableStreamRequestType);
         Assert.False(new DefaultMQPushConsumer("CID_stream_default").EnableStreamRequestType);
@@ -299,7 +299,7 @@ public class ClientIdTests
         admin.SetInstanceName(MixAll.DefaultInstanceName);
         admin.SetNamesrvAddr("127.0.0.1:1");
         Stamped(admin, admin.Start, admin.Shutdown);
-        Assert.Matches(JavaStyle, admin.ClientId);
+        Assert.Matches(LegacyStyle, admin.ClientId);
     }
 
     // ---------------------------------------------------------------- 失败路径

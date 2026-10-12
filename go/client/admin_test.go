@@ -268,7 +268,7 @@ func (c *adminCluster) onBroker(s *mockServer, req *remoting.RemotingCommand) *r
 		}
 		// The 220 body carries a MessageQueue-keyed map, so it uses the
 		// fastjson2 writer (raw inline-object keys) exactly like a real broker.
-		return respOK(remoting.EncodeFastJSON(map[string]any{"offsetTable": remoting.EncodeMQOffsetTable(table)}))
+		return respOK(remoting.EncodeInlineKeyJSON(map[string]any{"offsetTable": remoting.EncodeMQOffsetTable(table)}))
 	case remoting.ReqQueryMessage:
 		msg := newQueryableExt(c.t, "MyTopic", 0, 7, "hello", "Key1", "MSGID0000000001")
 		other := newQueryableExt(c.t, "MyTopic", 0, 9, "world", "Other", "MSGID0000000002")
@@ -382,7 +382,7 @@ func encodeStored(t *testing.T, msg *common.MessageExt) []byte {
 
 // ---------------- pure function: java.util.Properties ----------------
 
-func TestString2PropertiesMatchesJavaPropertiesLoad(t *testing.T) {
+func TestString2PropertiesMatchesServerPropertyParsing(t *testing.T) {
 	text := strings.Join([]string{
 		"# comment line",
 		"! also a comment",

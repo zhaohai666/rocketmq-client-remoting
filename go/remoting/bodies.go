@@ -5,8 +5,9 @@
 // MessageQueue-keyed maps travel as fastjson2 inline-object keys
 // (`{"brokerName":"b","queueId":1,"topic":"Tt"}:9`). That byte stream is not
 // valid JSON and the stdlib encoder cannot produce it, so bodies carrying one
-// are serialised by EncodeFastJSON — see mqKeyedJSON below for why, and for the
-// 5.5.1-jar evidence that the escaped alternative is rejected by fastjson2.
+// are serialised by EncodeInlineKeyJSON — see mqKeyedJSON below for why, and
+// for the 5.5.1-server evidence that the escaped alternative is rejected by
+// fastjson2.
 package remoting
 
 import (
@@ -91,7 +92,7 @@ func numberAsI64(v any) (int64, bool) {
 		return int64(t), true
 	case float64:
 		return int64(t), true
-	case JavaDouble:
+	case JSONDouble:
 		return int64(t), true
 	}
 	return 0, false
@@ -127,7 +128,8 @@ func jsonArray(value any, key string) []any {
 
 // CheckClientRequestBody is the body of CHECK_CLIENT_CONFIG(46). The broker
 // logs clientId/group and validates only subscriptionData's expressionType and
-// subString. namespace exists in Java 5.5.1 but senders leave it empty.
+// subString. namespace exists in the 5.5.1 server-side body but senders leave
+// it empty.
 type CheckClientRequestBody struct {
 	ClientID         *string
 	Group            *string
@@ -220,7 +222,8 @@ type MQOffsetTableEntry struct {
 type MQOffsetTable []MQOffsetTableEntry
 
 // messageQueueKeyJSON renders the fastjson2 inline-object key. encoding/json
-// sorts map keys, which lands on Java's alphabetical brokerName/queueId/topic.
+// sorts map keys, which lands on the alphabetical brokerName/queueId/topic
+// order the server emits.
 func messageQueueKeyJSON(q common.MessageQueue) string {
 	return string(EncodeJSON(map[string]any{
 		"brokerName": q.BrokerName,
@@ -245,23 +248,24 @@ func MessageQueueKeyJSON(q common.MessageQueue) string { return messageQueueKeyJ
 //	"{\"brokerName\":\"broker-a\",\"queueId\":3,\"topic\":\"TopicA\"}":{...}
 //
 // and fastjson2 rejects that spelling outright for a `Map<MessageQueue, X>`
-// field — to it the key is a Java MessageQueue, not a JSON string. Both forms
-// were fed to the 5.5.1 jars with the REAL Go bytes:
+// field — to the server the key is a MessageQueue object, not a JSON string.
+// Both forms were fed to a live 5.5.1 server with the REAL Go bytes:
 //
-//	Go CRI -> Java ConsumerRunningInfo: REJECTED -> JSONException:
+//	Go CRI -> server ConsumerRunningInfo: REJECTED -> JSONException:
 //	    read field 'ConsumerRunningInfo.setMqTable, offset 477'
-//	Go TST -> Java TopicStatsTable:     REJECTED -> JSONException:
+//	Go TST -> server TopicStatsTable:     REJECTED -> JSONException:
 //	    illegal fieldName input26, offset 156
 //
-// So an escaped key makes every MessageQueue-keyed body unreadable to a Java
-// admin or broker. The Go reader never noticed, because the local tolerant
-// parser unescapes the key and DecodeMapKey re-parses it afterwards: Go could
-// always read its own output, and only the Java direction was broken.
+// So an escaped key makes every MessageQueue-keyed body unreadable to a
+// broker or admin console. The Go reader never noticed, because the local
+// tolerant parser unescapes the key and DecodeMapKey re-parses it afterwards:
+// Go could always read its own output, and only the server direction was
+// broken.
 //
-// Order: entries are sorted by (topic, brokerName, queueId) — Java's
-// MessageQueue.compareTo. Only ConsumerRunningInfo.mqTable/mqPopTable are
-// TreeMaps where Java's order is deterministic, but sorting everywhere keeps
-// the output stable and byte-comparable with fastjson2's. (TopicStatsTable and
+// Order: entries are sorted by (topic, brokerName, queueId) — the protocol's
+// MessageQueue order. Only ConsumerRunningInfo.mqTable/mqPopTable are
+// server-side TreeMaps whose order is deterministic, but sorting everywhere
+// keeps the output stable and byte-comparable with fastjson2's. (TopicStatsTable and
 // ConsumeStats use ConcurrentHashMap, ResetOffsetBody/GetConsumerStatusBody
 // HashMap — order is not part of their contract.)
 type mqKeyedJSON []mqKeyedEntry
@@ -285,8 +289,7 @@ func newMQKeyedJSON[V any](table map[common.MessageQueue]V, render func(V) any) 
 	return out
 }
 
-// compareMessageQueue mirrors Java MessageQueue.compareTo: topic, then
-// brokerName, then queueId.
+// compareMessageQueue orders by topic, then brokerName, then queueId.
 func compareMessageQueue(a, b common.MessageQueue) int {
 	if a.Topic != b.Topic {
 		if a.Topic < b.Topic {
@@ -313,15 +316,15 @@ func compareMessageQueue(a, b common.MessageQueue) int {
 // encoding/json can neither emit it nor pass it through — it validates the
 // output of every Marshaler it calls (and without this method the slice would
 // silently serialise as a JSON ARRAY, which is worse than an error). A body
-// carrying one of these must be encoded with EncodeFastJSON.
+// carrying one of these must be encoded with EncodeInlineKeyJSON.
 func (mqKeyedJSON) MarshalJSON() ([]byte, error) {
-	return nil, errMQKeyedNeedsFastJSON
+	return nil, errMQKeyedNeedsInlineKeyJSON
 }
 
-var errMQKeyedNeedsFastJSON = errors.New(
+var errMQKeyedNeedsInlineKeyJSON = errors.New(
 	"remoting: a MessageQueue-keyed table cannot go through encoding/json " +
 		"(fastjson2 writes the queue as an unquoted inline-object key); " +
-		"encode this body with EncodeFastJSON instead of EncodeJSON")
+		"encode this body with EncodeInlineKeyJSON instead of EncodeJSON")
 
 // EncodeMQOffsetTable writes an ordered map with MessageQueue object keys.
 func EncodeMQOffsetTable(table MQOffsetTable) mqKeyedJSON {
@@ -334,8 +337,7 @@ func EncodeMQOffsetTable(table MQOffsetTable) mqKeyedJSON {
 
 // DecodeMQOffsetTable reads a MessageQueue-keyed map. Keys that do not
 // re-parse as MessageQueue objects are skipped (same tolerance as the route
-// beans; Rust decode_message_queue_map behaves the same). A non-object value
-// is an error.
+// beans). A non-object value is an error.
 func DecodeMQOffsetTable(value any) (MQOffsetTable, error) {
 	var out MQOffsetTable
 	obj, ok := value.(map[string]any)
@@ -369,8 +371,9 @@ func DecodeMQOffsetTable(value any) (MQOffsetTable, error) {
 }
 
 // MQOffsetMap is the unordered MessageQueue -> offset map form, used by the
-// TopicStatsTable offset table. Java declares both `HashMap` and `TreeMap`
-// flavours of this shape; the map form is what the admin beans expose.
+// TopicStatsTable offset table. The server declares both `HashMap` and
+// `TreeMap` flavours of this shape; the map form is what the admin beans
+// expose.
 type MQOffsetMap map[common.MessageQueue]int64
 
 // DecodeMQOffsetMap reads a MessageQueue-keyed map of integers. Keys that do
@@ -428,7 +431,7 @@ func (b *ResetOffsetBody) FromJSONValue(value any) error {
 	return nil
 }
 
-func (b *ResetOffsetBody) Encode() []byte { return EncodeFastJSON(b.ToJSONValue()) }
+func (b *ResetOffsetBody) Encode() []byte { return EncodeInlineKeyJSON(b.ToJSONValue()) }
 
 // DecodeResetOffsetBody parses a ResetOffsetBody.
 func DecodeResetOffsetBody(data []byte) (*ResetOffsetBody, error) {
@@ -443,9 +446,8 @@ func DecodeResetOffsetBody(data []byte) (*ResetOffsetBody, error) {
 	return body, nil
 }
 
-// MessageQueueForC is org.apache.rocketmq.common.message.MessageQueueForC
-// (element of the ResetOffsetBodyForC array). Field order matches Java's
-// declaration.
+// MessageQueueForC is the element type of the ResetOffsetBodyForC array.
+// Field order matches the server bean's declaration.
 type MessageQueueForC struct {
 	Topic      string
 	BrokerName string
@@ -467,8 +469,8 @@ func (e *MessageQueueForC) FromJSONValue(value any) error {
 
 // ResetOffsetBodyForC is the array-shaped 220 body: the broker only pushes it
 // when the reset initiator ran with language=CPP (Broker2Client.resetOffset).
-// Java management clients always send JAVA so the map shape suffices there;
-// parsing the array keeps old-C++-admin interop from silently dropping resets.
+// Admin traffic from language=JAVA initiators uses the map shape; parsing the
+// array keeps old CPP-admin clusters from silently dropping resets.
 type ResetOffsetBodyForC struct {
 	OffsetTable []MessageQueueForC
 }
@@ -492,8 +494,8 @@ func (b *ResetOffsetBodyForC) FromJSONValue(value any) error {
 	return nil
 }
 
-// ParseResetOffsetTable decodes a 220 body: map shape first, then the C++
-// array shape (mirrors Rust parse_reset_offset_table).
+// ParseResetOffsetTable decodes a 220 body: map shape first, then the
+// language=CPP array shape.
 func ParseResetOffsetTable(data []byte) (MQOffsetTable, error) {
 	body, mapErr := DecodeResetOffsetBody(data)
 	if mapErr == nil {
@@ -521,7 +523,7 @@ func ParseResetOffsetTable(data []byte) (MQOffsetTable, error) {
 
 // GetConsumerStatusBody answers GET_CONSUMER_STATUS_FROM_CLIENT. Both maps are
 // MessageQueue-keyed; consumerTable's outer key is the clientId string (a
-// deprecated Java field kept for old-broker compatibility).
+// deprecated protocol field kept for old-broker compatibility).
 type GetConsumerStatusBody struct {
 	MessageQueueTable MQOffsetTable
 	OffsetTable       MQOffsetTable
@@ -579,7 +581,7 @@ func (b *GetConsumerStatusBody) FromJSONValue(value any) error {
 	return nil
 }
 
-func (b *GetConsumerStatusBody) Encode() []byte { return EncodeFastJSON(b.ToJSONValue()) }
+func (b *GetConsumerStatusBody) Encode() []byte { return EncodeInlineKeyJSON(b.ToJSONValue()) }
 
 // DecodeGetConsumerStatusBody parses a GetConsumerStatusBody.
 func DecodeGetConsumerStatusBody(data []byte) (*GetConsumerStatusBody, error) {

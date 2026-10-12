@@ -810,7 +810,7 @@ mod tests {
     use crate::common::message_decoder::encode_messages;
 
     #[test]
-    fn message_queue_hashcode_matches_java() {
+    fn message_queue_hashcode_matches_contract() {
         // 与 Python tests/test_message_model.py 的字面量一致（rebalance 依赖它）
         let cases = [
             ("TopicTest", "BrokerA", 0, -1229861880i32),
@@ -1115,7 +1115,7 @@ mod tests {
 
     /// 判据本身：Java `Message.isWaitStoreMsgOK()` = 缺省 true + `Boolean.parseBoolean`。
     #[test]
-    fn wait_store_msg_ok_follows_java_parse_boolean() {
+    fn wait_store_msg_ok_follows_server_boolean_parsing() {
         assert!(wait_store_msg_ok_of(None));
         assert!(wait_store_msg_ok_of(Some("true")));
         assert!(wait_store_msg_ok_of(Some("TRUE")));

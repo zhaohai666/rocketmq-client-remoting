@@ -54,7 +54,7 @@ public class LatencyDetectorTests
     // ---------------------------------------------------------------- 默认值（Java 对拍）
 
     [Fact]
-    public void Detector_DefaultsMatchJavaClientConfig()
+    public void Detector_DefaultsMatchLegacyClientConfig()
     {
         var tol = new LatencyFaultToleranceImpl();
         Assert.Equal(200, tol.DetectTimeout);

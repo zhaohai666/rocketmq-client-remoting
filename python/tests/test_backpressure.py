@@ -211,7 +211,7 @@ def test_zero_permits_acquire_is_satisfied_even_when_empty():
     assert sem.try_acquire(0, 0) is True
 
 
-def test_floors_match_java():
+def test_backpressure_floors_are_the_documented_minima():
     assert MIN_ASYNC_SEND_NUM == 10
     assert MIN_ASYNC_SEND_SIZE == 1024 * 1024
 

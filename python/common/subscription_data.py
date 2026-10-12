@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import List, Optional, Set
 
-from .util_all import java_string_hash
+from .util_all import utf16_int32_hash
 
 
 class ExpressionType:
@@ -156,7 +156,7 @@ class FilterAPI:
             tag = part.strip()
             if tag != "":
                 sub.tags_set.add(tag)
-                sub.code_set.add(java_string_hash(tag))
+                sub.code_set.add(utf16_int32_hash(tag))
         return sub
 
     @staticmethod

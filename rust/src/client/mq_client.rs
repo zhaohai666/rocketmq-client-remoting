@@ -5254,7 +5254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql92_request_shape_matches_java() {
+    async fn sql92_request_shape_matches_broker_contract() {
         let broker = MockBroker::start().await;
         let instance = instance_with_sub(&broker, vec![sql92_sub(TOPIC, "a > 10")]);
         instance
@@ -5352,7 +5352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_error_is_wrapped_with_java_message() {
+    async fn transport_error_is_wrapped_with_canonical_message() {
         // 路由指向一个没人监听的端口 ⇒ 连接失败（Java 的 RemotingConnectException），
         // 换成 Java 的固定文案再抛 —— 老 broker 不认 46 号请求时也落在这里。
         let idle = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -104,7 +104,7 @@ public sealed class ProducerData
 
     public override bool Equals(object? obj) => obj is ProducerData other && Equals(other);
 
-    public override int GetHashCode() => JavaHash.JavaStringHash(GroupName);
+    public override int GetHashCode() => LegacyHash.StringHash(GroupName);
 
     public override string ToString() => "ProducerData [groupName=" + GroupName + "]";
 }
@@ -204,7 +204,7 @@ public sealed class ConsumerData
 
     public override bool Equals(object? obj) => obj is ConsumerData other && Equals(other);
 
-    public override int GetHashCode() => JavaHash.JavaStringHash(GroupName);
+    public override int GetHashCode() => LegacyHash.StringHash(GroupName);
 
     public override string ToString()
     {
@@ -291,7 +291,7 @@ public sealed class HeartbeatData
 
         if (v.TryGetInt("heartbeatFingerprint", out long n))
         {
-            hb.HeartbeatFingerprint = JavaNumber.ToInt32(n);
+            hb.HeartbeatFingerprint = LegacyNumber.ToInt32(n);
         }
 
         // 同时兼容 withoutSub 与 Java 字段名 isWithoutSub 两种写法

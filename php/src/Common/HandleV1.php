@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 对应 Java ``RecallMessageHandle.HandleV1``（移植自 recall_message_handle.py 的 HandleV1）。
+ * 定时消息撤回句柄 v1：topic / brokerName / timestampStr / messageId 四段。
  *
- * ``timestampStr`` 保留字符串而不是转成 int：Java 就是原样存 ``String``，
- * 撤回时要把它回填到请求里，非法时间戳由 broker 判定（``ILLEGAL_OPERATION``）。
+ * ``timestampStr`` 保留字符串而不是转成 int：协议里它就是原样存的文本，
+ * 撤回时要把它一字不差回填到请求里，非法时间戳由 broker 判定（``ILLEGAL_OPERATION``）。
  */
 final class HandleV1
 {

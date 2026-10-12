@@ -45,7 +45,7 @@ def _drop(inst: MQClientInstance) -> None:
 
 
 # ---------------------------------------------------------------- 报文形状
-def test_wire_value_is_the_java_enum_name_not_the_lowercase_name():
+def test_wire_value_is_the_uppercase_enum_name_not_the_lowercase_name():
     """入网文本必须是 ``Enum.toString()`` 的大写枚举名。
 
     Java 的 ``BoundaryType`` 有 ``getName()``（"lower"/"upper"）与枚举名两套写法，
@@ -68,7 +68,7 @@ def test_unset_boundary_omits_the_field():
     assert header.boundary_type is None
 
 
-def test_decode_is_lenient_like_java_get_type():
+def test_decode_is_lenient_on_unknown_type_values():
     """``BoundaryType.getType``：只有 upper（大小写不敏感）才是 UPPER。"""
     header = SearchOffsetRequestHeader()
     for text, expected in (("UPPER", BoundaryType.UPPER), ("upper", BoundaryType.UPPER),
@@ -148,7 +148,7 @@ def test_none_boundary_keeps_the_field_off_the_wire():
 
 
 # ---------------------------------------------------------------- admin facade
-def test_admin_exposes_java_boundary_method_names():
+def test_admin_exposes_the_boundary_method_names():
     """Java DefaultMQAdminExt:133/:137 的两个方法各自固定 LOWER / UPPER。"""
     admin = DefaultMQAdminExt()
 

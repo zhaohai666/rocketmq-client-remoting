@@ -107,8 +107,8 @@ export class HeartbeatData {
     this.withoutSub = false;
   }
   toDict(): Record<string, any> {
-    // heartbeatFingerprint intentionally 0 (broker takes the V1 register path);
-    // withoutSub mirrors Java's isWithoutSub / fastjson2 name withoutSub.
+    // heartbeatFingerprint 固定为 0（broker 因此走 V1 注册路径）；
+    // withoutSub 是 wire 上的协议字段名。
     return {
       clientID: this.clientID,
       producerDataSet: this.producerDataSet.map((p) => p.toDict()),

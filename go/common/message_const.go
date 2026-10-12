@@ -1,7 +1,7 @@
 package common
 
-// Message property key constants (Java MessageConst). These strings are wire
-// literals brokered between client and broker (the 17th segment of the message
+// Message property key constants. These strings are wire literals brokered
+// between client and broker (the 17th segment of the message
 // format, broker-side filtering/trace/transaction logic) — changing one
 // character breaks compatibility.
 const (
@@ -51,8 +51,8 @@ const (
 	PropertyPopCk                  = "POP_CK"
 	PropertyPopCkOffset            = "POP_CK_OFFSET"
 	PropertyPopTime                = "POP_TIME"
-	// Java writes "1ST_POP_TIME" (PROPERTY_FIRST_POP_TIME); the client only
-	// backfills it when missing.
+	// The broker stores this as "1ST_POP_TIME" (PROPERTY_FIRST_POP_TIME); the
+	// client only backfills it when missing.
 	PropertyFirstPopTime    = "1ST_POP_TIME"
 	PropertyInvisibleTime   = "INVISIBLE_TIME"
 	PropertyDelayTime       = "DELAY_TIME"
@@ -67,8 +67,8 @@ const (
 	PropertyOriginQueueID   = "ORIGIN_QID"
 	PropertyOriginTopic     = "ORIGIN_TOPIC"
 
-	// PropertyStartDeliverTime (Java MessageConst.PROPERTY_STARTDELIVERTIME,
-	// "_" + "_STARTDELIVERTIME"). Distinct from PropertyStartTime
+	// PropertyStartDeliverTime is the timer-scheduling key, spelled
+	// "_" + "_STARTDELIVERTIME". Distinct from PropertyStartTime
 	// ("START_TIME"), which is a trace-only field — substituting one for the
 	// other makes the delay-message classification silently miss every
 	// timer-scheduled message.
@@ -89,9 +89,8 @@ const (
 	IndexTagType    = "T"
 )
 
-// StringAllProperty lists every system property key (Java 4.x
-// MessageConst.STRING_ALL_PROPERTY), used to separate system properties from
-// user properties (trace, dashboards).
+// StringAllProperty lists every system property key, used to separate system
+// properties from user properties (trace, dashboards).
 var StringAllProperty = []string{
 	PropertyKeys,
 	PropertyTags,

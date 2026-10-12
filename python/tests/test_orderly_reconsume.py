@@ -35,7 +35,7 @@ from collections import deque
 import pytest
 
 from client import consumer
-from client.consumer import (_JAVA_INT_MAX, DefaultMQPushConsumer,
+from client.consumer import (_INT32_MAX, DefaultMQPushConsumer,
                                      MessageListenerOrderly)
 from client.consumer_result import (ConsumeConcurrentlyStatus,
                                              ConsumeOrderlyContext, ConsumeOrderlyStatus)
@@ -192,11 +192,11 @@ def _consume(h: Harness, batch, listener=None):
 
 def test_minus_one_is_unlimited_for_orderly_consumption():
     h = Harness(max_reconsume_times=-1)
-    assert h.c._orderly_max_reconsume_times() == _JAVA_INT_MAX
+    assert h.c._orderly_max_reconsume_times() == _INT32_MAX
     # 默认配置下毒消息不该被判定"用尽"：本地计数永远追不上 MAX_VALUE
-    batch = [msg(0, reconsume_times=_JAVA_INT_MAX - 1)]
+    batch = [msg(0, reconsume_times=_INT32_MAX - 1)]
     assert h.c._check_orderly_reconsume_times(batch) is True
-    assert batch[0].get_reconsume_times() == _JAVA_INT_MAX
+    assert batch[0].get_reconsume_times() == _INT32_MAX
     assert h.sent == []
 
 
@@ -231,7 +231,7 @@ def test_orderly_cap_does_not_reuse_the_concurrent_16_default():
     c.send_message_back(m, 3)
     header: ConsumerSendMsgBackRequestHeader = captured["header"]
     assert header.max_reconsume_times == 16, "并发回投仍按 Java 的 -1 → 16"
-    assert c._orderly_max_reconsume_times() == _JAVA_INT_MAX, "顺序侧必须是" \
+    assert c._orderly_max_reconsume_times() == _INT32_MAX, "顺序侧必须是" \
         " Integer.MAX_VALUE，两者不能共用一个解析结果"
 
 
@@ -380,7 +380,7 @@ def test_ordinary_topic_send_is_not_lifted():
 # ------------------------------------------------ 挂起时长：-1 → 配置 → [10, 30000]
 
 
-def test_orderly_context_defaults_are_java_defaults():
+def test_orderly_context_defaults_are_the_protocol_defaults():
     h = Harness()
     ctx = ConsumeOrderlyContext(h.mq)
     assert ctx.suspend_current_queue_time_millis == -1, "Java 默认 -1 = 未指定"
@@ -402,7 +402,7 @@ def test_context_value_wins_over_the_consumer_config():
     assert h.c._orderly_suspend_millis(ctx) == 250
 
 
-def test_suspend_millis_is_clamped_to_java_bounds():
+def test_suspend_millis_is_clamped_to_the_protocol_bounds():
     h = Harness()
     h.c.suspend_current_queue_time_millis = 1000
     ctx = ConsumeOrderlyContext(h.mq)

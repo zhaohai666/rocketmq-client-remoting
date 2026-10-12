@@ -14,12 +14,11 @@ use RocketMQ\Remoting\Protocol\ResponseCode;
 use RocketMQ\Remoting\Protocol\RocketMQSerializable;
 
 /**
- * socket 长连接客户端（对应 org.apache.rocketmq.remoting.netty.NettyRemotingClient 的核心能力，
- * 移植自 remoting/client.py）。
+ * socket 长连接客户端：与 NameServer / broker 之间的 remoting 帧收发。
  *
  * 提供：连接管理（惰性建连 + 复用 + 关闭回收）、invokeSync/invokeAsync/invokeOneway、
  * opaque 映射回调分发、超时控制、GO_AWAY 换连接重发、
- * 连接断开时立刻失败该连接上的在途请求（对应 Java failFast）。
+ * 连接断开时立刻失败该连接上的在途请求（failFast）。
  *
  * PHP 无线程（见 php/PORTING.md 异步模型）：
  *  - ``invokeAsync`` = 注册 pending 表（opaque → PendingResponse）+ 非阻塞写，立即返回；
@@ -33,20 +32,20 @@ final class RemotingClient
     private int $connectTimeoutMillis;
     private int $invokeTimeoutMillis;
 
-    /** 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）：
-     * 收到 ResponseCode.GO_AWAY(1500) 时换一条连接重发一次。 */
+    /** 默认 **true**：收到 broker 的 ResponseCode.GO_AWAY(1500) 时换一条连接重发一次；
+     * 关掉则直接把 GO_AWAY 当发送失败报错。 */
     private bool $enableReconnectForGoAway;
 
-    /** TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
-     * 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。 */
+    /** 是否用 TLS 连 broker。显式构造参数优先，否则读环境变量
+     * ROCKETMQ_TLS_ENABLE（本端没有运行时系统属性，env 是唯一的开关入口）。 */
     private bool $tlsEnable;
 
     /**
-     * TLS 细项（对应 Java TlsSystemConfig 的 certPath 族属性；键均可选）：
-     *   - caCert:     CA 证书路径。给了就**真校验**服务端证书链 + 主机名
-     *                 （tls.test.mode.enable=false 口径）；不给则信任自签（test-mode，默认）。
-     *   - clientCert: 客户端证书路径（mTLS，对应 tls.client.certPath + authClient=true）。
-     *   - clientKey:  客户端私钥路径（对应 tls.client.keyPath；cert 内含私钥时可省）。
+     * TLS 细项（键均可选，取值都是本机文件路径）：
+     *   - caCert:     CA 证书路径。给了就**真校验** broker 证书链 + 主机名
+     *                 （严格模式）；不给则信任自签（宽松模式，默认）。
+     *   - clientCert: 客户端证书路径（broker 开双向认证时必须提供）。
+     *   - clientKey:  客户端私钥路径（cert 内含私钥时可省）。
      *   - serverName: SNI/主机名校验覆盖（默认用连接地址的 host）。
      *
      * @var array{caCert?:string, clientCert?:string, clientKey?:string, serverName?:string}
@@ -98,7 +97,7 @@ final class RemotingClient
         }
     }
 
-    /** 超时判定专用单调时钟毫秒（对应 Java System.currentTimeMillis 口径，取更稳的 monotonic）。 */
+    /** 超时判定专用单调时钟毫秒：不受系统时间回拨影响，比 wall clock 稳。 */
     public static function monoMillis(): float
     {
         return hrtime(true) / 1e6;
@@ -129,7 +128,7 @@ final class RemotingClient
         [$host, $port] = self::parseAddr($addr);
         $ctx = stream_context_create([
             'ssl' => [
-                // 对应 Java tls.test.mode.enable 默认 true：信任 broker 的自签证书、
+                // 建连阶段的默认口径（宽松模式）：信任 broker 的自签证书、
                 // 不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
                 'verify_peer' => false,
                 'verify_peer_name' => false,
@@ -149,11 +148,11 @@ final class RemotingClient
             throw new RemotingConnectException($addr);
         }
         if ($this->tlsEnable) {
-            // 对应 Java pipeline.addFirst(SslHandler)：TLS 包住整个流，在任何 RocketMQ
-            // 帧之前完成握手。Python 侧是先建 plain socket 再 wrap_socket，等价路径。
+            // TLS 必须包住整个流、在任何 RocketMQ 帧之前完成握手（broker 侧也是
+            // 这个层次）。这里先建 plain socket 再 enable_crypto，握手后帧格式不变。
             $caCert = $this->tlsOptions['caCert'] ?? null;
             if ($caCert !== null && $caCert !== '') {
-                // 有 CA ⇒ 真校验（tls.test.mode.enable=false 口径）：证书链 + 主机名。
+                // 有 CA ⇒ 严格模式，真校验：证书链 + 主机名。
                 stream_context_set_option($conn, 'ssl', 'verify_peer', true);
                 stream_context_set_option($conn, 'ssl', 'verify_peer_name', true);
                 stream_context_set_option($conn, 'ssl', 'allow_self_signed', false);
@@ -163,7 +162,7 @@ final class RemotingClient
                     stream_context_set_option($conn, 'ssl', 'peer_name', $serverName);
                 }
             } else {
-                // test-mode（Java tls.test.mode.enable 默认 true）：信任 broker 的自签证书、
+                // 宽松模式（默认口径）：信任 broker 的自签证书、
                 // 不校验主机名、不带客户端证书（PERMISSIVE broker 即配即通）。
                 stream_context_set_option($conn, 'ssl', 'verify_peer', false);
                 stream_context_set_option($conn, 'ssl', 'verify_peer_name', false);
@@ -171,8 +170,8 @@ final class RemotingClient
             }
             $clientCert = $this->tlsOptions['clientCert'] ?? null;
             if ($clientCert !== null && $clientCert !== '') {
-                // mTLS：对应 Java tls.client.certPath/keyPath（broker 端
-                // tls.client.authServer=true 时会要求出示）。
+                // mTLS：broker 开启双向认证时会在握手阶段要求客户端出示证书，
+                // 缺证书直接握手失败。
                 stream_context_set_option($conn, 'ssl', 'local_cert', $clientCert);
                 $clientKey = $this->tlsOptions['clientKey'] ?? null;
                 if ($clientKey !== null && $clientKey !== '') {
@@ -214,8 +213,8 @@ final class RemotingClient
     }
 
     /**
-     * 摘掉到 addr 的连接（对应 Java closeChannel 的 removeChannel + channel.close）。
-     * 在途请求立即按发送失败处理（PHP 单线程里没有独立读线程可做 failFast）。
+     * 摘掉到 addr 的连接：先从连接表里去掉，再关闭套接字。
+     * 在途请求立即按发送失败处理（PHP 没有独立读线程，failFast 就挂在关闭点上做）。
      */
     public function closeChannel(string $addr): void
     {
@@ -239,7 +238,7 @@ final class RemotingClient
     // ---------- RPC 钩子 ----------
 
     /**
-     * 发送前依次执行 RPC 钩子（对应 Java NettyRemotingAbstract#doBeforeRpcHooks）。
+     * 发送前依次执行 RPC 钩子。
      *
      * **必须在 cmd.encode() 之前调用**：ACL 钩子要把 AccessKey/Signature 写进
      * ext_fields，而 Signature 覆盖的是 makeCustomHeaderToNet() 之后的完整
@@ -355,7 +354,7 @@ final class RemotingClient
 
     // ---------- 同步 RPC ----------
 
-    /** 同步 RPC，含 GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）。 */
+    /** 同步 RPC：等响应、判超时，含 GO_AWAY 换连接重发。 */
     public function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
     {
         $timeout = $timeoutMillis ?? $this->invokeTimeoutMillis;
@@ -378,7 +377,7 @@ final class RemotingClient
         }
         Logger::info("remoting: receive GO_AWAY from {$addr}, reconnect and retry once");
         $this->closeChannel($addr);
-        // 重发只花剩余预算：Java 用同一个 Stopwatch 的 elapsed 扣减 timeoutMillis。
+        // 重发只花剩余预算：总超时从首次发出前起算，一次重发不能让预算翻倍。
         $spent = (int)(self::monoMillis() - $started);
         $retryTimeout = max(1, $timeout - $spent);
         $retry = self::retryRequest($request);
@@ -390,7 +389,7 @@ final class RemotingClient
     }
 
     /**
-     * GO_AWAY 重发用的请求副本（对应 Java 的 createRequestCommand + setBody + setExtFields）。
+     * GO_AWAY 重发用的请求副本：照抄 code / 头部 / body，只换 opaque。
      *
      * 必须是**新** opaque：旧的那条已经在途表里摘掉了，复用会让响应错配到别的请求。
      * ext_fields 按值复制——ACL 签名（AccessKey/Signature）就存在这里，重发要带原签名，
@@ -425,7 +424,7 @@ final class RemotingClient
             return $future->response;
         }
         unset($this->pending[$request->opaque]);
-        // 连接断掉时 failFast 已经置好 cause 并唤醒了我：按 Java 的口径报"发送失败"，
+        // 连接断掉时 failFast 已经置好 cause 并唤醒了我：这里按"发送失败"收口，
         // 而不是等满 timeout 再报超时。两条路的可重试性不一样（见 producer 的重试分类）。
         if ($future->cause !== null) {
             throw $future->cause;
@@ -439,11 +438,11 @@ final class RemotingClient
      * 异步调用：注册 pending 表 + 非阻塞写后**立即返回**（见 php/PORTING.md 异步模型）。
      * 调用方随后用 waitResponses() 泵；Producer 的 asyncSend 会在回调注册后内部泵到完成。
      *
-     * 回调契约（与 Java InvokeCallback 的 operationSucceed / operationFail 二分等价）：
+     * 回调契约（成功 / 失败二分，二者互斥）：
      *  - 正常收到响应 → ``onSuccess(response)``
      *  - 超过 timeout 仍无响应 → ``onFailure(RemotingTimeoutException)``
      *  - 连接在响应之前断开 → ``onFailure(RemotingSendRequestException)``（failFast）
-     * 回调**恰好触发一次**（done 标志定胜负，对应 Java executeCallbackOnlyOnce）。
+     * 回调**恰好触发一次**（done 标志定胜负）。
      */
     public function invokeAsync(string $addr, RemotingCommand $request, ?\Closure $onSuccess, ?\Closure $onFailure, ?int $timeoutMillis = null): void
     {
@@ -459,7 +458,8 @@ final class RemotingClient
     }
 
     /**
-     * 泵所有在途请求直到 pending 表空或超时（对应 Java scanResponseTable + IO 线程）。
+     * 泵所有在途请求直到 pending 表空或超时。
+     * 本端没有 IO 线程：收帧、回调分发与超时清理都由这次调用驱动。
      */
     public function waitResponses(int $timeoutMillis): void
     {
@@ -614,7 +614,7 @@ final class RemotingClient
             // "暂时无数据"，结果收帧循环空转到超时才收口（本该立刻 failFast）。
             // 反过来，非阻塞读的瞬时失败（TLS 握手/解密抖动）也不能当死连接，故以 feof 定夺。
             if (feof($conn)) {
-                // 对端关了：立刻判死这条连接上的在途请求（对应 Java failFast）
+                // 对端关了：立刻 failFast，判死这条连接上的在途请求
                 $this->closeChannel($addr);
                 return false;
             }
@@ -624,7 +624,7 @@ final class RemotingClient
         while (strlen($buf) >= 4) {
             $totalLen = RocketMQSerializable::unpackSignedInt(substr($buf, 0, 4));
             if ($totalLen <= 0 || $totalLen > self::MAX_FRAME_LENGTH) {
-                // 流已坏，丢弃整个缓冲（Python 同口径 buf.clear()）
+                // 长度字段不可信说明流已坏：丢弃整个缓冲，不试图重新对齐帧边界
                 $buf = '';
                 break;
             }
@@ -667,7 +667,7 @@ final class RemotingClient
             Logger::debug(sprintf('no processor registered for request code %s (opaque=%s) from %s', $cmd->code, $cmd->opaque, $addr));
             return;
         }
-        // 处理器**可以**返回一个响应命令（对应 Java NettyRequestProcessor#processRequest 的返回值）。
+        // 处理器**可以**返回一个响应命令，返回的会按请求 opaque 写回对端。
         // 需要返回的典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)。事务回查 39 是 oneway，返回 null 即可。
         try {
             $response = $handler($cmd, $addr);
@@ -717,17 +717,17 @@ final class RemotingClient
             try {
                 ($future->onSuccess)($cmd);
             } catch (\Throwable $e) {
-                // 回调里抛出的异常不能带走收帧路径（对应 Java 的 try-catch + warn）
+                // 回调里抛出的异常不能带走收帧路径：只记日志，其余在途请求照常收
                 Logger::warning('remoting: invoke callback raised: ' . $e->getMessage());
             }
         }
     }
 
-    // ---------- 在途请求超时清理（对应 Java scanResponseTable） ----------
+    // ---------- 在途请求超时清理 ----------
 
     private function sweepExpired(): void
     {
-        // 与 Java 同式：beginTimestamp + timeoutMillis + 1000 <= now。这 1s 宽限是给
+        // 判定式：beginAt + timeoutMillis + 1000 <= now。这 1s 宽限是给
         // "响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递。
         $graceMillis = 1000.0;
         $now = self::monoMillis();
@@ -740,12 +740,12 @@ final class RemotingClient
         }
     }
 
-    // ---------- 连接断开时立刻失败在途请求（对应 Java failFast / requestFail） ----------
+    // ---------- 连接断开时立刻失败在途请求（failFast） ----------
 
     /**
      * ``conn`` 这条连接已经关了：把它名下还没响应的在途请求全部判为发送失败。
      *
-     * Java 报 RemotingSendRequestException（不是超时），异步发送的重试分类按类型分流，
+     * 这里报 RemotingSendRequestException（不是超时），异步发送的重试分类按异常类型分流，
      * 错类型等于错语义。按连接**资源身份**认领，不按地址：同地址可能已经换了新连接
      * （GO_AWAY 换连接重发、写失败后的 closeChannel），旧收尾不能误伤新连接。
      */
@@ -792,7 +792,7 @@ final class RemotingClient
     // ---------- broker 主动请求处理器 ----------
 
     /**
-     * 注册 broker 主动请求处理器（对应 Java NettyRemotingServer 的 processor 表）。
+     * 注册 broker 主动请求处理器：按 requestCode 建一张分发表。
      *
      * handler 签名 ``handler(cmd, addr) -> ?RemotingCommand``：**返回非 null 就会把该命令
      * 作为响应写回**（opaque 由框架填成请求的 opaque），返回 null 表示不需要响应
@@ -824,7 +824,7 @@ final class RemotingClient
         return $this->nameServerList;
     }
 
-    /** 轮询取一个 namesrv；列表为空返回 null（对应 Java getAndCreateNameserverChannel 的轮询语义）。 */
+    /** 轮询取一个 namesrv，每次往后移一位；列表为空返回 null，由调用方决定如何报错。 */
     public function chooseNameServer(): ?string
     {
         if ($this->nameServerList === []) {
@@ -856,7 +856,7 @@ final class RemotingClient
 }
 
 /**
- * 一次在途请求（对应 Java/Python ``ResponseFuture``）。
+ * 一次在途请求的等待槽。
  *
  * 同步等待方读 ``response`` / ``cause``；异步方通过 ``onSuccess`` / ``onFailure``
  * 回调（恰好触发一次，``done`` 标志定胜负）。

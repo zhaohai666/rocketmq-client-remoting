@@ -1,20 +1,16 @@
 // -*- coding: utf-8 -*-
-// PopProcessQueue — port of Java
-// org.apache.rocketmq.client.impl.consumer.PopProcessQueue (mirrors
-// go/client/pop_process_queue.go).
+// PopProcessQueue —— POP 消费下的队列状态。
 //
-// It is deliberately NOT the ordinary ProcessQueue: POP has no offset cursor
-// and no message buffer. The broker hands out an invisible batch and expects an
-// ACK (or an invisibility extension) per message; all the client tracks is how
-// many it still owes an answer for. That counter is what flow control reads.
+// 它刻意**不是**普通 ProcessQueue：POP 既没有 offset 游标，也不缓冲消息。broker
+// 交出一批不可见消息，客户端需要按条 ACK 或续不可见期，客户端只跟踪"还欠多少条回复"，
+// 这个计数就是流控读取的量。
 //
-// The one trap in the Java class: `ack()` returns the value BEFORE
-// decrementing, while `decFoundMsg()` ADDS (not subtracts) — it is a "give the
-// messages back" undo path. Both are reproduced with the Java behaviour,
-// because ConsumeMessagePopConcurrentlyService relies on the sign.
+// 这个类里有两个坑：`ack()` 返回的是**减一之前**的值；`decFoundMsg()` 做的是**加**
+// 而不是减——它是"这一批撤回，把债再挂回去"的路径。两处都得原样保留，因为
+// ConsumeMessagePopConcurrentlyService 依赖这个符号方向。
 import { currentTimeMillis } from '../common/utilAll.ts';
 
-// Java's PULL_MAX_IDLE_TIME (overridable via ROCKETMQ_CLIENT_PULL_MAX_IDLE_TIME).
+// POP 复用的空闲上限（默认 120000ms，可用 ROCKETMQ_CLIENT_PULL_MAX_IDLE_TIME 覆盖）。
 const POP_PULL_MAX_IDLE_TIME = (() => {
   const raw = process.env.ROCKETMQ_CLIENT_PULL_MAX_IDLE_TIME;
   if (!raw) return 120000;
@@ -38,26 +34,21 @@ export class PopProcessQueue {
   // an answer for each.
   incFoundMsg(count: number): void { this.waitAckCounter += count; }
 
-  // ack mirrors Java ack(): returns the value BEFORE the decrement
-  // (AtomicInteger.getAndDecrement). The live assertions read the pre-value.
+  // ack()：返回**减一之前**的原值（getAndDecrement 语义）；实时刻度读的是自减前的量。
   ack(): number { return this.waitAckCounter--; }
 
-  // decFoundMsg mirrors Java decFoundMsg, which ADDS. It is the "abort this
-  // batch, hand the debt back" path used when a batch turns out to be
-  // undeliverable (dropped queue / popped out of its invisibility window).
-  // Callers pass a negative count to return the debt: decFoundMsg(-msgs.length).
+  // decFoundMsg 做的是**加**：这是"整批撤回，把欠回复重新挂回来"的路径，用于队列
+  // 已 dropped 或消息已经出了不可见窗口这种不可投递场景。调用方传负数来销账：
+  // decFoundMsg(-msgs.length)。
   decFoundMsg(count: number): void { this.waitAckCounter += count; }
 
-  // waitAckMsgCount is the outstanding-ACK count (Java's misspelled
-  // getWaiAckMsgCount).
+  // 未回 ACK 的条数。
   waitAckMsgCount(): number { return this.waitAckCounter; }
 
   isDropped(): boolean { return this.dropped; }
   setDropped(dropped = true): void { this.dropped = dropped; }
 
-  // isPullExpired mirrors Java isPullExpired. The POP rebalance uses it to
-  // retire a queue whose pop loop has gone quiet (the broker would otherwise
-  // keep reviving its batch).
+  // POP rebalance 用它淘汰 pop 循环静默太久的队列（不然 broker 会一直 revival 它的批次）。
   isPullExpired(): boolean {
     return currentTimeMillis() - this.lastPopTimestamp > POP_PULL_MAX_IDLE_TIME;
   }

@@ -66,7 +66,7 @@ console.log('== allocation ==');
     for (const q of chash.allocate('g', c, mqAll, cid3)) all.add(q.getTopic() + '@' + q.getQueueId());
   }
   check('CONSISTENT_HASH covers all 8 queues', all.size === 8);
-  check('ALLOCATE_STRATEGIES registry has 6 entries (Java factory set)',
+  check('ALLOCATE_STRATEGIES registry has 6 entries',
     Object.keys(ALLOCATE_STRATEGIES).length === 6);
 }
 
@@ -88,7 +88,7 @@ console.log('== ProcessQueue ==');
   check('requeue restores batch', pq.takeBatch(4).length === 3);
 
   const removed = pq.removeMessage(msgs.slice(1));
-  check('removeMessage on emptied buffer returns -1 (Go/Java parity)', removed === -1);
+  check('removeMessage on emptied buffer returns -1', removed === -1);
   check('bufferedOffsetSpan after remove = (0,0,0)',
     JSON.stringify(pq.bufferedOffsetSpan()) === '[0,0,0]');
 }
@@ -100,7 +100,7 @@ console.log('== LocalFileOffsetStore ==');
   const mq = new MessageQueue('T', 'broker-a', 0);
   store.updateOffset(mq, 42, false);
   await store.persistAll([mq]);
-  // Java fastjson2 writes the compact object-key shape; keys are JSON objects.
+  // offsets 文件的键是紧凑的内联对象形态（键本身是 JSON 对象）。
   const file = path.join(base, 'cid1', 'g1', 'offsets.json');
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   const keys = Object.keys(raw.offsetTable);
@@ -146,7 +146,7 @@ console.log('== trace codec ==');
     decoded[0].traceType === 'Pub' && decoded[0].traceBeans[0].topic === 'T'
     && decoded[0].traceBeans[0].msgId === 'UNIQ_KEY_1');
 
-  // SubBefore WITHOUT keys → 7 segments (Java AIOOBE quirk) must still decode.
+  // 不带 keys 的 SubBefore → 解码成 7 段的边界情况也必须能解出来。
   const sub = new TraceContext();
   sub.traceType = TraceType.SUB_BEFORE;
   sub.groupName = 'G';
@@ -157,9 +157,8 @@ console.log('== trace codec ==');
   subBean.keys = ''; // no keys
   sub.traceBeans = [subBean];
   const enc2 = EncodeTraceContext(sub);
-  // Encoder always writes 8 fields (type..keys) → 7 `\x01` separators. The
-  // Java "7 segments" quirk is a DECODE-side effect: String#split drops the
-  // trailing empty keys segment, leaving 7.
+  // Encoder always writes 8 fields (type..keys) → 7 `\x01` separators.
+  // "7 段"是解码侧的效应：split 丢弃尾部空段，只剩 7 段。
   const segs = enc2!.transData.split('\u0001').length;
   check('keys-less SubBefore emits 8 fields (7 separators)', segs === 8);
   const dec2 = DecodeTraceDataString(enc2!.transData);
@@ -188,7 +187,7 @@ console.log('== consumer construct sanity ==');
 console.log('== admin construct sanity ==');
 {
   const admin = new DefaultMQAdminExt();
-  check('admin default timeout 20000 (Java)', admin.timeoutMillis === 20000);
+  check('admin default timeout 20000', admin.timeoutMillis === 20000);
   check('string2Properties comments/whitespace/colon',
     JSON.stringify(string2Properties('a=1\n# c\nb = x y\nc:z\n')) === '{"a":"1","b":"x y","c":"z"}');
   // 307 statusTable pre-start → zero-filled ConsumeStatus per subscribed topic.

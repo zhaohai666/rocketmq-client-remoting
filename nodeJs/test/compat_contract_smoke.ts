@@ -1,5 +1,6 @@
-// Smoke test for the Java-gap-fill surface. Run:
-//   node --experimental-strip-types test/java_gap_fill_smoke.ts
+// Smoke test for the compat-contract surface: wire-format / server-side
+// behaviors pinned by this port. Run:
+//   node --experimental-strip-types test/compat_contract_smoke.ts
 import assert from 'node:assert';
 import { MessageQueue, Message } from '../src/common/message.ts';
 import { AllocateMachineRoomNearby, AllocateMessageQueueAveragely } from '../src/client/allocate.ts';
@@ -38,7 +39,7 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: MACHINE_ROOM_NEARBY splits by room and shares orphans');
 }
 
-// 2) An empty machine room from the resolver throws (Java IllegalArgumentException).
+// 2) 解析出空机房时抛错（resolver 返回空串 -> Machine room is null）。
 {
   const resolver: MachineRoomResolver = {
     brokerDeployIn: () => '',
@@ -49,7 +50,7 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: MACHINE_ROOM_NEARBY empty room throws');
 }
 
-// 3) Constructor null checks mirror Java's NPEs.
+// 3) 构造器空值守卫：任一参数为 null 必须抛错。
 {
   const resolver: MachineRoomResolver = {
     brokerDeployIn: () => 'room-a',
@@ -99,7 +100,7 @@ function nearbyMQs(): MessageQueue[] {
   console.log('OK: FairSemaphore byte-size acquire/release');
 }
 
-// 6) VIP channel port math (Java MixAll.brokerVIPChannel).
+// 6) VIP 通道端口算术（开启时 port-2）。
 {
   assert.strictEqual(MixAll.brokerVipChannel(true, '127.0.0.1:10911'), '127.0.0.1:10909');
   assert.strictEqual(MixAll.brokerVipChannel(false, '127.0.0.1:10911'), '127.0.0.1:10911');
@@ -116,15 +117,14 @@ function nearbyMQs(): MessageQueue[] {
   m.setDeliverTimeMs(1699999999000);
   assert.strictEqual(m.getProperty('TIMER_DELIVER_MS'), '1699999999000');
   assert.strictEqual(m.getProperty('DELAY'), null); // 4.x level untouched
-  console.log('OK: timer delay setters use Java property names');
+  console.log('OK: timer delay setters use the server-side TIMER_* property names');
 }
 
-// 8) LitePullConsumer.seekToBegin / seekToEnd
-//    (Java DefaultLitePullConsumerImpl:697-705 — begin = minOffset then seek,
-//     end = maxOffset then seek; both go through MQAdminImpl, master only).
-//    The fake mqClient answers the boundary RPCs, so the assertion is on where
-//    the pull cursor actually lands — a seek that silently no-ops looks fine
-//    until the consumer replays the whole queue or skips it.
+// 8) LitePullConsumer.seekToBegin / seekToEnd：
+//    begin = 先取 minOffset 再 seek，end = 先取 maxOffset 再 seek，
+//    两者都走 admin 路径、只寻址 master broker。
+//    假的 mqClient 应答边界 RPC，所以断言盯住拉取游标真正落点——
+//    静默无效的 seek 要到消费者重放整个队列或跳过整个队列时才暴露。
 {
   const mq = new MessageQueue('SeekTopic', 'broker-a', 0);
   const route = { brokerDatas: [{ brokerName: 'broker-a', brokerAddrs: { '0': '127.0.0.1:10911' } }] };
@@ -137,8 +137,8 @@ function nearbyMQs(): MessageQueue[] {
     getMaxOffset: async () => stub.max,
   };
 
-  // seek() itself gates on started (Java checkServiceState), and so do the two
-  // wrappers — before start nothing moves.
+  // seek() 自身以 started 为准入门槛（校验服务状态），两个封装同样如此——
+  // start 之前什么都不会移动。
   await assert.rejects(() => c.seekToBegin(mq), /not started/);
   await assert.rejects(() => c.seekToEnd(mq), /not started/);
   assert.strictEqual(c.pullCursor.get(mqKey(mq)), undefined);
@@ -161,14 +161,11 @@ function nearbyMQs(): MessageQueue[] {
 }
 
 // 9) Push consumer: suspend() / resume() / isPaused()
-//    (Java DefaultMQPushConsumer#suspend:890 / #resume:898 / #isPause:902 →
-//     Impl#suspend:1312-1315, Impl#resume:741-745; the flag is read only at
-//     pullMessage:263-266 and popMessage:518-521, both backing off
-//     PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000ms).
-//    The invariant that matters is the ORDER: the gate must come after
-//    pq.touchPull(). Gate-before-stamp makes a merely-suspended consumer look
-//    dead to the 120s stall detector, and rebalance then tears the assignment
-//    down — an operator pausing for two minutes would get a full re-delivery.
+//    挂起标志只在 pullMessage 与 popMessage 两条路径读取，命中时按
+//    PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000ms 退避。
+//    关键不变量是顺序：门槛必须在 pq.touchPull() 之后。门槛先于时间戳更新，
+//    会让"只是被挂起"的消费者在 120s 停滞检测器眼里形同死掉，rebalance 随即
+//    拆掉分配——运维暂停两分钟就会换来一次全量重投。
 {
   const { DefaultMQPushConsumer } = await import('../src/client/consumer.ts');
   const { ProcessQueue } = await import('../src/client/process_queue.ts');
@@ -198,8 +195,8 @@ function nearbyMQs(): MessageQueue[] {
     return new PullResult(PullStatus.NO_NEW_MSG, next, 0, next, []);
   };
 
-  // suspend()/resume() touch no state a not-yet-started consumer owns (Java does
-  // not check service state here), so they must be safe before start too.
+  // suspend()/resume() 不触碰尚未 start 的消费者所持有的任何状态，
+  // 因此它们在 start 之前也必须安全。
   const idle: any = new DefaultMQPushConsumer('suspendIdleGroup');
   assert.strictEqual(idle.isPaused(), false, 'pause defaults to false');
   idle.suspend(); idle.suspend();
@@ -233,7 +230,7 @@ function nearbyMQs(): MessageQueue[] {
 
   c.resume();
   assert.strictEqual(c.isPaused(), false);
-  assert.ok(c._rebalanceNow, 'resume must wake the rebalance loop (Java Impl#resume:741-745)');
+  assert.ok(c._rebalanceNow, 'resume must immediately wake the rebalance loop');
   assert.ok(await waitPulls(baseline + 1), 'resume must restart pulling by itself');
 
   c._stopFlags.clear(); c._stopFlags.add('__stopped');
@@ -244,11 +241,8 @@ function nearbyMQs(): MessageQueue[] {
 
 // 10) Push consumer thread elasticity: updateCorePoolSize / getCorePoolSize /
 //     adjustThreadPool / computeAccumulationTotal
-//     (Java AbstractConsumeMessageService#updateCorePoolSize:59-67, #getCorePoolSize:78-79,
-//      #adjustThreadPool no-op at :70-75, DefaultMQPushConsumerImpl#computeAccumulationTotal).
-//    The guards matter: accept >= consumeThreadMax and the pool core exceeds its own
-//    max, which ThreadPoolExecutor rejects; silently ignoring a bad value is Java's
-//    contract, so the port must not throw either.
+//    守卫才是重点：接受 >= consumeThreadMax 会让池 core 超过自身 max，
+//    ThreadPoolExecutor 会拒绝；坏值必须静默忽略、不抛错——这是该接口的约定。
 {
   const { DefaultMQPushConsumer } = await import('../src/client/consumer.ts');
   const c: any = new DefaultMQPushConsumer('elasticitySmokeGroup');
@@ -257,13 +251,13 @@ function nearbyMQs(): MessageQueue[] {
 
   assert.strictEqual(c.updateCorePoolSize(32), true, 'a value below consumeThreadMax applies');
   assert.strictEqual(c.getCorePoolSize(), 32, 'getCorePoolSize reports the applied value');
-  // Guards (all silent, like Java): out of range, == / > max, non-finite.
+  // 守卫（全部静默拒绝）：越界、== / > max、非有限值。
   assert.strictEqual(c.updateCorePoolSize(0), false, 'core must be > 0');
   assert.strictEqual(c.updateCorePoolSize(-5), false, 'negative rejected');
   assert.strictEqual(c.updateCorePoolSize(32768), false, 'above Short.MAX_VALUE rejected');
   assert.strictEqual(c.updateCorePoolSize(32767), false, 'Short.MAX_VALUE still >= consumeThreadMax here');
   c.consumeThreadMax = 10;
-  assert.strictEqual(c.updateCorePoolSize(10), false, 'core == max is rejected (Java uses <)');
+  assert.strictEqual(c.updateCorePoolSize(10), false, 'core == max is rejected: the guard is a strict <');
   assert.strictEqual(c.updateCorePoolSize(NaN), false, 'non-finite rejected');
   assert.strictEqual(c.getCorePoolSize(), 32, 'a rejected value leaves the pool size alone');
 
@@ -274,10 +268,10 @@ function nearbyMQs(): MessageQueue[] {
   // adjustThreadPool is a documented no-op upstream: it must not move the pool.
   c.adjustThreadPoolNumsThreshold = 5;
   c.adjustThreadPool();
-  assert.strictEqual(c.getCorePoolSize(), 32, 'adjustThreadPool is a no-op in Java 5.5.1');
+  assert.strictEqual(c.getCorePoolSize(), 32, 'adjustThreadPool is a pinned no-op: it must not resize the pool');
 
-  console.log('OK: push consumer core-pool guards follow Java, adjustThreadPool stays a no-op');
+  console.log('OK: push consumer core-pool guards match the pinned contract, adjustThreadPool stays a no-op');
 }
 
-console.log('\nAll java-gap-fill smoke checks passed.');
+console.log('\nAll compat-contract smoke checks passed.');
 

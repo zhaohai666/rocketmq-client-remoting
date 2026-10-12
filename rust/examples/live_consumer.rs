@@ -1802,7 +1802,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
             Ok(text) => {
                 // Java fastjson2 落盘格式（真实 rocketmq-client 5.5.0 实测）：
                 // {"offsetTable":{{"brokerName":..,"queueId":..,"topic":..}:off,...}}
-                let offsets = java_format_offsets(&text);
+                let offsets = canonical_format_offsets(&text);
                 ck.check(
                     "C6 the local offset file uses Java's object-as-key offsetTable format with 2 entries summing to 8",
                     matches!(&offsets, Some(v) if v.len() == 2 && v.iter().sum::<i64>() == 8),
@@ -1850,7 +1850,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
 }
 
 /// 从 `{"offsetTable":{{...}:7,{...}:9}}` 抽出位点列表；格式不对返回 `None`。
-fn java_format_offsets(text: &str) -> Option<Vec<i64>> {
+fn canonical_format_offsets(text: &str) -> Option<Vec<i64>> {
     let body = text.strip_prefix("{\"offsetTable\":{")?.strip_suffix("}}")?;
     let mut offs = Vec::new();
     for (i, seg) in body.split("}:").enumerate() {

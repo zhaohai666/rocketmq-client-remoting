@@ -39,7 +39,7 @@ public class ValidatorsTests
     [InlineData("café")]
     [InlineData("tab\there")]
     [InlineData("line\nbreak")]
-    public void CharTableMatchesJava(string name)
+    public void CharTableMatchesLegacy(string name)
     {
         bool illegal = TopicValidator.IsTopicOrGroupIllegal(name);
         // 期望值直接由 Java 白名单正则表达：只有 % - _ | 与 ASCII 字母数字可用
@@ -215,7 +215,7 @@ public class ValidatorsTests
     // ---------------------------------------------------------------- 系统 topic
 
     [Fact]
-    public void SystemTopicMatchesJavaRuleSet()
+    public void SystemTopicMatchesLegacyRuleSet()
     {
         Assert.True(TopicValidator.IsSystemTopic("TBW102"));
         Assert.True(TopicValidator.IsSystemTopic("SCHEDULE_TOPIC_XXXX"));

@@ -18,7 +18,7 @@ int64_t nowMillis() { return UtilAll::currentTimeMillis(); }
 FaultItem::FaultItem(const std::string& name) : name_(name) {}
 
 void FaultItem::updateNotAvailableDuration(int64_t notAvailableDurationMillis) {
-    // Java：only when now + dur > startTimestamp 才更新（保持最长隔离期）
+    // 仅当 now + dur > startTimestamp 才更新（保持最长隔离期）
     if (notAvailableDurationMillis > 0
         && nowMillis() + notAvailableDurationMillis > startTimestamp_) {
         startTimestamp_ = nowMillis() + notAvailableDurationMillis;
@@ -49,7 +49,7 @@ void LatencyFaultToleranceImpl::updateFaultItem(const std::string& name, double 
 bool LatencyFaultToleranceImpl::isAvailable(const std::string& name) {
     std::lock_guard<std::mutex> lk(m_);
     auto it = table_.find(name);
-    // 没有记录 = 从未出过问题，默认可用（与 Java/Python 一致）
+    // 没有记录 = 从未出过问题，默认可用
     return it == table_.end() ? true : it->second.isAvailable();
 }
 

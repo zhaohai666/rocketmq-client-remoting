@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * TopicFilterType（对应 org.apache.rocketmq.common.TopicFilterType，移植自 topic_config.py）。
+ * Topic 的 tag 过滤类型：单 tag 还是多 tag（建 topic 时上报的字段）。
  */
 final class TopicFilterType
 {

@@ -109,7 +109,7 @@ def start_daemon(target) -> threading.Thread:
 
 # ---------------------------------------------------------------- 参数
 
-def test_default_params_match_java():
+def test_default_params_match_the_producer_contract():
     acc = ProduceAccumulator("params")
     assert acc.get_batch_max_delay_ms() == 10
     assert acc.get_batch_max_bytes() == 32 * 1024
@@ -119,7 +119,7 @@ def test_default_params_match_java():
     assert acc.currently_hold_size == 0
 
 
-def test_param_guards_copy_java_ranges():
+def test_param_guards_use_the_documented_ranges():
     acc = ProduceAccumulator("guards")
     acc.batch_max_delay_ms(1)
     acc.batch_max_delay_ms(30 * 1000)

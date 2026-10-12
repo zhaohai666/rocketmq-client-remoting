@@ -22,7 +22,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../bootstrap.php';
 
 // autoloader 只加载类不加载函数：本套件直接调 ConsumerSupport 的全局函数，先保证文件已加载。
-if (!function_exists('RocketMQ\\Client\\java_split')) {
+if (!function_exists('RocketMQ\\Client\\wire_split')) {
     require_once __DIR__ . '/../src/Client/ConsumerSupport.php';
 }
 
@@ -61,8 +61,8 @@ use RocketMQ\Common\PermName;
 use function RocketMQ\Client\build_local_offsets_json;
 use function RocketMQ\Client\client_side_tag_filter;
 use function RocketMQ\Client\filter_messages_for_delivery;
-use function RocketMQ\Client\java_message_queue_string;
-use function RocketMQ\Client\java_split;
+use function RocketMQ\Client\wire_queue_key_string;
+use function RocketMQ\Client\wire_split;
 use function RocketMQ\Client\parse_local_offsets_json;
 use function RocketMQ\Client\scan_offset_table_body;
 use function RocketMQ\Remoting\Protocol\message_queue_key;
@@ -567,24 +567,25 @@ final class RunClientConsumer
 
     private function testConsumerSupportUnit(): void
     {
-        // java_split：Java String#split 的丢尾空段语义。
-        $this->checkSame(['room1'], java_split('room1@', '@'), 'java_split 丢尾空段');
-        $this->checkSame(['room1', 'b'], java_split('room1@b@', '@'), 'java_split 中段保留尾剔除');
-        $this->checkSame([], java_split('@', '@'), 'java_split 全分隔符 → 空');
-        $this->checkSame([''], java_split('', '@'), 'java_split 无命中原样返回（含空串）');
-        $this->checkSame(['abc'], java_split('abc', '@'), 'java_split 无命中原样返回');
+        // wire_split：按协议 wire 字段的分隔符切分，丢弃尾部空段。
+        $this->checkSame(['room1'], wire_split('room1@', '@'), 'wire_split 丢尾空段');
+        $this->checkSame(['room1', 'b'], wire_split('room1@b@', '@'), 'wire_split 中段保留尾剔除');
+        $this->checkSame([], wire_split('@', '@'), 'wire_split 全分隔符 → 空');
+        $this->checkSame([''], wire_split('', '@'), 'wire_split 无命中原样返回（含空串）');
+        $this->checkSame(['abc'], wire_split('abc', '@'), 'wire_split 无命中原样返回');
 
-        // java_message_queue_string：一致性哈希的输入，必须逐字符对齐 Java。
+        // wire_queue_key_string：一致性哈希的输入串，格式固定为
+        // "MessageQueue [topic=..., brokerName=..., queueId=...]"，逐字符不得变形。
         $mq = new MessageQueue('T', 'b', 3);
-        $this->checkSame('MessageQueue [topic=T, brokerName=b, queueId=3]', java_message_queue_string($mq),
-            'java_message_queue_string 格式');
+        $this->checkSame('MessageQueue [topic=T, brokerName=b, queueId=3]', wire_queue_key_string($mq),
+            'wire_queue_key_string 格式');
 
         // 本地位点 JSON：严格扁平 map 往返。
         $items = ['Tb1' => 42, 'Tb2' => 7];
         $mqMap = ['Tb1' => new MessageQueue('T', 'b', 1), 'Tb2' => new MessageQueue('T', 'b', 2)];
         $json = build_local_offsets_json($items, $mqMap);
         $this->checkSame($items, parse_local_offsets_json($json), '本地位点 JSON 往返');
-        // fastjson2「对象作 key」格式（Java 写的文件）。
+        // 兼容「对象作 key」的非标准 offsetTable JSON（按协议字段名 brokerName/queueId/topic 回读）。
         $javaStyle = '{"offsetTable":{{"brokerName":"b","queueId":1,"topic":"T"}:42,'
             . '{"brokerName":"b","queueId":2,"topic":"T"}:7}}';
         $this->checkSame($items, parse_local_offsets_json($javaStyle), 'fastjson2 对象键格式解析');
@@ -634,12 +635,12 @@ final class RunClientConsumer
         $this->checkSame(3, $pq->waitAckCount(), 'PopProcessQueue incFoundMsg');
         $this->checkSame(2, $pq->ack(), 'PopProcessQueue ack 减一');
         $pq->decFoundMsg(-1);
-        $this->checkSame(1, $pq->waitAckCount(), 'PopProcessQueue decFoundMsg（Java 语义传负数）');
+        $this->checkSame(1, $pq->waitAckCount(), 'PopProcessQueue decFoundMsg（协议语义传负数递减）');
         $this->check(!$pq->isDropped(), 'PopProcessQueue 默认未 dropped');
         $pq->setDropped(true);
         $this->check($pq->isDropped(), 'PopProcessQueue setDropped');
 
-        // 消费侧常量对齐 Java 数值。
+        // 消费侧常量取值：POP 延迟档位与不可见时间上下限。
         $this->checkSame([10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1200, 1800, 3600, 7200],
             ConsumerDefaults::POP_DELAY_LEVEL, 'POP_DELAY_LEVEL 16 档');
         $this->checkSame(5000, ConsumerDefaults::MIN_POP_INVISIBLE_TIME, 'MIN_POP_INVISIBLE_TIME');
@@ -680,13 +681,13 @@ final class RunClientConsumer
         $this->checkSame(['retry-0', 'retry-1', 'retry-2'], $GLOBALS['RECV']['RTopic'] ?? [], 'RTopic 收满 3 条');
         $this->checkSame(['part-0', 'part-1', 'part-2'], $GLOBALS['RECV']['PTopic'] ?? [], 'PTopic 收满 3 条');
         // C4 地板语义：FTopic 回投 f-1/f-2 失败 → floor=min(1,2)=1 卡住位点，失败条目塞回队首。
-        // PHP 适配（有意偏差）：dispatchRound 对失败重排**同 tick 立即重试**（无 Java 的
-        // submitConsumeRequestLater 延迟），所以 floor 中间态在单线程内不可观测，只有终态可断言；
-        // "位点不越过失败条目"的真验证靠真机（重试天然跨 tick，见任务#10）。
+        // 本端口有意偏差：dispatchRound 对失败重排**同 tick 立即重试**（不做延迟提交），
+        // 所以 floor 中间态在单线程内不可观测，只有终态可断言；
+        // "位点不越过失败条目"的真验证靠真机（重试天然跨 tick）。
         $this->checkSame(['f-0', 'f-1', 'f-2', 'f-1', 'f-2'], $GLOBALS['RECV']['FTopic'] ?? [],
             'FTopic 回投失败的 2 条在同 tick 内被塞回队首重放');
         // PTopic：回投 p-1/p-2 成功 → broker 会重投到 %RETRY%，客户端照常推进越过它们
-        // （Java removeMessage 对"剩余 msgs"取 max(queueOffset)+1）。
+        // （回投成功的消息从本地缓冲移除，位点取剩余 msgs 的 max(queueOffset)+1）。
         $this->checkSame(3, ($c->getConsumerStatus('PTopic')[0]['offset'] ?? -1),
             '回投成功后位点照常推进到 3');
 
@@ -759,19 +760,18 @@ final class RunClientConsumer
         $status = $c->getConsumerStatus('CTopic');
         $this->checkSame(3, $status[0]['offset'] ?? -1, 'resetOffset 后空拉修正位点回到 3');
 
-        // 实例鸭子类型契约：adjustThreadPool 是 no-op（对齐 Java 5.5.1），corePoolSize 声明值可观测。
+        // 实例鸭子类型契约：adjustThreadPool 是 no-op，corePoolSize 声明值可观测。
         $c->adjustThreadPool();
         $this->checkSame(20, $c->getCorePoolSize(), 'corePoolSize 默认 20');
 
         $this->cleanup($c);
     }
 
-    // ================================================================ 2b. Push 挂起/恢复（Java suspend/resume/isPause）
+    // ================================================================ 2b. Push 挂起/恢复（suspend/resume/isPause）
 
     /**
-     * 对齐 Java DefaultMQPushConsumer#suspend:890 / #resume:898 / #isPause:902
-     *（Impl#suspend:1312-1315、Impl#resume:741-745；读闸门的只有 pullMessage:263-266
-     * 与 popMessage:518-521）。
+     * 契约：suspend/resume 只翻转挂起标志、isPause 读该标志；挂起闸门只作用在
+     * PULL_MESSAGE / POP_MESSAGE 的发送入口（发送前先判 pause 标志）。
      *
      * 这里锁的是**顺序**而不是"停没停"：闸门必须落在盖章之后。放前面的话挂起超过
      * PULL_MAX_IDLE_TIME（120s）就会让停摆判据把这条循环判死，rebalance 撤队列重建，
@@ -780,15 +780,15 @@ final class RunClientConsumer
      */
     private function testPushSuspendResume(ConsFakeBroker $broker): void
     {
-        // 常量：Java 的 1000ms 退避与 120s 停摆阈值，二者相差两个数量级才有意义。
+        // 常量：1000ms 挂起退避与 120s 停摆阈值，二者相差两个数量级才有意义。
         $this->checkSame(1.0, ConsumerDefaults::PULL_TIME_DELAY_WHEN_SUSPEND,
-            'PULL_TIME_DELAY_WHEN_SUSPEND = Java 默认 1000ms');
+            'PULL_TIME_DELAY_WHEN_SUSPEND = 默认 1000ms');
         $this->checkSame(120.0, ConsumerDefaults::PULL_MAX_IDLE_TIME, 'PULL_MAX_IDLE_TIME = 120s');
 
-        // 未 start 也必须安全（Java 不校验服务状态），且翻转幂等。
+        // 未 start 也必须安全（suspend/resume 不校验服务状态），且翻转幂等。
         $idle = new DefaultMQPushConsumer('GID-SUS-IDLE');
         $idle->setInstanceName('CONS-SUS-IDLE');
-        $this->checkSame(false, $idle->isPaused(), '默认不挂起（Java pause = false）');
+        $this->checkSame(false, $idle->isPaused(), '默认不挂起（初始 pause = false）');
         $idle->suspend();
         $idle->suspend();
         $this->checkSame(true, $idle->isPaused(), '重复 suspend 保持挂起');
@@ -826,14 +826,14 @@ final class RunClientConsumer
             $this->checkSame(true, $c->isPaused(), 'suspend 后 isPaused 为真');
 
             $baselinePulls = $before;
-            // 多个 tick、跨过 Java 的 1s 退避窗口：挂起期间一次网络都不许发。
+            // 多个 tick、跨过 1s 挂起退避窗口：挂起期间一次网络都不许发。
             for ($i = 0; $i < 4; $i++) {
                 $c->tick();
                 usleep(300_000);
             }
             $this->loadLog(getenv('RMQ_LOG'));
             $this->checkSame($baselinePulls, count($this->logWhere(RequestCode::PULL_MESSAGE, 'UTopic', 'GID-SUS-CONS')),
-                '挂起期间不得再有 PULL_MESSAGE 上线（Java pullMessage:263-266）');
+                '挂起期间不得再有 PULL_MESSAGE 上线（挂起闸门在发送入口生效）');
 
             // 关键不变量：挂起 ≠ 停摆。时刻必须继续推进，否则 120s 判据会把队列撤掉。
             $stampAfter = $c->consumerRunningInfo()->mqTable[$key]['lastPullTimestamp'] ?? 0;
@@ -967,8 +967,8 @@ final class RunClientConsumer
         $this->checkSame(2, (int) ($backs[0]['delayLevel'] ?? -1), '回投 delayLevel=2');
         $this->checkSame(null, $backs[0]['maxReconsumeTimes'] ?? null, 'pull 回投 maxReconsumeTimes 不下发');
 
-        // fetchMessageQueuesInBalance（Java MQPullConsumer:187 / Impl:120-135）：
-        // 本端口拉模式没有后台 rebalance，就按 rebalanceByTopic 同一条公式当场算。
+        // fetchMessageQueuesInBalance：拉模式没有后台 rebalance，就按 rebalanceByTopic
+        // 同一条公式当场算出本实例负责的队列。
         // 组里只有本实例（RMQ_CONSUMER_MAP 只登记了 CONS-P 一个 clientId）→ 全份都是我的。
         $balanced = $c->fetchMessageQueuesInBalance('DTopic');
         $this->checkSame(1, count($balanced), '平衡视图给出本实例负责的 1 条队列');
@@ -985,9 +985,9 @@ final class RunClientConsumer
                 $c->fetchMessageQueuesInBalance('DTopic')),
             '列表查不到时退回本地 pullFromWhichNodeTable 键集');
         $this->checkSame([], $c->fetchMessageQueuesInBalance('ETopic'),
-            '没拉过又查不到列表 → 空集（Java rebalance 前的空表同语义）');
+            '没拉过又查不到列表 → 空集（与首轮 rebalance 前的空表同语义）');
         $c->consumerGroup = $group;
-        // 未启动的消费者一律拒绝（Java isRunning()）：新实例直接调用要抛。
+        // 未启动的消费者一律拒绝（isRunning() 守卫）：新实例直接调用要抛。
         $idle = new DefaultMQPullConsumer('GID-P-CONS');
         $idle->setNameServerAddresses([$broker->addr]);
         $threw = false;
@@ -1019,7 +1019,7 @@ final class RunClientConsumer
         $this->checkSame(2, $c->pullCursorOf($mq), '拉取游标推进到 2');
         $this->checkSame(-1, $c->consumeCursorOf($mq), 'poll 前已消费游标未动');
 
-        // poll：交出缓冲并推进"已消费游标"（Java poll 语义）。
+        // poll：交出缓冲并推进"已消费游标"（poll 只交出缓冲，拉取游标不动）。
         $msgs = $c->poll(500);
         $this->checkSame(['lite-0', 'lite-1'], array_map(static fn($m) => $m->getBody(), $msgs), 'poll 交出 2 条');
         $this->checkSame(2, $c->consumeCursorOf($mq), 'poll 后已消费游标=2');

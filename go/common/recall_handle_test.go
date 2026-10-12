@@ -5,11 +5,12 @@ import (
 	"testing"
 )
 
-// The vector comes from Java RecallMessageHandleTest / the Rust port's test:
+// The vector below is a recorded reference fixture, captured from a probe run
+// of the handle codec:
 // build_handle("TopicA", "broker-a", "1700000000000",
-// "0123456789ABCDEF0123456789abcdef") must reproduce Java's PADDED url-base64
+// "0123456789ABCDEF0123456789abcdef") must reproduce the PADDED url-base64
 // byte for byte.
-func TestBuildRecallHandleJavaVector(t *testing.T) {
+func TestBuildRecallHandleReferenceVector(t *testing.T) {
 	const want = "djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgMDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY="
 	got := BuildRecallHandle("TopicA", "broker-a", "1700000000000", "0123456789ABCDEF0123456789abcdef")
 	if got != want {
@@ -20,7 +21,7 @@ func TestBuildRecallHandleJavaVector(t *testing.T) {
 func TestDecodeRecallHandleRoundTripAndPadding(t *testing.T) {
 	padded := BuildRecallHandle("TopicA", "broker-a", "1700000000000", "UNIQ-KEY-1")
 	if !hasPaddedSuffix(padded) {
-		t.Fatalf("BuildRecallHandle must emit padding (Java urlEncoder), got %q", padded)
+		t.Fatalf("BuildRecallHandle must emit padding (the on-wire urlEncoder form), got %q", padded)
 	}
 	unpadded := base64.RawURLEncoding.EncodeToString([]byte("v1 TopicA broker-a 1700000000000 UNIQ-KEY-1"))
 
@@ -71,7 +72,7 @@ func TestDecodeRecallHandleInvalid(t *testing.T) {
 	}
 }
 
-// Java's decoder splits on whitespace and only reads the first five fields, so
+// The wire decoder splits on whitespace and only reads the first five fields, so
 // trailing content is ignored and items[4] stays the messageID.
 func TestDecodeRecallHandleExtraSegmentsIgnored(t *testing.T) {
 	handle := base64.URLEncoding.EncodeToString([]byte("v1 TopicA b1 1700000000000 MID extra more"))

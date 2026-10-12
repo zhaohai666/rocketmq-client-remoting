@@ -25,14 +25,14 @@ func TestMQKeyedJSONThroughEncodeJSONFailsLoudly(t *testing.T) {
 	// And the reason must be the dedicated error, not a generic marshal failure.
 	if _, err := (&mqKeyedJSON{}).MarshalJSON(); err == nil {
 		t.Fatal("mqKeyedJSON.MarshalJSON must fail so encoding/json cannot be used by accident")
-	} else if !strings.Contains(err.Error(), "EncodeFastJSON") {
-		t.Errorf("error = %v, want it to name EncodeFastJSON", err)
+	} else if !strings.Contains(err.Error(), "EncodeInlineKeyJSON") {
+		t.Errorf("error = %v, want it to name EncodeInlineKeyJSON", err)
 	}
 }
 
 // The full ConsumerRunningInfo shape: raw inline-object keys in both tables,
 // PROP_CONSUMEORDERLY without underscores, and `0.0` doubles in statusTable.
-func TestEncodeFastJSONConsumerRunningInfoShape(t *testing.T) {
+func TestEncodeInlineKeyJSONConsumerRunningInfoShape(t *testing.T) {
 	cri := NewConsumerRunningInfo()
 	cri.MQTable[common.NewMessageQueue("TopicA", "broker-a", 3)] =
 		(&ProcessQueueInfo{CommitOffset: 7}).ToJSONValue()
@@ -54,7 +54,7 @@ func TestEncodeFastJSONConsumerRunningInfoShape(t *testing.T) {
 		t.Errorf("body = %s, want the underscore-free property VALUE", got)
 	}
 	if !strings.Contains(got, `"pullRT":0.0`) {
-		t.Errorf("body = %s, want Java double spelling in statusTable", got)
+		t.Errorf("body = %s, want fastjson2 double spelling (0.0) in statusTable", got)
 	}
 	// The empty tables stay objects, not nulls.
 	if !strings.Contains(got, `"mqPopTable":{}`) || !strings.Contains(got, `"userConsumerInfo":{}`) {
@@ -65,8 +65,9 @@ func TestEncodeFastJSONConsumerRunningInfoShape(t *testing.T) {
 	}
 }
 
-// Java iterates a TreeMap<MessageQueue, X>, so the order is
-// MessageQueue.compareTo: topic, then brokerName, then queueId. Inserting in the
+// The table is serialized in MessageQueue.compareTo order — the form fastjson2
+// produces when it iterates a TreeMap<MessageQueue, X>: topic, then brokerName,
+// then queueId. Inserting in the
 // reverse order must not change the output.
 func TestMQKeyedEntriesFollowMessageQueueCompareTo(t *testing.T) {
 	queues := []common.MessageQueue{
@@ -110,7 +111,7 @@ func TestMQKeyedEntriesFollowMessageQueueCompareTo(t *testing.T) {
 
 // The change is CONTAINED: a body without a MessageQueue-keyed table must
 // encode to the exact same bytes whichever writer is used.
-func TestEncodeFastJSONMatchesEncodeJSONWhenNoMQTableIsPresent(t *testing.T) {
+func TestEncodeInlineKeyJSONMatchesEncodeJSONWhenNoMQTableIsPresent(t *testing.T) {
 	bodies := []struct {
 		name string
 		v    any
@@ -126,7 +127,7 @@ func TestEncodeFastJSONMatchesEncodeJSONWhenNoMQTableIsPresent(t *testing.T) {
 	}
 	for _, b := range bodies {
 		std := EncodeJSON(b.v)
-		fast := EncodeFastJSON(b.v)
+		fast := EncodeInlineKeyJSON(b.v)
 		if std == nil {
 			t.Fatalf("%s: EncodeJSON failed", b.name)
 		}
@@ -136,8 +137,8 @@ func TestEncodeFastJSONMatchesEncodeJSONWhenNoMQTableIsPresent(t *testing.T) {
 	}
 }
 
-// A body whose table is empty still has to be a valid object (Java writes `{}`).
-func TestEncodeFastJSONEmptyTables(t *testing.T) {
+// A body whose table is empty still has to be a valid object (`{}`, not null).
+func TestEncodeInlineKeyJSONEmptyTables(t *testing.T) {
 	if got := string((&ResetOffsetBody{}).Encode()); got != `{"offsetTable":{}}` {
 		t.Errorf("empty ResetOffsetBody = %s, want {\"offsetTable\":{}}", got)
 	}
@@ -148,20 +149,20 @@ func TestEncodeFastJSONEmptyTables(t *testing.T) {
 
 // Strings must be escaped the same way in both writers: no HTML escaping, but
 // quotes/backslashes/control characters are still escaped.
-func TestEncodeFastJSONStringEscaping(t *testing.T) {
+func TestEncodeInlineKeyJSONStringEscaping(t *testing.T) {
 	v := map[string]any{"s": "a\"b\\c\nd<e>f&g"}
-	if std, fast := EncodeJSON(v), EncodeFastJSON(v); string(std) != string(fast) {
+	if std, fast := EncodeJSON(v), EncodeInlineKeyJSON(v); string(std) != string(fast) {
 		t.Errorf("escaping differs\n stdlib %s\n fast   %s", std, fast)
 	}
-	if got := string(EncodeFastJSON(v)); strings.Contains(got, `\u003c`) {
-		t.Errorf("got %s, want no HTML escaping (Java does not escape < > &)", got)
+	if got := string(EncodeInlineKeyJSON(v)); strings.Contains(got, `\u003c`) {
+		t.Errorf("got %s, want no HTML escaping (< > & stay raw)", got)
 	}
 }
 
 // Go must be able to read the fastjson2 form it now emits (the admin side of
 // the same wire): the tolerant parser keeps the object key as raw text and
 // DecodeMapKey re-parses it.
-func TestFastJSONMQKeyedBodyRoundTripsThroughTheTolerantParser(t *testing.T) {
+func TestInlineKeyJSONMQKeyedBodyRoundTripsThroughTheTolerantParser(t *testing.T) {
 	cri := NewConsumerRunningInfo()
 	cri.MQTable[common.NewMessageQueue("TopicA", "broker-a", 3)] =
 		(&ProcessQueueInfo{CommitOffset: 7}).ToJSONValue()
@@ -195,7 +196,7 @@ func TestFastJSONMQKeyedBodyRoundTripsThroughTheTolerantParser(t *testing.T) {
 
 // Repeat encodes must be byte-identical (map iteration is not deterministic, so
 // the writer sorts).
-func TestEncodeFastJSONIsDeterministic(t *testing.T) {
+func TestEncodeInlineKeyJSONIsDeterministic(t *testing.T) {
 	cri := NewConsumerRunningInfo()
 	for i := int32(0); i < 12; i++ {
 		cri.MQTable[common.NewMessageQueue("T", "b", i)] =
@@ -210,12 +211,12 @@ func TestEncodeFastJSONIsDeterministic(t *testing.T) {
 }
 
 // A MessageQueue-keyed offset body from the admin side (220) must use the raw
-// key form too — this one travels to the broker and on to a Java consumer.
+// key form too — this one travels to the broker and on to consumers' parsers.
 //
 // MQOffsetTable is a SLICE, so its order is the caller's and is preserved
-// as-is; Java declares the field as an unordered HashMap, so order is not part
+// as-is; the broker-side field is an unordered HashMap, so order is not part
 // of this particular contract.
-func TestEncodeFastJSONResetOffsetBodyShape(t *testing.T) {
+func TestEncodeInlineKeyJSONResetOffsetBodyShape(t *testing.T) {
 	body := &ResetOffsetBody{OffsetTable: MQOffsetTable{
 		{Queue: common.NewMessageQueue("T", "b", 1), Offset: 11},
 		{Queue: common.NewMessageQueue("T", "b", 0), Offset: 10},

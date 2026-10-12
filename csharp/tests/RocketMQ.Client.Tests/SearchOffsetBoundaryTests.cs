@@ -51,7 +51,7 @@ public class SearchOffsetBoundaryTests
     /// 防止有人"顺手"写成小写。
     /// </summary>
     [Fact]
-    public void WireValueIsTheJavaEnumNameNotTheLowercaseName()
+    public void WireValueIsTheLegacyEnumNameNotTheLowercaseName()
     {
         foreach ((BoundaryType boundary, string expected) in
                  new[] { (BoundaryType.Lower, "LOWER"), (BoundaryType.Upper, "UPPER") })
@@ -81,7 +81,7 @@ public class SearchOffsetBoundaryTests
 
     /// <summary>BoundaryType.getType：只有 upper（大小写不敏感）才是 UPPER。</summary>
     [Fact]
-    public void DecodeIsLenientLikeJavaGetType()
+    public void DecodeIsLenientLikeLegacyGetType()
     {
         var header = new SearchOffsetRequestHeader();
         foreach ((string text, BoundaryType expected) in new[]
@@ -173,7 +173,7 @@ public class SearchOffsetBoundaryTests
 
     /// <summary>Java DefaultMQAdminExt:133/:137 的两个方法各自固定 LOWER / UPPER。</summary>
     [Fact]
-    public void AdminExposesJavaBoundaryMethodNames()
+    public void AdminExposesLegacyBoundaryMethodNames()
     {
         using var cluster = MockCluster.Start(1);
         DefaultMQAdminExt admin = Started(cluster);

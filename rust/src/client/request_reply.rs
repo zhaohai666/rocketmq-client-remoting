@@ -514,7 +514,7 @@ mod tests {
     // ---------------- 应答消息构造 ----------------
 
     #[test]
-    fn create_reply_message_matches_java_shape() {
+    fn create_reply_message_matches_wire_shape() {
         let reply = create_reply_message(&request_msg(), b"pong").unwrap();
         // topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）
         assert_eq!(reply.get_topic(), "DefaultCluster_REPLY_TOPIC");

@@ -43,7 +43,7 @@ public class ProducerUnregisterTests
     private const string ClientId = "10.0.0.1@unreg-net-unit";
 
     /// <summary>35 在离线用例里用的超时 —— Java 的 mqClientApiTimeout，写死防止被改回 5000。</summary>
-    private const int JavaApiTimeout = 3000;
+    private const int DefaultApiTimeout = 3000;
 
     // ---------------- master + slave 假集群 ----------------
 
@@ -322,7 +322,7 @@ public class ProducerUnregisterTests
         using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
         using MQClientInstance inst = StartedInstance(cluster);
 
-        inst.UnregisterClient(cluster.MasterAddr, ClientId, Group, "", JavaApiTimeout);
+        inst.UnregisterClient(cluster.MasterAddr, ClientId, Group, "", DefaultApiTimeout);
 
         List<Frame> got = cluster.Frames(RequestCode.UnregisterClient);
         Assert.Single(got);
@@ -341,7 +341,7 @@ public class ProducerUnregisterTests
         using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
         using MQClientInstance inst = StartedInstance(cluster);
 
-        inst.UnregisterClient(cluster.MasterAddr, ClientId, "", Group, JavaApiTimeout);
+        inst.UnregisterClient(cluster.MasterAddr, ClientId, "", Group, DefaultApiTimeout);
 
         PropertyMap ext = Assert.Single(cluster.Frames(RequestCode.UnregisterClient)).Ext;
         Assert.Equal(ClientId, ext["clientID"]);
@@ -356,7 +356,7 @@ public class ProducerUnregisterTests
         using MasterSlaveCluster cluster = MasterSlaveCluster.Start();
         using MQClientInstance inst = StartedInstance(cluster);
 
-        inst.UnregisterClient(cluster.MasterAddr, ClientId, "PID_a", "GID_b", JavaApiTimeout);
+        inst.UnregisterClient(cluster.MasterAddr, ClientId, "PID_a", "GID_b", DefaultApiTimeout);
 
         PropertyMap ext = Assert.Single(cluster.Frames(RequestCode.UnregisterClient)).Ext;
         // PropertyMap 是 SortedDictionary ⇒ 这里锁的是「三个键都在」，顺序按字典序
@@ -373,7 +373,7 @@ public class ProducerUnregisterTests
 
         // 纯空白与空串同处理：合法组名不可能全是空白（Validators 那一关过不去），
         // 传进来只可能是调用方漏了值。broker 判的是 `group != null`，所以必须整个不上线。
-        inst.UnregisterClient(cluster.MasterAddr, ClientId, "   ", Group, JavaApiTimeout);
+        inst.UnregisterClient(cluster.MasterAddr, ClientId, "   ", Group, DefaultApiTimeout);
 
         PropertyMap ext = Assert.Single(cluster.Frames(RequestCode.UnregisterClient)).Ext;
         Assert.False(ext.ContainsKey("producerGroup"));
@@ -396,7 +396,7 @@ public class ProducerUnregisterTests
                      .ToList(),
             inst.GetAllBrokerAddrs().OrderBy(a => a, StringComparer.Ordinal).ToList());
 
-        inst.UnregisterClientAllBrokers(ClientId, Group, "", JavaApiTimeout);
+        inst.UnregisterClientAllBrokers(ClientId, Group, "", DefaultApiTimeout);
 
         List<Frame> unregs = cluster.Frames(RequestCode.UnregisterClient);
         Assert.Equal(2, unregs.Count);
@@ -463,13 +463,13 @@ public class ProducerUnregisterTests
 
         // 底层那一发**要**抛（带上 broker 的响应码），否则下面的「吞」就成了「什么都没发」
         MQBrokerException ex = Assert.Throws<MQBrokerException>(() =>
-            inst.UnregisterClient(cluster.SlaveAddr, ClientId, Group, "", JavaApiTimeout));
+            inst.UnregisterClient(cluster.SlaveAddr, ClientId, Group, "", DefaultApiTimeout));
         Assert.Equal(ResponseCode.SystemError, ex.ResponseCode);
 
         cluster.ClearFrames();
         // Java :1172-1178 三种异常全部只 log.warn —— shutdown 不因单台抖动中断，
         // 而且剩下的 broker 照样要注销到。
-        inst.UnregisterClientAllBrokers(ClientId, Group, "", JavaApiTimeout);
+        inst.UnregisterClientAllBrokers(ClientId, Group, "", DefaultApiTimeout);
         Assert.Equal(1, cluster.CountAt(cluster.MasterAddr, RequestCode.UnregisterClient));
         Assert.Equal(1, cluster.CountAt(cluster.SlaveAddr, RequestCode.UnregisterClient));
     }
@@ -477,7 +477,7 @@ public class ProducerUnregisterTests
     // ---------------- 5：超时预算与 Java 对齐 ----------------
 
     [Fact]
-    public void UnregisterTimeoutMatchesJavaApiTimeout()
+    public void UnregisterTimeoutMatchesLegacyApiTimeout()
     {
         Assert.Equal(3000, MQClientInstance.MqClientApiTimeoutMillis);
     }

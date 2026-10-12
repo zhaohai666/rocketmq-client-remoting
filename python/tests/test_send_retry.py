@@ -170,7 +170,7 @@ def test_name_server_configured_keeps_the_10005_no_route_code():
 
 
 # ---------------------------------------------------------------- 错误码表
-def test_client_error_code_table_matches_java():
+def test_client_error_code_table_matches_the_wire_codes():
     """``client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java``
     一共七个常量，一个都不能少、一个都不能改值。
 
@@ -238,7 +238,7 @@ def test_non_retryable_broker_code_raises_immediately():
     assert _client(p).sends == 1
 
 
-def test_all_java_default_retry_response_codes_are_retryable():
+def test_all_default_retry_response_codes_are_retryable():
     expected = {1, 2, 14, 16, 17, 204, 205, 1500}
     p = DefaultMQProducer("GID_test")
     assert set(p.retry_response_codes) == expected

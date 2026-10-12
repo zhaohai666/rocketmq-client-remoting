@@ -964,7 +964,7 @@ async fn p2_send_paths(
     )
     .await;
     let rejected_errors = rejected.errors();
-    let java_wording = rejected_errors
+    let canonical_wording = rejected_errors
         .first()
         .is_some_and(|e| e.contains("the message body size over max value, MAX: "));
     let after_reject = Arc::new(AsyncProbe::default());
@@ -987,7 +987,7 @@ async fn p2_send_paths(
         rejected_back
             && rejected.done() == 1
             && rejected.ok() == 0
-            && java_wording
+            && canonical_wording
             && still_works,
         &format!("{} / 之后一笔 {}", rejected.summary(), after_reject.summary()),
     );

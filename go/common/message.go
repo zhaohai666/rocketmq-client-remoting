@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// WaitStoreMsgOKOf mirrors Java Message#isWaitStoreMsgOK: absent means true,
-// otherwise Boolean.parseBoolean — only a case-insensitive "true" is true
+// WaitStoreMsgOKOf is the WAIT property rule: absent means true, otherwise
+// parse-boolean semantics — only a case-insensitive "true" is true
 // ("1" / "" / "yes" are all false). Every writer of the WAIT property
 // (MessageBatch.GenerateFromList in particular) must go through this rule.
 func WaitStoreMsgOKOf(value string, present bool) bool {
@@ -17,8 +17,8 @@ func WaitStoreMsgOKOf(value string, present bool) bool {
 	return strings.EqualFold(value, "true")
 }
 
-// MessageQueue mirrors Java MessageQueue. Used as a map key throughout the
-// rebalance/offset code, hence a comparable value type.
+// MessageQueue identifies one queue partition. Used as a map key throughout
+// the rebalance/offset code, hence a comparable value type.
 type MessageQueue struct {
 	Topic      string
 	BrokerName string
@@ -29,25 +29,27 @@ func NewMessageQueue(topic, brokerName string, queueID int32) MessageQueue {
 	return MessageQueue{Topic: topic, BrokerName: brokerName, QueueID: queueID}
 }
 
-// JavaString mirrors Java MessageQueue#toString. Deliberately NOT the same as
-// String(): the consistent-hash strategy hashes exactly this string — one
-// different space and the ring is no longer the one Java clients build.
-func (q MessageQueue) JavaString() string {
+// WireString renders the canonical queue identity string
+// `MessageQueue [topic=..., brokerName=..., queueId=...]`. Deliberately NOT
+// the same as String(): the consistent-hash strategy hashes exactly this
+// string — one different space and the ring no longer matches the one the
+// rest of the consumer group builds.
+func (q MessageQueue) WireString() string {
 	return fmt.Sprintf("MessageQueue [topic=%s, brokerName=%s, queueId=%d]", q.Topic, q.BrokerName, q.QueueID)
 }
 
-// HashCode mirrors Java MessageQueue#hashCode:
+// HashCode is the queue key hash:
 // ((31 + brokerHash) * 31 + queueId) * 31 + topicHash, 32-bit wrap.
 func (q MessageQueue) HashCode() int32 {
-	topicHash := JavaStringHash(q.Topic)
-	brokerHash := JavaStringHash(q.BrokerName)
+	topicHash := StringHash31(q.Topic)
+	brokerHash := StringHash31(q.BrokerName)
 	r := int32(31)
 	r += brokerHash
 	r = r*31 + q.QueueID
 	return r*31 + topicHash
 }
 
-// CompareTo orders by topic -> brokerName -> queueId (Java Comparable).
+// CompareTo orders by topic -> brokerName -> queueId.
 func (q MessageQueue) CompareTo(other MessageQueue) int {
 	if c := strings.Compare(q.Topic, other.Topic); c != 0 {
 		return c
@@ -64,24 +66,24 @@ func (q MessageQueue) CompareTo(other MessageQueue) int {
 	return 0
 }
 
-// String is the compact log form (rust Display). For the Java toString used by
-// hashing, see JavaString.
+// String is the compact log form. For the canonical string used by hashing,
+// see WireString.
 func (q MessageQueue) String() string {
 	return fmt.Sprintf("%s %s %d", q.Topic, q.BrokerName, q.QueueID)
 }
 
-// Message mirrors Java Message / Python Message.
+// Message is a to-send message.
 type Message struct {
 	Topic string
 	Flag  int32
-	// Body nil equals Java body == null; encoding treats it as empty. The zero
+	// Body nil means "null body"; encoding treats it as empty. The zero
 	// Message keeps nil so validators can tell "null body" from "zero length".
 	Body          []byte
 	Properties    *StringMap
 	TransactionID string
 }
 
-// NewMessage: a nil body is normalized to empty (Python does the same).
+// NewMessage: a nil body is normalized to empty.
 func NewMessage(topic string, body []byte) *Message {
 	if body == nil {
 		body = []byte{}
@@ -155,7 +157,7 @@ func (m *Message) DelayTimeLevel() int32 {
 	return 0
 }
 
-// SetDelayTimeSec is Java Message#setDelayTimeSec (5.x timer wheel): the
+// SetDelayTimeSec schedules delivery via the 5.x timer wheel: the
 // message is delivered `sec` seconds from now, expressed through the
 // TIMER_DELAY_SEC property alias of DELAY.
 func (m *Message) SetDelayTimeSec(sec int64) {
@@ -164,16 +166,15 @@ func (m *Message) SetDelayTimeSec(sec int64) {
 
 func (m *Message) GetDelayTimeSec() (string, bool) { return m.GetProperty(PropertyTimerDelaySec) }
 
-// SetDelayTimeMs is Java Message#setDelayTimeMs: delivered `ms` milliseconds
-// from now (TIMER_DELAY_MS).
+// SetDelayTimeMs: delivered `ms` milliseconds from now (TIMER_DELAY_MS).
 func (m *Message) SetDelayTimeMs(ms int64) {
 	m.PutProperty(PropertyTimerDelayMs, strconv.FormatInt(ms, 10))
 }
 
 func (m *Message) GetDelayTimeMs() (string, bool) { return m.GetProperty(PropertyTimerDelayMs) }
 
-// SetDeliverTimeMs is Java Message#setDeliverTimeMs: delivered AT the given
-// wall-clock timestamp (TIMER_DELIVER_MS).
+// SetDeliverTimeMs: delivered AT the given wall-clock timestamp
+// (TIMER_DELIVER_MS).
 func (m *Message) SetDeliverTimeMs(ms int64) {
 	m.PutProperty(PropertyTimerDeliverMs, strconv.FormatInt(ms, 10))
 }
@@ -190,7 +191,7 @@ func (m *Message) SetWaitStoreMsgOK(ok bool) {
 
 func (m *Message) GetWaitStoreMsgOK() (string, bool) { return m.GetProperty(PropertyWaitStoreMsgOK) }
 
-// IsWaitStoreMsgOK implements the Java parse rule; do NOT write
+// IsWaitStoreMsgOK implements the WaitStoreMsgOKOf parse rule; do NOT write
 // `value == "true"` — Message.NewMessage never pre-writes WAIT, so "absent" is
 // the common case, and treating it as false would send ordinary batches with
 // WAIT=false (broker replies SEND_OK without waiting for the flush).
@@ -220,7 +221,7 @@ func (m *Message) String() string {
 	return fmt.Sprintf("Message(topic='%s', body=%d bytes)", m.Topic, len(m.GetBody()))
 }
 
-// MessageExt mirrors Java MessageExt (a pulled message). Embeds Message so
+// MessageExt is a pulled/stored message. Embeds Message so
 // topic/flag/body/properties accessors promote.
 type MessageExt struct {
 	Message
@@ -249,8 +250,8 @@ func NewMessageExt() *MessageExt {
 	return &MessageExt{Message: *NewMessage("", nil)}
 }
 
-// ExtFromMessage derives an ext from a to-send message (the fields Java
-// MessageExt inherits from Message).
+// ExtFromMessage derives an ext from a to-send message, carrying over the
+// fields MessageExt shares with Message.
 func ExtFromMessage(msg *Message) *MessageExt {
 	return &MessageExt{
 		Message: Message{
@@ -297,7 +298,7 @@ func (e *MessageExt) String() string {
 		e.Topic, e.MsgID, e.QueueOffset, len(e.GetBody()))
 }
 
-// MessageBatch mirrors Java MessageBatch: no wire fields of its own — the body
+// MessageBatch has no wire fields of its own — the body
 // is the concatenation of per-message 6-segment light frames (EncodeMessage).
 type MessageBatch struct {
 	Message  *Message
@@ -306,10 +307,9 @@ type MessageBatch struct {
 
 func (b *MessageBatch) Encode() []byte { return EncodeMessages(b.Messages) }
 
-// GenerateFromList mirrors Java MessageBatch.generateFromList. Constraints:
+// GenerateFromList builds a batch from a list of messages. Constraints:
 // non-empty; same topic; same waitStoreMsgOK; no delayed messages; no retry
-// topics. Java throws UnsupportedOperationException/IllegalArgumentException,
-// Python ValueError — here all map to a client Error.
+// topics. Violations of any kind all map to a client Error.
 func GenerateFromList(messages []*Message) (*MessageBatch, error) {
 	if len(messages) == 0 {
 		return nil, ClientError("messages must not be null or empty")
@@ -338,8 +338,8 @@ func GenerateFromList(messages []*Message) (*MessageBatch, error) {
 	}
 
 	topic := first.Topic
-	// Java generateFromList: batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK()) —
-	// absent means true. Comparing raw property values would flip ordinary
+	// The batch takes waitStoreMsgOK from the first message through the parse
+	// rule (absent means true). Comparing raw property values would flip ordinary
 	// messages (WAIT never set) to WAIT=false and silently downgrade
 	// persistence.
 	waitStoreMsgOK := first.IsWaitStoreMsgOK()

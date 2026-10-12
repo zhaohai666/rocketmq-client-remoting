@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn split_drops_trailing_empty_segments_like_java() {
+    fn split_drops_trailing_empty_segments() {
         // Java `"a b ".split(" ")` -> ["a","b"]；Python split 会多一个空串
         assert_eq!(
             split("12345 1700000000000 ").unwrap(),
@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn java_style_builders_append_into_one_string() {
+    fn offset_info_builders_append_into_one_string() {
         // 对应 Java 的 StringBuilder 版本：startOffsetInfo / msgOffsetInfo / orderCountInfo
         let mut start = String::new();
         build_start_offset_info(&mut start, TOPIC, 3, 0);
@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn separators_match_java_constants() {
+    fn separators_match_protocol_constants() {
         assert_eq!(KEY_SEPARATOR, " ");
         assert_eq!(QUEUE_SEPARATOR, ";");
         assert_eq!(OFFSET_SEPARATOR, ",");

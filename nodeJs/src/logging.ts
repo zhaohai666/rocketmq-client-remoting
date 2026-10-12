@@ -1,28 +1,22 @@
 // -*- coding: utf-8 -*-
-// Client logging (Java rocketmq-client's logging.basicConfig equivalent, env
-// knobs exactly like go/common/logging.go, rotation like csharp ClientLog).
+// 客户端日志：支持环境变量开关、按大小轮转的文件 sink。
 //
-//   ROCKETMQ_CLIENT_LOG_LEVEL        TRACE|DEBUG|INFO|WARN|ERROR (default INFO)
-//   ROCKETMQ_CLIENT_LOG_DIR          log directory (default $HOME/logs/rocketmqlogs)
-//   ROCKETMQ_CLIENT_LOG_FILE         file name (default rocketmq_node_client.log;
-//                                    '' / OFF / NONE disables the file sink)
-//   ROCKETMQ_CLIENT_LOG_USE_STDOUT   any non-empty value -> stdout instead of file
+//   ROCKETMQ_CLIENT_LOG_LEVEL        TRACE|DEBUG|INFO|WARN|ERROR（默认 INFO）
+//   ROCKETMQ_CLIENT_LOG_DIR          日志目录（默认 $HOME/logs/rocketmqlogs）
+//   ROCKETMQ_CLIENT_LOG_FILE         文件名（默认 rocketmq_node_client.log；
+//                                    设为 '' / OFF / NONE 则关闭文件 sink）
+//   ROCKETMQ_CLIENT_LOG_USE_STDOUT   任意非空值 -> 输出到 stdout 而非文件
 //
-// The file name is deliberately NOT Java's rocketmq_client.log: on a machine
-// running the Java client at the same time, the two processes would interleave
-// into (and roll each other's) one file — the same rationale as the C# port
-// (csharp/src/RocketMQ.Client/Common/ClientLog.cs, "文件名刻意与 Java 的
-// rocketmq_client.log 区分" comment).
+// 文件名刻意不用 rocketmq_client.log：同一台机器上若与经典客户端进程并发运行，
+// 两个进程会交替写入并轮转同一个文件，互相破坏对方的日志。
 //
-// Rotation is SIZE based with a fixed backup window (csharp RollLocked):
-//   <file>.N oldest (deleted first), .N-1 -> .N ... .1 -> .2, base -> .1.
-//   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE   default 64MB
-//   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX  default 10 backups
+// 轮转按 SIZE 触发，固定备份窗口（RollLocked 式）：
+//   <file>.N 最旧（最先删除），.N-1 -> .N ... .1 -> .2，base -> .1。
+//   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE   默认 64MB
+//   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX  默认 10 个备份
 //
-// Thread safety: Node runs the JS program on a single event-loop thread and
-// every write below is a synchronous fs.writeSync of one line — the process is
-// the single writer, so no further locking is required (the Go port needs a
-// mutex for the same guarantee).
+// 线程安全：Node 的 JS 程序运行在单一事件循环线程上，下面的每次写入都是
+// 单行的同步 fs.writeSync——本进程是唯一写入者，无需额外加锁。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,7 +37,7 @@ function envInt(name: string, def: number): number {
 }
 
 export const DEFAULT_LOG_DIR = path.join(os.homedir(), 'logs', 'rocketmqlogs');
-// Distinct from the Java client's rocketmq_client.log — see the header comment.
+// 默认文件名带 node 标识，与通用的 rocketmq_client.log 刻意区分——见文件头注释。
 export const DEFAULT_LOG_FILE = 'rocketmq_node_client.log';
 
 class FileSink {
@@ -163,13 +157,11 @@ export class Logger {
 
   _log(level: number, levelName: string, args: any[]) {
     if (level < gLevel) return;
-    // ~70 call sites across the client are written Python-style
-    // (logger.info('rebalance changed, group=%s assigned=%d', g, n)) because the
-    // port mirrors Python's logging API. Plain space-joining printed the `%s`
-    // literally and dumped the values behind it, so every one of those lines was
-    // unreadable in rocketmq_node_client.log. util.format substitutes %s/%d/%j
-    // and, when the first argument is not a string, degrades to exactly the old
-    // space join — so multi-arg logging keeps working unchanged.
+    // 客户端内约 70 处调用点使用 printf 风格的占位符
+    // （logger.info('rebalance changed, group=%s assigned=%d', g, n)）。
+    // 若只是空格拼接输出，`%s` 会被原样打印、参数堆在其后，日志完全不可读。
+    // util.format 会替换 %s/%d/%j，且当首参不是字符串时退化为原来的空格拼接——
+    // 因此多参数日志的用法保持不变即可正常工作。
     const msg = (args.length > 1 && typeof args[0] === 'string')
       ? format(...args)
       : args.map(a => (typeof a === 'string' ? a : safeStringify(a))).join(' ');
@@ -182,9 +174,8 @@ export class Logger {
   debug(...args: any[]) { this._log(LEVELS.DEBUG, 'DEBUG', args); }
   info(...args: any[]) { this._log(LEVELS.INFO, 'INFO', args); }
   warn(...args: any[]) { this._log(LEVELS.WARN, 'WARN', args); }
-  // `warning` alias: the Python logging API name — ~30 call sites across the
-  // client use it (offset store, trace dispatcher, consumer loops). Missing
-  // alias = TypeError on the error path itself.
+  // `warning` 别名：客户端约 30 处调用点使用这个名字（offset store、
+  // trace dispatcher、消费循环等）。缺少别名会让错误路径本身抛出 TypeError。
   warning(...args: any[]) { this._log(LEVELS.WARN, 'WARN', args); }
   error(...args: any[]) { this._log(LEVELS.ERROR, 'ERROR', args); }
 }

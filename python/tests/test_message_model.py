@@ -13,7 +13,7 @@ class TestMessageQueue:
     """MessageQueue.hashCode 必须与 Java 逐步一致（否则 consumer rebalance 会算错）。"""
 
     @staticmethod
-    def _java_hash(s: str) -> int:
+    def _utf16_int32_hash(s: str) -> int:
         h = 0
         for ch in s:
             h = (31 * h + ord(ch)) & 0xFFFFFFFF
@@ -23,9 +23,9 @@ class TestMessageQueue:
     def _reference_hash(topic: str, broker_name: str, queue_id: int) -> int:
         """按 Java hashCode 实现逐位推导：((1*31+bh)*31+qid)*31+th。"""
         r = 1
-        r = (31 * r + TestMessageQueue._java_hash(broker_name)) & 0xFFFFFFFF
+        r = (31 * r + TestMessageQueue._utf16_int32_hash(broker_name)) & 0xFFFFFFFF
         r = (31 * r + queue_id) & 0xFFFFFFFF
-        r = (31 * r + TestMessageQueue._java_hash(topic)) & 0xFFFFFFFF
+        r = (31 * r + TestMessageQueue._utf16_int32_hash(topic)) & 0xFFFFFFFF
         return r - 0x100000000 if r >= 0x80000000 else r
 
     @pytest.mark.parametrize(
@@ -37,7 +37,7 @@ class TestMessageQueue:
             ("%RETRY%GroupA", "BrokerB", 1, 566955243),
         ],
     )
-    def test_hashcode_matches_java(self, topic, broker, queue_id, expected):
+    def test_message_queue_hash_matches_the_server_formula(self, topic, broker, queue_id, expected):
         mq = MessageQueue(topic, broker, queue_id)
         assert mq.hashcode() == expected
         assert mq.hashcode() == self._reference_hash(topic, broker, queue_id)
@@ -214,7 +214,7 @@ class TestMessageBatch:
             m.set_wait_store_msg_ok(False)
         assert MessageBatch.generate_from_list(messages).get_wait_store_msg_ok() == "false"
 
-    def test_is_wait_store_msg_ok_follows_java_parse_boolean(self):
+    def test_is_wait_store_msg_ok_follows_the_strict_boolean_parse_rule(self):
         """Java ``Message.isWaitStoreMsgOK()`` = 缺省 true + ``Boolean.parseBoolean``。"""
         msg = Message(topic="T", body=b"a")
         assert is_wait_store_msg_ok(msg)                      # 缺省

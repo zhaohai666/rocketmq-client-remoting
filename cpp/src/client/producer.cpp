@@ -1,4 +1,4 @@
-// 生产者实现（对应 Python client/producer.py 的 DefaultMQProducer）。
+// 生产者实现（DefaultMQProducer，走经典 remoting 协议）。
 #include "rocketmq/client/producer.h"
 
 #include <algorithm>
@@ -37,7 +37,7 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-// 对应 Java 失败信息里的 Arrays.toString(brokersSent)
+// 把 broker 名列表拼成 "a, b, c"，用于发送失败信息里的 brokersSent
 std::string joinStrings(const std::vector<std::string>& parts) {
     std::string out;
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -70,8 +70,9 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
     return out;
 }
 
-// 发送前确保消息带有 UNIQ_KEY（32 位十六进制唯一 ID），与 Java MessageClientIDSetter.setUniqID
-// 对齐：缺失才生成，已存在则保留（幂等）。轨迹钩子用它在 SendResult.msgId 里回填 UNIQ_KEY，
+// 发送前确保消息带有 UNIQ_KEY（32 位十六进制唯一 ID）：缺失才生成，已存在则保留（幂等）。
+// UNIQ_KEY 是经典 remoting 协议里的客户端消息 ID，broker 侧的事务回查与轨迹都按它关联。
+// 轨迹钩子用它在 SendResult.msgId 里回填 UNIQ_KEY，
 // 从而让发送侧轨迹的 msgId == UNIQ_KEY（非 offsetMsgId）。
 void ensureUniqId(Message& msg) {
     std::string uniq = msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
@@ -81,9 +82,8 @@ void ensureUniqId(Message& msg) {
     }
 }
 
-// 建背压信号量时的初始许可（Java DefaultMQProducerImpl:141-153）：配置**不高于**地板值时
-// 用地板值，并记一条 info —— Java 的分支是 `cfg > 10 ? new Semaphore(max(cfg, 10)) : new
-// Semaphore(10)`，所以恰好等于地板值时也会打这条日志。
+// 建背压信号量时的初始许可：配置**不高于**地板值时用地板值，并记一条 info ——
+// 分支是 `cfg > floor ? max(cfg, floor) : floor`，所以恰好等于地板值时也会打这条日志。
 int64_t backPressurePermits(int32_t configured, int64_t floor, const char* name) {
     if (static_cast<int64_t>(configured) > floor) {
         return configured;
@@ -92,17 +92,15 @@ int64_t backPressurePermits(int32_t configured, int64_t floor, const char* name)
     return floor;
 }
 
-// 扣多少「字节」许可（Java executeAsyncMessageSend:642 的
-// `msg.getBody() == null ? 1 : msg.getBody().length`）：不给空 body 算 1 就等于不限流。
+// 扣多少「字节」许可：取 body 长度，body 为空时按 1 计。不给空 body 算 1 就等于不限流。
 int64_t backPressureMsgLen(const Message& msg) {
     const Bytes& body = msg.getBody();
     return body.empty() ? 1 : static_cast<int64_t>(body.size());
 }
 
-// 批量异步扣多少「字节」许可（Python `_back_pressure_msg_len` 的 list 分支）：逐条累加、
-// 空 body 也算 1，整批为空算 1。Java 那边批量走 SEND_BATCH + invokeAsync、公式现成，本实现
-// 复用同步内核没有现成值可依——不给它按批累加，就等于一批整体只占 1 份容量，字节闸对批量
-// 形同虚设。
+// 批量异步扣多少「字节」许可：逐条累加、空 body 也算 1，整批为空算 1。批量发送走
+// SEND_BATCH、整批编码成一个 body，没有现成的批长度可依——不给它按批累加，就等于一批
+// 整体只占 1 份容量，字节闸对批量形同虚设。
 int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
     int64_t total = 0;
     for (const Message& m : msgs) {
@@ -111,17 +109,16 @@ int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
     return total == 0 ? 1 : total;
 }
 
-// Java `canBatch` 里四个延时属性的最大值（缺省 0）：`DELAY`（getDelayTimeLevel）+
-// `TIMER_DELAY_MS` / `TIMER_DELAY_SEC` / `TIMER_DELIVER_MS`（MessageConst:73-74/112）。
+// 攒批判定要看四个延时属性的最大值（缺省 0）：`DELAY`（getDelayTimeLevel）+
+// `TIMER_DELAY_MS` / `TIMER_DELAY_SEC` / `TIMER_DELIVER_MS`，这四个属性名都由经典
+// remoting 协议定义。
 //
 // 一个 `MessageBatch` 只能有一个延时属性，所以任何一个 > 0 都不攒批。
 //
-// ⚠ cpp 的 `MessageConst` 现已提供这三个常量（PROPERTY_TIMER_DELAY_SEC/MS/DELIVER_MS，
-// MessageConst.java:73-74/112），这里直接用常量 —— 与 python `_TIMER_DELAY_PROPERTIES` /
-// C# `TimerDelayProperties` 同一份清单。
+// ⚠ `MessageConst` 提供了这三个常量（PROPERTY_TIMER_DELAY_SEC/MS/DELIVER_MS），
+// 这里直接用常量，四个属性一份清单一起看。
 //
-// 取值口径：`getDelayTimeLevel()` 与 python 一致 —— 属性缺失返回 0；**值非法时不吞**
-// （python 的 `int(raw)` 会抛，Java 的 `Integer/Long.parseLong` 也会抛）。
+// 取值口径：属性缺失返回 0；**值非法时不吞**，数字解析的异常直接抛给调用方。
 int64_t maxDelayValue(const Message& msg) {
     int64_t result = msg.getDelayTimeLevel();
     static const char* kTimerDelayProperties[] = {
@@ -143,8 +140,8 @@ int64_t maxDelayValue(const Message& msg) {
 }  // namespace
 
 DefaultMQProducer::DefaultMQProducer(const std::string& producerGroup)
-    // Java 在建 impl 时就把两个公平信号量建好（DefaultMQProducerImpl:141-153），
-    // 而不是等 start()：开关允许运行时才打开，那时闸必须已经在了。
+    // 两个公平信号量在构造时就建好，而不是等 start()：背压开关允许运行时才打开，
+    // 那时闸必须已经在了。
     : semaphoreAsyncSendNum_(backPressurePermits(backPressureForAsyncSendNum_, kMinAsyncSendNum,
                                                  "semaphoreAsyncSendNum")),
       semaphoreAsyncSendSize_(backPressurePermits(backPressureForAsyncSendSize_,
@@ -194,16 +191,16 @@ void DefaultMQProducer::start() {
     if (started_) {
         return;
     }
-    // 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start():375 / Python：
-    // setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记。
+    // 生产者组也拼命名空间（`setProducerGroup(withNamespace(producerGroup))`），
+    // broker 侧按带前缀的组名登记。
     // wrapNamespace 自带"已带前缀则原样返回"的幂等守卫，重复 start 不会套两层。
     if (!namespace_.empty()) {
         producerGroup_ = NamespaceUtil::wrapNamespace(namespace_, producerGroup_);
     }
-    // 对应 Java DefaultMQProducerImpl.checkConfig(:295)：它排在 withNamespace 之后
-    // （Java 也是 start() 先 withNamespace 再 impl.start()），并且要挡住
+    // 启动先做配置校验（checkConfig）：它排在 withNamespace 之后（组名要按带命名空间前缀的
+    // 结果校验），并且要挡住
     // DEFAULT_PRODUCER —— 多进程共用默认组会互相踢下线。
-    // ⚠ checkConfig 是 Java start() 的第一步，所以这里领先于 name server 地址检查：
+    // ⚠ checkConfig 是 start() 的第一步，所以这里领先于 name server 地址检查：
     // 配置非法时不该先报"没配地址"，也不该建出客户端实例。
     Validators::checkGroup(producerGroup_);
     if (producerGroup_ == MixAll::DEFAULT_PRODUCER_GROUP) {
@@ -212,17 +209,16 @@ void DefaultMQProducer::start() {
     }
     // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
     if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
-        // 码值用 Java 的 10004（validateNameServerSetting 对同一个故障给的码）：
-        // Java 不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口提前到
-        // start()（更可预期），但不能让调用方看到两种不同的码。
+        // 码值用 10004（validateNameServerSetting 对同一个故障给的码）：
+        // 这道检查提前到 start()（更可预期），否则故障要等第一次发送才以 10004 冒出来，
+        // 但不能让调用方看到两种不同的码。
         throw MQClientException("name server address is not set",
                                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
-    // Java `DefaultMQProducerImpl#start`:250-252 的两步：先 `changeInstanceNameToPID`
-    // （Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，本端口没有内部生产者，所以无条件
-    // 执行），再由 `ClientConfig#buildMQClientId` 拼
-    // `<本机 IP>@<instanceName>[@unitName][@STREAM]`。
-    // instanceName 就地写回，和 Java 一样：第二次 start() 复用同一个 clientId。
+    // 启动的两步：先 `changeInstanceNameToPID`（本实现没有内部生产者，所以无条件
+    // 执行），再拼 clientId：
+    // `<本机 IP>@<instanceName>[@unitName][@STREAM]` —— broker 侧按这个串识别客户端连接。
+    // instanceName 就地写回：第二次 start() 复用同一个 clientId。
     instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);

@@ -133,7 +133,7 @@ HeartbeatData HeartbeatData::fromJson(const JsonValue& v) {
         hb.heartbeatFingerprint = static_cast<int32_t>(n);
     }
     bool b = false;
-    // 同时兼容 withoutSub 与 Java 字段名 isWithoutSub 两种写法
+    // 同时兼容 withoutSub 与协议字段名 isWithoutSub 两种写法
     if (v.tryGetBool("withoutSub", b)) {
         hb.withoutSub = b;
     } else if (v.tryGetBool("isWithoutSub", b)) {

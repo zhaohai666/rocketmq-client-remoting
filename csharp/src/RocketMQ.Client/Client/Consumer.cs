@@ -1,14 +1,14 @@
-// 推模式消费者（对齐 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。
+// 推模式消费者。
 //
-// 架构（对齐 Java PushConsumer 的三层模型）：
-//   1. 拉取层：每个队列一个拉取线程（对应 Java PullMessageService 的并发长轮询——
+// 架构（三层模型）：
+//   1. 拉取层：每个队列一个拉取线程（并发长轮询——
 //      broker 为每个队列挂起长轮询请求、消息到达立即返回），拉到的消息进
-//      _pending 缓冲（对应 ProcessQueue），拉取游标推进到 nextBeginOffset；
+//      _pending 缓冲，拉取游标推进到 nextBeginOffset；
 //   2. 分发层：单分发线程从缓冲按 ConsumeMessageBatchMaxSize 取批次交给
 //      IMessageListener；RECONSUME_LATER/异常批次逐条回投 %RETRY%topic
 //      （延迟梯度 3+reconsumeTimes，超 maxReconsumeTimes 由 broker 转 %DLQ%）；
 //   3. 位点层：_consumeOffsetTable 记录"已消费位点"，每 5s 用 UPDATE_CONSUMER_OFFSET
-//      提交 broker（Java persistAllConsumerOffset），启动先 QUERY_CONSUMER_OFFSET。
+//      提交 broker（周期全量落盘），启动先 QUERY_CONSUMER_OFFSET。
 //
 // 关键工程点（真机验证得出，勿删注释）：
 //   - 拉取必须按队列并行：单线程顺序长轮询下，空闲队列的 suspend 会阻塞
@@ -28,7 +28,7 @@ using RocketMQ.Remoting.Protocol;
 namespace RocketMQ.Client;
 
 /// <summary>
-/// 选择器（对应 Java MessageSelector / Python MessageSelector）。
+/// 消息选择器（按 tag 集合或 SQL92 表达式筛选）。
 /// </summary>
 public sealed class MessageSelector
 {
@@ -43,10 +43,10 @@ public sealed class MessageSelector
 }
 
 /// <summary>
-/// 推模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPushConsumer）。
+/// 推模式消费者。
 /// </summary>
 /// <summary>
-/// Java DefaultMQPushConsumerImpl.popDelayLevel（单位**秒**）。
+/// 弹出（POP）延迟档位表（单位**秒**）。
 /// 与 send 的延迟档位（首档 1s）不是同一张表，别混。
 /// </summary>
 public static class PopDelayLevelDefaults
@@ -56,7 +56,7 @@ public static class PopDelayLevelDefaults
 }
 
 /// <summary>
-/// POP 模式的队列状态（对应 org.apache.rocketmq.client.impl.consumer.PopProcessQueue）。
+/// POP 模式的队列状态：已弹未 ack 计数 + 是否已被 rebalance 撤销。
 /// <para>
 /// 与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
 /// 消费线程，确认靠 ack。这里只跟踪两件事：已弹未 ack 的条数（流控用）和队列是否已被
@@ -70,15 +70,15 @@ public sealed class PopProcessQueue
     private int _waitAckCounter;
     private volatile bool _dropped;
 
-    /// <summary>Java <c>PopProcessQueue.lastPopTimestamp</c>：最近一次**发起**弹出的时刻（毫秒），
-    /// 字段初始值同样是"现在"。Java 的 <c>isPullExpired</c> 在 pop 路径上读的就是它，
+    /// <summary>最近一次**发起**弹出的时刻（毫秒），
+    /// 字段初始值同样是"现在"。停摆判定在 pop 路径上读的就是它，
     /// 所以这里不能只写不读。</summary>
     private long _lastPopTimestamp = UtilAll.CurrentTimeMillis();
 
-    /// <summary>Java <c>getLastPopTimestamp()</c>。</summary>
+    /// <summary>读取最近一次弹出时刻（毫秒）。</summary>
     public long LastPopTimestamp => Interlocked.Read(ref _lastPopTimestamp);
 
-    /// <summary>Java <c>setLastPopTimestamp(long)</c>。</summary>
+    /// <summary>盖写最近一次弹出时刻（毫秒）。</summary>
     public void Touch(long timestampMillis)
     {
         Interlocked.Exchange(ref _lastPopTimestamp, timestampMillis);
@@ -89,7 +89,7 @@ public sealed class PopProcessQueue
         lock (_lock) { _waitAckCounter += n; }
     }
 
-    /// <summary>Java 传的是负数（decFoundMsg(-msgs.size())），这里按"减多少"理解。</summary>
+    /// <summary>入参为"减多少"（正数条数），不是负增量。</summary>
     public void DecFoundMsg(int n)
     {
         lock (_lock) { _waitAckCounter += n; }
@@ -136,17 +136,17 @@ public sealed class DefaultMQPushConsumer
 
     private string _namespace = string.Empty;
 
-    // 命名空间（对应 Java DefaultMQPushConsumer.setNamespace）：非空时把 topic / group
-    // 套上 "ns%" 前缀再与 broker 交互（对齐 Java start() 里对 consumerGroup 的包装）。
+    // 命名空间：非空时把 topic / group
+    // 套上 "ns%" 前缀再与 broker 交互（启动时对 consumerGroup 做同一包装）。
     public string Namespace
     {
         get => _namespace;
         set => _namespace = value ?? string.Empty;
     }
 
-    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
+    /// <summary>5.x 新命名空间（namespaceV2）：非空时由
     /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
-    /// 扩展头（Java NamespaceRpcHook 读 ClientConfig 同名属性）。钩子每笔请求现读本属性，
+    /// 扩展头（钩子读取本配置的同名属性）。钩子每笔请求现读本属性，
     /// 所以 Start() 之后设置也从下一笔请求起生效。</summary>
     public string NamespaceV2
     {
@@ -157,7 +157,7 @@ public sealed class DefaultMQPushConsumer
     private string _namespaceV2 = string.Empty;
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
-    // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置：unitName / @STREAM
+    // 单元化/流式三个开关。⚠ 必须在 Start() 之前设置：unitName / @STREAM
     // 决定 clientId 形状，stream 决定请求钩子链（ReqT 要进 ACL 签名内容）。
     /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
     public string UnitName
@@ -167,9 +167,9 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 对应 Java <c>ClientConfig#isUnitMode()</c>。推送消费者有三处落点：
-    /// 消息过滤上下文（DefaultMQPushConsumerImpl:640）、心跳里的
-    /// <c>ConsumerData.unitMode</c>（MQClientInstance:1039，broker 据此给 %RETRY% topic
+    /// 单元化开关。推送消费者有三处落点：
+    /// 消息过滤上下文、心跳里的
+    /// <c>ConsumerData.unitMode</c>（协议字段，broker 据此给 %RETRY% topic
     /// 打 UNIT_SUB 标记）、回投请求头（见 SendMessageBack 处的说明）。
     /// </summary>
     public bool UnitMode
@@ -180,7 +180,7 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>
     /// true 时每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。
-    /// Java 的推送消费者默认关（只有 pull / lite 消费者在构造里置真）。
+    /// 推送消费者默认关（只有 pull / lite 消费者在构造里置真）。
     /// </summary>
     public bool EnableStreamRequestType
     {
@@ -189,10 +189,10 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 对应 Java <c>DefaultMQPushConsumer#postSubscriptionWhenPull</c>（默认 false）。
+    /// 拉取时是否随请求上送订阅表达式（默认 false）。
     /// 打开后每次 PULL_MESSAGE 把订阅表达式随请求上送（SUBSCRIPTION 位置位），
     /// 让 broker 侧做过滤；默认关闭 —— tag 过滤由客户端
-    /// <c>FilterMessagesForDelivery</c> 兜底，与 Java 5.x 的默认行为一致。
+    /// <c>FilterMessagesForDelivery</c> 兜底。
     /// </summary>
     public bool PostSubscriptionWhenPull
     {
@@ -201,7 +201,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
+    /// 默认 30000ms：在用 topic 的
     /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
     /// </summary>
     public int PollNameServerIntervalMillis
@@ -211,8 +211,8 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>ClientConfig#persistConsumerOffsetInterval</c>（:66，默认 5000ms）：
-    /// 后台位点落盘周期。首个落盘在 10s 的 initialDelay 处（Java startScheduledTask:417-423），
+    /// 默认 5000ms：
+    /// 后台位点落盘周期。首个落盘在 10s 的 initialDelay 处，
     /// Shutdown() 的收尾落盘与该值无关（调大只推迟时机，不丢位点）。
     /// </summary>
     public int PersistConsumerOffsetIntervalMillis
@@ -221,7 +221,7 @@ public sealed class DefaultMQPushConsumer
         set => _persistConsumerOffsetIntervalMillis = value;
     }
 
-    // ---------------- ACL 鉴权（对应 Java DefaultMQPushConsumer(group, rpcHook)）----------------
+    // ---------------- ACL 鉴权 ----------------
     // 必须在 Start() 之前调用：钩子在 Start() 里绑定到 MQClientInstance。
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
@@ -229,7 +229,7 @@ public sealed class DefaultMQPushConsumer
     public void SetCredentials(string accessKey, string secretKey, string securityToken = "")
         => _rpcHook = new AclClientRPCHook(new SessionCredentials(accessKey, secretKey, securityToken));
 
-    // ---------------- 消息轨迹配置（对应 Java DefaultMQPushConsumer 的 enableMsgTrace / customizedTraceTopic）----------------
+    // ---------------- 消息轨迹配置（enableMsgTrace / customizedTraceTopic）----------------
     // 开启后 Start() 会建 AsyncTraceDispatcher（Type=Consume）并注册 ConsumeMessageTraceHook。
     public bool EnableTrace
     {
@@ -237,10 +237,10 @@ public sealed class DefaultMQPushConsumer
         set => _enableTrace = value;
     }
 
-    /// <summary>消费侧的命名入口（对应 Java setEnableMsgTrace），与 <see cref="EnableTrace"/> 等价。</summary>
+    /// <summary>消费侧的命名入口，与 <see cref="EnableTrace"/> 等价。</summary>
     public void SetEnableMsgTrace(bool enable) => _enableTrace = enable;
 
-    /// <summary>自定义轨迹 topic（Java customizedTraceTopic）；空则回落系统默认 RMQ_SYS_TRACE_TOPIC。</summary>
+    /// <summary>自定义轨迹 topic；空则回落系统默认 RMQ_SYS_TRACE_TOPIC。</summary>
     public string TraceTopic
     {
         get => _traceTopic;
@@ -253,10 +253,10 @@ public sealed class DefaultMQPushConsumer
         set => _traceMsgBatchNum = value;
     }
 
-    /// <summary>消费超时（分钟，Java consumeTimeout 默认 15）——决定轨迹 SubAfter 的 contextCode 是否为 TIME_OUT。</summary>
+    /// <summary>消费超时（分钟，默认 15）——决定轨迹 SubAfter 的 contextCode 是否为 TIME_OUT。</summary>
     public int ConsumeTimeout { get; set; } = 15;
 
-    /// <summary>注册消费钩子（对应 Java registerConsumeMessageHook）。</summary>
+    /// <summary>注册消费钩子。</summary>
     public void RegisterConsumeMessageHook(IConsumeMessageHook hook)
     {
         if (hook is not null)
@@ -267,7 +267,7 @@ public sealed class DefaultMQPushConsumer
 
     public bool HasConsumeMessageHook() => _consumeMessageHooks.Count > 0;
 
-    /// <summary>注册投递前过滤钩子（对应 Java registerFilterMessageHook / hasFilterMessageHook）。
+    /// <summary>注册投递前过滤钩子。
     /// 钩子摘掉的消息：拉取路径静默跳过（位点照常推进），POP 路径立刻 ack。</summary>
     public void RegisterFilterMessageHook(IFilterMessageHook hook)
     {
@@ -284,8 +284,7 @@ public sealed class DefaultMQPushConsumer
     /// <summary>已丢弃的条数（拉取 + POP 合计），供联调脚本与单测观测。</summary>
     public long FilteredMessageCount() => Interlocked.Read(ref _filteredMessageCount);
 
-    /// <summary>依次执行过滤钩子，<b>异常一律吞掉</b>并记 error
-    /// （Java PullAPIWrapper.executeHook:171-178）。
+    /// <summary>依次执行过滤钩子，<b>异常一律吞掉</b>并记 error。
     /// 与 CheckForbiddenHook 相反：过滤钩子挂了不能影响消费。</summary>
     public void ExecuteFilterMessageHook(FilterMessageContext context)
     {
@@ -305,7 +304,7 @@ public sealed class DefaultMQPushConsumer
     /// <summary>拉取 / POP 两条路径共用的投递前过滤：
     /// ① 客户端二次 tag 过滤（broker 侧按 codeSet 哈希过滤有碰撞误放）
     /// ② IFilterMessageHook（可改写 MsgList）。
-    /// <para>① 对齐 Java PullAPIWrapper.processPullResult:113-122 与 processPopResult:625-635：
+    /// <para>① 拉取与 POP 两条路径共用同一道闸门：
     /// broker 侧是按 tag 的<b>哈希（codeSet）</b>过滤的，存在哈希碰撞误放，客户端要再按
     /// 字符串核一遍。守卫 <c>!tagsSet.isEmpty()</c> 意味着订阅 "*"（SUB_ALL）时不过滤 ——
     /// 所以 FilterAPI.BuildSubscriptionData 对 SUB_ALL 必须留空。</para>
@@ -338,9 +337,7 @@ public sealed class DefaultMQPushConsumer
         {
             var context = new FilterMessageContext(ConsumerGroup, result, mq)
             {
-                // Java DefaultMQPushConsumerImpl:640：filterMessageContext
-                //   .setUnitMode(this.defaultMQPushConsumer.isUnitMode())
-                // —— 钩子据此判断是否单元化流量。
+                // 单元化标记随上下文交给钩子，钩子据此判断是否单元化流量。
                 UnitMode = _unitMode,
             };
             ExecuteFilterMessageHook(context);
@@ -351,7 +348,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>求 original \ kept 的差集（POP 路径要给被摘掉的消息补 ack）。
-    /// Java 用 List.contains 的引用同一性；C# 里 List 拷贝后无同一性，改按 MsgId 求差（语义等价）。</summary>
+    /// 按引用同一性求差在 List 拷贝后不成立，故改按 MsgId 求差（语义等价）。</summary>
     public static List<MessageExt> DroppedMessages(List<MessageExt> original, List<MessageExt> kept)
     {
         var dropped = new List<MessageExt>();
@@ -381,7 +378,7 @@ public sealed class DefaultMQPushConsumer
     // 关掉时完全走原来的 pull 长轮询路径，行为与改动前一致。
     public bool PopMode { get; set; }
 
-    /// <summary>TLS（对应 Java tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）。</summary>
+    /// <summary>TLS（开关名 tls.enable；缺省读 env ROCKETMQ_TLS_ENABLE）。</summary>
     /// <remarks>
     /// 初值必须在这里取 env：实例化 <c>MQClientInstance</c> 时传的是 <c>bool</c>（不是
     /// <c>bool?</c>），默认的 <c>false</c> 会盖掉 RemotingClient 内部的 env 兜底。
@@ -406,13 +403,13 @@ public sealed class DefaultMQPushConsumer
         set => _tlsOptions = value;
     }
 
-    /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
+    /// <summary>弹出后对其它实例不可见的时长（协议字段 popInvisibleTime，默认 60000）。</summary>
     public long PopInvisibleTime { get; set; } = 60000;
 
-    /// <summary>单次 POP 的最大条数（Java popBatchNums 默认 32；broker 侧 >32 会回 INVALID_PARAMETER）。</summary>
+    /// <summary>单次 POP 的最大条数（协议字段 popBatchNums，默认 32；broker 侧 >32 会回 INVALID_PARAMETER）。</summary>
     public int PopBatchNums { get; set; } = 32;
 
-    /// <summary>本队列"已弹未 ack"计数器上限，超过就暂停 POP（Java popThresholdForQueue 默认 96）。</summary>
+    /// <summary>本队列"已弹未 ack"计数器上限，超过就暂停 POP（默认 96）。</summary>
     public int PopThresholdForQueue { get; set; } = 96;
 
     /// <summary>
@@ -426,8 +423,8 @@ public sealed class DefaultMQPushConsumer
     /// <summary>消费失败时延长不可见时间的梯度（秒）。</summary>
     public List<int> PopDelayLevel { get; set; } = new(PopDelayLevelDefaults.Table);
 
-    // Java DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME：超出范围一律回落到 60000
-    // Java ConsumeInitMode
+    // POP invisibleTime 合法区间 [5s, 300s]：超出范围一律回落到 60000
+    // 协议 ConsumeInitMode：0=MIN（从头弹），1=MAX（从尾弹）
     public const int ConsumeInitModeMin = 0;
     public const int ConsumeInitModeMax = 1;
 
@@ -437,21 +434,21 @@ public sealed class DefaultMQPushConsumer
     // ACL 钩子，Start() 时绑定到 MQClientInstance 的传输层
     private IRpcHook? _rpcHook;
 
-    // ClientConfig 的三个单元化/stream 开关。Java 的 DefaultMQPushConsumer 既不置
+    // 三个单元化/stream 开关。推送消费者既不置
     // unitMode 也不置 enableStreamRequestType（只有 pull / lite 构造里置 true），默认全关。
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType;
 
-    // Java DefaultMQPushConsumer#postSubscriptionWhenPull：默认 false（表达式不败上送，
+    // 默认 false（表达式不随拉取上送，
     // tag 过滤走客户端 FilterMessagesForDelivery）。
     private bool _postSubscriptionWhenPull;
 
-    // Java PullAPIWrapper#pullFromWhichNodeTable（键 = Java toString 形态的 MessageQueue）：
+    // 主/从选择表（键 = 队列 key 串）：
     // 每次拉取应答头里的 suggestWhichBrokerId 回写进来，下次拉取按它选主/从。
     private readonly Dictionary<string, long> _pullFromWhichNode = new(StringComparer.Ordinal);
 
-    // ClientConfig 的两个周期（Java :58 / :66 的默认值，Start() 时定型）
+    // 两个周期（默认 30000ms / 5000ms，Start() 时定型）
     private int _pollNameServerIntervalMillis = 30000;
     private int _persistConsumerOffsetIntervalMillis = 5000;
 
@@ -467,23 +464,22 @@ public sealed class DefaultMQPushConsumer
     private string _instanceName = MixAll.DefaultInstanceName;
     private string _clientId = string.Empty;
     private string _messageModel = RocketMQ.Remoting.Protocol.MessageModel.Clustering;
-    // 队列分配策略，对应 Java DefaultMQPushConsumer.allocateMessageQueueStrategy
-    // （构造参数默认 new AllocateMessageQueueAveragely()）。
+    // 队列分配策略（构造参数默认 new AllocateMessageQueueAveragely()）。
     private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     private string _consumeFromWhere = RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromLastOffset;
 
-    // ---- 消费线程池（对齐 Java DefaultMQPushConsumer 的 consumeThreadMin/Max）----
-    // Java 5.x 的默认值是 min=20（:162）**且** max=20（:169）—— 两侧同为 20
-    // （4.x 时代才是 min=20/max=64，本端口早年照抄的是 4.x 那一组）。
+    // ---- 消费线程池（consumeThreadMin/Max）----
+    // 默认值是 min=20 **且** max=20 —— 两侧同为 20
+    // （4.x 时代才是 min=20/max=64，本端口早年用的是 4.x 那一组，已过时）。
     // 本实现的**拉取**路径是"每队列一个拉取线程 + 单分发线程"，
-    // 只有 **POP** 路径用真正的线程池（对应 Java ConsumeMessagePopConcurrentlyService），
-    // 因此 CorePoolSize 直接决定 POP 的消费并发度（Java 无界队列下 max 实际用不到）；
+    // 只有 **POP** 路径用真正的线程池（POP 并发消费服务），
+    // 因此 CorePoolSize 直接决定 POP 的消费并发度（无界队列下 max 实际用不到）；
     // 默认配置下 UpdateCorePoolSize 只能往**下**调（守卫 n < max = 20）。
     private int _consumeThreadMin = 20;
     private int _consumeThreadMax = 20;
-    // Java adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；上游 inc/dec 是空实现）
+    // adjustThreadPoolNumsThreshold 默认 100000（自动弹性阈值；弹性调整实为空实现）
     private long _adjustThreadPoolNumsThreshold = 100000;
-    // 声明式 core pool size（Java setCorePoolSize 的等价物），默认 = consumeThreadMin
+    // 声明式 core pool size（UpdateCorePoolSize 的初始值），默认 = consumeThreadMin
     private int _corePoolSize = 20;
     // key -> ProcessQueue.msgAccCnt（最近一次拉取算出的积压条数）
     private readonly Dictionary<string, long> _msgAccCntTable = new(StringComparer.Ordinal);
@@ -506,27 +502,27 @@ public sealed class DefaultMQPushConsumer
     private readonly Dictionary<string, SubscriptionData> _subscriptionData = new(StringComparer.Ordinal);
     private IMessageListener? _messageListener;
     private readonly Dictionary<string, long> _offsetTable = new(StringComparer.Ordinal);
-    // ---- 对齐 Java 的消费进度 / 缓冲 / 锁状态 ----
+    // ---- 消费进度 / 缓冲 / 锁状态 ----
     // _offsetTable 是"拉取游标"（nextBeginOffset）；_consumeOffsetTable 是"已消费位点"
-    // （周期持久化到 broker 的对象）；_pending 是已拉未消费缓冲（Java ProcessQueue）。
+    // （周期持久化到 broker 的对象）；_pending 是已拉未消费缓冲。
     private readonly Dictionary<string, long> _consumeOffsetTable = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MessageQueue> _mqMap = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Queue<MessageExt>> _pending = new(StringComparer.Ordinal);
-    // 在途批次计数（Java ProcessQueue.msgCount 里**正在被 listener 消费**的那部分）：
+    // 在途批次计数（**正在被 listener 消费**的那部分）：
     // DispatchLoop 取走批次时 +1、消费收尾（含异常回塞）时 -1。_pending 与它合起来才是
-    // Java 的 ProcessQueue.GetMsgCount()，CorrectTagsOffsetLocked 的闸门两个都要看。
+    // 在册消息总数 = 两者之和，CorrectTagsOffsetLocked 的闸门两个都要看。
     private readonly Dictionary<string, int> _inFlight = new(StringComparer.Ordinal);
-    // 「在途」批次的消息本体：Java 并发路径下消息被 ConsumeRequest 持有期间**仍留在**
-    // ProcessQueue.msgTreeMap 里，直到 processConsumeResult 的 removeMessage —— cleanExpiredMsg
+    // 「在途」批次的消息本体：并发路径下消息被消费任务持有期间**仍留在**
+    // 队列缓冲里，直到消费结果处理时 removeMessage —— cleanExpiredMsg
     // 的"队首"清扫与 containsMessage 判据都看它。_inFlight 只记条数（correctTagsOffset 闸门），
     // 这里记本体；两者在 _lock 下同增同减。身份用引用（批次与登记共用同一批对象）。
     private readonly Dictionary<string, List<MessageExt>> _inFlightMsgs = new(StringComparer.Ordinal);
-    // Start() 时刻（307 应答 PROP_CONSUMER_START_TIMESTAMP，对应 Java consumerStartTimestamp）
+    // Start() 时刻（307 应答 PROP_CONSUMER_START_TIMESTAMP 的取值）
     private long _startTimestamp;
     // 顺序消费：broker LOCK_BATCH_MQ 确认锁定成功的队列 key 集
     private readonly HashSet<string> _lockOk = new(StringComparer.Ordinal);
     private int _pullThresholdForQueue = 1000;
-    // Java ProcessQueue 余下四个阈值：字节闸门单位是 **MiB**（<=0 关闭）；跨度是 pending 里
+    // 余下四个流控阈值：字节闸门单位是 **MiB**（<=0 关闭）；跨度是 pending 里
     // queueOffset 的 max-min，**严格大于**才算命中；topic 级两条默认 -1（关闭），统计的是
     // 本实例该 topic **所有**队列的累计缓冲。
     private int _pullThresholdSizeForQueue = 100;
@@ -538,39 +534,37 @@ public sealed class DefaultMQPushConsumer
     private Thread? _persistThread;
     private Thread? _lockThread;
     private Thread? _rebalanceThread;
-    // 挂起 listener 的清扫调度（Java ConsumeMessageConcurrentlyService:68-88 的
-    // scheduleAtFixedRate(cleanExpireMsg, ...)）；顺序消费与 POP 没有这条调度
+    // 挂起 listener 的清扫调度（固定周期跑 cleanExpireMsg）；顺序消费与 POP 没有这条调度
     private Thread? _cleanExpireThread;
     private readonly Dictionary<string, Thread> _pullThreads = new(StringComparer.Ordinal);
-    // 队列 key -> 最近一次**发起**拉取/弹出的时刻（毫秒）。对齐 Java
-    // ProcessQueue.lastPullTimestamp / PopProcessQueue.lastPopTimestamp：rebalance 用它判
+    // 队列 key -> 最近一次**发起**拉取/弹出的时刻（毫秒）。拉取与 POP
+    // 两条路径共用同一张表：rebalance 用它判
     // 这条循环是不是停摆了（PullMaxIdleTime），307 也把它如实报出去。
     private readonly Dictionary<string, long> _lastPullAt = new(StringComparer.Ordinal);
-    /// <summary>Java <c>ProcessQueue.PULL_MAX_IDLE_TIME</c>（系统属性
-    /// <c>rocketmq.client.pull.pullMaxIdleTime</c>，默认 120000ms）：超过它就判停摆，
-    /// 用严格 <c>&gt;</c>。</summary>
+    /// <summary>停摆判定的最长空闲时间（PULL_MAX_IDLE_TIME，默认 120000ms）：
+    /// 超过它就判停摆，用严格 <c>&gt;</c>。</summary>
     private const long PullMaxIdleTime = 120000;
     // 队列 key -> PopProcessQueue（已弹未 ack 计数 + 是否已被 rebalance 撤销）
     private readonly Dictionary<string, PopProcessQueue> _popQueues = new(StringComparer.Ordinal);
-    // POP 顺序请求去重集（Java ConcurrentSet<ConsumeRequest>，相等性 =
+    // POP 顺序请求去重集（相等性 =
     // (shardingKeyIndex, pq 引用, mq)；shardingKeyIndex 恒 0，mq 用 key 串）
     private readonly HashSet<(PopProcessQueue, string)> _popOrderlyRequests = new();
 
-    // ---- 真实 rebalance（对齐 Java RebalanceImpl）----
-    // _assigned 是"当前分给本实例的队列集"（Java ProcessQueueTable 的键集），
+    // ---- 真实 rebalance ----
+    // _assigned 是"当前分给本实例的队列集"，
     // 由 DoRebalance() 按分配策略计算；_rebalanceNow 用于
-    // NOTIFY_CONSUMER_IDS_CHANGED(40) 触发的即时 rebalance（Java rebalanceImmediately）。
+    // NOTIFY_CONSUMER_IDS_CHANGED(40) 触发的即时 rebalance。
     private List<MessageQueue> _assigned = new();
     private readonly ManualResetEventSlim _rebalanceNow = new(false);
-    // 撤销标记（对齐 Java ProcessQueue.isDropped）：rebalance 把某队列从本实例分配中去掉后，
+    // 撤销标记（isDropped 语义）：rebalance 把某队列从本实例分配中去掉后，
     // 置 _dropped，pull 线程长轮询返回后看到该标记即丢弃批次并退出（不再为该队列服务）。
     private readonly HashSet<string> _dropped = new(StringComparer.Ordinal);
-    // 队列「代号」（Python _queue_epoch，相当 Java ProcessQueue 的对象身份）：每次撤队列 +1。
+    // 队列「代号」（相当于队列对象身份）：每次撤队列 +1。
     // DispatchLoop 取批次时把代号一起取走，ack 前比对 —— 不一致说明这条队列在消费期间被
-    // 撤销/重建过，整批作废（Java ConsumeMessageConcurrentlyService:339 的 isDropped 短路）。
+    // 撤销/重建过，整批作废（isDropped 短路）。
     private readonly Dictionary<string, long> _queueEpoch = new(StringComparer.Ordinal);
-    // 被 broker 纠正过位点、正等重建的队列（Python _frozen_offsets，Java
-    // RemoteBrokerOffsetStore.updateAndFreezeOffset 的 ControllableOffset.allowToUpdate=false）：
+    // 被 broker 纠正过位点、正等重建的队列（updateAndFreezeOffset 的
+    // allowToUpdate=false 语义）：
     // 冻结期间 ack 与 correctTagsOffset 都不许动位点，直到队列重建才解冻。
     private readonly HashSet<string> _frozenOffsets = new(StringComparer.Ordinal);
 
@@ -578,7 +572,7 @@ public sealed class DefaultMQPushConsumer
     private volatile bool _started;
     private volatile bool _stop;
 
-    // Java DefaultMQPushConsumerImpl.pause（:1313 / :742 读写）：Suspend()/Resume()
+    // 暂停标志：Suspend()/Resume()
     // 驱动的标志位。置位后两个拉取循环都不再发请求，按 1000ms
     // （PULL_TIME_DELAY_MILLS_WHEN_SUSPEND，:113）轮询等它清掉。
     private volatile bool _paused;
@@ -621,9 +615,8 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 队列分配策略（对应 Java DefaultMQPushConsumer.get/setAllocateMessageQueueStrategy）。
-    /// 与 Java 同款：setter 不校验，置 null 由 Start() 的 checkConfig 拒绝
-    /// （Java DefaultMQPushConsumerImpl.checkConfig:1067 "allocateMessageQueueStrategy is null"）。
+    /// 队列分配策略。setter 不校验，置 null 由 Start() 的 checkConfig 拒绝
+    /// （报错文案 "allocateMessageQueueStrategy is null"）。
     /// </summary>
     public IAllocateMessageQueueStrategy? AllocateMessageQueueStrategy
     {
@@ -637,8 +630,8 @@ public sealed class DefaultMQPushConsumer
         set => _consumeFromWhere = value;
     }
 
-    /// <summary>便捷方法：Min 与 Max 一起设（Java 4.x setConsumeThreadNums 的语义）。
-    /// Java 5.x 已拆成 SetConsumeThreadMin/Max，本方法保留是为了兼容既有调用点。</summary>
+    /// <summary>便捷方法：Min 与 Max 一起设。
+    /// 现已拆成 SetConsumeThreadMin/Max，本方法保留是为了兼容既有调用点。</summary>
     public void SetConsumeThreadNums(int n)
     {
         int v = Math.Max(1, n);
@@ -648,7 +641,7 @@ public sealed class DefaultMQPushConsumer
         _popConsumeExecutor?.SetCorePoolSize(v);
     }
 
-    // ---- 消费线程弹性（对应 Java AbstractConsumeMessageService）----
+    // ---- 消费线程弹性 ----
 
     public int ConsumeThreadMin => _consumeThreadMin;
     public int ConsumeThreadMax => _consumeThreadMax;
@@ -668,12 +661,12 @@ public sealed class DefaultMQPushConsumer
 
     public void SetAdjustThreadPoolNumsThreshold(long v) => _adjustThreadPoolNumsThreshold = v;
 
-    /// <summary>运行时调整消费并发度（对应 Java updateCorePoolSize → setCorePoolSize）。
-    /// <para>Java 的守卫逐条照抄（AbstractConsumeMessageService:63-71）：
+    /// <summary>运行时调整消费并发度（updateCorePoolSize → setCorePoolSize）。
+    /// <para>守卫逐条照抄经典语义：
     /// ownsConsumeExecutor &amp;&amp; corePoolSize &gt; 0
     /// &amp;&amp; corePoolSize &lt;= Short.MAX_VALUE(32767)
     /// &amp;&amp; corePoolSize &lt; consumeThreadMax。任一条不满足就**静默忽略**
-    /// （Java 也是静默 return，不抛异常）。返回值只用于单测断言"是否真的生效"。</para></summary>
+    /// （静默 return，不抛异常）。返回值只用于单测断言"是否真的生效"。</para></summary>
     public bool UpdateCorePoolSize(int corePoolSize)
     {
         if (corePoolSize <= 0 || corePoolSize > 32767 || corePoolSize >= _consumeThreadMax)
@@ -685,10 +678,10 @@ public sealed class DefaultMQPushConsumer
         return true;
     }
 
-    /// <summary>Java getCorePoolSize（本实现恒为自建执行器，故不会返回 -1）。</summary>
+    /// <summary>读取 core pool size（本实现恒为自建执行器，故不会返回 -1）。</summary>
     public int GetCorePoolSize() => _popConsumeExecutor?.GetCorePoolSize() ?? _corePoolSize;
 
-    /// <summary>Java DefaultMQPushConsumerImpl.computeAccumulationTotal：所有队列 msgAccCnt 之和。</summary>
+    /// <summary>所有队列 msgAccCnt 之和（累计积压条数）。</summary>
     public long ComputeAccumulationTotal()
     {
         lock (_lock)
@@ -714,7 +707,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>按 Java ProcessQueue.putMessage 的规则更新 msgAccCnt
+    /// <summary>按入队批次更新 msgAccCnt
     /// （= 最后一条消息的 MAX_OFFSET 属性 - 它的 queueOffset，&gt; 0 才更新）。</summary>
     public void UpdateMsgAccCnt(string key, IReadOnlyList<MessageExt> msgs)
     {
@@ -726,10 +719,8 @@ public sealed class DefaultMQPushConsumer
 
     private void UpdateMsgAccCntLocked(string key, IReadOnlyList<MessageExt> msgs)
     {
-        // Java ProcessQueue.java:148-158：
-        //   long accTotal = Long.parseLong(msg.getProperty(MAX_OFFSET)) - msg.getQueueOffset();
-        //   if (accTotal > 0) this.msgAccCnt = accTotal;
-        // 取**本批最后一条**；属性缺失/非数字/非正一律不更新（Java 里 parse 失败会抛，
+        // accTotal = MAX_OFFSET 属性值 - queueOffset，> 0 才更新；
+        // 取**本批最后一条**；属性缺失/非数字/非正一律不更新（严格解析会抛，
         // 但 broker 恒会带上该属性，这里做容错以免脏数据打断拉取线程）。
         if (msgs.Count == 0) return;
         MessageExt last = msgs[msgs.Count - 1];
@@ -743,8 +734,8 @@ public sealed class DefaultMQPushConsumer
         if (accTotal > 0) _msgAccCntTable[key] = accTotal;
     }
 
-    /// <summary>Java DefaultMQPushConsumerImpl.adjustThreadPool（每分钟调度一次）。
-    /// <para>⚠ **在 Java 5.5.1 这是 no-op，我们照抄 no-op**：它调用的
+    /// <summary>adjustThreadPool（每分钟调度一次）。
+    /// <para>⚠ **5.5.1 经典语义里这是 no-op，本实现照抄 no-op**：它调用的
     /// consumeMessageService.incCorePoolSize()/decCorePoolSize() 在
     /// AbstractConsumeMessageService:70-75 是**空方法体**。这里保留阈值比较仅为让
     /// msgAccCnt / 阈值配置可观测；**不要"修好"它** —— 真正生效的是显式的
@@ -834,14 +825,14 @@ public sealed class DefaultMQPushConsumer
         set => _heartbeatEnabled = value;
     }
 
-    // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（Java pullThresholdForQueue，默认 1000）
+    // 每队列"已拉未消费"阈值，超过则暂停该队列拉取（默认 1000）
     public int PullThresholdForQueue
     {
         get => _pullThresholdForQueue;
         set => _pullThresholdForQueue = value;
     }
 
-    /// <summary>Java <c>pullThresholdSizeForQueue</c>（默认 100）：本队列「已拉未消费」
+    /// <summary><c>pullThresholdSizeForQueue</c>（默认 100）：本队列「已拉未消费」
     /// 字节阈值，单位 <b>MiB</b>；&lt;=0 表示关闭这条闸门。</summary>
     public int PullThresholdSizeForQueue
     {
@@ -849,7 +840,7 @@ public sealed class DefaultMQPushConsumer
         set => _pullThresholdSizeForQueue = value;
     }
 
-    /// <summary>Java <c>consumeMessageMaxSpan</c>（默认 2000）：本队列「已拉未消费」消息
+    /// <summary><c>consumeMessageMaxSpan</c>（默认 2000）：本队列「已拉未消费」消息
     /// queueOffset 的跨度阈值，严格大于才命中（防止队首一条卡住、后面无限堆）；&lt;=0 关闭。</summary>
     public long ConsumeConcurrentlyMaxSpan
     {
@@ -857,16 +848,16 @@ public sealed class DefaultMQPushConsumer
         set => _consumeConcurrentlyMaxSpan = value;
     }
 
-    /// <summary>Java <c>pullThresholdForTopic</c>（默认 -1 关闭）：本实例同 topic <b>所有</b>队列
-    /// 累计「已拉未消费」条数阈值。注意 Java 在 RebalancePushImpl 里会把 topic 阈值除以队列数
-    /// 折算到队列级，本移植直接拿累计值比对（与 Python/Rust/C++ 同形）。</summary>
+    /// <summary><c>pullThresholdForTopic</c>（默认 -1 关闭）：本实例同 topic <b>所有</b>队列
+    /// 累计「已拉未消费」条数阈值。经典实现会把 topic 阈值除以队列数
+    /// 折算到队列级，本移植直接拿累计值比对。</summary>
     public int PullThresholdForTopic
     {
         get => _pullThresholdForTopic;
         set => _pullThresholdForTopic = value;
     }
 
-    /// <summary>Java <c>pullThresholdSizeForTopic</c>（默认 -1 关闭）：同 topic 累计字节阈值，
+    /// <summary><c>pullThresholdSizeForTopic</c>（默认 -1 关闭）：同 topic 累计字节阈值，
     /// 单位 <b>MiB</b>。这条闸门只看本属性，<b>不复用</b>队列级那道开关。</summary>
     public int PullThresholdSizeForTopic
     {
@@ -895,8 +886,7 @@ public sealed class DefaultMQPushConsumer
 
     // ---------------- 订阅 ----------------
     /// <summary>
-    /// 订阅 topic（对应 Java DefaultMQPushConsumerImpl#subscribe:1265-1275）。
-    /// 与 Java 一致，start() 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
+    /// 订阅 topic。start() 之后**仍可**调用：订阅表是活的（心跳与重平衡每轮都重读它），
     /// put 进去之后立即推一轮心跳（见 NotifySubscriptionChanged）。
     /// </summary>
     public void Subscribe(string topic, string subExpression = "*")
@@ -911,7 +901,7 @@ public sealed class DefaultMQPushConsumer
         NotifySubscriptionChanged(realTopic);
     }
 
-    /// <summary>对应 Java DefaultMQPushConsumerImpl#subscribe(topic, MessageSelector):1277-1287。</summary>
+    /// <summary>按选择器订阅 topic。</summary>
     public void Subscribe(string topic, MessageSelector selector)
     {
         string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
@@ -934,9 +924,8 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 取消订阅（对应 Java DefaultMQPushConsumerImpl#unsubscribe:1317-1319）。
-    /// Java 这里只删表项、不发心跳（后一轮心跳自然带出新订阅集），
-    /// 所以刻意不调 NotifySubscriptionChanged。
+    /// 取消订阅：只删表项、不发心跳（后一轮心跳自然带出新订阅集），
+    /// 因此这里不调 NotifySubscriptionChanged。
     /// </summary>
     public void Unsubscribe(string topic)
     {
@@ -947,15 +936,14 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 订阅表新增/更新后的立即动作，对齐 Java subscribe 里的第二句：
-    /// `subscriptionInner.put(...)` 之后 `if (mQClientFactory != null)
-    /// mQClientFactory.sendHeartbeatToAllBrokerWithLock();` —— 同步推一轮心跳。
+    /// 订阅表新增/更新后的立即动作：写入订阅表之后
+    /// 同步向所有 broker 推一轮心跳。
     /// 为什么必须立即：broker 的 ConsumerManager 只在收到心跳时才把 topic→group 记进
     /// 它自己那张 topicGroupTable（ClientManageProcessor → registerConsumer），而
     /// QUERY_TOPIC_CONSUME_BY_WHO(300) 读的正是这张表；晚一轮就是默认 30s 的空窗。
-    /// 同时把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（对应 Java
-    /// MQClientInstance:438-454 直接遍历消费者的**当前**订阅表收集要刷的 topic）。
-    /// 未启动时没有 client（Java 的 mQClientFactory == null），只落订阅表。
+    /// 同时把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（刷新任务
+    /// 直接遍历消费者的**当前**订阅表收集要刷的 topic）。未启动时没有
+    /// client 实例，只落订阅表。
     /// </summary>
     private void NotifySubscriptionChanged(string topic)
     {
@@ -989,25 +977,24 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>Java <c>DefaultMQPushConsumerImpl#checkConfig</c> 的数值段（:1099-1209）。
-    /// <para>逐条照抄 Java 的<b>顺序、区间和文案</b>（Java 每条都拼
+    /// <summary>checkConfig 的数值段校验。
+    /// <para>校验的<b>顺序、区间和文案</b>是约定死的（经典实现每条都拼
     /// <c>FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL)</c>，本仓库按约定不带后缀）。
-    /// 比较一律 <c>&lt; lo || &gt; hi</c>；<c>PopBatchNums</c> 跟随 Java 的字面写法
-    /// <c>&lt;= 0</c>。四语言（Python 参考实现 / C++ / Rust / 本移植）文案逐字一致，
-    /// 改一处要同时改四处，否则跨语言用例的断言会分叉。</para>
+    /// 比较一律 <c>&lt; lo || &gt; hi</c>；<c>PopBatchNums</c> 按约定保持字面写法
+    /// <c>&lt;= 0</c>。错误文案被用例按逐字断言，改动前先确认对账。</para>
     /// <para>为什么要在 <see cref="Start"/> 拦：这些值直接决定缓冲水位与线程池规模。
     /// 配成 0 或 <c>int.MaxValue</c> 而没有这道闸门时，要么每轮拉取都被"阈值 &lt;= 0"
     /// 判成积压而<b>永久停拉</b>（消费端静默收不到消息），要么整数溢出把流控判断整个
     /// 绕开。等 broker 报错已经晚了几拍，且错误只落在日志里。</para>
     /// <para><c>PullThresholdForTopic</c> / <c>PullThresholdSizeForTopic</c> 的 -1 是
-    /// Java 的"关闭这条闸门"哨兵，不在区间内也不报错；其余字段没有这个豁免（写成 -1
-    /// 在 Java 里是启动错误，不是"不限制"）。</para>
+    /// "关闭这条闸门"哨兵，不在区间内也不报错；其余字段没有这个豁免（写成 -1
+    /// 是启动错误，不是"不限制"）。</para>
     /// <para>public 只为离线可测：正向用例（边界值必须放行）走不到 <see cref="Start"/>
     /// 之后，测试工程与本程序集没有 InternalsVisibleTo 关系。业务代码请直接 <c>Start()</c>。</para>
-    /// <para>已知与 Java 的差异：<c>SetConsumeThreadMin/Max</c> 与
+    /// <para>注意：<c>SetConsumeThreadMin/Max</c> 与
     /// <c>ConsumeMessageBatchMaxSize</c> 的 setter 带 <c>Math.Max(1, n)</c> 兜底
-    /// （Java 的 setter 是裸赋值），于是这三条的**下界**越界从公开 API 走不到；
-    /// 上界与相对检查（min &gt; max）仍然可达，闸门本身照抄全量。</para>
+    /// （不是裸赋值），于是这三条的**下界**越界从公开 API 走不到；
+    /// 上界与相对检查（min &gt; max）仍然可达，闸门本身保留全量。</para>
     /// </summary>
     public void CheckConfigRanges()
     {
@@ -1059,7 +1046,7 @@ public sealed class DefaultMQPushConsumer
                 throw new MQClientException("pullThresholdSizeForTopic Out of range [1, 102400]");
             }
         }
-        // pullInterval：Java 的下界就是 0（不间隔），别照抄别条闸门的 1
+        // pullInterval 的下界就是 0（不间隔），别照抄别条闸门的 1
         if (PullIntervalMillis < 0 || PullIntervalMillis > 65535)
         {
             throw new MQClientException("pullInterval Out of range [0, 65535]");
@@ -1080,7 +1067,7 @@ public sealed class DefaultMQPushConsumer
             throw new MQClientException("popInvisibleTime Out of range [" + MinPopInvisibleTime
                                         + ", " + MaxPopInvisibleTime + "]");
         }
-        // popBatchNums（Java 写的就是 <= 0，不是 < 1）
+        // popBatchNums（下界按 <= 0 判，不是 < 1）
         if (PopBatchNums <= 0 || PopBatchNums > 32)
         {
             throw new MQClientException("popBatchNums Out of range [1, 32]");
@@ -1089,21 +1076,19 @@ public sealed class DefaultMQPushConsumer
 
     // ---------------- 挂起 / 恢复 ----------------
 
-    /// <summary>对应 Java <c>DefaultMQPushConsumer#suspend</c>（:890）→
-    /// <c>DefaultMQPushConsumerImpl#suspend</c>（:1312-1315）：置暂停标志并记一条 info。
-    /// 分配集、ProcessQueue、已提交位点**全部原地保留**，只是两个拉取循环不再发请求，
-    /// 每 1000ms（<c>PULL_TIME_DELAY_MILLS_WHEN_SUSPEND</c>，:113）回头看一次标志。
-    /// 幂等、不抛错，与 Java 一样。</summary>
+    /// <summary>挂起消费：置暂停标志并记一条 info。
+    /// 分配集、队列缓冲、已提交位点**全部原地保留**，只是两个拉取循环不再发请求，
+    /// 每 1000ms（<c>PULL_TIME_DELAY_MILLS_WHEN_SUSPEND</c>）回头看一次标志。
+    /// 幂等、不抛错。</summary>
     public void Suspend()
     {
         _paused = true;
         ClientLog.Info("suspend this consumer, " + ConsumerGroup);
     }
 
-    /// <summary>对应 Java <c>DefaultMQPushConsumer#resume</c>（:898）→
-    /// <c>DefaultMQPushConsumerImpl#resume</c>（:741-745）：清标志并立刻重平衡一次，
+    /// <summary>恢复消费：清标志并立刻重平衡一次，
     /// 把挂起窗口里错过的分配马上补上，而不是等 20s 周期。
-    /// Java 是同步 <c>doRebalance()</c>；这里复用只置位的 <see cref="WakeRebalanceLoop"/>
+    /// 这里不做同步 <c>doRebalance()</c>，复用只置位的 <see cref="WakeRebalanceLoop"/>
     /// （同步调 DoRebalance 会把调用线程的 RPC 卡在读线程自等上，见其注释）。</summary>
     public void Resume()
     {
@@ -1112,7 +1097,7 @@ public sealed class DefaultMQPushConsumer
         ClientLog.Info("resume this consumer, " + ConsumerGroup);
     }
 
-    /// <summary>对应 Java <c>DefaultMQPushConsumer#isPause</c>（:902）。</summary>
+    /// <summary>当前是否处于挂起状态。</summary>
     public bool IsPaused => _paused;
 
     // ---------------- 生命周期 ----------------
@@ -1124,17 +1109,17 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
-            // 对齐 Java DefaultMQPushConsumer.start()：把消费组套上命名空间（ns%group），
+            // Start() 把消费组套上命名空间（ns%group），
             // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
             if (_namespace.Length != 0)
             {
                 ConsumerGroup = NamespaceUtil.WrapNamespace(_namespace, ConsumerGroup);
             }
 
-            // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1026）：先 Validators.checkGroup
+            // checkConfig 先行：先 Validators.checkGroup
             // （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让
             // broker 侧的订阅关系判定把两组混在一起，回投与重平衡都错乱。
-            // Java 把 checkConfig 排在最前，所以这里也领先于地址/订阅检查。
+            // checkConfig 排在最前，领先于地址/订阅检查。
             Validators.CheckGroup(ConsumerGroup);
             if (ConsumerGroup == MixAll.DefaultConsumerGroup)
             {
@@ -1148,7 +1133,7 @@ public sealed class DefaultMQPushConsumer
                 throw new MQClientException("name server address is not set");
             }
 
-            // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1067）：策略为 null 直接拒绝启动。
+            // checkConfig：策略为 null 直接拒绝启动。
             if (_allocateMessageQueueStrategy is null)
             {
                 throw new MQClientException("allocateMessageQueueStrategy is null");
@@ -1164,18 +1149,18 @@ public sealed class DefaultMQPushConsumer
                 throw new MQClientException("message listener is not set");
             }
 
-            // 对应 Java DefaultMQPushConsumerImpl.checkConfig 的数值段（:1099-1209）。
+            // checkConfig 的数值段校验。
             // 排在所有 null 检查之后、建 MQClientInstance 之前：坏配置必须在实例化之前
             // 失败，否则起了后台线程/注册了 clientId 再抛错就留下半启动状态。
-            // Java :1058 那条 consumeTimestamp 格式校验在这里是 no-op —— 本移植没有
+            // consumeTimestamp 格式校验在这里是 no-op —— 本移植没有
             // 可配的 ConsumeTimestamp 属性，CONSUME_FROM_TIMESTAMP 一律取"30 分钟前"
-            // （见 ComputePullOffsetFromWhere），没有可写坏的字符串可拒。这是一处已知
-            // 与 Java 的差距（少一个可配项），不是这里漏了校验。
+            // （见 ComputePullOffsetFromWhere），没有可写坏的字符串可拒（少一个可配项，
+            // 不是这里漏了校验）。
             CheckConfigRanges();
 
-            // 对应 Java DefaultMQPushConsumerImpl.start()（:935）：**只有 CLUSTERING** 才把默认
+            // **只有 CLUSTERING** 才把默认
             // instanceName 换成 <pid>#<nanoTime>；BROADCASTING 保留 "DEFAULT"，于是同机同组的
-            // 广播消费者共用一个 clientId —— 那是 Java 故意留的共享语义，不能"修"掉。
+            // 广播消费者共用一个 clientId —— 这是设计保留的共享语义，不能"修"掉。
             if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Clustering)
             {
                 _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
@@ -1185,7 +1170,7 @@ public sealed class DefaultMQPushConsumer
                 _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
             }
 
-            // 集群模式自动订阅重试 topic（对齐 Java copySubscription → getRetryTopic）：
+            // 集群模式自动订阅重试 topic（copySubscription → getRetryTopic）：
             // broker 回投的消息写到 %RETRY%group，客户端不订阅就收不到
             if (_messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
             {
@@ -1198,7 +1183,7 @@ public sealed class DefaultMQPushConsumer
             }
 
             // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定在 Start() **之前** ——
-            // Java 的 rpcHook 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它。
+            // rpcHook 随 remoting 实例构造传入，实例第一笔报文就带着它。
             // 顺序由 RequestHooks.Compose 还原（Namespace → stream → ACL ⇒ ns/nsd 先写、ReqT 落在签名内容里）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
             _mqClient = new MQClientInstance(_clientId, _nameServerAddrs,
@@ -1213,14 +1198,14 @@ public sealed class DefaultMQPushConsumer
             }
             _mqClient.Start();
             // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
-            // （Java 由共享的 ClientConfig 天然同步）
+            // （由共享的 ClientConfig 天然同步）
             if (_nameServerAddrs.Count == 0 && _mqClient.NameServerAddrs.Count > 0)
             {
                 _nameServerAddrs = new List<string>(_mqClient.NameServerAddrs);
             }
 
             // POP 消费执行器必须在 rebalance（会立刻起每队列 POP 循环）之前建好，
-            // 否则循环弹出消息后无处投递（对齐 Java 在 service 构造时就建 consumeExecutor）。
+            // 否则循环弹出消息后无处投递（执行器必须在 POP 循环启动前建好）。
             if (PopMode)
             {
                 _popConsumeExecutor = new ConsumeExecutor(
@@ -1239,11 +1224,11 @@ public sealed class DefaultMQPushConsumer
             }
 
             // broker 主动通知 40（成员变化 → 立即重算）**不**在这里注册处理器：
-            // Java 把它注册在 MQClientAPIImpl（实例级），而一个 code 只能有一个处理器，
-            // 各自注册会互相覆盖。改成向实例登记「叫醒」回调，由实例收到后扇出。
+            // 该请求码只有一个处理器，各消费者
+            // 自行注册会互相覆盖。改成向实例登记「叫醒」回调，由实例收到后扇出。
             _mqClient.RegisterRebalanceWakeup(ConsumerGroup, WakeRebalanceLoop);
 
-            // 对应 Java ClientRemotingProcessor GET_CONSUMER_RUNNING_INFO(307)：
+            // GET_CONSUMER_RUNNING_INFO(307) 的处理：
             // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
             _mqClient.RemotingClient.RegisterProcessor(RequestCode.GetConsumerRunningInfo,
                 OnGetConsumerRunningInfo);
@@ -1262,7 +1247,7 @@ public sealed class DefaultMQPushConsumer
                 OnConsumeMessageDirectly);
         }
 
-        // 对齐 Java DefaultMQPushConsumerImpl.start 的顺序：
+        // 启动顺序：
         // 拉一次路由 → 发心跳（broker 先认识本消费者）→ 立即 rebalance → 起消费线程。
         // 心跳必须在 rebalance 之前：rebalance 要向 broker 查消费者列表。
         try
@@ -1274,7 +1259,7 @@ public sealed class DefaultMQPushConsumer
             ClientLog.Debug("initial refresh routes failed: " + e.Message);
         }
 
-        // 对齐 Java DefaultMQPushConsumerImpl.start:1013-1020：路由到手之后、心跳之前，把
+        // 路由到手之后、心跳之前，把
         // 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
         // 会**静默放行全部消息**，只有这一笔请求能把它变成启动错误；失败就地回滚后再上抛。
         try
@@ -1315,9 +1300,8 @@ public sealed class DefaultMQPushConsumer
         _rebalanceThread = MakeThread("RebalanceThread", RebalanceLoop);
         _rebalanceThread.Start();
 
-        // 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
-        // ConsumeMessageConcurrentlyService 的构造/start 里（:68-88），顺序消费的
-        // ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
+        // 挂起 listener 的清扫调度只在**经典并发**路径存在：它建在并发消费
+        // 服务的构造/start 里，顺序消费的 cleanExpiredMsg 本来就直接返回，POP 的
         // ConsumeMessagePopConcurrentlyService 没有对应的调度。
         if (!IsOrderly() && !PopMode)
         {
@@ -1363,12 +1347,12 @@ public sealed class DefaultMQPushConsumer
             _popQueues.Clear();
         }
 
-        // POP 消费执行器收工（对齐 Java shutdownGracefully：不再收新任务，把手上的批次跑完）。
+        // POP 消费执行器收工（shutdownGracefully 语义：不再收新任务，把手上的批次跑完）。
         // Dispose 里 Shutdown(wait=true)：工作线程捕获了 this，必须 join 完才能放。
         _popConsumeExecutor?.Shutdown(true);
         _popConsumeExecutor = null;
 
-        // 退出前把已消费位点持久化一次（对齐 Java shutdown → persistAllConsumerOffset）
+        // 退出前把已消费位点持久化一次（shutdown → persistAllConsumerOffset）
         try
         {
             PersistOffsetsOnce();
@@ -1378,9 +1362,9 @@ public sealed class DefaultMQPushConsumer
             ClientLog.Debug("persist offsets on shutdown failed: " + e.Message);
         }
 
-        // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）。
-        // POP 顺序服务（ConsumeMessagePopOrderlyService.shutdown:79-87 → unlockAll）走同一个
-        // RebalanceImpl.unlockAll，而它只读 processQueueTable —— POP 模式下是空表，不发报文。
+        // 顺序消费清退时解锁队列（shutdown → unlockAll）。
+        // POP 顺序服务走同一个
+        // unlockAll，而它只读 processQueueTable —— POP 模式下是空表，不发报文。
         if (IsOrderly() && !PopMode
             && _messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
         {
@@ -1433,7 +1417,7 @@ public sealed class DefaultMQPushConsumer
 
         _mqClient?.Shutdown();
 
-        // 顺序对齐 Java DefaultMQPushConsumer.shutdown()：先关本消费者，再 flush 并关轨迹分发器
+        // 关停顺序：先关本消费者，再 flush 并关轨迹分发器
         //（分发器用的是**自己的**内部生产者，与本实例无关，所以关掉了照样能发完）
         if (_traceDispatcher is not null)
         {
@@ -1448,7 +1432,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    // ---------------- 消费钩子（对应 Java executeHookBefore / executeHookAfter）----------------
+    // ---------------- 消费钩子（executeHookBefore / executeHookAfter）----------------
     // 钩子异常一律吞掉并记 warn：轨迹出错绝不能影响正常消费。
 
     private void ExecuteConsumeHookBefore(ConsumeMessageContext context)
@@ -1481,7 +1465,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>构造消费钩子上下文。初始值与 Java 一致：success=false、Props 空、accessChannel=LOCAL。</summary>
+    /// <summary>构造消费钩子上下文。初始值：success=false、Props 空、accessChannel=LOCAL。</summary>
     private ConsumeMessageContext BuildConsumeHookContext(List<MessageExt> msgs, MessageQueue mq)
         => new(ConsumerGroup, msgs, mq)
         {
@@ -1490,7 +1474,7 @@ public sealed class DefaultMQPushConsumer
             AccessChannel = AccessChannel.Local,
         };
 
-    /// <summary>对应 Java 的 returnType 判定（决定轨迹 SubAfter 的 contextCode）。
+    /// <summary>returnType 判定（决定轨迹 SubAfter 的 contextCode）。
     /// 顺序：status == null → EXCEPTION/RETURNNULL；RT ≥ consumeTimeout（分钟）→ TIME_OUT；
     /// 失败 → FAILED；成功 → SUCCESS。顺序消费把「挂起」当 FAILED、成功当 SUCCESS，
     /// 由调用方用 failed/succeeded 两个标志传入。</summary>
@@ -1515,7 +1499,7 @@ public sealed class DefaultMQPushConsumer
         return succeeded ? "SUCCESS" : "SUCCESS";
     }
 
-    /// <summary>把 returnType / status / success 写回上下文并触发 after 钩子（对齐 Java）。
+    /// <summary>把 returnType / status / success 写回上下文并触发 after 钩子。
     /// ⚠ returnType 判定必须在「status 归一化为 RECONSUME_LATER」**之前**做，
     /// 否则 listener 返回 null 会被误记成 FAILED 而不是 RETURNNULL。</summary>
     private void FinishConsumeHook(ConsumeMessageContext? hookCtx, bool hasStatus, bool hasException,
@@ -1534,7 +1518,7 @@ public sealed class DefaultMQPushConsumer
         ExecuteConsumeHookAfter(hookCtx);
     }
 
-    /// <summary>对应 Java DefaultMQPushConsumer.start()：enableTrace=true 时建分发器
+    /// <summary>Start() 时 enableTrace=true 则建分发器
     /// （Type=Consume）并注册 ConsumeMessageTraceHook，随后 start 它。
     /// 任何异常都只记日志 —— 轨迹挂了不能影响正常消费。</summary>
     private void StartTraceDispatcher()
@@ -1579,11 +1563,11 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>后台线程工厂（dispatch / pull / persist / lock / rebalance 全走这里）。</summary>
     /// <remarks>⚠ 这里的兜底 try/catch 是**刻意**的，别当成"掩盖 bug"删掉：
-    /// Java 的 ServiceThread / 线程池会把后台任务抛出的 Throwable 吞成日志（只损失那一个线程），
+    /// 后台任务抛出 Throwable，多数运行时的线程模型只损失那一个线程（记日志），
     /// 而 **C# 的默认行为是未处理异常直接终止整个进程**。实测后果：拉取线程在 Shutdown 竞态里
     /// 调 Client() 抛 MQClientException → 整个联调进程 `Abort trap: 6`（RC=134），
     /// 其后的所有场景（S6/S7）一行都跑不到。有了这层兜底，进程级崩溃降级为
-    /// "该后台线程退出 + 一条 WARN"，与 Java 的可观测行为一致。
+    /// "该后台线程退出 + 一条 WARN"，可观测行为收敛为单线程损失。
     /// 注意：正常路径**不应**出现这条 WARN —— 出现即代表有真 bug 要查。</remarks>
     private static Thread MakeThread(string name, ThreadStart action)
     {
@@ -1605,8 +1589,8 @@ public sealed class DefaultMQPushConsumer
         return t;
     }
 
-    /// <summary>启动初期把订阅 topic 的真实路由拉到本地缓存（对应 Java
-    /// MQClientInstance.updateTopicRouteInfoFromNameServer 的首轮拉取）。消费侧不做默认 topic
+    /// <summary>启动初期把订阅 topic 的真实路由拉到本地缓存（updateTopicRouteInfoFromNameServer
+    /// 的首轮拉取）。消费侧不做默认 topic
     /// 兜底——%RETRY%group 等尚未由 broker 创建的主题拉不到就保持空，rebalance 视图才一致。</summary>
     private void RefreshRoutes()
     {
@@ -1636,11 +1620,10 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 消费循环 ----------------
     private bool IsOrderly() => _messageListener is not null && _messageListener.Orderly();
 
-    /// <summary>本线程是否仍是该队列的属主（Python <c>_owns_queue</c> / C++ 的归属令牌）。
-    /// 必须持 <c>_lock</c> 调用。</summary>
-    /// <remarks>Java 用 <c>ProcessQueue</c> 对象本身表达这件事（一次拉取请求绑一把队列对象，
-    /// 撤走时 <c>setDropped(true)</c>，请求回来见到就丢弃批次）。C# 没有 per-queue 的
-    /// classic ProcessQueue，所以拿"登记在表里的线程是不是我自己"当等价物：
+    /// <summary>本线程是否仍是该队列的属主（归属令牌）。必须持 <c>_lock</c> 调用。</summary>
+    /// <remarks>常见做法用队列缓冲对象本身表达这件事（一次拉取请求绑一把队列对象，
+    /// 撤走时 <c>setDropped(true)</c>，请求回来见到就丢弃批次）。本实现没有 per-queue 的
+    /// 缓冲对象，所以拿"登记在表里的线程是不是我自己"当等价物：
     /// 自愈重建时旧线程即便还挂在长轮询上，回来后也会认输，不会和新线程同时服务一把队列。</remarks>
     private bool OwnsQueueLocked(string key)
     {
@@ -1659,7 +1642,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>发起本轮拉取/弹出前盖章（Java <c>pullMessage:253</c> / <c>popMessage:508</c>：
+    /// <summary>发起本轮拉取/弹出前盖章：
     /// 盖章在流控与挂起**之前**，判据是"这条循环还在跑"，不是"这轮真的打了网络"）。</summary>
     private void StampPullAt(string key, bool pop)
     {
@@ -1677,7 +1660,7 @@ public sealed class DefaultMQPushConsumer
         pq?.Touch(now);
     }
 
-    /// <summary>Java <c>ProcessQueue.isPullExpired</c> + Python 的线程存活检查：两种都算停摆
+    /// <summary>拉取超时判定 + 线程存活检查：两种都算停摆
     /// —— 登记过的循环线程已经不在了（异常穿透），或还在但超过 <see cref="PullMaxIdleTime"/>
     /// 没发起过拉取。从没盖过章（刚分配）不算停摆。</summary>
     private bool PullStalledLocked(string key, long now)
@@ -1695,7 +1678,7 @@ public sealed class DefaultMQPushConsumer
         return !(_pullThreads.TryGetValue(key, out Thread? t) && t is not null && t.IsAlive);
     }
 
-    /// <summary>停摆自愈（Java <c>updateProcessQueueTableInRebalance:438-461</c>）：队列仍分给
+    /// <summary>停摆自愈：队列仍分给
     /// 本实例、但拉取循环已经停摆 → 撤销它并交位点，让本轮后面的
     /// <see cref="RebalancePullThreads"/> 原地重建。</summary>
     private void SweepStalledLoopsLocked(Dictionary<string, MessageQueue> current,
@@ -1742,10 +1725,10 @@ public sealed class DefaultMQPushConsumer
         _offsetTable.Remove(key);
         _lockOk.Remove(key);
         _mqMap.Remove(key);
-        // 在途登记一并作废：队列已从 ProcessQueueTable 摘除（Java cleanExpireMsg:192-200
-        // 只遍历它），旧批次的引用不该继续留在清扫视图里
+        // 在途登记一并作废：队列已从在册分配表摘除（清扫只遍历
+        // 这张表），旧批次的引用不该继续留在清扫视图里
         _inFlightMsgs.Remove(key);
-        // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java setDropped(true)）；冻结标记**保留**到
+        // 代号 +1 ⇒ 在途批次的 ack 全部失效（isDropped 语义）；冻结标记**保留**到
         // 队列重建为止（RebalancePullThreads 解冻），避免纠错后的位点被旧 ack 覆盖。
         _queueEpoch.TryGetValue(key, out long epoch);
         _queueEpoch[key] = epoch + 1;
@@ -1799,7 +1782,7 @@ public sealed class DefaultMQPushConsumer
     // 勿用于业务代码）：验证脚本要能把时钟倒拨、触发一次同步，再确认「停摆的队列被撤掉
     // 重建、消息一条不重不丢」。没有接缝就只能 sleep 满 120s 去猜。
 
-    /// <summary>Java <c>ProcessQueue.PULL_MAX_IDLE_TIME</c> 的生效值。</summary>
+    /// <summary>PULL_MAX_IDLE_TIME 的生效值。</summary>
     public static long PullMaxIdleTimeMillis => PullMaxIdleTime;
 
     /// <summary>该队列现在是否会被 rebalance 判成停摆。</summary>
@@ -1812,7 +1795,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>单测专用：把判据的时钟交给调用方。真实时钟下"正好等于 120s"这条边界
-    /// 无法稳定断言（读表与比较之间总会推进几毫秒），而 Java 用的是严格 <c>&gt;</c>，
+    /// 无法稳定断言（读表与比较之间总会推进几毫秒），而判据用的是严格 <c>&gt;</c>，
     /// 差一个字符的写法（<c>&gt;=</c>）只能靠注入时钟锁死。</summary>
     public bool PullStalledForTest(string key, long now)
     {
@@ -1909,7 +1892,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>给某把队列登记一条占位循环线程（单测用）：<paramref name="alive"/>=false 时
-    /// 是一条"从未启动/已退出"的线程，正好触发 Java 侧 <c>isAlive</c> 那一半判据。
+    /// 是一条"从未启动/已退出"的线程，正好触发 <c>isAlive</c> 那一半判据。
     /// 活着的占位线程由 <see cref="ReleaseTestLoops"/> 统一放行。</summary>
     public void RegisterLoopForTest(string key, bool alive)
     {
@@ -1958,7 +1941,7 @@ public sealed class DefaultMQPushConsumer
                     // 307/220 里看到、位点也能持久化；不种时刻的话下一轮 rebalance 无从判断。
                     _mqMap[kv.Key] = kv.Value;
                     _lastPullAt[kv.Key] = beganAt;
-                    // 新 ProcessQueue 就位 ⇒ 解冻（Java removeProcessQueue 里的 removeOffset
+                    // 新队列缓冲就位 ⇒ 解冻（removeProcessQueue 会一并
                     // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让
                     // 这条队列从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
                     _frozenOffsets.Remove(kv.Key);
@@ -1995,7 +1978,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>实例收到 broker 的 40 通知后叫醒本消费者的重平衡线程
-    /// （对应 Java MQClientInstance#rebalanceImmediately → RebalanceService#wakeup）。
+    /// （rebalanceImmediately → RebalanceService#wakeup 语义）。
     /// 跑在 remoting 读线程上：只置位，不发 RPC、不做重活。</summary>
     /// <remarks>⚠ 这里**绝不能**同步调用 DoRebalance()：它内部会做阻塞式 invokeSync
     /// （GET_CONSUMER_LIST_BY_GROUP、心跳），而响应只能由**同一个读线程**投递 ——
@@ -2022,7 +2005,7 @@ public sealed class DefaultMQPushConsumer
 
     private RemotingCommand? OnGetConsumerRunningInfo(RemotingCommand cmd, string addr)
     {
-        // 对应 Java ClientRemotingProcessor.processRequest GET_CONSUMER_RUNNING_INFO 分支。
+        // GET_CONSUMER_RUNNING_INFO(307) 的处理。
         // 运行在读线程上：只做本地快照（构造 ConsumerRunningInfo），绝不做网络调用。
         string? group = null;
         if (cmd.ExtFields is not null && cmd.ExtFields.TryGetValue("consumerGroup", out string? g))
@@ -2032,7 +2015,7 @@ public sealed class DefaultMQPushConsumer
 
         if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
         {
-            // 与 Java 一致：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
+            // 协议约定：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
             return RemotingCommand.CreateResponseCommand(
                 ResponseCode.SystemError,
                 "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
@@ -2051,7 +2034,7 @@ public sealed class DefaultMQPushConsumer
 
     private RemotingCommand? OnResetConsumerOffset(RemotingCommand cmd, string addr)
     {
-        // 对应 Java ClientRemotingProcessor RESET_CONSUMER_CLIENT_OFFSET 分支：
+        // RESET_CONSUMER_CLIENT_OFFSET(220) 的处理：
         // oneway 请求（broker 不等响应），重置逻辑丢到后台线程（不能阻塞读线程）。
         string? group = null;
         string? topic = null;
@@ -2073,12 +2056,11 @@ public sealed class DefaultMQPushConsumer
             return null;   // oneway，不回响应
         }
 
-        // 222 的 body 有两种形状：map（ResetOffsetBody，Java 管理端恒用这种）与数组
-        // （ResetOffsetBodyForC，只有 222 发起方 language=CPP 时 broker 才推，见
-        // Broker2Client.resetOffset:158-163）。Java 处理器只认 map
-        // （ClientRemotingProcessor.resetOffset:153）—— Java 管理端恒发 JAVA 故碰不到数组；
-        // 本端口为与 language=CPP 的旧 C++ SDK 管理端互通而兜底它：map 解析器对数组只会
-        // 抛错/得空表，不兜底等于整笔重置静默丢弃（与 C++ parseResetOffsetBody 同口径）。
+        // 222 的 body 有两种形状：map（ResetOffsetBody）与数组
+        // （ResetOffsetBodyForC，只有 222 发起方 language=CPP 时 broker 才推）。
+        // 协议自身的处理器只认 map —— 发起方恒发 JAVA 时碰不到数组；
+        // 本端口为与 language=CPP 的发起方互通而兜底数组：map 解析器对数组只会
+        // 抛错/得空表，不兜底等于整笔重置静默丢弃。
         var table = new Dictionary<MessageQueue, long>();
         if (cmd.Body is { Length: > 0 })
         {
@@ -2135,7 +2117,7 @@ public sealed class DefaultMQPushConsumer
 
         if (!string.Equals(group, ConsumerGroup, StringComparison.Ordinal))
         {
-            // 与 Java 一致：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
+            // 协议约定：组不匹配回 SYSTEM_ERROR（broker 端会打 warn）
             return RemotingCommand.CreateResponseCommand(
                 ResponseCode.SystemError,
                 "consumerGroup not matched, expect " + ConsumerGroup + ", got " + (group ?? "<null>"));
@@ -2154,8 +2136,8 @@ public sealed class DefaultMQPushConsumer
 
     private RemotingCommand? OnConsumeMessageDirectly(RemotingCommand cmd, string addr)
     {
-        // 与 Python 一致：监听器在读线程上同步跑（admin 一次性探针；监听器里如果再发
-        // 同步请求会自死锁，但那是用户代码职责，Java 读线程同样有此约束）。
+        // 监听器在读线程上同步跑（admin 一次性探针；监听器里如果再发
+        // 同步请求会自死锁，但那是用户代码职责，读线程上始终有这一约束）。
         string? group = null;
         string? brokerName = null;
         if (cmd.ExtFields is not null)
@@ -2193,7 +2175,7 @@ public sealed class DefaultMQPushConsumer
         return ok;
     }
 
-    /// <summary>对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答体）。</summary>
+    /// <summary>构造 307 的应答体（consumerRunningInfo）。</summary>
     public ConsumerRunningInfo BuildConsumerRunningInfo()
     {
         var info = new ConsumerRunningInfo
@@ -2222,8 +2204,8 @@ public sealed class DefaultMQPushConsumer
 
             foreach (var kv in _mqMap)
             {
-                // POP 模式下弹出去 _popQueues（Java 的 popProcessQueueTable），classic 的
-                // processQueueTable 是空的 —— 两把表在 Java 里互斥，307 里也必须互斥：同一把
+                // POP 模式下弹出去 _popQueues（popProcessQueueTable），classic 的
+                // processQueueTable 是空的 —— 两把表互斥，307 应答里也必须互斥：同一把
                 // 队列既进 mqTable 又进 mqPopTable 会让控制台把一路消费数成两路。
                 // _mqMap 是"已分配"注册表（自愈、位点持久化都靠它），两种模式都写，所以按模式过滤。
                 if (PopMode && _popQueues.ContainsKey(kv.Key))
@@ -2236,7 +2218,7 @@ public sealed class DefaultMQPushConsumer
                 int cachedMsgCount = _pending.TryGetValue(kv.Key, out Queue<MessageExt>? q)
                     ? q.Count
                     : 0;
-                // Java ProcessQueue.fillOutRunningInfo:456 —— 运维看这个字段判断"还在不在拉"，
+                // 运行信息里的这个字段 —— 运维看它判断"还在不在拉"，
                 // rebalance 的停摆自愈用的就是同一个时刻。
                 long lastPull = _lastPullAt.TryGetValue(kv.Key, out long lpt) ? lpt : 0;
                 info.MqTable.Set(mqKey, MakeProcessQueueInfo(commitOffset, cachedMsgCount,
@@ -2254,14 +2236,14 @@ public sealed class DefaultMQPushConsumer
 
                     info.MqPopTable.Set(MessageQueueKeys.MessageQueueKey(mq),
                         MakeProcessQueueInfo(0, kv.Value.WaitAckCount(), kv.Value.IsDropped(),
-                            // Java 的 pop 视图本没有这个字段（PopProcessQueue 不填），但
-                            // lastPopTimestamp 正是停摆判据本身，如实暴露（与 Python 一致）。
+                            // pop 视图本没有这个字段（PopProcessQueue 不填），但
+                            // lastPopTimestamp 正是停摆判据本身，如实暴露。
                             lastPullTimestamp: kv.Value.LastPopTimestamp));
                 }
             }
         }
 
-        // statusTable（Java consumerRunningInfo：consumeStatus(group, topic)，minute 快照）
+        // statusTable（consumeStatus(group, topic)，minute 快照）
         foreach (string topic in _subscriptionData.Keys)
         {
             ConsumeStatus cs = _mqClient?.ConsumerStats.ConsumeStatus(ConsumerGroup, topic)
@@ -2275,9 +2257,9 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 对应 Java MQClientInstance.resetOffset（220 的消费者侧逻辑）。
+    /// resetOffset：220 的消费者侧逻辑。
     /// <para>
-    /// Java 的四步：<c>pq.setDropped(true); pq.clear()</c>（在途批次的 ack 与缓冲一起作废）
+    /// 四步：<c>pq.setDropped(true); pq.clear()</c>（在途批次的 ack 与缓冲一起作废）
     /// → 非顺序消费时等 <c>RESET_OFFSET_MAX_WAIT</c>＝10 秒让并发消费跑完 →
     /// <c>updateConsumeOffset(mq, offset)</c> ＋ <c>removeUnnecessaryMessageQueue</c>
     /// （立刻落盘、顺序解锁）→ 把队列从 processQueueTable 摘掉，rebalance 按新位点重建。
@@ -2312,7 +2294,7 @@ public sealed class DefaultMQPushConsumer
                 }
 
                 // 新位点先写进表：撤销会把**它**交给 OnQueuesRevoked 落盘
-                //（Java updateConsumeOffset 之后紧接着的那次 persist）
+                //（updateConsumeOffset 之后紧接着的那次 persist）
                 _consumeOffsetTable[kv.Key] = off;
                 RetireQueueLocked(kv.Key, mq, retired);
             }
@@ -2323,7 +2305,7 @@ public sealed class DefaultMQPushConsumer
             return;
         }
 
-        // Java 用 RESET_OFFSET_MAX_WAIT 等并发消费跑完；这里缩短以免阻塞太久
+        // 语义上等并发消费跑完（RESET_OFFSET_MAX_WAIT）；这里缩短以免阻塞太久
         // （220 是 oneway，broker 不等响应，但仍应尽快返回）。
         Thread.Sleep(200);
         OnQueuesRevoked(retired);
@@ -2342,14 +2324,14 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 被撤销队列的收尾（对应 Java <c>RebalanceImpl.removeUnnecessaryMessageQueue</c>）：
+    /// 被撤销队列的收尾（removeUnnecessaryMessageQueue）：
     /// 聚类模式把位点推给 broker + 顺序消费解锁；广播模式位点只存本地，连同队列信息写盘。
     /// </summary>
     private void OnQueuesRevoked(List<RetiredQueue> revoked)
     {
         if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
         {
-            // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件：Java 是
+            // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件：顺序是
             // persist(mq) 在前、removeOffset(mq) 在后（只摘内存条目，文件里的值留着），
             // 少了这一步，队列重建时读不到旧位点，会按 consumeFromWhere 从头/从尾重扫。
             SaveLocalOffsets(revoked);
@@ -2380,9 +2362,8 @@ public sealed class DefaultMQPushConsumer
                 }
             }
 
-            // 撤队列时的单队列解锁只属于 classic 顺序（Java
-            // RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 拿的是 processQueueTable
-            // 里的 ProcessQueue —— POP 模式下那张表是空的，这条路径根本不会跑）。
+            // 撤队列时的单队列解锁只属于 classic 顺序：removeUnnecessaryMessageQueue
+            // 拿的是 processQueueTable 里的队列缓冲 —— POP 模式下那张表是空的，这条路径根本不会跑。
             if (orderly && !PopMode)
             {
                 unlockList.Add(r.Mq);
@@ -2403,7 +2384,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）：
+    /// getConsumerStatus：221 的应答数据源：
     /// 返回**已消费位点**表（不是拉取游标），topic 为空则返回全部。
     /// </summary>
     public SortedDictionary<MessageQueue, long> GetConsumerStatus(string topic)
@@ -2429,7 +2410,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 对应 Java ConsumeMessageConcurrentlyService.consumeMessageDirectly（309）：
+    /// consumeMessageDirectly（309）：
     /// 本地真实消费一条消息（还原重投 topic 后交给监听器），把结果回给 admin。
     /// </summary>
     public ConsumeMessageDirectlyResult ConsumeMessageDirectly(MessageExt msg, string brokerName)
@@ -2449,7 +2430,7 @@ public sealed class DefaultMQPushConsumer
             var ctx = new ConsumeOrderlyContext(mq);
             try
             {
-                // Java 顺序 consumeMessageDirectly:103-161 —— 映射比并发侧多两个成员
+                // 顺序 consumeMessageDirectly 的映射比并发侧多两个成员
                 //（COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK，broker 按它们区分 binlog 口径），
                 // 且 AutoCommit 取 listener 跑完**之后**的上下文值。
                 ConsumeOrderlyStatus status = orderlyListener.ConsumeMessage(msgs, ctx);
@@ -2467,7 +2448,7 @@ public sealed class DefaultMQPushConsumer
                 result.Remark = e.GetType().Name + ": " + e.Message;
             }
 
-            // Java:156 —— 读的是 listener 跑完之后的上下文值（异常路径同样读）。listener 里置
+            // 读的是 listener 跑完之后的上下文值（异常路径同样读）。listener 里置
             // false 的 binlog 用法靠这条回传让 broker 知道「这条直接消费没提交」；提前读初值
             // 等于把它吞掉，真机上只表现为 mqadmin 返回的 AutoCommit 恒为 true。
             result.AutoCommit = ctx.AutoCommit;
@@ -2499,7 +2480,7 @@ public sealed class DefaultMQPushConsumer
     private static JsonValue MakeProcessQueueInfo(long commitOffset, long cachedMsgCount, bool droped,
                                                   long lastPullTimestamp = 0)
     {
-        // ProcessQueueInfo 全字段（Java body.ProcessQueueInfo；"droped" 拼写照抄）
+        // ProcessQueueInfo 全字段（线上字段名；"droped" 拼写照抄，是消费方匹配的键）
         var pqi = JsonValue.MakeObject();
         pqi.Set("commitOffset", JsonValue.MakeInt(commitOffset));
         pqi.Set("cachedMsgMinOffset", JsonValue.MakeInt(0));
@@ -2519,8 +2500,8 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 消费侧 RT/TPS 记数（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
-    /// <paramref name="ackCount"/> 对应 Java processConsumeResult:217-220 的 ok = ackIndex + 1：
+    /// 消费侧 RT/TPS 记数（RT 恒记，OK/FAILED 按结果）。
+    /// <paramref name="ackCount"/> 按 processConsumeResult 的 ok = ackIndex + 1：
     /// 部分 ack 时前缀算 OK、尾巴算 FAILED。不传则按整批算（顺序/POP 路径的旧口径）。
     /// </summary>
     private void RecordConsumeStats(string topic, int msgCount, long beginMs, bool failed,
@@ -2552,7 +2533,7 @@ public sealed class DefaultMQPushConsumer
 
     private void RebalanceLoop()
     {
-        // 周期重算分配（对齐 Java RebalanceService 默认 20s），或被通知时立即重算。
+        // 周期重算分配（默认 20s），或被通知时立即重算。
         // 启动阶段且当前没有任何分配时缩短为 2s 重试：消费者可能先于 topic 被创建启动
         // （autoCreateTopicEnable 下 broker 由生产者的首次发送建 topic），此时真实路由还
         // 拉不到——消费端不做默认 topic 兜底（见 MQClientInstance.UpdateTopicRouteInfoFromNameServer），
@@ -2577,10 +2558,10 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>拉取前的流控判定 —— Python <c>_flow_control_hit</c> / Java
-    /// <c>ProcessQueue.putMessage</c> 的五个阈值，按此顺序命中即返回（先命中的那条会掩盖后面的）：
+    /// <summary>拉取前的流控判定 —— 入队缓冲前检查的五个阈值，
+    /// 按此顺序命中即返回（先命中的那条会掩盖后面的）：
     /// <list type="number">
-    /// <item>条数 &gt;= <c>PullThresholdForQueue</c>（Java 的 <c>Math.max(1,n)</c> 守卫：配 0 也按 1 条算）</item>
+    /// <item>条数 &gt;= <c>PullThresholdForQueue</c>（<c>Math.max(1,n)</c> 守卫：配 0 也按 1 条算）</item>
     /// <item>字节 &gt;= <c>PullThresholdSizeForQueue</c>，单位 <b>MiB</b>（&lt;=0 关闭）</item>
     /// <item>跨度 <b>严格大于</b> <c>ConsumeConcurrentlyMaxSpan</c>（缓冲内 queueOffset 的 max-min）</item>
     /// <item>topic 累计条数 &gt;= <c>PullThresholdForTopic</c>（本实例该 topic <b>所有</b>队列合起来）</item>
@@ -2680,7 +2661,7 @@ public sealed class DefaultMQPushConsumer
         //    RebalancePullThreads 可能正好在那个窗口里把本线程 start 起来，于是本线程的
         //    第一条语句就撞上"未启动"状态，Client() 抛 MQClientException。该异常抛在**后台
         //    线程**上，C# 会因此终止整个进程（实测 Abort trap: 6 / RC=134），
-        //    而 Java/C++/Python 只是让这一个线程退出。判活后正常返回，把优雅退出变成正常路径。
+        //    别的线程模型只让这一个线程退出。判活后正常返回，把优雅退出变成正常路径。
         MQClientInstance? clientRef = _mqClient;
         if (clientRef is null || !_started) return;
         MQClientInstance c = clientRef;
@@ -2708,11 +2689,11 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
-            // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖章，在
+            // 每次**发起**拉取就盖章，在
             // 流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
             StampPullAt(key, pop: false);
 
-            // Java DefaultMQPushConsumerImpl.pullMessage:263-266 —— 挂起（Suspend()）
+            // 挂起（Suspend()）
             // 的判定在**盖章之后、锁与流控之前**：盖章必须先行，否则整段挂起期间
             // lastPullTimestamp 不更新，120s 停摆判死会把这条循环当成死循环拆掉，
             // 而消费者只是被暂停、并没有故障。
@@ -2749,7 +2730,7 @@ public sealed class DefaultMQPushConsumer
                 }
             }
 
-            // 流控（Java ProcessQueue 的五个阈值，见 FlowControlHit）：命中任一条就暂停本队列拉取
+            // 流控（五个阈值，见 FlowControlHit）：命中任一条就暂停本队列拉取
             if (FlowControlHit(mq, key))
             {
                 _stopEvent.Wait(TimeSpan.FromMilliseconds(100));
@@ -2784,7 +2765,7 @@ public sealed class DefaultMQPushConsumer
             PullResult result;
             try
             {
-                // Java DefaultMQPushConsumerImpl.pullMessage:458-468：只有
+                // 只有
                 // postSubscriptionWhenPull 打开且**非**类过滤模式时才带订阅表达式
                 // （SUBSCRIPTION 位 = subExpression != null）。
                 string? expr = PullSubscriptionExpression(sub);
@@ -2794,7 +2775,7 @@ public sealed class DefaultMQPushConsumer
                 long brokerId;
                 lock (_lock)
                 {
-                    // Java PullAPIWrapper#recalculatePullFromWhichNode：无记录按 master=0
+                    // 无记录按 master=0
                     brokerId = _pullFromWhichNode.TryGetValue(key, out long bid) ? bid : MixAll.MasterId;
                 }
 
@@ -2803,11 +2784,11 @@ public sealed class DefaultMQPushConsumer
                     /*commitOffset=*/0, expr ?? string.Empty, sub.SubVersion, sub.ExpressionType,
                     _pullTimeoutMillis, _pullBatchSizeInBytes, _pullSuspendTimeoutMillis,
                     /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/brokerId);
-                // Java PullAPIWrapper#processPullResult:77：每轮应答都回写
-                // pullFromWhichNodeTable（缺省按 master=0 记账，与 Java long 原语同口径）
+                // 每轮应答都回写
+                // pullFromWhichNodeTable（缺省按 master=0 记账，不把缺省当成保留旧值）
                 UpdatePullFromWhichNode(key, result.SuggestWhichBrokerId);
 
-                // 消费统计（Java PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
+                // 消费统计（RT 每次都记，TPS 只在有消息时记）
                 _mqClient!.ConsumerStats.IncPullRT(ConsumerGroup, mq.Topic,
                     UtilAll.CurrentTimeMillis() - pullBegan);
                 if (result.IsFound && result.MsgFoundList.Count > 0)
@@ -2840,7 +2821,7 @@ public sealed class DefaultMQPushConsumer
             }
 
             // 长轮询返回后再次确认：若期间被撤销或本线程已被自愈换下，丢弃本批消息并退出
-            // （对齐 Java ProcessQueue.isDropped 守卫——拉到的消息不再进入缓冲）。
+            // （isDropped 守卫——拉到的消息不再进入缓冲）。
             lock (_lock)
             {
                 if (_dropped.Contains(key))
@@ -2870,10 +2851,10 @@ public sealed class DefaultMQPushConsumer
 
             if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
             {
-                // 投递前的客户端侧过滤（对齐 Java PullAPIWrapper.processPullResult:113-128）：
+                // 投递前的客户端侧过滤（processPullResult）：
                 // 先二次 tag 过滤，再跑 FilterMessageHook。**必须在拿 _lock 之前做** ——
                 // 钩子是用户代码，可能阻塞，不能压在入队的临界区里。
-                // 拉取路径被摘掉的消息**不 ack**（Java 亦然）：位点照常推进 = 静默跳过。
+                // 拉取路径被摘掉的消息**不 ack**：位点照常推进 = 静默跳过。
                 int before = result.MsgFoundList.Count;
                 result.MsgFoundList = FilterMessagesForDelivery(mq, sub, result.MsgFoundList);
                 if (result.MsgFoundList.Count < before)
@@ -2881,7 +2862,7 @@ public sealed class DefaultMQPushConsumer
                     Interlocked.Add(ref _filteredMessageCount, before - result.MsgFoundList.Count);
                 }
 
-                // 重投消息 topic 还原（对齐 Java PullAPIWrapper.processPullResult）：broker 把重试
+                // 重投消息 topic 还原（processPullResult）：broker 把重试
                 // 消息写到 %RETRY%group，但消息自带 RETRY_TOPIC 属性指向原始 topic，分发前还原，
                 // 否则上层 listener 看到的 topic 是 %RETRY% 而非业务 topic。
                 string retryTopic = MixAll.GetRetryTopic(ConsumerGroup);
@@ -2895,7 +2876,7 @@ public sealed class DefaultMQPushConsumer
                             string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
                             if (!string.IsNullOrEmpty(orig))
                             {
-                                // Java 还会把命名空间从还原后的 topic 上剥掉再交给 listener
+                                // 还要把命名空间从还原后的 topic 上剥掉再交给 listener
                                 m.Topic = _namespace.Length == 0
                                     ? orig!
                                     : NamespaceUtil.WithoutNamespace(orig!, _namespace);
@@ -2905,7 +2886,7 @@ public sealed class DefaultMQPushConsumer
                         dq.Enqueue(m);
                     }
 
-                    // ProcessQueue.msgAccCnt：用**过滤后入队**的那批算（Java 是先过滤再 putMessage）
+                    // msgAccCnt：用**过滤后入队**的那批算（先过滤、再计数）
                     UpdateMsgAccCntLocked(key, result.MsgFoundList);
                 }
             }
@@ -2919,7 +2900,7 @@ public sealed class DefaultMQPushConsumer
                     _offsetTable[key] = result.NextBeginOffset;
                     if (result.Status == PullStatus.OffsetIllegal)
                     {
-                        // Java DefaultMQPushConsumerImpl:402-427 —— 位点被 broker 纠正时必须连
+                        // 位点被 broker 纠正时必须连
                         // 纠错带重建一起做，见 OffsetIllegalRecover。冻结在锁内先行（等价回调里
                         // 同步执行的 updateAndFreezeOffset），撤队列与落盘的 RPC 放锁外。
                         FreezeOffsetForIllegalLocked(key, result.NextBeginOffset);
@@ -2927,7 +2908,7 @@ public sealed class DefaultMQPushConsumer
                     }
                     else
                     {
-                        // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
+                        // 空应答（NO_NEW_MSG /
                         // NO_MATCHED_MSG）时修正"已消费位点"，见 CorrectTagsOffsetLocked
                         CorrectTagsOffsetLocked(key, result.Status, result.NextBeginOffset);
                     }
@@ -2942,9 +2923,9 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// POP 路径的拉取统计（Java <c>popMessage</c> 的 <c>PopCallback.onSuccess:556-563</c>）。
+    /// POP 路径的拉取统计（PopCallback.onSuccess 的口径）。
     /// <para>
-    /// Java 的 pull 回调每次都记 RT，POP 回调只在 <c>FOUND</c> 记，而且是在判空**之前**记；
+    /// pull 回调每次都记 RT，POP 回调只在 <c>FOUND</c> 记，而且是在判空**之前**记；
     /// TPS 只按真正弹到的条数记。照抄这个不对称：POP 的空手而归是长轮询常态
     /// （<c>POLLING_NOT_FOUND</c>），把它算进 RT 等于用挂起时长稀释平均拉取耗时。
     /// </para>
@@ -2973,7 +2954,7 @@ public sealed class DefaultMQPushConsumer
     // ---------------- POP 消费循环（5.x 轻量消费）----------------
 
     /// <summary>
-    /// 单队列 POP 循环（对应 Java DefaultMQPushConsumerImpl.popMessage 的回调部分）。
+    /// 单队列 POP 循环（popMessage 回调口径）。
     /// <para>与 pull 循环的关键差别：
     /// <list type="bullet">
     /// <item>**不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；</item>
@@ -2988,11 +2969,11 @@ public sealed class DefaultMQPushConsumer
         long invisible = PopInvisibleTime;
         if (invisible < MinPopInvisibleTime || invisible > MaxPopInvisibleTime)
         {
-            // Java 的钳制：超出 [5s, 300s] 一律回落到 60s
+            // 钳制：超出 [5s, 300s] 一律回落到 60s
             invisible = 60000;
         }
 
-        // Java PopRequest 默认 ConsumeInitMode.MAX；这里按 consumeFromWhere 映射，
+        // pop 请求默认 ConsumeInitMode.MAX；这里按 consumeFromWhere 映射，
         // 让"从头消费"的语义在 POP 模式下也成立。
         int initMode = _consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset
             ? ConsumeInitModeMin
@@ -3012,11 +2993,11 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
-            // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起弹出即盖章（在流控之前），
-            // PopProcessQueue.lastPopTimestamp 与拉取时刻表一起写，Java 的停摆判据读的就是它。
+            // 发起弹出即盖章（在流控之前），
+            // PopProcessQueue.lastPopTimestamp 与拉取时刻表一起写，停摆判据读的就是它。
             StampPullAt(key, pop: true);
 
-            // Java DefaultMQPushConsumerImpl.popMessage:518-521 —— POP 循环同样尊重
+            // POP 循环同样尊重
             // 挂起标志，退避时长同为 1000ms（PULL_TIME_DELAY_MILLS_WHEN_SUSPEND）。
             if (_paused)
             {
@@ -3032,7 +3013,7 @@ public sealed class DefaultMQPushConsumer
             }
 
             if (pq is null || pq.IsDropped() || sub is null) return;
-            // 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）
+            // 流控：已弹未 ack 太多就先缓一缓（popThresholdForQueue）
             if (pq.WaitAckCount() > PopThresholdForQueue)
             {
                 Thread.Sleep(50);
@@ -3062,7 +3043,7 @@ public sealed class DefaultMQPushConsumer
             }
 
             // 弹出后队列被 rebalance 撤走（或本线程已被自愈换下）：这一批**既不消费也不 ack**
-            // （Java 对应 PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
+            // （PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
             // broker 自动复活重投给新属主。
             bool discarded;
             lock (_lock)
@@ -3082,13 +3063,13 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
-            // 拉取统计（Java PopCallback.onSuccess:556-563，判定见 RecordPopPullStats）
+            // 拉取统计（PopCallback.onSuccess 口径，判定见 RecordPopPullStats）
             RecordPopPullStats(Client().ConsumerStats, ConsumerGroup, mq.Topic, result, began);
 
             if (result.Status == PopStatus.Found && result.MsgFoundList.Count > 0)
             {
                 pq.IncFoundMsg(result.MsgFoundList.Count);
-                // 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
+                // 投递前过滤（processPopResult）：POP 路径**必须 ack 被摘掉的**，
                 // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
                 List<MessageExt> kept = FilterMessagesForDelivery(mq, sub, result.MsgFoundList);
                 if (kept.Count != result.MsgFoundList.Count)
@@ -3120,16 +3101,16 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>POP 弹出批次的统一入口（Java service 接口的公开方法）：顺序监听器分流进
+    /// <summary>POP 弹出批次的统一入口：顺序监听器分流进
     /// <see cref="SubmitPopOrderlyRequest"/> 骨架，并发监听器走
     /// ConsumeMessagePopConcurrentlyService。公开给测试工程（无 InternalsVisibleTo）。
-    /// <para>Java DefaultMQPushConsumerImpl:960-990 按 listener 类型选服务：顺序监听器 +
-    /// POP 走 ConsumeMessagePopOrderlyService。上游 5.5.0 那是个未完成骨架（:533
-    /// POPTODO）：请求去重入队后 run() 拿到队列锁就返回 —— 消息**不消费、不 ack**，
-    /// invisibleTime 到期由 broker 复活重投。照抄这个行为，别"修好"。msgs 在顺序路径
-    /// 被忽略（Java 的 ConsumeRequest 只带 pq + mq）。</para>
+    /// <para>按 listener 类型选服务：顺序监听器 +
+    /// POP 走 ConsumeMessagePopOrderlyService。它在 5.5.0 是个未完成骨架（POPTODO）：
+    /// 请求去重入队后 run() 拿到队列锁就返回 —— 消息**不消费、不 ack**，
+    /// invisibleTime 到期由 broker 复活重投。保留这个行为，别"修好"。msgs 在顺序路径
+    /// 被忽略（顺序消费请求只带 pq + mq）。</para>
     /// <para>并发分支：按 ConsumeMessageBatchMaxSize 切批后投给 **core/max 两档线程池**
-    /// （core=ConsumeThreadMin / max=ConsumeThreadMax，队列无界，同 Java 的
+    /// （core=ConsumeThreadMin / max=ConsumeThreadMax，队列无界
     /// `LinkedBlockingQueue()`）。</para></summary>
     public void SubmitPopConsumeRequest(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
     {
@@ -3158,8 +3139,8 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>提交一份 POP 顺序请求（Java submitConsumeRequest:178-191）：force=false
-    /// 时按 (pq, mq) 去重，重复请求直接丢弃；新请求才投执行器。Java 的每 key
+    /// <summary>提交一份 POP 顺序请求（submitConsumeRequest）：force=false
+    /// 时按 (pq, mq) 去重，重复请求直接丢弃；新请求才投执行器。每 key
     /// MessageQueueLock 折进 _lock：临界区只有一次集合操作。公开给测试工程。</summary>
     public void SubmitPopOrderlyRequest(PopProcessQueue pq, MessageQueue mq, bool force)
     {
@@ -3186,13 +3167,13 @@ public sealed class DefaultMQPushConsumer
         }
         catch (Exception e)
         {
-            // Java :185-188 —— 提交失败只打日志，请求留在集合里（不会自动重投）。
+            // 提交失败只打日志，请求留在集合里（不会自动重投）。
             ClientLog.Error("error submit pop orderly request: " + e.Message + ", mq: " + mq);
         }
     }
 
-    /// <summary>请求的执行体（Java ConsumeRequest.run:315-324）—— 上游 5.5.0 的骨架
-    /// 到此为止：pq 被撤销才摘请求（Java removeConsumeRequest 同款日志）；否则拿到
+    /// <summary>请求的执行体 —— 5.5.0 的骨架
+    /// 到此为止：pq 被撤销才摘请求（removeConsumeRequest 同文案日志）；否则拿到
     /// 队列锁就**什么都不做** —— 不调 listener、不 ack。</summary>
     public void RunPopOrderlyRequest(PopProcessQueue pq, MessageQueue mq)
     {
@@ -3207,7 +3188,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>请求集条数（Java consumeRequestSet.size()；去重行为要能离线锁死）。</summary>
+    /// <summary>请求集条数（consumeRequestSet.size()；去重行为要能离线锁死）。</summary>
     public int PopOrderlyRequestCount()
     {
         lock (_lock)
@@ -3216,8 +3197,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>消费一个 POP 批次并按结果 ack / 延长不可见时间（对应 Java
-    /// ConsumeMessagePopConcurrentlyService$ConsumeRequest.run）。</summary>
+    /// <summary>消费一个 POP 批次并按结果 ack / 延长不可见时间（ConsumeRequest.run）。</summary>
     private void ConsumePopBatch(List<MessageExt> msgs, PopProcessQueue pq, MessageQueue mq)
     {
         if (pq.IsDropped() || msgs.Count == 0) return;
@@ -3249,7 +3229,7 @@ public sealed class DefaultMQPushConsumer
         ResetRetryTopicAndNamespace(msgs);
         var ctx = new ConsumeConcurrentlyContext(mq);
 
-        // 对应 Java ConsumeMessagePopConcurrentlyService：POP 路径把 ackIndex 当
+        // POP 路径把 ackIndex 当
         // 「已 ack 到第几条」用，语义与 classic 回投路径一致，默认值 Integer.MAX_VALUE
         // 已经表示「整批 ack」；这里钳到 size-1 只是让 ctx 上的值与本批条数对齐，
         // 不影响 CONSUME_SUCCESS 的行为（不 ack 会让消息在 invisibleTime 后被复活重投）。
@@ -3262,8 +3242,8 @@ public sealed class DefaultMQPushConsumer
         }
 
         long popBegin = UtilAll.CurrentTimeMillis();
-        // Java ConsumeMessagePopConcurrentlyService:379-385 —— POP 路径同样在交给 listener
-        // 之前盖章（POP 没有清扫调度，这里只为 listener/轨迹可见性与其余三端一致）
+        // POP 路径同样在交给 listener
+        // 之前盖章（POP 没有清扫调度，这里只为保持 listener/轨迹可见性一致）
         string popStamp = popBegin.ToString(CultureInfo.InvariantCulture);
         foreach (MessageExt m in msgs)
         {
@@ -3278,13 +3258,13 @@ public sealed class DefaultMQPushConsumer
         }
         catch (Exception e)
         {
-            // Java：消费抛异常按 RECONSUME_LATER 处理
+            // 消费抛异常按 RECONSUME_LATER 处理
             ClientLog.Debug("pop listener error, treat as RECONSUME_LATER: " + e.Message);
             popHasException = true;
         }
 
-        // 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做，
-        // 与 Java 一致（返回 null 记 RETURNNULL，而不是 FAILED）
+        // 钩子的 returnType 判定在「status 归一化为 RECONSUME_LATER」**之前**做
+        // （返回 null 记 RETURNNULL，而不是 FAILED）
         RecordConsumeStats(mq.Topic, msgs.Count, popBegin,
             failed: status == ConsumeConcurrentlyStatus.ReconsumeLater);
         FinishConsumeHook(popHookCtx, true, popHasException, popBegin,
@@ -3302,7 +3282,7 @@ public sealed class DefaultMQPushConsumer
         ProcessPopConsumeResult(status, ctx, msgs, pq);
     }
 
-    /// <summary>消费前把重投消息的 topic 还原成业务原始 topic（对应 Java resetRetryAndNamespace）。
+    /// <summary>消费前把重投消息的 topic 还原成业务原始 topic（resetRetryAndNamespace）。
     /// 与 pull 路径内联的那段同义，这里抽出来供 POP 复用。</summary>
     private void ResetRetryTopicAndNamespace(List<MessageExt> msgs)
     {
@@ -3312,19 +3292,19 @@ public sealed class DefaultMQPushConsumer
             if (m.Topic != retryTopic) continue;
             string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
             if (string.IsNullOrEmpty(orig)) continue;
-            // Java 还会把命名空间从还原后的 topic 上剥掉再交给 listener
+            // 还要把命名空间从还原后的 topic 上剥掉再交给 listener
             m.Topic = _namespace.Length == 0 ? orig! : NamespaceUtil.WithoutNamespace(orig!, _namespace);
         }
     }
 
-    /// <summary>Java ConsumeRequest.isPopTimeout：解析不出 popTime/invisibleTime 时按超时处理。</summary>
+    /// <summary>isPopTimeout：解析不出 popTime/invisibleTime 时按超时处理。</summary>
     public static bool IsPopTimeout(long popTime, long invisible)
     {
         if (popTime <= 0 || invisible <= 0) return true;
         return UtilAll.CurrentTimeMillis() - popTime >= invisible;
     }
 
-    /// <summary>对应 Java ConsumeMessagePopConcurrentlyService.processConsumeResult。</summary>
+    /// <summary>processConsumeResult：处理 POP 批次的消费结果。</summary>
     private void ProcessPopConsumeResult(ConsumeConcurrentlyStatus status,
                                          ConsumeConcurrentlyContext ctx,
                                          List<MessageExt> msgs, PopProcessQueue pq)
@@ -3352,7 +3332,7 @@ public sealed class DefaultMQPushConsumer
         {
             pq.Ack();
             MessageExt msg = msgs[i];
-            // 超过最大重试次数：Java 走 CheckNeedAckOrDelay（太老就直接 ack 丢弃，
+            // 超过最大重试次数：走 CheckNeedAckOrDelay（太老就直接 ack 丢弃，
             // 否则按消息已存活时间选一个延迟档位）
             if (_maxReconsumeTimes >= 0 && msg.ReconsumeTimes >= _maxReconsumeTimes)
             {
@@ -3364,7 +3344,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>Java checkNeedAckOrDelay：重试次数用尽后的兜底。
+    /// <summary>checkNeedAckOrDelay：重试次数用尽后的兜底。
     /// 消息存活时间已超过最大延迟档位的 2 倍 → 直接 ack 丢弃（不再无限重试）；
     /// 否则按存活时间选一个档位继续延长不可见时间。</summary>
     private void CheckNeedAckOrDelay(MessageExt msg)
@@ -3388,20 +3368,20 @@ public sealed class DefaultMQPushConsumer
             }
         }
 
-        // ⚠ 有意偏离 Java：存活时间小于首档时 Java 会算出 level=-1 并索引
-        // delayLevelTable[-1] 抛 IndexOutOfRangeException。这里在 ChangePopInvisibleTime
+        // ⚠ 有意修正：存活时间小于首档时朴素算法会算出 level=-1 并越界索引
+        // delayLevelTable[-1]。这里在 ChangePopInvisibleTime
         // 里钳到首档。
         ChangePopInvisibleTime(msg, level);
     }
 
     /// <summary>
-    /// 从 POP_CK 解出 ack/延长不可见时间需要的目标（对应 Java 客户端自行反构 extraInfo）。
+    /// 从 POP_CK 解出 ack/延长不可见时间需要的目标（extraInfo 需在客户端自行反构）。
     /// <para>⚠ 两处都不能想当然：
     /// <list type="number">
     /// <item>topic 要用 ExtraInfoUtil.GetRealTopic 按 CK 的 retryFlag 还原 —— 复活消息
     /// （retryFlag=1）的真实 topic 是 %RETRY%&lt;group&gt;_&lt;topic&gt;，**不是**消息上的 topic；</item>
     /// <item>地址要按 CK 里的 brokerName 反查，不能按 topic 查路由 —— retry topic 通常没有
-    /// 独立路由表项，按 topic 查会失败（Java 同理走 findBrokerAddressInSubscribe）。</item>
+    /// 独立路由表项，按 topic 查会失败（必须走 findBrokerAddressInSubscribe）。</item>
     /// </list>
     /// </para>
     /// </summary>
@@ -3433,7 +3413,7 @@ public sealed class DefaultMQPushConsumer
         return target;
     }
 
-    /// <summary>单条 ack（对应 Java DefaultMQPushConsumerImpl.ackAsync）。</summary>
+    /// <summary>单条 ack（ackAsync）。</summary>
     private void AckPopMsg(MessageExt msg)
     {
         PopCkTarget? target = PopCkTarget(msg);
@@ -3450,8 +3430,8 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>延长不可见时间（对应 Java changePopInvisibleTime）。
-    /// delayLevel == 0 时 Java 用消息已重试次数当档位；档位表是**秒**，接口要毫秒。</summary>
+    /// <summary>延长不可见时间（changePopInvisibleTime）。
+    /// delayLevel == 0 时用消息已重试次数当档位；档位表是**秒**，接口要毫秒。</summary>
     private void ChangePopInvisibleTime(MessageExt msg, int delayLevel)
     {
         PopCkTarget? target = PopCkTarget(msg);
@@ -3496,8 +3476,7 @@ public sealed class DefaultMQPushConsumer
                 {
                     if (!_mqMap.TryGetValue(key, out MessageQueue? m)) continue;
                     mq = m!;
-                    // 被撤销的队列：丢弃缓冲、跳过（不消费、不推进位点），对齐 Java 丢弃
-                    // 已从 ProcessQueueTable 移除的队列消息。
+                    // 被撤销的队列：丢弃缓冲、跳过（不消费、不推进位点）。
                     if (_dropped.Contains(key))
                     {
                         _pending.Remove(key);
@@ -3505,8 +3484,8 @@ public sealed class DefaultMQPushConsumer
                     }
                 }
 
-                // 代号与批次在**同一把锁**里取走（Java 取消息与 isDropped 判定同在
-                // ConsumeRequest.run 的临界区）：取走后又撤销/重建的队列，ack 全部作废
+                // 代号与批次在**同一把锁**里取走（取消息与 isDropped 判定同在
+                // 一个临界区）：取走后又撤销/重建的队列，ack 全部作废
                 List<MessageExt> batch = TakeBatchForConsume(key, out long epoch);
                 if (batch.Count == 0) continue;
                 try
@@ -3567,13 +3546,13 @@ public sealed class DefaultMQPushConsumer
                                     long? epoch = null)
         => ConsumeBatch(key, mq, batch, epoch);
 
-    /// <summary>顺序回投的 newMsg 构造体（Java 两条链路共用），供单测直接查属性。</summary>
+    /// <summary>顺序回投的 newMsg 构造体（两条链路共用），供单测直接查属性。</summary>
     public Message BuildRetryMessageForTest(MessageExt msg, int maxReconsumeTimes)
         => BuildRetryMessage(msg, maxReconsumeTimes);
 
     public static string OffsetKeyForTest(MessageQueue mq) => OffsetKey(mq);
 
-    /// <summary>预置某队列的「已拉未消费」缓冲（Java ProcessQueue）；null = 撤走该队列。</summary>
+    /// <summary>预置某队列的「已拉未消费」缓冲；null = 撤走该队列。</summary>
     public void SetPendingForTest(string key, List<MessageExt>? msgs)
     {
         lock (_lock)
@@ -3597,8 +3576,8 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java
-    /// ProcessQueue.msgTreeMap；单测/真机验证断言清扫前后的在册状态用。</summary>
+    /// <summary>「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即队列缓冲
+    /// （msgTreeMap）的全部内容；单测/真机验证断言清扫前后的在册状态用。</summary>
     public List<MessageExt> ProcessQueueEntriesForTest(string key)
     {
         lock (_lock)
@@ -3617,7 +3596,7 @@ public sealed class DefaultMQPushConsumer
     public long CleanExpirePeriodMillisForTest() => CleanExpirePeriodMillis();
 
     /// <summary>单测入口：把某条消息从「在册」视图里摘掉（模拟 cleanExpiredMsg 已把它
-    /// 回投并摘除），用于断言回投会跳过已被清扫的条目（Java processConsumeResult:243-248）。</summary>
+    /// 回投并摘除），用于断言回投会跳过已被清扫的条目。</summary>
     public void RemoveProcessQueueEntryForTest(string key, MessageExt msg)
     {
         lock (_lock)
@@ -3638,7 +3617,7 @@ public sealed class DefaultMQPushConsumer
     public bool RemoveExpiredEntryIfStillHeadForTest(string key, MessageExt msg)
         => RemoveExpiredEntryIfStillHead(key, msg);
 
-    /// <summary>预置某队列的「已分配队列」登记（Java ProcessQueueTable 的键值）。topic 级
+    /// <summary>预置某队列的「已分配队列」登记。topic 级
     /// 阈值要靠这张表把同 topic 的兄弟队列聚合起来，不登记就等于队列已被 rebalance 撤走。</summary>
     public void SetAssignedForTest(string key, MessageQueue mq)
     {
@@ -3663,9 +3642,9 @@ public sealed class DefaultMQPushConsumer
     // ---------------- postSubscriptionWhenPull / pullFromWhichNode ----------------
 
     /// <summary>
-    /// Java <c>DefaultMQPushConsumerImpl.pullMessage:458-468</c> 的订阅门控：只有
+    /// 订阅门控：只有
     /// <see cref="PostSubscriptionWhenPull"/> 打开**且非**类过滤模式时才把订阅表达式随请求
-    /// 上送；默认关闭（Java 5.x 默认 false），tag 过滤交给客户端
+    /// 上送；默认关闭，tag 过滤交给客户端
     /// <c>FilterMessagesForDelivery</c> 兜底。空表达式归一成 <c>"*"</c>（与 FilterAPI 同口径）。
     /// </summary>
     private string? PullSubscriptionExpression(SubscriptionData sub)
@@ -3679,9 +3658,9 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>PullAPIWrapper#updatePullFromWhichNode:157-164</c>：把应答头里的
+    /// updatePullFromWhichNode：把应答头里的
     /// <c>suggestWhichBrokerId</c> 写回表；缺省（老 broker 不带该字段）按 master=0 记账 ——
-    /// 与 Java 的 long 原语口径一致，所以**不能**把 null 当成「保留旧值」。
+    /// 口径是「缺省即 master」，所以**不能**把 null 当成「保留旧值」。
     /// </summary>
     private void UpdatePullFromWhichNode(string key, long? suggest)
     {
@@ -3691,7 +3670,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>Java <c>PullAPIWrapper#recalculatePullFromWhichNode</c>：无记录按 master=0。</summary>
+    /// <summary>recalculatePullFromWhichNode：无记录按 master=0。</summary>
     private long PullFromWhichNode(string key)
     {
         lock (_lock)
@@ -3724,8 +3703,8 @@ public sealed class DefaultMQPushConsumer
     /// <para>
     /// <paramref name="epoch"/>：这批消息所属的 ProcessQueue 代号（见 <see cref="_queueEpoch"/>）。
     /// 队列在本批次排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）时，这批
-    /// 消息<b>不能再消费也不能 ack</b> —— 符合 Java <c>ConsumeMessageConcurrentlyService:339</c>
-    /// / <c>ConsumeMessageOrderlyService:391</c> 的 <c>isDropped()</c> 短路。
+    /// 消息<b>不能再消费也不能 ack</b> —— 并发与顺序两条链路的
+    /// <c>isDropped()</c> 短路。
     /// </para>
     /// </summary>
     private bool ConsumeBatch(string key, MessageQueue mq, List<MessageExt> batch,
@@ -3751,7 +3730,7 @@ public sealed class DefaultMQPushConsumer
         }
 
         bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
-        // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
+        // ---- 顺序消费 ----
         if (IsOrderly())
         {
             var orderly = (IMessageListenerOrderly)_messageListener!;
@@ -3772,19 +3751,19 @@ public sealed class DefaultMQPushConsumer
             }
             catch (Exception e)
             {
-                // Java 顺序消费：异常 → 不提交 offset，原地重试
+                // 顺序消费：异常 → 不提交 offset，原地重试
                 ClientLog.Debug("orderly listener error (retry in place): " + e.Message);
                 status = ConsumeOrderlyStatus.SuspendCurrentQueueAMoment;
                 ohasException = true;
             }
 
-            // 顺序消费的钩子同样在拿到 status 后触发（Java ConsumeMessageOrderlyService:502-511）：
+            // 顺序消费的钩子同样在拿到 status 后触发：
             // status 是归一化后的枚举名，success 判据是 SUCCESS||COMMIT，而 returnType
             //（props 里的 CONSUME_CONTEXT_TYPE）按归一化前的 status 算。
             if (status == ConsumeOrderlyStatus.Rollback ||
                 status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
             {
-                // Java:476-482 —— 返回「不是 OK」时打一条 warn（含抛异常归一化来的挂起）。
+                // 返回「不是 OK」时打一条 warn（含抛异常归一化来的挂起）。
                 // 这条日志是顺序消费 head-of-line blocking 的唯一线索，缺了就只能看见
                 // "这个组不动了"。
                 ClientLog.Warn("consumeMessage Orderly return not OK, Group: " + ConsumerGroup +
@@ -3799,11 +3778,11 @@ public sealed class DefaultMQPushConsumer
 
             if (ctx.AutoCommit)
             {
-                // ---- Java processConsumeResult:244-269 ----
+                // ---- processConsumeResult：AutoCommit=true 分支 ----
                 if (status == ConsumeOrderlyStatus.Commit || status == ConsumeOrderlyStatus.Rollback)
                 {
-                    // Java:246-250 —— AutoCommit=true 时 Commit/Rollback 是**非法**用法（只给
-                    // binlog 消费用）：Java 只 warn、**不写 break**，顺势落进 Success 分支，
+                    // AutoCommit=true 时 Commit/Rollback 是**非法**用法（只给
+                    // binlog 消费用）：只 warn、**不写 break**，顺势落进 Success 分支，
                     // 消息照 ack、不当回滚。
                     ClientLog.Warn("the message queue consume result is illegal, we think you want " +
                         "to ack these message " + key);
@@ -3813,7 +3792,7 @@ public sealed class DefaultMQPushConsumer
                 if (status == ConsumeOrderlyStatus.SuspendCurrentQueueAMoment)
                 {
                     RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: true);
-                    // Java:256-266 —— 挂起之前要先过 checkReconsumeTimes：只有「还在重试次数内 /
+                    // 挂起之前要先过 checkReconsumeTimes：只有「还在重试次数内 /
                     // 回投失败」才把这一批塞回队首原地重试；已经交给 broker 的（回投成功）要
                     // 前进位点，否则一条毒消息永久占住这条队列 —— 而那看起来跟「消费者死了」
                     // 一模一样。
@@ -3834,10 +3813,10 @@ public sealed class DefaultMQPushConsumer
                 return true;
             }
 
-            // ---- AutoCommit=false（Java:270-300，binlog 消费场景：提交权在 listener 手里）----
+            // ---- AutoCommit=false（binlog 消费场景：提交权在 listener 手里）----
             if (status == ConsumeOrderlyStatus.Commit)
             {
-                // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+                // 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
                 RecordConsumeRt(mq.Topic, obegin);
                 AdvanceConsumeOffset(key, batch, null, epoch);
                 Interlocked.Add(ref _consumedCount, batch.Count);
@@ -3846,7 +3825,7 @@ public sealed class DefaultMQPushConsumer
 
             if (status == ConsumeOrderlyStatus.Rollback)
             {
-                // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
+                // rollback() 把消息退回队列缓冲并延后重试
                 RecordConsumeRt(mq.Topic, obegin);
                 RequeuePending(key, batch);
                 _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
@@ -3862,14 +3841,14 @@ public sealed class DefaultMQPushConsumer
                     _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
                 }
 
-                // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
+                // 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
                 // 位点前不前进由 binlog 消费方自己拿主意。
                 return false;
             }
 
-            // Success + AutoCommit=false：Java:272-274 只记 OK TPS、不提交。有意偏差：Java 把
-            // 消息留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()，而四个端口都
-            // 没把 ProcessQueue 暴露给 listener（没有 commit 的口子），照抄「什么都不做」会让这
+            // Success + AutoCommit=false：只记 OK TPS、不提交。有意偏差：经典做法把
+            // 消息留在 consumingMsgOrderlyTreeMap 里等显式 commit()，而 listener 拿不到
+            // 队列缓冲（没有 commit 的口子），照抄「什么都不做」会让这
             // 批消息被分发线程吞掉而位点又没动。这里等价地塞回队首并等一个挂起周期：位点同样不
             // 前进、消息不丢，也不会把消费线程变成忙等（不 sleep 的话下一轮立刻又拿到同一批）。
             RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: false);
@@ -3878,10 +3857,10 @@ public sealed class DefaultMQPushConsumer
             return false;
         }
 
-        // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
+        // ---- 并发消费（ConsumeRequest.run）----
         var conc = (IMessageListenerConcurrently)_messageListener!;
         var cctx = new ConsumeConcurrentlyContext(mq);
-        // 顺序与 Java 一致：before 钩子在 listener **之前**（生成 SubBefore 轨迹），
+        // before 钩子在 listener **之前**（生成 SubBefore 轨迹），
         // after 在拿到 status 之后（生成 SubAfter，带 contextCode）
         ConsumeMessageContext? hookCtx = null;
         if (_consumeMessageHooks.Count > 0)
@@ -3891,8 +3870,8 @@ public sealed class DefaultMQPushConsumer
         }
 
         long beginMs = UtilAll.CurrentTimeMillis();
-        // Java ConsumeRequest.run:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME：
-        // cleanExpiredMsg:88 的过期判据读它（StringUtils.isNotEmpty 短路，没盖章的不清扫），
+        // 交给 listener **之前**逐条盖 CONSUME_START_TIME：
+        // 清扫的过期判据读它（空串短路，没盖章的不清扫），
         // 盖晚了清扫永远看不见在途批次
         string stampText = beginMs.ToString(CultureInfo.InvariantCulture);
         foreach (MessageExt m in batch)
@@ -3908,13 +3887,13 @@ public sealed class DefaultMQPushConsumer
         }
         catch (Exception e)
         {
-            // Java：消费抛异常按 RECONSUME_LATER 处理
+            // 消费抛异常按 RECONSUME_LATER 处理
             ClientLog.Debug("listener error, treat as RECONSUME_LATER: " + e.Message);
             cstatus = ConsumeConcurrentlyStatus.ReconsumeLater;
             hasException = true;
         }
 
-        // Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
+        // CONSUME_SUCCESS 用 listener 设的 ackIndex
         // 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
         // RECONSUME_LATER 强制 ackIndex=-1，整批回投。
         int ackIndex = cctx.AckIndex;
@@ -3940,7 +3919,7 @@ public sealed class DefaultMQPushConsumer
 
         if (broadcast)
         {
-            // Java:232-237 —— 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
+            // 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
             // 整批位点照样前进（重启后不重投）
             int dropped = batch.Count - acked;
             if (dropped > 0)
@@ -3979,7 +3958,7 @@ public sealed class DefaultMQPushConsumer
             }
         }
 
-        // Java:256-260 —— 回投失败的那几条塞回队首稍后重试（ProcessQueue 里不摘掉它们）
+        // 回投失败的那几条塞回队首稍后重试（缓冲里不摘掉它们）
         if (msgBackFailed.Count > 0)
         {
             lock (_lock)
@@ -3996,7 +3975,7 @@ public sealed class DefaultMQPushConsumer
             _stopEvent.Wait(TimeSpan.FromMilliseconds(200));
         }
 
-        // Java:266-269 —— 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
+        // 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
         // 回投失败、仍留在缓冲里的那几条，否则那几条会被位点静默跳过（丢消息）
         var handled = new List<MessageExt>(batch.Count - failedIdx.Count);
         for (int i = 0; i < batch.Count; ++i)
@@ -4014,9 +3993,9 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>
     /// 从 <paramref name="base"/> 起把 batch[base, size) 逐条回投 broker
-    /// （对齐 Java processConsumeResult → sendMessageBack）。<paramref name="base"/> 是尾巴在
+    /// （processConsumeResult → sendMessageBack）。<paramref name="base"/> 是尾巴在
     /// 整批里的起始下标（部分 ack 时前缀已认可，不能再回投）。返回回投**失败**的
-    /// (整批下标, 消息)，失败条目的 ReconsumeTimes 已 +1（Java :251 —— broker 那边没记上
+    /// (整批下标, 消息)，失败条目的 ReconsumeTimes 已 +1（broker 那边没记上
     /// 这次数，客户端不补就永远进不了 %DLQ%）；调用方据此把尾巴塞回队首并钳住位点。
     /// </summary>
     private List<(int Index, MessageExt Msg)> SendBackBatch(List<MessageExt> batch,
@@ -4027,7 +4006,7 @@ public sealed class DefaultMQPushConsumer
         for (int i = @base; i < batch.Count; ++i)
         {
             MessageExt msg = batch[i];
-            // Java processConsumeResult:243-248 —— 已被 cleanExpiredMsg 清扫（或队列已撤销）
+            // 已被 cleanExpiredMsg 清扫（或队列已撤销）
             // 的条目**跳过回投**：它已经在回 broker 的路上，再发一次就是重复消息
             lock (_lock)
             {
@@ -4043,7 +4022,7 @@ public sealed class DefaultMQPushConsumer
 
             try
             {
-                // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
+                // delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
                 //（reconsumeTimes 在 MessageExt 线上格式第 13 字段，broker 重投时 +1）
                 int delayLevel = ctx.DelayLevelWhenNextConsume;
                 if (delayLevel == 0)
@@ -4056,7 +4035,7 @@ public sealed class DefaultMQPushConsumer
             catch (Exception e)
             {
                 ClientLog.Debug("send message back failed for msg " + msg.MsgId + ": " + e.Message);
-                // 与 Java 一样：次数加在**要被重新消费的副本**上，broker 没记成功
+                // 次数加在**要被重新消费的副本**上，broker 没记成功
                 msg.ReconsumeTimes += 1;
                 failed.Add((i, msg));
             }
@@ -4067,22 +4046,21 @@ public sealed class DefaultMQPushConsumer
 
     // ---------------- cleanExpiredMsg（挂起 listener 的逃生口） ----------------
     //
-    // 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:192-200 清扫入口）
-    // ＋ ProcessQueue.cleanExpiredMsg（:75-127）。三条「错了很安静」的语义在这里钉死：
-    //   1. **只看队首**（最小位点）：队首不过期就整条队列都不动手（Java:97-99 的 break）；
+    // 清扫调度与 cleanExpiredMsg 循环体。三条「错了很安静」的语义在这里钉死：
+    //   1. **只看队首**（最小位点）：队首不过期就整条队列都不动手（直接 break）；
     //   2. **严格大于** consumeTimeout：等于阈值不碰；没盖章的不当过期；
-    //   3. **单轮上限 16**，且 loop 在循环之前算一次（Java:80）——写松了会把整条队列
+    //   3. **单轮上限 16**，且 loop 在循环之前算一次 —— 写松了会把整条队列
     //      一次性全清空，位点/重投节奏全乱。
     // 离线能锁死的只有「判定」与「回投失败后原地保留」两条分支（未 start 的消费者
     // 回投必定失败）；真机链路（挂起 → 清扫 → %RETRY% 重投到达）见
     // examples/RocketMQ.Examples/LiveCleanExpiredMsg.cs。
 
-    /// <summary>Java ProcessQueue.cleanExpiredMsg:88 的过期判据：**严格**大于阈值；
-    /// 没有戳（null）不当过期（Java 的 StringUtils.isNotEmpty 短路）。</summary>
+    /// <summary>清扫的过期判据：**严格**大于阈值；
+    /// 没有戳（null）不当过期（空串判据短路）。</summary>
     private static bool IsConsumeExpired(long? stamp, long nowMs, int consumeTimeoutMinutes) =>
         stamp.HasValue && nowMs - stamp.Value > (long)consumeTimeoutMinutes * 60_000L;
 
-    /// <summary>Java ConsumeRequest.run:366-370 盖章的解析：空串/坏值一律按「没盖过章」。</summary>
+    /// <summary>消费开始戳的解析：空串/坏值一律按「没盖过章」。</summary>
     private static long? ConsumeStartTimestamp(MessageExt msg)
     {
         string? raw = msg.GetProperty(MessageConst.PropertyConsumeStartTimestamp);
@@ -4094,13 +4072,12 @@ public sealed class DefaultMQPushConsumer
         return long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v) ? v : null;
     }
 
-    /// <summary>Java scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)：
-    /// initialDelay 与 period 同值，都是 consumeTimeout 分钟。0/负值钳到 1 分钟避免忙等
-    /// （Python/Rust/C++ 同口径）。</summary>
+    /// <summary>scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)：
+    /// initialDelay 与 period 同值，都是 consumeTimeout 分钟。0/负值钳到 1 分钟避免忙等。</summary>
     private long CleanExpirePeriodMillis() => Math.Max(1, ConsumeTimeout) * 60_000L;
 
-    /// <summary>「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java
-    /// ProcessQueue.msgTreeMap。须持锁调用；按引用去重只为防御未来新调用点写出重叠。</summary>
+    /// <summary>「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即队列缓冲 msgTreeMap。
+    /// 须持锁调用；按引用去重只为防御未来新调用点写出重叠。</summary>
     private List<MessageExt> ProcessQueueEntriesLocked(string key)
     {
         var outList = new List<MessageExt>();
@@ -4130,7 +4107,7 @@ public sealed class DefaultMQPushConsumer
         return outList;
     }
 
-    /// <summary>队首 = 最小 queueOffset 的那条（Java msgTreeMap.firstEntry()）。须持锁调用。</summary>
+    /// <summary>队首 = 最小 queueOffset 的那条（firstEntry()）。须持锁调用。</summary>
     private MessageExt? ProcessQueueFirstEntryLocked(string key)
     {
         MessageExt? head = null;
@@ -4145,7 +4122,7 @@ public sealed class DefaultMQPushConsumer
         return head;
     }
 
-    /// <summary>Java ProcessQueue.containsMessage(:341-357)：这条消息还挂在队列上吗。
+    /// <summary>containsMessage：这条消息还挂在队列上吗。
     /// 被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上），回投要跳过它。</summary>
     private bool ProcessQueueContainsLocked(string key, MessageExt msg)
     {
@@ -4194,7 +4171,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>Java:106-115 —— 回投成功后，只有它**仍是**队首（最小位点还是它）时才摘除：
+    /// <summary>回投成功后，只有它**仍是**队首（最小位点还是它）时才摘除：
     /// listener 恰好在此期间正常收尾（或前面冒出了更小的位点）就让位给正常路径，别抢。</summary>
     private bool RemoveExpiredEntryIfStillHead(string key, MessageExt msg)
     {
@@ -4211,11 +4188,11 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>清理一条队列（Java ProcessQueue.cleanExpiredMsg:80-127），返回本轮实际发起
+    /// <summary>清理一条队列（cleanExpiredMsg 的循环体），返回本轮实际发起
     /// 回投的次数（单测取证「队首才动、失败重试同一条、单轮上限 16」用）。</summary>
     private int CleanExpiredQueue(string key)
     {
-        // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+        // 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
         if (IsOrderly())
         {
             return 0;
@@ -4224,7 +4201,7 @@ public sealed class DefaultMQPushConsumer
         int loop;
         lock (_lock)
         {
-            // Java:80 —— loop 在循环**之前**算一次（min(size, 16)）
+            // loop 在循环**之前**算一次（min(size, 16)）
             loop = Math.Min(ProcessQueueEntriesLocked(key).Count, 16);
         }
 
@@ -4239,24 +4216,24 @@ public sealed class DefaultMQPushConsumer
 
             if (head is null)
             {
-                break;   // Java NoSuchElementException 分支
+                break;   // 队列已空：直接结束本轮
             }
 
-            // Java:87-90 —— 没盖过章的直接当成未过期；过期判据是**严格**大于
+            // 没盖过章的直接当成未过期；过期判据是**严格**大于
             if (!IsConsumeExpired(ConsumeStartTimestamp(head), UtilAll.CurrentTimeMillis(), ConsumeTimeout))
             {
-                break;   // Java:97-99 —— 队首没过期，后面的更不可能过期
+                break;   // 队首没过期，后面的更不可能过期
             }
 
             attempts++;
             try
             {
-                // Java `pushConsumer.sendMessageBack(msg, 3)`：固定 delayLevel 3
+                // sendMessageBack(head, 3)：固定 delayLevel 3
                 SendMessageBack(head, 3);
             }
             catch (Exception e)
             {
-                // Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
+                // 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
                 // 再试；绝不摘除（摘了就真丢了）
                 ClientLog.Error("send expired msg exception: " + e.Message);
                 continue;
@@ -4272,8 +4249,8 @@ public sealed class DefaultMQPushConsumer
         return attempts;
     }
 
-    /// <summary>对应 Java cleanExpireMsg()（:192-200）：遍历当前持有的队列逐个清扫。
-    /// 任一条队列抛出异常与 Java 一样让整轮中止（调度壳子的 catch 兜住它，下一轮照常）。</summary>
+    /// <summary>cleanExpireMsg()：遍历当前持有的队列逐个清扫。
+    /// 任一条队列抛出异常让整轮中止（调度壳子的 catch 兜住它，下一轮照常）。</summary>
     private int CleanExpiredMsgOnce()
     {
         List<string> keys;
@@ -4291,8 +4268,7 @@ public sealed class DefaultMQPushConsumer
         return attempts;
     }
 
-    /// <summary>cleanExpiredMsg 的调度循环（Java scheduleAtFixedRate(cleanExpireMsg,
-    /// consumeTimeout, consumeTimeout, MINUTES)：initialDelay == period）。</summary>
+    /// <summary>cleanExpiredMsg 的调度循环（scheduleAtFixedRate：initialDelay == period）。</summary>
     private void CleanExpiredMsgLoop()
     {
         long period = CleanExpirePeriodMillis();
@@ -4312,20 +4288,20 @@ public sealed class DefaultMQPushConsumer
             }
             catch (Exception e)
             {
-                // Java:77-81 —— 整轮中止但调度照常（下一轮继续）
+                // 整轮中止但调度照常（下一轮继续）
                 ClientLog.Error("cleanExpireMsg error: " + e.Message);
             }
         }
     }
 
     // ---------------- 顺序消费的重试计数与回投 ----------------
-    // 对位 Java ConsumeMessageOrderlyService 的 getMaxReconsumeTimes / checkReconsumeTimes
-    // / sendMessageBack（:313-362），与上面并发那一套**不是同一条链路**，两处差异都要守住：
+    // 顺序消费的 getMaxReconsumeTimes / checkReconsumeTimes
+    // / sendMessageBack，与上面并发那一套**不是同一条链路**，两处差异都要守住：
     //   1. `-1` 在顺序侧是「不设限」（Integer.MAX_VALUE），在并发侧才是 16；
     //   2. 顺序侧的回投是**普通消息发送**（发到 %RETRY%<group>），不是 ConsumerSendMsgBack(3)。
 
     /// <summary>
-    /// Java <c>ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320</c>。
+    /// getMaxReconsumeTimes。
     ///
     /// 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认就该
     /// 一直重试到成功为止 —— <c>-1</c> 在这里读成 <c>int.MaxValue</c>。并发消费的
@@ -4342,8 +4318,8 @@ public sealed class DefaultMQPushConsumer
     /// <summary>
     /// 本端口的待消费缓冲是 <c>_pending</c> 队列，批次在分发给 listener <b>之前</b>就被弹出队首
     /// 了；而拉取游标在拉取那一刻已经推到 nextBeginOffset，所以「位点不前进」并不会让 broker 把
-    /// 这几条再发一遍 —— 想让它们原地重试就必须显式放回去（Java 那边消息始终留在 ProcessQueue
-    /// 里，不需要这一步）。等价 Java <c>makeMessageToConsumeAgain</c>/<c>rollback</c>。
+    /// 这几条再发一遍 —— 想让它们原地重试就必须显式放回去（经典链路的消息始终留在队列缓冲
+    /// 里，不需要这一步）。等价 <c>makeMessageToConsumeAgain</c>/<c>rollback</c>。
     /// </summary>
     private void RequeuePending(string key, List<MessageExt> batch)
     {
@@ -4360,7 +4336,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 只记 RT（Java <c>ConsumeMessageOrderlyService:515</c> 的 incConsumeRT 在
+    /// 只记 RT（incConsumeRT 在
     /// processConsumeResult <b>之外</b>、恒记）：顺序消费在 AutoCommit=false 的
     /// Success/Commit/Rollback 三个分支上一条 TPS 都不记，但 RT 照记。
     /// </summary>
@@ -4376,8 +4352,8 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 顺序消费的挂起时长（Java <c>ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234</c>）：
-    /// context 上的值优先、-1 回落到消费者配置，再钳到 [10, 30000]。listener 传 0 时 Java 仍然
+    /// 顺序消费的挂起时长（submitConsumeRequestLater）：
+    /// context 上的值优先、-1 回落到消费者配置，再钳到 [10, 30000]。listener 传 0 时仍然
     /// 等 10ms（否则返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
     /// </summary>
     public int OrderlySuspendMillis(ConsumeOrderlyContext ctx)
@@ -4397,11 +4373,11 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>ConsumeMessageOrderlyService#checkReconsumeTimes:322-339</c>。
+    /// checkReconsumeTimes。
     /// 返回「这一批是否还要原地挂起重试」。逐条两种走法：
     ///   - 次数没用尽：本地 <c>ReconsumeTimes + 1</c>（broker 那边压根没记这次失败，客户端
     ///     不补就永远到不了阈值），继续挂起；
-    ///   - 次数已用尽：交给 broker 回投。<b>回投成功就不再挂起</b>（Java 此时 commit 位点，
+    ///   - 次数已用尽：交给 broker 回投。<b>回投成功就不再挂起</b>（此时 commit 位点，
     ///     毒消息让路、队列继续往前），回投失败才 +1 并挂起。
     /// </summary>
     public bool CheckOrderlyReconsumeTimes(List<MessageExt>? msgs)
@@ -4434,15 +4410,15 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>ConsumeMessageOrderlyService#sendMessageBack:341-362</c>。
+    /// sendMessageBack（顺序链路）。
     ///
     /// 拿实例自带的内部生产者，把这条消息<b>当普通消息</b>发到 <c>%RETRY%&lt;group&gt;</c>：
     /// broker 的 <c>handleRetryAndDLQ</c>（<c>SendMessageProcessor:199-234</c>）见该组还持有
     /// 未过期的队列锁（正是顺序消费组的特征），直接把它改投 <c>%DLQ%&lt;group&gt;</c>。
     /// 其中 <c>RECONSUME_TIME</c> / <c>MAX_RECONSUME_TIMES</c> 会被发送侧抬进请求头
-    ///（<c>MQClientInstance.BuildSendRequest</c>，Java <c>sendKernelImpl:1004-1018</c>）。
+    ///（<c>MQClientInstance.BuildSendRequest</c> 发送侧抬进请求头，等价 sendKernelImpl）。
     ///
-    /// 失败只返回 false、绝不抛：Java 整段包在 try/catch 里，抛给消费线程等于这条既没
+    /// 失败只返回 false、绝不抛：整段包在 try/catch 里，抛给消费线程等于这条既没
     /// ack 也没回投，只能等锁超时 —— 而顺序消费的锁超时是分钟级，看起来就像卡死。
     /// </summary>
     private bool OrderlySendMessageBack(MessageExt msg)
@@ -4458,7 +4434,7 @@ public sealed class DefaultMQPushConsumer
                 return false;
             }
 
-            // unitMode 跟着消费者：Java 构造内部生产者时调过 resetClientConfig(clientConfig)，
+            // unitMode 跟着消费者：构造内部生产者时要复制消费者配置（resetClientConfig），
             // 不带的话重投出去的消息会丢单元标记。
             c.SendMessage(MixAll.ClientInnerProducerGroup, newMsg, publish.SelectOneMessageQueue(),
                 3000, unitMode: _unitMode);
@@ -4473,8 +4449,8 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>DefaultMQPushConsumerImpl#sendMessageBackAsNormalMessage:1148-1160</c> 与
-    /// <c>ConsumeMessageOrderlyService#sendMessageBack:341-362</c> 的两个 newMsg 构造体
+    /// <c>sendMessageBackAsNormalMessage</c> 与
+    /// <c>sendMessageBack</c>（顺序链路）的两个 newMsg 构造体
     /// <b>逐行相同</b>（只有 maxReconsumeTimes 各调各的 getter），所以抽成一个函数，
     /// 避免两处属性置法漂移。
     /// </summary>
@@ -4512,12 +4488,12 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>
     /// 推进位点到 batch 中最大 queueOffset+1；<paramref name="floor"/> 非空时不越过它
-    /// （对应 Java ProcessQueue.removeMessage：树里还留着未消费完的消息时提交位点只能是
+    /// （见 removeMessage：树里还留着未消费完的消息时提交位点只能是
     /// firstKey，否则会静默丢掉那条）。空批次直接返回。
     /// <para>
-    /// <paramref name="epoch"/> 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明
-    /// 队列已被撤销/重建（Java <c>ConsumeMessageConcurrentlyService:267</c> 的
-    /// <c>!processQueue.isDropped()</c>），<b>整批 ack 作废</b>。<see cref="_frozenOffsets"/>
+    /// <paramref name="epoch"/> 是取这批消息时队列缓冲的代号：与当前代号不一致说明
+    /// 队列已被撤销/重建，按 <c>isDropped</c> 一类的闸门
+    /// <b>整批 ack 作废</b>。<see cref="_frozenOffsets"/>
     /// 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
     /// </para>
     /// </summary>
@@ -4568,7 +4544,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>DefaultMQPushConsumerImpl#correctTagsOffset:713-717</c>（调用点 <c>:394-401</c>）。
+    /// correctTagsOffset（空应答路径的调用点）
     /// 调用方须持 <c>_lock</c>。
     /// <para>
     /// 拉取应答是 <c>NoNewMsg</c>（队列里真没消息）或 <c>NoMatchedMsg</c>（broker 侧按订阅
@@ -4579,7 +4555,7 @@ public sealed class DefaultMQPushConsumer
     /// 没人要的消息从头扫一遍。
     /// </para>
     /// <para>
-    /// Java 的更新是 <c>offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)</c>
+    /// 更新走 <c>offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)</c>
     /// （只前进不回退），且有一道闸：<c>0L == processQueue.getMsgCount()</c>。<c>msgCount</c>
     /// 数的是<b>仍在 ProcessQueue 里</b>的消息 —— 并发消费的 <c>removeMessage</c> 要等
     /// listener 返回之后才调（<c>ConsumeMessageConcurrentlyService:266</c>），所以在途批次
@@ -4588,7 +4564,7 @@ public sealed class DefaultMQPushConsumer
     /// <see cref="TakeBatchForConsume"/> 的同一把锁里完成。
     /// </para>
     /// <para>
-    /// 与 Java 的唯一有意偏差是把状态判据也收进了本函数（Java 在回调的 switch 里），这样
+    /// 唯一有意偏差是把状态判据也收进了本函数（经典做法在回调的 switch 里），这样
     /// 离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
     /// </para>
     /// </summary>
@@ -4601,7 +4577,7 @@ public sealed class DefaultMQPushConsumer
 
         if (_frozenOffsets.Contains(key))
         {
-            // 位点已被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset.update 在
+            // 位点已被 OFFSET_ILLEGAL 纠错冻结（ControllableOffset.update 在
             // allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
             return;
         }
@@ -4616,8 +4592,8 @@ public sealed class DefaultMQPushConsumer
             return;
         }
 
-        // Java RemoteBrokerOffsetStore.updateOffset:61-64：表里没有这条记录时
-        // putIfAbsent(mq, new ControllableOffset(offset)) —— 无条件建条目，哪怕 offset == 0。
+        // 表里没有这条记录时 putIfAbsent(mq, new ControllableOffset(offset))
+        // —— 无条件建条目，哪怕 offset == 0。
         // 用 TryGetValue 的默认值 0 会把「没有记录」与「记录是 0」混同：空队列
         // （nextBeginOffset == 0）的首次修正变成静默 no-op，broker 上永远查不到记录。
         if (!_consumeOffsetTable.TryGetValue(key, out long cur) || cur < nextOffset)
@@ -4627,7 +4603,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 拉取应答 OFFSET_ILLEGAL 的锁内动作（Java <c>RemoteBrokerOffsetStore.updateAndFreezeOffset</c>）：
+    /// 拉取应答 OFFSET_ILLEGAL 的锁内动作（<c>updateAndFreezeOffset</c>）：
     /// 位点**无条件**写成本次纠正值并冻结（ControllableOffset.allowToUpdate=false）。照
     /// <see cref="CorrectTagsOffsetLocked"/> 的 increaseOnly 写会让"broker 把位点往回调"这种
     /// 纠正永远生效不了。调用方须持 <c>_lock</c>。
@@ -4648,7 +4624,7 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// Java <c>DefaultMQPushConsumerImpl</c> 的 OFFSET_ILLEGAL 分支（<c>:402-427</c>）。
+    /// OFFSET_ILLEGAL 分支。
     /// <para>
     /// broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置，见
     /// <c>PullMessageProcessor</c> 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET
@@ -4658,7 +4634,7 @@ public sealed class DefaultMQPushConsumer
     /// 位点推回非法值），然后按修正位点把这条队列重建。
     /// </para>
     /// <para>
-    /// Java 的四步：<c>setNextOffset</c> → <c>ProcessQueue.setDropped(true)</c> →
+    /// 四步：<c>setNextOffset</c> → <c>setDropped(true)</c> →
     /// <c>{ updateAndFreezeOffset; persist; removeProcessQueue }</c> → <c>rebalanceImmediately</c>。
     /// 本端口：置位点 + 冻结（在回调的临界区里，等价 updateAndFreezeOffset）→ 撤队列
     /// （<see cref="RetireQueueLocked"/> 清缓冲/线程表并<b>代号 +1</b>，等价 setDropped）→
@@ -4674,8 +4650,8 @@ public sealed class DefaultMQPushConsumer
             RetireQueueLocked(key, mq, retired);
         }
 
-        // persist：把修正后的位点立刻写回 broker（Java 显式的一次 persist，不等周期落盘）；
-        // 顺序消费还要解锁（Java 走 removeProcessQueue → removeUnnecessaryMessageQueue）
+        // persist：把修正后的位点立刻写回 broker（显式一次 persist，不等周期落盘）；
+        // 顺序消费还要解锁（removeProcessQueue → removeUnnecessaryMessageQueue）
         bool broadcast = _messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting;
         if (!broadcast && _mqClient is not null)
         {
@@ -4725,8 +4701,8 @@ public sealed class DefaultMQPushConsumer
     public List<MessageExt> TakeBatchForConsume(string key) => TakeBatchForConsume(key, out _);
 
     /// <summary>见 <see cref="TakeBatchForConsume(string)"/>；<paramref name="epoch"/> 是本批
-    /// 所属 ProcessQueue 的代号，与批次在**同一把锁**里取走（Java 取消息与 isDropped 判定
-    /// 同在 ConsumeRequest.run 的临界区）。</summary>
+    /// 所属队列缓冲的代号，与批次在**同一把锁**里取走（取消息与 isDropped 判定
+    /// 同在消费请求的临界区）。</summary>
     public List<MessageExt> TakeBatchForConsume(string key, out long epoch)
     {
         List<MessageExt> batch = new();
@@ -4805,7 +4781,7 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>在途批次计数（Java <c>ProcessQueue.msgCount</c> 里"listener 手里"那部分），供单测观察登记/注销。</summary>
+    /// <summary>在途批次计数（msgCount 里"listener 手里"那部分），供单测观察登记/注销。</summary>
     public int InFlightForTest(string key)
     {
         lock (_lock)
@@ -4851,9 +4827,8 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 位点持久化 ----------------
     private void OffsetPersistLoop()
     {
-        // Java MQClientInstance.startScheduledTask:417-423：
-        //   scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
-        // ——首个任务延迟 10s，之后周期取 ClientConfig#persistConsumerOffsetInterval（:66，
+        // scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
+        // ——首个任务延迟 10s，之后周期取 persistConsumerOffsetInterval（
         // 默认 5s）。首笔落盘发生在 initialDelay **这一刻**，不是 initialDelay + 一个周期后；
         // 周期是**固定速率**：计划时刻锚定在 initialDelay + n*周期（见 Schedules），
         // 所以不会像"干完再按 100ms 切片睡一个周期"那样把周期越拖越长。
@@ -4913,7 +4888,7 @@ public sealed class DefaultMQPushConsumer
 
     private string LocalOffsetPath()
     {
-        // Java LocalFileOffsetStore：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
+        // 本地位点文件路径：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
         string home = UtilAll.UserHome();
         if (home.Length == 0) home = ".";
         return home + "/.rocketmq_offsets/" + (_clientId.Length == 0 ? "DEFAULT" : _clientId)
@@ -4922,7 +4897,7 @@ public sealed class DefaultMQPushConsumer
 
     /// <param name="extra">
     /// 刚被撤下来、已经不在 <c>_consumeOffsetTable</c>/<c>_mqMap</c> 里的队列位点：
-    /// Java 的 <c>persist(mq)</c> 先写文件、<c>removeOffset(mq)</c> 后摘内存条目，文件里的
+    /// <c>persist(mq)</c> 先写文件、<c>removeOffset(mq)</c> 后摘内存条目，文件里的
     /// 值要留着，重建后的队列才能从它续上（见 <see cref="OnQueuesRevoked"/> 广播分支）。
     /// </param>
     private void SaveLocalOffsets(List<RetiredQueue>? extra = null)
@@ -4962,7 +4937,7 @@ public sealed class DefaultMQPushConsumer
             Directory.CreateDirectory(dir);
         }
 
-        // Java MixAll.string2File：旧内容先滚到 .bak 再写新文件
+        // string2File：旧内容先滚到 .bak 再写新文件
         try
         {
             string prev = File.ReadAllText(path);
@@ -4981,9 +4956,9 @@ public sealed class DefaultMQPushConsumer
         File.Move(tmp, path, true);
     }
 
-    // Java persistAll + fastjson2 的落盘格式（真实 rocketmq-client 5.5.0 jar 实测）：
+    // persistAll 按 fastjson 写出的落盘格式（真实落盘文件实测）：
     // {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
-    // —— MessageQueue 对象直接当 JSON key。没有队列信息的条目跳过（persistAll(mqs) 同款）。
+    // —— MessageQueue 对象直接当 JSON key。没有队列信息的条目跳过（persistAll(mqs) 同样跳过）。
     // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
     public static string BuildLocalOffsetsJson(Dictionary<string, long> items,
         Dictionary<string, MessageQueue> mqMap)
@@ -5018,7 +4993,7 @@ public sealed class DefaultMQPushConsumer
         return LoadLocalOffsetsAt(LocalOffsetPath());
     }
 
-    // 主文件缺失/损坏时回退 .bak（Java readLocalOffset → readLocalOffsetBak）；都失败返回空。
+    // 主文件缺失/损坏时回退 .bak（readLocalOffset → readLocalOffsetBak）；都失败返回空。
     // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
     public static Dictionary<string, long> LoadLocalOffsetsAt(string path)
     {
@@ -5045,8 +5020,8 @@ public sealed class DefaultMQPushConsumer
         return outMap;
     }
 
-    // 先按严格 JSON 解析（旧版本端写过的扁平 map）；Java fastjson2 的「对象作 key」
-    // 格式对严格解析必然失败（含 pretty 版），落进 ScanJavaOffsetEntries。
+    // 先按严格 JSON 解析（旧版本端写过的扁平 map）；fastjson 的「对象作 key」
+    // 格式对严格解析必然失败（含 pretty 版），落进 ScanOffsetEntries。
     // 测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码。
     public static Dictionary<string, long>? ParseLocalOffsetsText(string text)
     {
@@ -5077,10 +5052,10 @@ public sealed class DefaultMQPushConsumer
             }
         }
 
-        return ScanJavaOffsetEntries(trimmed);
+        return ScanOffsetEntries(trimmed);
     }
 
-    private static Dictionary<string, long>? ScanJavaOffsetEntries(string text)
+    private static Dictionary<string, long>? ScanOffsetEntries(string text)
     {
         int pos = 0;
         if (!Eat(text, ref pos, '{'))
@@ -5322,11 +5297,11 @@ public sealed class DefaultMQPushConsumer
             return;
         }
 
-        // Java ConsumeMessageOrderlyService.lockMQ：每 20s 批量锁分到的队列；
+        // 顺序消费 lockMQ：每 20s 批量锁分到的队列；
         // 启动时立刻尝试一次，避免首个 20s 空转
         while (!_stop)
         {
-            // POP 顺序（Java ConsumeMessagePopOrderlyService.start:68-77）同样跑这个 20s
+            // POP 顺序同样跑这个 20s
             // 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
             // 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
             if (!PopMode)
@@ -5363,7 +5338,7 @@ public sealed class DefaultMQPushConsumer
             }
 
             // 等待 20s（期间响应 stop）。整段 wait：100ms 切片在 macOS 上每段实测 131ms，
-            // 200 段会把 Java 的 20s 轮次拖成 26s；Wait 本身被 Set 唤醒，照样立刻收手。
+            // 200 段会把 20s 的轮次拖成 26s；Wait 本身被 Set 唤醒，照样立刻收手。
             _stopEvent.Wait(TimeSpan.FromSeconds(20));
         }
     }
@@ -5379,10 +5354,10 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    /// <summary>topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
+    /// <summary>topic 的全部队列（topicSubscribeInfoTable 口径）。
     /// 取自**订阅信息**（topicRouteData2TopicSubscribeInfo：读位 + readQueueNums、不筛
     /// master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩从节点」
-    /// 两种路由上答案不同，消费侧必须用宽的这一份（Java 的 rebalance 队列集从来就是订阅
+    /// 两种路由上答案不同，消费侧必须用宽的这一份（rebalance 队列集从来就是订阅
     /// 信息，发布信息只服务生产者选队）。</summary>
     private List<MessageQueue> AllQueuesOfTopic(string topic)
     {
@@ -5398,11 +5373,11 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// 按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步拉取线程集。
-    /// ⚠ POP 的队列也来自这条**客户端 rebalance**（每队列一个 POP 循环 + ack）。Java 在
-    /// clientRebalance=false 时走 broker 侧分配（RebalanceImpl#getRebalanceResultFromBroker:345
-    /// → MQClientAPIImpl#queryAssignment:405，QUERY_ASSIGNMENT=400，回 MessageQueueAssignment
-    /// mode=POP）。本端口**刻意不实现那条路径**（与 python / rust / php 端口同一决定）：语义等价，
+    /// 按 rebalanceByTopic 计算分配，再同步拉取线程集。
+    /// ⚠ POP 的队列也来自这条**客户端 rebalance**（每队列一个 POP 循环 + ack）。
+    /// clientRebalance=false 时协议还支持 broker 侧分配（getRebalanceResultFromBroker
+    /// → queryAssignment，QUERY_ASSIGNMENT=400，回 MessageQueueAssignment
+    /// mode=POP）。本端口只做客户端侧、不实现那条路径：语义等价，
     /// 差别只在"谁决定队列集合"。动这里之前请先读这段。
     /// </summary>
     private void DoRebalance()
@@ -5441,7 +5416,7 @@ public sealed class DefaultMQPushConsumer
                 List<string>? cidAll = c.GetConsumerIdListByGroup(topic, ConsumerGroup);
                 if (cidAll is null || cidAll.Count == 0)
                 {
-                    // 查不到消费者列表：保留本 topic 现有分配（Java 仅告警；绝不回退成
+                    // 查不到消费者列表：保留本 topic 现有分配（仅告警；绝不回退成
                     // "独占全部队列"，否则同组多实例会互相重复消费）
                     ClientLog.Debug("rebalance: no consumer id list for " + ConsumerGroup + "/" + topic + ", keep current");
                     assigned.AddRange(AssignedQueues().FindAll(m => m.Topic == topic));
@@ -5449,8 +5424,8 @@ public sealed class DefaultMQPushConsumer
                 }
 
                 cidAll.Sort(StringComparer.Ordinal);
-                // 自定义策略抛异常时：**保持现有分配**并结束本轮 rebalance（Java catch Throwable
-                // → log error → return false；Python 同款 try/except → return）。
+                // 自定义策略抛异常时：**保持现有分配**并结束本轮 rebalance（catch Throwable
+                // → log error → return false）。
                 // 绝不能把该 topic 的队列撤走。
                 IAllocateMessageQueueStrategy strategy = _allocateMessageQueueStrategy
                     ?? throw new MQClientException("allocateMessageQueueStrategy is null");
@@ -5475,7 +5450,7 @@ public sealed class DefaultMQPushConsumer
             _assigned = assigned;
         }
 
-        // 撤销清理（对齐 Java updateProcessQueueTableInRebalance → removeUnnecessaryMessageQueue
+        // 撤销清理（updateProcessQueueTableInRebalance → removeUnnecessaryMessageQueue
         // + removeProcessQueue）：本轮不再分配给本实例的队列，先把已消费位点持久化、丢弃
         // 在途/缓冲消息、解除顺序锁（orderly+clustering），并在 _dropped 打标记让 pull 线程
         // 长轮询返回后丢弃批次并退出。绝不能直接丢弃位点——否则重分配后从 0 重投。
@@ -5487,7 +5462,7 @@ public sealed class DefaultMQPushConsumer
             current[OffsetKey(mq)] = mq;
         }
 
-        // 停摆自愈（Java isPullExpired / PopProcessQueue.isPullExpired）：同一趟里还要撤掉
+        // 停摆自愈（isPullExpired）：同一趟里还要撤掉
         // "仍归本实例、但拉取循环已经停摆"的队列，交给后面的 RebalancePullThreads 原地重建。
         List<RetiredQueue> healed = new();
         lock (_lock)
@@ -5541,8 +5516,8 @@ public sealed class DefaultMQPushConsumer
             OnQueuesRevoked(healed);
         }
 
-        // 新分配的队列**立刻**解析初始位点写入 offset 表（对齐 Java
-        // updateProcessQueueTableInRebalance：新队列 → computePullFromWhereWithException →
+        // 新分配的队列**立刻**解析初始位点写入 offset 表（updateProcessQueueTableInRebalance：
+        // 新队列 → computePullFromWhereWithException →
         // offsetStore.updateOffset）。不能留到首次拉取时惰性解析——CONSUME_FROM_LAST_OFFSET
         // 语义是"分配时刻的最新位点"，惰性解析会跳过分配后新产生的消息（真机表现为收不到）。
         foreach (MessageQueue mq in assigned)
@@ -5603,7 +5578,7 @@ public sealed class DefaultMQPushConsumer
 
         if (_messageModel == RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
         {
-            // 广播模式：offset 只存本地（对齐 Java LocalFileOffsetStore）
+            // 广播模式：offset 只存本地（LocalFileOffsetStore）
             Dictionary<string, long> stored = LoadLocalOffsets();
             if (stored.TryGetValue(OffsetKey(mq), out long v))
             {
@@ -5612,9 +5587,9 @@ public sealed class DefaultMQPushConsumer
 
             if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
             {
-                // Java RebalancePushImpl:197-208：FIRST_OFFSET 且本地没有位点时直接给 0
-                // （广播模式读的是 LocalFileOffsetStore，同一个分支），**不**发 minOffset
-                // 查询 —— minOffset 属 MQAdminImpl 口径（只认 master），主掉线期间会让
+                // FIRST_OFFSET 且本地没有位点时直接给 0
+                // （广播模式读的是本地位点表，同一个分支），**不**发 minOffset
+                // 查询 —— minOffset 属管理端口径（只认 master），主掉线期间会让
                 // 新起的消费者一条都拉不到；起点越界时由 broker 的 PULL_OFFSET_MOVED 纠正。
                 return 0;
             }
@@ -5622,7 +5597,7 @@ public sealed class DefaultMQPushConsumer
             return c.GetMaxOffset(mq);
         }
 
-        // 集群模式：先查 broker 上已提交的位点（对齐 Java RemoteBrokerOffsetStore.readOffset）
+        // 集群模式：先查 broker 上已提交的位点（RemoteBrokerOffsetStore.readOffset）
         try
         {
             if (c.QueryConsumerOffset(ConsumerGroup, mq, out long stored, 5000, null,
@@ -5640,7 +5615,7 @@ public sealed class DefaultMQPushConsumer
         {
             if (_consumeFromWhere == RocketMQ.Remoting.Protocol.ConsumeFromWhere.ConsumeFromFirstOffset)
             {
-                // 同上（Java 的本地文件与 broker 两条路径是同一个分支）：起点是字面量 0。
+                // 同上（本地文件与 broker 两条路径是同一个分支）：起点是字面量 0。
                 return 0;
             }
 
@@ -5670,7 +5645,7 @@ public sealed class DefaultMQPushConsumer
         List<string> addrs;
         try
         {
-            // 每台都发（主 + 从）：Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历
+            // 每台都发（主 + 从）：sendHeartbeatToAllBroker 遍历
             // brokerAddrTable 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID` 才跳过；
             // 消费者心跳必带 ConsumerData，故从节点不跳。broker 的 ConsumerManager 每台各自一份，
             // 从节点收不到心跳就会对指向自己的拉取回 SUBSCRIPTION_NOT_EXIST
@@ -5697,9 +5672,9 @@ public sealed class DefaultMQPushConsumer
             ConsumeType = ConsumeType.ConsumePassively,
             MessageModel = _messageModel,
             ConsumeFromWhere = _consumeFromWhere,
-            // Java MQClientInstance:1039：consumerData.setUnitMode(impl.isUnitMode())。
+            // consumerData.setUnitMode(impl.isUnitMode())。
             // broker 读到它会给 %RETRY%group 打上 UNIT_SUB(0x2) 系统标记
-            // （ClientManageProcessor:113-118）。
+            // （ClientManageProcessor）。
             UnitMode = _unitMode,
         };
         lock (_lock)
@@ -5754,8 +5729,8 @@ public sealed class DefaultMQPushConsumer
     // ---------------- 管理 ----------------
     public List<MessageQueue> FetchSubscribeMessageQueues(string topic)
     {
-        // Java DefaultMQPushConsumerImpl.fetchSubscribeMessageQueues:198 读的是
-        // rebalanceImpl 的订阅信息链（读位、不筛 master），与 rebalance 共用同一份口径，
+        // fetchSubscribeMessageQueues 读的是
+        // rebalance 的订阅信息链（读位、不筛 master），与 rebalance 共用同一份口径，
         // 不是发布信息。
         return Client().GetTopicSubscribeInfo(topic);
     }
@@ -5773,7 +5748,7 @@ public sealed class DefaultMQPushConsumer
         return outList;
     }
 
-    /// <summary>查消费组在某 topic 上的全部 clientId（对应 Java findConsumerIdList），
+    /// <summary>查消费组在某 topic 上的全部 clientId（findConsumerIdList），
     /// 用于验证多实例注册。查不到/未启动返回空，不抛。</summary>
     public List<string> ConsumerIdListOfGroup(string topic)
     {
@@ -5792,12 +5767,12 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    // 消息重投（对应 Java sendMessageBack）：失败抛 MQBrokerException，成功返回 true
+    // 消息重投（sendMessageBack）：失败抛 MQBrokerException，成功返回 true
     public bool SendMessageBack(MessageExt msg, int delayLevel, string? brokerNameIn = null)
     {
         MQClientInstance c = Client();
         string brokerName = string.IsNullOrEmpty(brokerNameIn) ? msg.BrokerName : brokerNameIn!;
-        // Java DefaultMQPushConsumerImpl:768 用的是 findBrokerAddressInPublish（只认 master，
+        // 用 findBrokerAddressInPublish（只认 master，
         // 不刷路由），拿不到就报「Broker[X] master node does not exist」；
         // 从节点不接 CONSUMER_SEND_MSG_BACK。
         string addr = c.FindBrokerAddressInPublish(brokerName);
@@ -5813,13 +5788,13 @@ public sealed class DefaultMQPushConsumer
             DelayLevel = delayLevel,
             OriginMsgId = msg.MsgId,
             OriginTopic = msg.Topic,
-            // ⚠ 有意超出 Java：MQClientAPIImpl#consumerSendMessageBack(:1684-1693) 只填
+            // ⚠ 有意超出协议要求：consumerSendMessageBack 协议上只填
             // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName，
             // 从不写 unitMode，字段恒为 false。broker 侧确实读它
             // （AbstractSendMessageProcessor:135-138 → buildSysFlag(false, true)），所以这里
             // 按消费者配置如实上报，单元化重试 topic 才会带上 UNIT_SUB 标记。
             UnitMode = _unitMode,
-            // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
+            // maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
             MaxReconsumeTimes = MaxReconsumeTimesOrDefault(),
         };
         c.InvokeSync(addr, RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);

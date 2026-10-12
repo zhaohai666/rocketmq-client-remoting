@@ -114,7 +114,7 @@ public class ConsumeAckIndexTests
     }
 
     [Fact]
-    public void ContextDefaultsLikeJava()
+    public void ContextDefaultsLikeLegacy()
     {
         // Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE（= 整批认可）。
         // 默认值写成 -1 会让每次 CONSUME_SUCCESS 都整批回投 —— 消息无限重复。
@@ -227,7 +227,7 @@ public class ConsumeAckIndexTests
     }
 
     [Fact]
-    public void HookStatusIsTheJavaEnumName()
+    public void HookStatusIsTheLegacyEnumName()
     {
         // Java 写进 ConsumeMessageContext.status 的是 status.toString()
         //（ConsumeMessageConcurrentlyService:408），默认实现就是**裸成员名**：

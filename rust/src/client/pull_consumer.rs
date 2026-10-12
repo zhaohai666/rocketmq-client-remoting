@@ -4240,7 +4240,7 @@ mod tests {
     /// `consumeFromWhere()` 恒 `CONSUME_FROM_LAST_OFFSET`（:353），订阅集来自
     /// `subscriptions():357-385` 的 registerTopics，每条 **subVersion 显式置 0**。
     #[test]
-    fn pull_heartbeat_matches_the_java_shape() {
+    fn pull_heartbeat_matches_the_wire_shape() {
         let c = DefaultMQPullConsumer::new("PG_PullHb").unwrap();
         c.update_config(|cfg| cfg.client_id = Some("cid-1".to_string()));
         c.register_topic("T2");
@@ -4278,7 +4278,7 @@ mod tests {
     /// start() 的同步一轮必须**主从各一份**：broker 的 ConsumerManager 是每台各自一份
     /// 状态，从节点收不到心跳就会对指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`。
     #[tokio::test]
-    async fn pull_start_heartbeats_master_and_slave_with_the_java_shape() {
+    async fn pull_start_heartbeats_master_and_slave_with_the_wire_shape() {
         let cluster = FakePullCluster::start().await;
         let c = started_pull("pull_hb_start", "PG_PullHbStart", &cluster, "T").await;
 
@@ -4834,7 +4834,7 @@ mod tests {
 
         // 分配前 cidAll 必排序（Java `Collections.sort(cidAll)`）；真实 broker 的返回顺序
         // 不定，用例先把两个 clientId 排好再登记，两边看到的才是同一份列表。
-        let mut ids = vec![a.client_id(), b.client_id()];
+        let mut ids = [a.client_id(), b.client_id()];
         ids.sort();
         cluster.set_cid_list(
             &ids.iter()
@@ -4948,13 +4948,16 @@ mod tests {
     // 入参守卫、注册即快照（只在 RUNNING）、集合相等才判"没变"、重复注册覆盖、
     // 后台循环真的在比对。
 
+    /// 监听器收到的变更事件：`(topic, 排序后的队列 id 列表)`。
+    type QueueEvents = Arc<Mutex<Vec<(String, Vec<i32>)>>>;
+
     /// 收集 `on_changed` 的监听器（队列 id 排序后存下来，比对与顺序无关）。
     struct RecordingQueueListener {
-        events: Arc<Mutex<Vec<(String, Vec<i32>)>>>,
+        events: QueueEvents,
     }
 
     impl RecordingQueueListener {
-        fn new() -> (Arc<Self>, Arc<Mutex<Vec<(String, Vec<i32>)>>>) {
+        fn new() -> (Arc<Self>, QueueEvents) {
             let events = Arc::new(Mutex::new(Vec::new()));
             (
                 Arc::new(RecordingQueueListener {
@@ -4989,18 +4992,8 @@ mod tests {
         c
     }
 
-    /// 强制刷一次路由：`get_topic_subscribe_info` 读的是缓存，改完假 namesrv 的
-    /// 队列数必须刷一次才看得到。
-    async fn refresh_route(c: &DefaultLitePullConsumer, topic: &str) {
-        let client = DefaultLitePullConsumer::require_client(&c.inner).expect("已启动");
-        client
-            .update_topic_route_info_from_name_server(topic, 3000, false)
-            .await
-            .expect("路由刷新应当成功");
-    }
-
     #[test]
-    fn same_queue_set_matches_java_is_set_equal() {
+    fn same_queue_set_matches_by_set_equality() {
         let q = |id: i32| queue("T", "broker-a", id);
         assert!(!same_queue_set(&[], &[q(0)]), "数量不等即变化");
         assert!(same_queue_set(&[q(0), q(1)], &[q(1), q(0)]), "集合与顺序无关");

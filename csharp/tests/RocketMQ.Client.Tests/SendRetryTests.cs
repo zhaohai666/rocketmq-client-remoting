@@ -40,7 +40,7 @@ public class SendRetryTests
 
     /// <summary>默认集合与 Java DefaultMQProducer#retryResponseCodes 逐项一致（8 个码）。</summary>
     [Fact]
-    public void DefaultRetryResponseCodes_MatchJava()
+    public void DefaultRetryResponseCodes_MatchLegacy()
     {
         var producer = new DefaultMQProducer("GID_RetryCodes");
         Assert.Equal(8, producer.RetryResponseCodes.Count);
@@ -188,7 +188,7 @@ public class SendRetryTests
     /// （request-reply 超时、造应答消息失败），以前表里缺这两个，站点只能拿默认码 1 抛出去。
     /// </summary>
     [Fact]
-    public void ClientErrorCodeTable_MatchesJava()
+    public void ClientErrorCodeTable_MatchesLegacy()
     {
         var expected = new Dictionary<string, int>
         {
@@ -434,7 +434,7 @@ public class SendRetryTests
     /// 所以两个都取证：只对码不对 <c>m</c>，批量 body 会被按单条解析。
     /// </summary>
     [Fact]
-    public void SendRequestCodeFollowsJava()
+    public void SendRequestCodeFollowsLegacy()
     {
         using var cluster = MockCluster.Start(1);
         DefaultMQProducer producer = Started(cluster, "GID_SendCodeBranch");

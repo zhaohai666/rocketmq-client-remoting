@@ -58,7 +58,7 @@ public:
     }
     bool operator!=(const QueueData& o) const { return !(*this == o); }
 
-    // Java compareTo：仅按 brokerName
+    // compareTo 协议语义：仅按 brokerName
     int compareTo(const QueueData& o) const {
         if (brokerName == o.brokerName) return 0;
         return brokerName < o.brokerName ? -1 : 1;
@@ -104,13 +104,13 @@ public:
     JsonValue toJson() const;
     static BrokerData fromJson(const JsonValue& v);
 
-    // Java equals：cluster / brokerName / brokerAddrs
+    // equals 协议语义：cluster / brokerName / brokerAddrs
     bool operator==(const BrokerData& o) const {
         return cluster == o.cluster && brokerName == o.brokerName && brokerAddrs == o.brokerAddrs;
     }
     bool operator!=(const BrokerData& o) const { return !(*this == o); }
 
-    // Java compareTo：仅按 brokerName
+    // compareTo 协议语义：仅按 brokerName
     int compareTo(const BrokerData& o) const {
         if (brokerName == o.brokerName) return 0;
         return brokerName < o.brokerName ? -1 : 1;
@@ -154,17 +154,16 @@ public:
     // topic 会回填进每个 MessageQueue，否则后续按 mq.topic 回查路由会查不到。
     std::vector<MessageQueue> getAllMessageQueue(const std::string& topic) const;
 
-    // 按 queueDatas 组装全部**可读** MessageQueue（对应 Java
-    // MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332）。
+    // 按 queueDatas 组装全部**可读** MessageQueue。
     // 只看读位与 readQueueNums，**不查 brokerDatas、也不要求 broker 有 master** ——
     // 消费侧（rebalance / fetchSubscribeMessageQueues）必须用这一份，不能拿发布信息代替：
-    // ①perm=4 的只读 topic 在 Java 里可消费，发布信息里却是空表；
-    // ②master 掉线只剩从节点时 Java 的 rebalance 队列集不变（拉取可以走从节点）。
+    // ①perm=4 的只读 topic 可消费，但发布信息里却是空表；
+    // ②master 掉线只剩从节点时可消费的队列集不变（拉取可以走从节点）。
     std::vector<MessageQueue> getAllSubscribeMessageQueue(const std::string& topic) const;
 
     TopicRouteData cloneTopicRouteData() const { return *this; }
 
-    // 路由是否变化：先按 compareTo 排序再比较（与 Java topicRouteDataChanged 一致）
+    // 路由是否变化：先按 compareTo 排序再比较
     bool topicRouteDataChanged(const TopicRouteData* oldData) const;
 
     JsonValue toJson() const;

@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn charset_matches_java_whitelist() {
+    fn charset_matches_server_whitelist() {
         for legal in [
             "order-topic",
             "order_topic",
@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn system_and_forbidden_sets_match_java() {
+    fn system_and_forbidden_sets_match_server() {
         assert_eq!(system_topic_set().len(), 12);
         assert_eq!(not_allowed_send_topic_set().len(), 8);
         for t in [

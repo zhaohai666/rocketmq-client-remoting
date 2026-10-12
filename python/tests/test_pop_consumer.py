@@ -88,7 +88,7 @@ class TestDefaults:
         """关掉时必须完全走原来的 pull 路径，行为与改动前一致。"""
         assert DefaultMQPushConsumer(GROUP).pop_mode is False
 
-    def test_pop_defaults_match_java(self):
+    def test_pop_defaults_match_the_protocol_defaults(self):
         c = DefaultMQPushConsumer(GROUP)
         # Java popInvisibleTime=60000 / popBatchNums=32 / popThresholdForQueue=96
         assert c.pop_invisible_time == 60000
@@ -124,7 +124,7 @@ class TestPopProcessQueue:
         pq.ack()
         assert pq.wait_ack_count() == 1
 
-    def test_dec_found_msg_takes_negative_like_java(self):
+    def test_dec_found_msg_takes_a_negative_invisible_time(self):
         """Java 是 decFoundMsg(-msgs.size())，这里按"减多少"理解。"""
         pq = PopProcessQueue()
         pq.inc_found_msg(5)

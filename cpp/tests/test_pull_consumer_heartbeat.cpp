@@ -324,7 +324,7 @@ bool waitFor(Fn fn, int timeoutMs = 5000) {
 
 // Java start():746 注册 + 实例周期任务首个 1s 内发心跳；本端口 start() 里同步发一轮。
 // 判据：broker 真的收到 HEART_BEAT，且 ConsumerData 的四项口径与 Java 一致。
-void testStartAnnouncesTheGroupWithTheJavaShape() {
+void testStartAnnouncesTheGroupWithTheWireShape() {
     MockEndpoint namesrv;
     MockEndpoint broker;
     namesrv.addRoute(kTopic, routeOne(kBroker, MixAll::MASTER_ID, broker.address()));
@@ -518,7 +518,7 @@ void testLitePullHeartbeatIsActivelyTyped() {
 }  // namespace
 
 int main() {
-    testStartAnnouncesTheGroupWithTheJavaShape();
+    testStartAnnouncesTheGroupWithTheWireShape();
     testHeartbeatFansOutToEveryBrokerId();
     testHeartbeatStillAnnouncesTheGroupWithoutRegisterTopics();
     testHeartbeatLoopRepeats();

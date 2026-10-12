@@ -1,24 +1,18 @@
 // DefaultLitePullConsumer topic queue-change listener — offline wire test.
 //
-// Baseline (Java 5.5.1 client, read line by line against
-// DefaultLitePullConsumerImpl / DefaultLitePullConsumer, same judgements as
-// cpp's test_lite_pull_topic_queue_change, python/tests/
-// test_lite_topic_queue_change.py, go/client/lite_topic_queue_change_test.go
-// and rust's pull_consumer tests):
-//   * Impl:1267-1279 register → null topic/listener throws
-//     "Topic or listener is null"; a duplicate registration WARNS and
-//     OVERWRITES; only a RUNNING consumer snapshots the current queue set
-//     (otherwise the first compare reports the set that was already there).
-//   * Impl:1230-1244 compare → onChanged fires ONLY on a real set change, and a
-//     failed route query for one topic must not abort the other topics.
-//   * Impl:1246-1260 isSetEqual → "no snapshot" is never equal, so a listener
-//     registered before start() fires once on the first round.
-//   * Impl:382-393 + DefaultLitePullConsumer:160 → 10s first delay, then every
-//     topicMetadataCheckIntervalMillis (default 30000).
-//   ⚠ This port keys the listener map by the BARE topic (like its subscribe /
-//     route / rebalance state) because namespaceV2 is applied on the wire by
-//     NamespaceRpcHook, not by prefixing topic names — Java keys by the
-//     namespaced topic. Test 6 pins the resulting behaviour.
+// 行为基线：
+//   * 注册：topic/listener 为 null 抛 "Topic or listener is null"；重复注册
+//     会告警并覆盖旧监听器；只有 RUNNING 状态的消费者会快照当前队列集合
+//     （否则第一轮比较会把本来就存在的集合当成变化）。
+//   * 比较：onChanged 只在集合真实变化时触发；单个 topic 的路由查询失败
+//     不得中断其他 topic 的检查。
+//   * "没有快照" 永远不算相等，所以 start() 之前注册的监听器会在第一轮
+//     触发一次。
+//   * 调度：首轮延迟 10s，之后每 topicMetadataCheckIntervalMillis
+//     （默认 30000ms）一次。
+//   ⚠ 监听器 map 以裸 topic 名为键（与 subscribe / route / rebalance 状态的
+//     键法一致）：namespaceV2 是在 wire 上靠 NamespaceRpcHook 的 nsd/ns 头
+//     生效的，不改写 topic 名。测试 6 钉住由此产生的行为。
 //
 // Run: node --experimental-strip-types test/lite_topic_queue_change_smoke.ts
 import net from 'node:net';
@@ -149,17 +143,17 @@ async function main() {
     let msg = '';
     try { await c.registerTopicMessageQueueChangeListener('', new Recorder()); }
     catch (e) { msg = (e as Error).message; }
-    check('an empty topic is rejected like Java', msg.includes('Topic or listener is null'), msg);
+    check('an empty topic is rejected with the pinned error', msg.includes('Topic or listener is null'), msg);
 
     msg = '';
     try { await c.registerTopicMessageQueueChangeListener('T', null); }
     catch (e) { msg = (e as Error).message; }
-    check('a missing listener is rejected like Java', msg.includes('Topic or listener is null'), msg);
+    check('a missing listener is rejected with the pinned error', msg.includes('Topic or listener is null'), msg);
 
-    check('interval defaults to Java 30s', c.getTopicMetadataCheckIntervalMillis() === 30000,
+    check('topic metadata check interval defaults to 30s', c.getTopicMetadataCheckIntervalMillis() === 30000,
       String(c.getTopicMetadataCheckIntervalMillis()));
     c.setTopicMetadataCheckIntervalMillis(0);
-    check('a 0 interval is floored to 1s (0 makes Java throw)',
+    check('a 0 interval is floored to 1s',
       c.getTopicMetadataCheckIntervalMillis() === 1000);
     c.setTopicMetadataCheckIntervalMillis(NaN);
     check('a non-numeric interval is floored too',
@@ -329,7 +323,7 @@ async function main() {
     check('start() arms the scheduled check', (c as any)._metadataTimer != null);
 
     cluster.scale(TOPIC, 3);
-    // Java's period is fixed at start(); drive a short one the same way.
+    // 检查周期在 start() 时固定；这里同样方式驱动一个短周期。
     clearInterval((c as any)._metadataTimer);
     clearTimeout((c as any)._metadataInitialTimer);
     (c as any)._metadataTimer = null;

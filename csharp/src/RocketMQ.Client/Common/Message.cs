@@ -32,10 +32,10 @@ public class MessageQueue : IComparable<MessageQueue>
     // 与 Java 对齐：((31 + brokerHash) * 31 + queueId) * 31 + topicHash，按 32 位有符号回绕。
     public int HashCode()
     {
-        long brokerHash = JavaHash.JavaStringHash(BrokerName);
-        long topicHash = JavaHash.JavaStringHash(Topic);
+        long brokerHash = LegacyHash.StringHash(BrokerName);
+        long topicHash = LegacyHash.StringHash(Topic);
         long v = ((31 + brokerHash) * 31 + QueueId) * 31 + topicHash;
-        return JavaNumber.ToInt32(v);
+        return LegacyNumber.ToInt32(v);
     }
 
     public int CompareTo(MessageQueue? other)

@@ -9,8 +9,8 @@ import { LanguageCode, SerializeType } from './codes.ts';
 import { RemotingSerializable, RocketMQSerializable } from './serialize.ts';
 
 const SERIALIZE_TYPE_ENV = 'ROCKETMQ_SERIALIZE_TYPE';
-// Java MQVersion.CURRENT_VERSION ordinal for 5.5.1. Must be > 28 (V3_0_7_SNAPSHOT)
-// so the broker will callback for 307/resetOffset. Sending 0 downgrades us.
+// 5.5.1 对应的协议版本号序数。必须 > 28（V3_0_7_SNAPSHOT），broker 才会回调
+// 307/resetOffset；发送 0 会导致降级。
 export const CURRENT_VERSION = 515;
 
 const RPC_TYPE = 0;

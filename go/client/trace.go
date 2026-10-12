@@ -11,7 +11,7 @@
 //     (trailing separators included) — Java String.split drops trailing empty
 //     strings, which is exactly what makes the trailing separator harmless.
 //   - The decoder must therefore use Java's split rule, not Go's
-//     strings.Split: Go keeps the trailing empty part. javaSplit below is the
+//     strings.Split: Go keeps the trailing empty part. splitWithoutTrailingEmpty below is the
 //     one and only entry point for that.
 package client
 
@@ -242,7 +242,7 @@ func DecodeTraceDataString(traceData string) []*TraceContext {
 		return nil
 	}
 	var out []*TraceContext
-	for _, record := range javaSplit(traceData, TraceFieldSplitor) {
+	for _, record := range splitWithoutTrailingEmpty(traceData, TraceFieldSplitor) {
 		if record == "" {
 			continue
 		}
@@ -257,7 +257,7 @@ func DecodeTraceDataString(traceData string) []*TraceContext {
 // decodeTraceContext decodes one FIELD_SPLITOR-delimited record; nil means
 // "unrecognised or malformed, skip it".
 func decodeTraceContext(record string) *TraceContext {
-	line := javaSplit(record, TraceContentSplitor)
+	line := splitWithoutTrailingEmpty(record, TraceContentSplitor)
 	if len(line) == 0 {
 		return nil
 	}

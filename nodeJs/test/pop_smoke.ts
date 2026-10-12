@@ -153,7 +153,7 @@ import { MixAll } from '../src/common/mixAll.ts';
   assert.strictEqual(popDelayLevelSeconds(3), 120);
   assert.strictEqual(popDelayLevelSeconds(-5), 10);              // clamped
   assert.strictEqual(popDelayLevelSeconds(99), 7200);            // clamped to last
-  assert.strictEqual(popDelayLevelForElapsed(0), -1);            // below 10s: Java AIOOBE, caller clamps
+  assert.strictEqual(popDelayLevelForElapsed(0), -1);            // 不足 10s：无更低档位，返回 -1 由调用方钳制
   assert.strictEqual(popDelayLevelForElapsed(9_999), -1);
   assert.strictEqual(popDelayLevelForElapsed(10_000), 1);        // notch 0 elapsed -> wait notch 1
   assert.strictEqual(popDelayLevelForElapsed(120_000), 4);       // notch 3 (120s) elapsed -> wait notch 4

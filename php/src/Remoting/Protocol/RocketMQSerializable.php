@@ -5,17 +5,16 @@ declare(strict_types=1);
 namespace RocketMQ\Remoting\Protocol;
 
 /**
- * RocketMQ 4.x 私有二进制协议（对应 org.apache.rocketmq.remoting.protocol.RocketMQSerializable，
- * 移植自 protocol/serialize.py 的 RocketMQSerializable）。
+ * ROCKETMQ 紧凑二进制命令头（header 序列化类型 1，与 JSON 头二选一）。
  *
  * 格式：code(2) + language(1) + version(2) + opaque(4) + flag(4)
  *       + remark(int+utf8) + extFields(int + key(short+utf8) / value(int+utf8))。
- * 端序一律大端；**字节级必须与 Python/Java 一致**。
+ * 端序一律大端；**字节级必须与 broker 侧解析器逐字节对齐**，差一个字节对端就报解析失败。
  */
 final class RocketMQSerializable
 {
     /**
-     * 带 4 字节大端长度前缀的十进制 long 写出（对应 Java RocketMQSerializable.writeDecimalLong）。
+     * 带 4 字节大端长度前缀的十进制数字写出：先占位写长度，再回填真实字节数。
      */
     public static function writeDecimalLong(string &$buf, int $value): void
     {
@@ -58,7 +57,7 @@ final class RocketMQSerializable
     }
 
     /**
-     * 读一个带长度前缀的 UTF-8 字符串；长度 0 → null（对应 Python read_str）。
+     * 读一个带长度前缀的 UTF-8 字符串；长度 0 → null。
      *
      * @return array{0: ?string, 1: int} [value, newOffset]
      */
@@ -103,7 +102,7 @@ final class RocketMQSerializable
     }
 
     /**
-     * 编码命令头（对应 Python rocket_mq_protocol_encode）。
+     * 编码命令头。
      * 顺序：code(2) language(1) version(2) opaque(4) flag(4) remark(int+utf8) extFields(int + map)。
      */
     public static function rocketMqProtocolEncode(RemotingCommand $cmd): string
@@ -153,14 +152,14 @@ final class RocketMQSerializable
     }
 
     /**
-     * 解码 ROCKETMQ 二进制命令头（对应 Python rocket_mq_protocol_decode）。
+     * 解码 ROCKETMQ 二进制命令头（字段顺序与编码一致）。
      *
      * @return array{code: int, language: int, version: int, opaque: int, flag: int, remark: ?string, extFields: ?array<string, string>}
      */
     public static function rocketMqProtocolDecode(string $headerBytes): array
     {
         $offset = 0;
-        // ">h" 是有符号 short；这里按无符号读再截 16 位，与 Python 的 code & 0xFFFF 一致
+        // ">h" 是有符号 short；这里按无符号读再截 16 位，保证 code 恒为 0..65535
         $code = unpack('n', substr($headerBytes, $offset, 2))[1];
         $offset += 2;
         $language = ord($headerBytes[$offset]);
@@ -189,7 +188,7 @@ final class RocketMQSerializable
         ];
     }
 
-    /** 4 字节大端 → 有符号 int（对应 Python struct ">i" 的语义）。 */
+    /** 4 字节大端 → 有符号 int：超过 0x7FFFFFFF 折回负数。 */
     public static function unpackSignedInt(string $bytes): int
     {
         $v = unpack('N', $bytes)[1];

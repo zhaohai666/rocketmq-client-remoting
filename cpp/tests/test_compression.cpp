@@ -49,13 +49,13 @@ const char* kZlibHex =
 
 // 同一段 1120B 明文，由 **Java lz4-java 1.10.3 的 LZ4FrameOutputStream**（即
 // Lz4Compressor 用的那个类）产出，58B。帧头 04 22 4d 18 = LZ4 Frame magic。
-const char* kLz4JavaHex =
+const char* kLz4ExternalHex =
     "04224d186070732b000000ff0d726f636b65746d712d636f6d707265737365642d7061796c6f61642d1c"
     "00ffffffff30506c6f61642d00000000";
 
 // 同一段明文，由 **Java zstd-jni 1.5.2-2 的 ZstdOutputStream(out, 5)**（即
 // ZstdCompressor 用的那个类）产出，48B。帧头 28 b5 2f fd = zstd magic。
-const char* kZstdJavaHex =
+const char* kZstdExternalHex =
     "28b52ffd0058240100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1"
     "ff7402010000";
 
@@ -213,7 +213,7 @@ static void testLz4RoundTrip() {
           "lz4 round-trip via raw type bit 1");
 
     // 外部真值：Java lz4-java 产的 58B 帧必须能解成同一段明文
-    Bytes external = UtilAll::string2Bytes(kLz4JavaHex);
+    Bytes external = UtilAll::string2Bytes(kLz4ExternalHex);
     CHECK(external.size() == 58, "external (Java lz4-java) lz4 frame fixture length == 58");
     CHECK(CompressorFactory::decompress(external, CompressionType::LZ4) == payload,
           "decompress external (Java-produced) lz4 frame");
@@ -246,7 +246,7 @@ static void testZstdRoundTrip() {
 
     // 外部真值 1：Java zstd-jni（流式写，帧头**不带** content size）产的 48B 帧。
     // 这条覆盖的是"未知长度"分支——解码必须靠指数扩容而不是预先按声明长度开缓冲。
-    Bytes external = UtilAll::string2Bytes(kZstdJavaHex);
+    Bytes external = UtilAll::string2Bytes(kZstdExternalHex);
     CHECK(external.size() == 48, "external (Java zstd-jni) zstd frame fixture length == 48");
     CHECK(CompressorFactory::decompress(external, CompressionType::ZSTD) == payload,
           "decompress external (Java-produced) zstd frame with unknown content size");

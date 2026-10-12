@@ -15,7 +15,7 @@ from client.producer import LocalTransactionState
 from client.send_result import SendResult, SendStatus
 from client.trace import (LOCAL_ADDRESS, AccessChannel, TraceBean, TraceConstants,
                                    TraceContext, TraceDataEncoder, TraceTransferBean,
-                                   TraceType, java_split)
+                                   TraceType, split_dropping_trailing_empty)
 from client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
 from client.trace_hook import ConsumeMessageTraceHook, SendMessageTraceHook
 from common.message import MessageExt, MessageQueue
@@ -70,7 +70,7 @@ def _bean(msg_id=MSG_ID_1, keys="KeyA KeyB", retry_times=2):
 
 
 # ---------------- 编码：与 Java 逐字节一致 ----------------
-def test_encode_pub_matches_java_vector():
+def test_encode_pub_matches_the_wire_vector():
     ctx = TraceContext()
     ctx.trace_type = TraceType.PUB
     ctx.time_stamp = 1700000000000
@@ -85,7 +85,7 @@ def test_encode_pub_matches_java_vector():
     assert tb.trans_key == {MSG_ID_1, "KeyA", "KeyB"}
 
 
-def test_encode_sub_before_matches_java_vector():
+def test_encode_sub_before_matches_the_wire_vector():
     ctx = TraceContext()
     ctx.trace_type = TraceType.SUB_BEFORE
     ctx.time_stamp = 1700000000000
@@ -98,7 +98,7 @@ def test_encode_sub_before_matches_java_vector():
     assert tb.trans_key == {MSG_ID_1, MSG_ID_2, "KeyA", "KeyB", "KeyC"}
 
 
-def test_encode_sub_after_matches_java_vector():
+def test_encode_sub_after_matches_the_wire_vector():
     ctx = TraceContext()
     ctx.trace_type = TraceType.SUB_AFTER
     ctx.time_stamp = 1700000000000
@@ -129,7 +129,7 @@ def test_encode_sub_after_cloud_drops_timestamp_and_group():
                               "KeyA KeyB", "2"]) + STX)
 
 
-def test_encode_end_transaction_and_recall_match_java_vectors():
+def test_encode_end_transaction_and_recall_match_the_wire_vectors():
     end_tx = TraceContext()
     end_tx.trace_type = TraceType.END_TRANSACTION
     end_tx.time_stamp = 1700000000000
@@ -153,11 +153,11 @@ def test_encode_null_returns_none():
 
 
 # ---------------- 解码：Java split 语义 + 字段还原 ----------------
-def test_java_split_drops_trailing_empty_like_java():
-    assert java_split("a" + STX, STX) == ["a"]
-    assert java_split(STX, STX) == []
-    assert java_split("a" + STX + "b" + STX, STX) == ["a", "b"]
-    assert java_split("a" + SOH + SOH + "b", SOH) == ["a", "", "b"]
+def test_trace_split_drops_trailing_empty():
+    assert split_dropping_trailing_empty("a" + STX, STX) == ["a"]
+    assert split_dropping_trailing_empty(STX, STX) == []
+    assert split_dropping_trailing_empty("a" + STX + "b" + STX, STX) == ["a", "b"]
+    assert split_dropping_trailing_empty("a" + SOH + SOH + "b", SOH) == ["a", "", "b"]
     # Python 原生 split 会保留末尾空串 —— 这正是不能直接用的原因
     assert "a" + STX.split()[0] is not None
     assert ("a" + STX).split(STX) == ["a", ""]
@@ -258,7 +258,7 @@ def test_decode_end_transaction_fields():
 
 
 # ---------------- 常量 ----------------
-def test_constants_match_java():
+def test_constants_match_the_trace_wire_format():
     assert TraceConstants.CONTENT_SPLITOR == "\u0001"
     assert TraceConstants.FIELD_SPLITOR == "\u0002"
     assert TraceConstants.GROUP_NAME_PREFIX == "_INNER_TRACE_PRODUCER"

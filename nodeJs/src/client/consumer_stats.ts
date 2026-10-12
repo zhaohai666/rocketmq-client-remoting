@@ -1,40 +1,36 @@
 // -*- coding: utf-8 -*-
-// Consumer-side statistics (org.apache.rocketmq.client.stat.ConsumerStatsManager
-// and org.apache.rocketmq.common.stats.{StatsItem, StatsItemSet, StatsSnapshot}).
-// Faithful port of python/client/consumer_stats.py, which was verified
-// against the Java 5.5.1 sources line by line.
+// 消费端统计（ConsumerStatsManager + StatsItem/StatsItemSet/StatsSnapshot）。
 //
-// The REAL Java model (NOT "one bucket per minute" as the name suggests):
+// 真实的模型（**不是**"每分钟一个桶"这个名字暗示的样子）：
 //
-// * A StatsItem holds CUMULATIVE value/times (only ever increase), plus TWO
-//   sampling snapshot chains: `csListMinute` (a cumulative point every 10s)
-//   and `csListHour` (a cumulative point every 10 minutes);
-// * Snapshot computation is Java StatsItem.computeStatsData:
-//       sum       = last.value - first.value          (window delta)
-//       tps       = sum * 1000.0 / (last.ts - first.ts)  (per SECOND)
+// * 一个 StatsItem 里维护**累计**的 value/times（只增不减），并挂两条采样快照链：
+//   `csListMinute`（每 10s 落一个累计点）和 `csListHour`（每 10 分钟落一个累计点）；
+// * 快照计算走 computeStatsData：
+//       sum       = last.value - first.value          (窗口差)
+//       tps       = sum * 1000.0 / (last.ts - first.ts)  (每秒)
 //       timesDiff = last.times - first.times
-//       avgpt     = timesDiff > 0 ? sum / timesDiff : 0  ("avg per time" —
-//                   for RT items this IS the average latency in ms)
-// * TPS-style counters use addValue(key, msgs, 1): value accumulates MESSAGE
-//   counts, times accumulates CALL counts → tps = calls (or msgs) per second;
-// * RT-style counters use addRTValue(key, rt, 1): value accumulates elapsed
-//   ms, times accumulates calls → avgpt = average latency;
-// * consumeStatus(group, topic) reads MINUTE snapshots for everything EXCEPT
-//   consumeFailedMsgs, which takes the failed set's HOUR-window sum (Java
-//   deliberately crosses windows — replicate, don't "fix").
+//       avgpt     = timesDiff > 0 ? sum / timesDiff : 0  ("平均每次") —— RT 类
+//                   指标上就是平均耗时（ms）
+// * TPS 类计数器走 addValue(key, msgs, 1)：value 累计消息数、times 累计调用次数 →
+//   tps = 每秒的调用（或消息）数；
+// * RT 类计数器走 addRTValue(key, rt, 1)：value 累计耗时 ms、times 累计调用次数
+//   → avgpt = 平均耗时；
+// * consumeStatus(group, topic) 除了 consumeFailedMsgs 之外全部读 MINUTE 快照；
+//   consumeFailedMsgs 取的是失败集合的 HOUR 窗口 sum ——**故意跨窗口**，是刻意的
+//   设计，别"顺手改正"。
 //
-// Implementation difference (semantics preserved): Java schedules a 10s/10min
-// sampler per StatsItem; here ONE manager-level sampling timer walks all sets
-// — identical sampling precision (10s), one timer instead of dozens.
+// 实现细节的差异（语义一致）：每个 StatsItem 原本各自挂一个 10s/10min 采样器；这里
+// 用**管理器级别的一把**采样定时器统一遍历所有集合——采样精度不变（10s），少掉几十
+// 个定时器。
 import { ConsumeStatus } from '../remoting/bodies.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('consumer-stats');
 
-// Java StatsItem.init's scheduleAtFixedRate parameters.
+// 采样间隔：minute 每 10s 一点，hour 每 10min 一点。
 export const SAMPLING_INTERVAL_SECONDS = 10.0;
 export const HOUR_SAMPLING_INTERVAL_SECONDS = 600.0;
-// Snapshot chain length (Java csListMinute caps at ~60 points ≈ 10min window).
+// 快照链长度上限：约 60 个点 ≈ 10 分钟窗口（分钟链）。
 const MINUTE_LIST_MAX = 60;
 const HOUR_LIST_MAX = 60;
 
@@ -51,7 +47,7 @@ interface SamplePoint {
   times: number;   // cumulative times
 }
 
-// Java StatsItem.computeStatsData, line by line.
+// 快照计算：窗口首尾差值 -> sum / tps / timesDiff / avgpt。
 export function computeStatsData(csList: SamplePoint[]): StatsSnapshot {
   const ss = new StatsSnapshot();
   if (csList.length === 0) return ss;
@@ -173,8 +169,7 @@ export class ConsumerStatsManager {
     ];
   }
 
-  // Java's start() is empty (sampling hangs off each StatsItem's scheduler);
-  // here ONE unified sampler timer — precision unchanged (10s).
+  // start 本身只做定时器；采样精度保持 10s。
   start(): void {
     if (this._timer != null) return;
     this._timer = setInterval(() => {
@@ -203,7 +198,7 @@ export class ConsumerStatsManager {
     return `${topic}@${group}`;
   }
 
-  // ---- recording (Java ConsumerStatsManager's same-named methods) ----
+  // ---- 记录接口：incPullRT / incPullTPS / incConsumeRT / incConsumeOKTPS / incConsumeFailedTPS ----
   incPullRT(group: string, topic: string, rt: number): void {
     this.topicAndGroupPullRT.addValue(ConsumerStatsManager._key(topic, group), rt, 1);
   }
@@ -224,9 +219,8 @@ export class ConsumerStatsManager {
     this.topicAndGroupConsumeFailedTPS.addValue(ConsumerStatsManager._key(topic, group), msgs, 1);
   }
 
-  // Java ConsumerStatsManager.consumeStatus: everything from MINUTE snapshots;
-  // consumeFailedMsgs from the failed set's HOUR-window sum (Java deliberately
-  // crosses windows — replicate).
+  // consumeStatus：除 consumeFailedMsgs 外全部走 MINUTE 快照；consumeFailedMsgs
+  // 取失败集合的 HOUR 窗口 sum ——跨窗口是刻意设计，别自作主张改。
   consumeStatus(group: string, topic: string): ConsumeStatus {
     const cs = new ConsumeStatus();
     const key = ConsumerStatsManager._key(topic, group);

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息系统标志位（对应 org.apache.rocketmq.common.sysflag.MessageSysFlag，移植自 sysflag.py）。
+ * 消息系统标志位（协议字段 sysFlag 的位定义，broker 侧按此解释）。
  *
  * 位含义（低 -> 高）：
  *     bit0  COMPRESSED
@@ -45,7 +45,7 @@ final class MessageSysFlag
     public const ZLIB_TYPE = 3;
     public const SNAPPY_TYPE = 4;
 
-    /** Java: (flag & COMPRESSION_TYPE_COMPARATOR) >> 8。 */
+    /** 取出 bit8~10 的压缩类型编号：(flag & COMPRESSION_TYPE_COMPARATOR) >> 8。 */
     public static function getCompressionType(int $sysFlag): int
     {
         return ($sysFlag & self::COMPRESSION_TYPE_COMPARATOR) >> self::COMPRESSION_TYPE_SHIFT;
@@ -68,7 +68,7 @@ final class MessageSysFlag
         return $sysFlag & ~self::COMPRESSED_FLAG;
     }
 
-    /** Java: flag & TRANSACTION_ROLLBACK_TYPE。 */
+    /** 事务状态占 bit2~3：flag & TRANSACTION_ROLLBACK_TYPE 取回原始值。 */
     public static function getTransactionValue(int $flag): int
     {
         return $flag & self::TRANSACTION_ROLLBACK_TYPE;

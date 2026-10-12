@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn properties_text_round_trip_matches_java() {
+    fn properties_text_round_trip_matches_wire_format() {
         let text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n";
         let props = MixAll::string_to_properties(text);
         assert_eq!(props.get("a"), Some("b"));

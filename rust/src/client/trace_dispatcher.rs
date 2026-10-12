@@ -1,120 +1,90 @@
-//! 异步轨迹分发器（对应 Java
-//! `org.apache.rocketmq.client.trace.AsyncTraceDispatcher`，逐条移植
-//! `python/client/trace_dispatcher.py`）。
+//! 异步轨迹分发器。
 //!
-//! 职责与 Python 模块头一致：钩子把 [`TraceContext`] 丢进内存队列（[`append`]，
-//! `trace_dispatcher.py:165`），后台任务按「攒够 `batch_num` 条 或 距上次发送超过 5s」
-//! 两个条件触发刷写（`trace_dispatcher.py:190`），再把编码后的文本用**独立的内部生产者**
-//! 发到轨迹 topic（默认 [`MixAll::TRACE_TOPIC`]）。
+//! 职责：钩子把 [`TraceContext`] 丢进内存队列（[`append`]），后台任务按
+//! 「攒够 `batch_num` 条 或 距上次发送超过 5s」两个条件触发刷写，
+//! 再把编码后的文本用**独立的内部生产者**发到轨迹 topic（默认 [`MixAll::TRACE_TOPIC`]）。
 //!
 //! [`append`]: AsyncTraceDispatcher::append
 //!
 //! ## 与已有接缝的关系
 //!
-//! * [`crate::client::mq_client::TraceDispatcher`] —— 生命周期 `start` / `shutdown`
-//!   （`trace_dispatcher.py:127` / `:144`）；
+//! * [`crate::client::mq_client::TraceDispatcher`] —— 生命周期 `start` / `shutdown`；
 //! * [`crate::client::trace_hook::TraceReportSink`] —— 轨迹钩子要的三件事
-//!   `trace_topic_name` / `report`(=`append`) / `client_id`（`trace_dispatcher.py:111` /
-//!   `:165` / `:120`）；
-//! * [`TraceProducer`] —— **本模块新引入**的「内部轨迹生产者」接缝，对应 Python 构造函数
-//!   里 `new DefaultMQProducer(...)` 之后被调用的那几个方法（见下）。
+//!   `trace_topic_name` / `report`(=`append`) / `client_id`；
+//! * [`TraceProducer`] —— 本模块定义的「内部轨迹生产者」接缝，即内部生产者在
+//!   构造与启动过程中被调用的那组方法（见下）。
 //!
-//! ## 与 Python 参考实现的有意差异（逐条在对应条目 doc 上再次标注）
+//! ## 设计要点（逐条在对应条目 doc 上再次标注）
 //!
 //! 1. **内部生产者：注入，或经 `auto_bridged_dispatcher` 自动建**（[`TraceDispatcherConfig::producer`]）。
-//!    Python 在 `__init__` 里直接 `DefaultMQProducer(self._gen_group_name_for_trace(), rpc_hook)`
-//!    （`trace_dispatcher.py:95` + `:98-105`）。本 crate 的接缝是 [`TraceProducer`]，
-//!    方法集 = Python 真正打到 `self.trace_producer` 上的方法集
+//!    接缝是 [`TraceProducer`]，方法集 = 分发器真正打到内部生产者上的方法集
 //!    （`set_send_msg_timeout` / `set_max_message_size` / `set_enable_trace` /
-//!    `set_namesrv_addr` / `set_instance_name` / `start` / `shutdown` / `send` /
-//!    `send_by_selector` / `_topic_publish_info`），由 `producer.rs` 的
+//!    `set_namesrv_addr` / `set_instance_name` / `set_namespace_v2` / `start` /
+//!    `shutdown` / `send` / 定点发送 / 取发布队列），由 `producer.rs` 的
 //!    `DefaultMQProducer` 实现；宿主（生产者/消费者）`enable_trace=true` 且未注入
 //!    分发器时，`start_trace_dispatcher` 会经 `crate::client::producer::auto_bridged_dispatcher`
-//!    自动建一套（内部生产者 + 分发器 + 宿主接线），与 Python 行为对齐。
+//!    自动建一套（内部生产者 + 分发器 + 宿主接线）。
 //!    注入了 `TraceDispatcherConfig { producer: None, .. }`（裸 `with_config`）时使用
 //!    [`DisabledTraceProducer`]（只记日志、发送必失败）并在构造时打一条 WARN。
 //!    组名字面量另拆了一个**纯**函数
 //!    [`format_trace_producer_group`]，`next_trace_producer_group` 只是「取号 + 调它」；
 //!    拆分动机是单测要能确定性地钉住格式（进程级计数器在并行用例下互相插号）。
-//! 2. **`send_by_selector` 的两步搬到分发器里**：Python
-//!    `producer.send_by_selector(msg, _BrokerSetSelector(counter), broker_set, 5000)`
-//!    （`trace_dispatcher.py:262`）在生产者内部做「取路由 → 调 selector → 定点发」。
-//!    Rust 拆成分发器里的 [`BrokerSetSelector::select`] + 生产者接缝上的
-//!    [`TraceProducer::send_to_queue`]，等价性：Python `send_by_selector` 与
-//!    `send(msg, timeout, mq)` 除了「是否自己取路由 / 是否把 `arg` 透传给
-//!    `CheckForbiddenContext`」外完全一致，而内部轨迹生产者**既没注册任何钩子**
-//!    （`_get_and_create_trace_producer` 只设 group/timeout/maxSize/enableTrace=False）
-//!    也**不需要** `arg`，故两条路径的线上字节与选中的队列都相同。
-//! 3. **`_topic_publish_info` 只暴露 `msg_queue_list`**（[`TraceProducer::publish_queues`]）：
-//!    Python 拿到 publish info 后只读 `publish.msg_queue_list`
-//!    （`trace_dispatcher.py:275-277`），而 Rust 的
+//! 2. **「按 broker 集合选队发送」拆成两步**：选队逻辑（broker 集合内轮转 +
+//!    取路由）放在分发器里（[`BrokerSetSelector::select`]），发送走生产者接缝上的
+//!    [`TraceProducer::send_to_queue`]。等价性：定点发送与「生产者内部自选」除了
+//!    「是否自己取路由 / 是否把 `arg` 透传给 `CheckForbiddenContext`」外完全一致，
+//!    而内部轨迹生产者**既没注册任何钩子**（构造时只设
+//!    group/timeout/maxSize/enableTrace=false）也**不需要** `arg`，
+//!    故两条路径的线上字节与选中的队列都相同。
+//! 3. **发布信息只暴露 `msg_queue_list`**（[`TraceProducer::publish_queues`]）：
+//!    分发器拿到 publish info 后只读队列列表，而 Rust 的
 //!    [`TopicPublishInfo`](crate::client::mq_client::TopicPublishInfo) 队列只能由实例路由
 //!    刷新写入、单测无法构造，故接缝直接给出队列列表。
-//! 4. **`start` 有两个版本**：Python `start()` 是同步的（内部 `producer.start()` 是阻塞
-//!    网络调用）。Rust 的具体类型给出 [`AsyncTraceDispatcher::start`]（`async fn`，与
-//!    Python 逐行对应，producer/consumer 移植层应当用它），对象安全的
+//! 4. **`start` 有两个版本**：具体类型给出 [`AsyncTraceDispatcher::start`]（`async fn`，
+//!    可 await 内部生产者启动结果），对象安全的
 //!    [`TraceDispatcher::start`] 则把同一段逻辑丢进 `tokio::spawn`（拿不到 await 结果，
 //!    失败只记 ERROR），并在**没有 tokio 运行时**时返回 `Err`。派发用的运行时句柄按
 //!    `OnceLock` 惰性绑定（构造可以发生在运行时之外）。
-//! 5. **`ThreadPoolExecutor(max_workers=4)` → `tokio::spawn` + 在途任务表**
-//!    （Python `trace_dispatcher.py:93-94`）。线程池的无界工作队列在 Rust 里就是
+//! 5. **线程池 → `tokio::spawn` + 在途任务表**。线程池的无界工作队列在 Rust 里就是
 //!    「spawn 出去的 future」；线程名前缀 `MQTraceSendThread_<id>_` 与 worker 线程名
-//!    `MQ-AsyncArrayDispatcher-Thread<id>`（`:140`）在 Rust 没有对应物，只影响日志。
-//!    `WAIT_FOR_SHUTDOWN = 5000`（`:70`）在 Python 里是**死常量**（`_executor.shutdown
-//!    (wait=False)`，`:150`），Rust 按 Java `ThreadUtils.shutdownGracefully(traceExecutor,
-//!    WAIT_FOR_SHUTDOWN)`（`AsyncTraceDispatcher.java:207`）把它用作 [`flush_and_wait`] /
+//!    `MQ-AsyncArrayDispatcher-Thread<id>` 在 Rust 没有对应物，只影响日志。
+//!    `WAIT_FOR_SHUTDOWN = 5000` 用作 [`flush_and_wait`] /
 //!    [`shutdown_gracefully`] 的等待上限。
 //!
 //! [`flush_and_wait`]: AsyncTraceDispatcher::flush_and_wait
 //! [`shutdown_gracefully`]: AsyncTraceDispatcher::shutdown_gracefully
-//! 6. **`atexit.register(self.shutdown)`（`:142` / `:159`）与 Java
-//!    `Runtime.addShutdownHook`（`AsyncTraceDispatcher.java:215-247`）无 Rust 等价物**：
-//!    进程退出前不会自动 flush，调用方必须显式 `shutdown()`。为免「忘了 shutdown 就
-//!    永久泄漏一个后台任务」，worker 任务只持 `Weak<Inner>`，句柄全部释放后自行退出
-//!    （等价于 Python 的 daemon 线程随解释器退出）。
-//! 7. **防忙等的 `time.sleep(0.005)`（`:204-205`）** 在 Python 里位于
-//!    `_flush_trace_context` 内部（本轮没刷出批次才睡）；Rust 该函数保持同步，
-//!    将 5ms 的 `tokio::time::sleep` 上移到 worker 循环里，触发条件完全相同。
-//! 8. **`threading.RLock`（`:91`）→ `tokio::sync::Mutex`**：Python 的锁临界区里只有同步
-//!    调用，Rust 临界区要跨 `await`（`producer.start()`），故用异步锁（Java 用
-//!    `AtomicBoolean#compareAndSet`，`AsyncTraceDispatcher.java:152`）。
-//! 9. **`shutdown()` 会 `take()` 掉 worker 句柄**，因此之后可以重新 `start()`。Python
-//!     shutdown 后 `self.worker` 仍指向已死的 `Thread`（`:137` 的 `is None` 判断不成立），
-//!    再 `start()` 不会重起后台刷写；Java 每次 `start()` 都新建 worker —— Rust 跟 Java。
-//!    Rust 在置 `stopped` 之后还 `abort()` 该任务（Python 只能等线程自己回到循环顶部）：
+//! 6. **进程退出前不会自动 flush**（无 atexit / shutdown-hook 等价物），调用方必须
+//!    显式 `shutdown()`。为免「忘了 shutdown 就永久泄漏一个后台任务」，worker 任务
+//!    只持 `Weak<Inner>`，句柄全部释放后自行退出（等价于 daemon 线程随进程退出）。
+//! 7. **防忙等的 5ms sleep**：`flush_trace_context` 保持同步（本轮没刷出批次才让出），
+//!    `tokio::time::sleep` 放在 worker 循环里，触发条件完全相同。
+//! 8. **重入锁 → `tokio::sync::Mutex`**：临界区要跨 `await`（`producer.start()`），
+//!    故用异步锁；启动标记的置位用 CAS 语义保证幂等。
+//! 9. **`shutdown()` 会 `take()` 掉 worker 句柄**，因此之后可以重新 `start()`，
+//!    每次 `start()` 都新建 worker。Rust 在置 `stopped` 之后还 `abort()` 该任务：
 //!    不丢东西 —— 刷写段是同步的，跑到下一个 await 点前不会被打断，已提交的发送批次在
 //!    独立任务里、由在途任务表记账（见第 5 条）。
-//! 10. **`flush()` 在 `batch_num == 0` 时不会死循环**：Python `while not empty` +
-//!     `for _ in range(0)` ⇒ 一次也取不出来 ⇒ 永久空转（`:177-181` + `:197`）。Rust 发现
+//! 10. **`flush()` 在 `batch_num == 0` 时不会死循环**：发现
 //!     「队列非空但本轮没刷出批次」时记一条 WARN 并退出。
-//! 11. **切块阈值比较的是码点**：Java `StringBuilder.length()` 是 UTF-16 code unit
-//!     （`AsyncTraceDispatcher.java:348`），Python `len(buffer)` 是码点
-//!     （`trace_dispatcher.py:244`）；Rust 跟 Python。纯 ASCII 轨迹文本下三者一致。
-//!     另外 Java 比的是 `traceProducer.getMaxMessageSize()`，Python 比的是自己的
-//!     `self.max_msg_size`（同值 128000），Rust 跟 Python 并保留 `set_max_msg_size`。
-//! 12. **分组容器保持插入顺序**：Python `dict` 天然是插入序（`:228` `setdefault`），
-//!     Java 用 `HashMap`（`AsyncTraceDispatcher.java:308`，顺序随机）。Rust 用
-//!     「Vec + 索引 HashMap」复刻 Python 的逐组发送顺序（多线程下轨迹到达顺序本就
-//!     不保证，但单发批次内的顺序是可测的线上行为）。
-//! 13. **`key.split(CONTENT_SPLITOR)` 的解包**：Python `topic, trace_topic = key.split(...)`
-//!     （`:230`）在 topic 真含 `\x01` 时抛 `ValueError`，异常被线程池吞掉；Rust 只按
-//!     **第一个** `\x01` 切一次（`split_once`），切不出两段则记 DEBUG 后跳过该组。
-//! 14. **`is_started` 在 `shutdown()` 后仍为 `true`** —— Python 原样（`:144-162` 没有复位
-//!     它）。但二次 `shutdown()` 不再重复关内部生产者：收尾在在途发送收敛后执行一次，
+//! 11. **切块阈值比较的是码点**（`chars().count()`），且比的是本分发器自己的
+//!     `max_msg_size`（128000，`set_max_msg_size` 可改）而非生产者的上限。
+//! 12. **分组容器保持插入顺序**：用「Vec + 索引 HashMap」固定逐组发送顺序
+//!     （多线程下轨迹到达顺序本就不保证，但单发批次内的顺序是可测的线上行为）。
+//! 13. **分组 key 的解包**：分组 key 是 `topic \x01 trace_topic`，只按**第一个**
+//!     `\x01` 切一次（`split_once`），topic 真含 `\x01` 而切不出预期两段时记 DEBUG
+//!     后跳过该组，不让脏 key 打断刷写。
+//! 14. **`is_started` 在 `shutdown()` 后仍为 `true`** —— 状态机不复位它。
+//!     但二次 `shutdown()` 不再重复关内部生产者：收尾在在途发送收敛后执行一次，
 //!     二次调用直接返回（重复关会把第一轮没等完的发送掐掉）。
-//! 15. **`namespace_v2`（`:86`）已接线**：Python 只在构造函数里赋了 `""`，全文
-//!     从未读取（死状态）；Rust 对齐 Java —— `AsyncTraceDispatcher.java:155` 在
-//!     `start()` 里 `traceProducer.setNamespaceV2(...)`，本移植同样在 `start()`
-//!     把 [`AsyncTraceDispatcher::set_namespace_v2`] 配好的值透到内部生产者，
-//!     内部生产者的实例据此注册 `NamespaceRpcHook`（`nsd`/`ns` 扩展头）。
-//!     差异：Java 无条件调用（字段可能为 null），Rust 在**未配置**（空串）时跳过
-//!     这一次 setter —— 空 namespaceV2 在 Java 侧同样不产生任何线上效果。
-//! 16. **`set_host_producer` / `set_host_consumer`（`:114-118`）走 [`TraceHost`] 接缝**：
-//!     Python 靠鸭子类型 `getattr(host, "_mq_client").client_id`（`:120-124`）拿 clientId，
-//!     Rust 声明一个只提供 `client_id()` 的小接缝，[`MQClientInstance`] 已实现它。
-//! 17. 编码（`TraceDataEncoder.encoder_from_context_bean`）、`TraceContext` 的字段与
+//! 15. **`namespace_v2` 已接线**：`start()` 时把 [`AsyncTraceDispatcher::set_namespace_v2`]
+//!     配好的值透到内部生产者，内部生产者的实例据此注册 `NamespaceRpcHook`
+//!     （`nsd`/`ns` 扩展头）。在**未配置**（空串）时跳过这一次 setter ——
+//!     空 namespaceV2 本来就不产生任何线上效果。
+//! 16. **`set_host_producer` / `set_host_consumer` 走 [`TraceHost`] 接缝**：
+//!     只提供 `client_id()` 一个小接缝，[`MQClientInstance`] 已实现它。
+//! 17. 编码（`TraceDataEncoder::encoder_from_context_bean`）、`TraceContext` 的字段与
 //!     `\x01`/`\x02` 拼串一律复用 [`crate::client::trace`]，本模块**不重复**实现也不
-//!     重复其单测；本模块只对齐「攒批 / 分组 / 切块 / KEYS 拼装 / 选队 / 生命周期」。
+//!     重复其单测；本模块只覆盖「攒批 / 分组 / 切块 / KEYS 拼装 / 选队 / 生命周期」。
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -142,22 +112,20 @@ use crate::{rmq_debug, rmq_error, rmq_info, rmq_warn};
 
 // ================================================================ 枚举 / 进程级计数
 
-/// 分发器类型（对应 Java `TraceDispatcher.Type`，`TraceDispatcher.java:27-30`；
-/// Python `TraceDispatcherType`，`trace_dispatcher.py:41-45`）。
+/// 分发器类型（生产侧 / 消费侧）。
 ///
-/// 只影响内部生产者组名里的那一段字面量（`PRODUCE` / `CONSUME`，Python 的 `.value`、
-/// Java 的枚举名），线上不落轨迹正文，故无编码风险。
+/// 只影响内部生产者组名里的那一段字面量（`PRODUCE` / `CONSUME`），
+/// 线上不落轨迹正文，故无编码风险。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TraceDispatcherType {
-    /// 生产侧（Python `TraceDispatcherType.PRODUCE`，`trace_dispatcher.py:44`）。
+    /// 生产侧。
     Produce,
-    /// 消费侧（Python `TraceDispatcherType.CONSUME`，`trace_dispatcher.py:45`）。
+    /// 消费侧。
     Consume,
 }
 
 impl TraceDispatcherType {
-    /// Python `.value`（`trace_dispatcher.py:109` 组名里那一段）／Java `Enum#name()`：
-    /// `PRODUCE` | `CONSUME`（枚举本体 `:41-45`）。
+    /// 类型名：`PRODUCE` | `CONSUME`（组名里那一段，字面值已固定）。
     pub fn name(self) -> &'static str {
         match self {
             TraceDispatcherType::Produce => "PRODUCE",
@@ -166,17 +134,14 @@ impl TraceDispatcherType {
     }
 }
 
-/// 为了让组名拼接处（`trace_dispatcher.py:109`）能像 Python 的 `%s`（= `.value`）
-/// 那样直接把类型写进 `format!`。
+/// 让组名拼接处能直接把类型写进 `format!`（等价于 `self.name()`）。
 impl std::fmt::Display for TraceDispatcherType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
     }
 }
 
-/// Python `AsyncTraceDispatcher._COUNTER = itertools.count(1)`（`trace_dispatcher.py:68`）：
-/// 进程级内部生产者组名序号，**从 1 开始**（Java `COUNTER.incrementAndGet()`，
-/// `AsyncTraceDispatcher.java:56` + `:181`）。
+/// 进程级内部生产者组名序号，**从 1 开始**。
 fn next_group_counter() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::AcqRel) + 1
@@ -185,9 +150,7 @@ fn next_group_counter() -> u64 {
 /// [`AsyncTraceDispatcher::next_trace_producer_group`] 的**纯**格式化部分
 /// （把自增号当参数传进来）。
 ///
-/// Python `_gen_group_name_for_trace`（`trace_dispatcher.py:107-109`）／Java
-/// `genGroupNameForTrace`（`AsyncTraceDispatcher.java:180-182`）本身是
-/// 「格式化 + 顺手自增」一体的；这里拆开只为让单测能确定性地断言字面格式 ——
+/// 组名格式是「格式化 + 顺手自增」一体的；这里拆开只为让单测能确定性地断言字面格式 ——
 /// 进程级计数器在 `cargo test` 的并行用例下互相插号，「恰好 +1」这种断言不可靠。
 fn format_trace_producer_group(
     group: &str,

@@ -120,7 +120,7 @@ class BrokerData:
         return "BrokerData [brokerName=%s, brokerAddrs=%s]" % (self.broker_name, self.broker_addrs)
 
 
-Long = int  # Java long 别名，便于阅读
+Long = int  # 协议里的 long（64 位整型）别名，便于阅读
 
 
 class TopicRouteData:
@@ -132,23 +132,23 @@ class TopicRouteData:
         self.topic_queue_mapping_by_broker: Optional[Dict[str, dict]] = None
 
     def get_broker_datas(self) -> List["BrokerData"]:
-        """返回 broker 数据列表（与 Java topicRouteData.getBrokerDatas() 对齐）。"""
+        """返回 broker 数据列表。"""
         return self.broker_datas
 
     def get_all_message_queue(self, topic: str = "") -> List["MessageQueue"]:
-        """根据 queueDatas + brokerDatas 组装全部可写 MessageQueue（对应 Java 的 topicRouteData2TopicPublishInfo 组装逻辑）。
+        """根据 queueDatas + brokerDatas 组装全部可写 MessageQueue。
 
-        topic 用于回填到每个 MessageQueue（Java 用真实 topic，而不是空串），否则后续
+        topic 用于回填到每个 MessageQueue（必须用真实 topic，而不是空串），否则后续
         send/pull 用 mq.topic 回查路由时会查不到。
 
-        两条跳过条件逐字对应 Java ``MQClientInstance.topicRouteData2TopicPublishInfo:294-303``：
+        两条跳过条件：
         路由里查不到同名 broker，**或者**该 broker 的 brokerAddrs 里没有 ``MASTER_ID``。
         后者不是冗余判断：从节点自己也会注册进 namesrv，且默认配置下它照样带写位
-        （``RouteInfoManager:344-346`` 只在「prime slave 且 enableActingMaster」时才抹掉
+        （namesrv 侧只在「prime slave 且 enableActingMaster」时才抹掉
         WRITE）——master 一旦掉线，路由里同一个 brokerName 就只剩 brokerId=1，写位还在。
         漏判这条，生产者会挑中这台队列并把消息发到从节点上，而从节点对发送请求是
         ``rejectRequest``（``SendMessageProcessor:131`` ⇒ SYSTEM_BUSY，还是个可重试码），
-        于是白烧一轮超时；Java 那边这种队列压根进不了发布信息，发送直接当无路由处理。
+        于是白烧一轮超时；这种队列本就不该进发布信息，发送应直接当无路由处理。
         """
         mqs: List["MessageQueue"] = []
         for qd in self.queue_datas:
@@ -168,12 +168,12 @@ class TopicRouteData:
         return mqs
 
     def get_all_subscribe_message_queue(self, topic: str = "") -> List["MessageQueue"]:
-        """按 queueDatas 组装全部**可读** MessageQueue（对应 Java ``MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332``）。
+        """按 queueDatas 组装全部**可读** MessageQueue。
 
-        与 :meth:`get_all_message_queue`（发布侧）有两处刻意的不同，都是 Java 的语义：
-        ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 在 Java 里照样能被消费）；
+        与 :meth:`get_all_message_queue`（发布侧）有两处刻意的不同，都是路由语义：
+        ①只看**读**位与 ``readQueueNums``（perm=4 的只读 topic 照样能被消费）；
         ②**不要求 broker 有 master** —— 主挂掉后从节点仍要能被拉取，客户端侧
-        ``findBrokerAddressInSubscribe`` 正是为此才带从节点回退。只有发布信息需要 master。
+        订阅寻址正是为此才带从节点回退。只有发布信息需要 master。
         """
         mqs: List["MessageQueue"] = []
         for qd in self.queue_datas:

@@ -1,6 +1,5 @@
 // -*- coding: utf-8 -*-
-// MQClient — the central client manager (org.apache.rocketmq.client.impl.MQClientInstance).
-// Faithful port of python/client/mq_client.py. It owns: the name-server address list,
+// MQClient — the central client manager. It owns: the name-server address list,
 // the topic-route cache, the per-topic publish-info table (with the SHARED round-robin cursor),
 // the broker-address table, and the low-level send / heartbeat / recall primitives.
 //
@@ -62,7 +61,7 @@ const logger = getLogger('mqclient');
 export class TopicPublishInfo {
   orderTopic: boolean;
   msgQueueList: MessageQueue[];
-  _index: number;            // shared cursor (mirrors Python sendWhichQueue)
+  _index: number;            // shared round-robin cursor
   haveTopicRouterInfo: boolean;
 
   constructor() {
@@ -116,25 +115,25 @@ export class MQClient {
   consumerTable: Map<string, any>;
   producerTable: Map<string, any>;
   heartbeatIntervalMillis: number;
-  // Java ClientConfig.mqClientApiTimeout (default 3000): the timeout used by
+  // Client-level API timeout (default 3000 ms): the timeout used by
   // the instance-level admin calls, including CHECK_CLIENT_CONFIG(46).
   mqClientApiTimeout: number;
-  // Consumer stats (Java MQClientFactory.getConsumerStatsManager — shared at
-  // the instance level; ONE sampler timer, 10s precision).
+  // Consumer stats manager — shared at the instance level; ONE sampler timer,
+  // 10s precision.
   consumerStatsManager: ConsumerStatsManager;
   _heartbeatTimer: NodeJS.Timeout | null;
   _routeTimer: NodeJS.Timeout | null;
   _routeInitialTimer: NodeJS.Timeout | null;
-  // Dynamic name-server addressing (Java MQClientInstance.startScheduledTask:
-  // fetchNameServerAddr via TopAddressing every 2min, initial delay 10s —
-  // ONLY when the name server address was not explicitly set).
+  // Dynamic name-server addressing: fetchNameServerAddr via TopAddressing
+  // every 2min, initial delay 10s — ONLY when the name server address was not
+  // explicitly set.
   _topAddressing: DefaultTopAddressing | null;
   _namesrvTimer: NodeJS.Timeout | null;
   _namesrvInitialTimer: NodeJS.Timeout | null;
-  // Java MQClientInstance's adjustThreadPool task: every 1 minute every
+  // adjustThreadPool task: every 1 minute every
   // consumer of this instance is offered a pool-size adjustment decision.
   _adjustThreadPoolTimer: NodeJS.Timeout | null;
-  // Java MQClientAPIImpl.namesrvAddrChoosed（:200）语义：上次应答过的 NS 粘住
+  // 名字服务粘性/轮换语义：上次应答过的 NS 粘住
   // 优先复用；失效才从它后面一台轮换。没有这个粘性 + 轮换，多 NS 挂一台时
   // 每次路由拉取都纯随机单挑 —— 撞上死的那台整个调用直接失败。
   _namesrvChosen: string | null;
@@ -178,8 +177,8 @@ export class MQClient {
     return this.nameServerAddrList;
   }
 
-  // Java MQClientAPIImpl#onNameServerAddressChange: apply a TopAddressing
-  // push. Returns the accepted address (null/unchanged -> no-op).
+  // Apply a TopAddressing push of a new nameserver list.
+  // Returns the accepted address (null/unchanged -> no-op).
   onNameServerAddressChange(namesrvAddress: string | null): string | null {
     if (namesrvAddress != null && namesrvAddress !== this.nameServerAddress) {
       logger.info('name server address changed, old=%s, new=%s', this.nameServerAddress, namesrvAddress);
@@ -189,8 +188,8 @@ export class MQClient {
     return this.nameServerAddress;
   }
 
-  // Java MQClientAPIImpl#fetchNameServerAddr: poll the TopAddressing HTTP
-  // endpoint; a changed answer is pushed through the change callback.
+  // Poll the TopAddressing HTTP endpoint for the current nameserver list;
+  // a changed answer is pushed through the change callback.
   async fetchNameServerAddr(): Promise<string | null> {
     if (this._topAddressing == null) return this.nameServerAddress;
     try {
@@ -207,8 +206,8 @@ export class MQClient {
     return list[Math.floor(Math.random() * list.length)];
   }
 
-  // Java MQClientAPIImpl#getAndCreateNameserverChannel（:376-407）的调用侧等价物：
-  // 上次应答过的 NS（_namesrvChosen）粘住优先；它没被配置过/失效了，就从随机位
+  // Nameserver 调用的粘性/轮换：上次应答过的 NS（_namesrvChosen）粘住优先；
+  // 它没被配置过/失效了，就从随机位
   // 开始把**整张列表轮一遍**，谁先应答谁当选并粘住。多 NS 挂一台时，旧实现
   // （纯随机单挑一次）撞上死的那台整个路由拉取直接失败 —— 3 台挂 1 台就是
   // ~33% 的调用死，新进程首拉路由撞死即表现为 "no route info"/消费 0 超时。
@@ -235,8 +234,7 @@ export class MQClient {
   }
 
   // ---- route management ----
-  // Build publish info from a TopicRouteData (mirrors
-  // MQClientInstance.topicRouteData2TopicPublishInfo). Returns a TopicPublishInfo whose
+  // Build publish info from a TopicRouteData. Returns a TopicPublishInfo whose
   // msgQueueList is the master-writable queue set.
   topicRouteData2TopicPublishInfo(topic: string, routeData: TopicRouteData): TopicPublishInfo {
     const info = new TopicPublishInfo();
@@ -267,7 +265,7 @@ export class MQClient {
     return this.topicPublishInfoTable.get(topic) != null ? this.topicPublishInfoTable.get(topic)! : null;
   }
 
-  // Resolve route from the name server (network). Java semantics: isDefault
+  // Resolve route from the name server (network). Contract: isDefault
   // only changes WHICH topic's route is fetched (TBW102 instead of `topic`);
   // the TBW102 fallback for a missing topic is the PRODUCER's
   // tryToFindTopicPublishInfo second step — never an automatic behaviour of
@@ -281,7 +279,7 @@ export class MQClient {
     request.addExtField('topic', realTopic);
     // NS 故障切换在 _invokeSyncNameServer 内做（轮换全部 NS，见其注释）；
     // 这里只区分「可达的 NS 明确说 topic 不存在」与「全部 NS 不可达」：
-    // 前者返回 false（Java 语义，不自动兜底 TBW102），后者把异常抛给调用方 ——
+    // 前者返回 false（不自动兜底 TBW102），后者把异常抛给调用方 ——
     // 抛出去的异常带着最后一个 NS 的失败原因（连接拒绝/TLS 握手失败…），
     // 生产者/消费者把它挂在自己的路由错误上，不再黑盒成 "No route info"。
     const response = await this._invokeSyncNameServer(request, 3000);
@@ -295,7 +293,7 @@ export class MQClient {
       return true;
     }
     // TOPIC_NOT_EXIST (or anything else): NO automatic fallback to TBW102 —
-    // Java returns false here. A silent fallback would poison the consumer's
+    // return false. A silent fallback would poison the consumer's
     // rebalance with TBW102's 8-queue layout ("queueId[N] is illegal").
     return false;
   }
@@ -343,8 +341,8 @@ export class MQClient {
   getBrokerAddrTable(): Map<string, Record<number, string>> { return this.brokerAddrTable; }
 
   // Every (id, addr) pair of every broker we know — masters AND slaves.
-  // Java sendHeartbeatToAllBroker / unregisterClient iterate the whole
-  // brokerAddrTable; restricting to masters breaks slave-only topologies
+  // Heartbeat and unregister iterate the whole brokerAddrTable; restricting
+  // to masters breaks slave-only topologies
   // (a slave that never received a heartbeat answers pulls with
   // "subscription not exist").
   getAllBrokerAddrEntries(): Array<{ brokerName: string; id: number; addr: string }> {
@@ -370,43 +368,44 @@ export class MQClient {
   }
 
   // ---- CHECK_CLIENT_CONFIG(46) ----
-  // Java MQClientInstance.checkClientInBroker. Only non-TAG subscriptions go
-  // on the wire: a broker that does not know 46 answers with a remoting error,
-  // and a silently-broken SQL92 filter would otherwise degrade into
-  // "subscribe to everything" (ExpressionMessageFilter admits all messages
-  // when the expression does not compile). Sending 46 turns that into a
-  // start-up failure.
+  // Pre-flight broker-side subscription validation. Only non-TAG
+  // subscriptions go on the wire: a broker that does not know 46 answers with
+  // a remoting error, and a silently-broken SQL92 filter would otherwise
+  // degrade into "subscribe to everything" (ExpressionMessageFilter admits all
+  // messages when the expression does not compile). Sending 46 turns that into
+  // a start-up failure.
   async checkClientInBroker(): Promise<void> {
     for (const [group, consumer] of this.consumerTable.entries()) {
       const subs: Map<string, any> | undefined = consumer.subscription;
       if (subs == null || subs.size === 0) {
-        // Java returns (does not `continue`) on a subscription-less consumer.
+        // Return (do not `continue`) on a subscription-less consumer — the
+        // whole instance is not ready yet.
         return;
       }
       await this.checkSubscriptionsInBroker(group, subs, this.mqClientApiTimeout);
     }
   }
 
-  // The inner loop, exposed for callers that keep consumers out of the table
-  // (mirrors Go's CheckSubscriptionsInBroker).
+  // The inner loop, exposed for callers that keep consumers out of the table.
   async checkSubscriptionsInBroker(
     group: string,
     subs: Map<string, any>,
     timeoutMillis: number,
   ): Promise<void> {
     for (const sub of subs.values()) {
-      // Java ExpressionType.isTagType: null / "" / "TAG" all count as TAG.
+      // TAG classification: null / "" / "TAG" all count as TAG.
       const exprType = sub.expressionType;
       if (exprType == null || exprType === '' || exprType === ExpressionType.TAG) continue;
-      // Java checks one broker per cluster and assumes the rest are identical.
+      // One broker per cluster is checked; the rest are assumed identical.
       const addr = this.findBrokerAddrByTopic(sub.topic);
       if (addr == null) continue;
       try {
         await this.checkClientConfig(addr, group, sub, timeoutMillis);
       } catch (e) {
         if (e instanceof MQClientException) throw e;
-        // Transport-class failure (a broker too old to know 46) keeps Java's
-        // fixed wording, which also takes the consumer start down.
+        // Transport-class failure (a broker too old to know 46) uses the fixed
+        // wording below — callers match on it. The failure also takes the
+        // consumer start down.
         throw new MQClientException(
           `Check client in broker error, maybe because you use ${exprType} to filter message, `
           + 'but server has not been upgraded to support!'
@@ -421,7 +420,7 @@ export class MQClient {
 
   // One CHECK_CLIENT_CONFIG(46) round trip. The custom header is null and the
   // body carries CheckClientRequestBody; any non-SUCCESS code becomes an
-  // MQClientException carrying the broker's own response code, as in Java.
+  // MQClientException carrying the broker's own response code.
   async checkClientConfig(
     addr: string,
     consumerGroup: string,
@@ -443,8 +442,8 @@ export class MQClient {
   }
 
   // ---- low-level send primitives ----
-  // Build the on-wire request command for a message (mirrors Java buildSendRequest /
-  // _build_send_request). The UNIQ_KEY must already be set on the message by the caller.
+  // Build the on-wire request command for a message. The UNIQ_KEY must
+  // already be set on the message by the caller.
   buildSendRequest(
     msg: Message,
     mq: MessageQueue,
@@ -453,7 +452,7 @@ export class MQClient {
   ): RemotingCommand {
     const topic = msg.getTopic();
     const isBatch = msg instanceof MessageBatch;
-    // Java buildSendRequest: only a REPLY (MSG_TYPE == "reply") goes out as
+    // Wire rule: only a REPLY (MSG_TYPE == "reply") goes out as
     // SEND_REPLY_MESSAGE_V2. A REQUEST carries MSG_TYPE=Request_Reply_Msg and
     // CORRELATION_ID but must go as a NORMAL send — the reply processor does
     // not stamp CLUSTER and would push the "reply" straight back to the
@@ -496,10 +495,10 @@ export class MQClient {
     return request;
   }
 
-  // Parse a send response into a SendResult (mirrors Java _parse_send_response).
-  // Java MQClientAPIImpl.sendMessage: for a single (non-batch) message the
-  // SendResult.msgId is the UNIQ_KEY client id (offsetMsgId keeps the physical
-  // broker id). The trace Pub record and the console join on this.
+  // Parse a send response into a SendResult. Wire rule: for a single
+  // (non-batch) message the SendResult.msgId is the UNIQ_KEY client id
+  // (offsetMsgId keeps the physical broker id). The trace Pub record and the
+  // console join on this.
   parseSendResponse(response: RemotingCommand, mq: MessageQueue, brokerAddr: string,
     msg: Message | null = null): SendResult {
     const code = response.code;
@@ -622,14 +621,14 @@ export class MQClient {
   }
 
   async unregisterClientAllBrokers(producerGroup: string, consumerGroup: string): Promise<void> {
-    // Java unregisterClient also goes to every broker entry (incl. slaves).
+    // Unregister goes to every broker entry (incl. slaves).
     for (const { addr } of this.getAllBrokerAddrEntries()) {
       try { await this.unregisterClient(addr, producerGroup, consumerGroup); } catch (e) { /* best effort */ }
     }
   }
 
   // ---- create topic ----
-  // Java MQClientAPIImpl.createTopic (UpdateAndCreateTopicRequestHeader):
+  // UPDATE_AND_CREATE_TOPIC(17) extFields:
   // topic / defaultTopic / readQueueNums / writeQueueNums / perm /
   // topicFilterType / attributes. NOTE: `defaultTopicQueueNums` is a SEND-path
   // field — it is NOT part of this request, and omitting read/writeQueueNums
@@ -654,7 +653,7 @@ export class MQClient {
 
   // ---- offset helpers (used by offset store / consumers / admin) ----
   // Master publish addr first, then any addr for this broker in a cached route
-  // (Java persistAll's findBrokerAddrByTopic fallback).
+  // (persistAll's findBrokerAddrByTopic fallback).
   findBrokerAddrForQueue(mq: MessageQueue): string | null {
     const master = this.findBrokerAddressInPublish(mq.getBrokerName());
     if (master) return master;
@@ -758,8 +757,7 @@ export class MQClient {
   }
 
   // ---------------------------------------------------------------- POP path
-  // (Java MQClientAPIImpl popAsync / ackMessageAsync / changeInvisibleTimeAsync
-  // / batchAckMessageAsync / setMessageRequestMode; port of go/client/pop_api.go.)
+  // POP/ACK/CHANGE_INVISIBLE/BATCH_ACK/SET_MESSAGE_REQUEST_MODE primitives.
 
   // popMessage sends POP_MESSAGE(200050) to one broker and turns the reply into
   // a PopResult with a POP_CK stamped on every message.
@@ -783,22 +781,21 @@ export class MQClient {
     const request = RemotingCommand.createRequestCommand(RequestCode.ACK_MESSAGE, header);
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
-      // Java maps every non-SUCCESS code to AckStatus.NO_EXIST — the broker
-      // could not find the checkpoint, which is a warning, not a hard error.
+      // Every non-SUCCESS code means the broker could not find the checkpoint
+      // (AckStatus.NO_EXIST on the wire) — a warning, not a hard error.
       throw new MQBrokerException(response.code, response.remark || '', addr);
     }
   }
 
   // batchAckMessage sends BATCH_ACK_MESSAGE(200151) with a pre-built body.
   //
-  // NOTE (Java fidelity): the CLASSIC Java client never calls this. Its POP
-  // path acks one message at a time through DefaultMQPushConsumerImpl#ackAsync.
-  // It is exported because the wire capability is real (the broker implements
-  // it and the next-gen/proxy clients use it). Do NOT "finish" the POP
-  // consumer by routing its acks through this — that would be inventing client
-  // behaviour.
+  // NOTE: the classic remoting POP path acks ONE message at a time via
+  // ACK_MESSAGE(200051). This primitive is exported because the broker-side
+  // capability is real and next-gen/proxy clients use it. Do NOT "finish" the
+  // POP consumer by routing its acks through this — that would be inventing
+  // client behaviour.
   async batchAckMessage(addr: string, body: BatchAckMessageRequestBody, timeoutMillis: number): Promise<void> {
-    // No custom header — Java passes null and rides the body only.
+    // No custom header — the request rides the body only.
     const request = RemotingCommand.createRequestCommand(RequestCode.BATCH_ACK_MESSAGE, null);
     request.setBody(body.encode());
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
@@ -810,8 +807,9 @@ export class MQClient {
   // changeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053) and returns
   // the NEW popTime / invisibleTime the broker assigned.
   //
-  // The returned values are not cosmetic: Java rebuilds the checkpoint from
-  // them so a later ACK still matches the (now longer) invisibility window.
+  // The returned values are not cosmetic: the caller rebuilds the checkpoint
+  // from them so a later ACK still matches the (now longer) invisibility
+  // window.
   async changeInvisibleTime(addr: string, header: ChangeInvisibleTimeRequestHeader,
     timeoutMillis: number): Promise<ChangeInvisibleTimeResponseHeader> {
     const request = RemotingCommand.createRequestCommand(RequestCode.CHANGE_MESSAGE_INVISIBLETIME, header);
@@ -843,12 +841,11 @@ export class MQClient {
     }
   }
 
-  // ---- QUERY_ASSIGNMENT(400) — broker-side 指配 (Java MQClientAPIImpl
-  // #queryAssignment, RebalanceImpl#getRebalanceResultFromBroker). Used by the
+  // ---- QUERY_ASSIGNMENT(400) — broker-side queue assignment. Used by the
   // push consumer's rebalance when clientRebalance is OFF: the broker decides
   // which queues (and in which MessageRequestMode) this client consumes.
-  // Returns null when the broker answered with an invalid/empty result — Java
-  // treats null as "skip the update", never "I own nothing".
+  // Returns null when the broker answered with an invalid/empty result — the
+  // caller treats null as "skip the update", never "I own nothing".
   async queryAssignment(addr: string, topic: string, consumerGroup: string, clientId: string,
     strategyName: string, messageModel: string, timeoutMillis = 3000,
   ): Promise<Array<{ mq: MessageQueue; mode: string }> | null> {
@@ -896,16 +893,15 @@ export class MQClient {
     this._startRouteRefreshLoop();
     this._startNamesrvAddressingLoop();
     this._startAdjustThreadPoolLoop();
-    // Java ConsumerStatsManager.start() is empty (sampling hangs off each
+    // The stats manager's own start() is empty (sampling hangs off each
     // StatsItem's scheduler); the unified sampler timer starts here.
     this.consumerStatsManager.start();
   }
 
-  // Java MQClientInstance.startScheduledTask — the TopAddressing branch runs
-  // ONLY when no name server address was explicitly configured:
-  //   scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)
+  // The TopAddressing branch runs ONLY when no name server address was
+  // explicitly configured: scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min).
   private _startNamesrvAddressingLoop(): void {
-    if (this.nameServerAddress != null) return; // explicitly set — Java skips the task
+    if (this.nameServerAddress != null) return; // explicitly set — skip the task
     this._topAddressing = new DefaultTopAddressing(null, null);
     this._topAddressing.registerChangeCallBack((addrs) => this.onNameServerAddressChange(addrs));
     const beat = () => { void this.fetchNameServerAddr(); };
@@ -916,9 +912,9 @@ export class MQClient {
     this._namesrvInitialTimer = initial;
   }
 
-  // Java MQClientInstance: scheduleAtFixedRate(adjustThreadPool, 1, 1, MINUTES).
-  // The consumer-side inc/dec is a faithful no-op (see DefaultMQPushConsumer
-  // .adjustThreadPool), so this only measures — exactly like Java.
+  // Periodic adjustThreadPool sweep every 1 minute (initial delay 1 min).
+  // The consumer-side inc/dec is a deliberate no-op (see DefaultMQPushConsumer
+  // .adjustThreadPool), so this only measures.
   private _startAdjustThreadPoolLoop(): void {
     this._adjustThreadPoolTimer = setInterval(() => { this.adjustThreadPool(); }, 60_000);
     if (typeof this._adjustThreadPoolTimer.unref === 'function') this._adjustThreadPoolTimer.unref();
@@ -927,13 +923,13 @@ export class MQClient {
   adjustThreadPool(): void {
     for (const consumer of this.consumerTable.values()) {
       if (consumer != null && typeof consumer.adjustThreadPool === 'function') {
-        try { consumer.adjustThreadPool(); } catch (e) { /* best effort, like Java's catch-all */ }
+        try { consumer.adjustThreadPool(); } catch (e) { /* best effort — never let one consumer break the sweep */ }
       }
     }
   }
 
-  // Java startScheduledTask: MQClientInstance.updateTopicRouteInfoFromNameServer()
-  // every pollNameServerInterval (30s), initial delay 10s. Refreshes the route
+  // Route refresh every pollNameServerInterval (30s), initial delay 10s.
+  // Refreshes the route
   // of EVERY topic the consumers subscribe to and the producers publish to —
   // without this, a route registered at the nameserver AFTER the client cached
   // it (e.g. topic created 3s before consumer start; broker registers its
@@ -974,11 +970,10 @@ export class MQClient {
     if (refreshed) void this.sendHeartbeatToAllBrokers();
   }
 
-  // Java MQClientInstance schedules sendHeartbeatToAllBrokerWithLock() every
-  // 30s (+ an early beat at start). Without a client-level heartbeat the
-  // broker's ProducerManager has no channel for the producer group and can
-  // never send CHECK_TRANSACTION_STATE back — the transaction check-back path
-  // silently dies ("Check transaction failed, channel table is empty").
+  // Client-level heartbeat beat every 30s (+ an early beat at start). Without
+  // it the broker's ProducerManager has no channel for the producer group and
+  // can never send CHECK_TRANSACTION_STATE back — the transaction check-back
+  // path silently dies ("Check transaction failed, channel table is empty").
   // Consumers keep their own loop too; duplicate beats are idempotent.
   private _startHeartbeatLoop(): void {
     if (this._heartbeatTimer != null) return;
@@ -988,7 +983,7 @@ export class MQClient {
   }
 
   private async sendHeartbeatToAllBrokers(): Promise<void> {
-    // Java sends the heartbeat to EVERY broker entry (masters and slaves).
+    // Heartbeats go to EVERY broker entry (masters and slaves).
     const entries = this.getAllBrokerAddrEntries();
     logger.debug('heartbeat beat to %d broker(s)', entries.length);
     for (const { addr } of entries) {
@@ -996,10 +991,9 @@ export class MQClient {
     }
   }
 
-  // Java ClientRemotingProcessor.checkTransactionState + DefaultMQProducerImpl
-  // .checkTransactionState: the broker's transaction-poll thread sends
-  // CHECK_TRANSACTION_STATE to the client; the client replies SUCCESS at once,
-  // then runs the listener check OFF the read thread (hard rule: a
+  // Broker-initiated transaction check: the broker's transaction-poll thread
+  // sends CHECK_TRANSACTION_STATE to the client; the client replies SUCCESS at
+  // once, then runs the listener check OFF the read thread (hard rule: a
   // broker-initiated request handler must NEVER issue a synchronous request
   // inline — self deadlock) and finally fires END_TRANSACTION oneway.
   private _registerTransactionCheckProcessor(): void {
@@ -1014,7 +1008,7 @@ export class MQClient {
         response.remark = 'decode message failed';
         return response;
       }
-      // transactionId = UNIQ_KEY user property (Java checkTransactionState).
+      // transactionId = UNIQ_KEY user property (broker-side check contract).
       const uniqKey = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
       if (uniqKey != null) (msg as any).transactionId = uniqKey;
       const group = msg.getProperty(MessageConst.PROPERTY_PRODUCER_GROUP);
@@ -1052,8 +1046,9 @@ export class MQClient {
     });
   }
 
-  // Java ClientRemotingProcessor.processReplyMsg: the broker pushes the REPLY
-  // message of a request(326) to the requesting client. The wire is NOT the 17
+  // Broker-initiated reply delivery (PUSH_REPLY_MESSAGE_TO_CLIENT, 326): the
+  // broker pushes the REPLY
+  // message of a request to the requesting client. The wire is NOT the 17
   // segment stored format — the message fields ride in the
   // ReplyMessageRequestHeader extFields and only the body is binary. The
   // handler rebuilds the MessageExt, extracts the CORRELATION_ID and resolves
@@ -1089,13 +1084,14 @@ export class MQClient {
           return response;
         }
         // Atomically remove so only one of the reply-arrival path and the
-        // timeout-scan path can take ownership (Java processReplyMessage).
+        // timeout-scan path can take ownership.
         const future = REQUEST_FUTURE_HOLDER.removeRequest(correlationId);
         if (future == null) {
           logger.warning('receive reply message, but not matched any request, CorrelationId: %s', correlationId);
           return response;
         }
-        // Java wakes the sync caller off the Netty thread — same hard rule here.
+        // Wake the sync caller off the read thread — same hard rule as the
+        // transaction-check processor: never run user code inline.
         setImmediate(() => future.complete(msg));
       } catch (e) {
         logger.warning('process reply message failed: %s', (e as Error).message);

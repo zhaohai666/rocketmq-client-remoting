@@ -1,10 +1,9 @@
 package common
 
-// MessageType mirrors Java org.apache.rocketmq.common.message.MessageType.
+// MessageType is the message-type classification carried in trace records.
 //
-// The INTEGER values are load-bearing: the trace codec writes msgType as the
-// enum's ordinal() (TraceDataEncoder's Pub and EndTransaction branches), so the
-// declaration order must match Java's exactly —
+// The INTEGER values are load-bearing: trace records store msgType as the
+// enum's ordinal, so the declaration order is itself the wire contract —
 // Normal_Msg=0, Trans_Msg_Half=1, Trans_msg_Commit=2, Delay_Msg=3, Order_Msg=4.
 // Reordering these would silently corrupt every trace record.
 type MessageType int
@@ -17,10 +16,9 @@ const (
 	OrderMsg
 )
 
-// messageTypeShortNames is Java MessageType's short name table. The values are
-// wire literals too: the trace HTTP/JSON views read them back by name
-// (MessageType.getByShortName), and an unknown name falls back to Normal_Msg
-// rather than failing.
+// messageTypeShortNames maps each type to its wire short name. The values are
+// wire literals too: the trace HTTP/JSON views read them back by name,
+// and an unknown name falls back to Normal_Msg rather than failing.
 var messageTypeShortNames = map[MessageType]string{
 	NormalMsg:      "Normal",
 	TransMsgHalf:   "Trans",
@@ -29,7 +27,7 @@ var messageTypeShortNames = map[MessageType]string{
 	OrderMsg:       "Order",
 }
 
-// ShortName is Java MessageType.getShortName().
+// ShortName returns the wire short name; an unknown type reports Normal.
 func (t MessageType) ShortName() string {
 	if name, ok := messageTypeShortNames[t]; ok {
 		return name
@@ -37,8 +35,8 @@ func (t MessageType) ShortName() string {
 	return messageTypeShortNames[NormalMsg]
 }
 
-// MessageTypeByShortName is Java MessageType.getByShortName: an unrecognised
-// name degrades to NormalMsg, it does not error.
+// MessageTypeByShortName maps a wire short name back to a type; an
+// unrecognised name degrades to NormalMsg, it does not error.
 func MessageTypeByShortName(shortName string) MessageType {
 	for t, name := range messageTypeShortNames {
 		if name == shortName {

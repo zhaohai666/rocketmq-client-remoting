@@ -46,7 +46,7 @@ public class LoggingTests : IDisposable
     }
 
     [Fact]
-    public void LineFormat_MatchesJavaStyle()
+    public void LineFormat_MatchesLegacyStyle()
     {
         string path = Path.Combine(_dir, "fmt.log");
         ClientLog.SetLogFile(path);

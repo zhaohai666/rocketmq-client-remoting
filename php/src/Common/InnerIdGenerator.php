@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息唯一 ID 生成器（对应用户端 MessageClientIDSetter，移植自 util_all.py 的 InnerIdGenerator）。
+ * 消息唯一 ID 生成器：UNIQ_KEY 的字节布局实现。
  */
 final class InnerIdGenerator
 {
@@ -24,14 +24,13 @@ final class InnerIdGenerator
         $result = '';
         $bin = @inet_pton($ip);
         if ($bin === false) {
-            // Python inet_pton 对非法地址抛 OSError，这里同样不让它静默通过
+            // 本机 IP 非法时不能让 UNIQ_KEY 静默带上坏地址
             throw new \ValueError(sprintf('invalid local ip: %s', $ip));
         }
         $result .= $bin;
         $result .= pack('n', $pid & 0xFFFF);
-        // Python 用 abs(hash("RocketMQClient"))——进程级随机盐、同进程内恒定；
-        // PHP 无等价物，改用确定性 crc32（该字段只需进程内稳定，Java 侧本来就是
-        // classloader hashCode 这类任意值）。
+        // 这一段是进程级盐，只要求同进程内恒定：协议侧它本来就是类加载
+        // 哈希这类任意值，所以这里用确定性 crc32。
         $result .= pack('N', crc32('RocketMQClient') & 0xFFFFFFFF);
         $now = new \DateTimeImmutable('now');
         $monthMs = ((((int) $now->format('G')) * 60 + (int) $now->format('i')) * 60 + (int) $now->format('s')) * 1000

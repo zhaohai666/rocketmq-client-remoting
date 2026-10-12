@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""管理端专用响应体（对应 org.apache.rocketmq.remoting.protocol.admin.* 与 body.* 中的管理类）：
+"""管理端专用响应体（协议 admin.* 与 body.* 中的管理类）：
 
 TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
 TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody。
 
-⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，fastjson2 会把键直接内联成 JSON 对象，
-产出**非法 JSON**，例如：
+⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧按 fastjson 序列化时会把
+键直接内联成 JSON 对象，产出**非法 JSON**，例如：
     {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
 所以必须用 serialize.fastjson_loads 解析，再把字符串键还原成 MessageQueue。
-字段名与结构均由 Java 探针实测确认。
+字段名与结构均由对 5.5.1 broker 的实测响应确认。
 """
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ class OffsetWrapper:
 
     @property
     def lag(self) -> int:
-        """与 Java OffsetWrapper.getLag() 一致：brokerOffset - consumerOffset。"""
+        """lag 的定义：brokerOffset - consumerOffset。"""
         return self.broker_offset - self.consumer_offset
 
     def to_dict(self) -> dict:
@@ -243,7 +243,7 @@ class ConsumeQueueData:
             "eval": self.eval,
             "bitMap": self.bit_map,
         }
-        # 同 Java：null 字段不序列化
+        # fastjson NON_NULL 语义：null 字段不序列化
         if self.extend_data_json is not None:
             d["extendDataJson"] = self.extend_data_json
         if self.msg is not None:

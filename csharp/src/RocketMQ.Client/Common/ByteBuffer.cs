@@ -246,7 +246,7 @@ public sealed class ByteReader
     }
 }
 
-public static class JavaHash
+public static class LegacyHash
 {
     /// <summary>
     /// Java String.hashCode：逐 char（UTF-16 单元）累加，32 位有符号回绕。
@@ -254,7 +254,7 @@ public static class JavaHash
     /// （C++ 侧要先从 UTF-8 解码再拆代理对，这里天然不需要）。
     /// unchecked 保证溢出回绕而不是抛异常。
     /// </summary>
-    public static int JavaStringHash(string s)
+    public static int StringHash(string s)
     {
         unchecked
         {
@@ -270,7 +270,7 @@ public static class JavaHash
 }
 
 /// <summary>Java 的 int/long 溢出语义：结果按 32/64 位有符号回绕（对应 C++ 的 toInt32）。</summary>
-public static class JavaNumber
+public static class LegacyNumber
 {
     public static int ToInt32(long v) => unchecked((int)(v & 0xFFFFFFFFL));
 

@@ -1,6 +1,6 @@
 // -*- coding: utf-8 -*-
 // SubscriptionData + FilterAPI (org.apache.rocketmq.common.filter.*).
-import { javaStringHash, currentTimeMillis } from './utilAll.ts';
+import { serverStringHash, currentTimeMillis } from './utilAll.ts';
 
 export const ExpressionType = {
   TAG: 'TAG',
@@ -50,7 +50,7 @@ export const FilterAPI = {
       const tag = part.trim();
       if (tag !== '') {
         sub.tagsSet.add(tag);
-        sub.codeSet.add(javaStringHash(tag));
+        sub.codeSet.add(serverStringHash(tag));
       }
     }
     return sub;

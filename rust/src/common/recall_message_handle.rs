@@ -98,7 +98,7 @@ mod tests {
     /// 载荷 `"v1 TopicA broker-a 1700000000000 <UNIQ_KEY>"` 的 base64url，
     /// 用 `java.util.Base64.getUrlEncoder()` 口径（含填充）算出。
     #[test]
-    fn encoding_matches_the_java_vector() {
+    fn encoding_matches_the_wire_vector() {
         assert_eq!(
             "djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAg\
              MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=",
@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn java_padded_and_unpadded_handles_both_decode() {
+    fn padded_and_unpadded_handles_both_decode() {
         let padded = build_handle("TopicA", "broker-a", "1700000000000", UNIQ_KEY);
         let unpadded = padded.trim_end_matches('=').to_string();
         assert_ne!(padded, unpadded, "Java 的编码器确实会补填充");
@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_handles_are_rejected_with_the_java_message() {
+    fn bad_handles_are_rejected_with_the_canonical_message() {
         let v2 = base64::engine::general_purpose::URL_SAFE.encode(b"v2 a b c d");
         for bad in ["", "not base64 !!", "!!!!", &v2] {
             let err = decode_handle(bad).expect_err("must not decode");
@@ -138,7 +138,7 @@ mod tests {
     /// Java `split(" ")` 只丢尾部空段，中间空段算一段 —— 载荷里多一段仍然合法，
     /// 前 5 段之外的内容照 Java 被忽略。
     #[test]
-    fn extra_segments_are_ignored_like_java_split() {
+    fn extra_segments_are_ignored_by_trailing_empty_split() {
         let raw = format!("v1 TopicA broker-a 1700000000000 {UNIQ_KEY} trailing");
         let encoded = base64::engine::general_purpose::URL_SAFE.encode(raw);
         assert_eq!(UNIQ_KEY, decode_handle(&encoded).expect("valid").message_id);

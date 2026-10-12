@@ -258,13 +258,14 @@ func TestCommandString(t *testing.T) {
 }
 
 // CurrentVersionDesc must stay paired with CurrentVersion. There is no
-// arithmetic relation to check (Java's Version ordinals are hand-maintained:
-// V5_5_0=513, V5_5_1=515, V5_5_2=517), so both values are pinned literals —
-// editing either one alone fails here, which is the whole point. A stale pair
-// would put a version in the 307 answer that this client does not speak.
+// arithmetic relation to check (the protocol's Version ordinals are
+// hand-maintained: V5_5_0=513, V5_5_1=515, V5_5_2=517), so both values are
+// pinned literals — editing either one alone fails here, which is the whole
+// point. A stale pair would put a version in the 307 answer that this client
+// does not speak.
 func TestCurrentVersionDescMatchesCurrentVersion(t *testing.T) {
-	// The 5.5.1 jars: CURRENT_VERSION = Version.V5_5_1.ordinal() = 515 and
-	// getVersionDesc(515) == "V5_5_1".
+	// Measured against the 5.5.1 server: CURRENT_VERSION =
+	// Version.V5_5_1.ordinal() = 515 and getVersionDesc(515) == "V5_5_1".
 	if CurrentVersion != 515 {
 		t.Errorf("CurrentVersion = %d, want 515", CurrentVersion)
 	}
@@ -273,7 +274,8 @@ func TestCurrentVersionDescMatchesCurrentVersion(t *testing.T) {
 	}
 	// It must be a real version name: the console parses the digits out of
 	// PROP_CLIENT_VERSION, so a placeholder reads as a much older (or newer)
-	// client. `HIGHER_VERSION` is what Java returns for an out-of-range ordinal,
+	// client. `HIGHER_VERSION` is what the version table returns for an
+	// out-of-range ordinal,
 	// i.e. exactly the wrong answer to hardcode here.
 	if !versionDescPattern.MatchString(CurrentVersionDesc) {
 		t.Errorf("CurrentVersionDesc = %q, want a V<maj>_<min>_<patch> name", CurrentVersionDesc)

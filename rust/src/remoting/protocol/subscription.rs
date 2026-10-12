@@ -399,7 +399,7 @@ mod tests {
     const GOLDEN_CONFIG: &str = r#"{"groupName":"MyGroup","consumeEnable":true,"consumeFromMinEnable":true,"consumeBroadcastEnable":true,"consumeMessageOrderly":false,"retryQueueNums":1,"retryMaxTimes":16,"groupRetryPolicy":{"type":"CUSTOMIZED"},"brokerId":0,"whichBrokerWhenConsumeSlowly":1,"notifyConsumerIdsChangedEnable":true,"groupSysFlag":0,"consumeTimeoutMinute":15,"attributes":{}}"#;
 
     #[test]
-    fn default_config_matches_java_probe() {
+    fn default_config_matches_server_probe() {
         let encoded = String::from_utf8(SubscriptionGroupConfig::new("MyGroup").encode()).unwrap();
         assert_eq!(encoded, GOLDEN_CONFIG);
     }
@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_fills_java_defaults_for_absent_keys() {
+    fn decode_fills_protocol_defaults_for_absent_keys() {
         let cfg = SubscriptionGroupConfig::decode(br#"{"groupName":"G"}"#).unwrap();
         assert_eq!(cfg.group_name, "G");
         assert!(cfg.consume_enable);

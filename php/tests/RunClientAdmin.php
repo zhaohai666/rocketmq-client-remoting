@@ -8,8 +8,8 @@ declare(strict_types=1);
  * 覆盖：Subscription 协议模型、DefaultMQAdminExt 全量方法面（请求头字段 / 请求码 /
  * body 编码形态 / 分页 / KV 广播 / offset 重置 / 异常路径）。
  *
- * 网络层替身：FakeAdmin 覆写 DefaultMQAdminExt::invokeSyncOn（Python 侧
- * client._invoke_sync 的等价入口），按脚本应答并记录全部请求；FakeClient 子类化
+ * 网络层替身：FakeAdmin 覆写 DefaultMQAdminExt::invokeSyncOn（同步传输入口的等价点），
+ * 按脚本应答并记录全部请求；FakeClient 子类化
  * MQClientInstance，覆写委托给实例的管理类方法并记录调用。
  *
  * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientAdmin.php
@@ -426,7 +426,7 @@ final class RunClientAdmin
         $this->checkSame('*', $sd->expression, 'SimpleSubscriptionData 默认 expression=*');
         $this->checkSame(0, $sd->version, 'SimpleSubscriptionData 默认 version=0');
 
-        // ---- SubscriptionGroupConfig（字段默认值按 Java 探针）
+        // ---- SubscriptionGroupConfig（字段默认值）
         $cfg = new SubscriptionGroupConfig('MyGroup');
         $this->checkSame('MyGroup', $cfg->groupName, 'SubscriptionGroupConfig groupName');
         $this->checkSame(true, $cfg->consumeEnable, 'SubscriptionGroupConfig consumeEnable=true');
@@ -528,7 +528,7 @@ final class RunClientAdmin
         $real->setInstanceName('DEFAULT');
         $real->start();
         $this->check($real->instanceName !== 'DEFAULT', "start 时 DEFAULT 实例名换成 <pid>#<nanoTime>");
-        // Java changeInstanceNameToPID 已把 DEFAULT 换成 <pid>#<nanoTime>，
+        // changeInstanceNameToPID 已把 DEFAULT 换成 <pid>#<nanoTime>，
         // clientId 形如 <ip>@<pid>#<nanoTime>，不再含字面量 DEFAULT。
         $this->check(
             $real->getClientId() !== null && str_contains((string) $real->getClientId(), '@')
@@ -547,7 +547,7 @@ final class RunClientAdmin
         $injected->setMqClientInstance($fc);
         $this->check($injected->getMqClientInstance() === $fc, 'setMqClientInstance 注入并取回');
 
-        // permIsValid（Python 模块级 _perm_is_valid）
+        // permIsValid（权限位判定）
         $this->checkSame(true, DefaultMQAdminExt::permIsValid('6'), "permIsValid('6')");
         $this->checkSame(true, DefaultMQAdminExt::permIsValid('0'), "permIsValid('0')");
         $this->checkSame(true, DefaultMQAdminExt::permIsValid(4), 'permIsValid(4)');
@@ -902,8 +902,8 @@ final class RunClientAdmin
         $this->checkSame('V1', $admin3->getKvConfig('NS', 'K'), 'getKvConfig 取 ext value');
         $this->checkSame(RequestCode::GET_KV_CONFIG, $this->lastCmd($admin3)->code, 'GET_KV_CONFIG=101');
         $admin3->handler = fn() => $this->errResponse(ResponseCode::SYSTEM_ERROR, 'x');
-        // Python get_kv_config：非 SUCCESS **不抛**，返回 None（与 checkResponse 语义不同）
-        $this->checkSame(null, $admin3->getKvConfig('NS', 'K'), 'getKvConfig 非 SUCCESS → null（对齐 Python）');
+        // getKvConfig：非 SUCCESS **不抛**，返回 null（与 checkResponse 语义不同）
+        $this->checkSame(null, $admin3->getKvConfig('NS', 'K'), 'getKvConfig 非 SUCCESS → null（不抛异常）');
 
         $admin4 = $this->newAdmin();
         $kv = new KVTable();
@@ -937,8 +937,8 @@ final class RunClientAdmin
         $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('', 'v'), MQClientException::class, 'createOrUpdateOrderConf 空 key 抛');
         $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('T', ''), MQClientException::class, 'createOrUpdateOrderConf 空 value 抛');
         $this->checkThrows(fn() => $admin6b->createOrUpdateOrderConf('T', ':conf'), MQClientException::class, 'createOrUpdateOrderConf value 无 key 抛');
-        // getKvConfig 抛异常时按空表继续（Python: try/except Exception → old_confs=""）
-        // 注意：Python 的 put 广播对连接失败**不容错**（_invoke_namesrv_all 不 try/except），
+        // getKvConfig 抛异常时按空表继续（异常被吞，old_confs 视为空串）
+        // 注意：put 广播对连接失败**不容错**（不做 try/catch 兜底），
         // 所以这里只让首次 GET 失败，PUT 必须能正常到达。
         $admin6c = $this->newAdmin();
         $seen6c = 0;
@@ -1378,7 +1378,7 @@ final class RunClientAdmin
         $t4 = $admin4->messageTrackDetail($this->trackMsg());
         $this->checkSame(TrackType::NOT_CONSUME_YET, $t4[0]->trackType, '位点未越过 → NOT_CONSUME_YET');
 
-        // BROADCAST_CONSUMPTION（213）—— Python 语义：213 在 consumed() 阶段（208）返回
+        // BROADCAST_CONSUMPTION（213）—— 判据：213 在 consumed() 阶段（208）返回
         // 才会落 CONSUME_BROADCASTING；连接阶段（203）的 213 只落 UNKNOWN + desc。
         $admin5 = $this->newAdmin();
         $this->route('T', 'broker-a', 'b:a');
@@ -1609,7 +1609,7 @@ final class RunClientAdmin
         $admin15->handler = fn(RemotingCommand $cmd) => $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($target));
         $got15 = $admin15->viewMessage('T', $msgId);
         $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $this->lastCmd($admin15)->code, 'VIEW_MESSAGE_BY_ID=33');
-        $this->checkSame('127.0.0.1:10911', $this->lastAddr($admin15), 'viewMessage 按 msgId 解出 broker 地址（Python 同样直连解码地址，不走路由）');
+        $this->checkSame('127.0.0.1:10911', $this->lastAddr($admin15), 'viewMessage 按 msgId 解出 broker 地址（直连解码地址，不走路由）');
         $this->checkSame($target->getBody(), $got15->getBody(), 'viewMessage 命中 offset msgId');
 
         // viewMessage：port=0（uniqKey 形态）→ 兜底 uniq 查询

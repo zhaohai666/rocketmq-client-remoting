@@ -117,7 +117,7 @@ def _stop(c, th):
 
 # ---------------- 常量：退避时长与 Java 默认一致 ----------------
 
-def test_suspend_backoff_matches_java_default():
+def test_suspend_backoff_matches_the_default_interval():
     """Java PULL_TIME_DELAY_MILLS_WHEN_SUSPEND 默认 1000ms。
 
     写小 ⇒ 挂起期间循环空转刷屏；写大 ⇒ resume() 后要等好几秒才恢复消费，

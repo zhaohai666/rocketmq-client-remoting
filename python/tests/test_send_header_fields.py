@@ -214,7 +214,7 @@ def test_sync_send_forwards_producer_config():
     assert seen["default_topic_queue_nums"] == 16
 
 
-def test_defaults_are_java_defaults_when_setters_never_run():
+def test_defaults_are_the_protocol_defaults_when_setters_never_run():
     p = _producer()
     p.send(Message("T_Header", b"x"))
     seen = p._mq_client.sync[-1]

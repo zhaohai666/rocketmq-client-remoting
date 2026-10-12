@@ -1,10 +1,10 @@
 // live_tls verifies the TLS transport against a broker started with
-// `-Dtls.enable=true`. Three legs (mirrors php/examples/live_tls.php):
+// `-Dtls.enable=true`. Three legs:
 //   plain_tls : tlsEnable only — trust the broker's self-signed cert
-//               (Java tls.test.mode.enable=true semantics)
+//               (test-mode 语义，不校验链与主机名)
 //   ca_verify : + setTlsOptions({caCert, serverName}) — STRICT verification:
 //               the broker cert must chain to the CA and the hostname/SAN
-//               must match (Java tls.test.mode.enable=false semantics)
+//               must match
 //   mtls      : ca_verify + client certificate (broker -Dtls.server.authClient=true)
 //
 //   node --experimental-strip-types examples/live_tls.ts --ns 127.0.0.1:9876 \

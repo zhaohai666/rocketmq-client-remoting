@@ -1,10 +1,9 @@
 package common
 
-// MessageClientIDSetter (Java org.apache.rocketmq.common.message.
-// MessageClientIDSetter / Python message_client_id_setter.py).
+// MessageClientIDSetter assigns and reads the UNIQ_KEY message id property.
 
-// SetUniqID writes UNIQ_KEY only when it is absent (Java
-// MessageClientIDSetter.setUniqID). The "only when absent" part is what makes
+// SetUniqID writes UNIQ_KEY only when it is absent. The "only when absent"
+// part is what makes
 // the id STABLE across send retries: every attempt goes through here, and the
 // broker, the trace subsystem and END_TRANSACTION all key off the first value.
 // Overwriting it on retry would make SendResult.msgId differ from the message

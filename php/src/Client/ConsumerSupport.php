@@ -9,10 +9,9 @@ use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\SubscriptionData;
 
 /**
- * 消费侧公共基础件，移植自 python/client/consumer.py 的模块常量、模块级辅助函数
- * 与 PopProcessQueue。
+ * 消费侧公共基础件：模块常量、模块级辅助函数与 PopProcessQueue。
  *
- * 分配策略（AllocateMessageQueue*）已在 Allocation.php 移植，不在此重复；
+ * 分配策略（AllocateMessageQueue*）已在 Allocation.php 实现，不在此重复；
  * 消费/拉取结果类型在 ConsumerResult.php。
  *
  * ⚠ PHP 的 autoloader 只加载类、不加载函数：本文件里的全局函数随本文件被
@@ -20,47 +19,46 @@ use RocketMQ\Common\SubscriptionData;
  * require 本文件（各消费方文件头部已做该保护）。
  */
 
-/** 消费侧常量（全部对齐 Java 数值）。 */
+/** 消费侧默认常量。 */
 final class ConsumerDefaults
 {
     /**
-     * POP 消费失败的延迟梯度（秒），逐项对应 Java
-     * DefaultMQPushConsumerImpl.popDelayLevel。
+     * POP 消费失败后重投的延迟档位表（秒）：按消息已存活时长挑档，
+     * 超过最长档的 2 倍仍未消费成功就直接 ack 丢弃。
      * @var list<int>
      */
     public const POP_DELAY_LEVEL = [10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600,
         1200, 1800, 3600, 7200];
 
-    /** Java DefaultMQPushConsumerImpl.MIN/MAX_POP_INVISIBLE_TIME：超出范围一律回落到 60000 */
+    /** POP 不可见时间的合法区间（毫秒）：超出范围一律回落到 60000 */
     public const MIN_POP_INVISIBLE_TIME = 5000;
     public const MAX_POP_INVISIBLE_TIME = 300000;
 
-    /** Java ConsumeInitMode */
+    /** pop 请求 initMode 字段：0 = 从队列最小位点起消费，1 = 从最大位点起消费 */
     public const CONSUME_INIT_MODE_MIN = 0;
     public const CONSUME_INIT_MODE_MAX = 1;
 
-    /** Java `Integer.MAX_VALUE`：顺序消费用尽判据的默认值（-1 在这条链路上读成它）。 */
-    public const JAVA_INT_MAX = 0x7FFFFFFF;
+    /** int32 上限：顺序消费「重试次数用尽」判据的默认值（-1 在这条链路上读成它）。 */
+    public const INT32_MAX = 0x7FFFFFFF;
 
     /**
-     * Java ProcessQueue.PULL_MAX_IDLE_TIME（默认 120000ms）。
+     * 拉取空闲上限 PULL_MAX_IDLE_TIME（默认 120000ms）。
      * 一个仍归本实例的队列超过这么久没发起过任何拉取/弹出 ⇒ rebalance 撤掉重建。
      */
     public const PULL_MAX_IDLE_TIME = 120.0;
 
     /**
-     * Java DefaultMQPushConsumerImpl.PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（1000ms）：
-     * suspend() 之后一条拉取循环每轮退避这么久。PHP 没有循环线程，退避由调用方的
+     * suspend() 之后的拉取退避时长（1000ms）。PHP 没有循环线程，退避由调用方的
      * tick 节奏承担（见 PushConsumer::suspend() 的说明），这个常量锁的是语义差：
      * 挂起**不撤队列**，而 PULL_MAX_IDLE_TIME 判的是"这条循环还活着吗"。
      */
     public const PULL_TIME_DELAY_WHEN_SUSPEND = 1.0;
 }
 
-/** 队列排序键，语义对齐 Java MessageQueue.compareTo：topic → brokerName → queueId。 */
+/** 队列排序键：topic → brokerName → queueId。 */
 function consumer_mq_sort_key(MessageQueue $mq): array
 {
-    // Java rebalance 会先把 mqAll/cidAll 排序再分配；顺序不一致会让不同实例算出
+    // rebalance 必须先把 mqAll/cidAll 排序再分配；顺序不一致会让不同实例算出
     // 不同的分配结果（同一队列被两个实例同时消费）。
     return [$mq->topic, $mq->brokerName, $mq->queueId];
 }
@@ -78,9 +76,9 @@ function safe_hook_name(object $hook): string
 }
 
 /**
- * 客户端二次 tag 过滤（对应 Java PullAPIWrapper.processPullResult:113-122）。
+ * 客户端二次 tag 过滤。
  *
- * broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放；Java 因此让客户端
+ * broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放，所以客户端必须
  * 再按字符串核一遍。守卫 `!tagsSet.isEmpty() && !isClassFilterMode` 意味着：
  * 订阅 `"*"`（SUB_ALL）时不过滤 —— 所以 `FilterAPI::buildSubscriptionData`
  * 对 SUB_ALL 必须保持 tagsSet 为空（那里有详细注释）。
@@ -106,7 +104,7 @@ function client_side_tag_filter(?SubscriptionData $sub, array $msgs): array
 }
 
 /**
- * 依次执行过滤钩子，**异常一律吞掉**（Java PullAPIWrapper.executeHook:171-178 记 error）。
+ * 依次执行过滤钩子，**异常一律吞掉**，只记一条 error 日志。
  *
  * 与 send/consume 钩子不同：过滤钩子失败不能影响消费，只是该次过滤不生效。
  *
@@ -127,7 +125,7 @@ function execute_filter_hooks(array $hookList, FilterMessageContext $context): v
  * 投递前过滤 = 客户端二次 tag 过滤 + FilterMessageHook（拉取/POP/pull 三处共用）。
  *
  * 钩子拿到的是**可变的** ``msgList``；被摘掉的消息由调用方决定处置方式：
- * 拉取路径 = 静默跳过（位点照常推进，不 ack，Java 亦然）；
+ * 拉取路径 = 静默跳过（位点照常推进，不 ack）；
  * POP 路径 = 必须立刻 ack，否则 invisibleTime 到期后会复活重投。
  *
  * @param list<object> $hookList
@@ -145,17 +143,17 @@ function filter_messages_for_delivery(
     $out = client_side_tag_filter($sub, array_values($msgs));
     if ($out !== [] && $hookList !== []) {
         $context = new FilterMessageContext($consumerGroup, $out, $mq);
-        $context->unitMode = $unitMode;    // Java DefaultMQPushConsumerImpl:640
+        $context->unitMode = $unitMode;    // 单元化部署标记，钩子据此区分本单元/跨单元消息
         execute_filter_hooks($hookList, $context);
         $out = array_values($context->msgList);
     }
     return $out;
 }
 
-// ---------------- 本地位点文件格式（对齐 Java LocalFileOffsetStore）----------------
-// Java 侧 fastjson2 序列化 Map<MessageQueue, AtomicLong> 时把 MessageQueue 对象**直接
-// 当 JSON key** 写出 —— 严格 JSON 非法，但 fastjson2 自产自销能读回。字段序固定为
-// brokerName/queueId/topic（fastjson2 字母序）。队列 key 仍用 topic+broker+queueId 拼接。
+// ---------------- 本地位点文件格式 ----------------
+// offset.json 里 MessageQueue → offset 的映射是把 MessageQueue 对象**直接当 JSON
+// key** 写出的 —— 严格 JSON 非法，但这份文件自己回读能解析。key 内字段序固定为
+// brokerName/queueId/topic（字母序）。内存里的队列 key 仍用 topic+broker+queueId 拼接。
 
 /**
  * @param array<string,int> $items key = topic.brokerName.queueId 拼接串
@@ -167,7 +165,7 @@ function build_local_offsets_json(array $items, array $mqMap): string
     foreach ($items as $key => $off) {
         $mq = $mqMap[$key] ?? null;
         if ($mq === null) {
-            // 与 Java persistAll(mqs) 一样：只写仍持有队列信息的条目
+            // 只写仍持有队列信息的条目：位点表里有、路由表里已经查不到的队列跳过
             continue;
         }
         $obj = json_encode([
@@ -181,7 +179,7 @@ function build_local_offsets_json(array $items, array $mqMap): string
 }
 
 /**
- * 解析本地位点文件（严格 JSON 扁平 map 或 Java fastjson2 的「对象作 key」格式）。
+ * 解析本地位点文件（严格 JSON 扁平 map 或「对象作 key」两种格式）。
  *
  * @return array<string,int>|null key = topic.brokerName.queueId 拼接串
  */
@@ -191,8 +189,8 @@ function parse_local_offsets_json(?string $text): ?array
         return null;
     }
     $stripped = trim($text);
-    // 先按严格 JSON 解析（旧版本端写过的扁平 map）；Java fastjson2 的"对象作 key"
-    // 格式对严格解析必然失败（含 pretty 版），落进下面的容忍扫描器。
+    // 先按严格 JSON 解析（旧版本写过的扁平 map）；「对象作 key」格式对严格解析
+    // 必然失败（含 pretty 版），落进下面的容忍扫描器。
     $strict = json_decode($stripped, true);
     if (is_array($strict)) {
         $out = [];
@@ -235,7 +233,7 @@ function scan_offset_table_body(string $text): ?array
         return $entries;
     }
     $pos = 0;
-    // 对应 Python _OBJ_AS_KEY_RE：(\{[^{}]*\})\s*:\s*(-?\d+)
+    // 「对象作 key」的匹配式：(\{[^{}]*\})\s*:\s*(-?\d+)
     if (!preg_match_all('/(\{[^{}]*\})\s*:\s*(-?\d+)/s', $body, $matches, PREG_OFFSET_CAPTURE)) {
         return null;
     }
@@ -248,7 +246,7 @@ function scan_offset_table_body(string $text): ?array
             return null;
         }
         $fields = [];
-        // 对应 Python _FIELD_RE："(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)
+        // 字段匹配式："(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)
         if (preg_match_all('/"(\w+)"\s*:\s*("(?:[^"\\\\]|\\\\.)*"|-?\d+)/s', $objBody, $fm, PREG_SET_ORDER)) {
             foreach ($fm as $fo) {
                 $raw = $fo[2];
@@ -277,39 +275,40 @@ function scan_offset_table_body(string $text): ?array
 }
 
 /**
- * 对应 Java `MessageQueue#toString`（一致性哈希要哈希**它**，不是 PHP 的 repr）。
+ * 队列的线上字符串形态：一致性哈希要散列**它**，不是 PHP 的对象 repr。
  *
- * ⚠ 必须逐字符等于 Java 的 `"MessageQueue [topic=.., brokerName=.., queueId=..]"`。
+ * ⚠ 必须逐字符等于 `"MessageQueue [topic=.., brokerName=.., queueId=..]"`，
+ * 换个写法环上的散列值就变了，队列归属会整体漂移。
  */
-function java_message_queue_string(MessageQueue $mq): string
+function wire_queue_key_string(MessageQueue $mq): string
 {
     return sprintf('MessageQueue [topic=%s, brokerName=%s, queueId=%d]',
         $mq->topic, $mq->brokerName, $mq->queueId);
 }
 
 /**
- * 对应 Java `String#split(String)`（limit=0）：**丢掉末尾的空段**。
+ * 按「裁掉末尾空段」的规则切分字符串（等价于 limit=0 的 split）。
  *
- * PHP 的 `explode` 保留尾空段，`AllocateMessageQueueByMachineRoom` 恰好按
+ * PHP 的 `explode` 保留尾空段，而 `AllocateMessageQueueByMachineRoom` 恰好按
  * `count == 2` 判合法，差异会直接改变一条队列参不参与分配：
  *
- * | 输入 | Java | PHP 原生 |
+ * | 输入 | 本函数 | explode 原生 |
  * |---|---|---|
  * | `"room1@"` | `["room1"]`（1 段，剔除） | `["room1", ""]`（2 段，误收） |
  * | `"room1@b@"` | `["room1", "b"]`（2 段，收） | `["room1", "b", ""]`（3 段，误剔） |
  * | `"@"` | `[]` | `["", ""]` |
  * | `""` / `"broker-a"` | 无分隔符命中时**整串原样返回**，哪怕是空串 | 同 |
  *
- * 最后一行是 Java `Pattern#split` 里 "If no match was found, return this" 那个早返回，
+ * 最后一行是最容易踩的坑：没命中分隔符时必须原样返回整串，
  * 所以不能无条件裁尾（否则 `""` 会变成 `[]`）。
  *
  * @return list<string>
  */
-function java_split(string $text, string $sep): array
+function wire_split(string $text, string $sep): array
 {
     $parts = explode($sep, $text);
     if (count($parts) === 1) {
-        return $parts; // 没命中分隔符：Java 原样返回整串
+        return $parts; // 没命中分隔符：整串原样返回
     }
     while ($parts !== [] && end($parts) === '') {
         array_pop($parts);
@@ -318,7 +317,7 @@ function java_split(string $text, string $sep): array
 }
 
 /**
- * POP 模式的队列状态（对应 org.apache.rocketmq.client.impl.consumer.PopProcessQueue）。
+ * POP 模式的队列状态。
  *
  * 与 pull 模式的 ProcessQueue 不同，POP **没有"已拉未消费"缓冲**：消息一弹出就交给
  * 消费流程，确认靠 ack。这里只跟踪两件事：
@@ -327,14 +326,14 @@ function java_split(string $text, string $sep): array
  * - ``dropped``：队列是否已被 rebalance 撤走（撤走后本批消息不再消费、也不 ack，
  *   交给 invisibleTime 到期后 broker 自动复活重投）。
  *
- * PHP 单线程模型下不需要锁（PORTING.md「异步模型」）。
+ * PHP 单线程模型下不需要锁。
  */
 final class PopProcessQueue
 {
     private int $waitAckCounter = 0;
     private bool $dropped = false;
 
-    /** 最近一次发起弹出的时刻（Java lastPopTimestamp），float 秒。 */
+    /** 最近一次发起弹出的时刻，float 秒。 */
     public float $lastPopTimestamp = 0.0;
 
     public function __construct()
@@ -347,7 +346,7 @@ final class PopProcessQueue
         $this->waitAckCounter += $count;
     }
 
-    /** Java 传的是负数（decFoundMsg(-msgs.size())），这里按"减多少"理解。 */
+    /** 递减沿用协议侧约定：调用方传负数（如 -count($msgs)），内部直接累加。 */
     public function decFoundMsg(int $count): void
     {
         $this->waitAckCounter += $count;

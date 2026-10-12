@@ -1,6 +1,5 @@
-// DefaultMQPullConsumer — the ACTIVE pull consumer (Java
-// org.apache.rocketmq.client.consumer.DefaultMQPullConsumer +
-// impl.consumer.DefaultMQPullConsumerImpl + impl.consumer.RebalancePullImpl).
+// DefaultMQPullConsumer — the ACTIVE pull consumer over the classic remoting
+// protocol.
 //
 // The difference from DefaultMQPushConsumer is not "who calls the network", it
 // is who owns the CURSOR and the QUEUE SET:
@@ -12,9 +11,9 @@
 //     `PullBlockIfNotFound` is a long poll (suspend=true). Nothing is pulled in
 //     the background and no offset is committed unless the caller asks.
 //
-// Three consequences that are easy to get wrong, all reproduced here:
+// Three consequences that are easy to get wrong:
 //
-//  1. `Pull` must NOT suspend. Java builds the sysFlag as
+//  1. `Pull` must NOT suspend. The pull sysFlag is built as
 //     `PullSysFlag.buildSysFlag(false, block, true, false)` with `block=false`
 //     for pull() and true only for pullBlockIfNotFound(). Writing suspend=true
 //     on the short path makes the broker hold the request until
@@ -24,20 +23,20 @@
 //  2. The offset the caller passes is authoritative. There is no local cursor to
 //     fall back to, and `FetchConsumeOffset` reads the STORE, so a caller that
 //     never calls UpdateConsumeOffset sees -1 forever.
-//  3. The retry ceiling is Java DefaultMQPullConsumer's 16, NOT the push
-//     consumer's -1. The broker takes the field at face value for any client
-//     version >= V3_4_9 (AbstractSendMessageProcessor:173-179), and
+//  3. The retry ceiling is 16 for this consumer, NOT the push
+//     consumer's unlimited -1. The broker takes the maxReconsumeTimes field at
+//     face value for any client version >= V3_4_9, and
 //     `reconsumeTimes(0) >= -1` is true, so -1 would send EVERY bounced message
 //     straight to %DLQ%.
 //
-// Deliberate simplification, matching python/client/consumer.py: this
+// Deliberate simplification: this
 // port does not install a pull-side rebalance THREAD, so the queue set is not
 // pushed into a process-queue table behind the caller's back. `FetchSubscribeMessageQueues`
 // gives the whole topic and `FetchMessageQueuesInBalance` computes "my share"
-// on demand with the exact formula Java's RebalanceImpl#rebalanceByTopic uses
-// (same source as this port's push consumer doRebalance) — which is what
-// Java's own example/simple/PullConsumer.java:62 relies on. The strategy is
-// configuration for that computation and is validated at Start (Java :803).
+// on demand with the same allocation formula the push consumer's doRebalance
+// uses, so a caller iterating balanced shares sees what a rebalanced group
+// would hand out. The strategy is
+// configuration for that computation and is validated at Start.
 // The message-queue listener fan-out and persistConsumerOffset over the
 // process-queue table stay out of scope: there is no such table on this path.
 // The caller keeps the offsets itself — which is exactly what the class is for.
@@ -53,25 +52,23 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// Pull-consumer defaults (Java DefaultMQPullConsumer 5.x).
+// Pull-consumer defaults.
 const (
-	// DefaultConsumerPullTimeoutMillis is consumerPullTimeoutMillis:98 — the
-	// budget for the SHORT pull().
+	// DefaultConsumerPullTimeoutMillis is the budget for the SHORT pull().
 	DefaultConsumerPullTimeoutMillis = int64(10000)
-	// DefaultBrokerSuspendMaxTimeMillis is brokerSuspendMaxTimeMillis:100 — how
-	// long the broker may hold a long-poll request.
+	// DefaultBrokerSuspendMaxTimeMillis is how long the broker may hold a
+	// long-poll request.
 	DefaultBrokerSuspendMaxTimeMillis = int64(20000)
-	// DefaultConsumerTimeoutMillisWhenSuspend is
-	// consumerTimeoutMillisWhenSuspend:102 — the CLIENT budget for the long
-	// poll. Start() refuses a value below brokerSuspendMaxTimeMillis (:811).
+	// DefaultConsumerTimeoutMillisWhenSuspend is the CLIENT budget for the
+	// long poll. Start() refuses a value below brokerSuspendMaxTimeMillis.
 	DefaultConsumerTimeoutMillisWhenSuspend = int64(30000)
-	// DefaultPullConsumerMaxReconsumeTimes is DefaultMQPullConsumer:95. See
-	// rule 3 in the file header: this is 16, not the push consumer's -1.
+	// DefaultPullConsumerMaxReconsumeTimes: see rule 3 in the file header —
+	// this is 16, not the push consumer's -1.
 	DefaultPullConsumerMaxReconsumeTimes = int32(16)
 	// DefaultPullMaxMsgNums matches the push consumer's pullBatchSize default.
 	DefaultPullMaxMsgNums = int32(32)
-	// defaultPullSendBackTimeoutMillis is the timeout Java passes to
-	// consumerSendMessageBack (3000 in the pull impl, 5000 in the push one).
+	// defaultPullSendBackTimeoutMillis is the send-back RPC timeout on the
+	// pull path (the push path uses 5000).
 	defaultPullSendBackTimeoutMillis = int64(3000)
 )
 
@@ -102,13 +99,13 @@ type DefaultMQPullConsumer struct {
 	consumerTimeoutMillisWhenSuspend int64
 	maxReconsumeTimes                int32
 
-	// allocateStrategy is validated at Start (Java checkConfig:803) and kept for
-	// the caller to use; this port does not run a pull-side rebalance.
+	// allocateStrategy is validated at Start and kept for the
+	// caller to use; this port does not run a pull-side rebalance.
 	allocateStrategy AllocateMessageQueueStrategy
 	queueListener    MessageQueueListener
 
-	// registerTopics is Java's registerTopics: every one of them is subscribed
-	// with SUB_ALL by copySubscription() before the client starts, which is what
+	// registerTopics: every one of them is subscribed
+	// with SUB_ALL at Start before the client registers, which is what
 	// puts them in the heartbeat. Topics reached only through Pull() are added
 	// lazily by subscriptionAutomatically.
 	registerTopics map[string]struct{}
@@ -122,26 +119,27 @@ type DefaultMQPullConsumer struct {
 	pullAPI     *pullAPI
 
 	// offsetQueues is the local-offset queue set: every queue whose offset the
-	// caller has parked in offsetStore. Java gets the equivalent set for free
-	// from rebalanceImpl.getProcessQueueTable(), which this port deliberately
-	// does not build (no pull-side rebalance, same as Python). It matters
-	// because RemoteBrokerOffsetStore.PersistAll REMOVES the entries for queues
+	// caller has parked in offsetStore. There is no pull-side rebalance and no
+	// process-queue table to derive this set from, so it is tracked here.
+	// It matters
+	// because the broker-backed offset store's PersistAll REMOVES the entries
+	// for queues
 	// it is not handed, so an incomplete set silently discards the caller's
 	// progress. Guarded by mu.
 	offsetQueues map[common.MessageQueue]struct{}
 
 	started bool
 
-	// startTime is Java's consumerStartTimestamp, stamped in start() and
-	// reported as PROP_CONSUMER_START_TIMESTAMP in the 307 answer. Java's pull
-	// implementation writes that property and nothing else beyond the
+	// startTime is the consumer start timestamp, stamped in Start() and
+	// reported as PROP_CONSUMER_START_TIMESTAMP in the 307 answer. This pull
+	// path writes that property and nothing else beyond the
 	// object2Properties dump, so it is the one per-consumer property this type
 	// contributes.
 	startTime time.Time
 }
 
-// NewDefaultMQPullConsumer mirrors Java's constructor: the group is mandatory
-// and an empty one is refused here rather than at Start.
+// NewDefaultMQPullConsumer requires the group up front: an empty one is refused
+// here rather than at Start.
 func NewDefaultMQPullConsumer(group string) (*DefaultMQPullConsumer, error) {
 	if err := common.CheckGroup(group); err != nil {
 		return nil, err
@@ -159,13 +157,11 @@ func NewDefaultMQPullConsumer(group string) (*DefaultMQPullConsumer, error) {
 		registerTopics:                   map[string]struct{}{},
 		subscription:                     map[string]*remoting.SubscriptionData{},
 		offsetQueues:                     map[common.MessageQueue]struct{}{},
-		// Java field initialiser :89 is AllocateMessageQueueAveragely, and
-		// checkConfig refuses a null strategy, so it must never be nil by
-		// default.
+		// Average allocation is the default, and Start refuses a nil strategy,
+		// so it must never be nil by default.
 		allocateStrategy: AllocateMessageQueueAveragely{},
-		// Java sets enableStreamRequestType = true in EVERY pull-consumer
-		// constructor (:113/:126) — the `@STREAM` clientId suffix is not
-		// optional here, unlike on the producer.
+		// Every pull consumer uses a stream request type — the `@STREAM`
+		// clientId suffix is not optional here, unlike on the producer.
 		streamRequest: true,
 	}, nil
 }
@@ -184,7 +180,7 @@ func MustNewDefaultMQPullConsumer(group string) *DefaultMQPullConsumer {
 
 func (c *DefaultMQPullConsumer) ConsumerGroup() string { return c.consumerGroup }
 
-// SetNameServerAddresses mirrors ClientConfig#setNameServerAddress.
+// SetNameServerAddresses replaces the nameserver address list.
 func (c *DefaultMQPullConsumer) SetNameServerAddresses(addrs []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -215,7 +211,8 @@ func (c *DefaultMQPullConsumer) ClientID() string {
 	return c.clientID
 }
 
-// SetUnitName / SetUnitMode / SetEnableStreamRequestType mirror ClientConfig.
+// SetUnitName / SetUnitMode / SetEnableStreamRequestType set the client config
+// fields of the same names.
 func (c *DefaultMQPullConsumer) SetUnitName(unit string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -235,7 +232,8 @@ func (c *DefaultMQPullConsumer) SetEnableStreamRequestType(enable bool) {
 }
 
 // SetNamespace is the CLIENT-side namespace: topic names are wrapped before they
-// go on the wire and unwrapped again on the way back (Java's resetTopic).
+// go on the wire and unwrapped again on the way back (resetTopic on pull
+// results).
 func (c *DefaultMQPullConsumer) SetNamespace(ns string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -256,7 +254,7 @@ func (c *DefaultMQPullConsumer) SetRpcHook(hook remoting.RPCHook) {
 	c.rpcHook = hook
 }
 
-// SetTlsEnable mirrors ClientConfig#setUseTLS (nil = leave the instance default).
+// SetTlsEnable turns TLS per consumer (nil = leave the instance default).
 func (c *DefaultMQPullConsumer) SetTlsEnable(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -287,7 +285,7 @@ func (c *DefaultMQPullConsumer) IsUnitMode() bool {
 	return c.unitMode
 }
 
-// SetPollNameServerInterval is ClientConfig#pollNameServerInterval, read once
+// SetPollNameServerInterval sets the nameserver poll interval, read once
 // when the instance is created.
 func (c *DefaultMQPullConsumer) SetPollNameServerInterval(millis int64) {
 	c.mu.Lock()
@@ -313,7 +311,7 @@ func (c *DefaultMQPullConsumer) SetConsumerTimeoutMillisWhenSuspend(v int64) {
 	c.consumerTimeoutMillisWhenSuspend = v
 }
 
-// SetMaxReconsumeTimes is DefaultMQPullConsumer#setMaxReconsumeTimes:496. See
+// SetMaxReconsumeTimes sets the retry ceiling carried on bounced messages. See
 // rule 3 in the file header — the pull default is 16, not -1.
 func (c *DefaultMQPullConsumer) SetMaxReconsumeTimes(v int32) {
 	c.mu.Lock()
@@ -321,43 +319,43 @@ func (c *DefaultMQPullConsumer) SetMaxReconsumeTimes(v int32) {
 	c.maxReconsumeTimes = v
 }
 
-// BrokerSuspendMaxTimeMillis is DefaultMQPullConsumer#getBrokerSuspendMaxTimeMillis:376.
+// BrokerSuspendMaxTimeMillis returns the broker-side suspend budget.
 func (c *DefaultMQPullConsumer) BrokerSuspendMaxTimeMillis() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.brokerSuspendMaxTimeMillis
 }
 
-// ConsumerPullTimeoutMillis is DefaultMQPullConsumer#getConsumerPullTimeoutMillis:384.
+// ConsumerPullTimeoutMillis returns the SHORT-pull budget.
 func (c *DefaultMQPullConsumer) ConsumerPullTimeoutMillis() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.consumerPullTimeoutMillis
 }
 
-// ConsumerTimeoutMillisWhenSuspend is
-// DefaultMQPullConsumer#getConsumerTimeoutMillisWhenSuspend:392.
+// ConsumerTimeoutMillisWhenSuspend returns the CLIENT budget for the long poll.
 func (c *DefaultMQPullConsumer) ConsumerTimeoutMillisWhenSuspend() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.consumerTimeoutMillisWhenSuspend
 }
 
-// MaxReconsumeTimes is DefaultMQPullConsumer#getMaxReconsumeTimes:504.
+// MaxReconsumeTimes returns the retry ceiling carried on bounced messages.
 func (c *DefaultMQPullConsumer) MaxReconsumeTimes() int32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.maxReconsumeTimes
 }
 
-// SetAllocateMessageQueueStrategy mirrors the Java setter; Start refuses nil.
+// SetAllocateMessageQueueStrategy installs the allocation strategy; Start
+// refuses nil.
 func (c *DefaultMQPullConsumer) SetAllocateMessageQueueStrategy(s AllocateMessageQueueStrategy) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.allocateStrategy = s
 }
 
-// SetMessageQueueListener mirrors Java setMessageQueueListener: the listener is
+// SetMessageQueueListener installs the queue-change listener: it is
 // notified when the topic's queue set (as this client sees it) changes.
 func (c *DefaultMQPullConsumer) SetMessageQueueListener(l MessageQueueListener) {
 	c.mu.Lock()
@@ -365,7 +363,7 @@ func (c *DefaultMQPullConsumer) SetMessageQueueListener(l MessageQueueListener) 
 	c.queueListener = l
 }
 
-// RegisterFilterMessageHook mirrors the Java hook registration; the hooks run
+// RegisterFilterMessageHook appends a filter hook; the hooks run
 // inside processPullResult, i.e. on the pull path before the caller sees the
 // messages.
 func (c *DefaultMQPullConsumer) RegisterFilterMessageHook(hook FilterMessageHook) {
@@ -380,8 +378,8 @@ func (c *DefaultMQPullConsumer) HasFilterMessageHook() bool {
 	return len(c.filterMessageHooks) > 0
 }
 
-// RegisterConsumeMessageHook mirrors DefaultMQPullConsumerImpl:92. The pair
-// fires around the pull result (pullSyncImpl:270-283), not around user
+// RegisterConsumeMessageHook appends a consume hook. The pair
+// fires around the pull result, not around user
 // consumption — the pull consumer has no consume service to hang it off.
 func (c *DefaultMQPullConsumer) RegisterConsumeMessageHook(hook ConsumeMessageHook) {
 	c.mu.Lock()
@@ -389,8 +387,7 @@ func (c *DefaultMQPullConsumer) RegisterConsumeMessageHook(hook ConsumeMessageHo
 	c.consumeMessageHooks = append(c.consumeMessageHooks, hook)
 }
 
-// ConsumeType is always CONSUME_ACTIVELY for this class (Java
-// DefaultMQPullConsumerImpl:348).
+// ConsumeType is always CONSUME_ACTIVELY for this class.
 func (c *DefaultMQPullConsumer) ConsumeType() string { return ConsumeTypeActively }
 
 // Subscriptions feeds ConsumerData.subscriptionDataSet in the heartbeat.
@@ -402,14 +399,14 @@ func (c *DefaultMQPullConsumer) Subscriptions() []*remoting.SubscriptionData {
 		out = append(out, sub)
 	}
 	// Map order is random; a stable order keeps wire diffs and test
-	// expectations readable (Java's HashMap has no order either, but the
-	// heartbeat is where a flapping order shows up as a diff on every beat).
+	// expectations readable — the heartbeat is where a flapping order shows up
+	// as a diff on every beat.
 	sort.Slice(out, func(i, j int) bool { return out[i].Topic < out[j].Topic })
 	return out
 }
 
-// RegisterTopic mirrors Java getRegisterTopics().add(): the topic is subscribed
-// with SUB_ALL by Start (copySubscription:819-831) so it reaches the broker's
+// RegisterTopic adds a topic to the register set: it is subscribed
+// with SUB_ALL at Start so it reaches the broker's
 // subscription group — pulling a topic without registering it works, but the
 // broker then has no subscription entry and the retry topic never gets created.
 func (c *DefaultMQPullConsumer) RegisterTopic(topic string) {
@@ -421,8 +418,8 @@ func (c *DefaultMQPullConsumer) RegisterTopic(topic string) {
 	c.registerTopics[topic] = struct{}{}
 }
 
-// Subscribe is the explicit form of subscriptionAutomatically (Java
-// DefaultMQPullConsumer#subscribe:(topic, subExpression)).
+// Subscribe is the explicit form of subscriptionAutomatically: it registers the
+// topic and installs the subExpression filter.
 func (c *DefaultMQPullConsumer) Subscribe(topic, subExpression string) error {
 	if err := common.CheckTopic(topic); err != nil {
 		return err
@@ -438,8 +435,7 @@ func (c *DefaultMQPullConsumer) Subscribe(topic, subExpression string) error {
 	return nil
 }
 
-// Unsubscribe mirrors DefaultMQPullConsumerImpl:311 — it only drops the
-// subscription; the topic stays registered until the next Start.
+// Unsubscribe drops the subscription and the register entry for the topic.
 func (c *DefaultMQPullConsumer) Unsubscribe(topic string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -447,7 +443,8 @@ func (c *DefaultMQPullConsumer) Unsubscribe(topic string) {
 	delete(c.registerTopics, topic)
 }
 
-// subscriptionAutomatically is DefaultMQPullConsumerImpl:301: pulling a topic
+// subscriptionAutomatically registers any topic pulled for the first time:
+// pulling a topic
 // this client has never heard of must still register it, or the heartbeat never
 // mentions it and the broker's consumer manager cannot reach the group.
 func (c *DefaultMQPullConsumer) subscriptionAutomatically(topic string) {
@@ -458,7 +455,7 @@ func (c *DefaultMQPullConsumer) subscriptionAutomatically(topic string) {
 	}
 	sub, err := remoting.FilterAPI{}.BuildSubscriptionData(topic, "*")
 	if err != nil {
-		// Java swallows this too (:306) — an unparsable auto-subscription must
+		// An unparsable auto-subscription is swallowed — it must
 		// not fail an otherwise valid pull.
 		return
 	}
@@ -467,7 +464,7 @@ func (c *DefaultMQPullConsumer) subscriptionAutomatically(topic string) {
 
 // ---------------------------------------------------------------- lifecycle
 
-// Start mirrors DefaultMQPullConsumerImpl:703-770. Unlike the push consumer
+// Start brings the consumer up. Unlike the push consumer
 // there is no rebalance loop, no consume service and no pull goroutine: after
 // Start the caller drives everything through Pull.
 func (c *DefaultMQPullConsumer) Start() error {
@@ -480,8 +477,8 @@ func (c *DefaultMQPullConsumer) Start() error {
 		c.mu.Unlock()
 		return err
 	}
-	// copySubscription (:819-831) — every registerTopic becomes SUB_ALL before
-	// the client is created, so the first heartbeat already carries it.
+	// Every registered topic becomes SUB_ALL before the client instance is
+	// created, so the first heartbeat already carries it.
 	for topic := range c.registerTopics {
 		if _, ok := c.subscription[topic]; ok {
 			continue
@@ -499,7 +496,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 		c.consumerGroup = common.WrapNamespace(c.namespace, c.consumerGroup)
 	}
 	if c.messageModel == MessageModelClustering {
-		// Java :712-714 — only CLUSTERING rewrites DEFAULT to pid#nanotime.
+		// Only CLUSTERING rewrites the DEFAULT instance name to pid#nanotime.
 		c.instanceName = common.ChangeInstanceNameToPID(c.instanceName)
 	}
 	if c.clientID == "" {
@@ -516,8 +513,8 @@ func (c *DefaultMQPullConsumer) Start() error {
 	userHook := c.rpcHook
 	c.mu.Unlock()
 
-	// Namespace + stream + user(ACL) + zone, in Java's order and once per
-	// instance — the signature has to cover exactly the fields Java signs.
+	// Namespace + stream + user(ACL) + zone, composed in a fixed order and once
+	// per instance — the signature has to cover exactly these fields.
 	instance.EnsureRPCHooks(namespaceV2, c.streamRequest, userHook)
 	if err := instance.Start(); err != nil {
 		c.mu.Lock()
@@ -527,7 +524,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 	}
 
 	c.mu.Lock()
-	// Java :728-742: a caller-supplied store wins, otherwise CLUSTERING gets the
+	// Offset store choice: a caller-supplied store wins, otherwise CLUSTERING gets the
 	// remote one and BROADCASTING the local file one.
 	if c.messageModel == MessageModelBroadcasting {
 		c.offsetStore = NewLocalFileOffsetStore(c.clientID, c.consumerGroup)
@@ -547,7 +544,7 @@ func (c *DefaultMQPullConsumer) Start() error {
 	c.mu.Unlock()
 
 	_ = store.Load()
-	// Java registerConsumer (:746) stores the consumer in the instance so the
+	// RegisterConsumer stores the consumer in the instance so the
 	// heartbeat task picks it up; without it the broker never learns the group
 	// is online and %RETRY% is never created.
 	instance.RegisterConsumer(c.consumerGroup, c)
@@ -560,8 +557,8 @@ func (c *DefaultMQPullConsumer) Start() error {
 	return nil
 }
 
-// checkConfigLocked is Java DefaultMQPullConsumerImpl:772-817 — same checks, in
-// same order, same wording. Must be called with c.mu held.
+// checkConfigLocked runs the fixed check list — same order, same wording.
+// Must be called with c.mu held.
 func (c *DefaultMQPullConsumer) checkConfigLocked() error {
 	if err := common.CheckGroup(c.consumerGroup); err != nil {
 		return err
@@ -579,7 +576,7 @@ func (c *DefaultMQPullConsumer) checkConfigLocked() error {
 	if len(c.nameServerAddrs) == 0 {
 		return common.ClientError("name server address is not set")
 	}
-	// :811 — the long poll can only work if the CLIENT waits longer than the
+	// The long poll can only work if the CLIENT waits longer than the
 	// BROKER is allowed to hold the request.
 	if c.consumerTimeoutMillisWhenSuspend < c.brokerSuspendMaxTimeMillis {
 		return common.ClientError(
@@ -588,14 +585,14 @@ func (c *DefaultMQPullConsumer) checkConfigLocked() error {
 	return nil
 }
 
-// Shutdown mirrors DefaultMQPullConsumerImpl:685-701: persist the offsets while
-// the consumer still counts as running, unregister the group at every broker
+// Shutdown persists the offsets while the consumer still counts as
+// running, unregisters the group at every broker
 // (the broker would otherwise keep routing rebalance notifications at a dead
-// client for ~120s), then shut the factory down.
+// client for ~120s), then shuts the factory down.
 //
-// The ORDER inside is load-bearing: Java's RUNNING branch calls
-// persistConsumerOffset() as its first statement, i.e. BEFORE leaving the
-// RUNNING state. Flipping `started` up front (the obvious way to write this)
+// The ORDER inside is load-bearing: the offsets must be persisted while the
+// consumer still counts as RUNNING, i.e. BEFORE leaving that state.
+// Flipping `started` up front (the obvious way to write this)
 // makes PersistConsumerOffset's own isRunning() guard fire and the caller's last
 // offsets are silently lost on every clean shutdown.
 func (c *DefaultMQPullConsumer) Shutdown() {
@@ -657,9 +654,8 @@ func (c *DefaultMQPullConsumer) Instance() *Instance {
 
 // ---------------------------------------------------------------- pull
 
-// Pull is Java DefaultMQPullConsumerImpl.pull:178 — a SHORT poll at an explicit
-// offset, with the caller's own maxNums. `offset < 0` and `maxNums <= 0` are
-// refused before anything goes on the wire (:238-244).
+// Pull is a SHORT poll at an explicit offset, with the caller's own maxNums.
+// `offset < 0` and `maxNums <= 0` are refused before anything goes on the wire.
 func (c *DefaultMQPullConsumer) Pull(mq common.MessageQueue, subExpression string, offset int64, maxNums int32) (*PullResult, error) {
 	c.mu.Lock()
 	timeout := c.consumerPullTimeoutMillis
@@ -677,7 +673,7 @@ func (c *DefaultMQPullConsumer) PullWithTimeout(mq common.MessageQueue, subExpre
 	return c.pullSync(mq, sub, offset, maxNums, false, timeoutMillis)
 }
 
-// PullBySelector is the MessageSelector flavour of Pull (Java :189-198): a SQL92
+// PullBySelector is the MessageSelector flavour of Pull: a SQL92
 // expression travels with its own expressionType, and a TAG selector keeps the
 // subVersion at 0.
 func (c *DefaultMQPullConsumer) PullBySelector(mq common.MessageQueue, selector MessageSelector,
@@ -697,7 +693,7 @@ func (c *DefaultMQPullConsumer) PullBySelectorWithTimeout(mq common.MessageQueue
 	return c.pullSync(mq, sub, offset, maxNums, false, timeoutMillis)
 }
 
-// PullBlockIfNotFound is the LONG poll (Java :586): suspend=true, so the broker
+// PullBlockIfNotFound is the LONG poll: suspend=true, so the broker
 // holds the request until a message arrives or brokerSuspendMaxTimeMillis
 // elapses. The client budget switches to consumerTimeoutMillisWhenSuspend.
 func (c *DefaultMQPullConsumer) PullBlockIfNotFound(mq common.MessageQueue, subExpression string,
@@ -725,9 +721,9 @@ func (c *DefaultMQPullConsumer) PullBlockIfNotFoundBySelector(mq common.MessageQ
 	return c.pullSync(mq, sub, offset, maxNums, true, timeout)
 }
 
-// buildPullSubscription is Java getSubscriptionData:200-212 — a null mq is an
-// error, and a parse failure is reported as "parse subscription error" rather
-// than leaking the FilterAPI text.
+// buildPullSubscription builds the ad-hoc subscription for one pull: a null mq
+// is an error, and a parse failure is reported as "parse subscription error"
+// rather than leaking the FilterAPI text.
 func buildPullSubscription(mq common.MessageQueue, subExpression string) (*remoting.SubscriptionData, error) {
 	if mq.Topic == "" {
 		return nil, common.ClientError("mq is null")
@@ -739,8 +735,8 @@ func buildPullSubscription(mq common.MessageQueue, subExpression string) (*remot
 	return sub, nil
 }
 
-// buildPullSelectorSubscription is Java getSubscriptionData(mq, messageSelector)
-// (:214-227) → FilterAPI.build(topic, expression, expressionType).
+// buildPullSelectorSubscription builds a SubscriptionData straight from a
+// MessageSelector (expression + expressionType).
 //
 // This port has no FilterAPI.build; the shape is copied from
 // DefaultMQPushConsumer.SubscribeWithSelector, which had to solve the same
@@ -776,7 +772,8 @@ func buildPullSelectorSubscription(mq common.MessageQueue, selector MessageSelec
 	return sub, nil
 }
 
-// pullSync is Java pullSyncImpl:229-285.
+// pullSync runs one pull round trip: validate, auto-register the topic, build
+// the sysFlag, zero the TAG subVersion, invoke, then post-process the result.
 func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.SubscriptionData,
 	offset int64, maxNums int32, block bool, timeoutMillis int64) (*PullResult, error) {
 
@@ -792,7 +789,7 @@ func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.S
 	if maxNums <= 0 {
 		return nil, common.ClientError("maxNums <= 0")
 	}
-	// :246 — pulling a topic the caller never registered still has to reach the
+	// Pulling a topic the caller never registered still has to reach the
 	// heartbeat, otherwise the broker has no subscription entry for us.
 	c.subscriptionAutomatically(mq.Topic)
 
@@ -807,11 +804,11 @@ func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.S
 		return nil, common.ClientError("consumer not started, call Start() first")
 	}
 
-	// :248 — commitOffset=false (the caller commits), suspend=block,
+	// commitOffset=false (the caller commits), suspend=block,
 	// subscription=true, classFilter=false.
 	sysFlag := common.BuildSysFlagBasic(false, block, true, false)
 
-	// :252-257 — for a TAG subscription the subVersion travels as 0; only an
+	// For a TAG subscription the subVersion travels as 0; only an
 	// expression with its own version (SQL92/class filter) sends the real one.
 	// pullKernel writes sub.SubVersion straight into the header, so the zeroing
 	// has to happen on the value it will read.
@@ -828,8 +825,8 @@ func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.S
 	result = api.processPullResult(mq, result, sub)
 	resetTopicForNamespace(result.MsgFoundList, namespace)
 
-	// :270-283 — the consume hook pair runs around the pull RESULT (the pull
-	// consumer has no consume service), and Java marks it succeeded as soon as
+	// The consume hook pair runs around the pull RESULT (the pull
+	// consumer has no consume service), and it is marked succeeded as soon as
 	// the pull returned: the caller's own handling is not observable here.
 	if len(consumeHooks) > 0 {
 		ctx := &ConsumeMessageContext{
@@ -847,8 +844,8 @@ func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.S
 	return result, nil
 }
 
-// resetTopicForNamespace is Java resetTopic:287-299 — with a namespace in play
-// every returned message's topic is un-wrapped before the caller sees it.
+// resetTopicForNamespace un-wraps every returned message's topic before the
+// caller sees it when a namespace is in play.
 func resetTopicForNamespace(msgs []*common.MessageExt, namespace string) {
 	if namespace == "" {
 		return
@@ -860,7 +857,8 @@ func resetTopicForNamespace(msgs []*common.MessageExt, namespace string) {
 
 // ---------------------------------------------------------------- offsets
 
-// FetchConsumeOffset is Java :115-118. `fromStore` picks READ_FROM_STORE (a
+// FetchConsumeOffset reads one queue's offset. `fromStore` picks READ_FROM_STORE
+// (a
 // broker round trip) over MEMORY_FIRST (the cache, then the broker). -1 means
 // the broker has no record for this queue.
 func (c *DefaultMQPullConsumer) FetchConsumeOffset(mq common.MessageQueue, fromStore bool) (int64, error) {
@@ -883,7 +881,7 @@ func (c *DefaultMQPullConsumer) FetchConsumeOffset(mq common.MessageQueue, fromS
 	}
 	if fromStore {
 		// READ_FROM_STORE routes through fetchConsumeOffsetFromBroker, which
-		// calls updateOffset on the way out (Java RemoteBrokerOffsetStore:213),
+		// updates the local table on the way out,
 		// so the queue now has a local entry whether it had one or not.
 		c.rememberOffsetQueue(mq)
 	}
@@ -901,7 +899,7 @@ func (c *DefaultMQPullConsumer) rememberOffsetQueue(mq common.MessageQueue) {
 	c.offsetQueues[mq] = struct{}{}
 }
 
-// UpdateConsumeOffset is Java :833-836 — updateOffset(..., increaseOnly=false),
+// UpdateConsumeOffset parks one offset locally with increaseOnly=false,
 // i.e. a backwards seek IS allowed. Nothing is sent to the broker; the periodic
 // persist (or PersistConsumerOffset) does that.
 func (c *DefaultMQPullConsumer) UpdateConsumeOffset(mq common.MessageQueue, offset int64) error {
@@ -919,10 +917,11 @@ func (c *DefaultMQPullConsumer) UpdateConsumeOffset(mq common.MessageQueue, offs
 	return nil
 }
 
-// UpdateConsumeOffsetToBroker is Java :641-644 — write one offset straight to
+// UpdateConsumeOffsetToBroker writes one offset straight to
 // the broker, skipping the store's periodic flush.
 //
-// Java's `isOneway` flag has no counterpart in this port's offset store (every
+// The `isOneway` flag of the classic API has no counterpart in this port's
+// offset store (every
 // write is a synchronous UPDATE_CONSUMER_OFFSET), so the round trip is always
 // confirmed before this returns.
 func (c *DefaultMQPullConsumer) UpdateConsumeOffsetToBroker(mq common.MessageQueue, offset int64) error {
@@ -936,9 +935,9 @@ func (c *DefaultMQPullConsumer) UpdateConsumeOffsetToBroker(mq common.MessageQue
 		if err := remote.updateConsumeOffsetToBroker(mq, offset); err != nil {
 			return err
 		}
-		// Java's DEFAULT (isOneway=false) path does NOT touch the local table —
-		// updateConsumeOffsetToBroker only calls updateOffset when isOneway is
-		// true (:140-145). Register the queue anyway so a later persistAll
+		// The DEFAULT (confirmed-write) path of the store does NOT touch the
+		// local table — a broker write only calls updateOffset when it is
+		// oneway. Register the queue anyway so a later persistAll
 		// cannot drop an entry another call created for it.
 		c.rememberOffsetQueue(mq)
 		return nil
@@ -953,14 +952,15 @@ func (c *DefaultMQPullConsumer) UpdateConsumeOffsetToBroker(mq common.MessageQue
 	return store.Persist(mq)
 }
 
-// PersistConsumerOffset is Java :410-420. Java passes the process-queue table's
+// PersistConsumerOffset flushes every queue this consumer knows about. The
+// reference path passes the process-queue table's
 // keys; this port has no pull-side rebalance, so the set is the union of the two
 // ways a queue can enter this consumer's world — the queues it has PULLED
 // (pullFromWhichNode) and the queues whose offset the CALLER parked locally
-// (offsetQueues). Both halves are needed: RemoteBrokerOffsetStore.PersistAll
+// (offsetQueues). Both halves are needed: the remote store's PersistAll
 // drops the entries for queues left out, so a short set is silent data loss,
 // while a queue with no local entry costs nothing (persistAll skips it —
-// Java RemoteBrokerOffsetStore:152 only sends entries it holds).
+// the store only sends entries it holds).
 func (c *DefaultMQPullConsumer) PersistConsumerOffset() error {
 	c.mu.Lock()
 	store := c.offsetStore
@@ -972,7 +972,8 @@ func (c *DefaultMQPullConsumer) PersistConsumerOffset() error {
 	}
 	c.mu.Unlock()
 	if !started || store == nil {
-		// Java's isRunning() would throw; the periodic caller treats a
+		// The strict reference behaviour throws when not running; the periodic
+		// caller here treats a
 		// not-yet-started consumer as "nothing to do".
 		return nil
 	}
@@ -993,8 +994,8 @@ func (c *DefaultMQPullConsumer) PersistConsumerOffset() error {
 	return store.PersistAll(mqs)
 }
 
-// MaxOffset / MinOffset / SearchOffset / EarliestMsgStoreTime are the Java
-// DefaultMQPullConsumer pass-throughs to MQAdminImpl: they go through the
+// MaxOffset / MinOffset / SearchOffset / EarliestMsgStoreTime are admin
+// pass-throughs: they go through the
 // instance's master-only offset lookup, NOT through the store.
 func (c *DefaultMQPullConsumer) MaxOffset(mq common.MessageQueue) (int64, error) {
 	instance, err := c.requireClient()
@@ -1042,7 +1043,7 @@ func (c *DefaultMQPullConsumer) EarliestMsgStoreTime(mq common.MessageQueue) (in
 
 // ---------------------------------------------------------------- queues
 
-// FetchSubscribeMessageQueues mirrors Java :142 — the SUBSCRIBE info (read
+// FetchSubscribeMessageQueues returns the SUBSCRIBE info (read
 // queues, no master filtering), which is what a caller iterates to pull.
 func (c *DefaultMQPullConsumer) FetchSubscribeMessageQueues(topic string) ([]common.MessageQueue, error) {
 	instance, err := c.requireClient()
@@ -1052,7 +1053,7 @@ func (c *DefaultMQPullConsumer) FetchSubscribeMessageQueues(topic string) ([]com
 	return instance.GetTopicSubscribeInfo(topic), nil
 }
 
-// FetchPublishMessageQueues mirrors Java :137 — the PUBLISH info (write queues,
+// FetchPublishMessageQueues returns the PUBLISH info (write queues,
 // master only).
 func (c *DefaultMQPullConsumer) FetchPublishMessageQueues(topic string) ([]common.MessageQueue, error) {
 	instance, err := c.requireClient()
@@ -1066,7 +1067,7 @@ func (c *DefaultMQPullConsumer) FetchPublishMessageQueues(topic string) ([]commo
 	return info.MsgQueueList(), nil
 }
 
-// ParseSubscribeMessageQueues is Java :153-161: keep only the queues whose topic
+// ParseSubscribeMessageQueues keeps only the queues whose topic
 // this consumer is actually subscribed to.
 func (c *DefaultMQPullConsumer) ParseSubscribeMessageQueues(queues []common.MessageQueue) []common.MessageQueue {
 	c.mu.Lock()
@@ -1080,17 +1081,17 @@ func (c *DefaultMQPullConsumer) ParseSubscribeMessageQueues(queues []common.Mess
 	return out
 }
 
-// FetchMessageQueuesInBalance is Java MQPullConsumer:187 →
-// DefaultMQPullConsumerImpl:120-135: the queues THIS instance owns once the
-// group is balanced — what example/simple/PullConsumer.java:62 iterates before
+// FetchMessageQueuesInBalance returns the queues THIS instance owns once the
+// group is balanced — the set a caller must iterate before
 // pulling, so pulling "all queues" instead is the classic duplicate-consumption
 // bug in a multi-instance group.
 //
-// Java reads rebalanceImpl.getProcessQueueTable(), a table its background
-// rebalance thread fills. This port runs no pull-side rebalance thread (see the
-// file header), so the view is computed on demand with the exact formula
-// RebalanceImpl#rebalanceByTopic uses — the same one this port's push consumer
-// doRebalance() runs. One formula, two call sites: if they ever disagree, a
+// The reference implementation reads this from a process-queue table its
+// background rebalance thread fills. This port runs no pull-side rebalance
+// thread (see the
+// file header), so the view is computed on demand with the exact allocation
+// formula the push consumer's doRebalance() runs.
+// One formula, two call sites: if they ever disagree, a
 // single queue gets claimed by two instances.
 //   - BROADCASTING: every queue, without consulting the consumer list;
 //   - CLUSTERING: the subscribe info (read queues, no master filter — the very
@@ -1099,13 +1100,13 @@ func (c *DefaultMQPullConsumer) ParseSubscribeMessageQueues(queues []common.Mess
 //     consumer's allocate strategy slices out my share.
 //
 // "No route" or "no answered consumer list" means CANNOT compute, not "my share
-// is empty", so the current assignment is kept: the key set of Java's
-// pullFromWhichNodeTable, i.e. the queues already being pulled. Falling back to
+// is empty", so the current assignment is kept: the queues already being pulled
+// (PulledQueues()). Falling back to
 // "I own everything" would make every co-instance read the same messages twice.
 // A share that genuinely computes to empty (the queues all went to someone
-// else) returns an empty slice, exactly like Java's empty table at that moment.
+// else) returns an empty slice — an honest "nothing to pull right now".
 func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]common.MessageQueue, error) {
-	instance, err := c.requireClient() // Java isRunning()
+	instance, err := c.requireClient()
 	if err != nil {
 		return nil, err
 	}
@@ -1129,7 +1130,7 @@ func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]com
 	mqAll := append([]common.MessageQueue(nil), instance.GetTopicSubscribeInfo(topic)...)
 	sort.Slice(mqAll, func(i, j int) bool { return mqAll[i].CompareTo(mqAll[j]) < 0 })
 	if model == MessageModelBroadcasting {
-		// Java rebalanceByTopic: BROADCASTING never asks for the cid list.
+		// BROADCASTING never asks for the cid list.
 		if len(mqAll) == 0 {
 			return pulled, nil
 		}
@@ -1146,14 +1147,14 @@ func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]com
 	got := strategy.Allocate(group, clientID, mqAll, cidAll)
 	if reporter, ok := strategy.(AllocateErrReporter); ok {
 		if err := reporter.AllocateErr(); err != nil {
-			// Java rebalanceByTopic's catch (Throwable): log and keep the current
+			// The rebalance loop's error discipline: log and keep the current
 			// assignment — a broken strategy must never revoke queues.
 			common.LogErrorf("allocate message queue failed, strategy=%s group=%s: %v, keep current",
 				strategyName(strategy), group, err)
 			return pulled, nil
 		}
 	}
-	// Java :128-131 compares every table key's topic: never let a strategy's
+	// Guard every returned queue's topic: never let a strategy's
 	// surprising return value leak another topic into the caller's pull loop.
 	out := make([]common.MessageQueue, 0, len(got))
 	for _, mq := range got {
@@ -1166,7 +1167,7 @@ func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]com
 }
 
 // PulledQueues reports the queues this consumer has pulled at least once
-// (Java's pullFromWhichNodeTable key set) — the assignment
+// (the pull-API's per-queue node table key set) — the assignment
 // FetchMessageQueuesInBalance falls back to when it cannot compute.
 func (c *DefaultMQPullConsumer) PulledQueues() []common.MessageQueue {
 	c.mu.Lock()
@@ -1182,16 +1183,16 @@ func (c *DefaultMQPullConsumer) PulledQueues() []common.MessageQueue {
 
 // ---------------------------------------------------------------- send back
 
-// SendMessageBack is Java :636-683's happy path, with the two documented
-// differences the other ports already carry:
+// SendMessageBack bounces a failed message back to its broker for retry.
+// Two documented behaviours:
 //
 //  1. the address comes from the PUBLISH table (master only), so the caller must
 //     have pulled the topic through THIS consumer first — a queue reached
 //     through another instance is not in this instance's route cache;
-//  2. Java's catch falls back to re-sending the message to %RETRY%group through
-//     an internal producer. This port reports the failure instead of silently
-//     switching transports — a bounce that failed is something the caller needs
-//     to see. (python/client/consumer.py:3890 documents the same.)
+//  2. the reference implementation's failure path re-sends the message to
+//     %RETRY%group through an internal producer. This port reports the failure
+//     instead of silently switching transports — a bounce that failed is
+//     something the caller needs to see.
 func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLevel int32, brokerName string) error {
 	instance, err := c.requireClient()
 	if err != nil {
@@ -1213,24 +1214,24 @@ func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLev
 	}
 	addr, ok := instance.FindBrokerAddressInPublish(dest)
 	if !ok || addr == "" {
-		// Java uses the same wording for the deprecated path's "no master".
+		// The error string is a fixed contract wording for "no master".
 		return common.ClientError(fmt.Sprintf("Broker[%s] master node does not exist", dest))
 	}
 	if err := instance.sendMessageBack(group, msg, delayLevel, maxReconsume, unitMode,
 		defaultPullSendBackTimeoutMillis); err != nil {
 		return err
 	}
-	// Java's finally (:681) un-wraps the topic even when the send threw.
+	// The topic is un-wrapped even when the send threw (finally semantics).
 	msg.Topic = common.WithoutNamespace(msg.Topic, namespace)
 	return nil
 }
 
-// CreateTopic mirrors Java :97-104 → MQAdminImpl.createTopic(key, newTopic,
-// queueNum, topicSysFlag). `key` is the topic whose route names the brokers to
+// CreateTopic creates a topic on every broker in `key`'s route
+// (UPDATE_AND_CREATE_TOPIC). `key` is the topic whose route names the brokers to
 // push the new topic to — in practice the default topic (TBW102), which is what
 // this port keys the lookup on, so the argument is unused exactly as in
 // DefaultMQAdminExt.CreateTopic. `queueNum` is used for BOTH the read and the
-// write count, as Java does.
+// write count.
 //
 // ⚠ It is NOT the attributes field of UPDATE_AND_CREATE_TOPIC: passing a
 // topic name there makes the broker answer `kv string format wrong` (it parses
@@ -1241,8 +1242,8 @@ func (c *DefaultMQPullConsumer) CreateTopic(key, newTopic string, queueNum, topi
 		return err
 	}
 	_ = key
-	// Java's TopicConfig default perm is 6 (read|write); MQAdminImpl.createTopic
-	// does not touch it.
+	// The protocol's TopicConfig default perm is 6 (read|write); the create
+	// call above does not touch it.
 	return instance.CreateTopicInRoute(newTopic, queueNum, queueNum, 6, topicSysFlag, "", 5000)
 }
 
@@ -1283,13 +1284,13 @@ func (c *DefaultMQPullConsumer) RebalanceImmediately() {
 	}
 }
 
-// AdjustThreadPool is the periodic elasticity sweep. Java's pull consumer has no
-// consume executor to resize, so it is a no-op there too.
+// AdjustThreadPool is the periodic elasticity sweep. A pull consumer has no
+// consume executor to resize, so it is a no-op here.
 func (c *DefaultMQPullConsumer) AdjustThreadPool() {}
 
-// ResetOffset handles RESET_CONSUMER_CLIENT_OFFSET(220). This port keeps Java's
-// store-side effect (update + persist) and drops the process-queue half, which
-// this consumer does not have.
+// ResetOffset handles RESET_CONSUMER_CLIENT_OFFSET(220). The effect is the
+// store-side half (update + persist); the process-queue half of the classic
+// reset does not exist for this consumer.
 func (c *DefaultMQPullConsumer) ResetOffset(topic string, table remoting.MQOffsetTable) {
 	if table == nil {
 		return
@@ -1318,14 +1319,13 @@ func (c *DefaultMQPullConsumer) ResetOffset(topic string, table remoting.MQOffse
 	}
 }
 
-// GetConsumerStatus answers GET_CONSUMER_STATUS_FROM_CLIENT(221).
-//
-// Java answers `offsetStore.cloneOffsetTable(topic)`. This port's OffsetStore
+// GetConsumerStatus answers GET_CONSUMER_STATUS_FROM_CLIENT(221) with a copy of
+// the offset table. This port's OffsetStore
 // interface has no table clone, so it enumerates the queues the consumer knows
 // about — the ones holding a local offset, the ones already pulled, and the
 // subscribed topic's queues — and reads each one. The first group is what makes
 // the answer correct for a caller that updates offsets without ever pulling
-// (and it is the group Java's cloneOffsetTable would return).
+// (a table clone would return exactly that group).
 func (c *DefaultMQPullConsumer) GetConsumerStatus(topic *string) remoting.MQOffsetTable {
 	c.mu.Lock()
 	store := c.offsetStore

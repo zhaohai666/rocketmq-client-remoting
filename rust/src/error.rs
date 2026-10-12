@@ -167,7 +167,7 @@ mod tests {
     /// Java `ClientErrorCode` 的七个常量一个都不能改名、改值（只在设置了
     /// `ROCKETMQ_JAVA_SRC` 时跑，否则静默跳过）。
     #[test]
-    fn test_java_alignment() {
+    fn test_client_error_codes_match_server_contract() {
         let Ok(root) = std::env::var("ROCKETMQ_JAVA_SRC") else {
             eprintln!("ROCKETMQ_JAVA_SRC 未设置，跳过 ClientErrorCode 对拍");
             return;

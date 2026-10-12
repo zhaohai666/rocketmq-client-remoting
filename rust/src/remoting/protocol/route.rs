@@ -457,10 +457,10 @@ mod tests {
 
     // 以下字面量由 Python 参考实现（route.py 的 to_dict + json.dumps 紧凑分隔符）打印得到。
 
-    const JAVA_QUEUE_DATA: &str =
+    const WIRE_QUEUE_DATA: &str =
         r#"{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}"#;
 
-    const JAVA_BROKER_DATA: &str = r#"{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911","1":"127.0.0.1:10912"},"zoneName":"zone-1","enableActingMaster":false}"#;
+    const WIRE_BROKER_DATA: &str = r#"{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911","1":"127.0.0.1:10912"},"zoneName":"zone-1","enableActingMaster":false}"#;
 
     const EMPTY_TOPIC_ROUTE: &str =
         r#"{"orderTopicConf":null,"queueDatas":[],"brokerDatas":[],"filterServerTable":{}}"#;
@@ -484,9 +484,9 @@ mod tests {
         let qd = QueueData::new("broker-a", 8, 8, 6, 0);
         assert_eq!(
             RemotingSerializable::to_json_string(&qd.to_json_value()),
-            JAVA_QUEUE_DATA
+            WIRE_QUEUE_DATA
         );
-        assert_eq!(QueueData::from_json_value(&value(JAVA_QUEUE_DATA)).unwrap(), qd);
+        assert_eq!(QueueData::from_json_value(&value(WIRE_QUEUE_DATA)).unwrap(), qd);
         assert_eq!(qd.clone().compare_to(&qd), Ordering::Equal);
         assert_eq!(
             QueueData::new("broker-b", 0, 0, 0, 0).compare_to(&qd),
@@ -507,15 +507,15 @@ mod tests {
         );
         assert_eq!(
             RemotingSerializable::to_json_string(&bd.to_json_value()),
-            JAVA_BROKER_DATA
+            WIRE_BROKER_DATA
         );
         assert_eq!(
             bd.select_broker_addr().as_deref(),
             Some("127.0.0.1:10911"),
             "brokerId=0 在表里时必须优先 master"
         );
-        assert_eq!(BrokerData::from_json_value(&value(JAVA_BROKER_DATA)).unwrap(), bd);
-        let decoded = BrokerData::decode(JAVA_BROKER_DATA.as_bytes()).unwrap();
+        assert_eq!(BrokerData::from_json_value(&value(WIRE_BROKER_DATA)).unwrap(), bd);
+        let decoded = BrokerData::decode(WIRE_BROKER_DATA.as_bytes()).unwrap();
         assert_eq!(decoded.zone_name, "zone-1");
         assert_eq!(decoded.broker_addrs.len(), 2);
         assert_eq!(

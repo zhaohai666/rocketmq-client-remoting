@@ -40,8 +40,7 @@ use RocketMQ\Remoting\Protocol\ResponseCode;
 use RocketMQ\Remoting\RPCHook;
 
 /**
- * 生产者（对应 org.apache.rocketmq.client.producer.* 及 impl.producer，
- * 1:1 移植自 python/client/producer.py）。
+ * 生产者：经典 remoting 协议下的生产者实现。
  *
  * 提供：DefaultMQProducer（同步/异步/单向/批量/选择器发送、事务消息）、
  * TransactionMQProducer、MessageQueueSelector 系列选择器、SendCallback 回调、
@@ -49,24 +48,23 @@ use RocketMQ\Remoting\RPCHook;
  *
  * ## PHP 单线程适配（见 php/PORTING.md「异步模型」）
  *
- * Python 的 send_async 注册回调后**立刻返回**、由后台线程收响应；PHP 改为注册回调后
- * **在内部泵到完成**（``pumpAsyncSend``：驱动 AsyncSenderExecutor 队列、remoting 层
- * ``waitResponses``、回调执行器，直到回调链走完），对调用方呈现与 Python 相同的回调时序。
- * 所有后台线程（心跳循环、事务回查线程）一律改为调用方驱动的显式泵：
+ * sendAsync 注册回调后**在内部泵到完成**（``pumpAsyncSend``：驱动 AsyncSenderExecutor 队列、
+ * remoting 层 ``waitResponses``、回调执行器，直到回调链走完），对调用方呈现「注册回调后
+ * 由回调通知结果」的时序，没有后台线程。所有周期性/异步的后台工作一律改为调用方驱动的显式泵：
  *
- *   * 心跳：``heartbeatOnce()``（替代 Python 的 _heartbeat_loop 线程）；
- *   * 事务回查 CHECK_TRANSACTION_STATE(39)：处理器内联执行（Python 起线程）。
+ *   * 心跳：``heartbeatOnce()`` 由调用方按周期驱动；
+ *   * 事务回查 CHECK_TRANSACTION_STATE(39)：处理器内联执行。
  *
  * 允许注入时钟（``monoClock`` / ``wallClock``）便于单测。
  */
 
-// 定点发送守卫的两处 Java 文案（同步 DefaultMQProducerImpl:1235、异步 :1278），
-// 逐字保留：两处文案不同是 Java 的原样，跨语言对齐时按入口取。
+// 定点发送守卫的两处错误文案（同步入口与异步入口各一处），
+// 逐字保留：两处文案本就不同，按调用入口取对应的那条。
 // （以 DefaultMQProducer::PINNED_TOPIC_MISMATCH_SYNC / _ASYNC 常量落地。）
 
 /**
- * request() 专用的空发送回调（对齐 Java 里给 sendDefaultImpl 传的那个匿名 SendCallback，
- * 移植自 producer.py 的 _NullSendCallback）。
+ * request() 专用的空发送回调（同步请求-应答走异步发送链时，需要一个占位回调，
+ * 它不消费发送结果，只负责把状态写回 future）。
  *
  * 它只负责把「发送成功/失败」写回 RequestResponseFuture，应答本身由 broker 的
  * 326 推送投递，与这个回调无关。
@@ -87,7 +85,7 @@ final class NullSendCallback implements SendCallback
     public function onException(\Throwable $e): void
     {
         if ($this->future !== null) {
-            // 与 Java 的 onException 完全一致：三件事都要做。少了 putResponseMessage(null)
+            // 失败时必须同时做满三件事。少了 putResponseMessage(null)
             // 的话，等待方会一直阻塞到超时才抛错（明明是发送失败，却要等满 timeout）。
             $this->future->sendRequestOk = false;
             $this->future->putResponseMessage(null);
@@ -97,12 +95,11 @@ final class NullSendCallback implements SendCallback
 }
 
 /**
- * 异步链内部**唯一**被调用的回调（对应 Java
- * ``DefaultMQProducerImpl.BackpressureSendCallBack:577-633``，移植自 _BackPressureSendCallback）。
+ * 异步链内部**唯一**被调用的回调（背压版发送回调，包在用户回调外面）。
  *
  * 它是异步链内部**唯一**被调用的回调：链的终点 ``complete()`` 先跑 ``SendMessageHook.after``，
- * 再进这里的 ``onSuccess``/``onException`` —— 与 Java 的顺序一致（after 钩子在
- * ``sendKernelImpl`` 的包装回调里、信号量在外层，所以 after 先于归还许可）。归还之后才把
+ * 再进这里的 ``onSuccess``/``onException`` —— after 钩子必须早于归还许可（它在
+ * ``sendKernelImpl`` 的包装回调里、信号量在外层）。归还之后才把
  * 结果交给用户回调。
  *
  * 只归还**本次真正拿到**的许可（``numAcquired``/``sizeAcquired``）：字节信号量超时而
@@ -110,7 +107,7 @@ final class NullSendCallback implements SendCallback
  */
 final class BackPressureSendCallback implements SendCallback
 {
-    /** PHP 单线程泵需要知道回调链是否已走完（Python 无此字段）。 */
+    /** PHP 单线程泵需要知道回调链是否已走完。 */
     public bool $done = false;
     public bool $numAcquired = false;
     public bool $sizeAcquired = false;
@@ -140,11 +137,10 @@ final class BackPressureSendCallback implements SendCallback
     }
 
     /**
-     * Java ``semaphoreProcessor:599-610``（先还字节、再还条数）。
+     * 归还顺序：先还字节、再还条数。
      *
-     * 与 Java 的一处加固：用 ``$released`` 保证只还一次（对应 Python 的 _released）。
-     * Java 直接还，链上任何一条走到终点之后的重复回调都会把容量虚增出去；
-     * 本端口的重试链更长，还一次更稳妥。
+     * 用 ``$released`` 保证只还一次。直接归还的话，链上任何一条走到终点之后的
+     * 重复回调都会把容量虚增出去；本端的异步重试链较长，还一次更稳妥。
      */
     private function releasePermits(): void
     {
@@ -162,8 +158,7 @@ final class BackPressureSendCallback implements SendCallback
 }
 
 /**
- * 异步发送重试计数（对应 Python 的 ``times: List[int]``——PHP 数组是值类型，
- * 用一个小对象代替「跨重试共享的自增下标」）。
+ * 异步发送重试计数（PHP 数组是值类型，用一个小对象代替「跨重试共享的自增下标」）。
  */
 final class AsyncSendAttempt
 {
@@ -171,7 +166,7 @@ final class AsyncSendAttempt
 }
 
 /**
- * 消息队列选择器（对应 Java MessageQueueSelector）。
+ * 消息队列选择器。
  */
 interface MessageQueueSelector
 {
@@ -182,7 +177,7 @@ interface MessageQueueSelector
 }
 
 /**
- * 按 arg 的 hash 选择队列（Java SelectMessageQueueByHash）。
+ * 按 arg 的 hash 选择队列。
  */
 final class SelectMessageQueueByHash implements MessageQueueSelector
 {
@@ -192,13 +187,13 @@ final class SelectMessageQueueByHash implements MessageQueueSelector
             throw new MQClientException('no message queue');
         }
         $value = $arg ?? 0;
-        // Python 用跨进程随机化的 hash()；这里取确定性的 Java 风格 hashCode：
-        // 只保证「同值同队列」与均匀分布语义，跨语言不逐位对齐。
+        // 这里取确定性的 32 位字符串哈希：
+        // 只保证「同值同队列」与均匀分布语义，不追求和别的语言实现逐位相同。
         $idx = abs(self::valueHash($value)) % count($mqs);
         return $mqs[$idx];
     }
 
-    /** Java ``String.hashCode``（s[0]*31^(n-1)+...，32 位有环绕）+ 其它类型的兜底。 */
+    /** 确定性字符串哈希（``h = s[0]*31^(n-1) + ...``，32 位有环绕）+ 其它类型的兜底。 */
     public static function valueHash(mixed $value): int
     {
         if (is_int($value)) {
@@ -220,7 +215,7 @@ final class SelectMessageQueueByHash implements MessageQueueSelector
 }
 
 /**
- * 随机选择一个可用队列（Java SelectMessageQueueByRandom）。
+ * 随机选择一个可用队列。
  */
 final class SelectMessageQueueByRandom implements MessageQueueSelector
 {
@@ -234,7 +229,7 @@ final class SelectMessageQueueByRandom implements MessageQueueSelector
 }
 
 /**
- * 按机房（brokerName 前缀）选择队列（Java SelectMessageQueueByMachineRoom）。
+ * 按机房（brokerName 前缀）选择队列。
  */
 final class SelectMessageQueueByMachineRoom implements MessageQueueSelector
 {
@@ -255,7 +250,7 @@ final class SelectMessageQueueByMachineRoom implements MessageQueueSelector
 }
 
 /**
- * 异步发送回调（对应 Java SendCallback）。
+ * 异步发送回调。
  */
 interface SendCallback
 {
@@ -265,7 +260,7 @@ interface SendCallback
 }
 
 /**
- * 本地事务状态（对应 Java LocalTransactionState，ordinal 与 Java 一致）。
+ * 本地事务状态。整型取值就是回查应答里上报给 broker 的 localState。
  */
 enum LocalTransactionState: int
 {
@@ -275,7 +270,7 @@ enum LocalTransactionState: int
 }
 
 /**
- * 事务监听器（对应 Java TransactionListener）。
+ * 事务监听器：执行本地事务、以及响应 broker 的事务回查。
  */
 interface TransactionListener
 {
@@ -285,11 +280,10 @@ interface TransactionListener
 }
 
 /**
- * 事务消息发送结果（对应 Java TransactionSendResult）。
+ * 事务消息发送结果：半消息的发送结果加上本地事务状态。
  *
- * ⚠ 与 Python/Java 的**结构性差异**：既有的 ``SendResult`` 已被声明为 ``final``，
- * PHP 无法 ``extends``。这里用组合替代继承——构造时拷贝父结果字段（与 Python 的
- * ``__init__(send_result)`` 逐字段拷贝一致），并对全部读取口径做同形委托。
+ * ⚠ 既有的 ``SendResult`` 已被声明为 ``final``，PHP 无法 ``extends``。这里用组合替代
+ * 继承——构造时拷贝基础结果的字段，并对全部读取口径做同形委托。
  * 若未来 SendResult 放开 final，可无感切回继承（本文件不改对外 API）。
  */
 final class TransactionSendResult
@@ -370,19 +364,19 @@ final class TransactionSendResult
 }
 
 /**
- * 默认生产者（对应 org.apache.rocketmq.client.producer.DefaultMQProducer）。
+ * 默认生产者：同步 / 异步 / 单向发送、事务消息、Request-Reply 与消息查询的入口。
  */
 class DefaultMQProducer
 {
-    /** 定点发送守卫的两处 Java 文案（同步 ``DefaultMQProducerImpl:1235``、异步 ``:1278``）。 */
+    /** 定点发送守卫的两处文案：同步入口与异步入口各自一处。 */
     public const PINNED_TOPIC_MISMATCH_SYNC = "message's topic not equal mq's topic";
     public const PINNED_TOPIC_MISMATCH_ASYNC = 'Topic of the message does not match its target message queue';
 
-    /** Java ``canBatch`` 里四个延时属性（缺省 0；名字逐字对齐 MessageConst）。 */
+    /** 攒批排除项检查的四个 broker 延时属性（缺省 0）。 */
     private const TIMER_DELAY_PROPERTIES = ['DELAY', 'TIMER_DELAY_MS', 'TIMER_DELAY_SEC', 'TIMER_DELIVER_MS'];
 
     public string $producerGroup;
-    /** TLS（Java 全局系统属性 tls.enable 的等价物；null = 交给 env ROCKETMQ_TLS_ENABLE） */
+    /** TLS（null = 交给 env ROCKETMQ_TLS_ENABLE 决定） */
     public ?bool $tlsEnable;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
@@ -392,16 +386,16 @@ class DefaultMQProducer
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
     public ?string $clientId = null;
 
-    // ---- unit / stream 配置（对应 Java ClientConfig 的同名字段）----
+    // ---- unit / stream 配置 ----
     // unitName 会拼进 clientId 与动态取址 URL；unitMode 会透传给 broker
     // （发消息头、心跳 ConsumerData、拦截钩子上下文）；enableStreamRequestType
-    // 既给 clientId 加 @STREAM 后缀（Java 注释：防止 MQClientInstance 被意外复用），
-    // 也给每个请求加 ReqT=0 扩展字段。Java 的 producer 默认三个都是「关/空」。
+    // 既给 clientId 加 @STREAM 后缀（防止客户端实例被意外复用），
+    // 也给每个请求加 ReqT=0 扩展字段。三者默认都是「关/空」。
     public ?string $unitName = null;
     public bool $unitMode = false;
     public bool $enableStreamRequestType = false;
     /**
-     * 5.x 新命名空间（对应 Java ClientConfig.namespaceV2）：非空时**每笔**请求都带
+     * 5.x 新命名空间（namespaceV2）：非空时**每笔**请求都带
      * `nsd=true` / `ns=<该值>` 两个扩展头，broker 据此把请求解析到对应的 serverless 实例。
      * 与 {@see $namespace}（客户端把 `namespace%` 拼进 topic/group 名）是两套机制：
      * namespaceV2 **不改**任何资源名，只改请求头。见 NamespaceRpcHook。
@@ -411,18 +405,18 @@ class DefaultMQProducer
     public string $createTopicKey = MixAll::DEFAULT_TOPIC;
     public int $defaultTopicQueueNums = MixAll::DEFAULT_TOPIC_QUEUE_NUMS;
     public int $sendMsgTimeout = 3000;
-    // 压缩配置，默认值与 Java DefaultMQProducer 一致
+    // 压缩配置：body 超过 compressMsgBodyOverHowmuch 才压缩，默认 ZLIB
     public int $compressMsgBodyOverHowmuch = 1024 * 4;
     public int $compressLevel = 5;
     public int $compressType = MessageSysFlag::ZLIB_TYPE;
     public int $retryTimesWhenSendFailed = 2;
     public int $retryTimesWhenSendAsyncFailed = 2;
     public bool $retryAnotherBrokerWhenNotStoreOk = false;
-    // Java DefaultMQProducer 默认 -1 = 不限制单次请求超时；开了之后每次重试的单请求
+    // 默认 -1 = 不限制单次请求超时；设成正值后每次重试的单请求
     // 超时被压到该值，慢 broker 才会被换掉而不是把总预算吃光。
     public int $sendMsgMaxTimeoutPerRequest = -1;
     /**
-     * Java retryResponseCodes：broker 明确回了这些码才值得换一台重试，
+     * 可重试的 broker 响应码：明确回了这些码才值得换一台重试，
      * 其余码（如 MESSAGE_ILLEGAL）重试也是白试，必须原样抛出。
      * @var array<int, true>
      */
@@ -439,22 +433,21 @@ class DefaultMQProducer
     /** 当前事务监听器（sendMessageInTransaction 时记录，供 broker 回查调用） */
     private ?TransactionListener $transactionListener = null;
     /**
-     * PHP 无线程：Python 的心跳线程改由调用方显式泵（``heartbeatOnce()``）。
-     * 字段保留只为与 Python 状态对齐（shutdown 后置 false）。
+     * PHP 无线程：心跳不启后台循环，改由调用方显式泵（``heartbeatOnce()``）。
+     * 字段保留只是为了表达「心跳是否还在跑」这个状态（shutdown 后置 false）。
      */
     public bool $heartbeatRunning = false;
     public int $heartbeatIntervalMillis = 30000;
-    // 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）。
-    // 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效（Java 的
-    // scheduledExecutorService 也是按启动时的周期排定）。
+    // 路由刷新周期（默认 30000ms）。
+    // 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效：排期按启动时的周期定下。
     public int $pollNameServerInterval = 30000;
-    // 发送延迟故障容错：默认关闭，与 Java sendLatencyFaultEnable 一致
+    // 发送延迟故障容错：默认关闭
     public bool $sendLatencyFaultEnable = false;
     public MQFaultStrategy $mqFaultStrategy;
 
-    // ---- 自动攒批（对应 Java DefaultMQProducer 的 autoBatch / batchMaxDelayMs /
-    // batchMaxBytes / totalBatchMaxBytes）----
-    // 四个配置在 Java 里都是"先记在 producer 上、start() 建累加器时再同步下去"，
+    // ---- 自动攒批配置（autoBatch / batchMaxDelayMs / batchMaxBytes /
+    // totalBatchMaxBytes）----
+    // 四个配置都是"先记在 producer 上、start() 建累加器时再同步下去"，
     // 因为累加器是按 clientId 复用的（同 clientId 的第二个 producer 会**复用**第一个
     // 的累加器，此时 setter 立即生效、不再重新初始化）。-1 表示"不动累加器的默认值"。
     public bool $autoBatch = false;
@@ -463,7 +456,7 @@ class DefaultMQProducer
     public int $totalBatchMaxBytes = -1;
     public ?ProduceAccumulator $produceAccumulator = null;
 
-    // ---- 消息轨迹（对应 Java ClientConfig.enableTrace / traceTopic / traceMsgBatchNum）----
+    // ---- 消息轨迹（enableTrace / traceTopic / traceMsgBatchNum）----
     public bool $enableTrace = false;
     public ?string $traceTopic = null; // null → 用 RMQ_SYS_TRACE_TOPIC
     public int $traceMsgBatchNum = 10;
@@ -471,7 +464,7 @@ class DefaultMQProducer
     public array $sendMessageHookList = [];
     /** @var list<EndTransactionHook> */
     public array $endTransactionHookList = [];
-    /** 发送前拦截钩子（Java DefaultMQProducerImpl.checkForbiddenHookList） */
+    /** 发送前拦截钩子 */
     /** @var list<CheckForbiddenHook> */
     public array $checkForbiddenHookList = [];
     public ?AsyncTraceDispatcher $traceDispatcher = null;
@@ -481,18 +474,16 @@ class DefaultMQProducer
     /** Request-Reply 的默认超时（不传 timeout 给 request() 时用它）。 */
     public int $requestTimeout = RequestResponseFuture::DEFAULT_REQUEST_TIMEOUT_MILLIS;
 
-    // ---- 异步发送（对应 Java DefaultMQProducerImpl 的 asyncSenderThreadPoolQueue +
-    // defaultAsyncSenderExecutor，以及 NettyRemotingClient 的 publicExecutor）----
-    // Java：LinkedBlockingQueue(50000)，池大小 = CPU 核数（core==max，keepAlive 60s）
+    // ---- 异步发送（待发送队列 + 发送执行器 + 回调执行器）----
+    // 待发送队列容量默认 50000，发送池大小 = CPU 核数。
     public int $asyncSenderQueueCapacity = 50000;
-    // Java NettyClientConfig.clientCallbackExecutorThreads 默认 availableProcessors，
-    // <=0 时兜到 4；这里 0 表示"按 CPU 核数"
+    // 回调执行器线程数默认取可用 CPU 核数，<=0 时兜到 4；这里 0 表示"按 CPU 核数"
     public int $clientCallbackExecutorThreads = 0;
     private ?ConsumeExecutor $asyncSenderExecutor = null;
     private ?ConsumeExecutor $callbackExecutor = null;
 
-    // ---- 异步发送背压（对应 Java DefaultMQProducerImpl:122-153 的两个公平信号量）----
-    // 默认关闭，且开关本身**不是**启动期配置：Java 允许跑到一半再打开/关掉，
+    // ---- 异步发送背压（在途条数与在途字节数两个公平信号量）----
+    // 默认关闭，且开关本身**不是**启动期配置：允许跑到一半再打开/关掉，
     // 三个字段都是普通属性，改容量走 setter。
     public bool $enableBackpressureForAsyncMode = false;
     public int $backPressureForAsyncSendNum = 1024;
@@ -501,7 +492,7 @@ class DefaultMQProducer
     private FairSemaphore $semaphoreAsyncSendSize;
 
     /**
-     * 注入时钟（毫秒，单调口径；对应 Python 的 time.monotonic）。null = microtime(true)*1000。
+     * 注入时钟（毫秒，单调口径）。null = microtime(true)*1000。
      * 仅供单测推进超时/重试预算。
      *
      * @var \Closure(): float|null
@@ -509,7 +500,7 @@ class DefaultMQProducer
     public ?\Closure $monoClock = null;
 
     /**
-     * 注入墙钟（毫秒；对应 Python 的 time.time()*1000，Request-Reply 用）。
+     * 注入墙钟（毫秒，Request-Reply 用）。
      *
      * @var \Closure(): int|null
      */
@@ -548,7 +539,7 @@ class DefaultMQProducer
         ];
         $this->metrics = new ClientMetrics();
         $this->mqFaultStrategy = new MQFaultStrategy(false);
-        // Java 在建 impl 时按配置建两个公平信号量，并对越界的配置兜地板值
+        // 建两个公平信号量，并对越界的配置兜地板值
         $this->semaphoreAsyncSendNum = new FairSemaphore(
             self::backPressurePermits(
                 $this->backPressureForAsyncSendNum,
@@ -565,13 +556,12 @@ class DefaultMQProducer
         );
     }
 
-    // ================================================================ 模块级 helper（Python producer.py 顶层函数）
+    // ================================================================ 模块级 helper
 
     /**
-     * 对应 Java ``DefaultMQProducerImpl:141-153``：配置不高于地板值时用地板值并记一条日志。
+     * 背压许可容量：配置不高于地板值时用地板值并记一条日志。
      *
-     * Java 的分支写成 ``if (cfg > 10) new Semaphore(max(cfg, 10)) else new Semaphore(10)``，
-     * 也就是**恰好等于**地板值时也会走 else 分支（照样打那条日志），这里保持一致。
+     * 分支条件是严格大于：也就是**恰好等于**地板值时照样打那条日志。
      */
     public static function backPressurePermits(int $configured, int $floor, string $name): int
     {
@@ -583,12 +573,9 @@ class DefaultMQProducer
     }
 
     /**
-     * 扣多少个「字节」许可（Java ``executeAsyncMessageSend:642`` 的
-     * ``msg.getBody() == null ? 1 : msg.getBody().length``）。
+     * 扣多少个「字节」许可：按 body 长度，空 body 也算 1。
      *
-     * 批量异步（Java ``DefaultMQProducer.send(Collection, SendCallback, timeout)``，
-     * :1121 起）没有 Java 那边的现成公式可依（Java 走 SEND_BATCH + invokeAsync，本实现批量
-     * 只有同步内核），这里按每条累加、空 body 也算 1，整批为空时算 1 —— 不给它一个值就等于
+     * 批量发送没有单条那样的现成公式，这里按每条累加、整批为空时算 1 —— 不给它一个值就等于
      * 一批消息整体只占 1 份容量，字节闸对批量形同虚设。
      */
     public static function backPressureMsgLen(Message|array $msg): int
@@ -606,11 +593,10 @@ class DefaultMQProducer
     }
 
     /**
-     * Java ``canBatch`` 里四个延时属性的最大值（缺省 0）。
+     * 攒批排除项检查用的四个 broker 延时属性的最大值（缺省 0）。
      *
-     * 属性名逐字对齐 ``MessageConst``：``DELAY``（delayTimeLevel）、``TIMER_DELAY_MS``、
-     * ``TIMER_DELAY_SEC``、``TIMER_DELIVER_MS``。值非法时与 Java 的
-     * ``Integer/Long.parseLong`` 一样**直接抛**，不静默当 0。
+     * 属性名为服务端定义的投递延时属性：``DELAY``（延时等级）、``TIMER_DELAY_MS``、
+     * ``TIMER_DELAY_SEC``、``TIMER_DELIVER_MS``。值非法时**直接抛**，不静默当 0。
      */
     public static function maxDelayValue(Message $msg): int
     {
@@ -635,11 +621,11 @@ class DefaultMQProducer
     }
 
     /**
-     * 对应 Java ``sendMessageAsync`` 里 ``operationFail`` 的三分支：包装 + 判定能否重试。
+     * 异步发送失败的三分支包装：按 remoting 层异常类型判定能否重试。
      *
      * ⚠ 只有 remoting 层抛回来的异常走这里。**已经收到响应**、但 ``parseSendResponse``
-     * 判定为失败的错误（``MQBrokerException``）不走这里 —— Java 那条路径传的是
-     * ``needRetry=false`` 且**原样**抛出。也就是说异步发送**不看** ``retryResponseCodes``：
+     * 判定为失败的错误（``MQBrokerException``）不走这里 —— 那条路径的 ``needRetry`` 恒为
+     * false 且**原样**抛出。也就是说异步发送**不看** ``retryResponseCodes``：
      * broker 明确回了错就不会换 broker 重试。别和同步发送的语义混为一谈。
      *
      * @return array{0: \Throwable, 1: bool} [包装后的异常, 是否可重试]
@@ -660,19 +646,16 @@ class DefaultMQProducer
     }
 
     /**
-     * 对应 Python 装饰器 ``_restores_caller_message`` 的还原体（PHP 无装饰器，做成
-     * 显式 try/finally：发送结束后还原**调用方**那条 Message，Java
-     * ``sendKernelImpl:1095-1096`` 的 finally）。
+     * 发送结束后还原**调用方**那条 Message（用显式 try/finally 保证三条出口都走到）。
      *
      * body 换回压缩前那一份、topic 剥掉命名空间。不还原会坏在哪：压缩是就地
      * ``msg->setBody(...)``，调用方拿着同一个对象再发一次，第二次就把压缩流当原文又压
      * 一遍（zlib(zlib(x))），消费端只解一层、拿到的是压缩流；带 namespace 时调用方还会
-     * 一直盯着被改写的 ``ns%topic``。Java 的两个入口（``DefaultMQProducerImpl:930`` 取
-     * ``prevBody``）在成功、失败、拦截钩子抛异常三条路上都会还原，所以必须在 ``finally``
-     * 而不是正常返回路径。
+     * 一直盯着被改写的 ``ns%topic``。成功、失败、拦截钩子抛异常三条路上都要还原，
+     * 所以必须在 ``finally`` 而不是正常返回路径。
      *
-     * topic 是 ``withoutNamespace`` 而不是"恢复进入时的字符串"——Java 的 finally 就是这么
-     * 写的：调用方自己传进来、本来就带前缀的 topic 同样会被剥掉。
+     * topic 是 ``withoutNamespace`` 而不是"恢复进入时的字符串"：调用方自己传进来、
+     * 本来就带前缀的 topic 同样会被剥掉。
      *
      * 只对单条消息生效（批量路径由调用方在进入前分流，不做还原）。
      */
@@ -696,7 +679,7 @@ class DefaultMQProducer
 
     // ================================================================ 配置
 
-    /** 按 ";" 拆分并去空白（对应 Python set_namesrv_addr）。 */
+    /** 按 ";" 拆分并去空白。 */
     public function setNamesrvAddr(string $addr): void
     {
         $addrs = [];

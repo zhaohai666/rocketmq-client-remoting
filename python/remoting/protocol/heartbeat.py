@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""心跳数据（对应 org.apache.rocketmq.remoting.protocol.heartbeat.*）。"""
+"""心跳数据（协议 heartbeat 包各模型）。"""
 from __future__ import annotations
 
 import time
@@ -56,7 +56,7 @@ class ConsumerData:
         self.unit_mode = False
 
     def to_dict(self) -> dict:
-        """对齐 Java 5.x ConsumerData 字段（**没有** 4.x 的 consumeTimestamp /
+        """按 5.x 协议的 ConsumerData 字段序列化（**没有** 4.x 的 consumeTimestamp /
         maxReconsumeTimes）；subscriptionDataSet 用 SubscriptionData.to_dict()，
         不能直接 __dict__（那是 snake_case 键 + set 类型，JSON 也序列化不了）。
         """
@@ -99,7 +99,7 @@ class HeartbeatData:
     def to_dict(self) -> dict:
         # heartbeatFingerprint 故意留 0：broker 见到 0 走 V1 注册路径（用完整
         # subscriptionDataSet 注册），最稳妥；非 0 才会进 heartBeatV2 优化。
-        # withoutSub 同理（Java 字段 isWithoutSub，fastjson2 名是 withoutSub）。
+        # withoutSub 同理（协议字段 isWithoutSub，broker 侧 fastjson 名是 withoutSub）。
         return {
             "clientID": self.client_id,
             "producerDataSet": [p.to_dict() for p in self.producer_data_set],

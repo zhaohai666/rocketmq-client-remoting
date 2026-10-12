@@ -5,9 +5,8 @@ import (
 	"testing"
 )
 
-// The 8-segment layout is the contract with the broker. These cases are
-// transcribed from the Java call sites (PullAPIWrapper.popAsync ->
-// MQClientAPIImpl.processPopResponse -> DefaultMQPushConsumerImpl.ackAsync) so a
+// The 8-segment layout is the contract with the broker. These cases walk the
+// pop -> checkpoint -> ack chain end to end so a
 // reordering of the segments fails here instead of at "every ack silently does
 // nothing" on a real cluster.
 
@@ -50,7 +49,8 @@ func TestExtraInfoBuildAndParseRoundTrip(t *testing.T) {
 	}
 }
 
-// The 7-argument overload stops at segment 6; Java uses it only as a prefix and
+// The 7-argument overload stops at segment 6; the checkpoint format uses it
+// only as a prefix and
 // then appends the offset. Using it as an ACK checkpoint would send an address
 // with no message offset.
 func TestExtraInfoSevenArgOverloadHasNoOffsetSegment(t *testing.T) {
@@ -72,8 +72,8 @@ func TestExtraInfoRetryMarkerPerTopic(t *testing.T) {
 		{"TopicA", "0"},
 		{"%RETRY%GroupA_TopicA", "1"},
 		{"%RETRY%GroupA+TopicA", "2"},
-		// A plain %RETRY% group topic (no separator) still counts as "1": Java
-		// only checks the prefix.
+		// A plain %RETRY% group topic (no separator) still counts as "1": only
+		// the prefix is checked.
 		{"%RETRY%GroupA", "1"},
 	}
 	for _, c := range cases {
@@ -136,20 +136,20 @@ func TestExtraInfoIsOrderUsesReviveQid(t *testing.T) {
 	}
 }
 
-// Java drops trailing empty segments; Go's strings.Split would keep them. That
-// difference flips the length guards, so pin it down.
-func TestExtraInfoSplitMatchesJavaTrailingTrim(t *testing.T) {
+// The checkpoint split drops trailing empty segments; Go's strings.Split would
+// keep them. That difference flips the length guards, so pin it down.
+func TestExtraInfoSplitDropsTrailingEmptyParts(t *testing.T) {
 	if got := SplitExtraInfo("1 2"); len(got) != 2 {
 		t.Fatalf("want 2 segments, got %v", got)
 	}
 	if got := SplitExtraInfo("1 2 "); len(got) != 2 {
 		t.Fatalf("trailing separator must be trimmed, got %v", got)
 	}
-	// A leading separator is a real empty segment in Java.
+	// A leading separator is a real empty segment.
 	if got := SplitExtraInfo(" 2"); len(got) != 2 || got[0] != "" {
 		t.Fatalf("leading empty segment must be kept, got %q", got)
 	}
-	// "".split(" ") is [""] in Java, not an empty array.
+	// "".split(" ") yields [""], one empty segment, not an empty array.
 	if got := SplitExtraInfo(""); len(got) != 1 {
 		t.Fatalf(`SplitExtraInfo("") = %v`, got)
 	}

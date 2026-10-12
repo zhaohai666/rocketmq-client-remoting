@@ -5,8 +5,8 @@ package common
 
 import "fmt"
 
-// ErrorKind discriminates the error families, one per Java exception type
-// (RemotingCommandException, RemotingConnectException, MQClientException, ...).
+// ErrorKind discriminates the error families, one per protocol failure stage
+// (command processing, connect, send-request, timeout, too-many-request, ...).
 type ErrorKind int
 
 const (
@@ -24,7 +24,7 @@ const (
 	KindIO
 )
 
-// ClientErrorCode mirrors org.apache.rocketmq.client.exception.ClientErrorCode.
+// ClientErrorCode carries the protocol's client-side exception codes.
 // 10001~10005 classify the send-retry outcome, 10006/10007 have their own
 // throw sites (request-reply).
 const (
@@ -88,7 +88,7 @@ func (e *Error) Unwrap() error { return e.Cause }
 
 // ResponseCode returns the broker/client business code when one is attached:
 // Server/Broker always, Client only when HasCode, RequestTimeout always
-// (Java constructs RequestTimeoutException with REQUEST_TIMEOUT_EXCEPTION).
+// (the timeout error is built with the REQUEST_TIMEOUT_EXCEPTION code).
 func (e *Error) ResponseCode() (int32, bool) {
 	switch e.Kind {
 	case KindServer, KindBroker:

@@ -1,11 +1,9 @@
 // -*- coding: utf-8 -*-
-// Request-reply support (org.apache.rocketmq.client.producer.RequestReplyProducer).
-// Faithful port of python/client/request_reply.py, aligned with Java
-// RequestResponseFuture / RequestFutureHolder (client/producer/*.java).
+// 请求-响应支持。
 //
-// A request producer sends a message carrying a correlation id + reply-to topic; the replying
-// side creates a reply message and the future is resolved. This module holds the in-flight
-// future table and the message helpers. Actual network round-trips are performed by the producer.
+// 请求 producer 发出的消息带一个关联 id 和 reply-to topic；应答端据此生成一条
+// 应答消息、把对应 future 兑现。本模块只维护在途 future 表和消息辅助函数，真正的
+// 网络往返由 producer 完成。
 import { Message } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MessageAccessor } from '../common/message_accessor.ts';
@@ -15,9 +13,8 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.request_reply');
 
-// A request callback is either a Java-style RequestCallback object
-// (onSuccess(replyMsg) / onException(err)) or a node-style
-// (replyMsg, err) => void function.
+// 请求回调：既可以是 RequestCallback 对象（onSuccess/onException），
+// 也可以是 node 风格的 (replyMsg, err) => void 函数。
 export type RequestCallbackLike = RequestCallback |
   ((replyMsg: Message | null, err: Error | null) => void);
 
@@ -33,9 +30,8 @@ export class RequestResponseFuture {
   timeoutMillis: number;
   beginTimestamp: number;
   done: boolean;
-  // Java RequestResponseFuture state: the async callback (null for the sync
-  // form), the reply message, whether the request itself was sent, the failure
-  // cause, and the execute-request-callback-once latch.
+  // 异步回调（同步形态下为 null）、应答消息、请求是否已发出、失败原因，
+  // 以及"回调只跑一次"闩。
   requestCallback: RequestCallbackLike | null;
   responseMsg: Message | null;
   sendRequestOk: boolean;
@@ -67,8 +63,7 @@ export class RequestResponseFuture {
 
   promise(): Promise<Message> { return this._promise; }
 
-  // Java putResponseMessage — stores the reply (the Java latch countDown is
-  // node's promise resolution, done by complete()).
+  // 存放应答消息；闩在这里由 promise 兑现来承担，由 complete() 触发。
   putResponseMessage(responseMsg: Message | null): void {
     this.responseMsg = responseMsg;
   }
@@ -76,10 +71,8 @@ export class RequestResponseFuture {
   setSendRequestOk(sendRequestOk: boolean): void { this.sendRequestOk = sendRequestOk; }
   setCause(cause: Error | null): void { this.cause = cause; }
 
-  // Java executeRequestCallback: fire the async callback EXACTLY once (Java
-  // guards with an AtomicBoolean CAS so the reply-arrival path and the
-  // timeout-scan path cannot both deliver). onSuccess only when the request
-  // was sent and no cause was recorded; otherwise onException.
+  // 触发异步回调**恰好一次**：由 _callbackExecuted 闩保证——应答到达路径与超时扫描
+  // 路径不会都投递。请求已发出且没记录 cause 时才走 onSuccess，否则走 onException。
   executeRequestCallback(): void {
     const cb: any = this.requestCallback;
     if (cb == null) return;
@@ -121,8 +114,7 @@ export class RequestResponseFuture {
 export class RequestFutureHolder {
   private static _instance: RequestFutureHolder | null = null;
   private table: Map<string, RequestResponseFuture> = new Map();
-  // Java producerSet + scheduledExecutorService: the TTL sweep runs while at
-  // least one producer is started (3s initial delay, 1s interval).
+  // TTL 扫描：只要至少还有一个 producer 在跑就定时清理超时请求（首次延迟 3s，间隔 1s）。
   private producerSet: Set<any> = new Set();
   private _sweepTimer: NodeJS.Timeout | null = null;
 
@@ -141,17 +133,16 @@ export class RequestFutureHolder {
     return this.table.get(correlationId) != null ? this.table.get(correlationId)! : null;
   }
 
-  // Remove and return the future (mirrors Java's putResponse which removes).
+  // 取出并把 future 从表里移除（应答到达即不再需要跟踪）。
   removeRequest(correlationId: string): RequestResponseFuture | null {
     const f = this.table.get(correlationId);
     if (f != null) this.table.delete(correlationId);
     return f != null ? f : null;
   }
 
-  // Java RequestFutureHolder.scanExpiredRequest: remove every future whose TTL
-  // elapsed, then fail its callback with a timeout cause. Removing BEFORE the
-  // callback keeps the reply-arrival path (which also removes) from delivering
-  // a late reply to an already-failed request.
+  // scanExpiredRequest：把 TTL 到期的 future 全部先摘表，再统一以超时 cause 触发回调。
+  // **先摘表再回调**——应答到达路径也会摘表，先摘能避免已经把请求标失败之后又被
+  // 迟到应答二次投递。
   scanExpiredRequest(): void {
     const expired: RequestResponseFuture[] = [];
     for (const [key, rep] of this.table.entries()) {
@@ -171,8 +162,7 @@ export class RequestFutureHolder {
     }
   }
 
-  // Java startScheduledTask(DefaultMQProducerImpl): refcounted sweep. The first
-  // scan runs 3s after the first producer starts; the interval is 1s.
+  // 引用计数的 TTL 扫描：首个 producer 启动后 3s 跑第一轮，之后每 1s 一轮。
   startScheduledTask(producer: any): void {
     this.producerSet.add(producer);
     if (this._sweepTimer == null) {
@@ -186,8 +176,7 @@ export class RequestFutureHolder {
     }
   }
 
-  // Java shutdown(DefaultMQProducerImpl): drop one producer reference; stop the
-  // sweep only when the last producer is gone.
+  // 少一个 producer 引用；只有最后一个 producer 走掉才停 TTL 扫描。
   shutdown(producer: any): void {
     this.producerSet.delete(producer);
     if (this.producerSet.size <= 0 && this._sweepTimer != null) {
@@ -201,13 +190,10 @@ export class RequestFutureHolder {
 
 export const REQUEST_FUTURE_HOLDER = RequestFutureHolder.getInstance();
 
-// Build a reply message for the given request message — Java MessageUtil.
-// createReplyMessage: the reply's TOPIC is the 5.x REPLY topic
-// (`<cluster>_REPLY_TOPIC`, cluster read from the request's CLUSTER property,
-// which the broker stamps on receipt); the requester's clientId rides along as
-// the REPLY_TO_CLIENT property — the broker uses it to find the requestor's
-// channel and push 326 directly. Throws when the request carries no CLUSTER
-// property (Java does the same).
+// 依据请求消息构造应答消息：应答的 TOPIC 是 5.x 的 REPLY topic
+// （`<cluster>_REPLY_TOPIC`，cluster 取自请求的 CLUSTER 属性，由 broker 在收到请求
+// 时盖章写入）；请求方的 clientId 通过 REPLY_TO_CLIENT 属性带过去，broker 用它
+// 找到请求者所在的 channel 直接推回 326。请求缺少 CLUSTER 属性时抛错。
 export function createReplyMessage(requestMessage: Message, body: Buffer | string): Message {
   const cluster = MessageAccessor.getProperty(requestMessage, MessageConst.PROPERTY_CLUSTER);
   if (cluster == null || cluster === '') {

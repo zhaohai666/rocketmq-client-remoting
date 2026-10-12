@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestJavaHashMatchesReferenceVectors(t *testing.T) {
+func TestStringHash31MatchesReferenceVectors(t *testing.T) {
 	cases := []struct {
 		in   string
 		want int32
@@ -20,8 +20,8 @@ func TestJavaHashMatchesReferenceVectors(t *testing.T) {
 		{"\u4e2d", 20013},
 	}
 	for _, c := range cases {
-		if got := JavaStringHash(c.in); got != c.want {
-			t.Fatalf("JavaStringHash(%q) = %d, want %d", c.in, got, c.want)
+		if got := StringHash31(c.in); got != c.want {
+			t.Fatalf("StringHash31(%q) = %d, want %d", c.in, got, c.want)
 		}
 	}
 }

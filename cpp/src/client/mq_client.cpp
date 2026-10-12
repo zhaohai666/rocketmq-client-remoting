@@ -1,4 +1,4 @@
-// MQClientInstance 实现（对应 Python client/mq_client.py）。
+// MQClientInstance 实现：客户端实例级的路由、发送、拉取、POP、位点与心跳底座。
 #include "rocketmq/client/mq_client.h"
 
 #include <algorithm>
@@ -37,7 +37,7 @@ namespace rocketmq {
 
 namespace {
 
-// 拉取响应码 -> PullStatus（对应 Python pull_message 的映射）
+// 拉取响应码 -> PullStatus（经典 remoting 协议对 PULL_* 响应码的口径）
 bool mapPullStatus(int32_t code, PullStatus& out) {
     switch (code) {
         case ResponseCode::SUCCESS:
@@ -57,13 +57,12 @@ bool mapPullStatus(int32_t code, PullStatus& out) {
     }
 }
 
-// 发送请求码（对应 Java `MQClientAPIImpl#sendMessage:550-563`）：先判应答消息，
-// 再判批量。应答必须走 325（broker 只在 324/325 上注册 ReplyMessageProcessor）；
-// 批量走 SEND_BATCH_MESSAGE(320)，判据与 Java 一样是「这条消息是不是批量」
-// （Java 用 `msg instanceof MessageBatch`，这里用 `msg.isBatch`）。
+// 发送请求码：先判应答消息，再判批量。应答必须走 325（broker 只在 324/325 上注册
+// ReplyMessageProcessor）；批量走 SEND_BATCH_MESSAGE(320)，判据是「这条消息是不是批量」
+// （`msg.isBatch`）。
 // 服务端对 310/320 走同一条路（broker 按 header.batch 选写入方式，proxy 和 auth
-// 把两个码列在同一个 case 里），所以这不是修 bug，只是把请求码这一层也对齐 Java，
-// 免得服务端按码统计/限流时把批量当成单条。
+// 把两个码列在同一个 case 里），所以这不是修 bug，只是在请求码这一层把批量与单条
+// 分开，免得服务端按码统计/限流时把批量当成单条。
 int32_t sendRequestCode(const Message& msg) {
     if (isReplyMessage(msg)) {
         return RequestCode::SEND_REPLY_MESSAGE_V2;
@@ -76,7 +75,7 @@ int32_t sendRequestCode(const Message& msg) {
 // ---------------------------------------------------------------- clientId
 namespace {
 
-// 对应 Java `System.nanoTime()`：单调、原点任意，只用来保证同进程内不重复。
+// 单调纳秒时钟：数值原点任意，只用来保证同进程内不重复（供 clientId 生成）。
 uint64_t nanoTime() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -102,12 +101,12 @@ std::string changeInstanceNameToPID(const std::string& instanceName) {
 
 std::string buildMqClientId(const std::string& clientIp, const std::string& instanceName,
                             const std::string& unitName, bool enableStreamRequestType) {
-    // Java `ClientConfig#buildMQClientId`：
-    //   sb.append(clientIP).append("@").append(instanceName);
-    //   if (!UtilAll.isBlank(unitName)) sb.append("@").append(unitName);
-    //   if (enableStreamRequestType) sb.append("@").append(RequestType.STREAM);
-    // 末段 Java 拼的是**枚举名**（`RequestType.STREAM` 的 toString = "STREAM"），
-    // 不是 code；code 只出现在 extFields 的 ReqT 里。
+    // 经典 remoting 协议规定的 clientId 拼接格式：
+    //   clientIP + "@" + instanceName
+    //   unitName 非空白时再拼 "@" + unitName
+    //   enableStreamRequestType 时再拼 "@" + "STREAM"
+    // 末段拼的是**请求类型名**（"STREAM"），不是 code；code 只出现在 extFields 的
+    // ReqT 里。
     std::string id = clientIp + "@" + instanceName;
     if (!isBlank(unitName)) {
         id += "@" + unitName;
@@ -137,7 +136,7 @@ MessageQueue TopicPublishInfo::selectOneMessageQueue(const std::string& lastBrok
     if (msgQueueList.empty()) {
         throw MQClientException("no message queue for publish info");
     }
-    // 对应 Java：尽量避开上次失败的 broker；若全是同一 broker 则退化为轮询
+    // 重试时尽量避开上次失败的 broker；若全是同一 broker 则退化为轮询
     for (size_t i = 0; i < msgQueueList.size(); ++i) {
         uint64_t idx = index_.fetch_add(1);
         const MessageQueue& mq = msgQueueList[static_cast<size_t>(idx % msgQueueList.size())];
@@ -155,7 +154,7 @@ std::optional<MessageQueue> TopicPublishInfo::selectOneMessageQueue(
     if (msgQueueList.empty()) {
         throw MQClientException("no message queue for publish info");
     }
-    // 对应 Python select_one_message_queue(*filters)：游标照常推进，
+    // 带过滤器的选择：游标照常推进，
     // 一轮内全部不匹配返回 nullopt（由调用方退化选择，不在这里兜底）。
     const size_t n = msgQueueList.size();
     for (size_t i = 0; i < n; ++i) {

@@ -11,8 +11,7 @@ import (
 	"time"
 )
 
-// MixAll constants and helpers (Java org.apache.rocketmq.common.MixAll), cut
-// down to what the client layer uses.
+// MixAll constants and helpers, cut down to what the client layer uses.
 const (
 	NamesrvAddrProperty  = "rocketmq.namesrv.addr"
 	NamesrvAddrEnv       = "NAMESRV_ADDR"
@@ -38,7 +37,7 @@ const (
 	// Region placeholder when the SEND response header carries no MSG_REGION.
 	DefaultTraceRegionID = "DefaultRegion"
 	// ConsumeContextType is the hook-context property carrying the NAME of the
-	// ConsumeReturnType (Java MixAll.CONSUME_CONTEXT_TYPE). The trace hook turns
+	// ConsumeReturnType. The trace hook turns
 	// it back into the ordinal that goes into a SubAfter record.
 	ConsumeContextType = "ConsumeContextType"
 
@@ -46,9 +45,8 @@ const (
 	ReqT              = "ReqT"
 	StreamRequestType = "STREAM"
 
-	// Zone hooks (Java MixAll / DynamicalExtFieldRPCHook). The zone name comes
-	// from a system property first, then the environment variable — the same
-	// two-step lookup Java does.
+	// Zone hooks. The zone name comes from a config property first, then the
+	// environment variable (two-step lookup).
 	ZoneNameEnv      = "ROCKETMQ_ZONE"
 	ZoneNameProperty = "rocketmq.zone"
 	ZoneModeEnv      = "ROCKETMQ_ZONE_MODE"
@@ -67,17 +65,17 @@ const (
 	DefaultTraceRegionPlaceholder       = "DefaultRegion"
 )
 
-// GetRetryTopic mirrors Java MixAll.getRetryTopic.
+// GetRetryTopic builds the %RETRY%<group> topic.
 func GetRetryTopic(consumerGroup string) string { return RetryGroupTopicPrefix + consumerGroup }
 
 func IsRetryTopic(topic string) bool { return strings.HasPrefix(topic, RetryGroupTopicPrefix) }
 
-// GetDLQTopic mirrors Java MixAll.getDLQTopic.
+// GetDLQTopic builds the %DLQ%<group> topic.
 func GetDLQTopic(consumerGroup string) string { return DLQGroupTopicPrefix + consumerGroup }
 
 func IsDLQTopic(topic string) bool { return strings.HasPrefix(topic, DLQGroupTopicPrefix) }
 
-// GetReplyTopic mirrors Java MixAll.getReplyTopic(clusterName). NOT the
+// GetReplyTopic builds the request-reply topic <cluster>_REPLY_TOPIC. NOT the
 // %REPLY%<topic> prefix (that is a different mechanism).
 func GetReplyTopic(clusterName string) string { return clusterName + "_" + ReplyTopicPostfix }
 
@@ -92,8 +90,8 @@ func ResetRetryAndDLQTopic(topic string) string {
 	return topic
 }
 
-// CompareAndIncreaseNamespace mirrors Java MixAll.compareAndIncreaseNamespace;
-// an empty namespace is a no-op.
+// CompareAndIncreaseNamespace prefixes the instance name as
+// %<namespace>%%<instanceName>; an empty namespace is a no-op.
 func CompareAndIncreaseNamespace(instanceName, namespace string) string {
 	if namespace == "" {
 		return instanceName
@@ -109,7 +107,7 @@ func CompareAndIncreaseNamespace(instanceName, namespace string) string {
 
 var uniqNameCounter uint64
 
-// CreateUniqName mirrors Java MixAll.createUniqName: prefix + 32 hex chars
+// CreateUniqName returns prefix + 32 hex chars
 // built from pid/nanos/per-process counter.
 func CreateUniqName(prefix string) string {
 	seq := atomic.AddUint64(&uniqNameCounter, 1) - 1
@@ -137,7 +135,7 @@ func CachedPID() int {
 	return cachedPIDVal
 }
 
-// BuildMQClientID mirrors Java ClientConfig#buildMQClientId:
+// BuildMQClientID:
 // clientIP + "@" + instanceName + ("@" + unitName if not blank) + ("@STREAM" if enabled).
 func BuildMQClientID(clientIP, instanceName, unitName string, enableStreamRequestType bool) string {
 	var sb strings.Builder
@@ -155,7 +153,7 @@ func BuildMQClientID(clientIP, instanceName, unitName string, enableStreamReques
 	return sb.String()
 }
 
-// ChangeInstanceNameToPID mirrors Java ClientConfig#changeInstanceNameToPID:
+// ChangeInstanceNameToPID:
 // only the default name becomes "<pid>#<nanoTime>" (idempotent afterwards).
 func ChangeInstanceNameToPID(instanceName string) string {
 	if instanceName == DefaultInstanceName {
@@ -179,7 +177,7 @@ func ClientIDFor(instanceName, unitName string, enableStreamRequestType bool) st
 	return BuildMQClientID(CachedIPStr(), ChangeInstanceNameToPID(instanceName), unitName, enableStreamRequestType)
 }
 
-// BrokerVIPChannel mirrors Java MixAll.brokerVIPChannel: VIP port = port - 2;
+// BrokerVIPChannel rewrites the address to the VIP port: VIP port = port - 2;
 // unparseable ports come back unchanged.
 func BrokerVIPChannel(isChange bool, brokerAddr string) string {
 	if !isChange {
@@ -213,7 +211,7 @@ func StringToMessageQueue(queue, separator string) (MessageQueue, error) {
 }
 
 // StringToMessageQueues parses newline-separated queues, skipping blank lines
-// and (like Java) silently skipping lines that fail to parse.
+// and silently skipping lines that fail to parse.
 func StringToMessageQueues(queues string) []MessageQueue {
 	var out []MessageQueue
 	for _, line := range strings.Split(queues, "\n") {

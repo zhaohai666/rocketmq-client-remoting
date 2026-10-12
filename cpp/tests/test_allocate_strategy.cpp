@@ -174,7 +174,7 @@ void runTable(const AllocateMessageQueueStrategy& strategy, const std::vector<Ca
 }
 
 // Java AllocateMessageQueueAveragelyTest：10 队列 / 4 消费者 → size {3,3,2,2}
-void testAveragelyMatchesJavaUnitTest() {
+void testAveragelyMatchesKnownSplit() {
     runTable(AllocateMessageQueueAveragely(), averagelyCases());
     std::vector<MessageQueue> mqAll = queuesOf(10);
     std::vector<std::string> cidAll = cidsOf(4);
@@ -185,7 +185,7 @@ void testAveragelyMatchesJavaUnitTest() {
 }
 
 // Java AllocateMessageQueueAveragelyByCircleTest：10 / 4 → {0,4,8} {1,5,9} {2,6} {3,7}
-void testCircleMatchesJavaUnitTest() {
+void testCircleMatchesKnownSplit() {
     runTable(AllocateMessageQueueAveragelyByCircle(), circleCases());
     std::vector<MessageQueue> mqAll = queuesOf(10);
     std::vector<std::string> cidAll = cidsOf(4);
@@ -222,7 +222,7 @@ void testGuardsReturnEmpty() {
 }
 
 // Java AllocateMessageQueueByConfigTest：配 4 个队列，2 个消费者都拿到 [0,1,2,3]
-void testByConfigMatchesJavaUnitTest() {
+void testByConfigMatchesKnownSplit() {
     std::vector<MessageQueue> mqAll = queuesOf(4);
     std::vector<std::string> cidAll = cidsOf(2);
     AllocateMessageQueueByConfig s;
@@ -252,7 +252,7 @@ void testByConfigDefaultsEmptyAndReturnsCopy() {
 }
 
 // getName() 字面值（Java 六个策略的 getName 返回值）
-void testNamesMatchJava() {
+void testStrategyNamesMatchProtocol() {
     std::vector<std::shared_ptr<AllocateMessageQueueStrategy>> strategies = {
         std::make_shared<AllocateMessageQueueAveragely>(),
         std::make_shared<AllocateMessageQueueAveragelyByCircle>(),
@@ -429,7 +429,7 @@ const std::vector<Case>& consistentHashDefaultVcCases() {
     return kCases;
 }
 
-void testConsistentHashMatchesJavaRingTable() {
+void testConsistentHashRingTableLayout() {
     runConsistentHashTable(AllocateMessageQueueConsistentHash(3), consistentHashCases());
     runConsistentHashTable(AllocateMessageQueueConsistentHash(), consistentHashDefaultVcCases());
     CHECK_EQ(AllocateMessageQueueConsistentHash(3).getVirtualNodeCnt(), 3, "vc=3 可读回");
@@ -551,7 +551,7 @@ void testConsistentHashGuardsReturnEmpty() {
 // Java AllocateMessageQueueByMachineRoomTest：10 队列（0..4 在 room1）+ 白名单 {room1}
 // + 2 消费者 → [0,1,4] / [2,3]（真实 Java 客户端复核）。
 // 余数队列给**前 rem 个**消费者（rem > currentIndex），与 AVG 的切法不同。
-void testByMachineRoomMatchesJavaUnitTest() {
+void testByMachineRoomMatchesKnownSplit() {
     std::vector<MessageQueue> mqAll;
     for (int32_t i = 0; i < 10; ++i) {
         mqAll.emplace_back("topic", i < 5 ? "room1@broker-a" : "room2@broker-b", i);
@@ -564,13 +564,13 @@ void testByMachineRoomMatchesJavaUnitTest() {
 }
 
 // broker 名必须是 `机房@名字`，且切分按 Java String#split 的裁尾口径。
-// javaParts 一列是 JDK 17 实测的 `String#split("@")` 段数。
-void testByMachineRoomUsesJavaSplitOnTheBrokerName() {
+// expectedParts 一列是 JDK 17 实测的 `String#split("@")` 段数。
+void testByMachineRoomSplitsBrokerName() {
     const std::vector<std::string> cidAll = cidsOf(1);
     AllocateMessageQueueByMachineRoom strategy({"room1"});
     struct SplitCase {
         const char* broker;
-        size_t javaParts;
+        size_t expectedParts;
         bool allocated;
     };
     const std::vector<SplitCase> cases = {
@@ -584,7 +584,7 @@ void testByMachineRoomUsesJavaSplitOnTheBrokerName() {
         {"", 1, false},
     };
     for (const SplitCase& c : cases) {
-        CHECK_EQ(javaSplit(c.broker, '@').size(), c.javaParts,
+        CHECK_EQ(javaSplit(c.broker, '@').size(), c.expectedParts,
                  std::string("javaSplit(\"") + c.broker + "\") 段数与 Java 不一致");
         const std::vector<MessageQueue> mqAll = roomQueuesOf(c.broker, 0, 1);
         const bool got = !allocateIds(strategy, cidAll[0], mqAll, cidAll).empty();
@@ -807,7 +807,7 @@ void testNearbyRejectsNullArguments() {
 }
 
 // javaSplit 的早返回分支（没命中分隔符时不裁尾）单独钉一遍
-void testJavaSplitMatchesJdk() {
+void testBrokerNameSplitMatchesSpec() {
     CHECK_EQ(javaSplit("", '@').size(), static_cast<size_t>(1), "\"\" → 1 段");
     CHECK_EQ(javaSplit("@", '@').size(), static_cast<size_t>(0), "\"@\" → 0 段");
     CHECK_EQ(javaSplit("room1@", '@').size(), static_cast<size_t>(1), "\"room1@\" → 1 段");
@@ -924,26 +924,26 @@ void testNewStrategiesPlugIntoConsumers() {
 }
 
 int main() {
-    testAveragelyMatchesJavaUnitTest();
-    testCircleMatchesJavaUnitTest();
+    testAveragelyMatchesKnownSplit();
+    testCircleMatchesKnownSplit();
     testGuardsReturnEmpty();
-    testByConfigMatchesJavaUnitTest();
+    testByConfigMatchesKnownSplit();
     testByConfigIgnoresGuards();
     testByConfigDefaultsEmptyAndReturnsCopy();
-    testNamesMatchJava();
+    testStrategyNamesMatchProtocol();
     testPartitionCoversEveryQueueOnce();
     testCrossCheckAgainstPythonFormula();
     testRealQueuesFromMultipleBrokers();
-    testConsistentHashMatchesJavaRingTable();
+    testConsistentHashRingTableLayout();
     testConsistentHashCoversEveryQueueOnce();
     testConsistentHashIsStableWhenMembershipChanges();
     testConsistentHashRejectsNegativeVirtualNodeCnt();
     testConsistentHashUsesInjectedHashFunction();
     testConsistentHashGuardsReturnEmpty();
-    testByMachineRoomMatchesJavaUnitTest();
-    testByMachineRoomUsesJavaSplitOnTheBrokerName();
+    testByMachineRoomMatchesKnownSplit();
+    testByMachineRoomSplitsBrokerName();
     testByMachineRoomGuardsReturnEmpty();
-    testJavaSplitMatchesJdk();
+    testBrokerNameSplitMatchesSpec();
     testNearbyAllocatesSameRoomOnlyAndCoversEverything();
     testNearbySharesRoomsWithNoConsumer();
     testNearbyNameExposesInnerStrategy();

@@ -1,7 +1,7 @@
 // 请求/响应自定义头 <-> extFields 的映射实现。
 //
-// 严格对齐 python/remoting/protocol/headers.py 与 Java header/*.java：
-//   - toExtFields()：仅输出已设置（optional 有值）的字段，等价 Java makeCustomHeaderToNet 的"非空才写"；
+// 字段名/键名以 broker 侧协议 header/* 定义为准：
+//   - toExtFields()：仅输出已设置（optional 有值）的字段（"非空才写"）；
 //   - fromExtFields()：从 extFields 读回，缺省保持 nullopt；
 //   - V2 用短字段名 a..n 缩减头部体积，并可无损与 V1 互转。
 #include "rocketmq/remoting/protocol/headers.h"
@@ -521,7 +521,7 @@ PropertyMap CheckTransactionStateRequestHeader::toExtFields() const {
     putOptInt(out, "commitLogOffset", commitLogOffset);
     putOptStr(out, "msgId", msgId);
     putOptStr(out, "transactionId", transactionId);
-    putOptStr(out, "offsetMsgId", offsetMsgId);  // Java 侧是 String，不是 long
+    putOptStr(out, "offsetMsgId", offsetMsgId);  // 协议字段是 String，不是 long
     putOptStr(out, "bname", bname);
     return out;
 }
@@ -578,7 +578,7 @@ PropertyMap PopMessageRequestHeader::toExtFields() const {
     putOptInt32(out, "initMode", initMode);
     putOptStr(out, "expType", expType);
     putOptStr(out, "exp", exp);
-    // 非 optional：Java 侧是 Boolean order = Boolean.FALSE，总是写出
+    // 非 optional：协议里 order 是非 null Boolean（默认 false），总是写出
     putOptBool(out, "order", std::optional<bool>(order));
     putOptStr(out, "attemptId", attemptId);
     return out;
@@ -650,7 +650,7 @@ PropertyMap ChangeInvisibleTimeRequestHeader::toExtFields() const {
     putOptInt(out, "offset", offset);
     putOptInt(out, "invisibleTime", invisibleTime);
     putOptStr(out, "liteTopic", liteTopic);
-    // 非 optional：Java 侧是 private boolean suspend = false，总是写出
+    // 非 optional：协议里 suspend 是原始 boolean（默认 false），总是写出
     putOptBool(out, "suspend", std::optional<bool>(suspend));
     return out;
 }

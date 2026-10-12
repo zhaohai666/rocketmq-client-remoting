@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn code_above_65535_truncates_like_java_short() {
+    fn code_above_65535_truncates_to_16_bits() {
         let mut w = Writer::new();
         w.i16(200_050);
         let mut r = Reader::new(w.as_slice());

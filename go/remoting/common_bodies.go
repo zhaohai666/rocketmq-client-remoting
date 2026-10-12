@@ -1,4 +1,4 @@
-// Shared admin response bodies (Java org.apache.rocketmq.remoting.protocol.body.*):
+// Shared admin response bodies:
 // KVTable, TopicList, ClusterInfo, Connection/ConsumerConnection/ProducerConnection,
 // ConsumerRunningInfo and ConsumeStatsList.
 //
@@ -93,8 +93,8 @@ func (t *TopicList) FromJSONValue(value any) error {
 	if !ok {
 		return decodeErrf("TopicList: expected object")
 	}
-	// The topic list is a Set<String> on the Java side; keep declaration order
-	// but drop duplicates so a merged multi-broker list matches Java's Set.
+	// The topic list is a Set<String> on the server side; keep declaration
+	// order but drop duplicates so a merged multi-broker list matches a Set.
 	seen := map[string]bool{}
 	t.TopicList = []string{}
 	for _, item := range jsonArray(obj, "topicList") {
@@ -157,7 +157,7 @@ func NewClusterInfo() *ClusterInfo {
 }
 
 // BrokerAddrs flattens every broker address, de-duplicated, ordered by broker
-// name then brokerId — the same order Java's DefaultMQAdminExt ends up with.
+// name then brokerId — the order the admin tools end up with.
 func (c *ClusterInfo) BrokerAddrs() []string {
 	names := sortedKeys(c.BrokerAddrTable)
 	var addrs []string
@@ -417,20 +417,20 @@ func DecodeProducerConnection(data []byte) (*ProducerConnection, error) {
 
 // ---------------- ConsumerRunningInfo ----------------
 
-// ConsumerRunningInfo property keys (Java ConsumerRunningInfo constants).
+// ConsumerRunningInfo property keys (the broker bean's constants).
 //
-// Note PROP_CONSUME_ORDERLY: this is the ONE key where the Java constant NAME
+// Note PROP_CONSUME_ORDERLY: this is the ONE key where the constant NAME
 // and its VALUE disagree. The field name carries the underscores and the value
-// does not — `PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"`. Verified by JVM
-// reflection on 5.5.1 (`RemotingSerializable`-adjacent probe):
+// does not — `PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"`. Verified by
+// reflection on a live 5.5.1 server:
 //
 //	PROP_CONSUME_ORDERLY field name  = PROP_CONSUME_ORDERLY
 //	PROP_CONSUME_ORDERLY field value = PROP_CONSUMEORDERLY
 //
 // The broker/admin look the property up BY VALUE, so shipping the underscored
 // form makes the "is this consumer orderly" flag silently disappear from every
-// 307 answer. Python / Rust / C++ / C# / Node all use the underscore-free
-// value; only Java's identifier keeps the underscores.
+// 307 answer. The value, not the identifier spelling, is the contract; only
+// the server-side identifier keeps the underscores.
 const (
 	PropNameServerAddr         = "PROP_NAMESERVER_ADDR"
 	PropThreadPoolCoreSize     = "PROP_THREADPOOL_CORE_SIZE"
@@ -495,7 +495,7 @@ func (r *ConsumerRunningInfo) ToJSONValue() map[string]any {
 		"statusTable":      statusTable,
 		"userConsumerInfo": userInfo,
 	}
-	// Java's `jstack` is a null String unless someone called setJstack(), and
+	// The server bean's `jstack` is a null String unless someone set it, and
 	// fastjson2 drops null fields — so an un-set jstack is an ABSENT key, not
 	// an empty string. The empty body therefore has exactly six keys, and
 	// jstack is APPENDED last when present. Emitting "jstack":"" instead would
@@ -539,7 +539,7 @@ func (r *ConsumerRunningInfo) FromJSONValue(value any) error {
 // Encode renders the running info with fastjson2's inline-object mqTable keys.
 // This MUST NOT go through EncodeJSON: encoding/json validates Marshaler output
 // and rejects the unquoted key (see mqKeyedJSON).
-func (r *ConsumerRunningInfo) Encode() []byte { return EncodeFastJSON(r.ToJSONValue()) }
+func (r *ConsumerRunningInfo) Encode() []byte { return EncodeInlineKeyJSON(r.ToJSONValue()) }
 
 // DecodeConsumerRunningInfo parses a ConsumerRunningInfo body.
 func DecodeConsumerRunningInfo(data []byte) (*ConsumerRunningInfo, error) {
@@ -586,9 +586,9 @@ func decodeMQInfoMap(value any) map[common.MessageQueue]map[string]any {
 
 // ---------------- ConsumeStatsList ----------------
 
-// ConsumeStatsList mirrors body.ConsumeStatsList (GET_BROKER_CONSUME_STATS=317).
+// ConsumeStatsList is the GET_BROKER_CONSUME_STATS(317) body.
 //
-// The JSON key is the Java FIELD name `consumeStatsList` — a wrong key name
+// The JSON key is the server-side field name `consumeStatsList` — a wrong key name
 // silently parses to an empty list, which looks like "this broker has no
 // backlog". `brokerAddr` is a String with NON_NULL serialisation; `totalDiff`
 // and `totalInflightDiff` are primitive longs and are always present.

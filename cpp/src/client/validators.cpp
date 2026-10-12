@@ -1,5 +1,4 @@
-// Validators 实现（对应 Java org.apache.rocketmq.client.Validators
-// 与 Python client/validators.py，文案与判定顺序以后者为准）。
+// Validators 实现：校验错误文案与判定顺序是调用方和文档匹配的合同，保持稳定。
 #include "rocketmq/client/validators.h"
 
 #include <string>
@@ -56,14 +55,14 @@ void Validators::isNotAllowedSendTopic(const std::string& topic) {
 }
 
 void Validators::checkMessage(const Message& msg, int32_t maxMessageSize) {
-    // Java 的第一分支 `null == msg` 在 C++ 没有对应物：Message 是值类型，
+    // 第一分支"msg 为 null"在 C++ 没有对应物：Message 是值类型，
     // 调用方（producer.cpp 各发送入口）拿到的永远是实体而不是 null，故此分支跳过。
 
-    // topic：先 checkTopic，再挡禁发 topic（顺序照抄 Java/Python）
+    // topic：先 checkTopic，再挡禁发 topic
     checkTopic(msg.topic);
     isNotAllowedSendTopic(msg.topic);
 
-    // body：Java 判 null / 零长 / 超限；C++ 用 hasBody 标志位表达"null body"
+    // body：判 null / 零长 / 超限三段；C++ 用 hasBody 标志位表达"null body"
     // （Bytes 即 std::string，本身无 null 态，见 message.h 的 hasBody 注释）。
     if (!msg.hasBody) {
         throw MQClientException("the message body is null", ResponseCode::MESSAGE_ILLEGAL);

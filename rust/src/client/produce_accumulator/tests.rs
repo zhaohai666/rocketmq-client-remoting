@@ -299,7 +299,7 @@ fn wait_for_batch(
 // ================================================================ 参数
 
 #[test]
-fn default_params_match_java() {
+fn default_params_match_contract() {
     let acc = accumulator("params", &FakeSender::new());
     assert_eq!(acc.get_batch_max_delay_ms(), DEFAULT_HOLD_MS);
     assert_eq!(acc.get_batch_max_bytes(), DEFAULT_HOLD_SIZE);
@@ -313,7 +313,7 @@ fn default_params_match_java() {
 }
 
 #[test]
-fn param_guards_copy_java_ranges() {
+fn param_guards_enforce_contract_ranges() {
     let acc = accumulator("guards", &FakeSender::new());
     assert!(acc.batch_max_delay_ms(1).is_ok());
     assert!(acc.batch_max_delay_ms(30 * 1000).is_ok());

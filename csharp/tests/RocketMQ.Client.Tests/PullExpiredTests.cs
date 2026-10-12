@@ -41,7 +41,7 @@ public class PullExpiredTests
     private static MessageQueue Mq(int queueId) => new(Topic, "broker-a", queueId);
 
     [Fact]
-    public void PullMaxIdleTime_MatchesJavaDefault()
+    public void PullMaxIdleTime_MatchesLegacyDefault()
     {
         // 阈值写错方向很安静：调小了会误撤健康队列（白白重投），调大了等于没有自愈。
         Assert.Equal(120000L, DefaultMQPushConsumer.PullMaxIdleTimeMillis);

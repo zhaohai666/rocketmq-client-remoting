@@ -200,7 +200,7 @@ public class OrderlyReconsumeTests
     }
 
     [Fact]
-    public void RetryMessageCarriesExactlyJavasFields()
+    public void RetryMessageCarriesExactlyLegacysFields()
     {
         var h = new Harness(2);
         MessageExt poison = OffsetBatch(7, new[] { 2 })[0];
@@ -255,7 +255,7 @@ public class OrderlyReconsumeTests
     /// 天亮。
     /// </summary>
     [Fact]
-    public void OrderlySuspendMillisResolvesThenClampsLikeJava()
+    public void OrderlySuspendMillisResolvesThenClampsLikeLegacy()
     {
         var h = new Harness(0);
         h.Consumer().SuspendCurrentQueueTimeMillis = 900;

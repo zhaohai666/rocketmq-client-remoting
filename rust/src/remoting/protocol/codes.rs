@@ -395,7 +395,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn language_codes_match_java() {
+    fn language_codes_match_server_enum() {
         assert_eq!(language_code::JAVA, 0);
         assert_eq!(language_code::PYTHON, 3);
         assert_eq!(language_code::RUST, 12);
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn key_codes_match_java() {
+    fn key_codes_match_protocol_numbers() {
         assert_eq!(request_code::SEND_MESSAGE_V2, 310);
         assert_eq!(request_code::GET_ROUTEINFO_BY_TOPIC, 105);
         assert_eq!(request_code::POP_MESSAGE, 200050);

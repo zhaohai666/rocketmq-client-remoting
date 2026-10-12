@@ -5,13 +5,12 @@ declare(strict_types=1);
 namespace RocketMQ\Remoting\Protocol;
 
 /**
- * 协议序列化：JSON（RemotingSerializable）与 fastjson2 兼容解析（移植自 protocol/serialize.py）。
+ * 协议序列化：JSON 命令头 / body 的编解码，外加对 broker 侧非标准 JSON 的容错解析。
  *
- * 对应 org.apache.rocketmq.remoting.protocol.RemotingSerializable。
  * ROCKETMQ 私有二进制部分见 RocketMQSerializable.php。
  */
 
-/** fastjson2 兼容解析失败（对应 Python FastJsonDecodeError(ValueError)）。 */
+/** 容错解析仍失败：输入连非标准 JSON 的形状都凑不齐。 */
 class FastJsonDecodeError extends \InvalidArgumentException
 {
 }
@@ -297,8 +296,8 @@ final class RemotingSerializable
     // ---------------- 编码（PHP 端 → 线上字节）----------------
 
     /**
-     * 对应 Python RemotingSerializable.encode：None → b""，bytes 原样，其余 JSON UTF-8。
-     * JSON 端序：ensure_ascii=False + 不转义斜杠（与 Python json.dumps 对齐）。
+     * null → 空串，字符串原样，其余按 UTF-8 JSON 输出。
+     * JSON 侧不转义非 ASCII、不转义斜杠，保持与 broker 读到的字面量一致。
      */
     public static function encode(mixed $obj): string
     {
@@ -330,7 +329,7 @@ final class RemotingSerializable
         return self::fromJson($data);
     }
 
-    /** @param class-string|null $expectClass 带 fromDict() 的目标类（对应 Python expect_type） */
+    /** @param class-string|null $expectClass 带 fromDict() 的目标类；构造失败退回原始数组 */
     public static function fromJson(string $jsonStr, ?string $expectClass = null): mixed
     {
         $obj = json_decode($jsonStr, true, 512, JSON_THROW_ON_ERROR);
@@ -344,7 +343,7 @@ final class RemotingSerializable
         return $obj;
     }
 
-    /** 容忍 fastjson2 非标准输出（对应 Python decode_json → _tolerant_json_loads）。 */
+    /** 容忍 broker 侧 fastjson 的非标准 JSON 输出（数字键不带引号等）。 */
     public static function decodeJson(string $data): mixed
     {
         return self::tolerantJsonLoads($data);

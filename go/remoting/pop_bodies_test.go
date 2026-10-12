@@ -42,7 +42,7 @@ func TestPopMessageRequestHeaderExtFieldKeys(t *testing.T) {
 		t.Fatal("POP header must use bname, not brokerName")
 	}
 	if v, _ := ext.Get("order"); v != "false" {
-		t.Fatalf("order = %q; a Java Boolean.FALSE is emitted as \"false\"", v)
+		t.Fatalf("order = %q; want \"false\" — the broker's boxed Boolean emits lowercase \"false\" and only that spelling parses", v)
 	}
 
 	// Round-trip.
@@ -54,8 +54,8 @@ func TestPopMessageRequestHeaderExtFieldKeys(t *testing.T) {
 	}
 }
 
-// A nil `order` means false — not true. The Java getter is isOrder() and the
-// field defaults to FALSE.
+// A nil `order` means false — not true. The field defaults to FALSE on the
+// wire.
 func TestPopHeaderOrderNeverDefaultsTrue(t *testing.T) {
 	if (&PopMessageRequestHeader{}).IsOrder() {
 		t.Fatal("nil order must not read as true")
@@ -106,7 +106,7 @@ func TestChangeInvisibleTimeHeadersExtFieldKeys(t *testing.T) {
 			t.Fatalf("missing extFields key %q", key)
 		}
 	}
-	// Java's `suspend` is a primitive boolean defaulting to false, so it always
+	// `suspend` is a primitive boolean defaulting to false, so it always
 	// reaches the wire.
 	if v, _ := ext.Get("suspend"); v != "false" {
 		t.Fatalf("suspend = %q", v)
@@ -158,7 +158,7 @@ func TestSetMessageRequestModeBody(t *testing.T) {
 		}
 	}
 
-	// Java's field initialiser is PULL, so an unset mode must not silently
+	// The field default is PULL, so an unset mode must not silently
 	// become POP on the wire.
 	empty := &SetMessageRequestModeRequestBody{Topic: "T", ConsumerGroup: "G"}
 	if !contains(string(empty.Encode()), `"mode":"PULL"`) {
@@ -172,7 +172,7 @@ func TestSetMessageRequestModeBody(t *testing.T) {
 	if decoded.Mode != MessageRequestModePop || decoded.PopShareQueueNum != 2 {
 		t.Fatalf("decoded %+v", decoded)
 	}
-	// An empty body is a valid default (Java's default PULL), not an error.
+	// An empty body is a valid default (mode PULL), not an error.
 	if b, err := DecodeSetMessageRequestModeRequestBody(nil); err != nil || b.Mode != MessageRequestModePull {
 		t.Fatalf("empty body: %+v %v", b, err)
 	}
@@ -191,12 +191,12 @@ func TestBitSetLittleEndianAndTrailingTrim(t *testing.T) {
 	if !bs.Get(0) || bs.Get(1) || !bs.Get(2) {
 		t.Fatal("bit membership wrong")
 	}
-	// Out-of-range reads are false, like java.util.BitSet#get.
+	// Out-of-range reads are false, never an error.
 	if bs.Get(64) {
 		t.Fatal("out-of-range bit must be false")
 	}
 
-	// Bit 8 lands in the second byte; Java trims trailing zero bytes so bit 8
+	// Bit 8 lands in the second byte; trailing zero bytes are trimmed so bit 8
 	// alone encodes as [0, 1] -> "AAE=".
 	var high BitSet
 	high.Set(8)
@@ -283,8 +283,8 @@ func TestBatchAckBodyUsesShortJSONNames(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 	raw := string(body.Encode())
-	// fastjson2 writes @JSONField(name=...) — the SHORT names — not the Java
-	// property names.
+	// fastjson2 on the broker declares @JSONField(name=...) — the SHORT names —
+	// as the wire keys, not the property names.
 	for _, want := range []string{`"brokerName":"broker-a"`, `"c":"G"`, `"t":"T"`, `"r":"0"`, `"so":10`, `"q":0`, `"rq":3`, `"it":60000`} {
 		if !contains(raw, want) {
 			t.Fatalf("body %s missing %s", raw, want)
@@ -329,7 +329,7 @@ func TestMessageQueueAssignmentMode(t *testing.T) {
 		t.Fatalf("decoded %+v", a)
 	}
 
-	// Absent mode defaults to PULL (the Java field initialiser) — this decides
+	// Absent mode defaults to PULL — this decides
 	// pop-vs-pull for the queue, so the default must not be invented.
 	var b MessageQueueAssignment
 	if err := b.FromJSONValue(mustJSON(t, `{"messageQueue":{"brokerName":"b","queueId":0,"topic":"T"}}`)); err != nil {

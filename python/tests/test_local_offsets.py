@@ -16,9 +16,9 @@ from client.consumer import (_build_local_offsets_json,
 from common.message import MessageQueue
 
 # 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
-JAVA_COMPACT = ('{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,'
+FASTJSON_OFFSETS_COMPACT = ('{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,'
                 '{"brokerName":"broker-a","queueId":0,"topic":"Tt"}:7}}')
-JAVA_PRETTY = ('{\n\t"offsetTable":{\n\t\t{"brokerName":"broker-a","queueId":0,'
+FASTJSON_OFFSETS_PRETTY = ('{\n\t"offsetTable":{\n\t\t{"brokerName":"broker-a","queueId":0,'
                '"topic":"Tt"}:7\n\t}\n}')
 
 
@@ -27,7 +27,7 @@ def _mq_map():
             for i in range(3)}
 
 
-def test_build_uses_java_object_as_key_format():
+def test_build_uses_the_object_as_key_format():
     text = _build_local_offsets_json(
         {"Ttbroker-a0": 7, "Ttbroker-a1": 9}, _mq_map())
     assert text.startswith('{"offsetTable":{')
@@ -41,10 +41,10 @@ def test_build_skips_entries_without_queue_info():
     assert "Orphan" not in text
 
 
-def test_parse_java_format_compact_and_pretty():
-    assert _parse_local_offsets_json(JAVA_COMPACT) == {
+def test_parse_fastjson_compact_and_pretty():
+    assert _parse_local_offsets_json(FASTJSON_OFFSETS_COMPACT) == {
         "Ttbroker-a1": 9, "Ttbroker-a0": 7}
-    assert _parse_local_offsets_json(JAVA_PRETTY) == {"Ttbroker-a0": 7}
+    assert _parse_local_offsets_json(FASTJSON_OFFSETS_PRETTY) == {"Ttbroker-a0": 7}
 
 
 def test_parse_accepts_legacy_flat_map():
@@ -80,7 +80,7 @@ def _consumer_with_offsets(home):
     return c
 
 
-def test_save_writes_java_format_and_rolls_bak(offset_home):
+def test_save_writes_the_object_as_key_format_and_rolls_bak(offset_home):
     c = _consumer_with_offsets(offset_home)
     c._save_local_offsets()
     path = c._local_offset_path()
@@ -114,11 +114,11 @@ def test_load_main_then_bak_fallback(offset_home):
     assert c._load_local_offsets() == {}
 
 
-def test_load_reads_java_written_file(offset_home):
+def test_load_reads_a_fastjson_written_file(offset_home):
     # Java 写出的文件本端要能读（跨端互认的核心）
     c = _consumer_with_offsets(offset_home)
     path = c._local_offset_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(JAVA_COMPACT)
+        f.write(FASTJSON_OFFSETS_COMPACT)
     assert c._load_local_offsets() == {"Ttbroker-a1": 9, "Ttbroker-a0": 7}

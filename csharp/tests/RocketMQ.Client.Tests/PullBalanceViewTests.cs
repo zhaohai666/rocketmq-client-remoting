@@ -56,7 +56,7 @@ public class PullBalanceViewTests
     // ---------------------------------------------------------------- 1. 未启动 / 空 topic
 
     [Fact]
-    public void NotStarted_IsRejectedLikeJavaIsRunning()
+    public void NotStarted_IsRejectedAsNotRunning()
     {
         var consumer = new DefaultMQPullConsumer(Group);
         MQClientException ex = Assert.Throws<MQClientException>(

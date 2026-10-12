@@ -161,11 +161,11 @@ class GetConsumerListByGroupResponseBody:
 
 
 class CheckClientRequestBody:
-    """对应 org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody。
+    """协议模型 ``CheckClientRequestBody``。
 
     只被 ``CHECK_CLIENT_CONFIG(46)`` 用到：broker 拿 clientId/group 记日志，真正被校验的
-    只有 ``subscriptionData`` 的 expressionType 与 subString（Java
-    ``ClientManageProcessor.checkClientConfig``）。namespace 字段 Java 5.5.1 里存在但
+    只有 ``subscriptionData`` 的 expressionType 与 subString（broker 侧
+    ``ClientManageProcessor.checkClientConfig``）。namespace 字段在 5.5.1 协议里存在但
     发送端不填，这里同样保留字段而不写值（fastjson 不序列化 None）。
     """
 
@@ -259,20 +259,20 @@ class ClusterInfo:
 
 
 class ConsumerRunningInfo:
-    """对应 org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo。
+    """协议模型 ``ConsumerRunningInfo``。
 
     两端都用得到：**admin 侧**解析 broker 汇总的运行信息；**客户端侧**在应答
     GET_CONSUMER_RUNNING_INFO(307) 时编码自己的运行信息。
 
-    ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``，fastjson2 会把它内联成
-    JSON 对象（``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这不是
-    合法 JSON，但 Java 的 fastjson2 能读回来，所以必须用 ``message_queue_key`` /
+    ⚠ ``mqTable`` / ``mqPopTable`` 的键是 ``MessageQueue``，broker 侧 fastjson 会把它
+    内联成 JSON 对象（``{{"brokerName":...,"queueId":...,"topic":...}:{...}}``）——这不是
+    合法 JSON，但 broker 按 fastjson 容错解析能读回来，所以必须用 ``message_queue_key`` /
     ``decode_message_queue_map`` 处理，不能当普通字符串键。
     """
 
     PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR"
     PROP_THREADPOOL_CORE_SIZE = "PROP_THREADPOOL_CORE_SIZE"
-    PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"   # 注意 Java 常量名没有下划线
+    PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY"   # 协议常量名就没有下划线（拼写如此）
     PROP_CONSUME_TYPE = "PROP_CONSUME_TYPE"
     PROP_CLIENT_VERSION = "PROP_CLIENT_VERSION"
     PROP_CONSUMER_START_TIMESTAMP = "PROP_CONSUMER_START_TIMESTAMP"
@@ -456,11 +456,11 @@ class ConsumeStatus:
 
 
 class ConsumeStatsList:
-    """对应 Java `body.ConsumeStatsList`（`GET_BROKER_CONSUME_STATS` 响应）。
+    """协议模型 `body.ConsumeStatsList`（`GET_BROKER_CONSUME_STATS` 响应）。
 
-    ⚠ JSON 键是 Java 字段名 `consumeStatsList`，不是 `statsList`：写错键名时
+    ⚠ JSON 键是协议字段名 `consumeStatsList`，不是 `statsList`：写错键名时
     真机响应会解析成空列表，看着像「这个 broker 没有积压」。
-    `brokerAddr` 是 Java 的 String 字段，走 NON_NULL 序列化所以 None 时整键消失；
+    `brokerAddr` 是协议里的 String 字段，走 NON_NULL 序列化所以 None 时整键消失；
     `totalDiff` / `totalInflightDiff` 是 `long` 原语字段，恒在。
     """
 
@@ -496,11 +496,11 @@ class ConsumeStatsList:
 
 
 class ResetOffsetBody:
-    """对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody。
+    """协议模型 ``ResetOffsetBody``。
 
-    ⚠ Java 字段是 ``Map<MessageQueue, Long> offsetTable``，**不是** topic→queueId→offset
-    的嵌套 map（早期 Python 实现写错了，真实 broker 响应解析不出来）。
-    fastjson2 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
+    ⚠ 协议字段是 ``Map<MessageQueue, Long> offsetTable``，**不是** topic→queueId→offset
+    的嵌套 map（真实 broker 响应解析不出来即是这个形状）。
+    broker 侧 fastjson 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
     """
 
     def __init__(self):
@@ -549,12 +549,11 @@ class MessageQueueForC:
 
 
 class ResetOffsetBodyForC:
-    """对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：``offsetTable`` 是
+    """协议模型 ``ResetOffsetBodyForC``：``offsetTable`` 是
     **数组**（每条自带 offset），不是 map。
 
-    只有 222 发起方的 language=CPP 时 broker 才推这种体（``Broker2Client.resetOffset:158-163``），
-    Java 管理端恒发 JAVA，所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
-    旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
+    只有 222（RESET_CONSUMER_OFFSET）发起方的 language 是 CPP 时 broker 才推这种体
+    （``Broker2Client.resetOffset``），所以必须能解析——收到却解析不出等于整笔重置静默丢弃。
     """
 
     def __init__(self):

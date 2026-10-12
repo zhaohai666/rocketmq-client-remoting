@@ -109,7 +109,7 @@ std::string BrokerData::selectBrokerAddr() const {
     if (it != brokerAddrs.end()) {
         return it->second;
     }
-    // 无 master：随机取一个从节点（对应 Java new Random().nextInt(size)）
+    // 无 master：随机取一个从节点
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::vector<std::string> addrs;
     addrs.reserve(brokerAddrs.size());
@@ -181,7 +181,7 @@ std::string BrokerData::toString() const {
 std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& topic) const {
     std::vector<MessageQueue> mqs;
     for (const QueueData& qd : queueDatas) {
-        // 只挑有写权限的队列（Java: PermName.isWriteable）
+        // 只挑有写权限的队列（协议 PermName.isWriteable）
         if (!PermName::checkPerm(qd.perm, PermName::PERM_WRITE)) {
             continue;
         }
@@ -195,11 +195,10 @@ std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& 
         if (found == nullptr) {
             continue;
         }
-        // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
-        // 从节点自己也会注册进 namesrv，且默认配置下照样带写位（RouteInfoManager:344-346
-        // 只在「prime slave 且 enableActingMaster」时才抹掉 WRITE）—— master 一旦掉线，
+        // 发布口径：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
+        // 从节点自己也会注册进 namesrv，且默认配置下照样带写位 —— master 一旦掉线，
         // 路由里同一个 brokerName 只剩 brokerId=1。漏判这条，生产者会把消息发到从节点上，
-        // 而从节点对发送请求一律 reject（SendMessageProcessor:131 ⇒ SYSTEM_BUSY，可重试码）。
+        // 而从节点对发送请求一律 reject（broker 侧 SendMessageProcessor ⇒ SYSTEM_BUSY，可重试码）。
         if (found->brokerAddrs.find(0) == found->brokerAddrs.end()) {
             continue;
         }
@@ -210,10 +209,9 @@ std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& 
     return mqs;
 }
 
-// 对应 Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332。
 // 与 getAllMessageQueue 是两条口径，不能合成一条：这里只看**读**位与 readQueueNums，
 // 不查 brokerDatas、也不要求 broker 有 master（master 掉线时从节点照样服务拉取；
-// perm=4 的只读 topic 在 Java 里可消费，发布信息里却为空）。
+// perm=4 的只读 topic 可消费，发布信息里却为空）。
 std::vector<MessageQueue> TopicRouteData::getAllSubscribeMessageQueue(
     const std::string& topic) const {
     std::vector<MessageQueue> mqs;

@@ -179,7 +179,7 @@ void testCorePoolSizeMutation() {
 
 // ---------------------------------------------------------------- 消费者侧（不联网）
 
-void testJavaDefaults() {
+void testConsumerThreadDefaults() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
     expectEq(c.getConsumeThreadMin(), 20, "consumeThreadMin default = 20");
     expectEq(c.getConsumeThreadMax(), 20, "consumeThreadMax default = 20");
@@ -208,7 +208,7 @@ void testUpdateCorePoolSizeGuards() {
 // Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），守卫
 // `corePoolSize < consumeThreadMax` 把默认配置下的上调全挡掉；差异不报错，只表现为
 // "同一个 updateCorePoolSize(30)，本端口真的改了并发度、Java 没改"。
-void testDefaultMaxIsJava5xTwenty() {
+void testDefaultMaxIsTwenty() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
     expectEq(c.getConsumeThreadMax(), 20, "default max is Java 5.x's 20");
     expect(!c.updateCorePoolSize(30), "30 rejected under default max");
@@ -306,9 +306,9 @@ int main() {
     testShutdownWaitDrainsQueue();
     testZeroCoreStillRunsTasks();
     testCorePoolSizeMutation();
-    testJavaDefaults();
+    testConsumerThreadDefaults();
     testUpdateCorePoolSizeGuards();
-    testDefaultMaxIsJava5xTwenty();
+    testDefaultMaxIsTwenty();
     testSetConsumeThreadNumsSetsBothAndCore();
     testConsumeThreadMinSetterMovesCoreMaxDoesNot();
     testMsgAccCntRules();

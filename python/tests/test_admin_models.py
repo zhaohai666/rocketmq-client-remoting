@@ -25,24 +25,24 @@ from remoting.protocol.subscription import (GroupRetryPolicy, SubscriptionGroupC
 
 # ---------------------------------------------------------------- fastjson2 解析器
 # Java 探针输出：JSON.toJSONString(new TopicStatsTable())，键为 MessageQueue
-JAVA_TOPIC_STATS = ('{"offsetTable":{{"brokerName":"broker-a","queueId":3,'
+FASTJSON_TOPIC_STATS = ('{"offsetTable":{{"brokerName":"broker-a","queueId":3,'
                     '"topic":"MyTopic"}:{"lastUpdateTimestamp":1700000000000,'
                     '"maxOffset":500,"minOffset":0}},"topicPutTps":0.0}')
 
 # Java 探针输出：JSON.toJSONString(new ConsumeStats())
-JAVA_CONSUME_STATS = ('{"consumeTps":1.5,"offsetTable":{{"brokerName":"broker-a",'
+FASTJSON_CONSUME_STATS = ('{"consumeTps":1.5,"offsetTable":{{"brokerName":"broker-a",'
                       '"queueId":3,"topic":"MyTopic"}:{"brokerOffset":100,'
                       '"consumerOffset":90,"lastTimestamp":1700000000000,'
                       '"pullOffset":0}}}')
 
 # Java 探针输出：JSON.toJSONString(new TopicConfig("attr-topic"))
-JAVA_TOPIC_CONFIG = ('{"attributes":{"+fileReservedTime":"72","+deleteWhen":"04"},'
+FASTJSON_TOPIC_CONFIG = ('{"attributes":{"+fileReservedTime":"72","+deleteWhen":"04"},'
                      '"order":false,"perm":6,"readQueueNums":16,'
                      '"topicFilterType":"SINGLE_TAG","topicName":"attr-topic",'
                      '"topicSysFlag":0,"writeQueueNums":16}')
 
 # Java 探针输出：JSON.toJSONString(new SubscriptionGroupConfig())（groupName=MyGroup）
-JAVA_SUB_GROUP = ('{"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,'
+FASTJSON_SUB_GROUP = ('{"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,'
                   '"consumeEnable":true,"consumeFromMinEnable":true,'
                   '"consumeMessageOrderly":false,"consumeTimeoutMinute":15,'
                   '"groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},'
@@ -54,8 +54,8 @@ JAVA_SUB_GROUP = ('{"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,'
 def test_fastjson_parses_object_keys():
     """核心：非字符串键的内联对象必须能解析（标准 json 会失败）。"""
     with pytest.raises(Exception):
-        __import__("json").loads(JAVA_TOPIC_STATS)  # 证明确实是非法 JSON
-    obj = fastjson_loads(JAVA_TOPIC_STATS)
+        __import__("json").loads(FASTJSON_TOPIC_STATS)  # 证明确实是非法 JSON
+    obj = fastjson_loads(FASTJSON_TOPIC_STATS)
     assert set(obj["offsetTable"].keys()) == {
         '{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}'}
     assert obj["offsetTable"]['{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}'
@@ -90,7 +90,7 @@ def test_fastjson_rejects_garbage():
 
 
 def test_topic_stats_table_decode():
-    t = TopicStatsTable.decode(JAVA_TOPIC_STATS.encode("utf-8"))
+    t = TopicStatsTable.decode(FASTJSON_TOPIC_STATS.encode("utf-8"))
     assert len(t.offset_table) == 1
     mq = MessageQueue("MyTopic", "broker-a", 3)
     assert mq in t.offset_table
@@ -111,7 +111,7 @@ def test_topic_stats_table_round_trip():
 
 
 def test_consume_stats_decode_and_lag():
-    cs = ConsumeStats.decode(JAVA_CONSUME_STATS.encode("utf-8"))
+    cs = ConsumeStats.decode(FASTJSON_CONSUME_STATS.encode("utf-8"))
     mq = MessageQueue("MyTopic", "broker-a", 3)
     assert cs.consume_tps == 1.5
     assert cs.offset_table[mq].broker_offset == 100
@@ -120,7 +120,7 @@ def test_consume_stats_decode_and_lag():
     assert cs.total_lag == 10
 
 
-def test_offset_wrapper_lag_matches_java():
+def test_offset_wrapper_lag_is_broker_minus_consumer():
     """Java OffsetWrapper.getLag() = brokerOffset - consumerOffset（可为负）。"""
     assert OffsetWrapper(broker_offset=5, consumer_offset=9).lag == -4
 
@@ -136,7 +136,7 @@ def test_reset_offset_body_is_mq_keyed():
     assert again.offset_table[MessageQueue("T", "b", 1)] == 20
 
 
-def test_consume_stats_list_uses_java_field_name():
+def test_consume_stats_list_uses_the_server_field_name():
     """Java `ConsumeStatsList` 的 JSON 键是 `consumeStatsList`，不是 `statsList`。
 
     写错键名时真实 broker 的 341 响应会解析成空集合，看着像「这个 broker 没有积压」。
@@ -163,7 +163,7 @@ def test_consume_stats_list_uses_java_field_name():
 # ---------------------------------------------------------------- TopicConfig / 订阅组
 
 
-def test_topic_config_java_defaults():
+def test_topic_config_server_side_defaults():
     """Java: new TopicConfig("t") → 16/16 队列、perm=6、SINGLE_TAG、attributes={}。"""
     cfg = TopicConfig("t")
     assert cfg.read_queue_nums == 16
@@ -174,7 +174,7 @@ def test_topic_config_java_defaults():
 
 
 def test_topic_config_serializes_attributes():
-    cfg = TopicConfig.from_dict(fastjson_loads(JAVA_TOPIC_CONFIG))
+    cfg = TopicConfig.from_dict(fastjson_loads(FASTJSON_TOPIC_CONFIG))
     assert cfg.attributes["+deleteWhen"] == "04"
     assert cfg.attributes["+fileReservedTime"] == "72"
     out = cfg.to_dict()
@@ -183,14 +183,14 @@ def test_topic_config_serializes_attributes():
 
 def test_topic_config_serialize_wrapper():
     raw = ('{"dataVersion":{"counter":0,"stateVersion":0,"timestamp":1},'
-           '"topicConfigTable":{"MyTopic":' + JAVA_TOPIC_CONFIG + '}}')
+           '"topicConfigTable":{"MyTopic":' + FASTJSON_TOPIC_CONFIG + '}}')
     w = TopicConfigSerializeWrapper.decode(raw.encode("utf-8"))
     assert "MyTopic" in w.topic_config_table
     assert w.topic_config_table["MyTopic"].read_queue_nums == 16
 
 
 def test_subscription_group_config_fields():
-    cfg = SubscriptionGroupConfig.from_dict(fastjson_loads(JAVA_SUB_GROUP))
+    cfg = SubscriptionGroupConfig.from_dict(fastjson_loads(FASTJSON_SUB_GROUP))
     assert cfg.group_name == "MyGroup"
     assert cfg.retry_queue_nums == 1
     assert cfg.retry_max_times == 16
@@ -208,7 +208,7 @@ def config_has_no_null_sub_set(cfg: SubscriptionGroupConfig) -> bool:
 
 def test_subscription_group_wrapper_decode():
     raw = ('{"dataVersion":{"counter":0,"stateVersion":0,"timestamp":1},'
-           '"forbiddenTable":{},"subscriptionGroupTable":{"G1":' + JAVA_SUB_GROUP + '}}')
+           '"forbiddenTable":{},"subscriptionGroupTable":{"G1":' + FASTJSON_SUB_GROUP + '}}')
     w = SubscriptionGroupWrapper.decode(raw.encode("utf-8"))
     assert w.subscription_group_table["G1"].group_name == "MyGroup"
     assert w.forbidden_table == {}
@@ -224,7 +224,7 @@ def test_subscription_group_round_trip():
 
 
 # ---------------------------------------------------------------- MixAll properties
-def test_properties_text_round_trip_matches_java():
+def test_properties_text_round_trip_matches_the_server_format():
     """Java Properties.load 语义：键去空白、值只去左空白、支持 \\ 续行。"""
     from common.mix_all import MixAll
     text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n"
@@ -259,7 +259,7 @@ def test_properties_whitespace_is_a_valid_separator():
     assert props3["messageDelayLevel"] == "1s 5s 10s", props3
 
 
-def test_perm_name_is_valid_matches_java():
+def test_perm_name_is_valid_matches_the_server_rule():
     """Java PermName.isValid(perm) = perm >= 0 && perm < PERM_PRIORITY(8)。"""
     from common.sysflag import PermName
     assert PermName.is_valid(0) is True

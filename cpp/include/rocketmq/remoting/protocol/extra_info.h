@@ -1,5 +1,5 @@
-// POP 模式的 extraInfo（CK 串）编解码 —— 逐条移植 Java
-// `org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil`。
+// POP 模式的 extraInfo（CK 串）编解码 —— 格式与 broker 侧协议
+// `org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil` 逐字段对应。
 //
 // CK 串是 POP 的核心凭据：broker 在普通 topic 的 POP 响应里**不写** `POP_CK`
 // 属性（只在 retry topic 重编码路径才写），客户端必须自己用响应头的
@@ -8,10 +8,10 @@
 //
 //   ckQueueOffset popTime invisibleTime reviveQid retryFlag brokerName queueId [msgQueueOffset]
 //
-// 分隔符用错（比如逗号）会让 broker 静默解析失败，所以这里照抄 Java 的常量。
+// 分隔符用错（比如逗号）会让 broker 静默解析失败，所以这里固化协议常量。
 //
-// 报错语义与 Java 对齐：参数非法（段数不足、段数不为 3、重复 key、非法 retry 值）
-// 抛 `std::invalid_argument`，对应 Java 的 IllegalArgumentException。
+// 报错语义：参数非法（段数不足、段数不为 3、重复 key、非法 retry 值）
+// 抛 `std::invalid_argument`，与 broker 侧对这些输入的拒绝语义一致。
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_EXTRA_INFO_H
 #define ROCKETMQ_REMOTING_PROTOCOL_EXTRA_INFO_H
 
@@ -24,7 +24,7 @@
 namespace rocketmq {
 namespace extra_info {
 
-// 段内分隔符；**必须**是空格，对应 Java MessageConst.KEY_SEPARATOR
+// 段内分隔符；**必须**是空格，即协议常量 MessageConst.KEY_SEPARATOR
 inline constexpr const char* kKeySeparator = " ";
 // 队列之间的分隔符
 inline constexpr char kQueueSeparator = ';';
@@ -35,25 +35,25 @@ inline constexpr const char* kNormalTopic = "0";
 inline constexpr const char* kRetryTopic = "1";
 inline constexpr const char* kRetryTopicV2 = "2";
 
-// 顺序消费用的固定 revive 队列号，对应 Java KeyBuilder.POP_ORDER_REVIVE_QUEUE
+// 顺序消费用的固定 revive 队列号，即协议常量 KeyBuilder.POP_ORDER_REVIVE_QUEUE
 inline constexpr int32_t kPopOrderReviveQueue = 999;
 
 // ---------------------------------------------------------------- 重试 topic
 
-// Java KeyBuilder.buildPopRetryTopicV1 -> "%RETRY%<cid>_<topic>"
+// 协议 KeyBuilder.buildPopRetryTopicV1 -> "%RETRY%<cid>_<topic>"
 std::string buildPopRetryTopicV1(const std::string& topic, const std::string& cid);
-// Java KeyBuilder.buildPopRetryTopicV2 -> "%RETRY%<cid>+<topic>"
+// 协议 KeyBuilder.buildPopRetryTopicV2 -> "%RETRY%<cid>+<topic>"
 std::string buildPopRetryTopicV2(const std::string& topic, const std::string& cid);
-// Java buildPopRetryTopic：enableRetryTopicV2 关（broker 默认）走 V1
+// buildPopRetryTopic：enableRetryTopicV2 关（broker 默认）走 V1
 std::string buildPopRetryTopic(const std::string& topic, const std::string& cid,
                                bool enableRetryV2 = false);
-// Java KeyBuilder.isPopRetryTopicV2：%RETRY% 前缀且含 '+'
+// 协议 KeyBuilder.isPopRetryTopicV2：%RETRY% 前缀且含 '+'
 bool isPopRetryTopicV2(const std::string& retryTopic);
 
 // ---------------------------------------------------------------- 切分与取值
 
-// 按空格切分，并**丢弃末尾空串**（复刻 Java String.split 语义；C++ 手写实现
-// 若保留空串会让下面的段数校验产生与 Java 不一致的结果）。
+// 按空格切分，并**丢弃末尾空串**（与 broker 侧 split 的"裁尾"语义一致；若保留
+// 空串会让下面的段数校验产生与 broker 不一致的结果）。
 std::vector<std::string> split(const std::string& extraInfo);
 
 int64_t getCkQueueOffset(const std::vector<std::string>& segments);
@@ -82,7 +82,7 @@ std::string buildExtraInfo(int64_t ckQueueOffset, int64_t popTime, int64_t invis
 
 // ---------------------------------------------------------------- 解析响应头编码
 
-// 空串 -> nullopt（Java 返回 null）；每段必须正好 3 个字段，key 重复抛异常
+// 空串 -> nullopt（协议空值即 null）；每段必须正好 3 个字段，key 重复抛异常
 std::optional<std::map<std::string, int64_t>> parseStartOffsetInfo(const std::string& s);
 std::optional<std::map<std::string, std::vector<int64_t>>> parseMsgOffsetInfo(const std::string& s);
 std::optional<std::map<std::string, int32_t>> parseOrderCountInfo(const std::string& s);
@@ -95,7 +95,7 @@ std::string getQueueOffsetMapKey(const std::string& topic, int64_t queueId, int6
 // reviveQid == 999 表示顺序消费
 bool isOrder(const std::vector<std::string>& segments);
 
-// 由 retryFlag 还原真实 topic（Java ExtraInfoUtil.getRealTopic）
+// 由 retryFlag 还原真实 topic（协议 ExtraInfoUtil.getRealTopic）
 std::string getRealTopic(const std::string& topic, const std::string& cid,
                          const std::string& retry);
 

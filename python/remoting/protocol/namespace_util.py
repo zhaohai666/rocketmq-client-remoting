@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""命名空间工具（对应 org.apache.rocketmq.remoting.protocol.NamespaceUtil）。
+"""命名空间工具（资源名的 namespace 前缀处理）。
 
 命名空间用于多租户隔离：客户端把 ``namespace`` 以 ``namespace%`` 前缀拼到
 topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层（listener、
 admin 结果）之前再剥掉前缀。
 
-对齐要点（勿凭直觉改）：
+线上契约（勿凭直觉改）：
 - 分隔符是 ``%``（不是 ``/`` 也不是 ``:``）。
 - ``%RETRY%`` / ``%DLQ%`` 前缀**在**命名空间之外：``%RETRY%NS%GID``。
   因此剥/拼都要先把 retry/DLQ 前缀摘下来处理，再拼回去。
@@ -19,11 +19,11 @@ NAMESPACE_SEPARATOR = "%"
 
 
 class NamespaceUtil:
-    """对应 Java NamespaceUtil（仅客户端用到的部分）。"""
+    """命名空间资源名工具（仅客户端用到的部分）。"""
 
     @staticmethod
     def with_out_retry_and_dlq(resource: str) -> str:
-        """摘掉 retry/DLQ 前缀（对应 Java withOutRetryAndDLQ）。"""
+        """摘掉 retry/DLQ 前缀。"""
         return MixAll.reset_retry_and_dlq_topic(resource)
 
     @staticmethod
@@ -49,7 +49,7 @@ class NamespaceUtil:
 
     @staticmethod
     def without_namespace(resource_with_namespace: str, namespace: str = "") -> str:
-        """剥掉命名空间前缀（对应 Java 两个重载的 withoutNamespace）。
+        """剥掉命名空间前缀（显式指定 namespace 与自动探测两种用法）。
 
         ``MQ_INST_XX%Topic`` → ``Topic``；``%RETRY%MQ_INST_XX%GID`` → ``%RETRY%GID``。
         未带该命名空间时原样返回。
@@ -75,7 +75,7 @@ class NamespaceUtil:
 
     @staticmethod
     def wrap_namespace(namespace: str, resource_without_namespace: str) -> str:
-        """拼上命名空间前缀（对应 Java wrapNamespace）。"""
+        """拼上命名空间前缀。"""
         if not namespace or not resource_without_namespace:
             return resource_without_namespace
         if NamespaceUtil.is_system_resource(resource_without_namespace):
@@ -92,7 +92,7 @@ class NamespaceUtil:
 
     @staticmethod
     def wrap_namespace_and_retry(namespace: str, consumer_group: str) -> str:
-        """``%RETRY%<wrapNamespace(namespace, group)>``（对应 Java wrapNamespaceAndRetry）。"""
+        """``%RETRY%<wrapNamespace(namespace, group)>``。"""
         if not consumer_group:
             return consumer_group
         return MixAll.RETRY_GROUP_TOPIC_PREFIX + NamespaceUtil.wrap_namespace(
@@ -100,7 +100,7 @@ class NamespaceUtil:
 
     @staticmethod
     def get_namespace_from_resource(resource: str) -> str:
-        """从资源名里取出命名空间（对应 Java getNamespaceFromResource）。"""
+        """从资源名里取出命名空间。"""
         if not resource or NamespaceUtil.is_system_resource(resource):
             return ""
         plain = NamespaceUtil.with_out_retry_and_dlq(resource)

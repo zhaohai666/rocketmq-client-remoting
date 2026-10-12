@@ -27,37 +27,37 @@ const (
 )
 
 var (
-	javaMsgID1      = "AC1400A1F0A018B4AAC2A1B2C3D4E5F6"
-	javaMsgID2      = "AC1400A1F0A018B4AAC2A1B2C3D4E5F7"
-	javaOffsetMsgID = "AC1400A1000027100000000000000001"
-	javaBody        = []byte(strings.Repeat("x", 42))
+	referenceMsgID1      = "AC1400A1F0A018B4AAC2A1B2C3D4E5F6"
+	referenceMsgID2      = "AC1400A1F0A018B4AAC2A1B2C3D4E5F7"
+	referenceOffsetMsgID = "AC1400A1000027100000000000000001"
+	referenceBody        = []byte(strings.Repeat("x", 42))
 
 	expectedPub = strings.Join([]string{"Pub", "1700000000000", "DefaultRegion", "GID_test",
-		"TopicTest", javaMsgID1, "TagA", "KeyA KeyB", "127.0.0.1:10911", "42", "7", "0",
-		javaOffsetMsgID, "true"}, traceSOH) + traceSTX
+		"TopicTest", referenceMsgID1, "TagA", "KeyA KeyB", "127.0.0.1:10911", "42", "7", "0",
+		referenceOffsetMsgID, "true"}, traceSOH) + traceSTX
 
 	expectedSubBefore = strings.Join([]string{"SubBefore", "1700000000000", "DefaultRegion",
-		"CID_test", "REQ-SUB-001", javaMsgID1, "2", "KeyA KeyB"}, traceSOH) + traceSTX +
+		"CID_test", "REQ-SUB-001", referenceMsgID1, "2", "KeyA KeyB"}, traceSOH) + traceSTX +
 		strings.Join([]string{"SubBefore", "1700000000000", "DefaultRegion",
-			"CID_test", "REQ-SUB-001", javaMsgID2, "0", "KeyC"}, traceSOH) + traceSTX
+			"CID_test", "REQ-SUB-001", referenceMsgID2, "0", "KeyC"}, traceSOH) + traceSTX
 
-	expectedSubAfter = strings.Join([]string{"SubAfter", "REQ-SUB-001", javaMsgID1, "11",
+	expectedSubAfter = strings.Join([]string{"SubAfter", "REQ-SUB-001", referenceMsgID1, "11",
 		"false", "KeyA KeyB", "2", "1700000000000", "CID_test"}, traceSOH) + traceSTX
 
 	expectedEndTransaction = strings.Join([]string{"EndTransaction", "1700000000000",
-		"DefaultRegion", "GID_test", "TopicTest", javaMsgID1, "TagA", "KeyA KeyB",
+		"DefaultRegion", "GID_test", "TopicTest", referenceMsgID1, "TagA", "KeyA KeyB",
 		"127.0.0.1:10911", "0", "TRAN-001", "COMMIT_MESSAGE", "false"}, traceSOH) + traceSTX
 
 	expectedRecall = strings.Join([]string{"Recall", "1700000000000", "DefaultRegion",
-		"GID_test", "TopicTest", javaMsgID1, "true"}, traceSOH) + traceSTX
+		"GID_test", "TopicTest", referenceMsgID1, "true"}, traceSOH) + traceSTX
 )
 
-// javaVectorBean fills every field the Java probe set on TraceBean.
-func javaVectorBean(msgID, keys string, retryTimes int32) *TraceBean {
+// referenceTraceBean fills every field the Java probe set on TraceBean.
+func referenceTraceBean(msgID, keys string, retryTimes int32) *TraceBean {
 	b := newTraceBean()
 	b.Topic = "TopicTest"
 	b.MsgID = msgID
-	b.OffsetMsgID = javaOffsetMsgID
+	b.OffsetMsgID = referenceOffsetMsgID
 	b.Tags = "TagA"
 	b.Keys = keys
 	b.StoreHost = "127.0.0.1:10911"
@@ -98,7 +98,7 @@ func equalStringSet(a, b []string) bool {
 
 // ---------------------------------------------------------------- encoding
 
-func TestTraceEncodePubMatchesJavaVector(t *testing.T) {
+func TestTraceEncodePubMatchesWireFormat(t *testing.T) {
 	ctx := &TraceContext{
 		TraceType: TracePub,
 		TimeStamp: 1700000000000,
@@ -108,19 +108,19 @@ func TestTraceEncodePubMatchesJavaVector(t *testing.T) {
 		IsSuccess: true,
 		RequestID: "REQ-PUB-001",
 		TraceBeans: []*TraceBean{
-			javaVectorBean(javaMsgID1, "KeyA KeyB", 2),
+			referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2),
 		},
 	}
 	tb := EncodeTraceContext(ctx)
 	if tb.TransData != expectedPub {
 		t.Errorf("encoded Pub differs from the Java vector:\n got %q\nwant %q", tb.TransData, expectedPub)
 	}
-	if got := keysOf(tb.TransKey); !equalStringSet(got, []string{javaMsgID1, "KeyA", "KeyB"}) {
+	if got := keysOf(tb.TransKey); !equalStringSet(got, []string{referenceMsgID1, "KeyA", "KeyB"}) {
 		t.Errorf("trans keys = %v", got)
 	}
 }
 
-func TestTraceEncodeSubBeforeMatchesJavaVector(t *testing.T) {
+func TestTraceEncodeSubBeforeMatchesWireFormat(t *testing.T) {
 	ctx := &TraceContext{
 		TraceType: TraceSubBefore,
 		TimeStamp: 1700000000000,
@@ -128,8 +128,8 @@ func TestTraceEncodeSubBeforeMatchesJavaVector(t *testing.T) {
 		GroupName: "CID_test",
 		RequestID: "REQ-SUB-001",
 		TraceBeans: []*TraceBean{
-			javaVectorBean(javaMsgID1, "KeyA KeyB", 2),
-			javaVectorBean(javaMsgID2, "KeyC", 0),
+			referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2),
+			referenceTraceBean(referenceMsgID2, "KeyC", 0),
 		},
 	}
 	tb := EncodeTraceContext(ctx)
@@ -137,12 +137,12 @@ func TestTraceEncodeSubBeforeMatchesJavaVector(t *testing.T) {
 		t.Errorf("encoded SubBefore differs:\n got %q\nwant %q", tb.TransData, expectedSubBefore)
 	}
 	if got := keysOf(tb.TransKey); !equalStringSet(got,
-		[]string{javaMsgID1, javaMsgID2, "KeyA", "KeyB", "KeyC"}) {
+		[]string{referenceMsgID1, referenceMsgID2, "KeyA", "KeyB", "KeyC"}) {
 		t.Errorf("trans keys = %v", got)
 	}
 }
 
-func TestTraceEncodeSubAfterMatchesJavaVector(t *testing.T) {
+func TestTraceEncodeSubAfterMatchesWireFormat(t *testing.T) {
 	ctx := &TraceContext{
 		TraceType:     TraceSubAfter,
 		TimeStamp:     1700000000000,
@@ -152,7 +152,7 @@ func TestTraceEncodeSubAfterMatchesJavaVector(t *testing.T) {
 		IsSuccess:     false,
 		ContextCode:   2,
 		AccessChannel: AccessChannelLocal,
-		TraceBeans:    []*TraceBean{javaVectorBean(javaMsgID1, "KeyA KeyB", 2)},
+		TraceBeans:    []*TraceBean{referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2)},
 	}
 	if got := EncodeTraceContext(ctx).TransData; got != expectedSubAfter {
 		t.Errorf("encoded SubAfter differs:\n got %q\nwant %q", got, expectedSubAfter)
@@ -171,22 +171,22 @@ func TestTraceEncodeSubAfterCloudDropsTimestampAndGroup(t *testing.T) {
 		IsSuccess:     false,
 		ContextCode:   2,
 		AccessChannel: AccessChannelCloud,
-		TraceBeans:    []*TraceBean{javaVectorBean(javaMsgID1, "KeyA KeyB", 2)},
+		TraceBeans:    []*TraceBean{referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2)},
 	}
-	want := strings.Join([]string{"SubAfter", "REQ-SUB-001", javaMsgID1, "11", "false",
+	want := strings.Join([]string{"SubAfter", "REQ-SUB-001", referenceMsgID1, "11", "false",
 		"KeyA KeyB", "2"}, traceSOH) + traceSTX
 	if got := EncodeTraceContext(ctx).TransData; got != want {
 		t.Errorf("CLOUD SubAfter got %q, want %q", got, want)
 	}
 }
 
-func TestTraceEncodeEndTransactionAndRecallMatchJavaVectors(t *testing.T) {
+func TestTraceEncodeEndTransactionAndRecallMatchWireFormat(t *testing.T) {
 	endTx := &TraceContext{
 		TraceType:  TraceEndTransaction,
 		TimeStamp:  1700000000000,
 		RegionID:   "DefaultRegion",
 		GroupName:  "GID_test",
-		TraceBeans: []*TraceBean{javaVectorBean(javaMsgID1, "KeyA KeyB", 2)},
+		TraceBeans: []*TraceBean{referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2)},
 	}
 	if got := EncodeTraceContext(endTx).TransData; got != expectedEndTransaction {
 		t.Errorf("encoded EndTransaction differs:\n got %q\nwant %q", got, expectedEndTransaction)
@@ -198,7 +198,7 @@ func TestTraceEncodeEndTransactionAndRecallMatchJavaVectors(t *testing.T) {
 		RegionID:   "DefaultRegion",
 		GroupName:  "GID_test",
 		IsSuccess:  true,
-		TraceBeans: []*TraceBean{javaVectorBean(javaMsgID1, "KeyA KeyB", 2)},
+		TraceBeans: []*TraceBean{referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2)},
 	}
 	if got := EncodeTraceContext(recall).TransData; got != expectedRecall {
 		t.Errorf("encoded Recall differs:\n got %q\nwant %q", got, expectedRecall)
@@ -211,7 +211,7 @@ func TestTraceEncodeNilContextIsNil(t *testing.T) {
 	}
 }
 
-func TestTraceConstantsMatchJava(t *testing.T) {
+func TestTraceConstantsMatchWireFormat(t *testing.T) {
 	if TraceContentSplitor != "\u0001" || TraceFieldSplitor != "\u0002" {
 		t.Errorf("splitors = %q/%q", TraceContentSplitor, TraceFieldSplitor)
 	}
@@ -250,7 +250,7 @@ func TestTraceDecodePubRoundTrip(t *testing.T) {
 		CostTime:  7,
 		IsSuccess: true,
 		TraceBeans: []*TraceBean{
-			javaVectorBean(javaMsgID1, "KeyA KeyB", 2),
+			referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2),
 		},
 	}
 	records := DecodeTraceDataString(EncodeTraceContext(ctx).TransData)
@@ -266,11 +266,11 @@ func TestTraceDecodePubRoundTrip(t *testing.T) {
 		t.Errorf("costTime/isSuccess = %d/%v", got.CostTime, got.IsSuccess)
 	}
 	bean := got.TraceBeans[0]
-	if bean.Topic != "TopicTest" || bean.MsgID != javaMsgID1 || bean.Tags != "TagA" ||
+	if bean.Topic != "TopicTest" || bean.MsgID != referenceMsgID1 || bean.Tags != "TagA" ||
 		bean.Keys != "KeyA KeyB" || bean.StoreHost != "127.0.0.1:10911" {
 		t.Errorf("bean = %+v", bean)
 	}
-	if bean.BodyLength != 42 || bean.OffsetMsgID != javaOffsetMsgID || bean.MsgType != common.NormalMsg {
+	if bean.BodyLength != 42 || bean.OffsetMsgID != referenceOffsetMsgID || bean.MsgType != common.NormalMsg {
 		t.Errorf("bean = %+v", bean)
 	}
 	// Java's encoder never writes clientHost; the decoder falls back to the
@@ -288,15 +288,15 @@ func TestTraceDecodeSubBeforeKeepsRequestIDAndRetryTimes(t *testing.T) {
 		GroupName: "CID_test",
 		RequestID: "REQ-SUB-001",
 		TraceBeans: []*TraceBean{
-			javaVectorBean(javaMsgID1, "KeyA KeyB", 2),
-			javaVectorBean(javaMsgID2, "KeyC", 0),
+			referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2),
+			referenceTraceBean(referenceMsgID2, "KeyC", 0),
 		},
 	}
 	records := DecodeTraceDataString(EncodeTraceContext(ctx).TransData)
 	if len(records) != 2 {
 		t.Fatalf("one record per bean, got %d", len(records))
 	}
-	if records[0].TraceBeans[0].MsgID != javaMsgID1 || records[1].TraceBeans[0].MsgID != javaMsgID2 {
+	if records[0].TraceBeans[0].MsgID != referenceMsgID1 || records[1].TraceBeans[0].MsgID != referenceMsgID2 {
 		t.Errorf("msgIds = %q/%q", records[0].TraceBeans[0].MsgID, records[1].TraceBeans[0].MsgID)
 	}
 	if records[0].TraceBeans[0].RetryTimes != 2 || records[1].TraceBeans[0].RetryTimes != 0 {
@@ -319,7 +319,7 @@ func TestTraceDecodeSubAfterContextCodeAndLegacyBranch(t *testing.T) {
 		IsSuccess:     false,
 		ContextCode:   4,
 		AccessChannel: AccessChannelLocal,
-		TraceBeans:    []*TraceBean{javaVectorBean(javaMsgID1, "KeyA KeyB", 2)},
+		TraceBeans:    []*TraceBean{referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2)},
 	}
 	got := DecodeTraceDataString(EncodeTraceContext(ctx).TransData)[0]
 	if got.ContextCode != 4 || got.IsSuccess || got.GroupName != "CID_test" || got.TimeStamp != 1700000000000 {
@@ -327,7 +327,7 @@ func TestTraceDecodeSubAfterContextCodeAndLegacyBranch(t *testing.T) {
 	}
 	// The pre-5.x layout has only 7 segments; timestamp and group must fall back
 	// to "now" and "" rather than shifting the other fields.
-	legacy := strings.Join([]string{"SubAfter", "REQ", javaMsgID1, "5", "true", "KeyA", "0"}, traceSOH)
+	legacy := strings.Join([]string{"SubAfter", "REQ", referenceMsgID1, "5", "true", "KeyA", "0"}, traceSOH)
 	old := DecodeTraceDataString(legacy)[0]
 	if old.ContextCode != 0 || old.GroupName != "" || old.TimeStamp < 1700000000000 {
 		t.Errorf("legacy SubAfter = %+v", old)
@@ -340,7 +340,7 @@ func TestTraceDecodeEndTransactionFields(t *testing.T) {
 		TimeStamp:  1700000000000,
 		RegionID:   "DefaultRegion",
 		GroupName:  "GID_test",
-		TraceBeans: []*TraceBean{javaVectorBean(javaMsgID1, "KeyA KeyB", 2)},
+		TraceBeans: []*TraceBean{referenceTraceBean(referenceMsgID1, "KeyA KeyB", 2)},
 	}
 	got := DecodeTraceDataString(EncodeTraceContext(ctx).TransData)[0]
 	if got.TraceType != TraceEndTransaction {
@@ -362,21 +362,21 @@ func TestTraceDecodeEndTransactionFields(t *testing.T) {
 // message; this decoder reads a missing segment as "".
 func TestTraceDecodeSubBeforeWithoutKeys(t *testing.T) {
 	raw := strings.Join([]string{"SubBefore", "1700000000000", "DefaultRegion", "GID_trace_live",
-		"REQ-001", javaMsgID1, "0", ""}, traceSOH) + traceSTX
+		"REQ-001", referenceMsgID1, "0", ""}, traceSOH) + traceSTX
 	records := DecodeTraceDataString(raw)
 	if len(records) != 1 {
 		t.Fatalf("decoded %d records, want 1", len(records))
 	}
 	bean := records[0].TraceBeans[0]
-	if bean.Keys != "" || bean.RetryTimes != 0 || bean.MsgID != javaMsgID1 {
+	if bean.Keys != "" || bean.RetryTimes != 0 || bean.MsgID != referenceMsgID1 {
 		t.Errorf("bean = %+v", bean)
 	}
 }
 
 func TestTraceDecodeOneBadRecordDoesNotDropTheBatch(t *testing.T) {
-	broken := strings.Join([]string{"SubAfter", "REQ-9", javaMsgID2}, traceSOH) + traceSTX
+	broken := strings.Join([]string{"SubAfter", "REQ-9", referenceMsgID2}, traceSOH) + traceSTX
 	goodSub := strings.Join([]string{"SubBefore", "1700000000000", "R", "G", "REQ-1",
-		javaMsgID1, "0", "K"}, traceSOH) + traceSTX
+		referenceMsgID1, "0", "K"}, traceSOH) + traceSTX
 
 	records := DecodeTraceDataString(expectedPub + broken + goodSub)
 	if len(records) != 2 || records[0].TraceType != TracePub || records[1].TraceType != TraceSubBefore {
@@ -524,7 +524,7 @@ func TestSendTraceHookPublishesPubRecord(t *testing.T) {
 	if hook.HookName() != "SendMessageTraceHook" {
 		t.Errorf("hook name = %q", hook.HookName())
 	}
-	msg := common.NewMessage("TopicTest", javaBody)
+	msg := common.NewMessage("TopicTest", referenceBody)
 	msg.SetTags("TagA")
 	msg.SetKeys("KeyA KeyB")
 	ctx := &SendMessageContext{
@@ -533,8 +533,8 @@ func TestSendTraceHookPublishesPubRecord(t *testing.T) {
 		BrokerAddr:    "127.0.0.1:10911",
 		SendResult: &SendResult{
 			SendStatus:  SendOK,
-			MsgID:       javaMsgID1,
-			OffsetMsgID: javaOffsetMsgID,
+			MsgID:       referenceMsgID1,
+			OffsetMsgID: referenceOffsetMsgID,
 			RegionID:    "DefaultRegion",
 			TraceOn:     true,
 		},
@@ -546,7 +546,7 @@ func TestSendTraceHookPublishesPubRecord(t *testing.T) {
 		t.Fatalf("before hook did not build a Pub context: %+v", ctx.MQTraceContext)
 	}
 	if traceCtx.GroupName != "GID_test" || traceCtx.TraceBeans[0].Topic != "TopicTest" ||
-		traceCtx.TraceBeans[0].BodyLength != len(javaBody) {
+		traceCtx.TraceBeans[0].BodyLength != len(referenceBody) {
 		t.Errorf("before context = %+v", traceCtx)
 	}
 	hook.SendMessageAfter(ctx)
@@ -555,7 +555,7 @@ func TestSendTraceHookPublishesPubRecord(t *testing.T) {
 		if got.TraceType != TracePub || got.RegionID != "DefaultRegion" || !got.IsSuccess {
 			t.Errorf("appended context = %+v", got)
 		}
-		if got.TraceBeans[0].MsgID != javaMsgID1 || got.TraceBeans[0].OffsetMsgID != javaOffsetMsgID {
+		if got.TraceBeans[0].MsgID != referenceMsgID1 || got.TraceBeans[0].OffsetMsgID != referenceOffsetMsgID {
 			t.Errorf("bean = %+v", got.TraceBeans[0])
 		}
 		// storeTime is the midpoint of the attempt (Java: timestamp + cost/2), so
@@ -575,7 +575,7 @@ func TestSendTraceHookSkipsTheTraceTopicItself(t *testing.T) {
 	hook := NewSendMessageTraceHook(d)
 	ctx := &SendMessageContext{
 		ProducerGroup: "GID_test",
-		Message:       common.NewMessage(common.TraceTopic, javaBody),
+		Message:       common.NewMessage(common.TraceTopic, referenceBody),
 		SendResult:    &SendResult{SendStatus: SendOK, RegionID: "DefaultRegion", TraceOn: true},
 	}
 	hook.SendMessageBefore(ctx)
@@ -594,20 +594,20 @@ func TestSendTraceHookSkipsTraceOffAndMissingResult(t *testing.T) {
 
 	// TRACE_ON=false from the broker: not tracked.
 	off := &SendMessageContext{
-		Message:    common.NewMessage("TopicTest", javaBody),
+		Message:    common.NewMessage("TopicTest", referenceBody),
 		SendResult: &SendResult{SendStatus: SendOK, RegionID: "DefaultRegion", TraceOn: false},
 	}
 	hook.SendMessageBefore(off)
 	hook.SendMessageAfter(off)
 
 	// No result at all (a failed attempt or a oneway send): not tracked.
-	failed := &SendMessageContext{Message: common.NewMessage("TopicTest", javaBody)}
+	failed := &SendMessageContext{Message: common.NewMessage("TopicTest", referenceBody)}
 	hook.SendMessageBefore(failed)
 	hook.SendMessageAfter(failed)
 
 	// After without Before: not tracked.
 	bare := &SendMessageContext{
-		Message:    common.NewMessage("TopicTest", javaBody),
+		Message:    common.NewMessage("TopicTest", referenceBody),
 		SendResult: &SendResult{SendStatus: SendOK, RegionID: "DefaultRegion", TraceOn: true},
 	}
 	hook.SendMessageAfter(bare)
@@ -621,7 +621,7 @@ func TestSendTraceHookMarksFailureStatus(t *testing.T) {
 	d := newTestDispatcher("GID_test", TraceDispatcherProduce, 1, "")
 	hook := NewSendMessageTraceHook(d)
 	ctx := &SendMessageContext{
-		Message:    common.NewMessage("TopicTest", javaBody),
+		Message:    common.NewMessage("TopicTest", referenceBody),
 		SendResult: &SendResult{SendStatus: FlushDiskTimeout, RegionID: "DefaultRegion", TraceOn: true},
 	}
 	hook.SendMessageBefore(ctx)
@@ -642,13 +642,13 @@ func TestEndTransactionTraceHookRecordsTheVerdict(t *testing.T) {
 	if hook.HookName() != "EndTransactionTraceHook" {
 		t.Errorf("hook name = %q", hook.HookName())
 	}
-	msg := common.NewMessage("TopicTest", javaBody)
+	msg := common.NewMessage("TopicTest", referenceBody)
 	msg.SetKeys("KeyA")
 	hook.EndTransaction(&EndTransactionContext{
 		ProducerGroup:        "GID_test",
 		Message:              msg,
 		BrokerAddr:           "127.0.0.1:10911",
-		MsgID:                javaMsgID1,
+		MsgID:                referenceMsgID1,
 		TransactionID:        "TRAN-001",
 		TransactionState:     CommitMessage,
 		FromTransactionCheck: false,
@@ -660,7 +660,7 @@ func TestEndTransactionTraceHookRecordsTheVerdict(t *testing.T) {
 		}
 		bean := got.TraceBeans[0]
 		if bean.TransactionState != "COMMIT_MESSAGE" || bean.MsgType != common.TransMsgCommit ||
-			bean.MsgID != javaMsgID1 {
+			bean.MsgID != referenceMsgID1 {
 			t.Errorf("bean = %+v", bean)
 		}
 	default:
@@ -678,8 +678,8 @@ func TestConsumeTraceHookSharesRequestIDAndMapsContextCode(t *testing.T) {
 	}
 	msg := common.NewMessageExt()
 	msg.Topic = "TopicTest"
-	msg.MsgID = javaMsgID1
-	msg.Body = javaBody
+	msg.MsgID = referenceMsgID1
+	msg.Body = referenceBody
 	msg.StoreTimestamp = 1700000000000
 	msg.StoreSize = 42
 	msg.ReconsumeTimes = 1
@@ -697,7 +697,7 @@ func TestConsumeTraceHookSharesRequestIDAndMapsContextCode(t *testing.T) {
 		if got.TraceType != TraceSubBefore || got.GroupName != "CID_test" || got.RegionID != "DefaultRegion" {
 			t.Fatalf("SubBefore = %+v", got)
 		}
-		if got.TraceBeans[0].MsgID != javaMsgID1 || got.TraceBeans[0].RetryTimes != 1 {
+		if got.TraceBeans[0].MsgID != referenceMsgID1 || got.TraceBeans[0].RetryTimes != 1 {
 			t.Errorf("bean = %+v", got.TraceBeans[0])
 		}
 	default:
@@ -727,7 +727,7 @@ func TestConsumeTraceHookContextCodeFromFailedStatus(t *testing.T) {
 	hook := NewConsumeMessageTraceHook(d)
 	msg := common.NewMessageExt()
 	msg.Topic = "TopicTest"
-	msg.MsgID = javaMsgID1
+	msg.MsgID = referenceMsgID1
 	msg.PutProperty(common.PropertyMsgRegion, "DefaultRegion")
 	ctx := &ConsumeMessageContext{
 		ConsumerGroup: "CID_test",
@@ -748,7 +748,7 @@ func TestConsumeTraceHookSkipsTraceOffAndBeforeLessAfter(t *testing.T) {
 	hook := NewConsumeMessageTraceHook(d)
 	off := common.NewMessageExt()
 	off.Topic = "TopicTest"
-	off.MsgID = javaMsgID1
+	off.MsgID = referenceMsgID1
 	off.PutProperty(common.PropertyTraceSwitch, "false")
 	ctx := &ConsumeMessageContext{ConsumerGroup: "CID_test", MsgList: []*common.MessageExt{off}}
 	hook.ConsumeMessageBefore(ctx)

@@ -7,24 +7,24 @@ namespace RocketMQ\Remoting\Protocol;
 use RocketMQ\Common\SubscriptionData;
 
 /**
- * 心跳数据（对应 org.apache.rocketmq.remoting.protocol.heartbeat.*，移植自 protocol/heartbeat.py）。
+ * 心跳数据：客户端向 broker 注册生产者 / 消费者及其订阅集合的线格式。
  */
 
-/** 对应 Java ConsumeType 枚举名。 */
+/** 消费方式（协议字段 consumeType 的枚举名）。 */
 final class ConsumeType
 {
     public const CONSUME_ACTIVELY = 'CONSUME_ACTIVELY';
     public const CONSUME_PASSIVELY = 'CONSUME_PASSIVELY';
 }
 
-/** 对应 Java MessageModel 枚举名。 */
+/** 消费模式（协议字段 messageModel 的枚举名）。 */
 final class MessageModel
 {
     public const CLUSTERING = 'CLUSTERING';
     public const BROADCASTING = 'BROADCASTING';
 }
 
-/** 对应 Java ConsumeFromWhere 枚举名。 */
+/** 起始消费位置（协议字段 consumeFromWhere 的枚举名）。 */
 final class ConsumeFromWhere
 {
     public const CONSUME_FROM_LAST_OFFSET = 'CONSUME_FROM_LAST_OFFSET';
@@ -53,7 +53,7 @@ final class ProducerData
 
 final class ConsumerData
 {
-    /** @var list<SubscriptionData> 对应 Python set（无重复）；JSON 输出顺序按插入序 */
+    /** @var list<SubscriptionData> 集合语义：一个 topic 一条，调用方排序后填入；JSON 输出顺序即插入序 */
     public array $subscriptionDataSet = [];
     public bool $unitMode = false;
 
@@ -66,7 +66,7 @@ final class ConsumerData
     }
 
     /**
-     * 对齐 Java 5.x ConsumerData 字段（**没有** 4.x 的 consumeTimestamp /
+     * 只输出 5.x broker 认识的 ConsumerData 字段（**不带** 4.x 的 consumeTimestamp /
      * maxReconsumeTimes）；subscriptionDataSet 用 SubscriptionData.toDict()。
      *
      * @return array<string, mixed>
@@ -120,7 +120,7 @@ final class HeartbeatData
     /**
      * heartbeatFingerprint 故意留 0：broker 见到 0 走 V1 注册路径（用完整
      * subscriptionDataSet 注册），最稳妥；非 0 才会进 heartBeatV2 优化。
-     * withoutSub 同理（Java 字段 isWithoutSub，fastjson2 名是 withoutSub）。
+     * withoutSub 同理：协议里的布尔字段名就是 withoutSub，false 表示照常上报订阅集合。
      *
      * @return array<string, mixed>
      */

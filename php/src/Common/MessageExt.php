@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 对应 org.apache.rocketmq.common.message.MessageExt（拉取到的消息，
- * 移植自 message.py 的 MessageExt）。
+ * 拉取到的消息：Message 的字段加上 broker 回填的队列 / 位点 / 收发主机 /
+ * 重投次数等存储侧信息。
  */
 class MessageExt extends Message
 {

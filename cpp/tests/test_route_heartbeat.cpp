@@ -199,7 +199,7 @@ static void testTopicRouteData() {
     CHECK(t.topicRouteDataChanged(&other), "route changed on queue diff");
 
     // 真实样例（nameserver 响应形如 Java fastjson2 输出）
-    TopicRouteData fromJava;
+    TopicRouteData fromServerSample;
     CHECK(TopicRouteData::decode(
               "{\"brokerDatas\":[{\"brokerAddrs\":{0:\"127.0.0.1:10911\"},"
               "\"brokerName\":\"broker-a\",\"cluster\":\"DefaultCluster\","
@@ -207,10 +207,10 @@ static void testTopicRouteData() {
               "\"filterServerTable\":{},\"orderTopicConf\":\"\","
               "\"queueDatas\":[{\"brokerName\":\"broker-a\",\"perm\":6,\"readQueueNums\":4,"
               "\"topicSysFlag\":0,\"writeQueueNums\":4}]}",
-              fromJava),
+              fromServerSample),
           "route decode java-shaped json");
-    CHECK(fromJava.getAllMessageQueue("T").size() == 4, "route java-shaped writable queues");
-    CHECK(fromJava.brokerDatas[0].selectBrokerAddr() == "127.0.0.1:10911",
+    CHECK(fromServerSample.getAllMessageQueue("T").size() == 4, "route java-shaped writable queues");
+    CHECK(fromServerSample.brokerDatas[0].selectBrokerAddr() == "127.0.0.1:10911",
           "route java-shaped select master");
 
     // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。

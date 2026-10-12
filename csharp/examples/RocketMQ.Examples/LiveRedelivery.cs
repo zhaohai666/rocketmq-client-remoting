@@ -1268,7 +1268,7 @@ public static class LiveRedelivery
     /// context 70ms 压过配置 900ms（中位间隔贴着 70ms）、context 保持 -1 时回落配置 400ms、
     /// 两个非法值（context 1ms / 配置 0）钳到下限不忙等。
     /// 钳位端点只能兜「不忙等」（>= 10ms）：分发循环本身有 50ms 固定节拍，间隔法分不出 10ms
-    /// 与 1ms —— 精确值由离线矩阵锁死（OrderlyReconsumeTests.OrderlySuspendMillisResolvesThenClampsLikeJava）。
+    /// 与 1ms —— 精确值由离线矩阵锁死（OrderlyReconsumeTests.OrderlySuspendMillisResolvesThenClampsLikeLegacy）。
     /// </summary>
     private static void ScenarioOrderlySuspendMillis(DefaultMQProducer producer)
     {

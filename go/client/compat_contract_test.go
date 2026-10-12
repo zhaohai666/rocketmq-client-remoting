@@ -1,5 +1,6 @@
-// Tests for the Java-alignment gap fills: producer VIP channel switch and the
-// 5.x timer delay setters.
+// Contract tests pinning two wire-format corners of the producer: the VIP
+// channel port rewrite on the broker address, and the 5.x timer-delay
+// property keys as they must appear on the wire.
 package client
 
 import (
@@ -32,7 +33,7 @@ func TestProducerSendAddrAppliesVIPChannel(t *testing.T) {
 }
 
 // The three 5.x timer aliases write the exact Java property keys.
-func TestMessageTimerDelaySettersUseJavaPropertyNames(t *testing.T) {
+func TestMessageTimerDelaySettersUseWirePropertyKeys(t *testing.T) {
 	msg := common.NewMessage("T", []byte("x"))
 
 	msg.SetDelayTimeSec(30)

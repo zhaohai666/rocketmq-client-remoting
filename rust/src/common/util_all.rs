@@ -237,7 +237,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn java_hash_matches_reference_vectors() {
+    fn string_hash_matches_reference_vectors() {
         assert_eq!(java_string_hash("TagA"), 2598919);
         assert_eq!(java_string_hash("TagB"), 2598920);
         assert_eq!(java_string_hash("P"), 80);

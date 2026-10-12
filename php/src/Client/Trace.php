@@ -26,9 +26,9 @@ use RocketMQ\Common\UtilAll;
  * ⚠ 两个必须保留的 Java 语义差异（否则编解码对不上）：
  *   1. CONTENT_SPLITOR = \x01、FIELD_SPLITOR = \x02，编码时**每条记录末尾补
  *      FIELD_SPLITOR**；解码用 Java String.split 语义（**丢弃末尾空串**）切分
- *      —— 见 TraceDataEncoder::javaSplit()。
+ *      —— 见 TraceDataEncoder::wireSplit()。
  *   2. PHP 的 explode 与 Python 的 str.split 一样保留末尾空串，直接切会多出一个
- *      空段并把字段整体错位。本模块一律走 javaSplit()。
+ *      空段并把字段整体错位。本模块一律走 wireSplit()。
  */
 final class TraceConstants
 {
@@ -221,7 +221,7 @@ final class TraceDataEncoder
      *
      * @return list<string>
      */
-    public static function javaSplit(string $value, string $sep): array
+    public static function wireSplit(string $value, string $sep): array
     {
         $parts = explode($sep, $value);
         while ($parts !== [] && end($parts) === '') {
@@ -241,7 +241,7 @@ final class TraceDataEncoder
         if ($traceData === null || $traceData === '') {
             return $res;
         }
-        foreach (self::javaSplit($traceData, TraceConstants::FIELD_SPLITOR) as $context) {
+        foreach (self::wireSplit($traceData, TraceConstants::FIELD_SPLITOR) as $context) {
             if ($context === '') {
                 continue;
             }
@@ -263,7 +263,7 @@ final class TraceDataEncoder
     /** 解一条轨迹记录（一段 FIELD_SPLITOR 之内）。无法识别时返回 null。 */
     private static function decodeContext(string $context): ?TraceContext
     {
-        $line = self::javaSplit($context, TraceConstants::CONTENT_SPLITOR);
+        $line = self::wireSplit($context, TraceConstants::CONTENT_SPLITOR);
         if ($line === []) {
             return null;
         }

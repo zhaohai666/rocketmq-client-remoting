@@ -1,21 +1,18 @@
-// Message trace types + codec (Java org.apache.rocketmq.client.trace.*).
+// 消息轨迹类型与编解码。
 //
-// The encoded text is what the broker stores under RMQ_SYS_TRACE_TOPIC and
-// what the RocketMQ console reads back, so the field order is a WIRE FORMAT,
-// not an implementation detail.
+// 编码文本就是 broker 落盘到 RMQ_SYS_TRACE_TOPIC、控制台原样读回的内容，字段顺序
+// 属于经典 remoting 协议规定的线上格式，不是实现细节。
 //
-// Two Java split semantics are load-bearing and easy to get wrong:
+// 分隔规则容易踩坑，两处关键点必须遵守：
 //
-//  - CONTENT_SPLITOR (\x01) separates fields inside one record,
-//    FIELD_SPLITOR (\x02) separates records and is appended after EVERY
-//    record (trailing separators included) — Java String.split drops trailing
-//    empty strings, which is exactly what makes the trailing separator
-//    harmless. Record count == count("\x02") on the wire.
-//  - The decoder must use Java's split rule, not a naive split: JS split keeps
-//    the trailing empty part. javaSplit below is the one and only entry point.
+//  - CONTENT_SPLITOR（\x01）分隔单条记录内的字段，FIELD_SPLITOR（\x02）分隔记录，
+//    并且**每条记录末尾都补一个 FIELD_SPLITOR**。解码时必须丢弃末尾空段，尾部
+//    补的分隔符才无害；线上记录条数等于 "\x02" 的出现次数。
+//  - JS 原生 split 会保留末尾空串，直接切会多出一个空段并把字段整体错位。统一走
+//    下面的 splitTrimmingTrailingEmpty。
 import { MessageConst } from '../common/messageConst.ts';
 
-// Trace constants (Java TraceConstants). The last two are wire literals too.
+// 轨迹相关常量，最后两个 accessChannel 同样属于线上字面量。
 export const TraceGroupNamePrefix = '_INNER_TRACE_PRODUCER';
 export const TraceContentSplitor = '\u0001';
 export const TraceFieldSplitor = '\u0002';
@@ -24,8 +21,7 @@ export const TraceTopicPrefix = 'rmq_sys_TRACE_DATA_';
 export const AccessChannelLocal = 'LOCAL';
 export const AccessChannelCloud = 'CLOUD';
 
-// TraceType is Java TraceType. The string is the first field of every encoded
-// record, so these values are wire literals.
+// 轨迹事件类型。类型字符串就是每条编码记录的首字段，属于线上字面量。
 export const TraceType = {
   PUB: 'Pub',
   RECALL: 'Recall',
@@ -35,10 +31,10 @@ export const TraceType = {
 } as const;
 export type TraceType = string;
 
-// MessageType ordinals (Java common.MessageType) — wire values.
+// 消息类型序号 —— 编码到线上的字段值。
 export const TraceMsgType = { NORMAL: 0, ORDER: 1, TRANSACTION: 2, DELAY: 3, BATCH: 4, REPLY: 5 } as const;
 
-// TraceBean is Java TraceBean: the traced message behind one record.
+// TraceBean：一条轨迹记录背后被追踪的消息。
 export class TraceBean {
   topic = '';
   msgId = '';
@@ -58,7 +54,7 @@ export class TraceBean {
   fromTransactionCheck = false;
 }
 
-// TraceContext is Java TraceContext: one trace event.
+// TraceContext：一次轨迹事件。
 export class TraceContext {
   traceType: TraceType = TraceType.PUB;
   timeStamp = 0;
@@ -73,27 +69,24 @@ export class TraceContext {
   traceBeans: TraceBean[] = [];
 }
 
-// TraceTransferBean is Java TraceTransferBean: one encoded chunk plus the keys
-// the receiver can look it up by.
+// TraceTransferBean：一段编码后的载荷，加上供下游按 key 检索的键集合。
 export class TraceTransferBean {
   transData = '';
   transKey = new Set<string>();
 }
 
-// traceField reads one segment, defaulting to "" when it is missing.
+// traceField 读取一段，缺失时按空串处理。
 //
-// This is a DELIBERATE robustness deviation from Java, mirroring the Python
-// port: Java's decoder indexes line[7] directly, and a SubBefore record of a
-// message WITHOUT keys loses that segment to the trailing split rule — so an
-// AIOOBE kills the whole trace message. A trace reader should not die on a
-// legal record, so the missing segment reads as an empty string instead.
+// 这里刻意做健壮性处理：SubBefore 记录若来自一条**未带 keys 的消息**，其 keys 段
+// 会被"丢弃末尾空段"的规则吃掉，直接按下标 7 硬取就会越界抛错，进而让整批轨迹消息丢光。
+// 读侧不应因合法记录缺段而崩溃，所以缺段读作空串。
 function traceField(line: string[], index: number): string {
   return index < line.length ? line[index] : '';
 }
 
-// javaSplit mirrors Java String#split(sep, 0): trailing empty segments are
-// DROPPED, but a string with no separator is returned whole.
-export function javaSplit(text: string, sep: string): string[] {
+// splitTrimmingTrailingEmpty：按分隔符切分，**丢弃末尾空段**（协议规定每条记录末尾都补
+// FIELD_SPLITOR）；没有分隔符的字符串原样返回。
+export function splitTrimmingTrailingEmpty(text: string, sep: string): string[] {
   const parts = text.split(sep);
   if (parts.length === 1) return parts;
   while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
@@ -106,8 +99,7 @@ function traceMsgType(text: string): number | null {
   return n;
 }
 
-// EncodeTraceContext mirrors Java TraceDataEncoder.encoderFromContextBean.
-// A nil context encodes to null (Java returns null).
+// EncodeTraceContext 把一次轨迹事件编码为传输块；上下文为 null 时返回 null。
 export function EncodeTraceContext(ctx: TraceContext | null): TraceTransferBean | null {
   if (ctx == null) return null;
   const tb = new TraceTransferBean();
@@ -183,15 +175,13 @@ export function EncodeTraceContext(ctx: TraceContext | null): TraceTransferBean 
   return tb;
 }
 
-// DecodeTraceDataString mirrors Java decoderFromTraceDataString.
+// DecodeTraceDataString 解一批轨迹记录。
 //
-// Deviation, matching the Python port: a record that fails to decode is
-// skipped instead of aborting the whole payload. Java lets the exception
-// escape, which loses every record in the message because of one bad one.
+// 健壮性策略：单条解码失败时跳过，不中断整段解析——否则一条坏记录会让整批轨迹全部丢光。
 export function DecodeTraceDataString(traceData: string): TraceContext[] {
   if (!traceData) return [];
   const out: TraceContext[] = [];
-  for (const record of javaSplit(traceData, TraceFieldSplitor)) {
+  for (const record of splitTrimmingTrailingEmpty(traceData, TraceFieldSplitor)) {
     if (record === '') continue;
     const ctx = decodeTraceContext(record);
     if (ctx !== null) out.push(ctx);
@@ -200,7 +190,7 @@ export function DecodeTraceDataString(traceData: string): TraceContext[] {
 }
 
 function decodeTraceContext(record: string): TraceContext | null {
-  const line = javaSplit(record, TraceContentSplitor);
+  const line = splitTrimmingTrailingEmpty(record, TraceContentSplitor);
   if (line.length === 0) return null;
   const newCtx = (): TraceContext => new TraceContext();
   const newBean = (): TraceBean => new TraceBean();
@@ -255,7 +245,7 @@ function decodeTraceContext(record: string): TraceContext | null {
       const bean = newBean();
       bean.msgId = line[5];
       bean.retryTimes = retry;
-      // Segment 7 is what a keys-less message loses (Java's AIOOBE quirk).
+      // 段 7 是无 keys 的消息会被切掉的段，用 traceField 兜底。
       bean.keys = traceField(line, 7);
       ctx.traceBeans = [bean];
       return ctx;
@@ -331,9 +321,8 @@ function decodeTraceContext(record: string): TraceContext | null {
   }
 }
 
-// Helper: build a TraceBean from a MessageExt (consumer side — the msg_id is
-// the OFFSET-based ID, aligning with SendResult.offsetMsgId; the Pub trace
-// uses UNIQ_KEY instead — cross-port rule #14).
+// 从 MessageExt 构造 TraceBean（消费侧）：msgId 取 OFFSET 形式的 ID，与
+// SendResult.offsetMsgId 同一路；生产侧 Pub 轨迹则使用 UNIQ_KEY。
 export function traceBeanFromMessageExt(msg: any, offsetBasedId: boolean): TraceBean {
   const bean = new TraceBean();
   bean.topic = msg.getTopic();

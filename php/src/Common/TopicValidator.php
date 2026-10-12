@@ -5,10 +5,9 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * topic / group 名字的合法性判定（对应 ``org.apache.rocketmq.common.topic.TopicValidator``，
- * 移植自 topic_validator.py）。
+ * topic / group 名字的合法性判定。
  *
- * Java 的字符表白名单是 ``^[%|a-zA-Z0-9_-]+$``，实现方式是一张 128 长的
+ * 协议里的字符表白名单是 ``^[%|a-zA-Z0-9_-]+$``，实现方式是一张 128 长的
  * ``VALID_CHAR_BIT_MAP``：**码点 >= 128 一律非法**。这里逐字节照抄，因为 broker 侧
  * （``TopicConfigValidator``）用的是同一张表，客户端放行而 broker 拒绝只会把错误推迟到
  * 建 topic 那一刻，而名字是**发送路径**上就该定的东西。
@@ -70,10 +69,10 @@ final class TopicValidator
     private const ALLOWED_CHARS = '%-_|0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
     /**
-     * 对应 ``TopicValidator.isTopicOrGroupIllegal``：空串返回 False（空由 isBlank 那步管）。
+     * 空串返回 false（空由 isBlank 那步管）。
      *
      * 按字节遍历：合法字符全为 ASCII，任何 >= 0x80 的字节（即所有非 ASCII 码点）
-     * 一律非法，与 Python 逐字符 ``ord(ch) >= 128`` 语义等价。
+     * 一律非法——等价于逐码点判 >= 128。
      */
     public static function isTopicOrGroupIllegal(string $name): bool
     {

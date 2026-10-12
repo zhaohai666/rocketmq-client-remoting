@@ -5,8 +5,7 @@ declare(strict_types=1);
 namespace RocketMQ\Common;
 
 /**
- * 消息属性访问器（对应 org.apache.rocketmq.common.message.MessageAccessor，
- * 移植自 message_accessor.py）。
+ * 消息属性访问器：属性表的集中读写入口（重试次数、撤回、轨迹等键都从这里走）。
  */
 final class MessageAccessor
 {
@@ -91,9 +90,9 @@ final class MessageAccessor
     }
 
     /**
-     * Java MessageAccessor.getReconsumeTime：重试次数以**属性**形式挂在消息上，
-     * 只由回投链路（``sendMessageBack``）写入，与 MessageExt 线上第 13 字段的
-     * reconsumeTimes 不是一回事 —— broker 消费投递给客户端的是后者。
+     * 重试次数以**属性**形式挂在消息上，只由回投链路（``sendMessageBack``）写入，
+     * 与 MessageExt 线上第 13 字段的 reconsumeTimes 不是一回事 ——
+     * broker 投递给客户端的是后者，读错来源会拿到 0。
      */
     public static function getReconsumeTime(Message $msg): ?string
     {

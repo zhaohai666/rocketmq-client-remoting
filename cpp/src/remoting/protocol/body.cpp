@@ -144,7 +144,7 @@ JsonValue CheckClientRequestBody::toJson() const {
     v.set("clientId", JsonValue::makeString(clientId));
     v.set("group", JsonValue::makeString(group));
     v.set("subscriptionData", subscriptionData.toJson());
-    // Java 的 namespace 为 null 时 fastjson 不写这个键，这里用 hasNamespace 表达同一语义
+    // namespace 未置位时不写这个键（broker 侧 fastjson 不序列化 null 字段），用 hasNamespace 表达该语义
     if (hasNamespace) v.set("namespace", JsonValue::makeString(clientNamespace));
     return v;
 }
@@ -373,9 +373,8 @@ JsonValue ConsumerRunningInfo::toJson() const {
     v.set("properties", makeStringMap(properties));
     v.set("subscriptionSet", subscriptionSet.isNull() ? JsonValue::makeArray() : subscriptionSet);
     v.set("mqTable", mqTable.isNull() ? JsonValue::makeObject() : mqTable);
-    // Python/Java 侧 307 应答总是带 mqPopTable/statusTable/userConsumerInfo；
-    // 缺省时输出空对象，保持三语言报文形状一致（fastjson2 会忽略空 map 吗？不会，
-    // Java 的字段非 null 就序列化，空 TreeMap 输出 {}）。
+    // 307 应答报文总是带 mqPopTable/statusTable/userConsumerInfo，缺省时输出空对象 {}：
+    // broker 侧 fastjson 字段非 null 就序列化，空 map 输出 {}，故保持这一报文形状。
     v.set("mqPopTable", mqPopTable.isNull() ? JsonValue::makeObject() : mqPopTable);
     v.set("statusTable", statusTable.isNull() ? JsonValue::makeObject() : statusTable);
     v.set("userConsumerInfo", userConsumerInfo.isNull() ? JsonValue::makeObject() : userConsumerInfo);
@@ -523,8 +522,8 @@ JsonValue GetConsumerStatusBody::toJson() const {
         table.set(messageQueueKey(kv.first), JsonValue::makeInt(kv.second));
     }
     v.set("messageQueueTable", table);
-    // Java 保留的废弃字段 consumerTable（clientId -> 位点表）：始终带空对象，
-    // 与 Python/Java 序列化形状一致。
+    // 协议保留的废弃字段 consumerTable（clientId -> 位点表）：始终带空对象 {}，
+    // 与 broker 侧约定的序列化形状一致。
     v.set("consumerTable", JsonValue::makeObject());
     return v;
 }

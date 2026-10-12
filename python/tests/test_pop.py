@@ -104,7 +104,7 @@ class TestExtraInfoBuildSplit:
         assert ck == "0 1 2 3 0 broker-a 4"
         assert len(ei.split(ck)) == 7
 
-    def test_split_drops_trailing_empty_like_java(self):
+    def test_pop_split_drops_trailing_empty(self):
         # Java "1 2 3 ".split(" ") -> ["1","2","3"]；Python 原生会留一个 ""
         assert ei.split("1 2 3 ") == ["1", "2", "3"]
         assert ei.split("1 2 3  ") == ["1", "2", "3"]
@@ -217,7 +217,7 @@ class TestExtraInfoParse:
 # ---------------------------------------------------------------- 2. 请求/响应头
 
 class TestPopRequestHeader:
-    def test_ext_keys_exactly_match_java(self):
+    def test_ext_keys_are_the_documented_wire_keys(self):
         h = PopMessageRequestHeader()
         h.consumer_group = GROUP
         h.topic = TOPIC

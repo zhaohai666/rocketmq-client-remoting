@@ -464,7 +464,7 @@ void testMissingSlaveFallsBackToMasterAndKeepsCommitOffset() {
 // ---------------------------------------------------------------- 5. push 侧订阅门控
 
 // Java DefaultMQPushConsumer#postSubscriptionWhenPull 默认 false；打开且非类过滤模式才上送。
-void testPullSubscriptionGatingFollowsJavaDefault() {
+void testPullSubscriptionGatingFollowsDefault() {
     expect(!DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(false, false),
            "默认关闭 → 不上送");
     expect(DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(true, false),
@@ -516,7 +516,7 @@ int main() {
     testPullToSlaveClearsCommitOffsetAndOmitsSubscription();
     testPullToMasterKeepsCommitOffsetAndPostsSubscription();
     testMissingSlaveFallsBackToMasterAndKeepsCommitOffset();
-    testPullSubscriptionGatingFollowsJavaDefault();
+    testPullSubscriptionGatingFollowsDefault();
     testPullFromWhichNodeRoundTrip();
     std::printf("%d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;

@@ -12,13 +12,8 @@ use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MixAll;
 
 /**
- * Request-Reply（5.x）客户端侧支撑，移植自 request_reply.py。
- *
- * 对应 Java 的这几个类：
- * - org.apache.rocketmq.client.producer.RequestResponseFuture
- * - org.apache.rocketmq.client.producer.RequestFutureHolder
- * - org.apache.rocketmq.client.utils.MessageUtil#createReplyMessage
- * - org.apache.rocketmq.client.impl.ClientRemotingProcessor#receiveReplyMessage
+ * Request-Reply（5.x）客户端侧支撑：请求等待槽、correlationId 全局表、
+ * 应答消息派生与接收分发。
  *
  * 协议回顾：
  *   请求方（producer.request）：msg.properties[CORRELATION_ID]=uuid /
@@ -30,7 +25,7 @@ use RocketMQ\Common\MixAll;
  * REPLY_TO_CLIENT 是**请求方的 clientId**，所以请求方必须发过心跳注册为 producer。
  */
 
-/** 对应 Java ``RequestCallback``。 */
+/** request 的异步回调接口。 */
 interface RequestCallback
 {
     public function onSuccess(?Message $responseMessage): void;
@@ -39,14 +34,14 @@ interface RequestCallback
 }
 
 /**
- * 对应 Java ``RequestResponseFuture``：一次 request 的等待槽。
+ * 一次 request 的等待槽。
  *
- * 与 Java 的差异（有意）：Java 额外起了一个 ``scanExpiredRequest`` 定时线程清理超时项；
- * 本实现由 ``request()`` 的 ``finally`` 保证移除，故不需要后台扫描线程。
+ * 超时清理（有意）：不设后台定时扫描线程；由 ``request()`` 的 ``finally`` 保证移除，
+ * 兜底清扫走 {@see RequestFutureHolder::scanExpiredRequest()}。
  *
- * PHP 单线程适配：Python 的 ``threading.Event.wait`` 会阻塞到应答投递或超时。单线程里
- * 没有别的线程能在此调用内投递应答，因此 ``waitResponseMessage`` 只返回**当前**已到达的
- * 应答（可能为 null）——真实的"等待"由上层生产者驱动 remoting 层 pump 后再取。
+ * PHP 单线程适配：进程内没有别的线程能在此调用内投递应答，因此 ``waitResponseMessage``
+ * 只返回**当前**已到达的应答（可能为 null）——真实的"等待"由上层生产者驱动 remoting 层
+ * pump 后再取。
  */
 class RequestResponseFuture
 {
@@ -67,13 +62,13 @@ class RequestResponseFuture
         $this->beginTimestamp = (int) (microtime(true) * 1000.0);
     }
 
-    /** 对应 Java ``waitResponseMessage``（单线程：返回当前应答，不阻塞）。 */
+    /** 取应答（单线程：返回当前应答，不阻塞）。 */
     public function waitResponseMessage(int $timeoutMillis): ?Message
     {
         return $this->responseMsg;
     }
 
-    /** 对应 Java ``putResponseMessage``（会 countDown latch，允许多次调用）。 */
+    /** 写入应答（允许多次调用，以最后一次为准）。 */
     public function putResponseMessage(?Message $responseMsg): void
     {
         $this->responseMsg = $responseMsg;
@@ -84,13 +79,13 @@ class RequestResponseFuture
         return (int) (microtime(true) * 1000.0) - $this->beginTimestamp > $this->timeoutMillis;
     }
 
-    /** 对应 Java ``setCause``。 */
+    /** 记录失败原因。 */
     public function setCause(?\Throwable $cause): void
     {
         $this->cause = $cause;
     }
 
-    /** 对应 Java ``executeRequestCallback``：回调只允许触发一次。 */
+    /** 触发回调：只允许触发一次。 */
     public function executeRequestCallback(): void
     {
         if ($this->requestCallback === null) {
