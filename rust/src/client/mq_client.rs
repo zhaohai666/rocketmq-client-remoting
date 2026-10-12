@@ -631,6 +631,11 @@ struct RouteTables {
     /// `brokerName -> {brokerId: addr}` 的**平表**。发布地址解析（只认 0）读的就是它，
     /// 而它只在路由落库那一处整批刷新 —— 与 Java `:962-964` 同点。
     broker_addr_table: HashMap<String, HashMap<i64, String>>,
+    /// 仅静态主题：`MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名`。
+    /// Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
+    /// `TopicQueueMappingUtils` 那套推导重建，mock 名通过
+    /// `getBrokerNameFromMessageQueue` 解析。非静态主题路由会把旧条目清掉。
+    topic_end_points_table: HashMap<String, HashMap<MessageQueue, String>>,
 }
 
 struct Inner {
@@ -1598,6 +1603,18 @@ impl MQClientInstance {
                     bd.broker_addrs.iter().cloned().collect(),
                 );
             }
+            // 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
+            // （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
+            match crate::client::static_topic::topic_route_data_2_endpoints_for_static_topic(
+                topic, &route,
+            ) {
+                Some(endpoints) => {
+                    tables.topic_end_points_table.insert(topic.to_string(), endpoints);
+                }
+                None => {
+                    tables.topic_end_points_table.remove(topic);
+                }
+            }
             tables
                 .topic_publish_info_table
                 .entry(topic.to_string())
@@ -2537,7 +2554,9 @@ impl MQClientInstance {
         };
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.addr_for(topic, Some(&broker_name)).await?,
+            // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
+            // changePopInvisibleTimeAsync 的只要主 + 重写语义）。
+            None => self.pop_ack_addr(&broker_name, topic, queue_id).await?,
         };
         let header = AckMessageRequestHeader {
             consumer_group: Some(consumer_group.to_string()),
@@ -2582,7 +2601,9 @@ impl MQClientInstance {
         };
         let addr = match addr {
             Some(a) => a.to_string(),
-            None => self.addr_for(topic, Some(&broker_name)).await?,
+            // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
+            // changePopInvisibleTimeAsync 的只要主 + 重写语义）。
+            None => self.pop_ack_addr(&broker_name, topic, queue_id).await?,
         };
         let header = ChangeInvisibleTimeRequestHeader {
             consumer_group: Some(consumer_group.to_string()),
@@ -2759,6 +2780,63 @@ impl MQClientInstance {
             addr = self.find_broker_address_in_publish(broker_name);
         }
         addr.ok_or_else(|| Error::client(format!("The broker[{broker_name}] not exist")))
+    }
+
+    /// Java `MQClientInstance#getBrokerNameFromMessageQueue`：把静态主题的**逻辑**
+    /// 队列（mock broker 名 `__syslo__<scope>`）经 topicEndPointsTable 解析成承载它的
+    /// 真实 broker 名。非静态主题 —— 或者表里没有的队列 —— 原样透传自己的 broker 名。
+    pub fn get_broker_name_from_message_queue(&self, mq: &MessageQueue) -> String {
+        let tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
+        match tables.topic_end_points_table.get(&mq.topic) {
+            Some(endpoints) if !endpoints.is_empty() => endpoints
+                .get(mq)
+                .cloned()
+                .unwrap_or_else(|| mq.broker_name.clone()),
+            _ => mq.broker_name.clone(),
+        }
+    }
+
+    /// POP ack / changeInvisibleTime 的地址解析（Go `popAckAddress` 同形）。
+    ///
+    /// Java `ackAsync` / `changePopInvisibleTimeAsync` 对静态主题：来自**逻辑**队列的
+    /// checkpoint 第 5 段带的是 MOCK broker 名（`__syslo__<scope>`）；真实承载者要用
+    /// 实例的 topicEndPointsTable + checkpoint **自己的** queueId 解析 —— 同一静态
+    /// 主题的各 globalId 可能落在**不同**真实 broker 上，用 queueId 0 会解析错机器。
+    /// 请求头里保留**原样**（mock）名；只有地址查找走真实名。
+    pub async fn pop_ack_addr(&self, broker_name: &str, topic: &str, queue_id: i32) -> Result<String> {
+        let resolve_des = |inst: &Self| -> String {
+            if crate::client::static_topic::is_logical_queue_mock_broker_name(broker_name) {
+                inst.get_broker_name_from_message_queue(&MessageQueue::new(
+                    topic, broker_name, queue_id,
+                ))
+            } else {
+                broker_name.to_string()
+            }
+        };
+        let mut des = resolve_des(self);
+        let mut addr = self.find_broker_address_in_publish(&des);
+        if addr.is_none() {
+            self.update_topic_route_info_from_name_server(topic, 5000, false)
+                .await?;
+            // Java 在路由刷新之后**重新解析** desBrokerName —— 刷新后的映射可能把
+            // 这个逻辑队列搬到了新 broker 上。
+            des = resolve_des(self);
+            addr = self.find_broker_address_in_publish(&des);
+        }
+        addr.ok_or_else(|| Error::client(format!("The broker[{des}] master node does not exist")))
+    }
+
+    /// 测试专用：直接把端点表写进 RouteTables（等价于一次静态主题路由落库）。
+    #[cfg(test)]
+    pub(crate) fn seed_end_points_for_test(
+        &self,
+        topic: &str,
+        endpoints: HashMap<MessageQueue, String>,
+    ) {
+        let mut tables = self.inner.tables.lock().unwrap_or_else(|e| e.into_inner());
+        tables
+            .topic_end_points_table
+            .insert(topic.to_string(), endpoints);
     }
 
     /// Python `_publish_addr_in_admin`：Java `MQAdminImpl` 的 offset 查询口径

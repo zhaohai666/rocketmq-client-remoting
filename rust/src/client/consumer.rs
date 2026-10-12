@@ -3946,7 +3946,9 @@ fn ack_pop_msg(inner: &Inner, msg: &MessageExt) {
     handle.spawn(async move {
         // Java ackAsync 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
         // **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
-        let addr = match client.publish_addr_for(&broker_name, &topic).await {
+        // 静态主题：mock broker 名先经 topicEndPointsTable 重写成真实承载者
+        // （用 checkpoint 自己的 queueId —— 各 globalId 可能落在不同 broker）。
+        let addr = match client.pop_ack_addr(&broker_name, &topic, queue_id).await {
             Ok(addr) => addr,
             Err(e) => {
                 rmq_debug!("ack failed: {e}");
@@ -4011,8 +4013,9 @@ fn change_pop_invisible_time(
         return;
     };
     handle.spawn(async move {
-        // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由
-        let addr = match client.publish_addr_for(&broker_name, &topic).await {
+        // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由；
+        // 静态主题的 mock 名重写同 ack 路径。
+        let addr = match client.pop_ack_addr(&broker_name, &topic, queue_id).await {
             Ok(addr) => addr,
             Err(e) => {
                 rmq_debug!("change invisible time failed: {e}");
