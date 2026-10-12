@@ -212,6 +212,12 @@ public sealed class MQClientInstance : IDisposable
     // 路由是**按 topic** 刷的，master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，
     // 扫出来是谁全看字典顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
     private readonly Dictionary<string, SortedDictionary<long, string>> _brokerAddrTable = new(StringComparer.Ordinal);
+    // 仅静态主题：MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名。
+    // Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
+    // TopicQueueMappingUtils 那套推导重建（见 StaticTopic），mock 名通过
+    // GetBrokerNameFromMessageQueue 解析。非静态主题路由会把旧条目清掉。
+    private readonly Dictionary<string, Dictionary<MessageQueue, string>> _topicEndPointsTable =
+        new(StringComparer.Ordinal);
 
     private readonly Dictionary<string, TopicPublishInfo> _topicPublishInfoTable = new(StringComparer.Ordinal);
     private volatile bool _started;
@@ -781,6 +787,18 @@ public sealed class MQClientInstance : IDisposable
                 _brokerAddrTable[bd.BrokerName] = bd.BrokerAddrs;
             }
 
+            // 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
+            // （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
+            var endpoints = new Dictionary<MessageQueue, string>();
+            if (StaticTopic.TopicRouteData2EndpointsForStaticTopic(topic, route, endpoints))
+            {
+                _topicEndPointsTable[topic] = endpoints;
+            }
+            else
+            {
+                _topicEndPointsTable.Remove(topic);
+            }
+
             if (!_topicPublishInfoTable.TryGetValue(topic, out TopicPublishInfo? publish) || publish is null)
             {
                 publish = new TopicPublishInfo();
@@ -1045,6 +1063,75 @@ public sealed class MQClientInstance : IDisposable
     /// 主掉线期间这里就该报错，让调用方看见。
     /// </summary>
     public string PublishAddrInAdmin(MessageQueue mq) => PublishAddrFor(mq.BrokerName, mq.Topic);
+
+    /// <summary>
+    /// Java <c>MQClientInstance#getBrokerNameFromMessageQueue</c>：把静态主题的
+    /// <strong>逻辑</strong>队列（mock broker 名 "__syslo__&lt;scope&gt;"）经
+    /// topicEndPointsTable 解析成承载它的真实 broker 名。非静态主题 —— 或者表里
+    /// 没有的队列 —— 原样透传自己的 broker 名。
+    /// </summary>
+    public string GetBrokerNameFromMessageQueue(MessageQueue mq)
+    {
+        lock (_routeLock)
+        {
+            if (_topicEndPointsTable.TryGetValue(mq.Topic,
+                    out Dictionary<MessageQueue, string>? endpoints)
+                && endpoints is { Count: > 0 }
+                && endpoints.TryGetValue(mq, out string? real) && real is not null)
+            {
+                return real;
+            }
+        }
+
+        return mq.BrokerName;
+    }
+
+    /// <summary>
+    /// POP 的 ack / changeInvisibleTime 地址解析（Go popAckAddress 同形）。
+    /// Java ackAsync / changePopInvisibleTimeAsync 对静态主题：来自<strong>逻辑</strong>队列的
+    /// checkpoint 第 5 段带的是 MOCK broker 名（"__syslo__&lt;scope&gt;"）；真实承载者要用
+    /// 实例的 topicEndPointsTable + checkpoint <strong>自己的</strong> queueId 解析 —— 同一
+    /// 静态主题的各 globalId 可能落在<strong>不同</strong>真实 broker 上，用 queueId 0 会解析
+    /// 错机器。请求头保留<strong>原样</strong>（mock）名；只有地址查找走真实名。
+    /// </summary>
+    public string PopAckAddrFor(string topic, string brokerName, int queueId)
+    {
+        string ResolveDes()
+        {
+            return StaticTopic.IsLogicalQueueMockBrokerName(brokerName)
+                ? GetBrokerNameFromMessageQueue(new MessageQueue(topic, brokerName, queueId))
+                : brokerName;
+        }
+
+        string des = ResolveDes();
+        string addr = FindBrokerAddressInPublish(des);
+        if (addr.Length == 0)
+        {
+            UpdateTopicRouteInfoFromNameServer(topic);
+            // Java 在路由刷新之后重新解析 desBrokerName —— 刷新后的映射可能把这个
+            // 逻辑队列搬到了新 broker 上。
+            des = ResolveDes();
+            addr = FindBrokerAddressInPublish(des);
+        }
+
+        if (addr.Length == 0)
+        {
+            // Java DefaultMQPushConsumerImpl:771 的报错原文（ack 只要主）。
+            throw new MQClientException("Broker[" + des + "] master node does not exist", -1);
+        }
+
+        return addr;
+    }
+
+    /// <summary>测试工程与本程序集没有 InternalsVisibleTo 关系，故用 public，勿用于业务代码：
+    /// 离线用例没有名字服务，直接播种端点表（等价于一次静态主题路由落库）。</summary>
+    public void SetTopicEndPointsForTest(string topic, Dictionary<MessageQueue, string> endpoints)
+    {
+        lock (_routeLock)
+        {
+            _topicEndPointsTable[topic] = new Dictionary<MessageQueue, string>(endpoints);
+        }
+    }
 
     public List<string> KnownBrokerAddrs() => GetRouteOfAllBrokers();
 
@@ -1797,7 +1884,8 @@ public sealed class MQClientInstance : IDisposable
             // Java ackAsync:820-825 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
             // **只要主**，查不到刷一次路由重查，仍查不到抛「The broker[X] not exist」。
             // 从节点不接 ACK_MESSAGE，所以这里不能退到从节点地址（PublishAddrFor 即该形状）。
-            addr = PublishAddrFor(brokerName, topic);
+            // 静态主题的 mock broker 名在这里经端点表重写（PopAckAddrFor）。
+            addr = PopAckAddrFor(topic, brokerName, queueId);
         }
 
         var header = new AckMessageRequestHeader
@@ -1836,7 +1924,8 @@ public sealed class MQClientInstance : IDisposable
         {
             // Java changePopInvisibleTimeAsync:869-876 同样是
             // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) + 刷一次路由重查。
-            addr = PublishAddrFor(brokerName, topic);
+            // mock 名重写同 ack 路径（PopAckAddrFor）。
+            addr = PopAckAddrFor(topic, brokerName, queueId);
         }
 
         var header = new ChangeInvisibleTimeRequestHeader
