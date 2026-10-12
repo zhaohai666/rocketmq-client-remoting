@@ -26,6 +26,7 @@ $suites = [
     'Client 故障探活' => __DIR__ . '/RunClientFaultDetector.php',
     'Client 消费者' => __DIR__ . '/RunClientConsumer.php',
     'Client 队列变更监听' => __DIR__ . '/RunClientLiteTopicChange.php',
+    'Client 静态主题路由' => __DIR__ . '/RunClientStaticTopic.php',
 ];
 
 // 顶层先加载 autoloader，避免各子套件重复注册。

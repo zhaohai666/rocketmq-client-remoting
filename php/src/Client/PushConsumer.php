@@ -3295,6 +3295,8 @@ final class DefaultMQPushConsumer
         try {
             $client = $this->requireClient();
             // Java ackAsync 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：**只要主**。
+            // 静态主题：mock broker 名先经 topicEndPointsTable 重写成真实承载者
+            // （用 checkpoint 自己的 queueId —— 各 globalId 可能落在不同 broker）。
             $client->ackMessage(
                 $this->consumerGroup,
                 $topic,
@@ -3302,7 +3304,7 @@ final class DefaultMQPushConsumer
                 $ck,
                 $offset,
                 brokerName: $brokerName,
-                addr: $client->publishAddrFor($brokerName, $topic),
+                addr: $client->popAckAddrFor($brokerName, $topic, $queueId),
             );
         } catch (\Throwable $e) {
             // ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
@@ -3330,7 +3332,8 @@ final class DefaultMQPushConsumer
             : $table[max(0, $delayLevel)];
         try {
             $client = $this->requireClient();
-            // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由
+            // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由；
+            // mock 名重写同 ack 路径。
             $client->changeInvisibleTime(
                 $this->consumerGroup,
                 $topic,
@@ -3339,7 +3342,7 @@ final class DefaultMQPushConsumer
                 $offset,
                 $delaySecond * 1000,
                 brokerName: $brokerName,
-                addr: $client->publishAddrFor($brokerName, $topic),
+                addr: $client->popAckAddrFor($brokerName, $topic, $queueId),
             );
         } catch (\Throwable $e) {
             Logger::debug('change invisible time failed for ' . $msg->msgId . ': ' . $e->getMessage());

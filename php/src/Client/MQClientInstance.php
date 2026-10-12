@@ -245,7 +245,6 @@ class MQClientInstance
 
     /** @var array<string, TopicRouteData> */
     public array $topicRouteTable = [];
-
     /** @var array<string, TopicPublishInfo> */
     public array $topicPublishInfoTable = [];
 
@@ -255,6 +254,18 @@ class MQClientInstance
      * @var array<string, array<int, string>>
      */
     public array $brokerAddrTable = [];
+
+    /**
+     * 仅静态主题：MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名。
+     * Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
+     * TopicQueueMappingUtils 那套推导重建（见 StaticTopic），mock 名通过
+     * getBrokerNameFromMessageQueue 解析。非静态主题路由会把旧条目清掉。
+     * PHP 数组键只能用标量，键是 StaticTopic::queueKey 的
+     * "topic@brokerName@queueId" 字符串。
+     *
+     * @var array<string, array<string, string>>
+     */
+    public array $topicEndPointsTable = [];
 
     /** PHP 单线程顺序执行：路由表读写不跨请求，这里只保留互斥语义的标记位。 */
     public bool $topicRouteLockHeld = false;
@@ -1144,6 +1155,15 @@ class MQClientInstance
         foreach ($route->getBrokerDatas() as $bd) {
             $this->brokerAddrTable[$bd->brokerName] = $bd->brokerAddrs;
         }
+        // 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
+        // （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
+        // 键是 StaticTopic::queueKey 的 "topic@brokerName@queueId" 字符串。
+        $endpoints = StaticTopic::topicRouteData2EndpointsForStaticTopic($topic, $route);
+        if ($endpoints !== null) {
+            $this->topicEndPointsTable[$topic] = $endpoints;
+        } else {
+            unset($this->topicEndPointsTable[$topic]);
+        }
         $publish = $this->topicPublishInfoTable[$topic] ??= new TopicPublishInfo();
         $publish->orderTopic = $route->orderTopicConf !== null;
         $publish->topicRouteData = $route;
@@ -1244,6 +1264,59 @@ class MQClientInstance
         }
         if ($addr === null || $addr === '') {
             throw new MQClientException(sprintf('The broker[%s] not exist', $brokerName));
+        }
+        return $addr;
+    }
+
+    /**
+     * Java `MQClientInstance#getBrokerNameFromMessageQueue`：把静态主题的**逻辑**
+     * 队列（mock broker 名 "__syslo__<scope>"）经 topicEndPointsTable 解析成承载它的
+     * 真实 broker 名。非静态主题 —— 或者表里没有的队列 —— 原样透传自己的 broker 名。
+     */
+    public function getBrokerNameFromMessageQueue(MessageQueue $mq): string
+    {
+        $endpoints = $this->topicEndPointsTable[$mq->topic] ?? null;
+        if ($endpoints !== null && $endpoints !== []) {
+            $real = $endpoints[StaticTopic::queueKey($mq)] ?? null;
+            if ($real !== null) {
+                return $real;
+            }
+        }
+        return $mq->brokerName;
+    }
+
+    /**
+     * POP 的 ack / changeInvisibleTime 地址解析（Go popAckAddress 同形）。
+     *
+     * Java ackAsync / changePopInvisibleTimeAsync 对静态主题：来自**逻辑**队列的
+     * checkpoint 第 5 段带的是 MOCK broker 名（"__syslo__<scope>"）；真实承载者要用
+     * 实例的 topicEndPointsTable + checkpoint **自己的** queueId 解析 —— 同一静态
+     * 主题的各 globalId 可能落在**不同**真实 broker 上，用 queueId 0 会解析错机器。
+     * 请求头保留**原样**（mock）名；只有地址查找走真实名。
+     */
+    public function popAckAddrFor(string $brokerName, string $topic, int $queueId): string
+    {
+        $resolveDes = function () use ($brokerName, $topic, $queueId): string {
+            if (StaticTopic::isLogicalQueueMockBrokerName($brokerName)) {
+                return $this->getBrokerNameFromMessageQueue(
+                    new MessageQueue($topic, $brokerName, $queueId),
+                );
+            }
+            return $brokerName;
+        };
+
+        $des = $resolveDes();
+        $addr = $this->findBrokerAddressInPublish($des);
+        if ($addr === null || $addr === '') {
+            $this->updateTopicRouteInfoFromNameServer($topic);
+            // Java 在路由刷新之后**重新解析** desBrokerName —— 刷新后的映射可能把
+            // 这个逻辑队列搬到了新 broker 上。
+            $des = $resolveDes();
+            $addr = $this->findBrokerAddressInPublish($des);
+        }
+        if ($addr === null || $addr === '') {
+            // Java DefaultMQPushConsumerImpl:771 的报错原文（ack 只要主）。
+            throw new MQClientException(sprintf('Broker[%s] master node does not exist', $des));
         }
         return $addr;
     }
@@ -2010,7 +2083,9 @@ class MQClientInstance
             $brokerName = ExtraInfoUtil::getBrokerName(ExtraInfoUtil::split($extraInfo));
         }
         if ($addr === null) {
-            $addr = $this->addrFor($topic, $brokerName);
+            // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
+            // changePopInvisibleTimeAsync 的只要主 + 重写语义）。
+            $addr = $this->popAckAddrFor($brokerName, $topic, $queueId);
         }
         $header = new AckMessageRequestHeader();
         $header->consumerGroup = $consumerGroup;
@@ -2041,7 +2116,9 @@ class MQClientInstance
             $brokerName = ExtraInfoUtil::getBrokerName(ExtraInfoUtil::split($extraInfo));
         }
         if ($addr === null) {
-            $addr = $this->addrFor($topic, $brokerName);
+            // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
+            // changePopInvisibleTimeAsync 的只要主 + 重写语义）。
+            $addr = $this->popAckAddrFor($brokerName, $topic, $queueId);
         }
         $header = new ChangeInvisibleTimeRequestHeader();
         $header->consumerGroup = $consumerGroup;
