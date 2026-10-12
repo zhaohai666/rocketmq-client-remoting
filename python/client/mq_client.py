@@ -24,6 +24,7 @@ from common.message_decoder import (decode_message, decode_messages, decompress_
 from common.mix_all import MixAll
 from common.subscription_data import ExpressionType, SubscriptionData
 from common.sysflag import MessageSysFlag, PullSysFlag
+from client import static_topic
 from common.topic_config import TopicFilterType
 from rocketmq_logging import get_logger
 from remoting.client import RemotingClient
@@ -168,6 +169,11 @@ class MQClientInstance:
         # master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，扫出来是谁
         # 全看字典顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
         self.broker_addr_table: Dict[str, Dict[int, str]] = {}
+        # 仅静态主题：MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名。
+        # Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
+        # TopicQueueMappingUtils 那套推导重建，mock 名通过
+        # getBrokerNameFromMessageQueue 解析。非静态主题路由会把旧条目清掉。
+        self.topic_end_points_table: Dict[str, Dict[MessageQueue, str]] = {}
         self.topic_route_lock = threading.RLock()
         self._started = False
         self._last_route_fetch = 0.0
@@ -727,6 +733,13 @@ class MQClientInstance:
             # 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
             for bd in route.get_broker_datas():
                 self.broker_addr_table[bd.broker_name] = dict(bd.broker_addrs)
+            # 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
+            # （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
+            endpoints = static_topic.topic_route_data_2_endpoints_for_static_topic(topic, route)
+            if endpoints is not None:
+                self.topic_end_points_table[topic] = endpoints
+            else:
+                self.topic_end_points_table.pop(topic, None)
             publish = self.topic_publish_info_table.setdefault(topic, TopicPublishInfo())
             publish.order_topic = route.order_topic_conf is not None
             publish.topic_route_data = route
@@ -822,6 +835,48 @@ class MQClientInstance:
             addr = self.find_broker_address_in_publish(broker_name)
         if not addr:
             raise MQClientException("The broker[%s] not exist" % broker_name)
+        return addr
+
+    def get_broker_name_from_message_queue(self, mq: MessageQueue) -> str:
+        """Java ``MQClientInstance#getBrokerNameFromMessageQueue``：把静态主题的
+        **逻辑**队列（mock broker 名 ``__syslo__<scope>``）经 topicEndPointsTable
+        解析成承载它的真实 broker 名。非静态主题 —— 或者表里没有的队列 ——
+        原样透传自己的 broker 名。"""
+        with self.topic_route_lock:
+            endpoints = self.topic_end_points_table.get(mq.topic)
+        if endpoints:
+            real = endpoints.get(mq)
+            if real is not None:
+                return real
+        return mq.broker_name
+
+    def pop_ack_addr(self, broker_name: str, topic: str, queue_id: int) -> str:
+        """POP ack / changeInvisibleTime 的地址解析（Go ``popAckAddress`` 同形）。
+
+        Java ``ackAsync`` / ``changePopInvisibleTimeAsync`` 对静态主题：来自
+        **逻辑**队列的 checkpoint 第 5 段带的是 MOCK broker 名
+        （``__syslo__<scope>``）；真实承载者要用实例的 topicEndPointsTable +
+        checkpoint **自己的** queueId 解析 —— 同一静态主题的各 globalId 可能落在
+        **不同**真实 broker 上，用 queueId 0 会解析错机器。请求头里保留**原样**
+        （mock）名；只有地址查找走真实名。
+        """
+        def _resolve_des() -> str:
+            if static_topic.is_logical_queue_mock_broker_name(broker_name):
+                return self.get_broker_name_from_message_queue(
+                    MessageQueue(topic, broker_name, queue_id))
+            return broker_name
+
+        des = _resolve_des()
+        addr = self.find_broker_address_in_publish(des)
+        if not addr:
+            self.update_topic_route_info_from_name_server(topic)
+            # Java 在路由刷新之后**重新解析** desBrokerName —— 刷新后的映射可能把
+            # 这个逻辑队列搬到了新 broker 上。
+            des = _resolve_des()
+            addr = self.find_broker_address_in_publish(des)
+        if not addr:
+            raise MQClientException(
+                "The broker[%s] master node does not exist" % des)
         return addr
 
     def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
@@ -1386,7 +1441,9 @@ class MQClientInstance:
         if broker_name is None:
             broker_name = extra.get_broker_name(extra.split(extra_info))
         if addr is None:
-            addr = self._addr_for(topic, broker_name)
+            # 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
+            # changePopInvisibleTimeAsync 的只要主 + 重写语义）。
+            addr = self.pop_ack_addr(broker_name, topic, queue_id)
 
         header = AckMessageRequestHeader()
         header.consumer_group = consumer_group
@@ -1417,7 +1474,9 @@ class MQClientInstance:
         if broker_name is None:
             broker_name = extra.get_broker_name(extra.split(extra_info))
         if addr is None:
-            addr = self._addr_for(topic, broker_name)
+            # 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
+            # changePopInvisibleTimeAsync 的只要主 + 重写语义）。
+            addr = self.pop_ack_addr(broker_name, topic, queue_id)
 
         header = ChangeInvisibleTimeRequestHeader()
         header.consumer_group = consumer_group

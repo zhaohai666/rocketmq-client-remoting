@@ -2496,9 +2496,11 @@ class DefaultMQPushConsumer:
             client = self._require_client()
             # 地址解析是 (brokerName, MASTER_ID, 允许刷路由)：
             # **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
+            # 静态主题：mock broker 名先经 topicEndPointsTable 重写成真实承载者
+            # （用 checkpoint 自己的 queueId —— 各 globalId 可能落在不同 broker）。
             client.ack_message(self.consumer_group, topic, queue_id, ck, offset,
                                broker_name=broker_name,
-                               addr=client.publish_addr_for(broker_name, topic))
+                               addr=client.pop_ack_addr(broker_name, topic, queue_id))
         except Exception as e:  # noqa: BLE001
             # ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
             logger.debug("ack failed for %s: %s", msg.msg_id, e)
@@ -2519,10 +2521,11 @@ class DefaultMQPushConsumer:
         try:
             client = self._require_client()
             # 同样是「只要主」+ 刷一次路由
+            # mock 名重写同 ack 路径。
             client.change_invisible_time(self.consumer_group, topic, queue_id, ck, offset,
                                          delay_second * 1000,
                                          broker_name=broker_name,
-                                         addr=client.publish_addr_for(broker_name, topic))
+                                         addr=client.pop_ack_addr(broker_name, topic, queue_id))
         except Exception as e:  # noqa: BLE001
             logger.debug("change invisible time failed for %s: %s", msg.msg_id, e)
 
