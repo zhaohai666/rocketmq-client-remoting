@@ -50,7 +50,7 @@ for (const mod of modules) {
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
   'test/compat_contract_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts',
   'test/ns_failover_smoke.ts', 'test/lite_topic_queue_change_smoke.ts', 'test/pull_balance_view_smoke.ts',
-  'test/socks_smoke.ts', 'test/mq_client_manager_smoke.ts'];
+  'test/socks_smoke.ts', 'test/mq_client_manager_smoke.ts', 'test/static_topic_smoke.ts'];
 console.log(`\n== smoke suites (${smokes.length}) ==`);
 for (const smoke of smokes) {
   const r = spawnSync(node, ['--experimental-strip-types', '--no-warnings', path.join(here, smoke)],

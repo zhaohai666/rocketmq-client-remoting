@@ -5,6 +5,7 @@ import { MessageQueue } from '../common/message.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { PermName } from '../common/sysflag.ts';
 import { RemotingSerializable } from './serialize.ts';
+import { topicRouteData2EndpointsForStaticTopic } from './static_topic.ts';
 
 export class QueueData {
   brokerName: string;
@@ -105,7 +106,18 @@ export class TopicRouteData {
     this.topicQueueMappingByBroker = null;
   }
   // 组装发布侧全部可写 MessageQueue。
+  // Static-topic branch (Java MQClientInstance.topicRouteData2TopicPublishInfo):
+  // with orderTopicConf unset and a topicQueueMappingByBroker present, the
+  // publish set is the LOGICAL queue list derived from the mapping, sorted by
+  // queueId — NOT the physical queueDatas layout.
   getAllMessageQueue(topic = ''): MessageQueue[] {
+    const hasMapping = this.topicQueueMappingByBroker != null
+      && Object.keys(this.topicQueueMappingByBroker).length > 0;
+    if ((this.orderTopicConf == null || this.orderTopicConf.length === 0) && hasMapping) {
+      const mqs = Array.from(topicRouteData2EndpointsForStaticTopic(topic, this).keys());
+      mqs.sort((a, b) => a.queueId - b.queueId);
+      return mqs;
+    }
     const mqs: MessageQueue[] = [];
     for (const qd of this.queueDatas) {
       if (!PermName.checkPerm(qd.perm, PermName.PERM_WRITE)) continue;
@@ -121,13 +133,30 @@ export class TopicRouteData {
   }
   // Assemble all readable MessageQueues (subscribe side). Mirrors
   // MQClientInstance.topicRouteData2TopicSubscribeInfo (read perm; no master required).
+  // Static-topic branch: with a mapping present the subscribe set is the
+  // logical endpoints key set, regardless of queueDatas.
   getAllSubscribeMessageQueue(topic = ''): MessageQueue[] {
+    const hasMapping = this.topicQueueMappingByBroker != null
+      && Object.keys(this.topicQueueMappingByBroker).length > 0;
+    if (hasMapping) {
+      return Array.from(topicRouteData2EndpointsForStaticTopic(topic, this).keys());
+    }
     const mqs: MessageQueue[] = [];
     for (const qd of this.queueDatas) {
       if (!PermName.checkPerm(qd.perm, PermName.PERM_READ)) continue;
       for (let i = 0; i < qd.readQueueNums; i++) mqs.push(new MessageQueue(topic, qd.brokerName, i));
     }
     return mqs;
+  }
+  // The logical -> real broker name map for this route, or null when the topic
+  // is not static. "__syslo__none__" values mean a logical queue no broker
+  // hosts yet (Java LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST).
+  getStaticTopicEndPoints(topic: string): Map<MessageQueue, string> | null {
+    const hasMapping = this.topicQueueMappingByBroker != null
+      && Object.keys(this.topicQueueMappingByBroker).length > 0;
+    if (!hasMapping) return null;
+    const endpoints = topicRouteData2EndpointsForStaticTopic(topic, this);
+    return endpoints.size > 0 ? endpoints : null;
   }
   cloneTopicRouteData(): TopicRouteData {
     const trd = new TopicRouteData();

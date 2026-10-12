@@ -113,6 +113,12 @@ export class MQClient {
   remotingClient: RemotingClient;
   topicRouteTable: Map<string, TopicRouteData>;
   topicPublishInfoTable: Map<string, TopicPublishInfo>;
+  // topicEndPointsTable — for STATIC topics only: keyed by
+  // "topic@mockBrokerName@globalId" (string keys: JS Map has no
+  // equals/hashCode like Java's ConcurrentHashMap) -> real broker name.
+  // Java MQClientInstance builds it on every route refresh and resolves mock
+  // broker names through getBrokerNameFromMessageQueue.
+  topicEndPointsTable: Map<string, Map<string, string>>;
   brokerAddrTable: Map<string, Record<number, string>>;
   consumerTable: Map<string, any>;
   producerTable: Map<string, any>;
@@ -163,6 +169,7 @@ export class MQClient {
     this.remotingClient = remotingClient != null ? remotingClient : new RemotingClient({});
     this.topicRouteTable = new Map();
     this.topicPublishInfoTable = new Map();
+    this.topicEndPointsTable = new Map();
     this.brokerAddrTable = new Map();
     this.consumerTable = new Map();
     this.producerTable = new Map();
@@ -249,13 +256,24 @@ export class MQClient {
 
   // ---- route management ----
   // Build publish info from a TopicRouteData. Returns a TopicPublishInfo whose
-  // msgQueueList is the master-writable queue set.
+  // msgQueueList is the master-writable queue set. Also refreshes the static
+  // topicEndPointsTable (Java builds both in the same route-refresh block).
   topicRouteData2TopicPublishInfo(topic: string, routeData: TopicRouteData): TopicPublishInfo {
     const info = new TopicPublishInfo();
     info.orderTopic = false;
     info.msgQueueList = routeData.getAllMessageQueue(topic);
     info.haveTopicRouterInfo = true;
     this.topicRouteTable.set(topic, routeData);
+    const endpoints = routeData.getStaticTopicEndPoints(topic);
+    if (endpoints != null) {
+      const byKey = new Map<string, string>();
+      for (const [mq, real] of endpoints.entries()) {
+        byKey.set(`${mq.topic}@${mq.brokerName}@${mq.queueId}`, real);
+      }
+      this.topicEndPointsTable.set(topic, byKey);
+    } else {
+      this.topicEndPointsTable.delete(topic);
+    }
     this._refreshBrokerAddrTable(routeData);
     return info;
   }
@@ -317,7 +335,7 @@ export class MQClient {
     const info = this.topicPublishInfoTable.get(topic);
     if (info != null && info.ok()) {
       const mq = info.selectOneMessageQueue(null, true);
-      if (mq != null) return this.findBrokerAddressInPublish(mq.getBrokerName());
+      if (mq != null) return this.findBrokerAddressInPublish(this.getBrokerNameFromMessageQueue(mq));
     }
     const route = this.topicRouteTable.get(topic);
     if (route != null) {
@@ -327,6 +345,19 @@ export class MQClient {
       }
     }
     return null;
+  }
+
+  // Java MQClientInstance.getBrokerNameFromMessageQueue: a static topic's
+  // logical MessageQueue carries the MOCK broker name ("__syslo__<scope>");
+  // the topicEndPointsTable maps it to the REAL hosting broker name. Non
+  // static topics (or an unknown queue) pass their own broker name through.
+  getBrokerNameFromMessageQueue(mq: MessageQueue): string {
+    const endpoints = this.topicEndPointsTable.get(mq.topic);
+    if (endpoints != null && endpoints.size > 0) {
+      const real = endpoints.get(`${mq.topic}@${mq.brokerName}@${mq.queueId}`);
+      if (real != null) return real;
+    }
+    return mq.brokerName;
   }
 
   findBrokerAddressInPublish(brokerName: string): string | null {
@@ -347,9 +378,11 @@ export class MQClient {
     return null;
   }
 
-  // Publish address for a specific queue (master only).
+  // Publish address for a specific queue (master only). Static-topic queues
+  // resolve through the endpoints table first (Java sendKernelImpl does
+  // findBrokerAddressInPublish(getBrokerNameFromMessageQueue(mq))).
   publishAddrFor(mq: MessageQueue): string | null {
-    return this.findBrokerAddressInPublish(mq.getBrokerName());
+    return this.findBrokerAddressInPublish(this.getBrokerNameFromMessageQueue(mq));
   }
 
   getBrokerAddrTable(): Map<string, Record<number, string>> { return this.brokerAddrTable; }
@@ -667,14 +700,16 @@ export class MQClient {
 
   // ---- offset helpers (used by offset store / consumers / admin) ----
   // Master publish addr first, then any addr for this broker in a cached route
-  // (persistAll's findBrokerAddrByTopic fallback).
+  // (persistAll's findBrokerAddrByTopic fallback). Static-topic logical queues
+  // resolve their real broker name first (endpoints table).
   findBrokerAddrForQueue(mq: MessageQueue): string | null {
-    const master = this.findBrokerAddressInPublish(mq.getBrokerName());
+    const master = this.findBrokerAddressInPublish(this.getBrokerNameFromMessageQueue(mq));
     if (master) return master;
+    const realName = this.getBrokerNameFromMessageQueue(mq);
     const route = this.getTopicRouteData(mq.getTopic());
     if (route) {
       for (const bd of route.brokerDatas || []) {
-        if (bd.brokerName === mq.getBrokerName()) {
+        if (bd.brokerName === realName) {
           const addrs = Object.values(bd.brokerAddrs || {});
           if (addrs.length) return addrs[0];
         }

@@ -39,6 +39,7 @@ import {
   ConsumeMessageDirectlyResult,
 } from '../remoting/bodies.ts';
 import { TopicStatsTable } from '../remoting/admin_body.ts';
+import { TopicQueueMappingDetail } from '../remoting/static_topic.ts';
 import { RemotingSerializable } from '../remoting/serialize.ts';
 import { MQClientManager } from './mq_client_manager.ts';
 import { MixAll } from '../common/mixAll.ts';
@@ -425,6 +426,31 @@ export class DefaultMQAdminExt {
       config.readQueueNums, config.writeQueueNums, config.perm,
       config.topicSysFlag, config.topicFilterType || TopicFilterType.SINGLE_TAG,
       config.order === true, config.attributes != null ? JSON.stringify(config.attributes) : '');
+  }
+
+  // createStaticTopic sends UPDATE_AND_CREATE_STATIC_TOPIC(513) to ONE broker
+  // (broker-local operation for unitized deployments, Java
+  // MQClientAPIImpl.createStaticTopic): a CreateTopicRequestHeader-shaped
+  // custom header (topic/defaultTopic/queue nums/perm/topicFilterType/
+  // topicSysFlag/order/force) plus an encoded TopicQueueMappingDetail body.
+  // `topicFilterType` must be carried — see the UPDATE_AND_CREATE_TOPIC(17)
+  // wire fact above, the header validation is shared.
+  async createStaticTopic(brokerAddr: string, defaultTopic: string, config: TopicConfig,
+    mappingDetail: TopicQueueMappingDetail, force: boolean = false): Promise<void> {
+    if (mappingDetail == null) {
+      throw new MQClientException('createStaticTopic: mappingDetail must not be null');
+    }
+    await this._invokeBroker(brokerAddr, RequestCode.UPDATE_AND_CREATE_STATIC_TOPIC, adminExt({
+      topic: config.topicName,
+      defaultTopic,
+      readQueueNums: config.readQueueNums,
+      writeQueueNums: config.writeQueueNums,
+      perm: config.perm,
+      topicFilterType: config.topicFilterType || TopicFilterType.SINGLE_TAG,
+      topicSysFlag: config.topicSysFlag,
+      order: config.order === true,
+      force,
+    }), mappingDetail.encode());
   }
 
   // DELETE_TOPIC_IN_BROKER(215) for each addr.

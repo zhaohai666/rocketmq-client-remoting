@@ -32,6 +32,7 @@ import {
 import { AckMessageRequestHeader, ChangeInvisibleTimeRequestHeader, PopMessageRequestHeader } from '../remoting/headers.ts';
 import { MESSAGE_REQUEST_MODE_POP } from '../remoting/pop_bodies.ts';
 import { ResponseCode } from '../remoting/codes.ts';
+import { isLogicalQueueMockBrokerName } from '../remoting/static_topic.ts';
 import { RemotingTimeoutException } from '../remoting/exception.ts';
 import { ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus } from './consumer_result.ts';
 import { ConsumeMessageContext } from './hook.ts';
@@ -358,27 +359,37 @@ function popMaxReconsumeTimes(c: DefaultMQPushConsumer): number {
 // ---------------------------------------------------------------------------
 
 // popAckAddress resolves the broker address an ACK/CHANGE_INVISIBLETIME
-// belongs to: the LOGICAL broker name from checkpoint segment 5, looked up
-// against the master, refreshing the route once.
+// belongs to: the broker name from checkpoint segment 5, looked up against
+// the master, refreshing the route once.
 //
-// Note: a checkpoint broker name beginning with "__syslo__" (MixAll
-// .LOGICAL_QUEUE_MOCK_BROKER_PREFIX) is normally mapped through a
-// topicEndPointsTable built from TopicRouteData.topicQueueMapping. This port
-// decodes topicQueueMappingByBroker as an opaque MappingEntry list and keeps
-// no topicEndPointsTable, so there is no address to map to and the branch is
-// not taken. The static-topic / logical-queue routing feature is a known P3
-// gap, not a silent fallback: the header still carries the LOGICAL broker
-// name.
-async function popAckAddress(c: DefaultMQPushConsumer, brokerName: string, topic: string): Promise<string> {
+// Static topics (Java ackAsync / changePopInvisibleTimeAsync): a checkpoint
+// from a LOGICAL queue carries the MOCK broker name ("__syslo__<scope>");
+// the REAL hosting broker is resolved through the instance's
+// topicEndPointsTable with the checkpoint's own queueId — globalIds of one
+// static topic may map to DIFFERENT real brokers, so queueId 0 would resolve
+// the wrong host. The request header keeps the ORIGINAL (mock) name either
+// way; only the address lookup goes through the real one.
+async function popAckAddress(c: DefaultMQPushConsumer, brokerName: string, topic: string,
+  queueId: number): Promise<string> {
   const client = c.mqClient;
   if (!client) throw new Error('consumer not started');
-  let resolved = c._findBrokerAddressInSubscribe(brokerName, MixAll.MASTER_ID, true);
+  const resolveAddr = (name: string): { addr: string } | null =>
+    c._findBrokerAddressInSubscribe(name, MixAll.MASTER_ID, true);
+  const desBrokerName = isLogicalQueueMockBrokerName(brokerName)
+    ? client.getBrokerNameFromMessageQueue(new MessageQueue(topic, brokerName, queueId))
+    : brokerName;
+  let resolved = resolveAddr(desBrokerName);
   if (!resolved) {
     await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
-    resolved = c._findBrokerAddressInSubscribe(brokerName, MixAll.MASTER_ID, true);
+    // retry the (possibly mock) name resolution after the route refresh —
+    // Java re-resolves desBrokerName after updateTopicRouteInfoFromNameServer.
+    const retryName = isLogicalQueueMockBrokerName(brokerName)
+      ? client.getBrokerNameFromMessageQueue(new MessageQueue(topic, brokerName, queueId))
+      : brokerName;
+    resolved = resolveAddr(retryName);
   }
   if (!resolved) {
-    throw new Error('The broker[' + brokerName + '] master node does not exist');
+    throw new Error('The broker[' + desBrokerName + '] master node does not exist');
   }
   return resolved.addr;
 }
@@ -407,7 +418,7 @@ export async function ackMessagePop(c: DefaultMQPushConsumer, msg: MessageExt): 
 
   let addr: string;
   try {
-    addr = await popAckAddress(c, brokerName, msg.getTopic());
+    addr = await popAckAddress(c, brokerName, msg.getTopic(), queueId);
   } catch (e) {
     logger.warning('ack failed, broker %s not resolvable: %s', brokerName, (e as Error).message);
     return;
@@ -461,7 +472,7 @@ function changePopInvisibleTimeAtLevel(c: DefaultMQPushConsumer, msg: MessageExt
   void (async () => {
     let addr: string;
     try {
-      addr = await popAckAddress(c, brokerName, msg.getTopic());
+      addr = await popAckAddress(c, brokerName, msg.getTopic(), queueId);
     } catch (e) {
       logger.warning('changePopInvisibleTime failed, broker %s not resolvable: %s',
         brokerName, (e as Error).message);
