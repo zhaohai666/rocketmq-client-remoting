@@ -495,6 +495,12 @@ public:
     // （sendKernelImpl 报 MQClientException、endTransaction 什么都不报）。
     std::string findBrokerAddressInPublish(const std::string& brokerName);
 
+    // Java `MQClientInstance#getBrokerNameFromMessageQueue`：把静态主题的**逻辑**
+    // 队列（mock broker 名 "__syslo__<scope>"）经 topicEndPointsTable_ 解析成承载
+    // 它的真实 broker 名。非静态主题 —— 或者表里没有的队列 —— 原样透传自己的
+    // broker 名。
+    std::string getBrokerNameFromMessageQueue(const MessageQueue& mq);
+
     // Java 侧「**只要主**」的地址解析，出现处都是同一个形状。
     //
     // 对应 `DefaultMQProducerImpl.sendKernelImpl:919-924`（发送）、
@@ -524,6 +530,16 @@ public:
     // （brokerName 为空时用它去反构 POP_CK，retryFlag 会算错）；addrIn 非空则原样返回。
     std::string resolvePopAddr(const std::string& topic, std::string& brokerName,
                                const std::string& addrIn);
+    // POP 的 ack / changeInvisibleTime 地址解析（Go popAckAddress 同形）。
+    //
+    // Java ackAsync / changePopInvisibleTimeAsync 对静态主题：来自**逻辑**队列的
+    // checkpoint 第 5 段带的是 MOCK broker 名（"__syslo__<scope>"）；真实承载者要用
+    // 实例的 topicEndPointsTable_ + checkpoint **自己的** queueId 解析 —— 同一静态
+    // 主题的各 globalId 可能落在**不同**真实 broker 上，用 queueId 0 会解析错机器。
+    // 请求头保留**原样**（mock）名；只有地址查找走真实名。
+    // brokerName 空时与 resolvePopAddr 同样按路由补一台；addrIn 非空原样返回。
+    std::string popAckAddrFor(const std::string& topic, const std::string& brokerName,
+                              int32_t queueId, const std::string& addrIn);
     std::vector<std::string> getRouteOfAllBrokers();
     // 列出已知路由里所有 broker 地址（用于探活）
     std::vector<std::string> knownBrokerAddrs();
@@ -553,6 +569,9 @@ private:
     // 后台路由刷新循环（对应 Java startScheduledTask 的 updateTopicRouteInfoFromNameServer 周期任务）
     void routeRefreshLoop();
 
+    // 离线单测播种端点表用（离线没有名字服务；产品代码只在路由落库块里写这张表）。
+    friend struct MQClientInstanceTestAccess;
+
     std::string clientId_;
     std::vector<std::string> nameServerAddrs_;
     std::unique_ptr<RemotingClient> remotingClient_;
@@ -572,6 +591,11 @@ private:
     // master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，扫出来是谁
     // 全看 map 顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
     std::map<std::string, std::map<int64_t, std::string>> brokerAddrTable_;
+    // 仅静态主题：MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名。
+    // Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
+    // TopicQueueMappingUtils 那套推导重建（见 client/static_topic.h），mock 名通过
+    // getBrokerNameFromMessageQueue 解析。非静态主题路由会把旧条目清掉。
+    std::map<std::string, std::map<MessageQueue, std::string>> topicEndPointsTable_;
     std::map<std::string, std::shared_ptr<TopicPublishInfo>> topicPublishInfoTable_;
     // 在用 topic（消费者订阅 + 生产者发送过的），由周期任务刷新路由
     std::set<std::string> topicsInUse_;

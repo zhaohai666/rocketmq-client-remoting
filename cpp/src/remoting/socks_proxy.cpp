@@ -107,7 +107,8 @@ int32_t remainingMs(int64_t deadlineMs) {
 // 超时统一由 setIoTimeout 设好的 SO_RCVTIMEO/SO_SNDTIMEO 兜底。
 bool socks5Greeting(netcompat::socket_t sock, const SocksProxyConfig& proxy, std::string& err) {
     const bool useAuth = !proxy.username.empty() || !proxy.password.empty();
-    unsigned char greeting[4] = {0x05, 0x01, useAuth ? 0x02u : 0x00u, 0x00};
+    unsigned char greeting[4] = {0x05, 0x01,
+                                 static_cast<unsigned char>(useAuth ? 0x02u : 0x00u), 0x00};
     if (!writeFull(sock, greeting, 3)) {
         err = "send method selection failed";
         return false;

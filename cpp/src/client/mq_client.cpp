@@ -19,6 +19,7 @@
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/request_reply.h"
+#include "rocketmq/client/static_topic.h"
 #include "rocketmq/client/trace.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"
@@ -493,6 +494,16 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
     for (const BrokerData& bd : route.brokerDatas) {
         brokerAddrTable_[bd.brokerName] = bd.brokerAddrs;
     }
+    // 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
+    // （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
+    {
+        std::map<MessageQueue, std::string> endpoints;
+        if (static_topic::topicRouteData2EndpointsForStaticTopic(topic, route, endpoints)) {
+            topicEndPointsTable_[topic] = std::move(endpoints);
+        } else {
+            topicEndPointsTable_.erase(topic);
+        }
+    }
     auto it = topicPublishInfoTable_.find(topic);
     if (it == topicPublishInfoTable_.end() || it->second == nullptr) {
         it = topicPublishInfoTable_.emplace(topic, std::make_shared<TopicPublishInfo>()).first;
@@ -688,6 +699,59 @@ std::string MQClientInstance::resolvePopAddr(const std::string& topic, std::stri
         return addrIn;  // 调用方点名了地址：只借路由把 brokerName 补上，不动地址
     }
     return publishAddrFor(brokerName, topic);
+}
+
+std::string MQClientInstance::getBrokerNameFromMessageQueue(const MessageQueue& mq) {
+    std::lock_guard<std::recursive_mutex> lk(routeLock_);
+    auto tableIt = topicEndPointsTable_.find(mq.topic);
+    if (tableIt != topicEndPointsTable_.end() && !tableIt->second.empty()) {
+        auto it = tableIt->second.find(mq);
+        if (it != tableIt->second.end()) {
+            return it->second;
+        }
+    }
+    return mq.brokerName;
+}
+
+std::string MQClientInstance::popAckAddrFor(const std::string& topic,
+                                            const std::string& brokerName,
+                                            int32_t queueId, const std::string& addrIn) {
+    // 调用方点名了地址：原样返回（与 resolvePopAddr 同口径）。
+    if (!addrIn.empty()) {
+        return addrIn;
+    }
+    std::string name = brokerName;
+    if (name.empty()) {
+        // 与 resolvePopAddr 相同的便利口径：按路由挑一台，挑完照样只认它的 master。
+        auto route = getTopicRouteData(topic);
+        if (route == nullptr) {
+            throw MQClientNoRouteException(topic);
+        }
+        if (route->brokerDatas.empty()) {
+            throw MQClientException("No broker in route of topic: " + topic);
+        }
+        name = route->brokerDatas.front().brokerName;
+    }
+    const auto resolveDes = [this, &topic, &name, queueId]() -> std::string {
+        if (static_topic::isLogicalQueueMockBrokerName(name)) {
+            return getBrokerNameFromMessageQueue(MessageQueue(topic, name, queueId));
+        }
+        return name;
+    };
+    std::string des = resolveDes();
+    std::string addr = findBrokerAddressInPublish(des);
+    if (addr.empty()) {
+        updateTopicRouteInfoFromNameServer(topic, 5000, false);
+        // Java 在路由刷新之后重新解析 —— 刷新后的映射可能把这个逻辑队列搬到了
+        // 新 broker 上。
+        des = resolveDes();
+        addr = findBrokerAddressInPublish(des);
+    }
+    if (addr.empty()) {
+        // Java DefaultMQPushConsumerImpl:771 的报错原文（ack 只要主）。
+        throw MQClientException("Broker[" + des + "] master node does not exist", -1);
+    }
+    return addr;
 }
 
 std::string MQClientInstance::consumerOffsetAddr(const MessageQueue& mq) {
@@ -1236,7 +1300,8 @@ int32_t MQClientInstance::ackMessage(const std::string& consumerGroup, const std
         // 与 Java 一致：从 CK 串第 6 段取 brokerName（ACK 是靠它找地址的）
         brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
     }
-    const std::string addr = resolvePopAddr(topic, brokerName, addrIn);
+    // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync 的只要主 + 重写）。
+    const std::string addr = popAckAddrFor(topic, brokerName, queueId, addrIn);
 
     auto header = std::make_shared<AckMessageRequestHeader>();
     header->consumerGroup = consumerGroup;
@@ -1259,7 +1324,8 @@ ChangeInvisibleTimeResult MQClientInstance::changeInvisibleTime(
     if (brokerName.empty() && !extraInfo.empty()) {
         brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
     }
-    const std::string addr = resolvePopAddr(topic, brokerName, addrIn);
+    // mock 名重写同 ack 路径。
+    const std::string addr = popAckAddrFor(topic, brokerName, queueId, addrIn);
 
     auto header = std::make_shared<ChangeInvisibleTimeRequestHeader>();
     header->consumerGroup = consumerGroup;

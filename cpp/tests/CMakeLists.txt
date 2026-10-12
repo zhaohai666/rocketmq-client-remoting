@@ -362,3 +362,8 @@ add_test(NAME clean_expired_msg COMMAND rmq_test_clean_expired_msg)
 add_executable(rmq_test_lite_topic_queue_change test_lite_topic_queue_change.cpp)
 target_link_libraries(rmq_test_lite_topic_queue_change PRIVATE rocketmq::remoting)
 add_test(NAME lite_topic_queue_change COMMAND rmq_test_lite_topic_queue_change)
+
+# 静态主题路由：mock broker 名推导 + 端点表（对标 Go static_topic_test.go 五用例）
+add_executable(rmq_test_static_topic test_static_topic.cpp)
+target_link_libraries(rmq_test_static_topic PRIVATE rocketmq::remoting)
+add_test(NAME static_topic COMMAND rmq_test_static_topic)

@@ -63,6 +63,7 @@ set(RMQ_SOURCES
     src/remoting/socks_proxy.cpp
     src/remoting/rpchook.cpp
     src/client/result.cpp
+    src/client/static_topic.cpp
     src/client/allocate_strategy.cpp
     src/client/mq_client.cpp
     src/client/consumer_stats.cpp
