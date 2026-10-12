@@ -1565,6 +1565,24 @@ func (p *DefaultMQProducer) SendBatchToQueue(messages []*common.Message, mq comm
 	return p.sendBatch(messages, &mq, p.sendMsgTimeout, pinnedTopicMismatchSync)
 }
 
+// joinMemberUniqIDs renders the reply msgId for a CLIENT batch: Java
+// MQClientAPIImpl.processSendResponse:786 builds SendResult.msgId as the
+// comma-joined per-member UNIQ_KEYs whenever the broker echoes no batchUniqId
+// (a client batch on an ordinary topic — the only kind the remoting send
+// kernel produces). The broker's own header msgId (comma-joined per-member
+// offset ids) stays in OffsetMsgID. The ProduceAccumulator splits per-message
+// results from exactly this list, so the join is what makes auto-batch and
+// explicit batches report per-message ids.
+func joinMemberUniqIDs(messages []*common.Message) string {
+	ids := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if u, ok := common.GetUniqID(m); ok {
+			ids = append(ids, u)
+		}
+	}
+	return strings.Join(ids, ",")
+}
+
 // sendBatch is the batch kernel. pinnedMismatch is the wording for the pinned
 // queue guard: the async caller passes pinnedTopicMismatchAsync, because the
 // async prologue uses its own text rather than the sync one.
@@ -1611,21 +1629,34 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	// tryToCompressMessage skips a batch outright, so batches are never
 	// compressed.
 	sysFlag := p.tryToCompressMessage(batch.Message, true)
+	var res *SendResult
+	var sendErr error
 	if pinned != nil {
-		return p.sendAttempt(batch.Message, true, *pinned, sysFlag, timeoutMillis, CommunicationModeSync)
+		res, sendErr = p.sendAttempt(batch.Message, true, *pinned, sysFlag, timeoutMillis, CommunicationModeSync)
+	} else {
+		publish, pubErr := p.topicPublishInfo(batch.Message.Topic)
+		if pubErr != nil {
+			return nil, pubErr
+		}
+		selected, ok, selErr := publish.SelectOneMessageQueue(nil)
+		if selErr != nil {
+			return nil, selErr
+		}
+		if !ok {
+			return nil, common.ClientError("no message queue for publish info")
+		}
+		res, sendErr = p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis, CommunicationModeSync)
 	}
-	publish, err := p.topicPublishInfo(batch.Message.Topic)
-	if err != nil {
-		return nil, err
+	if sendErr != nil {
+		return nil, sendErr
 	}
-	selected, ok, err := publish.SelectOneMessageQueue(nil)
-	if err != nil {
-		return nil, err
+	// Java processSendResponse:786: a client batch's reply msgId is the
+	// comma-joined member UNIQ_KEYs (built client-side) — see
+	// joinMemberUniqIDs.
+	if len(messages) > 1 {
+		res.MsgID = joinMemberUniqIDs(messages)
 	}
-	if !ok {
-		return nil, common.ClientError("no message queue for publish info")
-	}
-	return p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis, CommunicationModeSync)
+	return res, nil
 }
 
 // sendAccumulatorBatch assembles the accumulated messages into ONE MessageBatch
@@ -1699,19 +1730,12 @@ func (p *DefaultMQProducer) sendAccumulatorBatch(messages []*common.Message, tag
 	if err != nil {
 		return nil, err
 	}
-	// Java MQClientAPIImpl.processSendResponse:786: for a client batch (the
-	// broker echoes no batchUniqId), the reply's msgId is built CLIENT-SIDE as
-	// the comma-joined per-member UNIQ_KEYs — the ProduceAccumulator splits
-	// per-message results from exactly that list. The broker's own (here:
-	// comma-joined per-member offset ids) stays in OffsetMsgID.
+	// Java processSendResponse:786: a client batch's reply msgId is the
+	// comma-joined member UNIQ_KEYs (built client-side) — see
+	// joinMemberUniqIDs. The ProduceAccumulator splits per-message results
+	// from exactly that list.
 	if len(messages) > 1 {
-		ids := make([]string, 0, len(messages))
-		for _, m := range messages {
-			if u, ok := common.GetUniqID(m); ok {
-				ids = append(ids, u)
-			}
-		}
-		res.MsgID = strings.Join(ids, ",")
+		res.MsgID = joinMemberUniqIDs(messages)
 	}
 	return res, nil
 }

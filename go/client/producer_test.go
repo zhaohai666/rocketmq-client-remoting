@@ -306,6 +306,18 @@ func TestProducerBatchEncodingAndPerMessageUniqKeys(t *testing.T) {
 	if result.SendStatus != SendOK {
 		t.Errorf("status = %s", result.SendStatus)
 	}
+	// Java processSendResponse:786: a client batch's SendResult.msgId is the
+	// comma-joined per-member UNIQ_KEYs (built CLIENT-SIDE — the broker
+	// replies a single wrapper id). Consumers and traces join on the member
+	// ids, not on the batch wrapper's.
+	id1, _ := common.GetUniqID(first)
+	id2, _ := common.GetUniqID(second)
+	if result.MsgID != id1+","+id2 {
+		t.Errorf("result.MsgID = %q, want the joined member ids %q,%q", result.MsgID, id1, id2)
+	}
+	if result.MsgID == id1 || !strings.Contains(result.MsgID, ",") {
+		t.Errorf("result.MsgID %q must not be a single (wrapper) id", result.MsgID)
+	}
 }
 
 // decodeBatchBody splits a batch body into its per-message light frames. Java's
